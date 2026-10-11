@@ -259,7 +259,7 @@ void MediaPool::clear() {
     peaks_.clear();
 }
 
-void MediaPool::forget(const std::string& path) {
+void MediaPool::forget(const std::string& path, bool sound) {
     // The file however it is read (each eye of a stereo file, every interpretation of it).
     const std::string file = uninterpretedPath(path);
     auto same = [&](const std::string& key) { return key == path || uninterpretedPath(key) == file; };
@@ -284,9 +284,43 @@ void MediaPool::forget(const std::string& path) {
             d = slots.empty() ? decoders_.erase(d) : std::next(d);
         }
     }
+    if (!sound) return;
     std::lock_guard lock(audioM_);
     for (auto it = audio_.begin(); it != audio_.end();) it = same(audioKeyFile(it->first.first)) ? audio_.erase(it) : std::next(it);
     for (auto it = peaks_.begin(); it != peaks_.end();) it = same(audioKeyFile(it->first)) ? peaks_.erase(it) : std::next(it);
+}
+
+bool MediaPool::refreshAudio(const std::string& path) {
+    const std::string file = uninterpretedPath(path);
+    auto same = [&](const std::string& key) { return key == path || uninterpretedPath(key) == file; };
+    std::vector<std::pair<std::pair<std::string, int>, std::shared_ptr<std::mutex>>> cached;
+    {
+        std::lock_guard lock(audioM_);
+        for (const auto& [key, buf] : audio_)
+            if (same(audioKeyFile(key.first))) {
+                auto& l = audioLocks_[key];
+                if (!l) l = std::make_shared<std::mutex>();
+                cached.push_back({key, l});
+            }
+    }
+    for (const auto& [key, decodeLock] : cached) {
+        std::unique_lock dl(*decodeLock, std::try_to_lock);
+        if (!dl.owns_lock()) continue;  // (being decoded already: that read stands)
+        std::vector<int> channels;
+        const std::string f = audioKeyFile(key.first, &channels);
+        AudioBufferPtr buf = isAmbisonicAudioKey(key.first) ? decodeAmbisonic(f, key.second) : decodeAudio(f, key.second, nullptr, nullptr, channels);
+        if (!buf) continue;  // (unreadable mid-write: the last read stays)
+        PeaksPtr pk = computePeaks(*buf);
+        std::function<void(const std::string&)> cb;
+        {
+            std::lock_guard lock(audioM_);
+            audio_[key] = buf;
+            peaks_[key.first] = pk;
+            cb = readyCb_;
+        }
+        if (cb) cb(key.first);
+    }
+    return !cached.empty();
 }
 
 void MediaPool::setReadyCallback(std::function<void(const std::string&)> cb) {

@@ -1453,7 +1453,10 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
     growing->setObjectName(QStringLiteral("growingFiles"));
     bool anyGrowing = false;
     for (const MediaItem& m : state_->project().media) anyGrowing |= state_->isMediaGrowing(m.id);
-    growing->addAction(tr("Refresh Now"), this, [this] { state_->refreshGrowingMedia(); })->setEnabled(anyGrowing);
+    QAction* now = growing->addAction(anyGrowing ? tr("Refresh Now") : tr("Refresh All Media Lengths Now"), this, [this] { state_->refreshGrowingMedia(); });
+    now->setObjectName(QStringLiteral("refreshGrowing"));
+    // (A file written on a network share from another computer is not noticed growing by itself.)
+    now->setToolTip(tr("Read again the length of files still being written, or of every media file when none is seen growing"));
     growing->addSeparator();
     auto* every = new QActionGroup(growing);
     for (const auto& [label, ms] : {std::pair{tr("Every 5 Seconds"), 5000}, {tr("Every 15 Seconds"), 15000}, {tr("Every 30 Seconds"), 30000},

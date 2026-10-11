@@ -22,6 +22,11 @@ namespace montage {
 
 // Fills `out` (kind, duration, dimensions, codecs...) from the file at `path`.
 bool probeMedia(const std::string& path, MediaItem& out, std::string* error = nullptr);
+// What probing says about a file (duration, picture size and rate, streams, codecs, stereo packing), as opposed to
+// what a project sets on its media: copied over when the file changes on disk (`length` false keeps the duration, as a
+// subclip's range is its own), and compared.
+void copyProbedFacts(MediaItem& to, const MediaItem& from, bool length = true);
+bool sameProbedFacts(const MediaItem& a, const MediaItem& b, bool length = true);
 // A project saved before Montage read stereo packing: its stereo video files (side-by-side or top-and-bottom metadata)
 // are found from their headers and read again, so their items say so and give one eye's size, as they would imported
 // now. Nothing happens once a project has been checked (Project::stereoChecked). ProRes RAW media saved by a build

@@ -216,19 +216,23 @@ public:
     // and Resolve do: their cached frames, thumbnails and sound are dropped and their details re-read.
     void reloadChangedMedia(const QStringList& paths);
     // Growing media (Avid's and Premiere's growing files, Resolve's editing while recording): a file that is still
-    // being written (a recorder, a capture card, a render still going) is followed while it grows: its length is
-    // re-read every growingRefreshMs (0: only once it stops), without waiting for it to go quiet, and it is reloaded
-    // in full (thumbnails, sound) once it has stopped growing. A file counts as growing once written for over two
-    // seconds without a pause of a second and a half.
+    // being written (a recorder, a capture card, a render still going) is followed while it grows: its length,
+    // pictures and sound are read again every growingRefreshMs (0: only once it stops), off the window's thread and
+    // without waiting for it to go quiet, and it is reloaded in full (thumbnails too) once it has stopped growing. A
+    // file counts as growing once written for over two seconds without a pause of a second and a half. What is read
+    // is a fact about the file, not an edit: undo keeps it, and the project is marked changed.
     bool isMediaGrowing(Id media) const;
+    QStringList growingFiles() const;  // the files followed as growing now
     int growingRefreshMs() const { return growingRefreshMs_; }
     void setGrowingRefreshMs(int ms);
-    void refreshGrowingMedia();  // their lengths re-read now
+    // Lengths read again now: of the growing files, or with none seen growing, of every media file (one written on a
+    // network share from another computer is not noticed by itself). Done when growingRefreshed is emitted.
+    void refreshGrowingMedia();
     // A media file written to (the watcher's notice; public for tests) and the growing files looked at (every second
     // while any file is being written), by the clock (setClock for tests; milliseconds).
     void noteMediaFileWritten(const QString& path);
     void checkGrowingMedia();
-    void setClock(std::function<qint64()> clock) { clock_ = std::move(clock); }
+    void setClock(std::function<qint64()> clock);  // (empty: the real clock again)
 
 signals:
     void projectChanged();            // anything in the project changed
@@ -240,6 +244,7 @@ signals:
     void sequencesAsClipsChanged(bool on);
     void mediaReady(const QString& path);  // audio peaks / thumbnails available
     void mediaFileChanged(montage::Id media);  // its file changed on disk and was reloaded
+    void growingRefreshed(bool changed);       // lengths read again (refreshGrowingMedia, or a growing file's turn)
     void statusMessage(const QString& text, int timeoutMs);
     void fileStateChanged();          // path or modified flag changed
     void lockStateChanged();          // read-only, who holds the lock, or whether it is free changed
@@ -276,7 +281,14 @@ private:
     QTimer* growthTimer_ = nullptr;
     int growingRefreshMs_ = 15000;
     std::function<qint64()> clock_;
-    bool refreshLengths(const QStringList& paths);  // re-reads their media's length and streams (no reload); any changed
+    // Reads their media's length and streams again on a worker (paths already being read are skipped), then applies
+    // what changed (no reload) and emits growingRefreshed.
+    void refreshLengths(const QStringList& paths);
+    std::set<QString> probing_;
+    std::map<QString, int> reloads_;  // per file, how often reloaded (a read begun before a reload is not applied)
+    // Sets what probing `path` gave on its media, in the project and every state undo, redo or a gesture's start can
+    // bring back, marking the project changed; whether the project changed.
+    bool applyProbedFacts(const std::string& path, const MediaItem& fresh);
     mutable std::map<std::string, std::pair<bool, qint64>> offlineChecked_;  // path -> offline, when checked (ms)
     std::set<std::pair<std::string, int>> clipAudioRequested_;  // audio keys and rates already decoding
 

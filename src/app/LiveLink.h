@@ -18,6 +18,9 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
+#include <string>
+#include <vector>
 
 #include "core/Model.h"
 
@@ -28,6 +31,12 @@ namespace montage {
 
 class EditorState;
 class McpServer;
+
+// A tool's result on the open project (`loaded`, worked from `before`), to apply to the project as it is `now`:
+// nothing if the editor changed it meanwhile. Set aside: the playhead and marks (playback moves them) and what files
+// say (a growing recording's length is read again outside any edit): files read again in Montage meanwhile keep what
+// it read, and files the tool read again itself are named in `reread` (on disk), to be reloaded.
+std::optional<Project> mergeToolResult(const Project& before, const Project& now, Project loaded, std::vector<std::string>* reread = nullptr);
 
 class LiveLink : public QObject {
     Q_OBJECT

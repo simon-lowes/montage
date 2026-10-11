@@ -7543,6 +7543,51 @@ const auto seq = [this] { return state()->sequence(); };
         return got.split(' ').value(1).toInt();
     }
 
+    void agentLinkKeepsWhatFilesSay() {
+        // A tool's result on the open project, applied while a growing file's length was read again meanwhile.
+        Project before = makeDefaultProject();
+        MediaItem rec;
+        rec.id = before.newId();
+        rec.path = "/rec/take1.wav";
+        rec.name = "take1.wav";
+        rec.hasAudio = true;
+        rec.duration = 2.0;
+        before.media.push_back(rec);
+        MediaItem sub = rec;  // a subclip of it: its range is its own
+        sub.id = before.newId();
+        sub.subclipOf = rec.id;
+        sub.duration = 1.0;
+        before.media.push_back(sub);
+        Project now = before;
+        now.media[0].duration = 5.0;  // read again in Montage while the tool ran
+        now.media[1].sampleRate = 48000;
+        now.sequences[0].playhead = 40;
+        Project loaded = before;
+        loaded.sequences[0].markers.push_back(Marker{});  // the tool's edit
+        std::vector<std::string> reread;
+        std::optional<Project> merged = mergeToolResult(before, now, loaded, &reread);
+        QVERIFY(merged);
+        QCOMPARE(merged->media[0].duration, 5.0);
+        QCOMPARE(merged->media[1].duration, 1.0);
+        QCOMPARE(merged->media[1].sampleRate, 48000);
+        QCOMPARE(merged->sequences[0].markers.size(), size_t(1));
+        QCOMPARE(merged->sequences[0].playhead, FrameTime(40));
+        QVERIFY(reread.empty());
+        // The tool read the file again itself (montage_refresh_media): its reading stands, and the file is named.
+        loaded.media[0].duration = 6.0;
+        merged = mergeToolResult(before, now, loaded, &reread);
+        QVERIFY(merged);
+        QCOMPARE(merged->media[0].duration, 6.0);
+        QCOMPARE(reread, std::vector<std::string>{"/rec/take1.wav"});
+        // An edit in Montage meanwhile (a subclip's range included) still refuses the result.
+        Project edited = now;
+        edited.media[1].duration = 0.5;
+        QVERIFY(!mergeToolResult(before, edited, loaded));
+        edited = now;
+        edited.media[0].name = "Take 1";
+        QVERIFY(!mergeToolResult(before, edited, loaded));
+    }
+
     void agentLinkEditsTheOpenProject() {
         qputenv("MONTAGE_MCP_LIVE_FILE", dir_.filePath("mcp-live.json").toUtf8());
         QVERIFY(win_->findChild<QAction*>("agentLink") && win_->findChild<QAction*>("agentLinkDialog"));
@@ -10404,25 +10449,50 @@ const auto seq = [this] { return state()->sequence(); };
         }));
         auto length = [&] { return state()->project().findMedia(id)->duration; };
         QVERIFY(std::fabs(length() - 1.0) < 0.01);
-        // Time is the test's: written every 0.8 s for over two seconds, it counts as growing and its length is read.
+        // Its sound, as playback has it.
+        const std::string file = wav.toStdString();
+        QVERIFY(MediaPool::instance().audio(file, 48000));
+        auto heard = [&] {
+            AudioBufferPtr a = MediaPool::instance().audioIfReady(file, 48000);
+            return a ? double(a->frames()) / 48000 : -1.0;
+        };
+        // Time is the test's (put back however the test ends): written every 0.8 s for over two seconds, it counts as
+        // growing and its length is read (on a worker).
         qint64 now = 1000000;
         state()->setClock([&now] { return now; });
+        struct Restore {
+            EditorState* s;
+            ~Restore() {
+                s->setClock({});
+                s->setGrowingRefreshMs(15000);
+            }
+        } restore{state()};
         state()->setGrowingRefreshMs(5000);
+        QSignalSpy refreshed(state(), &EditorState::growingRefreshed);
         const int steps = int(state()->history().undoCount());
+        const uint64_t revision = state()->history().revision();
         for (int i = 0; i < 4; ++i) {
             append(0.5);
             state()->noteMediaFileWritten(wav);
             now += 800;
             state()->checkGrowingMedia();
+            QCOMPARE(state()->isMediaGrowing(id), i == 3);  // (written for 2.4 s by the fourth write)
         }
-        QVERIFY(state()->isMediaGrowing(id));
-        QVERIFY2(std::fabs(length() - 2.5) < 0.01, qPrintable(QString::number(length())));  // (read when it began to count)
+        QTRY_COMPARE(refreshed.size(), 1);
+        QVERIFY2(std::fabs(length() - 3.0) < 0.01, qPrintable(QString::number(length())));
+        // The sound stays playable while it grows, then holds the new part too.
+        QVERIFY(heard() > 0.99);
+        QTRY_VERIFY2(std::fabs(heard() - 3.0) < 0.01, qPrintable(QString::number(heard())));
+        // A fact about the file, not an edit: no undo step, but the project is changed (saved, the length is kept).
+        QCOMPARE(int(state()->history().undoCount()), steps);
+        QVERIFY(state()->history().revision() > revision && state()->isModified());
         auto* bin = win_->findChild<MediaBinWidget*>();
         bin->showBin(QString());
         QApplication::processEvents();
         const QModelIndex row = bin->model()->index(bin->model()->rowOf(id), 0);
         QVERIFY(row.data(Qt::ToolTipRole).toString().contains("Growing"));
-        // Still growing: read again every five seconds, not only once it is quiet; none of it an undo step.
+        QCOMPARE(state()->growingFiles(), QStringList{wav});
+        // Still growing: read again every five seconds, not only once it is quiet.
         for (int i = 0; i < 7; ++i) {
             append(0.25);
             state()->noteMediaFileWritten(wav);
@@ -10430,24 +10500,56 @@ const auto seq = [this] { return state()->sequence(); };
             state()->checkGrowingMedia();
         }
         QVERIFY(state()->isMediaGrowing(id));
-        QVERIFY2(length() > 3.0, qPrintable(QString::number(length())));
+        QTRY_COMPARE(refreshed.size(), 2);
+        QVERIFY2(std::fabs(length() - 4.75) < 0.01, qPrintable(QString::number(length())));
         QCOMPARE(int(state()->history().undoCount()), steps);
+        // Undo after the length was read keeps it (every state undo can bring back has it).
+        QVERIFY(state()->edit("Marker", [](Project&, Sequence& s) {
+            s.markers.push_back(Marker{});
+            return true;
+        }));
+        state()->undo();
+        QVERIFY2(std::fabs(length() - 4.75) < 0.01, qPrintable(QString::number(length())));
+        state()->redo();
+        QVERIFY(std::fabs(length() - 4.75) < 0.01);
+        state()->undo();
         // Stopped: reloaded in full, no longer growing.
         now += 3500;
         state()->checkGrowingMedia();
         QVERIFY(!state()->isMediaGrowing(id));
-        QVERIFY2(std::fabs(length() - (3.0 + 7 * 0.25)) < 0.01, qPrintable(QString::number(length())));
-        // A save in a few quick writes is not growing (it is reloaded once quiet, as before).
-        append(0.1);
+        QVERIFY(state()->growingFiles().isEmpty());
+        QVERIFY2(std::fabs(length() - 4.75) < 0.01, qPrintable(QString::number(length())));
+        // A save in a few writes over a second is not growing (it is reloaded once quiet, as before).
         state()->noteMediaFileWritten(wav);
-        now += 300;
+        now += 500;
         state()->noteMediaFileWritten(wav);
-        now += 1600;
+        now += 500;
+        state()->noteMediaFileWritten(wav);
+        now += 1000;
         state()->checkGrowingMedia();
         QVERIFY(!state()->isMediaGrowing(id));
-        state()->setClock([] { return QDateTime::currentMSecsSinceEpoch(); });
-        state()->setGrowingRefreshMs(15000);
+        now += 600;
+        state()->checkGrowingMedia();
+        QVERIFY(!state()->isMediaGrowing(id));
+        // "Only when they stop": nothing read while it grows.
+        state()->setGrowingRefreshMs(0);
+        refreshed.clear();
+        for (int i = 0; i < 4; ++i) {
+            append(0.25);
+            state()->noteMediaFileWritten(wav);
+            now += 800;
+            state()->checkGrowingMedia();
+        }
+        QVERIFY(state()->isMediaGrowing(id));
+        QTest::qWait(100);
+        QCOMPARE(refreshed.size(), 0);
+        QVERIFY(std::fabs(length() - 4.75) < 0.01);
+        // Another project open while it grows: no longer followed.
         state()->newProject();
+        QVERIFY(state()->growingFiles().isEmpty());
+        now += 3500;
+        state()->checkGrowingMedia();
+        QVERIFY(state()->growingFiles().isEmpty());
     }
 
     void storyboardBin() {

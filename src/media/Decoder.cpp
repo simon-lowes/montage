@@ -244,6 +244,21 @@ bool readEmbeddedCaptions(const std::string& path, Rational fps, std::vector<Cap
     return true;
 }
 
+void copyProbedFacts(MediaItem& to, const MediaItem& from, bool length) {
+    to.width = from.width, to.height = from.height, to.fps = from.fps;
+    to.hasVideo = from.hasVideo, to.hasAudio = from.hasAudio;
+    to.sampleRate = from.sampleRate, to.channels = from.channels, to.audioStreams = from.audioStreams;
+    to.videoCodec = from.videoCodec, to.audioCodec = from.audioCodec;
+    to.stereo = from.stereo;
+    if (length) to.duration = from.duration;
+}
+
+bool sameProbedFacts(const MediaItem& a, const MediaItem& b, bool length) {
+    MediaItem x = a;
+    copyProbedFacts(x, b, length);
+    return x == a;
+}
+
 bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
     Interpretation in;
     parseInterpretation(path, in);

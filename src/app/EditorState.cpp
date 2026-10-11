@@ -371,6 +371,9 @@ void EditorState::watchMediaFiles() {
         if (!watched.contains(p)) added << p;
     if (!gone.isEmpty()) watcher_->removePaths(gone);
     if (!added.isEmpty()) watcher_->addPaths(added);
+    // Files no media uses any more (removed, relinked, another project open) are no longer followed as they grow.
+    for (auto it = growth_.begin(); it != growth_.end();) it = wanted.contains(it->first) ? std::next(it) : growth_.erase(it);
+    if (growth_.empty()) growthTimer_->stop();
 }
 
 void EditorState::reloadChangedMedia(const QStringList& paths) {
@@ -378,27 +381,22 @@ void EditorState::reloadChangedMedia(const QStringList& paths) {
     std::vector<Id> reloaded;
     for (const QString& path : paths) {
         if (!QFileInfo::exists(path)) continue;  // gone (or being replaced): offline until it is back
-        if (!watcher_->files().contains(path)) watcher_->addPath(path);  // replaced by a new file: watch that
         // The media in that file: the file itself, or each of its layers.
         std::set<std::string> mediaPaths;
         for (const MediaItem& m : project_.media)
-            if (!m.path.empty() && mediaFileOnDisk(m.path) == path.toStdString()) mediaPaths.insert(m.path);
+            if (!m.path.empty() && m.kind != MediaKind::Sequence && mediaFileOnDisk(m.path) == path.toStdString()) mediaPaths.insert(m.path);
+        if (mediaPaths.empty()) continue;  // (no media of this project's in it)
+        if (!watcher_->files().contains(path)) watcher_->addPath(path);  // replaced by a new file: watch that
+        ++reloads_[path];
         for (const std::string& p : mediaPaths) {
             MediaPool::instance().forget(p);
             ThumbnailCache::instance().forget(QString::fromStdString(p));
             MediaItem fresh;
             if (!probeMedia(p, fresh)) continue;
-            for (MediaItem& m : project_.media) {
+            applyProbedFacts(p, fresh);
+            for (const MediaItem& m : project_.media) {
                 if (m.path != p) continue;
-                m.width = fresh.width, m.height = fresh.height, m.fps = fresh.fps;
-                m.hasVideo = fresh.hasVideo, m.hasAudio = fresh.hasAudio;
-                m.sampleRate = fresh.sampleRate, m.channels = fresh.channels, m.audioStreams = fresh.audioStreams;
-                m.videoCodec = fresh.videoCodec, m.audioCodec = fresh.audioCodec;
-                m.stereo = fresh.stereo;
-                if (!m.subclipOf) {
-                    m.duration = fresh.duration;
-                    names << QString::fromStdString(m.name);
-                }
+                if (!m.subclipOf) names << QString::fromStdString(m.name);
                 reloaded.push_back(m.id);
             }
             for (const MediaItem& m : project_.media)
@@ -428,6 +426,27 @@ void EditorState::noteMediaFileWritten(const QString& path) {
     if (!growthTimer_->isActive()) growthTimer_->start();
 }
 
+void EditorState::setClock(std::function<qint64()> clock) {
+    clock_ = clock ? std::move(clock) : std::function<qint64()>([] { return QDateTime::currentMSecsSinceEpoch(); });
+}
+
+bool EditorState::applyProbedFacts(const std::string& path, const MediaItem& fresh) {
+    auto apply = [&](Project& p) {
+        bool changed = false;
+        for (MediaItem& m : p.media)
+            if (m.path == path && !sameProbedFacts(m, fresh, !m.subclipOf)) {
+                copyProbedFacts(m, fresh, !m.subclipOf);  // (a subclip's range is its own)
+                changed = true;
+            }
+        return changed;
+    };
+    const bool changed = apply(project_);
+    history_.forEachState(apply);
+    if (gesture_) apply(gesture_->origin);
+    if (changed) history_.touch();  // (saved, or the next open would have the old length)
+    return changed;
+}
+
 void EditorState::checkGrowingMedia() {
     const qint64 now = clock_();
     QStringList refresh, finished, started;
@@ -443,16 +462,17 @@ void EditorState::checkGrowingMedia() {
         } else if (now - g.last >= kPauseMs) {
             it = growth_.erase(it);  // a save in a few writes, reloaded once quiet as any change
             continue;
-        } else if (now - g.first >= kGrowingAfterMs) {
+        } else if (g.last - g.first >= kGrowingAfterMs) {
             g.growing = true;
             g.refreshed = now;
-            refresh << it->first;
+            if (growingRefreshMs_ > 0) refresh << it->first;  // (else only read once it stops)
             started << it->first;
         }
         ++it;
     }
     if (growth_.empty()) growthTimer_->stop();
-    if ((!refresh.isEmpty() && refreshLengths(refresh)) || !started.isEmpty()) emit projectChanged();  // (the bin shows them as growing)
+    if (!refresh.isEmpty()) refreshLengths(refresh);
+    if (!started.isEmpty()) emit projectChanged();  // (the bin shows them as growing)
     if (!started.isEmpty()) {
         QStringList names;
         for (const QString& p : started) names << QFileInfo(p).fileName();
@@ -463,27 +483,69 @@ void EditorState::checkGrowingMedia() {
     if (!finished.isEmpty()) reloadChangedMedia(finished);  // in full now: thumbnails, sound
 }
 
-bool EditorState::refreshLengths(const QStringList& paths) {
-    bool changed = false;
+void EditorState::refreshLengths(const QStringList& paths) {
+    // The media in those files (each layer of a layered file), read on a worker: a recording on slow shared storage can
+    // take a while to open, and the window stays responsive.
+    std::vector<std::string> mediaPaths;
+    QStringList files;
+    std::map<QString, int> reloads;
     for (const QString& path : paths) {
-        std::set<std::string> mediaPaths;
+        if (probing_.count(path)) continue;  // (still being read from last time)
+        std::set<std::string> in;
         for (const MediaItem& m : project_.media)
-            if (!m.path.empty() && m.kind != MediaKind::Sequence && mediaFileOnDisk(m.path) == path.toStdString()) mediaPaths.insert(m.path);
+            if (!m.path.empty() && m.kind != MediaKind::Sequence && mediaFileOnDisk(m.path) == path.toStdString()) in.insert(m.path);
+        if (in.empty()) continue;
+        probing_.insert(path);
+        files << path;
+        reloads[path] = reloads_[path];
+        mediaPaths.insert(mediaPaths.end(), in.begin(), in.end());
+    }
+    if (files.isEmpty()) {
+        QMetaObject::invokeMethod(this, [this] { emit growingRefreshed(false); }, Qt::QueuedConnection);
+        return;
+    }
+    QPointer<EditorState> self(this);
+    const uint64_t generation = projectGeneration_;
+    (void)QtConcurrent::run([self, mediaPaths, files, reloads, generation] {
+        std::vector<std::pair<std::string, MediaItem>> read;
         for (const std::string& p : mediaPaths) {
             MediaItem fresh;
-            if (!probeMedia(p, fresh)) continue;  // (unreadable mid-write: tried again next time)
-            MediaPool::instance().forget(p);  // decoders open again to see the new end
-            for (MediaItem& m : project_.media)
-                if (m.path == p && !m.subclipOf && (std::fabs(m.duration - fresh.duration) > 1e-6 || m.hasVideo != fresh.hasVideo || m.hasAudio != fresh.hasAudio)) {
-                    m.duration = fresh.duration;
-                    m.hasVideo = fresh.hasVideo, m.hasAudio = fresh.hasAudio;
-                    if (fresh.width > 0) m.width = fresh.width, m.height = fresh.height;
-                    if (fresh.fps.valid()) m.fps = fresh.fps;
-                    changed = true;
-                }
+            if (probeMedia(p, fresh)) read.push_back({p, fresh});  // (unreadable mid-write: tried again next time)
         }
-    }
-    return changed;
+        QCoreApplication* app = QCoreApplication::instance();
+        if (!app) return;
+        QMetaObject::invokeMethod(app, [self, read, files, reloads, generation] {
+            if (!self) return;
+            for (const QString& f : files) self->probing_.erase(f);
+            bool changed = false;
+            if (generation == self->projectGeneration_) {
+                for (const auto& [p, fresh] : read) {
+                    const QString file = QString::fromStdString(mediaFileOnDisk(p));
+                    if (reloads.count(file) && self->reloads_[file] != reloads.at(file)) continue;  // (reloaded since: that read is newer)
+                    if (!self->applyProbedFacts(p, fresh)) continue;
+                    changed = true;
+                    // Pictures decoded again to see the new end; the sound read again on a worker, the last read
+                    // playing until then.
+                    MediaPool::instance().forget(p, false);
+                    const Sequence* s = self->sequence();
+                    const int rate = s ? s->sampleRate : 48000;
+                    if (fresh.hasAudio)
+                        (void)QtConcurrent::run([p, rate] {
+                            if (!MediaPool::instance().refreshAudio(p)) MediaPool::instance().audio(p, rate);
+                        });
+                }
+            }
+            if (changed) emit self->projectChanged();
+            emit self->growingRefreshed(changed);
+        }, Qt::QueuedConnection);
+    });
+}
+
+QStringList EditorState::growingFiles() const {
+    QStringList out;
+    for (const auto& [path, g] : growth_)
+        if (g.growing) out << path;
+    return out;
 }
 
 bool EditorState::isMediaGrowing(Id media) const {
@@ -502,7 +564,13 @@ void EditorState::refreshGrowingMedia() {
     QStringList paths;
     for (auto& [path, g] : growth_)
         if (g.growing) paths << path, g.refreshed = clock_();
-    if (!paths.isEmpty() && refreshLengths(paths)) emit projectChanged();
+    if (paths.isEmpty())
+        for (const MediaItem& m : project_.media)
+            if (!m.path.empty() && m.kind != MediaKind::Sequence && !m.subclipOf && m.kind != MediaKind::Image) {
+                const QString f = QString::fromStdString(mediaFileOnDisk(m.path));
+                if (!paths.contains(f) && QFileInfo::exists(f)) paths << f;
+            }
+    refreshLengths(paths);
 }
 
 bool EditorState::isMediaOffline(Id media) const {

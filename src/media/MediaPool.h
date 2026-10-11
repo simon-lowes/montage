@@ -43,8 +43,12 @@ public:
     void setFrameCacheBudget(size_t bytes);
     size_t frameCacheBytes() const;
     void clear();
-    // Drops everything cached for one file (decoded frames, idle decoders, audio and peaks), after it changed on disk.
-    void forget(const std::string& path);
+    // Drops everything cached for one file (decoded frames, idle decoders, audio and peaks), after it changed on disk;
+    // `sound` false keeps its audio and peaks (a file still growing, whose sound refreshAudio replaces when read).
+    void forget(const std::string& path, bool sound = true);
+    // Decodes again the audio cached for a file (every rate and channel choice), replacing each when it is read, so
+    // what plays stays meanwhile; false if none was cached. A decode of it already going is left to finish instead.
+    bool refreshAudio(const std::string& path);
     // The files idle decoders may stay open on (the open project's media). Any other file's decoders are closed now
     // if idle, or as soon as they are released, so a closed project's files are let go even while background jobs
     // finish (on Windows an open file stops its folder being moved or renamed). nullopt (the start) lifts the limit.

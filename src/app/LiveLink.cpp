@@ -22,6 +22,7 @@
 #include "core/History.h"
 #include "core/ProjectIO.h"
 #include "media/Decoder.h"
+#include "media/ImageSequence.h"
 
 namespace montage {
 
@@ -42,11 +43,37 @@ QString canonical(const QString& path) {
     return fi.exists() ? fi.canonicalFilePath() : QDir::cleanPath(fi.absoluteFilePath());
 }
 
-// The project as the link compares it: the playhead and marks set aside, since playback moves them.
+// The project as the link compares it: the playhead and marks set aside, since playback moves them, and what the
+// files say (a growing recording's length is read again while a tool runs, outside any edit).
 Project withoutMarks(Project p) {
     for (Sequence& s : p.sequences) s.playhead = 0, s.inPoint = s.outPoint = -1;
+    const MediaItem blank;
+    for (MediaItem& m : p.media) copyProbedFacts(m, blank, !m.subclipOf);
     return p;
 }
+
+}  // namespace
+
+std::optional<Project> mergeToolResult(const Project& before, const Project& now, Project loaded, std::vector<std::string>* reread) {
+    if (!(withoutMarks(now) == withoutMarks(before))) return std::nullopt;
+    // The editor's playhead and marks stay where they are.
+    for (Sequence& s : loaded.sequences)
+        if (const Sequence* cur = now.findSequence(s.id)) s.playhead = cur->playhead, s.inPoint = cur->inPoint, s.outPoint = cur->outPoint;
+    for (MediaItem& m : loaded.media) {
+        const MediaItem* was = before.findMedia(m.id);
+        const MediaItem* cur = now.findMedia(m.id);
+        if (!was || !cur || m.path != cur->path) continue;
+        if (sameProbedFacts(m, *was, !m.subclipOf)) {
+            copyProbedFacts(m, *cur, !m.subclipOf);  // (read again in Montage, or unchanged)
+        } else if (reread && !m.path.empty() && !sameProbedFacts(m, *cur, !m.subclipOf)) {
+            const std::string file = mediaFileOnDisk(m.path);
+            if (std::find(reread->begin(), reread->end(), file) == reread->end()) reread->push_back(file);
+        }
+    }
+    return loaded;
+}
+
+namespace {
 
 QString trackName(const Sequence& s, Id clip) {
     for (size_t i = 0; i < s.videoTracks.size(); ++i)
@@ -483,13 +510,20 @@ void LiveLink::finish(const Job& job, const QString& tool, const Project& before
             QJsonObject r = toolResult(QStringLiteral("The project was changed in Montage while %1 ran, so its result was not applied. Call it again.").arg(tool), {}, true);
             reply = QJsonObject{{"jsonrpc", "2.0"}, {"id", job.message.value("id")}, {"result", r}};
         } else {
-            Project loaded;
+            Project read;
             std::string err;
-            if (loadProject(path.toStdString(), loaded, &err)) {
-                checkStereoMedia(loaded);
-                // The editor's playhead and marks stay where they are.
-                for (Sequence& s : loaded.sequences)
-                    if (const Sequence* now = state_->project().findSequence(s.id)) s.playhead = now->playhead, s.inPoint = now->inPoint, s.outPoint = now->outPoint;
+            std::vector<std::string> files;
+            std::optional<Project> merged;
+            if (loadProject(path.toStdString(), read, &err)) {
+                checkStereoMedia(read);
+                merged = mergeToolResult(before, state_->project(), std::move(read), &files);
+            }
+            if (merged) {
+                Project& loaded = *merged;
+                // Files the tool read again itself (montage_refresh_media) are reloaded below, so what plays is what
+                // they now hold.
+                QStringList reread;
+                for (const std::string& f : files) reread << QString::fromStdString(f);
                 std::set<Id> had;
                 for (const MediaItem& m : state_->project().media) had.insert(m.id);
                 const auto info = tools_.find(tool);
@@ -501,6 +535,7 @@ void LiveLink::finish(const Job& job, const QString& tool, const Project& before
                 }, job.group);
                 for (const MediaItem& m : state_->project().media)
                     if (!had.count(m.id) && m.hasAudio) state_->startAudioDecode(m);
+                if (!reread.isEmpty()) state_->reloadChangedMedia(reread);
                 emit applied(label);
             }
         }
