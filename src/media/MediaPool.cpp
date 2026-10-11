@@ -1,5 +1,7 @@
 #include "MediaPool.h"
 
+#include <thread>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -186,6 +188,19 @@ AudioBufferPtr MediaPool::audioIfReady(const std::string& path, int sampleRate) 
     std::lock_guard lock(audioM_);
     auto it = audio_.find({path, sampleRate});
     return it == audio_.end() ? nullptr : it->second;
+}
+
+void MediaPool::requestAudio(const std::string& path, int sampleRate) {
+    {
+        std::lock_guard lock(audioM_);
+        const auto key = std::make_pair(path, sampleRate);
+        if (audio_.count(key)) return;
+        const auto now = std::chrono::steady_clock::now();
+        auto it = requested_.find(key);
+        if (it != requested_.end() && now - it->second < std::chrono::seconds(10)) return;
+        requested_[key] = now;
+    }
+    std::thread([this, path, sampleRate] { audio(path, sampleRate); }).detach();
 }
 
 AudioBufferPtr MediaPool::audio(const std::string& path, int sampleRate) {

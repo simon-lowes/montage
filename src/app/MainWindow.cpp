@@ -2162,11 +2162,14 @@ bool MainWindow::openProjectAs(const QString& path, OpenMode mode) {
     appSettings().setValue("lastProjectDir", QFileInfo(path).absolutePath());
     timeline_->zoomToFit();
     statusBar()->showMessage(tr("Opened %1").arg(path), 4000);
-    // Offline files are asked about, unless every one has its proxy here (editing with the proxies alone).
+    // Offline files are asked about, unless every one has its proxy here, with sound where the file has sound
+    // (editing with the proxies alone).
     if (const std::vector<Id> offline = offlineMedia(state_->project()); !offline.empty()) {
         const bool proxied = std::all_of(offline.begin(), offline.end(), [&](Id id) {
             const MediaItem* m = state_->project().findMedia(id);
-            return m && m->kind == MediaKind::Video && !m->proxyPath.empty() && QFileInfo::exists(QString::fromStdString(m->proxyPath));
+            if (!m || m->kind != MediaKind::Video || m->proxyPath.empty() || !QFileInfo::exists(QString::fromStdString(m->proxyPath))) return false;
+            forgetFileFacts(m->proxyPath);  // (looked at afresh: it may have been made again)
+            return !m->hasAudio || fileHasSound(m->proxyPath);
         });
         if (proxied) statusBar()->showMessage(tr("%n file(s) offline: playing from their proxies", nullptr, int(offline.size())), 8000);
         else showLinkMedia();

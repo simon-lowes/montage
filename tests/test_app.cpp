@@ -3156,14 +3156,42 @@ private slots:
         QVERIFY(!win_->findChild<LinkMediaDialog*>("linkMedia"));
         QVERIFY(win_->statusBar()->currentMessage().contains("playing from their proxies"));
         QVERIFY(state()->isMediaOffline(id));
-        // A file without a proxy is still asked about.
+        // A proxy without sound for a file with sound, or no proxy at all, is still asked about.
         state()->newProject();
         bool removed = false;
         QTRY_VERIFY_WITH_TIMEOUT(removed || (removed = QFile::remove(proxy)), 10000);
+        {
+            ProxyOptions silent;
+            silent.format = ProxyFormat::ProResProxy;
+            silent.maxWidth = 0;
+            std::string err;
+            QVERIFY2(createProxy((root + "/B001-away.mp4").toStdString(), proxy.toStdString(), silent, {}, nullptr, &err), err.c_str());
+        }
         QVERIFY(win_->openProject(root + "/cut.montage"));
         auto* dlg = win_->findChild<LinkMediaDialog*>("linkMedia");
         QVERIFY(dlg && dlg->isVisible());
         dlg->close();
+        state()->newProject();
+        removed = false;
+        QTRY_VERIFY_WITH_TIMEOUT(removed || (removed = QFile::remove(proxy)), 10000);
+        QVERIFY(win_->openProject(root + "/cut.montage"));
+        dlg = win_->findChild<LinkMediaDialog*>("linkMedia");
+        QVERIFY(dlg && dlg->isVisible());
+        dlg->close();
+
+        // Two files of the same name (A.mp4 and A.mov) each get their own proxy beside them, made in one go.
+        state()->newProject();
+        QVERIFY(QDir().mkpath(root + "/card2"));
+        QVERIFY(QFile::copy(root + "/B001-away.mp4", root + "/card2/A.mp4"));
+        QVERIFY(QFile::copy(root + "/B001-away.mp4", root + "/card2/A.mov"));
+        const auto pair = state()->importFiles({root + "/card2/A.mp4", root + "/card2/A.mov"});
+        QCOMPARE(pair.size(), size_t(2));
+        bin->createProxies(pair, *options);
+        QTRY_VERIFY_WITH_TIMEOUT(!state()->project().findMedia(pair[0])->proxyPath.empty() && !state()->project().findMedia(pair[1])->proxyPath.empty(), 60000);
+        const std::string pa = state()->project().findMedia(pair[0])->proxyPath, pb = state()->project().findMedia(pair[1])->proxyPath;
+        QVERIFY2(pa != pb, pa.c_str());
+        QVERIFY(QFileInfo::exists(QString::fromStdString(pa)) && QFileInfo::exists(QString::fromStdString(pb)));
+        QCOMPARE(QDir(root + "/card2/Proxy").entryList(QDir::Files).size(), 2);
         appSettings().setValue(QStringLiteral("proxy/where"), "cache");
         appSettings().setValue(QStringLiteral("proxy/format"), "h264");
         appSettings().setValue(QStringLiteral("proxy/sound"), false);

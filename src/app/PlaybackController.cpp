@@ -95,6 +95,7 @@ private:
         RenderOptions o;
         o.scale = r.scale;
         o.useProxies = r.proxies;
+        o.offlineProxies = true;  // (viewing: an offline file plays its proxy)
         o.captions = r.captions;
         o.stereoView = r.stereoView;
         return signalImage(renderProgramFrame(*r.project, *s, t, o));
@@ -132,6 +133,7 @@ private:
         RenderOptions o;
         o.scale = r.scale;
         o.useProxies = r.proxies;
+        o.offlineProxies = true;  // (viewing: an offline file plays its proxy)
         o.captions = r.captions;
         o.stereoView = r.stereoView;
         o.displaySpace = "rec709";  // HDR and wide-gamut sequences are previewed tone mapped to SDR
@@ -241,7 +243,10 @@ private:
 class MixerDevice : public QIODevice {
     Q_OBJECT
 public:
-    explicit MixerDevice(QObject* parent) : QIODevice(parent) { mixer_.setNonBlocking(true); }
+    explicit MixerDevice(QObject* parent) : QIODevice(parent) {
+        mixer_.setNonBlocking(true);
+        mixer_.setOfflineProxies(true);  // (an offline file's proxy is heard while editing)
+    }
 
     void configure(std::shared_ptr<const Project> p, Id seq, int64_t startSample, bool int16) {
         QMutexLocker lock(&m_);
@@ -387,6 +392,7 @@ PlaybackController::PlaybackController(QObject* parent) : QObject(parent) {
     device_ = new MixerDevice(this);
     device_->setAmbisonicBinaural(ambisonicBinaural_);
     scrubMixer_.setAmbisonicBinaural(ambisonicBinaural_);
+    scrubMixer_.setOfflineProxies(true);
     connect(device_, &MixerDevice::levels, this, &PlaybackController::audioLevels);
     connect(device_, &MixerDevice::loudness, this, &PlaybackController::loudness);
     timer_.setTimerType(Qt::PreciseTimer);
@@ -694,6 +700,7 @@ RenderOptions PlaybackController::renderOptions() const {
     RenderOptions o;
     o.scale = scale_;
     o.useProxies = useProxies_;
+    o.offlineProxies = true;
     o.captions = showCaptions_;
     o.stereoView = stereoView_;
     o.displaySpace = "rec709";

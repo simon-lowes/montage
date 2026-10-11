@@ -1,8 +1,8 @@
 // Montage — proxy media (Premiere's and Resolve's proxy workflows, Final Cut's proxy media, Avid's dual-resolution
 // media): lighter copies of camera files to edit with, made here in a choice of formats and sizes, with or without
-// sound, HDR kept where the format can carry it; or the camera's own proxies attached by name. A file that is offline
-// plays from its proxy (its picture, and its sound when the proxy carries sound), so a cut goes on with the proxies
-// alone, as on a laptop away from the camera originals.
+// sound, HDR kept where the format can carry it; or the camera's own proxies attached by name. While editing, a file
+// that is offline plays from its proxy (its picture, and its sound when the proxy carries sound), so a cut goes on
+// with the proxies alone, as on a laptop away from the camera originals; a delivery shows it offline instead.
 #pragma once
 
 #include <atomic>
@@ -14,6 +14,8 @@
 #include "core/Model.h"
 
 namespace montage {
+
+struct ColorSpace;
 
 enum class ProxyFormat {
     H264,         // fast-seeking intra-frame H.264 (.mp4)
@@ -37,11 +39,14 @@ using ProxyProgress = std::function<void(double fraction)>;
 bool createProxy(const std::string& source, const std::string& dest, const ProxyOptions& options, const ProxyProgress& progress = {},
                  const std::atomic<bool>* cancel = nullptr, std::string* error = nullptr);
 
-// The file a media item's picture is read from: its proxy when proxies are on, or when the file itself is offline and
-// a proxy is there; else the file.
-std::string pictureSource(const MediaItem& m, bool useProxies);
-// Its sound: the file, or its proxy when the file is offline and the proxy carries sound.
-std::string soundSource(const MediaItem& m);
+// The file a media item's picture is read from: its proxy when proxies are on and the proxy is there, or (with
+// `offlineProxies`, as viewing asks) when the file itself is offline and a proxy is there; else the file.
+std::string pictureSource(const MediaItem& m, bool useProxies, bool offlineProxies = false);
+// Its sound: the file, or (with `offlineProxies`) its proxy when the file is offline and the proxy carries sound.
+std::string soundSource(const MediaItem& m, bool offlineProxies);
+// The colour space a picture read from `path` is in: the media's own for its file, else what the proxy file says
+// (Rec.709 when it says nothing, as proxies made here from log footage are).
+const ColorSpace& pictureColorSpace(const MediaItem& m, const std::string& path);
 // The file shot analysis reads (visual search and auto-tags, scene cuts, slates; not faces, whose boxes are in the
 // file's pixels): the proxy when one is here at least 640 pixels wide (quicker to read than a camera file, and there
 // when the file is offline), else the file.

@@ -734,13 +734,14 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             convertColor(src, sequenceColorSpace(*nested), sequenceColorSpace(seq), seq.hdrPeakNits);
         } else if (m->kind == MediaKind::Video || m->kind == MediaKind::Image) {
             if (!m->hasVideo && m->kind != MediaKind::Image) return {};
-            std::string path = pictureSource(*m, o.useProxies);  // (an offline file plays its proxy)
+            std::string path = pictureSource(*m, o.useProxies, o.offlineProxies);  // (viewing: an offline file plays its proxy)
             // Stereoscopic footage: the eye being rendered (a clip's Stereo 3D effect can swap them). A proxy holds
-            // the left eye alone (it is made through a flat sequence), so the right eye is always read from the file.
+            // the left eye alone (it is made through a flat sequence), so the right eye is read from the file (or,
+            // with the file offline, both eyes show the proxy).
             if (!m->stereo.empty()) {
                 int eye = o.eye;
                 if (const Effect* s3d = enabledEffect(c, "stereo_3d"); s3d && s3d->p("swap_eyes", lt, 0) > 0.5) eye = 1 - eye;
-                if (eye) path = eyePath(m->path, 1);
+                if (eye && (path == m->path || fileOnline(m->path))) path = eyePath(m->path, 1);
                 // Faces analysed in the left eye sit elsewhere in the right (the eyes' disparity): there they are found
                 // in the picture itself, so Redact Faces never leaves one uncovered.
                 if (eye) reframed = true;
@@ -793,7 +794,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 const bool hq = o.highQuality;
                 const Clip clipCopy = c;
                 // Neighbouring frames in the same working space as the frame the plugin is given.
-                const ColorSpace* from = &mediaColorSpace(*m);
+                const ColorSpace* from = &pictureColorSpace(*m, path);
                 const ColorSpace* to = &sequenceColorSpace(seq);
                 const double peak = seq.hdrPeakNits;
                 ofxFetch = [path, w, h, hq, clipCopy, duration, frameSeconds, seqFps, from, to, peak](double at, Image& out) {
@@ -932,8 +933,8 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     sourceCdl = &e;
                     applyCdlValues(e, lt, src);
                 }
-            // Input transform: the media's space into the sequence's working space.
-            convertColor(src, mediaColorSpace(*m), sequenceColorSpace(seq), seq.hdrPeakNits);
+            // Input transform: the media's space (or its proxy's) into the sequence's working space.
+            convertColor(src, original ? mediaColorSpace(*m) : pictureColorSpace(*m, path), sequenceColorSpace(seq), seq.hdrPeakNits);
         } else {
             return {};
         }
@@ -1733,6 +1734,7 @@ const float* AudioMixer::keySignal(Id trackId, int frames, int64_t keyAt) {
     if (!keyMixer_) {
         keyMixer_ = std::make_unique<AudioMixer>();
         keyMixer_->setNonBlocking(nonBlocking_);
+        keyMixer_->setOfflineProxies(offlineProxies_);
     }
     slot.block = keyBlock_;
     slot.samples.assign(size_t(frames) * 2, 0.0f);
@@ -2185,11 +2187,14 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             }
         } else {
             if (!m->hasAudio) continue;
-            // The file, or the channels the clip plays (an offline file's proxy with sound plays whole).
-            const std::string sound = soundSource(*m);
+            // The file, or the channels the clip plays. When playing an offline file, its proxy's sound (the file's
+            // whole mix, so only for a clip that plays all of it).
+            const std::string sound = c.channels.empty() ? soundSource(*m, offlineProxies_) : m->path;
             const std::string source = sound == m->path ? audioKey(m->path, c.channels) : sound;
             AudioBufferPtr buf = nonBlocking_ ? MediaPool::instance().audioIfReady(source, int(sr))
                                               : MediaPool::instance().audio(source, int(sr));
+            // (A proxy's sound wanted in real time, not decoded yet: decoded in the background for the next blocks.)
+            if (!buf && nonBlocking_ && source != audioKey(m->path, c.channels)) MediaPool::instance().requestAudio(source, int(sr));
             if (!buf || buf->samples.empty()) continue;
             // Noise reduction and voice isolation work on the whole source (the
             // original plays until the cleaned copy is ready in real time).

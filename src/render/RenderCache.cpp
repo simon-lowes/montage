@@ -1,4 +1,5 @@
 #include "RenderCache.h"
+#include "media/Proxy.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -61,7 +62,8 @@ void addClip(QCryptographicHash& h, const Clip& c) {
 }
 
 void addMedia(QCryptographicHash& h, const MediaItem& m, const RenderOptions& o) {
-    const std::string& path = o.useProxies && !m.proxyPath.empty() ? m.proxyPath : m.path;
+    // The file the picture is read from (a proxy attached, made again, or standing in for an offline file changes it).
+    const std::string path = pictureSource(m, o.useProxies, o.offlineProxies);
     const QFileInfo fi(QString::fromStdString(path));
     h.addData(QByteArray::fromStdString(path));
     h.addData(QByteArray::number(fi.size()));

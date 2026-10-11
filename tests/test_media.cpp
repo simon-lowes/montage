@@ -17397,8 +17397,17 @@ private slots:
         QVERIFY(parseProxyFormat("prores_proxy", f) && f == ProxyFormat::ProResProxy);
         QVERIFY(!parseProxyFormat("prores", f));
         QCOMPARE(proxyExtension(ProxyFormat::DnxhrLb), std::string(".mov"));
-        // Audio-only files have no proxy.
+        // Audio-only files have no proxy, and ProRes or DNxHR none in MP4.
         QVERIFY(!createProxy(wav, path("pxtone_proxy.mp4"), ProxyOptions{}, nullptr, nullptr, &err));
+        ProxyOptions inMp4;
+        inMp4.format = ProxyFormat::ProResProxy;
+        QVERIFY(!createProxy(st.path, path("pxsrc_prores.mp4"), inMp4, nullptr, nullptr, &err));
+        QVERIFY(err.find(".mov") != std::string::npos);
+        // Proxies on with the proxy gone: the file (not a blank picture).
+        MediaItem gone;
+        gone.path = st.path;
+        gone.proxyPath = path("pxsrc_deleted_proxy.mp4");
+        QCOMPARE(pictureSource(gone, true), st.path);
 
         // HDR: ProRes and HEVC proxies stay HDR10; H.264 and DNxHR are tone mapped to Rec.709.
         {
@@ -17416,6 +17425,8 @@ private slots:
             hst.audioCodec = "none";
             hst.preset = "ultrafast";
             QVERIFY2(exportSequence(h, hs, hst, nullptr, nullptr, &err), err.c_str());
+            Project hp;
+            MediaItem hm = probeOrFail(hp, hst.path);
             for (ProxyFormat pf : {ProxyFormat::H264, ProxyFormat::ProResProxy, ProxyFormat::DnxhrLb, ProxyFormat::Hevc10}) {
                 ProxyOptions o;
                 o.format = pf;
@@ -17424,6 +17435,10 @@ private slots:
                 Project q;
                 const MediaItem pm = probeOrFail(q, out);
                 QVERIFY2((pm.colorSpace == "rec2100pq") == proxyKeepsHdr(pf), (std::string(proxyFormatName(pf)) + " " + pm.colorSpace).c_str());
+                // A picture read from the proxy is converted from the proxy's own space, the file's from the file's.
+                hm.proxyPath = out;
+                QCOMPARE(pictureColorSpace(hm, out).id == "rec2100pq", proxyKeepsHdr(pf));
+                QCOMPARE(pictureColorSpace(hm, hm.path).id, std::string("rec2100pq"));
             }
         }
 
@@ -17437,24 +17452,55 @@ private slots:
         MediaItem src = probeOrFail(e, moved);
         src.proxyPath = made[ProxyFormat::ProResProxy];
         e.media.push_back(src);
-        QCOMPARE(pictureSource(src, true), src.proxyPath);  // proxies on: the proxy, without looking at the file
+        QCOMPARE(pictureSource(src, true), src.proxyPath);  // proxies on: the proxy
         QVERIFY(QFile::remove(QString::fromStdString(moved)));
-        QCOMPARE(pictureSource(src, false), src.proxyPath);
-        QCOMPARE(soundSource(src), src.proxyPath);
+        QCOMPARE(pictureSource(src, false, true), src.proxyPath);  // viewing an offline file
+        QCOMPARE(pictureSource(src, false), moved);                // delivering: shown offline
+        QCOMPARE(soundSource(src, true), src.proxyPath);
+        QCOMPARE(soundSource(src, false), moved);
         MediaItem silent = src;
         silent.proxyPath = made[ProxyFormat::H264];
-        QCOMPARE(pictureSource(silent, false), silent.proxyPath);
-        QCOMPARE(soundSource(silent), moved);  // (a proxy without sound: the file's, which is not there)
+        QCOMPARE(pictureSource(silent, false, true), silent.proxyPath);
+        QCOMPARE(soundSource(silent, true), moved);  // (a proxy without sound: the file's, which is not there)
         MediaItem none = src;
         none.proxyPath.clear();
-        QCOMPARE(pictureSource(none, false), moved);
+        QCOMPARE(pictureSource(none, false, true), moved);
         QVERIFY(edit::placeMedia(e, es, src.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
-        Image img = renderProgramFrame(e, es, 15, RenderOptions{});
+        RenderOptions viewing;
+        viewing.offlineProxies = true;
+        Image img = renderProgramFrame(e, es, 15, viewing);
         QVERIFY2(img.at(256, 144)[2] > 0.6f && img.at(256, 144)[0] < 0.3f, "the proxy's blue, not Media Offline");
+        // An export shows it offline (the red slate), never the proxy's picture.
+        img = renderProgramFrame(e, es, 15, RenderOptions{});
+        QVERIFY2(img.at(10, 10)[0] > 0.4f && img.at(10, 10)[2] < 0.3f, "Media Offline");
         AudioMixer mixer;
+        mixer.setOfflineProxies(true);
         std::vector<float> out(4800 * 2);
         mixer.mix(e, es, 12000, 4800, out.data());
         QVERIFY2(std::fabs(out[2000] - 0.4f) < 0.02f, qPrintable(QString::number(out[2000])));
+        AudioMixer delivery;
+        std::fill(out.begin(), out.end(), 1.0f);
+        delivery.mix(e, es, 12000, 4800, out.data());
+        QCOMPARE(out[2000], 0.0f);
+        // Playback (not blocking for decodes) asks for the proxy's sound in the background and has it shortly after.
+        {
+            Sequence at44 = es;
+            at44.sampleRate = 44100;  // (not decoded at this rate yet)
+            AudioMixer live;
+            live.setNonBlocking(true);
+            live.setOfflineProxies(true);
+            live.mix(e, at44, 11025, 4410, out.data());
+            QCOMPARE(out[2000], 0.0f);
+            QTRY_VERIFY_WITH_TIMEOUT((live.reset(), live.mix(e, at44, 11025, 4410, out.data()), std::fabs(out[2000] - 0.4f) < 0.02f), 10000);
+        }
+        // A clip playing some of the file's channels does not get the proxy's whole mix.
+        e.active()->audioTracks[0].clips.front().channels = {0};
+        AudioMixer picked;
+        picked.setOfflineProxies(true);
+        std::fill(out.begin(), out.end(), 1.0f);
+        picked.mix(e, es, 12000, 4800, out.data());
+        QCOMPARE(out[2000], 0.0f);
+        e.active()->audioTracks[0].clips.front().channels.clear();
 
         // Shot analysis reads a proxy at least 640 wide (not this 256-wide one).
         QCOMPARE(analysisSource(src), moved);
@@ -17480,6 +17526,10 @@ private slots:
         QVERIFY(QDir().mkpath(cam + "/Sub"));
         QVERIFY(QFile::copy(QString::fromStdString(made[ProxyFormat::H264]), cam + "/Sub/PXSRC_MOVED_Proxy.mp4"));
         QVERIFY(QFile::copy(QString::fromStdString(made[ProxyFormat::H264]), cam + "/other.mp4"));
+        // Not proxies: a name going on without a separator ("A0010" for "A001"), and another original of the project.
+        QVERIFY(QFile::copy(QString::fromStdString(made[ProxyFormat::H264]), cam + "/pxsrc_moved0.mp4"));
+        QVERIFY(QFile::copy(QString::fromStdString(made[ProxyFormat::H264]), cam + "/pxsrc_moved_b.mp4"));
+        e.media.push_back(probeOrFail(e, (cam + "/pxsrc_moved_b.mp4").toStdString()));
         {
             Project g = makeDefaultProject();
             Sequence& gs = *g.active();

@@ -11,6 +11,7 @@ extern "C" {
 #include <chrono>
 #include <cmath>
 #include <mutex>
+#include <set>
 
 #include "core/EditOps.h"
 #include "media/Decoder.h"
@@ -45,6 +46,12 @@ bool proxyKeepsHdr(ProxyFormat f) { return f == ProxyFormat::ProResProxy || f ==
 
 bool createProxy(const std::string& source, const std::string& dest, const ProxyOptions& o, const ProxyProgress& progress,
                  const std::atomic<bool>* cancel, std::string* error) {
+    // ProRes and DNxHR (and their PCM sound) live in QuickTime or MXF, not MP4.
+    const QString ext = QFileInfo(QString::fromStdString(dest)).suffix().toLower();
+    if ((o.format == ProxyFormat::ProResProxy || o.format == ProxyFormat::DnxhrLb) && ext != QLatin1String("mov") && ext != QLatin1String("mxf")) {
+        if (error) *error = "ProRes and DNxHR proxies are .mov files";
+        return false;
+    }
     MediaItem m;
     if (!probeMedia(source, m, error)) return false;
     if (!m.hasVideo || m.kind != MediaKind::Video) {
@@ -119,6 +126,7 @@ std::map<std::string, Seen> gOnline;
 struct Probed {
     bool sound = false;
     int width = 0;
+    std::string colorSpace;
 };
 std::map<std::string, Probed> gProbed;
 
@@ -130,7 +138,7 @@ Probed probed(const std::string& path) {
     }
     MediaItem m;
     Probed out;
-    if (probeMedia(path, m)) out = {m.hasAudio, m.hasVideo ? m.width : 0};
+    if (probeMedia(path, m)) out = {m.hasAudio, m.hasVideo ? m.width : 0, m.colorSpace};
     std::lock_guard lock(gSeenMutex);
     gProbed[path] = out;
     return out;
@@ -162,15 +170,22 @@ void forgetFileFacts(const std::string& path) {
     gProbed.erase(path);
 }
 
-std::string pictureSource(const MediaItem& m, bool useProxies) {
+std::string pictureSource(const MediaItem& m, bool useProxies, bool offlineProxies) {
     if (m.proxyPath.empty()) return m.path;
-    if (useProxies) return m.proxyPath;
-    return !fileOnline(m.path) && fileOnline(m.proxyPath) ? m.proxyPath : m.path;
+    const bool here = fileOnline(m.proxyPath);
+    if (useProxies && here) return m.proxyPath;  // (a proxy that is gone: the file)
+    return offlineProxies && here && !fileOnline(m.path) ? m.proxyPath : m.path;
 }
 
-std::string soundSource(const MediaItem& m) {
-    if (m.proxyPath.empty() || fileOnline(m.path) || !fileOnline(m.proxyPath)) return m.path;
+std::string soundSource(const MediaItem& m, bool offlineProxies) {
+    if (!offlineProxies || m.proxyPath.empty() || fileOnline(m.path) || !fileOnline(m.proxyPath)) return m.path;
     return fileHasSound(m.proxyPath) ? m.proxyPath : m.path;
+}
+
+const ColorSpace& pictureColorSpace(const MediaItem& m, const std::string& path) {
+    if (m.proxyPath.empty() || path != m.proxyPath) return mediaColorSpace(m);
+    const ColorSpace* c = findColorSpace(probed(path).colorSpace);
+    return c ? *c : rec709Space();
 }
 
 std::string analysisSource(const MediaItem& m) {
@@ -179,13 +194,18 @@ std::string analysisSource(const MediaItem& m) {
 }
 
 std::map<Id, std::string> findCameraProxies(const Project& p, const std::vector<Id>& media, const std::string& folder) {
+    // The project's own files are originals, never another's proxy (a multicam shoot's "Scene1_CamB" for "Scene1").
+    std::set<QString> originals;
+    for (const MediaItem& m : p.media)
+        if (!m.path.empty()) originals.insert(QFileInfo(QString::fromStdString(mediaFileOnDisk(m.path))).absoluteFilePath());
     // The folder's video files once, by lower-case name.
     std::vector<std::pair<QString, QString>> files;  // (base name lower-case, path)
     QDirIterator it(QString::fromStdString(folder), QDir::Files, QDirIterator::Subdirectories);
     static const QStringList kVideo = {"mp4", "mov", "mxf", "m4v", "mkv", "avi", "mts", "m2ts"};
     while (it.hasNext()) {
         const QFileInfo fi(it.next());
-        if (kVideo.contains(fi.suffix().toLower())) files.push_back({fi.completeBaseName().toLower(), fi.absoluteFilePath()});
+        if (kVideo.contains(fi.suffix().toLower()) && !originals.count(fi.absoluteFilePath()))
+            files.push_back({fi.completeBaseName().toLower(), fi.absoluteFilePath()});
     }
     std::map<Id, std::string> found;
     for (Id id : media) {
@@ -193,15 +213,21 @@ std::map<Id, std::string> findCameraProxies(const Project& p, const std::vector<
         if (!m || m->kind != MediaKind::Video || m->path.empty() || m->subclipOf) continue;
         const QFileInfo original(QString::fromStdString(mediaFileOnDisk(m->path)));
         const QString name = original.completeBaseName().toLower();
-        // The closest name first (exactly the same, then the shortest that begins with it), its length checked.
+        // The closest name first (exactly the same, then the shortest that begins with it and goes on after a
+        // separator: "A001_Proxy" or "A001 S03" for "A001", never "A0010"), its length and shape checked.
         std::vector<std::pair<QString, QString>> candidates;
         for (const auto& f : files)
-            if (f.first.startsWith(name) && QFileInfo(f.second).absoluteFilePath() != original.absoluteFilePath()) candidates.push_back(f);
+            if (f.first.startsWith(name) && (f.first.size() == name.size() || !f.first.at(name.size()).isLetterOrNumber()) &&
+                f.second != original.absoluteFilePath())
+                candidates.push_back(f);
         std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) { return a.first.size() < b.first.size(); });
         for (const auto& c : candidates) {
             MediaItem probe;
             if (!probeMedia(c.second.toStdString(), probe) || !probe.hasVideo) continue;
             if (m->duration > 0 && std::fabs(probe.duration - m->duration) > 1.0) continue;
+            if (m->width > 0 && m->height > 0 && probe.width > 0 && probe.height > 0 &&
+                std::fabs(double(probe.width) / probe.height - double(m->width) / m->height) > 0.03 * double(m->width) / m->height)
+                continue;  // (another shape: not this shot)
             found[id] = c.second.toStdString();
             break;
         }
