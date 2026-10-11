@@ -350,16 +350,19 @@ QMimeData* MediaBinModel::mimeData(const QModelIndexList& indexes) const {
     QStringList ids;
     std::set<int> rows;
     const double fps = state_->sequence() ? state_->sequence()->fpsValue() : 30.0;
-    for (const QModelIndex& i : indexes) {
-        if (!rows.insert(i.row()).second) continue;
-        const MediaItem* m = state_->project().findMedia(mediaAt(i.row()));
+    std::vector<Id> picked;
+    for (const QModelIndex& i : indexes)
+        if (rows.insert(i.row()).second) picked.push_back(mediaAt(i.row()));
+    if (dragOrder_) picked = dragOrder_(picked);
+    for (Id id : picked) {
+        const MediaItem* m = state_->project().findMedia(id);
         if (m && m->subclipOf) {
             // A subclip places its media's range: "media:in:out:subclip", in sequence frames.
             const FrameTime in = FrameTime(std::floor(m->subclipIn * fps + 1e-6));
             const FrameTime out = std::max(in, FrameTime(std::ceil(m->subclipOut * fps - 1e-6)) - 1);
             ids << QStringLiteral("%1:%2:%3:%4").arg(m->subclipOf).arg(in).arg(out).arg(m->id);
         } else {
-            ids << QString::number(mediaAt(i.row()));
+            ids << QString::number(id);
         }
     }
     auto* m = new QMimeData;

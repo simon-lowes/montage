@@ -6,6 +6,7 @@
 
 #include <QAbstractTableModel>
 #include <QPixmap>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -58,6 +59,8 @@ public:
     QStringList mimeTypes() const override;
     QMimeData* mimeData(const QModelIndexList& indexes) const override;
     Qt::DropActions supportedDragActions() const override { return Qt::CopyAction | Qt::MoveAction; }
+    // The order dragged media go in (the Board view's storyboard order); unset, the order they were picked in.
+    void setDragOrder(std::function<std::vector<Id>(const std::vector<Id>&)> order) { dragOrder_ = std::move(order); }
 
 private:
     QPixmap thumbnail(const MediaItem& m) const;
@@ -65,6 +68,7 @@ private:
     QString toolTip(const MediaItem& m) const;
 
     EditorState* state_;
+    std::function<std::vector<Id>(const std::vector<Id>&)> dragOrder_;
     std::vector<Id> ids_;
     std::map<Id, int> usage_;
     mutable std::map<Id, QPixmap> thumbs_;  // real thumbnails, once decoded

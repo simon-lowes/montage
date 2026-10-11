@@ -30,6 +30,7 @@
 #include "core/Checkerboard.h"
 #include "core/EditOps.h"
 #include "core/GraphicsTemplate.h"
+#include "core/Storyboard.h"
 #include "core/GradeVersions.h"
 #include "core/EffectPresets.h"
 #include "core/Effects.h"
@@ -500,6 +501,89 @@ private slots:
                 if (edit::locate(is2, l)->track.kind == TrackKind::Audio) ++sounds;
             QCOMPARE(sounds, 1);
         }
+    }
+
+    void storyboard() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        const double fps = s.fpsValue();
+        std::vector<Id> ids;
+        for (const char* name : {"A", "B", "C", "D", "E"}) {
+            MediaItem m;
+            m.id = p.newId();
+            m.name = name;
+            m.kind = MediaKind::Video;
+            m.hasVideo = m.hasAudio = true;
+            m.path = std::string("/nowhere/") + name + ".mov";
+            m.duration = 2;
+            m.fps = s.fps;
+            m.width = s.width, m.height = s.height;
+            p.media.push_back(m);
+            ids.push_back(m.id);
+        }
+        const Id A = ids[0], B = ids[1], C = ids[2], D = ids[3], E = ids[4];
+        // Nothing placed: the order given.
+        QCOMPARE(storyboardOrder(p, ids), ids);
+        // Rows top to bottom (C, a little lower, still in B's row), left to right; E, not placed, last.
+        p.findMedia(A)->board = {2, 0, true};
+        p.findMedia(B)->board = {0, 0, true};
+        p.findMedia(C)->board = {1, 0.3, true};
+        p.findMedia(D)->board = {0, 1.2, true};
+        QCOMPARE(storyboardOrder(p, ids), (std::vector<Id>{B, C, A, D, E}));
+        QCOMPARE(storyboardOrder(p, {E, A, B}), (std::vector<Id>{B, A, E}));
+        // Laid out: the placed where they are, E in the first row clear of D (which reaches 2.2).
+        const auto spots = boardLayout(p, ids, 3);
+        QCOMPARE(spots.at(C).y, 0.3);
+        QVERIFY(spots.at(C).placed && !spots.at(E).placed);
+        QCOMPARE(spots.at(E).x, 0.0);
+        QCOMPARE(spots.at(E).y, 3.0);
+        QCOMPARE(boardLayout(p, {E}, 3).at(E).y, 0.0);  // alone, from the top
+        // Saved and loaded (only placed media keep a spot).
+        QTemporaryDir dir;
+        const std::string file = (dir.path() + "/b.montage").toStdString();
+        QVERIFY(saveProject(p, file));
+        Project back;
+        QVERIFY(loadProject(file, back));
+        QCOMPARE(back.findMedia(C)->board, p.findMedia(C)->board);
+        QVERIFY(!back.findMedia(E)->board.placed);
+        // Arranged in a grid two wide, in storyboard order.
+        arrangeStoryboard(p, storyboardOrder(p, ids), 2);
+        QCOMPARE(p.findMedia(B)->board, (BoardSpot{0, 0, true}));
+        QCOMPARE(p.findMedia(C)->board, (BoardSpot{1, 0, true}));
+        QCOMPARE(p.findMedia(A)->board, (BoardSpot{0, 1, true}));
+        QCOMPARE(p.findMedia(E)->board, (BoardSpot{0, 2, true}));
+        QCOMPARE(storyboardOrder(p, ids), (std::vector<Id>{B, C, A, D, E}));
+
+        // Assembled from frame 10: one after another, picture and sound linked, a subclip as its range.
+        MediaItem sub;
+        sub.id = p.newId();
+        sub.name = "A middle";
+        sub.kind = MediaKind::Video;
+        sub.subclipOf = A;
+        sub.subclipIn = 0.5, sub.subclipOut = 1.5;
+        p.media.push_back(sub);
+        const FrameTime two = FrameTime(std::llround(2 * fps)), one = FrameTime(std::llround(fps));
+        edit::Result r = assembleStoryboard(p, s, {B, sub.id, A}, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        QVERIFY2(r.ok, r.error.c_str());
+        QCOMPARE(r.created.size(), size_t(6));
+        const Track& v1 = s.videoTracks[0];
+        QCOMPARE(v1.clips.size(), size_t(3));
+        QCOMPARE(v1.clips[0].mediaId, B);
+        QCOMPARE(v1.clips[0].start, FrameTime(10));
+        QCOMPARE(v1.clips[1].mediaId, A);  // the subclip plays A's range
+        QCOMPARE(v1.clips[1].start, 10 + two);
+        QCOMPARE(v1.clips[1].duration, one);
+        QCOMPARE(v1.clips[1].sourceIn, std::floor(0.5 * fps + 1e-6));
+        QCOMPARE(v1.clips[2].start, 10 + two + one);
+        QCOMPARE(s.audioTracks[0].clips.size(), size_t(3));
+        QVERIFY(v1.clips[0].linkGroup && v1.clips[0].linkGroup == s.audioTracks[0].clips[0].linkGroup);
+        // Inserted: what was after the playhead moves along by their length.
+        const FrameTime end = s.duration();
+        r = assembleStoryboard(p, s, {C, D}, 10 + two, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, true);
+        QVERIFY2(r.ok, r.error.c_str());
+        QCOMPARE(s.duration(), end + 2 * two);
+        QCOMPARE(edit::clipById(s, r.created[0])->start, 10 + two);
+        QVERIFY(!assembleStoryboard(p, s, {}, 0, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
     }
 
     void gzipAndTar() {

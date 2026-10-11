@@ -92,6 +92,7 @@
 #include "media/Psd.h"
 #include "media/MicBleed.h"
 #include "core/GraphicsTemplate.h"
+#include "core/Storyboard.h"
 #include "render/ProjectManager.h"
 #include "PsdWriter.h"
 #include "render/AutoBroll.h"
@@ -9024,6 +9025,77 @@ private slots:
         QCOMPARE(replaced.findMedia(a.id)->name, std::string("c.mp4"));
         QCOMPARE(replaced.findMedia(subItem.id)->path, path("relink/c.mp4"));
         QCOMPARE(replaced.active()->videoTracks[0].clips.size(), size_t(1));
+    }
+
+    void storyboardOverMcp() {
+        // Three stills in a project's top bin.
+        QDir().mkpath(QString::fromStdString(path("mcp-board")));
+        Project p = makeDefaultProject();
+        std::vector<Id> ids;
+        for (const char* name : {"one", "two", "three"}) {
+            QImage img(64, 36, QImage::Format_RGB32);
+            img.fill(Qt::darkGreen);
+            const std::string f = path((std::string("mcp-board/") + name + ".png").c_str());
+            QVERIFY(img.save(QString::fromStdString(f)));
+            MediaItem m = probeOrFail(p, f);
+            m.name = name;
+            p.media.push_back(m);
+            ids.push_back(m.id);
+        }
+        const QString project = QString::fromStdString(path("mcp-board/b.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_storyboard"}, {"arguments", args}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto data = [](const QJsonObject& r) { return r.value("structuredContent").toObject(); };
+        auto order = [&](const QJsonObject& r) {
+            std::vector<Id> o;
+            for (const QJsonValue& v : data(r).value("order").toArray()) o.push_back(Id(v.toDouble()));
+            return o;
+        };
+        // Nothing placed: laid out in rows in project order.
+        QJsonObject r = call({{"action", "board"}, {"columns", 2}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(order(r), ids);
+        QCOMPARE(data(r).value("items").toArray()[2].toObject().value("y").toDouble(), 1.0);
+        QVERIFY(!data(r).value("items").toArray()[0].toObject().value("placed").toBool());
+        // "three" moved to the front of the first row: the reading order follows.
+        r = call({{"action", "move"}, {"spots", QJsonArray{QJsonObject{{"media", "three"}, {"x", 0}, {"y", 0}},
+                                                           QJsonObject{{"media", double(ids[0])}, {"x", 1}, {"y", 0.2}},
+                                                           QJsonObject{{"media", "two"}, {"x", 0}, {"y", 1}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call({{"action", "board"}});
+        QCOMPARE(order(r), (std::vector<Id>{ids[2], ids[0], ids[1]}));
+        QVERIFY(call({{"action", "move"}, {"spots", QJsonArray{QJsonObject{{"media", "nothing"}, {"x", 0}, {"y", 0}}}}}).value("isError").toBool());
+        // Arranged in one column, in that order.
+        r = call({{"action", "arrange"}, {"columns", 1}});
+        QVERIFY(!r.value("isError").toBool());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.findMedia(ids[2])->board.y, 0.0);
+        QCOMPARE(back.findMedia(ids[0])->board.y, 1.0);
+        QCOMPARE(back.findMedia(ids[1])->board.y, 2.0);
+        // Assembled in storyboard order from 2 s; named media too, in board order unless keep_order.
+        r = call({{"action", "assemble"}, {"at", 2}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(data(r).value("clips").toArray().size(), 3);
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Track& v1 = back.active()->videoTracks[0];
+        QCOMPARE(v1.clips.size(), size_t(3));
+        QCOMPARE(v1.clips[0].mediaId, ids[2]);
+        QCOMPARE(v1.clips[0].start, FrameTime(std::llround(2 * back.active()->fpsValue())));
+        QCOMPARE(v1.clips[2].mediaId, ids[1]);
+        r = call({{"action", "assemble"}, {"media", QJsonArray{"two", "one"}}, {"video_track", "V2"}, {"keep_order", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->videoTracks[1].clips.front().mediaId, ids[1]);
+        QVERIFY(call({{"action", "assemble"}, {"video_track", "A1"}}).value("isError").toBool());
+        QVERIFY(call({{"action", "nonsense"}}).value("isError").toBool());
     }
 
     void luaScripts() {

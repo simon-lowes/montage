@@ -28,6 +28,7 @@
 #include "core/SpellCheck.h"
 #include "core/ColorGroups.h"
 #include "core/GraphicsTemplate.h"
+#include "core/Storyboard.h"
 #include "render/ExtendClip.h"
 #include "render/ReviewExport.h"
 #include "render/RoomTone.h"
@@ -5562,6 +5563,96 @@ void McpServer::Impl::addTools() {
                           .arg(ducked),
                       QJsonObject{{"captions_track", english}, {"audio_track", QStringLiteral("A%1").arg(dub.index + 1)}, {"clips", placed},
                                   {"ducked", ducked}, {"first", sample}});
+        });
+
+    add("montage_storyboard", "Storyboard a bin",
+        "The storyboard (Premiere's Freeform view, Avid's Frame view): a bin's media as thumbnails placed freely on a board, "
+        "positions in thumbnail cells (x across, y down), read in rows top to bottom and left to right. board lists a bin's "
+        "media with their spots (those not placed yet are laid out after the rest) and that reading order; move puts media "
+        "at spots; arrange lays a bin's media (or those named) in a grid `columns` wide in their current order; assemble puts "
+        "media (default: the bin's, in storyboard order; named media keep their storyboard order unless keep_order) into "
+        "the active sequence one after another from `at`, inserted or over what is there.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "action":{"type":"string","enum":["board","move","arrange","assemble"]},
+            "bin":{"type":"string","description":"Bin path (\"\" or left out: the top level)"},
+            "media":{"type":"array","items":{"type":["string","number"]},"description":"Media names, files or ids"},
+            "spots":{"type":"array","items":{"type":"object","properties":{"media":{"type":["string","number"]},"x":{"type":"number"},"y":{"type":"number"}},"required":["media","x","y"]}},
+            "columns":{"type":"integer","minimum":1,"default":6},
+            "at":{"type":["number","string"],"description":"Where assembling starts (default 0)"},
+            "insert":{"type":"boolean","default":false},
+            "keep_order":{"type":"boolean","default":false,"description":"Assemble the named media in the order given"},
+            "video_track":{"type":"string","default":"V1"},"audio_track":{"type":"string","default":"A1"}},
+            "required":["project","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const QString action = need(a, "action");
+            auto mediaRef = [&](const QJsonValue& v) -> MediaItem& {
+                if (v.isDouble()) {
+                    if (MediaItem* m = l.project.findMedia(Id(v.toDouble()))) return *m;
+                    throw ArgError{QStringLiteral("No media with id %1").arg(v.toDouble(), 0, 'f', 0)};
+                }
+                return projectMedia(l.project, v.toString());
+            };
+            const std::string bin = a.value("bin").toString().toStdString();
+            std::vector<Id> binMedia;
+            for (const MediaItem& m : l.project.media)
+                if (m.bin == bin && !(m.kind == MediaKind::Sequence && l.project.findSequence(m.sequenceId) == &l.seq())) binMedia.push_back(m.id);
+            std::vector<Id> named;
+            for (const QJsonValue& v : a.value("media").toArray()) named.push_back(mediaRef(v).id);
+            const int columns = std::max(1, a.value("columns").toInt(6));
+            auto boardJson = [&](const std::vector<Id>& ids) {
+                const std::map<Id, BoardSpot> spots = boardLayout(l.project, ids, columns);
+                QJsonArray items, order;
+                for (Id id : storyboardOrder(l.project, ids)) {
+                    const MediaItem* m = l.project.findMedia(id);
+                    const BoardSpot& b = spots.at(id);
+                    items.append(QJsonObject{{"media", double(id)}, {"name", QString::fromStdString(m->name)}, {"x", b.x}, {"y", b.y}, {"placed", b.placed}});
+                    order.append(double(id));
+                }
+                return QJsonObject{{"items", items}, {"order", order}};
+            };
+            if (action == "board") {
+                const QJsonObject o = boardJson(named.empty() ? binMedia : named);
+                return ok(QStringLiteral("%1 item(s) on the board").arg(o.value("items").toArray().size()), o);
+            }
+            if (action == "move") {
+                const QJsonArray spots = a.value("spots").toArray();
+                if (spots.isEmpty()) throw ArgError{"\"spots\" is required: [{media, x, y}]"};
+                std::vector<Id> moved;
+                for (const QJsonValue& v : spots) {
+                    const QJsonObject o = v.toObject();
+                    if (!o.value("x").isDouble() || !o.value("y").isDouble()) throw ArgError{"each spot needs numbers x and y"};
+                    MediaItem& m = mediaRef(o.value("media"));
+                    m.board = {std::max(0.0, o.value("x").toDouble()), std::max(0.0, o.value("y").toDouble()), true};
+                    moved.push_back(m.id);
+                }
+                save(l);
+                return ok(QStringLiteral("Moved %1").arg(moved.size()), boardJson(moved));
+            }
+            if (action == "arrange") {
+                const std::vector<Id> ids = storyboardOrder(l.project, named.empty() ? binMedia : named);
+                if (ids.empty()) throw ArgError{"Nothing to arrange in that bin"};
+                arrangeStoryboard(l.project, ids, columns);
+                save(l);
+                return ok(QStringLiteral("Arranged %1 in rows of %2").arg(ids.size()).arg(columns), boardJson(ids));
+            }
+            if (action == "assemble") {
+                Sequence& s = l.seq();
+                std::vector<Id> ids = named.empty() ? binMedia : named;
+                if (!(a.value("keep_order").toBool() && !named.empty())) ids = storyboardOrder(l.project, ids);
+                if (ids.empty()) throw ArgError{"Nothing to assemble in that bin"};
+                const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : 0;
+                const TrackRef v = trackArg(a.value("video_track").toString("V1"), s, true, &l.project, &s);
+                const TrackRef au = trackArg(a.value("audio_track").toString("A1"), s, true, &l.project, &s);
+                if (v.kind != TrackKind::Video || au.kind != TrackKind::Audio) throw ArgError{"video_track must be a video track and audio_track an audio track"};
+                const edit::Result r = assembleStoryboard(l.project, s, ids, at, v, au, a.value("insert").toBool());
+                check(r);
+                save(l);
+                QJsonArray clips;
+                for (Id c : r.created) clips.append(double(c));
+                return ok(QStringLiteral("Assembled %1 item(s) from %2").arg(ids.size()).arg(tc(at, l.seq())), QJsonObject{{"clips", clips}});
+            }
+            throw ArgError{"\"action\" must be board, move, arrange or assemble"};
         });
 
     add("montage_log_media", "Log media",

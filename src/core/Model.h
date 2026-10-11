@@ -154,6 +154,12 @@ struct MediaItem {
     // that item (with this range), so only bins, logging and search see it.
     Id subclipOf = 0;
     double subclipIn = 0, subclipOut = 0;  // seconds of the parent media
+    // Where it sits on its bin's storyboard (core/Storyboard.h: Premiere's Freeform view), in thumbnail cells.
+    struct BoardSpot {
+        double x = 0, y = 0;
+        bool placed = false;
+        bool operator==(const BoardSpot&) const = default;
+    } board;
     bool operator==(const MediaItem&) const = default;
 };
 

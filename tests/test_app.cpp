@@ -90,6 +90,7 @@
 #include "EffectPresetStore.h"
 #include "EffectsBrowser.h"
 #include "MediaBinWidget.h"
+#include "StoryboardView.h"
 #include "StackedTimelineWidget.h"
 #include "SmartBinDialog.h"
 #include "ScriptCutDialog.h"
@@ -10180,6 +10181,86 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY2(offered.contains(QStringLiteral("Publish to Graphic…")), qPrintable(offered.join(", ")));
         state()->setActiveSequence(main);
         qunsetenv("MONTAGE_TEMPLATES_DIR");
+        state()->newProject();
+    }
+
+    void storyboardBin() {
+        state()->newProject();
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        QVERIFY(bin && win_->findChild<QToolButton*>("boardViewButton"));
+        std::vector<Id> ids;
+        QVERIFY(state()->edit("Media", [&](Project& p, Sequence& s) {
+            for (const char* name : {"one", "two", "three"}) {
+                MediaItem m;
+                m.id = p.newId();
+                m.name = name;
+                m.kind = MediaKind::Video;
+                m.hasVideo = m.hasAudio = true;
+                m.path = (dir_.path() + "/missing-" + name + ".mov").toStdString();
+                m.duration = 1;
+                m.fps = s.fps;
+                m.width = s.width, m.height = s.height;
+                p.media.push_back(m);
+                ids.push_back(m.id);
+            }
+            return true;
+        }));
+        bin->showBin(QString());
+        bin->setView(MediaBinWidget::View::Board);
+        QApplication::processEvents();
+        StoryboardView* board = bin->board();
+        QCOMPARE(board->shownInOrder(), ids);  // nothing placed yet: as listed
+        auto indexOf = [&](Id id) {
+            for (int r = 0; r < board->model()->rowCount(); ++r)
+                if (Id(board->model()->index(r, 0).data(MediaBinModel::IdRole).toULongLong()) == id) return board->model()->index(r, 0);
+            return QModelIndex();
+        };
+        // Moved about (three first, one last): saved as one undo step, in cells.
+        const QSize cell = board->cellSize();
+        board->moveThumbnail(indexOf(ids[0]), QPoint(2 * cell.width(), 0));
+        board->moveThumbnail(indexOf(ids[1]), QPoint(cell.width(), cell.height() / 4));
+        board->moveThumbnail(indexOf(ids[2]), QPoint(0, 0));
+        const int steps = int(state()->history().undoCount());
+        QVERIFY(board->saveBoard("Arrange Storyboard"));
+        QCOMPARE(int(state()->history().undoCount()), steps + 1);
+        QVERIFY(!board->saveBoard("Arrange Storyboard"));  // nothing moved since
+        QCOMPARE(board->shownInOrder(), (std::vector<Id>{ids[2], ids[1], ids[0]}));
+        QCOMPARE(state()->project().findMedia(ids[0])->board, (MediaItem::BoardSpot{2, 0, true}));
+        QCOMPARE(state()->project().findMedia(ids[1])->board.y, 0.25);
+        // Kept where they are when the bin is rebuilt, and at twice the size, twice as far apart.
+        bin->rebuild();
+        QApplication::processEvents();
+        QCOMPARE(board->thumbnailAt(indexOf(ids[0])), QPoint(2 * cell.width(), 0));
+        const int width = board->thumbnailWidth();
+        board->setThumbnailWidth(width * 2);
+        QCOMPARE(board->thumbnailAt(indexOf(ids[0])).x(), 2 * board->cellSize().width());
+        board->setThumbnailWidth(width);
+        // Dragged out in storyboard order, whatever order they were picked in.
+        std::unique_ptr<QMimeData> mime(board->model()->mimeData({indexOf(ids[0]), indexOf(ids[2])}));
+        QCOMPARE(QString::fromUtf8(mime->data("application/x-montage-media")), QStringLiteral("%1,%2").arg(ids[2]).arg(ids[0]));
+        // Assembled at the playhead on the targeted tracks, in that order, one undo step.
+        bin->selectMedia({});
+        state()->setPlayhead(12);
+        const std::vector<Id> made = bin->assembleStoryboard(false);
+        QCOMPARE(made.size(), size_t(6));
+        const Track& v1 = state()->sequence()->videoTracks[size_t(state()->targetVideoTrack())];
+        QCOMPARE(v1.clips.size(), size_t(3));
+        QCOMPARE(v1.clips[0].start, FrameTime(12));
+        QCOMPARE(v1.clips[0].mediaId, ids[2]);
+        QCOMPARE(v1.clips[1].mediaId, ids[1]);
+        QCOMPARE(v1.clips[2].mediaId, ids[0]);
+        state()->undo();
+        QVERIFY(state()->sequence()->videoTracks[0].clips.empty());
+        // Only the selection, in board order.
+        bin->selectMedia({ids[0], ids[1]});
+        QCOMPARE(bin->assembleStoryboard(false).size(), size_t(4));
+        QCOMPARE(state()->sequence()->videoTracks[0].clips[0].mediaId, ids[1]);
+        state()->undo();
+        // Arrange in Grid: rows as wide as the view, in storyboard order, one undo step.
+        QVERIFY(bin->arrangeBoard());
+        QCOMPARE(state()->project().findMedia(ids[2])->board, (MediaItem::BoardSpot{0, 0, true}));
+        QCOMPARE(board->shownInOrder(), (std::vector<Id>{ids[2], ids[1], ids[0]}));
+        bin->setView(MediaBinWidget::View::Icons);
         state()->newProject();
     }
 

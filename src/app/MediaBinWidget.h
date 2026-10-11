@@ -24,6 +24,7 @@ namespace montage {
 
 class EditorState;
 class MediaBinModel;
+class StoryboardView;
 
 // The bin tree: media dropped on a bin move into it, bins dropped on a bin
 // move inside it, and files dropped on a bin are imported into it.
@@ -56,7 +57,7 @@ private:
 class MediaBinWidget : public QWidget {
     Q_OBJECT
 public:
-    enum class View { Icons, List };
+    enum class View { Icons, List, Board };
 
     explicit MediaBinWidget(EditorState* state, QWidget* parent = nullptr);
 
@@ -124,6 +125,12 @@ public:
     bool interpretFootage(const std::vector<Id>& media, const Interpretation& how, bool keepHighlights = false);
     // The Interpret Footage dialog for `media`, applied when accepted.
     void interpretFootageDialog(const std::vector<Id>& media);
+    // The Board view (core/Storyboard.h; Premiere's Freeform view): the shown media put in a grid in storyboard order,
+    // one undo step; and the selection (or everything shown) assembled into the open sequence at the playhead on the
+    // targeted tracks in storyboard order, inserted or over what is there, one undo step (the clips made).
+    bool arrangeBoard();
+    std::vector<Id> assembleStoryboard(bool insert);
+    StoryboardView* board() const { return board_; }
 
 public slots:
     void importDialog();
@@ -168,9 +175,11 @@ private:
     QStackedWidget* stack_;
     QListView* icons_;
     QTreeView* list_;
+    StoryboardView* board_;
     QLineEdit* search_;
     QToolButton* iconsBtn_;
     QToolButton* listBtn_;
+    QToolButton* boardBtn_;
     View view_ = View::Icons;
     bool hoverScrub_ = true;
     QString bin_;

@@ -51,6 +51,8 @@
 #include "EditorState.h"
 #include "media/DualSystem.h"
 #include "MediaBinModel.h"
+#include "StoryboardView.h"
+#include "core/Storyboard.h"
 #include "ModelPacks.h"
 #include "ShotSearchPanel.h"
 #include "SmartBinDialog.h"
@@ -252,10 +254,13 @@ MediaBinWidget::MediaBinWidget(EditorState* state, QWidget* parent) : QWidget(pa
     binBtn->setMinimumWidth(binBtn->fontMetrics().horizontalAdvance(binBtn->text()) + 30);  // room for the arrow beside it
     iconsBtn_ = addButton(QStringLiteral("▦"), tr("Icon view"));
     listBtn_ = addButton(QStringLiteral("☰"), tr("List view, with metadata columns"));
+    boardBtn_ = addButton(QStringLiteral("⊞"), tr("Board view: arrange thumbnails anywhere as a storyboard, then drag or assemble them in that order"));
     iconsBtn_->setObjectName(QStringLiteral("iconViewButton"));
     listBtn_->setObjectName(QStringLiteral("listViewButton"));
+    boardBtn_->setObjectName(QStringLiteral("boardViewButton"));
     iconsBtn_->setCheckable(true);
     listBtn_->setCheckable(true);
+    boardBtn_->setCheckable(true);
     search_ = new QLineEdit(this);
     search_->setPlaceholderText(tr("Search media"));
     search_->setToolTip(tr("Finds names, keywords, metadata and what is said; \"quotes\" for a phrase"));
@@ -302,10 +307,18 @@ MediaBinWidget::MediaBinWidget(EditorState* state, QWidget* parent) : QWidget(pa
     list_->header()->setStretchLastSection(false);
     list_->header()->setContextMenuPolicy(Qt::CustomContextMenu);
     list_->header()->resizeSection(0, 200);
-    QItemSelectionModel* old = list_->selectionModel();
-    list_->setSelectionModel(icons_->selectionModel());  // one selection for both views
-    delete old;
-    for (QAbstractItemView* v : {static_cast<QAbstractItemView*>(icons_), static_cast<QAbstractItemView*>(list_)}) {
+    board_ = new StoryboardView(state_, [](const QModelIndex& i) { return Id(i.data(MediaBinModel::IdRole).toULongLong()); }, stack_);
+    board_->setObjectName(QStringLiteral("mediaBoard"));
+    board_->setModel(proxy_);
+    board_->setEditTriggers(QAbstractItemView::EditKeyPressed);
+    board_->setThumbnailWidth(appSettings().value(QStringLiteral("bin/boardThumb"), MediaBinModel::kThumbW).toInt());
+    connect(board_, &StoryboardView::thumbnailWidthChanged, this, [](int w) { appSettings().setValue(QStringLiteral("bin/boardThumb"), w); });
+    for (QAbstractItemView* v : {static_cast<QAbstractItemView*>(list_), static_cast<QAbstractItemView*>(board_)}) {
+        QItemSelectionModel* old = v->selectionModel();
+        v->setSelectionModel(icons_->selectionModel());  // one selection for every view
+        delete old;
+    }
+    for (QAbstractItemView* v : {static_cast<QAbstractItemView*>(icons_), static_cast<QAbstractItemView*>(list_), static_cast<QAbstractItemView*>(board_)}) {
         v->setSelectionMode(QAbstractItemView::ExtendedSelection);
         v->setSelectionBehavior(QAbstractItemView::SelectRows);
         v->setDragEnabled(true);
@@ -319,6 +332,9 @@ MediaBinWidget::MediaBinWidget(EditorState* state, QWidget* parent) : QWidget(pa
                 [this](const QModelIndex& i) { open(i.data(MediaBinModel::IdRole).toULongLong()); });
         stack_->addWidget(v);
     }
+    // The board moves its thumbnails about as well as dragging them out.
+    board_->setDragDropMode(QAbstractItemView::DragDrop);
+    board_->setDefaultDropAction(Qt::MoveAction);
     split_->addWidget(tree_);
     split_->addWidget(stack_);
     split_->setStretchFactor(1, 1);
@@ -330,7 +346,8 @@ MediaBinWidget::MediaBinWidget(EditorState* state, QWidget* parent) : QWidget(pa
     const QStringList visible = settings.value("mediaBin/columns", defaultColumns()).toStringList();
     for (int c = 0; c < model_->columnCount(); ++c)
         list_->setColumnHidden(c, c != 0 && !visible.contains(QString::fromStdString(MediaBinModel::columnKeys()[size_t(c)])));
-    setView(settings.value("mediaBin/view").toString() == "list" ? View::List : View::Icons);
+    const QString shownView = settings.value("mediaBin/view").toString();
+    setView(shownView == "list" ? View::List : shownView == "board" ? View::Board : View::Icons);
 
     connect(importBtn, &QToolButton::clicked, this, &MediaBinWidget::importDialog);
     connect(titleBtn, &QToolButton::clicked, this, &MediaBinWidget::newTitleRequested);
@@ -338,6 +355,7 @@ MediaBinWidget::MediaBinWidget(EditorState* state, QWidget* parent) : QWidget(pa
     connect(binBtn, &QToolButton::clicked, this, [this] { newBin(bin_); });
     connect(iconsBtn_, &QToolButton::clicked, this, [this] { setView(View::Icons); });
     connect(listBtn_, &QToolButton::clicked, this, [this] { setView(View::List); });
+    connect(boardBtn_, &QToolButton::clicked, this, [this] { setView(View::Board); });
     connect(search_, &QLineEdit::textChanged, this, &MediaBinWidget::rebuild);
     connect(list_->header(), &QWidget::customContextMenuRequested, this, &MediaBinWidget::showColumnMenu);
     connect(tree_, &QTreeWidget::currentItemChanged, this, [this](QTreeWidgetItem* it) {
@@ -374,14 +392,46 @@ MediaBinWidget::MediaBinWidget(EditorState* state, QWidget* parent) : QWidget(pa
 
 void MediaBinWidget::setView(View v) {
     view_ = v;
-    stack_->setCurrentWidget(v == View::Icons ? static_cast<QWidget*>(icons_) : static_cast<QWidget*>(list_));
+    stack_->setCurrentWidget(currentView());
     iconsBtn_->setChecked(v == View::Icons);
     listBtn_->setChecked(v == View::List);
-    QSettings("Montage", "Montage").setValue("mediaBin/view", v == View::List ? "list" : "icons");
+    boardBtn_->setChecked(v == View::Board);
+    // Drags from the board go in storyboard order; from the other views, in the order picked.
+    if (v == View::Board) model_->setDragOrder([this](const std::vector<Id>& ids) { return storyboardOrder(state_->project(), ids); });
+    else model_->setDragOrder({});
+    if (v == View::Board) board_->applyBoard();
+    QSettings("Montage", "Montage").setValue("mediaBin/view", v == View::List ? "list" : v == View::Board ? "board" : "icons");
 }
 
 QAbstractItemView* MediaBinWidget::currentView() const {
+    if (view_ == View::Board) return board_;
     return view_ == View::Icons ? static_cast<QAbstractItemView*>(icons_) : static_cast<QAbstractItemView*>(list_);
+}
+
+bool MediaBinWidget::arrangeBoard() {
+    const std::vector<Id> order = board_->shownInOrder();
+    const int columns = board_->columns();
+    return state_->edit(tr("Arrange in Grid"), [&](Project& p, Sequence&) {
+        const Project before = p;
+        arrangeStoryboard(p, order, columns);
+        return !(p == before);
+    });
+}
+
+std::vector<Id> MediaBinWidget::assembleStoryboard(bool insert) {
+    std::vector<Id> media = board_->selectedInOrder();
+    if (media.empty()) media = board_->shownInOrder();
+    if (media.empty() || !state_->sequence()) return {};
+    std::vector<Id> made;
+    const FrameTime at = state_->playhead();
+    const TrackRef video{TrackKind::Video, state_->targetVideoTrack()}, audio{TrackKind::Audio, state_->targetAudioTrack()};
+    state_->apply(insert ? tr("Assemble Storyboard (Insert)") : tr("Assemble Storyboard"), [&](Project& p, Sequence& s) {
+        edit::Result r = montage::assembleStoryboard(p, s, media, at, video, audio, insert);
+        if (r.ok) made = r.created;
+        return r;
+    });
+    if (!made.empty()) state_->message(tr("Assembled %n clip(s) in storyboard order", "", int(media.size())), 4000);
+    return made;
 }
 
 void MediaBinWidget::showBin(const QString& bin) {
@@ -928,7 +978,7 @@ bool MediaBinWidget::eventFilter(QObject* watched, QEvent* event) {
             model_->clearSkim();
         }
     }
-    const bool view = watched == icons_ || watched == list_;
+    const bool view = watched == icons_ || watched == list_ || watched == board_;
     // Rating keys: 0–5 and X (reject), over the window's shortcuts while a view has the focus.
     if (view && (event->type() == QEvent::ShortcutOverride || event->type() == QEvent::KeyPress)) {
         auto* ke = static_cast<QKeyEvent*>(event);
@@ -952,7 +1002,7 @@ bool MediaBinWidget::eventFilter(QObject* watched, QEvent* event) {
         }
     }
     // Files dropped on a view are imported into the bin shown.
-    if (!view && (watched == icons_->viewport() || watched == list_->viewport())) {
+    if (!view && (watched == icons_->viewport() || watched == list_->viewport() || watched == board_->viewport())) {
         if (event->type() == QEvent::DragEnter || event->type() == QEvent::DragMove) {
             auto* e = static_cast<QDragMoveEvent*>(event);
             if (e->mimeData()->hasUrls()) {
@@ -1032,6 +1082,25 @@ void MediaBinWidget::showBinMenu(const QPoint& pos) {
 void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos) {
     auto ids = selectedMedia();
     QMenu menu(this);
+    if (view == board_) {
+        // The storyboard: put in the sequence in reading order (Premiere's Automate to Sequence from Freeform view).
+        const QString what = ids.empty() ? tr("All") : tr("Selected");
+        menu.addAction(tr("Assemble %1 at Playhead").arg(what), this, [this] { assembleStoryboard(false); })
+            ->setObjectName(QStringLiteral("assembleBoard"));
+        menu.addAction(tr("Assemble %1 at Playhead (Insert)").arg(what), this, [this] { assembleStoryboard(true); })
+            ->setObjectName(QStringLiteral("assembleBoardInsert"));
+        menu.addAction(tr("Arrange in Grid"), this, [this] { arrangeBoard(); })->setObjectName(QStringLiteral("arrangeBoard"));
+        QMenu* size = menu.addMenu(tr("Thumbnail Size"));
+        for (const auto& [name, width] : {std::pair{tr("Small"), 96}, {tr("Medium"), 128}, {tr("Large"), 192}, {tr("Extra Large"), 288}}) {
+            QAction* a = size->addAction(name, this, [this, w = width] {
+                board_->setThumbnailWidth(w);
+                appSettings().setValue(QStringLiteral("bin/boardThumb"), w);
+            });
+            a->setCheckable(true);
+            a->setChecked(board_->thumbnailWidth() == width);
+        }
+        menu.addSeparator();
+    }
     if (ids.size() == 1) {
         Id id = ids.front();
         const MediaItem* m = state_->project().findMedia(id);
