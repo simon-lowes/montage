@@ -120,6 +120,7 @@
 #include "MaskOverlay.h"
 #include "TransformOverlay.h"
 #include "SequenceIndexPanel.h"
+#include "StackedTimelineWidget.h"
 #include "PanFollowDialog.h"
 #include "RedactFacesDialog.h"
 #include "SpectralRepairDialog.h"
@@ -450,6 +451,13 @@ void MainWindow::buildPanels() {
     assistant_ = new AssistantPanel(liveLink_, this);
     assistantDock_ = makeDock(tr("Assistant"), "assistant", assistant_);
     indexDock_ = makeDock(tr("Sequence Index"), "index", new SequenceIndexPanel(state_, this));
+    stacked_ = new StackedTimelineWidget(state_, this);
+    stackedDock_ = makeDock(tr("Stacked Timeline"), "stacked", stacked_);
+    connect(bin_, &MediaBinWidget::openInStackedTimeline, this, [this](Id sequence) {
+        stacked_->setSequence(sequence);
+        stackedDock_->show();
+        stackedDock_->raise();
+    });
     multicamDock_ = makeDock(tr("Multicam"), "multicam", multicam_);
     adr_ = new AdrPanel(state_, program_, programPanel_->viewer(), this);
     adrDock_ = makeDock(tr("ADR"), "adr", adr_);
@@ -604,7 +612,8 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         resizeDocks({sourceDock_}, {h / 2 + 40}, Qt::Vertical);
     } else {  // Editing
         arrangeDocks({{sourceDock_, inspectorDock_, scopesDock_, mixerDock_, captionsDock_, multicamDock_, keyframesDock_}, {programDock_}},
-                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, peopleDock_, indexDock_, queueDock_, assistantDock_}}, {{meterDock_}});
+                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, peopleDock_, indexDock_, stackedDock_, queueDock_, assistantDock_}},
+                     {{meterDock_}});
         resizeDocks({binDock_}, {380}, Qt::Horizontal);
         resizeDocks({meterDock_}, {70}, Qt::Horizontal);
         resizeDocks({sourceDock_, programDock_}, {720, 860}, Qt::Horizontal);
@@ -1262,6 +1271,18 @@ void MainWindow::buildMenus() {
         ->setObjectName(QStringLiteral("rippleOverwrite"));
     add(clipM, tr("Smart Insert"), QKeySequence(), [this] { state_->sourceEdit(EditorState::SourceEdit::SmartInsert); })
         ->setObjectName(QStringLiteral("smartInsert"));
+    {
+        // Premiere's "insert and overwrite sequences as nests or individual clips".
+        state_->setSequencesAsClips(appSettings().value("editing/sequencesAsClips", false).toBool());
+        QAction* a = add(clipM, tr("Insert Sequences as Clips"), QKeySequence(), [this](bool on) {
+            state_->setSequencesAsClips(on);
+            appSettings().setValue("editing/sequencesAsClips", on);
+        });
+        a->setObjectName(QStringLiteral("sequencesAsClips"));
+        a->setCheckable(true);
+        a->setChecked(state_->sequencesAsClips());
+        a->setToolTip(tr("Edit a sequence from the Source monitor or the bin as its own clips instead of one nested clip"));
+    }
     add(clipM, tr("&Match Frame"), QKeySequence(Qt::Key_F), [this] { matchFrame(); })->setObjectName(QStringLiteral("matchFrame"));
     add(clipM, tr("Reverse Match Frame"), QKeySequence("Shift+R"), [this] { reverseMatchFrame(); })
         ->setObjectName(QStringLiteral("reverseMatchFrame"));

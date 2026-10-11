@@ -264,6 +264,7 @@ private:
     void handleHeaderClick(const Hit& hit);
     std::vector<Ghost> ghostsFor(const QMimeData* mime, const QPoint& pos) const;
     void dropMedia(const QMimeData* mime, const QPoint& pos, bool insertMode);
+    void dropSequencePart(const QMimeData* mime, const QPoint& pos, bool insertMode);  // clips or a range from a stacked timeline
     void dropEffect(const QString& type, const QPoint& pos);
 
     EditorState* state_;

@@ -144,6 +144,28 @@ struct ClipboardItem {
 std::vector<ClipboardItem> copyClips(const Sequence& s, const std::vector<Id>& ids);
 Result pasteClips(Project& p, Sequence& s, const std::vector<ClipboardItem>& items, FrameTime at, bool insertMode);
 
+// ---- Editing from a sequence (selects reels, stacked timelines) --------------------------------------
+// A stretch of a sequence as clips (every track, cut at `in` and `out`, starts counted from `in`) and the transitions
+// between them, or chosen clips (with what they are linked to) and the transitions among them.
+struct SequenceRange {
+    std::vector<ClipboardItem> clips;
+    std::vector<std::pair<TrackRef, Transition>> transitions;
+    FrameTime length = 0;
+};
+SequenceRange copySequenceRange(const Sequence& s, FrameTime in, FrameTime out);
+SequenceRange copySequenceClips(const Sequence& s, const std::vector<Id>& ids);
+// Places such clips at `at`, their tracks moved so the lowest picture and sound tracks among them land on tracks
+// `video` and `audio` (tracks added above as needed), links and transitions kept; with `insert` the target tracks
+// (and the sync-locked others) open up first.
+Result pasteRange(Project& p, Sequence& s, const SequenceRange& r, FrameTime at, int video, int audio, bool insert);
+// Premiere's "insert and overwrite sequences as individual clips", Avid's editing from a source sequence: `source`'s
+// clips from `in` to `out` (exclusive; -1 = its end) edited into `s` at `at` as themselves, not as one nested clip.
+// Fails for `s` itself or a sequence that nests it, and for one at another frame rate (nest that).
+Result placeSequenceClips(Project& p, Sequence& s, Id source, FrameTime in, FrameTime out, FrameTime at, int video, int audio,
+                          bool insert);
+// Whether sequence `seq` is `target` or nests it anywhere inside.
+bool sequenceUses(const Project& p, Id seq, Id target);
+
 // ---- Transitions -----------------------------------------------------------------
 Result addTransition(Project& p, Sequence& s, Id clipId, Edge edge, const std::string& type, FrameTime duration);
 // Premiere's Apply Default Transitions to Selection, Final Cut's Add Transition on several clips: a transition at both

@@ -25,6 +25,7 @@
 
 #include "EditorState.h"
 #include "ModelPacks.h"
+#include "StackedTimelineWidget.h"
 #include "render/Exporter.h"
 #include "Theme.h"
 #include "ThumbnailCache.h"
@@ -2362,7 +2363,7 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* e) {
 
 void TimelineWidget::dragEnterEvent(QDragEnterEvent* e) {
     const QMimeData* m = e->mimeData();
-    if (m->hasFormat("application/x-montage-media") || m->hasFormat("application/x-montage-effect") || m->hasUrls())
+    if (m->hasFormat("application/x-montage-media") || m->hasFormat("application/x-montage-effect") || m->hasUrls() || hasSequencePart(m))
         e->acceptProposedAction();
 }
 
@@ -2370,6 +2371,29 @@ std::vector<TimelineWidget::Ghost> TimelineWidget::ghostsFor(const QMimeData* mi
     std::vector<Ghost> out;
     const Sequence* s = state_->sequence();
     if (!s) return out;
+    if (hasSequencePart(mime)) {
+        // Clips from another sequence: their lowest tracks land on the ones under the pointer (or the targets).
+        edit::SequenceRange part;
+        if (!sequencePartFromMime(state_->project(), mime, nullptr, &part)) return out;
+        auto row = rowAt(pos.y());
+        const int vt = row && row->ref.kind == TrackKind::Video ? row->ref.index : state_->targetVideoTrack();
+        const int at = row && row->ref.kind == TrackKind::Audio ? row->ref.index : state_->targetAudioTrack();
+        int lowV = std::numeric_limits<int>::max(), lowA = lowV;
+        for (const edit::ClipboardItem& it : part.clips) {
+            int& low = it.track.kind == TrackKind::Video ? lowV : lowA;
+            low = std::min(low, it.track.index);
+        }
+        const FrameTime f = frameRound(pos.x());
+        for (const edit::ClipboardItem& it : part.clips) {
+            const bool video = it.track.kind == TrackKind::Video;
+            const int count = int(video ? s->videoTracks.size() : s->audioTracks.size());
+            const int index = std::min((video ? vt : at) + it.track.index - (video ? lowV : lowA), count - 1);
+            if (index >= 0) out.push_back({{it.track.kind, index}, f + it.clip.start, it.clip.duration});
+        }
+        // The earliest first: drops snap by it.
+        std::stable_sort(out.begin(), out.end(), [](const Ghost& a, const Ghost& b) { return a.start < b.start; });
+        return out;
+    }
     auto refs = parseMediaMime(mime);
     if (refs.empty()) return out;
     auto row = rowAt(pos.y());
@@ -2396,7 +2420,7 @@ std::vector<TimelineWidget::Ghost> TimelineWidget::ghostsFor(const QMimeData* mi
 void TimelineWidget::dragMoveEvent(QDragMoveEvent* e) {
     const QMimeData* m = e->mimeData();
     hoverPos_ = e->position().toPoint();
-    if (m->hasFormat("application/x-montage-media")) {
+    if (m->hasFormat("application/x-montage-media") || hasSequencePart(m)) {
         ghosts_ = ghostsFor(m, hoverPos_);
         // Snap the drop point.
         if (!ghosts_.empty()) {
@@ -2428,7 +2452,7 @@ void TimelineWidget::dropMedia(const QMimeData* mime, const QPoint& pos, bool in
     int vt = row && row->ref.kind == TrackKind::Video ? row->ref.index : state_->targetVideoTrack();
     int at = row && row->ref.kind == TrackKind::Audio ? row->ref.index : state_->targetAudioTrack();
     std::vector<Id> created;
-    QString matched;
+    QString matched, nested;
     state_->apply(insertMode ? tr("Insert") : tr("Overwrite"), [&](Project& p, Sequence& sq) {
         FrameTime f = start;
         edit::Result last = edit::Result::fail("Nothing to place");
@@ -2445,7 +2469,15 @@ void TimelineWidget::dropMedia(const QMimeData* mime, const QPoint& pos, bool in
             }
             double in = r.in >= 0 ? double(r.in) : 0.0;
             double out = r.out >= 0 ? double(r.out + 1) : -1.0;
-            auto res = edit::placeMedia(p, sq, r.id, f, in, out, v, a, insertMode);
+            // With Insert Sequences as Clips, a sequence at this frame rate comes in as its clips.
+            const Sequence* src = m->kind == MediaKind::Sequence && state_->sequencesAsClips() ? p.findSequence(m->sequenceId) : nullptr;
+            if (src && !(src->fps == sq.fps)) {
+                src = nullptr;
+                nested = QString::fromStdString(m->name);
+            }
+            auto res = src ? edit::placeSequenceClips(p, sq, m->sequenceId, FrameTime(in), r.out >= 0 ? FrameTime(out) : -1, f, v.index,
+                                                      a.index, insertMode)
+                           : edit::placeMedia(p, sq, r.id, f, in, out, v, a, insertMode);
             if (!res.ok) {
                 last = res;
                 continue;
@@ -2465,6 +2497,31 @@ void TimelineWidget::dropMedia(const QMimeData* mime, const QPoint& pos, bool in
     if (!created.empty()) state_->setSelection(created);
     if (!matched.isEmpty() && !created.empty())
         state_->message(tr("Sequence settings changed to match %1").arg(matched), 6000);
+    else if (!nested.isEmpty() && !created.empty())
+        state_->message(tr("%1 runs at another frame rate, so it went in nested").arg(nested), 6000);
+}
+
+void TimelineWidget::dropSequencePart(const QMimeData* mime, const QPoint& pos, bool insertMode) {
+    Id from = 0;
+    edit::SequenceRange part;
+    if (!state_->sequence() || !sequencePartFromMime(state_->project(), mime, &from, &part)) return;
+    // Snapped as the ghosts were: by the earliest clip.
+    FrameTime at = frameRound(pos.x());
+    if (auto ghosts = ghostsFor(mime, pos); !ghosts.empty()) at += snapFrame(ghosts.front().start, {}) - ghosts.front().start;
+    auto row = rowAt(pos.y());
+    const int vt = row && row->ref.kind == TrackKind::Video ? row->ref.index : state_->targetVideoTrack();
+    const int aud = row && row->ref.kind == TrackKind::Audio ? row->ref.index : state_->targetAudioTrack();
+    std::vector<Id> created;
+    state_->apply(insertMode ? tr("Insert from Sequence") : tr("Overwrite from Sequence"), [&](Project& p, Sequence& sq) {
+        const Sequence* src = p.findSequence(from);
+        if (!src) return edit::Result::fail("Unknown sequence");
+        if (edit::sequenceUses(p, from, sq.id)) return edit::Result::fail("A sequence cannot be placed inside itself");
+        if (!(src->fps == sq.fps)) return edit::Result::fail("That sequence runs at another frame rate");
+        edit::Result r = edit::pasteRange(p, sq, part, at, vt, aud, insertMode);
+        created = r.created;
+        return r;
+    });
+    if (!created.empty()) state_->setSelection(created);
 }
 
 void TimelineWidget::dropEffect(const QString& typeQ, const QPoint& pos) {
@@ -2558,6 +2615,8 @@ void TimelineWidget::dropEvent(QDropEvent* e) {
     ghosts_.clear();
     if (m->hasFormat("application/x-montage-media")) {
         dropMedia(m, pos, insertMode);
+    } else if (hasSequencePart(m)) {
+        dropSequencePart(m, pos, insertMode);
     } else if (m->hasFormat("application/x-montage-effect")) {
         dropEffect(QString::fromUtf8(m->data("application/x-montage-effect")), pos);
     } else if (m->hasUrls()) {

@@ -1037,6 +1037,9 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
         const MediaItem* m = state_->project().findMedia(id);
         if (m && m->kind == MediaKind::Sequence) {
             menu.addAction(tr("Open Sequence"), this, [this, m] { state_->setActiveSequence(m->sequenceId); });
+            // A selects reel in the Source monitor: three-point edits from it (as its clips with Insert Sequences as Clips).
+            menu.addAction(tr("Open in Source Monitor"), this, [this, id] { emit openInSource(id); });
+            menu.addAction(tr("Open in Stacked Timeline"), this, [this, m] { emit openInStackedTimeline(m->sequenceId); });
         } else {
             menu.addAction(tr("Open in Source Monitor"), this, [this, id] { emit openInSource(id); });
         }

@@ -59,6 +59,7 @@ class ShotSearchPanel;
 class PeoplePanel;
 class MulticamPanel;
 class AdrPanel;
+class StackedTimelineWidget;
 class ProductionPanel;
 class AudioDescriptionDialog;
 class AudioMeterWidget;
@@ -488,6 +489,8 @@ private:
     QDockWidget* assistantDock_ = nullptr;
     AssistantPanel* assistant_ = nullptr;
     QDockWidget* indexDock_ = nullptr;
+    QDockWidget* stackedDock_ = nullptr;
+    StackedTimelineWidget* stacked_ = nullptr;
     QDockWidget* multicamDock_ = nullptr;
     QDockWidget* adrDock_ = nullptr;
     QDockWidget* queueDock_ = nullptr;

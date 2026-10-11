@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <map>
 #include <set>
@@ -1229,6 +1230,138 @@ Result pasteClips(Project& p, Sequence& s, const std::vector<ClipboardItem>& ite
         res.created.insert(res.created.end(), r.created.begin(), r.created.end());
     }
     return res;
+}
+
+// ---------------------------------------------------------------------------
+// Editing from a sequence
+
+namespace {
+
+// The transitions of `s` whose clips are all among `ids` (a fade's one side, a dissolve's two).
+void keepTransitions(const Sequence& s, const std::set<Id>& ids, SequenceRange& r) {
+    for (TrackRef t : allTracks(s))
+        if (const Track* tk = trackAt(const_cast<Sequence&>(s), t))
+            for (const Transition& tr : tk->transitions) {
+                if (!tr.clipA && !tr.clipB) continue;
+                if ((tr.clipA && !ids.count(tr.clipA)) || (tr.clipB && !ids.count(tr.clipB))) continue;
+                r.transitions.push_back({t, tr});
+            }
+}
+
+}  // namespace
+
+SequenceRange copySequenceRange(const Sequence& src, FrameTime in, FrameTime out) {
+    SequenceRange r;
+    if (out < 0) out = src.duration();
+    in = std::max<FrameTime>(0, in);
+    if (out <= in) return r;
+    // Cut on a copy; the pieces' ids start above every id in it (they get new ones when placed).
+    Project scratch;
+    Sequence s = src;
+    for (TrackRef t : allTracks(s))
+        for (const Clip& c : trackAt(s, t)->clips) scratch.nextId = std::max({scratch.nextId, c.id + 1, c.linkGroup + 1});
+    for (TrackRef t : allTracks(s)) trackAt(s, t)->locked = false;
+    razorAll(scratch, s, in);
+    razorAll(scratch, s, out);
+    std::set<Id> ids;
+    for (TrackRef t : allTracks(s))
+        for (const Clip& c : trackAt(s, t)->clips)
+            if (c.start >= in && c.end() <= out) {
+                Clip copy = c;
+                copy.start -= in;
+                r.clips.push_back({t, copy});
+                ids.insert(c.id);
+            }
+    keepTransitions(s, ids, r);
+    r.length = out - in;
+    return r;
+}
+
+SequenceRange copySequenceClips(const Sequence& s, const std::vector<Id>& chosen) {
+    SequenceRange r;
+    r.clips = copyClips(s, expandLinks(s, chosen));
+    std::set<Id> ids;
+    for (const ClipboardItem& it : r.clips) {
+        ids.insert(it.clip.id);
+        r.length = std::max(r.length, it.clip.end());
+    }
+    keepTransitions(s, ids, r);
+    return r;
+}
+
+Result pasteRange(Project& p, Sequence& s, const SequenceRange& r, FrameTime at, int video, int audio, bool insert) {
+    if (r.clips.empty()) return Result::fail("Nothing to place");
+    int lowV = std::numeric_limits<int>::max(), lowA = std::numeric_limits<int>::max();
+    for (const ClipboardItem& it : r.clips) {
+        int& low = it.track.kind == TrackKind::Video ? lowV : lowA;
+        low = std::min(low, it.track.index);
+    }
+    auto mapped = [&](TrackRef t) {
+        return TrackRef{t.kind, std::max(0, t.kind == TrackKind::Video ? video + t.index - lowV : audio + t.index - lowA)};
+    };
+    std::vector<TrackRef> targets;
+    for (const ClipboardItem& it : r.clips) {
+        const TrackRef t = mapped(it.track);
+        auto& tracks = t.kind == TrackKind::Video ? s.videoTracks : s.audioTracks;
+        while (int(tracks.size()) <= t.index) addTrack(p, s, t.kind);
+        if (!editable(trackAt(s, t))) return Result::fail("A target track is locked");
+        if (std::find(targets.begin(), targets.end(), t) == targets.end()) targets.push_back(t);
+    }
+    at = std::max<FrameTime>(0, at);
+    if (insert) rippleOpen(p, s, at, std::max<FrameTime>(1, r.length), rippleTracks(s, targets));
+    Result res;
+    std::map<Id, Id> ids, groups;
+    for (const ClipboardItem& it : r.clips) {
+        Clip c = it.clip;
+        const Id old = c.id;
+        c.id = p.newId();
+        ids[old] = c.id;
+        c.start += at;
+        if (c.linkGroup) {
+            auto g = groups.find(c.linkGroup);
+            if (g == groups.end()) g = groups.emplace(c.linkGroup, p.newId()).first;
+            c.linkGroup = g->second;
+        }
+        for (auto& e : c.effects) e.id = p.newId();
+        const Result placed = overwrite(p, s, mapped(it.track), c);
+        if (placed.ok) res.created.push_back(c.id);
+    }
+    for (const auto& [track, tr] : r.transitions) {
+        Transition t = tr;
+        t.id = p.newId();
+        t.params.id = p.newId();
+        t.clipA = tr.clipA ? ids[tr.clipA] : 0;
+        t.clipB = tr.clipB ? ids[tr.clipB] : 0;
+        if (Track* tk = trackAt(s, mapped(track))) tk->transitions.push_back(t);
+    }
+    if (res.created.empty()) return Result::fail("Nothing could be placed");
+    return res;
+}
+
+bool sequenceUses(const Project& p, Id seq, Id target) {
+    std::set<Id> seen;
+    std::function<bool(Id)> uses = [&](Id id) {
+        if (id == target) return true;
+        if (!seen.insert(id).second) return false;
+        const Sequence* s = p.findSequence(id);
+        if (!s) return false;
+        for (TrackRef t : allTracks(*s))
+            for (const Clip& c : trackAt(const_cast<Sequence&>(*s), t)->clips)
+                if (const MediaItem* m = p.findMedia(c.mediaId); m && m->kind == MediaKind::Sequence && uses(m->sequenceId)) return true;
+        return false;
+    };
+    return uses(seq);
+}
+
+Result placeSequenceClips(Project& p, Sequence& s, Id source, FrameTime in, FrameTime out, FrameTime at, int video, int audio,
+                          bool insert) {
+    const Sequence* src = p.findSequence(source);
+    if (!src) return Result::fail("Unknown sequence");
+    if (sequenceUses(p, source, s.id)) return Result::fail("A sequence cannot be placed inside itself");
+    if (!(src->fps == s.fps)) return Result::fail("That sequence runs at another frame rate; place it as a nested clip");
+    const SequenceRange r = copySequenceRange(*src, in, out);
+    if (r.clips.empty()) return Result::fail("No clips there");
+    return pasteRange(p, s, r, at, video, audio, insert);
 }
 
 Result duplicateClips(Project& p, Sequence& s, const std::vector<Id>& ids, FrameTime at) {

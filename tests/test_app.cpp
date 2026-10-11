@@ -87,6 +87,7 @@
 #include "EffectPresetStore.h"
 #include "EffectsBrowser.h"
 #include "MediaBinWidget.h"
+#include "StackedTimelineWidget.h"
 #include "SmartBinDialog.h"
 #include "ScriptCutDialog.h"
 #include "core/KeyframeEdit.h"
@@ -9673,6 +9674,127 @@ const auto seq = [this] { return state()->sequence(); };
         // Not for SDR.
         state()->newProject();
         QVERIFY(!win_->analyseHdrLightLevels(false));
+    }
+
+    void editingFromAnotherSequence() {
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id cut = state()->project().activeSequence;
+        const Sequence* first = state()->sequence();
+        // A selects reel at the same rate: three 30-frame stills on V1 (0, 30, 60).
+        const Id selects = state()->newSequence(QStringLiteral("Selects"), first->width, first->height, first->fps);
+        QVERIFY(selects && state()->project().activeSequence == selects);
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            bool ok = true;
+            for (int i = 0; i < 3; ++i) ok = ok && edit::placeMedia(p, s, ids[0], i * 30, 0, 30, V1, A1, false).ok;
+            return ok;
+        }));
+        const std::vector<Id> pulls = [&] {
+            std::vector<Id> out;
+            for (const Clip& c : state()->sequence()->videoTracks[0].clips) out.push_back(c.id);
+            return out;
+        }();
+        Id reel = 0;
+        for (const MediaItem& m : state()->project().media)
+            if (m.kind == MediaKind::Sequence && m.sequenceId == selects) reel = m.id;
+        QVERIFY(reel);
+        state()->setActiveSequence(cut);
+        const auto v1 = [this]() -> const std::vector<Clip>& { return state()->sequence()->videoTracks[0].clips; };
+
+        // Insert Sequences as Clips off: a source edit from the reel nests it.
+        auto* asClips = win_->findChild<QAction*>(QStringLiteral("sequencesAsClips"));
+        QVERIFY(asClips && asClips->isCheckable());
+        if (asClips->isChecked()) asClips->trigger();
+        QVERIFY(!state()->sequencesAsClips());
+        state()->setSourceMedia(reel);
+        state()->setSourceIn(15);
+        state()->setSourceOut(44);
+        state()->setPlayhead(0);
+        QVERIFY(state()->sourceEdit(EditorState::SourceEdit::Overwrite));
+        QCOMPARE(v1().size(), size_t(1));
+        QCOMPARE(v1()[0].mediaId, reel);
+        QCOMPARE(v1()[0].duration, FrameTime(30));
+        state()->undo();
+        // On: the same edit brings the reel's own clips, cut at the marks (15 frames of each of the first two).
+        asClips->trigger();
+        QVERIFY(state()->sequencesAsClips());
+        state()->setPlayhead(0);
+        QVERIFY(state()->sourceEdit(EditorState::SourceEdit::Overwrite));
+        QCOMPARE(v1().size(), size_t(2));
+        for (size_t i = 0; i < 2; ++i) {
+            QCOMPARE(v1()[i].mediaId, ids[0]);
+            QCOMPARE(v1()[i].start, FrameTime(15 * i));
+            QCOMPARE(v1()[i].duration, FrameTime(15));
+        }
+        QCOMPARE(v1()[0].sourceIn, 15.0);
+        QCOMPARE(state()->project().findSequence(selects)->videoTracks[0].clips.size(), size_t(3));  // the reel is untouched
+        state()->undo();
+        QVERIFY(v1().empty());
+
+        // The stacked timeline shows every sequence but the open one.
+        auto* stacked = win_->findChild<StackedTimelineWidget*>();
+        QVERIFY(stacked);
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        emit bin->openInStackedTimeline(selects);  // the bin's "Open in Stacked Timeline"
+        QCOMPARE(stacked->sequenceId(), selects);
+        QCOMPARE(stacked->picker()->count(), 1);
+        QVERIFY(win_->findChild<QDockWidget*>(QStringLiteral("stacked"))->isVisibleTo(win_.get()));
+        // Drag its last two clips onto the timeline at frame 100: they keep their spacing.
+        stacked->setSelection({pulls[1], pulls[2]});
+        ppf_ = measurePpf();
+        const auto dropAt = [&](FrameTime f, Qt::KeyboardModifiers mods) {
+            std::unique_ptr<QMimeData> mime(stacked->dragData());
+            QVERIFY(mime);
+            const QPoint pos = pointFor(f, V1);
+            QDragEnterEvent enter(pos, Qt::CopyAction, mime.get(), Qt::LeftButton, mods);
+            QApplication::sendEvent(viewport(), &enter);
+            QVERIFY(enter.isAccepted());
+            QDropEvent drop(pos, Qt::CopyAction, mime.get(), Qt::LeftButton, mods);
+            QApplication::sendEvent(viewport(), &drop);
+        };
+        dropAt(100, Qt::NoModifier);
+        QCOMPARE(v1().size(), size_t(2));
+        QCOMPARE(v1()[0].start, FrameTime(100));
+        QCOMPARE(v1()[1].start, FrameTime(130));
+        QCOMPARE(state()->selectedClips().size(), size_t(2));
+        state()->undo();
+        // A range marked with I and O, dropped with Ctrl, inserts into a 200-frame clip.
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) { return edit::placeMedia(p, s, ids[0], 0, 0, 200, V1, A1, false).ok; }));
+        ppf_ = measurePpf();
+        stacked->setSelection({});
+        stacked->setPlayhead(15);
+        QTest::keyClick(stacked->canvas(), Qt::Key_I);
+        stacked->setPlayhead(44);
+        QTest::keyClick(stacked->canvas(), Qt::Key_O);
+        QCOMPARE(stacked->markIn(), FrameTime(15));
+        QCOMPARE(stacked->markOut(), FrameTime(44));
+        dropAt(100, Qt::ControlModifier);
+        QCOMPARE(state()->sequence()->duration(), FrameTime(230));
+        QCOMPARE(v1().size(), size_t(4));
+        QCOMPARE(v1()[1].start, FrameTime(100));
+        QCOMPARE(v1()[2].start, FrameTime(115));
+        QCOMPARE(v1()[3].start, FrameTime(130));
+        state()->undo();
+        state()->undo();
+
+        // Swap: edit the reel and stack the cut. A cut that nests the reel cannot go back into it.
+        asClips->trigger();
+        state()->setPlayhead(0);
+        QVERIFY(state()->sourceEdit(EditorState::SourceEdit::Overwrite));
+        QCOMPARE(v1()[0].mediaId, reel);
+        QVERIFY(stacked->swap());
+        QCOMPARE(state()->project().activeSequence, selects);
+        QCOMPARE(stacked->sequenceId(), cut);
+        stacked->setMarks(-1, -1);
+        stacked->setSelection({state()->project().findSequence(cut)->videoTracks[0].clips[0].id});
+        ppf_ = measurePpf();
+        dropAt(200, Qt::NoModifier);
+        QCOMPARE(v1().size(), size_t(3));
+        state()->setActiveSequence(cut);
+        QCOMPARE(stacked->sequenceId(), selects);  // the open sequence never shows in the stack
+        state()->undo();
+        if (asClips->isChecked()) asClips->trigger();
     }
 
     void hdrViewerOnHdrSequences() {

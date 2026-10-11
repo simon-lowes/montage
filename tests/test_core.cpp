@@ -6404,6 +6404,135 @@ private slots:
         QVERIFY(!importEdl(p, "nothing here", {25, 1}).ok);
     }
 
+    void editingFromASequence() {
+        Fixture f;
+        Project& p = f.p;
+        const Id main = f.s().id;
+        // A selects reel at the same rate: a linked clip (0-60), a picture-only clip after it (60-120) with a dissolve
+        // between them, and a clip on V2 (20-50).
+        Sequence sel = makeSequence(p, "Selects", f.s().width, f.s().height, f.s().fps);
+        const Id selId = sel.id;
+        p.sequences.push_back(sel);
+        Sequence* selects = p.findSequence(selId);
+        QVERIFY(placeMedia(p, *selects, f.media, 0, 0, 60, V1, A1, false).ok);
+        {
+            Clip c = makeClip(p, *p.findMedia(f.media), TrackKind::Video, *selects);
+            c.start = 60, c.duration = 60, c.sourceIn = 100;
+            QVERIFY(overwrite(p, *selects, V1, c).ok);
+            addTrack(p, *selects, TrackKind::Video);
+            Clip top = makeClip(p, *p.findMedia(f.media), TrackKind::Video, *selects);
+            top.start = 20, top.duration = 30, top.sourceIn = 200;
+            QVERIFY(overwrite(p, *selects, TrackRef{TrackKind::Video, 1}, top).ok);
+        }
+        const Id first = selects->videoTracks[0].clips[0].id;
+        QVERIFY(addTransition(p, *selects, first, Edge::Out, "cross_dissolve", 10).ok);
+        const Id selGroup = selects->videoTracks[0].clips[0].linkGroup;
+        QVERIFY(selGroup);
+
+        // From 30 to 90 into the main sequence at 100, overwriting V1/A1: the pieces, cut where the range is, as clips.
+        Sequence& s = *p.findSequence(main);
+        edit::Result r = placeSequenceClips(p, s, selId, 30, 90, 100, 0, 0, false);
+        QVERIFY2(r.ok, r.error.c_str());
+        const Track& v1 = s.videoTracks[0];
+        QCOMPARE(v1.clips.size(), size_t(2));
+        QCOMPARE(v1.clips[0].start, FrameTime(100));
+        QCOMPARE(v1.clips[0].duration, FrameTime(30));
+        QCOMPARE(v1.clips[0].sourceIn, 30.0);
+        QCOMPARE(v1.clips[1].start, FrameTime(130));
+        QCOMPARE(v1.clips[1].sourceIn, 100.0);
+        // Linked to its sound still, as a new group; the dissolve between the pieces came along.
+        QCOMPARE(s.audioTracks[0].clips.size(), size_t(1));
+        QCOMPARE(s.audioTracks[0].clips[0].linkGroup, v1.clips[0].linkGroup);
+        QVERIFY(v1.clips[0].linkGroup && v1.clips[0].linkGroup != selGroup);
+        QCOMPARE(v1.transitions.size(), size_t(1));
+        QCOMPARE(v1.transitions[0].clipA, v1.clips[0].id);
+        QCOMPARE(v1.transitions[0].clipB, v1.clips[1].id);
+        // V2's clip, cut at 30 too, on a V2 made for it.
+        QVERIFY(s.videoTracks.size() >= 2);
+        QCOMPARE(s.videoTracks[1].clips.size(), size_t(1));
+        QCOMPARE(s.videoTracks[1].clips[0].start, FrameTime(100));
+        QCOMPARE(s.videoTracks[1].clips[0].duration, FrameTime(20));
+        QCOMPARE(s.videoTracks[1].clips[0].sourceIn, 210.0);
+        // The selects reel itself is untouched.
+        QCOMPARE(p.findSequence(selId)->videoTracks[0].clips.size(), size_t(2));
+
+        // Insert: what was there moves on by the range's length; to other tracks: the lowest lands on the one asked for.
+        {
+            Fixture g;
+            Sequence& t = g.s();
+            g.put(V1, 0, 200);
+            Sequence src = makeSequence(g.p, "Selects", t.width, t.height, t.fps);
+            QVERIFY(placeMedia(g.p, src, g.media, 0, 0, 60, V1, A1, false).ok);
+            const Id srcId = src.id;
+            g.p.sequences.push_back(src);
+            Sequence& t2 = g.s();
+            QVERIFY(placeSequenceClips(g.p, t2, srcId, -1, -1, 50, 0, 0, true).ok);
+            QCOMPARE(t2.videoTracks[0].clips.size(), size_t(3));
+            QCOMPARE(t2.videoTracks[0].clips[1].start, FrameTime(50));
+            QCOMPARE(t2.videoTracks[0].clips[2].start, FrameTime(110));
+            QCOMPARE(t2.videoTracks[0].clips[2].end(), FrameTime(260));
+            const size_t videoTracks = t2.videoTracks.size();
+            QVERIFY(placeSequenceClips(g.p, t2, srcId, 0, 30, 300, int(videoTracks), 0, false).ok);
+            QCOMPARE(t2.videoTracks.size(), videoTracks + 1);
+            QCOMPARE(t2.videoTracks.back().clips.size(), size_t(1));
+        }
+        // Chosen clips (with their links) instead of a range.
+        {
+            const Sequence& sq = *p.findSequence(selId);
+            const SequenceRange chosen = copySequenceClips(sq, {sq.videoTracks[0].clips[0].id});
+            QCOMPARE(chosen.clips.size(), size_t(2));  // its picture and its sound
+            QCOMPARE(chosen.length, FrameTime(60));
+            QVERIFY(chosen.transitions.empty());  // (the dissolve needs the next clip too)
+            const SequenceRange both = copySequenceClips(sq, {sq.videoTracks[0].clips[0].id, sq.videoTracks[0].clips[1].id});
+            QCOMPARE(both.transitions.size(), size_t(1));
+        }
+        // A clip id the cut on a copy would hand out again (1, after one cut): the pieces are still told apart.
+        {
+            Project q;
+            Sequence low = makeSequence(q, "Low", 640, 360, Rational{30, 1});
+            Clip a, b;
+            a.id = 5;
+            a.mediaId = f.media;
+            a.duration = 60;
+            b.id = 1;
+            b.mediaId = f.media;
+            b.start = 60;
+            b.duration = 60;
+            b.sourceIn = 200;
+            low.videoTracks[0].clips = {a, b};
+            const SequenceRange r = copySequenceRange(low, 30, 90);
+            QCOMPARE(r.clips.size(), size_t(2));
+            QCOMPARE(r.clips[0].clip.start, FrameTime(0));
+            QCOMPARE(r.clips[0].clip.duration, FrameTime(30));
+            QCOMPARE(r.clips[0].clip.sourceIn, 30.0);
+            QCOMPARE(r.clips[1].clip.start, FrameTime(30));
+            QCOMPARE(r.clips[1].clip.duration, FrameTime(30));
+            QCOMPARE(r.clips[1].clip.sourceIn, 200.0);
+            QVERIFY(r.clips[0].clip.id != r.clips[1].clip.id);
+        }
+        // Not into itself, nor into a sequence it nests; not at another rate; nothing in an empty stretch.
+        QVERIFY(!placeSequenceClips(p, s, main, 0, 10, 0, 0, 0, false).ok);
+        {
+            MediaItem nest;
+            nest.id = p.newId();
+            nest.kind = MediaKind::Sequence;
+            nest.sequenceId = main;
+            nest.hasVideo = true;
+            p.media.push_back(nest);
+            QVERIFY(placeMedia(p, *p.findSequence(selId), nest.id, 300, 0, 10, V1, A1, false).ok);
+            QVERIFY(sequenceUses(p, selId, main));
+            QVERIFY(!sequenceUses(p, main, selId));
+            const edit::Result cycle = placeSequenceClips(p, *p.findSequence(main), selId, 0, -1, 0, 0, 0, false);
+            QVERIFY(!cycle.ok && cycle.error.find("itself") != std::string::npos);
+        }
+        Sequence other = makeSequence(p, "25p", 1920, 1080, Rational{25, 1});
+        QVERIFY(placeMedia(p, other, f.media, 0, 0, 30, V1, A1, false).ok);
+        const Id otherId = other.id;
+        p.sequences.push_back(other);
+        QVERIFY(!placeSequenceClips(p, *p.findSequence(main), otherId, 0, -1, 0, 0, 0, false).ok);
+        QVERIFY(!placeSequenceClips(p, *p.findSequence(main), selId, 500, 600, 0, 0, 0, false).ok);
+    }
+
     void interchangeReviewFixes() {
         Project p = makeDefaultProject();
         auto addMedia = [&](const char* name, bool video, bool audio) {

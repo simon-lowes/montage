@@ -122,6 +122,10 @@ public:
     // A subclip opens its media with In and Out around its range.
     void setSourceMedia(Id id);
     FrameTime sourceIn() const { return sourceIn_; }
+    // Premiere's "insert and overwrite sequences as nests or individual clips": a sequence edited from the Source monitor
+    // or dropped on the timeline comes in as its own clips (edit::placeSequenceClips) rather than one nested clip.
+    bool sequencesAsClips() const { return sequencesAsClips_; }
+    void setSequencesAsClips(bool on);
     FrameTime sourceOut() const { return sourceOut_; }
     void setSourceIn(FrameTime t);
     void setSourceOut(FrameTime t);
@@ -191,6 +195,7 @@ signals:
     void sequenceSwitched();          // a different sequence became active / project replaced
     void historyChanged();
     void sourceChanged();             // source monitor media or marks changed
+    void sequencesAsClipsChanged(bool on);
     void mediaReady(const QString& path);  // audio peaks / thumbnails available
     void mediaFileChanged(montage::Id media);  // its file changed on disk and was reloaded
     void statusMessage(const QString& text, int timeoutMs);
@@ -231,6 +236,7 @@ private:
     int targetAudio_ = 0;
     bool snapping_ = true;
     Id sourceMedia_ = 0;
+    bool sequencesAsClips_ = false;
     FrameTime sourceIn_ = -1;
     FrameTime sourceOut_ = -1;
     QString lastMergeKey_;

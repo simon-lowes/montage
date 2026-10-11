@@ -133,6 +133,7 @@ public slots:
 
 signals:
     void openInSource(montage::Id media);
+    void openInStackedTimeline(montage::Id sequence);
     void newTitleRequested();
     void newSequenceRequested();
     void createMulticamRequested(const std::vector<montage::Id>& media);

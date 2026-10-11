@@ -722,6 +722,12 @@ void EditorState::setSourceOut(FrameTime t) {
     emit sourceChanged();
 }
 
+void EditorState::setSequencesAsClips(bool on) {
+    if (sequencesAsClips_ == on) return;
+    sequencesAsClips_ = on;
+    emit sequencesAsClipsChanged(on);
+}
+
 bool EditorState::insertFromSource(bool overwriteMode) { return sourceEdit(overwriteMode ? SourceEdit::Overwrite : SourceEdit::Insert); }
 
 bool EditorState::sourceEdit(SourceEdit mode) {
@@ -764,14 +770,29 @@ bool EditorState::sourceEdit(SourceEdit mode) {
                           : mode == SourceEdit::RippleOverwrite ? tr("Ripple Overwrite")
                           : mode == SourceEdit::SmartInsert     ? tr("Smart Insert")
                                                                 : tr("Insert");
+    // A sequence as its own clips (insert, overwrite, append, smart insert), at the same frame rate; else nested.
+    const bool asClips = sequencesAsClips_ && m->kind == MediaKind::Sequence && mode != SourceEdit::PlaceOnTop &&
+                         mode != SourceEdit::RippleOverwrite;
+    bool nestedInstead = false;
     bool ok = apply(label, [&](Project& p, Sequence& sq) {
         matched = edit::matchSequenceToMedia(sq, *m);
+        if (asClips) {
+            const Sequence* src = p.findSequence(m->sequenceId);
+            if (src && src->fps == sq.fps) {
+                edit::Result r = edit::placeSequenceClips(p, sq, m->sequenceId, FrameTime(in), out < 0 ? -1 : FrameTime(out), at, vt.index,
+                                                          at_.index, insertMode);
+                created = r.created;
+                return r;
+            }
+            nestedInstead = true;
+        }
         edit::Result r = mode == SourceEdit::PlaceOnTop        ? edit::placeOnTop(p, sq, m->id, at, in, out, vt, at_)
                          : mode == SourceEdit::RippleOverwrite ? edit::rippleOverwrite(p, sq, replaced, m->id, in, out, vt, at_)
                                                                : edit::placeMedia(p, sq, m->id, at, in, out, vt, at_, insertMode);
         created = r.created;
         return r;
     });
+    if (ok && nestedInstead) message(tr("%1 runs at another frame rate, so it went in nested").arg(QString::fromStdString(m->name)), 6000);
     if (ok && !created.empty()) {
         if (const Clip* c = edit::clipById(*sequence(), created.front())) setPlayhead(c->end());
         setSelection(created);
