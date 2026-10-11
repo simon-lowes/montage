@@ -56,8 +56,9 @@ struct CredentialOptions {
 };
 
 // Signs the file at `path` in place: its credentials say Montage made it from other media, with `provenance`'s AI
-// use, and carry the credentials of `options.sources`. False with `error` when the format cannot hold them, the
-// signer is refused or the file cannot be written (the file is then as it was).
+// use, and carry the credentials of `options.sources` (those c2pa-rs can take in); a file already signed keeps its own
+// as their parent. False with `error` when the format cannot hold them, the signer is refused or the file cannot be
+// written (the file is then as it was).
 bool signContentCredentials(const std::string& path, const Provenance& provenance, const CredentialSigner& signer,
                             const CredentialOptions& options = {}, std::string* error = nullptr);
 
@@ -65,7 +66,9 @@ bool signContentCredentials(const std::string& path, const Provenance& provenanc
 // memory, so a refused certificate is known before a long export rather than after; false with why.
 bool checkCredentialSigner(const CredentialSigner& signer, std::string* error = nullptr);
 
-// The manifest definition signContentCredentials gives c2pa-rs (exposed for tests).
-std::string credentialManifestJson(const std::string& path, const Provenance& provenance, const CredentialOptions& options);
+// The manifest definition signContentCredentials gives c2pa-rs (exposed for tests); `parent`: the label of the file's
+// own earlier credentials, kept as an ingredient (opened, rather than created, in Montage).
+std::string credentialManifestJson(const std::string& path, const Provenance& provenance, const CredentialOptions& options,
+                                   const std::string& parent = {});
 
 }  // namespace montage

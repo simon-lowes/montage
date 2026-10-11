@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <set>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1705,17 +1706,27 @@ bool containerCarriesStreams(const std::string& path) {
     return false;
 }
 
+bool exportCarriesCredentials(const ExportSettings& s) {
+    // One file of a kind that holds them (not numbered frames, nor a GIF).
+    static const std::set<std::string> frames{"png", "tiff", "exr", "dpx", "gif"};
+    return contentCredentialsFormat(s.path) && !frames.count(s.videoCodec);
+}
+
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
                     LightLevels* light) {
     bool opened = false;
     if (smartRendered) *smartRendered = 0;
     if (light) *light = LightLevels{};
-    if (!s.credentialCertificate.empty() && (!contentCredentialsAvailable() || !contentCredentialsFormat(s.path))) {
-        if (error)
-            *error = contentCredentialsAvailable() ? "Content Credentials cannot go in this kind of file"
-                                                   : "This build of Montage cannot sign with Content Credentials";
-        return false;
+    if (!s.credentialCertificate.empty()) {  // (refused before rendering rather than after)
+        std::string why;
+        if (!contentCredentialsAvailable()) why = "This build of Montage cannot sign with Content Credentials";
+        else if (!exportCarriesCredentials(s)) why = "Content Credentials cannot go in this kind of file";
+        else if (!checkCredentialSigner({s.credentialCertificate, s.credentialKey, {}}, &why)) why = "Cannot sign with Content Credentials: " + why;
+        if (!why.empty()) {
+            if (error) *error = why;
+            return false;
+        }
     }
     // Channels the codec cannot carry fold down (an immersive mix in AAC to its ear-level 7.1 or 5.1), as the export
     // dialog's summary says, rather than failing or turning into stereo. Down to stereo it is the stereo fold-down of the

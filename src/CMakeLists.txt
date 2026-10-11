@@ -316,7 +316,8 @@ if(MONTAGE_WITH_ONNXRUNTIME)
   endif()
 endif()
 if(MONTAGE_WITH_C2PA)
-  # c2pa-rs's C API as a static library (scripts/build-c2pa.sh), with the system libraries rustc says it needs.
+  # c2pa-rs's C API as a static library (scripts/build-c2pa.sh), with the system libraries rustc says it needs (in
+  # its order, repeats kept: the Windows GNU toolchain's runtime libraries need them).
   if(NOT C2PA_ROOT)
     if(DEFINED ENV{C2PA_ROOT})
       set(C2PA_ROOT $ENV{C2PA_ROOT})
@@ -347,10 +348,11 @@ if(MONTAGE_WITH_C2PA)
           list(APPEND C2PA_NATIVE ${CMAKE_MATCH_1})
         endif()
       endforeach()
-      list(REMOVE_DUPLICATES C2PA_NATIVE)
     endif()
     add_library(montage_c2pa INTERFACE)
     target_include_directories(montage_c2pa INTERFACE ${C2PA_INCLUDE_DIR})
+    # A static library: its functions are not imported from a DLL (c2pa.h declares them dllimport on Windows otherwise).
+    target_compile_definitions(montage_c2pa INTERFACE C2PA_DYNAMIC_LOADING=1)
     target_link_libraries(montage_c2pa INTERFACE ${C2PA_LIBRARY} ${C2PA_NATIVE})
     target_link_libraries(montage_engine PRIVATE montage_c2pa)
     target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_C2PA)

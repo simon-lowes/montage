@@ -292,6 +292,7 @@ private:
     // Reads their media's length and streams again on a worker (paths already being read are skipped), then applies
     // what changed (no reload) and emits growingRefreshed.
     void refreshLengths(const QStringList& paths);
+    std::map<std::string, int> credentialReads_;  // per media path, credential reads begun (only the latest is applied)
     std::set<QString> probing_;
     std::map<QString, int> reloads_;  // per file, how often reloaded (a read begun before a reload is not applied)
     // Sets what probing `path` gave on its media, in the project and every state undo, redo or a gesture's start can

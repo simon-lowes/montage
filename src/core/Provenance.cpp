@@ -4,6 +4,7 @@
 #include <cmath>
 #include <set>
 
+#include "ColorGroups.h"
 #include "Effects.h"
 
 namespace montage {
@@ -48,7 +49,9 @@ void effectUses(Provenance& out, const Effect& e) {
 }
 
 void mediaUses(Provenance& out, const MediaItem& m) {
-    if (std::find(m.keywords.begin(), m.keywords.end(), "AI voice") == m.keywords.end()) return;
+    auto has = [&](const char* k) { return std::find(m.keywords.begin(), m.keywords.end(), k) != m.keywords.end(); };
+    if (has("Stem")) add(out, {"Stem Separation", "Spleeter", AiRole::Enhanced});  // (one part of a mix, split by a model)
+    if (!has("AI voice")) return;
     const auto note = m.metadata.find("comment");
     const std::string said = note == m.metadata.end() ? std::string() : note->second;
     if (said.find(" converted to a voice") != std::string::npos) add(out, {"Voice Conversion", "Chatterbox", AiRole::Generated});
@@ -61,8 +64,9 @@ void walk(Provenance& out, const Project& p, const Sequence& s, std::set<Id>& se
     for (const auto* tracks : {&s.videoTracks, &s.audioTracks})
         for (const Track& t : *tracks) {
             for (const Clip& c : t.clips) {
-                if (!c.enabled || (from >= 0 && c.end() <= from) || (to >= 0 && c.start > to)) continue;
-                for (const Effect& e : c.effects) effectUses(out, e);
+                // (`to` is exclusive, as an export's out point)
+                if (!c.enabled || (from >= 0 && c.end() <= from) || (to >= 0 && c.start >= to)) continue;
+                for (const Effect* e : gradeChain(s, c)) effectUses(out, *e);  // (its colour group's effects too)
                 if (!c.timing.empty() && std::lround(c.timing.p("sampling", 0)) == 3) add(out, {"AI Frames", "RIFE", AiRole::Generated});
                 const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
                 if (!m) continue;

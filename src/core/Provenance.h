@@ -1,8 +1,8 @@
 // Montage — what went into a sequence, for its Content Credentials (media/ContentCredentials.h): the media files it
 // plays (through nested sequences) and each use of an AI model in it, sorted by what the model did: made new content
 // (cloned or generated speech, voice conversion, object removal, AI frame interpolation), changed what was there (Super
-// Scale, Face Refinement, Relight, speech enhancement...) or only helped the edit (object and people masks, depth,
-// finding faces to redact).
+// Scale, Face Refinement, Relight, speech enhancement, stem separation...) or only helped the edit (object and people
+// masks, depth, finding faces to redact).
 #pragma once
 
 #include <string>
@@ -31,8 +31,8 @@ struct Provenance {
     bool generated() const;            // any AiRole::Generated
 };
 
-// What the enabled clips of the sequence between `from` and `to` (timeline frames, -1: its start or end), and the
-// sequences nested in them, use.
+// What the enabled clips of the sequence from `from` up to `to` (timeline frames, `to` not included, as an export's
+// range; -1: its start or end), and the sequences nested in them, use.
 Provenance sequenceProvenance(const Project& p, const Sequence& s, FrameTime from = -1, FrameTime to = -1);
 
 // The IPTC digital source type for a role ("" for Assisted).

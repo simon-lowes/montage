@@ -19,11 +19,14 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 15
         run: ./scripts/setup-deps.sh
+      - name: Rust version (part of the C2PA library's cache key)
+        id: rust
+        run: echo "version=$(rustc --version | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
       - name: Cache the C2PA library
         uses: actions/cache@v4
         with:
           path: ~/c2pa
-          key: c2pa-${{ runner.os }}-${{ hashFiles('scripts/build-c2pa.sh') }}
+          key: c2pa-${{ runner.os }}-${{ steps.rust.outputs.version }}-${{ hashFiles('scripts/build-c2pa.sh') }}
       - name: C2PA library (Content Credentials)
         run: scripts/build-c2pa.sh ~/c2pa
       - name: Configure

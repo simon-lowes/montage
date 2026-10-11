@@ -6825,13 +6825,15 @@ void McpServer::Impl::addTools() {
             const QString stems = str(a, "stems", "none");
             if (stems != "none" && stems != "tracks" && stems != "buses" && stems != "roles")
                 throw ArgError{"\"stems\" must be none, tracks, buses or roles"};
+            if (a.contains("credentials") && !a.value("credentials").isObject())
+                throw ArgError{"\"credentials\" is an object: {certificate, key, allow_ai_training}"};
             if (a.value("credentials").isObject()) {
                 const QJsonObject c = a.value("credentials").toObject();
                 st.credentialCertificate = absolute(need(c, "certificate")).toStdString();
                 st.credentialKey = absolute(need(c, "key")).toStdString();
                 st.credentialAllowAiTraining = c.value("allow_ai_training").toBool();
                 if (!contentCredentialsAvailable()) throw ArgError{"This build of Montage cannot sign with Content Credentials (no C2PA library)"};
-                if (!contentCredentialsFormat(st.path)) throw ArgError{"Content Credentials cannot go in this kind of file (mp4, mov, wav, mp3, jpg, png, tif can hold them)"};
+                if (!exportCarriesCredentials(st)) throw ArgError{"Content Credentials cannot go in this kind of export (a single mp4, mov, wav, mp3, jpg, png or tif file can hold them)"};
                 std::string why;
                 if (!checkCredentialSigner({st.credentialCertificate, st.credentialKey, {}}, &why)) return fail(QString::fromStdString(why));
             }

@@ -7019,6 +7019,20 @@ private slots:
         QCOMPARE(made.ai.size(), size_t(1));
         QCOMPARE(made.ai[0].feature, std::string("People Matte"));
 
+        // A range ends before its out point: a clip starting there is not in it.
+        QVERIFY(sequenceProvenance(fx.p, fx.s(), 0, 30).ai.empty());  // (a is off; b starts at 30)
+        // A colour group's grade runs on its clips too.
+        Id group = 0;
+        QVERIFY(makeColorGroup(fx.p, fx.s(), {b}, "Interviews", &group).ok);
+        findColorGroup(fx.s(), group)->post.push_back(makeEffect(fx.p, "relight"));
+        made = sequenceProvenance(fx.p, fx.s());
+        QVERIFY(std::find(made.ai.begin(), made.ai.end(), AiUse{"Relight", "Depth Anything V2", AiRole::Enhanced}) != made.ai.end());
+        // A stem a model split from a mix changed what was there.
+        fx.p.findMedia(fx.media)->keywords = {"Stem"};
+        made = sequenceProvenance(fx.p, fx.s());
+        QVERIFY(std::find(made.ai.begin(), made.ai.end(), AiUse{"Stem Separation", "Spleeter", AiRole::Enhanced}) != made.ai.end());
+        fx.p.findMedia(fx.media)->keywords.clear();
+
         // AI frames for slow motion generate pictures.
         clipById(fx.s(), b)->timing = makeEffect(fx.p, "time");
         clipById(fx.s(), b)->timing.params["sampling"] = Param(3);

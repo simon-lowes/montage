@@ -607,13 +607,18 @@ void ExportDialog::updateControls() {
     chapters_->setEnabled(chapterFile && anyChapters);
     startTc_->setEnabled(ext == QLatin1String("mxf") || ext == QLatin1String("mov"));
     if (credentials_) {
-        const bool can = contentCredentialsAvailable() && contentCredentialsFormat(("x." + ext).toStdString());
+        ExportSettings would = p ? p->settings : ExportSettings{};
+        would.path = ("x." + ext).toStdString();
+        const bool can = contentCredentialsAvailable() && p && exportCarriesCredentials(would);
         credentials_->setEnabled(can);
         credentials_->setToolTip(!contentCredentialsAvailable() ? tr("This build of Montage cannot sign (no C2PA library)")
-                                 : !can ? tr("Content Credentials cannot go in %1 files: MP4, MOV, WAV, MP3, JPEG, PNG and TIFF can hold them").arg(ext.toUpper())
+                                 : !can ? tr("Content Credentials cannot go in %1 exports: a single MP4, MOV, WAV, MP3, JPEG, PNG or TIFF file can hold them").arg(ext.toUpper())
                                         : tr("A signed record in the file of who made it, with what, and each AI model that "
                                              "generated or changed it, with the credentials its sources carried; checked at "
                                              "contentcredentials.org/verify. Like Premiere's Content Credentials."));
+        // Ticked but not possible here: said, so the export is not taken for signed.
+        credentials_->setText(can || !credentials_->isChecked() ? tr("Sign with Content Credentials")
+                                                                : tr("Sign with Content Credentials (not possible here: exported unsigned)"));
         credentialIdentity_->setEnabled(can);
         aiTraining_->setEnabled(can && credentials_->isChecked());
     }

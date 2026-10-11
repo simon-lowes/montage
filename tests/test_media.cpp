@@ -17133,10 +17133,45 @@ private slots:
         QVERIFY(probeMedia(camera, m));
         QVERIFY(std::abs(m.duration - 11.0) < 0.1);
 
-        // A format that cannot hold them: refused, the file untouched.
+        // Signed again (montage-cli sign on a camera original): the earlier credentials kept as its parent.
+        const std::string twice = path("twice.wav");
+        QVERIFY(QFile::copy(QString::fromStdString(camera), QString::fromStdString(twice)));
+        QVERIFY2(signContentCredentials(twice, {}, {certs, key, {}}, {}, &err), err.c_str());
+        QVERIFY2(readContentCredentials(twice, c, &err), err.c_str());
+        QVERIFY(c.present && c.state == "Valid");
+        QVERIFY(std::find(c.actions.begin(), c.actions.end(), "c2pa.opened") != c.actions.end());
+        QVERIFY(c.json.find("parentOf") != std::string::npos && c.json.find("Camera original") != std::string::npos);
+
+        // A format that cannot hold them: refused, the file untouched and nothing left beside it.
         const std::string mkv = path("cut.mkv");
         QVERIFY(QFile::copy(MONTAGE_TEST_DATA_DIR "/jfk.wav", QString::fromStdString(mkv)));
         QVERIFY(!signContentCredentials(mkv, {}, {certs, key, {}}, {}, &err) && err.find(".mkv") != std::string::npos);
+        auto bytes = [](const std::string& f) {
+            QFile in(QString::fromStdString(f));
+            return in.open(QIODevice::ReadOnly) ? in.readAll() : QByteArray();
+        };
+        QCOMPARE(bytes(mkv), bytes(MONTAGE_TEST_DATA_DIR "/jfk.wav"));
+        // A refused signer: the file untouched, no copy left beside it.
+        const QByteArray before = bytes(camera);
+        QVERIFY(!signContentCredentials(camera, {}, {MONTAGE_TEST_DATA_DIR "/c2pa/ca.pem", key, {}}, {}, &err));
+        QCOMPARE(bytes(camera), before);
+        QVERIFY(QDir(QString::fromStdString(path(""))).entryList({"*.signing-*"}, QDir::Files | QDir::Hidden).isEmpty());
+        // A file c2pa-rs cannot follow is not taken for one with broken credentials.
+        const std::string broken = path("broken.mp4");
+        {
+            QFile f(QString::fromStdString(broken));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QByteArray(4096, 'x'));
+        }
+        const bool readBroken = readContentCredentials(broken, c, &err);
+        QVERIFY(!(readBroken && c.present));
+        // Numbered frames cannot be signed: one file is.
+        ExportSettings frames;
+        frames.path = path("frame.png");
+        frames.videoCodec = "png";
+        QVERIFY(!exportCarriesCredentials(frames));
+        frames.videoCodec = "libx264", frames.path = path("cut.mp4");
+        QVERIFY(exportCarriesCredentials(frames));
         // Changed after signing: invalid.
         const std::string changed = path("changed.wav");
         QVERIFY(QFile::copy(QString::fromStdString(camera), QString::fromStdString(changed)));
@@ -17186,6 +17221,7 @@ private slots:
         QJsonObject r = call("montage_render", {{"project", project}, {"output", out}, {"preset", "Audio - WAV 24-bit"},
                                                 {"credentials", QJsonObject{{"certificate", MONTAGE_TEST_DATA_DIR "/c2pa/ca.pem"}, {"key", QString::fromStdString(key)}}}});
         QVERIFY2(r.value("isError").toBool() && !QFileInfo::exists(out), QJsonDocument(r).toJson().constData());
+        QVERIFY(call("montage_render", {{"project", project}, {"output", out}, {"credentials", "yes"}}).value("isError").toBool());
         r = call("montage_render", {{"project", project}, {"output", QString::fromStdString(path("signed.mkv"))}, {"credentials", signer}});
         QVERIFY(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("cannot go in"));
         r = call("montage_render", {{"project", project}, {"output", out}, {"preset", "Audio - WAV 24-bit"}, {"credentials", signer}});

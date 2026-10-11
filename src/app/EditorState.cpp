@@ -632,14 +632,15 @@ void EditorState::startCredentialRead(const MediaItem& m) {
     if (!contentCredentialsFormat(file)) return;
     QPointer<EditorState> self(this);
     const uint64_t generation = projectGeneration_;
-    (void)QtConcurrent::run([self, path, file, generation] {
+    const int read = ++credentialReads_[path];
+    (void)QtConcurrent::run([self, path, file, generation, read] {
         CredentialSummary c;
         if (!readContentCredentials(file, c)) return;  // (unreadable: what it said before stays)
         const std::string label = c.present ? credentialsLabel(c) : std::string();
         QCoreApplication* app = QCoreApplication::instance();
         if (!app) return;
-        QMetaObject::invokeMethod(app, [self, path, label, generation] {
-            if (!self || generation != self->projectGeneration_) return;
+        QMetaObject::invokeMethod(app, [self, path, label, generation, read] {
+            if (!self || generation != self->projectGeneration_ || self->credentialReads_[path] != read) return;  // (read again since)
             // As probed facts: in the project and every state undo, redo or a gesture's start can bring back.
             auto apply = [&](Project& p) {
                 bool changed = false;

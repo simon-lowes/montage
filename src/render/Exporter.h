@@ -119,6 +119,9 @@ struct ExportSettings {
     bool credentialAllowAiTraining = false;
 };
 
+// Whether an export with these settings can be signed with Content Credentials: a single file of a kind that holds them.
+bool exportCarriesCredentials(const ExportSettings& s);
+
 struct ExportPreset {
     std::string name;
     std::string extension;  // without dot

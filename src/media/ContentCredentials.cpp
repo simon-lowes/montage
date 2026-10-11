@@ -50,16 +50,24 @@ std::string credentialsLabel(const CredentialSummary& c) {
     return out;
 }
 
-std::string credentialManifestJson(const std::string& path, const Provenance& provenance, const CredentialOptions& options) {
+std::string credentialManifestJson(const std::string& path, const Provenance& provenance, const CredentialOptions& options,
+                                   const std::string& parent) {
     const QString name = QFileInfo(QString::fromStdString(path)).fileName();
     const QJsonObject montage{{"name", "Montage"}, {"version", MONTAGE_VERSION}};
-    // Made by Montage from other media (some of it made by AI, when it is), then each model's part.
+    // Made by Montage from other media (some of it made by AI, when it is), or a signed file opened in Montage; then each
+    // model's part.
     QJsonArray actions;
-    actions.append(QJsonObject{{"action", "c2pa.created"},
-                               {"digitalSourceType", QString::fromStdString(provenance.generated() ? iptcSourceType(AiRole::Generated)
-                                                                                                   : "http://cv.iptc.org/newscodes/digitalsourcetype/composite")},
-                               {"softwareAgent", montage},
-                               {"description", "Edited in Montage from other media"}});
+    if (!parent.empty())
+        actions.append(QJsonObject{{"action", "c2pa.opened"},
+                                   {"softwareAgent", montage},
+                                   {"parameters", QJsonObject{{"ingredientIds", QJsonArray{QString::fromStdString(parent)}}}},
+                                   {"description", "Signed again in Montage, its earlier credentials kept"}});
+    else
+        actions.append(QJsonObject{{"action", "c2pa.created"},
+                                   {"digitalSourceType", QString::fromStdString(provenance.generated() ? iptcSourceType(AiRole::Generated)
+                                                                                                       : "http://cv.iptc.org/newscodes/digitalsourcetype/composite")},
+                                   {"softwareAgent", montage},
+                                   {"description", "Edited in Montage from other media"}});
     for (const AiUse& u : provenance.ai) {
         const QString what = QString::fromStdString(u.feature + " (" + u.model + ")");
         QJsonObject a{{"action", "c2pa.edited"},
@@ -207,7 +215,7 @@ bool checkCredentialSigner(const CredentialSigner& signer, std::string* error) {
         QBuffer from(&wav), to;
         from.open(QIODevice::ReadOnly);
         to.open(QIODevice::ReadWrite);
-        C2paBuilder* builder = makeBuilder(credentialManifestJson("check.wav", {}, {}));
+        C2paBuilder* builder = makeBuilder(credentialManifestJson("check.wav", {}, {}, ""));
         why = builder ? signStream(builder, "audio/wav", &from, &to, sign) : "Content Credentials: " + lastError();
         if (builder) c2pa_free(builder);
         c2pa_free(sign);
@@ -231,15 +239,21 @@ bool readContentCredentials(const std::string& path, CredentialSummary& out, std
     if (reader) reader = c2pa_reader_with_stream(reader, format.c_str(), stream.get());
     if (context) c2pa_free(context);
     if (!reader) {
+        // By the kind of error ("Kind: message"): no manifest at all is the usual case, not a failure; a manifest that
+        // is there but broken or badly signed is invalid credentials; anything else (a file c2pa-rs cannot follow, a
+        // read error) says nothing about credentials.
         const std::string why = lastError();
-        // No manifest at all is the usual case, not a failure.
-        if (why.find("ManifestNotFound") != std::string::npos || why.find("JumbfNotFound") != std::string::npos ||
-            why.find("not found") != std::string::npos)
+        const std::string kind = why.substr(0, why.find(':'));
+        if (kind == "ManifestNotFound") return true;
+        if (kind == "Manifest" || kind == "Signature" || kind == "Verify" || kind == "Decoding" || kind == "Assertion" ||
+            kind == "AssertionNotFound") {
+            out.present = true;
+            out.state = "Invalid";
+            out.problems.push_back(why);
             return true;
-        out.present = true;
-        out.state = "Invalid";
-        out.problems.push_back(why);
-        return true;
+        }
+        if (error) *error = "Cannot read the Content Credentials of " + path + ": " + why;
+        return false;
     }
     char* json = c2pa_reader_json(reader);
     out.json = json ? json : "";
@@ -295,10 +309,29 @@ bool signContentCredentials(const std::string& path, const Provenance& provenanc
     std::string why;
     C2paSigner* sign = makeSigner(signer, why);
     if (!sign) return fail(why);
-    C2paBuilder* builder = makeBuilder(credentialManifestJson(path, provenance, options));
+    // A file already signed (a camera original) keeps its credentials, as the parent of the new ones.
+    CredentialSummary own;
+    const bool reSigned = readContentCredentials(path, own) && own.present;
+    C2paBuilder* builder = makeBuilder(credentialManifestJson(path, provenance, options, reSigned ? "parent" : ""));
     if (!builder) {
         c2pa_free(sign);
         return fail("Content Credentials: " + lastError());
+    }
+    if (reSigned) {
+        QFile in(QString::fromStdString(path));
+        bool added = in.open(QIODevice::ReadOnly);
+        if (added) {
+            FileStream stream(&in);
+            const QJsonObject ingredient{{"title", QFileInfo(in).fileName()}, {"relationship", "parentOf"}, {"label", "parent"}};
+            added = c2pa_builder_add_ingredient_from_stream(builder, QJsonDocument(ingredient).toJson(QJsonDocument::Compact).constData(),
+                                                            format.c_str(), stream.get()) == 0;
+        }
+        if (!added) {
+            const std::string why = lastError();
+            c2pa_free(builder);
+            c2pa_free(sign);
+            return fail("Could not keep the credentials " + path + " already has: " + why);
+        }
     }
     // Source files with credentials of their own (a camera's signature...) go in as ingredients, kept whole.
     int n = 0;
@@ -318,10 +351,10 @@ bool signContentCredentials(const std::string& path, const Provenance& provenanc
                                      {"label", QStringLiteral("source_%1").arg(++n)}};
         if (c2pa_builder_add_ingredient_from_stream(builder, QJsonDocument(ingredient).toJson(QJsonDocument::Compact).constData(),
                                                     type.c_str(), stream.get()) != 0) {
-            const std::string why = lastError();
-            c2pa_free(builder);
-            c2pa_free(sign);
-            return fail("Could not add the credentials of " + QFileInfo(in).fileName().toStdString() + ": " + why);
+            // (one source c2pa-rs cannot take in does not cost the export its own credentials)
+            (void)lastError();
+            --n;
+            continue;
         }
         const QJsonObject placed{{"action", "c2pa.placed"},
                                  {"parameters", QJsonObject{{"ingredientIds", QJsonArray{QStringLiteral("source_%1").arg(n)}}}}};

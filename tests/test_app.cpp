@@ -6394,6 +6394,9 @@ private slots:
                 if (preset->itemText(i).contains("MKV")) {
                     preset->setCurrentIndex(i);
                     QVERIFY(!sign->isEnabled());
+                    sign->setChecked(true);  // (remembered from another export): said to go out unsigned
+                    QVERIFY(sign->text().contains("unsigned"));
+                    sign->setChecked(false);
                     break;
                 }
             if (!contentCredentialsAvailable()) QSKIP("Built without the C2PA library (scripts/build-c2pa.sh) for the rest");
@@ -6442,6 +6445,8 @@ private slots:
         // A file without credentials gets none.
         const MediaItem* plain = state()->project().findMedia(ids[0]);
         QVERIFY(plain && !plain->metadata.count("c2pa"));
+        appSettings().remove("credentials/certificate");
+        appSettings().remove("credentials/key");
     }
 
     void convertVoice() {
