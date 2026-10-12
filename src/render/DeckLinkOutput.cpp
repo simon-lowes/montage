@@ -162,6 +162,7 @@ public:
         // P3-D65 or BT.2020 primaries, D65 white.
         const double p3[6] = {0.680, 0.320, 0.265, 0.690, 0.150, 0.060}, bt2020[6] = {0.708, 0.292, 0.170, 0.797, 0.131, 0.046};
         const double* pr = signal.masteringP3 ? p3 : bt2020;
+        if (!signal.hdrMetadata) return E_INVALIDARG;  // (HDR10's static metadata turned off, or HLG: the EOTF alone)
         switch (id) {
             case bmdDeckLinkFrameMetadataHDRDisplayPrimariesRedX: *v = pr[0]; break;
             case bmdDeckLinkFrameMetadataHDRDisplayPrimariesRedY: *v = pr[1]; break;
@@ -260,6 +261,7 @@ public:
         for (Card& c : cards())
             if (c.id == device.id) deckLink_ = std::move(c.deckLink);
         if (!deckLink_) return fail("The DeckLink device is not there any more");
+        hdrCard_ = device.hdr;
         output_ = query<IDeckLinkOutput>(deckLink_.p, IID_IDeckLinkOutput);
         if (!output_) return fail("The DeckLink device has no output");
         // Its frame duration in the card's time scale.
@@ -332,7 +334,8 @@ public:
         const Timecode& tc = vf.timecode;
         s.frame->SetTimecodeFromComponents(bmdTimecodeRP188Any, uint8_t(tc.hours), uint8_t(tc.minutes), uint8_t(tc.seconds), uint8_t(tc.frames),
                                            tc.dropFrame ? bmdTimecodeIsDropFrame : bmdTimecodeFlagDefault);
-        IDeckLinkVideoFrame* shown = signal_.eotf != Eotf::Sdr || signal_.bt2020 ? static_cast<IDeckLinkVideoFrame*>(&s.hdr)
+        // (a card that takes no HDR metadata gets the frame as it is)
+        IDeckLinkVideoFrame* shown = hdrCard_ && (signal_.eotf != Eotf::Sdr || signal_.bt2020) ? static_cast<IDeckLinkVideoFrame*>(&s.hdr)
                                                                                     : static_cast<IDeckLinkVideoFrame*>(s.frame);
         if (output_->ScheduleVideoFrame(shown, scheduled_ * duration_, duration_, scale_) != S_OK) {
             std::lock_guard lock(m_);
@@ -417,7 +420,7 @@ private:
     BMDTimeScale scale_ = 0;
     int width_ = 0, height_ = 0, channels_ = 0;
     size_t rowBytes_ = 0;
-    bool videoOn_ = false, audioOn_ = false, started_ = false;
+    bool videoOn_ = false, audioOn_ = false, started_ = false, hdrCard_ = false;
     int64_t scheduled_ = 0, audioTime_ = 0;
     Slot slots_[kFrames];
     std::vector<int32_t> pcm_;

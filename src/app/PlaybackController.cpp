@@ -208,7 +208,7 @@ private:
         auto it = cache_.find(r.frame);
         // (A frame kept here but let go by the reference output is rendered again for it.)
         const std::shared_ptr<output::Scheduler> dest = sink();
-        Rendered img = it != cache_.end() && (!dest || dest->ready(r.frame)) ? it->second : render(r, r.frame);
+        Rendered img = it != cache_.end() && (!dest || !dest->wants(r.frame)) ? it->second : render(r, r.frame);
         if (img.view.isNull()) return;
         emitFrame(img, r, r.frame);
         cache_[r.frame] = img;
@@ -230,7 +230,7 @@ private:
         for (int k = 1, n = ahead(); k <= n; ++k) {
             FrameTime t = ctx_.frame + FrameTime(k) * ctx_.direction;
             if (t < 0 || t >= end) return;
-            if (cache_.count(t)) continue;
+            if (cache_.count(t) && !(sink() && sink()->wants(t))) continue;
             Rendered img = render(ctx_, t);
             if (img.view.isNull()) return;
             cache_[t] = img;
@@ -496,8 +496,11 @@ void PlaybackController::syncOutput() {
 }
 
 double PlaybackController::renderScale() const {
+    // While output is on: the mode's size playing (a UHD sequence on a 1080p mode at half); parked, the whole picture
+    // or more, as the viewer and scopes show it.
     const double out = output_ && output_->running() ? output_->renderScale() : 0;
-    return out > 0 ? out : isPlaying() ? scale_ : 1.0;
+    if (out > 0) return isPlaying() ? out : std::max(1.0, out);
+    return isPlaying() ? scale_ : 1.0;
 }
 
 void PlaybackController::updateHeard() {

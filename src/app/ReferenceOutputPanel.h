@@ -59,6 +59,7 @@ private:
     std::shared_ptr<output::Backend> backend_;
     std::shared_ptr<output::Scheduler> scheduler_;
     output::Device device_;
+    QTimer* watch_ = nullptr;  // notices the output stopping by itself (a card unplugged)
     QString startedFor_;  // the sequence format it was opened for
     QString lastError_;
 };

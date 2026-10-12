@@ -4885,13 +4885,21 @@ colorspaces:
         }
         const std::vector<float> heard = dev->audio();
         QCOMPARE(heard[heard.size() - 2 * 1920], float(15 * 1920));  // embedded, channel 1 of 2
-        // A frame not rendered in time: the last one again, counted late.
+        // Frames not rendered in time: the last one again, counted late, while the sound runs on (not back over what
+        // it played).
         const int64_t lateBefore = sched.stats().late;
-        sched.setPosition(40, 1);
-        dev->step(1);
-        QVERIFY(dev->waitSent(sent.size() + 1));
-        QCOMPARE(dev->sent().back().frame, FrameTime(15));
-        QCOMPARE(sched.stats().late, lateBefore + 1);
+        for (FrameTime t = 16; t < 19; ++t) {
+            sched.setPosition(t, 1);
+            const size_t n = dev->sent().size();
+            dev->step(1);
+            QVERIFY(dev->waitSent(n + 1));
+            QCOMPARE(dev->sent().back().frame, FrameTime(15));
+        }
+        QCOMPARE(sched.stats().late, lateBefore + 3);
+        QCOMPARE(asked.size(), size_t(9));
+        for (size_t i = 6; i < asked.size(); ++i) QCOMPARE(asked[i].first, asked[i - 1].first + asked[i - 1].second);
+        // What it no longer wants: frames packed or behind the one due.
+        QVERIFY(!sched.wants(15) && !sched.wants(10) && sched.wants(19) && sched.wants(30));
         // Stopping while the device waits.
         sched.stop();
         QVERIFY(!sched.running());

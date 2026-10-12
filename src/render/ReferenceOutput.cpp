@@ -234,7 +234,11 @@ bool Scheduler::start(const Device& device, const Mode& mode, const Sequence& s,
 
 void Scheduler::stop() {
     if (!packer_.joinable() && !sender_.joinable()) return;
-    running_ = false;
+    {
+        // (under the lock: else the packer could miss the wake between testing running_ and waiting)
+        std::lock_guard lock(m_);
+        running_ = false;
+    }
     wake_.notify_all();
     backend_->wake();
     if (packer_.joinable()) packer_.join();
@@ -259,6 +263,15 @@ void Scheduler::submit(FrameTime t, std::shared_ptr<const Image> img) {
 bool Scheduler::ready(FrameTime t) const {
     std::lock_guard lock(m_);
     return packed_.count(t) > 0;
+}
+
+bool Scheduler::wants(FrameTime t) const {
+    std::lock_guard lock(m_);
+    if (!running_ || packed_.count(t) || pending_.count(t)) return false;
+    const int dir = speed_ > 0 ? 1 : speed_ < 0 ? -1 : 0;
+    const FrameTime target = position_ + FrameTime(config_.videoOffset) * dir;
+    // (as sendLoop lets frames go)
+    return dir > 0 ? t >= target - 2 : dir < 0 ? t <= target + 2 : true;
 }
 
 void Scheduler::clearFrames() {
@@ -377,8 +390,9 @@ void Scheduler::sendLoop() {
         const int n = int(std::llround((tick + 1) * audioRate_ / modeFps) - std::llround(tick * audioRate_ / modeFps));
         audio.assign(size_t(std::max(0, n)) * size_t(audioChannels_), 0.0f);
         if (audioChannels_ > 0 && speed == 1 && source) {
-            // Sound runs on from where it was, unless it has drifted more than a frame from the picture's.
-            const FrameTime shown = lastFrame >= 0 ? lastFrame : pos;
+            // Sound runs on from where it was, unless it has drifted more than a frame from the picture due (not the
+            // one repeated while frames are late, which would send it back over what it has played).
+            const FrameTime shown = target;
             const int64_t want = std::llround(double(shown) * audioRate_ / seqFps) - int64_t(config_.audioOffsetMs) * audioRate_ / 1000;
             if (!audioOn || std::llabs(cursor - want) > n * 3 / 2) cursor = want;
             if (cursor + n > 0) source(cursor, n, audioChannels_, audio.data());

@@ -159,6 +159,8 @@ public:
     void setPosition(FrameTime t, double speed);
     // Frame `t` packed, ready to send.
     bool ready(FrameTime t) const;
+    // Whether frame `t` is still to be submitted: not packed or waiting, and not behind the frame due to be sent.
+    bool wants(FrameTime t) const;
     // Frames submitted before are let go (the project changed).
     void clearFrames();
     // Mixes `frames` samples from sample `start` into `out` (`channels` interleaved, zeroed).

@@ -25,7 +25,17 @@ QString qs(const std::string& s) { return QString::fromStdString(s); }
 }  // namespace
 
 ReferenceOutputController::ReferenceOutputController(PlaybackController* program, QObject* parent)
-    : QObject(parent), program_(program), config_(loadConfig()) {}
+    : QObject(parent), program_(program), config_(loadConfig()) {
+    watch_ = new QTimer(this);
+    watch_->setInterval(500);
+    connect(watch_, &QTimer::timeout, this, [this] {
+        if (!scheduler_ || scheduler_->running()) return;
+        // Stopped by itself: said so, and let go.
+        const std::string why = scheduler_->stats().error;
+        stop();
+        lastError_ = why.empty() ? tr("The output stopped") : qs(why);
+    });
+}
 
 ReferenceOutputController::~ReferenceOutputController() { stop(); }
 
@@ -100,6 +110,8 @@ bool ReferenceOutputController::start(const output::Config& config, QString* err
     const output::Device* d = nullptr;
     for (const auto& x : devices)
         if (x.id == config.device) d = &x;
+    // (one named and not there is not swapped for another)
+    if (!d && !config.device.empty()) return fail(tr("No %1 device \"%2\"").arg(qs(b->name()), qs(config.device)));
     if (!d && !devices.empty()) d = &devices.front();
     if (!d) return fail(tr("No %1 device found").arg(qs(b->name())));
     // The mode: chosen, else the sequence's (any size and rate on NDI).
@@ -124,12 +136,14 @@ bool ReferenceOutputController::start(const output::Config& config, QString* err
     startedFor_ = formatKey();
     lastError_.clear();
     program_->setReferenceOutput(scheduler_);
+    watch_->start();
     emit runningChanged(true);
     return true;
 }
 
 void ReferenceOutputController::stop() {
     if (!scheduler_) return;
+    watch_->stop();
     if (program_) program_->setReferenceOutput(nullptr);
     scheduler_->stop();
     scheduler_.reset();
@@ -214,11 +228,23 @@ QString ReferenceOutputController::runTool(const QJsonObject& args, QJsonObject&
         auto has = [&](const char* k) { return args.contains(QLatin1String(k)); };
         if (has("interface")) c.backend = args.value("interface").toString().toStdString();
         if (has("device")) {
-            // By id or by name.
+            // By id or by name, on the interface named or any.
             c.device = args.value("device").toString().toStdString();
-            if (const auto b = output::findBackend(c.backend))
+            for (const auto& b : output::backends()) {
+                if ((!c.backend.empty() && b->name() != c.backend) || !b->available()) continue;
                 for (const auto& d : b->devices())
-                    if (d.name == c.device) c.device = d.id;
+                    if (d.id == c.device || d.name == c.device) {
+                        c.device = d.id;
+                        c.backend = b->name();
+                    }
+            }
+        } else if (const auto b = output::findBackend(c.backend)) {
+            // The last used, if it is still there (else the first).
+            bool there = false;
+            for (const auto& d : b->available() ? b->devices() : std::vector<output::Device>{}) there = there || d.id == c.device;
+            if (!there) c.device.clear();
+        } else {
+            c.device.clear();
         }
         if (has("mode")) c.mode = args.value("mode").toString().toStdString();
         if (has("depth")) c.depth = args.value("depth").toInt() == 8 ? 8 : 10;
@@ -384,6 +410,7 @@ void ReferenceOutputPanel::fillDevices() {
     why_->setText(!b ? QString() : !why.empty() ? qs(why) : devices_.empty() ? tr("No %1 device found").arg(qs(b->name())) : QString());
     why_->setVisible(!why_->text().isEmpty());
     const bool ndi = b && b->name() == "NDI";
+    hdr_->setEnabled(!ndi);  // (NDI carries the colour, not HDR10's mastering metadata)
     device_->setToolTip(ndi ? tr("The NDI source's name (other computers see \"<this computer> (Montage)\")") : QString());
     fillModes();    refresh();  // (Start, as there is a device now or not)
 }
