@@ -68,6 +68,7 @@
 #include "control/Hui.h"
 #include "control/Osc.h"
 #include "control/SpeedEditor.h"
+#include "control/Hid.h"
 #include "control/MackieControl.h"
 #include "control/Midi.h"
 
@@ -1283,6 +1284,26 @@ private slots:
         QCOMPARE(name, std::string("DaVinci Resolve Speed Editor"));
         QCOMPARE(serial, std::string("ab:cd"));
         QVERIFY(!parseHidUevent("DRIVER=hid-generic\n", bus, vendor, product, name, serial));
+        // An interface's usage, from its report descriptor: a keyboard's ordinary keys are told from the vendor's.
+        uint16_t page = 0, usage = 0;
+        const uint8_t keyboard[] = {0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x05, 0x07, 0xc0};
+        QVERIFY(hidPrimaryUsage(keyboard, sizeof keyboard, page, usage));
+        QCOMPARE(page, uint16_t(1));
+        QCOMPARE(usage, uint16_t(6));
+        HidDeviceInfo info;
+        info.usagePage = page;
+        info.usage = usage;
+        QVERIFY(info.isKeyboardOrMouse());
+        const uint8_t vendorDefined[] = {0x06, 0x00, 0xff, 0x09, 0x01, 0xa1, 0x01, 0xc0};
+        QVERIFY(hidPrimaryUsage(vendorDefined, sizeof vendorDefined, page, usage));
+        QCOMPARE(page, uint16_t(0xff00));
+        QCOMPARE(usage, uint16_t(1));
+        const uint8_t extended[] = {0x0b, 0x01, 0x00, 0x0c, 0x00, 0xa1, 0x01, 0xc0};  // (a four-byte usage: its page with it)
+        QVERIFY(hidPrimaryUsage(extended, sizeof extended, page, usage));
+        QCOMPARE(page, uint16_t(0x0c));
+        QCOMPARE(usage, uint16_t(1));
+        const uint8_t cut[] = {0x05, 0x01, 0x0a, 0x06};
+        QVERIFY(!hidPrimaryUsage(cut, sizeof cut, page, usage));
     }
 
     void huiProtocol() {
@@ -6716,6 +6737,35 @@ private slots:
         only.p.media.push_back(still);
         r = placeMedia(only.p, only.s(), still.id, 100, 0, 10, V1, A1, false, false, true);
         QVERIFY(!r.ok && r.error.find("Audio Only") != std::string::npos);
+
+        // Ripple Overwrite in Video Only replaces the picture and leaves the clip's sound where it was; shorter, it
+        // leaves a gap (what follows stays in sync), longer it pushes both kinds after it along.
+        Fixture ro2;
+        QVERIFY(placeMedia(ro2.p, ro2.s(), ro2.media, 0, 0, 60, V1, A1, false).ok);
+        const Result linked = placeMedia(ro2.p, ro2.s(), ro2.media, 60, 0, 60, V1, A1, false);
+        QVERIFY(linked.ok && linked.created.size() == 2);
+        const Result after = placeMedia(ro2.p, ro2.s(), ro2.media, 120, 0, 60, V1, A1, false);
+        QVERIFY(after.ok && after.created.size() == 2);
+        const Id keptSound = linked.created[1];
+        r = rippleOverwrite(ro2.p, ro2.s(), linked.created[0], ro2.media, 200, 220, V1, A1, true, false);
+        QVERIFY2(r.ok, r.error.c_str());
+        QCOMPARE(r.created.size(), size_t(1));
+        QCOMPARE(clipById(ro2.s(), r.created[0])->duration, FrameTime(20));
+        QVERIFY(clipById(ro2.s(), keptSound));
+        QCOMPARE(clipById(ro2.s(), keptSound)->duration, FrameTime(60));
+        QCOMPARE(clipById(ro2.s(), after.created[0])->start, FrameTime(120));
+        QCOMPARE(clipById(ro2.s(), after.created[1])->start, FrameTime(120));
+        r = rippleOverwrite(ro2.p, ro2.s(), r.created[0], ro2.media, 200, 300, V1, A1, true, false);
+        QVERIFY2(r.ok, r.error.c_str());
+        QCOMPARE(clipById(ro2.s(), r.created[0])->duration, FrameTime(100));
+        QCOMPARE(clipById(ro2.s(), after.created[0])->start, FrameTime(200));
+        QCOMPARE(clipById(ro2.s(), after.created[1])->start, FrameTime(200));
+        QCOMPARE(clipById(ro2.s(), keptSound)->start, FrameTime(60));
+        // Audio Only on a clip with no sound has nothing to replace.
+        const Id silent = ro2.put(V1, 200, 10);
+        r = rippleOverwrite(ro2.p, ro2.s(), silent, ro2.media, 0, 10, V1, A1, false, true);
+        QVERIFY(!r.ok && r.error.find("Audio Only") != std::string::npos);
+        QVERIFY(clipById(ro2.s(), silent));
     }
 
     void audioRoles() {

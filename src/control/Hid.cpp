@@ -30,6 +30,7 @@ extern "C" {
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 
 #include "SpeedEditor.h"
@@ -47,6 +48,38 @@ struct LostOnce {
     }
 };
 }  // namespace
+
+bool hidPrimaryUsage(const uint8_t* d, size_t n, uint16_t& page, uint16_t& usage) {
+    uint32_t pageSeen = 0, usageSeen = 0;
+    bool havePage = false, haveUsage = false;
+    for (size_t i = 0; i < n;) {
+        const uint8_t prefix = d[i];
+        if (prefix == 0xfe) {  // a long item: its size, its tag, its data
+            if (i + 1 >= n) break;
+            i += 3 + d[i + 1];
+            continue;
+        }
+        const size_t size = (prefix & 3) == 3 ? 4 : (prefix & 3);
+        if (i + 1 + size > n) break;
+        uint32_t v = 0;
+        for (size_t k = 0; k < size; ++k) v |= uint32_t(d[i + 1 + k]) << (8 * k);
+        const int type = (prefix >> 2) & 3, tag = prefix >> 4;
+        if (type == 1 && tag == 0) {  // Usage Page
+            pageSeen = v;
+            havePage = true;
+        } else if (type == 2 && tag == 0 && !haveUsage) {  // Usage (four bytes: the page in the high half)
+            usageSeen = size == 4 ? v : (havePage ? pageSeen : 0) << 16 | v;
+            haveUsage = true;
+        } else if (type == 0 && tag == 0xa) {  // Collection: the first one is the interface's
+            if (!haveUsage) return false;
+            page = uint16_t(usageSeen >> 16);
+            usage = uint16_t(usageSeen & 0xffff);
+            return true;
+        }
+        i += 1 + size;
+    }
+    return false;
+}
 
 #if defined(__linux__)
 
@@ -66,6 +99,9 @@ std::vector<HidDeviceInfo> hidDevices(uint16_t vendor, uint16_t product) {
         if (d.vendor != vendor || (product && d.product != product)) continue;
         d.path = std::string("/dev/") + e->d_name;
         d.bluetooth = bus == 0x05;  // BUS_BLUETOOTH
+        std::ifstream rd(std::string("/sys/class/hidraw/") + e->d_name + "/device/report_descriptor", std::ios::binary);
+        const std::string desc((std::istreambuf_iterator<char>(rd)), std::istreambuf_iterator<char>());
+        hidPrimaryUsage(reinterpret_cast<const uint8_t*>(desc.data()), desc.size(), d.usagePage, d.usage);
         out.push_back(d);
     }
     closedir(dir);
@@ -208,6 +244,8 @@ std::vector<HidDeviceInfo> hidDevices(uint16_t vendor, uint16_t product) {
             info.name = stringProperty(d, CFSTR(kIOHIDProductKey));
             info.serial = stringProperty(d, CFSTR(kIOHIDSerialNumberKey));
             info.bluetooth = stringProperty(d, CFSTR(kIOHIDTransportKey)).find("Bluetooth") != std::string::npos;
+            info.usagePage = uint16_t(intProperty(d, CFSTR(kIOHIDPrimaryUsagePageKey)));
+            info.usage = uint16_t(intProperty(d, CFSTR(kIOHIDPrimaryUsageKey)));
             out.push_back(info);
         }
         CFRelease(set);
@@ -352,7 +390,18 @@ std::vector<HidDeviceInfo> hidDevices(uint16_t vendor, uint16_t product) {
             if (HidD_GetProductString(h, text, sizeof text)) d.name = utf8(text);
             wchar_t serial[256] = {};
             if (HidD_GetSerialNumberString(h, serial, sizeof serial)) d.serial = utf8(serial);
-            d.bluetooth = lower.find("00001124-0000-1000-8000-00805f9b34fb") != std::string::npos || lower.find("bthledevice") != std::string::npos;
+            // Classic Bluetooth's HID service, or HID over GATT (Bluetooth LE).
+            d.bluetooth = lower.find("00001124-0000-1000-8000-00805f9b34fb") != std::string::npos ||
+                          lower.find("00001812-0000-1000-8000-00805f9b34fb") != std::string::npos || lower.find("bthledevice") != std::string::npos;
+            PHIDP_PREPARSED_DATA pp = nullptr;
+            if (HidD_GetPreparsedData(h, &pp)) {
+                HIDP_CAPS caps{};
+                if (HidP_GetCaps(pp, &caps) == HIDP_STATUS_SUCCESS) {
+                    d.usagePage = caps.UsagePage;
+                    d.usage = caps.Usage;
+                }
+                HidD_FreePreparsedData(pp);
+            }
             out.push_back(d);
         }
         CloseHandle(h);

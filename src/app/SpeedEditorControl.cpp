@@ -1,6 +1,7 @@
 #include "SpeedEditorControl.h"
 
 #include <QAction>
+#include <QApplication>
 #include <QTimer>
 #include <QWidget>
 #include <algorithm>
@@ -19,6 +20,7 @@ using speed::Key;
 namespace {
 constexpr int kDoublePressMs = 400;
 constexpr double kLevelStep = 0.5;  // dB a step of the wheel
+constexpr qint64 kRetryMs = 30000;  // a device refused is tried again after this
 
 struct Binding {
     Key key;
@@ -119,6 +121,7 @@ const std::pair<const char*, const char*> kBuiltIns[] = {
 
 SpeedEditorControl::SpeedEditorControl(EditorState* state, QWidget* window, Hooks hooks, QObject* parent)
     : QObject(parent), state_(state), window_(window), hooks_(std::move(hooks)) {
+    clock_.start();
     pollTimer_ = new QTimer(this);
     pollTimer_->setInterval(3000);
     connect(pollTimer_, &QTimer::timeout, this, &SpeedEditorControl::poll);
@@ -148,6 +151,7 @@ SpeedEditorControl::~SpeedEditorControl() {
 void SpeedEditorControl::setEnabled(bool on) {
     enabled_ = on;
     if (on) {
+        refused_.clear();  // (turned on again: everything is tried)
         pollTimer_->start();
         QTimer::singleShot(0, this, &SpeedEditorControl::poll);
     } else {
@@ -161,28 +165,40 @@ void SpeedEditorControl::poll() {
     std::vector<HidDeviceInfo> found;
     for (uint16_t product : {speed::kSpeedEditor, speed::kEditorKeyboard})
         for (const HidDeviceInfo& d : hidDevices(speed::kVendor, product)) found.push_back(d);
-    // Paths no longer there may be another device next time.
-    for (auto it = refused_.begin(); it != refused_.end();)
-        it = std::any_of(found.begin(), found.end(), [&](const HidDeviceInfo& d) { return d.path == *it; }) ? std::next(it) : refused_.erase(it);
+    // Paths no longer there may be another device next time; ones refused are tried again after a while (the
+    // device was busy in another program, or its permission has since been given).
+    const qint64 now = clock_.elapsed();
+    for (auto it = refused_.begin(); it != refused_.end();) {
+        const bool there = std::any_of(found.begin(), found.end(), [&](const HidDeviceInfo& d) { return d.path == it->first; });
+        it = there && now - it->second < kRetryMs ? std::next(it) : refused_.erase(it);
+    }
     for (const HidDeviceInfo& d : found) {
-        if (refused_.count(d.path)) continue;
+        if (refused_.count(d.path) || d.isKeyboardOrMouse()) continue;  // (the Editor Keyboard's ordinary keys)
         std::string err;
+        // Reports still queued from a device let go are dropped (attach() starts the next generation).
+        const uint64_t generation = generation_ + 1;
         auto dev = openHid(
             d.path,
-            [this](const uint8_t* data, size_t n) {
+            [this, generation](const uint8_t* data, size_t n) {
                 std::vector<uint8_t> report(data, data + n);
-                QMetaObject::invokeMethod(this, [this, report] { feed(report); }, Qt::QueuedConnection);
+                QMetaObject::invokeMethod(
+                    this, [this, generation, report] { if (generation == generation_) feed(report); }, Qt::QueuedConnection);
             },
-            [this] { QMetaObject::invokeMethod(this, [this] { lost(); }, Qt::QueuedConnection); }, &err);
+            [this, generation] {
+                QMetaObject::invokeMethod(this, [this, generation] { if (generation == generation_) lost(); }, Qt::QueuedConnection);
+            },
+            &err);
         if (!dev) {
             error_ = QString::fromStdString(err);
-            refused_.insert(d.path);
+            refused_[d.path] = now;
             emit connectionChanged();
             continue;
         }
         QString why;
         if (attach(std::move(dev), d, &why)) return;
-        refused_.insert(d.path);  // (the Editor Keyboard's ordinary keyboard: no challenge there)
+        refused_[d.path] = now;
+        error_ = why;
+        emit connectionChanged();
     }
 }
 
@@ -194,6 +210,7 @@ void SpeedEditorControl::lost() {
 
 bool SpeedEditorControl::attach(std::unique_ptr<HidDevice> device, const HidDeviceInfo& info, QString* error) {
     detach();
+    ++generation_;
     device_ = std::move(device);
     product_ = info.product;
     std::string why;
@@ -214,8 +231,10 @@ bool SpeedEditorControl::attach(std::unique_ptr<HidDevice> device, const HidDevi
     charging_ = false;
     accumulated_ = 0;
     shuttleSent_ = 0;
-    target_ = Target::None;
+    wheelModeKnown_ = false;
+    endTarget();
     holding_ = Key::None;
+    rollClip_ = 0;
     ledsKnown_ = false;
     setJogMode(jogMode_);
     refreshLeds();
@@ -230,10 +249,11 @@ void SpeedEditorControl::detach() {
     authTimer_->stop();
     deferTimer_->stop();
     deferred_ = Key::None;
-    if (jogMode_ == Key::Shuttle && shuttleSent_ != 0)
-        if (PlaybackController* c = hooks_.controller ? hooks_.controller() : nullptr) c->setSpeed(0);
-    shuttleSent_ = 0;
+    stopShuttle();
+    endTarget();
+    holding_ = Key::None;
     device_.reset();
+    ++generation_;
     name_.clear();
     battery_ = -1;
     emit connectionChanged();
@@ -258,11 +278,18 @@ void SpeedEditorControl::send(const std::vector<uint8_t>& report) {
 
 void SpeedEditorControl::feed(const std::vector<uint8_t>& report) {
     if (!device_) return;
+    // A dialog open (the keys' settings among them): keys and the wheel wait for it (a key let go still ends a hold).
+    // (Shuttling can still be stopped by turning the wheel back.)
+    const bool modal = QApplication::activeModalWidget() != nullptr;
     for (const speed::Event& e : decoder_.feed(report.data(), report.size())) {
         switch (e.kind) {
-            case speed::Event::KeyDown: keyDown(e.key); break;
+            case speed::Event::KeyDown:
+                if (!modal) keyDown(e.key);
+                break;
             case speed::Event::KeyUp: keyUp(e.key); break;
-            case speed::Event::Jog: jog(e.mode, e.value); break;
+            case speed::Event::Jog:
+                if (!modal || (jogMode_ == Key::Shuttle && shuttleSpeed(e.value) == 0)) jog(e.mode, e.value);
+                break;
             case speed::Event::Battery:
                 if (battery_ != e.level || charging_ != e.charging) {
                     battery_ = e.level;
@@ -324,6 +351,12 @@ QString SpeedEditorControl::builtInLabel(const QString& id) {
 }
 
 void SpeedEditorControl::keyDown(Key k) {
+    // TRANS waiting while another key comes: it goes first, as pressed.
+    if (deferred_ != Key::None && deferred_ != k) {
+        deferTimer_->stop();
+        const Key waiting = std::exchange(deferred_, Key::None);
+        run(binding(waiting), waiting);
+    }
     const QString second = secondBinding(k);
     if (k == lastKey_ && lastPress_.isValid() && lastPress_.elapsed() < kDoublePressMs && !second.isEmpty()) {
         // Pressed twice: what the brackets say (a primary still waiting is dropped).
@@ -334,9 +367,11 @@ void SpeedEditorControl::keyDown(Key k) {
         }
         if (holding_ == k) {
             holding_ = Key::None;
-            target_ = Target::None;
+            endTarget();
         }
+        second_ = true;
         run(second, k);
+        second_ = false;
         return;
     }
     lastKey_ = k;
@@ -353,7 +388,8 @@ void SpeedEditorControl::keyDown(Key k) {
 void SpeedEditorControl::keyUp(Key k) {
     if (holding_ != k) return;
     holding_ = Key::None;
-    if (target_ == Target::Level || target_ == Target::TransitionDuration) target_ = Target::None;
+    if (target_ == Target::Level || target_ == Target::TransitionDuration) endTarget();
+    refreshLeds();
 }
 
 void SpeedEditorControl::run(const QString& what, Key k) {
@@ -377,12 +413,18 @@ void SpeedEditorControl::runBuiltIn(const QString& id, Key k) {
     if (name == QLatin1String("shuttle")) return setJogMode(Key::Shuttle);
     if (name == QLatin1String("scroll")) return setJogMode(Key::Scroll);
     if (name == QLatin1String("source") || name == QLatin1String("timeline")) {
+        stopShuttle();  // (it would run on in the monitor left)
         if (hooks_.showMonitor) hooks_.showMonitor(name == QLatin1String("source"));
         return;
     }
     if (name == QLatin1String("play")) {
-        if (c) c->togglePlay();
-        shuttleSent_ = 0;
+        if (shuttleSent_ != 0 && shuttled_ && shuttled_->isPlaying()) {
+            stopShuttle();
+        } else {
+            shuttleSent_ = 0;
+            shuttled_ = nullptr;
+            if (c) c->togglePlay();
+        }
         return;
     }
     if (name.startsWith(QLatin1String("cam"))) {
@@ -401,23 +443,25 @@ void SpeedEditorControl::runBuiltIn(const QString& id, Key k) {
     if (name == QLatin1String("dissolve")) return void(setEditTransition("cross_dissolve"));
     if (name == QLatin1String("smooth_cut")) return void(setEditTransition("smooth_cut"));
     if (name == QLatin1String("audio_level") || name == QLatin1String("transition_duration")) {
+        startGesture();
         target_ = name == QLatin1String("audio_level") ? Target::Level : Target::TransitionDuration;
         holding_ = k;
-        ++gesture_;
-        accumulated_ = 0;
         return;
     }
     if (name == QLatin1String("escape")) {
-        target_ = Target::None;
-        targetClip_ = 0;
+        endTarget();
         if (QAction* a = keymap::find(window_, QStringLiteral("Sequence/End Trim Mode"))) a->trigger();
         return;
     }
     const Sequence* s = state_->sequence();
     if (!s) return;
     if (name == QLatin1String("trim_in") || name == QLatin1String("trim_out") || name == QLatin1String("roll")) {
-        target_ = Target::None;
+        endTarget();
+        stopShuttle();
         accumulated_ = 0;
+        // The clip under the playhead before it moves to the edit: ROLL pressed again slides that one.
+        rollClip_ = 0;
+        if (const Clip* under = edit::clipAt(*s, {TrackKind::Video, state_->targetVideoTrack()}, state_->playhead())) rollClip_ = under->id;
         if (hooks_.selectEdit) hooks_.selectEdit(name == QLatin1String("roll") ? 0 : name == QLatin1String("trim_out") ? 1 : 2);
         return;
     }
@@ -426,16 +470,17 @@ void SpeedEditorControl::runBuiltIn(const QString& id, Key k) {
         FrameTime at = 0;
         Id clip = 0;
         if (name == QLatin1String("slide")) {
-            if (const Clip* under = edit::clipAt(*s, {TrackKind::Video, state_->targetVideoTrack()}, state_->playhead())) clip = under->id;
+            if (second_ && k == Key::Roll && rollClip_ && edit::clipById(*s, rollClip_)) clip = rollClip_;
+            else if (const Clip* under = edit::clipAt(*s, {TrackKind::Video, state_->targetVideoTrack()}, state_->playhead())) clip = under->id;
+            rollClip_ = 0;
         } else if (targetEdit(outgoing, incoming, at)) {
             clip = name == QLatin1String("slip_source") ? incoming : outgoing;
         }
         if (!clip) return state_->message(tr("No clip there on the target video track"), 3000);
         if (QAction* a = keymap::find(window_, QStringLiteral("Sequence/End Trim Mode")); a && hooks_.trimming && hooks_.trimming()) a->trigger();
+        startGesture();
         target_ = name == QLatin1String("slide") ? Target::Slide : Target::Slip;
         targetClip_ = clip;
-        ++gesture_;
-        accumulated_ = 0;
         const Clip* cl = edit::clipById(*s, clip);
         state_->message((target_ == Target::Slide ? tr("Sliding %1: turn the wheel (ESC ends)") : tr("Slipping %1: turn the wheel (ESC ends)"))
                             .arg(cl ? QString::fromStdString(cl->name) : QString()),
@@ -448,14 +493,11 @@ void SpeedEditorControl::runBuiltIn(const QString& id, Key k) {
 
 void SpeedEditorControl::setJogMode(Key mode) {
     if (mode != Key::Jog && mode != Key::Shuttle && mode != Key::Scroll) return;
-    if (jogMode_ == Key::Shuttle && mode != Key::Shuttle && shuttleSent_ != 0) {
-        if (PlaybackController* c = hooks_.controller ? hooks_.controller() : nullptr) c->setSpeed(0);  // leaving the shuttle stops it
-    }
+    if (mode != jogMode_) stopShuttle();  // leaving the shuttle stops it
     jogMode_ = mode;
     accumulated_ = 0;
-    shuttleSent_ = 0;
-    send(speed::jogModeReport(mode == Key::Shuttle ? speed::JogMode::AbsoluteDeadZero : speed::JogMode::Relative2));
-    refreshLeds();
+    wheelModeKnown_ = false;
+    refreshLeds();  // (the device's wheel mode with them)
 }
 
 double SpeedEditorControl::shuttleSpeed(int32_t position) {
@@ -469,12 +511,16 @@ double SpeedEditorControl::shuttleSpeed(int32_t position) {
 
 void SpeedEditorControl::jog(speed::JogMode mode, int32_t value) {
     const bool absolute = mode == speed::JogMode::Absolute || mode == speed::JogMode::AbsoluteDeadZero;
-    if (jogMode_ == Key::Shuttle) {
+    // Slipping, sliding, a level, a transition or a trim take the wheel's turns in SHTL too (the device turned
+    // relative for them).
+    if (jogMode_ == Key::Shuttle && !wheelTurns()) {
         if (!absolute) return;  // (the mode is still changing)
         const double v = shuttleSpeed(value);
         if (v == shuttleSent_) return;
+        PlaybackController* c = shuttleSent_ != 0 && shuttled_ ? shuttled_.data() : hooks_.controller ? hooks_.controller() : nullptr;
         shuttleSent_ = v;
-        if (PlaybackController* c = hooks_.controller ? hooks_.controller() : nullptr) c->setSpeed(v);
+        shuttled_ = v != 0 ? c : nullptr;
+        if (c) c->setSpeed(v);
         return;
     }
     if (absolute) return;
@@ -489,7 +535,7 @@ void SpeedEditorControl::turn(int steps) {
     PlaybackController* c = hooks_.controller ? hooks_.controller() : nullptr;
     const double fps = s && s->fpsValue() > 0 ? s->fpsValue() : 25.0;
     const FrameTime frames = jogMode_ == Key::Scroll ? FrameTime(steps) * std::max<FrameTime>(1, FrameTime(std::lround(fps / 4))) : steps;
-    const QString key = QStringLiteral("speed-editor:%1").arg(gesture_);
+    const QString key = group_;
     switch (target_) {
         case Target::Slip:
         case Target::Slide: {
@@ -572,6 +618,46 @@ void SpeedEditorControl::turn(int steps) {
     if (c) c->step(int(frames));
 }
 
+void SpeedEditorControl::startGesture() {
+    endTarget();
+    stopShuttle();
+    ++gesture_;
+    accumulated_ = 0;
+    // Its edits one undo step however slowly the wheel turns (unless a script's run is grouping already).
+    group_ = QStringLiteral("speed-editor:%1").arg(gesture_);
+    if (state_->undoGroup().isEmpty()) state_->setUndoGroup(group_);
+}
+
+void SpeedEditorControl::endTarget() {
+    target_ = Target::None;
+    targetClip_ = 0;
+    rollClip_ = 0;
+    if (!group_.isEmpty() && state_->undoGroup() == group_) state_->setUndoGroup({});
+    group_.clear();
+}
+
+bool SpeedEditorControl::wheelTurns() const {
+    return target_ != Target::None || (hooks_.trimming && hooks_.trimming());
+}
+
+void SpeedEditorControl::syncWheelMode() {
+    // Back to the shuttle, the device's zero is where the wheel is then (so it does not start playing at once).
+    const speed::JogMode m = jogMode_ == Key::Shuttle && !wheelTurns() ? speed::JogMode::AbsoluteDeadZero : speed::JogMode::Relative2;
+    if (wheelModeKnown_ && m == wheelModeSent_) return;
+    if (m != speed::JogMode::AbsoluteDeadZero) stopShuttle();
+    send(speed::jogModeReport(m));
+    wheelModeSent_ = m;
+    wheelModeKnown_ = true;
+    accumulated_ = 0;
+}
+
+void SpeedEditorControl::stopShuttle() {
+    if (shuttleSent_ != 0)
+        if (PlaybackController* c = shuttled_ ? shuttled_.data() : hooks_.controller ? hooks_.controller() : nullptr) c->setSpeed(0);
+    shuttleSent_ = 0;
+    shuttled_ = nullptr;
+}
+
 // ---- The edit nearest the playhead
 
 bool SpeedEditorControl::targetEdit(Id& outgoing, Id& incoming, FrameTime& at) const {
@@ -640,6 +726,7 @@ bool SpeedEditorControl::setEditTransition(const std::string& type) {
 
 void SpeedEditorControl::refreshLeds() {
     if (!device_) return;
+    syncWheelMode();
     uint32_t leds = 0;
     for (Key k : speed::allKeys()) {
         const uint32_t bit = speed::ledBit(k);

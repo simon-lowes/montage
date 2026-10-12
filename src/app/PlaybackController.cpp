@@ -759,6 +759,7 @@ void PlaybackController::shuttle(int direction) {
 }
 
 void PlaybackController::setSpeed(double speed) {
+    if (!sequence()) return;
     if (speed == 0) {
         pause();
         return;

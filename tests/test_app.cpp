@@ -1,6 +1,7 @@
 // Application integration tests: drive the real main window offscreen —
 // timeline mouse gestures, tools, undo, inspector, monitors and playback.
 #include <QtTest>
+#include <QDialog>
 #include <QPointer>
 #include <QSignalSpy>
 #include <QStandardPaths>
@@ -1268,6 +1269,22 @@ private slots:
         QVERIFY(!program->isPlaying());
         wheel(speed::JogMode::AbsoluteDeadZero, 1100);
         QVERIFY(program->isPlaying());
+        // Another monitor picked: the one shuttling stops (and the wheel shuttles the one picked).
+        press(Key::Source);
+        QVERIFY(!program->isPlaying());
+        press(Key::Timeline);
+        wheel(speed::JogMode::AbsoluteDeadZero, 1100);
+        QVERIFY(program->isPlaying());
+        // Stopped some other way, STOP/PLAY plays at once.
+        program->pause();
+        apart();
+        press(Key::StopPlay);
+        QVERIFY(program->isPlaying());
+        apart();
+        press(Key::StopPlay);
+        QVERIFY(!program->isPlaying());
+        wheel(speed::JogMode::AbsoluteDeadZero, 2000);
+        QVERIFY(program->isPlaying());
         press(Key::Jog);  // leaving the shuttle stops it
         QVERIFY(!program->isPlaying());
         QCOMPARE(se->jogLeds(), speed::jogLedBit(Key::Jog));
@@ -1323,6 +1340,44 @@ private slots:
         wheel(speed::JogMode::Relative2, 360);
         QTRY_COMPARE(state()->playhead(), at + 1);  // the wheel moves the playhead again
         QCOMPARE(clip("A")->sourceIn, 21.0);
+        state()->undo();
+        QCOMPARE(clip("A")->sourceIn, 20.0);
+        // In SHTL a slip takes the wheel's turns too (the device turned relative until ESC), and a slow slip is still
+        // one undo step.
+        press(Key::Shuttle);
+        apart();
+        written->clear();
+        press(Key::SlipSource);
+        QVERIFY(sent(speed::jogModeReport(speed::JogMode::Relative2)));
+        wheel(speed::JogMode::AbsoluteDeadZero, 2000);  // (sent before the device changed mode: ignored)
+        QVERIFY(!program->isPlaying());
+        wheel(speed::JogMode::Relative2, 720);
+        QCOMPARE(clip("B")->sourceIn, 22.0);
+        QTest::qWait(1600);
+        wheel(speed::JogMode::Relative2, 360);
+        QCOMPARE(clip("B")->sourceIn, 23.0);
+        state()->undo();
+        QCOMPARE(clip("B")->sourceIn, 20.0);
+        apart();
+        written->clear();
+        press(Key::Escape);
+        QVERIFY(sent(speed::jogModeReport(speed::JogMode::AbsoluteDeadZero)));
+        QVERIFY(!program->isPlaying());
+        press(Key::Jog);
+        // ROLL twice slides the clip the playhead was in (B), not the one it moved to at the edit (C).
+        state()->setPlayhead(98);
+        program->seek(98);
+        apart();
+        press(Key::Roll);
+        press(Key::Roll);
+        QVERIFY(!win_->trimEdit());
+        wheel(speed::JogMode::Relative2, 360);
+        QCOMPARE(clip("B")->start, FrameTime(51));
+        QCOMPARE(clip("A")->end(), FrameTime(51));
+        state()->undo();
+        QCOMPARE(clip("B")->start, FrameTime(50));
+        apart();
+        press(Key::Escape);
 
         // DIS, SMTH CUT and CUT at the nearest edit (50), lit to match; TRANS DUR held lengthens it.
         state()->setPlayhead(48);
@@ -1348,6 +1403,23 @@ private slots:
         press(Key::Cut);
         QVERIFY(transitions().empty());
         QVERIFY(se->leds() & speed::ledBit(Key::Cut));
+        // TRANS waits for a second press, but another key coming first runs it at once: here CUT takes it off again.
+        state()->clearSelection();
+        apart();
+        press(Key::Transition);
+        press(Key::Cut);
+        QTest::qWait(450);
+        QVERIFY(transitions().empty());
+        // A dialog open: the keys wait.
+        {
+            QDialog dialog(win_.get());
+            dialog.setModal(true);
+            dialog.show();
+            QTRY_VERIFY(QApplication::activeModalWidget());
+            apart();
+            press(Key::Dissolve);
+            QVERIFY(transitions().empty());
+        }
 
         // AUDIO LEVEL held: the sound at the playhead, half a dB a step, one undo step.
         state()->setPlayhead(20);

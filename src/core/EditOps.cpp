@@ -385,21 +385,32 @@ Result placeOnTop(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcI
 
 Result rippleOverwrite(Project& p, Sequence& s, Id clipId, Id mediaId, double srcIn, double srcOut, TrackRef videoTrack,
                        TrackRef audioTrack, bool useVideo, bool useAudio) {
-    const Clip* c = clipById(s, clipId);
-    if (!c) return Result::fail("Unknown clip");
+    if (!clipById(s, clipId)) return Result::fail("Unknown clip");
+    if (!useVideo && !useAudio) useVideo = useAudio = true;
+    // The clip and its links, of the kinds edited (Video Only leaves the sound there, Audio Only the picture).
+    std::vector<Id> replaced;
+    bool kept = false;  // a linked clip of the other kind stays
+    for (Id id : linkedClips(s, clipId))
+        if (auto loc = locate(s, id)) {
+            if (loc->track.kind == TrackKind::Video ? useVideo : useAudio) replaced.push_back(id);
+            else kept = true;
+        }
+    if (replaced.empty()) return Result::fail(useVideo ? "No picture there to replace (Video Only)" : "No sound there to replace (Audio Only)");
+    const Clip* c = clipById(s, std::find(replaced.begin(), replaced.end(), clipId) != replaced.end() ? clipId : replaced.front());
     const FrameTime a = c->start, b = c->end();
     const Placed dry = dryPlace(p, s, mediaId, a, srcIn, srcOut, useVideo, useAudio);
     if (!dry.result.ok) return dry.result;
     // The replaced clips' tracks close up or open by the difference after the old end; other sync-locked tracks
     // follow where they can (a clip across the old end stays put).
-    const std::vector<Id> replaced = linkedClips(s, clipId);
     std::vector<TrackRef> primary;
     for (Id id : replaced)
         if (auto loc = locate(s, id); loc && std::find(primary.begin(), primary.end(), loc->track) == primary.end())
             primary.push_back(loc->track);
     Result r = removeClips(p, s, replaced, false);
     if (!r.ok) return r;
-    rippleShift(s, rippleTracks(s, primary), primary, b, dry.length - (b - a));
+    // With the other kind kept, a shorter clip leaves a gap rather than pulling what follows out of sync with it.
+    const FrameTime delta = dry.length - (b - a);
+    rippleShift(s, rippleTracks(s, primary), primary, b, kept ? std::max<FrameTime>(0, delta) : delta);
     return placeMedia(p, s, mediaId, a, srcIn, srcOut, videoTrack, audioTrack, false, useVideo, useAudio);
 }
 

@@ -43,6 +43,7 @@ public:
     // Edits with merge key `key` join one undo step however far apart they come (a script's run), until it is
     // cleared (""), the editor makes an edit of their own, or one is undone.
     void setUndoGroup(const QString& key) { undoGroup_ = key; }
+    QString undoGroup() const { return undoGroup_; }
     // The merge key of the latest undo step's edits, while nothing else has been done since ("" otherwise).
     QString lastMergeKey() const { return lastMergeKey_; }
     // Changes the project without a new undo step, for results derived from the

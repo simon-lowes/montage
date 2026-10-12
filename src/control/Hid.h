@@ -18,7 +18,12 @@ struct HidDeviceInfo {
     uint16_t vendor = 0, product = 0;
     std::string name, serial;
     bool bluetooth = false;
+    uint16_t usagePage = 0, usage = 0;  // the interface's top-level collection (0: not known)
+    // The system's own keyboard or mouse interface (a keyboard's ordinary keys): not one to open.
+    bool isKeyboardOrMouse() const { return usagePage == 0x01 && (usage == 0x06 || usage == 0x02); }
 };
+// The usage page and usage of a HID report descriptor's first top-level collection. False if there is none.
+bool hidPrimaryUsage(const uint8_t* descriptor, size_t size, uint16_t& page, uint16_t& usage);
 // The HID devices (each interface of a device its own) with this vendor id, and product id unless 0.
 std::vector<HidDeviceInfo> hidDevices(uint16_t vendor, uint16_t product = 0);
 

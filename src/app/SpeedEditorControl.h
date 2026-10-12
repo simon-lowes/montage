@@ -22,12 +22,12 @@
 #include <QElapsedTimer>
 #include <QJsonObject>
 #include <QObject>
+#include <QPointer>
 #include <QString>
 #include <QStringList>
 #include <functional>
 #include <map>
 #include <memory>
-#include <set>
 
 #include "control/Hid.h"
 #include "control/SpeedEditor.h"
@@ -110,6 +110,11 @@ private:
     bool setEditTransition(const std::string& type);
     std::string editTransition() const;  // the nearest edit's: "" a cut, "?" none there
     bool targetEdit(Id& outgoing, Id& incoming, FrameTime& at) const;
+    void startGesture();  // a new hold, slip or slide: one undo step, and the shuttle stopped
+    void endTarget();
+    void stopShuttle();
+    bool wheelTurns() const;  // a target or trim takes the wheel's turns
+    void syncWheelMode();
     void send(const std::vector<uint8_t>& report);
 
     EditorState* state_;
@@ -124,7 +129,10 @@ private:
     QTimer* authTimer_ = nullptr;
     QTimer* ledTimer_ = nullptr;
     QTimer* deferTimer_ = nullptr;
-    std::set<std::string> refused_;  // paths that would not authenticate (another interface of the keyboard)
+    // Paths that would not open or authenticate, and when (tried again a little later).
+    std::map<std::string, qint64> refused_;
+    QElapsedTimer clock_;
+    uint64_t generation_ = 0;  // which device opened the reports still queued come from
     int battery_ = -1;
     bool charging_ = false;
     std::map<speed::Key, QString> changes_;
@@ -136,10 +144,17 @@ private:
     speed::Key jogMode_ = speed::Key::Jog;
     int accumulated_ = 0;
     double shuttleSent_ = 0;
+    QPointer<PlaybackController> shuttled_;  // the monitor the shuttle runs
+    // The wheel's mode on the device: relative while a target or trim takes its turns, even in SHTL.
+    speed::JogMode wheelModeSent_ = speed::JogMode::Relative2;
+    bool wheelModeKnown_ = false;
     enum class Target { None, Slip, Slide, Level, TransitionDuration } target_ = Target::None;
     speed::Key holding_ = speed::Key::None;
     Id targetClip_ = 0;
+    Id rollClip_ = 0;  // the clip at the playhead when ROLL was pressed (ROLL twice slides it)
+    bool second_ = false;  // a key's second press running
     int gesture_ = 0;  // each hold or slip one undo step
+    QString group_;    // its undo group while on
     bool liveOverwrite_ = false;
     uint32_t ledsSent_ = 0;
     uint8_t jogLedsSent_ = 0;
