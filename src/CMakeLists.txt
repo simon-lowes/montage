@@ -45,6 +45,7 @@ add_library(montage_engine STATIC
   core/MergeClips.h core/MergeClips.cpp
   core/ClipAnimation.h core/ClipAnimation.cpp
   core/GradeVersions.h core/GradeVersions.cpp
+  core/GradeGraph.h core/GradeGraph.cpp
   core/AudioChannels.h core/AudioChannels.cpp
   core/TranscriptCorrect.h core/TranscriptCorrect.cpp
   core/SpellCheck.h core/SpellCheck.cpp

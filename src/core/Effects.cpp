@@ -113,6 +113,14 @@ std::vector<EffectInfo> buildCatalog() {
                   num("bb", "Blue from Blue", -16, 16, 1, 0.0001), num("offset_r", "Red Offset", -1, 1, 0, 0.00001), num("offset_g", "Green Offset", -1, 1, 0, 0.00001),
                   num("offset_b", "Blue Offset", -1, 1, 0, 0.00001)},
                  {}});
+    // A grade node's own settings (core/GradeGraph.h): how much of the node shows, its key input's part in its matte,
+    // and (as every video filter) its window, qualifier and depth qualifier, which limit the node as a whole.
+    c.push_back({"grade_node", "Node", EffectCategory::VideoFilter, "Color",
+                 {pct("mix", "Key Output Gain (Mix)", 0, 100, 100), pct("key_gain", "Key Input Gain", 0, 100, 100),
+                  boolean("key_invert", "Invert Key Input"),
+                  choice("key_mode", "Key Input", {"Multiply with the node's matte", "Add to it", "Subtract from it", "Replace it"}, 0)},
+                 {}});
+    c.back().hidden = true;
     c.push_back({"color_correct", "Color Correct (Primaries)", EffectCategory::VideoFilter, "Color",
                  {
                      num("exposure", "Exposure (stops)", -5, 5, 0),

@@ -1848,6 +1848,18 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
         for (Effect& e : g.pre) renew(e);
         for (Effect& e : g.post) renew(e);
     }
+    // Shared grade nodes likewise (their ids own their effects).
+    std::map<Id, Id> sharedNodes;
+    for (SharedNode& n : s.sharedNodes) {
+        const Id fresh = p.newId();
+        sharedNodes[n.id] = fresh;
+        n.id = fresh;
+        for (Effect& e : n.effects) renew(e);
+    }
+    auto remapShared = [&](GradeGraph& g) {
+        for (GradeNode& n : g.nodes)
+            if (n.shared) n.shared = sharedNodes.count(n.shared) ? sharedNodes[n.shared] : 0;
+    };
     for (auto* tracks : {&s.videoTracks, &s.audioTracks})
         for (Track& t : *tracks) {
             t.id = p.newId();
@@ -1870,6 +1882,8 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
                 for (Effect& e : c.effects) renew(e);
                 owner = 0;
                 if (c.colorGroup) c.colorGroup = colorGroups.count(c.colorGroup) ? colorGroups[c.colorGroup] : 0;
+                remapShared(c.grade);
+                for (GradeVersion& v : c.gradeVersions) remapShared(v.grade);
             }
             for (Transition& tr : t.transitions) {
                 tr.id = p.newId();
@@ -2168,6 +2182,8 @@ std::vector<Effect>* effectChain(Sequence& s, Id owner, FrameTime* origin) {
         if (g.id == owner) return &g.pre;
         if (g.postId == owner) return &g.post;
     }
+    for (auto& n : s.sharedNodes)
+        if (n.id == owner) return &n.effects;
     return nullptr;
 }
 

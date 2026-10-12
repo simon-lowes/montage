@@ -21,6 +21,12 @@ std::vector<const Effect*> gradeChain(const Sequence& s, const Clip& c) {
     if (g)
         for (const Effect& e : g->pre) out.push_back(&e);
     for (const Effect& e : c.effects) out.push_back(&e);
+    // The shared grade nodes its graph uses (core/GradeGraph.h).
+    for (const GradeNode& n : c.grade.nodes)
+        if (n.shared)
+            for (const SharedNode& sn : s.sharedNodes)
+                if (sn.id == n.shared)
+                    for (const Effect& e : sn.effects) out.push_back(&e);
     if (g)
         for (const Effect& e : g->post) out.push_back(&e);
     return out;

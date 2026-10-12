@@ -127,7 +127,7 @@ const Keyframe* Param::keyAt(FrameTime t) const {
 // Effect
 
 bool Effect::operator==(const Effect& o) const {
-    if (id != o.id || type != o.type || enabled != o.enabled || params != o.params || strings != o.strings) return false;
+    if (id != o.id || type != o.type || enabled != o.enabled || params != o.params || strings != o.strings || node != o.node) return false;
     if (object == o.object) return true;
     return object && o.object && *object == *o.object;
 }

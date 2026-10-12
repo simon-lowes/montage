@@ -1666,7 +1666,8 @@ bool redactNeedsLiveFaces(const Effect& e, double sourceSeconds) {
 }
 
 void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds) {
-    if (!e.enabled || img.empty()) return;
+    // (a grade node's settings act through the node graph, render/GradeGraph.h)
+    if (!e.enabled || img.empty() || e.type == "grade_node") return;
     struct SourceTime {
         double previous;
         explicit SourceTime(double s) : previous(tSourceSeconds) { tSourceSeconds = s; }
