@@ -197,10 +197,17 @@ std::vector<EffectInfo> buildCatalog() {
                  {angle("hue", "Hue Shift"), num("saturation", "Saturation", 0, 3, 1),
                   num("lightness", "Lightness", -1, 1, 0), num("vibrance", "Vibrance", -1, 1, 0)},
                  {}});
-    c.push_back({"lut", "LUT (.cube)", EffectCategory::VideoFilter, "Color",
-                 {pct("strength", "Strength", 0, 100, 100)},
-                 {str("path", "LUT File", StringKind::File)}});
-    c.back().strings[0].fileFilter = "LUT files (*.cube)";
+    {
+        // A .cube LUT or a Common LUT Format file (render/Clf.h, as ACES looks come), applied in the working space or
+        // in the space it was made for (a camera log, ACEScct, ACES2065-1).
+        std::vector<std::string> spaces{"Working space"};
+        for (const auto& cs : colorSpaces()) spaces.push_back(cs.label);
+        c.push_back({"lut", "LUT (.cube, .clf)", EffectCategory::VideoFilter, "Color",
+                     {pct("strength", "Strength", 0, 100, 100)},
+                     {str("path", "LUT File", StringKind::File), str("space", "Apply In", StringKind::Choice, "Working space")}});
+        c.back().strings[0].fileFilter = "LUT files (*.cube *.clf)";
+        c.back().strings[1].choices = spaces;
+    }
     {
         // ASC CDL (core/Cdl.h): slope, offset and power per channel and saturation, as dailies carry it, applied in
         // the working space or in the space it was made in (a camera log, ACEScct).

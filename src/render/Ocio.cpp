@@ -193,6 +193,22 @@ bool applyOcioBuiltin(const std::string& style, float* rgb, size_t count, bool i
     }
 }
 
+bool applyOcioFile(const std::string& path, float* rgb, size_t count, std::string* error) {
+    try {
+        OCIO::FileTransformRcPtr t = OCIO::FileTransform::Create();
+        t->setSrc(path.c_str());
+        t->setInterpolation(OCIO::INTERP_BEST);
+        OCIO::ConstConfigRcPtr raw = OCIO::Config::CreateRaw();
+        OCIO::ConstCPUProcessorRcPtr cpu = raw->getProcessor(t)->getDefaultCPUProcessor();
+        OCIO::PackedImageDesc desc(rgb, long(count), 1, 3);
+        cpu->apply(desc);
+        return true;
+    } catch (const OCIO::Exception& ex) {
+        if (error) *error = ex.what();
+        return false;
+    }
+}
+
 #else  // no OpenColorIO
 
 bool ocioAvailable() { return false; }
@@ -204,6 +220,10 @@ bool applyOcio(const Effect&, Image&, std::string* error) {
     return false;
 }
 bool applyOcioBuiltin(const std::string&, float*, size_t, bool, std::string* error) {
+    if (error) *error = "Montage was built without OpenColorIO";
+    return false;
+}
+bool applyOcioFile(const std::string&, float*, size_t, std::string* error) {
     if (error) *error = "Montage was built without OpenColorIO";
     return false;
 }

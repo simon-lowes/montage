@@ -4,6 +4,7 @@
 
 #include "ColorSpace.h"
 #include "ColorSlice.h"
+#include "Clf.h"
 #include "Gamut.h"
 #include "TransferTables.h"
 #include "Ocio.h"
@@ -24,10 +25,12 @@
 #include "media/Tracking.h"
 #include "media/FaceTracks.h"
 
+#include <QFileInfo>
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <array>
 #include <atomic>
@@ -293,18 +296,91 @@ void hueSat(const Effect& e, FrameTime t, Image& img) {
     });
 }
 
+// The colour space an effect's "Apply In" names (null: the working space).
+const ColorSpace* applyInSpace(const Effect& e) {
+    const ColorSpace& working = currentWorkingSpace();
+    for (const auto& cs : colorSpaces())
+        if (cs.label == e.s("space")) return cs.id == working.id ? nullptr : &cs;
+    return nullptr;
+}
+
+// `fn` run in `space`: the working space's code values into it and back exactly (linear light through its primaries and
+// curve, no display rendering), so only `fn` changes the picture; the round trip baked into a 65^3 LUT, kept for `key`.
+std::shared_ptr<const Lut3D> bakedInSpace(const ColorSpace& space, const std::string& key, const std::function<void(float[3])>& fn) {
+    const ColorSpace& working = currentWorkingSpace();
+    static std::mutex m;
+    static std::map<std::string, std::shared_ptr<const Lut3D>> cache;
+    const std::string full = working.id + "|" + space.id + "|" + key;
+    {
+        std::lock_guard lock(m);
+        if (auto it = cache.find(full); it != cache.end()) return it->second;
+    }
+    double to[9], from[9];
+    primariesMatrix(working.primaries, space.primaries, to);
+    primariesMatrix(space.primaries, working.primaries, from);
+    auto through = [](const double mat[9], Transfer a, Transfer b, float v[3]) {
+        double l[3], o[3];
+        for (int i = 0; i < 3; ++i) l[i] = toLinear(a, v[i]);
+        for (int i = 0; i < 3; ++i) o[i] = mat[i * 3] * l[0] + mat[i * 3 + 1] * l[1] + mat[i * 3 + 2] * l[2];
+        for (int i = 0; i < 3; ++i) v[i] = float(fromLinear(b, o[i]));
+    };
+    auto made = std::make_shared<Lut3D>();
+    const int n = 65;
+    made->size = n;
+    made->data.resize(size_t(n) * n * n * 3);
+    parallelRows(n, [&](int b0, int b1) {
+        for (int bi = b0; bi < b1; ++bi)
+            for (int gi = 0; gi < n; ++gi)
+                for (int ri = 0; ri < n; ++ri) {
+                    float v[3] = {float(ri) / (n - 1), float(gi) / (n - 1), float(bi) / (n - 1)};
+                    through(to, working.transfer, space.transfer, v);
+                    fn(v);
+                    through(from, space.transfer, working.transfer, v);
+                    float* d = &made->data[(size_t(bi) * n * n + size_t(gi) * n + size_t(ri)) * 3];
+                    d[0] = v[0], d[1] = v[1], d[2] = v[2];
+                }
+    });
+    std::lock_guard lock(m);
+    if (cache.size() > 64) cache.clear();  // (a keyframed CDL makes a new one each frame)
+    cache[full] = made;
+    return made;
+}
+
+// A .cube or CLF file's transform on one colour; null (with the reason) when it cannot be read.
+std::function<void(float[3])> lutFileTransform(const std::string& path, std::string* error) {
+    if (QString::fromStdString(path).endsWith(QLatin1String(".clf"), Qt::CaseInsensitive)) {
+        auto clf = loadClf(path, error);
+        if (!clf) return nullptr;
+        return [clf](float v[3]) { clf->apply(v); };
+    }
+    auto lut = loadCubeLut(path, error);
+    if (!lut) return nullptr;
+    return [lut](float v[3]) { lut->apply(v[0], v[1], v[2]); };
+}
+
 void applyLut(const Effect& e, FrameTime t, Image& img) {
     std::string path = e.s("path");
     if (path.empty()) return;
-    auto lut = loadCubeLut(path);
-    if (!lut) return;
+    auto fn = lutFileTransform(path, nullptr);
+    if (!fn) return;
     float strength = float(e.p("strength", t, 100)) / 100.0f;
+    std::shared_ptr<const Lut3D> baked;
+    if (const ColorSpace* space = applyInSpace(e)) {
+        const QFileInfo fi(QString::fromStdString(path));
+        baked = bakedInSpace(*space, "lut|" + path + "|" + std::to_string(fi.size()) + "|" +
+                                         std::to_string(fi.lastModified().toMSecsSinceEpoch()), fn);
+    }
     perPixel(img, [&](float& r, float& g, float& b, float&) {
-        float nr = r, ng = g, nb = b;
-        lut->apply(nr, ng, nb);
-        r += (nr - r) * strength;
-        g += (ng - g) * strength;
-        b += (nb - b) * strength;
+        float v[3] = {r, g, b};
+        if (baked) {
+            for (float& c : v) c = std::clamp(c, 0.0f, 1.0f);
+            baked->apply(v[0], v[1], v[2]);
+        } else {
+            fn(v);
+        }
+        r += (v[0] - r) * strength;
+        g += (v[1] - g) * strength;
+        b += (v[2] - b) * strength;
     });
 }
 
@@ -321,55 +397,13 @@ Cdl effectCdl(const Effect& e, FrameTime t) {
 void applyCdlEffect(const Effect& e, FrameTime t, Image& img) {
     const Cdl cdl = effectCdl(e, t);
     if (cdl.identity()) return;
-    const ColorSpace* space = nullptr;
-    for (const auto& cs : colorSpaces())
-        if (cs.label == e.s("space")) space = &cs;
-    const ColorSpace& working = currentWorkingSpace();
-    if (!space || space->id == working.id) {
+    const ColorSpace* space = applyInSpace(e);
+    if (!space) {
         perPixel(img, [&](float& r, float& g, float& b, float&) { applyCdl(cdl, r, g, b); });
         return;
     }
-    // Into that space and back exactly (linear light through its primaries and curve, no display rendering), so only
-    // the CDL changes the picture: the whole round trip baked into a 65^3 LUT, kept for these values.
-    static std::mutex m;
-    static std::map<std::string, std::shared_ptr<const Lut3D>> cache;
-    std::string key = working.id + "|" + space->id + "|" + cdlSopText(cdl) + cdlNumber(cdl.saturation);
-    std::shared_ptr<const Lut3D> lut;
-    {
-        std::lock_guard lock(m);
-        if (auto it = cache.find(key); it != cache.end()) lut = it->second;
-    }
-    if (!lut) {
-        double to[9], from[9];
-        primariesMatrix(working.primaries, space->primaries, to);
-        primariesMatrix(space->primaries, working.primaries, from);
-        auto through = [](const double mat[9], Transfer a, Transfer b, float v[3]) {
-            double l[3], o[3];
-            for (int i = 0; i < 3; ++i) l[i] = toLinear(a, v[i]);
-            for (int i = 0; i < 3; ++i) o[i] = mat[i * 3] * l[0] + mat[i * 3 + 1] * l[1] + mat[i * 3 + 2] * l[2];
-            for (int i = 0; i < 3; ++i) v[i] = float(fromLinear(b, o[i]));
-        };
-        auto made = std::make_shared<Lut3D>();
-        const int n = 65;
-        made->size = n;
-        made->data.resize(size_t(n) * n * n * 3);
-        parallelRows(n, [&](int b0, int b1) {
-            for (int bi = b0; bi < b1; ++bi)
-                for (int gi = 0; gi < n; ++gi)
-                    for (int ri = 0; ri < n; ++ri) {
-                        float v[3] = {float(ri) / (n - 1), float(gi) / (n - 1), float(bi) / (n - 1)};
-                        through(to, working.transfer, space->transfer, v);
-                        applyCdl(cdl, v[0], v[1], v[2]);
-                        through(from, space->transfer, working.transfer, v);
-                        float* d = &made->data[(size_t(bi) * n * n + size_t(gi) * n + size_t(ri)) * 3];
-                        d[0] = v[0], d[1] = v[1], d[2] = v[2];
-                    }
-        });
-        lut = made;
-        std::lock_guard lock(m);
-        if (cache.size() > 64) cache.clear();  // (a keyframed CDL makes a new one each frame)
-        cache[key] = lut;
-    }
+    auto lut = bakedInSpace(*space, "cdl|" + cdlSopText(cdl) + cdlNumber(cdl.saturation),
+                            [&](float v[3]) { applyCdl(cdl, v[0], v[1], v[2]); });
     perPixel(img, [&](float& r, float& g, float& b, float&) {
         r = std::clamp(r, 0.0f, 1.0f), g = std::clamp(g, 0.0f, 1.0f), b = std::clamp(b, 0.0f, 1.0f);
         lut->apply(r, g, b);

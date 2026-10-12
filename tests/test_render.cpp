@@ -31,6 +31,7 @@
 #include "core/LensProfile.h"
 #include "render/ColorSpace.h"
 #include "render/ColorSlice.h"
+#include "render/Clf.h"
 #include "render/Gamut.h"
 #include "render/HdrView.h"
 #include "render/Compositor.h"
@@ -238,6 +239,73 @@ private slots:
         for (int i = 0; i < 3; ++i)
             QVERIFY2(std::fabs(compressed[i] - want[i]) < 0.005f, qPrintable(QString("%1: %2 vs %3").arg(i).arg(compressed[i]).arg(want[i])));
         QVERIFY2(std::fabs(compressed[1] - plain[1]) > 0.005f, qPrintable(QString("%1 / %2").arg(plain[1]).arg(compressed[1])));
+    }
+
+    void clfMatchesOcio() {
+        // Montage's CLF reader gives what OpenColorIO gives for the same files: every operator, integer bit depths,
+        // both 3D LUT interpolations, values outside 0..1.
+        if (!ocioAvailable()) QSKIP("Built without OpenColorIO");
+        std::vector<float> colours;
+        for (float r : {-0.1f, 0.0f, 0.18f, 0.37f, 0.5f, 0.73f, 1.0f, 1.2f})
+            for (float g : {0.0f, 0.05f, 0.42f, 0.9f, 1.0f})
+                for (float b : {-0.02f, 0.11f, 0.6f, 0.95f}) colours.insert(colours.end(), {r, g, b});
+        for (const char* name : {"operators.clf", "lut3d_tetrahedral.clf", "lut3d_trilinear.clf"}) {
+            const std::string path = std::string(MONTAGE_TEST_DATA_DIR) + "/clf/" + name;
+            std::string error;
+            auto clf = loadClf(path, &error);
+            QVERIFY2(clf, error.c_str());
+            QVERIFY(!clf->description.empty());
+            std::vector<float> want = colours;
+            QVERIFY2(applyOcioFile(path, want.data(), want.size() / 3, &error), error.c_str());
+            double worst = 0;
+            for (size_t i = 0; i < colours.size(); i += 3) {
+                float v[3] = {colours[i], colours[i + 1], colours[i + 2]};
+                clf->apply(v);
+                for (int c = 0; c < 3; ++c) worst = std::max(worst, double(std::fabs(v[c] - want[i + size_t(c)])));
+            }
+            QVERIFY2(worst < 1e-4, (std::string(name) + " differs by " + std::to_string(worst)).c_str());
+            QCOMPARE(loadClf(path).get(), clf.get());  // (kept while the file is unchanged)
+        }
+        // The LUT effect applies a CLF as it is in the working space, or in the space it names (here ACEScct, by way of
+        // linear light), mixed by its strength.
+        const std::string ops = std::string(MONTAGE_TEST_DATA_DIR) + "/clf/operators.clf";
+        auto clf = loadClf(ops);
+        Project p;
+        Effect e = makeEffect(p, "lut");
+        e.strings["path"] = ops;
+        const float in[3] = {0.3f, 0.55f, 0.8f};
+        Image img = solid(2, 2, in[0], in[1], in[2]);
+        applyVideoEffect(e, 0, img, 1);
+        float c[4], want[3] = {in[0], in[1], in[2]};
+        clf->apply(want);
+        rgb(img, 0, 0, c);
+        for (int i = 0; i < 3; ++i) QVERIFY(std::fabs(c[i] - want[i]) < 1e-5);
+        e.strings["space"] = "ACEScct";
+        e.params["strength"] = 50.0;
+        img = solid(2, 2, in[0], in[1], in[2]);
+        applyVideoEffect(e, 0, img, 1);
+        const ColorSpace& rec = rec709Space();
+        double to[9], from[9], l[3], o[3];
+        primariesMatrix(rec.primaries, Primaries::Ap1, to);
+        primariesMatrix(Primaries::Ap1, rec.primaries, from);
+        for (int i = 0; i < 3; ++i) l[i] = toLinear(rec.transfer, in[i]);
+        for (int i = 0; i < 3; ++i) want[i] = float(fromLinear(Transfer::AcesCct, to[i * 3] * l[0] + to[i * 3 + 1] * l[1] + to[i * 3 + 2] * l[2]));
+        clf->apply(want);
+        for (int i = 0; i < 3; ++i) o[i] = toLinear(Transfer::AcesCct, want[i]);
+        for (int i = 0; i < 3; ++i) want[i] = float(fromLinear(rec.transfer, from[i * 3] * o[0] + from[i * 3 + 1] * o[1] + from[i * 3 + 2] * o[2]));
+        rgb(img, 0, 0, c);
+        for (int i = 0; i < 3; ++i) QVERIFY2(std::fabs(c[i] - (in[i] + want[i]) / 2) < 3e-3, std::to_string(c[i] - (in[i] + want[i]) / 2).c_str());
+
+        // Files that are not CLF, or use what is not read, say why.
+        std::string why;
+        QVERIFY(!parseClf("<ProcessList><LUT1D halfDomain=\"true\"><Array dim=\"2 1\">0 1</Array></LUT1D></ProcessList>", &why));
+        QVERIFY(why.find("Half") != std::string::npos);
+        QVERIFY(!parseClf("<ProcessList><LUT3D><Array dim=\"2 2 2 3\">0 1</Array></LUT3D></ProcessList>", &why));
+        QVERIFY(why.find("size") != std::string::npos);
+        QVERIFY(!parseClf("<ProcessList><Gamut /></ProcessList>", &why));
+        QVERIFY(why.find("Gamut") != std::string::npos);
+        QVERIFY(!parseClf("<Something />", &why));
+        QVERIFY(!parseClf("not xml", &why));
     }
 
     void colorSliceAndTexture() {
