@@ -1,5 +1,5 @@
-// Montage — scripts in the app (automation/ScriptHost.h): the Script Console (write, open, save and run Lua against
-// the open project, its output below) and the scripts folder the Tools › Scripts menu lists. A script's tools work on
+// Montage — scripts in the app (automation/ScriptHost.h): the Script Console (write, open, save and run Lua or Python
+// against the open project, its output below) and the scripts folder the Tools › Scripts menu lists. A script's tools work on
 // the open project through the agent link (app/LiveLink.h), and a whole run is one undo step, "Script: <name>". A
 // script that calls montage.panel ends there and its panel opens (app/ScriptPanelWidget.h, through the PanelHost);
 // a button on the panel runs it again with what the panel holds.
@@ -14,6 +14,7 @@
 #include "automation/ScriptPanel.h"
 
 class QEventLoop;
+class QComboBox;
 class QLabel;
 class QPlainTextEdit;
 class QPushButton;
@@ -25,7 +26,7 @@ class LiveLink;
 
 // $MONTAGE_SCRIPTS_DIR, else "Scripts" in the app's data folder.
 QString scriptsDirectory();
-// The .lua files in it, by name.
+// The .lua and .py files in it, by name.
 QStringList listScripts();
 
 // Where scripts' panels live (the main window's docks). A panel is known by its key: its script's file, or
@@ -59,6 +60,9 @@ public:
     void stop();  // the script stops at its next step; a tool running is not waited for, and its result not applied
     bool running() const { return running_; }
 
+    // The editor's language (an opened or saved script's follows its file); switching it swaps an untouched example.
+    bool python() const;
+    void setPython(bool on);
     bool open(const QString& path);  // into the editor
     bool save(const QString& path);  // the editor's script
     QPlainTextEdit* editor() const { return editor_; }
@@ -71,6 +75,7 @@ signals:
 private:
     void print(const QString& text, bool error = false);
     void updateButtons();
+    void followFile();  // the language set to the file's
     // A run: `key` names its panel, `values` answer montage.panel (a button pressed), `setUp` refuses tools.
     bool runScriptAs(const QString& code, const QString& name, const QStringList& args, const QString& key,
                      const std::optional<QJsonObject>& values, bool setUp);
@@ -83,6 +88,7 @@ private:
     QPlainTextEdit* output_;
     QPushButton* run_;
     QPushButton* stop_;
+    QComboBox* language_;
     QLabel* file_;
     QString path_;  // the editor's script on disk ("" until saved)
     QString group_;  // the running script's undo group (its calls, for cancelling)

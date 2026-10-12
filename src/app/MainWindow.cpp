@@ -5,6 +5,7 @@
 #include "AssistantPanel.h"
 #include "ScriptConsole.h"
 #include "ScriptPanelWidget.h"
+#include "automation/ScriptHost.h"
 #include "CleanFeed.h"
 #include "Settings.h"
 
@@ -1941,7 +1942,8 @@ void MainWindow::buildMenus() {
         scriptsM->addAction(tr("Run Script…"), this, [this] {
             if (scripts_->running()) return state_->message(tr("A script is running"), 4000);
             QDir().mkpath(scriptsDirectory());
-            const QString f = QFileDialog::getOpenFileName(this, tr("Run Script"), scriptsDirectory(), tr("Lua scripts (*.lua);;All files (*)"));
+            const QString f = QFileDialog::getOpenFileName(this, tr("Run Script"), scriptsDirectory(),
+                                                           tr("Scripts (*.lua *.py);;Lua scripts (*.lua);;Python scripts (*.py);;All files (*)"));
             if (f.isEmpty()) return;
             scriptsDock_->show();
             scriptsDock_->raise();
@@ -5724,6 +5726,8 @@ void MainWindow::restoreScriptPanels() {
     QStringList open = appSettings().value(QStringLiteral("scripts/panels")).toStringList(), forgotten;
     for (const QString& path : open) {
         if (scriptPanels_.count(path) || scripts_->running()) continue;
+        // (Not forgotten for want of a Python this time: one may be found at the next start.)
+        if (!scriptAvailable(path)) continue;
         // A script that is gone, or no longer describes its panel (it errs, runs on, or ends without one), is forgotten
         // rather than run again at every start.
         if (!QFileInfo::exists(path) || !scripts_->setUpPanel(path)) forgotten << path;

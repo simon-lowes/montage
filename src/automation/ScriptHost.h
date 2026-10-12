@@ -1,5 +1,5 @@
-// Montage — scripts (Resolve's Lua and Python scripting, Premiere's UXP scripts, Avid's scripting): Lua 5.4 programs
-// that drive Montage through the same tools as its MCP server and AI agents. In a script `montage.add_title{text =
+// Montage — scripts (Resolve's Lua and Python scripting, Premiere's UXP scripts, Avid's scripting): Lua 5.4 programs (or Python
+// ones, automation/PythonHost.h) that drive Montage through the same tools as its MCP server and AI agents. In a script `montage.add_title{text =
 // "Hello", at = 2}` calls montage_add_title (any tool by its name without "montage_", or montage.call("montage_...",
 // args)); arguments are tables, results come back as tables (a tool's structured result, else {text = ...}; JSON null in
 // an array as montage.null), and a tool's error stops the script with its message. `montage.tools()` lists them, `montage.args` holds the script's
@@ -26,6 +26,7 @@ struct ScriptOptions {
     std::function<void()> tick;     // called now and then while the script runs (the app keeps its window alive)
     QStringList args;
     QString project;  // montage.project: the project the script works on ("" if none)
+    QString file;     // the script's file (absolute), when it has one: Python's __file__ and sys.path[0]
     bool noStdin = false;  // no io.read or io.lines() from standard input (the app has none: they would wait for ever)
     // A panel opening again by itself (at start-up): no os.execute, io.popen, writing or removing files.
     bool quiet = false;
@@ -43,8 +44,12 @@ class McpServer;
 ScriptOptions toolScriptOptions(McpServer& server, const QString& project = {});
 
 bool scriptingAvailable();  // built with Lua
+// Whether a script named `name` can run here: Python's (".py", automation/PythonHost.h) with a Python 3.8 or later on
+// the computer, the rest (Lua) with Lua built in.
+bool scriptAvailable(const QString& name);
 
-// Runs Lua `code` (named `name` in errors); false with the error (its line, or "Stopped") when it fails or is stopped.
+// Runs `code` (named `name` in errors): Python when the name ends ".py", else Lua; false with the error (its line, or
+// "Stopped") when it fails or is stopped.
 bool runScript(const QString& code, const QString& name, const ScriptOptions& options, QString* error = nullptr);
 
 }  // namespace montage

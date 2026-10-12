@@ -34,6 +34,7 @@
 #include "media/Loudness.h"
 #ifdef MONTAGE_WITH_WHISPER
 #include "automation/McpServer.h"
+#include "automation/PythonHost.h"
 #include "automation/ScriptHost.h"
 #include "automation/ScriptPanel.h"
 #include "media/Inference.h"
@@ -118,9 +119,11 @@ int usage() {
                  "              (Content Credentials: made in Montage, with the project's AI use and its sources' credentials)\n"
                  "  montage-cli convert-voice <speech> --voice sample.wav -o out.wav --consent [--from S] [--to S]\n"
                  "              [--voice-from S] [--voice-to S]   (the speech said again in the sample's voice, as long as it was)\n"
-                 "  montage-cli script [--project <project.montage>] [--press <button> [--set id=value]...] <file.lua> [arg...]\n"
-                 "                                       (a Lua script driving Montage's tools; montage.add_title{text = \"Hi\"}\n"
-                 "                                        calls montage_add_title. A script with a panel prints it, or with\n"
+                 "  montage-cli script [--project <project.montage>] [--press <button> [--set id=value]...] <file.lua|.py> [arg...]\n"
+                 "                                       (a Lua or Python script driving Montage's tools; montage.add_title{text =\n"
+                 "                                        \"Hi\"} (Python: montage.add_title(text=\"Hi\")) calls montage_add_title.\n"
+                 "                                        Python is the computer's ($MONTAGE_PYTHON, else python3; 3.8 or later).\n"
+                 "                                        A script with a panel prints it, or with\n"
                  "                                        --press runs as if that button were pressed, --set filling its controls)\n"
                  "  montage-cli mcp [--live]              (Model Context Protocol server on stdio, for AI agents;\n"
                  "                                        --live: on the project open in Montage, with Tools > Agent Link on)\n"
@@ -1336,7 +1339,7 @@ int cmdConvertVoice(const std::vector<std::string>& args) {
     return 0;
 }
 
-// A Lua script on Montage's tools, on the project named by --project (the tools that take a project get it when the
+// A Lua or Python (.py) script on Montage's tools, on the project named by --project (the tools that take a project get it when the
 // script names none); print() goes to stdout, the error to stderr.
 int cmdScript(const std::vector<std::string>& args) {
     // Options before the script; everything after it is the script's ("-p 3" there is an argument).
@@ -1364,8 +1367,10 @@ int cmdScript(const std::vector<std::string>& args) {
         std::fprintf(stderr, "error: --set fills a panel for --press\n");
         return 2;
     }
-    if (!scriptingAvailable()) {
-        std::fprintf(stderr, "error: this build of Montage has no Lua\n");
+    if (!scriptAvailable(QString::fromStdString(file))) {
+        std::fprintf(stderr, isPythonScript(QString::fromStdString(file))
+                                 ? "error: no Python 3.8 or later was found (set MONTAGE_PYTHON to one)\n"
+                                 : "error: this build of Montage has no Lua\n");
         return 1;
     }
     std::ifstream in(file, std::ios::binary);
@@ -1377,6 +1382,7 @@ int cmdScript(const std::vector<std::string>& args) {
     McpServer server;
     ScriptOptions o = toolScriptOptions(server, project.empty() ? QString() : QFileInfo(QString::fromStdString(project)).absoluteFilePath());
     o.args = rest;
+    o.file = QFileInfo(QString::fromStdString(file)).absoluteFilePath();
     o.print = [](const QString& line) {
         std::printf("%s\n", line.toUtf8().constData());
         std::fflush(stdout);

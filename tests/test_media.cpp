@@ -124,6 +124,7 @@
 #include "media/Inpaint.h"
 #include "media/VisualSearch.h"
 #include "automation/McpServer.h"
+#include "automation/PythonHost.h"
 #include "automation/ScriptHost.h"
 #include "automation/ScriptPanel.h"
 #include "core/Cdl.h"
@@ -9507,6 +9508,261 @@ private slots:
         // A table held many times over is refused as a tool's argument rather than copied 2^60 times.
         QVERIFY(!runScript("local t = {} for i = 1, 60 do t = {t, t} end montage.call('montage_project_info', {x = t})", "big.lua", o, &err));
         QVERIFY2(err.contains("too large"), qPrintable(err));
+    }
+
+    void pythonScripts() {
+        if (!pythonAvailable()) QSKIP("no Python 3.8 or later here");
+        QVERIFY(isPythonScript("a.py") && isPythonScript("A.PY") && !isPythonScript("a.lua") && !isPythonScript("py"));
+        QVERIFY(scriptAvailable("x.py"));
+        QTemporaryDir dir;
+        const QString project = dir.path() + "/s.montage";
+        McpServer server;
+        ScriptOptions o = toolScriptOptions(server, project);
+        QStringList printed;
+        o.print = [&](const QString& line) { printed << line; };
+        o.args = {"Hello", "2"};
+        // The same tools as Lua's, by short name (keywords or a dict) and by montage.call; results as dicts; the
+        // arguments as montage.args and sys.argv; montage.json and montage.project; print() and sys.stderr both shown.
+        QString err;
+        const QString code = R"py(
+import sys
+import montage
+montage.create_project(width=1280, height=720, fps=25)
+first = montage.add_title(text=montage.args[0], at=0, duration=float(sys.argv[2]))
+second = montage.call("montage_add_title", {"text": "World", "at": 2})
+assert first["id"] != second["id"]
+info = montage.project_info()
+titles = sum(1 for t in info["tracks"] for c in t.get("clips", []) if c.get("generator") == "title")
+print("titles", titles)
+print(montage.json([1, 2, {"a": True}, None]).replace(" ", "").replace("\n", ""))
+print(montage.project.endswith("s.montage"), sys.argv[0])
+print(type(info["width"]).__name__, info["width"])
+print("to stderr", file=sys.stderr)
+print("no newline at the end", end="")
+)py";
+        QVERIFY2(runScript(code, "make.py", o, &err), qPrintable(err));
+        QCOMPARE(printed.value(0), QStringLiteral("titles 2"));
+        QCOMPARE(printed.value(1), QStringLiteral("[1,2,{\"a\":true},null]"));
+        QCOMPARE(printed.value(2), QStringLiteral("True make.py"));
+        QCOMPARE(printed.value(3), QStringLiteral("int 1280"));
+        QCOMPARE(printed.value(4), QStringLiteral("to stderr"));
+        QCOMPARE(printed.value(5), QStringLiteral("no newline at the end"));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->width, 1280);
+        // A tool's error raises montage.ToolError (which a script can catch); uncaught, the script fails with the line
+        // it was on. So does a tool that does not exist, a Python error, and a script that does not parse.
+        QVERIFY(!runScript("\n\nmontage.add_title(text='x', at='not a time')", "bad.py", o, &err));
+        QVERIFY2(err.startsWith("bad.py:3: ToolError:") && err.contains("montage_add_title"), qPrintable(err));
+        printed.clear();
+        QVERIFY2(runScript("try:\n    montage.add_title(text='x', at='no')\nexcept montage.ToolError as e:\n    print('caught')", "c.py", o, &err), qPrintable(err));
+        QCOMPARE(printed, QStringList{"caught"});
+        QVERIFY(!runScript("montage.no_such_tool()", "t.py", o, &err));
+        QVERIFY2(err.contains("no tool montage.no_such_tool"), qPrintable(err));
+        QVERIFY(!runScript("raise ValueError('mine')", "e.py", o, &err));
+        QCOMPARE(err, QStringLiteral("e.py:1: ValueError: mine"));
+        QVERIFY(!runScript("x = 1\ndef (:", "p.py", o, &err));
+        QVERIFY2(err.startsWith("p.py:2: SyntaxError"), qPrintable(err));
+        // The script's own lines of the traceback go to its output.
+        printed.clear();
+        QVERIFY(!runScript("def f():\n    raise KeyError('k')\nf()", "tb.py", o, &err));
+        QVERIFY2(err.startsWith("tb.py:2: KeyError"), qPrintable(err));
+        QVERIFY2(printed.join('\n').contains("line 3") && !printed.join('\n').contains("<string>"), qPrintable(printed.join('\n')));
+        // sys.exit: 0 (or none) succeeds, anything else fails; os._exit too.
+        QVERIFY(runScript("import sys\nsys.exit()", "x.py", o, &err));
+        QVERIFY(!runScript("import sys\nsys.exit(3)", "x.py", o, &err) && err.contains("3"));
+        QVERIFY(!runScript("import os\nos._exit(4)", "x.py", o, &err));
+        QVERIFY2(err.contains("exit code 4"), qPrintable(err));
+        // Keywords named like call()'s own parameters are the tool's.
+        printed.clear();
+        QVERIFY2(runScript("m = montage.add_marker(at=1, name='Named')\nm2 = montage.call('montage_add_marker', at=2, name='Too', args=None)\nprint('ok')", "kw.py", o, &err), qPrintable(err));
+        QCOMPARE(printed.value(0), QStringLiteral("ok"));
+        // montage.tools() lists them; what JSON cannot hold is refused, not changed.
+        printed.clear();
+        QVERIFY(runScript("print(len(montage.tools()) > 50, 'montage_add_title' in montage.tools())", "n.py", o, &err));
+        QCOMPARE(printed.value(0), QStringLiteral("True True"));
+        for (const char* bad : {"montage.json([float('nan')])", "montage.json([float('inf')])", "montage.json([1 << 60])",
+                                "montage.json({(1, 2): 1})", "montage.json([print])", "l = []; l.append(l); montage.project_info(x=l)",
+                                "montage.project_info(5)"})
+            QVERIFY2(!runScript(bad, "bad.py", o, &err), bad);
+        // A file's "#!" line and byte order mark (line numbers kept), and text beyond ASCII both ways.
+        QVERIFY(!runScript("\xEF\xBB\xBF#!/usr/bin/env -S montage-cli script\nraise RuntimeError('here')", "sh.py", o, &err));
+        QVERIFY2(err.startsWith("sh.py:2:"), qPrintable(err));
+        printed.clear();
+        QVERIFY2(runScript(QString::fromUtf8("print('Grüße, 東京 🎬')"), "u.py", o, &err), qPrintable(err));
+        QCOMPARE(printed.value(0), QString::fromUtf8("Grüße, 東京 🎬"));
+        // No standard input: reading it is an error rather than a wait for ever. Programs it runs write to the
+        // script's output, not into Montage's messages.
+        QVERIFY(!runScript("input()", "in.py", o, &err) && err.contains("no standard input"));
+        printed.clear();
+        QVERIFY2(runScript("import os, subprocess, sys\nsubprocess.run([sys.executable, '-c', 'print(\"child\")'])\nos.system('echo shell')", "sub.py", o, &err),
+                 qPrintable(err));
+        QVERIFY2(printed.contains("child") && printed.contains("shell"), qPrintable(printed.join('|')));
+        // Stopped: a script that never ends (or is waiting) stops when its host says so; no tool runs once stopped.
+        QElapsedTimer t;
+        t.start();
+        o.stopped = [&] { return t.elapsed() > 300; };
+        QVERIFY(!runScript("while True:\n    pass", "forever.py", o, &err));
+        QCOMPARE(err, QStringLiteral("Stopped"));
+        t.restart();
+        QVERIFY(!runScript("import time\ntime.sleep(60)", "sleep.py", o, &err));
+        QCOMPARE(err, QStringLiteral("Stopped"));
+        QVERIFY(t.elapsed() < 10000);
+        bool stop = false;
+        int calls = 0;
+        o.stopped = [&] { return stop; };
+        const auto call = o.call;
+        o.call = [&](const QString& name, const QJsonObject& args, QString* e) {
+            if (++calls == 3) stop = true;
+            return call(name, args, e);
+        };
+        QVERIFY(!runScript("while True:\n    try:\n        montage.project_info()\n    except BaseException:\n        pass", "catching.py", o, &err));
+        QCOMPARE(err, QStringLiteral("Stopped"));
+        QCOMPARE(calls, 3);
+        o.call = call;
+        o.stopped = {};
+        // A tool's answer that is not structured comes back as {"text": ...}; montage.null is None.
+        printed.clear();
+        QVERIFY2(runScript("print(montage.null is None, isinstance(montage.project_info(), dict))", "v.py", o, &err), qPrintable(err));
+        QCOMPARE(printed.value(0), QStringLiteral("True True"));
+        // Several threads calling tools at once each get their own answers.
+        printed.clear();
+        QVERIFY2(runScript("import threading\n"
+                           "bad = []\n"
+                           "def work(n):\n"
+                           "    for i in range(40):\n"
+                           "        r = montage.project_info()\n"
+                           "        if 'width' not in r: bad.append(r)\n"
+                           "        print('thread', n, i)\n"
+                           "ts = [threading.Thread(target=work, args=(n,)) for n in range(4)]\n"
+                           "[t.start() for t in ts]\n"
+                           "[t.join() for t in ts]\n"
+                           "print('bad', len(bad))", "threads.py", o, &err), qPrintable(err));
+        QCOMPARE(printed.size(), 161);
+        QCOMPARE(printed.last(), QStringLiteral("bad 0"));
+        // A message of several lines is kept whole, with its type.
+        QVERIFY(!runScript("raise ValueError('first\\nsecond')", "lines.py", o, &err));
+        QCOMPARE(err, QStringLiteral("lines.py:1: ValueError: first\nsecond"));
+        // Programs given the script's output write to it; a line ends at "\r" too, and flush shows what is held.
+        printed.clear();
+        QVERIFY2(runScript("import subprocess, sys\n"
+                           "subprocess.run([sys.executable, '-c', 'print(\"given\")'], stdout=sys.stdout)\n"
+                           "print('10%', end='\\r')\nprint('done')\n"
+                           "sys.stdout.write('held')\nsys.stdout.flush()\nimport time\ntime.sleep(0.1)", "out.py", o, &err), qPrintable(err));
+        QCOMPARE(printed, (QStringList{"given", "10%", "done", "held"}));
+        // A script's file: its folder's modules import, __file__ is its path, and its traceback shows its lines; a
+        // module in the working directory does not take the place of Python's own.
+        QDir(dir.path()).mkpath("lib");
+        QFile helper(dir.path() + "/lib/helper.py");
+        QVERIFY(helper.open(QIODevice::WriteOnly));
+        helper.write("WORD = 'beside'\n");
+        helper.close();
+        QFile shadow(dir.path() + "/traceback.py");
+        QVERIFY(shadow.open(QIODevice::WriteOnly));
+        shadow.write("raise ImportError('shadowed')\n");
+        shadow.close();
+        const QString was = QDir::currentPath();
+        QDir::setCurrent(dir.path());
+        o.file = dir.path() + "/lib/main.py";
+        printed.clear();
+        const bool besides = runScript("import helper, os\nprint(helper.WORD, os.path.basename(__file__))\ndef f():\n    raise KeyError('k')\nf()", "main.py", o, &err);
+        QDir::setCurrent(was);
+        o.file.clear();
+        QVERIFY(!besides);
+        QVERIFY2(err.startsWith("main.py:4: KeyError"), qPrintable(err));
+        QCOMPARE(printed.value(0), QStringLiteral("beside main.py"));
+        QVERIFY2(printed.join('\n').contains("raise KeyError('k')"), qPrintable(printed.join('\n')));
+        // The script is __main__, as `python script.py` makes it.
+        printed.clear();
+        QVERIFY2(runScript("import __main__, sys\nx = 5\nprint(__name__, __main__.x, __file__)", "m.py", o, &err), qPrintable(err));
+        QCOMPARE(printed.value(0), QStringLiteral("__main__ 5 m.py"));
+    }
+
+    void pythonScriptPanels() {
+        if (!pythonAvailable()) QSKIP("no Python 3.8 or later here");
+        QTemporaryDir dir;
+        const QString project = dir.path() + "/p.montage";
+        McpServer server;
+        ScriptOptions o = toolScriptOptions(server, project);
+        QStringList printed;
+        o.print = [&](const QString& line) { printed << line; };
+        const QString code = R"py(
+print("before")
+try:
+    ui = montage.panel(title="Titles", controls=[
+        {"type": "text", "id": "words", "label": "Words", "value": "Hello"},
+        {"type": "number", "id": "at", "label": "At", "value": 1, "min": 0, "max": 60},
+        {"type": "label", "id": "status", "text": ""},
+        {"type": "button", "id": "add", "label": "Add Title"},
+    ])
+except BaseException:
+    print("caught")  # described ends the script whatever catches
+    raise
+print("pressed", ui["pressed"], ui["words"], type(ui["at"]).__name__, ui["at"])
+if ui["pressed"] == "add":
+    montage.create_project(width=640, height=360, fps=25)
+    montage.add_title(text=ui["words"], at=ui["at"])
+    montage.set_panel(status="Added " + ui["words"])
+)py";
+        std::optional<PanelSpec> described;
+        std::optional<QJsonObject> answer;
+        o.panel = [&](const QJsonObject& d, QString* error) -> std::optional<QJsonObject> {
+            described = parsePanel(d, error);
+            if (!described) return std::nullopt;
+            return answer;
+        };
+        QJsonObject shown;
+        o.setPanel = [&](const QJsonObject& v, QString*) {
+            for (auto it = v.begin(); it != v.end(); ++it) shown[it.key()] = it.value();
+            return true;
+        };
+        // Described: the script ends there, successfully, nothing after it run.
+        QString error;
+        QVERIFY2(runScript(code, "titles.py", o, &error), qPrintable(error));
+        QVERIFY(described && described->title == "Titles" && described->controls.size() == 4);
+        QCOMPARE(printed, QStringList{"before"});
+        QVERIFY(!QFileInfo::exists(project));
+        // Quiet (a panel opening by itself): no programs run, no files written or removed; reading is allowed.
+        o.quiet = true;
+        const QString target = dir.path() + "/x.txt";
+        QVERIFY(!runScript("import subprocess\nsubprocess.run(['true'])", "q.py", o, &error) && error.contains("not available while a panel opens"));
+        QVERIFY(!runScript("import os\nos.system('true')", "q.py", o, &error) && error.contains("os.system"));
+        QVERIFY(!runScript(QStringLiteral("open(r'%1', 'w')").arg(target), "q.py", o, &error) && error.contains("only reading"));
+        QVERIFY(!runScript(QStringLiteral("open(r'%1', 'a')").arg(target), "q.py", o, &error));
+        QVERIFY(!runScript(QStringLiteral("import os\nos.open(r'%1', os.O_WRONLY | os.O_CREAT)").arg(target), "q.py", o, &error));
+        QVERIFY(!runScript(QStringLiteral("import pathlib\npathlib.Path(r'%1').write_text('x')").arg(target), "q.py", o, &error));
+        QVERIFY(!runScript(QStringLiteral("import os\nos.remove(r'%1')").arg(project), "q.py", o, &error));
+        QVERIFY(!runScript("import ctypes\nctypes.CDLL(None)", "q.py", o, &error) && error.contains("ctypes"));
+        QVERIFY(!runScript(QStringLiteral("import sqlite3\nsqlite3.connect(r'%1/x.db')").arg(dir.path()), "q.py", o, &error) && error.contains("sqlite3"));
+        QVERIFY(!runScript("import multiprocessing\nmultiprocessing.get_context('spawn').Process(target=print).start()", "q.py", o, &error));
+        QVERIFY2(runScript("import os, sqlite3\nos.putenv('MONTAGE_X', '1')\nsqlite3.connect(':memory:')", "q.py", o, &error), qPrintable(error));
+        QVERIFY(!QFileInfo::exists(dir.path() + "/x.db"));
+        QVERIFY2(runScript(QStringLiteral("import json, collections\ncollections.namedtuple('P', 'x')\nprint(open(r'%1').read() if False else 'read')")
+                               .arg(target), "q.py", o, &error), qPrintable(error));
+        QVERIFY(!QFileInfo::exists(target));
+        o.quiet = false;
+        // A button pressed: the script goes on with the panel's values, its tools run and set_panel shows a result.
+        printed.clear();
+        QJsonObject values{{"words", "Panel title"}, {"at", 2}, {"status", ""}, {"pressed", "add"}};
+        answer = values;
+        QVERIFY2(runScript(code, "titles.py", o, &error), qPrintable(error));
+        QCOMPARE(printed.value(1), QString("pressed add Panel title int 2"));
+        QCOMPARE(shown.value("status").toString(), QString("Added Panel title"));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        bool found = false;
+        for (const Track& t : back.active()->videoTracks)
+            for (const Clip& c : t.clips) found |= c.generator.type == "title" && c.start == 2 * 25;
+        QVERIFY(found);
+        // A description that does not check out, and a host without panels, are errors naming the problem.
+        QVERIFY(!runScript("montage.panel(controls=[{'type': 'dial', 'id': 'x'}])", "bad.py", o, &error));
+        QVERIFY2(error.contains("montage.panel") && error.contains("type"), qPrintable(error));
+        o.panel = nullptr;
+        o.setPanel = nullptr;
+        QVERIFY(!runScript("montage.panel(controls=[{'type': 'button', 'id': 'b'}])", "none.py", o, &error));
+        QVERIFY2(error.contains("Montage app"), qPrintable(error));
+        QVERIFY(!runScript("montage.set_panel(a=1)", "none.py", o, &error));
+        QVERIFY(error.contains("no panel"));
     }
 
     void consolidateKeepsGraphicPictures() {

@@ -7,6 +7,7 @@
 #include <cstdlib>
 
 #include "automation/McpServer.h"
+#include "automation/PythonHost.h"
 
 #ifdef MONTAGE_WITH_LUA
 // (Lua is compiled as C++ here: its headers without lua.hpp's extern "C", and its errors are C++ exceptions.)
@@ -49,7 +50,7 @@ ScriptOptions toolScriptOptions(McpServer& server, const QString& project) {
 #ifndef MONTAGE_WITH_LUA
 
 bool scriptingAvailable() { return false; }
-bool runScript(const QString&, const QString&, const ScriptOptions&, QString* error) {
+static bool runLuaScript(const QString&, const QString&, const ScriptOptions&, QString* error) {
     if (error) *error = QStringLiteral("This build of Montage has no Lua");
     return false;
 }
@@ -352,7 +353,7 @@ end
 
 }  // namespace
 
-bool runScript(const QString& code, const QString& name, const ScriptOptions& options, QString* error) {
+static bool runLuaScript(const QString& code, const QString& name, const ScriptOptions& options, QString* error) {
     lua_State* L = luaL_newstate();
     if (!L) {
         if (error) *error = QStringLiteral("Lua could not start");
@@ -467,5 +468,12 @@ bool runScript(const QString& code, const QString& name, const ScriptOptions& op
 }
 
 #endif
+
+bool scriptAvailable(const QString& name) { return isPythonScript(name) ? pythonAvailable() : scriptingAvailable(); }
+
+bool runScript(const QString& code, const QString& name, const ScriptOptions& options, QString* error) {
+    if (isPythonScript(name)) return runPythonScript(code, name, options, error);
+    return runLuaScript(code, name, options, error);
+}
 
 }  // namespace montage

@@ -82,6 +82,7 @@
 #include "RedactFacesDialog.h"
 #include "SpectralRepairDialog.h"
 #include "automation/McpServer.h"
+#include "automation/PythonHost.h"
 #include "automation/ScriptHost.h"
 #include "ScriptConsole.h"
 #include "ScriptPanelWidget.h"
@@ -11932,6 +11933,137 @@ print("added " .. ui.name)
         QCOMPARE(state()->sequence()->markers.back().name, std::string("From a file"));
         QVERIFY(console->open(listScripts()[0]) && console->editor()->toPlainText().contains("add_marker"));
         qunsetenv("MONTAGE_SCRIPTS_DIR");
+        state()->newProject();
+    }
+
+    void pythonScriptsInTheApp() {
+        if (!pythonAvailable()) QSKIP("no Python 3.8 or later here");
+        state()->newProject();
+        appSettings().remove("scripts/panels");
+        auto* console = win_->scriptConsole();
+        auto titles = [&] {
+            int n = 0;
+            for (const Track& t : state()->sequence()->videoTracks)
+                for (const Clip& c : t.clips) n += c.generator.type == "title";
+            return n;
+        };
+        // Two titles from one Python run: one undo step, named for the script; what it prints in the console.
+        const int steps = int(state()->history().undoCount());
+        console->clearOutput();
+        QVERIFY2(console->run("here = montage.live_context()\n"
+                              "print('at', here['playhead'])\n"
+                              "montage.add_title(text='One', at=0)\n"
+                              "montage.add_title({'text': 'Two', 'at': 1})\n",
+                              "titles.py"),
+                 qPrintable(console->output()));
+        QCOMPARE(titles(), 2);
+        QCOMPARE(int(state()->history().undoCount()), steps + 1);
+        QCOMPARE(state()->undoText(), QStringLiteral("Script: titles.py"));
+        QVERIFY2(console->output().contains("at 00:00:00:00"), qPrintable(console->output()));
+        state()->undo();
+        // A tool's error fails the run on its line, what it did before kept as one undo step.
+        QVERIFY(!console->run("montage.add_title(text='Kept', at=0)\nmontage.add_title(at='never')", "fails.py"));
+        QCOMPARE(titles(), 1);
+        QVERIFY(console->output().contains("fails.py:2: ToolError"));
+        state()->undo();
+        // Stop: a script busy or asleep stops, the window working meanwhile.
+        for (const char* endless : {"while True:\n    pass", "import time\ntime.sleep(600)", "while True:\n    try:\n        montage.live_context()\n    except Exception:\n        pass"}) {
+            bool ticked = false;
+            QTimer::singleShot(300, console, [&] {
+                ticked = true;
+                QVERIFY(console->running());
+                console->stop();
+            });
+            QVERIFY(!console->run(endless, "forever.py"));
+            QVERIFY(ticked && !console->running());
+            QVERIFY(console->output().endsWith("Stopped"));
+        }
+        // The language: switching swaps the untouched example, a file opened or saved sets it, and an unsaved Python
+        // script runs as Python.
+        {
+            ScriptConsole fresh(state(), win_->liveLink());
+            QVERIFY(fresh.findChild<QComboBox*>("scriptLanguage") && !fresh.python());
+            fresh.setPython(true);
+            QVERIFY(fresh.editor()->toPlainText().startsWith("# A Python script"));
+            fresh.setPython(false);
+            QVERIFY(fresh.editor()->toPlainText().startsWith("-- A Lua script"));
+        }
+        console->setPython(true);
+        console->editor()->setPlainText("import sys\nprint('version', sys.version_info[0])");
+        console->clearOutput();
+        console->findChild<QPushButton*>("runScript")->click();
+        QTRY_VERIFY(!console->running());
+        QVERIFY2(console->output().contains("version 3"), qPrintable(console->output()));
+        qputenv("MONTAGE_SCRIPTS_DIR", (dir_.path() + "/pyscripts").toUtf8());
+        QDir().mkpath(dir_.path() + "/pyscripts");
+        const QString path = QFileInfo(dir_.path() + "/pyscripts/Marker Maker.py").absoluteFilePath();
+        auto write = [&](const QByteArray& code) {
+            QFile f(path);
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(code);
+        };
+        const QByteArray code = R"py(
+ui = montage.panel(title="Marker Maker", controls=[
+    {"type": "text", "id": "name", "label": "Name", "value": "Cue"},
+    {"type": "number", "id": "at", "label": "At (s)", "value": 1, "min": 0, "max": 600},
+    {"type": "label", "id": "status", "text": ""},
+    {"type": "button", "id": "add", "label": "Add Marker"},
+])
+montage.add_marker(at=ui["at"], name=ui["name"])
+montage.set_panel(status="Added " + ui["name"])
+print("added " + ui["name"])
+)py";
+        write(code);
+        QCOMPARE(listScripts(), QStringList{path});
+        QVERIFY(console->open(path) && console->python());
+        QVERIFY(console->save(dir_.path() + "/pyscripts/copy.lua") && !console->python());
+        // Saving the Lua example as Python keeps what the editor holds (no example swapped in).
+        {
+            ScriptConsole fresh(state(), win_->liveLink());
+            const QString example = fresh.editor()->toPlainText();
+            QVERIFY(example.startsWith("-- A Lua script"));
+            QVERIFY(fresh.save(dir_.path() + "/pyscripts/copy.py") && fresh.python());
+            QCOMPARE(fresh.editor()->toPlainText(), example);
+        }
+        QFile::remove(dir_.path() + "/pyscripts/copy.py");
+        QFile::remove(dir_.path() + "/pyscripts/copy.lua");
+        // A Python script's panel: opened by its run, its button runs it again with what the panel holds.
+        QVERIFY(console->runFile(path));
+        ScriptPanelWidget* panel = win_->scriptPanel(path);
+        QVERIFY(panel);
+        QVERIFY(state()->sequence()->markers.empty());
+        qobject_cast<QLineEdit*>(panel->control("name"))->setText("Intro");
+        qobject_cast<QPushButton*>(panel->control("add"))->click();
+        QCOMPARE(state()->sequence()->markers.size(), size_t(1));
+        QCOMPARE(QString::fromStdString(state()->sequence()->markers[0].name), QString("Intro"));
+        QCOMPARE(qobject_cast<QLabel*>(panel->control("status"))->text(), QString("Added Intro"));
+        QCOMPARE(panel->findChild<QLabel*>("panelMessage")->text(), QString("added Intro"));
+        state()->undo();
+        // Opened again at start-up: quietly (writing no files), and ended if it takes more than five seconds.
+        auto* dock = qobject_cast<QDockWidget*>(panel->parentWidget());
+        dock->close();
+        QTRY_VERIFY(!win_->scriptPanel(path));
+        appSettings().setValue("scripts/panels", QStringList{path});
+        win_->restoreScriptPanels();
+        QVERIFY(win_->scriptPanel(path));
+        qobject_cast<QDockWidget*>(win_->scriptPanel(path)->parentWidget())->close();
+        QTRY_VERIFY(!win_->scriptPanel(path));
+        const QString trap = dir_.filePath("py-written-at-start.txt");
+        write("open(r'" + trap.toUtf8() + "', 'w')\n" + code);
+        appSettings().setValue("scripts/panels", QStringList{path});
+        win_->restoreScriptPanels();
+        QVERIFY(!QFileInfo::exists(trap) && !win_->scriptPanel(path));
+        QVERIFY(console->output().contains("only reading while a panel opens"));
+        write("import time\ntime.sleep(600)\n" + code);
+        appSettings().setValue("scripts/panels", QStringList{path});
+        QElapsedTimer spent;
+        spent.start();
+        win_->restoreScriptPanels();
+        QVERIFY(spent.elapsed() < 15000 && !win_->scriptPanel(path) && !console->running());
+        QVERIFY(!appSettings().value("scripts/panels").toStringList().contains(path));
+        appSettings().remove("scripts/panels");
+        qunsetenv("MONTAGE_SCRIPTS_DIR");
+        console->setPython(false);
         state()->newProject();
     }
 
