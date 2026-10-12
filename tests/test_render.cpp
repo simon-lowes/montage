@@ -55,6 +55,7 @@
 #include "render/VideoFx.h"
 #include "render/VideoPacking.h"
 #include "render/ReferenceOutput.h"
+#include "audio/DynLib.h"
 #include <random>
 
 extern "C" {
@@ -4907,6 +4908,61 @@ colorspaces:
         sched.stop();
         cfg.depth = 8;
         QVERIFY(!sched.start(d, d.modes[0], s, cfg, &why));
+    }
+
+    void ndiOutput() {
+        using namespace montage::output;
+        // A stand-in NDI Runtime where the SDK says to look.
+        qputenv("NDI_RUNTIME_DIR_V6", MONTAGE_TEST_NDI_DIR);
+        const auto ndi = findBackend("NDI");
+        QVERIFY(ndi);
+        std::string why;
+        QVERIFY2(ndi->available(&why), why.c_str());
+        const std::vector<Device> devices = ndi->devices();
+        QCOMPARE(devices.size(), size_t(1));
+        QVERIFY(devices[0].modes.empty());  // any size and rate
+        montage::plugins::DynLib fake;
+        QVERIFY2(fake.open(MONTAGE_TEST_NDI_LIBRARY, &why), why.c_str());
+        auto info = [&] {
+            auto fn = reinterpret_cast<int (*)(char*, int)>(fake.symbol("fake_ndi_info"));
+            char buf[1024] = {};
+            if (fn) fn(buf, sizeof buf);
+            return QString::fromUtf8(buf);
+        };
+        // An HDR (PQ) sequence: 16-bit P216 with its colour metadata, stereo sound as planar float, timecode in
+        // 100 ns units.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = {25, 1}, s.sampleRate = 48000, s.colorSpace = "rec2100pq";
+        Scheduler sched(ndi);
+        const Mode mode{modeName(64, 36, {25, 1}, false), 64, 36, {25, 1}, false, 0};
+        Config cfg;
+        QVERIFY2(sched.start(devices[0], mode, s, cfg, &why), why.c_str());
+        sched.setAudioSource([](int64_t, int frames, int channels, float* out) {
+            for (int i = 0; i < frames; ++i) out[size_t(i) * size_t(channels)] = 0.5f, out[size_t(i) * size_t(channels) + 1] = -0.25f;
+        });
+        auto img = std::make_shared<Image>(64, 36);
+        img->fill(0, 0, 0, 1);
+        sched.submit(3, img);
+        sched.setPosition(3, 1);
+        QTRY_VERIFY_WITH_TIMEOUT(sched.stats().sent >= 6 && info().contains("audios=") && !info().contains("audios=0 "), 10000);
+        QCOMPARE(sched.stats().receivers, 1);
+        sched.stop();
+        const QString got = info();
+        for (const char* want : {"name=Montage clock=1", "fourcc=P216", "x=64 y=36 rate=25/1 stride=128",
+                                 "meta=<ndi_color_info transfer=\"bt_2100_pq\" matrix=\"bt_2020\" primaries=\"bt_2020\"/>",
+                                 "arate=48000 ch=2 n=1920 cstride=7680 a0=0.5 a1=-0.25", "tc=1200000 "})
+            QVERIFY2(got.contains(QString::fromUtf8(want)), qPrintable(got + " lacks " + want));
+        // Black, limited range: Y 16 << 8 (4096, little-endian), then Y again.
+        QVERIFY2(got.contains("bytes=0,16,0,16"), qPrintable(got));
+        // 8-bit SDR: UYVY.
+        s.colorSpace = "rec709";
+        cfg.depth = 8;
+        QVERIFY2(sched.start(devices[0], mode, s, cfg, &why), why.c_str());
+        sched.submit(0, img);
+        QTRY_VERIFY_WITH_TIMEOUT(info().contains("fourcc=UYVY") && info().contains("bytes=128,16,128,16"), 10000);
+        QVERIFY(info().contains("transfer=\"bt_709\""));
+        sched.stop();
     }
 
     void lensCorrectionEffect() {

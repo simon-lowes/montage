@@ -168,7 +168,7 @@ add_library(montage_engine STATIC
   render/Deconvolve.h render/Deconvolve.cpp
   render/Exporter.h render/Exporter.cpp
   render/VideoPacking.h render/VideoPacking.cpp
-  render/ReferenceOutput.h render/ReferenceOutput.cpp
+  render/ReferenceOutput.h render/ReferenceOutput.cpp render/NdiOutput.cpp
   audio/Plugins.h audio/PluginScan.cpp audio/ClapHost.cpp
   audio/DynLib.h audio/DynLib.cpp
   audio/PluginEffect.h audio/PluginEffect.cpp
@@ -181,6 +181,8 @@ target_include_directories(montage_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/clap/include)
 # OpenFX 1.5 headers (BSD-3-Clause, the ASWF's), for hosting video plugins (render/Ofx).
 target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/openfx/include)
+# NDI SDK headers (MIT, these files only), for loading the NDI Runtime when installed (render/NdiOutput).
+target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/ndi/include)
 
 if(MONTAGE_WITH_VST3)
   # The VST 3 interfaces and the few SDK host helpers Montage uses (MIT).

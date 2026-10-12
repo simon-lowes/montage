@@ -206,6 +206,8 @@ private:
     Stats stats_;
 };
 
+std::shared_ptr<Backend> makeNdiBackend();
+
 // The interfaces Montage knows (NDI and DeckLink; and Virtual, a test device, with MONTAGE_VIRTUAL_OUTPUT set).
 std::vector<std::shared_ptr<Backend>> backends();
 std::shared_ptr<Backend> findBackend(const std::string& name);

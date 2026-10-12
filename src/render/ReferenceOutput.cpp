@@ -516,7 +516,7 @@ Signal VirtualBackend::openSignal() const {
 
 std::vector<std::shared_ptr<Backend>> backends() {
     static const std::vector<std::shared_ptr<Backend>> all = [] {
-        std::vector<std::shared_ptr<Backend>> v;
+        std::vector<std::shared_ptr<Backend>> v{makeNdiBackend()};
         const char* virt = std::getenv("MONTAGE_VIRTUAL_OUTPUT");
         if (virt && *virt) v.push_back(std::make_shared<VirtualBackend>());
         return v;
