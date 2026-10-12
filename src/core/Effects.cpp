@@ -220,6 +220,12 @@ std::vector<EffectInfo> buildCatalog() {
         cdl.strings[0].choices = spaces;
         c.push_back(cdl);
     }
+    // ACES Reference Gamut Compression (render/Gamut.h): colours a camera saw outside AP1 brought smoothly inside it. On a
+    // clip of media it works on the media's colours as they come, before the input transform clips them to the working
+    // gamut; elsewhere (adjustment layers, nodes, LUT export) in the working space.
+    c.push_back({"aces_gamut_compress", "ACES Gamut Compress", EffectCategory::VideoFilter, "Color",
+                 {choice("direction", "Direction", {"Forward", "Inverse"}, 0)},
+                 {}});
     {
         // Colour Space Transform: one clip from any space into another (render/ColorSpace.h).
         std::vector<std::string> spaces;

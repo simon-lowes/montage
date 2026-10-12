@@ -99,6 +99,7 @@
 #include "ProjectManagerDialog.h"
 #include "MediaBinModel.h"
 #include "ScopesWidget.h"
+#include "render/Gamut.h"
 #include "LinkMediaDialog.h"
 #include "EffectPresetStore.h"
 #include "EffectsBrowser.h"
@@ -2521,7 +2522,7 @@ private slots:
             if (m->mode() == MonitorPanel::Mode::Program) program = m;
         QVERIFY(program);
         auto* combo = program->findChild<QComboBox*>("exposureView");
-        QVERIFY(combo && combo->count() == 4);
+        QVERIFY(combo && combo->count() == 6);
         state()->setPlayhead(10);
         QTRY_VERIFY(!program->viewer()->image().isNull());
         const QImage frame = program->viewer()->image();
@@ -2533,6 +2534,67 @@ private slots:
         QCOMPARE(program->viewer()->image(), frame);
         combo->setCurrentIndex(0);
         QCOMPARE(program->viewer()->shownImage(), program->viewer()->image());
+        // Out of Gamut on a Rec.709 sequence: nothing it delivers is outside Rec.709.
+        combo->setCurrentIndex(int(ExposureView::OutOfGamut709));
+        win_->findChild<PlaybackController*>("programPlayback")->requestFrame();
+        QTest::qWait(300);
+        QCOMPARE(program->viewer()->shownImage(), program->viewer()->image().convertToFormat(QImage::Format_RGB32));
+        combo->setCurrentIndex(0);
+    }
+
+    void gamutScopeAndChecks() {
+        // A Rec.2020 frame: the left half its pure green (outside Rec.709 and P3), the right half grey.
+        QImage frame(160, 90, QImage::Format_RGBA64);
+        for (int y = 0; y < 90; ++y)
+            for (int x = 0; x < 160; ++x)
+                frame.setPixelColor(x, y, x < 80 ? QColor::fromRgba64(0, 65535, 0, 65535) : QColor::fromRgba64(30000, 30000, 30000, 65535));
+        ScopesWidget scopes;
+        scopes.resize(640, 420);
+        scopes.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&scopes));
+        scopes.setMode(ScopesWidget::Mode::Chromaticity);
+        auto* cie = scopes.findChild<QComboBox*>("scopeCie");
+        QVERIFY(cie && cie->isVisible());
+        scopes.setSignal(frame, 0, "rec2020", 1000);
+        QTRY_VERIFY(scopes.outsideRec709() >= 0);
+        QVERIFY2(std::fabs(scopes.outsideRec709() - 0.5) < 0.01 && std::fabs(scopes.outsideP3() - 0.5) < 0.01,
+                 qPrintable(QString("%1 %2").arg(scopes.outsideRec709()).arg(scopes.outsideP3())));
+        // Plotted where the colours are: Rec.2020's green at (0.170, 0.797), grey at D65; in u'v' too.
+        const int half = 160 * 90 / 2;
+        QVERIFY(scopes.cieSamplesNear(0.170, 0.797, 0.01) > half * 9 / 10);
+        QVERIFY(scopes.cieSamplesNear(0.3127, 0.3290, 0.01) > half * 9 / 10);
+        cie->setCurrentIndex(1);
+        QVERIFY(scopes.cieUv());
+        const Xy greenUv = xyToUv({0.170, 0.797});
+        QVERIFY(scopes.cieSamplesNear(greenUv.x, greenUv.y, 0.01) > half * 9 / 10);
+        QVERIFY(scopes.cieSamplesNear(0.170, 0.797, 0.01) < half / 10);
+        QVERIFY(!scopes.grab().toImage().isNull());
+        // Rec.709 frames are all inside.
+        QImage sdr(160, 90, QImage::Format_RGB32);
+        sdr.fill(qRgb(255, 0, 0));
+        scopes.setFrame(sdr, 1);
+        QTRY_COMPARE(scopes.outsideRec709(), 0.0);
+        QCOMPARE(scopes.outsideP3(), 0.0);
+        scopes.setMode(ScopesWidget::Mode::Waveform);
+        QVERIFY(!cie->isVisible());
+
+        // Out of gamut on a monitor: the green striped, the grey left; only with the frame's own signal.
+        QImage picture(160, 90, QImage::Format_RGB32);
+        picture.fill(qRgb(90, 90, 90));
+        const QImage marked = gamutView(picture, frame, "rec2020", Primaries::Bt709);
+        int left = 0, right = 0;
+        for (int y = 0; y < 90; ++y)
+            for (int x = 0; x < 160; ++x) (x < 80 ? left : right) += marked.pixel(x, y) != picture.pixel(x, y);
+        QCOMPARE(left, half);
+        QCOMPARE(right, 0);
+        QCOMPARE(gamutView(picture, frame, "rec2020", Primaries::Bt2020), picture);
+        ViewerWidget viewer;
+        viewer.setImage(picture, 5);
+        viewer.setSignal(frame, 5, "rec2020");
+        viewer.setExposureView(int(ExposureView::OutOfGamut709));
+        QCOMPARE(viewer.shownImage(), marked);
+        viewer.setSignal(frame, 6, "rec2020");  // (another frame's)
+        QCOMPARE(viewer.shownImage(), picture);
     }
 
     void sequenceTabs() {

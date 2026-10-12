@@ -692,6 +692,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     const int SW = seq.width, SH = seq.height;
     Image src;
     const Effect* sourceCdl = nullptr;  // a CDL applied in the media's own space, before the input transform
+    const Effect* sourceRgc = nullptr;  // the ACES gamut compression, likewise
     double mw = SW, mh = SH;
     Geometry g;
     double sourceSeconds = -1;  // media time of the frame, for effects that follow the footage
@@ -939,8 +940,16 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     sourceCdl = &e;
                     applyCdlValues(e, lt, src);
                 }
+            // The ACES gamut compression too: on the colours the camera saw, before the input transform clips what is outside
+            // the working gamut (and as it comes after the camera's own transform in ACES, in AP1).
+            const ColorSpace& from = original ? mediaColorSpace(*m) : pictureColorSpace(*m, path);
+            for (const Effect& e : c.effects)
+                if (!sourceRgc && e.enabled && e.type == "aces_gamut_compress" && !hasMask(e, lt)) {
+                    sourceRgc = &e;
+                    applyAcesGamutCompress(e, lt, from, src);
+                }
             // Input transform: the media's space (or its proxy's) into the sequence's working space.
-            convertColor(src, original ? mediaColorSpace(*m) : pictureColorSpace(*m, path), sequenceColorSpace(seq), seq.hdrPeakNits);
+            convertColor(src, from, sequenceColorSpace(seq), seq.hdrPeakNits);
         } else {
             return {};
         }
@@ -978,7 +987,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         if (e->type == "redact_faces") applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
     auto ranAlready = [&](const Effect& e) {
         return e.type == "video_denoise" || e.type == "super_scale" || e.type == "reframe_360" || e.type == "redact_faces" ||
-               e.type == "stereo_3d" || &e == sourceCdl;  // those ran already (Stereo 3D is placed below)
+               e.type == "stereo_3d" || &e == sourceCdl || &e == sourceRgc;  // those ran already (Stereo 3D is placed below)
     };
     // A node graph (core/GradeGraph.h) runs where its first node's effect is in the stack (or after the clip's own
     // effects); the effects in its nodes, and its shared nodes', run in it.

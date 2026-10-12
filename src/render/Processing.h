@@ -81,6 +81,8 @@ private:
 struct ColorSpace;
 // An ASC CDL effect applied to the pixels as they are (the compositor's for a CDL made in the media's own space).
 void applyCdlValues(const Effect& e, FrameTime t, Image& img);
+// The ACES gamut compression effect on pixels in `space` (the compositor's on the media as it comes, in the media's space).
+void applyAcesGamutCompress(const Effect& e, FrameTime t, const ColorSpace& space, Image& img);
 const ColorSpace& currentWorkingSpace();
 class WorkingSpaceScope {
 public:

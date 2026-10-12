@@ -30,6 +30,7 @@
 #include "render/ColorChart.h"
 #include "core/LensProfile.h"
 #include "render/ColorSpace.h"
+#include "render/Gamut.h"
 #include "render/HdrView.h"
 #include "render/Compositor.h"
 #include "render/Dcp.h"
@@ -103,6 +104,141 @@ Clip colorClip(Project& p, float r, float g, float b, FrameTime start, FrameTime
 class TestRender : public QObject {
     Q_OBJECT
 private slots:
+    void gamutTools() {
+        auto near = [](Xy a, double x, double y, double tol) { return std::fabs(a.x - x) < tol && std::fabs(a.y - y) < tol; };
+        // Chromaticities: white is D65, the primaries where the standards put them (Rec.709 red, Rec.2020 green, P3 blue).
+        const ColorSpace& rec709 = *findColorSpace("rec709");
+        const ColorSpace& rec2020 = *findColorSpace("rec2020");
+        Xy c;
+        const float white[3] = {1, 1, 1}, red[3] = {1, 0, 0}, green[3] = {0, 1, 0}, black[3] = {0, 0, 0};
+        QVERIFY(codeToXy(rec709, white, c) && near(c, 0.3127, 0.3290, 1e-4));
+        QVERIFY(codeToXy(rec709, red, c) && near(c, 0.64, 0.33, 1e-4));
+        QVERIFY(codeToXy(rec2020, green, c) && near(c, 0.170, 0.797, 1e-4));
+        QVERIFY(!codeToXy(rec709, black, c));
+        const float grey[3] = {0.3f, 0.3f, 0.3f};  // (any brightness: the same chromaticity)
+        QVERIFY(codeToXy(*findColorSpace("rec2100pq"), grey, c) && near(c, 0.3127, 0.3290, 1e-4));
+        const auto p3 = gamutChromaticities(Primaries::P3D65);
+        QVERIFY(near(p3[2], 0.150, 0.060, 1e-4) && near(p3[3], 0.3127, 0.3290, 1e-4));
+        // u'v' of D65 is (0.1978, 0.4683).
+        QVERIFY(near(xyToUv({0.3127, 0.3290}), 0.1978, 0.4683, 1e-4));
+        // The spectral locus: 380 to 700 nm; 520 nm (the greenest light) at (0.0743, 0.8338), 700 nm (0.7347, 0.2653).
+        const std::vector<Xy>& locus = spectralLocus();
+        QCOMPARE(locus.size(), size_t(65));
+        QVERIFY(near(locus[28], 0.0743, 0.8338, 1e-4));
+        QVERIFY(near(locus.back(), 0.7347, 0.2653, 1e-4));
+
+        // Outside a gamut: Rec.2020's green is outside Rec.709 and P3; Rec.709's red inside all three; a P3 red inside P3
+        // but not Rec.709.
+        QVERIFY(GamutCheck(rec2020, Primaries::Bt709).outside(green));
+        QVERIFY(GamutCheck(rec2020, Primaries::P3D65).outside(green));
+        QVERIFY(!GamutCheck(rec2020, Primaries::Bt2020).outside(green));
+        QVERIFY(!GamutCheck(rec709, Primaries::Bt2020).outside(red));
+        const ColorSpace& displayP3 = *findColorSpace("p3d65");
+        QVERIFY(GamutCheck(displayP3, Primaries::Bt709).outside(red));
+        QVERIFY(!GamutCheck(displayP3, Primaries::P3D65).outside(red));
+        QVERIFY(!GamutCheck(rec2020, Primaries::Bt709).outside(white) && !GamutCheck(rec2020, Primaries::Bt709).outside(black));
+        // (A Rec.709 colour taken to Rec.2020 and its codes rounded to 16 bits is still inside Rec.709.)
+        float conv[3] = {0.9f, 0.05f, 0.02f};
+        convertPixel(conv, rec709, rec2020);
+        for (float& v : conv) v = std::round(v * 65535) / 65535;
+        QVERIFY(!GamutCheck(rec2020, Primaries::Bt709).outside(conv));
+
+        // ACES Reference Gamut Compression: colours well inside left alone; one at a limit's distance lands on the
+        // edge (its channel 0); further out ones come inside; the inverse undoes it.
+        float inside[3] = {0.5f, 0.3f, 0.2f};
+        acesGamutCompress(inside);
+        QCOMPARE(inside[0], 0.5f);
+        QCOMPARE(inside[1], 0.3f);
+        QCOMPARE(inside[2], 0.2f);
+        for (int ch = 0; ch < 3; ++ch) {
+            const double limit = ch == 0 ? 1.147 : ch == 1 ? 1.264 : 1.312;
+            float v[3] = {1, 1, 1};
+            v[ch] = float(1 - limit);
+            acesGamutCompress(v);
+            QVERIFY2(std::fabs(v[ch]) < 1e-5f, qPrintable(QString::number(v[ch])));
+        }
+        float far[3] = {0.8f, -0.6f, 0.1f};
+        acesGamutCompress(far);
+        QVERIFY(far[1] > -0.6f && far[1] < 0 && far[0] == 0.8f);
+        float back[3] = {far[0], far[1], far[2]};
+        acesGamutCompress(back, true);
+        QVERIFY(std::fabs(back[1] + 0.6f) < 1e-4f && std::fabs(back[2] - 0.1f) < 1e-4f);
+        float none[3] = {0, 0, 0};
+        acesGamutCompress(none);
+        QCOMPARE(none[0], 0.0f);
+        // Against OpenColorIO's own (ACES 1.3's LMT, on ACES2065-1): within the spec's 0.002.
+        if (ocioAvailable()) {
+            double toAp1[9], toAp0[9];
+            primariesMatrix(Primaries::Ap0, Primaries::Ap1, toAp1);
+            primariesMatrix(Primaries::Ap1, Primaries::Ap0, toAp0);
+            std::vector<float> ours, theirs;
+            const float samples[][3] = {{0.18f, 0.18f, 0.18f}, {0.9f, -0.05f, 0.02f}, {0.02f, 0.5f, -0.1f}, {-0.02f, 0.1f, 0.6f},
+                                        {2.5f, 0.1f, -0.3f}, {0.05f, 0.01f, 0.4f}, {1.0f, 0.4f, 0.0f}, {0.3f, -0.2f, 0.9f}};
+            for (const auto& s : samples) {
+                theirs.insert(theirs.end(), s, s + 3);
+                float a[3];
+                for (int r = 0; r < 3; ++r) a[r] = float(toAp1[r * 3] * s[0] + toAp1[r * 3 + 1] * s[1] + toAp1[r * 3 + 2] * s[2]);
+                acesGamutCompress(a);
+                for (int r = 0; r < 3; ++r) ours.push_back(float(toAp0[r * 3] * a[0] + toAp0[r * 3 + 1] * a[1] + toAp0[r * 3 + 2] * a[2]));
+            }
+            std::string err;
+            QVERIFY2(applyOcioBuiltin("ACES-LMT - ACES 1.3 Reference Gamut Compression", theirs.data(), theirs.size() / 3, false, &err), err.c_str());
+            for (size_t i = 0; i < ours.size(); ++i)
+                QVERIFY2(std::fabs(ours[i] - theirs[i]) < 0.002f, qPrintable(QString("%1: %2 vs %3").arg(i).arg(ours[i]).arg(theirs[i])));
+        }
+
+        // The effect, in the working space: an ACEScct sequence's out-of-gamut colour brought in, an in-gamut one alone;
+        // Inverse takes it back; LUT export holds it.
+        Project p = makeDefaultProject();
+        Effect e = makeEffect(p, "aces_gamut_compress");
+        const ColorSpace& cct = *findColorSpace("acescct");
+        const WorkingSpaceScope working(&cct);
+        float outCode[3] = {float(fromLinear(Transfer::AcesCct, 0.6)), float(fromLinear(Transfer::AcesCct, -0.05)),
+                            float(fromLinear(Transfer::AcesCct, 0.1))};
+        Image img = solid(1, 1, outCode[0], outCode[1], outCode[2]);
+        applyVideoEffect(e, 0, img, 1.0);
+        float lin[3] = {0.6f, -0.05f, 0.1f};
+        acesGamutCompress(lin);
+        QVERIFY(std::fabs(toLinear(Transfer::AcesCct, img.at(0, 0)[1]) - lin[1]) < 1e-4);
+        QVERIFY(toLinear(Transfer::AcesCct, img.at(0, 0)[1]) > -0.05);
+        e.params["direction"] = Param(1.0);
+        applyVideoEffect(e, 0, img, 1.0);
+        QVERIFY(std::fabs(img.at(0, 0)[1] - outCode[1]) < 1e-4f);
+        Image calm = solid(1, 1, 0.4f, 0.4f, 0.35f);
+        e.params["direction"] = Param(0.0);
+        applyVideoEffect(e, 0, calm, 1.0);
+        QVERIFY(std::fabs(calm.at(0, 0)[2] - 0.35f) < 1e-5f);
+        QVERIFY(isColorOnlyEffect(e, 0));
+
+        // On a clip of media it works on the media's colours, before the input transform clips them to the working
+        // gamut: an ACES2065-1 blue outside AP1 (and Rec.709) comes out compressed, not clipped.
+        QTemporaryDir dir;
+        const QString path = dir.filePath("ap0.png");
+        QImage q(8, 8, QImage::Format_RGBA64);
+        q.fill(QColor::fromRgbF(0.05f, 0.05f, 0.4f));
+        QVERIFY(q.save(path));
+        Project pm = makeDefaultProject();
+        MediaItem m;
+        QVERIFY(probeMedia(path.toStdString(), m));
+        m.id = pm.newId();
+        m.colorOverride = "aces2065-1";
+        pm.media.push_back(m);
+        Sequence& sm = *pm.active();
+        sm.width = sm.height = 8;
+        QVERIFY(edit::placeMedia(pm, sm, m.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        RenderOptions o;
+        float plain[4], compressed[4];
+        rgb(renderProgramFrame(pm, sm, 0, o), 4, 4, plain);
+        sm.videoTracks[0].clips[0].effects.push_back(makeEffect(pm, "aces_gamut_compress"));
+        rgb(renderProgramFrame(pm, sm, 0, o), 4, 4, compressed);
+        float want[3] = {std::round(0.05f * 65535) / 65535, std::round(0.05f * 65535) / 65535, std::round(0.4f * 65535) / 65535};
+        AcesGamutCompressor(*findColorSpace("aces2065-1"))(want);
+        convertPixel(want, *findColorSpace("aces2065-1"), rec709);
+        for (int i = 0; i < 3; ++i)
+            QVERIFY2(std::fabs(compressed[i] - want[i]) < 0.005f, qPrintable(QString("%1: %2 vs %3").arg(i).arg(compressed[i]).arg(want[i])));
+        QVERIFY2(std::fabs(compressed[1] - plain[1]) > 0.005f, qPrintable(QString("%1 / %2").arg(plain[1]).arg(compressed[1])));
+    }
+
     void ascCdlEffect() {
         // The cdl effect grades like the ASC's maths, in the working space or in the space the CDL was made in.
         Project p = makeDefaultProject();

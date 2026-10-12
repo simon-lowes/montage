@@ -1,6 +1,7 @@
 // Montage — video scopes for the program monitor: luma waveform, RGB parade,
 // vectorscope and histogram, one at a time or all four together (Resolve's quad view),
-// analysed at a throttled rate on a downsampled frame.
+// and a CIE chromaticity scope (1931 xy or 1976 u'v') with the Rec.709, P3 and Rec.2020
+// gamuts drawn on it, analysed at a throttled rate on a downsampled frame.
 #pragma once
 
 #include <QElapsedTimer>
@@ -24,7 +25,7 @@ namespace montage {
 class ScopesWidget : public QWidget {
     Q_OBJECT
 public:
-    enum class Mode { Waveform = 0, Parade, Vectorscope, Histogram, Quad };
+    enum class Mode { Waveform = 0, Parade, Vectorscope, Histogram, Quad, Chromaticity };
 
     explicit ScopesWidget(QWidget* parent = nullptr);
 
@@ -43,6 +44,14 @@ public:
     void setNitsRange(double nits);
     // The trace's rows (levels shown, bottom to top), for tests.
     int traceRows() const { return trace_.height(); }
+    // The chromaticity scope: 1976 u'v' (else 1931 xy).
+    bool cieUv() const { return cieUv_; }
+    void setCieUv(bool uv);
+    // Of the frame's lit pixels (chromaticity scope), the share outside Rec.709 and outside P3, 0..1 (-1: no data).
+    double outsideRec709() const { return outside709_; }
+    double outsideP3() const { return outsideP3_; }
+    // The chromaticity scope's samples near a point (xy, or u'v' when cieUv()), for tests.
+    int cieSamplesNear(double a, double b, double radius) const;
     QSize sizeHint() const override;
     QSize minimumSizeHint() const override;
 
@@ -66,6 +75,7 @@ private:
     void analyzeWaveform(bool parade);
     void analyzeVectorscope();
     void analyzeHistogram();
+    void analyzeChromaticity();
     QRect scopeArea() const;
     // trace_ resampled (area-averaged) to `size`, cached until the trace or size changes.
     const QImage& scaledTrace(const QSize& size);
@@ -73,6 +83,7 @@ private:
     void paintWaveform(QPainter& p, const QRect& area, bool parade);
     void paintVectorscope(QPainter& p, const QRect& area);
     void paintHistogram(QPainter& p, const QRect& area);
+    void paintChromaticity(QPainter& p, const QRect& area);
     void paintLevelGraticule(QPainter& p, const QRectF& plot, bool labels);
     // HDR scale marks: nits and where they sit (0..1 of the plot), the mastering peak's place or -1.
     std::vector<std::pair<double, double>> nitsMarks(bool fullRange, double& peakAt) const;
@@ -81,6 +92,7 @@ private:
 
     QComboBox* modeBox_ = nullptr;
     QComboBox* rangeBox_ = nullptr;
+    QComboBox* cieBox_ = nullptr;
     QLabel* nitsLabel_ = nullptr;
     QString space_ = QStringLiteral("rec709"), pendingSpace_ = QStringLiteral("rec709");
     double masterPeak_ = 1000, pendingPeak_ = 1000;
@@ -92,6 +104,7 @@ private:
 
     QImage pending_;        // latest frame as received
     QImage small_;          // downsampled RGB32 copy of the last analysed frame
+    Image codes_;           // the same frame's code values (the chromaticity scope)
     bool dirty_ = false;    // pending_ not yet analysed
     FrameTime frameTime_ = -1;
     QTimer throttle_;
@@ -103,6 +116,9 @@ private:
     qint64 traceScaledKey_ = 0;
     std::array<std::array<uint32_t, 256>, 4> hist_{};  // R, G, B, luma
     bool haveData_ = false;
+    bool cieUv_ = false;
+    std::vector<uint32_t> cieCounts_;  // the chromaticity scope's bins (kCieBins square)
+    double outside709_ = -1, outsideP3_ = -1;
 };
 
 }  // namespace montage

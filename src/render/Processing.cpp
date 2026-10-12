@@ -3,6 +3,7 @@
 #include "Ofx.h"
 
 #include "ColorSpace.h"
+#include "Gamut.h"
 #include "TransferTables.h"
 #include "Ocio.h"
 #include "VideoFx.h"
@@ -1794,6 +1795,7 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "hue_sat") hueSat(e, t, img);
     else if (ty == "lut") applyLut(e, t, img);
     else if (ty == "cdl") applyCdlEffect(e, t, img);
+    else if (ty == "aces_gamut_compress") applyAcesGamutCompress(e, t, currentWorkingSpace(), img);
     else if (ty == "color_space_transform") {
         const ColorSpace* from = nullptr;
         const ColorSpace* to = nullptr;
@@ -2707,6 +2709,16 @@ Image transitionMix(const std::string& type, const Effect& params, const Image& 
         }
     });
     return out;
+}
+
+void applyAcesGamutCompress(const Effect& e, FrameTime t, const ColorSpace& space, Image& img) {
+    // In AP1 from `space` and back (render/Gamut.h); Inverse takes compressed colours back out.
+    const AcesGamutCompressor rgc(space, e.p("direction", t, 0) >= 0.5);
+    perPixel(img, [&](float& r, float& g, float& b, float&) {
+        float v[3] = {r, g, b};
+        rgc(v);
+        r = v[0], g = v[1], b = v[2];
+    });
 }
 
 }  // namespace montage
