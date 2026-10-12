@@ -207,7 +207,15 @@ bool grabStill(const Project& p, const Sequence& s, FrameTime t, const std::stri
     toRgba8(view, picture.bits(), size_t(picture.bytesPerLine()));
 
     GalleryStill still;
-    const QDateTime now = QDateTime::currentDateTime();
+    // (Each grab a millisecond after the last at least, so stills grabbed together keep their order.)
+    static std::mutex clockLock;
+    static qint64 lastGrab = 0;
+    QDateTime now = QDateTime::currentDateTime();
+    {
+        std::lock_guard lock(clockLock);
+        if (now.toMSecsSinceEpoch() <= lastGrab) now = QDateTime::fromMSecsSinceEpoch(lastGrab + 1);
+        lastGrab = now.toMSecsSinceEpoch();
+    }
     still.id = (now.toString("yyyyMMdd-HHmmss-zzz") + QStringLiteral("-%1").arg(QRandomGenerator::global()->bounded(0x10000), 4, 16, QLatin1Char('0')))
                    .toStdString();
     still.album = album;
