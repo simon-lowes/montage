@@ -157,7 +157,7 @@ std::shared_ptr<Model> loadModel(std::string* error) {
         model->session = openModel(model->env, path.c_str(), so);
         *cached = model;
         return model;
-    } catch (const Ort::Exception& e) {
+    } catch (const std::exception& e) {
         if (error) *error = std::string("The Super Scale model could not be loaded: ") + e.what();
         return nullptr;
     }
@@ -219,7 +219,7 @@ bool superScale4x(const Image& in, Image& out, std::string* error, const std::at
                 }
             }
         return true;
-    } catch (const Ort::Exception& e) {
+    } catch (const std::exception& e) {
         if (error) *error = std::string("Super Scale failed: ") + e.what();
         return false;
     }

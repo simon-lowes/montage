@@ -1,7 +1,9 @@
 #include "RenderCache.h"
 #include "TrimPasses.h"
 #include "core/GradeGraph.h"
+#include "media/MotionDeblur.h"
 #include "media/Proxy.h"
+#include "media/SuperScale.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -65,6 +67,10 @@ void addClip(QCryptographicHash& h, const Clip& c) {
     }
     h.addData(QByteArray::fromStdString(clipToJsonString(k)));
     for (const QByteArray& o : objects) h.addData(o);
+    // Effects whose model is downloaded later change the picture then.
+    for (const Effect& e : c.effects)
+        if (e.enabled && e.type == "motion_deblur") h.addData(deblurModel().installed() ? "deblur:1" : "deblur:0");
+        else if (e.enabled && e.type == "super_scale") h.addData(upscaleModel().installed() ? "upscale:1" : "upscale:0");
 }
 
 void addMedia(QCryptographicHash& h, const MediaItem& m, const RenderOptions& o) {
@@ -276,7 +282,18 @@ int renderToCache(const Project& p, const Sequence& seq, FrameTime from, FrameTi
         if (cancel && cancel->load()) return -1;
         const QByteArray key = frameKey(p, seq, t, o);
         if (!key.isEmpty() && !cache.has(key)) {
-            const Image img = renderProgramFrame(p, seq, t, o);
+            // Rendered ahead, so effects that take seconds a frame run; a frame they could not finish is not kept.
+            RenderIssues issues;
+            RenderOptions ahead = o;
+            ahead.slowEffects = true;
+            ahead.issues = &issues;
+            ahead.cancel = cancel;
+            const Image img = renderProgramFrame(p, seq, t, ahead);
+            if (issues.incomplete) {
+                if (cancel && cancel->load()) return -1;
+                if (progress) progress(double(t - from + 1) / double(n));
+                continue;
+            }
             QImage q(img.width, img.height, QImage::Format_RGBA8888);
             toRgba8(img, q.bits(), size_t(q.bytesPerLine()));
             if (cache.store(key, q)) ++rendered;

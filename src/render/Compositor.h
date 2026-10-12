@@ -1,9 +1,11 @@
 // Montage — renders a sequence frame (video) and mixes sequence audio.
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "Stereo.h"
@@ -14,6 +16,25 @@
 class QImage;
 
 namespace montage {
+
+// What kept a frame from being rendered in full: an effect that takes seconds a frame left out of a view that cannot wait,
+// or one whose model is missing or failed. Such a frame is not final: the render cache does not keep it, and an export
+// fails with the reason.
+struct RenderIssues {
+    std::atomic<bool> incomplete{false};
+    void note(const std::string& why) {
+        std::lock_guard lock(m_);
+        if (!incomplete.exchange(true)) reason_ = why;
+    }
+    std::string reason() const {
+        std::lock_guard lock(m_);
+        return reason_;
+    }
+
+private:
+    mutable std::mutex m_;
+    std::string reason_;
+};
 
 struct RenderOptions {
     double scale = 1.0;        // output size relative to the sequence (preview resolution)
@@ -30,6 +51,11 @@ struct RenderOptions {
     int eye = 0;               // stereoscopic 3D: the eye rendered (0 left, 1 right)
     // How renderProgramFrame shows a stereoscopic sequence's two eyes (render/Stereo.h); flat sequences ignore it.
     StereoView stereoView = StereoView::Left;
+    // Effects that take seconds a frame (Motion Deblur) run in deliveries (highQuality) and when this is set (rendering
+    // previews ahead); otherwise a result already made for the frame is used, else the frame goes without them.
+    bool slowEffects = false;
+    RenderIssues* issues = nullptr;               // told when a frame is not rendered in full
+    const std::atomic<bool>* cancel = nullptr;    // stops a slow effect part way (the frame is then not final)
 };
 
 // Composites all video tracks of `seq` at timeline frame `t`.

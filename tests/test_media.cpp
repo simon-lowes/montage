@@ -8352,28 +8352,65 @@ private slots:
         Image half;
         QVERIFY(motionDeblur(blurred, half, 0.5));
         QVERIFY(std::fabs(half.at(100, 60)[0] - 0.5f * (blurred.at(100, 60)[0] + sharp.at(100, 60)[0])) < 1e-5f);
-        Image tiled;
-        QVERIFY2(motionDeblur(blurred, tiled, 1.0, &err, nullptr, 384), err.c_str());
-        double diff = 0;
-        for (size_t i = 0; i < tiled.px.size(); ++i) diff += std::fabs(tiled.px[i] - sharp.px[i]);
-        diff /= double(tiled.px.size());
-        QVERIFY2(diff < 0.01, qPrintable(QString::number(diff)));
-        QVERIFY2(psnr(tiled) > psnr(blurred) + 0.8, qPrintable(QString::number(psnr(tiled))));
-        // Smaller than the model takes: mirrored out to its size and back; alpha kept.
-        Image small(100, 80);
-        for (int y = 0; y < 80; ++y)
-            for (int x = 0; x < 100; ++x) {
-                float* p = small.at(x, y);
-                const float a = x < 50 ? 1.0f : 0.5f;
-                p[0] = blurred.at(x + 40, y + 30)[0] * a, p[1] = blurred.at(x + 40, y + 30)[1] * a, p[2] = blurred.at(x + 40, y + 30)[2] * a;
-                p[3] = a;
+        {
+            // Twice as wide: three tiles of 384 (starting at 0, 256 and 512) against one pass, compared across the joins.
+            const int W2 = 2 * W;
+            Image wide(W2, H), wideTruth(W2, H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W2; ++x) {
+                    std::copy_n(blurred.at(x % W, y), 4, wide.at(x, y));
+                    std::copy_n(truth.at(x % W, y), 4, wideTruth.at(x, y));
+                }
+            Image whole, tiled;
+            QVERIFY2(motionDeblur(wide, whole, 1.0, &err, nullptr, 1024), err.c_str());
+            QVERIFY2(motionDeblur(wide, tiled, 1.0, &err, nullptr, 384), err.c_str());
+            std::vector<float> seams;
+            for (int y = 0; y < H; ++y)
+                for (int join : {256, 384, 512, 640})
+                    for (int x = join - 32; x < join + 32; ++x) seams.push_back(std::fabs(tiled.at(x, y)[1] - whole.at(x, y)[1]));
+            std::sort(seams.begin(), seams.end());
+            const float p99 = seams[seams.size() * 99 / 100];
+            QVERIFY2(p99 < 0.08f, qPrintable(QString::number(p99)));
+            double acc = 0, accBlur = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 16; x < W2 - 16; ++x)
+                    for (int c = 0; c < 3; ++c) {
+                        acc += std::pow(double(tiled.at(x, y)[c]) - wideTruth.at(x, y)[c], 2);
+                        accBlur += std::pow(double(wide.at(x, y)[c]) - wideTruth.at(x, y)[c], 2);
+                    }
+            QVERIFY2(10 * std::log10(accBlur / acc) > 0.8, qPrintable(QString::number(10 * std::log10(accBlur / acc))));
+        }
+        // Smaller than the model takes (the lettering, 300 x 120): mirrored out to its size, deblurred, and back; alpha kept,
+        // a transparent corner left as it was, a value above 1 keeping what is beyond.
+        const int SW2 = 300, SH2 = 120;
+        Image small(SW2, SH2);
+        for (int y = 0; y < SH2; ++y)
+            for (int x = 0; x < SW2; ++x) {
+                float* q = small.at(x, y);
+                const float a = x < 250 ? 1.0f : 0.5f;
+                for (int c = 0; c < 3; ++c) q[c] = blurred.at(x + 74, y + 5)[c] * a;
+                q[3] = a;
             }
+        for (int y = 0; y < 10; ++y)
+            for (int x = 0; x < 10; ++x) std::fill_n(small.at(x, y), 4, 0.0f);
+        small.at(150, 100)[0] = 1.5f;
         Image smallOut;
         QVERIFY2(motionDeblur(small, smallOut, 1.0, &err), err.c_str());
-        QCOMPARE(smallOut.width, 100);
-        QCOMPARE(smallOut.at(80, 40)[3], 0.5f);
+        QCOMPARE(smallOut.width, SW2);
+        QCOMPARE(smallOut.at(280, 40)[3], 0.5f);
         for (float v : smallOut.px) QVERIFY(std::isfinite(v));
-        QVERIFY(smallOut.at(80, 40)[0] <= 0.5f + 1e-6f);
+        QCOMPARE(smallOut.at(3, 3)[0], 0.0f);
+        QVERIFY(smallOut.at(150, 100)[0] > 1.0f);
+        {
+            double acc = 0, accBlur = 0;
+            for (int y = 16; y < SH2 - 16; ++y)
+                for (int x = 16; x < 234; ++x)
+                    for (int c = 0; c < 3; ++c) {
+                        acc += std::pow(double(smallOut.at(x, y)[c]) - truth.at(x + 74, y + 5)[c], 2);
+                        accBlur += std::pow(double(small.at(x, y)[c]) - truth.at(x + 74, y + 5)[c], 2);
+                    }
+            QVERIFY2(10 * std::log10(accBlur / acc) > 0.5, qPrintable(QString::number(10 * std::log10(accBlur / acc))));
+        }
 
         // As a clip effect on a still of the smeared picture.
         const QString png = QString::fromStdString(path("smeared.png"));
@@ -8395,8 +8432,28 @@ private slots:
         QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
         const Image without = renderSequenceFrame(p, s, 5, {});
         s.videoTracks[0].clips[0].effects.push_back(makeEffect(p, "motion_deblur"));
-        const Image with = renderSequenceFrame(p, s, 5, {});
+        // A view that cannot wait goes without it (and says the frame is not final); rendered ahead it runs, and the view then
+        // has it; half strength mixes the same result without the model.
+        RenderIssues quick;
+        RenderOptions interactive;
+        interactive.issues = &quick;
+        QCOMPARE(renderSequenceFrame(p, s, 5, interactive).px, without.px);
+        QVERIFY(quick.incomplete);
+        RenderIssues full;
+        RenderOptions ahead;
+        ahead.slowEffects = true;
+        ahead.issues = &full;
+        const Image with = renderSequenceFrame(p, s, 5, ahead);
+        QVERIFY(!full.incomplete);
         QVERIFY2(psnr(with) > psnr(without) + 1.0, qPrintable(QString("%1 %2").arg(psnr(without)).arg(psnr(with))));
+        QCOMPARE(renderSequenceFrame(p, s, 5, {}).px, with.px);
+        s.videoTracks[0].clips[0].effects.back().params["strength"] = Param(50.0);
+        RenderIssues halfIssues;
+        RenderOptions halfView;
+        halfView.issues = &halfIssues;
+        const Image halfWith = renderSequenceFrame(p, s, 5, halfView);
+        QVERIFY(!halfIssues.incomplete);
+        QVERIFY(std::fabs(halfWith.at(200, 60)[1] - 0.5f * (with.at(200, 60)[1] + without.at(200, 60)[1])) < 1e-4f);
         const Provenance prov = sequenceProvenance(p, s);
         QVERIFY(std::any_of(prov.ai.begin(), prov.ai.end(), [](const AiUse& u) { return u.model == "NAFNet"; }));
     }

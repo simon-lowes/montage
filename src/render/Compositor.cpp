@@ -16,6 +16,7 @@
 #include <QTransform>
 #include <algorithm>
 #include <functional>
+#include <string_view>
 #include <cmath>
 #include <cstring>
 #include <deque>
@@ -480,35 +481,63 @@ bool cachedSuperScale(const Image& in, int w, int h, double strength, Image& out
     return true;
 }
 
-// The last few Motion Deblur results, by what went in (sampled) and the strength, as for Super Scale.
-bool cachedDeblur(const Image& in, double strength, Image& out) {
-    uint64_t key = 1469598103934665603ULL;
-    auto mix = [&](uint64_t v) { key = (key ^ v) * 1099511628211ULL; };
-    mix(uint64_t(in.width)), mix(uint64_t(in.height)), mix(uint64_t(std::lround(strength * 1000)));
-    const size_t step = std::max<size_t>(1, in.px.size() / 8192);
-    for (size_t i = 0; i < in.px.size(); i += step) {
-        uint32_t bits;
-        std::memcpy(&bits, &in.px[i], 4);
-        mix(bits);
-    }
+// Motion Deblur's last results at full strength, by every pixel that went in (a strength change or a key mixes them again
+// without the model), up to a few hundred megabytes. With `run` false only a result already made is given.
+bool cachedDeblur(const Image& in, bool run, const std::atomic<bool>* cancel, Image& out, std::string* error) {
+    const uint64_t key = std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(in.px.data()), in.px.size() * sizeof(float))) ^
+                         (uint64_t(in.width) << 32 | uint64_t(in.height));
     static std::mutex m;
     static std::deque<std::pair<uint64_t, std::shared_ptr<const Image>>> cache;
-    {
+    auto find = [&] {
         std::lock_guard lock(m);
         for (const auto& [k, img] : cache)
-            if (k == key) {
+            if (k == key && img->width == in.width && img->height == in.height) {
                 out = *img;
                 return true;
             }
-    }
+        return false;
+    };
+    if (find()) return true;
+    if (!run) return false;
+    // One run at a time, so two views asking for the same frame wait for the first rather than both running it.
+    static std::mutex running;
+    std::lock_guard one(running);
+    if (find()) return true;
     Image result;
-    if (!motionDeblur(in, result, strength)) return false;
+    if (!motionDeblur(in, result, 1.0, error, cancel)) return false;
     auto shared = std::make_shared<const Image>(result);
     std::lock_guard lock(m);
     cache.emplace_front(key, shared);
-    if (cache.size() > 2) cache.pop_back();
+    size_t bytes = 0, keep = 0;
+    for (const auto& [k, img] : cache) {
+        bytes += img->px.size() * sizeof(float);
+        if (keep >= 2 && bytes > (size_t(384) << 20)) break;
+        ++keep;
+    }
+    cache.resize(keep);
     out = std::move(result);
     return true;
+}
+
+// Motion Deblur on a clip's source picture (render/MotionDeblur.h): in deliveries and previews rendered ahead the model
+// runs; views that cannot wait (playback, scrubbing, thumbnails) take a result already made, else go without (noted as
+// not final). A missing model leaves it out, which a delivery reports.
+void applyMotionDeblur(const Effect& e, FrameTime lt, const RenderOptions& o, Image& src) {
+    const double strength = std::clamp(e.p("strength", lt, 100) / 100, 0.0, 1.0);
+    if (src.empty() || strength <= 0) return;
+    if (!deblurAvailable() || !deblurModel().installed()) {
+        if (o.issues && o.highQuality) o.issues->note("Motion Deblur needs its model: add the effect once in the app or run scripts/fetch-models.sh");
+        return;
+    }
+    Image sharp;
+    std::string why;
+    if (!cachedDeblur(src, o.highQuality || o.slowEffects, o.cancel, sharp, &why)) {
+        if (o.issues) o.issues->note(why.empty() ? "Motion Deblur is shown once the frames are rendered (Render In to Out)" : why);
+        return;
+    }
+    if (strength < 1)
+        for (size_t i = 0; i < sharp.px.size(); ++i) sharp.px[i] = src.px[i] + (sharp.px[i] - src.px[i]) * float(strength);
+    src = std::move(sharp);
 }
 
 const Effect* denoiseEffect(const Clip& c) {
@@ -770,6 +799,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             src = renderSequenceFrame(p, *nested, nf, no);
             if (const Effect* nr = denoiseEffect(c); nr && !src.empty())
                 applyDenoise(*nr, lt, src, {}, {}, effectPixelScale(c, lt, g.sx, mw, src.width), -1);
+            if (const Effect* db = enabledEffect(c, "motion_deblur")) applyMotionDeblur(*db, lt, o, src);
             convertColor(src, sequenceColorSpace(*nested), sequenceColorSpace(seq), seq.hdrPeakNits);
         } else if (m->kind == MediaKind::Video || m->kind == MediaKind::Image) {
             if (!m->hasVideo && m->kind != MediaKind::Image) return {};
@@ -900,12 +930,8 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 applyDenoise(*nr, lt, src, around, motion, effectPixelScale(c, lt, g.sx, mw, src.width),
                              m->kind == MediaKind::Video ? sec : -1);
             }
-            // Motion Deblur, on the source frame as decoded (the size it is shown at), when its model is here.
-            if (const Effect* db = enabledEffect(c, "motion_deblur"); db && !src.empty() && db->p("strength", lt, 100) > 0 &&
-                                                                         deblurAvailable() && deblurModel().installed()) {
-                Image sharp;
-                if (cachedDeblur(src, db->p("strength", lt, 100) / 100, sharp)) src = std::move(sharp);
-            }
+            // Motion Deblur, on the source frame as decoded (the size it is shown at); not on proxies, which are for speed.
+            if (const Effect* db = enabledEffect(c, "motion_deblur"); db && original) applyMotionDeblur(*db, lt, o, src);
             // Motion Blur and Deflicker, from the source frames either side.
             const Effect* blur = enabledEffect(c, "motion_blur");
             const Effect* flicker = enabledEffect(c, "deflicker");

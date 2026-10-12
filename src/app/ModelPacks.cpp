@@ -206,7 +206,8 @@ bool ensureEffectModel(QWidget* parent, const std::string& type) {
         }
         return ensureModelPack(parent, deblurModel(), QObject::tr("Motion Deblur"),
                                QObject::tr("Motion Deblur uses NAFNet (MIT, trained on the GoPro dataset, CC BY 4.0), an image model that "
-                                           "runs on this computer. It takes seconds a frame: render long stretches ahead."));
+                                           "runs on this computer. It takes seconds a frame, so the monitors show it once the frames are rendered "
+                                           "(Sequence › Render In to Out); exports always include it."));
     }
     if (type == "depth_blur" || type == "depth_fog" || type == "depth_map" || type == "relight" || type == "mask.depth") {
         if (!depthAvailable()) {

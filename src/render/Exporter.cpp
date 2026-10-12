@@ -1410,6 +1410,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     ro.highQuality = true;
     ro.useProxies = s.useProxies;
     ro.stereoView = stereoView;
+    // A frame an effect could not finish (its model missing or failing) fails the export rather than going out without it.
+    RenderIssues issues;
+    ro.issues = &issues;
+    ro.cancel = cancel;
     // Smart rendering: only where nothing would change the source's pictures for the whole export.
     std::unique_ptr<SmartRenderer> smart;
     if (wantVideo && s.smartRender && o.vctx && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height && !seq.stereo3d &&
@@ -1517,6 +1521,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             // copied from the source
         } else if (wantVideo) {
             Image img = deliveredFrame(f);
+            if (issues.incomplete) return fail(cancel && cancel->load() ? std::string("Export cancelled") : issues.reason());
             if (measure) meter.add(img, f, measured);
             if (floatFrames && img.width == W && img.height == H) {
                 // Planar float, green-blue-red(-alpha), unpremultiplied, values above 1 kept.

@@ -65,8 +65,13 @@ struct Model {
 std::shared_ptr<Model> loadModel(std::string* error) {
     static std::mutex m;
     static auto* cached = new std::shared_ptr<Model>();  // kept for the session, never torn down
+    static std::string failed;                           // (a model that would not open is not tried again every frame)
     std::lock_guard lock(m);
     if (*cached) return *cached;
+    if (!failed.empty()) {
+        if (error) *error = failed;
+        return nullptr;
+    }
     if (!ortUsable(error)) return nullptr;
     const ModelPack& pack = deblurModel();
     if (!pack.installed()) {
@@ -77,6 +82,8 @@ std::shared_ptr<Model> loadModel(std::string* error) {
         auto model = std::make_shared<Model>();
         Ort::SessionOptions so;
         so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        // (Its working memory, a gigabyte or more for a large tile, is handed back after each run rather than kept.)
+        so.DisableCpuMemArena();
 #ifdef _WIN32
         const std::wstring path = QString::fromStdString(pack.path(pack.files[0])).toStdWString();
 #else
@@ -85,8 +92,9 @@ std::shared_ptr<Model> loadModel(std::string* error) {
         model->session = openModel(model->env, path.c_str(), so);
         *cached = model;
         return model;
-    } catch (const Ort::Exception& e) {
-        if (error) *error = std::string("The Motion Deblur model could not be loaded: ") + e.what();
+    } catch (const std::exception& e) {
+        failed = std::string("The Motion Deblur model could not be loaded: ") + e.what();
+        if (error) *error = failed;
         return nullptr;
     }
 }
@@ -99,18 +107,19 @@ int mirror(int i, int n) {
     return i < n ? i : period - i;
 }
 
-// Where tiles of `t` start along `n` pixels: each a whole tile, the last ending at the edge.
-std::vector<int> tileStarts(int n, int t) {
-    if (n <= t) return {0};
-    std::vector<int> s;
-    for (int x = 0;; x += t - kOverlap) {
-        if (x + t >= n) {
-            s.push_back(n - t);
-            break;
-        }
-        s.push_back(x);
-    }
-    return s;
+// Tiles along `n` pixels, none over `t` (nor under the model's smallest where the picture allows): as few as cover it with
+// at least kOverlap between neighbours, all one size and evenly spread, so no work is wasted on a sliver at the end.
+struct Tiles {
+    int size;
+    std::vector<int> starts;
+};
+Tiles tiles(int n, int t) {
+    if (n <= t) return {n, {0}};
+    const int k = (n - kOverlap + (t - kOverlap) - 1) / (t - kOverlap);
+    const int size = std::min(n, std::max(kMin, (n + (k - 1) * kOverlap + k - 1) / k));
+    Tiles out{size, {}};
+    for (int i = 0; i < k; ++i) out.starts.push_back(int(std::lround(double(i) * (n - size) / std::max(1, k - 1))));
+    return out;
 }
 
 }  // namespace
@@ -123,12 +132,58 @@ bool motionDeblur(const Image& in, Image& out, double strength, std::string* err
     }
     auto model = loadModel(error);
     if (!model) return false;
+    // One picture at a time: each run already takes every core, and its memory would multiply.
+    static std::mutex running;
+    std::lock_guard lock(running);
     const int W = in.width, H = in.height;
+    const size_t N = size_t(W) * size_t(H);
     tile = std::max(tile, kMin);
-    const int tw = std::min(W, tile), th = std::min(H, tile);
-    // The model's result, weighted where tiles overlap.
-    std::vector<float> acc(size_t(3) * size_t(W) * size_t(H), 0.0f), weight(size_t(W) * size_t(H), 0.0f);
+    const Tiles tx = tiles(W, tile), ty = tiles(H, tile);
+    const int tw = tx.size, th = ty.size;
     try {
+        // The colour un-premultiplied; where it is (nearly) transparent, the nearest visible colour along the row, then the
+        // column, so a cut-out's surround does not read as black next to its edge.
+        std::vector<float> colour(3 * N);
+        std::vector<uint8_t> seen(N);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const float* p = in.at(x, y);
+                const size_t o = size_t(y) * size_t(W) + size_t(x);
+                seen[o] = p[3] >= 0.01f;
+                for (int c = 0; c < 3; ++c) colour[size_t(c) * N + o] = seen[o] ? std::clamp(p[c] / p[3], 0.0f, 1.0f) : 0.5f;
+            }
+        const std::vector<uint8_t> opaque = seen;
+        auto fill = [&](size_t count, size_t length, size_t stride, size_t step) {
+            std::vector<size_t> filled;
+            std::vector<long> before(length);
+            for (size_t line = 0; line < count; ++line) {
+                const size_t base = line * stride;
+                long last = -1;
+                for (size_t i = 0; i < length; ++i) {
+                    if (seen[base + i * step]) last = long(i);
+                    before[i] = last;
+                }
+                last = -1;
+                for (size_t i = length; i-- > 0;) {
+                    const size_t o = base + i * step;
+                    if (seen[o]) {
+                        last = long(i);
+                        continue;
+                    }
+                    long from = before[i];
+                    if (last >= 0 && (from < 0 || last - long(i) < long(i) - from)) from = last;
+                    if (from < 0) continue;
+                    for (int c = 0; c < 3; ++c) colour[size_t(c) * N + o] = colour[size_t(c) * N + base + size_t(from) * step];
+                    filled.push_back(o);
+                }
+            }
+            for (size_t o : filled) seen[o] = 1;
+        };
+        fill(size_t(H), size_t(W), size_t(W), 1);
+        fill(size_t(W), size_t(H), 1, size_t(W));
+
+        // The model's result, weighted where tiles overlap.
+        std::vector<float> acc(3 * N, 0.0f), weight(N, 0.0f);
         Ort::MemoryInfo cpu = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
         const char* inNames[] = {"lq"};
         const char* outNames[] = {"output"};
@@ -136,19 +191,17 @@ bool motionDeblur(const Image& in, Image& out, double strength, std::string* err
         const int pw = std::max(tw, kMin), ph = std::max(th, kMin);
         const size_t plane = size_t(pw) * size_t(ph);
         std::vector<float> input(3 * plane);
-        const std::vector<int> xs = tileStarts(W, tw), ys = tileStarts(H, th);
-        for (int y0 : ys)
-            for (int x0 : xs) {
+        for (int y0 : ty.starts)
+            for (int x0 : tx.starts) {
                 if (cancel && cancel->load()) {
                     if (error) *error = "Cancelled";
                     return false;
                 }
                 for (int y = 0; y < ph; ++y) {
-                    const int sy = y0 + mirror(y, th);
+                    const size_t row = size_t(y0 + mirror(y, th)) * size_t(W);
                     for (int x = 0; x < pw; ++x) {
-                        const float* p = in.at(x0 + mirror(x, tw), sy);
-                        const float a = p[3] > 1e-6f ? p[3] : 1.0f;
-                        for (int c = 0; c < 3; ++c) input[size_t(c) * plane + size_t(y) * size_t(pw) + size_t(x)] = std::clamp(p[c] / a, 0.0f, 1.0f);
+                        const size_t o = row + size_t(x0 + mirror(x, tw));
+                        for (int c = 0; c < 3; ++c) input[size_t(c) * plane + size_t(y) * size_t(pw) + size_t(x)] = colour[size_t(c) * N + o];
                     }
                 }
                 const int64_t shape[4] = {1, 3, ph, pw};
@@ -166,34 +219,33 @@ bool motionDeblur(const Image& in, Image& out, double strength, std::string* err
                         if (x0 + tw < W) wx = std::min(wx, (tw - x - 0.5f) / kOverlap);
                         const float w = std::max(1e-4f, wx * wy);
                         const size_t o = size_t(y0 + y) * size_t(W) + size_t(x0 + x);
-                        for (int c = 0; c < 3; ++c)
-                            acc[size_t(c) * size_t(W) * size_t(H) + o] += w * r[size_t(c) * plane + size_t(y) * size_t(pw) + size_t(x)];
+                        for (int c = 0; c < 3; ++c) acc[size_t(c) * N + o] += w * r[size_t(c) * plane + size_t(y) * size_t(pw) + size_t(x)];
                         weight[o] += w;
                     }
                 }
             }
-    } catch (const Ort::Exception& e) {
+        out = in;
+        const float k = float(strength);
+        parallelRows(H, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y) {
+                float* p = out.row(y);
+                for (int x = 0; x < W; ++x, p += 4) {
+                    const size_t o = size_t(y) * size_t(W) + size_t(x);
+                    const float a = p[3];
+                    if (!opaque[o]) continue;  // (nearly transparent: left as it was)
+                    for (int c = 0; c < 3; ++c) {
+                        // (The change the model made, so values outside 0..1, which it never saw, keep what is beyond.)
+                        const float before = p[c] / a, made = std::clamp(acc[size_t(c) * N + o] / weight[o], 0.0f, 1.0f);
+                        p[c] = (before + (made - colour[size_t(c) * N + o]) * k) * a;
+                    }
+                }
+            }
+        });
+        return true;
+    } catch (const std::exception& e) {
         if (error) *error = std::string("Motion Deblur failed: ") + e.what();
         return false;
     }
-    out = in;
-    const float k = float(strength);
-    parallelRows(H, [&](int y0, int y1) {
-        for (int y = y0; y < y1; ++y) {
-            float* p = out.row(y);
-            for (int x = 0; x < W; ++x, p += 4) {
-                const float a = p[3];
-                if (a <= 0) continue;
-                const size_t o = size_t(y) * size_t(W) + size_t(x);
-                for (int c = 0; c < 3; ++c) {
-                    // (The change the model made, so values outside 0..1, which it never saw, keep what is beyond.)
-                    const float before = p[c] / a, made = std::clamp(acc[size_t(c) * size_t(W) * size_t(H) + o] / weight[o], 0.0f, 1.0f);
-                    p[c] = (before + (made - std::clamp(before, 0.0f, 1.0f)) * k) * a;
-                }
-            }
-        }
-    });
-    return true;
 }
 
 #endif
