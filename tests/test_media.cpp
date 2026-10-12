@@ -5192,6 +5192,75 @@ private slots:
         QVERIFY(QFileInfo::exists(r.value("structuredContent").toObject().value("pull_list").toString()));
     }
 
+    void trimPassesOverMcp() {
+        // An HDR master with two shots: trim targets added, a shot trimmed, the SDR pass rendered.
+        Project q = makeDefaultProject();
+        Sequence& seq = *q.active();
+        seq.width = 64;
+        seq.height = 36;
+        seq.colorSpace = "rec2100pq";
+        Clip a = makeGeneratorClip(q, "color", 10);
+        a.name = "Wide";
+        Clip b = makeGeneratorClip(q, "color", 10);
+        b.name = "Close";
+        b.start = 10;
+        edit::overwrite(q, seq, {TrackKind::Video, 0}, a);
+        edit::overwrite(q, seq, {TrackKind::Video, 0}, b);
+        const QString project = QString::fromStdString(path("trims/film.montage"));
+        QDir().mkpath(QFileInfo(project).absolutePath());
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        QJsonObject r = call("montage_trim", {{"action", "add_target"}, {"target", "sdr"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("id").toString(), QString("sdr"));
+        r = call("montage_trim", {{"action", "add_target"}, {"color_space", "rec2100pq"}, {"peak_nits", 500}, {"name", "Phones"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const QString phones = r.value("structuredContent").toObject().value("id").toString();
+        QVERIFY(call("montage_trim", {{"action", "add_target"}, {"target", "cinema"}}).value("isError").toBool());
+        r = call("montage_trim", {{"action", "set"}, {"target", "sdr"}, {"clip", "Wide"}, {"values", QJsonObject{{"gain", 0.8}, {"highlights", 0.3}}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call("montage_trim", {{"action", "set"}, {"target", "sdr"}, {"clip", "Wide"}, {"values", QJsonObject{{"warmth", 1}}}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("No trim control"));
+        r = call("montage_trim", {{"action", "copy"}, {"target", "sdr"}, {"clip", "Wide"}, {"clips", QJsonArray{"Close"}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call("montage_trim", {});
+        QJsonObject listed = r.value("structuredContent").toObject();
+        QCOMPARE(listed.value("targets").toArray().size(), 2);
+        QCOMPARE(listed.value("targets").toArray().at(1).toObject().value("peak_nits").toDouble(), 500.0);
+        QCOMPARE(listed.value("trims").toArray().size(), 2);
+        QCOMPARE(listed.value("trims").toArray().at(0).toObject().value("values").toObject().value("gain").toDouble(), 0.8);
+        r = call("montage_trim", {{"action", "reset"}, {"clips", QJsonArray{"Close"}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call("montage_trim", {{"action", "remove_target"}, {"target", phones}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->trimTargets.size(), size_t(1));
+        QCOMPARE(back.active()->videoTracks[0].clips.at(0).trims.at("sdr").params.at("gain").value, 0.8);
+        QVERIFY(back.active()->videoTracks[0].clips.at(1).trims.empty());
+
+        // montage_render delivers a target (SDR: Rec.709 tags), and refuses one the sequence lacks.
+        const QString out = QString::fromStdString(path("trims/sdr.mp4"));
+        r = call("montage_render", {{"output", out}, {"preset", "H.264 - Fast Draft"}, {"trim_target", "hdr10-300"}});
+        QVERIFY(r.value("isError").toBool());
+        r = call("montage_render", {{"output", out}, {"preset", "H.264 - Fast Draft"}, {"trim_target", "sdr"}, {"in", 0}, {"out", 0.2}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        MediaItem m;
+        std::string err;
+        QVERIFY2(probeMedia(out.toStdString(), m, &err), err.c_str());
+        QCOMPARE(m.colorSpace.empty() ? std::string("rec709") : m.colorSpace, std::string("rec709"));
+    }
+
     void galleryOverMcp() {
         // Two colour clips, the first with a Curves grade; stills grabbed, its grade applied to the second.
         Project q = makeDefaultProject();

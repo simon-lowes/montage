@@ -85,6 +85,7 @@
 #include "automation/McpServer.h"
 #include "render/OGraf.h"
 #include "GalleryPanel.h"
+#include "TrimPanel.h"
 #include "render/Gallery.h"
 #include "ClipStripPanel.h"
 #include "automation/PythonHost.h"
@@ -10180,6 +10181,62 @@ const auto seq = [this] { return state()->sequence(); };
         state()->undo();
         QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(1));
         state()->newProject();
+    }
+
+    void trimPassesPanel() {
+        // The demo as an HDR master: an SDR target added in the Trims panel, which the Program monitor then shows.
+        const QString path = dir_.path() + "/trims-demo.montage";
+        Project demo = demoProject();
+        demo.active()->colorSpace = "rec2100pq";
+        QVERIFY(saveProject(demo, path.toStdString()));
+        QVERIFY(win_->openProject(path));
+        auto* trims = win_->findChild<TrimPanel*>();
+        QVERIFY(trims);
+        PlaybackController* program = nullptr;
+        for (auto* mp : win_->findChildren<MonitorPanel*>())
+            if (mp->mode() == MonitorPanel::Mode::Program) program = mp->controller();
+        QVERIFY(program);
+        QCOMPARE(trims->shown(), QString());
+        QVERIFY(!win_->findChild<QDoubleSpinBox*>("trim_gain")->isEnabled());
+        QVERIFY(trims->addTarget("sdr"));
+        QCOMPARE(trims->shown(), QString("sdr"));
+        QCOMPARE(program->trimTarget(), std::string("sdr"));
+
+        // The shot at the playhead (Red; the title over it is not one) trimmed: one undo step for a run of changes.
+        const Id red = clipNamed(*state()->sequence(), "Red")->id, blue = clipNamed(*state()->sequence(), "Blue")->id;
+        state()->setPlayhead(20);
+        QCOMPARE(trims->shot(), red);
+        auto* gain = win_->findChild<QDoubleSpinBox*>("trim_gain");
+        QVERIFY(gain->isEnabled());
+        gain->setValue(0.8);
+        gain->setValue(0.6);
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->trims.at("sdr").p("gain", 0), 0.6);
+        state()->undo();
+        QVERIFY(edit::clipById(*state()->sequence(), red)->trims.empty());
+        state()->redo();
+        QCOMPARE(gain->value(), 0.6);
+        state()->setSelection({blue}, false);
+        QVERIFY(trims->copyToSelection());
+        QCOMPARE(edit::clipById(*state()->sequence(), blue)->trims.at("sdr").p("gain", 0), 0.6);
+        state()->setPlayhead(70);
+        QCOMPARE(trims->shot(), blue);
+        QVERIFY(trims->resetShot());
+        QVERIFY(edit::clipById(*state()->sequence(), blue)->trims.empty());
+
+        // Queue Passes: a render of each target, delivering it.
+        RenderQueue* queue = win_->renderQueue();
+        const size_t before = queue->jobs().size();
+        QCOMPARE(win_->queueTrimPasses(dir_.path() + "/passes"), 1);
+        QCOMPARE(queue->jobs().size(), before + 1);
+        QCOMPARE(queue->jobs().back().settings.trimTarget, std::string("sdr"));
+        QVERIFY(QString::fromStdString(queue->jobs().back().settings.path).endsWith(".mp4"));
+        queue->remove(queue->jobs().back().id);
+
+        // Removing the target shows the master again.
+        QVERIFY(trims->removeShown());
+        QCOMPARE(trims->shown(), QString());
+        QCOMPARE(program->trimTarget(), std::string());
+        QVERIFY(state()->sequence()->trimTargets.empty());
     }
 
     void galleryAndClipStrip() {

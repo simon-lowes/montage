@@ -35,6 +35,7 @@
 #include <QFile>
 #include <QDesktopServices>
 #include <QFileDialog>
+#include <QRegularExpression>
 #include <QFileInfo>
 #include <QHeaderView>
 #include <QInputDialog>
@@ -120,6 +121,8 @@
 #include "KeyframePanel.h"
 #include "GradeNodePanel.h"
 #include "GalleryPanel.h"
+#include "TrimPanel.h"
+#include "render/TrimPasses.h"
 #include "ClipStripPanel.h"
 #include "MediaBinWidget.h"
 #include "RenderQueue.h"
@@ -561,6 +564,17 @@ void MainWindow::buildPanels() {
     connect(gallery_, &GalleryPanel::compareCleared, this, [this] {
         if (programPanel_ && !(compareRef_ && compareRef_->isChecked())) programPanel_->viewer()->clearCompare();
     });
+    // Trim passes (Resolve's Trim Manager): the target the Program monitor and reference output show.
+    trims_ = new TrimPanel(state_, this);
+    trimsDock_ = makeDock(tr("Trims"), "trims", trims_);
+    connect(trims_, &TrimPanel::shownChanged, this, [this](const QString& target) {
+        program_->setTrimTarget(target.toStdString());
+        if (referenceOutput_) referenceOutput_->sequenceChanged();
+    });
+    connect(trims_, &TrimPanel::queueRequested, this, [this] {
+        const QString folder = QFileDialog::getExistingDirectory(this, tr("Render the Trim Passes Into"), QFileInfo(state_->filePath()).absolutePath());
+        if (!folder.isEmpty()) queueTrimPasses(folder);
+    });
     queue_ = new RenderQueue(this);
     queueDock_ = makeDock(tr("Render Queue"), "renderqueue", new RenderQueuePanel(queue_, this));
     production_ = new ProductionPanel(state_, this);
@@ -680,7 +694,7 @@ void MainWindow::layOutBuiltIn(const QString& name) {
     if (name == "Colour") {
         // A large Program monitor between the scopes and the Inspector (Premiere's Color workspace).
         // The gallery beside them, the clips under the timeline.
-        arrangeDocks({{scopesDock_}, {programDock_}}, {{galleryDock_, binDock_, effectsDock_, indexDock_}}, {{nodesDock_}, {inspectorDock_, keyframesDock_}},
+        arrangeDocks({{scopesDock_}, {programDock_}}, {{galleryDock_, binDock_, effectsDock_, indexDock_}}, {{nodesDock_}, {inspectorDock_, trimsDock_, keyframesDock_}},
                      {{clipsDock_}});
         setCorner(Qt::TopRightCorner, Qt::RightDockWidgetArea);  // the Inspector the full height
         resizeDocks({binDock_}, {260}, Qt::Horizontal);
@@ -716,7 +730,7 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         resizeDocks({sourceDock_}, {h / 2 + 40}, Qt::Vertical);
     } else {  // Editing
         arrangeDocks({{sourceDock_, inspectorDock_, scopesDock_, mixerDock_, captionsDock_, multicamDock_, keyframesDock_}, {programDock_}},
-                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, peopleDock_, indexDock_, stackedDock_, queueDock_, assistantDock_, nodesDock_, galleryDock_, clipsDock_}},
+                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, peopleDock_, indexDock_, stackedDock_, queueDock_, assistantDock_, nodesDock_, galleryDock_, clipsDock_, trimsDock_}},
                      {{meterDock_}});
         resizeDocks({binDock_}, {380}, Qt::Horizontal);
         resizeDocks({meterDock_}, {70}, Qt::Horizontal);
@@ -4217,7 +4231,8 @@ unsigned MainWindow::askAttributes(const QString& title, bool removing) {
                                                      {"attrTimeRemap", tr("Time Remapping")},
                                                      {"attrVolume", tr("Volume and pan")},
                                                      {"attrEffects", removing ? tr("Effects") : tr("Effects (added after the clip's own)")},
-                                                     {"attrGrade", removing ? tr("Colour nodes") : tr("Colour nodes (replacing the clip's)")}};
+                                                     {"attrGrade", removing ? tr("Colour nodes") : tr("Colour nodes (replacing the clip's)")},
+                                                     {"attrTrims", removing ? tr("Trim passes") : tr("Trim passes (replacing the clip's)")}};
     std::vector<QCheckBox*> boxes;
     QSettings settings = appSettings();
     for (const auto& [name, label] : items) {
@@ -4949,6 +4964,33 @@ bool MainWindow::addToColorGroup(Id group) {
 bool MainWindow::removeFromColorGroup() {
     const std::vector<Id> sel = state_->selectedClips();
     return state_->edit(tr("Remove from Colour Group"), [&](Project&, Sequence& s) { return edit::removeFromColorGroup(s, sel).ok; });
+}
+
+int MainWindow::queueTrimPasses(const QString& folder) {
+    const Sequence* s = state_->sequence();
+    if (!s || s->trimTargets.empty()) {
+        state_->message(tr("Add a trim target first (the Trims panel)"), 5000);
+        return 0;
+    }
+    QDir().mkpath(folder);
+    int queued = 0;
+    for (const TrimTarget& t : s->trimTargets) {
+        // HDR as 10-bit HEVC with HDR10+ (PQ), SDR as H.264.
+        const bool hdr = trimTargetSpace(*s, t.id).hdr();
+        const ExportPreset* preset = findExportPreset(hdr ? "H.265 / HEVC 10-bit" : "H.264 - High Quality");
+        if (!preset) continue;
+        ExportSettings st = preset->settings;
+        st.trimTarget = t.id;
+        st.hdr10Plus = trimTargetSpace(*s, t.id).transfer == Transfer::Pq;
+        QString name = QString::fromStdString(s->name + " - " + t.name);
+        name.replace(QRegularExpression(QStringLiteral("[\\\\/:*?\"<>|]")), QStringLiteral("_"));
+        st.path = QDir(folder).filePath(name + "." + QString::fromStdString(preset->extension)).toStdString();
+        queue_->add(name, QString::fromStdString(preset->name), state_->project(), s->id, st);
+        ++queued;
+    }
+    if (queueDock_) queueDock_->show();
+    state_->message(tr("%n trim pass(es) queued to render into %1", "", queued).arg(QDir::toNativeSeparators(folder)), 6000);
+    return queued;
 }
 
 std::vector<Id> MainWindow::exportVersions(const std::vector<VersionShape>& shapes, const QString& folder, bool captions, double lufs,

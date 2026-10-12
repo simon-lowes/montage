@@ -54,6 +54,7 @@ signals:
 
 private:
     QString formatKey() const;
+    Sequence signalSequence(const Sequence& s) const;
     QPointer<PlaybackController> program_;  // (may go first when the window closes)
     output::Config config_;
     std::shared_ptr<output::Backend> backend_;

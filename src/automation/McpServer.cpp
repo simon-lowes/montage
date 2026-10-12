@@ -121,6 +121,7 @@
 #include "render/ClipAnalysis.h"
 #include "render/OGraf.h"
 #include "render/Gallery.h"
+#include "render/TrimPasses.h"
 #include "media/Segmenter.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
@@ -6513,6 +6514,106 @@ void McpServer::Impl::addTools() {
                       QJsonObject{{"applied", double(r.applied)}});
         });
 
+    add("montage_trim", "HDR and SDR trim passes",
+        "Trim passes (Resolve's MultiMaster Trim): the sequence graded once (its master, usually HDR) delivered to other "
+        "displays, each a trim target: a preset (sdr: Rec.709 100 nits; hdr10-1000, hdr10-600, hdr10-300: PQ rolled off "
+        "to that peak; hlg) or a space and peak of its own. Each shot (the top picture clip on screen) can be trimmed for "
+        "a target on its code values: lift (-0.5..0.5), gamma (-1..1), gain (0..2), saturation (0..2), highlights (a "
+        "roll-off, 0..1) and mid_detail (-1..1), keyframed where a control has keys. list gives the targets and the "
+        "clips' trims; add_target, remove_target; set a clip's controls (at a timeline time, default the playhead); "
+        "reset clips' trims; copy one clip's trim to others. montage_render's trim_target delivers a target.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "action":{"type":"string","enum":["list","add_target","remove_target","set","reset","copy"],"default":"list"},
+            "target":{"type":"string","description":"A target's id; add_target: a preset (sdr, hdr10-1000, hdr10-600, hdr10-300, hlg) or omitted with color_space"},
+            "color_space":{"type":"string","description":"add_target: a display space (rec709, rec2100pq, rec2100hlg...)"},
+            "peak_nits":{"type":"number","description":"add_target: the display's peak (PQ)"},
+            "name":{"type":"string","description":"add_target: its name"},
+            "clip":{"type":["number","string"],"description":"set, copy: the clip (id or name)"},
+            "clips":{"type":"array","items":{"type":["number","string"]},"description":"reset, copy: clips (ids or names)"},
+            "values":{"type":"object","description":"set: controls and their values, e.g. {\"gain\":0.9,\"highlights\":0.4}"},
+            "at":{"type":["number","string"],"description":"set: timeline time a keyframed control is set at (default the playhead)"}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const QString action = str(a, "action", "list");
+            auto done = [&](edit::Result r, const QString& said) {
+                if (!r.ok) return fail(QString::fromStdString(r.error));
+                save(l);
+                return ok(said);
+            };
+            auto clipsArg = [&] {
+                std::vector<Id> ids;
+                for (const QJsonValue& v : a.value("clips").toArray()) ids.push_back(videoClipArg(l, QJsonObject{{"clip", v}}).id);
+                if (ids.empty()) throw ArgError{"\"clips\" is required"};
+                return ids;
+            };
+            if (action == "list") {
+                QJsonArray targets, presets, trims;
+                for (const TrimTarget& tt : s.trimTargets)
+                    targets.append(QJsonObject{{"id", QString::fromStdString(tt.id)}, {"name", QString::fromStdString(tt.name)},
+                                               {"color_space", QString::fromStdString(tt.colorSpace)}, {"peak_nits", trimTargetPeak(s, tt.id)}});
+                for (const TrimTarget& tt : trimTargetPresets()) presets.append(QString::fromStdString(tt.id));
+                for (const Track& tr : s.videoTracks)
+                    for (const Clip& c : tr.clips)
+                        for (const auto& [target, e] : c.trims) {
+                            QJsonObject values;
+                            for (const TrimControl& k : trimControls()) {
+                                const auto it = e.params.find(k.name);
+                                if (it == e.params.end()) continue;
+                                if (it->second.animated()) values[k.name] = QStringLiteral("keyframed");
+                                else if (std::fabs(it->second.value - k.def) > 1e-9) values[k.name] = it->second.value;
+                            }
+                            trims.append(QJsonObject{{"clip", double(c.id)}, {"name", QString::fromStdString(c.name)},
+                                                     {"target", QString::fromStdString(target)}, {"values", values}});
+                        }
+                return ok(QStringLiteral("%1 trim target(s), %2 trim(s)").arg(targets.size()).arg(trims.size()),
+                          QJsonObject{{"master", QString::fromStdString(s.colorSpace)}, {"master_peak_nits", s.hdrPeakNits},
+                                      {"targets", targets}, {"presets", presets}, {"trims", trims}});
+            }
+            if (action == "add_target") {
+                TrimTarget tt;
+                const QString preset = str(a, "target");
+                if (!preset.isEmpty() && !a.contains("color_space")) {
+                    const auto& all = trimTargetPresets();
+                    const auto it = std::find_if(all.begin(), all.end(), [&](const TrimTarget& x) { return x.id == preset.toStdString(); });
+                    if (it == all.end()) throw ArgError{"\"target\" is a preset: sdr, hdr10-1000, hdr10-600, hdr10-300 or hlg"};
+                    tt = *it;
+                } else {
+                    tt.id = preset.toStdString();
+                    tt.colorSpace = need(a, "color_space").toStdString();
+                    tt.peakNits = a.value("peak_nits").toDouble(1000);
+                }
+                if (a.contains("name")) tt.name = str(a, "name").toStdString();
+                const size_t before = s.trimTargets.size();
+                const auto r = edit::addTrimTarget(s, tt);
+                if (!r.ok) return fail(QString::fromStdString(r.error));
+                save(l);
+                const TrimTarget& added = s.trimTargets.at(before);
+                return ok(QStringLiteral("Added trim target %1").arg(QString::fromStdString(added.name)),
+                          QJsonObject{{"id", QString::fromStdString(added.id)}});
+            }
+            if (action == "remove_target") return done(edit::removeTrimTarget(s, need(a, "target").toStdString()), QStringLiteral("Removed"));
+            if (action == "set") {
+                const Clip& c = videoClipArg(l, a);
+                std::map<std::string, double> values;
+                const QJsonObject v = a.value("values").toObject();
+                for (auto it = v.begin(); it != v.end(); ++it) {
+                    if (!it.value().isDouble()) throw ArgError{QStringLiteral("\"%1\" must be a number").arg(it.key())};
+                    values[it.key().toStdString()] = it.value().toDouble();
+                }
+                if (values.empty()) throw ArgError{"\"values\" is required"};
+                const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : s.playhead;
+                return done(edit::setTrim(s, c.id, need(a, "target").toStdString(), values, at), QStringLiteral("Trimmed %1").arg(QString::fromStdString(c.name)));
+            }
+            if (action == "reset") return done(edit::resetTrims(s, clipsArg(), str(a, "target").toStdString()), QStringLiteral("Reset"));
+            if (action == "copy") {
+                const Clip& c = videoClipArg(l, a);
+                return done(edit::copyTrim(s, c.id, clipsArg(), need(a, "target").toStdString()), QStringLiteral("Copied"));
+            }
+            throw ArgError{"\"action\" is list, add_target, remove_target, set, reset or copy"};
+        });
+
     add("montage_match_chart", "Match a colour chart",
         "Colour-chart calibration (Resolve's Color Match): finds an X-Rite ColorChecker Classic (24 patches) in a clip's "
         "picture at `at` (or its middle frame), upright, upside down or on its side, or uses `corners` (the patch area's "
@@ -7121,6 +7222,7 @@ void McpServer::Impl::addTools() {
             "stems":{"type":"string","enum":["none","tracks","buses","roles"],"default":"none",
                 "description":"Also write 24-bit WAV stems beside the output, one per audio track, per bus (plus Main) or per audio role"},
             "captions":{"type":"string","enum":["none","burn","embed","both"],"default":"none","description":"The visible caption track, burned into the picture and/or embedded as a subtitle stream"},
+            "trim_target":{"type":"string","description":"A trim pass (montage_trim): deliver that target of the sequence (its space and peak, each shot's trim) instead of the master"},
             "hdr10plus":{"type":"boolean","default":false,"description":"PQ exports: HDR10+ dynamic metadata, scene by scene, in HEVC and AV1 video and as name.hdr10plus.json beside the file (measured first unless montage_measure_hdr's analysis still matches the cut)"},
             "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as CEA-608 closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask)"},
             "all_captions":{"type":"boolean","default":false,"description":"With embed: every caption track as its own subtitle stream, language tagged"},
@@ -7193,6 +7295,9 @@ void McpServer::Impl::addTools() {
             st.burnInCaptions = cap == "burn" || cap == "both";
             st.cea608 = a.value("cea608").toBool();
             st.hdr10Plus = a.value("hdr10plus").toBool();
+            st.trimTarget = str(a, "trim_target").toStdString();
+            if (!st.trimTarget.empty() && !findTrimTarget(s, st.trimTarget))
+                throw ArgError{QStringLiteral("The sequence has no trim target \"%1\" (montage_trim lists them)").arg(str(a, "trim_target"))};
             st.embedCaptions = cap == "embed" || cap == "both";
             if (st.embedCaptions && a.value("all_captions").toBool())
                 for (const CaptionTrack& t : s.captionTracks)

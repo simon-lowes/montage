@@ -1,4 +1,5 @@
 #include "RenderCache.h"
+#include "TrimPasses.h"
 #include "core/GradeGraph.h"
 #include "media/Proxy.h"
 
@@ -167,6 +168,8 @@ QByteArray frameKey(const Project& p, const Sequence& seq, FrameTime t, const Re
     h.addData(QByteArray::number(o.scale, 'g', 10) + (o.useProxies ? "P" : "") + (o.highQuality ? "H" : "") + '#' +
               QByteArray::fromStdString(o.displaySpace) + '#' + QByteArray::number(o.soloVideoTrack) +
               (seq.stereo3d ? QByteArray("#3D") + QByteArray::number(int(o.stereoView)) : QByteArray()));
+    if (const TrimTarget* trim = o.trimTarget.empty() ? nullptr : findTrimTarget(seq, o.trimTarget))
+        h.addData(QByteArray::fromStdString("#trim|" + trim->id + "|" + trim->colorSpace + "|") + QByteArray::number(trim->peakNits));
     bool any = addFrame(h, p, seq, t, o, 0);
     if (o.captions)
         if (const CaptionTrack* track = captionTrackFor(seq)) {

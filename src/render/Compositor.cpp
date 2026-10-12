@@ -1,4 +1,5 @@
 #include "Compositor.h"
+#include "TrimPasses.h"
 #include "OGraf.h"
 #include "Ofx.h"
 
@@ -1169,8 +1170,11 @@ Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, con
         img = o.stereoView == StereoView::Right ? eyeFrame(1) : combineStereo(eyeFrame(0), eyeFrame(1), o.stereoView);
     else
         img = eyeFrame(seq.stereo3d && o.depth == 0 ? 0 : o.eye);
+    const TrimTarget* trim = o.depth == 0 && !o.trimTarget.empty() ? findTrimTarget(seq, o.trimTarget) : nullptr;
+    if (trim) applyTrimPass(img, seq, t, *trim);
     if (!o.displaySpace.empty() && o.depth == 0)
-        if (const ColorSpace* d = findColorSpace(o.displaySpace)) convertColor(img, sequenceColorSpace(seq), *d, seq.hdrPeakNits);
+        if (const ColorSpace* d = findColorSpace(o.displaySpace))
+            convertColor(img, trimTargetSpace(seq, trim ? trim->id : std::string()), *d, trimTargetPeak(seq, trim ? trim->id : std::string()));
     return img;
 }
 

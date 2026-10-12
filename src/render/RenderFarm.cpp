@@ -169,6 +169,7 @@ void visitSettings(S& s, V& v) {
     v("captionTrack", s.captionTrack);
     v("cea608", s.cea608);
     v("colorSpace", s.colorSpace);
+    v("trimTarget", s.trimTarget);
     v("hdr10Plus", s.hdr10Plus);
     v("loudnessTarget", s.loudnessTarget);
     v("peakCeiling", s.peakCeiling);

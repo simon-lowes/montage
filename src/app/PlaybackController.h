@@ -58,6 +58,9 @@ public:
     // difference (render/Stereo.h). Other sequences are not affected.
     void setStereoView(StereoView v);
     StereoView stereoView() const { return stereoView_; }
+    // The trim pass shown (render/TrimPasses.h: one of the sequence's targets), "" = the master.
+    const std::string& trimTarget() const { return trimTarget_; }
+    void setTrimTarget(const std::string& id);
     // Also render HDR sequences as light for the HDR viewer (hdrFrameRendered), beside their SDR pictures.
     void setHdrOutput(bool on);
     bool hdrOutput() const { return hdrOutput_; }
@@ -144,6 +147,7 @@ private:
     bool useProxies_ = false;
     bool showCaptions_ = false;
     StereoView stereoView_ = StereoView::Left;
+    std::string trimTarget_;
     bool hdrOutput_ = false;
     double speed_ = 0;
     bool loop_ = false;

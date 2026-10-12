@@ -327,6 +327,11 @@ QJsonObject clipToJson(const Clip& c) {
     }
     if (c.colorGroup) o["colorGroup"] = double(c.colorGroup);
     if (!c.grade.empty()) o["grade"] = gradeGraphToJson(c.grade);
+    if (!c.trims.empty()) {
+        QJsonObject trims;
+        for (const auto& [target, e] : c.trims) trims[qs(target)] = effectToJson(e);
+        o["trims"] = trims;
+    }
     if (!c.fields.empty()) {
         QJsonObject values;
         for (const auto& [id, v] : c.fields) values[qs(id)] = qs(v);
@@ -390,6 +395,11 @@ Clip clipFromJson(const QJsonObject& o) {
     c.gradeVersion = c.gradeVersions.empty() ? 0 : std::clamp(o.value("gradeVersion").toInt(), 0, int(c.gradeVersions.size()) - 1);
     c.colorGroup = Id(i64(o.value("colorGroup")));
     c.grade = gradeGraphFromJson(o.value("grade").toObject());
+    const QJsonObject trims = o.value("trims").toObject();
+    for (auto it = trims.begin(); it != trims.end(); ++it) {
+        Effect e = effectFromJson(it.value());
+        if (e.type == "trim") c.trims[it.key().toStdString()] = std::move(e);
+    }
     const QJsonObject values = o.value("fields").toObject();
     for (auto it = values.begin(); it != values.end(); ++it) c.fields[it.key().toStdString()] = ss(it.value());
     return c;
@@ -660,6 +670,12 @@ QJsonObject sequenceToJson(const Sequence& s) {
     }
     if (s.colorSpace != "rec709") o["colorSpace"] = qs(s.colorSpace);
     if (s.hdrPeakNits != 1000) o["hdrPeakNits"] = s.hdrPeakNits;
+    if (!s.trimTargets.empty()) {
+        QJsonArray targets;
+        for (const TrimTarget& tt : s.trimTargets)
+            targets.append(QJsonObject{{"id", qs(tt.id)}, {"name", qs(tt.name)}, {"colorSpace", qs(tt.colorSpace)}, {"peakNits", tt.peakNits}});
+        o["trimTargets"] = targets;
+    }
     if (s.hdrMaxCll > 0) o["hdrMaxCll"] = s.hdrMaxCll;
     if (s.hdrMaxFall > 0) o["hdrMaxFall"] = s.hdrMaxFall;
     if (!s.hdr10Plus.empty()) {
@@ -707,6 +723,12 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     for (auto it = gains.begin(); it != gains.end(); ++it) s.folderGains[it.key().toStdString()] = it.value().toDouble();
     s.colorSpace = o.contains("colorSpace") ? ss(o.value("colorSpace")) : "rec709";
     s.hdrPeakNits = std::clamp(o.value("hdrPeakNits").toDouble(1000), 100.0, 10000.0);
+    for (const auto& v : o.value("trimTargets").toArray()) {
+        const QJsonObject tt = v.toObject();
+        TrimTarget target{ss(tt.value("id")), ss(tt.value("name")), ss(tt.value("colorSpace")), std::clamp(tt.value("peakNits").toDouble(100), 100.0, 10000.0)};
+        if (!target.id.empty() && std::none_of(s.trimTargets.begin(), s.trimTargets.end(), [&](const TrimTarget& x) { return x.id == target.id; }))
+            s.trimTargets.push_back(std::move(target));
+    }
     s.hdrMaxCll = std::clamp(o.value("hdrMaxCll").toDouble(0), 0.0, 10000.0);
     s.hdrMaxFall = std::clamp(o.value("hdrMaxFall").toDouble(0), 0.0, s.hdrMaxCll);
     for (const auto& v : o.value("hdr10Plus").toArray()) {

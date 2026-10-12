@@ -199,7 +199,8 @@ enum Attribute : unsigned {
     AttrVolume = 8,      // clip gain and pan
     AttrEffects = 16,    // the effect stack (pasted ones are added after the clip's own); a node graph's aside
     AttrGrade = 32,      // the colour node graph with its nodes' effects (replacing the clip's)
-    AttrAll = 63
+    AttrTrims = 64,      // its trims for the sequence's trim passes (render/TrimPasses.h), replacing the clip's
+    AttrAll = 127
 };
 // Copies the chosen attributes of `from` (a clip on a `fromKind` track,
 // keyframes included) onto the clips: picture ones onto video clips, volume
