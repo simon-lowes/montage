@@ -168,6 +168,7 @@ add_library(montage_engine STATIC
   render/Deconvolve.h render/Deconvolve.cpp
   render/Exporter.h render/Exporter.cpp
   render/VideoPacking.h render/VideoPacking.cpp
+  render/ReferenceOutput.h render/ReferenceOutput.cpp
   audio/Plugins.h audio/PluginScan.cpp audio/ClapHost.cpp
   audio/DynLib.h audio/DynLib.cpp
   audio/PluginEffect.h audio/PluginEffect.cpp

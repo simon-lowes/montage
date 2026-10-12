@@ -54,6 +54,7 @@
 #include "render/VideoDenoise.h"
 #include "render/VideoFx.h"
 #include "render/VideoPacking.h"
+#include "render/ReferenceOutput.h"
 #include <random>
 
 extern "C" {
@@ -4766,6 +4767,146 @@ colorspaces:
             const uint32_t w0 = packed[0] | packed[1] << 8 | packed[2] << 16 | uint32_t(packed[3]) << 24;
             QCOMPARE(int(w0 >> 10 & 1023), (yc.y[0] + 32) >> 6);
         }
+    }
+
+    void referenceOutput() {
+        using namespace montage::output;
+        // Modes: the sequence's own, progressive first; else its rate at the nearest larger size; none at a rate no
+        // mode has.
+        const std::vector<Mode> modes = standardModes();
+        QCOMPARE(QString::fromStdString(matchMode(modes, 1920, 1080, {25, 1})->name), QStringLiteral("1080p25"));
+        QCOMPARE(QString::fromStdString(matchMode(modes, 1920, 1080, {30000, 1001})->name), QStringLiteral("1080p29.97"));
+        QCOMPARE(QString::fromStdString(matchMode(modes, 1280, 720, {25, 1})->name), QStringLiteral("1080p25"));
+        QCOMPARE(QString::fromStdString(matchMode(modes, 1280, 720, {60000, 1001})->name), QStringLiteral("720p59.94"));
+        QCOMPARE(QString::fromStdString(matchMode(modes, 3840, 2160, {24000, 1001})->name), QStringLiteral("2160p23.98"));
+        QCOMPARE(QString::fromStdString(matchMode(modes, 8192, 4320, {25, 1})->name), QStringLiteral("4096x2160p25"));
+        QVERIFY(!matchMode(modes, 1920, 1080, {48, 1}));
+        QVERIFY(findMode(modes, "1080i50") && findMode(modes, "1080i50")->interlaced && findMode(modes, "1080i50")->fps == (Rational{25, 1}));
+        QVERIFY(findMode(modes, "2048x1080p24"));
+        // Timecode, drop-frame at 29.97.
+        const Timecode tc = timecodeOf(1800, {30000, 1001});
+        QVERIFY(tc.dropFrame && tc.minutes == 1 && tc.seconds == 0 && tc.frames == 2);
+        QCOMPARE(timecodeOf(90061, {25, 1}).hours, 1);
+
+        // The signal: the sequence's own (HDR needing 10 bits; P3 PQ as BT.2020 PQ; sRGB as BT.709), or BT.709.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = {25, 1}, s.sampleRate = 48000;
+        Config cfg;
+        Signal sig;
+        s.colorSpace = "rec2100pq";
+        s.hdrPeakNits = 1000;
+        QVERIFY(signalFor(s, cfg, PixelFormat::V210, sig));
+        QVERIFY(sig.eotf == Eotf::Pq && sig.bt2020 && sig.matrix == video::YcbcrMatrix::Bt2020 && sig.hdrMetadata);
+        QCOMPARE(sig.maxCll, 1000);
+        QCOMPARE(sig.maxFall, 400);
+        QCOMPARE(QString::fromStdString(ndiColorInfo(sig)), QStringLiteral("<ndi_color_info transfer=\"bt_2100_pq\" matrix=\"bt_2020\" primaries=\"bt_2020\"/>"));
+        std::string why;
+        QVERIFY(!signalFor(s, cfg, PixelFormat::Uyvy8, sig, &why) && QString::fromStdString(why).contains("10-bit"));
+        s.colorSpace = "p3d65pq";
+        QVERIFY(signalFor(s, cfg, PixelFormat::P216, sig) && sig.colorSpace == "rec2100pq" && sig.masteringP3);
+        s.colorSpace = "rec2100hlg";
+        QVERIFY(signalFor(s, cfg, PixelFormat::V210, sig) && sig.eotf == Eotf::Hlg && !sig.hdrMetadata);
+        cfg.rec709 = true;
+        QVERIFY(signalFor(s, cfg, PixelFormat::Uyvy8, sig) && sig.colorSpace == "rec709" && sig.eotf == Eotf::Sdr);
+        cfg.rec709 = false;
+        s.colorSpace = "srgb";
+        QVERIFY(signalFor(s, cfg, PixelFormat::V210, sig) && sig.colorSpace == "rec709" && !sig.bt2020);
+        s.colorSpace = "rec709";
+
+        // Framing: letterboxed, pillarboxed, cropped to fill.
+        Rect r = fitRect(1920, 800, 1920, 1080, Config::Scaling::Fit);
+        QVERIFY(r.x == 0 && r.y == 140 && r.width == 1920 && r.height == 800);
+        r = fitRect(1440, 1080, 1920, 1080, Config::Scaling::Fit);
+        QVERIFY(r.x == 240 && r.width == 1440);
+        r = fitRect(1280, 720, 1920, 1080, Config::Scaling::Fit);
+        QVERIFY(r.x == 0 && r.y == 0 && r.width == 1920 && r.height == 1080);
+        r = fitRect(1920, 800, 1920, 1080, Config::Scaling::Fill);
+        QVERIFY(r.height == 1080 && r.x < 0);
+        Image small(4, 2);
+        small.fill(1, 1, 1, 1);
+        Image boxed = fitInto(small, 8, 8, Config::Scaling::Fit);
+        QCOMPARE(boxed.at(4, 0)[0], 0.0f);  // black above
+        QCOMPARE(boxed.at(4, 4)[0], 1.0f);
+
+        // Scheduled on a virtual device (manual clock, a tiny mode).
+        auto dev = std::make_shared<VirtualBackend>();
+        dev->setManual(true);
+        Device d = dev->devices()[0];
+        d.modes = {Mode{"tiny", 64, 36, {25, 1}, false, 0}};
+        Scheduler sched(dev);
+        QVERIFY2(sched.start(d, d.modes[0], s, cfg, &why), why.c_str());
+        QCOMPARE(dev->openChannels(), 2);
+        QCOMPARE(sched.renderScale(), 1.0);
+        auto grey = [&](float v) {
+            auto img = std::make_shared<Image>(64, 36);
+            img->fill(v, v, v, 1);
+            return std::shared_ptr<const Image>(img);
+        };
+        auto lumaOf = [&](const VirtualBackend::Sent& x) {
+            const uint32_t w0 = x.data[0] | x.data[1] << 8 | x.data[2] << 16 | uint32_t(x.data[3]) << 24;
+            return int(w0 >> 10 & 1023);
+        };
+        // Sends one frame once `frame` is ready; it must be the one sent.
+        auto sendNext = [&](FrameTime frame) {
+            for (int i = 0; i < 500 && !sched.ready(frame); ++i) QThread::msleep(2);
+            const size_t n = dev->sent().size();
+            dev->step(1);
+            return dev->waitSent(n + 1) && dev->sent().back().frame == frame;
+        };
+        // Parked: the frame at the playhead (mid grey: 64 + 876 / 2), repeated.
+        sched.setPosition(5, 0);
+        sched.submit(5, grey(0.5f));
+        QVERIFY(sendNext(5));
+        QCOMPARE(lumaOf(dev->sent().back()), 502);
+        QVERIFY(sendNext(5));
+        QCOMPARE(dev->sent().back().timecode.frames, 5);
+        // Playing: each frame as the playhead reaches it, the sound with it and running on unbroken.
+        std::vector<std::pair<int64_t, int>> asked;
+        sched.setAudioSource([&](int64_t start, int frames, int channels, float* out) {
+            asked.push_back({start, frames});
+            for (int i = 0; i < frames; ++i) out[size_t(i) * size_t(channels)] = float(start + i);
+        });
+        for (FrameTime t = 10; t < 16; ++t) sched.submit(t, grey(0.25f + 0.1f * float(t - 10)));
+        const size_t before = dev->sent().size();
+        for (FrameTime t = 10; t < 16; ++t) {
+            sched.setPosition(t, 1);
+            QVERIFY(sendNext(t));
+            QCOMPARE(lumaOf(dev->sent().back()), int(std::lround(64 + 876 * (0.25 + 0.1 * double(t - 10)))));
+        }
+        const auto sent = dev->sent();
+        QCOMPARE(sent.size(), before + 6);
+        QCOMPARE(asked.size(), size_t(6));
+        QCOMPARE(asked.front().first, int64_t(10 * 1920));  // with its picture
+        for (size_t i = 1; i < asked.size(); ++i) {
+            QCOMPARE(asked[i].first, asked[i - 1].first + asked[i - 1].second);  // unbroken
+            QCOMPARE(asked[i].second, 1920);
+        }
+        const std::vector<float> heard = dev->audio();
+        QCOMPARE(heard[heard.size() - 2 * 1920], float(15 * 1920));  // embedded, channel 1 of 2
+        // A frame not rendered in time: the last one again, counted late.
+        const int64_t lateBefore = sched.stats().late;
+        sched.setPosition(40, 1);
+        dev->step(1);
+        QVERIFY(dev->waitSent(sent.size() + 1));
+        QCOMPARE(dev->sent().back().frame, FrameTime(15));
+        QCOMPARE(sched.stats().late, lateBefore + 1);
+        // Stopping while the device waits.
+        sched.stop();
+        QVERIFY(!sched.running());
+
+        // The picture ahead of the playhead by the video offset; HDR as the device was opened with.
+        cfg.videoOffset = 2;
+        s.colorSpace = "rec2100pq";
+        QVERIFY2(sched.start(d, d.modes[0], s, cfg, &why), why.c_str());
+        QCOMPARE(dev->openSignal().eotf, Eotf::Pq);
+        QVERIFY(dev->openSignal().hdrMetadata);
+        sched.setPosition(20, 1);
+        sched.submit(22, grey(0.5f));
+        QVERIFY(sendNext(22));
+        sched.stop();
+        cfg.depth = 8;
+        QVERIFY(!sched.start(d, d.modes[0], s, cfg, &why));
     }
 
     void lensCorrectionEffect() {
