@@ -52,6 +52,7 @@ class MediaBinWidget;
 class RenderQueue;
 class EffectsBrowser;
 class InspectorWidget;
+class GradeNodePanel;
 class ScopesWidget;
 class MixerPanel;
 class ControlSurface;
@@ -529,6 +530,8 @@ private:
     QDockWidget* adrDock_ = nullptr;
     QDockWidget* queueDock_ = nullptr;
     QDockWidget* keyframesDock_ = nullptr;
+    QDockWidget* nodesDock_ = nullptr;
+    GradeNodePanel* gradeNodes_ = nullptr;
     QDockWidget* meterDock_ = nullptr;
     RenderQueue* queue_ = nullptr;
     Image colourRef_;       // the look Match Colour aims for

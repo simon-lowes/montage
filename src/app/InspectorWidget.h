@@ -61,10 +61,13 @@ private:
     void addParamRow(QFormLayout* form, const ParamInfo& pi, const Target& target);
     void addStringRow(QFormLayout* form, const StringParamInfo& si, const Target& target);
     // The effect stack of a clip, audio track, bus or master (by owner id), with its Add menu.
+    // `node`: only the effects in that colour node (0: those outside the clip's node graph; -1 all).
     void buildEffectStack(Id owner, TrackKind kind, const std::vector<Effect>& effects,
-                          const std::function<FrameTime()>& localTime);
+                          const std::function<FrameTime()>& localTime, int node = -1);
+    // A clip's colour nodes (core/GradeGraph.h): the picked one, or each in turn, then the effects outside them.
+    void buildGradeNodes(const Clip& clip, const std::function<FrameTime()>& localTime);
     void buildChain(Id owner);
-    void addEffectMenu(TrackKind kind, Id owner);
+    void addEffectMenu(TrackKind kind, Id owner, int node = 0);
 
     // Publishes a clip's setting as a field of the graphic its sequence is, asking for its label.
     void publishParameter(const Target& target, const std::string& param, const QString& label);

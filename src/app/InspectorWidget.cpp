@@ -1,6 +1,7 @@
 #include "InspectorWidget.h"
 #include "SpellUi.h"
 #include "core/ColorGroups.h"
+#include "core/GradeGraph.h"
 
 #include <QAbstractItemView>
 #include <QCheckBox>
@@ -113,6 +114,7 @@ InspectorWidget::InspectorWidget(EditorState* state, QWidget* parent) : QScrollA
     });
     connect(state_, &EditorState::playheadChanged, this, &InspectorWidget::refreshValues);
     connect(state_, &EditorState::maskObjectChanged, this, &InspectorWidget::refreshValues);
+    connect(state_, &EditorState::gradeNodeSelected, this, &InspectorWidget::rebuild);
     rebuild();
 }
 
@@ -144,7 +146,18 @@ QString InspectorWidget::signature() const {
     // Object and Bézier masks have their own controls: rebuild when one is chosen.
     for (const auto& e : c->effects) {
         const long shape = std::lround(e.p("mask.shape", 0));
-        sig += QString(":%1%2%3").arg(e.id).arg(e.enabled ? "+" : "-").arg(shape == 3 ? "o" : shape == 5 ? "p" : "");
+        sig += QString(":%1%2%3n%4").arg(e.id).arg(e.enabled ? "+" : "-").arg(shape == 3 ? "o" : shape == 5 ? "p" : "").arg(e.node);
+    }
+    // Its colour nodes: rebuild when one is added, picked, renamed or shared, or a shared one's effects change.
+    if (!c->grade.empty()) {
+        sig += QString("|N%1").arg(state_->selectedGradeNode());
+        for (const GradeNode& n : c->grade.nodes) {
+            sig += QString(":%1%2%3%4/%5").arg(n.key).arg(QString::fromStdString(n.kind)).arg(n.enabled ? "+" : "-")
+                       .arg(QString::fromStdString(n.label)).arg(n.shared);
+            for (const std::string& b : n.blend) sig += QString::fromStdString(b) + ',';
+            if (const SharedNode* sn = findSharedNode(*s, n.shared))
+                for (const auto& e : sn->effects) sig += QString(";%1%2").arg(e.id).arg(e.enabled ? "+" : "-");
+        }
     }
     // Its colour group: rebuild when it joins or leaves one, or the group's effects change.
     if (const ColorGroup* g = colorGroupOf(*s, *c)) {
@@ -591,8 +604,9 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
             });
         }
     }
-    // ---- Effect stack ------------------------------------------------------------
-    buildEffectStack(clipId, kind, clip.effects, localTime);
+    // ---- Effect stack (in colour nodes, when the clip has them) -------------------------
+    if (kind == TrackKind::Video && !clip.grade.empty()) buildGradeNodes(clip, localTime);
+    else buildEffectStack(clipId, kind, clip.effects, localTime);
     // ---- Its colour group's grades, before and after its own (core/ColorGroups.h) --------
     const Sequence* seqNow = state_->sequence();
     if (const ColorGroup* g = kind == TrackKind::Video && seqNow ? colorGroupOf(*seqNow, clip) : nullptr) {
@@ -611,6 +625,91 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
             f->addRow(note);
             buildEffectStack(stage == 0 ? preOwner : postOwner, TrackKind::Video, stage == 0 ? pre : post, localTime);
         }
+    }
+}
+
+void InspectorWidget::buildGradeNodes(const Clip& clip, const std::function<FrameTime()>& localTime) {
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    const Id clipId = clip.id;
+    const GradeGraph graph = clip.grade;  // a copy: building can change the project
+    const std::vector<Effect> effects = clip.effects;
+    const int picked = state_->selectedGradeNode();
+    // The nodes in the order they run, then any the output does not reach.
+    std::vector<int> keys = gradeOrder(graph);
+    for (const GradeNode& n : graph.nodes)
+        if (std::find(keys.begin(), keys.end(), n.key) == keys.end()) keys.push_back(n.key);
+    auto note = [this](QFormLayout* f, const QString& text, const char* name) {
+        auto* l = new QLabel(text, content_);
+        l->setObjectName(QString::fromLatin1(name));
+        l->setWordWrap(true);
+        l->setStyleSheet(QString("color: %1;").arg(theme::kTextDim.name()));
+        f->addRow(l);
+    };
+    if (!picked) {
+        QFormLayout* f = addSection(tr("Colour Nodes"));
+        note(f, tr("%n node(s). Pick one in the Nodes panel to see only its effects.", "", int(graph.nodes.size())), "gradeNodesNote");
+    }
+    for (int key : keys) {
+        if (picked && key != picked) continue;
+        const GradeNode* n = findGradeNode(graph, key);
+        const QString name = QString::fromStdString(gradeNodeName(*n));
+        if (n->kind == "corrector") {
+            QFormLayout* f = addSection(n->label.empty() ? name : tr("%1 (Node %2)").arg(name).arg(key));
+            if (!n->enabled) note(f, tr("Switched off: it passes its picture on unchanged."), "gradeNodeOff");
+            const SharedNode* sn = findSharedNode(*s, n->shared);
+            if (sn)
+                note(f, tr("Shared node \"%1\": a change here is seen on all %n clip(s) using it.", "", sharedNodeUsers(*s, sn->id))
+                            .arg(QString::fromStdString(sn->name)), "gradeNodeShared");
+            if (!gradeNodeSettings(clip, key)) {
+                // Its window, qualifier, key input and mix: made when first wanted.
+                auto* more = new QPushButton(tr("Window, Key and Mix"), content_);
+                more->setObjectName(QStringLiteral("gradeNodeSettings"));
+                more->setToolTip(tr("Limit this node to a window, a qualifier or its key input, or mix it with its input"));
+                connect(more, &QPushButton::clicked, this, [this, clipId, key] {
+                    QTimer::singleShot(0, this, [this, clipId, key] {
+                        state_->apply(tr("Node Settings"), [clipId, key](Project& p, Sequence& sq) {
+                            return edit::setGradeNodeParams(p, sq, clipId, key, {{"mix", 100.0}});
+                        });
+                    });
+                });
+                f->addRow(QString(), more);
+            }
+            if (sn) {
+                buildEffectStack(clipId, TrackKind::Video, effects, localTime, key);  // (its settings: the clip's own)
+                const std::vector<Effect> shared = sn->effects;
+                buildEffectStack(sn->id, TrackKind::Video, shared, localTime);
+            } else {
+                buildEffectStack(clipId, TrackKind::Video, effects, localTime, key);
+            }
+        } else {
+            QFormLayout* f = addSection(name);
+            if (n->kind == "parallel") note(f, tr("Each input where its key is (a node's window or qualifier), or their average."), "gradeMixerNote");
+            else if (n->kind == "key_mixer") note(f, tr("Joins the keys coming into it."), "gradeMixerNote");
+            else note(f, tr("Each input over those before it, with its blend mode, where its key is."), "gradeMixerNote");
+            for (size_t i = 0; n->kind == "layer" && i < n->blend.size(); ++i) {
+                auto* mode = new QComboBox(content_);
+                mode->setObjectName(QStringLiteral("layerBlend%1").arg(i + 1));
+                for (const std::string& b : blendModes()) mode->addItem(QString::fromStdString(b));
+                mode->setCurrentText(QString::fromStdString(n->blend[i]));
+                f->addRow(tr("Input %1:").arg(i + 2), mode);
+                connect(mode, &QComboBox::currentTextChanged, this, [this, clipId, key, i](const QString& b) {
+                    state_->apply(tr("Layer Blend Mode"), [clipId, key, i, b](Project&, Sequence& sq) {
+                        const Clip* c = edit::clipById(sq, clipId);
+                        const GradeNode* m = c ? findGradeNode(c->grade, key) : nullptr;
+                        if (!m || i >= m->blend.size()) return edit::Result::fail("");
+                        GradeNode changed = *m;
+                        changed.blend[i] = b.toStdString();
+                        return edit::setGradeNode(sq, clipId, changed);
+                    });
+                });
+            }
+        }
+    }
+    // What runs outside the graph, after it.
+    if (!picked) {
+        addSection(tr("Outside the Nodes"));
+        buildEffectStack(clipId, TrackKind::Video, effects, localTime, 0);
     }
 }
 
@@ -641,7 +740,7 @@ void InspectorWidget::buildChain(Id owner) {
 }
 
 void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vector<Effect>& effects,
-                                       const std::function<FrameTime()>& localTime) {
+                                       const std::function<FrameTime()>& localTime, int node) {
     auto target = [&](Id effectId) {
         Target t;
         t.resolve = [owner, effectId](Sequence& s) -> Effect* { return edit::ownedEffect(s, owner, effectId); };
@@ -662,10 +761,11 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
     for (size_t i = 0; i < effects.size(); ++i) {
         const Effect& e = effects[i];
         const EffectInfo* catalog = findEffectInfo(e.type);
-        if (!catalog) continue;
+        if (!catalog || (node >= 0 && e.node != node)) continue;
         // Plugin effects carry their own parameter list and name.
         EffectInfo shown = *catalog;
         shown.displayName = plugins::effectName(e);
+        if (e.type == "grade_node") shown.displayName = tr("Window, Key and Mix").toStdString();  // a colour node's own
         shown.params = effectParams(e);
         // A plugin with a key input: which track it hears there (as the Compressor's sidechain).
         if (e.type == "plugin" && (e.s("key_input") == "1" || plugins::knownSidechain(e.s("plugin_id")))) {
@@ -1077,14 +1177,23 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
         connect(on, &QCheckBox::toggled, this, [=](bool en) {
             mutateStack(en ? tr("Enable Effect") : tr("Bypass Effect"), [en](std::vector<Effect>& v, size_t k, Project&) { v[k].enabled = en; });
         });
+        // (past the next effect in the same colour node: those in others run elsewhere)
         connect(up, &QToolButton::clicked, this, [=] {
             mutateStack(tr("Reorder Effects"), [](std::vector<Effect>& v, size_t k, Project&) {
-                if (k > 0) std::swap(v[k], v[k - 1]);
+                for (size_t j = k; j-- > 0;)
+                    if (v[j].node == v[k].node) {
+                        std::swap(v[k], v[j]);
+                        break;
+                    }
             });
         });
         connect(down, &QToolButton::clicked, this, [=] {
             mutateStack(tr("Reorder Effects"), [](std::vector<Effect>& v, size_t k, Project&) {
-                if (k + 1 < v.size()) std::swap(v[k], v[k + 1]);
+                for (size_t j = k + 1; j < v.size(); ++j)
+                    if (v[j].node == v[k].node) {
+                        std::swap(v[k], v[j]);
+                        break;
+                    }
             });
         });
         connect(reset, &QToolButton::clicked, this, [=] {
@@ -1107,10 +1216,10 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             mutateStack(tr("Remove Effect"), [](std::vector<Effect>& v, size_t k, Project&) { v.erase(v.begin() + long(k)); });
         });
     }
-    addEffectMenu(kind, owner);
+    addEffectMenu(kind, owner, std::max(0, node));
 }
 
-void InspectorWidget::addEffectMenu(TrackKind kind, Id owner) {
+void InspectorWidget::addEffectMenu(TrackKind kind, Id owner, int node) {
     auto* btn = new QPushButton(kind == TrackKind::Video ? tr("Add Video Effect…") : tr("Add Audio Effect…"), content_);
     auto* menu = new QMenu(btn);
     std::map<std::string, QMenu*> groups;
@@ -1119,18 +1228,28 @@ void InspectorWidget::addEffectMenu(TrackKind kind, Id owner) {
         if (!g) g = menu->addMenu(QString::fromStdString(info->group));
         std::string type = info->type;
         QString label = QString::fromStdString(info->displayName);
-        g->addAction(label, this, [this, owner, type, label] {
+        g->addAction(label, this, [this, owner, type, label, node] {
             if (!ensureEffectModel(window(), type)) return;
             Id added = 0;
-            state_->edit(tr("Add %1").arg(label), [owner, type, &added](Project& p, Sequence& s) {
+            state_->edit(tr("Add %1").arg(label), [owner, type, node, &added](Project& p, Sequence& s) {
                 std::vector<Effect>* chain = edit::effectChain(s, owner);
                 if (!chain) return false;
                 Effect e = makeEffect(p, type);
                 added = e.id;
                 // Stabilize, Rolling Shutter Repair and Lens Correction reshape the whole frame: they go first, before any
-                // filter.
-                if (type == "stabilize" || type == "rolling_shutter" || type == "lens_correction") chain->insert(chain->begin(), e);
-                else chain->push_back(e);
+                // filter (outside any colour node).
+                if (type == "stabilize" || type == "rolling_shutter" || type == "lens_correction") {
+                    chain->insert(chain->begin(), e);
+                } else if (node) {
+                    // Into the colour node, after its own effects.
+                    e.node = node;
+                    auto at = chain->end();
+                    for (auto it = chain->begin(); it != chain->end(); ++it)
+                        if (it->node == node) at = it + 1;
+                    chain->insert(at, e);
+                } else {
+                    chain->push_back(e);
+                }
                 return true;
             });
             if ((type == "stabilize" || type == "rolling_shutter") && added && state_->sequence() && edit::clipById(*state_->sequence(), owner))

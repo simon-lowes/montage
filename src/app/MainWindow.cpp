@@ -115,6 +115,7 @@
 #include "media/Proxy.h"
 #include "media/Relink.h"
 #include "KeyframePanel.h"
+#include "GradeNodePanel.h"
 #include "MediaBinWidget.h"
 #include "RenderQueue.h"
 #include "RenderQueuePanel.h"
@@ -535,6 +536,8 @@ void MainWindow::buildPanels() {
     adr_ = new AdrPanel(state_, program_, programPanel_->viewer(), this);
     adrDock_ = makeDock(tr("ADR"), "adr", adr_);
     keyframesDock_ = makeDock(tr("Keyframes"), "keyframes", new KeyframePanel(state_, this));
+    gradeNodes_ = new GradeNodePanel(state_, this);
+    nodesDock_ = makeDock(tr("Nodes"), "nodes", gradeNodes_);
     queue_ = new RenderQueue(this);
     queueDock_ = makeDock(tr("Render Queue"), "renderqueue", new RenderQueuePanel(queue_, this));
     production_ = new ProductionPanel(state_, this);
@@ -652,12 +655,13 @@ void MainWindow::layOutBuiltIn(const QString& name) {
     const int h = height();
     if (name == "Colour") {
         // A large Program monitor between the scopes and the Inspector (Premiere's Color workspace).
-        arrangeDocks({{scopesDock_}, {programDock_}}, {{binDock_, effectsDock_, indexDock_}}, {{inspectorDock_, keyframesDock_}});
+        arrangeDocks({{scopesDock_}, {programDock_}}, {{binDock_, effectsDock_, indexDock_}}, {{nodesDock_}, {inspectorDock_, keyframesDock_}});
         setCorner(Qt::TopRightCorner, Qt::RightDockWidgetArea);  // the Inspector the full height
         resizeDocks({binDock_}, {260}, Qt::Horizontal);
         resizeDocks({inspectorDock_}, {400}, Qt::Horizontal);
         resizeDocks({scopesDock_, programDock_}, {520, 900}, Qt::Horizontal);
         resizeDocks({scopesDock_}, {h * 3 / 5}, Qt::Vertical);
+        resizeDocks({nodesDock_}, {h / 3}, Qt::Vertical);
     } else if (name == "Audio") {
         // The mixer where the Source monitor was, wide meters (Premiere's Audio workspace, Resolve's Fairlight page).
         arrangeDocks({{mixerDock_, adrDock_, sourceDock_}, {programDock_}}, {{binDock_, effectsDock_}}, {{meterDock_}});
@@ -685,7 +689,7 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         resizeDocks({sourceDock_}, {h / 2 + 40}, Qt::Vertical);
     } else {  // Editing
         arrangeDocks({{sourceDock_, inspectorDock_, scopesDock_, mixerDock_, captionsDock_, multicamDock_, keyframesDock_}, {programDock_}},
-                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, peopleDock_, indexDock_, stackedDock_, queueDock_, assistantDock_}},
+                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, peopleDock_, indexDock_, stackedDock_, queueDock_, assistantDock_, nodesDock_}},
                      {{meterDock_}});
         resizeDocks({binDock_}, {380}, Qt::Horizontal);
         resizeDocks({meterDock_}, {70}, Qt::Horizontal);

@@ -134,6 +134,7 @@
 #include "PluginEditorWindow.h"
 #include "audio/PluginEffect.h"
 #include "KeyframePanel.h"
+#include "GradeNodePanel.h"
 #include "CompareDialog.h"
 #include "Keymap.h"
 #include "LoudnessReadout.h"
@@ -3852,6 +3853,100 @@ private slots:
         QCOMPARE(clipNamed(*state()->sequence(), "Red")->gradeVersion, 1);
         state()->undo();
         QVERIFY(clipNamed(*state()->sequence(), "Red")->gradeVersions.empty());
+        state()->setSelection({}, false);
+    }
+
+    void nodesPanelEditsTheGraph() {
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        QVERIFY(state()->edit("Grade", [&](Project& p, Sequence& s) {
+            edit::clipById(s, red)->effects = {makeEffect(p, "color_correct"), makeEffect(p, "curves")};
+            return true;
+        }));
+        auto* dock = win_->findChild<QDockWidget*>("nodes");
+        QVERIFY(dock);
+        dock->setFloating(true);
+        dock->resize(700, 320);
+        dock->show();
+        auto* panel = win_->findChild<GradeNodePanel*>();
+        QVERIFY(panel);
+        state()->setSelection({red}, false);
+        QApplication::processEvents();
+        QCOMPARE(panel->clip(), red);
+        auto clip = [&] { return edit::clipById(*state()->sequence(), red); };
+        // Use Nodes: one node each, in series, the first picked; the Inspector shows that node alone.
+        QVERIFY(panel->convert());
+        QCOMPARE(clip()->grade.nodes.size(), size_t(2));
+        QCOMPARE(panel->selectedNode(), 1);
+        QApplication::processEvents();
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QVERIFY(inspector->findChild<QPushButton*>("gradeNodeSettings"));
+        QVERIFY(!inspector->findChild<QLabel*>("gradeNodesNote"));
+        // A click on node 2 picks it; on nothing, no node (the Inspector then shows them all).
+        QTest::mouseClick(panel->canvas(), Qt::LeftButton, {}, panel->nodeCentre(2).toPoint());
+        QCOMPARE(panel->selectedNode(), 2);
+        QTest::mouseClick(panel->canvas(), Qt::LeftButton, {}, QPoint(4, panel->canvas()->height() - 4));
+        QCOMPARE(panel->selectedNode(), 0);
+        QApplication::processEvents();
+        QVERIFY(inspector->findChild<QLabel*>("gradeNodesNote"));
+        // Dragged: moved in one undo step.
+        const double x0 = findGradeNode(clip()->grade, 2)->x;
+        const QPoint from = panel->nodeCentre(2).toPoint(), to = from + QPoint(30, 20);
+        QTest::mousePress(panel->canvas(), Qt::LeftButton, {}, from);
+        for (QPoint at : {from + QPoint(10, 5), to}) {
+            QMouseEvent m(QEvent::MouseMove, at, panel->canvas()->mapToGlobal(at), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(panel->canvas(), &m);
+        }
+        QTest::mouseRelease(panel->canvas(), Qt::LeftButton, {}, to);
+        QVERIFY(findGradeNode(clip()->grade, 2)->x > x0 + 10);
+        state()->undo();
+        QCOMPARE(findGradeNode(clip()->grade, 2)->x, x0);
+        // A parallel node beside node 2 (Alt+P on the canvas, not the menus'), then node 1's key dragged into the new
+        // node's key input.
+        panel->selectNode(2);
+        panel->canvas()->setFocus();
+        QTest::keyClick(panel->canvas(), Qt::Key_P, Qt::AltModifier);
+        const int branch = panel->selectedNode();
+        QCOMPARE(findGradeNode(clip()->grade, branch)->kind, std::string("corrector"));
+        QCOMPARE(clip()->grade.nodes.size(), size_t(4));  // and the mixer
+        QApplication::processEvents();
+        const QPoint keyOut = panel->portPoint(1, true, 0, true).toPoint(), keyIn = panel->portPoint(branch, false, 1, true).toPoint();
+        QTest::mousePress(panel->canvas(), Qt::LeftButton, {}, keyOut);
+        QMouseEvent m(QEvent::MouseMove, keyIn, panel->canvas()->mapToGlobal(keyIn), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(panel->canvas(), &m);
+        QTest::mouseRelease(panel->canvas(), Qt::LeftButton, {}, keyIn);
+        const GradeLink* k = gradeLinkInto(clip()->grade, branch, 1);
+        QVERIFY(k && k->from == 1 && k->key);
+        QVERIFY(!panel->canvas()->grab().isNull());  // (drawn: nodes, mixer, links, ports)
+        // A link that would make a loop is refused, the graph unchanged.
+        const GradeGraph before = clip()->grade;
+        QVERIFY(!panel->connectNodes({branch + 1, 1, 0, false}));
+        QCOMPARE(clip()->grade, before);
+        // Switched off and renamed; shared, then used by the Blue clip.
+        panel->selectNode(branch);
+        QTest::keyClick(panel->canvas(), Qt::Key_D, Qt::ControlModifier);  // (not the timeline's Default Transition)
+        QVERIFY(!findGradeNode(clip()->grade, branch)->enabled);
+        QVERIFY(panel->renameSelected("Sky"));
+        QCOMPARE(gradeNodeName(*findGradeNode(clip()->grade, branch)), std::string("Sky"));
+        panel->selectNode(1);
+        QVERIFY(panel->shareSelected("Look"));
+        QCOMPARE(state()->sequence()->sharedNodes.size(), size_t(1));
+        const Id look = state()->sequence()->sharedNodes[0].id;
+        const Id blue = clipNamed(*state()->sequence(), "Blue")->id;
+        state()->setSelection({blue}, false);
+        QVERIFY(panel->useShared(look));
+        QCOMPARE(findGradeNode(edit::clipById(*state()->sequence(), blue)->grade, panel->selectedNode())->shared, look);
+        // Delete on the canvas removes the picked node; Flatten turns the graph back into a stack.
+        state()->setSelection({red}, false);
+        panel->selectNode(branch);
+        panel->canvas()->setFocus();
+        QTest::keyClick(panel->canvas(), Qt::Key_Delete);
+        QVERIFY(!findGradeNode(clip()->grade, branch));
+        QVERIFY(panel->flatten());
+        QVERIFY(clip()->grade.empty());
+        QCOMPARE(clip()->effects.size(), size_t(2));
+        dock->setFloating(false);
+        dock->hide();
         state()->setSelection({}, false);
     }
 
