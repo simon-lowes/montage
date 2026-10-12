@@ -98,9 +98,11 @@ LensCorrectionDialog::LensCorrectionDialog(std::shared_ptr<const lens::Database>
         if (at != cameras_.end()) camera_->setCurrentIndex(int(at - cameras_.begin()) + 1);
     }
     // What is typed counts as much as what is picked: the lenses follow the camera named, Apply waits for a lens named.
-    connect(camera_, &QComboBox::editTextChanged, this, [this] {
+    auto followCamera = [this] {
         if (currentCamera() != listedFor_) cameraChanged();
-    });
+    };
+    connect(camera_, &QComboBox::editTextChanged, this, followCamera);
+    connect(camera_, &QComboBox::currentIndexChanged, this, followCamera);  // (another of the same name)
     connect(lens_, &QComboBox::editTextChanged, this, &LensCorrectionDialog::lensChanged);
     cameraChanged();
     if (start.lens) setLens(qs(lens::lensName(*start.lens)));
@@ -110,7 +112,11 @@ LensCorrectionDialog::LensCorrectionDialog(std::shared_ptr<const lens::Database>
 
 // By the name in the box (any letter case), not the list's current index, which typing leaves behind.
 const lens::Camera* LensCorrectionDialog::currentCamera() const {
-    const int i = camera_->currentText().isEmpty() ? 0 : camera_->findText(camera_->currentText(), Qt::MatchFixedString);
+    // (The entry picked when it has the name: some cameras share theirs, one per sensor shape or mount.)
+    const QString text = camera_->currentText();
+    int i = camera_->currentIndex();
+    if (text.isEmpty()) i = 0;
+    else if (i < 0 || camera_->itemText(i).compare(text, Qt::CaseInsensitive) != 0) i = camera_->findText(text, Qt::MatchFixedString);
     return i > 0 && i <= int(cameras_.size()) ? cameras_[size_t(i - 1)] : nullptr;
 }
 

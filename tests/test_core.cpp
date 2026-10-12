@@ -7010,10 +7010,12 @@ private slots:
         // An unknown model of a known maker is no camera, its maker's name in another language no model name.
         Database olympus;
         QVERIFY(olympus.addXml("<lensdatabase><camera><maker>OLYMPUS IMAGING CORP.</maker><maker lang=\"en\">Olympus</maker>"
-                               "<model>C8080WZ</model><mount>olympusC8080</mount><cropfactor>3.93</cropfactor></camera></lensdatabase>"));
+                               "<model>C8080WZ</model><mount>olympusC8080</mount><cropfactor>3.93</cropfactor></camera>"
+                               "<camera><maker>AEE DV</maker><model>AEE DV</model><mount>aee</mount></camera></lensdatabase>"));
         QVERIFY(olympus.findCamera("OLYMPUS IMAGING CORP. C8080WZ"));
         QVERIFY(!olympus.findCamera("Olympus TG-99"));
         QVERIFY(!olympus.findCamera("OLYMPUS IMAGING CORP."));
+        QVERIFY(olympus.findCamera("AEE DV"));  // a model named as its maker is
 
         // The camera's own lenses first, then those its mount takes by adapter; a fixed lens alone. Not a lens measured
         // on a smaller sensor than the camera's (the APS-C fisheye on the full-frame body).

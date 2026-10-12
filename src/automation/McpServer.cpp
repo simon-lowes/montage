@@ -6305,6 +6305,8 @@ void McpServer::Impl::addTools() {
             if (!db) return fail("No lens database: correct a lens once in the app (Clip > Correct Lens...), run scripts/fetch-models.sh, or set MONTAGE_LENS_DB to lensfun's database folder");
             for (const char* k : {"camera", "lens", "query"})
                 if (a.contains(k) && !a.value(k).isString()) throw ArgError{QStringLiteral("\"%1\" must be a string").arg(k)};
+            for (const char* k : {"focal", "aperture"})
+                if (a.contains(k) && !a.value(k).isDouble()) throw ArgError{QStringLiteral("\"%1\" must be a number").arg(k)};
             LensChoice c = suggestLens(*db, *media);
             if (a.contains("camera")) {
                 const std::string want = a.value("camera").toString().toStdString();

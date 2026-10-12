@@ -7181,6 +7181,11 @@ void MainWindow::applyFromBrowser(const QString& typeQ, EffectCategory category)
         state_->message(video ? tr("Select a video clip to apply the effect to") : tr("Select an audio clip to apply the effect to"));
         return;
     }
+    if (type == "lens_correction") {
+        // Which lens first (it goes first on the clip, and on the other clips of its media when chosen).
+        montage::correctLens(this, state_, targets.front());
+        return;
+    }
     QString error;
     state_->edit(tr("Add %1").arg(name), [targets, type, &error](Project& p, Sequence& sq) {
         bool added = false;

@@ -427,10 +427,12 @@ const Camera* Database::findCamera(const std::string& device) const {
             for (const std::string& w : words(maker)) makerWords.insert(w);
         size_t score = 0;
         for (const std::string& model : c.names) {
-            if (std::find(c.makers.begin(), c.makers.end(), model) != c.makers.end()) continue;
+            // (Its own model name counts even when it is the maker's: "AEE DV" by AEE DV.)
+            const bool own = model == c.model;
+            if (!own && std::find(c.makers.begin(), c.makers.end(), model) != c.makers.end()) continue;
             const std::vector<std::string> m = words(model);
             if (m.empty() || !std::all_of(m.begin(), m.end(), [&](const std::string& w) { return haveSet.count(w); }) ||
-                std::all_of(m.begin(), m.end(), [&](const std::string& w) { return makerWords.count(w); }))
+                (!own && std::all_of(m.begin(), m.end(), [&](const std::string& w) { return makerWords.count(w); })))
                 continue;
             size_t s = m.size() * 2;
             for (const std::string& w : makerWords) s += haveSet.count(w);
