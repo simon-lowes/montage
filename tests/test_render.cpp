@@ -2449,7 +2449,9 @@ colorspaces:
         QTemporaryDir dir;
         QVERIFY(dir.isValid());
         const std::string folder = dir.path().toStdString() + "/Gallery/film";
-        QCOMPARE(galleryFolder("/x/y/film.montage"), std::string("/x/y/Gallery/film"));
+        // (beside the project; on Windows a rooted path gains the current drive)
+        QCOMPARE(galleryFolder("/x/y/film.montage"), (QFileInfo("/x/y/film.montage").absolutePath() + "/Gallery/film").toStdString());
+        QVERIFY(QString::fromStdString(galleryFolder("/x/y/film.montage")).endsWith("/x/y/Gallery/film"));
         QVERIFY(!galleryFolder("").empty());
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
