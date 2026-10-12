@@ -18,6 +18,7 @@
 #include "core/ClipAnimation.h"
 #include "core/ColorGroups.h"
 #include "core/GradeVersions.h"
+#include "core/GradeGraph.h"
 #include "core/Captions.h"
 #include "core/EditOps.h"
 #include "core/GraphicsTemplate.h"
@@ -4448,6 +4449,150 @@ colorspaces:
             Effect t = makeEffect(p, id);
             QVERIFY2(ink(renderGenerator(t, 60, 640, 360, 1.0, 90, 30), 0, 640) > 50, id);
         }
+    }
+
+    void gradeNodeGraphs() {
+        // A grey shot (0.25) graded through nodes; each result checked against the same effect run alone as a stack.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36;
+        Clip grey = makeGeneratorClip(p, "color", 10);
+        for (const char* k : {"color.r", "color.g", "color.b"}) grey.generator.params[k] = 0.25;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, grey).ok);
+        const Id id = s.videoTracks[0].clips[0].id;
+        auto clip = [&]() -> Clip& { return *edit::clipById(s, id); };
+        Effect gain = makeEffect(p, "color_correct");
+        gain.params["gain"] = 2.0;
+        Effect invert = makeEffect(p, "invert");
+        RenderOptions o;
+        auto at = [&](const Sequence& seq, int x, int y) {
+            const Image img = renderProgramFrame(p, seq, 2, o);
+            const float* v = img.at(x, y);
+            return v[0];
+        };
+        auto stackOf = [&](std::vector<Effect> fx) {
+            Sequence alone = s;
+            Clip& c = alone.videoTracks[0].clips[0];
+            c.effects = std::move(fx);
+            c.grade = {};
+            return alone;
+        };
+        const float plain = at(stackOf({}), 32, 18), gained = at(stackOf({gain}), 32, 18), inverted = at(stackOf({invert}), 32, 18);
+        QVERIFY(gained > plain + 0.1f && inverted > plain + 0.1f && std::fabs(gained - inverted) > 0.01f);
+        auto near = [](float a, float b) { return std::fabs(a - b) < 2e-4f; };
+        // A rectangle over the left (or right) half, as a node's window.
+        auto half = [&](int node, bool left) {
+            Effect st = makeEffect(p, "grade_node");
+            st.node = node;
+            st.params["mask.shape"] = 2.0;
+            st.params["mask.x"] = left ? 0.25 : 0.75;
+            st.params["mask.w"] = 0.5;
+            st.params["mask.h"] = 2.0;
+            st.params["mask.feather"] = 0.0;
+            return st;
+        };
+
+        // In series, converted from the stack: the same picture.
+        Effect curves = makeEffect(p, "hue_sat");
+        curves.params["saturation"] = 50.0;
+        clip().effects = {gain, curves};
+        const float stacked = at(s, 32, 18);
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        QCOMPARE(at(s, 32, 18), stacked);
+
+        // Parallel: gain on the left, invert on the right; unkeyed, their average.
+        QVERIFY(edit::flattenGrade(s, id).ok);
+        clip().effects = {gain};
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        int right = 0;
+        QVERIFY(edit::addGradeNode(p, s, id, edit::NodeHow::Parallel, 1, &right).ok);
+        Effect inv = invert;
+        inv.node = right;
+        clip().effects.push_back(inv);
+        QVERIFY2(near(at(s, 32, 18), (gained + inverted) / 2), qPrintable(QString::number(at(s, 32, 18))));
+        clip().effects.push_back(half(1, true));
+        clip().effects.push_back(half(right, false));
+        QVERIFY2(near(at(s, 8, 18), gained), qPrintable(QString::number(at(s, 8, 18))));
+        QVERIFY2(near(at(s, 56, 18), inverted), qPrintable(QString::number(at(s, 56, 18))));
+        // Its LUT: a window is about where a colour is, so those nodes are named as left out (and the LUT is the input).
+        std::vector<std::string> skipped;
+        const Lut3D lut = bakeClipLut(s, clip(), 2, 9, &skipped);
+        QCOMPARE(skipped.size(), size_t(2));
+        QVERIFY(std::fabs(lut.data[(1 + 9 * (1 + 9 * 1)) * 3] - 0.125f) < 1e-4f);
+        // Unkeyed, the LUT holds the average.
+        std::erase_if(clip().effects, [](const Effect& e) { return e.type == "grade_node"; });
+        skipped.clear();
+        const Lut3D both = bakeClipLut(s, clip(), 2, 9, &skipped);
+        QVERIFY(skipped.empty());
+        Image one(1, 1);
+        one.px = {0.25f, 0.25f, 0.25f, 1.0f};
+        Image viaGain = one, viaInvert = one;
+        applyVideoEffect(gain, 2, viaGain, 1.0);
+        applyVideoEffect(invert, 2, viaInvert, 1.0);
+        const float expect = (viaGain.px[0] + viaInvert.px[0]) / 2;
+        QVERIFY2(std::fabs(lut.data.size() ? both.data[(2 + 9 * (2 + 9 * 2)) * 3] - expect : 1) < 1e-4f,
+                 qPrintable(QString::number(both.data[(2 + 9 * (2 + 9 * 2)) * 3])));
+
+        // Layer: invert over the picture where its window is.
+        QVERIFY(edit::flattenGrade(s, id).ok);
+        clip().effects = {};
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        int top = 0;
+        QVERIFY(edit::addGradeNode(p, s, id, edit::NodeHow::Layer, 1, &top).ok);
+        inv.node = top;
+        clip().effects = {inv, half(top, true)};
+        QVERIFY(near(at(s, 8, 18), inverted) && near(at(s, 56, 18), plain));
+        // A multiply blend: the picture times the inverted one, on the left.
+        for (GradeNode& n : clip().grade.nodes)
+            if (n.kind == "layer") n.blend = {"multiply"};
+        QVERIFY2(near(at(s, 8, 18), plain * inverted) || std::fabs(at(s, 8, 18) - plain * inverted) < 0.02f, qPrintable(QString::number(at(s, 8, 18))));
+
+        // Outside: gain inside node 1's left half, invert outside it.
+        QVERIFY(edit::flattenGrade(s, id).ok);
+        clip().effects = {};
+        Effect g1 = gain;
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        g1.node = 1;
+        clip().effects = {g1, half(1, true)};
+        int outside = 0;
+        QVERIFY(edit::addGradeNode(p, s, id, edit::NodeHow::Outside, 1, &outside).ok);
+        inv.node = outside;
+        clip().effects.push_back(inv);
+        QVERIFY2(near(at(s, 8, 18), gained), qPrintable(QString::number(at(s, 8, 18))));
+        QVERIFY2(near(at(s, 56, 18), inverted), qPrintable(QString::number(at(s, 56, 18))));
+
+        // A key input: node 1 only chooses the left half (no effects), its key limits node 2's invert.
+        QVERIFY(edit::flattenGrade(s, id).ok);
+        clip().effects = {};
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        int second = 0;
+        QVERIFY(edit::addGradeNode(p, s, id, edit::NodeHow::Serial, 1, &second).ok);
+        QVERIFY(edit::connectGradeNodes(s, id, {1, second, 1, true}).ok);
+        inv.node = second;
+        clip().effects = {half(1, true), inv};
+        QVERIFY(near(at(s, 8, 18), inverted) && near(at(s, 56, 18), plain));
+        // Switched off, a node passes its picture on; a mix of 0 too.
+        GradeNode off = *findGradeNode(clip().grade, second);
+        off.enabled = false;
+        QVERIFY(edit::setGradeNode(s, id, off).ok);
+        QVERIFY(near(at(s, 8, 18), plain));
+
+        // A shared node: one change seen on both clips using it.
+        QVERIFY(edit::flattenGrade(s, id).ok);
+        clip().effects = {gain};
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        Id shared = 0;
+        QVERIFY(edit::shareGradeNode(p, s, id, 1, "Look", &shared).ok);
+        Clip other = grey;
+        other.id = p.newId();
+        other.start = 10;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, other).ok);
+        const Id otherId = s.videoTracks[0].clips[1].id;
+        QVERIFY(edit::useSharedNode(p, s, otherId, shared).ok);
+        auto atTime = [&](FrameTime t) { return renderProgramFrame(p, s, t, o).at(32, 18)[0]; };
+        QVERIFY(near(atTime(2), gained) && near(atTime(12), gained));
+        edit::effectChain(s, shared)->front() = invert;
+        QVERIFY(near(atTime(2), inverted) && near(atTime(12), inverted));
     }
 
     void colorGroupGrades() {

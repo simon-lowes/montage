@@ -4248,7 +4248,7 @@ bool MainWindow::exportClipLut(const QString& path, int size) {
     const FrameTime t = std::clamp<FrameTime>(state_->playhead() - c->start, 0, std::max<FrameTime>(0, c->duration - 1));
     std::vector<std::string> skipped;
     const WorkingSpaceScope working(state_->sequence() ? &sequenceColorSpace(*state_->sequence()) : nullptr);
-    const Lut3D lut = bakeLut(c->effects, t, size, &skipped);
+    const Lut3D lut = bakeClipLut(*state_->sequence(), *c, t, size, &skipped);
     std::string err;
     if (!writeCubeLut(lut, path.toStdString(), c->name, &err)) {
         statusBar()->showMessage(QString::fromStdString(err), 6000);

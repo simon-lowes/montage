@@ -2,6 +2,8 @@
 #include "Ofx.h"
 
 #include "core/ColorGroups.h"
+#include "core/GradeGraph.h"
+#include "GradeGraph.h"
 #include "core/Automation.h"
 
 #include <QFont>
@@ -970,10 +972,33 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     // Faces are covered first, where they are in the source, whatever moves the picture after (Stabilize, transforms).
     for (const Effect* e : chain)
         if (e->type == "redact_faces") applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
-    for (const Effect* e : chain)
-        if (e->type != "video_denoise" && e->type != "super_scale" && e->type != "reframe_360" && e->type != "redact_faces" &&
-            e->type != "stereo_3d" && e != sourceCdl)  // those ran already (Stereo 3D is placed below)
-            applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
+    auto ranAlready = [&](const Effect& e) {
+        return e.type == "video_denoise" || e.type == "super_scale" || e.type == "reframe_360" || e.type == "redact_faces" ||
+               e.type == "stereo_3d" || &e == sourceCdl;  // those ran already (Stereo 3D is placed below)
+    };
+    // A node graph (core/GradeGraph.h) runs where its first node's effect is in the stack (or after the clip's own
+    // effects); the effects in its nodes, and its shared nodes', run in it.
+    const bool graph = !c.grade.empty();
+    bool graphRan = false;
+    auto in = [](const Effect* e, const std::vector<Effect>& v) { return !v.empty() && e >= v.data() && e < v.data() + v.size(); };
+    const ColorGroup* group = colorGroupOf(seq, c);
+    auto runGraph = [&] {
+        if (graph && !graphRan) applyGradeGraph(seq, c, lt, src, pixelScale, sourceSeconds, ranAlready);
+        graphRan = true;
+    };
+    for (const Effect* e : chain) {
+        const bool pre = group && in(e, group->pre), post = group && in(e, group->post), mine = in(e, c.effects);
+        if (graph) {
+            if (post) runGraph();  // (before the group's post-clip grade)
+            if (!pre && !post && !mine) continue;  // a shared node's: in the graph
+            if (mine && e->node != 0) {
+                runGraph();
+                continue;
+            }
+        }
+        if (!ranAlready(*e)) applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
+    }
+    runGraph();
     // Stereo 3D: in a stereoscopic sequence the eyes are moved apart by the clip's depth (into the screen when
     // positive, out of it when negative); half the separation each way.
     if (seq.stereo3d && !(c.isGenerator() && c.generator.type == "adjustment"))

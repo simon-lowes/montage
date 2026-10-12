@@ -18,6 +18,9 @@ bool isColorOnlyEffect(const Effect& e, FrameTime t);
 // `skipped` receives the display names of enabled effects that could not be included.
 Lut3D bakeLut(const std::vector<Effect>& effects, FrameTime t, int size = 33, std::vector<std::string>* skipped = nullptr);
 
+// A clip's grade as bakeLut bakes it, through its node graph when it has one (nodes limited by a window or depth are
+// left out and named).
+Lut3D bakeClipLut(const Sequence& s, const Clip& c, FrameTime t, int size = 33, std::vector<std::string>* skipped = nullptr);
 // Writes a 3D LUT as an Adobe / Resolve .cube file (red varying fastest).
 bool writeCubeLut(const Lut3D& lut, const std::string& path, const std::string& title = {}, std::string* error = nullptr);
 

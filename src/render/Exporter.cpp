@@ -644,7 +644,7 @@ private:
             }
         }
         const ColorGroup* group = found ? colorGroupOf(seq_, *found) : nullptr;
-        if (!found || found->isGenerator() || !found->effects.empty() || (group && (!group->pre.empty() || !group->post.empty())) ||
+        if (!found || found->isGenerator() || !found->effects.empty() || !found->grade.empty() || (group && (!group->pre.empty() || !group->post.empty())) ||
             found->blendMode != "normal" || found->speed != 1.0 ||
             found->reverse || found->ramped() || !identityMotion(*found, f - found->start))
             return nullptr;

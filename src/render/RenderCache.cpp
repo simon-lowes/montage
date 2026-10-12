@@ -1,4 +1,5 @@
 #include "RenderCache.h"
+#include "core/GradeGraph.h"
 #include "media/Proxy.h"
 
 #include <QCryptographicHash>
@@ -87,6 +88,15 @@ void addClipAt(QCryptographicHash& h, const Project& p, const Sequence& seq, con
         for (const auto* chain : {&g->pre, &g->post}) {
             h.addData(chain == &g->pre ? QByteArray("|pre") : QByteArray("|post"));
             for (Effect e : *chain) {
+                e.id = 0;
+                h.addData(QByteArray::fromStdString(effectToJsonString(e)));
+            }
+        }
+    // And the shared grade nodes its graph uses (the graph itself is in the clip's settings).
+    for (const GradeNode& n : c.grade.nodes)
+        if (const SharedNode* sn = findSharedNode(seq, n.shared)) {
+            h.addData(QByteArray("|shared"));
+            for (Effect e : sn->effects) {
                 e.id = 0;
                 h.addData(QByteArray::fromStdString(effectToJsonString(e)));
             }

@@ -168,6 +168,7 @@ add_library(montage_engine STATIC
   render/TemporalFx.h render/TemporalFx.cpp
   render/Deconvolve.h render/Deconvolve.cpp
   render/Exporter.h render/Exporter.cpp
+  render/GradeGraph.h render/GradeGraph.cpp
   render/VideoPacking.h render/VideoPacking.cpp
   render/ReferenceOutput.h render/ReferenceOutput.cpp render/NdiOutput.cpp render/DeckLinkOutput.cpp
   audio/Plugins.h audio/PluginScan.cpp audio/ClapHost.cpp

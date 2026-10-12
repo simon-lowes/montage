@@ -2282,6 +2282,9 @@ int modeIndex(const std::string& mode) {
 
 }  // namespace
 
+int blendModeIndex(const std::string& mode) { return modeIndex(mode); }
+float blendModeChannel(int mode, float backdrop, float source) { return blendChannel(mode, backdrop, source); }
+
 void blendOnto(Image& dst, const Image& src, const std::string& mode, float opacity) {
     if (src.width != dst.width || src.height != dst.height || opacity <= 0) return;
     int m = modeIndex(mode);

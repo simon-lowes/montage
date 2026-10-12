@@ -144,6 +144,10 @@ std::vector<float> buildFlatCurve(const std::string& points, int n = 360, bool c
 
 // Composites `src` over `dst` (same size) with a blend mode and opacity.
 void blendOnto(Image& dst, const Image& src, const std::string& mode, float opacity);
+// A blend mode's index ("normal" 0, "add", "multiply", "screen", "overlay"...), and one channel of it: `source` blended
+// onto `backdrop` (straight, not premultiplied).
+int blendModeIndex(const std::string& mode);
+float blendModeChannel(int mode, float backdrop, float source);
 
 // Mixes outgoing `a` and incoming `b` (either may be empty = transparent) for
 // transition progress u in [0,1]; result has the given size.
