@@ -121,6 +121,7 @@
 #include "media/Segmenter.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
+#include "render/RenderFarm.h"
 #include "render/Shorts.h"
 #include "render/Letterbox.h"
 #include "render/Processing.h"
@@ -7055,7 +7056,8 @@ void McpServer::Impl::addTools() {
                 "properties":{"certificate":{"type":"string","description":"The signing certificate chain (PEM, the signing certificate first; issued by a certificate authority, for digital signatures with e-mail protection or document signing use)"},
                     "key":{"type":"string","description":"Its private key (PEM)"},
                     "allow_ai_training":{"type":"boolean","default":false,"description":"false: the credentials ask that it not be used to train AI models"}},"required":["certificate","key"]},
-            "stereo_view":{"type":"string","enum":["sbs","sbs_half","tb","tb_half","left","right","anaglyph"],"default":"sbs","description":"A stereoscopic 3D sequence: the eyes side by side or top and bottom (full size, or squeezed into one frame), or one picture"}},
+            "stereo_view":{"type":"string","enum":["sbs","sbs_half","tb","tb_half","left","right","anaglyph"],"default":"sbs","description":"A stereoscopic 3D sequence: the eyes side by side or top and bottom (full size, or squeezed into one frame), or one picture"},
+            "farm":{"type":"string","description":"A render farm folder: send the render there for its render nodes (montage-cli node) instead of rendering now; returns the job's id. The output is where the nodes write (each maps paths to its own)"}},
             "required":["project","output"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -7158,6 +7160,16 @@ void McpServer::Impl::addTools() {
                 std::string why;
                 if (!checkCredentialSigner({st.credentialCertificate, st.credentialKey, {}}, &why)) return fail(QString::fromStdString(why));
             }
+            if (a.contains("farm")) {
+                // Sent to a render farm's nodes instead (render/RenderFarm.h): the project as it is now.
+                const std::string farm = absolute(need(a, "farm")).toStdString();
+                const int groups = stems == "buses" ? StemsByBus : stems == "roles" ? StemsByRole : stems == "tracks" ? StemsByTrack : 0;
+                std::string id, why;
+                const std::string name = s.name + " - " + QFileInfo(QString::fromStdString(st.path)).fileName().toStdString();
+                if (!submitFarmJob(farm, name, l.project, s.id, st, groups, &id, &why)) return fail(QString::fromStdString(why));
+                return ok(QStringLiteral("Sent to the render farm as %1 (montage_render_farm follows it)").arg(QString::fromStdString(id)),
+                          QJsonObject{{"job", QString::fromStdString(id)}, {"farm", QString::fromStdString(farm)}, {"output", QString::fromStdString(st.path)}});
+            }
             std::string err;
             LightLevels light;
             if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, nullptr, &err, nullptr, nullptr, &light))
@@ -7202,6 +7214,49 @@ void McpServer::Impl::addTools() {
                 o["stems"] = list;
             }
             return ok(text, o);
+        });
+
+    add("montage_render_farm", "Render farm",
+        "A render farm (a folder shared by computers running `montage-cli node <folder>`): its jobs (state, progress, node, "
+        "output, error) or nodes, or a job cancelled (a rendering one stops within seconds), retried (a failed or cancelled "
+        "one waits again) or removed. Jobs are sent with montage_render's farm argument.",
+        R"json({"type":"object","properties":{"farm":{"type":"string","description":"The farm's folder"},
+            "action":{"type":"string","enum":["jobs","nodes","cancel","retry","remove"],"default":"jobs"},
+            "job":{"type":"string","description":"The job's id, for cancel, retry and remove"}},"required":["farm"]})json",
+        false, [this](const QJsonObject& a) {
+            const std::string farm = absolute(need(a, "farm")).toStdString();
+            const QString action = str(a, "action", "jobs");
+            std::string err;
+            if (action == "jobs" || action == "nodes") {
+                if (!openFarm(farm, &err)) return fail(QString::fromStdString(err));
+                QJsonArray list;
+                QStringList lines;
+                if (action == "jobs") {
+                    for (const FarmJob& j : farmJobs(farm)) {
+                        list.append(QJsonObject{{"id", QString::fromStdString(j.id)}, {"name", QString::fromStdString(j.name)},
+                                                {"state", farmStateName(j.state)}, {"progress", j.progress}, {"node", QString::fromStdString(j.node)},
+                                                {"output", QString::fromStdString(j.output)}, {"error", QString::fromStdString(j.error)},
+                                                {"cancel_requested", j.cancelRequested}, {"submitted_by", QString::fromStdString(j.submittedBy)}});
+                        lines << QStringLiteral("%1 %2 %3").arg(QString::fromStdString(j.id), farmStateName(j.state), QString::fromStdString(j.name));
+                    }
+                    return ok(lines.isEmpty() ? QStringLiteral("No jobs") : lines.join('\n'), QJsonObject{{"jobs", list}});
+                }
+                for (const FarmNodeInfo& n : farmNodes(farm)) {
+                    list.append(QJsonObject{{"name", QString::fromStdString(n.name)}, {"host", QString::fromStdString(n.host)},
+                                            {"state", QString::fromStdString(n.state)}, {"job", QString::fromStdString(n.job)},
+                                            {"updated", QString::fromStdString(n.updated)}});
+                    lines << QStringLiteral("%1 %2").arg(QString::fromStdString(n.name), QString::fromStdString(n.state));
+                }
+                return ok(lines.isEmpty() ? QStringLiteral("No nodes have run on this farm") : lines.join('\n'), QJsonObject{{"nodes", list}});
+            }
+            const std::string id = need(a, "job").toStdString();
+            bool done = false;
+            if (action == "cancel") done = cancelFarmJob(farm, id, &err);
+            else if (action == "retry") done = retryFarmJob(farm, id, &err);
+            else if (action == "remove") done = removeFarmJob(farm, id, &err);
+            else throw ArgError{"\"action\" is jobs, nodes, cancel, retry or remove"};
+            if (!done) return fail(QString::fromStdString(err));
+            return ok(QStringLiteral("%1: %2").arg(action, QString::fromStdString(id)), QJsonObject{{"job", QString::fromStdString(id)}});
         });
 
     add("montage_animate_to_audio", "Animate to audio",

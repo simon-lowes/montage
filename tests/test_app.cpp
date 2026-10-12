@@ -176,6 +176,7 @@
 #include "Recovery.h"
 #include "RenderQueue.h"
 #include "RenderQueuePanel.h"
+#include "render/RenderFarm.h"
 #include "TimelineWidget.h"
 #include "TranscribeDialog.h"
 #include "TranscriptPanel.h"
@@ -12065,6 +12066,69 @@ print("added " + ui["name"])
         qunsetenv("MONTAGE_SCRIPTS_DIR");
         console->setPython(false);
         state()->newProject();
+    }
+
+    void renderFarmInTheQueue() {
+        state()->newProject();
+        auto* panel = win_->findChild<RenderQueuePanel*>();
+        QVERIFY(panel);
+        const QString was = panel->farmFolder();
+        auto* sendButton = panel->findChild<QPushButton*>("queueSendToFarm");
+        QVERIFY(sendButton);
+        // A job on the local queue, sent to the farm: off the queue, waiting there for a node.
+        Project p = makeDefaultProject();
+        p.active()->width = 320;
+        p.active()->height = 180;
+        edit::overwrite(p, *p.active(), {TrackKind::Video, 0}, makeGeneratorClip(p, "color", 25));
+        ExportSettings st;
+        st.path = dir_.filePath("farm-out/queued.mp4").toStdString();
+        st.audioCodec = "none";
+        RenderQueue* queue = win_->renderQueue();
+        const int id = queue->add("Farm job", "H.264", p, p.active()->id, st);
+        panel->setFarmFolder({});
+        QVERIFY(!panel->sendToFarm(id));  // (no farm yet)
+        const QString farm = dir_.filePath("farm");
+        panel->setFarmFolder(farm);
+        QCOMPARE(appSettings().value("renderFarm/folder").toString(), farm);
+        QVERIFY(panel->sendToFarm(id));
+        QVERIFY(!queue->job(id));
+        auto* list = panel->findChild<QTreeWidget*>("farmJobs");
+        QCOMPARE(list->topLevelItemCount(), 1);
+        QCOMPARE(list->topLevelItem(0)->text(0), QString("Farm job"));
+        QVERIFY(list->topLevelItem(0)->text(3).startsWith("Waiting"));
+        QCOMPARE(panel->findChild<QLabel*>("farmNodes")->text(), QString("No nodes running"));
+        // Cancelled from the panel, then retried.
+        list->setCurrentItem(list->topLevelItem(0));
+        list->topLevelItem(0)->setSelected(true);
+        auto* cancel = panel->findChild<QPushButton*>("farmCancel");
+        auto* retry = panel->findChild<QPushButton*>("farmRetry");
+        auto* remove = panel->findChild<QPushButton*>("farmRemove");
+        QVERIFY(cancel->isEnabled() && !retry->isEnabled());
+        cancel->click();
+        QCOMPARE(list->topLevelItem(0)->text(3), QString("Cancelled"));
+        QVERIFY(retry->isEnabled() && remove->isEnabled());
+        retry->click();
+        QVERIFY(list->topLevelItem(0)->text(3).startsWith("Waiting"));
+        // A node renders it; the panel follows on its own (its timer).
+        FarmNodeOptions o;
+        o.farm = farm.toStdString();
+        o.name = "Test node";
+        o.once = true;
+        int rendered = 0;
+        std::thread node([&] { runFarmNode(o, &rendered); });
+        node.join();
+        QCOMPARE(rendered, 1);
+        auto* dock = qobject_cast<QDockWidget*>(panel->parentWidget());
+        const bool shown = dock && dock->isVisible();
+        if (dock) dock->show();
+        QTRY_VERIFY_WITH_TIMEOUT(list->topLevelItem(0)->text(3).startsWith("Done"), 5000);  // (read on a worker by its timer)
+        if (dock && !shown) dock->hide();
+        QCOMPARE(list->topLevelItem(0)->text(1), QString("Test node"));
+        QVERIFY(QFileInfo::exists(QString::fromStdString(st.path)));
+        QVERIFY(!cancel->isEnabled());
+        remove->click();
+        QCOMPARE(list->topLevelItemCount(), 0);
+        panel->setFarmFolder(was);
     }
 
     void separateStemsFromTheMenu() {

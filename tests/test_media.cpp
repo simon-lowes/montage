@@ -25,6 +25,7 @@
 #include <complex>
 #include <tuple>
 #include <sstream>
+#include <thread>
 #include <cstdio>
 
 #include "core/AudioChannels.h"
@@ -136,6 +137,7 @@
 #include "render/AudioFx.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
+#include "render/RenderFarm.h"
 #include "core/ColorGroups.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
@@ -11898,6 +11900,324 @@ if ui["pressed"] == "add":
         QVERIFY(r.value("isError").toBool());
         r = call(QJsonObject{{"project", project}, {"music_track", "A2"}});
         QVERIFY(r.value("isError").toBool());
+    }
+
+    void renderFarmJobs() {
+        // ---- An export's settings as JSON and back, every kind of field.
+        ExportSettings s;
+        s.path = "/out/a.mov";
+        s.videoCodec = "prores_ks";
+        s.profile = "hq";
+        s.width = 1280;
+        s.fps = 23.976;
+        s.videoBitrate = 50000000000LL;
+        s.in = 12;
+        s.out = 480;
+        s.alpha = true;
+        s.captionTrack = (Id(1) << 60) + 3;  // (more than a JSON number holds)
+        s.chapters = false;
+        s.loudnessTarget = -23;
+        s.burnIn.text = "Draft";
+        s.burnIn.watermarkOpacity = 0.25;
+        s.audioTracks = {true, false, true};
+        s.extraCaptions = {7, (Id(1) << 62) + 1};
+        ExportSettings::AudioStream me;
+        me.name = "M&E";
+        me.language = "en";
+        me.tracks = {false, true};
+        me.unmute = {"Music"};
+        me.normalise = true;
+        s.extraAudio = {me};
+        s.startTimecode = "10:00:00:00";
+        s.credentialAllowAiTraining = true;
+        const QJsonObject json = exportSettingsToJson(s);
+        ExportSettings back;
+        std::string err;
+        QVERIFY2(exportSettingsFromJson(json, back, &err), err.c_str());
+        QCOMPARE(exportSettingsToJson(back), json);
+        QCOMPARE(back.captionTrack, s.captionTrack);
+        QCOMPARE(back.extraCaptions, s.extraCaptions);
+        QCOMPARE(back.extraAudio.size(), size_t(1));
+        QCOMPARE(back.extraAudio[0].unmute, std::vector<std::string>{"Music"});
+        QCOMPARE(back.videoBitrate, s.videoBitrate);
+        // What is missing keeps its default; a value of the wrong type is an error.
+        ExportSettings partial;
+        QVERIFY(exportSettingsFromJson(QJsonObject{{"crf", 20}}, partial));
+        QCOMPARE(partial.crf, 20);
+        QCOMPARE(partial.videoCodec, std::string("libx264"));
+        QVERIFY(!exportSettingsFromJson(QJsonObject{{"width", "wide"}}, partial, &err) && err.find("width") != std::string::npos);
+        QVERIFY(!exportSettingsFromJson(QJsonObject{{"burnIn", "none"}}, partial, &err) && err.find("burnIn") != std::string::npos);
+        QVERIFY(!exportSettingsFromJson(QJsonObject{{"extraAudio", 3}}, partial, &err));
+        QVERIFY(!exportSettingsFromJson(QJsonObject{{"audioTracks", QJsonArray{1}}}, partial, &err) && err.find("audioTracks") != std::string::npos);
+        QVERIFY(!exportSettingsFromJson(QJsonObject{{"extraCaptions", QJsonArray{"seven"}}}, partial, &err) && err.find("id") != std::string::npos);
+        QVERIFY(!exportSettingsFromJson(QJsonObject{{"extraAudio", QJsonArray{1}}}, partial, &err));
+
+        // ---- Path mapping: folders (not prefixes of names), either kind of separator, the first map that fits.
+        const std::vector<FarmPathMap> maps{{"/Volumes/Media", "/mnt/media"}, {"D:\\Shoot", "/mnt/shoot"}, {"/srv/out/", "E:\\Out"}};
+        QCOMPARE(mapFarmPath("/Volumes/Media/Day 1/a.mov", maps), std::string("/mnt/media/Day 1/a.mov"));
+        QCOMPARE(mapFarmPath("/Volumes/MediaX/a.mov", maps), std::string("/Volumes/MediaX/a.mov"));
+        QCOMPARE(mapFarmPath("/Volumes/Media", maps), std::string("/mnt/media"));
+        QCOMPARE(mapFarmPath("D:\\Shoot\\b\\c.mxf", maps), std::string("/mnt/shoot/b/c.mxf"));
+        QCOMPARE(mapFarmPath("D:/Shoot/c.mxf", maps), std::string("/mnt/shoot/c.mxf"));
+        QCOMPARE(mapFarmPath("/srv/out/x/y.mp4", maps), std::string("E:\\Out\\x\\y.mp4"));
+        QCOMPARE(mapFarmPath("", maps), std::string());
+        // Windows paths match whatever their case; others do not. A map from the root keeps its separators.
+        QCOMPARE(mapFarmPath("M:\\Media\\a.mov", {{"m:\\media", "/mnt/m"}}), std::string("/mnt/m/a.mov"));
+        QCOMPARE(mapFarmPath("\\\\NAS\\Share\\a.mov", {{"\\\\nas\\share", "/mnt/nas"}}), std::string("/mnt/nas/a.mov"));
+        QCOMPARE(mapFarmPath("/volumes/media/a.mov", {{"/Volumes/Media", "/mnt/m"}}), std::string("/volumes/media/a.mov"));
+        QCOMPARE(mapFarmPath("/a/b.mov", {{"/", "/mnt/x"}}), std::string("/mnt/x/a/b.mov"));
+        QCOMPARE(mapFarmPath("/a/b.mov", {{"/a", "/mnt/x/"}}), std::string("/mnt/x/b.mov"));
+        FarmPathMap m;
+        QVERIFY(parseFarmPathMap("C:\\Media=/mnt/media", m) && m.from == "C:\\Media" && m.to == "/mnt/media");
+        QVERIFY(!parseFarmPathMap("nothing", m) && !parseFarmPathMap("=x", m) && !parseFarmPathMap("x=", m));
+
+        // ---- A job sent with the media where the sender has it, rendered by a node that has it somewhere else.
+        QTemporaryDir dir;
+        const QString farm = dir.path() + "/farm";
+        QVERIFY(QDir().mkpath(dir.path() + "/sender"));
+        QImage still(64, 36, QImage::Format_RGB32);
+        still.fill(qRgb(200, 40, 40));
+        QVERIFY(still.save(dir.path() + "/sender/still.png"));
+        Project p = makeDefaultProject();
+        Sequence& seq = *p.active();
+        seq.width = 320;
+        seq.height = 180;
+        MediaItem pic = probeOrFail(p, (dir.path() + "/sender/still.png").toStdString());
+        p.media.push_back(pic);
+        QVERIFY(edit::placeMedia(p, seq, pic.id, 0, 0, 25, {TrackKind::Video, 0}, {}, false).ok);
+        ExportSettings st;
+        st.path = (dir.path() + "/sender/out/first.mp4").toStdString();
+        st.audioCodec = "none";
+        std::string id;
+        QVERIFY2(submitFarmJob(farm.toStdString(), "First", p, seq.id, st, 0, &id, &err), err.c_str());
+        std::vector<FarmJob> jobs = farmJobs(farm.toStdString());
+        QCOMPARE(jobs.size(), size_t(1));
+        QCOMPARE(jobs[0].id, id);
+        QCOMPARE(jobs[0].name, std::string("First"));
+        QCOMPARE(jobs[0].state, FarmState::Waiting);
+        QCOMPARE(jobs[0].output, st.path);
+        QVERIFY(QDir().rename(dir.path() + "/sender", dir.path() + "/node"));  // (mounted elsewhere on the node)
+        FarmNodeOptions o;
+        o.farm = farm.toStdString();
+        o.name = "Node A";
+        o.once = true;
+        o.maps = {{(dir.path() + "/sender").toStdString(), (dir.path() + "/node").toStdString()}};
+        QStringList log;
+        o.log = [&](const std::string& l) { log << QString::fromStdString(l); };
+        int rendered = 0;
+        QVERIFY2(runFarmNode(o, &rendered, &err), err.c_str());
+        QCOMPARE(rendered, 1);
+        jobs = farmJobs(farm.toStdString());
+        QVERIFY2(jobs[0].state == FarmState::Done, jobs[0].error.c_str());
+        QCOMPARE(jobs[0].node, std::string("Node A"));
+        QCOMPARE(jobs[0].progress, 1.0);
+        MediaItem out;
+        QVERIFY(probeMedia((dir.path() + "/node/out/first.mp4").toStdString(), out, &err));
+        QCOMPARE(out.width, 320);
+        QVERIFY(!QFileInfo::exists(dir.path() + "/sender"));
+        const std::vector<FarmNodeInfo> nodes = farmNodes(farm.toStdString());
+        QCOMPARE(nodes.size(), size_t(1));
+        QCOMPARE(nodes[0].name, std::string("Node A"));
+        QCOMPARE(nodes[0].state, std::string("stopped"));
+        // Without the map the media is missing (offline): the job still renders, as the queue would; a missing
+        // sequence or output is refused when sending.
+        QVERIFY(!submitFarmJob(farm.toStdString(), "None", p, 999999, st, 0, nullptr, &err));
+        ExportSettings nowhere = st;
+        nowhere.path.clear();
+        QVERIFY(!submitFarmJob(farm.toStdString(), "None", p, seq.id, nowhere, 0, nullptr, &err));
+        QVERIFY2(retryFarmJob(farm.toStdString(), id, &err), err.c_str());
+        QCOMPARE(farmJobs(farm.toStdString())[0].state, FarmState::Waiting);
+        QVERIFY(removeFarmJob(farm.toStdString(), id, &err));
+        QVERIFY(farmJobs(farm.toStdString()).empty());
+        QVERIFY(QFileInfo::exists(dir.path() + "/node/out/first.mp4"));  // (the output stays)
+
+        // ---- Cancelled while waiting: no node takes it; retried, it waits again; removed, it is gone.
+        st.path = (dir.path() + "/node/out/second.mp4").toStdString();
+        QVERIFY(submitFarmJob(farm.toStdString(), "Second", p, seq.id, st, 0, &id, &err));
+        QVERIFY(cancelFarmJob(farm.toStdString(), id, &err));
+        QCOMPARE(farmJobs(farm.toStdString())[0].state, FarmState::Cancelled);
+        QVERIFY(!cancelFarmJob(farm.toStdString(), id, &err));  // (ended already)
+        o.maps.clear();
+        QVERIFY(runFarmNode(o, &rendered) && rendered == 0);
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(st.path)));
+        QVERIFY(retryFarmJob(farm.toStdString(), id));
+        QCOMPARE(farmJobs(farm.toStdString())[0].state, FarmState::Waiting);
+        QVERIFY(!retryFarmJob(farm.toStdString(), id, &err));  // (waiting already)
+        QVERIFY(removeFarmJob(farm.toStdString(), id));
+        QVERIFY(!removeFarmJob(farm.toStdString(), "../x", &err) && !cancelFarmJob(farm.toStdString(), "nope", &err));
+
+        // ---- Two nodes at once: each job rendered once.
+        std::vector<std::string> ids;
+        for (int i = 0; i < 4; ++i) {
+            st.path = (dir.path() + QString("/node/out/many%1.mp4").arg(i)).toStdString();
+            QVERIFY(submitFarmJob(farm.toStdString(), "Many", p, seq.id, st, 0, &id, &err));
+            ids.push_back(id);
+        }
+        FarmNodeOptions a = o, b = o;
+        a.name = "A";
+        b.name = "B";
+        a.log = b.log = nullptr;
+        int ra = 0, rb = 0;
+        std::thread ta([&] { runFarmNode(a, &ra); });
+        std::thread tb([&] { runFarmNode(b, &rb); });
+        ta.join();
+        tb.join();
+        QCOMPARE(ra + rb, 4);
+        for (const FarmJob& j : farmJobs(farm.toStdString())) QVERIFY2(j.state == FarmState::Done && (j.node == "A" || j.node == "B"), j.error.c_str());
+        for (const std::string& j : ids) QVERIFY(removeFarmJob(farm.toStdString(), j));
+
+        // ---- Cancelled while rendering: stopped within a second or two, the half-written file removed. A node stopped
+        // while rendering gives its job back to wait for another.
+        Sequence& longSeq = *p.active();
+        longSeq.width = 1920;
+        longSeq.height = 1080;
+        Clip noise = makeGeneratorClip(p, "color", 25 * 600);
+        edit::overwrite(p, longSeq, {TrackKind::Video, 0}, noise);
+        st.path = (dir.path() + "/node/out/long.mov").toStdString();
+        st.videoCodec = "prores_ks";
+        st.profile = "4444";
+        QVERIFY(submitFarmJob(farm.toStdString(), "Long", p, longSeq.id, st, 0, &id, &err));
+        std::atomic<bool> stop{false};
+        o.once = false;
+        o.pollMs = 100;
+        o.stopped = [&] { return stop.load(); };
+        auto rendering = [&] {
+            const std::vector<FarmJob> js = farmJobs(farm.toStdString());
+            return !js.empty() && js[0].state == FarmState::Rendering && js[0].progress > 0;
+        };
+        {
+            std::thread node([&] { runFarmNode(o, &rendered); });
+            QTRY_VERIFY_WITH_TIMEOUT(rendering(), 30000);
+            QVERIFY(cancelFarmJob(farm.toStdString(), id, &err));
+            QTRY_VERIFY_WITH_TIMEOUT(farmJobs(farm.toStdString())[0].state == FarmState::Cancelled, 10000);
+            stop = true;
+            node.join();
+        }
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(st.path)));
+        QVERIFY(retryFarmJob(farm.toStdString(), id));
+        stop = false;
+        {
+            std::thread node([&] { runFarmNode(o, &rendered); });
+            QTRY_VERIFY_WITH_TIMEOUT(rendering(), 30000);
+            stop = true;
+            node.join();
+        }
+        jobs = farmJobs(farm.toStdString());
+        QCOMPARE(jobs[0].state, FarmState::Waiting);
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(st.path)));
+        // A node that loses its job (taken back while it was silent, and claimed by another) stops, and leaves what
+        // the other writes alone: it renders into a folder of its own and moves nothing into place.
+        stop = false;
+        {
+            std::thread node([&] { runFarmNode(o, &rendered); });
+            QTRY_VERIFY_WITH_TIMEOUT(rendering(), 30000);
+            QFile theirs(QString::fromStdString(st.path));
+            QVERIFY(theirs.open(QIODevice::WriteOnly));
+            theirs.write("the other node's render");
+            theirs.close();
+            QFile claim(farm + "/jobs/" + QString::fromStdString(id) + "/claim");
+            QVERIFY(claim.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            claim.write("the-other-node");
+            claim.close();
+            QTRY_VERIFY_WITH_TIMEOUT(QDir(dir.path() + "/node/out").entryList({".montage-farm-*"}, QDir::Dirs | QDir::Hidden).isEmpty(), 10000);
+            stop = true;
+            node.join();
+        }
+        {
+            QFile theirs(QString::fromStdString(st.path));
+            QVERIFY(theirs.open(QIODevice::ReadOnly));
+            QCOMPARE(theirs.readAll(), QByteArray("the other node's render"));
+        }
+        QCOMPARE(farmJobs(farm.toStdString())[0].claim, std::string("the-other-node"));
+        QFile::remove(farm + "/jobs/" + QString::fromStdString(id) + "/claim");
+        QFile::remove(QString::fromStdString(st.path));
+        QVERIFY(removeFarmJob(farm.toStdString(), id));
+
+        // ---- A node that stops answering: its job is taken back once its heartbeat has not moved for a while (by the
+        // watcher's own clock), by one watcher only, and then rendered by another node.
+        st.path = (dir.path() + "/node/out/orphan.mp4").toStdString();
+        st.videoCodec = "libx264";
+        st.profile.clear();
+        Project shortP = makeDefaultProject();
+        shortP.active()->width = 320;
+        shortP.active()->height = 180;
+        edit::overwrite(shortP, *shortP.active(), {TrackKind::Video, 0}, makeGeneratorClip(shortP, "color", 25));
+        QVERIFY(submitFarmJob(farm.toStdString(), "Orphan", shortP, shortP.active()->id, st, 0, &id, &err));
+        const QDir jd(farm + "/jobs/" + QString::fromStdString(id));
+        {
+            QFile claim(jd.filePath("claim"));
+            QVERIFY(claim.open(QIODevice::WriteOnly));
+            claim.write("gone-node-token");
+            QFile status(jd.filePath("status.json"));
+            QVERIFY(status.open(QIODevice::WriteOnly));
+            status.write(R"({"state": "rendering", "progress": 0.3, "node": "Gone", "beat": 5})");
+        }
+        jobs = farmJobs(farm.toStdString());
+        QCOMPARE(jobs[0].state, FarmState::Rendering);
+        QCOMPARE(jobs[0].node, std::string("Gone"));
+        QCOMPARE(jobs[0].claim, std::string("gone-node-token"));
+        // Taken back only from the claim judged silent (not from a node that has claimed it since).
+        QVERIFY(!reclaimFarmJob(farm.toStdString(), id, "another-node-token", &err));
+        QVERIFY(QFileInfo::exists(jd.filePath("claim")));
+        QCOMPARE(farmJobs(farm.toStdString())[0].claim, std::string("gone-node-token"));
+        FarmHeartbeats beats(200);
+        QVERIFY(!beats.stale(id, 5));
+        QVERIFY(!beats.stale(id, 6));  // (it moved: watched afresh)
+        QTest::qWait(250);
+        QVERIFY(beats.stale(id, 6));
+        // A node with a short patience takes it back and renders it.
+        stop = false;
+        o.staleMs = 300;
+        o.stopped = [&] { return stop.load() || rendered > 0; };
+        rendered = 0;
+        log.clear();
+        QVERIFY(runFarmNode(o, &rendered, &err));
+        QCOMPARE(rendered, 1);
+        jobs = farmJobs(farm.toStdString());
+        QVERIFY2(jobs[0].state == FarmState::Done && jobs[0].node == "Node A", jobs[0].error.c_str());
+        QVERIFY2(log.join('\n').contains("Took back") && log.join('\n').contains("Gone"), qPrintable(log.join('\n')));
+        QVERIFY(!reclaimFarmJob(farm.toStdString(), id, jobs[0].claim, &err));  // (only a rendering job is taken back)
+        QVERIFY(QFileInfo::exists(QString::fromStdString(st.path)));
+        QVERIFY(QDir(dir.path() + "/node/out").entryList({".montage-farm-*"}, QDir::Dirs | QDir::Hidden).isEmpty());
+
+        // ---- Over MCP: montage_render's farm sends the job; montage_render_farm lists, cancels and removes it.
+        const QString project = dir.path() + "/mcp.montage";
+        QVERIFY(saveProject(shortP, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        const QString mcpOut = dir.path() + "/node/out/mcp.mp4";
+        QJsonObject r = call("montage_render", {{"project", project}, {"output", mcpOut}, {"farm", farm}, {"stems", "tracks"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const QString mcpJob = r.value("structuredContent").toObject().value("job").toString();
+        QVERIFY(!mcpJob.isEmpty() && !QFileInfo::exists(mcpOut));
+        r = call("montage_render_farm", {{"farm", farm}});
+        QJsonArray listed = r.value("structuredContent").toObject().value("jobs").toArray();
+        QCOMPARE(listed.size(), 2);
+        QJsonObject sent;
+        for (const QJsonValue& j : listed)
+            if (j.toObject().value("id").toString() == mcpJob) sent = j.toObject();
+        QCOMPARE(sent.value("state").toString(), QString("waiting"));
+        QCOMPARE(sent.value("output").toString(), mcpOut);
+        r = call("montage_render_farm", {{"farm", farm}, {"action", "nodes"}});
+        QStringList nodeNames;
+        for (const QJsonValue& n : r.value("structuredContent").toObject().value("nodes").toArray()) nodeNames << n.toObject().value("name").toString();
+        QCOMPARE(nodeNames, (QStringList{"A", "B", "Node A"}));
+        r = call("montage_render_farm", {{"farm", farm}, {"action", "cancel"}, {"job", mcpJob}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        for (const FarmJob& j : farmJobs(farm.toStdString()))
+            if (j.id == mcpJob.toStdString()) QCOMPARE(j.state, FarmState::Cancelled);
+        r = call("montage_render_farm", {{"farm", farm}, {"action", "remove"}, {"job", mcpJob}});
+        QVERIFY(!r.value("isError").toBool());
+        r = call("montage_render_farm", {{"farm", farm}, {"action", "retry"}, {"job", mcpJob}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("No job"));
     }
 
     void mcpBuildsACutFromAScript() {
