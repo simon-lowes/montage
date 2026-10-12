@@ -1,4 +1,5 @@
 #include "ReferenceOutputPanel.h"
+#include "render/TrimPasses.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -80,7 +81,19 @@ QString ReferenceOutputController::formatKey() const {
         .arg(qs(sequenceColorSpace(*s).id))
         .arg(s->sampleRate)
         .arg(s->hdrPeakNits)
-        .arg(s->hdrMaxCll);
+        .arg(s->hdrMaxCll) + QStringLiteral(" ") + qs(program_->trimTarget());
+}
+
+Sequence ReferenceOutputController::signalSequence(const Sequence& s) const {
+    // A trim pass goes out as its target's signal (its space and peak; light levels unmeasured).
+    Sequence out = s;
+    const std::string trim = program_ ? program_->trimTarget() : std::string();
+    if (findTrimTarget(s, trim)) {
+        out.colorSpace = trimTargetSpace(s, trim).id;
+        out.hdrPeakNits = trimTargetPeak(s, trim);
+        out.hdrMaxCll = out.hdrMaxFall = 0;
+    }
+    return out;
 }
 
 bool ReferenceOutputController::start(const output::Config& config, QString* error) {
@@ -129,7 +142,7 @@ bool ReferenceOutputController::start(const output::Config& config, QString* err
         mode = *m;
     }
     auto sched = std::make_shared<output::Scheduler>(b);
-    if (!sched->start(*d, mode, *s, config, &why)) return fail(qs(why));
+    if (!sched->start(*d, mode, signalSequence(*s), config, &why)) return fail(qs(why));
     backend_ = b;
     device_ = *d;
     scheduler_ = sched;

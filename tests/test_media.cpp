@@ -150,6 +150,7 @@
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
 #include "render/QualityCheck.h"
+#include "render/DialogueLoudness.h"
 #include "render/ProjectManager.h"
 #include "render/LutExport.h"
 
@@ -773,6 +774,36 @@ private slots:
         QVERIFY(plain.created.empty() && plain.metadata.empty());
     }
 
+    void loudnessOverSpeech() {
+        // 5 s of a -23 dBFS tone marked as speech, then 5 s at -13 that is not: the speech reads -23, everything louder.
+        LoudnessMeter m(48000);
+        std::vector<float> block(48000 * 2);
+        auto feed = [&](double db) {
+            const double amp = std::pow(10.0, db / 20.0);
+            for (int i = 0; i < 48000; ++i) block[size_t(i) * 2] = block[size_t(i) * 2 + 1] = float(amp * std::sin(2 * M_PI * 997.0 * i / 48000.0));
+            m.add(block.data(), 48000);
+        };
+        QVERIFY(!m.speechResult().valid);
+        m.setSpeech(true);
+        for (int i = 0; i < 5; ++i) feed(-23);
+        m.setSpeech(false);
+        for (int i = 0; i < 5; ++i) feed(-13);
+        QCOMPARE(m.steps(), size_t(100));
+        const LoudnessResult speech = m.speechResult(), all = m.result();
+        QVERIFY2(speech.valid && std::fabs(speech.integrated + 23) < 0.2, qPrintable(QString::number(speech.integrated)));
+        QVERIFY2(std::fabs(all.integrated + 15.6) < 0.2, qPrintable(QString::number(all.integrated)));  // the two blocks' mean energy
+        QVERIFY2(std::fabs(m.speechShare() - 0.5) < 0.02, qPrintable(QString::number(m.speechShare())));
+        QVERIFY(std::fabs(m.momentaryAt(20) + 23) < 0.2 && std::fabs(m.momentaryAt(80) + 13) < 0.2);
+        QCOMPARE(m.momentaryAt(500), -200.0);
+        // Marked after the fact: the last second is speech too.
+        for (size_t i = 90; i < 100; ++i) m.markSpeech(i, true);
+        QVERIFY(m.speechResult().integrated > -21);
+        QVERIFY(std::fabs(m.speechShare() - 0.6) < 0.02);
+        m.reset();
+        QCOMPARE(m.steps(), size_t(0));
+        QCOMPARE(m.speechShare(), 0.0);
+    }
+
     void loudnessMeasurement() {
         // A 997 Hz stereo sine at -23 dBFS reads -23 LUFS (EBU Tech 3341 case 1 style).
         AudioBuffer buf;
@@ -1211,6 +1242,156 @@ private slots:
         QVERIFY(!has(QcKind::Silence));
         q.clipping = false, q.loudnessTarget = 0;
         QVERIFY2(qualityCheck(p, s, 0, speechEnd, q).empty(), qPrintable(describe(qualityCheck(p, s, 0, speechEnd, q))));
+    }
+
+    void dialogueGatedLoudness() {
+        // JFK's speech (Dialogue, about -15 LUFS) for its 11 s, then 11 s of a loud tone (Music): the dialogue's loudness is the
+        // speech's alone, however loud the music after it.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem jfk = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/jfk.wav");
+        p.media.push_back(jfk);
+        QVERIFY(edit::placeMedia(p, s, jfk.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const FrameTime speechEnd = s.duration();
+        const double fps = s.fpsValue(), speechSeconds = double(speechEnd) / fps;
+        const std::string tonePath = path("dialogue-tone.wav");
+        writeVoiceWav(tonePath, 11, 220, [](double) { return true; }, [](double) { return false; });
+        MediaItem tone = probeOrFail(p, tonePath);
+        p.media.push_back(tone);
+        QVERIFY(s.audioTracks.size() >= 2);
+        QVERIFY(edit::placeMedia(p, s, tone.id, speechEnd, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok);
+        s.audioTracks[0].clips.front().role = "Dialogue";
+        s.audioTracks[1].clips.front().role = "Music";
+        s.audioTracks[1].clips.front().audio.params["gain_db"] = 6.0;  // (about -4.6 LUFS)
+        std::string err;
+        // The speech on its own, as BS.1770 measures it.
+        DialogueLoudnessOptions alone;
+        alone.out = speechEnd;
+        alone.gate = SpeechGate::Roles;
+        const DialogueLoudness speech = measureDialogueLoudness(p, s, alone, {}, nullptr, &err);
+        QVERIFY2(speech.valid, err.c_str());
+
+        const DialogueLoudness d = measureDialogueLoudness(p, s, {}, {}, nullptr, &err);
+        const QString said = QString::fromStdString(describeDialogueLoudness(d));
+        QVERIFY2(d.valid && d.gate == SpeechGate::Roles && !d.usesProgramme, qPrintable(said));
+        QVERIFY2(std::fabs(d.dialogue - speech.programme) < 1.0, qPrintable(said + " / " + QString::number(speech.programme)));
+        QVERIFY2(d.programme > d.dialogue + 3, qPrintable(said + " / " + QString::number(d.programme)));
+        QVERIFY2(d.speechShare > 0.3 && d.speechShare < 0.55, qPrintable(said));
+        QCOMPARE(d.value(), d.dialogue);
+        QVERIFY(said.startsWith("Dialogue") && said.contains("estimate"));
+        QVERIFY(!d.speech.empty() && d.speech.front().first < 1.5 && d.speech.back().second <= speechSeconds + 0.5);
+        // The pauses between JFK's phrases are not speech.
+        QVERIFY2(d.speech.size() > 1, qPrintable(QString::number(d.speech.size())));
+        // Only the music's stretch: no Dialogue clip there and no words, so it is listened to, and nothing is speech.
+        DialogueLoudnessOptions after;
+        after.in = speechEnd;
+        const DialogueLoudness musicStretch = measureDialogueLoudness(p, s, after, {}, nullptr, &err);
+        QVERIFY2(musicStretch.gate == SpeechGate::Classifier && musicStretch.usesProgramme,
+                 qPrintable(QString::fromStdString(describeDialogueLoudness(musicStretch))));
+
+        // From a transcript (no roles): the same, near enough.
+        for (Track& t : s.audioTracks)
+            for (Clip& c : t.clips) c.role.clear();
+        {
+            auto t = std::make_shared<Transcript>();
+            TranscriptSegment seg;
+            for (double at = 0.4; at + 0.4 < speechSeconds - 0.3; at += 0.5) seg.words.push_back({at, at + 0.4, "word", 1});
+            t->segments.push_back(seg);
+            p.findMedia(jfk.id)->transcript = t;
+        }
+        const DialogueLoudness byWords = measureDialogueLoudness(p, s, {}, {}, nullptr, &err);
+        QVERIFY2(byWords.gate == SpeechGate::Transcripts && !byWords.usesProgramme, qPrintable(QString::fromStdString(describeDialogueLoudness(byWords))));
+        QVERIFY2(std::fabs(byWords.dialogue - speech.programme) < 1.5, qPrintable(QString::number(byWords.dialogue)));
+        // The speech track left out: its words are not heard, so nothing is speech and the programme counts.
+        DialogueLoudnessOptions musicOnly;
+        musicOnly.tracks = {false, true};
+        musicOnly.gate = SpeechGate::Transcripts;
+        const DialogueLoudness music = measureDialogueLoudness(p, s, musicOnly, {}, nullptr, &err);
+        QVERIFY2(music.valid && music.usesProgramme && music.speechShare == 0, qPrintable(QString::fromStdString(describeDialogueLoudness(music))));
+        QCOMPARE(music.value(), music.programme);
+        QVERIFY(QString::fromStdString(describeDialogueLoudness(music)).startsWith("Programme"));
+
+        // By listening (no roles, no transcript): the speech is heard as speech, the tone is not.
+        p.findMedia(jfk.id)->transcript.reset();
+        const DialogueLoudness heard = measureDialogueLoudness(p, s, {}, {}, nullptr, &err);
+        const QString heardSaid = QString::fromStdString(describeDialogueLoudness(heard));
+        QVERIFY2(heard.gate == SpeechGate::Classifier && !heard.usesProgramme, qPrintable(heardSaid));
+        QVERIFY2(std::fabs(heard.dialogue - speech.programme) < 2.0, qPrintable(heardSaid + " / " + QString::number(speech.programme)));
+        QVERIFY2(heard.speech.back().second < speechSeconds + 2.5, qPrintable(QString::number(heard.speech.back().second)));
+        // A share asked for that it does not reach: the programme counts.
+        DialogueLoudnessOptions strict;
+        strict.minSpeechShare = 0.9;
+        QVERIFY(measureDialogueLoudness(p, s, strict).usesProgramme);
+        // Cancelled.
+        std::atomic<bool> cancel{true};
+        QVERIFY(!measureDialogueLoudness(p, s, {}, {}, &cancel, &err).valid);
+        QCOMPARE(err, std::string("Cancelled"));
+        SpeechGate g;
+        QVERIFY(parseSpeechGate("transcripts", g) && g == SpeechGate::Transcripts && !parseSpeechGate("dolby", g));
+
+        // Quality Check against Netflix: the dialogue (not the music) is what is measured, within 2 LU.
+        s.audioTracks[0].clips.front().role = "Dialogue";
+        QcSettings q;
+        q.flashing = false, q.levels = false, q.blackSeconds = 0, q.freezeSeconds = 0, q.silenceSeconds = 0, q.clipping = false;
+        q.spelling = false, q.sync = false;
+        q.dialogueGated = true;
+        q.loudnessTolerance = 2;
+        q.peakCeiling = 0;
+        q.loudnessTarget = std::round(speech.programme) + 1;
+        std::vector<QcIssue> issues = qualityCheck(p, s, 0, -1, q);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues[0].text.c_str());
+        q.dialogueGated = false;  // the whole programme is far louder
+        issues = qualityCheck(p, s, 0, -1, q);
+        QVERIFY(issues.size() == 1 && issues[0].kind == QcKind::Loudness);
+        q.dialogueGated = true;
+        q.loudnessTarget = speech.programme > -24 ? -40 : -10;  // well away either way
+        issues = qualityCheck(p, s, 0, -1, q);
+        QVERIFY(issues.size() == 1 && issues[0].kind == QcKind::Loudness);
+        QVERIFY2(QString::fromStdString(issues[0].text).contains("Dialogue") && QString::fromStdString(issues[0].text).contains("±2 LU"),
+                 issues[0].text.c_str());
+
+        // Exported to Netflix's -27 LKFS of dialogue, peaks under -2 dBTP: the speech lands on -27.
+        ExportSettings st = findExportPreset("Audio - WAV 24-bit")->settings;
+        st.path = path("netflix.wav");
+        st.loudnessTarget = -27;
+        st.peakCeiling = -2;
+        st.dialogueGated = true;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        const AudioBufferPtr out = decodeAudio(st.path, 48000, &err);
+        QVERIFY2(out, err.c_str());
+        const LoudnessResult spoken = measureLoudness(*out, 0, int64_t(speechSeconds * 48000));
+        QVERIFY2(std::fabs(spoken.integrated + 27) < 1.0, qPrintable(QString::number(spoken.integrated)));
+        QVERIFY2(measureLoudness(*out).truePeakDb <= -2.0 + 0.15, qPrintable(QString::number(measureLoudness(*out).truePeakDb)));
+
+        // Over the agent link: measured, and checked as Netflix does.
+        const QString project = QString::fromStdString(path("dialogue/film.montage"));
+        QDir().mkpath(QFileInfo(project).absolutePath());
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        QJsonObject r = call("montage_dialogue_loudness", {});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const QJsonObject m = r.value("structuredContent").toObject();
+        QCOMPARE(m.value("gate").toString(), QString("roles"));
+        QVERIFY(m.value("estimate").toBool() && !m.value("uses_programme").toBool());
+        QVERIFY2(std::fabs(m.value("dialogue_lkfs").toDouble() - d.dialogue) < 0.05, qPrintable(text(r)));
+        QVERIFY(m.value("speech_seconds").toArray().size() > 1);
+        r = call("montage_dialogue_loudness", {{"gate", "dolby"}});
+        QVERIFY(r.value("isError").toBool());
+        r = call("montage_quality_check", {{"flashing", false}, {"levels", false}, {"black_seconds", 0}, {"freeze_seconds", 0},
+                                           {"silence_seconds", 0}, {"clipping", false}, {"spelling", false}, {"sync", false},
+                                           {"loudness_target", std::round(speech.programme) + 1}, {"peak_ceiling", 0},
+                                           {"loudness_dialogue", true}});
+        QVERIFY2(text(r).contains("No problems"), qPrintable(text(r)));
     }
 
     void dereverbSpeech() {
@@ -5190,6 +5371,135 @@ private slots:
         QCOMPARE(pulled.size(), 2);
         QCOMPARE(pulled[0].toObject().value("first_frame").toInt(), 997);
         QVERIFY(QFileInfo::exists(r.value("structuredContent").toObject().value("pull_list").toString()));
+    }
+
+    void trimPassesOverMcp() {
+        // An HDR master with two shots: trim targets added, a shot trimmed, the SDR pass rendered.
+        Project q = makeDefaultProject();
+        Sequence& seq = *q.active();
+        seq.width = 64;
+        seq.height = 36;
+        seq.colorSpace = "rec2100pq";
+        Clip a = makeGeneratorClip(q, "color", 10);
+        a.name = "Wide";
+        Clip b = makeGeneratorClip(q, "color", 10);
+        b.name = "Close";
+        b.start = 10;
+        edit::overwrite(q, seq, {TrackKind::Video, 0}, a);
+        edit::overwrite(q, seq, {TrackKind::Video, 0}, b);
+        const QString project = QString::fromStdString(path("trims/film.montage"));
+        QDir().mkpath(QFileInfo(project).absolutePath());
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        QJsonObject r = call("montage_trim", {{"action", "add_target"}, {"target", "sdr"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("id").toString(), QString("sdr"));
+        r = call("montage_trim", {{"action", "add_target"}, {"color_space", "rec2100pq"}, {"peak_nits", 500}, {"name", "Phones"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const QString phones = r.value("structuredContent").toObject().value("id").toString();
+        QVERIFY(call("montage_trim", {{"action", "add_target"}, {"target", "cinema"}}).value("isError").toBool());
+        r = call("montage_trim", {{"action", "set"}, {"target", "sdr"}, {"clip", "Wide"}, {"values", QJsonObject{{"gain", 0.8}, {"highlights", 0.3}}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call("montage_trim", {{"action", "set"}, {"target", "sdr"}, {"clip", "Wide"}, {"values", QJsonObject{{"warmth", 1}}}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("No trim control"));
+        r = call("montage_trim", {{"action", "copy"}, {"target", "sdr"}, {"clip", "Wide"}, {"clips", QJsonArray{"Close"}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call("montage_trim", {});
+        QJsonObject listed = r.value("structuredContent").toObject();
+        QCOMPARE(listed.value("targets").toArray().size(), 2);
+        QCOMPARE(listed.value("targets").toArray().at(1).toObject().value("peak_nits").toDouble(), 500.0);
+        QCOMPARE(listed.value("trims").toArray().size(), 2);
+        QCOMPARE(listed.value("trims").toArray().at(0).toObject().value("values").toObject().value("gain").toDouble(), 0.8);
+        r = call("montage_trim", {{"action", "reset"}, {"clips", QJsonArray{"Close"}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call("montage_trim", {{"action", "remove_target"}, {"target", phones}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->trimTargets.size(), size_t(1));
+        QCOMPARE(back.active()->videoTracks[0].clips.at(0).trims.at("sdr").params.at("gain").value, 0.8);
+        QVERIFY(back.active()->videoTracks[0].clips.at(1).trims.empty());
+
+        // montage_render delivers a target (SDR: Rec.709 tags), and refuses one the sequence lacks.
+        const QString out = QString::fromStdString(path("trims/sdr.mp4"));
+        r = call("montage_render", {{"output", out}, {"preset", "H.264 - Fast Draft"}, {"trim_target", "hdr10-300"}});
+        QVERIFY(r.value("isError").toBool());
+        r = call("montage_render", {{"output", out}, {"preset", "H.264 - Fast Draft"}, {"trim_target", "sdr"}, {"in", 0}, {"out", 0.2}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        MediaItem m;
+        std::string err;
+        QVERIFY2(probeMedia(out.toStdString(), m, &err), err.c_str());
+        QCOMPARE(m.colorSpace.empty() ? std::string("rec709") : m.colorSpace, std::string("rec709"));
+    }
+
+    void galleryOverMcp() {
+        // Two colour clips, the first with a Curves grade; stills grabbed, its grade applied to the second.
+        Project q = makeDefaultProject();
+        q.active()->width = 64;
+        q.active()->height = 36;
+        Clip a = makeGeneratorClip(q, "color", 30);
+        a.name = "Graded";
+        a.effects = {makeEffect(q, "curves"), makeEffect(q, "gaussian_blur")};
+        Clip b = makeGeneratorClip(q, "color", 30);
+        b.start = 30;
+        b.name = "Plain";
+        edit::overwrite(q, *q.active(), {TrackKind::Video, 0}, a);
+        edit::overwrite(q, *q.active(), {TrackKind::Video, 0}, b);
+        const double second = double(q.active()->videoTracks[0].clips.at(1).id);
+        const QString project = QString::fromStdString(path("gallery/film.montage"));
+        QDir().mkpath(QFileInfo(project).absolutePath());
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_gallery"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        QJsonObject r = call({{"project", project}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("folder").toString(), QFileInfo(project).absolutePath() + "/Gallery/film");
+        QCOMPARE(r.value("structuredContent").toObject().value("stills").toArray().size(), 0);
+        r = call({{"project", project}, {"action", "grab"}, {"at", 0.2}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QJsonObject still = r.value("structuredContent").toObject();
+        QCOMPARE(still.value("label").toString(), QString("1"));
+        QCOMPARE(still.value("clip").toString(), QString("Graded"));
+        QCOMPARE(still.value("grade_effects").toInt(), 1);
+        QVERIFY(QFileInfo::exists(still.value("picture").toString()));
+        r = call({{"project", project}, {"action", "grab"}, {"at", 100}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"project", project}, {"action", "apply"}, {"still", "1"}, {"clips", QJsonArray{"Plain"}}});  // (by name)
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Clip& graded = back.active()->videoTracks[0].clips.at(1);
+        QCOMPARE(graded.effects.size(), size_t(1));
+        QCOMPARE(graded.effects[0].type, std::string("curves"));
+        r = call({{"project", project}, {"action", "apply"}, {"still", "9"}, {"clips", QJsonArray{second}}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("No still"));
+        r = call({{"project", project}, {"action", "add_album"}, {"name", "Looks"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call({{"project", project}, {"action", "rename"}, {"still", "1"}, {"label", "Warm"}});
+        QVERIFY2(!r.value("isError").toBool() && r.value("structuredContent").toObject().value("label").toString() == "Warm", qPrintable(text(r)));
+        r = call({{"project", project}});
+        QCOMPARE(r.value("structuredContent").toObject().value("albums").toArray().size(), 2);
+        r = call({{"project", project}, {"action", "remove"}, {"still", "Warm"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(!QFileInfo::exists(still.value("picture").toString()));
     }
 
     void gradeVersionsOverMcp() {

@@ -22,6 +22,9 @@ struct RenderOptions {
     bool offlineProxies = false;  // an offline file plays its proxy (viewing; deliveries show it offline)
     int depth = 0;             // nesting depth (internal)
     bool captions = false;     // draw the visible caption track over the program
+    // A trim pass (render/TrimPasses.h, the id of one of the sequence's targets): program frames as that display shows
+    // them, in its space (displaySpace converts from there); "" = the master.
+    std::string trimTarget;
     std::string displaySpace;  // program frames converted to this space (ColorSpace.h id) for viewing; "" = as is
     int soloVideoTrack = -1;   // render only this video track (a multicam angle); not passed to nested sequences
     int eye = 0;               // stereoscopic 3D: the eye rendered (0 left, 1 right)
@@ -33,6 +36,9 @@ struct RenderOptions {
 // The result is (seq.width*scale) x (seq.height*scale), transparent where
 // nothing is on screen; call flattenOver() to put it over black.
 Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o);
+
+// The video tracks a Track Matte Key hides at t (they are its mattes, not seen themselves).
+std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t);
 
 // Same, flattened over black — what the program monitor and exports show.
 Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o);

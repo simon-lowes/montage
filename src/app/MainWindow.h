@@ -53,6 +53,9 @@ class RenderQueue;
 class EffectsBrowser;
 class InspectorWidget;
 class GradeNodePanel;
+class GalleryPanel;
+class ClipStripPanel;
+class TrimPanel;
 class ScopesWidget;
 class MixerPanel;
 class ControlSurface;
@@ -185,6 +188,8 @@ public:
     Id newColorGroup(const QString& name = {});
     // File › Export Versions (render/Versions.h): the current sequence in several shapes, the reframed copies added in
     // one undo step and every version queued to render into `folder` with the preset `presetName`. The versions' ids.
+    // Queues a render of each trim pass of the sequence into `folder`; how many.
+    int queueTrimPasses(const QString& folder);
     std::vector<Id> exportVersions(const std::vector<VersionShape>& shapes, const QString& folder, bool captions = true, double lufs = -14,
                                    const QString& presetName = QStringLiteral("H.264 - High Quality"));
     void exportVersionsDialog();
@@ -367,7 +372,7 @@ private:
     // Lays the panels out afresh: groups across the top, down the left and down the right, each group's panels as tabs
     // with its first in front. Panels in no group are hidden, tabbed behind the first top group for Window to bring back.
     using DockGroups = std::vector<std::vector<QDockWidget*>>;
-    void arrangeDocks(const DockGroups& top, const DockGroups& left, const DockGroups& right);
+    void arrangeDocks(const DockGroups& top, const DockGroups& left, const DockGroups& right, const DockGroups& bottom = {});
     void layOutBuiltIn(const QString& name);
     void syncWorkspaceUi();
     void syncProgram();
@@ -536,6 +541,12 @@ private:
     QDockWidget* keyframesDock_ = nullptr;
     QDockWidget* nodesDock_ = nullptr;
     GradeNodePanel* gradeNodes_ = nullptr;
+    QDockWidget* galleryDock_ = nullptr;
+    GalleryPanel* gallery_ = nullptr;
+    QDockWidget* clipsDock_ = nullptr;
+    ClipStripPanel* clipStrip_ = nullptr;
+    QDockWidget* trimsDock_ = nullptr;
+    TrimPanel* trims_ = nullptr;
     QDockWidget* meterDock_ = nullptr;
     RenderQueue* queue_ = nullptr;
     Image colourRef_;       // the look Match Colour aims for

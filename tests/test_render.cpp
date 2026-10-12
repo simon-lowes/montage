@@ -7,6 +7,8 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <cmath>
 #include <complex>
 #include <cstring>
@@ -21,6 +23,7 @@
 #include "core/GradeGraph.h"
 #include "core/Captions.h"
 #include "core/EditOps.h"
+#include "core/ProjectIO.h"
 #include "core/GraphicsTemplate.h"
 #include "core/Effects.h"
 #include "core/MaskPath.h"
@@ -35,6 +38,8 @@
 #include "render/DcpMxf.h"
 #include "media/Decoder.h"
 #include "render/Exporter.h"
+#include "render/Gallery.h"
+#include "render/TrimPasses.h"
 #include "render/RoomTone.h"
 #include "render/Ocio.h"
 #include "media/Tracking.h"
@@ -2437,6 +2442,329 @@ colorspaces:
         QVERIFY(edit::switchGradeVersion(s, red.id, 0).ok);
         rgb(renderSequenceFrame(p, s, 5, o), 32, 18, c);
         QVERIFY(c[0] < 0.1f && c[1] > 0.9f);
+    }
+
+    void galleryStillsAndGrades() {
+        // Red inverted (cyan) with a blur after the grade; blue with only a blur; green with nothing.
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const std::string folder = dir.path().toStdString() + "/Gallery/film";
+        // (beside the project; on Windows a rooted path gains the current drive)
+        QCOMPARE(galleryFolder("/x/y/film.montage"), (QFileInfo("/x/y/film.montage").absolutePath() + "/Gallery/film").toStdString());
+        QVERIFY(QString::fromStdString(galleryFolder("/x/y/film.montage")).endsWith("/x/y/Gallery/film"));
+        QVERIFY(!galleryFolder("").empty());
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64;
+        s.height = 36;
+        Clip red = colorClip(p, 1, 0, 0, 0, 30);
+        red.name = "Red";
+        red.effects = {makeEffect(p, "invert"), makeEffect(p, "gaussian_blur")};
+        Clip blue = colorClip(p, 0, 0, 1, 30, 30);
+        blue.effects = {makeEffect(p, "gaussian_blur")};
+        Clip green = colorClip(p, 0, 1, 0, 60, 30);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, red);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, blue);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, green);
+
+        // Grabbed: the picture as the viewer shows it, the grade (the invert, first among the clip's effects).
+        GalleryStill one;
+        std::string err;
+        QVERIFY2(grabStill(p, s, 5, folder, kDefaultAlbum, one, &err), err.c_str());
+        QCOMPARE(one.label, std::string("1"));
+        QCOMPARE(one.clip, std::string("Red"));
+        QCOMPARE(one.effects.size(), size_t(1));
+        QCOMPARE(one.effects[0].type, std::string("invert"));
+        QVERIFY(one.anchors == std::vector<int>{0});
+        const QImage picture(QString::fromStdString(one.picture));
+        QCOMPARE(picture.size(), QSize(64, 36));
+        const QColor cyan = picture.pixelColor(32, 18);
+        QVERIFY(cyan.red() < 30 && cyan.green() > 220 && cyan.blue() > 220);
+        GalleryStill two;
+        QVERIFY(grabStill(p, s, 40, folder, kDefaultAlbum, two, &err));
+        QCOMPARE(two.label, std::string("2"));
+        QVERIFY(two.effects.empty());
+        QVERIFY(!grabStill(p, s, 200, folder, kDefaultAlbum, two, &err) && !err.empty());  // nothing there
+        std::vector<GalleryStill> stills = galleryStills(folder, kDefaultAlbum);
+        QCOMPARE(stills.size(), size_t(2));
+        QCOMPARE(stills[0].id, one.id);
+        GalleryStill found;
+        QVERIFY(findStill(folder, kDefaultAlbum, "1", found) && found.id == one.id && found.effects.size() == 1);
+
+        // Applied to blue: the invert in place of its (empty) grade, before its blur; blue inverted is yellow.
+        QVERIFY(edit::applyStillGrade(p, s, found, {blue.id}).ok);
+        const Clip* b = edit::clipById(s, blue.id);
+        QCOMPARE(b->effects.size(), size_t(2));
+        QCOMPARE(b->effects[0].type, std::string("invert"));
+        QVERIFY(b->effects[0].id != red.effects[0].id);
+        RenderOptions o;
+        float c[4];
+        rgb(renderSequenceFrame(p, s, 40, o), 32, 18, c);
+        QVERIFY(c[0] > 0.9f && c[1] > 0.9f && c[2] < 0.1f);
+        // The second still (no grade) takes it off again, the blur kept.
+        QVERIFY(findStill(folder, kDefaultAlbum, "2", found));
+        QVERIFY(edit::applyStillGrade(p, s, found, {blue.id}).ok);
+        QCOMPARE(edit::clipById(s, blue.id)->effects.size(), size_t(1));
+        QCOMPARE(edit::clipById(s, blue.id)->effects[0].type, std::string("gaussian_blur"));
+
+        // A node grade goes with its graph.
+        QVERIFY(edit::convertToNodes(s, red.id).ok);
+        QVERIFY(edit::addGradeNode(p, s, red.id, edit::NodeHow::Serial).ok);
+        GalleryStill nodes;
+        QVERIFY(grabStill(p, s, 5, folder, kDefaultAlbum, nodes, &err));
+        QCOMPARE(nodes.graph.nodes.size(), edit::clipById(s, red.id)->grade.nodes.size());
+        QVERIFY(findStill(folder, kDefaultAlbum, nodes.id, found));
+        QVERIFY(found.graph == nodes.graph);
+        QVERIFY(edit::applyStillGrade(p, s, found, {green.id}).ok);
+        const Clip* g = edit::clipById(s, green.id);
+        QVERIFY(g->grade == edit::clipById(s, red.id)->grade);
+        QVERIFY(std::any_of(g->effects.begin(), g->effects.end(), [](const Effect& e) { return e.type == "invert" && e.node != 0; }));
+        rgb(renderSequenceFrame(p, s, 70, o), 32, 18, c);
+        QVERIFY(c[0] > 0.9f && c[1] < 0.1f && c[2] > 0.9f);  // green inverted: magenta
+        QVERIFY(!edit::applyStillGrade(p, s, found, {}).ok);
+
+        // A shared node goes as the still has it: not one of the same id here that does something else (another
+        // project's ids could be anything's here), and one copy for all the clips it goes on, reused when applied again.
+        GalleryStill shared = found;
+        shared.sharedNodes = {SharedNode{9000, "Look", {makeEffect(p, "invert")}}};
+        shared.graph.nodes.front().shared = 9000;
+        s.sharedNodes.push_back(SharedNode{9000, "Skin", {makeEffect(p, "gaussian_blur")}});
+        QVERIFY(edit::applyStillGrade(p, s, shared, {blue.id, green.id}).ok);
+        const Id lookNode = edit::clipById(s, blue.id)->grade.nodes.front().shared;
+        QVERIFY(lookNode && lookNode != 9000);
+        QCOMPARE(edit::clipById(s, green.id)->grade.nodes.front().shared, lookNode);
+        QCOMPARE(findSharedNode(s, lookNode)->name, std::string("Look"));
+        QCOMPARE(findSharedNode(s, 9000)->name, std::string("Skin"));
+        const size_t nodeCount = s.sharedNodes.size();
+        QVERIFY(edit::applyStillGrade(p, s, shared, {red.id}).ok);
+        QCOMPARE(s.sharedNodes.size(), nodeCount);
+        QCOMPARE(edit::clipById(s, red.id)->grade.nodes.front().shared, lookNode);
+
+        // Albums, renaming, removing.
+        QVERIFY(addAlbum(folder, "Looks"));
+        QVERIFY(!addAlbum(folder, "a/b"));
+        QVERIFY(!addAlbum(folder, ".."));
+        const std::vector<std::string> albums = galleryAlbums(folder);
+        QCOMPARE(albums.front(), std::string(kDefaultAlbum));
+        QVERIFY(std::find(albums.begin(), albums.end(), "Looks") != albums.end());
+        GalleryStill look;
+        QVERIFY(grabStill(p, s, 5, folder, "Looks", look, &err));
+        QCOMPARE(look.label, std::string("1"));
+        QVERIFY(galleryStills(folder, "../Stills").empty());
+        GalleryStill other;
+        QVERIFY(grabStill(p, s, 40, folder, "Looks", other, &err));
+        QVERIFY(renameStill(folder, look, "Night"));
+        QVERIFY(findStill(folder, "Looks", "Night", found) && found.id == look.id);
+        QVERIFY(!renameStill(folder, other, "Night", &err) && !err.empty());  // a label names one still
+        QVERIFY(findStill(folder, "Looks", other.id, found) && found.label == "2");
+        // A picture is the one beside its JSON, whatever the JSON says.
+        {
+            const QString json = QString::fromStdString(folder) + "/Looks/" + QString::fromStdString(other.id) + ".json";
+            QFile f(json);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
+            f.close();
+            o["picture"] = "../../outside.png";
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(QJsonDocument(o).toJson());
+            f.close();
+            QVERIFY(findStill(folder, "Looks", other.id, found));
+            QCOMPARE(QFileInfo(QString::fromStdString(found.picture)).absolutePath(), QFileInfo(json).absolutePath());
+            QVERIFY(removeStill(folder, found));
+        }
+        QVERIFY(removeStill(folder, look));
+        QVERIFY(galleryStills(folder, "Looks").empty());
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(look.picture)));
+    }
+
+    void trimPasses() {
+        // A PQ master at 4000 nits: two shots, a title over the first.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 32;
+        s.height = 18;
+        s.colorSpace = "rec2100pq";
+        s.hdrPeakNits = 4000;
+        Clip a = colorClip(p, 0.5f, 0.5f, 0.5f, 0, 30);
+        a.name = "A";
+        Clip b = colorClip(p, 0.5f, 0.5f, 0.5f, 30, 30);
+        b.name = "B";
+        edit::overwrite(p, s, {TrackKind::Video, 0}, a);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, b);
+        Clip title = makeGeneratorClip(p, "title", 30);
+        edit::overwrite(p, s, {TrackKind::Video, 1}, title);
+        QCOMPARE(trimShot(s, 10)->id, a.id);  // (the title is not a shot)
+        QCOMPARE(trimShot(s, 40)->id, b.id);
+        QVERIFY(!trimShot(s, 90));
+
+        // Targets: presets, one of its own, ids kept unique; a camera log space is not a display.
+        for (const char* id : {"sdr", "hdr10-600", "sdr"}) {
+            const auto& all = trimTargetPresets();
+            QVERIFY(edit::addTrimTarget(s, *std::find_if(all.begin(), all.end(), [&](const TrimTarget& t) { return t.id == id; })).ok);
+        }
+        QVERIFY(edit::addTrimTarget(s, TrimTarget{"", "", "rec2100pq", 400}).ok);
+        QVERIFY(!edit::addTrimTarget(s, TrimTarget{"", "", "slog3-sgamut3cine", 100}).ok);
+        QCOMPARE(s.trimTargets.size(), size_t(4));
+        QCOMPARE(s.trimTargets[2].id, std::string("sdr-2"));
+        QCOMPARE(s.trimTargets[3].id, std::string("rec2100pq-400"));
+        QCOMPARE(trimTargetPeak(s, "hdr10-600"), 600.0);
+        QCOMPARE(trimTargetSpace(s, "sdr").id, std::string("rec709"));
+        QCOMPARE(trimTargetSpace(s, "").id, std::string("rec2100pq"));
+
+        // 600 nits: 2000-nit light rolled off under the peak, 100 nits left as it is.
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        auto frame = [&](double nits) {
+            Image img(4, 2);
+            for (int i = 0; i < 8; ++i) {
+                float* px = img.px.data() + i * 4;
+                px[0] = px[1] = px[2] = float(nitsToCode(pq, i < 4 ? nits : 100));
+                px[3] = 1;
+            }
+            return img;
+        };
+        Image hdr = frame(2000);
+        applyTrimPass(hdr, s, 10, *findTrimTarget(s, "hdr10-600"));
+        const double bright = codeToNits(pq, hdr.at(0, 0)[0]), mid = codeToNits(pq, hdr.at(0, 1)[0]);
+        QVERIFY2(bright > 400 && bright <= 601, qPrintable(QString::number(bright)));
+        QVERIFY2(std::fabs(mid - 100) < 1, qPrintable(QString::number(mid)));
+        Image peakImg = frame(4000);
+        rollOffPq(peakImg, 4000, 1000);
+        QVERIFY(std::fabs(codeToNits(pq, peakImg.at(0, 0)[0]) - 1000) < 15);
+
+        // SDR: the master tone mapped into Rec.709; then shot A's trim (half the gain), not shot B's.
+        auto sdrAt = [&](FrameTime t) {
+            Image img = frame(100);
+            applyTrimPass(img, s, t, *findTrimTarget(s, "sdr"));
+            return img.at(0, 1)[0];
+        };
+        const float plain = sdrAt(10);
+        QVERIFY(plain > 0.6f && plain < 0.85f);  // 100 nits under BT.2408's 203-nit white
+        QVERIFY(edit::setTrim(s, a.id, "sdr", {{"gain", 0.5}}, 10).ok);
+        QVERIFY(!edit::setTrim(s, a.id, "sdr", {{"exposure", 1}}, 10).ok);
+        QVERIFY(!edit::setTrim(s, a.id, "nope", {{"gain", 1}}, 10).ok);
+        QVERIFY(std::fabs(sdrAt(10) - plain * 0.5f) < 0.01f);
+        QVERIFY(std::fabs(sdrAt(40) - plain) < 1e-4f);
+        // Saturation and lift do what they say on a coloured pixel.
+        {
+            Image img(1, 1);
+            float* px = img.at(0, 0);
+            px[0] = float(nitsToCode(pq, 150)), px[1] = px[2] = float(nitsToCode(pq, 20)), px[3] = 1;
+            Image grey = img;
+            QVERIFY(edit::setTrim(s, b.id, "sdr", {{"saturation", 0.0}}, 40).ok);
+            applyTrimPass(grey, s, 40, *findTrimTarget(s, "sdr"));
+            QVERIFY(std::fabs(grey.at(0, 0)[0] - grey.at(0, 0)[2]) < 1e-4f);
+        }
+        // Keyframed: set at the playhead once the control has keys.
+        Clip* ca = edit::clipById(s, a.id);
+        ca->trims["sdr"].params["gain"].addKey(0, 1.0);
+        ca->trims["sdr"].params["gain"].addKey(20, 0.5);
+        QVERIFY(std::fabs(sdrAt(0) - plain) < 0.01f);
+        QVERIFY(edit::setTrim(s, a.id, "sdr", {{"gain", 0.25}}, 10).ok);
+        QCOMPARE(edit::clipById(s, a.id)->trims.at("sdr").params.at("gain").keys.size(), size_t(3));
+        QVERIFY(std::fabs(sdrAt(10) - plain * 0.25f) < 0.01f);
+        // A split keeps each half's keys on the same frames of the cut.
+        QVERIFY(edit::razor(p, s, {TrackKind::Video, 0}, 15).ok);
+        QVERIFY(std::fabs(sdrAt(18) - plain * float(0.25 + 0.25 * 8 / 10)) < 0.01f);
+
+        // The program as a target shows it: the viewer's frame and the frame key.
+        RenderOptions o;
+        o.trimTarget = "sdr";
+        const Image shown = renderProgramFrame(p, s, 45, o);
+        QVERIFY(shown.at(16, 9)[0] > 0 && shown.at(16, 9)[0] < 1);
+        RenderOptions master;
+        QVERIFY(frameKey(p, s, 45, o) != frameKey(p, s, 45, master));
+
+        // Paste and Remove Attributes carry the trims; Reset and Copy too; a removed target takes its trims.
+        QVERIFY(edit::pasteAttributes(p, s, *edit::clipById(s, b.id), TrackKind::Video, {a.id}, edit::AttrTrims).ok);
+        QVERIFY(edit::clipById(s, a.id)->trims == edit::clipById(s, b.id)->trims);
+        QVERIFY(edit::removeAttributes(p, s, {a.id}, edit::AttrTrims).ok);
+        QVERIFY(edit::clipById(s, a.id)->trims.empty());
+        QVERIFY(edit::copyTrim(s, b.id, {a.id}, "sdr").ok);
+        QVERIFY(edit::clipById(s, a.id)->trims.count("sdr"));
+        QVERIFY(edit::resetTrims(s, {a.id}, "sdr").ok);
+        QVERIFY(!edit::clipById(s, a.id)->trims.count("sdr"));
+        QVERIFY(edit::setTrim(s, a.id, "hdr10-600", {{"highlights", 0.5}}, 5).ok);
+
+        // Saved and read back.
+        QTemporaryDir dir;
+        const std::string file = dir.path().toStdString() + "/trims.montage";
+        QVERIFY(saveProject(p, file));
+        Project back;
+        QVERIFY(loadProject(file, back));
+        QVERIFY(back.active()->trimTargets == s.trimTargets);
+        QVERIFY(edit::clipById(*back.active(), b.id)->trims == edit::clipById(s, b.id)->trims);
+
+        // Delivered: the SDR pass as Rec.709 PNG frames, darker where its trim says.
+        ExportSettings st;
+        st.path = dir.path().toStdString() + "/pass.png";
+        st.videoCodec = "png";
+        st.audioCodec = "none";
+        st.in = 40;
+        st.out = 41;
+        st.trimTarget = "sdr";
+        std::string err;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        const QStringList written = QDir(dir.path()).entryList({"pass_*.png"});
+        QCOMPARE(written.size(), 1);
+        const QImage pass(dir.path() + "/" + written.first());
+        QVERIFY(!pass.isNull());
+        const QColor c = pass.pixelColor(16, 9);
+        QVERIFY2(std::abs(c.red() - c.blue()) <= 2, "saturation 0: grey");
+        st.trimTarget = "nope";
+        QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err) && err.find("trim target") != std::string::npos);
+        st.trimTarget = "sdr";
+        st.videoCodec = "gif";
+        st.path = dir.path().toStdString() + "/pass.gif";
+        QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err));
+
+        // Pasting from a clip with no trims leaves the clips' own.
+        const Id ta = edit::clipById(s, a.id)->id;
+        const size_t had = edit::clipById(s, ta)->trims.size();
+        Clip plainClip = colorClip(p, 0, 0, 0, 0, 5);
+        QVERIFY(had > 0);
+        edit::pasteAttributes(p, s, plainClip, TrackKind::Video, {ta}, edit::AttrTrims);
+        QCOMPARE(edit::clipById(s, ta)->trims.size(), had);
+        // Keyframes made by setting with `keyframe`: the first keeps the value at the clip's start.
+        QVERIFY(edit::setTrim(s, b.id, "sdr", {{"lift", 0.2}}, 50, true).ok);
+        const Param& lift = edit::clipById(s, b.id)->trims.at("sdr").params.at("lift");
+        QCOMPARE(lift.keys.size(), size_t(2));
+        QCOMPARE(lift.at(0), 0.0);
+        QCOMPARE(lift.at(20), 0.2);
+
+        // A track matte's hidden source is not the shot: the clip it keys is.
+        {
+            Sequence m = s;
+            Clip under = colorClip(p, 1, 0, 0, 100, 10);
+            under.effects.push_back(makeEffect(p, "track_matte"));
+            Clip matte = colorClip(p, 1, 1, 1, 100, 10);
+            edit::overwrite(p, m, {TrackKind::Video, 0}, under);
+            edit::overwrite(p, m, {TrackKind::Video, 1}, matte);  // (the track above: its matte by default)
+            QVERIFY(hiddenMatteTracks(m, 105).at(1));
+            QCOMPARE(trimShot(m, 105)->id, under.id);
+        }
+
+        // An HLG master on a 300-nit PQ display: its highlights rolled off, not clipped (two levels stay two).
+        {
+            Sequence h = s;
+            h.colorSpace = "rec2100hlg";
+            const ColorSpace& hlg = *findColorSpace("rec2100hlg");
+            Image img(2, 1);
+            for (int i = 0; i < 2; ++i) {
+                float* px = img.at(i, 0);
+                px[0] = px[1] = px[2] = float(nitsToCode(hlg, i ? 1000 : 500));
+                px[3] = 1;
+            }
+            QVERIFY(edit::addTrimTarget(h, *std::find_if(trimTargetPresets().begin(), trimTargetPresets().end(),
+                                                         [](const TrimTarget& x) { return x.id == "hdr10-300"; })).ok);
+            applyTrimPass(img, h, 90, *findTrimTarget(h, "hdr10-300"));
+            const double lo = codeToNits(pq, img.at(0, 0)[0]), hi = codeToNits(pq, img.at(1, 0)[0]);
+            QVERIFY2(hi <= 301 && hi > lo + 10 && lo > 150, qPrintable(QStringLiteral("%1 %2").arg(lo).arg(hi)));
+        }
+
+        // Removing a target takes its trims away.
+        QVERIFY(edit::removeTrimTarget(s, "hdr10-600").ok);
+        QVERIFY(!edit::clipById(s, a.id)->trims.count("hdr10-600"));
+        QVERIFY(!edit::removeTrimTarget(s, "hdr10-600").ok);
     }
 
     void clipAnimationsRendered() {

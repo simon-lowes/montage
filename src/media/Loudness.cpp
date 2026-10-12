@@ -71,6 +71,8 @@ struct LoudnessMeter::Impl {
     KFilter k;
     int64_t step;
     std::vector<double> steps;  // mean square per 100 ms
+    std::vector<char> speech;   // per step: marked as speech
+    bool speechNow = false;
     double acc = 0;
     int64_t n = 0;
     double peak = 0;
@@ -123,6 +125,7 @@ void LoudnessMeter::addChannels(const float* data, int64_t frames, int channels,
         d.acc += sum;
         if (++d.n == d.step) {
             d.steps.push_back(d.acc / double(d.step));
+            d.speech.push_back(d.speechNow);
             d.acc = 0;
             d.n = 0;
             if (d.steps.size() >= 4) d.maxM = std::max(d.maxM, toLufs(d.window(4)));
@@ -131,10 +134,36 @@ void LoudnessMeter::addChannels(const float* data, int64_t frames, int channels,
     }
 }
 
+namespace {
+// BS.1770's two gates over 400 ms block mean squares: absolute at -70 LUFS, then relative 10 LU below the gated mean.
+LoudnessResult gated(const std::vector<double>& blocks, double peak) {
+    LoudnessResult r;
+    r.truePeakDb = peak > 0 ? 20.0 * std::log10(peak) : -96.0;
+    double sum = 0;
+    int cnt = 0;
+    for (double b : blocks)
+        if (toLufs(b) > -70.0) {
+            sum += b;
+            ++cnt;
+        }
+    if (cnt == 0) return r;
+    const double relGate = toLufs(sum / cnt) - 10.0;
+    double sum2 = 0;
+    int cnt2 = 0;
+    for (double b : blocks)
+        if (toLufs(b) > -70.0 && toLufs(b) > relGate) {
+            sum2 += b;
+            ++cnt2;
+        }
+    if (cnt2 == 0) return r;
+    r.integrated = toLufs(sum2 / cnt2);
+    r.valid = true;
+    return r;
+}
+}  // namespace
+
 LoudnessResult LoudnessMeter::result() const {
     const Impl& d = *d_;
-    LoudnessResult r;
-    r.truePeakDb = d.peak > 0 ? 20.0 * std::log10(d.peak) : -96.0;
     // Blocks are 400 ms with 75 % overlap.
     const std::vector<double>& steps = d.steps;
     std::vector<double> blocks;
@@ -144,28 +173,44 @@ LoudnessResult LoudnessMeter::result() const {
         for (double v : steps) s += v;
         blocks.push_back(s / double(steps.size()));
     }
-    auto lufs = [](double ms) { return ms > 0 ? -0.691 + 10.0 * std::log10(ms) : -200.0; };
-    // Absolute gate at -70 LUFS, then relative gate 10 LU below the gated mean.
+    return gated(blocks, d.peak);
+}
+
+void LoudnessMeter::setSpeech(bool on) { d_->speechNow = on; }
+
+void LoudnessMeter::markSpeech(size_t step, bool on) {
+    if (step < d_->speech.size()) d_->speech[step] = on;
+}
+
+size_t LoudnessMeter::steps() const { return d_->steps.size(); }
+
+double LoudnessMeter::momentaryAt(size_t i) const {
+    const auto& st = d_->steps;
+    if (i >= st.size()) return -200.0;
+    const size_t from = i >= 3 ? i - 3 : 0;
     double sum = 0;
-    int cnt = 0;
-    for (double b : blocks)
-        if (lufs(b) > -70.0) {
-            sum += b;
-            ++cnt;
+    for (size_t j = from; j <= i; ++j) sum += st[j];
+    return std::max(-200.0, toLufs(sum / double(i - from + 1)));
+}
+
+LoudnessResult LoudnessMeter::speechResult() const {
+    const Impl& d = *d_;
+    std::vector<double> blocks;
+    for (size_t i = 3; i < d.steps.size(); ++i)
+        if (d.speech[i] && d.speech[i - 1] && d.speech[i - 2] && d.speech[i - 3])
+            blocks.push_back((d.steps[i] + d.steps[i - 1] + d.steps[i - 2] + d.steps[i - 3]) / 4.0);
+    return gated(blocks, d.peak);
+}
+
+double LoudnessMeter::speechShare() const {
+    const Impl& d = *d_;
+    size_t sound = 0, speech = 0;
+    for (size_t i = 0; i < d.steps.size(); ++i)
+        if (toLufs(d.steps[i]) > -70.0) {
+            ++sound;
+            speech += d.speech[i] ? 1 : 0;
         }
-    if (cnt == 0) return r;
-    const double relGate = lufs(sum / cnt) - 10.0;
-    double sum2 = 0;
-    int cnt2 = 0;
-    for (double b : blocks)
-        if (lufs(b) > -70.0 && lufs(b) > relGate) {
-            sum2 += b;
-            ++cnt2;
-        }
-    if (cnt2 == 0) return r;
-    r.integrated = lufs(sum2 / cnt2);
-    r.valid = true;
-    return r;
+    return sound ? double(speech) / double(sound) : 0.0;
 }
 
 double LoudnessMeter::momentary() const { return std::max(-200.0, toLufs(d_->window(4))); }

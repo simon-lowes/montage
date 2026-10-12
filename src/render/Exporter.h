@@ -65,6 +65,9 @@ struct ExportSettings {
     // An HDR sequence delivered in SDR is tone mapped. HDR output is 10-bit,
     // tagged, and PQ carries HDR10 mastering and light-level metadata.
     std::string colorSpace;
+    // A trim pass (render/TrimPasses.h): the id of one of the sequence's targets, delivered in its space and peak (in
+    // place of colorSpace), each shot trimmed for it; "" = the master. Not for GIF or OpenEXR.
+    std::string trimTarget;
     // HDR10+ dynamic metadata (PQ exports, render/Hdr10Plus.h): each scene measured (with the sequence's analysis
     // while it still matches the cut, else before the render) and carried in HEVC and AV1 video on every frame; the
     // same goes beside the file as name.hdr10plus.json, for other codecs and for encoders and checks that read it.
@@ -74,6 +77,9 @@ struct ExportSettings {
     // the ceiling. 0 = off; e.g. -14 LUFS for streaming, -23 for EBU R128.
     double loudnessTarget = 0;
     double peakCeiling = -1;  // dBTP, when normalising
+    // The target is the dialogue's loudness (render/DialogueLoudness.h), as Netflix's -27 LKFS is: the mix is measured
+    // over its speech (over everything when speech is under 15 % of it).
+    bool dialogueGated = false;
     BurnIn burnIn;
     // A 5.1 or 7.1 sequence's audio is written with all its channels, or folded down to stereo.
     bool downmixStereo = false;

@@ -120,6 +120,9 @@
 #include "media/VisualSearch.h"
 #include "render/ClipAnalysis.h"
 #include "render/OGraf.h"
+#include "render/Gallery.h"
+#include "render/DialogueLoudness.h"
+#include "render/TrimPasses.h"
 #include "media/Segmenter.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
@@ -2873,6 +2876,8 @@ void McpServer::Impl::addTools() {
             "clipping":{"type":"boolean","default":true},
             "loudness_target":{"type":"number","description":"LUFS, e.g. -14 (streaming) or -23 (EBU R128); omitted = not checked"},
             "peak_ceiling":{"type":"number","default":-1,"description":"dBTP, checked with the loudness"},
+            "loudness_dialogue":{"type":"boolean","default":false,"description":"Check the dialogue's loudness (montage_dialogue_loudness), as Netflix does: -27 with peak_ceiling -2"},
+            "loudness_tolerance":{"type":"number","description":"LU either side of the target (default 1, 2 with loudness_dialogue)"},
             "spelling":{"type":"boolean","default":true},"title_language":{"type":"string","default":"en-US"},
             "sync":{"type":"boolean","default":true},"markers":{"type":"boolean","default":false}},"required":["project"]})json",
         false, [this](const QJsonObject& a) {
@@ -2889,6 +2894,8 @@ void McpServer::Impl::addTools() {
             q.clipping = a.value("clipping").toBool(true);
             q.loudnessTarget = a.value("loudness_target").toDouble(0);
             q.peakCeiling = a.value("peak_ceiling").toDouble(-1);
+            q.dialogueGated = a.value("loudness_dialogue").toBool(false);
+            q.loudnessTolerance = std::max(0.1, a.value("loudness_tolerance").toDouble(q.dialogueGated ? 2 : 1));
             q.spelling = a.value("spelling").toBool(true);
             q.titleLanguage = str(a, "title_language", "en-US").toStdString();
             q.sync = a.value("sync").toBool(true);
@@ -2902,6 +2909,37 @@ void McpServer::Impl::addTools() {
                 save(l);
             }
             return ok(issues.empty() ? QStringLiteral("No problems found.") : QStringLiteral("%1 problem(s):\n").arg(issues.size()) + text);
+        });
+
+    add("montage_dialogue_loudness", "Measure dialogue loudness",
+        "Measure the sequence's (or from..to's) loudness over its speech only, the \"Dialog LKFS\" Netflix delivers at "
+        "(-27 LKFS ±2, true peaks under -2 dBTP), beside the programme's BS.1770 loudness, its true peak and the share of "
+        "the sound that is speech (under 15 %, the programme figure is the one that counts: `value`). The speech is found "
+        "from the Dialogue clips (`gate` roles), transcribed words (transcripts) or by listening (classifier); auto takes "
+        "the first the sequence has. Montage's own gate: an estimate of Dolby's Dialogue Intelligence, which Netflix's QC runs.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
+            "to":{"type":["number","string"]},"gate":{"type":"string","enum":["auto","roles","transcripts","classifier"],"default":"auto"},
+            "surround":{"type":"boolean","default":false,"description":"Measure a surround sequence's own channels, not its stereo fold-down"}},
+            "required":["project"]})json",
+        true, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Sequence& s = l.seq();
+            DialogueLoudnessOptions o;
+            o.in = a.contains("from") ? timeArg(a.value("from"), s, "from") : 0;
+            o.out = a.contains("to") ? timeArg(a.value("to"), s, "to") : -1;
+            o.layout = a.value("surround").toBool(false);
+            if (!parseSpeechGate(str(a, "gate", "auto").toStdString(), o.gate))
+                throw ArgError{"\"gate\" is auto, roles, transcripts or classifier"};
+            std::string why;
+            const DialogueLoudness d = measureDialogueLoudness(l.project, s, o, [this](double f) { progress(f, "Measuring"); }, nullptr, &why);
+            if (!why.empty()) return fail(QString::fromStdString(why));
+            QJsonArray speech;
+            for (const auto& [from, to] : d.speech) speech.append(QJsonArray{from, to});
+            const QJsonObject r{{"valid", d.valid}, {"dialogue_lkfs", d.dialogue}, {"programme_lkfs", d.programme},
+                                {"true_peak_dbtp", d.truePeak}, {"speech_share", d.speechShare}, {"uses_programme", d.usesProgramme},
+                                {"value", d.value()}, {"gate", QString::fromLatin1(speechGateName(d.gate))}, {"estimate", true},
+                                {"speech_seconds", speech}, {"text", QString::fromStdString(describeDialogueLoudness(d))}};
+            return ok(json(r), r);
         });
 
     add("montage_export_markers", "Export markers",
@@ -6438,6 +6476,182 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Matched %1 clip(s) to the picture at %2").arg(n).arg(tc(at, s)), QJsonObject{{"matched", n}});
         });
 
+    add("montage_gallery", "Colour gallery stills",
+        "The colour gallery (Resolve's Gallery): stills of the cut, each with the grade of the clip it shows, kept in "
+        "albums beside the project (Gallery/<project>/<album>, a PNG and the grade as JSON). list gives the albums and "
+        "an album's stills; grab takes a still of the picture at `at` with the top clip's grade; apply puts a still's "
+        "grade (its colour effects and nodes) in place of the grade of `clips`, their other effects kept; rename, remove "
+        "and add_album tidy up. A still is named by its id or its label (1, 2...).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "action":{"type":"string","enum":["list","grab","apply","rename","remove","add_album"],"default":"list"},
+            "album":{"type":"string","default":"Stills"},
+            "still":{"type":"string","description":"apply, rename, remove: the still's id or label"},
+            "at":{"type":["number","string"],"description":"grab: timeline time (default the sequence's playhead)"},
+            "clips":{"type":"array","items":{"type":["number","string"]},"description":"apply: video clips' ids or names"},
+            "label":{"type":"string","description":"rename: its new label"},
+            "name":{"type":"string","description":"add_album: the album's name"}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const std::string folder = galleryFolder(l.path.toStdString());
+            const std::string album = str(a, "album", kDefaultAlbum).toStdString();
+            const QString action = str(a, "action", "list");
+            std::string err;
+            auto stillJson = [](const GalleryStill& g) {
+                return QJsonObject{{"id", QString::fromStdString(g.id)},           {"label", QString::fromStdString(g.label)},
+                                   {"picture", QString::fromStdString(g.picture)}, {"clip", QString::fromStdString(g.clip)},
+                                   {"sequence", QString::fromStdString(g.sequence)}, {"timecode", QString::fromStdString(g.timecode)},
+                                   {"created", QString::fromStdString(g.created)}, {"grade_effects", int(g.effects.size())},
+                                   {"grade_nodes", int(g.graph.nodes.size())}};
+            };
+            auto still = [&]() {
+                GalleryStill g;
+                if (!findStill(folder, album, need(a, "still").toStdString(), g))
+                    throw ArgError{QStringLiteral("No still \"%1\" in album \"%2\" (or several have that label: give its id)").arg(str(a, "still"), QString::fromStdString(album))};
+                return g;
+            };
+            if (action == "list") {
+                QJsonArray albums, stills;
+                for (const std::string& name : galleryAlbums(folder)) albums.append(QString::fromStdString(name));
+                for (const GalleryStill& g : galleryStills(folder, album)) stills.append(stillJson(g));
+                return ok(QStringLiteral("%1 still(s) in %2").arg(stills.size()).arg(QString::fromStdString(album)),
+                          QJsonObject{{"folder", QString::fromStdString(folder)}, {"albums", albums}, {"stills", stills}});
+            }
+            if (action == "add_album") {
+                if (!addAlbum(folder, need(a, "name").toStdString(), &err)) return fail(QString::fromStdString(err));
+                return ok(QStringLiteral("Added album %1").arg(str(a, "name")));
+            }
+            if (action == "grab") {
+                const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : s.playhead;
+                GalleryStill g;
+                if (!grabStill(l.project, s, at, folder, album, g, &err)) return fail(QString::fromStdString(err));
+                return ok(QStringLiteral("Grabbed still %1 of %2").arg(QString::fromStdString(g.label), QString::fromStdString(g.clip)), stillJson(g));
+            }
+            if (action == "rename") {
+                GalleryStill g = still();
+                if (!renameStill(folder, g, need(a, "label").toStdString(), &err))
+                    return fail(err.empty() ? QStringLiteral("Cannot rename the still") : QString::fromStdString(err));
+                return ok(QStringLiteral("Renamed"), stillJson(g));
+            }
+            if (action == "remove") {
+                if (!removeStill(folder, still())) return fail("Cannot remove the still");
+                return ok(QStringLiteral("Removed"));
+            }
+            if (action != "apply") throw ArgError{"\"action\" is list, grab, apply, rename, remove or add_album"};
+            const GalleryStill g = still();
+            std::vector<Id> clips;
+            for (const QJsonValue& v : a.value("clips").toArray()) clips.push_back(videoClipArg(l, QJsonObject{{"clip", v}}).id);
+            if (clips.empty()) throw ArgError{"\"clips\" is required"};
+            const auto r = edit::applyStillGrade(l.project, s, g, clips);
+            if (!r.ok) return fail(QString::fromStdString(r.error));
+            save(l);
+            return ok(QStringLiteral("Applied still %1's grade to %2 clip(s)").arg(QString::fromStdString(g.label)).arg(r.applied),
+                      QJsonObject{{"applied", double(r.applied)}});
+        });
+
+    add("montage_trim", "HDR and SDR trim passes",
+        "Trim passes (Resolve's MultiMaster Trim): the sequence graded once (its master, usually HDR) delivered to other "
+        "displays, each a trim target: a preset (sdr: Rec.709 100 nits; hdr10-1000, hdr10-600, hdr10-300: PQ rolled off "
+        "to that peak; hlg) or a space and peak of its own. Each shot (the top picture clip on screen) can be trimmed for "
+        "a target on its code values: lift (-0.5..0.5), gamma (-1..1), gain (0..2), saturation (0..2), highlights (a "
+        "roll-off, 0..1) and mid_detail (-1..1), keyframed with `keyframe` (or where a control has keys). list gives the targets and the "
+        "clips' trims; add_target, remove_target; set a clip's controls (at a timeline time, default the playhead); "
+        "reset clips' trims; copy one clip's trim to others. montage_render's trim_target delivers a target.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "action":{"type":"string","enum":["list","add_target","remove_target","set","reset","copy"],"default":"list"},
+            "target":{"type":"string","description":"A target's id; add_target: a preset (sdr, hdr10-1000, hdr10-600, hdr10-300, hlg) or omitted with color_space"},
+            "color_space":{"type":"string","description":"add_target: a display space (rec709, rec2100pq, rec2100hlg...)"},
+            "peak_nits":{"type":"number","description":"add_target: the display's peak (PQ)"},
+            "name":{"type":"string","description":"add_target: its name"},
+            "clip":{"type":["number","string"],"description":"set, copy: the clip (id or name)"},
+            "clips":{"type":"array","items":{"type":["number","string"]},"description":"reset, copy: clips (ids or names)"},
+            "values":{"type":"object","description":"set: controls and their values, e.g. {\"gain\":0.9,\"highlights\":0.4}"},
+            "at":{"type":["number","string"],"description":"set: timeline time a keyframed control is set at (default the playhead)"},
+            "keyframe":{"type":"boolean","default":false,"description":"set: add keyframes at `at` (the first also keeping the control's value at the clip's start)"}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const QString action = str(a, "action", "list");
+            auto done = [&](edit::Result r, const QString& said) {
+                if (!r.ok) return fail(QString::fromStdString(r.error));
+                save(l);
+                return ok(said);
+            };
+            auto clipsArg = [&] {
+                std::vector<Id> ids;
+                for (const QJsonValue& v : a.value("clips").toArray()) ids.push_back(videoClipArg(l, QJsonObject{{"clip", v}}).id);
+                if (ids.empty()) throw ArgError{"\"clips\" is required"};
+                return ids;
+            };
+            if (action == "list") {
+                QJsonArray targets, presets, trims;
+                for (const TrimTarget& tt : s.trimTargets)
+                    targets.append(QJsonObject{{"id", QString::fromStdString(tt.id)}, {"name", QString::fromStdString(tt.name)},
+                                               {"color_space", QString::fromStdString(tt.colorSpace)}, {"peak_nits", trimTargetPeak(s, tt.id)}});
+                for (const TrimTarget& tt : trimTargetPresets()) presets.append(QString::fromStdString(tt.id));
+                for (const Track& tr : s.videoTracks)
+                    for (const Clip& c : tr.clips)
+                        for (const auto& [target, e] : c.trims) {
+                            QJsonObject values;
+                            for (const TrimControl& k : trimControls()) {
+                                const auto it = e.params.find(k.name);
+                                if (it == e.params.end()) continue;
+                                if (it->second.animated()) values[k.name] = QStringLiteral("keyframed");
+                                else if (std::fabs(it->second.value - k.def) > 1e-9) values[k.name] = it->second.value;
+                            }
+                            trims.append(QJsonObject{{"clip", double(c.id)}, {"name", QString::fromStdString(c.name)},
+                                                     {"target", QString::fromStdString(target)}, {"values", values}});
+                        }
+                return ok(QStringLiteral("%1 trim target(s), %2 trim(s)").arg(targets.size()).arg(trims.size()),
+                          QJsonObject{{"master", QString::fromStdString(s.colorSpace)}, {"master_peak_nits", s.hdrPeakNits},
+                                      {"targets", targets}, {"presets", presets}, {"trims", trims}});
+            }
+            if (action == "add_target") {
+                TrimTarget tt;
+                const QString preset = str(a, "target");
+                if (!preset.isEmpty() && !a.contains("color_space")) {
+                    const auto& all = trimTargetPresets();
+                    const auto it = std::find_if(all.begin(), all.end(), [&](const TrimTarget& x) { return x.id == preset.toStdString(); });
+                    if (it == all.end()) throw ArgError{"\"target\" is a preset: sdr, hdr10-1000, hdr10-600, hdr10-300 or hlg"};
+                    tt = *it;
+                } else {
+                    tt.id = preset.toStdString();
+                    tt.colorSpace = need(a, "color_space").toStdString();
+                    tt.peakNits = a.value("peak_nits").toDouble(1000);
+                }
+                if (a.contains("name")) tt.name = str(a, "name").toStdString();
+                const size_t before = s.trimTargets.size();
+                const auto r = edit::addTrimTarget(s, tt);
+                if (!r.ok) return fail(QString::fromStdString(r.error));
+                save(l);
+                const TrimTarget& added = s.trimTargets.at(before);
+                return ok(QStringLiteral("Added trim target %1").arg(QString::fromStdString(added.name)),
+                          QJsonObject{{"id", QString::fromStdString(added.id)}});
+            }
+            if (action == "remove_target") return done(edit::removeTrimTarget(s, need(a, "target").toStdString()), QStringLiteral("Removed"));
+            if (action == "set") {
+                const Clip& c = videoClipArg(l, a);
+                std::map<std::string, double> values;
+                const QJsonObject v = a.value("values").toObject();
+                for (auto it = v.begin(); it != v.end(); ++it) {
+                    if (!it.value().isDouble()) throw ArgError{QStringLiteral("\"%1\" must be a number").arg(it.key())};
+                    values[it.key().toStdString()] = it.value().toDouble();
+                }
+                if (values.empty()) throw ArgError{"\"values\" is required"};
+                const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : s.playhead;
+                return done(edit::setTrim(s, c.id, need(a, "target").toStdString(), values, at, a.value("keyframe").toBool()),
+                            QStringLiteral("Trimmed %1").arg(QString::fromStdString(c.name)));
+            }
+            if (action == "reset") return done(edit::resetTrims(s, clipsArg(), str(a, "target").toStdString()), QStringLiteral("Reset"));
+            if (action == "copy") {
+                const Clip& c = videoClipArg(l, a);
+                return done(edit::copyTrim(s, c.id, clipsArg(), need(a, "target").toStdString()), QStringLiteral("Copied"));
+            }
+            throw ArgError{"\"action\" is list, add_target, remove_target, set, reset or copy"};
+        });
+
     add("montage_match_chart", "Match a colour chart",
         "Colour-chart calibration (Resolve's Color Match): finds an X-Rite ColorChecker Classic (24 patches) in a clip's "
         "picture at `at` (or its middle frame), upright, upside down or on its side, or uses `corners` (the patch area's "
@@ -7035,6 +7249,7 @@ void McpServer::Impl::addTools() {
             "preset":{"type":"string"},"in":{"type":["number","string"]},"out":{"type":["number","string"]},
             "loudness_lufs":{"type":"number","description":"Normalise the mix to this loudness, e.g. -14 (streaming) or -23 (EBU R128)"},
             "peak_ceiling":{"type":"number","default":-1,"description":"True peak ceiling (dBTP) when normalising"},
+            "loudness_dialogue":{"type":"boolean","default":false,"description":"loudness_lufs is the dialogue's (Netflix: -27, peak_ceiling -2), measured as montage_dialogue_loudness does"},
             "burn_in":{"type":"object","description":"Overlays for a review copy","properties":{
                 "timecode":{"type":"boolean"},"clip_name":{"type":"boolean"},"text":{"type":"string"},
                 "corner":{"type":"string","enum":["top_left","top_centre","top_right","bottom_left","bottom_centre","bottom_right"],"default":"top_left"},
@@ -7046,6 +7261,7 @@ void McpServer::Impl::addTools() {
             "stems":{"type":"string","enum":["none","tracks","buses","roles"],"default":"none",
                 "description":"Also write 24-bit WAV stems beside the output, one per audio track, per bus (plus Main) or per audio role"},
             "captions":{"type":"string","enum":["none","burn","embed","both"],"default":"none","description":"The visible caption track, burned into the picture and/or embedded as a subtitle stream"},
+            "trim_target":{"type":"string","description":"A trim pass (montage_trim): deliver that target of the sequence (its space and peak, each shot's trim) instead of the master"},
             "hdr10plus":{"type":"boolean","default":false,"description":"PQ exports: HDR10+ dynamic metadata, scene by scene, in HEVC and AV1 video and as name.hdr10plus.json beside the file (measured first unless montage_measure_hdr's analysis still matches the cut)"},
             "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as CEA-608 closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask)"},
             "all_captions":{"type":"boolean","default":false,"description":"With embed: every caption track as its own subtitle stream, language tagged"},
@@ -7091,6 +7307,7 @@ void McpServer::Impl::addTools() {
                 st.loudnessTarget = a.value("loudness_lufs").toDouble();
                 if (st.loudnessTarget >= 0 || st.loudnessTarget < -70) throw ArgError{"\"loudness_lufs\" must be between -70 and 0"};
                 st.peakCeiling = std::min(0.0, a.value("peak_ceiling").toDouble(-1));
+                st.dialogueGated = a.value("loudness_dialogue").toBool(false);
             }
             if (a.value("burn_in").isObject()) {
                 const QJsonObject b = a.value("burn_in").toObject();
@@ -7118,6 +7335,9 @@ void McpServer::Impl::addTools() {
             st.burnInCaptions = cap == "burn" || cap == "both";
             st.cea608 = a.value("cea608").toBool();
             st.hdr10Plus = a.value("hdr10plus").toBool();
+            st.trimTarget = str(a, "trim_target").toStdString();
+            if (!st.trimTarget.empty() && !findTrimTarget(s, st.trimTarget))
+                throw ArgError{QStringLiteral("The sequence has no trim target \"%1\" (montage_trim lists them)").arg(str(a, "trim_target"))};
             st.embedCaptions = cap == "embed" || cap == "both";
             if (st.embedCaptions && a.value("all_captions").toBool())
                 for (const CaptionTrack& t : s.captionTracks)

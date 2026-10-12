@@ -58,6 +58,9 @@ public:
     // difference (render/Stereo.h). Other sequences are not affected.
     void setStereoView(StereoView v);
     StereoView stereoView() const { return stereoView_; }
+    // The trim pass shown (render/TrimPasses.h: one of the sequence's targets), "" = the master.
+    const std::string& trimTarget() const { return trimTarget_; }
+    void setTrimTarget(const std::string& id);
     // Also render HDR sequences as light for the HDR viewer (hdrFrameRendered), beside their SDR pictures.
     void setHdrOutput(bool on);
     bool hdrOutput() const { return hdrOutput_; }
@@ -119,6 +122,10 @@ signals:
     void audioLevels(float masterL, float masterR, const QVector<float>& trackPeaks);
     // Loudness of what is heard (LUFS, LU and dBTP; -200 for nothing yet), ten times a second.
     void loudness(double momentary, double shortTerm, double integrated, double range, double truePeak);
+    // The same measured over speech only (render/DialogueLoudness.h, as the sequence marks it: whole Dialogue clips,
+    // pauses and all, else transcribed words; -200 for none yet) and the share of the sound that is speech (-1: the
+    // sequence marks none). An approximation: exports and Quality Check narrow Dialogue clips to where they sound.
+    void dialogueLoudness(double integrated, double speechShare);
     void playingChanged(bool playing);
 
 private slots:
@@ -144,6 +151,7 @@ private:
     bool useProxies_ = false;
     bool showCaptions_ = false;
     StereoView stereoView_ = StereoView::Left;
+    std::string trimTarget_;
     bool hdrOutput_ = false;
     double speed_ = 0;
     bool loop_ = false;

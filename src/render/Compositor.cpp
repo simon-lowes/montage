@@ -1,4 +1,5 @@
 #include "Compositor.h"
+#include "TrimPasses.h"
 #include "OGraf.h"
 #include "Ofx.h"
 
@@ -1064,6 +1065,15 @@ void applyTrackMatte(Image& layer, const Image& matte, bool luma, bool reverse) 
 
 }  // namespace
 
+std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t) {
+    std::vector<bool> hidden(seq.videoTracks.size(), false);
+    for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti)
+        if (const Clip* c = clipAt(seq.videoTracks[ti], t))
+            if (const Effect* e = trackMatteOf(*c); e && e->p("hide", t - c->start, 1) > 0.5)
+                if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
+    return hidden;
+}
+
 Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& opts) {
     const WorkingSpaceScope working(&sequenceColorSpace(seq));  // effects that work in light know whose
     const int solo = opts.soloVideoTrack;
@@ -1071,12 +1081,7 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
     o.soloVideoTrack = -1;
     int W = std::max(1, int(std::lround(seq.width * o.scale))), H = std::max(1, int(std::lround(seq.height * o.scale)));
     Image canvas(W, H);
-    // Tracks a Track Matte Key is using now and hiding (the matte is not seen itself).
-    std::vector<bool> hiddenMatte(seq.videoTracks.size(), false);
-    for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti)
-        if (const Clip* c = clipAt(seq.videoTracks[ti], t))
-            if (const Effect* e = trackMatteOf(*c); e && e->p("hide", t - c->start, 1) > 0.5)
-                if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hiddenMatte[size_t(m)] = true;
+    const std::vector<bool> hiddenMatte = hiddenMatteTracks(seq, t);
     bool canvasEmpty = true;  // nothing drawn yet: the first normal layer can be moved in
     auto composite = [&](Image&& layer, const std::string& mode) {
         if (layer.empty()) return;
@@ -1155,13 +1160,17 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
 }
 
 Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
+    // A trim pass: each eye as its target shows it, captions over that (as exports burn them in).
+    const TrimTarget* trim = o.depth == 0 && !o.trimTarget.empty() ? findTrimTarget(seq, o.trimTarget) : nullptr;
+    const std::string shown = trim ? trim->id : std::string();
     auto eyeFrame = [&](int eye) {
         RenderOptions e = o;
         e.eye = eye;
         Image img = renderSequenceFrame(p, seq, t, e);
         flattenOver(img, 0, 0, 0);
+        if (trim) applyTrimPass(img, seq, t, *trim);
         if (o.captions && o.depth == 0)
-            if (const CaptionTrack* track = captionTrackFor(seq)) drawCaption(img, *track, t, &sequenceColorSpace(seq));
+            if (const CaptionTrack* track = captionTrackFor(seq)) drawCaption(img, *track, t, &trimTargetSpace(seq, shown));
         return img;
     };
     Image img;
@@ -1170,7 +1179,7 @@ Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, con
     else
         img = eyeFrame(seq.stereo3d && o.depth == 0 ? 0 : o.eye);
     if (!o.displaySpace.empty() && o.depth == 0)
-        if (const ColorSpace* d = findColorSpace(o.displaySpace)) convertColor(img, sequenceColorSpace(seq), *d, seq.hdrPeakNits);
+        if (const ColorSpace* d = findColorSpace(o.displaySpace)) convertColor(img, trimTargetSpace(seq, shown), *d, trimTargetPeak(seq, shown));
     return img;
 }
 

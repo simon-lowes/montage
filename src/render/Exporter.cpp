@@ -1,4 +1,5 @@
 #include "Exporter.h"
+#include "TrimPasses.h"
 #include "media/SpatialAudio.h"
 #include "core/AudioDescription.h"
 #include "core/Provenance.h"
@@ -32,6 +33,7 @@
 #include "Processing.h"
 #include "media/HwAccel.h"
 #include "media/Loudness.h"
+#include "render/DialogueLoudness.h"
 #include "media/SuperScale.h"
 
 extern "C" {
@@ -737,6 +739,11 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     const bool wantAudio = s.audioCodec != "none" && !s.audioCodec.empty();
     if (!wantVideo && !wantAudio) return fail("No video or audio codec selected");
 
+    // A trim pass: the target's pictures, in its space.
+    const TrimTarget* trim = s.trimTarget.empty() ? nullptr : findTrimTarget(seq, s.trimTarget);
+    if (!s.trimTarget.empty() && !trim) return fail("The sequence has no trim target " + s.trimTarget);
+    if (trim && wantVideo && (s.videoCodec == "gif" || s.videoCodec == "exr"))
+        return fail("A trim pass is delivered as video or PNG, TIFF or DPX frames, not " + s.videoCodec);
     if (s.videoCodec == "gif") return exportGif(p, seq, s, in, out, progress, cancel, error, opened);
     // Image sequences: numbered files, no sound.
     const bool imageSequence = s.videoCodec == "png" || s.videoCodec == "tiff" || s.videoCodec == "exr" || s.videoCodec == "dpx";
@@ -772,8 +779,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     if (down == 2) H += 2 * ((H / 2) & 1);
     const int sr = s.sampleRate > 0 ? s.sampleRate : seq.sampleRate;
 
-    const ColorSpace& seqSpace = sequenceColorSpace(seq);
-    const ColorSpace* chosen = findColorSpace(s.colorSpace);
+    // (A trim pass's pictures are in its target's space and delivered so.)
+    const ColorSpace& seqSpace = trim ? trimTargetSpace(seq, trim->id) : sequenceColorSpace(seq);
+    const ColorSpace* chosen = trim ? &seqSpace : findColorSpace(s.colorSpace);
     // OpenEXR holds scene-linear light: Linear Rec.709 unless a linear (or any scene-referred) space is asked for.
     // DPX can hold camera log too (a VFX pull of log footage stays log).
     const bool logOk = s.videoCodec == "dpx";
@@ -781,9 +789,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                                  : chosen && (logOk || !chosen->sceneReferred) ? *chosen
                                                                                : seqSpace;
     const bool pq = outSpace.transfer == Transfer::Pq;
-    const double peakNits = std::clamp(seq.hdrPeakNits, 100.0, 10000.0);
-    // Light levels stated up front: the sequence's analysed ones, else the mastering peak (and an average under it).
-    const bool analysed = seq.hdrMaxCll > 0;
+    const double peakNits = std::clamp(trim ? trimTargetPeak(seq, trim->id) : seq.hdrPeakNits, 100.0, 10000.0);
+    // Light levels stated up front: the sequence's analysed ones (the master's), else the mastering peak (and an average
+    // under it).
+    const bool analysed = seq.hdrMaxCll > 0 && !trim;
     const int maxCll = analysed ? int(std::clamp(std::lround(seq.hdrMaxCll), 1L, 10000L)) : int(std::lround(peakNits));
     const int maxFall = analysed ? int(std::clamp(std::lround(seq.hdrMaxFall), 1L, long(maxCll))) : int(std::lround(std::min(peakNits, 400.0)));
     // What is rendered is measured as it goes (HDR only): the file gets those where its format allows.
@@ -1235,20 +1244,35 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     std::unique_ptr<PeakLimiter> limiter;
     int64_t limiterDelay = 0;
     if (wantAudio && s.loudnessTarget < 0) {
-        AudioMixer meterMixer;
-        meterMixer.setTrackMask(s.audioTracks);
-        LoudnessMeter meter(mixRate);
         const int64_t end = int64_t(std::llround(double(out) * mixRate / seq.fpsValue()));
         std::vector<float> chunk(size_t(8192) * size_t(nch));
-        for (int64_t pos = audioCursor; pos < end;) {
-            if (cancel && cancel->load()) return fail("Cancelled");
-            const int n = int(std::min<int64_t>(8192, end - pos));
-            mixBlock(meterMixer, pos, n, chunk.data());
-            meter.addChannels(chunk.data(), n, nch, weights.data());
-            pos += n;
+        // The dialogue's loudness (Netflix's), or everything's.
+        auto dialogueGain = [&](const Sequence& sq, const std::vector<bool>& tracks, double& gain) {
+            DialogueLoudnessOptions o;
+            o.tracks = tracks;
+            o.in = in;
+            o.out = out;
+            o.layout = nch > 2;
+            const DialogueLoudness d = measureDialogueLoudness(p, sq, o, {}, cancel);
+            if (d.valid) gain = std::pow(10.0, (s.loudnessTarget - d.value()) / 20.0);
+            return !(cancel && cancel->load());
+        };
+        if (s.dialogueGated) {
+            if (!dialogueGain(mixSeq, s.audioTracks, normGain)) return fail("Cancelled");
+        } else {
+            AudioMixer meterMixer;
+            meterMixer.setTrackMask(s.audioTracks);
+            LoudnessMeter meter(mixRate);
+            for (int64_t pos = audioCursor; pos < end;) {
+                if (cancel && cancel->load()) return fail("Cancelled");
+                const int n = int(std::min<int64_t>(8192, end - pos));
+                mixBlock(meterMixer, pos, n, chunk.data());
+                meter.addChannels(chunk.data(), n, nch, weights.data());
+                pos += n;
+            }
+            const LoudnessResult measured = meter.result();
+            if (measured.valid) normGain = std::pow(10.0, (s.loudnessTarget - measured.integrated) / 20.0);
         }
-        const LoudnessResult measured = meter.result();
-        if (measured.valid) normGain = std::pow(10.0, (s.loudnessTarget - measured.integrated) / 20.0);
         // A little under the ceiling: the limiter sees samples, and true peaks fall between them.
         limiter = std::make_unique<PeakLimiter>(mixRate, s.peakCeiling - 0.5, 5, 80, nch);
         limiterDelay = limiter->latency();
@@ -1261,19 +1285,23 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         // Streams of the whole programme (the described one) likewise, each measured on its own.
         for (auto& e : extras) {
             if (!e->normalise) continue;
-            AudioMixer m;
-            m.setTrackMask(e->tracks);
-            LoudnessMeter em(mixRate);
-            for (int64_t pos = e->cursor; pos < end;) {
-                if (cancel && cancel->load()) return fail("Cancelled");
-                const int n = int(std::min<int64_t>(8192, end - pos));
-                if (nch > 2) m.mixLayout(p, e->seq, pos, n, chunk.data());
-                else m.mix(p, e->seq, pos, n, chunk.data());
-                em.addChannels(chunk.data(), n, nch, weights.data());
-                pos += n;
+            if (s.dialogueGated) {
+                if (!dialogueGain(e->seq, e->tracks, e->gain)) return fail("Cancelled");
+            } else {
+                AudioMixer m;
+                m.setTrackMask(e->tracks);
+                LoudnessMeter em(mixRate);
+                for (int64_t pos = e->cursor; pos < end;) {
+                    if (cancel && cancel->load()) return fail("Cancelled");
+                    const int n = int(std::min<int64_t>(8192, end - pos));
+                    if (nch > 2) m.mixLayout(p, e->seq, pos, n, chunk.data());
+                    else m.mix(p, e->seq, pos, n, chunk.data());
+                    em.addChannels(chunk.data(), n, nch, weights.data());
+                    pos += n;
+                }
+                const LoudnessResult r = em.result();
+                if (r.valid) e->gain = std::pow(10.0, (s.loudnessTarget - r.integrated) / 20.0);
             }
-            const LoudnessResult r = em.result();
-            if (r.valid) e->gain = std::pow(10.0, (s.loudnessTarget - r.integrated) / 20.0);
             e->limiter = std::make_unique<PeakLimiter>(mixRate, s.peakCeiling - 0.5, 5, 80, nch);
             e->delay = e->limiter->latency();
             std::vector<float> ep(size_t(e->delay) * size_t(nch));
@@ -1384,7 +1412,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     // Smart rendering: only where nothing would change the source's pictures for the whole export.
     std::unique_ptr<SmartRenderer> smart;
     if (wantVideo && s.smartRender && o.vctx && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height && !seq.stereo3d &&
-        !s.useProxies && !s.burnInCaptions && !s.cea608 && !s.burnIn.any() && outSpace.id == seqSpace.id)
+        !s.useProxies && !s.burnInCaptions && !s.cea608 && !s.burnIn.any() && outSpace.id == seqSpace.id && !trim)
         smart = std::make_unique<SmartRenderer>(p, seq, seqSpace, o.vctx, o.vst, s.alpha, s.profile);
     // CEA-608 captions in the video: the pairs due in each frame's span of the 29.97 Hz line-21 clock, padding between.
     std::vector<Cc608Pair> cc608;
@@ -1439,11 +1467,13 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             Image left = renderProgramFrame(p, seq, f, eye);
             eye.stereoView = StereoView::Right;
             Image right = renderProgramFrame(p, seq, f, eye);
+            if (trim) applyTrimPass(left, seq, f, *trim), applyTrimPass(right, seq, f, *trim);
             burn(left);
             burn(right);
             img = combineStereo(left, right, stereoView);
         } else {
             img = s.alpha && !seq.stereo3d ? renderSequenceFrame(p, seq, f, ro) : renderProgramFrame(p, seq, f, ro);
+            if (trim) applyTrimPass(img, seq, f, *trim);
             burn(img);
         }
         convertColor(img, seqSpace, outSpace, peakNits);
@@ -1453,7 +1483,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     // the cut (not when burn-ins or packed eyes change the picture from what was analysed); the rest is measured now on
     // the frames as delivered, as the first part of the progress.
     if (wantHdr10) {
-        const bool reuse = !burns && !packedEyes;
+        const bool reuse = !burns && !packedEyes && !trim;  // (the analysis is the master's)
         FrameTime toMeasure = 0;
         renderFrom = 0.3;
         std::string e;
@@ -1643,7 +1673,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
 std::string hdr10PlusCarriage(const Sequence& seq, const ExportSettings& s) {
     const std::string& c = s.videoCodec;
     if (c.empty() || c == "none" || c == "gif" || c == "exr") return {};
-    const ColorSpace* chosen = findColorSpace(s.colorSpace);
+    const ColorSpace* chosen = findTrimTarget(seq, s.trimTarget) ? &trimTargetSpace(seq, s.trimTarget) : findColorSpace(s.colorSpace);
     const ColorSpace& out = chosen && !chosen->sceneReferred ? *chosen : sequenceColorSpace(seq);
     if (out.transfer != Transfer::Pq) return {};
     const bool video = c == "libx265" || c == "hw_hevc" || c.rfind("hevc_", 0) == 0 || c == "libsvtav1" || c == "libaom-av1" ||

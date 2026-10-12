@@ -46,6 +46,19 @@ public:
     double seconds() const;
     void reset();
 
+    // Dialogue gating (render/DialogueLoudness.h): each 100 ms step measured is speech or not. Steps finished from
+    // now on take `on` (false at first); markSpeech changes one after the fact.
+    void setSpeech(bool on);
+    void markSpeech(size_t step, bool on);
+    size_t steps() const;  // the 100 ms steps finished so far
+    // The loudness of the 400 ms ending with step `i` (LUFS, -200 for silence or before it).
+    double momentaryAt(size_t i) const;
+    // BS.1770 over only the 400 ms blocks that are speech throughout (all four of their steps); the true peak is the
+    // whole programme's. Not valid without speech.
+    LoudnessResult speechResult() const;
+    // The share of the sound (steps above -70 LUFS) marked as speech, 0..1.
+    double speechShare() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> d_;

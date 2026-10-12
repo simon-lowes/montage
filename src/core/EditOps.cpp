@@ -112,6 +112,7 @@ void shiftKeyframes(Clip& c, FrameTime delta) {
     shiftParamKeys(c.generator, delta);
     shiftParamKeys(c.timing, delta);
     for (auto& e : c.effects) shiftParamKeys(e, delta);
+    for (auto& [target, e] : c.trims) shiftParamKeys(e, delta);
 }
 
 Clip subClip(const Clip& c, FrameTime from, FrameTime to) {
@@ -1592,6 +1593,11 @@ Result pasteAttributes(Project& p, Sequence& s, const Clip& from, TrackKind from
                 if (n.shared && !findSharedNode(s, n.shared)) n.shared = 0;  // (a shared node not to be had: empty)
             changed = true;
         }
+        if (video && (what & AttrTrims) && fromKind == TrackKind::Video && !from.trims.empty()) {
+            // (keyed to the source's start: they play the same way on a clip as long)
+            c.trims = from.trims;
+            changed = true;
+        }
         if (changed) res.created.push_back(id);
     }
     if (res.created.empty()) return Result::fail("Nothing to paste onto");
@@ -1632,6 +1638,7 @@ Result removeAttributes(Project& p, Sequence& s, const std::vector<Id>& ids, uns
             c.grade = {};
         }
         if (what & AttrEffects) std::erase_if(c.effects, [&](const Effect& e) { return e.node == 0 || c.grade.empty(); });
+        if (video && (what & AttrTrims)) c.trims.clear();
         ++res.applied;
     }
     if (res.applied == 0) return Result::fail("No clips to change");

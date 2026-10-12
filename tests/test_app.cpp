@@ -3,6 +3,7 @@
 #include <QtTest>
 #include <QPointer>
 #include <QSignalSpy>
+#include <QStandardPaths>
 #include <QPlainTextEdit>
 
 #include <QAbstractScrollArea>
@@ -83,6 +84,10 @@
 #include "SpectralRepairDialog.h"
 #include "automation/McpServer.h"
 #include "render/OGraf.h"
+#include "GalleryPanel.h"
+#include "TrimPanel.h"
+#include "render/Gallery.h"
+#include "ClipStripPanel.h"
 #include "automation/PythonHost.h"
 #include "automation/ScriptHost.h"
 #include "ScriptConsole.h"
@@ -2455,7 +2460,7 @@ private slots:
         state()->setSelection({clip}, false);
         QApplication::processEvents();
         QDoubleSpinBox* gain = nullptr;
-        for (auto* sp : win_->findChildren<QDoubleSpinBox*>())
+        for (auto* sp : win_->findChild<InspectorWidget*>()->findChildren<QDoubleSpinBox*>())
             if (sp->maximum() == 2 && sp->minimum() == 0 && sp->isVisibleTo(win_.get())) gain = sp;
         QVERIFY(gain);
         gain->setValue(0.5);
@@ -7834,7 +7839,22 @@ const auto seq = [this] { return state()->sequence(); };
         readout->findChild<QToolButton*>("loudnessReset")->click();
         QCOMPARE(reset.count(), 1);
         QCOMPARE(readout->text("M"), QString("—"));
+        // Netflix: the dialogue's loudness counts, within 2 LU, while speech is 15 % of the sound or more.
+        readout->setTargetIndex(4);
+        QVERIFY(readout->dialogueTarget());
+        QCOMPARE(readout->target(), -27.0);
+        readout->setReading(-20, -20, -20, 6, -3);
+        readout->setDialogue(-28.5, 0.4);
+        QCOMPARE(readout->text("D"), QString("-28.5"));
+        QCOMPARE(readout->text("SP"), QString("40 %"));
+        QCOMPARE(readout->integratedStatus(), 0);
+        readout->setDialogue(-28.5, 0.1);  // too little speech: the programme's -20 counts
+        QCOMPARE(readout->integratedStatus(), 2);
+        readout->setDialogue(-200, -1);  // nothing marked as speech
+        QCOMPARE(readout->text("D"), QString("—"));
+        QCOMPARE(readout->text("SP"), QString("—"));
         readout->setTargetIndex(0);
+        QVERIFY(!readout->dialogueTarget());
     }
 
     void renderInToOutAndTheRenderBar() {
@@ -10095,10 +10115,13 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(color->itemText(0).contains("HLG"));
         // Loudness targets for delivery, as (LUFS, dBTP).
         auto* loudness = ed.findChild<QComboBox*>("exportLoudness");
-        QVERIFY(loudness && loudness->count() == 5);
+        QVERIFY(loudness && loudness->count() == 6);
         QCOMPARE(loudness->itemData(0).toPointF(), QPointF(0, 0));
         QCOMPARE(loudness->itemData(1).toPointF(), QPointF(-14, -1));
         QCOMPARE(loudness->itemData(3).toPointF(), QPointF(-23, -1));
+        // Netflix's is measured on the dialogue.
+        QCOMPARE(loudness->itemData(5).toPointF(), QPointF(-27, -2));
+        QVERIFY(loudness->itemData(5, Qt::UserRole + 1).toBool() && !loudness->itemData(4, Qt::UserRole + 1).toBool());
         state()->newProject();
         win_->activateWindow();  // the context menu took the focus
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));
@@ -10176,6 +10199,157 @@ const auto seq = [this] { return state()->sequence(); };
         state()->undo();
         QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(1));
         state()->newProject();
+    }
+
+    void trimPassesPanel() {
+        // The demo as an HDR master: an SDR target added in the Trims panel, which the Program monitor then shows.
+        const QString path = dir_.path() + "/trims-demo.montage";
+        Project demo = demoProject();
+        demo.active()->colorSpace = "rec2100pq";
+        QVERIFY(saveProject(demo, path.toStdString()));
+        QVERIFY(win_->openProject(path));
+        auto* trims = win_->findChild<TrimPanel*>();
+        QVERIFY(trims);
+        PlaybackController* program = nullptr;
+        for (auto* mp : win_->findChildren<MonitorPanel*>())
+            if (mp->mode() == MonitorPanel::Mode::Program) program = mp->controller();
+        QVERIFY(program);
+        QCOMPARE(trims->shown(), QString());
+        QVERIFY(!win_->findChild<QDoubleSpinBox*>("trim_gain")->isEnabled());
+        QVERIFY(trims->addTarget("sdr"));
+        QCOMPARE(trims->shown(), QString("sdr"));
+        QCOMPARE(program->trimTarget(), std::string("sdr"));
+
+        // The shot at the playhead (Red; the title over it is not one) trimmed: one undo step for a run of changes.
+        const Id red = clipNamed(*state()->sequence(), "Red")->id, blue = clipNamed(*state()->sequence(), "Blue")->id;
+        state()->setPlayhead(20);
+        QCOMPARE(trims->shot(), red);
+        auto* gain = win_->findChild<QDoubleSpinBox*>("trim_gain");
+        QVERIFY(gain->isEnabled());
+        gain->setValue(0.8);
+        gain->setValue(0.6);
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->trims.at("sdr").p("gain", 0), 0.6);
+        state()->undo();
+        QVERIFY(edit::clipById(*state()->sequence(), red)->trims.empty());
+        state()->redo();
+        QCOMPARE(gain->value(), 0.6);
+        // Keyframe on: the change is a key at the playhead.
+        auto* key = win_->findChild<QToolButton*>("trimKeyframe");
+        QVERIFY(key && !gain->keyboardTracking());
+        key->setChecked(true);
+        win_->findChild<QDoubleSpinBox*>("trim_lift")->setValue(0.1);
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->trims.at("sdr").params.at("lift").keys.size(), size_t(2));
+        key->setChecked(false);
+        state()->setSelection({blue}, false);
+        QVERIFY(trims->copyToSelection());
+        QCOMPARE(edit::clipById(*state()->sequence(), blue)->trims.at("sdr").p("gain", 0), 0.6);
+        state()->setPlayhead(70);
+        QCOMPARE(trims->shot(), blue);
+        QVERIFY(trims->resetShot());
+        QVERIFY(edit::clipById(*state()->sequence(), blue)->trims.empty());
+
+        // Queue Passes: a render of each target, delivering it.
+        RenderQueue* queue = win_->renderQueue();
+        const size_t before = queue->jobs().size();
+        QCOMPARE(win_->queueTrimPasses(dir_.path() + "/passes"), 1);
+        QCOMPARE(queue->jobs().size(), before + 1);
+        QCOMPARE(queue->jobs().back().settings.trimTarget, std::string("sdr"));
+        QVERIFY(QString::fromStdString(queue->jobs().back().settings.path).endsWith(".mp4"));
+        queue->remove(queue->jobs().back().id);
+
+        // Removing the target shows the master again.
+        QVERIFY(trims->removeShown());
+        QCOMPARE(trims->shown(), QString());
+        QCOMPARE(program->trimTarget(), std::string());
+        QVERIFY(state()->sequence()->trimTargets.empty());
+    }
+
+    void galleryAndClipStrip() {
+        // The demo (Red, then Blue on V1; a title over Red on V2), saved: its gallery beside it.
+        const QString path = dir_.path() + "/gallery-demo.montage";
+        QVERIFY(saveProject(demoProject(), path.toStdString()));
+        QVERIFY(win_->openProject(path));
+        auto* gallery = win_->findChild<GalleryPanel*>();
+        QVERIFY(gallery);
+        QCOMPARE(gallery->folder(), dir_.path() + "/Gallery/gallery-demo");
+        const Id red = clipNamed(*state()->sequence(), "Red")->id, blue = clipNamed(*state()->sequence(), "Blue")->id;
+        state()->edit("Grade", [&](Project& p, Sequence& s) {
+            edit::clipById(s, red)->effects.push_back(makeEffect(p, "invert"));
+            return true;
+        });
+        QVERIFY(win_->findChild<QAction*>("grabStillAction"));
+
+        // Grab Still at frame 5 (Red alone), then Wipe: the Program monitor compares with it until Wipe is off.
+        state()->setPlayhead(5);
+        QVERIFY(gallery->grab());
+        auto* stills = win_->findChild<QListWidget*>("galleryStills");
+        QCOMPARE(stills->count(), 1);
+        QVERIFY(!gallery->selectedStill().isEmpty());
+        MonitorPanel* program = nullptr;
+        for (auto* mp : win_->findChildren<MonitorPanel*>())
+            if (mp->mode() == MonitorPanel::Mode::Program) program = mp;
+        QVERIFY(program);
+        QVERIFY(gallery->wipe(true));
+        QVERIFY(program->viewer()->comparing());
+        QVERIFY(win_->findChild<QPushButton*>("wipeStill")->isChecked());
+        gallery->wipe(false);
+        QVERIFY(!program->viewer()->comparing());
+
+        // Apply Grade to the selected clip: Blue gets the invert, one undo step.
+        state()->setSelection({blue}, false);
+        QVERIFY(gallery->applyToSelection());
+        auto inverted = [&] {
+            const Clip* c = edit::clipById(*state()->sequence(), blue);
+            return std::any_of(c->effects.begin(), c->effects.end(), [](const Effect& e) { return e.type == "invert"; });
+        };
+        QVERIFY(inverted());
+        state()->undo();
+        QVERIFY(!inverted());
+        QVERIFY(gallery->addAlbum("Looks"));
+        QCOMPARE(gallery->album(), QString("Looks"));
+        QCOMPARE(stills->count(), 0);
+        gallery->setAlbum("Stills");
+        QCOMPARE(stills->count(), 1);
+        gallery->selectStill(stills->item(0)->data(Qt::UserRole).toString());
+        QVERIFY(gallery->removeSelected());
+        QCOMPARE(stills->count(), 0);
+
+        // The clip strip: every picture clip in timeline order, graded thumbnails, the one under the playhead marked.
+        auto* strip = win_->findChild<ClipStripPanel*>();
+        QVERIFY(strip);
+        strip->rebuild();
+        const std::vector<Id> listed = strip->clips();
+        QCOMPARE(listed.size(), size_t(3));
+        QCOMPARE(listed.front(), red);
+        QCOMPARE(listed.back(), blue);
+        auto* list = win_->findChild<QListWidget*>("clipStrip");
+        QTRY_COMPARE_WITH_TIMEOUT(strip->pending(), 0, 20000);
+        QVERIFY(!list->item(0)->icon().isNull());
+        state()->setPlayhead(20);  // the title, over Red
+        QCOMPARE(list->currentRow(), 1);
+        emit list->itemClicked(list->item(2));
+        QCOMPARE(state()->selectedClips(), std::vector<Id>{blue});
+        QCOMPARE(state()->playhead(), FrameTime(60));
+        QCOMPARE(list->currentRow(), 2);
+        strip->setLightbox(true);
+        QVERIFY(strip->lightbox() && list->isWrapping() && list->iconSize().width() > 200);
+        strip->setLightbox(false);
+        QVERIFY(!list->isWrapping());
+
+        // A still grabbed before the project's first save goes with it when it is saved.
+        QStandardPaths::setTestModeEnabled(true);
+        state()->newProject();
+        QCOMPARE(gallery->folder(), QString::fromStdString(galleryFolder("")));
+        state()->edit("Clip", [](Project& p, Sequence& s) { return edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "color", 30)).ok; });
+        state()->setPlayhead(5);
+        QVERIFY(gallery->grab());
+        const QString saved = dir_.path() + "/gallery-later.montage";
+        QVERIFY(state()->save(saved));
+        QCOMPARE(gallery->folder(), dir_.path() + "/Gallery/gallery-later");
+        QCOMPARE(stills->count(), 1);
+        QVERIFY(galleryStills(galleryFolder(""), kDefaultAlbum).empty());
+        QDir(QString::fromStdString(galleryFolder(""))).removeRecursively();
+        QStandardPaths::setTestModeEnabled(false);
     }
 
     void ografGraphicInInspector() {

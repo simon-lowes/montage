@@ -256,6 +256,15 @@ struct GradeGraph {
     bool empty() const { return nodes.empty(); }
     bool operator==(const GradeGraph&) const = default;
 };
+// A trim pass's deliverable (render/TrimPasses.h): a display the master is mapped to, its space and peak, each shot
+// trimmed for it (Clip::trims).
+struct TrimTarget {
+    std::string id;          // unique in its sequence
+    std::string name;        // shown
+    std::string colorSpace;  // a display space (ColorSpace.h id)
+    double peakNits = 100;   // its display's peak (a PQ target is rolled off to it)
+    bool operator==(const TrimTarget&) const = default;
+};
 // A grade node's effects shared by clips (Resolve's shared nodes): edited once, seen on each clip using it. Its id is
 // the owner of its effects (edit::effectChain).
 struct SharedNode {
@@ -346,6 +355,9 @@ struct Clip {
     // A graphic's own settings (core/GraphicsTemplate.h): values for the fields published by the sequence it plays,
     // by field id, as text ("#rrggbb", "1"); a field without one shows the template's own setting.
     std::map<std::string, std::string> fields;
+    // Trim passes (render/TrimPasses.h): its trim for each of its sequence's targets, by TrimTarget::id (a "trim"
+    // effect: lift, gamma, gain, saturation, highlights, mid_detail; keyframable). None: the target as mapped.
+    std::map<std::string, Effect> trims;
     bool operator==(const Clip&) const = default;
 };
 
@@ -492,6 +504,7 @@ struct Sequence {
     std::vector<std::string> mutedRoles;  // audio roles not heard (clip roles, see Clip::role)
     std::vector<ColorGroup> colorGroups;   // clips graded together (core/ColorGroups.h)
     std::vector<SharedNode> sharedNodes;   // grade nodes shared by its clips (core/GradeGraph.h)
+    std::vector<TrimTarget> trimTargets;   // HDR and SDR deliverables the grade is trimmed for (render/TrimPasses.h)
     std::vector<AdrCue> adrCues;           // lines to re-record, in time order (core/Adr.h)
     std::string colorSpace = "rec709";  // working and delivery space (ColorSpace.h id)
     double hdrPeakNits = 1000;          // mastering peak for HDR spaces
