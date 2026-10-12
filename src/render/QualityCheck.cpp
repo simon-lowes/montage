@@ -317,7 +317,7 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
                 measured = describeDialogueLoudness(d);
             }
             const std::string target = fmt(q.dialogueGated ? "the target is %.0f LKFS" : "the target is %.0f LUFS", q.loudnessTarget) +
-                                       (q.loudnessTolerance != 1 ? fmt(" ±%.0f LU", q.loudnessTolerance) : std::string());
+                                       (q.loudnessTolerance != 1 ? fmt(" ±%g LU", q.loudnessTolerance) : std::string());
             if (!r.valid || std::fabs(r.integrated - q.loudnessTarget) > q.loudnessTolerance + 1e-9)
                 issues.push_back({QcKind::Loudness, in, out, (r.valid ? measured : std::string("Too quiet to measure")) + "; " + target});
             if (r.valid && r.truePeakDb > q.peakCeiling + 0.05)

@@ -52,7 +52,8 @@ bool parseSpeechGate(const std::string& name, SpeechGate& out) {
     return false;
 }
 
-Spans timelineSpeech(const Project& p, const Sequence& s, SpeechGate& gate, const std::vector<bool>& tracks) {
+Spans timelineSpeech(const Project& p, const Sequence& s, SpeechGate& gate, const std::vector<bool>& tracks, double from, double to) {
+    auto within = [&](double a, double b) { return b > from && (to < 0 || a < to); };
     if (gate == SpeechGate::Classifier) return {};
     const double fps = s.fpsValue() > 0 ? s.fpsValue() : 30.0;
     const bool anySolo = std::any_of(s.audioTracks.begin(), s.audioTracks.end(), [](const Track& t) { return t.solo; });
@@ -66,7 +67,8 @@ Spans timelineSpeech(const Project& p, const Sequence& s, SpeechGate& gate, cons
             for (size_t i = 0; i < s.audioTracks.size(); ++i)
                 if (heard(i))
                     for (const Clip& c : s.audioTracks[i].clips)
-                        if (c.enabled && c.role == "Dialogue") clips.push_back({double(c.start) / fps, double(c.end()) / fps});
+                        if (c.enabled && c.role == "Dialogue" && within(double(c.start) / fps, double(c.end()) / fps))
+                            clips.push_back({double(c.start) / fps, double(c.end()) / fps});
         if (!clips.empty() || gate == SpeechGate::Roles) {
             gate = SpeechGate::Roles;
             return merged(std::move(clips), 0);
@@ -81,8 +83,12 @@ Spans timelineSpeech(const Project& p, const Sequence& s, SpeechGate& gate, cons
         for (Clip& c : t.clips)
             if (edit::roleMuted(s, c.role)) c.enabled = false;
     }
+    // Picture clips' words stand in for the sound's only when the sequence has no sound clips at all (not when the
+    // dialogue's are muted or left out).
+    if (std::any_of(s.audioTracks.begin(), s.audioTracks.end(), [](const Track& t) { return !t.clips.empty(); })) heardSeq.videoTracks.clear();
     Spans words;
-    for (const TranscriptWord& w : sequenceTranscriptWords(p, heardSeq)) words.push_back({std::max(0.0, w.start - kWordPad), w.end + kWordPad});
+    for (const TranscriptWord& w : sequenceTranscriptWords(p, heardSeq))
+        if (within(w.start, w.end)) words.push_back({std::max(0.0, w.start - kWordPad), w.end + kWordPad});
     return merged(std::move(words), kWordGap);
 }
 
@@ -100,7 +106,7 @@ DialogueLoudness measureDialogueLoudness(const Project& p, const Sequence& s, co
     const int64_t first = int64_t(std::llround(double(o.in) * rate / fps)), end = int64_t(std::llround(double(out) * rate / fps));
 
     SpeechGate gate = o.gate;
-    const Spans marks = timelineSpeech(p, s, gate, o.tracks);
+    const Spans marks = timelineSpeech(p, s, gate, o.tracks, double(o.in) / fps, double(out) / fps);
     if (o.gate == SpeechGate::Auto && gate == SpeechGate::Transcripts && marks.empty()) gate = SpeechGate::Classifier;
 
     const int nch = o.layout ? std::max(1, layoutChannels(s.audioLayout)) : 2;
@@ -202,6 +208,7 @@ DialogueLoudness measureDialogueLoudness(const Project& p, const Sequence& s, co
     r.truePeak = whole.truePeakDb;
     r.dialogue = dialogue.valid ? dialogue.integrated : -70;
     r.speechShare = meter.speechShare();
+    r.minSpeechShare = o.minSpeechShare;
     r.usesProgramme = !dialogue.valid || r.speechShare < o.minSpeechShare;
     // The speech as timeline spans.
     for (size_t i = 0; i < steps; ++i)
@@ -219,8 +226,9 @@ std::string describeDialogueLoudness(const DialogueLoudness& d) {
     static const char* const by[] = {"", "Dialogue clips", "transcripts", "listening"};
     char buf[200];
     if (d.usesProgramme)
-        std::snprintf(buf, sizeof buf, "Programme %.1f LKFS (%.0f %% speech, by %s: under the share dialogue gating needs)", d.programme,
-                      d.speechShare * 100, by[int(d.gate)]);
+        std::snprintf(buf, sizeof buf, "Programme %.1f LKFS (%.0f %% speech, by %s: %s)", d.programme, d.speechShare * 100, by[int(d.gate)],
+                      d.speechShare < d.minSpeechShare ? "under the share dialogue gating needs"
+                                                       : "no stretch of speech long enough to measure");
     else
         std::snprintf(buf, sizeof buf, "Dialogue %.1f LKFS (estimate: %.0f %% speech, by %s)", d.dialogue, d.speechShare * 100, by[int(d.gate)]);
     return buf;

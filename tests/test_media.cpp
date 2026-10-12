@@ -1282,6 +1282,12 @@ private slots:
         QVERIFY(!d.speech.empty() && d.speech.front().first < 1.5 && d.speech.back().second <= speechSeconds + 0.5);
         // The pauses between JFK's phrases are not speech.
         QVERIFY2(d.speech.size() > 1, qPrintable(QString::number(d.speech.size())));
+        // Only the music's stretch: no Dialogue clip there and no words, so it is listened to, and nothing is speech.
+        DialogueLoudnessOptions after;
+        after.in = speechEnd;
+        const DialogueLoudness musicStretch = measureDialogueLoudness(p, s, after, {}, nullptr, &err);
+        QVERIFY2(musicStretch.gate == SpeechGate::Classifier && musicStretch.usesProgramme,
+                 qPrintable(QString::fromStdString(describeDialogueLoudness(musicStretch))));
 
         // From a transcript (no roles): the same, near enough.
         for (Track& t : s.audioTracks)

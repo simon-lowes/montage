@@ -122,8 +122,9 @@ signals:
     void audioLevels(float masterL, float masterR, const QVector<float>& trackPeaks);
     // Loudness of what is heard (LUFS, LU and dBTP; -200 for nothing yet), ten times a second.
     void loudness(double momentary, double shortTerm, double integrated, double range, double truePeak);
-    // The same measured over speech only (render/DialogueLoudness.h, as the sequence marks it: Dialogue clips, else
-    // transcribed words; -200 for none yet) and the share of the sound that is speech (-1: the sequence marks none).
+    // The same measured over speech only (render/DialogueLoudness.h, as the sequence marks it: whole Dialogue clips,
+    // pauses and all, else transcribed words; -200 for none yet) and the share of the sound that is speech (-1: the
+    // sequence marks none). An approximation: exports and Quality Check narrow Dialogue clips to where they sound.
     void dialogueLoudness(double integrated, double speechShare);
     void playingChanged(bool playing);
 

@@ -281,6 +281,7 @@ public:
     }
 
     void configure(std::shared_ptr<const Project> p, Id seq, int64_t startSample, bool int16) {
+        auto speech = speechIn(p, seq);  // (worked out before the audio thread is held up)
         QMutexLocker lock(&m_);
         const Sequence* s = p ? p->findSequence(seq) : nullptr;
         project_ = std::move(p);
@@ -296,17 +297,23 @@ public:
             meterSeq_ = seq;
             meterRate_ = rate;
         }
-        updateSpeech(s);
+        speech_ = std::move(speech);
     }
     void resetLoudness() {
         QMutexLocker lock(&meterM_);
         if (meter_) meter_->reset();
     }
     void setProject(std::shared_ptr<const Project> p) {
+        Id seq = 0;
+        {
+            QMutexLocker lock(&m_);
+            seq = seq_;
+        }
+        auto speech = speechIn(p, seq);  // (outside the locks the audio thread takes)
         QMutexLocker lock(&m_);
         project_ = std::move(p);
         QMutexLocker meterLock(&meterM_);
-        updateSpeech(project_ ? project_->findSequence(seq_) : nullptr);
+        speech_ = std::move(speech);
     }
     // Global Mute: the meters still move, the speakers get silence.
     void setMuted(bool on) { muted_ = on; }
@@ -400,10 +407,11 @@ protected:
     qint64 writeData(const char*, qint64) override { return -1; }
 
 private:
-    // The timeline's own speech marks (Dialogue clips or transcribed words), in seconds; with meterM_ held.
-    void updateSpeech(const Sequence* s) {
+    // The timeline's own speech marks (whole Dialogue clips, else transcribed words), in seconds.
+    static std::vector<std::pair<double, double>> speechIn(const std::shared_ptr<const Project>& p, Id seq) {
+        const Sequence* s = p ? p->findSequence(seq) : nullptr;
         SpeechGate gate = SpeechGate::Auto;
-        speech_ = s && project_ ? timelineSpeech(*project_, *s, gate) : std::vector<std::pair<double, double>>{};
+        return s ? timelineSpeech(*p, *s, gate) : std::vector<std::pair<double, double>>{};
     }
     QMutex m_;
     std::shared_ptr<const Project> project_;

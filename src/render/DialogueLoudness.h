@@ -35,17 +35,19 @@ struct DialogueLoudness {
     double programme = -70;      // LKFS over everything (BS.1770)
     double truePeak = -96;       // dBTP, the whole programme
     double speechShare = 0;      // of the sound, 0..1
-    bool usesProgramme = true;   // too little speech: the programme figure is the one to use
+    bool usesProgramme = true;   // too little speech (or none in whole 400 ms blocks): the programme figure counts
+    double minSpeechShare = 0.15;  // the share asked for
     SpeechGate gate = SpeechGate::Auto;  // how the speech was found
     std::vector<std::pair<double, double>> speech;  // timeline seconds
     double value() const { return usesProgramme ? programme : dialogue; }
 };
 
 // Where the sequence itself says someone speaks, in timeline seconds (merged, in order), without listening: heard
-// Dialogue-role clips (Roles) or transcribed words, a little padded (Transcripts). Auto picks Roles when a Dialogue
-// clip is heard, else Transcripts, and says which in `gate`; Classifier gives none.
+// Dialogue-role clips (Roles) or transcribed words, a little padded (Transcripts), over [from, to) seconds (to < 0:
+// the end). Auto picks Roles when a Dialogue clip is heard there, else Transcripts, and says which in `gate`;
+// Classifier gives none. Whole clips: measureDialogueLoudness narrows them to where their sound is.
 std::vector<std::pair<double, double>> timelineSpeech(const Project& p, const Sequence& s, SpeechGate& gate,
-                                                      const std::vector<bool>& tracks = {});
+                                                      const std::vector<bool>& tracks = {}, double from = 0, double to = -1);
 
 // Mixes the range and measures it. Fails (invalid, with `error`) only when cancelled or the range is empty.
 DialogueLoudness measureDialogueLoudness(const Project& p, const Sequence& s, const DialogueLoudnessOptions& o,
