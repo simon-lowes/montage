@@ -42,6 +42,8 @@ const char* const kLibrary = "libDeckLinkAPI.so";
 #endif
 
 bool sameIid(const REFIID& a, const REFIID& b) { return std::memcmp(&a, &b, sizeof(REFIID)) == 0; }
+// IUnknown's IID as bytes (macOS's IUnknownUUID is a CFUUIDRef, and it has no IID_IUnknown).
+const REFIID kIidUnknown = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46};
 
 struct DlApi {
     plugins::DynLib lib;
@@ -130,7 +132,7 @@ public:
     HRESULT QueryInterface(REFIID iid, LPVOID* out) override {
         if (sameIid(iid, IID_IDeckLinkVideoFrameMetadataExtensions)) {
             *out = static_cast<IDeckLinkVideoFrameMetadataExtensions*>(this);
-        } else if (sameIid(iid, IID_IDeckLinkVideoFrame) || sameIid(iid, IID_IUnknown)) {
+        } else if (sameIid(iid, IID_IDeckLinkVideoFrame) || sameIid(iid, kIidUnknown)) {
             *out = static_cast<IDeckLinkVideoFrame*>(this);
         } else {
             *out = nullptr;
@@ -394,7 +396,7 @@ public:
     }
     HRESULT ScheduledPlaybackHasStopped() override { return S_OK; }
     HRESULT QueryInterface(REFIID iid, LPVOID* out) override {
-        if (sameIid(iid, IID_IDeckLinkVideoOutputCallback) || sameIid(iid, IID_IUnknown)) {
+        if (sameIid(iid, IID_IDeckLinkVideoOutputCallback) || sameIid(iid, kIidUnknown)) {
             *out = static_cast<IDeckLinkVideoOutputCallback*>(this);
             return S_OK;
         }
