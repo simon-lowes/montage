@@ -6447,6 +6447,18 @@ private slots:
             QVERIFY(dlg->lensText().isEmpty());
             QVERIFY(!dlg->findChild<QPushButton*>("lensApply")->isEnabled());
             QCOMPARE(dlg->findChild<QComboBox*>("lensLens")->count(), 2);
+            // Typed names count: a lens part-typed is none, one typed whole (any case) is it; a camera typed brings
+            // its lenses.
+            auto* lensBox = dlg->findChild<QComboBox*>("lensLens");
+            lensBox->setEditText("Samyang 8mm");
+            QVERIFY(!dlg->findChild<QPushButton*>("lensApply")->isEnabled());
+            lensBox->setEditText("samyang 8mm f/2.8 umc fish-eye");
+            QVERIFY(dlg->findChild<QPushButton*>("lensApply")->isEnabled());
+            QVERIFY(dlg->choice().lens);
+            dlg->findChild<QComboBox*>("lensCamera")->setEditText("Sony ILCE-7M4");
+            QCOMPARE(lensBox->count(), 1);
+            QVERIFY(dlg->choice().camera && dlg->choice().camera->model == "ILCE-7M4");
+            QVERIFY(dlg->setCamera("Sony ILCE-6400"));
             QVERIFY(dlg->setLens("Samyang 8mm f/2.8 UMC Fish-eye"));
             dlg->findChild<QDoubleSpinBox*>("lensAperture")->setValue(4);
             QVERIFY(dlg->sameMedia());
@@ -6463,11 +6475,22 @@ private slots:
         QCOMPARE(int(std::count_if(edit::clipById(*state()->sequence(), a)->effects.begin(), edit::clipById(*state()->sequence(), a)->effects.end(),
                                    [](const Effect& e) { return e.type == "lens_correction"; })),
                  1);
+        // The aperture not known: no vignetting correction, and so when opened again.
+        shown = false;
+        lensDialogHook() = [&](LensCorrectionDialog* dlg) {
+            shown = true;
+            dlg->findChild<QDoubleSpinBox*>("lensAperture")->setValue(0);
+            QMetaObject::invokeMethod(dlg, "accept", Qt::QueuedConnection);
+        };
+        QVERIFY(win_->correctLens());
+        QVERIFY(shown);
+        QCOMPARE(lensOf(a)->p("aperture", -1), 0.0);
         // Cancelled, nothing changes.
         const std::string profile = lensOf(a)->s("profile");
         shown = false;
         lensDialogHook() = [&](LensCorrectionDialog* dlg) {
             shown = true;
+            QCOMPARE(dlg->findChild<QDoubleSpinBox*>("lensAperture")->value(), 0.0);
             QMetaObject::invokeMethod(dlg, "reject", Qt::QueuedConnection);
         };
         QVERIFY(!win_->correctLens());

@@ -91,11 +91,6 @@ std::shared_ptr<const lens::Database>& loaded() {
     return db;
 }
 
-bool& tried() {
-    static bool t = false;
-    return t;
-}
-
 }  // namespace
 
 const ModelPack& lensDatabasePack() {
@@ -133,8 +128,8 @@ std::vector<std::string> lensDatabaseFolders() {
 
 std::shared_ptr<const lens::Database> lensDatabase() {
     std::lock_guard lock(dbMutex());
-    if (tried()) return loaded();
-    tried() = true;
+    // (Looked for again while there is none: it may have been fetched since.)
+    if (loaded()) return loaded();
     const char* env = std::getenv("MONTAGE_LENS_DB");
     for (const std::string& dir : lensDatabaseFolders()) {
         // (Not a download cut short.)
@@ -150,7 +145,6 @@ std::shared_ptr<const lens::Database> lensDatabase() {
 
 void reloadLensDatabase() {
     std::lock_guard lock(dbMutex());
-    tried() = false;
     loaded().reset();
 }
 
@@ -189,7 +183,7 @@ Effect lensCorrectionEffect(const LensChoice& c, Id id, const Effect* existing) 
         p.value = v;
     };
     set("focal", c.focal > 0 ? c.focal : c.lens->minFocal);
-    set("aperture", c.aperture > 0 ? c.aperture : c.lens->minAperture);
+    set("aperture", c.aperture >= 0 ? c.aperture : c.lens->minAperture);
     set("camera_crop", c.camera && c.camera->cropFactor > 0 ? c.camera->cropFactor : 0);
     return e;
 }

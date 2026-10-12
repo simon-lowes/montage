@@ -104,6 +104,7 @@ void parseCamera(QXmlStreamReader& x, Camera& c) {
         if (n == QLatin1String("maker")) {
             if (!translated) c.maker = text;
             addName(c.names, text);
+            addName(c.makers, text);
         } else if (n == QLatin1String("model")) {
             if (!translated) c.model = text;
             addName(c.names, text);
@@ -183,6 +184,18 @@ void parseCalibration(QXmlStreamReader& x, Lens& lens, double crop, double aspec
     c.vignetting.insert(c.vignetting.end(), got.vignetting.begin(), got.vignetting.end());
 }
 
+// A number as a name writes it ("2.8"), whatever the locale; its leading part as atof reads it ("5." is 5).
+double number(const std::string& s) {
+    bool ok = false;
+    QString t = QString::fromStdString(s);
+    while (!t.isEmpty()) {
+        const double v = t.toDouble(&ok);
+        if (ok) return v;
+        t.chop(1);
+    }
+    return 0;
+}
+
 // lensfun's guesses at a lens's focal lengths and widest aperture from its name ("24-70mm f/2.8", "1:2.8 50mm",
 // "2.8/50"), where the database does not give them; not for adapters and converters.
 void guessFromName(Lens& l, double& minF, double& maxF, double& minA) {
@@ -200,9 +213,9 @@ void guessFromName(Lens& l, double& minF, double& maxF, double& minA) {
     for (int i = 0; i < 3; ++i) {
         std::smatch r;
         if (!std::regex_match(m, r, patterns[i])) continue;
-        if (r[groups[i][0]].matched) minF = std::atof(r[groups[i][0]].str().c_str());
-        if (r[groups[i][1]].matched) maxF = std::atof(r[groups[i][1]].str().c_str());
-        if (r[groups[i][2]].matched) minA = std::atof(r[groups[i][2]].str().c_str());
+        if (r[groups[i][0]].matched) minF = number(r[groups[i][0]].str());
+        if (r[groups[i][1]].matched) maxF = number(r[groups[i][1]].str());
+        if (r[groups[i][2]].matched) minA = number(r[groups[i][2]].str());
         return;
     }
 }
@@ -407,15 +420,20 @@ const Camera* Database::findCamera(const std::string& device) const {
     const Camera* best = nullptr;
     size_t bestScore = 0;
     for (const Camera& c : cameras_) {
-        // The model's words must all be there; the maker's count when they are.
+        // A model name's words must all be there, one at least not the maker's (an unknown model of a known maker is
+        // no camera); the maker's count when they are.
+        std::set<std::string> makerWords;
+        for (const std::string& maker : c.makers)
+            for (const std::string& w : words(maker)) makerWords.insert(w);
         size_t score = 0;
         for (const std::string& model : c.names) {
-            if (model == c.maker) continue;
+            if (std::find(c.makers.begin(), c.makers.end(), model) != c.makers.end()) continue;
             const std::vector<std::string> m = words(model);
-            if (m.empty() || !std::all_of(m.begin(), m.end(), [&](const std::string& w) { return haveSet.count(w); }))
+            if (m.empty() || !std::all_of(m.begin(), m.end(), [&](const std::string& w) { return haveSet.count(w); }) ||
+                std::all_of(m.begin(), m.end(), [&](const std::string& w) { return makerWords.count(w); }))
                 continue;
             size_t s = m.size() * 2;
-            for (const std::string& w : words(c.maker)) s += haveSet.count(w);
+            for (const std::string& w : makerWords) s += haveSet.count(w);
             score = std::max(score, s);
         }
         if (score > bestScore) {
@@ -766,8 +784,9 @@ Correction::Correction(const Lens& lens, const Settings& s, int width, int heigh
         // (fill: the most outside; whole: the most inside).
         auto worst = [&](double scale) {
             double out = s.fit == Settings::Fill ? -DBL_MAX : DBL_MAX;
-            for (int i = 0; i <= 128; ++i) {
-                const double phi = kPi / 2 * i / 128;
+            // (And the corner's own angle, where the frame reaches furthest.)
+            for (int i = 0; i <= 129; ++i) {
+                const double phi = i == 129 ? std::atan2(hy, hx) : kPi / 2 * i / 128;
                 const double c = std::cos(phi), sn = std::sin(phi);
                 const double edge = std::min(c > 1e-9 ? hx / c : DBL_MAX, sn > 1e-9 ? hy / sn : DBL_MAX);
                 for (int ch = 0; ch < 3; ++ch) {
@@ -778,6 +797,23 @@ Correction::Correction(const Lens& lens, const Settings& s, int width, int heigh
             return out;
         };
         double lo = s.fit == Settings::Fill ? 1.0 / 16 : 0.25, hi = 16;
+        // Only while the correction still moves outward with the radius: a barrel polynomial turns back further out
+        // (and goes negative), where it means nothing. So the frame's corner stays inside where it first turns.
+        const double corner = std::hypot(hx, hy), far = corner / lo;
+        double turn = far;
+        for (int ch = 0; ch < 3; ++ch) {
+            const int steps = 4096;
+            double was = radius(0, ch);
+            for (int i = 1; i <= steps; ++i) {
+                const double r = far * i / steps, now = radius(r, ch);
+                if (!(now > was)) {
+                    turn = std::min(turn, far * (i - 1) / steps);
+                    break;
+                }
+                was = now;
+            }
+        }
+        if (turn < far) lo = std::min(hi, std::max(lo, corner / std::max(turn, 1e-9)));
         if (s.fit == Settings::Fill) {
             // The smallest scale with nothing outside.
             if (worst(lo) <= 0) scale_ = lo;

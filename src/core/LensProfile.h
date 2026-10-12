@@ -48,7 +48,8 @@ struct Calibration {
 
 struct Camera {
     std::string maker, model, variant, mount;
-    std::vector<std::string> names;  // every maker and model name given (translations too), for finding it
+    std::vector<std::string> names;   // every maker and model name given (translations too), for finding it
+    std::vector<std::string> makers;  // the maker's names among them
     double cropFactor = 0;
 };
 
@@ -80,8 +81,8 @@ public:
     const std::vector<Lens>& lenses() const { return lenses_; }
     bool empty() const { return lenses_.empty(); }
 
-    // The camera a recording's camera name ("GoPro HERO11 Black", "Sony ILCE-7M4") is, or null: every word of a
-    // camera's maker and model found in it, the camera matching most words winning.
+    // The camera a recording's camera name ("GoPro HERO11 Black", "Sony ILCE-7M4") is, or null: every word of one of
+    // a camera's model names found in it (one at least not the maker's), the camera matching most words winning.
     const Camera* findCamera(const std::string& device) const;
     // Lenses for `camera`: those on its mount first (a fixed lens alone there), then those its mount takes by
     // adapter; only calibrated lenses. Every calibrated lens when `camera` is null.

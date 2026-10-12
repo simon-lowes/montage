@@ -43,6 +43,8 @@ private:
     std::shared_ptr<const lens::Database> db_;
     std::vector<const lens::Camera*> cameras_;
     std::vector<const lens::Lens*> lenses_;
+    const lens::Camera* listedFor_ = nullptr;  // the camera lenses_ is for
+    const lens::Lens* shown_ = nullptr;        // the lens the focal length, aperture and description are for
     QComboBox* camera_;
     QComboBox* lens_;
     QDoubleSpinBox* focal_;

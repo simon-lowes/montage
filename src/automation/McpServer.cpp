@@ -6284,7 +6284,7 @@ void McpServer::Impl::addTools() {
         "picture rectilinear, scaled to fill the frame. `camera` defaults to the one the clip's media names (its Camera "
         "Model); `lens` may be left out when that camera has a fixed lens. Names match by their words (\"HERO11 Black\", "
         "\"FE 24-70mm f/2.8 GM\"). `focal` (mm) and `aperture` (f-number) default to the lens's shortest and widest; "
-        "vignetting depends on the aperture. `same_media` corrects every clip of the media. `list` changes nothing and "
+        "vignetting depends on the aperture (0: not known, no vignetting correction). `same_media` corrects every clip of the media. `list` changes nothing and "
         "returns the camera found and the lenses that fit it (`query` narrows them by words). The profile is kept in the "
         "project. `params` sets its other settings: distortion, tca, vignetting and rectilinear (0 off, 1 on), fit (0 fill "
         "the frame, 1 show the whole picture, 2 neither), scale (%), recording_crop (how much narrower than the sensor's "
@@ -6303,12 +6303,17 @@ void McpServer::Impl::addTools() {
             if (!media) throw ArgError{"\"clip\" must show media (not a generator or a nested sequence)"};
             const std::shared_ptr<const lens::Database> db = lensDatabase();
             if (!db) return fail("No lens database: correct a lens once in the app (Clip > Correct Lens...), run scripts/fetch-models.sh, or set MONTAGE_LENS_DB to lensfun's database folder");
+            for (const char* k : {"camera", "lens", "query"})
+                if (a.contains(k) && !a.value(k).isString()) throw ArgError{QStringLiteral("\"%1\" must be a string").arg(k)};
             LensChoice c = suggestLens(*db, *media);
             if (a.contains("camera")) {
                 const std::string want = a.value("camera").toString().toStdString();
                 c.camera = want.empty() ? nullptr : db->camera(want);
                 if (!want.empty() && !c.camera) throw ArgError{QStringLiteral("No camera \"%1\" in the lens database").arg(QString::fromStdString(want))};
-                c.lens = nullptr;
+                // Its own lens when it has a fixed one.
+                c.lens = db->fixedLens(c.camera);
+                c.focal = c.lens ? c.lens->minFocal : 0;
+                c.aperture = -1;
             }
             auto cameraJson = [&]() -> QJsonValue {
                 if (!c.camera) return QJsonValue::Null;
@@ -6333,13 +6338,16 @@ void McpServer::Impl::addTools() {
                 c.lens = db->lens(want, c.camera);
                 if (!c.lens) throw ArgError{QStringLiteral("No lens \"%1\"%2 in the lens database (list them with \"list\": true)")
                                                 .arg(QString::fromStdString(want), c.camera ? " for the " + QString::fromStdString(lens::cameraName(*c.camera)) : QString())};
-                c.focal = c.aperture = 0;
+                c.focal = 0;
+                c.aperture = -1;
             }
             if (!c.lens) return fail(c.camera ? QStringLiteral("Which lens was on the %1? Give \"lens\" (\"list\": true lists them)").arg(QString::fromStdString(lens::cameraName(*c.camera)))
                                               : QStringLiteral("The clip's camera is not known: give \"camera\" and \"lens\""));
             if (a.contains("focal")) c.focal = a.value("focal").toDouble();
             if (a.contains("aperture")) c.aperture = a.value("aperture").toDouble();
-            if (c.focal < 0 || c.aperture < 0) throw ArgError{"\"focal\" and \"aperture\" must not be negative"};
+            if (c.focal < 0 || c.focal > 2000) throw ArgError{"\"focal\" must be from 0 to 2000 (mm)"};
+            if (a.contains("aperture") && (c.aperture < 0 || c.aperture > 64))
+                throw ArgError{"\"aperture\" must be from 0 (not known: no vignetting correction) to 64"};
             const QJsonObject params = a.value("params").toObject();
             const EffectInfo* info = findEffectInfo("lens_correction");
             for (auto it = params.begin(); it != params.end(); ++it) {
@@ -6349,6 +6357,8 @@ void McpServer::Impl::addTools() {
                     throw ArgError{QStringLiteral("\"params\" has no setting \"%1\" (focal and aperture are their own arguments)").arg(it.key())};
                 if (!it.value().isDouble() || it.value().toDouble() < pi->min || it.value().toDouble() > pi->max)
                     throw ArgError{QStringLiteral("\"%1\" must be a number from %2 to %3").arg(it.key()).arg(pi->min).arg(pi->max)};
+                if ((pi->kind == ParamKind::Bool || pi->kind == ParamKind::Choice) && it.value().toDouble() != std::floor(it.value().toDouble()))
+                    throw ArgError{QStringLiteral("\"%1\" must be a whole number").arg(it.key())};
             }
             const std::vector<Id> clips = a.value("same_media").toBool() ? clipsOfSameMedia(s, clip.id) : std::vector<Id>{clip.id};
             const int n = applyLensCorrection(l.project, s, clips, c);

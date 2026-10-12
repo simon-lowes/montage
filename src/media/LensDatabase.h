@@ -25,7 +25,8 @@ void reloadLensDatabase();
 struct LensChoice {
     const lens::Lens* lens = nullptr;
     const lens::Camera* camera = nullptr;
-    double focal = 0, aperture = 0;
+    double focal = 0;     // 0: the lens's shortest
+    double aperture = -1;  // -1: the lens's widest; 0: not known (no vignetting correction)
 };
 // The camera `m` was recorded with (by its Camera Model), and its lens when it has a fixed one.
 LensChoice suggestLens(const lens::Database& db, const MediaItem& m);

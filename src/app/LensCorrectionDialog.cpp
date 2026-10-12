@@ -97,27 +97,32 @@ LensCorrectionDialog::LensCorrectionDialog(std::shared_ptr<const lens::Database>
         const auto at = std::find(cameras_.begin(), cameras_.end(), start.camera);
         if (at != cameras_.end()) camera_->setCurrentIndex(int(at - cameras_.begin()) + 1);
     }
-    connect(camera_, &QComboBox::currentIndexChanged, this, &LensCorrectionDialog::cameraChanged);
-    connect(lens_, &QComboBox::currentIndexChanged, this, &LensCorrectionDialog::lensChanged);
+    // What is typed counts as much as what is picked: the lenses follow the camera named, Apply waits for a lens named.
+    connect(camera_, &QComboBox::editTextChanged, this, [this] {
+        if (currentCamera() != listedFor_) cameraChanged();
+    });
+    connect(lens_, &QComboBox::editTextChanged, this, &LensCorrectionDialog::lensChanged);
     cameraChanged();
     if (start.lens) setLens(qs(lens::lensName(*start.lens)));
     if (start.focal > 0) focal_->setValue(start.focal);
-    if (start.aperture > 0) aperture_->setValue(start.aperture);
+    if (start.aperture >= 0) aperture_->setValue(start.aperture);
 }
 
+// By the name in the box (any letter case), not the list's current index, which typing leaves behind.
 const lens::Camera* LensCorrectionDialog::currentCamera() const {
-    const int i = camera_->currentIndex();
-    return i > 0 && i <= int(cameras_.size()) && camera_->currentText() == camera_->itemText(i) ? cameras_[size_t(i - 1)] : nullptr;
+    const int i = camera_->currentText().isEmpty() ? 0 : camera_->findText(camera_->currentText(), Qt::MatchFixedString);
+    return i > 0 && i <= int(cameras_.size()) ? cameras_[size_t(i - 1)] : nullptr;
 }
 
 const lens::Lens* LensCorrectionDialog::currentLens() const {
-    const int i = lens_->currentIndex();
-    return i >= 0 && i < int(lenses_.size()) && lens_->currentText() == lens_->itemText(i) ? lenses_[size_t(i)] : nullptr;
+    const int i = lens_->currentText().isEmpty() ? -1 : lens_->findText(lens_->currentText(), Qt::MatchFixedString);
+    return i >= 0 && i < int(lenses_.size()) ? lenses_[size_t(i)] : nullptr;
 }
 
 void LensCorrectionDialog::cameraChanged() {
     const QString was = lens_->currentText();
     const lens::Camera* cam = currentCamera();
+    listedFor_ = cam;
     lenses_ = db_->lensesFor(cam);
     {
         QSignalBlocker b(lens_);
@@ -138,9 +143,13 @@ void LensCorrectionDialog::lensChanged() {
     const lens::Lens* l = currentLens();
     apply_->setEnabled(l != nullptr);
     if (!l) {
+        shown_ = nullptr;
         about_->setText(lenses_.empty() ? tr("No lens profile fits this camera.") : tr("%n lens profile(s) fit this camera.", "", int(lenses_.size())));
         return;
     }
+    // (The same lens again, as after another camera that takes it: its focal length and aperture stay.)
+    if (l == shown_) return;
+    shown_ = l;
     const double lo = l->minFocal > 0 ? l->minFocal : 1, hi = std::max(lo, l->maxFocal);
     focal_->setRange(lo, hi);
     focal_->setValue(lo);
@@ -195,16 +204,23 @@ QString LensCorrectionDialog::cameraText() const { return camera_->currentText()
 QString LensCorrectionDialog::lensText() const { return lens_->currentText(); }
 
 bool correctLens(QWidget* parent, EditorState* state, Id clipId) {
-    const Sequence* s = state->sequence();
-    const Clip* clip = s ? edit::clipById(*s, clipId) : nullptr;
-    const MediaItem* media = clip && clip->mediaId ? state->project().findMedia(clip->mediaId) : nullptr;
-    if (!media) {
+    auto find = [&](const Clip*& clip, const MediaItem*& media) {
+        const Sequence* s = state->sequence();
+        const auto loc = s ? edit::locate(*s, clipId) : std::nullopt;
+        clip = loc && loc->track.kind == TrackKind::Video ? edit::clipById(*s, clipId) : nullptr;
+        media = clip && clip->mediaId ? state->project().findMedia(clip->mediaId) : nullptr;
+        return media != nullptr;
+    };
+    const Clip* clip = nullptr;
+    const MediaItem* media = nullptr;
+    if (!find(clip, media)) {
         state->message(QObject::tr("Select the video clip to correct"));
         return false;
     }
     if (!ensureEffectModel(parent, "lens_correction")) return false;
     const std::shared_ptr<const lens::Database> db = lensDatabase();
-    if (!db) return false;
+    // (Found again: the project may have changed while the database downloaded.)
+    if (!db || !find(clip, media)) return false;
     // What its Lens Correction has, else what its camera suggests.
     LensChoice start = suggestLens(*db, *media);
     for (const Effect& e : clip->effects)

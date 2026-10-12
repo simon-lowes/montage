@@ -15218,11 +15218,20 @@ private slots:
             QCOMPARE(k.effects[0].p("camera_crop", 0), 1.534);
         }
         QCOMPARE(edit::clipById(*back.active(), first)->effects[0].p("fit", 0), 1.0);  // its own settings kept
+        // A fixed-lens camera named brings its lens; aperture 0 (not known) stays 0, no vignetting correction.
+        const double second = double(back.active()->videoTracks[0].clips[1].id);
+        r = call({{"clip", second}, {"camera", "GoPro HERO11 Black"}, {"aperture", 0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("lens").toString(), QStringLiteral("GoPro HERO11 Black & compatibles"));
+        QCOMPARE(r.value("structuredContent").toObject().value("aperture").toDouble(), 0.0);
         // Refused: an unknown lens or camera, a setting it has no, focal length among the settings.
         for (const QJsonObject& bad : {QJsonObject{{"clip", double(first)}, {"lens", "Nikkor 50mm"}},
                                        QJsonObject{{"clip", double(first)}, {"camera", "Canon EOS R5"}},
                                        QJsonObject{{"clip", double(first)}, {"params", QJsonObject{{"focal", 10}}}},
                                        QJsonObject{{"clip", double(first)}, {"params", QJsonObject{{"fit", 7}}}},
+                                       QJsonObject{{"clip", double(first)}, {"params", QJsonObject{{"fit", 0.5}}}},
+                                       QJsonObject{{"clip", double(first)}, {"camera", 5}, {"lens", "Samyang 8mm"}},
+                                       QJsonObject{{"clip", double(first)}, {"lens", "Samyang 8mm"}, {"focal", 5000}},
                                        QJsonObject{{"clip", double(first)}, {"camera", "Sony ILCE-6400"}}})
             QVERIFY2(call(bad).value("isError").toBool(), QJsonDocument(bad).toJson().constData());
         // Played back: the frame (flat) filled to the edges.

@@ -7007,6 +7007,13 @@ private slots:
         QVERIFY(gopro && gopro->mount == "goProHero11bl");
         QVERIFY(!db.findCamera("Canon EOS R5"));
         QCOMPARE(cameraName(*gopro), std::string("GoPro Hero11 Black"));
+        // An unknown model of a known maker is no camera, its maker's name in another language no model name.
+        Database olympus;
+        QVERIFY(olympus.addXml("<lensdatabase><camera><maker>OLYMPUS IMAGING CORP.</maker><maker lang=\"en\">Olympus</maker>"
+                               "<model>C8080WZ</model><mount>olympusC8080</mount><cropfactor>3.93</cropfactor></camera></lensdatabase>"));
+        QVERIFY(olympus.findCamera("OLYMPUS IMAGING CORP. C8080WZ"));
+        QVERIFY(!olympus.findCamera("Olympus TG-99"));
+        QVERIFY(!olympus.findCamera("OLYMPUS IMAGING CORP."));
 
         // The camera's own lenses first, then those its mount takes by adapter; a fixed lens alone. Not a lens measured
         // on a smaller sensor than the camera's (the APS-C fisheye on the full-frame body).
@@ -7143,6 +7150,22 @@ private slots:
             more.scale = 1.5;
             QVERIFY(std::fabs(Correction(*l, more, 1920, 1080).scale() - f.scale() * 1.5) < 1e-9);
         }
+        // A barrel polynomial turns back beyond its picture (and goes negative): the scale that fills the frame is
+        // found where it still rises, not at the smallest scale tried.
+        Database barrel;
+        QVERIFY(barrel.addXml("<lensdatabase><lens><maker>Test</maker><model>Barrel 80mm f/2.8</model><mount>Test E</mount>"
+                              "<cropfactor>1</cropfactor><calibration><distortion model=\"poly3\" focal=\"80\" k1=\"-0.02\"/>"
+                              "</calibration></lens></lensdatabase>"));
+        Settings b80;
+        b80.cameraCrop = 1;
+        const Correction bf(barrel.lenses()[0], b80, 1920, 1080);
+        QVERIFY2(bf.scale() > 0.9 && bf.scale() < 1.1, qPrintable(QString::number(bf.scale())));
+        QVERIFY(edges(bf, 1920, 1080, true));
+        b80.fit = Settings::Whole;
+        const Correction bw(barrel.lenses()[0], b80, 1920, 1080);
+        QVERIFY2(bw.scale() > 0.9 && bw.scale() <= bf.scale(), qPrintable(QString::number(bw.scale())));
+        QVERIFY(edges(bw, 1920, 1080, false));
+
         // Nothing to do when everything is off.
         Settings off;
         off.distortion = off.tca = off.vignetting = off.rectilinear = false;
