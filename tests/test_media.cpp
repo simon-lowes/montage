@@ -67,6 +67,7 @@
 #include "media/Relink.h"
 #include "media/SpeakerSwitch.h"
 #include "media/Tracking.h"
+#include "media/CameraSolve.h"
 #include "media/Vector.h"
 #include "media/Beats.h"
 #include "render/Spherical.h"
@@ -16163,6 +16164,465 @@ if ui["pressed"] == "add":
         QVERIFY2(quadError(cornerPinQuad(pin, 0), corners[0]) < 1.0, qPrintable(QString::number(quadError(cornerPinQuad(pin, 0), corners[0]))));
         // Not past the end.
         QVERIFY(!trackClipCorners(p, s, over, pin, frames - 1, true, keys, {}, nullptr, &err));
+    }
+
+    // A camera moving through a scene (x right, y down, z forward, as CameraSolve's cameras are): it slides right,
+    // rises a little and pushes in while panning to keep the scene in view. Its rotation and position at t in [0, 1].
+    static void sceneCamera(double t, std::array<double, 9>& R, Vec3& C) {
+        const double yaw = 0.25 - 0.5 * t, pitch = 0.04 * std::sin(t * 3.0);
+        const double cy = std::cos(yaw), sy = std::sin(yaw), cp = std::cos(pitch), sp = std::sin(pitch);
+        // Turned about y by yaw, then about x by pitch (world to camera).
+        const std::array<double, 9> Ry{cy, 0, -sy, 0, 1, 0, sy, 0, cy}, Rx{1, 0, 0, 0, cp, sp, 0, -sp, cp};
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) R[size_t(i * 3 + j)] = Rx[size_t(i * 3)] * Ry[size_t(j)] + Rx[size_t(i * 3 + 1)] * Ry[size_t(3 + j)] + Rx[size_t(i * 3 + 2)] * Ry[size_t(6 + j)];
+        C = {-1.5 + 3.0 * t, -0.3 * t, 0.8 * t};
+    }
+    static bool sceneProject(const std::array<double, 9>& R, const Vec3& C, double f, int w, int h, const Vec3& X, Point2& out) {
+        const double d[3] = {X.x - C.x, X.y - C.y, X.z - C.z};
+        const double x = R[0] * d[0] + R[1] * d[1] + R[2] * d[2], y = R[3] * d[0] + R[4] * d[1] + R[5] * d[2],
+                     z = R[6] * d[0] + R[7] * d[1] + R[8] * d[2];
+        if (z < 0.1) return false;
+        out = {f * x / z + w / 2.0, f * y / z + h / 2.0};
+        return out.x >= 2 && out.y >= 2 && out.x <= w - 3 && out.y <= h - 3;
+    }
+    // How far the solved camera path is from the scene's, gauge free: each camera's position seen from the first
+    // camera, over the whole move's length (`place`), and its rotation from the first's (`turn`, degrees).
+    static void pathMismatch(const CameraSolve& s, int frames, double& place, double& turn) {
+        using M = std::array<double, 9>;
+        auto mulT = [](const M& a, const M& b) {  // a b'
+            M r{};
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j)
+                    for (int k = 0; k < 3; ++k) r[size_t(i * 3 + j)] += a[size_t(i * 3 + k)] * b[size_t(j * 3 + k)];
+            return r;
+        };
+        auto rel = [](const M& R, Vec3 C0, Vec3 C) {
+            const double d[3] = {C.x - C0.x, C.y - C0.y, C.z - C0.z};
+            return Vec3{R[0] * d[0] + R[1] * d[1] + R[2] * d[2], R[3] * d[0] + R[4] * d[1] + R[5] * d[2], R[6] * d[0] + R[7] * d[1] + R[8] * d[2]};
+        };
+        auto length = [](Vec3 v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); };
+        M R0, Rn;
+        Vec3 C0, Cn;
+        sceneCamera(0, R0, C0);
+        sceneCamera(1, Rn, Cn);
+        const SolvedCamera& s0 = s.cameras.front();
+        const SolvedCamera& sn = s.cameras.back();
+        place = turn = 1e9;
+        if (!s0.valid || !sn.valid) return;
+        const double truthScale = length(rel(R0, C0, Cn)), solvedScale = length(rel(s0.R, s0.C, sn.C));
+        place = turn = 0;
+        for (int i = 0; i < frames; ++i) {
+            M R;
+            Vec3 C;
+            sceneCamera(double(i) / (frames - 1), R, C);
+            const SolvedCamera& c = s.cameras[size_t(i)];
+            if (!c.valid) {
+                place = turn = 1e9;
+                return;
+            }
+            const Vec3 a = rel(R0, C0, C), b = rel(s0.R, s0.C, c.C);
+            place = std::max(place, length({a.x / truthScale - b.x / solvedScale, a.y / truthScale - b.y / solvedScale,
+                                             a.z / truthScale - b.z / solvedScale}));
+            // (c s0') (R R0')' is the identity when the turns from the first camera agree.
+            const M d = mulT(mulT(c.R, s0.R), mulT(R, R0));
+            turn = std::max(turn, std::acos(std::clamp((d[0] + d[4] + d[8] - 1) / 2, -1.0, 1.0)) * 180 / M_PI);
+        }
+    }
+
+    void cameraTracking() {
+        // A scene of points: a ground (y = 1.5, under the camera) and things standing on it, seen by a moving camera
+        // whose focal length is 520 px on a 640 x 360 picture; the tracks start and end at random, a few are wrong,
+        // all have a third of a pixel of noise.
+        const int W = 640, H = 360, frames = 60;
+        const double f = 520;
+        std::mt19937 rng(3);
+        std::uniform_real_distribution<double> ux(-5, 5), uz(3, 14), uy(-2.5, 1.4), u01(0, 1);
+        std::normal_distribution<double> noise(0, 0.33);
+        std::vector<Vec3> scene;
+        std::vector<bool> ground;
+        for (int i = 0; i < 700; ++i) {
+            const bool g = i % 5 < 3;
+            scene.push_back({ux(rng), g ? 1.5 : uy(rng), uz(rng)});
+            ground.push_back(g);
+        }
+        std::vector<FeatureTrack> tracks;
+        std::vector<int> pointOfTrack;
+        for (size_t j = 0; j < scene.size(); ++j) {
+            const int a = int(u01(rng) * frames * 0.7), len = 10 + int(u01(rng) * frames);
+            FeatureTrack t;
+            for (int i = a; i < std::min(frames, a + len); ++i) {
+                std::array<double, 9> R;
+                Vec3 C;
+                sceneCamera(double(i) / (frames - 1), R, C);
+                Point2 q;
+                if (!sceneProject(R, C, f, W, H, scene[j], q)) break;
+                if (t.at.empty()) t.first = i;
+                t.at.push_back({q.x + noise(rng), q.y + noise(rng)});
+            }
+            if (t.at.size() >= 2) {
+                tracks.push_back(t);
+                pointOfTrack.push_back(int(j));
+            }
+        }
+        for (int j = 0; j < 30; ++j) {  // features on something moving on its own
+            FeatureTrack t;
+            t.first = int(u01(rng) * 30);
+            Point2 q{50 + u01(rng) * 500, 50 + u01(rng) * 250};
+            for (int i = 0; i < 20; ++i) {
+                q.x += 3;
+                q.y += std::sin(i * 0.9) * 8;
+                t.at.push_back(q);
+            }
+            tracks.push_back(t);
+            pointOfTrack.push_back(-1);
+        }
+        CameraSolve s;
+        std::string err;
+        QElapsedTimer clock;
+        clock.start();
+        QVERIFY2(solveCamera(tracks, frames, W, H, {}, s, {}, nullptr, &err), err.c_str());
+        qInfo("solved in %lld ms: focal %.1f, error %.3f px, %d keyframes, %zu points", qint64(clock.elapsed()), s.focal, s.error,
+              s.keyframes, s.points.size());
+        QVERIFY2(std::fabs(s.focal - f) < 0.05 * f, qPrintable(QString::number(s.focal)));
+        QVERIFY2(s.error < 1.0, qPrintable(QString::number(s.error)));
+        QCOMPARE(int(s.cameras.size()), frames);
+        double place = 0, turn = 0;
+        pathMismatch(s, frames, place, turn);
+        QVERIFY2(place < 0.02 && turn < 0.2, qPrintable(QString("%1 %2").arg(place).arg(turn)));
+        QVERIFY(s.points.size() > 300);
+        for (const SolvedPoint& p : s.points) QVERIFY(pointOfTrack[size_t(p.track)] >= 0);  // the wrong ones are left out
+        // Given the focal length, it is kept.
+        CameraSolveOptions known;
+        known.focal = 500;
+        CameraSolve fixed;
+        QVERIFY2(solveCamera(tracks, frames, W, H, known, fixed, {}, nullptr, &err), err.c_str());
+        QCOMPARE(fixed.focal, 500.0);
+        QVERIFY(fixed.error > s.error);
+        QVERIFY(std::fabs(s.fieldOfView() - 2 * std::atan(320 / f) * 180 / M_PI) < 3);
+
+        // Stood on its ground: the ground's points at y = 0, the first camera 1.6 above it, looking along -z.
+        CameraSolve o = s;
+        QVERIFY(orientScene(o, 1.6));
+        QVERIFY(o.oriented);
+        QVERIFY(std::fabs(o.cameras[0].C.y - 1.6) < 1e-6);
+        double off = 0, offSum = 0;
+        int onGround = 0;
+        for (const SolvedPoint& p : o.points)
+            if (ground[size_t(pointOfTrack[size_t(p.track)])]) {
+                off = std::max(off, std::fabs(p.X.y));
+                offSum += std::fabs(p.X.y);
+                ++onGround;
+            }
+        QVERIFY(onGround > 100);
+        QVERIFY2(off < 0.1 && offSum / onGround < 0.02, qPrintable(QString("%1 %2").arg(off).arg(offSum / onGround)));
+        const auto& R0 = o.cameras[0].R;
+        QVERIFY(R0[8] * -1 > 0.9 || std::hypot(R0[6], R0[8]) > 0.9);  // its forward axis is level-ish, along -z
+        QVERIFY(R0[7] < 0.2 && R0[8] < 0);
+        // Projections are the solve's: a solved point lands where its feature was.
+        const SolvedPoint& sp = o.points[o.points.size() / 2];
+        const FeatureTrack& ft = tracks[size_t(sp.track)];
+        Point2 q;
+        QVERIFY(o.project(ft.first, sp.X, q));
+        QVERIFY(std::hypot(q.x - ft.at[0].x, q.y - ft.at[0].y) < 2);
+        QVERIFY(!o.project(-1, sp.X, q) && !o.project(frames, sp.X, q));
+        // A rectangle on the ground about a ground point: its corners on the ground, its sides as asked, its top edge
+        // farther from the camera; upright, it stands up from there facing the camera.
+        Vec3 centre;
+        for (const SolvedPoint& p : o.points)
+            if (ground[size_t(pointOfTrack[size_t(p.track)])]) {
+                centre = p.X;
+                break;
+            }
+        centre.y = 0;
+        auto rect = sceneRectangle(o, centre, 2, 1, false);
+        auto dist = [](Vec3 a, Vec3 b) { return std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z - b.z) * (a.z - b.z)); };
+        for (const Vec3& c : rect) QVERIFY(std::fabs(c.y) < 1e-9);
+        QVERIFY(std::fabs(dist(rect[0], rect[1]) - 2) < 1e-9 && std::fabs(dist(rect[1], rect[2]) - 1) < 1e-9);
+        QVERIFY(dist(rect[0], o.cameras[0].C) > dist(rect[3], o.cameras[0].C));
+        auto up = sceneRectangle(o, centre, 2, 1, true);
+        QVERIFY(std::fabs(up[0].y - 0.5) < 1e-9 && std::fabs(up[3].y + 0.5) < 1e-9);
+        const auto square = sceneRectangle(o, centre, 2, 2, false), turned = sceneRectangle(o, centre, 2, 2, false, 90);
+        QVERIFY(std::fabs(turned[0].y) < 1e-9);
+        QVERIFY(dist(turned[0], square[1]) < 1e-9 || dist(turned[0], square[3]) < 1e-9);  // a quarter turn about its centre
+        // Not every scene has a ground: too few points.
+        CameraSolve bare = o;
+        bare.points.resize(5);
+        QVERIFY(!orientScene(bare));
+
+        // As text, and for other programs.
+        CameraSolve back;
+        QVERIFY(cameraSolveFromString(cameraSolveToString(o), back));
+        QCOMPARE(back.points.size(), o.points.size());
+        QCOMPARE(back.cameras.size(), o.cameras.size());
+        QVERIFY(back.oriented && std::fabs(back.focal - o.focal) < 1e-6 && std::fabs(back.cameras[30].C.x - o.cameras[30].C.x) < 1e-6);
+        QVERIFY(!cameraSolveFromString("c1 640 360", back) && !cameraSolveFromString("x", back));
+        const std::string chan = path("camera.chan"), ply = path("points.ply");
+        QVERIFY(writeNukeChan(o, chan, 1001, &err));
+        QFile cf(QString::fromStdString(chan));
+        QVERIFY(cf.open(QIODevice::ReadOnly));
+        const QStringList lines = QString::fromUtf8(cf.readAll()).split('\n', Qt::SkipEmptyParts);
+        QCOMPARE(lines.size(), frames);
+        const QStringList first = lines[0].split(' ');
+        QCOMPARE(first.size(), 8);
+        QCOMPARE(first[0], QString("1001"));
+        QVERIFY(std::fabs(first[2].toDouble() - 1.6) < 1e-5);  // ty: its height
+        QVERIFY(std::fabs(first[4].toDouble()) < 10);           // rx: looking about level
+        QVERIFY(std::fabs(first[7].toDouble() - 2 * std::atan(180 / o.focal) * 180 / M_PI) < 1e-4);  // vertical field of view
+        QVERIFY(writePointsPly(o, ply, &err));
+        QFile pf(QString::fromStdString(ply));
+        QVERIFY(pf.open(QIODevice::ReadOnly));
+        const QString plyText = QString::fromUtf8(pf.readAll());
+        QVERIFY(plyText.startsWith("ply\n") && plyText.contains(QString("element vertex %1\n").arg(o.points.size())));
+        QVERIFY(!writeNukeChan(o, "/nonexistent/dir/c.chan", 1, &err) && !err.empty());
+
+        // A camera that only turns shows no depth: no solve.
+        std::vector<FeatureTrack> turning;
+        for (size_t j = 0; j < scene.size(); ++j) {
+            FeatureTrack t;
+            for (int i = 0; i < frames; ++i) {
+                std::array<double, 9> R;
+                Vec3 C;
+                sceneCamera(double(i) / (frames - 1), R, C);
+                Point2 p2;
+                if (!sceneProject(R, Vec3{}, f, W, H, scene[j], p2)) break;
+                t.at.push_back(p2);
+            }
+            if (t.at.size() >= 10) turning.push_back(t);
+        }
+        QVERIFY(turning.size() > 50);
+        QVERIFY(!solveCamera(turning, frames, W, H, {}, back, {}, nullptr, &err));
+        QVERIFY2(QString::fromStdString(err).contains("moves too little"), err.c_str());
+        QVERIFY(!solveCamera({}, frames, W, H, {}, back, {}, nullptr, &err));
+        // A long shot whose features last only a few frames each (few alive at once): it ends, solved or not.
+        std::vector<FeatureTrack> brief;
+        for (int start = 0; start + 9 < 400; start += 3) {
+            FeatureTrack t;
+            t.first = start;
+            t.at.assign(9, Point2{20.0 + start, 30.0 + (start * 7) % 300});
+            brief.push_back(t);
+        }
+        QVERIFY(!solveCamera(brief, 400, W, H, {}, back, {}, nullptr, &err));
+    }
+
+    void cameraTrackingFootage() {
+        // The scene rendered (ray cast, 3 x 3 samples a pixel): a chequered ground under the camera, a wall far
+        // behind and two boxes standing on the ground, each square its own grey; 480 x 270 at 25 fps, as PNGs.
+        const int W = 480, H = 270, frames = 40;
+        const double f = 0.8 * W;
+        const QString dir = QString::fromStdString(path("solve"));
+        QDir().mkpath(dir);
+        auto grey = [](int a, int b, int face) {
+            uint32_t h = uint32_t(a) * 73856093u ^ uint32_t(b) * 19349663u ^ uint32_t(face) * 83492791u;
+            h ^= h >> 13;
+            h *= 0x5bd1e995u;
+            h ^= h >> 15;
+            return 0.12 + 0.8 * double(h % 1000) / 1000;
+        };
+        struct Box {
+            double x0, x1, y0, y1, z0, z1;
+        };
+        const Box boxes[2] = {{-2.2, -0.8, 0.0, 1.5, 6, 7.5}, {1.0, 2.6, -1.2, 1.5, 9, 10.5}};
+        auto shade = [&](Vec3 o, Vec3 d) {
+            double best = 1e30, value = 0.5;
+            auto hit = [&](double t, double v) {
+                if (t > 1e-6 && t < best) {
+                    best = t;
+                    value = v;
+                }
+            };
+            const double cell = 0.3;
+            auto tex = [&](double u, double v, int face) { return grey(int(std::floor(u / cell)), int(std::floor(v / cell)), face); };
+            if (d.y > 1e-9) {  // the ground, y = 1.5
+                const double t = (1.5 - o.y) / d.y;
+                hit(t, tex(o.x + t * d.x, o.z + t * d.z, 1));
+            }
+            if (d.z > 1e-9) {  // the wall, z = 16
+                const double t = (16 - o.z) / d.z;
+                hit(t, tex(o.x + t * d.x, o.y + t * d.y, 2));
+            }
+            for (int b = 0; b < 2; ++b) {
+                const Box& B = boxes[b];
+                double t0 = -1e30, t1 = 1e30;
+                int axis = -1;
+                const double lo[3] = {B.x0, B.y0, B.z0}, hi[3] = {B.x1, B.y1, B.z1}, oo[3] = {o.x, o.y, o.z}, dd[3] = {d.x, d.y, d.z};
+                bool miss = false;
+                for (int a = 0; a < 3 && !miss; ++a) {
+                    if (std::fabs(dd[a]) < 1e-12) {
+                        miss = oo[a] < lo[a] || oo[a] > hi[a];
+                        continue;
+                    }
+                    double ta = (lo[a] - oo[a]) / dd[a], tb = (hi[a] - oo[a]) / dd[a];
+                    if (ta > tb) std::swap(ta, tb);
+                    if (ta > t0) {
+                        t0 = ta;
+                        axis = a;
+                    }
+                    t1 = std::min(t1, tb);
+                    miss = t0 > t1;
+                }
+                if (miss || axis < 0) continue;
+                const Vec3 q{o.x + t0 * d.x, o.y + t0 * d.y, o.z + t0 * d.z};
+                const double u = axis == 0 ? q.z : q.x, v = axis == 1 ? q.z : q.y;
+                hit(t0, tex(u, v, 10 + b * 3 + axis));
+            }
+            return value;
+        };
+        for (int i = 0; i < frames; ++i) {
+            std::array<double, 9> R;
+            Vec3 C;
+            sceneCamera(double(i) / (frames - 1), R, C);
+            QImage img(W, H, QImage::Format_RGB32);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    double sum = 0;
+                    for (int sy = 0; sy < 3; ++sy)
+                        for (int sx = 0; sx < 3; ++sx) {
+                            // The ray through the sample, camera to world (R').
+                            const double cx = (x + (sx + 0.5) / 3 - W / 2.0) / f, cy = (y + (sy + 0.5) / 3 - H / 2.0) / f;
+                            const Vec3 d{R[0] * cx + R[3] * cy + R[6], R[1] * cx + R[4] * cy + R[7], R[2] * cx + R[5] * cy + R[8]};
+                            sum += shade(C, d);
+                        }
+                    const int g = int(std::lround(255 * sum / 9));
+                    img.setPixel(x, y, qRgb(g, g, g));
+                }
+            QVERIFY(img.save(dir + QStringLiteral("/shot_%1.png").arg(i + 1, 4, 10, QLatin1Char('0'))));
+        }
+        ImageSequence seq;
+        QVERIFY(detectImageSequence((dir + "/shot_0001.png").toStdString(), seq));
+        seq.fps = Rational{25, 1};
+        const std::string video = imageSequencePath(seq);
+
+        CameraSolve s;
+        std::string err;
+        std::vector<double> fractions;
+        QElapsedTimer clock;
+        clock.start();
+        QVERIFY2(solveMediaCamera(video, 0, frames / 25.0, {}, s, [&](double x, const char*) { fractions.push_back(x); }, nullptr, &err),
+                 err.c_str());
+        qInfo("solved the footage in %lld ms: focal %.1f, error %.3f px, %d keyframes, %zu points", qint64(clock.elapsed()), s.focal,
+              s.error, s.keyframes, s.points.size());
+        QCOMPARE(s.width, W);
+        QCOMPARE(s.height, H);
+        QCOMPARE(s.fps, 25.0);
+        QCOMPARE(int(s.cameras.size()), frames);
+        QVERIFY2(std::fabs(s.focal - f) < 0.05 * f, qPrintable(QString::number(s.focal)));
+        QVERIFY2(s.error < 1.0, qPrintable(QString::number(s.error)));
+        double place = 0, turn = 0;
+        pathMismatch(s, frames, place, turn);
+        QVERIFY2(place < 0.03 && turn < 0.5, qPrintable(QString("%1 %2").arg(place).arg(turn)));
+        QVERIFY(!fractions.empty() && fractions.back() == 1.0);
+        QVERIFY(std::is_sorted(fractions.begin(), fractions.end()));
+        // Stood on the ground: most of what was followed is on it.
+        QVERIFY(orientScene(s, 1.5));
+
+        // ---- On a clip, over MCP: solved and kept on the clip, a title placed on the ground stays there.
+        Project p = makeDefaultProject();
+        Sequence& sq = *p.active();
+        sq.width = W;
+        sq.height = H;
+        sq.fps = {25, 1};
+        MediaItem m = probeOrFail(p, video);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, sq, m.id, 0, 0, frames, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id footage = trackAt(sq, {TrackKind::Video, 0})->clips.at(0).id;
+        const QString project = QString::fromStdString(path("solve.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        const QJsonObject clipArgs{{"project", project}, {"clip", double(footage)}};
+        auto with = [&](QJsonObject extra) {
+            for (auto it = clipArgs.begin(); it != clipArgs.end(); ++it) extra.insert(it.key(), it.value());
+            return extra;
+        };
+        QJsonObject r = call("montage_camera_track", with({{"action", "info"}}));
+        QVERIFY(r.value("isError").toBool() && text(r).contains("not solved"));
+        r = call("montage_camera_track", clipArgs);
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QJsonObject sc = r.value("structuredContent").toObject();
+        QVERIFY2(std::fabs(sc.value("focal_px").toDouble() - f) < 0.05 * f, qPrintable(text(r)));
+        QCOMPARE(sc.value("frames_solved").toInt(), frames);
+        QVERIFY(sc.value("on_ground").toBool());
+        r = call("montage_camera_track", clipArgs);  // again: the one effect, its solve replaced
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Clip& solved = trackAt(*back.active(), {TrackKind::Video, 0})->clips.at(0);
+        QCOMPARE(std::count_if(solved.effects.begin(), solved.effects.end(), [](const Effect& e) { return e.type == "camera_track"; }), 1);
+        CameraSolve kept;
+        QVERIFY(clipCameraSolve(solved, kept));
+        QCOMPARE(cameraSolveFrame(*back.active(), solved, kept, 12), 12);
+        QCOMPARE(cameraSolveFrame(*back.active(), solved, kept, frames), -1);
+        // Given the lens: kept.
+        r = call("montage_camera_track", with({{"field_of_view", 70}}));
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(std::fabs(r.value("structuredContent").toObject().value("field_of_view").toDouble() - 70) < 1e-6);
+        r = call("montage_camera_track", clipArgs);
+        r = call("montage_camera_track", with({{"action", "info"}}));
+        QVERIFY2(!r.value("isError").toBool() && text(r).contains("Focal length"), qPrintable(text(r)));
+        // Placed on the ground at the bottom middle of the first frame: in the scene, where that ray meets the ground
+        // (y = 1.5); through the shot the title's middle (where its diagonals cross) is where that point is seen.
+        r = call("montage_camera_track", with({{"action", "place"}, {"text", "Hello"}, {"x", 0.5}, {"y", 0.8}, {"size", 0.3}}));
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const Id titleId = Id(r.value("structuredContent").toObject().value("id").toDouble());
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Sequence& bs = *back.active();
+        const Clip* title = edit::clipById(bs, titleId);
+        QVERIFY(title);
+        QCOMPARE(edit::locate(bs, titleId)->track.index, 1);
+        QCOMPARE(title->generator.strings.at("text"), std::string("Hello"));
+        QCOMPARE(title->duration, FrameTime(frames));
+        const Effect* pin = nullptr;
+        for (const Effect& e : title->effects)
+            if (e.type == "corner_pin") pin = &e;
+        QVERIFY(pin);
+        std::array<double, 9> R;
+        Vec3 C;
+        sceneCamera(0, R, C);
+        const double rx = 0, ry = (0.8 * H - H / 2.0) / f;
+        const Vec3 d{R[0] * rx + R[3] * ry + R[6], R[1] * rx + R[4] * ry + R[7], R[2] * rx + R[5] * ry + R[8]};
+        const double t = (1.5 - C.y) / d.y;
+        const Vec3 spot{C.x + t * d.x, 1.5, C.z + t * d.z};
+        for (int i : {0, frames / 2, frames - 1}) {
+            sceneCamera(double(i) / (frames - 1), R, C);
+            Point2 truth;
+            QVERIFY(sceneProject(R, C, f, W, H, spot, truth));
+            const TrackQuad q = cornerPinQuad(*pin, i);
+            // The diagonals tl-br and tr-bl cross at the rectangle's middle.
+            const Point2 a{q.p[0].x * W, q.p[0].y * H}, b{q.p[2].x * W, q.p[2].y * H}, c2{q.p[1].x * W, q.p[1].y * H}, e2{q.p[3].x * W, q.p[3].y * H};
+            const double den = (a.x - b.x) * (c2.y - e2.y) - (a.y - b.y) * (c2.x - e2.x);
+            QVERIFY(std::fabs(den) > 1e-9);
+            const double u = ((a.x - c2.x) * (c2.y - e2.y) - (a.y - c2.y) * (c2.x - e2.x)) / den;
+            const Point2 mid{a.x + u * (b.x - a.x), a.y + u * (b.y - a.y)};
+            QVERIFY2(std::hypot(mid.x - truth.x, mid.y - truth.y) < 3,
+                     qPrintable(QString("frame %1: %2,%3 against %4,%5").arg(i).arg(mid.x).arg(mid.y).arg(truth.x).arg(truth.y)));
+        }
+        // Not on the sky, nor outside the clip; and the effect is not added bare.
+        r = call("montage_camera_track", with({{"action", "place"}, {"y", 0.02}}));
+        QVERIFY2(r.value("isError").toBool() && text(r).contains("not on the ground"), qPrintable(text(r)));
+        r = call("montage_camera_track", with({{"action", "place"}, {"at", 1000}}));
+        QVERIFY(r.value("isError").toBool());
+        r = call("montage_add_effect", with({{"effect", "camera_track"}}));
+        QVERIFY2(r.value("isError").toBool() && text(r).contains("montage_camera_track"), qPrintable(text(r)));
+        // Exported for other programs.
+        const QString chan = QString::fromStdString(path("shot.chan")), ply = QString::fromStdString(path("shot.ply"));
+        r = call("montage_camera_track", with({{"action", "export"}, {"chan", chan}, {"ply", ply}, {"first_frame", 1001}}));
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(QFileInfo(chan).size() > 0 && QFileInfo(ply).size() > 0);
+        r = call("montage_camera_track", with({{"action", "export"}}));
+        QVERIFY(r.value("isError").toBool());
+
+        // Stopped part way: no solve.
+        std::atomic<bool> stop{true};
+        QVERIFY(!solveMediaCamera(video, 0, frames / 25.0, {}, s, {}, &stop, &err));
+        QCOMPARE(err, std::string("Cancelled"));
     }
 
     void multicamSpeakerSwitchAndAudioAngles() {

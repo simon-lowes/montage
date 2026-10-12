@@ -1666,8 +1666,8 @@ bool redactNeedsLiveFaces(const Effect& e, double sourceSeconds) {
 }
 
 void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds) {
-    // (a grade node's settings act through the node graph, render/GradeGraph.h)
-    if (!e.enabled || img.empty() || e.type == "grade_node") return;
+    // (a grade node's settings act through the node graph, render/GradeGraph.h; a 3D Camera Tracker only holds its solve)
+    if (!e.enabled || img.empty() || e.type == "grade_node" || e.type == "camera_track") return;
     struct SourceTime {
         double previous;
         explicit SourceTime(double s) : previous(tSourceSeconds) { tSourceSeconds = s; }

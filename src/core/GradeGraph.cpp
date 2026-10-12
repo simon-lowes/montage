@@ -339,7 +339,9 @@ Result convertToNodes(Sequence& s, Id clip) {
     const auto last = std::find_if(c->effects.rbegin(), c->effects.rend(), colour).base();
     for (auto it = first; it < last; ++it) {
         Effect& e = *it;
-        if (e.type == "grade_node" || e.type == "stabilize" || e.type == "rolling_shutter" || e.type == "lens_correction") continue;
+        if (e.type == "grade_node" || e.type == "stabilize" || e.type == "rolling_shutter" || e.type == "lens_correction" ||
+            e.type == "camera_track")
+            continue;
         e.node = ++key;
         GradeNode n;
         n.key = key;

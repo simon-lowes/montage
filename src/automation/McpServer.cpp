@@ -2156,6 +2156,7 @@ void McpServer::Impl::addTools() {
             if (audioClip != (info->category == EffectCategory::AudioFilter))
                 throw ArgError{audioClip ? QStringLiteral("That is an audio clip: choose an audio effect")
                                          : QStringLiteral("That is a video clip: choose a video effect")};
+            if (type == "camera_track") throw ArgError{"Solve a clip's camera with montage_camera_track"};
             if (a.contains("group_stage")) {
                 const QString stage = str(a, "group_stage");
                 ColorGroup* g = findColorGroup(l.seq(), c.colorGroup);
@@ -7257,6 +7258,106 @@ void McpServer::Impl::addTools() {
             else throw ArgError{"\"action\" is jobs, nodes, cancel, retry or remove"};
             if (!done) return fail(QString::fromStdString(err));
             return ok(QStringLiteral("%1: %2").arg(action, QString::fromStdString(id)), QJsonObject{{"job", QString::fromStdString(id)}});
+        });
+
+    add("montage_camera_track", "3D camera tracking",
+        "The camera that filmed a video clip, solved from its footage (as Fusion's Camera Tracker and After Effects' 3D "
+        "Camera Tracker do): features followed through the clip, the camera's path and focal length and the features' "
+        "places in the scene, stood on the ground the most features lie on (y up, the first solved frame's camera 1.6 high). "
+        "The camera needs to move (not only turn) over a scene with depth. solve keeps it on the clip in a 3D Camera "
+        "Tracker effect (redoing it replaces it); info reports it; place puts a title in the scene: on the ground where "
+        "the point (x, y) of the picture at `at` is (or standing there, `upright`), pinned to it in every frame; export "
+        "writes the camera as a Nuke .chan file and the points as a PLY.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "action":{"type":"string","enum":["solve","info","place","export"],"default":"solve"},
+            "field_of_view":{"type":"number","description":"solve: the lens's horizontal field of view in degrees, when known (else it is solved)"},
+            "text":{"type":"string","default":"Title","description":"place: the title's text"},
+            "at":{"type":["number","string"],"description":"place: when on the timeline to pick the point (default the clip's start)"},
+            "x":{"type":"number","default":0.5,"description":"place: across the picture, 0 to 1"},
+            "y":{"type":"number","default":0.7,"description":"place: down the picture, 0 to 1 (on the ground)"},
+            "size":{"type":"number","default":0.4,"description":"place: the title's width as a share of its distance from the camera"},
+            "upright":{"type":"boolean","default":false},"turn":{"type":"number","default":0,"description":"place: degrees about its face"},
+            "chan":{"type":"string","description":"export: the .chan file to write"},"ply":{"type":"string","description":"export: the .ply file to write"},
+            "first_frame":{"type":"integer","default":1,"description":"export: the .chan's first frame number"}},
+            "required":["project","clip"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            Clip& c = clipArg(l, a);
+            const QString action = str(a, "action", "solve");
+            std::string err;
+            auto summary = [](const CameraSolve& cs) {
+                int solved = 0;
+                for (const SolvedCamera& k : cs.cameras) solved += k.valid ? 1 : 0;
+                return QJsonObject{{"focal_px", cs.focal}, {"field_of_view", cs.fieldOfView()}, {"width", cs.width}, {"height", cs.height},
+                                   {"error_px", cs.error}, {"frames", int(cs.cameras.size())}, {"frames_solved", solved},
+                                   {"keyframes", cs.keyframes}, {"points", int(cs.points.size())}, {"on_ground", cs.oriented}};
+            };
+            auto line = [](const CameraSolve& cs) {
+                return QStringLiteral("Focal length %1 px (%2° across), error %3 px, %4 points%5")
+                    .arg(cs.focal, 0, 'f', 1)
+                    .arg(cs.fieldOfView(), 0, 'f', 1)
+                    .arg(cs.error, 0, 'f', 2)
+                    .arg(cs.points.size())
+                    .arg(cs.oriented ? QString() : QStringLiteral(" (no ground found: titles cannot be placed)"));
+            };
+            if (action == "solve") {
+                CameraSolveOptions o;
+                if (a.contains("field_of_view")) {
+                    const double fov = a.value("field_of_view").toDouble();
+                    if (!(fov > 1 && fov < 179)) throw ArgError{"\"field_of_view\" is degrees, between 1 and 179"};
+                    o.fieldOfView = fov;
+                }
+                CameraSolve cs;
+                if (!solveClipCamera(l.project, s, c, o, cs, {}, nullptr, &err))
+                    return fail(QStringLiteral("Could not solve the camera: %1").arg(QString::fromStdString(err)));
+                Effect* e = nullptr;
+                for (Effect& x : c.effects)
+                    if (!e && x.type == "camera_track") e = &x;
+                if (!e) {
+                    c.effects.push_back(makeEffect(l.project, "camera_track"));
+                    e = &c.effects.back();
+                }
+                e->strings["solve"] = cameraSolveToString(cs);
+                QJsonObject r = summary(cs);
+                r["effect_id"] = double(e->id);
+                save(l);
+                return ok(line(cs), r);
+            }
+            CameraSolve cs;
+            if (!clipCameraSolve(c, cs)) return fail("The clip's camera is not solved yet (action solve)");
+            if (action == "info") return ok(line(cs), summary(cs));
+            if (action == "export") {
+                if (!a.contains("chan") && !a.contains("ply")) throw ArgError{"Give \"chan\" and/or \"ply\": the files to write"};
+                QJsonObject r;
+                if (a.contains("chan")) {
+                    const QString chan = absolute(need(a, "chan"));
+                    if (!writeNukeChan(cs, chan.toStdString(), a.value("first_frame").toInt(1), &err)) return fail(QString::fromStdString(err));
+                    r["chan"] = chan;
+                }
+                if (a.contains("ply")) {
+                    const QString ply = absolute(need(a, "ply"));
+                    if (!writePointsPly(cs, ply.toStdString(), &err)) return fail(QString::fromStdString(err));
+                    r["ply"] = ply;
+                }
+                return ok(QStringLiteral("Wrote %1").arg(QStringList(r.keys()).join(" and ")), r);
+            }
+            if (action != "place") throw ArgError{"\"action\" is solve, info, place or export"};
+            const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : c.start;
+            if (!c.contains(at)) throw ArgError{"\"at\" is not within the clip"};
+            for (const char* key : {"x", "y", "size", "turn"})
+                if (a.contains(key) && !a.value(key).isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(key)};
+            const double size = a.value("size").toDouble(0.4);
+            if (!(size > 0)) throw ArgError{"\"size\" is more than 0"};
+            std::array<Vec3, 4> corners;
+            if (!sceneRectangleAt(s, c, cs, at - c.start, a.value("x").toDouble(0.5), a.value("y").toDouble(0.7), size,
+                                  double(s.height) / s.width, a.value("upright").toBool(), a.value("turn").toDouble(0), corners, &err))
+                return fail(QString::fromStdString(err));
+            const Id title = placeSceneTitle(l.project, s, c.id, str(a, "text", "Title").toStdString(), corners, &err);
+            if (!title) return fail(QString::fromStdString(err));
+            save(l);
+            const Clip* made = edit::clipById(s, title);
+            return ok(QStringLiteral("Placed a title in the scene"), made ? clipJson(l.project, s, *made) : QJsonObject{});
         });
 
     add("montage_animate_to_audio", "Animate to audio",

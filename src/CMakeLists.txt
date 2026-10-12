@@ -104,6 +104,7 @@ add_library(montage_engine STATIC
   media/Offload.h media/Offload.cpp
   media/MicBleed.h media/MicBleed.cpp
   media/Tracking.h media/Tracking.cpp
+  media/CameraSolve.h media/CameraSolve.cpp
   media/Reframe.h media/Reframe.cpp
   media/ModelFiles.h media/ModelFiles.cpp
   media/LensDatabase.h media/LensDatabase.cpp

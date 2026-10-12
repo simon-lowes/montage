@@ -8,6 +8,7 @@
 #include "Compositor.h"
 #include "core/Automation.h"
 #include "core/EditOps.h"
+#include "core/Effects.h"
 #include "core/Surround.h"
 #include "media/Decoder.h"
 #include "media/Reframe.h"
@@ -204,6 +205,117 @@ void applyCornerTrack(Effect& e, const std::vector<std::pair<FrameTime, TrackQua
                            prm.keys.end());
             for (const auto& [t, q] : keys) prm.addKey(t, axis == 0 ? q.p[k].x : q.p[k].y, Interp::Linear);
         }
+}
+
+// ---- 3D camera tracking ---------------------------------------------------------------
+
+bool solveClipCamera(const Project& p, const Sequence& s, const Clip& c, const CameraSolveOptions& options, CameraSolve& out,
+                     const SolveProgress& progress, const std::atomic<bool>* cancel, std::string* error) {
+    const MediaItem* m = videoMedia(p, c, error);
+    if (!m) return false;
+    const double a = sourceSeconds(s, c, 0), b = sourceSeconds(s, c, c.duration - 1);
+    const double frame = 1 / (m->fps.valid() ? m->fps.toDouble() : s.fpsValue());
+    const double from = std::max(0.0, std::min(a, b)), to = std::max(a, b) + frame;
+    if (!solveMediaCamera(m->path, from, to, options, out, progress, cancel, error)) return false;
+    orientScene(out);
+    return true;
+}
+
+bool clipCameraSolve(const Clip& c, CameraSolve& out, Id* effect) {
+    for (const Effect& e : c.effects)
+        if (e.type == "camera_track" && cameraSolveFromString(e.s("solve"), out)) {
+            if (effect) *effect = e.id;
+            return true;
+        }
+    return false;
+}
+
+int cameraSolveFrame(const Sequence& s, const Clip& c, const CameraSolve& solve, FrameTime local) {
+    if (!(solve.fps > 0) || local < 0 || local >= c.duration) return -1;
+    const long long i = std::llround((sourceSeconds(s, c, local) - solve.start) * solve.fps);
+    return i >= 0 && i < (long long)solve.cameras.size() ? int(i) : -1;
+}
+
+bool sceneRectangleAt(const Sequence& s, const Clip& c, const CameraSolve& solve, FrameTime local, double x, double y, double size,
+                      double aspect, bool upright, double turn, std::array<Vec3, 4>& out, std::string* error) {
+    const int frame = cameraSolveFrame(s, c, solve, local);
+    if (frame < 0 || !solve.cameras[size_t(frame)].valid) {
+        if (error) *error = "The camera is not solved at this frame";
+        return false;
+    }
+    if (!solve.oriented) {
+        if (error) *error = "No ground was found in the shot to place things on";
+        return false;
+    }
+    Vec3 at;
+    if (!groundPoint(solve, frame, {x * solve.width, y * solve.height}, at)) {
+        if (error) *error = "That point is not on the ground: pick one below the horizon";
+        return false;
+    }
+    const Vec3 C = solve.cameras[size_t(frame)].C;
+    const double distance = std::sqrt((at.x - C.x) * (at.x - C.x) + (at.y - C.y) * (at.y - C.y) + (at.z - C.z) * (at.z - C.z));
+    const double w = std::max(1e-6, size) * distance, h = w * aspect;
+    if (upright) at.y += h / 2;
+    out = sceneRectangle(solve, at, w, h, upright, turn);
+    return true;
+}
+
+bool sceneCornerKeys(const Project& p, const Sequence& s, const Clip& footage, const CameraSolve& solve,
+                     const std::array<Vec3, 4>& corners, const Clip& over, std::vector<std::pair<FrameTime, TrackQuad>>& keys,
+                     std::string* error) {
+    keys.clear();
+    const FrameTime from = std::max(footage.start, over.start), to = std::min(footage.end(), over.end());
+    for (FrameTime t = from; t < to; ++t) {
+        const int frame = cameraSolveFrame(s, footage, solve, t - footage.start);
+        if (frame < 0) continue;
+        TrackQuad q;
+        bool ok = true;
+        for (int k = 0; k < 4 && ok; ++k) {
+            Point2 px;
+            ok = solve.project(frame, corners[size_t(k)], px);
+            q.p[k] = {px.x / solve.width, px.y / solve.height};
+        }
+        if (ok && mapQuad(p, s, footage, over, t, q)) keys.push_back({t - over.start, q});
+    }
+    if (keys.empty() && error) *error = "The rectangle is not in view where the camera is solved";
+    return !keys.empty();
+}
+
+Id placeSceneTitle(Project& p, Sequence& s, Id footageId, const std::string& text, const std::array<Vec3, 4>& corners,
+                   std::string* error) {
+    auto fail = [&](const char* message) {
+        if (error) *error = message;
+        return Id(0);
+    };
+    const auto loc = edit::locate(s, footageId);
+    const Clip* found = edit::clipById(s, footageId);
+    if (!loc || !found || loc->track.kind != TrackKind::Video) return fail("Place titles over a video clip");
+    const Clip footage = *found;
+    CameraSolve solve;
+    if (!clipCameraSolve(footage, solve)) return fail("Solve the clip's camera first (3D Camera Tracker)");
+    Clip title = makeGeneratorClip(p, "title", footage.duration);
+    title.generator.strings["text"] = text;
+    title.name = text.substr(0, 40);
+    title.start = footage.start;
+    std::vector<std::pair<FrameTime, TrackQuad>> keys;
+    if (!sceneCornerKeys(p, s, footage, solve, corners, title, keys, error)) return 0;
+    Effect pin = makeEffect(p, "corner_pin");
+    applyCornerTrack(pin, keys);
+    title.effects.push_back(pin);
+    // The first track above the footage with room for it, else a new one.
+    TrackRef track{TrackKind::Video, -1};
+    for (int i = loc->track.index + 1; i < int(s.videoTracks.size()) && track.index < 0; ++i) {
+        bool room = true;
+        for (const Clip& c : s.videoTracks[size_t(i)].clips) room = room && (c.end() <= footage.start || c.start >= footage.end());
+        if (room) track.index = i;
+    }
+    if (track.index < 0) track = edit::addTrack(p, s, TrackKind::Video);
+    const auto r = edit::overwrite(p, s, track, title);
+    if (!r.ok || r.created.empty()) {
+        if (error) *error = r.error.empty() ? "The title could not be placed" : r.error;
+        return 0;
+    }
+    return r.created[0];
 }
 
 // ---- Following -----------------------------------------------------------------------

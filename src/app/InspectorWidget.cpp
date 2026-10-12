@@ -10,6 +10,7 @@
 #include <QInputDialog>
 #include <QDoubleSpinBox>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QFontComboBox>
 #include <QFormLayout>
 #include <QHBoxLayout>
@@ -825,6 +826,63 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             // Deferred: the analysis waits in an event loop, and the Inspector may rebuild meanwhile.
             connect(analyze, &QPushButton::clicked, this,
                     [this, owner, eid] { QTimer::singleShot(0, this, [this, owner, eid] { analyzeStabilize(owner, eid); }); });
+        }
+        if (e.type == "camera_track" && onClip) {
+            // The solve lives in the effect; titles are placed from it, and it is exported for 3D programs.
+            auto* row = new QWidget(content_);
+            auto* rv = new QVBoxLayout(row);
+            rv->setContentsMargins(0, 0, 0, 0);
+            auto* status = new QLabel(row);
+            status->setObjectName(QStringLiteral("cameraTrackStatus"));
+            status->setWordWrap(true);
+            CameraSolve cs;
+            if (cameraSolveFromString(e.s("solve"), cs))
+                status->setText(tr("Solved: %1° lens, %2 px error, %n point(s)%3", "", int(cs.points.size()))
+                                    .arg(cs.fieldOfView(), 0, 'f', 1)
+                                    .arg(cs.error, 0, 'f', 2)
+                                    .arg(cs.oriented ? QString() : tr("; no ground found")));
+            else
+                status->setText(tr("Not solved yet: the camera needs to move (not only turn) over a scene with depth"));
+            auto* buttons = new QWidget(row);
+            auto* bh = new QHBoxLayout(buttons);
+            bh->setContentsMargins(0, 0, 0, 0);
+            auto* solve = new QPushButton(tr("Solve"), buttons);
+            solve->setObjectName(QStringLiteral("solveCamera"));
+            solve->setToolTip(tr("Solve the camera that filmed this clip"));
+            auto* place = new QPushButton(tr("Place Title"), buttons);
+            place->setObjectName(QStringLiteral("placeSceneTitle"));
+            place->setToolTip(tr("Put a title in the scene at the playhead, where Place At points (on the ground, or standing on it)"));
+            auto* save = new QPushButton(tr("Export…"), buttons);
+            save->setObjectName(QStringLiteral("exportCamera"));
+            save->setToolTip(tr("Write the camera as a Nuke .chan file and its points as a .ply beside it"));
+            place->setEnabled(cs.oriented);
+            save->setEnabled(cs.focal > 0);
+            bh->addWidget(solve);
+            bh->addWidget(place);
+            bh->addWidget(save);
+            rv->addWidget(status);
+            rv->addWidget(buttons);
+            f->insertRow(0, QString(), row);
+            connect(solve, &QPushButton::clicked, this,
+                    [this, owner, eid] { QTimer::singleShot(0, this, [this, owner, eid] { solveCameraTrack(owner, eid); }); });
+            connect(place, &QPushButton::clicked, this, [this, owner, eid] {
+                QTimer::singleShot(0, this, [this, owner, eid] {
+                    bool ok = false;
+                    const QString text = QInputDialog::getText(window(), tr("Place Title"), tr("Text:"), QLineEdit::Normal, tr("Title"), &ok);
+                    if (ok && !text.isEmpty()) placeTitleInScene(owner, eid, text);
+                });
+            });
+            connect(save, &QPushButton::clicked, this, [this, cs] {
+                const QString chan = QFileDialog::getSaveFileName(window(), tr("Export Camera"), QStringLiteral("camera.chan"),
+                                                                  tr("Nuke camera (*.chan)"));
+                if (chan.isEmpty()) return;
+                const QString ply = QFileInfo(chan).path() + "/" + QFileInfo(chan).completeBaseName() + ".ply";
+                std::string err;
+                if (!writeNukeChan(cs, chan.toStdString(), 1, &err) || !writePointsPly(cs, ply.toStdString(), &err))
+                    state_->message(QString::fromStdString(err), 6000);
+                else
+                    state_->message(tr("Wrote %1 and %2").arg(QFileInfo(chan).fileName(), QFileInfo(ply).fileName()), 4000);
+            });
         }
         if (e.type == "lens_correction" && onClip) {
             // The lens profile it holds, chosen in the Correct Lens dialog.
@@ -2189,6 +2247,57 @@ void InspectorWidget::analyzeStabilize(Id clip, Id effect) {
         e->strings["motion"] = motion;
         return true;
     });
+}
+
+void InspectorWidget::solveCameraTrack(Id clip, Id effect) {
+    const Sequence* s = state_->sequence();
+    if (!s || !edit::clipById(*s, clip)) return;
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    CameraSolve cs;
+    const bool ok = runAnalysis(tr("Solving the camera..."), [&, project, seqId, clip](const auto& progress, const auto* cancel, std::string* err) {
+        const Sequence* sq = project->findSequence(seqId);
+        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
+        return cl && solveClipCamera(*project, *sq, *cl, {}, cs, [&](double f, const char*) { progress(f); }, cancel, err);
+    });
+    if (!ok) return;
+    const std::string solve = cameraSolveToString(cs);
+    state_->edit(tr("Solve Camera"), [clip, effect, solve](Project&, Sequence& sq) {
+        Effect* e = edit::ownedEffect(sq, clip, effect);
+        if (!e) return false;
+        e->strings["solve"] = solve;
+        return true;
+    });
+    state_->message(cs.oriented ? tr("Solved the camera: %1 px error").arg(cs.error, 0, 'f', 2)
+                                : tr("Solved the camera, but found no ground to place titles on"),
+                    5000);
+}
+
+Id InspectorWidget::placeTitleInScene(Id clip, Id effect, const QString& text) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
+    const Effect* e = c ? edit::ownedEffect(const_cast<Sequence&>(*s), clip, effect) : nullptr;
+    CameraSolve cs;
+    if (!e || !cameraSolveFromString(e->s("solve"), cs)) {
+        state_->message(tr("Solve the camera first"), 5000);
+        return 0;
+    }
+    const FrameTime local = std::clamp<FrameTime>(state_->playhead() - c->start, 0, c->duration - 1);
+    std::array<Vec3, 4> corners;
+    std::string err;
+    if (!sceneRectangleAt(*s, *c, cs, local, e->p("place_x", local, 50) / 100, e->p("place_y", local, 70) / 100,
+                          e->p("place_size", local, 40) / 100, double(s->height) / s->width, e->p("place_upright", local) > 0.5,
+                          e->p("place_turn", local), corners, &err)) {
+        state_->message(QString::fromStdString(err), 6000);
+        return 0;
+    }
+    Id made = 0;
+    state_->edit(tr("Place Title in Scene"), [&](Project& p, Sequence& sq) {
+        made = placeSceneTitle(p, sq, clip, text.toStdString(), corners, &err);
+        return made != 0;
+    });
+    if (!made) state_->message(QString::fromStdString(err), 6000);
+    return made;
 }
 
 void InspectorWidget::trackMask(Id clip, Id effect, bool forward, int model) {

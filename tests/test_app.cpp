@@ -10177,6 +10177,153 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void cameraTrackerInInspectorAndViewer() {
+        // A clip with a solve (made here: a camera 1.6 above a ground of points, moving right while it looks along -z).
+        QImage tex(320, 180, QImage::Format_RGB32);
+        tex.fill(QColor(60, 90, 120));
+        const QString png = dir_.path() + "/flat.png";
+        QVERIFY(tex.save(png));
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 320;
+        gs.height = 180;
+        gs.fps = {25, 1};
+        MediaItem m;
+        m.id = gen.newId();
+        std::string err;
+        QVERIFY(probeMedia(png.toStdString(), m, &err));
+        gen.media.push_back(m);
+        Clip gc = makeClip(gen, m, TrackKind::Video, gs);
+        gc.duration = 20;
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, gc);
+        ExportSettings st;
+        st.path = (dir_.path() + "/flat.mp4").toStdString();
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        state()->newProject();
+        state()->edit("Format", [](Project&, Sequence& s) {
+            s.width = 320;
+            s.height = 180;
+            s.fps = {25, 1};
+            return true;
+        });
+        auto ids = state()->importFiles({QString::fromStdString(st.path)});
+        QCOMPARE(ids.size(), size_t(1));
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        });
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        CameraSolve cs;
+        cs.width = 320;
+        cs.height = 180;
+        cs.focal = 300;
+        cs.fps = 25;
+        cs.oriented = true;
+        cs.keyframes = 3;
+        for (int i = 0; i < 20; ++i) {
+            SolvedCamera c;
+            c.valid = true;
+            c.R = {1, 0, 0, 0, -1, 0, 0, 0, -1};
+            c.C = {0.02 * i, 1.6, 0};
+            cs.cameras.push_back(c);
+        }
+        for (int i = 0; i < 40; ++i) {
+            SolvedPoint sp;
+            sp.X = {-2 + 0.1 * i, 0, -3 - 0.15 * i};
+            sp.error = 0.4;
+            sp.seen = 20;
+            sp.last = 19;
+            cs.points.push_back(sp);
+        }
+        Id eid = 0;
+        state()->edit("Tracker", [&](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "camera_track");
+            e.strings["solve"] = cameraSolveToString(cs);
+            eid = e.id;
+            edit::clipById(s, clip)->effects.push_back(e);
+            return true;
+        });
+        state()->setSelection({clip}, false);
+        state()->setPlayhead(10);
+        win_->findChild<QDockWidget*>("inspector")->show();
+        win_->findChild<QDockWidget*>("inspector")->raise();
+        QApplication::processEvents();
+
+        // The Inspector says what was solved and offers Solve, Place Title and Export.
+        QLabel* status = nullptr;
+        for (auto* l : win_->findChildren<QLabel*>("cameraTrackStatus"))
+            if (l->isVisibleTo(win_.get())) status = l;
+        QVERIFY(status);
+        QVERIFY2(status->text().contains("Solved") && status->text().contains("40 point"), qPrintable(status->text()));
+        for (const char* name : {"solveCamera", "placeSceneTitle", "exportCamera"}) {
+            QPushButton* b = nullptr;
+            for (auto* x : win_->findChildren<QPushButton*>(name))
+                if (x->isVisibleTo(win_.get())) b = x;
+            QVERIFY2(b && b->isEnabled(), name);
+        }
+
+        // The viewer shows the points tracked in the frame on screen (green: they fit), until Show Tracked Points is off.
+        MonitorPanel* program = nullptr;
+        for (auto* mp : win_->findChildren<MonitorPanel*>())
+            if (mp->mode() == MonitorPanel::Mode::Program) program = mp;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        QTRY_VERIFY_WITH_TIMEOUT(!viewer->image().isNull(), 5000);
+        auto* overlay = viewer->findChild<MaskOverlay*>();
+        QVERIFY(overlay);
+        auto greens = [&] {
+            QApplication::processEvents();
+            const QImage img = viewer->grab().toImage();
+            int n = 0;
+            for (int y = 0; y < img.height(); ++y)
+                for (int x = 0; x < img.width(); ++x) {
+                    const QColor c = img.pixelColor(x, y);
+                    if (c.green() > 180 && c.red() < 140 && c.blue() < 160) ++n;
+                }
+            return n;
+        };
+        QVERIFY(greens() > 20);
+        state()->edit("Hide", [&](Project&, Sequence& s) {
+            edit::ownedEffect(s, clip, eid)->params["show_points"] = Param(0.0);
+            return true;
+        });
+        QCOMPARE(greens(), 0);
+
+        // Place Title: a title over the clip for its length, on the ground where the picture's (50 %, 70 %) is at the
+        // playhead, its Corner Pin keyed through the clip.
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        const Id title = inspector->placeTitleInScene(clip, eid, "Hello");
+        QVERIFY(title);
+        const Sequence& sq = *state()->sequence();
+        QCOMPARE(edit::locate(sq, title)->track.index, 1);
+        const Clip* t = edit::clipById(sq, title);
+        QCOMPARE(t->duration, FrameTime(20));
+        const Effect* pin = nullptr;
+        for (const Effect& e : t->effects)
+            if (e.type == "corner_pin") pin = &e;
+        QVERIFY(pin && pin->params.at("tl_x").keys.size() == 20);
+        // The ground point under (50 %, 70 %) at frame 10 is in the middle of the title's bottom half there.
+        const TrackQuad q = cornerPinQuad(*pin, 10);
+        const double midX = (q.p[0].x + q.p[1].x + q.p[2].x + q.p[3].x) / 4, midY = (q.p[0].y + q.p[1].y + q.p[2].y + q.p[3].y) / 4;
+        QVERIFY2(std::fabs(midX - 0.5) < 0.02 && std::fabs(midY - 0.7) < 0.03, qPrintable(QString("%1 %2").arg(midX).arg(midY)));
+        QVERIFY(q.p[0].y < q.p[3].y && q.p[0].x < q.p[1].x);  // its top edge farther away, upright on screen
+        state()->undo();
+        QVERIFY(!edit::clipById(*state()->sequence(), title));
+        // Pointing at the sky: nothing placed.
+        state()->edit("Sky", [&](Project&, Sequence& s) {
+            edit::ownedEffect(s, clip, eid)->params["place_y"] = Param(10.0);
+            return true;
+        });
+        QCOMPARE(inspector->placeTitleInScene(clip, eid, "Up"), Id(0));
+
+        // Solving a flat picture finds nothing to follow: the solve kept is the one it had.
+        inspector->solveCameraTrack(clip, eid);
+        CameraSolve kept;
+        QVERIFY(clipCameraSolve(*edit::clipById(*state()->sequence(), clip), kept));
+        QCOMPARE(kept.points.size(), size_t(40));
+    }
+
     void stabilizeAndTrackFromInspector() {
         // A textured still shaken by a few pixels every frame.
         QImage tex(320, 180, QImage::Format_RGB32);

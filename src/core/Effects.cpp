@@ -239,6 +239,15 @@ std::vector<EffectInfo> buildCatalog() {
                   pct("rolling_shutter", "Rolling Shutter", 0, 100, 0)},
                  {}});
     for (auto& pi : c.back().params) pi.keyframeable = false;
+    // 3D Camera Tracker (Fusion's Camera Tracker, After Effects' 3D Camera Tracker): the camera that filmed the clip,
+    // solved from its footage (media/CameraSolve.h) and kept in strings["solve"]; the picture is untouched. Its tracked
+    // points show in the viewer, and titles are placed in the scene from the Inspector (render/ClipAnalysis.h).
+    c.push_back({"camera_track", "3D Camera Tracker", EffectCategory::VideoFilter, "Transform",
+                 {boolean("show_points", "Show Tracked Points", true), pct("place_x", "Place At X", 0, 100, 50),
+                  pct("place_y", "Place At Y", 0, 100, 70), pct("place_size", "Title Width (% of its distance)", 1, 300, 40),
+                  boolean("place_upright", "Stand Upright"), num("place_turn", "Turn (degrees)", -180, 180, 0, 1)},
+                 {}});
+    for (auto& pi : c.back().params) pi.keyframeable = false;
     // Rolling Shutter Repair (Premiere's, Final Cut's): the same analysis; each row is moved back to where the
     // picture was mid-frame, from the camera's speed and how long the sensor takes to read out (a share of a frame).
     c.push_back({"rolling_shutter", "Rolling Shutter Repair", EffectCategory::VideoFilter, "Transform",

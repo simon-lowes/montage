@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "core/Model.h"
+#include "media/CameraSolve.h"
 #include "media/Tracking.h"
 #include "core/ObjectMask.h"
 #include <memory>
@@ -51,6 +52,32 @@ bool trackClipCorners(const Project& p, const Sequence& s, const Clip& c, const 
 // eight corner parameters (replacing the keyframes in the tracked range).
 TrackQuad cornerPinQuad(const Effect& e, FrameTime t);
 void applyCornerTrack(Effect& e, const std::vector<std::pair<FrameTime, TrackQuad>>& keys);
+
+// ---- 3D camera tracking (media/CameraSolve.h) -------------------------------------
+// The camera of video clip `c`, solved over the part of its media it shows and stood on its ground (orientScene) when
+// the scene has one.
+bool solveClipCamera(const Project& p, const Sequence& s, const Clip& c, const CameraSolveOptions& options, CameraSolve& out,
+                     const SolveProgress& progress = {}, const std::atomic<bool>* cancel = nullptr, std::string* error = nullptr);
+// The solve a clip's 3D Camera Tracker effect holds (its strings["solve"]); false when it has none. `effect` gets the
+// effect's id.
+bool clipCameraSolve(const Clip& c, CameraSolve& out, Id* effect = nullptr);
+// The solve's frame showing clip-local frame `local`; -1 when the solve does not reach it.
+int cameraSolveFrame(const Sequence& s, const Clip& c, const CameraSolve& solve, FrameTime local);
+// A flat rectangle in the scene for a title: centred where the point (x, y) (fractions of the clip's frame) at
+// clip-local `local` meets the ground, `size` (a share of its distance from the camera) wide and `aspect` (height /
+// width) of that high, lying on the ground or (`upright`) standing on it facing the camera, turned `turn` degrees.
+bool sceneRectangleAt(const Sequence& s, const Clip& c, const CameraSolve& solve, FrameTime local, double x, double y, double size,
+                      double aspect, bool upright, double turn, std::array<Vec3, 4>& out, std::string* error = nullptr);
+// Corner Pin keys that put the whole frame of clip `over` (on a track above `footage`) on the scene rectangle
+// `corners` in each frame the two share where the camera is solved, as (`over`-local frame, corners) keys.
+bool sceneCornerKeys(const Project& p, const Sequence& s, const Clip& footage, const CameraSolve& solve,
+                     const std::array<Vec3, 4>& corners, const Clip& over, std::vector<std::pair<FrameTime, TrackQuad>>& keys,
+                     std::string* error = nullptr);
+// A title saying `text` over `footage` for its length (on the first track above it with room, a new one if none),
+// pinned with a Corner Pin to the scene rectangle `corners` of the footage's solve. Its id, 0 with `error` when it
+// cannot be.
+Id placeSceneTitle(Project& p, Sequence& s, Id footage, const std::string& text, const std::array<Vec3, 4>& corners,
+                   std::string* error = nullptr);
 
 // ---- Following (titles and graphics that move with the footage) ---------------
 // The topmost video clip beneath `c` on a lower track at clip-local `local`; null if none.

@@ -81,6 +81,11 @@ public:
     QString publishField(Id clip, Id effect, const std::string& param, const QString& label);
     // Analyses clip `clip`'s footage for its Stabilize effect `effect`.
     void analyzeStabilize(Id clip, Id effect);
+    // Solves the camera of clip `clip`'s footage into its 3D Camera Tracker `effect`.
+    void solveCameraTrack(Id clip, Id effect);
+    // A title saying `text` placed in the scene of `clip`'s solve, where its 3D Camera Tracker `effect`'s settings say
+    // at the playhead; its id, 0 (with the reason shown) when it cannot be.
+    Id placeTitleInScene(Id clip, Id effect, const QString& text);
     // Tracks the mask of `effect` on `clip` from the playhead to the clip's end
     // (forward) or start; model 0 position, 1 + scale, 2 + rotation.
     void trackMask(Id clip, Id effect, bool forward, int model);
