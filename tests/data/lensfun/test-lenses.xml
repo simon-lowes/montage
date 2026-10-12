@@ -1,0 +1,68 @@
+<lensdatabase version="1">
+    <mount>
+        <name>Test E</name>
+        <compat>Test Old</compat>
+    </mount>
+    <camera>
+        <maker>Sony</maker>
+        <model>ILCE-7M4</model>
+        <model lang="en">Alpha 7 IV</model>
+        <mount>Test E</mount>
+        <cropfactor>1</cropfactor>
+    </camera>
+    <camera>
+        <maker>Sony</maker>
+        <model>ILCE-6400</model>
+        <model lang="en">Alpha 6400</model>
+        <mount>Test E</mount>
+        <cropfactor>1.534</cropfactor>
+    </camera>
+    <camera>
+        <maker>GoPro</maker>
+        <model>Hero11 Black</model>
+        <mount>goProHero11bl</mount>
+        <cropfactor>5.54</cropfactor>
+    </camera>
+    <lens>
+        <maker>Sony</maker>
+        <model>FE 24-38mm f/2.8 Test</model>
+        <mount>Test E</mount>
+        <cropfactor>1</cropfactor>
+        <calibration>
+            <distortion model="ptlens" focal="24" a="0.02824" b="-0.07818" c="0.03129"/>
+            <distortion model="ptlens" focal="30" a="0.01769" b="-0.03891" c="0.01588"/>
+            <distortion model="ptlens" focal="38" a="0.01259" b="-0.01412" c="-0.00168"/>
+            <tca model="poly3" focal="24" vr="1.0004" vb="0.9995" cr="0.0002" cb="-0.0001" br="-0.0003" bb="0.0002"/>
+            <tca model="poly3" focal="38" vr="1.0001" vb="0.9998" cr="0.0001" cb="0.0001" br="-0.0001" bb="0.0001"/>
+            <vignetting model="pa" focal="24" aperture="2.8" distance="1000" k1="-0.5106" k2="-0.3627" k3="0.1448"/>
+            <vignetting model="pa" focal="24" aperture="4" distance="1000" k1="-0.5475" k2="-0.0406" k3="-0.0402"/>
+            <vignetting model="pa" focal="38" aperture="2.8" distance="1000" k1="-0.4385" k2="-0.0068" k3="-0.1004"/>
+            <vignetting model="pa" focal="38" aperture="4" distance="1000" k1="-0.3202" k2="-0.2120" k3="0.1510"/>
+        </calibration>
+    </lens>
+    <lens>
+        <maker>Samyang</maker>
+        <model>Samyang 8mm f/2.8 UMC Fish-eye</model>
+        <mount>Test Old</mount>
+        <type>stereographic</type>
+        <cropfactor>1.534</cropfactor>
+        <calibration>
+            <distortion model="ptlens" focal="8" a="0.02036" b="-0.08028" c="0.01446"/>
+            <real-focal-length focal="8" real-focal="8.405"/>
+            <tca model="poly3" focal="8" br="-0.0000138" vr="1.0000964" bb="0.0001036" vb="1.0000325"/>
+            <vignetting model="pa" focal="8" aperture="2.8" distance="1000" k1="-1.5018" k2="0.9506" k3="-0.2946"/>
+        </calibration>
+    </lens>
+    <lens>
+        <maker>GoPro</maker>
+        <model>HERO11 Black &amp; compatibles</model>
+        <model lang="en">fixed lens</model>
+        <mount>goProHero11bl</mount>
+        <type>fisheye</type>
+        <cropfactor>5.54</cropfactor>
+        <aspect-ratio>8:7</aspect-ratio>
+        <calibration>
+            <distortion model="ptlens" focal="2.7" a="0.0594752" b="-0.141715" c="-0.322349"/>
+        </calibration>
+    </lens>
+</lensdatabase>

@@ -72,6 +72,7 @@
 #include "media/SpatialAudio.h"
 #include "render/ExtendClip.h"
 #include "render/ColorChart.h"
+#include "media/LensDatabase.h"
 #include "render/ReviewExport.h"
 #include "render/Versions.h"
 #include "render/ClipPlacement.h"
@@ -15108,6 +15109,132 @@ private slots:
             for (int i = 0; i < 24; ++i) mean += deltaE76(got[size_t(i)], colorChecker24()[size_t(i)]) / 24;
             QVERIFY2(mean < promised + 1, qPrintable(QString("%1 played, %2 promised").arg(mean).arg(promised)));
         }
+    }
+
+    void correctLensOverMcp() {
+        // The test database stands in for lensfun's, from MONTAGE_LENS_DB.
+        QTemporaryDir lenses;
+        QVERIFY(QFile::copy(QStringLiteral(MONTAGE_TEST_DATA_DIR "/lensfun/test-lenses.xml"), lenses.filePath("test-lenses.xml")));
+        const QByteArray before = qgetenv("MONTAGE_LENS_DB");
+        qputenv("MONTAGE_LENS_DB", lenses.path().toUtf8());
+        reloadLensDatabase();
+        struct Restore {
+            QByteArray v;
+            ~Restore() {
+                if (v.isEmpty()) qunsetenv("MONTAGE_LENS_DB");
+                else qputenv("MONTAGE_LENS_DB", v);
+                reloadLensDatabase();
+            }
+        } restore{before};
+        const auto db = lensDatabase();
+        QVERIFY(db);
+        QCOMPARE(db->lenses().size(), size_t(3));
+        QCOMPARE(lensDatabaseFolders(), std::vector<std::string>{lenses.path().toStdString()});
+        QCOMPARE(lensDatabasePack().files.size(), size_t(56));
+        QCOMPARE(lensDatabasePack().directory(), lenses.path().toStdString());
+
+        // A recording names its camera; a fixed lens comes with it, an interchangeable one is asked for.
+        MediaItem cam;
+        cam.metadata["device"] = "GoPro HERO11 Black";
+        LensChoice c = suggestLens(*db, cam);
+        QVERIFY(c.camera && c.lens);
+        QCOMPARE(lens::lensName(*c.lens), std::string("GoPro HERO11 Black & compatibles"));
+        QCOMPARE(c.focal, 2.7);
+        cam.metadata["device"] = "Sony ILCE-6400";
+        c = suggestLens(*db, cam);
+        QVERIFY(c.camera && !c.lens);
+        cam.metadata.clear();
+        QVERIFY(!suggestLens(*db, cam).camera);
+
+        // A still from the GoPro on the timeline twice.
+        const std::string png = path("gopro-frame.png");
+        QImage frame(320, 180, QImage::Format_RGB32);
+        frame.fill(QColor(90, 120, 150));
+        QVERIFY(frame.save(QString::fromStdString(png)));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180;
+        MediaItem m = probeOrFail(p, png);
+        m.metadata["device"] = "GoPro HERO11 Black";
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, m.id, 60, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id first = s.videoTracks[0].clips[0].id;
+        s.videoTracks[0].clips[0].effects.push_back(makeEffect(p, "brightness_contrast"));
+        const QString project = QString::fromStdString(path("lens.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject full = args;
+            if (!full.contains("project")) full["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_correct_lens"}, {"arguments", full},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject o = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object();
+            return o.contains("error") ? QJsonObject{{"isError", true}, {"error", o.value("error")}} : o.value("result").toObject();
+        };
+        // Listing: the camera found from the clip's media and the lenses that fit it; a query narrows them.
+        QJsonObject r = call({{"clip", double(first)}, {"list", true}, {"camera", "Sony ILCE-6400"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject out = r.value("structuredContent").toObject();
+        QCOMPARE(out.value("camera").toObject().value("name").toString(), QStringLiteral("Sony ILCE-6400"));
+        QCOMPARE(out.value("lenses").toArray().size(), 2);
+        r = call({{"clip", double(first)}, {"list", true}, {"camera", "Sony ILCE-6400"}, {"query", "fish"}});
+        QCOMPARE(r.value("structuredContent").toObject().value("lenses").toArray().size(), 1);
+        // Corrected: the GoPro's fixed lens, from the clip's camera, first in its effects; the project saved.
+        r = call({{"clip", double(first)}, {"params", QJsonObject{{"fit", 1}, {"tca", 0}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        out = r.value("structuredContent").toObject();
+        QCOMPARE(out.value("lens").toString(), QStringLiteral("GoPro HERO11 Black & compatibles"));
+        QCOMPARE(out.value("type").toString(), QStringLiteral("Fisheye"));
+        QCOMPARE(out.value("clips").toInt(), 1);
+        QCOMPARE(out.value("focal").toDouble(), 2.7);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Clip* clip = edit::clipById(*back.active(), first);
+        QVERIFY(clip && clip->effects.size() == 2);
+        const Effect& e = clip->effects[0];
+        QCOMPARE(e.type, std::string("lens_correction"));
+        QCOMPARE(qint64(e.id), qint64(out.value("effect").toDouble()));
+        QCOMPARE(e.s("camera"), std::string("GoPro Hero11 Black"));
+        QCOMPARE(e.p("fit", 0), 1.0);
+        QCOMPARE(e.p("tca", 0), 0.0);
+        QCOMPARE(e.p("camera_crop", 0), 5.54);
+        // The profile is in the project: it renders without the database.
+        const auto kept = lens::parseLens(e.s("profile"));
+        QVERIFY(kept && kept->type == lens::Projection::Fisheye && kept->calibrations.size() == 1);
+        QVERIFY(edit::clipById(*back.active(), back.active()->videoTracks[0].clips[1].id)->effects.empty());
+        // Again, another lens by name with its focal length and aperture, on every clip of the media: replaced, not added.
+        r = call({{"clip", double(first)}, {"camera", "Sony ILCE-6400"}, {"lens", "Samyang 8mm"}, {"aperture", 4}, {"same_media", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("clips").toInt(), 2);
+        QVERIFY(loadProject(project.toStdString(), back));
+        for (const Clip& k : back.active()->videoTracks[0].clips) {
+            QCOMPARE(int(std::count_if(k.effects.begin(), k.effects.end(), [](const Effect& x) { return x.type == "lens_correction"; })), 1);
+            QCOMPARE(k.effects[0].s("lens"), std::string("Samyang 8mm f/2.8 UMC Fish-eye"));
+            QCOMPARE(k.effects[0].p("aperture", 0), 4.0);
+            QCOMPARE(k.effects[0].p("camera_crop", 0), 1.534);
+        }
+        QCOMPARE(edit::clipById(*back.active(), first)->effects[0].p("fit", 0), 1.0);  // its own settings kept
+        // Refused: an unknown lens or camera, a setting it has no, focal length among the settings.
+        for (const QJsonObject& bad : {QJsonObject{{"clip", double(first)}, {"lens", "Nikkor 50mm"}},
+                                       QJsonObject{{"clip", double(first)}, {"camera", "Canon EOS R5"}},
+                                       QJsonObject{{"clip", double(first)}, {"params", QJsonObject{{"focal", 10}}}},
+                                       QJsonObject{{"clip", double(first)}, {"params", QJsonObject{{"fit", 7}}}},
+                                       QJsonObject{{"clip", double(first)}, {"camera", "Sony ILCE-6400"}}})
+            QVERIFY2(call(bad).value("isError").toBool(), QJsonDocument(bad).toJson().constData());
+        // Played back: the frame (flat) filled to the edges.
+        const Image played = renderProgramFrame(back, *back.active(), 5, RenderOptions{});
+        QVERIFY(!played.empty());
+        QVERIFY(played.at(0, 0)[3] > 0.99f && played.at(319, 179)[3] > 0.99f);
+        // Without a database, the tool says where to get one.
+        qputenv("MONTAGE_LENS_DB", QFile::encodeName(lenses.filePath("none")));
+        reloadLensDatabase();
+        r = call({{"clip", double(first)}});
+        QVERIFY(r.value("isError").toBool());
+        QVERIFY(QJsonDocument(r).toJson().contains("fetch-models"));
     }
 
     void reviewPackages() {

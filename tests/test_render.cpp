@@ -24,6 +24,7 @@
 #include "core/Effects.h"
 #include "core/MaskPath.h"
 #include "render/ColorChart.h"
+#include "core/LensProfile.h"
 #include "render/ColorSpace.h"
 #include "render/HdrView.h"
 #include "render/Compositor.h"
@@ -4641,6 +4642,88 @@ colorspaces:
         Project empty = makeDefaultProject();
         empty.active()->colorSpace = "rec2100pq";
         QVERIFY(!measureLightLevels(empty, *empty.active(), 0, 0, l, &err) && err.find("empty") != std::string::npos);
+    }
+
+    void lensCorrectionEffect() {
+        QFile file(QStringLiteral(MONTAGE_TEST_DATA_DIR "/lensfun/test-lenses.xml"));
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        lens::Database db;
+        QVERIFY(db.addXml(file.readAll().toStdString()));
+        const lens::Lens* zoom = db.lens("FE 24-38mm f/2.8 Test");
+        QVERIFY(zoom);
+        Effect e = makeEffect("lens_correction", 1);
+        QVERIFY(findEffectInfo("lens_correction"));
+        const int W = 192, H = 108;
+        // A horizontal ramp (each pixel's x in linear light / W), opaque.
+        Image ramp(W, H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = ramp.at(x, y);
+                p[0] = p[1] = p[2] = float((x + 0.5) / W);
+                p[3] = 1;
+            }
+        // No profile chosen yet: nothing happens.
+        Image same = ramp;
+        applyVideoEffect(e, 0, same, 1.0);
+        QVERIFY(same.px == ramp.px);
+
+        e.strings["profile"] = lens::lensXml(*zoom);
+        e.params["focal"] = Param(27);
+        e.params["camera_crop"] = Param(1);
+        e.params["vignetting"] = Param(0);
+        // Each pixel comes from where the correction says (green), red and blue from their own places; filled to the
+        // frame's edges.
+        Image out = ramp;
+        applyVideoEffect(e, 0, out, 1.0);
+        lens::Settings s;
+        s.focal = 27;
+        s.cameraCrop = 1;
+        s.vignetting = false;
+        const lens::Correction c(*zoom, s, W, H);
+        QVERIFY(c.scale() > 1);  // edges pulled in by the correction, then the frame filled
+        for (const auto& [x, y] : {std::pair{0, 0}, {W - 1, H - 1}, {40, 70}, {W / 2, H / 2}}) {
+            double at[6];
+            c.source(x + 0.5, y + 0.5, at);
+            const float* p = out.at(x, y);
+            QVERIFY2(std::fabs(p[1] - std::clamp(at[2], 0.5, W - 0.5) / W) < 1e-4, qPrintable(QString("%1,%2: %3 vs %4").arg(x).arg(y).arg(p[1]).arg(at[2] / W)));
+            QVERIFY(std::fabs(p[0] - std::clamp(at[0], 0.5, W - 0.5) / W) < 1e-4);
+            QVERIFY(std::fabs(p[2] - std::clamp(at[4], 0.5, W - 0.5) / W) < 1e-4);
+            QVERIFY(std::fabs(p[3] - 1) < 1e-4);
+        }
+        // Made smaller without filling the frame, there is nothing beyond the picture.
+        Effect none = e;
+        none.params["fit"] = Param(2);
+        none.params["scale"] = Param(50);
+        Image bare = ramp;
+        applyVideoEffect(none, 0, bare, 1.0);
+        QVERIFY(bare.at(0, 0)[3] < 0.5);
+        QVERIFY(bare.at(W / 2, H / 2)[3] > 0.99);
+
+        // Vignetting: a flat grey brightened towards the corners in linear light (Rec.709 coded here), the middle kept.
+        Effect vig = makeEffect("lens_correction", 2);
+        vig.strings["profile"] = e.strings["profile"];
+        vig.params["focal"] = Param(30);
+        vig.params["aperture"] = Param(3.3);
+        vig.params["camera_crop"] = Param(1);
+        for (const char* off : {"distortion", "tca", "rectilinear"}) vig.params[off] = Param(0);
+        Image grey(W, H);
+        grey.fill(0.4f, 0.4f, 0.4f, 1);
+        applyVideoEffect(vig, 0, grey, 1.0);
+        lens::Settings vs;
+        vs.focal = 30;
+        vs.aperture = 3.3;
+        vs.cameraCrop = 1;
+        const lens::Correction vc(*zoom, vs, W, H);
+        const double corner = fromLinear(Transfer::Bt1886, toLinear(Transfer::Bt1886, 0.4) / vc.falloff(0.5, 0.5));
+        QVERIFY2(std::fabs(grey.at(0, 0)[1] - corner) < 2e-3, qPrintable(QString::number(grey.at(0, 0)[1])));
+        QVERIFY(grey.at(0, 0)[1] > 0.5f);
+        QVERIFY(std::fabs(grey.at(W / 2, H / 2)[1] - 0.4f) < 2e-3);
+        // Half-covered pixels keep their coverage; the colour is brightened as it is straight.
+        Image half(W, H);
+        half.fill(0.4f, 0.4f, 0.4f, 0.5f);  // (premultiplied by fill)
+        applyVideoEffect(vig, 0, half, 1.0);
+        QVERIFY(std::fabs(half.at(0, 0)[3] - 0.5f) < 1e-6);
+        QVERIFY(std::fabs(half.at(0, 0)[1] / 0.5f - corner) < 2e-3);
     }
 
     void colorChartCalibration() {
