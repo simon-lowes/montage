@@ -117,6 +117,7 @@ Result interpretFootage(Project& p, Id media, Interpretation i) {
         if (m->sounds) {
             auto v = std::make_shared<VisualIndex>(*m->sounds);
             v->step *= ratio;
+            v->span *= ratio;  // (each window hears as many media seconds as before)
             for (VisualIndex::Sample& smp : v->samples) smp.time *= ratio;
             m->sounds = v;
         }

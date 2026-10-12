@@ -644,7 +644,7 @@ private:
             }
         }
         const ColorGroup* group = found ? colorGroupOf(seq_, *found) : nullptr;
-        if (!found || found->isGenerator() || !found->effects.empty() || (group && (!group->pre.empty() || !group->post.empty())) ||
+        if (!found || found->isGenerator() || !found->effects.empty() || !found->grade.empty() || (group && (!group->pre.empty() || !group->post.empty())) ||
             found->blendMode != "normal" || found->speed != 1.0 ||
             found->reverse || found->ramped() || !identityMotion(*found, f - found->start))
             return nullptr;
@@ -1787,8 +1787,8 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
         o.sources = made.sources;
         std::string why;
         if (!signContentCredentials(s.path, made, {s.credentialCertificate, s.credentialKey, {}}, o, &why)) {
-            if (error) *error = "Could not sign it with Content Credentials: " + why;
-            std::remove(s.path.c_str());  // (asked for signed, so not left unsigned)
+            // The render is kept (it may have taken hours), unsigned, and said to be: it can be signed again later.
+            if (error) *error = "Could not sign it with Content Credentials (" + why + "); the export is kept, unsigned, at " + s.path;
             return false;
         }
     }

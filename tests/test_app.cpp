@@ -47,6 +47,7 @@
 #include <QJsonDocument>
 #include "core/ProjectLock.h"
 #include "ProductionPanel.h"
+#include "ReferenceOutputPanel.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -81,6 +82,8 @@
 #include "RedactFacesDialog.h"
 #include "SpectralRepairDialog.h"
 #include "automation/McpServer.h"
+#include "render/OGraf.h"
+#include "automation/PythonHost.h"
 #include "automation/ScriptHost.h"
 #include "ScriptConsole.h"
 #include "ScriptPanelWidget.h"
@@ -96,6 +99,7 @@
 #include "MediaBinWidget.h"
 #include "ReviewOverlay.h"
 #include "ChartMatchDialog.h"
+#include "LensCorrectionDialog.h"
 #include "media/Proxy.h"
 #include "StoryboardView.h"
 #include "StackedTimelineWidget.h"
@@ -132,6 +136,7 @@
 #include "PluginEditorWindow.h"
 #include "audio/PluginEffect.h"
 #include "KeyframePanel.h"
+#include "GradeNodePanel.h"
 #include "CompareDialog.h"
 #include "Keymap.h"
 #include "LoudnessReadout.h"
@@ -172,6 +177,7 @@
 #include "Recovery.h"
 #include "RenderQueue.h"
 #include "RenderQueuePanel.h"
+#include "render/RenderFarm.h"
 #include "TimelineWidget.h"
 #include "TranscribeDialog.h"
 #include "TranscriptPanel.h"
@@ -322,6 +328,11 @@ class TestApp : public QObject {
         std::string path = (dir_.path() + "/demo.montage").toStdString();
         QVERIFY(saveProject(demoProject(), path));
         QVERIFY(win_->openProject(QString::fromStdString(path)));
+        // The window active again with the timeline focused, for its shortcuts: on the offscreen platform a dialog an
+        // earlier test closed leaves no window active.
+        win_->activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+        if (!QApplication::focusWidget()) timeline()->setFocus();
         ppf_ = measurePpf();
     }
 
@@ -3848,6 +3859,100 @@ private slots:
         state()->setSelection({}, false);
     }
 
+    void nodesPanelEditsTheGraph() {
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        QVERIFY(state()->edit("Grade", [&](Project& p, Sequence& s) {
+            edit::clipById(s, red)->effects = {makeEffect(p, "color_correct"), makeEffect(p, "curves")};
+            return true;
+        }));
+        auto* dock = win_->findChild<QDockWidget*>("nodes");
+        QVERIFY(dock);
+        dock->setFloating(true);
+        dock->resize(700, 320);
+        dock->show();
+        auto* panel = win_->findChild<GradeNodePanel*>();
+        QVERIFY(panel);
+        state()->setSelection({red}, false);
+        QApplication::processEvents();
+        QCOMPARE(panel->clip(), red);
+        auto clip = [&] { return edit::clipById(*state()->sequence(), red); };
+        // Use Nodes: one node each, in series, the first picked; the Inspector shows that node alone.
+        QVERIFY(panel->convert());
+        QCOMPARE(clip()->grade.nodes.size(), size_t(2));
+        QCOMPARE(panel->selectedNode(), 1);
+        QApplication::processEvents();
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QVERIFY(inspector->findChild<QPushButton*>("gradeNodeSettings"));
+        QVERIFY(!inspector->findChild<QLabel*>("gradeNodesNote"));
+        // A click on node 2 picks it; on nothing, no node (the Inspector then shows them all).
+        QTest::mouseClick(panel->canvas(), Qt::LeftButton, {}, panel->nodeCentre(2).toPoint());
+        QCOMPARE(panel->selectedNode(), 2);
+        QTest::mouseClick(panel->canvas(), Qt::LeftButton, {}, QPoint(4, panel->canvas()->height() - 4));
+        QCOMPARE(panel->selectedNode(), 0);
+        QApplication::processEvents();
+        QVERIFY(inspector->findChild<QLabel*>("gradeNodesNote"));
+        // Dragged: moved in one undo step.
+        const double x0 = findGradeNode(clip()->grade, 2)->x;
+        const QPoint from = panel->nodeCentre(2).toPoint(), to = from + QPoint(30, 20);
+        QTest::mousePress(panel->canvas(), Qt::LeftButton, {}, from);
+        for (QPoint at : {from + QPoint(10, 5), to}) {
+            QMouseEvent m(QEvent::MouseMove, at, panel->canvas()->mapToGlobal(at), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(panel->canvas(), &m);
+        }
+        QTest::mouseRelease(panel->canvas(), Qt::LeftButton, {}, to);
+        QVERIFY(findGradeNode(clip()->grade, 2)->x > x0 + 10);
+        state()->undo();
+        QCOMPARE(findGradeNode(clip()->grade, 2)->x, x0);
+        // A parallel node beside node 2 (Alt+P on the canvas, not the menus'), then node 1's key dragged into the new
+        // node's key input.
+        panel->selectNode(2);
+        panel->canvas()->setFocus();
+        QTest::keyClick(panel->canvas(), Qt::Key_P, Qt::AltModifier);
+        const int branch = panel->selectedNode();
+        QCOMPARE(findGradeNode(clip()->grade, branch)->kind, std::string("corrector"));
+        QCOMPARE(clip()->grade.nodes.size(), size_t(4));  // and the mixer
+        QApplication::processEvents();
+        const QPoint keyOut = panel->portPoint(1, true, 0, true).toPoint(), keyIn = panel->portPoint(branch, false, 1, true).toPoint();
+        QTest::mousePress(panel->canvas(), Qt::LeftButton, {}, keyOut);
+        QMouseEvent m(QEvent::MouseMove, keyIn, panel->canvas()->mapToGlobal(keyIn), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(panel->canvas(), &m);
+        QTest::mouseRelease(panel->canvas(), Qt::LeftButton, {}, keyIn);
+        const GradeLink* k = gradeLinkInto(clip()->grade, branch, 1);
+        QVERIFY(k && k->from == 1 && k->key);
+        QVERIFY(!panel->canvas()->grab().isNull());  // (drawn: nodes, mixer, links, ports)
+        // A link that would make a loop is refused, the graph unchanged.
+        const GradeGraph before = clip()->grade;
+        QVERIFY(!panel->connectNodes({branch + 1, 1, 0, false}));
+        QCOMPARE(clip()->grade, before);
+        // Switched off and renamed; shared, then used by the Blue clip.
+        panel->selectNode(branch);
+        QTest::keyClick(panel->canvas(), Qt::Key_D, Qt::ControlModifier);  // (not the timeline's Default Transition)
+        QVERIFY(!findGradeNode(clip()->grade, branch)->enabled);
+        QVERIFY(panel->renameSelected("Sky"));
+        QCOMPARE(gradeNodeName(*findGradeNode(clip()->grade, branch)), std::string("Sky"));
+        panel->selectNode(1);
+        QVERIFY(panel->shareSelected("Look"));
+        QCOMPARE(state()->sequence()->sharedNodes.size(), size_t(1));
+        const Id look = state()->sequence()->sharedNodes[0].id;
+        const Id blue = clipNamed(*state()->sequence(), "Blue")->id;
+        state()->setSelection({blue}, false);
+        QVERIFY(panel->useShared(look));
+        QCOMPARE(findGradeNode(edit::clipById(*state()->sequence(), blue)->grade, panel->selectedNode())->shared, look);
+        // Delete on the canvas removes the picked node; Flatten turns the graph back into a stack.
+        state()->setSelection({red}, false);
+        panel->selectNode(branch);
+        panel->canvas()->setFocus();
+        QTest::keyClick(panel->canvas(), Qt::Key_Delete);
+        QVERIFY(!findGradeNode(clip()->grade, branch));
+        QVERIFY(panel->flatten());
+        QVERIFY(clip()->grade.empty());
+        QCOMPARE(clip()->effects.size(), size_t(2));
+        dock->setFloating(false);
+        dock->hide();
+        state()->setSelection({}, false);
+    }
+
     void animateToAudioOnTheSelection() {
         loadDemo();
         QVERIFY(win_->findChild<QAction*>("animateToAudio"));
@@ -6367,6 +6472,137 @@ private slots:
         // One undo step takes it away.
         state()->undo();
         QVERIFY(!edit::clipById(*state()->sequence(), clips[0]));
+    }
+
+    void correctLensInTheApp() {
+        // The test database stands in for lensfun's.
+        QTemporaryDir lenses;
+        QVERIFY(QFile::copy(QStringLiteral(MONTAGE_TEST_DATA_DIR "/lensfun/test-lenses.xml"), lenses.filePath("test-lenses.xml")));
+        qputenv("MONTAGE_LENS_DB", lenses.path().toUtf8());
+        reloadLensDatabase();
+        struct Restore {
+            ~Restore() {
+                qunsetenv("MONTAGE_LENS_DB");
+                reloadLensDatabase();
+                lensDialogHook() = nullptr;
+            }
+        } restore;
+        // A GoPro still, on the timeline twice.
+        const QString file = dir_.filePath("gopro.png");
+        QImage img(320, 180, QImage::Format_RGB32);
+        img.fill(QColor(80, 110, 140));
+        QVERIFY(img.save(file));
+        state()->newProject();
+        const auto ids = state()->importFiles({file});
+        QCOMPARE(ids.size(), size_t(1));
+        Id a = 0, b = 0;
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            p.findMedia(ids[0])->metadata["device"] = "GoPro HERO11 Black";
+            s.width = 320, s.height = 180;
+            if (!edit::placeMedia(p, s, ids[0], 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok) return false;
+            if (!edit::placeMedia(p, s, ids[0], 60, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok) return false;
+            a = s.videoTracks[0].clips[0].id, b = s.videoTracks[0].clips[1].id;
+            return true;
+        }));
+        auto lensOf = [&](Id clip) -> const Effect* {
+            for (const Effect& e : edit::clipById(*state()->sequence(), clip)->effects)
+                if (e.type == "lens_correction") return &e;
+            return nullptr;
+        };
+        state()->setSelection({a}, false);
+        // The camera from the clip's Camera Model, its fixed lens with it; applied to this clip alone.
+        bool shown = false;
+        lensDialogHook() = [&](LensCorrectionDialog* dlg) {
+            shown = true;
+            QCOMPARE(dlg->cameraText(), QStringLiteral("GoPro Hero11 Black"));
+            QCOMPARE(dlg->lensText(), QStringLiteral("GoPro HERO11 Black & compatibles"));
+            QVERIFY(dlg->findChild<QPushButton*>("lensApply")->isEnabled());
+            QVERIFY(dlg->findChild<QLabel*>("lensAbout")->text().contains("rectilinear"));
+            dlg->findChild<QCheckBox*>()->setChecked(false);
+            QMetaObject::invokeMethod(dlg, "accept", Qt::QueuedConnection);
+        };
+        QAction* action = win_->findChild<QAction*>("correctLens");
+        QVERIFY(action);
+        action->trigger();
+        QVERIFY(shown);
+        QVERIFY(lensOf(a) && !lensOf(b));
+        QCOMPARE(edit::clipById(*state()->sequence(), a)->effects[0].type, std::string("lens_correction"));
+        QCOMPARE(lensOf(a)->s("lens"), std::string("GoPro HERO11 Black & compatibles"));
+        QCOMPARE(lensOf(a)->p("focal", 0), 2.7);
+        // In the Inspector: the lens it holds, and Choose Lens… opens the dialog on it. Another camera: its lenses (a
+        // lens left unchosen cannot be applied), then the fisheye from the adapter, at f/4 on both clips.
+        win_->findChild<QDockWidget*>("inspector")->show();
+        win_->findChild<QDockWidget*>("inspector")->raise();
+        QApplication::processEvents();
+        QLabel* name = nullptr;
+        for (auto* l : win_->findChildren<QLabel*>("lensName"))
+            if (l->isVisibleTo(win_.get())) name = l;
+        QVERIFY(name);
+        QVERIFY2(name->text().contains("HERO11") && name->text().contains("GoPro Hero11 Black"), qPrintable(name->text()));
+        QPushButton* choose = nullptr;
+        for (auto* c : win_->findChildren<QPushButton*>("chooseLens"))
+            if (c->isVisibleTo(win_.get())) choose = c;
+        QVERIFY(choose);
+        shown = false;
+        lensDialogHook() = [&](LensCorrectionDialog* dlg) {
+            shown = true;
+            QCOMPARE(dlg->lensText(), QStringLiteral("GoPro HERO11 Black & compatibles"));  // what it holds
+            QVERIFY(dlg->setCamera("Sony ILCE-6400"));
+            QVERIFY(dlg->lensText().isEmpty());
+            QVERIFY(!dlg->findChild<QPushButton*>("lensApply")->isEnabled());
+            QCOMPARE(dlg->findChild<QComboBox*>("lensLens")->count(), 2);
+            // Typed names count: a lens part-typed is none, one typed whole (any case) is it; a camera typed brings
+            // its lenses.
+            auto* lensBox = dlg->findChild<QComboBox*>("lensLens");
+            lensBox->setEditText("Samyang 8mm");
+            QVERIFY(!dlg->findChild<QPushButton*>("lensApply")->isEnabled());
+            lensBox->setEditText("samyang 8mm f/2.8 umc fish-eye");
+            QVERIFY(dlg->findChild<QPushButton*>("lensApply")->isEnabled());
+            QVERIFY(dlg->choice().lens);
+            dlg->findChild<QComboBox*>("lensCamera")->setEditText("Sony ILCE-7M4");
+            QCOMPARE(lensBox->count(), 1);
+            QVERIFY(dlg->choice().camera && dlg->choice().camera->model == "ILCE-7M4");
+            QVERIFY(dlg->setCamera("Sony ILCE-6400"));
+            QVERIFY(dlg->setLens("Samyang 8mm f/2.8 UMC Fish-eye"));
+            dlg->findChild<QDoubleSpinBox*>("lensAperture")->setValue(4);
+            QVERIFY(dlg->sameMedia());
+            QMetaObject::invokeMethod(dlg, "accept", Qt::QueuedConnection);
+        };
+        choose->click();
+        QTRY_VERIFY(shown);
+        QTRY_VERIFY(lensOf(b));
+        for (Id clip : {a, b}) {
+            QCOMPARE(lensOf(clip)->s("lens"), std::string("Samyang 8mm f/2.8 UMC Fish-eye"));
+            QCOMPARE(lensOf(clip)->s("camera"), std::string("Sony ILCE-6400"));
+            QCOMPARE(lensOf(clip)->p("aperture", 0), 4.0);
+        }
+        QCOMPARE(int(std::count_if(edit::clipById(*state()->sequence(), a)->effects.begin(), edit::clipById(*state()->sequence(), a)->effects.end(),
+                                   [](const Effect& e) { return e.type == "lens_correction"; })),
+                 1);
+        // The aperture not known: no vignetting correction, and so when opened again.
+        shown = false;
+        lensDialogHook() = [&](LensCorrectionDialog* dlg) {
+            shown = true;
+            dlg->findChild<QDoubleSpinBox*>("lensAperture")->setValue(0);
+            QMetaObject::invokeMethod(dlg, "accept", Qt::QueuedConnection);
+        };
+        QVERIFY(win_->correctLens());
+        QVERIFY(shown);
+        QCOMPARE(lensOf(a)->p("aperture", -1), 0.0);
+        // Cancelled, nothing changes.
+        const std::string profile = lensOf(a)->s("profile");
+        shown = false;
+        lensDialogHook() = [&](LensCorrectionDialog* dlg) {
+            shown = true;
+            QCOMPARE(dlg->findChild<QDoubleSpinBox*>("lensAperture")->value(), 0.0);
+            QMetaObject::invokeMethod(dlg, "reject", Qt::QueuedConnection);
+        };
+        QVERIFY(!win_->correctLens());
+        QVERIFY(shown);
+        QCOMPARE(lensOf(a)->s("profile"), profile);
+        // Played: filled to the frame's corners.
+        const Image frame = renderProgramFrame(state()->project(), *state()->sequence(), 5, RenderOptions{});
+        QVERIFY(frame.at(0, 0)[3] > 0.99f);
     }
 
     void contentCredentialsInTheApp() {
@@ -9942,6 +10178,240 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void ografGraphicInInspector() {
+        // Add OGraf Graphic: the graphic at the playhead with its schema's defaults, its fields in the Inspector.
+        state()->newProject();
+        state()->edit("Format", [](Project&, Sequence& s) {
+            s.width = 320;
+            s.height = 180;
+            s.fps = {25, 1};
+            return true;
+        });
+        qputenv("MONTAGE_OGRAF_CACHE", (dir_.path() + "/ograf-cache").toUtf8());
+        struct Unset {
+            ~Unset() { qunsetenv("MONTAGE_OGRAF_CACHE"); }
+        } unset;
+        QCOMPARE(win_->addOGrafGraphic(dir_.path() + "/none.ograf.json"), Id(0));
+        const Id clip = win_->addOGrafGraphic(QStringLiteral(MONTAGE_TEST_DATA_DIR "/ograf/lower-third/lower.ograf.json"));
+        QVERIFY(clip);
+        // (A second long, not played out: each value tried renders it.)
+        state()->edit("Shorter", [&](Project&, Sequence& s) {
+            edit::clipById(s, clip)->duration = 25;
+            edit::clipById(s, clip)->generator.params["out"] = Param(0.0);
+            return true;
+        });
+        auto data = [&] {
+            const Clip* c = edit::clipById(*state()->sequence(), clip);
+            return QJsonDocument::fromJson(QByteArray::fromStdString(c->generator.s("data"))).object();
+        };
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->name, std::string("Lower Third"));
+        QCOMPARE(data().value("name").toString(), QString("Ada Lovelace"));
+        win_->findChild<QDockWidget*>("inspector")->show();
+        win_->findChild<QDockWidget*>("inspector")->raise();
+        QApplication::processEvents();
+        auto visible = [&]<typename W>(const char* name, W*) {
+            W* found = nullptr;
+            for (auto* w : win_->findChildren<W*>(name))
+                if (w->isVisibleTo(win_.get())) found = w;
+            return found;
+        };
+        auto* name = visible("ograf_name", static_cast<QLineEdit*>(nullptr));
+        auto* colour = visible("ograf_color", static_cast<QComboBox*>(nullptr));
+        auto* size = visible("ograf_size", static_cast<QDoubleSpinBox*>(nullptr));
+        auto* count = visible("ograf_count", static_cast<QSpinBox*>(nullptr));
+        auto* show = visible("ograf_show", static_cast<QCheckBox*>(nullptr));
+        auto* extra = visible("ograf_extra", static_cast<QLineEdit*>(nullptr));
+        QVERIFY(name && colour && size && count && show && extra && visible("ograf_role", static_cast<QPlainTextEdit*>(nullptr)));
+        QCOMPARE(name->text(), QString("Ada Lovelace"));
+        QCOMPARE(size->value(), 40.0);
+        QVERIFY(show->isChecked());
+        QCOMPARE(extra->text(), QString(R"~({"a":1})~"));
+        // Edited: each field written into the data (one undo step a field).
+        name->setText("Grace Hopper");
+        emit name->editingFinished();
+        colour->setCurrentIndex(1);
+        show->setChecked(false);
+        extra->setText("[1, 2]");
+        emit extra->editingFinished();
+        QCOMPARE(data().value("name").toString(), QString("Grace Hopper"));
+        QCOMPARE(data().value("color").toString(), QString("rgb(0, 255, 0)"));
+        QCOMPARE(data().value("show").toBool(true), false);
+        QCOMPARE(data().value("extra").toArray().size(), 2);
+        state()->undo();
+        QCOMPARE(data().value("extra").toObject().value("a").toInt(), 1);
+        QApplication::processEvents();
+        QCOMPARE(extra->text(), QString(R"~({"a":1})~"));
+
+        // Render: its frames now; the viewer draws them (the bar green, in all the way 0.8 s in).
+        if (ografBrowser().empty()) QSKIP("No Chrome, Chromium or Edge to render OGraf graphics in (set MONTAGE_CHROMIUM)");
+        const Sequence& sq = *state()->sequence();
+        const Clip* c = edit::clipById(sq, clip);
+        const OGrafJob job = ografClipJob(c->generator, sq.width, sq.height, sq.fpsValue(), c->duration);
+        auto* render = visible("renderOGraf", static_cast<QPushButton*>(nullptr));
+        QVERIFY(render);
+        render->click();
+        QTRY_VERIFY_WITH_TIMEOUT(ografCached(job), 120000);
+        state()->setPlayhead(20);
+        MonitorPanel* program = nullptr;
+        for (auto* mp : win_->findChildren<MonitorPanel*>())
+            if (mp->mode() == MonitorPanel::Mode::Program) program = mp;
+        QVERIFY(program);
+        auto greenAt = [&](double x, double y) {
+            const QImage img = program->viewer()->image();
+            if (img.isNull()) return false;
+            const QColor px = img.pixelColor(int(x * img.width()), int(y * img.height()));
+            return px.green() > 200 && px.red() < 60;
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(greenAt(150.0 / 320, 120.0 / 180), 30000);
+    }
+
+    void cameraTrackerInInspectorAndViewer() {
+        // A clip with a solve (made here: a camera 1.6 above a ground of points, moving right while it looks along -z).
+        QImage tex(320, 180, QImage::Format_RGB32);
+        tex.fill(QColor(60, 90, 120));
+        const QString png = dir_.path() + "/flat.png";
+        QVERIFY(tex.save(png));
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 320;
+        gs.height = 180;
+        gs.fps = {25, 1};
+        MediaItem m;
+        m.id = gen.newId();
+        std::string err;
+        QVERIFY(probeMedia(png.toStdString(), m, &err));
+        gen.media.push_back(m);
+        Clip gc = makeClip(gen, m, TrackKind::Video, gs);
+        gc.duration = 20;
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, gc);
+        ExportSettings st;
+        st.path = (dir_.path() + "/flat.mp4").toStdString();
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        state()->newProject();
+        state()->edit("Format", [](Project&, Sequence& s) {
+            s.width = 320;
+            s.height = 180;
+            s.fps = {25, 1};
+            return true;
+        });
+        auto ids = state()->importFiles({QString::fromStdString(st.path)});
+        QCOMPARE(ids.size(), size_t(1));
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        });
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        CameraSolve cs;
+        cs.width = 320;
+        cs.height = 180;
+        cs.focal = 300;
+        cs.fps = 25;
+        cs.oriented = true;
+        cs.keyframes = 3;
+        for (int i = 0; i < 20; ++i) {
+            SolvedCamera c;
+            c.valid = true;
+            c.R = {1, 0, 0, 0, -1, 0, 0, 0, -1};
+            c.C = {0.02 * i, 1.6, 0};
+            cs.cameras.push_back(c);
+        }
+        for (int i = 0; i < 40; ++i) {
+            SolvedPoint sp;
+            sp.X = {-2 + 0.1 * i, 0, -3 - 0.15 * i};
+            sp.error = 0.4;
+            sp.seen = 20;
+            sp.last = 19;
+            cs.points.push_back(sp);
+        }
+        Id eid = 0;
+        state()->edit("Tracker", [&](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "camera_track");
+            e.strings["solve"] = cameraSolveToString(cs);
+            eid = e.id;
+            edit::clipById(s, clip)->effects.push_back(e);
+            return true;
+        });
+        state()->setSelection({clip}, false);
+        state()->setPlayhead(10);
+        win_->findChild<QDockWidget*>("inspector")->show();
+        win_->findChild<QDockWidget*>("inspector")->raise();
+        QApplication::processEvents();
+
+        // The Inspector says what was solved and offers Solve, Place Title and Export.
+        QLabel* status = nullptr;
+        for (auto* l : win_->findChildren<QLabel*>("cameraTrackStatus"))
+            if (l->isVisibleTo(win_.get())) status = l;
+        QVERIFY(status);
+        QVERIFY2(status->text().contains("Solved") && status->text().contains("40 point"), qPrintable(status->text()));
+        for (const char* name : {"solveCamera", "placeSceneTitle", "exportCamera"}) {
+            QPushButton* b = nullptr;
+            for (auto* x : win_->findChildren<QPushButton*>(name))
+                if (x->isVisibleTo(win_.get())) b = x;
+            QVERIFY2(b && b->isEnabled(), name);
+        }
+
+        // The viewer shows the points tracked in the frame on screen (green: they fit), until Show Tracked Points is off.
+        MonitorPanel* program = nullptr;
+        for (auto* mp : win_->findChildren<MonitorPanel*>())
+            if (mp->mode() == MonitorPanel::Mode::Program) program = mp;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        QTRY_VERIFY_WITH_TIMEOUT(!viewer->image().isNull(), 5000);
+        auto* overlay = viewer->findChild<MaskOverlay*>();
+        QVERIFY(overlay);
+        auto greens = [&] {
+            QApplication::processEvents();
+            const QImage img = viewer->grab().toImage();
+            int n = 0;
+            for (int y = 0; y < img.height(); ++y)
+                for (int x = 0; x < img.width(); ++x) {
+                    const QColor c = img.pixelColor(x, y);
+                    if (c.green() > 180 && c.red() < 140 && c.blue() < 160) ++n;
+                }
+            return n;
+        };
+        QVERIFY(greens() > 20);
+        state()->edit("Hide", [&](Project&, Sequence& s) {
+            edit::ownedEffect(s, clip, eid)->params["show_points"] = Param(0.0);
+            return true;
+        });
+        QCOMPARE(greens(), 0);
+
+        // Place Title: a title over the clip for its length, on the ground where the picture's (50 %, 70 %) is at the
+        // playhead, its Corner Pin keyed through the clip.
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        const Id title = inspector->placeTitleInScene(clip, eid, "Hello");
+        QVERIFY(title);
+        const Sequence& sq = *state()->sequence();
+        QCOMPARE(edit::locate(sq, title)->track.index, 1);
+        const Clip* t = edit::clipById(sq, title);
+        QCOMPARE(t->duration, FrameTime(20));
+        const Effect* pin = nullptr;
+        for (const Effect& e : t->effects)
+            if (e.type == "corner_pin") pin = &e;
+        QVERIFY(pin && pin->params.at("tl_x").keys.size() == 20);
+        // The ground point under (50 %, 70 %) at frame 10 is in the middle of the title's bottom half there.
+        const TrackQuad q = cornerPinQuad(*pin, 10);
+        const double midX = (q.p[0].x + q.p[1].x + q.p[2].x + q.p[3].x) / 4, midY = (q.p[0].y + q.p[1].y + q.p[2].y + q.p[3].y) / 4;
+        QVERIFY2(std::fabs(midX - 0.5) < 0.02 && std::fabs(midY - 0.7) < 0.03, qPrintable(QString("%1 %2").arg(midX).arg(midY)));
+        QVERIFY(q.p[0].y < q.p[3].y && q.p[0].x < q.p[1].x);  // its top edge farther away, upright on screen
+        state()->undo();
+        QVERIFY(!edit::clipById(*state()->sequence(), title));
+        // Pointing at the sky: nothing placed.
+        state()->edit("Sky", [&](Project&, Sequence& s) {
+            edit::ownedEffect(s, clip, eid)->params["place_y"] = Param(10.0);
+            return true;
+        });
+        QCOMPARE(inspector->placeTitleInScene(clip, eid, "Up"), Id(0));
+
+        // Solving a flat picture finds nothing to follow: the solve kept is the one it had.
+        inspector->solveCameraTrack(clip, eid);
+        CameraSolve kept;
+        QVERIFY(clipCameraSolve(*edit::clipById(*state()->sequence(), clip), kept));
+        QCOMPARE(kept.points.size(), size_t(40));
+    }
+
     void stabilizeAndTrackFromInspector() {
         // A textured still shaken by a few pixels every frame.
         QImage tex(320, 180, QImage::Format_RGB32);
@@ -11702,6 +12172,200 @@ print("added " .. ui.name)
         state()->newProject();
     }
 
+    void pythonScriptsInTheApp() {
+        if (!pythonAvailable()) QSKIP("no Python 3.8 or later here");
+        state()->newProject();
+        appSettings().remove("scripts/panels");
+        auto* console = win_->scriptConsole();
+        auto titles = [&] {
+            int n = 0;
+            for (const Track& t : state()->sequence()->videoTracks)
+                for (const Clip& c : t.clips) n += c.generator.type == "title";
+            return n;
+        };
+        // Two titles from one Python run: one undo step, named for the script; what it prints in the console.
+        const int steps = int(state()->history().undoCount());
+        console->clearOutput();
+        QVERIFY2(console->run("here = montage.live_context()\n"
+                              "print('at', here['playhead'])\n"
+                              "montage.add_title(text='One', at=0)\n"
+                              "montage.add_title({'text': 'Two', 'at': 1})\n",
+                              "titles.py"),
+                 qPrintable(console->output()));
+        QCOMPARE(titles(), 2);
+        QCOMPARE(int(state()->history().undoCount()), steps + 1);
+        QCOMPARE(state()->undoText(), QStringLiteral("Script: titles.py"));
+        QVERIFY2(console->output().contains("at 00:00:00:00"), qPrintable(console->output()));
+        state()->undo();
+        // A tool's error fails the run on its line, what it did before kept as one undo step.
+        QVERIFY(!console->run("montage.add_title(text='Kept', at=0)\nmontage.add_title(at='never')", "fails.py"));
+        QCOMPARE(titles(), 1);
+        QVERIFY(console->output().contains("fails.py:2: ToolError"));
+        state()->undo();
+        // Stop: a script busy or asleep stops, the window working meanwhile.
+        for (const char* endless : {"while True:\n    pass", "import time\ntime.sleep(600)", "while True:\n    try:\n        montage.live_context()\n    except Exception:\n        pass"}) {
+            bool ticked = false;
+            QTimer::singleShot(300, console, [&] {
+                ticked = true;
+                QVERIFY(console->running());
+                console->stop();
+            });
+            QVERIFY(!console->run(endless, "forever.py"));
+            QVERIFY(ticked && !console->running());
+            QVERIFY(console->output().endsWith("Stopped"));
+        }
+        // The language: switching swaps the untouched example, a file opened or saved sets it, and an unsaved Python
+        // script runs as Python.
+        {
+            ScriptConsole fresh(state(), win_->liveLink());
+            QVERIFY(fresh.findChild<QComboBox*>("scriptLanguage") && !fresh.python());
+            fresh.setPython(true);
+            QVERIFY(fresh.editor()->toPlainText().startsWith("# A Python script"));
+            fresh.setPython(false);
+            QVERIFY(fresh.editor()->toPlainText().startsWith("-- A Lua script"));
+        }
+        console->setPython(true);
+        console->editor()->setPlainText("import sys\nprint('version', sys.version_info[0])");
+        console->clearOutput();
+        console->findChild<QPushButton*>("runScript")->click();
+        QTRY_VERIFY(!console->running());
+        QVERIFY2(console->output().contains("version 3"), qPrintable(console->output()));
+        qputenv("MONTAGE_SCRIPTS_DIR", (dir_.path() + "/pyscripts").toUtf8());
+        QDir().mkpath(dir_.path() + "/pyscripts");
+        const QString path = QFileInfo(dir_.path() + "/pyscripts/Marker Maker.py").absoluteFilePath();
+        auto write = [&](const QByteArray& code) {
+            QFile f(path);
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(code);
+        };
+        const QByteArray code = R"py(
+ui = montage.panel(title="Marker Maker", controls=[
+    {"type": "text", "id": "name", "label": "Name", "value": "Cue"},
+    {"type": "number", "id": "at", "label": "At (s)", "value": 1, "min": 0, "max": 600},
+    {"type": "label", "id": "status", "text": ""},
+    {"type": "button", "id": "add", "label": "Add Marker"},
+])
+montage.add_marker(at=ui["at"], name=ui["name"])
+montage.set_panel(status="Added " + ui["name"])
+print("added " + ui["name"])
+)py";
+        write(code);
+        QCOMPARE(listScripts(), QStringList{path});
+        QVERIFY(console->open(path) && console->python());
+        QVERIFY(console->save(dir_.path() + "/pyscripts/copy.lua") && !console->python());
+        // Saving the Lua example as Python keeps what the editor holds (no example swapped in).
+        {
+            ScriptConsole fresh(state(), win_->liveLink());
+            const QString example = fresh.editor()->toPlainText();
+            QVERIFY(example.startsWith("-- A Lua script"));
+            QVERIFY(fresh.save(dir_.path() + "/pyscripts/copy.py") && fresh.python());
+            QCOMPARE(fresh.editor()->toPlainText(), example);
+        }
+        QFile::remove(dir_.path() + "/pyscripts/copy.py");
+        QFile::remove(dir_.path() + "/pyscripts/copy.lua");
+        // A Python script's panel: opened by its run, its button runs it again with what the panel holds.
+        QVERIFY(console->runFile(path));
+        ScriptPanelWidget* panel = win_->scriptPanel(path);
+        QVERIFY(panel);
+        QVERIFY(state()->sequence()->markers.empty());
+        qobject_cast<QLineEdit*>(panel->control("name"))->setText("Intro");
+        qobject_cast<QPushButton*>(panel->control("add"))->click();
+        QCOMPARE(state()->sequence()->markers.size(), size_t(1));
+        QCOMPARE(QString::fromStdString(state()->sequence()->markers[0].name), QString("Intro"));
+        QCOMPARE(qobject_cast<QLabel*>(panel->control("status"))->text(), QString("Added Intro"));
+        QCOMPARE(panel->findChild<QLabel*>("panelMessage")->text(), QString("added Intro"));
+        state()->undo();
+        // Opened again at start-up: quietly (writing no files), and ended if it takes more than five seconds.
+        auto* dock = qobject_cast<QDockWidget*>(panel->parentWidget());
+        dock->close();
+        QTRY_VERIFY(!win_->scriptPanel(path));
+        appSettings().setValue("scripts/panels", QStringList{path});
+        win_->restoreScriptPanels();
+        QVERIFY(win_->scriptPanel(path));
+        qobject_cast<QDockWidget*>(win_->scriptPanel(path)->parentWidget())->close();
+        QTRY_VERIFY(!win_->scriptPanel(path));
+        const QString trap = dir_.filePath("py-written-at-start.txt");
+        write("open(r'" + trap.toUtf8() + "', 'w')\n" + code);
+        appSettings().setValue("scripts/panels", QStringList{path});
+        win_->restoreScriptPanels();
+        QVERIFY(!QFileInfo::exists(trap) && !win_->scriptPanel(path));
+        QVERIFY(console->output().contains("only reading while a panel opens"));
+        write("import time\ntime.sleep(600)\n" + code);
+        appSettings().setValue("scripts/panels", QStringList{path});
+        QElapsedTimer spent;
+        spent.start();
+        win_->restoreScriptPanels();
+        QVERIFY(spent.elapsed() < 15000 && !win_->scriptPanel(path) && !console->running());
+        QVERIFY(!appSettings().value("scripts/panels").toStringList().contains(path));
+        appSettings().remove("scripts/panels");
+        qunsetenv("MONTAGE_SCRIPTS_DIR");
+        console->setPython(false);
+        state()->newProject();
+    }
+
+    void renderFarmInTheQueue() {
+        state()->newProject();
+        auto* panel = win_->findChild<RenderQueuePanel*>();
+        QVERIFY(panel);
+        const QString was = panel->farmFolder();
+        auto* sendButton = panel->findChild<QPushButton*>("queueSendToFarm");
+        QVERIFY(sendButton);
+        // A job on the local queue, sent to the farm: off the queue, waiting there for a node.
+        Project p = makeDefaultProject();
+        p.active()->width = 320;
+        p.active()->height = 180;
+        edit::overwrite(p, *p.active(), {TrackKind::Video, 0}, makeGeneratorClip(p, "color", 25));
+        ExportSettings st;
+        st.path = dir_.filePath("farm-out/queued.mp4").toStdString();
+        st.audioCodec = "none";
+        RenderQueue* queue = win_->renderQueue();
+        const int id = queue->add("Farm job", "H.264", p, p.active()->id, st);
+        panel->setFarmFolder({});
+        QVERIFY(!panel->sendToFarm(id));  // (no farm yet)
+        const QString farm = dir_.filePath("farm");
+        panel->setFarmFolder(farm);
+        QCOMPARE(appSettings().value("renderFarm/folder").toString(), farm);
+        QVERIFY(panel->sendToFarm(id));
+        QVERIFY(!queue->job(id));
+        auto* list = panel->findChild<QTreeWidget*>("farmJobs");
+        QCOMPARE(list->topLevelItemCount(), 1);
+        QCOMPARE(list->topLevelItem(0)->text(0), QString("Farm job"));
+        QVERIFY(list->topLevelItem(0)->text(3).startsWith("Waiting"));
+        QCOMPARE(panel->findChild<QLabel*>("farmNodes")->text(), QString("No nodes running"));
+        // Cancelled from the panel, then retried.
+        list->setCurrentItem(list->topLevelItem(0));
+        list->topLevelItem(0)->setSelected(true);
+        auto* cancel = panel->findChild<QPushButton*>("farmCancel");
+        auto* retry = panel->findChild<QPushButton*>("farmRetry");
+        auto* remove = panel->findChild<QPushButton*>("farmRemove");
+        QVERIFY(cancel->isEnabled() && !retry->isEnabled());
+        cancel->click();
+        QCOMPARE(list->topLevelItem(0)->text(3), QString("Cancelled"));
+        QVERIFY(retry->isEnabled() && remove->isEnabled());
+        retry->click();
+        QVERIFY(list->topLevelItem(0)->text(3).startsWith("Waiting"));
+        // A node renders it; the panel follows on its own (its timer).
+        FarmNodeOptions o;
+        o.farm = farm.toStdString();
+        o.name = "Test node";
+        o.once = true;
+        int rendered = 0;
+        std::thread node([&] { runFarmNode(o, &rendered); });
+        node.join();
+        QCOMPARE(rendered, 1);
+        auto* dock = qobject_cast<QDockWidget*>(panel->parentWidget());
+        const bool shown = dock && dock->isVisible();
+        if (dock) dock->show();
+        QTRY_VERIFY_WITH_TIMEOUT(list->topLevelItem(0)->text(3).startsWith("Done"), 5000);  // (read on a worker by its timer)
+        if (dock && !shown) dock->hide();
+        QCOMPARE(list->topLevelItem(0)->text(1), QString("Test node"));
+        QVERIFY(QFileInfo::exists(QString::fromStdString(st.path)));
+        QVERIFY(!cancel->isEnabled());
+        remove->click();
+        QCOMPARE(list->topLevelItemCount(), 0);
+        panel->setFarmFolder(was);
+    }
+
     void separateStemsFromTheMenu() {
         state()->newProject();
         QVERIFY(win_->findChild<QAction*>("separateStems"));
@@ -12811,6 +13475,73 @@ print("added " .. ui.name)
         QCOMPARE(program->speed(), 2.0);
         program->shuttle(0);
         QCOMPARE(program->speed(), 0.0);
+    }
+
+    void referenceOutputFollowsProgram() {
+        loadDemo();
+        // The test device stands in for a DeckLink card or NDI.
+        qputenv("MONTAGE_VIRTUAL_OUTPUT", "1");
+        auto* action = win_->findChild<QAction*>("referenceOutput");
+        QVERIFY(action);
+        action->trigger();
+        auto* dlg = win_->findChild<QDialog*>("referenceOutputDialog");
+        QVERIFY(dlg);
+        auto* backend = dlg->findChild<QComboBox*>("outputBackend");
+        QVERIFY(backend);
+        const int virt = backend->findData(QStringLiteral("Virtual"));
+        QVERIFY(virt >= 0);
+        backend->setCurrentIndex(virt);
+        QCOMPARE(dlg->findChild<QComboBox*>("outputDevice")->currentText(), QStringLiteral("Virtual Output"));
+        // Started at the sequence's own mode: the Program's frames go out and the menu shows it on.
+        state()->setPlayhead(10);
+        auto* start = dlg->findChild<QPushButton*>("outputStart");
+        start->click();
+        auto* controller = win_->findChild<ReferenceOutputController*>();
+        QVERIFY(controller);
+        QVERIFY2(controller->running(), qPrintable(controller->status()));
+        QVERIFY(action->isChecked());
+        auto dev = std::dynamic_pointer_cast<output::VirtualBackend>(controller->backend());
+        QVERIFY(dev);
+        // (a small sequence is fitted into the device's mode at its rate)
+        QCOMPARE(dev->openMode().fps.num * state()->sequence()->fps.den, state()->sequence()->fps.num * dev->openMode().fps.den);
+        QTRY_VERIFY_WITH_TIMEOUT(!dev->sent().empty() && dev->sent().back().frame == 10, 5000);
+        // A seek sends the new frame.
+        state()->setPlayhead(40);
+        QTRY_VERIFY_WITH_TIMEOUT(dev->sent().back().frame == 40, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(dlg->findChild<QLabel*>("outputStatus")->text().contains("Virtual Output"), 2000);
+        // Stopped from the panel.
+        start->click();
+        QVERIFY(!controller->running());
+        QVERIFY(!action->isChecked());
+        dlg->close();
+        // The same from an agent: listed, started on the Virtual device, its status, stopped.
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 3}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_reference_output"}, {"arguments", args}}}};
+            win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+            return answer;
+        };
+        QJsonObject r = call({{"action", "list"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(QJsonDocument(r).toJson().contains("Virtual Output"));
+        r = call({{"action", "start"}, {"interface", "Virtual"}, {"device", "Virtual Output"}, {"mode", "1080p25"}, {"depth", 8}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(controller->running());
+        dev = std::dynamic_pointer_cast<output::VirtualBackend>(controller->backend());
+        QCOMPARE(dev->openMode().name, std::string("1080p25"));
+        QCOMPARE(controller->scheduler()->signal().format, output::PixelFormat::Uyvy8);
+        r = call({{"action", "status"}});
+        QCOMPARE(r.value("structuredContent").toObject().value("mode").toString(), QStringLiteral("1080p25"));
+        r = call({{"action", "start"}, {"interface", "Virtual"}, {"mode", "4320p25"}});
+        QVERIFY(r.value("isError").toBool());  // no such mode
+        r = call({{"action", "start"}, {"device", "Virtual Ouptut"}});
+        QVERIFY(r.value("isError").toBool() && !controller->running());  // a device misnamed is not swapped for another
+        QVERIFY(!action->isChecked());
+        r = call({{"action", "stop"}});
+        QVERIFY(!r.value("isError").toBool() && !controller->running());
+        qunsetenv("MONTAGE_VIRTUAL_OUTPUT");
     }
 
     void saveAndReopen() {

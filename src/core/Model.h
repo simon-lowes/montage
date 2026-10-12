@@ -88,6 +88,9 @@ struct Effect {
     std::map<std::string, std::string> strings;
     // The object picked for an "Object" mask (shared: undo snapshots copy the pointer).
     std::shared_ptr<const ObjectMask> object;
+    // The grade node it belongs to (GradeNode::key; core/GradeGraph.h), 0 = none: outside a clip's node graph, or a
+    // clip without one.
+    int node = 0;
 
     double p(const std::string& name, FrameTime t, double def = 0) const;
     std::string s(const std::string& name, const std::string& def = {}) const;
@@ -225,11 +228,49 @@ struct Take {
     bool operator==(const Take&) const = default;
 };
 
+// A clip's node graph (Resolve's nodes; core/GradeGraph.h): correctors and mixers joined by links. A corrector holds
+// the effects marked with its key (Effect::node), or a shared node's; its window, qualifier, mix and key settings are
+// a "grade_node" effect of its own. Links run from a node's output (picture and key) to an input: a corrector's
+// picture (0) or key (1) input, a mixer's inputs in order. Node 0 is the clip's picture (as a link's `from`) and the
+// graph's output (as a link's `to`). Empty: the effects run in order, as a stack.
+struct GradeNode {
+    int key = 0;                     // 1, 2, 3...: unique in the clip, what Effect::node names
+    std::string kind = "corrector";  // "corrector", "parallel", "layer" or "key_mixer"
+    std::string label;
+    bool enabled = true;
+    Id shared = 0;                   // a corrector whose effects are a shared node's (Sequence::sharedNodes)
+    std::vector<std::string> blend;  // a layer mixer's blend mode for each input after the first ("normal"...)
+    double x = 0, y = 0;             // where the node editor shows it
+    bool operator==(const GradeNode&) const = default;
+};
+struct GradeLink {
+    int from = 0;      // the node it comes from (0: the clip's picture)
+    int to = 0;        // the node it goes to (0: the graph's output)
+    int input = 0;     // which of its inputs: a corrector's 0 picture, 1 key; a mixer's in order
+    bool key = false;  // from the node's key output rather than its picture
+    bool operator==(const GradeLink&) const = default;
+};
+struct GradeGraph {
+    std::vector<GradeNode> nodes;
+    std::vector<GradeLink> links;
+    bool empty() const { return nodes.empty(); }
+    bool operator==(const GradeGraph&) const = default;
+};
+// A grade node's effects shared by clips (Resolve's shared nodes): edited once, seen on each clip using it. Its id is
+// the owner of its effects (edit::effectChain).
+struct SharedNode {
+    Id id = 0;
+    std::string name;
+    std::vector<Effect> effects;
+    bool operator==(const SharedNode&) const = default;
+};
+
 // A grade version (core/GradeVersions.h): its name and, while it is not the one shown, its colour effects.
 struct GradeVersion {
     std::string name;
     std::vector<Effect> effects;
     std::vector<int> anchors;  // where each went in the stack: how many other effects came before it
+    GradeGraph grade;          // its node graph
     bool operator==(const GradeVersion&) const = default;
 };
 
@@ -301,6 +342,7 @@ struct Clip {
     std::vector<GradeVersion> gradeVersions;
     int gradeVersion = 0;
     Id colorGroup = 0;  // the colour group it is graded with (Sequence::colorGroups), 0 = none
+    GradeGraph grade;   // its node graph (core/GradeGraph.h); empty: its effects run as a stack
     // A graphic's own settings (core/GraphicsTemplate.h): values for the fields published by the sequence it plays,
     // by field id, as text ("#rrggbb", "1"); a field without one shows the template's own setting.
     std::map<std::string, std::string> fields;
@@ -449,6 +491,7 @@ struct Sequence {
     std::map<std::string, double> folderGains;  // audio track folders' faders (a VCA over their tracks), dB, by "A/name"
     std::vector<std::string> mutedRoles;  // audio roles not heard (clip roles, see Clip::role)
     std::vector<ColorGroup> colorGroups;   // clips graded together (core/ColorGroups.h)
+    std::vector<SharedNode> sharedNodes;   // grade nodes shared by its clips (core/GradeGraph.h)
     std::vector<AdrCue> adrCues;           // lines to re-record, in time order (core/Adr.h)
     std::string colorSpace = "rec709";  // working and delivery space (ColorSpace.h id)
     double hdrPeakNits = 1000;          // mastering peak for HDR spaces

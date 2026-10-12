@@ -7,6 +7,7 @@
 #include <cstdlib>
 
 #include "automation/McpServer.h"
+#include "automation/PythonHost.h"
 
 #ifdef MONTAGE_WITH_LUA
 // (Lua is compiled as C++ here: its headers without lua.hpp's extern "C", and its errors are C++ exceptions.)
@@ -49,7 +50,7 @@ ScriptOptions toolScriptOptions(McpServer& server, const QString& project) {
 #ifndef MONTAGE_WITH_LUA
 
 bool scriptingAvailable() { return false; }
-bool runScript(const QString&, const QString&, const ScriptOptions&, QString* error) {
+static bool runLuaScript(const QString&, const QString&, const ScriptOptions&, QString* error) {
     if (error) *error = QStringLiteral("This build of Montage has no Lua");
     return false;
 }
@@ -141,7 +142,11 @@ void push(lua_State* L, const QJsonValue& v) {
 // A Lua value as JSON: a table whose keys are whole numbers from 1 is an array (gaps as null), any other an object
 // (keys strings or numbers); montage.null is null. What JSON cannot hold (NaN, infinity, integers past 2^53, a function,
 // a key that is neither string nor number) is an error rather than a different value.
-QJsonValue toJson(lua_State* L, int index, int depth = 0) {
+QJsonValue toJson(lua_State* L, int index, int depth = 0, int64_t* values = nullptr) {
+    // (a table held many times over is copied each time: {t, t} nested 60 deep would be 2^60 values)
+    int64_t count = 0;
+    if (!values) values = &count;
+    if (++*values > 1000000) luaL_error(L, "a tool's argument is too large (a million values, or a table held many times over)");
     index = lua_absindex(L, index);
     switch (lua_type(L, index)) {
         case LUA_TBOOLEAN: return bool(lua_toboolean(L, index));
@@ -183,7 +188,7 @@ QJsonValue toJson(lua_State* L, int index, int depth = 0) {
                 QJsonArray a;
                 for (lua_Integer i = 1; i <= last; ++i) {
                     lua_rawgeti(L, index, i);
-                    a.append(lua_isnil(L, -1) ? QJsonValue(QJsonValue::Null) : toJson(L, -1, depth + 1));
+                    a.append(lua_isnil(L, -1) ? QJsonValue(QJsonValue::Null) : toJson(L, -1, depth + 1, values));
                     lua_pop(L, 1);
                 }
                 return a;
@@ -194,7 +199,7 @@ QJsonValue toJson(lua_State* L, int index, int depth = 0) {
                 lua_pushvalue(L, -2);  // (a copy: tostring on the key itself would confuse lua_next)
                 const QString key = QString::fromUtf8(lua_tostring(L, -1));
                 lua_pop(L, 1);
-                o[key] = toJson(L, -1, depth + 1);
+                o[key] = toJson(L, -1, depth + 1, values);
                 lua_pop(L, 1);
             }
             return o;
@@ -348,7 +353,7 @@ end
 
 }  // namespace
 
-bool runScript(const QString& code, const QString& name, const ScriptOptions& options, QString* error) {
+static bool runLuaScript(const QString& code, const QString& name, const ScriptOptions& options, QString* error) {
     lua_State* L = luaL_newstate();
     if (!L) {
         if (error) *error = QStringLiteral("Lua could not start");
@@ -380,14 +385,19 @@ bool runScript(const QString& code, const QString& name, const ScriptOptions& op
                          "for _, n in ipairs{'execute', 'remove', 'rename', 'tmpname'} do os[n] = no('os.' .. n) end\n"
                          "io.popen = no('io.popen'); io.output = no('io.output'); io.write = no('io.write'); io.tmpfile = no('io.tmpfile')\n"
                          "local open0 = io.open\n"
-                         "io.open = function(f, mode) if mode ~= nil and not tostring(mode):match('^r') then error('io.open: only reading while a panel opens', 2) end return open0(f, mode) end");
+                         "io.open = function(f, mode) if mode ~= nil and not tostring(mode):match('^rb?$') then error('io.open: only reading while a panel opens', 2) end return open0(f, mode) end\n"
+                         // (debug reaches the functions replaced here, through their upvalues and the registry)
+                         "debug = nil; package.loaded.debug = nil");
     }
     // Without a terminal (the app), reading standard input would wait for ever.
     if (options.noStdin) {
         luaL_dostring(L, "local lines0 = io.lines\n"
                          "io.read = function() error('io.read: scripts in the app have no input to read', 2) end\n"
                          "io.lines = function(f, ...) if f == nil then error('io.lines needs a file here', 2) end return lines0(f, ...) end\n"
-                         "io.stdin = nil");
+                         "io.stdin = nil\n"
+                         // (io.input() with nothing named is standard input, until a file is named)
+                         "local input0, named = io.input, false\n"
+                         "io.input = function(f) if f == nil and not named then error('io.input: scripts in the app have no input to read', 2) end if f ~= nil then named = true end return input0(f) end");
     }
     lua_pushcfunction(L, montagePrint);
     lua_setglobal(L, "print");
@@ -458,5 +468,12 @@ bool runScript(const QString& code, const QString& name, const ScriptOptions& op
 }
 
 #endif
+
+bool scriptAvailable(const QString& name) { return isPythonScript(name) ? pythonAvailable() : scriptingAvailable(); }
+
+bool runScript(const QString& code, const QString& name, const ScriptOptions& options, QString* error) {
+    if (isPythonScript(name)) return runPythonScript(code, name, options, error);
+    return runLuaScript(code, name, options, error);
+}
 
 }  // namespace montage

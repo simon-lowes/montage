@@ -315,6 +315,42 @@ void MaskOverlay::paint(QPainter& p, const QRectF&) const {
     p.restore();
     paintPins(p);
     paintObjects(p);
+    paintScenePoints(p);
+}
+
+void MaskOverlay::paintScenePoints(QPainter& p) const {
+    const Sequence* seq = state_->sequence();
+    const FrameTime t = state_->playhead();
+    if (!seq) return;
+    for (Id id : state_->selectedClips()) {
+        const Clip* c = edit::clipById(*seq, id);
+        if (!c || !c->contains(t)) continue;
+        for (const Effect& e : c->effects) {
+            if (!e.enabled || e.type != "camera_track" || e.p("show_points", t - c->start, 1) < 0.5) continue;
+            auto& [text, solve] = solves_[e.id];
+            if (!solve || text != e.s("solve")) {
+                auto parsed = std::make_shared<CameraSolve>();
+                text = e.s("solve");
+                solve = cameraSolveFromString(text, *parsed) ? parsed : nullptr;
+            }
+            const int frame = solve ? cameraSolveFrame(*seq, *c, *solve, t - c->start) : -1;
+            if (frame < 0) continue;
+            p.save();
+            p.setRenderHint(QPainter::Antialiasing);
+            p.setClipRect(viewer_->imageRect());
+            p.setPen(QPen(QColor(0, 0, 0, 160), 1));
+            for (const SolvedPoint& sp : solve->points) {
+                Point2 px;
+                QPointF w;
+                if (frame < sp.first || frame > sp.last || !solve->project(frame, sp.X, px) ||
+                    !toWidget(c->id, px.x / solve->width, px.y / solve->height, w))
+                    continue;
+                p.setBrush(sp.error < 1 ? QColor(90, 220, 110) : sp.error < 2 ? QColor(255, 196, 70) : QColor(240, 80, 70));
+                p.drawEllipse(w, 2.5, 2.5);
+            }
+            p.restore();
+        }
+    }
 }
 
 void MaskOverlay::paintPins(QPainter& p) const {

@@ -1,4 +1,5 @@
 // montage-cli — headless rendering, probing and project assembly.
+#include <QDateTime>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -34,6 +35,7 @@
 #include "media/Loudness.h"
 #ifdef MONTAGE_WITH_WHISPER
 #include "automation/McpServer.h"
+#include "automation/PythonHost.h"
 #include "automation/ScriptHost.h"
 #include "automation/ScriptPanel.h"
 #include "media/Inference.h"
@@ -62,6 +64,7 @@
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
+#include "render/RenderFarm.h"
 
 using namespace montage;
 
@@ -86,6 +89,13 @@ int usage() {
                  "                     [--burn-timecode] [--burn-clip-name] [--burn-text TEXT] [--burn-corner 0-5]\n"
                  "                     [--watermark IMAGE [--watermark-corner 0-5] [--watermark-opacity 0..1]]\n"
                  "                     (corners: 0 top left, 1 top centre, 2 top right, 3-5 bottom)\n"
+                 "  montage-cli farm <folder> submit <project.montage> -o <output> [--name NAME] [render's options]\n"
+                 "  montage-cli farm <folder> jobs|nodes [--json]\n"
+                 "  montage-cli farm <folder> cancel|retry|remove <job>\n"
+                 "                     (a render farm: a folder every computer reaches; jobs wait there for render nodes)\n"
+                 "  montage-cli node <folder> [--name NAME] [--map FROM=TO]... [--once] [--poll SECONDS]\n"
+                 "                     (a render node: renders the farm's waiting jobs one at a time, FROM paths read as TO;\n"
+                 "                      Ctrl+C gives its job back for another node)\n"
                  "  montage-cli frame <project.montage> --at TC -o <image.png>\n"
                  "  montage-cli presets\n"
                  "  montage-cli colorspaces\n"
@@ -118,9 +128,11 @@ int usage() {
                  "              (Content Credentials: made in Montage, with the project's AI use and its sources' credentials)\n"
                  "  montage-cli convert-voice <speech> --voice sample.wav -o out.wav --consent [--from S] [--to S]\n"
                  "              [--voice-from S] [--voice-to S]   (the speech said again in the sample's voice, as long as it was)\n"
-                 "  montage-cli script [--project <project.montage>] [--press <button> [--set id=value]...] <file.lua> [arg...]\n"
-                 "                                       (a Lua script driving Montage's tools; montage.add_title{text = \"Hi\"}\n"
-                 "                                        calls montage_add_title. A script with a panel prints it, or with\n"
+                 "  montage-cli script [--project <project.montage>] [--press <button> [--set id=value]...] <file.lua|.py> [arg...]\n"
+                 "                                       (a Lua or Python script driving Montage's tools; montage.add_title{text =\n"
+                 "                                        \"Hi\"} (Python: montage.add_title(text=\"Hi\")) calls montage_add_title.\n"
+                 "                                        Python is the computer's ($MONTAGE_PYTHON, else python3; 3.8 or later).\n"
+                 "                                        A script with a panel prints it, or with\n"
                  "                                        --press runs as if that button were pressed, --set filling its controls)\n"
                  "  montage-cli mcp [--live]              (Model Context Protocol server on stdio, for AI agents;\n"
                  "                                        --live: on the project open in Montage, with Tools > Agent Link on)\n"
@@ -297,17 +309,19 @@ int cmdInfo(const std::vector<std::string>& args) {
     return 0;
 }
 
-int cmdRender(const std::vector<std::string>& args) {
+// `render`'s arguments (the project, then its options) made into the project to render, its settings and its stems;
+// 0, or the exit code to end with. (`farm submit` takes the same.)
+int prepareRender(const std::vector<std::string>& args, Project& p, ExportSettings& st, int& stems) {
     if (args.empty()) return usage();
     std::string projectPath = args[0], outPath, presetName = "H.264 - High Quality", inTc, outTc;
-    ExportSettings st;
+    st = ExportSettings();
     int width = 0, height = 0, crf = -1;
     std::string vcodec, acodec;
     bool proxies = false;
     double loudness = 0, ceiling = -1;
     int captionAnimation = -1;  // -1: as the project has it
     bool downmix = false;
-    int stems = 0;  // 1 per track, 2 per bus, 3 per role
+    stems = 0;  // 1 per track, 2 per bus, 3 per role
     BurnIn burnIns;
     for (size_t i = 1; i < args.size(); ++i) {
         const std::string& a = args[i];
@@ -367,7 +381,6 @@ int cmdRender(const std::vector<std::string>& args) {
     st.embedCaptions = embed;
     st.colorSpace = colorSpace;
     st.burnIn = burnIns;
-    Project p;
     if (!load(projectPath, p)) return 1;
     if (captionAnimation >= 0)
         for (CaptionTrack& t : p.active()->captionTracks) t.style.animation = captionAnimation;
@@ -387,6 +400,16 @@ int cmdRender(const std::vector<std::string>& args) {
     if (!outTc.empty() && !parseTimecode(outTc, s->fps, st.out)) return usage();
     if (st.in < 0 && s->inPoint >= 0) st.in = s->inPoint;
     if (st.out < 0 && s->outPoint >= 0) st.out = s->outPoint + 1;  // marks are inclusive
+    return 0;
+}
+
+int cmdRender(const std::vector<std::string>& args) {
+    Project p;
+    ExportSettings st;
+    int stems = 0;
+    if (const int code = prepareRender(args, p, st, stems)) return code;
+    const Sequence* s = p.active();
+    const std::string outPath = st.path;
     std::signal(SIGINT, [](int) { gCancel = true; });
     std::string err;
     bool ok = exportSequence(
@@ -416,6 +439,123 @@ int cmdRender(const std::vector<std::string>& args) {
         }
         std::fprintf(stderr, "\n");
         for (const StemFile& f : files) std::printf("Wrote %s\n", f.path.c_str());
+    }
+    return 0;
+}
+
+// The render farm (render/RenderFarm.h): jobs sent, listed, cancelled, retried and removed.
+int cmdFarm(const std::vector<std::string>& args) {
+    if (args.size() < 2) return usage();
+    const std::string farm = args[0], what = args[1];
+    std::string err;
+    if (what == "submit") {
+        // `render`'s arguments, plus --name.
+        std::vector<std::string> rest(args.begin() + 2, args.end());
+        std::string name;
+        for (size_t i = 0; i + 1 < rest.size(); ++i)
+            if (rest[i] == "--name") {
+                name = rest[i + 1];
+                rest.erase(rest.begin() + long(i), rest.begin() + long(i) + 2);
+                break;
+            }
+        Project p;
+        ExportSettings st;
+        int stems = 0;
+        if (const int code = prepareRender(rest, p, st, stems)) return code;
+        // (Where the nodes write, as this computer names it; each node maps it to its own.)
+        st.path = QFileInfo(QString::fromStdString(st.path)).absoluteFilePath().toStdString();
+        if (name.empty()) name = p.active()->name + " - " + QFileInfo(QString::fromStdString(st.path)).fileName().toStdString();
+        std::string id;
+        if (!submitFarmJob(farm, name, p, p.active()->id, st, stems, &id, &err)) {
+            std::fprintf(stderr, "error: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("%s\n", id.c_str());
+        return 0;
+    }
+    if (what == "jobs" || what == "nodes") {
+        if (!openFarm(farm, &err)) {
+            std::fprintf(stderr, "error: %s\n", err.c_str());
+            return 1;
+        }
+        const bool json = args.size() > 2 && args[2] == "--json";
+        if (args.size() > 2 && !json) return usage();
+        QJsonArray list;
+        if (what == "jobs") {
+            for (const FarmJob& j : farmJobs(farm)) {
+                if (json) {
+                    list.append(QJsonObject{{"id", QString::fromStdString(j.id)}, {"name", QString::fromStdString(j.name)},
+                                            {"state", farmStateName(j.state)}, {"progress", j.progress},
+                                            {"node", QString::fromStdString(j.node)}, {"output", QString::fromStdString(j.output)},
+                                            {"error", QString::fromStdString(j.error)}, {"submittedBy", QString::fromStdString(j.submittedBy)},
+                                            {"submitted", QString::fromStdString(j.submitted)}, {"started", QString::fromStdString(j.started)},
+                                            {"finished", QString::fromStdString(j.finished)}, {"cancelRequested", j.cancelRequested}});
+                    continue;
+                }
+                std::string state = farmStateName(j.state);
+                if (j.state == FarmState::Rendering) state += " " + std::to_string(int(j.progress * 100)) + "%" + (j.cancelRequested ? " (cancelling)" : "");
+                std::printf("%s  %-16s  %-10s  %s%s%s\n", j.id.c_str(), state.c_str(), j.node.c_str(), j.name.c_str(),
+                            j.error.empty() || j.state == FarmState::Cancelled ? "" : "  ", j.state == FarmState::Failed ? j.error.c_str() : "");
+            }
+        } else {
+            for (const FarmNodeInfo& n : farmNodes(farm)) {
+                if (json) {
+                    list.append(QJsonObject{{"name", QString::fromStdString(n.name)}, {"host", QString::fromStdString(n.host)},
+                                            {"state", QString::fromStdString(n.state)}, {"job", QString::fromStdString(n.job)},
+                                            {"updated", QString::fromStdString(n.updated)}});
+                    continue;
+                }
+                std::printf("%-20s  %-10s  %-24s  %s\n", n.name.c_str(), n.state.c_str(), n.job.c_str(), n.updated.c_str());
+            }
+        }
+        if (json) std::printf("%s", QJsonDocument(list).toJson(QJsonDocument::Indented).constData());
+        return 0;
+    }
+    if (what == "cancel" || what == "retry" || what == "remove") {
+        if (args.size() != 3) return usage();
+        const bool ok = what == "cancel" ? cancelFarmJob(farm, args[2], &err) : what == "retry" ? retryFarmJob(farm, args[2], &err)
+                                                                                                : removeFarmJob(farm, args[2], &err);
+        if (!ok) {
+            std::fprintf(stderr, "error: %s\n", err.c_str());
+            return 1;
+        }
+        return 0;
+    }
+    return usage();
+}
+
+// A render node on the farm: its waiting jobs rendered one at a time until Ctrl+C (or, --once, until none waits).
+int cmdNode(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    FarmNodeOptions o;
+    o.farm = args[0];
+    for (size_t i = 1; i < args.size(); ++i) {
+        const std::string& a = args[i];
+        auto next = [&]() -> std::string { return i + 1 < args.size() ? args[++i] : std::string(); };
+        if (a == "--name") o.name = next();
+        else if (a == "--once") o.once = true;
+        else if (a == "--poll") o.pollMs = std::max(100, int(std::atof(next().c_str()) * 1000));
+        else if (a == "--map") {
+            FarmPathMap m;
+            if (!parseFarmPathMap(next(), m)) {
+                std::fprintf(stderr, "error: --map takes from=to\n");
+                return 2;
+            }
+            o.maps.push_back(m);
+        } else return usage();
+    }
+    // Ctrl+C: the job rendering is given back for another node, and the node ends.
+    std::signal(SIGINT, [](int) { gCancel = true; });
+    o.stopped = [] { return gCancel.load(); };
+    o.log = [](const std::string& line) {
+        std::printf("%s  %s\n", QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss")).toUtf8().constData(), line.c_str());
+        std::fflush(stdout);
+    };
+    std::string err;
+    int rendered = 0;
+    if (!runFarmNode(o, &rendered, &err)) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
     }
     return 0;
 }
@@ -1336,7 +1476,7 @@ int cmdConvertVoice(const std::vector<std::string>& args) {
     return 0;
 }
 
-// A Lua script on Montage's tools, on the project named by --project (the tools that take a project get it when the
+// A Lua or Python (.py) script on Montage's tools, on the project named by --project (the tools that take a project get it when the
 // script names none); print() goes to stdout, the error to stderr.
 int cmdScript(const std::vector<std::string>& args) {
     // Options before the script; everything after it is the script's ("-p 3" there is an argument).
@@ -1364,8 +1504,10 @@ int cmdScript(const std::vector<std::string>& args) {
         std::fprintf(stderr, "error: --set fills a panel for --press\n");
         return 2;
     }
-    if (!scriptingAvailable()) {
-        std::fprintf(stderr, "error: this build of Montage has no Lua\n");
+    if (!scriptAvailable(QString::fromStdString(file))) {
+        std::fprintf(stderr, isPythonScript(QString::fromStdString(file))
+                                 ? "error: no Python 3.8 or later was found (set MONTAGE_PYTHON to one)\n"
+                                 : "error: this build of Montage has no Lua\n");
         return 1;
     }
     std::ifstream in(file, std::ios::binary);
@@ -1377,6 +1519,7 @@ int cmdScript(const std::vector<std::string>& args) {
     McpServer server;
     ScriptOptions o = toolScriptOptions(server, project.empty() ? QString() : QFileInfo(QString::fromStdString(project)).absoluteFilePath());
     o.args = rest;
+    o.file = QFileInfo(QString::fromStdString(file)).absoluteFilePath();
     o.print = [](const QString& line) {
         std::printf("%s\n", line.toUtf8().constData());
         std::fflush(stdout);
@@ -1469,6 +1612,8 @@ int main(int argc, char** argv) {
     if (cmd == "new") return cmdNew(args);
     if (cmd == "info") return cmdInfo(args);
     if (cmd == "render") return cmdRender(args);
+    if (cmd == "farm") return cmdFarm(args);
+    if (cmd == "node") return cmdNode(args);
     if (cmd == "frame") return cmdFrame(args);
     if (cmd == "presets") return cmdPresets();
     if (cmd == "devices") {  // where the AI models can run (media/Inference.h)

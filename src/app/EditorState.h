@@ -112,6 +112,10 @@ public:
     void setMaskObject(Id effect, int which);
     // The single clip shown in the inspector (first selected), or nullptr.
     const Clip* primaryClip() const;
+    // The colour node picked in the Nodes panel (core/GradeGraph.h): its key in the graph of the clip shown in the
+    // Inspector, or 0 (none picked: the Inspector shows every node). A choice of what to work on, not an edit.
+    int selectedGradeNode() const;
+    void selectGradeNode(int key);
 
     // ---- Playhead (stored in the active sequence) ------------------------
     FrameTime playhead() const;
@@ -245,6 +249,7 @@ signals:
     void projectChanged();            // anything in the project changed
     void selectionChanged();
     void maskObjectChanged();         // a different object chosen in an object mask
+    void gradeNodeSelected();         // a different colour node picked
     void playheadChanged(montage::FrameTime t);
     void sequenceSwitched();          // a different sequence became active / project replaced
     void historyChanged();
@@ -309,6 +314,8 @@ private:
     Id selectedTransition_ = 0;
     Id inspectedChain_ = 0;
     std::map<Id, int> maskObjects_;  // effect -> object being picked
+    Id gradeNodeClip_ = 0;           // the clip whose colour node is picked, and the node
+    int gradeNodeKey_ = 0;
     int targetVideo_ = 0;
     int targetAudio_ = 0;
     bool snapping_ = true;

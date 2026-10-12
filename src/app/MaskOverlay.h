@@ -10,7 +10,8 @@
 // picture is pinned to (then track it from the Inspector). Object masks are
 // picked here too: click the object (Alt-click: not the
 // object, drag: a box around it, Ctrl/Cmd-click a point: remove it), and the
-// model segments that frame in the background.
+// model segments that frame in the background. A 3D Camera Tracker's points show where its solve puts them (green
+// when they fit it well, amber, then red), those tracked in the frame on screen.
 #pragma once
 
 #include <QImage>
@@ -19,12 +20,14 @@
 #include <QPolygonF>
 #include <QThreadPool>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <vector>
 
 #include "core/MaskPath.h"
 #include "core/Model.h"
+#include "media/CameraSolve.h"
 
 class QPainter;
 class QRectF;
@@ -116,6 +119,7 @@ private:
     bool toWidget(Id clip, double u, double v, QPointF& out) const;
     bool fromWidget(Id clip, const QPointF& pt, double& u, double& v) const;
     void paintObjects(QPainter& p) const;
+    void paintScenePoints(QPainter& p) const;
     bool objectPress(const QPointF& pos);
     void objectRelease(const QPointF& pos, Qt::KeyboardModifiers mods);
 
@@ -136,6 +140,7 @@ private:
     QPointF pressPos_, dragPos_;
     QThreadPool pool_;  // one thread: segmentations finish in the order they were asked for
     int pending_ = 0;
+    mutable std::map<Id, std::pair<std::string, std::shared_ptr<const CameraSolve>>> solves_;  // by effect, with its text
     mutable QImage tint_;
     mutable QString tintKey_;
     mutable QImage ownTint_;  // the object being picked, when the mask has several

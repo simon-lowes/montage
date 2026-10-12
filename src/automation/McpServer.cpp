@@ -6,6 +6,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QDirIterator>
+#include <QElapsedTimer>
 #include <QFileInfo>
 #include <QImage>
 #include <QJsonArray>
@@ -23,6 +24,7 @@
 
 #include "core/ClipAnimation.h"
 #include "core/GradeVersions.h"
+#include "core/GradeGraph.h"
 #include "core/AudioChannels.h"
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
@@ -117,12 +119,15 @@
 #include "media/Transcriber.h"
 #include "media/VisualSearch.h"
 #include "render/ClipAnalysis.h"
+#include "render/OGraf.h"
 #include "media/Segmenter.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
+#include "render/RenderFarm.h"
 #include "render/Shorts.h"
 #include "render/Letterbox.h"
 #include "render/Processing.h"
+#include "media/LensDatabase.h"
 #include "core/Production.h"
 #include "core/ProjectLock.h"
 
@@ -255,6 +260,27 @@ Clip& clipArg(Loaded& l, const QJsonObject& a, const char* key = "clip") {
     Clip* c = edit::clipById(l.seq(), Id(v.toDouble()));
     if (!c) throw ArgError{QStringLiteral("No clip %1 in the active sequence").arg(qulonglong(v.toDouble()))};
     return *c;
+}
+
+// A video clip by its id or its name.
+const Clip& videoClipArg(Loaded& l, const QJsonObject& a) {
+    Sequence& s = l.seq();
+    if (a.value("clip").isString()) {
+        const std::string name = a.value("clip").toString().toStdString();
+        const Clip* found = nullptr;
+        for (const Track& t : s.videoTracks)
+            for (const Clip& c : t.clips)
+                if (c.name == name) {
+                    if (found) throw ArgError{QStringLiteral("Several clips are named \"%1\": give its id").arg(QString::fromStdString(name))};
+                    found = &c;
+                }
+        if (!found) throw ArgError{QStringLiteral("No video clip named \"%1\" in the active sequence").arg(QString::fromStdString(name))};
+        return *found;
+    }
+    const Clip& c = clipArg(l, a);
+    const auto loc = edit::locate(s, c.id);
+    if (!loc || loc->track.kind != TrackKind::Video) throw ArgError{"\"clip\" must be a video clip (its picture, not its sound)"};
+    return c;
 }
 
 QJsonObject clipJson(const Project& p, const Sequence& s, const Clip& c) {
@@ -1548,6 +1574,179 @@ void McpServer::Impl::addTools() {
             return ok(lines.isEmpty() ? QStringLiteral("One grade (Version 1)") : lines.join('\n'), QJsonObject{{"versions", list}});
         });
 
+    add("montage_grade_nodes", "Colour nodes",
+        "A picture clip's grade as a node graph (Resolve's Color page nodes): correctors in series, side by side through "
+        "a parallel mixer (each branch from the same picture, blended by their keys or averaged) or a layer mixer (each "
+        "input over those before it with its blend mode, where its key is), and keys passed between nodes (an outside "
+        "node grades the rest of the picture). `action`: list; convert (the clip's colour effects, one node each, in "
+        "series); add (a corrector after node `anchor`, by default the last: `how` serial, parallel, layer or outside); "
+        "key_mixer (the keys of `keys` joined into corrector `node`'s key input); remove (`node`); connect (`from` 0 the "
+        "clip's picture, `to` 0 the output, `input` 0 the picture, 1 a corrector's key or a mixer's input number, `key` "
+        "true for a key); disconnect (`to`, `input`); set (`node`: `label`, `enabled`, a layer mixer's `blend` modes, "
+        "`x`/`y`, and `settings`: mix, key_gain, key_invert, key_mode 0 multiply 1 add 2 subtract 3 replace, and mask.* "
+        "as montage_add_effect's, which limit the node to a window, qualifier or depth); move_effect (effect `effect` into "
+        "corrector `node`, 0 out of the graph); share (corrector `node` as a shared node `name`, one change seen by every "
+        "clip using it); use_shared (shared node `shared` added after the clip's last node); unshare (`node` keeps a copy); "
+        "rename_shared, remove_shared (`shared`: one no clip uses); flatten (back to an effect stack). Add effects to a "
+        "node with montage_add_effect's `node` or `shared`.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "action":{"type":"string","enum":["list","convert","add","key_mixer","remove","connect","disconnect","set","move_effect","share","use_shared","unshare","rename_shared","remove_shared","flatten"]},
+            "node":{"type":"integer"},"anchor":{"type":"integer"},"how":{"type":"string","enum":["serial","parallel","layer","outside"]},
+            "keys":{"type":"array","items":{"type":"integer"}},"from":{"type":"integer"},"to":{"type":"integer"},
+            "input":{"type":"integer"},"key":{"type":"boolean"},"label":{"type":"string"},"enabled":{"type":"boolean"},
+            "blend":{"type":"array","items":{"type":"string"}},"x":{"type":"number"},"y":{"type":"number"},
+            "settings":{"type":"object","additionalProperties":{"type":"number"}},"effect":{"type":"number"},
+            "shared":{"type":"number"},"name":{"type":"string"}},"required":["project","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const QString action = need(a, "action");
+            auto nodeArg = [&](const char* key = "node") {
+                if (!a.value(key).isDouble()) throw ArgError{QStringLiteral("\"%1\" must be a node's key (see action list)").arg(key)};
+                return a.value(key).toInt();
+            };
+            auto sharedArg = [&] {
+                if (!a.value("shared").isDouble()) throw ArgError{"\"shared\" must be a shared node's id (see action list)"};
+                return Id(a.value("shared").toDouble());
+            };
+            Id id = 0;
+            const bool needsClip = action != "rename_shared" && action != "remove_shared" && !(action == "list" && !a.contains("clip"));
+            if (needsClip) {
+                const Clip& c = clipArg(l, a);
+                const auto loc = edit::locate(s, c.id);
+                if (!loc || loc->track.kind != TrackKind::Video) throw ArgError{"Colour nodes are a picture clip's"};
+                id = c.id;
+            }
+            edit::Result r;
+            int made = 0;
+            Id madeShared = 0;
+            if (action == "convert") {
+                r = edit::convertToNodes(s, id);
+            } else if (action == "add") {
+                const QString how = str(a, "how", "serial");
+                const edit::NodeHow h = how == "parallel" ? edit::NodeHow::Parallel : how == "layer" ? edit::NodeHow::Layer
+                                      : how == "outside" ? edit::NodeHow::Outside : edit::NodeHow::Serial;
+                if (how != "serial" && h == edit::NodeHow::Serial) throw ArgError{"\"how\" is serial, parallel, layer or outside"};
+                r = edit::addGradeNode(l.project, s, id, h, a.value("anchor").toInt(), &made);
+            } else if (action == "key_mixer") {
+                std::vector<int> keys;
+                for (const QJsonValue& v : a.value("keys").toArray()) keys.push_back(v.toInt());
+                r = edit::addKeyMixer(s, id, keys, nodeArg(), &made);
+            } else if (action == "remove") {
+                r = edit::removeGradeNode(l.project, s, id, nodeArg());
+            } else if (action == "connect") {
+                r = edit::connectGradeNodes(s, id, {a.value("from").toInt(), a.value("to").toInt(), a.value("input").toInt(), a.value("key").toBool()});
+            } else if (action == "disconnect") {
+                r = edit::disconnectGradeNodes(s, id, nodeArg("to"), a.value("input").toInt());
+            } else if (action == "set") {
+                const int key = nodeArg();
+                const GradeNode* n = findGradeNode(edit::clipById(s, id)->grade, key);
+                if (!n) throw ArgError{"No such node (see action list)"};
+                GradeNode changed = *n;
+                if (a.contains("label")) changed.label = str(a, "label").toStdString();
+                if (a.contains("enabled")) changed.enabled = a.value("enabled").toBool();
+                if (a.contains("x")) changed.x = a.value("x").toDouble();
+                if (a.contains("y")) changed.y = a.value("y").toDouble();
+                if (a.contains("blend")) {
+                    if (n->kind != "layer") throw ArgError{"Blend modes are a layer mixer's"};
+                    changed.blend.clear();
+                    for (const QJsonValue& v : a.value("blend").toArray()) changed.blend.push_back(v.toString().toStdString());
+                }
+                r = edit::setGradeNode(s, id, changed);
+                if (!r.ok && !r.error.empty()) throw ArgError{QString::fromStdString(r.error)};
+                const QJsonObject settings = a.value("settings").toObject();
+                if (!settings.isEmpty()) {
+                    std::vector<std::pair<std::string, double>> values;
+                    for (auto it = settings.begin(); it != settings.end(); ++it) values.push_back({it.key().toStdString(), it.value().toDouble()});
+                    check(edit::setGradeNodeParams(l.project, s, id, key, values));
+                    r = {};
+                }
+            } else if (action == "move_effect") {
+                if (!a.value("effect").isDouble()) throw ArgError{"\"effect\" must be an effect id on the clip"};
+                r = edit::moveEffectToNode(l.project, s, id, Id(a.value("effect").toDouble()), a.value("node").toInt());
+            } else if (action == "share") {
+                r = edit::shareGradeNode(l.project, s, id, nodeArg(), str(a, "name").toStdString(), &madeShared);
+            } else if (action == "use_shared") {
+                r = edit::useSharedNode(l.project, s, id, sharedArg(), &made);
+            } else if (action == "unshare") {
+                r = edit::unshareGradeNode(l.project, s, id, nodeArg());
+            } else if (action == "rename_shared") {
+                r = edit::renameSharedNode(s, sharedArg(), need(a, "name").toStdString());
+            } else if (action == "remove_shared") {
+                r = edit::removeSharedNode(s, sharedArg());
+            } else if (action == "flatten") {
+                r = edit::flattenGrade(s, id);
+            } else if (action != "list") {
+                throw ArgError{QStringLiteral("Unknown action \"%1\"").arg(action)};
+            }
+            if (!r.ok) return fail(r.error.empty() ? QStringLiteral("Nothing to change") : QString::fromStdString(r.error));
+            if (action != "list") save(l);
+            auto effectsJson = [](const std::vector<const Effect*>& fx) {
+                QJsonArray list;
+                for (const Effect* e : fx) {
+                    const EffectInfo* info = findEffectInfo(e->type);
+                    list.append(QJsonObject{{"id", double(e->id)}, {"type", QString::fromStdString(e->type)},
+                                            {"name", QString::fromStdString(info ? info->displayName : e->type)}, {"enabled", e->enabled}});
+                }
+                return list;
+            };
+            QJsonObject out;
+            QStringList lines;
+            if (id) {
+                const Clip& c = *edit::clipById(s, id);
+                QJsonArray nodes, links, outside;
+                for (const GradeNode& n : c.grade.nodes) {
+                    QJsonObject o{{"key", n.key}, {"kind", QString::fromStdString(n.kind)}, {"name", QString::fromStdString(gradeNodeName(n))},
+                                  {"enabled", n.enabled}, {"x", n.x}, {"y", n.y}};
+                    if (n.shared) o["shared"] = double(n.shared);
+                    if (n.kind == "layer") {
+                        QJsonArray blend;
+                        for (const std::string& b : n.blend) blend.append(QString::fromStdString(b));
+                        o["blend"] = blend;
+                    }
+                    if (n.kind == "corrector") {
+                        const std::vector<const Effect*> fx = gradeNodeEffects(s, c, n.key);
+                        o["effects"] = effectsJson(fx);
+                        if (const Effect* st = gradeNodeSettings(c, n.key)) {
+                            QJsonObject settings;
+                            for (const auto& [name, prm] : st->params) settings[QString::fromStdString(name)] = prm.value;
+                            o["settings"] = settings;
+                        }
+                        QStringList names;
+                        for (const Effect* e : fx) names << QString::fromStdString(findEffectInfo(e->type) ? findEffectInfo(e->type)->displayName : e->type);
+                        lines << QStringLiteral("%1 (%2)%3: %4").arg(QString::fromStdString(gradeNodeName(n))).arg(n.key)
+                                     .arg(n.enabled ? "" : " off").arg(names.isEmpty() ? QStringLiteral("empty") : names.join(", "));
+                    } else {
+                        lines << QStringLiteral("%1 (%2)").arg(QString::fromStdString(gradeNodeName(n))).arg(n.key);
+                    }
+                    nodes.append(o);
+                }
+                for (const GradeLink& k : c.grade.links)
+                    links.append(QJsonObject{{"from", k.from}, {"to", k.to}, {"input", k.input}, {"key", k.key}});
+                std::vector<const Effect*> rest;
+                for (const Effect& e : c.effects)
+                    if (!e.node || c.grade.empty()) rest.push_back(&e);
+                out = QJsonObject{{"nodes", nodes}, {"links", links}, {"outside", effectsJson(rest)}};
+                QJsonArray order;
+                for (int k : gradeOrder(c.grade)) order.append(k);
+                out["order"] = order;
+                if (c.grade.empty()) lines << QStringLiteral("No nodes: the clip's effects run as a stack (action convert)");
+            }
+            QJsonArray shared;
+            for (const SharedNode& n : s.sharedNodes) {
+                std::vector<const Effect*> fx;
+                for (const Effect& e : n.effects) fx.push_back(&e);
+                shared.append(QJsonObject{{"id", double(n.id)}, {"name", QString::fromStdString(n.name)}, {"effects", effectsJson(fx)},
+                                          {"clips", sharedNodeUsers(s, n.id)}});
+                lines << QStringLiteral("Shared node %1 \"%2\": %3 effect(s), %4 clip(s)").arg(qint64(n.id)).arg(QString::fromStdString(n.name))
+                             .arg(n.effects.size()).arg(sharedNodeUsers(s, n.id));
+            }
+            out["shared_nodes"] = shared;
+            if (made) out["created"] = made;
+            if (madeShared) out["shared"] = double(madeShared);
+            return ok(lines.join('\n'), out);
+        });
+
     add("montage_animate_clip", "Animate a clip",
         "Give a picture clip (video, still, title, shape) an animation preset, as CapCut's In / Out / Combo: in plays "
         "over its first seconds, out over its last, combo repeats all through. Drawn on top of the clip's own transform, "
@@ -1859,7 +2058,9 @@ void McpServer::Impl::addTools() {
             "strings":{"type":"object","additionalProperties":{"type":"string"},"description":"Text settings: curves (\"x,y x,y\"), hue curves, a LUT file, the Colour Warper's mesh (\"spoke,ring,hue,sat,luma;...\": spokes 0-11 every 30 degrees from red, rings 1-4 for saturation 25-100 %, hue moved in degrees, saturation in 0-1 units, brightness in stops)..."},
             "mask_path":{"type":"array","items":{"type":["array","object"]},"description":"A closed Bezier mask: three or more points, fractions of the clip's frame"},
             "mask_smooth":{"type":"boolean","default":false},
-            "group_stage":{"type":"string","enum":["pre","post"],"description":"Add it to the clip's colour group instead: its pre-clip grade (before each member's own effects) or post-clip grade (after them)"}},
+            "group_stage":{"type":"string","enum":["pre","post"],"description":"Add it to the clip's colour group instead: its pre-clip grade (before each member's own effects) or post-clip grade (after them)"},
+            "node":{"type":"integer","description":"Into the clip's corrector node with this key (montage_grade_nodes); a shared node's goes into the shared node"},
+            "shared":{"type":"number","description":"Into this shared node (montage_grade_nodes), seen by every clip using it"}},
             "required":["project","clip","effect"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -1957,6 +2158,7 @@ void McpServer::Impl::addTools() {
             if (audioClip != (info->category == EffectCategory::AudioFilter))
                 throw ArgError{audioClip ? QStringLiteral("That is an audio clip: choose an audio effect")
                                          : QStringLiteral("That is a video clip: choose a video effect")};
+            if (type == "camera_track") throw ArgError{"Solve a clip's camera with montage_camera_track"};
             if (a.contains("group_stage")) {
                 const QString stage = str(a, "group_stage");
                 ColorGroup* g = findColorGroup(l.seq(), c.colorGroup);
@@ -1967,6 +2169,35 @@ void McpServer::Impl::addTools() {
                 (stage == "pre" ? g->pre : g->post).push_back(e);
                 save(l);
                 return ok(QStringLiteral("Added %1 to the %2-clip grade of %3").arg(QString::fromStdString(displayName), stage, QString::fromStdString(g->name)),
+                          QJsonObject{{"effect_id", double(e.id)}});
+            }
+            if (a.contains("node") || a.contains("shared")) {
+                if (audioClip || type == "stabilize" || type == "rolling_shutter")
+                    throw ArgError{"A node takes picture effects that work on the picture it is given"};
+                Id shared = Id(a.value("shared").toDouble());
+                if (a.contains("node")) {
+                    const GradeNode* n = findGradeNode(c.grade, a.value("node").toInt());
+                    if (!n || n->kind != "corrector") throw ArgError{"No corrector node with that key on the clip (see montage_grade_nodes)"};
+                    if (n->shared) shared = n->shared;
+                    else e.node = n->key;
+                }
+                if (shared) {
+                    SharedNode* sn = nullptr;
+                    for (SharedNode& x : l.seq().sharedNodes)
+                        if (x.id == shared) sn = &x;
+                    if (!sn) throw ArgError{"No such shared node (see montage_grade_nodes)"};
+                    sn->effects.push_back(e);
+                    save(l);
+                    return ok(QStringLiteral("Added %1 to shared node \"%2\"").arg(QString::fromStdString(displayName), QString::fromStdString(sn->name)),
+                              QJsonObject{{"effect_id", double(e.id)}});
+                }
+                // (after the node's own effects: before the next node's, where the graph runs)
+                auto at = c.effects.end();
+                for (auto it = c.effects.begin(); it != c.effects.end(); ++it)
+                    if (it->node == e.node) at = it + 1;
+                c.effects.insert(at, e);
+                save(l);
+                return ok(QStringLiteral("Added %1 to %2's node %3").arg(QString::fromStdString(displayName), QString::fromStdString(c.name)).arg(e.node),
                           QJsonObject{{"effect_id", double(e.id)}});
             }
             if (type == "stabilize" || type == "rolling_shutter") {
@@ -2530,7 +2761,7 @@ void McpServer::Impl::addTools() {
             const FrameTime t = std::clamp<FrameTime>(at - c.start, 0, std::max<FrameTime>(0, c.duration - 1));
             std::vector<std::string> skipped;
             const WorkingSpaceScope working(&sequenceColorSpace(s));
-            const Lut3D lut = bakeLut(c.effects, t, a.value("size").toInt(33), &skipped);
+            const Lut3D lut = bakeClipLut(s, c, t, a.value("size").toInt(33), &skipped);
             const QString path = absolute(need(a, "path"));
             std::string err;
             if (!writeCubeLut(lut, path.toStdString(), c.name, &err)) return fail(QString::fromStdString(err));
@@ -5588,8 +5819,8 @@ void McpServer::Impl::addTools() {
         "by duck_db while the dub speaks (volume keyframes, replacing theirs; 0 leaves them), as in a voice-over translation. "
         "The translated captions are added as a hidden track. The voice is an English AI voice (Kokoro; a little faster where "
         "a cue is short), or with voice: \"clone\" the speaker's own voice cloned (Chatterbox; from voice_clip, voice_media, "
-        "or the clip heard under the first caption) into `to`, any of ar da de el en es fi fr he hi it ja ko ms nl no pl pt ru "
-        "sv sw tr zh, which needs consent: true. Needs the translation and speech models (the app asks the first time; or "
+        "or the clip heard under the first caption) into `to`, any of ar da de el en es fi fr he hi it ko ms nl no pl pt ru "
+        "sv sw tr zh (not Japanese: translations come in kanji, which the voice model cannot read), which needs consent: true. Needs the translation and speech models (the app asks the first time; or "
         "scripts/fetch-models.sh).",
         R"json({"type":"object","properties":{"project":{"type":"string"},
             "track":{"type":"integer","default":0,"description":"Caption track index"},
@@ -5613,6 +5844,9 @@ void McpServer::Impl::addTools() {
             if (cloning) {
                 QJsonObject args = a;
                 args["language"] = str(a, "to", "en");
+                // (as the app: translations come in kanji, and the voice model reads Japanese in kana only)
+                if (const CloneLanguage* want = findCloneLanguage(args["language"].toString().toStdString()); want && std::string(want->code) == "ja")
+                    throw ArgError{"Dubbing into Japanese in a cloned voice is not offered: translations come in kanji, which the voice model cannot read (montage_clone_speech reads kana)"};
                 const FrameTime first = s.captionTracks[size_t(index)].captions.front().start;
                 clone = cloneVoiceArg(args, l.project, s, first);
                 to = clone->options.language;
@@ -6219,23 +6453,7 @@ void McpServer::Impl::addTools() {
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
-            // A video clip, by id or by its name.
-            const Clip* found = nullptr;
-            if (a.value("clip").isString()) {
-                const std::string name = a.value("clip").toString().toStdString();
-                for (const Track& t : s.videoTracks)
-                    for (const Clip& c : t.clips)
-                        if (c.name == name) {
-                            if (found) throw ArgError{QStringLiteral("Several clips are named \"%1\": give its id").arg(QString::fromStdString(name))};
-                            found = &c;
-                        }
-                if (!found) throw ArgError{QStringLiteral("No video clip named \"%1\" in the active sequence").arg(QString::fromStdString(name))};
-            } else {
-                found = &clipArg(l, a);
-                const auto loc = edit::locate(s, found->id);
-                if (!loc || loc->track.kind != TrackKind::Video) throw ArgError{"\"clip\" must be a video clip (its picture, not its sound)"};
-            }
-            const Clip clip = *found;
+            const Clip clip = videoClipArg(l, a);
             const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : clip.start + clip.duration / 2;
             const Image frame = chartFrame(l.project, s, clip, at);
             if (frame.empty()) return fail("The clip has no picture to read a chart from");
@@ -6269,6 +6487,113 @@ void McpServer::Impl::addTools() {
             save(l);
             out["clips"] = n;
             return ok(QStringLiteral("Matched the chart on %1 clip(s): delta E %2 before, %3 after").arg(n).arg(fit.deltaEBefore, 0, 'f', 1).arg(fit.deltaEAfter, 0, 'f', 1), out);
+        });
+
+    add("montage_correct_lens", "Correct a lens",
+        "Lens-profile correction (Premiere's and Resolve's lens correction, Lightroom's profiles): puts a Lens Correction "
+        "first in a video clip's effects from lensfun's profile of the lens it was shot with, undoing its distortion, "
+        "colour fringes (lateral chromatic aberration) and vignetting and, for a fisheye (GoPro, DJI...), making the "
+        "picture rectilinear, scaled to fill the frame. `camera` defaults to the one the clip's media names (its Camera "
+        "Model); `lens` may be left out when that camera has a fixed lens. Names match by their words (\"HERO11 Black\", "
+        "\"FE 24-70mm f/2.8 GM\"). `focal` (mm) and `aperture` (f-number) default to the lens's shortest and widest; "
+        "vignetting depends on the aperture (0: not known, no vignetting correction). `same_media` corrects every clip of the media. `list` changes nothing and "
+        "returns the camera found and the lenses that fit it (`query` narrows them by words). The profile is kept in the "
+        "project. `params` sets its other settings: distortion, tca, vignetting and rectilinear (0 off, 1 on), fit (0 fill "
+        "the frame, 1 show the whole picture, 2 neither), scale (%), recording_crop (how much narrower than the sensor's "
+        "width the recording is), distance (focus, m). Needs the lens database: downloaded by the app (Clip > Correct "
+        "Lens...), scripts/fetch-models.sh, MONTAGE_LENS_DB, or lensfun's installed one.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":["number","string"],"description":"A video clip's id or name"},
+            "camera":{"type":"string"},"lens":{"type":"string"},"focal":{"type":"number"},"aperture":{"type":"number"},
+            "params":{"type":"object","additionalProperties":{"type":"number"}},
+            "same_media":{"type":"boolean","default":false},"list":{"type":"boolean","default":false},"query":{"type":"string"}},
+            "required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Clip clip = videoClipArg(l, a);
+            const MediaItem* media = clip.mediaId ? l.project.findMedia(clip.mediaId) : nullptr;
+            if (!media) throw ArgError{"\"clip\" must show media (not a generator or a nested sequence)"};
+            const std::shared_ptr<const lens::Database> db = lensDatabase();
+            if (!db) return fail("No lens database: correct a lens once in the app (Clip > Correct Lens...), run scripts/fetch-models.sh, or set MONTAGE_LENS_DB to lensfun's database folder");
+            for (const char* k : {"camera", "lens", "query"})
+                if (a.contains(k) && !a.value(k).isString()) throw ArgError{QStringLiteral("\"%1\" must be a string").arg(k)};
+            for (const char* k : {"focal", "aperture"})
+                if (a.contains(k) && !a.value(k).isDouble()) throw ArgError{QStringLiteral("\"%1\" must be a number").arg(k)};
+            LensChoice c = suggestLens(*db, *media);
+            if (a.contains("camera")) {
+                const std::string want = a.value("camera").toString().toStdString();
+                c.camera = want.empty() ? nullptr : db->camera(want);
+                if (!want.empty() && !c.camera) throw ArgError{QStringLiteral("No camera \"%1\" in the lens database").arg(QString::fromStdString(want))};
+                // Its own lens when it has a fixed one.
+                c.lens = db->fixedLens(c.camera);
+                c.focal = c.lens ? c.lens->minFocal : 0;
+                c.aperture = -1;
+            }
+            auto cameraJson = [&]() -> QJsonValue {
+                if (!c.camera) return QJsonValue::Null;
+                return QJsonObject{{"name", QString::fromStdString(lens::cameraName(*c.camera))}, {"mount", QString::fromStdString(c.camera->mount)},
+                                   {"crop_factor", c.camera->cropFactor}};
+            };
+            if (a.value("list").toBool()) {
+                const QStringList words = a.value("query").toString().split(' ', Qt::SkipEmptyParts);
+                QJsonArray lenses;
+                for (const lens::Lens* x : db->lensesFor(c.camera)) {
+                    const QString name = QString::fromStdString(lens::lensName(*x));
+                    if (!std::all_of(words.begin(), words.end(), [&](const QString& w) { return name.contains(w, Qt::CaseInsensitive); })) continue;
+                    if (lenses.size() >= 200) break;
+                    lenses.append(QJsonObject{{"name", name}, {"type", QString::fromStdString(lens::projectionName(x->type))},
+                                              {"focal_min", x->minFocal}, {"focal_max", x->maxFocal}, {"crop_factor", x->cropFactor}});
+                }
+                return ok(QStringLiteral("%1 lens(es) fit %2").arg(lenses.size()).arg(c.camera ? QString::fromStdString(lens::cameraName(*c.camera)) : QStringLiteral("any camera")),
+                          QJsonObject{{"camera", cameraJson()}, {"lenses", lenses}});
+            }
+            if (a.contains("lens")) {
+                const std::string want = a.value("lens").toString().toStdString();
+                c.lens = db->lens(want, c.camera);
+                if (!c.lens) throw ArgError{QStringLiteral("No lens \"%1\"%2 in the lens database (list them with \"list\": true)")
+                                                .arg(QString::fromStdString(want), c.camera ? " for the " + QString::fromStdString(lens::cameraName(*c.camera)) : QString())};
+                c.focal = 0;
+                c.aperture = -1;
+            }
+            if (!c.lens) return fail(c.camera ? QStringLiteral("Which lens was on the %1? Give \"lens\" (\"list\": true lists them)").arg(QString::fromStdString(lens::cameraName(*c.camera)))
+                                              : QStringLiteral("The clip's camera is not known: give \"camera\" and \"lens\""));
+            if (a.contains("focal")) c.focal = a.value("focal").toDouble();
+            if (a.contains("aperture")) c.aperture = a.value("aperture").toDouble();
+            if (c.focal < 0 || c.focal > 2000) throw ArgError{"\"focal\" must be from 0 to 2000 (mm)"};
+            if (a.contains("aperture") && (c.aperture < 0 || c.aperture > 64))
+                throw ArgError{"\"aperture\" must be from 0 (not known: no vignetting correction) to 64"};
+            const QJsonObject params = a.value("params").toObject();
+            const EffectInfo* info = findEffectInfo("lens_correction");
+            for (auto it = params.begin(); it != params.end(); ++it) {
+                const std::string name = it.key().toStdString();
+                const auto pi = std::find_if(info->params.begin(), info->params.end(), [&](const ParamInfo& x) { return x.name == name; });
+                if (pi == info->params.end() || name == "focal" || name == "aperture" || name == "camera_crop")
+                    throw ArgError{QStringLiteral("\"params\" has no setting \"%1\" (focal and aperture are their own arguments)").arg(it.key())};
+                if (!it.value().isDouble() || it.value().toDouble() < pi->min || it.value().toDouble() > pi->max)
+                    throw ArgError{QStringLiteral("\"%1\" must be a number from %2 to %3").arg(it.key()).arg(pi->min).arg(pi->max)};
+                if ((pi->kind == ParamKind::Bool || pi->kind == ParamKind::Choice) && it.value().toDouble() != std::floor(it.value().toDouble()))
+                    throw ArgError{QStringLiteral("\"%1\" must be a whole number").arg(it.key())};
+            }
+            const std::vector<Id> clips = a.value("same_media").toBool() ? clipsOfSameMedia(s, clip.id) : std::vector<Id>{clip.id};
+            const int n = applyLensCorrection(l.project, s, clips, c);
+            for (Id id : clips)
+                if (Clip* k = edit::clipById(s, id))
+                    for (Effect& x : k->effects)
+                        if (x.type == "lens_correction")
+                            for (auto it = params.begin(); it != params.end(); ++it) x.params[it.key().toStdString()] = Param(it.value().toDouble());
+            save(l);
+            const Effect* e = nullptr;
+            if (const Clip* now = edit::clipById(s, clip.id))
+                for (const Effect& x : now->effects)
+                    if (x.type == "lens_correction") e = &x;
+            QJsonObject out{{"camera", cameraJson()}, {"lens", QString::fromStdString(lens::lensName(*c.lens))},
+                            {"type", QString::fromStdString(lens::projectionName(c.lens->type))}, {"clips", n}};
+            if (e) {
+                out["effect"] = double(e->id);
+                out["focal"] = e->p("focal", 0);
+                out["aperture"] = e->p("aperture", 0);
+            }
+            return ok(QStringLiteral("Corrected the %1 on %2 clip(s)").arg(QString::fromStdString(lens::lensName(*c.lens))).arg(n), out);
         });
 
     add("montage_object_mask", "Pick objects for a mask",
@@ -6734,7 +7059,8 @@ void McpServer::Impl::addTools() {
                 "properties":{"certificate":{"type":"string","description":"The signing certificate chain (PEM, the signing certificate first; issued by a certificate authority, for digital signatures with e-mail protection or document signing use)"},
                     "key":{"type":"string","description":"Its private key (PEM)"},
                     "allow_ai_training":{"type":"boolean","default":false,"description":"false: the credentials ask that it not be used to train AI models"}},"required":["certificate","key"]},
-            "stereo_view":{"type":"string","enum":["sbs","sbs_half","tb","tb_half","left","right","anaglyph"],"default":"sbs","description":"A stereoscopic 3D sequence: the eyes side by side or top and bottom (full size, or squeezed into one frame), or one picture"}},
+            "stereo_view":{"type":"string","enum":["sbs","sbs_half","tb","tb_half","left","right","anaglyph"],"default":"sbs","description":"A stereoscopic 3D sequence: the eyes side by side or top and bottom (full size, or squeezed into one frame), or one picture"},
+            "farm":{"type":"string","description":"A render farm folder: send the render there for its render nodes (montage-cli node) instead of rendering now; returns the job's id. The output is where the nodes write (each maps paths to its own)"}},
             "required":["project","output"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -6837,6 +7163,16 @@ void McpServer::Impl::addTools() {
                 std::string why;
                 if (!checkCredentialSigner({st.credentialCertificate, st.credentialKey, {}}, &why)) return fail(QString::fromStdString(why));
             }
+            if (a.contains("farm")) {
+                // Sent to a render farm's nodes instead (render/RenderFarm.h): the project as it is now.
+                const std::string farm = absolute(need(a, "farm")).toStdString();
+                const int groups = stems == "buses" ? StemsByBus : stems == "roles" ? StemsByRole : stems == "tracks" ? StemsByTrack : 0;
+                std::string id, why;
+                const std::string name = s.name + " - " + QFileInfo(QString::fromStdString(st.path)).fileName().toStdString();
+                if (!submitFarmJob(farm, name, l.project, s.id, st, groups, &id, &why)) return fail(QString::fromStdString(why));
+                return ok(QStringLiteral("Sent to the render farm as %1 (montage_render_farm follows it)").arg(QString::fromStdString(id)),
+                          QJsonObject{{"job", QString::fromStdString(id)}, {"farm", QString::fromStdString(farm)}, {"output", QString::fromStdString(st.path)}});
+            }
             std::string err;
             LightLevels light;
             if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, nullptr, &err, nullptr, nullptr, &light))
@@ -6881,6 +7217,283 @@ void McpServer::Impl::addTools() {
                 o["stems"] = list;
             }
             return ok(text, o);
+        });
+
+    add("montage_render_farm", "Render farm",
+        "A render farm (a folder shared by computers running `montage-cli node <folder>`): its jobs (state, progress, node, "
+        "output, error) or nodes, or a job cancelled (a rendering one stops within seconds), retried (a failed or cancelled "
+        "one waits again) or removed. Jobs are sent with montage_render's farm argument.",
+        R"json({"type":"object","properties":{"farm":{"type":"string","description":"The farm's folder"},
+            "action":{"type":"string","enum":["jobs","nodes","cancel","retry","remove"],"default":"jobs"},
+            "job":{"type":"string","description":"The job's id, for cancel, retry and remove"}},"required":["farm"]})json",
+        false, [this](const QJsonObject& a) {
+            const std::string farm = absolute(need(a, "farm")).toStdString();
+            const QString action = str(a, "action", "jobs");
+            std::string err;
+            if (action == "jobs" || action == "nodes") {
+                if (!openFarm(farm, &err)) return fail(QString::fromStdString(err));
+                QJsonArray list;
+                QStringList lines;
+                if (action == "jobs") {
+                    for (const FarmJob& j : farmJobs(farm)) {
+                        list.append(QJsonObject{{"id", QString::fromStdString(j.id)}, {"name", QString::fromStdString(j.name)},
+                                                {"state", farmStateName(j.state)}, {"progress", j.progress}, {"node", QString::fromStdString(j.node)},
+                                                {"output", QString::fromStdString(j.output)}, {"error", QString::fromStdString(j.error)},
+                                                {"cancel_requested", j.cancelRequested}, {"submitted_by", QString::fromStdString(j.submittedBy)}});
+                        lines << QStringLiteral("%1 %2 %3").arg(QString::fromStdString(j.id), farmStateName(j.state), QString::fromStdString(j.name));
+                    }
+                    return ok(lines.isEmpty() ? QStringLiteral("No jobs") : lines.join('\n'), QJsonObject{{"jobs", list}});
+                }
+                for (const FarmNodeInfo& n : farmNodes(farm)) {
+                    list.append(QJsonObject{{"name", QString::fromStdString(n.name)}, {"host", QString::fromStdString(n.host)},
+                                            {"state", QString::fromStdString(n.state)}, {"job", QString::fromStdString(n.job)},
+                                            {"updated", QString::fromStdString(n.updated)}});
+                    lines << QStringLiteral("%1 %2").arg(QString::fromStdString(n.name), QString::fromStdString(n.state));
+                }
+                return ok(lines.isEmpty() ? QStringLiteral("No nodes have run on this farm") : lines.join('\n'), QJsonObject{{"nodes", list}});
+            }
+            const std::string id = need(a, "job").toStdString();
+            bool done = false;
+            if (action == "cancel") done = cancelFarmJob(farm, id, &err);
+            else if (action == "retry") done = retryFarmJob(farm, id, &err);
+            else if (action == "remove") done = removeFarmJob(farm, id, &err);
+            else throw ArgError{"\"action\" is jobs, nodes, cancel, retry or remove"};
+            if (!done) return fail(QString::fromStdString(err));
+            return ok(QStringLiteral("%1: %2").arg(action, QString::fromStdString(id)), QJsonObject{{"job", QString::fromStdString(id)}});
+        });
+
+    add("montage_camera_track", "3D camera tracking",
+        "The camera that filmed a video clip, solved from its footage (as Fusion's Camera Tracker and After Effects' 3D "
+        "Camera Tracker do): features followed through the clip, the camera's path and focal length and the features' "
+        "places in the scene, stood on the ground the most features lie on (y up, the first solved frame's camera 1.6 high). "
+        "The camera needs to move (not only turn) over a scene with depth. solve keeps it on the clip in a 3D Camera "
+        "Tracker effect (redoing it replaces it); info reports it; place puts a title in the scene: on the ground where "
+        "the point (x, y) of the picture at `at` is (or standing there, `upright`), pinned to it in every frame; export "
+        "writes the camera as a Nuke .chan file and the points as a PLY.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "action":{"type":"string","enum":["solve","info","place","export"],"default":"solve"},
+            "field_of_view":{"type":"number","description":"solve: the lens's horizontal field of view in degrees, when known (else it is solved)"},
+            "text":{"type":"string","default":"Title","description":"place: the title's text"},
+            "at":{"type":["number","string"],"description":"place: when on the timeline to pick the point (default the clip's start)"},
+            "x":{"type":"number","default":0.5,"description":"place: across the picture, 0 to 1"},
+            "y":{"type":"number","default":0.7,"description":"place: down the picture, 0 to 1 (on the ground)"},
+            "size":{"type":"number","default":0.4,"description":"place: the title's width as a share of its distance from the camera"},
+            "upright":{"type":"boolean","default":false},"turn":{"type":"number","default":0,"description":"place: degrees about its face"},
+            "chan":{"type":"string","description":"export: the .chan file to write"},"ply":{"type":"string","description":"export: the .ply file to write"},
+            "first_frame":{"type":"integer","default":1,"description":"export: the .chan's first frame number"}},
+            "required":["project","clip"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            Clip& c = clipArg(l, a);
+            const QString action = str(a, "action", "solve");
+            std::string err;
+            auto summary = [](const CameraSolve& cs) {
+                int solved = 0;
+                for (const SolvedCamera& k : cs.cameras) solved += k.valid ? 1 : 0;
+                return QJsonObject{{"focal_px", cs.focal}, {"field_of_view", cs.fieldOfView()}, {"width", cs.width}, {"height", cs.height},
+                                   {"error_px", cs.error}, {"frames", int(cs.cameras.size())}, {"frames_solved", solved},
+                                   {"keyframes", cs.keyframes}, {"points", int(cs.points.size())}, {"on_ground", cs.oriented}};
+            };
+            auto line = [](const CameraSolve& cs) {
+                return QStringLiteral("Focal length %1 px (%2° across), error %3 px, %4 points%5")
+                    .arg(cs.focal, 0, 'f', 1)
+                    .arg(cs.fieldOfView(), 0, 'f', 1)
+                    .arg(cs.error, 0, 'f', 2)
+                    .arg(cs.points.size())
+                    .arg(cs.oriented ? QString() : QStringLiteral(" (no ground found: titles cannot be placed)"));
+            };
+            if (action == "solve") {
+                CameraSolveOptions o;
+                if (a.contains("field_of_view")) {
+                    const double fov = a.value("field_of_view").toDouble();
+                    if (!(fov > 1 && fov < 179)) throw ArgError{"\"field_of_view\" is degrees, between 1 and 179"};
+                    o.fieldOfView = fov;
+                }
+                CameraSolve cs;
+                if (!solveClipCamera(l.project, s, c, o, cs, {}, nullptr, &err))
+                    return fail(QStringLiteral("Could not solve the camera: %1").arg(QString::fromStdString(err)));
+                Effect* e = nullptr;
+                for (Effect& x : c.effects)
+                    if (!e && x.type == "camera_track") e = &x;
+                if (!e) {
+                    c.effects.push_back(makeEffect(l.project, "camera_track"));
+                    e = &c.effects.back();
+                }
+                e->strings["solve"] = cameraSolveToString(cs);
+                QJsonObject r = summary(cs);
+                r["effect_id"] = double(e->id);
+                save(l);
+                return ok(line(cs), r);
+            }
+            CameraSolve cs;
+            if (!clipCameraSolve(c, cs)) return fail("The clip's camera is not solved yet (action solve)");
+            if (action == "info") return ok(line(cs), summary(cs));
+            if (action == "export") {
+                if (!a.contains("chan") && !a.contains("ply")) throw ArgError{"Give \"chan\" and/or \"ply\": the files to write"};
+                QJsonObject r;
+                if (a.contains("chan")) {
+                    const QString chan = absolute(need(a, "chan"));
+                    if (!writeNukeChan(cs, chan.toStdString(), a.value("first_frame").toInt(1), &err)) return fail(QString::fromStdString(err));
+                    r["chan"] = chan;
+                }
+                if (a.contains("ply")) {
+                    const QString ply = absolute(need(a, "ply"));
+                    if (!writePointsPly(cs, ply.toStdString(), &err)) return fail(QString::fromStdString(err));
+                    r["ply"] = ply;
+                }
+                return ok(QStringLiteral("Wrote %1").arg(QStringList(r.keys()).join(" and ")), r);
+            }
+            if (action != "place") throw ArgError{"\"action\" is solve, info, place or export"};
+            const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : c.start;
+            if (!c.contains(at)) throw ArgError{"\"at\" is not within the clip"};
+            for (const char* key : {"x", "y", "size", "turn"})
+                if (a.contains(key) && !a.value(key).isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(key)};
+            const double size = a.value("size").toDouble(0.4);
+            if (!(size > 0)) throw ArgError{"\"size\" is more than 0"};
+            std::array<Vec3, 4> corners;
+            if (!sceneRectangleAt(s, c, cs, at - c.start, a.value("x").toDouble(0.5), a.value("y").toDouble(0.7), size,
+                                  double(s.height) / s.width, a.value("upright").toBool(), a.value("turn").toDouble(0), corners, &err))
+                return fail(QString::fromStdString(err));
+            const Id title = placeSceneTitle(l.project, s, c.id, str(a, "text", "Title").toStdString(), corners, &err);
+            if (!title) return fail(QString::fromStdString(err));
+            save(l);
+            const Clip* made = edit::clipById(s, title);
+            return ok(QStringLiteral("Placed a title in the scene"), made ? clipJson(l.project, s, *made) : QJsonObject{});
+        });
+
+    add("montage_ograf", "OGraf graphics",
+        "OGraf graphics (the EBU's open HTML graphics format, as Resolve plays them: a folder with a *.ograf.json manifest "
+        "and a JavaScript module) as clips. info reads a graphic: its name, whether it can go to any time, and the fields "
+        "of its data with their defaults. add puts one on a video track at `at` for `duration` (default 5 s), its data the "
+        "defaults with `data` over them; it plays in at its start, steps on every `advance` seconds when it has steps, and "
+        "plays out `out` seconds before its end (default 1, 0 never), or follows `actions` instead ([{\"at\": seconds, "
+        "\"type\": \"playAction\" | \"stopAction\" | \"updateAction\" | \"customAction\", \"params\": {...}}]). set changes a "
+        "clip's data (merged), graphic or actions. render renders a clip's frames now (they are otherwise rendered the "
+        "first time they are shown) and says why when the graphic fails. Graphics render offline in an installed Chrome, "
+        "Chromium or Edge (or MONTAGE_CHROMIUM).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "action":{"type":"string","enum":["info","add","set","render"],"default":"add"},
+            "manifest":{"type":"string","description":"The graphic's .ograf.json (info, add; set to change it)"},
+            "clip":{"type":"number","description":"set, render: the graphic's clip"},
+            "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":5},"track":{"type":"string"},
+            "data":{"type":"object","description":"Values for the graphic's fields (see info)"},
+            "actions":{"type":"array","items":{"type":"object"}},
+            "out":{"type":"number","default":1},"advance":{"type":"number","default":0}},
+            "required":[]})json",
+        false, [](const QJsonObject& a) {
+            const QString action = str(a, "action", "add");
+            std::string err;
+            auto graphic = [&](const QString& manifest) {
+                OGrafGraphic g;
+                if (!readOGraf(manifest.toStdString(), g, &err)) throw ArgError{QString::fromStdString(err)};
+                return g;
+            };
+            auto describe = [](const OGrafGraphic& g) {
+                QJsonArray fields;
+                for (const OGrafField& f : g.fields) {
+                    QJsonObject o{{"key", QString::fromStdString(f.key)}, {"type", QString::fromStdString(f.type)}};
+                    if (!f.title.empty()) o["title"] = QString::fromStdString(f.title);
+                    if (!f.description.empty()) o["description"] = QString::fromStdString(f.description);
+                    if (f.multiline) o["multiline"] = true;
+                    if (!f.choices.empty()) {
+                        QJsonArray c;
+                        for (const std::string& v : f.choices) c.append(QString::fromStdString(v));
+                        o["choices"] = c;
+                    }
+                    fields.append(o);
+                }
+                QJsonArray custom;
+                for (const auto& [id, name] : g.customActions) custom.append(QJsonObject{{"id", QString::fromStdString(id)}, {"name", QString::fromStdString(name)}});
+                return QJsonObject{{"name", QString::fromStdString(g.name)}, {"description", QString::fromStdString(g.description)},
+                                   {"real_time", g.realTime}, {"any_time", g.nonRealTime}, {"steps", g.stepCount},
+                                   {"fields", fields}, {"custom_actions", custom},
+                                   {"defaults", QJsonDocument::fromJson(QByteArray::fromStdString(ografDefaultData(g))).object()}};
+            };
+            if (action == "info") {
+                QJsonObject r = describe(graphic(need(a, "manifest")));
+                r["browser"] = QString::fromStdString(ografBrowser());
+                return ok(r.value("name").toString(), r);
+            }
+            if (a.contains("data") && !a.value("data").isObject()) throw ArgError{"\"data\" is an object"};
+            if (a.contains("actions")) {
+                if (!a.value("actions").isArray()) throw ArgError{"\"actions\" is an array"};
+                for (const QJsonValue& v : a.value("actions").toArray()) {
+                    const QJsonObject o = v.toObject();
+                    static const QStringList types{"playAction", "stopAction", "updateAction", "customAction"};
+                    if (!o.value("at").isDouble() || !types.contains(o.value("type").toString()))
+                        throw ArgError{"Each action has \"at\" (seconds) and \"type\" (playAction, stopAction, updateAction or customAction)"};
+                    if (o.contains("params") && !o.value("params").isObject()) throw ArgError{"An action's \"params\" is an object"};
+                }
+            }
+            for (const char* key : {"out", "advance"})
+                if (a.contains(key) && !a.value(key).isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(key)};
+            // The data, the actions and the timing onto a generator.
+            auto apply = [&](Effect& e, const QJsonObject& base) {
+                QJsonObject data = base;
+                const QJsonObject given = a.value("data").toObject();
+                for (auto it = given.begin(); it != given.end(); ++it) data[it.key()] = it.value();
+                e.strings["data"] = QJsonDocument(data).toJson(QJsonDocument::Compact).toStdString();
+                if (a.contains("actions")) {
+                    if (a.value("actions").toArray().isEmpty()) e.strings.erase("actions");
+                    else e.strings["actions"] = QJsonDocument(a.value("actions").toArray()).toJson(QJsonDocument::Compact).toStdString();
+                }
+                if (a.contains("out")) e.params["out"] = Param(std::clamp(a.value("out").toDouble(), 0.0, 30.0));
+                if (a.contains("advance")) e.params["advance"] = Param(std::clamp(a.value("advance").toDouble(), 0.0, 60.0));
+            };
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            if (action == "add") {
+                const QString manifest = QFileInfo(need(a, "manifest")).absoluteFilePath();
+                const OGrafGraphic g = graphic(manifest);
+                TrackRef t{TrackKind::Video, 0};
+                if (a.contains("track")) t = trackArg(str(a, "track"), s, true, &l.project, &s);
+                else {
+                    int top = -1;
+                    for (int i = 0; i < int(s.videoTracks.size()); ++i)
+                        if (!s.videoTracks[size_t(i)].clips.empty()) top = i;
+                    t = top + 1 < int(s.videoTracks.size()) ? TrackRef{TrackKind::Video, top + 1} : edit::addTrack(l.project, s, TrackKind::Video);
+                }
+                const FrameTime len = a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(5 * s.fpsValue()));
+                Clip c = makeGeneratorClip(l.project, "ograf", std::max<FrameTime>(1, len));
+                c.generator.strings["manifest"] = manifest.toStdString();
+                apply(c.generator, QJsonDocument::fromJson(QByteArray::fromStdString(ografDefaultData(g))).object());
+                c.start = timeArg(a.value("at"), s, "at");
+                if (!g.name.empty()) c.name = g.name;
+                const auto r = edit::overwrite(l.project, s, t, c);
+                check(r);
+                save(l);
+                const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
+                QJsonObject out = made ? clipJson(l.project, s, *made) : QJsonObject{};
+                out["graphic"] = describe(g);
+                return ok(QStringLiteral("Added %1 on %2").arg(QString::fromStdString(g.name), QString::fromStdString(trackAt(s, t)->name)), out);
+            }
+            Clip& c = clipArg(l, a);
+            if (c.generator.type != "ograf") throw ArgError{"That clip is not an OGraf graphic"};
+            if (action == "set") {
+                QJsonObject base = QJsonDocument::fromJson(QByteArray::fromStdString(c.generator.s("data"))).object();
+                if (a.contains("manifest")) {
+                    // Another graphic: its defaults beneath the data it had.
+                    const QString manifest = QFileInfo(str(a, "manifest")).absoluteFilePath();
+                    QJsonObject data = QJsonDocument::fromJson(QByteArray::fromStdString(ografDefaultData(graphic(manifest)))).object();
+                    for (auto it = base.begin(); it != base.end(); ++it) data[it.key()] = it.value();
+                    base = data;
+                    c.generator.strings["manifest"] = manifest.toStdString();
+                }
+                apply(c.generator, base);
+                save(l);
+                return ok(QStringLiteral("Changed the graphic"), clipJson(l.project, s, c));
+            }
+            if (action != "render") throw ArgError{"\"action\" is info, add, set or render"};
+            const OGrafJob job = ografClipJob(c.generator, s.width, s.height, s.fpsValue(), c.duration);
+            if (job.manifest.empty()) throw ArgError{"That clip has no graphic"};
+            QElapsedTimer clock;
+            clock.start();
+            const bool cached = ografCached(job);
+            if (!prepareOGraf(job, {}, nullptr, &err)) return fail(QString::fromStdString(err));
+            return ok(cached ? QStringLiteral("Already rendered") : QStringLiteral("Rendered %1 frames").arg(job.frames),
+                      QJsonObject{{"frames", job.frames}, {"seconds", cached ? 0.0 : clock.elapsed() / 1000.0},
+                                  {"folder", QString::fromStdString(ografCacheFolder(job))}});
         });
 
     add("montage_animate_to_audio", "Animate to audio",

@@ -594,6 +594,8 @@ void MixerPanel::rebaseRecorders() {
 bool MixerPanel::captureInsert(const EditorState::ParameterMove& m) {
     const Sequence* seq = state_->sequence();
     if (!recordingAutomation() || !seq || !m.owner || m.owner == seq->id) return false;  // the master has no mode
+    // Stopped, the pass waiting to be written: nothing samples a move now, so it is an ordinary change.
+    if (stopAt_ >= 0) return false;
     // A track or bus writing its automation.
     AutomationMode mode = AutomationMode::Off;
     for (const Track& tr : seq->audioTracks)

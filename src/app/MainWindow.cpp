@@ -1,10 +1,12 @@
 #include "MainWindow.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
+#include "render/OGraf.h"
 #include "render/Ofx.h"
 #include "AssistantPanel.h"
 #include "ScriptConsole.h"
 #include "ScriptPanelWidget.h"
+#include "automation/ScriptHost.h"
 #include "CleanFeed.h"
 #include "Settings.h"
 
@@ -78,6 +80,7 @@
 #include "core/Surround.h"
 #include "core/ColorGroups.h"
 #include "core/GradeVersions.h"
+#include "core/GradeGraph.h"
 #include "core/AudioChannels.h"
 #include "render/ClipPlacement.h"
 #include "core/Chapters.h"
@@ -115,6 +118,7 @@
 #include "media/Proxy.h"
 #include "media/Relink.h"
 #include "KeyframePanel.h"
+#include "GradeNodePanel.h"
 #include "MediaBinWidget.h"
 #include "RenderQueue.h"
 #include "RenderQueuePanel.h"
@@ -130,6 +134,8 @@
 #include "TransformOverlay.h"
 #include "ReviewOverlay.h"
 #include "ChartMatchDialog.h"
+#include "LensCorrectionDialog.h"
+#include "ReferenceOutputPanel.h"
 #include "SequenceIndexPanel.h"
 #include "StackedTimelineWidget.h"
 #include "PanFollowDialog.h"
@@ -533,6 +539,8 @@ void MainWindow::buildPanels() {
     adr_ = new AdrPanel(state_, program_, programPanel_->viewer(), this);
     adrDock_ = makeDock(tr("ADR"), "adr", adr_);
     keyframesDock_ = makeDock(tr("Keyframes"), "keyframes", new KeyframePanel(state_, this));
+    gradeNodes_ = new GradeNodePanel(state_, this);
+    nodesDock_ = makeDock(tr("Nodes"), "nodes", gradeNodes_);
     queue_ = new RenderQueue(this);
     queueDock_ = makeDock(tr("Render Queue"), "renderqueue", new RenderQueuePanel(queue_, this));
     production_ = new ProductionPanel(state_, this);
@@ -650,12 +658,13 @@ void MainWindow::layOutBuiltIn(const QString& name) {
     const int h = height();
     if (name == "Colour") {
         // A large Program monitor between the scopes and the Inspector (Premiere's Color workspace).
-        arrangeDocks({{scopesDock_}, {programDock_}}, {{binDock_, effectsDock_, indexDock_}}, {{inspectorDock_, keyframesDock_}});
+        arrangeDocks({{scopesDock_}, {programDock_}}, {{binDock_, effectsDock_, indexDock_}}, {{nodesDock_}, {inspectorDock_, keyframesDock_}});
         setCorner(Qt::TopRightCorner, Qt::RightDockWidgetArea);  // the Inspector the full height
         resizeDocks({binDock_}, {260}, Qt::Horizontal);
         resizeDocks({inspectorDock_}, {400}, Qt::Horizontal);
         resizeDocks({scopesDock_, programDock_}, {520, 900}, Qt::Horizontal);
         resizeDocks({scopesDock_}, {h * 3 / 5}, Qt::Vertical);
+        resizeDocks({nodesDock_}, {h / 3}, Qt::Vertical);
     } else if (name == "Audio") {
         // The mixer where the Source monitor was, wide meters (Premiere's Audio workspace, Resolve's Fairlight page).
         arrangeDocks({{mixerDock_, adrDock_, sourceDock_}, {programDock_}}, {{binDock_, effectsDock_}}, {{meterDock_}});
@@ -683,7 +692,7 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         resizeDocks({sourceDock_}, {h / 2 + 40}, Qt::Vertical);
     } else {  // Editing
         arrangeDocks({{sourceDock_, inspectorDock_, scopesDock_, mixerDock_, captionsDock_, multicamDock_, keyframesDock_}, {programDock_}},
-                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, peopleDock_, indexDock_, stackedDock_, queueDock_, assistantDock_}},
+                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, peopleDock_, indexDock_, stackedDock_, queueDock_, assistantDock_, nodesDock_}},
                      {{meterDock_}});
         resizeDocks({binDock_}, {380}, Qt::Horizontal);
         resizeDocks({meterDock_}, {70}, Qt::Horizontal);
@@ -1148,6 +1157,7 @@ void MainWindow::buildMenus() {
         ->setObjectName(QStringLiteral("setColourReference"));
     add(clipM, tr("&Key Out Green / Blue Screen"), QKeySequence(), [this] { keyOutScreen(); })->setObjectName(QStringLiteral("keyScreen"));
     add(clipM, tr("Match Colour Chart…"), QKeySequence(), [this] { matchColourChart(); })->setObjectName(QStringLiteral("matchColourChart"));
+    add(clipM, tr("Correct Lens…"), QKeySequence(), [this] { correctLens(); })->setObjectName(QStringLiteral("correctLens"));
     add(clipM, tr("Match Colour to Reference"), QKeySequence("Ctrl+Alt+Shift+C"), [this] { matchColour(); })
         ->setObjectName(QStringLiteral("matchColour"));
     compareRef_ = add(clipM, tr("Compare with Reference"), QKeySequence(), [this] { setCompareWithReference(compareRef_->isChecked()); });
@@ -1388,6 +1398,8 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Nudge &Right"), QKeySequence("Alt+Right"), [this] { nudge(1); });
     clipM->addSeparator();
     add(clipM, tr("New &Title"), QKeySequence("Ctrl+T"), [this] { addTitle(); });
+    add(clipM, tr("Add OGraf Graphic…"), QKeySequence(), withSeq([this] { addOGrafGraphic(); }))
+        ->setObjectName(QStringLiteral("addOGrafGraphic"));
     // Graphics templates (core/GraphicsTemplate.h): from the library, a picture published, filled from a table.
     add(clipM, tr("Insert Graphics Template…"), QKeySequence(), withSeq([this] {
             GraphicsTemplatesDialog dlg(state_, this);
@@ -1782,7 +1794,25 @@ void MainWindow::buildMenus() {
             a->setCheckable(true);
             a->setChecked(cleanFeed_ && cleanFeed_->isVisible() && cleanFeed_->screen() == screens[i]);
         }
+        output->addSeparator();
+        output->addAction(referenceOutputAction_);
     });
+    // To a broadcast monitor: SDI/HDMI through a DeckLink card, or NDI (render/ReferenceOutput.h).
+    referenceOutput_ = new ReferenceOutputController(program_, this);
+    referenceOutputAction_ = new QAction(tr("Reference Output…"), this);
+    referenceOutputAction_->setObjectName(QStringLiteral("referenceOutput"));
+    referenceOutputAction_->setToolTip(tr("The Program to a broadcast monitor through a DeckLink card (SDI or HDMI) or over NDI"));
+    referenceOutputAction_->setCheckable(true);
+    connect(referenceOutputAction_, &QAction::triggered, this, [this] {
+        referenceOutputAction_->setChecked(referenceOutput_->running());
+        showReferenceOutput();
+    });
+    connect(referenceOutput_, &ReferenceOutputController::runningChanged, referenceOutputAction_, &QAction::setChecked);
+    addAction(referenceOutputAction_);
+    if (liveLink_)
+        liveLink_->addAppTool(ReferenceOutputController::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
+            return referenceOutput_->runTool(args, structured, isError);
+        });
     // How ambisonic sound (core/Ambisonics.h) is heard: binaurally on headphones, or as stereo on speakers.
     {
         QMenu* ambiM = play->addMenu(tr("Ambisonic Monitoring"));
@@ -1915,7 +1945,8 @@ void MainWindow::buildMenus() {
         scriptsM->addAction(tr("Run Script…"), this, [this] {
             if (scripts_->running()) return state_->message(tr("A script is running"), 4000);
             QDir().mkpath(scriptsDirectory());
-            const QString f = QFileDialog::getOpenFileName(this, tr("Run Script"), scriptsDirectory(), tr("Lua scripts (*.lua);;All files (*)"));
+            const QString f = QFileDialog::getOpenFileName(this, tr("Run Script"), scriptsDirectory(),
+                                                           tr("Scripts (*.lua *.py);;Lua scripts (*.lua);;Python scripts (*.py);;All files (*)"));
             if (f.isEmpty()) return;
             scriptsDock_->show();
             scriptsDock_->raise();
@@ -2097,7 +2128,17 @@ void MainWindow::syncProgram() {
     const Sequence* s = state_->sequence();
     if (!s) return;
     program_->setProject(state_->project(), s->id);
+    if (referenceOutput_) referenceOutput_->sequenceChanged();
     program_->requestFrame();
+}
+
+void MainWindow::showReferenceOutput() {
+    if (auto* open = findChild<ReferenceOutputPanel*>(QStringLiteral("referenceOutputDialog"))) {
+        open->raise();
+        open->activateWindow();
+        return;
+    }
+    (new ReferenceOutputPanel(referenceOutput_, this))->show();
 }
 
 void MainWindow::rebuildSourceProject() {
@@ -3949,6 +3990,30 @@ int MainWindow::matchColour() {
     return n;
 }
 
+bool MainWindow::correctLens() {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    // The selected picture clip, else the top one at the playhead.
+    const FrameTime at = state_->playhead();
+    Id clip = 0;
+    for (Id id : state_->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Video && edit::clipById(*s, id)->mediaId) {
+            clip = id;
+            break;
+        }
+    for (auto t = s->videoTracks.rbegin(); !clip && t != s->videoTracks.rend(); ++t)
+        for (const Clip& c : t->clips)
+            if (c.mediaId && c.contains(at)) {
+                clip = c.id;
+                break;
+            }
+    if (!clip) {
+        state_->message(tr("Select the video clip to correct (or park on it)"));
+        return false;
+    }
+    return montage::correctLens(this, state_, clip);
+}
+
 int MainWindow::matchColourChart() {
     const Sequence* s = state_->sequence();
     if (!s) return 0;
@@ -4121,7 +4186,8 @@ unsigned MainWindow::askAttributes(const QString& title, bool removing) {
                                                      {"attrOpacity", tr("Opacity and blend mode")},
                                                      {"attrTimeRemap", tr("Time Remapping")},
                                                      {"attrVolume", tr("Volume and pan")},
-                                                     {"attrEffects", removing ? tr("Effects") : tr("Effects (added after the clip's own)")}};
+                                                     {"attrEffects", removing ? tr("Effects") : tr("Effects (added after the clip's own)")},
+                                                     {"attrGrade", removing ? tr("Colour nodes") : tr("Colour nodes (replacing the clip's)")}};
     std::vector<QCheckBox*> boxes;
     QSettings settings = appSettings();
     for (const auto& [name, label] : items) {
@@ -4165,7 +4231,7 @@ bool MainWindow::pasteAttributes(unsigned what) {
     return state_->apply(tr("Paste Attributes"), [&](Project& p, Sequence& s) {
         edit::Result r = edit::Result::fail("Nothing to paste onto");
         if (video) {
-            edit::Result rv = edit::pasteAttributes(p, s, video->clip, TrackKind::Video, to, what & ~unsigned(edit::AttrVolume));
+            edit::Result rv = edit::pasteAttributes(p, s, video->clip, TrackKind::Video, to, what & ~unsigned(edit::AttrVolume), video->sharedNodes);
             if (rv.ok) r = rv;
         }
         if (audio) {
@@ -4193,7 +4259,7 @@ bool MainWindow::exportClipLut(const QString& path, int size) {
     const FrameTime t = std::clamp<FrameTime>(state_->playhead() - c->start, 0, std::max<FrameTime>(0, c->duration - 1));
     std::vector<std::string> skipped;
     const WorkingSpaceScope working(state_->sequence() ? &sequenceColorSpace(*state_->sequence()) : nullptr);
-    const Lut3D lut = bakeLut(c->effects, t, size, &skipped);
+    const Lut3D lut = bakeClipLut(*state_->sequence(), *c, t, size, &skipped);
     std::string err;
     if (!writeCubeLut(lut, path.toStdString(), c->name, &err)) {
         statusBar()->showMessage(QString::fromStdString(err), 6000);
@@ -4266,7 +4332,7 @@ QString MainWindow::saveEffectsAsPreset(const QString& name) {
     EffectPreset preset;
     preset.name = name.trimmed().isEmpty() ? c->name : name.trimmed().toStdString();
     preset.video = loc->track.kind == TrackKind::Video;
-    preset.effects = c->effects;
+    preset.effects = flattenedEffects(*s, *c);  // (colour nodes as the stack they amount to)
     QString error;
     const QString file = presets::save(preset, &error);
     if (file.isEmpty()) {
@@ -5663,6 +5729,8 @@ void MainWindow::restoreScriptPanels() {
     QStringList open = appSettings().value(QStringLiteral("scripts/panels")).toStringList(), forgotten;
     for (const QString& path : open) {
         if (scriptPanels_.count(path) || scripts_->running()) continue;
+        // (Not forgotten for want of a Python this time: one may be found at the next start.)
+        if (!scriptAvailable(path)) continue;
         // A script that is gone, or no longer describes its panel (it errs, runs on, or ends without one), is forgotten
         // rather than run again at every start.
         if (!QFileInfo::exists(path) || !scripts_->setUpPanel(path)) forgotten << path;
@@ -7002,6 +7070,49 @@ void MainWindow::addTitle() {
     }
 }
 
+Id MainWindow::addOGrafGraphic(const QString& chosen) {
+    if (!state_->sequence()) return 0;
+    const bool asked = chosen.isEmpty();
+    const QString file = asked ? QFileDialog::getOpenFileName(this, tr("Add OGraf Graphic"), QString(), tr("OGraf graphics (*.ograf.json)")) : chosen;
+    if (file.isEmpty()) return 0;
+    OGrafGraphic g;
+    std::string err;
+    if (!readOGraf(file.toStdString(), g, &err)) {
+        if (asked) QMessageBox::warning(this, tr("Add OGraf Graphic"), QString::fromStdString(err));
+        else state_->message(QString::fromStdString(err), 6000);
+        return 0;
+    }
+    if (asked && ografBrowser().empty())
+        QMessageBox::information(this, tr("Add OGraf Graphic"),
+                                 tr("OGraf graphics are drawn by a web browser: install Chrome, Chromium or Edge (or set "
+                                    "MONTAGE_CHROMIUM to one) to see this one."));
+    const Sequence* s = state_->sequence();  // (after the dialogs)
+    if (!s) return 0;
+    FrameTime at = s->playhead, len = FrameTime(std::llround(5 * s->fpsValue()));
+    // Like a title: on the first track above the target that is free at the playhead.
+    int vt = std::min(state_->targetVideoTrack() + 1, int(s->videoTracks.size()) - 1);
+    for (int i = vt; i < int(s->videoTracks.size()); ++i)
+        if (edit::trackEmpty(s->videoTracks[size_t(i)], at, at + len)) {
+            vt = i;
+            break;
+        }
+    std::vector<Id> created;
+    state_->apply(tr("Add OGraf Graphic"), [&](Project& p, Sequence& sq) {
+        Clip c = makeGeneratorClip(p, "ograf", len);
+        c.start = at;
+        c.generator.strings["manifest"] = QFileInfo(file).absoluteFilePath().toStdString();
+        c.generator.strings["data"] = ografDefaultData(g);
+        if (!g.name.empty()) c.name = g.name;
+        auto r = edit::overwrite(p, sq, {TrackKind::Video, vt}, c);
+        created = r.created;
+        return r;
+    });
+    if (created.empty()) return 0;
+    state_->setSelection(created, false);
+    inspectorDock_->raise();
+    return created[0];
+}
+
 void MainWindow::newSequence() {
     auto spec = SequenceSettingsDialog::askNew(this, tr("Sequence %1").arg(state_->project().sequences.size() + 1));
     if (!spec) return;
@@ -7153,6 +7264,11 @@ void MainWindow::applyFromBrowser(const QString& typeQ, EffectCategory category)
         if (auto loc = edit::locate(*s, id); loc && (loc->track.kind == TrackKind::Video) == video) targets.push_back(id);
     if (targets.empty()) {
         state_->message(video ? tr("Select a video clip to apply the effect to") : tr("Select an audio clip to apply the effect to"));
+        return;
+    }
+    if (type == "lens_correction") {
+        // Which lens first (it goes first on the clip, and on the other clips of its media when chosen).
+        montage::correctLens(this, state_, targets.front());
         return;
     }
     QString error;

@@ -40,10 +40,12 @@ add_library(montage_engine STATIC
   core/Reconform.h core/Reconform.cpp
   core/Adr.h core/Adr.cpp
   core/Provenance.h core/Provenance.cpp
+  core/LensProfile.h core/LensProfile.cpp
   core/AudioDescription.h core/AudioDescription.cpp
   core/MergeClips.h core/MergeClips.cpp
   core/ClipAnimation.h core/ClipAnimation.cpp
   core/GradeVersions.h core/GradeVersions.cpp
+  core/GradeGraph.h core/GradeGraph.cpp
   core/AudioChannels.h core/AudioChannels.cpp
   core/TranscriptCorrect.h core/TranscriptCorrect.cpp
   core/SpellCheck.h core/SpellCheck.cpp
@@ -61,6 +63,7 @@ add_library(montage_engine STATIC
   core/GraphicsTemplate.h core/GraphicsTemplate.cpp
   core/Storyboard.h core/Storyboard.cpp
   automation/ScriptHost.h automation/ScriptHost.cpp
+  automation/PythonHost.h automation/PythonHost.cpp
   automation/ScriptPanel.h automation/ScriptPanel.cpp
   core/Interchange.h core/Interchange.cpp
   automation/McpServer.h automation/McpServer.cpp
@@ -101,8 +104,10 @@ add_library(montage_engine STATIC
   media/Offload.h media/Offload.cpp
   media/MicBleed.h media/MicBleed.cpp
   media/Tracking.h media/Tracking.cpp
+  media/CameraSolve.h media/CameraSolve.cpp
   media/Reframe.h media/Reframe.cpp
   media/ModelFiles.h media/ModelFiles.cpp
+  media/LensDatabase.h media/LensDatabase.cpp
   media/Segmenter.h media/Segmenter.cpp
   media/Diarizer.h media/Diarizer.cpp
   media/VisualSearch.h media/VisualSearch.cpp
@@ -111,7 +116,7 @@ add_library(montage_engine STATIC
   media/SpeechEnhance.h media/SpeechEnhance.cpp
   media/Beats.h media/Beats.cpp
   media/Translator.h media/Translator.cpp
-  render/Processing.h render/Processing.cpp
+  render/Processing.h render/Processing.cpp render/TransferTables.h
   render/Ofx.h render/Ofx.cpp
   render/FaceRefine.h render/FaceRefine.cpp
   render/Jpeg2000.h render/Jpeg2000.cpp
@@ -158,6 +163,7 @@ add_library(montage_engine STATIC
   render/HdrView.h render/HdrView.cpp
   render/Ocio.h render/Ocio.cpp
   render/Compositor.h render/Compositor.cpp
+  render/OGraf.h render/OGraf.cpp
   render/RenderCache.h render/RenderCache.cpp
   render/AudioFx.h render/AudioFx.cpp
   render/VideoFx.h render/VideoFx.cpp
@@ -165,6 +171,10 @@ add_library(montage_engine STATIC
   render/TemporalFx.h render/TemporalFx.cpp
   render/Deconvolve.h render/Deconvolve.cpp
   render/Exporter.h render/Exporter.cpp
+  render/RenderFarm.h render/RenderFarm.cpp
+  render/GradeGraph.h render/GradeGraph.cpp
+  render/VideoPacking.h render/VideoPacking.cpp
+  render/ReferenceOutput.h render/ReferenceOutput.cpp render/NdiOutput.cpp render/DeckLinkOutput.cpp
   audio/Plugins.h audio/PluginScan.cpp audio/ClapHost.cpp
   audio/DynLib.h audio/DynLib.cpp
   audio/PluginEffect.h audio/PluginEffect.cpp
@@ -177,6 +187,15 @@ target_include_directories(montage_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/clap/include)
 # OpenFX 1.5 headers (BSD-3-Clause, the ASWF's), for hosting video plugins (render/Ofx).
 target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/openfx/include)
+# NDI SDK headers (MIT, these files only), for loading the NDI Runtime when installed (render/NdiOutput).
+target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/ndi/include)
+# DeckLink SDK 12 headers (Blackmagic's permissive licence), for the Desktop Video driver's API when installed
+# (render/DeckLinkOutput; not on Windows yet).
+if(APPLE)
+  target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/decklink/mac)
+elseif(NOT WIN32)
+  target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/decklink/linux)
+endif()
 
 if(MONTAGE_WITH_VST3)
   # The VST 3 interfaces and the few SDK host helpers Montage uses (MIT).
@@ -198,6 +217,7 @@ if(MONTAGE_WITH_VST3)
 endif()
 target_compile_definitions(montage_engine PUBLIC MONTAGE_VERSION="${PROJECT_VERSION}")
 target_link_libraries(montage_engine PUBLIC Qt6::Core Qt6::Gui Qt6::Xml PkgConfig::FFMPEG Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(montage_engine PRIVATE Qt6::Network)  # (OGraf graphics: the browser's DevTools socket)
 if(APPLE)
   target_sources(montage_engine PRIVATE audio/AuHost.cpp)
   target_link_libraries(montage_engine PUBLIC "-framework AudioToolbox" "-framework CoreFoundation" "-framework CoreMIDI")

@@ -113,6 +113,14 @@ std::vector<EffectInfo> buildCatalog() {
                   num("bb", "Blue from Blue", -16, 16, 1, 0.0001), num("offset_r", "Red Offset", -1, 1, 0, 0.00001), num("offset_g", "Green Offset", -1, 1, 0, 0.00001),
                   num("offset_b", "Blue Offset", -1, 1, 0, 0.00001)},
                  {}});
+    // A grade node's own settings (core/GradeGraph.h): how much of the node shows, its key input's part in its matte,
+    // and (as every video filter) its window, qualifier and depth qualifier, which limit the node as a whole.
+    c.push_back({"grade_node", "Node", EffectCategory::VideoFilter, "Color",
+                 {pct("mix", "Key Output Gain (Mix)", 0, 100, 100), pct("key_gain", "Key Input Gain", 0, 100, 100),
+                  boolean("key_invert", "Invert Key Input"),
+                  choice("key_mode", "Key Input", {"Multiply with the node's matte", "Add to it", "Subtract from it", "Replace it"}, 0)},
+                 {}});
+    c.back().hidden = true;
     c.push_back({"color_correct", "Color Correct (Primaries)", EffectCategory::VideoFilter, "Color",
                  {
                      num("exposure", "Exposure (stops)", -5, 5, 0),
@@ -229,6 +237,15 @@ std::vector<EffectInfo> buildCatalog() {
                   choice("method", "Method", {"Position", "Position & Scale", "Position, Scale & Rotation"}, 2),
                   choice("framing", "Framing", {"Zoom to Fill", "Show Edges"}, 0), pct("extra_zoom", "Extra Zoom", 0, 50, 0),
                   pct("rolling_shutter", "Rolling Shutter", 0, 100, 0)},
+                 {}});
+    for (auto& pi : c.back().params) pi.keyframeable = false;
+    // 3D Camera Tracker (Fusion's Camera Tracker, After Effects' 3D Camera Tracker): the camera that filmed the clip,
+    // solved from its footage (media/CameraSolve.h) and kept in strings["solve"]; the picture is untouched. Its tracked
+    // points show in the viewer, and titles are placed in the scene from the Inspector (render/ClipAnalysis.h).
+    c.push_back({"camera_track", "3D Camera Tracker", EffectCategory::VideoFilter, "Transform",
+                 {boolean("show_points", "Show Tracked Points", true), pct("place_x", "Place At X", 0, 100, 50),
+                  pct("place_y", "Place At Y", 0, 100, 70), pct("place_size", "Title Width (% of its distance)", 1, 300, 40),
+                  boolean("place_upright", "Stand Upright"), num("place_turn", "Turn (degrees)", -180, 180, 0, 1)},
                  {}});
     for (auto& pi : c.back().params) pi.keyframeable = false;
     // Rolling Shutter Repair (Premiere's, Final Cut's): the same analysis; each row is moved back to where the
@@ -421,6 +438,20 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"lens_distortion", "Lens Distortion", EffectCategory::VideoFilter, "Distort",
                  {num("amount", "Barrel / Pincushion", -100, 100, 0, 0.5)},
                  {}});
+    // Lens Correction (Premiere's Lens Distortion presets, Resolve's Lens Correction, Lightroom's profiles): a lens's
+    // profile from the lensfun database (strings["profile"], its <lens> as written by core/LensProfile lensXml, with
+    // strings["camera"] and ["lens"] naming them, chosen in the Correct Lens dialog) undoes its distortion, colour
+    // fringes and vignetting and makes a fisheye rectilinear; render/VideoFx.cpp lensCorrection.
+    c.push_back({"lens_correction", "Lens Correction", EffectCategory::VideoFilter, "Distort",
+                 {num("focal", "Focal Length (mm)", 0, 2000, 0, 0.1), num("aperture", "Aperture (f/)", 0, 64, 0, 0.1),
+                  num("distance", "Focus Distance (m)", 0.1, 1000, 1000, 0.1),
+                  num("camera_crop", "Camera Crop Factor", 0, 20, 0, 0.001),
+                  num("recording_crop", "Recording Crop", 1, 10, 1, 0.01),
+                  boolean("distortion", "Distortion", true), boolean("tca", "Chromatic Aberration", true),
+                  boolean("vignetting", "Vignetting", true), boolean("rectilinear", "Fisheye to Rectilinear", true),
+                  choice("fit", "Framing", {"Fill Frame", "Show Whole Picture", "None"}, 0), pct("scale", "Scale", 25, 400, 100)},
+                 {}});
+    for (auto& pi : c.back().params) pi.keyframeable = pi.name == "focal" || pi.name == "aperture" || pi.name == "distance" || pi.name == "scale";
     // Corners as fractions of the frame, keyframeable for screen replacements.
     c.push_back({"corner_pin", "Corner Pin", EffectCategory::VideoFilter, "Distort",
                  {num("tl_x", "Top Left X", -1, 2, 0, 0.001), num("tl_y", "Top Left Y", -1, 2, 0, 0.001),
@@ -700,6 +731,16 @@ std::vector<EffectInfo> buildCatalog() {
                   pct("trim_start", "Trim Start", 0, 100, 0), pct("trim_end", "Trim End", 0, 100, 100),
                   angle("trim_offset", "Trim Offset", 0), pct("opacity", "Opacity", 0, 100, 100)},
                  {}});
+    // An OGraf graphic (render/OGraf.h): an HTML graphic in the EBU's open format, rendered in a headless browser. Its
+    // strings: "manifest" (the .ograf.json), "data" (JSON, edited in the Inspector's fields from its schema) and
+    // "actions" (JSON, replacing the usual play in, steps and out).
+    c.push_back({"ograf", "OGraf Graphic", EffectCategory::Generator, "Titles",
+                 {num("out", "Play Out Before the End (s, 0 none)", 0, 30, 1, 0.1),
+                  num("advance", "Next Step Every (s, 0 never)", 0, 60, 0, 0.1)},
+                 {str("manifest", "Graphic", StringKind::File)}});
+    c.back().strings[0].fileFilter = "OGraf graphics (*.ograf.json)";
+    for (auto& pi : c.back().params) pi.keyframeable = false;
+    c.back().hidden = true;  // (added with Add OGraf Graphic, which picks the graphic first)
     // Its effects, opacity and blend mode apply to everything on the tracks below it.
     c.push_back({"adjustment", "Adjustment Layer", EffectCategory::Generator, "Generators", {}, {}});
     // Audio Visualiser (render/AudioReactive): an audio track's sound drawn each frame, for audiograms and music videos.

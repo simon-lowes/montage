@@ -219,6 +219,7 @@ ChartMatchDialog::ChartMatchDialog(const Image& frame, const Image& view, const 
     connect(view_, &ChartView::quadChanged, this, &ChartMatchDialog::measure);
     connect(view_, &ChartView::quadEdited, this, [this] {
         placed_ = true;
+        if (searching_) editedWhileSearching_ = true;
         measure();
     });
     connect(&watcher_, &QFutureWatcherBase::finished, this, [this] {
@@ -240,6 +241,7 @@ bool ChartMatchDialog::findChart() {
 void ChartMatchDialog::findChartLater() {
     if (searching_) return;
     searching_ = true;
+    editedWhileSearching_ = false;
     find_->setEnabled(false);
     apply_->setEnabled(false);
     status_->setText(tr("Looking for the chart…"));
@@ -254,12 +256,16 @@ void ChartMatchDialog::findChartLater() {
 void ChartMatchDialog::found(bool ok, const TrackQuad& q) {
     searching_ = false;
     find_->setEnabled(true);
-    if (ok) {
+    if (ok && !editedWhileSearching_) {
         placed_ = true;
         view_->setQuad(q);  // (measured again by quadChanged)
         return;
     }
     measure();
+    if (editedWhileSearching_) {
+        editedWhileSearching_ = false;
+        return;  // (placed by hand: measured as it is)
+    }
     status_->setText(placed_ ? tr("No chart found: the outline stays where it was.") : tr("No chart found: drag the corners onto its patches."));
 }
 

@@ -9,6 +9,8 @@ namespace montage {
 bool isGradeEffect(const Effect& e) {
     const EffectInfo* info = findEffectInfo(e.type);
     // (A Chart Match is the camera's calibration, under every version, not one of them.)
+    // (Any effect in a grade node is part of the grade: a blur in a node, say.)
+    if (e.node != 0) return true;
     return info && info->category == EffectCategory::VideoFilter && info->group == "Color" && e.type != "chart_match";
 }
 
@@ -60,13 +62,15 @@ Result addGradeVersion(Project& p, Sequence& s, Id clipId, const std::string& na
         for (const Clip& k : t.clips) onVideo = onVideo || k.id == clipId;
     if (!onVideo) return Result::fail("Grades are for picture clips");
     if (c->gradeVersions.empty()) {
-        c->gradeVersions.push_back({"Version 1", {}, {}});
+        c->gradeVersions.push_back({"Version 1", {}, {}, {}});
         c->gradeVersion = 0;
     }
     std::vector<int> anchors;
     std::vector<Effect> current = takeGrade(*c, anchors);
     c->gradeVersions[size_t(c->gradeVersion)].effects = current;
     c->gradeVersions[size_t(c->gradeVersion)].anchors = anchors;
+    c->gradeVersions[size_t(c->gradeVersion)].grade = c->grade;
+    if (empty) c->grade = {};  // (a copy keeps the nodes: they name the copied effects by key, not id)
     std::vector<Effect> fresh;
     if (!empty)
         for (const Effect& e : current) {
@@ -75,7 +79,7 @@ Result addGradeVersion(Project& p, Sequence& s, Id clipId, const std::string& na
             fresh.push_back(copy);
         }
     const std::string label = name.empty() ? "Version " + std::to_string(c->gradeVersions.size() + 1) : name;
-    c->gradeVersions.push_back({label, {}, {}});
+    c->gradeVersions.push_back({label, {}, {}, {}});
     c->gradeVersion = int(c->gradeVersions.size()) - 1;
     putGrade(*c, fresh, empty ? std::vector<int>{} : anchors, anchors);
     return {};
@@ -90,10 +94,13 @@ Result switchGradeVersion(Sequence& s, Id clipId, int index) {
     GradeVersion& from = c->gradeVersions[size_t(c->gradeVersion)];
     from.effects = takeGrade(*c, anchors);
     from.anchors = anchors;
+    from.grade = std::move(c->grade);
     GradeVersion& to = c->gradeVersions[size_t(index)];
     putGrade(*c, to.effects, to.anchors, anchors);
+    c->grade = std::move(to.grade);
     to.effects.clear();  // live in the stack now
     to.anchors.clear();
+    to.grade = {};
     c->gradeVersion = index;
     return {};
 }

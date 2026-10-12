@@ -1,14 +1,20 @@
 #include "InspectorWidget.h"
 #include "SpellUi.h"
 #include "core/ColorGroups.h"
+#include "core/GradeGraph.h"
 
 #include <QAbstractItemView>
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QComboBox>
 #include <QInputDialog>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QSpinBox>
 #include <QDoubleSpinBox>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QFontComboBox>
 #include <QFormLayout>
 #include <QHBoxLayout>
@@ -31,6 +37,7 @@
 #include <utility>
 
 #include "EditorState.h"
+#include "LensCorrectionDialog.h"
 #include "ModelPacks.h"
 #include "media/DepthMap.h"
 #include "media/Matting.h"
@@ -48,6 +55,7 @@
 #include "CurveEditor.h"
 #include "render/ClipAnalysis.h"
 #include "render/Compositor.h"
+#include "render/OGraf.h"
 #include "render/Ocio.h"
 
 namespace montage {
@@ -112,6 +120,7 @@ InspectorWidget::InspectorWidget(EditorState* state, QWidget* parent) : QScrollA
     });
     connect(state_, &EditorState::playheadChanged, this, &InspectorWidget::refreshValues);
     connect(state_, &EditorState::maskObjectChanged, this, &InspectorWidget::refreshValues);
+    connect(state_, &EditorState::gradeNodeSelected, this, &InspectorWidget::rebuild);
     rebuild();
 }
 
@@ -134,6 +143,8 @@ QString InspectorWidget::signature() const {
         return sig;
     }
     QString sig = QString("C%1:%2:%3").arg(c->id).arg(QString::fromStdString(c->generator.type)).arg(c->mediaId);
+    // An OGraf graphic's fields: rebuild when another graphic is chosen.
+    if (c->generator.type == "ograf") sig += "|G" + QString::fromStdString(c->generator.s("manifest"));
     // A graphic's fields: rebuild when one is published, removed or renamed.
     if (const Sequence* g = graphicOf(state_->project(), *c)) {
         sig += QString("|F%1").arg(g->id);
@@ -143,7 +154,18 @@ QString InspectorWidget::signature() const {
     // Object and Bézier masks have their own controls: rebuild when one is chosen.
     for (const auto& e : c->effects) {
         const long shape = std::lround(e.p("mask.shape", 0));
-        sig += QString(":%1%2%3").arg(e.id).arg(e.enabled ? "+" : "-").arg(shape == 3 ? "o" : shape == 5 ? "p" : "");
+        sig += QString(":%1%2%3n%4").arg(e.id).arg(e.enabled ? "+" : "-").arg(shape == 3 ? "o" : shape == 5 ? "p" : "").arg(e.node);
+    }
+    // Its colour nodes: rebuild when one is added, picked, renamed or shared, or a shared one's effects change.
+    if (!c->grade.empty()) {
+        sig += QString("|N%1").arg(state_->selectedGradeNode());
+        for (const GradeNode& n : c->grade.nodes) {
+            sig += QString(":%1%2%3%4/%5").arg(n.key).arg(QString::fromStdString(n.kind)).arg(n.enabled ? "+" : "-")
+                       .arg(QString::fromStdString(n.label)).arg(n.shared);
+            for (const std::string& b : n.blend) sig += QString::fromStdString(b) + ',';
+            if (const SharedNode* sn = findSharedNode(*s, n.shared))
+                for (const auto& e : sn->effects) sig += QString(";%1%2").arg(e.id).arg(e.enabled ? "+" : "-");
+        }
     }
     // Its colour group: rebuild when it joins or leaves one, or the group's effects change.
     if (const ColorGroup* g = colorGroupOf(*s, *c)) {
@@ -436,6 +458,7 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
         if (const EffectInfo* info = findEffectInfo(clip.generator.type)) {
             QFormLayout* g = addSection(QString::fromStdString(info->displayName));
             addParamRows(g, *info, target(clip.generator.id));
+            if (clip.generator.type == "ograf") addOGrafFields(g, clip, target(clip.generator.id));
         }
     }
     // ---- Fixed attributes ----------------------------------------------------
@@ -590,8 +613,9 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
             });
         }
     }
-    // ---- Effect stack ------------------------------------------------------------
-    buildEffectStack(clipId, kind, clip.effects, localTime);
+    // ---- Effect stack (in colour nodes, when the clip has them) -------------------------
+    if (kind == TrackKind::Video && !clip.grade.empty()) buildGradeNodes(clip, localTime);
+    else buildEffectStack(clipId, kind, clip.effects, localTime);
     // ---- Its colour group's grades, before and after its own (core/ColorGroups.h) --------
     const Sequence* seqNow = state_->sequence();
     if (const ColorGroup* g = kind == TrackKind::Video && seqNow ? colorGroupOf(*seqNow, clip) : nullptr) {
@@ -610,6 +634,92 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
             f->addRow(note);
             buildEffectStack(stage == 0 ? preOwner : postOwner, TrackKind::Video, stage == 0 ? pre : post, localTime);
         }
+    }
+}
+
+void InspectorWidget::buildGradeNodes(const Clip& clip, const std::function<FrameTime()>& localTime) {
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    const Id clipId = clip.id;
+    const GradeGraph graph = clip.grade;  // a copy: building can change the project
+    const std::vector<Effect> effects = clip.effects;
+    const int picked = state_->selectedGradeNode();
+    // The nodes in the order they run, then any the output does not reach.
+    std::vector<int> keys = gradeOrder(graph);
+    for (const GradeNode& n : graph.nodes)
+        if (std::find(keys.begin(), keys.end(), n.key) == keys.end()) keys.push_back(n.key);
+    auto note = [this](QFormLayout* f, const QString& text, const char* name) {
+        auto* l = new QLabel(text, content_);
+        l->setObjectName(QString::fromLatin1(name));
+        l->setWordWrap(true);
+        l->setStyleSheet(QString("color: %1;").arg(theme::kTextDim.name()));
+        f->addRow(l);
+    };
+    if (!picked) {
+        QFormLayout* f = addSection(tr("Colour Nodes"));
+        note(f, tr("%n node(s). Pick one in the Nodes panel to see only its effects.", "", int(graph.nodes.size())), "gradeNodesNote");
+    }
+    for (int key : keys) {
+        if (picked && key != picked) continue;
+        const GradeNode* n = findGradeNode(graph, key);
+        const QString name = QString::fromStdString(gradeNodeName(*n));
+        if (n->kind == "corrector") {
+            QFormLayout* f = addSection(n->label.empty() ? name : tr("%1 (Node %2)").arg(name).arg(key));
+            if (!n->enabled) note(f, tr("Switched off: it passes its picture on unchanged."), "gradeNodeOff");
+            const SharedNode* sn = findSharedNode(*s, n->shared);
+            if (sn)
+                note(f, tr("Shared node \"%1\": a change here is seen on all %n clip(s) using it.", "", sharedNodeUsers(*s, sn->id))
+                            .arg(QString::fromStdString(sn->name)), "gradeNodeShared");
+            if (!gradeNodeSettings(clip, key)) {
+                // Its window, qualifier, key input and mix: made when first wanted.
+                auto* more = new QPushButton(tr("Window, Key and Mix"), content_);
+                more->setObjectName(QStringLiteral("gradeNodeSettings"));
+                more->setToolTip(tr("Limit this node to a window, a qualifier or its key input, or mix it with its input"));
+                connect(more, &QPushButton::clicked, this, [this, clipId, key] {
+                    QTimer::singleShot(0, this, [this, clipId, key] {
+                        state_->apply(tr("Node Settings"), [clipId, key](Project& p, Sequence& sq) {
+                            return edit::setGradeNodeParams(p, sq, clipId, key, {{"mix", 100.0}});
+                        });
+                    });
+                });
+                f->addRow(QString(), more);
+            }
+            if (sn) {
+                // Its settings (the clip's own: effects go into the shared node, below).
+                buildEffectStack(clipId, TrackKind::Video, effects, localTime, key, false);
+                const std::vector<Effect> shared = sn->effects;
+                buildEffectStack(sn->id, TrackKind::Video, shared, localTime);
+            } else {
+                buildEffectStack(clipId, TrackKind::Video, effects, localTime, key);
+            }
+        } else {
+            QFormLayout* f = addSection(name);
+            if (n->kind == "parallel") note(f, tr("Each input where its key is (a node's window or qualifier), or their average."), "gradeMixerNote");
+            else if (n->kind == "key_mixer") note(f, tr("Joins the keys coming into it."), "gradeMixerNote");
+            else note(f, tr("Each input over those before it, with its blend mode, where its key is."), "gradeMixerNote");
+            for (size_t i = 0; n->kind == "layer" && i < n->blend.size(); ++i) {
+                auto* mode = new QComboBox(content_);
+                mode->setObjectName(QStringLiteral("layerBlend%1").arg(i + 1));
+                for (const std::string& b : blendModes()) mode->addItem(QString::fromStdString(b));
+                mode->setCurrentText(QString::fromStdString(n->blend[i]));
+                f->addRow(tr("Input %1:").arg(i + 2), mode);
+                connect(mode, &QComboBox::currentTextChanged, this, [this, clipId, key, i](const QString& b) {
+                    state_->apply(tr("Layer Blend Mode"), [clipId, key, i, b](Project&, Sequence& sq) {
+                        const Clip* c = edit::clipById(sq, clipId);
+                        const GradeNode* m = c ? findGradeNode(c->grade, key) : nullptr;
+                        if (!m || i >= m->blend.size()) return edit::Result::fail("");
+                        GradeNode changed = *m;
+                        changed.blend[i] = b.toStdString();
+                        return edit::setGradeNode(sq, clipId, changed);
+                    });
+                });
+            }
+        }
+    }
+    // What runs outside the graph, after it.
+    if (!picked) {
+        addSection(tr("Outside the Nodes"));
+        buildEffectStack(clipId, TrackKind::Video, effects, localTime, 0);
     }
 }
 
@@ -640,7 +750,7 @@ void InspectorWidget::buildChain(Id owner) {
 }
 
 void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vector<Effect>& effects,
-                                       const std::function<FrameTime()>& localTime) {
+                                       const std::function<FrameTime()>& localTime, int node, bool addMenu) {
     auto target = [&](Id effectId) {
         Target t;
         t.resolve = [owner, effectId](Sequence& s) -> Effect* { return edit::ownedEffect(s, owner, effectId); };
@@ -661,10 +771,11 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
     for (size_t i = 0; i < effects.size(); ++i) {
         const Effect& e = effects[i];
         const EffectInfo* catalog = findEffectInfo(e.type);
-        if (!catalog) continue;
+        if (!catalog || (node >= 0 && e.node != node)) continue;
         // Plugin effects carry their own parameter list and name.
         EffectInfo shown = *catalog;
         shown.displayName = plugins::effectName(e);
+        if (e.type == "grade_node") shown.displayName = tr("Window, Key and Mix").toStdString();  // a colour node's own
         shown.params = effectParams(e);
         // A plugin with a key input: which track it hears there (as the Compressor's sidechain).
         if (e.type == "plugin" && (e.s("key_input") == "1" || plugins::knownSidechain(e.s("plugin_id")))) {
@@ -723,6 +834,81 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             // Deferred: the analysis waits in an event loop, and the Inspector may rebuild meanwhile.
             connect(analyze, &QPushButton::clicked, this,
                     [this, owner, eid] { QTimer::singleShot(0, this, [this, owner, eid] { analyzeStabilize(owner, eid); }); });
+        }
+        if (e.type == "camera_track" && onClip) {
+            // The solve lives in the effect; titles are placed from it, and it is exported for 3D programs.
+            auto* row = new QWidget(content_);
+            auto* rv = new QVBoxLayout(row);
+            rv->setContentsMargins(0, 0, 0, 0);
+            auto* status = new QLabel(row);
+            status->setObjectName(QStringLiteral("cameraTrackStatus"));
+            status->setWordWrap(true);
+            CameraSolve cs;
+            if (cameraSolveFromString(e.s("solve"), cs))
+                status->setText(tr("Solved: %1° lens, %2 px error, %n point(s)%3", "", int(cs.points.size()))
+                                    .arg(cs.fieldOfView(), 0, 'f', 1)
+                                    .arg(cs.error, 0, 'f', 2)
+                                    .arg(cs.oriented ? QString() : tr("; no ground found")));
+            else
+                status->setText(tr("Not solved yet: the camera needs to move (not only turn) over a scene with depth"));
+            auto* buttons = new QWidget(row);
+            auto* bh = new QHBoxLayout(buttons);
+            bh->setContentsMargins(0, 0, 0, 0);
+            auto* solve = new QPushButton(tr("Solve"), buttons);
+            solve->setObjectName(QStringLiteral("solveCamera"));
+            solve->setToolTip(tr("Solve the camera that filmed this clip"));
+            auto* place = new QPushButton(tr("Place Title"), buttons);
+            place->setObjectName(QStringLiteral("placeSceneTitle"));
+            place->setToolTip(tr("Put a title in the scene at the playhead, where Place At points (on the ground, or standing on it)"));
+            auto* save = new QPushButton(tr("Export…"), buttons);
+            save->setObjectName(QStringLiteral("exportCamera"));
+            save->setToolTip(tr("Write the camera as a Nuke .chan file and its points as a .ply beside it"));
+            place->setEnabled(cs.oriented);
+            save->setEnabled(cs.focal > 0);
+            bh->addWidget(solve);
+            bh->addWidget(place);
+            bh->addWidget(save);
+            rv->addWidget(status);
+            rv->addWidget(buttons);
+            f->insertRow(0, QString(), row);
+            connect(solve, &QPushButton::clicked, this,
+                    [this, owner, eid] { QTimer::singleShot(0, this, [this, owner, eid] { solveCameraTrack(owner, eid); }); });
+            connect(place, &QPushButton::clicked, this, [this, owner, eid] {
+                QTimer::singleShot(0, this, [this, owner, eid] {
+                    bool ok = false;
+                    const QString text = QInputDialog::getText(window(), tr("Place Title"), tr("Text:"), QLineEdit::Normal, tr("Title"), &ok);
+                    if (ok && !text.isEmpty()) placeTitleInScene(owner, eid, text);
+                });
+            });
+            connect(save, &QPushButton::clicked, this, [this, cs] {
+                const QString chan = QFileDialog::getSaveFileName(window(), tr("Export Camera"), QStringLiteral("camera.chan"),
+                                                                  tr("Nuke camera (*.chan)"));
+                if (chan.isEmpty()) return;
+                const QString ply = QFileInfo(chan).path() + "/" + QFileInfo(chan).completeBaseName() + ".ply";
+                std::string err;
+                if (!writeNukeChan(cs, chan.toStdString(), 1, &err) || !writePointsPly(cs, ply.toStdString(), &err))
+                    state_->message(QString::fromStdString(err), 6000);
+                else
+                    state_->message(tr("Wrote %1 and %2").arg(QFileInfo(chan).fileName(), QFileInfo(ply).fileName()), 4000);
+            });
+        }
+        if (e.type == "lens_correction" && onClip) {
+            // The lens profile it holds, chosen in the Correct Lens dialog.
+            auto* row = new QWidget(content_);
+            auto* rh = new QHBoxLayout(row);
+            rh->setContentsMargins(0, 0, 0, 0);
+            auto* name = new QLabel(row);
+            name->setObjectName(QStringLiteral("lensName"));
+            name->setWordWrap(true);
+            const QString cam = QString::fromStdString(e.s("camera")), lensName = QString::fromStdString(e.s("lens"));
+            name->setText(e.s("profile").empty() ? tr("No lens chosen") : cam.isEmpty() ? lensName : tr("%1 on %2").arg(lensName, cam));
+            auto* choose = new QPushButton(tr("Choose Lens…"), row);
+            choose->setObjectName(QStringLiteral("chooseLens"));
+            rh->addWidget(name, 1);
+            rh->addWidget(choose);
+            f->insertRow(0, tr("Lens:"), row);
+            connect(choose, &QPushButton::clicked, this,
+                    [this, owner] { QTimer::singleShot(0, this, [this, owner] { correctLens(window(), state_, owner); }); });
         }
         if (e.type == "corner_pin" && onClip) {
             // Planar tracking: the corners follow a flat surface (a screen, a sign) in the footage.
@@ -1058,14 +1244,28 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
         connect(on, &QCheckBox::toggled, this, [=](bool en) {
             mutateStack(en ? tr("Enable Effect") : tr("Bypass Effect"), [en](std::vector<Effect>& v, size_t k, Project&) { v[k].enabled = en; });
         });
+        // (past the next effect in the same colour node: those in others run elsewhere)
         connect(up, &QToolButton::clicked, this, [=] {
             mutateStack(tr("Reorder Effects"), [](std::vector<Effect>& v, size_t k, Project&) {
-                if (k > 0) std::swap(v[k], v[k - 1]);
+                for (size_t j = k; j-- > 0;)
+                    if (v[j].node == v[k].node) {
+                        // (taken out and put back before it: the effects between keep their places around the graph)
+                        Effect moved = std::move(v[k]);
+                        v.erase(v.begin() + long(k));
+                        v.insert(v.begin() + long(j), std::move(moved));
+                        break;
+                    }
             });
         });
         connect(down, &QToolButton::clicked, this, [=] {
             mutateStack(tr("Reorder Effects"), [](std::vector<Effect>& v, size_t k, Project&) {
-                if (k + 1 < v.size()) std::swap(v[k], v[k + 1]);
+                for (size_t j = k + 1; j < v.size(); ++j)
+                    if (v[j].node == v[k].node) {
+                        Effect moved = std::move(v[k]);
+                        v.erase(v.begin() + long(k));
+                        v.insert(v.begin() + long(j), std::move(moved));
+                        break;
+                    }
             });
         });
         connect(reset, &QToolButton::clicked, this, [=] {
@@ -1073,6 +1273,12 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                 if (v[k].type == "plugin") {
                     // Keep the plugin; put its parameters back to their defaults.
                     for (const ParamInfo& pi : effectParams(v[k])) v[k].params[pi.name] = Param(pi.def);
+                } else if (v[k].type == "lens_correction") {
+                    // Keep the lens and what it was chosen with; put the rest back.
+                    Effect e = makeEffect(v[k].type, v[k].id);
+                    e.strings = v[k].strings;
+                    for (const char* n : {"focal", "aperture", "camera_crop"}) e.params[n] = v[k].params[n];
+                    v[k] = e;
                 } else {
                     v[k] = makeEffect(v[k].type, v[k].id);
                 }
@@ -1082,10 +1288,10 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             mutateStack(tr("Remove Effect"), [](std::vector<Effect>& v, size_t k, Project&) { v.erase(v.begin() + long(k)); });
         });
     }
-    addEffectMenu(kind, owner);
+    if (addMenu) addEffectMenu(kind, owner, std::max(0, node));
 }
 
-void InspectorWidget::addEffectMenu(TrackKind kind, Id owner) {
+void InspectorWidget::addEffectMenu(TrackKind kind, Id owner, int node) {
     auto* btn = new QPushButton(kind == TrackKind::Video ? tr("Add Video Effect…") : tr("Add Audio Effect…"), content_);
     auto* menu = new QMenu(btn);
     std::map<std::string, QMenu*> groups;
@@ -1094,21 +1300,34 @@ void InspectorWidget::addEffectMenu(TrackKind kind, Id owner) {
         if (!g) g = menu->addMenu(QString::fromStdString(info->group));
         std::string type = info->type;
         QString label = QString::fromStdString(info->displayName);
-        g->addAction(label, this, [this, owner, type, label] {
+        g->addAction(label, this, [this, owner, type, label, node] {
             if (!ensureEffectModel(window(), type)) return;
             Id added = 0;
-            state_->edit(tr("Add %1").arg(label), [owner, type, &added](Project& p, Sequence& s) {
+            state_->edit(tr("Add %1").arg(label), [owner, type, node, &added](Project& p, Sequence& s) {
                 std::vector<Effect>* chain = edit::effectChain(s, owner);
                 if (!chain) return false;
                 Effect e = makeEffect(p, type);
                 added = e.id;
-                // Stabilize and Rolling Shutter Repair move the whole frame: they go first, before any filter.
-                if (type == "stabilize" || type == "rolling_shutter") chain->insert(chain->begin(), e);
-                else chain->push_back(e);
+                // Stabilize, Rolling Shutter Repair and Lens Correction reshape the whole frame: they go first, before any
+                // filter (outside any colour node).
+                if (type == "stabilize" || type == "rolling_shutter" || type == "lens_correction") {
+                    chain->insert(chain->begin(), e);
+                } else if (node) {
+                    // Into the colour node, after its own effects.
+                    e.node = node;
+                    auto at = chain->end();
+                    for (auto it = chain->begin(); it != chain->end(); ++it)
+                        if (it->node == node) at = it + 1;
+                    chain->insert(at, e);
+                } else {
+                    chain->push_back(e);
+                }
                 return true;
             });
             if ((type == "stabilize" || type == "rolling_shutter") && added && state_->sequence() && edit::clipById(*state_->sequence(), owner))
                 QTimer::singleShot(0, this, [this, owner, added] { analyzeStabilize(owner, added); });
+            if (type == "lens_correction" && added && state_->sequence() && edit::clipById(*state_->sequence(), owner))
+                QTimer::singleShot(0, this, [this, owner] { correctLens(window(), state_, owner); });
         });
     }
     if (kind == TrackKind::Audio) {
@@ -1987,6 +2206,173 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
     }
 }
 
+void InspectorWidget::addOGrafFields(QFormLayout* form, const Clip& clip, const Target& target) {
+    OGrafGraphic g;
+    std::string err;
+    const std::string manifest = clip.generator.s("manifest");
+    auto* about = new QLabel(content_);
+    about->setObjectName(QStringLiteral("ografStatus"));
+    about->setWordWrap(true);
+    form->addRow(QString(), about);
+    if (manifest.empty() || !readOGraf(manifest, g, &err)) {
+        about->setText(manifest.empty() ? tr("Choose a graphic: its .ograf.json") : QString::fromStdString(err));
+        return;
+    }
+    const Sequence* seq = state_->sequence();
+    const std::string failed = seq ? ografFailure(ografClipJob(clip.generator, seq->width, seq->height, seq->fpsValue(), clip.duration)) : std::string();
+    if (ografBrowser().empty())
+        about->setText(tr("%1. To draw it, install Chrome, Chromium or Edge (or set MONTAGE_CHROMIUM)").arg(QString::fromStdString(g.name)));
+    else if (!failed.empty())
+        about->setText(tr("%1 cannot be drawn: %2").arg(QString::fromStdString(g.name), QString::fromStdString(failed)));
+    else
+        about->setText(g.description.empty() ? QString::fromStdString(g.name) : QString::fromStdString(g.name + ": " + g.description));
+    // The data: one row per field of its schema, each writing its key into the data's JSON.
+    const QJsonObject defaults = QJsonDocument::fromJson(QByteArray::fromStdString(ografDefaultData(g))).object();
+    auto read = [this, target, defaults](const QString& key) -> QJsonValue {
+        const Sequence* s = state_->sequence();
+        const Effect* e = s ? target.resolve(const_cast<Sequence&>(*s)) : nullptr;
+        if (!e) return {};
+        const QJsonObject data = QJsonDocument::fromJson(QByteArray::fromStdString(e->s("data"))).object();
+        return data.contains(key) ? data.value(key) : defaults.value(key);
+    };
+    for (const OGrafField& f : g.fields) {
+        const QString key = QString::fromStdString(f.key);
+        const QString label = f.title.empty() ? key : QString::fromStdString(f.title);
+        const QString mergeKey = target.key + ":ograf:" + key;
+        auto write = [this, target, key, label, mergeKey](const QJsonValue& v) {
+            state_->edit(tr("Change %1").arg(label), [target, key, v](Project&, Sequence& s) {
+                Effect* e = target.resolve(s);
+                if (!e) return false;
+                QJsonObject data = QJsonDocument::fromJson(QByteArray::fromStdString(e->s("data"))).object();
+                if (data.value(key) == v) return false;
+                data[key] = v;
+                e->strings["data"] = QJsonDocument(data).toJson(QJsonDocument::Compact).toStdString();
+                return true;
+            }, mergeKey);
+        };
+        QWidget* w = nullptr;
+        if (!f.choices.empty()) {
+            auto* box = new QComboBox(content_);
+            for (const std::string& c : f.choices) box->addItem(QString::fromStdString(c));
+            connect(box, &QComboBox::currentTextChanged, this, [write](const QString& t) { write(t); });
+            refreshers_.push_back([box, read, key] {
+                QSignalBlocker b(box);
+                box->setCurrentIndex(box->findText(read(key).toString()));  // (none picked when it has no value)
+            });
+            w = box;
+        } else if (f.type == "string" && f.multiline) {
+            // Text is written once typing pauses: each new value renders the graphic again.
+            auto* edit = new QPlainTextEdit(content_);
+            edit->setFixedHeight(64);
+            auto* pause = new QTimer(edit);
+            pause->setSingleShot(true);
+            pause->setInterval(700);
+            connect(pause, &QTimer::timeout, this, [edit, write] { write(edit->toPlainText()); });
+            connect(edit, &QPlainTextEdit::textChanged, pause, qOverload<>(&QTimer::start));
+            refreshers_.push_back([edit, read, key] {
+                if (edit->hasFocus() || edit->toPlainText() == read(key).toString()) return;
+                QSignalBlocker b(edit);
+                edit->setPlainText(read(key).toString());
+            });
+            w = edit;
+        } else if (f.type == "string") {
+            auto* line = new QLineEdit(content_);
+            auto* pause = new QTimer(line);
+            pause->setSingleShot(true);
+            pause->setInterval(700);
+            connect(pause, &QTimer::timeout, this, [line, write] { write(line->text()); });
+            connect(line, &QLineEdit::textEdited, pause, qOverload<>(&QTimer::start));
+            connect(line, &QLineEdit::editingFinished, this, [line, pause, write] {
+                pause->stop();
+                write(line->text());
+            });
+            refreshers_.push_back([line, read, key] {
+                if (!line->hasFocus()) line->setText(read(key).toString());
+            });
+            w = line;
+        } else if (f.type == "number") {
+            auto* spin = new QDoubleSpinBox(content_);
+            spin->setRange(-1e9, 1e9);
+            spin->setDecimals(3);
+            spin->setKeyboardTracking(false);  // (a typed number is written when it is finished)
+            connect(spin, &QDoubleSpinBox::valueChanged, this, [write](double v) { write(v); });
+            refreshers_.push_back([spin, read, key] {
+                QSignalBlocker b(spin);
+                spin->setValue(read(key).toDouble());
+            });
+            w = spin;
+        } else if (f.type == "integer") {
+            auto* spin = new QSpinBox(content_);
+            spin->setRange(-1000000000, 1000000000);
+            spin->setKeyboardTracking(false);
+            connect(spin, &QSpinBox::valueChanged, this, [write](int v) { write(v); });
+            refreshers_.push_back([spin, read, key] {
+                QSignalBlocker b(spin);
+                spin->setValue(read(key).toInt());
+            });
+            w = spin;
+        } else if (f.type == "boolean") {
+            auto* check = new QCheckBox(content_);
+            connect(check, &QCheckBox::toggled, this, [write](bool v) { write(v); });
+            refreshers_.push_back([check, read, key] {
+                QSignalBlocker b(check);
+                check->setChecked(read(key).toBool());
+            });
+            w = check;
+        } else {
+            // An object or a list: its JSON.
+            auto* line = new QLineEdit(content_);
+            line->setPlaceholderText(tr("JSON"));
+            connect(line, &QLineEdit::editingFinished, this, [this, line, write, label] {
+                QJsonParseError pe;
+                const QJsonDocument d = QJsonDocument::fromJson(("[" + line->text() + "]").toUtf8(), &pe);
+                if (pe.error != QJsonParseError::NoError || d.array().size() != 1) {
+                    state_->message(tr("%1 is not JSON").arg(label), 4000);
+                    return;
+                }
+                write(d.array().at(0));
+            });
+            refreshers_.push_back([line, read, key] {
+                if (line->hasFocus()) return;
+                const QJsonValue v = read(key);
+                line->setText(v.isUndefined() || v.isNull() ? QString()
+                              : QString::fromUtf8(QJsonDocument(QJsonArray{v}).toJson(QJsonDocument::Compact)).mid(1).chopped(1));
+            });
+            w = line;
+        }
+        w->setObjectName("ograf_" + key);
+        if (!f.description.empty()) w->setToolTip(QString::fromStdString(f.description));
+        form->addRow(label, w);
+    }
+    // Rendering ahead: otherwise its frames render the first time they are shown.
+    auto* row = new QWidget(content_);
+    auto* rh = new QHBoxLayout(row);
+    rh->setContentsMargins(0, 0, 0, 0);
+    auto* render = new QPushButton(tr("Render"), row);
+    render->setObjectName(QStringLiteral("renderOGraf"));
+    render->setToolTip(tr("Render the graphic's frames now (they are kept, and rendered again only when it changes)"));
+    rh->addStretch(1);
+    rh->addWidget(render);
+    form->addRow(QString(), row);
+    const Id clipId = clip.id;
+    connect(render, &QPushButton::clicked, this, [this, clipId] { QTimer::singleShot(0, this, [this, clipId] { renderOGrafClip(clipId); }); });
+}
+
+void InspectorWidget::renderOGrafClip(Id clip) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
+    if (!c || c->generator.type != "ograf") return;
+    const OGrafJob job = ografClipJob(c->generator, s->width, s->height, s->fpsValue(), c->duration);
+    if (ografCached(job)) {
+        state_->message(tr("The graphic is rendered"), 3000);
+        return;
+    }
+    if (runAnalysis(tr("Rendering the graphic..."), [job](const auto& progress, const auto* cancel, std::string* err) {
+            return prepareOGraf(job, progress, cancel, err);
+        }))
+        state_->message(tr("Rendered the graphic"), 3000);
+}
+
 bool InspectorWidget::runAnalysis(
     const QString& title, const std::function<bool(const std::function<void(double)>&, const std::atomic<bool>*, std::string*)>& work) {
     QProgressDialog progress(title, tr("Cancel"), 0, 1000, window());
@@ -2036,6 +2422,57 @@ void InspectorWidget::analyzeStabilize(Id clip, Id effect) {
         e->strings["motion"] = motion;
         return true;
     });
+}
+
+void InspectorWidget::solveCameraTrack(Id clip, Id effect) {
+    const Sequence* s = state_->sequence();
+    if (!s || !edit::clipById(*s, clip)) return;
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    CameraSolve cs;
+    const bool ok = runAnalysis(tr("Solving the camera..."), [&, project, seqId, clip](const auto& progress, const auto* cancel, std::string* err) {
+        const Sequence* sq = project->findSequence(seqId);
+        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
+        return cl && solveClipCamera(*project, *sq, *cl, {}, cs, [&](double f, const char*) { progress(f); }, cancel, err);
+    });
+    if (!ok) return;
+    const std::string solve = cameraSolveToString(cs);
+    state_->edit(tr("Solve Camera"), [clip, effect, solve](Project&, Sequence& sq) {
+        Effect* e = edit::ownedEffect(sq, clip, effect);
+        if (!e) return false;
+        e->strings["solve"] = solve;
+        return true;
+    });
+    state_->message(cs.oriented ? tr("Solved the camera: %1 px error").arg(cs.error, 0, 'f', 2)
+                                : tr("Solved the camera, but found no ground to place titles on"),
+                    5000);
+}
+
+Id InspectorWidget::placeTitleInScene(Id clip, Id effect, const QString& text) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
+    const Effect* e = c ? edit::ownedEffect(const_cast<Sequence&>(*s), clip, effect) : nullptr;
+    CameraSolve cs;
+    if (!e || !cameraSolveFromString(e->s("solve"), cs)) {
+        state_->message(tr("Solve the camera first"), 5000);
+        return 0;
+    }
+    const FrameTime local = std::clamp<FrameTime>(state_->playhead() - c->start, 0, c->duration - 1);
+    std::array<Vec3, 4> corners;
+    std::string err;
+    if (!sceneRectangleAt(*s, *c, cs, local, e->p("place_x", local, 50) / 100, e->p("place_y", local, 70) / 100,
+                          e->p("place_size", local, 40) / 100, double(s->height) / s->width, e->p("place_upright", local) > 0.5,
+                          e->p("place_turn", local), corners, &err)) {
+        state_->message(QString::fromStdString(err), 6000);
+        return 0;
+    }
+    Id made = 0;
+    state_->edit(tr("Place Title in Scene"), [&](Project& p, Sequence& sq) {
+        made = placeSceneTitle(p, sq, clip, text.toStdString(), corners, &err);
+        return made != 0;
+    });
+    if (!made) state_->message(QString::fromStdString(err), 6000);
+    return made;
 }
 
 void InspectorWidget::trackMask(Id clip, Id effect, bool forward, int model) {

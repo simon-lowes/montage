@@ -1,4 +1,6 @@
 #include "EditorState.h"
+
+#include "core/GradeGraph.h"
 #include "render/ClipAnalysis.h"
 
 #include <QCoreApplication>
@@ -273,6 +275,20 @@ void EditorState::setMaskObject(Id effect, int which) {
     if (!added && it->second == which) return;
     it->second = which;
     emit maskObjectChanged();
+}
+
+int EditorState::selectedGradeNode() const {
+    const Clip* c = primaryClip();
+    return c && c->id == gradeNodeClip_ && findGradeNode(c->grade, gradeNodeKey_) ? gradeNodeKey_ : 0;
+}
+
+void EditorState::selectGradeNode(int key) {
+    const Clip* c = primaryClip();
+    const Id clip = c && key ? c->id : 0;
+    if (clip == gradeNodeClip_ && (clip ? key : 0) == gradeNodeKey_) return;
+    gradeNodeClip_ = clip;
+    gradeNodeKey_ = clip ? key : 0;
+    emit gradeNodeSelected();
 }
 
 const Clip* EditorState::primaryClip() const {

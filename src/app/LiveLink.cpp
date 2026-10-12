@@ -269,9 +269,14 @@ QByteArray LiveLink::patchedToolList(const QByteArray& answer) const {
         tools.append(t);
     }
     tools.append(QJsonDocument::fromJson(kContextTool).object());
+    for (const auto& [tool, run] : appTools_) tools.append(tool);
     result["tools"] = tools;
     reply["result"] = result;
     return compact(reply);
+}
+
+void LiveLink::addAppTool(const QByteArray& toolJson, AppTool run) {
+    appTools_.emplace_back(QJsonDocument::fromJson(toolJson).object(), std::move(run));
 }
 
 bool LiveLink::targetsOpenProject(const QJsonObject& args) const {
@@ -403,6 +408,13 @@ void LiveLink::dispatch(const QByteArray& message, std::function<void(QByteArray
         bool isError = false;
         return answer(contextResult(args, isError));
     }
+    for (const auto& [tool, run] : appTools_)
+        if (tool.value("name").toString() == name) {
+            QJsonObject structured;
+            bool isError = false;
+            const QString text = run(args, structured, isError);
+            return answer(toolResult(text, structured, isError));
+        }
     if (name == "montage_undo" && targetsOpenProject(args) && state_->readOnly())
         return answer(toolResult(QStringLiteral("The project is open read-only (%1 is editing it): nothing to undo here")
                                      .arg(state_->lockHolder().isEmpty() ? QStringLiteral("someone else") : state_->lockHolder()),

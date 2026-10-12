@@ -61,15 +61,22 @@ private:
     void addParamRow(QFormLayout* form, const ParamInfo& pi, const Target& target);
     void addStringRow(QFormLayout* form, const StringParamInfo& si, const Target& target);
     // The effect stack of a clip, audio track, bus or master (by owner id), with its Add menu.
+    // `node`: only the effects in that colour node (0: those outside the clip's node graph; -1 all).
+    // `addMenu`: with its Add menu.
     void buildEffectStack(Id owner, TrackKind kind, const std::vector<Effect>& effects,
-                          const std::function<FrameTime()>& localTime);
+                          const std::function<FrameTime()>& localTime, int node = -1, bool addMenu = true);
+    // A clip's colour nodes (core/GradeGraph.h): the picked one, or each in turn, then the effects outside them.
+    void buildGradeNodes(const Clip& clip, const std::function<FrameTime()>& localTime);
     void buildChain(Id owner);
-    void addEffectMenu(TrackKind kind, Id owner);
+    void addEffectMenu(TrackKind kind, Id owner, int node = 0);
 
     // Publishes a clip's setting as a field of the graphic its sequence is, asking for its label.
     void publishParameter(const Target& target, const std::string& param, const QString& label);
     // A graphic's own values for the fields its template publishes (core/GraphicsTemplate.h).
     void addGraphicSection(const Clip& clip);
+    // An OGraf graphic's data, a row per field of its schema, and rendering it ahead.
+    void addOGrafFields(QFormLayout* form, const Clip& clip, const Target& target);
+    void renderOGrafClip(Id clip);
 
 public:
     // Publishes setting `param` of effect `effect` (0: the generator) on clip `clip` of the open sequence as a field
@@ -77,6 +84,11 @@ public:
     QString publishField(Id clip, Id effect, const std::string& param, const QString& label);
     // Analyses clip `clip`'s footage for its Stabilize effect `effect`.
     void analyzeStabilize(Id clip, Id effect);
+    // Solves the camera of clip `clip`'s footage into its 3D Camera Tracker `effect`.
+    void solveCameraTrack(Id clip, Id effect);
+    // A title saying `text` placed in the scene of `clip`'s solve, where its 3D Camera Tracker `effect`'s settings say
+    // at the playhead; its id, 0 (with the reason shown) when it cannot be.
+    Id placeTitleInScene(Id clip, Id effect, const QString& text);
     // Tracks the mask of `effect` on `clip` from the playhead to the clip's end
     // (forward) or start; model 0 position, 1 + scale, 2 + rotation.
     void trackMask(Id clip, Id effect, bool forward, int model);

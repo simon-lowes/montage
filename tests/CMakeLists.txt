@@ -15,6 +15,7 @@ set_tests_properties(test_media PROPERTIES TIMEOUT 900)
 target_compile_definitions(test_media PRIVATE MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
                            MONTAGE_TEST_TOOLS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tools")
 target_compile_definitions(test_core PRIVATE MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_compile_definitions(test_render PRIVATE MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 
 if(MONTAGE_BUILD_APP)
   add_executable(test_app test_app.cpp)
@@ -114,3 +115,19 @@ if(MONTAGE_WITH_VST3)
   add_dependencies(test_plugins montage_test_vst3)
   target_compile_definitions(test_plugins PRIVATE MONTAGE_TEST_VST3_DIR="${CMAKE_CURRENT_BINARY_DIR}/vst3")
 endif()
+
+# ---- Reference output: a stand-in NDI Runtime, named and placed as NDI_RUNTIME_DIR_V6 has it ----
+add_library(montage_fake_ndi MODULE plugins/fake_ndi.c)
+target_include_directories(montage_fake_ndi PRIVATE ${PROJECT_SOURCE_DIR}/third_party/ndi/include)
+if(WIN32)
+  set_target_properties(montage_fake_ndi PROPERTIES PREFIX "" OUTPUT_NAME "Processing.NDI.Lib.x64" SUFFIX ".dll")
+elseif(APPLE)
+  set_target_properties(montage_fake_ndi PROPERTIES PREFIX "lib" OUTPUT_NAME "ndi" SUFFIX ".dylib")
+else()
+  set_target_properties(montage_fake_ndi PROPERTIES PREFIX "lib" OUTPUT_NAME "ndi" SUFFIX ".so.6")
+endif()
+set_target_properties(montage_fake_ndi PROPERTIES C_VISIBILITY_PRESET hidden
+  LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/ndi RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/ndi)
+add_dependencies(test_render montage_fake_ndi)
+target_compile_definitions(test_render PRIVATE MONTAGE_TEST_NDI_DIR="${CMAKE_CURRENT_BINARY_DIR}/ndi"
+  MONTAGE_TEST_NDI_LIBRARY="$<TARGET_FILE:montage_fake_ndi>")

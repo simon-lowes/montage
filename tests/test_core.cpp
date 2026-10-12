@@ -32,6 +32,7 @@
 #include "core/GraphicsTemplate.h"
 #include "core/Storyboard.h"
 #include "core/GradeVersions.h"
+#include "core/GradeGraph.h"
 #include "core/EffectPresets.h"
 #include "core/Effects.h"
 #include "core/History.h"
@@ -47,6 +48,7 @@
 #include "core/Reconform.h"
 #include "core/Adr.h"
 #include "core/Provenance.h"
+#include "core/LensProfile.h"
 #include "core/AudioDescription.h"
 #include <QProcess>
 #include <QSysInfo>
@@ -2118,6 +2120,331 @@ private slots:
         QCOMPARE(bestSpokenHits(hits, 1).size(), size_t(1));
     }
 
+    void gradeGraphEdits() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        Clip c = makeGeneratorClip(p, "color", 60);
+        c.effects = {makeEffect(p, "gaussian_blur"), makeEffect(p, "color_correct"), makeEffect(p, "curves")};
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok);
+        const Id id = s.videoTracks[0].clips.front().id;
+        auto clip = [&]() -> Clip& { return *edit::clipById(s, id); };
+        // Converted: a node for each colour effect, in series; the blur before them stays outside the graph.
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        QVERIFY(!edit::convertToNodes(s, id).ok);
+        const GradeGraph& g = clip().grade;
+        QCOMPARE(g.nodes.size(), size_t(2));
+        QVERIFY(validGrade(g) && serialGrade(g));
+        QCOMPARE(gradeOrder(g), (std::vector<int>{1, 2}));
+        QCOMPARE(clip().effects[0].node, 0);
+        QCOMPARE(clip().effects[1].node, 1);
+        QCOMPARE(clip().effects[2].node, 2);
+        QCOMPARE(gradeNodeEffects(s, clip(), 2).at(0)->type, std::string("curves"));
+        QVERIFY(isGradeEffect(clip().effects[2]));
+        // A serial node after node 1: between it and node 2.
+        int n3 = 0;
+        QVERIFY(edit::addGradeNode(p, s, id, edit::NodeHow::Serial, 1, &n3).ok);
+        QCOMPARE(n3, 3);
+        QCOMPARE(gradeOrder(clip().grade), (std::vector<int>{1, 3, 2}));
+        QVERIFY(serialGrade(clip().grade));
+        // A parallel node beside node 3: a mixer after them both, fed from node 1.
+        int n4 = 0;
+        { auto rr = edit::addGradeNode(p, s, id, edit::NodeHow::Parallel, 3, &n4); QVERIFY2(rr.ok, rr.error.c_str()); }
+        const GradeNode* mixer = nullptr;
+        for (const GradeNode& n : clip().grade.nodes)
+            if (n.kind == "parallel") mixer = &n;
+        QVERIFY(mixer);
+        const int m = mixer->key;
+        QCOMPARE(gradeLinkInto(clip().grade, n4, 0)->from, 1);
+        QCOMPARE(gradeLinkInto(clip().grade, m, 0)->from, 3);
+        QCOMPARE(gradeLinkInto(clip().grade, m, 1)->from, n4);
+        QCOMPARE(gradeLinkInto(clip().grade, 2, 0)->from, m);
+        QVERIFY(!serialGrade(clip().grade));
+        // Another beside node 3 joins the same mixer.
+        int n6 = 0;
+        QVERIFY(edit::addGradeNode(p, s, id, edit::NodeHow::Parallel, 3, &n6).ok);
+        QCOMPARE(gradeLinkInto(clip().grade, m, 2)->from, n6);
+        // Links that would not hold together are refused: a loop, a key into a picture input, the output unfed.
+        QVERIFY(!edit::connectGradeNodes(s, id, {2, 1, 0, false}).ok);
+        QVERIFY(!edit::connectGradeNodes(s, id, {1, 2, 0, true}).ok);
+        QVERIFY(!edit::disconnectGradeNodes(s, id, 0, 0).ok);
+        QVERIFY(edit::connectGradeNodes(s, id, {1, 2, 1, true}).ok);  // node 1's key into node 2's key input
+        QVERIFY(validGrade(clip().grade));
+        // Removing the parallel nodes: the mixer left with one picture goes too, and node 3 feeds node 2 again.
+        QVERIFY(edit::removeGradeNode(p, s, id, n6).ok);
+        QVERIFY(findGradeNode(clip().grade, m));
+        QVERIFY(edit::removeGradeNode(p, s, id, n4).ok);
+        QVERIFY(!findGradeNode(clip().grade, m));
+        QCOMPARE(gradeLinkInto(clip().grade, 2, 0)->from, 3);
+        // Removing node 1: node 3 takes the clip's picture, and node 1's key and effect go.
+        QVERIFY(edit::removeGradeNode(p, s, id, 1).ok);
+        QCOMPARE(gradeLinkInto(clip().grade, 3, 0)->from, 0);
+        QVERIFY(!gradeLinkInto(clip().grade, 2, 1));
+        QCOMPARE(clip().effects.size(), size_t(2));
+        // An outside node: in series after node 3, taking its key inverted.
+        int out = 0;
+        QVERIFY(edit::addGradeNode(p, s, id, edit::NodeHow::Outside, 3, &out).ok);
+        QVERIFY(gradeLinkInto(clip().grade, out, 1) && gradeLinkInto(clip().grade, out, 1)->key && gradeLinkInto(clip().grade, out, 1)->from == 3);
+        QCOMPARE(gradeNodeSettings(clip(), out)->p("key_invert", 0), 1.0);
+        // A layer mixer's blend modes follow its inputs.
+        int layered = 0;
+        QVERIFY(edit::addGradeNode(p, s, id, edit::NodeHow::Layer, 2, &layered).ok);
+        for (const GradeNode& n : clip().grade.nodes)
+            if (n.kind == "layer") QCOMPARE(n.blend, std::vector<std::string>{"normal"});
+        // An effect moved into a node and out; a node renamed and switched off.
+        const Id blur = clip().effects[0].id;
+        QVERIFY(edit::moveEffectToNode(p, s, id, blur, 3).ok);
+        QCOMPARE(gradeNodeEffects(s, clip(), 3).size(), size_t(1));
+        QVERIFY(!edit::moveEffectToNode(p, s, id, blur, 99).ok);
+        GradeNode renamed = *findGradeNode(clip().grade, 3);
+        renamed.label = "Skin";
+        renamed.enabled = false;
+        QVERIFY(edit::setGradeNode(s, id, renamed).ok);
+        QCOMPARE(gradeNodeName(*findGradeNode(clip().grade, 3)), std::string("Skin"));
+        // Flattened: the nodes' effects as a stack again, the nodes' settings gone.
+        QVERIFY(edit::flattenGrade(s, id).ok);
+        QVERIFY(clip().grade.empty());
+        for (const Effect& e : clip().effects) QVERIFY(e.node == 0 && e.type != "grade_node");
+        QCOMPARE(clip().effects.size(), size_t(2));  // the blur and the curves
+    }
+
+    void gradeGraphKeptWithTheClip() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        Clip c = makeGeneratorClip(p, "color", 60);
+        Effect cc = makeEffect(p, "color_correct");
+        cc.params["saturation"] = Param(150.0);
+        c.effects = {cc, makeEffect(p, "curves")};
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok);
+        const Id id = s.videoTracks[0].clips.front().id;
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        QVERIFY(edit::addGradeNode(p, s, id, edit::NodeHow::Layer, 1).ok);
+        // A shared node: node 2's curves now the shared node's, seen by another clip using it.
+        Id shared = 0;
+        QVERIFY(edit::shareGradeNode(p, s, id, 2, "Look", &shared).ok);
+        QVERIFY(shared && findSharedNode(s, shared));
+        QCOMPARE(findGradeNode(edit::clipById(s, id)->grade, 2)->shared, shared);
+        QCOMPARE(gradeNodeEffects(s, *edit::clipById(s, id), 2).at(0)->type, std::string("curves"));
+        QCOMPARE(edit::effectChain(s, shared), &s.sharedNodes[0].effects);  // the Inspector edits it as any chain
+        Clip other = makeGeneratorClip(p, "color", 30);
+        other.start = 60;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, other).ok);
+        const Id otherId = s.videoTracks[0].clips.back().id;
+        int used = 0;
+        QVERIFY(edit::useSharedNode(p, s, otherId, shared, &used).ok);
+        QCOMPARE(gradeNodeEffects(s, *edit::clipById(s, otherId), used).size(), size_t(1));
+        // Saved and loaded: the nodes, links, effects' nodes and shared nodes; a project without them loads as a stack.
+        Project back;
+        std::string err;
+        QVERIFY2(projectFromJson(projectToJson(p), back, &err), err.c_str());
+        const Sequence& bs = *back.active();
+        QCOMPARE(edit::clipById(bs, id)->grade, edit::clipById(s, id)->grade);
+        QCOMPARE(edit::clipById(bs, id)->effects, edit::clipById(s, id)->effects);
+        QCOMPARE(bs.sharedNodes, s.sharedNodes);
+        QVERIFY(back.nextId > shared);
+        // Split: both halves keep the graph and their effects' nodes.
+        QVERIFY(edit::razor(p, s, {TrackKind::Video, 0}, 30).ok);
+        const Clip& right = s.videoTracks[0].clips.at(1);
+        QCOMPARE(right.grade, edit::clipById(s, id)->grade);
+        QCOMPARE(right.effects.at(0).node, 1);
+        // A copy of the sequence: its own shared node, which its clips use.
+        std::map<Id, Id> ids;
+        const Id copy = edit::duplicateSequence(p, s.id, "Copy", &ids);
+        const Sequence& d = *p.findSequence(copy);
+        QCOMPARE(d.sharedNodes.size(), size_t(1));
+        QVERIFY(d.sharedNodes[0].id != shared);
+        QCOMPARE(findGradeNode(edit::clipById(d, ids[id])->grade, 2)->shared, d.sharedNodes[0].id);
+        // Grade versions: each its own graph.
+        Sequence& sq = *p.active();
+        QVERIFY(edit::addGradeVersion(p, sq, id, {}, true).ok);
+        QVERIFY(edit::clipById(sq, id)->grade.empty());
+        QVERIFY(edit::switchGradeVersion(sq, id, 0).ok);
+        QCOMPARE(edit::clipById(sq, id)->grade.nodes.size(), size_t(4));
+        QCOMPARE(edit::clipById(sq, id)->effects.at(0).node, 1);
+        // Unshared: the node holds its own copy again.
+        QVERIFY(edit::unshareGradeNode(p, sq, id, 2).ok);
+        QVERIFY(!findGradeNode(edit::clipById(sq, id)->grade, 2)->shared);
+        QCOMPARE(gradeNodeEffects(sq, *edit::clipById(sq, id), 2).size(), size_t(1));
+    }
+
+    void gradeGraphPasted() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        for (int i = 0; i < 2; ++i) {
+            Clip c = makeGeneratorClip(p, "color", 30);
+            c.start = i * 30;
+            c.effects = {makeEffect(p, i ? "invert" : "color_correct"), makeEffect(p, "gaussian_blur")};
+            QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok);
+        }
+        const Id a = s.videoTracks[0].clips[0].id, b = s.videoTracks[0].clips[1].id;
+        auto clip = [&](Id id) -> Clip& { return *edit::clipById(s, id); };
+        QVERIFY(edit::convertToNodes(s, a).ok);
+        int second = 0;
+        QVERIFY(edit::addGradeNode(p, s, a, edit::NodeHow::Serial, 1, &second).ok);
+        clip(a).effects.push_back(makeEffect(p, "curves"));
+        clip(a).effects.back().node = second;
+        Id shared = 0;
+        QVERIFY(edit::shareGradeNode(p, s, a, second, "Look", &shared).ok);
+        // A node's settings: made when first set; an unknown one refused.
+        QVERIFY(edit::setGradeNodeParams(p, s, a, 1, {{"mix", 40}, {"mask.shape", 1}}).ok);
+        QCOMPARE(gradeNodeSettings(clip(a), 1)->p("mix", 0), 40.0);
+        QVERIFY(!edit::setGradeNodeParams(p, s, a, 1, {{"brightness", 1}}).ok);
+        QVERIFY(!edit::setGradeNodeParams(p, s, a, 99, {{"mix", 1}}).ok);
+        // Effects pasted: only those outside the graph; the grade pasted: the graph and its nodes' effects, in place of
+        // the other clip's colour nodes (it had none, so after its own effects).
+        QVERIFY(edit::pasteAttributes(p, s, clip(a), TrackKind::Video, {b}, edit::AttrEffects).ok);
+        QCOMPARE(clip(b).effects.size(), size_t(3));  // invert, blur, and the pasted blur
+        QVERIFY(clip(b).grade.empty() && clip(b).effects[2].type == "gaussian_blur" && clip(b).effects[2].node == 0);
+        QVERIFY(edit::pasteAttributes(p, s, clip(a), TrackKind::Video, {b}, edit::AttrGrade, sharedNodesUsed(s, clip(a))).ok);
+        QCOMPARE(clip(b).grade, clip(a).grade);
+        QCOMPARE(gradeNodeEffects(s, clip(b), 1).at(0)->type, std::string("color_correct"));
+        QVERIFY(gradeNodeEffects(s, clip(b), 1).at(0)->id != gradeNodeEffects(s, clip(a), 1).at(0)->id);
+        QCOMPARE(gradeNodeEffects(s, clip(b), second).at(0), &s.sharedNodes[0].effects[0]);  // the same shared node
+        QCOMPARE(gradeNodeSettings(clip(b), 1)->p("mix", 0), 40.0);
+        // A shared node in use is not removed; renamed, the nodes showing its name follow.
+        QVERIFY(!edit::removeSharedNode(s, shared).ok);
+        QVERIFY(edit::renameSharedNode(s, shared, "Warm").ok);
+        QCOMPARE(gradeNodeName(*findGradeNode(clip(b).grade, second)), std::string("Warm"));
+        QCOMPARE(sharedNodeUsers(s, shared), 2);
+        // Copied into another sequence: the shared node goes with the clip.
+        const auto items = edit::copyClips(s, {a});
+        QCOMPARE(items.at(0).sharedNodes.size(), size_t(1));
+        Sequence other = makeSequence(p, "Other", 1920, 1080, Rational{30, 1});
+        QVERIFY(edit::pasteClips(p, other, items, 0, false).ok);
+        QCOMPARE(other.sharedNodes.size(), size_t(1));
+        const Clip& pasted = other.videoTracks[0].clips.at(0);
+        QCOMPARE(gradeNodeEffects(other, pasted, second).at(0)->type, std::string("curves"));
+        // Pasting the grade without its shared nodes (they were not to be had): the node is left empty, not dangling.
+        Clip lone = clip(a);
+        lone.id = 0;
+        Sequence third = makeSequence(p, "Third", 1920, 1080, Rational{30, 1});
+        Clip target = makeGeneratorClip(p, "color", 30);
+        QVERIFY(edit::overwrite(p, third, {TrackKind::Video, 0}, target).ok);
+        QVERIFY(edit::pasteAttributes(p, third, lone, TrackKind::Video, {third.videoTracks[0].clips[0].id}, edit::AttrGrade).ok);
+        QCOMPARE(findGradeNode(third.videoTracks[0].clips[0].grade, second)->shared, Id(0));
+        // Removing the grade: the graph and its effects go, the effects outside stay; then the shared node can go.
+        QVERIFY(edit::removeAttributes(p, s, {b}, edit::AttrGrade).ok);
+        QVERIFY(clip(b).grade.empty());
+        QCOMPARE(clip(b).effects.size(), size_t(3));
+        QVERIFY(edit::removeAttributes(p, s, {a}, edit::AttrEffects).ok);
+        QVERIFY(!clip(a).grade.empty());
+        for (const Effect& e : clip(a).effects) QVERIFY(e.node != 0);
+        QVERIFY(edit::removeAttributes(p, s, {a}, edit::AttrGrade).ok);
+        QVERIFY(clip(a).effects.empty());
+        QVERIFY(edit::removeSharedNode(s, shared).ok);
+        QVERIFY(s.sharedNodes.empty());
+        // A layer mixer's blend modes: known ones only, one for each input after the first.
+        int layer = 0;
+        QVERIFY(edit::addGradeNode(p, s, a, edit::NodeHow::Layer, 1, &layer).ok);
+        GradeNode mixer;
+        for (const GradeNode& n : clip(a).grade.nodes)
+            if (n.kind == "layer") mixer = n;
+        mixer.blend = {"glitter"};
+        QVERIFY(!edit::setGradeNode(s, a, mixer).ok);
+        mixer.blend = {"multiply", "screen"};
+        QVERIFY(edit::setGradeNode(s, a, mixer).ok);
+        QCOMPARE(findGradeNode(clip(a).grade, mixer.key)->blend, std::vector<std::string>{"multiply"});
+    }
+
+    void gradeGraphKeepsItsPlace() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        Clip c = makeGeneratorClip(p, "color", 30);
+        c.effects = {makeEffect(p, "color_correct"), makeEffect(p, "posterize"), makeEffect(p, "curves"), makeEffect(p, "gaussian_blur")};
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok);
+        const Id id = s.videoTracks[0].clips[0].id;
+        auto clip = [&]() -> Clip& { return *edit::clipById(*p.active(), id); };
+        auto types = [&](const std::vector<Effect>& fx) {
+            std::string out;
+            for (const Effect& e : fx) out += e.type + (e.node ? "@" + std::to_string(e.node) : std::string()) + " ";
+            return out;
+        };
+        // Converted: what runs between two colour effects is a node too (so the graph, where the first ran, renders the
+        // same); what comes after them stays outside.
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        QCOMPARE(types(clip().effects), std::string("color_correct@1 posterize@2 curves@3 gaussian_blur "));
+        // Shared, and moved out of a node: the graph still runs before the blur.
+        Id shared = 0;
+        QVERIFY(edit::shareGradeNode(p, s, id, 1, "Look", &shared).ok);
+        QVERIFY(edit::moveEffectToNode(p, s, id, clip().effects[0].id, 0).ok);  // the posterize, out after the graph
+        QCOMPARE(types(clip().effects), std::string("curves@3 posterize gaussian_blur "));
+        QVERIFY(edit::moveEffectToNode(p, s, id, clip().effects[0].id, 0).ok);  // the curves: no own node effects left
+        QCOMPARE(types(clip().effects), std::string("grade_node@1 curves posterize gaussian_blur "));  // held in place
+        // Flattened with only a shared node's effects: they come back where the graph ran.
+        QVERIFY(edit::flattenGrade(s, id).ok);
+        QCOMPARE(types(clip().effects), std::string("color_correct curves posterize gaussian_blur "));
+        // A node's window goes onto its effects when flattened.
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        QVERIFY(edit::setGradeNodeParams(p, s, id, 1, {{"mask.shape", 2}}).ok);
+        QVERIFY(edit::flattenGrade(s, id).ok);
+        QCOMPARE(clip().effects[0].p("mask.shape", 0), 2.0);
+        // Layer mixer inputs keep their blend modes when one goes, and a mixer's input past the next is refused.
+        clip().effects = {makeEffect(p, "color_correct")};
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        int a = 0, b = 0;
+        QVERIFY(edit::addGradeNode(p, s, id, edit::NodeHow::Layer, 1, &a).ok);
+        QVERIFY(edit::addGradeNode(p, s, id, edit::NodeHow::Layer, 1, &b).ok);
+        int mixer = 0;
+        for (const GradeNode& n : clip().grade.nodes)
+            if (n.kind == "layer") mixer = n.key;
+        GradeNode m = *findGradeNode(clip().grade, mixer);
+        m.blend = {"multiply", "screen"};
+        QVERIFY(edit::setGradeNode(s, id, m).ok);
+        QVERIFY(!edit::connectGradeNodes(s, id, {0, mixer, 9, false}).ok);
+        QVERIFY(edit::removeGradeNode(p, s, id, a).ok);
+        QCOMPARE(findGradeNode(clip().grade, mixer)->blend, std::vector<std::string>{"screen"});
+        QCOMPARE(gradeLinkInto(clip().grade, mixer, 1)->from, b);
+        // A key mixer left with no keys goes.
+        int k = 0;
+        QVERIFY(edit::addKeyMixer(s, id, {b}, 1, &k).ok);
+        QVERIFY(edit::removeGradeNode(p, s, id, b).ok);
+        QVERIFY(!findGradeNode(clip().grade, k));
+        QVERIFY(validGrade(clip().grade));
+        // Presets hold a stack: a node's settings dropped, its effects outside any node.
+        EffectPreset preset;
+        preset.effects = clip().effects;
+        preset.effects.push_back(makeEffect(p, "grade_node"));
+        preset.effects.back().node = 1;
+        Clip plain = makeGeneratorClip(p, "color", 10);
+        QCOMPARE(applyPreset(p, plain, preset), int(clip().effects.size()));
+        for (const Effect& e : plain.effects) QVERIFY(e.node == 0 && e.type != "grade_node");
+        // Nested: the shared node goes into the compound's sequence with the clip.
+        QVERIFY(edit::shareGradeNode(p, s, id, 1, "Look", &shared).ok);
+        QCOMPARE(sharedNodesUsed(s, clip()).size(), size_t(1));
+        QVERIFY(edit::addGradeVersion(p, s, id, "Bare", true).ok);
+        QCOMPARE(sharedNodesUsed(s, clip()).size(), size_t(1));  // (from the version put aside)
+        QVERIFY(edit::switchGradeVersion(s, id, 0).ok);
+        // Pasted from another project: a fresh id for its shared node, which the pasted clip shows.
+        Project other = makeDefaultProject();
+        other.nextId = 5;
+        const auto items = edit::copyClips(s, {id});
+        QVERIFY(edit::pasteClips(other, *other.active(), items, 0, false).ok);
+        const Sequence& os = *other.active();
+        QCOMPARE(os.sharedNodes.size(), size_t(1));
+        QVERIFY(os.sharedNodes[0].id != shared && os.sharedNodes[0].id < other.nextId);
+        QCOMPARE(findGradeNode(os.videoTracks[0].clips[0].grade, 1)->shared, os.sharedNodes[0].id);
+        QVERIFY(edit::makeCompound(p, *p.active(), {id}, "Nest").ok);
+        const Sequence* nest = nullptr;
+        for (const Sequence& q : p.sequences)
+            if (q.name == "Nest") nest = &q;
+        QVERIFY(nest && nest->sharedNodes.size() == 1 && nest->sharedNodes[0].id == shared);
+        // A graph that does not hold together is read as its stack.
+        Project broken;
+        QVERIFY(projectFromJson(projectToJson(p), broken));
+        Clip* inNest = nullptr;
+        for (Sequence& q : broken.sequences)
+            if (q.name == "Nest") inNest = &q.videoTracks[0].clips[0];
+        QVERIFY(inNest && !inNest->grade.empty());
+        inNest->grade.links.clear();  // (the output unfed)
+        Project again;
+        QVERIFY(projectFromJson(projectToJson(broken), again));
+        for (const Sequence& q : again.sequences)
+            if (q.name == "Nest") {
+                QVERIFY(q.videoTracks[0].clips[0].grade.empty());
+                QCOMPARE(q.videoTracks[0].clips[0].effects.at(0).type, std::string("color_correct"));
+                QCOMPARE(q.videoTracks[0].clips[0].effects.at(0).node, 0);
+            }
+    }
+
     void colorGroups() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
@@ -2495,6 +2822,13 @@ private slots:
         QVERIFY(parseTimecode("120", f30, t));
         QCOMPARE(t, FrameTime(120));
         QVERIFY(!parseTimecode("abc", f30, t));
+        // Too long for any sequence (from OSC or an imported review): refused, not thrown or overflowed.
+        QVERIFY(!parseTimecode("99999999999999999999:00", f30, t));
+        QVERIFY(!parseTimecode("9999999999:00:00:00", f30, t));
+        QVERIFY(!parseTimecode("1e300s", f30, t));
+        QVERIFY(!parseTimecode("99999999999999999999", f30, t));
+        QVERIFY(parseTimecode("999999999:00:00:00", f30, t));
+        QCOMPARE(t, FrameTime(999999999LL * 3600 * 30));
         // Round trip across a range of frames.
         for (FrameTime f : {0, 1, 1799, 1800, 1801, 17981, 17982, 107892})
             QVERIFY(parseTimecode(formatTimecode(f, df), df, t) && t == f);
@@ -5520,8 +5854,18 @@ private slots:
         Effect masterFx = makeEffect(p, "limiter");
         masterFx.params["ceiling_db"].addKey(100, -3);
         sq().masterEffects.push_back(masterFx);
+        // A mute turned on inside the gap still holds over what comes after it; a review drawing moves with its frame.
+        a1.panAuto.addKey(60, 0.5);
+        Marker drawn;
+        drawn.t = 20;
+        drawn.drawnAt = 90;
+        sq().markers.push_back(drawn);
         QVERIFY(edit::deleteGaps(p, sq()).ok);
         QCOMPARE(sq().audioTracks[0].muteAuto.keys.at(0).t, FrameTime(70));
+        QCOMPARE(sq().audioTracks[0].panAuto.keys.size(), size_t(1));
+        QCOMPARE(sq().audioTracks[0].panAuto.keys.at(0).t, FrameTime(50));
+        QCOMPARE(sq().audioTracks[0].panAuto.at(55), 0.5);
+        QCOMPARE(sq().markers.back().drawnAt, FrameTime(60));
         QCOMPARE(sq().audioTracks[0].sends[0].levelAuto.keys.at(0).t, FrameTime(70));
         for (const Param* lane : {&sq().buses[0].volumeAuto, &sq().buses[0].panAuto, &sq().buses[0].muteAuto}) QCOMPARE(lane->keys.at(0).t, FrameTime(70));
         QCOMPARE(sq().buses[0].effects[0].params.at("mix").keys.at(0).t, FrameTime(70));
@@ -5553,7 +5897,7 @@ private slots:
         s.captionTracks.push_back(CaptionTrack{});
         s.captionTracks[0].captions = {{20, 60, "reaches into the gap"}, {90, 110, "after"}};
         s.markers = {Marker{65, 0, "in the gap", "", 0, false}, Marker{100, 0, "after", "", 0, false}};
-        trackAt(s, a1)->volumeAuto.addKey(60, -6);   // inside the gap: goes
+        trackAt(s, a1)->volumeAuto.addKey(60, -6);   // inside the gap: goes, its curve keyed where the gap ends
         trackAt(s, a1)->volumeAuto.addKey(140, -3);  // after it: moves up
         s.inPoint = 90;
         s.outPoint = 160;
@@ -5571,8 +5915,10 @@ private slots:
         QCOMPARE(s.captionTracks[0].captions[1].start, FrameTime(60));
         QCOMPARE(s.markers[0].t, FrameTime(50));
         QCOMPARE(s.markers[1].t, FrameTime(70));
-        QCOMPARE(trackAt(s, a1)->volumeAuto.keys.size(), size_t(1));
-        QCOMPARE(trackAt(s, a1)->volumeAuto.keys[0].t, FrameTime(110));
+        QCOMPARE(trackAt(s, a1)->volumeAuto.keys.size(), size_t(2));
+        QCOMPARE(trackAt(s, a1)->volumeAuto.keys[0].t, FrameTime(50));
+        QCOMPARE(trackAt(s, a1)->volumeAuto.keys[0].v, -6 + 3 * 20 / 80.0);  // (what it was at 80, on the way to 140)
+        QCOMPARE(trackAt(s, a1)->volumeAuto.keys[1].t, FrameTime(110));
         QCOMPARE(s.inPoint, FrameTime(60));
         QCOMPARE(s.outPoint, FrameTime(130));
         // Nothing left but the start, which goes when asked.
@@ -6982,6 +7328,208 @@ private slots:
         QVERIFY(clipById(fx.s(), clip)->takes.empty());
         QCOMPARE(clipById(fx.s(), clip)->mediaId, b);
         QVERIFY(!cycleTake(fx.p, fx.s(), clip, 1).ok);
+    }
+
+    void lensProfiles() {
+        using namespace montage::lens;
+        QFile file(QStringLiteral(MONTAGE_TEST_DATA_DIR "/lensfun/test-lenses.xml"));
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        const std::string xml = file.readAll().toStdString();
+        Database db;
+        std::string err;
+        QVERIFY2(db.addXml(xml, &err), err.c_str());
+        QCOMPARE(db.cameras().size(), size_t(3));
+        QCOMPARE(db.lenses().size(), size_t(3));
+        QVERIFY(!Database().addXml("<lenses/>", &err));
+        QVERIFY(!Database().addXml("<lensdatabase version=\"3\"></lensdatabase>", &err));
+        QVERIFY(QString::fromStdString(err).contains("newer"));
+
+        // Cameras are found from the names recordings give them, by their words; nothing for an unknown one.
+        const Camera* sony = db.findCamera("Sony ILCE-7M4");
+        QVERIFY(sony && sony->model == "ILCE-7M4");
+        QCOMPARE(db.findCamera("SONY Alpha 7 IV"), sony);
+        const Camera* gopro = db.findCamera("GoPro HERO11 Black");
+        QVERIFY(gopro && gopro->mount == "goProHero11bl");
+        QVERIFY(!db.findCamera("Canon EOS R5"));
+        QCOMPARE(cameraName(*gopro), std::string("GoPro Hero11 Black"));
+        // An unknown model of a known maker is no camera, its maker's name in another language no model name.
+        Database olympus;
+        QVERIFY(olympus.addXml("<lensdatabase><camera><maker>OLYMPUS IMAGING CORP.</maker><maker lang=\"en\">Olympus</maker>"
+                               "<model>C8080WZ</model><mount>olympusC8080</mount><cropfactor>3.93</cropfactor></camera>"
+                               "<camera><maker>AEE DV</maker><model>AEE DV</model><mount>aee</mount></camera></lensdatabase>"));
+        QVERIFY(olympus.findCamera("OLYMPUS IMAGING CORP. C8080WZ"));
+        QVERIFY(!olympus.findCamera("Olympus TG-99"));
+        QVERIFY(!olympus.findCamera("OLYMPUS IMAGING CORP."));
+        QVERIFY(olympus.findCamera("AEE DV"));  // a model named as its maker is
+
+        // The camera's own lenses first, then those its mount takes by adapter; a fixed lens alone. Not a lens measured
+        // on a smaller sensor than the camera's (the APS-C fisheye on the full-frame body).
+        QCOMPARE(db.lensesFor(sony).size(), size_t(1));
+        sony = db.findCamera("Sony ILCE-6400");
+        QVERIFY(sony && sony->cropFactor == 1.534);
+        const auto sonyLenses = db.lensesFor(sony);
+        QCOMPARE(sonyLenses.size(), size_t(2));
+        QCOMPARE(lensName(*sonyLenses[0]), std::string("Sony FE 24-38mm f/2.8 Test"));
+        QCOMPARE(lensName(*sonyLenses[1]), std::string("Samyang 8mm f/2.8 UMC Fish-eye"));
+        const auto goproLenses = db.lensesFor(gopro);
+        QCOMPARE(goproLenses.size(), size_t(1));
+        QCOMPARE(db.lensesFor(nullptr).size(), size_t(3));
+        QCOMPARE(db.fixedLens(gopro), goproLenses[0]);
+        QVERIFY(!db.fixedLens(sony));  // an interchangeable mount, however few of its lenses are known
+        QCOMPARE(db.lens("fe 24-38", sony), sonyLenses[0]);
+        QVERIFY(!db.lens("FE 24-38", gopro));
+
+        // Focal lengths and the widest aperture from the name where the database leaves them out; a measured real
+        // focal length (version 1's element); the fisheye's projection and the GoPro sensor's shape.
+        const Lens& zoom = *sonyLenses[0];
+        const Lens& samyang = *sonyLenses[1];
+        const Lens& hero = *goproLenses[0];
+        QCOMPARE(zoom.minFocal, 24.0);
+        QCOMPARE(zoom.maxFocal, 38.0);
+        QCOMPARE(zoom.minAperture, 2.8);
+        QCOMPARE(samyang.minFocal, 8.0);
+        QCOMPARE(samyang.type, Projection::Stereographic);
+        QVERIFY(samyang.calibrations[0].distortion[0].realFocalMeasured);
+        QCOMPARE(samyang.calibrations[0].distortion[0].realFocal, 8.405);
+        QCOMPARE(hero.type, Projection::Fisheye);
+        QVERIFY(std::fabs(hero.aspectRatio - 8.0 / 7) < 1e-12);
+
+        // Interpolation: a calibrated focal length as it is; between them, the terms times the focal length on a
+        // spline, so 27 mm lies between 24 and 30 mm's.
+        Distortion d;
+        QVERIFY(interpolateDistortion(zoom, 1, 24, d));
+        QCOMPARE(d.terms[1], -0.07818);
+        QVERIFY(interpolateDistortion(zoom, 1, 27, d));
+        QVERIFY(d.terms[1] > -0.07818 && d.terms[1] < -0.03891);
+        QVERIFY(interpolateDistortion(zoom, 1, 50, d));  // beyond the last: the last
+        QCOMPARE(d.terms[2], -0.00168);
+        QVERIFY(!interpolateDistortion(zoom, 0.5, 24, d));  // a picture from a larger sensor than it was measured on
+        Vignetting v;
+        QVERIFY(interpolateVignetting(zoom, 1, 24, 4, 1000, v));
+        QCOMPARE(v.k[0], -0.5475);
+        QVERIFY(!interpolateVignetting(zoom, 1, 24, 0, 1000, v));  // aperture not known
+
+        // The corrections against lensfun 0.3.4's for the same file and frames (1920 x 1080; pixel centres; red,
+        // green and blue's sources).
+        struct Point {
+            double x, y, src[6];
+        };
+        auto compare = [](const Lens& l, Settings s, const std::vector<Point>& want) {
+            s.fit = Settings::None;
+            const Correction c(l, s, 1920, 1080);
+            for (const Point& p : want) {
+                double got[6];
+                c.source(p.x + 0.5, p.y + 0.5, got);
+                for (int k = 0; k < 6; ++k)
+                    if (std::fabs(got[k] - 0.5 - p.src[k]) > 0.01) return QStringLiteral("(%1, %2) [%3]: %4, lensfun %5").arg(p.x).arg(p.y).arg(k).arg(got[k] - 0.5).arg(p.src[k]);
+            }
+            return QString();
+        };
+        Settings zoomAt27;
+        zoomAt27.focal = 27;
+        zoomAt27.cameraCrop = 1;
+        zoomAt27.vignetting = zoomAt27.rectilinear = false;
+        QString bad = compare(zoom, zoomAt27, {{0, 0, {2.569, 1.444, 2.493, 1.402, 2.497, 1.404}},
+                                               {1919, 0, {1916.431, 1.444, 1916.507, 1.402, 1916.503, 1.404}},
+                                               {480, 270, {478.272, 269.029, 478.418, 269.111, 478.583, 269.204}},
+                                               {1919, 1079, {1916.431, 1077.556, 1916.507, 1077.598, 1916.503, 1077.596}},
+                                               {100, 900, {105.121, 897.852, 105.188, 897.824, 105.305, 897.775}}});
+        QVERIFY2(bad.isEmpty(), qPrintable(bad));
+        // The fisheye made rectilinear (stereographic; its measured focal length).
+        Settings fish;
+        fish.focal = 8;
+        fish.cameraCrop = 1.534;
+        bad = compare(samyang, fish, {{0, 0, {318.508, 179.088, 318.558, 179.116, 318.449, 179.055}},
+                                      {1919, 0, {1600.492, 179.088, 1600.442, 179.116, 1600.551, 179.055}},
+                                      {480, 270, {534.885, 300.848, 534.923, 300.869, 534.884, 300.847}},
+                                      {1919, 1079, {1600.492, 899.912, 1600.442, 899.884, 1600.551, 899.945}},
+                                      {100, 900, {334.470, 801.656, 334.521, 801.635, 334.428, 801.674}}});
+        QVERIFY2(bad.isEmpty(), qPrintable(bad));
+        // GoPro's 16:9 recording from its 8:7 sensor: the sensor's full width.
+        Settings action;
+        action.cameraCrop = 5.54;
+        const Correction heroAt1080(hero, action, 1920, 1080);
+        QVERIFY(std::fabs(heroAt1080.cropFactor() - 6.41662) < 1e-4);
+        bad = compare(hero, action, {{0, 0, {253.727, 142.664, 253.727, 142.664, 253.727, 142.664}},
+                                     {1919, 0, {1665.273, 142.664, 1665.273, 142.664, 1665.273, 142.664}},
+                                     {480, 270, {454.021, 255.399, 454.021, 255.399, 454.021, 255.399}},
+                                     {100, 900, {256.722, 834.266, 256.722, 834.266, 256.722, 834.266}}});
+        QVERIFY2(bad.isEmpty(), qPrintable(bad));
+        // Vignetting, at 30 mm and f/3.3 (between the four measurements): lensfun's gains.
+        Settings vig;
+        vig.focal = 30;
+        vig.aperture = 3.3;
+        vig.cameraCrop = 1;
+        const Correction vc(zoom, vig, 1920, 1080);
+        QVERIFY(vc.vignetting());
+        for (const auto& [x, y, gain] : {std::tuple{0.0, 0.0, 2.231159}, {480.0, 270.0, 1.134559}, {100.0, 900.0, 1.607652}})
+            QVERIFY2(std::fabs(1 / vc.falloff(x + 0.5, y + 0.5) - gain) < 1e-5, qPrintable(QString::number(1 / vc.falloff(x + 0.5, y + 0.5))));
+        QCOMPARE(vc.falloff(960, 540), 1.0);
+
+        // Filling the frame: every edge pixel of the corrected frame comes from inside the recorded one, and only
+        // just (a smaller scale would not do); the whole picture: every edge pixel from outside it (or on its edge).
+        auto edges = [](const Correction& c, int w, int h, bool inside) {
+            for (int i = 0; i <= 64; ++i)
+                for (const auto& [x, y] : {std::pair{w * i / 64.0, 0.0}, {w * i / 64.0, double(h)}, {0.0, h * i / 64.0}, {double(w), h * i / 64.0}}) {
+                    double at[6];
+                    c.source(x, y, at);
+                    for (int k = 0; k < 6; k += 2) {
+                        const bool in = at[k] >= -0.01 && at[k] <= w + 0.01 && at[k + 1] >= -0.01 && at[k + 1] <= h + 0.01;
+                        const bool out = at[k] <= 0.01 || at[k] >= w - 0.01 || at[k + 1] <= 0.01 || at[k + 1] >= h - 0.01;
+                        if (inside ? !in : !out) return false;
+                    }
+                }
+            return true;
+        };
+        for (const auto& [l, s] : {std::pair{&zoom, zoomAt27}, {&samyang, fish}, {&hero, action}}) {
+            Settings fill = s, whole = s;
+            whole.fit = Settings::Whole;
+            const Correction f(*l, fill, 1920, 1080), w(*l, whole, 1920, 1080);
+            QVERIFY2(edges(f, 1920, 1080, true), l->model.c_str());
+            Settings less = fill;
+            less.fit = Settings::None;
+            less.scale = f.scale() * 0.99;
+            QVERIFY2(!edges(Correction(*l, less, 1920, 1080), 1920, 1080, true), l->model.c_str());
+            // (A fisheye's whole picture cannot be made rectilinear: it reaches 90 degrees off the axis and beyond.)
+            if (l == &zoom) QVERIFY2(edges(w, 1920, 1080, false), l->model.c_str());
+            QVERIFY(w.scale() <= f.scale());
+            Settings more = fill;
+            more.scale = 1.5;
+            QVERIFY(std::fabs(Correction(*l, more, 1920, 1080).scale() - f.scale() * 1.5) < 1e-9);
+        }
+        // A barrel polynomial turns back beyond its picture (and goes negative): the scale that fills the frame is
+        // found where it still rises, not at the smallest scale tried.
+        Database barrel;
+        QVERIFY(barrel.addXml("<lensdatabase><lens><maker>Test</maker><model>Barrel 80mm f/2.8</model><mount>Test E</mount>"
+                              "<cropfactor>1</cropfactor><calibration><distortion model=\"poly3\" focal=\"80\" k1=\"-0.02\"/>"
+                              "</calibration></lens></lensdatabase>"));
+        Settings b80;
+        b80.cameraCrop = 1;
+        const Correction bf(barrel.lenses()[0], b80, 1920, 1080);
+        QVERIFY2(bf.scale() > 0.9 && bf.scale() < 1.1, qPrintable(QString::number(bf.scale())));
+        QVERIFY(edges(bf, 1920, 1080, true));
+        b80.fit = Settings::Whole;
+        const Correction bw(barrel.lenses()[0], b80, 1920, 1080);
+        QVERIFY2(bw.scale() > 0.9 && bw.scale() <= bf.scale(), qPrintable(QString::number(bw.scale())));
+        QVERIFY(edges(bw, 1920, 1080, false));
+
+        // Nothing to do when everything is off.
+        Settings off;
+        off.distortion = off.tca = off.vignetting = off.rectilinear = false;
+        QVERIFY(!Correction(samyang, off, 1920, 1080).active());
+
+        // A lens kept as a file of its own reads back the same.
+        const std::shared_ptr<const Lens> back = parseLens(lensXml(samyang));
+        QVERIFY(back);
+        QCOMPARE(lensName(*back), lensName(samyang));
+        QCOMPARE(back->type, samyang.type);
+        QCOMPARE(back->minAperture, samyang.minAperture);
+        const Correction a(samyang, fish, 1920, 1080), b(*back, fish, 1920, 1080);
+        double pa[6], pb[6];
+        a.source(10, 20, pa);
+        b.source(10, 20, pb);
+        for (int k = 0; k < 6; ++k) QCOMPARE(pa[k], pb[k]);
+        QVERIFY(!parseLens("<lensdatabase/>"));
     }
 
     void provenanceForCredentials() {

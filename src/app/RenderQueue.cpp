@@ -5,6 +5,8 @@
 #include <QtConcurrent>
 #include <algorithm>
 
+#include "render/RenderFarm.h"
+
 namespace montage {
 
 RenderQueue::RenderQueue(QObject* parent) : QObject(parent) {
@@ -117,21 +119,7 @@ void RenderQueue::next() {
     std::atomic<double>* progress = &progress_;
     watcher_.setFuture(QtConcurrent::run([project, seq, settings, stems, cancel, progress]() -> Result {
         Result r;
-        const Sequence* s = project->findSequence(seq);
-        if (!s) {
-            r.error = "The sequence no longer exists";
-            return r;
-        }
-        try {
-            const double share = stems ? 0.5 : 1.0;  // the stems take the second half of the bar
-            r.ok = exportSequence(*project, *s, settings, [progress, share](double f, FrameTime) { *progress = f * share; }, cancel,
-                                  &r.error, &r.encoder);
-            if (r.ok && stems)
-                r.ok = exportStems(*project, *s, settings, stems, nullptr,
-                                   [progress](double f, FrameTime) { *progress = 0.5 + f * 0.5; }, cancel, &r.error);
-        } catch (const std::exception& e) {
-            r.error = e.what();
-        }
+        r.ok = renderExport(*project, seq, settings, stems, [progress](double f, FrameTime) { *progress = f; }, cancel, &r.error, &r.encoder);
         return r;
     }));
 }

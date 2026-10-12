@@ -1,6 +1,7 @@
 #include "ProjectIO.h"
 #include "Surround.h"
 #include "Interpretation.h"
+#include "GradeGraph.h"
 
 #include <QDir>
 #include <QFile>
@@ -166,7 +167,52 @@ QJsonObject effectToJson(const Effect& e) {
     for (const auto& [k, v] : e.strings) strings[qs(k)] = qs(v);
     if (!strings.isEmpty()) o["strings"] = strings;
     if (e.object) o["object"] = objectMaskToJson(*e.object);
+    if (e.node) o["node"] = e.node;
     return o;
+}
+
+QJsonObject gradeGraphToJson(const GradeGraph& g) {
+    QJsonArray nodes, links;
+    for (const GradeNode& n : g.nodes) {
+        QJsonObject o{{"key", n.key}, {"kind", qs(n.kind)}, {"x", n.x}, {"y", n.y}};
+        if (!n.label.empty()) o["label"] = qs(n.label);
+        if (!n.enabled) o["enabled"] = false;
+        if (n.shared) o["shared"] = double(n.shared);
+        if (!n.blend.empty()) {
+            QJsonArray b;
+            for (const std::string& m : n.blend) b.append(qs(m));
+            o["blend"] = b;
+        }
+        nodes.append(o);
+    }
+    for (const GradeLink& l : g.links) {
+        QJsonObject o{{"from", l.from}, {"to", l.to}, {"input", l.input}};
+        if (l.key) o["key"] = true;
+        links.append(o);
+    }
+    return QJsonObject{{"nodes", nodes}, {"links", links}};
+}
+
+GradeGraph gradeGraphFromJson(const QJsonObject& o) {
+    GradeGraph g;
+    for (const auto& v : o.value("nodes").toArray()) {
+        const QJsonObject n = v.toObject();
+        GradeNode node;
+        node.key = n.value("key").toInt();
+        node.kind = n.value("kind").toString("corrector").toStdString();
+        node.label = ss(n.value("label"));
+        node.enabled = n.value("enabled").toBool(true);
+        node.shared = Id(i64(n.value("shared")));
+        for (const auto& b : n.value("blend").toArray()) node.blend.push_back(ss(b));
+        node.x = n.value("x").toDouble();
+        node.y = n.value("y").toDouble();
+        if (node.key > 0) g.nodes.push_back(std::move(node));
+    }
+    for (const auto& v : o.value("links").toArray()) {
+        const QJsonObject l = v.toObject();
+        g.links.push_back({l.value("from").toInt(), l.value("to").toInt(), l.value("input").toInt(), l.value("key").toBool()});
+    }
+    return g;
 }
 
 Effect effectFromJson(const QJsonValue& v) {
@@ -181,6 +227,7 @@ Effect effectFromJson(const QJsonValue& v) {
     QJsonObject strings = o.value("strings").toObject();
     for (auto it = strings.begin(); it != strings.end(); ++it) e.strings[it.key().toStdString()] = ss(it.value());
     if (o.contains("object")) e.object = objectMaskFromJson(o.value("object").toObject());
+    e.node = std::max(0, o.value("node").toInt());
     return e;
 }
 
@@ -271,12 +318,15 @@ QJsonObject clipToJson(const Clip& c) {
             for (const Effect& e : v.effects) fx.append(effectToJson(e));
             QJsonArray at;
             for (int a : v.anchors) at.append(a);
-            versions.append(QJsonObject{{"name", qs(v.name)}, {"effects", fx}, {"anchors", at}});
+            QJsonObject vo{{"name", qs(v.name)}, {"effects", fx}, {"anchors", at}};
+            if (!v.grade.empty()) vo["grade"] = gradeGraphToJson(v.grade);
+            versions.append(vo);
         }
         o["gradeVersions"] = versions;
         o["gradeVersion"] = c.gradeVersion;
     }
     if (c.colorGroup) o["colorGroup"] = double(c.colorGroup);
+    if (!c.grade.empty()) o["grade"] = gradeGraphToJson(c.grade);
     if (!c.fields.empty()) {
         QJsonObject values;
         for (const auto& [id, v] : c.fields) values[qs(id)] = qs(v);
@@ -334,10 +384,12 @@ Clip clipFromJson(const QJsonObject& o) {
         GradeVersion g{ss(v.value("name")), {}, {}};
         for (const auto& e : v.value("effects").toArray()) g.effects.push_back(effectFromJson(e));
         for (const auto& a : v.value("anchors").toArray()) g.anchors.push_back(a.toInt());
+        g.grade = gradeGraphFromJson(v.value("grade").toObject());
         c.gradeVersions.push_back(std::move(g));
     }
     c.gradeVersion = c.gradeVersions.empty() ? 0 : std::clamp(o.value("gradeVersion").toInt(), 0, int(c.gradeVersions.size()) - 1);
     c.colorGroup = Id(i64(o.value("colorGroup")));
+    c.grade = gradeGraphFromJson(o.value("grade").toObject());
     const QJsonObject values = o.value("fields").toObject();
     for (auto it = values.begin(); it != values.end(); ++it) c.fields[it.key().toStdString()] = ss(it.value());
     return c;
@@ -580,6 +632,15 @@ QJsonObject sequenceToJson(const Sequence& s) {
         }
         o["colorGroups"] = groups;
     }
+    if (!s.sharedNodes.empty()) {
+        QJsonArray shared;
+        for (const SharedNode& n : s.sharedNodes) {
+            QJsonArray fx;
+            for (const auto& e : n.effects) fx.append(effectToJson(e));
+            shared.append(QJsonObject{{"id", double(n.id)}, {"name", qs(n.name)}, {"effects", fx}});
+        }
+        o["sharedNodes"] = shared;
+    }
     if (s.masterVolumeDb != 0) o["masterVolumeDb"] = s.masterVolumeDb;
     if (s.multicam) o["multicam"] = true;
     if (!s.folderGains.empty()) {
@@ -724,6 +785,28 @@ Sequence sequenceFromJson(const QJsonObject& o) {
         for (const auto& e : go.value("post").toArray()) g.post.push_back(effectFromJson(e));
         if (g.id && g.postId) s.colorGroups.push_back(std::move(g));
     }
+    for (const auto& nv : o.value("sharedNodes").toArray()) {
+        const QJsonObject no = nv.toObject();
+        SharedNode n;
+        n.id = Id(i64(no.value("id")));
+        n.name = ss(no.value("name"));
+        for (const auto& e : no.value("effects").toArray()) n.effects.push_back(effectFromJson(e));
+        if (n.id) s.sharedNodes.push_back(std::move(n));
+    }
+    // A colour node graph that does not hold together (a file edited by hand, or damaged) is read as the stack it
+    // amounts to, and effects naming nodes not there are outside the graph, rather than not rendering at all.
+    auto settle = [](std::vector<Effect>& effects, GradeGraph& g) {
+        if (!g.empty() && !validGrade(g)) g = {};
+        std::erase_if(effects, [&](const Effect& e) { return e.type == "grade_node" && !findGradeNode(g, e.node); });
+        for (Effect& e : effects)
+            if (e.node && !findGradeNode(g, e.node)) e.node = 0;
+    };
+    for (Track& t : s.videoTracks)
+        for (Clip& c : t.clips) {
+            if (!c.grade.empty() && !validGrade(c.grade)) edit::flattenGrade(s, c.id);
+            settle(c.effects, c.grade);
+            for (GradeVersion& v : c.gradeVersions) settle(v.effects, v.grade);
+        }
     s.masterVolumeDb = o.value("masterVolumeDb").toDouble(0);
     return s;
 }
@@ -1035,6 +1118,10 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
             bump(g.postId);
             for (const auto& e : g.pre) bump(e.id);
             for (const auto& e : g.post) bump(e.id);
+        }
+        for (const auto& n : s.sharedNodes) {
+            bump(n.id);
+            for (const auto& e : n.effects) bump(e.id);
         }
     }
     p.nextId = std::max(p.nextId, maxId + 1);

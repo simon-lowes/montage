@@ -89,8 +89,9 @@ bool parseTimecode(const std::string& textIn, Rational fps, FrameTime& out) {
     // Seconds: "12.5s"
     if (text.back() == 's') {
         try {
-            double sec = std::stod(text.substr(0, text.size() - 1));
-            out = FrameTime(std::llround(sec * fps.toDouble()));
+            const double frames = std::stod(text.substr(0, text.size() - 1)) * fps.toDouble();
+            if (!std::isfinite(frames) || std::fabs(frames) > 1e15) return false;  // (beyond any sequence)
+            out = FrameTime(std::llround(frames));
             return true;
         } catch (...) {
             return false;
@@ -109,14 +110,15 @@ bool parseTimecode(const std::string& textIn, Rational fps, FrameTime& out) {
             return false;
         }
     }
-    // HH:MM:SS:FF (any of ':', ';', '.' as separators); fewer fields are allowed.
+    // HH:MM:SS:FF (any of ':', ';', '.' as separators); fewer fields are allowed. Each field up to 9 digits, so the
+    // frame count cannot overflow.
     std::vector<long long> parts;
     bool df = false;
     std::string cur;
     for (char c : text) {
         if (c == ':' || c == ';' || c == '.') {
             if (c == ';') df = true;
-            if (cur.empty()) return false;
+            if (cur.empty() || cur.size() > 9) return false;
             parts.push_back(std::stoll(cur));
             cur.clear();
         } else if (std::isdigit(static_cast<unsigned char>(c))) {
@@ -125,7 +127,7 @@ bool parseTimecode(const std::string& textIn, Rational fps, FrameTime& out) {
             return false;
         }
     }
-    if (cur.empty()) return false;
+    if (cur.empty() || cur.size() > 9) return false;
     parts.push_back(std::stoll(cur));
     while (parts.size() < 4) parts.insert(parts.begin(), 0);
     if (parts.size() > 4) return false;

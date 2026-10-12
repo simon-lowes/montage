@@ -42,7 +42,7 @@ function(montage_copy_runtime target)
   endif()
 endfunction()
 
-find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Concurrent Xml)
+find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Concurrent Xml Network)
 if(MONTAGE_BUILD_APP)
   find_package(Qt6 6.4 REQUIRED COMPONENTS Widgets Multimedia Network)
 endif()

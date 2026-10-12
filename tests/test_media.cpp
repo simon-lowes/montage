@@ -25,6 +25,7 @@
 #include <complex>
 #include <tuple>
 #include <sstream>
+#include <thread>
 #include <cstdio>
 
 #include "core/AudioChannels.h"
@@ -66,12 +67,15 @@
 #include "media/Relink.h"
 #include "media/SpeakerSwitch.h"
 #include "media/Tracking.h"
+#include "media/CameraSolve.h"
+#include "render/OGraf.h"
 #include "media/Vector.h"
 #include "media/Beats.h"
 #include "render/Spherical.h"
 #include "media/SpatialAudio.h"
 #include "render/ExtendClip.h"
 #include "render/ColorChart.h"
+#include "media/LensDatabase.h"
 #include "render/ReviewExport.h"
 #include "render/Versions.h"
 #include "render/ClipPlacement.h"
@@ -123,6 +127,7 @@
 #include "media/Inpaint.h"
 #include "media/VisualSearch.h"
 #include "automation/McpServer.h"
+#include "automation/PythonHost.h"
 #include "automation/ScriptHost.h"
 #include "automation/ScriptPanel.h"
 #include "core/Cdl.h"
@@ -134,6 +139,7 @@
 #include "render/AudioFx.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
+#include "render/RenderFarm.h"
 #include "core/ColorGroups.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
@@ -1974,6 +1980,10 @@ private slots:
         auto said = std::make_shared<Transcript>();
         said->segments.push_back({0.5, 0.6, "hello", {{0.5, 0.6, "hello"}}});
         p.findMedia(m.id)->transcript = said;
+        auto heard = std::make_shared<VisualIndex>();
+        heard->step = 0.1, heard->span = 0.2;
+        heard->add(0.5, std::vector<float>(4, 0.5f));
+        p.findMedia(m.id)->sounds = heard;
         RenderOptions o;
         auto frameShown = [&](FrameTime t) { return renderSequenceFrame(p, s, t, o).at(80, 45)[0] * 119; };  // the file's frame
         QVERIFY2(std::fabs(frameShown(10) - 50) < 1, qPrintable(QString::number(frameShown(10))));  // 10/24 s: frame 50
@@ -1992,6 +2002,8 @@ private slots:
         QVERIFY2(std::fabs(frameShown(10) - 10) < 1, qPrintable(QString::number(frameShown(10))));
         QVERIFY2(std::fabs(frameShown(23) - 23) < 1, qPrintable(QString::number(frameShown(23))));
         QCOMPARE(placed.markers.at(0).t, FrameTime(60));  // the same moment of the footage
+        // What's Heard windows hear as much of the footage as before.
+        QVERIFY(std::fabs(now->sounds->span - 1.0) < 0.02 && std::fabs(now->sounds->samples.at(0).time - 2.5) < 0.05);
         QCOMPARE(p.findMedia(sub.id)->subclipIn, 1.25);
         QCOMPARE(p.findMedia(sub.id)->subclipOut, 2.5);
         // The subclip is read as its media is (thumbnails and its own decodes).
@@ -5213,6 +5225,76 @@ private slots:
         Project back;
         QVERIFY(loadProject(project.toStdString(), back));
         QCOMPARE(back.active()->videoTracks[0].clips.front().gradeVersions.size(), size_t(3));
+    }
+
+    void gradeNodesOverMcp() {
+        Project q = makeDefaultProject();
+        for (int i = 0; i < 2; ++i) {
+            Clip c = makeGeneratorClip(q, "color", 30);
+            c.start = i * 30;
+            c.effects = {makeEffect(q, "curves")};
+            edit::overwrite(q, *q.active(), {TrackKind::Video, 0}, c);
+        }
+        const double id = double(q.active()->videoTracks[0].clips[0].id), otherId = double(q.active()->videoTracks[0].clips[1].id);
+        const QString project = QString::fromStdString(path("nodes.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto nodes = [&](const QJsonObject& args) { return call("montage_grade_nodes", args); };
+        // Converted: one node with the curves; a parallel node beside it, with a mixer.
+        QJsonObject r = nodes({{"project", project}, {"clip", id}, {"action", "convert"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject g = r.value("structuredContent").toObject();
+        QCOMPARE(g.value("nodes").toArray().size(), 1);
+        QCOMPARE(g.value("nodes").toArray()[0].toObject().value("effects").toArray()[0].toObject().value("type").toString(), QString("curves"));
+        r = nodes({{"project", project}, {"clip", id}, {"action", "add"}, {"how", "parallel"}, {"anchor", 1}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const int branch = r.value("structuredContent").toObject().value("created").toInt();
+        QCOMPARE(r.value("structuredContent").toObject().value("nodes").toArray().size(), 3);
+        // An effect into the new node; its window and mix; a node renamed.
+        r = call("montage_add_effect", {{"project", project}, {"clip", id}, {"effect", "invert"}, {"node", branch}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = nodes({{"project", project}, {"clip", id}, {"action", "set"}, {"node", branch}, {"label", "Sky"},
+                   {"settings", QJsonObject{{"mask.shape", 2}, {"mix", 50}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject sky;
+        for (const QJsonValue v : r.value("structuredContent").toObject().value("nodes").toArray())
+            if (v.toObject().value("key").toInt() == branch) sky = v.toObject();
+        QCOMPARE(sky.value("name").toString(), QString("Sky"));
+        QCOMPARE(sky.value("effects").toArray()[0].toObject().value("type").toString(), QString("invert"));
+        QCOMPARE(sky.value("settings").toObject().value("mix").toDouble(), 50.0);
+        // Shared with the other clip, which then sees an effect added to the shared node.
+        r = nodes({{"project", project}, {"clip", id}, {"action", "share"}, {"node", 1}, {"name", "Look"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const double shared = r.value("structuredContent").toObject().value("shared").toDouble();
+        QVERIFY(shared > 0);
+        QVERIFY(!nodes({{"project", project}, {"clip", otherId}, {"action", "use_shared"}, {"shared", shared}}).value("isError").toBool());
+        QVERIFY(!call("montage_add_effect", {{"project", project}, {"clip", id}, {"effect", "color_correct"}, {"shared", shared}}).value("isError").toBool());
+        r = nodes({{"project", project}, {"action", "list"}});
+        const QJsonObject look = r.value("structuredContent").toObject().value("shared_nodes").toArray()[0].toObject();
+        QCOMPARE(look.value("effects").toArray().size(), 2);
+        QCOMPARE(look.value("clips").toInt(), 2);
+        QVERIFY(nodes({{"project", project}, {"action", "remove_shared"}, {"shared", shared}}).value("isError").toBool());  // in use
+        // Refused: a loop (the mixer into the node feeding it), an unknown action, a key that is no node, a picture effect on a sound clip's node.
+        QVERIFY(nodes({{"project", project}, {"clip", id}, {"action", "connect"}, {"from", branch + 1}, {"to", 1}}).value("isError").toBool());
+        QVERIFY(nodes({{"project", project}, {"clip", id}, {"action", "paint"}}).value("isError").toBool());
+        QVERIFY(nodes({{"project", project}, {"clip", id}, {"action", "remove"}, {"node", 42}}).value("isError").toBool());
+        QVERIFY(call("montage_add_effect", {{"project", project}, {"clip", id}, {"effect", "invert"}, {"node", 42}}).value("isError").toBool());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Clip& c = back.active()->videoTracks[0].clips[0];
+        QCOMPARE(c.grade.nodes.size(), size_t(3));
+        QCOMPARE(back.active()->sharedNodes.size(), size_t(1));
+        // Flattened: a stack again.
+        r = nodes({{"project", project}, {"clip", id}, {"action", "flatten"}});
+        QVERIFY(r.value("structuredContent").toObject().value("nodes").toArray().isEmpty());
     }
 
     void captionStyleOverMcp() {
@@ -9292,6 +9374,10 @@ private slots:
         QVERIFY(!runScript("os.execute('true')", "q.lua", o, &error) && error.contains("not available while a panel opens"));
         QVERIFY(!runScript("io.popen('ls')", "q.lua", o, &error) && error.contains("io.popen"));
         QVERIFY(!runScript(QStringLiteral("io.open([[%1/x.txt]], 'w')").arg(dir.path()), "q.lua", o, &error) && error.contains("only reading"));
+        // Nor a file opened for reading and writing, nor io.open's original reached through the debug library.
+        QVERIFY(!runScript(QStringLiteral("io.open([[%1]], 'r+')").arg(project), "q.lua", o, &error) && error.contains("only reading"));
+        QVERIFY(!runScript("local _, open = debug.getupvalue(io.open, 1)", "q.lua", o, &error));
+        QVERIFY(!runScript("require('debug')", "q.lua", o, &error));
         QVERIFY(!runScript(QStringLiteral("os.remove([[%1]])").arg(project), "q.lua", o, &error));
         QVERIFY2(runScript(QStringLiteral("assert(io.open([[%1]], 'r') == nil or true)").arg(project), "q.lua", o, &error), qPrintable(error));
         QVERIFY(!QFileInfo::exists(dir.path() + "/x.txt"));
@@ -9422,6 +9508,265 @@ private slots:
         o.noStdin = true;
         QVERIFY(!runScript("io.read()", "in.lua", o, &err) && err.contains("io.read"));
         QVERIFY(!runScript("for l in io.lines() do end", "in.lua", o, &err) && err.contains("io.lines"));
+        QVERIFY(!runScript("io.input():read()", "in.lua", o, &err) && err.contains("io.input"));
+        // A table held many times over is refused as a tool's argument rather than copied 2^60 times.
+        QVERIFY(!runScript("local t = {} for i = 1, 60 do t = {t, t} end montage.call('montage_project_info', {x = t})", "big.lua", o, &err));
+        QVERIFY2(err.contains("too large"), qPrintable(err));
+    }
+
+    void pythonScripts() {
+        if (!pythonAvailable()) QSKIP("no Python 3.8 or later here");
+        QVERIFY(isPythonScript("a.py") && isPythonScript("A.PY") && !isPythonScript("a.lua") && !isPythonScript("py"));
+        QVERIFY(scriptAvailable("x.py"));
+        QTemporaryDir dir;
+        const QString project = dir.path() + "/s.montage";
+        McpServer server;
+        ScriptOptions o = toolScriptOptions(server, project);
+        QStringList printed;
+        o.print = [&](const QString& line) { printed << line; };
+        o.args = {"Hello", "2"};
+        // The same tools as Lua's, by short name (keywords or a dict) and by montage.call; results as dicts; the
+        // arguments as montage.args and sys.argv; montage.json and montage.project; print() and sys.stderr both shown.
+        QString err;
+        const QString code = R"py(
+import sys
+import montage
+montage.create_project(width=1280, height=720, fps=25)
+first = montage.add_title(text=montage.args[0], at=0, duration=float(sys.argv[2]))
+second = montage.call("montage_add_title", {"text": "World", "at": 2})
+assert first["id"] != second["id"]
+info = montage.project_info()
+titles = sum(1 for t in info["tracks"] for c in t.get("clips", []) if c.get("generator") == "title")
+print("titles", titles)
+print(montage.json([1, 2, {"a": True}, None]).replace(" ", "").replace("\n", ""))
+print(montage.project.endswith("s.montage"), sys.argv[0])
+print(type(info["width"]).__name__, info["width"])
+print("to stderr", file=sys.stderr)
+print("no newline at the end", end="")
+)py";
+        QVERIFY2(runScript(code, "make.py", o, &err), qPrintable(err));
+        QCOMPARE(printed.value(0), QStringLiteral("titles 2"));
+        QCOMPARE(printed.value(1), QStringLiteral("[1,2,{\"a\":true},null]"));
+        QCOMPARE(printed.value(2), QStringLiteral("True make.py"));
+        QCOMPARE(printed.value(3), QStringLiteral("int 1280"));
+        QCOMPARE(printed.value(4), QStringLiteral("to stderr"));
+        QCOMPARE(printed.value(5), QStringLiteral("no newline at the end"));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->width, 1280);
+        // A tool's error raises montage.ToolError (which a script can catch); uncaught, the script fails with the line
+        // it was on. So does a tool that does not exist, a Python error, and a script that does not parse.
+        QVERIFY(!runScript("\n\nmontage.add_title(text='x', at='not a time')", "bad.py", o, &err));
+        QVERIFY2(err.startsWith("bad.py:3: ToolError:") && err.contains("montage_add_title"), qPrintable(err));
+        printed.clear();
+        QVERIFY2(runScript("try:\n    montage.add_title(text='x', at='no')\nexcept montage.ToolError as e:\n    print('caught')", "c.py", o, &err), qPrintable(err));
+        QCOMPARE(printed, QStringList{"caught"});
+        QVERIFY(!runScript("montage.no_such_tool()", "t.py", o, &err));
+        QVERIFY2(err.contains("no tool montage.no_such_tool"), qPrintable(err));
+        QVERIFY(!runScript("raise ValueError('mine')", "e.py", o, &err));
+        QCOMPARE(err, QStringLiteral("e.py:1: ValueError: mine"));
+        QVERIFY(!runScript("x = 1\ndef (:", "p.py", o, &err));
+        QVERIFY2(err.startsWith("p.py:2: SyntaxError"), qPrintable(err));
+        // The script's own lines of the traceback go to its output.
+        printed.clear();
+        QVERIFY(!runScript("def f():\n    raise KeyError('k')\nf()", "tb.py", o, &err));
+        QVERIFY2(err.startsWith("tb.py:2: KeyError"), qPrintable(err));
+        QVERIFY2(printed.join('\n').contains("line 3") && !printed.join('\n').contains("<string>"), qPrintable(printed.join('\n')));
+        // sys.exit: 0 (or none) succeeds, anything else fails; os._exit too.
+        QVERIFY(runScript("import sys\nsys.exit()", "x.py", o, &err));
+        QVERIFY(!runScript("import sys\nsys.exit(3)", "x.py", o, &err) && err.contains("3"));
+        QVERIFY(!runScript("import os\nos._exit(4)", "x.py", o, &err));
+        QVERIFY2(err.contains("exit code 4"), qPrintable(err));
+        // Keywords named like call()'s own parameters are the tool's.
+        printed.clear();
+        QVERIFY2(runScript("m = montage.add_marker(at=1, name='Named')\nm2 = montage.call('montage_add_marker', at=2, name='Too', args=None)\nprint('ok')", "kw.py", o, &err), qPrintable(err));
+        QCOMPARE(printed.value(0), QStringLiteral("ok"));
+        // montage.tools() lists them; what JSON cannot hold is refused, not changed.
+        printed.clear();
+        QVERIFY(runScript("print(len(montage.tools()) > 50, 'montage_add_title' in montage.tools())", "n.py", o, &err));
+        QCOMPARE(printed.value(0), QStringLiteral("True True"));
+        for (const char* bad : {"montage.json([float('nan')])", "montage.json([float('inf')])", "montage.json([1 << 60])",
+                                "montage.json({(1, 2): 1})", "montage.json([print])", "l = []; l.append(l); montage.project_info(x=l)",
+                                "montage.project_info(5)"})
+            QVERIFY2(!runScript(bad, "bad.py", o, &err), bad);
+        // A file's "#!" line and byte order mark (line numbers kept), and text beyond ASCII both ways.
+        QVERIFY(!runScript("\xEF\xBB\xBF#!/usr/bin/env -S montage-cli script\nraise RuntimeError('here')", "sh.py", o, &err));
+        QVERIFY2(err.startsWith("sh.py:2:"), qPrintable(err));
+        printed.clear();
+        QVERIFY2(runScript(QString::fromUtf8("print('Grüße, 東京 🎬')"), "u.py", o, &err), qPrintable(err));
+        QCOMPARE(printed.value(0), QString::fromUtf8("Grüße, 東京 🎬"));
+        // No standard input: reading it is an error rather than a wait for ever. Programs it runs write to the
+        // script's output, not into Montage's messages.
+        QVERIFY(!runScript("input()", "in.py", o, &err) && err.contains("no standard input"));
+        printed.clear();
+        QVERIFY2(runScript("import os, subprocess, sys\nsubprocess.run([sys.executable, '-c', 'print(\"child\")'])\nos.system('echo shell')", "sub.py", o, &err),
+                 qPrintable(err));
+        QVERIFY2(printed.contains("child") && printed.contains("shell"), qPrintable(printed.join('|')));
+        // Stopped: a script that never ends (or is waiting) stops when its host says so; no tool runs once stopped.
+        QElapsedTimer t;
+        t.start();
+        o.stopped = [&] { return t.elapsed() > 300; };
+        QVERIFY(!runScript("while True:\n    pass", "forever.py", o, &err));
+        QCOMPARE(err, QStringLiteral("Stopped"));
+        t.restart();
+        QVERIFY(!runScript("import time\ntime.sleep(60)", "sleep.py", o, &err));
+        QCOMPARE(err, QStringLiteral("Stopped"));
+        QVERIFY(t.elapsed() < 10000);
+        bool stop = false;
+        int calls = 0;
+        o.stopped = [&] { return stop; };
+        const auto call = o.call;
+        o.call = [&](const QString& name, const QJsonObject& args, QString* e) {
+            if (++calls == 3) stop = true;
+            return call(name, args, e);
+        };
+        QVERIFY(!runScript("while True:\n    try:\n        montage.project_info()\n    except BaseException:\n        pass", "catching.py", o, &err));
+        QCOMPARE(err, QStringLiteral("Stopped"));
+        QCOMPARE(calls, 3);
+        o.call = call;
+        o.stopped = {};
+        // A tool's answer that is not structured comes back as {"text": ...}; montage.null is None.
+        printed.clear();
+        QVERIFY2(runScript("print(montage.null is None, isinstance(montage.project_info(), dict))", "v.py", o, &err), qPrintable(err));
+        QCOMPARE(printed.value(0), QStringLiteral("True True"));
+        // Several threads calling tools at once each get their own answers.
+        printed.clear();
+        QVERIFY2(runScript("import threading\n"
+                           "bad = []\n"
+                           "def work(n):\n"
+                           "    for i in range(40):\n"
+                           "        r = montage.project_info()\n"
+                           "        if 'width' not in r: bad.append(r)\n"
+                           "        print('thread', n, i)\n"
+                           "ts = [threading.Thread(target=work, args=(n,)) for n in range(4)]\n"
+                           "[t.start() for t in ts]\n"
+                           "[t.join() for t in ts]\n"
+                           "print('bad', len(bad))", "threads.py", o, &err), qPrintable(err));
+        QCOMPARE(printed.size(), 161);
+        QCOMPARE(printed.last(), QStringLiteral("bad 0"));
+        // A message of several lines is kept whole, with its type.
+        QVERIFY(!runScript("raise ValueError('first\\nsecond')", "lines.py", o, &err));
+        QCOMPARE(err, QStringLiteral("lines.py:1: ValueError: first\nsecond"));
+        // Programs given the script's output write to it; a line ends at "\r" too, and flush shows what is held.
+        printed.clear();
+        QVERIFY2(runScript("import subprocess, sys\n"
+                           "subprocess.run([sys.executable, '-c', 'print(\"given\")'], stdout=sys.stdout)\n"
+                           "print('10%', end='\\r')\nprint('done')\n"
+                           "sys.stdout.write('held')\nsys.stdout.flush()\nimport time\ntime.sleep(0.1)", "out.py", o, &err), qPrintable(err));
+        QCOMPARE(printed, (QStringList{"given", "10%", "done", "held"}));
+        // A script's file: its folder's modules import, __file__ is its path, and its traceback shows its lines; a
+        // module in the working directory does not take the place of Python's own.
+        QDir(dir.path()).mkpath("lib");
+        QFile helper(dir.path() + "/lib/helper.py");
+        QVERIFY(helper.open(QIODevice::WriteOnly));
+        helper.write("WORD = 'beside'\n");
+        helper.close();
+        QFile shadow(dir.path() + "/traceback.py");
+        QVERIFY(shadow.open(QIODevice::WriteOnly));
+        shadow.write("raise ImportError('shadowed')\n");
+        shadow.close();
+        const QString was = QDir::currentPath();
+        QDir::setCurrent(dir.path());
+        o.file = dir.path() + "/lib/main.py";
+        printed.clear();
+        const bool besides = runScript("import helper, os\nprint(helper.WORD, os.path.basename(__file__))\ndef f():\n    raise KeyError('k')\nf()", "main.py", o, &err);
+        QDir::setCurrent(was);
+        o.file.clear();
+        QVERIFY(!besides);
+        QVERIFY2(err.startsWith("main.py:4: KeyError"), qPrintable(err));
+        QCOMPARE(printed.value(0), QStringLiteral("beside main.py"));
+        QVERIFY2(printed.join('\n').contains("raise KeyError('k')"), qPrintable(printed.join('\n')));
+        // The script is __main__, as `python script.py` makes it.
+        printed.clear();
+        QVERIFY2(runScript("import __main__, sys\nx = 5\nprint(__name__, __main__.x, __file__)", "m.py", o, &err), qPrintable(err));
+        QCOMPARE(printed.value(0), QStringLiteral("__main__ 5 m.py"));
+    }
+
+    void pythonScriptPanels() {
+        if (!pythonAvailable()) QSKIP("no Python 3.8 or later here");
+        QTemporaryDir dir;
+        const QString project = dir.path() + "/p.montage";
+        McpServer server;
+        ScriptOptions o = toolScriptOptions(server, project);
+        QStringList printed;
+        o.print = [&](const QString& line) { printed << line; };
+        const QString code = R"py(
+print("before")
+try:
+    ui = montage.panel(title="Titles", controls=[
+        {"type": "text", "id": "words", "label": "Words", "value": "Hello"},
+        {"type": "number", "id": "at", "label": "At", "value": 1, "min": 0, "max": 60},
+        {"type": "label", "id": "status", "text": ""},
+        {"type": "button", "id": "add", "label": "Add Title"},
+    ])
+except BaseException:
+    print("caught")  # described ends the script whatever catches
+    raise
+print("pressed", ui["pressed"], ui["words"], type(ui["at"]).__name__, ui["at"])
+if ui["pressed"] == "add":
+    montage.create_project(width=640, height=360, fps=25)
+    montage.add_title(text=ui["words"], at=ui["at"])
+    montage.set_panel(status="Added " + ui["words"])
+)py";
+        std::optional<PanelSpec> described;
+        std::optional<QJsonObject> answer;
+        o.panel = [&](const QJsonObject& d, QString* error) -> std::optional<QJsonObject> {
+            described = parsePanel(d, error);
+            if (!described) return std::nullopt;
+            return answer;
+        };
+        QJsonObject shown;
+        o.setPanel = [&](const QJsonObject& v, QString*) {
+            for (auto it = v.begin(); it != v.end(); ++it) shown[it.key()] = it.value();
+            return true;
+        };
+        // Described: the script ends there, successfully, nothing after it run.
+        QString error;
+        QVERIFY2(runScript(code, "titles.py", o, &error), qPrintable(error));
+        QVERIFY(described && described->title == "Titles" && described->controls.size() == 4);
+        QCOMPARE(printed, QStringList{"before"});
+        QVERIFY(!QFileInfo::exists(project));
+        // Quiet (a panel opening by itself): no programs run, no files written or removed; reading is allowed.
+        o.quiet = true;
+        const QString target = dir.path() + "/x.txt";
+        QVERIFY(!runScript("import subprocess\nsubprocess.run(['true'])", "q.py", o, &error) && error.contains("not available while a panel opens"));
+        QVERIFY(!runScript("import os\nos.system('true')", "q.py", o, &error) && error.contains("os.system"));
+        QVERIFY(!runScript(QStringLiteral("open(r'%1', 'w')").arg(target), "q.py", o, &error) && error.contains("only reading"));
+        QVERIFY(!runScript(QStringLiteral("open(r'%1', 'a')").arg(target), "q.py", o, &error));
+        QVERIFY(!runScript(QStringLiteral("import os\nos.open(r'%1', os.O_WRONLY | os.O_CREAT)").arg(target), "q.py", o, &error));
+        QVERIFY(!runScript(QStringLiteral("import pathlib\npathlib.Path(r'%1').write_text('x')").arg(target), "q.py", o, &error));
+        QVERIFY(!runScript(QStringLiteral("import os\nos.remove(r'%1')").arg(project), "q.py", o, &error));
+        QVERIFY(!runScript("import ctypes\nctypes.CDLL(None)", "q.py", o, &error) && error.contains("ctypes"));
+        QVERIFY(!runScript(QStringLiteral("import sqlite3\nsqlite3.connect(r'%1/x.db')").arg(dir.path()), "q.py", o, &error) && error.contains("sqlite3"));
+        QVERIFY(!runScript("import multiprocessing\nmultiprocessing.get_context('spawn').Process(target=print).start()", "q.py", o, &error));
+        QVERIFY2(runScript("import os, sqlite3\nos.putenv('MONTAGE_X', '1')\nsqlite3.connect(':memory:')", "q.py", o, &error), qPrintable(error));
+        QVERIFY(!QFileInfo::exists(dir.path() + "/x.db"));
+        QVERIFY2(runScript(QStringLiteral("import json, collections\ncollections.namedtuple('P', 'x')\nprint(open(r'%1').read() if False else 'read')")
+                               .arg(target), "q.py", o, &error), qPrintable(error));
+        QVERIFY(!QFileInfo::exists(target));
+        o.quiet = false;
+        // A button pressed: the script goes on with the panel's values, its tools run and set_panel shows a result.
+        printed.clear();
+        QJsonObject values{{"words", "Panel title"}, {"at", 2}, {"status", ""}, {"pressed", "add"}};
+        answer = values;
+        QVERIFY2(runScript(code, "titles.py", o, &error), qPrintable(error));
+        QCOMPARE(printed.value(1), QString("pressed add Panel title int 2"));
+        QCOMPARE(shown.value("status").toString(), QString("Added Panel title"));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        bool found = false;
+        for (const Track& t : back.active()->videoTracks)
+            for (const Clip& c : t.clips) found |= c.generator.type == "title" && c.start == 2 * 25;
+        QVERIFY(found);
+        // A description that does not check out, and a host without panels, are errors naming the problem.
+        QVERIFY(!runScript("montage.panel(controls=[{'type': 'dial', 'id': 'x'}])", "bad.py", o, &error));
+        QVERIFY2(error.contains("montage.panel") && error.contains("type"), qPrintable(error));
+        o.panel = nullptr;
+        o.setPanel = nullptr;
+        QVERIFY(!runScript("montage.panel(controls=[{'type': 'button', 'id': 'b'}])", "none.py", o, &error));
+        QVERIFY2(error.contains("Montage app"), qPrintable(error));
+        QVERIFY(!runScript("montage.set_panel(a=1)", "none.py", o, &error));
+        QVERIFY(error.contains("no panel"));
     }
 
     void consolidateKeepsGraphicPictures() {
@@ -11557,6 +11902,324 @@ private slots:
         QVERIFY(r.value("isError").toBool());
         r = call(QJsonObject{{"project", project}, {"music_track", "A2"}});
         QVERIFY(r.value("isError").toBool());
+    }
+
+    void renderFarmJobs() {
+        // ---- An export's settings as JSON and back, every kind of field.
+        ExportSettings s;
+        s.path = "/out/a.mov";
+        s.videoCodec = "prores_ks";
+        s.profile = "hq";
+        s.width = 1280;
+        s.fps = 23.976;
+        s.videoBitrate = 50000000000LL;
+        s.in = 12;
+        s.out = 480;
+        s.alpha = true;
+        s.captionTrack = (Id(1) << 60) + 3;  // (more than a JSON number holds)
+        s.chapters = false;
+        s.loudnessTarget = -23;
+        s.burnIn.text = "Draft";
+        s.burnIn.watermarkOpacity = 0.25;
+        s.audioTracks = {true, false, true};
+        s.extraCaptions = {7, (Id(1) << 62) + 1};
+        ExportSettings::AudioStream me;
+        me.name = "M&E";
+        me.language = "en";
+        me.tracks = {false, true};
+        me.unmute = {"Music"};
+        me.normalise = true;
+        s.extraAudio = {me};
+        s.startTimecode = "10:00:00:00";
+        s.credentialAllowAiTraining = true;
+        const QJsonObject json = exportSettingsToJson(s);
+        ExportSettings back;
+        std::string err;
+        QVERIFY2(exportSettingsFromJson(json, back, &err), err.c_str());
+        QCOMPARE(exportSettingsToJson(back), json);
+        QCOMPARE(back.captionTrack, s.captionTrack);
+        QCOMPARE(back.extraCaptions, s.extraCaptions);
+        QCOMPARE(back.extraAudio.size(), size_t(1));
+        QCOMPARE(back.extraAudio[0].unmute, std::vector<std::string>{"Music"});
+        QCOMPARE(back.videoBitrate, s.videoBitrate);
+        // What is missing keeps its default; a value of the wrong type is an error.
+        ExportSettings partial;
+        QVERIFY(exportSettingsFromJson(QJsonObject{{"crf", 20}}, partial));
+        QCOMPARE(partial.crf, 20);
+        QCOMPARE(partial.videoCodec, std::string("libx264"));
+        QVERIFY(!exportSettingsFromJson(QJsonObject{{"width", "wide"}}, partial, &err) && err.find("width") != std::string::npos);
+        QVERIFY(!exportSettingsFromJson(QJsonObject{{"burnIn", "none"}}, partial, &err) && err.find("burnIn") != std::string::npos);
+        QVERIFY(!exportSettingsFromJson(QJsonObject{{"extraAudio", 3}}, partial, &err));
+        QVERIFY(!exportSettingsFromJson(QJsonObject{{"audioTracks", QJsonArray{1}}}, partial, &err) && err.find("audioTracks") != std::string::npos);
+        QVERIFY(!exportSettingsFromJson(QJsonObject{{"extraCaptions", QJsonArray{"seven"}}}, partial, &err) && err.find("id") != std::string::npos);
+        QVERIFY(!exportSettingsFromJson(QJsonObject{{"extraAudio", QJsonArray{1}}}, partial, &err));
+
+        // ---- Path mapping: folders (not prefixes of names), either kind of separator, the first map that fits.
+        const std::vector<FarmPathMap> maps{{"/Volumes/Media", "/mnt/media"}, {"D:\\Shoot", "/mnt/shoot"}, {"/srv/out/", "E:\\Out"}};
+        QCOMPARE(mapFarmPath("/Volumes/Media/Day 1/a.mov", maps), std::string("/mnt/media/Day 1/a.mov"));
+        QCOMPARE(mapFarmPath("/Volumes/MediaX/a.mov", maps), std::string("/Volumes/MediaX/a.mov"));
+        QCOMPARE(mapFarmPath("/Volumes/Media", maps), std::string("/mnt/media"));
+        QCOMPARE(mapFarmPath("D:\\Shoot\\b\\c.mxf", maps), std::string("/mnt/shoot/b/c.mxf"));
+        QCOMPARE(mapFarmPath("D:/Shoot/c.mxf", maps), std::string("/mnt/shoot/c.mxf"));
+        QCOMPARE(mapFarmPath("/srv/out/x/y.mp4", maps), std::string("E:\\Out\\x\\y.mp4"));
+        QCOMPARE(mapFarmPath("", maps), std::string());
+        // Windows paths match whatever their case; others do not. A map from the root keeps its separators.
+        QCOMPARE(mapFarmPath("M:\\Media\\a.mov", {{"m:\\media", "/mnt/m"}}), std::string("/mnt/m/a.mov"));
+        QCOMPARE(mapFarmPath("\\\\NAS\\Share\\a.mov", {{"\\\\nas\\share", "/mnt/nas"}}), std::string("/mnt/nas/a.mov"));
+        QCOMPARE(mapFarmPath("/volumes/media/a.mov", {{"/Volumes/Media", "/mnt/m"}}), std::string("/volumes/media/a.mov"));
+        QCOMPARE(mapFarmPath("/a/b.mov", {{"/", "/mnt/x"}}), std::string("/mnt/x/a/b.mov"));
+        QCOMPARE(mapFarmPath("/a/b.mov", {{"/a", "/mnt/x/"}}), std::string("/mnt/x/b.mov"));
+        FarmPathMap m;
+        QVERIFY(parseFarmPathMap("C:\\Media=/mnt/media", m) && m.from == "C:\\Media" && m.to == "/mnt/media");
+        QVERIFY(!parseFarmPathMap("nothing", m) && !parseFarmPathMap("=x", m) && !parseFarmPathMap("x=", m));
+
+        // ---- A job sent with the media where the sender has it, rendered by a node that has it somewhere else.
+        QTemporaryDir dir;
+        const QString farm = dir.path() + "/farm";
+        QVERIFY(QDir().mkpath(dir.path() + "/sender"));
+        QImage still(64, 36, QImage::Format_RGB32);
+        still.fill(qRgb(200, 40, 40));
+        QVERIFY(still.save(dir.path() + "/sender/still.png"));
+        Project p = makeDefaultProject();
+        Sequence& seq = *p.active();
+        seq.width = 320;
+        seq.height = 180;
+        MediaItem pic = probeOrFail(p, (dir.path() + "/sender/still.png").toStdString());
+        p.media.push_back(pic);
+        QVERIFY(edit::placeMedia(p, seq, pic.id, 0, 0, 25, {TrackKind::Video, 0}, {}, false).ok);
+        ExportSettings st;
+        st.path = (dir.path() + "/sender/out/first.mp4").toStdString();
+        st.audioCodec = "none";
+        std::string id;
+        QVERIFY2(submitFarmJob(farm.toStdString(), "First", p, seq.id, st, 0, &id, &err), err.c_str());
+        std::vector<FarmJob> jobs = farmJobs(farm.toStdString());
+        QCOMPARE(jobs.size(), size_t(1));
+        QCOMPARE(jobs[0].id, id);
+        QCOMPARE(jobs[0].name, std::string("First"));
+        QCOMPARE(jobs[0].state, FarmState::Waiting);
+        QCOMPARE(jobs[0].output, st.path);
+        QVERIFY(QDir().rename(dir.path() + "/sender", dir.path() + "/node"));  // (mounted elsewhere on the node)
+        FarmNodeOptions o;
+        o.farm = farm.toStdString();
+        o.name = "Node A";
+        o.once = true;
+        o.maps = {{(dir.path() + "/sender").toStdString(), (dir.path() + "/node").toStdString()}};
+        QStringList log;
+        o.log = [&](const std::string& l) { log << QString::fromStdString(l); };
+        int rendered = 0;
+        QVERIFY2(runFarmNode(o, &rendered, &err), err.c_str());
+        QCOMPARE(rendered, 1);
+        jobs = farmJobs(farm.toStdString());
+        QVERIFY2(jobs[0].state == FarmState::Done, jobs[0].error.c_str());
+        QCOMPARE(jobs[0].node, std::string("Node A"));
+        QCOMPARE(jobs[0].progress, 1.0);
+        MediaItem out;
+        QVERIFY(probeMedia((dir.path() + "/node/out/first.mp4").toStdString(), out, &err));
+        QCOMPARE(out.width, 320);
+        QVERIFY(!QFileInfo::exists(dir.path() + "/sender"));
+        const std::vector<FarmNodeInfo> nodes = farmNodes(farm.toStdString());
+        QCOMPARE(nodes.size(), size_t(1));
+        QCOMPARE(nodes[0].name, std::string("Node A"));
+        QCOMPARE(nodes[0].state, std::string("stopped"));
+        // Without the map the media is missing (offline): the job still renders, as the queue would; a missing
+        // sequence or output is refused when sending.
+        QVERIFY(!submitFarmJob(farm.toStdString(), "None", p, 999999, st, 0, nullptr, &err));
+        ExportSettings nowhere = st;
+        nowhere.path.clear();
+        QVERIFY(!submitFarmJob(farm.toStdString(), "None", p, seq.id, nowhere, 0, nullptr, &err));
+        QVERIFY2(retryFarmJob(farm.toStdString(), id, &err), err.c_str());
+        QCOMPARE(farmJobs(farm.toStdString())[0].state, FarmState::Waiting);
+        QVERIFY(removeFarmJob(farm.toStdString(), id, &err));
+        QVERIFY(farmJobs(farm.toStdString()).empty());
+        QVERIFY(QFileInfo::exists(dir.path() + "/node/out/first.mp4"));  // (the output stays)
+
+        // ---- Cancelled while waiting: no node takes it; retried, it waits again; removed, it is gone.
+        st.path = (dir.path() + "/node/out/second.mp4").toStdString();
+        QVERIFY(submitFarmJob(farm.toStdString(), "Second", p, seq.id, st, 0, &id, &err));
+        QVERIFY(cancelFarmJob(farm.toStdString(), id, &err));
+        QCOMPARE(farmJobs(farm.toStdString())[0].state, FarmState::Cancelled);
+        QVERIFY(!cancelFarmJob(farm.toStdString(), id, &err));  // (ended already)
+        o.maps.clear();
+        QVERIFY(runFarmNode(o, &rendered) && rendered == 0);
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(st.path)));
+        QVERIFY(retryFarmJob(farm.toStdString(), id));
+        QCOMPARE(farmJobs(farm.toStdString())[0].state, FarmState::Waiting);
+        QVERIFY(!retryFarmJob(farm.toStdString(), id, &err));  // (waiting already)
+        QVERIFY(removeFarmJob(farm.toStdString(), id));
+        QVERIFY(!removeFarmJob(farm.toStdString(), "../x", &err) && !cancelFarmJob(farm.toStdString(), "nope", &err));
+
+        // ---- Two nodes at once: each job rendered once.
+        std::vector<std::string> ids;
+        for (int i = 0; i < 4; ++i) {
+            st.path = (dir.path() + QString("/node/out/many%1.mp4").arg(i)).toStdString();
+            QVERIFY(submitFarmJob(farm.toStdString(), "Many", p, seq.id, st, 0, &id, &err));
+            ids.push_back(id);
+        }
+        FarmNodeOptions a = o, b = o;
+        a.name = "A";
+        b.name = "B";
+        a.log = b.log = nullptr;
+        int ra = 0, rb = 0;
+        std::thread ta([&] { runFarmNode(a, &ra); });
+        std::thread tb([&] { runFarmNode(b, &rb); });
+        ta.join();
+        tb.join();
+        QCOMPARE(ra + rb, 4);
+        for (const FarmJob& j : farmJobs(farm.toStdString())) QVERIFY2(j.state == FarmState::Done && (j.node == "A" || j.node == "B"), j.error.c_str());
+        for (const std::string& j : ids) QVERIFY(removeFarmJob(farm.toStdString(), j));
+
+        // ---- Cancelled while rendering: stopped within a second or two, the half-written file removed. A node stopped
+        // while rendering gives its job back to wait for another.
+        Sequence& longSeq = *p.active();
+        longSeq.width = 1920;
+        longSeq.height = 1080;
+        Clip noise = makeGeneratorClip(p, "color", 25 * 600);
+        edit::overwrite(p, longSeq, {TrackKind::Video, 0}, noise);
+        st.path = (dir.path() + "/node/out/long.mov").toStdString();
+        st.videoCodec = "prores_ks";
+        st.profile = "4444";
+        QVERIFY(submitFarmJob(farm.toStdString(), "Long", p, longSeq.id, st, 0, &id, &err));
+        std::atomic<bool> stop{false};
+        o.once = false;
+        o.pollMs = 100;
+        o.stopped = [&] { return stop.load(); };
+        auto rendering = [&] {
+            const std::vector<FarmJob> js = farmJobs(farm.toStdString());
+            return !js.empty() && js[0].state == FarmState::Rendering && js[0].progress > 0;
+        };
+        {
+            std::thread node([&] { runFarmNode(o, &rendered); });
+            QTRY_VERIFY_WITH_TIMEOUT(rendering(), 30000);
+            QVERIFY(cancelFarmJob(farm.toStdString(), id, &err));
+            QTRY_VERIFY_WITH_TIMEOUT(farmJobs(farm.toStdString())[0].state == FarmState::Cancelled, 10000);
+            stop = true;
+            node.join();
+        }
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(st.path)));
+        QVERIFY(retryFarmJob(farm.toStdString(), id));
+        stop = false;
+        {
+            std::thread node([&] { runFarmNode(o, &rendered); });
+            QTRY_VERIFY_WITH_TIMEOUT(rendering(), 30000);
+            stop = true;
+            node.join();
+        }
+        jobs = farmJobs(farm.toStdString());
+        QCOMPARE(jobs[0].state, FarmState::Waiting);
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(st.path)));
+        // A node that loses its job (taken back while it was silent, and claimed by another) stops, and leaves what
+        // the other writes alone: it renders into a folder of its own and moves nothing into place.
+        stop = false;
+        {
+            std::thread node([&] { runFarmNode(o, &rendered); });
+            QTRY_VERIFY_WITH_TIMEOUT(rendering(), 30000);
+            QFile theirs(QString::fromStdString(st.path));
+            QVERIFY(theirs.open(QIODevice::WriteOnly));
+            theirs.write("the other node's render");
+            theirs.close();
+            QFile claim(farm + "/jobs/" + QString::fromStdString(id) + "/claim");
+            QVERIFY(claim.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            claim.write("the-other-node");
+            claim.close();
+            QTRY_VERIFY_WITH_TIMEOUT(QDir(dir.path() + "/node/out").entryList({".montage-farm-*"}, QDir::Dirs | QDir::Hidden).isEmpty(), 10000);
+            stop = true;
+            node.join();
+        }
+        {
+            QFile theirs(QString::fromStdString(st.path));
+            QVERIFY(theirs.open(QIODevice::ReadOnly));
+            QCOMPARE(theirs.readAll(), QByteArray("the other node's render"));
+        }
+        QCOMPARE(farmJobs(farm.toStdString())[0].claim, std::string("the-other-node"));
+        QFile::remove(farm + "/jobs/" + QString::fromStdString(id) + "/claim");
+        QFile::remove(QString::fromStdString(st.path));
+        QVERIFY(removeFarmJob(farm.toStdString(), id));
+
+        // ---- A node that stops answering: its job is taken back once its heartbeat has not moved for a while (by the
+        // watcher's own clock), by one watcher only, and then rendered by another node.
+        st.path = (dir.path() + "/node/out/orphan.mp4").toStdString();
+        st.videoCodec = "libx264";
+        st.profile.clear();
+        Project shortP = makeDefaultProject();
+        shortP.active()->width = 320;
+        shortP.active()->height = 180;
+        edit::overwrite(shortP, *shortP.active(), {TrackKind::Video, 0}, makeGeneratorClip(shortP, "color", 25));
+        QVERIFY(submitFarmJob(farm.toStdString(), "Orphan", shortP, shortP.active()->id, st, 0, &id, &err));
+        const QDir jd(farm + "/jobs/" + QString::fromStdString(id));
+        {
+            QFile claim(jd.filePath("claim"));
+            QVERIFY(claim.open(QIODevice::WriteOnly));
+            claim.write("gone-node-token");
+            QFile status(jd.filePath("status.json"));
+            QVERIFY(status.open(QIODevice::WriteOnly));
+            status.write(R"({"state": "rendering", "progress": 0.3, "node": "Gone", "beat": 5})");
+        }
+        jobs = farmJobs(farm.toStdString());
+        QCOMPARE(jobs[0].state, FarmState::Rendering);
+        QCOMPARE(jobs[0].node, std::string("Gone"));
+        QCOMPARE(jobs[0].claim, std::string("gone-node-token"));
+        // Taken back only from the claim judged silent (not from a node that has claimed it since).
+        QVERIFY(!reclaimFarmJob(farm.toStdString(), id, "another-node-token", &err));
+        QVERIFY(QFileInfo::exists(jd.filePath("claim")));
+        QCOMPARE(farmJobs(farm.toStdString())[0].claim, std::string("gone-node-token"));
+        FarmHeartbeats beats(200);
+        QVERIFY(!beats.stale(id, 5));
+        QVERIFY(!beats.stale(id, 6));  // (it moved: watched afresh)
+        QTest::qWait(250);
+        QVERIFY(beats.stale(id, 6));
+        // A node with a short patience takes it back and renders it.
+        stop = false;
+        o.staleMs = 300;
+        o.stopped = [&] { return stop.load() || rendered > 0; };
+        rendered = 0;
+        log.clear();
+        QVERIFY(runFarmNode(o, &rendered, &err));
+        QCOMPARE(rendered, 1);
+        jobs = farmJobs(farm.toStdString());
+        QVERIFY2(jobs[0].state == FarmState::Done && jobs[0].node == "Node A", jobs[0].error.c_str());
+        QVERIFY2(log.join('\n').contains("Took back") && log.join('\n').contains("Gone"), qPrintable(log.join('\n')));
+        QVERIFY(!reclaimFarmJob(farm.toStdString(), id, jobs[0].claim, &err));  // (only a rendering job is taken back)
+        QVERIFY(QFileInfo::exists(QString::fromStdString(st.path)));
+        QVERIFY(QDir(dir.path() + "/node/out").entryList({".montage-farm-*"}, QDir::Dirs | QDir::Hidden).isEmpty());
+
+        // ---- Over MCP: montage_render's farm sends the job; montage_render_farm lists, cancels and removes it.
+        const QString project = dir.path() + "/mcp.montage";
+        QVERIFY(saveProject(shortP, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        const QString mcpOut = dir.path() + "/node/out/mcp.mp4";
+        QJsonObject r = call("montage_render", {{"project", project}, {"output", mcpOut}, {"farm", farm}, {"stems", "tracks"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const QString mcpJob = r.value("structuredContent").toObject().value("job").toString();
+        QVERIFY(!mcpJob.isEmpty() && !QFileInfo::exists(mcpOut));
+        r = call("montage_render_farm", {{"farm", farm}});
+        QJsonArray listed = r.value("structuredContent").toObject().value("jobs").toArray();
+        QCOMPARE(listed.size(), 2);
+        QJsonObject sent;
+        for (const QJsonValue& j : listed)
+            if (j.toObject().value("id").toString() == mcpJob) sent = j.toObject();
+        QCOMPARE(sent.value("state").toString(), QString("waiting"));
+        QCOMPARE(sent.value("output").toString(), mcpOut);
+        r = call("montage_render_farm", {{"farm", farm}, {"action", "nodes"}});
+        QStringList nodeNames;
+        for (const QJsonValue& n : r.value("structuredContent").toObject().value("nodes").toArray()) nodeNames << n.toObject().value("name").toString();
+        QCOMPARE(nodeNames, (QStringList{"A", "B", "Node A"}));
+        r = call("montage_render_farm", {{"farm", farm}, {"action", "cancel"}, {"job", mcpJob}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        for (const FarmJob& j : farmJobs(farm.toStdString()))
+            if (j.id == mcpJob.toStdString()) QCOMPARE(j.state, FarmState::Cancelled);
+        r = call("montage_render_farm", {{"farm", farm}, {"action", "remove"}, {"job", mcpJob}});
+        QVERIFY(!r.value("isError").toBool());
+        r = call("montage_render_farm", {{"farm", farm}, {"action", "retry"}, {"job", mcpJob}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("No job"));
     }
 
     void mcpBuildsACutFromAScript() {
@@ -15110,6 +15773,141 @@ private slots:
         }
     }
 
+    void correctLensOverMcp() {
+        // The test database stands in for lensfun's, from MONTAGE_LENS_DB.
+        QTemporaryDir lenses;
+        QVERIFY(QFile::copy(QStringLiteral(MONTAGE_TEST_DATA_DIR "/lensfun/test-lenses.xml"), lenses.filePath("test-lenses.xml")));
+        const QByteArray before = qgetenv("MONTAGE_LENS_DB");
+        qputenv("MONTAGE_LENS_DB", lenses.path().toUtf8());
+        reloadLensDatabase();
+        struct Restore {
+            QByteArray v;
+            ~Restore() {
+                if (v.isEmpty()) qunsetenv("MONTAGE_LENS_DB");
+                else qputenv("MONTAGE_LENS_DB", v);
+                reloadLensDatabase();
+            }
+        } restore{before};
+        const auto db = lensDatabase();
+        QVERIFY(db);
+        QCOMPARE(db->lenses().size(), size_t(3));
+        QCOMPARE(lensDatabaseFolders(), std::vector<std::string>{lenses.path().toStdString()});
+        QCOMPARE(lensDatabasePack().files.size(), size_t(56));
+        QCOMPARE(lensDatabasePack().directory(), lenses.path().toStdString());
+
+        // A recording names its camera; a fixed lens comes with it, an interchangeable one is asked for.
+        MediaItem cam;
+        cam.metadata["device"] = "GoPro HERO11 Black";
+        LensChoice c = suggestLens(*db, cam);
+        QVERIFY(c.camera && c.lens);
+        QCOMPARE(lens::lensName(*c.lens), std::string("GoPro HERO11 Black & compatibles"));
+        QCOMPARE(c.focal, 2.7);
+        cam.metadata["device"] = "Sony ILCE-6400";
+        c = suggestLens(*db, cam);
+        QVERIFY(c.camera && !c.lens);
+        cam.metadata.clear();
+        QVERIFY(!suggestLens(*db, cam).camera);
+
+        // A still from the GoPro on the timeline twice.
+        const std::string png = path("gopro-frame.png");
+        QImage frame(320, 180, QImage::Format_RGB32);
+        frame.fill(QColor(90, 120, 150));
+        QVERIFY(frame.save(QString::fromStdString(png)));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180;
+        MediaItem m = probeOrFail(p, png);
+        m.metadata["device"] = "GoPro HERO11 Black";
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, m.id, 60, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id first = s.videoTracks[0].clips[0].id;
+        s.videoTracks[0].clips[0].effects.push_back(makeEffect(p, "brightness_contrast"));
+        const QString project = QString::fromStdString(path("lens.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject full = args;
+            if (!full.contains("project")) full["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_correct_lens"}, {"arguments", full},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject o = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object();
+            return o.contains("error") ? QJsonObject{{"isError", true}, {"error", o.value("error")}} : o.value("result").toObject();
+        };
+        // Listing: the camera found from the clip's media and the lenses that fit it; a query narrows them.
+        QJsonObject r = call({{"clip", double(first)}, {"list", true}, {"camera", "Sony ILCE-6400"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject out = r.value("structuredContent").toObject();
+        QCOMPARE(out.value("camera").toObject().value("name").toString(), QStringLiteral("Sony ILCE-6400"));
+        QCOMPARE(out.value("lenses").toArray().size(), 2);
+        r = call({{"clip", double(first)}, {"list", true}, {"camera", "Sony ILCE-6400"}, {"query", "fish"}});
+        QCOMPARE(r.value("structuredContent").toObject().value("lenses").toArray().size(), 1);
+        // Corrected: the GoPro's fixed lens, from the clip's camera, first in its effects; the project saved.
+        r = call({{"clip", double(first)}, {"params", QJsonObject{{"fit", 1}, {"tca", 0}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        out = r.value("structuredContent").toObject();
+        QCOMPARE(out.value("lens").toString(), QStringLiteral("GoPro HERO11 Black & compatibles"));
+        QCOMPARE(out.value("type").toString(), QStringLiteral("Fisheye"));
+        QCOMPARE(out.value("clips").toInt(), 1);
+        QCOMPARE(out.value("focal").toDouble(), 2.7);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Clip* clip = edit::clipById(*back.active(), first);
+        QVERIFY(clip && clip->effects.size() == 2);
+        const Effect& e = clip->effects[0];
+        QCOMPARE(e.type, std::string("lens_correction"));
+        QCOMPARE(qint64(e.id), qint64(out.value("effect").toDouble()));
+        QCOMPARE(e.s("camera"), std::string("GoPro Hero11 Black"));
+        QCOMPARE(e.p("fit", 0), 1.0);
+        QCOMPARE(e.p("tca", 0), 0.0);
+        QCOMPARE(e.p("camera_crop", 0), 5.54);
+        // The profile is in the project: it renders without the database.
+        const auto kept = lens::parseLens(e.s("profile"));
+        QVERIFY(kept && kept->type == lens::Projection::Fisheye && kept->calibrations.size() == 1);
+        QVERIFY(edit::clipById(*back.active(), back.active()->videoTracks[0].clips[1].id)->effects.empty());
+        // Again, another lens by name with its focal length and aperture, on every clip of the media: replaced, not added.
+        r = call({{"clip", double(first)}, {"camera", "Sony ILCE-6400"}, {"lens", "Samyang 8mm"}, {"aperture", 4}, {"same_media", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("clips").toInt(), 2);
+        QVERIFY(loadProject(project.toStdString(), back));
+        for (const Clip& k : back.active()->videoTracks[0].clips) {
+            QCOMPARE(int(std::count_if(k.effects.begin(), k.effects.end(), [](const Effect& x) { return x.type == "lens_correction"; })), 1);
+            QCOMPARE(k.effects[0].s("lens"), std::string("Samyang 8mm f/2.8 UMC Fish-eye"));
+            QCOMPARE(k.effects[0].p("aperture", 0), 4.0);
+            QCOMPARE(k.effects[0].p("camera_crop", 0), 1.534);
+        }
+        QCOMPARE(edit::clipById(*back.active(), first)->effects[0].p("fit", 0), 1.0);  // its own settings kept
+        // A fixed-lens camera named brings its lens; aperture 0 (not known) stays 0, no vignetting correction.
+        const double second = double(back.active()->videoTracks[0].clips[1].id);
+        r = call({{"clip", second}, {"camera", "GoPro HERO11 Black"}, {"aperture", 0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("lens").toString(), QStringLiteral("GoPro HERO11 Black & compatibles"));
+        QCOMPARE(r.value("structuredContent").toObject().value("aperture").toDouble(), 0.0);
+        // Refused: an unknown lens or camera, a setting it has no, focal length among the settings.
+        for (const QJsonObject& bad : {QJsonObject{{"clip", double(first)}, {"lens", "Nikkor 50mm"}},
+                                       QJsonObject{{"clip", double(first)}, {"camera", "Canon EOS R5"}},
+                                       QJsonObject{{"clip", double(first)}, {"params", QJsonObject{{"focal", 10}}}},
+                                       QJsonObject{{"clip", double(first)}, {"params", QJsonObject{{"fit", 7}}}},
+                                       QJsonObject{{"clip", double(first)}, {"params", QJsonObject{{"fit", 0.5}}}},
+                                       QJsonObject{{"clip", double(first)}, {"camera", 5}, {"lens", "Samyang 8mm"}},
+                                       QJsonObject{{"clip", double(first)}, {"lens", "Samyang 8mm"}, {"focal", 5000}},
+                                       QJsonObject{{"clip", double(first)}, {"camera", "Sony ILCE-6400"}}})
+            QVERIFY2(call(bad).value("isError").toBool(), QJsonDocument(bad).toJson().constData());
+        // Played back: the frame (flat) filled to the edges.
+        const Image played = renderProgramFrame(back, *back.active(), 5, RenderOptions{});
+        QVERIFY(!played.empty());
+        QVERIFY(played.at(0, 0)[3] > 0.99f && played.at(319, 179)[3] > 0.99f);
+        // Without a database, the tool says where to get one.
+        qputenv("MONTAGE_LENS_DB", QFile::encodeName(lenses.filePath("none")));
+        reloadLensDatabase();
+        r = call({{"clip", double(first)}});
+        QVERIFY(r.value("isError").toBool());
+        QVERIFY(QJsonDocument(r).toJson().contains("fetch-models"));
+    }
+
     void reviewPackages() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
@@ -15367,6 +16165,736 @@ private slots:
         QVERIFY2(quadError(cornerPinQuad(pin, 0), corners[0]) < 1.0, qPrintable(QString::number(quadError(cornerPinQuad(pin, 0), corners[0]))));
         // Not past the end.
         QVERIFY(!trackClipCorners(p, s, over, pin, frames - 1, true, keys, {}, nullptr, &err));
+    }
+
+    // A camera moving through a scene (x right, y down, z forward, as CameraSolve's cameras are): it slides right,
+    // rises a little and pushes in while panning to keep the scene in view. Its rotation and position at t in [0, 1].
+    static void sceneCamera(double t, std::array<double, 9>& R, Vec3& C) {
+        const double yaw = 0.25 - 0.5 * t, pitch = 0.04 * std::sin(t * 3.0);
+        const double cy = std::cos(yaw), sy = std::sin(yaw), cp = std::cos(pitch), sp = std::sin(pitch);
+        // Turned about y by yaw, then about x by pitch (world to camera).
+        const std::array<double, 9> Ry{cy, 0, -sy, 0, 1, 0, sy, 0, cy}, Rx{1, 0, 0, 0, cp, sp, 0, -sp, cp};
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) R[size_t(i * 3 + j)] = Rx[size_t(i * 3)] * Ry[size_t(j)] + Rx[size_t(i * 3 + 1)] * Ry[size_t(3 + j)] + Rx[size_t(i * 3 + 2)] * Ry[size_t(6 + j)];
+        C = {-1.5 + 3.0 * t, -0.3 * t, 0.8 * t};
+    }
+    static bool sceneProject(const std::array<double, 9>& R, const Vec3& C, double f, int w, int h, const Vec3& X, Point2& out) {
+        const double d[3] = {X.x - C.x, X.y - C.y, X.z - C.z};
+        const double x = R[0] * d[0] + R[1] * d[1] + R[2] * d[2], y = R[3] * d[0] + R[4] * d[1] + R[5] * d[2],
+                     z = R[6] * d[0] + R[7] * d[1] + R[8] * d[2];
+        if (z < 0.1) return false;
+        out = {f * x / z + w / 2.0, f * y / z + h / 2.0};
+        return out.x >= 2 && out.y >= 2 && out.x <= w - 3 && out.y <= h - 3;
+    }
+    // How far the solved camera path is from the scene's, gauge free: each camera's position seen from the first
+    // camera, over the whole move's length (`place`), and its rotation from the first's (`turn`, degrees).
+    static void pathMismatch(const CameraSolve& s, int frames, double& place, double& turn) {
+        using M = std::array<double, 9>;
+        auto mulT = [](const M& a, const M& b) {  // a b'
+            M r{};
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j)
+                    for (int k = 0; k < 3; ++k) r[size_t(i * 3 + j)] += a[size_t(i * 3 + k)] * b[size_t(j * 3 + k)];
+            return r;
+        };
+        auto rel = [](const M& R, Vec3 C0, Vec3 C) {
+            const double d[3] = {C.x - C0.x, C.y - C0.y, C.z - C0.z};
+            return Vec3{R[0] * d[0] + R[1] * d[1] + R[2] * d[2], R[3] * d[0] + R[4] * d[1] + R[5] * d[2], R[6] * d[0] + R[7] * d[1] + R[8] * d[2]};
+        };
+        auto length = [](Vec3 v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); };
+        M R0, Rn;
+        Vec3 C0, Cn;
+        sceneCamera(0, R0, C0);
+        sceneCamera(1, Rn, Cn);
+        const SolvedCamera& s0 = s.cameras.front();
+        const SolvedCamera& sn = s.cameras.back();
+        place = turn = 1e9;
+        if (!s0.valid || !sn.valid) return;
+        const double truthScale = length(rel(R0, C0, Cn)), solvedScale = length(rel(s0.R, s0.C, sn.C));
+        place = turn = 0;
+        for (int i = 0; i < frames; ++i) {
+            M R;
+            Vec3 C;
+            sceneCamera(double(i) / (frames - 1), R, C);
+            const SolvedCamera& c = s.cameras[size_t(i)];
+            if (!c.valid) {
+                place = turn = 1e9;
+                return;
+            }
+            const Vec3 a = rel(R0, C0, C), b = rel(s0.R, s0.C, c.C);
+            place = std::max(place, length({a.x / truthScale - b.x / solvedScale, a.y / truthScale - b.y / solvedScale,
+                                             a.z / truthScale - b.z / solvedScale}));
+            // (c s0') (R R0')' is the identity when the turns from the first camera agree.
+            const M d = mulT(mulT(c.R, s0.R), mulT(R, R0));
+            turn = std::max(turn, std::acos(std::clamp((d[0] + d[4] + d[8] - 1) / 2, -1.0, 1.0)) * 180 / M_PI);
+        }
+    }
+
+    void cameraTracking() {
+        // A scene of points: a ground (y = 1.5, under the camera) and things standing on it, seen by a moving camera
+        // whose focal length is 520 px on a 640 x 360 picture; the tracks start and end at random, a few are wrong,
+        // all have a third of a pixel of noise.
+        const int W = 640, H = 360, frames = 60;
+        const double f = 520;
+        std::mt19937 rng(3);
+        std::uniform_real_distribution<double> ux(-5, 5), uz(3, 14), uy(-2.5, 1.4), u01(0, 1);
+        std::normal_distribution<double> noise(0, 0.33);
+        std::vector<Vec3> scene;
+        std::vector<bool> ground;
+        for (int i = 0; i < 700; ++i) {
+            const bool g = i % 5 < 3;
+            scene.push_back({ux(rng), g ? 1.5 : uy(rng), uz(rng)});
+            ground.push_back(g);
+        }
+        std::vector<FeatureTrack> tracks;
+        std::vector<int> pointOfTrack;
+        for (size_t j = 0; j < scene.size(); ++j) {
+            const int a = int(u01(rng) * frames * 0.7), len = 10 + int(u01(rng) * frames);
+            FeatureTrack t;
+            for (int i = a; i < std::min(frames, a + len); ++i) {
+                std::array<double, 9> R;
+                Vec3 C;
+                sceneCamera(double(i) / (frames - 1), R, C);
+                Point2 q;
+                if (!sceneProject(R, C, f, W, H, scene[j], q)) break;
+                if (t.at.empty()) t.first = i;
+                t.at.push_back({q.x + noise(rng), q.y + noise(rng)});
+            }
+            if (t.at.size() >= 2) {
+                tracks.push_back(t);
+                pointOfTrack.push_back(int(j));
+            }
+        }
+        for (int j = 0; j < 30; ++j) {  // features on something moving on its own
+            FeatureTrack t;
+            t.first = int(u01(rng) * 30);
+            Point2 q{50 + u01(rng) * 500, 50 + u01(rng) * 250};
+            for (int i = 0; i < 20; ++i) {
+                q.x += 3;
+                q.y += std::sin(i * 0.9) * 8;
+                t.at.push_back(q);
+            }
+            tracks.push_back(t);
+            pointOfTrack.push_back(-1);
+        }
+        CameraSolve s;
+        std::string err;
+        QElapsedTimer clock;
+        clock.start();
+        QVERIFY2(solveCamera(tracks, frames, W, H, {}, s, {}, nullptr, &err), err.c_str());
+        qInfo("solved in %lld ms: focal %.1f, error %.3f px, %d keyframes, %zu points", qint64(clock.elapsed()), s.focal, s.error,
+              s.keyframes, s.points.size());
+        QVERIFY2(std::fabs(s.focal - f) < 0.05 * f, qPrintable(QString::number(s.focal)));
+        QVERIFY2(s.error < 1.0, qPrintable(QString::number(s.error)));
+        QCOMPARE(int(s.cameras.size()), frames);
+        double place = 0, turn = 0;
+        pathMismatch(s, frames, place, turn);
+        QVERIFY2(place < 0.02 && turn < 0.2, qPrintable(QString("%1 %2").arg(place).arg(turn)));
+        QVERIFY(s.points.size() > 300);
+        for (const SolvedPoint& p : s.points) QVERIFY(pointOfTrack[size_t(p.track)] >= 0);  // the wrong ones are left out
+        // Given the focal length, it is kept.
+        CameraSolveOptions known;
+        known.focal = 500;
+        CameraSolve fixed;
+        QVERIFY2(solveCamera(tracks, frames, W, H, known, fixed, {}, nullptr, &err), err.c_str());
+        QCOMPARE(fixed.focal, 500.0);
+        QVERIFY(fixed.error > s.error);
+        QVERIFY(std::fabs(s.fieldOfView() - 2 * std::atan(320 / f) * 180 / M_PI) < 3);
+
+        // Stood on its ground: the ground's points at y = 0, the first camera 1.6 above it, looking along -z.
+        CameraSolve o = s;
+        QVERIFY(orientScene(o, 1.6));
+        QVERIFY(o.oriented);
+        QVERIFY(std::fabs(o.cameras[0].C.y - 1.6) < 1e-6);
+        double off = 0, offSum = 0;
+        int onGround = 0;
+        for (const SolvedPoint& p : o.points)
+            if (ground[size_t(pointOfTrack[size_t(p.track)])]) {
+                off = std::max(off, std::fabs(p.X.y));
+                offSum += std::fabs(p.X.y);
+                ++onGround;
+            }
+        QVERIFY(onGround > 100);
+        QVERIFY2(off < 0.1 && offSum / onGround < 0.02, qPrintable(QString("%1 %2").arg(off).arg(offSum / onGround)));
+        const auto& R0 = o.cameras[0].R;
+        QVERIFY(R0[8] * -1 > 0.9 || std::hypot(R0[6], R0[8]) > 0.9);  // its forward axis is level-ish, along -z
+        QVERIFY(R0[7] < 0.2 && R0[8] < 0);
+        // Projections are the solve's: a solved point lands where its feature was.
+        const SolvedPoint& sp = o.points[o.points.size() / 2];
+        const FeatureTrack& ft = tracks[size_t(sp.track)];
+        Point2 q;
+        QVERIFY(o.project(ft.first, sp.X, q));
+        QVERIFY(std::hypot(q.x - ft.at[0].x, q.y - ft.at[0].y) < 2);
+        QVERIFY(!o.project(-1, sp.X, q) && !o.project(frames, sp.X, q));
+        // A rectangle on the ground about a ground point: its corners on the ground, its sides as asked, its top edge
+        // farther from the camera; upright, it stands up from there facing the camera.
+        Vec3 centre;
+        for (const SolvedPoint& p : o.points)
+            if (ground[size_t(pointOfTrack[size_t(p.track)])]) {
+                centre = p.X;
+                break;
+            }
+        centre.y = 0;
+        auto rect = sceneRectangle(o, centre, 2, 1, false);
+        auto dist = [](Vec3 a, Vec3 b) { return std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z - b.z) * (a.z - b.z)); };
+        for (const Vec3& c : rect) QVERIFY(std::fabs(c.y) < 1e-9);
+        QVERIFY(std::fabs(dist(rect[0], rect[1]) - 2) < 1e-9 && std::fabs(dist(rect[1], rect[2]) - 1) < 1e-9);
+        QVERIFY(dist(rect[0], o.cameras[0].C) > dist(rect[3], o.cameras[0].C));
+        auto up = sceneRectangle(o, centre, 2, 1, true);
+        QVERIFY(std::fabs(up[0].y - 0.5) < 1e-9 && std::fabs(up[3].y + 0.5) < 1e-9);
+        const auto square = sceneRectangle(o, centre, 2, 2, false), turned = sceneRectangle(o, centre, 2, 2, false, 90);
+        QVERIFY(std::fabs(turned[0].y) < 1e-9);
+        QVERIFY(dist(turned[0], square[1]) < 1e-9 || dist(turned[0], square[3]) < 1e-9);  // a quarter turn about its centre
+        // Not every scene has a ground: too few points.
+        CameraSolve bare = o;
+        bare.points.resize(5);
+        QVERIFY(!orientScene(bare));
+
+        // As text, and for other programs.
+        CameraSolve back;
+        QVERIFY(cameraSolveFromString(cameraSolveToString(o), back));
+        QCOMPARE(back.points.size(), o.points.size());
+        QCOMPARE(back.cameras.size(), o.cameras.size());
+        QVERIFY(back.oriented && std::fabs(back.focal - o.focal) < 1e-6 && std::fabs(back.cameras[30].C.x - o.cameras[30].C.x) < 1e-6);
+        QVERIFY(!cameraSolveFromString("c1 640 360", back) && !cameraSolveFromString("x", back));
+        const std::string chan = path("camera.chan"), ply = path("points.ply");
+        QVERIFY(writeNukeChan(o, chan, 1001, &err));
+        QFile cf(QString::fromStdString(chan));
+        QVERIFY(cf.open(QIODevice::ReadOnly));
+        const QStringList lines = QString::fromUtf8(cf.readAll()).split('\n', Qt::SkipEmptyParts);
+        QCOMPARE(lines.size(), frames);
+        const QStringList first = lines[0].split(' ');
+        QCOMPARE(first.size(), 8);
+        QCOMPARE(first[0], QString("1001"));
+        QVERIFY(std::fabs(first[2].toDouble() - 1.6) < 1e-5);  // ty: its height
+        QVERIFY(std::fabs(first[4].toDouble()) < 10);           // rx: looking about level
+        QVERIFY(std::fabs(first[7].toDouble() - 2 * std::atan(180 / o.focal) * 180 / M_PI) < 1e-4);  // vertical field of view
+        QVERIFY(writePointsPly(o, ply, &err));
+        QFile pf(QString::fromStdString(ply));
+        QVERIFY(pf.open(QIODevice::ReadOnly));
+        const QString plyText = QString::fromUtf8(pf.readAll());
+        QVERIFY(plyText.startsWith("ply\n") && plyText.contains(QString("element vertex %1\n").arg(o.points.size())));
+        QVERIFY(!writeNukeChan(o, "/nonexistent/dir/c.chan", 1, &err) && !err.empty());
+
+        // A camera that only turns shows no depth: no solve.
+        std::vector<FeatureTrack> turning;
+        for (size_t j = 0; j < scene.size(); ++j) {
+            FeatureTrack t;
+            for (int i = 0; i < frames; ++i) {
+                std::array<double, 9> R;
+                Vec3 C;
+                sceneCamera(double(i) / (frames - 1), R, C);
+                Point2 p2;
+                if (!sceneProject(R, Vec3{}, f, W, H, scene[j], p2)) break;
+                t.at.push_back(p2);
+            }
+            if (t.at.size() >= 10) turning.push_back(t);
+        }
+        QVERIFY(turning.size() > 50);
+        QVERIFY(!solveCamera(turning, frames, W, H, {}, back, {}, nullptr, &err));
+        QVERIFY2(QString::fromStdString(err).contains("moves too little"), err.c_str());
+        QVERIFY(!solveCamera({}, frames, W, H, {}, back, {}, nullptr, &err));
+        // A long shot whose features last only a few frames each (few alive at once): it ends, solved or not.
+        std::vector<FeatureTrack> brief;
+        for (int start = 0; start + 9 < 400; start += 3) {
+            FeatureTrack t;
+            t.first = start;
+            t.at.assign(9, Point2{20.0 + start, 30.0 + (start * 7) % 300});
+            brief.push_back(t);
+        }
+        QVERIFY(!solveCamera(brief, 400, W, H, {}, back, {}, nullptr, &err));
+    }
+
+    void cameraTrackingFootage() {
+        // The scene rendered (ray cast, 3 x 3 samples a pixel): a chequered ground under the camera, a wall far
+        // behind and two boxes standing on the ground, each square its own grey; 480 x 270 at 25 fps, as PNGs.
+        const int W = 480, H = 270, frames = 40;
+        const double f = 0.8 * W;
+        const QString dir = QString::fromStdString(path("solve"));
+        QDir().mkpath(dir);
+        auto grey = [](int a, int b, int face) {
+            uint32_t h = uint32_t(a) * 73856093u ^ uint32_t(b) * 19349663u ^ uint32_t(face) * 83492791u;
+            h ^= h >> 13;
+            h *= 0x5bd1e995u;
+            h ^= h >> 15;
+            return 0.12 + 0.8 * double(h % 1000) / 1000;
+        };
+        struct Box {
+            double x0, x1, y0, y1, z0, z1;
+        };
+        const Box boxes[2] = {{-2.2, -0.8, 0.0, 1.5, 6, 7.5}, {1.0, 2.6, -1.2, 1.5, 9, 10.5}};
+        auto shade = [&](Vec3 o, Vec3 d) {
+            double best = 1e30, value = 0.5;
+            auto hit = [&](double t, double v) {
+                if (t > 1e-6 && t < best) {
+                    best = t;
+                    value = v;
+                }
+            };
+            const double cell = 0.3;
+            auto tex = [&](double u, double v, int face) { return grey(int(std::floor(u / cell)), int(std::floor(v / cell)), face); };
+            if (d.y > 1e-9) {  // the ground, y = 1.5
+                const double t = (1.5 - o.y) / d.y;
+                hit(t, tex(o.x + t * d.x, o.z + t * d.z, 1));
+            }
+            if (d.z > 1e-9) {  // the wall, z = 16
+                const double t = (16 - o.z) / d.z;
+                hit(t, tex(o.x + t * d.x, o.y + t * d.y, 2));
+            }
+            for (int b = 0; b < 2; ++b) {
+                const Box& B = boxes[b];
+                double t0 = -1e30, t1 = 1e30;
+                int axis = -1;
+                const double lo[3] = {B.x0, B.y0, B.z0}, hi[3] = {B.x1, B.y1, B.z1}, oo[3] = {o.x, o.y, o.z}, dd[3] = {d.x, d.y, d.z};
+                bool miss = false;
+                for (int a = 0; a < 3 && !miss; ++a) {
+                    if (std::fabs(dd[a]) < 1e-12) {
+                        miss = oo[a] < lo[a] || oo[a] > hi[a];
+                        continue;
+                    }
+                    double ta = (lo[a] - oo[a]) / dd[a], tb = (hi[a] - oo[a]) / dd[a];
+                    if (ta > tb) std::swap(ta, tb);
+                    if (ta > t0) {
+                        t0 = ta;
+                        axis = a;
+                    }
+                    t1 = std::min(t1, tb);
+                    miss = t0 > t1;
+                }
+                if (miss || axis < 0) continue;
+                const Vec3 q{o.x + t0 * d.x, o.y + t0 * d.y, o.z + t0 * d.z};
+                const double u = axis == 0 ? q.z : q.x, v = axis == 1 ? q.z : q.y;
+                hit(t0, tex(u, v, 10 + b * 3 + axis));
+            }
+            return value;
+        };
+        for (int i = 0; i < frames; ++i) {
+            std::array<double, 9> R;
+            Vec3 C;
+            sceneCamera(double(i) / (frames - 1), R, C);
+            QImage img(W, H, QImage::Format_RGB32);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    double sum = 0;
+                    for (int sy = 0; sy < 3; ++sy)
+                        for (int sx = 0; sx < 3; ++sx) {
+                            // The ray through the sample, camera to world (R').
+                            const double cx = (x + (sx + 0.5) / 3 - W / 2.0) / f, cy = (y + (sy + 0.5) / 3 - H / 2.0) / f;
+                            const Vec3 d{R[0] * cx + R[3] * cy + R[6], R[1] * cx + R[4] * cy + R[7], R[2] * cx + R[5] * cy + R[8]};
+                            sum += shade(C, d);
+                        }
+                    const int g = int(std::lround(255 * sum / 9));
+                    img.setPixel(x, y, qRgb(g, g, g));
+                }
+            QVERIFY(img.save(dir + QStringLiteral("/shot_%1.png").arg(i + 1, 4, 10, QLatin1Char('0'))));
+        }
+        ImageSequence seq;
+        QVERIFY(detectImageSequence((dir + "/shot_0001.png").toStdString(), seq));
+        seq.fps = Rational{25, 1};
+        const std::string video = imageSequencePath(seq);
+
+        CameraSolve s;
+        std::string err;
+        std::vector<double> fractions;
+        QElapsedTimer clock;
+        clock.start();
+        QVERIFY2(solveMediaCamera(video, 0, frames / 25.0, {}, s, [&](double x, const char*) { fractions.push_back(x); }, nullptr, &err),
+                 err.c_str());
+        qInfo("solved the footage in %lld ms: focal %.1f, error %.3f px, %d keyframes, %zu points", qint64(clock.elapsed()), s.focal,
+              s.error, s.keyframes, s.points.size());
+        QCOMPARE(s.width, W);
+        QCOMPARE(s.height, H);
+        QCOMPARE(s.fps, 25.0);
+        QCOMPARE(int(s.cameras.size()), frames);
+        QVERIFY2(std::fabs(s.focal - f) < 0.05 * f, qPrintable(QString::number(s.focal)));
+        QVERIFY2(s.error < 1.0, qPrintable(QString::number(s.error)));
+        double place = 0, turn = 0;
+        pathMismatch(s, frames, place, turn);
+        QVERIFY2(place < 0.03 && turn < 0.5, qPrintable(QString("%1 %2").arg(place).arg(turn)));
+        QVERIFY(!fractions.empty() && fractions.back() == 1.0);
+        QVERIFY(std::is_sorted(fractions.begin(), fractions.end()));
+        // Stood on the ground: most of what was followed is on it.
+        QVERIFY(orientScene(s, 1.5));
+
+        // ---- On a clip, over MCP: solved and kept on the clip, a title placed on the ground stays there.
+        Project p = makeDefaultProject();
+        Sequence& sq = *p.active();
+        sq.width = W;
+        sq.height = H;
+        sq.fps = {25, 1};
+        MediaItem m = probeOrFail(p, video);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, sq, m.id, 0, 0, frames, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id footage = trackAt(sq, {TrackKind::Video, 0})->clips.at(0).id;
+        const QString project = QString::fromStdString(path("solve.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        const QJsonObject clipArgs{{"project", project}, {"clip", double(footage)}};
+        auto with = [&](QJsonObject extra) {
+            for (auto it = clipArgs.begin(); it != clipArgs.end(); ++it) extra.insert(it.key(), it.value());
+            return extra;
+        };
+        QJsonObject r = call("montage_camera_track", with({{"action", "info"}}));
+        QVERIFY(r.value("isError").toBool() && text(r).contains("not solved"));
+        r = call("montage_camera_track", clipArgs);
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QJsonObject sc = r.value("structuredContent").toObject();
+        QVERIFY2(std::fabs(sc.value("focal_px").toDouble() - f) < 0.05 * f, qPrintable(text(r)));
+        QCOMPARE(sc.value("frames_solved").toInt(), frames);
+        QVERIFY(sc.value("on_ground").toBool());
+        r = call("montage_camera_track", clipArgs);  // again: the one effect, its solve replaced
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Clip& solved = trackAt(*back.active(), {TrackKind::Video, 0})->clips.at(0);
+        QCOMPARE(std::count_if(solved.effects.begin(), solved.effects.end(), [](const Effect& e) { return e.type == "camera_track"; }), 1);
+        CameraSolve kept;
+        QVERIFY(clipCameraSolve(solved, kept));
+        QCOMPARE(cameraSolveFrame(*back.active(), solved, kept, 12), 12);
+        QCOMPARE(cameraSolveFrame(*back.active(), solved, kept, frames), -1);
+        // Given the lens: kept.
+        r = call("montage_camera_track", with({{"field_of_view", 70}}));
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(std::fabs(r.value("structuredContent").toObject().value("field_of_view").toDouble() - 70) < 1e-6);
+        r = call("montage_camera_track", clipArgs);
+        r = call("montage_camera_track", with({{"action", "info"}}));
+        QVERIFY2(!r.value("isError").toBool() && text(r).contains("Focal length"), qPrintable(text(r)));
+        // Placed on the ground at the bottom middle of the first frame: in the scene, where that ray meets the ground
+        // (y = 1.5); through the shot the title's middle (where its diagonals cross) is where that point is seen.
+        r = call("montage_camera_track", with({{"action", "place"}, {"text", "Hello"}, {"x", 0.5}, {"y", 0.8}, {"size", 0.3}}));
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const Id titleId = Id(r.value("structuredContent").toObject().value("id").toDouble());
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Sequence& bs = *back.active();
+        const Clip* title = edit::clipById(bs, titleId);
+        QVERIFY(title);
+        QCOMPARE(edit::locate(bs, titleId)->track.index, 1);
+        QCOMPARE(title->generator.strings.at("text"), std::string("Hello"));
+        QCOMPARE(title->duration, FrameTime(frames));
+        const Effect* pin = nullptr;
+        for (const Effect& e : title->effects)
+            if (e.type == "corner_pin") pin = &e;
+        QVERIFY(pin);
+        std::array<double, 9> R;
+        Vec3 C;
+        sceneCamera(0, R, C);
+        const double rx = 0, ry = (0.8 * H - H / 2.0) / f;
+        const Vec3 d{R[0] * rx + R[3] * ry + R[6], R[1] * rx + R[4] * ry + R[7], R[2] * rx + R[5] * ry + R[8]};
+        const double t = (1.5 - C.y) / d.y;
+        const Vec3 spot{C.x + t * d.x, 1.5, C.z + t * d.z};
+        for (int i : {0, frames / 2, frames - 1}) {
+            sceneCamera(double(i) / (frames - 1), R, C);
+            Point2 truth;
+            QVERIFY(sceneProject(R, C, f, W, H, spot, truth));
+            const TrackQuad q = cornerPinQuad(*pin, i);
+            // The diagonals tl-br and tr-bl cross at the rectangle's middle.
+            const Point2 a{q.p[0].x * W, q.p[0].y * H}, b{q.p[2].x * W, q.p[2].y * H}, c2{q.p[1].x * W, q.p[1].y * H}, e2{q.p[3].x * W, q.p[3].y * H};
+            const double den = (a.x - b.x) * (c2.y - e2.y) - (a.y - b.y) * (c2.x - e2.x);
+            QVERIFY(std::fabs(den) > 1e-9);
+            const double u = ((a.x - c2.x) * (c2.y - e2.y) - (a.y - c2.y) * (c2.x - e2.x)) / den;
+            const Point2 mid{a.x + u * (b.x - a.x), a.y + u * (b.y - a.y)};
+            QVERIFY2(std::hypot(mid.x - truth.x, mid.y - truth.y) < 3,
+                     qPrintable(QString("frame %1: %2,%3 against %4,%5").arg(i).arg(mid.x).arg(mid.y).arg(truth.x).arg(truth.y)));
+        }
+        // Not on the sky, nor outside the clip; and the effect is not added bare.
+        r = call("montage_camera_track", with({{"action", "place"}, {"y", 0.02}}));
+        QVERIFY2(r.value("isError").toBool() && text(r).contains("not on the ground"), qPrintable(text(r)));
+        r = call("montage_camera_track", with({{"action", "place"}, {"at", 1000}}));
+        QVERIFY(r.value("isError").toBool());
+        r = call("montage_add_effect", with({{"effect", "camera_track"}}));
+        QVERIFY2(r.value("isError").toBool() && text(r).contains("montage_camera_track"), qPrintable(text(r)));
+        // Exported for other programs.
+        const QString chan = QString::fromStdString(path("shot.chan")), ply = QString::fromStdString(path("shot.ply"));
+        r = call("montage_camera_track", with({{"action", "export"}, {"chan", chan}, {"ply", ply}, {"first_frame", 1001}}));
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(QFileInfo(chan).size() > 0 && QFileInfo(ply).size() > 0);
+        r = call("montage_camera_track", with({{"action", "export"}}));
+        QVERIFY(r.value("isError").toBool());
+
+        // Stopped part way: no solve.
+        std::atomic<bool> stop{true};
+        QVERIFY(!solveMediaCamera(video, 0, frames / 25.0, {}, s, {}, &stop, &err));
+        QCOMPARE(err, std::string("Cancelled"));
+    }
+
+    // Writes `text` to `file` (folders made).
+    static void writeText(const QString& file, const QString& text) {
+        QDir().mkpath(QFileInfo(file).absolutePath());
+        QFile f(file);
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write(text.toUtf8());
+    }
+
+    void ografGraphics() {
+        // A real-time lower third: a red bar (its colour from the data) wipes in over a second with a CSS transition and
+        // out again on stop; a blue dot moves 100 px a second on animation frames, and drops 20 px after half a second
+        // on a timer. Its element draws in a shadow root.
+        // (tests/data/ograf/lower-third)
+        const QString dir = QString::fromStdString(path("ograf"));
+        const QString lower = QStringLiteral(MONTAGE_TEST_DATA_DIR "/ograf/lower-third/lower.ograf.json");
+        OGrafGraphic g;
+        std::string err;
+        QVERIFY(isOGrafManifest(lower.toStdString()) && !isOGrafManifest("lower.json"));
+        QVERIFY2(readOGraf(lower.toStdString(), g, &err), err.c_str());
+        QCOMPARE(g.name, std::string("Lower Third"));
+        QCOMPARE(g.main, std::string("lib/graphic.mjs"));
+        QVERIFY(g.realTime && !g.nonRealTime && g.stepCount == 1);
+        QCOMPARE(g.fields.size(), size_t(7));
+        std::map<std::string, OGrafField> fields;
+        for (const OGrafField& f : g.fields) fields[f.key] = f;
+        QCOMPARE(fields["name"].title, std::string("Name"));
+        QVERIFY(fields["role"].multiline && fields["role"].type == "string");
+        QCOMPARE(fields["color"].choices.size(), size_t(2));
+        QCOMPARE(fields["size"].type, std::string("number"));
+        QCOMPARE(fields["count"].type, std::string("integer"));
+        QCOMPARE(fields["show"].type, std::string("boolean"));
+        QCOMPARE(fields["extra"].type, std::string("json"));
+        QCOMPARE(g.customActions.size(), size_t(1));
+        const QJsonObject defaults = QJsonDocument::fromJson(QByteArray::fromStdString(ografDefaultData(g))).object();
+        QCOMPARE(defaults.value("name").toString(), QString("Ada Lovelace"));
+        QCOMPARE(defaults.value("size").toDouble(), 40.0);
+        QCOMPARE(defaults.value("extra").toObject().value("a").toInt(), 1);
+        QVERIFY(!defaults.contains("role"));
+        writeText(dir + "/bad.ograf.json", R"~({"name": "No module"})~");
+        QVERIFY(!readOGraf((dir + "/bad.ograf.json").toStdString(), g, &err) && QString::fromStdString(err).contains("main"));
+        QVERIFY(!readOGraf((dir + "/none.ograf.json").toStdString(), g, &err));
+
+        if (ografBrowser().empty()) QSKIP("No Chrome, Chromium or Edge to render OGraf graphics in (set MONTAGE_CHROMIUM)");
+        qputenv("MONTAGE_OGRAF_CACHE", path("ograf-cache").c_str());
+        struct Unset {
+            ~Unset() { qunsetenv("MONTAGE_OGRAF_CACHE"); }
+        } unset;
+
+        // Rendered over 2 s at 25 fps, 320 x 180, played in at the start and out at 1 s.
+        OGrafJob job;
+        job.manifest = lower.toStdString();
+        job.data = R"~({"color": "rgb(255, 0, 0)"})~";
+        job.width = 320;
+        job.height = 180;
+        job.fps = 25;
+        job.frames = 50;
+        job.actions = {{0, "playAction", R"~({"delta": 1})~"}, {1.0, "stopAction", "{}"}};
+        const std::string frames = path("ograf-frames");
+        std::vector<double> fractions;
+        QElapsedTimer clock;
+        clock.start();
+        QVERIFY2(renderOGraf(job, frames, [&](double f) { fractions.push_back(f); }, nullptr, &err), err.c_str());
+        qInfo("rendered 50 frames in %lld ms", qint64(clock.elapsed()));
+        QCOMPARE(fractions.size(), size_t(50));
+        auto frame = [&](int i) {
+            QImage q(QString::fromStdString(frames) + QStringLiteral("/frame_%1.png").arg(i, 5, 10, QLatin1Char('0')));
+            return q.convertToFormat(QImage::Format_RGBA8888);
+        };
+        // The bar's right end (its row at y = 120), and the dot's left edge and top.
+        auto barEnd = [](const QImage& q) {
+            int end = -1;
+            for (int x = 0; x < q.width(); ++x) {
+                const QColor c = q.pixelColor(x, 120);
+                if (c.alpha() > 128 && c.red() > 200 && c.blue() < 60) end = x;
+            }
+            return end;
+        };
+        auto dot = [](const QImage& q, int& left, int& top) {
+            left = top = -1;
+            for (int y = 0; y < q.height() && left < 0; ++y)
+                for (int x = 0; x < q.width(); ++x) {
+                    const QColor c = q.pixelColor(x, y);
+                    if (c.alpha() > 128 && c.blue() > 200 && c.red() < 60) {
+                        left = x;
+                        top = y;
+                        break;
+                    }
+                }
+        };
+        const QImage f0 = frame(0), f10 = frame(10), f25 = frame(25), f40 = frame(40);
+        QCOMPARE(f0.size(), QSize(320, 180));
+        QCOMPARE(f0.pixelColor(300, 170).alpha(), 0);  // transparent where nothing is drawn
+        QVERIFY2(barEnd(f0) < 33, qPrintable(QString::number(barEnd(f0))));
+        // 0.4 s in: the wipe is 40 % across (80 px of 200), the dot 40 px along and not yet dropped.
+        QVERIFY2(std::abs(barEnd(f10) - (32 + 80 - 1)) <= 2, qPrintable(QString::number(barEnd(f10))));
+        int left = 0, top = 0;
+        dot(f10, left, top);
+        QVERIFY2(std::abs(left - 40) <= 1 && top == 0, qPrintable(QString("%1 %2").arg(left).arg(top)));
+        // 1 s: all the way, the dot at 100 px and dropped; then out over the next second (1.6 s: 40 % left).
+        QVERIFY2(std::abs(barEnd(f25) - (32 + 200 - 1)) <= 2, qPrintable(QString::number(barEnd(f25))));
+        dot(f25, left, top);
+        QVERIFY2(std::abs(left - 100) <= 1 && top == 20, qPrintable(QString("%1 %2").arg(left).arg(top)));
+        QVERIFY2(std::abs(barEnd(f40) - (32 + 80 - 1)) <= 2, qPrintable(QString::number(barEnd(f40))));
+        // The same again: exactly the same pixels (a clock of its own, not the computer's).
+        const std::string again = path("ograf-again");
+        QVERIFY2(renderOGraf(job, again, {}, nullptr, &err), err.c_str());
+        QCOMPARE(QImage(QString::fromStdString(again) + "/frame_00010.png").convertToFormat(QImage::Format_RGBA8888), f10);
+
+        // A graphic that can go to any time is told each frame's: a green bar 1 px per 10 ms, blue once played.
+        const QString seekable = QStringLiteral(MONTAGE_TEST_DATA_DIR "/ograf/seek/seek.ograf.json");
+        OGrafJob seekJob = job;
+        seekJob.manifest = seekable.toStdString();
+        seekJob.frames = 20;
+        seekJob.actions = {{0.5, "playAction", "{}"}};
+        const std::string seekFrames = path("seek-frames");
+        QVERIFY2(renderOGraf(seekJob, seekFrames, {}, nullptr, &err), err.c_str());
+        auto widthAt = [&](int i, QColor& colour) {
+            const QImage q = QImage(QString::fromStdString(seekFrames) + QStringLiteral("/frame_%1.png").arg(i, 5, 10, QLatin1Char('0')))
+                                 .convertToFormat(QImage::Format_RGBA8888);
+            int w = 0;
+            while (w < q.width() && q.pixelColor(w, 5).alpha() > 128) ++w;
+            colour = q.pixelColor(0, 5);
+            return w;
+        };
+        QColor colour;
+        QCOMPARE(widthAt(5, colour), 20);  // 200 ms
+        QVERIFY(colour.green() > 200);
+        QCOMPARE(widthAt(15, colour), 60);  // 600 ms: played
+        QVERIFY(colour.blue() > 200);
+
+        // A graphic that fails says why; so does a missing browser.
+        writeText(dir + "/broken/broken.ograf.json", R"~({"name": "Broken", "main": "b.mjs"})~");
+        writeText(dir + "/broken/b.mjs", "export default class B extends HTMLElement { async load() { throw new Error('No data feed'); } }");
+        OGrafJob broken = job;
+        broken.manifest = (dir + "/broken/broken.ograf.json").toStdString();
+        broken.frames = 2;
+        QVERIFY(!renderOGraf(broken, path("broken-frames"), {}, nullptr, &err));
+        QVERIFY2(QString::fromStdString(err).contains("No data feed"), err.c_str());
+        writeText(dir + "/nomodule/n.ograf.json", R"~({"name": "Missing", "main": "gone.mjs"})~");
+        broken.manifest = (dir + "/nomodule/n.ograf.json").toStdString();
+        QVERIFY(!renderOGraf(broken, path("broken-frames"), {}, nullptr, &err) && !err.empty());
+        {
+            const QByteArray browser = qgetenv("MONTAGE_CHROMIUM");
+            qputenv("MONTAGE_CHROMIUM", "/nonexistent/chrome");
+            QVERIFY(!renderOGraf(job, path("none-frames"), {}, nullptr, &err));
+            QVERIFY2(QString::fromStdString(err).contains("Chrome"), err.c_str());
+            if (browser.isEmpty()) qunsetenv("MONTAGE_CHROMIUM");
+            else qputenv("MONTAGE_CHROMIUM", browser);
+        }
+        std::atomic<bool> stop{true};
+        QVERIFY(!renderOGraf(job, path("stopped-frames"), {}, &stop, &err));
+        QCOMPARE(err, std::string("Cancelled"));
+        // An action that fails says so; data holding "%2" is passed as it is.
+        writeText(dir + "/cue/cue.ograf.json", "{\"name\": \"Cue\", \"main\": \"cue.mjs\"}");
+        writeText(dir + "/cue/cue.mjs", "export default class C extends HTMLElement { async load({ data }) { this.textContent = data.t; "
+                                        "if (data.t !== 'a%2Fb%1') throw new Error('Data changed: ' + data.t); } "
+                                        "async playAction() { throw new Error('No cue'); } }");
+        broken.manifest = (dir + "/cue/cue.ograf.json").toStdString();
+        broken.data = R"~({"t": "a%2Fb%1"})~";
+        QVERIFY(!renderOGraf(broken, path("cue-frames"), {}, nullptr, &err));
+        QVERIFY2(QString::fromStdString(err).contains("playAction: No cue"), err.c_str());
+
+        // On the timeline: an OGraf Graphic clip over 2 s plays in at its start and out a second before its end; its
+        // frames are rendered once (cached) and drawn at the preview's size too.
+        Project p = makeDefaultProject();
+        Sequence& sq = *p.active();
+        sq.width = 320;
+        sq.height = 180;
+        sq.fps = {25, 1};
+        Clip c = makeGeneratorClip(p, "ograf", 50);
+        c.generator.strings["manifest"] = lower.toStdString();
+        c.generator.strings["data"] = R"~({"color": "rgb(255, 0, 0)"})~";
+        QVERIFY(edit::overwrite(p, sq, {TrackKind::Video, 0}, c).ok);
+        const Clip& placed = sq.videoTracks[0].clips.at(0);
+        const OGrafJob clipJob = ografClipJob(placed.generator, 320, 180, 25, 50);
+        QCOMPARE(clipJob.actions.size(), size_t(2));
+        QCOMPARE(clipJob.actions[1].type, std::string("stopAction"));
+        QCOMPARE(clipJob.actions[1].at, 1.0);
+        QVERIFY(!ografCached(clipJob));
+        RenderOptions o;
+        const Image at10 = renderSequenceFrame(p, sq, 10, o);
+        QVERIFY(ografCached(clipJob));
+        auto red = [](const Image& img, int x, int y) { const float* px = img.at(x, y); return px[0] > 0.8f && px[1] < 0.2f && px[3] > 0.9f; };
+        QVERIFY(red(at10, 100, 120) && !red(at10, 130, 120));  // 0.4 s: the wipe 80 px across from 32
+        clock.restart();
+        const Image at25 = renderSequenceFrame(p, sq, 25, o);
+        QVERIFY(clock.elapsed() < 2000);  // (from the cache)
+        QVERIFY(red(at25, 220, 120));
+        o.scale = 0.5;
+        const Image half = renderSequenceFrame(p, sq, 25, o);
+        QCOMPARE(half.width, 160);
+        QVERIFY(red(half, 110, 60));
+        // Scaled down to a third on the timeline: still the sequence-size render, not one of its own.
+        auto renders = [&] { return QDir(QString::fromStdString(path("ograf-cache"))).entryList(QDir::Dirs | QDir::NoDotAndDotDot).size(); };
+        const auto before = renders();
+        o.scale = 1;
+        sq.videoTracks[0].clips.at(0).motion.params["scale"] = Param(33.0);
+        renderSequenceFrame(p, sq, 25, o);
+        QCOMPARE(renders(), before);
+        sq.videoTracks[0].clips.at(0).motion.params["scale"] = Param(100.0);
+        // Its own actions instead: played in at 0.2 s and never out.
+        Effect custom = placed.generator;
+        custom.strings["actions"] = R"~([{"at": 0.2, "type": "playAction", "params": {"delta": 1}}])~";
+        const OGrafJob customJob = ografClipJob(custom, 320, 180, 25, 50);
+        QCOMPARE(customJob.actions.size(), size_t(1));
+        QCOMPARE(customJob.actions[0].at, 0.2);
+        QVERIFY(ografCacheFolder(customJob) != ografCacheFolder(clipJob));
+        // Changed data renders again; a clip with no graphic draws nothing.
+        Effect blue = placed.generator;
+        blue.strings["data"] = R"~({"color": "rgb(0, 255, 0)"})~";
+        QVERIFY(ografCacheFolder(ografClipJob(blue, 320, 180, 25, 50)) != ografCacheFolder(clipJob));
+        Effect none = placed.generator;
+        none.strings.erase("manifest");
+        QVERIFY(ografCacheFolder(ografClipJob(none, 320, 180, 25, 50)).empty());
+        const Image empty = ografFrame(none, 10, 320, 180, 320, 180, 50, 25);
+        QCOMPARE(empty.at(100, 120)[3], 0.0f);
+
+        // Through MCP: a graphic's fields, added with some of its data, changed, and rendered (or why not).
+        const QString project = QString::fromStdString(path("ograf.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_ograf"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        QJsonObject r = call({{"action", "info"}, {"manifest", lower}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QJsonObject sc = r.value("structuredContent").toObject();
+        QCOMPARE(sc.value("fields").toArray().size(), 7);
+        QCOMPARE(sc.value("defaults").toObject().value("name").toString(), QString("Ada Lovelace"));
+        r = call({{"action", "info"}, {"manifest", dir + "/bad.ograf.json"}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"project", project}, {"manifest", lower}, {"at", 3}, {"duration", 2}, {"data", QJsonObject{{"color", "rgb(0, 255, 0)"}}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const Id added = Id(r.value("structuredContent").toObject().value("id").toDouble());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Clip* made = edit::clipById(*back.active(), added);
+        QVERIFY(made && made->generator.type == "ograf" && made->name == "Lower Third");
+        QJsonObject data = QJsonDocument::fromJson(QByteArray::fromStdString(made->generator.s("data"))).object();
+        QCOMPARE(data.value("color").toString(), QString("rgb(0, 255, 0)"));
+        QCOMPARE(data.value("name").toString(), QString("Ada Lovelace"));  // (the defaults beneath)
+        r = call({{"project", project}, {"action", "set"}, {"clip", double(added)}, {"data", QJsonObject{{"name", "Grace Hopper"}}},
+                  {"actions", QJsonArray{QJsonObject{{"at", 0}, {"type", "playAction"}}}}, {"out", 0}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(loadProject(project.toStdString(), back));
+        made = edit::clipById(*back.active(), added);
+        data = QJsonDocument::fromJson(QByteArray::fromStdString(made->generator.s("data"))).object();
+        QCOMPARE(data.value("name").toString(), QString("Grace Hopper"));
+        QCOMPARE(data.value("color").toString(), QString("rgb(0, 255, 0)"));
+        QVERIFY(made->generator.s("actions").find("playAction") != std::string::npos);
+        r = call({{"project", project}, {"action", "set"}, {"clip", double(added)}, {"actions", QJsonArray{QJsonObject{{"type", "dance"}}}}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"project", project}, {"action", "set"}, {"clip", double(added)},
+                  {"actions", QJsonArray{QJsonObject{{"at", 0}, {"type", "playAction"}, {"params", 1}}}}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"project", project}, {"action", "render"}, {"clip", double(added)}});
+        QVERIFY2(!r.value("isError").toBool() && text(r).startsWith("Rendered"), qPrintable(text(r)));
+        r = call({{"project", project}, {"action", "render"}, {"clip", double(added)}});
+        QVERIFY2(text(r) == "Already rendered", qPrintable(text(r)));
+        r = call({{"project", project}, {"action", "set"}, {"clip", double(added)}, {"manifest", dir + "/broken/broken.ograf.json"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call({{"project", project}, {"action", "render"}, {"clip", double(added)}});
+        QVERIFY2(r.value("isError").toBool() && text(r).contains("No data feed"), qPrintable(text(r)));
     }
 
     void multicamSpeakerSwitchAndAudioAngles() {
@@ -17400,7 +18928,10 @@ private slots:
             const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
             return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
         };
-        QJsonObject r = call({{"project", project}, {"voice", "am_michael"}});
+        // Not into Japanese in a cloned voice (as the app: translations come in kanji, which it cannot read).
+        QJsonObject r = call({{"project", project}, {"voice", "clone"}, {"to", "Japanese"}, {"consent", true}});
+        QVERIFY(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("kanji"));
+        r = call({{"project", project}, {"voice", "am_michael"}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         QCOMPARE(r.value("structuredContent").toObject().value("audio_track").toString(), QStringLiteral("A%1").arg(tracks + 1));
         Project back;

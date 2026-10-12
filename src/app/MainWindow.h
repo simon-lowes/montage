@@ -44,6 +44,7 @@ class RedactFacesDialog;
 class EditorState;
 class CompareDialog;
 class CleanFeedWindow;
+class ReferenceOutputController;
 struct ConsolidateOptions;
 class PlaybackController;
 class MonitorPanel;
@@ -51,6 +52,7 @@ class MediaBinWidget;
 class RenderQueue;
 class EffectsBrowser;
 class InspectorWidget;
+class GradeNodePanel;
 class ScopesWidget;
 class MixerPanel;
 class ControlSurface;
@@ -109,6 +111,9 @@ public:
     // took the match. (Tests: chartDialogHook_ gets the dialog before it runs.)
     int matchColourChart();
     std::function<void(class ChartMatchDialog*)> chartDialogHook_;
+    // Clip › Correct Lens…: the selected clip's (or the one at the playhead's) lens profile chosen and its Lens
+    // Correction put on (app/LensCorrectionDialog.h; tests reach the dialog through lensDialogHook()).
+    bool correctLens();
     // Split-screen compare in the Program monitor: the reference beside the current frame.
     void setCompareWithReference(bool on);
     void scriptCutDialog();  // Sequence › Build Cut from Script…
@@ -425,6 +430,10 @@ private:
     // Imports an OTIO, EDL or FCP XML timeline as a new sequence (one undo step).
     void importTimeline();
     void addTitle();
+public:
+    // Adds the OGraf graphic `file` (asked for when "") at the playhead, its data its defaults; the clip, or 0.
+    Id addOGrafGraphic(const QString& file = {});
+private:
     void newSequence();
     void openInSource(Id media);
     Id makeSubclip();
@@ -433,6 +442,7 @@ private:
     void offerRecovery(const std::vector<RecoveryManager::Session>& crashed);
     void openSnapshot();
     void showShortcuts();
+    void showReferenceOutput();
     void about();
 
     EditorState* state_;
@@ -462,6 +472,9 @@ private:
     InspectorWidget* inspector_ = nullptr;
     ScopesWidget* scopes_ = nullptr;
     CleanFeedWindow* cleanFeed_ = nullptr;
+    // Playback › Video Output › Reference Output…: the Program to a DeckLink card or over NDI.
+    ReferenceOutputController* referenceOutput_ = nullptr;
+    QAction* referenceOutputAction_ = nullptr;
     MixerPanel* mixer_ = nullptr;
     ControlSurface* surface_ = nullptr;
     OscControl* osc_ = nullptr;
@@ -521,6 +534,8 @@ private:
     QDockWidget* adrDock_ = nullptr;
     QDockWidget* queueDock_ = nullptr;
     QDockWidget* keyframesDock_ = nullptr;
+    QDockWidget* nodesDock_ = nullptr;
+    GradeNodePanel* gradeNodes_ = nullptr;
     QDockWidget* meterDock_ = nullptr;
     RenderQueue* queue_ = nullptr;
     Image colourRef_;       // the look Match Colour aims for

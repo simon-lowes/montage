@@ -1,4 +1,5 @@
 #include "RenderCache.h"
+#include "core/GradeGraph.h"
 #include "media/Proxy.h"
 
 #include <QCryptographicHash>
@@ -87,6 +88,15 @@ void addClipAt(QCryptographicHash& h, const Project& p, const Sequence& seq, con
         for (const auto* chain : {&g->pre, &g->post}) {
             h.addData(chain == &g->pre ? QByteArray("|pre") : QByteArray("|post"));
             for (Effect e : *chain) {
+                e.id = 0;
+                h.addData(QByteArray::fromStdString(effectToJsonString(e)));
+            }
+        }
+    // And the shared grade nodes its graph uses (the graph itself is in the clip's settings).
+    for (const GradeNode& n : c.grade.nodes)
+        if (const SharedNode* sn = findSharedNode(seq, n.shared)) {
+            h.addData(QByteArray("|shared"));
+            for (Effect e : sn->effects) {
                 e.id = 0;
                 h.addData(QByteArray::fromStdString(effectToJsonString(e)));
             }
@@ -238,7 +248,7 @@ std::vector<std::pair<FrameTime, FrameTime>> rangesToRender(const Sequence& seq)
     for (const Track& t : seq.videoTracks) {
         if (t.muted) continue;
         for (const Clip& c : t.clips)
-            if (c.enabled && (!c.effects.empty() || (c.isGenerator() && c.generator.type != "color" && c.generator.type != "adjustment")))
+            if (c.enabled && (!c.effects.empty() || !c.grade.empty() || (c.isGenerator() && c.generator.type != "color" && c.generator.type != "adjustment")))
                 spans.push_back({c.start, c.end()});
         for (const Transition& tr : t.transitions) {
             FrameTime a = 0, b = 0;

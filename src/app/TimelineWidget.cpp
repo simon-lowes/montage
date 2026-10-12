@@ -24,6 +24,7 @@
 #include <utility>
 
 #include "EditorState.h"
+#include "LensCorrectionDialog.h"
 #include "ModelPacks.h"
 #include "StackedTimelineWidget.h"
 #include "render/Exporter.h"
@@ -2545,6 +2546,12 @@ void TimelineWidget::dropEffect(const QString& typeQ, const QPoint& pos) {
     const EffectInfo* info = findEffectInfo(type);
     const bool plugin = plugins::isPluginType(type);
     if ((!info && !plugin) || !s) return;
+    if (type == "lens_correction") {
+        // Which lens first (it goes first on the clip): Clip > Correct Lens...
+        const Hit hit = hitTest(pos);
+        if (hit.clip) correctLens(window(), state_, hit.clip);
+        return;
+    }
     if (!ensureEffectModel(window(), type)) return;
     s = state_->sequence();  // the download waited in an event loop
     if (!s) return;

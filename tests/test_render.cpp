@@ -18,12 +18,14 @@
 #include "core/ClipAnimation.h"
 #include "core/ColorGroups.h"
 #include "core/GradeVersions.h"
+#include "core/GradeGraph.h"
 #include "core/Captions.h"
 #include "core/EditOps.h"
 #include "core/GraphicsTemplate.h"
 #include "core/Effects.h"
 #include "core/MaskPath.h"
 #include "render/ColorChart.h"
+#include "core/LensProfile.h"
 #include "render/ColorSpace.h"
 #include "render/HdrView.h"
 #include "render/Compositor.h"
@@ -52,7 +54,15 @@
 #include "core/Transcript.h"
 #include "render/VideoDenoise.h"
 #include "render/VideoFx.h"
+#include "render/VideoPacking.h"
+#include "render/ReferenceOutput.h"
+#include "audio/DynLib.h"
 #include <random>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
+}
 
 using namespace montage;
 
@@ -4441,6 +4451,150 @@ colorspaces:
         }
     }
 
+    void gradeNodeGraphs() {
+        // A grey shot (0.25) graded through nodes; each result checked against the same effect run alone as a stack.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36;
+        Clip grey = makeGeneratorClip(p, "color", 10);
+        for (const char* k : {"color.r", "color.g", "color.b"}) grey.generator.params[k] = 0.25;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, grey).ok);
+        const Id id = s.videoTracks[0].clips[0].id;
+        auto clip = [&]() -> Clip& { return *edit::clipById(s, id); };
+        Effect gain = makeEffect(p, "color_correct");
+        gain.params["gain"] = 2.0;
+        Effect invert = makeEffect(p, "invert");
+        RenderOptions o;
+        auto at = [&](const Sequence& seq, int x, int y) {
+            const Image img = renderProgramFrame(p, seq, 2, o);
+            const float* v = img.at(x, y);
+            return v[0];
+        };
+        auto stackOf = [&](std::vector<Effect> fx) {
+            Sequence alone = s;
+            Clip& c = alone.videoTracks[0].clips[0];
+            c.effects = std::move(fx);
+            c.grade = {};
+            return alone;
+        };
+        const float plain = at(stackOf({}), 32, 18), gained = at(stackOf({gain}), 32, 18), inverted = at(stackOf({invert}), 32, 18);
+        QVERIFY(gained > plain + 0.1f && inverted > plain + 0.1f && std::fabs(gained - inverted) > 0.01f);
+        auto near = [](float a, float b) { return std::fabs(a - b) < 2e-4f; };
+        // A rectangle over the left (or right) half, as a node's window.
+        auto half = [&](int node, bool left) {
+            Effect st = makeEffect(p, "grade_node");
+            st.node = node;
+            st.params["mask.shape"] = 2.0;
+            st.params["mask.x"] = left ? 0.25 : 0.75;
+            st.params["mask.w"] = 0.5;
+            st.params["mask.h"] = 2.0;
+            st.params["mask.feather"] = 0.0;
+            return st;
+        };
+
+        // In series, converted from the stack: the same picture.
+        Effect curves = makeEffect(p, "hue_sat");
+        curves.params["saturation"] = 50.0;
+        clip().effects = {gain, curves};
+        const float stacked = at(s, 32, 18);
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        QCOMPARE(at(s, 32, 18), stacked);
+
+        // Parallel: gain on the left, invert on the right; unkeyed, their average.
+        QVERIFY(edit::flattenGrade(s, id).ok);
+        clip().effects = {gain};
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        int right = 0;
+        QVERIFY(edit::addGradeNode(p, s, id, edit::NodeHow::Parallel, 1, &right).ok);
+        Effect inv = invert;
+        inv.node = right;
+        clip().effects.push_back(inv);
+        QVERIFY2(near(at(s, 32, 18), (gained + inverted) / 2), qPrintable(QString::number(at(s, 32, 18))));
+        clip().effects.push_back(half(1, true));
+        clip().effects.push_back(half(right, false));
+        QVERIFY2(near(at(s, 8, 18), gained), qPrintable(QString::number(at(s, 8, 18))));
+        QVERIFY2(near(at(s, 56, 18), inverted), qPrintable(QString::number(at(s, 56, 18))));
+        // Its LUT: a window is about where a colour is, so those nodes are named as left out (and the LUT is the input).
+        std::vector<std::string> skipped;
+        const Lut3D lut = bakeClipLut(s, clip(), 2, 9, &skipped);
+        QCOMPARE(skipped.size(), size_t(2));
+        QVERIFY(std::fabs(lut.data[(1 + 9 * (1 + 9 * 1)) * 3] - 0.125f) < 1e-4f);
+        // Unkeyed, the LUT holds the average.
+        std::erase_if(clip().effects, [](const Effect& e) { return e.type == "grade_node"; });
+        skipped.clear();
+        const Lut3D both = bakeClipLut(s, clip(), 2, 9, &skipped);
+        QVERIFY(skipped.empty());
+        Image one(1, 1);
+        one.px = {0.25f, 0.25f, 0.25f, 1.0f};
+        Image viaGain = one, viaInvert = one;
+        applyVideoEffect(gain, 2, viaGain, 1.0);
+        applyVideoEffect(invert, 2, viaInvert, 1.0);
+        const float expect = (viaGain.px[0] + viaInvert.px[0]) / 2;
+        QVERIFY2(std::fabs(lut.data.size() ? both.data[(2 + 9 * (2 + 9 * 2)) * 3] - expect : 1) < 1e-4f,
+                 qPrintable(QString::number(both.data[(2 + 9 * (2 + 9 * 2)) * 3])));
+
+        // Layer: invert over the picture where its window is.
+        QVERIFY(edit::flattenGrade(s, id).ok);
+        clip().effects = {};
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        int top = 0;
+        QVERIFY(edit::addGradeNode(p, s, id, edit::NodeHow::Layer, 1, &top).ok);
+        inv.node = top;
+        clip().effects = {inv, half(top, true)};
+        QVERIFY(near(at(s, 8, 18), inverted) && near(at(s, 56, 18), plain));
+        // A multiply blend: the picture times the inverted one, on the left.
+        for (GradeNode& n : clip().grade.nodes)
+            if (n.kind == "layer") n.blend = {"multiply"};
+        QVERIFY2(near(at(s, 8, 18), plain * inverted) || std::fabs(at(s, 8, 18) - plain * inverted) < 0.02f, qPrintable(QString::number(at(s, 8, 18))));
+
+        // Outside: gain inside node 1's left half, invert outside it.
+        QVERIFY(edit::flattenGrade(s, id).ok);
+        clip().effects = {};
+        Effect g1 = gain;
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        g1.node = 1;
+        clip().effects = {g1, half(1, true)};
+        int outside = 0;
+        QVERIFY(edit::addGradeNode(p, s, id, edit::NodeHow::Outside, 1, &outside).ok);
+        inv.node = outside;
+        clip().effects.push_back(inv);
+        QVERIFY2(near(at(s, 8, 18), gained), qPrintable(QString::number(at(s, 8, 18))));
+        QVERIFY2(near(at(s, 56, 18), inverted), qPrintable(QString::number(at(s, 56, 18))));
+
+        // A key input: node 1 only chooses the left half (no effects), its key limits node 2's invert.
+        QVERIFY(edit::flattenGrade(s, id).ok);
+        clip().effects = {};
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        int second = 0;
+        QVERIFY(edit::addGradeNode(p, s, id, edit::NodeHow::Serial, 1, &second).ok);
+        QVERIFY(edit::connectGradeNodes(s, id, {1, second, 1, true}).ok);
+        inv.node = second;
+        clip().effects = {half(1, true), inv};
+        QVERIFY(near(at(s, 8, 18), inverted) && near(at(s, 56, 18), plain));
+        // Switched off, a node passes its picture on; a mix of 0 too.
+        GradeNode off = *findGradeNode(clip().grade, second);
+        off.enabled = false;
+        QVERIFY(edit::setGradeNode(s, id, off).ok);
+        QVERIFY(near(at(s, 8, 18), plain));
+
+        // A shared node: one change seen on both clips using it.
+        QVERIFY(edit::flattenGrade(s, id).ok);
+        clip().effects = {gain};
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        Id shared = 0;
+        QVERIFY(edit::shareGradeNode(p, s, id, 1, "Look", &shared).ok);
+        Clip other = grey;
+        other.id = p.newId();
+        other.start = 10;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, other).ok);
+        const Id otherId = s.videoTracks[0].clips[1].id;
+        QVERIFY(edit::useSharedNode(p, s, otherId, shared).ok);
+        auto atTime = [&](FrameTime t) { return renderProgramFrame(p, s, t, o).at(32, 18)[0]; };
+        QVERIFY(near(atTime(2), gained) && near(atTime(12), gained));
+        edit::effectChain(s, shared)->front() = invert;
+        QVERIFY(near(atTime(2), inverted) && near(atTime(12), inverted));
+    }
+
     void colorGroupGrades() {
         // Two grey shots in a group: its pre-clip grade (gain x2) before each one's own (invert on the second), its
         // post-clip grade (tint) after.
@@ -4641,6 +4795,425 @@ colorspaces:
         Project empty = makeDefaultProject();
         empty.active()->colorSpace = "rec2100pq";
         QVERIFY(!measureLightLevels(empty, *empty.active(), 0, 0, l, &err) && err.find("empty") != std::string::npos);
+    }
+
+    void videoPacking() {
+        using namespace montage::video;
+        std::mt19937 rng(9);
+        // v210 as FFmpeg's encoder writes it, byte for byte (its last pixels in a row of 1280 and its padding, codes
+        // outside 4..1019 kept in), from random 10-bit pictures.
+        for (int w : {720, 1280, 1920, 2048, 3840, 1924}) {
+            const int h = 3;
+            Ycbcr422 pic(w, h);
+            std::uniform_int_distribution<int> any(0, 1023);
+            AVFrame* f = av_frame_alloc();
+            f->format = AV_PIX_FMT_YUV422P10LE;
+            f->width = w, f->height = h;
+            QVERIFY(av_frame_get_buffer(f, 0) == 0);
+            for (int y = 0; y < h; ++y) {
+                for (int x = 0; x < w; ++x) {
+                    const int v = any(rng);
+                    pic.y[size_t(y * w + x)] = uint16_t(v << 6);
+                    reinterpret_cast<uint16_t*>(f->data[0] + y * f->linesize[0])[x] = uint16_t(v);
+                }
+                for (int x = 0; x < w / 2; ++x) {
+                    const int u = any(rng), v = any(rng);
+                    pic.cb[size_t(y * (w / 2) + x)] = uint16_t(u << 6);
+                    pic.cr[size_t(y * (w / 2) + x)] = uint16_t(v << 6);
+                    reinterpret_cast<uint16_t*>(f->data[1] + y * f->linesize[1])[x] = uint16_t(u);
+                    reinterpret_cast<uint16_t*>(f->data[2] + y * f->linesize[2])[x] = uint16_t(v);
+                }
+            }
+            const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_V210);
+            QVERIFY(codec);
+            AVCodecContext* c = avcodec_alloc_context3(codec);
+            c->width = w, c->height = h, c->pix_fmt = AV_PIX_FMT_YUV422P10LE, c->time_base = {1, 25};
+            QVERIFY(avcodec_open2(c, codec, nullptr) == 0);
+            AVPacket* pkt = av_packet_alloc();
+            QVERIFY(avcodec_send_frame(c, f) == 0 && avcodec_receive_packet(c, pkt) == 0);
+            const size_t stride = v210RowBytes(w);
+            QCOMPARE(size_t(pkt->size), stride * h);
+            std::vector<uint8_t> ours(stride * h, 0xAB);
+            packV210(pic, ours.data(), stride);
+            QVERIFY2(std::memcmp(ours.data(), pkt->data, ours.size()) == 0, qPrintable(QString::number(w)));
+            av_packet_free(&pkt);
+            avcodec_free_context(&c);
+            av_frame_free(&f);
+        }
+        // UYVY as swscale packs 8-bit 4:2:2, and clipped to 1..254.
+        {
+            const int w = 64, h = 2;
+            Ycbcr422 pic(w, h);
+            std::vector<uint8_t> y8(w * h), u8(w / 2 * h), v8(w / 2 * h);
+            std::uniform_int_distribution<int> legal(1, 254);
+            for (size_t i = 0; i < y8.size(); ++i) pic.y[i] = uint16_t((y8[i] = uint8_t(legal(rng))) << 8);
+            for (size_t i = 0; i < u8.size(); ++i) {
+                pic.cb[i] = uint16_t((u8[i] = uint8_t(legal(rng))) << 8);
+                pic.cr[i] = uint16_t((v8[i] = uint8_t(legal(rng))) << 8);
+            }
+            SwsContext* sws = sws_getContext(w, h, AV_PIX_FMT_YUV422P, w, h, AV_PIX_FMT_UYVY422, SWS_POINT, nullptr, nullptr, nullptr);
+            QVERIFY(sws);
+            std::vector<uint8_t> want(w * 2 * h), ours(w * 2 * h);
+            const uint8_t* src[3] = {y8.data(), u8.data(), v8.data()};
+            const int srcStride[3] = {w, w / 2, w / 2};
+            uint8_t* dst[1] = {want.data()};
+            const int dstStride[1] = {w * 2};
+            sws_scale(sws, src, srcStride, 0, h, dst, dstStride);
+            sws_freeContext(sws);
+            packUyvy(pic, ours.data(), w * 2);
+            QVERIFY(ours == want);
+            pic.y[0] = 0, pic.cb[0] = 65535;
+            packUyvy(pic, ours.data(), w * 2);
+            QCOMPARE(int(ours[0]), 254);
+            QCOMPARE(int(ours[1]), 1);
+        }
+        // P216: 16-bit Y, then the Cb Cr pairs below it, little-endian, rows `stride` apart.
+        {
+            Ycbcr422 pic(4, 2);
+            for (size_t i = 0; i < pic.y.size(); ++i) pic.y[i] = uint16_t(0x1000 + i);
+            for (size_t i = 0; i < pic.cb.size(); ++i) pic.cb[i] = uint16_t(0x2000 + i), pic.cr[i] = uint16_t(0x3000 + i);
+            const size_t stride = 16;
+            std::vector<uint8_t> out(stride * 4, 0);
+            packP216(pic, out.data(), stride);
+            auto at = [&](size_t byte) { return int(out[byte] | out[byte + 1] << 8); };
+            QCOMPARE(at(0), 0x1000);
+            QCOMPARE(at(stride + 6), 0x1007);
+            QCOMPARE(at(stride * 2), 0x2000);      // Cb of row 0
+            QCOMPARE(at(stride * 2 + 2), 0x3000);  // Cr
+            QCOMPARE(at(stride * 3 + 4), 0x2003);  // row 1's second pair
+            QCOMPARE(at(stride * 3 + 6), 0x3003);
+        }
+        // 75 % colour bars in Y'CbCr: SMPTE RP 219's codes for BT.709 (white 721 512 512, yellow 674 176 543, cyan 581
+        // 589 176, green 534 253 207, magenta 251 771 817, red 204 435 848, blue 111 848 481), black 64 512 512.
+        {
+            const float bars[8][3] = {{0.75f, 0.75f, 0.75f}, {0.75f, 0.75f, 0}, {0, 0.75f, 0.75f}, {0, 0.75f, 0},
+                                      {0.75f, 0, 0.75f}, {0.75f, 0, 0}, {0, 0, 0.75f}, {0, 0, 0}};
+            const int want[8][3] = {{721, 512, 512}, {674, 176, 543}, {581, 589, 176}, {534, 253, 207},
+                                    {251, 771, 817}, {204, 435, 848}, {111, 848, 481}, {64, 512, 512}};
+            Image img(8 * 4, 2);
+            for (int y = 0; y < 2; ++y)
+                for (int x = 0; x < 32; ++x) {
+                    float* p = img.at(x, y);
+                    p[0] = bars[x / 4][0], p[1] = bars[x / 4][1], p[2] = bars[x / 4][2], p[3] = 1;
+                }
+            const Ycbcr422 yc = toYcbcr422(img, YcbcrMatrix::Bt709);
+            for (int b = 0; b < 8; ++b) {
+                // The middle of each bar (away from the chroma filter's edges).
+                const int x = b * 4 + 2;
+                const int got[3] = {(yc.y[size_t(x)] + 32) >> 6, (yc.cb[size_t(x / 2)] + 32) >> 6, (yc.cr[size_t(x / 2)] + 32) >> 6};
+                for (int k = 0; k < 3; ++k) QVERIFY2(std::abs(got[k] - want[b][k]) <= 1, qPrintable(QStringLiteral("bar %1 [%2]: %3").arg(b).arg(k).arg(got[k])));
+            }
+            // BT.2020's matrix: its white is the same, its red has more luma than BT.709's.
+            const Ycbcr422 wide = toYcbcr422(img, YcbcrMatrix::Bt2020);
+            QCOMPARE(wide.y[2], yc.y[2]);
+            QVERIFY(wide.y[22] > yc.y[22]);
+            // Packed as v210, a bar's codes as they are.
+            std::vector<uint8_t> packed(v210RowBytes(32) * 2);
+            packV210(yc, packed.data(), v210RowBytes(32));
+            const uint32_t w0 = packed[0] | packed[1] << 8 | packed[2] << 16 | uint32_t(packed[3]) << 24;
+            QCOMPARE(int(w0 >> 10 & 1023), (yc.y[0] + 32) >> 6);
+        }
+    }
+
+    void referenceOutput() {
+        using namespace montage::output;
+        // Modes: the sequence's own, progressive first; else its rate at the nearest larger size; none at a rate no
+        // mode has.
+        const std::vector<Mode> modes = standardModes();
+        QCOMPARE(QString::fromStdString(matchMode(modes, 1920, 1080, {25, 1})->name), QStringLiteral("1080p25"));
+        QCOMPARE(QString::fromStdString(matchMode(modes, 1920, 1080, {30000, 1001})->name), QStringLiteral("1080p29.97"));
+        QCOMPARE(QString::fromStdString(matchMode(modes, 1280, 720, {25, 1})->name), QStringLiteral("1080p25"));
+        QCOMPARE(QString::fromStdString(matchMode(modes, 1280, 720, {60000, 1001})->name), QStringLiteral("720p59.94"));
+        QCOMPARE(QString::fromStdString(matchMode(modes, 3840, 2160, {24000, 1001})->name), QStringLiteral("2160p23.98"));
+        QCOMPARE(QString::fromStdString(matchMode(modes, 8192, 4320, {25, 1})->name), QStringLiteral("4096x2160p25"));
+        QVERIFY(!matchMode(modes, 1920, 1080, {48, 1}));
+        QVERIFY(findMode(modes, "1080i50") && findMode(modes, "1080i50")->interlaced && findMode(modes, "1080i50")->fps == (Rational{25, 1}));
+        QVERIFY(findMode(modes, "2048x1080p24"));
+        // Timecode, drop-frame at 29.97.
+        const Timecode tc = timecodeOf(1800, {30000, 1001});
+        QVERIFY(tc.dropFrame && tc.minutes == 1 && tc.seconds == 0 && tc.frames == 2);
+        QCOMPARE(timecodeOf(90061, {25, 1}).hours, 1);
+
+        // The signal: the sequence's own (HDR needing 10 bits; P3 PQ as BT.2020 PQ; sRGB as BT.709), or BT.709.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = {25, 1}, s.sampleRate = 48000;
+        Config cfg;
+        Signal sig;
+        s.colorSpace = "rec2100pq";
+        s.hdrPeakNits = 1000;
+        QVERIFY(signalFor(s, cfg, PixelFormat::V210, sig));
+        QVERIFY(sig.eotf == Eotf::Pq && sig.bt2020 && sig.matrix == video::YcbcrMatrix::Bt2020 && sig.hdrMetadata);
+        QCOMPARE(sig.maxCll, 1000);
+        QCOMPARE(sig.maxFall, 400);
+        QCOMPARE(QString::fromStdString(ndiColorInfo(sig)), QStringLiteral("<ndi_color_info transfer=\"bt_2100_pq\" matrix=\"bt_2020\" primaries=\"bt_2020\"/>"));
+        std::string why;
+        QVERIFY(!signalFor(s, cfg, PixelFormat::Uyvy8, sig, &why) && QString::fromStdString(why).contains("10-bit"));
+        s.colorSpace = "p3d65pq";
+        QVERIFY(signalFor(s, cfg, PixelFormat::P216, sig) && sig.colorSpace == "rec2100pq" && sig.masteringP3);
+        s.colorSpace = "rec2100hlg";
+        QVERIFY(signalFor(s, cfg, PixelFormat::V210, sig) && sig.eotf == Eotf::Hlg && !sig.hdrMetadata);
+        cfg.rec709 = true;
+        QVERIFY(signalFor(s, cfg, PixelFormat::Uyvy8, sig) && sig.colorSpace == "rec709" && sig.eotf == Eotf::Sdr);
+        cfg.rec709 = false;
+        s.colorSpace = "srgb";
+        QVERIFY(signalFor(s, cfg, PixelFormat::V210, sig) && sig.colorSpace == "rec709" && !sig.bt2020);
+        s.colorSpace = "rec709";
+
+        // Framing: letterboxed, pillarboxed, cropped to fill.
+        Rect r = fitRect(1920, 800, 1920, 1080, Config::Scaling::Fit);
+        QVERIFY(r.x == 0 && r.y == 140 && r.width == 1920 && r.height == 800);
+        r = fitRect(1440, 1080, 1920, 1080, Config::Scaling::Fit);
+        QVERIFY(r.x == 240 && r.width == 1440);
+        r = fitRect(1280, 720, 1920, 1080, Config::Scaling::Fit);
+        QVERIFY(r.x == 0 && r.y == 0 && r.width == 1920 && r.height == 1080);
+        r = fitRect(1920, 800, 1920, 1080, Config::Scaling::Fill);
+        QVERIFY(r.height == 1080 && r.x < 0);
+        Image small(4, 2);
+        small.fill(1, 1, 1, 1);
+        Image boxed = fitInto(small, 8, 8, Config::Scaling::Fit);
+        QCOMPARE(boxed.at(4, 0)[0], 0.0f);  // black above
+        QCOMPARE(boxed.at(4, 4)[0], 1.0f);
+
+        // Scheduled on a virtual device (manual clock, a tiny mode).
+        auto dev = std::make_shared<VirtualBackend>();
+        dev->setManual(true);
+        Device d = dev->devices()[0];
+        d.modes = {Mode{"tiny", 64, 36, {25, 1}, false, 0}};
+        Scheduler sched(dev);
+        QVERIFY2(sched.start(d, d.modes[0], s, cfg, &why), why.c_str());
+        QCOMPARE(dev->openChannels(), 2);
+        QCOMPARE(sched.renderScale(), 1.0);
+        auto grey = [&](float v) {
+            auto img = std::make_shared<Image>(64, 36);
+            img->fill(v, v, v, 1);
+            return std::shared_ptr<const Image>(img);
+        };
+        auto lumaOf = [&](const VirtualBackend::Sent& x) {
+            const uint32_t w0 = x.data[0] | x.data[1] << 8 | x.data[2] << 16 | uint32_t(x.data[3]) << 24;
+            return int(w0 >> 10 & 1023);
+        };
+        // Sends one frame once `frame` is ready; it must be the one sent.
+        auto sendNext = [&](FrameTime frame) {
+            for (int i = 0; i < 500 && !sched.ready(frame); ++i) QThread::msleep(2);
+            const size_t n = dev->sent().size();
+            dev->step(1);
+            return dev->waitSent(n + 1) && dev->sent().back().frame == frame;
+        };
+        // Parked: the frame at the playhead (mid grey: 64 + 876 / 2), repeated.
+        sched.setPosition(5, 0);
+        sched.submit(5, grey(0.5f));
+        QVERIFY(sendNext(5));
+        QCOMPARE(lumaOf(dev->sent().back()), 502);
+        QVERIFY(sendNext(5));
+        QCOMPARE(dev->sent().back().timecode.frames, 5);
+        // Playing: each frame as the playhead reaches it, the sound with it and running on unbroken.
+        std::vector<std::pair<int64_t, int>> asked;
+        sched.setAudioSource([&](int64_t start, int frames, int channels, float* out) {
+            asked.push_back({start, frames});
+            for (int i = 0; i < frames; ++i) out[size_t(i) * size_t(channels)] = float(start + i);
+        });
+        for (FrameTime t = 10; t < 16; ++t) sched.submit(t, grey(0.25f + 0.1f * float(t - 10)));
+        const size_t before = dev->sent().size();
+        for (FrameTime t = 10; t < 16; ++t) {
+            sched.setPosition(t, 1);
+            QVERIFY(sendNext(t));
+            QCOMPARE(lumaOf(dev->sent().back()), int(std::lround(64 + 876 * (0.25 + 0.1 * double(t - 10)))));
+        }
+        const auto sent = dev->sent();
+        QCOMPARE(sent.size(), before + 6);
+        QCOMPARE(asked.size(), size_t(6));
+        QCOMPARE(asked.front().first, int64_t(10 * 1920));  // with its picture
+        for (size_t i = 1; i < asked.size(); ++i) {
+            QCOMPARE(asked[i].first, asked[i - 1].first + asked[i - 1].second);  // unbroken
+            QCOMPARE(asked[i].second, 1920);
+        }
+        const std::vector<float> heard = dev->audio();
+        QCOMPARE(heard[heard.size() - 2 * 1920], float(15 * 1920));  // embedded, channel 1 of 2
+        // Frames not rendered in time: the last one again, counted late, while the sound runs on (not back over what
+        // it played).
+        const int64_t lateBefore = sched.stats().late;
+        for (FrameTime t = 16; t < 19; ++t) {
+            sched.setPosition(t, 1);
+            const size_t n = dev->sent().size();
+            dev->step(1);
+            QVERIFY(dev->waitSent(n + 1));
+            QCOMPARE(dev->sent().back().frame, FrameTime(15));
+        }
+        QCOMPARE(sched.stats().late, lateBefore + 3);
+        QCOMPARE(asked.size(), size_t(9));
+        for (size_t i = 6; i < asked.size(); ++i) QCOMPARE(asked[i].first, asked[i - 1].first + asked[i - 1].second);
+        // What it no longer wants: frames packed or behind the one due.
+        QVERIFY(!sched.wants(15) && !sched.wants(10) && sched.wants(19) && sched.wants(30));
+        // Stopping while the device waits.
+        sched.stop();
+        QVERIFY(!sched.running());
+
+        // The picture ahead of the playhead by the video offset; HDR as the device was opened with.
+        cfg.videoOffset = 2;
+        s.colorSpace = "rec2100pq";
+        QVERIFY2(sched.start(d, d.modes[0], s, cfg, &why), why.c_str());
+        QCOMPARE(dev->openSignal().eotf, Eotf::Pq);
+        QVERIFY(dev->openSignal().hdrMetadata);
+        sched.setPosition(20, 1);
+        sched.submit(22, grey(0.5f));
+        QVERIFY(sendNext(22));
+        sched.stop();
+        cfg.depth = 8;
+        QVERIFY(!sched.start(d, d.modes[0], s, cfg, &why));
+    }
+
+    void deckLinkWithoutDriver() {
+        using namespace montage::output;
+        // No Desktop Video here: listed, not available, with the reason, and no devices or opening.
+        const auto dl = findBackend("DeckLink");
+        QVERIFY(dl);
+        std::string why;
+        QVERIFY(!dl->available(&why));
+        QVERIFY(!why.empty());
+        QVERIFY(dl->devices().empty());
+        Device d;
+        d.id = "0";
+        QVERIFY(!dl->open(d, standardModes()[0], Signal{}, 2, 48000, &why));
+        QVERIFY(!why.empty());
+        QCOMPARE(dl->receivers(), -1);
+    }
+
+    void ndiOutput() {
+        using namespace montage::output;
+        // A stand-in NDI Runtime where the SDK says to look.
+        qputenv("NDI_RUNTIME_DIR_V6", MONTAGE_TEST_NDI_DIR);
+        const auto ndi = findBackend("NDI");
+        QVERIFY(ndi);
+        std::string why;
+        QVERIFY2(ndi->available(&why), why.c_str());
+        const std::vector<Device> devices = ndi->devices();
+        QCOMPARE(devices.size(), size_t(1));
+        QVERIFY(devices[0].modes.empty());  // any size and rate
+        montage::plugins::DynLib fake;
+        QVERIFY2(fake.open(MONTAGE_TEST_NDI_LIBRARY, &why), why.c_str());
+        auto info = [&] {
+            auto fn = reinterpret_cast<int (*)(char*, int)>(fake.symbol("fake_ndi_info"));
+            char buf[1024] = {};
+            if (fn) fn(buf, sizeof buf);
+            return QString::fromUtf8(buf);
+        };
+        // An HDR (PQ) sequence: 16-bit P216 with its colour metadata, stereo sound as planar float, timecode in
+        // 100 ns units.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = {25, 1}, s.sampleRate = 48000, s.colorSpace = "rec2100pq";
+        Scheduler sched(ndi);
+        const Mode mode{modeName(64, 36, {25, 1}, false), 64, 36, {25, 1}, false, 0};
+        Config cfg;
+        QVERIFY2(sched.start(devices[0], mode, s, cfg, &why), why.c_str());
+        sched.setAudioSource([](int64_t, int frames, int channels, float* out) {
+            for (int i = 0; i < frames; ++i) out[size_t(i) * size_t(channels)] = 0.5f, out[size_t(i) * size_t(channels) + 1] = -0.25f;
+        });
+        auto img = std::make_shared<Image>(64, 36);
+        img->fill(0, 0, 0, 1);
+        sched.submit(3, img);
+        sched.setPosition(3, 1);
+        QTRY_VERIFY_WITH_TIMEOUT(sched.stats().sent >= 6 && info().contains("audios=") && !info().contains("audios=0 "), 10000);
+        QCOMPARE(sched.stats().receivers, 1);
+        sched.stop();
+        const QString got = info();
+        for (const char* want : {"name=Montage clock=1", "fourcc=P216", "x=64 y=36 rate=25/1 stride=128",
+                                 "meta=<ndi_color_info transfer=\"bt_2100_pq\" matrix=\"bt_2020\" primaries=\"bt_2020\"/>",
+                                 "arate=48000 ch=2 n=1920 cstride=7680 a0=0.5 a1=-0.25", "tc=1200000 "})
+            QVERIFY2(got.contains(QString::fromUtf8(want)), qPrintable(got + " lacks " + want));
+        // Black, limited range: Y 16 << 8 (4096, little-endian), then Y again.
+        QVERIFY2(got.contains("bytes=0,16,0,16"), qPrintable(got));
+        // 8-bit SDR: UYVY.
+        s.colorSpace = "rec709";
+        cfg.depth = 8;
+        QVERIFY2(sched.start(devices[0], mode, s, cfg, &why), why.c_str());
+        sched.submit(0, img);
+        QTRY_VERIFY_WITH_TIMEOUT(info().contains("fourcc=UYVY") && info().contains("bytes=128,16,128,16"), 10000);
+        QVERIFY(info().contains("transfer=\"bt_709\""));
+        sched.stop();
+    }
+
+    void lensCorrectionEffect() {
+        QFile file(QStringLiteral(MONTAGE_TEST_DATA_DIR "/lensfun/test-lenses.xml"));
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        lens::Database db;
+        QVERIFY(db.addXml(file.readAll().toStdString()));
+        const lens::Lens* zoom = db.lens("FE 24-38mm f/2.8 Test");
+        QVERIFY(zoom);
+        Effect e = makeEffect("lens_correction", 1);
+        QVERIFY(findEffectInfo("lens_correction"));
+        const int W = 192, H = 108;
+        // A horizontal ramp (each pixel's x in linear light / W), opaque.
+        Image ramp(W, H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = ramp.at(x, y);
+                p[0] = p[1] = p[2] = float((x + 0.5) / W);
+                p[3] = 1;
+            }
+        // No profile chosen yet: nothing happens.
+        Image same = ramp;
+        applyVideoEffect(e, 0, same, 1.0);
+        QVERIFY(same.px == ramp.px);
+
+        e.strings["profile"] = lens::lensXml(*zoom);
+        e.params["focal"] = Param(27);
+        e.params["camera_crop"] = Param(1);
+        e.params["vignetting"] = Param(0);
+        // Each pixel comes from where the correction says (green), red and blue from their own places; filled to the
+        // frame's edges.
+        Image out = ramp;
+        applyVideoEffect(e, 0, out, 1.0);
+        lens::Settings s;
+        s.focal = 27;
+        s.cameraCrop = 1;
+        s.vignetting = false;
+        const lens::Correction c(*zoom, s, W, H);
+        QVERIFY(c.scale() > 1);  // edges pulled in by the correction, then the frame filled
+        for (const auto& [x, y] : {std::pair{0, 0}, {W - 1, H - 1}, {40, 70}, {W / 2, H / 2}}) {
+            double at[6];
+            c.source(x + 0.5, y + 0.5, at);
+            const float* p = out.at(x, y);
+            QVERIFY2(std::fabs(p[1] - std::clamp(at[2], 0.5, W - 0.5) / W) < 1e-4, qPrintable(QString("%1,%2: %3 vs %4").arg(x).arg(y).arg(p[1]).arg(at[2] / W)));
+            QVERIFY(std::fabs(p[0] - std::clamp(at[0], 0.5, W - 0.5) / W) < 1e-4);
+            QVERIFY(std::fabs(p[2] - std::clamp(at[4], 0.5, W - 0.5) / W) < 1e-4);
+            QVERIFY(std::fabs(p[3] - 1) < 1e-4);
+        }
+        // Made smaller without filling the frame, there is nothing beyond the picture.
+        Effect none = e;
+        none.params["fit"] = Param(2);
+        none.params["scale"] = Param(50);
+        Image bare = ramp;
+        applyVideoEffect(none, 0, bare, 1.0);
+        QVERIFY(bare.at(0, 0)[3] < 0.5);
+        QVERIFY(bare.at(W / 2, H / 2)[3] > 0.99);
+
+        // Vignetting: a flat grey brightened towards the corners in linear light (Rec.709 coded here), the middle kept.
+        Effect vig = makeEffect("lens_correction", 2);
+        vig.strings["profile"] = e.strings["profile"];
+        vig.params["focal"] = Param(30);
+        vig.params["aperture"] = Param(3.3);
+        vig.params["camera_crop"] = Param(1);
+        for (const char* off : {"distortion", "tca", "rectilinear"}) vig.params[off] = Param(0);
+        Image grey(W, H);
+        grey.fill(0.4f, 0.4f, 0.4f, 1);
+        applyVideoEffect(vig, 0, grey, 1.0);
+        lens::Settings vs;
+        vs.focal = 30;
+        vs.aperture = 3.3;
+        vs.cameraCrop = 1;
+        const lens::Correction vc(*zoom, vs, W, H);
+        const double corner = fromLinear(Transfer::Bt1886, toLinear(Transfer::Bt1886, 0.4) / vc.falloff(0.5, 0.5));
+        QVERIFY2(std::fabs(grey.at(0, 0)[1] - corner) < 2e-3, qPrintable(QString::number(grey.at(0, 0)[1])));
+        QVERIFY(grey.at(0, 0)[1] > 0.5f);
+        QVERIFY(std::fabs(grey.at(W / 2, H / 2)[1] - 0.4f) < 2e-3);
+        // Half-covered pixels keep their coverage; the colour is brightened as it is straight.
+        Image half(W, H);
+        half.fill(0.4f, 0.4f, 0.4f, 0.5f);  // (premultiplied by fill)
+        applyVideoEffect(vig, 0, half, 1.0);
+        QVERIFY(std::fabs(half.at(0, 0)[3] - 0.5f) < 1e-6);
+        QVERIFY(std::fabs(half.at(0, 0)[1] / 0.5f - corner) < 2e-3);
     }
 
     void colorChartCalibration() {

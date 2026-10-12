@@ -1,0 +1,61 @@
+{
+  "$schema": "https://ograf.ebu.io/v1/specification/json-schemas/graphics/schema.json",
+  "id": "lower-third",
+  "version": "1",
+  "name": "Lower Third",
+  "description": "A name on a bar",
+  "main": "lib/graphic.mjs",
+  "supportsRealTime": true,
+  "supportsNonRealTime": false,
+  "stepCount": 1,
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "title": "Name",
+        "default": "Ada Lovelace"
+      },
+      "role": {
+        "type": "string",
+        "title": "Role",
+        "gddType": "multi-line"
+      },
+      "color": {
+        "type": "string",
+        "enum": [
+          "rgb(255, 0, 0)",
+          "rgb(0, 255, 0)"
+        ],
+        "default": "rgb(255, 0, 0)"
+      },
+      "size": {
+        "type": "number",
+        "title": "Size",
+        "default": 40
+      },
+      "count": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "show": {
+        "type": "boolean",
+        "default": true
+      },
+      "extra": {
+        "type": "object",
+        "default": {
+          "a": 1
+        }
+      }
+    }
+  },
+  "customActions": [
+    {
+      "id": "highlight",
+      "name": "Highlight"
+    }
+  ]
+}

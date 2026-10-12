@@ -1,5 +1,6 @@
 #include "ScriptConsole.h"
 
+#include <QComboBox>
 #include <QCoreApplication>
 #include <QDir>
 #include <QElapsedTimer>
@@ -15,6 +16,7 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QShortcut>
+#include <QSignalBlocker>
 #include <QSplitter>
 #include <QStandardPaths>
 #include <QVBoxLayout>
@@ -22,6 +24,7 @@
 #include "EditorState.h"
 #include "LiveLink.h"
 #include "Theme.h"
+#include "automation/PythonHost.h"
 #include "automation/ScriptHost.h"
 
 namespace montage {
@@ -34,7 +37,7 @@ QString scriptsDirectory() {
 QStringList listScripts() {
     QStringList out;
     const QDir dir(scriptsDirectory());
-    for (const QString& f : dir.entryList({QStringLiteral("*.lua")}, QDir::Files, QDir::Name | QDir::IgnoreCase)) out << dir.filePath(f);
+    for (const QString& f : dir.entryList({QStringLiteral("*.lua"), QStringLiteral("*.py")}, QDir::Files, QDir::Name | QDir::IgnoreCase)) out << dir.filePath(f);
     return out;
 }
 
@@ -46,6 +49,18 @@ const char* kExample =
     "local here = montage.live_context{}\n"
     "print(\"Playhead at \" .. here.playhead)\n"
     "-- montage.add_marker{at = here.playhead, name = \"From a script\"}\n";
+
+const char* kPythonExample =
+    "# A Python script on the open project: each tool is montage.<name>(...) (montage.tools() lists them).\n"
+    "# A whole run is one undo step.\n"
+    "here = montage.live_context()\n"
+    "print(\"Playhead at\", here[\"playhead\"])\n"
+    "# montage.add_marker(at=here[\"playhead\"], name=\"From a script\")\n";
+
+QString noRunner(bool python) {
+    return python ? ScriptConsole::tr("No Python 3.8 or later was found (set MONTAGE_PYTHON to one), so Python scripts cannot run.")
+                  : ScriptConsole::tr("This build of Montage has no Lua, so Lua scripts cannot run.");
+}
 
 QByteArray compact(const QJsonObject& o) { return QJsonDocument(o).toJson(QJsonDocument::Compact); }
 
@@ -63,12 +78,18 @@ ScriptConsole::ScriptConsole(EditorState* state, LiveLink* link, QWidget* parent
     connect(runKey, &QShortcut::activated, run_, &QPushButton::click);
     stop_ = new QPushButton(tr("Stop"), this);
     stop_->setObjectName(QStringLiteral("stopScript"));
+    language_ = new QComboBox(this);
+    language_->setObjectName(QStringLiteral("scriptLanguage"));
+    language_->addItems({QStringLiteral("Lua"), QStringLiteral("Python")});
+    language_->setToolTip(tr("The script's language (a script opened or saved follows its file's)"));
     auto* openBtn = new QPushButton(tr("Open…"), this);
     auto* saveBtn = new QPushButton(tr("Save…"), this);
     auto* clearBtn = new QPushButton(tr("Clear Output"), this);
     file_ = new QLabel(this);
     file_->setStyleSheet(QString("color: %1;").arg(theme::kTextDim.name()));
-    for (QPushButton* b : {run_, stop_, openBtn, saveBtn, clearBtn}) bar->addWidget(b);
+    for (QPushButton* b : {run_, stop_}) bar->addWidget(b);
+    bar->addWidget(language_);
+    for (QPushButton* b : {openBtn, saveBtn, clearBtn}) bar->addWidget(b);
     bar->addWidget(file_, 1);
     v->addLayout(bar);
     auto* split = new QSplitter(Qt::Vertical, this);
@@ -88,26 +109,39 @@ ScriptConsole::ScriptConsole(EditorState* state, LiveLink* link, QWidget* parent
     split->setStretchFactor(0, 3);
     split->setStretchFactor(1, 2);
     v->addWidget(split, 1);
-    if (!scriptingAvailable()) print(tr("This build of Montage has no Lua, so scripts cannot run."), true);
+    if (!scriptingAvailable()) print(noRunner(false), true);
 
+    connect(language_, &QComboBox::currentIndexChanged, this, [this](int i) {
+        const QString was = QString::fromLatin1(i == 1 ? kExample : kPythonExample);
+        if (editor_->toPlainText() == was) editor_->setPlainText(QString::fromLatin1(i == 1 ? kPythonExample : kExample));
+        if (i == 1 && !pythonAvailable()) print(noRunner(true), true);
+        updateButtons();
+    });
     connect(run_, &QPushButton::clicked, this, [this] {
-        // (The console's panel runs the console's script: the file on disk may differ from what is in the editor.)
-        runScriptAs(editor_->toPlainText(), path_.isEmpty() ? tr("Console") : QFileInfo(path_).fileName(), {}, QStringLiteral("console"),
-                    std::nullopt, false);
+        // (The console's panel runs the console's script: the file on disk may differ from what is in the editor. The
+        // name says the language: the file's, unless another one is picked.)
+        const bool file = !path_.isEmpty() && isPythonScript(path_) == python();
+        const QString name = file ? QFileInfo(path_).fileName() : python() ? tr("Console") + QStringLiteral(".py") : tr("Console");
+        runScriptAs(editor_->toPlainText(), name, {}, QStringLiteral("console"), std::nullopt, false);
     });
     connect(stop_, &QPushButton::clicked, this, &ScriptConsole::stop);
     connect(openBtn, &QPushButton::clicked, this, [this] {
         QDir().mkpath(scriptsDirectory());
         const QString f = QFileDialog::getOpenFileName(this, tr("Open Script"), path_.isEmpty() ? scriptsDirectory() : path_,
-                                                       tr("Lua scripts (*.lua);;All files (*)"));
+                                                       tr("Scripts (*.lua *.py);;Lua scripts (*.lua);;Python scripts (*.py);;All files (*)"));
         if (!f.isEmpty() && !open(f)) print(tr("Cannot read %1").arg(QDir::toNativeSeparators(f)), true);
     });
     connect(saveBtn, &QPushButton::clicked, this, [this] {
         QDir().mkpath(scriptsDirectory());
-        QString f = QFileDialog::getSaveFileName(this, tr("Save Script"), path_.isEmpty() ? scriptsDirectory() + QStringLiteral("/script.lua") : path_,
-                                                 tr("Lua scripts (*.lua)"));
+        // (A file of the other language is offered again with this one's extension.)
+        const QString ext = python() ? QStringLiteral(".py") : QStringLiteral(".lua");
+        const QString proposed = path_.isEmpty() ? scriptsDirectory() + QStringLiteral("/script") + ext
+                                 : isPythonScript(path_) == python() ? path_
+                                                                     : QFileInfo(path_).path() + '/' + QFileInfo(path_).completeBaseName() + ext;
+        QString f = QFileDialog::getSaveFileName(this, tr("Save Script"), proposed,
+                                                 python() ? tr("Python scripts (*.py)") : tr("Lua scripts (*.lua)"));
         if (f.isEmpty()) return;
-        if (QFileInfo(f).suffix().isEmpty()) f += QStringLiteral(".lua");
+        if (QFileInfo(f).suffix().isEmpty()) f += ext;
         if (!save(f)) print(tr("Cannot write %1").arg(QDir::toNativeSeparators(f)), true);
     });
     connect(clearBtn, &QPushButton::clicked, this, &ScriptConsole::clearOutput);
@@ -115,7 +149,8 @@ ScriptConsole::ScriptConsole(EditorState* state, LiveLink* link, QWidget* parent
 }
 
 void ScriptConsole::updateButtons() {
-    run_->setEnabled(!running_ && scriptingAvailable());
+    // (Python's is looked for when it is picked, not here.)
+    run_->setEnabled(!running_ && (python() || scriptingAvailable()));
     stop_->setEnabled(running_);
     file_->setText(path_.isEmpty() ? tr("Not saved") : QDir::toNativeSeparators(path_));
 }
@@ -128,11 +163,21 @@ void ScriptConsole::print(const QString& text, bool error) {
 QString ScriptConsole::output() const { return output_->toPlainText(); }
 void ScriptConsole::clearOutput() { output_->clear(); }
 
+bool ScriptConsole::python() const { return language_->currentIndex() == 1; }
+void ScriptConsole::setPython(bool on) { language_->setCurrentIndex(on ? 1 : 0); }
+
+void ScriptConsole::followFile() {
+    // (What is in the editor stays: no example swapped in.)
+    const QSignalBlocker block(language_);
+    language_->setCurrentIndex(isPythonScript(path_) ? 1 : 0);
+}
+
 bool ScriptConsole::open(const QString& path) {
     QFile f(path);
     if (!f.open(QIODevice::ReadOnly)) return false;
     editor_->setPlainText(QString::fromUtf8(f.readAll()));
     path_ = QFileInfo(path).absoluteFilePath();
+    followFile();
     updateButtons();
     return true;
 }
@@ -141,6 +186,7 @@ bool ScriptConsole::save(const QString& path) {
     QFile f(path);
     if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(editor_->toPlainText().toUtf8()) < 0) return false;
     path_ = QFileInfo(path).absoluteFilePath();
+    followFile();
     updateButtons();
     return true;
 }
@@ -183,8 +229,9 @@ bool ScriptConsole::run(const QString& code, const QString& name, const QStringL
 bool ScriptConsole::runScriptAs(const QString& code, const QString& name, const QStringList& args, const QString& key,
                                 const std::optional<QJsonObject>& values, bool setUp) {
     if (running_) return false;
-    if (!scriptingAvailable()) {
-        print(tr("This build of Montage has no Lua, so scripts cannot run."), true);
+    if (!scriptAvailable(name)) {
+        print(noRunner(isPythonScript(name)), true);
+        lastSetUpDescribed_ = false;
         return false;
     }
     running_ = true;
@@ -203,6 +250,7 @@ bool ScriptConsole::runScriptAs(const QString& code, const QString& name, const 
     for (const QJsonValue& t : QJsonDocument::fromJson(list).object().value("result").toObject().value("tools").toArray())
         o.tools << t.toObject().value("name").toString();
     o.project = state_->filePath();
+    if (key != QLatin1String("console")) o.file = key;  // (a file's key is its path)
     o.args = args;
     o.noStdin = true;
     QString lastLine;  // (a panel shows its run's last line)

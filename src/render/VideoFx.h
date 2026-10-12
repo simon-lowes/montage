@@ -5,6 +5,7 @@
 // pixels, so previews at lower resolution look the same).
 #pragma once
 
+#include "core/LensProfile.h"
 #include "core/Model.h"
 #include "media/Image.h"
 
@@ -16,6 +17,10 @@ void filmGrain(const Effect& e, FrameTime t, Image& img, double pixelScale);
 void directionalBlur(const Effect& e, FrameTime t, Image& img, double pixelScale);
 void chromaticAberration(const Effect& e, FrameTime t, Image& img, double pixelScale);
 void lensDistortion(const Effect& e, FrameTime t, Image& img);
+// Lens Correction: a lens profile's correction (core/LensProfile) of the frame, its vignetting undone in linear light
+// (the working space's), then its distortion, colour fringes and fisheye projection, scaled to fill the frame.
+void lensCorrection(const Effect& e, FrameTime t, Image& img);
+lens::Settings lensSettings(const Effect& e, FrameTime t);
 void cornerPin(const Effect& e, FrameTime t, Image& img);
 void letterbox(const Effect& e, FrameTime t, Image& img);
 void posterize(const Effect& e, FrameTime t, Image& img);
