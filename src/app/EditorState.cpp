@@ -967,6 +967,14 @@ void EditorState::setSequencesAsClips(bool on) {
     emit sequencesAsClipsChanged(on);
 }
 
+void EditorState::setSourceKinds(bool video, bool audio) {
+    if (!video && !audio) video = audio = true;
+    if (video == sourceVideo_ && audio == sourceAudio_) return;
+    sourceVideo_ = video;
+    sourceAudio_ = audio;
+    emit sourceKindsChanged();
+}
+
 bool EditorState::insertFromSource(bool overwriteMode) { return sourceEdit(overwriteMode ? SourceEdit::Overwrite : SourceEdit::Insert); }
 
 bool EditorState::sourceEdit(SourceEdit mode) {
@@ -1020,7 +1028,7 @@ bool EditorState::sourceEdit(SourceEdit mode) {
             const Sequence* src = p.findSequence(m->sequenceId);
             if (src && src->fps == sq.fps) {
                 edit::Result r = edit::placeSequenceClips(p, sq, m->sequenceId, FrameTime(in), out < 0 ? -1 : FrameTime(out), at, vt.index,
-                                                          at_.index, insertMode);
+                                                          at_.index, insertMode, sourceVideo_, sourceAudio_);
                 const FrameTime end = out < 0 ? src->duration() : std::min(FrameTime(out), src->duration());
                 placedEnd = at + std::max<FrameTime>(0, end - FrameTime(in));
                 created = r.created;
@@ -1028,9 +1036,10 @@ bool EditorState::sourceEdit(SourceEdit mode) {
             }
             nestedInstead = true;
         }
-        edit::Result r = mode == SourceEdit::PlaceOnTop        ? edit::placeOnTop(p, sq, m->id, at, in, out, vt, at_)
-                         : mode == SourceEdit::RippleOverwrite ? edit::rippleOverwrite(p, sq, replaced, m->id, in, out, vt, at_)
-                                                               : edit::placeMedia(p, sq, m->id, at, in, out, vt, at_, insertMode);
+        edit::Result r = mode == SourceEdit::PlaceOnTop ? edit::placeOnTop(p, sq, m->id, at, in, out, vt, at_, sourceVideo_, sourceAudio_)
+                         : mode == SourceEdit::RippleOverwrite
+                             ? edit::rippleOverwrite(p, sq, replaced, m->id, in, out, vt, at_, sourceVideo_, sourceAudio_)
+                             : edit::placeMedia(p, sq, m->id, at, in, out, vt, at_, insertMode, sourceVideo_, sourceAudio_);
         created = r.created;
         return r;
     });

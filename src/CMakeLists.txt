@@ -142,6 +142,8 @@ add_library(montage_engine STATIC
   control/MackieControl.h control/MackieControl.cpp
   control/Hui.h control/Hui.cpp
   control/Osc.h control/Osc.cpp
+  control/Hid.h control/Hid.cpp
+  control/SpeedEditor.h control/SpeedEditor.cpp
   render/Versions.h render/Versions.cpp
   render/ReviewExport.h render/ReviewExport.cpp
   render/DcpMxf.h render/DcpMxf.cpp
@@ -224,10 +226,10 @@ target_link_libraries(montage_engine PUBLIC Qt6::Core Qt6::Gui Qt6::Xml PkgConfi
 target_link_libraries(montage_engine PRIVATE Qt6::Network)  # (OGraf graphics: the browser's DevTools socket)
 if(APPLE)
   target_sources(montage_engine PRIVATE audio/AuHost.cpp)
-  target_link_libraries(montage_engine PUBLIC "-framework AudioToolbox" "-framework CoreFoundation" "-framework CoreMIDI")
+  target_link_libraries(montage_engine PUBLIC "-framework AudioToolbox" "-framework CoreFoundation" "-framework CoreMIDI" "-framework IOKit")
 endif()
 if(WIN32)
-  target_link_libraries(montage_engine PUBLIC winmm)  # MIDI (control/Midi.cpp)
+  target_link_libraries(montage_engine PUBLIC winmm setupapi hid)  # MIDI (control/Midi.cpp), HID (control/Hid.cpp)
 endif()
 target_compile_options(montage_engine PRIVATE
   $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter>)

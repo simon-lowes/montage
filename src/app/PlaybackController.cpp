@@ -758,6 +758,23 @@ void PlaybackController::shuttle(int direction) {
     if (!wasPlaying) emit playingChanged(true);
 }
 
+void PlaybackController::setSpeed(double speed) {
+    if (speed == 0) {
+        pause();
+        return;
+    }
+    if (speed == speed_) return;
+    const bool wasPlaying = isPlaying();
+    speed_ = std::clamp(speed, -32.0, 32.0);
+    startFrame_ = position_;
+    clock_.restart();
+    if (speed_ == 1) startAudio(position_);
+    else stopAudio();
+    timer_.start();
+    syncOutput();
+    if (!wasPlaying) emit playingChanged(true);
+}
+
 void PlaybackController::tick() {
     const Sequence* s = sequence();
     if (!s || speed_ == 0) return;

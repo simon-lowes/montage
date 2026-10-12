@@ -174,6 +174,11 @@ public:
     // at the edit nearest the playhead (Smart Insert). Each one undo step.
     enum class SourceEdit { Insert, Overwrite, Append, PlaceOnTop, RippleOverwrite, SmartInsert };
     bool sourceEdit(SourceEdit mode);
+    // Resolve's Video Only and Audio Only: source edits (and sequences edited as their clips) bring only the picture
+    // or only the sound. Both on is the usual; setting one alone turns the other off.
+    bool sourceVideo() const { return sourceVideo_; }
+    bool sourceAudio() const { return sourceAudio_; }
+    void setSourceKinds(bool video, bool audio);
     // Saves a range of a media item (frames of the active sequence, Out
     // inclusive) as a subclip in the bin; returns its id, or 0.
     Id makeSubclip(Id media, FrameTime in, FrameTime out, const QString& name = QString());
@@ -255,6 +260,7 @@ signals:
     void historyChanged();
     void sourceChanged();             // source monitor media or marks changed
     void sequencesAsClipsChanged(bool on);
+    void sourceKindsChanged();
     void mediaReady(const QString& path);  // audio peaks / thumbnails available
     void mediaFileChanged(montage::Id media);  // its file changed on disk and was reloaded
     void growingRefreshed(bool changed);       // lengths read again (refreshGrowingMedia, or a growing file's turn)
@@ -321,6 +327,7 @@ private:
     bool snapping_ = true;
     Id sourceMedia_ = 0;
     bool sequencesAsClips_ = false;
+    bool sourceVideo_ = true, sourceAudio_ = true;
     FrameTime sourceIn_ = -1;
     FrameTime sourceOut_ = -1;
     QString lastMergeKey_, undoGroup_;

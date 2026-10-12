@@ -16,6 +16,8 @@
 #include "LoudnessReadout.h"
 #include "Voiceover.h"
 
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QAction>
 #include <QCheckBox>
 #include <QClipboard>
@@ -130,6 +132,7 @@
 #include "MixerPanel.h"
 #include "ControlSurface.h"
 #include "OscControl.h"
+#include "SpeedEditorControl.h"
 #include "control/Midi.h"
 #include "MulticamPanel.h"
 #include "AdrPanel.h"
@@ -601,6 +604,42 @@ void MainWindow::buildPanels() {
         if (ok) statusBar()->showMessage(tr("Rendered %1").arg(file), 8000);
         else if (j->status == RenderQueue::Status::Failed) statusBar()->showMessage(tr("Render failed: %1 (%2)").arg(file, j->error), 10000);
     });
+    // The Blackmagic Speed Editor and Editor Keyboard, when plugged in or paired.
+    {
+        SpeedEditorControl::Hooks hooks;
+        hooks.controller = [this] { return activeController(); };
+        hooks.showMonitor = [this](bool source) {
+            active_ = source ? Monitor::Source : Monitor::Program;
+            (source ? sourceDock_ : programDock_)->raise();
+        };
+        hooks.selectEdit = [this](int side) {
+            if (!selectNearestEdit()) return false;
+            // The side asked for where there is a clip on it (else the one there is).
+            if ((side == 0 && trimEdit_->outgoing && trimEdit_->incoming) || (side == 1 && trimEdit_->outgoing) || (side == 2 && trimEdit_->incoming))
+                trimEdit_->side = side;
+            showTrimEdit();
+            return true;
+        };
+        hooks.trimBy = [this](FrameTime frames) { return trimSelectedEdit(frames); };
+        hooks.trimming = [this] { return trimEdit_.has_value(); };
+        hooks.switchAngle = [this](int angle, bool cut) { return multicam_->currentClip() != 0 && multicam_->switchTo(angle, cut); };
+        hooks.angle = [this] {
+            const Sequence* s = state_->sequence();
+            const Id id = multicam_->currentClip();
+            const Clip* c = s && id ? edit::clipById(*s, id) : nullptr;
+            return c ? c->angle : -1;
+        };
+        speedEditor_ = new SpeedEditorControl(state_, this, std::move(hooks), this);
+        speedEditor_->setObjectName(QStringLiteral("speedEditor"));
+        speedEditor_->setBindingChanges(
+            QJsonDocument::fromJson(appSettings().value(QStringLiteral("speedEditor/bindings")).toString().toUtf8()).object());
+        connect(speedEditor_, &SpeedEditorControl::connectionChanged, this, [this] {
+            if (speedEditor_->isConnected()) state_->message(tr("%1 connected").arg(speedEditor_->deviceName()), 4000);
+        });
+        // (after the menus: its keys are their commands)
+        const bool on = appSettings().value(QStringLiteral("speedEditor/enabled"), true).toBool();
+        QTimer::singleShot(0, speedEditor_, [this, on] { speedEditor_->setEnabled(on); });
+    }
     // 1–9 cut to an angle (live while playing); Shift cuts at the playhead when stopped.
     for (int i = 0; i < 9; ++i) {
         auto* sw = new QShortcut(QKeySequence(Qt::Key_1 + i), this);
@@ -1424,6 +1463,24 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Smart Insert"), QKeySequence(), [this] { state_->sourceEdit(EditorState::SourceEdit::SmartInsert); })
         ->setObjectName(QStringLiteral("smartInsert"));
     {
+        // Resolve's Video Only and Audio Only (the Speed Editor's keys): source edits bring one or the other.
+        QAction* video = add(clipM, tr("Edit Video Only"), QKeySequence(), [this](bool on) { state_->setSourceKinds(true, !on); });
+        QAction* audio = add(clipM, tr("Edit Audio Only"), QKeySequence(), [this](bool on) { state_->setSourceKinds(!on, true); });
+        video->setObjectName(QStringLiteral("editVideoOnly"));
+        audio->setObjectName(QStringLiteral("editAudioOnly"));
+        for (QAction* a : {video, audio}) a->setCheckable(true);
+        video->setToolTip(tr("Source edits bring only the picture"));
+        audio->setToolTip(tr("Source edits bring only the sound"));
+        connect(state_, &EditorState::sourceKindsChanged, this, [this, video, audio] {
+            video->setChecked(!state_->sourceAudio());
+            audio->setChecked(!state_->sourceVideo());
+            state_->message(!state_->sourceAudio()   ? tr("Source edits: video only")
+                            : !state_->sourceVideo() ? tr("Source edits: audio only")
+                                                     : tr("Source edits: video and audio"),
+                            3000);
+        });
+    }
+    {
         // Premiere's "insert and overwrite sequences as nests or individual clips".
         state_->setSequencesAsClips(appSettings().value("editing/sequencesAsClips", false).toBool());
         QAction* a = add(clipM, tr("Insert Sequences as Clips"), QKeySequence(), [this](bool on) {
@@ -1607,6 +1664,14 @@ void MainWindow::buildMenus() {
             state_->setOutPoint(-1);
         }
     });
+    add(seqM, tr("Clear In"), QKeySequence("Ctrl+Shift+I"), [this] {
+        if (active_ == Monitor::Source) state_->setSourceIn(-1);
+        else state_->setInPoint(-1);
+    })->setObjectName(QStringLiteral("clearIn"));
+    add(seqM, tr("Clear Out"), QKeySequence("Ctrl+Shift+O"), [this] {
+        if (active_ == Monitor::Source) state_->setSourceOut(-1);
+        else state_->setOutPoint(-1);
+    })->setObjectName(QStringLiteral("clearOut"));
     add(seqM, tr("Go to In"), QKeySequence("Shift+I"), [this] {
         FrameTime t = active_ == Monitor::Source ? state_->sourceIn() : (state_->sequence() ? state_->sequence()->inPoint : -1);
         if (t >= 0) activeController()->seek(t);
@@ -6018,7 +6083,109 @@ QDialog* MainWindow::controlSurfaceDialog() {
         list->resize(760, 520);
         list->show();
     });
+    // Blackmagic's Speed Editor and Editor Keyboard (HID, USB or Bluetooth).
+    auto* speedBox = new QGroupBox(tr("DaVinci Resolve Speed Editor and Editor Keyboard"), dlg);
+    auto* speedForm = new QFormLayout(speedBox);
+    auto* speedOn = new QCheckBox(tr("Use a Speed Editor or Editor Keyboard when one is plugged in or paired"), speedBox);
+    speedOn->setObjectName(QStringLiteral("speedEditorEnabled"));
+    speedOn->setChecked(speedEditor_->isEnabled());
+    speedOn->setToolTip(tr("DaVinci Resolve holds the device while it runs: quit it first"));
+    auto* speedStatus = new QLabel(speedBox);
+    speedStatus->setObjectName(QStringLiteral("speedEditorStatus"));
+    speedStatus->setWordWrap(true);
+    auto* speedKeys = new QPushButton(tr("Keys…"), speedBox);
+    speedKeys->setObjectName(QStringLiteral("speedEditorKeys"));
+    speedKeys->setToolTip(tr("What each key does (any key can do any menu command)"));
+    speedForm->addRow(speedOn);
+    speedForm->addRow(speedStatus);
+    speedForm->addRow(speedKeys);
+    form->addRow(speedBox);
+    auto showSpeed = [this, speedStatus] {
+        QString text;
+        if (speedEditor_->isConnected()) {
+            text = tr("Connected to %1").arg(speedEditor_->deviceName());
+            if (speedEditor_->batteryLevel() >= 0)
+                text += speedEditor_->charging() ? tr(" (battery %1 %, charging)").arg(speedEditor_->batteryLevel())
+                                                 : tr(" (battery %1 %)").arg(speedEditor_->batteryLevel());
+            text += QLatin1Char('.');
+        } else if (!speedEditor_->isEnabled()) {
+            text = tr("Off.");
+        } else {
+            text = speedEditor_->lastError().isEmpty() ? tr("Looking for one…") : speedEditor_->lastError();
+        }
+        speedStatus->setText(text);
+    };
+    showSpeed();
+    connect(speedEditor_, &SpeedEditorControl::connectionChanged, speedStatus, showSpeed);
+    connect(speedEditor_, &SpeedEditorControl::batteryChanged, speedStatus, showSpeed);
+    connect(speedOn, &QCheckBox::toggled, dlg, [this, showSpeed](bool on) {
+        appSettings().setValue(QStringLiteral("speedEditor/enabled"), on);
+        speedEditor_->setEnabled(on);
+        showSpeed();
+    });
+    connect(speedKeys, &QPushButton::clicked, dlg, [this, dlg] { speedEditorKeysDialog(dlg); });
     form->addRow(buttons);
+    dlg->show();
+    return dlg;
+}
+
+QDialog* MainWindow::speedEditorKeysDialog(QWidget* parent) {
+    auto* dlg = new QDialog(parent ? parent : this);
+    dlg->setObjectName(QStringLiteral("speedEditorKeysDialog"));
+    dlg->setWindowTitle(tr("Speed Editor Keys"));
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    auto* v = new QVBoxLayout(dlg);
+    auto* intro = new QLabel(tr("What each key does. Keys with a second function in brackets do it when pressed twice, "
+                                "while they do their own thing."),
+                             dlg);
+    intro->setWordWrap(true);
+    v->addWidget(intro);
+    auto* table = new QTableWidget(int(speed::allKeys().size()), 3, dlg);
+    table->setObjectName(QStringLiteral("speedEditorKeyTable"));
+    table->setHorizontalHeaderLabels({tr("Key"), tr("Pressed twice"), tr("Does")});
+    table->verticalHeader()->hide();
+    table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    // Every built-in function and menu command, by what it is called.
+    QList<std::pair<QString, QString>> choices = {{QString(), tr("Nothing")}};
+    for (const QString& id : SpeedEditorControl::builtIns()) choices.push_back({id, SpeedEditorControl::builtInLabel(id)});
+    for (QAction* a : keymap::actions(this))
+        if (const QString id = keymap::idOf(a); !id.isEmpty()) choices.push_back({id, id});
+    int row = 0;
+    for (speed::Key k : speed::allKeys()) {
+        QString label = QString::fromStdString(speed::keyLabel(k));
+        if (!speed::onSpeedEditor(k)) label += tr(" (Editor Keyboard)");
+        table->setItem(row, 0, new QTableWidgetItem(label));
+        table->setItem(row, 1, new QTableWidgetItem(QString::fromStdString(speed::keySecondLabel(k))));
+        auto* box = new QComboBox(table);
+        box->setObjectName(QStringLiteral("speedKey_") + QString::fromStdString(speed::keyName(k)));
+        for (const auto& [id, text] : choices) box->addItem(id == SpeedEditorControl::defaultBinding(k) ? tr("%1 (default)").arg(text) : text, id);
+        const int at = box->findData(speedEditor_->binding(k));
+        if (at < 0) box->addItem(speedEditor_->binding(k), speedEditor_->binding(k));  // (a command no longer there)
+        box->setCurrentIndex(at >= 0 ? at : box->count() - 1);
+        connect(box, &QComboBox::currentIndexChanged, dlg, [this, k, box] {
+            speedEditor_->setBinding(k, box->currentData().toString());
+            appSettings().setValue(QStringLiteral("speedEditor/bindings"),
+                                   QString::fromUtf8(QJsonDocument(speedEditor_->bindingChanges()).toJson(QJsonDocument::Compact)));
+            speedEditor_->refreshLeds();
+        });
+        table->setCellWidget(row, 2, box);
+        ++row;
+    }
+    table->resizeColumnsToContents();
+    v->addWidget(table);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, dlg);
+    QPushButton* reset = buttons->addButton(tr("Reset All"), QDialogButtonBox::ResetRole);
+    reset->setObjectName(QStringLiteral("speedEditorReset"));
+    connect(reset, &QPushButton::clicked, dlg, [this, table] {
+        int r = 0;
+        for (speed::Key k : speed::allKeys()) {
+            if (auto* box = qobject_cast<QComboBox*>(table->cellWidget(r++, 2))) box->setCurrentIndex(box->findData(SpeedEditorControl::defaultBinding(k)));
+        }
+    });
+    connect(buttons, &QDialogButtonBox::rejected, dlg, &QDialog::close);
+    v->addWidget(buttons);
+    dlg->resize(720, 640);
     dlg->show();
     return dlg;
 }

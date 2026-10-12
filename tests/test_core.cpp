@@ -67,6 +67,7 @@
 #include "core/G2p.h"
 #include "control/Hui.h"
 #include "control/Osc.h"
+#include "control/SpeedEditor.h"
 #include "control/MackieControl.h"
 #include "control/Midi.h"
 
@@ -1146,6 +1147,142 @@ private slots:
         for (int i = 0; i < 10; ++i) deep = std::string("#bundle\0", 8) + std::string(8, '\0') + u32(uint32_t(deep.size())) + deep;
         QVERIFY(!osc::parse(deep, back, &err) && err.find("deeply") != std::string::npos);
         QVERIFY(back.empty());
+    }
+
+    void speedEditorProtocol() {
+        using namespace speed;
+        // ---- The answer to the device's challenge, against blackmagic-misc's own (Python, run on these values).
+        const std::pair<uint64_t, uint64_t> answers[] = {
+            {0x0, 0x3ae1206f97c10bc8},
+            {0x1, 0x2b9ab32bebf244c6},
+            {0x0123456789abcdef, 0xe5c7b689e9967608},
+            {0xfedcba9876543210, 0xc4a7da4761c769e8},
+            {0x5a5a5a5a5a5a5a5a, 0x78e6e0b28592df00},
+            {0xffffffffffffffff, 0x61a3f6474ff236c6},
+            {0x00000000deadbeef, 0x751bf6fddd11d83e},
+            {0x7, 0x751bf623f42e0ade},
+        };
+        for (const auto& [challenge, answer] : answers) QCOMPARE(authResponse(challenge), answer);
+
+        // ---- The exchange on feature report 6, with a device that checks the answer and allows 600 seconds.
+        const uint64_t challenge = 0x0123456789abcdef;
+        std::vector<std::vector<uint8_t>> sent;
+        int state = 0;
+        auto send = [&](const std::vector<uint8_t>& r) {
+            sent.push_back(r);
+            if (r.size() != 10 || r[0] != 6) return false;
+            if (r[1] == 0) state = 1;
+            else if (r[1] == 1 && state == 1) state = 2;
+            else if (r[1] == 3 && state == 2) {
+                uint64_t got = 0;
+                for (int i = 7; i >= 0; --i) got = got << 8 | r[size_t(2 + i)];
+                state = got == authResponse(challenge) ? 3 : 4;
+            }
+            return true;
+        };
+        auto get = [&](uint8_t id, std::vector<uint8_t>& out) {
+            if (id != 6) return false;
+            out.assign(10, 0);
+            out[0] = 6;
+            if (state == 1) {
+                for (int i = 0; i < 8; ++i) out[size_t(2 + i)] = uint8_t(challenge >> (8 * i));
+            } else if (state == 2) {
+                out[1] = 2;
+            } else if (state == 3) {
+                out[1] = 4;
+                out[2] = 600 & 0xff;
+                out[3] = 600 >> 8;
+            } else {
+                out[1] = 4;  // refused: no time given
+            }
+            return true;
+        };
+        std::string why;
+        QCOMPARE(authenticate(send, get, &why), 600);
+        QCOMPARE(int(sent.size()), 3);
+        QCOMPARE(sent[0], (std::vector<uint8_t>{6, 0, 0, 0, 0, 0, 0, 0, 0, 0}));
+        QCOMPARE(sent[1], (std::vector<uint8_t>{6, 1, 0, 0, 0, 0, 0, 0, 0, 0}));
+        QCOMPARE(sent[2][1], uint8_t(3));
+        // A device that does not take the answer, and one that sends no challenge.
+        sent.clear();
+        auto wrong = [&](const std::vector<uint8_t>& r) {
+            std::vector<uint8_t> bad = r;
+            if (bad[1] == 3) bad[2] ^= 1;
+            return send(bad);
+        };
+        QCOMPARE(authenticate(wrong, get, &why), 0);
+        QVERIFY(!why.empty());
+        QCOMPARE(authenticate(send, [](uint8_t, std::vector<uint8_t>&) { return false; }, &why), 0);
+
+        // ---- Keys: the set held, every change; presses and releases from it.
+        Decoder d;
+        auto keys = [](std::initializer_list<uint16_t> held) {
+            std::vector<uint8_t> r(13, 0);
+            r[0] = 4;
+            size_t i = 0;
+            for (uint16_t k : held) {
+                r[1 + i * 2] = uint8_t(k);
+                r[2 + i * 2] = uint8_t(k >> 8);
+                ++i;
+            }
+            return r;
+        };
+        auto r = keys({0x07});
+        std::vector<Event> ev = d.feed(r.data(), r.size());
+        QCOMPARE(int(ev.size()), 1);
+        QVERIFY(ev[0].kind == Event::KeyDown && ev[0].key == Key::In);
+        r = keys({0x07, 0x3c});
+        ev = d.feed(r.data(), r.size());
+        QCOMPARE(int(ev.size()), 1);
+        QVERIFY(ev[0].kind == Event::KeyDown && ev[0].key == Key::StopPlay);
+        r = keys({0x3c, 0x33});
+        ev = d.feed(r.data(), r.size());
+        QCOMPARE(int(ev.size()), 2);  // released first, then pressed
+        QVERIFY(ev[0].kind == Event::KeyUp && ev[0].key == Key::In);
+        QVERIFY(ev[1].kind == Event::KeyDown && ev[1].key == Key::Cam1);
+        r = keys({0x3c, 0x33, 0x99});  // an unknown code is left out
+        QVERIFY(d.feed(r.data(), r.size()).empty());
+        r = keys({});
+        ev = d.feed(r.data(), r.size());
+        QCOMPARE(int(ev.size()), 2);
+        QCOMPARE(int(d.held().size()), 0);
+        // The wheel (mode, then a signed value) and the battery.
+        const std::vector<uint8_t> jogReport = {3, 2, 0x98, 0xfe, 0xff, 0xff, 0};  // -360, relative
+        ev = d.feed(jogReport.data(), jogReport.size());
+        QVERIFY(ev.size() == 1 && ev[0].kind == Event::Jog && ev[0].mode == JogMode::Relative2 && ev[0].value == -360);
+        const std::vector<uint8_t> battery = {7, 1, 85};
+        ev = d.feed(battery.data(), battery.size());
+        QVERIFY(ev.size() == 1 && ev[0].kind == Event::Battery && ev[0].charging && ev[0].level == 85);
+        const std::vector<uint8_t> shortJog = {3, 2, 0x98};
+        QVERIFY(d.feed(shortJog.data(), shortJog.size()).empty());
+
+        // ---- What goes to the device: lights, the wheel's lights and mode.
+        QCOMPARE(ledReport(ledBit(Key::Cam1) | ledBit(Key::Snap)), (std::vector<uint8_t>{2, 0x20, 0x40, 0, 0}));
+        QCOMPARE(ledBit(Key::AudioOnly), 1u << 17);
+        QCOMPARE(ledBit(Key::In), 0u);
+        QCOMPARE(jogLedReport(jogLedBit(Key::Shuttle)), (std::vector<uint8_t>{4, 2}));
+        QCOMPARE(jogModeReport(JogMode::AbsoluteDeadZero), (std::vector<uint8_t>{3, 3, 0, 0, 0, 0, 255}));
+        // Names both ways, labels with their bracketed second function.
+        for (Key k : allKeys()) {
+            Key back = Key::None;
+            QVERIFY(keyFromName(keyName(k), back) && back == k);
+            QVERIFY(!keyLabel(k).empty());
+        }
+        QCOMPARE(keySecondLabel(Key::Escape), std::string("UNDO"));
+        QVERIFY(onSpeedEditor(Key::Cam9) && !onSpeedEditor(Key::FitToFill));
+
+        // ---- Linux: a hidraw device's uevent.
+        int bus = 0;
+        uint16_t vendor = 0, product = 0;
+        std::string name, serial;
+        QVERIFY(parseHidUevent("DRIVER=hid-generic\nHID_ID=0005:00001EDB:0000DA0E\nHID_NAME=DaVinci Resolve Speed Editor\nHID_UNIQ=ab:cd\n",
+                               bus, vendor, product, name, serial));
+        QCOMPARE(bus, 5);
+        QCOMPARE(vendor, kVendor);
+        QCOMPARE(product, kSpeedEditor);
+        QCOMPARE(name, std::string("DaVinci Resolve Speed Editor"));
+        QCOMPARE(serial, std::string("ab:cd"));
+        QVERIFY(!parseHidUevent("DRIVER=hid-generic\n", bus, vendor, product, name, serial));
     }
 
     void huiProtocol() {
@@ -6553,6 +6690,32 @@ private slots:
         QCOMPARE(nearestEdit(fx.s(), V1, 75), FrameTime(80));
         fx.s().videoTracks.push_back(Track{});
         QCOMPARE(nearestEdit(fx.s(), {TrackKind::Video, int(fx.s().videoTracks.size()) - 1}, 42), FrameTime(42));
+
+        // Video Only and Audio Only: one kind, unlinked; inserting still opens the sync-locked sound, leaving a gap there.
+        Fixture only;
+        QVERIFY(placeMedia(only.p, only.s(), only.media, 0, 0, 60, V1, A1, false).ok);
+        Result r = placeMedia(only.p, only.s(), only.media, 30, 0, 10, V1, A1, true, true, false);
+        QVERIFY2(r.ok, r.error.c_str());
+        QCOMPARE(r.created.size(), size_t(1));
+        QCOMPARE(locate(only.s(), r.created[0])->track, V1);
+        QCOMPARE(clipById(only.s(), r.created[0])->linkGroup, Id(0));
+        QCOMPARE(only.v1().clips.back().end(), FrameTime(70));
+        QVERIFY(!clipAt(only.s(), A1, 35));
+        QCOMPARE(only.a1().clips.back().end(), FrameTime(70));
+        const size_t videoTracks = only.s().videoTracks.size();
+        r = placeOnTop(only.p, only.s(), only.media, 0, 0, 10, V1, A1, false, true);
+        QVERIFY(r.ok && r.created.size() == 1);
+        QCOMPARE(locate(only.s(), r.created[0])->track.kind, TrackKind::Audio);
+        QCOMPARE(only.s().videoTracks.size(), videoTracks);
+        // Media without the kind asked for is refused, and says why.
+        MediaItem still;
+        still.id = only.p.newId();
+        still.kind = MediaKind::Image;
+        still.hasVideo = true;
+        still.path = "still.png";
+        only.p.media.push_back(still);
+        r = placeMedia(only.p, only.s(), still.id, 100, 0, 10, V1, A1, false, false, true);
+        QVERIFY(!r.ok && r.error.find("Audio Only") != std::string::npos);
     }
 
     void audioRoles() {

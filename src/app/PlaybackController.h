@@ -103,6 +103,7 @@ public slots:
     void pause();
     void togglePlay();
     void shuttle(int direction);  // J (-1) / L (+1): repeated presses speed up; 0 = K (stop)
+    void setSpeed(double speed);  // a shuttle ring's: any speed either way (0 pauses; sound at 1x only)
     void seek(montage::FrameTime t);  // also renders the frame when paused
     void step(int frames);
     void requestFrame();          // re-render the current frame (after edits)

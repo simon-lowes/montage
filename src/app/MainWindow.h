@@ -76,6 +76,7 @@ class LiveLink;
 class AssistantPanel;
 class ScriptConsole;
 class OscControl;
+class SpeedEditorControl;
 class ScriptPanelWidget;
 
 class MainWindow : public QMainWindow {
@@ -183,6 +184,9 @@ public:
     QDialog* controlSurfaceDialog();
     ControlSurface* controlSurface() const { return surface_; }
     OscControl* oscControl() const { return osc_; }
+    // The Speed Editor's keys (from Edit > Control Surface): what each does, any menu command.
+    QDialog* speedEditorKeysDialog(QWidget* parent = nullptr);
+    SpeedEditorControl* speedEditor() const { return speedEditor_; }
     // Clip › Colour Group (core/ColorGroups.h), each one undo step: a new group of the selected video clips (its id, 0
     // with a message when none are selected), the selection joining a group, or leaving its group.
     Id newColorGroup(const QString& name = {});
@@ -483,6 +487,7 @@ private:
     MixerPanel* mixer_ = nullptr;
     ControlSurface* surface_ = nullptr;
     OscControl* osc_ = nullptr;
+    SpeedEditorControl* speedEditor_ = nullptr;
     MulticamPanel* multicam_ = nullptr;
     AdrPanel* adr_ = nullptr;
     ProductionPanel* production_ = nullptr;
