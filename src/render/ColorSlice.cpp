@@ -1,7 +1,9 @@
 #include "ColorSlice.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <functional>
 
 #include "TransferTables.h"
 
@@ -36,7 +38,8 @@ float hueDistance(float a, float b) {
     return d;
 }
 
-// The mean over a (2r+1)-square box, the edges counting only the pixels inside.
+// The mean over a (2r+1)-square box, the edges counting only the pixels inside. Both passes walk the rows in order
+// (the vertical one keeps a running sum per column of a band of columns).
 std::vector<float> boxMean(const std::vector<float>& in, int W, int H, int r) {
     std::vector<float> mid(in.size()), out(in.size());
     parallelRows(H, [&](int y0, int y1) {
@@ -52,17 +55,68 @@ std::vector<float> boxMean(const std::vector<float>& in, int W, int H, int r) {
         }
     });
     parallelRows(W, [&](int x0, int x1) {
-        std::vector<double> sum(size_t(H) + 1);
-        for (int x = x0; x < x1; ++x) {
-            sum[0] = 0;
-            for (int y = 0; y < H; ++y) sum[size_t(y) + 1] = sum[size_t(y)] + mid[size_t(y) * W + x];
-            for (int y = 0; y < H; ++y) {
-                const int a = std::max(0, y - r), b = std::min(H - 1, y + r);
-                out[size_t(y) * W + x] = float((sum[size_t(b) + 1] - sum[size_t(a)]) / (b - a + 1));
-            }
+        const int n = x1 - x0;
+        std::vector<double> sum(size_t(n), 0.0);
+        for (int y = 0; y <= std::min(r, H - 1); ++y)
+            for (int i = 0; i < n; ++i) sum[size_t(i)] += mid[size_t(y) * W + x0 + i];
+        for (int y = 0; y < H; ++y) {
+            const int a = std::max(0, y - r), b = std::min(H - 1, y + r);
+            const double inv = 1.0 / (b - a + 1);
+            for (int i = 0; i < n; ++i) out[size_t(y) * W + x0 + i] = float(sum[size_t(i)] * inv);
+            if (y + r + 1 < H)
+                for (int i = 0; i < n; ++i) sum[size_t(i)] += mid[size_t(y + r + 1) * W + x0 + i];
+            if (y - r >= 0)
+                for (int i = 0; i < n; ++i) sum[size_t(i)] -= mid[size_t(y - r) * W + x0 + i];
         }
     });
     return out;
+}
+
+// A Gaussian blur of any (fractional) size, the edges counting only the pixels inside.
+std::vector<float> gaussianMean(const std::vector<float>& in, int W, int H, double sigma) {
+    sigma = std::max(0.3, sigma);
+    const int r = int(std::ceil(3 * sigma));
+    std::vector<float> k(size_t(2 * r + 1));
+    for (int i = -r; i <= r; ++i) k[size_t(i + r)] = float(std::exp(-0.5 * i * i / (sigma * sigma)));
+    std::vector<float> mid(in.size()), out(in.size());
+    parallelRows(H, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            const float* row = in.data() + size_t(y) * W;
+            for (int x = 0; x < W; ++x) {
+                float acc = 0, wsum = 0;
+                for (int i = std::max(-r, -x); i <= std::min(r, W - 1 - x); ++i) acc += k[size_t(i + r)] * row[x + i], wsum += k[size_t(i + r)];
+                mid[size_t(y) * W + x] = acc / wsum;
+            }
+        }
+    });
+    parallelRows(H, [&](int y0, int y1) {
+        std::vector<float> acc(static_cast<size_t>(W));
+        for (int y = y0; y < y1; ++y) {
+            std::fill(acc.begin(), acc.end(), 0.0f);
+            float wsum = 0;
+            for (int i = std::max(-r, -y); i <= std::min(r, H - 1 - y); ++i) {
+                const float w = k[size_t(i + r)];
+                const float* row = mid.data() + size_t(y + i) * W;
+                for (int x = 0; x < W; ++x) acc[size_t(x)] += w * row[x];
+                wsum += w;
+            }
+            for (int x = 0; x < W; ++x) out[size_t(y) * W + x] = acc[size_t(x)] / wsum;
+        }
+    });
+    return out;
+}
+
+// A blur of `plane` weighted by `weight` (the pixels' alpha), so transparent pixels round a matte do not count; no
+// weight: a plain one.
+template <typename Blur>
+std::vector<float> weightedBlur(const std::vector<float>& plane, const std::vector<float>& weight, Blur blur) {
+    if (weight.empty()) return blur(plane);
+    std::vector<float> pw(plane.size());
+    for (size_t i = 0; i < plane.size(); ++i) pw[i] = plane[i] * weight[i];
+    std::vector<float> num = blur(pw);
+    const std::vector<float> den = blur(weight);
+    for (size_t i = 0; i < num.size(); ++i) num[i] = den[i] > 1e-6f ? num[i] / den[i] : plane[i];
+    return num;
 }
 
 }  // namespace
@@ -81,12 +135,13 @@ void colorSlice(const Effect& e, FrameTime t, const ColorSpace& space, Image& im
         float centre, width, hue, sat, density;
     };
     std::vector<Vec> vecs;
-    bool any = false;
     for (const HueVector& v : colorSliceVectors()) {
         const std::string n = v.name;
-        vecs.push_back({float(v.centre), 60, float(e.p(n + "_hue", t)), float(e.p(n + "_saturation", t, 1)), float(e.p(n + "_density", t))});
-        any |= vecs.back().hue != 0 || vecs.back().sat != 1 || vecs.back().density != 0;
+        const Vec vec{float(v.centre), 60, float(e.p(n + "_hue", t)), float(e.p(n + "_saturation", t, 1)), float(e.p(n + "_density", t))};
+        // (A vector left as it is adds nothing to any colour's change.)
+        if (vec.hue != 0 || vec.sat != 1 || vec.density != 0) vecs.push_back(vec);
     }
+    bool any = !vecs.empty();
     const Vec skin{float(e.p("skin_centre", t, 25)), std::max(1.0f, float(e.p("skin_width", t, 25))), float(e.p("skin_hue", t)),
                    float(e.p("skin_saturation", t, 1)), float(e.p("skin_density", t))};
     const float globalSat = float(e.p("saturation", t, 1)), globalDensity = float(e.p("density", t));
@@ -98,8 +153,17 @@ void colorSlice(const Effect& e, FrameTime t, const ColorSpace& space, Image& im
 
     const TransferTables tables(space.transfer);
     const float white = toWhite(space);
-    float lw[3];
-    lumaWeights(space, lw);
+    // Hues are those of Rec.709's primaries whatever the working space, so a grade lands alike in any of them (colours
+    // outside Rec.709 have negative channels there, which ACEScct's straight toe takes).
+    const bool ref709 = space.primaries != Primaries::Bt709;
+    double toRef[9], fromRef[9];
+    primariesMatrix(space.primaries, Primaries::Bt709, toRef);
+    primariesMatrix(Primaries::Bt709, space.primaries, fromRef);
+    auto mul = [](const double m[9], float v[3]) {
+        const float a = v[0], b = v[1], c = v[2];
+        for (int r = 0; r < 3; ++r) v[r] = float(m[r * 3] * a + m[r * 3 + 1] * b + m[r * 3 + 2] * c);
+    };
+    const float lw[3] = {0.2126f, 0.7152f, 0.0722f};
     // (Chroma in the log encoding at which a colour counts as fully saturated: four stops between its brightest and
     // darkest channels.)
     constexpr float kFull = 4 * kStop;
@@ -116,9 +180,10 @@ void colorSlice(const Effect& e, FrameTime t, const ColorSpace& space, Image& im
                 for (int k = 0; k < 3; ++k) {
                     code[k] = p[k] / a;
                     lin[k] = tables.decode(code[k]) * white;
-                    c[k] = acesCct(lin[k]);
                 }
                 const float linMax = std::max({lin[0], lin[1], lin[2]});
+                if (ref709) mul(toRef, lin);
+                for (int k = 0; k < 3; ++k) c[k] = acesCct(lin[k]);
                 const float mx = std::max({c[0], c[1], c[2]}), mn = std::min({c[0], c[1], c[2]}), ch = mx - mn;
                 if (ch <= 1e-6f) continue;  // (a neutral colour has no hue, saturation or density to change)
                 float h = 0;
@@ -141,6 +206,7 @@ void colorSlice(const Effect& e, FrameTime t, const ColorSpace& space, Image& im
                 }
                 sat = std::max(0.0f, sat * globalSat);
                 density += globalDensity;
+                if (hueShift == 0 && sat == 1 && density == 0) continue;
 
                 float o[3] = {c[0], c[1], c[2]};
                 if (hueShift != 0 && ch > 1e-6f) {
@@ -160,8 +226,9 @@ void colorSlice(const Effect& e, FrameTime t, const ColorSpace& space, Image& im
                 }
                 // Subtractive: the brightest channel stays and the others move away from it (or towards it) in stops, as
                 // dyes do.
+                // (Never below no light, unless the colour was already: ACEScct's toe is straight, not stops.)
                 if (subtractive && sat != 1)
-                    for (float& v : o) v = mx - (mx - v) * sat;
+                    for (int k = 0; k < 3; ++k) o[k] = std::max(mx - (mx - o[k]) * sat, std::min(o[k], kCctB));
                 float l[3];
                 for (int k = 0; k < 3; ++k) l[k] = acesCctToLinear(o[k]);
                 if (!subtractive && sat != 1) {
@@ -175,6 +242,7 @@ void colorSlice(const Effect& e, FrameTime t, const ColorSpace& space, Image& im
                     const float g = std::exp2(-kDensityStops * depth * density * s);
                     for (float& v : l) v *= g;
                 }
+                if (ref709) mul(fromRef, l);
                 const float keep = 1 - protect * smoothstep(0.5f, 1.0f, linMax);
                 const float amount = mix * keep;
                 for (int k = 0; k < 3; ++k) {
@@ -192,13 +260,17 @@ void textureDetail(const Effect& e, FrameTime t, const ColorSpace& space, Image&
     const float floor = float(e.p("noise_floor", t, 10)) / 100 * 0.35f * kStop;
     if ((mid == 0 && pop == 0) || img.width <= 0 || img.height <= 0) return;
     const int W = img.width, H = img.height;
+    const size_t N = size_t(W) * size_t(H);
     const TransferTables tables(space.transfer);
     const float white = toWhite(space);
     float lw[3];
     lumaWeights(space, lw);
-    // Brightness in the log encoding.
-    std::vector<float> Y(size_t(W) * size_t(H));
+    // Brightness in the log encoding, and alpha where any pixel is not opaque (so a matte's transparent surround is not
+    // taken for black next to it).
+    std::vector<float> Y(N), alpha(N);
+    std::atomic<bool> opaque = true;
     parallelRows(H, [&](int y0, int y1) {
+        bool rowsOpaque = true;
         for (int y = y0; y < y1; ++y) {
             const float* p = img.row(y);
             for (int x = 0; x < W; ++x, p += 4) {
@@ -207,42 +279,56 @@ void textureDetail(const Effect& e, FrameTime t, const ColorSpace& space, Image&
                 if (a > 0)
                     for (int k = 0; k < 3; ++k) yl += lw[k] * tables.decode(p[k] / a) * white;
                 Y[size_t(y) * W + x] = acesCct(std::max(0.0f, yl));
+                alpha[size_t(y) * W + x] = std::clamp(a, 0.0f, 1.0f);
+                rowsOpaque &= a >= 1;
             }
         }
+        if (!rowsOpaque) opaque = false;
     });
-    std::vector<float> delta(Y.size(), 0.0f);
+    if (opaque) std::vector<float>().swap(alpha);
+    auto rows = [&](const std::function<void(size_t, size_t)>& fn) {
+        parallelRows(H, [&](int y0, int y1) { fn(size_t(y0) * W, size_t(y1) * W); });
+    };
+    std::vector<float> delta(N, 0.0f);
     if (mid != 0) {
-        // Mid-tone detail: brightness less an edge-preserving (guided) smoothing of it, so an edge of a couple of stops
-        // or more keeps most of itself and gets no halo.
+        // Mid-tone detail: brightness less an edge-preserving (self-guided) smoothing of it, so an edge of a couple of
+        // stops or more keeps most of itself and gets no halo.
         const int r = std::max(1, int(std::lround(24 * scale)));
+        auto box = [&](const std::vector<float>& v) { return boxMean(v, W, H, r); };
         constexpr float eps = 0.002f;
-        std::vector<float> sq(Y.size());
-        for (size_t i = 0; i < Y.size(); ++i) sq[i] = Y[i] * Y[i];
-        const std::vector<float> mean = boxMean(Y, W, H, r), meanSq = boxMean(sq, W, H, r);
-        std::vector<float> A(Y.size()), B(Y.size());
-        for (size_t i = 0; i < Y.size(); ++i) {
-            const float var = std::max(0.0f, meanSq[i] - mean[i] * mean[i]);
-            A[i] = var / (var + eps);
-            B[i] = mean[i] - A[i] * mean[i];
-        }
-        const std::vector<float> mA = boxMean(A, W, H, r), mB = boxMean(B, W, H, r);
-        // Strongest round mid grey (ACEScct 0.41), none in deep shadow or well above white.
-        for (size_t i = 0; i < Y.size(); ++i) {
-            const float d = (Y[i] - 0.43f) / 0.25f, w = d * d >= 1 ? 0.0f : (1 - d * d) * (1 - d * d);
-            delta[i] += mid * w * (Y[i] - (mA[i] * Y[i] + mB[i]));
-        }
+        std::vector<float> A(N);
+        rows([&](size_t i0, size_t i1) {
+            for (size_t i = i0; i < i1; ++i) A[i] = Y[i] * Y[i];
+        });
+        std::vector<float> B = weightedBlur(Y, alpha, box);  // the mean, then B
+        A = weightedBlur(A, alpha, box);                     // the mean square, then A
+        rows([&](size_t i0, size_t i1) {
+            for (size_t i = i0; i < i1; ++i) {
+                const float mean = B[i], var = std::max(0.0f, A[i] - mean * mean);
+                A[i] = var / (var + eps);
+                B[i] = mean - A[i] * mean;
+            }
+        });
+        A = weightedBlur(A, alpha, box);
+        B = weightedBlur(B, alpha, box);
+        // Strongest at mid grey (ACEScct 0.41), none in deep shadow or well above white.
+        rows([&](size_t i0, size_t i1) {
+            for (size_t i = i0; i < i1; ++i) {
+                const float d = (Y[i] - 0.41f) / 0.25f, w = d * d >= 1 ? 0.0f : (1 - d * d) * (1 - d * d);
+                delta[i] += mid * w * (Y[i] - (A[i] * Y[i] + B[i]));
+            }
+        });
     }
     if (pop != 0) {
-        // Texture: brightness less a fine blur of it (three boxes, near a Gaussian of 1.5 px), the smallest differences
-        // (noise) left alone.
-        const double sigma = 1.5 * scale;
-        const int r = std::max(1, int(std::lround((std::sqrt(1 + 4 * sigma * sigma) - 1) / 2)));
-        std::vector<float> blur = boxMean(boxMean(boxMean(Y, W, H, r), W, H, r), W, H, r);
-        for (size_t i = 0; i < Y.size(); ++i) {
-            const float d = Y[i] - blur[i];
-            const float keep = floor > 0 ? smoothstep(floor, 2 * floor, std::fabs(d)) : 1.0f;
-            delta[i] += pop * keep * d;
-        }
+        // Texture: brightness less a fine Gaussian blur of it (1.5 px), the smallest differences (noise) left alone.
+        const std::vector<float> blur = weightedBlur(Y, alpha, [&](const std::vector<float>& v) { return gaussianMean(v, W, H, 1.5 * scale); });
+        rows([&](size_t i0, size_t i1) {
+            for (size_t i = i0; i < i1; ++i) {
+                const float d = Y[i] - blur[i];
+                const float keep = floor > 0 ? smoothstep(floor, 2 * floor, std::fabs(d)) : 1.0f;
+                delta[i] += pop * keep * d;
+            }
+        });
     }
     // The change in brightness as a gain on every channel alike, so colours keep their balance.
     parallelRows(H, [&](int y0, int y1) {
@@ -255,7 +341,7 @@ void textureDetail(const Effect& e, FrameTime t, const ColorSpace& space, Image&
                 const float before = acesCctToLinear(Y[i]), after = acesCctToLinear(Y[i] + delta[i]);
                 if (before <= 1e-7f) continue;
                 const float g = std::clamp(std::max(0.0f, after) / before, 1.0f / 16, 16.0f);
-                for (int k = 0; k < 3; ++k) p[k] = tables.encode(tables.decode(p[k] / a) * white * g / white) * a;
+                for (int k = 0; k < 3; ++k) p[k] = tables.encode(tables.decode(p[k] / a) * g) * a;
             }
         }
     });

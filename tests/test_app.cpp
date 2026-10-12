@@ -6698,6 +6698,52 @@ private slots:
         state()->newProject();
     }
 
+    void colorSliceInInspector() {
+        // Colour Slice shows one vector at a time: Global's settings, then a hue's own, then Skin's with its centre.
+        QImage frame(64, 36, QImage::Format_RGB32);
+        frame.fill(QColor(160, 60, 40));
+        const QString png = dir_.path() + "/slice.png";
+        QVERIFY(frame.save(png));
+        state()->newProject();
+        const auto ids = state()->importFiles({png});
+        QCOMPARE(ids.size(), size_t(1));
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        });
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        state()->edit("Slice", [clip](Project& p, Sequence& s) {
+            edit::clipById(s, clip)->effects.push_back(makeEffect(p, "color_slice"));
+            return true;
+        });
+        state()->setSelection({clip}, false);
+        win_->findChild<QDockWidget*>("inspector")->show();
+        win_->findChild<QDockWidget*>("inspector")->raise();
+        QApplication::processEvents();
+        auto vector = [&]() -> QComboBox* {
+            for (auto* w : win_->findChildren<QComboBox*>("sliceVector"))
+                if (w->isVisibleTo(win_.get())) return w;
+            return nullptr;
+        };
+        auto shown = [&](const QString& text) {
+            for (QLabel* l : win_->findChildren<QLabel*>())
+                if (l->isVisibleTo(win_.get()) && l->text() == text) return true;
+            return false;
+        };
+        QVERIFY(vector());
+        QCOMPARE(vector()->count(), 8);
+        QVERIFY(shown("Density") && shown("Depth"));
+        QVERIFY(!shown("Red Density") && !shown("Skin Centre (°)"));
+        vector()->setCurrentIndex(1);
+        QTRY_VERIFY(shown("Red Density"));
+        QVERIFY(shown("Red Hue (°)") && !shown("Depth") && !shown("Skin Centre (°)"));
+        vector()->setCurrentIndex(7);
+        QTRY_VERIFY(shown("Skin Centre (°)"));
+        QVERIFY(shown("Skin Density") && shown("Skin Width (°)") && !shown("Red Density"));
+        QCOMPARE(vector()->currentText(), QString("Skin"));
+        vector()->setCurrentIndex(0);
+        QTRY_VERIFY(shown("Depth"));
+    }
+
     void gradingCurvesWheelsAndCompare() {
         auto mouse = [](QWidget* w, QEvent::Type type, QPointF pos, Qt::MouseButtons held) {
             QMouseEvent ev(type, pos, w->mapToGlobal(pos), type == QEvent::MouseMove ? Qt::NoButton : Qt::LeftButton, held, Qt::NoModifier);

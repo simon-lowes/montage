@@ -314,6 +314,42 @@ private slots:
         QVERIFY(run(e, bright)[1] < 0.35f);
         e.params["mix"] = Param(0.0);
         QVERIFY(std::fabs(run(e, bright)[1] - 0.4f) < 1e-4);
+        // Much more saturation never takes a channel below no light; a wide-gamut working space slices the same hues.
+        e = makeEffect(p, "color_slice");
+        e.params["protect_highlights"] = Param(0.0);
+        e.params["saturation"] = Param(2.0);
+        e.params["red_saturation"] = Param(2.0);
+        {
+            const auto r = run(e, red);
+            QVERIFY2(r[1] >= 0 && r[2] >= 0 && r[1] < 0.03f, qPrintable(QString("%1 %2").arg(r[1]).arg(r[2])));
+        }
+        {
+            e = makeEffect(p, "color_slice");
+            e.params["protect_highlights"] = Param(0.0);
+            e.params["red_density"] = Param(1.0);
+            const float in709 = run(e, red)[0];
+            const ColorSpace& wide = *findColorSpace("rec2020");
+            const WorkingSpaceScope working(&wide);
+            auto inWide = [&](std::array<float, 3> lin) {
+                float v[3] = {lin[0], lin[1], lin[2]};
+                double m[9];
+                primariesMatrix(Primaries::Bt709, Primaries::Bt2020, m);
+                float w[3];
+                for (int r = 0; r < 3; ++r) w[r] = float(m[r * 3] * v[0] + m[r * 3 + 1] * v[1] + m[r * 3 + 2] * v[2]);
+                Image img = solid(1, 1, float(fromLinear(wide.transfer, w[0])), float(fromLinear(wide.transfer, w[1])),
+                                  float(fromLinear(wide.transfer, w[2])));
+                applyVideoEffect(e, 0, img, 1.0);
+                float back[3];
+                for (int k = 0; k < 3; ++k) back[k] = float(toLinear(wide.transfer, img.at(0, 0)[k]));
+                primariesMatrix(Primaries::Bt2020, Primaries::Bt709, m);
+                return std::array<float, 3>{float(m[0] * back[0] + m[1] * back[1] + m[2] * back[2]),
+                                            float(m[3] * back[0] + m[4] * back[1] + m[5] * back[2]),
+                                            float(m[6] * back[0] + m[7] * back[1] + m[8] * back[2])};
+            };
+            const auto r = inWide({0.4f, 0.03f, 0.03f});
+            QVERIFY2(std::fabs(r[0] - in709) < 2e-3, qPrintable(QString("%1 %2").arg(r[0]).arg(in709)));
+            QVERIFY(std::fabs(inWide({0.03f, 0.4f, 0.03f})[1] - 0.4f) < 2e-3);
+        }
         QVERIFY(isColorOnlyEffect(makeEffect(p, "color_slice"), 0));
         QVERIFY(!isColorOnlyEffect(makeEffect(p, "texture_pop"), 0));
 
@@ -369,6 +405,28 @@ private slots:
                 const double rg = toLinear(rec.transfer, px[1]) / toLinear(rec.transfer, px[0]);
                 QVERIFY2(std::fabs(rg - 0.6) < 2e-3, qPrintable(QString::number(rg)));
             }
+        }
+        {
+            // Texture Pop's size follows the preview too; and a matte's transparent surround is not taken for black.
+            tx.params["noise_floor"] = Param(0.0);
+            const Image full = pattern(96, 96, 6, 0.3f), half = pattern(48, 48, 3, 0.3f);
+            Image fullOut = full, halfOut = half;
+            applyVideoEffect(tx, 0, fullOut, 1.0);
+            applyVideoEffect(tx, 0, halfOut, 0.5);
+            const double fullRatio = spread(fullOut) / spread(full), halfRatio = spread(halfOut) / spread(half);
+            QVERIFY2(std::fabs(fullRatio - halfRatio) < 0.1 * fullRatio, qPrintable(QString("%1 %2").arg(fullRatio).arg(halfRatio)));
+            tx.params["midtone_detail"] = Param(100.0);
+            Image matte(48, 48);
+            const float grey = float(fromLinear(rec.transfer, 0.18));
+            for (int y = 12; y < 36; ++y)
+                for (int x = 12; x < 36; ++x) {
+                    float* px = matte.at(x, y);
+                    px[0] = px[1] = px[2] = grey, px[3] = 1;
+                }
+            applyVideoEffect(tx, 0, matte, 1.0);
+            for (int x : {12, 13, 24, 35})
+                QVERIFY2(std::fabs(matte.at(x, 12)[1] - grey) < 1e-4, qPrintable(QString("%1: %2").arg(x).arg(matte.at(x, 12)[1])));
+            QCOMPARE(matte.at(5, 5)[3], 0.0f);
         }
         tx = makeEffect(p, "texture_pop");
         tx.params["midtone_detail"] = Param(-100.0);
