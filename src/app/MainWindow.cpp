@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
+#include "render/OGraf.h"
 #include "render/Ofx.h"
 #include "AssistantPanel.h"
 #include "ScriptConsole.h"
@@ -1397,6 +1398,8 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Nudge &Right"), QKeySequence("Alt+Right"), [this] { nudge(1); });
     clipM->addSeparator();
     add(clipM, tr("New &Title"), QKeySequence("Ctrl+T"), [this] { addTitle(); });
+    add(clipM, tr("Add OGraf Graphic…"), QKeySequence(), withSeq([this] { addOGrafGraphic(); }))
+        ->setObjectName(QStringLiteral("addOGrafGraphic"));
     // Graphics templates (core/GraphicsTemplate.h): from the library, a picture published, filled from a table.
     add(clipM, tr("Insert Graphics Template…"), QKeySequence(), withSeq([this] {
             GraphicsTemplatesDialog dlg(state_, this);
@@ -7065,6 +7068,49 @@ void MainWindow::addTitle() {
         state_->setSelection(created, false);
         inspectorDock_->raise();
     }
+}
+
+Id MainWindow::addOGrafGraphic(const QString& chosen) {
+    if (!state_->sequence()) return 0;
+    const bool asked = chosen.isEmpty();
+    const QString file = asked ? QFileDialog::getOpenFileName(this, tr("Add OGraf Graphic"), QString(), tr("OGraf graphics (*.ograf.json)")) : chosen;
+    if (file.isEmpty()) return 0;
+    OGrafGraphic g;
+    std::string err;
+    if (!readOGraf(file.toStdString(), g, &err)) {
+        if (asked) QMessageBox::warning(this, tr("Add OGraf Graphic"), QString::fromStdString(err));
+        else state_->message(QString::fromStdString(err), 6000);
+        return 0;
+    }
+    if (asked && ografBrowser().empty())
+        QMessageBox::information(this, tr("Add OGraf Graphic"),
+                                 tr("OGraf graphics are drawn by a web browser: install Chrome, Chromium or Edge (or set "
+                                    "MONTAGE_CHROMIUM to one) to see this one."));
+    const Sequence* s = state_->sequence();  // (after the dialogs)
+    if (!s) return 0;
+    FrameTime at = s->playhead, len = FrameTime(std::llround(5 * s->fpsValue()));
+    // Like a title: on the first track above the target that is free at the playhead.
+    int vt = std::min(state_->targetVideoTrack() + 1, int(s->videoTracks.size()) - 1);
+    for (int i = vt; i < int(s->videoTracks.size()); ++i)
+        if (edit::trackEmpty(s->videoTracks[size_t(i)], at, at + len)) {
+            vt = i;
+            break;
+        }
+    std::vector<Id> created;
+    state_->apply(tr("Add OGraf Graphic"), [&](Project& p, Sequence& sq) {
+        Clip c = makeGeneratorClip(p, "ograf", len);
+        c.start = at;
+        c.generator.strings["manifest"] = QFileInfo(file).absoluteFilePath().toStdString();
+        c.generator.strings["data"] = ografDefaultData(g);
+        if (!g.name.empty()) c.name = g.name;
+        auto r = edit::overwrite(p, sq, {TrackKind::Video, vt}, c);
+        created = r.created;
+        return r;
+    });
+    if (created.empty()) return 0;
+    state_->setSelection(created, false);
+    inspectorDock_->raise();
+    return created[0];
 }
 
 void MainWindow::newSequence() {

@@ -82,6 +82,7 @@
 #include "RedactFacesDialog.h"
 #include "SpectralRepairDialog.h"
 #include "automation/McpServer.h"
+#include "render/OGraf.h"
 #include "automation/PythonHost.h"
 #include "automation/ScriptHost.h"
 #include "ScriptConsole.h"
@@ -10175,6 +10176,93 @@ const auto seq = [this] { return state()->sequence(); };
         state()->undo();
         QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(1));
         state()->newProject();
+    }
+
+    void ografGraphicInInspector() {
+        // Add OGraf Graphic: the graphic at the playhead with its schema's defaults, its fields in the Inspector.
+        state()->newProject();
+        state()->edit("Format", [](Project&, Sequence& s) {
+            s.width = 320;
+            s.height = 180;
+            s.fps = {25, 1};
+            return true;
+        });
+        qputenv("MONTAGE_OGRAF_CACHE", (dir_.path() + "/ograf-cache").toUtf8());
+        struct Unset {
+            ~Unset() { qunsetenv("MONTAGE_OGRAF_CACHE"); }
+        } unset;
+        QCOMPARE(win_->addOGrafGraphic(dir_.path() + "/none.ograf.json"), Id(0));
+        const Id clip = win_->addOGrafGraphic(QStringLiteral(MONTAGE_TEST_DATA_DIR "/ograf/lower-third/lower.ograf.json"));
+        QVERIFY(clip);
+        // (A second long, not played out: each value tried renders it.)
+        state()->edit("Shorter", [&](Project&, Sequence& s) {
+            edit::clipById(s, clip)->duration = 25;
+            edit::clipById(s, clip)->generator.params["out"] = Param(0.0);
+            return true;
+        });
+        auto data = [&] {
+            const Clip* c = edit::clipById(*state()->sequence(), clip);
+            return QJsonDocument::fromJson(QByteArray::fromStdString(c->generator.s("data"))).object();
+        };
+        QCOMPARE(edit::clipById(*state()->sequence(), clip)->name, std::string("Lower Third"));
+        QCOMPARE(data().value("name").toString(), QString("Ada Lovelace"));
+        win_->findChild<QDockWidget*>("inspector")->show();
+        win_->findChild<QDockWidget*>("inspector")->raise();
+        QApplication::processEvents();
+        auto visible = [&]<typename W>(const char* name, W*) {
+            W* found = nullptr;
+            for (auto* w : win_->findChildren<W*>(name))
+                if (w->isVisibleTo(win_.get())) found = w;
+            return found;
+        };
+        auto* name = visible("ograf_name", static_cast<QLineEdit*>(nullptr));
+        auto* colour = visible("ograf_color", static_cast<QComboBox*>(nullptr));
+        auto* size = visible("ograf_size", static_cast<QDoubleSpinBox*>(nullptr));
+        auto* count = visible("ograf_count", static_cast<QSpinBox*>(nullptr));
+        auto* show = visible("ograf_show", static_cast<QCheckBox*>(nullptr));
+        auto* extra = visible("ograf_extra", static_cast<QLineEdit*>(nullptr));
+        QVERIFY(name && colour && size && count && show && extra && visible("ograf_role", static_cast<QPlainTextEdit*>(nullptr)));
+        QCOMPARE(name->text(), QString("Ada Lovelace"));
+        QCOMPARE(size->value(), 40.0);
+        QVERIFY(show->isChecked());
+        QCOMPARE(extra->text(), QString(R"~({"a":1})~"));
+        // Edited: each field written into the data (one undo step a field).
+        name->setText("Grace Hopper");
+        emit name->editingFinished();
+        colour->setCurrentIndex(1);
+        show->setChecked(false);
+        extra->setText("[1, 2]");
+        emit extra->editingFinished();
+        QCOMPARE(data().value("name").toString(), QString("Grace Hopper"));
+        QCOMPARE(data().value("color").toString(), QString("rgb(0, 255, 0)"));
+        QCOMPARE(data().value("show").toBool(true), false);
+        QCOMPARE(data().value("extra").toArray().size(), 2);
+        state()->undo();
+        QCOMPARE(data().value("extra").toObject().value("a").toInt(), 1);
+        QApplication::processEvents();
+        QCOMPARE(extra->text(), QString(R"~({"a":1})~"));
+
+        // Render: its frames now; the viewer draws them (the bar green, in all the way 0.8 s in).
+        if (ografBrowser().empty()) QSKIP("No Chrome, Chromium or Edge to render OGraf graphics in (set MONTAGE_CHROMIUM)");
+        const Sequence& sq = *state()->sequence();
+        const Clip* c = edit::clipById(sq, clip);
+        const OGrafJob job = ografClipJob(c->generator, sq.width, sq.height, sq.fpsValue(), c->duration);
+        auto* render = visible("renderOGraf", static_cast<QPushButton*>(nullptr));
+        QVERIFY(render);
+        render->click();
+        QTRY_VERIFY_WITH_TIMEOUT(ografCached(job), 120000);
+        state()->setPlayhead(20);
+        MonitorPanel* program = nullptr;
+        for (auto* mp : win_->findChildren<MonitorPanel*>())
+            if (mp->mode() == MonitorPanel::Mode::Program) program = mp;
+        QVERIFY(program);
+        auto greenAt = [&](double x, double y) {
+            const QImage img = program->viewer()->image();
+            if (img.isNull()) return false;
+            const QColor px = img.pixelColor(int(x * img.width()), int(y * img.height()));
+            return px.green() > 200 && px.red() < 60;
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(greenAt(150.0 / 320, 120.0 / 180), 30000);
     }
 
     void cameraTrackerInInspectorAndViewer() {

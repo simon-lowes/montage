@@ -163,6 +163,7 @@ add_library(montage_engine STATIC
   render/HdrView.h render/HdrView.cpp
   render/Ocio.h render/Ocio.cpp
   render/Compositor.h render/Compositor.cpp
+  render/OGraf.h render/OGraf.cpp
   render/RenderCache.h render/RenderCache.cpp
   render/AudioFx.h render/AudioFx.cpp
   render/VideoFx.h render/VideoFx.cpp
@@ -216,6 +217,7 @@ if(MONTAGE_WITH_VST3)
 endif()
 target_compile_definitions(montage_engine PUBLIC MONTAGE_VERSION="${PROJECT_VERSION}")
 target_link_libraries(montage_engine PUBLIC Qt6::Core Qt6::Gui Qt6::Xml PkgConfig::FFMPEG Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(montage_engine PRIVATE Qt6::Network)  # (OGraf graphics: the browser's DevTools socket)
 if(APPLE)
   target_sources(montage_engine PRIVATE audio/AuHost.cpp)
   target_link_libraries(montage_engine PUBLIC "-framework AudioToolbox" "-framework CoreFoundation" "-framework CoreMIDI")

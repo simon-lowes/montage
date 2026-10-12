@@ -1,0 +1,11 @@
+{
+  "id": "seek",
+  "name": "Seek",
+  "main": "seek.mjs",
+  "supportsRealTime": false,
+  "supportsNonRealTime": true,
+  "schema": {
+    "type": "object",
+    "properties": {}
+  }
+}

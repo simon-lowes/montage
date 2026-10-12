@@ -8,6 +8,10 @@
 #include <QColorDialog>
 #include <QComboBox>
 #include <QInputDialog>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QSpinBox>
 #include <QDoubleSpinBox>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -51,6 +55,7 @@
 #include "CurveEditor.h"
 #include "render/ClipAnalysis.h"
 #include "render/Compositor.h"
+#include "render/OGraf.h"
 #include "render/Ocio.h"
 
 namespace montage {
@@ -138,6 +143,8 @@ QString InspectorWidget::signature() const {
         return sig;
     }
     QString sig = QString("C%1:%2:%3").arg(c->id).arg(QString::fromStdString(c->generator.type)).arg(c->mediaId);
+    // An OGraf graphic's fields: rebuild when another graphic is chosen.
+    if (c->generator.type == "ograf") sig += "|G" + QString::fromStdString(c->generator.s("manifest"));
     // A graphic's fields: rebuild when one is published, removed or renamed.
     if (const Sequence* g = graphicOf(state_->project(), *c)) {
         sig += QString("|F%1").arg(g->id);
@@ -451,6 +458,7 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
         if (const EffectInfo* info = findEffectInfo(clip.generator.type)) {
             QFormLayout* g = addSection(QString::fromStdString(info->displayName));
             addParamRows(g, *info, target(clip.generator.id));
+            if (clip.generator.type == "ograf") addOGrafFields(g, clip, target(clip.generator.id));
         }
     }
     // ---- Fixed attributes ----------------------------------------------------
@@ -2196,6 +2204,173 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
             break;
         }
     }
+}
+
+void InspectorWidget::addOGrafFields(QFormLayout* form, const Clip& clip, const Target& target) {
+    OGrafGraphic g;
+    std::string err;
+    const std::string manifest = clip.generator.s("manifest");
+    auto* about = new QLabel(content_);
+    about->setObjectName(QStringLiteral("ografStatus"));
+    about->setWordWrap(true);
+    form->addRow(QString(), about);
+    if (manifest.empty() || !readOGraf(manifest, g, &err)) {
+        about->setText(manifest.empty() ? tr("Choose a graphic: its .ograf.json") : QString::fromStdString(err));
+        return;
+    }
+    const Sequence* seq = state_->sequence();
+    const std::string failed = seq ? ografFailure(ografClipJob(clip.generator, seq->width, seq->height, seq->fpsValue(), clip.duration)) : std::string();
+    if (ografBrowser().empty())
+        about->setText(tr("%1. To draw it, install Chrome, Chromium or Edge (or set MONTAGE_CHROMIUM)").arg(QString::fromStdString(g.name)));
+    else if (!failed.empty())
+        about->setText(tr("%1 cannot be drawn: %2").arg(QString::fromStdString(g.name), QString::fromStdString(failed)));
+    else
+        about->setText(g.description.empty() ? QString::fromStdString(g.name) : QString::fromStdString(g.name + ": " + g.description));
+    // The data: one row per field of its schema, each writing its key into the data's JSON.
+    const QJsonObject defaults = QJsonDocument::fromJson(QByteArray::fromStdString(ografDefaultData(g))).object();
+    auto read = [this, target, defaults](const QString& key) -> QJsonValue {
+        const Sequence* s = state_->sequence();
+        const Effect* e = s ? target.resolve(const_cast<Sequence&>(*s)) : nullptr;
+        if (!e) return {};
+        const QJsonObject data = QJsonDocument::fromJson(QByteArray::fromStdString(e->s("data"))).object();
+        return data.contains(key) ? data.value(key) : defaults.value(key);
+    };
+    for (const OGrafField& f : g.fields) {
+        const QString key = QString::fromStdString(f.key);
+        const QString label = f.title.empty() ? key : QString::fromStdString(f.title);
+        const QString mergeKey = target.key + ":ograf:" + key;
+        auto write = [this, target, key, label, mergeKey](const QJsonValue& v) {
+            state_->edit(tr("Change %1").arg(label), [target, key, v](Project&, Sequence& s) {
+                Effect* e = target.resolve(s);
+                if (!e) return false;
+                QJsonObject data = QJsonDocument::fromJson(QByteArray::fromStdString(e->s("data"))).object();
+                if (data.value(key) == v) return false;
+                data[key] = v;
+                e->strings["data"] = QJsonDocument(data).toJson(QJsonDocument::Compact).toStdString();
+                return true;
+            }, mergeKey);
+        };
+        QWidget* w = nullptr;
+        if (!f.choices.empty()) {
+            auto* box = new QComboBox(content_);
+            for (const std::string& c : f.choices) box->addItem(QString::fromStdString(c));
+            connect(box, &QComboBox::currentTextChanged, this, [write](const QString& t) { write(t); });
+            refreshers_.push_back([box, read, key] {
+                QSignalBlocker b(box);
+                box->setCurrentIndex(box->findText(read(key).toString()));  // (none picked when it has no value)
+            });
+            w = box;
+        } else if (f.type == "string" && f.multiline) {
+            // Text is written once typing pauses: each new value renders the graphic again.
+            auto* edit = new QPlainTextEdit(content_);
+            edit->setFixedHeight(64);
+            auto* pause = new QTimer(edit);
+            pause->setSingleShot(true);
+            pause->setInterval(700);
+            connect(pause, &QTimer::timeout, this, [edit, write] { write(edit->toPlainText()); });
+            connect(edit, &QPlainTextEdit::textChanged, pause, qOverload<>(&QTimer::start));
+            refreshers_.push_back([edit, read, key] {
+                if (edit->hasFocus() || edit->toPlainText() == read(key).toString()) return;
+                QSignalBlocker b(edit);
+                edit->setPlainText(read(key).toString());
+            });
+            w = edit;
+        } else if (f.type == "string") {
+            auto* line = new QLineEdit(content_);
+            auto* pause = new QTimer(line);
+            pause->setSingleShot(true);
+            pause->setInterval(700);
+            connect(pause, &QTimer::timeout, this, [line, write] { write(line->text()); });
+            connect(line, &QLineEdit::textEdited, pause, qOverload<>(&QTimer::start));
+            connect(line, &QLineEdit::editingFinished, this, [line, pause, write] {
+                pause->stop();
+                write(line->text());
+            });
+            refreshers_.push_back([line, read, key] {
+                if (!line->hasFocus()) line->setText(read(key).toString());
+            });
+            w = line;
+        } else if (f.type == "number") {
+            auto* spin = new QDoubleSpinBox(content_);
+            spin->setRange(-1e9, 1e9);
+            spin->setDecimals(3);
+            spin->setKeyboardTracking(false);  // (a typed number is written when it is finished)
+            connect(spin, &QDoubleSpinBox::valueChanged, this, [write](double v) { write(v); });
+            refreshers_.push_back([spin, read, key] {
+                QSignalBlocker b(spin);
+                spin->setValue(read(key).toDouble());
+            });
+            w = spin;
+        } else if (f.type == "integer") {
+            auto* spin = new QSpinBox(content_);
+            spin->setRange(-1000000000, 1000000000);
+            spin->setKeyboardTracking(false);
+            connect(spin, &QSpinBox::valueChanged, this, [write](int v) { write(v); });
+            refreshers_.push_back([spin, read, key] {
+                QSignalBlocker b(spin);
+                spin->setValue(read(key).toInt());
+            });
+            w = spin;
+        } else if (f.type == "boolean") {
+            auto* check = new QCheckBox(content_);
+            connect(check, &QCheckBox::toggled, this, [write](bool v) { write(v); });
+            refreshers_.push_back([check, read, key] {
+                QSignalBlocker b(check);
+                check->setChecked(read(key).toBool());
+            });
+            w = check;
+        } else {
+            // An object or a list: its JSON.
+            auto* line = new QLineEdit(content_);
+            line->setPlaceholderText(tr("JSON"));
+            connect(line, &QLineEdit::editingFinished, this, [this, line, write, label] {
+                QJsonParseError pe;
+                const QJsonDocument d = QJsonDocument::fromJson(("[" + line->text() + "]").toUtf8(), &pe);
+                if (pe.error != QJsonParseError::NoError || d.array().size() != 1) {
+                    state_->message(tr("%1 is not JSON").arg(label), 4000);
+                    return;
+                }
+                write(d.array().at(0));
+            });
+            refreshers_.push_back([line, read, key] {
+                if (line->hasFocus()) return;
+                const QJsonValue v = read(key);
+                line->setText(v.isUndefined() || v.isNull() ? QString()
+                              : QString::fromUtf8(QJsonDocument(QJsonArray{v}).toJson(QJsonDocument::Compact)).mid(1).chopped(1));
+            });
+            w = line;
+        }
+        w->setObjectName("ograf_" + key);
+        if (!f.description.empty()) w->setToolTip(QString::fromStdString(f.description));
+        form->addRow(label, w);
+    }
+    // Rendering ahead: otherwise its frames render the first time they are shown.
+    auto* row = new QWidget(content_);
+    auto* rh = new QHBoxLayout(row);
+    rh->setContentsMargins(0, 0, 0, 0);
+    auto* render = new QPushButton(tr("Render"), row);
+    render->setObjectName(QStringLiteral("renderOGraf"));
+    render->setToolTip(tr("Render the graphic's frames now (they are kept, and rendered again only when it changes)"));
+    rh->addStretch(1);
+    rh->addWidget(render);
+    form->addRow(QString(), row);
+    const Id clipId = clip.id;
+    connect(render, &QPushButton::clicked, this, [this, clipId] { QTimer::singleShot(0, this, [this, clipId] { renderOGrafClip(clipId); }); });
+}
+
+void InspectorWidget::renderOGrafClip(Id clip) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
+    if (!c || c->generator.type != "ograf") return;
+    const OGrafJob job = ografClipJob(c->generator, s->width, s->height, s->fpsValue(), c->duration);
+    if (ografCached(job)) {
+        state_->message(tr("The graphic is rendered"), 3000);
+        return;
+    }
+    if (runAnalysis(tr("Rendering the graphic..."), [job](const auto& progress, const auto* cancel, std::string* err) {
+            return prepareOGraf(job, progress, cancel, err);
+        }))
+        state_->message(tr("Rendered the graphic"), 3000);
 }
 
 bool InspectorWidget::runAnalysis(

@@ -1,4 +1,5 @@
 #include "Compositor.h"
+#include "OGraf.h"
 #include "Ofx.h"
 
 #include "core/ColorGroups.h"
@@ -385,6 +386,7 @@ Image renderGenerator(const Effect& g, FrameTime t, int w, int h, double scale, 
     } else if (g.type == "title3d") {
         return renderTitle3D(g, t, w, h, scale, duration, fps);
     }
+    // (OGraf graphics are drawn by clipLayer: they need the sequence's size.)
     return img;
 }
 
@@ -705,6 +707,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         int w, h;
         sourceSize(g, o.scale, int(SW * 4), int(SH * 4), w, h);
         src = c.generator.type == "audio_viz" ? renderAudioVisualiser(p, seq, c, t, w, h)
+              : c.generator.type == "ograf"   ? ografFrame(c.generator, lt, w, h, SW, SH, c.duration, seq.fpsValue())
                                               : renderGenerator(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue());
         // Titles and mattes are authored in SDR: graphics white sits at HDR reference white.
         convertColor(src, rec709Space(), sequenceColorSpace(seq), seq.hdrPeakNits);

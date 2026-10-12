@@ -731,6 +731,16 @@ std::vector<EffectInfo> buildCatalog() {
                   pct("trim_start", "Trim Start", 0, 100, 0), pct("trim_end", "Trim End", 0, 100, 100),
                   angle("trim_offset", "Trim Offset", 0), pct("opacity", "Opacity", 0, 100, 100)},
                  {}});
+    // An OGraf graphic (render/OGraf.h): an HTML graphic in the EBU's open format, rendered in a headless browser. Its
+    // strings: "manifest" (the .ograf.json), "data" (JSON, edited in the Inspector's fields from its schema) and
+    // "actions" (JSON, replacing the usual play in, steps and out).
+    c.push_back({"ograf", "OGraf Graphic", EffectCategory::Generator, "Titles",
+                 {num("out", "Play Out Before the End (s, 0 none)", 0, 30, 1, 0.1),
+                  num("advance", "Next Step Every (s, 0 never)", 0, 60, 0, 0.1)},
+                 {str("manifest", "Graphic", StringKind::File)}});
+    c.back().strings[0].fileFilter = "OGraf graphics (*.ograf.json)";
+    for (auto& pi : c.back().params) pi.keyframeable = false;
+    c.back().hidden = true;  // (added with Add OGraf Graphic, which picks the graphic first)
     // Its effects, opacity and blend mode apply to everything on the tracks below it.
     c.push_back({"adjustment", "Adjustment Layer", EffectCategory::Generator, "Generators", {}, {}});
     // Audio Visualiser (render/AudioReactive): an audio track's sound drawn each frame, for audiograms and music videos.

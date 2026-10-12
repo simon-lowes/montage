@@ -6,6 +6,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QDirIterator>
+#include <QElapsedTimer>
 #include <QFileInfo>
 #include <QImage>
 #include <QJsonArray>
@@ -118,6 +119,7 @@
 #include "media/Transcriber.h"
 #include "media/VisualSearch.h"
 #include "render/ClipAnalysis.h"
+#include "render/OGraf.h"
 #include "media/Segmenter.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
@@ -7358,6 +7360,140 @@ void McpServer::Impl::addTools() {
             save(l);
             const Clip* made = edit::clipById(s, title);
             return ok(QStringLiteral("Placed a title in the scene"), made ? clipJson(l.project, s, *made) : QJsonObject{});
+        });
+
+    add("montage_ograf", "OGraf graphics",
+        "OGraf graphics (the EBU's open HTML graphics format, as Resolve plays them: a folder with a *.ograf.json manifest "
+        "and a JavaScript module) as clips. info reads a graphic: its name, whether it can go to any time, and the fields "
+        "of its data with their defaults. add puts one on a video track at `at` for `duration` (default 5 s), its data the "
+        "defaults with `data` over them; it plays in at its start, steps on every `advance` seconds when it has steps, and "
+        "plays out `out` seconds before its end (default 1, 0 never), or follows `actions` instead ([{\"at\": seconds, "
+        "\"type\": \"playAction\" | \"stopAction\" | \"updateAction\" | \"customAction\", \"params\": {...}}]). set changes a "
+        "clip's data (merged), graphic or actions. render renders a clip's frames now (they are otherwise rendered the "
+        "first time they are shown) and says why when the graphic fails. Graphics render offline in an installed Chrome, "
+        "Chromium or Edge (or MONTAGE_CHROMIUM).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "action":{"type":"string","enum":["info","add","set","render"],"default":"add"},
+            "manifest":{"type":"string","description":"The graphic's .ograf.json (info, add; set to change it)"},
+            "clip":{"type":"number","description":"set, render: the graphic's clip"},
+            "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":5},"track":{"type":"string"},
+            "data":{"type":"object","description":"Values for the graphic's fields (see info)"},
+            "actions":{"type":"array","items":{"type":"object"}},
+            "out":{"type":"number","default":1},"advance":{"type":"number","default":0}},
+            "required":[]})json",
+        false, [](const QJsonObject& a) {
+            const QString action = str(a, "action", "add");
+            std::string err;
+            auto graphic = [&](const QString& manifest) {
+                OGrafGraphic g;
+                if (!readOGraf(manifest.toStdString(), g, &err)) throw ArgError{QString::fromStdString(err)};
+                return g;
+            };
+            auto describe = [](const OGrafGraphic& g) {
+                QJsonArray fields;
+                for (const OGrafField& f : g.fields) {
+                    QJsonObject o{{"key", QString::fromStdString(f.key)}, {"type", QString::fromStdString(f.type)}};
+                    if (!f.title.empty()) o["title"] = QString::fromStdString(f.title);
+                    if (!f.description.empty()) o["description"] = QString::fromStdString(f.description);
+                    if (f.multiline) o["multiline"] = true;
+                    if (!f.choices.empty()) {
+                        QJsonArray c;
+                        for (const std::string& v : f.choices) c.append(QString::fromStdString(v));
+                        o["choices"] = c;
+                    }
+                    fields.append(o);
+                }
+                QJsonArray custom;
+                for (const auto& [id, name] : g.customActions) custom.append(QJsonObject{{"id", QString::fromStdString(id)}, {"name", QString::fromStdString(name)}});
+                return QJsonObject{{"name", QString::fromStdString(g.name)}, {"description", QString::fromStdString(g.description)},
+                                   {"real_time", g.realTime}, {"any_time", g.nonRealTime}, {"steps", g.stepCount},
+                                   {"fields", fields}, {"custom_actions", custom},
+                                   {"defaults", QJsonDocument::fromJson(QByteArray::fromStdString(ografDefaultData(g))).object()}};
+            };
+            if (action == "info") {
+                QJsonObject r = describe(graphic(need(a, "manifest")));
+                r["browser"] = QString::fromStdString(ografBrowser());
+                return ok(r.value("name").toString(), r);
+            }
+            if (a.contains("data") && !a.value("data").isObject()) throw ArgError{"\"data\" is an object"};
+            if (a.contains("actions")) {
+                if (!a.value("actions").isArray()) throw ArgError{"\"actions\" is an array"};
+                for (const QJsonValue& v : a.value("actions").toArray()) {
+                    const QJsonObject o = v.toObject();
+                    static const QStringList types{"playAction", "stopAction", "updateAction", "customAction"};
+                    if (!o.value("at").isDouble() || !types.contains(o.value("type").toString()))
+                        throw ArgError{"Each action has \"at\" (seconds) and \"type\" (playAction, stopAction, updateAction or customAction)"};
+                    if (o.contains("params") && !o.value("params").isObject()) throw ArgError{"An action's \"params\" is an object"};
+                }
+            }
+            for (const char* key : {"out", "advance"})
+                if (a.contains(key) && !a.value(key).isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(key)};
+            // The data, the actions and the timing onto a generator.
+            auto apply = [&](Effect& e, const QJsonObject& base) {
+                QJsonObject data = base;
+                const QJsonObject given = a.value("data").toObject();
+                for (auto it = given.begin(); it != given.end(); ++it) data[it.key()] = it.value();
+                e.strings["data"] = QJsonDocument(data).toJson(QJsonDocument::Compact).toStdString();
+                if (a.contains("actions")) {
+                    if (a.value("actions").toArray().isEmpty()) e.strings.erase("actions");
+                    else e.strings["actions"] = QJsonDocument(a.value("actions").toArray()).toJson(QJsonDocument::Compact).toStdString();
+                }
+                if (a.contains("out")) e.params["out"] = Param(std::clamp(a.value("out").toDouble(), 0.0, 30.0));
+                if (a.contains("advance")) e.params["advance"] = Param(std::clamp(a.value("advance").toDouble(), 0.0, 60.0));
+            };
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            if (action == "add") {
+                const QString manifest = QFileInfo(need(a, "manifest")).absoluteFilePath();
+                const OGrafGraphic g = graphic(manifest);
+                TrackRef t{TrackKind::Video, 0};
+                if (a.contains("track")) t = trackArg(str(a, "track"), s, true, &l.project, &s);
+                else {
+                    int top = -1;
+                    for (int i = 0; i < int(s.videoTracks.size()); ++i)
+                        if (!s.videoTracks[size_t(i)].clips.empty()) top = i;
+                    t = top + 1 < int(s.videoTracks.size()) ? TrackRef{TrackKind::Video, top + 1} : edit::addTrack(l.project, s, TrackKind::Video);
+                }
+                const FrameTime len = a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(5 * s.fpsValue()));
+                Clip c = makeGeneratorClip(l.project, "ograf", std::max<FrameTime>(1, len));
+                c.generator.strings["manifest"] = manifest.toStdString();
+                apply(c.generator, QJsonDocument::fromJson(QByteArray::fromStdString(ografDefaultData(g))).object());
+                c.start = timeArg(a.value("at"), s, "at");
+                if (!g.name.empty()) c.name = g.name;
+                const auto r = edit::overwrite(l.project, s, t, c);
+                check(r);
+                save(l);
+                const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
+                QJsonObject out = made ? clipJson(l.project, s, *made) : QJsonObject{};
+                out["graphic"] = describe(g);
+                return ok(QStringLiteral("Added %1 on %2").arg(QString::fromStdString(g.name), QString::fromStdString(trackAt(s, t)->name)), out);
+            }
+            Clip& c = clipArg(l, a);
+            if (c.generator.type != "ograf") throw ArgError{"That clip is not an OGraf graphic"};
+            if (action == "set") {
+                QJsonObject base = QJsonDocument::fromJson(QByteArray::fromStdString(c.generator.s("data"))).object();
+                if (a.contains("manifest")) {
+                    // Another graphic: its defaults beneath the data it had.
+                    const QString manifest = QFileInfo(str(a, "manifest")).absoluteFilePath();
+                    QJsonObject data = QJsonDocument::fromJson(QByteArray::fromStdString(ografDefaultData(graphic(manifest)))).object();
+                    for (auto it = base.begin(); it != base.end(); ++it) data[it.key()] = it.value();
+                    base = data;
+                    c.generator.strings["manifest"] = manifest.toStdString();
+                }
+                apply(c.generator, base);
+                save(l);
+                return ok(QStringLiteral("Changed the graphic"), clipJson(l.project, s, c));
+            }
+            if (action != "render") throw ArgError{"\"action\" is info, add, set or render"};
+            const OGrafJob job = ografClipJob(c.generator, s.width, s.height, s.fpsValue(), c.duration);
+            if (job.manifest.empty()) throw ArgError{"That clip has no graphic"};
+            QElapsedTimer clock;
+            clock.start();
+            const bool cached = ografCached(job);
+            if (!prepareOGraf(job, {}, nullptr, &err)) return fail(QString::fromStdString(err));
+            return ok(cached ? QStringLiteral("Already rendered") : QStringLiteral("Rendered %1 frames").arg(job.frames),
+                      QJsonObject{{"frames", job.frames}, {"seconds", cached ? 0.0 : clock.elapsed() / 1000.0},
+                                  {"folder", QString::fromStdString(ografCacheFolder(job))}});
         });
 
     add("montage_animate_to_audio", "Animate to audio",

@@ -430,6 +430,10 @@ private:
     // Imports an OTIO, EDL or FCP XML timeline as a new sequence (one undo step).
     void importTimeline();
     void addTitle();
+public:
+    // Adds the OGraf graphic `file` (asked for when "") at the playhead, its data its defaults; the clip, or 0.
+    Id addOGrafGraphic(const QString& file = {});
+private:
     void newSequence();
     void openInSource(Id media);
     Id makeSubclip();

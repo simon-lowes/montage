@@ -74,6 +74,9 @@ private:
     void publishParameter(const Target& target, const std::string& param, const QString& label);
     // A graphic's own values for the fields its template publishes (core/GraphicsTemplate.h).
     void addGraphicSection(const Clip& clip);
+    // An OGraf graphic's data, a row per field of its schema, and rendering it ahead.
+    void addOGrafFields(QFormLayout* form, const Clip& clip, const Target& target);
+    void renderOGrafClip(Id clip);
 
 public:
     // Publishes setting `param` of effect `effect` (0: the generator) on clip `clip` of the open sequence as a field

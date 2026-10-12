@@ -68,6 +68,7 @@
 #include "media/SpeakerSwitch.h"
 #include "media/Tracking.h"
 #include "media/CameraSolve.h"
+#include "render/OGraf.h"
 #include "media/Vector.h"
 #include "media/Beats.h"
 #include "render/Spherical.h"
@@ -16623,6 +16624,277 @@ if ui["pressed"] == "add":
         std::atomic<bool> stop{true};
         QVERIFY(!solveMediaCamera(video, 0, frames / 25.0, {}, s, {}, &stop, &err));
         QCOMPARE(err, std::string("Cancelled"));
+    }
+
+    // Writes `text` to `file` (folders made).
+    static void writeText(const QString& file, const QString& text) {
+        QDir().mkpath(QFileInfo(file).absolutePath());
+        QFile f(file);
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write(text.toUtf8());
+    }
+
+    void ografGraphics() {
+        // A real-time lower third: a red bar (its colour from the data) wipes in over a second with a CSS transition and
+        // out again on stop; a blue dot moves 100 px a second on animation frames, and drops 20 px after half a second
+        // on a timer. Its element draws in a shadow root.
+        // (tests/data/ograf/lower-third)
+        const QString dir = QString::fromStdString(path("ograf"));
+        const QString lower = QStringLiteral(MONTAGE_TEST_DATA_DIR "/ograf/lower-third/lower.ograf.json");
+        OGrafGraphic g;
+        std::string err;
+        QVERIFY(isOGrafManifest(lower.toStdString()) && !isOGrafManifest("lower.json"));
+        QVERIFY2(readOGraf(lower.toStdString(), g, &err), err.c_str());
+        QCOMPARE(g.name, std::string("Lower Third"));
+        QCOMPARE(g.main, std::string("lib/graphic.mjs"));
+        QVERIFY(g.realTime && !g.nonRealTime && g.stepCount == 1);
+        QCOMPARE(g.fields.size(), size_t(7));
+        std::map<std::string, OGrafField> fields;
+        for (const OGrafField& f : g.fields) fields[f.key] = f;
+        QCOMPARE(fields["name"].title, std::string("Name"));
+        QVERIFY(fields["role"].multiline && fields["role"].type == "string");
+        QCOMPARE(fields["color"].choices.size(), size_t(2));
+        QCOMPARE(fields["size"].type, std::string("number"));
+        QCOMPARE(fields["count"].type, std::string("integer"));
+        QCOMPARE(fields["show"].type, std::string("boolean"));
+        QCOMPARE(fields["extra"].type, std::string("json"));
+        QCOMPARE(g.customActions.size(), size_t(1));
+        const QJsonObject defaults = QJsonDocument::fromJson(QByteArray::fromStdString(ografDefaultData(g))).object();
+        QCOMPARE(defaults.value("name").toString(), QString("Ada Lovelace"));
+        QCOMPARE(defaults.value("size").toDouble(), 40.0);
+        QCOMPARE(defaults.value("extra").toObject().value("a").toInt(), 1);
+        QVERIFY(!defaults.contains("role"));
+        writeText(dir + "/bad.ograf.json", R"~({"name": "No module"})~");
+        QVERIFY(!readOGraf((dir + "/bad.ograf.json").toStdString(), g, &err) && QString::fromStdString(err).contains("main"));
+        QVERIFY(!readOGraf((dir + "/none.ograf.json").toStdString(), g, &err));
+
+        if (ografBrowser().empty()) QSKIP("No Chrome, Chromium or Edge to render OGraf graphics in (set MONTAGE_CHROMIUM)");
+        qputenv("MONTAGE_OGRAF_CACHE", path("ograf-cache").c_str());
+        struct Unset {
+            ~Unset() { qunsetenv("MONTAGE_OGRAF_CACHE"); }
+        } unset;
+
+        // Rendered over 2 s at 25 fps, 320 x 180, played in at the start and out at 1 s.
+        OGrafJob job;
+        job.manifest = lower.toStdString();
+        job.data = R"~({"color": "rgb(255, 0, 0)"})~";
+        job.width = 320;
+        job.height = 180;
+        job.fps = 25;
+        job.frames = 50;
+        job.actions = {{0, "playAction", R"~({"delta": 1})~"}, {1.0, "stopAction", "{}"}};
+        const std::string frames = path("ograf-frames");
+        std::vector<double> fractions;
+        QElapsedTimer clock;
+        clock.start();
+        QVERIFY2(renderOGraf(job, frames, [&](double f) { fractions.push_back(f); }, nullptr, &err), err.c_str());
+        qInfo("rendered 50 frames in %lld ms", qint64(clock.elapsed()));
+        QCOMPARE(fractions.size(), size_t(50));
+        auto frame = [&](int i) {
+            QImage q(QString::fromStdString(frames) + QStringLiteral("/frame_%1.png").arg(i, 5, 10, QLatin1Char('0')));
+            return q.convertToFormat(QImage::Format_RGBA8888);
+        };
+        // The bar's right end (its row at y = 120), and the dot's left edge and top.
+        auto barEnd = [](const QImage& q) {
+            int end = -1;
+            for (int x = 0; x < q.width(); ++x) {
+                const QColor c = q.pixelColor(x, 120);
+                if (c.alpha() > 128 && c.red() > 200 && c.blue() < 60) end = x;
+            }
+            return end;
+        };
+        auto dot = [](const QImage& q, int& left, int& top) {
+            left = top = -1;
+            for (int y = 0; y < q.height() && left < 0; ++y)
+                for (int x = 0; x < q.width(); ++x) {
+                    const QColor c = q.pixelColor(x, y);
+                    if (c.alpha() > 128 && c.blue() > 200 && c.red() < 60) {
+                        left = x;
+                        top = y;
+                        break;
+                    }
+                }
+        };
+        const QImage f0 = frame(0), f10 = frame(10), f25 = frame(25), f40 = frame(40);
+        QCOMPARE(f0.size(), QSize(320, 180));
+        QCOMPARE(f0.pixelColor(300, 170).alpha(), 0);  // transparent where nothing is drawn
+        QVERIFY2(barEnd(f0) < 33, qPrintable(QString::number(barEnd(f0))));
+        // 0.4 s in: the wipe is 40 % across (80 px of 200), the dot 40 px along and not yet dropped.
+        QVERIFY2(std::abs(barEnd(f10) - (32 + 80 - 1)) <= 2, qPrintable(QString::number(barEnd(f10))));
+        int left = 0, top = 0;
+        dot(f10, left, top);
+        QVERIFY2(std::abs(left - 40) <= 1 && top == 0, qPrintable(QString("%1 %2").arg(left).arg(top)));
+        // 1 s: all the way, the dot at 100 px and dropped; then out over the next second (1.6 s: 40 % left).
+        QVERIFY2(std::abs(barEnd(f25) - (32 + 200 - 1)) <= 2, qPrintable(QString::number(barEnd(f25))));
+        dot(f25, left, top);
+        QVERIFY2(std::abs(left - 100) <= 1 && top == 20, qPrintable(QString("%1 %2").arg(left).arg(top)));
+        QVERIFY2(std::abs(barEnd(f40) - (32 + 80 - 1)) <= 2, qPrintable(QString::number(barEnd(f40))));
+        // The same again: exactly the same pixels (a clock of its own, not the computer's).
+        const std::string again = path("ograf-again");
+        QVERIFY2(renderOGraf(job, again, {}, nullptr, &err), err.c_str());
+        QCOMPARE(QImage(QString::fromStdString(again) + "/frame_00010.png").convertToFormat(QImage::Format_RGBA8888), f10);
+
+        // A graphic that can go to any time is told each frame's: a green bar 1 px per 10 ms, blue once played.
+        const QString seekable = QStringLiteral(MONTAGE_TEST_DATA_DIR "/ograf/seek/seek.ograf.json");
+        OGrafJob seekJob = job;
+        seekJob.manifest = seekable.toStdString();
+        seekJob.frames = 20;
+        seekJob.actions = {{0.5, "playAction", "{}"}};
+        const std::string seekFrames = path("seek-frames");
+        QVERIFY2(renderOGraf(seekJob, seekFrames, {}, nullptr, &err), err.c_str());
+        auto widthAt = [&](int i, QColor& colour) {
+            const QImage q = QImage(QString::fromStdString(seekFrames) + QStringLiteral("/frame_%1.png").arg(i, 5, 10, QLatin1Char('0')))
+                                 .convertToFormat(QImage::Format_RGBA8888);
+            int w = 0;
+            while (w < q.width() && q.pixelColor(w, 5).alpha() > 128) ++w;
+            colour = q.pixelColor(0, 5);
+            return w;
+        };
+        QColor colour;
+        QCOMPARE(widthAt(5, colour), 20);  // 200 ms
+        QVERIFY(colour.green() > 200);
+        QCOMPARE(widthAt(15, colour), 60);  // 600 ms: played
+        QVERIFY(colour.blue() > 200);
+
+        // A graphic that fails says why; so does a missing browser.
+        writeText(dir + "/broken/broken.ograf.json", R"~({"name": "Broken", "main": "b.mjs"})~");
+        writeText(dir + "/broken/b.mjs", "export default class B extends HTMLElement { async load() { throw new Error('No data feed'); } }");
+        OGrafJob broken = job;
+        broken.manifest = (dir + "/broken/broken.ograf.json").toStdString();
+        broken.frames = 2;
+        QVERIFY(!renderOGraf(broken, path("broken-frames"), {}, nullptr, &err));
+        QVERIFY2(QString::fromStdString(err).contains("No data feed"), err.c_str());
+        writeText(dir + "/nomodule/n.ograf.json", R"~({"name": "Missing", "main": "gone.mjs"})~");
+        broken.manifest = (dir + "/nomodule/n.ograf.json").toStdString();
+        QVERIFY(!renderOGraf(broken, path("broken-frames"), {}, nullptr, &err) && !err.empty());
+        {
+            const QByteArray browser = qgetenv("MONTAGE_CHROMIUM");
+            qputenv("MONTAGE_CHROMIUM", "/nonexistent/chrome");
+            QVERIFY(!renderOGraf(job, path("none-frames"), {}, nullptr, &err));
+            QVERIFY2(QString::fromStdString(err).contains("Chrome"), err.c_str());
+            if (browser.isEmpty()) qunsetenv("MONTAGE_CHROMIUM");
+            else qputenv("MONTAGE_CHROMIUM", browser);
+        }
+        std::atomic<bool> stop{true};
+        QVERIFY(!renderOGraf(job, path("stopped-frames"), {}, &stop, &err));
+        QCOMPARE(err, std::string("Cancelled"));
+        // An action that fails says so; data holding "%2" is passed as it is.
+        writeText(dir + "/cue/cue.ograf.json", "{\"name\": \"Cue\", \"main\": \"cue.mjs\"}");
+        writeText(dir + "/cue/cue.mjs", "export default class C extends HTMLElement { async load({ data }) { this.textContent = data.t; "
+                                        "if (data.t !== 'a%2Fb%1') throw new Error('Data changed: ' + data.t); } "
+                                        "async playAction() { throw new Error('No cue'); } }");
+        broken.manifest = (dir + "/cue/cue.ograf.json").toStdString();
+        broken.data = R"~({"t": "a%2Fb%1"})~";
+        QVERIFY(!renderOGraf(broken, path("cue-frames"), {}, nullptr, &err));
+        QVERIFY2(QString::fromStdString(err).contains("playAction: No cue"), err.c_str());
+
+        // On the timeline: an OGraf Graphic clip over 2 s plays in at its start and out a second before its end; its
+        // frames are rendered once (cached) and drawn at the preview's size too.
+        Project p = makeDefaultProject();
+        Sequence& sq = *p.active();
+        sq.width = 320;
+        sq.height = 180;
+        sq.fps = {25, 1};
+        Clip c = makeGeneratorClip(p, "ograf", 50);
+        c.generator.strings["manifest"] = lower.toStdString();
+        c.generator.strings["data"] = R"~({"color": "rgb(255, 0, 0)"})~";
+        QVERIFY(edit::overwrite(p, sq, {TrackKind::Video, 0}, c).ok);
+        const Clip& placed = sq.videoTracks[0].clips.at(0);
+        const OGrafJob clipJob = ografClipJob(placed.generator, 320, 180, 25, 50);
+        QCOMPARE(clipJob.actions.size(), size_t(2));
+        QCOMPARE(clipJob.actions[1].type, std::string("stopAction"));
+        QCOMPARE(clipJob.actions[1].at, 1.0);
+        QVERIFY(!ografCached(clipJob));
+        RenderOptions o;
+        const Image at10 = renderSequenceFrame(p, sq, 10, o);
+        QVERIFY(ografCached(clipJob));
+        auto red = [](const Image& img, int x, int y) { const float* px = img.at(x, y); return px[0] > 0.8f && px[1] < 0.2f && px[3] > 0.9f; };
+        QVERIFY(red(at10, 100, 120) && !red(at10, 130, 120));  // 0.4 s: the wipe 80 px across from 32
+        clock.restart();
+        const Image at25 = renderSequenceFrame(p, sq, 25, o);
+        QVERIFY(clock.elapsed() < 2000);  // (from the cache)
+        QVERIFY(red(at25, 220, 120));
+        o.scale = 0.5;
+        const Image half = renderSequenceFrame(p, sq, 25, o);
+        QCOMPARE(half.width, 160);
+        QVERIFY(red(half, 110, 60));
+        // Scaled down to a third on the timeline: still the sequence-size render, not one of its own.
+        auto renders = [&] { return QDir(QString::fromStdString(path("ograf-cache"))).entryList(QDir::Dirs | QDir::NoDotAndDotDot).size(); };
+        const auto before = renders();
+        o.scale = 1;
+        sq.videoTracks[0].clips.at(0).motion.params["scale"] = Param(33.0);
+        renderSequenceFrame(p, sq, 25, o);
+        QCOMPARE(renders(), before);
+        sq.videoTracks[0].clips.at(0).motion.params["scale"] = Param(100.0);
+        // Its own actions instead: played in at 0.2 s and never out.
+        Effect custom = placed.generator;
+        custom.strings["actions"] = R"~([{"at": 0.2, "type": "playAction", "params": {"delta": 1}}])~";
+        const OGrafJob customJob = ografClipJob(custom, 320, 180, 25, 50);
+        QCOMPARE(customJob.actions.size(), size_t(1));
+        QCOMPARE(customJob.actions[0].at, 0.2);
+        QVERIFY(ografCacheFolder(customJob) != ografCacheFolder(clipJob));
+        // Changed data renders again; a clip with no graphic draws nothing.
+        Effect blue = placed.generator;
+        blue.strings["data"] = R"~({"color": "rgb(0, 255, 0)"})~";
+        QVERIFY(ografCacheFolder(ografClipJob(blue, 320, 180, 25, 50)) != ografCacheFolder(clipJob));
+        Effect none = placed.generator;
+        none.strings.erase("manifest");
+        QVERIFY(ografCacheFolder(ografClipJob(none, 320, 180, 25, 50)).empty());
+        const Image empty = ografFrame(none, 10, 320, 180, 320, 180, 50, 25);
+        QCOMPARE(empty.at(100, 120)[3], 0.0f);
+
+        // Through MCP: a graphic's fields, added with some of its data, changed, and rendered (or why not).
+        const QString project = QString::fromStdString(path("ograf.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_ograf"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        QJsonObject r = call({{"action", "info"}, {"manifest", lower}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QJsonObject sc = r.value("structuredContent").toObject();
+        QCOMPARE(sc.value("fields").toArray().size(), 7);
+        QCOMPARE(sc.value("defaults").toObject().value("name").toString(), QString("Ada Lovelace"));
+        r = call({{"action", "info"}, {"manifest", dir + "/bad.ograf.json"}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"project", project}, {"manifest", lower}, {"at", 3}, {"duration", 2}, {"data", QJsonObject{{"color", "rgb(0, 255, 0)"}}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const Id added = Id(r.value("structuredContent").toObject().value("id").toDouble());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Clip* made = edit::clipById(*back.active(), added);
+        QVERIFY(made && made->generator.type == "ograf" && made->name == "Lower Third");
+        QJsonObject data = QJsonDocument::fromJson(QByteArray::fromStdString(made->generator.s("data"))).object();
+        QCOMPARE(data.value("color").toString(), QString("rgb(0, 255, 0)"));
+        QCOMPARE(data.value("name").toString(), QString("Ada Lovelace"));  // (the defaults beneath)
+        r = call({{"project", project}, {"action", "set"}, {"clip", double(added)}, {"data", QJsonObject{{"name", "Grace Hopper"}}},
+                  {"actions", QJsonArray{QJsonObject{{"at", 0}, {"type", "playAction"}}}}, {"out", 0}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(loadProject(project.toStdString(), back));
+        made = edit::clipById(*back.active(), added);
+        data = QJsonDocument::fromJson(QByteArray::fromStdString(made->generator.s("data"))).object();
+        QCOMPARE(data.value("name").toString(), QString("Grace Hopper"));
+        QCOMPARE(data.value("color").toString(), QString("rgb(0, 255, 0)"));
+        QVERIFY(made->generator.s("actions").find("playAction") != std::string::npos);
+        r = call({{"project", project}, {"action", "set"}, {"clip", double(added)}, {"actions", QJsonArray{QJsonObject{{"type", "dance"}}}}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"project", project}, {"action", "set"}, {"clip", double(added)},
+                  {"actions", QJsonArray{QJsonObject{{"at", 0}, {"type", "playAction"}, {"params", 1}}}}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"project", project}, {"action", "render"}, {"clip", double(added)}});
+        QVERIFY2(!r.value("isError").toBool() && text(r).startsWith("Rendered"), qPrintable(text(r)));
+        r = call({{"project", project}, {"action", "render"}, {"clip", double(added)}});
+        QVERIFY2(text(r) == "Already rendered", qPrintable(text(r)));
+        r = call({{"project", project}, {"action", "set"}, {"clip", double(added)}, {"manifest", dir + "/broken/broken.ograf.json"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call({{"project", project}, {"action", "render"}, {"clip", double(added)}});
+        QVERIFY2(r.value("isError").toBool() && text(r).contains("No data feed"), qPrintable(text(r)));
     }
 
     void multicamSpeakerSwitchAndAudioAngles() {
