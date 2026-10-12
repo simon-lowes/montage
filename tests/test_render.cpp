@@ -4910,6 +4910,22 @@ colorspaces:
         QVERIFY(!sched.start(d, d.modes[0], s, cfg, &why));
     }
 
+    void deckLinkWithoutDriver() {
+        using namespace montage::output;
+        // No Desktop Video here: listed, not available, with the reason, and no devices or opening.
+        const auto dl = findBackend("DeckLink");
+        QVERIFY(dl);
+        std::string why;
+        QVERIFY(!dl->available(&why));
+        QVERIFY(!why.empty());
+        QVERIFY(dl->devices().empty());
+        Device d;
+        d.id = "0";
+        QVERIFY(!dl->open(d, standardModes()[0], Signal{}, 2, 48000, &why));
+        QVERIFY(!why.empty());
+        QCOMPARE(dl->receivers(), -1);
+    }
+
     void ndiOutput() {
         using namespace montage::output;
         // A stand-in NDI Runtime where the SDK says to look.

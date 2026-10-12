@@ -131,6 +131,7 @@
 #include "ReviewOverlay.h"
 #include "ChartMatchDialog.h"
 #include "LensCorrectionDialog.h"
+#include "ReferenceOutputPanel.h"
 #include "SequenceIndexPanel.h"
 #include "StackedTimelineWidget.h"
 #include "PanFollowDialog.h"
@@ -1784,7 +1785,25 @@ void MainWindow::buildMenus() {
             a->setCheckable(true);
             a->setChecked(cleanFeed_ && cleanFeed_->isVisible() && cleanFeed_->screen() == screens[i]);
         }
+        output->addSeparator();
+        output->addAction(referenceOutputAction_);
     });
+    // To a broadcast monitor: SDI/HDMI through a DeckLink card, or NDI (render/ReferenceOutput.h).
+    referenceOutput_ = new ReferenceOutputController(program_, this);
+    referenceOutputAction_ = new QAction(tr("Reference Output…"), this);
+    referenceOutputAction_->setObjectName(QStringLiteral("referenceOutput"));
+    referenceOutputAction_->setToolTip(tr("The Program to a broadcast monitor through a DeckLink card (SDI or HDMI) or over NDI"));
+    referenceOutputAction_->setCheckable(true);
+    connect(referenceOutputAction_, &QAction::triggered, this, [this] {
+        referenceOutputAction_->setChecked(referenceOutput_->running());
+        showReferenceOutput();
+    });
+    connect(referenceOutput_, &ReferenceOutputController::runningChanged, referenceOutputAction_, &QAction::setChecked);
+    addAction(referenceOutputAction_);
+    if (liveLink_)
+        liveLink_->addAppTool(ReferenceOutputController::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
+            return referenceOutput_->runTool(args, structured, isError);
+        });
     // How ambisonic sound (core/Ambisonics.h) is heard: binaurally on headphones, or as stereo on speakers.
     {
         QMenu* ambiM = play->addMenu(tr("Ambisonic Monitoring"));
@@ -2099,7 +2118,17 @@ void MainWindow::syncProgram() {
     const Sequence* s = state_->sequence();
     if (!s) return;
     program_->setProject(state_->project(), s->id);
+    if (referenceOutput_) referenceOutput_->sequenceChanged();
     program_->requestFrame();
+}
+
+void MainWindow::showReferenceOutput() {
+    if (auto* open = findChild<ReferenceOutputPanel*>(QStringLiteral("referenceOutputDialog"))) {
+        open->raise();
+        open->activateWindow();
+        return;
+    }
+    (new ReferenceOutputPanel(referenceOutput_, this))->show();
 }
 
 void MainWindow::rebuildSourceProject() {

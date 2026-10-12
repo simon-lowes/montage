@@ -26,6 +26,10 @@ namespace montage {
 
 class RenderWorker;
 class MixerDevice;
+namespace output {
+class Scheduler;
+}
+struct OutputAudio;
 
 class PlaybackController : public QObject {
     Q_OBJECT
@@ -57,6 +61,11 @@ public:
     // Also render HDR sequences as light for the HDR viewer (hdrFrameRendered), beside their SDR pictures.
     void setHdrOutput(bool on);
     bool hdrOutput() const { return hdrOutput_; }
+
+    // Reference output (render/ReferenceOutput.h): every frame rendered also goes to `out` (in the sequence's own
+    // colour space, at its render scale, the render cache bypassed), with the playhead and the sound heard; null: none.
+    void setReferenceOutput(std::shared_ptr<output::Scheduler> out);
+    std::shared_ptr<output::Scheduler> referenceOutput() const { return output_; }
 
     bool isPlaying() const { return speed_ != 0; }
     // Global Mute (as in Premiere): playback and scrubbing are silent; clips, tracks and exports are untouched.
@@ -122,6 +131,8 @@ private:
     int playStep() const;
     void scrubAudio(FrameTime t);  // frames per tick direction for render-ahead (0 = paused)
     void updateHeard();
+    void syncOutput();  // the playhead and what is heard, to the reference output
+    double renderScale() const;
 
     std::shared_ptr<const Project> project_;
     std::shared_ptr<const Project> heard_;  // project_, or a copy with mutedTracks_ muted and liveMix_ laid over
@@ -152,6 +163,8 @@ private:
     AudioMixer scrubMixer_;
     bool globalMute_ = false;
     bool ambisonicBinaural_ = true;
+    std::shared_ptr<output::Scheduler> output_;
+    std::shared_ptr<OutputAudio> outputAudio_;
 };
 
 }  // namespace montage

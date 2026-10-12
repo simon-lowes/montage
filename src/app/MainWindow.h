@@ -44,6 +44,7 @@ class RedactFacesDialog;
 class EditorState;
 class CompareDialog;
 class CleanFeedWindow;
+class ReferenceOutputController;
 struct ConsolidateOptions;
 class PlaybackController;
 class MonitorPanel;
@@ -436,6 +437,7 @@ private:
     void offerRecovery(const std::vector<RecoveryManager::Session>& crashed);
     void openSnapshot();
     void showShortcuts();
+    void showReferenceOutput();
     void about();
 
     EditorState* state_;
@@ -465,6 +467,9 @@ private:
     InspectorWidget* inspector_ = nullptr;
     ScopesWidget* scopes_ = nullptr;
     CleanFeedWindow* cleanFeed_ = nullptr;
+    // Playback › Video Output › Reference Output…: the Program to a DeckLink card or over NDI.
+    ReferenceOutputController* referenceOutput_ = nullptr;
+    QAction* referenceOutputAction_ = nullptr;
     MixerPanel* mixer_ = nullptr;
     ControlSurface* surface_ = nullptr;
     OscControl* osc_ = nullptr;

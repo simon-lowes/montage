@@ -207,6 +207,7 @@ private:
 };
 
 std::shared_ptr<Backend> makeNdiBackend();
+std::shared_ptr<Backend> makeDeckLinkBackend();
 
 // The interfaces Montage knows (NDI and DeckLink; and Virtual, a test device, with MONTAGE_VIRTUAL_OUTPUT set).
 std::vector<std::shared_ptr<Backend>> backends();

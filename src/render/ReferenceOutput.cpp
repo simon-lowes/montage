@@ -515,13 +515,13 @@ Signal VirtualBackend::openSignal() const {
 }
 
 std::vector<std::shared_ptr<Backend>> backends() {
-    static const std::vector<std::shared_ptr<Backend>> all = [] {
-        std::vector<std::shared_ptr<Backend>> v{makeNdiBackend()};
-        const char* virt = std::getenv("MONTAGE_VIRTUAL_OUTPUT");
-        if (virt && *virt) v.push_back(std::make_shared<VirtualBackend>());
-        return v;
-    }();
-    return all;
+    static const std::shared_ptr<Backend> decklink = makeDeckLinkBackend(), ndi = makeNdiBackend();
+    static const std::shared_ptr<Backend> virt = std::make_shared<VirtualBackend>();
+    std::vector<std::shared_ptr<Backend>> v{decklink, ndi};
+    // (looked at each time, so a test can turn it on after start-up)
+    const char* env = std::getenv("MONTAGE_VIRTUAL_OUTPUT");
+    if (env && *env) v.push_back(virt);
+    return v;
 }
 
 std::shared_ptr<Backend> findBackend(const std::string& name) {

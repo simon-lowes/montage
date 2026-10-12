@@ -65,12 +65,18 @@ public:
     // A stopped script's calls: those waiting are answered as not run, and one running is not applied.
     void cancelScript(const QString& group);
 
+    // A tool the app answers itself on the UI thread (one the engine has no part in, such as the reference monitor
+    // output), listed with the others. `run` gives the text, sets `structured` and `isError`.
+    using AppTool = std::function<QString(const QJsonObject& args, QJsonObject& structured, bool& isError)>;
+    void addAppTool(const QByteArray& toolJson, AppTool run);
+
 signals:
     void runningChanged(bool on);
     // A tool changed the open project: the undo step's name.
     void applied(const QString& label);
 
 private:
+    std::vector<std::pair<QJsonObject, AppTool>> appTools_;
     struct Job {
         QJsonObject message;
         std::function<void(QByteArray)> done;

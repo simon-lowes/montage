@@ -47,6 +47,7 @@
 #include <QJsonDocument>
 #include "core/ProjectLock.h"
 #include "ProductionPanel.h"
+#include "ReferenceOutputPanel.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -12943,6 +12944,70 @@ print("added " .. ui.name)
         QCOMPARE(program->speed(), 2.0);
         program->shuttle(0);
         QCOMPARE(program->speed(), 0.0);
+    }
+
+    void referenceOutputFollowsProgram() {
+        loadDemo();
+        // The test device stands in for a DeckLink card or NDI.
+        qputenv("MONTAGE_VIRTUAL_OUTPUT", "1");
+        auto* action = win_->findChild<QAction*>("referenceOutput");
+        QVERIFY(action);
+        action->trigger();
+        auto* dlg = win_->findChild<QDialog*>("referenceOutputDialog");
+        QVERIFY(dlg);
+        auto* backend = dlg->findChild<QComboBox*>("outputBackend");
+        QVERIFY(backend);
+        const int virt = backend->findData(QStringLiteral("Virtual"));
+        QVERIFY(virt >= 0);
+        backend->setCurrentIndex(virt);
+        QCOMPARE(dlg->findChild<QComboBox*>("outputDevice")->currentText(), QStringLiteral("Virtual Output"));
+        // Started at the sequence's own mode: the Program's frames go out and the menu shows it on.
+        state()->setPlayhead(10);
+        auto* start = dlg->findChild<QPushButton*>("outputStart");
+        start->click();
+        auto* controller = win_->findChild<ReferenceOutputController*>();
+        QVERIFY(controller);
+        QVERIFY2(controller->running(), qPrintable(controller->status()));
+        QVERIFY(action->isChecked());
+        auto dev = std::dynamic_pointer_cast<output::VirtualBackend>(controller->backend());
+        QVERIFY(dev);
+        // (a small sequence is fitted into the device's mode at its rate)
+        QCOMPARE(dev->openMode().fps.num * state()->sequence()->fps.den, state()->sequence()->fps.num * dev->openMode().fps.den);
+        QTRY_VERIFY_WITH_TIMEOUT(!dev->sent().empty() && dev->sent().back().frame == 10, 5000);
+        // A seek sends the new frame.
+        state()->setPlayhead(40);
+        QTRY_VERIFY_WITH_TIMEOUT(dev->sent().back().frame == 40, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(dlg->findChild<QLabel*>("outputStatus")->text().contains("Virtual Output"), 2000);
+        // Stopped from the panel.
+        start->click();
+        QVERIFY(!controller->running());
+        QVERIFY(!action->isChecked());
+        dlg->close();
+        // The same from an agent: listed, started on the Virtual device, its status, stopped.
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 3}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_reference_output"}, {"arguments", args}}}};
+            win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+            return answer;
+        };
+        QJsonObject r = call({{"action", "list"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(QJsonDocument(r).toJson().contains("Virtual Output"));
+        r = call({{"action", "start"}, {"interface", "Virtual"}, {"device", "Virtual Output"}, {"mode", "1080p25"}, {"depth", 8}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(controller->running());
+        dev = std::dynamic_pointer_cast<output::VirtualBackend>(controller->backend());
+        QCOMPARE(dev->openMode().name, std::string("1080p25"));
+        QCOMPARE(controller->scheduler()->signal().format, output::PixelFormat::Uyvy8);
+        r = call({{"action", "status"}});
+        QCOMPARE(r.value("structuredContent").toObject().value("mode").toString(), QStringLiteral("1080p25"));
+        r = call({{"action", "start"}, {"interface", "Virtual"}, {"mode", "4320p25"}});
+        QVERIFY(r.value("isError").toBool());  // no such mode
+        r = call({{"action", "stop"}});
+        QVERIFY(!r.value("isError").toBool() && !controller->running());
+        qunsetenv("MONTAGE_VIRTUAL_OUTPUT");
     }
 
     void saveAndReopen() {

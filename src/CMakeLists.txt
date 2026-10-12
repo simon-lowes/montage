@@ -168,7 +168,7 @@ add_library(montage_engine STATIC
   render/Deconvolve.h render/Deconvolve.cpp
   render/Exporter.h render/Exporter.cpp
   render/VideoPacking.h render/VideoPacking.cpp
-  render/ReferenceOutput.h render/ReferenceOutput.cpp render/NdiOutput.cpp
+  render/ReferenceOutput.h render/ReferenceOutput.cpp render/NdiOutput.cpp render/DeckLinkOutput.cpp
   audio/Plugins.h audio/PluginScan.cpp audio/ClapHost.cpp
   audio/DynLib.h audio/DynLib.cpp
   audio/PluginEffect.h audio/PluginEffect.cpp
@@ -183,6 +183,13 @@ target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_pa
 target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/openfx/include)
 # NDI SDK headers (MIT, these files only), for loading the NDI Runtime when installed (render/NdiOutput).
 target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/ndi/include)
+# DeckLink SDK 12 headers (Blackmagic's permissive licence), for the Desktop Video driver's API when installed
+# (render/DeckLinkOutput; not on Windows yet).
+if(APPLE)
+  target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/decklink/mac)
+elseif(NOT WIN32)
+  target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/decklink/linux)
+endif()
 
 if(MONTAGE_WITH_VST3)
   # The VST 3 interfaces and the few SDK host helpers Montage uses (MIT).
