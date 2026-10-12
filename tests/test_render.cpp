@@ -7,6 +7,8 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <cmath>
 #include <complex>
 #include <cstring>
@@ -2517,6 +2519,23 @@ colorspaces:
         QVERIFY(c[0] > 0.9f && c[1] < 0.1f && c[2] > 0.9f);  // green inverted: magenta
         QVERIFY(!edit::applyStillGrade(p, s, found, {}).ok);
 
+        // A shared node goes as the still has it: not one of the same id here that does something else (another
+        // project's ids could be anything's here), and one copy for all the clips it goes on, reused when applied again.
+        GalleryStill shared = found;
+        shared.sharedNodes = {SharedNode{9000, "Look", {makeEffect(p, "invert")}}};
+        shared.graph.nodes.front().shared = 9000;
+        s.sharedNodes.push_back(SharedNode{9000, "Skin", {makeEffect(p, "gaussian_blur")}});
+        QVERIFY(edit::applyStillGrade(p, s, shared, {blue.id, green.id}).ok);
+        const Id lookNode = edit::clipById(s, blue.id)->grade.nodes.front().shared;
+        QVERIFY(lookNode && lookNode != 9000);
+        QCOMPARE(edit::clipById(s, green.id)->grade.nodes.front().shared, lookNode);
+        QCOMPARE(findSharedNode(s, lookNode)->name, std::string("Look"));
+        QCOMPARE(findSharedNode(s, 9000)->name, std::string("Skin"));
+        const size_t nodeCount = s.sharedNodes.size();
+        QVERIFY(edit::applyStillGrade(p, s, shared, {red.id}).ok);
+        QCOMPARE(s.sharedNodes.size(), nodeCount);
+        QCOMPARE(edit::clipById(s, red.id)->grade.nodes.front().shared, lookNode);
+
         // Albums, renaming, removing.
         QVERIFY(addAlbum(folder, "Looks"));
         QVERIFY(!addAlbum(folder, "a/b"));
@@ -2528,8 +2547,27 @@ colorspaces:
         QVERIFY(grabStill(p, s, 5, folder, "Looks", look, &err));
         QCOMPARE(look.label, std::string("1"));
         QVERIFY(galleryStills(folder, "../Stills").empty());
+        GalleryStill other;
+        QVERIFY(grabStill(p, s, 40, folder, "Looks", other, &err));
         QVERIFY(renameStill(folder, look, "Night"));
         QVERIFY(findStill(folder, "Looks", "Night", found) && found.id == look.id);
+        QVERIFY(!renameStill(folder, other, "Night", &err) && !err.empty());  // a label names one still
+        QVERIFY(findStill(folder, "Looks", other.id, found) && found.label == "2");
+        // A picture is the one beside its JSON, whatever the JSON says.
+        {
+            const QString json = QString::fromStdString(folder) + "/Looks/" + QString::fromStdString(other.id) + ".json";
+            QFile f(json);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
+            f.close();
+            o["picture"] = "../../outside.png";
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(QJsonDocument(o).toJson());
+            f.close();
+            QVERIFY(findStill(folder, "Looks", other.id, found));
+            QCOMPARE(QFileInfo(QString::fromStdString(found.picture)).absolutePath(), QFileInfo(json).absolutePath());
+            QVERIFY(removeStill(folder, found));
+        }
         QVERIFY(removeStill(folder, look));
         QVERIFY(galleryStills(folder, "Looks").empty());
         QVERIFY(!QFileInfo::exists(QString::fromStdString(look.picture)));

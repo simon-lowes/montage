@@ -16,6 +16,7 @@
 
 #include "EditorState.h"
 #include "core/EditOps.h"
+#include "core/GradeGraph.h"
 #include "core/History.h"
 #include "core/ProjectIO.h"
 #include "render/Compositor.h"
@@ -75,6 +76,10 @@ ClipStripPanel::ClipStripPanel(EditorState* state, QWidget* parent) : QWidget(pa
     connect(later, &QTimer::timeout, this, &ClipStripPanel::rebuild);
     for (auto sig : {&EditorState::projectChanged, &EditorState::sequenceSwitched})
         connect(state_, sig, later, qOverload<>(&QTimer::start));
+    connect(state_, &EditorState::mediaFileChanged, this, [this, later] {  // (the same file, its picture changed)
+        thumbs_.clear();
+        later->start();
+    });
     connect(state_, &EditorState::playheadChanged, this, [this] { markCurrent(); });
     connect(lightbox_, &QToolButton::toggled, this, [this](bool on) { setLightbox(on); });
     connect(list_, &QListWidget::itemClicked, this, [this](QListWidgetItem* item) {
@@ -123,9 +128,14 @@ void ClipStripPanel::rebuild() {
     blank.fill(QColor(40, 40, 40));
     for (const Listed& c : pictureClips(*s)) {
         const Clip* clip = edit::clipById(*s, c.id);
-        // What the thumbnail shows: the clip (as saved), its track, the sequence's size and colour.
+        // What the thumbnail shows: the clip (as saved), its media's file, the shared nodes it shows, its track, the
+        // sequence's size and colour.
         QCryptographicHash h(QCryptographicHash::Sha1);
         h.addData(QByteArray::fromStdString(clipToJsonString(*clip)));
+        if (const MediaItem* m = state_->project().findMedia(clip->mediaId))
+            h.addData(QByteArray::fromStdString("|" + m->path + "|" + m->proxyPath + "|" + m->colorOverride));
+        for (const SharedNode& n : sharedNodesUsed(*s, *clip))
+            for (const Effect& e : n.effects) h.addData(QByteArray::fromStdString(effectToJsonString(e)));
         h.addData(QStringLiteral("|%1|%2|%3x%4|%5").arg(s->id).arg(c.track).arg(s->width).arg(s->height).arg(QString::fromStdString(s->colorSpace)).toUtf8());
         const QString key = QString::fromLatin1(h.result().toHex());
         keys_.insert(c.id, key);
@@ -168,11 +178,11 @@ void ClipStripPanel::requestThumbnails() {
     auto project = std::make_shared<const Project>(state_->project());
     const Id seq = s->id;
     QPointer<ClipStripPanel> self(this);
-    std::weak_ptr<int> current = generation_;
+    std::weak_ptr<std::atomic<int>> current = generation_;
     (void)QtConcurrent::run([project, seq, jobs, generation, self, current] {
         const Sequence* sq = project->findSequence(seq);
         for (const Job& j : jobs) {
-            if (const auto g = current.lock(); !g || *g != generation || !sq) return;
+            if (const auto g = current.lock(); !g || g->load() != generation || !sq) return;
             RenderOptions o;
             o.scale = std::min(1.0, double(kThumbWidth) / std::max(1, sq->width));
             o.displaySpace = "rec709";
@@ -183,7 +193,7 @@ void ClipStripPanel::requestThumbnails() {
             QMetaObject::invokeMethod(
                 qApp, [self, current, generation, key = j.key, q] {
                     const auto g = current.lock();
-                    if (!self || !g || *g != generation) return;
+                    if (!self || !g || g->load() != generation) return;
                     self->thumbs_.insert(key, q);
                     self->pending_ = std::max(0, self->pending_ - 1);
                     for (int i = 0; i < self->list_->count(); ++i) {

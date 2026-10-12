@@ -5202,6 +5202,7 @@ private slots:
         a.effects = {makeEffect(q, "curves"), makeEffect(q, "gaussian_blur")};
         Clip b = makeGeneratorClip(q, "color", 30);
         b.start = 30;
+        b.name = "Plain";
         edit::overwrite(q, *q.active(), {TrackKind::Video, 0}, a);
         edit::overwrite(q, *q.active(), {TrackKind::Video, 0}, b);
         const double second = double(q.active()->videoTracks[0].clips.at(1).id);
@@ -5231,7 +5232,7 @@ private slots:
         QVERIFY(QFileInfo::exists(still.value("picture").toString()));
         r = call({{"project", project}, {"action", "grab"}, {"at", 100}});
         QVERIFY(r.value("isError").toBool());
-        r = call({{"project", project}, {"action", "apply"}, {"still", "1"}, {"clips", QJsonArray{second}}});
+        r = call({{"project", project}, {"action", "apply"}, {"still", "1"}, {"clips", QJsonArray{"Plain"}}});  // (by name)
         QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
         Project back;
         QVERIFY(loadProject(project.toStdString(), back));

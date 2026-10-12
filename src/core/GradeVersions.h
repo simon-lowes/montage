@@ -6,6 +6,7 @@
 // and switching swaps them in place, leaving every other effect alone.
 #pragma once
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -23,10 +24,10 @@ void gradeOf(const Clip& c, std::vector<Effect>& effects, std::vector<int>& anch
 
 namespace edit {
 // Replaces the clip's grade (its grade effects and node graph, its versions kept aside untouched) with `effects`
-// (fresh ids), each where `anchors` says or where the grade it replaces was, and `graph`; the shared nodes the graph
-// shows added to the sequence when it lacks them (Paste Attributes' way).
+// (fresh ids), each where `anchors` says or where the grade it replaces was, and `graph`, its shared nodes renamed by
+// `sharedIds` (the sequence's nodes they became, adoptSharedNodes); one the sequence lacks is dropped.
 Result replaceGrade(Project& p, Sequence& s, Id clipId, const std::vector<Effect>& effects, const std::vector<int>& anchors,
-                    const GradeGraph& graph, const std::vector<SharedNode>& sharedNodes);
+                    const GradeGraph& graph, const std::map<Id, Id>& sharedIds);
 // A new version, a copy of the current grade (or none with `empty`), switched
 // to. The first call also makes "Version 1" of the grade the clip already had.
 Result addGradeVersion(Project& p, Sequence& s, Id clipId, const std::string& name = {}, bool empty = false);

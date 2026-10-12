@@ -36,6 +36,7 @@ std::vector<std::string> galleryAlbums(const std::string& folder);
 bool addAlbum(const std::string& folder, const std::string& name, std::string* error = nullptr);
 // The stills of an album, oldest first.
 std::vector<GalleryStill> galleryStills(const std::string& folder, const std::string& album);
+// By its id, else its label (false when several have it).
 bool findStill(const std::string& folder, const std::string& album, const std::string& idOrLabel, GalleryStill& out);
 
 // Grabs the Program monitor's picture at `t` with the grade of the top clip there into `album` (made if need be);
@@ -43,7 +44,13 @@ bool findStill(const std::string& folder, const std::string& album, const std::s
 bool grabStill(const Project& p, const Sequence& s, FrameTime t, const std::string& folder, const std::string& album,
                GalleryStill& out, std::string* error = nullptr, int maxWidth = 1920);
 bool removeStill(const std::string& folder, const GalleryStill& still);
-bool renameStill(const std::string& folder, GalleryStill& still, const std::string& label);
+// False when another still of its album has the label.
+bool renameStill(const std::string& folder, GalleryStill& still, const std::string& label, std::string* error = nullptr);
+// The stills this run grabbed into the unsaved project's gallery (galleryFolder("")), moved to `folder` once the
+// project has a file; how many.
+int moveUntitledStills(const std::string& folder);
+// (Another project took the unsaved one's place: its stills stay where they are.)
+void forgetUntitledStills();
 
 namespace edit {
 // The still's grade in place of each clip's (their other effects and grade versions left alone).

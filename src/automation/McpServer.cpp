@@ -6471,7 +6471,7 @@ void McpServer::Impl::addTools() {
             auto still = [&]() {
                 GalleryStill g;
                 if (!findStill(folder, album, need(a, "still").toStdString(), g))
-                    throw ArgError{QStringLiteral("No still \"%1\" in album \"%2\"").arg(str(a, "still"), QString::fromStdString(album))};
+                    throw ArgError{QStringLiteral("No still \"%1\" in album \"%2\" (or several have that label: give its id)").arg(str(a, "still"), QString::fromStdString(album))};
                 return g;
             };
             if (action == "list") {
@@ -6493,7 +6493,8 @@ void McpServer::Impl::addTools() {
             }
             if (action == "rename") {
                 GalleryStill g = still();
-                if (!renameStill(folder, g, need(a, "label").toStdString())) return fail("Cannot rename the still");
+                if (!renameStill(folder, g, need(a, "label").toStdString(), &err))
+                    return fail(err.empty() ? QStringLiteral("Cannot rename the still") : QString::fromStdString(err));
                 return ok(QStringLiteral("Renamed"), stillJson(g));
             }
             if (action == "remove") {
@@ -6503,7 +6504,7 @@ void McpServer::Impl::addTools() {
             if (action != "apply") throw ArgError{"\"action\" is list, grab, apply, rename, remove or add_album"};
             const GalleryStill g = still();
             std::vector<Id> clips;
-            for (const QJsonValue& v : a.value("clips").toArray()) clips.push_back(clipArg(l, QJsonObject{{"clip", v}}).id);
+            for (const QJsonValue& v : a.value("clips").toArray()) clips.push_back(videoClipArg(l, QJsonObject{{"clip", v}}).id);
             if (clips.empty()) throw ArgError{"\"clips\" is required"};
             const auto r = edit::applyStillGrade(l.project, s, g, clips);
             if (!r.ok) return fail(QString::fromStdString(r.error));

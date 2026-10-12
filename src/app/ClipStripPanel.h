@@ -7,6 +7,7 @@
 #include <QHash>
 #include <QImage>
 #include <QWidget>
+#include <atomic>
 #include <memory>
 
 #include "core/Model.h"
@@ -42,7 +43,7 @@ private:
     QHash<QString, QImage> thumbs_;  // by what the thumbnail shows (the clip as saved, its track, the sequence's size)
     QHash<Id, QString> keys_;        // each clip's, as listed
     int pending_ = 0;
-    std::shared_ptr<int> generation_ = std::make_shared<int>(0);
+    std::shared_ptr<std::atomic<int>> generation_ = std::make_shared<std::atomic<int>>(0);  // (read by the renders)
 };
 
 }  // namespace montage

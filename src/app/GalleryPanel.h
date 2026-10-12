@@ -52,6 +52,7 @@ private:
     QPushButton* wipe_;
     QString wiping_;  // the still being wiped against
     QString shownFolder_;
+    uint64_t shownProject_ = 0;  // EditorState::projectGeneration when it was shown
 };
 
 }  // namespace montage

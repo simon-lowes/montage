@@ -9,8 +9,11 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QRandomGenerator>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include <algorithm>
+#include <mutex>
+#include <set>
 
 #include "Compositor.h"
 #include "core/GradeGraph.h"
@@ -52,8 +55,9 @@ bool writeStill(const std::string& folder, const GalleryStill& s, std::string* e
                         {"width", s.width},           {"height", s.height},
                         {"grade", objectOf(clipToJsonString(graded))},
                         {"anchors", anchors},         {"shared_nodes", shared}};
-    QFile f(stillJson(folder, s));
-    if (!f.open(QIODevice::WriteOnly) || f.write(QJsonDocument(o).toJson()) <= 0) {
+    // (Whole or not at all: a still whose JSON is cut short is lost.)
+    QSaveFile f(stillJson(folder, s));
+    if (!f.open(QIODevice::WriteOnly) || f.write(QJsonDocument(o).toJson()) <= 0 || !f.commit()) {
         if (error) *error = "Cannot write " + stillJson(folder, s).toStdString();
         return false;
     }
@@ -69,7 +73,10 @@ bool readStill(const QString& json, const std::string& album, GalleryStill& out)
     s.id = QFileInfo(json).completeBaseName().toStdString();
     s.album = album;
     s.label = o.value("label").toString().toStdString();
-    s.picture = (QFileInfo(json).absolutePath() + "/" + o.value("picture").toString()).toStdString();
+    // Beside the JSON whatever it says (removing a still removes its picture).
+    QString picture = QFileInfo(o.value("picture").toString()).fileName();
+    if (picture.isEmpty() || picture.startsWith('.')) picture = QString::fromStdString(s.id) + ".png";
+    s.picture = (QFileInfo(json).absolutePath() + "/" + picture).toStdString();
     s.clip = o.value("clip").toString().toStdString();
     s.sequence = o.value("sequence").toString().toStdString();
     s.timecode = o.value("timecode").toString().toStdString();
@@ -96,6 +103,20 @@ bool readStill(const QString& json, const std::string& album, GalleryStill& out)
     out = std::move(s);
     return true;
 }
+
+// What a shared node does, its ids aside.
+std::string nodeContent(const SharedNode& n) {
+    std::string k = n.name;
+    for (Effect e : n.effects) {
+        e.id = 0;
+        k += '\n' + effectToJsonString(e);
+    }
+    return k;
+}
+
+// The stills grabbed while the project had no file, by this run (moveUntitledStills).
+std::mutex untitledMutex;
+std::set<std::pair<std::string, std::string>> untitledStills;  // album, id
 
 }  // namespace
 
@@ -144,12 +165,21 @@ std::vector<GalleryStill> galleryStills(const std::string& folder, const std::st
 }
 
 bool findStill(const std::string& folder, const std::string& album, const std::string& idOrLabel, GalleryStill& out) {
-    for (GalleryStill& s : galleryStills(folder, album))
-        if (s.id == idOrLabel || s.label == idOrLabel) {
-            out = std::move(s);
+    const std::vector<GalleryStill> stills = galleryStills(folder, album);
+    for (const GalleryStill& s : stills)
+        if (s.id == idOrLabel) {
+            out = s;
             return true;
         }
-    return false;
+    // A label names a still only when one has it.
+    const GalleryStill* found = nullptr;
+    for (const GalleryStill& s : stills)
+        if (s.label == idOrLabel) {
+            if (found) return false;
+            found = &s;
+        }
+    if (found) out = *found;
+    return found;
 }
 
 bool grabStill(const Project& p, const Sequence& s, FrameTime t, const std::string& folder, const std::string& album,
@@ -193,14 +223,44 @@ bool grabStill(const Project& p, const Sequence& s, FrameTime t, const std::stri
     still.height = view.height;
     gradeOf(*clip, still.effects, still.anchors);
     still.graph = clip->grade;
-    still.sharedNodes = sharedNodesUsed(s, *clip);
+    // (The shared nodes its grade shows, not its versions'.)
+    for (const SharedNode& n : sharedNodesUsed(s, *clip))
+        if (std::any_of(clip->grade.nodes.begin(), clip->grade.nodes.end(), [&](const GradeNode& g) { return g.shared == n.id; }))
+            still.sharedNodes.push_back(n);
     if (!picture.save(qs(still.picture), "PNG")) return fail("Cannot write " + still.picture);
     if (!writeStill(folder, still, error)) {
         QFile::remove(qs(still.picture));
         return false;
     }
+    if (folder == galleryFolder("")) {
+        const std::lock_guard<std::mutex> lock(untitledMutex);
+        untitledStills.insert({album, still.id});
+    }
     out = std::move(still);
     return true;
+}
+
+int moveUntitledStills(const std::string& folder) {
+    const std::string from = galleryFolder("");
+    if (folder == from) return 0;
+    const std::lock_guard<std::mutex> lock(untitledMutex);
+    int moved = 0;
+    for (auto it = untitledStills.begin(); it != untitledStills.end();) {
+        const auto& [album, id] = *it;
+        const QString src = qs(from) + "/" + qs(album) + "/" + qs(id), dst = qs(folder) + "/" + qs(album) + "/" + qs(id);
+        if (QFileInfo::exists(src + ".json") && QDir().mkpath(qs(folder) + "/" + qs(album)) && !QFileInfo::exists(dst + ".json") &&
+            QFile::rename(src + ".json", dst + ".json")) {
+            QFile::rename(src + ".png", dst + ".png");
+            ++moved;
+        }
+        it = untitledStills.erase(it);
+    }
+    return moved;
+}
+
+void forgetUntitledStills() {
+    const std::lock_guard<std::mutex> lock(untitledMutex);
+    untitledStills.clear();
 }
 
 bool removeStill(const std::string& folder, const GalleryStill& still) {
@@ -209,11 +269,16 @@ bool removeStill(const std::string& folder, const GalleryStill& still) {
     return json;
 }
 
-bool renameStill(const std::string& folder, GalleryStill& still, const std::string& label) {
+bool renameStill(const std::string& folder, GalleryStill& still, const std::string& label, std::string* error) {
     if (label.empty()) return false;
+    for (const GalleryStill& g : galleryStills(folder, still.album))
+        if (g.id != still.id && (g.label == label || g.id == label)) {
+            if (error) *error = "Another still is called " + label;
+            return false;
+        }
     GalleryStill renamed = still;
     renamed.label = label;
-    if (!writeStill(folder, renamed, nullptr)) return false;
+    if (!writeStill(folder, renamed, error)) return false;
     still = std::move(renamed);
     return true;
 }
@@ -223,6 +288,32 @@ namespace edit {
 Result applyStillGrade(Project& p, Sequence& s, const GalleryStill& still, const std::vector<Id>& clips) {
     Result res;
     std::string why;
+    // The still's shared nodes (those its graph shows) once for them all: the sequence's own when one does just the
+    // same (the same node, or a copy from an earlier apply), else a copy of the still's, fresh ids and all, so one of
+    // another project's (whose ids could be anything's here) or one changed since stays as the still has it.
+    std::map<Id, Id> sharedIds;
+    auto adopt = [&] {
+        for (const SharedNode& n : still.sharedNodes) {
+            if (sharedIds.count(n.id) ||
+                std::none_of(still.graph.nodes.begin(), still.graph.nodes.end(), [&](const GradeNode& g) { return g.shared == n.id; }))
+                continue;
+            const std::string content = nodeContent(n);
+            const SharedNode* same = findSharedNode(s, n.id);
+            if (same && nodeContent(*same) != content) same = nullptr;
+            for (size_t i = 0; i < s.sharedNodes.size() && !same; ++i)
+                if (nodeContent(s.sharedNodes[i]) == content) same = &s.sharedNodes[i];
+            if (same) {
+                sharedIds[n.id] = same->id;
+                continue;
+            }
+            SharedNode copy = n;
+            copy.id = p.newId();
+            for (Effect& e : copy.effects) e.id = p.newId();
+            sharedIds[n.id] = copy.id;
+            s.sharedNodes.push_back(std::move(copy));
+        }
+    };
+    bool adopted = false;
     for (Id id : clips) {
         const auto loc = locate(s, id);
         if (!loc || loc->track.kind != TrackKind::Video) continue;
@@ -231,7 +322,8 @@ Result applyStillGrade(Project& p, Sequence& s, const GalleryStill& still, const
             why = "Its track is locked";
             continue;
         }
-        const Result r = replaceGrade(p, s, id, still.effects, still.anchors, still.graph, still.sharedNodes);
+        if (!adopted) adopt(), adopted = true;
+        const Result r = replaceGrade(p, s, id, still.effects, still.anchors, still.graph, sharedIds);
         if (r.ok) ++res.applied;
         else why = r.error;
     }

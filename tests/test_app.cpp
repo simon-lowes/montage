@@ -3,6 +3,7 @@
 #include <QtTest>
 #include <QPointer>
 #include <QSignalSpy>
+#include <QStandardPaths>
 #include <QPlainTextEdit>
 
 #include <QAbstractScrollArea>
@@ -84,6 +85,7 @@
 #include "automation/McpServer.h"
 #include "render/OGraf.h"
 #include "GalleryPanel.h"
+#include "render/Gallery.h"
 #include "ClipStripPanel.h"
 #include "automation/PythonHost.h"
 #include "automation/ScriptHost.h"
@@ -10251,6 +10253,21 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(strip->lightbox() && list->isWrapping() && list->iconSize().width() > 200);
         strip->setLightbox(false);
         QVERIFY(!list->isWrapping());
+
+        // A still grabbed before the project's first save goes with it when it is saved.
+        QStandardPaths::setTestModeEnabled(true);
+        state()->newProject();
+        QCOMPARE(gallery->folder(), QString::fromStdString(galleryFolder("")));
+        state()->edit("Clip", [](Project& p, Sequence& s) { return edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "color", 30)).ok; });
+        state()->setPlayhead(5);
+        QVERIFY(gallery->grab());
+        const QString saved = dir_.path() + "/gallery-later.montage";
+        QVERIFY(state()->save(saved));
+        QCOMPARE(gallery->folder(), dir_.path() + "/Gallery/gallery-later");
+        QCOMPARE(stills->count(), 1);
+        QVERIFY(galleryStills(galleryFolder(""), kDefaultAlbum).empty());
+        QDir(QString::fromStdString(galleryFolder(""))).removeRecursively();
+        QStandardPaths::setTestModeEnabled(false);
     }
 
     void ografGraphicInInspector() {

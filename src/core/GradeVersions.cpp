@@ -61,15 +61,13 @@ void gradeOf(const Clip& c, std::vector<Effect>& effects, std::vector<int>& anch
 namespace edit {
 
 Result replaceGrade(Project& p, Sequence& s, Id clipId, const std::vector<Effect>& effects, const std::vector<int>& anchors,
-                    const GradeGraph& graph, const std::vector<SharedNode>& sharedNodes) {
+                    const GradeGraph& graph, const std::map<Id, Id>& sharedIds) {
     Clip* c = clipById(s, clipId);
     if (!c) return Result::fail("No such clip");
     bool onVideo = false;
     for (const Track& t : s.videoTracks)
         for (const Clip& k : t.clips) onVideo = onVideo || k.id == clipId;
     if (!onVideo) return Result::fail("Grades are for picture clips");
-    const std::map<Id, Id> sharedIds = adoptSharedNodes(p, s, sharedNodes);
-    c = clipById(s, clipId);  // (adopting may add to the sequence, not its clips; looked up again all the same)
     std::vector<int> replaced;
     takeGrade(*c, replaced);
     std::vector<Effect> fresh = effects;

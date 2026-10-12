@@ -85,7 +85,10 @@ GalleryPanel::GalleryPanel(EditorState* state, QWidget* parent) : QWidget(parent
             if (!still(selectedStill(), s)) return;
             bool ok = false;
             const QString label = QInputDialog::getText(this, tr("Rename Still"), tr("Label:"), QLineEdit::Normal, QString::fromStdString(s.label), &ok);
-            if (ok && !label.trimmed().isEmpty() && renameStill(folder().toStdString(), s, label.trimmed().toStdString())) refresh();
+            if (!ok || label.trimmed().isEmpty()) return;
+            std::string err;
+            if (renameStill(folder().toStdString(), s, label.trimmed().toStdString(), &err)) refresh();
+            else state_->message(QString::fromStdString(err.empty() ? "Cannot rename the still" : err), 4000);
         });
         menu.addAction(tr("Delete…"), this, [this] {
             if (QMessageBox::question(this, tr("Delete Still"), tr("Delete this still and its grade from the gallery?")) == QMessageBox::Yes)
@@ -93,10 +96,16 @@ GalleryPanel::GalleryPanel(EditorState* state, QWidget* parent) : QWidget(parent
         });
         menu.exec(list_->viewport()->mapToGlobal(at));
     });
-    // Another project, another gallery.
+    // Another project, another gallery; a project saved for the first time takes the stills grabbed before.
     shownFolder_ = folder();
+    shownProject_ = state_->projectGeneration();
     connect(state_, &EditorState::fileStateChanged, this, [this] {
+        const bool sameProject = shownProject_ == state_->projectGeneration();
+        if (!sameProject) forgetUntitledStills();
+        shownProject_ = state_->projectGeneration();
         if (shownFolder_ == folder()) return;
+        if (sameProject && shownFolder_ == QString::fromStdString(galleryFolder("")) && !state_->filePath().isEmpty())
+            moveUntitledStills(folder().toStdString());
         shownFolder_ = folder();
         if (wipe_->isChecked()) wipe(false);
         refresh();
@@ -178,7 +187,8 @@ bool GalleryPanel::applyToSelection() {
         if (const auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Video) clips.push_back(id);
     if (clips.empty())
         for (int i = int(s->videoTracks.size()) - 1; i >= 0 && clips.empty(); --i)
-            if (const Clip* c = edit::clipAt(*s, TrackRef{TrackKind::Video, i}, state_->playhead())) clips.push_back(c->id);
+            if (!s->videoTracks[size_t(i)].muted)  // (the one the picture shows, as Grab Still takes)
+                if (const Clip* c = edit::clipAt(*s, TrackRef{TrackKind::Video, i}, state_->playhead()); c && c->enabled) clips.push_back(c->id);
     if (clips.empty()) {
         state_->message(tr("Select the clips to grade"), 4000);
         return false;
