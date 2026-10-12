@@ -164,6 +164,7 @@ add_library(montage_engine STATIC
   render/VoiceMatch.h render/VoiceMatch.cpp
   render/ColorSpace.h render/ColorSpace.cpp
   render/Gamut.h render/Gamut.cpp
+  render/ColorSlice.h render/ColorSlice.cpp
   render/HdrView.h render/HdrView.cpp
   render/Ocio.h render/Ocio.cpp
   render/Compositor.h render/Compositor.cpp

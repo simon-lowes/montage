@@ -227,6 +227,29 @@ std::vector<EffectInfo> buildCatalog() {
                  {choice("direction", "Direction", {"Forward", "Inverse"}, 0)},
                  {}});
     {
+        // Colour Slice (render/ColorSlice.h; Resolve's ColorSlice): hue shift, saturation and density by hue vector in a
+        // log encoding, saturation subtractive as film's or additive (brightness kept), highlights protected.
+        EffectInfo slice{"color_slice", "Colour Slice", EffectCategory::VideoFilter, "Color",
+                         {num("density", "Density", -1, 1, 0), pct("depth", "Depth", 0, 200, 100), num("saturation", "Saturation", 0, 2, 1),
+                          boolean("subtractive", "Subtractive Saturation", true), pct("protect_highlights", "Protect Highlights", 0, 100, 50),
+                          pct("mix", "Mix", 0, 100, 100)},
+                         {}};
+        auto vector = [&](const std::string& n, const std::string& l) {
+            slice.params.push_back(num(n + "_hue", l + " Hue (°)", -60, 60, 0, 0.5));
+            slice.params.push_back(num(n + "_saturation", l + " Saturation", 0, 2, 1));
+            slice.params.push_back(num(n + "_density", l + " Density", -1, 1, 0));
+        };
+        for (const char* v : {"red", "yellow", "green", "cyan", "blue", "magenta"}) {
+            std::string l = v;
+            l[0] = char(std::toupper(l[0]));
+            vector(v, l);
+        }
+        vector("skin", "Skin");
+        slice.params.push_back(num("skin_centre", "Skin Centre (°)", 0, 90, 25, 0.5));
+        slice.params.push_back(num("skin_width", "Skin Width (°)", 5, 60, 25, 0.5));
+        c.push_back(slice);
+    }
+    {
         // Colour Space Transform: one clip from any space into another (render/ColorSpace.h).
         std::vector<std::string> spaces;
         for (const auto& cs : colorSpaces()) spaces.push_back(cs.label);
@@ -354,6 +377,12 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"gaussian_blur", "Gaussian Blur", EffectCategory::VideoFilter, "Blur & Sharpen",
                  {num("radius", "Radius (px)", 0, 250, 10, 0.5),
                   choice("direction", "Direction", {"Both", "Horizontal", "Vertical"})},
+                 {}});
+    // Mid-tone Detail and Texture Pop (render/ColorSlice.h): local contrast in brightness only, mid-tone detail through an
+    // edge-preserving filter, texture above a noise floor; Detail Scale scales both.
+    c.push_back({"texture_pop", "Texture Pop / Mid-tone Detail", EffectCategory::VideoFilter, "Color",
+                 {pct("midtone_detail", "Mid-tone Detail", -100, 100, 0), pct("texture_pop", "Texture Pop", 0, 200, 0),
+                  num("scale", "Detail Scale", 0.25, 4, 1), pct("noise_floor", "Noise Floor", 0, 100, 10)},
                  {}});
     c.push_back({"sharpen", "Sharpen", EffectCategory::VideoFilter, "Blur & Sharpen",
                  {num("amount", "Amount", 0, 5, 1), num("radius", "Radius (px)", 0.5, 20, 1.5, 0.1)},

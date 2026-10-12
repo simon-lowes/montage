@@ -30,6 +30,7 @@
 #include "render/ColorChart.h"
 #include "core/LensProfile.h"
 #include "render/ColorSpace.h"
+#include "render/ColorSlice.h"
 #include "render/Gamut.h"
 #include "render/HdrView.h"
 #include "render/Compositor.h"
@@ -237,6 +238,166 @@ private slots:
         for (int i = 0; i < 3; ++i)
             QVERIFY2(std::fabs(compressed[i] - want[i]) < 0.005f, qPrintable(QString("%1: %2 vs %3").arg(i).arg(compressed[i]).arg(want[i])));
         QVERIFY2(std::fabs(compressed[1] - plain[1]) > 0.005f, qPrintable(QString("%1 / %2").arg(plain[1]).arg(compressed[1])));
+    }
+
+    void colorSliceAndTexture() {
+        // Colour Slice in a Rec.709 sequence: each vector changes its own colours, density darkens richer colours more,
+        // subtractive saturation keeps the brightest channel, additive keeps the brightness, highlights can be kept.
+        Project p = makeDefaultProject();
+        const ColorSpace& rec = rec709Space();
+        auto code = [&](float r, float g, float b) {
+            return std::array<float, 3>{float(fromLinear(rec.transfer, r)), float(fromLinear(rec.transfer, g)), float(fromLinear(rec.transfer, b))};
+        };
+        auto run = [&](const Effect& e, std::array<float, 3> c) {
+            Image img = solid(1, 1, c[0], c[1], c[2]);
+            applyVideoEffect(e, 0, img, 1.0);
+            return std::array<float, 3>{float(toLinear(rec.transfer, img.at(0, 0)[0])), float(toLinear(rec.transfer, img.at(0, 0)[1])),
+                                        float(toLinear(rec.transfer, img.at(0, 0)[2]))};
+        };
+        auto lumaOf = [](std::array<float, 3> l) { return 0.2126f * l[0] + 0.7152f * l[1] + 0.0722f * l[2]; };
+        const auto red = code(0.4f, 0.03f, 0.03f), paleRed = code(0.4f, 0.25f, 0.25f), grey = code(0.3f, 0.3f, 0.3f),
+                   blue = code(0.03f, 0.03f, 0.4f), skinTone = code(0.4f, 0.22f, 0.15f), green = code(0.03f, 0.4f, 0.03f);
+        Effect e = makeEffect(p, "color_slice");
+        for (auto c : {red, grey, skinTone}) {
+            const auto out = run(e, c);
+            for (int k = 0; k < 3; ++k) QVERIFY(std::fabs(out[k] - toLinear(rec.transfer, c[size_t(k)])) < 1e-5);
+        }
+        e.params["protect_highlights"] = Param(0.0);
+        e.params["red_density"] = Param(1.0);
+        {
+            const auto r = run(e, red), pr = run(e, paleRed), g = run(e, grey), b = run(e, blue);
+            const float redStops = std::log2(0.4f / r[0]), paleStops = std::log2(0.4f / pr[0]);
+            QVERIFY2(redStops > 0.8f && redStops < 1.05f, qPrintable(QString::number(redStops)));
+            QVERIFY2(paleStops > 0.05f && paleStops < 0.5f * redStops, qPrintable(QString::number(paleStops)));
+            QVERIFY(std::fabs(r[1] / r[0] - 0.03f / 0.4f) < 1e-3);  // (darker, the same colour)
+            QVERIFY(std::fabs(g[0] - 0.3f) < 1e-4 && std::fabs(b[2] - 0.4f) < 1e-4 && std::fabs(b[0] - 0.03f) < 1e-4);
+        }
+        {
+            const float full = std::log2(0.4f / run(e, red)[0]);
+            e.params["depth"] = Param(50.0);
+            QVERIFY(std::fabs(std::log2(0.4f / run(e, red)[0]) - 0.5f * full) < 1e-3);
+        }
+        e = makeEffect(p, "color_slice");
+        e.params["protect_highlights"] = Param(0.0);
+        e.params["saturation"] = Param(1.5);
+        const auto warm = code(0.5f, 0.2f, 0.1f);
+        {
+            const auto sub = run(e, warm);
+            QVERIFY(std::fabs(sub[0] - 0.5f) < 1e-3 && sub[1] < 0.2f && sub[2] < 0.1f);
+            QVERIFY(lumaOf(sub) < lumaOf({0.5f, 0.2f, 0.1f}) - 0.02f);
+            e.params["subtractive"] = Param(0.0);
+            const auto add = run(e, warm);
+            QVERIFY(add[0] > 0.5f && add[1] < 0.2f);
+            QVERIFY(std::fabs(lumaOf(add) - lumaOf({0.5f, 0.2f, 0.1f})) < 2e-3);
+        }
+        // A hue shift turns red towards yellow, and skin's own vector leaves green alone.
+        e = makeEffect(p, "color_slice");
+        e.params["protect_highlights"] = Param(0.0);
+        e.params["red_hue"] = Param(30.0);
+        {
+            const auto r = run(e, red);
+            QVERIFY2(r[1] > 3 * r[2] && std::fabs(r[0] - 0.4f) < 1e-3, qPrintable(QString("%1 %2 %3").arg(r[0]).arg(r[1]).arg(r[2])));
+            QVERIFY(std::fabs(run(e, blue)[2] - 0.4f) < 1e-4);
+        }
+        e = makeEffect(p, "color_slice");
+        e.params["protect_highlights"] = Param(0.0);
+        e.params["skin_density"] = Param(1.0);
+        QVERIFY(run(e, skinTone)[0] < 0.37f);
+        QVERIFY(std::fabs(run(e, green)[1] - 0.4f) < 1e-4);
+        // Protect Highlights keeps colours at white; Mix 0 changes nothing.
+        e = makeEffect(p, "color_slice");
+        e.params["saturation"] = Param(1.5);
+        const auto bright = code(1.0f, 0.4f, 0.2f);
+        e.params["protect_highlights"] = Param(100.0);
+        QVERIFY(std::fabs(run(e, bright)[1] - 0.4f) < 1e-4);
+        e.params["protect_highlights"] = Param(0.0);
+        QVERIFY(run(e, bright)[1] < 0.35f);
+        e.params["mix"] = Param(0.0);
+        QVERIFY(std::fabs(run(e, bright)[1] - 0.4f) < 1e-4);
+        QVERIFY(isColorOnlyEffect(makeEffect(p, "color_slice"), 0));
+        QVERIFY(!isColorOnlyEffect(makeEffect(p, "texture_pop"), 0));
+
+        // Texture Pop and Mid-tone Detail: a flat picture stays as it is; texture grows above the noise floor and not below
+        // it; colours keep their balance; negative mid-tone detail softens; a strong edge gets little halo; sizes follow
+        // the preview's scale.
+        auto pattern = [&](int w, int h, double period, float amp, float r = 1, float g = 1, float b = 1) {
+            Image img(w, h);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    const float v = 0.18f * std::exp2(amp * float(std::sin(2 * M_PI * x / period) * std::sin(2 * M_PI * y / period)));
+                    float* px = img.at(x, y);
+                    px[0] = float(fromLinear(rec.transfer, v * r)), px[1] = float(fromLinear(rec.transfer, v * g));
+                    px[2] = float(fromLinear(rec.transfer, v * b)), px[3] = 1;
+                }
+            return img;
+        };
+        auto spread = [](const Image& img) {
+            double s = 0, s2 = 0;
+            const int n = img.width * img.height;
+            for (int y = 0; y < img.height; ++y)
+                for (int x = 0; x < img.width; ++x) s += img.at(x, y)[1], s2 += double(img.at(x, y)[1]) * img.at(x, y)[1];
+            return std::sqrt(std::max(0.0, s2 / n - (s / n) * (s / n)));
+        };
+        Effect tx = makeEffect(p, "texture_pop");
+        tx.params["texture_pop"] = Param(100.0);
+        tx.params["midtone_detail"] = Param(100.0);
+        {
+            Image flat = solid(32, 32, 0.4f, 0.4f, 0.4f);
+            applyVideoEffect(tx, 0, flat, 1.0);
+            QVERIFY(std::fabs(flat.at(16, 16)[0] - 0.4f) < 1e-5 && std::fabs(flat.at(0, 0)[2] - 0.4f) < 1e-5);
+        }
+        tx.params["midtone_detail"] = Param(0.0);
+        {
+            const Image fine = pattern(64, 64, 4, 0.5f);
+            Image popped = fine;
+            applyVideoEffect(tx, 0, popped, 1.0);
+            QVERIFY2(spread(popped) > 1.3 * spread(fine), qPrintable(QString("%1 %2").arg(spread(popped)).arg(spread(fine))));
+            const Image faint = pattern(64, 64, 4, 0.02f);
+            Image kept = faint;
+            tx.params["noise_floor"] = Param(100.0);
+            applyVideoEffect(tx, 0, kept, 1.0);
+            QVERIFY2(spread(kept) < 1.05 * spread(faint), qPrintable(QString("%1 %2").arg(spread(kept)).arg(spread(faint))));
+            tx.params["noise_floor"] = Param(0.0);
+            kept = faint;
+            applyVideoEffect(tx, 0, kept, 1.0);
+            QVERIFY(spread(kept) > 1.3 * spread(faint));
+            // (each pixel's channels in the same ratio as before)
+            Image tinted = pattern(32, 32, 4, 0.5f, 1.0f, 0.6f, 0.3f);
+            applyVideoEffect(tx, 0, tinted, 1.0);
+            for (int x = 0; x < 8; ++x) {
+                const float* px = tinted.at(x, 5);
+                const double rg = toLinear(rec.transfer, px[1]) / toLinear(rec.transfer, px[0]);
+                QVERIFY2(std::fabs(rg - 0.6) < 2e-3, qPrintable(QString::number(rg)));
+            }
+        }
+        tx = makeEffect(p, "texture_pop");
+        tx.params["midtone_detail"] = Param(-100.0);
+        {
+            const Image wide = pattern(128, 128, 48, 0.4f);
+            Image soft = wide;
+            applyVideoEffect(tx, 0, soft, 1.0);
+            QVERIFY2(spread(soft) < 0.85 * spread(wide), qPrintable(QString("%1 %2").arg(spread(soft)).arg(spread(wide))));
+            // Sizes follow the preview: the same picture at half size, half the scale, changes as much.
+            Image half = pattern(64, 64, 24, 0.4f), halfOut = half;
+            applyVideoEffect(tx, 0, halfOut, 0.5);
+            const double fullRatio = spread(soft) / spread(wide), halfRatio = spread(halfOut) / spread(half);
+            QVERIFY2(std::fabs(fullRatio - halfRatio) < 0.08, qPrintable(QString("%1 %2").arg(fullRatio).arg(halfRatio)));
+        }
+        tx.params["midtone_detail"] = Param(100.0);
+        {
+            // A step of four stops: next to it the dark side darkens and the bright side brightens by little.
+            Image step(96, 8);
+            for (int y = 0; y < 8; ++y)
+                for (int x = 0; x < 96; ++x) {
+                    const float v = float(fromLinear(rec.transfer, x < 48 ? 0.05 : 0.8));
+                    float* px = step.at(x, y);
+                    px[0] = px[1] = px[2] = v, px[3] = 1;
+                }
+            applyVideoEffect(tx, 0, step, 1.0);
+            const double darkStops = std::log2(0.05 / toLinear(rec.transfer, step.at(46, 4)[1])),
+                         brightStops = std::log2(toLinear(rec.transfer, step.at(49, 4)[1]) / 0.8);
+            QVERIFY2(std::fabs(darkStops) < 0.35 && std::fabs(brightStops) < 0.35, qPrintable(QString("%1 %2").arg(darkStops).arg(brightStops)));
+        }
     }
 
     void ascCdlEffect() {

@@ -3,6 +3,7 @@
 #include "Ofx.h"
 
 #include "ColorSpace.h"
+#include "ColorSlice.h"
 #include "Gamut.h"
 #include "TransferTables.h"
 #include "Ocio.h"
@@ -1796,6 +1797,8 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "lut") applyLut(e, t, img);
     else if (ty == "cdl") applyCdlEffect(e, t, img);
     else if (ty == "aces_gamut_compress") applyAcesGamutCompress(e, t, currentWorkingSpace(), img);
+    else if (ty == "color_slice") colorSlice(e, t, currentWorkingSpace(), img);
+    else if (ty == "texture_pop") textureDetail(e, t, currentWorkingSpace(), img, pixelScale);
     else if (ty == "color_space_transform") {
         const ColorSpace* from = nullptr;
         const ColorSpace* to = nullptr;
