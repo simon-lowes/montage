@@ -9293,6 +9293,10 @@ private slots:
         QVERIFY(!runScript("os.execute('true')", "q.lua", o, &error) && error.contains("not available while a panel opens"));
         QVERIFY(!runScript("io.popen('ls')", "q.lua", o, &error) && error.contains("io.popen"));
         QVERIFY(!runScript(QStringLiteral("io.open([[%1/x.txt]], 'w')").arg(dir.path()), "q.lua", o, &error) && error.contains("only reading"));
+        // Nor a file opened for reading and writing, nor io.open's original reached through the debug library.
+        QVERIFY(!runScript(QStringLiteral("io.open([[%1]], 'r+')").arg(project), "q.lua", o, &error) && error.contains("only reading"));
+        QVERIFY(!runScript("local _, open = debug.getupvalue(io.open, 1)", "q.lua", o, &error));
+        QVERIFY(!runScript("require('debug')", "q.lua", o, &error));
         QVERIFY(!runScript(QStringLiteral("os.remove([[%1]])").arg(project), "q.lua", o, &error));
         QVERIFY2(runScript(QStringLiteral("assert(io.open([[%1]], 'r') == nil or true)").arg(project), "q.lua", o, &error), qPrintable(error));
         QVERIFY(!QFileInfo::exists(dir.path() + "/x.txt"));
@@ -9423,6 +9427,10 @@ private slots:
         o.noStdin = true;
         QVERIFY(!runScript("io.read()", "in.lua", o, &err) && err.contains("io.read"));
         QVERIFY(!runScript("for l in io.lines() do end", "in.lua", o, &err) && err.contains("io.lines"));
+        QVERIFY(!runScript("io.input():read()", "in.lua", o, &err) && err.contains("io.input"));
+        // A table held many times over is refused as a tool's argument rather than copied 2^60 times.
+        QVERIFY(!runScript("local t = {} for i = 1, 60 do t = {t, t} end montage.call('montage_project_info', {x = t})", "big.lua", o, &err));
+        QVERIFY2(err.contains("too large"), qPrintable(err));
     }
 
     void consolidateKeepsGraphicPictures() {

@@ -1787,8 +1787,8 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
         o.sources = made.sources;
         std::string why;
         if (!signContentCredentials(s.path, made, {s.credentialCertificate, s.credentialKey, {}}, o, &why)) {
-            if (error) *error = "Could not sign it with Content Credentials: " + why;
-            std::remove(s.path.c_str());  // (asked for signed, so not left unsigned)
+            // The render is kept (it may have taken hours), unsigned, and said to be: it can be signed again later.
+            if (error) *error = "Could not sign it with Content Credentials (" + why + "); the export is kept, unsigned, at " + s.path;
             return false;
         }
     }

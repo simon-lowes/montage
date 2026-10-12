@@ -2496,6 +2496,13 @@ private slots:
         QVERIFY(parseTimecode("120", f30, t));
         QCOMPARE(t, FrameTime(120));
         QVERIFY(!parseTimecode("abc", f30, t));
+        // Too long for any sequence (from OSC or an imported review): refused, not thrown or overflowed.
+        QVERIFY(!parseTimecode("99999999999999999999:00", f30, t));
+        QVERIFY(!parseTimecode("9999999999:00:00:00", f30, t));
+        QVERIFY(!parseTimecode("1e300s", f30, t));
+        QVERIFY(!parseTimecode("99999999999999999999", f30, t));
+        QVERIFY(parseTimecode("999999999:00:00:00", f30, t));
+        QCOMPARE(t, FrameTime(999999999LL * 3600 * 30));
         // Round trip across a range of frames.
         for (FrameTime f : {0, 1, 1799, 1800, 1801, 17981, 17982, 107892})
             QVERIFY(parseTimecode(formatTimecode(f, df), df, t) && t == f);

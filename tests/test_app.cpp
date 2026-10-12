@@ -324,6 +324,11 @@ class TestApp : public QObject {
         std::string path = (dir_.path() + "/demo.montage").toStdString();
         QVERIFY(saveProject(demoProject(), path));
         QVERIFY(win_->openProject(QString::fromStdString(path)));
+        // The window active again with the timeline focused, for its shortcuts: on the offscreen platform a dialog an
+        // earlier test closed leaves no window active.
+        win_->activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+        if (!QApplication::focusWidget()) timeline()->setFocus();
         ppf_ = measurePpf();
     }
 
@@ -13005,6 +13010,9 @@ print("added " .. ui.name)
         QCOMPARE(r.value("structuredContent").toObject().value("mode").toString(), QStringLiteral("1080p25"));
         r = call({{"action", "start"}, {"interface", "Virtual"}, {"mode", "4320p25"}});
         QVERIFY(r.value("isError").toBool());  // no such mode
+        r = call({{"action", "start"}, {"device", "Virtual Ouptut"}});
+        QVERIFY(r.value("isError").toBool() && !controller->running());  // a device misnamed is not swapped for another
+        QVERIFY(!action->isChecked());
         r = call({{"action", "stop"}});
         QVERIFY(!r.value("isError").toBool() && !controller->running());
         qunsetenv("MONTAGE_VIRTUAL_OUTPUT");
