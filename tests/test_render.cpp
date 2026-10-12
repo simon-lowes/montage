@@ -53,7 +53,13 @@
 #include "core/Transcript.h"
 #include "render/VideoDenoise.h"
 #include "render/VideoFx.h"
+#include "render/VideoPacking.h"
 #include <random>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
+}
 
 using namespace montage;
 
@@ -4642,6 +4648,124 @@ colorspaces:
         Project empty = makeDefaultProject();
         empty.active()->colorSpace = "rec2100pq";
         QVERIFY(!measureLightLevels(empty, *empty.active(), 0, 0, l, &err) && err.find("empty") != std::string::npos);
+    }
+
+    void videoPacking() {
+        using namespace montage::video;
+        std::mt19937 rng(9);
+        // v210 as FFmpeg's encoder writes it, byte for byte (its last pixels in a row of 1280 and its padding, codes
+        // outside 4..1019 kept in), from random 10-bit pictures.
+        for (int w : {720, 1280, 1920, 2048, 3840, 1924}) {
+            const int h = 3;
+            Ycbcr422 pic(w, h);
+            std::uniform_int_distribution<int> any(0, 1023);
+            AVFrame* f = av_frame_alloc();
+            f->format = AV_PIX_FMT_YUV422P10LE;
+            f->width = w, f->height = h;
+            QVERIFY(av_frame_get_buffer(f, 0) == 0);
+            for (int y = 0; y < h; ++y) {
+                for (int x = 0; x < w; ++x) {
+                    const int v = any(rng);
+                    pic.y[size_t(y * w + x)] = uint16_t(v << 6);
+                    reinterpret_cast<uint16_t*>(f->data[0] + y * f->linesize[0])[x] = uint16_t(v);
+                }
+                for (int x = 0; x < w / 2; ++x) {
+                    const int u = any(rng), v = any(rng);
+                    pic.cb[size_t(y * (w / 2) + x)] = uint16_t(u << 6);
+                    pic.cr[size_t(y * (w / 2) + x)] = uint16_t(v << 6);
+                    reinterpret_cast<uint16_t*>(f->data[1] + y * f->linesize[1])[x] = uint16_t(u);
+                    reinterpret_cast<uint16_t*>(f->data[2] + y * f->linesize[2])[x] = uint16_t(v);
+                }
+            }
+            const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_V210);
+            QVERIFY(codec);
+            AVCodecContext* c = avcodec_alloc_context3(codec);
+            c->width = w, c->height = h, c->pix_fmt = AV_PIX_FMT_YUV422P10LE, c->time_base = {1, 25};
+            QVERIFY(avcodec_open2(c, codec, nullptr) == 0);
+            AVPacket* pkt = av_packet_alloc();
+            QVERIFY(avcodec_send_frame(c, f) == 0 && avcodec_receive_packet(c, pkt) == 0);
+            const size_t stride = v210RowBytes(w);
+            QCOMPARE(size_t(pkt->size), stride * h);
+            std::vector<uint8_t> ours(stride * h, 0xAB);
+            packV210(pic, ours.data(), stride);
+            QVERIFY2(std::memcmp(ours.data(), pkt->data, ours.size()) == 0, qPrintable(QString::number(w)));
+            av_packet_free(&pkt);
+            avcodec_free_context(&c);
+            av_frame_free(&f);
+        }
+        // UYVY as swscale packs 8-bit 4:2:2, and clipped to 1..254.
+        {
+            const int w = 64, h = 2;
+            Ycbcr422 pic(w, h);
+            std::vector<uint8_t> y8(w * h), u8(w / 2 * h), v8(w / 2 * h);
+            std::uniform_int_distribution<int> legal(1, 254);
+            for (size_t i = 0; i < y8.size(); ++i) pic.y[i] = uint16_t((y8[i] = uint8_t(legal(rng))) << 8);
+            for (size_t i = 0; i < u8.size(); ++i) {
+                pic.cb[i] = uint16_t((u8[i] = uint8_t(legal(rng))) << 8);
+                pic.cr[i] = uint16_t((v8[i] = uint8_t(legal(rng))) << 8);
+            }
+            SwsContext* sws = sws_getContext(w, h, AV_PIX_FMT_YUV422P, w, h, AV_PIX_FMT_UYVY422, SWS_POINT, nullptr, nullptr, nullptr);
+            QVERIFY(sws);
+            std::vector<uint8_t> want(w * 2 * h), ours(w * 2 * h);
+            const uint8_t* src[3] = {y8.data(), u8.data(), v8.data()};
+            const int srcStride[3] = {w, w / 2, w / 2};
+            uint8_t* dst[1] = {want.data()};
+            const int dstStride[1] = {w * 2};
+            sws_scale(sws, src, srcStride, 0, h, dst, dstStride);
+            sws_freeContext(sws);
+            packUyvy(pic, ours.data(), w * 2);
+            QVERIFY(ours == want);
+            pic.y[0] = 0, pic.cb[0] = 65535;
+            packUyvy(pic, ours.data(), w * 2);
+            QCOMPARE(int(ours[0]), 254);
+            QCOMPARE(int(ours[1]), 1);
+        }
+        // P216: 16-bit Y, then the Cb Cr pairs below it, little-endian, rows `stride` apart.
+        {
+            Ycbcr422 pic(4, 2);
+            for (size_t i = 0; i < pic.y.size(); ++i) pic.y[i] = uint16_t(0x1000 + i);
+            for (size_t i = 0; i < pic.cb.size(); ++i) pic.cb[i] = uint16_t(0x2000 + i), pic.cr[i] = uint16_t(0x3000 + i);
+            const size_t stride = 16;
+            std::vector<uint8_t> out(stride * 4, 0);
+            packP216(pic, out.data(), stride);
+            auto at = [&](size_t byte) { return int(out[byte] | out[byte + 1] << 8); };
+            QCOMPARE(at(0), 0x1000);
+            QCOMPARE(at(stride + 6), 0x1007);
+            QCOMPARE(at(stride * 2), 0x2000);      // Cb of row 0
+            QCOMPARE(at(stride * 2 + 2), 0x3000);  // Cr
+            QCOMPARE(at(stride * 3 + 4), 0x2003);  // row 1's second pair
+            QCOMPARE(at(stride * 3 + 6), 0x3003);
+        }
+        // 75 % colour bars in Y'CbCr: SMPTE RP 219's codes for BT.709 (white 721 512 512, yellow 674 176 543, cyan 581
+        // 589 176, green 534 253 207, magenta 251 771 817, red 204 435 848, blue 111 848 481), black 64 512 512.
+        {
+            const float bars[8][3] = {{0.75f, 0.75f, 0.75f}, {0.75f, 0.75f, 0}, {0, 0.75f, 0.75f}, {0, 0.75f, 0},
+                                      {0.75f, 0, 0.75f}, {0.75f, 0, 0}, {0, 0, 0.75f}, {0, 0, 0}};
+            const int want[8][3] = {{721, 512, 512}, {674, 176, 543}, {581, 589, 176}, {534, 253, 207},
+                                    {251, 771, 817}, {204, 435, 848}, {111, 848, 481}, {64, 512, 512}};
+            Image img(8 * 4, 2);
+            for (int y = 0; y < 2; ++y)
+                for (int x = 0; x < 32; ++x) {
+                    float* p = img.at(x, y);
+                    p[0] = bars[x / 4][0], p[1] = bars[x / 4][1], p[2] = bars[x / 4][2], p[3] = 1;
+                }
+            const Ycbcr422 yc = toYcbcr422(img, YcbcrMatrix::Bt709);
+            for (int b = 0; b < 8; ++b) {
+                // The middle of each bar (away from the chroma filter's edges).
+                const int x = b * 4 + 2;
+                const int got[3] = {(yc.y[size_t(x)] + 32) >> 6, (yc.cb[size_t(x / 2)] + 32) >> 6, (yc.cr[size_t(x / 2)] + 32) >> 6};
+                for (int k = 0; k < 3; ++k) QVERIFY2(std::abs(got[k] - want[b][k]) <= 1, qPrintable(QStringLiteral("bar %1 [%2]: %3").arg(b).arg(k).arg(got[k])));
+            }
+            // BT.2020's matrix: its white is the same, its red has more luma than BT.709's.
+            const Ycbcr422 wide = toYcbcr422(img, YcbcrMatrix::Bt2020);
+            QCOMPARE(wide.y[2], yc.y[2]);
+            QVERIFY(wide.y[22] > yc.y[22]);
+            // Packed as v210, a bar's codes as they are.
+            std::vector<uint8_t> packed(v210RowBytes(32) * 2);
+            packV210(yc, packed.data(), v210RowBytes(32));
+            const uint32_t w0 = packed[0] | packed[1] << 8 | packed[2] << 16 | uint32_t(packed[3]) << 24;
+            QCOMPARE(int(w0 >> 10 & 1023), (yc.y[0] + 32) >> 6);
+        }
     }
 
     void lensCorrectionEffect() {
