@@ -31,6 +31,7 @@
 #include <utility>
 
 #include "EditorState.h"
+#include "LensCorrectionDialog.h"
 #include "ModelPacks.h"
 #include "media/DepthMap.h"
 #include "media/Matting.h"
@@ -724,6 +725,24 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             connect(analyze, &QPushButton::clicked, this,
                     [this, owner, eid] { QTimer::singleShot(0, this, [this, owner, eid] { analyzeStabilize(owner, eid); }); });
         }
+        if (e.type == "lens_correction" && onClip) {
+            // The lens profile it holds, chosen in the Correct Lens dialog.
+            auto* row = new QWidget(content_);
+            auto* rh = new QHBoxLayout(row);
+            rh->setContentsMargins(0, 0, 0, 0);
+            auto* name = new QLabel(row);
+            name->setObjectName(QStringLiteral("lensName"));
+            name->setWordWrap(true);
+            const QString cam = QString::fromStdString(e.s("camera")), lensName = QString::fromStdString(e.s("lens"));
+            name->setText(e.s("profile").empty() ? tr("No lens chosen") : cam.isEmpty() ? lensName : tr("%1 on %2").arg(lensName, cam));
+            auto* choose = new QPushButton(tr("Choose Lens…"), row);
+            choose->setObjectName(QStringLiteral("chooseLens"));
+            rh->addWidget(name, 1);
+            rh->addWidget(choose);
+            f->insertRow(0, tr("Lens:"), row);
+            connect(choose, &QPushButton::clicked, this,
+                    [this, owner] { QTimer::singleShot(0, this, [this, owner] { correctLens(window(), state_, owner); }); });
+        }
         if (e.type == "corner_pin" && onClip) {
             // Planar tracking: the corners follow a flat surface (a screen, a sign) in the footage.
             auto* row = new QWidget(content_);
@@ -1073,6 +1092,12 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                 if (v[k].type == "plugin") {
                     // Keep the plugin; put its parameters back to their defaults.
                     for (const ParamInfo& pi : effectParams(v[k])) v[k].params[pi.name] = Param(pi.def);
+                } else if (v[k].type == "lens_correction") {
+                    // Keep the lens and what it was chosen with; put the rest back.
+                    Effect e = makeEffect(v[k].type, v[k].id);
+                    e.strings = v[k].strings;
+                    for (const char* n : {"focal", "aperture", "camera_crop"}) e.params[n] = v[k].params[n];
+                    v[k] = e;
                 } else {
                     v[k] = makeEffect(v[k].type, v[k].id);
                 }
@@ -1102,13 +1127,16 @@ void InspectorWidget::addEffectMenu(TrackKind kind, Id owner) {
                 if (!chain) return false;
                 Effect e = makeEffect(p, type);
                 added = e.id;
-                // Stabilize and Rolling Shutter Repair move the whole frame: they go first, before any filter.
-                if (type == "stabilize" || type == "rolling_shutter") chain->insert(chain->begin(), e);
+                // Stabilize, Rolling Shutter Repair and Lens Correction reshape the whole frame: they go first, before any
+                // filter.
+                if (type == "stabilize" || type == "rolling_shutter" || type == "lens_correction") chain->insert(chain->begin(), e);
                 else chain->push_back(e);
                 return true;
             });
             if ((type == "stabilize" || type == "rolling_shutter") && added && state_->sequence() && edit::clipById(*state_->sequence(), owner))
                 QTimer::singleShot(0, this, [this, owner, added] { analyzeStabilize(owner, added); });
+            if (type == "lens_correction" && added && state_->sequence() && edit::clipById(*state_->sequence(), owner))
+                QTimer::singleShot(0, this, [this, owner] { correctLens(window(), state_, owner); });
         });
     }
     if (kind == TrackKind::Audio) {

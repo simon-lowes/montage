@@ -421,6 +421,20 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"lens_distortion", "Lens Distortion", EffectCategory::VideoFilter, "Distort",
                  {num("amount", "Barrel / Pincushion", -100, 100, 0, 0.5)},
                  {}});
+    // Lens Correction (Premiere's Lens Distortion presets, Resolve's Lens Correction, Lightroom's profiles): a lens's
+    // profile from the lensfun database (strings["profile"], its <lens> as written by core/LensProfile lensXml, with
+    // strings["camera"] and ["lens"] naming them, chosen in the Correct Lens dialog) undoes its distortion, colour
+    // fringes and vignetting and makes a fisheye rectilinear; render/VideoFx.cpp lensCorrection.
+    c.push_back({"lens_correction", "Lens Correction", EffectCategory::VideoFilter, "Distort",
+                 {num("focal", "Focal Length (mm)", 0, 2000, 0, 0.1), num("aperture", "Aperture (f/)", 0, 64, 0, 0.1),
+                  num("distance", "Focus Distance (m)", 0.1, 1000, 1000, 0.1),
+                  num("camera_crop", "Camera Crop Factor", 0, 20, 0, 0.001),
+                  num("recording_crop", "Recording Crop", 1, 10, 1, 0.01),
+                  boolean("distortion", "Distortion", true), boolean("tca", "Chromatic Aberration", true),
+                  boolean("vignetting", "Vignetting", true), boolean("rectilinear", "Fisheye to Rectilinear", true),
+                  choice("fit", "Framing", {"Fill Frame", "Show Whole Picture", "None"}, 0), pct("scale", "Scale", 25, 400, 100)},
+                 {}});
+    for (auto& pi : c.back().params) pi.keyframeable = pi.name == "focal" || pi.name == "aperture" || pi.name == "distance" || pi.name == "scale";
     // Corners as fractions of the frame, keyframeable for screen replacements.
     c.push_back({"corner_pin", "Corner Pin", EffectCategory::VideoFilter, "Distort",
                  {num("tl_x", "Top Left X", -1, 2, 0, 0.001), num("tl_y", "Top Left Y", -1, 2, 0, 0.001),

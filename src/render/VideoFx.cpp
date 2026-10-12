@@ -3,8 +3,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <map>
+#include <memory>
+#include <mutex>
 
 #include "Processing.h"
+#include "TransferTables.h"
+#include "core/LensProfile.h"
 
 namespace montage::vfx {
 
@@ -201,6 +206,86 @@ void lensDistortion(const Effect& e, FrameTime t, Image& img) {
         sx = cx + nx * f * norm;
         sy = cy + ny * f * norm;
         return sx >= 0 && sy >= 0 && sx <= img.width && sy <= img.height;
+    });
+}
+
+namespace {
+
+// The lens a correction's profile describes, read once.
+std::shared_ptr<const lens::Lens> profileLens(const std::string& xml) {
+    static std::mutex mutex;
+    static std::map<std::string, std::shared_ptr<const lens::Lens>> cache;
+    std::lock_guard lock(mutex);
+    if (auto it = cache.find(xml); it != cache.end()) return it->second;
+    if (cache.size() >= 32) cache.clear();
+    return cache[xml] = lens::parseLens(xml);
+}
+
+}  // namespace
+
+lens::Settings lensSettings(const Effect& e, FrameTime t) {
+    lens::Settings s;
+    s.focal = e.p("focal", t, 0);
+    s.aperture = e.p("aperture", t, 0);
+    s.distance = std::max(0.1, e.p("distance", t, 1000));
+    s.cameraCrop = e.p("camera_crop", t, 0);
+    s.recordingCrop = std::max(1.0, e.p("recording_crop", t, 1));
+    s.distortion = e.p("distortion", t, 1) >= 0.5;
+    s.tca = e.p("tca", t, 1) >= 0.5;
+    s.vignetting = e.p("vignetting", t, 1) >= 0.5;
+    s.rectilinear = e.p("rectilinear", t, 1) >= 0.5;
+    const int fit = int(std::lround(e.p("fit", t, 0)));
+    s.fit = fit == 1 ? lens::Settings::Whole : fit == 2 ? lens::Settings::None : lens::Settings::Fill;
+    s.scale = std::max(0.01, e.p("scale", t, 100) / 100);
+    return s;
+}
+
+void lensCorrection(const Effect& e, FrameTime t, Image& img) {
+    const std::shared_ptr<const lens::Lens> lens = profileLens(e.s("profile"));
+    if (!lens || img.width < 2 || img.height < 2) return;
+    const lens::Correction c(*lens, lensSettings(e, t), img.width, img.height);
+    if (c.vignetting()) {
+        // Vignetting is a loss of light: the recorded frame brightened in linear light, before it is reshaped.
+        const TransferTables tables(currentWorkingSpace().transfer);
+        parallelRows(img.height, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y) {
+                float* p = img.row(y);
+                for (int x = 0; x < img.width; ++x, p += 4) {
+                    const float a = p[3];
+                    if (a <= 0) continue;
+                    const float gain = float(1 / c.falloff(x + 0.5, y + 0.5));
+                    for (int k = 0; k < 3; ++k) p[k] = tables.encode(tables.decode(p[k] / a) * gain) * a;
+                }
+            }
+        });
+    }
+    if (!c.geometric()) return;
+    const Image src = img;
+    // Within the recorded frame its edge pixels reach its edge (no fringe of transparency); beyond it, nothing.
+    auto take = [&](double x, double y, float out[4]) {
+        if (!(x >= 0 && y >= 0 && x <= src.width && y <= src.height)) {
+            std::fill(out, out + 4, 0.f);
+            return;
+        }
+        sample(src, std::clamp(x, 0.5, src.width - 0.5), std::clamp(y, 0.5, src.height - 0.5), out);
+    };
+    parallelRows(img.height, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            float* p = img.row(y);
+            for (int x = 0; x < img.width; ++x, p += 4) {
+                double at[6];
+                c.source(x + 0.5, y + 0.5, at);
+                take(at[2], at[3], p);
+                if (at[0] != at[2] || at[1] != at[3] || at[4] != at[2] || at[5] != at[3]) {
+                    // Red and blue from where the lens put them (the fringes closed); coverage is green's.
+                    float r[4], b[4];
+                    take(at[0], at[1], r);
+                    take(at[4], at[5], b);
+                    p[0] = r[3] > 0 && p[3] > 0 ? r[0] / r[3] * p[3] : r[0];
+                    p[2] = b[3] > 0 && p[3] > 0 ? b[2] / b[3] * p[3] : b[2];
+                }
+            }
+        }
     });
 }
 

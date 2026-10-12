@@ -47,6 +47,7 @@
 #include "core/Reconform.h"
 #include "core/Adr.h"
 #include "core/Provenance.h"
+#include "core/LensProfile.h"
 #include "core/AudioDescription.h"
 #include <QProcess>
 #include <QSysInfo>
@@ -6982,6 +6983,183 @@ private slots:
         QVERIFY(clipById(fx.s(), clip)->takes.empty());
         QCOMPARE(clipById(fx.s(), clip)->mediaId, b);
         QVERIFY(!cycleTake(fx.p, fx.s(), clip, 1).ok);
+    }
+
+    void lensProfiles() {
+        using namespace montage::lens;
+        QFile file(QStringLiteral(MONTAGE_TEST_DATA_DIR "/lensfun/test-lenses.xml"));
+        QVERIFY(file.open(QIODevice::ReadOnly));
+        const std::string xml = file.readAll().toStdString();
+        Database db;
+        std::string err;
+        QVERIFY2(db.addXml(xml, &err), err.c_str());
+        QCOMPARE(db.cameras().size(), size_t(3));
+        QCOMPARE(db.lenses().size(), size_t(3));
+        QVERIFY(!Database().addXml("<lenses/>", &err));
+        QVERIFY(!Database().addXml("<lensdatabase version=\"3\"></lensdatabase>", &err));
+        QVERIFY(QString::fromStdString(err).contains("newer"));
+
+        // Cameras are found from the names recordings give them, by their words; nothing for an unknown one.
+        const Camera* sony = db.findCamera("Sony ILCE-7M4");
+        QVERIFY(sony && sony->model == "ILCE-7M4");
+        QCOMPARE(db.findCamera("SONY Alpha 7 IV"), sony);
+        const Camera* gopro = db.findCamera("GoPro HERO11 Black");
+        QVERIFY(gopro && gopro->mount == "goProHero11bl");
+        QVERIFY(!db.findCamera("Canon EOS R5"));
+        QCOMPARE(cameraName(*gopro), std::string("GoPro Hero11 Black"));
+
+        // The camera's own lenses first, then those its mount takes by adapter; a fixed lens alone. Not a lens measured
+        // on a smaller sensor than the camera's (the APS-C fisheye on the full-frame body).
+        QCOMPARE(db.lensesFor(sony).size(), size_t(1));
+        sony = db.findCamera("Sony ILCE-6400");
+        QVERIFY(sony && sony->cropFactor == 1.534);
+        const auto sonyLenses = db.lensesFor(sony);
+        QCOMPARE(sonyLenses.size(), size_t(2));
+        QCOMPARE(lensName(*sonyLenses[0]), std::string("Sony FE 24-38mm f/2.8 Test"));
+        QCOMPARE(lensName(*sonyLenses[1]), std::string("Samyang 8mm f/2.8 UMC Fish-eye"));
+        const auto goproLenses = db.lensesFor(gopro);
+        QCOMPARE(goproLenses.size(), size_t(1));
+        QCOMPARE(db.lensesFor(nullptr).size(), size_t(3));
+        QCOMPARE(db.fixedLens(gopro), goproLenses[0]);
+        QVERIFY(!db.fixedLens(sony));  // an interchangeable mount, however few of its lenses are known
+        QCOMPARE(db.lens("fe 24-38", sony), sonyLenses[0]);
+        QVERIFY(!db.lens("FE 24-38", gopro));
+
+        // Focal lengths and the widest aperture from the name where the database leaves them out; a measured real
+        // focal length (version 1's element); the fisheye's projection and the GoPro sensor's shape.
+        const Lens& zoom = *sonyLenses[0];
+        const Lens& samyang = *sonyLenses[1];
+        const Lens& hero = *goproLenses[0];
+        QCOMPARE(zoom.minFocal, 24.0);
+        QCOMPARE(zoom.maxFocal, 38.0);
+        QCOMPARE(zoom.minAperture, 2.8);
+        QCOMPARE(samyang.minFocal, 8.0);
+        QCOMPARE(samyang.type, Projection::Stereographic);
+        QVERIFY(samyang.calibrations[0].distortion[0].realFocalMeasured);
+        QCOMPARE(samyang.calibrations[0].distortion[0].realFocal, 8.405);
+        QCOMPARE(hero.type, Projection::Fisheye);
+        QVERIFY(std::fabs(hero.aspectRatio - 8.0 / 7) < 1e-12);
+
+        // Interpolation: a calibrated focal length as it is; between them, the terms times the focal length on a
+        // spline, so 27 mm lies between 24 and 30 mm's.
+        Distortion d;
+        QVERIFY(interpolateDistortion(zoom, 1, 24, d));
+        QCOMPARE(d.terms[1], -0.07818);
+        QVERIFY(interpolateDistortion(zoom, 1, 27, d));
+        QVERIFY(d.terms[1] > -0.07818 && d.terms[1] < -0.03891);
+        QVERIFY(interpolateDistortion(zoom, 1, 50, d));  // beyond the last: the last
+        QCOMPARE(d.terms[2], -0.00168);
+        QVERIFY(!interpolateDistortion(zoom, 0.5, 24, d));  // a picture from a larger sensor than it was measured on
+        Vignetting v;
+        QVERIFY(interpolateVignetting(zoom, 1, 24, 4, 1000, v));
+        QCOMPARE(v.k[0], -0.5475);
+        QVERIFY(!interpolateVignetting(zoom, 1, 24, 0, 1000, v));  // aperture not known
+
+        // The corrections against lensfun 0.3.4's for the same file and frames (1920 x 1080; pixel centres; red,
+        // green and blue's sources).
+        struct Point {
+            double x, y, src[6];
+        };
+        auto compare = [](const Lens& l, Settings s, const std::vector<Point>& want) {
+            s.fit = Settings::None;
+            const Correction c(l, s, 1920, 1080);
+            for (const Point& p : want) {
+                double got[6];
+                c.source(p.x + 0.5, p.y + 0.5, got);
+                for (int k = 0; k < 6; ++k)
+                    if (std::fabs(got[k] - 0.5 - p.src[k]) > 0.01) return QStringLiteral("(%1, %2) [%3]: %4, lensfun %5").arg(p.x).arg(p.y).arg(k).arg(got[k] - 0.5).arg(p.src[k]);
+            }
+            return QString();
+        };
+        Settings zoomAt27;
+        zoomAt27.focal = 27;
+        zoomAt27.cameraCrop = 1;
+        zoomAt27.vignetting = zoomAt27.rectilinear = false;
+        QString bad = compare(zoom, zoomAt27, {{0, 0, {2.569, 1.444, 2.493, 1.402, 2.497, 1.404}},
+                                               {1919, 0, {1916.431, 1.444, 1916.507, 1.402, 1916.503, 1.404}},
+                                               {480, 270, {478.272, 269.029, 478.418, 269.111, 478.583, 269.204}},
+                                               {1919, 1079, {1916.431, 1077.556, 1916.507, 1077.598, 1916.503, 1077.596}},
+                                               {100, 900, {105.121, 897.852, 105.188, 897.824, 105.305, 897.775}}});
+        QVERIFY2(bad.isEmpty(), qPrintable(bad));
+        // The fisheye made rectilinear (stereographic; its measured focal length).
+        Settings fish;
+        fish.focal = 8;
+        fish.cameraCrop = 1.534;
+        bad = compare(samyang, fish, {{0, 0, {318.508, 179.088, 318.558, 179.116, 318.449, 179.055}},
+                                      {1919, 0, {1600.492, 179.088, 1600.442, 179.116, 1600.551, 179.055}},
+                                      {480, 270, {534.885, 300.848, 534.923, 300.869, 534.884, 300.847}},
+                                      {1919, 1079, {1600.492, 899.912, 1600.442, 899.884, 1600.551, 899.945}},
+                                      {100, 900, {334.470, 801.656, 334.521, 801.635, 334.428, 801.674}}});
+        QVERIFY2(bad.isEmpty(), qPrintable(bad));
+        // GoPro's 16:9 recording from its 8:7 sensor: the sensor's full width.
+        Settings action;
+        action.cameraCrop = 5.54;
+        const Correction heroAt1080(hero, action, 1920, 1080);
+        QVERIFY(std::fabs(heroAt1080.cropFactor() - 6.41662) < 1e-4);
+        bad = compare(hero, action, {{0, 0, {253.727, 142.664, 253.727, 142.664, 253.727, 142.664}},
+                                     {1919, 0, {1665.273, 142.664, 1665.273, 142.664, 1665.273, 142.664}},
+                                     {480, 270, {454.021, 255.399, 454.021, 255.399, 454.021, 255.399}},
+                                     {100, 900, {256.722, 834.266, 256.722, 834.266, 256.722, 834.266}}});
+        QVERIFY2(bad.isEmpty(), qPrintable(bad));
+        // Vignetting, at 30 mm and f/3.3 (between the four measurements): lensfun's gains.
+        Settings vig;
+        vig.focal = 30;
+        vig.aperture = 3.3;
+        vig.cameraCrop = 1;
+        const Correction vc(zoom, vig, 1920, 1080);
+        QVERIFY(vc.vignetting());
+        for (const auto& [x, y, gain] : {std::tuple{0.0, 0.0, 2.231159}, {480.0, 270.0, 1.134559}, {100.0, 900.0, 1.607652}})
+            QVERIFY2(std::fabs(1 / vc.falloff(x + 0.5, y + 0.5) - gain) < 1e-5, qPrintable(QString::number(1 / vc.falloff(x + 0.5, y + 0.5))));
+        QCOMPARE(vc.falloff(960, 540), 1.0);
+
+        // Filling the frame: every edge pixel of the corrected frame comes from inside the recorded one, and only
+        // just (a smaller scale would not do); the whole picture: every edge pixel from outside it (or on its edge).
+        auto edges = [](const Correction& c, int w, int h, bool inside) {
+            for (int i = 0; i <= 64; ++i)
+                for (const auto& [x, y] : {std::pair{w * i / 64.0, 0.0}, {w * i / 64.0, double(h)}, {0.0, h * i / 64.0}, {double(w), h * i / 64.0}}) {
+                    double at[6];
+                    c.source(x, y, at);
+                    for (int k = 0; k < 6; k += 2) {
+                        const bool in = at[k] >= -0.01 && at[k] <= w + 0.01 && at[k + 1] >= -0.01 && at[k + 1] <= h + 0.01;
+                        const bool out = at[k] <= 0.01 || at[k] >= w - 0.01 || at[k + 1] <= 0.01 || at[k + 1] >= h - 0.01;
+                        if (inside ? !in : !out) return false;
+                    }
+                }
+            return true;
+        };
+        for (const auto& [l, s] : {std::pair{&zoom, zoomAt27}, {&samyang, fish}, {&hero, action}}) {
+            Settings fill = s, whole = s;
+            whole.fit = Settings::Whole;
+            const Correction f(*l, fill, 1920, 1080), w(*l, whole, 1920, 1080);
+            QVERIFY2(edges(f, 1920, 1080, true), l->model.c_str());
+            Settings less = fill;
+            less.fit = Settings::None;
+            less.scale = f.scale() * 0.99;
+            QVERIFY2(!edges(Correction(*l, less, 1920, 1080), 1920, 1080, true), l->model.c_str());
+            // (A fisheye's whole picture cannot be made rectilinear: it reaches 90 degrees off the axis and beyond.)
+            if (l == &zoom) QVERIFY2(edges(w, 1920, 1080, false), l->model.c_str());
+            QVERIFY(w.scale() <= f.scale());
+            Settings more = fill;
+            more.scale = 1.5;
+            QVERIFY(std::fabs(Correction(*l, more, 1920, 1080).scale() - f.scale() * 1.5) < 1e-9);
+        }
+        // Nothing to do when everything is off.
+        Settings off;
+        off.distortion = off.tca = off.vignetting = off.rectilinear = false;
+        QVERIFY(!Correction(samyang, off, 1920, 1080).active());
+
+        // A lens kept as a file of its own reads back the same.
+        const std::shared_ptr<const Lens> back = parseLens(lensXml(samyang));
+        QVERIFY(back);
+        QCOMPARE(lensName(*back), lensName(samyang));
+        QCOMPARE(back->type, samyang.type);
+        QCOMPARE(back->minAperture, samyang.minAperture);
+        const Correction a(samyang, fish, 1920, 1080), b(*back, fish, 1920, 1080);
+        double pa[6], pb[6];
+        a.source(10, 20, pa);
+        b.source(10, 20, pb);
+        for (int k = 0; k < 6; ++k) QCOMPARE(pa[k], pb[k]);
+        QVERIFY(!parseLens("<lensdatabase/>"));
     }
 
     void provenanceForCredentials() {

@@ -123,6 +123,7 @@
 #include "render/Shorts.h"
 #include "render/Letterbox.h"
 #include "render/Processing.h"
+#include "media/LensDatabase.h"
 #include "core/Production.h"
 #include "core/ProjectLock.h"
 
@@ -255,6 +256,27 @@ Clip& clipArg(Loaded& l, const QJsonObject& a, const char* key = "clip") {
     Clip* c = edit::clipById(l.seq(), Id(v.toDouble()));
     if (!c) throw ArgError{QStringLiteral("No clip %1 in the active sequence").arg(qulonglong(v.toDouble()))};
     return *c;
+}
+
+// A video clip by its id or its name.
+const Clip& videoClipArg(Loaded& l, const QJsonObject& a) {
+    Sequence& s = l.seq();
+    if (a.value("clip").isString()) {
+        const std::string name = a.value("clip").toString().toStdString();
+        const Clip* found = nullptr;
+        for (const Track& t : s.videoTracks)
+            for (const Clip& c : t.clips)
+                if (c.name == name) {
+                    if (found) throw ArgError{QStringLiteral("Several clips are named \"%1\": give its id").arg(QString::fromStdString(name))};
+                    found = &c;
+                }
+        if (!found) throw ArgError{QStringLiteral("No video clip named \"%1\" in the active sequence").arg(QString::fromStdString(name))};
+        return *found;
+    }
+    const Clip& c = clipArg(l, a);
+    const auto loc = edit::locate(s, c.id);
+    if (!loc || loc->track.kind != TrackKind::Video) throw ArgError{"\"clip\" must be a video clip (its picture, not its sound)"};
+    return c;
 }
 
 QJsonObject clipJson(const Project& p, const Sequence& s, const Clip& c) {
@@ -6219,23 +6241,7 @@ void McpServer::Impl::addTools() {
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
-            // A video clip, by id or by its name.
-            const Clip* found = nullptr;
-            if (a.value("clip").isString()) {
-                const std::string name = a.value("clip").toString().toStdString();
-                for (const Track& t : s.videoTracks)
-                    for (const Clip& c : t.clips)
-                        if (c.name == name) {
-                            if (found) throw ArgError{QStringLiteral("Several clips are named \"%1\": give its id").arg(QString::fromStdString(name))};
-                            found = &c;
-                        }
-                if (!found) throw ArgError{QStringLiteral("No video clip named \"%1\" in the active sequence").arg(QString::fromStdString(name))};
-            } else {
-                found = &clipArg(l, a);
-                const auto loc = edit::locate(s, found->id);
-                if (!loc || loc->track.kind != TrackKind::Video) throw ArgError{"\"clip\" must be a video clip (its picture, not its sound)"};
-            }
-            const Clip clip = *found;
+            const Clip clip = videoClipArg(l, a);
             const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : clip.start + clip.duration / 2;
             const Image frame = chartFrame(l.project, s, clip, at);
             if (frame.empty()) return fail("The clip has no picture to read a chart from");
@@ -6269,6 +6275,101 @@ void McpServer::Impl::addTools() {
             save(l);
             out["clips"] = n;
             return ok(QStringLiteral("Matched the chart on %1 clip(s): delta E %2 before, %3 after").arg(n).arg(fit.deltaEBefore, 0, 'f', 1).arg(fit.deltaEAfter, 0, 'f', 1), out);
+        });
+
+    add("montage_correct_lens", "Correct a lens",
+        "Lens-profile correction (Premiere's and Resolve's lens correction, Lightroom's profiles): puts a Lens Correction "
+        "first in a video clip's effects from lensfun's profile of the lens it was shot with, undoing its distortion, "
+        "colour fringes (lateral chromatic aberration) and vignetting and, for a fisheye (GoPro, DJI...), making the "
+        "picture rectilinear, scaled to fill the frame. `camera` defaults to the one the clip's media names (its Camera "
+        "Model); `lens` may be left out when that camera has a fixed lens. Names match by their words (\"HERO11 Black\", "
+        "\"FE 24-70mm f/2.8 GM\"). `focal` (mm) and `aperture` (f-number) default to the lens's shortest and widest; "
+        "vignetting depends on the aperture. `same_media` corrects every clip of the media. `list` changes nothing and "
+        "returns the camera found and the lenses that fit it (`query` narrows them by words). The profile is kept in the "
+        "project. `params` sets its other settings: distortion, tca, vignetting and rectilinear (0 off, 1 on), fit (0 fill "
+        "the frame, 1 show the whole picture, 2 neither), scale (%), recording_crop (how much narrower than the sensor's "
+        "width the recording is), distance (focus, m). Needs the lens database: downloaded by the app (Clip > Correct "
+        "Lens...), scripts/fetch-models.sh, MONTAGE_LENS_DB, or lensfun's installed one.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":["number","string"],"description":"A video clip's id or name"},
+            "camera":{"type":"string"},"lens":{"type":"string"},"focal":{"type":"number"},"aperture":{"type":"number"},
+            "params":{"type":"object","additionalProperties":{"type":"number"}},
+            "same_media":{"type":"boolean","default":false},"list":{"type":"boolean","default":false},"query":{"type":"string"}},
+            "required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Clip clip = videoClipArg(l, a);
+            const MediaItem* media = clip.mediaId ? l.project.findMedia(clip.mediaId) : nullptr;
+            if (!media) throw ArgError{"\"clip\" must show media (not a generator or a nested sequence)"};
+            const std::shared_ptr<const lens::Database> db = lensDatabase();
+            if (!db) return fail("No lens database: correct a lens once in the app (Clip > Correct Lens...), run scripts/fetch-models.sh, or set MONTAGE_LENS_DB to lensfun's database folder");
+            LensChoice c = suggestLens(*db, *media);
+            if (a.contains("camera")) {
+                const std::string want = a.value("camera").toString().toStdString();
+                c.camera = want.empty() ? nullptr : db->camera(want);
+                if (!want.empty() && !c.camera) throw ArgError{QStringLiteral("No camera \"%1\" in the lens database").arg(QString::fromStdString(want))};
+                c.lens = nullptr;
+            }
+            auto cameraJson = [&]() -> QJsonValue {
+                if (!c.camera) return QJsonValue::Null;
+                return QJsonObject{{"name", QString::fromStdString(lens::cameraName(*c.camera))}, {"mount", QString::fromStdString(c.camera->mount)},
+                                   {"crop_factor", c.camera->cropFactor}};
+            };
+            if (a.value("list").toBool()) {
+                const QStringList words = a.value("query").toString().split(' ', Qt::SkipEmptyParts);
+                QJsonArray lenses;
+                for (const lens::Lens* x : db->lensesFor(c.camera)) {
+                    const QString name = QString::fromStdString(lens::lensName(*x));
+                    if (!std::all_of(words.begin(), words.end(), [&](const QString& w) { return name.contains(w, Qt::CaseInsensitive); })) continue;
+                    if (lenses.size() >= 200) break;
+                    lenses.append(QJsonObject{{"name", name}, {"type", QString::fromStdString(lens::projectionName(x->type))},
+                                              {"focal_min", x->minFocal}, {"focal_max", x->maxFocal}, {"crop_factor", x->cropFactor}});
+                }
+                return ok(QStringLiteral("%1 lens(es) fit %2").arg(lenses.size()).arg(c.camera ? QString::fromStdString(lens::cameraName(*c.camera)) : QStringLiteral("any camera")),
+                          QJsonObject{{"camera", cameraJson()}, {"lenses", lenses}});
+            }
+            if (a.contains("lens")) {
+                const std::string want = a.value("lens").toString().toStdString();
+                c.lens = db->lens(want, c.camera);
+                if (!c.lens) throw ArgError{QStringLiteral("No lens \"%1\"%2 in the lens database (list them with \"list\": true)")
+                                                .arg(QString::fromStdString(want), c.camera ? " for the " + QString::fromStdString(lens::cameraName(*c.camera)) : QString())};
+                c.focal = c.aperture = 0;
+            }
+            if (!c.lens) return fail(c.camera ? QStringLiteral("Which lens was on the %1? Give \"lens\" (\"list\": true lists them)").arg(QString::fromStdString(lens::cameraName(*c.camera)))
+                                              : QStringLiteral("The clip's camera is not known: give \"camera\" and \"lens\""));
+            if (a.contains("focal")) c.focal = a.value("focal").toDouble();
+            if (a.contains("aperture")) c.aperture = a.value("aperture").toDouble();
+            if (c.focal < 0 || c.aperture < 0) throw ArgError{"\"focal\" and \"aperture\" must not be negative"};
+            const QJsonObject params = a.value("params").toObject();
+            const EffectInfo* info = findEffectInfo("lens_correction");
+            for (auto it = params.begin(); it != params.end(); ++it) {
+                const std::string name = it.key().toStdString();
+                const auto pi = std::find_if(info->params.begin(), info->params.end(), [&](const ParamInfo& x) { return x.name == name; });
+                if (pi == info->params.end() || name == "focal" || name == "aperture" || name == "camera_crop")
+                    throw ArgError{QStringLiteral("\"params\" has no setting \"%1\" (focal and aperture are their own arguments)").arg(it.key())};
+                if (!it.value().isDouble() || it.value().toDouble() < pi->min || it.value().toDouble() > pi->max)
+                    throw ArgError{QStringLiteral("\"%1\" must be a number from %2 to %3").arg(it.key()).arg(pi->min).arg(pi->max)};
+            }
+            const std::vector<Id> clips = a.value("same_media").toBool() ? clipsOfSameMedia(s, clip.id) : std::vector<Id>{clip.id};
+            const int n = applyLensCorrection(l.project, s, clips, c);
+            for (Id id : clips)
+                if (Clip* k = edit::clipById(s, id))
+                    for (Effect& x : k->effects)
+                        if (x.type == "lens_correction")
+                            for (auto it = params.begin(); it != params.end(); ++it) x.params[it.key().toStdString()] = Param(it.value().toDouble());
+            save(l);
+            const Effect* e = nullptr;
+            if (const Clip* now = edit::clipById(s, clip.id))
+                for (const Effect& x : now->effects)
+                    if (x.type == "lens_correction") e = &x;
+            QJsonObject out{{"camera", cameraJson()}, {"lens", QString::fromStdString(lens::lensName(*c.lens))},
+                            {"type", QString::fromStdString(lens::projectionName(c.lens->type))}, {"clips", n}};
+            if (e) {
+                out["effect"] = double(e->id);
+                out["focal"] = e->p("focal", 0);
+                out["aperture"] = e->p("aperture", 0);
+            }
+            return ok(QStringLiteral("Corrected the %1 on %2 clip(s)").arg(QString::fromStdString(lens::lensName(*c.lens))).arg(n), out);
         });
 
     add("montage_object_mask", "Pick objects for a mask",

@@ -130,6 +130,7 @@
 #include "TransformOverlay.h"
 #include "ReviewOverlay.h"
 #include "ChartMatchDialog.h"
+#include "LensCorrectionDialog.h"
 #include "SequenceIndexPanel.h"
 #include "StackedTimelineWidget.h"
 #include "PanFollowDialog.h"
@@ -1148,6 +1149,7 @@ void MainWindow::buildMenus() {
         ->setObjectName(QStringLiteral("setColourReference"));
     add(clipM, tr("&Key Out Green / Blue Screen"), QKeySequence(), [this] { keyOutScreen(); })->setObjectName(QStringLiteral("keyScreen"));
     add(clipM, tr("Match Colour Chart…"), QKeySequence(), [this] { matchColourChart(); })->setObjectName(QStringLiteral("matchColourChart"));
+    add(clipM, tr("Correct Lens…"), QKeySequence(), [this] { correctLens(); })->setObjectName(QStringLiteral("correctLens"));
     add(clipM, tr("Match Colour to Reference"), QKeySequence("Ctrl+Alt+Shift+C"), [this] { matchColour(); })
         ->setObjectName(QStringLiteral("matchColour"));
     compareRef_ = add(clipM, tr("Compare with Reference"), QKeySequence(), [this] { setCompareWithReference(compareRef_->isChecked()); });
@@ -3947,6 +3949,30 @@ int MainWindow::matchColour() {
     state_->message(tr("Matched %n clip(s) to %1", "", n).arg(colourRefName_), 5000);
     inspectorDock_->raise();
     return n;
+}
+
+bool MainWindow::correctLens() {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    // The selected picture clip, else the top one at the playhead.
+    const FrameTime at = state_->playhead();
+    Id clip = 0;
+    for (Id id : state_->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Video && edit::clipById(*s, id)->mediaId) {
+            clip = id;
+            break;
+        }
+    for (auto t = s->videoTracks.rbegin(); !clip && t != s->videoTracks.rend(); ++t)
+        for (const Clip& c : t->clips)
+            if (c.mediaId && c.contains(at)) {
+                clip = c.id;
+                break;
+            }
+    if (!clip) {
+        state_->message(tr("Select the video clip to correct (or park on it)"));
+        return false;
+    }
+    return montage::correctLens(this, state_, clip);
 }
 
 int MainWindow::matchColourChart() {

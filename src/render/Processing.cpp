@@ -3,6 +3,7 @@
 #include "Ofx.h"
 
 #include "ColorSpace.h"
+#include "TransferTables.h"
 #include "Ocio.h"
 #include "VideoFx.h"
 #include "core/Cdl.h"
@@ -174,37 +175,6 @@ void curves(const Effect& e, FrameTime t, Image& img) {
 
 void hueCurves(const Effect& e, FrameTime t, Image& img);  // below, beside the curve building
 void colorWarper(const Effect& e, FrameTime t, Image& img);  // below, as hue curves
-
-// A transfer function and its inverse as tables (the HDR Palette decodes and encodes every pixel): code values to
-// light over 0..1.25, light to code values over 2^-24..2^8 by its logarithm; beyond them the functions themselves, and
-// negative values mirrored.
-struct TransferTables {
-    static constexpr int kDecode = 4096, kEncode = 4096;
-    static constexpr float kDecodeMax = 1.25f, kLogMin = -24, kLogMax = 8;
-    Transfer tf;
-    std::vector<float> dec, enc;
-    explicit TransferTables(Transfer t) : tf(t), dec(kDecode + 1), enc(kEncode + 1) {
-        for (int i = 0; i <= kDecode; ++i) dec[size_t(i)] = float(toLinear(tf, double(kDecodeMax) * i / kDecode));
-        for (int i = 0; i <= kEncode; ++i)
-            enc[size_t(i)] = float(fromLinear(tf, std::exp2(double(kLogMin) + double(kLogMax - kLogMin) * i / kEncode)));
-    }
-    float decode(float v) const {
-        if (v < 0) return -decode(-v);
-        if (v >= kDecodeMax) return float(toLinear(tf, v));
-        const float x = v / kDecodeMax * kDecode;
-        const int i = std::min(kDecode - 1, int(x));
-        return dec[size_t(i)] + (dec[size_t(i + 1)] - dec[size_t(i)]) * (x - float(i));
-    }
-    float encode(float l) const {
-        if (l < 0) return -encode(-l);
-        if (l <= std::exp2(kLogMin)) return enc[0] * l / std::exp2(kLogMin);  // a straight line to black
-        const float lg = std::log2(l);
-        if (lg >= kLogMax) return float(fromLinear(tf, l));
-        const float x = (lg - kLogMin) / (kLogMax - kLogMin) * kEncode;
-        const int i = std::min(kEncode - 1, int(x));
-        return enc[size_t(i)] + (enc[size_t(i + 1)] - enc[size_t(i)]) * (x - float(i));
-    }
-};
 
 // HDR Palette: each pixel's brightness in stops from mid grey (0.18 of reference white, in the light the working space
 // shows: SDR white and HDR's 203 nits are both 1.0), moved by the global exposure and each zone's exposure as far as the
@@ -1853,6 +1823,7 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "directional_blur") vfx::directionalBlur(e, t, img, pixelScale);
     else if (ty == "chromatic_aberration") vfx::chromaticAberration(e, t, img, pixelScale);
     else if (ty == "lens_distortion") vfx::lensDistortion(e, t, img);
+    else if (ty == "lens_correction") vfx::lensCorrection(e, t, img);
     else if (ty == "magnify") vfx::magnify(e, t, img, pixelScale);
     else if (ty == "channel_blur") vfx::channelBlur(e, t, img, pixelScale);
     else if (ty == "noise") vfx::noise(e, t, img);

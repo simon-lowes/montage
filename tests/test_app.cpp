@@ -96,6 +96,7 @@
 #include "MediaBinWidget.h"
 #include "ReviewOverlay.h"
 #include "ChartMatchDialog.h"
+#include "LensCorrectionDialog.h"
 #include "media/Proxy.h"
 #include "StoryboardView.h"
 #include "StackedTimelineWidget.h"
@@ -6367,6 +6368,114 @@ private slots:
         // One undo step takes it away.
         state()->undo();
         QVERIFY(!edit::clipById(*state()->sequence(), clips[0]));
+    }
+
+    void correctLensInTheApp() {
+        // The test database stands in for lensfun's.
+        QTemporaryDir lenses;
+        QVERIFY(QFile::copy(QStringLiteral(MONTAGE_TEST_DATA_DIR "/lensfun/test-lenses.xml"), lenses.filePath("test-lenses.xml")));
+        qputenv("MONTAGE_LENS_DB", lenses.path().toUtf8());
+        reloadLensDatabase();
+        struct Restore {
+            ~Restore() {
+                qunsetenv("MONTAGE_LENS_DB");
+                reloadLensDatabase();
+                lensDialogHook() = nullptr;
+            }
+        } restore;
+        // A GoPro still, on the timeline twice.
+        const QString file = dir_.filePath("gopro.png");
+        QImage img(320, 180, QImage::Format_RGB32);
+        img.fill(QColor(80, 110, 140));
+        QVERIFY(img.save(file));
+        state()->newProject();
+        const auto ids = state()->importFiles({file});
+        QCOMPARE(ids.size(), size_t(1));
+        Id a = 0, b = 0;
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            p.findMedia(ids[0])->metadata["device"] = "GoPro HERO11 Black";
+            s.width = 320, s.height = 180;
+            if (!edit::placeMedia(p, s, ids[0], 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok) return false;
+            if (!edit::placeMedia(p, s, ids[0], 60, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok) return false;
+            a = s.videoTracks[0].clips[0].id, b = s.videoTracks[0].clips[1].id;
+            return true;
+        }));
+        auto lensOf = [&](Id clip) -> const Effect* {
+            for (const Effect& e : edit::clipById(*state()->sequence(), clip)->effects)
+                if (e.type == "lens_correction") return &e;
+            return nullptr;
+        };
+        state()->setSelection({a}, false);
+        // The camera from the clip's Camera Model, its fixed lens with it; applied to this clip alone.
+        bool shown = false;
+        lensDialogHook() = [&](LensCorrectionDialog* dlg) {
+            shown = true;
+            QCOMPARE(dlg->cameraText(), QStringLiteral("GoPro Hero11 Black"));
+            QCOMPARE(dlg->lensText(), QStringLiteral("GoPro HERO11 Black & compatibles"));
+            QVERIFY(dlg->findChild<QPushButton*>("lensApply")->isEnabled());
+            QVERIFY(dlg->findChild<QLabel*>("lensAbout")->text().contains("rectilinear"));
+            dlg->findChild<QCheckBox*>()->setChecked(false);
+            QMetaObject::invokeMethod(dlg, "accept", Qt::QueuedConnection);
+        };
+        QAction* action = win_->findChild<QAction*>("correctLens");
+        QVERIFY(action);
+        action->trigger();
+        QVERIFY(shown);
+        QVERIFY(lensOf(a) && !lensOf(b));
+        QCOMPARE(edit::clipById(*state()->sequence(), a)->effects[0].type, std::string("lens_correction"));
+        QCOMPARE(lensOf(a)->s("lens"), std::string("GoPro HERO11 Black & compatibles"));
+        QCOMPARE(lensOf(a)->p("focal", 0), 2.7);
+        // In the Inspector: the lens it holds, and Choose Lens… opens the dialog on it. Another camera: its lenses (a
+        // lens left unchosen cannot be applied), then the fisheye from the adapter, at f/4 on both clips.
+        win_->findChild<QDockWidget*>("inspector")->show();
+        win_->findChild<QDockWidget*>("inspector")->raise();
+        QApplication::processEvents();
+        QLabel* name = nullptr;
+        for (auto* l : win_->findChildren<QLabel*>("lensName"))
+            if (l->isVisibleTo(win_.get())) name = l;
+        QVERIFY(name);
+        QVERIFY2(name->text().contains("HERO11") && name->text().contains("GoPro Hero11 Black"), qPrintable(name->text()));
+        QPushButton* choose = nullptr;
+        for (auto* c : win_->findChildren<QPushButton*>("chooseLens"))
+            if (c->isVisibleTo(win_.get())) choose = c;
+        QVERIFY(choose);
+        shown = false;
+        lensDialogHook() = [&](LensCorrectionDialog* dlg) {
+            shown = true;
+            QCOMPARE(dlg->lensText(), QStringLiteral("GoPro HERO11 Black & compatibles"));  // what it holds
+            QVERIFY(dlg->setCamera("Sony ILCE-6400"));
+            QVERIFY(dlg->lensText().isEmpty());
+            QVERIFY(!dlg->findChild<QPushButton*>("lensApply")->isEnabled());
+            QCOMPARE(dlg->findChild<QComboBox*>("lensLens")->count(), 2);
+            QVERIFY(dlg->setLens("Samyang 8mm f/2.8 UMC Fish-eye"));
+            dlg->findChild<QDoubleSpinBox*>("lensAperture")->setValue(4);
+            QVERIFY(dlg->sameMedia());
+            QMetaObject::invokeMethod(dlg, "accept", Qt::QueuedConnection);
+        };
+        choose->click();
+        QTRY_VERIFY(shown);
+        QTRY_VERIFY(lensOf(b));
+        for (Id clip : {a, b}) {
+            QCOMPARE(lensOf(clip)->s("lens"), std::string("Samyang 8mm f/2.8 UMC Fish-eye"));
+            QCOMPARE(lensOf(clip)->s("camera"), std::string("Sony ILCE-6400"));
+            QCOMPARE(lensOf(clip)->p("aperture", 0), 4.0);
+        }
+        QCOMPARE(int(std::count_if(edit::clipById(*state()->sequence(), a)->effects.begin(), edit::clipById(*state()->sequence(), a)->effects.end(),
+                                   [](const Effect& e) { return e.type == "lens_correction"; })),
+                 1);
+        // Cancelled, nothing changes.
+        const std::string profile = lensOf(a)->s("profile");
+        shown = false;
+        lensDialogHook() = [&](LensCorrectionDialog* dlg) {
+            shown = true;
+            QMetaObject::invokeMethod(dlg, "reject", Qt::QueuedConnection);
+        };
+        QVERIFY(!win_->correctLens());
+        QVERIFY(shown);
+        QCOMPARE(lensOf(a)->s("profile"), profile);
+        // Played: filled to the frame's corners.
+        const Image frame = renderProgramFrame(state()->project(), *state()->sequence(), 5, RenderOptions{});
+        QVERIFY(frame.at(0, 0)[3] > 0.99f);
     }
 
     void contentCredentialsInTheApp() {

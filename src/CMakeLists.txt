@@ -40,6 +40,7 @@ add_library(montage_engine STATIC
   core/Reconform.h core/Reconform.cpp
   core/Adr.h core/Adr.cpp
   core/Provenance.h core/Provenance.cpp
+  core/LensProfile.h core/LensProfile.cpp
   core/AudioDescription.h core/AudioDescription.cpp
   core/MergeClips.h core/MergeClips.cpp
   core/ClipAnimation.h core/ClipAnimation.cpp
@@ -103,6 +104,7 @@ add_library(montage_engine STATIC
   media/Tracking.h media/Tracking.cpp
   media/Reframe.h media/Reframe.cpp
   media/ModelFiles.h media/ModelFiles.cpp
+  media/LensDatabase.h media/LensDatabase.cpp
   media/Segmenter.h media/Segmenter.cpp
   media/Diarizer.h media/Diarizer.cpp
   media/VisualSearch.h media/VisualSearch.cpp
@@ -111,7 +113,7 @@ add_library(montage_engine STATIC
   media/SpeechEnhance.h media/SpeechEnhance.cpp
   media/Beats.h media/Beats.cpp
   media/Translator.h media/Translator.cpp
-  render/Processing.h render/Processing.cpp
+  render/Processing.h render/Processing.cpp render/TransferTables.h
   render/Ofx.h render/Ofx.cpp
   render/FaceRefine.h render/FaceRefine.cpp
   render/Jpeg2000.h render/Jpeg2000.cpp
