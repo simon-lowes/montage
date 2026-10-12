@@ -164,6 +164,7 @@ add_library(montage_engine STATIC
   render/Ocio.h render/Ocio.cpp
   render/Compositor.h render/Compositor.cpp
   render/OGraf.h render/OGraf.cpp
+  render/Gallery.h render/Gallery.cpp
   render/RenderCache.h render/RenderCache.cpp
   render/AudioFx.h render/AudioFx.cpp
   render/VideoFx.h render/VideoFx.cpp

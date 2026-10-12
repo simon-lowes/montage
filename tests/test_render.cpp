@@ -35,6 +35,7 @@
 #include "render/DcpMxf.h"
 #include "media/Decoder.h"
 #include "render/Exporter.h"
+#include "render/Gallery.h"
 #include "render/RoomTone.h"
 #include "render/Ocio.h"
 #include "media/Tracking.h"
@@ -2437,6 +2438,101 @@ colorspaces:
         QVERIFY(edit::switchGradeVersion(s, red.id, 0).ok);
         rgb(renderSequenceFrame(p, s, 5, o), 32, 18, c);
         QVERIFY(c[0] < 0.1f && c[1] > 0.9f);
+    }
+
+    void galleryStillsAndGrades() {
+        // Red inverted (cyan) with a blur after the grade; blue with only a blur; green with nothing.
+        QTemporaryDir dir;
+        QVERIFY(dir.isValid());
+        const std::string folder = dir.path().toStdString() + "/Gallery/film";
+        QCOMPARE(galleryFolder("/x/y/film.montage"), std::string("/x/y/Gallery/film"));
+        QVERIFY(!galleryFolder("").empty());
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64;
+        s.height = 36;
+        Clip red = colorClip(p, 1, 0, 0, 0, 30);
+        red.name = "Red";
+        red.effects = {makeEffect(p, "invert"), makeEffect(p, "gaussian_blur")};
+        Clip blue = colorClip(p, 0, 0, 1, 30, 30);
+        blue.effects = {makeEffect(p, "gaussian_blur")};
+        Clip green = colorClip(p, 0, 1, 0, 60, 30);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, red);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, blue);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, green);
+
+        // Grabbed: the picture as the viewer shows it, the grade (the invert, first among the clip's effects).
+        GalleryStill one;
+        std::string err;
+        QVERIFY2(grabStill(p, s, 5, folder, kDefaultAlbum, one, &err), err.c_str());
+        QCOMPARE(one.label, std::string("1"));
+        QCOMPARE(one.clip, std::string("Red"));
+        QCOMPARE(one.effects.size(), size_t(1));
+        QCOMPARE(one.effects[0].type, std::string("invert"));
+        QVERIFY(one.anchors == std::vector<int>{0});
+        const QImage picture(QString::fromStdString(one.picture));
+        QCOMPARE(picture.size(), QSize(64, 36));
+        const QColor cyan = picture.pixelColor(32, 18);
+        QVERIFY(cyan.red() < 30 && cyan.green() > 220 && cyan.blue() > 220);
+        GalleryStill two;
+        QVERIFY(grabStill(p, s, 40, folder, kDefaultAlbum, two, &err));
+        QCOMPARE(two.label, std::string("2"));
+        QVERIFY(two.effects.empty());
+        QVERIFY(!grabStill(p, s, 200, folder, kDefaultAlbum, two, &err) && !err.empty());  // nothing there
+        std::vector<GalleryStill> stills = galleryStills(folder, kDefaultAlbum);
+        QCOMPARE(stills.size(), size_t(2));
+        QCOMPARE(stills[0].id, one.id);
+        GalleryStill found;
+        QVERIFY(findStill(folder, kDefaultAlbum, "1", found) && found.id == one.id && found.effects.size() == 1);
+
+        // Applied to blue: the invert in place of its (empty) grade, before its blur; blue inverted is yellow.
+        QVERIFY(edit::applyStillGrade(p, s, found, {blue.id}).ok);
+        const Clip* b = edit::clipById(s, blue.id);
+        QCOMPARE(b->effects.size(), size_t(2));
+        QCOMPARE(b->effects[0].type, std::string("invert"));
+        QVERIFY(b->effects[0].id != red.effects[0].id);
+        RenderOptions o;
+        float c[4];
+        rgb(renderSequenceFrame(p, s, 40, o), 32, 18, c);
+        QVERIFY(c[0] > 0.9f && c[1] > 0.9f && c[2] < 0.1f);
+        // The second still (no grade) takes it off again, the blur kept.
+        QVERIFY(findStill(folder, kDefaultAlbum, "2", found));
+        QVERIFY(edit::applyStillGrade(p, s, found, {blue.id}).ok);
+        QCOMPARE(edit::clipById(s, blue.id)->effects.size(), size_t(1));
+        QCOMPARE(edit::clipById(s, blue.id)->effects[0].type, std::string("gaussian_blur"));
+
+        // A node grade goes with its graph.
+        QVERIFY(edit::convertToNodes(s, red.id).ok);
+        QVERIFY(edit::addGradeNode(p, s, red.id, edit::NodeHow::Serial).ok);
+        GalleryStill nodes;
+        QVERIFY(grabStill(p, s, 5, folder, kDefaultAlbum, nodes, &err));
+        QCOMPARE(nodes.graph.nodes.size(), edit::clipById(s, red.id)->grade.nodes.size());
+        QVERIFY(findStill(folder, kDefaultAlbum, nodes.id, found));
+        QVERIFY(found.graph == nodes.graph);
+        QVERIFY(edit::applyStillGrade(p, s, found, {green.id}).ok);
+        const Clip* g = edit::clipById(s, green.id);
+        QVERIFY(g->grade == edit::clipById(s, red.id)->grade);
+        QVERIFY(std::any_of(g->effects.begin(), g->effects.end(), [](const Effect& e) { return e.type == "invert" && e.node != 0; }));
+        rgb(renderSequenceFrame(p, s, 70, o), 32, 18, c);
+        QVERIFY(c[0] > 0.9f && c[1] < 0.1f && c[2] > 0.9f);  // green inverted: magenta
+        QVERIFY(!edit::applyStillGrade(p, s, found, {}).ok);
+
+        // Albums, renaming, removing.
+        QVERIFY(addAlbum(folder, "Looks"));
+        QVERIFY(!addAlbum(folder, "a/b"));
+        QVERIFY(!addAlbum(folder, ".."));
+        const std::vector<std::string> albums = galleryAlbums(folder);
+        QCOMPARE(albums.front(), std::string(kDefaultAlbum));
+        QVERIFY(std::find(albums.begin(), albums.end(), "Looks") != albums.end());
+        GalleryStill look;
+        QVERIFY(grabStill(p, s, 5, folder, "Looks", look, &err));
+        QCOMPARE(look.label, std::string("1"));
+        QVERIFY(galleryStills(folder, "../Stills").empty());
+        QVERIFY(renameStill(folder, look, "Night"));
+        QVERIFY(findStill(folder, "Looks", "Night", found) && found.id == look.id);
+        QVERIFY(removeStill(folder, look));
+        QVERIFY(galleryStills(folder, "Looks").empty());
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(look.picture)));
     }
 
     void clipAnimationsRendered() {

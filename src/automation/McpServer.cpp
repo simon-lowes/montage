@@ -120,6 +120,7 @@
 #include "media/VisualSearch.h"
 #include "render/ClipAnalysis.h"
 #include "render/OGraf.h"
+#include "render/Gallery.h"
 #include "media/Segmenter.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
@@ -6436,6 +6437,79 @@ void McpServer::Impl::addTools() {
             if (n == 0) return fail("None of the clips has a picture to match");
             save(l);
             return ok(QStringLiteral("Matched %1 clip(s) to the picture at %2").arg(n).arg(tc(at, s)), QJsonObject{{"matched", n}});
+        });
+
+    add("montage_gallery", "Colour gallery stills",
+        "The colour gallery (Resolve's Gallery): stills of the cut, each with the grade of the clip it shows, kept in "
+        "albums beside the project (Gallery/<project>/<album>, a PNG and the grade as JSON). list gives the albums and "
+        "an album's stills; grab takes a still of the picture at `at` with the top clip's grade; apply puts a still's "
+        "grade (its colour effects and nodes) in place of the grade of `clips`, their other effects kept; rename, remove "
+        "and add_album tidy up. A still is named by its id or its label (1, 2...).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "action":{"type":"string","enum":["list","grab","apply","rename","remove","add_album"],"default":"list"},
+            "album":{"type":"string","default":"Stills"},
+            "still":{"type":"string","description":"apply, rename, remove: the still's id or label"},
+            "at":{"type":["number","string"],"description":"grab: timeline time (default the sequence's playhead)"},
+            "clips":{"type":"array","items":{"type":["number","string"]},"description":"apply: video clips' ids or names"},
+            "label":{"type":"string","description":"rename: its new label"},
+            "name":{"type":"string","description":"add_album: the album's name"}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const std::string folder = galleryFolder(l.path.toStdString());
+            const std::string album = str(a, "album", kDefaultAlbum).toStdString();
+            const QString action = str(a, "action", "list");
+            std::string err;
+            auto stillJson = [](const GalleryStill& g) {
+                return QJsonObject{{"id", QString::fromStdString(g.id)},           {"label", QString::fromStdString(g.label)},
+                                   {"picture", QString::fromStdString(g.picture)}, {"clip", QString::fromStdString(g.clip)},
+                                   {"sequence", QString::fromStdString(g.sequence)}, {"timecode", QString::fromStdString(g.timecode)},
+                                   {"created", QString::fromStdString(g.created)}, {"grade_effects", int(g.effects.size())},
+                                   {"grade_nodes", int(g.graph.nodes.size())}};
+            };
+            auto still = [&]() {
+                GalleryStill g;
+                if (!findStill(folder, album, need(a, "still").toStdString(), g))
+                    throw ArgError{QStringLiteral("No still \"%1\" in album \"%2\"").arg(str(a, "still"), QString::fromStdString(album))};
+                return g;
+            };
+            if (action == "list") {
+                QJsonArray albums, stills;
+                for (const std::string& name : galleryAlbums(folder)) albums.append(QString::fromStdString(name));
+                for (const GalleryStill& g : galleryStills(folder, album)) stills.append(stillJson(g));
+                return ok(QStringLiteral("%1 still(s) in %2").arg(stills.size()).arg(QString::fromStdString(album)),
+                          QJsonObject{{"folder", QString::fromStdString(folder)}, {"albums", albums}, {"stills", stills}});
+            }
+            if (action == "add_album") {
+                if (!addAlbum(folder, need(a, "name").toStdString(), &err)) return fail(QString::fromStdString(err));
+                return ok(QStringLiteral("Added album %1").arg(str(a, "name")));
+            }
+            if (action == "grab") {
+                const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : s.playhead;
+                GalleryStill g;
+                if (!grabStill(l.project, s, at, folder, album, g, &err)) return fail(QString::fromStdString(err));
+                return ok(QStringLiteral("Grabbed still %1 of %2").arg(QString::fromStdString(g.label), QString::fromStdString(g.clip)), stillJson(g));
+            }
+            if (action == "rename") {
+                GalleryStill g = still();
+                if (!renameStill(folder, g, need(a, "label").toStdString())) return fail("Cannot rename the still");
+                return ok(QStringLiteral("Renamed"), stillJson(g));
+            }
+            if (action == "remove") {
+                if (!removeStill(folder, still())) return fail("Cannot remove the still");
+                return ok(QStringLiteral("Removed"));
+            }
+            if (action != "apply") throw ArgError{"\"action\" is list, grab, apply, rename, remove or add_album"};
+            const GalleryStill g = still();
+            std::vector<Id> clips;
+            for (const QJsonValue& v : a.value("clips").toArray()) clips.push_back(clipArg(l, QJsonObject{{"clip", v}}).id);
+            if (clips.empty()) throw ArgError{"\"clips\" is required"};
+            const auto r = edit::applyStillGrade(l.project, s, g, clips);
+            if (!r.ok) return fail(QString::fromStdString(r.error));
+            save(l);
+            return ok(QStringLiteral("Applied still %1's grade to %2 clip(s)").arg(QString::fromStdString(g.label)).arg(r.applied),
+                      QJsonObject{{"applied", double(r.applied)}});
         });
 
     add("montage_match_chart", "Match a colour chart",

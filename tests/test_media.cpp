@@ -5192,6 +5192,65 @@ private slots:
         QVERIFY(QFileInfo::exists(r.value("structuredContent").toObject().value("pull_list").toString()));
     }
 
+    void galleryOverMcp() {
+        // Two colour clips, the first with a Curves grade; stills grabbed, its grade applied to the second.
+        Project q = makeDefaultProject();
+        q.active()->width = 64;
+        q.active()->height = 36;
+        Clip a = makeGeneratorClip(q, "color", 30);
+        a.name = "Graded";
+        a.effects = {makeEffect(q, "curves"), makeEffect(q, "gaussian_blur")};
+        Clip b = makeGeneratorClip(q, "color", 30);
+        b.start = 30;
+        edit::overwrite(q, *q.active(), {TrackKind::Video, 0}, a);
+        edit::overwrite(q, *q.active(), {TrackKind::Video, 0}, b);
+        const double second = double(q.active()->videoTracks[0].clips.at(1).id);
+        const QString project = QString::fromStdString(path("gallery/film.montage"));
+        QDir().mkpath(QFileInfo(project).absolutePath());
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_gallery"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        QJsonObject r = call({{"project", project}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("folder").toString(), QFileInfo(project).absolutePath() + "/Gallery/film");
+        QCOMPARE(r.value("structuredContent").toObject().value("stills").toArray().size(), 0);
+        r = call({{"project", project}, {"action", "grab"}, {"at", 0.2}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QJsonObject still = r.value("structuredContent").toObject();
+        QCOMPARE(still.value("label").toString(), QString("1"));
+        QCOMPARE(still.value("clip").toString(), QString("Graded"));
+        QCOMPARE(still.value("grade_effects").toInt(), 1);
+        QVERIFY(QFileInfo::exists(still.value("picture").toString()));
+        r = call({{"project", project}, {"action", "grab"}, {"at", 100}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"project", project}, {"action", "apply"}, {"still", "1"}, {"clips", QJsonArray{second}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Clip& graded = back.active()->videoTracks[0].clips.at(1);
+        QCOMPARE(graded.effects.size(), size_t(1));
+        QCOMPARE(graded.effects[0].type, std::string("curves"));
+        r = call({{"project", project}, {"action", "apply"}, {"still", "9"}, {"clips", QJsonArray{second}}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("No still"));
+        r = call({{"project", project}, {"action", "add_album"}, {"name", "Looks"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call({{"project", project}, {"action", "rename"}, {"still", "1"}, {"label", "Warm"}});
+        QVERIFY2(!r.value("isError").toBool() && r.value("structuredContent").toObject().value("label").toString() == "Warm", qPrintable(text(r)));
+        r = call({{"project", project}});
+        QCOMPARE(r.value("structuredContent").toObject().value("albums").toArray().size(), 2);
+        r = call({{"project", project}, {"action", "remove"}, {"still", "Warm"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(!QFileInfo::exists(still.value("picture").toString()));
+    }
+
     void gradeVersionsOverMcp() {
         Project q = makeDefaultProject();
         Clip c = makeGeneratorClip(q, "color", 30);

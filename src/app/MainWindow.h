@@ -53,6 +53,8 @@ class RenderQueue;
 class EffectsBrowser;
 class InspectorWidget;
 class GradeNodePanel;
+class GalleryPanel;
+class ClipStripPanel;
 class ScopesWidget;
 class MixerPanel;
 class ControlSurface;
@@ -367,7 +369,7 @@ private:
     // Lays the panels out afresh: groups across the top, down the left and down the right, each group's panels as tabs
     // with its first in front. Panels in no group are hidden, tabbed behind the first top group for Window to bring back.
     using DockGroups = std::vector<std::vector<QDockWidget*>>;
-    void arrangeDocks(const DockGroups& top, const DockGroups& left, const DockGroups& right);
+    void arrangeDocks(const DockGroups& top, const DockGroups& left, const DockGroups& right, const DockGroups& bottom = {});
     void layOutBuiltIn(const QString& name);
     void syncWorkspaceUi();
     void syncProgram();
@@ -536,6 +538,10 @@ private:
     QDockWidget* keyframesDock_ = nullptr;
     QDockWidget* nodesDock_ = nullptr;
     GradeNodePanel* gradeNodes_ = nullptr;
+    QDockWidget* galleryDock_ = nullptr;
+    GalleryPanel* gallery_ = nullptr;
+    QDockWidget* clipsDock_ = nullptr;
+    ClipStripPanel* clipStrip_ = nullptr;
     QDockWidget* meterDock_ = nullptr;
     RenderQueue* queue_ = nullptr;
     Image colourRef_;       // the look Match Colour aims for

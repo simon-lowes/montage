@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "Effects.h"
+#include "GradeGraph.h"
 
 namespace montage {
 
@@ -52,7 +53,34 @@ void putGrade(Clip& c, const std::vector<Effect>& grade, const std::vector<int>&
 
 }  // namespace
 
+void gradeOf(const Clip& c, std::vector<Effect>& effects, std::vector<int>& anchors) {
+    Clip copy = c;
+    effects = takeGrade(copy, anchors);
+}
+
 namespace edit {
+
+Result replaceGrade(Project& p, Sequence& s, Id clipId, const std::vector<Effect>& effects, const std::vector<int>& anchors,
+                    const GradeGraph& graph, const std::vector<SharedNode>& sharedNodes) {
+    Clip* c = clipById(s, clipId);
+    if (!c) return Result::fail("No such clip");
+    bool onVideo = false;
+    for (const Track& t : s.videoTracks)
+        for (const Clip& k : t.clips) onVideo = onVideo || k.id == clipId;
+    if (!onVideo) return Result::fail("Grades are for picture clips");
+    const std::map<Id, Id> sharedIds = adoptSharedNodes(p, s, sharedNodes);
+    c = clipById(s, clipId);  // (adopting may add to the sequence, not its clips; looked up again all the same)
+    std::vector<int> replaced;
+    takeGrade(*c, replaced);
+    std::vector<Effect> fresh = effects;
+    for (Effect& e : fresh) e.id = p.newId();
+    putGrade(*c, fresh, anchors, replaced);
+    c->grade = graph;
+    remapSharedNodes(c->grade, sharedIds);
+    for (GradeNode& n : c->grade.nodes)
+        if (n.shared && !findSharedNode(s, n.shared)) n.shared = 0;
+    return {};
+}
 
 Result addGradeVersion(Project& p, Sequence& s, Id clipId, const std::string& name, bool empty) {
     Clip* c = clipById(s, clipId);

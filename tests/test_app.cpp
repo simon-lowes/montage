@@ -83,6 +83,8 @@
 #include "SpectralRepairDialog.h"
 #include "automation/McpServer.h"
 #include "render/OGraf.h"
+#include "GalleryPanel.h"
+#include "ClipStripPanel.h"
 #include "automation/PythonHost.h"
 #include "automation/ScriptHost.h"
 #include "ScriptConsole.h"
@@ -10176,6 +10178,79 @@ const auto seq = [this] { return state()->sequence(); };
         state()->undo();
         QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(1));
         state()->newProject();
+    }
+
+    void galleryAndClipStrip() {
+        // The demo (Red, then Blue on V1; a title over Red on V2), saved: its gallery beside it.
+        const QString path = dir_.path() + "/gallery-demo.montage";
+        QVERIFY(saveProject(demoProject(), path.toStdString()));
+        QVERIFY(win_->openProject(path));
+        auto* gallery = win_->findChild<GalleryPanel*>();
+        QVERIFY(gallery);
+        QCOMPARE(gallery->folder(), dir_.path() + "/Gallery/gallery-demo");
+        const Id red = clipNamed(*state()->sequence(), "Red")->id, blue = clipNamed(*state()->sequence(), "Blue")->id;
+        state()->edit("Grade", [&](Project& p, Sequence& s) {
+            edit::clipById(s, red)->effects.push_back(makeEffect(p, "invert"));
+            return true;
+        });
+        QVERIFY(win_->findChild<QAction*>("grabStillAction"));
+
+        // Grab Still at frame 5 (Red alone), then Wipe: the Program monitor compares with it until Wipe is off.
+        state()->setPlayhead(5);
+        QVERIFY(gallery->grab());
+        auto* stills = win_->findChild<QListWidget*>("galleryStills");
+        QCOMPARE(stills->count(), 1);
+        QVERIFY(!gallery->selectedStill().isEmpty());
+        MonitorPanel* program = nullptr;
+        for (auto* mp : win_->findChildren<MonitorPanel*>())
+            if (mp->mode() == MonitorPanel::Mode::Program) program = mp;
+        QVERIFY(program);
+        QVERIFY(gallery->wipe(true));
+        QVERIFY(program->viewer()->comparing());
+        QVERIFY(win_->findChild<QPushButton*>("wipeStill")->isChecked());
+        gallery->wipe(false);
+        QVERIFY(!program->viewer()->comparing());
+
+        // Apply Grade to the selected clip: Blue gets the invert, one undo step.
+        state()->setSelection({blue}, false);
+        QVERIFY(gallery->applyToSelection());
+        auto inverted = [&] {
+            const Clip* c = edit::clipById(*state()->sequence(), blue);
+            return std::any_of(c->effects.begin(), c->effects.end(), [](const Effect& e) { return e.type == "invert"; });
+        };
+        QVERIFY(inverted());
+        state()->undo();
+        QVERIFY(!inverted());
+        QVERIFY(gallery->addAlbum("Looks"));
+        QCOMPARE(gallery->album(), QString("Looks"));
+        QCOMPARE(stills->count(), 0);
+        gallery->setAlbum("Stills");
+        QCOMPARE(stills->count(), 1);
+        gallery->selectStill(stills->item(0)->data(Qt::UserRole).toString());
+        QVERIFY(gallery->removeSelected());
+        QCOMPARE(stills->count(), 0);
+
+        // The clip strip: every picture clip in timeline order, graded thumbnails, the one under the playhead marked.
+        auto* strip = win_->findChild<ClipStripPanel*>();
+        QVERIFY(strip);
+        strip->rebuild();
+        const std::vector<Id> listed = strip->clips();
+        QCOMPARE(listed.size(), size_t(3));
+        QCOMPARE(listed.front(), red);
+        QCOMPARE(listed.back(), blue);
+        auto* list = win_->findChild<QListWidget*>("clipStrip");
+        QTRY_COMPARE_WITH_TIMEOUT(strip->pending(), 0, 20000);
+        QVERIFY(!list->item(0)->icon().isNull());
+        state()->setPlayhead(20);  // the title, over Red
+        QCOMPARE(list->currentRow(), 1);
+        emit list->itemClicked(list->item(2));
+        QCOMPARE(state()->selectedClips(), std::vector<Id>{blue});
+        QCOMPARE(state()->playhead(), FrameTime(60));
+        QCOMPARE(list->currentRow(), 2);
+        strip->setLightbox(true);
+        QVERIFY(strip->lightbox() && list->isWrapping() && list->iconSize().width() > 200);
+        strip->setLightbox(false);
+        QVERIFY(!list->isWrapping());
     }
 
     void ografGraphicInInspector() {

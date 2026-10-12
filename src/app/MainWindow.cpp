@@ -119,6 +119,8 @@
 #include "media/Relink.h"
 #include "KeyframePanel.h"
 #include "GradeNodePanel.h"
+#include "GalleryPanel.h"
+#include "ClipStripPanel.h"
 #include "MediaBinWidget.h"
 #include "RenderQueue.h"
 #include "RenderQueuePanel.h"
@@ -541,6 +543,24 @@ void MainWindow::buildPanels() {
     keyframesDock_ = makeDock(tr("Keyframes"), "keyframes", new KeyframePanel(state_, this));
     gradeNodes_ = new GradeNodePanel(state_, this);
     nodesDock_ = makeDock(tr("Nodes"), "nodes", gradeNodes_);
+    // The colour page's stills and clips (Resolve's Gallery and thumbnail timeline).
+    gallery_ = new GalleryPanel(state_, this);
+    galleryDock_ = makeDock(tr("Gallery"), "gallery", gallery_);
+    clipStrip_ = new ClipStripPanel(state_, this);
+    clipsDock_ = makeDock(tr("Clips"), "clips", clipStrip_);
+    connect(gallery_, &GalleryPanel::compareRequested, this, [this](const QImage& still, const QString& label) {
+        if (compareRef_ && compareRef_->isChecked()) {
+            const QSignalBlocker b(compareRef_);
+            compareRef_->setChecked(false);
+        }
+        if (programPanel_) {
+            programDock_->raise();
+            programPanel_->viewer()->setCompare(still, label);
+        }
+    });
+    connect(gallery_, &GalleryPanel::compareCleared, this, [this] {
+        if (programPanel_ && !(compareRef_ && compareRef_->isChecked())) programPanel_->viewer()->clearCompare();
+    });
     queue_ = new RenderQueue(this);
     queueDock_ = makeDock(tr("Render Queue"), "renderqueue", new RenderQueuePanel(queue_, this));
     production_ = new ProductionPanel(state_, this);
@@ -607,7 +627,7 @@ void MainWindow::buildPanels() {
     resetLayout();
 }
 
-void MainWindow::arrangeDocks(const DockGroups& top, const DockGroups& left, const DockGroups& right) {
+void MainWindow::arrangeDocks(const DockGroups& top, const DockGroups& left, const DockGroups& right, const DockGroups& bottom) {
     for (QDockWidget* d : docks_) {
         removeDockWidget(d);
         d->setFloating(false);
@@ -637,13 +657,14 @@ void MainWindow::arrangeDocks(const DockGroups& top, const DockGroups& left, con
     place(Qt::TopDockWidgetArea, top, Qt::Horizontal);
     place(Qt::LeftDockWidgetArea, left, Qt::Vertical);
     place(Qt::RightDockWidgetArea, right, Qt::Vertical);
+    place(Qt::BottomDockWidgetArea, bottom, Qt::Horizontal);
     QDockWidget* home = top.front().front();
     for (QDockWidget* d : docks_)
         if (std::find(placed.begin(), placed.end(), d) == placed.end()) {
             tabifyDockWidget(home, d);
             d->hide();
         }
-    for (const DockGroups* area : {&top, &left, &right})
+    for (const DockGroups* area : {&top, &left, &right, &bottom})
         for (const auto& g : *area)
             if (!g.empty()) g[0]->raise();
 }
@@ -658,13 +679,16 @@ void MainWindow::layOutBuiltIn(const QString& name) {
     const int h = height();
     if (name == "Colour") {
         // A large Program monitor between the scopes and the Inspector (Premiere's Color workspace).
-        arrangeDocks({{scopesDock_}, {programDock_}}, {{binDock_, effectsDock_, indexDock_}}, {{nodesDock_}, {inspectorDock_, keyframesDock_}});
+        // The gallery beside them, the clips under the timeline.
+        arrangeDocks({{scopesDock_}, {programDock_}}, {{galleryDock_, binDock_, effectsDock_, indexDock_}}, {{nodesDock_}, {inspectorDock_, keyframesDock_}},
+                     {{clipsDock_}});
         setCorner(Qt::TopRightCorner, Qt::RightDockWidgetArea);  // the Inspector the full height
         resizeDocks({binDock_}, {260}, Qt::Horizontal);
         resizeDocks({inspectorDock_}, {400}, Qt::Horizontal);
         resizeDocks({scopesDock_, programDock_}, {520, 900}, Qt::Horizontal);
         resizeDocks({scopesDock_}, {h * 3 / 5}, Qt::Vertical);
         resizeDocks({nodesDock_}, {h / 3}, Qt::Vertical);
+        resizeDocks({clipsDock_}, {150}, Qt::Vertical);
     } else if (name == "Audio") {
         // The mixer where the Source monitor was, wide meters (Premiere's Audio workspace, Resolve's Fairlight page).
         arrangeDocks({{mixerDock_, adrDock_, sourceDock_}, {programDock_}}, {{binDock_, effectsDock_}}, {{meterDock_}});
@@ -692,7 +716,7 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         resizeDocks({sourceDock_}, {h / 2 + 40}, Qt::Vertical);
     } else {  // Editing
         arrangeDocks({{sourceDock_, inspectorDock_, scopesDock_, mixerDock_, captionsDock_, multicamDock_, keyframesDock_}, {programDock_}},
-                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, peopleDock_, indexDock_, stackedDock_, queueDock_, assistantDock_, nodesDock_}},
+                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, peopleDock_, indexDock_, stackedDock_, queueDock_, assistantDock_, nodesDock_, galleryDock_, clipsDock_}},
                      {{meterDock_}});
         resizeDocks({binDock_}, {380}, Qt::Horizontal);
         resizeDocks({meterDock_}, {70}, Qt::Horizontal);
@@ -1155,6 +1179,11 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Auto &Colour"), QKeySequence("Ctrl+Alt+C"), [this] { autoColor(); });
     add(clipM, tr("Set Colour &Reference"), QKeySequence(), [this] { setColourReference(); })
         ->setObjectName(QStringLiteral("setColourReference"));
+    add(clipM, tr("Grab Still"), QKeySequence(), withSeq([this] {
+            galleryDock_->show();
+            galleryDock_->raise();
+            gallery_->grab();
+        }))->setObjectName(QStringLiteral("grabStillAction"));
     add(clipM, tr("&Key Out Green / Blue Screen"), QKeySequence(), [this] { keyOutScreen(); })->setObjectName(QStringLiteral("keyScreen"));
     add(clipM, tr("Match Colour Chart…"), QKeySequence(), [this] { matchColourChart(); })->setObjectName(QStringLiteral("matchColourChart"));
     add(clipM, tr("Correct Lens…"), QKeySequence(), [this] { correctLens(); })->setObjectName(QStringLiteral("correctLens"));
@@ -3883,6 +3912,7 @@ void MainWindow::setCompareWithReference(bool on) {
         compareRef_->setChecked(on);
     }
     if (!programPanel_) return;
+    if (on && gallery_) gallery_->wipeEnded();
     if (on) programPanel_->viewer()->setCompare(colourRefView_, tr("Reference: %1").arg(colourRefName_));
     else programPanel_->viewer()->clearCompare();
 }
