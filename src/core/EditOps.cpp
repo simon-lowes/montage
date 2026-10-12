@@ -1093,8 +1093,18 @@ Result deleteGaps(Project& p, Sequence& s, bool leading, int* closed, FrameTime*
         return false;
     };
     auto shiftParam = [](Param& q, FrameTime from, FrameTime len) {
-        // Keys in the gap go; those after it move up.
-        std::erase_if(q.keys, [&](const Keyframe& k) { return k.t > from - len && k.t < from; });
+        // Keys in the gap go; those after it move up. What they left at the gap's end is keyed there first, so a
+        // switch or mute turned on in the gap still holds after it.
+        const auto inGap = [&](const Keyframe& k) { return k.t > from - len && k.t < from; };
+        auto lastInGap = std::find_if(q.keys.rbegin(), q.keys.rend(), inGap);
+        const bool keyedAtEnd = std::any_of(q.keys.begin(), q.keys.end(), [&](const Keyframe& k) { return k.t == from; });
+        if (lastInGap != q.keys.rend() && !keyedAtEnd) {
+            Keyframe k = *lastInGap;
+            k.t = from;
+            k.v = q.at(from);
+            q.keys.insert(std::lower_bound(q.keys.begin(), q.keys.end(), from, [](const Keyframe& x, FrameTime t) { return x.t < t; }), k);
+        }
+        std::erase_if(q.keys, inGap);
         for (Keyframe& k : q.keys)
             if (k.t >= from) k.t -= len;
     };
@@ -1133,9 +1143,13 @@ Result deleteGaps(Project& p, Sequence& s, bool leading, int* closed, FrameTime*
                     c.end = std::max(c.start + 1, std::min(c.end, a));
                 }
         }
-        for (Marker& m : s.markers)
+        for (Marker& m : s.markers) {
             if (m.t >= b) m.t -= len;
             else if (m.t > a) m.t = a;
+            // Its review drawing with the frame it was drawn on.
+            if (m.drawnAt >= b) m.drawnAt -= len;
+            else if (m.drawnAt > a) m.drawnAt = a;
+        }
         rippleAdrCues(s, a, b);
         if (s.inPoint >= b) s.inPoint -= len;
         if (s.outPoint >= b) s.outPoint -= len;

@@ -1975,6 +1975,10 @@ private slots:
         auto said = std::make_shared<Transcript>();
         said->segments.push_back({0.5, 0.6, "hello", {{0.5, 0.6, "hello"}}});
         p.findMedia(m.id)->transcript = said;
+        auto heard = std::make_shared<VisualIndex>();
+        heard->step = 0.1, heard->span = 0.2;
+        heard->add(0.5, std::vector<float>(4, 0.5f));
+        p.findMedia(m.id)->sounds = heard;
         RenderOptions o;
         auto frameShown = [&](FrameTime t) { return renderSequenceFrame(p, s, t, o).at(80, 45)[0] * 119; };  // the file's frame
         QVERIFY2(std::fabs(frameShown(10) - 50) < 1, qPrintable(QString::number(frameShown(10))));  // 10/24 s: frame 50
@@ -1993,6 +1997,8 @@ private slots:
         QVERIFY2(std::fabs(frameShown(10) - 10) < 1, qPrintable(QString::number(frameShown(10))));
         QVERIFY2(std::fabs(frameShown(23) - 23) < 1, qPrintable(QString::number(frameShown(23))));
         QCOMPARE(placed.markers.at(0).t, FrameTime(60));  // the same moment of the footage
+        // What's Heard windows hear as much of the footage as before.
+        QVERIFY(std::fabs(now->sounds->span - 1.0) < 0.02 && std::fabs(now->sounds->samples.at(0).time - 2.5) < 0.05);
         QCOMPARE(p.findMedia(sub.id)->subclipIn, 1.25);
         QCOMPARE(p.findMedia(sub.id)->subclipOut, 2.5);
         // The subclip is read as its media is (thumbnails and its own decodes).
@@ -17544,7 +17550,10 @@ private slots:
             const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
             return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
         };
-        QJsonObject r = call({{"project", project}, {"voice", "am_michael"}});
+        // Not into Japanese in a cloned voice (as the app: translations come in kanji, which it cannot read).
+        QJsonObject r = call({{"project", project}, {"voice", "clone"}, {"to", "Japanese"}, {"consent", true}});
+        QVERIFY(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("kanji"));
+        r = call({{"project", project}, {"voice", "am_michael"}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         QCOMPARE(r.value("structuredContent").toObject().value("audio_track").toString(), QStringLiteral("A%1").arg(tracks + 1));
         Project back;

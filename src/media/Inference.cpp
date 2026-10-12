@@ -223,7 +223,16 @@ std::shared_ptr<Ort::Session> OrtModel::open(bool device) {
     };
     const InferenceMode mode = inferenceMode();
 #if ORT_API_VERSION >= 22
-    if (device && where_ == ModelRuns::Anywhere && mode != InferenceMode::Cpu) {
+    // (only with a GPU or NPU to choose: else the policy picks the processor, and runs would queue for nothing)
+    auto accelerator = [] {
+        try {
+            for (const Ort::ConstEpDevice& d : sharedEnv().GetEpDevices())
+                if (d.Device().Type() != OrtHardwareDeviceType_CPU) return true;
+        } catch (const std::exception&) {
+        }
+        return false;
+    };
+    if (device && where_ == ModelRuns::Anywhere && mode != InferenceMode::Cpu && accelerator()) {
         std::string why;
         try {
             Ort::SessionOptions o = options_.Clone();

@@ -5528,8 +5528,18 @@ private slots:
         Effect masterFx = makeEffect(p, "limiter");
         masterFx.params["ceiling_db"].addKey(100, -3);
         sq().masterEffects.push_back(masterFx);
+        // A mute turned on inside the gap still holds over what comes after it; a review drawing moves with its frame.
+        a1.panAuto.addKey(60, 0.5);
+        Marker drawn;
+        drawn.t = 20;
+        drawn.drawnAt = 90;
+        sq().markers.push_back(drawn);
         QVERIFY(edit::deleteGaps(p, sq()).ok);
         QCOMPARE(sq().audioTracks[0].muteAuto.keys.at(0).t, FrameTime(70));
+        QCOMPARE(sq().audioTracks[0].panAuto.keys.size(), size_t(1));
+        QCOMPARE(sq().audioTracks[0].panAuto.keys.at(0).t, FrameTime(50));
+        QCOMPARE(sq().audioTracks[0].panAuto.at(55), 0.5);
+        QCOMPARE(sq().markers.back().drawnAt, FrameTime(60));
         QCOMPARE(sq().audioTracks[0].sends[0].levelAuto.keys.at(0).t, FrameTime(70));
         for (const Param* lane : {&sq().buses[0].volumeAuto, &sq().buses[0].panAuto, &sq().buses[0].muteAuto}) QCOMPARE(lane->keys.at(0).t, FrameTime(70));
         QCOMPARE(sq().buses[0].effects[0].params.at("mix").keys.at(0).t, FrameTime(70));
@@ -5561,7 +5571,7 @@ private slots:
         s.captionTracks.push_back(CaptionTrack{});
         s.captionTracks[0].captions = {{20, 60, "reaches into the gap"}, {90, 110, "after"}};
         s.markers = {Marker{65, 0, "in the gap", "", 0, false}, Marker{100, 0, "after", "", 0, false}};
-        trackAt(s, a1)->volumeAuto.addKey(60, -6);   // inside the gap: goes
+        trackAt(s, a1)->volumeAuto.addKey(60, -6);   // inside the gap: goes, its curve keyed where the gap ends
         trackAt(s, a1)->volumeAuto.addKey(140, -3);  // after it: moves up
         s.inPoint = 90;
         s.outPoint = 160;
@@ -5579,8 +5589,10 @@ private slots:
         QCOMPARE(s.captionTracks[0].captions[1].start, FrameTime(60));
         QCOMPARE(s.markers[0].t, FrameTime(50));
         QCOMPARE(s.markers[1].t, FrameTime(70));
-        QCOMPARE(trackAt(s, a1)->volumeAuto.keys.size(), size_t(1));
-        QCOMPARE(trackAt(s, a1)->volumeAuto.keys[0].t, FrameTime(110));
+        QCOMPARE(trackAt(s, a1)->volumeAuto.keys.size(), size_t(2));
+        QCOMPARE(trackAt(s, a1)->volumeAuto.keys[0].t, FrameTime(50));
+        QCOMPARE(trackAt(s, a1)->volumeAuto.keys[0].v, -6 + 3 * 20 / 80.0);  // (what it was at 80, on the way to 140)
+        QCOMPARE(trackAt(s, a1)->volumeAuto.keys[1].t, FrameTime(110));
         QCOMPARE(s.inPoint, FrameTime(60));
         QCOMPARE(s.outPoint, FrameTime(130));
         // Nothing left but the start, which goes when asked.

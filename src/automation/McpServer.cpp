@@ -5610,8 +5610,8 @@ void McpServer::Impl::addTools() {
         "by duck_db while the dub speaks (volume keyframes, replacing theirs; 0 leaves them), as in a voice-over translation. "
         "The translated captions are added as a hidden track. The voice is an English AI voice (Kokoro; a little faster where "
         "a cue is short), or with voice: \"clone\" the speaker's own voice cloned (Chatterbox; from voice_clip, voice_media, "
-        "or the clip heard under the first caption) into `to`, any of ar da de el en es fi fr he hi it ja ko ms nl no pl pt ru "
-        "sv sw tr zh, which needs consent: true. Needs the translation and speech models (the app asks the first time; or "
+        "or the clip heard under the first caption) into `to`, any of ar da de el en es fi fr he hi it ko ms nl no pl pt ru "
+        "sv sw tr zh (not Japanese: translations come in kanji, which the voice model cannot read), which needs consent: true. Needs the translation and speech models (the app asks the first time; or "
         "scripts/fetch-models.sh).",
         R"json({"type":"object","properties":{"project":{"type":"string"},
             "track":{"type":"integer","default":0,"description":"Caption track index"},
@@ -5635,6 +5635,9 @@ void McpServer::Impl::addTools() {
             if (cloning) {
                 QJsonObject args = a;
                 args["language"] = str(a, "to", "en");
+                // (as the app: translations come in kanji, and the voice model reads Japanese in kana only)
+                if (const CloneLanguage* want = findCloneLanguage(args["language"].toString().toStdString()); want && std::string(want->code) == "ja")
+                    throw ArgError{"Dubbing into Japanese in a cloned voice is not offered: translations come in kanji, which the voice model cannot read (montage_clone_speech reads kana)"};
                 const FrameTime first = s.captionTracks[size_t(index)].captions.front().start;
                 clone = cloneVoiceArg(args, l.project, s, first);
                 to = clone->options.language;

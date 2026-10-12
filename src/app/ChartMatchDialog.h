@@ -96,6 +96,7 @@ private:
     bool placed_ = false;  // found, or moved by hand
     bool ready_ = false;
     bool searching_ = false;
+    bool editedWhileSearching_ = false;  // (the outline placed by hand meanwhile is kept over what the search finds)
     QFutureWatcher<std::pair<bool, TrackQuad>> watcher_;
 };
 
