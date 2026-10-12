@@ -1275,7 +1275,7 @@ bool cameraSolveFromString(const std::string& text, CameraSolve& s) {
 }
 
 bool writeNukeChan(const CameraSolve& s, const std::string& path, int firstFrame, std::string* error) {
-    std::ofstream f(path);
+    std::ofstream f(path, std::ios::binary);  // (\n lines everywhere)
     if (!f) {
         if (error) *error = "Cannot write " + path;
         return false;
@@ -1307,7 +1307,7 @@ bool writeNukeChan(const CameraSolve& s, const std::string& path, int firstFrame
 }
 
 bool writePointsPly(const CameraSolve& s, const std::string& path, std::string* error) {
-    std::ofstream f(path);
+    std::ofstream f(path, std::ios::binary);  // (\n lines everywhere: PLY readers want them)
     if (!f) {
         if (error) *error = "Cannot write " + path;
         return false;
