@@ -77,6 +77,9 @@ struct ExportSettings {
     // the ceiling. 0 = off; e.g. -14 LUFS for streaming, -23 for EBU R128.
     double loudnessTarget = 0;
     double peakCeiling = -1;  // dBTP, when normalising
+    // The target is the dialogue's loudness (render/DialogueLoudness.h), as Netflix's -27 LKFS is: the mix is measured
+    // over its speech (over everything when speech is under 15 % of it).
+    bool dialogueGated = false;
     BurnIn burnIn;
     // A 5.1 or 7.1 sequence's audio is written with all its channels, or folded down to stereo.
     bool downmixStereo = false;

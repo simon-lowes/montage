@@ -5,7 +5,7 @@
 //    screen, more than three flashes in any second;
 //  - picture levels outside EBU R103 (RGB -5 % to 105 %, luma -1 % to 103 %) on more than 1 % of the picture;
 //  - black and frozen picture, silence and clipped sound held too long;
-//  - integrated loudness away from the target and true peaks over the ceiling;
+//  - integrated loudness (or the dialogue's) away from the target and true peaks over the ceiling;
 //  - spelling in captions (in each track's language) and titles (core/SpellCheck.h), the project's vocabulary allowed;
 //  - linked clips out of sync with their picture (core/EditOps.h syncOffsets).
 #pragma once
@@ -27,8 +27,12 @@ struct QcSettings {
     double freezeSeconds = 5.0;     // 0 = not checked
     double silenceSeconds = 2.0;    // below -60 dBFS; 0 = not checked
     bool clipping = true;           // samples at full scale
-    double loudnessTarget = 0;      // LUFS, within 1 LU; 0 = not checked
+    double loudnessTarget = 0;      // LUFS, within loudnessTolerance; 0 = not checked
+    double loudnessTolerance = 1;   // LU
     double peakCeiling = -1;        // dBTP, checked with the loudness
+    // The loudness of the dialogue, as Netflix asks for it (render/DialogueLoudness.h; the programme's where speech is
+    // under 15 % of the sound), not of everything.
+    bool dialogueGated = false;
     int analysisWidth = 160;        // the picture is checked at this width
     bool spelling = true;           // captions and titles
     std::string titleLanguage = "en-US";  // the dictionary titles are checked with

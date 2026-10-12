@@ -121,6 +121,7 @@
 #include "render/ClipAnalysis.h"
 #include "render/OGraf.h"
 #include "render/Gallery.h"
+#include "render/DialogueLoudness.h"
 #include "render/TrimPasses.h"
 #include "media/Segmenter.h"
 #include "render/Compositor.h"
@@ -2875,6 +2876,8 @@ void McpServer::Impl::addTools() {
             "clipping":{"type":"boolean","default":true},
             "loudness_target":{"type":"number","description":"LUFS, e.g. -14 (streaming) or -23 (EBU R128); omitted = not checked"},
             "peak_ceiling":{"type":"number","default":-1,"description":"dBTP, checked with the loudness"},
+            "loudness_dialogue":{"type":"boolean","default":false,"description":"Check the dialogue's loudness (montage_dialogue_loudness), as Netflix does: -27 with peak_ceiling -2"},
+            "loudness_tolerance":{"type":"number","description":"LU either side of the target (default 1, 2 with loudness_dialogue)"},
             "spelling":{"type":"boolean","default":true},"title_language":{"type":"string","default":"en-US"},
             "sync":{"type":"boolean","default":true},"markers":{"type":"boolean","default":false}},"required":["project"]})json",
         false, [this](const QJsonObject& a) {
@@ -2891,6 +2894,8 @@ void McpServer::Impl::addTools() {
             q.clipping = a.value("clipping").toBool(true);
             q.loudnessTarget = a.value("loudness_target").toDouble(0);
             q.peakCeiling = a.value("peak_ceiling").toDouble(-1);
+            q.dialogueGated = a.value("loudness_dialogue").toBool(false);
+            q.loudnessTolerance = std::max(0.1, a.value("loudness_tolerance").toDouble(q.dialogueGated ? 2 : 1));
             q.spelling = a.value("spelling").toBool(true);
             q.titleLanguage = str(a, "title_language", "en-US").toStdString();
             q.sync = a.value("sync").toBool(true);
@@ -2904,6 +2909,37 @@ void McpServer::Impl::addTools() {
                 save(l);
             }
             return ok(issues.empty() ? QStringLiteral("No problems found.") : QStringLiteral("%1 problem(s):\n").arg(issues.size()) + text);
+        });
+
+    add("montage_dialogue_loudness", "Measure dialogue loudness",
+        "Measure the sequence's (or from..to's) loudness over its speech only, the \"Dialog LKFS\" Netflix delivers at "
+        "(-27 LKFS ±2, true peaks under -2 dBTP), beside the programme's BS.1770 loudness, its true peak and the share of "
+        "the sound that is speech (under 15 %, the programme figure is the one that counts: `value`). The speech is found "
+        "from the Dialogue clips (`gate` roles), transcribed words (transcripts) or by listening (classifier); auto takes "
+        "the first the sequence has. Montage's own gate: an estimate of Dolby's Dialogue Intelligence, which Netflix's QC runs.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
+            "to":{"type":["number","string"]},"gate":{"type":"string","enum":["auto","roles","transcripts","classifier"],"default":"auto"},
+            "surround":{"type":"boolean","default":false,"description":"Measure a surround sequence's own channels, not its stereo fold-down"}},
+            "required":["project"]})json",
+        true, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Sequence& s = l.seq();
+            DialogueLoudnessOptions o;
+            o.in = a.contains("from") ? timeArg(a.value("from"), s, "from") : 0;
+            o.out = a.contains("to") ? timeArg(a.value("to"), s, "to") : -1;
+            o.layout = a.value("surround").toBool(false);
+            if (!parseSpeechGate(str(a, "gate", "auto").toStdString(), o.gate))
+                throw ArgError{"\"gate\" is auto, roles, transcripts or classifier"};
+            std::string why;
+            const DialogueLoudness d = measureDialogueLoudness(l.project, s, o, [this](double f) { progress(f, "Measuring"); }, nullptr, &why);
+            if (!why.empty()) return fail(QString::fromStdString(why));
+            QJsonArray speech;
+            for (const auto& [from, to] : d.speech) speech.append(QJsonArray{from, to});
+            const QJsonObject r{{"valid", d.valid}, {"dialogue_lkfs", d.dialogue}, {"programme_lkfs", d.programme},
+                                {"true_peak_dbtp", d.truePeak}, {"speech_share", d.speechShare}, {"uses_programme", d.usesProgramme},
+                                {"value", d.value()}, {"gate", QString::fromLatin1(speechGateName(d.gate))}, {"estimate", true},
+                                {"speech_seconds", speech}, {"text", QString::fromStdString(describeDialogueLoudness(d))}};
+            return ok(json(r), r);
         });
 
     add("montage_export_markers", "Export markers",
@@ -7213,6 +7249,7 @@ void McpServer::Impl::addTools() {
             "preset":{"type":"string"},"in":{"type":["number","string"]},"out":{"type":["number","string"]},
             "loudness_lufs":{"type":"number","description":"Normalise the mix to this loudness, e.g. -14 (streaming) or -23 (EBU R128)"},
             "peak_ceiling":{"type":"number","default":-1,"description":"True peak ceiling (dBTP) when normalising"},
+            "loudness_dialogue":{"type":"boolean","default":false,"description":"loudness_lufs is the dialogue's (Netflix: -27, peak_ceiling -2), measured as montage_dialogue_loudness does"},
             "burn_in":{"type":"object","description":"Overlays for a review copy","properties":{
                 "timecode":{"type":"boolean"},"clip_name":{"type":"boolean"},"text":{"type":"string"},
                 "corner":{"type":"string","enum":["top_left","top_centre","top_right","bottom_left","bottom_centre","bottom_right"],"default":"top_left"},
@@ -7270,6 +7307,7 @@ void McpServer::Impl::addTools() {
                 st.loudnessTarget = a.value("loudness_lufs").toDouble();
                 if (st.loudnessTarget >= 0 || st.loudnessTarget < -70) throw ArgError{"\"loudness_lufs\" must be between -70 and 0"};
                 st.peakCeiling = std::min(0.0, a.value("peak_ceiling").toDouble(-1));
+                st.dialogueGated = a.value("loudness_dialogue").toBool(false);
             }
             if (a.value("burn_in").isObject()) {
                 const QJsonObject b = a.value("burn_in").toObject();

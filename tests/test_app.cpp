@@ -7839,7 +7839,22 @@ const auto seq = [this] { return state()->sequence(); };
         readout->findChild<QToolButton*>("loudnessReset")->click();
         QCOMPARE(reset.count(), 1);
         QCOMPARE(readout->text("M"), QString("—"));
+        // Netflix: the dialogue's loudness counts, within 2 LU, while speech is 15 % of the sound or more.
+        readout->setTargetIndex(4);
+        QVERIFY(readout->dialogueTarget());
+        QCOMPARE(readout->target(), -27.0);
+        readout->setReading(-20, -20, -20, 6, -3);
+        readout->setDialogue(-28.5, 0.4);
+        QCOMPARE(readout->text("D"), QString("-28.5"));
+        QCOMPARE(readout->text("SP"), QString("40 %"));
+        QCOMPARE(readout->integratedStatus(), 0);
+        readout->setDialogue(-28.5, 0.1);  // too little speech: the programme's -20 counts
+        QCOMPARE(readout->integratedStatus(), 2);
+        readout->setDialogue(-200, -1);  // nothing marked as speech
+        QCOMPARE(readout->text("D"), QString("—"));
+        QCOMPARE(readout->text("SP"), QString("—"));
         readout->setTargetIndex(0);
+        QVERIFY(!readout->dialogueTarget());
     }
 
     void renderInToOutAndTheRenderBar() {

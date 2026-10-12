@@ -1,4 +1,5 @@
 #include "PlaybackController.h"
+#include "render/DialogueLoudness.h"
 #include "render/TrimPasses.h"
 
 #include <atomic>
@@ -295,6 +296,7 @@ public:
             meterSeq_ = seq;
             meterRate_ = rate;
         }
+        updateSpeech(s);
     }
     void resetLoudness() {
         QMutexLocker lock(&meterM_);
@@ -303,6 +305,8 @@ public:
     void setProject(std::shared_ptr<const Project> p) {
         QMutexLocker lock(&m_);
         project_ = std::move(p);
+        QMutexLocker meterLock(&meterM_);
+        updateSpeech(project_ ? project_->findSequence(seq_) : nullptr);
     }
     // Global Mute: the meters still move, the speakers get silence.
     void setMuted(bool on) { muted_ = on; }
@@ -321,6 +325,7 @@ public:
 signals:
     void levels(float l, float r, const QVector<float>& tracks);
     void loudness(double momentary, double shortTerm, double integrated, double range, double truePeak);
+    void dialogueLoudness(double integrated, double speechShare);
 
 protected:
     qint64 readData(char* data, qint64 maxlen) override {
@@ -374,6 +379,10 @@ protected:
         {
             QMutexLocker lock(&meterM_);
             if (meter_) {
+                // Speech (the dialogue-gated reading) where the timeline says someone speaks, at the block's middle.
+                const double mid = double(first + frames / 2) / meterRate_;
+                const auto at = std::upper_bound(speech_.begin(), speech_.end(), std::make_pair(mid, 1e300));
+                meter_->setSpeech(at != speech_.begin() && std::prev(at)->second > mid);
                 meter_->add(buf_.data(), frames);
                 sinceReport_ += frames;
                 if (sinceReport_ >= meterRate_ / 10) {
@@ -381,6 +390,8 @@ protected:
                     const LoudnessResult r = meter_->result();
                     emit loudness(meter_->momentary(), meter_->shortTerm(), r.valid ? r.integrated : -200.0, meter_->loudnessRange(),
                                   r.truePeakDb);
+                    const LoudnessResult d = meter_->speechResult();
+                    emit dialogueLoudness(d.valid ? d.integrated : -200.0, speech_.empty() ? -1.0 : meter_->speechShare());
                 }
             }
         }
@@ -389,6 +400,11 @@ protected:
     qint64 writeData(const char*, qint64) override { return -1; }
 
 private:
+    // The timeline's own speech marks (Dialogue clips or transcribed words), in seconds; with meterM_ held.
+    void updateSpeech(const Sequence* s) {
+        SpeechGate gate = SpeechGate::Auto;
+        speech_ = s && project_ ? timelineSpeech(*project_, *s, gate) : std::vector<std::pair<double, double>>{};
+    }
     QMutex m_;
     std::shared_ptr<const Project> project_;
     Id seq_ = 0;
@@ -403,6 +419,7 @@ private:
     Id meterSeq_ = 0;
     int meterRate_ = 48000;
     int64_t sinceReport_ = 0;
+    std::vector<std::pair<double, double>> speech_;
 };
 
 // ---------------------------------------------------------------------------
@@ -453,6 +470,7 @@ PlaybackController::PlaybackController(QObject* parent) : QObject(parent) {
     scrubMixer_.setOfflineProxies(true);
     connect(device_, &MixerDevice::levels, this, &PlaybackController::audioLevels);
     connect(device_, &MixerDevice::loudness, this, &PlaybackController::loudness);
+    connect(device_, &MixerDevice::dialogueLoudness, this, &PlaybackController::dialogueLoudness);
     timer_.setTimerType(Qt::PreciseTimer);
     timer_.setInterval(8);
     connect(&timer_, &QTimer::timeout, this, &PlaybackController::tick);

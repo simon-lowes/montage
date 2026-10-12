@@ -89,6 +89,8 @@ QualityCheckDialog::QualityCheckDialog(EditorState* state, QWidget* parent) : QD
     loudness_->addItem(tr("Podcast: -16 LUFS, -1 dBTP"), QPointF(-16, -1));
     loudness_->addItem(tr("EBU R128: -23 LUFS, -1 dBTP"), QPointF(-23, -1));
     loudness_->addItem(tr("ATSC A/85: -24 LKFS, -2 dBTP"), QPointF(-24, -2));
+    loudness_->addItem(tr("Netflix: -27 ±2 LKFS dialogue, -2 dBTP"), QPointF(-27, -2));
+    loudness_->setItemData(loudness_->count() - 1, true, Qt::UserRole + 1);  // (measured on the dialogue, within 2 LU)
     form->addRow(tr("Loudness:"), loudness_);
     spelling_ = new QCheckBox(tr("Spelling in captions and titles"), this);
     spelling_->setObjectName(QStringLiteral("qcSpelling"));
@@ -141,6 +143,8 @@ QcSettings QualityCheckDialog::settings() const {
     const QPointF target = loudness_->currentData().toPointF();
     q.loudnessTarget = target.x();
     q.peakCeiling = target.y();
+    q.dialogueGated = loudness_->currentData(Qt::UserRole + 1).toBool();
+    if (q.dialogueGated) q.loudnessTolerance = 2;
     q.spelling = spelling_->isChecked();
     q.sync = sync_->isChecked();
     q.titleLanguage = titleSpellingLanguage().toStdString();

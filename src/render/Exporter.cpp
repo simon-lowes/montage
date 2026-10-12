@@ -33,6 +33,7 @@
 #include "Processing.h"
 #include "media/HwAccel.h"
 #include "media/Loudness.h"
+#include "render/DialogueLoudness.h"
 #include "media/SuperScale.h"
 
 extern "C" {
@@ -1243,20 +1244,35 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     std::unique_ptr<PeakLimiter> limiter;
     int64_t limiterDelay = 0;
     if (wantAudio && s.loudnessTarget < 0) {
-        AudioMixer meterMixer;
-        meterMixer.setTrackMask(s.audioTracks);
-        LoudnessMeter meter(mixRate);
         const int64_t end = int64_t(std::llround(double(out) * mixRate / seq.fpsValue()));
         std::vector<float> chunk(size_t(8192) * size_t(nch));
-        for (int64_t pos = audioCursor; pos < end;) {
-            if (cancel && cancel->load()) return fail("Cancelled");
-            const int n = int(std::min<int64_t>(8192, end - pos));
-            mixBlock(meterMixer, pos, n, chunk.data());
-            meter.addChannels(chunk.data(), n, nch, weights.data());
-            pos += n;
+        // The dialogue's loudness (Netflix's), or everything's.
+        auto dialogueGain = [&](const Sequence& sq, const std::vector<bool>& tracks, double& gain) {
+            DialogueLoudnessOptions o;
+            o.tracks = tracks;
+            o.in = in;
+            o.out = out;
+            o.layout = nch > 2;
+            const DialogueLoudness d = measureDialogueLoudness(p, sq, o, {}, cancel);
+            if (d.valid) gain = std::pow(10.0, (s.loudnessTarget - d.value()) / 20.0);
+            return !(cancel && cancel->load());
+        };
+        if (s.dialogueGated) {
+            if (!dialogueGain(mixSeq, s.audioTracks, normGain)) return fail("Cancelled");
+        } else {
+            AudioMixer meterMixer;
+            meterMixer.setTrackMask(s.audioTracks);
+            LoudnessMeter meter(mixRate);
+            for (int64_t pos = audioCursor; pos < end;) {
+                if (cancel && cancel->load()) return fail("Cancelled");
+                const int n = int(std::min<int64_t>(8192, end - pos));
+                mixBlock(meterMixer, pos, n, chunk.data());
+                meter.addChannels(chunk.data(), n, nch, weights.data());
+                pos += n;
+            }
+            const LoudnessResult measured = meter.result();
+            if (measured.valid) normGain = std::pow(10.0, (s.loudnessTarget - measured.integrated) / 20.0);
         }
-        const LoudnessResult measured = meter.result();
-        if (measured.valid) normGain = std::pow(10.0, (s.loudnessTarget - measured.integrated) / 20.0);
         // A little under the ceiling: the limiter sees samples, and true peaks fall between them.
         limiter = std::make_unique<PeakLimiter>(mixRate, s.peakCeiling - 0.5, 5, 80, nch);
         limiterDelay = limiter->latency();
@@ -1269,19 +1285,23 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         // Streams of the whole programme (the described one) likewise, each measured on its own.
         for (auto& e : extras) {
             if (!e->normalise) continue;
-            AudioMixer m;
-            m.setTrackMask(e->tracks);
-            LoudnessMeter em(mixRate);
-            for (int64_t pos = e->cursor; pos < end;) {
-                if (cancel && cancel->load()) return fail("Cancelled");
-                const int n = int(std::min<int64_t>(8192, end - pos));
-                if (nch > 2) m.mixLayout(p, e->seq, pos, n, chunk.data());
-                else m.mix(p, e->seq, pos, n, chunk.data());
-                em.addChannels(chunk.data(), n, nch, weights.data());
-                pos += n;
+            if (s.dialogueGated) {
+                if (!dialogueGain(e->seq, e->tracks, e->gain)) return fail("Cancelled");
+            } else {
+                AudioMixer m;
+                m.setTrackMask(e->tracks);
+                LoudnessMeter em(mixRate);
+                for (int64_t pos = e->cursor; pos < end;) {
+                    if (cancel && cancel->load()) return fail("Cancelled");
+                    const int n = int(std::min<int64_t>(8192, end - pos));
+                    if (nch > 2) m.mixLayout(p, e->seq, pos, n, chunk.data());
+                    else m.mix(p, e->seq, pos, n, chunk.data());
+                    em.addChannels(chunk.data(), n, nch, weights.data());
+                    pos += n;
+                }
+                const LoudnessResult r = em.result();
+                if (r.valid) e->gain = std::pow(10.0, (s.loudnessTarget - r.integrated) / 20.0);
             }
-            const LoudnessResult r = em.result();
-            if (r.valid) e->gain = std::pow(10.0, (s.loudnessTarget - r.integrated) / 20.0);
             e->limiter = std::make_unique<PeakLimiter>(mixRate, s.peakCeiling - 0.5, 5, 80, nch);
             e->delay = e->limiter->latency();
             std::vector<float> ep(size_t(e->delay) * size_t(nch));

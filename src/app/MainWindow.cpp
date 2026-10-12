@@ -622,7 +622,10 @@ void MainWindow::buildPanels() {
     ml->setSpacing(2);
     ml->addWidget(meter_, 1);
     ml->addWidget(loudness_);
-    for (PlaybackController* pc : {program_, source_}) connect(pc, &PlaybackController::loudness, loudness_, &LoudnessReadout::setReading);
+    for (PlaybackController* pc : {program_, source_}) {
+        connect(pc, &PlaybackController::loudness, loudness_, &LoudnessReadout::setReading);
+        connect(pc, &PlaybackController::dialogueLoudness, loudness_, &LoudnessReadout::setDialogue);
+    }
     connect(loudness_, &LoudnessReadout::resetRequested, this, [this] {
         program_->resetLoudness();
         source_->resetLoudness();

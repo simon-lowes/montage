@@ -173,6 +173,7 @@ void visitSettings(S& s, V& v) {
     v("hdr10Plus", s.hdr10Plus);
     v("loudnessTarget", s.loudnessTarget);
     v("peakCeiling", s.peakCeiling);
+    v("dialogueGated", s.dialogueGated);
     v("downmixStereo", s.downmixStereo);
     v("audioTracks", s.audioTracks);
     v("chapters", s.chapters);

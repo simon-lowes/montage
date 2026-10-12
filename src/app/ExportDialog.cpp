@@ -276,6 +276,13 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     loudness_->addItem(tr("-16 LUFS, -1 dBTP (Apple Podcasts, Amazon Music)"), QPointF(-16, -1));
     loudness_->addItem(tr("-23 LUFS, -1 dBTP (EBU R128 broadcast)"), QPointF(-23, -1));
     loudness_->addItem(tr("-24 LKFS, -2 dBTP (ATSC A/85, US broadcast)"), QPointF(-24, -2));
+    // Netflix measures the dialogue (render/DialogueLoudness.h): the item says so in its second role.
+    loudness_->addItem(tr("-27 LKFS dialogue, -2 dBTP (Netflix)"), QPointF(-27, -2));
+    loudness_->setItemData(loudness_->count() - 1, true, Qt::UserRole + 1);
+    loudness_->setItemData(loudness_->count() - 1,
+                           tr("Measures the mix over its speech (Montage's own estimate of Dolby's dialogue gating; over everything "
+                              "when speech is under 15 %), then sets its level to the target"),
+                           Qt::ToolTipRole);
     loudness_->setCurrentIndex(std::clamp(appSettings().value("export/loudness", 0).toInt(), 0, loudness_->count() - 1));
     loudness_->setToolTip(tr("Measures the whole mix first, then sets its level to the target, with a limiter "
                              "keeping peaks under the ceiling"));
@@ -811,6 +818,7 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         const QPointF target = loudness_->currentData().toPointF();
         s.loudnessTarget = target.x();
         s.peakCeiling = target.y();
+        s.dialogueGated = loudness_->currentData(Qt::UserRole + 1).toBool();
     }
     settings.setValue("export/loudness", loudness_->currentIndex());
     if (hasAudio(s)) s.downmixStereo = !audioOut_->isHidden() && audioOut_->currentIndex() == 1;

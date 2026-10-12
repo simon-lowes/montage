@@ -82,7 +82,8 @@ int usage() {
                  "  montage-cli info <project.montage>\n"
                  "  montage-cli render <project.montage> -o <output> [--preset NAME] [--in TC] [--out TC]\n"
                  "                     [--width W] [--height H] [--crf N] [--vcodec C] [--acodec C] [--proxies]\n"
-                 "                     [--loudness LUFS [--ceiling dBTP]]  (e.g. --loudness -14: normalise the mix)\n"
+                 "                     [--loudness LUFS [--ceiling dBTP] [--dialogue-gated]]  (e.g. --loudness -14: normalise the mix;\n"
+                 "                     --loudness -27 --ceiling -2 --dialogue-gated: by its dialogue, as Netflix asks)\n"
                  "                     [--burn-captions [--caption-animation none|word|highlight|pop|one-word]]\n"
                  "                     [--embed-captions] [--color-space ID]\n"
                  "                     [--downmix-stereo] [--stems tracks|buses|roles]  (surround fold-down; WAV stems beside it)\n"
@@ -319,6 +320,7 @@ int prepareRender(const std::vector<std::string>& args, Project& p, ExportSettin
     std::string vcodec, acodec;
     bool proxies = false;
     double loudness = 0, ceiling = -1;
+    bool dialogueGated = false;
     int captionAnimation = -1;  // -1: as the project has it
     bool downmix = false;
     stems = 0;  // 1 per track, 2 per bus, 3 per role
@@ -356,6 +358,7 @@ int prepareRender(const std::vector<std::string>& args, Project& p, ExportSettin
         else if (a == "--color-space") st.colorSpace = next();
         else if (a == "--loudness") loudness = std::atof(next().c_str());
         else if (a == "--ceiling") ceiling = std::atof(next().c_str());
+        else if (a == "--dialogue-gated") dialogueGated = true;
         else if (a == "--downmix-stereo") downmix = true;
         else if (a == "--stems") {
             const std::string v = next();
@@ -395,6 +398,7 @@ int prepareRender(const std::vector<std::string>& args, Project& p, ExportSettin
     st.useProxies = proxies;
     st.loudnessTarget = loudness;
     st.peakCeiling = ceiling;
+    st.dialogueGated = dialogueGated;
     st.downmixStereo = downmix;
     if (!inTc.empty() && !parseTimecode(inTc, s->fps, st.in)) return usage();
     if (!outTc.empty() && !parseTimecode(outTc, s->fps, st.out)) return usage();
