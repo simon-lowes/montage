@@ -148,6 +148,32 @@ std::string gradeNodeName(const GradeNode& n) {
     return kind + " " + std::to_string(n.key);
 }
 
+std::vector<SharedNode> sharedNodesUsed(const Sequence& s, const Clip& c) {
+    std::vector<SharedNode> out;
+    for (const GradeNode& n : c.grade.nodes)
+        if (const SharedNode* sn = findSharedNode(s, n.shared))
+            if (std::none_of(out.begin(), out.end(), [&](const SharedNode& x) { return x.id == sn->id; })) out.push_back(*sn);
+    return out;
+}
+
+void adoptSharedNodes(Sequence& s, const std::vector<SharedNode>& nodes) {
+    for (const SharedNode& n : nodes)
+        if (!findSharedNode(s, n.id)) s.sharedNodes.push_back(n);
+}
+
+int sharedNodeUsers(const Sequence& s, Id id) {
+    int users = 0;
+    for (const auto* tracks : {&s.videoTracks, &s.audioTracks})
+        for (const Track& t : *tracks)
+            for (const Clip& c : t.clips) {
+                bool uses = std::any_of(c.grade.nodes.begin(), c.grade.nodes.end(), [&](const GradeNode& n) { return n.shared == id; });
+                for (const GradeVersion& v : c.gradeVersions)
+                    uses = uses || std::any_of(v.grade.nodes.begin(), v.grade.nodes.end(), [&](const GradeNode& n) { return n.shared == id; });
+                users += uses;
+            }
+    return users;
+}
+
 namespace edit {
 
 namespace {
@@ -196,7 +222,11 @@ Result convertToNodes(Sequence& s, Id clip) {
         n.x = 160.0 * (key - 1);
         g.nodes.push_back(n);
     }
-    if (g.nodes.empty()) g.nodes.push_back(GradeNode{1});
+    if (g.nodes.empty()) {
+        GradeNode n;
+        n.key = 1;
+        g.nodes.push_back(n);
+    }
     for (size_t i = 0; i <= g.nodes.size(); ++i)
         g.links.push_back({i ? g.nodes[i - 1].key : 0, i < g.nodes.size() ? g.nodes[i].key : 0, 0, false});
     c->grade = std::move(g);
@@ -383,7 +413,12 @@ Result setGradeNode(Sequence& s, Id clip, const GradeNode& node) {
     changed.enabled = node.enabled;
     changed.x = node.x;
     changed.y = node.y;
-    if (n->kind == "layer") changed.blend = node.blend;
+    if (n->kind == "layer") {
+        for (const std::string& b : node.blend)
+            if (std::find(blendModes().begin(), blendModes().end(), b) == blendModes().end()) return Result::fail("Unknown blend mode \"" + b + "\"");
+        changed.blend = node.blend;
+        changed.blend.resize(n->blend.size(), "normal");  // (one for each input after the first)
+    }
     if (changed == *n) return Result::fail("");
     *n = changed;
     return {};
@@ -492,6 +527,54 @@ Result unshareGradeNode(Project& p, Sequence& s, Id clip, int key) {
         }
     }
     n->shared = 0;
+    return {};
+}
+
+Result renameSharedNode(Sequence& s, Id shared, const std::string& name) {
+    for (SharedNode& n : s.sharedNodes)
+        if (n.id == shared) {
+            if (name.empty()) return Result::fail("Give the shared node a name");
+            if (n.name == name) return Result::fail("");
+            // (nodes showing it under its old name take the new one)
+            for (Track& t : s.videoTracks)
+                for (Clip& c : t.clips)
+                    for (GradeNode& g : c.grade.nodes)
+                        if (g.shared == shared && g.label == n.name) g.label = name;
+            n.name = name;
+            return {};
+        }
+    return Result::fail("No such shared node");
+}
+
+Result removeSharedNode(Sequence& s, Id shared) {
+    if (!findSharedNode(s, shared)) return Result::fail("No such shared node");
+    if (const int users = sharedNodeUsers(s, shared))
+        return Result::fail(std::to_string(users) + (users == 1 ? " clip uses" : " clips use") + " that shared node: unshare it there first");
+    std::erase_if(s.sharedNodes, [&](const SharedNode& n) { return n.id == shared; });
+    return {};
+}
+
+Result setGradeNodeParams(Project& p, Sequence& s, Id clip, int key, const std::vector<std::pair<std::string, double>>& values) {
+    Clip* c = videoClip(s, clip);
+    if (!c) return Result::fail("No such clip");
+    const GradeNode* n = findGradeNode(c->grade, key);
+    if (!n || n->kind != "corrector") return Result::fail("Settings are a corrector node's");
+    const EffectInfo* info = findEffectInfo("grade_node");
+    for (const auto& [name, v] : values) {
+        const bool known = name.rfind("mask.", 0) == 0 ||
+                           std::any_of(info->params.begin(), info->params.end(), [&](const ParamInfo& pi) { return pi.name == name; });
+        if (!known) return Result::fail("A node has no setting \"" + name + "\"");
+    }
+    Effect* settings = nullptr;
+    for (Effect& e : c->effects)
+        if (e.node == key && e.type == "grade_node") settings = &e;
+    if (!settings) {
+        Effect e = makeEffect(p, "grade_node");
+        e.node = key;
+        c->effects.push_back(std::move(e));
+        settings = &c->effects.back();
+    }
+    for (const auto& [name, v] : values) settings->params[name] = Param(v);
     return {};
 }
 

@@ -12,6 +12,7 @@
 
 #include "AudioChannels.h"
 #include "Effects.h"
+#include "GradeGraph.h"
 
 namespace montage::edit {
 
@@ -1223,7 +1224,7 @@ std::vector<ClipboardItem> copyClips(const Sequence& s, const std::vector<Id>& i
         auto loc = locate(s, id);
         if (!loc) continue;
         const Clip& c = trackAt(s, loc->track)->clips[loc->index];
-        items.push_back({loc->track, c});
+        items.push_back({loc->track, c, sharedNodesUsed(s, c)});
         minStart = std::min(minStart, c.start);
     }
     for (auto& it : items) it.clip.start -= minStart;
@@ -1252,6 +1253,7 @@ Result pasteClips(Project& p, Sequence& s, const std::vector<ClipboardItem>& ite
             c.linkGroup = g->second;
         }
         for (auto& e : c.effects) e.id = p.newId();
+        adoptSharedNodes(s, it.sharedNodes);
         Result r = overwrite(p, s, it.track, c);
         res.created.insert(res.created.end(), r.created.begin(), r.created.end());
     }
@@ -1303,7 +1305,7 @@ SequenceRange copySequenceRange(const Sequence& src, FrameTime in, FrameTime out
             if (c.start >= in && c.end() <= out) {
                 Clip copy = c;
                 copy.start -= in;
-                r.clips.push_back({t, copy});
+                r.clips.push_back({t, copy, sharedNodesUsed(s, c)});
                 ids.insert(c.id);
             }
     keepTransitions(s, ids, r);
@@ -1357,6 +1359,7 @@ Result pasteRange(Project& p, Sequence& s, const SequenceRange& r, FrameTime at,
             c.linkGroup = g->second;
         }
         for (auto& e : c.effects) e.id = p.newId();
+        adoptSharedNodes(s, it.sharedNodes);
         const Result placed = overwrite(p, s, mapped(it.track), c);
         if (placed.ok) res.created.push_back(c.id);
     }
@@ -1521,7 +1524,7 @@ void copyEffectsOnto(Project& p, const std::vector<Effect>& from, std::vector<Ef
 }  // namespace
 
 Result pasteAttributes(Project& p, Sequence& s, const Clip& from, TrackKind fromKind, const std::vector<Id>& to,
-                       unsigned what) {
+                       unsigned what, const std::vector<SharedNode>& sharedNodes) {
     Result res;
     for (Id id : to) {
         auto loc = locate(s, id);
@@ -1560,8 +1563,32 @@ Result pasteAttributes(Project& p, Sequence& s, const Clip& from, TrackKind from
             c.audio.id = keep;
             changed = true;
         }
-        if ((what & AttrEffects) && loc->track.kind == fromKind && !from.effects.empty()) {
-            copyEffectsOnto(p, from.effects, c.effects);
+        if ((what & AttrEffects) && loc->track.kind == fromKind) {
+            // (those in its node graph are its grade)
+            std::vector<Effect> outside;
+            for (const Effect& e : from.effects)
+                if (!e.node || from.grade.empty()) {
+                    outside.push_back(e);
+                    outside.back().node = 0;
+                }
+            copyEffectsOnto(p, outside, c.effects);
+            changed = changed || !outside.empty();
+        }
+        if (video && (what & AttrGrade) && fromKind == TrackKind::Video && !from.grade.empty()) {
+            // The graph and its nodes' effects in place of the clip's, where its own graph ran (or after its effects).
+            adoptSharedNodes(s, sharedNodes);
+            std::vector<Effect> nodes;
+            for (const Effect& e : from.effects)
+                if (e.node) nodes.push_back(e);
+            const auto first = std::find_if(c.effects.begin(), c.effects.end(), [](const Effect& e) { return e.node != 0; });
+            const size_t at = size_t(std::count_if(c.effects.begin(), first, [](const Effect& e) { return e.node == 0; }));
+            std::erase_if(c.effects, [](const Effect& e) { return e.node != 0; });
+            std::vector<Effect> copied;
+            copyEffectsOnto(p, nodes, copied);
+            c.effects.insert(c.effects.begin() + std::ptrdiff_t(at), copied.begin(), copied.end());
+            c.grade = from.grade;
+            for (GradeNode& n : c.grade.nodes)
+                if (n.shared && !findSharedNode(s, n.shared)) n.shared = 0;  // (a shared node not to be had: empty)
             changed = true;
         }
         if (changed) res.created.push_back(id);
@@ -1599,7 +1626,11 @@ Result removeAttributes(Project& p, Sequence& s, const std::vector<Id>& ids, uns
         }
         if (what & AttrTimeRemap) c.timing = makeEffect("time", c.timing.id ? c.timing.id : p.newId());
         if (!video && (what & AttrVolume)) c.audio = makeEffect("volume", c.audio.id);
-        if (what & AttrEffects) c.effects.clear();
+        if (what & AttrGrade) {
+            std::erase_if(c.effects, [](const Effect& e) { return e.node != 0; });
+            c.grade = {};
+        }
+        if (what & AttrEffects) std::erase_if(c.effects, [&](const Effect& e) { return e.node == 0 || c.grade.empty(); });
         ++res.applied;
     }
     if (res.applied == 0) return Result::fail("No clips to change");

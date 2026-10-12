@@ -62,7 +62,7 @@ Result addGradeVersion(Project& p, Sequence& s, Id clipId, const std::string& na
         for (const Clip& k : t.clips) onVideo = onVideo || k.id == clipId;
     if (!onVideo) return Result::fail("Grades are for picture clips");
     if (c->gradeVersions.empty()) {
-        c->gradeVersions.push_back({"Version 1", {}, {}});
+        c->gradeVersions.push_back({"Version 1", {}, {}, {}});
         c->gradeVersion = 0;
     }
     std::vector<int> anchors;
@@ -79,7 +79,7 @@ Result addGradeVersion(Project& p, Sequence& s, Id clipId, const std::string& na
             fresh.push_back(copy);
         }
     const std::string label = name.empty() ? "Version " + std::to_string(c->gradeVersions.size() + 1) : name;
-    c->gradeVersions.push_back({label, {}, {}});
+    c->gradeVersions.push_back({label, {}, {}, {}});
     c->gradeVersion = int(c->gradeVersions.size()) - 1;
     putGrade(*c, fresh, empty ? std::vector<int>{} : anchors, anchors);
     return {};

@@ -23,6 +23,7 @@
 
 #include "core/ClipAnimation.h"
 #include "core/GradeVersions.h"
+#include "core/GradeGraph.h"
 #include "core/AudioChannels.h"
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
@@ -1570,6 +1571,179 @@ void McpServer::Impl::addTools() {
             return ok(lines.isEmpty() ? QStringLiteral("One grade (Version 1)") : lines.join('\n'), QJsonObject{{"versions", list}});
         });
 
+    add("montage_grade_nodes", "Colour nodes",
+        "A picture clip's grade as a node graph (Resolve's Color page nodes): correctors in series, side by side through "
+        "a parallel mixer (each branch from the same picture, blended by their keys or averaged) or a layer mixer (each "
+        "input over those before it with its blend mode, where its key is), and keys passed between nodes (an outside "
+        "node grades the rest of the picture). `action`: list; convert (the clip's colour effects, one node each, in "
+        "series); add (a corrector after node `anchor`, by default the last: `how` serial, parallel, layer or outside); "
+        "key_mixer (the keys of `keys` joined into corrector `node`'s key input); remove (`node`); connect (`from` 0 the "
+        "clip's picture, `to` 0 the output, `input` 0 the picture, 1 a corrector's key or a mixer's input number, `key` "
+        "true for a key); disconnect (`to`, `input`); set (`node`: `label`, `enabled`, a layer mixer's `blend` modes, "
+        "`x`/`y`, and `settings`: mix, key_gain, key_invert, key_mode 0 multiply 1 add 2 subtract 3 replace, and mask.* "
+        "as montage_add_effect's, which limit the node to a window, qualifier or depth); move_effect (effect `effect` into "
+        "corrector `node`, 0 out of the graph); share (corrector `node` as a shared node `name`, one change seen by every "
+        "clip using it); use_shared (shared node `shared` added after the clip's last node); unshare (`node` keeps a copy); "
+        "rename_shared, remove_shared (`shared`: one no clip uses); flatten (back to an effect stack). Add effects to a "
+        "node with montage_add_effect's `node` or `shared`.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "action":{"type":"string","enum":["list","convert","add","key_mixer","remove","connect","disconnect","set","move_effect","share","use_shared","unshare","rename_shared","remove_shared","flatten"]},
+            "node":{"type":"integer"},"anchor":{"type":"integer"},"how":{"type":"string","enum":["serial","parallel","layer","outside"]},
+            "keys":{"type":"array","items":{"type":"integer"}},"from":{"type":"integer"},"to":{"type":"integer"},
+            "input":{"type":"integer"},"key":{"type":"boolean"},"label":{"type":"string"},"enabled":{"type":"boolean"},
+            "blend":{"type":"array","items":{"type":"string"}},"x":{"type":"number"},"y":{"type":"number"},
+            "settings":{"type":"object","additionalProperties":{"type":"number"}},"effect":{"type":"number"},
+            "shared":{"type":"number"},"name":{"type":"string"}},"required":["project","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const QString action = need(a, "action");
+            auto nodeArg = [&](const char* key = "node") {
+                if (!a.value(key).isDouble()) throw ArgError{QStringLiteral("\"%1\" must be a node's key (see action list)").arg(key)};
+                return a.value(key).toInt();
+            };
+            auto sharedArg = [&] {
+                if (!a.value("shared").isDouble()) throw ArgError{"\"shared\" must be a shared node's id (see action list)"};
+                return Id(a.value("shared").toDouble());
+            };
+            Id id = 0;
+            const bool needsClip = action != "rename_shared" && action != "remove_shared" && !(action == "list" && !a.contains("clip"));
+            if (needsClip) {
+                const Clip& c = clipArg(l, a);
+                const auto loc = edit::locate(s, c.id);
+                if (!loc || loc->track.kind != TrackKind::Video) throw ArgError{"Colour nodes are a picture clip's"};
+                id = c.id;
+            }
+            edit::Result r;
+            int made = 0;
+            Id madeShared = 0;
+            if (action == "convert") {
+                r = edit::convertToNodes(s, id);
+            } else if (action == "add") {
+                const QString how = str(a, "how", "serial");
+                const edit::NodeHow h = how == "parallel" ? edit::NodeHow::Parallel : how == "layer" ? edit::NodeHow::Layer
+                                      : how == "outside" ? edit::NodeHow::Outside : edit::NodeHow::Serial;
+                if (how != "serial" && h == edit::NodeHow::Serial) throw ArgError{"\"how\" is serial, parallel, layer or outside"};
+                r = edit::addGradeNode(l.project, s, id, h, a.value("anchor").toInt(), &made);
+            } else if (action == "key_mixer") {
+                std::vector<int> keys;
+                for (const QJsonValue& v : a.value("keys").toArray()) keys.push_back(v.toInt());
+                r = edit::addKeyMixer(s, id, keys, nodeArg(), &made);
+            } else if (action == "remove") {
+                r = edit::removeGradeNode(s, id, nodeArg());
+            } else if (action == "connect") {
+                r = edit::connectGradeNodes(s, id, {a.value("from").toInt(), a.value("to").toInt(), a.value("input").toInt(), a.value("key").toBool()});
+            } else if (action == "disconnect") {
+                r = edit::disconnectGradeNodes(s, id, nodeArg("to"), a.value("input").toInt());
+            } else if (action == "set") {
+                const int key = nodeArg();
+                const GradeNode* n = findGradeNode(edit::clipById(s, id)->grade, key);
+                if (!n) throw ArgError{"No such node (see action list)"};
+                GradeNode changed = *n;
+                if (a.contains("label")) changed.label = str(a, "label").toStdString();
+                if (a.contains("enabled")) changed.enabled = a.value("enabled").toBool();
+                if (a.contains("x")) changed.x = a.value("x").toDouble();
+                if (a.contains("y")) changed.y = a.value("y").toDouble();
+                if (a.contains("blend")) {
+                    if (n->kind != "layer") throw ArgError{"Blend modes are a layer mixer's"};
+                    changed.blend.clear();
+                    for (const QJsonValue& v : a.value("blend").toArray()) changed.blend.push_back(v.toString().toStdString());
+                }
+                r = edit::setGradeNode(s, id, changed);
+                if (!r.ok && !r.error.empty()) throw ArgError{QString::fromStdString(r.error)};
+                const QJsonObject settings = a.value("settings").toObject();
+                if (!settings.isEmpty()) {
+                    std::vector<std::pair<std::string, double>> values;
+                    for (auto it = settings.begin(); it != settings.end(); ++it) values.push_back({it.key().toStdString(), it.value().toDouble()});
+                    check(edit::setGradeNodeParams(l.project, s, id, key, values));
+                    r = {};
+                }
+            } else if (action == "move_effect") {
+                if (!a.value("effect").isDouble()) throw ArgError{"\"effect\" must be an effect id on the clip"};
+                r = edit::moveEffectToNode(s, id, Id(a.value("effect").toDouble()), a.value("node").toInt());
+            } else if (action == "share") {
+                r = edit::shareGradeNode(l.project, s, id, nodeArg(), str(a, "name").toStdString(), &madeShared);
+            } else if (action == "use_shared") {
+                r = edit::useSharedNode(l.project, s, id, sharedArg(), &made);
+            } else if (action == "unshare") {
+                r = edit::unshareGradeNode(l.project, s, id, nodeArg());
+            } else if (action == "rename_shared") {
+                r = edit::renameSharedNode(s, sharedArg(), need(a, "name").toStdString());
+            } else if (action == "remove_shared") {
+                r = edit::removeSharedNode(s, sharedArg());
+            } else if (action == "flatten") {
+                r = edit::flattenGrade(s, id);
+            } else if (action != "list") {
+                throw ArgError{QStringLiteral("Unknown action \"%1\"").arg(action)};
+            }
+            if (!r.ok) return fail(r.error.empty() ? QStringLiteral("Nothing to change") : QString::fromStdString(r.error));
+            if (action != "list") save(l);
+            auto effectsJson = [](const std::vector<const Effect*>& fx) {
+                QJsonArray list;
+                for (const Effect* e : fx) {
+                    const EffectInfo* info = findEffectInfo(e->type);
+                    list.append(QJsonObject{{"id", double(e->id)}, {"type", QString::fromStdString(e->type)},
+                                            {"name", QString::fromStdString(info ? info->displayName : e->type)}, {"enabled", e->enabled}});
+                }
+                return list;
+            };
+            QJsonObject out;
+            QStringList lines;
+            if (id) {
+                const Clip& c = *edit::clipById(s, id);
+                QJsonArray nodes, links, outside;
+                for (const GradeNode& n : c.grade.nodes) {
+                    QJsonObject o{{"key", n.key}, {"kind", QString::fromStdString(n.kind)}, {"name", QString::fromStdString(gradeNodeName(n))},
+                                  {"enabled", n.enabled}, {"x", n.x}, {"y", n.y}};
+                    if (n.shared) o["shared"] = double(n.shared);
+                    if (n.kind == "layer") {
+                        QJsonArray blend;
+                        for (const std::string& b : n.blend) blend.append(QString::fromStdString(b));
+                        o["blend"] = blend;
+                    }
+                    if (n.kind == "corrector") {
+                        const std::vector<const Effect*> fx = gradeNodeEffects(s, c, n.key);
+                        o["effects"] = effectsJson(fx);
+                        if (const Effect* st = gradeNodeSettings(c, n.key)) {
+                            QJsonObject settings;
+                            for (const auto& [name, prm] : st->params) settings[QString::fromStdString(name)] = prm.value;
+                            o["settings"] = settings;
+                        }
+                        QStringList names;
+                        for (const Effect* e : fx) names << QString::fromStdString(findEffectInfo(e->type) ? findEffectInfo(e->type)->displayName : e->type);
+                        lines << QStringLiteral("%1 (%2)%3: %4").arg(QString::fromStdString(gradeNodeName(n))).arg(n.key)
+                                     .arg(n.enabled ? "" : " off").arg(names.isEmpty() ? QStringLiteral("empty") : names.join(", "));
+                    } else {
+                        lines << QStringLiteral("%1 (%2)").arg(QString::fromStdString(gradeNodeName(n))).arg(n.key);
+                    }
+                    nodes.append(o);
+                }
+                for (const GradeLink& k : c.grade.links)
+                    links.append(QJsonObject{{"from", k.from}, {"to", k.to}, {"input", k.input}, {"key", k.key}});
+                std::vector<const Effect*> rest;
+                for (const Effect& e : c.effects)
+                    if (!e.node || c.grade.empty()) rest.push_back(&e);
+                out = QJsonObject{{"nodes", nodes}, {"links", links}, {"outside", effectsJson(rest)}};
+                QJsonArray order;
+                for (int k : gradeOrder(c.grade)) order.append(k);
+                out["order"] = order;
+                if (c.grade.empty()) lines << QStringLiteral("No nodes: the clip's effects run as a stack (action convert)");
+            }
+            QJsonArray shared;
+            for (const SharedNode& n : s.sharedNodes) {
+                std::vector<const Effect*> fx;
+                for (const Effect& e : n.effects) fx.push_back(&e);
+                shared.append(QJsonObject{{"id", double(n.id)}, {"name", QString::fromStdString(n.name)}, {"effects", effectsJson(fx)},
+                                          {"clips", sharedNodeUsers(s, n.id)}});
+                lines << QStringLiteral("Shared node %1 \"%2\": %3 effect(s), %4 clip(s)").arg(qint64(n.id)).arg(QString::fromStdString(n.name))
+                             .arg(n.effects.size()).arg(sharedNodeUsers(s, n.id));
+            }
+            out["shared_nodes"] = shared;
+            if (made) out["created"] = made;
+            if (madeShared) out["shared"] = double(madeShared);
+            return ok(lines.join('\n'), out);
+        });
+
     add("montage_animate_clip", "Animate a clip",
         "Give a picture clip (video, still, title, shape) an animation preset, as CapCut's In / Out / Combo: in plays "
         "over its first seconds, out over its last, combo repeats all through. Drawn on top of the clip's own transform, "
@@ -1881,7 +2055,9 @@ void McpServer::Impl::addTools() {
             "strings":{"type":"object","additionalProperties":{"type":"string"},"description":"Text settings: curves (\"x,y x,y\"), hue curves, a LUT file, the Colour Warper's mesh (\"spoke,ring,hue,sat,luma;...\": spokes 0-11 every 30 degrees from red, rings 1-4 for saturation 25-100 %, hue moved in degrees, saturation in 0-1 units, brightness in stops)..."},
             "mask_path":{"type":"array","items":{"type":["array","object"]},"description":"A closed Bezier mask: three or more points, fractions of the clip's frame"},
             "mask_smooth":{"type":"boolean","default":false},
-            "group_stage":{"type":"string","enum":["pre","post"],"description":"Add it to the clip's colour group instead: its pre-clip grade (before each member's own effects) or post-clip grade (after them)"}},
+            "group_stage":{"type":"string","enum":["pre","post"],"description":"Add it to the clip's colour group instead: its pre-clip grade (before each member's own effects) or post-clip grade (after them)"},
+            "node":{"type":"integer","description":"Into the clip's corrector node with this key (montage_grade_nodes); a shared node's goes into the shared node"},
+            "shared":{"type":"number","description":"Into this shared node (montage_grade_nodes), seen by every clip using it"}},
             "required":["project","clip","effect"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -1989,6 +2165,35 @@ void McpServer::Impl::addTools() {
                 (stage == "pre" ? g->pre : g->post).push_back(e);
                 save(l);
                 return ok(QStringLiteral("Added %1 to the %2-clip grade of %3").arg(QString::fromStdString(displayName), stage, QString::fromStdString(g->name)),
+                          QJsonObject{{"effect_id", double(e.id)}});
+            }
+            if (a.contains("node") || a.contains("shared")) {
+                if (audioClip || type == "stabilize" || type == "rolling_shutter")
+                    throw ArgError{"A node takes picture effects that work on the picture it is given"};
+                Id shared = Id(a.value("shared").toDouble());
+                if (a.contains("node")) {
+                    const GradeNode* n = findGradeNode(c.grade, a.value("node").toInt());
+                    if (!n || n->kind != "corrector") throw ArgError{"No corrector node with that key on the clip (see montage_grade_nodes)"};
+                    if (n->shared) shared = n->shared;
+                    else e.node = n->key;
+                }
+                if (shared) {
+                    SharedNode* sn = nullptr;
+                    for (SharedNode& x : l.seq().sharedNodes)
+                        if (x.id == shared) sn = &x;
+                    if (!sn) throw ArgError{"No such shared node (see montage_grade_nodes)"};
+                    sn->effects.push_back(e);
+                    save(l);
+                    return ok(QStringLiteral("Added %1 to shared node \"%2\"").arg(QString::fromStdString(displayName), QString::fromStdString(sn->name)),
+                              QJsonObject{{"effect_id", double(e.id)}});
+                }
+                // (after the node's own effects: before the next node's, where the graph runs)
+                auto at = c.effects.end();
+                for (auto it = c.effects.begin(); it != c.effects.end(); ++it)
+                    if (it->node == e.node) at = it + 1;
+                c.effects.insert(at, e);
+                save(l);
+                return ok(QStringLiteral("Added %1 to %2's node %3").arg(QString::fromStdString(displayName), QString::fromStdString(c.name)).arg(e.node),
                           QJsonObject{{"effect_id", double(e.id)}});
             }
             if (type == "stabilize" || type == "rolling_shutter") {

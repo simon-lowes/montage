@@ -140,6 +140,7 @@ Result duplicateClips(Project& p, Sequence& s, const std::vector<Id>& ids, Frame
 struct ClipboardItem {
     TrackRef track;
     Clip clip;
+    std::vector<SharedNode> sharedNodes = {};  // the shared grade nodes its node graph shows (core/GradeGraph.h)
 };
 std::vector<ClipboardItem> copyClips(const Sequence& s, const std::vector<Id>& ids);
 Result pasteClips(Project& p, Sequence& s, const std::vector<ClipboardItem>& items, FrameTime at, bool insertMode);
@@ -196,14 +197,16 @@ enum Attribute : unsigned {
     AttrOpacity = 2,     // opacity and blend mode
     AttrTimeRemap = 4,   // the Time Remapping curve and frame sampling
     AttrVolume = 8,      // clip gain and pan
-    AttrEffects = 16,    // the effect stack (pasted ones are added after the clip's own)
-    AttrAll = 31
+    AttrEffects = 16,    // the effect stack (pasted ones are added after the clip's own); a node graph's aside
+    AttrGrade = 32,      // the colour node graph with its nodes' effects (replacing the clip's)
+    AttrAll = 63
 };
 // Copies the chosen attributes of `from` (a clip on a `fromKind` track,
 // keyframes included) onto the clips: picture ones onto video clips, volume
-// onto audio clips, effects onto clips of the same kind.
+// onto audio clips, effects onto clips of the same kind. `sharedNodes`: the
+// shared grade nodes `from`'s graph shows (from its sequence).
 Result pasteAttributes(Project& p, Sequence& s, const Clip& from, TrackKind fromKind, const std::vector<Id>& to,
-                       unsigned what);
+                       unsigned what, const std::vector<SharedNode>& sharedNodes = {});
 // Puts the chosen attributes back to their defaults (effects: removed).
 Result removeAttributes(Project& p, Sequence& s, const std::vector<Id>& ids, unsigned what);
 

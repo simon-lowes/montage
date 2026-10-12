@@ -5222,6 +5222,76 @@ private slots:
         QCOMPARE(back.active()->videoTracks[0].clips.front().gradeVersions.size(), size_t(3));
     }
 
+    void gradeNodesOverMcp() {
+        Project q = makeDefaultProject();
+        for (int i = 0; i < 2; ++i) {
+            Clip c = makeGeneratorClip(q, "color", 30);
+            c.start = i * 30;
+            c.effects = {makeEffect(q, "curves")};
+            edit::overwrite(q, *q.active(), {TrackKind::Video, 0}, c);
+        }
+        const double id = double(q.active()->videoTracks[0].clips[0].id), otherId = double(q.active()->videoTracks[0].clips[1].id);
+        const QString project = QString::fromStdString(path("nodes.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto nodes = [&](const QJsonObject& args) { return call("montage_grade_nodes", args); };
+        // Converted: one node with the curves; a parallel node beside it, with a mixer.
+        QJsonObject r = nodes({{"project", project}, {"clip", id}, {"action", "convert"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject g = r.value("structuredContent").toObject();
+        QCOMPARE(g.value("nodes").toArray().size(), 1);
+        QCOMPARE(g.value("nodes").toArray()[0].toObject().value("effects").toArray()[0].toObject().value("type").toString(), QString("curves"));
+        r = nodes({{"project", project}, {"clip", id}, {"action", "add"}, {"how", "parallel"}, {"anchor", 1}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const int branch = r.value("structuredContent").toObject().value("created").toInt();
+        QCOMPARE(r.value("structuredContent").toObject().value("nodes").toArray().size(), 3);
+        // An effect into the new node; its window and mix; a node renamed.
+        r = call("montage_add_effect", {{"project", project}, {"clip", id}, {"effect", "invert"}, {"node", branch}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = nodes({{"project", project}, {"clip", id}, {"action", "set"}, {"node", branch}, {"label", "Sky"},
+                   {"settings", QJsonObject{{"mask.shape", 2}, {"mix", 50}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject sky;
+        for (const QJsonValue v : r.value("structuredContent").toObject().value("nodes").toArray())
+            if (v.toObject().value("key").toInt() == branch) sky = v.toObject();
+        QCOMPARE(sky.value("name").toString(), QString("Sky"));
+        QCOMPARE(sky.value("effects").toArray()[0].toObject().value("type").toString(), QString("invert"));
+        QCOMPARE(sky.value("settings").toObject().value("mix").toDouble(), 50.0);
+        // Shared with the other clip, which then sees an effect added to the shared node.
+        r = nodes({{"project", project}, {"clip", id}, {"action", "share"}, {"node", 1}, {"name", "Look"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const double shared = r.value("structuredContent").toObject().value("shared").toDouble();
+        QVERIFY(shared > 0);
+        QVERIFY(!nodes({{"project", project}, {"clip", otherId}, {"action", "use_shared"}, {"shared", shared}}).value("isError").toBool());
+        QVERIFY(!call("montage_add_effect", {{"project", project}, {"clip", id}, {"effect", "color_correct"}, {"shared", shared}}).value("isError").toBool());
+        r = nodes({{"project", project}, {"action", "list"}});
+        const QJsonObject look = r.value("structuredContent").toObject().value("shared_nodes").toArray()[0].toObject();
+        QCOMPARE(look.value("effects").toArray().size(), 2);
+        QCOMPARE(look.value("clips").toInt(), 2);
+        QVERIFY(nodes({{"project", project}, {"action", "remove_shared"}, {"shared", shared}}).value("isError").toBool());  // in use
+        // Refused: a loop (the mixer into the node feeding it), an unknown action, a key that is no node, a picture effect on a sound clip's node.
+        QVERIFY(nodes({{"project", project}, {"clip", id}, {"action", "connect"}, {"from", branch + 1}, {"to", 1}}).value("isError").toBool());
+        QVERIFY(nodes({{"project", project}, {"clip", id}, {"action", "paint"}}).value("isError").toBool());
+        QVERIFY(nodes({{"project", project}, {"clip", id}, {"action", "remove"}, {"node", 42}}).value("isError").toBool());
+        QVERIFY(call("montage_add_effect", {{"project", project}, {"clip", id}, {"effect", "invert"}, {"node", 42}}).value("isError").toBool());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Clip& c = back.active()->videoTracks[0].clips[0];
+        QCOMPARE(c.grade.nodes.size(), size_t(3));
+        QCOMPARE(back.active()->sharedNodes.size(), size_t(1));
+        // Flattened: a stack again.
+        r = nodes({{"project", project}, {"clip", id}, {"action", "flatten"}});
+        QVERIFY(r.value("structuredContent").toObject().value("nodes").toArray().isEmpty());
+    }
+
     void captionStyleOverMcp() {
         Project q = makeDefaultProject();
         CaptionTrack t;

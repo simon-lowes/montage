@@ -39,6 +39,12 @@ std::vector<const Effect*> gradeNodeEffects(const Sequence& s, const Clip& c, in
 const SharedNode* findSharedNode(const Sequence& s, Id id);
 // "Node 2", or its label.
 std::string gradeNodeName(const GradeNode& n);
+// The shared nodes the clip's graph shows (copied with it to another sequence), and those of `nodes` the sequence
+// lacks added to it.
+std::vector<SharedNode> sharedNodesUsed(const Sequence& s, const Clip& c);
+void adoptSharedNodes(Sequence& s, const std::vector<SharedNode>& nodes);
+// The clips whose graphs show shared node `id`.
+int sharedNodeUsers(const Sequence& s, Id id);
 
 namespace edit {
 
@@ -70,6 +76,12 @@ Result shareGradeNode(Project& p, Sequence& s, Id clip, int key, const std::stri
 Result useSharedNode(Project& p, Sequence& s, Id clip, Id shared, int* created = nullptr);
 // The shared node's effects copied into the node, which no longer follows it.
 Result unshareGradeNode(Project& p, Sequence& s, Id clip, int key);
+Result renameSharedNode(Sequence& s, Id shared, const std::string& name);
+// A shared node no clip shows any more gone.
+Result removeSharedNode(Sequence& s, Id shared);
+// Corrector `key`'s settings (mix, key_gain, key_invert, key_mode, mask.*) set, its "grade_node" effect made when it
+// has none.
+Result setGradeNodeParams(Project& p, Sequence& s, Id clip, int key, const std::vector<std::pair<std::string, double>>& values);
 
 }  // namespace edit
 

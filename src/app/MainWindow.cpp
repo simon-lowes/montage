@@ -4176,7 +4176,8 @@ unsigned MainWindow::askAttributes(const QString& title, bool removing) {
                                                      {"attrOpacity", tr("Opacity and blend mode")},
                                                      {"attrTimeRemap", tr("Time Remapping")},
                                                      {"attrVolume", tr("Volume and pan")},
-                                                     {"attrEffects", removing ? tr("Effects") : tr("Effects (added after the clip's own)")}};
+                                                     {"attrEffects", removing ? tr("Effects") : tr("Effects (added after the clip's own)")},
+                                                     {"attrGrade", removing ? tr("Colour nodes") : tr("Colour nodes (replacing the clip's)")}};
     std::vector<QCheckBox*> boxes;
     QSettings settings = appSettings();
     for (const auto& [name, label] : items) {
@@ -4220,7 +4221,7 @@ bool MainWindow::pasteAttributes(unsigned what) {
     return state_->apply(tr("Paste Attributes"), [&](Project& p, Sequence& s) {
         edit::Result r = edit::Result::fail("Nothing to paste onto");
         if (video) {
-            edit::Result rv = edit::pasteAttributes(p, s, video->clip, TrackKind::Video, to, what & ~unsigned(edit::AttrVolume));
+            edit::Result rv = edit::pasteAttributes(p, s, video->clip, TrackKind::Video, to, what & ~unsigned(edit::AttrVolume), video->sharedNodes);
             if (rv.ok) r = rv;
         }
         if (audio) {
