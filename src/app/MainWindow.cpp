@@ -570,6 +570,9 @@ void MainWindow::buildPanels() {
     connect(trims_, &TrimPanel::shownChanged, this, [this](const QString& target) {
         program_->setTrimTarget(target.toStdString());
         if (referenceOutput_) referenceOutput_->sequenceChanged();
+        // (rendered previews are the master's or another target's: what is cached changes)
+        stopBackgroundRender();
+        refreshRenderBar();
     });
     connect(trims_, &TrimPanel::queueRequested, this, [this] {
         const QString folder = QFileDialog::getExistingDirectory(this, tr("Render the Trim Passes Into"), QFileInfo(state_->filePath()).absolutePath());
@@ -4982,7 +4985,9 @@ int MainWindow::queueTrimPasses(const QString& folder) {
         ExportSettings st = preset->settings;
         st.trimTarget = t.id;
         st.hdr10Plus = trimTargetSpace(*s, t.id).transfer == Transfer::Pq;
-        QString name = QString::fromStdString(s->name + " - " + t.name);
+        // (two targets of one name take their ids)
+        const bool named = std::count_if(s->trimTargets.begin(), s->trimTargets.end(), [&](const TrimTarget& o) { return o.name == t.name; }) == 1;
+        QString name = QString::fromStdString(s->name + " - " + (named ? t.name : t.id));
         name.replace(QRegularExpression(QStringLiteral("[\\\\/:*?\"<>|]")), QStringLiteral("_"));
         st.path = QDir(folder).filePath(name + "." + QString::fromStdString(preset->extension)).toStdString();
         queue_->add(name, QString::fromStdString(preset->name), state_->project(), s->id, st);

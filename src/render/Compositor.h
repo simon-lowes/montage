@@ -37,6 +37,9 @@ struct RenderOptions {
 // nothing is on screen; call flattenOver() to put it over black.
 Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o);
 
+// The video tracks a Track Matte Key hides at t (they are its mattes, not seen themselves).
+std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t);
+
 // Same, flattened over black — what the program monitor and exports show.
 Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o);
 

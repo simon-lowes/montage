@@ -56,6 +56,7 @@ TrimPanel::TrimPanel(EditorState* state, QWidget* parent) : QWidget(parent), sta
         box->setDecimals(3);
         box->setSingleStep((c.max - c.min) / 100);
         box->setValue(c.def);
+        box->setKeyboardTracking(false);  // (typed values count once finished)
         const std::string name = c.name;
         connect(box, &QDoubleSpinBox::valueChanged, this, [this, name](double value) {
             if (!updating_) setControl(QString::fromStdString(name), value);
@@ -65,6 +66,12 @@ TrimPanel::TrimPanel(EditorState* state, QWidget* parent) : QWidget(parent), sta
     }
     v->addLayout(form);
     auto* buttons = new QHBoxLayout;
+    key_ = new QToolButton(this);
+    key_->setObjectName(QStringLiteral("trimKeyframe"));
+    key_->setText(tr("Keyframe"));
+    key_->setCheckable(true);
+    key_->setToolTip(tr("Changes add keyframes at the playhead (a control with keyframes always does)"));
+    buttons->addWidget(key_);
     reset_ = new QPushButton(tr("Reset"), this);
     reset_->setObjectName(QStringLiteral("resetTrim"));
     reset_->setToolTip(tr("Take the shot's trim for this target away"));
@@ -94,7 +101,7 @@ TrimPanel::TrimPanel(EditorState* state, QWidget* parent) : QWidget(parent), sta
     connect(copy_, &QPushButton::clicked, this, [this] { copyToSelection(); });
     connect(queue_, &QPushButton::clicked, this, &TrimPanel::queueRequested);
     for (auto sig : {&EditorState::projectChanged, &EditorState::sequenceSwitched}) connect(state_, sig, this, &TrimPanel::refresh);
-    connect(state_, &EditorState::playheadChanged, this, &TrimPanel::refresh);
+    connect(state_, &EditorState::playheadChanged, this, [this] { refreshShot(); });
     refresh();
 }
 
@@ -121,7 +128,14 @@ void TrimPanel::refresh() {
         for (const TrimTarget& t : s->trimTargets) targets_->addItem(QString::fromStdString(t.name), QString::fromStdString(t.id));
     const int at = targets_->findData(was);
     targets_->setCurrentIndex(std::max(0, at));
-    const bool lost = at < 0;  // (its target was removed: the master shows again)
+    updating_ = false;
+    refreshShot();
+    if (at < 0 && !was.isEmpty()) emit shownChanged(QString());  // (its target was removed: the master shows again)
+}
+
+void TrimPanel::refreshShot() {
+    const Sequence* s = state_->sequence();
+    updating_ = true;
     const std::string target = shown().toStdString();
     const Clip* c = s ? trimShot(*s, state_->playhead()) : nullptr;
     const bool editing = s && c && !target.empty();
@@ -133,7 +147,8 @@ void TrimPanel::refresh() {
     for (const TrimControl& k : trimControls()) {
         QDoubleSpinBox* box = controls_[k.name];
         box->setEnabled(editing);
-        box->setValue(has ? trim->second.p(k.name, state_->playhead() - c->start, k.def) : k.def);
+        if (!box->hasFocus())  // (not under someone typing)
+            box->setValue(has ? trim->second.p(k.name, state_->playhead() - c->start, k.def) : k.def);
         const auto p = has ? trim->second.params.find(k.name) : decltype(trim->second.params)::const_iterator{};
         box->setToolTip(has && p != trim->second.params.end() && p->second.animated() ? tr("Keyframed: set at the playhead") : QString());
     }
@@ -142,7 +157,6 @@ void TrimPanel::refresh() {
     copy_->setEnabled(editing);
     queue_->setEnabled(s && !s->trimTargets.empty());
     updating_ = false;
-    if (lost && !was.isEmpty()) emit shownChanged(QString());
 }
 
 bool TrimPanel::addTarget(const QString& preset) {
@@ -171,7 +185,7 @@ bool TrimPanel::setControl(const QString& name, double value) {
     const bool ok = state_->edit(
         tr("Trim"),
         [&](Project&, Sequence& s) {
-            const edit::Result r = edit::setTrim(s, clip, target, {{control, value}}, at);
+            const edit::Result r = edit::setTrim(s, clip, target, {{control, value}}, at, key_->isChecked());
             why = QString::fromStdString(r.error);
             return r.ok;
         },

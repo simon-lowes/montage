@@ -5,6 +5,7 @@
 #include <optional>
 
 #include "ColorSpace.h"
+#include "Compositor.h"
 
 namespace montage {
 
@@ -144,9 +145,10 @@ bool isNeutralTrim(const Effect& trim, FrameTime t) {
 }
 
 const Clip* trimShot(const Sequence& s, FrameTime t) {
+    const std::vector<bool> mattes = hiddenMatteTracks(s, t);
     for (int i = int(s.videoTracks.size()) - 1; i >= 0; --i) {
         const Track& track = s.videoTracks[size_t(i)];
-        if (track.muted) continue;
+        if (track.muted || mattes[size_t(i)]) continue;
         for (const Clip& c : track.clips)
             if (c.enabled && c.contains(t) && !overlay(c)) return &c;
     }
@@ -187,8 +189,15 @@ void applyTrimPass(Image& img, const Sequence& s, FrameTime t, const TrimTarget&
     if (img.empty() || !to) return;
     // 1. The master on the target's display: PQ above its peak rolled off first, then into its space.
     const double peak = targetPeak(*to, target.peakNits);
-    if (from.transfer == Transfer::Pq && to->hdr() && sourcePeak(s) > peak) rollOffPq(img, sourcePeak(s), peak);
-    convertColor(img, from, *to, to->transfer == Transfer::Pq ? peak : sourcePeak(s));
+    if (to->transfer == Transfer::Pq && from.hdr() && sourcePeak(s) > peak) {
+        // (into PQ at the master's peak, then rolled off there: HLG's highlights too)
+        convertColor(img, from, *to, sourcePeak(s));
+        rollOffPq(img, sourcePeak(s), peak);
+    } else {
+        // (a PQ master into HLG rolled off to its 1000 nits first, on PQ's own code values)
+        if (from.transfer == Transfer::Pq && to->hdr() && sourcePeak(s) > peak) rollOffPq(img, sourcePeak(s), peak);
+        convertColor(img, from, *to, to->transfer == Transfer::Pq ? peak : sourcePeak(s));
+    }
     // 2. The shot's trim, on the display's code values.
     const Clip* shot = trimShot(s, t);
     if (!shot) return;
@@ -259,7 +268,7 @@ Result removeTrimTarget(Sequence& s, const std::string& id) {
     return {};
 }
 
-Result setTrim(Sequence& s, Id clipId, const std::string& target, const std::map<std::string, double>& values, FrameTime at) {
+Result setTrim(Sequence& s, Id clipId, const std::string& target, const std::map<std::string, double>& values, FrameTime at, bool keyframe) {
     if (!findTrimTarget(s, target)) return Result::fail("No trim target " + target);
     const auto loc = locate(s, clipId);
     if (!loc || loc->track.kind != TrackKind::Video) return Result::fail("Trims are for picture clips");
@@ -271,7 +280,13 @@ Result setTrim(Sequence& s, Id clipId, const std::string& target, const std::map
             return Result::fail("No trim control " + name + " (lift, gamma, gain, saturation, highlights, mid_detail)");
     auto [it, added] = c.trims.try_emplace(target, makeTrim());
     for (const TrimControl& k : trimControls())
-        if (const auto v = values.find(k.name); v != values.end()) it->second.params[k.name].set(at - c.start, std::clamp(v->second, k.min, k.max));
+        if (const auto v = values.find(k.name); v != values.end()) {
+            Param& prm = it->second.params[k.name];
+            const double value = std::clamp(v->second, k.min, k.max);
+            if (keyframe && !prm.animated() && at != c.start) prm.addKey(0, prm.value);  // (from where it was)
+            if (keyframe) prm.addKey(at - c.start, value);
+            else prm.set(at - c.start, value);
+        }
     return {};
 }
 

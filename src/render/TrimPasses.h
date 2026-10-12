@@ -49,8 +49,10 @@ Result addTrimTarget(Sequence& s, TrimTarget target);
 // Removes one and every clip's trim for it.
 Result removeTrimTarget(Sequence& s, const std::string& id);
 // Sets controls of a clip's trim for a target (made if need be): at `at` (timeline frame) when the control has
-// keyframes, else its value. Unknown controls fail.
-Result setTrim(Sequence& s, Id clip, const std::string& target, const std::map<std::string, double>& values, FrameTime at);
+// keyframes (or `keyframe`: one is added there, the first also keeping its value at the clip's start), else its
+// value. Unknown controls fail.
+Result setTrim(Sequence& s, Id clip, const std::string& target, const std::map<std::string, double>& values, FrameTime at,
+               bool keyframe = false);
 // The clips' trims for a target back to none (all targets for "").
 Result resetTrims(Sequence& s, const std::vector<Id>& clips, const std::string& target);
 // A clip's trim for a target on other picture clips (in place of theirs).

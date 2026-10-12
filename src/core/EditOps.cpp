@@ -1593,7 +1593,7 @@ Result pasteAttributes(Project& p, Sequence& s, const Clip& from, TrackKind from
                 if (n.shared && !findSharedNode(s, n.shared)) n.shared = 0;  // (a shared node not to be had: empty)
             changed = true;
         }
-        if (video && (what & AttrTrims) && fromKind == TrackKind::Video) {
+        if (video && (what & AttrTrims) && fromKind == TrackKind::Video && !from.trims.empty()) {
             // (keyed to the source's start: they play the same way on a clip as long)
             c.trims = from.trims;
             changed = true;

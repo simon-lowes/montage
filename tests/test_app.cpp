@@ -2460,7 +2460,7 @@ private slots:
         state()->setSelection({clip}, false);
         QApplication::processEvents();
         QDoubleSpinBox* gain = nullptr;
-        for (auto* sp : win_->findChildren<QDoubleSpinBox*>())
+        for (auto* sp : win_->findChild<InspectorWidget*>()->findChildren<QDoubleSpinBox*>())
             if (sp->maximum() == 2 && sp->minimum() == 0 && sp->isVisibleTo(win_.get())) gain = sp;
         QVERIFY(gain);
         gain->setValue(0.5);
@@ -10215,6 +10215,13 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(edit::clipById(*state()->sequence(), red)->trims.empty());
         state()->redo();
         QCOMPARE(gain->value(), 0.6);
+        // Keyframe on: the change is a key at the playhead.
+        auto* key = win_->findChild<QToolButton*>("trimKeyframe");
+        QVERIFY(key && !gain->keyboardTracking());
+        key->setChecked(true);
+        win_->findChild<QDoubleSpinBox*>("trim_lift")->setValue(0.1);
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->trims.at("sdr").params.at("lift").keys.size(), size_t(2));
+        key->setChecked(false);
         state()->setSelection({blue}, false);
         QVERIFY(trims->copyToSelection());
         QCOMPARE(edit::clipById(*state()->sequence(), blue)->trims.at("sdr").p("gain", 0), 0.6);

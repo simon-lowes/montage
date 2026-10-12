@@ -36,6 +36,7 @@ public:
     // The shot being trimmed (0: none at the playhead).
     Id shot() const;
     void refresh();
+    void refreshShot();  // the shot at the playhead and its controls
 
 signals:
     void shownChanged(const QString& target);
@@ -48,6 +49,7 @@ private:
     QToolButton* remove_;
     QLabel* shotLabel_;
     std::map<std::string, QDoubleSpinBox*> controls_;
+    QToolButton* key_;
     QPushButton* reset_;
     QPushButton* copy_;
     QPushButton* queue_;

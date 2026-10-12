@@ -6519,7 +6519,7 @@ void McpServer::Impl::addTools() {
         "displays, each a trim target: a preset (sdr: Rec.709 100 nits; hdr10-1000, hdr10-600, hdr10-300: PQ rolled off "
         "to that peak; hlg) or a space and peak of its own. Each shot (the top picture clip on screen) can be trimmed for "
         "a target on its code values: lift (-0.5..0.5), gamma (-1..1), gain (0..2), saturation (0..2), highlights (a "
-        "roll-off, 0..1) and mid_detail (-1..1), keyframed where a control has keys. list gives the targets and the "
+        "roll-off, 0..1) and mid_detail (-1..1), keyframed with `keyframe` (or where a control has keys). list gives the targets and the "
         "clips' trims; add_target, remove_target; set a clip's controls (at a timeline time, default the playhead); "
         "reset clips' trims; copy one clip's trim to others. montage_render's trim_target delivers a target.",
         R"json({"type":"object","properties":{"project":{"type":"string"},
@@ -6531,7 +6531,8 @@ void McpServer::Impl::addTools() {
             "clip":{"type":["number","string"],"description":"set, copy: the clip (id or name)"},
             "clips":{"type":"array","items":{"type":["number","string"]},"description":"reset, copy: clips (ids or names)"},
             "values":{"type":"object","description":"set: controls and their values, e.g. {\"gain\":0.9,\"highlights\":0.4}"},
-            "at":{"type":["number","string"],"description":"set: timeline time a keyframed control is set at (default the playhead)"}},
+            "at":{"type":["number","string"],"description":"set: timeline time a keyframed control is set at (default the playhead)"},
+            "keyframe":{"type":"boolean","default":false,"description":"set: add keyframes at `at` (the first also keeping the control's value at the clip's start)"}},
             "required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -6604,7 +6605,8 @@ void McpServer::Impl::addTools() {
                 }
                 if (values.empty()) throw ArgError{"\"values\" is required"};
                 const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : s.playhead;
-                return done(edit::setTrim(s, c.id, need(a, "target").toStdString(), values, at), QStringLiteral("Trimmed %1").arg(QString::fromStdString(c.name)));
+                return done(edit::setTrim(s, c.id, need(a, "target").toStdString(), values, at, a.value("keyframe").toBool()),
+                            QStringLiteral("Trimmed %1").arg(QString::fromStdString(c.name)));
             }
             if (action == "reset") return done(edit::resetTrims(s, clipsArg(), str(a, "target").toStdString()), QStringLiteral("Reset"));
             if (action == "copy") {

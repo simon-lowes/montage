@@ -2717,6 +2717,50 @@ colorspaces:
         st.path = dir.path().toStdString() + "/pass.gif";
         QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err));
 
+        // Pasting from a clip with no trims leaves the clips' own.
+        const Id ta = edit::clipById(s, a.id)->id;
+        const size_t had = edit::clipById(s, ta)->trims.size();
+        Clip plainClip = colorClip(p, 0, 0, 0, 0, 5);
+        QVERIFY(had > 0);
+        edit::pasteAttributes(p, s, plainClip, TrackKind::Video, {ta}, edit::AttrTrims);
+        QCOMPARE(edit::clipById(s, ta)->trims.size(), had);
+        // Keyframes made by setting with `keyframe`: the first keeps the value at the clip's start.
+        QVERIFY(edit::setTrim(s, b.id, "sdr", {{"lift", 0.2}}, 50, true).ok);
+        const Param& lift = edit::clipById(s, b.id)->trims.at("sdr").params.at("lift");
+        QCOMPARE(lift.keys.size(), size_t(2));
+        QCOMPARE(lift.at(0), 0.0);
+        QCOMPARE(lift.at(20), 0.2);
+
+        // A track matte's hidden source is not the shot: the clip it keys is.
+        {
+            Sequence m = s;
+            Clip under = colorClip(p, 1, 0, 0, 100, 10);
+            under.effects.push_back(makeEffect(p, "track_matte"));
+            Clip matte = colorClip(p, 1, 1, 1, 100, 10);
+            edit::overwrite(p, m, {TrackKind::Video, 0}, under);
+            edit::overwrite(p, m, {TrackKind::Video, 1}, matte);  // (the track above: its matte by default)
+            QVERIFY(hiddenMatteTracks(m, 105).at(1));
+            QCOMPARE(trimShot(m, 105)->id, under.id);
+        }
+
+        // An HLG master on a 300-nit PQ display: its highlights rolled off, not clipped (two levels stay two).
+        {
+            Sequence h = s;
+            h.colorSpace = "rec2100hlg";
+            const ColorSpace& hlg = *findColorSpace("rec2100hlg");
+            Image img(2, 1);
+            for (int i = 0; i < 2; ++i) {
+                float* px = img.at(i, 0);
+                px[0] = px[1] = px[2] = float(nitsToCode(hlg, i ? 1000 : 500));
+                px[3] = 1;
+            }
+            QVERIFY(edit::addTrimTarget(h, *std::find_if(trimTargetPresets().begin(), trimTargetPresets().end(),
+                                                         [](const TrimTarget& x) { return x.id == "hdr10-300"; })).ok);
+            applyTrimPass(img, h, 90, *findTrimTarget(h, "hdr10-300"));
+            const double lo = codeToNits(pq, img.at(0, 0)[0]), hi = codeToNits(pq, img.at(1, 0)[0]);
+            QVERIFY2(hi <= 301 && hi > lo + 10 && lo > 150, qPrintable(QStringLiteral("%1 %2").arg(lo).arg(hi)));
+        }
+
         // Removing a target takes its trims away.
         QVERIFY(edit::removeTrimTarget(s, "hdr10-600").ok);
         QVERIFY(!edit::clipById(s, a.id)->trims.count("hdr10-600"));
