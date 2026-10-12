@@ -4768,9 +4768,9 @@ void McpServer::Impl::addTools() {
 
     add("montage_captions", "Import or export captions",
         "Write a caption track to a file in the format its extension names: .srt (SubRip), .vtt (WebVTT), .scc "
-        "(Scenarist, CEA-608), .ttml / .xml / .dfxp (TTML, IMSC 1.1 Text profile, with the track's colours), .stl "
+        "(Scenarist, CEA-608), .mcc (MacCaption: CEA-608 and CTA-708, with the track's places and colours), .ttml / .xml / .dfxp (TTML, IMSC 1.1 Text profile, with the track's colours), .stl "
         "(EBU Tech 3264, 25 or 30 fps) or .ass / .ssa (SubStation Alpha, with the track's style); or read any of them "
-        "as a new caption track (`import`), or the CEA-608 closed captions inside a video clip's file (`import_embedded`). "
+        "as a new caption track (`import`), or the closed captions inside a video clip's file (`import_embedded`: CTA-708 service 1, else CEA-608 channel 1). "
         "`track` is a caption track index (default: the visible one).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"export":{"type":"string","description":"A file to write"},
             "import":{"type":"string","description":"A file to read as a new track"},"track":{"type":"integer"},
@@ -4838,7 +4838,7 @@ void McpServer::Impl::addTools() {
             if (!t) return fail("The sequence has no captions");
             const std::string ext = "." + QFileInfo(path).suffix().toStdString();
             if (!captionFormatKnown(ext))
-                throw ArgError{QStringLiteral("Unknown caption format \"%1\": use .srt, .vtt, .scc, .ttml, .stl or .ass")
+                throw ArgError{QStringLiteral("Unknown caption format \"%1\": use .srt, .vtt, .scc, .mcc, .ttml, .stl or .ass")
                                    .arg(QString::fromStdString(ext))};
             const std::string data = exportCaptions(*t, s, ext);
             QFile o(path);
@@ -7263,7 +7263,8 @@ void McpServer::Impl::addTools() {
             "captions":{"type":"string","enum":["none","burn","embed","both"],"default":"none","description":"The visible caption track, burned into the picture and/or embedded as a subtitle stream"},
             "trim_target":{"type":"string","description":"A trim pass (montage_trim): deliver that target of the sequence (its space and peak, each shot's trim) instead of the master"},
             "hdr10plus":{"type":"boolean","default":false,"description":"PQ exports: HDR10+ dynamic metadata, scene by scene, in HEVC and AV1 video and as name.hdr10plus.json beside the file (measured first unless montage_measure_hdr's analysis still matches the cut)"},
-            "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as CEA-608 closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask)"},
+            "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask): CEA-608 and CTA-708 service 1"},
+            "cea708":{"type":"boolean","default":true,"description":"With cea608: the CTA-708 service beside the 608 bytes"},
             "all_captions":{"type":"boolean","default":false,"description":"With embed: every caption track as its own subtitle stream, language tagged"},
             "audio_streams":{"description":"More audio streams after the mix (a master's M&E, dialogue, dubs): \"roles\" (one per role), \"tracks\" (one per track), or a list of {name, language, tracks:[\"A2\",...], role}",
                 "anyOf":[{"type":"string","enum":["mix","roles","tracks"]},{"type":"array","items":{"type":"object","properties":{
@@ -7334,6 +7335,7 @@ void McpServer::Impl::addTools() {
             if (cap != "none" && cap != "burn" && cap != "embed" && cap != "both") throw ArgError{"\"captions\" must be none, burn, embed or both"};
             st.burnInCaptions = cap == "burn" || cap == "both";
             st.cea608 = a.value("cea608").toBool();
+            st.cea708 = a.value("cea708").toBool(true);
             st.hdr10Plus = a.value("hdr10plus").toBool();
             st.trimTarget = str(a, "trim_target").toStdString();
             if (!st.trimTarget.empty() && !findTrimTarget(s, st.trimTarget))

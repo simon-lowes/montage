@@ -201,10 +201,11 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     allCaptions_->setToolTip(tr("Embed each caption track as its own subtitle stream, tagged with its language, so players offer them all"));
     allCaptions_->setChecked(appSettings().value("export/allCaptions", false).toBool());
     form->addRow(QString(), allCaptions_);
-    cea608_ = new QCheckBox(tr("CEA-608 closed captions in the video (broadcast, streaming platforms)"), form_);
+    cea608_ = new QCheckBox(tr("Closed captions in the video, CEA-608 and CTA-708 (broadcast, streaming platforms)"), form_);
     cea608_->setObjectName(QStringLiteral("exportCea608"));
-    cea608_->setToolTip(tr("The caption track as line-21 (A/53) captions inside H.264 or HEVC video, as US broadcast and "
-                           "streaming deliveries ask; players show them as CC1"));
+    cea608_->setToolTip(tr("The caption track as A/53 captions inside H.264 or HEVC video, as US broadcast and streaming "
+                           "deliveries ask: line-21 (CEA-608, players show it as CC1) and digital (CTA-708 service 1, placed "
+                           "and coloured as the track shows it)"));
     cea608_->setChecked(appSettings().value("export/cea608", false).toBool());
     form->addRow(QString(), cea608_);
     streams_ = new QComboBox(form_);

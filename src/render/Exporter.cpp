@@ -8,6 +8,7 @@
 #include "core/ColorGroups.h"
 #include "core/ClipAnimation.h"
 #include "core/Interpretation.h"
+#include "core/Cea708.h"
 #include "core/Chapters.h"
 #include "core/Surround.h"
 
@@ -1414,9 +1415,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     if (wantVideo && s.smartRender && o.vctx && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height && !seq.stereo3d &&
         !s.useProxies && !s.burnInCaptions && !s.cea608 && !s.burnIn.any() && outSpace.id == seqSpace.id && !trim)
         smart = std::make_unique<SmartRenderer>(p, seq, seqSpace, o.vctx, o.vst, s.alpha, s.profile);
-    // CEA-608 captions in the video: the pairs due in each frame's span of the 29.97 Hz line-21 clock, padding between.
-    std::vector<Cc608Pair> cc608;
-    size_t ccNext = 0;
+    // CEA-608 (and CTA-708) captions in the video: each frame's A/53 cc_data (core/Cea708.h).
+    std::vector<std::vector<CcTriplet>> ccFrames;
     if (s.cea608 && wantVideo) {
         const std::string vc = o.vctx && o.vctx->codec ? o.vctx->codec->name : "";
         if (o.vctx->codec_id != AV_CODEC_ID_H264 && o.vctx->codec_id != AV_CODEC_ID_HEVC)
@@ -1429,21 +1429,17 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                 c.end = std::min(c.end, out) - in;
                 part.push_back(std::move(c));
             }
-            cc608 = captionsTo608(part, seq.fps);
+            ccFrames = captionCcData(part, seq.fps, out - in, true, s.cea708, t->style);
+        } else {
+            ccFrames = captionCcData({}, seq.fps, out - in, true, s.cea708);
         }
     }
     auto attach608 = [&](FrameTime rel) {
         if (!s.cea608) return true;
         av_frame_remove_side_data(o.vframe, AV_FRAME_DATA_A53_CC);
-        const double rate = 30000.0 / 1001.0, fpsv = seq.fpsValue();
-        const int64_t from = int64_t(std::floor(double(rel) / fpsv * rate + 1e-6)), to = int64_t(std::floor(double(rel + 1) / fpsv * rate + 1e-6));
+        if (rel < 0 || size_t(rel) >= ccFrames.size()) return true;
         std::vector<uint8_t> cc;
-        for (int64_t slot = from; slot < to; ++slot) {
-            uint16_t pair = 0x8080;  // padding (null characters with parity)
-            while (ccNext < cc608.size() && cc608[ccNext].frame < slot) ++ccNext;
-            if (ccNext < cc608.size() && cc608[ccNext].frame == slot) pair = cc608[ccNext++].pair;
-            cc.insert(cc.end(), {uint8_t(0xfc), uint8_t(pair >> 8), uint8_t(pair & 0xff)});  // valid, field 1
-        }
+        for (const CcTriplet& t : ccFrames[size_t(rel)]) cc.insert(cc.end(), t.begin(), t.end());
         if (cc.empty()) return true;
         AVFrameSideData* sd = av_frame_new_side_data(o.vframe, AV_FRAME_DATA_A53_CC, cc.size());
         if (!sd) return false;

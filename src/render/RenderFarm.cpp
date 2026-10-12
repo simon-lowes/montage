@@ -168,6 +168,7 @@ void visitSettings(S& s, V& v) {
     v("embedCaptions", s.embedCaptions);
     v("captionTrack", s.captionTrack);
     v("cea608", s.cea608);
+    v("cea708", s.cea708);
     v("colorSpace", s.colorSpace);
     v("trimTarget", s.trimTarget);
     v("hdr10Plus", s.hdr10Plus);

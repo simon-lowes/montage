@@ -137,8 +137,8 @@ int usage() {
                  "                                        --press runs as if that button were pressed, --set filling its controls)\n"
                  "  montage-cli mcp [--live]              (Model Context Protocol server on stdio, for AI agents;\n"
                  "                                        --live: on the project open in Montage, with Tools > Agent Link on)\n"
-                 "  montage-cli captions <project.montage> [-o out.srt|.vtt|.scc|.ttml|.stl|.ass] [--transcribe MODEL]\n"
-                 "                     [--generate] [--import file.srt|.vtt|.scc|.ttml|.stl|.ass] [--save]\n"
+                 "  montage-cli captions <project.montage> [-o out.srt|.vtt|.scc|.mcc|.ttml|.stl|.ass] [--transcribe MODEL]\n"
+                 "                     [--generate] [--import file.srt|.vtt|.scc|.mcc|.ttml|.stl|.ass] [--save]\n"
                  "  montage-cli translate <subtitles.srt|.vtt> --to LANG [--from LANG] [-o out.srt|out.vtt]\n"
                  "                     (on this computer, with Opus-MT; LANG is de, fr, es, ja... see `models`)\n",
                  MONTAGE_VERSION);

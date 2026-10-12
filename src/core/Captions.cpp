@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <limits>
 
+#include "Cea708.h"
 #include "History.h"
 #include "Model.h"
 #include "Transcript.h"
@@ -402,6 +403,7 @@ bool parseSubtitles(const std::string& text, Rational fps, std::vector<Caption>&
     const size_t skip = text.compare(0, 3, "\xEF\xBB\xBF") == 0 ? 3 : 0;
     const std::string head = text.substr(skip, 4096);
     if (head.rfind("Scenarist_SCC", 0) == 0) return parseScc(text, fps, out, error);
+    if (head.rfind("File Format=MacCaption_MCC", 0) == 0) return parseMcc(text, fps, out, error);
     if (head.find("<tt") != std::string::npos && head.find("-->") == std::string::npos) return parseTtml(text, fps, out, error);
     if (head.find("[Script Info]") != std::string::npos || head.find("[Events]") != std::string::npos) return parseAss(text, fps, out, error);
     const double f = fps.valid() ? fps.toDouble() : 30.0;
@@ -440,7 +442,7 @@ bool parseSubtitles(const std::string& text, Rational fps, std::vector<Caption>&
     }
     normalizeCaptions(caps);
     if (caps.empty()) {
-        if (error) *error = "No captions found (expected SubRip, WebVTT, SCC, TTML, EBU STL or ASS)";
+        if (error) *error = "No captions found (expected SubRip, WebVTT, SCC, MCC, TTML, EBU STL or ASS)";
         return false;
     }
     out = std::move(caps);

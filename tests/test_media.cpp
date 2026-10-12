@@ -12967,8 +12967,9 @@ if ui["pressed"] == "add":
     }
 
     void embeddedClosedCaptions() {
-        // A 6 s cut with two captions, written with CEA-608 captions inside the video and read back.
-        auto make = [&](Rational fps, const std::string& codec, const std::string& file, std::string* err) {
+        // A 6 s cut with two captions (the second at the top right), written with CEA-608 and CTA-708 captions inside the
+        // video and read back, each standard on its own.
+        auto make = [&](Rational fps, const std::string& codec, const std::string& file, std::string* err, bool with708 = true) {
             Project p = makeDefaultProject();
             Sequence& s = *p.active();
             s.width = 160, s.height = 90, s.fps = fps;
@@ -12979,6 +12980,8 @@ if ui["pressed"] == "add":
             t.id = p.newId();
             t.captions = {{FrameTime(std::llround(1.0 * f)), FrameTime(std::llround(2.5 * f)), "Hello there", {}},
                           {FrameTime(std::llround(3.0 * f)), FrameTime(std::llround(5.0 * f)), "A second caption\non two rows", {}}};
+            t.captions[1].vertical = kCaptionTop;
+            t.captions[1].align = kCaptionRight;
             s.captionTracks.push_back(t);
             ExportSettings st;
             st.path = file;
@@ -12986,23 +12989,39 @@ if ui["pressed"] == "add":
             st.audioCodec = "none";
             st.preset = codec == "libx264" ? "ultrafast" : "medium";
             st.cea608 = true;
+            st.cea708 = with708;
             return exportSequence(p, s, st, nullptr, nullptr, err);
         };
         std::string err;
         for (const auto& [fps, codec] : std::vector<std::pair<Rational, std::string>>{{{30000, 1001}, "libx264"}, {{25, 1}, "libx264"}, {{24000, 1001}, "libx265"}}) {
             const std::string file = path(("cc608-" + std::to_string(fps.num) + "-" + codec + ".mp4").c_str());
             QVERIFY2(make(fps, codec, file, &err), err.c_str());
+            for (CaptionStandard standard : {CaptionStandard::Auto, CaptionStandard::Cea608, CaptionStandard::Cea708}) {
+                std::vector<Caption> back;
+                QVERIFY2(readEmbeddedCaptions(file, fps, back, {}, nullptr, &err, standard), qPrintable(QString::fromStdString(codec + ": " + err)));
+                QCOMPARE(back.size(), size_t(2));
+                const double f = fps.toDouble();
+                if (standard != CaptionStandard::Cea608) {  // 708 keeps the place
+                    QCOMPARE(back[1].vertical, int(kCaptionTop));
+                    QCOMPARE(back[1].align, int(kCaptionRight));
+                }
+                QCOMPARE(back[0].text, std::string("Hello there"));
+                QCOMPARE(back[1].text, std::string("A second caption\non two rows"));
+                // Shown and cleared within a frame or two of when the captions say.
+                QVERIFY2(std::llabs(back[0].start - std::llround(1.0 * f)) <= 2, qPrintable(QString::number(back[0].start)));
+                QVERIFY2(std::llabs(back[0].end - std::llround(2.5 * f)) <= 2, qPrintable(QString::number(back[0].end)));
+                QVERIFY2(std::llabs(back[1].start - std::llround(3.0 * f)) <= 2, qPrintable(QString::number(back[1].start)));
+                QVERIFY2(std::llabs(back[1].end - std::llround(5.0 * f)) <= 2, qPrintable(QString::number(back[1].end)));
+            }
+        }
+        // 608 alone: no 708 service to read, and Auto reads the 608.
+        {
+            const std::string file = path("cc608-only.mp4");
+            QVERIFY2(make({30000, 1001}, "libx264", file, &err, false), err.c_str());
             std::vector<Caption> back;
-            QVERIFY2(readEmbeddedCaptions(file, fps, back, {}, nullptr, &err), qPrintable(QString::fromStdString(codec + ": " + err)));
-            QCOMPARE(back.size(), size_t(2));
-            const double f = fps.toDouble();
-            QCOMPARE(back[0].text, std::string("Hello there"));
-            QCOMPARE(back[1].text, std::string("A second caption\non two rows"));
-            // Shown and cleared within a frame or two of when the captions say.
-            QVERIFY2(std::llabs(back[0].start - std::llround(1.0 * f)) <= 2, qPrintable(QString::number(back[0].start)));
-            QVERIFY2(std::llabs(back[0].end - std::llround(2.5 * f)) <= 2, qPrintable(QString::number(back[0].end)));
-            QVERIFY2(std::llabs(back[1].start - std::llround(3.0 * f)) <= 2, qPrintable(QString::number(back[1].start)));
-            QVERIFY2(std::llabs(back[1].end - std::llround(5.0 * f)) <= 2, qPrintable(QString::number(back[1].end)));
+            QVERIFY(!readEmbeddedCaptions(file, {30000, 1001}, back, {}, nullptr, &err, CaptionStandard::Cea708));
+            QVERIFY(readEmbeddedCaptions(file, {30000, 1001}, back, {}, nullptr, &err));
+            QVERIFY(back.size() == 2 && back[0].text == "Hello there");
         }
         // Only H.264 and HEVC carry them.
         QVERIFY(!make({25, 1}, "prores_ks", path("cc608.mov"), &err));

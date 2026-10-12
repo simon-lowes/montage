@@ -33,12 +33,14 @@ bool sameProbedFacts(const MediaItem& a, const MediaItem& b, bool length = true)
 // that read them differently (with or without FFmpeg 9's colour) are probed again every time.
 void checkStereoMedia(Project& p);
 
-// Captions carried inside a video as CEA-608 (the A/53 caption data of H.264, HEVC and MPEG-2 frames, as broadcast
-// and camera files carry them): caption channel 1, timed in frames at `fps` of the media's own time. The whole video
-// is read. False (with `error`) if it holds none.
+// Captions carried inside a video (the A/53 caption data of H.264, HEVC and MPEG-2 frames, as broadcast and camera
+// files carry them): CTA-708 service 1 (core/Cea708.h) or CEA-608 caption channel 1; Auto takes 708 when it holds
+// pop-on captions, else 608 (roll-up and paint-on read from 608 when it has them). Timed in frames at `fps` of the media's own time. The whole video is read. False (with `error`)
+// if it holds none of the kind asked for.
+enum class CaptionStandard { Auto, Cea608, Cea708 };
 bool readEmbeddedCaptions(const std::string& path, Rational fps, std::vector<Caption>& out,
                           const std::function<void(double)>& progress = {}, const std::atomic<bool>* cancel = nullptr,
-                          std::string* error = nullptr);
+                          std::string* error = nullptr, CaptionStandard standard = CaptionStandard::Auto);
 
 struct ImageSequence;
 

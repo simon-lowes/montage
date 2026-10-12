@@ -8,6 +8,7 @@
 #include "Psd.h"
 #include "audio/TimeStretch.h"
 #include "core/Ambisonics.h"
+#include "core/Cea708.h"
 #include "SpatialAudio.h"
 #include "core/Interpretation.h"
 
@@ -180,7 +181,7 @@ int openMediaInput(AVFormatContext** fmt, const std::string& decorated) {
 }
 
 bool readEmbeddedCaptions(const std::string& path, Rational fps, std::vector<Caption>& out, const std::function<void(double)>& progress,
-                          const std::atomic<bool>* cancel, std::string* error) {
+                          const std::atomic<bool>* cancel, std::string* error, CaptionStandard standard) {
     auto fail = [&](const std::string& why) {
         if (error) *error = why;
         return false;
@@ -205,6 +206,7 @@ bool readEmbeddedCaptions(const std::string& path, Rational fps, std::vector<Cap
     const int64_t start = st->start_time != AV_NOPTS_VALUE ? st->start_time : 0;
     const double duration = fmt->duration > 0 ? double(fmt->duration) / AV_TIME_BASE : 0;
     std::vector<std::pair<double, uint16_t>> pairs;
+    std::vector<std::pair<double, CcTriplet>> dtvcc;  // CTA-708's entries
     auto take = [&] {
         while (avcodec_receive_frame(ctx.get(), frame.get()) >= 0) {
             const int64_t pts = frame->best_effort_timestamp != AV_NOPTS_VALUE ? frame->best_effort_timestamp : frame->pts;
@@ -213,6 +215,7 @@ bool readEmbeddedCaptions(const std::string& path, Rational fps, std::vector<Cap
                 int k = 0;  // field-1 pairs in this frame, a 29.97th of a second apart
                 for (size_t i = 0; i + 2 < size_t(sd->size); i += 3) {
                     const uint8_t head = sd->data[i];
+                    if ((head & 0x03) >= 2) dtvcc.push_back({t, {head, sd->data[i + 1], sd->data[i + 2]}});
                     if (!(head & 0x04) || (head & 0x03) != 0) continue;  // not valid, or not field 1 (CC1/CC2)
                     pairs.push_back({t + double(k++) * 1001.0 / 30000.0, uint16_t((sd->data[i + 1] << 8) | sd->data[i + 2])});
                 }
@@ -234,12 +237,25 @@ bool readEmbeddedCaptions(const std::string& path, Rational fps, std::vector<Cap
     avcodec_send_packet(ctx.get(), nullptr);
     take();
     std::stable_sort(pairs.begin(), pairs.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-    const bool any = std::any_of(pairs.begin(), pairs.end(), [](const auto& p) { return (p.second & 0x7f7f) != 0; });
-    if (!any) return fail("The video carries no CEA-608 captions");
+    std::stable_sort(dtvcc.begin(), dtvcc.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     // A conformed video's captions keep to its frames.
-    if (Interpretation in; parseInterpretation(path, in) && in.conformed())
+    if (Interpretation in; parseInterpretation(path, in) && in.conformed()) {
         for (auto& pair : pairs) pair.first /= in.timeScale();
+        for (auto& entry : dtvcc) entry.first /= in.timeScale();
+    }
     std::string err;
+    const bool any = std::any_of(pairs.begin(), pairs.end(), [](const auto& p) { return (p.second & 0x7f7f) != 0; });
+    if (standard != CaptionStandard::Cea608 && !dtvcc.empty()) {
+        // Auto: 708's pop-on captions, but roll-up and paint-on from the 608, which reads them better.
+        std::vector<Caption> from708;
+        bool painted = false;
+        if (captionsFrom708(dtvcc, fps, from708, &err, &painted) && (standard == CaptionStandard::Cea708 || !painted || !any)) {
+            out = std::move(from708);
+            return true;
+        }
+    }
+    if (standard == CaptionStandard::Cea708) return fail("The video carries no CTA-708 captions");
+    if (!any) return fail("The video carries no CEA-608 captions");
     if (!captionsFrom608(pairs, fps, out, &err)) return fail("The video's CEA-608 data holds no captions");
     return true;
 }

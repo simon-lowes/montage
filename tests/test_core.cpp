@@ -22,6 +22,7 @@
 #include "core/CaptionTools.h"
 #include "core/ClipAnimation.h"
 #include "core/Captions.h"
+#include "core/Cea708.h"
 #include "core/ColorWarp.h"
 #include "core/Bleep.h"
 #include "core/Cfb.h"
@@ -1843,6 +1844,150 @@ private slots:
         QVERIFY(std::llabs(back[1].start - 90) <= 2);
         QVERIFY(std::llabs(back[1].end - 150) <= 2);
         QVERIFY(!captionsFrom608({}, {30, 1}, back));
+    }
+
+    void cea708Service() {
+        // Three captions at 29.97: one placed top left, accents (Latin-1) and curly quotes (G2), back to back with the
+        // next, then a gap. Every frame carries A/53's 20 entries; read back from the 708 entries alone.
+        const Rational fps{30000, 1001};
+        std::vector<Caption> caps = {{30, 75, "Caf\xc3\xa9 au lait", {}},
+                                     {75, 150, "\xe2\x80\x9cQuoted\xe2\x80\x9d words\non two rows", {}},
+                                     {200, 260, "Up here \xe2\x99\xaa", {}}};
+        caps[2].vertical = kCaptionTop;
+        caps[2].align = kCaptionLeft;
+        const int64_t frames = 300;
+        const auto data = captionCcData(caps, fps, frames, true, true);
+        QCOMPARE(data.size(), size_t(frames));
+        std::vector<std::pair<double, CcTriplet>> entries;
+        int packets = 0;
+        for (int64_t f = 0; f < frames; ++f) {
+            QCOMPARE(int(data[size_t(f)].size()), 20);
+            QCOMPARE(int(data[size_t(f)].size()), ccCountForRate(fps.toDouble()));
+            for (const CcTriplet& t : data[size_t(f)]) {
+                QVERIFY((t[0] & 0xF8) == 0xF8);  // marker bits
+                if ((t[0] & 0x03) == 3) ++packets;
+                entries.push_back({double(f) / fps.toDouble(), t});
+            }
+        }
+        QVERIFY(packets >= 6);
+        std::vector<Caption> back;
+        std::string err;
+        QVERIFY2(captionsFrom708(entries, fps, back, &err), err.c_str());
+        QCOMPARE(back.size(), size_t(3));
+        for (size_t i = 0; i < 3; ++i) {
+            QCOMPARE(back[i].text, caps[i].text);
+            QVERIFY2(std::llabs(back[i].start - caps[i].start) <= 1, qPrintable(QString::number(back[i].start)));
+            QVERIFY2(std::llabs(back[i].end - caps[i].end) <= 1, qPrintable(QString::number(back[i].end)));
+        }
+        QCOMPARE(back[0].vertical, int(kCaptionBottom));
+        QCOMPARE(back[0].align, int(kCaptionCentre));
+        QCOMPARE(back[2].vertical, int(kCaptionTop));
+        QCOMPARE(back[2].align, int(kCaptionLeft));
+        // Without 708: just the 608 pairs, field 1's and field 2's nulls, at most one of each a frame.
+        const auto only608 = captionCcData(caps, fps, frames, true, false);
+        for (const auto& f : only608) QVERIFY(f.size() <= 2 && (f.empty() || (f[0][0] == 0xFC && f[1] == CcTriplet{0xFD, 0x80, 0x80})));
+        // Read at another rate; no entries, nothing found.
+        QVERIFY(captionsFrom708(entries, {25, 1}, back));
+        QVERIFY(!captionsFrom708({}, fps, back, &err));
+        QCOMPARE(ccCountForRate(25), 24);
+        QCOMPARE(ccCountForRate(60000.0 / 1001), 10);
+
+        // MCC: written and read back (its 708 service), through the caption formats too.
+        const std::string mcc = captionsToMcc(caps, fps);
+        QVERIFY(mcc.rfind("File Format=MacCaption_MCC V1.0", 0) == 0);
+        QVERIFY(mcc.find("Time Code Rate=30DF") != std::string::npos);
+        QVERIFY(mcc.find("00:00:01;00\tT") != std::string::npos);  // drop-frame timecode, then DID and SDID
+        std::vector<Caption> fromMcc;
+        QVERIFY2(parseSubtitles(mcc, fps, fromMcc, &err), err.c_str());
+        QCOMPARE(fromMcc.size(), size_t(3));
+        QCOMPARE(fromMcc[1].text, caps[1].text);
+        QVERIFY(std::llabs(fromMcc[1].start - 75) <= 1 && std::llabs(fromMcc[2].end - 260) <= 1);
+        QCOMPARE(fromMcc[2].vertical, int(kCaptionTop));
+        // At 25 fps, the rate MCC names is 25; captions keep their frames.
+        const std::vector<Caption> pal = {{25, 75, "Bonjour", {}}};
+        const std::string mcc25 = captionsToMcc(pal, {25, 1});
+        QVERIFY(mcc25.find("Time Code Rate=25") != std::string::npos);
+        QVERIFY(parseMcc(mcc25, {25, 1}, fromMcc));
+        QVERIFY(fromMcc.size() == 1 && fromMcc[0].text == "Bonjour" && std::llabs(fromMcc[0].start - 25) <= 1);
+        // A 608-only MCC (as some tools write): its line-21 pairs are read.
+        std::string only608Mcc = "File Format=MacCaption_MCC V1.0\n\nTime Code Rate=30DF\n\n";
+        {
+            const auto cc = captionCcData(pal, {30000, 1001}, 120, true, false);
+            for (size_t f = 0; f < cc.size(); ++f) {
+                std::string hex = "T" + QStringLiteral("%1").arg(9 + 3 * int(cc[f].size()) + 4, 2, 16, QChar('0')).toUpper().toStdString() +
+                                  "S" + QStringLiteral("%1").arg(9 + 3 * int(cc[f].size()) + 4, 2, 16, QChar('0')).toUpper().toStdString() + "4F43";
+                hex += "0000";
+                hex += "72" + QStringLiteral("%1").arg(0xE0 | int(cc[f].size()), 2, 16, QChar('0')).toUpper().toStdString();
+                for (const CcTriplet& t : cc[f])
+                    for (uint8_t b : t) hex += QStringLiteral("%1").arg(b, 2, 16, QChar('0')).toUpper().toStdString();
+                hex += "7400000000";
+                only608Mcc += formatTimecode(FrameTime(f), {30000, 1001}, true) + "\t" + hex + "\n";
+            }
+        }
+        QVERIFY2(parseMcc(only608Mcc, {30000, 1001}, fromMcc, &err), err.c_str());
+        QVERIFY(fromMcc.size() == 1 && fromMcc[0].text == "Bonjour");
+        QVERIFY(!parseMcc("Scenarist_SCC V1.0\n", fps, fromMcc, &err));
+        // A caption at frame 0, the same words twice back to back, a short one before a long one, a 60-character row.
+        const std::vector<Caption> tight = {{0, 20, "First", {}},
+                                            {20, 40, "Yes.", {}},
+                                            {40, 43, "Oh!", {}},
+                                            {43, 90, "A long caption on four rows\nthat fills its window\nfrom side to side\nall the way", {}},
+                                            {90, 120, "Yes.", {}},
+                                            {120, 160, "This single row runs on well past the forty-two columns a window has", {}}};
+        std::vector<std::pair<double, CcTriplet>> te;
+        const auto tightData = captionCcData(tight, fps, 200, true, true);
+        for (size_t f = 0; f < tightData.size(); ++f)
+            for (const CcTriplet& t : tightData[f]) te.push_back({double(f) / fps.toDouble(), t});
+        bool painted = true;
+        QVERIFY2(captionsFrom708(te, fps, back, &err, &painted), err.c_str());
+        QVERIFY(!painted);
+        QCOMPARE(back.size(), tight.size());
+        for (size_t i = 0; i + 1 < tight.size(); ++i) {
+            QCOMPARE(back[i].text, tight[i].text);
+            // (the first is loaded and shown in its own first frame, which holds only so much: a frame late at most)
+            QVERIFY2(back[i].start - tight[i].start <= (i == 0 ? 1 : 0) && back[i].start >= tight[i].start && back[i].end == tight[i].end,
+                     qPrintable(QStringLiteral("%1: %2-%3").arg(i).arg(back[i].start).arg(back[i].end)));
+        }
+        QCOMPARE(back.back().text, wrapCaptionText(tight.back().text, 42, 4));  // wrapped, not cut
+        // Roll-up written by another tool: a two-row window on screen, typed into, scrolling. Read as the text grows,
+        // and said to be painted (so Auto reads such files' 608).
+        {
+            std::vector<uint8_t> svc{0x98, 0x38 /* visible */, 0x80 | 90, 50, (7 << 4) | 1, 31, 0x09};
+            auto typed = [&](const std::string& t) { svc.insert(svc.end(), t.begin(), t.end()); };
+            std::vector<std::vector<uint8_t>> packets;
+            typed("ONE");
+            packets.push_back(svc);
+            packets.push_back({'\x0D'});
+            std::vector<uint8_t> two{'T', 'W', 'O'};
+            packets.push_back(two);
+            packets.push_back({'\x0D', 'T', 'H', 'R', 'E', 'E'});
+            std::vector<std::pair<double, CcTriplet>> rollup;
+            int sq = 0;
+            for (size_t k = 0; k < packets.size(); ++k) {
+                std::vector<uint8_t> pk{0, uint8_t((1 << 5) | packets[k].size())};
+                pk.insert(pk.end(), packets[k].begin(), packets[k].end());
+                if (pk.size() % 2) pk.push_back(0);
+                pk[0] = uint8_t(((sq++ & 3) << 6) | (pk.size() / 2));
+                for (size_t i = 0; i < pk.size(); i += 2) rollup.push_back({double(k), {uint8_t(i ? 0xFE : 0xFF), pk[i], pk[i + 1]}});
+            }
+            QVERIFY(captionsFrom708(rollup, {30, 1}, back, &err, &painted));
+            QVERIFY(painted);
+            QVERIFY2(back.size() == 2, qPrintable(QString::number(back.size())));
+            QCOMPARE(back[0].text, std::string("ONE\nTWO"));  // typed in, one caption
+            QCOMPARE(back[1].text, std::string("TWO\nTHREE"));  // scrolled up past its two rows
+        }
+        // 23.976 is written as "24" and read back on its own frames, with no drift an hour in.
+        const std::vector<Caption> late = {{86400, 86460, "An hour in", {}}};
+        QVERIFY(parseMcc(captionsToMcc(late, {24000, 1001}), {24000, 1001}, fromMcc));
+        QVERIFY2(fromMcc.size() == 1 && std::llabs(fromMcc[0].start - 86400) <= 1, qPrintable(QString::number(fromMcc.empty() ? -1 : fromMcc[0].start)));
+        // 59.94 drop frame needs MCC V2.0.
+        QVERIFY(captionsToMcc(pal, {60000, 1001}).rfind("File Format=MacCaption_MCC V2.0", 0) == 0);
+        // The caption export by extension.
+        Project p = makeDefaultProject();
+        CaptionTrack t;
+        t.captions = caps;
+        QVERIFY(captionFormatKnown(".mcc"));
+        QCOMPARE(exportCaptions(t, *p.active(), ".mcc").substr(0, 26), std::string("File Format=MacCaption_MCC"));
     }
 
     void suggestingChapters() {

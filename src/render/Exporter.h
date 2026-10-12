@@ -61,6 +61,9 @@ struct ExportSettings {
     // The caption track as CEA-608 line-21 captions inside the video (A/53, as US broadcast and streaming platforms
     // take them): H.264 and HEVC only.
     bool cea608 = false;
+    // With cea608, the same captions as CTA-708 service 1 too (core/Cea708.h: the digital captions US broadcast
+    // requires, placed and coloured as the track shows them), beside the 608 bytes.
+    bool cea708 = true;
     // Delivery colour space (ColorSpace.h display space); "" = the sequence's.
     // An HDR sequence delivered in SDR is tone mapped. HDR output is 10-bit,
     // tagged, and PQ carries HDR10 mastering and light-level metadata.
