@@ -51,6 +51,7 @@
 #include "media/DepthMap.h"
 #include "media/Matting.h"
 #include "media/Faces.h"
+#include "media/MotionDeblur.h"
 #include "media/Rife.h"
 #include "media/SuperScale.h"
 #include "core/Interpretation.h"
@@ -479,6 +480,37 @@ bool cachedSuperScale(const Image& in, int w, int h, double strength, Image& out
     return true;
 }
 
+// The last few Motion Deblur results, by what went in (sampled) and the strength, as for Super Scale.
+bool cachedDeblur(const Image& in, double strength, Image& out) {
+    uint64_t key = 1469598103934665603ULL;
+    auto mix = [&](uint64_t v) { key = (key ^ v) * 1099511628211ULL; };
+    mix(uint64_t(in.width)), mix(uint64_t(in.height)), mix(uint64_t(std::lround(strength * 1000)));
+    const size_t step = std::max<size_t>(1, in.px.size() / 8192);
+    for (size_t i = 0; i < in.px.size(); i += step) {
+        uint32_t bits;
+        std::memcpy(&bits, &in.px[i], 4);
+        mix(bits);
+    }
+    static std::mutex m;
+    static std::deque<std::pair<uint64_t, std::shared_ptr<const Image>>> cache;
+    {
+        std::lock_guard lock(m);
+        for (const auto& [k, img] : cache)
+            if (k == key) {
+                out = *img;
+                return true;
+            }
+    }
+    Image result;
+    if (!motionDeblur(in, result, strength)) return false;
+    auto shared = std::make_shared<const Image>(result);
+    std::lock_guard lock(m);
+    cache.emplace_front(key, shared);
+    if (cache.size() > 2) cache.pop_back();
+    out = std::move(result);
+    return true;
+}
+
 const Effect* denoiseEffect(const Clip& c) {
     for (const Effect& e : c.effects)
         if (e.type == "video_denoise" && e.enabled) return &e;
@@ -868,6 +900,12 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 applyDenoise(*nr, lt, src, around, motion, effectPixelScale(c, lt, g.sx, mw, src.width),
                              m->kind == MediaKind::Video ? sec : -1);
             }
+            // Motion Deblur, on the source frame as decoded (the size it is shown at), when its model is here.
+            if (const Effect* db = enabledEffect(c, "motion_deblur"); db && !src.empty() && db->p("strength", lt, 100) > 0 &&
+                                                                         deblurAvailable() && deblurModel().installed()) {
+                Image sharp;
+                if (cachedDeblur(src, db->p("strength", lt, 100) / 100, sharp)) src = std::move(sharp);
+            }
             // Motion Blur and Deflicker, from the source frames either side.
             const Effect* blur = enabledEffect(c, "motion_blur");
             const Effect* flicker = enabledEffect(c, "deflicker");
@@ -986,7 +1024,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     for (const Effect* e : chain)
         if (e->type == "redact_faces") applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
     auto ranAlready = [&](const Effect& e) {
-        return e.type == "video_denoise" || e.type == "super_scale" || e.type == "reframe_360" || e.type == "redact_faces" ||
+        return e.type == "video_denoise" || e.type == "super_scale" || e.type == "motion_deblur" || e.type == "reframe_360" || e.type == "redact_faces" ||
                e.type == "stereo_3d" || &e == sourceCdl || &e == sourceRgc;  // those ran already (Stereo 3D is placed below)
     };
     // A node graph (core/GradeGraph.h) runs where its first node's effect is in the stack (or after the clip's own

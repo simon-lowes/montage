@@ -87,6 +87,7 @@
 #include "media/DualSystem.h"
 #include "media/Relink.h"
 #include "media/SpeechEnhance.h"
+#include "media/MotionDeblur.h"
 #include "media/SuperScale.h"
 #include "media/Translator.h"
 #include "render/AudioReactive.h"
@@ -2086,6 +2087,8 @@ void McpServer::Impl::addTools() {
                 return fail("Enhance Speech needs its model: run `scripts/fetch-models.sh` or add the effect once in the app");
             if (type == "super_scale" && (!upscalerAvailable() || !upscaleModel().installed()))
                 return fail("Super Scale needs its model: run `scripts/fetch-models.sh` or add the effect once in the app");
+            if (type == "motion_deblur" && (!deblurAvailable() || !deblurModel().installed()))
+                return fail("Motion Deblur needs its model: run `scripts/fetch-models.sh` or add the effect once in the app");
             Effect e = plugin ? *plugin : makeEffect(l.project, type);
             const QJsonObject params = a.value("params").toObject();
             for (auto it = params.begin(); it != params.end(); ++it) {

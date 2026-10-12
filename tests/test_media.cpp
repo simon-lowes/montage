@@ -111,6 +111,7 @@
 #include "media/Segmenter.h"
 #include "media/Translator.h"
 #include "media/SpeechEnhance.h"
+#include "media/MotionDeblur.h"
 #include "media/SuperScale.h"
 #include "media/Reframe.h"
 #include "media/Diarizer.h"
@@ -8297,6 +8298,107 @@ private slots:
             const QJsonArray v2 = qt[1].toObject().value("components").toArray();
             QCOMPARE(v2[0].toObject().value("inputs").toArray()[0].toObject().value("length").toInt(), 41);  // 40.4 frames, all shown
         }
+    }
+
+    void motionDeblurring() {
+        if (!deblurAvailable()) QSKIP("Built without ONNX Runtime");
+        if (!deblurModel().installed()) QSKIP("Set MONTAGE_DEBLUR_MODEL to the Motion Deblur model");
+        // Lettering, a ring and slanted bars over a soft gradient, smeared sideways over 13 px in light (as a moving camera
+        // smears it), then deblurred.
+        const int W = 448, H = 384;
+        QImage qi(W, H, QImage::Format_RGBA8888_Premultiplied);
+        {
+            QLinearGradient bg(0, 0, 0, H);
+            bg.setColorAt(0, QColor(235, 240, 250));
+            bg.setColorAt(1, QColor(200, 222, 202));
+            QPainter pa(&qi);
+            pa.setRenderHint(QPainter::Antialiasing);
+            pa.fillRect(qi.rect(), bg);
+            QFont font("Sans Serif");
+            font.setPixelSize(64);
+            font.setBold(true);
+            pa.setFont(font);
+            pa.setPen(QColor(20, 20, 30));
+            pa.drawText(QRect(0, 20, W, 90), Qt::AlignCenter, "Montage");
+            pa.setPen(QPen(QColor(200, 40, 40), 6));
+            pa.drawEllipse(QPointF(120, 230), 60, 60);
+            pa.setPen(QPen(QColor(30, 90, 200), 6));
+            for (int i = 0; i < 6; ++i) pa.drawLine(230 + i * 30, 150, 250 + i * 30, 330);
+        }
+        Image truth(W, H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W * 4; ++x) truth.row(y)[x] = qi.constScanLine(y)[x] / 255.0f;
+        Image blurred = truth;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                for (int c = 0; c < 3; ++c) {
+                    double acc = 0;
+                    for (int d = -6; d <= 6; ++d) acc += std::pow(double(truth.at(std::clamp(x + d, 0, W - 1), y)[c]), 2.2);
+                    blurred.at(x, y)[c] = float(std::pow(acc / 13, 1 / 2.2));
+                }
+        auto psnr = [&](const Image& a) {
+            double acc = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 16; x < W - 16; ++x)
+                    for (int c = 0; c < 3; ++c) acc += std::pow(double(a.at(x, y)[c]) - truth.at(x, y)[c], 2);
+            return 10 * std::log10(1.0 / (acc / (double(W - 32) * H * 3)));
+        };
+        Image sharp;
+        std::string err;
+        QVERIFY2(motionDeblur(blurred, sharp, 1.0, &err), err.c_str());
+        QCOMPARE(sharp.width, W);
+        QVERIFY2(psnr(sharp) > psnr(blurred) + 1.0, qPrintable(QString("blurred %1 dB, deblurred %2 dB").arg(psnr(blurred)).arg(psnr(sharp))));
+        // Half strength is half way; in two overlapping tiles much the same as one pass.
+        Image half;
+        QVERIFY(motionDeblur(blurred, half, 0.5));
+        QVERIFY(std::fabs(half.at(100, 60)[0] - 0.5f * (blurred.at(100, 60)[0] + sharp.at(100, 60)[0])) < 1e-5f);
+        Image tiled;
+        QVERIFY2(motionDeblur(blurred, tiled, 1.0, &err, nullptr, 384), err.c_str());
+        double diff = 0;
+        for (size_t i = 0; i < tiled.px.size(); ++i) diff += std::fabs(tiled.px[i] - sharp.px[i]);
+        diff /= double(tiled.px.size());
+        QVERIFY2(diff < 0.01, qPrintable(QString::number(diff)));
+        QVERIFY2(psnr(tiled) > psnr(blurred) + 0.8, qPrintable(QString::number(psnr(tiled))));
+        // Smaller than the model takes: mirrored out to its size and back; alpha kept.
+        Image small(100, 80);
+        for (int y = 0; y < 80; ++y)
+            for (int x = 0; x < 100; ++x) {
+                float* p = small.at(x, y);
+                const float a = x < 50 ? 1.0f : 0.5f;
+                p[0] = blurred.at(x + 40, y + 30)[0] * a, p[1] = blurred.at(x + 40, y + 30)[1] * a, p[2] = blurred.at(x + 40, y + 30)[2] * a;
+                p[3] = a;
+            }
+        Image smallOut;
+        QVERIFY2(motionDeblur(small, smallOut, 1.0, &err), err.c_str());
+        QCOMPARE(smallOut.width, 100);
+        QCOMPARE(smallOut.at(80, 40)[3], 0.5f);
+        for (float v : smallOut.px) QVERIFY(std::isfinite(v));
+        QVERIFY(smallOut.at(80, 40)[0] <= 0.5f + 1e-6f);
+
+        // As a clip effect on a still of the smeared picture.
+        const QString png = QString::fromStdString(path("smeared.png"));
+        {
+            QImage q(W, H, QImage::Format_RGBA8888);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const float* p = blurred.at(x, y);
+                    q.setPixelColor(x, y, QColor::fromRgbF(p[0], p[1], p[2], 1));
+                }
+            QVERIFY(q.save(png));
+        }
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W;
+        s.height = H;
+        MediaItem m = probeOrFail(p, png.toStdString());
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Image without = renderSequenceFrame(p, s, 5, {});
+        s.videoTracks[0].clips[0].effects.push_back(makeEffect(p, "motion_deblur"));
+        const Image with = renderSequenceFrame(p, s, 5, {});
+        QVERIFY2(psnr(with) > psnr(without) + 1.0, qPrintable(QString("%1 %2").arg(psnr(without)).arg(psnr(with))));
+        const Provenance prov = sequenceProvenance(p, s);
+        QVERIFY(std::any_of(prov.ai.begin(), prov.ai.end(), [](const AiUse& u) { return u.model == "NAFNet"; }));
     }
 
     void superScaleUpscaling() {

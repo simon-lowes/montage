@@ -22,6 +22,7 @@
 #include "media/Rife.h"
 #include "media/TextToSpeech.h"
 #include "media/VoiceClone.h"
+#include "media/MotionDeblur.h"
 #include "media/SuperScale.h"
 #include "media/SpeechEnhance.h"
 
@@ -196,6 +197,16 @@ bool ensureEffectModel(QWidget* parent, const std::string& type) {
         }
         return ensureModelPack(parent, upscaleModel(), QObject::tr("Super Scale"),
                                QObject::tr("Super Scale uses Real-ESRGAN (BSD-3-Clause), an image model that runs on this computer."));
+    }
+    if (type == "motion_deblur") {
+        if (!deblurAvailable()) {
+            QMessageBox::information(parent, QObject::tr("Motion Deblur"),
+                                     QObject::tr("This build of Montage cannot use Motion Deblur: it was built without ONNX Runtime."));
+            return false;
+        }
+        return ensureModelPack(parent, deblurModel(), QObject::tr("Motion Deblur"),
+                               QObject::tr("Motion Deblur uses NAFNet (MIT, trained on the GoPro dataset, CC BY 4.0), an image model that "
+                                           "runs on this computer. It takes seconds a frame: render long stretches ahead."));
     }
     if (type == "depth_blur" || type == "depth_fog" || type == "depth_map" || type == "relight" || type == "mask.depth") {
         if (!depthAvailable()) {

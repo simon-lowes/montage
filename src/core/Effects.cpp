@@ -412,6 +412,10 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"super_scale", "Super Scale", EffectCategory::VideoFilter, "Blur & Sharpen",
                  {pct("strength", "Strength", 0, 100, 100)},
                  {}});
+    // NAFNet on the source frames: the smear of camera or subject motion taken out (media/MotionDeblur.h).
+    c.push_back({"motion_deblur", "Motion Deblur", EffectCategory::VideoFilter, "Blur & Sharpen",
+                 {pct("strength", "Strength", 0, 100, 100)},
+                 {}});
     // Depth (Depth Anything V2 on the clip's source frame): 0 is the farthest part of the picture, 100 the nearest.
     c.push_back({"depth_blur", "Lens Blur (Depth)", EffectCategory::VideoFilter, "Depth",
                  {pct("focus", "Focus Depth", 0, 100, 80), pct("range", "In Focus Range", 0, 100, 10),

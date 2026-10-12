@@ -6,6 +6,7 @@
 #   <dir>/clip-vit-b32   Find Shots         (MONTAGE_VISUAL_MODEL)
 #   <dir>/speech-enhance Enhance Speech     (MONTAGE_SPEECH_MODEL)
 #   <dir>/upscale        Super Scale        (MONTAGE_UPSCALE_MODEL)
+#   <dir>/deblur         Motion Deblur      (MONTAGE_DEBLUR_MODEL)
 #   <dir>/faces          Find People        (MONTAGE_FACE_MODEL)
 #   <dir>/depth          depth effects      (MONTAGE_DEPTH_MODEL)
 #   <dir>/rife           AI slow motion     (MONTAGE_RIFE_MODEL)
@@ -65,6 +66,9 @@ fetch speech-enhance deepfilternet3.onnx \
 fetch upscale realesr-general-x4v3.onnx \
   https://huggingface.co/jonathanst29/tinier-upscale-models/resolve/899dc1e4b22bbf1955c2f1739c085edc080cb366/realesr-general-x4v3.onnx \
   924ebad6532777303582d4ce7811849b88869231a3ae7093e0f21200249df8d5
+fetch deblur deblurring_nafnet_2025may.onnx \
+  https://huggingface.co/opencv/deblurring_nafnet/resolve/f1f255116cdb628a311d2b5749871189a4639d84/deblurring_nafnet_2025may.onnx \
+  07263f416febecce10193dd648e950b22e397cf521eedab1a114ef77b2bc9587
 fetch faces face_detection_yunet_2023mar.onnx \
   https://huggingface.co/opencv/face_detection_yunet/resolve/3cc26e7f1014a5ee5d74a42acee58bafc9d0a310/face_detection_yunet_2023mar.onnx \
   8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4
@@ -195,4 +199,4 @@ slr-ussr.xml 1fd6acc8a8f40373379bea2899ffd96fc34b22d9b044d0474dabd4c89af44efb
 slr-vivitar.xml c5c67e3fe38e8fa19044acadc7730047690435f66aac563f55ffe04997a88111
 slr-zeiss.xml 49aa211a41fd5fe391d26af5fa65bdf9428d60863ffff15d3916fa1c520dc101
 LENSES
-echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife MONTAGE_MATTE_MODEL=$DIR/matte MONTAGE_TTS_MODEL=$DIR/tts MONTAGE_INPAINT_MODEL=$DIR/inpaint MONTAGE_SENTENCE_MODEL=$DIR/minilm-qa MONTAGE_OCR_MODEL=$DIR/ocr MONTAGE_SOUND_MODEL=$DIR/sound MONTAGE_STEM_MODELS=$DIR/stems MONTAGE_LENS_DB=$DIR/lensfun-db"
+echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_DEBLUR_MODEL=$DIR/deblur MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife MONTAGE_MATTE_MODEL=$DIR/matte MONTAGE_TTS_MODEL=$DIR/tts MONTAGE_INPAINT_MODEL=$DIR/inpaint MONTAGE_SENTENCE_MODEL=$DIR/minilm-qa MONTAGE_OCR_MODEL=$DIR/ocr MONTAGE_SOUND_MODEL=$DIR/sound MONTAGE_STEM_MODELS=$DIR/stems MONTAGE_LENS_DB=$DIR/lensfun-db"

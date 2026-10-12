@@ -46,6 +46,7 @@
 #include "media/Diarizer.h"
 #include "media/Segmenter.h"
 #include "media/SpeechEnhance.h"
+#include "media/MotionDeblur.h"
 #include "media/SuperScale.h"
 #include "media/Translator.h"
 #include "media/VisualSearch.h"
@@ -813,6 +814,11 @@ int cmdModels() {
     else
         std::printf("  %-22s %6.1f MB  %s\n", upscaleModel().id.c_str(), double(upscaleModel().bytes()) / 1e6,
                     upscaleModel().installed() ? "downloaded" : "");
+    std::printf("\nMotion Deblur model (NAFNet GoPro; folder: %s)\n", deblurModel().directory().c_str());
+    if (!deblurAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        std::printf("  %-22s %6.1f MB  %s\n", deblurModel().id.c_str(), double(deblurModel().bytes()) / 1e6,
+                    deblurModel().installed() ? "downloaded" : "");
     std::printf("\nFace models (YuNet and SFace, for Find People; folder: %s)\n", faceModel().directory().c_str());
     if (!faceSearchAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
     else

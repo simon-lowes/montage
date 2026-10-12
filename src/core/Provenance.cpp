@@ -33,6 +33,7 @@ void effectUses(Provenance& out, const Effect& e) {
     const std::string& t = e.type;
     if (t == "object_removal") add(out, {"Object Removal", "LaMa", AiRole::Generated});
     else if (t == "super_scale") add(out, {"Super Scale", "Real-ESRGAN", AiRole::Enhanced});
+    else if (t == "motion_deblur") add(out, {"Motion Deblur", "NAFNet", AiRole::Enhanced});
     else if (t == "face_refine") add(out, {"Face Refinement", "YuNet", AiRole::Enhanced});
     else if (t == "blemish_remover") add(out, {"Blemish Remover", "YuNet", AiRole::Enhanced});
     else if (t == "relight") add(out, {"Relight", "Depth Anything V2", AiRole::Enhanced});
