@@ -676,7 +676,8 @@ void InspectorWidget::buildGradeNodes(const Clip& clip, const std::function<Fram
                 f->addRow(QString(), more);
             }
             if (sn) {
-                buildEffectStack(clipId, TrackKind::Video, effects, localTime, key);  // (its settings: the clip's own)
+                // Its settings (the clip's own: effects go into the shared node, below).
+                buildEffectStack(clipId, TrackKind::Video, effects, localTime, key, false);
                 const std::vector<Effect> shared = sn->effects;
                 buildEffectStack(sn->id, TrackKind::Video, shared, localTime);
             } else {
@@ -740,7 +741,7 @@ void InspectorWidget::buildChain(Id owner) {
 }
 
 void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vector<Effect>& effects,
-                                       const std::function<FrameTime()>& localTime, int node) {
+                                       const std::function<FrameTime()>& localTime, int node, bool addMenu) {
     auto target = [&](Id effectId) {
         Target t;
         t.resolve = [owner, effectId](Sequence& s) -> Effect* { return edit::ownedEffect(s, owner, effectId); };
@@ -1182,7 +1183,10 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             mutateStack(tr("Reorder Effects"), [](std::vector<Effect>& v, size_t k, Project&) {
                 for (size_t j = k; j-- > 0;)
                     if (v[j].node == v[k].node) {
-                        std::swap(v[k], v[j]);
+                        // (taken out and put back before it: the effects between keep their places around the graph)
+                        Effect moved = std::move(v[k]);
+                        v.erase(v.begin() + long(k));
+                        v.insert(v.begin() + long(j), std::move(moved));
                         break;
                     }
             });
@@ -1191,7 +1195,9 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             mutateStack(tr("Reorder Effects"), [](std::vector<Effect>& v, size_t k, Project&) {
                 for (size_t j = k + 1; j < v.size(); ++j)
                     if (v[j].node == v[k].node) {
-                        std::swap(v[k], v[j]);
+                        Effect moved = std::move(v[k]);
+                        v.erase(v.begin() + long(k));
+                        v.insert(v.begin() + long(j), std::move(moved));
                         break;
                     }
             });
@@ -1216,7 +1222,7 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             mutateStack(tr("Remove Effect"), [](std::vector<Effect>& v, size_t k, Project&) { v.erase(v.begin() + long(k)); });
         });
     }
-    addEffectMenu(kind, owner, std::max(0, node));
+    if (addMenu) addEffectMenu(kind, owner, std::max(0, node));
 }
 
 void InspectorWidget::addEffectMenu(TrackKind kind, Id owner, int node) {

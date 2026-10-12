@@ -1253,7 +1253,7 @@ Result pasteClips(Project& p, Sequence& s, const std::vector<ClipboardItem>& ite
             c.linkGroup = g->second;
         }
         for (auto& e : c.effects) e.id = p.newId();
-        adoptSharedNodes(s, it.sharedNodes);
+        remapSharedNodes(c, adoptSharedNodes(p, s, it.sharedNodes));
         Result r = overwrite(p, s, it.track, c);
         res.created.insert(res.created.end(), r.created.begin(), r.created.end());
     }
@@ -1359,7 +1359,7 @@ Result pasteRange(Project& p, Sequence& s, const SequenceRange& r, FrameTime at,
             c.linkGroup = g->second;
         }
         for (auto& e : c.effects) e.id = p.newId();
-        adoptSharedNodes(s, it.sharedNodes);
+        remapSharedNodes(c, adoptSharedNodes(p, s, it.sharedNodes));
         const Result placed = overwrite(p, s, mapped(it.track), c);
         if (placed.ok) res.created.push_back(c.id);
     }
@@ -1576,7 +1576,7 @@ Result pasteAttributes(Project& p, Sequence& s, const Clip& from, TrackKind from
         }
         if (video && (what & AttrGrade) && fromKind == TrackKind::Video && !from.grade.empty()) {
             // The graph and its nodes' effects in place of the clip's, where its own graph ran (or after its effects).
-            adoptSharedNodes(s, sharedNodes);
+            const std::map<Id, Id> sharedIds = adoptSharedNodes(p, s, sharedNodes);
             std::vector<Effect> nodes;
             for (const Effect& e : from.effects)
                 if (e.node) nodes.push_back(e);
@@ -1587,6 +1587,7 @@ Result pasteAttributes(Project& p, Sequence& s, const Clip& from, TrackKind from
             copyEffectsOnto(p, nodes, copied);
             c.effects.insert(c.effects.begin() + std::ptrdiff_t(at), copied.begin(), copied.end());
             c.grade = from.grade;
+            remapSharedNodes(c.grade, sharedIds);
             for (GradeNode& n : c.grade.nodes)
                 if (n.shared && !findSharedNode(s, n.shared)) n.shared = 0;  // (a shared node not to be had: empty)
             changed = true;
@@ -2251,6 +2252,7 @@ Result makeCompound(Project& p, Sequence& s, const std::vector<Id>& ids, const s
         Track* src = trackAt(s, loc->track);
         Clip c = src->clips[loc->index];
         c.start -= lo;
+        adoptSharedNodes(p, nested, sharedNodesUsed(s, c));  // (its shared colour nodes go in with it)
         Track* dst = trackAt(nested, loc->track);
         dst->clips.push_back(c);
         if (loc->track.kind == TrackKind::Audio) hasAudio = true;

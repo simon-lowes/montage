@@ -1,6 +1,7 @@
 #include "ProjectIO.h"
 #include "Surround.h"
 #include "Interpretation.h"
+#include "GradeGraph.h"
 
 #include <QDir>
 #include <QFile>
@@ -792,6 +793,20 @@ Sequence sequenceFromJson(const QJsonObject& o) {
         for (const auto& e : no.value("effects").toArray()) n.effects.push_back(effectFromJson(e));
         if (n.id) s.sharedNodes.push_back(std::move(n));
     }
+    // A colour node graph that does not hold together (a file edited by hand, or damaged) is read as the stack it
+    // amounts to, and effects naming nodes not there are outside the graph, rather than not rendering at all.
+    auto settle = [](std::vector<Effect>& effects, GradeGraph& g) {
+        if (!g.empty() && !validGrade(g)) g = {};
+        std::erase_if(effects, [&](const Effect& e) { return e.type == "grade_node" && !findGradeNode(g, e.node); });
+        for (Effect& e : effects)
+            if (e.node && !findGradeNode(g, e.node)) e.node = 0;
+    };
+    for (Track& t : s.videoTracks)
+        for (Clip& c : t.clips) {
+            if (!c.grade.empty() && !validGrade(c.grade)) edit::flattenGrade(s, c.id);
+            settle(c.effects, c.grade);
+            for (GradeVersion& v : c.gradeVersions) settle(v.effects, v.grade);
+        }
     s.masterVolumeDb = o.value("masterVolumeDb").toDouble(0);
     return s;
 }

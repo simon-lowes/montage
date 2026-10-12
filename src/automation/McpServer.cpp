@@ -1630,7 +1630,7 @@ void McpServer::Impl::addTools() {
                 for (const QJsonValue& v : a.value("keys").toArray()) keys.push_back(v.toInt());
                 r = edit::addKeyMixer(s, id, keys, nodeArg(), &made);
             } else if (action == "remove") {
-                r = edit::removeGradeNode(s, id, nodeArg());
+                r = edit::removeGradeNode(l.project, s, id, nodeArg());
             } else if (action == "connect") {
                 r = edit::connectGradeNodes(s, id, {a.value("from").toInt(), a.value("to").toInt(), a.value("input").toInt(), a.value("key").toBool()});
             } else if (action == "disconnect") {
@@ -1660,7 +1660,7 @@ void McpServer::Impl::addTools() {
                 }
             } else if (action == "move_effect") {
                 if (!a.value("effect").isDouble()) throw ArgError{"\"effect\" must be an effect id on the clip"};
-                r = edit::moveEffectToNode(s, id, Id(a.value("effect").toDouble()), a.value("node").toInt());
+                r = edit::moveEffectToNode(l.project, s, id, Id(a.value("effect").toDouble()), a.value("node").toInt());
             } else if (action == "share") {
                 r = edit::shareGradeNode(l.project, s, id, nodeArg(), str(a, "name").toStdString(), &madeShared);
             } else if (action == "use_shared") {

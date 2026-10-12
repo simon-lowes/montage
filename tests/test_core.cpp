@@ -2124,19 +2124,19 @@ private slots:
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
         Clip c = makeGeneratorClip(p, "color", 60);
-        c.effects = {makeEffect(p, "color_correct"), makeEffect(p, "gaussian_blur"), makeEffect(p, "curves")};
+        c.effects = {makeEffect(p, "gaussian_blur"), makeEffect(p, "color_correct"), makeEffect(p, "curves")};
         QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok);
         const Id id = s.videoTracks[0].clips.front().id;
         auto clip = [&]() -> Clip& { return *edit::clipById(s, id); };
-        // Converted: a node for each colour effect, in series; the blur stays outside the graph.
+        // Converted: a node for each colour effect, in series; the blur before them stays outside the graph.
         QVERIFY(edit::convertToNodes(s, id).ok);
         QVERIFY(!edit::convertToNodes(s, id).ok);
         const GradeGraph& g = clip().grade;
         QCOMPARE(g.nodes.size(), size_t(2));
         QVERIFY(validGrade(g) && serialGrade(g));
         QCOMPARE(gradeOrder(g), (std::vector<int>{1, 2}));
-        QCOMPARE(clip().effects[0].node, 1);
-        QCOMPARE(clip().effects[1].node, 0);
+        QCOMPARE(clip().effects[0].node, 0);
+        QCOMPARE(clip().effects[1].node, 1);
         QCOMPARE(clip().effects[2].node, 2);
         QCOMPARE(gradeNodeEffects(s, clip(), 2).at(0)->type, std::string("curves"));
         QVERIFY(isGradeEffect(clip().effects[2]));
@@ -2170,13 +2170,13 @@ private slots:
         QVERIFY(edit::connectGradeNodes(s, id, {1, 2, 1, true}).ok);  // node 1's key into node 2's key input
         QVERIFY(validGrade(clip().grade));
         // Removing the parallel nodes: the mixer left with one picture goes too, and node 3 feeds node 2 again.
-        QVERIFY(edit::removeGradeNode(s, id, n6).ok);
+        QVERIFY(edit::removeGradeNode(p, s, id, n6).ok);
         QVERIFY(findGradeNode(clip().grade, m));
-        QVERIFY(edit::removeGradeNode(s, id, n4).ok);
+        QVERIFY(edit::removeGradeNode(p, s, id, n4).ok);
         QVERIFY(!findGradeNode(clip().grade, m));
         QCOMPARE(gradeLinkInto(clip().grade, 2, 0)->from, 3);
         // Removing node 1: node 3 takes the clip's picture, and node 1's key and effect go.
-        QVERIFY(edit::removeGradeNode(s, id, 1).ok);
+        QVERIFY(edit::removeGradeNode(p, s, id, 1).ok);
         QCOMPARE(gradeLinkInto(clip().grade, 3, 0)->from, 0);
         QVERIFY(!gradeLinkInto(clip().grade, 2, 1));
         QCOMPARE(clip().effects.size(), size_t(2));
@@ -2192,9 +2192,9 @@ private slots:
             if (n.kind == "layer") QCOMPARE(n.blend, std::vector<std::string>{"normal"});
         // An effect moved into a node and out; a node renamed and switched off.
         const Id blur = clip().effects[0].id;
-        QVERIFY(edit::moveEffectToNode(s, id, blur, 3).ok);
+        QVERIFY(edit::moveEffectToNode(p, s, id, blur, 3).ok);
         QCOMPARE(gradeNodeEffects(s, clip(), 3).size(), size_t(1));
-        QVERIFY(!edit::moveEffectToNode(s, id, blur, 99).ok);
+        QVERIFY(!edit::moveEffectToNode(p, s, id, blur, 99).ok);
         GradeNode renamed = *findGradeNode(clip().grade, 3);
         renamed.label = "Skin";
         renamed.enabled = false;
@@ -2343,6 +2343,106 @@ private slots:
         mixer.blend = {"multiply", "screen"};
         QVERIFY(edit::setGradeNode(s, a, mixer).ok);
         QCOMPARE(findGradeNode(clip(a).grade, mixer.key)->blend, std::vector<std::string>{"multiply"});
+    }
+
+    void gradeGraphKeepsItsPlace() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        Clip c = makeGeneratorClip(p, "color", 30);
+        c.effects = {makeEffect(p, "color_correct"), makeEffect(p, "posterize"), makeEffect(p, "curves"), makeEffect(p, "gaussian_blur")};
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok);
+        const Id id = s.videoTracks[0].clips[0].id;
+        auto clip = [&]() -> Clip& { return *edit::clipById(*p.active(), id); };
+        auto types = [&](const std::vector<Effect>& fx) {
+            std::string out;
+            for (const Effect& e : fx) out += e.type + (e.node ? "@" + std::to_string(e.node) : std::string()) + " ";
+            return out;
+        };
+        // Converted: what runs between two colour effects is a node too (so the graph, where the first ran, renders the
+        // same); what comes after them stays outside.
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        QCOMPARE(types(clip().effects), std::string("color_correct@1 posterize@2 curves@3 gaussian_blur "));
+        // Shared, and moved out of a node: the graph still runs before the blur.
+        Id shared = 0;
+        QVERIFY(edit::shareGradeNode(p, s, id, 1, "Look", &shared).ok);
+        QVERIFY(edit::moveEffectToNode(p, s, id, clip().effects[0].id, 0).ok);  // the posterize, out after the graph
+        QCOMPARE(types(clip().effects), std::string("curves@3 posterize gaussian_blur "));
+        QVERIFY(edit::moveEffectToNode(p, s, id, clip().effects[0].id, 0).ok);  // the curves: no own node effects left
+        QCOMPARE(types(clip().effects), std::string("grade_node@1 curves posterize gaussian_blur "));  // held in place
+        // Flattened with only a shared node's effects: they come back where the graph ran.
+        QVERIFY(edit::flattenGrade(s, id).ok);
+        QCOMPARE(types(clip().effects), std::string("color_correct curves posterize gaussian_blur "));
+        // A node's window goes onto its effects when flattened.
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        QVERIFY(edit::setGradeNodeParams(p, s, id, 1, {{"mask.shape", 2}}).ok);
+        QVERIFY(edit::flattenGrade(s, id).ok);
+        QCOMPARE(clip().effects[0].p("mask.shape", 0), 2.0);
+        // Layer mixer inputs keep their blend modes when one goes, and a mixer's input past the next is refused.
+        clip().effects = {makeEffect(p, "color_correct")};
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        int a = 0, b = 0;
+        QVERIFY(edit::addGradeNode(p, s, id, edit::NodeHow::Layer, 1, &a).ok);
+        QVERIFY(edit::addGradeNode(p, s, id, edit::NodeHow::Layer, 1, &b).ok);
+        int mixer = 0;
+        for (const GradeNode& n : clip().grade.nodes)
+            if (n.kind == "layer") mixer = n.key;
+        GradeNode m = *findGradeNode(clip().grade, mixer);
+        m.blend = {"multiply", "screen"};
+        QVERIFY(edit::setGradeNode(s, id, m).ok);
+        QVERIFY(!edit::connectGradeNodes(s, id, {0, mixer, 9, false}).ok);
+        QVERIFY(edit::removeGradeNode(p, s, id, a).ok);
+        QCOMPARE(findGradeNode(clip().grade, mixer)->blend, std::vector<std::string>{"screen"});
+        QCOMPARE(gradeLinkInto(clip().grade, mixer, 1)->from, b);
+        // A key mixer left with no keys goes.
+        int k = 0;
+        QVERIFY(edit::addKeyMixer(s, id, {b}, 1, &k).ok);
+        QVERIFY(edit::removeGradeNode(p, s, id, b).ok);
+        QVERIFY(!findGradeNode(clip().grade, k));
+        QVERIFY(validGrade(clip().grade));
+        // Presets hold a stack: a node's settings dropped, its effects outside any node.
+        EffectPreset preset;
+        preset.effects = clip().effects;
+        preset.effects.push_back(makeEffect(p, "grade_node"));
+        preset.effects.back().node = 1;
+        Clip plain = makeGeneratorClip(p, "color", 10);
+        QCOMPARE(applyPreset(p, plain, preset), int(clip().effects.size()));
+        for (const Effect& e : plain.effects) QVERIFY(e.node == 0 && e.type != "grade_node");
+        // Nested: the shared node goes into the compound's sequence with the clip.
+        QVERIFY(edit::shareGradeNode(p, s, id, 1, "Look", &shared).ok);
+        QCOMPARE(sharedNodesUsed(s, clip()).size(), size_t(1));
+        QVERIFY(edit::addGradeVersion(p, s, id, "Bare", true).ok);
+        QCOMPARE(sharedNodesUsed(s, clip()).size(), size_t(1));  // (from the version put aside)
+        QVERIFY(edit::switchGradeVersion(s, id, 0).ok);
+        // Pasted from another project: a fresh id for its shared node, which the pasted clip shows.
+        Project other = makeDefaultProject();
+        other.nextId = 5;
+        const auto items = edit::copyClips(s, {id});
+        QVERIFY(edit::pasteClips(other, *other.active(), items, 0, false).ok);
+        const Sequence& os = *other.active();
+        QCOMPARE(os.sharedNodes.size(), size_t(1));
+        QVERIFY(os.sharedNodes[0].id != shared && os.sharedNodes[0].id < other.nextId);
+        QCOMPARE(findGradeNode(os.videoTracks[0].clips[0].grade, 1)->shared, os.sharedNodes[0].id);
+        QVERIFY(edit::makeCompound(p, *p.active(), {id}, "Nest").ok);
+        const Sequence* nest = nullptr;
+        for (const Sequence& q : p.sequences)
+            if (q.name == "Nest") nest = &q;
+        QVERIFY(nest && nest->sharedNodes.size() == 1 && nest->sharedNodes[0].id == shared);
+        // A graph that does not hold together is read as its stack.
+        Project broken;
+        QVERIFY(projectFromJson(projectToJson(p), broken));
+        Clip* inNest = nullptr;
+        for (Sequence& q : broken.sequences)
+            if (q.name == "Nest") inNest = &q.videoTracks[0].clips[0];
+        QVERIFY(inNest && !inNest->grade.empty());
+        inNest->grade.links.clear();  // (the output unfed)
+        Project again;
+        QVERIFY(projectFromJson(projectToJson(broken), again));
+        for (const Sequence& q : again.sequences)
+            if (q.name == "Nest") {
+                QVERIFY(q.videoTracks[0].clips[0].grade.empty());
+                QCOMPARE(q.videoTracks[0].clips[0].effects.at(0).type, std::string("color_correct"));
+                QCOMPARE(q.videoTracks[0].clips[0].effects.at(0).node, 0);
+            }
     }
 
     void colorGroups() {

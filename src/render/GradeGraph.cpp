@@ -150,9 +150,10 @@ void applyGradeGraph(const Sequence& s, const Clip& c, FrameTime lt, Image& img,
             }
             st.key = std::move(m);
         } else if (n->kind == "key_mixer") {
-            // Its keys added (where any of them is).
-            std::vector<float> k(N, 0.0f);
-            for (const GradeLink* l : inputsOf(key)) {
+            // Its keys added (where any of them is); none: no key (everywhere).
+            const std::vector<const GradeLink*> ins = inputsOf(key);
+            std::vector<float> k(ins.empty() ? 0 : N, 0.0f);
+            for (const GradeLink* l : ins) {
                 const std::vector<float>* in = keyFrom(l);
                 for (size_t i = 0; i < N; ++i) k[i] = std::min(1.0f, k[i] + (in ? keyAt(*in, i) : 1.0f));
             }

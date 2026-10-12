@@ -7,6 +7,7 @@
 // colour effect a node of its own, in series, which renders the same.
 #pragma once
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -39,10 +40,16 @@ std::vector<const Effect*> gradeNodeEffects(const Sequence& s, const Clip& c, in
 const SharedNode* findSharedNode(const Sequence& s, Id id);
 // "Node 2", or its label.
 std::string gradeNodeName(const GradeNode& n);
-// The shared nodes the clip's graph shows (copied with it to another sequence), and those of `nodes` the sequence
-// lacks added to it.
+// The shared nodes the clip's graphs show (its grade versions' too; copied with it to another sequence). Adopting
+// them: those the sequence lacks added to it, under fresh ids when they come from another project; the ids to give
+// the pasted clips' nodes (remapSharedNodes).
 std::vector<SharedNode> sharedNodesUsed(const Sequence& s, const Clip& c);
-void adoptSharedNodes(Sequence& s, const std::vector<SharedNode>& nodes);
+std::map<Id, Id> adoptSharedNodes(Project& p, Sequence& s, const std::vector<SharedNode>& nodes);
+void remapSharedNodes(Clip& c, const std::map<Id, Id>& ids);
+void remapSharedNodes(GradeGraph& g, const std::map<Id, Id>& ids);
+// The clip's effects as a stack: its nodes' effects (shared ones copied in) in the order the graph runs them, where
+// it runs them, its nodes' settings dropped. Its effects as they are when it has no graph.
+std::vector<Effect> flattenedEffects(const Sequence& s, const Clip& c);
 // The clips whose graphs show shared node `id`.
 int sharedNodeUsers(const Sequence& s, Id id);
 
@@ -59,7 +66,7 @@ Result addGradeNode(Project& p, Sequence& s, Id clip, NodeHow how, int anchor = 
 // A key mixer joining the keys of `keys` (correctors or mixers), and its key into corrector `to`'s key input.
 Result addKeyMixer(Sequence& s, Id clip, const std::vector<int>& keys, int to, int* created = nullptr);
 // The node gone (its effects with it), what it fed taking what fed it.
-Result removeGradeNode(Sequence& s, Id clip, int key);
+Result removeGradeNode(Project& p, Sequence& s, Id clip, int key);
 // A link (replacing the one into the same input); refused when the graph would not hold together.
 Result connectGradeNodes(Sequence& s, Id clip, const GradeLink& link);
 // The link into `to`'s input `input` gone (not the output's).
@@ -67,7 +74,7 @@ Result disconnectGradeNodes(Sequence& s, Id clip, int to, int input);
 // A node's label, switch, blend modes and place (by its key; its kind and sharing are kept).
 Result setGradeNode(Sequence& s, Id clip, const GradeNode& node);
 // The effect into corrector `key` (0: outside the graph, after it).
-Result moveEffectToNode(Sequence& s, Id clip, Id effect, int key);
+Result moveEffectToNode(Project& p, Sequence& s, Id clip, Id effect, int key);
 // No graph: the nodes' effects stay, as a stack; the nodes' settings go.
 Result flattenGrade(Sequence& s, Id clip);
 // Corrector `key`'s effects into a new shared node named `name`, which the node then shows.

@@ -150,15 +150,121 @@ std::string gradeNodeName(const GradeNode& n) {
 
 std::vector<SharedNode> sharedNodesUsed(const Sequence& s, const Clip& c) {
     std::vector<SharedNode> out;
-    for (const GradeNode& n : c.grade.nodes)
-        if (const SharedNode* sn = findSharedNode(s, n.shared))
-            if (std::none_of(out.begin(), out.end(), [&](const SharedNode& x) { return x.id == sn->id; })) out.push_back(*sn);
+    auto take = [&](const GradeGraph& g) {
+        for (const GradeNode& n : g.nodes)
+            if (const SharedNode* sn = findSharedNode(s, n.shared))
+                if (std::none_of(out.begin(), out.end(), [&](const SharedNode& x) { return x.id == sn->id; })) out.push_back(*sn);
+    };
+    take(c.grade);
+    for (const GradeVersion& v : c.gradeVersions) take(v.grade);
     return out;
 }
 
-void adoptSharedNodes(Sequence& s, const std::vector<SharedNode>& nodes) {
-    for (const SharedNode& n : nodes)
-        if (!findSharedNode(s, n.id)) s.sharedNodes.push_back(n);
+std::map<Id, Id> adoptSharedNodes(Project& p, Sequence& s, const std::vector<SharedNode>& nodes) {
+    std::map<Id, Id> ids;
+    for (const SharedNode& n : nodes) {
+        if (findSharedNode(s, n.id)) {
+            ids[n.id] = n.id;
+            continue;
+        }
+        // One of this project's (from another of its sequences) keeps its id; one from elsewhere gets fresh ids, which
+        // could otherwise be anything's here.
+        bool ours = false;
+        for (const Sequence& q : p.sequences) ours = ours || findSharedNode(q, n.id);
+        SharedNode copy = n;
+        if (!ours) {
+            copy.id = p.newId();
+            for (Effect& e : copy.effects) e.id = p.newId();
+        }
+        ids[n.id] = copy.id;
+        s.sharedNodes.push_back(std::move(copy));
+    }
+    return ids;
+}
+
+void remapSharedNodes(GradeGraph& g, const std::map<Id, Id>& ids) {
+    for (GradeNode& n : g.nodes)
+        if (auto it = ids.find(n.shared); n.shared && it != ids.end()) n.shared = it->second;
+}
+
+void remapSharedNodes(Clip& c, const std::map<Id, Id>& ids) {
+    remapSharedNodes(c.grade, ids);
+    for (GradeVersion& v : c.gradeVersions) remapSharedNodes(v.grade, ids);
+}
+
+namespace {
+
+// How many effects outside the graph run before it (it runs where its first node's effect is, else after them all).
+size_t graphSlot(const Clip& c) {
+    size_t n = 0;
+    for (const Effect& e : c.effects) {
+        if (e.node) return n;
+        ++n;
+    }
+    return n;
+}
+
+// The nodes' effects together after `slot` effects outside the graph, so an edit taking or adding node effects
+// leaves the graph where it ran; a graph whose nodes have no effects of their own there (all shared, or empty) is held
+// there by the first corrector's settings.
+void keepGraphAt(Project& p, Clip& c, size_t slot) {
+    if (c.grade.empty()) return;
+    std::vector<Effect> outside, inside;
+    for (Effect& e : c.effects) (e.node ? inside : outside).push_back(std::move(e));
+    slot = std::min(slot, outside.size());
+    if (inside.empty() && slot < outside.size()) {
+        for (int key : gradeOrder(c.grade))
+            if (const GradeNode* n = findGradeNode(c.grade, key); n && n->kind == "corrector") {
+                Effect anchor = makeEffect(p, "grade_node");
+                anchor.node = key;
+                inside.push_back(std::move(anchor));
+                break;
+            }
+    }
+    c.effects.clear();
+    c.effects.insert(c.effects.end(), std::make_move_iterator(outside.begin()), std::make_move_iterator(outside.begin() + std::ptrdiff_t(slot)));
+    c.effects.insert(c.effects.end(), std::make_move_iterator(inside.begin()), std::make_move_iterator(inside.end()));
+    c.effects.insert(c.effects.end(), std::make_move_iterator(outside.begin() + std::ptrdiff_t(slot)), std::make_move_iterator(outside.end()));
+}
+
+}  // namespace
+
+std::vector<Effect> flattenedEffects(const Sequence& s, const Clip& c) {
+    if (c.grade.empty()) return c.effects;
+    std::vector<Effect> graph;
+    // (a graph that does not hold together: every node, in their order)
+    std::vector<int> order = gradeOrder(c.grade);
+    if (!validGrade(c.grade)) {
+        order.clear();
+        for (const GradeNode& n : c.grade.nodes) order.push_back(n.key);
+    }
+    for (int key : order) {
+        const GradeNode* n = findGradeNode(c.grade, key);
+        if (!n || n->kind != "corrector") continue;
+        // A node's window goes onto its effects without one of their own (its key input and mix cannot follow).
+        const Effect* st = gradeNodeSettings(c, key);
+        const bool window = st && st->enabled && hasMask(*st, 0);
+        for (const Effect* x : gradeNodeEffects(s, c, key)) {
+            Effect copy = *x;
+            copy.node = 0;
+            copy.enabled = copy.enabled && n->enabled;
+            if (window && !hasMask(copy, 0))
+                for (const auto& [name, prm] : st->params)
+                    if (name.rfind("mask.", 0) == 0) copy.params[name] = prm;
+            if (window && !hasMask(copy, 0)) copy.strings.insert(st->strings.begin(), st->strings.end());
+            graph.push_back(copy);
+        }
+    }
+    std::vector<Effect> out;
+    const size_t slot = graphSlot(c);
+    size_t seen = 0;
+    for (const Effect& e : c.effects) {
+        if (e.node) continue;
+        if (seen++ == slot) out.insert(out.end(), graph.begin(), graph.end());
+        out.push_back(e);
+    }
+    if (seen <= slot) out.insert(out.end(), graph.begin(), graph.end());
+    return out;
 }
 
 int sharedNodeUsers(const Sequence& s, Id id) {
@@ -199,6 +305,18 @@ Result changeGraph(Clip& c, const std::function<Result(GradeGraph&)>& change) {
     return {};
 }
 
+// A mixer's inputs numbered 0, 1, 2... in their order (a layer mixer's blend modes one for each after the first);
+// how many it has.
+size_t compactInputs(GradeGraph& g, int mixer) {
+    std::vector<GradeLink*> ins;
+    for (GradeLink& x : g.links)
+        if (x.to == mixer) ins.push_back(&x);
+    std::sort(ins.begin(), ins.end(), [](const GradeLink* a, const GradeLink* b) { return a->input < b->input; });
+    for (size_t i = 0; i < ins.size(); ++i) ins[i]->input = int(i);
+    if (GradeNode* m = findGradeNode(g, mixer); m && m->kind == "layer") m->blend.resize(ins.empty() ? 0 : ins.size() - 1, "normal");
+    return ins.size();
+}
+
 // Where a new node goes on screen: right of `anchor` (lower when beside it).
 void placeNear(GradeGraph& g, GradeNode& n, int anchor, bool below) {
     const GradeNode* a = findGradeNode(g, anchor);
@@ -214,8 +332,14 @@ Result convertToNodes(Sequence& s, Id clip) {
     if (!c->grade.empty()) return Result::fail("The clip's grade is in nodes already");
     GradeGraph g;
     int key = 0;
-    for (Effect& e : c->effects) {
-        if (!isGradeEffect(e) || e.type == "grade_node") continue;
+    // The colour effects and whatever runs between them (a blur between two corrections): each a node, so the graph,
+    // running where the first one was, renders the same.
+    auto colour = [](const Effect& e) { return isGradeEffect(e) && e.type != "grade_node"; };
+    const auto first = std::find_if(c->effects.begin(), c->effects.end(), colour);
+    const auto last = std::find_if(c->effects.rbegin(), c->effects.rend(), colour).base();
+    for (auto it = first; it < last; ++it) {
+        Effect& e = *it;
+        if (e.type == "grade_node" || e.type == "stabilize" || e.type == "rolling_shutter" || e.type == "lens_correction") continue;
         e.node = ++key;
         GradeNode n;
         n.key = key;
@@ -245,6 +369,7 @@ Result addGradeNode(Project& p, Sequence& s, Id clip, NodeHow how, int anchor, i
     const GradeNode* at = anchor ? findGradeNode(c->grade, anchor) : nullptr;
     if (anchor && !at) return Result::fail("No such node");
     if (at && at->kind == "key_mixer") return Result::fail("A key mixer gives a key: add the node after a corrector or mixer");
+    const size_t slot = graphSlot(*c);
     int key = nextGradeNodeKey(c->grade);
     const int made = key;
     Result r = changeGraph(*c, [&](GradeGraph& g) -> Result {
@@ -308,6 +433,7 @@ Result addGradeNode(Project& p, Sequence& s, Id clip, NodeHow how, int anchor, i
         settings.params["key_invert"] = Param(1.0);
         c->effects.push_back(settings);
     }
+    keepGraphAt(p, *c, slot);
     if (created) *created = made;
     return {};
 }
@@ -335,38 +461,34 @@ Result addKeyMixer(Sequence& s, Id clip, const std::vector<int>& keys, int to, i
     return r;
 }
 
-Result removeGradeNode(Sequence& s, Id clip, int key) {
+Result removeGradeNode(Project& p, Sequence& s, Id clip, int key) {
     Clip* c = videoClip(s, clip);
     if (!c) return Result::fail("No such clip");
     if (!findGradeNode(c->grade, key)) return Result::fail("No such node");
+    const size_t slot = graphSlot(*c);
     Result r = changeGraph(*c, [&](GradeGraph& g) -> Result {
         // Takes a node out: what its picture fed takes what fed its picture (a mixer's first input) instead, a
         // mixer it fed loses that input, and its keys go.
         std::function<void(int)> remove = [&](int k) {
             const GradeLink* in = gradeLinkInto(g, k, 0);
             const int source = in && !in->key ? in->from : 0;
-            std::vector<int> mixers;
+            std::vector<std::pair<int, int>> mixers;  // the mixers it fed, and which input
             for (GradeLink& l : g.links)
-                if (l.from == k && !l.key) {
-                    if (const GradeNode* m = findGradeNode(g, l.to); m && isGradeMixer(*m)) mixers.push_back(m->key);
-                    else l.from = source;
+                if (l.from == k) {
+                    if (const GradeNode* m = findGradeNode(g, l.to); m && m->kind != "corrector") mixers.push_back({m->key, l.input});
+                    else if (!l.key) l.from = source;
                 }
             std::erase_if(g.links, [&](const GradeLink& l) {
                 return l.to == k || l.from == k;  // (its own inputs, its keys and its pictures into mixers)
             });
             std::erase_if(g.nodes, [&](const GradeNode& x) { return x.key == k; });
-            for (int m : mixers) {
-                if (!findGradeNode(g, m)) continue;
-                std::vector<GradeLink*> ins;
-                for (GradeLink& x : g.links)
-                    if (x.to == m) ins.push_back(&x);
-                std::sort(ins.begin(), ins.end(), [](const GradeLink* a, const GradeLink* b) { return a->input < b->input; });
-                for (size_t i = 0; i < ins.size(); ++i) ins[i]->input = int(i);
-                if (ins.size() <= 1) {
-                    remove(m);  // (a mixer of one picture passes it on)
-                } else if (GradeNode* mn = findGradeNode(g, m); mn->kind == "layer") {
-                    mn->blend.resize(ins.size() - 1, "normal");
-                }
+            for (const auto& [m, input] : mixers) {
+                GradeNode* mn = findGradeNode(g, m);
+                if (!mn) continue;
+                // Each remaining input keeps its blend mode (the first input has none).
+                if (mn->kind == "layer" && !mn->blend.empty()) mn->blend.erase(mn->blend.begin() + std::clamp<std::ptrdiff_t>(input - 1, 0, std::ptrdiff_t(mn->blend.size()) - 1));
+                const size_t left = compactInputs(g, m);
+                if (mn->kind == "key_mixer" ? left == 0 : left <= 1) remove(m);  // (a mixer of one picture passes it on; a key mixer of none goes)
             }
         };
         remove(key);
@@ -376,6 +498,7 @@ Result removeGradeNode(Sequence& s, Id clip, int key) {
     std::set<int> left;
     for (const GradeNode& n : c->grade.nodes) left.insert(n.key);
     std::erase_if(c->effects, [&](const Effect& e) { return e.node && !left.count(e.node); });
+    keepGraphAt(p, *c, slot);
     return {};
 }
 
@@ -383,6 +506,11 @@ Result connectGradeNodes(Sequence& s, Id clip, const GradeLink& link) {
     Clip* c = videoClip(s, clip);
     if (!c || c->grade.empty()) return Result::fail("The clip has no nodes");
     if (const GradeLink* l = gradeLinkInto(c->grade, link.to, link.input); l && *l == link) return Result::fail("");
+    if (const GradeNode* m = findGradeNode(c->grade, link.to); m && m->kind != "corrector") {
+        int inputs = 0;
+        for (const GradeLink& l : c->grade.links) inputs += l.to == link.to;
+        if (link.input > inputs) return Result::fail("A mixer's inputs are numbered from 0: the next one is " + std::to_string(inputs));
+    }
     return changeGraph(*c, [&](GradeGraph& g) -> Result {
         std::erase_if(g.links, [&](const GradeLink& l) { return l.to == link.to && l.input == link.input; });
         g.links.push_back(link);
@@ -399,6 +527,11 @@ Result disconnectGradeNodes(Sequence& s, Id clip, int to, int input) {
     if (!gradeLinkInto(c->grade, to, input)) return Result::fail("");
     return changeGraph(*c, [&](GradeGraph& g) -> Result {
         std::erase_if(g.links, [&](const GradeLink& l) { return l.to == to && l.input == input; });
+        if (GradeNode* m = findGradeNode(g, to); m && m->kind != "corrector") {
+            if (m->kind == "layer" && input >= 1 && size_t(input - 1) < m->blend.size()) m->blend.erase(m->blend.begin() + (input - 1));
+            else if (m->kind == "layer" && input == 0 && !m->blend.empty()) m->blend.erase(m->blend.begin());
+            compactInputs(g, to);
+        }
         return {};
     });
 }
@@ -424,9 +557,10 @@ Result setGradeNode(Sequence& s, Id clip, const GradeNode& node) {
     return {};
 }
 
-Result moveEffectToNode(Sequence& s, Id clip, Id effect, int key) {
+Result moveEffectToNode(Project& p, Sequence& s, Id clip, Id effect, int key) {
     Clip* c = videoClip(s, clip);
     if (!c) return Result::fail("No such clip");
+    const size_t slot = graphSlot(*c);
     if (key) {
         const GradeNode* n = findGradeNode(c->grade, key);
         if (!n || n->kind != "corrector") return Result::fail("Effects go into a corrector node");
@@ -436,7 +570,16 @@ Result moveEffectToNode(Sequence& s, Id clip, Id effect, int key) {
         if (e.id == effect) {
             if (e.type == "grade_node") return Result::fail("That is a node's own settings");
             if (e.node == key) return Result::fail("");
+            const bool out = e.node && !key;
             e.node = key;
+            if (out) {
+                // Outside the graph, after it.
+                Effect moved = std::move(e);
+                std::erase_if(c->effects, [&](const Effect& x) { return x.id == effect; });
+                auto last = std::find_if(c->effects.rbegin(), c->effects.rend(), [](const Effect& x) { return x.node != 0; });
+                c->effects.insert(last.base(), std::move(moved));
+            }
+            keepGraphAt(p, *c, slot);
             return {};
         }
     return Result::fail("No such effect");
@@ -446,27 +589,8 @@ Result flattenGrade(Sequence& s, Id clip) {
     Clip* c = videoClip(s, clip);
     if (!c) return Result::fail("No such clip");
     if (c->grade.empty()) return Result::fail("");
-    // The nodes' effects in the order the graph ran them (shared nodes' copied in), then the rest.
-    std::vector<Effect> out;
-    std::vector<Effect> own;
-    bool placed = false;
-    for (const Effect& e : c->effects) {
-        if (e.type == "grade_node") continue;
-        if (e.node && !placed) {
-            placed = true;
-            for (int key : gradeOrder(c->grade)) {
-                const GradeNode* n = findGradeNode(c->grade, key);
-                if (!n || n->kind != "corrector") continue;
-                for (const Effect* x : gradeNodeEffects(s, *c, key)) {
-                    Effect copy = *x;
-                    copy.node = 0;
-                    out.push_back(copy);
-                }
-            }
-        }
-        if (!e.node) out.push_back(e);
-    }
-    c->effects = std::move(out);
+    // (where the graph ran; a node switched off adds nothing)
+    c->effects = flattenedEffects(s, *c);
     c->grade = {};
     return {};
 }
@@ -477,6 +601,7 @@ Result shareGradeNode(Project& p, Sequence& s, Id clip, int key, const std::stri
     GradeNode* n = findGradeNode(c->grade, key);
     if (!n || n->kind != "corrector") return Result::fail("Only a corrector node can be shared");
     if (n->shared) return Result::fail("That node is shared already");
+    const size_t slot = graphSlot(*c);
     SharedNode sn;
     sn.id = p.newId();
     sn.name = name.empty() ? "Shared Node " + std::to_string(s.sharedNodes.size() + 1) : name;
@@ -496,6 +621,7 @@ Result shareGradeNode(Project& p, Sequence& s, Id clip, int key, const std::stri
     if (n->label.empty()) n->label = sn.name;
     if (created) *created = sn.id;
     s.sharedNodes.push_back(std::move(sn));
+    keepGraphAt(p, *c, slot);
     return {};
 }
 
@@ -517,6 +643,7 @@ Result unshareGradeNode(Project& p, Sequence& s, Id clip, int key) {
     if (!c) return Result::fail("No such clip");
     GradeNode* n = findGradeNode(c->grade, key);
     if (!n || !n->shared) return Result::fail("That node is not shared");
+    const size_t slot = graphSlot(*c);
     if (const SharedNode* sn = findSharedNode(s, n->shared)) {
         if (n->label == sn->name) n->label.clear();
         for (const Effect& e : sn->effects) {
@@ -527,6 +654,7 @@ Result unshareGradeNode(Project& p, Sequence& s, Id clip, int key) {
         }
     }
     n->shared = 0;
+    keepGraphAt(p, *c, slot);
     return {};
 }
 
@@ -568,6 +696,7 @@ Result setGradeNodeParams(Project& p, Sequence& s, Id clip, int key, const std::
     Effect* settings = nullptr;
     for (Effect& e : c->effects)
         if (e.node == key && e.type == "grade_node") settings = &e;
+    const size_t slot = graphSlot(*c);
     if (!settings) {
         Effect e = makeEffect(p, "grade_node");
         e.node = key;
@@ -575,6 +704,7 @@ Result setGradeNodeParams(Project& p, Sequence& s, Id clip, int key, const std::
         settings = &c->effects.back();
     }
     for (const auto& [name, v] : values) settings->params[name] = Param(v);
+    keepGraphAt(p, *c, slot);
     return {};
 }
 

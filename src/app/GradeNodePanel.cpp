@@ -539,7 +539,7 @@ bool GradeNodePanel::removeSelected() {
     const Id id = clip();
     const int key = selectedNode();
     if (!id || !key) return false;
-    if (!state_->apply(tr("Remove Node"), [id, key](Project&, Sequence& s) { return edit::removeGradeNode(s, id, key); })) return false;
+    if (!state_->apply(tr("Remove Node"), [id, key](Project& p, Sequence& s) { return edit::removeGradeNode(p, s, id, key); })) return false;
     selectNode(0);
     return true;
 }

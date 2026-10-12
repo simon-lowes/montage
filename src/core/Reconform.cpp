@@ -10,7 +10,9 @@
 #include <sstream>
 
 #include "Captions.h"
+#include "GradeGraph.h"
 #include "EditOps.h"
+#include "GradeGraph.h"
 #include "History.h"
 #include "MediaLog.h"
 
@@ -535,6 +537,9 @@ ReconformResult reconformSequence(Project& p, Id sourceId, const CutChanges& cha
     auto renew = [&](Effect& e) {
         if (e.id) e.id = p.newId();
     };
+    // The copy's shared colour nodes have ids of their own (duplicateSequence): the copied clips' nodes show those.
+    std::map<Id, Id> sharedIds;
+    for (size_t i = 0; i < source.sharedNodes.size() && i < out.sharedNodes.size(); ++i) sharedIds[source.sharedNodes[i].id] = out.sharedNodes[i].id;
     std::map<std::pair<size_t, Id>, Id> groups;  // (stretch, link group) -> the copies' link group
     std::map<std::pair<size_t, Id>, Id> copies;  // (stretch, source clip) -> its copy there
     auto copyClip = [&](const Clip& c, FrameTime from, FrameTime to, FrameTime shift, size_t stretch) {
@@ -548,6 +553,7 @@ ReconformResult reconformSequence(Project& p, Id sourceId, const CutChanges& cha
         }
         for (Effect* e : {&piece.generator, &piece.motion, &piece.audio, &piece.timing}) renew(*e);
         for (Effect& e : piece.effects) renew(e);
+        remapSharedNodes(piece, sharedIds);
         return piece;
     };
     auto rebuild = [&](const Track& from, Track& to) {

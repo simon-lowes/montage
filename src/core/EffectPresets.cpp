@@ -42,11 +42,15 @@ bool presetFromJson(const std::string& json, EffectPreset& out, std::string* err
 }
 
 int applyPreset(Project& p, Clip& c, const EffectPreset& preset) {
+    int added = 0;
     for (Effect e : preset.effects) {
+        if (e.type == "grade_node") continue;  // (a colour node's settings: presets hold a stack)
         e.id = p.newId();
+        e.node = 0;
         c.effects.push_back(std::move(e));
+        ++added;
     }
-    return int(preset.effects.size());
+    return added;
 }
 
 }  // namespace montage

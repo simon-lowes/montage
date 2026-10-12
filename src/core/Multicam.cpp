@@ -5,6 +5,7 @@
 #include <map>
 
 #include "Effects.h"
+#include "GradeGraph.h"
 
 namespace montage {
 
@@ -369,7 +370,8 @@ Result flattenMulticam(Project& p, Sequence& s, const std::vector<Id>& clips) {
             shiftKeyframes(own, -(t0 - c.start));
             if (!defaultParams(own.motion)) piece.motion = own.motion;
             if (!defaultParams(own.audio)) piece.audio = own.audio;
-            for (Effect e : own.effects) {
+            // (its colour nodes as a stack: the angle's clip has nodes of its own, or none)
+            for (Effect e : flattenedEffects(s, own)) {
                 e.id = p.newId();
                 piece.effects.push_back(e);
             }

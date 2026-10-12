@@ -78,6 +78,7 @@
 #include "core/Surround.h"
 #include "core/ColorGroups.h"
 #include "core/GradeVersions.h"
+#include "core/GradeGraph.h"
 #include "core/AudioChannels.h"
 #include "render/ClipPlacement.h"
 #include "core/Chapters.h"
@@ -4326,7 +4327,7 @@ QString MainWindow::saveEffectsAsPreset(const QString& name) {
     EffectPreset preset;
     preset.name = name.trimmed().isEmpty() ? c->name : name.trimmed().toStdString();
     preset.video = loc->track.kind == TrackKind::Video;
-    preset.effects = c->effects;
+    preset.effects = flattenedEffects(*s, *c);  // (colour nodes as the stack they amount to)
     QString error;
     const QString file = presets::save(preset, &error);
     if (file.isEmpty()) {
