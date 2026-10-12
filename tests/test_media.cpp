@@ -47,9 +47,12 @@
 #include "core/ClipAnimation.h"
 #include "core/GradeVersions.h"
 #include "core/MergeClips.h"
+#include "media/ContentCredentials.h"
+#include "core/Provenance.h"
 #include "media/DualSystem.h"
 #include "media/FieldRecorder.h"
 #include "media/Analysis.h"
+#include "media/Inference.h"
 #include "media/Proxy.h"
 #include "media/AudioSync.h"
 #include "media/AutoDuck.h"
@@ -68,6 +71,7 @@
 #include "render/Spherical.h"
 #include "media/SpatialAudio.h"
 #include "render/ExtendClip.h"
+#include "render/ColorChart.h"
 #include "render/ReviewExport.h"
 #include "render/Versions.h"
 #include "render/ClipPlacement.h"
@@ -563,6 +567,28 @@ static std::shared_ptr<Transcript> threeTalks(double& end) {
         }
     end = at;
     return t;
+}
+
+// A ColorChecker photographed under a warm cast, on a grey wall (640 x 360, the patch area at 120,80 300 x 200).
+static QImage castChartImage() {
+    const ChartColors& ref = colorChecker24();
+    const double cast[3][3] = {{1.15, 0.08, 0.0}, {0.02, 0.95, 0.03}, {0.0, 0.05, 0.7}};
+    QImage img(640, 360, QImage::Format_RGB32);
+    img.fill(QColor(84, 84, 84));
+    QPainter p(&img);
+    p.fillRect(QRect(112, 72, 316, 216), QColor(13, 13, 13));
+    for (int i = 0; i < 24; ++i) {
+        double rgb[3];
+        for (int c = 0; c < 3; ++c) {
+            double l = 0;
+            for (int k = 0; k < 3; ++k) l += cast[c][k] * std::pow(ref[size_t(i)][size_t(k)], 2.4);
+            rgb[c] = std::pow(std::max(0.0, l * 0.9), 1 / 2.4);
+        }
+        const double cw = 50, ch = 50;
+        p.fillRect(QRectF(120 + (i % 6) * cw + 4, 80 + (i / 6) * ch + 4, cw - 8, ch - 8),
+                   QColor::fromRgbF(float(std::min(1.0, rgb[0])), float(std::min(1.0, rgb[1])), float(std::min(1.0, rgb[2]))));
+    }
+    return img;
 }
 
 class TestMedia : public QObject {
@@ -13637,8 +13663,9 @@ private slots:
     }
 
     // A shaded red ball (70 x 50 px radii) crossing textured ground, 640 x 360 at
-    // 25 fps; returns its centre in each frame.
-    std::vector<Point2> writeBallVideo(const std::string& file, int frames) {
+    // 25 fps; returns its centre in each frame. With `second`, a blue ball too, low on the right drifting left (its
+    // centres there).
+    std::vector<Point2> writeBallVideo(const std::string& file, int frames, std::vector<Point2>* second = nullptr) {
         QImage bg(640, 360, QImage::Format_RGB32);
         std::mt19937 rng(3);
         std::normal_distribution<double> noise(0, 10);
@@ -13681,6 +13708,29 @@ private slots:
         edit::overwrite(p, s, {TrackKind::Video, 0}, cb);
         while (s.videoTracks.size() < 2) s.videoTracks.push_back(makeTrack(p, TrackKind::Video, "V2"));
         edit::overwrite(p, s, {TrackKind::Video, 1}, co);
+        if (second) {
+            QImage blue = ball;
+            for (int y = 0; y < 360; ++y)
+                for (int x = 0; x < 640; ++x) {
+                    const QColor c = blue.pixelColor(x, y);
+                    if (c.alpha()) blue.setPixelColor(x, y, QColor(c.blue(), c.green() + 60, c.red(), c.alpha()));
+                }
+            const QString bluePng = QString::fromStdString(path("blueball.png"));
+            blue.save(bluePng);
+            MediaItem m2 = probeOrFail(p, bluePng.toStdString());
+            p.media.push_back(m2);
+            Clip c2 = makeClip(p, m2, TrackKind::Video, s);
+            c2.duration = frames;
+            second->clear();
+            for (int i = 0; i < frames; ++i) {
+                const Point2 c{480.0 - 6 * i, 300};
+                second->push_back(c);
+                c2.motion.params["pos_x"].addKey(i, c.x - 320, Interp::Hold);
+                c2.motion.params["pos_y"].addKey(i, c.y - 180, Interp::Hold);
+            }
+            while (s.videoTracks.size() < 3) s.videoTracks.push_back(makeTrack(p, TrackKind::Video, "V3"));
+            edit::overwrite(p, s, {TrackKind::Video, 2}, c2);
+        }
         ExportSettings st;
         st.path = file;
         st.audioCodec = "none";
@@ -13776,6 +13826,149 @@ private slots:
         err = "x";
         QVERIFY(!trackClipObject(p, s, c, *first, 0, true, {}, &cancel, &err));
         QVERIFY(err.empty());
+    }
+
+    void objectMasksSeveralObjects() {
+        if (!segmenterAvailable()) QSKIP("Built without ONNX Runtime");
+        if (!objectModel().installed())
+            QSKIP("Set MONTAGE_OBJECT_MODEL to a folder with the EdgeTAM model files to run this test");
+        const int frames = 10;
+        const std::string video = path("balls.mp4");
+        std::vector<Point2> blue;
+        const auto red = writeBallVideo(video, frames, &blue);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 640;
+        s.height = 360;
+        s.fps = {25, 1};
+        MediaItem m = probeOrFail(p, video);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, frames, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& c = s.videoTracks[0].clips[0];
+        Effect e = makeEffect(p, "invert");
+        e.params["mask.shape"] = Param(3.0);
+        // How much of a ball the mask covers, and how much of the frame outside both balls.
+        auto inside = [](const std::vector<float>& matte, Point2 centre) {
+            double in = 0, n = 0;
+            for (int y = 0; y < 360; ++y)
+                for (int x = 0; x < 640; ++x) {
+                    const double u = (x + 0.5 - centre.x) / 70, v = (y + 0.5 - centre.y) / 50;
+                    if (u * u + v * v > 0.8) continue;
+                    in += matte[size_t(y) * 640 + size_t(x)];
+                    ++n;
+                }
+            return in / n;
+        };
+        auto matteAt = [&](int n) {
+            Image frame(640, 360);
+            frame.fill(1, 1, 1, 1);
+            return effectMatte(e, n, frame, 1.0, (n + 0.5) / 25);
+        };
+        std::string err;
+        // The red ball clicked and segmented; then a second object, the blue ball.
+        e.object = withObjectPoint(p, s, c, e, 0, {red[0].x / 640, red[0].y / 360, 1});
+        e.object = segmentClipObjectFrame(p, s, c, *e.object, 0, &err);
+        QVERIFY2(e.object, err.c_str());
+        int which = -1;
+        e.object = withNewObject(p, s, c, e, false, &which);
+        QCOMPARE(which, 1);
+        QCOMPARE(e.object->count(), 2);
+        QCOMPARE(currentObject(e, 1), 1);
+        QCOMPARE(currentObject(e, 7), 1);  // (clamped to the objects there are)
+        e.object = withObjectPoint(p, s, c, e, 0, {blue[0].x / 640, blue[0].y / 360, 1}, which);
+        QCOMPARE(int(e.object->object(1).prompts.size()), 1);
+        QCOMPARE(int(e.object->prompts.size()), 1);  // (the first object's clicks untouched)
+        e.object = segmentClipObjectFrame(p, s, c, *e.object, 0, &err, which);
+        QVERIFY2(e.object, err.c_str());
+        std::vector<float> m0 = matteAt(0);
+        QVERIFY2(inside(m0, red[0]) > 0.95 && inside(m0, blue[0]) > 0.95,
+                 qPrintable(QString("%1 %2").arg(inside(m0, red[0])).arg(inside(m0, blue[0]))));
+        // Each tracked on its own.
+        e.object = trackClipObject(p, s, c, *e.object, 0, true, {}, nullptr, &err, 1);
+        QVERIFY2(e.object, err.c_str());
+        QCOMPARE(int(e.object->object(1).frames.size()), frames);
+        QCOMPARE(int(e.object->frames.size()), 1);
+        e.object = trackClipObject(p, s, c, *e.object, 0, true, {}, nullptr, &err, 0);
+        QVERIFY2(e.object, err.c_str());
+        QCOMPARE(int(e.object->frames.size()), frames);
+        std::vector<float> m8 = matteAt(8);
+        QVERIFY2(inside(m8, red[8]) > 0.95 && inside(m8, blue[8]) > 0.95,
+                 qPrintable(QString("%1 %2").arg(inside(m8, red[8])).arg(inside(m8, blue[8]))));
+        QVERIFY(!trackClipObject(p, s, c, *e.object, 0, true, {}, nullptr, &err, 5));  // no such object
+        // Cut out: the blue ball leaves the mask.
+        e.object = withObjectSubtracted(e, 1, true);
+        m8 = matteAt(8);
+        QVERIFY(inside(m8, red[8]) > 0.95 && inside(m8, blue[8]) < 0.05);
+        QVERIFY(!withObjectSubtracted(e, 0, true)->object(0).subtract);  // the first always adds
+        // Removed: the first gone, the blue ball stays cut out, under an empty first object.
+        auto rest = withoutObject(e, 0);
+        QVERIFY(rest && rest->count() == 2 && !rest->subtract && rest->frames.empty() && rest->prompts.empty());
+        QVERIFY(rest->object(1).subtract && rest->object(1).frames.size() == size_t(frames));
+        Effect onlyCut = e;
+        onlyCut.object = rest;
+        QVERIFY(!withoutObject(onlyCut, 0));  // (that empty first removed too: nothing is left to cut from)
+        // Added back first, it takes the first's place when the first goes.
+        Effect both = e;
+        both.object = withObjectSubtracted(e, 1, false);
+        auto promoted = withoutObject(both, 0);
+        QVERIFY(promoted && promoted->count() == 1 && !promoted->subtract && promoted->frames.size() == size_t(frames));
+        QVERIFY(!withoutObject(Effect{}, 0));
+        Effect single = e;
+        single.object = promoted;
+        QVERIFY(!withoutObject(single, 0));  // the last one
+        // A mask with no object yet has nothing to cut out of: its first object adds.
+        const Effect fresh = makeEffect(p, "invert");
+        QVERIFY(!withNewObject(p, s, c, fresh, true));
+        auto first = withNewObject(p, s, c, fresh, false, &which);
+        QVERIFY(first && first->count() == 1 && !first->subtract && which == 0);
+
+        // Over MCP: a new object to cut out, clicked and tracked both ways from the middle; listed with the rest.
+        auto firstOnly = std::make_shared<ObjectMask>(*e.object);
+        firstOnly->more.clear();
+        e.object = firstOnly;
+        c.effects.push_back(e);
+        const QString project = QString::fromStdString(path("objects.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject full = args;
+            full["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_object_mask"}, {"arguments", full},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto refused = [](const QJsonObject& r) { return r.value("isError").toBool() || r.isEmpty(); };
+        const double clipId = double(c.id), effectId = double(e.id);
+        QJsonObject r = call({{"clip", clipId}, {"effect", effectId}, {"object", "new_cut"}, {"name", "Blue"}, {"at", 4.0 / 25},
+                              {"points", QJsonArray{QJsonValue(QJsonArray{blue[4].x / 640, blue[4].y / 360, 1})}}, {"track", "both"}});
+        QVERIFY2(!refused(r), QJsonDocument(r).toJson().constData());
+        const QJsonArray objs = r.value("structuredContent").toObject().value("objects").toArray();
+        QCOMPARE(objs.size(), 2);
+        QCOMPARE(objs[1].toObject().value("name").toString(), QString("Blue"));
+        QVERIFY(objs[1].toObject().value("subtract").toBool());
+        QCOMPARE(objs[1].toObject().value("segmented_frames").toInt(), frames);
+        QCOMPARE(r.value("structuredContent").toObject().value("object").toInt(), 1);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Effect& saved = back.active()->videoTracks[0].clips[0].effects.back();
+        QVERIFY(saved.object && saved.object->count() == 2 && saved.object->object(1).subtract);
+        QVERIFY(!saved.params.count("mask.object"));  // (which object is being picked is not saved in the project)
+        // Tracked without "at": from the frame the object was clicked on (frame 4), not the clip's start.
+        r = call({{"clip", clipId}, {"effect", effectId}, {"object", 1}, {"track", "forward"}});
+        QVERIFY2(!refused(r), QJsonDocument(r).toJson().constData());
+        // Added back, then removed; bad input refused.
+        r = call({{"clip", clipId}, {"effect", effectId}, {"object", 1}, {"subtract", false}});
+        QVERIFY(!refused(r) && !r.value("structuredContent").toObject().value("objects").toArray()[1].toObject().value("subtract").toBool());
+        QVERIFY(refused(call({{"clip", clipId}, {"effect", effectId}, {"object", 0}, {"subtract", true}})));
+        QVERIFY(refused(call({{"clip", clipId}, {"effect", effectId}, {"object", 9}})));
+        QVERIFY(refused(call({{"clip", clipId}, {"effect", effectId}, {"points", QJsonArray{QJsonValue(QJsonArray{1.5, 0.2, 1})}}})));
+        QVERIFY(refused(call({{"clip", clipId}, {"effect", effectId + 1000}})));
+        QVERIFY(refused(call({{"clip", clipId}, {"effect", effectId}, {"object", 1}, {"remove", true}, {"name", "Kept"}})));
+        r = call({{"clip", clipId}, {"effect", effectId}, {"object", 1}, {"remove", true}});
+        QCOMPARE(r.value("structuredContent").toObject().value("objects").toArray().size(), 1);
     }
 
     void slowMotionFrameSampling() {
@@ -14816,6 +15009,107 @@ private slots:
         QVERIFY(br.contains("error") || br.value("result").toObject().value("isError").toBool());
     }
 
+    void matchChartOverMcp() {
+        const std::string png = path("chart-mcp.png");
+        QVERIFY(castChartImage().save(QString::fromStdString(png)));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 640, s.height = 360;
+        MediaItem m = probeOrFail(p, png);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, m.id, 60, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id first = s.videoTracks[0].clips[0].id;
+        s.videoTracks[0].clips[0].name = "Chart A";
+        const QString project = QString::fromStdString(path("chart.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject full = args;
+            if (!full.contains("project")) full["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_match_chart"}, {"arguments", full},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        // Measured only: found, far off, nothing changed.
+        QJsonObject r = call({{"clip", double(first)}, {"measure_only", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject out = r.value("structuredContent").toObject();
+        QVERIFY(out.value("delta_e_before").toDouble() > 5 && out.value("delta_e_after").toDouble() < 2);
+        QCOMPARE(out.value("corners").toArray().size(), 4);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QVERIFY(back.active()->videoTracks[0].clips[0].effects.empty() ||
+                back.active()->videoTracks[0].clips[0].effects.front().type != "chart_match");
+        // Both clips of the media, from given corners.
+        r = call({{"clip", double(first)}, {"same_media", true},
+                  {"corners", QJsonArray{QJsonArray{120.0 / 640, 80.0 / 360}, QJsonArray{420.0 / 640, 80.0 / 360}, QJsonArray{420.0 / 640, 280.0 / 360},
+                                         QJsonArray{120.0 / 640, 280.0 / 360}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("clips").toInt(), 2);
+        QVERIFY(loadProject(project.toStdString(), back));
+        for (const Clip& c : back.active()->videoTracks[0].clips) QCOMPARE(c.effects.front().type, std::string("chart_match"));
+        // Again: the same effect replaced, not a second one.
+        r = call({{"clip", double(first)}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(loadProject(project.toStdString(), back));
+        const auto& fx = back.active()->videoTracks[0].clips[0].effects;
+        QCOMPARE(std::count_if(fx.begin(), fx.end(), [](const Effect& e) { return e.type == "chart_match"; }), 1);
+        // Bad corners: too few, in a line, off the frame; a clip by name, and a name two clips share.
+        auto refused = [](const QJsonObject& res) { return res.value("isError").toBool() || res.isEmpty(); };
+        r = call({{"clip", double(first)}, {"corners", QJsonArray{QJsonArray{0, 0}}}});
+        QVERIFY(refused(r));
+        r = call({{"clip", double(first)}, {"corners", QJsonArray{QJsonArray{0.1, 0.5}, QJsonArray{0.5, 0.5}, QJsonArray{0.9, 0.5}, QJsonArray{0.3, 0.5}}}});
+        QVERIFY(refused(r));
+        r = call({{"clip", double(first)}, {"corners", QJsonArray{QJsonArray{0.1, 0.1}, QJsonArray{1.4, 0.1}, QJsonArray{1.4, 0.9}, QJsonArray{0.1, 0.9}}}});
+        QVERIFY(refused(r));
+        r = call({{"clip", "Chart A"}, {"measure_only", true}});
+        QVERIFY2(!refused(r), QJsonDocument(r).toJson().constData());
+        r = call({{"clip", "No Such Clip"}, {"measure_only", true}});
+        QVERIFY(refused(r));
+        // In an HDR sequence, behind its colour group's pre-clip grade: the chart is measured as the effect receives the
+        // picture, so what plays is as close to the chart as the tool said (read back from PQ), not graded twice or in
+        // the wrong space.
+        {
+            Project h = makeDefaultProject();
+            Sequence& hs = *h.active();
+            hs.width = 640, hs.height = 360;
+            hs.colorSpace = "rec2100pq";
+            MediaItem hm = probeOrFail(h, png);
+            h.media.push_back(hm);
+            QVERIFY(edit::placeMedia(h, hs, hm.id, 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            const Id hc = hs.videoTracks[0].clips[0].id;
+            Id group = 0;
+            QVERIFY(edit::makeColorGroup(h, hs, {hc}, "Scene", &group).ok);
+            Effect lift = makeEffect(h, "color_correct");
+            lift.params["exposure"] = 0.1;
+            findColorGroup(hs, group)->pre.push_back(lift);
+            const QString hdr = QString::fromStdString(path("chart-hdr.montage"));
+            QVERIFY(saveProject(h, hdr.toStdString()));
+            r = call({{"project", hdr}, {"clip", double(hc)},
+                      {"corners", QJsonArray{QJsonArray{120.0 / 640, 80.0 / 360}, QJsonArray{420.0 / 640, 80.0 / 360},
+                                             QJsonArray{420.0 / 640, 280.0 / 360}, QJsonArray{120.0 / 640, 280.0 / 360}}}});
+            QVERIFY2(!refused(r), QJsonDocument(r).toJson().constData());
+            const double promised = r.value("structuredContent").toObject().value("delta_e_after").toDouble();
+            // (The group's exposure works on PQ code values, which no matrix in linear light undoes exactly.)
+            QVERIFY2(promised < 4, qPrintable(QString::number(promised)));
+            Project back2;
+            QVERIFY(loadProject(hdr.toStdString(), back2));
+            const Sequence& bs = *back2.active();
+            QCOMPARE(bs.videoTracks[0].clips[0].effects.front().s("space"), std::string("rec2100pq"));
+            const Image played = renderProgramFrame(back2, bs, 10, RenderOptions{});
+            TrackQuad q;
+            q.p[0] = {120.0 / 640, 80.0 / 360}, q.p[1] = {420.0 / 640, 80.0 / 360}, q.p[2] = {420.0 / 640, 280.0 / 360}, q.p[3] = {120.0 / 640, 280.0 / 360};
+            const ChartColors got = sampleChart(played, q, *findColorSpace("rec2100pq"));
+            double mean = 0;
+            for (int i = 0; i < 24; ++i) mean += deltaE76(got[size_t(i)], colorChecker24()[size_t(i)]) / 24;
+            QVERIFY2(mean < promised + 1, qPrintable(QString("%1 played, %2 promised").arg(mean).arg(promised)));
+        }
+    }
+
     void reviewPackages() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
@@ -14904,6 +15198,88 @@ private slots:
         auto found = std::find_if(ms.begin(), ms.end(), [](const Marker& m) { return m.name == "Ana"; });
         QVERIFY(found != ms.end() && found->t == 12 && found->duration == 5 && found->comment == "Flash frame?");
         QVERIFY(std::any_of(ms.begin(), ms.end(), [](const Marker& m) { return m.name == "Sam" && m.t == 30; }));
+
+        // Versions: the two copies so far are 1 and 2 (the range); the next is 3, its page comparing with 2.
+        QCOMPARE(reviewVersions(*back.active(), folder.toStdString()), (std::vector<int>{1, 2}));
+        r = call("montage_export_review", {{"project", project}, {"folder", folder}, {"max_height", 180}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject v3 = r.value("structuredContent").toObject();
+        QVERIFY2(v3.value("version").toInt() == 3, QJsonDocument(r).toJson().constData());
+        QCOMPARE(v3.value("compares_with").toInt(), 2);
+        QVERIFY(v3.value("video").toString().endsWith("Ep 1- Pilot - Review v3.mp4"));
+        QFile p3(v3.value("page").toString());
+        QVERIFY(p3.open(QIODevice::ReadOnly));
+        const auto info3 = readReviewPage(p3.readAll().toStdString());
+        QVERIFY(info3 && info3->version == 3 && info3->frames == 50);
+        QVERIFY(!readReviewPage("<html>not a page</html>"));
+        {
+            QFile again(v3.value("page").toString());
+            QVERIFY(again.open(QIODevice::ReadOnly));
+            const QByteArray h3 = again.readAll();
+            QVERIFY(h3.contains("\"previous\":{"));
+            QVERIFY(h3.contains("\"video\":\"Ep 1- Pilot - Review v2.mp4\""));
+            QVERIFY(h3.contains("\"offset\":25"));  // version 2 was the range from a second in
+        }
+        // The same number replaces that copy; without comparing.
+        r = call("montage_export_review", {{"project", project}, {"folder", folder}, {"max_height", 180}, {"version", 3}, {"compare", false}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("version").toInt(), 3);
+        QVERIFY(r.value("structuredContent").toObject().value("compares_with").isNull());
+        QCOMPARE(reviewVersions(*back.active(), folder.toStdString()), (std::vector<int>{1, 2, 3}));
+        r = call("montage_export_review", {{"project", project}, {"folder", folder}, {"version", 0}});
+        QVERIFY(r.value("isError").toBool() || r.isEmpty());
+        // A name with [ ] (not a wildcard here) and another case are told apart.
+        {
+            Sequence promo = s;
+            promo.name = "Promo [final]";
+            const QString pf = QString::fromStdString(path("review-brackets"));
+            QDir(pf).removeRecursively();
+            QVERIFY(QDir().mkpath(pf));
+            for (const char* f : {"Promo [final] - Review.html", "Promo [final] - Review v4.html", "promo [final] - Review v7.html", "Promo [final] - Review vX.html"}) {
+                QFile page(pf + "/" + f);
+                QVERIFY(page.open(QIODevice::WriteOnly));
+            }
+            QCOMPARE(reviewVersions(promo, pf.toStdString()), (std::vector<int>{1, 4}));
+            QCOMPARE(reviewPackage(promo, pf.toStdString()).page.version, 5);
+        }
+
+        // Notes with a drawing, replies and a status: the marker keeps the drawing and the note's id; a note on a frame
+        // that has a marker goes to the next free one.
+        auto writeNotes = [&](const char* json) {
+            QFile f(notes);
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(json);
+        };
+        writeNotes(R"({"montageReview":2,"fps":[25,1],"version":3,"notes":[
+            {"id":"n1","frame":30,"author":"Sam","text":"Mask this","status":"progress","updated":"2026-10-11T10:00:00Z",
+             "replies":[{"author":"Ana","text":"Agreed","created":"2026-10-11T10:01:00Z"}],
+             "drawing":[{"tool":"ellipse","color":"\u0023ffcc00","width":0.003,"points":[[0.2,0.2],[0.4,0.5]]}]}]})");
+        r = call("montage_import_markers", {{"project", project}, {"path", notes}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("added").toInt(), 1);
+        QVERIFY(loadProject(project.toStdString(), back));
+        auto drawn = std::find_if(back.active()->markers.begin(), back.active()->markers.end(), [](const Marker& m) { return m.reviewId == "n1"; });
+        QVERIFY(drawn != back.active()->markers.end());
+        QCOMPARE(drawn->t, FrameTime(31));
+        QCOMPARE(drawn->drawingFrame(), FrameTime(30));  // drawn on 30, beside Sam's earlier note there
+        QCOMPARE(drawn->name, std::string("\xE2\x97\x90 Sam \xC2\xB7 v3"));
+        QCOMPARE(drawn->comment, std::string("Mask this\n\xE2\x86\xB3 Ana: Agreed"));
+        QCOMPARE(parseReviewDrawing(drawn->drawing).size(), size_t(1));
+        QCOMPARE(parseReviewDrawing(drawn->drawing)[0].tool, std::string("ellipse"));
+        // Imported again, done and with another reply: the same marker brought up to date.
+        writeNotes(R"({"montageReview":2,"fps":[25,1],"version":3,"notes":[
+            {"id":"n1","frame":30,"author":"Sam","text":"Mask this","status":"done",
+             "replies":[{"author":"Ana","text":"Agreed"},{"author":"Sam","text":"Done in v4"}],
+             "drawing":[{"tool":"ellipse","color":"\u0023ffcc00","points":[[0.2,0.2],[0.4,0.5]]}]}]})");
+        r = call("montage_import_markers", {{"project", project}, {"path", notes}});
+        QCOMPARE(r.value("structuredContent").toObject().value("updated").toInt(), 1);
+        QCOMPARE(r.value("structuredContent").toObject().value("added").toInt(), 0);
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->markers.size(), size_t(4));
+        drawn = std::find_if(back.active()->markers.begin(), back.active()->markers.end(), [](const Marker& m) { return m.reviewId == "n1"; });
+        QCOMPARE(drawn->name, std::string("\xE2\x9C\x93 Sam \xC2\xB7 v3"));
+        QVERIFY(drawn->comment.find("Done in v4") != std::string::npos);
+        QCOMPARE(drawn->t, FrameTime(31));
     }
 
     void planarTracking() {
@@ -16683,6 +17059,318 @@ private slots:
         QCOMPARE(bs.audioTracks[1].clips[0].start, FrameTime(std::llround(20 * fps)));
     }
 
+    void contentCredentials() {
+        // What an export's credentials say, as c2pa-rs is given it: made by Montage from other media, then each AI model's
+        // part, and that it may not train AI.
+        Provenance made;
+        made.ai = {{"Object Removal", "LaMa", AiRole::Generated}, {"Super Scale", "Real-ESRGAN", AiRole::Enhanced}};
+        QJsonObject def = QJsonDocument::fromJson(QByteArray::fromStdString(credentialManifestJson("/x/cut.mp4", made, {}))).object();
+        QCOMPARE(def.value("title").toString(), QStringLiteral("cut.mp4"));
+        QCOMPARE(def.value("format").toString(), QStringLiteral("video/mp4"));
+        QCOMPARE(def.value("claim_generator_info").toArray()[0].toObject().value("name").toString(), QStringLiteral("Montage"));
+        QJsonArray assertions = def.value("assertions").toArray();
+        QCOMPARE(assertions.size(), 2);
+        QJsonArray actions = assertions[0].toObject().value("data").toObject().value("actions").toArray();
+        QCOMPARE(actions.size(), 3);
+        QCOMPARE(actions[0].toObject().value("action").toString(), QStringLiteral("c2pa.created"));
+        QVERIFY(actions[0].toObject().value("digitalSourceType").toString().endsWith("compositeWithTrainedAlgorithmicMedia"));
+        QCOMPARE(actions[1].toObject().value("action").toString(), QStringLiteral("c2pa.edited"));
+        QVERIFY(actions[1].toObject().value("description").toString().contains("Object Removal (LaMa)"));
+        QVERIFY(actions[2].toObject().value("digitalSourceType").toString().endsWith("algorithmicallyEnhanced"));
+        QCOMPARE(assertions[1].toObject().value("label").toString(), QStringLiteral("cawg.training-mining"));
+        // No AI, a title, and training allowed: a composite, and nothing said about training.
+        CredentialOptions allow;
+        allow.title = "Trailer";
+        allow.allowAiTraining = true;
+        def = QJsonDocument::fromJson(QByteArray::fromStdString(credentialManifestJson("/x/cut.wav", {}, allow))).object();
+        QCOMPARE(def.value("title").toString(), QStringLiteral("Trailer"));
+        assertions = def.value("assertions").toArray();
+        QCOMPARE(assertions.size(), 1);
+        QVERIFY(assertions[0].toObject().value("data").toObject().value("actions").toArray()[0].toObject().value("digitalSourceType").toString().endsWith("/composite"));
+        // Which files can hold them, and how a file's read.
+        QVERIFY(contentCredentialsFormat("a.MOV") && contentCredentialsFormat("b.wav") && contentCredentialsFormat("c.jpg"));
+        QVERIFY(!contentCredentialsFormat("a.mkv") && !contentCredentialsFormat("a.mxf") && !contentCredentialsFormat("a.webm"));
+        CredentialSummary said;
+        said.present = true, said.state = "Trusted", said.issuer = "Sony Corporation", said.signedAt = "2026-10-01T09:30:00Z";
+        said.generator = "ILCE-1", said.aiGenerated = true;
+        QCOMPARE(credentialsLabel(said), std::string("Signed by Sony Corporation, 2026-10-01, made with ILCE-1 (trusted); made with AI"));
+        QCOMPARE(credentialsLabel({}), std::string());
+
+        std::string err;
+        const std::string certs = MONTAGE_TEST_DATA_DIR "/c2pa/chain.pem", key = MONTAGE_TEST_DATA_DIR "/c2pa/signer.key";
+        if (!contentCredentialsAvailable()) {
+            QVERIFY(!checkCredentialSigner({certs, key, {}}, &err) && err.find("C2PA") != std::string::npos);
+            QSKIP("Built without the C2PA library (scripts/build-c2pa.sh) for the rest");
+        }
+        // The test signer can sign; a certificate authority's own certificate, or a missing key, cannot.
+        QVERIFY2(checkCredentialSigner({certs, key, {}}, &err), err.c_str());
+        QVERIFY(!checkCredentialSigner({MONTAGE_TEST_DATA_DIR "/c2pa/ca.pem", key, {}}, &err) && !err.empty());
+        QVERIFY(!checkCredentialSigner({certs, path("missing.key"), {}}, &err) && err.find("private key") != std::string::npos);
+
+        // A file without credentials has none; a "camera original" signed, then read back.
+        CredentialSummary c;
+        QVERIFY2(readContentCredentials(MONTAGE_TEST_DATA_DIR "/jfk.wav", c, &err), err.c_str());
+        QVERIFY(!c.present);
+        const std::string camera = path("camera.wav");
+        QVERIFY(QFile::copy(MONTAGE_TEST_DATA_DIR "/jfk.wav", QString::fromStdString(camera)));
+        QFile::setPermissions(QString::fromStdString(camera), QFile::permissions(QString::fromStdString(camera)) | QFileDevice::WriteOwner | QFileDevice::ReadGroup);
+        const auto permissions = QFile::permissions(QString::fromStdString(camera));
+        CredentialOptions original;
+        original.title = "Camera original";
+        QVERIFY2(signContentCredentials(camera, {}, {certs, key, {}}, original, &err), err.c_str());
+        QCOMPARE(QFile::permissions(QString::fromStdString(camera)), permissions);  // (not a temporary file's)
+        QVERIFY2(readContentCredentials(camera, c, &err), err.c_str());
+        QVERIFY(c.present);
+        QCOMPARE(c.state, std::string("Valid"));  // intact; the test authority is on no trust list
+        QCOMPARE(c.issuer, std::string("Montage tests"));
+        QCOMPARE(c.title, std::string("Camera original"));
+        QVERIFY(QString::fromStdString(c.generator).startsWith("Montage"));
+        QVERIFY(!c.aiGenerated);
+        QVERIFY(std::find(c.actions.begin(), c.actions.end(), "c2pa.created") != c.actions.end());
+        QVERIFY(c.json.find("cawg.training-mining") != std::string::npos);
+        // Still plays as it did.
+        MediaItem m;
+        QVERIFY(probeMedia(camera, m));
+        QVERIFY(std::abs(m.duration - 11.0) < 0.1);
+
+        // Signed again (montage-cli sign on a camera original): the earlier credentials kept as its parent.
+        const std::string twice = path("twice.wav");
+        QVERIFY(QFile::copy(QString::fromStdString(camera), QString::fromStdString(twice)));
+        QVERIFY2(signContentCredentials(twice, {}, {certs, key, {}}, {}, &err), err.c_str());
+        QVERIFY2(readContentCredentials(twice, c, &err), err.c_str());
+        QVERIFY(c.present && c.state == "Valid");
+        QVERIFY(std::find(c.actions.begin(), c.actions.end(), "c2pa.opened") != c.actions.end());
+        QVERIFY(c.json.find("parentOf") != std::string::npos && c.json.find("Camera original") != std::string::npos);
+
+        // A format that cannot hold them: refused, the file untouched and nothing left beside it.
+        const std::string mkv = path("cut.mkv");
+        QVERIFY(QFile::copy(MONTAGE_TEST_DATA_DIR "/jfk.wav", QString::fromStdString(mkv)));
+        QVERIFY(!signContentCredentials(mkv, {}, {certs, key, {}}, {}, &err) && err.find(".mkv") != std::string::npos);
+        auto bytes = [](const std::string& f) {
+            QFile in(QString::fromStdString(f));
+            return in.open(QIODevice::ReadOnly) ? in.readAll() : QByteArray();
+        };
+        QCOMPARE(bytes(mkv), bytes(MONTAGE_TEST_DATA_DIR "/jfk.wav"));
+        // A refused signer: the file untouched, no copy left beside it.
+        const QByteArray before = bytes(camera);
+        QVERIFY(!signContentCredentials(camera, {}, {MONTAGE_TEST_DATA_DIR "/c2pa/ca.pem", key, {}}, {}, &err));
+        QCOMPARE(bytes(camera), before);
+        QVERIFY(QDir(QString::fromStdString(path(""))).entryList({"*.signing-*"}, QDir::Files | QDir::Hidden).isEmpty());
+        // A file c2pa-rs cannot follow is not taken for one with broken credentials.
+        const std::string broken = path("broken.mp4");
+        {
+            QFile f(QString::fromStdString(broken));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QByteArray(4096, 'x'));
+        }
+        const bool readBroken = readContentCredentials(broken, c, &err);
+        QVERIFY(!(readBroken && c.present));
+        // Numbered frames cannot be signed: one file is.
+        ExportSettings frames;
+        frames.path = path("frame.png");
+        frames.videoCodec = "png";
+        QVERIFY(!exportCarriesCredentials(frames));
+        frames.videoCodec = "libx264", frames.path = path("cut.mp4");
+        QVERIFY(exportCarriesCredentials(frames));
+        // Changed after signing: invalid.
+        const std::string changed = path("changed.wav");
+        QVERIFY(QFile::copy(QString::fromStdString(camera), QString::fromStdString(changed)));
+        {
+            QFile f(QString::fromStdString(changed));
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            f.seek(f.size() / 2);
+            const QByteArray b = f.read(64);
+            QByteArray flipped = b;
+            for (char& x : flipped) x = char(~x);
+            f.seek(f.size() / 2);
+            f.write(flipped);
+        }
+        QVERIFY2(readContentCredentials(changed, c, &err), err.c_str());
+        QVERIFY(c.present && c.state == "Invalid" && !c.problems.empty());
+
+        // An export through MCP: signed, the camera's credentials kept as an ingredient; then read through MCP. With
+        // AI in it (speech made by a model), it says so.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        QVERIFY(probeMedia(camera, m));
+        m.id = p.newId();
+        p.media.push_back(m);
+        MediaItem voice;
+        QVERIFY(probeMedia(MONTAGE_TEST_DATA_DIR "/jfk.wav", voice));
+        voice.id = p.newId();
+        voice.keywords = {"AI voice"};
+        voice.metadata["comment"] = "Spoken by Kokoro voice af_heart";
+        p.media.push_back(voice);
+        const double fps = s.fpsValue();
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 2 * fps, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, voice.id, FrameTime(2 * fps), 0, 2 * fps, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const QString project = QString::fromStdString(path("credentials.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const QJsonObject signer{{"certificate", QString::fromStdString(certs)}, {"key", QString::fromStdString(key)}};
+        const QString out = QString::fromStdString(path("signed.wav"));
+        // A refused certificate fails before rendering; MKV cannot hold them.
+        QJsonObject r = call("montage_render", {{"project", project}, {"output", out}, {"preset", "Audio - WAV 24-bit"},
+                                                {"credentials", QJsonObject{{"certificate", MONTAGE_TEST_DATA_DIR "/c2pa/ca.pem"}, {"key", QString::fromStdString(key)}}}});
+        QVERIFY2(r.value("isError").toBool() && !QFileInfo::exists(out), QJsonDocument(r).toJson().constData());
+        QVERIFY(call("montage_render", {{"project", project}, {"output", out}, {"credentials", "yes"}}).value("isError").toBool());
+        r = call("montage_render", {{"project", project}, {"output", QString::fromStdString(path("signed.mkv"))}, {"credentials", signer}});
+        QVERIFY(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("cannot go in"));
+        r = call("montage_render", {{"project", project}, {"output", out}, {"preset", "Audio - WAV 24-bit"}, {"credentials", signer}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject written = r.value("structuredContent").toObject().value("credentials").toObject();
+        QVERIFY(written.value("signed").toBool());
+        QCOMPARE(written.value("ai").toArray().size(), 1);
+        QCOMPARE(written.value("ai").toArray()[0].toObject().value("role").toString(), QStringLiteral("generated"));
+        r = call("montage_read_credentials", {{"path", out}, {"full", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject read = r.value("structuredContent").toObject();
+        QVERIFY(read.value("present").toBool());
+        QCOMPARE(read.value("state").toString(), QStringLiteral("Valid"));
+        QVERIFY(read.value("ai_generated").toBool());
+        QVERIFY(read.value("label").toString().endsWith("made with AI"));
+        // The camera original's credentials inside, as an ingredient.
+        const QByteArray store = QJsonDocument(read.value("manifest_store").toObject()).toJson();
+        QVERIFY2(store.contains("Camera original") && store.contains("componentOf"), store.left(4000).constData());
+        QVERIFY(!call("montage_read_credentials", {{"path", MONTAGE_TEST_DATA_DIR "/jfk.wav"}}).value("structuredContent").toObject().value("present").toBool());
+    }
+
+    void voiceConversion() {
+        // Cut into pieces of at most 9.5 s, at the quietest moment in each piece's last three seconds.
+        std::vector<float> speech(size_t(kCloneSampleRate) * 25);
+        for (size_t i = 0; i < speech.size(); ++i) speech[i] = float(0.3 * std::sin(2 * M_PI * 200.0 * double(i) / kCloneSampleRate));
+        for (const double gap : {8.0, 16.5})
+            std::fill(speech.begin() + std::ptrdiff_t(gap * kCloneSampleRate), speech.begin() + std::ptrdiff_t((gap + 0.1) * kCloneSampleRate), 0.0f);
+        const std::vector<size_t> cuts = voiceConversionCuts(speech, kCloneSampleRate);
+        QCOMPARE(cuts.size(), size_t(4));
+        QCOMPARE(cuts.front(), size_t(0));
+        QCOMPARE(cuts.back(), speech.size());
+        QVERIFY2(std::abs(double(cuts[1]) / kCloneSampleRate - 8.05) < 0.06, qPrintable(QString::number(double(cuts[1]) / kCloneSampleRate)));
+        QVERIFY2(std::abs(double(cuts[2]) / kCloneSampleRate - 16.55) < 0.06, qPrintable(QString::number(double(cuts[2]) / kCloneSampleRate)));
+        for (size_t i = 1; i < cuts.size(); ++i) QVERIFY(cuts[i] - cuts[i - 1] <= size_t(9.5 * kCloneSampleRate));
+        QCOMPARE(voiceConversionCuts(std::vector<float>(1000), kCloneSampleRate), (std::vector<size_t>{0, 1000}));
+        QCOMPARE(voiceConversionCuts({}, kCloneSampleRate), (std::vector<size_t>{0, 0}));
+        // Refused before any model: a voice sample too short to hear a voice in, and nothing said.
+        std::vector<float> out;
+        std::string err;
+        QVERIFY(!convertVoice(speech, kCloneSampleRate, std::vector<float>(kCloneSampleRate / 4, 0.2f), kCloneSampleRate, out, &err));
+        QVERIFY2(!voiceCloneAvailable() || err.find("too short") != std::string::npos, err.c_str());
+        QVERIFY(!convertVoice(std::vector<float>(kCloneSampleRate * 2, 0.0f), kCloneSampleRate, speech, kCloneSampleRate, out, &err));
+        QVERIFY2(!voiceCloneAvailable() || err.find("no speech") != std::string::npos, err.c_str());
+        QVERIFY(out.empty());
+
+        // The real model: JFK's words in a synthetic voice, as long as he took to say them.
+        if (!voiceCloneAvailable() || !voiceCloneModel().installed()) QSKIP("Set MONTAGE_VOICE_CLONE_MODEL to the Chatterbox Multilingual ONNX files to run the rest");
+        if (!ttsModel().installed()) QSKIP("Set MONTAGE_TTS_MODEL to the Kokoro files for a voice to convert to");
+        std::vector<float> voice;
+        QVERIFY2(synthesizeSpeech("Good evening. My name is Michael, and I will be your narrator for tonight. Every story begins with a single "
+                                  "voice.",
+                                  "am_michael", 1.0, voice, &err),
+                 err.c_str());
+        std::vector<float> jfk;
+        QVERIFY2(voiceSoundFrom(MONTAGE_TEST_DATA_DIR "/jfk.wav", 0, 0, jfk, &err), err.c_str());
+        QVERIFY(jfk.size() > size_t(kCloneSampleRate) * 10);  // two pieces
+        QElapsedTimer timer;
+        timer.start();
+        double progressed = 0;
+        QVERIFY2(convertVoice(jfk, kCloneSampleRate, voice, kTtsSampleRate, out, &err, [&](double f) { progressed = f; }), err.c_str());
+        qInfo("converted %.1f s of speech in %.1f s", double(jfk.size()) / kCloneSampleRate, timer.elapsed() / 1000.0);
+        QCOMPARE(out.size(), jfk.size());  // in sync
+        QCOMPARE(progressed, 1.0);
+        double energy = 0;
+        for (const float v : out) energy += double(v) * v;
+        QVERIFY(std::sqrt(energy / double(out.size())) > 0.01);
+        const std::string converted = path("converted.wav");
+        QVERIFY(writeClonedSpeechWav(converted, out, "Speech converted in a test"));
+        // The same words.
+        if (const QByteArray whisper = qgetenv("MONTAGE_TEST_WHISPER_MODEL"); !whisper.isEmpty()) {
+            TranscribeOptions opts;
+            opts.model = whisper.toStdString();
+            Transcript said;
+            QVERIFY2(transcribeMedia(converted, opts, said, {}, nullptr, &err), err.c_str());
+            const QString text = QString::fromStdString(said.text()).toLower();
+            for (const char* word : {"fellow americans", "ask not", "country"}) QVERIFY2(text.contains(QLatin1String(word)), qPrintable(text));
+        }
+        // In the new voice: one person with the voice sample, two with the original.
+        if (diarizerAvailable() && speakerModel().installed()) {
+            auto at16k = [](const std::vector<float>& x, int rate) {
+                std::vector<float> y;
+                for (double t = 0; t + 1 < double(x.size()); t += double(rate) / 16000) {
+                    const size_t i = size_t(t);
+                    y.push_back(float(x[i] + (x[i + 1] - x[i]) * (t - double(i))));
+                }
+                return y;
+            };
+            auto people = [&](const std::vector<float>& a, int rateA, const std::vector<float>& b, int rateB) {
+                std::vector<float> mix = at16k(a, rateA), second = at16k(b, rateB);
+                mix.insert(mix.end(), 16000, 0.0f);
+                mix.insert(mix.end(), second.begin(), second.end());
+                std::vector<SpeakerTurn> turns;
+                std::string why;
+                if (!diarize(mix, {}, turns, {}, nullptr, &why)) return -1;
+                int n = 0;
+                for (const auto& turn : turns) n = std::max(n, turn.speaker + 1);
+                return n;
+            };
+            QCOMPARE(people(voice, kTtsSampleRate, out, kCloneSampleRate), 1);
+            QCOMPARE(people(jfk, kCloneSampleRate, out, kCloneSampleRate), 2);
+        }
+
+        // Through MCP: refused without consent or a voice; a trimmed clip's sound (with a second's handle either side)
+        // becomes its picked take, in place.
+        const std::string sample = path("narrator.wav");
+        QVERIFY(writeSpeechWav(sample, voice, &err));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem m;
+        QVERIFY(probeMedia(MONTAGE_TEST_DATA_DIR "/jfk.wav", m));
+        m.id = p.newId();
+        p.media.push_back(m);
+        const double fps = s.fpsValue();
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 2 * fps, 5 * fps, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id clip = s.audioTracks[0].clips[0].id;
+        const QString project = QString::fromStdString(path("convert.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_convert_voice"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"project", project}, {"clip", double(clip)}, {"consent", false}, {"voice_media", QString::fromStdString(sample)}});
+        QVERIFY(r.value("isError").toBool() && QJsonDocument(r).toJson().contains("consent"));
+        QVERIFY(call({{"project", project}, {"clip", double(clip)}, {"consent", true}}).value("isError").toBool());
+        QVERIFY(call({{"project", project}, {"clip", double(clip)}, {"consent", true}, {"voice_clip", double(clip)}}).value("isError").toBool());
+        r = call({{"project", project}, {"clip", double(clip)}, {"consent", true}, {"voice_media", QString::fromStdString(sample)}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const double seconds = r.value("structuredContent").toObject().value("seconds").toDouble();
+        QVERIFY2(std::abs(seconds - 5.0) < 0.05, qPrintable(QString::number(seconds)));  // 1 s to 6 s of the file
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back, &err));
+        const Clip& c = back.active()->audioTracks[0].clips[0];
+        QCOMPARE(c.takes.size(), size_t(2));
+        QCOMPARE(c.take, 1);
+        QCOMPARE(c.takes[0].mediaId, m.id);
+        QVERIFY(std::abs(c.sourceIn - 1 * fps) < 1e-6);  // its second second, where the line was
+        QCOMPARE(c.start, FrameTime(0));
+        QCOMPARE(c.duration, FrameTime(std::llround(3 * fps)));
+        const MediaItem* made = back.findMedia(c.mediaId);
+        QVERIFY(made && QString::fromStdString(made->name).contains("Converted Voice") && made->bin == "Voiceover");
+        QVERIFY(QString::fromStdString(made->metadata.at("comment")).contains("converted to a voice cloned from narrator.wav"));
+        QVERIFY(std::find(made->keywords.begin(), made->keywords.end(), "AI voice") != made->keywords.end());
+    }
+
     void dubIntoEnglish() {
         const ModelPack* deen = translationModel("de", "en");
         QVERIFY(deen);
@@ -17280,6 +17968,60 @@ private slots:
         QVERIFY(!edit::matchSequenceToMedia(s2, src));  // not empty
     }
 
+    void inferenceDevices() {
+        // The processor is always among the devices; a model runs in every mode (falling back to the processor when the
+        // device chosen cannot take it), and the environment variable wins over the setting.
+        const auto devices = montage::inferenceDevices();
+        if (devices.empty()) QSKIP("Built without ONNX Runtime");
+        const QByteArray was = qgetenv("MONTAGE_INFERENCE");
+        auto restore = qScopeGuard([&] {
+            qputenv("MONTAGE_INFERENCE", was);
+            setInferenceMode(InferenceMode::Auto);
+        });
+        QVERIFY(std::any_of(devices.begin(), devices.end(), [](const InferenceDevice& d) { return d.kind == "CPU"; }));
+        InferenceMode parsed;
+        QVERIFY(parseInferenceMode("efficient", parsed) && parsed == InferenceMode::Efficient);
+        QVERIFY(!parseInferenceMode("gpu", parsed));
+        QVERIFY(parseInferenceMode("CPU", parsed) && parsed == InferenceMode::Cpu);  // (any case)
+        qunsetenv("MONTAGE_INFERENCE");
+        for (InferenceMode m : {InferenceMode::Auto, InferenceMode::Efficient, InferenceMode::Cpu}) {
+            setInferenceMode(m);
+            QCOMPARE(inferenceMode(), m);
+            std::string why;
+            QVERIFY2(inferenceCheck(&why), why.c_str());
+        }
+        QVERIFY(!inferenceModeOverridden());
+        // A mode changed after a model opened: it opens again for the new one and still runs.
+        setInferenceMode(InferenceMode::Cpu);
+        QVERIFY(inferenceCheck());
+        qputenv("MONTAGE_INFERENCE", "Cpu");  // (as the tests run)
+        setInferenceMode(InferenceMode::Auto);
+        QCOMPARE(inferenceMode(), InferenceMode::Cpu);
+        QVERIFY(inferenceModeOverridden());
+        // No folder, and a folder of things that are not provider libraries (a text file named as one, and a link to it):
+        // none registered, and why the file was refused kept.
+        QCOMPARE(registerInferenceLibraries(path("no-providers-here")), 0);
+        const QString folder = QString::fromStdString(path("providers"));
+        QVERIFY(QDir().mkpath(folder));
+#if defined(Q_OS_WIN)
+        const QString fake = folder + "/notaprovider.dll";
+#elif defined(Q_OS_MACOS)
+        const QString fake = folder + "/libnotaprovider.dylib";
+#else
+        const QString fake = folder + "/libnotaprovider.so";
+#endif
+        {
+            QFile f(fake);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write("not a library");
+        }
+#ifndef Q_OS_WIN
+        QVERIFY(QFile::link(fake, folder + "/libnotaprovider.so.1"));
+#endif
+        QCOMPARE(registerInferenceLibraries(folder.toStdString()), 0);
+        QVERIFY2(QString::fromStdString(lastInferenceLibraryError()).contains("notaprovider"), lastInferenceLibraryError().c_str());
+    }
+
     void proxyFormatsAndOfflineEditing() {
         // A blue 512x288 clip with a 0.4 tone, a second long.
         std::string wav = path("pxtone.wav");
@@ -17330,8 +18072,17 @@ private slots:
         QVERIFY(parseProxyFormat("prores_proxy", f) && f == ProxyFormat::ProResProxy);
         QVERIFY(!parseProxyFormat("prores", f));
         QCOMPARE(proxyExtension(ProxyFormat::DnxhrLb), std::string(".mov"));
-        // Audio-only files have no proxy.
+        // Audio-only files have no proxy, and ProRes or DNxHR none in MP4.
         QVERIFY(!createProxy(wav, path("pxtone_proxy.mp4"), ProxyOptions{}, nullptr, nullptr, &err));
+        ProxyOptions inMp4;
+        inMp4.format = ProxyFormat::ProResProxy;
+        QVERIFY(!createProxy(st.path, path("pxsrc_prores.mp4"), inMp4, nullptr, nullptr, &err));
+        QVERIFY(err.find(".mov") != std::string::npos);
+        // Proxies on with the proxy gone: the file (not a blank picture).
+        MediaItem gone;
+        gone.path = st.path;
+        gone.proxyPath = path("pxsrc_deleted_proxy.mp4");
+        QCOMPARE(pictureSource(gone, true), st.path);
 
         // HDR: ProRes and HEVC proxies stay HDR10; H.264 and DNxHR are tone mapped to Rec.709.
         {
@@ -17349,6 +18100,8 @@ private slots:
             hst.audioCodec = "none";
             hst.preset = "ultrafast";
             QVERIFY2(exportSequence(h, hs, hst, nullptr, nullptr, &err), err.c_str());
+            Project hp;
+            MediaItem hm = probeOrFail(hp, hst.path);
             for (ProxyFormat pf : {ProxyFormat::H264, ProxyFormat::ProResProxy, ProxyFormat::DnxhrLb, ProxyFormat::Hevc10}) {
                 ProxyOptions o;
                 o.format = pf;
@@ -17357,6 +18110,10 @@ private slots:
                 Project q;
                 const MediaItem pm = probeOrFail(q, out);
                 QVERIFY2((pm.colorSpace == "rec2100pq") == proxyKeepsHdr(pf), (std::string(proxyFormatName(pf)) + " " + pm.colorSpace).c_str());
+                // A picture read from the proxy is converted from the proxy's own space, the file's from the file's.
+                hm.proxyPath = out;
+                QCOMPARE(pictureColorSpace(hm, out).id == "rec2100pq", proxyKeepsHdr(pf));
+                QCOMPARE(pictureColorSpace(hm, hm.path).id, std::string("rec2100pq"));
             }
         }
 
@@ -17370,24 +18127,55 @@ private slots:
         MediaItem src = probeOrFail(e, moved);
         src.proxyPath = made[ProxyFormat::ProResProxy];
         e.media.push_back(src);
-        QCOMPARE(pictureSource(src, true), src.proxyPath);  // proxies on: the proxy, without looking at the file
+        QCOMPARE(pictureSource(src, true), src.proxyPath);  // proxies on: the proxy
         QVERIFY(QFile::remove(QString::fromStdString(moved)));
-        QCOMPARE(pictureSource(src, false), src.proxyPath);
-        QCOMPARE(soundSource(src), src.proxyPath);
+        QCOMPARE(pictureSource(src, false, true), src.proxyPath);  // viewing an offline file
+        QCOMPARE(pictureSource(src, false), moved);                // delivering: shown offline
+        QCOMPARE(soundSource(src, true), src.proxyPath);
+        QCOMPARE(soundSource(src, false), moved);
         MediaItem silent = src;
         silent.proxyPath = made[ProxyFormat::H264];
-        QCOMPARE(pictureSource(silent, false), silent.proxyPath);
-        QCOMPARE(soundSource(silent), moved);  // (a proxy without sound: the file's, which is not there)
+        QCOMPARE(pictureSource(silent, false, true), silent.proxyPath);
+        QCOMPARE(soundSource(silent, true), moved);  // (a proxy without sound: the file's, which is not there)
         MediaItem none = src;
         none.proxyPath.clear();
-        QCOMPARE(pictureSource(none, false), moved);
+        QCOMPARE(pictureSource(none, false, true), moved);
         QVERIFY(edit::placeMedia(e, es, src.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
-        Image img = renderProgramFrame(e, es, 15, RenderOptions{});
+        RenderOptions viewing;
+        viewing.offlineProxies = true;
+        Image img = renderProgramFrame(e, es, 15, viewing);
         QVERIFY2(img.at(256, 144)[2] > 0.6f && img.at(256, 144)[0] < 0.3f, "the proxy's blue, not Media Offline");
+        // An export shows it offline (the red slate), never the proxy's picture.
+        img = renderProgramFrame(e, es, 15, RenderOptions{});
+        QVERIFY2(img.at(10, 10)[0] > 0.4f && img.at(10, 10)[2] < 0.3f, "Media Offline");
         AudioMixer mixer;
+        mixer.setOfflineProxies(true);
         std::vector<float> out(4800 * 2);
         mixer.mix(e, es, 12000, 4800, out.data());
         QVERIFY2(std::fabs(out[2000] - 0.4f) < 0.02f, qPrintable(QString::number(out[2000])));
+        AudioMixer delivery;
+        std::fill(out.begin(), out.end(), 1.0f);
+        delivery.mix(e, es, 12000, 4800, out.data());
+        QCOMPARE(out[2000], 0.0f);
+        // Playback (not blocking for decodes) asks for the proxy's sound in the background and has it shortly after.
+        {
+            Sequence at44 = es;
+            at44.sampleRate = 44100;  // (not decoded at this rate yet)
+            AudioMixer live;
+            live.setNonBlocking(true);
+            live.setOfflineProxies(true);
+            live.mix(e, at44, 11025, 4410, out.data());
+            QCOMPARE(out[2000], 0.0f);
+            QTRY_VERIFY_WITH_TIMEOUT((live.reset(), live.mix(e, at44, 11025, 4410, out.data()), std::fabs(out[2000] - 0.4f) < 0.02f), 10000);
+        }
+        // A clip playing some of the file's channels does not get the proxy's whole mix.
+        e.active()->audioTracks[0].clips.front().channels = {0};
+        AudioMixer picked;
+        picked.setOfflineProxies(true);
+        std::fill(out.begin(), out.end(), 1.0f);
+        picked.mix(e, es, 12000, 4800, out.data());
+        QCOMPARE(out[2000], 0.0f);
+        e.active()->audioTracks[0].clips.front().channels.clear();
 
         // Shot analysis reads a proxy at least 640 wide (not this 256-wide one).
         QCOMPARE(analysisSource(src), moved);
@@ -17413,6 +18201,10 @@ private slots:
         QVERIFY(QDir().mkpath(cam + "/Sub"));
         QVERIFY(QFile::copy(QString::fromStdString(made[ProxyFormat::H264]), cam + "/Sub/PXSRC_MOVED_Proxy.mp4"));
         QVERIFY(QFile::copy(QString::fromStdString(made[ProxyFormat::H264]), cam + "/other.mp4"));
+        // Not proxies: a name going on without a separator ("A0010" for "A001"), and another original of the project.
+        QVERIFY(QFile::copy(QString::fromStdString(made[ProxyFormat::H264]), cam + "/pxsrc_moved0.mp4"));
+        QVERIFY(QFile::copy(QString::fromStdString(made[ProxyFormat::H264]), cam + "/pxsrc_moved_b.mp4"));
+        e.media.push_back(probeOrFail(e, (cam + "/pxsrc_moved_b.mp4").toStdString()));
         {
             Project g = makeDefaultProject();
             Sequence& gs = *g.active();
@@ -17475,3 +18267,6 @@ private slots:
 
 QTEST_MAIN(TestMedia)
 #include "test_media.moc"
+
+// (AI models run on the processor in tests, so results do not depend on the machine's GPU: media/Inference.h.)
+[[maybe_unused]] static const bool kCpuInference = (qputenv("MONTAGE_INFERENCE", "cpu"), true);

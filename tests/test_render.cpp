@@ -11,6 +11,7 @@
 #include <complex>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <set>
 #include <tuple>
 
@@ -22,6 +23,7 @@
 #include "core/GraphicsTemplate.h"
 #include "core/Effects.h"
 #include "core/MaskPath.h"
+#include "render/ColorChart.h"
 #include "render/ColorSpace.h"
 #include "render/HdrView.h"
 #include "render/Compositor.h"
@@ -922,6 +924,191 @@ colorspaces:
         e.params["mask.invert"] = Param(0.0);
         applyVideoEffect(e, 0, img, 1.0, 10.2 / 25);
         QVERIFY(std::fabs(img.at(320, 180)[0] - 0.8f) < 1e-4 && std::fabs(img.at(20, 20)[0] - 0.2f) < 1e-4);
+
+        // Several objects in one mask: added ones joined, cut-out ones taken away, each on the frames it was segmented.
+        {
+            auto field = [](double cx, double cy, double r) {
+                std::vector<float> l(size_t(kObjectGrid) * kObjectGrid);
+                for (int y = 0; y < kObjectGrid; ++y)
+                    for (int x = 0; x < kObjectGrid; ++x) l[size_t(y) * kObjectGrid + size_t(x)] = float(r - std::hypot(x - cx, y - cy)) * 0.5f;
+                return l;
+            };
+            ObjectMask mask;
+            mask.fps = 25;
+            mask.frames[10] = packObjectLogits(field(64, 128, 30).data());  // left disc
+            ObjectMask right;
+            right.fps = 25;
+            right.frames[10] = packObjectLogits(field(192, 128, 30).data());
+            right.frames[11] = right.frames[10];  // (only this object on frame 11)
+            ObjectMask hole;
+            hole.fps = 25;
+            hole.subtract = true;
+            hole.frames[10] = packObjectLogits(field(64, 128, 12).data());  // cut out of the left disc
+            mask.more = {right, hole};
+            std::vector<float> l;
+            QVERIFY(mask.maskLogits(10, l));
+            auto in = [&](int x, int y) { return l[size_t(y) * kObjectGrid + size_t(x)] > 0; };
+            QVERIFY(in(64 + 20, 128) && in(192, 128) && !in(64, 128) && !in(128, 128));
+            QVERIFY(mask.maskLogits(11, l) && in(192, 128) && !in(64 + 20, 128));
+            // A frame with only a cut-out object is no mask; none at all, none.
+            ObjectMask onlyCut = mask;
+            onlyCut.frames.clear();
+            onlyCut.more[0].frames.clear();
+            QVERIFY(!onlyCut.maskLogits(10, l));
+            QVERIFY(!mask.maskLogits(12, l));
+            // Rendered through an effect.
+            Effect two = makeEffect(p, "invert");
+            two.params["mask.shape"] = Param(3.0);
+            two.params["mask.feather"] = Param(1.0);
+            two.object = std::make_shared<ObjectMask>(mask);
+            Image flat(256, 256);
+            flat.fill(0.5f, 0.5f, 0.5f, 1);
+            const std::vector<float> m2 = effectMatte(two, 0, flat, 1.0, 10.2 / 25);
+            QVERIFY(m2[size_t(128) * 256 + 64 + 20] > 0.9f && m2[size_t(128) * 256 + 192] > 0.9f && m2[size_t(128) * 256 + 64] < 0.1f);
+        }
+    }
+
+    void maskEdgeRefinement() {
+        // A white disc (radius 50) on a textured dark ground; the coarse mask a model gives, blocky on an 8 px grid.
+        const int W = 240, H = 200;
+        Image img(W, H);
+        std::vector<float> truth(size_t(W) * H), coarse(size_t(W) * H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                // Coverage of the disc at each pixel (4 x 4 samples), and the ground's texture.
+                double cov = 0;
+                for (int j = 0; j < 4; ++j)
+                    for (int i = 0; i < 4; ++i) cov += std::hypot(x + (i + 0.5) / 4 - 120, y + (j + 0.5) / 4 - 100) < 50;
+                cov /= 16;
+                truth[size_t(y) * W + size_t(x)] = float(cov);
+                const float g = 0.15f + 0.05f * float(std::sin(x * 0.7) * std::cos(y * 0.9));
+                float* p = img.at(x, y);
+                for (int k = 0; k < 3; ++k) p[k] = float(cov * 0.9 + (1 - cov) * g);
+                p[3] = 1;
+                const int bx = x / 8 * 8 + 4, by = y / 8 * 8 + 4;
+                coarse[size_t(y) * W + size_t(x)] = std::hypot(bx - 120.0, by - 100.0) < 50 ? 1.f : 0.f;
+            }
+        auto error = [&](const std::vector<float>& m) {
+            double e = 0;
+            for (size_t i = 0; i < m.size(); ++i) e += std::fabs(m[i] - truth[i]);
+            return e;
+        };
+        // Refine Edges: the blocky edge settled on the disc's.
+        std::vector<float> refined = coarse;
+        refineMatteEdges(refined, img, 8, 1.0);
+        QVERIFY2(error(refined) < 0.15 * error(coarse), qPrintable(QString("%1 -> %2").arg(error(coarse)).arg(error(refined))));
+        for (float v : refined) QVERIFY(v >= 0 && v <= 1);
+        // Half of it: in between.
+        std::vector<float> half = coarse;
+        refineMatteEdges(half, img, 8, 0.5);
+        QVERIFY(error(half) < error(coarse) && error(half) > error(refined));
+        // A flat picture gives the filter nothing to follow: the mask stays close to itself, softened.
+        Image grey(W, H);
+        grey.fill(0.4f, 0.4f, 0.4f, 1);
+        std::vector<float> same = truth;
+        refineMatteEdges(same, grey, 8, 1.0);
+        QVERIFY(same[size_t(100) * W + 120] > 0.95f && same[size_t(10) * W + 10] < 0.05f);
+
+        // Consolidate: a hole and a narrow gap closed, the outline otherwise kept.
+        std::vector<float> holey = truth;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                if (std::hypot(x - 120.0, y - 100.0) < 6) holey[size_t(y) * W + size_t(x)] = 0;  // a hole
+                if (x >= 150 && x < 154 && y > 80 && y < 120) holey[size_t(y) * W + size_t(x)] = 0;  // a slit
+            }
+        std::vector<float> closed = holey;
+        consolidateMatte(closed, W, H, 8);
+        QVERIFY(closed[size_t(100) * W + 120] > 0.99f && closed[size_t(100) * W + 152] > 0.99f);
+        QVERIFY(closed[size_t(100) * W + 200] < 0.01f && closed[size_t(20) * W + 120] < 0.01f);  // still nothing outside
+        QVERIFY(std::fabs(closed[size_t(100) * W + 170] - truth[size_t(100) * W + 170]) < 0.05f);  // the edge where it was
+        std::vector<float> none = holey;
+        consolidateMatte(none, W, H, 0);
+        QVERIFY(none == holey);
+
+        // A disc feathered by 20 px keeps its whole ramp; only the slit cut into it fills, feathered the same way.
+        auto smooth = [](double d, double fe) {
+            const double k = std::clamp(0.5 - d / fe, 0.0, 1.0);
+            return float(k * k * (3 - 2 * k));
+        };
+        std::vector<float> soft(size_t(W) * H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const bool slit = x >= 150 && x < 154 && y > 80 && y < 120;
+                soft[size_t(y) * W + size_t(x)] = slit ? 0.f : smooth(std::hypot(x + 0.5 - 120, y + 0.5 - 100) - 50, 20);
+            }
+        std::vector<float> softClosed = soft;
+        consolidateMatte(softClosed, W, H, 8, 20);
+        QVERIFY(softClosed[size_t(100) * W + 152] > 0.99f);
+        for (int x : {66, 72, 76, 80})  // the left edge's ramp, far from the slit
+            QCOMPARE(softClosed[size_t(100) * W + size_t(x)], soft[size_t(100) * W + size_t(x)]);
+        QVERIFY(soft[size_t(100) * W + 72] > 0.3f && soft[size_t(100) * W + 72] < 0.7f && soft[size_t(100) * W + 76] < 0.95f);
+        // Two feathered discs 4 px apart joined by a small Consolidate: the gap fills, and no haze spreads round them.
+        std::vector<float> pair(size_t(W) * H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const double d = std::min(std::hypot(x + 0.5 - 68, y + 0.5 - 100), std::hypot(x + 0.5 - 172, y + 0.5 - 100)) - 50;
+                pair[size_t(y) * W + size_t(x)] = smooth(d, 20);
+            }
+        for (float& v : pair) v = v < 0.02f ? 0.f : v;  // (the feather's faint tail cut, so the shapes stand 4 px apart)
+        std::vector<float> joined = pair;
+        consolidateMatte(joined, W, H, 3, 20);
+        QVERIFY(joined[size_t(100) * W + 120] > pair[size_t(100) * W + 120] + 0.2f);
+        QVERIFY2(joined[size_t(70) * W + 120] < 0.01f && pair[size_t(70) * W + 120] == 0, qPrintable(QString::number(joined[size_t(70) * W + 120])));
+        // Nothing joins a shape to the frame's edge: beyond the frame counts as outside.
+        std::vector<float> nearEdge(size_t(W) * H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) nearEdge[size_t(y) * W + size_t(x)] = std::hypot(x + 0.5 - 53, y + 0.5 - 100) < 50 ? 1.f : 0.f;
+        consolidateMatte(nearEdge, W, H, 8);
+        QVERIFY(nearEdge[size_t(100) * W + 1] < 0.01f && nearEdge[size_t(100) * W + 53] > 0.99f);
+
+        // Refine Edges across a wide feather: the whole ramp settles on the disc, with no step where the band would end.
+        std::vector<float> wide(size_t(W) * H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) wide[size_t(y) * W + size_t(x)] = smooth(std::hypot(x + 0.5 - 120, y + 0.5 - 100) - 50, 30);
+        std::vector<float> wideRefined = wide;
+        refineMatteEdges(wideRefined, img, 4, 1.0);
+        QVERIFY2(error(wideRefined) < 0.3 * error(wide), qPrintable(QString("%1 -> %2").arg(error(wide)).arg(error(wideRefined))));
+        // A stray faint pixel far from the edge changes nothing, and a mask that is sure but never whole (a people
+        // mask at 0.96 inside) is refined all the same.
+        std::vector<float> stray = coarse, strayRefined;
+        stray[size_t(5) * W + 5] = 0.05f;
+        strayRefined = stray;
+        refineMatteEdges(strayRefined, img, 8, 1.0);
+        QVERIFY2(error(strayRefined) < 0.15 * error(coarse), qPrintable(QString::number(error(strayRefined))));
+        std::vector<float> unsure = coarse;
+        for (float& v : unsure) v *= 0.96f;
+        const double unsureBefore = error(unsure);
+        refineMatteEdges(unsure, img, 8, 1.0);
+        QVERIFY2(error(unsure) < 0.5 * unsureBefore, qPrintable(QString("%1 -> %2").arg(unsureBefore).arg(error(unsure))));
+        // Colours above white (HDR) count as they are, and transparent pixels are left alone.
+        Image bright = img;
+        for (size_t i = 0; i < size_t(W) * H; ++i)
+            for (int k = 0; k < 3; ++k) bright.px[i * 4 + k] += 1.5f;
+        std::vector<float> brightRefined = coarse;
+        refineMatteEdges(brightRefined, bright, 8, 1.0);
+        QVERIFY2(error(brightRefined) < 0.15 * error(coarse), qPrintable(QString::number(error(brightRefined))));
+        Image clear = img;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W / 2; ++x) std::fill_n(clear.at(x, y), 4, 0.f);
+        std::vector<float> clearRefined = coarse;
+        refineMatteEdges(clearRefined, clear, 8, 1.0);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W / 2; ++x) QCOMPARE(clearRefined[size_t(y) * W + size_t(x)], coarse[size_t(y) * W + size_t(x)]);
+
+        // Through an effect's mask: an ellipse drawn loosely round the disc, refined onto it.
+        Project p = makeDefaultProject();
+        Effect e = makeEffect(p, "invert");
+        e.params["mask.shape"] = Param(1.0);
+        e.params["mask.x"] = Param(0.5);
+        e.params["mask.y"] = Param(0.5);
+        e.params["mask.w"] = Param(0.45);  // radii of 54 px, the disc's 50
+        e.params["mask.h"] = Param(0.54);
+        e.params["mask.feather"] = Param(1.0);
+        const std::vector<float> loose = effectMatte(e, 0, img, 1.0);
+        e.params["mask.refine"] = Param(100.0);
+        e.params["mask.refine_radius"] = Param(12.0);
+        const std::vector<float> snapped = effectMatte(e, 0, img, 1.0);
+        QVERIFY2(error(snapped) < 0.15 * error(loose), qPrintable(QString("%1 -> %2").arg(error(loose)).arg(error(snapped))));
     }
 
     void multicamShowsOneAngle() {
@@ -2954,6 +3141,25 @@ colorspaces:
         QVERIFY(frameKey(p, s, 40, o) != k40);
         blue.effects.clear();
         QCOMPARE(frameKey(p, s, 40, o), k40);
+        // An object mask's names don't show in its frames: renaming an object keeps their keys; a cut-out changes them.
+        Effect masked = makeEffect(p, "invert");
+        masked.params["mask.shape"] = Param(3.0);
+        auto objects = std::make_shared<ObjectMask>();
+        objects->fps = 25;
+        objects->more.emplace_back();
+        masked.object = objects;
+        blue.effects.push_back(masked);
+        const QByteArray withMask = frameKey(p, s, 40, o);
+        auto renamed = std::make_shared<ObjectMask>(*objects);
+        renamed->name = "Car";
+        renamed->more[0].name = "Driver";
+        blue.effects.back().object = renamed;
+        QCOMPARE(frameKey(p, s, 40, o), withMask);
+        auto cut = std::make_shared<ObjectMask>(*objects);
+        cut->more[0].subtract = true;
+        blue.effects.back().object = cut;
+        QVERIFY(frameKey(p, s, 40, o) != withMask);
+        blue.effects.clear();
         // Moving a clip keeps its frames: the same frame of it has the same key wherever it sits.
         Project lone = makeDefaultProject();
         Sequence& ls = *lone.active();
@@ -4437,6 +4643,158 @@ colorspaces:
         QVERIFY(!measureLightLevels(empty, *empty.active(), 0, 0, l, &err) && err.find("empty") != std::string::npos);
     }
 
+    void colorChartCalibration() {
+        // A ColorChecker shot under a warm cast: its colours through a matrix in linear light, on a grey wall.
+        const ChartColors& ref = colorChecker24();
+        auto lin = [](double v) { return std::pow(std::max(v, 0.0), 2.4); };
+        auto code = [](double v) { return std::pow(std::max(v, 0.0), 1 / 2.4); };
+        const double cast[3][3] = {{1.15, 0.08, 0.0}, {0.02, 0.95, 0.03}, {0.0, 0.05, 0.7}};
+        ChartColors shot;
+        for (int i = 0; i < 24; ++i)
+            for (int c = 0; c < 3; ++c) {
+                const double l = cast[c][0] * lin(ref[size_t(i)][0]) + cast[c][1] * lin(ref[size_t(i)][1]) + cast[c][2] * lin(ref[size_t(i)][2]);
+                shot[size_t(i)][size_t(c)] = code(l * 0.9);
+            }
+        // Draws the chart over (x, y, w, h) in pixels of a W x H picture, turned: 0 upright, 1 upside down, 2 with its top
+        // to the right, 3 with its top to the left.
+        auto picture = [&](int turn, int x0, int y0, int w, int h, int W = 640, int H = 360) {
+            Image img(W, H);
+            img.fill(0.33f, 0.33f, 0.33f, 1);
+            for (int y = y0 - 8; y < y0 + h + 8; ++y)
+                for (int x = x0 - 8; x < x0 + w + 8; ++x) {
+                    float* p = img.at(x, y);
+                    p[0] = p[1] = p[2] = 0.05f;  // the chart's black frame and gaps
+                }
+            const int cols = turn >= 2 ? 4 : 6, rows = turn >= 2 ? 6 : 4;
+            for (int r = 0; r < rows; ++r)
+                for (int c = 0; c < cols; ++c) {
+                    // Which patch sits in this cell.
+                    int pr = r, pc = c;
+                    if (turn == 1) pr = 3 - r, pc = 5 - c;
+                    if (turn == 2) pr = 3 - c, pc = r;
+                    if (turn == 3) pr = c, pc = 5 - r;
+                    const ChartColor& col = shot[size_t(pr * 6 + pc)];
+                    const double cw = double(w) / cols, ch = double(h) / rows;
+                    for (int y = int(y0 + r * ch + ch * 0.08); y < int(y0 + (r + 1) * ch - ch * 0.08); ++y)
+                        for (int x = int(x0 + c * cw + cw * 0.08); x < int(x0 + (c + 1) * cw - cw * 0.08); ++x) {
+                            float* p = img.at(x, y);
+                            for (int k = 0; k < 3; ++k) p[k] = float(col[size_t(k)]);
+                        }
+                }
+            return img;
+        };
+        auto near = [](const ChartColors& a, const ChartColors& b, double tol) {
+            for (size_t i = 0; i < 24; ++i)
+                for (size_t k = 0; k < 3; ++k)
+                    if (std::fabs(a[i][k] - b[i][k]) > tol) return false;
+            return true;
+        };
+        // Upright: found, its outline the patch area, its patches as shot.
+        Image img = picture(0, 120, 80, 300, 200);
+        TrackQuad q;
+        double residual = 1;
+        QVERIFY(detectChart(img, q, &residual));
+        QVERIFY2(residual < 0.03, qPrintable(QString::number(residual)));
+        QVERIFY2(std::fabs(q.p[0].x - 120.0 / 640) < 0.02 && std::fabs(q.p[0].y - 80.0 / 360) < 0.03, qPrintable(QString("%1 %2").arg(q.p[0].x).arg(q.p[0].y)));
+        QVERIFY(std::fabs(q.p[2].x - 420.0 / 640) < 0.02 && std::fabs(q.p[2].y - 280.0 / 360) < 0.03);
+        const ChartColors measured = sampleChart(img, q);
+        QVERIFY(near(measured, shot, 0.01));
+        // The fit takes the cast away: far off before, close after.
+        const ChartFit fit = fitChart(measured);
+        QVERIFY(fit.ok);
+        QVERIFY2(fit.deltaEBefore > 5 && fit.deltaEAfter < 1 && fit.deltaEMax < 2,
+                 qPrintable(QString("%1 %2 %3").arg(fit.deltaEBefore).arg(fit.deltaEAfter).arg(fit.deltaEMax)));
+        // The Chart Match effect does the same to the picture.
+        Effect e = chartMatchEffect(fit, 1);
+        QCOMPARE(e.type, std::string("chart_match"));
+        Image graded = img;
+        applyChartMatch(e, 0, graded);
+        QVERIFY(near(sampleChart(graded, q), ref, 0.02));
+        e.params["amount"] = 0.0;  // none of it
+        Image same = img;
+        applyChartMatch(e, 0, same);
+        QVERIFY(near(sampleChart(same, q), shot, 1e-4));
+        // Upside down and on either side: found, the outline starting at the chart's own top left; and in a tall frame.
+        for (int turn : {1, 2, 3, 4}) {
+            const Image turned = turn == 1   ? picture(1, 200, 100, 330, 220)
+                                 : turn == 4 ? picture(0, 40, 240, 270, 180, 360, 640)
+                                             : picture(turn, 250, 40, 180, 270);
+            TrackQuad tq;
+            QVERIFY2(detectChart(turned, tq), qPrintable(QString::number(turn)));
+            QVERIFY2(near(sampleChart(turned, tq), shot, 0.015), qPrintable(QString::number(turn)));
+        }
+        // An outline that is none (corners in a line) or off the picture is no measurement.
+        {
+            bool complete = false;
+            sampleChart(img, q, rec709Space(), &complete);
+            QVERIFY(complete);
+            TrackQuad line;
+            line.p[0] = {0.1, 0.5}, line.p[1] = {0.5, 0.5}, line.p[2] = {0.9, 0.5}, line.p[3] = {0.3, 0.5};
+            sampleChart(img, line, rec709Space(), &complete);
+            QVERIFY(!complete);
+            TrackQuad off = q;
+            for (auto& pt : off.p) pt.x += 0.6;
+            sampleChart(img, off, rec709Space(), &complete);
+            QVERIFY(!complete);
+        }
+        // At no change it changes nothing: deep shadows, highlights past white and colour outside the gamut kept.
+        {
+            const float vals[6] = {0.002f, 0.01f, 0.02f, 0.03f, 1.3f, -0.02f};
+            Image px(6, 1);
+            for (int i = 0; i < 6; ++i) {
+                float* p = px.at(i, 0);
+                p[0] = p[1] = p[2] = vals[i], p[3] = 1;
+            }
+            applyChartMatch(chartMatchEffect(ChartFit{}, 3), 0, px);
+            for (int i = 0; i < 6; ++i) QVERIFY2(std::fabs(px.at(i, 0)[0] - vals[i]) < 2e-4, qPrintable(QString("%1 %2").arg(vals[i]).arg(px.at(i, 0)[0])));
+        }
+        // Premultiplied pixels: an empty one stays empty, a half-covered one gets the same colour at half strength; a pixel
+        // that is not a number does no harm.
+        {
+            ChartFit lift;
+            lift.m[0][0] = 1.2;
+            lift.offset[0] = lift.offset[1] = lift.offset[2] = 0.002;
+            Image a(4, 1);
+            a.fill(0, 0, 0, 0);
+            float* half = a.at(1, 0);
+            half[0] = half[1] = half[2] = 0.25f, half[3] = 0.5f;
+            float* whole = a.at(2, 0);
+            whole[0] = whole[1] = whole[2] = 0.5f, whole[3] = 1;
+            float* bad = a.at(3, 0);
+            bad[0] = std::numeric_limits<float>::quiet_NaN(), bad[1] = bad[2] = 0.5f, bad[3] = 1;
+            applyChartMatch(chartMatchEffect(lift, 4), 0, a);
+            for (int k = 0; k < 4; ++k) QCOMPARE(a.at(0, 0)[k], 0.0f);
+            for (int k = 0; k < 3; ++k) QVERIFY(std::fabs(a.at(1, 0)[k] - a.at(2, 0)[k] * 0.5f) < 1e-5);
+            QVERIFY(a.at(2, 0)[0] > 0.5f);
+            QVERIFY(std::isfinite(a.at(3, 0)[0]));
+        }
+        // In HDR and wide-gamut sequences: the patches read back as the chart's own values, and the effect, told the
+        // space, grades the picture there to the chart.
+        QCOMPARE(e.s("space"), std::string("rec709"));
+        for (const char* id : {"rec2100pq", "rec2100hlg", "p3d65", "rec2020"}) {
+            const ColorSpace& cs = *findColorSpace(id);
+            Image wide = img;
+            convertColor(wide, rec709Space(), cs);
+            const ChartColors read = sampleChart(wide, q, cs);
+            QVERIFY2(near(read, shot, 0.01), id);
+            applyChartMatch(chartMatchEffect(fitChart(read), 5, id), 0, wide);
+            QVERIFY2(near(sampleChart(wide, q, cs), ref, 0.02), id);
+        }
+        // The camera's calibration stays under every grade version.
+        QVERIFY(!isGradeEffect(e));
+        QVERIFY(isGradeEffect(makeEffect("color_correct", 9)));
+        // A picture without a chart: none.
+        Image wall(640, 360);
+        for (int y = 0; y < 360; ++y)
+            for (int x = 0; x < 640; ++x) {
+                float* p = wall.at(x, y);
+                p[0] = float(x) / 640, p[1] = float(y) / 360, p[2] = 0.4f, p[3] = 1;
+            }
+        QVERIFY(!detectChart(wall, q));
+        QVERIFY(std::fabs(deltaE76({1, 1, 1}, {0, 0, 0}) - 100) < 0.5);
+        QCOMPARE(std::string(colorCheckerName(18)), std::string("White"));
+    }
+
     void stereoViews() {
         // Two eyes, a red left and a blue right, 8 x 4, shown each way the viewer and exports offer.
         Image left(8, 4), right(8, 4);
@@ -4660,3 +5018,6 @@ colorspaces:
 
 QTEST_MAIN(TestRender)
 #include "test_render.moc"
+
+// (AI models run on the processor in tests, so results do not depend on the machine's GPU: media/Inference.h.)
+[[maybe_unused]] static const bool kCpuInference = (qputenv("MONTAGE_INFERENCE", "cpu"), true);

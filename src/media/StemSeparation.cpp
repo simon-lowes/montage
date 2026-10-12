@@ -195,7 +195,7 @@ namespace {
 
 struct Model {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "montage-stems"};
-    std::unique_ptr<Ort::Session> session;
+    std::unique_ptr<OrtModel> session;
     int stems = 0;
 };
 
@@ -227,7 +227,7 @@ std::shared_ptr<Model> loadModel(int stems, std::string* error) {
 #else
         const std::string& path = graph;
 #endif
-        model->session = std::make_unique<Ort::Session>(model->env, path.c_str(), so);
+        model->session = openModel(model->env, path.c_str(), so);
         slot = model;
         return model;
     } catch (const Ort::Exception& e) {

@@ -604,7 +604,19 @@ double mediaFps(const Sequence& s, const MediaItem& m) { return m.fps.valid() ? 
 ObjectMask objectFor(const Sequence& s, const MediaItem& m, const ObjectMask* existing) {
     ObjectMask o = existing ? *existing : ObjectMask{};
     if (o.fps <= 0) o.fps = mediaFps(s, m);
+    for (ObjectMask& x : o.more) x.fps = o.fps;
     return o;
+}
+
+// Object `which` of `o`, added (empty) when `which` is its count.
+ObjectMask& objectIn(ObjectMask& o, int which) {
+    if (which >= o.count()) {
+        ObjectMask x;
+        x.fps = o.fps;
+        o.more.push_back(std::move(x));
+        return o.more.back();
+    }
+    return o.object(which);
 }
 
 // The media frame range a clip shows (inclusive, ascending).
@@ -631,39 +643,88 @@ int64_t clipObjectFrame(const Project& p, const Sequence& s, const Clip& c, Fram
 }
 
 std::shared_ptr<ObjectMask> withObjectPoint(const Project& p, const Sequence& s, const Clip& c, const Effect& e,
-                                            FrameTime local, const ObjectPoint& point) {
+                                            FrameTime local, const ObjectPoint& point, int which) {
     const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
     if (!m) return nullptr;
     auto o = std::make_shared<ObjectMask>(objectFor(s, *m, e.object.get()));
-    o->prompts[o->frameAt(sourceSeconds(s, c, local))].push_back(point);
+    objectIn(*o, which).prompts[o->frameAt(sourceSeconds(s, c, local))].push_back(point);
     return o;
 }
 
 std::shared_ptr<ObjectMask> withObjectPrompts(const Project& p, const Sequence& s, const Clip& c, const Effect& e,
-                                              FrameTime local, const std::vector<ObjectPoint>& points) {
+                                              FrameTime local, const std::vector<ObjectPoint>& points, int which) {
     const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
     if (!m) return nullptr;
     auto o = std::make_shared<ObjectMask>(objectFor(s, *m, e.object.get()));
     const int64_t n = o->frameAt(sourceSeconds(s, c, local));
+    ObjectMask& t = objectIn(*o, which);
     if (points.empty()) {
-        o->prompts.erase(n);
-        o->frames.erase(n);
+        t.prompts.erase(n);
+        t.frames.erase(n);
     } else {
-        o->prompts[n] = points;
+        t.prompts[n] = points;
     }
     return o;
 }
 
+std::shared_ptr<ObjectMask> withNewObject(const Project& p, const Sequence& s, const Clip& c, const Effect& e, bool subtract,
+                                          int* which) {
+    const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
+    if (!m) return nullptr;
+    if (!e.object && subtract) return nullptr;  // (nothing to cut out of yet)
+    auto o = std::make_shared<ObjectMask>(objectFor(s, *m, e.object.get()));
+    const int index = e.object ? o->count() : 0;  // (a mask with no object yet: this is its first)
+    objectIn(*o, index).subtract = subtract;
+    if (which) *which = index;
+    return o;
+}
+
+std::shared_ptr<ObjectMask> withoutObject(const Effect& e, int which) {
+    if (!e.object || which < 0 || which >= e.object->count()) return e.object ? std::make_shared<ObjectMask>(*e.object) : nullptr;
+    auto o = std::make_shared<ObjectMask>(*e.object);
+    if (which > 0) {
+        o->more.erase(o->more.begin() + (which - 1));
+        return o;
+    }
+    if (o->more.empty()) return nullptr;
+    // The next object that adds becomes the first; a cut-out stays a cut-out, under an empty first object if need be.
+    std::vector<ObjectMask> rest = std::move(o->more);
+    auto adds = std::find_if(rest.begin(), rest.end(), [](const ObjectMask& x) { return !x.subtract; });
+    if (adds == rest.end() && o->prompts.empty() && o->frames.empty()) return nullptr;  // (an empty first removed: all goes)
+    ObjectMask first;
+    if (adds != rest.end()) {
+        first = std::move(*adds);
+        rest.erase(adds);
+    }
+    first.more = std::move(rest);
+    first.subtract = false;
+    first.fps = o->fps;
+    return std::make_shared<ObjectMask>(std::move(first));
+}
+
+std::shared_ptr<ObjectMask> withObjectSubtracted(const Effect& e, int which, bool subtract) {
+    if (!e.object) return nullptr;
+    auto o = std::make_shared<ObjectMask>(*e.object);
+    if (which > 0 && which < o->count()) o->object(which).subtract = subtract;
+    return o;
+}
+
+int currentObject(const Effect& e, int chosen) {
+    const int n = e.object ? e.object->count() : 1;
+    return std::clamp(chosen, 0, n - 1);
+}
+
 std::shared_ptr<const ObjectMask> segmentClipObjectFrame(const Project& p, const Sequence& s, const Clip& c,
-                                                         const ObjectMask& object, FrameTime local, std::string* error) {
+                                                         const ObjectMask& object, FrameTime local, std::string* error, int which) {
     const MediaItem* m = videoMedia(p, c, error);
     if (!m) return nullptr;
     auto o = std::make_shared<ObjectMask>(objectFor(s, *m, &object));
     const int64_t n = o->frameAt(sourceSeconds(s, c, local));
-    auto it = o->prompts.find(n);
-    if (it == o->prompts.end() || it->second.empty()) {
+    ObjectMask& t = objectIn(*o, which);
+    auto it = t.prompts.find(n);
+    if (it == t.prompts.end() || it->second.empty()) {
         // No clicks left on this frame: it is no longer segmented.
-        o->frames.erase(n);
+        t.frames.erase(n);
         return o;
     }
     VideoDecoder dec;
@@ -676,16 +737,21 @@ std::shared_ptr<const ObjectMask> segmentClipObjectFrame(const Project& p, const
     ObjectTracker tracker;
     SegmentResult r;
     if (!tracker.step(*f, it->second, r, error)) return nullptr;
-    o->frames[n] = packObjectLogits(r.logits.data());
+    t.frames[n] = packObjectLogits(r.logits.data());
     return o;
 }
 
 std::shared_ptr<const ObjectMask> trackClipObject(const Project& p, const Sequence& s, const Clip& c, const ObjectMask& object,
                                                   FrameTime fromLocal, bool forward, const TrackProgress& progress,
-                                                  const std::atomic<bool>* cancel, std::string* error) {
+                                                  const std::atomic<bool>* cancel, std::string* error, int which) {
     const MediaItem* m = videoMedia(p, c, error);
     if (!m) return nullptr;
     auto o = std::make_shared<ObjectMask>(objectFor(s, *m, &object));
+    if (which < 0 || which >= o->count()) {
+        if (error) *error = "No such object in the mask";
+        return nullptr;
+    }
+    ObjectMask& t = o->object(which);
     int64_t lo = 0, hi = 0;
     clipFrameRange(s, c, *o, *m, lo, hi);
     fromLocal = std::clamp<FrameTime>(fromLocal, 0, std::max<FrameTime>(0, c.duration - 1));
@@ -695,7 +761,7 @@ std::shared_ptr<const ObjectMask> trackClipObject(const Project& p, const Sequen
     const int dir = mediaForward ? 1 : -1;
     // Start at the nearest clicked frame behind the playhead.
     int64_t start = -1;
-    for (const auto& [n, pts] : o->prompts) {
+    for (const auto& [n, pts] : t.prompts) {
         if (pts.empty() || n < lo || n > hi) continue;
         if (mediaForward ? n <= from && (start < 0 || n > start) : n >= from && (start < 0 || n < start)) start = n;
     }
@@ -718,10 +784,10 @@ std::shared_ptr<const ObjectMask> trackClipObject(const Project& p, const Sequen
         Frame16Ptr f = modelFrame(dec, *o, n);
         if (!f) break;  // past the media's last frame
         static const std::vector<ObjectPoint> none;
-        auto it = o->prompts.find(n);
+        auto it = t.prompts.find(n);
         SegmentResult r;
-        if (!tracker.step(*f, it != o->prompts.end() ? it->second : none, r, error)) return nullptr;
-        o->frames[n] = packObjectLogits(r.logits.data());
+        if (!tracker.step(*f, it != t.prompts.end() ? it->second : none, r, error)) return nullptr;
+        t.frames[n] = packObjectLogits(r.logits.data());
         if (progress) progress(double(std::llabs(n - start) + 1) / total);
         if (n == end) break;
     }

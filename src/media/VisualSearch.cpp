@@ -195,7 +195,7 @@ bool visualSearchAvailable() { return true; }
 
 struct ClipModel::Impl {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "montage-visual"};
-    std::unique_ptr<Ort::Session> text, vision;
+    std::unique_ptr<OrtModel> text, vision;
     Bpe bpe;
 };
 
@@ -238,7 +238,7 @@ std::shared_ptr<ClipModel> ClipModel::load(std::string* error) {
 #else
             const std::string path = pack.path(f);
 #endif
-            return std::make_unique<Ort::Session>(model->d_->env, path.c_str(), so);
+            return openModel(model->d_->env, path.c_str(), so);
         };
         model->d_->text = open(pack.files[0]);
         model->d_->vision = open(pack.files[1]);

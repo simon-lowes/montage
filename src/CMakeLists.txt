@@ -39,6 +39,7 @@ add_library(montage_engine STATIC
   core/TimelineCompare.h core/TimelineCompare.cpp
   core/Reconform.h core/Reconform.cpp
   core/Adr.h core/Adr.cpp
+  core/Provenance.h core/Provenance.cpp
   core/AudioDescription.h core/AudioDescription.cpp
   core/MergeClips.h core/MergeClips.cpp
   core/ClipAnimation.h core/ClipAnimation.cpp
@@ -75,6 +76,7 @@ add_library(montage_engine STATIC
   media/Matting.h media/Matting.cpp
   media/TextToSpeech.h media/TextToSpeech.cpp
   media/VoiceClone.h media/VoiceClone.cpp
+  media/ContentCredentials.h media/ContentCredentials.cpp
   media/SoundSearch.h media/SoundSearch.cpp
   media/StemSeparation.h media/StemSeparation.cpp
   media/Inpaint.h media/Inpaint.cpp
@@ -85,6 +87,8 @@ add_library(montage_engine STATIC
   media/Relink.h media/Relink.cpp
   media/Analysis.h media/Analysis.cpp
   media/Proxy.h media/Proxy.cpp
+  media/Inference.h media/Inference.cpp
+  render/ColorChart.h render/ColorChart.cpp
   media/Loudness.h media/Loudness.cpp
   media/AudioSync.h media/AudioSync.cpp
   media/FieldRecorder.h media/FieldRecorder.cpp
@@ -309,6 +313,54 @@ if(MONTAGE_WITH_ONNXRUNTIME)
     message(FATAL_ERROR "ONNX Runtime not found (set ONNXRUNTIME_ROOT)")
   else()
     message(STATUS "ONNX Runtime not found: object masks can be shown but not tracked")
+  endif()
+endif()
+if(MONTAGE_WITH_C2PA)
+  # c2pa-rs's C API as a static library (scripts/build-c2pa.sh), with the system libraries rustc says it needs (in
+  # its order, repeats kept: the Windows GNU toolchain's runtime libraries need them).
+  if(NOT C2PA_ROOT)
+    if(DEFINED ENV{C2PA_ROOT})
+      set(C2PA_ROOT $ENV{C2PA_ROOT})
+    elseif(EXISTS /opt/c2pa/include/c2pa.h)
+      set(C2PA_ROOT /opt/c2pa)
+    endif()
+  endif()
+  if(C2PA_ROOT)
+    find_path(C2PA_INCLUDE_DIR c2pa.h PATHS ${C2PA_ROOT}/include NO_DEFAULT_PATH)
+    find_file(C2PA_LIBRARY libc2pa_c.a PATHS ${C2PA_ROOT}/lib NO_DEFAULT_PATH)
+  endif()
+  if(C2PA_INCLUDE_DIR AND C2PA_LIBRARY)
+    set(C2PA_NATIVE "")
+    if(EXISTS ${C2PA_ROOT}/lib/c2pa-native-libs.txt)
+      file(READ ${C2PA_ROOT}/lib/c2pa-native-libs.txt C2PA_NATIVE_TEXT)
+      string(STRIP "${C2PA_NATIVE_TEXT}" C2PA_NATIVE_TEXT)
+      separate_arguments(C2PA_NATIVE_ARGS UNIX_COMMAND "${C2PA_NATIVE_TEXT}")
+      set(framework OFF)
+      foreach(arg IN LISTS C2PA_NATIVE_ARGS)
+        if(framework)
+          list(APPEND C2PA_NATIVE "-framework ${arg}")
+          set(framework OFF)
+        elseif(arg STREQUAL "-framework")
+          set(framework ON)
+        elseif(arg MATCHES "^-l(.+)$")
+          list(APPEND C2PA_NATIVE ${CMAKE_MATCH_1})
+        elseif(arg MATCHES "^(.+)\\.lib$")
+          list(APPEND C2PA_NATIVE ${CMAKE_MATCH_1})
+        endif()
+      endforeach()
+    endif()
+    add_library(montage_c2pa INTERFACE)
+    target_include_directories(montage_c2pa INTERFACE ${C2PA_INCLUDE_DIR})
+    # A static library: its functions are not imported from a DLL (c2pa.h declares them dllimport on Windows otherwise).
+    target_compile_definitions(montage_c2pa INTERFACE C2PA_DYNAMIC_LOADING=1)
+    target_link_libraries(montage_c2pa INTERFACE ${C2PA_LIBRARY} ${C2PA_NATIVE})
+    target_link_libraries(montage_engine PRIVATE montage_c2pa)
+    target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_C2PA)
+    message(STATUS "C2PA (${C2PA_LIBRARY}; ${C2PA_NATIVE}): Content Credentials enabled")
+  elseif(MONTAGE_REQUIRE_C2PA)
+    message(FATAL_ERROR "C2PA library not found (run scripts/build-c2pa.sh and set C2PA_ROOT)")
+  else()
+    message(STATUS "C2PA library not found: exports are not signed with Content Credentials")
   endif()
 endif()
 if(MONTAGE_WITH_THORVG)

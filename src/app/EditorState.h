@@ -106,6 +106,10 @@ public:
     // Selecting clips or a transition clears it.
     Id inspectedChain() const { return inspectedChain_; }
     void inspectChain(Id owner);
+    // The object being picked in an effect's object mask (0 the first), clamped to the objects it has. Which one is a
+    // choice of what to work on, not a change to the project: it makes no undo step and works in a read-only project.
+    int maskObject(const Effect& e) const;
+    void setMaskObject(Id effect, int which);
     // The single clip shown in the inspector (first selected), or nullptr.
     const Clip* primaryClip() const;
 
@@ -206,6 +210,9 @@ public:
     void message(const QString& text, int timeoutMs = 4000) { emit statusMessage(text, timeoutMs); }
     // Decodes the media's audio (and its waveform peaks) in the background; mediaReady follows.
     void startAudioDecode(const MediaItem& m);
+    // Reads and checks the Content Credentials in the media's file (media/ContentCredentials.h) in the background,
+    // setting its "c2pa" metadata to what they say ("" when it has none); projectChanged follows a change.
+    void startCredentialRead(const MediaItem& m);
     // The same for the channels clips have chosen (Clip::channels), each once.
     void startClipAudioDecodes();
     // Whether the media's file is missing (media/Relink.h), each file checked at most every two seconds, since
@@ -237,6 +244,7 @@ public:
 signals:
     void projectChanged();            // anything in the project changed
     void selectionChanged();
+    void maskObjectChanged();         // a different object chosen in an object mask
     void playheadChanged(montage::FrameTime t);
     void sequenceSwitched();          // a different sequence became active / project replaced
     void historyChanged();
@@ -284,6 +292,7 @@ private:
     // Reads their media's length and streams again on a worker (paths already being read are skipped), then applies
     // what changed (no reload) and emits growingRefreshed.
     void refreshLengths(const QStringList& paths);
+    std::map<std::string, int> credentialReads_;  // per media path, credential reads begun (only the latest is applied)
     std::set<QString> probing_;
     std::map<QString, int> reloads_;  // per file, how often reloaded (a read begun before a reload is not applied)
     // Sets what probing `path` gave on its media, in the project and every state undo, redo or a gesture's start can
@@ -299,6 +308,7 @@ private:
     std::vector<Id> selection_;
     Id selectedTransition_ = 0;
     Id inspectedChain_ = 0;
+    std::map<Id, int> maskObjects_;  // effect -> object being picked
     int targetVideo_ = 0;
     int targetAudio_ = 0;
     bool snapping_ = true;

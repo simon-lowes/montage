@@ -4,8 +4,10 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <sstream>
 
+#include "EditOps.h"
 #include "History.h"
 #include "MediaLog.h"
 #include "ReviewPage.h"
@@ -183,6 +185,95 @@ bool parseMarkerList(const std::string& text, const Sequence& s, std::vector<Mar
         for (Marker& m : out) m.t -= hour;
     std::sort(out.begin(), out.end(), [](const Marker& a, const Marker& b) { return a.t < b.t; });
     return true;
+}
+
+namespace {
+
+// A review marker's author, its status mark and version left off ("✓ Ana · v2" is Ana).
+std::string reviewAuthor(std::string name) {
+    for (const char* mark : {"\xE2\x9C\x93 ", "\xE2\x97\x90 "})
+        if (name.rfind(mark, 0) == 0) name = name.substr(std::strlen(mark));
+    if (const size_t v = name.rfind(" \xC2\xB7 v"); v != std::string::npos) name = name.substr(0, v);
+    return name;
+}
+
+// A review marker's comment as the note's text and its replies ("↳ who: what" lines).
+void splitComment(const std::string& comment, std::string& text, std::vector<std::string>& replies) {
+    std::istringstream in(comment);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("\xE2\x86\xB3 ", 0) == 0) replies.push_back(line);
+        else text += (text.empty() ? "" : "\n") + line;
+    }
+}
+
+// The same note imported again: its replies from both, the status set later, its text, length and drawing; where
+// the editor put the marker, its colour and chapter kept.
+void mergeNote(Marker& m, const Marker& in) {
+    std::string text, theirText;
+    std::vector<std::string> replies, theirs;
+    splitComment(m.comment, text, replies);
+    splitComment(in.comment, theirText, theirs);
+    for (const std::string& r : theirs)
+        if (std::find(replies.begin(), replies.end(), r) == replies.end()) replies.push_back(r);
+    m.comment = theirText.empty() ? text : theirText;
+    for (const std::string& r : replies) m.comment += (m.comment.empty() ? "" : "\n") + r;
+    if (in.reviewStatusAt >= m.reviewStatusAt) {  // (a status with no time never overrides one with a time)
+        m.name = in.name;
+        m.reviewStatusAt = in.reviewStatusAt;
+    }
+    m.duration = in.duration;
+    m.drawing = in.drawing;
+    m.reviewId = in.reviewId;
+}
+
+}  // namespace
+
+MarkerImport addImportedMarkers(Sequence& s, const std::vector<Marker>& markers) {
+    MarkerImport r;
+    auto at = [&](FrameTime t) { return std::find_if(s.markers.begin(), s.markers.end(), [&](const Marker& m) { return m.t == t; }); };
+    // The free frame nearest t (after it first), inside the cut where there is room.
+    auto freeNear = [&](FrameTime t) {
+        const FrameTime last = std::max(t, s.duration() - 1);
+        for (FrameTime d = 0; d <= last + 1; ++d) {
+            if (t + d <= last && at(t + d) == s.markers.end()) return t + d;
+            if (d && t - d >= 0 && at(t - d) == s.markers.end()) return t - d;
+        }
+        return last + 1;
+    };
+    for (const Marker& in : markers) {
+        if (in.reviewId.empty()) {
+            edit::addMarker(s, in);
+            ++r.added;
+            continue;
+        }
+        auto same = std::find_if(s.markers.begin(), s.markers.end(), [&](const Marker& m) { return m.reviewId == in.reviewId; });
+        if (same == s.markers.end()) {
+            // The same note imported before notes kept their ids: at its frame, by the same reviewer, saying the same.
+            std::string text;
+            std::vector<std::string> ignored;
+            splitComment(in.comment, text, ignored);
+            same = std::find_if(s.markers.begin(), s.markers.end(), [&](const Marker& m) {
+                if (!m.reviewId.empty() || m.t != in.t || reviewAuthor(m.name) != reviewAuthor(in.name)) return false;
+                std::string t;
+                std::vector<std::string> rs;
+                splitComment(m.comment, t, rs);
+                return t == text;
+            });
+        }
+        if (same != s.markers.end()) {
+            mergeNote(*same, in);
+            ++r.updated;
+            continue;
+        }
+        // (Never over another marker: the nearest free frame, the drawing kept to the frame it was drawn on.)
+        Marker m = in;
+        m.t = freeNear(in.t);
+        if (m.t != in.t && !m.drawing.empty()) m.drawnAt = in.t;
+        edit::addMarker(s, std::move(m));
+        ++r.added;
+    }
+    return r;
 }
 
 }  // namespace montage

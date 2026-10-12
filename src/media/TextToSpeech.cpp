@@ -142,7 +142,7 @@ namespace {
 
 struct Model {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "montage-tts"};
-    std::unique_ptr<Ort::Session> session;
+    std::unique_ptr<OrtModel> session;
     std::map<QChar, int64_t> vocab;
 };
 
@@ -178,7 +178,7 @@ std::shared_ptr<Model> loadModel(std::string* error) {
 #else
         const std::string path = pack.path(pack.files[0]);
 #endif
-        model->session = std::make_unique<Ort::Session>(model->env, path.c_str(), so);
+        model->session = openModel(model->env, path.c_str(), so);
         *cached = model;
         return model;
     } catch (const Ort::Exception& e) {

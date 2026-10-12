@@ -1,4 +1,5 @@
 #include "EditorState.h"
+#include "render/ClipAnalysis.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -19,6 +20,7 @@
 #include "core/MediaLog.h"
 #include "core/ProjectIO.h"
 #include "core/ProjectLock.h"
+#include "media/ContentCredentials.h"
 #include "media/Decoder.h"
 #include "media/MediaPool.h"
 #include "media/Proxy.h"
@@ -261,6 +263,18 @@ void EditorState::inspectChain(Id owner) {
     emit selectionChanged();
 }
 
+int EditorState::maskObject(const Effect& e) const {
+    auto it = maskObjects_.find(e.id);
+    return currentObject(e, it == maskObjects_.end() ? 0 : it->second);
+}
+
+void EditorState::setMaskObject(Id effect, int which) {
+    auto [it, added] = maskObjects_.try_emplace(effect, which);
+    if (!added && it->second == which) return;
+    it->second = which;
+    emit maskObjectChanged();
+}
+
 const Clip* EditorState::primaryClip() const {
     const Sequence* s = sequence();
     if (!s || selection_.empty()) return nullptr;
@@ -401,7 +415,7 @@ void EditorState::reloadChangedMedia(const QStringList& paths) {
                 reloaded.push_back(m.id);
             }
             for (const MediaItem& m : project_.media)
-                if (m.path == p && !m.subclipOf) startAudioDecode(m);
+                if (m.path == p && !m.subclipOf) startAudioDecode(m), startCredentialRead(m);
             for (auto it = clipAudioRequested_.begin(); it != clipAudioRequested_.end();)
                 it = audioKeyFile(it->first) == p ? clipAudioRequested_.erase(it) : std::next(it);
         }
@@ -597,7 +611,6 @@ void EditorState::startClipAudioDecodes() {
                 // An ambisonic file's field (core/Ambisonics.h), or the channels a clip picked.
                 const bool field = m->ambisonic > 0 && c.channels.empty();
                 if (c.channels.empty() && !field) continue;
-                if (soundSource(*m) != m->path) continue;  // (offline: its proxy's sound plays whole, decoded with the media)
                 std::string key = field ? ambisonicAudioKey(m->path) : audioKey(m->path, c.channels);
                 if (!clipAudioRequested_.insert({key, rate}).second) continue;
                 (void)QtConcurrent::run([key, rate] { MediaPool::instance().audio(key, rate); });
@@ -608,8 +621,47 @@ void EditorState::startAudioDecode(const MediaItem& m) {
     if (!m.hasAudio || m.path.empty() || m.kind == MediaKind::Image) return;
     const Sequence* s = sequence();
     int rate = s ? s->sampleRate : 48000;
-    std::string path = soundSource(m);  // (an offline file's proxy, when it carries sound)
+    std::string path = soundSource(m, true);  // (an offline file's proxy, when it carries sound)
     (void)QtConcurrent::run([path, rate] { MediaPool::instance().audio(path, rate); });
+}
+
+void EditorState::startCredentialRead(const MediaItem& m) {
+    if (m.path.empty() || m.subclipOf || m.kind == MediaKind::Sequence || !contentCredentialsAvailable()) return;
+    const std::string path = m.path;
+    const std::string file = mediaFileOnDisk(path);
+    if (!contentCredentialsFormat(file)) return;
+    QPointer<EditorState> self(this);
+    const uint64_t generation = projectGeneration_;
+    const int read = ++credentialReads_[path];
+    (void)QtConcurrent::run([self, path, file, generation, read] {
+        CredentialSummary c;
+        if (!readContentCredentials(file, c)) return;  // (unreadable: what it said before stays)
+        const std::string label = c.present ? credentialsLabel(c) : std::string();
+        QCoreApplication* app = QCoreApplication::instance();
+        if (!app) return;
+        QMetaObject::invokeMethod(app, [self, path, label, generation, read] {
+            if (!self || generation != self->projectGeneration_ || self->credentialReads_[path] != read) return;  // (read again since)
+            // As probed facts: in the project and every state undo, redo or a gesture's start can bring back.
+            auto apply = [&](Project& p) {
+                bool changed = false;
+                for (MediaItem& m : p.media) {
+                    if (m.path != path) continue;
+                    const auto it = m.metadata.find("c2pa");
+                    if (label.empty() ? it == m.metadata.end() : it != m.metadata.end() && it->second == label) continue;
+                    if (label.empty()) m.metadata.erase(it);
+                    else m.metadata["c2pa"] = label;
+                    changed = true;
+                }
+                return changed;
+            };
+            const bool changed = apply(self->project_);
+            self->history_.forEachState(apply);
+            if (self->gesture_) apply(self->gesture_->origin);
+            if (!changed) return;
+            self->history_.touch();
+            emit self->projectChanged();
+        }, Qt::QueuedConnection);
+    });
 }
 
 Id EditorState::importImageSequence(const QString& frame, Rational fps, QString* error) {
@@ -818,7 +870,7 @@ std::vector<Id> EditorState::importFiles(const QStringList& paths, QStringList* 
              }
              return true;
          });
-    for (const auto& m : items) startAudioDecode(m);
+    for (const auto& m : items) startAudioDecode(m), startCredentialRead(m);
     return ids;
 }
 
@@ -1108,6 +1160,7 @@ bool EditorState::open(const QString& path, QString* error, Access access) {
     lastRefresh_ = QDateTime::currentDateTimeUtc();
     if (gesture_) gesture_.reset();
     ++projectGeneration_;
+    maskObjects_.clear();
     project_ = std::move(p);
     // The last project's files are let go (idle decoders keep them open, which on Windows stops their folder being
     // moved or renamed, as when a card is relinked).
@@ -1186,6 +1239,7 @@ bool EditorState::reloadFromDisk() {
     const bool switched = p.activeSequence != project_.activeSequence;
     if (gesture_) gesture_.reset();
     ++projectGeneration_;
+    maskObjects_.clear();
     std::set<std::string> known;
     for (const MediaItem& m : project_.media) known.insert(m.path);
     project_ = std::move(p);
@@ -1245,6 +1299,7 @@ void EditorState::newProject() {
     }
     if (gesture_) gesture_.reset();
     ++projectGeneration_;
+    maskObjects_.clear();
     project_ = makeDefaultProject();
     MediaPool::instance().clear();  // let the last project's files go
     history_.clear();

@@ -19,6 +19,7 @@ struct RenderOptions {
     double scale = 1.0;        // output size relative to the sequence (preview resolution)
     bool highQuality = false;  // bicubic scaling for export
     bool useProxies = false;
+    bool offlineProxies = false;  // an offline file plays its proxy (viewing; deliveries show it offline)
     int depth = 0;             // nesting depth (internal)
     bool captions = false;     // draw the visible caption track over the program
     std::string displaySpace;  // program frames converted to this space (ColorSpace.h id) for viewing; "" = as is
@@ -110,6 +111,11 @@ public:
         nonBlocking_ = on;
         if (keyMixer_) keyMixer_->setNonBlocking(on);
     }
+    // An offline file's proxy plays its sound, when it has sound (playback; deliveries leave it silent).
+    void setOfflineProxies(bool on) {
+        offlineProxies_ = on;
+        if (keyMixer_) keyMixer_->setOfflineProxies(on);
+    }
     // How mix() lets an ambisonic sequence be heard: binaurally for headphones, or through two virtual cardioids for
     // speakers (the default, as downmixToStereo folds it: exports, stems; playback sets the monitoring choice).
     void setAmbisonicBinaural(bool on) { ambisonicBinaural_ = on; }
@@ -162,6 +168,7 @@ private:
     std::map<std::pair<Id, Id>, std::unique_ptr<State>> states_;
     std::mutex m_;
     bool nonBlocking_ = false;
+    bool offlineProxies_ = false;
     std::vector<bool> mask_, lfeOnly_;
     bool ambisonicBinaural_ = false;
     std::map<Id, std::unique_ptr<FoaBinaural>> binaural_;  // per ambisonic clip heard binaurally

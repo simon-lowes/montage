@@ -24,6 +24,7 @@
 #include "core/History.h"
 #include "core/Interchange.h"
 #include "core/ProjectIO.h"
+#include "core/Provenance.h"
 #include "core/Transcript.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
@@ -35,6 +36,7 @@
 #include "automation/McpServer.h"
 #include "automation/ScriptHost.h"
 #include "automation/ScriptPanel.h"
+#include "media/Inference.h"
 #include "media/Proxy.h"
 #ifdef MONTAGE_LIVE_BRIDGE
 #include "app/LiveBridge.h"
@@ -52,6 +54,7 @@
 #include "media/Rife.h"
 #include "media/Matting.h"
 #include "media/TextToSpeech.h"
+#include "media/ContentCredentials.h"
 #include "media/VoiceClone.h"
 #include "media/Inpaint.h"
 #include "media/Transcriber.h"
@@ -86,6 +89,7 @@ int usage() {
                  "  montage-cli frame <project.montage> --at TC -o <image.png>\n"
                  "  montage-cli presets\n"
                  "  montage-cli colorspaces\n"
+                 "  montage-cli devices                                (where AI models can run: CPU, GPU, NPU)\n"
                  "  montage-cli scenes <video> [--sensitivity 0..1]\n"
                  "  montage-cli proxy <video> -o <proxy.mp4|.mov> [--format h264|prores_proxy|dnxhr_lb|hevc10]\n"
                  "                    [--width 960|half|quarter] [--sound]   (an editing proxy; ProRes and HEVC keep HDR)\n"
@@ -109,6 +113,11 @@ int usage() {
                  "  montage-cli speak \"text\" -o voice.wav [--voice af_heart] [--speed 1]   (a voiceover from text; --phonemes prints them)\n"
                  "  montage-cli clone-speech \"text\" --voice sample.wav -o out.wav --consent [--language en] [--from S] [--to S]\n"
                  "              [--speed 1] [--exaggeration 0.5]   (in the voice of the sample, with its owner's consent; 23 languages)\n"
+                 "  montage-cli credentials <file> [--json]   (its Content Credentials: who signed it, intact or not, AI use)\n"
+                 "  montage-cli sign <file> --cert chain.pem --key key.pem [--project <project.montage>] [--allow-ai-training]\n"
+                 "              (Content Credentials: made in Montage, with the project's AI use and its sources' credentials)\n"
+                 "  montage-cli convert-voice <speech> --voice sample.wav -o out.wav --consent [--from S] [--to S]\n"
+                 "              [--voice-from S] [--voice-to S]   (the speech said again in the sample's voice, as long as it was)\n"
                  "  montage-cli script [--project <project.montage>] [--press <button> [--set id=value]...] <file.lua> [arg...]\n"
                  "                                       (a Lua script driving Montage's tools; montage.add_title{text = \"Hi\"}\n"
                  "                                        calls montage_add_title. A script with a panel prints it, or with\n"
@@ -1234,6 +1243,99 @@ int cmdCloneSpeech(const std::vector<std::string>& args) {
     return 0;
 }
 
+// A file's Content Credentials.
+int cmdCredentials(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    const bool json = std::find(args.begin(), args.end(), "--json") != args.end();
+    CredentialSummary c;
+    std::string err;
+    if (!readContentCredentials(args[0], c, &err)) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    if (json) {
+        std::printf("%s\n", c.json.c_str());
+        return 0;
+    }
+    if (!c.present) {
+        std::printf("No Content Credentials\n");
+        return 0;
+    }
+    std::printf("%s\n", credentialsLabel(c).c_str());
+    for (const std::string& a : c.actions) std::printf("  %s\n", a.c_str());
+    for (const std::string& p : c.problems) std::printf("  problem: %s\n", p.c_str());
+    return c.state == "Invalid" ? 2 : 0;
+}
+
+// Signs a file with Content Credentials, with a project's AI use and its sources' credentials.
+int cmdSign(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    CredentialSigner signer;
+    CredentialOptions o;
+    std::string project;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "--cert" && i + 1 < args.size()) signer.certificatePath = args[++i];
+        else if (args[i] == "--key" && i + 1 < args.size()) signer.keyPath = args[++i];
+        else if (args[i] == "--algorithm" && i + 1 < args.size()) signer.algorithm = args[++i];
+        else if (args[i] == "--project" && i + 1 < args.size()) project = args[++i];
+        else if (args[i] == "--allow-ai-training") o.allowAiTraining = true;
+        else return usage();
+    }
+    if (signer.certificatePath.empty() || signer.keyPath.empty()) return usage();
+    Provenance made;
+    if (!project.empty()) {
+        Project p;
+        if (!load(project, p)) return 1;
+        if (const Sequence* s = p.active()) made = sequenceProvenance(p, *s);
+        o.sources = made.sources;
+    }
+    std::string err;
+    if (!signContentCredentials(args[0], made, signer, o, &err)) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf("Signed %s (%zu AI uses noted)\n", args[0].c_str(), made.ai.size());
+    return 0;
+}
+
+// Says speech again in a voice cloned from a recording (Chatterbox's decoder), its words and timing kept, with the
+// voice's owner's consent.
+int cmdConvertVoice(const std::vector<std::string>& args) {
+    if (args.empty()) return usage();
+    std::string out, sample;
+    double from = 0, to = 0, voiceFrom = 0, voiceTo = 30;
+    bool consent = false;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
+        else if (args[i] == "--voice" && i + 1 < args.size()) sample = args[++i];
+        else if (args[i] == "--from" && i + 1 < args.size()) from = std::atof(args[++i].c_str());
+        else if (args[i] == "--to" && i + 1 < args.size()) to = std::atof(args[++i].c_str());
+        else if (args[i] == "--voice-from" && i + 1 < args.size()) voiceFrom = std::atof(args[++i].c_str());
+        else if (args[i] == "--voice-to" && i + 1 < args.size()) voiceTo = std::atof(args[++i].c_str());
+        else if (args[i] == "--consent") consent = true;
+        else return usage();
+    }
+    if (out.empty() || sample.empty()) return usage();
+    if (!consent) {
+        std::fprintf(stderr, "error: converting speech into someone's voice needs their consent: pass --consent to confirm you have it\n");
+        return 1;
+    }
+    std::vector<float> speech, voice, samples;
+    std::string err;
+    if (!voiceSoundFrom(args[0], from, to, speech, &err) || !voiceSampleFrom(sample, voiceFrom, voiceTo, voice, &err) ||
+        !convertVoice(speech, kCloneSampleRate, voice, kCloneSampleRate, samples, &err) ||
+        !writeClonedSpeechWav(out, samples,
+                              "Speech from " + std::filesystem::path(args[0]).filename().string() + " converted to a voice cloned from " +
+                                  std::filesystem::path(sample).filename().string() +
+                                  " with Chatterbox in Montage; the speaker's consent was confirmed.",
+                              &err)) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf("Wrote %s (%.2f s)\n", out.c_str(), double(samples.size()) / kCloneSampleRate);
+    return 0;
+}
+
 // A Lua script on Montage's tools, on the project named by --project (the tools that take a project get it when the
 // script names none); print() goes to stdout, the error to stderr.
 int cmdScript(const std::vector<std::string>& args) {
@@ -1358,6 +1460,7 @@ int cmdPresets() {
 int main(int argc, char** argv) {
     if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM")) qputenv("QT_QPA_PLATFORM", "offscreen");
     QGuiApplication app(argc, argv);  // fonts for title rendering
+    initInference();  // (the provider libraries and Tools › AI Models Run On, as the app has them)
     std::vector<std::string> args(argv + 1, argv + argc);
     if (args.empty()) return usage();
     std::string cmd = args[0];
@@ -1368,6 +1471,20 @@ int main(int argc, char** argv) {
     if (cmd == "render") return cmdRender(args);
     if (cmd == "frame") return cmdFrame(args);
     if (cmd == "presets") return cmdPresets();
+    if (cmd == "devices") {  // where the AI models can run (media/Inference.h)
+        for (const InferenceDevice& d : inferenceDevices())
+            std::printf("%-4s %s%s\n", d.kind.c_str(), d.provider.c_str(), d.vendor.empty() ? "" : (" (" + d.vendor + ")").c_str());
+        std::printf("Models run: %s%s\n", inferenceModeName(inferenceMode()),
+                    inferenceModeOverridden() ? " (from MONTAGE_INFERENCE)" : " (Tools > AI Models Run On; MONTAGE_INFERENCE=auto|efficient|cpu overrides it)");
+        if (const std::string e = lastInferenceLibraryError(); !e.empty()) std::printf("A provider library was not taken: %s\n", e.c_str());
+        std::string why;
+        const int before = inferenceFallbacks();
+        const bool ok = inferenceCheck(&why);
+        if (!ok) std::printf("A test model: %s\n", why.c_str());
+        else if (inferenceFallbacks() > before) std::printf("A test model: ran on the processor (the device would not take it: %s)\n", lastInferenceFallback().c_str());
+        else std::printf("A test model: ran\n");
+        return ok ? 0 : 1;
+    }
     if (cmd == "colorspaces") {
         for (const auto& c : colorSpaces())
             std::printf("%-20s %s%s\n", c.id.c_str(), c.label.c_str(), c.sceneReferred ? "  (media only)" : "");
@@ -1398,6 +1515,9 @@ int main(int argc, char** argv) {
     if (cmd == "people") return cmdPeople(args);
     if (cmd == "speak") return cmdSpeak(args);
     if (cmd == "clone-speech") return cmdCloneSpeech(args);
+    if (cmd == "convert-voice") return cmdConvertVoice(args);
+    if (cmd == "credentials") return cmdCredentials(args);
+    if (cmd == "sign") return cmdSign(args);
     if (cmd == "script") return cmdScript(args);
     if (cmd == "mcp") {
 #ifdef MONTAGE_LIVE_BRIDGE

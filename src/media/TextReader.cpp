@@ -71,7 +71,7 @@ QImage frameImage(const Frame16& f) {
 bool ocrAvailable() { return true; }
 struct TextReader::Impl {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "montage-ocr"};
-    std::unique_ptr<Ort::Session> det, rec;
+    std::unique_ptr<OrtModel> det, rec;
     std::vector<std::string> chars;  // the recogniser's characters: index 1 on (0 is CTC's blank), a space last
 };
 #else
@@ -119,7 +119,7 @@ std::shared_ptr<TextReader> TextReader::load(const std::string& language, std::s
 #else
             const std::string path = pack.path(f);
 #endif
-            return std::make_unique<Ort::Session>(r->d_->env, path.c_str(), so);
+            return openModel(r->d_->env, path.c_str(), so);
         };
         r->d_->det = open(pack.files[0]);
         r->d_->rec = open(pack.files[latin ? 3 : 1]);

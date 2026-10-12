@@ -85,7 +85,7 @@ constexpr float kNoObject = -1024.f;  // SAM 2's logit for "no object here"
 
 struct Models {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "montage"};
-    std::unique_ptr<Ort::Session> encoder, decoder, attention, memory;
+    std::unique_ptr<OrtModel> encoder, decoder, attention, memory;
 };
 
 std::basic_string<ORTCHAR_T> ortPath(const QString& path) {
@@ -117,7 +117,7 @@ std::shared_ptr<Models> loadModels(std::string* error) {
         so.SetIntraOpNumThreads(int(std::max(1u, std::thread::hardware_concurrency())));
         so.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         auto open = [&](const char* name) {
-            return std::make_unique<Ort::Session>(models->env, ortPath(dir + "/" + name).c_str(), so);
+            return openModel(models->env, ortPath(dir + "/" + name).c_str(), so);
         };
         models->encoder = open("vision_encoder.onnx");
         models->decoder = open("mask_decoder.onnx");

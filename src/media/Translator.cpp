@@ -264,7 +264,7 @@ namespace {
 
 struct Model {
     Ort::Env env{ORT_LOGGING_LEVEL_ERROR, "montage-translate"};
-    std::unique_ptr<Ort::Session> encoder, decoder;
+    std::unique_ptr<OrtModel> encoder, decoder;
     SentencePiece source;
     std::map<std::string, int64_t> ids;
     std::vector<std::string> pieces;  // by id
@@ -333,7 +333,7 @@ std::shared_ptr<Model> loadModel(const std::string& from, const std::string& to,
 #else
             const std::string path = file(name);
 #endif
-            return std::make_unique<Ort::Session>(model->env, path.c_str(), so);
+            return openModel(model->env, path.c_str(), so, ModelRuns::OnProcessor);  // (a word at a time)
         };
         model->encoder = open("encoder.onnx");
         model->decoder = open("decoder.onnx");

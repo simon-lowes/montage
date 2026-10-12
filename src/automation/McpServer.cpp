@@ -30,6 +30,7 @@
 #include "core/GraphicsTemplate.h"
 #include "core/Storyboard.h"
 #include "render/ExtendClip.h"
+#include "render/ColorChart.h"
 #include "render/ReviewExport.h"
 #include "render/RoomTone.h"
 #include "render/Versions.h"
@@ -42,6 +43,8 @@
 #include "render/ClipPlacement.h"
 #include "audio/SpeechCleanup.h"
 #include "core/AafImport.h"
+#include "core/Provenance.h"
+#include "media/ContentCredentials.h"
 #include "media/Offload.h"
 #include "media/Proxy.h"
 #include "media/SpeechSearch.h"
@@ -114,6 +117,7 @@
 #include "media/Transcriber.h"
 #include "media/VisualSearch.h"
 #include "render/ClipAnalysis.h"
+#include "media/Segmenter.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
 #include "render/Shorts.h"
@@ -359,8 +363,11 @@ QJsonObject projectJson(const Project& p) {
         tracks.append(to);
     }
     QJsonArray markers;
-    for (const Marker& m : s.markers)
-        markers.append(QJsonObject{{"at", tc(m.t, s)}, {"name", QString::fromStdString(m.name)}, {"comment", QString::fromStdString(m.comment)}});
+    for (const Marker& m : s.markers) {
+        QJsonObject mo{{"at", tc(m.t, s)}, {"name", QString::fromStdString(m.name)}, {"comment", QString::fromStdString(m.comment)}};
+        if (!m.drawing.empty()) mo["drawing_strokes"] = int(parseReviewDrawing(m.drawing).size());  // a reviewer drew on the frame
+        markers.append(mo);
+    }
     QJsonArray media;
     for (const MediaItem& m : p.media) {
         QJsonObject mo{{"id", double(m.id)}, {"name", QString::fromStdString(m.name)}, {"duration_seconds", m.duration}};
@@ -688,6 +695,40 @@ void McpServer::Impl::addTools() {
             if (!probeMedia(absolute(need(a, "path")).toStdString(), m, &err)) return fail(QString::fromStdString(err));
             const QJsonObject o = mediaJson(m);
             return ok(json(o), o);
+        });
+
+    add("montage_read_credentials", "Read Content Credentials",
+        "Read and check a file's Content Credentials (C2PA): whether it has any, whether they are intact and who signed "
+        "them (state Trusted, Valid or Invalid, with the problems), the app or camera that made it, its actions, and whether "
+        "it says AI generated or changed it. `full` adds the whole manifest store as JSON.",
+        R"json({"type":"object","properties":{"path":{"type":"string","description":"Media file"},
+            "full":{"type":"boolean","default":false,"description":"Add the whole manifest store (manifest_store)"}},"required":["path"]})json", true,
+        [](const QJsonObject& a) {
+            const std::string path = absolute(need(a, "path")).toStdString();
+            if (!contentCredentialsAvailable()) return fail("This build of Montage cannot read Content Credentials (no C2PA library)");
+            if (!contentCredentialsFormat(path)) return fail("Content Credentials cannot be in this kind of file");
+            CredentialSummary c;
+            std::string err;
+            if (!readContentCredentials(path, c, &err)) return fail(QString::fromStdString(err));
+            auto list = [](const std::vector<std::string>& v) {
+                QJsonArray out;
+                for (const std::string& x : v) out.append(QString::fromStdString(x));
+                return out;
+            };
+            QJsonObject o{{"present", c.present}};
+            if (c.present) {
+                o["state"] = QString::fromStdString(c.state);
+                o["issuer"] = QString::fromStdString(c.issuer);
+                o["signed_at"] = QString::fromStdString(c.signedAt);
+                o["generator"] = QString::fromStdString(c.generator);
+                o["title"] = QString::fromStdString(c.title);
+                o["actions"] = list(c.actions);
+                o["ai_generated"] = c.aiGenerated;
+                o["problems"] = list(c.problems);
+                o["label"] = QString::fromStdString(credentialsLabel(c));
+                if (a.value("full").toBool()) o["manifest_store"] = QJsonDocument::fromJson(QByteArray::fromStdString(c.json)).object();
+            }
+            return ok(c.present ? QString::fromStdString(credentialsLabel(c)) : QStringLiteral("No Content Credentials"), o);
         });
 
     add("montage_offload", "Offload a camera card",
@@ -2655,7 +2696,9 @@ void McpServer::Impl::addTools() {
     add("montage_import_markers", "Import markers",
         "Add markers from a marker list: a CSV with a header row (name, description or notes, in or timecode, out or duration, "
         "type, colour), as review tools and Premiere write them, Avid locator lines, or a notes file saved from a review "
-        "page (montage_export_review; one marker a note, named and coloured by reviewer). Give the file's `path` or its `text`.",
+        "page (montage_export_review; one marker a note, named and coloured by reviewer, with its replies, status and "
+        "drawing; notes imported before bring their markers up to date, and a note never replaces another marker). Give "
+        "the file's `path` or its `text`.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"path":{"type":"string"},"text":{"type":"string"}},
             "required":["project"]})json",
         false, [](const QJsonObject& a) {
@@ -2670,9 +2713,11 @@ void McpServer::Impl::addTools() {
             std::vector<Marker> markers;
             std::string err;
             if (!parseMarkerList(text, s, markers, &err)) return fail(QString::fromStdString(err));
-            for (const Marker& m : markers) edit::addMarker(s, m);
+            const MarkerImport r = addImportedMarkers(s, markers);
             save(l);
-            return ok(QStringLiteral("Added %1 marker(s)").arg(markers.size()));
+            return ok(r.updated ? QStringLiteral("Added %1 marker(s), brought %2 up to date").arg(r.added).arg(r.updated)
+                                : QStringLiteral("Added %1 marker(s)").arg(r.added),
+                      QJsonObject{{"added", r.added}, {"updated", r.updated}});
         });
 
     add("montage_ale", "Avid Log Exchange (ALE) in and out",
@@ -5326,6 +5371,74 @@ void McpServer::Impl::addTools() {
                       QJsonObject{{"clips", placed}, {"voice_from", QString::fromStdString(voice.from)}, {"language", QString::fromStdString(voice.options.language)}});
         });
 
+    add("montage_convert_voice", "Convert a voice",
+        "Say a clip's speech again in another person's voice (speech to speech, as Resolve's Voice Convert: Chatterbox, on "
+        "this computer), its words, timing and delivery kept, for ADR read by someone else or a temp line made to sound "
+        "like the actor. clip is an audio clip; its sound (with handles seconds either side, default 1) is converted and "
+        "added to it as a take, picked, so the original stays one take away. The voice is voice_clip (a clip id, what it "
+        "plays) or voice_media (a file or the project's media, voice_from to voice_to seconds); 5 to 10 clean seconds of "
+        "them speaking is best. Needs consent: true, confirming you have the speaker's consent (or it is your own voice). "
+        "The WAV (in the Voiceover folder) and its media note what it was converted from and whose voice it has; its media "
+        "gets the keyword AI voice.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"integer","description":"The audio clip to convert"},
+            "consent":{"type":"boolean","description":"You have the speaker's consent to use their voice"},
+            "voice_clip":{"type":"integer"},"voice_media":{"type":"string"},"voice_from":{"type":"number"},"voice_to":{"type":"number"},
+            "handles":{"type":"number","default":1,"description":"Seconds converted either side of what the clip plays"}},
+            "required":["project","clip","consent"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id clip = clipArg(l, a).id;
+            const auto at = edit::locate(s, clip);
+            double from = 0, to = 0;
+            if (!at || at->track.kind != TrackKind::Audio ||
+                !edit::voiceConversionRange(l.project, s, clip, std::clamp(a.value("handles").toDouble(1), 0.0, 10.0), from, to))
+                throw ArgError{"clip must be a clip with sound on an audio track"};
+            if (!a.contains("voice_clip") && !a.contains("voice_media")) throw ArgError{"Give voice_clip or voice_media: the voice to convert to"};
+            if (a.contains("voice_clip") && Id(a.value("voice_clip").toDouble()) == clip) throw ArgError{"voice_clip is the clip being converted"};
+            const CloneVoice voice = cloneVoiceArg(a, l.project, s, 0);
+            const Clip* c = edit::clipById(s, clip);
+            const MediaItem* m = l.project.findMedia(c->mediaId);
+            const std::string name = c->name.empty() ? m->name : c->name;
+            std::vector<float> speech, converted;
+            std::string err;
+            progress(0, QStringLiteral("Converting the voice"));
+            if (!voiceSoundFrom(m->path, from, to, speech, &err, c->channels, s.sampleRate > 0 ? s.sampleRate : 48000) ||
+                !convertVoice(speech, kCloneSampleRate, voice.sample, kCloneSampleRate, converted, &err,
+                              [this](double f) { progress(f, QStringLiteral("Converting the voice")); }))
+                return fail(QString::fromStdString(err));
+            const std::string note = "Speech from " + name + " converted to a voice cloned from " + voice.from + " with Chatterbox in Montage, " +
+                                     QDateTime::currentDateTime().toString(Qt::ISODate).toStdString() +
+                                     "; the speaker's consent was confirmed by the caller.";
+            const QString folder = QFileInfo(absolute(need(a, "project"))).absolutePath() + QStringLiteral("/Voiceover");
+            QDir().mkpath(folder);
+            QString path;
+            int n = 1;
+            do path = folder + '/' + QString::fromStdString(edit::convertedVoiceStem(name)) + QString::number(n++) + QStringLiteral(".wav");
+            while (QFileInfo::exists(path));
+            if (!writeClonedSpeechWav(path.toStdString(), converted, note, &err)) return fail(QString::fromStdString(err));
+            const Id media = mediaFor(l.project, path);
+            if (MediaItem* made = l.project.findMedia(media)) {
+                made->metadata["comment"] = note;
+                made->bin = "Voiceover";  // (as the app files it)
+                if (std::find(made->keywords.begin(), made->keywords.end(), "AI voice") == made->keywords.end()) made->keywords.push_back("AI voice");
+            }
+            if (const edit::Result r = edit::addConvertedTake(l.project, s, clip, media, from); !r.ok) {
+                QFile::remove(path);  // (the project is not saved)
+                return fail(QString::fromStdString(r.error));
+            }
+            save(l);
+            const Clip* now = edit::clipById(s, clip);
+            return ok(QStringLiteral("Converted %1 (%2 s) to the voice from %3: take %4 of %5, picked")
+                          .arg(QString::fromStdString(name))
+                          .arg(double(converted.size()) / kCloneSampleRate, 0, 'f', 2)
+                          .arg(QString::fromStdString(voice.from))
+                          .arg(now->take + 1)
+                          .arg(now->takes.size()),
+                      QJsonObject{{"file", path}, {"media", double(media)}, {"seconds", double(converted.size()) / kCloneSampleRate},
+                                  {"take", now->take}, {"takes", int(now->takes.size())}, {"voice_from", QString::fromStdString(voice.from)}});
+        });
+
     add("montage_audio_description", "Audio description",
         "Described video for broadcasters and streaming services: descriptions of what is seen, spoken in the gaps between "
         "the dialogue. gaps finds them (speech on the audio tracks other than the AD track; at least min_gap seconds, kept "
@@ -6091,6 +6204,190 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Matched %1 clip(s) to the picture at %2").arg(n).arg(tc(at, s)), QJsonObject{{"matched", n}});
         });
 
+    add("montage_match_chart", "Match a colour chart",
+        "Colour-chart calibration (Resolve's Color Match): finds an X-Rite ColorChecker Classic (24 patches) in a clip's "
+        "picture at `at` (or its middle frame), upright, upside down or on its side, or uses `corners` (the patch area's "
+        "four corners in fractions of the frame, the chart's top left first, by Dark Skin, then clockwise), measures its "
+        "patches and puts a Chart Match first in the clip's effects (a colour matrix in linear light) that brings them to "
+        "the chart's published values. `same_media` grades every clip of the same media too. Returns the corners and "
+        "the patches' mean CIE76 delta E before and after (under 2 is a close match). `measure_only` changes nothing.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":["number","string"],"description":"A video clip's id or name"},
+            "at":{"type":["number","string"],"description":"Timeline time of the frame showing the chart"},
+            "corners":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},"minItems":4,"maxItems":4},
+            "same_media":{"type":"boolean","default":false},"measure_only":{"type":"boolean","default":false}},
+            "required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            // A video clip, by id or by its name.
+            const Clip* found = nullptr;
+            if (a.value("clip").isString()) {
+                const std::string name = a.value("clip").toString().toStdString();
+                for (const Track& t : s.videoTracks)
+                    for (const Clip& c : t.clips)
+                        if (c.name == name) {
+                            if (found) throw ArgError{QStringLiteral("Several clips are named \"%1\": give its id").arg(QString::fromStdString(name))};
+                            found = &c;
+                        }
+                if (!found) throw ArgError{QStringLiteral("No video clip named \"%1\" in the active sequence").arg(QString::fromStdString(name))};
+            } else {
+                found = &clipArg(l, a);
+                const auto loc = edit::locate(s, found->id);
+                if (!loc || loc->track.kind != TrackKind::Video) throw ArgError{"\"clip\" must be a video clip (its picture, not its sound)"};
+            }
+            const Clip clip = *found;
+            const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : clip.start + clip.duration / 2;
+            const Image frame = chartFrame(l.project, s, clip, at);
+            if (frame.empty()) return fail("The clip has no picture to read a chart from");
+            TrackQuad q;
+            double residual = 0;
+            if (a.contains("corners")) {
+                const QJsonArray cs = a.value("corners").toArray();
+                if (cs.size() != 4) throw ArgError{"\"corners\" is four [x, y] pairs"};
+                for (int i = 0; i < 4; ++i) {
+                    const QJsonArray pt = cs[i].toArray();
+                    if (pt.size() != 2 || !pt[0].isDouble() || !pt[1].isDouble()) throw ArgError{"\"corners\" is four [x, y] pairs"};
+                    const double x = pt[0].toDouble(), y = pt[1].toDouble();
+                    if (!(x >= 0 && x <= 1 && y >= 0 && y <= 1)) throw ArgError{"\"corners\" are fractions of the frame, 0 to 1"};
+                    q.p[i] = {x, y};
+                }
+            } else if (!detectChart(chartView(frame, s), q, &residual)) {
+                return fail("No ColorChecker chart found in the picture: give its corners");
+            }
+            bool complete = false;
+            const ChartColors shot = sampleChart(frame, q, sequenceColorSpace(s), &complete);
+            if (!complete) throw ArgError{"\"corners\" must outline the chart: four corners apart, in order round it, not crossed"};
+            const ChartFit fit = fitChart(shot);
+            if (!fit.ok) return fail("The patches could not be matched (are the corners on the chart?)");
+            QJsonArray corners;
+            for (const Point2& p : q.p) corners.append(QJsonArray{std::round(p.x * 1e4) / 1e4, std::round(p.y * 1e4) / 1e4});
+            QJsonObject out{{"corners", corners}, {"delta_e_before", std::round(fit.deltaEBefore * 100) / 100},
+                            {"delta_e_after", std::round(fit.deltaEAfter * 100) / 100}, {"delta_e_worst", std::round(fit.deltaEMax * 100) / 100}};
+            if (a.value("measure_only").toBool()) return ok(QStringLiteral("Chart measured: delta E %1 now, %2 once matched").arg(fit.deltaEBefore, 0, 'f', 1).arg(fit.deltaEAfter, 0, 'f', 1), out);
+            const std::vector<Id> clips = a.value("same_media").toBool() ? clipsOfSameMedia(s, clip.id) : std::vector<Id>{clip.id};
+            const int n = applyChartMatchToClips(l.project, s, clips, fit);
+            save(l);
+            out["clips"] = n;
+            return ok(QStringLiteral("Matched the chart on %1 clip(s): delta E %2 before, %3 after").arg(n).arg(fit.deltaEBefore, 0, 'f', 1).arg(fit.deltaEAfter, 0, 'f', 1), out);
+        });
+
+    add("montage_object_mask", "Pick objects for a mask",
+        "AI object masks (Premiere's Object Mask, Resolve's Magic Mask, Final Cut's Magnetic Mask), with several objects in "
+        "one mask: limits a clip's video effect (`effect`, its id) to objects picked by clicks. `object` is the object's "
+        "index (0, the first, by default), \"new\" for another object joining the mask or \"new_cut\" for one cut out of "
+        "it (once the mask has a first). `points` are clicks on the frame at `at` (fractions of the clip's frame, [x, y, label]: label 1 the object, 0 not the object, 2 and 3 a "
+        "box's top left and bottom right); that frame is segmented at once. `track` follows the object forward, backward "
+        "or both from there to the clip's ends (without `at`, from the first frame it was clicked on). `subtract` cuts an object (not the first) out of the mask or adds it back; "
+        "`name` names it; `remove` drops it (on its own). Edges: mask.refine (0-100) snaps the mask's edge to the picture's, "
+        "mask.consolidate (px) closes holes and gaps (montage_add_effect params). Returns each object's clicked and "
+        "segmented frames.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "effect":{"type":"number","description":"The effect's id on the clip"},
+            "object":{"type":["integer","string"],"description":"An index (0 the first), \"new\" or \"new_cut\""},
+            "at":{"type":["number","string"],"description":"Timeline time of the frame clicked (the clip's start by default)"},
+            "points":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3}},
+            "track":{"type":"string","enum":["forward","backward","both"]},
+            "subtract":{"type":"boolean"},"name":{"type":"string"},"remove":{"type":"boolean","default":false}},
+            "required":["project","clip","effect"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id clipId = clipArg(l, a).id;
+            const auto loc = edit::locate(s, clipId);
+            if (!loc || loc->track.kind != TrackKind::Video) throw ArgError{"\"clip\" must be a video clip"};
+            const Id effectId = Id(a.value("effect").toDouble());
+            Effect* e = edit::ownedEffect(s, clipId, effectId);
+            if (!e || !supportsMask(e->type)) throw ArgError{QStringLiteral("No video effect %1 on that clip (see montage_project_info)").arg(qint64(effectId))};
+            Clip& c = *edit::clipById(s, clipId);
+            const MediaItem* m = c.mediaId ? l.project.findMedia(c.mediaId) : nullptr;
+            if (!m || m->kind != MediaKind::Video) throw ArgError{"Object masks follow objects in video clips"};
+            e->params["mask.shape"] = Param(3.0);
+            // Which object (the editor's choice of one is not part of the project: the first unless named).
+            int which = 0;
+            const QJsonValue ov = a.value("object");
+            if (ov.isString()) {
+                const QString kind = ov.toString();
+                if (kind != "new" && kind != "new_cut") throw ArgError{"\"object\" is an index, \"new\" or \"new_cut\""};
+                e->object = withNewObject(l.project, s, c, *e, kind == "new_cut", &which);
+                if (!e->object) throw ArgError{"The mask has no object to cut out of yet: pick its first (\"object\": 0)"};
+            } else if (ov.isDouble()) {
+                which = int(ov.toDouble());
+                const int n = e->object ? e->object->count() : 1;
+                if (which < 0 || which >= n) throw ArgError{QStringLiteral("The mask has %1 object(s): \"object\" is 0 to %2").arg(n).arg(n - 1)};
+            }
+            if (a.value("remove").toBool()) {
+                if (!e->object) throw ArgError{"The mask has no objects yet"};
+                for (const char* k : {"points", "track", "name", "subtract", "at"})
+                    if (a.contains(k)) throw ArgError{QStringLiteral("\"remove\" drops the object: give it without \"%1\"").arg(k)};
+                e->object = withoutObject(*e, which);
+                which = std::max(0, which - 1);
+            } else {
+                if (a.contains("subtract")) {
+                    const bool cut = a.value("subtract").toBool();
+                    if (cut && which == 0) throw ArgError{"The first object always adds: cut out another (\"object\": \"new_cut\")"};
+                    if (e->object) e->object = withObjectSubtracted(*e, which, cut);
+                }
+                if (a.contains("name")) {
+                    auto o = std::make_shared<ObjectMask>(e->object ? *e->object : ObjectMask{});
+                    o->object(which).name = a.value("name").toString().toStdString();
+                    e->object = o;
+                }
+                FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : c.start;
+                if (!c.contains(at)) throw ArgError{"\"at\" must be inside the clip"};
+                if (!a.contains("at") && !a.contains("points") && a.contains("track") && e->object) {
+                    // Tracking without `at`: from the first frame of the clip the object was clicked on.
+                    const auto& clicked = e->object->object(which).prompts;
+                    for (FrameTime f = 0; f < c.duration; ++f)
+                        if (auto it = clicked.find(clipObjectFrame(l.project, s, c, f)); it != clicked.end() && !it->second.empty()) {
+                            at = c.start + f;
+                            break;
+                        }
+                }
+                const FrameTime local = at - c.start;
+                const bool needModel = a.contains("points") || a.contains("track");
+                if (needModel && (!segmenterAvailable() || !objectModel().installed()))
+                    return fail("Object masks need their model: run `scripts/fetch-models.sh` or pick an object once in the app");
+                std::string err;
+                if (a.contains("points")) {
+                    std::vector<ObjectPoint> pts;
+                    for (const QJsonValue& v : a.value("points").toArray()) {
+                        const QJsonArray pt = v.toArray();
+                        const double x = pt.at(0).toDouble(-1), y = pt.at(1).toDouble(-1);
+                        const int label = pt.at(2).toInt(-1);
+                        if (pt.size() != 3 || !(x >= 0 && x <= 1 && y >= 0 && y <= 1) || label < 0 || label > 3)
+                            throw ArgError{"Each point is [x, y, label]: x and y fractions of the frame, label 0 to 3"};
+                        pts.push_back({x, y, label});
+                    }
+                    e->object = withObjectPrompts(l.project, s, c, *e, local, pts, which);
+                    if (!e->object) return fail("The clip has no media to pick from");
+                    auto seg = segmentClipObjectFrame(l.project, s, c, *e->object, local, &err, which);
+                    if (!seg) return fail(QString::fromStdString(err));
+                    e->object = seg;
+                }
+                const QString dir = str(a, "track");
+                if (!dir.isEmpty()) {
+                    if (!e->object || e->object->object(which).prompts.empty()) throw ArgError{"Click the object first (\"points\")"};
+                    for (bool forward : {true, false}) {
+                        if ((forward && dir == "backward") || (!forward && dir == "forward")) continue;
+                        auto tracked = trackClipObject(l.project, s, c, *e->object, local, forward,
+                                                       [this, forward](double f) { progress(f, forward ? QStringLiteral("Tracking forward") : QStringLiteral("Tracking backward")); },
+                                                       nullptr, &err, which);
+                        if (!tracked) return fail(QString::fromStdString(err));
+                        e->object = tracked;
+                    }
+                }
+            }
+            save(l);
+            QJsonArray objects;
+            if (e->object)
+                for (int i = 0; i < e->object->count(); ++i) {
+                    const ObjectMask& o = e->object->object(i);
+                    objects.append(QJsonObject{{"index", i}, {"name", QString::fromStdString(o.name)}, {"subtract", i > 0 && o.subtract},
+                                               {"clicked_frames", int(o.prompts.size())}, {"segmented_frames", int(o.frames.size())}});
+                }
+            return ok(QStringLiteral("The mask has %1 object(s)").arg(objects.size()), QJsonObject{{"objects", objects}, {"object", which}});
+        });
+
     add("montage_auto_reframe", "Auto reframe for another shape",
         "Make the cut in another aspect ratio (9:16 for Reels, Shorts and TikTok; 1:1; 4:5; 16:9): a copy of the active "
         "sequence at the new shape where every video and still clip fills the frame and follows its subject (found from "
@@ -6230,14 +6527,19 @@ void McpServer::Impl::addTools() {
         "Send the cut out for notes without a review service (Frame.io's role): renders an H.264 review copy "
         "(\"<name> - Review.mp4\", at most `max_height` lines, default 1080; timecode burned in unless `timecode` is "
         "false; an optional `watermark` text; captions burned in) into `folder` with \"<name> - Review.html\", a "
-        "self-contained page that plays it in any browser, offline, where reviewers step to a frame or mark a range and "
-        "type notes, then save them as a notes file. montage_import_markers turns that file into markers coloured by "
-        "reviewer. `note` is a message shown to the reviewers; the sequence's markers are shown unless `markers` is "
-        "false; `in`/`out` (timecodes) limit it to a range. Returns both paths.",
+        "self-contained page that plays it in any browser, offline, where reviewers step to a frame or mark a range, "
+        "draw on the picture (pen, arrow, box, ellipse), type notes, reply and set a status, then save them as a notes "
+        "file. montage_import_markers turns that file into markers coloured by reviewer, with their drawings (importing "
+        "it again brings those markers up to date). `note` is a message shown to the reviewers; the sequence's markers "
+        "are shown unless `markers` is false; `in`/`out` (timecodes) limit it to a range. A copy of the same cut sent "
+        "to the same folder again is the next version (\"<name> - Review v2\"; `version` sets the number) and its page "
+        "compares it with the version before, side by side or with a wipe, unless `compare` is false. Returns both "
+        "paths and the version.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string"},
             "max_height":{"type":"integer","default":1080},"timecode":{"type":"boolean","default":true},
             "watermark":{"type":"string"},"note":{"type":"string"},"markers":{"type":"boolean","default":true},
-            "in":{"type":"string"},"out":{"type":"string"}},"required":["project","folder"]})json",
+            "in":{"type":"string"},"out":{"type":"string"},"version":{"type":"integer","minimum":1,"description":"Default: the next after those in the folder"},
+            "compare":{"type":"boolean","default":true}},"required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             const Sequence& s = l.seq();
@@ -6251,6 +6553,11 @@ void McpServer::Impl::addTools() {
             if (a.contains("in")) o.in = timeArg(a.value("in"), s, "in");
             if (a.contains("out")) o.out = timeArg(a.value("out"), s, "out");
             if (o.in >= 0 && o.out >= 0 && o.out <= o.in) throw ArgError{"\"out\" comes after \"in\""};
+            if (a.contains("version")) {
+                o.version = a.value("version").toInt(0);
+                if (o.version < 1 || o.version > 999) throw ArgError{"\"version\" is 1 to 999"};
+            }
+            o.compare = a.value("compare").toBool(true);
             const QString folder = absolute(need(a, "folder"));
             QDir().mkpath(folder);
             const ReviewPackage pkg = reviewPackage(s, folder.toStdString(), o);
@@ -6261,7 +6568,9 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Wrote %1 and %2: send both; the notes saved from the page import as markers.")
                           .arg(QString::fromStdString(pkg.videoPath), QString::fromStdString(pkg.pagePath)),
                       QJsonObject{{"video", QString::fromStdString(pkg.videoPath)}, {"page", QString::fromStdString(pkg.pagePath)},
-                                  {"width", pkg.page.width}, {"height", pkg.page.height}, {"frames", double(pkg.page.frames)}});
+                                  {"width", pkg.page.width}, {"height", pkg.page.height}, {"frames", double(pkg.page.frames)},
+                                  {"version", pkg.page.version},
+                                  {"compares_with", pkg.page.previous ? QJsonValue(pkg.page.previous->version) : QJsonValue()}});
         });
 
     add("montage_export_dcp", "Export a DCP",
@@ -6421,6 +6730,10 @@ void McpServer::Impl::addTools() {
             "audio_name":{"type":"string","description":"The mix stream's title"},"audio_language":{"type":"string","description":"The mix stream's language (ISO 639-1)"},
             "start_timecode":{"type":"string","description":"The file's starting timecode (MXF and MOV), e.g. 10:00:00:00 as broadcasters ask"},
             "mono_tracks":{"type":"integer","description":"Write the mix (then each audio stream) as mono tracks, padded with silence to this many, as broadcast MXF takes it; the MXF presets set 8, 4 or 2"},
+            "credentials":{"type":"object","description":"Sign it with Content Credentials (C2PA, as Premiere does): a signed record in the file that Montage made it, each AI model that generated or changed what is in the range, and the credentials its sources carried. MP4, MOV, WAV, MP3, JPEG, PNG and TIFF",
+                "properties":{"certificate":{"type":"string","description":"The signing certificate chain (PEM, the signing certificate first; issued by a certificate authority, for digital signatures with e-mail protection or document signing use)"},
+                    "key":{"type":"string","description":"Its private key (PEM)"},
+                    "allow_ai_training":{"type":"boolean","default":false,"description":"false: the credentials ask that it not be used to train AI models"}},"required":["certificate","key"]},
             "stereo_view":{"type":"string","enum":["sbs","sbs_half","tb","tb_half","left","right","anaglyph"],"default":"sbs","description":"A stereoscopic 3D sequence: the eyes side by side or top and bottom (full size, or squeezed into one frame), or one picture"}},
             "required":["project","output"]})json",
         false, [this](const QJsonObject& a) {
@@ -6512,6 +6825,18 @@ void McpServer::Impl::addTools() {
             const QString stems = str(a, "stems", "none");
             if (stems != "none" && stems != "tracks" && stems != "buses" && stems != "roles")
                 throw ArgError{"\"stems\" must be none, tracks, buses or roles"};
+            if (a.contains("credentials") && !a.value("credentials").isObject())
+                throw ArgError{"\"credentials\" is an object: {certificate, key, allow_ai_training}"};
+            if (a.value("credentials").isObject()) {
+                const QJsonObject c = a.value("credentials").toObject();
+                st.credentialCertificate = absolute(need(c, "certificate")).toStdString();
+                st.credentialKey = absolute(need(c, "key")).toStdString();
+                st.credentialAllowAiTraining = c.value("allow_ai_training").toBool();
+                if (!contentCredentialsAvailable()) throw ArgError{"This build of Montage cannot sign with Content Credentials (no C2PA library)"};
+                if (!exportCarriesCredentials(st)) throw ArgError{"Content Credentials cannot go in this kind of export (a single mp4, mov, wav, mp3, jpg, png or tif file can hold them)"};
+                std::string why;
+                if (!checkCredentialSigner({st.credentialCertificate, st.credentialKey, {}}, &why)) return fail(QString::fromStdString(why));
+            }
             std::string err;
             LightLevels light;
             if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, nullptr, &err, nullptr, nullptr, &light))
@@ -6525,6 +6850,17 @@ void McpServer::Impl::addTools() {
                 text += carriage == "video" ? QStringLiteral("\nHDR10+ metadata in the video, and beside it as .hdr10plus.json")
                         : carriage == "json" ? QStringLiteral("\nHDR10+ metadata beside it as .hdr10plus.json (this codec cannot carry it)")
                                              : QStringLiteral("\nNo HDR10+ metadata: it is for PQ (HDR10) video");
+            }
+            if (!st.credentialCertificate.empty()) {
+                // What the credentials say it was made with (core/Provenance.h).
+                const Provenance made = sequenceProvenance(l.project, s, st.in, st.out);
+                QJsonArray ai;
+                for (const AiUse& u : made.ai)
+                    ai.append(QJsonObject{{"feature", QString::fromStdString(u.feature)}, {"model", QString::fromStdString(u.model)},
+                                          {"role", u.role == AiRole::Generated ? "generated" : u.role == AiRole::Enhanced ? "enhanced" : "assisted"}});
+                o["credentials"] = QJsonObject{{"signed", true}, {"ai", ai}};
+                text += made.ai.empty() ? QStringLiteral("\nSigned with Content Credentials (no AI recorded)")
+                                        : QStringLiteral("\nSigned with Content Credentials, recording %1 AI use%2").arg(made.ai.size()).arg(made.ai.size() == 1 ? "" : "s");
             }
             if (light.frames > 0) {  // HDR: what was rendered, measured
                 unsigned cll = 0, fall = 0;

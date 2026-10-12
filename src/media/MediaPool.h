@@ -3,6 +3,7 @@
 
 #include <functional>
 #include <list>
+#include <chrono>
 #include <map>
 #include <optional>
 #include <set>
@@ -37,6 +38,8 @@ public:
     AudioBufferPtr audio(const std::string& path, int sampleRate);
     // Returns cached audio or nullptr without decoding.
     AudioBufferPtr audioIfReady(const std::string& path, int sampleRate);
+    // Starts decoding it in the background unless it is cached or being decoded (or failed in the last ten seconds).
+    void requestAudio(const std::string& path, int sampleRate);
     PeaksPtr peaks(const std::string& path, int sampleRate = 48000);
     PeaksPtr peaksIfReady(const std::string& path);
 
@@ -99,6 +102,7 @@ private:
 
     std::mutex audioM_;
     std::map<std::pair<std::string, int>, AudioBufferPtr> audio_;
+    std::map<std::pair<std::string, int>, std::chrono::steady_clock::time_point> requested_;  // background decodes asked for
     std::map<std::string, PeaksPtr> peaks_;
     std::map<std::pair<std::string, int>, std::shared_ptr<std::mutex>> audioLocks_;
     std::function<void(const std::string&)> readyCb_;

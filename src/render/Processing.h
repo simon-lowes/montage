@@ -102,6 +102,13 @@ void refineMatte(std::vector<float>& matte, int w, int h, double expand, double 
 // of the media at `sourceSeconds`. Empty when there is no mask.
 std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, double pixelScale, double sourceSeconds = -1);
 
+// Mask edges. Holes and gaps narrower than twice `px` filled (a closing, beyond the frame counting as outside; what
+// it adds feathered by `feather` px, as the shape is, and the shape's own edge kept); and, within `radius` px of the
+// edge and across a soft edge, each pixel's alpha taken from where `guide`'s colour lies between the object's and the
+// background's colours nearby (a colour-line matte), mixed in by `amount` (0..1), so the edge follows the picture's.
+void consolidateMatte(std::vector<float>& matte, int w, int h, double px, double feather = 1);
+void refineMatteEdges(std::vector<float>& matte, const Image& guide, double radius, double amount);
+
 // Euclidean distance (px) from each pixel to the nearest pixel where seed is
 // non-zero (exact; Felzenszwalb–Huttenlocher). Very large where there is no seed.
 std::vector<float> distanceTransform(const std::vector<uint8_t>& seed, int w, int h);

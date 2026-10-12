@@ -104,6 +104,15 @@ std::vector<EffectInfo> buildCatalog() {
                  {}});
 
     // ---- Video filters ----------------------------------------------------
+    // A colour chart's match (render/ColorChart.h): a matrix and offset in linear light, from Clip › Match Colour Chart (its
+    // string "space": the colour space of the picture it was measured in).
+    c.push_back({"chart_match", "Chart Match", EffectCategory::VideoFilter, "Color",
+                 {num("amount", "Amount (%)", 0, 100, 100, 1), num("rr", "Red from Red", -16, 16, 1, 0.0001), num("rg", "Red from Green", -16, 16, 0, 0.0001),
+                  num("rb", "Red from Blue", -16, 16, 0, 0.0001), num("gr", "Green from Red", -16, 16, 0, 0.0001), num("gg", "Green from Green", -16, 16, 1, 0.0001),
+                  num("gb", "Green from Blue", -16, 16, 0, 0.0001), num("br", "Blue from Red", -16, 16, 0, 0.0001), num("bg", "Blue from Green", -16, 16, 0, 0.0001),
+                  num("bb", "Blue from Blue", -16, 16, 1, 0.0001), num("offset_r", "Red Offset", -1, 1, 0, 0.00001), num("offset_g", "Green Offset", -1, 1, 0, 0.00001),
+                  num("offset_b", "Blue Offset", -1, 1, 0, 0.00001)},
+                 {}});
     c.push_back({"color_correct", "Color Correct (Primaries)", EffectCategory::VideoFilter, "Color",
                  {
                      num("exposure", "Exposure (stops)", -5, 5, 0),
@@ -854,6 +863,9 @@ const EffectInfo& maskInfo() {
                     angle("mask.rotation", "Rotation"),
                     num("mask.feather", "Feather (px)", 0, 500, 20, 0.5),
                     num("mask.expansion", "Expansion (px)", -500, 500, 0, 0.5),
+                    num("mask.consolidate", "Consolidate (px)", 0, 200, 0, 0.5),
+                    pct("mask.refine", "Refine Edges", 0, 100, 0),
+                    num("mask.refine_radius", "Refine Radius (px)", 1, 64, 8, 0.5),
                     pct("mask.opacity", "Mask Opacity", 0, 100, 100),
                     boolean("mask.invert", "Invert"),
                     boolean("mask.qualify", "HSL Qualifier"),

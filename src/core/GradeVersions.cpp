@@ -8,7 +8,8 @@ namespace montage {
 
 bool isGradeEffect(const Effect& e) {
     const EffectInfo* info = findEffectInfo(e.type);
-    return info && info->category == EffectCategory::VideoFilter && info->group == "Color";
+    // (A Chart Match is the camera's calibration, under every version, not one of them.)
+    return info && info->category == EffectCategory::VideoFilter && info->group == "Color" && e.type != "chart_match";
 }
 
 namespace {

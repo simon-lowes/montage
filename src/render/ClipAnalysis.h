@@ -138,24 +138,41 @@ void reframeSize(const Sequence& s, int aspectW, int aspectH, int& width, int& h
 
 // The media frame on screen at clip-local frame `local`.
 int64_t clipObjectFrame(const Project& p, const Sequence& s, const Clip& c, FrameTime local);
+// A mask holds one object or several (ObjectMask::more); `which` picks the one the clicks and tracking are for (0 the
+// first; the count adds a new one).
+//
 // The effect's object data with `point` added to the clicks at clip-local
 // frame `local` (a new ObjectMask when the effect has none).
 std::shared_ptr<ObjectMask> withObjectPoint(const Project& p, const Sequence& s, const Clip& c, const Effect& e,
-                                            FrameTime local, const ObjectPoint& point);
+                                            FrameTime local, const ObjectPoint& point, int which = 0);
 // The same with the clicks at `local` replaced by `points` (none removes them
 // and that frame's segmentation).
 std::shared_ptr<ObjectMask> withObjectPrompts(const Project& p, const Sequence& s, const Clip& c, const Effect& e,
-                                              FrameTime local, const std::vector<ObjectPoint>& points);
+                                              FrameTime local, const std::vector<ObjectPoint>& points, int which = 0);
+// Another object, not clicked yet, added to the effect's mask (or cut out of it when `subtract`); its index in `which`.
+// A mask with no object yet gets its first, which always adds: null for one to cut out (there is nothing to cut from).
+std::shared_ptr<ObjectMask> withNewObject(const Project& p, const Sequence& s, const Clip& c, const Effect& e, bool subtract,
+                                          int* which = nullptr);
+// The mask without object `which`; null when none is left. Without the first, the next object that adds takes its place
+// (the others keep their order); when only objects cut out are left, an empty first object stays to cut them from
+// (removing that empty first removes the mask).
+std::shared_ptr<ObjectMask> withoutObject(const Effect& e, int which);
+// Object `which` (not the first) cut out of the mask or added to it again.
+std::shared_ptr<ObjectMask> withObjectSubtracted(const Effect& e, int which, bool subtract);
+// Object `chosen` of the effect's mask, clamped to the objects it has (which object is being picked is the editor's
+// choice, not part of the project: EditorState::maskObject).
+int currentObject(const Effect& e, int chosen);
 // Segments the clicked frame at clip-local `local` on its own (what the user
 // sees straight after clicking), into a copy of `object`.
 std::shared_ptr<const ObjectMask> segmentClipObjectFrame(const Project& p, const Sequence& s, const Clip& c,
                                                          const ObjectMask& object, FrameTime local,
-                                                         std::string* error = nullptr);
+                                                         std::string* error = nullptr, int which = 0);
 // Follows the object from the nearest clicked frame at or before clip-local
 // `fromLocal` (after it, going backwards) to the clip's end (start). Clicked
 // frames on the way correct the track. The result replaces those frames.
 std::shared_ptr<const ObjectMask> trackClipObject(const Project& p, const Sequence& s, const Clip& c, const ObjectMask& object,
                                                   FrameTime fromLocal, bool forward, const TrackProgress& progress = {},
-                                                  const std::atomic<bool>* cancel = nullptr, std::string* error = nullptr);
+                                                  const std::atomic<bool>* cancel = nullptr, std::string* error = nullptr,
+                                                  int which = 0);
 
 }  // namespace montage

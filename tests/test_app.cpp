@@ -64,6 +64,8 @@
 #include "EditorState.h"
 #include "EffectsBrowser.h"
 #include "ExportDialog.h"
+#include <QMessageBox>
+#include "media/ContentCredentials.h"
 #include "ExposureView.h"
 #include "QualityCheckDialog.h"
 #include "OffloadDialog.h"
@@ -92,6 +94,8 @@
 #include "EffectPresetStore.h"
 #include "EffectsBrowser.h"
 #include "MediaBinWidget.h"
+#include "ReviewOverlay.h"
+#include "ChartMatchDialog.h"
 #include "media/Proxy.h"
 #include "StoryboardView.h"
 #include "StackedTimelineWidget.h"
@@ -152,6 +156,7 @@
 #include "media/StemSeparation.h"
 #include "media/Inpaint.h"
 #include "SpeechDialog.h"
+#include "VoiceConvert.h"
 #include "StemsDialog.h"
 #include "GraphicsDialogs.h"
 #include "ShotSearchPanel.h"
@@ -181,6 +186,7 @@
 #include "core/ProjectIO.h"
 #include "media/Decoder.h"
 #include "render/ColorSpace.h"
+#include "render/ClipAnalysis.h"
 #include "render/Compositor.h"
 #include "render/RenderCache.h"
 #include "render/Exporter.h"
@@ -250,6 +256,28 @@ static std::shared_ptr<Transcript> threeTalks(double& end) {
         }
     end = at;
     return t;
+}
+
+// A ColorChecker photographed under a warm cast, on a grey wall (640 x 360, the patch area at 120,80 300 x 200).
+static QImage castChartImage() {
+    const ChartColors& ref = colorChecker24();
+    const double cast[3][3] = {{1.15, 0.08, 0.0}, {0.02, 0.95, 0.03}, {0.0, 0.05, 0.7}};
+    QImage img(640, 360, QImage::Format_RGB32);
+    img.fill(QColor(84, 84, 84));
+    QPainter p(&img);
+    p.fillRect(QRect(112, 72, 316, 216), QColor(13, 13, 13));
+    for (int i = 0; i < 24; ++i) {
+        double rgb[3];
+        for (int c = 0; c < 3; ++c) {
+            double l = 0;
+            for (int k = 0; k < 3; ++k) l += cast[c][k] * std::pow(ref[size_t(i)][size_t(k)], 2.4);
+            rgb[c] = std::pow(std::max(0.0, l * 0.9), 1 / 2.4);
+        }
+        const double cw = 50, ch = 50;
+        p.fillRect(QRectF(120 + (i % 6) * cw + 4, 80 + (i / 6) * ch + 4, cw - 8, ch - 8),
+                   QColor::fromRgbF(float(std::min(1.0, rgb[0])), float(std::min(1.0, rgb[1])), float(std::min(1.0, rgb[2]))));
+    }
+    return img;
 }
 
 class TestApp : public QObject {
@@ -3155,14 +3183,42 @@ private slots:
         QVERIFY(!win_->findChild<LinkMediaDialog*>("linkMedia"));
         QVERIFY(win_->statusBar()->currentMessage().contains("playing from their proxies"));
         QVERIFY(state()->isMediaOffline(id));
-        // A file without a proxy is still asked about.
+        // A proxy without sound for a file with sound, or no proxy at all, is still asked about.
         state()->newProject();
         bool removed = false;
         QTRY_VERIFY_WITH_TIMEOUT(removed || (removed = QFile::remove(proxy)), 10000);
+        {
+            ProxyOptions silent;
+            silent.format = ProxyFormat::ProResProxy;
+            silent.maxWidth = 0;
+            std::string err;
+            QVERIFY2(createProxy((root + "/B001-away.mp4").toStdString(), proxy.toStdString(), silent, {}, nullptr, &err), err.c_str());
+        }
         QVERIFY(win_->openProject(root + "/cut.montage"));
         auto* dlg = win_->findChild<LinkMediaDialog*>("linkMedia");
         QVERIFY(dlg && dlg->isVisible());
         dlg->close();
+        state()->newProject();
+        removed = false;
+        QTRY_VERIFY_WITH_TIMEOUT(removed || (removed = QFile::remove(proxy)), 10000);
+        QVERIFY(win_->openProject(root + "/cut.montage"));
+        dlg = win_->findChild<LinkMediaDialog*>("linkMedia");
+        QVERIFY(dlg && dlg->isVisible());
+        dlg->close();
+
+        // Two files of the same name (A.mp4 and A.mov) each get their own proxy beside them, made in one go.
+        state()->newProject();
+        QVERIFY(QDir().mkpath(root + "/card2"));
+        QVERIFY(QFile::copy(root + "/B001-away.mp4", root + "/card2/A.mp4"));
+        QVERIFY(QFile::copy(root + "/B001-away.mp4", root + "/card2/A.mov"));
+        const auto pair = state()->importFiles({root + "/card2/A.mp4", root + "/card2/A.mov"});
+        QCOMPARE(pair.size(), size_t(2));
+        bin->createProxies(pair, *options);
+        QTRY_VERIFY_WITH_TIMEOUT(!state()->project().findMedia(pair[0])->proxyPath.empty() && !state()->project().findMedia(pair[1])->proxyPath.empty(), 60000);
+        const std::string pa = state()->project().findMedia(pair[0])->proxyPath, pb = state()->project().findMedia(pair[1])->proxyPath;
+        QVERIFY2(pa != pb, pa.c_str());
+        QVERIFY(QFileInfo::exists(QString::fromStdString(pa)) && QFileInfo::exists(QString::fromStdString(pb)));
+        QCOMPARE(QDir(root + "/card2/Proxy").entryList(QDir::Files).size(), 2);
         appSettings().setValue(QStringLiteral("proxy/where"), "cache");
         appSettings().setValue(QStringLiteral("proxy/format"), "h264");
         appSettings().setValue(QStringLiteral("proxy/sound"), false);
@@ -4404,6 +4460,275 @@ private slots:
         QCOMPARE(j2.settings.out, FrameTime(21));
         QVERIFY(QFileInfo::exists(QDir(other).filePath(name + " - Review.html")));
         win_->renderQueue()->remove(j2.id);
+    }
+
+    void matchColourChart() {
+        // A still of a chart under a warm cast, on the timeline twice.
+        const QString file = dir_.filePath("chart.png");
+        QVERIFY(castChartImage().save(file));
+        state()->newProject();
+        const auto ids = state()->importFiles({file});
+        QCOMPARE(ids.size(), size_t(1));
+        Id a = 0, b = 0;
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = 640, s.height = 360;
+            if (!edit::placeMedia(p, s, ids[0], 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok) return false;
+            if (!edit::placeMedia(p, s, ids[0], 60, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok) return false;
+            a = s.videoTracks[0].clips[0].id, b = s.videoTracks[0].clips[1].id;
+            return true;
+        }));
+        QVERIFY(win_->findChild<QAction*>("matchColourChart"));
+        state()->setSelection({a}, false);
+        // Found when the dialog opens; the outline dragged off it, the match falls apart; Find Chart puts it back.
+        QString first, after;
+        bool shown = false;
+        win_->chartDialogHook_ = [&](ChartMatchDialog* dlg) {
+            shown = true;
+            // Looked for in the background: nothing to apply until it is found.
+            QVERIFY(!dlg->findChild<QPushButton*>("chartApply")->isEnabled());
+            QTRY_VERIFY(!dlg->searching() && dlg->ready());
+            QVERIFY(dlg->findChild<QPushButton*>("chartApply")->isEnabled());
+            const TrackQuad found = dlg->quad();
+            QVERIFY(std::fabs(found.p[0].x - 120.0 / 640) < 0.02 && std::fabs(found.p[2].y - 280.0 / 360) < 0.03);
+            QVERIFY(dlg->fit().deltaEBefore > 5 && dlg->fit().deltaEAfter < 2);
+            first = dlg->findChild<QLabel*>("chartStatus")->text();
+            TrackQuad off = found;
+            for (auto& pt : off.p) pt.x += 0.25;
+            dlg->setQuad(off);
+            QVERIFY(dlg->fit().deltaEAfter > 3 || !dlg->fit().ok);
+            dlg->findChild<QPushButton*>("chartFind")->click();
+            QTRY_VERIFY(!dlg->searching() && dlg->fit().ok);
+            QVERIFY(dlg->fit().deltaEAfter < 2);
+            after = dlg->findChild<QLabel*>("chartStatus")->text();
+            // The corners move with the keys: 3 picks the bottom right, Shift+Right moves it ten pixels of the frame.
+            auto* view = dlg->findChild<QWidget*>("chartView");
+            const double x = dlg->quad().p[2].x;
+            QTest::keyClick(view, Qt::Key_3);
+            QTest::keyClick(view, Qt::Key_Right, Qt::ShiftModifier);
+            QVERIFY(std::fabs(dlg->quad().p[2].x - (x + 10.0 / 640)) < 1e-6);
+            QTest::keyClick(view, Qt::Key_Left, Qt::ShiftModifier);
+            QVERIFY(std::fabs(dlg->quad().p[2].x - x) < 1e-6);
+            QMetaObject::invokeMethod(dlg, "accept", Qt::QueuedConnection);
+        };
+        QCOMPARE(win_->matchColourChart(), 1);
+        QVERIFY(shown);
+        QVERIFY2(first.contains("Delta E") && after.contains("Delta E"), qPrintable(first));
+        // One Chart Match, first in the clip's effects, one undo step; the other clip of the media untouched.
+        auto chartOn = [&](Id id) {
+            const Clip* c = edit::clipById(*state()->sequence(), id);
+            return c && !c->effects.empty() && c->effects.front().type == "chart_match";
+        };
+        QVERIFY(chartOn(a));
+        QVERIFY(!chartOn(b));
+        // The picture played: the patches as the chart has them.
+        {
+            const Sequence& s = *state()->sequence();
+            const Image img = renderProgramFrame(state()->project(), s, 10, RenderOptions{});
+            TrackQuad q;
+            q.p[0] = {120.0 / 640, 80.0 / 360}, q.p[1] = {420.0 / 640, 80.0 / 360}, q.p[2] = {420.0 / 640, 280.0 / 360}, q.p[3] = {120.0 / 640, 280.0 / 360};
+            const ChartColors got = sampleChart(img, q);
+            double worst = 0;
+            for (int i = 0; i < 24; ++i) worst = std::max(worst, deltaE76(got[size_t(i)], colorChecker24()[size_t(i)]));
+            QVERIFY2(worst < 4, qPrintable(QString::number(worst)));
+        }
+        state()->undo();
+        QVERIFY(!chartOn(a));
+        // Every clip of the media, when asked; cancelling changes nothing.
+        win_->chartDialogHook_ = [](ChartMatchDialog* dlg) {
+            QTRY_VERIFY(!dlg->searching());
+            dlg->findChild<QCheckBox*>("chartSameMedia")->setChecked(true);
+            QMetaObject::invokeMethod(dlg, "accept", Qt::QueuedConnection);
+        };
+        QCOMPARE(win_->matchColourChart(), 2);
+        QVERIFY(chartOn(a) && chartOn(b));
+        win_->chartDialogHook_ = [](ChartMatchDialog* dlg) { QMetaObject::invokeMethod(dlg, "reject", Qt::QueuedConnection); };
+        QCOMPARE(win_->matchColourChart(), 0);
+        // A picture with no chart: Apply stays off, and accepting anyway changes nothing.
+        {
+            const QString plain = dir_.filePath("plain.png");
+            QImage grey(640, 360, QImage::Format_RGB32);
+            grey.fill(QColor(90, 90, 90));
+            QVERIFY(grey.save(plain));
+            const auto plainIds = state()->importFiles({plain});
+            QCOMPARE(plainIds.size(), size_t(1));
+            Id c = 0;
+            QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+                if (!edit::placeMedia(p, s, plainIds[0], 200, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok) return false;
+                c = s.videoTracks[0].clips.back().id;
+                return true;
+            }));
+            state()->setSelection({c}, false);
+            bool apply = true;
+            win_->chartDialogHook_ = [&](ChartMatchDialog* dlg) {
+                QTRY_VERIFY(!dlg->searching());
+                apply = dlg->findChild<QPushButton*>("chartApply")->isEnabled() || dlg->ready();
+                QMetaObject::invokeMethod(dlg, "accept", Qt::QueuedConnection);
+            };
+            QCOMPARE(win_->matchColourChart(), 0);
+            QVERIFY(!apply);
+            QVERIFY(!chartOn(c));
+        }
+        win_->chartDialogHook_ = nullptr;
+        state()->newProject();
+    }
+
+    void aiRunsOn() {
+        // Tools > AI Models Run On: one choice checked at a time, remembered in the settings; fixed while
+        // MONTAGE_INFERENCE says where models run (as it does in these tests).
+        auto* menu = win_->findChild<QMenu*>("aiRunOn");
+        QVERIFY(menu);
+        QVERIFY(win_->findChild<QAction*>("aiDevices"));
+        auto* efficient = win_->findChild<QAction*>("aiRunOn_efficient");
+        auto* cpu = win_->findChild<QAction*>("aiRunOn_cpu");
+        auto* automatic = win_->findChild<QAction*>("aiRunOn_auto");
+        QVERIFY(efficient && cpu && automatic);
+        const QByteArray was = qgetenv("MONTAGE_INFERENCE");
+        qputenv("MONTAGE_INFERENCE", "cpu");
+        emit menu->aboutToShow();
+        QVERIFY(!efficient->isEnabled() && efficient->toolTip().contains("MONTAGE_INFERENCE"));
+        qunsetenv("MONTAGE_INFERENCE");
+        auto restore = qScopeGuard([&] {
+            qputenv("MONTAGE_INFERENCE", was);
+            emit menu->aboutToShow();
+        });
+        emit menu->aboutToShow();
+        QVERIFY(efficient->isEnabled());
+        efficient->trigger();
+        QVERIFY(efficient->isChecked() && !automatic->isChecked() && !cpu->isChecked());
+        QCOMPARE(appSettings().value("ai/inference").toString(), QString("efficient"));
+        cpu->trigger();
+        QVERIFY(cpu->isChecked() && !efficient->isChecked());
+        QCOMPARE(appSettings().value("ai/inference").toString(), QString("cpu"));
+        automatic->trigger();
+        QCOMPARE(appSettings().value("ai/inference").toString(), QString("auto"));
+    }
+
+    void reviewDrawingsAndVersions() {
+        loadDemo();
+        MonitorPanel* program = nullptr;
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        auto* overlay = win_->findChild<ReviewOverlay*>();
+        QVERIFY(overlay);
+        QAction* show = win_->findChild<QAction*>("showReviewDrawings");
+        QVERIFY(show && show->isChecked() && show->isCheckable());
+
+        // A reviewer's green line across the middle of frame 10, drawn over the Program monitor there and nowhere else.
+        state()->setPlayhead(10);
+        QTest::qWait(300);  // (the frame rendered for the playhead)
+        ReviewStroke line;
+        line.color = "#00ff00";
+        line.width = 0.05;
+        line.points = {{0.1, 0.5}, {0.9, 0.5}};
+        Marker m{10, 0, "Sam", "Here", 7, false};
+        m.drawing = reviewDrawingJson({line});
+        m.reviewId = "x1";
+        QVERIFY(state()->edit("Mark", [&](Project&, Sequence& s) {
+            edit::addMarker(s, m);
+            return true;
+        }));
+        QCOMPARE(overlay->strokesNow().size(), size_t(1));
+        QImage black(320, 180, QImage::Format_RGB32);
+        black.fill(Qt::black);
+        viewer->setImage(black);
+        auto centre = [&] {
+            const QImage shot = viewer->grab().toImage();
+            const qreal dpr = shot.devicePixelRatio();
+            const QRectF r = viewer->imageRect();
+            return shot.pixelColor(int(r.center().x() * dpr), int(r.center().y() * dpr));
+        };
+        QColor c = centre();
+        QVERIFY2(c.green() > 200 && c.red() < 80 && c.blue() < 80, qPrintable(c.name()));
+        show->trigger();  // Playback › Show Review Drawings off
+        QVERIFY(!overlay->shown());
+        c = centre();
+        QVERIFY2(c.green() < 60, qPrintable(c.name()));
+        show->trigger();
+        QVERIFY(overlay->shown());
+        state()->setPlayhead(11);
+        QVERIFY(overlay->strokesNow().empty());
+        // A marker with a length shows its drawing all through it.
+        QVERIFY(state()->edit("Lengthen", [&](Project&, Sequence& s) {
+            for (Marker& x : s.markers)
+                if (x.reviewId == "x1") x.duration = 5;
+            return true;
+        }));
+        QCOMPARE(overlay->strokesNow().size(), size_t(1));
+        state()->setPlayhead(15);
+        QVERIFY(overlay->strokesNow().empty());
+        // A note that had to sit beside its frame shows its drawing on the frame it was drawn on.
+        QVERIFY(state()->edit("Move", [&](Project&, Sequence& s) {
+            for (Marker& x : s.markers)
+                if (x.reviewId == "x1") x.duration = 0, x.t = 12, x.drawnAt = 10;
+            return true;
+        }));
+        state()->setPlayhead(10);
+        QCOMPARE(overlay->strokesNow().size(), size_t(1));
+        state()->setPlayhead(12);
+        QVERIFY(overlay->strokesNow().empty());
+
+        // A copy sent again to the same folder is version 2, and its page compares with version 1.
+        const QString name = QString::fromStdString(state()->sequence()->name);
+        const QString folder = dir_.filePath("versions");
+        QDir(folder).removeRecursively();
+        const QString first = win_->exportForReview(folder, ReviewExportOptions{});
+        QCOMPARE(first, QDir(folder).filePath(name + " - Review.html"));
+        win_->renderQueue()->remove(win_->renderQueue()->jobs().back().id);
+        {
+            QFile copy(QDir(folder).filePath(name + " - Review.mp4"));  // (as if rendered)
+            QVERIFY(copy.open(QIODevice::WriteOnly));
+        }
+        bool shown = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = win_->findChild<QDialog*>("exportForReviewDialog");
+            QVERIFY(dlg);
+            shown = true;
+            dlg->findChild<QLineEdit*>("reviewFolder")->setText(folder);
+            auto* version = dlg->findChild<QSpinBox*>("reviewVersion");
+            auto* compare = dlg->findChild<QCheckBox*>("reviewCompare");
+            QCOMPARE(version->value(), 2);
+            QVERIFY(compare->isEnabled() && compare->isChecked());
+            version->setValue(1);
+            QVERIFY(!compare->isEnabled());  // nothing before version 1
+            version->setValue(2);
+            QVERIFY(compare->isEnabled());
+            dlg->accept();
+        });
+        win_->findChild<QAction*>("exportForReview")->trigger();
+        QVERIFY(shown);
+        const RenderQueue::Job& job = win_->renderQueue()->jobs().back();
+        QCOMPARE(QString::fromStdString(job.settings.path), QDir(folder).filePath(name + " - Review v2.mp4"));
+        win_->renderQueue()->remove(job.id);
+        QFile page(QDir(folder).filePath(name + " - Review v2.html"));
+        QVERIFY(page.open(QIODevice::ReadOnly));
+        const auto info = readReviewPage(page.readAll().toStdString());
+        QVERIFY(info && info->version == 2);
+
+        // Notes imported twice: the second time brings the same markers up to date instead of adding more.
+        const QString notes = dir_.filePath("drawn-notes.json");
+        auto writeNotes = [&](const char* json) {
+            QFile f(notes);
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(json);
+        };
+        writeNotes(R"({"montageReview":2,"fps":[30,1],"version":2,"notes":[{"id":"q1","frame":40,"author":"Ana","text":"Brighter",
+            "drawing":[{"tool":"arrow","points":[[0.2,0.2],[0.5,0.5]]}]}]})");
+        const size_t before = state()->sequence()->markers.size();
+        QCOMPARE(win_->importMarkers(notes), 1);
+        QCOMPARE(state()->sequence()->markers.size(), before + 1);
+        writeNotes(R"({"montageReview":2,"fps":[30,1],"version":2,"notes":[{"id":"q1","frame":40,"author":"Ana","text":"Brighter","status":"done",
+            "drawing":[{"tool":"arrow","points":[[0.2,0.2],[0.5,0.5]]}]}]})");
+        QCOMPARE(win_->importMarkers(notes), 1);
+        QCOMPARE(state()->sequence()->markers.size(), before + 1);
+        QVERIFY(win_->statusBar()->currentMessage().contains("up to date"));
+        const auto& ms = state()->sequence()->markers;
+        QVERIFY(std::any_of(ms.begin(), ms.end(), [](const Marker& x) { return x.reviewId == "q1" && x.name.rfind("\xE2\x9C\x93 ", 0) == 0; }));
+        const auto q1 = std::find_if(ms.begin(), ms.end(), [](const Marker& x) { return x.reviewId == "q1"; });
+        state()->setPlayhead(q1->t);
+        QCOMPARE(overlay->strokesNow().size(), size_t(1));
+        QCOMPARE(overlay->strokesNow()[0].tool, std::string("arrow"));
     }
 
     void transitionsToSelection() {
@@ -6044,6 +6369,144 @@ private slots:
         QVERIFY(!edit::clipById(*state()->sequence(), clips[0]));
     }
 
+    void contentCredentialsInTheApp() {
+        // The Export dialog offers signing for files that can hold credentials, and not for MKV.
+        state()->newProject();
+        const QString certs = MONTAGE_TEST_DATA_DIR "/c2pa/chain.pem", key = MONTAGE_TEST_DATA_DIR "/c2pa/signer.key";
+        appSettings().remove("credentials/certificate");
+        appSettings().remove("credentials/key");
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->apply("Place", [&](Project& p, Sequence& s) { return edit::placeMedia(p, s, ids[0], 0, 0, 60, V1, A1, false); }));
+        const QString out = dir_.path() + "/signed-in-app.wav";
+        {
+            ExportDialog ed(state(), win_.get());
+            auto* sign = ed.findChild<QCheckBox*>("exportCredentials");
+            auto* identity = ed.findChild<QPushButton*>("exportCredentialIdentity");
+            auto* training = ed.findChild<QCheckBox*>("exportAllowAiTraining");
+            auto* preset = ed.findChild<QComboBox*>("exportPreset");
+            auto* path = ed.findChild<QLineEdit*>("exportPath");
+            QVERIFY(sign && identity && training && preset && path);
+            QVERIFY(identity->text().contains("Choose"));
+            preset->setCurrentIndex(preset->findText("Audio - WAV 24-bit"));
+            QCOMPARE(sign->isEnabled(), contentCredentialsAvailable());
+            for (int i = 0; i < preset->count(); ++i)
+                if (preset->itemText(i).contains("MKV")) {
+                    preset->setCurrentIndex(i);
+                    QVERIFY(!sign->isEnabled());
+                    sign->setChecked(true);  // (remembered from another export): said to go out unsigned
+                    QVERIFY(sign->text().contains("unsigned"));
+                    sign->setChecked(false);
+                    break;
+                }
+            if (!contentCredentialsAvailable()) QSKIP("Built without the C2PA library (scripts/build-c2pa.sh) for the rest");
+            preset->setCurrentIndex(preset->findText("Audio - WAV 24-bit"));
+            path->setText(out);
+            // Asked to sign without a certificate: nothing is exported.
+            sign->setChecked(true);
+            QVERIFY(training->isEnabled() && !training->isChecked());
+            QTimer::singleShot(0, [] {
+                if (auto* box = qobject_cast<QMessageBox*>(QApplication::activeModalWidget())) box->accept();
+            });
+            ed.findChild<QPushButton*>("exportButton")->click();
+            QVERIFY(!ed.isExporting() && !QFileInfo::exists(out));
+        }
+        appSettings().setValue("credentials/certificate", certs);
+        appSettings().setValue("credentials/key", key);
+        {
+            ExportDialog ed(state(), win_.get());
+            QCOMPARE(ed.findChild<QPushButton*>("exportCredentialIdentity")->text(), QStringLiteral("chain.pem"));
+            ed.findChild<QComboBox*>("exportPreset")->setCurrentIndex(ed.findChild<QComboBox*>("exportPreset")->findText("Audio - WAV 24-bit"));
+            ed.findChild<QLineEdit*>("exportPath")->setText(out);
+            ed.findChild<QCheckBox*>("exportCredentials")->setChecked(true);
+            ed.findChild<QPushButton*>("exportButton")->click();
+            QTRY_COMPARE_WITH_TIMEOUT(ed.result(), int(QDialog::Accepted), 60000);
+        }
+        appSettings().setValue("export/credentials", false);
+        CredentialSummary c;
+        QVERIFY(readContentCredentials(out.toStdString(), c) && c.present && c.state == "Valid");
+
+        // Imported, the bin shows who signed it (read in the background), in its column and tooltip; not an undo step.
+        const int undoBefore = int(state()->history().undoCount());
+        const auto signedIds = state()->importFiles({out});
+        QCOMPARE(signedIds.size(), size_t(1));
+        auto label = [&] {
+            const MediaItem* m = state()->project().findMedia(signedIds[0]);
+            const auto it = m ? m->metadata.find("c2pa") : decltype(m->metadata.end()){};
+            return m && it != m->metadata.end() ? QString::fromStdString(it->second) : QString();
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(!label().isEmpty(), 20000);
+        QVERIFY2(label().startsWith("Signed by Montage tests") && label().contains("(valid)"), qPrintable(label()));
+        QCOMPARE(int(state()->history().undoCount()), undoBefore + 1);  // the import alone
+        state()->undo();
+        QVERIFY(!state()->project().findMedia(signedIds[0]));
+        state()->redo();
+        QVERIFY2(label().startsWith("Signed by"), "redo brings back what was read");
+        // A file without credentials gets none.
+        const MediaItem* plain = state()->project().findMedia(ids[0]);
+        QVERIFY(plain && !plain->metadata.count("c2pa"));
+        appSettings().remove("credentials/certificate");
+        appSettings().remove("credentials/key");
+    }
+
+    void convertVoice() {
+        // JFK's line (two to five seconds of the file) on A1, and the whole of it again on A2 as the voice to convert to.
+        state()->newProject();
+        QVERIFY(state()->save(dir_.path() + "/convert.montage"));
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        const double fps = state()->sequence()->fpsValue();
+        QVERIFY(state()->apply("Place", [&](Project& p, Sequence& s) {
+            edit::addTrack(p, s, TrackKind::Audio);
+            const edit::Result r = edit::placeMedia(p, s, media, 0, FrameTime(2 * fps), FrameTime(5 * fps), V1, A1, false);
+            return r.ok ? edit::placeMedia(p, s, media, 600, 0, -1, V1, {TrackKind::Audio, 1}, false) : r;
+        }));
+        const Id clip = trackAt(*state()->sequence(), A1)->clips.at(0).id;
+        const Id voiceClip = state()->sequence()->audioTracks.at(1).clips.at(0).id;
+        // The clip a selection converts.
+        QCOMPARE(voiceConversionClip(state()->project(), *state()->sequence(), {clip}), clip);
+        QCOMPARE(voiceConversionClip(state()->project(), *state()->sequence(), {}), Id(0));
+        QVERIFY(win_->findChild<QAction*>("convertVoice"));
+
+        // The dialog offers every other clip with sound, then a recording, and needs the speaker's consent.
+        VoiceConvertDialog dlg(state(), clip, voiceClip, win_.get());
+        auto* voice = dlg.findChild<QComboBox*>("convertVoice");
+        auto* consent = dlg.findChild<QCheckBox*>("convertConsent");
+        auto* go = dlg.findChild<QPushButton*>("convertGo");
+        QVERIFY(voice && consent && go);
+        QCOMPARE(voice->count(), 2);
+        QCOMPARE(voice->currentData().toLongLong(), qint64(voiceClip));
+        QCOMPARE(voice->itemData(1).toLongLong(), qint64(0));
+        QVERIFY(!go->isEnabled());
+        QVERIFY(!dlg.convert());  // no consent
+        consent->setChecked(true);
+        QCOMPARE(go->isEnabled(), voiceCloneAvailable());
+        dlg.setRecording(QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav"));
+        QCOMPARE(voice->currentData().toLongLong(), qint64(0));
+        QVERIFY(dlg.findChild<QLabel*>("convertStatus")->text().contains("jfk.wav") || !voiceCloneAvailable());
+        voice->setCurrentIndex(0);
+
+        if (!voiceCloneAvailable() || !voiceCloneModel().installed()) QSKIP("Set MONTAGE_VOICE_CLONE_MODEL to the Chatterbox Multilingual pack");
+        // Converted: a take of the clip, picked, with a second either side, its file beside the project saying what it is.
+        QVERIFY(dlg.convert());
+        const Clip* c = edit::clipById(*state()->sequence(), clip);
+        QCOMPARE(c->takes.size(), size_t(2));
+        QCOMPARE(c->take, 1);
+        QVERIFY(std::abs(c->sourceIn - fps) < 1e-6);
+        const MediaItem* m = state()->project().findMedia(c->mediaId);
+        QVERIFY(m && m->bin == "Voiceover" && QString::fromStdString(m->name).contains("Converted Voice"));
+        QVERIFY(QFileInfo(QString::fromStdString(m->path)).absolutePath() == QDir(dir_.path()).absoluteFilePath("Voiceover"));
+        QVERIFY(std::abs(m->duration - 5.0) < 0.05);
+        QVERIFY(QString::fromStdString(m->metadata.at("comment")).contains("converted to a voice cloned from jfk"));
+        QVERIFY(std::find(m->keywords.begin(), m->keywords.end(), "AI voice") != m->keywords.end());
+        // One undo step gives back the original.
+        state()->undo();
+        c = edit::clipById(*state()->sequence(), clip);
+        QVERIFY(c->takes.empty());
+        QCOMPARE(c->mediaId, media);
+    }
+
     void clonedVoiceover() {
         state()->newProject();
         auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
@@ -7289,6 +7752,7 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(!said.isEmpty());
         QCOMPARE(said.last().at(0).toString(), QString("The start must be a timecode before the end"));
 
+        QVERIFY(!panel->findChild<QPushButton*>("adrConvertVoice")->isEnabled());  // no take to convert yet
         // Rehearse: the cycle (beeps, streamer) goes to the Program monitor and nothing is recorded.
         auto* program = win_->findChild<PlaybackController*>("programPlayback");
         panel->rehearse();
@@ -7334,6 +7798,9 @@ const auto seq = [this] { return state()->sequence(); };
         const Id clip = state()->sequence()->adrCues[0].clip;
         QVERIFY(clip);
         QCOMPARE(state()->sequence()->adrCues[0].status, int(kAdrRecorded));
+        // A take can be said again in the guide's voice (none on the guide track here).
+        QTRY_VERIFY(panel->findChild<QPushButton*>("adrConvertVoice")->isEnabled());
+        QCOMPARE(panel->guideClip(), Id(0));
         const Clip* c = edit::clipById(*state()->sequence(), clip);
         QVERIFY(c && c->start == 150 && c->duration == 60);
         QCOMPARE(c->sourceIn, double(150 - cyc.playFrom));
@@ -12074,6 +12541,52 @@ print("added " .. ui.name)
         static_cast<QToolButton*>(visible("trackObjectForward"))->click();
         QTest::qWait(50);
         QVERIFY(!edit::clipById(*state()->sequence(), clip)->effects.back().object);
+        // Several objects: + adds one, − one to cut out (chosen at once), Cut Out flips it, Remove drops the chosen one;
+        // each one undo step. Choosing an object is not an edit: it makes no undo step.
+        {
+            auto fx = [&]() -> const Effect& { return edit::clipById(*state()->sequence(), clip)->effects.back(); };
+            auto* list = static_cast<QComboBox*>(visible("objectList"));
+            QVERIFY(list && visible("objectAdd") && visible("objectSubtract") && visible("objectRemove") && visible("objectCutOut"));
+            QCOMPARE(list->count(), 1);
+            // Until the first object is picked there is nothing to add to or cut out of.
+            QVERIFY(!visible("objectAdd")->isEnabled() && !visible("objectSubtract")->isEnabled());
+            state()->edit("Pick Object", [&](Project& p, Sequence& s) {
+                Clip* c = edit::clipById(s, clip);
+                Effect& ef = c->effects.back();
+                ef.object = withNewObject(p, s, *c, ef, false);
+                return ef.object != nullptr;
+            });
+            QTRY_VERIFY(visible("objectAdd")->isEnabled() && visible("objectSubtract")->isEnabled());
+            static_cast<QToolButton*>(visible("objectSubtract"))->click();
+            QTRY_VERIFY(fx().object->count() == 2);
+            QTRY_COMPARE(static_cast<QComboBox*>(visible("objectList"))->count(), 2);
+            list = static_cast<QComboBox*>(visible("objectList"));
+            QCOMPARE(list->currentIndex(), 1);
+            QVERIFY(list->itemText(1).contains("cut out"));
+            QCOMPARE(state()->maskObject(fx()), 1);
+            QVERIFY(fx().object->object(1).subtract);
+            auto* cut = static_cast<QCheckBox*>(visible("objectCutOut"));
+            QVERIFY(cut->isEnabled() && cut->isChecked());
+            cut->click();
+            QTRY_VERIFY(!fx().object->object(1).subtract);
+            // Choosing the first: Cut Out is off for it, and undo still undoes the Cut Out change.
+            const QString lastStep = state()->undoText();
+            list = static_cast<QComboBox*>(visible("objectList"));
+            list->setCurrentIndex(0);
+            emit list->activated(0);
+            QTRY_COMPARE(state()->maskObject(fx()), 0);
+            QTRY_VERIFY(!static_cast<QCheckBox*>(visible("objectCutOut"))->isEnabled());
+            QCOMPARE(state()->undoText(), lastStep);
+            list = static_cast<QComboBox*>(visible("objectList"));
+            list->setCurrentIndex(1);
+            emit list->activated(1);
+            QTRY_COMPARE(state()->maskObject(fx()), 1);
+            static_cast<QToolButton*>(visible("objectRemove"))->click();
+            QTRY_VERIFY(fx().object && fx().object->count() == 1);
+            QCOMPARE(state()->maskObject(fx()), 0);
+            static_cast<QToolButton*>(visible("objectRemove"))->click();
+            QTRY_VERIFY(!fx().object);
+        }
 
         if (!segmenterAvailable() || !objectModel().installed())
             QSKIP("Picking objects needs ONNX Runtime and the model (MONTAGE_OBJECT_MODEL)");
@@ -12316,3 +12829,6 @@ print("added " .. ui.name)
 
 QTEST_MAIN(TestApp)
 #include "test_app.moc"
+
+// (AI models run on the processor in tests, so results do not depend on the machine's GPU: media/Inference.h.)
+[[maybe_unused]] static const bool kCpuInference = (qputenv("MONTAGE_INFERENCE", "cpu"), true);

@@ -283,6 +283,7 @@ const std::vector<MediaField>& mediaFields() {
         {"device", "Camera Model", T::Text, true, true, true},
         {"description", "Description", T::Text, true, true, true},
         {"comment", "Comment", T::Text, true, true, true},
+        {"c2pa", "Content Credentials", T::Text, false, true, true},
         {"created", "Date Recorded", T::Text, false, true, true},
         {"resolution", "Resolution", T::Text, false, true, false},
         {"width", "Width", T::Number, false, false, true},
@@ -311,7 +312,7 @@ const MediaField* mediaField(const std::string& key) {
 }
 
 const std::vector<std::string>& metadataKeys() {
-    static const std::vector<std::string> keys{"scene", "shot", "take", "tape", "camera", "device", "description", "comment", "tracks"};
+    static const std::vector<std::string> keys{"scene", "shot", "take", "tape", "camera", "device", "description", "comment", "tracks", "c2pa"};
     return keys;
 }
 

@@ -798,6 +798,7 @@ void MonitorPanel::renderTrimView() {
             RenderOptions o;
             o.scale = scale;
             o.useProxies = proxies;
+            o.offlineProxies = true;
             o.displaySpace = "rec709";
             const Image img = renderProgramFrame(*project, *sq, t, o);
             QImage out(img.width, img.height, QImage::Format_RGBA8888);

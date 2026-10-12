@@ -1,6 +1,8 @@
 #include "Exporter.h"
 #include "media/SpatialAudio.h"
 #include "core/AudioDescription.h"
+#include "core/Provenance.h"
+#include "media/ContentCredentials.h"
 
 #include "core/ColorGroups.h"
 #include "core/ClipAnimation.h"
@@ -17,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <set>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1703,12 +1706,28 @@ bool containerCarriesStreams(const std::string& path) {
     return false;
 }
 
+bool exportCarriesCredentials(const ExportSettings& s) {
+    // One file of a kind that holds them (not numbered frames, nor a GIF).
+    static const std::set<std::string> frames{"png", "tiff", "exr", "dpx", "gif"};
+    return contentCredentialsFormat(s.path) && !frames.count(s.videoCodec);
+}
+
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
                     LightLevels* light) {
     bool opened = false;
     if (smartRendered) *smartRendered = 0;
     if (light) *light = LightLevels{};
+    if (!s.credentialCertificate.empty()) {  // (refused before rendering rather than after)
+        std::string why;
+        if (!contentCredentialsAvailable()) why = "This build of Montage cannot sign with Content Credentials";
+        else if (!exportCarriesCredentials(s)) why = "Content Credentials cannot go in this kind of file";
+        else if (!checkCredentialSigner({s.credentialCertificate, s.credentialKey, {}}, &why)) why = "Cannot sign with Content Credentials: " + why;
+        if (!why.empty()) {
+            if (error) *error = why;
+            return false;
+        }
+    }
     // Channels the codec cannot carry fold down (an immersive mix in AAC to its ear-level 7.1 or 5.1), as the export
     // dialog's summary says, rather than failing or turning into stereo. Down to stereo it is the stereo fold-down of the
     // whole mix. Mono tracks carry a channel each, whatever the codec.
@@ -1761,6 +1780,18 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
     // Never leave a truncated file behind (the output is closed by now), but
     // don't touch an existing file if we failed before writing to it.
     if (!ok && opened) std::remove(s.path.c_str());
+    if (ok && !s.credentialCertificate.empty()) {
+        const Provenance made = sequenceProvenance(p, seq, s.in, s.out);
+        CredentialOptions o;
+        o.allowAiTraining = s.credentialAllowAiTraining;
+        o.sources = made.sources;
+        std::string why;
+        if (!signContentCredentials(s.path, made, {s.credentialCertificate, s.credentialKey, {}}, o, &why)) {
+            if (error) *error = "Could not sign it with Content Credentials: " + why;
+            std::remove(s.path.c_str());  // (asked for signed, so not left unsigned)
+            return false;
+        }
+    }
     return ok;
 }
 

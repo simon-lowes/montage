@@ -90,6 +90,15 @@ int adrTrack(Project& p, Sequence& s);
 // what a take covers when an earlier one was cut short. A take that ends before the line is refused. A cue still
 // To Record becomes Recorded.
 Result addAdrTake(Project& p, Sequence& s, Id cueId, Id mediaId, FrameTime recordedFrom, int track);
+
+// Voice conversion (app/VoiceConvert.h): the media seconds a clip's conversion covers, what it plays and `handles`
+// seconds either side as far as its media goes; false for a clip with no sound.
+bool voiceConversionRange(const Project& p, const Sequence& s, Id clip, double handles, double& from, double& to);
+// What a converted file of a clip named `name` is called, before its number: "<name> Converted Voice ", with
+// characters no file name can hold replaced.
+std::string convertedVoiceStem(const std::string& name);
+// Adds `mediaId`, the clip's sound from `from` seconds of its media said again, as a take of the clip, and picks it.
+Result addConvertedTake(Project& p, Sequence& s, Id clip, Id mediaId, double from);
 }  // namespace edit
 
 }  // namespace montage

@@ -46,6 +46,7 @@
 #include "core/TimelineCompare.h"
 #include "core/Reconform.h"
 #include "core/Adr.h"
+#include "core/Provenance.h"
 #include "core/AudioDescription.h"
 #include <QProcess>
 #include <QSysInfo>
@@ -3135,6 +3136,17 @@ private slots:
                     logits[size_t(y) * kObjectGrid + size_t(x)] = float(40 - std::hypot(x - 100.0, y - 120.0)) * 0.37f;
             obj->frames[12] = packObjectLogits(logits.data());
             obj->frames[13] = packObjectLogits(logits.data());
+            // A second object, named and cut out of the mask.
+            ObjectMask cut;
+            cut.fps = obj->fps;
+            cut.name = "Mic";
+            cut.subtract = true;
+            cut.prompts[12] = {{0.5, 0.5, 1}};
+            cut.frames[12] = packObjectLogits(logits.data());
+            obj->more.push_back(cut);
+            QCOMPARE(obj->count(), 2);
+            QCOMPARE(obj->object(1).name, std::string("Mic"));
+            QCOMPARE(&obj->object(7), &obj->more.back());  // (out of range: the last)
             v->effects.back().params["mask.shape"] = Param(3.0);
             v->effects.back().object = obj;
             // Packed to 1/8 of a logit, clamped where the sigmoid is flat; a few kB a frame.
@@ -5667,6 +5679,157 @@ private slots:
         QVERIFY2(parseMarkerList("\xEF\xBB\xBF" + notesJson, s, back, &err), err.c_str());
         QCOMPARE(back.size(), size_t(4));
         QCOMPARE(back[3].comment, std::string("From a timecode"));
+
+        // Drawings: kept to the tools, colours, widths and points understood, as JSON on the marker.
+        const std::vector<ReviewStroke> strokes = parseReviewDrawing(
+            R"([{"tool":"arrow","color":"\u0023FF0000","width":0.004,"points":[[0.1,0.2],[0.5,0.6]]},
+                {"tool":"laser","points":[[0.1,0.1]]},
+                {"tool":"box","color":"red","width":9,"points":[[-1,0.5],[2,0.7]]},
+                {"tool":"ellipse","points":[[0.3,0.3]]},
+                {"tool":"pen","points":[[0.5,0.5],["x",1],[0.6,0.5]]}])");
+        QCOMPARE(strokes.size(), size_t(3));  // an unknown tool and a one-point ellipse left out
+        QCOMPARE(strokes[0].color, std::string("#ff0000"));
+        QCOMPARE(strokes[1].color, std::string("#ff3b30"));  // not a #rrggbb colour: the default
+        QCOMPARE(strokes[1].width, 0.05);
+        QCOMPARE(strokes[1].points[0][0], 0.0);  // clamped into the frame
+        QCOMPARE(strokes[1].points[1][0], 1.0);
+        QCOMPARE(strokes[2].points.size(), size_t(2));
+        QCOMPARE(parseReviewDrawing(reviewDrawingJson(strokes)).size(), size_t(3));
+        QVERIFY(reviewDrawingJson({}).empty() && parseReviewDrawing("").empty() && parseReviewDrawing("{oops").empty());
+        std::string many = "[";
+        for (int i = 0; i < 250; ++i) many += std::string(i ? "," : "") + R"({"tool":"pen","points":[[0.5,0.5]]})";
+        QCOMPARE(parseReviewDrawing(many + "]").size(), size_t(200));
+
+        // Notes with a status, replies, a version, an id and a drawing (a drawing alone is a note too).
+        const std::string v2 = R"({"montageReview":2,"fps":[25,1],"version":2,"notes":[
+            {"id":"a1","frame":20,"author":"Sam","text":"Cut here","status":"progress",
+             "replies":[{"author":"Ana","text":"Yes"},{"author":"","text":"Me too"},{"author":"Bo","text":"  "}],
+             "drawing":[{"tool":"box","color":"\u002334c759","points":[[0.1,0.1],[0.3,0.3]]}]},
+            {"id":"a2","frame":20,"author":"Ana","text":"","drawing":[{"tool":"pen","points":[[0.5,0.5],[0.6,0.6]]}],"version":1},
+            {"id":"a3","frame":90,"author":"Ana","text":"Old style","done":true},
+            {"id":"a4","frame":95,"author":"Ana","text":"","drawing":[{"tool":"laser","points":[[0.5,0.5]]}]}]})";
+        std::vector<ReviewNote> drawn;
+        QVERIFY2(parseReviewNotes(v2, s.fps, drawn, nullptr, &err), err.c_str());
+        QCOMPARE(drawn.size(), size_t(3));  // a drawing nobody can show, and no text: dropped
+        QCOMPARE(drawn[0].status, std::string("progress"));
+        QVERIFY(!drawn[0].done);
+        QCOMPARE(drawn[0].version, 2);  // the file's
+        QCOMPARE(drawn[0].replies.size(), size_t(2));
+        QCOMPARE(drawn[0].replies[1].author, std::string("Reviewer"));
+        QCOMPARE(drawn[1].version, 1);  // the note's own
+        QVERIFY(drawn[1].text.empty() && !drawn[1].drawing.empty());
+        QCOMPARE(drawn[2].status, std::string("done"));
+        const std::vector<Marker> dm = reviewNotesToMarkers(drawn);
+        QCOMPARE(dm[0].name, std::string("\xE2\x97\x90 Sam \xC2\xB7 v2"));
+        QCOMPARE(dm[0].comment, std::string("Cut here\n\xE2\x86\xB3 Ana: Yes\n\xE2\x86\xB3 Reviewer: Me too"));
+        QCOMPARE(dm[0].reviewId, std::string("a1"));
+        QCOMPARE(parseReviewDrawing(dm[0].drawing)[0].tool, std::string("box"));
+        QCOMPARE(dm[1].name, std::string("Ana"));  // version 1: no mark
+        QCOMPARE(dm[1].comment, std::string("(a drawing)"));
+        QCOMPARE(dm[2].name, std::string("\xE2\x9C\x93 Ana \xC2\xB7 v2"));
+
+        // Into the sequence: notes never replace a marker (the editor's at 20 stays; both notes on 20 go to the nearest
+        // free frames, their drawings kept to frame 20), and imported again they bring their markers up to date.
+        Sequence seq = s;
+        seq.markers = {Marker{20, 0, "Editor's", "", 3, false}};
+        MarkerImport mi = addImportedMarkers(seq, dm);
+        QCOMPARE(mi.added, 3);
+        QCOMPARE(mi.updated, 0);
+        QCOMPARE(seq.markers.size(), size_t(4));
+        QCOMPARE(seq.markers[0].reviewId, std::string("a2"));
+        QCOMPARE(seq.markers[0].t, FrameTime(19));  // (21 was taken by then: the frame before)
+        QCOMPARE(seq.markers[0].drawingFrame(), FrameTime(20));
+        QCOMPARE(seq.markers[1].name, std::string("Editor's"));
+        QCOMPARE(seq.markers[2].reviewId, std::string("a1"));
+        QCOMPARE(seq.markers[2].t, FrameTime(21));
+        QCOMPARE(seq.markers[2].drawnAt, FrameTime(20));
+        QCOMPARE(seq.markers[3].drawnAt, FrameTime(-1));  // at its own frame
+        seq.markers[3].t = 120;  // moved by the editor
+        seq.markers[3].color = 2;  // and recoloured
+        std::vector<ReviewNote> later = drawn;
+        later[2].status = "open", later[2].done = false;
+        later[2].replies.push_back({"Sam", "Reopened", ""});
+        mi = addImportedMarkers(seq, reviewNotesToMarkers(later));
+        QCOMPARE(mi.added, 0);
+        QCOMPARE(mi.updated, 3);
+        QCOMPARE(seq.markers.size(), size_t(4));
+        const auto a3 = std::find_if(seq.markers.begin(), seq.markers.end(), [](const Marker& m) { return m.reviewId == "a3"; });
+        QCOMPARE(a3->t, FrameTime(120));
+        QCOMPARE(a3->color, 2);
+        QCOMPARE(a3->name, std::string("Ana \xC2\xB7 v2"));
+        QVERIFY(a3->comment.find("Reopened") != std::string::npos);
+        // Replies from two reviewers' copies both stay; a status set earlier does not undo one set later.
+        {
+            Sequence two = s;
+            two.markers.clear();
+            ReviewNote n;
+            n.frame = 40, n.author = "Ana", n.text = "Tighter", n.id = "t1", n.status = "done", n.done = true, n.statusAt = "2026-10-02T10:00:00Z";
+            n.replies = {{"Bo", "Agreed", ""}};
+            addImportedMarkers(two, reviewNotesToMarkers({n}));
+            ReviewNote old = n;
+            old.status = "open", old.done = false, old.statusAt = "2026-10-01T10:00:00Z";
+            old.replies = {{"Cy", "Why?", ""}};
+            QCOMPARE(addImportedMarkers(two, reviewNotesToMarkers({old})).updated, 1);
+            QCOMPARE(two.markers.size(), size_t(1));
+            QCOMPARE(two.markers[0].name, std::string("\xE2\x9C\x93 Ana"));
+            QCOMPARE(two.markers[0].comment, std::string("Tighter\n\xE2\x86\xB3 Bo: Agreed\n\xE2\x86\xB3 Cy: Why?"));
+            ReviewNote newer = old;
+            newer.statusAt = "2026-10-03T10:00:00Z";
+            addImportedMarkers(two, reviewNotesToMarkers({newer}));
+            QCOMPARE(two.markers[0].name, std::string("Ana"));  // reopened later
+            QCOMPARE(two.markers[0].reviewStatusAt, std::string("2026-10-03T10:00:00Z"));
+            // A marker imported before notes kept ids: the same note, not a second marker.
+            Sequence before = s;
+            before.markers = {Marker{90, 0, "\xE2\x9C\x93 Ana", "Old style", 7, false}};
+            QCOMPARE(addImportedMarkers(before, {dm[2]}).updated, 1);
+            QCOMPARE(before.markers.size(), size_t(1));
+            QCOMPARE(before.markers[0].reviewId, std::string("a3"));
+            // A note at the cut's last frame, taken: the frame before (not past the end).
+            Sequence end = s;
+            end.markers = {Marker{249, 0, "Last", "", 0, false}};
+            ReviewNote last;
+            last.frame = 249, last.author = "Bo", last.text = "End", last.id = "e1";
+            addImportedMarkers(end, reviewNotesToMarkers({last}));
+            QCOMPARE(end.markers[0].t, FrameTime(248));
+        }
+        // Markers without an id replace any at their frame, as before.
+        mi = addImportedMarkers(seq, {Marker{20, 0, "CSV", "", 0, false}});
+        QCOMPARE(mi.added, 1);
+        QCOMPARE(seq.markers[1].t, FrameTime(20));
+        QCOMPARE(seq.markers[1].name, std::string("CSV"));  // (the editor's marker at 20 replaced)
+
+        // The page: its version, the version it compares with, and the editor's drawings; read back from its HTML.
+        info.version = 3;
+        info.previous = ReviewVersion{2, "Cut - Review v2.mp4", {25, 1}, 10, 200};
+        info.markers[0].drawing = dm[0].drawing;
+        const std::string page3 = reviewPageHtml(info);
+        const auto read = readReviewPage(page3);
+        QVERIFY(read);
+        QCOMPARE(read->version, 3);
+        QCOMPARE(read->videoFile, std::string("Cut - Review.mp4"));
+        QCOMPARE(read->frames, FrameTime(250));
+        QCOMPARE(read->fps, (Rational{25, 1}));
+        QVERIFY(page3.find("\"previous\":{\"fps\":[25,1],\"frames\":200,\"offset\":10,\"version\":2,\"video\":\"Cut - Review v2.mp4\"}") != std::string::npos);
+        QVERIFY(page3.find("\"drawing\":[{\"color\":\"#34c759\"") != std::string::npos);
+        QVERIFY(!readReviewPage("<html><script type=\"application/json\" id=\"review-config\">{}</script></html>"));
+        QVERIFY(page3.find("\"drawnAt\":20") != std::string::npos);  // (the editor's drawing at its own frame)
+        // A title holding the page's own placeholders is written as it is (it once froze the export).
+        ReviewPageInfo odd = info;
+        odd.title = "@@TITLE@@ and @@CONFIG@@";
+        const std::string oddPage = reviewPageHtml(odd);
+        QVERIFY(oddPage.find("<title>@@TITLE@@ and @@CONFIG@@ - Review</title>") != std::string::npos);
+        const auto oddBack = readReviewPage(oddPage);
+        QVERIFY(oddBack && oddBack->title == odd.title);
+
+        // Saved and loaded with the project.
+        QTemporaryDir dir;
+        Project withNotes = p;
+        withNotes.active()->markers = seq.markers;
+        const std::string file = (dir.path() + "/notes.montage").toStdString();
+        QVERIFY(saveProject(withNotes, file));
+        Project loaded;
+        QVERIFY(loadProject(file, loaded));
+        QCOMPARE(loaded.active()->markers, seq.markers);
     }
 
     void markerLists() {
@@ -6819,6 +6982,208 @@ private slots:
         QVERIFY(clipById(fx.s(), clip)->takes.empty());
         QCOMPARE(clipById(fx.s(), clip)->mediaId, b);
         QVERIFY(!cycleTake(fx.p, fx.s(), clip, 1).ok);
+    }
+
+    void provenanceForCredentials() {
+        // A plain cut: its file, no AI.
+        Fixture fx;
+        const Id a = fx.put(V1, 0, 30), b = fx.put(V1, 30, 30);
+        Provenance made = sequenceProvenance(fx.p, fx.s());
+        QCOMPARE(made.sources, std::vector<std::string>{"/nonexistent/clip.mov"});
+        QVERIFY(made.ai.empty() && !made.generated());
+
+        // Object removal generates; Super Scale enhances; a people mask only assists. Each once.
+        clipById(fx.s(), a)->effects.push_back(makeEffect(fx.p, "object_removal"));
+        clipById(fx.s(), a)->effects.push_back(makeEffect(fx.p, "object_removal"));
+        clipById(fx.s(), b)->effects.push_back(makeEffect(fx.p, "super_scale"));
+        Effect masked = makeEffect(fx.p, "gaussian_blur");
+        masked.params["mask.shape"] = Param(4);
+        clipById(fx.s(), b)->effects.push_back(masked);
+        made = sequenceProvenance(fx.p, fx.s());
+        QCOMPARE(made.ai.size(), size_t(3));
+        QCOMPARE(made.ai[0], (AiUse{"Object Removal", "LaMa", AiRole::Generated}));
+        QCOMPARE(made.ai[1], (AiUse{"Super Scale", "Real-ESRGAN", AiRole::Enhanced}));
+        QCOMPARE(made.ai[2], (AiUse{"People Matte", "MODNet", AiRole::Assisted}));
+        QVERIFY(made.generated());
+        QVERIFY(QString::fromStdString(iptcSourceType(AiRole::Generated)).endsWith("compositeWithTrainedAlgorithmicMedia"));
+        QVERIFY(QString::fromStdString(iptcSourceType(AiRole::Enhanced)).endsWith("algorithmicallyEnhanced"));
+        QVERIFY(iptcSourceType(AiRole::Assisted).empty());
+
+        // Only what the range exports counts, and a turned-off effect or clip does not.
+        made = sequenceProvenance(fx.p, fx.s(), 30, 59);
+        QCOMPARE(made.ai.size(), size_t(2));
+        QCOMPARE(made.ai[0].feature, std::string("Super Scale"));
+        clipById(fx.s(), b)->effects[0].enabled = false;
+        clipById(fx.s(), a)->enabled = false;
+        made = sequenceProvenance(fx.p, fx.s());
+        QCOMPARE(made.ai.size(), size_t(1));
+        QCOMPARE(made.ai[0].feature, std::string("People Matte"));
+
+        // A range ends before its out point: a clip starting there is not in it.
+        QVERIFY(sequenceProvenance(fx.p, fx.s(), 0, 30).ai.empty());  // (a is off; b starts at 30)
+        // A colour group's grade runs on its clips too.
+        Id group = 0;
+        QVERIFY(makeColorGroup(fx.p, fx.s(), {b}, "Interviews", &group).ok);
+        findColorGroup(fx.s(), group)->post.push_back(makeEffect(fx.p, "relight"));
+        made = sequenceProvenance(fx.p, fx.s());
+        QVERIFY(std::find(made.ai.begin(), made.ai.end(), AiUse{"Relight", "Depth Anything V2", AiRole::Enhanced}) != made.ai.end());
+        // A stem a model split from a mix changed what was there.
+        fx.p.findMedia(fx.media)->keywords = {"Stem"};
+        made = sequenceProvenance(fx.p, fx.s());
+        QVERIFY(std::find(made.ai.begin(), made.ai.end(), AiUse{"Stem Separation", "Spleeter", AiRole::Enhanced}) != made.ai.end());
+        fx.p.findMedia(fx.media)->keywords.clear();
+
+        // AI frames for slow motion generate pictures.
+        clipById(fx.s(), b)->timing = makeEffect(fx.p, "time");
+        clipById(fx.s(), b)->timing.params["sampling"] = Param(3);
+        made = sequenceProvenance(fx.p, fx.s());
+        QVERIFY(std::find(made.ai.begin(), made.ai.end(), AiUse{"AI Frames", "RIFE", AiRole::Generated}) != made.ai.end());
+
+        // Speech made by a model, through a nested sequence: generated, converted or cloned, from the media's note.
+        Fixture n;
+        Sequence inner = n.s();
+        inner.id = n.p.newId();
+        inner.videoTracks.assign(1, Track{}), inner.audioTracks.assign(1, Track{});
+        const char* notes[] = {"Spoken by Kokoro voice af_heart", "Speech converted to a voice cloned from narrator.wav",
+                               "Spoken in a voice cloned from narrator.wav"};
+        for (const char* note : notes) {
+            MediaItem m;
+            m.id = n.p.newId();
+            m.kind = MediaKind::Audio;
+            m.path = std::string("/nonexistent/") + std::to_string(m.id) + ".wav";
+            m.duration = 2;
+            m.hasAudio = true;
+            m.keywords = {"AI voice"};
+            m.metadata["comment"] = note;
+            n.p.media.push_back(m);
+            Clip c = makeClip(n.p, m, TrackKind::Audio, inner);
+            c.start = inner.audioTracks[0].clips.empty() ? 0 : inner.audioTracks[0].clips.back().end();
+            inner.audioTracks[0].clips.push_back(c);
+        }
+        n.p.sequences.push_back(inner);
+        MediaItem nest;
+        nest.id = n.p.newId();
+        nest.kind = MediaKind::Sequence;
+        nest.sequenceId = inner.id;
+        nest.hasAudio = true;
+        n.p.media.push_back(nest);
+        Clip c = makeClip(n.p, nest, TrackKind::Audio, n.s());
+        n.a1().clips.push_back(c);
+        made = sequenceProvenance(n.p, n.s());
+        QCOMPARE(made.ai.size(), size_t(3));
+        QCOMPARE(made.ai[0].feature, std::string("Generated Speech"));
+        QCOMPARE(made.ai[1].feature, std::string("Voice Conversion"));
+        QCOMPARE(made.ai[2].feature, std::string("Cloned Voice"));
+        QCOMPARE(made.sources.size(), size_t(3));
+
+        // The bin shows what a file's credentials said, read on import.
+        MediaItem signedFile;
+        signedFile.metadata["c2pa"] = "Signed by Sony Corporation (valid)";
+        QVERIFY(mediaField("c2pa") && !mediaField("c2pa")->editable);
+        QCOMPARE(mediaFieldText(signedFile, "c2pa"), std::string("Signed by Sony Corporation (valid)"));
+    }
+
+    void convertedVoiceTakes() {
+        // A clip's sound (channel 4 of four) with its picture; a second sound clip linked to them plays channel 2.
+        Fixture fx;
+        fx.p.findMedia(fx.media)->channels = 4;
+        const double fps = fx.s().fpsValue();
+        QVERIFY(placeMedia(fx.p, fx.s(), fx.media, 30, FrameTime(2 * fps), FrameTime(5 * fps), V1, A1, false).ok);
+        const Id picture = fx.v1().clips[0].id, sound = fx.a1().clips[0].id;
+        clipById(fx.s(), sound)->channels = {3};
+        Clip other = *clipById(fx.s(), sound);
+        other.id = fx.p.newId();
+        other.channels = {1};
+        while (fx.s().audioTracks.size() < 2) addTrack(fx.p, fx.s(), TrackKind::Audio);
+        fx.s().audioTracks[1].clips.push_back(other);
+
+        // What a conversion covers: what the clip plays and a second either side, as far as the media goes.
+        double from = 0, to = 0;
+        QVERIFY(voiceConversionRange(fx.p, fx.s(), sound, 1, from, to));
+        QVERIFY(std::abs(from - 1) < 1e-9 && std::abs(to - 6) < 1e-9);
+        QVERIFY(voiceConversionRange(fx.p, fx.s(), sound, 5, from, to));
+        QVERIFY(std::abs(from - 0) < 1e-9 && std::abs(to - 10) < 1e-9);
+        fx.p.findMedia(fx.media)->hasAudio = false;
+        QVERIFY(!voiceConversionRange(fx.p, fx.s(), sound, 1, from, to));
+        fx.p.findMedia(fx.media)->hasAudio = true;
+
+        // The converted sound (a mono file from 1 s of the media on) becomes the picked take: the same moment plays.
+        MediaItem wav;
+        wav.id = fx.p.newId();
+        wav.kind = MediaKind::Audio;
+        wav.name = "Converted Voice 1.wav";
+        wav.path = "/nonexistent/converted.wav";
+        wav.duration = 5;
+        wav.hasAudio = true;
+        wav.channels = 1;
+        fx.p.media.push_back(wav);
+        Result r = addConvertedTake(fx.p, fx.s(), sound, wav.id, 1);
+        QVERIFY2(r.ok, r.error.c_str());
+        const Clip* c = clipById(fx.s(), sound);
+        QCOMPARE(c->mediaId, wav.id);
+        QCOMPARE(c->take, 1);
+        QVERIFY(std::abs(c->sourceIn - fps) < 1e-9);
+        QVERIFY(c->channels.empty());  // the file's own sound
+        QCOMPARE(c->takes[0].channels, std::vector<int>{3});
+        // The picture has no part in a sound-only take, nor the clip on channel 2 in a one-channel file.
+        QCOMPARE(clipById(fx.s(), picture)->mediaId, fx.media);
+        QCOMPARE(clipById(fx.s(), picture)->sourceIn, 2 * fps);
+        QCOMPARE(clipById(fx.s(), other.id)->mediaId, fx.media);
+        // Saved and read back, with the channels each take plays.
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(fx.p), back));
+        QCOMPARE(clipById(*back.active(), sound)->takes, c->takes);
+        // Back to the original: its channel too.
+        QVERIFY(pickTake(fx.p, fx.s(), sound, 0).ok);
+        c = clipById(fx.s(), sound);
+        QCOMPARE(c->mediaId, fx.media);
+        QCOMPARE(c->channels, std::vector<int>{3});
+        QCOMPARE(c->sourceIn, 2 * fps);
+        QVERIFY(!addConvertedTake(fx.p, fx.s(), 999999, wav.id, 1).ok);
+
+        // Another file from the same recorder (picture and four channels) plays the same channel when it is a take.
+        MediaItem camB = *fx.p.findMedia(fx.media);
+        camB.id = fx.p.newId();
+        camB.name = "B.mov";
+        camB.path = "/nonexistent/B.mov";
+        fx.p.media.push_back(camB);
+        QVERIFY(addTakes(fx.p, fx.s(), sound, {{camB.id, 3 * fps}}).ok);
+        QCOMPARE(clipById(fx.s(), sound)->takes.back().channels, std::vector<int>{3});
+        // The picture left on B under the converted take catches up when the original is picked again.
+        QVERIFY(pickTake(fx.p, fx.s(), sound, 2).ok);
+        QCOMPARE(clipById(fx.s(), picture)->mediaId, camB.id);
+        QCOMPARE(clipById(fx.s(), picture)->sourceIn, 3 * fps);
+        QCOMPARE(clipById(fx.s(), sound)->channels, std::vector<int>{3});
+        QVERIFY(pickTake(fx.p, fx.s(), sound, 1).ok);
+        QCOMPARE(clipById(fx.s(), picture)->mediaId, camB.id);  // (a sound-only take)
+        QVERIFY(pickTake(fx.p, fx.s(), sound, 0).ok);
+        QCOMPARE(clipById(fx.s(), picture)->mediaId, fx.media);
+        QCOMPARE(clipById(fx.s(), picture)->sourceIn, 2 * fps);
+        QCOMPARE(clipById(fx.s(), sound)->sourceIn, 2 * fps);
+
+        // A project from before takes had their own channels: each plays the clip's, as it did.
+        QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromStdString(projectToJson(fx.p)));
+        std::function<QJsonValue(const QJsonValue&)> strip = [&](const QJsonValue& v) -> QJsonValue {
+            if (v.isArray()) {
+                QJsonArray a;
+                for (const auto& x : v.toArray()) a.append(strip(x));
+                return a;
+            }
+            if (!v.isObject()) return v;
+            QJsonObject o = v.toObject();
+            if (o.contains("media") && o.contains("offset")) o.remove("channels");
+            for (auto it = o.begin(); it != o.end(); ++it) it.value() = strip(it.value());
+            return o;
+        };
+        Project old;
+        QVERIFY(projectFromJson(QJsonDocument(strip(doc.object()).toObject()).toJson().toStdString(), old));
+        for (const Take& t : clipById(*old.active(), sound)->takes) QCOMPARE(t.channels, std::vector<int>{3});
+
+        // A clip at twice the speed takes its last frame's two source frames; a name with a slash still makes a file name.
+        clipById(fx.s(), sound)->speed = 2;
+        QVERIFY(voiceConversionRange(fx.p, fx.s(), sound, 0, from, to));
+        QVERIFY2(std::abs(to - (2 * fps + 2 * (clipById(fx.s(), sound)->duration - 1) + 2) / fps) < 1e-9, qPrintable(QString::number(to)));
+        QCOMPARE(convertedVoiceStem("Sc 3/Tk 2: \"Hi\""), std::string("Sc 3-Tk 2- -Hi- Converted Voice "));
     }
 
     void swapClips() {

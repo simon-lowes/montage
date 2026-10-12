@@ -1,5 +1,7 @@
 #include "MediaBinWidget.h"
 
+#include <filesystem>
+#include <set>
 #include <QActionGroup>
 #include "InterpretFootageDialog.h"
 #include "media/Interpret.h"
@@ -1613,18 +1615,37 @@ void MediaBinWidget::createProxies(const std::vector<Id>& ids, const ProxyOption
         std::string src, dst;
     };
     std::vector<Job> jobs;
+    std::map<std::string, std::string> made;  // file on disk -> its proxy (a file imported twice is made once)
+    std::set<std::string> taken;
     const QString ext = QString::fromStdString(proxyExtension(options.format));
     for (Id id : ids) {
         const MediaItem* m = state_->project().findMedia(id);
         if (!m) continue;
-        // In the cache under a name from the file's path and the format, or as Proxy/<name>_Proxy beside the file.
-        const QFileInfo src(QString::fromStdString(m->path));
+        // The file itself (an interpretation after its path changes how it is read, not the proxy).
+        const std::string file = mediaFileOnDisk(m->path);
+        if (const auto it = made.find(file); it != made.end()) {
+            jobs.push_back({id, file, it->second});
+            continue;
+        }
+        // In the cache under a name from the file's path and the format, or as Proxy/<name>_Proxy beside the file
+        // (with a few letters of that hash when another file of the same name, A001.mov beside A001.mp4, has it).
+        const QFileInfo src(QString::fromStdString(file));
         QString dir = beside ? src.absolutePath() + QStringLiteral("/Proxy") : cache;
         QDir().mkpath(dir);
         if (beside && !QFileInfo(dir).isWritable()) dir = cache, QDir().mkpath(dir);  // (a read-only card: the cache instead)
-        const QByteArray hash = QCryptographicHash::hash(QByteArray::fromStdString(m->path + "|" + proxyFormatName(options.format)), QCryptographicHash::Sha1).toHex().left(16);
-        const QString name = beside && dir != cache ? src.completeBaseName() + QStringLiteral("_Proxy") : QString::fromLatin1(hash) + QStringLiteral("_proxy");
-        jobs.push_back({id, m->path, (dir + "/" + name + ext).toStdString()});
+        const QByteArray hash = QCryptographicHash::hash(QByteArray::fromStdString(file + "|" + proxyFormatName(options.format)), QCryptographicHash::Sha1).toHex().left(16);
+        QString name = beside && dir != cache ? src.completeBaseName() + QStringLiteral("_Proxy") : QString::fromLatin1(hash) + QStringLiteral("_proxy");
+        auto othersUse = [&](const std::string& dst) {
+            if (taken.count(dst)) return true;
+            for (const MediaItem& o : state_->project().media)
+                if (o.proxyPath == dst && mediaFileOnDisk(o.path) != file) return true;
+            return false;
+        };
+        if (othersUse((dir + "/" + name + ext).toStdString())) name += QStringLiteral("_") + QString::fromLatin1(hash.left(6));
+        const std::string dst = (dir + "/" + name + ext).toStdString();
+        taken.insert(dst);
+        made[file] = dst;
+        jobs.push_back({id, file, dst});
     }
     if (jobs.empty()) return;
     auto* dlg = new QProgressDialog(tr("Creating proxy media..."), tr("Cancel"), 0, 1000, this);
@@ -1653,9 +1674,16 @@ void MediaBinWidget::createProxies(const std::vector<Id>& ids, const ProxyOption
         else state_->message(tr("Proxy media ready — toggle \"Proxy\" in the Program monitor to use it"), 6000);
     });
     QPointer<QProgressDialog> guard(dlg);
+    // What plays a proxy being remade lets go of it first (on Windows an open file cannot be replaced).
+    for (const auto& j : jobs) {
+        MediaPool::instance().forget(j.dst);
+        forgetFileFacts(j.dst);
+    }
     watcher->setFuture(QtConcurrent::run([jobs, cancel, guard, options]() {
         QStringList errors;
+        std::set<std::string> done;
         for (size_t i = 0; i < jobs.size(); ++i) {
+            if (!done.insert(jobs[i].dst).second) continue;  // (made already for the same file)
             std::string err;
             auto progress = [&](double f) {
                 int v = int((double(i) + f) / double(jobs.size()) * 1000);
@@ -1672,8 +1700,13 @@ void MediaBinWidget::createProxies(const std::vector<Id>& ids, const ProxyOption
                 if (*cancel) break;
                 errors << QString::fromStdString(err);
             } else {
-                QFile::remove(dst);
-                if (!QFile::rename(part, dst)) QFile::remove(part), errors << tr("Could not write %1").arg(dst);
+                // Put in place in one step (replacing the old proxy only once the new one is whole).
+                std::error_code ec;
+                std::filesystem::rename(std::filesystem::path(part.toStdWString()), std::filesystem::path(dst.toStdWString()), ec);
+                if (ec) {
+                    QFile::remove(part);
+                    errors << tr("Could not put %1 in place (%2)").arg(dst, QString::fromStdString(ec.message()));
+                }
                 MediaPool::instance().forget(jobs[i].dst);
                 forgetFileFacts(jobs[i].dst);
             }

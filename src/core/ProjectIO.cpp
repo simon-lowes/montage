@@ -120,7 +120,15 @@ QJsonObject objectMaskToJson(const ObjectMask& m) {
     }
     for (const auto& [f, data] : m.frames)
         frames[QString::number(f)] = QString::fromLatin1(QByteArray::fromRawData(data.data(), qsizetype(data.size())).toBase64());
-    return QJsonObject{{"fps", m.fps}, {"prompts", prompts}, {"frames", frames}};
+    QJsonObject o{{"fps", m.fps}, {"prompts", prompts}, {"frames", frames}};
+    if (!m.name.empty()) o["name"] = QString::fromStdString(m.name);
+    if (m.subtract) o["subtract"] = true;
+    if (!m.more.empty()) {  // (the mask's further objects)
+        QJsonArray more;
+        for (const ObjectMask& x : m.more) more.append(objectMaskToJson(x));
+        o["more"] = more;
+    }
+    return o;
 }
 
 std::shared_ptr<const ObjectMask> objectMaskFromJson(const QJsonObject& o) {
@@ -137,6 +145,14 @@ std::shared_ptr<const ObjectMask> objectMaskFromJson(const QJsonObject& o) {
     }
     for (auto it = frames.begin(); it != frames.end(); ++it)
         m->frames[it.key().toLongLong()] = QByteArray::fromBase64(it.value().toString().toLatin1()).toStdString();
+    m->name = o.value("name").toString().toStdString();
+    m->subtract = o.value("subtract").toBool();
+    for (const QJsonValue& v : o.value("more").toArray()) {
+        ObjectMask x = *objectMaskFromJson(v.toObject());
+        x.fps = m->fps;
+        x.more.clear();  // (one level: the mask's objects)
+        m->more.push_back(std::move(x));
+    }
     return m;
 }
 
@@ -173,6 +189,10 @@ QJsonArray markersToJson(const std::vector<Marker>& markers) {
     for (const auto& mk : markers) {
         QJsonObject mo{{"t", double(mk.t)}, {"duration", double(mk.duration)}, {"name", qs(mk.name)}, {"comment", qs(mk.comment)}, {"color", mk.color}};
         if (mk.chapter) mo["chapter"] = true;
+        if (!mk.drawing.empty()) mo["drawing"] = qs(mk.drawing);
+        if (mk.drawnAt >= 0) mo["drawn_at"] = double(mk.drawnAt);
+        if (!mk.reviewId.empty()) mo["review_id"] = qs(mk.reviewId);
+        if (!mk.reviewStatusAt.empty()) mo["review_status_at"] = qs(mk.reviewStatusAt);
         m.append(mo);
     }
     return m;
@@ -189,6 +209,10 @@ std::vector<Marker> markersFromJson(const QJsonValue& v) {
         mk.comment = ss(mo.value("comment"));
         mk.color = mo.value("color").toInt(0);
         mk.chapter = mo.value("chapter").toBool(false);
+        mk.drawing = ss(mo.value("drawing"));
+        mk.drawnAt = mo.contains("drawn_at") ? i64(mo.value("drawn_at")) : -1;
+        mk.reviewId = ss(mo.value("review_id"));
+        mk.reviewStatusAt = ss(mo.value("review_status_at"));
         out.push_back(mk);
     }
     return out;
@@ -226,8 +250,11 @@ QJsonObject clipToJson(const Clip& c) {
     if (!c.markers.empty()) o["markers"] = markersToJson(c.markers);
     if (!c.takes.empty()) {
         QJsonArray takes;
-        for (const Take& t : c.takes)
-            takes.append(QJsonObject{{"media", qint64(t.mediaId)}, {"offset", t.offset}, {"name", qs(t.name)}});
+        for (const Take& t : c.takes) {
+            QJsonArray ch;  // (always written: a project from before takes had their own plays the clip's channels in each)
+            for (int i : t.channels) ch.append(i);
+            takes.append(QJsonObject{{"media", qint64(t.mediaId)}, {"offset", t.offset}, {"name", qs(t.name)}, {"channels", ch}});
+        }
         o["takes"] = takes;
         o["take"] = c.take;
     }
@@ -287,7 +314,11 @@ Clip clipFromJson(const QJsonObject& o) {
     c.markers = markersFromJson(o.value("markers"));
     for (const auto& tv : o.value("takes").toArray()) {
         const QJsonObject t = tv.toObject();
-        c.takes.push_back({Id(i64(t.value("media"))), t.value("offset").toDouble(), ss(t.value("name"))});
+        Take take{Id(i64(t.value("media"))), t.value("offset").toDouble(), ss(t.value("name")), {}};
+        for (const auto& v : t.value("channels").toArray())
+            if (v.toInt(-1) >= 0) take.channels.push_back(v.toInt());
+        if (!t.contains("channels")) take.channels = c.channels;  // as every take played before they had their own
+        c.takes.push_back(take);
     }
     c.take = c.takes.empty() ? 0 : std::clamp(o.value("take").toInt(), 0, int(c.takes.size()) - 1);
     const QJsonObject anim = o.value("animation").toObject();
@@ -493,14 +524,10 @@ QJsonObject sequenceToJson(const Sequence& s) {
                   {"in", double(s.inPoint)},
                   {"out", double(s.outPoint)},
                   {"playhead", double(s.playhead)}};
-    QJsonArray v, a, m;
+    QJsonArray v, a;
     for (const auto& t : s.videoTracks) v.append(trackToJson(t));
     for (const auto& t : s.audioTracks) a.append(trackToJson(t));
-    for (const auto& mk : s.markers) {
-        QJsonObject mo{{"t", double(mk.t)}, {"duration", double(mk.duration)}, {"name", qs(mk.name)}, {"comment", qs(mk.comment)}, {"color", mk.color}};
-        if (mk.chapter) mo["chapter"] = true;
-        m.append(mo);
-    }
+    const QJsonArray m = markersToJson(s.markers);
     o["video"] = v;
     o["audio"] = a;
     o["markers"] = m;
@@ -654,17 +681,7 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     if (std::find(audioLayouts().begin(), audioLayouts().end(), s.audioLayout) == audioLayouts().end()) s.audioLayout = "stereo";
     for (const auto& t : o.value("video").toArray()) s.videoTracks.push_back(trackFromJson(t.toObject(), TrackKind::Video));
     for (const auto& t : o.value("audio").toArray()) s.audioTracks.push_back(trackFromJson(t.toObject(), TrackKind::Audio));
-    for (const auto& mv : o.value("markers").toArray()) {
-        QJsonObject mo = mv.toObject();
-        Marker mk;
-        mk.t = i64(mo.value("t"));
-        mk.duration = i64(mo.value("duration"));
-        mk.name = ss(mo.value("name"));
-        mk.comment = ss(mo.value("comment"));
-        mk.color = mo.value("color").toInt(0);
-        mk.chapter = mo.value("chapter").toBool(false);
-        s.markers.push_back(mk);
-    }
+    s.markers = markersFromJson(o.value("markers"));
     for (const auto& c : o.value("captions").toArray()) s.captionTracks.push_back(captionTrackFromJson(c.toObject()));
     for (const auto& v : o.value("adrCues").toArray()) {
         const QJsonObject qo = v.toObject();

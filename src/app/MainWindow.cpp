@@ -111,6 +111,7 @@
 #include "ProjectManagerDialog.h"
 #include "LinkMediaDialog.h"
 #include "EffectPresetStore.h"
+#include "media/Inference.h"
 #include "media/Proxy.h"
 #include "media/Relink.h"
 #include "KeyframePanel.h"
@@ -127,6 +128,8 @@
 #include "CaptionsPanel.h"
 #include "MaskOverlay.h"
 #include "TransformOverlay.h"
+#include "ReviewOverlay.h"
+#include "ChartMatchDialog.h"
 #include "SequenceIndexPanel.h"
 #include "StackedTimelineWidget.h"
 #include "PanFollowDialog.h"
@@ -137,6 +140,7 @@
 #include "media/VisualSearch.h"
 #include "PeoplePanel.h"
 #include "SpeechDialog.h"
+#include "VoiceConvert.h"
 #include "StemsDialog.h"
 #include "GraphicsDialogs.h"
 #include "TranscriptPanel.h"
@@ -359,6 +363,8 @@ void MainWindow::buildPanels() {
     // The transform box first: mask and Corner Pin handles, installed after it, get the pointer before it.
     new TransformOverlay(state_, programPanel_->viewer());
     new MaskOverlay(state_, programPanel_->viewer());
+    reviewOverlay_ = new ReviewOverlay(state_, programPanel_->viewer());
+    reviewOverlay_->setShown(appSettings().value("playback/reviewDrawings", true).toBool());
     connect(programPanel_, &MonitorPanel::exportFrameRequested, this, &MainWindow::exportFrame);
     connect(timeline_, &TimelineWidget::trimViewChanged, this,
             [this](FrameTime left, FrameTime right, const QString& leftLabel, const QString& rightLabel) {
@@ -1141,6 +1147,7 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Set Colour &Reference"), QKeySequence(), [this] { setColourReference(); })
         ->setObjectName(QStringLiteral("setColourReference"));
     add(clipM, tr("&Key Out Green / Blue Screen"), QKeySequence(), [this] { keyOutScreen(); })->setObjectName(QStringLiteral("keyScreen"));
+    add(clipM, tr("Match Colour Chart…"), QKeySequence(), [this] { matchColourChart(); })->setObjectName(QStringLiteral("matchColourChart"));
     add(clipM, tr("Match Colour to Reference"), QKeySequence("Ctrl+Alt+Shift+C"), [this] { matchColour(); })
         ->setObjectName(QStringLiteral("matchColour"));
     compareRef_ = add(clipM, tr("Compare with Reference"), QKeySequence(), [this] { setCompareWithReference(compareRef_->isChecked()); });
@@ -1324,6 +1331,16 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Fit to Fill"), QKeySequence(), [this] { fitToFill(); })->setObjectName(QStringLiteral("fitToFill"));
     add(clipM, tr("Set Voice Reference"), QKeySequence(), [this] { setVoiceReference(); })->setObjectName(QStringLiteral("setVoiceReference"));
     add(clipM, tr("Match Voice to Reference"), QKeySequence(), [this] { matchVoice(); })->setObjectName(QStringLiteral("matchVoice"));
+    add(clipM, tr("Convert Voice…"), QKeySequence(), [this] {
+        const Sequence* s = state_->sequence();
+        const Id clip = s ? voiceConversionClip(state_->project(), *s, state_->selectedClips()) : 0;
+        if (!clip) {
+            state_->message(tr("Select a clip with speech to convert into another voice"), 5000);
+            return;
+        }
+        VoiceConvertDialog dlg(state_, clip, 0, this);
+        dlg.exec();
+    })->setObjectName(QStringLiteral("convertVoice"));
     add(clipM, tr("Add Bar Markers"), QKeySequence(), [this] { addBeatMarkers(false); })->setObjectName(QStringLiteral("addBarMarkers"));
     add(clipM, tr("Add Beat Markers"), QKeySequence(), [this] { addBeatMarkers(true); })->setObjectName(QStringLiteral("addBeatMarkers"));
     add(clipM, tr("Fit Music to Length…"), QKeySequence(), [this] { fitMusicDialog(); })->setObjectName(QStringLiteral("fitMusic"));
@@ -1722,6 +1739,14 @@ void MainWindow::buildMenus() {
     trimView_->setCheckable(true);
     trimView_->setChecked(appSettings().value("playback/twoUpTrim", true).toBool());
     trimView_->setToolTip(tr("While trimming, rolling, slipping or sliding, show the frames either side of the edit side by side"));
+    QAction* drawings = add(play, tr("Show Review Drawings"), QKeySequence(), [this](bool on) {
+        appSettings().setValue("playback/reviewDrawings", on);
+        if (reviewOverlay_) reviewOverlay_->setShown(on);
+    });
+    drawings->setObjectName(QStringLiteral("showReviewDrawings"));
+    drawings->setCheckable(true);
+    drawings->setChecked(appSettings().value("playback/reviewDrawings", true).toBool());
+    drawings->setToolTip(tr("Show what reviewers drew on a frame (notes imported from a review page) over the Program monitor at its marker"));
     // HDR sequences as HDR on an HDR or EDR display (app/HdrSurface.h); elsewhere, and in builds without it, tone mapped.
     hdrViewer_ = add(play, tr("HDR Viewer"), QKeySequence(), [this](bool on) {
         appSettings().setValue("playback/hdrViewer", on);
@@ -1912,6 +1937,65 @@ void MainWindow::buildMenus() {
         connect(dlg, &PluginManagerDialog::pluginsChanged, effects_, &EffectsBrowser::reload);
         dlg->show();
     });
+    {
+        // Where the AI models run (media/Inference.h): the GPU or NPU when there is one, or the processor only.
+        // Provider libraries beside the program or in Montage's data folder are registered first.
+        initInference();  // (the provider libraries, and the choice saved here, as the command line takes them too)
+        InferenceMode saved = InferenceMode::Auto;
+        parseInferenceMode(appSettings().value(QStringLiteral("ai/inference"), "auto").toString().toStdString(), saved);
+        QMenu* runOn = toolsM->addMenu(tr("AI Models Run On"));
+        runOn->setObjectName(QStringLiteral("aiRunOn"));
+        auto* modes = new QActionGroup(this);
+        const std::pair<InferenceMode, QString> choices[] = {
+            {InferenceMode::Auto, tr("Automatic (the GPU when there is one)")},
+            {InferenceMode::Efficient, tr("Power Saving (an NPU first)")},
+            {InferenceMode::Cpu, tr("This Computer's Processor Only")},
+        };
+        for (const auto& [mode, label] : choices) {
+            const InferenceMode m = mode;
+            QAction* a = runOn->addAction(label, this, [this, m] {
+                setInferenceMode(m);
+                appSettings().setValue(QStringLiteral("ai/inference"), QString::fromLatin1(inferenceModeName(m)));
+                statusBar()->showMessage(tr("AI models opened from now on run %1").arg(m == InferenceMode::Cpu ? tr("on the processor")
+                                                                                          : m == InferenceMode::Efficient ? tr("on an NPU when there is one")
+                                                                                                                          : tr("on the GPU when there is one")),
+                                         5000);
+            });
+            a->setObjectName(QStringLiteral("aiRunOn_") + QString::fromLatin1(inferenceModeName(m)));
+            a->setCheckable(true);
+            a->setChecked(m == saved);
+            modes->addAction(a);
+        }
+        // While MONTAGE_INFERENCE says where models run, the choices are fixed (and say why).
+        auto fixChoices = [this, modes] {
+            const bool fixed = inferenceModeOverridden();
+            for (QAction* a : modes->actions()) {
+                a->setEnabled(!fixed);
+                a->setToolTip(fixed ? tr("MONTAGE_INFERENCE=%1 is set: models run as it says").arg(QString::fromLatin1(inferenceModeName(inferenceMode())))
+                                    : QString());
+            }
+        };
+        fixChoices();
+        connect(runOn, &QMenu::aboutToShow, this, fixChoices);
+        runOn->setToolTipsVisible(true);
+        runOn->addSeparator();
+        runOn->addAction(tr("Devices…"), this, [this] {
+            QStringList lines;
+            for (const InferenceDevice& d : inferenceDevices())
+                lines << QStringLiteral("%1 — %2%3").arg(QString::fromStdString(d.kind), QString::fromStdString(d.provider),
+                                                         d.vendor.empty() ? QString() : QStringLiteral(" (%1)").arg(QString::fromStdString(d.vendor)));
+            if (lines.isEmpty()) lines << tr("No AI runtime is loaded.");
+            if (inferenceModeOverridden())
+                lines << QString() << tr("MONTAGE_INFERENCE=%1 is set: models run as it says, whatever is chosen here.")
+                                          .arg(QString::fromLatin1(inferenceModeName(inferenceMode())));
+            if (inferenceFallbacks())
+                lines << QString() << tr("%n model(s) went to the processor because the device would not take or run them: %1", "", inferenceFallbacks())
+                                          .arg(QString::fromStdString(lastInferenceFallback()));
+            if (const std::string e = lastInferenceLibraryError(); !e.empty())
+                lines << QString() << tr("A provider library was not taken: %1").arg(QString::fromStdString(e));
+            QMessageBox::information(this, tr("AI Devices"), tr("AI models can run on:") + "\n\n" + lines.join("\n"));
+        })->setObjectName(QStringLiteral("aiDevices"));
+    }
     tb->addSeparator();
     tb->addAction(snapping_);
     tb->addSeparator();
@@ -2151,11 +2235,14 @@ bool MainWindow::openProjectAs(const QString& path, OpenMode mode) {
     appSettings().setValue("lastProjectDir", QFileInfo(path).absolutePath());
     timeline_->zoomToFit();
     statusBar()->showMessage(tr("Opened %1").arg(path), 4000);
-    // Offline files are asked about, unless every one has its proxy here (editing with the proxies alone).
+    // Offline files are asked about, unless every one has its proxy here, with sound where the file has sound
+    // (editing with the proxies alone).
     if (const std::vector<Id> offline = offlineMedia(state_->project()); !offline.empty()) {
         const bool proxied = std::all_of(offline.begin(), offline.end(), [&](Id id) {
             const MediaItem* m = state_->project().findMedia(id);
-            return m && m->kind == MediaKind::Video && !m->proxyPath.empty() && QFileInfo::exists(QString::fromStdString(m->proxyPath));
+            if (!m || m->kind != MediaKind::Video || m->proxyPath.empty() || !QFileInfo::exists(QString::fromStdString(m->proxyPath))) return false;
+            forgetFileFacts(m->proxyPath);  // (looked at afresh: it may have been made again)
+            return !m->hasAudio || fileHasSound(m->proxyPath);
         });
         if (proxied) statusBar()->showMessage(tr("%n file(s) offline: playing from their proxies", nullptr, int(offline.size())), 8000);
         else showLinkMedia();
@@ -3306,12 +3393,15 @@ int MainWindow::importMarkers(const QString& path) {
         statusBar()->showMessage(QString::fromStdString(err), 6000);
         return 0;
     }
+    MarkerImport result;
     state_->edit(tr("Import Markers"), [&](Project&, Sequence& sq) {
-        for (const Marker& m : markers) edit::addMarker(sq, m);
+        result = addImportedMarkers(sq, markers);
         return true;
     });
-    statusBar()->showMessage(tr("Imported %n marker(s)", nullptr, int(markers.size())), 6000);
-    return int(markers.size());
+    QString msg = tr("Imported %n marker(s)", nullptr, result.added);
+    if (result.updated) msg += tr(", brought %n up to date", nullptr, result.updated);
+    statusBar()->showMessage(msg, 6000);
+    return result.added + result.updated;
 }
 
 int MainWindow::importAle(const QString& path, bool cdlToClips) {
@@ -3856,6 +3946,49 @@ int MainWindow::matchColour() {
     }
     state_->message(tr("Matched %n clip(s) to %1", "", n).arg(colourRefName_), 5000);
     inspectorDock_->raise();
+    return n;
+}
+
+int MainWindow::matchColourChart() {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    // The selected picture clip, else the top one at the playhead.
+    const FrameTime at = state_->playhead();
+    const Clip* clip = nullptr;
+    for (Id id : state_->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Video) {
+            clip = edit::clipById(*s, id);
+            break;
+        }
+    for (auto t = s->videoTracks.rbegin(); !clip && t != s->videoTracks.rend(); ++t)
+        for (const Clip& c : t->clips)
+            if (c.mediaId && c.contains(at)) {
+                clip = &c;
+                break;
+            }
+    const Image frame = clip ? chartFrame(state_->project(), *s, *clip, at) : Image{};
+    if (frame.empty()) {
+        state_->message(tr("Select the clip showing the colour chart (or park on it)"));
+        return 0;
+    }
+    const Id clipId = clip->id;
+    // (Measured in the sequence's working space, as the effect receives the picture; shown and searched as Rec.709.)
+    ChartMatchDialog dlg(frame, chartView(frame, *s), sequenceColorSpace(*s), QString::fromStdString(clip->name), this);
+    if (chartDialogHook_) chartDialogHook_(&dlg);
+    if (dlg.exec() != QDialog::Accepted) return 0;
+    const ChartFit fit = dlg.fit();
+    if (!fit.ok || !dlg.ready()) {
+        state_->message(tr("The chart could not be matched: put its outline on the patches"), 5000);
+        return 0;
+    }
+    int n = 0;
+    const bool all = dlg.sameMedia();
+    state_->edit(tr("Match Colour Chart"), [&](Project& p, Sequence& sq) {
+        n = applyChartMatchToClips(p, sq, all ? clipsOfSameMedia(sq, clipId) : std::vector<Id>{clipId}, fit);
+        return n > 0;
+    });
+    if (n)
+        state_->message(tr("Chart matched on %n clip(s): delta E %1 as shot, %2 now", "", n).arg(fit.deltaEBefore, 0, 'f', 1).arg(fit.deltaEAfter, 0, 'f', 1), 6000);
     return n;
 }
 
@@ -4909,8 +5042,9 @@ QString MainWindow::exportForReview(const QString& folder, const ReviewExportOpt
     queue_->add(QString::fromStdString(s->name) + tr(" - Review"), tr("Review copy"), state_->project(), s->id, pkg.settings);
     if (queueDock_) queueDock_->show();
     const QString page = QString::fromStdString(pkg.pagePath);
-    state_->message(tr("Review copy queued; send it with %1. The notes saved from the page come back with File › Import Review Notes.")
-                        .arg(QFileInfo(page).fileName()),
+    const QString compare = pkg.page.previous ? tr(" (it compares with version %1)").arg(pkg.page.previous->version) : QString();
+    state_->message(tr("Review copy queued; send it with %1%2. The notes saved from the page come back with File › Import Review Notes.")
+                        .arg(QFileInfo(page).fileName(), compare),
                     8000);
     return page;
 }
@@ -4969,6 +5103,30 @@ void MainWindow::exportForReviewDialog() {
     range->setObjectName(QStringLiteral("reviewRange"));
     range->setEnabled(marked);
     form->addRow(QString(), range);
+    // Version: the next after the copies already in the folder, compared with the one before.
+    auto* version = new QSpinBox(&dlg);
+    version->setObjectName(QStringLiteral("reviewVersion"));
+    version->setRange(1, 999);
+    auto* compare = new QCheckBox(tr("The page compares it with the version before"), &dlg);
+    compare->setObjectName(QStringLiteral("reviewCompare"));
+    compare->setChecked(true);
+    auto versionsHere = [s, folder] { return reviewVersions(*s, folder->text().toStdString()); };
+    auto nextVersion = [version, versionsHere] {
+        const std::vector<int> v = versionsHere();
+        version->setValue(v.empty() ? 1 : v.back() + 1);
+    };
+    auto updateCompare = [compare, version, versionsHere] {
+        const std::vector<int> v = versionsHere();
+        compare->setEnabled(std::any_of(v.begin(), v.end(), [&](int x) { return x < version->value(); }));
+    };
+    nextVersion();
+    updateCompare();
+    connect(folder, &QLineEdit::textChanged, &dlg, [=] { nextVersion(); updateCompare(); });
+    connect(version, &QSpinBox::valueChanged, &dlg, [=] { updateCompare(); });
+    version->setToolTip(tr("A copy of this cut sent again is the next version (\"%1 - Review v2\"); the same number replaces that copy")
+                            .arg(QString::fromStdString(s->name)));
+    form->addRow(tr("Version:"), version);
+    form->addRow(QString(), compare);
     auto* note = new QPlainTextEdit(&dlg);
     note->setObjectName(QStringLiteral("reviewNote"));
     note->setPlaceholderText(tr("A message for the reviewers (optional)"));
@@ -4986,6 +5144,8 @@ void MainWindow::exportForReviewDialog() {
     o.watermark = watermark->text().trimmed().toStdString();
     o.markers = markers->isChecked();
     o.note = note->toPlainText().trimmed().toStdString();
+    o.version = version->value();
+    o.compare = compare->isChecked();
     if (range->isChecked() && marked) {
         o.in = s->inPoint;
         o.out = s->outPoint + 1;
