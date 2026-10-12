@@ -195,7 +195,7 @@ std::vector<HidDeviceInfo> hidDevices(uint16_t vendor, uint16_t product) {
     CFRelease(match);
     if (CFSetRef set = IOHIDManagerCopyDevices(manager)) {
         const CFIndex n = CFSetGetCount(set);
-        std::vector<const void*> devices(size_t(n));
+        std::vector<const void*> devices(static_cast<size_t>(n));
         CFSetGetValues(set, devices.data());
         for (const void* v : devices) {
             auto d = IOHIDDeviceRef(v);
