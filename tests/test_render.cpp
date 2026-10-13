@@ -5485,6 +5485,13 @@ colorspaces:
         const float stacked = at(s, 32, 18);
         QVERIFY(edit::convertToNodes(s, id).ok);
         QCOMPARE(at(s, 32, 18), stacked);
+        // Show Mask on a node with no window or mix of its own: its key (everywhere) as grey.
+        Effect shown = makeEffect(p, "grade_node");
+        shown.node = 1;
+        shown.params["mask.show"] = 1.0;
+        clip().effects.push_back(shown);
+        QVERIFY2(near(at(s, 32, 18), 1.0f), qPrintable(QString::number(at(s, 32, 18))));
+        clip().effects.pop_back();
 
         // Parallel: gain on the left, invert on the right; unkeyed, their average.
         QVERIFY(edit::flattenGrade(p, s, id).ok);
@@ -6831,6 +6838,17 @@ colorspaces:
         // through a parallel mixer, which the GPU leaves to the CPU.
         const Id topId = r2.created[0];
         QVERIFY(edit::convertToNodes(s, topId).ok);
+        // A plain chain with one node showing its key.
+        {
+            Effect shown = makeEffect(p, "grade_node");
+            shown.node = 1;
+            shown.params["mask.show"] = 1.0;
+            edit::clipById(s, topId)->effects.push_back(shown);
+            gpu::resetStats();
+            compare(20, o, "plain chain shows a key");
+            QCOMPARE(gpu::stats().cpuLayers, 0L);
+            edit::clipById(s, topId)->effects.pop_back();
+        }
         Effect window = makeEffect(p, "grade_node");
         window.node = 2;
         window.params["mask.shape"] = 1.0;
