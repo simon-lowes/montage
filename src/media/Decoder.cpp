@@ -1241,8 +1241,10 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
             rawHalf_ = half;
             stillFrame_.reset();
         }
-        if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH)
+        if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH || (highQuality && !stillHq_)) {
             stillFrame_ = convert(raw_, double(n) / fps_, targetW, targetH, highQuality);
+            stillHq_ = highQuality;
+        }
         curPts_ = double(n) / fps_;
         return stillFrame_;
     }
@@ -1731,7 +1733,8 @@ AudioBufferPtr decodeAmbisonic(const std::string& path, int sampleRate, std::str
     // The stream the stereo mix comes from, with its own channels.
     int ordinal = -1;
     if (MlvInfo mi; isMlvPath(uninterpretedPath(path))) {
-        if (readMlvInfo(uninterpretedPath(path), mi, error) && mi.hasAudio) ordinal = 0;  // (its one sound stream)
+        if (!readMlvInfo(uninterpretedPath(path), mi, error)) return nullptr;
+        if (mi.hasAudio) ordinal = 0;  // (its one sound stream)
     } else {
         AVFormatContext* fmt = nullptr;
         if (int rc = openMediaInput(&fmt, path); rc < 0) {
@@ -1816,7 +1819,8 @@ AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string*
     // Chosen channels: each audio stream they come from, decoded with its own channels, then routed to stereo.
     std::vector<int> streams;  // channels per audio stream
     if (MlvInfo mi; isMlvPath(uninterpretedPath(path))) {
-        if (readMlvInfo(uninterpretedPath(path), mi, error) && mi.hasAudio) streams.push_back(mi.channels);
+        if (!readMlvInfo(uninterpretedPath(path), mi, error)) return nullptr;
+        if (mi.hasAudio) streams.push_back(mi.channels);
     } else {
         AVFormatContext* fmt = nullptr;
         if (int rc = openMediaInput(&fmt, path); rc < 0) {

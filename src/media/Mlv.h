@@ -86,7 +86,7 @@ void mlvPictureSize(const MlvInfo& info, bool half, int& width, int& height);
 
 // Lossless JPEG (SOF3, any predictor, one to four interleaved components, 2 to 16 bits): the samples in raster order,
 // each row `width * components` of them. False with the reason if it is not one this reads, or (with `samples` not 0)
-// if it does not hold exactly that many samples.
+// if it holds fewer samples than that, or far more (an eighth more is taken as the encoder's padding).
 bool decodeLosslessJpeg(const uint8_t* data, size_t size, std::vector<uint16_t>& out, int& width, int& height, int& components,
                         int& bits, std::string* error = nullptr, size_t samples = 0);
 

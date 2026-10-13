@@ -105,6 +105,7 @@ private:
     int dispW_ = 0, dispH_ = 0;
     bool still_ = false;
     Frame16Ptr stillFrame_;
+    bool stillHq_ = true;  // stillFrame_ scaled with high quality (an MLV frame's)
     SwsContext* sws_ = nullptr;
     int swsKey_[6] = {};  // the conversion sws_ was made for: sizes, source format, flags
     // Hardware decoding: the device's pixel format (-1 = software), the frame

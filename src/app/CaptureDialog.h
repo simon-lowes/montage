@@ -73,6 +73,7 @@ private:
     QTimer* tick_;
     std::unique_ptr<Recorder> recorder_;
     QString path_, error_;
+    QString importedPath_;  // the imported file's path on disk, while it records
     Id imported_ = 0;
     bool recording_ = false;  // (until the recording's end has been taken in here)
     int generation_ = 0;      // the recording the recorder's notices are about

@@ -278,7 +278,8 @@ bool decodeLosslessJpeg(const uint8_t* data, size_t size, std::vector<uint16_t>&
             p = segEnd;
             // The samples.
             const size_t rowLen = size_t(width) * size_t(components);
-            if (samples && rowLen * size_t(height) != samples) return fail("The lossless JPEG frame is not the picture's size");
+            if (samples && rowLen * size_t(height) < samples) return fail("The lossless JPEG frame is smaller than the picture");
+            if (samples && rowLen * size_t(height) > samples + samples / 8) return fail("The lossless JPEG frame is larger than the picture");
             out.resize(rowLen * size_t(height));  // (every sample written below)
             BitReader br(p, end);
             const int initial = 1 << std::max(0, bits - pt - 1);
@@ -531,13 +532,17 @@ std::shared_ptr<const MlvIndex> indexMlv(const std::string& path, std::string* e
     return index;
 }
 
-// The indexes of files read, while each is unchanged (its size and time), so the decoders, thumbnails and analyses
-// opening the same recording read its blocks once.
+// The indexes of files read, while each is unchanged (its and its chunks' sizes and times), so the decoders,
+// thumbnails and analyses opening the same recording read its blocks once.
 std::shared_ptr<const MlvIndex> sharedIndex(const std::string& path, std::string* error) {
     static std::mutex mutex;
     static std::map<std::string, std::pair<std::string, std::shared_ptr<const MlvIndex>>> cache;
-    const QFileInfo fi(QString::fromStdString(path));
-    const std::string stamp = std::to_string(fi.size()) + ":" + std::to_string(fi.lastModified().toMSecsSinceEpoch());
+    std::string stamp;
+    for (int chunk = 0; chunk <= 100; ++chunk) {
+        const QFileInfo fi(QString::fromStdString(chunk == 0 ? path : chunkPath(path, chunk)));
+        if (!fi.exists()) break;
+        stamp += std::to_string(fi.size()) + ":" + std::to_string(fi.lastModified().toMSecsSinceEpoch()) + ";";
+    }
     {
         std::lock_guard<std::mutex> lock(mutex);
         const auto it = cache.find(path);
@@ -601,6 +606,7 @@ bool MlvReader::loadMosaic(int n, std::string* error) {
     if (info.lossless) {
         int jw = 0, jh = 0, jc = 0, jbits = 0;
         if (!decodeLosslessJpeg(buffer_.data(), buffer_.size(), mosaic_, jw, jh, jc, jbits, error, count)) return false;
+        mosaic_.resize(count);  // (any padding the encoder added after the picture dropped)
         // (the samples in raster order, whatever the components; scaled to 16 bits)
         if (shift > 0)
             parallelRows(h, [&](int y0, int y1) {

@@ -249,6 +249,7 @@ bool CaptureDialog::record() {
     settings.setValue(QStringLiteral("capture/options"), options_->text().trimmed());
     recording_ = true;
     notedFrames_ = -1;
+    importedPath_.clear();
     record_->setText(tr("Stop"));
     tick_->start();
     refresh();
@@ -264,7 +265,11 @@ void CaptureDialog::importNow() {
     if (imported_ || !import_->isChecked() || path_.isEmpty() || !QFileInfo::exists(path_)) return;
     QStringList errors;
     const std::vector<Id> ids = state_->importFiles({path_}, &errors, tr("Captures"));
-    if (!ids.empty()) imported_ = ids.front();
+    if (!ids.empty()) {
+        imported_ = ids.front();
+        // (as the project names it; kept, as another project opened meanwhile may have a media item of the same id)
+        if (const MediaItem* m = state_->project().findMedia(imported_)) importedPath_ = QString::fromStdString(mediaFileOnDisk(m->path));
+    }
     else if (!errors.isEmpty()) error_ = errors.front();
     refresh();
 }
@@ -294,11 +299,10 @@ void CaptureDialog::refresh() {
     const CaptureStatus st = recorder_->status();
     // The file imported is being written by this program: said so as it records, not left to the system's notice of
     // writes (late on macOS and Windows), so it is followed as growing at once.
-    if (st.recording && st.frames != notedFrames_)
-        if (const MediaItem* m = imported_ ? state_->project().findMedia(imported_) : nullptr) {
-            state_->noteMediaFileWritten(QString::fromStdString(mediaFileOnDisk(m->path)));
-            notedFrames_ = st.frames;
-        }
+    if (st.recording && st.frames != notedFrames_ && !importedPath_.isEmpty()) {
+        state_->noteMediaFileWritten(importedPath_);
+        notedFrames_ = st.frames;
+    }
     QString text;
     if (st.recording && st.frames == 0) {
         text = tr("Waiting for the feed…");
