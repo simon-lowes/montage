@@ -58,6 +58,7 @@
 #include "media/Proxy.h"
 #include "media/AudioSync.h"
 #include "media/AutoDuck.h"
+#include "media/Capture.h"
 #include "media/Decoder.h"
 #include "media/HwAccel.h"
 #include "media/Loudness.h"
@@ -610,6 +611,134 @@ class TestMedia : public QObject {
     std::string path(const char* name) { return (dir_.path() + "/" + name).toStdString(); }
 
 private slots:
+    void captureFromFeeds() {
+        // Recording a feed: lavfi's test pattern and tone (a capture device FFmpeg offers everywhere, made to run in
+        // real time) into ProRes HQ in QuickTime, at a set timecode, for three seconds.
+        const std::vector<std::string> devices = captureDeviceKinds();
+        const auto codecs = captureCodecs();
+        QVERIFY(std::any_of(codecs.begin(), codecs.end(), [](const auto& c) { return c.first == "prores_hq"; }));
+        Recorder bad;
+        std::string err;
+        CaptureSettings wrong;
+        wrong.video.url = "x";
+        wrong.path = path("capture.mp4");
+        QVERIFY(!bad.start(wrong, &err) && !err.empty());  // (QuickTime or MXF only)
+        if (std::find(devices.begin(), devices.end(), "lavfi") != devices.end()) {
+            CaptureSettings cs;
+            cs.video.device = "lavfi";
+            cs.video.url = "testsrc2=size=320x180:rate=25,realtime[out0];sine=frequency=1000:sample_rate=48000,arealtime[out1]";
+            cs.path = path("capture.mov");
+            cs.timecode = "10:00:00:00";
+            cs.seconds = 3;
+            Recorder rec;
+            std::atomic<bool> fragment{false}, finished{false}, fine{false};
+            rec.onFirstFragment = [&] { fragment = true; };
+            rec.onFinished = [&](bool ok, const std::string&) {
+                fine = ok;
+                finished = true;
+            };
+            QVERIFY2(rec.start(cs, &err), err.c_str());
+            QTRY_VERIFY_WITH_TIMEOUT(fragment, 10000);
+            // While it records, the file so far opens: a picture with its sound and timecode.
+            QVERIFY(rec.recording());
+            MediaItem partial;
+            QVERIFY(probeMedia(cs.path, partial, &err));
+            QVERIFY(partial.hasVideo && partial.hasAudio);
+            QCOMPARE(partial.width, 320);
+            QVERIFY(partial.duration > 0.5 && partial.duration < 3);
+            QVERIFY(rec.wait(15));
+            QVERIFY(finished && fine);
+            const CaptureStatus st = rec.status();
+            QVERIFY(!st.recording && st.finished && st.error.empty());
+            QCOMPARE(st.frames, int64_t(75));
+            QCOMPARE(st.timecode, std::string("10:00:00:00"));
+            QCOMPARE(st.channels, 1);
+            MediaItem m;
+            QVERIFY(probeMedia(cs.path, m, &err));
+            QCOMPARE(m.videoCodec, std::string("prores"));
+            QCOMPARE(m.fps.num * 1, 25 * m.fps.den);
+            QVERIFY(std::fabs(m.duration - 3.0) < 0.05);
+            QVERIFY(m.hasAudio && m.sampleRate == 48000 && m.channels == 1);
+            QCOMPARE(m.timecode, 36000.0);
+            // Its pictures: the moving test pattern to the last frame.
+            VideoDecoder dec;
+            QVERIFY(dec.open(cs.path));
+            const Frame16Ptr one = dec.frameAt(1.0), last = dec.frameAt(74.0 / 25);
+            QVERIFY(one && last && one->width == 320);
+            QVERIFY(std::memcmp(one->px.data(), last->px.data(), one->bytes()) != 0);
+
+            // Avid DNxHR SQ in MXF, a second long, its timecode the time of day.
+            CaptureSettings mxf = cs;
+            mxf.path = path("capture.mxf");
+            mxf.codec = "dnxhr_sq";
+            mxf.timecode.clear();
+            mxf.seconds = 1;
+            mxf.video.url = "testsrc2=size=640x360:rate=25[out0];sine=sample_rate=48000[out1]";
+            Recorder rec2;
+            QVERIFY2(rec2.start(mxf, &err), err.c_str());
+            QVERIFY(rec2.wait(30));
+            QVERIFY2(rec2.status().error.empty(), rec2.status().error.c_str());
+            MediaItem d;
+            QVERIFY(probeMedia(mxf.path, d, &err));
+            QCOMPARE(d.videoCodec, std::string("dnxhd"));
+            QVERIFY(std::fabs(d.duration - 1.0) < 0.05);
+            QVERIFY(d.timecode >= 0);
+            QVERIFY(d.hasAudio);
+        }
+
+        // A feed that never comes: given up, nothing written.
+        CaptureSettings none;
+        none.video.url = "udp://127.0.0.1:47391";
+        none.path = path("never.mov");
+        none.openTimeout = 1;
+        Recorder never;
+        QVERIFY(never.start(none, &err));
+        QVERIFY(never.wait(10));
+        QVERIFY(!never.status().error.empty());
+        QVERIFY(!QFile::exists(QString::fromStdString(none.path)));
+
+        // Network feeds sent by FFmpeg's own command (MPEG-2 in an MPEG transport stream, as an encoder sends it): over
+        // UDP, and SRT where FFmpeg has it.
+        const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg");
+        if (ffmpeg.isEmpty()) QSKIP("No ffmpeg command to send a feed");
+        QProcess probe;
+        probe.start(ffmpeg, {"-hide_banner", "-protocols"});
+        probe.waitForFinished(20000);
+        const QString protocols = QString::fromLocal8Bit(probe.readAllStandardOutput());
+        int port = 47400;
+        for (const char* proto : {"udp", "srt"}) {
+            if (!protocols.contains(QRegularExpression(QStringLiteral("\\n\\s*%1\\s*\\n").arg(proto)))) continue;
+            ++port;
+            CaptureSettings net;
+            const QString receive = QString(proto) == "srt" ? QStringLiteral("srt://127.0.0.1:%1?mode=listener&latency=120000&transtype=live").arg(port)
+                                                            : QStringLiteral("udp://127.0.0.1:%1").arg(port);
+            const QString send = QString(proto) == "srt" ? QStringLiteral("srt://127.0.0.1:%1?mode=caller&latency=120000&transtype=live").arg(port)
+                                                         : QStringLiteral("udp://127.0.0.1:%1?pkt_size=1316").arg(port);
+            net.video.url = receive.toStdString();
+            net.path = path((std::string("net-") + proto + ".mov").c_str());
+            net.codec = "prores_lt";
+            net.seconds = 2;
+            net.openTimeout = 15;
+            Recorder r;
+            if (!r.start(net, &err)) QFAIL(err.c_str());
+            QThread::msleep(300);
+            QProcess sender;
+            sender.start(ffmpeg, {"-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25", "-f", "lavfi", "-i",
+                                  "sine=sample_rate=48000", "-t", "6", "-c:v", "mpeg2video", "-g", "12", "-b:v", "2M", "-c:a", "mp2", "-f", "mpegts", send});
+            QVERIFY(sender.waitForStarted(10000));
+            const bool ended = r.wait(30);
+            sender.kill();
+            sender.waitForFinished(5000);
+            if (r.status().error.find("Protocol not found") != std::string::npos) continue;  // (this build's FFmpeg lacks it)
+            QVERIFY2(ended && r.status().error.empty(), (std::string(proto) + ": " + r.status().error).c_str());
+            MediaItem m;
+            QVERIFY(probeMedia(net.path, m, &err));
+            QVERIFY(m.hasVideo && m.hasAudio);
+            QCOMPARE(m.width, 320);
+            QVERIFY2(std::fabs(m.duration - 2.0) < 0.05, std::to_string(m.duration).c_str());
+        }
+    }
+
     void ascCdlAndAleOverMcp() {
         // A project with two (offline) camera files, one cut in twice.
         Project q = makeDefaultProject();

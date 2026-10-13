@@ -38,11 +38,32 @@ uint32_t hashed(uint32_t base, const std::string& s) {
     return base | (h & 0x00FFFFFF);
 }
 
-// The Color Correct the clip's node grades with (its first, on or off).
-Effect* colorCorrect(Clip& c, int node) {
-    for (Effect& e : c.effects)
-        if (e.type == "color_correct" && e.node == node) return &e;
+// The Color Correct the clip's node grades with (its first, on or off): the clip's own, or its shared node's.
+const Effect* colorCorrect(const Sequence& s, const Clip& c, int node) {
+    if (node)
+        for (const Effect* e : gradeNodeEffects(s, c, node))
+            if (e->type == "color_correct") return e;
+    if (!node)
+        for (const Effect& e : c.effects)
+            if (e.type == "color_correct" && e.node == 0) return &e;
     return nullptr;
+}
+
+// The effects a node's Color Correct goes in (the shared node's for a shared node).
+std::vector<Effect>* nodeEffects(Sequence& s, Clip& c, int node) {
+    if (const GradeNode* n = node ? findGradeNode(c.grade, node) : nullptr; n && n->shared) {
+        for (SharedNode& sn : s.sharedNodes)
+            if (sn.id == n->shared) return &sn.effects;
+        return nullptr;
+    }
+    return &c.effects;
+}
+
+// A control's name on the panels' small displays (nine letters): "Lift R" for "Lift (Red)".
+std::string shortName(const std::string& label) {
+    const size_t open = label.find(" (");
+    if (open != std::string::npos && open + 2 < label.size()) return label.substr(0, std::min<size_t>(open, 7)) + " " + label[open + 2];
+    return label.substr(0, 9);
 }
 
 const char* kBuiltIns[][2] = {{"tangent:play", QT_TRANSLATE_NOOP("TangentControl", "Play / Stop")},
@@ -78,7 +99,7 @@ QString TangentControl::folder() const {
     return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/tangent");
 }
 
-bool TangentControl::isConnected() const { return socket_ && socket_->state() == QAbstractSocket::ConnectedState; }
+bool TangentControl::isConnected() const { return introduced_ && socket_ && socket_->state() == QAbstractSocket::ConnectedState; }
 
 void TangentControl::setEnabled(bool on) {
     enabled_ = on;
@@ -88,11 +109,12 @@ void TangentControl::setEnabled(bool on) {
     } else {
         retry_->stop();
         watch_->stop();
-        if (socket_) {
-            socket_->abort();
-            socket_->deleteLater();
+        if (QTcpSocket* sock = socket_) {
             socket_ = nullptr;
             introduced_ = false;
+            sock->disconnect(this);
+            sock->abort();
+            sock->deleteLater();
             emit connectionChanged();
         }
     }
@@ -102,10 +124,7 @@ void TangentControl::tryConnect() {
     if (!enabled_ || socket_) return;
     socket_ = new QTcpSocket(this);
     connect(socket_, &QTcpSocket::readyRead, this, &TangentControl::readHub);
-    connect(socket_, &QTcpSocket::connected, this, [this] {
-        error_.clear();
-        emit connectionChanged();
-    });
+    connect(socket_, &QTcpSocket::connected, this, [this] { error_.clear(); });
     connect(socket_, &QTcpSocket::disconnected, this, &TangentControl::lost);
     connect(socket_, &QTcpSocket::errorOccurred, this, [this](QAbstractSocket::SocketError) {
         if (!socket_) return;
@@ -118,12 +137,14 @@ void TangentControl::tryConnect() {
 
 void TangentControl::lost() {
     if (!socket_) return;
-    const bool was = introduced_;
-    socket_->deleteLater();
+    QTcpSocket* sock = socket_;
     socket_ = nullptr;
+    sock->disconnect(this);
+    sock->deleteLater();
     introduced_ = false;
+    shuttle_ = 0;
     watch_->stop();
-    if (was) emit connectionChanged();
+    emit connectionChanged();
 }
 
 void TangentControl::send(const std::string& bytes) {
@@ -168,7 +189,7 @@ tangent::ControlSystem TangentControl::controls() const {
             tangent::Control c;
             c.id = parameterId(p.name);
             c.name = p.label;
-            c.shortName = p.label.substr(0, 9);
+            c.shortName = shortName(p.label);
             c.min = p.min, c.max = p.max, c.step = p.step > 0 ? p.step : 0.01;
             primaries.controls.push_back(c);
             const std::string wheel = p.name.substr(0, p.name.find('_'));
@@ -255,7 +276,7 @@ TangentControl::Target TangentControl::target() const {
     }
     if (!c) return t;
     t.clip = c->id;
-    t.at = std::max<FrameTime>(0, state_->playhead() - c->start);
+    t.at = std::clamp<FrameTime>(state_->playhead() - c->start, 0, std::max<FrameTime>(0, c->duration - 1));
     if (!c->grade.empty()) {
         const int picked = state_->primaryClip() && state_->primaryClip()->id == c->id ? state_->selectedGradeNode() : 0;
         const GradeNode* n = picked ? findGradeNode(c->grade, picked) : nullptr;
@@ -272,14 +293,15 @@ TangentControl::Target TangentControl::target() const {
     return t;
 }
 
-double TangentControl::value(const std::string& name) const {
+double TangentControl::value(const std::string& name) const { return value(name, target()); }
+
+double TangentControl::value(const std::string& name, const Target& t) const {
     const ParamInfo* info = paramInfo(name);
     const double def = info ? info->def : 0;
-    const Target t = target();
     const Sequence* s = state_->sequence();
     if (!t.clip || !s) return def;
-    Clip* c = edit::clipById(const_cast<Sequence&>(*s), t.clip);
-    const Effect* e = c ? colorCorrect(*c, t.node) : nullptr;
+    const Clip* c = edit::clipById(const_cast<Sequence&>(*s), t.clip);
+    const Effect* e = c ? colorCorrect(*s, *c, t.node) : nullptr;
     return e ? e->p(name, t.at, def) : def;
 }
 
@@ -293,16 +315,24 @@ bool TangentControl::change(const std::string& name, double to, bool reset) {
     }
     const double v = reset ? info->def : std::clamp(to, info->min, info->max);
     const QString label = tr("%1 (Tangent)").arg(QString::fromStdString(info->label));
-    const QString key = QStringLiteral("tangent:%1:%2:%3").arg(t.clip).arg(t.node).arg(QString::fromStdString(name));
+    // (a run of turns on the node, a trackball's three colours interleaved, is one undo step)
+    const QString key = QStringLiteral("tangent:%1:%2").arg(t.clip).arg(t.node);
     return state_->edit(label, [t, name, v](Project& p, Sequence& s) {
         Clip* c = edit::clipById(s, t.clip);
-        if (!c) return false;
-        Effect* e = colorCorrect(*c, t.node);
+        std::vector<Effect>* effects = c ? nodeEffects(s, *c, t.node) : nullptr;
+        if (!effects) return false;
+        const bool shared = effects != &c->effects;
+        Effect* e = nullptr;
+        for (Effect& x : *effects)
+            if (x.type == "color_correct" && (shared || x.node == t.node)) {
+                e = &x;
+                break;
+            }
         if (!e) {
             Effect made = makeEffect(p, "color_correct");
-            made.node = t.node;
-            c->effects.push_back(made);
-            e = &c->effects.back();
+            if (!shared) made.node = t.node;
+            effects->push_back(made);
+            e = &effects->back();
         }
         e->params[name].set(t.at, v);
         return true;
@@ -328,8 +358,7 @@ void TangentControl::sendMenu() {
     send(tangent::menuString(kNodeMenu, text, false));
 }
 
-void TangentControl::sendDisplay() {
-    const Target t = target();
+void TangentControl::sendDisplay(const Target& t) {
     const Sequence* s = state_->sequence();
     const Clip* c = s && t.clip ? edit::clipById(const_cast<Sequence&>(*s), t.clip) : nullptr;
     std::vector<std::string> lines;
@@ -351,14 +380,16 @@ void TangentControl::watch() {
     if (!introduced_) return;
     // What the panels show: the clip, its node, and its values there.
     const Target t = target();
+    sendDisplay(t);
+    // (while playing over a keyframed grade the Hub is told once playback stops, not at every tick)
+    if (PlaybackController* c = hooks_.controller ? hooks_.controller() : nullptr; c && c->isPlaying() && !watched_.isEmpty()) return;
     QString now = QStringLiteral("%1/%2/").arg(t.clip).arg(t.node);
-    for (const auto& [id, name] : parameters_) now += QString::number(value(name), 'g', 9) + QLatin1Char(',');
+    for (const auto& [id, name] : parameters_) now += QString::number(value(name, t), 'g', 9) + QLatin1Char(',');
     if (now != watched_) {
         const bool first = watched_.isEmpty();
         watched_ = now;
         if (!first) send(tangent::allChange());
     }
-    sendDisplay();
 }
 
 void TangentControl::command(const QString& id, bool on) {
@@ -436,14 +467,16 @@ void TangentControl::handle(const tangent::HubMessage& m) {
         case tangent::Transport: {
             PlaybackController* c = hooks_.controller ? hooks_.controller() : nullptr;
             if (!c) break;
-            if (!m.jog && !m.shuttle) c->pause();
             if (m.jog) {
+                shuttle_ = 0;
                 if (c->isPlaying()) c->pause();
                 c->step(m.jog);
             }
             if (m.shuttle) {
-                const int n = std::clamp(std::abs(m.shuttle), 1, 6);
-                c->setSpeed((m.shuttle < 0 ? -1.0 : 1.0) * double(1 << (n - 1)));
+                // (the ring's turns add up: 1, 2, 4... 32 times either way, back to the middle to stop)
+                shuttle_ = std::clamp(shuttle_ + m.shuttle, -6, 6);
+                if (shuttle_ == 0) c->pause();
+                else c->setSpeed((shuttle_ < 0 ? -1.0 : 1.0) * double(1 << (std::abs(shuttle_) - 1)));
             }
             break;
         }

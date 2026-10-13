@@ -74,6 +74,8 @@
 #include "ExposureView.h"
 #include "QualityCheckDialog.h"
 #include "OffloadDialog.h"
+#include "CaptureDialog.h"
+#include "media/Capture.h"
 #include "SpellUi.h"
 #include "core/ColorGroups.h"
 #include "core/Interpretation.h"
@@ -1569,6 +1571,61 @@ private slots:
     // Tangent panels through a stand-in Tangent Hub: introduced, the controls file written, turns, resets and value
     // requests answered on the graded clip's Color Correct (a run of turns one undo step), the node menu, the jog
     // wheel and a menu command.
+    void captureWhileEditing() {
+        // File › Capture: a live feed (lavfi's test pattern and tone, in real time) recorded to ProRes; a second in, the
+        // file is in the Captures bin and grows there; once stopped it holds the whole recording.
+        const std::vector<std::string> kinds = captureDeviceKinds();
+        if (std::find(kinds.begin(), kinds.end(), "lavfi") == kinds.end()) QSKIP("This build has no capture devices");
+        state()->newProject();
+        CaptureDialog* dlg = win_->captureDialog();
+        QVERIFY(dlg && dlg == win_->captureDialog());
+        QTemporaryDir dir;
+        dlg->setSource("lavfi", "testsrc2=size=320x180:rate=25,realtime[out0];sine=sample_rate=48000,arealtime[out1]");
+        dlg->setFolder(dir.path());
+        dlg->setClipName("Take 01");
+        dlg->setCodec("prores_lt");
+        dlg->setWrapper("mov");
+        dlg->setTimecode("1:00");
+        QVERIFY(!dlg->record());
+        QVERIFY(dlg->statusText().contains("hh:mm:ss:ff"));
+        dlg->setTimecode("01:00:00:00");
+        dlg->setSeconds(6);
+        QVERIFY(dlg->record());
+        QVERIFY(dlg->isRecording());
+        QCOMPARE(dlg->filePath(), dir.filePath("Take 01.mov"));
+        QTRY_VERIFY_WITH_TIMEOUT(dlg->importedMedia() != 0, 10000);
+        const Id id = dlg->importedMedia();
+        const MediaItem* m = state()->project().findMedia(id);
+        QVERIFY(m && m->hasVideo && m->hasAudio);
+        QCOMPARE(QString::fromStdString(m->bin), QString("Captures"));
+        QCOMPARE(m->timecode, 3600.0);
+        QVERIFY(m->duration < 4.5);
+        QVERIFY(dlg->statusText().startsWith("Recording 00:00:0"));
+        // Cut in while it records.
+        QVERIFY(state()->edit("Place", [id](Project& p, Sequence& s) { return edit::placeMedia(p, s, id, 0, 0, 25, {TrackKind::Video, 0}, {}, false).ok; }));
+        bool grew = false;
+        QElapsedTimer t;
+        t.start();
+        while (dlg->isRecording() && t.elapsed() < 20000) {
+            QTest::qWait(50);
+            grew = grew || state()->isMediaGrowing(id);
+        }
+        QVERIFY(!dlg->isRecording());
+        QVERIFY(grew);
+        QTRY_VERIFY_WITH_TIMEOUT(std::fabs(state()->project().findMedia(id)->duration - 6.0) < 0.05 && !state()->isMediaGrowing(id), 20000);
+        QVERIFY(dlg->statusText().startsWith("Recorded 00:00:06"));
+        QVERIFY(dlg->statusText().contains("320×180") && dlg->statusText().contains("TC 01:00:00:00"));
+        QCOMPARE(win_->findChild<QLineEdit*>("captureName")->text(), QString("Take 02"));
+        // A feed that does not open: said so, nothing imported.
+        dlg->setSource(QString(), "udp://127.0.0.1:47393?timeout=500000");
+        dlg->setSeconds(0);
+        QVERIFY(dlg->record());
+        QTRY_VERIFY_WITH_TIMEOUT(!dlg->isRecording(), 20000);
+        QTRY_VERIFY(!dlg->statusText().contains("Waiting"));
+        QCOMPARE(dlg->importedMedia(), Id(0));
+        dlg->hide();
+    }
+
     void tangentPanels() {
         state()->newProject();
         QVERIFY(state()->edit("Shot", [](Project& p, Sequence& s) {
@@ -1632,7 +1689,9 @@ private slots:
         QVERIFY(xml.open(QIODevice::ReadOnly));
         const QString controls = QString::fromUtf8(xml.readAll());
         const uint32_t liftR = TangentControl::parameterId("lift_r"), gain = TangentControl::parameterId("gain");
+        QVERIFY(controls.contains("<Controls>") && controls.indexOf("<Group name=\"Primaries\">") > controls.indexOf("<Controls>"));
         QVERIFY(controls.contains(QString::asprintf("<Parameter id=\"%#010x\">", liftR)));
+        QVERIFY(controls.contains("<Name9>Lift R</Name9>"));
         QVERIFY(controls.contains("<Binding name=\"Lift\">"));
         QVERIFY(controls.contains(QString::asprintf("<Menu id=\"%#010x\">", TangentControl::kNodeMenu)));
         QVERIFY(controls.contains("<Name>Add Marker</Name>"));
@@ -1643,9 +1702,13 @@ private slots:
         toHub(tangent::idCommand(tangent::ParameterValueRequest, gain));
         auto v = hear(tangent::ParameterValue, gain);
         QVERIFY(v && v->value == 1.0f && v->atDefault);
-        // Two turns of Lift R: a Color Correct added at the playhead's clip, 0.2, one undo step.
+        // Two turns of Lift R with one of Lift G between (a trackball rolling): a Color Correct added at the playhead's
+        // clip, 0.2, one undo step.
+        const uint32_t liftG = TangentControl::parameterId("lift_g");
         toHub(tangent::parameterChange(liftR, 0.1f));
         QVERIFY((v = hear(tangent::ParameterValue, liftR)) && std::fabs(v->value - 0.1f) < 1e-6f && !v->atDefault);
+        toHub(tangent::parameterChange(liftG, 0.05f));
+        QVERIFY((v = hear(tangent::ParameterValue, liftG)) && std::fabs(v->value - 0.05f) < 1e-6f);
         toHub(tangent::parameterChange(liftR, 0.1f));
         QVERIFY((v = hear(tangent::ParameterValue, liftR)) && std::fabs(v->value - 0.2f) < 1e-6f);
         QVERIFY(colorCorrect());
@@ -1689,12 +1752,33 @@ private slots:
         bool onAdded = false;
         for (const Effect& e : graded->effects) onAdded = onAdded || (e.type == "color_correct" && e.node == added);
         QVERIFY(onAdded);
+        // A shared node: its own Color Correct changed (every clip showing it follows), none added to the clip.
+        Id sharedId = 0;
+        QVERIFY(state()->edit("Share", [shot, added, &sharedId](Project& p, Sequence& s) {
+            return edit::shareGradeNode(p, s, shot, added, "Look", &sharedId).ok;
+        }));
+        toHub(tangent::parameterChange(gain, 0.25f));
+        QVERIFY((v = hear(tangent::ParameterValue, gain)) && std::fabs(v->value - 1.75f) < 1e-6f);
+        const SharedNode* look = findSharedNode(*state()->sequence(), sharedId);
+        QVERIFY(look && look->effects.size() == 1);
+        QVERIFY(std::fabs(look->effects[0].p("gain", 10) - 1.75) < 1e-6);
+        int onClip = 0;
+        for (const Effect& e : edit::clipById(*state()->sequence(), shot)->effects) onClip += e.type == "color_correct" && e.node == added;
+        QCOMPARE(onClip, 0);
 
         // The jog wheel steps the playhead; a menu command runs.
         state()->setSelection({});
         const FrameTime at = state()->playhead();
         toHub(tangent::transport(3, 0));
         QTRY_COMPARE(state()->playhead(), at + 3);
+        // The shuttle ring's turns add up (1x, then 2x), and back in the middle it stops.
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        toHub(tangent::transport(0, 1));
+        QTRY_COMPARE(program->speed(), 1.0);
+        toHub(tangent::transport(0, 1));
+        QTRY_COMPARE(program->speed(), 2.0);
+        toHub(tangent::transport(0, -2));
+        QTRY_COMPARE(program->speed(), 0.0);
         const QString addMarker = "Sequence/Add Marker";
         QVERIFY(keymap::find(win_.get(), addMarker) && tc->actionId(addMarker));
         const size_t markers = state()->sequence()->markers.size();

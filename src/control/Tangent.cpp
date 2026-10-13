@@ -135,9 +135,9 @@ bool Decoder::feed(const std::string& bytes, std::vector<HubMessage>& out, std::
                 case InitiateComms: {
                     m.protocolRev = r.u32();
                     const uint32_t count = r.u32();
-                    for (uint32_t i = 0; r.ok && i < count && i < 64; ++i) {
+                    for (uint32_t i = 0; r.ok && i < count; ++i) {
                         const uint32_t type = r.u32(), id = r.u32();
-                        m.panels.push_back({type, id});
+                        if (m.panels.size() < 64) m.panels.push_back({type, id});
                     }
                     break;
                 }
@@ -373,8 +373,10 @@ std::string controlsXml(const ControlSystem& system) {
     for (const auto& [id, name] : system.modes)
         x += "    <Mode id=\"" + hexId(id) + "\">\n      <Name>" + xmlEscape(ascii(name)) + "</Name>\n    </Mode>\n";
     x += "  </Modes>\n";
-    for (const Group& g : system.groups) writeGroup(x, g, "  ");
-    for (const Control& c : system.controls) writeControl(x, c, "  ");
+    x += "  <Controls>\n";
+    for (const Group& g : system.groups) writeGroup(x, g, "    ");
+    for (const Control& c : system.controls) writeControl(x, c, "    ");
+    x += "  </Controls>\n";
     x += "</TangentWave>\n";
     return x;
 }

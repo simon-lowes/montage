@@ -110,6 +110,7 @@
 #include "ScriptCutDialog.h"
 #include "QualityCheckDialog.h"
 #include "OffloadDialog.h"
+#include "CaptureDialog.h"
 #include "ProductionPanel.h"
 #include "core/AafImport.h"
 #include "core/Production.h"
@@ -988,6 +989,12 @@ void MainWindow::buildMenus() {
             takeEdit_->setEnabled(state_->canTakeEdit());
         });
     }
+    add(file, tr("&Capture…"), QKeySequence(), [this] {
+        CaptureDialog* d = captureDialog();
+        d->show();
+        d->raise();
+        d->activateWindow();
+    })->setObjectName(QStringLiteral("capture"));
     add(file, tr("&Offload Card…"), QKeySequence(), [this] {
         OffloadDialog dlg(state_, this);
         dlg.exec();
@@ -2341,6 +2348,11 @@ void MainWindow::updateTitle() {
         name += state_->lockHolder().isEmpty() ? tr(" (Read-Only)") : tr(" (Read-Only: %1 is editing)").arg(state_->lockHolder());
     setWindowTitle(QString("%1[*] — Montage").arg(name));
     setWindowModified(state_->isModified());
+}
+
+CaptureDialog* MainWindow::captureDialog() {
+    if (!capture_) capture_ = new CaptureDialog(state_, this);
+    return capture_;
 }
 
 PlaybackController* MainWindow::activeController() const { return active_ == Monitor::Source ? source_ : program_; }

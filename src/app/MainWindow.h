@@ -78,6 +78,7 @@ class ScriptConsole;
 class OscControl;
 class SpeedEditorControl;
 class TangentControl;
+class CaptureDialog;
 class ScriptPanelWidget;
 
 class MainWindow : public QMainWindow {
@@ -189,6 +190,8 @@ public:
     QDialog* speedEditorKeysDialog(QWidget* parent = nullptr);
     SpeedEditorControl* speedEditor() const { return speedEditor_; }
     TangentControl* tangent() const { return tangent_; }
+    // File › Capture (made when first opened; it stays, recording, while hidden).
+    CaptureDialog* captureDialog();
     // Clip › Colour Group (core/ColorGroups.h), each one undo step: a new group of the selected video clips (its id, 0
     // with a message when none are selected), the selection joining a group, or leaving its group.
     Id newColorGroup(const QString& name = {});
@@ -500,6 +503,7 @@ private:
     OscControl* osc_ = nullptr;
     SpeedEditorControl* speedEditor_ = nullptr;
     TangentControl* tangent_ = nullptr;
+    CaptureDialog* capture_ = nullptr;
     MulticamPanel* multicam_ = nullptr;
     AdrPanel* adr_ = nullptr;
     ProductionPanel* production_ = nullptr;

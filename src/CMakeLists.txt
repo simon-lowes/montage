@@ -108,6 +108,7 @@ add_library(montage_engine STATIC
   media/Tracking.h media/Tracking.cpp
   media/CameraSolve.h media/CameraSolve.cpp
   media/Reframe.h media/Reframe.cpp
+  media/Capture.h media/Capture.cpp
   media/ModelFiles.h media/ModelFiles.cpp
   media/Sofa.h media/Sofa.cpp
   media/LensDatabase.h media/LensDatabase.cpp
@@ -273,6 +274,15 @@ if(MONTAGE_WITH_LV2)
   else()
     message(STATUS "lilv not found: LV2 plugins are listed but not hosted")
   endif()
+endif()
+# Capture devices (cameras and sound cards) through libavdevice; network feeds need only libavformat.
+pkg_check_modules(AVDEVICE IMPORTED_TARGET GLOBAL libavdevice)
+if(AVDEVICE_FOUND)
+  message(STATUS "libavdevice ${AVDEVICE_VERSION}: recording from capture devices enabled")
+  target_link_libraries(montage_engine PRIVATE PkgConfig::AVDEVICE)
+  target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_AVDEVICE)
+else()
+  message(STATUS "libavdevice not found: recording from network feeds only")
 endif()
 if(MONTAGE_WITH_LIBRAW)
   pkg_check_modules(LIBRAW IMPORTED_TARGET GLOBAL libraw>=0.20)
