@@ -13,6 +13,8 @@
 //   15 a parallel mixer's sums: what it has (table) and a branch (srcTex) by its key (maskTex)
 //   16 a parallel mixer's picture: the weighted sum (srcTex) by the weights (maskTex), else the plain one (table)
 //   17 a layer mixer's branch (table) blended onto what is under it (srcTex) where its key is (maskTex)
+// and the keyers, which change the alpha as well: 18 Chroma Key, 19 Luma Key, 20 Screen Key (without shrinking or
+// softening its matte, which only the CPU does).
 // Through the effect's mask where it has one (p[13..15]): its shape drawn on the CPU (maskTex), an HSL qualifier on
 // the colour as it comes in, inverted and faded, and the picture mixed with what the effect made by it (all four
 // channels, premultiplied, as the CPU mixes them).
@@ -27,6 +29,7 @@ layout(binding = 5) uniform sampler2D maskTex; // R32F: the mask's shape, the la
 float clamp01(float v) { return v > 0.0 ? min(v, 1.0) : 0.0; }  // (NaN to 0, as the CPU does)
 float luma(vec3 c) { return 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b; }
 float smoothstepCpu(float e0, float e1, float x) {
+    if (e1 == e0) return x < e0 ? 0.0 : 1.0;
     float t = clamp01((x - e0) / (e1 - e0));
     return t * t * (3.0 - 2.0 * t);
 }
@@ -290,9 +293,70 @@ vec4 graphStep(ivec2 xy, int mode) {
     return vec4(o, a);
 }
 
+// The keyers (modes 18 to 20), on the pixel's straight colour `c` and alpha `a`: what they make, premultiplied.
+vec4 keyer(int mode, vec3 c, float a) {
+    if (mode == 18) {
+        // Chroma Key. p[1]: the key's Cb and Cr, the distance's scale, tolerance; p[2]: softness, spill, the key's
+        // strongest channel, the matte shown.
+        const float y = luma(c);
+        const vec2 d2 = vec2((c.b - y) / 1.8556, (c.r - y) / 1.5748) - p[1].xy;
+        const float nd = sqrt(dot(d2, d2)) / p[1].z;
+        const float matte = smoothstepCpu(p[1].w, p[1].w + p[2].x, nd);
+        vec3 o = c;
+        if (p[2].y > 0.0) {
+            const int dom = int(p[2].z);
+            const float others = 0.5 * (o[(dom + 1) % 3] + o[(dom + 2) % 3]);
+            if (o[dom] > others) o[dom] -= (o[dom] - others) * p[2].y;
+        }
+        const float na = a * matte;
+        return p[2].w > 0.5 ? vec4(vec3(na), 1.0) : vec4(o * na, na);
+    }
+    if (mode == 19) {
+        // Luma Key. p[1]: threshold, softness, inverted.
+        float m = smoothstepCpu(p[1].x - p[1].y, p[1].x + p[1].y, luma(c));
+        if (p[1].z > 0.5) m = 1.0 - m;
+        return vec4(c * (a * m), a * m);
+    }
+    // Screen Key. p[1]: the screen's channel, balance, gain, the screen's strength; p[2]: clip black and white,
+    // despill, restore; p[3]: edge desaturation, the view (0 the result, 1 the matte, 2 status).
+    const int dom = int(p[1].x), o1 = (dom + 1) % 3, o2 = (dom + 2) % 3;
+    float m = 0.0;
+    if (a > 0.0) {
+        const float others = p[1].y * max(c[o1], c[o2]) + (1.0 - p[1].y) * min(c[o1], c[o2]);
+        m = clamp(1.0 - (c[dom] - others) / p[1].w * p[1].z, 0.0, 1.0);
+        m = clamp((m - p[2].x) / (p[2].y - p[2].x), 0.0, 1.0);
+    }
+    const float na = a * m;
+    const int view = int(p[3].y);
+    if (view == 1) return vec4(vec3(na), 1.0);
+    if (view == 2) return vec4(vec3(na < 0.02 ? 0.0 : na > 0.98 ? 1.0 : 0.5), 1.0);
+    vec3 o = c;
+    const float before = luma(o);
+    const float limit = p[1].y * max(o[o1], o[o2]) + (1.0 - p[1].y) * min(o[o1], o[o2]);
+    if (o[dom] > limit) o[dom] -= (o[dom] - limit) * p[2].z;
+    o += vec3((before - luma(o)) * p[2].w);
+    if (p[3].x > 0.0) {
+        const float edge = 4.0 * m * (1.0 - m) * p[3].x, l = luma(o);
+        o += (vec3(l) - o) * edge;
+    }
+    return vec4(o * na, na);
+}
+
 void main() {
     const ivec2 xy = ivec2(gl_FragCoord.xy);
     const int mode = int(p[0].x);
+    if (mode >= 18) {
+        const vec4 px = texelFetch(srcTex, xy, 0);
+        const float a = px.a;
+        if (a <= 0.0 && (mode != 20 || int(p[3].y) == 0)) {  // (a Screen Key's matte or status view shows it)
+            fragColor = px;
+            return;
+        }
+        const vec3 c = a > 0.0 ? px.rgb * (1.0 / a) : vec3(0.0);
+        const vec4 made = keyer(mode, c, a);
+        fragColor = p[12].x > 0.5 ? px + (made - px) * maskAt(xy, c, a) : made;
+        return;
+    }
     if (mode >= 11) {
         fragColor = graphStep(xy, mode);
         return;

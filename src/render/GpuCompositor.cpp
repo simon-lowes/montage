@@ -640,7 +640,8 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
             textures.push_back({3, lut});
             textures.push_back({4, table});
         } else if (op.kind != ColorOp::Mix) {
-            p[0] = float(int(op.kind) + 1);  // (gpucolor.frag's modes: Color Correct 2 ... Levels 9)
+            // (gpucolor.frag's modes: Color Correct 2 ... Levels 9; the keyers 18 to 20)
+            p[0] = op.kind >= ColorOp::ChromaKey ? float(18 + int(op.kind) - int(ColorOp::ChromaKey)) : float(int(op.kind) + 1);
             std::copy(op.params, op.params + 32, p + 4);  // from p[1]
             const int rows = op.tableWidth > 0 ? int(op.table.size() / (size_t(op.tableWidth) * 4)) : 0;
             if (rows > 0) {

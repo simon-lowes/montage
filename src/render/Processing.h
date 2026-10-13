@@ -22,7 +22,8 @@ namespace gpu {
 struct ColorOp;
 }
 // The GPU compositor's form of a colour effect at frame t (render/GpuCompositor.h): Color Correct, Curves, Hue Curves,
-// .cube LUTs, ASC CDL, Colour Space Transform, Invert, Black & White, Hue/Saturation and Levels, through a drawn mask
+// .cube LUTs, ASC CDL, Colour Space Transform, Invert, Black & White, Hue/Saturation, Levels and the keyers (Chroma,
+// Luma, and Screen Key without shrinking or softening its matte), through a drawn mask
 // and an HSL qualifier if it has them, appended to `out` (nothing when the effect is off or changes nothing). False for
 // any other effect or mask (people, objects, depth, Refine Edges, Show Mask), which only the CPU draws. The mask's
 // shape is drawn for a picture `width` by `height` (0: whether it could be, alone).
