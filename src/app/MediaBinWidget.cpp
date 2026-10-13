@@ -1554,8 +1554,8 @@ std::optional<ProxyOptions> MediaBinWidget::proxyOptionsDialog() {
     auto* format = new QComboBox(&dlg);
     format->setObjectName(QStringLiteral("proxyFormat"));
     format->addItem(tr("H.264 (fast seeking)"), QStringLiteral("h264"));
-    format->addItem(tr("Apple ProRes 422 Proxy (keeps HDR)"), QStringLiteral("prores_proxy"));
-    format->addItem(tr("Avid DNxHR LB"), QStringLiteral("dnxhr_lb"));
+    format->addItem(tr("ProRes 422 Proxy (keeps HDR)"), QStringLiteral("prores_proxy"));
+    format->addItem(tr("DNxHR LB"), QStringLiteral("dnxhr_lb"));
     format->addItem(tr("HEVC 10-bit (smallest, keeps HDR)"), QStringLiteral("hevc10"));
     format->setCurrentIndex(std::max(0, format->findData(appSettings().value(QStringLiteral("proxy/format"), "h264"))));
     auto* size = new QComboBox(&dlg);

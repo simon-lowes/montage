@@ -115,7 +115,7 @@ private:
     QVBoxLayout* layout_ = nullptr;
     QString signature_;
     std::vector<std::function<void()>> refreshers_;
-    int sliceVector_ = 0;  // the Colour Slice vector shown (0 Global, then Red to Magenta, then Skin)
+    int sliceVector_ = 0;  // the Hue Vectors vector shown (0 Global, then Red to Magenta, then Skin)
     int hdrZone_ = 0;  // the HDR Palette zone shown (0 Global, then Black to Specular)
 };
 

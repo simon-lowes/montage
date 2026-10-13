@@ -8314,6 +8314,15 @@ const auto seq = [this] { return state()->sequence(); };
             for (auto it = keys.begin(); it != keys.end(); ++it)
                 QCOMPARE(keymap::find(w, it.key())->shortcut().toString(QKeySequence::PortableText), it.value().toString());
         }
+        // A preset's old name still finds it, and the new name is the one remembered.
+        QVERIFY(keymap::presets().contains(QStringLiteral("Montage")) && !keymap::presets().contains(QStringLiteral("Montage (Premiere Pro)")));
+        QVERIFY(!keymap::presetKeys("Final Cut Pro").isEmpty());
+        QVERIFY(keymap::presetKeys("Final Cut Pro") == keymap::presetKeys("Final Cut Pro-style"));
+        QVERIFY(keymap::applyPreset(w, "Avid Media Composer"));
+        QCOMPARE(appSettings().value("keymapPreset").toString(), QString("Avid Media Composer-style"));
+        QVERIFY(keymap::applyPreset(w, "Montage (Premiere Pro)"));
+        QCOMPARE(appSettings().value("keymapPreset").toString(), QString("Montage"));
+        QVERIFY(!keymap::applyPreset(w, "Nothing"));
         keymap::resetAll(w);
         // Resetting brings back every key, the second ones too.
         QAction* redo = keymap::find(w, "Edit/Redo");
@@ -9743,6 +9752,10 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(job.settings.startTimecode, formatTimecode(FrameTime(std::llround(36000 * state()->sequence()->fpsValue())), state()->sequence()->fps));
         QCOMPARE(job.settings.width, 1920);
         queue->remove(job.id);
+        // A preset remembered under its old name, with its maker's name in front, comes back under its new one.
+        appSettings().setValue("export/preset", "Avid DNxHR HQ (MXF)");
+        ExportDialog again(state(), win_.get());
+        QCOMPARE(again.findChild<QComboBox*>("exportPreset")->currentText(), QStringLiteral("DNxHR HQ (MXF)"));
     }
 
     void renderQueueInTheBackground() {

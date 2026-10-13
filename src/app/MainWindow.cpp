@@ -5354,7 +5354,7 @@ void MainWindow::exportVersionsDialog() {
     loud->addItem(tr("As mixed"), 0.0);
     form->addRow(tr("Loudness:"), loud);
     auto* format = new QComboBox(&dlg);
-    for (const char* name : {"H.264 - High Quality", "H.265 / HEVC", "Apple ProRes 422 HQ"})
+    for (const char* name : {"H.264 - High Quality", "H.265 / HEVC", "ProRes 422 HQ"})
         if (findExportPreset(name)) format->addItem(QString::fromLatin1(name));
     form->addRow(tr("Format:"), format);
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
@@ -6441,7 +6441,7 @@ bool MainWindow::analyseHdrLightLevels(bool ask) {
         return edit::Result{};
     });
     const QLocale loc;
-    state_->message(pq ? tr("MaxCLL %1 nits, MaxFALL %2 nits, %3 HDR10+ scenes").arg(loc.toString(cll), loc.toString(fall)).arg(scenes.size())
+    state_->message(pq ? tr("MaxCLL %1 nits, MaxFALL %2 nits, %3 dynamic HDR metadata scenes").arg(loc.toString(cll), loc.toString(fall)).arg(scenes.size())
                        : tr("MaxCLL %1 nits, MaxFALL %2 nits").arg(loc.toString(cll), loc.toString(fall)),
                     8000);
     if (!ask) return true;
@@ -6453,7 +6453,7 @@ bool MainWindow::analyseHdrLightLevels(bool ask) {
     box.setObjectName(QStringLiteral("hdrLightLevelsDialog"));
     QString more = tr("Saved with the sequence: HDR10 exports state them (MP4 and MOV also measure what they render).");
     if (pq)
-        more += tr("\n\nHDR10+: %n scene(s) measured, used by exports with HDR10+ metadata while the cut still matches them.", "", int(scenes.size()));
+        more += tr("\n\nDynamic HDR metadata (ST 2094-40): %n scene(s) measured, used by exports with it while the cut still matches them.", "", int(scenes.size()));
     if (sequenceColorSpace(s).transfer == Transfer::Pq && cll > s.hdrPeakNits + 0.5)
         more = tr("Brighter than the %1-nit mastering peak: highlights above it will be clipped or tone mapped by displays.\n\n")
                    .arg(loc.toString(qRound(s.hdrPeakNits))) + more;

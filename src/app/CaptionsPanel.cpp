@@ -827,7 +827,7 @@ void CaptionsPanel::exportDialog() {
     const QList<QPair<QString, QString>> formats = {{tr("SubRip (*.srt)"), ".srt"},
                                                     {tr("WebVTT (*.vtt)"), ".vtt"},
                                                     {tr("Scenarist SCC, CEA-608 (*.scc)"), ".scc"},
-                                                    {tr("MacCaption MCC, CEA-608 and CTA-708 (*.mcc)"), ".mcc"},
+                                                    {tr("MCC captions, CEA-608 and CTA-708 (*.mcc)"), ".mcc"},
                                                     {tr("TTML, IMSC 1.1 (*.ttml *.xml *.dfxp)"), ".ttml"},
                                                     {tr("EBU STL (*.stl)"), ".stl"},
                                                     {tr("Advanced SubStation Alpha (*.ass *.ssa)"), ".ass"}};

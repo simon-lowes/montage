@@ -618,7 +618,7 @@ bool parseMcc(const std::string& text, Rational fps, std::vector<Caption>& out, 
         return false;
     };
     const size_t skip = text.compare(0, 3, "\xEF\xBB\xBF") == 0 ? 3 : 0;
-    if (text.compare(skip, 26, "File Format=MacCaption_MCC") != 0) return fail("Not a MacCaption MCC file");
+    if (text.compare(skip, 26, "File Format=MacCaption_MCC") != 0) return fail("Not an MCC caption file");
     Rational rate{30000, 1001};
     std::vector<std::pair<double, CcTriplet>> triplets;
     std::vector<std::pair<double, uint16_t>> pairs;

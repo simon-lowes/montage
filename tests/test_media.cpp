@@ -3004,7 +3004,7 @@ private slots:
             Clip a = makeClip(gen, mr, TrackKind::Audio, gs);
             a.duration = frames;
             QVERIFY(edit::overwrite(gen, gs, {TrackKind::Audio, 0}, a).ok);
-            ExportSettings st = findExportPreset("Apple ProRes 422")->settings;
+            ExportSettings st = findExportPreset("ProRes 422")->settings;
             st.path = video;
             std::string err;
             QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
@@ -3286,7 +3286,7 @@ private slots:
         QVERIFY(silent(decodeAudioStream(st.path, 2)) && silent(decodeAudioStream(st.path, 3)));
 
         // DNxHR in MXF keeps the sequence's size, a mono track a channel.
-        const ExportPreset* dnx = findExportPreset("Avid DNxHR HQ (MXF)");
+        const ExportPreset* dnx = findExportPreset("DNxHR HQ (MXF)");
         QVERIFY(dnx);
         st = dnx->settings;
         st.path = path("delivery-dnx.mxf");
@@ -3309,13 +3309,13 @@ private slots:
             return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object();
         };
         const QString mcpOut = QString::fromStdString(path("mcp.mxf"));
-        QJsonObject r = call({{"project", project}, {"output", mcpOut}, {"preset", "Avid DNxHR HQ (MXF)"}, {"out", "00:00:00:10"},
+        QJsonObject r = call({{"project", project}, {"output", mcpOut}, {"preset", "DNxHR HQ (MXF)"}, {"out", "00:00:00:10"},
                               {"start_timecode", "01:00:00:00"}, {"mono_tracks", 4}});
         QVERIFY2(!r.value("result").toObject().value("isError").toBool(), QJsonDocument(r).toJson().constData());
         QVERIFY(probe(mcpOut.toStdString(), streams, timecode, seconds));
         QCOMPARE(timecode, std::string("01:00:00:00"));
         QCOMPARE(streams.size(), size_t(5));
-        r = call({{"project", project}, {"output", mcpOut}, {"preset", "Avid DNxHR HQ (MXF)"}, {"start_timecode", "ten o'clock"}});
+        r = call({{"project", project}, {"output", mcpOut}, {"preset", "DNxHR HQ (MXF)"}, {"start_timecode", "ten o'clock"}});
         QVERIFY(r.contains("error") || r.value("result").toObject().value("isError").toBool());
     }
 
@@ -9239,17 +9239,26 @@ private slots:
             double tolerance;
         };
         const Want wants[] = {
-            {"Apple ProRes 422", "prores", "Standard", "yuv422p10le", "pcm_s24le", 0.012},
-            {"Apple ProRes 422 Proxy", "prores", "Proxy", "yuv422p10le", "pcm_s16le", 0.03},
-            {"Apple ProRes 4444 XQ (alpha)", "prores", "XQ", "yuva444p12le", "pcm_s24le", 0.012},  // decoded as 12-bit
-            {"Avid DNxHR SQ", "dnxhd", "DNXHR SQ", "yuv422p", "pcm_s24le", 0.02},
-            {"Avid DNxHR LB", "dnxhd", "DNXHR LB", "yuv422p", "pcm_s16le", 0.04},
-            {"Avid DNxHR HQX (10-bit)", "dnxhd", "DNXHR HQX", "yuv422p10le", "pcm_s24le", 0.012},
-            {"Avid DNxHR 444 (10-bit)", "dnxhd", "DNXHR 444", "yuv444p10le", "pcm_s24le", 0.012},
-            {"GoPro CineForm", "cfhd", "", "yuv422p10le", "pcm_s24le", 0.02},
+            {"ProRes 422", "prores", "Standard", "yuv422p10le", "pcm_s24le", 0.012},
+            {"ProRes 422 Proxy", "prores", "Proxy", "yuv422p10le", "pcm_s16le", 0.03},
+            {"ProRes 4444 XQ (alpha)", "prores", "XQ", "yuva444p12le", "pcm_s24le", 0.012},  // decoded as 12-bit
+            {"DNxHR SQ", "dnxhd", "DNXHR SQ", "yuv422p", "pcm_s24le", 0.02},
+            {"DNxHR LB", "dnxhd", "DNXHR LB", "yuv422p", "pcm_s16le", 0.04},
+            {"DNxHR HQX (10-bit)", "dnxhd", "DNXHR HQX", "yuv422p10le", "pcm_s24le", 0.012},
+            {"DNxHR 444 (10-bit)", "dnxhd", "DNXHR 444", "yuv444p10le", "pcm_s24le", 0.012},
+            {"CineForm", "cfhd", "", "yuv422p10le", "pcm_s24le", 0.02},
             {"FFV1 (lossless archive)", "ffv1", "", "yuv422p10le", "flac", 0.006},
             {"Uncompressed 10-bit (v210)", "v210", "", "yuv422p10le", "pcm_s24le", 0.006},
         };
+        // The presets' old names, with their makers' names in front, still find them (saved settings, scripts, MCP calls).
+        for (const ExportPreset& pr : exportPresets())
+            for (const char* maker : {"Apple ", "Avid ", "GoPro "}) QVERIFY2(pr.name.rfind(maker, 0) != 0, pr.name.c_str());
+        QCOMPARE(findExportPreset("Apple ProRes 422 HQ"), findExportPreset("ProRes 422 HQ"));
+        QCOMPARE(findExportPreset("Apple ProRes 4444 XQ (alpha)"), findExportPreset("ProRes 4444 XQ (alpha)"));
+        QCOMPARE(findExportPreset("Avid DNxHR HQ (MXF)"), findExportPreset("DNxHR HQ (MXF)"));
+        QCOMPARE(findExportPreset("GoPro CineForm"), findExportPreset("CineForm"));
+        QVERIFY(findExportPreset("ProRes 422 HQ") && findExportPreset("DNxHR HQ (MXF)") && findExportPreset("CineForm"));
+        QVERIFY(!findExportPreset("Apple ") && !findExportPreset("Apple Nothing"));
         std::string err;
         for (const Want& w : wants) {
             const ExportPreset* pr = findExportPreset(w.preset);
@@ -9268,18 +9277,18 @@ private slots:
         {
             Sequence odd = s;
             odd.height = 180;
-            ExportSettings st = findExportPreset("GoPro CineForm")->settings;
+            ExportSettings st = findExportPreset("CineForm")->settings;
             st.path = path("odd-cineform.mov");
             QVERIFY(!exportSequence(p, odd, st, nullptr, nullptr, &err));
             QVERIFY2(QString::fromStdString(err).contains("divisible by 8"), err.c_str());
         }
         // Transparency survives CineForm RGBA and ProRes 4444 XQ: clear round the title, solid on it.
-        for (const char* name : {"GoPro CineForm (alpha)", "Apple ProRes 4444 XQ (alpha)"}) {
+        for (const char* name : {"CineForm (alpha)", "ProRes 4444 XQ (alpha)"}) {
             ExportSettings st = findExportPreset(name)->settings;
-            st.path = path((std::string("alpha-") + (name[0] == 'G' ? "cfhd" : "xq") + ".mov").c_str());
+            st.path = path((std::string("alpha-") + (name[0] == 'C' ? "cfhd" : "xq") + ".mov").c_str());
             st.audioCodec = "none";
             QVERIFY2(exportSequence(overlay, os, st, nullptr, nullptr, &err), err.c_str());
-            if (name[0] == 'G') QCOMPARE(QString::fromStdString(info(st.path).pix), QString("gbrap12le"));
+            if (name[0] == 'C') QCOMPARE(QString::fromStdString(info(st.path).pix), QString("gbrap12le"));
             VideoDecoder dec;
             QVERIFY(dec.open(st.path));
             const Image got = toImage(*dec.frameAt(0.16));
@@ -9300,7 +9309,7 @@ private slots:
             gs.height = 180;
             gs.fps = {25, 1};
             build(gen, gs);
-            ExportSettings st = findExportPreset("Apple ProRes 422 HQ")->settings;
+            ExportSettings st = findExportPreset("ProRes 422 HQ")->settings;
             st.path = path(file.c_str());
             st.audioCodec = "none";
             if (!exportSequence(gen, gs, st, nullptr, nullptr, &err)) qFatal("%s", err.c_str());
@@ -9411,7 +9420,7 @@ private slots:
         grain.params["color"] = Param(1.0);
         c.effects.push_back(grain);
         edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
-        ExportSettings st = findExportPreset("Apple ProRes 422 HQ")->settings;
+        ExportSettings st = findExportPreset("ProRes 422 HQ")->settings;
         st.path = path("grain.mov");
         st.audioCodec = "none";
         std::string err;
@@ -13186,7 +13195,7 @@ if ui["pressed"] == "add":
         MediaItem audio = probeOrFail(gen, wav);
         gen.media.push_back(audio);
         QVERIFY(edit::placeMedia(gen, gs, audio.id, 0, 0, -1, {TrackKind::Video, 2}, {TrackKind::Audio, 0}, false).ok);
-        ExportSettings st = findExportPreset("Apple ProRes 422 HQ")->settings;
+        ExportSettings st = findExportPreset("ProRes 422 HQ")->settings;
         st.path = path("highlight-footage.mov");
         QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
 
@@ -13700,7 +13709,7 @@ if ui["pressed"] == "add":
         MediaItem audio = probeOrFail(gen, wav);
         gen.media.push_back(audio);
         QVERIFY(edit::placeMedia(gen, gs, audio.id, 0, 0, -1, {TrackKind::Video, 1}, {TrackKind::Audio, 0}, false).ok);
-        ExportSettings st = findExportPreset("Apple ProRes 422 HQ")->settings;
+        ExportSettings st = findExportPreset("ProRes 422 HQ")->settings;
         st.path = path("shorts-footage.mov");
         QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
         const std::vector<std::string> said = {"Thanks for having me, it is lovely to be here.", "We drove up this morning and the traffic was fine.",
@@ -20812,7 +20821,7 @@ if ui["pressed"] == "add":
         QVERIFY(back && std::abs(back->frames() - 48000) < 100);
         QVERIFY(std::fabs(back->samples[10000] - 0.4f) < 0.002f);
         // ProRes and DNxHR intermediates with PCM audio.
-        for (const char* name : {"Apple ProRes 422 HQ", "Avid DNxHR HQ"}) {
+        for (const char* name : {"ProRes 422 HQ", "DNxHR HQ"}) {
             ExportSettings st = findExportPreset(name)->settings;
             st.path = path(std::string(name).find("ProRes") != std::string::npos ? "out_prores.mov" : "out_dnx.mov");
             QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());

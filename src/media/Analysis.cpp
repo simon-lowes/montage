@@ -157,7 +157,7 @@ bool createSuperScaled(const std::string& source, const std::string& dest, int f
     e.params["strength"] = Param(std::clamp(strength, 0.0, 1.0) * 100);
     s.videoTracks[0].clips[0].effects.push_back(e);
     const std::string ext = dest.substr(dest.find_last_of('.') + 1);
-    const ExportPreset* pr = findExportPreset(ext == "mov" ? "Apple ProRes 422 HQ" : "H.264 - High Quality");
+    const ExportPreset* pr = findExportPreset(ext == "mov" ? "ProRes 422 HQ" : "H.264 - High Quality");
     ExportSettings st = pr ? pr->settings : ExportSettings{};
     st.path = dest;
     st.width = s.width;
