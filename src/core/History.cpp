@@ -49,11 +49,18 @@ bool isDropFrameRate(Rational fps) {
     return fps.den == 1001 && (fps.num == 30000 || fps.num == 60000);
 }
 
+// Timecode's whole frames per second: 30 for no rate, or one beyond 10000 fps (no sequence's: rounding it could
+// overflow, and frame counts with it).
+static int nominalTimecodeRate(Rational fps) {
+    const double rate = fps.toDouble();
+    const int nominal = std::isfinite(rate) && rate > 0 && rate <= 10000 ? int(std::lround(rate)) : 0;
+    return nominal > 0 ? nominal : 30;
+}
+
 std::string formatTimecode(FrameTime frame, Rational fps, bool dropFrame) {
     bool neg = frame < 0;
     if (neg) frame = -frame;
-    int nominal = int(std::lround(fps.toDouble()));
-    if (nominal <= 0) nominal = 30;
+    const int nominal = nominalTimecodeRate(fps);
     bool df = dropFrame && isDropFrameRate(fps);
     if (df) {
         // SMPTE drop-frame: skip 2 (or 4) frame numbers each minute except every tenth.
@@ -83,8 +90,7 @@ bool parseTimecode(const std::string& textIn, Rational fps, FrameTime& out) {
     for (char c : textIn)
         if (!std::isspace(static_cast<unsigned char>(c))) text += c;
     if (text.empty()) return false;
-    int nominal = int(std::lround(fps.toDouble()));
-    if (nominal <= 0) nominal = 30;
+    const int nominal = nominalTimecodeRate(fps);
 
     // Seconds: "12.5s"
     if (text.back() == 's') {

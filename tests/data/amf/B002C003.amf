@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<aces:acesMetadataFile xmlns:aces="urn:ampas:aces:amf:v2.0" xmlns:cdl="urn:ASC:CDL:v1.01" version="2.0">
+    <aces:amfInfo>
+        <aces:dateTime>
+            <aces:creationDateTime>2026-10-12T09:00:00Z</aces:creationDateTime>
+            <aces:modificationDateTime>2026-10-12T09:00:00Z</aces:modificationDateTime>
+        </aces:dateTime>
+        <aces:uuid>urn:uuid:5c1e2f6a-8d4b-4f3e-b0a7-2e9d6c4b1a03</aces:uuid>
+    </aces:amfInfo>
+    <aces:clipId>
+        <aces:clipName>Interview B</aces:clipName>
+        <aces:file>B002C003.mxf</aces:file>
+    </aces:clipId>
+    <aces:pipeline>
+        <aces:pipelineInfo>
+            <aces:dateTime>
+                <aces:creationDateTime>2026-10-12T09:00:00Z</aces:creationDateTime>
+                <aces:modificationDateTime>2026-10-12T09:00:00Z</aces:modificationDateTime>
+            </aces:dateTime>
+            <aces:uuid>urn:uuid:5c1e2f6a-8d4b-4f3e-b0a7-2e9d6c4b1a04</aces:uuid>
+            <aces:systemVersion>
+                <aces:majorVersion>2</aces:majorVersion>
+                <aces:minorVersion>0</aces:minorVersion>
+                <aces:patchVersion>0</aces:patchVersion>
+            </aces:systemVersion>
+        </aces:pipelineInfo>
+        <aces:inputTransform applied="false">
+            <aces:description>Rec.709 video brought into ACES</aces:description>
+            <aces:inverseOutputTransform>
+                <aces:transformId>urn:ampas:aces:transformId:v2.0:InvOutput.Academy.Rec709-D65_100nit_in_Rec709-D65_BT1886.a2.v1</aces:transformId>
+            </aces:inverseOutputTransform>
+        </aces:inputTransform>
+        <aces:lookTransform applied="false">
+            <aces:description>Grade 7 from the collection</aces:description>
+            <aces:cdlWorkingSpace>
+                <aces:fromCdlWorkingSpace>
+                    <aces:transformId>urn:ampas:aces:transformId:v2.0:CSC.Academy.ACEScct_to_ACES.a2.v1</aces:transformId>
+                </aces:fromCdlWorkingSpace>
+            </aces:cdlWorkingSpace>
+            <cdl:ColorCorrectionRef ref="grade7"/>
+            <aces:file>grades.ccc</aces:file>
+        </aces:lookTransform>
+        <aces:outputTransform applied="false">
+            <aces:transformId>urn:ampas:aces:transformId:v2.0:Output.Academy.Rec2100-D65_1000nit_in_Rec2100-D65_ST2084.a2.v1</aces:transformId>
+        </aces:outputTransform>
+    </aces:pipeline>
+</aces:acesMetadataFile>

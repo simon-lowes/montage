@@ -812,7 +812,7 @@ bool CaptionsPanel::exportFile(const QString& path, QString* error) const {
 void CaptionsPanel::importDialog() {
     QSettings settings = appSettings();
     const QString path = QFileDialog::getOpenFileName(this, tr("Import Captions"), settings.value("captions/dir").toString(),
-                                                      tr("Captions (*.srt *.vtt *.scc *.ttml *.xml *.dfxp *.stl *.ass *.ssa);;All files (*)"));
+                                                      tr("Captions (*.srt *.vtt *.scc *.mcc *.ttml *.xml *.dfxp *.stl *.ass *.ssa);;All files (*)"));
     if (path.isEmpty()) return;
     settings.setValue("captions/dir", QFileInfo(path).absolutePath());
     QString err;
@@ -827,6 +827,7 @@ void CaptionsPanel::exportDialog() {
     const QList<QPair<QString, QString>> formats = {{tr("SubRip (*.srt)"), ".srt"},
                                                     {tr("WebVTT (*.vtt)"), ".vtt"},
                                                     {tr("Scenarist SCC, CEA-608 (*.scc)"), ".scc"},
+                                                    {tr("MacCaption MCC, CEA-608 and CTA-708 (*.mcc)"), ".mcc"},
                                                     {tr("TTML, IMSC 1.1 (*.ttml *.xml *.dfxp)"), ".ttml"},
                                                     {tr("EBU STL (*.stl)"), ".stl"},
                                                     {tr("Advanced SubStation Alpha (*.ass *.ssa)"), ".ass"}};

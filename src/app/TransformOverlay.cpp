@@ -25,9 +25,10 @@ double cross(const QPointF& a, const QPointF& b) { return a.x() * b.y() - a.y() 
 double dot(const QPointF& a, const QPointF& b) { return a.x() * b.x() + a.y() * b.y(); }
 
 // A clip the overlay can move: a picture on a video track, not a whole-frame adjustment or a 360° view.
-bool movable(const Clip& c) {
+bool movable(const Sequence& s, const Clip& c) {
     if (!c.enabled || (c.isGenerator() && c.generator.type == "adjustment")) return false;
-    return std::none_of(c.effects.begin(), c.effects.end(), [](const Effect& e) { return e.enabled && e.type == "reframe_360"; });
+    const std::vector<const Effect*> fx = liveEffects(s, c);  // (one in a grade node switched off does nothing)
+    return std::none_of(fx.begin(), fx.end(), [](const Effect* e) { return e->type == "reframe_360"; });
 }
 
 }  // namespace
@@ -41,7 +42,7 @@ TransformOverlay::TransformOverlay(EditorState* state, ViewerWidget* viewer) : Q
 Id TransformOverlay::target() const {
     const Sequence* s = state_->sequence();
     const Clip* c = state_->primaryClip();
-    if (!s || !c || !c->contains(state_->playhead()) || !movable(*c)) return 0;
+    if (!s || !c || !c->contains(state_->playhead()) || !movable(*s, *c)) return 0;
     const auto loc = edit::locate(*s, c->id);
     if (!loc || loc->track.kind != TrackKind::Video || trackAt(*s, loc->track)->muted) return 0;
     std::array<QPointF, 4> corners;
@@ -136,7 +137,7 @@ Id TransformOverlay::clipAt(const QPointF& pos) const {
         const Track& tr = s->videoTracks[size_t(i)];
         if (tr.muted) continue;
         for (const Clip& c : tr.clips) {
-            if (!c.contains(t) || !movable(c)) continue;
+            if (!c.contains(t) || !movable(*s, c)) continue;
             std::array<QPointF, 4> corners;
             QPointF anchor;
             if (box(c.id, corners, anchor) && QPolygonF({corners[0], corners[1], corners[2], corners[3]}).containsPoint(pos, Qt::OddEvenFill))

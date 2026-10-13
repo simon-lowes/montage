@@ -1,6 +1,7 @@
 // Application integration tests: drive the real main window offscreen —
 // timeline mouse gestures, tools, undo, inspector, monitors and playback.
 #include <QtTest>
+#include <QDialog>
 #include <QPointer>
 #include <QSignalSpy>
 #include <QStandardPaths>
@@ -57,6 +58,8 @@
 #include "AutoDuckDialog.h"
 #include "Settings.h"
 #include "media/MediaPool.h"
+#include "core/Ambisonics.h"
+#include "media/Sofa.h"
 #include "AutoMixDialog.h"
 #include "CaptionsPanel.h"
 #include "CleanFeed.h"
@@ -98,6 +101,7 @@
 #include "ProjectManagerDialog.h"
 #include "MediaBinModel.h"
 #include "ScopesWidget.h"
+#include "render/Gamut.h"
 #include "LinkMediaDialog.h"
 #include "EffectPresetStore.h"
 #include "EffectsBrowser.h"
@@ -133,8 +137,11 @@
 #include "MixerPanel.h"
 #include "ControlSurface.h"
 #include "OscControl.h"
+#include "SpeedEditorControl.h"
 #include "control/Osc.h"
+#include "control/SpeedEditor.h"
 #include "core/Cdl.h"
+#include "render/Amf.h"
 #include "control/Hui.h"
 #include "control/MackieControl.h"
 #include "MulticamPanel.h"
@@ -290,6 +297,47 @@ static QImage castChartImage() {
     }
     return img;
 }
+
+// A Speed Editor as the protocol has it: it answers the challenge on feature report 6 (checking the answer) and keeps
+// what it is sent.
+class FakeSpeedEditor : public montage::HidDevice {
+public:
+    explicit FakeSpeedEditor(std::shared_ptr<std::vector<std::vector<uint8_t>>> written) : written_(std::move(written)) {}
+    int authenticated = 0;
+    bool write(const std::vector<uint8_t>& report) override {
+        written_->push_back(report);
+        return true;
+    }
+    bool sendFeature(const std::vector<uint8_t>& r) override {
+        if (r.size() != 10 || r[0] != 6) return false;
+        if (r[1] == 0) state_ = 1;
+        else if (r[1] == 1 && state_ == 1) state_ = 2;
+        else if (r[1] == 3 && state_ == 2) {
+            uint64_t got = 0;
+            for (int i = 7; i >= 0; --i) got = got << 8 | r[size_t(2 + i)];
+            state_ = got == montage::speed::authResponse(kChallenge) ? 3 : 4;
+            if (state_ == 3) ++authenticated;
+        }
+        return true;
+    }
+    bool getFeature(uint8_t id, std::vector<uint8_t>& out) override {
+        if (id != 6) return false;
+        out.assign(10, 0);
+        out[0] = 6;
+        if (state_ == 1) {
+            for (int i = 0; i < 8; ++i) out[size_t(2 + i)] = uint8_t(kChallenge >> (8 * i));
+        } else {
+            out[1] = state_ == 2 ? 2 : 4;
+            if (state_ == 3) out[2] = 88, out[3] = 2;  // 600 seconds
+        }
+        return true;
+    }
+
+private:
+    static constexpr uint64_t kChallenge = 0x0123456789abcdef;
+    std::shared_ptr<std::vector<std::vector<uint8_t>>> written_;
+    int state_ = 0;
+};
 
 class TestApp : public QObject {
     Q_OBJECT
@@ -716,6 +764,51 @@ private slots:
         QVERIFY2(aleText.contains("A001C005.mov") && aleText.contains("ASC_SOP") && aleText.contains("01:00:00:00"), qPrintable(aleText));
     }
 
+    void amfFromTheMenus() {
+        state()->newProject();
+        QVERIFY(state()->edit("Media", [&](Project& p, Sequence& s) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Video;
+            m.name = "A001C012.mov";
+            m.path = "/cards/A001C012.mov";
+            m.duration = 8;
+            m.width = 1920;
+            m.height = 1080;
+            m.fps = s.fps;
+            m.hasVideo = true;
+            p.media.push_back(m);
+            return edit::placeMedia(p, s, m.id, 0, 0, 60, {TrackKind::Video, 0}, {}, false).ok;
+        }));
+        for (const char* name : {"importAmf", "exportAmf"}) QVERIFY(win_->findChild<QAction*>(name));
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        auto theClip = [&] { return edit::clipById(*state()->sequence(), clip); };
+        const QString data = QStringLiteral(MONTAGE_TEST_DATA_DIR "/amf");
+        // Nothing selected: the clip its clip name matches, as one undo step; the sequence's space kept when asked.
+        state()->setSelection({});
+        QCOMPARE(win_->importAmf(data + "/A001C012.amf", 0), 1);
+        QCOMPARE(theClip()->effects.size(), size_t(3));
+        QCOMPARE(state()->project().findMedia(theClip()->mediaId)->colorOverride, std::string("logc3-awg3"));
+        QVERIFY(win_->statusBar()->currentMessage().contains("Bleach"));  // the look it could not carry
+        state()->undo();
+        QVERIFY(theClip()->effects.empty());
+        // Another onto the selected clip, taking its output transform's space.
+        state()->setSelection({clip});
+        QCOMPARE(win_->importAmf(data + "/B002C003.amf", 1), 1);
+        QCOMPARE(state()->sequence()->colorSpace, std::string("rec2100pq"));
+        QCOMPARE(win_->importAmf(data + "/missing.amf", 0), 0);
+        // Out again for the selected clip; without a selection, a hint.
+        const QString out = dir_.path() + "/clip.amf";
+        QCOMPARE(win_->exportAmf(out), 1);
+        AmfDocument back;
+        QVERIFY(readAmf(out.toStdString(), back));
+        QCOMPARE(back.outputSpace, std::string("rec2100pq"));
+        QCOMPARE(back.looks.size(), size_t(1));
+        state()->setSelection({});
+        win_->findChild<QAction*>("exportAmf")->trigger();
+        QTRY_VERIFY(win_->statusBar()->currentMessage().contains("Select the clips"));
+    }
+
     void controlSurfaceMackie() {
         // A stand-in for the surface's MIDI connection: what Montage sends it is kept.
         struct Recorder : MidiConnection {
@@ -1112,6 +1205,363 @@ private slots:
         osc->stop();
         osc->setFeedbackPort(0);
         QVERIFY(!osc->isRunning());
+    }
+
+    void speedEditor() {
+        using speed::Key;
+        state()->newProject();
+        // Three 50-frame shots on V1 (edits at 50 and 100) and sound on A1 over the first 60 frames.
+        QVERIFY(state()->edit("Shots", [](Project& p, Sequence& s) {
+            const char* names[] = {"A", "B", "C"};
+            for (int i = 0; i < 3; ++i) {
+                Clip c = makeGeneratorClip(p, "color", 50);
+                c.name = names[i];
+                c.start = 50 * i;
+                c.sourceIn = 20;
+                edit::overwrite(p, s, V1, c);
+            }
+            return true;
+        }));
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id jfk = ids[0];
+        QVERIFY(state()->apply("Sound", [jfk](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, jfk, 0, 0, 60, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false, false, true);
+        }));
+        auto clip = [&](const char* name) { return clipNamed(*state()->sequence(), name); };
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        SpeedEditorControl* se = win_->speedEditor();
+        QVERIFY(se);
+        se->setEnabled(false);  // (no looking for real devices)
+
+        // Every key's command is one the menus have.
+        for (Key k : speed::allKeys())
+            for (const QString& what : {SpeedEditorControl::defaultBinding(k), se->secondBinding(k)})
+                if (!what.isEmpty() && !what.startsWith("speed:")) QVERIFY2(keymap::find(win_.get(), what), qPrintable(what));
+
+        // Plugged in: authenticated, the wheel set to jog and its light on.
+        auto written = std::make_shared<std::vector<std::vector<uint8_t>>>();
+        auto* fake = new FakeSpeedEditor(written);
+        HidDeviceInfo info;
+        info.vendor = speed::kVendor;
+        info.product = speed::kSpeedEditor;
+        QString err;
+        QVERIFY2(se->attach(std::unique_ptr<HidDevice>(fake), info, &err), qPrintable(err));
+        QVERIFY(se->isConnected());
+        QCOMPARE(fake->authenticated, 1);
+        QVERIFY(se->deviceName().contains("Speed Editor"));
+        auto sent = [&](const std::vector<uint8_t>& r) { return std::find(written->begin(), written->end(), r) != written->end(); };
+        QVERIFY(sent(speed::jogModeReport(speed::JogMode::Relative2)));
+        QCOMPARE(se->jogLeds(), speed::jogLedBit(Key::Jog));
+        QVERIFY(sent(speed::jogLedReport(speed::jogLedBit(Key::Jog))));
+        // Snapping is on, so SNAP is lit; the edit nearest the playhead (0) has no transition, so CUT is.
+        QVERIFY(se->leds() & speed::ledBit(Key::Snap));
+        QVERIFY(se->leds() & speed::ledBit(Key::Cut));
+        QVERIFY(se->renew());
+        QCOMPARE(fake->authenticated, 2);
+
+        auto keys = [](std::initializer_list<Key> held) {
+            std::vector<uint8_t> r(13, 0);
+            r[0] = 4;
+            size_t i = 0;
+            for (Key k : held) {
+                r[1 + i * 2] = uint8_t(k);
+                r[2 + i * 2] = uint8_t(uint16_t(k) >> 8);
+                ++i;
+            }
+            return r;
+        };
+        auto press = [&](Key k) {
+            se->feed(keys({k}));
+            se->feed(keys({}));
+        };
+        auto wheel = [&](speed::JogMode mode, int32_t v) {
+            se->feed({3, uint8_t(mode), uint8_t(v), uint8_t(v >> 8), uint8_t(v >> 16), uint8_t(v >> 24), 0});
+        };
+        auto apart = [] { QTest::qWait(450); };  // (pressed again later: not a double press)
+
+        // IN at the playhead; IN twice clears it.
+        state()->setPlayhead(10);
+        program->seek(10);
+        press(Key::In);
+        QCOMPARE(state()->sequence()->inPoint, FrameTime(10));
+        apart();
+        press(Key::In);
+        press(Key::In);
+        QCOMPARE(state()->sequence()->inPoint, FrameTime(-1));
+
+        // The wheel: a frame a step (360), backwards too; SCRL a quarter second a step.
+        wheel(speed::JogMode::Relative2, 720);
+        QTRY_COMPARE(state()->playhead(), FrameTime(12));
+        wheel(speed::JogMode::Relative2, -200);
+        wheel(speed::JogMode::Relative2, -200);  // (steps add up)
+        QTRY_COMPARE(state()->playhead(), FrameTime(11));
+        wheel(speed::JogMode::Absolute, 3000);  // (absolute values are the shuttle's: ignored)
+        QCOMPARE(state()->playhead(), FrameTime(11));
+        press(Key::Scroll);
+        QCOMPARE(se->jogLeds(), speed::jogLedBit(Key::Scroll));
+        const double fps = state()->sequence()->fpsValue();
+        wheel(speed::JogMode::Relative2, 360);
+        QTRY_COMPARE(state()->playhead(), FrameTime(11 + std::lround(fps / 4)));
+        // SHTL: by how far it is turned, either way; back to the middle stops.
+        press(Key::Shuttle);
+        QVERIFY(sent(speed::jogModeReport(speed::JogMode::AbsoluteDeadZero)));
+        QCOMPARE(SpeedEditorControl::shuttleSpeed(30), 0.0);
+        QCOMPARE(SpeedEditorControl::shuttleSpeed(1100), 1.0);
+        QCOMPARE(SpeedEditorControl::shuttleSpeed(-4096), -32.0);
+        wheel(speed::JogMode::AbsoluteDeadZero, 1100);
+        QVERIFY(program->isPlaying());
+        QCOMPARE(program->speed(), 1.0);
+        wheel(speed::JogMode::AbsoluteDeadZero, -3000);
+        QCOMPARE(program->speed(), -8.0);
+        wheel(speed::JogMode::AbsoluteDeadZero, 0);
+        QVERIFY(!program->isPlaying());
+        wheel(speed::JogMode::AbsoluteDeadZero, 1100);
+        QVERIFY(program->isPlaying());
+        // Another monitor picked: the one shuttling stops (and the wheel shuttles the one picked).
+        press(Key::Source);
+        QVERIFY(!program->isPlaying());
+        press(Key::Timeline);
+        wheel(speed::JogMode::AbsoluteDeadZero, 1100);
+        QVERIFY(program->isPlaying());
+        // Stopped some other way, STOP/PLAY plays at once.
+        program->pause();
+        apart();
+        press(Key::StopPlay);
+        QVERIFY(program->isPlaying());
+        apart();
+        press(Key::StopPlay);
+        QVERIFY(!program->isPlaying());
+        wheel(speed::JogMode::AbsoluteDeadZero, 2000);
+        QVERIFY(program->isPlaying());
+        press(Key::Jog);  // leaving the shuttle stops it
+        QVERIFY(!program->isPlaying());
+        QCOMPARE(se->jogLeds(), speed::jogLedBit(Key::Jog));
+        // STOP/PLAY.
+        press(Key::StopPlay);
+        QVERIFY(program->isPlaying());
+        apart();
+        press(Key::StopPlay);
+        QVERIFY(!program->isPlaying());
+
+        // TRIM IN: the edit at 50, its incoming side, trimmed by the wheel; ESC ends it.
+        state()->setPlayhead(48);
+        program->seek(48);
+        press(Key::TrimIn);
+        QVERIFY(win_->trimEdit());
+        QCOMPARE(win_->trimEdit()->side, 2);
+        wheel(speed::JogMode::Relative2, 360);
+        QCOMPARE(clip("B")->duration, FrameTime(49));
+        press(Key::Escape);
+        QVERIFY(!win_->trimEdit());
+        state()->undo();
+        QCOMPARE(clip("B")->duration, FrameTime(50));
+        // ROLL: both sides.
+        press(Key::Roll);
+        QCOMPARE(win_->trimEdit()->side, 0);
+        wheel(speed::JogMode::Relative2, -360);
+        QCOMPARE(clip("A")->end(), FrameTime(49));
+        QCOMPARE(clip("B")->start, FrameTime(49));
+        apart();
+        press(Key::Escape);
+        QVERIFY(!win_->trimEdit());
+        // ESC twice: Undo (the roll back).
+        press(Key::Escape);
+        QCOMPARE(clip("A")->end(), FrameTime(50));
+
+        // SLIP SRC: the clip after the nearest edit slips (one undo step however far); ESC lets it go.
+        state()->setPlayhead(48);
+        program->seek(48);
+        apart();
+        press(Key::SlipSource);
+        wheel(speed::JogMode::Relative2, -360 * 3);
+        wheel(speed::JogMode::Relative2, -360 * 2);
+        QCOMPARE(clip("B")->sourceIn, 15.0);
+        QCOMPARE(clip("A")->sourceIn, 20.0);
+        state()->undo();
+        QCOMPARE(clip("B")->sourceIn, 20.0);
+        press(Key::SlipDest);
+        wheel(speed::JogMode::Relative2, 360);
+        QCOMPARE(clip("A")->sourceIn, 21.0);
+        apart();
+        press(Key::Escape);
+        const FrameTime at = state()->playhead();
+        wheel(speed::JogMode::Relative2, 360);
+        QTRY_COMPARE(state()->playhead(), at + 1);  // the wheel moves the playhead again
+        QCOMPARE(clip("A")->sourceIn, 21.0);
+        state()->undo();
+        QCOMPARE(clip("A")->sourceIn, 20.0);
+        // In SHTL a slip takes the wheel's turns too (the device turned relative until ESC), and a slow slip is still
+        // one undo step.
+        press(Key::Shuttle);
+        apart();
+        written->clear();
+        press(Key::SlipSource);
+        QVERIFY(sent(speed::jogModeReport(speed::JogMode::Relative2)));
+        wheel(speed::JogMode::AbsoluteDeadZero, 2000);  // (sent before the device changed mode: ignored)
+        QVERIFY(!program->isPlaying());
+        wheel(speed::JogMode::Relative2, 720);
+        QCOMPARE(clip("B")->sourceIn, 22.0);
+        QTest::qWait(1600);
+        wheel(speed::JogMode::Relative2, 360);
+        QCOMPARE(clip("B")->sourceIn, 23.0);
+        state()->undo();
+        QCOMPARE(clip("B")->sourceIn, 20.0);
+        apart();
+        written->clear();
+        press(Key::Escape);
+        QVERIFY(sent(speed::jogModeReport(speed::JogMode::AbsoluteDeadZero)));
+        QVERIFY(!program->isPlaying());
+        press(Key::Jog);
+        // ROLL twice slides the clip the playhead was in (B), not the one it moved to at the edit (C).
+        state()->setPlayhead(98);
+        program->seek(98);
+        apart();
+        press(Key::Roll);
+        press(Key::Roll);
+        QVERIFY(!win_->trimEdit());
+        wheel(speed::JogMode::Relative2, 360);
+        QCOMPARE(clip("B")->start, FrameTime(51));
+        QCOMPARE(clip("A")->end(), FrameTime(51));
+        state()->undo();
+        QCOMPARE(clip("B")->start, FrameTime(50));
+        apart();
+        press(Key::Escape);
+
+        // DIS, SMTH CUT and CUT at the nearest edit (50), lit to match; TRANS DUR held lengthens it.
+        state()->setPlayhead(48);
+        program->seek(48);
+        auto transitions = [&] { return trackAt(*state()->sequence(), V1)->transitions; };
+        press(Key::Dissolve);
+        QCOMPARE(transitions().size(), size_t(1));
+        QCOMPARE(transitions()[0].type, std::string("cross_dissolve"));
+        QCOMPARE(transitions()[0].clipA, clip("A")->id);
+        QCOMPARE(transitions()[0].clipB, clip("B")->id);
+        QVERIFY(se->leds() & speed::ledBit(Key::Dissolve));
+        QVERIFY(!(se->leds() & speed::ledBit(Key::Cut)));
+        const FrameTime length = transitions()[0].duration;
+        se->feed(keys({Key::TransitionDuration}));
+        wheel(speed::JogMode::Relative2, 720);
+        se->feed(keys({}));
+        QCOMPARE(transitions()[0].duration, length + 2);
+        QCOMPARE(state()->playhead(), FrameTime(48));  // (held, the wheel did not move it)
+        press(Key::SmoothCut);
+        QCOMPARE(transitions()[0].type, std::string("smooth_cut"));
+        QCOMPARE(transitions()[0].duration, length + 2);  // the length kept
+        QVERIFY(se->leds() & speed::ledBit(Key::SmoothCut));
+        press(Key::Cut);
+        QVERIFY(transitions().empty());
+        QVERIFY(se->leds() & speed::ledBit(Key::Cut));
+        // TRANS waits for a second press, but another key coming first runs it at once: here CUT takes it off again.
+        state()->clearSelection();
+        apart();
+        press(Key::Transition);
+        press(Key::Cut);
+        QTest::qWait(450);
+        QVERIFY(transitions().empty());
+        // A dialog open: the keys wait.
+        {
+            QDialog dialog(win_.get());
+            dialog.setModal(true);
+            dialog.show();
+            QTRY_VERIFY(QApplication::activeModalWidget());
+            apart();
+            press(Key::Dissolve);
+            QVERIFY(transitions().empty());
+        }
+
+        // AUDIO LEVEL held: the sound at the playhead, half a dB a step, one undo step.
+        state()->setPlayhead(20);
+        const Clip* sound = edit::clipAt(*state()->sequence(), A1, 20);
+        QVERIFY(sound);
+        const Id soundId = sound->id;
+        auto gain = [&] { return edit::clipById(*state()->sequence(), soundId)->audio.p("gain_db", 0, 0); };
+        se->feed(keys({Key::AudioLevel}));
+        wheel(speed::JogMode::Relative2, 360);
+        wheel(speed::JogMode::Relative2, 360);
+        se->feed(keys({}));
+        QCOMPARE(gain(), 1.0);
+        state()->undo();
+        QCOMPARE(gain(), 0.0);
+        // AUDIO LEVEL twice: a marker.
+        const size_t markers = state()->sequence()->markers.size();
+        apart();
+        press(Key::AudioLevel);
+        press(Key::AudioLevel);
+        QCOMPARE(state()->sequence()->markers.size(), markers + 1);
+
+        // Switches lit while on: SNAP, VIDEO ONLY and AUDIO ONLY (one turns the other off).
+        press(Key::Snap);
+        QVERIFY(!state()->snapping());
+        QVERIFY(!(se->leds() & speed::ledBit(Key::Snap)));
+        apart();
+        press(Key::Snap);
+        QVERIFY(state()->snapping());
+        press(Key::VideoOnly);
+        QVERIFY(state()->sourceVideo() && !state()->sourceAudio());
+        QVERIFY(se->leds() & speed::ledBit(Key::VideoOnly));
+        press(Key::AudioOnly);
+        QVERIFY(!state()->sourceVideo() && state()->sourceAudio());
+        QVERIFY(se->leds() & speed::ledBit(Key::AudioOnly));
+        QVERIFY(!(se->leds() & speed::ledBit(Key::VideoOnly)));
+        apart();
+        press(Key::AudioOnly);
+        QVERIFY(state()->sourceVideo() && state()->sourceAudio());
+        QVERIFY(!(se->leds() & (speed::ledBit(Key::VideoOnly) | speed::ledBit(Key::AudioOnly))));
+        // LIVE O/WR latches; no multicam clip here, so no angle is lit.
+        press(Key::LiveOverwrite);
+        QVERIFY(se->liveOverwrite() && (se->leds() & speed::ledBit(Key::LiveOverwrite)));
+        press(Key::Cam2);
+        QVERIFY(!(se->leds() & speed::ledBit(Key::Cam2)));
+        apart();
+        press(Key::LiveOverwrite);
+        QVERIFY(!se->liveOverwrite());
+        // The battery, as reported.
+        se->feed({7, 1, 55});
+        QCOMPARE(se->batteryLevel(), 55);
+        QVERIFY(se->charging());
+
+        // Any key can do any menu command, and back.
+        se->setBinding(Key::Cam1, "Sequence/Add Marker");
+        QCOMPARE(se->bindingChanges().value("cam1").toString(), QString("Sequence/Add Marker"));
+        state()->setPlayhead(30);
+        press(Key::Cam1);
+        QCOMPARE(state()->sequence()->markers.size(), markers + 2);
+        se->setBinding(Key::In, "");  // nothing
+        press(Key::In);
+        QCOMPARE(state()->sequence()->inPoint, FrameTime(-1));
+        QCOMPARE(se->secondBinding(Key::In), QString());  // (not its own thing: nothing twice either)
+        se->setBinding(Key::Cam1, SpeedEditorControl::defaultBinding(Key::Cam1));
+        se->setBinding(Key::In, SpeedEditorControl::defaultBinding(Key::In));
+        QVERIFY(se->bindingChanges().isEmpty());
+        se->setBinding(Key::Split, "Nowhere/Nothing");
+        press(Key::Split);  // (said, not done)
+        QVERIFY(win_->statusBar()->currentMessage().contains("Nowhere"));
+        se->setBindingChanges({});
+
+        // The keys dialog: a key given another command, then all put back.
+        QDialog* keysDlg = win_->speedEditorKeysDialog();
+        QVERIFY(keysDlg);
+        auto* cam3 = keysDlg->findChild<QComboBox*>("speedKey_cam3");
+        QVERIFY(cam3);
+        QCOMPARE(cam3->currentData().toString(), QString("speed:cam3"));
+        cam3->setCurrentIndex(cam3->findData("Clip/Add Edit"));
+        QCOMPARE(se->binding(Key::Cam3), QString("Clip/Add Edit"));
+        keysDlg->findChild<QPushButton*>("speedEditorReset")->click();
+        QCOMPARE(se->binding(Key::Cam3), QString("speed:cam3"));
+        QVERIFY(se->bindingChanges().isEmpty());
+        keysDlg->close();
+        // Edit > Control Surface shows it.
+        QDialog* dlg = win_->controlSurfaceDialog();
+        QVERIFY(dlg->findChild<QLabel*>("speedEditorStatus")->text().contains("Speed Editor"));
+        QVERIFY(dlg->findChild<QLabel*>("speedEditorStatus")->text().contains("55"));
+        // Unplugged.
+        se->detach();
+        QVERIFY(!se->isConnected());
+        QVERIFY(!dlg->findChild<QLabel*>("speedEditorStatus")->text().contains("Connected"));
+        dlg->close();
+        appSettings().remove("speedEditor/bindings");
+        state()->newProject();
     }
 
     void controlSurfaceHui() {
@@ -2120,7 +2570,7 @@ private slots:
             if (m->mode() == MonitorPanel::Mode::Program) program = m;
         QVERIFY(program);
         auto* combo = program->findChild<QComboBox*>("exposureView");
-        QVERIFY(combo && combo->count() == 4);
+        QVERIFY(combo && combo->count() == 6);
         state()->setPlayhead(10);
         QTRY_VERIFY(!program->viewer()->image().isNull());
         const QImage frame = program->viewer()->image();
@@ -2132,6 +2582,67 @@ private slots:
         QCOMPARE(program->viewer()->image(), frame);
         combo->setCurrentIndex(0);
         QCOMPARE(program->viewer()->shownImage(), program->viewer()->image());
+        // Out of Gamut on a Rec.709 sequence: nothing it delivers is outside Rec.709.
+        combo->setCurrentIndex(int(ExposureView::OutOfGamut709));
+        win_->findChild<PlaybackController*>("programPlayback")->requestFrame();
+        QTest::qWait(300);
+        QCOMPARE(program->viewer()->shownImage(), program->viewer()->image().convertToFormat(QImage::Format_RGB32));
+        combo->setCurrentIndex(0);
+    }
+
+    void gamutScopeAndChecks() {
+        // A Rec.2020 frame: the left half its pure green (outside Rec.709 and P3), the right half grey.
+        QImage frame(160, 90, QImage::Format_RGBA64);
+        for (int y = 0; y < 90; ++y)
+            for (int x = 0; x < 160; ++x)
+                frame.setPixelColor(x, y, x < 80 ? QColor::fromRgba64(0, 65535, 0, 65535) : QColor::fromRgba64(30000, 30000, 30000, 65535));
+        ScopesWidget scopes;
+        scopes.resize(640, 420);
+        scopes.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&scopes));
+        scopes.setMode(ScopesWidget::Mode::Chromaticity);
+        auto* cie = scopes.findChild<QComboBox*>("scopeCie");
+        QVERIFY(cie && cie->isVisible());
+        scopes.setSignal(frame, 0, "rec2020", 1000);
+        QTRY_VERIFY(scopes.outsideRec709() >= 0);
+        QVERIFY2(std::fabs(scopes.outsideRec709() - 0.5) < 0.01 && std::fabs(scopes.outsideP3() - 0.5) < 0.01,
+                 qPrintable(QString("%1 %2").arg(scopes.outsideRec709()).arg(scopes.outsideP3())));
+        // Plotted where the colours are: Rec.2020's green at (0.170, 0.797), grey at D65; in u'v' too.
+        const int half = 160 * 90 / 2;
+        QVERIFY(scopes.cieSamplesNear(0.170, 0.797, 0.01) > half * 9 / 10);
+        QVERIFY(scopes.cieSamplesNear(0.3127, 0.3290, 0.01) > half * 9 / 10);
+        cie->setCurrentIndex(1);
+        QVERIFY(scopes.cieUv());
+        const Xy greenUv = xyToUv({0.170, 0.797});
+        QVERIFY(scopes.cieSamplesNear(greenUv.x, greenUv.y, 0.01) > half * 9 / 10);
+        QVERIFY(scopes.cieSamplesNear(0.170, 0.797, 0.01) < half / 10);
+        QVERIFY(!scopes.grab().toImage().isNull());
+        // Rec.709 frames are all inside.
+        QImage sdr(160, 90, QImage::Format_RGB32);
+        sdr.fill(qRgb(255, 0, 0));
+        scopes.setFrame(sdr, 1);
+        QTRY_COMPARE(scopes.outsideRec709(), 0.0);
+        QCOMPARE(scopes.outsideP3(), 0.0);
+        scopes.setMode(ScopesWidget::Mode::Waveform);
+        QVERIFY(!cie->isVisible());
+
+        // Out of gamut on a monitor: the green striped, the grey left; only with the frame's own signal.
+        QImage picture(160, 90, QImage::Format_RGB32);
+        picture.fill(qRgb(90, 90, 90));
+        const QImage marked = gamutView(picture, frame, "rec2020", Primaries::Bt709);
+        int left = 0, right = 0;
+        for (int y = 0; y < 90; ++y)
+            for (int x = 0; x < 160; ++x) (x < 80 ? left : right) += marked.pixel(x, y) != picture.pixel(x, y);
+        QCOMPARE(left, half);
+        QCOMPARE(right, 0);
+        QCOMPARE(gamutView(picture, frame, "rec2020", Primaries::Bt2020), picture);
+        ViewerWidget viewer;
+        viewer.setImage(picture, 5);
+        viewer.setSignal(frame, 5, "rec2020");
+        viewer.setExposureView(int(ExposureView::OutOfGamut709));
+        QCOMPARE(viewer.shownImage(), marked);
+        viewer.setSignal(frame, 6, "rec2020");  // (another frame's)
+        QCOMPARE(viewer.shownImage(), picture);
     }
 
     void sequenceTabs() {
@@ -6235,6 +6746,52 @@ private slots:
         state()->newProject();
     }
 
+    void colorSliceInInspector() {
+        // Colour Slice shows one vector at a time: Global's settings, then a hue's own, then Skin's with its centre.
+        QImage frame(64, 36, QImage::Format_RGB32);
+        frame.fill(QColor(160, 60, 40));
+        const QString png = dir_.path() + "/slice.png";
+        QVERIFY(frame.save(png));
+        state()->newProject();
+        const auto ids = state()->importFiles({png});
+        QCOMPARE(ids.size(), size_t(1));
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        });
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        state()->edit("Slice", [clip](Project& p, Sequence& s) {
+            edit::clipById(s, clip)->effects.push_back(makeEffect(p, "color_slice"));
+            return true;
+        });
+        state()->setSelection({clip}, false);
+        win_->findChild<QDockWidget*>("inspector")->show();
+        win_->findChild<QDockWidget*>("inspector")->raise();
+        QApplication::processEvents();
+        auto vector = [&]() -> QComboBox* {
+            for (auto* w : win_->findChildren<QComboBox*>("sliceVector"))
+                if (w->isVisibleTo(win_.get())) return w;
+            return nullptr;
+        };
+        auto shown = [&](const QString& text) {
+            for (QLabel* l : win_->findChildren<QLabel*>())
+                if (l->isVisibleTo(win_.get()) && l->text() == text) return true;
+            return false;
+        };
+        QVERIFY(vector());
+        QCOMPARE(vector()->count(), 8);
+        QVERIFY(shown("Density") && shown("Depth"));
+        QVERIFY(!shown("Red Density") && !shown("Skin Centre (°)"));
+        vector()->setCurrentIndex(1);
+        QTRY_VERIFY(shown("Red Density"));
+        QVERIFY(shown("Red Hue (°)") && !shown("Depth") && !shown("Skin Centre (°)"));
+        vector()->setCurrentIndex(7);
+        QTRY_VERIFY(shown("Skin Centre (°)"));
+        QVERIFY(shown("Skin Density") && shown("Skin Width (°)") && !shown("Red Density"));
+        QCOMPARE(vector()->currentText(), QString("Skin"));
+        vector()->setCurrentIndex(0);
+        QTRY_VERIFY(shown("Depth"));
+    }
+
     void gradingCurvesWheelsAndCompare() {
         auto mouse = [](QWidget* w, QEvent::Type type, QPointF pos, Qt::MouseButtons held) {
             QMouseEvent ev(type, pos, w->mapToGlobal(pos), type == QEvent::MouseMove ? Qt::NoButton : Qt::LeftButton, held, Qt::NoModifier);
@@ -8423,6 +8980,75 @@ const auto seq = [this] { return state()->sequence(); };
         binaural->trigger();
         QVERIFY(program->controller()->ambisonicBinaural());
         appSettings().remove("playback/ambisonicBinaural");
+        state()->newProject();
+    }
+
+    void higherOrderAmbisonicsUi() {
+        // A third-order field (16 channels) as a WAV, which does not mark it as one.
+        const QString field = dir_.filePath("field-hoa3.wav");
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.fps = Rational{25, 1};
+            gs.audioLayout = "ambix3";
+            MediaItem speech;
+            QVERIFY(probeMedia(MONTAGE_TEST_DATA_DIR "/jfk.wav", speech));
+            speech.id = gen.newId();
+            gen.media.push_back(speech);
+            QVERIFY(edit::placeMedia(gen, gs, speech.id, 0, 0, 25, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            ExportSettings st = findExportPreset("Audio - WAV 24-bit")->settings;
+            st.path = field.toStdString();
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({field});
+        QCOMPARE(ids.size(), size_t(1));
+        QCOMPARE(state()->project().findMedia(ids[0])->channels, 16);
+        // Marked ambisonic from the media bin: to the highest order its channels hold.
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        QVERIFY(bin->setMediaAmbisonic(ids, kMaxAmbisonicOrder));
+        QCOMPARE(state()->project().findMedia(ids[0])->ambisonic, 3);
+        QVERIFY(bin->setMediaAmbisonic(ids, 1));
+        QCOMPARE(state()->project().findMedia(ids[0])->ambisonic, 1);
+        // Sequence Settings offers second- and third-order mixes.
+        {
+            SequenceSettingsDialog dlg(win_.get());
+            auto* layouts = dlg.findChild<QComboBox*>("audioLayout");
+            QVERIFY(layouts && layouts->findData("ambix2") >= 0 && layouts->findData("ambix3") >= 0);
+            NewSequenceSpec spec;
+            spec.audioLayout = "ambix3";
+            dlg.setSpec(spec);
+            QCOMPARE(dlg.spec().audioLayout, std::string("ambix3"));
+        }
+        // Playback › Ambisonic Monitoring › the head heard through: the model, SADIE II's KU100, or a SOFA file.
+        auto* head = win_->findChild<QAction*>("hrtfHead");
+        auto* ku100 = win_->findChild<QAction*>("hrtfKu100");
+        auto* file = win_->findChild<QAction*>("hrtfFile");
+        auto* menu = win_->findChild<QMenu*>("ambisonicMonitorMenu");
+        QVERIFY(head && ku100 && file && menu);
+        QCOMPARE(file->isEnabled(), sofaSupported());
+        QVERIFY(head->isChecked() && binauralHrtf().empty());
+        const QString sofa = QStringLiteral(MONTAGE_TEST_DATA_DIR "/sofa/small.sofa");
+        if (!sofaSupported()) {
+            QVERIFY(!win_->setBinauralHrtfChoice(sofa, true));
+            QSKIP("Built without libmysofa");
+        }
+        QVERIFY(win_->setBinauralHrtfChoice(sofa, true));
+        QCOMPARE(binauralHrtf(), sofa.toStdString());
+        QCOMPARE(appSettings().value("playback/binauralHrtf").toString(), sofa);
+        QMetaObject::invokeMethod(menu, "aboutToShow");
+        QVERIFY(file->isChecked() && !head->isChecked() && file->text().contains("small.sofa"));
+        // A file that is not one is refused, the choice kept.
+        QVERIFY(!win_->setBinauralHrtfChoice(field, true));
+        QCOMPARE(binauralHrtf(), sofa.toStdString());
+        // The KU100 when downloaded (not asked for here).
+        QCOMPARE(win_->setBinauralHrtfChoice("ku100", true), sadieKu100Pack().installed());
+        head->trigger();
+        QVERIFY(binauralHrtf().empty());
+        QMetaObject::invokeMethod(menu, "aboutToShow");
+        QVERIFY(head->isChecked() && !file->isChecked() && !ku100->isChecked());
+        appSettings().remove("playback/binauralHrtf");
         state()->newProject();
     }
 

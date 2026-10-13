@@ -1,9 +1,11 @@
 // Montage — renders a sequence frame (video) and mixes sequence audio.
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "Stereo.h"
@@ -14,6 +16,25 @@
 class QImage;
 
 namespace montage {
+
+// What kept a frame from being rendered in full: an effect that takes seconds a frame left out of a view that cannot wait,
+// or one whose model is missing or failed. Such a frame is not final: the render cache does not keep it, and an export
+// fails with the reason.
+struct RenderIssues {
+    std::atomic<bool> incomplete{false};
+    void note(const std::string& why) {
+        std::lock_guard lock(m_);
+        if (!incomplete.exchange(true)) reason_ = why;
+    }
+    std::string reason() const {
+        std::lock_guard lock(m_);
+        return reason_;
+    }
+
+private:
+    mutable std::mutex m_;
+    std::string reason_;
+};
 
 struct RenderOptions {
     double scale = 1.0;        // output size relative to the sequence (preview resolution)
@@ -30,6 +51,13 @@ struct RenderOptions {
     int eye = 0;               // stereoscopic 3D: the eye rendered (0 left, 1 right)
     // How renderProgramFrame shows a stereoscopic sequence's two eyes (render/Stereo.h); flat sequences ignore it.
     StereoView stereoView = StereoView::Left;
+    // Effects that take seconds a frame (Motion Deblur) run in deliveries (highQuality) and when this is set (rendering
+    // previews ahead); otherwise a result already made for the frame is used, else the frame goes without them.
+    bool slowEffects = false;
+    // Program frames drawn on the GPU (render/GpuCompositor.h) where it can draw them, the CPU otherwise.
+    bool gpu = false;
+    RenderIssues* issues = nullptr;               // told when a frame is not rendered in full
+    const std::atomic<bool>* cancel = nullptr;    // stops a slow effect part way (the frame is then not final)
 };
 
 // Composites all video tracks of `seq` at timeline frame `t`.
@@ -37,11 +65,17 @@ struct RenderOptions {
 // nothing is on screen; call flattenOver() to put it over black.
 Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o);
 
+// The clip's effects that take part, in order: its own that are on and outside its grade graph or in a node of it that
+// is on and feeds the output, then the effects of the shared nodes it shows there.
+std::vector<const Effect*> liveEffects(const Sequence& seq, const Clip& c);
+
 // The video tracks a Track Matte Key hides at t (they are its mattes, not seen themselves).
 std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t);
 
 // Same, flattened over black — what the program monitor and exports show.
 Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o);
+// Same as 8-bit RGBA (as toRgba8 makes it), for showing: from the GPU without a float frame in between when o.gpu.
+QImage renderProgramFrameRgba8(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o);
 
 // Maps between a clip's own frame (u, v as fractions of its media frame, as
 // masks use) and the sequence frame (pixels) at timeline frame t, following
@@ -133,17 +167,18 @@ private:
     // `rate` overrides the sequence's sample rate (nested sequences mix at the outer rate);
     // `onlyTrack` mixes that audio track alone (a multicam clip's audio angle).
     // `channels` is 2, or the sequence layout's count for a surround mix (depth 0 only; an ambisonic sequence nested in
-    // an ambisonic mix is mixed as its four-channel field).
+    // an ambisonic mix is mixed as its field).
     void mixInto(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
                  std::vector<MeterLevels>* trackLevels, int depth, int rate = 0, int onlyTrack = -1, int channels = 2);
     // Runs an effect chain over an interleaved stereo block; DSP state is kept per (owner, effect).
     void processChain(const std::vector<Effect>& chain, Id owner, FrameTime lt, double sr, float* buf, int frames);
-    // Sums a track's clips over [start, start + frames) into trackBuf; false if none plays. With `trackField` (an
-    // ambisonic mix), ambisonic clips (and nested ambisonic sequences) add their turned field there (four channels)
-    // over [fieldStart, fieldStart + frames) instead of being heard as stereo: the field passes no stereo inserts, so it
-    // is read where the mix after them is (the master's latency ahead) rather than as far ahead as the track's sound.
+    // Sums a track's clips over [start, start + frames) into trackBuf; false if none plays. With `trackField` (a
+    // surround mix, `fieldChannels` wide), ambisonic clips (and nested ambisonic sequences) add their turned field
+    // there (an ambisonic mix's channels, or decoded to a speaker layout's) over [fieldStart, fieldStart + frames)
+    // instead of being heard as stereo: the field passes no stereo inserts, so it is read where the mix after them is
+    // (the master's latency ahead) rather than as far ahead as the track's sound.
     bool mixTrackClips(const Project& p, const Sequence& seq, const Track& track, int64_t start, int frames, double sr,
-                       int depth, float* trackBuf, float* trackField = nullptr, int64_t fieldStart = 0);
+                       int depth, float* trackBuf, float* trackField = nullptr, int64_t fieldStart = 0, int fieldChannels = 0);
     // Latency (samples) of a chain's plugins, loading them if needed; and the largest in a sequence.
     int chainLatency(const std::vector<Effect>& chain, Id owner, double sr);
     int maxLatency(const Sequence& seq, double sr);
@@ -177,8 +212,15 @@ private:
     bool offlineProxies_ = false;
     std::vector<bool> mask_, lfeOnly_;
     bool ambisonicBinaural_ = false;
-    std::map<Id, std::unique_ptr<FoaBinaural>> binaural_;  // per ambisonic clip heard binaurally
-    std::unique_ptr<FoaBinaural> monitor_;                  // an ambisonic sequence heard binaurally
+    struct Binaural {
+        std::unique_ptr<AmbisonicBinaural> renderer;
+        std::shared_ptr<const Hrirs> hrirs;  // what it was made with (null: the spherical head)
+        uint64_t generation = 0;  // of the HRTF chosen (media/Sofa.h) when it was last checked
+    };
+    // The renderer in `slot`, made for the order, rate and HRTF chosen now.
+    AmbisonicBinaural& binauralFor(Binaural& slot, int order, double sr);
+    std::map<Id, Binaural> binaural_;  // per ambisonic clip heard binaurally
+    Binaural monitor_;                  // an ambisonic sequence heard binaurally
 };
 
 }  // namespace montage

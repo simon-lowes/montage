@@ -82,15 +82,18 @@
 #include "core/ProjectIO.h"
 #include "core/ScriptCut.h"
 #include "core/Ambisonics.h"
+#include "media/Sofa.h"
 #include "core/Surround.h"
 #include "core/TranscriptEdit.h"
 #include "media/DualSystem.h"
 #include "media/Relink.h"
 #include "media/SpeechEnhance.h"
+#include "media/MotionDeblur.h"
 #include "media/SuperScale.h"
 #include "media/Translator.h"
 #include "render/AudioReactive.h"
 #include "render/VfxPull.h"
+#include "render/Amf.h"
 #include "render/AafExport.h"
 #include "render/AutoMix.h"
 #include "render/AutoBroll.h"
@@ -952,7 +955,7 @@ void McpServer::Impl::addTools() {
             "project":{"type":"string","description":"Path of the .montage file to write"},
             "media":{"type":"array","items":{"type":"string"},"description":"Media files, in order"},
             "width":{"type":"integer"},"height":{"type":"integer"},"fps":{"type":"number"},
-            "audio_layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4","ambix"],"default":"stereo"}},
+            "audio_layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4","ambix","ambix2","ambix3"],"default":"stereo"}},
             "required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l;
@@ -980,7 +983,7 @@ void McpServer::Impl::addTools() {
             if (a.contains("audio_layout")) {
                 const std::string layout = a.value("audio_layout").toString().toStdString();
                 if (std::find(audioLayouts().begin(), audioLayouts().end(), layout) == audioLayouts().end())
-                    throw ArgError{"\"audio_layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2, 7.1.4 or ambix"};
+                    throw ArgError{"\"audio_layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2, 7.1.4, ambix, ambix2 or ambix3"};
                 s.audioLayout = layout;
             }
             FrameTime at = 0;
@@ -1678,7 +1681,7 @@ void McpServer::Impl::addTools() {
             } else if (action == "remove_shared") {
                 r = edit::removeSharedNode(s, sharedArg());
             } else if (action == "flatten") {
-                r = edit::flattenGrade(s, id);
+                r = edit::flattenGrade(l.project, s, id);
             } else if (action != "list") {
                 throw ArgError{QStringLiteral("Unknown action \"%1\"").arg(action)};
             }
@@ -2086,6 +2089,8 @@ void McpServer::Impl::addTools() {
                 return fail("Enhance Speech needs its model: run `scripts/fetch-models.sh` or add the effect once in the app");
             if (type == "super_scale" && (!upscalerAvailable() || !upscaleModel().installed()))
                 return fail("Super Scale needs its model: run `scripts/fetch-models.sh` or add the effect once in the app");
+            if (type == "motion_deblur" && (!deblurAvailable() || !deblurModel().installed()))
+                return fail("Motion Deblur needs its model: run `scripts/fetch-models.sh` or add the effect once in the app");
             Effect e = plugin ? *plugin : makeEffect(l.project, type);
             const QJsonObject params = a.value("params").toObject();
             for (auto it = params.begin(); it != params.end(); ++it) {
@@ -2175,8 +2180,8 @@ void McpServer::Impl::addTools() {
                           QJsonObject{{"effect_id", double(e.id)}});
             }
             if (a.contains("node") || a.contains("shared")) {
-                if (audioClip || type == "stabilize" || type == "rolling_shutter")
-                    throw ArgError{"A node takes picture effects that work on the picture it is given"};
+                if (audioClip || runsBeforeGrade(type))
+                    throw ArgError{"A node takes picture effects that work on the picture it is given (that one works on the picture as it comes: add it to the clip)"};
                 Id shared = Id(a.value("shared").toDouble());
                 if (a.contains("node")) {
                     const GradeNode* n = findGradeNode(c.grade, a.value("node").toInt());
@@ -4647,8 +4652,9 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_set_surround", "Set up a surround mix",
-        "Mix the active sequence in stereo, 5.1 (L R C LFE Ls Rs), 7.1 (L R C LFE Lb Rb Ls Rs) or an immersive layout with "
-        "overhead speakers (5.1.2, 5.1.4, 7.1.2 as the Dolby Atmos bed, 7.1.4), and place audio tracks among the speakers. A "
+        "Mix the active sequence in stereo, 5.1 (L R C LFE Ls Rs), 7.1 (L R C LFE Lb Rb Ls Rs), an immersive layout with "
+        "overhead speakers (5.1.2, 5.1.4, 7.1.2 as the Dolby Atmos bed, 7.1.4) or an ambisonic field (ambix, ambix2, ambix3: "
+        "first to third order), and place audio tracks among the speakers or in the field. A "
         "position is an angle (0 straight ahead, 90 right, -90 left, 180 behind) and a distance (1 at the speakers, 0 spread "
         "over all of them); height (0 at the ear to 1 overhead) lifts it in immersive layouts; width narrows a stereo track "
         "to a point (0, e.g. dialogue in the centre speaker); lfe_db sends it to the subwoofer (-100 off); object makes the "
@@ -4658,7 +4664,7 @@ void McpServer::Impl::addTools() {
         "master; an empty path stops it moving. A track routed to a bus is placed by its bus. Export with montage_render "
         "(downmix_stereo for a stereo copy).",
         R"json({"type":"object","properties":{"project":{"type":"string"},
-            "layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4","ambix"]},
+            "layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4","ambix","ambix2","ambix3"]},
             "tracks":{"type":"array","items":{"type":"object","properties":{
                 "track":{"type":"string","description":"Audio track, e.g. A1"},"angle":{"type":"number","default":0},
                 "distance":{"type":"number","default":1},"height":{"type":"number","default":0},"width":{"type":"number","default":1},
@@ -4672,7 +4678,7 @@ void McpServer::Impl::addTools() {
             if (a.contains("layout")) {
                 const std::string layout = a.value("layout").toString().toStdString();
                 if (std::find(audioLayouts().begin(), audioLayouts().end(), layout) == audioLayouts().end())
-                    throw ArgError{"\"layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2, 7.1.4 or ambix"};
+                    throw ArgError{"\"layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2, 7.1.4, ambix, ambix2 or ambix3"};
                 s.audioLayout = layout;
             }
             QJsonArray out;
@@ -4768,9 +4774,9 @@ void McpServer::Impl::addTools() {
 
     add("montage_captions", "Import or export captions",
         "Write a caption track to a file in the format its extension names: .srt (SubRip), .vtt (WebVTT), .scc "
-        "(Scenarist, CEA-608), .ttml / .xml / .dfxp (TTML, IMSC 1.1 Text profile, with the track's colours), .stl "
+        "(Scenarist, CEA-608), .mcc (MacCaption: CEA-608 and CTA-708, with the track's places and colours), .ttml / .xml / .dfxp (TTML, IMSC 1.1 Text profile, with the track's colours), .stl "
         "(EBU Tech 3264, 25 or 30 fps) or .ass / .ssa (SubStation Alpha, with the track's style); or read any of them "
-        "as a new caption track (`import`), or the CEA-608 closed captions inside a video clip's file (`import_embedded`). "
+        "as a new caption track (`import`), or the closed captions inside a video clip's file (`import_embedded`: CTA-708 service 1, else CEA-608 channel 1). "
         "`track` is a caption track index (default: the visible one).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"export":{"type":"string","description":"A file to write"},
             "import":{"type":"string","description":"A file to read as a new track"},"track":{"type":"integer"},
@@ -4838,7 +4844,7 @@ void McpServer::Impl::addTools() {
             if (!t) return fail("The sequence has no captions");
             const std::string ext = "." + QFileInfo(path).suffix().toStdString();
             if (!captionFormatKnown(ext))
-                throw ArgError{QStringLiteral("Unknown caption format \"%1\": use .srt, .vtt, .scc, .ttml, .stl or .ass")
+                throw ArgError{QStringLiteral("Unknown caption format \"%1\": use .srt, .vtt, .scc, .mcc, .ttml, .stl or .ass")
                                    .arg(QString::fromStdString(ext))};
             const std::string data = exportCaptions(*t, s, ext);
             QFile o(path);
@@ -6179,7 +6185,7 @@ void McpServer::Impl::addTools() {
             "raw_tint":{"type":"number","description":"Camera RAW: tint, + magenta, - green (-150 to 150)"},
             "raw_highlights":{"type":"string","enum":["clip","blend","rebuild"],"description":"Camera RAW stills and CinemaDNG (ProRes RAW clips at the sensor's white)"},
             "raw_half":{"type":"boolean","description":"Camera RAW: decode at half size for speed"},
-            "stereo":{"type":"string","enum":["file","none","sbs","sbs_half","tb","tb_half"],"description":"Stereoscopic 3D: how the eyes are packed (side by side or top and bottom, full size or squeezed), none for a flat picture"},
+            "stereo":{"type":"string","enum":["file","none","sbs","sbs_half","tb","tb_half","mv"],"description":"Stereoscopic 3D: how the eyes are packed (side by side or top and bottom, full size or squeezed, or mv for MV-HEVC's two views), none for a flat picture"},
             "swap_eyes":{"type":"boolean","description":"Stereoscopic 3D: the eyes are the other way round"},
             "reset":{"type":"boolean","description":"Read the files as they are"}},"required":["project","media"]})json",
         false, [](const QJsonObject& a) {
@@ -7263,7 +7269,8 @@ void McpServer::Impl::addTools() {
             "captions":{"type":"string","enum":["none","burn","embed","both"],"default":"none","description":"The visible caption track, burned into the picture and/or embedded as a subtitle stream"},
             "trim_target":{"type":"string","description":"A trim pass (montage_trim): deliver that target of the sequence (its space and peak, each shot's trim) instead of the master"},
             "hdr10plus":{"type":"boolean","default":false,"description":"PQ exports: HDR10+ dynamic metadata, scene by scene, in HEVC and AV1 video and as name.hdr10plus.json beside the file (measured first unless montage_measure_hdr's analysis still matches the cut)"},
-            "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as CEA-608 closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask)"},
+            "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask): CEA-608 and CTA-708 service 1"},
+            "cea708":{"type":"boolean","default":true,"description":"With cea608: the CTA-708 service beside the 608 bytes"},
             "all_captions":{"type":"boolean","default":false,"description":"With embed: every caption track as its own subtitle stream, language tagged"},
             "audio_streams":{"description":"More audio streams after the mix (a master's M&E, dialogue, dubs): \"roles\" (one per role), \"tracks\" (one per track), or a list of {name, language, tracks:[\"A2\",...], role}",
                 "anyOf":[{"type":"string","enum":["mix","roles","tracks"]},{"type":"array","items":{"type":"object","properties":{
@@ -7334,6 +7341,7 @@ void McpServer::Impl::addTools() {
             if (cap != "none" && cap != "burn" && cap != "embed" && cap != "both") throw ArgError{"\"captions\" must be none, burn, embed or both"};
             st.burnInCaptions = cap == "burn" || cap == "both";
             st.cea608 = a.value("cea608").toBool();
+            st.cea708 = a.value("cea708").toBool(true);
             st.hdr10Plus = a.value("hdr10plus").toBool();
             st.trimTarget = str(a, "trim_target").toStdString();
             if (!st.trimTarget.empty() && !findTrimTarget(s, st.trimTarget))
@@ -7969,17 +7977,21 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_ambisonics", "Ambisonic audio",
-        "Ambisonic (spatial) sound, as Premiere's VR audio and YouTube's spatial audio take it: first-order AmbiX (W, Y, Z, "
-        "X; ACN, SN3D) from 360° cameras and ambisonic microphones, found from a file's spatial audio metadata or marked "
-        "here with `media` and `ambisonic`. With `clip` (an audio clip of ambisonic media): turn its field with `yaw` "
-        "(degrees right), `pitch` (up) and `roll` (clockwise), keyed at `at` when given; `follow_view` (default true) "
-        "turns it with the linked picture's Reframe 360° view so the sound follows the picture; `decode` binaural "
-        "(headphones, the default) or stereo (speakers) in a stereo or surround mix. A sequence whose audio layout is "
-        "\"ambix\" (montage_set_surround layout) mixes to a four-channel field (tracks placed in it by their surround panner, "
-        "ambisonic clips added as they are) and exports as AAC or PCM in MP4 or MOV with the SA3D box YouTube reads.",
+        "Ambisonic (spatial) sound, as Premiere's VR audio, Fairlight and YouTube's spatial audio take it: AmbiX (ACN, SN3D) "
+        "from first order (W, Y, Z, X: 360° cameras, ambisonic microphones) to third (16 channels), found from a file's "
+        "spatial audio metadata or marked here with `media` and `ambisonic` (to `order`, default the highest its channels "
+        "hold). With `clip` (an audio clip of ambisonic media): turn its field with `yaw` (degrees right), `pitch` (up) and "
+        "`roll` (clockwise), keyed at `at` when given; `follow_view` (default true) turns it with the linked picture's "
+        "Reframe 360° view so the sound follows the picture; `decode` binaural (headphones, the default) or stereo "
+        "(speakers) in a stereo mix (a surround mix decodes it to its speakers, AllRAD). A sequence whose audio layout is "
+        "\"ambix\", \"ambix2\" or \"ambix3\" (montage_set_surround layout) mixes to a field of that order (tracks placed in "
+        "it by their surround panner, ambisonic clips added as they are) and exports as PCM (or AAC) in MP4 or MOV with "
+        "the SA3D box YouTube reads (first order). `hrtf` picks what binaural listening hears through: \"head\" (a "
+        "spherical-head model), \"ku100\" (SADIE II's measured KU100 dummy head, once downloaded) or a SOFA file's path.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"media":{"type":"number"},"ambisonic":{"type":"boolean"},
+            "order":{"type":"integer","minimum":1,"maximum":3},
             "clip":{"type":"number"},"yaw":{"type":"number"},"pitch":{"type":"number"},"roll":{"type":"number"},"at":{"type":"integer"},
-            "follow_view":{"type":"boolean"},"decode":{"type":"string","enum":["binaural","stereo"]}},"required":["project"]})json",
+            "follow_view":{"type":"boolean"},"decode":{"type":"string","enum":["binaural","stereo"]},"hrtf":{"type":"string"}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             QStringList done;
@@ -7988,10 +8000,15 @@ void McpServer::Impl::addTools() {
                 if (!m || !m->hasAudio || m->kind == MediaKind::Sequence) throw ArgError{"No such sound media"};
                 const bool on = a.value("ambisonic").toBool(true);
                 if (on && m->channels < kFoaChannels) throw ArgError{"Ambisonic sound has at least four channels"};
-                m->ambisonic = on ? 1 : 0;
+                const int most = ambisonicOrderForChannels(m->channels);
+                const int order = a.contains("order") ? a.value("order").toInt() : most;
+                if (on && (order < 1 || order > most))
+                    throw ArgError{QStringLiteral("Its %1 channels hold orders 1 to %2").arg(m->channels).arg(most)};
+                m->ambisonic = on ? order : 0;
                 for (MediaItem& sub : l.project.media)
                     if (sub.subclipOf == m->id) sub.ambisonic = m->ambisonic;
-                done << QStringLiteral("%1 is %2").arg(QString::fromStdString(m->name), on ? "an ambisonic field" : "channels for speakers");
+                done << QStringLiteral("%1 is %2").arg(QString::fromStdString(m->name),
+                                                       on ? QStringLiteral("an ambisonic field (order %1)").arg(order) : QStringLiteral("channels for speakers"));
             }
             QJsonObject field;
             if (a.contains("clip")) {
@@ -8027,9 +8044,27 @@ void McpServer::Impl::addTools() {
                 done << QStringLiteral("Clip %1: turned %2° right, %3° up, %4° roll%5").arg(clip->id).arg(it->p("yaw", t)).arg(it->p("pitch", t))
                             .arg(it->p("roll", t)).arg(it->p("follow_view", t, 1) > 0.5 ? QStringLiteral(", following the 360° view") : QString());
             }
-            if (done.isEmpty()) throw ArgError{"Give media or clip"};
+            if (a.contains("hrtf")) {
+                const QString h = str(a, "hrtf");
+                std::string choice = h == "head" ? std::string() : h.toStdString();
+                if (!choice.empty()) {
+                    if (!sofaSupported()) throw ArgError{"This build of Montage cannot read SOFA files (it was built without libmysofa)"};
+                    if (choice == "ku100" && !sadieKu100Pack().installed())
+                        throw ArgError{"SADIE II's KU100 responses are not downloaded: run `scripts/fetch-models.sh --hrtf` or choose them once in the app"};
+                    std::string why;
+                    if (choice != "ku100" && !readSofa(choice, 48000, &why)) throw ArgError{QString::fromStdString(why)};
+                }
+                setBinauralHrtf(choice);
+                done << QStringLiteral("Binaural listening through %1").arg(choice.empty() ? QStringLiteral("the spherical head model") : h);
+            }
+            if (done.isEmpty()) throw ArgError{"Give media, clip or hrtf"};
             save(l);
-            return ok(done.join('\n'), QJsonObject{{"field", field}, {"sequence_ambisonic", ambisonicLayout(l.seq().audioLayout)}});
+            const std::string hrtf = binauralHrtf();
+            return ok(done.join('\n'), QJsonObject{{"field", field},
+                                                   {"sequence_ambisonic", ambisonicLayout(l.seq().audioLayout)},
+                                                   {"sequence_order", ambisonicOrder(l.seq().audioLayout)},
+                                                   {"hrtf", hrtf.empty() ? QStringLiteral("head") : QString::fromStdString(hrtf)},
+                                                   {"sofa_supported", sofaSupported()}});
         });
 
     add("montage_pan_follow", "Pan to follow the picture",
@@ -8100,11 +8135,11 @@ void McpServer::Impl::addTools() {
         "Stereoscopic 3D editing, as Premiere's and Resolve's stereo workflows: with `sequence_3d` make the active "
         "sequence stereoscopic (each eye rendered, stereo footage giving each its own picture) or flat, and with "
         "`vr180` mark a 360° sequence as VR180 (the front half of the sphere); with `media` and `layout` say how a "
-        "file packs its eyes (file, none, sbs, sbs_half, tb, tb_half) and `swap_eyes` if they are the other way round; "
+        "file packs its eyes (file, none, sbs, sbs_half, tb, tb_half, or mv for MV-HEVC spatial video's two views) and `swap_eyes` if they are the other way round; "
         "with `clip` and `depth` (% of the frame's width, -10 to 10: + further away, - nearer) set the clip's Stereo 3D "
         "convergence (titles and graphics placed in depth), keyed at `at` when given. Reports the sequence's stereo state.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"sequence_3d":{"type":"boolean"},"vr180":{"type":"boolean"},
-            "media":{"type":"number"},"layout":{"type":"string","enum":["file","none","sbs","sbs_half","tb","tb_half"]},"swap_eyes":{"type":"boolean"},
+            "media":{"type":"number"},"layout":{"type":"string","enum":["file","none","sbs","sbs_half","tb","tb_half","mv"]},"swap_eyes":{"type":"boolean"},
             "clip":{"type":"number"},"depth":{"type":"number"},"at":{"type":"integer"}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -8166,15 +8201,107 @@ void McpServer::Impl::addTools() {
             return ok(done.join('\n'), res);
         });
 
+    add("montage_amf", "ACES Metadata Files (AMF)",
+        "read: what an AMF (`path`) holds: its clip, input transform, looks and output transform, and the colour spaces "
+        "Montage reads them as. import: the AMF onto `clips` (default: the video clips whose name, file or tape match its "
+        "clip): their media read as its input transform's colour space, its looks not yet applied (ASC CDL in its working "
+        "space, CLF or .cube look files, the Reference Gamut Compression) as effects first in their chains (an earlier "
+        "AMF's replaced); with `set_sequence_space` the sequence also delivers in its output transform's display space. "
+        "export: an AMF for each of `clips` (one clip: `path` is the file; more: a folder, one per clip): the media's "
+        "colour space as the input transform, its CDL, looks in ACES2065-1 and gamut compression as looks, the sequence's "
+        "space as the output transform. Notes say what could not be carried.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"action":{"type":"string","enum":["read","import","export"]},
+            "path":{"type":"string"},"clips":{"type":"array","items":{"type":"number"}},"set_sequence_space":{"type":"boolean"}},
+            "required":["project","action","path"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const QString action = need(a, "action");
+            const QString path = absolute(need(a, "path"));
+            std::vector<Id> clips;
+            for (const QJsonValue& v : a.value("clips").toArray()) clips.push_back(Id(v.toDouble()));
+            auto notesOf = [](const std::vector<std::string>& notes) {
+                QJsonArray arr;
+                for (const std::string& n : notes) arr.append(QString::fromStdString(n));
+                return arr;
+            };
+            if (action == "read" || action == "import") {
+                AmfDocument amf;
+                std::string err;
+                if (!readAmf(path.toStdString(), amf, &err)) return fail(QString::fromStdString(err));
+                if (action == "read") {
+                    QJsonArray looks;
+                    for (const AmfLook& lk : amf.looks) {
+                        QJsonObject o{{"applied", lk.applied}, {"description", QString::fromStdString(lk.description)}};
+                        if (lk.kind == AmfLook::Kind::Cdl) {
+                            o["kind"] = "cdl";
+                            o["asc_sop"] = QString::fromStdString(cdlSopText(lk.cdl));
+                            o["saturation"] = lk.cdl.saturation;
+                            o["space"] = QString::fromStdString(lk.cdlSpace);
+                        } else if (lk.kind == AmfLook::Kind::File) {
+                            o["kind"] = "file";
+                            o["file"] = QString::fromStdString(lk.file);
+                        } else {
+                            o["kind"] = "transform";
+                            o["transform_id"] = QString::fromStdString(lk.transformId);
+                        }
+                        looks.append(o);
+                    }
+                    const QJsonObject o{{"clip_name", QString::fromStdString(amf.clipName)}, {"clip_file", QString::fromStdString(amf.clipFile)},
+                                        {"clip_sequence", QString::fromStdString(amf.clipSequence)}, {"clip_uuid", QString::fromStdString(amf.clipUuid)},
+                                        {"input_transform", QString::fromStdString(amf.inputTransformId.empty() ? amf.inputFile : amf.inputTransformId)},
+                                        {"input_applied", amf.inputApplied}, {"input_space", QString::fromStdString(amf.inputSpace)},
+                                        {"looks", looks}, {"output_transform", QString::fromStdString(amf.outputTransformId)},
+                                        {"output_space", QString::fromStdString(amf.outputSpace)}, {"output_peak_nits", amf.outputPeakNits}};
+                    return ok(QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact)), o);
+                }
+                AmfImportOptions o;
+                o.setSequenceSpace = a.value("set_sequence_space").toBool(false);
+                const AmfImportResult r = applyAmf(l.project, l.seq(), clips, amf, o);
+                if (r.clips) save(l);
+                QString msg = QStringLiteral("Gave %1 clips the ACES pipeline").arg(r.clips);
+                for (const std::string& n : r.notes) msg += "\n" + QString::fromStdString(n);
+                return ok(msg, QJsonObject{{"clips", r.clips}, {"notes", notesOf(r.notes)}});
+            }
+            if (action != "export") throw ArgError{QStringLiteral("\"action\" is read, import or export")};
+            const Sequence& s = l.seq();
+            std::vector<const Clip*> chosen;
+            for (Id id : clips)
+                if (const Clip* c = edit::clipById(s, id)) chosen.push_back(c);
+            if (chosen.empty()) throw ArgError{QStringLiteral("Give the clips to write ACES Metadata Files for")};
+            QJsonArray files;
+            std::vector<std::string> notes;
+            std::set<QString> used;
+            for (const Clip* c : chosen) {
+                // One per clip, named after it as the app names them (numbered when two share a name).
+                QString base = QString::fromStdString(c->name).replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9_.-]+")), QStringLiteral("_"));
+                if (base.isEmpty() || base.startsWith('.')) base = "clip" + base;
+                QString name = base;
+                for (int n = 2; used.count(name); ++n) name = base + QStringLiteral("_%1").arg(n);
+                used.insert(name);
+                const QString file = chosen.size() == 1 ? path : QDir(path).filePath(name + ".amf");
+                std::vector<std::string> said;
+                std::string err;
+                if (!writeClipAmf(l.project, s, *c, file.toStdString(), &said, {}, &err)) return fail(QString::fromStdString(err));
+                for (const std::string& n : said)
+                    if (std::find(notes.begin(), notes.end(), n) == notes.end()) notes.push_back(n);
+                files.append(file);
+            }
+            QString msg = QStringLiteral("Wrote %1 ACES Metadata Files").arg(files.size());
+            for (const std::string& n : notes) msg += "\n" + QString::fromStdString(n);
+            return ok(msg, QJsonObject{{"files", files}, {"notes", notesOf(notes)}});
+        });
+
     add("montage_vfx_pull", "VFX pulls",
         "Pull shots for visual effects: each clip's source frames, untouched, at the footage's own size and rate, with "
         "`handles` frames either side (default 8, as far as the footage goes), as an image sequence in a folder per shot "
         "(format exr: half float in scene-linear light; dpx: 10-bit in the footage's own colour; tiff: 16-bit), numbered "
-        "so the cut's first frame is `cut_in` (default 1001), with a pull_list.csv. `clips` are clip ids (default: every "
-        "footage clip on the video tracks).",
+        "so the cut's first frame is `cut_in` (default 1001), with a pull_list.csv and (unless `amf` is false) an ACES "
+        "Metadata File per shot giving the frames' colour space and the clip's CDL and looks. `clips` are clip ids "
+        "(default: every footage clip on the video tracks).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string"},
             "clips":{"type":"array","items":{"type":"number"}},"format":{"type":"string","enum":["exr","dpx","tiff"],"default":"exr"},
-            "handles":{"type":"integer","default":8},"cut_in":{"type":"integer","default":1001}},"required":["project","folder"]})json",
+            "handles":{"type":"integer","default":8},"cut_in":{"type":"integer","default":1001},"amf":{"type":"boolean","default":true}},
+            "required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             VfxPullOptions o;
@@ -8182,6 +8309,7 @@ void McpServer::Impl::addTools() {
             o.format = str(a, "format", "exr").toStdString();
             o.handles = std::clamp(a.value("handles").toInt(8), 0, 1000);
             o.cutIn = a.value("cut_in").toInt(1001);
+            o.amf = a.value("amf").toBool(true);
             std::vector<Id> clips;
             for (const QJsonValue& v : a.value("clips").toArray()) clips.push_back(Id(v.toDouble()));
             if (clips.empty())
@@ -8196,7 +8324,7 @@ void McpServer::Impl::addTools() {
             for (const VfxShot& s : shots) {
                 list.append(QJsonObject{{"name", QString::fromStdString(s.name)}, {"folder", QString::fromStdString(s.folder)},
                                         {"first_frame", s.firstFrame}, {"cut_in", s.cutIn}, {"cut_out", s.cutOut}, {"last_frame", s.lastFrame},
-                                        {"head_handle", s.headHandle}, {"tail_handle", s.tailHandle}});
+                                        {"head_handle", s.headHandle}, {"tail_handle", s.tailHandle}, {"amf", QString::fromStdString(s.amf)}});
                 lines << QStringLiteral("%1: frames %2-%3 (cut %4-%5)").arg(QString::fromStdString(s.name)).arg(s.firstFrame).arg(s.lastFrame).arg(s.cutIn).arg(s.cutOut);
             }
             const QString csv = QDir(QString::fromStdString(o.folder)).filePath("pull_list.csv");

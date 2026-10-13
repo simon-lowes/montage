@@ -62,18 +62,19 @@ std::vector<TrackRef> rippleTracks(const Sequence& s, const std::vector<TrackRef
 // ---- Edits -------------------------------------------------------------------
 Result overwrite(Project& p, Sequence& s, TrackRef t, Clip clip);
 Result insert(Project& p, Sequence& s, TrackRef t, Clip clip);
-// Places a media item on the timeline (video and/or linked audio).
+// Places a media item on the timeline (video and/or linked audio; only what `useVideo` and `useAudio` allow, as
+// Resolve's Video Only and Audio Only).
 // srcIn / srcOut are in sequence frames; srcOut < 0 means "to the end".
 Result placeMedia(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcIn, double srcOut,
-                  TrackRef videoTrack, TrackRef audioTrack, bool insertMode);
+                  TrackRef videoTrack, TrackRef audioTrack, bool insertMode, bool useVideo = true, bool useAudio = true);
 // Place on Top: the media on the first tracks above the video target (the audio target or after it) with nothing
 // over its length, new tracks when none have room. Nothing already in the sequence moves.
 Result placeOnTop(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcIn, double srcOut, TrackRef videoTrack,
-                  TrackRef audioTrack);
+                  TrackRef audioTrack, bool useVideo = true, bool useAudio = true);
 // Ripple Overwrite: the clip and the clips linked to it give way to the media range at its start, and everything
 // after moves by the difference in length.
 Result rippleOverwrite(Project& p, Sequence& s, Id clipId, Id mediaId, double srcIn, double srcOut, TrackRef videoTrack,
-                       TrackRef audioTrack);
+                       TrackRef audioTrack, bool useVideo = true, bool useAudio = true);
 // Audio roles (Clip::role). The standard ones, then any others the sequence's clips use, in that order.
 extern const std::vector<std::string> kStandardRoles;  // Dialogue, Music, Effects
 std::vector<std::string> sequenceRoles(const Sequence& s);
@@ -161,9 +162,10 @@ SequenceRange copySequenceClips(const Sequence& s, const std::vector<Id>& ids);
 Result pasteRange(Project& p, Sequence& s, const SequenceRange& r, FrameTime at, int video, int audio, bool insert);
 // Premiere's "insert and overwrite sequences as individual clips", Avid's editing from a source sequence: `source`'s
 // clips from `in` to `out` (exclusive; -1 = its end) edited into `s` at `at` as themselves, not as one nested clip.
-// Fails for `s` itself or a sequence that nests it, and for one at another frame rate (nest that).
+// Fails for `s` itself or a sequence that nests it, and for one at another frame rate (nest that). Only its picture or
+// only its sound without `useAudio` or `useVideo`.
 Result placeSequenceClips(Project& p, Sequence& s, Id source, FrameTime in, FrameTime out, FrameTime at, int video, int audio,
-                          bool insert);
+                          bool insert, bool useVideo = true, bool useAudio = true);
 // Whether sequence `seq` is `target` or nests it anywhere inside.
 bool sequenceUses(const Project& p, Id seq, Id target);
 

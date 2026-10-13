@@ -29,13 +29,15 @@ class ViewerWidget : public QWidget {
     Q_OBJECT
 public:
     explicit ViewerWidget(QWidget* parent = nullptr);
-    void setImage(const QImage& img);
+    void setImage(const QImage& img, montage::FrameTime t = -1);
     const QImage& image() const { return image_; }
     void setPlaceholder(const QString& text);
     void setSafeMargins(bool on);
     // An exposure check over the picture (ExposureView.h); 0 = off.
     void setExposureView(int mode);
     int exposureView() const { return exposure_; }
+    // The frame as delivered (code values in `space`), for the out-of-gamut checks: used while it is the picture's.
+    void setSignal(const QImage& signal, montage::FrameTime t, const QString& space);
     // The picture as drawn (with the exposure check), for testing.
     QImage shownImage() const;
     void setDragSource(bool on) { dragSource_ = on; }
@@ -112,7 +114,10 @@ private:
     bool safe_ = false;
     int exposure_ = 0;
     mutable QImage exposed_;           // image_ with the exposure check
-    mutable qint64 exposedKey_ = -1;
+    mutable qint64 exposedKey_ = -1, exposedSignalKey_ = -1;
+    FrameTime imageTime_ = -1, signalTime_ = -1;
+    QImage signal_;
+    QString signalSpace_;
     mutable int exposedMode_ = 0;
     bool dragSource_ = false;
     bool lookAround_ = false, looking_ = false;

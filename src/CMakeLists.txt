@@ -12,6 +12,7 @@ add_library(montage_engine STATIC
   core/Transcript.h core/Transcript.cpp
   core/Captions.h core/Captions.cpp
   core/CaptionFormats.cpp
+  core/Cea708.h core/Cea708.cpp
   core/CaptionTools.h core/CaptionTools.cpp
   core/TranscriptEdit.h core/TranscriptEdit.cpp
   core/Slate.h core/Slate.cpp
@@ -73,6 +74,7 @@ add_library(montage_engine STATIC
   media/CameraRaw.h media/CameraRaw.cpp
   media/ProResRaw.h media/ProResRaw.cpp
   media/SuperScale.h media/SuperScale.cpp
+  media/MotionDeblur.h media/MotionDeblur.cpp
   media/Faces.h media/Faces.cpp
   media/FaceTracks.h media/FaceTracks.cpp
   media/DepthMap.h media/DepthMap.cpp
@@ -107,6 +109,7 @@ add_library(montage_engine STATIC
   media/CameraSolve.h media/CameraSolve.cpp
   media/Reframe.h media/Reframe.cpp
   media/ModelFiles.h media/ModelFiles.cpp
+  media/Sofa.h media/Sofa.cpp
   media/LensDatabase.h media/LensDatabase.cpp
   media/Segmenter.h media/Segmenter.cpp
   media/Diarizer.h media/Diarizer.cpp
@@ -141,6 +144,8 @@ add_library(montage_engine STATIC
   control/MackieControl.h control/MackieControl.cpp
   control/Hui.h control/Hui.cpp
   control/Osc.h control/Osc.cpp
+  control/Hid.h control/Hid.cpp
+  control/SpeedEditor.h control/SpeedEditor.cpp
   render/Versions.h render/Versions.cpp
   render/ReviewExport.h render/ReviewExport.cpp
   render/DcpMxf.h render/DcpMxf.cpp
@@ -160,9 +165,14 @@ add_library(montage_engine STATIC
   render/AutoMix.h render/AutoMix.cpp
   render/VoiceMatch.h render/VoiceMatch.cpp
   render/ColorSpace.h render/ColorSpace.cpp
+  render/Gamut.h render/Gamut.cpp
+  render/ColorSlice.h render/ColorSlice.cpp
+  render/Clf.h render/Clf.cpp
+  render/Amf.h render/Amf.cpp
   render/HdrView.h render/HdrView.cpp
   render/Ocio.h render/Ocio.cpp
   render/Compositor.h render/Compositor.cpp
+  render/GpuCompositor.h render/GpuCompositor.cpp
   render/OGraf.h render/OGraf.cpp
   render/Gallery.h render/Gallery.cpp
   render/TrimPasses.h render/TrimPasses.cpp
@@ -221,12 +231,29 @@ endif()
 target_compile_definitions(montage_engine PUBLIC MONTAGE_VERSION="${PROJECT_VERSION}")
 target_link_libraries(montage_engine PUBLIC Qt6::Core Qt6::Gui Qt6::Xml PkgConfig::FFMPEG Threads::Threads ${CMAKE_DL_LIBS})
 target_link_libraries(montage_engine PRIVATE Qt6::Network)  # (OGraf graphics: the browser's DevTools socket)
+# The GPU compositor (render/GpuCompositor.h): Qt's RHI, public from Qt 6.6 (in the private GUI module, which Qt 6.9 and
+# later only load when asked for by name). Older Qt builds render on the CPU, as before.
+if(MONTAGE_GPU AND Qt6_VERSION VERSION_GREATER_EQUAL 6.6)
+  if(NOT TARGET Qt6::GuiPrivate)
+    set(QT_NO_PRIVATE_MODULE_WARNING ON)
+    find_package(Qt6 QUIET COMPONENTS GuiPrivate)
+  endif()
+  if(TARGET Qt6::GuiPrivate)
+    target_link_libraries(montage_engine PRIVATE Qt6::GuiPrivate)
+    target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_GPU)
+    message(STATUS "GPU compositor: on (Qt ${Qt6_VERSION})")
+  else()
+    message(STATUS "GPU compositor: off (Qt's private GUI module was not found)")
+  endif()
+else()
+  message(STATUS "GPU compositor: off (Qt ${Qt6_VERSION}; it needs 6.6 or later)")
+endif()
 if(APPLE)
   target_sources(montage_engine PRIVATE audio/AuHost.cpp)
-  target_link_libraries(montage_engine PUBLIC "-framework AudioToolbox" "-framework CoreFoundation" "-framework CoreMIDI")
+  target_link_libraries(montage_engine PUBLIC "-framework AudioToolbox" "-framework CoreFoundation" "-framework CoreMIDI" "-framework IOKit")
 endif()
 if(WIN32)
-  target_link_libraries(montage_engine PUBLIC winmm)  # MIDI (control/Midi.cpp)
+  target_link_libraries(montage_engine PUBLIC winmm setupapi hid)  # MIDI (control/Midi.cpp), HID (control/Hid.cpp)
 endif()
 target_compile_options(montage_engine PRIVATE
   $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter>)
@@ -254,6 +281,32 @@ if(MONTAGE_WITH_LIBRAW)
     target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_LIBRAW)
   else()
     message(STATUS "LibRaw not found: camera raw stills are not read")
+  endif()
+endif()
+if(MONTAGE_WITH_MYSOFA)
+  # (Not as an imported target: MSYS2's libmysofa.pc names "/ucrt64/include", a path CMake cannot see.)
+  pkg_check_modules(MYSOFA libmysofa>=1.0)
+  if(MYSOFA_FOUND)
+    # SOFA files are read from memory (a zip's entry), which older libmysofa cannot.
+    include(CheckSymbolExists)
+    set(CMAKE_REQUIRED_INCLUDES ${MYSOFA_INCLUDE_DIRS})
+    set(CMAKE_REQUIRED_LIBRARIES ${MYSOFA_LINK_LIBRARIES})
+    check_symbol_exists(mysofa_load_data mysofa.h MONTAGE_MYSOFA_LOAD_DATA)
+    unset(CMAKE_REQUIRED_INCLUDES)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+  endif()
+  if(MYSOFA_FOUND AND MONTAGE_MYSOFA_LOAD_DATA)
+    message(STATUS "libmysofa ${MYSOFA_VERSION}: SOFA HRTFs for binaural ambisonics enabled")
+    foreach(dir ${MYSOFA_INCLUDE_DIRS})
+      if(EXISTS "${dir}")
+        target_include_directories(montage_engine PRIVATE "${dir}")
+      endif()
+    endforeach()
+    target_compile_options(montage_engine PRIVATE ${MYSOFA_CFLAGS_OTHER})
+    target_link_libraries(montage_engine PRIVATE ${MYSOFA_LINK_LIBRARIES})
+    target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_MYSOFA)
+  else()
+    message(STATUS "libmysofa (with mysofa_load_data) not found: ambisonics is heard binaurally through the spherical head model only")
   endif()
 endif()
 if(MONTAGE_WITH_OPENJPEG)

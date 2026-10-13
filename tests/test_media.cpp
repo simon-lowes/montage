@@ -28,6 +28,7 @@
 #include <thread>
 #include <cstdio>
 
+#include "core/GradeGraph.h"
 #include "core/AudioChannels.h"
 #include "core/Aaf.h"
 #include "core/Bleep.h"
@@ -73,6 +74,8 @@
 #include "media/Beats.h"
 #include "render/Spherical.h"
 #include "media/SpatialAudio.h"
+#include "core/Ambisonics.h"
+#include "media/Sofa.h"
 #include "render/ExtendClip.h"
 #include "render/ColorChart.h"
 #include "media/LensDatabase.h"
@@ -83,6 +86,7 @@
 #include "media/Interpret.h"
 #include "render/AudioReactive.h"
 #include "render/VfxPull.h"
+#include "render/Amf.h"
 #include "render/AafExport.h"
 #include "core/Interpretation.h"
 #include "render/Adm.h"
@@ -111,6 +115,7 @@
 #include "media/Segmenter.h"
 #include "media/Translator.h"
 #include "media/SpeechEnhance.h"
+#include "media/MotionDeblur.h"
 #include "media/SuperScale.h"
 #include "media/Reframe.h"
 #include "media/Diarizer.h"
@@ -136,6 +141,7 @@
 #endif
 #include "render/ClipAnalysis.h"
 #include "render/ColorSpace.h"
+#include "render/Clf.h"
 #include "render/AudioFx.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
@@ -730,6 +736,57 @@ private slots:
         convertPixel(plain, logc, rec709Space(), 1000);
         QVERIFY2(std::fabs(after - (plain[1] + 0.05f)) < 0.01f, qPrintable(QString("%1 vs %2").arg(after).arg(plain[1] + 0.05f)));
         QVERIFY(std::fabs(after - want[1]) > 0.01f);
+    }
+
+    void amfLooksOnTheCamerasPicture() {
+        // LogC3 footage given an AMF's pipeline in a Rec.709 sequence: its CDL (in ACEScct) and its look (a CLF in
+        // ACES2065-1) grade the camera's picture, each in its own space, before the display rendering, as dailies do.
+        QImage grey(64, 48, QImage::Format_RGB32);
+        grey.fill(qRgb(102, 110, 96));
+        QVERIFY(grey.save(QString::fromStdString(path("amf-grey.png"))));
+        Project p = makeDefaultProject();
+        MediaItem m = probeOrFail(p, path("amf-grey.png"));
+        m.name = "A001C012.png";
+        p.media.push_back(m);
+        Sequence& s = *p.active();
+        s.width = 64;
+        s.height = 48;
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 25, {TrackKind::Video, 0}, {}, false).ok);
+        AmfDocument amf;
+        std::string err;
+        QVERIFY2(readAmf(MONTAGE_TEST_DATA_DIR "/amf/A001C012.amf", amf, &err), err.c_str());
+        QCOMPARE(applyAmf(p, s, {}, amf).clips, 1);
+        const ColorSpace& logc = *findColorSpace("logc3-awg3");
+        QCOMPARE(p.findMedia(m.id)->colorOverride, logc.id);
+        RenderOptions ro;
+        const Image img = renderProgramFrame(p, s, 2, ro);
+        auto into = [](float v[3], const ColorSpace& a, const ColorSpace& b) {
+            double mat[9], l[3];
+            primariesMatrix(a.primaries, b.primaries, mat);
+            for (int i = 0; i < 3; ++i) l[i] = toLinear(a.transfer, v[i]);
+            for (int i = 0; i < 3; ++i) v[i] = float(fromLinear(b.transfer, mat[i * 3] * l[0] + mat[i * 3 + 1] * l[1] + mat[i * 3 + 2] * l[2]));
+        };
+        float want[3] = {102 / 255.0f, 110 / 255.0f, 96 / 255.0f};
+        const ColorSpace &cct = *findColorSpace("acescct"), &ap0 = *findColorSpace("aces2065-1");
+        into(want, logc, cct);
+        applyCdl(amf.looks[1].cdl, want[0], want[1], want[2]);
+        into(want, cct, logc);
+        into(want, logc, ap0);
+        loadClf(amf.looks[2].file)->apply(want);
+        into(want, ap0, logc);
+        float rgc[4] = {want[0], want[1], want[2], 1};
+        Image px(1, 1);
+        std::copy(rgc, rgc + 4, px.at(0, 0));
+        applyAcesGamutCompress(edit::clipById(s, s.videoTracks[0].clips[0].id)->effects[2], 0, logc, px);
+        std::copy(px.at(0, 0), px.at(0, 0) + 3, want);
+        convertPixel(want, logc, rec709Space(), 1000);
+        for (int c = 0; c < 3; ++c)
+            QVERIFY2(std::fabs(img.at(32, 24)[c] - want[c]) < 0.01f, qPrintable(QString("%1: %2 vs %3").arg(c).arg(img.at(32, 24)[c]).arg(want[c])));
+        // A dailies AMF whose output transform was applied: the pictures are Rec.709 video, with no looks to add.
+        amf.outputApplied = true;
+        QCOMPARE(applyAmf(p, s, {}, amf).clips, 1);
+        QCOMPARE(p.findMedia(m.id)->colorOverride, std::string("rec709"));
+        QVERIFY(s.videoTracks[0].clips[0].effects.empty());
     }
 
     void probeAndDecodeWav() {
@@ -4759,6 +4816,111 @@ private slots:
         QCOMPARE(withDepth->effects.back().params.at("depth").keys.size(), size_t(1));
     }
 
+    void spatialVideo() {
+        // MV-HEVC (two views in one HEVC stream): each eye its own view, whole.
+        const std::string file = std::string(MONTAGE_TEST_DATA_DIR) + "/mvhevc/spatial.mov";
+        Project p = makeDefaultProject();
+        p.sequences.clear();
+        MediaItem m = probeOrFail(p, file);
+        QCOMPARE(m.width, 128);
+        QCOMPARE(m.height, 72);
+        if (!multiviewDecoding()) {
+            QVERIFY(m.stereo.empty());  // (its first view, flat)
+            QSKIP("This FFmpeg reads only the first view of MV-HEVC (7.1 and later read both)");
+        }
+        QCOMPARE(m.stereo, std::string("mv"));
+        auto px = [](const Image& img, int x, int y) { return QVector3D(img.at(x, y)[0], img.at(x, y)[1], img.at(x, y)[2]); };
+        auto isRed = [](QVector3D c) { return c.x() > 0.6f && c.y() < 0.25f && c.z() < 0.3f; };
+        auto isBlue = [](QVector3D c) { return c.z() > 0.6f && c.x() < 0.25f && c.y() < 0.25f; };
+        auto isGrey = [](QVector3D c) { return c.x() < 0.2f && c.y() < 0.2f && c.z() < 0.2f; };
+        auto describe = [&](QVector3D c) { return QString("%1 %2 %3").arg(c.x()).arg(c.y()).arg(c.z()); };
+        p.media.push_back(m);
+        Sequence& s3 = p.sequences.emplace_back(makeSequence(p, "Spatial", 128, 72, Rational{25, 1}, 2, 1));
+        p.activeSequence = s3.id;
+        s3.stereo3d = true;
+        QVERIFY(edit::placeMedia(p, s3, m.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        RenderOptions o;
+        o.eye = 0;
+        const Image left = renderSequenceFrame(p, s3, 3, o);
+        o.eye = 1;
+        const Image right = renderSequenceFrame(p, s3, 3, o);
+        QCOMPARE(left.width, 128);
+        // The left eye's square at x 20 to 44, the right eye's at 32 to 56.
+        QVERIFY2(isRed(px(left, 26, 32)) && isGrey(px(left, 50, 32)), qPrintable(describe(px(left, 26, 32)) + " / " + describe(px(left, 50, 32))));
+        QVERIFY2(isBlue(px(right, 50, 32)) && isGrey(px(right, 26, 32)), qPrintable(describe(px(right, 50, 32)) + " / " + describe(px(right, 26, 32))));
+        // Swapped eyes; and read as not stereo, its first view.
+        Interpretation how;
+        how.swapEyes = true;
+        QVERIFY(edit::interpretFootage(p, m.id, how).ok);
+        o.eye = 0;
+        QVERIFY(isBlue(px(renderSequenceFrame(p, s3, 3, o), 50, 32)));
+        o.eye = 1;
+        QVERIFY(isRed(px(renderSequenceFrame(p, s3, 3, o), 26, 32)));
+        how = {};
+        how.stereo = "none";
+        QVERIFY(edit::interpretFootage(p, m.id, how).ok);
+        QVERIFY(p.findMedia(m.id)->stereo.empty());
+        QCOMPARE(p.findMedia(m.id)->width, 128);
+        QVERIFY(isRed(px(renderSequenceFrame(p, s3, 3, o), 26, 32)));
+        // Apple's eyes box saying both eyes are there, the views the other way round: the left eye is the second view.
+        {
+            Project q = makeDefaultProject();
+            q.sequences.clear();
+            MediaItem e = probeOrFail(q, std::string(MONTAGE_TEST_DATA_DIR) + "/mvhevc/spatial-eyes.mov");
+            QCOMPARE(e.stereo, std::string("mv"));
+            q.media.push_back(e);
+            Sequence& se = q.sequences.emplace_back(makeSequence(q, "Eyes", 128, 72, Rational{25, 1}, 2, 1));
+            se.stereo3d = true;
+            QVERIFY(edit::placeMedia(q, se, e.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            o.eye = 0;
+            QVERIFY(isBlue(px(renderSequenceFrame(q, se, 3, o), 50, 32)));
+            o.eye = 1;
+            QVERIFY(isRed(px(renderSequenceFrame(q, se, 3, o), 26, 32)));
+        }
+        // Said to be two views, a file of one is read flat (as the decoder reads it).
+        {
+            Project q = makeDefaultProject();
+            q.sequences.clear();
+            Sequence& sf = q.sequences.emplace_back(makeSequence(q, "Flat", 64, 36, Rational{25, 1}, 2, 1));
+            QVERIFY(edit::overwrite(q, sf, {TrackKind::Video, 0}, makeGeneratorClip(q, "color", 5)).ok);
+            ExportSettings st;
+            st.path = path("mv-flat.mov");
+            st.videoCodec = "prores_ks";
+            std::string err;
+            QVERIFY2(exportSequence(q, sf, st, nullptr, nullptr, &err), err.c_str());
+            MediaItem one = probeOrFail(q, st.path);
+            q.media.push_back(one);
+            Interpretation forced;
+            forced.stereo = "mv";
+            QVERIFY(edit::interpretFootage(q, one.id, forced).ok);
+            QVERIFY(q.findMedia(one.id)->stereo.empty());
+            QCOMPARE(q.findMedia(one.id)->width, 64);
+        }
+        // A project saved before Montage read MV-HEVC: the item is found to be two views when it is opened.
+        {
+            Project old = makeDefaultProject();
+            MediaItem item = probeOrFail(old, file);
+            item.stereo.clear();
+            old.media.push_back(item);
+            const std::string saved = path("old-spatial.montage");
+            QVERIFY(saveProject(old, saved));
+            QFile f(QString::fromStdString(saved));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
+            f.close();
+            root["mediaStereo"] = 1;
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(QJsonDocument(root).toJson());
+            f.close();
+            Project loaded;
+            QVERIFY(loadProject(saved, loaded));
+            QVERIFY(!loaded.stereoChecked);
+            checkStereoMedia(loaded);
+            QCOMPARE(loaded.findMedia(item.id)->stereo, std::string("mv"));
+            QCOMPARE(loaded.findMedia(item.id)->width, 128);
+        }
+    }
+
     void stereoscopicEdgeCases() {
         // A side-by-side file with stereo metadata: the left eye red, the right blue, 160 x 96 an eye.
         auto solid = [](Project& pr, double r, double g, double b, FrameTime len) {
@@ -5249,6 +5411,21 @@ private slots:
         QCOMPARE(turned->effects.back().params.at("yaw").keys.size(), size_t(2));
         QCOMPARE(turned->effects.back().p("follow_view", 0, 1), 0.0);
         QCOMPARE(turned->effects.back().p("decode", 0), 1.0);
+        // An order its channels do not hold is refused; a third-order mix; the head binaural listening hears through.
+        QVERIFY(call("montage_ambisonics", {{"project", project}, {"media", double(wm.id)}, {"order", 2}}).value("isError").toBool());
+        res = call("montage_set_surround", {{"project", project}, {"layout", "ambix3"}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        res = call("montage_ambisonics", {{"project", project}, {"hrtf", "head"}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        QCOMPARE(res.value("structuredContent").toObject().value("sequence_order").toInt(), 3);
+        QCOMPARE(res.value("structuredContent").toObject().value("hrtf").toString(), QStringLiteral("head"));
+        const QString sofa = QStringLiteral(MONTAGE_TEST_DATA_DIR "/sofa/small.sofa");
+        res = call("montage_ambisonics", {{"project", project}, {"hrtf", sofa}});
+        QCOMPARE(res.value("isError").toBool(), !sofaSupported());
+        if (sofaSupported()) QCOMPARE(binauralHrtf(), sofa.toStdString());
+        QVERIFY(call("montage_ambisonics", {{"project", project}, {"hrtf", QString::fromStdString(fieldWav)}}).value("isError").toBool());
+        call("montage_ambisonics", {{"project", project}, {"hrtf", "head"}});
+        QVERIFY(binauralHrtf().empty());
     }
 
     void vfxPullsWithHandles() {
@@ -5328,6 +5505,17 @@ private slots:
         const auto red = colour(file(shots[0], 1001, "exr")), blue = colour(file(shots[0], 1010, "exr"));
         QVERIFY2(red[0] > 0.6 && red[0] < 0.9 && red[2] < 0.05, qPrintable(QString("%1 %2 %3").arg(red[0]).arg(red[1]).arg(red[2])));
         QVERIFY2(blue[2] > 0.6 && blue[0] < 0.05, qPrintable(QString("%1 %2 %3").arg(blue[0]).arg(blue[1]).arg(blue[2])));
+        // Each shot's ACES Metadata File: its frames by number, in linear Rec.709 (a CLF beside it, ACES having no id
+        // for that), the cut's grade (none here) and the sequence's output transform.
+        AmfDocument amf;
+        QVERIFY2(readAmf(shots[0].amf, amf, &err), err.c_str());
+        QCOMPARE(amf.clipName, std::string("Shot_A"));
+        QCOMPARE(amf.clipSequence, std::string("Shot_A.####.exr"));
+        QVERIFY(amf.sequenceMin == 993 && amf.sequenceMax == 1018);
+        QCOMPARE(amf.inputSpace, std::string("linear-rec709"));
+        QVERIFY(QFileInfo::exists(QString::fromStdString(shots[0].folder + "/linear-rec709_to_ACES2065-1.clf")));
+        QVERIFY(amf.looks.empty());
+        QCOMPARE(amf.outputSpace, std::string("rec709"));
         // The pull list.
         QFile list(QString::fromStdString(o.folder + "/pull_list.csv"));
         QVERIFY(list.open(QIODevice::ReadOnly));
@@ -5354,7 +5542,11 @@ private slots:
         title.start = 40;
         edit::overwrite(p, s, {TrackKind::Video, 0}, title);
         QVERIFY(!exportVfxPulls(p, s, {title.id}, o, &shots, nullptr, nullptr, &err));
-        // Over MCP: every footage clip (the title skipped), as TIFF.
+        // Over MCP: every footage clip (the title skipped), as TIFF; shot A graded with a CDL, which its AMF carries.
+        Cdl grade;
+        grade.slope[0] = 1.2;
+        grade.saturation = 0.8;
+        setClipCdl(p, *edit::clipById(s, a.id), grade);
         const QString project = QString::fromStdString(path("pulls.montage"));
         QVERIFY(saveProject(p, project.toStdString()));
         McpServer server;
@@ -5371,6 +5563,34 @@ private slots:
         QCOMPARE(pulled.size(), 2);
         QCOMPARE(pulled[0].toObject().value("first_frame").toInt(), 997);
         QVERIFY(QFileInfo::exists(r.value("structuredContent").toObject().value("pull_list").toString()));
+        QVERIFY2(readAmf(pulled[0].toObject().value("amf").toString().toStdString(), amf, &err), err.c_str());
+        QVERIFY(amf.looks.size() == 1 && amf.looks[0].cdl.sameGrade(grade));
+        QCOMPARE(amf.inputSpace, std::string("rec709"));  // (TIFF frames are in the sequence's display space)
+        // montage_amf: shot A's AMF out, read, and onto shot B.
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject q{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_amf"}, {"arguments", args},
+                                                       {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                             {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto out = server.handle(QJsonDocument(q).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(out.back())).object().value("result").toObject();
+            return res;
+        };
+        const QString amfPath = QString::fromStdString(path("shotA.amf"));
+        QJsonObject res = call({{"project", project}, {"action", "export"}, {"path", amfPath}, {"clips", QJsonArray{double(a.id)}}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        res = call({{"project", project}, {"action", "read"}, {"path", amfPath}});
+        const QJsonObject held = res.value("structuredContent").toObject();
+        QCOMPARE(held.value("looks").toArray().at(0).toObject().value("kind").toString(), QString("cdl"));
+        QCOMPARE(held.value("output_space").toString(), QString("rec709"));
+        res = call({{"project", project}, {"action", "import"}, {"path", amfPath}, {"clips", QJsonArray{double(b.id)}}});
+        QCOMPARE(res.value("structuredContent").toObject().value("clips").toInt(), 1);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        Cdl got;
+        QVERIFY(clipCdl(*edit::clipById(*back.active(), b.id), 0, got) && got.sameGrade(grade));
+        res = call({{"project", project}, {"action", "export"}, {"path", amfPath}});
+        QVERIFY(res.value("isError").toBool());  // (no clips)
     }
 
     void trimPassesOverMcp() {
@@ -5535,6 +5755,66 @@ private slots:
         Project back;
         QVERIFY(loadProject(project.toStdString(), back));
         QCOMPARE(back.active()->videoTracks[0].clips.front().gradeVersions.size(), size_t(3));
+    }
+
+    void sourceEffectsInNodes() {
+        // Effects that work on the picture as it comes (here Reframe 360) run before the grade whichever node holds
+        // them: off with their node, and run from a shared node.
+        const std::string png = path("nodes-gradient.png");
+        {
+            QImage img(320, 180, QImage::Format_RGB32);
+            for (int y = 0; y < img.height(); ++y)
+                for (int x = 0; x < img.width(); ++x) img.setPixel(x, y, qRgb(x * 255 / 319, y * 255 / 179, 64));
+            QVERIFY(img.save(QString::fromStdString(png)));
+        }
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160, s.height = 90;
+        MediaItem m = probeOrFail(p, png);
+        p.media.push_back(m);
+        Clip c = makeClip(p, p.media.back(), TrackKind::Video, s);
+        c.duration = 10;
+        Effect cc = makeEffect(p, "color_correct");  // (as it is: the picture unchanged)
+        c.effects = {cc};
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok);
+        const Id id = s.videoTracks[0].clips[0].id;
+        auto clip = [&]() -> Clip& { return *edit::clipById(s, id); };
+        RenderOptions o;
+        auto diff = [&](const Image& a, const Image& b) {
+            float d = 0;
+            for (size_t i = 0; i < std::min(a.px.size(), b.px.size()); ++i) d = std::max(d, std::fabs(a.px[i] - b.px[i]));
+            return a.px.size() == b.px.size() ? d : 1e9f;
+        };
+        const Image plain = renderProgramFrame(p, s, 2, o);
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        Effect view = makeEffect(p, "reframe_360");
+        view.params["yaw"] = 90.0;
+        view.node = 1;  // (in a node, as an older project or a hand-made file has it)
+        clip().effects.push_back(view);
+        const Image turned = renderProgramFrame(p, s, 2, o);
+        QVERIFY2(diff(turned, plain) > 0.05f, qPrintable(QString::number(diff(turned, plain))));
+        // The node switched off: no turn.
+        clip().grade.nodes[0].enabled = false;
+        QVERIFY2(diff(renderProgramFrame(p, s, 2, o), plain) < 1e-4f, qPrintable(QString::number(diff(renderProgramFrame(p, s, 2, o), plain))));
+        clip().grade.nodes[0].enabled = true;
+        // Shared, the node's effects in the shared node: still turned; and not with the node off.
+        QVERIFY(edit::shareGradeNode(p, s, id, 1, "Look").ok);
+        QCOMPARE(s.sharedNodes.at(0).effects.size(), size_t(2));
+        QVERIFY2(diff(renderProgramFrame(p, s, 2, o), turned) < 1e-4f, qPrintable(QString::number(diff(renderProgramFrame(p, s, 2, o), turned))));
+        clip().grade.nodes[0].enabled = false;
+        QVERIFY(diff(renderProgramFrame(p, s, 2, o), plain) < 1e-4f);
+        // Such effects stay outside nodes: not moved into one, left out when converting.
+        Clip& d = clip();
+        d.grade = {};
+        Effect nr = makeEffect(p, "video_denoise");
+        d.effects = {cc, nr, makeEffect(p, "invert")};
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        QCOMPARE(clip().effects.at(1).type, std::string("video_denoise"));
+        QCOMPARE(clip().effects.at(1).node, 0);
+        QVERIFY(clip().effects.at(0).node != 0 && clip().effects.at(2).node != 0);
+        const edit::Result moved = edit::moveEffectToNode(p, s, id, clip().effects.at(1).id, clip().effects.at(0).node);
+        QVERIFY(!moved.ok);
+        QVERIFY(QString::fromStdString(moved.error).contains("outside the nodes"));
     }
 
     void gradeNodesOverMcp() {
@@ -8297,6 +8577,164 @@ private slots:
             const QJsonArray v2 = qt[1].toObject().value("components").toArray();
             QCOMPARE(v2[0].toObject().value("inputs").toArray()[0].toObject().value("length").toInt(), 41);  // 40.4 frames, all shown
         }
+    }
+
+    void motionDeblurring() {
+        if (!deblurAvailable()) QSKIP("Built without ONNX Runtime");
+        if (!deblurModel().installed()) QSKIP("Set MONTAGE_DEBLUR_MODEL to the Motion Deblur model");
+        // Lettering, a ring and slanted bars over a soft gradient, smeared sideways over 13 px in light (as a moving camera
+        // smears it), then deblurred.
+        const int W = 448, H = 384;
+        QImage qi(W, H, QImage::Format_RGBA8888_Premultiplied);
+        {
+            QLinearGradient bg(0, 0, 0, H);
+            bg.setColorAt(0, QColor(235, 240, 250));
+            bg.setColorAt(1, QColor(200, 222, 202));
+            QPainter pa(&qi);
+            pa.setRenderHint(QPainter::Antialiasing);
+            pa.fillRect(qi.rect(), bg);
+            QFont font("Sans Serif");
+            font.setPixelSize(64);
+            font.setBold(true);
+            pa.setFont(font);
+            pa.setPen(QColor(20, 20, 30));
+            pa.drawText(QRect(0, 20, W, 90), Qt::AlignCenter, "Montage");
+            pa.setPen(QPen(QColor(200, 40, 40), 6));
+            pa.drawEllipse(QPointF(120, 230), 60, 60);
+            pa.setPen(QPen(QColor(30, 90, 200), 6));
+            for (int i = 0; i < 6; ++i) pa.drawLine(230 + i * 30, 150, 250 + i * 30, 330);
+        }
+        Image truth(W, H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W * 4; ++x) truth.row(y)[x] = qi.constScanLine(y)[x] / 255.0f;
+        Image blurred = truth;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                for (int c = 0; c < 3; ++c) {
+                    double acc = 0;
+                    for (int d = -6; d <= 6; ++d) acc += std::pow(double(truth.at(std::clamp(x + d, 0, W - 1), y)[c]), 2.2);
+                    blurred.at(x, y)[c] = float(std::pow(acc / 13, 1 / 2.2));
+                }
+        auto psnr = [&](const Image& a) {
+            double acc = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 16; x < W - 16; ++x)
+                    for (int c = 0; c < 3; ++c) acc += std::pow(double(a.at(x, y)[c]) - truth.at(x, y)[c], 2);
+            return 10 * std::log10(1.0 / (acc / (double(W - 32) * H * 3)));
+        };
+        Image sharp;
+        std::string err;
+        QVERIFY2(motionDeblur(blurred, sharp, 1.0, &err), err.c_str());
+        QCOMPARE(sharp.width, W);
+        QVERIFY2(psnr(sharp) > psnr(blurred) + 1.0, qPrintable(QString("blurred %1 dB, deblurred %2 dB").arg(psnr(blurred)).arg(psnr(sharp))));
+        // Half strength is half way; in two overlapping tiles much the same as one pass.
+        Image half;
+        QVERIFY(motionDeblur(blurred, half, 0.5));
+        QVERIFY(std::fabs(half.at(100, 60)[0] - 0.5f * (blurred.at(100, 60)[0] + sharp.at(100, 60)[0])) < 1e-5f);
+        {
+            // Twice as wide: three tiles of 384 (starting at 0, 256 and 512) against one pass, compared across the joins.
+            const int W2 = 2 * W;
+            Image wide(W2, H), wideTruth(W2, H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W2; ++x) {
+                    std::copy_n(blurred.at(x % W, y), 4, wide.at(x, y));
+                    std::copy_n(truth.at(x % W, y), 4, wideTruth.at(x, y));
+                }
+            Image whole, tiled;
+            QVERIFY2(motionDeblur(wide, whole, 1.0, &err, nullptr, 1024), err.c_str());
+            QVERIFY2(motionDeblur(wide, tiled, 1.0, &err, nullptr, 384), err.c_str());
+            std::vector<float> seams;
+            for (int y = 0; y < H; ++y)
+                for (int join : {256, 384, 512, 640})
+                    for (int x = join - 32; x < join + 32; ++x) seams.push_back(std::fabs(tiled.at(x, y)[1] - whole.at(x, y)[1]));
+            std::sort(seams.begin(), seams.end());
+            const float p99 = seams[seams.size() * 99 / 100];
+            QVERIFY2(p99 < 0.08f, qPrintable(QString::number(p99)));
+            double acc = 0, accBlur = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 16; x < W2 - 16; ++x)
+                    for (int c = 0; c < 3; ++c) {
+                        acc += std::pow(double(tiled.at(x, y)[c]) - wideTruth.at(x, y)[c], 2);
+                        accBlur += std::pow(double(wide.at(x, y)[c]) - wideTruth.at(x, y)[c], 2);
+                    }
+            QVERIFY2(10 * std::log10(accBlur / acc) > 0.8, qPrintable(QString::number(10 * std::log10(accBlur / acc))));
+        }
+        // Smaller than the model takes (the lettering, 300 x 120): mirrored out to its size, deblurred, and back; alpha kept,
+        // a transparent corner left as it was, a value above 1 keeping what is beyond.
+        const int SW2 = 300, SH2 = 120;
+        Image small(SW2, SH2);
+        for (int y = 0; y < SH2; ++y)
+            for (int x = 0; x < SW2; ++x) {
+                float* q = small.at(x, y);
+                const float a = x < 250 ? 1.0f : 0.5f;
+                for (int c = 0; c < 3; ++c) q[c] = blurred.at(x + 74, y + 5)[c] * a;
+                q[3] = a;
+            }
+        for (int y = 0; y < 10; ++y)
+            for (int x = 0; x < 10; ++x) std::fill_n(small.at(x, y), 4, 0.0f);
+        small.at(150, 100)[0] = 1.5f;
+        Image smallOut;
+        QVERIFY2(motionDeblur(small, smallOut, 1.0, &err), err.c_str());
+        QCOMPARE(smallOut.width, SW2);
+        QCOMPARE(smallOut.at(280, 40)[3], 0.5f);
+        for (float v : smallOut.px) QVERIFY(std::isfinite(v));
+        QCOMPARE(smallOut.at(3, 3)[0], 0.0f);
+        QVERIFY(smallOut.at(150, 100)[0] > 1.0f);
+        {
+            double acc = 0, accBlur = 0;
+            for (int y = 16; y < SH2 - 16; ++y)
+                for (int x = 16; x < 234; ++x)
+                    for (int c = 0; c < 3; ++c) {
+                        acc += std::pow(double(smallOut.at(x, y)[c]) - truth.at(x + 74, y + 5)[c], 2);
+                        accBlur += std::pow(double(small.at(x, y)[c]) - truth.at(x + 74, y + 5)[c], 2);
+                    }
+            QVERIFY2(10 * std::log10(accBlur / acc) > 0.5, qPrintable(QString::number(10 * std::log10(accBlur / acc))));
+        }
+
+        // As a clip effect on a still of the smeared picture.
+        const QString png = QString::fromStdString(path("smeared.png"));
+        {
+            QImage q(W, H, QImage::Format_RGBA8888);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const float* p = blurred.at(x, y);
+                    q.setPixelColor(x, y, QColor::fromRgbF(p[0], p[1], p[2], 1));
+                }
+            QVERIFY(q.save(png));
+        }
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W;
+        s.height = H;
+        MediaItem m = probeOrFail(p, png.toStdString());
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Image without = renderSequenceFrame(p, s, 5, {});
+        s.videoTracks[0].clips[0].effects.push_back(makeEffect(p, "motion_deblur"));
+        // A view that cannot wait goes without it (and says the frame is not final); rendered ahead it runs, and the view then
+        // has it; half strength mixes the same result without the model.
+        RenderIssues quick;
+        RenderOptions interactive;
+        interactive.issues = &quick;
+        QCOMPARE(renderSequenceFrame(p, s, 5, interactive).px, without.px);
+        QVERIFY(quick.incomplete);
+        RenderIssues full;
+        RenderOptions ahead;
+        ahead.slowEffects = true;
+        ahead.issues = &full;
+        const Image with = renderSequenceFrame(p, s, 5, ahead);
+        QVERIFY(!full.incomplete);
+        QVERIFY2(psnr(with) > psnr(without) + 1.0, qPrintable(QString("%1 %2").arg(psnr(without)).arg(psnr(with))));
+        QCOMPARE(renderSequenceFrame(p, s, 5, {}).px, with.px);
+        s.videoTracks[0].clips[0].effects.back().params["strength"] = Param(50.0);
+        RenderIssues halfIssues;
+        RenderOptions halfView;
+        halfView.issues = &halfIssues;
+        const Image halfWith = renderSequenceFrame(p, s, 5, halfView);
+        QVERIFY(!halfIssues.incomplete);
+        QVERIFY(std::fabs(halfWith.at(200, 60)[1] - 0.5f * (with.at(200, 60)[1] + without.at(200, 60)[1])) < 1e-4f);
+        const Provenance prov = sequenceProvenance(p, s);
+        QVERIFY(std::any_of(prov.ai.begin(), prov.ai.end(), [](const AiUse& u) { return u.model == "NAFNet"; }));
     }
 
     void superScaleUpscaling() {
@@ -12967,8 +13405,9 @@ if ui["pressed"] == "add":
     }
 
     void embeddedClosedCaptions() {
-        // A 6 s cut with two captions, written with CEA-608 captions inside the video and read back.
-        auto make = [&](Rational fps, const std::string& codec, const std::string& file, std::string* err) {
+        // A 6 s cut with two captions (the second at the top right), written with CEA-608 and CTA-708 captions inside the
+        // video and read back, each standard on its own.
+        auto make = [&](Rational fps, const std::string& codec, const std::string& file, std::string* err, bool with708 = true) {
             Project p = makeDefaultProject();
             Sequence& s = *p.active();
             s.width = 160, s.height = 90, s.fps = fps;
@@ -12979,6 +13418,8 @@ if ui["pressed"] == "add":
             t.id = p.newId();
             t.captions = {{FrameTime(std::llround(1.0 * f)), FrameTime(std::llround(2.5 * f)), "Hello there", {}},
                           {FrameTime(std::llround(3.0 * f)), FrameTime(std::llround(5.0 * f)), "A second caption\non two rows", {}}};
+            t.captions[1].vertical = kCaptionTop;
+            t.captions[1].align = kCaptionRight;
             s.captionTracks.push_back(t);
             ExportSettings st;
             st.path = file;
@@ -12986,23 +13427,39 @@ if ui["pressed"] == "add":
             st.audioCodec = "none";
             st.preset = codec == "libx264" ? "ultrafast" : "medium";
             st.cea608 = true;
+            st.cea708 = with708;
             return exportSequence(p, s, st, nullptr, nullptr, err);
         };
         std::string err;
         for (const auto& [fps, codec] : std::vector<std::pair<Rational, std::string>>{{{30000, 1001}, "libx264"}, {{25, 1}, "libx264"}, {{24000, 1001}, "libx265"}}) {
             const std::string file = path(("cc608-" + std::to_string(fps.num) + "-" + codec + ".mp4").c_str());
             QVERIFY2(make(fps, codec, file, &err), err.c_str());
+            for (CaptionStandard standard : {CaptionStandard::Auto, CaptionStandard::Cea608, CaptionStandard::Cea708}) {
+                std::vector<Caption> back;
+                QVERIFY2(readEmbeddedCaptions(file, fps, back, {}, nullptr, &err, standard), qPrintable(QString::fromStdString(codec + ": " + err)));
+                QCOMPARE(back.size(), size_t(2));
+                const double f = fps.toDouble();
+                if (standard != CaptionStandard::Cea608) {  // 708 keeps the place
+                    QCOMPARE(back[1].vertical, int(kCaptionTop));
+                    QCOMPARE(back[1].align, int(kCaptionRight));
+                }
+                QCOMPARE(back[0].text, std::string("Hello there"));
+                QCOMPARE(back[1].text, std::string("A second caption\non two rows"));
+                // Shown and cleared within a frame or two of when the captions say.
+                QVERIFY2(std::llabs(back[0].start - std::llround(1.0 * f)) <= 2, qPrintable(QString::number(back[0].start)));
+                QVERIFY2(std::llabs(back[0].end - std::llround(2.5 * f)) <= 2, qPrintable(QString::number(back[0].end)));
+                QVERIFY2(std::llabs(back[1].start - std::llround(3.0 * f)) <= 2, qPrintable(QString::number(back[1].start)));
+                QVERIFY2(std::llabs(back[1].end - std::llround(5.0 * f)) <= 2, qPrintable(QString::number(back[1].end)));
+            }
+        }
+        // 608 alone: no 708 service to read, and Auto reads the 608.
+        {
+            const std::string file = path("cc608-only.mp4");
+            QVERIFY2(make({30000, 1001}, "libx264", file, &err, false), err.c_str());
             std::vector<Caption> back;
-            QVERIFY2(readEmbeddedCaptions(file, fps, back, {}, nullptr, &err), qPrintable(QString::fromStdString(codec + ": " + err)));
-            QCOMPARE(back.size(), size_t(2));
-            const double f = fps.toDouble();
-            QCOMPARE(back[0].text, std::string("Hello there"));
-            QCOMPARE(back[1].text, std::string("A second caption\non two rows"));
-            // Shown and cleared within a frame or two of when the captions say.
-            QVERIFY2(std::llabs(back[0].start - std::llround(1.0 * f)) <= 2, qPrintable(QString::number(back[0].start)));
-            QVERIFY2(std::llabs(back[0].end - std::llround(2.5 * f)) <= 2, qPrintable(QString::number(back[0].end)));
-            QVERIFY2(std::llabs(back[1].start - std::llround(3.0 * f)) <= 2, qPrintable(QString::number(back[1].start)));
-            QVERIFY2(std::llabs(back[1].end - std::llround(5.0 * f)) <= 2, qPrintable(QString::number(back[1].end)));
+            QVERIFY(!readEmbeddedCaptions(file, {30000, 1001}, back, {}, nullptr, &err, CaptionStandard::Cea708));
+            QVERIFY(readEmbeddedCaptions(file, {30000, 1001}, back, {}, nullptr, &err));
+            QVERIFY(back.size() == 2 && back[0].text == "Hello there");
         }
         // Only H.264 and HEVC carry them.
         QVERIFY(!make({25, 1}, "prores_ks", path("cc608.mov"), &err));
@@ -15275,6 +15732,276 @@ if ui["pressed"] == "add":
         // Nothing beneath: an error.
         QVERIFY(!trackClipFollow(p, s, footage, 0, true, MotionModel::Translation, 0.3, keys, {}, nullptr, &err));
         QVERIFY(!err.empty());
+    }
+
+    void higherOrderAmbisonics() {
+        const int rate = 48000;
+        // A third-order field (16 channels, ACN, SN3D) of a 3 kHz tone from the left, as a plain WAV.
+        // `gated`: the tone only in the first half of each half second (so noise reduction does not take it for noise).
+        auto writeField = [&](const std::string& file, int order, double angle, double elevation, bool gated = false) {
+            const int nch = ambisonicChannels(order);
+            float g[16];
+            ambisonicEncode(order, angle, elevation, g);
+            QByteArray data;
+            for (int i = 0; i < rate; ++i) {
+                const bool on = !gated || (i % 24000) < 12000;
+                const float v = on ? 0.3f * float(std::sin(2 * M_PI * 3000 * i / double(rate))) : 0.0f;
+                for (int k = 0; k < nch; ++k) {
+                    const int16_t q = int16_t(std::lround(std::clamp(v * g[k], -1.0f, 1.0f) * 32767));
+                    data.append(reinterpret_cast<const char*>(&q), 2);
+                }
+            }
+            auto u32 = [](uint32_t v) { return std::string(reinterpret_cast<const char*>(&v), 4); };
+            auto u16 = [](uint16_t v) { return std::string(reinterpret_cast<const char*>(&v), 2); };
+            const std::string fmt = u16(1) + u16(uint16_t(nch)) + u32(uint32_t(rate)) + u32(uint32_t(rate * nch * 2)) + u16(uint16_t(nch * 2)) + u16(16);
+            const std::string chunks = "fmt " + u32(16) + fmt + "data" + u32(uint32_t(data.size())) + data.toStdString();
+            QFile f(QString::fromStdString(file));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QByteArray::fromStdString("RIFF" + u32(uint32_t(4 + chunks.size())) + "WAVE" + chunks));
+        };
+        auto rms = [](const std::vector<float>& b, int nch, int ch, int from, int to) {
+            double e = 0;
+            for (int i = from; i < to; ++i) e += double(b[size_t(i) * size_t(nch) + size_t(ch)]) * b[size_t(i) * size_t(nch) + size_t(ch)];
+            return std::sqrt(e / std::max(1, to - from));
+        };
+        const std::string third = path("hoa3-left.wav"), first = path("foa-left.wav");
+        writeField(third, 3, -90, 0);
+        writeField(first, 1, -90, 0);
+        // Decoded to its order: all 16 channels, as encoded.
+        std::string err;
+        AudioBufferPtr b = decodeAmbisonic(third, rate, &err);
+        QVERIFY2(b && b->channels == 16, err.c_str());
+        float want[16];
+        ambisonicEncode(3, -90, 0, want);
+        const double w0 = rms(b->samples, 16, 0, 4800, 24000);
+        for (int k = 0; k < 16; ++k)
+            QVERIFY2(std::fabs(rms(b->samples, 16, k, 4800, 24000) - std::fabs(want[k]) * w0) < 0.01, qPrintable(QString::number(k)));
+        // A sequence with the field on its first track, and its mix in a layout.
+        auto fieldSequence = [&](Project& p, const std::string& file, int order, const std::string& layout) -> Sequence& {
+            p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.fps = Rational{25, 1};
+            s.audioLayout = layout;
+            MediaItem m = probeOrFail(p, file);
+            m.ambisonic = order;
+            p.media.push_back(m);
+            Clip c = makeClip(p, m, TrackKind::Audio, s);
+            c.duration = 25;
+            edit::overwrite(p, s, {TrackKind::Audio, 0}, c);
+            return s;
+        };
+        auto mixLayout = [&](const Project& p, const Sequence& s) {
+            std::vector<float> out(size_t(rate) * size_t(layoutChannels(s.audioLayout)));
+            AudioMixer mixer;
+            mixer.mixLayout(p, s, 0, rate, out.data());
+            return out;
+        };
+        Project p;
+        {
+            // Kept whole in a third-order mix; cut to its first order in a first-order one.
+            Sequence& s = fieldSequence(p, third, 3, "ambix3");
+            QCOMPARE(p.media.back().channels, 16);
+            auto out = mixLayout(p, s);
+            const double w = rms(out, 16, 0, 4800, 24000);
+            QVERIFY2(w > 0.15, qPrintable(QString::number(w)));
+            for (int k = 0; k < 16; ++k) QVERIFY2(std::fabs(rms(out, 16, k, 4800, 24000) - std::fabs(want[k]) * w) < 0.01 * w + 1e-4, qPrintable(QString::number(k)));
+            s.audioLayout = "ambix";
+            out = mixLayout(p, s);
+            QVERIFY(std::fabs(rms(out, 4, 1, 4800, 24000) - w) < 0.01 * w);
+            // Media marked first order plays its first four channels, whatever else the file holds.
+            s.audioLayout = "ambix3";
+            p.media.back().ambisonic = 1;
+            out = mixLayout(p, s);
+            QVERIFY(std::fabs(rms(out, 16, 1, 4800, 24000) - w) < 0.01 * w);
+            for (int k = 4; k < 16; ++k) QVERIFY(rms(out, 16, k, 4800, 24000) < 1e-5);
+        }
+        {
+            // The pool decodes only the order asked for (a third-order file marked first order costs four channels).
+            QCOMPARE(MediaPool::instance().audio(ambisonicAudioKey(third, 1), rate)->channels, 4);
+            QCOMPARE(MediaPool::instance().audio(ambisonicAudioKey(third, 2), rate)->channels, 9);
+            QCOMPARE(ambisonicAudioKeyOrder(ambisonicAudioKey(third, 3)), 3);
+            QCOMPARE(ambisonicAudioKeyOrder(third), 0);
+            AudioBufferPtr nine = decodeAmbisonic(third, rate, &err, nullptr, 2);
+            QVERIFY(nine && nine->channels == 9);
+            // Noise reduction on a third-order field: all 16 channels kept, cleaned alike, the field's shape held.
+            const std::string gated = path("hoa3-gated.wav");
+            writeField(gated, 3, -90, 0, true);
+            auto src = MediaPool::instance().audio(ambisonicAudioKey(gated, 3), rate);
+            Effect dn = makeEffect(p, "denoise");
+            dn.params["reduction_db"] = Param(20.0);
+            const AudioBufferPtr clean = cleanedAudio(ambisonicAudioKey(gated, 3), src, {&dn}, true);
+            QVERIFY(clean && clean->channels == 16 && clean->frames() == src->frames());
+            const double cw = rms(clean->samples, 16, 0, 2000, 10000);
+            QVERIFY2(cw > 0.1, qPrintable(QString::number(cw)));
+            for (int k : {1, 9, 15})
+                QVERIFY2(std::fabs(rms(clean->samples, 16, k, 2000, 10000) - std::fabs(want[k]) * cw) < 0.05 * cw, qPrintable(QString::number(k)));
+            // And in the mix, with Pitch Shift (the channels in pairs, an odd count's last with itself) too.
+            Sequence& s = fieldSequence(p, gated, 3, "ambix3");
+            s.audioTracks[0].clips[0].effects.push_back(dn);
+            auto out = mixLayout(p, s);
+            QVERIFY(rms(out, 16, 1, 2000, 10000) > 0.1);
+            Effect shift = makeEffect(p, "pitch_shift");
+            s.audioTracks[0].clips[0].effects = {shift};
+            s.audioLayout = "ambix2";
+            p.media.back().ambisonic = 2;
+            out = mixLayout(p, s);
+            QVERIFY(rms(out, 9, 8, 2000, 10000) > 0.01);
+        }
+        {
+            // A first-order file in a third-order mix: its channels as they are, the higher orders silent.
+            Sequence& s = fieldSequence(p, first, 1, "ambix3");
+            QCOMPARE(p.media.back().channels, 4);
+            const auto out = mixLayout(p, s);
+            QVERIFY(rms(out, 16, 1, 4800, 24000) > 0.15);
+            for (int k = 4; k < 16; ++k) QVERIFY(rms(out, 16, k, 4800, 24000) < 1e-5);
+        }
+        {
+            // On 7.1.4's speakers (AllRAD): from the left, the left side speaker loudest, little on the right, nothing in
+            // the LFE; turned 90° left by its Ambisonics effect, the centre.
+            Sequence& s = fieldSequence(p, third, 3, "7.1.4");
+            const auto& sp = layoutSpeakers("7.1.4");
+            const int n = int(sp.size());
+            auto loudest = [&](const std::vector<float>& out) {
+                int best = 0;
+                for (int c = 1; c < n; ++c)
+                    if (rms(out, n, c, 4800, 24000) > rms(out, n, best, 4800, 24000)) best = c;
+                return std::string(sp[size_t(best)].name);
+            };
+            auto out = mixLayout(p, s);
+            QCOMPARE(loudest(out), std::string("Ls"));
+            QVERIFY(rms(out, n, 7, 4800, 24000) < 0.1 * rms(out, n, 6, 4800, 24000));  // Rs against Ls
+            QVERIFY(rms(out, n, 3, 4800, 24000) < 1e-6);
+            Effect amb = makeEffect(p, "ambisonics");
+            amb.params["yaw"] = -90.0;
+            s.audioTracks[0].clips[0].effects.push_back(amb);
+            out = mixLayout(p, s);
+            QCOMPARE(loudest(out), std::string("C"));
+            // The clip's gain moves it; the track's fader too.
+            s.audioTracks[0].clips[0].audio.params["gain_db"] = Param(-6.0);
+            s.audioTracks[0].volumeDb = -6;
+            const auto quieter = mixLayout(p, s);
+            QVERIFY2(std::fabs(rms(quieter, n, 2, 4800, 24000) / rms(out, n, 2, 4800, 24000) - 0.25) < 0.02,
+                     qPrintable(QString::number(rms(quieter, n, 2, 4800, 24000) / rms(out, n, 2, 4800, 24000))));
+            // Folded to stereo for listening: from the left again, on the left.
+            s.audioTracks[0].clips[0].effects.clear();
+            std::vector<float> st(size_t(rate) * 2);
+            AudioMixer mixer;
+            mixer.mix(p, s, 0, rate, st.data());
+            QVERIFY(rms(st, 2, 0, 4800, 24000) > 1.5 * rms(st, 2, 1, 4800, 24000));
+        }
+        {
+            // In a stereo mix, binaurally at its own order: the left ear louder.
+            Sequence& s = fieldSequence(p, third, 3, "stereo");
+            std::vector<float> st(size_t(rate) * 2);
+            AudioMixer mixer;
+            mixer.mix(p, s, 0, rate, st.data());
+            QVERIFY(rms(st, 2, 0, 4800, 24000) > 1.5 * rms(st, 2, 1, 4800, 24000));
+        }
+        {
+            // Exported as a third-order field: PCM in MOV, with an SA3D box of order 3 Montage reads back; AAC (which has
+            // no layout for 16 channels) takes its first order, as YouTube does.
+            Sequence& s = fieldSequence(p, third, 3, "ambix3");
+            QCOMPARE(exportAudioLayout("ambix3", "pcm_s24le"), std::string("ambix3"));
+            QCOMPARE(exportAudioLayout("ambix3", "aac"), std::string("ambix"));
+            QCOMPARE(exportAudioLayout("ambix2", "libopus"), std::string("stereo"));
+            for (const auto& [codec, file] : {std::pair<std::string, std::string>{"pcm_s24le", path("hoa3.mov")}, {"aac", path("hoa3.mp4")}}) {
+                const int order = codec == "aac" ? 1 : 3, nch = ambisonicChannels(order);
+                ExportSettings st;
+                st.path = file;
+                st.videoCodec = "none";
+                st.audioCodec = codec;
+                st.in = 0;
+                st.out = 25;
+                QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), (codec + ": " + err).c_str());
+                QCOMPARE(readSpatialAudioBox(file), order);
+                MediaItem back;
+                QVERIFY(probeMedia(file, back));
+                QCOMPARE(back.channels, nch);
+                QCOMPARE(back.ambisonic, order);
+                AudioBufferPtr fb = decodeAmbisonic(file, rate, &err);
+                QVERIFY2(fb && fb->channels == nch, err.c_str());
+                const double w = rms(fb->samples, nch, 0, 4800, 24000);
+                for (int k : {1, 4, 9, 15})
+                    if (k < nch)
+                        QVERIFY2(std::fabs(rms(fb->samples, nch, k, 4800, 24000) - std::fabs(want[k]) * w) < 0.05 * w + 1e-3,
+                                 qPrintable(QString("%1 %2").arg(QString::fromStdString(codec)).arg(k)));
+            }
+        }
+        // Measured heads from SOFA files (a made-up one here; SADIE II's KU100 when it is downloaded).
+        const std::string sofa = std::string(MONTAGE_TEST_DATA_DIR) + "/sofa/small.sofa";
+        if (!sofaSupported()) {
+            QVERIFY(!readSofa(sofa, rate, &err) && err.find("libmysofa") != std::string::npos);
+            QSKIP("Built without libmysofa");
+        }
+        for (const std::string& file : {sofa, std::string(MONTAGE_TEST_DATA_DIR) + "/sofa/small.zip"}) {
+            auto h = readSofa(file, rate, &err);
+            QVERIFY2(h, err.c_str());
+            QCOMPARE(h->sampleRate, double(rate));
+            QCOMPARE(h->directions.size(), binauralDirections().size());
+            QCOMPARE(h->name, std::string("Montage test head"));
+            QVERIFY(h->length >= 32 && h->length <= 40);  // 32 taps at 44.1 kHz, resampled
+            // binauralDirections()'s first is straight ahead (the ears alike); its third the left.
+            auto peak = [&](const std::vector<float>& ir, size_t k) {
+                size_t at = 0;
+                for (size_t i = 1; i < size_t(h->length); ++i)
+                    if (std::fabs(ir[k * size_t(h->length) + i]) > std::fabs(ir[k * size_t(h->length) + at])) at = i;
+                return std::pair{int(at), std::fabs(ir[k * size_t(h->length) + at])};
+            };
+            QVERIFY(std::fabs(binauralDirections()[2][0] + 90) < 1e-6);
+            const auto l = peak(h->left, 2), r = peak(h->right, 2);
+            QVERIFY2(l.first < r.first && l.second > 2 * r.second, qPrintable(QString("%1 %2 %3 %4").arg(l.first).arg(r.first).arg(l.second).arg(r.second)));
+        }
+        QVERIFY(!readSofa(third, rate, &err) && !err.empty());
+        QVERIFY(!readSofa(path("no-such.sofa"), rate, &err));
+        // Chosen for binaural listening: the mix hears through it (made again for the new head), and the head model
+        // again when chosen back.
+        {
+            Sequence& s = fieldSequence(p, third, 3, "stereo");
+            AudioMixer mixer;
+            std::vector<float> model(size_t(rate) * 2), measured(size_t(rate) * 2);
+            mixer.mix(p, s, 0, rate, model.data());
+            const uint64_t before = binauralHrtfGeneration();
+            setBinauralHrtf(sofa);
+            QCOMPARE(binauralHrtf(), sofa);
+            QVERIFY(binauralHrtfGeneration() != before);
+            QVERIFY(binauralHrirs(rate));
+            mixer.mix(p, s, rate, rate, measured.data());  // (a later block: the mixer keeps going)
+            AudioMixer fresh;
+            fresh.mix(p, s, 0, rate, measured.data());
+            QVERIFY(rms(measured, 2, 0, 4800, 24000) > 1.5 * rms(measured, 2, 1, 4800, 24000));
+            double diff = 0;
+            for (size_t i = 0; i < model.size(); ++i) diff = std::max(diff, double(std::fabs(model[i] - measured[i])));
+            QVERIFY(diff > 0.01);
+            // An offline mix (an export) keeps the head it started with when another is chosen part way through.
+            setBinauralHrtf("");
+            AudioMixer offline, steady;
+            std::vector<float> a(size_t(rate) * 2), b2(size_t(rate) * 2);
+            offline.mix(p, s, 0, rate / 2, a.data());
+            setBinauralHrtf(sofa);
+            offline.mix(p, s, rate / 2, rate / 2, a.data() + rate);
+            setBinauralHrtf("");
+            steady.mix(p, s, 0, rate, b2.data());
+            for (size_t i = 0; i < a.size(); ++i) QVERIFY(std::fabs(a[i] - b2[i]) < 1e-5);
+            setBinauralHrtf(sofa);
+            // Not readable: the head model is heard, and why is said.
+            setBinauralHrtf(third);
+            QVERIFY(!binauralHrirs(rate, true, &err) && !err.empty());
+            setBinauralHrtf("");
+            QVERIFY(!binauralHrirs(rate));
+            AudioMixer again;
+            again.mix(p, s, 0, rate, measured.data());
+            for (size_t i = 0; i < model.size(); ++i) QVERIFY(std::fabs(model[i] - measured[i]) < 1e-5);
+        }
+        // SADIE II's KU100: 256 taps at 48 kHz; from the left, the left ear louder.
+        if (sadieKu100Pack().installed()) {
+            auto h = readSofa(sadieKu100Pack().path(sadieKu100Pack().files.front()), rate, &err);
+            QVERIFY2(h && h->length == 256, err.c_str());
+            double eL = 0, eR = 0;
+            for (int i = 0; i < 256; ++i) eL += h->left[2 * 256 + size_t(i)] * h->left[2 * 256 + size_t(i)], eR += h->right[2 * 256 + size_t(i)] * h->right[2 * 256 + size_t(i)];
+            QVERIFY2(eL > 4 * eR, qPrintable(QString("%1 %2").arg(eL).arg(eR)));
+        } else {
+            qInfo("SADIE II's KU100 is not downloaded (scripts/fetch-models.sh --hrtf, MONTAGE_HRTF_DIR): its check skipped");
+        }
     }
 
     void ambisonicReviewFixes() {

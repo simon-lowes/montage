@@ -45,9 +45,10 @@ ViewerWidget::ViewerWidget(QWidget* parent) : QWidget(parent) {
     setAttribute(Qt::WA_OpaquePaintEvent);
 }
 
-void ViewerWidget::setImage(const QImage& img) {
+void ViewerWidget::setImage(const QImage& img, FrameTime t) {
     const bool reshaped = img.isNull() != image_.isNull() || img.size() != image_.size();
     image_ = img;
+    imageTime_ = t;
     // Under the HDR surface the SDR picture is not seen: repainted (and the drawing over it sent again) only when its
     // place moved, or when the exposure check, drawn from it, is on.
     if (!hdrShowing() || reshaped || exposure_ != 0) update();
@@ -68,15 +69,28 @@ void ViewerWidget::setSafeMargins(bool on) {
 }
 
 void ViewerWidget::setExposureView(int mode) {
-    exposure_ = std::clamp(mode, 0, 3);
+    exposure_ = std::clamp(mode, 0, int(ExposureView::OutOfGamutP3));
     update();
+}
+
+void ViewerWidget::setSignal(const QImage& signal, FrameTime t, const QString& space) {
+    signal_ = signal;
+    signalTime_ = t;
+    signalSpace_ = space;
+    if (exposure_ >= int(ExposureView::OutOfGamut709)) update();
 }
 
 QImage ViewerWidget::shownImage() const {
     if (exposure_ == 0 || image_.isNull()) return image_;
-    if (exposedKey_ != image_.cacheKey() || exposedMode_ != exposure_) {
-        exposed_ = montage::exposureView(image_, ExposureView(exposure_));
+    const bool gamut = exposure_ >= int(ExposureView::OutOfGamut709);
+    // The gamut checks need the frame as delivered: none marked while the one at hand is another frame's.
+    const QImage signal = gamut && !signal_.isNull() && signalTime_ == imageTime_ ? signal_ : QImage();
+    if (exposedKey_ != image_.cacheKey() || exposedMode_ != exposure_ || exposedSignalKey_ != (signal.isNull() ? -1 : signal.cacheKey())) {
+        exposed_ = !gamut ? montage::exposureView(image_, ExposureView(exposure_))
+                          : montage::gamutView(image_, signal, signalSpace_,
+                                               exposure_ == int(ExposureView::OutOfGamutP3) ? Primaries::P3D65 : Primaries::Bt709);
         exposedKey_ = image_.cacheKey();
+        exposedSignalKey_ = signal.isNull() ? -1 : signal.cacheKey();
         exposedMode_ = exposure_;
     }
     return exposed_;
@@ -632,8 +646,11 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
     exposure_->addItem(tr("Zebras 100 %"));
     exposure_->addItem(tr("Zebras 70 %"));
     exposure_->addItem(tr("False Colour"));
+    exposure_->addItem(tr("Out of Gamut: Rec.709"));
+    exposure_->addItem(tr("Out of Gamut: P3"));
     exposure_->setToolTip(tr("Zebra stripes over clipping (or skin-tone exposure), or false colour by brightness: purple crushed, "
-                             "blue near black, green 18 % grey, pink a stop over, yellow near clipping, red clipped"));
+                             "blue near black, green 18 % grey, pink a stop over, yellow near clipping, red clipped; or "
+                             "magenta stripes over colours a Rec.709 or P3 delivery cannot show"));
     connect(exposure_, &QComboBox::currentIndexChanged, viewer_, &ViewerWidget::setExposureView);
     bar->addWidget(exposure_);
     bar->addStretch();
@@ -649,10 +666,12 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
     lay->addLayout(bar);
 
     connect(scrub_, &ScrubBar::seekRequested, controller_, &PlaybackController::seek);
-    connect(controller_, &PlaybackController::frameRendered, viewer_, [this](const QImage& img, FrameTime) {
+    connect(controller_, &PlaybackController::frameRendered, viewer_, [this](const QImage& img, FrameTime t) {
         if (mode_ == Mode::Source && !state_->sourceMedia()) return;
-        viewer_->setImage(img);
+        viewer_->setImage(img, t);
     });
+    connect(controller_, &PlaybackController::scopeFrameRendered, viewer_,
+            [this](const QImage& img, FrameTime t, const QString& space, double) { viewer_->setSignal(img, t, space); });
     connect(controller_, &PlaybackController::hdrFrameRendered, viewer_, [this](HdrPicturePtr picture, FrameTime) {
         if (mode_ == Mode::Source && !state_->sourceMedia()) return;
         viewer_->setHdrPicture(std::move(picture));
@@ -730,8 +749,8 @@ void MonitorPanel::updateLookAround() {
     if (s)
         for (Id id : state_->selectedClips())
             if (const Clip* c = edit::clipById(*s, id); c && c->contains(t))
-                for (const Effect& e : c->effects)
-                    if (e.type == "reframe_360" && e.enabled) lookClip_ = id;
+                for (const Effect* e : liveEffects(*s, *c))
+                    if (e->type == "reframe_360") lookClip_ = id;
     if (!state_->inGesture() || !lookClip_) viewer_->setLookAround(lookClip_ != 0);
 }
 

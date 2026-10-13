@@ -23,12 +23,19 @@ struct Speaker {
 // overhead speakers: "5.1.2" and "5.1.4" (5.1 and two or four above, ITU-R BS.2051 2+5+0 and 4+5+0), "7.1.2" (7.1
 // and two above at the sides, as Dolby's bed) and "7.1.4" (4+7+0), in channel order (FFmpeg's). Anything else is stereo.
 // "ambix" is first-order ambisonics (core/Ambisonics.h): its four channels W, Y, Z, X are not speakers but the
-// sound field, and panning places a sound in it from a direction.
+// sound field, and panning places a sound in it from a direction; "ambix2" and "ambix3" are second and third order
+// (9 and 16 channels, ACN order, SN3D).
 const std::vector<Speaker>& layoutSpeakers(const std::string& layout);
 int layoutChannels(const std::string& layout);
-// "stereo", "5.1", "7.1", "5.1.2", "5.1.4", "7.1.2", "7.1.4", "ambix"
+// "stereo", "5.1", "7.1", "5.1.2", "5.1.4", "7.1.2", "7.1.4", "ambix", "ambix2", "ambix3"
 const std::vector<std::string>& audioLayouts();
 bool ambisonicLayout(const std::string& layout);
+// An ambisonic layout's order (1 to 3), else 0; and the layout of an order.
+int ambisonicOrder(const std::string& layout);
+std::string ambisonicLayoutFor(int order);
+// A speaker layout's AllRAD decoder for a field of `order` (core/Ambisonics.h allradDecoder): speakers ×
+// ambisonicChannels(order) gains, the LFE's none. Empty for stereo and ambisonic layouts.
+const std::vector<float>& layoutDecoder(const std::string& layout, int order);
 // Whether a layout has overhead speakers, and the same layout without them ("7.1.4" -> "7.1").
 bool immersiveLayout(const std::string& layout);
 std::string earLevelLayout(const std::string& layout);
@@ -52,7 +59,7 @@ SurroundGains surroundGains(const std::string& layout, const SurroundPan& p);
 
 // ITU-R BS.775 fold-down to stereo: the centre and the surrounds at -3 dB
 // into their side, the LFE left out (an ambisonic mix is heard through two
-// virtual cardioids). `in` has the layout's channels; `out` is stereo. In
+// virtual cardioids, from its first order). `in` has the layout's channels; `out` is stereo. In
 // place is not allowed.
 void downmixToStereo(const std::string& layout, const float* in, int frames, float* out);
 

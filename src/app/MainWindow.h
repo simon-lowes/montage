@@ -76,6 +76,7 @@ class LiveLink;
 class AssistantPanel;
 class ScriptConsole;
 class OscControl;
+class SpeedEditorControl;
 class ScriptPanelWidget;
 
 class MainWindow : public QMainWindow {
@@ -183,6 +184,9 @@ public:
     QDialog* controlSurfaceDialog();
     ControlSurface* controlSurface() const { return surface_; }
     OscControl* oscControl() const { return osc_; }
+    // The Speed Editor's keys (from Edit > Control Surface): what each does, any menu command.
+    QDialog* speedEditorKeysDialog(QWidget* parent = nullptr);
+    SpeedEditorControl* speedEditor() const { return speedEditor_; }
     // Clip › Colour Group (core/ColorGroups.h), each one undo step: a new group of the selected video clips (its id, 0
     // with a message when none are selected), the selection joining a group, or leaving its group.
     Id newColorGroup(const QString& name = {});
@@ -252,6 +256,15 @@ public:
     // clips' CDLs (else every clip with one) as a .cc (one) or a .ccc or .cdl.
     int importCdl(const QString& path);
     bool exportCdl(const QString& path);
+    // ACES Metadata Files (render/Amf.h): one onto the selected clips (else the clips it names); `setSpace` -1 asks
+    // whether the sequence takes its output transform's space. Export writes one for each selected clip (`target` a
+    // file for one, a folder for more).
+    int importAmf(const QString& path, int setSpace = -1);
+    int exportAmf(const QString& target);
+    // Play › Ambisonic Monitoring › the head binaural listening hears through (media/Sofa.h): "" the spherical head
+    // model, "ku100" SADIE II's KU100 (downloaded when asked, after asking), or a SOFA file. False (with a message
+    // unless `quiet`) when it cannot be used; the choice is then left as it was.
+    bool setBinauralHrtfChoice(const QString& choice, bool quiet = false);
     // File › Link Media: the dialog for the offline media (shown by itself when a project opens with some), or a
     // message and nullptr when nothing is offline.
     LinkMediaDialog* showLinkMedia();
@@ -483,6 +496,7 @@ private:
     MixerPanel* mixer_ = nullptr;
     ControlSurface* surface_ = nullptr;
     OscControl* osc_ = nullptr;
+    SpeedEditorControl* speedEditor_ = nullptr;
     MulticamPanel* multicam_ = nullptr;
     AdrPanel* adr_ = nullptr;
     ProductionPanel* production_ = nullptr;

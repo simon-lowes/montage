@@ -22,6 +22,7 @@
 #include "core/CaptionTools.h"
 #include "core/ClipAnimation.h"
 #include "core/Captions.h"
+#include "core/Cea708.h"
 #include "core/ColorWarp.h"
 #include "core/Bleep.h"
 #include "core/Cfb.h"
@@ -66,6 +67,8 @@
 #include "core/G2p.h"
 #include "control/Hui.h"
 #include "control/Osc.h"
+#include "control/SpeedEditor.h"
+#include "control/Hid.h"
 #include "control/MackieControl.h"
 #include "control/Midi.h"
 
@@ -1147,6 +1150,162 @@ private slots:
         QVERIFY(back.empty());
     }
 
+    void speedEditorProtocol() {
+        using namespace speed;
+        // ---- The answer to the device's challenge, against blackmagic-misc's own (Python, run on these values).
+        const std::pair<uint64_t, uint64_t> answers[] = {
+            {0x0, 0x3ae1206f97c10bc8},
+            {0x1, 0x2b9ab32bebf244c6},
+            {0x0123456789abcdef, 0xe5c7b689e9967608},
+            {0xfedcba9876543210, 0xc4a7da4761c769e8},
+            {0x5a5a5a5a5a5a5a5a, 0x78e6e0b28592df00},
+            {0xffffffffffffffff, 0x61a3f6474ff236c6},
+            {0x00000000deadbeef, 0x751bf6fddd11d83e},
+            {0x7, 0x751bf623f42e0ade},
+        };
+        for (const auto& [challenge, answer] : answers) QCOMPARE(authResponse(challenge), answer);
+
+        // ---- The exchange on feature report 6, with a device that checks the answer and allows 600 seconds.
+        const uint64_t challenge = 0x0123456789abcdef;
+        std::vector<std::vector<uint8_t>> sent;
+        int state = 0;
+        auto send = [&](const std::vector<uint8_t>& r) {
+            sent.push_back(r);
+            if (r.size() != 10 || r[0] != 6) return false;
+            if (r[1] == 0) state = 1;
+            else if (r[1] == 1 && state == 1) state = 2;
+            else if (r[1] == 3 && state == 2) {
+                uint64_t got = 0;
+                for (int i = 7; i >= 0; --i) got = got << 8 | r[size_t(2 + i)];
+                state = got == authResponse(challenge) ? 3 : 4;
+            }
+            return true;
+        };
+        auto get = [&](uint8_t id, std::vector<uint8_t>& out) {
+            if (id != 6) return false;
+            out.assign(10, 0);
+            out[0] = 6;
+            if (state == 1) {
+                for (int i = 0; i < 8; ++i) out[size_t(2 + i)] = uint8_t(challenge >> (8 * i));
+            } else if (state == 2) {
+                out[1] = 2;
+            } else if (state == 3) {
+                out[1] = 4;
+                out[2] = 600 & 0xff;
+                out[3] = 600 >> 8;
+            } else {
+                out[1] = 4;  // refused: no time given
+            }
+            return true;
+        };
+        std::string why;
+        QCOMPARE(authenticate(send, get, &why), 600);
+        QCOMPARE(int(sent.size()), 3);
+        QCOMPARE(sent[0], (std::vector<uint8_t>{6, 0, 0, 0, 0, 0, 0, 0, 0, 0}));
+        QCOMPARE(sent[1], (std::vector<uint8_t>{6, 1, 0, 0, 0, 0, 0, 0, 0, 0}));
+        QCOMPARE(sent[2][1], uint8_t(3));
+        // A device that does not take the answer, and one that sends no challenge.
+        sent.clear();
+        auto wrong = [&](const std::vector<uint8_t>& r) {
+            std::vector<uint8_t> bad = r;
+            if (bad[1] == 3) bad[2] ^= 1;
+            return send(bad);
+        };
+        QCOMPARE(authenticate(wrong, get, &why), 0);
+        QVERIFY(!why.empty());
+        QCOMPARE(authenticate(send, [](uint8_t, std::vector<uint8_t>&) { return false; }, &why), 0);
+
+        // ---- Keys: the set held, every change; presses and releases from it.
+        Decoder d;
+        auto keys = [](std::initializer_list<uint16_t> held) {
+            std::vector<uint8_t> r(13, 0);
+            r[0] = 4;
+            size_t i = 0;
+            for (uint16_t k : held) {
+                r[1 + i * 2] = uint8_t(k);
+                r[2 + i * 2] = uint8_t(k >> 8);
+                ++i;
+            }
+            return r;
+        };
+        auto r = keys({0x07});
+        std::vector<Event> ev = d.feed(r.data(), r.size());
+        QCOMPARE(int(ev.size()), 1);
+        QVERIFY(ev[0].kind == Event::KeyDown && ev[0].key == Key::In);
+        r = keys({0x07, 0x3c});
+        ev = d.feed(r.data(), r.size());
+        QCOMPARE(int(ev.size()), 1);
+        QVERIFY(ev[0].kind == Event::KeyDown && ev[0].key == Key::StopPlay);
+        r = keys({0x3c, 0x33});
+        ev = d.feed(r.data(), r.size());
+        QCOMPARE(int(ev.size()), 2);  // released first, then pressed
+        QVERIFY(ev[0].kind == Event::KeyUp && ev[0].key == Key::In);
+        QVERIFY(ev[1].kind == Event::KeyDown && ev[1].key == Key::Cam1);
+        r = keys({0x3c, 0x33, 0x99});  // an unknown code is left out
+        QVERIFY(d.feed(r.data(), r.size()).empty());
+        r = keys({});
+        ev = d.feed(r.data(), r.size());
+        QCOMPARE(int(ev.size()), 2);
+        QCOMPARE(int(d.held().size()), 0);
+        // The wheel (mode, then a signed value) and the battery.
+        const std::vector<uint8_t> jogReport = {3, 2, 0x98, 0xfe, 0xff, 0xff, 0};  // -360, relative
+        ev = d.feed(jogReport.data(), jogReport.size());
+        QVERIFY(ev.size() == 1 && ev[0].kind == Event::Jog && ev[0].mode == JogMode::Relative2 && ev[0].value == -360);
+        const std::vector<uint8_t> battery = {7, 1, 85};
+        ev = d.feed(battery.data(), battery.size());
+        QVERIFY(ev.size() == 1 && ev[0].kind == Event::Battery && ev[0].charging && ev[0].level == 85);
+        const std::vector<uint8_t> shortJog = {3, 2, 0x98};
+        QVERIFY(d.feed(shortJog.data(), shortJog.size()).empty());
+
+        // ---- What goes to the device: lights, the wheel's lights and mode.
+        QCOMPARE(ledReport(ledBit(Key::Cam1) | ledBit(Key::Snap)), (std::vector<uint8_t>{2, 0x20, 0x40, 0, 0}));
+        QCOMPARE(ledBit(Key::AudioOnly), 1u << 17);
+        QCOMPARE(ledBit(Key::In), 0u);
+        QCOMPARE(jogLedReport(jogLedBit(Key::Shuttle)), (std::vector<uint8_t>{4, 2}));
+        QCOMPARE(jogModeReport(JogMode::AbsoluteDeadZero), (std::vector<uint8_t>{3, 3, 0, 0, 0, 0, 255}));
+        // Names both ways, labels with their bracketed second function.
+        for (Key k : allKeys()) {
+            Key back = Key::None;
+            QVERIFY(keyFromName(keyName(k), back) && back == k);
+            QVERIFY(!keyLabel(k).empty());
+        }
+        QCOMPARE(keySecondLabel(Key::Escape), std::string("UNDO"));
+        QVERIFY(onSpeedEditor(Key::Cam9) && !onSpeedEditor(Key::FitToFill));
+
+        // ---- Linux: a hidraw device's uevent.
+        int bus = 0;
+        uint16_t vendor = 0, product = 0;
+        std::string name, serial;
+        QVERIFY(parseHidUevent("DRIVER=hid-generic\nHID_ID=0005:00001EDB:0000DA0E\nHID_NAME=DaVinci Resolve Speed Editor\nHID_UNIQ=ab:cd\n",
+                               bus, vendor, product, name, serial));
+        QCOMPARE(bus, 5);
+        QCOMPARE(vendor, kVendor);
+        QCOMPARE(product, kSpeedEditor);
+        QCOMPARE(name, std::string("DaVinci Resolve Speed Editor"));
+        QCOMPARE(serial, std::string("ab:cd"));
+        QVERIFY(!parseHidUevent("DRIVER=hid-generic\n", bus, vendor, product, name, serial));
+        // An interface's usage, from its report descriptor: a keyboard's ordinary keys are told from the vendor's.
+        uint16_t page = 0, usage = 0;
+        const uint8_t keyboard[] = {0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x05, 0x07, 0xc0};
+        QVERIFY(hidPrimaryUsage(keyboard, sizeof keyboard, page, usage));
+        QCOMPARE(page, uint16_t(1));
+        QCOMPARE(usage, uint16_t(6));
+        HidDeviceInfo info;
+        info.usagePage = page;
+        info.usage = usage;
+        QVERIFY(info.isKeyboardOrMouse());
+        const uint8_t vendorDefined[] = {0x06, 0x00, 0xff, 0x09, 0x01, 0xa1, 0x01, 0xc0};
+        QVERIFY(hidPrimaryUsage(vendorDefined, sizeof vendorDefined, page, usage));
+        QCOMPARE(page, uint16_t(0xff00));
+        QCOMPARE(usage, uint16_t(1));
+        const uint8_t extended[] = {0x0b, 0x01, 0x00, 0x0c, 0x00, 0xa1, 0x01, 0xc0};  // (a four-byte usage: its page with it)
+        QVERIFY(hidPrimaryUsage(extended, sizeof extended, page, usage));
+        QCOMPARE(page, uint16_t(0x0c));
+        QCOMPARE(usage, uint16_t(1));
+        const uint8_t cut[] = {0x05, 0x01, 0x0a, 0x06};
+        QVERIFY(!hidPrimaryUsage(cut, sizeof cut, page, usage));
+    }
+
     void huiProtocol() {
         using mcu::Event;
         // ---- What a HUI says: a switch as its zone then its port, a fader as its high then its low seven bits.
@@ -1845,6 +2004,150 @@ private slots:
         QVERIFY(!captionsFrom608({}, {30, 1}, back));
     }
 
+    void cea708Service() {
+        // Three captions at 29.97: one placed top left, accents (Latin-1) and curly quotes (G2), back to back with the
+        // next, then a gap. Every frame carries A/53's 20 entries; read back from the 708 entries alone.
+        const Rational fps{30000, 1001};
+        std::vector<Caption> caps = {{30, 75, "Caf\xc3\xa9 au lait", {}},
+                                     {75, 150, "\xe2\x80\x9cQuoted\xe2\x80\x9d words\non two rows", {}},
+                                     {200, 260, "Up here \xe2\x99\xaa", {}}};
+        caps[2].vertical = kCaptionTop;
+        caps[2].align = kCaptionLeft;
+        const int64_t frames = 300;
+        const auto data = captionCcData(caps, fps, frames, true, true);
+        QCOMPARE(data.size(), size_t(frames));
+        std::vector<std::pair<double, CcTriplet>> entries;
+        int packets = 0;
+        for (int64_t f = 0; f < frames; ++f) {
+            QCOMPARE(int(data[size_t(f)].size()), 20);
+            QCOMPARE(int(data[size_t(f)].size()), ccCountForRate(fps.toDouble()));
+            for (const CcTriplet& t : data[size_t(f)]) {
+                QVERIFY((t[0] & 0xF8) == 0xF8);  // marker bits
+                if ((t[0] & 0x03) == 3) ++packets;
+                entries.push_back({double(f) / fps.toDouble(), t});
+            }
+        }
+        QVERIFY(packets >= 6);
+        std::vector<Caption> back;
+        std::string err;
+        QVERIFY2(captionsFrom708(entries, fps, back, &err), err.c_str());
+        QCOMPARE(back.size(), size_t(3));
+        for (size_t i = 0; i < 3; ++i) {
+            QCOMPARE(back[i].text, caps[i].text);
+            QVERIFY2(std::llabs(back[i].start - caps[i].start) <= 1, qPrintable(QString::number(back[i].start)));
+            QVERIFY2(std::llabs(back[i].end - caps[i].end) <= 1, qPrintable(QString::number(back[i].end)));
+        }
+        QCOMPARE(back[0].vertical, int(kCaptionBottom));
+        QCOMPARE(back[0].align, int(kCaptionCentre));
+        QCOMPARE(back[2].vertical, int(kCaptionTop));
+        QCOMPARE(back[2].align, int(kCaptionLeft));
+        // Without 708: just the 608 pairs, field 1's and field 2's nulls, at most one of each a frame.
+        const auto only608 = captionCcData(caps, fps, frames, true, false);
+        for (const auto& f : only608) QVERIFY(f.size() <= 2 && (f.empty() || (f[0][0] == 0xFC && f[1] == CcTriplet{0xFD, 0x80, 0x80})));
+        // Read at another rate; no entries, nothing found.
+        QVERIFY(captionsFrom708(entries, {25, 1}, back));
+        QVERIFY(!captionsFrom708({}, fps, back, &err));
+        QCOMPARE(ccCountForRate(25), 24);
+        QCOMPARE(ccCountForRate(60000.0 / 1001), 10);
+
+        // MCC: written and read back (its 708 service), through the caption formats too.
+        const std::string mcc = captionsToMcc(caps, fps);
+        QVERIFY(mcc.rfind("File Format=MacCaption_MCC V1.0", 0) == 0);
+        QVERIFY(mcc.find("Time Code Rate=30DF") != std::string::npos);
+        QVERIFY(mcc.find("00:00:01;00\tT") != std::string::npos);  // drop-frame timecode, then DID and SDID
+        std::vector<Caption> fromMcc;
+        QVERIFY2(parseSubtitles(mcc, fps, fromMcc, &err), err.c_str());
+        QCOMPARE(fromMcc.size(), size_t(3));
+        QCOMPARE(fromMcc[1].text, caps[1].text);
+        QVERIFY(std::llabs(fromMcc[1].start - 75) <= 1 && std::llabs(fromMcc[2].end - 260) <= 1);
+        QCOMPARE(fromMcc[2].vertical, int(kCaptionTop));
+        // At 25 fps, the rate MCC names is 25; captions keep their frames.
+        const std::vector<Caption> pal = {{25, 75, "Bonjour", {}}};
+        const std::string mcc25 = captionsToMcc(pal, {25, 1});
+        QVERIFY(mcc25.find("Time Code Rate=25") != std::string::npos);
+        QVERIFY(parseMcc(mcc25, {25, 1}, fromMcc));
+        QVERIFY(fromMcc.size() == 1 && fromMcc[0].text == "Bonjour" && std::llabs(fromMcc[0].start - 25) <= 1);
+        // A 608-only MCC (as some tools write): its line-21 pairs are read.
+        std::string only608Mcc = "File Format=MacCaption_MCC V1.0\n\nTime Code Rate=30DF\n\n";
+        {
+            const auto cc = captionCcData(pal, {30000, 1001}, 120, true, false);
+            for (size_t f = 0; f < cc.size(); ++f) {
+                std::string hex = "T" + QStringLiteral("%1").arg(9 + 3 * int(cc[f].size()) + 4, 2, 16, QChar('0')).toUpper().toStdString() +
+                                  "S" + QStringLiteral("%1").arg(9 + 3 * int(cc[f].size()) + 4, 2, 16, QChar('0')).toUpper().toStdString() + "4F43";
+                hex += "0000";
+                hex += "72" + QStringLiteral("%1").arg(0xE0 | int(cc[f].size()), 2, 16, QChar('0')).toUpper().toStdString();
+                for (const CcTriplet& t : cc[f])
+                    for (uint8_t b : t) hex += QStringLiteral("%1").arg(b, 2, 16, QChar('0')).toUpper().toStdString();
+                hex += "7400000000";
+                only608Mcc += formatTimecode(FrameTime(f), {30000, 1001}, true) + "\t" + hex + "\n";
+            }
+        }
+        QVERIFY2(parseMcc(only608Mcc, {30000, 1001}, fromMcc, &err), err.c_str());
+        QVERIFY(fromMcc.size() == 1 && fromMcc[0].text == "Bonjour");
+        QVERIFY(!parseMcc("Scenarist_SCC V1.0\n", fps, fromMcc, &err));
+        // A caption at frame 0, the same words twice back to back, a short one before a long one, a 60-character row.
+        const std::vector<Caption> tight = {{0, 20, "First", {}},
+                                            {20, 40, "Yes.", {}},
+                                            {40, 43, "Oh!", {}},
+                                            {43, 90, "A long caption on four rows\nthat fills its window\nfrom side to side\nall the way", {}},
+                                            {90, 120, "Yes.", {}},
+                                            {120, 160, "This single row runs on well past the forty-two columns a window has", {}}};
+        std::vector<std::pair<double, CcTriplet>> te;
+        const auto tightData = captionCcData(tight, fps, 200, true, true);
+        for (size_t f = 0; f < tightData.size(); ++f)
+            for (const CcTriplet& t : tightData[f]) te.push_back({double(f) / fps.toDouble(), t});
+        bool painted = true;
+        QVERIFY2(captionsFrom708(te, fps, back, &err, &painted), err.c_str());
+        QVERIFY(!painted);
+        QCOMPARE(back.size(), tight.size());
+        for (size_t i = 0; i + 1 < tight.size(); ++i) {
+            QCOMPARE(back[i].text, tight[i].text);
+            // (the first is loaded and shown in its own first frame, which holds only so much: a frame late at most)
+            QVERIFY2(back[i].start - tight[i].start <= (i == 0 ? 1 : 0) && back[i].start >= tight[i].start && back[i].end == tight[i].end,
+                     qPrintable(QStringLiteral("%1: %2-%3").arg(i).arg(back[i].start).arg(back[i].end)));
+        }
+        QCOMPARE(back.back().text, wrapCaptionText(tight.back().text, 42, 4));  // wrapped, not cut
+        // Roll-up written by another tool: a two-row window on screen, typed into, scrolling. Read as the text grows,
+        // and said to be painted (so Auto reads such files' 608).
+        {
+            std::vector<uint8_t> svc{0x98, 0x38 /* visible */, 0x80 | 90, 50, (7 << 4) | 1, 31, 0x09};
+            auto typed = [&](const std::string& t) { svc.insert(svc.end(), t.begin(), t.end()); };
+            std::vector<std::vector<uint8_t>> packets;
+            typed("ONE");
+            packets.push_back(svc);
+            packets.push_back({'\x0D'});
+            std::vector<uint8_t> two{'T', 'W', 'O'};
+            packets.push_back(two);
+            packets.push_back({'\x0D', 'T', 'H', 'R', 'E', 'E'});
+            std::vector<std::pair<double, CcTriplet>> rollup;
+            int sq = 0;
+            for (size_t k = 0; k < packets.size(); ++k) {
+                std::vector<uint8_t> pk{0, uint8_t((1 << 5) | packets[k].size())};
+                pk.insert(pk.end(), packets[k].begin(), packets[k].end());
+                if (pk.size() % 2) pk.push_back(0);
+                pk[0] = uint8_t(((sq++ & 3) << 6) | (pk.size() / 2));
+                for (size_t i = 0; i < pk.size(); i += 2) rollup.push_back({double(k), {uint8_t(i ? 0xFE : 0xFF), pk[i], pk[i + 1]}});
+            }
+            QVERIFY(captionsFrom708(rollup, {30, 1}, back, &err, &painted));
+            QVERIFY(painted);
+            QVERIFY2(back.size() == 2, qPrintable(QString::number(back.size())));
+            QCOMPARE(back[0].text, std::string("ONE\nTWO"));  // typed in, one caption
+            QCOMPARE(back[1].text, std::string("TWO\nTHREE"));  // scrolled up past its two rows
+        }
+        // 23.976 is written as "24" and read back on its own frames, with no drift an hour in.
+        const std::vector<Caption> late = {{86400, 86460, "An hour in", {}}};
+        QVERIFY(parseMcc(captionsToMcc(late, {24000, 1001}), {24000, 1001}, fromMcc));
+        QVERIFY2(fromMcc.size() == 1 && std::llabs(fromMcc[0].start - 86400) <= 1, qPrintable(QString::number(fromMcc.empty() ? -1 : fromMcc[0].start)));
+        // 59.94 drop frame needs MCC V2.0.
+        QVERIFY(captionsToMcc(pal, {60000, 1001}).rfind("File Format=MacCaption_MCC V2.0", 0) == 0);
+        // The caption export by extension.
+        Project p = makeDefaultProject();
+        CaptionTrack t;
+        t.captions = caps;
+        QVERIFY(captionFormatKnown(".mcc"));
+        QCOMPARE(exportCaptions(t, *p.active(), ".mcc").substr(0, 26), std::string("File Format=MacCaption_MCC"));
+    }
+
     void suggestingChapters() {
         // Three talks of ten sentences each (cooking, football, astronomy), a word every 0.4 s and 0.6 s between sentences.
         const std::vector<std::vector<std::string>> talks = {
@@ -2201,7 +2504,7 @@ private slots:
         QVERIFY(edit::setGradeNode(s, id, renamed).ok);
         QCOMPARE(gradeNodeName(*findGradeNode(clip().grade, 3)), std::string("Skin"));
         // Flattened: the nodes' effects as a stack again, the nodes' settings gone.
-        QVERIFY(edit::flattenGrade(s, id).ok);
+        QVERIFY(edit::flattenGrade(p, s, id).ok);
         QVERIFY(clip().grade.empty());
         for (const Effect& e : clip().effects) QVERIFY(e.node == 0 && e.type != "grade_node");
         QCOMPARE(clip().effects.size(), size_t(2));  // the blur and the curves
@@ -2370,12 +2673,28 @@ private slots:
         QVERIFY(edit::moveEffectToNode(p, s, id, clip().effects[0].id, 0).ok);  // the curves: no own node effects left
         QCOMPARE(types(clip().effects), std::string("grade_node@1 curves posterize gaussian_blur "));  // held in place
         // Flattened with only a shared node's effects: they come back where the graph ran.
-        QVERIFY(edit::flattenGrade(s, id).ok);
+        QVERIFY(edit::flattenGrade(p, s, id).ok);
         QCOMPARE(types(clip().effects), std::string("color_correct curves posterize gaussian_blur "));
+        // A shared node shown twice, flattened: each copy its own id, none the shared node's.
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        QVERIFY(edit::useSharedNode(p, s, id, shared).ok);
+        QVERIFY(edit::useSharedNode(p, s, id, shared).ok);
+        QVERIFY(edit::flattenGrade(p, s, id).ok);
+        {
+            std::set<Id> ids;
+            int copies = 0;
+            for (const Effect& e : clip().effects) {
+                QVERIFY(ids.insert(e.id).second);
+                QVERIFY(e.id != findSharedNode(s, shared)->effects.at(0).id);
+                copies += e.type == "color_correct";
+            }
+            QCOMPARE(copies, 3);  // (its own, from the earlier flatten, and the two)
+        }
+        clip().effects = {makeEffect(p, "color_correct"), makeEffect(p, "curves"), makeEffect(p, "posterize"), makeEffect(p, "gaussian_blur")};
         // A node's window goes onto its effects when flattened.
         QVERIFY(edit::convertToNodes(s, id).ok);
         QVERIFY(edit::setGradeNodeParams(p, s, id, 1, {{"mask.shape", 2}}).ok);
-        QVERIFY(edit::flattenGrade(s, id).ok);
+        QVERIFY(edit::flattenGrade(p, s, id).ok);
         QCOMPARE(clip().effects[0].p("mask.shape", 0), 2.0);
         // Layer mixer inputs keep their blend modes when one goes, and a mixer's input past the next is refused.
         clip().effects = {makeEffect(p, "color_correct")};
@@ -5703,7 +6022,7 @@ private slots:
         foaDecodeStereo(g.data(), l, r);
         QVERIFY(near(l, r) && l > 0.5f);
         // Binaurally, a click from the left reaches the left ear first and louder.
-        FoaBinaural bin(48000);
+        AmbisonicBinaural bin(1, 48000);
         std::vector<float> in(size_t(512) * 4, 0.0f), out(size_t(512) * 2);
         g = foaEncode(-90, 0);
         for (int k = 0; k < 4; ++k) in[size_t(10) * 4 + size_t(k)] = g[size_t(k)];
@@ -5762,6 +6081,178 @@ private slots:
         // The Ambisonics effect: no turn, follows the view, heard binaurally.
         const Effect e = makeEffect(p, "ambisonics");
         QVERIFY(e.p("yaw", 0, 9) == 0 && e.p("follow_view", 0, 0) == 1 && e.p("decode", 0, 9) == 0);
+    }
+
+    void higherOrderAmbisonics() {
+        auto near = [](double a, double b, double tol = 1e-4) { return std::fabs(a - b) < tol; };
+        QCOMPARE(ambisonicChannels(3), 16);
+        QCOMPARE(ambisonicOrderForChannels(3), 0);
+        QCOMPARE(ambisonicOrderForChannels(8), 1);
+        QCOMPARE(ambisonicOrderForChannels(9), 2);
+        QCOMPARE(ambisonicOrderForChannels(25), 3);
+        // The harmonics are SN3D: over the sphere each one's mean square is 1/(2l + 1), and they are orthogonal (Lebedev's
+        // 50 directions integrate them exactly).
+        const auto& dirs = binauralDirections();
+        QCOMPARE(int(dirs.size()), 50);
+        double gram[16][16] = {};
+        for (size_t k = 0; k < dirs.size(); ++k) {
+            const double w = k < 6 ? 0.0126984126984127 : k < 18 ? 0.02257495590828924 : k < 26 ? 0.02109375 : 0.02017333553791887;
+            float h[16];
+            ambisonicEncode(3, dirs[k][0], dirs[k][1], h);
+            for (int a = 0; a < 16; ++a)
+                for (int b = 0; b < 16; ++b) gram[a][b] += w * h[a] * h[b];
+        }
+        for (int a = 0; a < 16; ++a)
+            for (int b = 0; b < 16; ++b) {
+                const int l = int(std::sqrt(a + 0.5));
+                QVERIFY2(near(gram[a][b], a == b ? 1.0 / (2 * l + 1) : 0.0, 1e-5), qPrintable(QString("%1 %2 %3").arg(a).arg(b).arg(gram[a][b])));
+            }
+        // First order is foaEncode; focus 0 leaves only W.
+        float h[16];
+        ambisonicEncode(3, 40, 20, h);
+        const auto f = foaEncode(40, 20);
+        for (int k = 0; k < 4; ++k) QVERIFY(near(h[k], f[size_t(k)]));
+        ambisonicEncode(3, 40, 20, h, 0);
+        QVERIFY(near(h[0], 1) && near(h[5], 0) && near(h[12], 0));
+        // Turning a field is the same as encoding the turned direction, to every order.
+        for (int order = 1; order <= 3; ++order)
+            for (const auto& [yaw, pitch, roll] : std::vector<std::array<double, 3>>{{90, 0, 0}, {30, 45, 0}, {-120, -30, 60}, {170, 80, -45}}) {
+                const FoaRotation turn = foaRotation(yaw, pitch, roll);
+                const AmbisonicRotation r = ambisonicRotation(order, turn);
+                for (const auto& [angle, el] : std::vector<std::array<double, 2>>{{0, 0}, {-90, 10}, {135, -40}, {20, 70}}) {
+                    float field[16], first[4];
+                    ambisonicEncode(order, angle, el, field);
+                    std::copy_n(field, 4, first);
+                    ambisonicRotate(r, field);
+                    foaRotate(turn, first);
+                    const double az = -std::atan2(first[1], first[3]) * 180 / M_PI, up = std::asin(std::clamp<double>(first[2], -1, 1)) * 180 / M_PI;
+                    float want[16];
+                    ambisonicEncode(order, az, up, want);
+                    for (int k = 0; k < ambisonicChannels(order); ++k) QVERIFY2(near(field[k], want[k], 1e-4), qPrintable(QString("o%1 ch%2").arg(order).arg(k)));
+                }
+            }
+        // The layouts: 9 and 16 channels, metered by W, panned by direction to their order, folded from first order.
+        QCOMPARE(ambisonicOrder("ambix3"), 3);
+        QCOMPARE(ambisonicOrder("ambix"), 1);
+        QCOMPARE(ambisonicOrder("7.1.4"), 0);
+        QCOMPARE(ambisonicLayoutFor(2), std::string("ambix2"));
+        QCOMPARE(layoutChannels("ambix2"), 9);
+        QCOMPARE(layoutChannels("ambix3"), 16);
+        QVERIFY(ambisonicLayout("ambix3") && !immersiveLayout("ambix3"));
+        QVERIFY(layoutSpeakers("ambix3")[0].loudnessWeight == 1 && layoutSpeakers("ambix3")[15].loudnessWeight == 0);
+        const auto pg = panGains("ambix3", -90, 1, 0);
+        ambisonicEncode(3, -90, 0, h);
+        QCOMPARE(int(pg.size()), 16);
+        for (int k = 0; k < 16; ++k) QVERIFY(near(pg[size_t(k)], h[k]));
+        std::vector<float> field(16 * 2, 0.0f), st(4);
+        ambisonicEncode(3, -90, 0, field.data());
+        ambisonicEncode(3, 90, 0, field.data() + 16);
+        downmixToStereo("ambix3", field.data(), 2, st.data());
+        QVERIFY(st[0] > 4 * st[1] && st[3] > 4 * st[2]);
+        // AllRAD onto 7.1.4: a sound at a speaker is loudest there, nothing goes to the LFE, a sound keeps about its
+        // power all round, and one from below fades.
+        const auto& sp = layoutSpeakers("7.1.4");
+        for (int order = 1; order <= 3; ++order) {
+            const std::vector<float>& dec = layoutDecoder("7.1.4", order);
+            const int nch = ambisonicChannels(order);
+            QCOMPARE(int(dec.size()), int(sp.size()) * nch);
+            auto heard = [&](double angle, double el) {
+                float x[16];
+                ambisonicEncode(order, angle, el, x);
+                std::vector<double> out(sp.size(), 0.0);
+                for (size_t s = 0; s < sp.size(); ++s)
+                    for (int k = 0; k < nch; ++k) out[s] += dec[s * size_t(nch) + size_t(k)] * x[k];
+                return out;
+            };
+            for (size_t s = 0; s < sp.size(); ++s) {
+                if (sp[s].lfe) continue;
+                const auto out = heard(sp[s].angle, sp[s].elevation);
+                const size_t loudest = size_t(std::max_element(out.begin(), out.end()) - out.begin());
+                QVERIFY2(loudest == s, qPrintable(QString("order %1 speaker %2 loudest %3").arg(order).arg(sp[s].name).arg(sp[loudest].name)));
+            }
+            for (size_t s = 0; s < sp.size(); ++s)
+                if (sp[s].lfe)
+                    for (int k = 0; k < nch; ++k) QCOMPARE(dec[s * size_t(nch) + size_t(k)], 0.0f);
+            for (const auto& [angle, el] : std::vector<std::array<double, 2>>{{0, 0}, {-90, 0}, {150, 0}, {60, 45}}) {
+                double power = 0;
+                for (double v : heard(angle, el)) power += v * v;
+                QVERIFY2(power > 0.5 && power < 2.0, qPrintable(QString("order %1 at %2,%3: %4").arg(order).arg(angle).arg(el).arg(power)));
+            }
+            double below = 0;
+            for (double v : heard(0, -80)) below += v * v;
+            // (First order is too broad to fade much.)
+            QVERIFY2(below < (order == 1 ? 0.9 : 0.5), qPrintable(QString("order %1 below %2").arg(order).arg(below)));
+        }
+        // Ear-level 5.1: what is overhead is spread over the ring; stereo and ambisonic layouts have no decoder.
+        {
+            const std::vector<float>& dec = layoutDecoder("5.1", 3);
+            float x[16];
+            ambisonicEncode(3, 0, 90, x);
+            int heardBy = 0;
+            for (size_t s = 0; s < 6; ++s) {
+                double v = 0;
+                for (int k = 0; k < 16; ++k) v += dec[s * 16 + size_t(k)] * x[k];
+                if (v > 0.1) ++heardBy;
+            }
+            QCOMPARE(heardBy, 5);
+            QVERIFY(layoutDecoder("stereo", 1).empty() && layoutDecoder("ambix", 1).empty());
+        }
+        // Binaurally to third order: from the left, the left ear first and louder; from the front, the ears agree; a
+        // higher order's image is sharper (more of it in the near ear).
+        double ratio[4] = {};
+        for (int order = 1; order <= 3; ++order) {
+            AmbisonicBinaural bin(order, 48000);
+            QCOMPARE(bin.order(), order);
+            QVERIFY(bin.hrirs() && bin.hrirs()->directions.size() == dirs.size());
+            const int nch = ambisonicChannels(order);
+            std::vector<float> in(size_t(512) * size_t(nch), 0.0f), out(size_t(512) * 2);
+            ambisonicEncode(order, -90, 0, &in[size_t(10) * size_t(nch)]);
+            bin.process(in.data(), 512, out.data());
+            int peakL = 0, peakR = 0;
+            double eL = 0, eR = 0;
+            for (int i = 0; i < 512; ++i) {
+                if (std::fabs(out[size_t(i) * 2]) > std::fabs(out[size_t(peakL) * 2])) peakL = i;
+                if (std::fabs(out[size_t(i) * 2 + 1]) > std::fabs(out[size_t(peakR) * 2 + 1])) peakR = i;
+                eL += out[size_t(i) * 2] * out[size_t(i) * 2];
+                eR += out[size_t(i) * 2 + 1] * out[size_t(i) * 2 + 1];
+            }
+            QVERIFY2(peakR - peakL >= 10 && eL > 2 * eR, qPrintable(QString("order %1: %2 %3 %4 %5").arg(order).arg(peakL).arg(peakR).arg(eL).arg(eR)));
+            ratio[order] = eL / eR;
+            bin.reset();
+            std::fill(in.begin(), in.end(), 0.0f);
+            ambisonicEncode(order, 0, 0, &in[size_t(10) * size_t(nch)]);
+            bin.process(in.data(), 512, out.data());
+            for (int i = 0; i < 512; ++i) QVERIFY(near(out[size_t(i) * 2], out[size_t(i) * 2 + 1], 1e-5));
+        }
+        QVERIFY(ratio[3] > ratio[1]);
+        // Every order as loud in a diffuse field: half its power at each ear.
+        for (int order = 1; order <= 3; ++order) {
+            const int nch = ambisonicChannels(order);
+            double energy = 0;
+            for (size_t k = 0; k < dirs.size(); ++k) {
+                AmbisonicBinaural bin(order, 48000);
+                std::vector<float> in(size_t(256) * size_t(nch), 0.0f), out(size_t(256) * 2);
+                ambisonicEncode(order, dirs[k][0], dirs[k][1], in.data());
+                bin.process(in.data(), 256, out.data());
+                const double w = k < 6 ? 0.0126984126984127 : k < 18 ? 0.02257495590828924 : k < 26 ? 0.02109375 : 0.02017333553791887;
+                for (float v : out) energy += w * v * v;
+            }
+            QVERIFY2(near(energy, 1, 1e-3), qPrintable(QString("order %1: %2").arg(order).arg(energy)));
+        }
+        // Processed in pieces as at once (the history carries over).
+        {
+            AmbisonicBinaural a(2, 48000), b(2, 48000);
+            std::vector<float> in(size_t(300) * 9), whole(600), parts(600);
+            for (size_t i = 0; i < in.size(); ++i) in[i] = float(std::sin(double(i) * 0.37));
+            a.process(in.data(), 300, whole.data());
+            b.process(in.data(), 100, parts.data());
+            b.process(in.data() + 900, 200, parts.data() + 200);
+            for (size_t i = 0; i < 600; ++i) QVERIFY(near(whole[i], parts[i], 1e-5));
+        }
+        // Responses for another rate are not used at this one (the spherical head is).
+        auto other = sphericalHeadHrirs(44100);
+        QCOMPARE(AmbisonicBinaural(1, 48000, other).hrirs()->sampleRate, 48000.0);
+        QCOMPARE(sphericalHeadHrirs(44100).get(), other.get());  // made once
     }
 
     void stereoInterpretation() {
@@ -6016,6 +6507,19 @@ private slots:
         QVERIFY(parseReviewNotes(R"({"montageReview":1,"fps":[50,1],"notes":[{"frame":100,"duration":10,"author":"Sam","text":"x"}]})", s.fps, fast));
         QCOMPARE(fast.at(0).frame, FrameTime(50));
         QCOMPARE(fast.at(0).duration, FrameTime(5));
+        // A rate that is not a page's (too fast, a fraction, nought) is ignored: its timecodes read at the sequence's.
+        for (const char* rate : {"[1e20,1]", "[24,0.5]", "[24,0]", "[0,1]", "[1,100000]"}) {
+            fast.clear();
+            const std::string json = std::string(R"({"montageReview":1,"fps":)") + rate +
+                                     R"(,"notes":[{"timecode":"00:00:04:00","text":"x"}]})";
+            QVERIFY2(parseReviewNotes(json, s.fps, fast), rate);
+            QCOMPARE(fast.at(0).frame, FrameTime(4 * std::lround(s.fps.toDouble())));
+        }
+        // Timecode at a rate no sequence has reads at 30 rather than overflowing.
+        FrameTime huge = 0;
+        QVERIFY(parseTimecode("999999999:00:00:00", Rational{2000000000, 1}, huge));
+        QCOMPARE(huge, FrameTime(999999999LL * 3600 * 30));
+        QCOMPARE(formatTimecode(90, Rational{2000000000, 1}), std::string("00:00:03:00"));
         // Not notes, or none.
         QVERIFY(!parseReviewNotes("{\"notes\":[]}", s.fps, fast, nullptr, &err));
         QVERIFY(!parseReviewNotes(R"({"montageReview":1,"notes":[]})", s.fps, fast, nullptr, &err));
@@ -6408,6 +6912,61 @@ private slots:
         QCOMPARE(nearestEdit(fx.s(), V1, 75), FrameTime(80));
         fx.s().videoTracks.push_back(Track{});
         QCOMPARE(nearestEdit(fx.s(), {TrackKind::Video, int(fx.s().videoTracks.size()) - 1}, 42), FrameTime(42));
+
+        // Video Only and Audio Only: one kind, unlinked; inserting still opens the sync-locked sound, leaving a gap there.
+        Fixture only;
+        QVERIFY(placeMedia(only.p, only.s(), only.media, 0, 0, 60, V1, A1, false).ok);
+        Result r = placeMedia(only.p, only.s(), only.media, 30, 0, 10, V1, A1, true, true, false);
+        QVERIFY2(r.ok, r.error.c_str());
+        QCOMPARE(r.created.size(), size_t(1));
+        QCOMPARE(locate(only.s(), r.created[0])->track, V1);
+        QCOMPARE(clipById(only.s(), r.created[0])->linkGroup, Id(0));
+        QCOMPARE(only.v1().clips.back().end(), FrameTime(70));
+        QVERIFY(!clipAt(only.s(), A1, 35));
+        QCOMPARE(only.a1().clips.back().end(), FrameTime(70));
+        const size_t videoTracks = only.s().videoTracks.size();
+        r = placeOnTop(only.p, only.s(), only.media, 0, 0, 10, V1, A1, false, true);
+        QVERIFY(r.ok && r.created.size() == 1);
+        QCOMPARE(locate(only.s(), r.created[0])->track.kind, TrackKind::Audio);
+        QCOMPARE(only.s().videoTracks.size(), videoTracks);
+        // Media without the kind asked for is refused, and says why.
+        MediaItem still;
+        still.id = only.p.newId();
+        still.kind = MediaKind::Image;
+        still.hasVideo = true;
+        still.path = "still.png";
+        only.p.media.push_back(still);
+        r = placeMedia(only.p, only.s(), still.id, 100, 0, 10, V1, A1, false, false, true);
+        QVERIFY(!r.ok && r.error.find("Audio Only") != std::string::npos);
+
+        // Ripple Overwrite in Video Only replaces the picture and leaves the clip's sound where it was; shorter, it
+        // leaves a gap (what follows stays in sync), longer it pushes both kinds after it along.
+        Fixture ro2;
+        QVERIFY(placeMedia(ro2.p, ro2.s(), ro2.media, 0, 0, 60, V1, A1, false).ok);
+        const Result linked = placeMedia(ro2.p, ro2.s(), ro2.media, 60, 0, 60, V1, A1, false);
+        QVERIFY(linked.ok && linked.created.size() == 2);
+        const Result after = placeMedia(ro2.p, ro2.s(), ro2.media, 120, 0, 60, V1, A1, false);
+        QVERIFY(after.ok && after.created.size() == 2);
+        const Id keptSound = linked.created[1];
+        r = rippleOverwrite(ro2.p, ro2.s(), linked.created[0], ro2.media, 200, 220, V1, A1, true, false);
+        QVERIFY2(r.ok, r.error.c_str());
+        QCOMPARE(r.created.size(), size_t(1));
+        QCOMPARE(clipById(ro2.s(), r.created[0])->duration, FrameTime(20));
+        QVERIFY(clipById(ro2.s(), keptSound));
+        QCOMPARE(clipById(ro2.s(), keptSound)->duration, FrameTime(60));
+        QCOMPARE(clipById(ro2.s(), after.created[0])->start, FrameTime(120));
+        QCOMPARE(clipById(ro2.s(), after.created[1])->start, FrameTime(120));
+        r = rippleOverwrite(ro2.p, ro2.s(), r.created[0], ro2.media, 200, 300, V1, A1, true, false);
+        QVERIFY2(r.ok, r.error.c_str());
+        QCOMPARE(clipById(ro2.s(), r.created[0])->duration, FrameTime(100));
+        QCOMPARE(clipById(ro2.s(), after.created[0])->start, FrameTime(200));
+        QCOMPARE(clipById(ro2.s(), after.created[1])->start, FrameTime(200));
+        QCOMPARE(clipById(ro2.s(), keptSound)->start, FrameTime(60));
+        // Audio Only on a clip with no sound has nothing to replace.
+        const Id silent = ro2.put(V1, 200, 10);
+        r = rippleOverwrite(ro2.p, ro2.s(), silent, ro2.media, 0, 10, V1, A1, false, true);
+        QVERIFY(!r.ok && r.error.find("Audio Only") != std::string::npos);
+        QVERIFY(clipById(ro2.s(), silent));
     }
 
     void audioRoles() {
@@ -8519,6 +9078,33 @@ private slots:
         QCOMPARE(c0.effects.size(), size_t(3));
         QCOMPARE(c0.effects[0].type, std::string("cdl"));
         QVERIFY(clipCdl(c0, 0, cc0) && cc0.sameGrade(h));
+    }
+
+    void aleAmfColumns() {
+        // ACES dailies' AMF_NAME and AMF_UUID columns onto media, and out again only when some media has them.
+        Project p = makeDefaultProject();
+        for (const char* name : {"A001C001.mov", "A001C002.mov"}) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Video;
+            m.name = name;
+            m.path = std::string("/cards/") + name;
+            m.duration = 4;
+            m.fps = {25, 1};
+            m.hasVideo = true;
+            p.media.push_back(m);
+        }
+        AleTable t;
+        QVERIFY(parseAle("Heading\nFIELD_DELIM\tTABS\nFPS\t25\n\nColumn\nName\tAMF_NAME\tAMF_UUID\n\nData\n"
+                         "A001C001\tA001C001_graded\turn:uuid:797c7cd8-4eb1-4f67-afce-af2b0a1d0285\n", t));
+        QCOMPARE(applyAle(p, t, false).matched.size(), size_t(1));
+        QCOMPARE(p.media[0].metadata.at("amf_uuid"), std::string("urn:uuid:797c7cd8-4eb1-4f67-afce-af2b0a1d0285"));
+        QCOMPARE(p.media[0].metadata.at("amf_name"), std::string("A001C001_graded"));
+        const AleTable out = aleFromMedia(p, {p.media[0].id, p.media[1].id}, {25, 1});
+        QCOMPARE(out.value(0, "AMF_UUID"), std::string("urn:uuid:797c7cd8-4eb1-4f67-afce-af2b0a1d0285"));
+        QCOMPARE(out.value(1, "AMF_NAME"), std::string());
+        const AleTable plain = aleFromMedia(p, {p.media[1].id}, {25, 1});
+        QVERIFY(std::find(plain.columns.begin(), plain.columns.end(), "AMF_NAME") == plain.columns.end());
     }
 
     void cdlAleReviewFixes() {

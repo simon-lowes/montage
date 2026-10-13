@@ -42,6 +42,7 @@ public slots:
 private:
     struct Result {
         bool ok = false;
+        bool keptUnsigned = false;  // failed signing; the export is kept
         QString error;
         QString encoder;  // the video encoder that ran (hardware presets resolve at export time)
     };

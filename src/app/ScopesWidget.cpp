@@ -14,6 +14,7 @@
 
 #include "Theme.h"
 #include "render/ColorSpace.h"
+#include "render/Gamut.h"
 
 namespace montage {
 
@@ -25,6 +26,9 @@ constexpr int kMaxAnalysisHeight = 320;
 constexpr int kVectorBins = 256;
 constexpr float kVectorRange = 0.6f;  // Cb/Cr magnitude at the edge of the vectorscope circle
 constexpr double kPi = 3.14159265358979323846;
+constexpr int kCieBins = 256;
+// The chromaticity scope's square, from 0 on both axes: the whole spectral locus fits.
+double cieRange(bool uv) { return uv ? 0.7 : 0.9; }
 
 struct CbCr {
     float cb, cr;  // -0.5..0.5
@@ -66,6 +70,46 @@ QRgb phosphor(const QColor& base, float s) {
     const float hot = std::clamp((s - 0.8f) / 0.2f, 0.0f, 1.0f) * 0.35f;
     auto ch = [&](int v) { return int((v + (255 - v) * hot) * s); };
     return qRgba(ch(base.red()), ch(base.green()), ch(base.blue()), int(255 * s));
+}
+
+// The colour of every chromaticity bin (its xy or u'v' shown in Rec.709 at full brightness, lifted like the
+// vectorscope's), so the trace shows the colours it plots.
+const std::vector<QRgb>& chromaticityColors(bool uv) {
+    static const std::array<std::vector<QRgb>, 2> tables = [] {
+        double fromXyz[9], toXyz[9];
+        primariesToXyz(Primaries::Bt709, toXyz);
+        // (the inverse, by hand)
+        const double* m = toXyz;
+        const double det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6]);
+        fromXyz[0] = (m[4] * m[8] - m[5] * m[7]) / det, fromXyz[1] = (m[2] * m[7] - m[1] * m[8]) / det, fromXyz[2] = (m[1] * m[5] - m[2] * m[4]) / det;
+        fromXyz[3] = (m[5] * m[6] - m[3] * m[8]) / det, fromXyz[4] = (m[0] * m[8] - m[2] * m[6]) / det, fromXyz[5] = (m[2] * m[3] - m[0] * m[5]) / det;
+        fromXyz[6] = (m[3] * m[7] - m[4] * m[6]) / det, fromXyz[7] = (m[1] * m[6] - m[0] * m[7]) / det, fromXyz[8] = (m[0] * m[4] - m[1] * m[3]) / det;
+        std::vector<QRgb> out[2];
+        for (int t = 0; t < 2; ++t) {
+            const double range = cieRange(t == 1);
+            out[t].resize(size_t(kCieBins) * kCieBins);
+            for (int by = 0; by < kCieBins; ++by)
+                for (int bx = 0; bx < kCieBins; ++bx) {
+                    double a = (bx + 0.5) / kCieBins * range, b = (1 - (by + 0.5) / kCieBins) * range;
+                    double x = a, y = b;
+                    if (t == 1) {  // u'v' back to xy
+                        const double d = 6 * a - 16 * b + 12;
+                        x = 9 * a / d, y = 4 * b / d;
+                    }
+                    double rgb[3] = {0.5, 0.5, 0.5};
+                    if (y > 1e-6) {
+                        const double X = x / y, Z = (1 - x - y) / y;
+                        for (int i = 0; i < 3; ++i) rgb[i] = fromXyz[i * 3] * X + fromXyz[i * 3 + 1] + fromXyz[i * 3 + 2] * Z;
+                        const double mx = std::max({rgb[0], rgb[1], rgb[2], 1e-6});
+                        for (double& v : rgb) v = std::pow(std::clamp(v / mx, 0.0, 1.0), 1 / 2.2);
+                    }
+                    auto fix = [](double v) { return int(255 * (0.35 + 0.65 * v)); };
+                    out[t][size_t(by) * kCieBins + bx] = qRgb(fix(rgb[0]), fix(rgb[1]), fix(rgb[2]));
+                }
+        }
+        return std::array<std::vector<QRgb>, 2>{out[0], out[1]};
+    }();
+    return tables[uv ? 1u : 0u];
 }
 
 // Hue of every vectorscope bin, so the trace shows the colours it represents.
@@ -119,6 +163,7 @@ ScopesWidget::ScopesWidget(QWidget* parent) : QWidget(parent) {
     modeBox_->addItem(tr("Vectorscope"));
     modeBox_->addItem(tr("Histogram"));
     modeBox_->addItem(tr("All Four"));
+    modeBox_->addItem(tr("CIE Chromaticity"));
     modeBox_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     modeBox_->setToolTip(tr("Scope type"));
     row->addWidget(modeBox_);
@@ -130,6 +175,16 @@ ScopesWidget::ScopesWidget(QWidget* parent) : QWidget(parent) {
     rangeBox_->setToolTip(tr("The top of the waveform and parade"));
     rangeBox_->hide();
     row->addWidget(rangeBox_);
+    // The chromaticity scope's diagram.
+    cieBox_ = new QComboBox(this);
+    cieBox_->setObjectName(QStringLiteral("scopeCie"));
+    cieBox_->addItem(tr("CIE 1931 xy"));
+    cieBox_->addItem(tr("CIE 1976 u′v′"));
+    cieBox_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    cieBox_->setToolTip(tr("The chromaticity diagram: 1931 xy, or 1976 u'v' (its distances closer to how different colours look)"));
+    cieBox_->hide();
+    row->addWidget(cieBox_);
+    connect(cieBox_, &QComboBox::currentIndexChanged, this, [this](int i) { setCieUv(i == 1); });
     connect(rangeBox_, &QComboBox::currentIndexChanged, this, [this](int i) { setNitsRange(rangeBox_->itemData(i).toDouble()); });
     row->addStretch(1);
     nitsLabel_ = new QLabel(this);
@@ -153,11 +208,35 @@ void ScopesWidget::setMode(Mode m) {
         QSignalBlocker block(modeBox_);
         modeBox_->setCurrentIndex(int(m));
     }
+    cieBox_->setVisible(m == Mode::Chromaticity);
     if (m == mode_)
         return;
     mode_ = m;
     computeTrace();
     update();
+}
+
+void ScopesWidget::setCieUv(bool uv) {
+    if (cieBox_->currentIndex() != (uv ? 1 : 0)) {
+        QSignalBlocker block(cieBox_);
+        cieBox_->setCurrentIndex(uv ? 1 : 0);
+    }
+    if (uv == cieUv_) return;
+    cieUv_ = uv;
+    computeTrace();
+    update();
+}
+
+int ScopesWidget::cieSamplesNear(double a, double b, double radius) const {
+    if (cieCounts_.empty()) return 0;
+    const double range = cieRange(cieUv_);
+    int n = 0;
+    for (int by = 0; by < kCieBins; ++by)
+        for (int bx = 0; bx < kCieBins; ++bx) {
+            const double ca = (bx + 0.5) / kCieBins * range, cb = (1 - (by + 0.5) / kCieBins) * range;
+            if (std::hypot(ca - a, cb - b) <= radius) n += int(cieCounts_[size_t(by) * kCieBins + bx]);
+        }
+    return n;
 }
 
 void ScopesWidget::setFrame(const QImage& image, FrameTime t) { setSignal(image, t, QStringLiteral("rec709"), 1000); }
@@ -209,6 +288,9 @@ void ScopesWidget::clear() {
     throttle_.stop();
     pending_ = QImage();
     small_ = QImage();
+    codes_ = Image();
+    cieCounts_.clear();
+    outside709_ = outsideP3_ = -1;
     trace_ = QImage();
     traceScaled_ = QImage();
     dirty_ = false;
@@ -249,7 +331,8 @@ void ScopesWidget::analyze() {
     }
     masterPeak_ = pendingPeak_;
     peakNits_ = averageNits_ = -1;
-    if (meter_) meter_->measure(toCodeValues(sampled), peakNits_, averageNits_);
+    codes_ = toCodeValues(sampled);
+    if (meter_) meter_->measure(codes_, peakNits_, averageNits_);
     small_ = sampled.convertToFormat(QImage::Format_RGB32);
     pending_ = QImage();
     dirty_ = false;
@@ -269,6 +352,7 @@ void ScopesWidget::computeTrace() {
     case Mode::Parade: analyzeWaveform(true); break;
     case Mode::Vectorscope: analyzeVectorscope(); break;
     case Mode::Histogram: analyzeHistogram(); break;
+    case Mode::Chromaticity: analyzeChromaticity(); break;
     case Mode::Quad:
         analyzeWaveform(false);
         quad_[0] = trace_;
@@ -385,6 +469,53 @@ void ScopesWidget::analyzeHistogram() {
     }
 }
 
+void ScopesWidget::analyzeChromaticity() {
+    const ColorSpace* cs = findColorSpace(space_.toStdString());
+    if (!cs) cs = &rec709Space();
+    const bool uv = cieUv_;
+    const double range = cieRange(uv);
+    cieCounts_.assign(size_t(kCieBins) * kCieBins, 0);
+    const GamutCheck in709(*cs, Primaries::Bt709), inP3(*cs, Primaries::P3D65);
+    // (The codes came from 16-bit pictures: their light by table.)
+    const std::vector<float>& lin = linearTable16(cs->transfer);
+    double toXyz[9];
+    primariesToXyz(cs->primaries, toXyz);
+    int lit = 0, out709 = 0, outP3 = 0;
+    for (int y = 0; y < codes_.height; ++y) {
+        const float* row = codes_.row(y);
+        for (int x = 0; x < codes_.width; ++x) {
+            const float* px = row + x * 4;
+            // (Near black a colour's chromaticity is noise: left out.)
+            if (std::max({px[0], px[1], px[2]}) < 0.02f) continue;
+            double l[3], xyz[3];
+            for (int i = 0; i < 3; ++i) l[i] = lin[size_t(std::clamp(int(px[i] * 65535.0f + 0.5f), 0, 65535))];
+            for (int r = 0; r < 3; ++r) xyz[r] = toXyz[r * 3] * l[0] + toXyz[r * 3 + 1] * l[1] + toXyz[r * 3 + 2] * l[2];
+            const double sum = xyz[0] + xyz[1] + xyz[2];
+            if (!(sum > 1e-9)) continue;
+            const Xy c{xyz[0] / sum, xyz[1] / sum};
+            ++lit;
+            out709 += in709.possible() && in709.outsideLinear(l);
+            outP3 += inP3.possible() && inP3.outsideLinear(l);
+            const Xy at = uv ? xyToUv(c) : c;
+            const int bx = int(at.x / range * kCieBins), by = int((1 - at.y / range) * kCieBins);
+            if (bx >= 0 && bx < kCieBins && by >= 0 && by < kCieBins) ++cieCounts_[size_t(by) * kCieBins + bx];
+        }
+    }
+    outside709_ = lit ? double(out709) / lit : 0;
+    outsideP3_ = lit ? double(outP3) / lit : 0;
+    const std::vector<QRgb>& colors = chromaticityColors(uv);
+    const float ref = std::log1p(std::max(4.0f, float(codes_.width) * codes_.height / 600.0f));
+    trace_ = QImage(kCieBins, kCieBins, QImage::Format_ARGB32_Premultiplied);
+    for (int row = 0; row < kCieBins; ++row) {
+        auto* out = reinterpret_cast<QRgb*>(trace_.scanLine(row));
+        for (int x = 0; x < kCieBins; ++x) {
+            const size_t i = size_t(row) * kCieBins + x;
+            const uint32_t c = cieCounts_[i];
+            out[x] = c ? phosphor(QColor(colors[i]), std::min(1.0f, 0.2f + 0.8f * std::log1p(float(c)) / ref)) : 0;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Painting
 
@@ -415,6 +546,7 @@ void ScopesWidget::paintEvent(QPaintEvent*) {
     case Mode::Parade: paintWaveform(p, area, true); break;
     case Mode::Vectorscope: paintVectorscope(p, area); break;
     case Mode::Histogram: paintHistogram(p, area); break;
+    case Mode::Chromaticity: paintChromaticity(p, area); break;
     case Mode::Quad: {
         // Waveform and parade above, vectorscope and histogram below.
         const int w2 = area.width() / 2, h2 = area.height() / 2;
@@ -689,6 +821,113 @@ void ScopesWidget::paintHistogram(QPainter& p, const QRect& area) {
         p.setPen(QPen(lc, 1));
         p.setBrush(Qt::NoBrush);
         p.drawPath(line);
+    }
+    p.restore();
+}
+
+void ScopesWidget::paintChromaticity(QPainter& p, const QRect& area) {
+    const QFontMetrics fm(p.font());
+    const int labelW = fm.horizontalAdvance(QStringLiteral("0.0")) + 6;
+    const int side = std::min(area.width() - labelW - 4, area.height() - fm.height() - 6);
+    if (side < 40) return;
+    const QRectF plot(area.left() + labelW + (area.width() - labelW - side) / 2.0, area.top() + 2, side, side);
+    const bool uv = cieUv_;
+    const double range = cieRange(uv);
+    auto at = [&](Xy c) {
+        const Xy d = uv ? xyToUv(c) : c;
+        return QPointF(plot.left() + d.x / range * plot.width(), plot.bottom() - d.y / range * plot.height());
+    };
+    p.save();
+    p.fillRect(plot, theme::kWindow);
+    // Grid a tenth apart, labelled.
+    p.setPen(QPen(graticuleColor(45), 1, Qt::DotLine));
+    for (int i = 1; i * 0.1 < range + 1e-9; ++i) {
+        const double f = i * 0.1 / range;
+        p.drawLine(QPointF(plot.left() + f * plot.width(), plot.top()), QPointF(plot.left() + f * plot.width(), plot.bottom()));
+        p.drawLine(QPointF(plot.left(), plot.bottom() - f * plot.height()), QPointF(plot.right(), plot.bottom() - f * plot.height()));
+    }
+    p.setPen(theme::kTextDim);
+    for (int i = 0; i * 0.1 < range + 1e-9; i += 2) {
+        const double f = i * 0.1 / range;
+        const QString label = QString::number(i * 0.1, 'f', 1);
+        p.drawText(QRectF(plot.left() - labelW - 2, plot.bottom() - f * plot.height() - fm.height() / 2.0, labelW - 2, fm.height()),
+                   Qt::AlignRight | Qt::AlignVCenter, label);
+        p.drawText(QRectF(plot.left() + f * plot.width() - 20, plot.bottom() + 2, 40, fm.height()), Qt::AlignHCenter | Qt::AlignTop, label);
+    }
+    p.drawText(QRectF(plot.right() - 40, plot.bottom() - fm.height() - 2, 38, fm.height()), Qt::AlignRight | Qt::AlignBottom,
+               uv ? QStringLiteral("u′") : QStringLiteral("x"));
+    p.drawText(QRectF(plot.left() + 3, plot.top() + 2, 40, fm.height()), Qt::AlignLeft | Qt::AlignTop, uv ? QStringLiteral("v′") : QStringLiteral("y"));
+
+    p.setRenderHint(QPainter::Antialiasing);
+    // The spectral locus, closed by the line of purples.
+    QPainterPath locus;
+    const std::vector<Xy>& points = spectralLocus();
+    for (size_t i = 0; i < points.size(); ++i) {
+        if (i == 0) locus.moveTo(at(points[i]));
+        else locus.lineTo(at(points[i]));
+    }
+    locus.closeSubpath();
+    p.fillPath(locus, QColor(255, 255, 255, 10));
+    p.setPen(QPen(graticuleColor(140), 1));
+    p.drawPath(locus);
+    // Wavelengths along it.
+    p.setPen(theme::kTextDim);
+    for (int nm : {460, 480, 500, 520, 540, 560, 580, 600, 620}) {
+        const QPointF pt = at(points[size_t(nm - 380) / 5]);
+        const QPointF c = at(Xy{0.3127, 0.3290});
+        QPointF dir = pt - c;
+        const double len = std::hypot(dir.x(), dir.y());
+        if (len > 0) dir /= len;
+        p.drawLine(pt, pt + dir * 3);
+        const QPointF lp = pt + dir * (fm.height() * 0.9);
+        p.drawText(QRectF(lp.x() - 14, lp.y() - fm.height() / 2.0, 28, fm.height()), Qt::AlignCenter, QString::number(nm));
+    }
+
+    if (haveData_ && !trace_.isNull()) {
+        p.save();
+        p.setClipRect(plot);
+        p.setCompositionMode(QPainter::CompositionMode_Plus);
+        p.drawImage(plot, scaledTrace(plot.size().toSize()));
+        p.restore();
+    }
+
+    // The gamuts: Rec.709, P3 and Rec.2020, and the signal's own when it is another.
+    struct Gamut {
+        Primaries primaries;
+        QString name;
+        QColor color;
+    };
+    std::vector<Gamut> gamuts{{Primaries::Bt709, tr("Rec.709"), QColor(235, 235, 235, 200)},
+                              {Primaries::P3D65, tr("P3"), QColor(255, 180, 70, 200)},
+                              {Primaries::Bt2020, tr("Rec.2020"), QColor(90, 200, 255, 200)}};
+    const ColorSpace* cs = findColorSpace(space_.toStdString());
+    if (cs && cs->primaries != Primaries::Bt709 && cs->primaries != Primaries::P3D65 && cs->primaries != Primaries::Bt2020)
+        gamuts.push_back({cs->primaries, QString::fromStdString(cs->label), QColor(200, 130, 255, 200)});
+    for (size_t g = 0; g < gamuts.size(); ++g) {
+        const auto c = gamutChromaticities(gamuts[g].primaries);
+        QPolygonF tri;
+        for (int i = 0; i < 3; ++i) tri << at(c[size_t(i)]);
+        p.setPen(QPen(gamuts[g].color, 1, g == 3 ? Qt::DashLine : Qt::SolidLine));
+        p.setBrush(Qt::NoBrush);
+        p.drawPolygon(tri);
+        // Named beside its red corner, one below another.
+        p.setPen(gamuts[g].color);
+        const QPointF red = tri[0];
+        p.drawText(QRectF(red.x() + 4, red.y() - fm.height() / 2.0 + double(g) * fm.height() - fm.height(), 120, fm.height()),
+                   Qt::AlignLeft | Qt::AlignVCenter, gamuts[g].name);
+    }
+    // D65.
+    const QPointF white = at(Xy{0.3127, 0.3290});
+    p.setPen(QPen(graticuleColor(200), 1));
+    p.drawLine(white - QPointF(4, 0), white + QPointF(4, 0));
+    p.drawLine(white - QPointF(0, 4), white + QPointF(0, 4));
+    // How much of the picture is outside the smaller gamuts.
+    if (haveData_ && outside709_ >= 0) {
+        const QLocale loc;
+        auto pct = [&](double f) { return f > 0 && f < 0.001 ? QStringLiteral("<0.1") : loc.toString(f * 100, 'f', 1); };
+        p.setPen(outside709_ > 0 ? QColor(255, 150, 90) : theme::kTextDim);
+        p.drawText(QRectF(plot.right() - 200, plot.top() + 3, 196, fm.height()), Qt::AlignRight | Qt::AlignTop,
+                   tr("Outside Rec.709 %1 % · P3 %2 %").arg(pct(outside709_), pct(outsideP3_)));
     }
     p.restore();
 }

@@ -14,6 +14,7 @@
 #include <map>
 
 #include "Captions.h"
+#include "Cea708.h"
 #include "Model.h"
 
 namespace montage {
@@ -714,7 +715,7 @@ std::string formatOf(std::string ext) {
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
     if (ext == "xml" || ext == "dfxp" || ext == "imsc" || ext == "ttml") return "ttml";
     if (ext == "ssa" || ext == "ass") return "ass";
-    if (ext == "srt" || ext == "vtt" || ext == "scc" || ext == "stl") return ext;
+    if (ext == "srt" || ext == "vtt" || ext == "scc" || ext == "stl" || ext == "mcc") return ext;
     return {};
 }
 }  // namespace
@@ -726,6 +727,7 @@ std::string exportCaptions(const CaptionTrack& track, const Sequence& seq, const
     if (f == "srt") return captionsToSrt(track.captions, seq.fps);
     if (f == "vtt") return captionsToVtt(track.captions, seq.fps);
     if (f == "scc") return captionsToScc(track.captions, seq.fps);
+    if (f == "mcc") return captionsToMcc(track.captions, seq.fps, track.style);
     if (f == "ttml") return captionsToTtml(track.captions, seq.fps, track.language, track.style);
     if (f == "stl") return captionsToStl(track.captions, seq.fps, track.language, seq.name);
     if (f == "ass") return captionsToAss(track.captions, seq.fps, track.style, seq.width, seq.height);

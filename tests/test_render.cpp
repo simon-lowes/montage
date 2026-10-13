@@ -2,6 +2,7 @@
 #include <QtTest>
 #include <map>
 #include <QTemporaryDir>
+#include <QProcess>
 
 #include <algorithm>
 #include <QDir>
@@ -30,8 +31,14 @@
 #include "render/ColorChart.h"
 #include "core/LensProfile.h"
 #include "render/ColorSpace.h"
+#include "render/ColorSlice.h"
+#include "render/Clf.h"
+#include "render/Amf.h"
+#include "core/Cdl.h"
+#include "render/Gamut.h"
 #include "render/HdrView.h"
 #include "render/Compositor.h"
+#include "render/GpuCompositor.h"
 #include "render/Dcp.h"
 #include "render/Imf.h"
 #include "render/Jpeg2000.h"
@@ -103,6 +110,644 @@ Clip colorClip(Project& p, float r, float g, float b, FrameTime start, FrameTime
 class TestRender : public QObject {
     Q_OBJECT
 private slots:
+    void gamutTools() {
+        auto near = [](Xy a, double x, double y, double tol) { return std::fabs(a.x - x) < tol && std::fabs(a.y - y) < tol; };
+        // Chromaticities: white is D65, the primaries where the standards put them (Rec.709 red, Rec.2020 green, P3 blue).
+        const ColorSpace& rec709 = *findColorSpace("rec709");
+        const ColorSpace& rec2020 = *findColorSpace("rec2020");
+        Xy c;
+        const float white[3] = {1, 1, 1}, red[3] = {1, 0, 0}, green[3] = {0, 1, 0}, black[3] = {0, 0, 0};
+        QVERIFY(codeToXy(rec709, white, c) && near(c, 0.3127, 0.3290, 1e-4));
+        QVERIFY(codeToXy(rec709, red, c) && near(c, 0.64, 0.33, 1e-4));
+        QVERIFY(codeToXy(rec2020, green, c) && near(c, 0.170, 0.797, 1e-4));
+        QVERIFY(!codeToXy(rec709, black, c));
+        const float grey[3] = {0.3f, 0.3f, 0.3f};  // (any brightness: the same chromaticity)
+        QVERIFY(codeToXy(*findColorSpace("rec2100pq"), grey, c) && near(c, 0.3127, 0.3290, 1e-4));
+        const auto p3 = gamutChromaticities(Primaries::P3D65);
+        QVERIFY(near(p3[2], 0.150, 0.060, 1e-4) && near(p3[3], 0.3127, 0.3290, 1e-4));
+        // u'v' of D65 is (0.1978, 0.4683).
+        QVERIFY(near(xyToUv({0.3127, 0.3290}), 0.1978, 0.4683, 1e-4));
+        // The spectral locus: 380 to 700 nm; 520 nm (the greenest light) at (0.0743, 0.8338), 700 nm (0.7347, 0.2653).
+        const std::vector<Xy>& locus = spectralLocus();
+        QCOMPARE(locus.size(), size_t(65));
+        QVERIFY(near(locus[28], 0.0743, 0.8338, 1e-4));
+        QVERIFY(near(locus.back(), 0.7347, 0.2653, 1e-4));
+
+        // Outside a gamut: Rec.2020's green is outside Rec.709 and P3; Rec.709's red inside all three; a P3 red inside P3
+        // but not Rec.709.
+        QVERIFY(GamutCheck(rec2020, Primaries::Bt709).outside(green));
+        QVERIFY(GamutCheck(rec2020, Primaries::P3D65).outside(green));
+        QVERIFY(!GamutCheck(rec2020, Primaries::Bt2020).outside(green));
+        QVERIFY(!GamutCheck(rec709, Primaries::Bt2020).outside(red));
+        const ColorSpace& displayP3 = *findColorSpace("p3d65");
+        QVERIFY(GamutCheck(displayP3, Primaries::Bt709).outside(red));
+        QVERIFY(!GamutCheck(displayP3, Primaries::P3D65).outside(red));
+        QVERIFY(!GamutCheck(rec2020, Primaries::Bt709).outside(white) && !GamutCheck(rec2020, Primaries::Bt709).outside(black));
+        // (A Rec.709 colour taken to Rec.2020 and its codes rounded to 16 bits is still inside Rec.709.)
+        float conv[3] = {0.9f, 0.05f, 0.02f};
+        convertPixel(conv, rec709, rec2020);
+        for (float& v : conv) v = std::round(v * 65535) / 65535;
+        QVERIFY(!GamutCheck(rec2020, Primaries::Bt709).outside(conv));
+
+        // ACES Reference Gamut Compression: colours well inside left alone; one at a limit's distance lands on the
+        // edge (its channel 0); further out ones come inside; the inverse undoes it.
+        float inside[3] = {0.5f, 0.3f, 0.2f};
+        acesGamutCompress(inside);
+        QCOMPARE(inside[0], 0.5f);
+        QCOMPARE(inside[1], 0.3f);
+        QCOMPARE(inside[2], 0.2f);
+        for (int ch = 0; ch < 3; ++ch) {
+            const double limit = ch == 0 ? 1.147 : ch == 1 ? 1.264 : 1.312;
+            float v[3] = {1, 1, 1};
+            v[ch] = float(1 - limit);
+            acesGamutCompress(v);
+            QVERIFY2(std::fabs(v[ch]) < 1e-5f, qPrintable(QString::number(v[ch])));
+        }
+        float far[3] = {0.8f, -0.6f, 0.1f};
+        acesGamutCompress(far);
+        QVERIFY(far[1] > -0.6f && far[1] < 0 && far[0] == 0.8f);
+        float back[3] = {far[0], far[1], far[2]};
+        acesGamutCompress(back, true);
+        QVERIFY(std::fabs(back[1] + 0.6f) < 1e-4f && std::fabs(back[2] - 0.1f) < 1e-4f);
+        float none[3] = {0, 0, 0};
+        acesGamutCompress(none);
+        QCOMPARE(none[0], 0.0f);
+        // Against OpenColorIO's own (ACES 1.3's LMT, on ACES2065-1): within the spec's 0.002.
+        if (ocioAvailable()) {
+            double toAp1[9], toAp0[9];
+            primariesMatrix(Primaries::Ap0, Primaries::Ap1, toAp1);
+            primariesMatrix(Primaries::Ap1, Primaries::Ap0, toAp0);
+            std::vector<float> ours, theirs;
+            const float samples[][3] = {{0.18f, 0.18f, 0.18f}, {0.9f, -0.05f, 0.02f}, {0.02f, 0.5f, -0.1f}, {-0.02f, 0.1f, 0.6f},
+                                        {2.5f, 0.1f, -0.3f}, {0.05f, 0.01f, 0.4f}, {1.0f, 0.4f, 0.0f}, {0.3f, -0.2f, 0.9f}};
+            for (const auto& s : samples) {
+                theirs.insert(theirs.end(), s, s + 3);
+                float a[3];
+                for (int r = 0; r < 3; ++r) a[r] = float(toAp1[r * 3] * s[0] + toAp1[r * 3 + 1] * s[1] + toAp1[r * 3 + 2] * s[2]);
+                acesGamutCompress(a);
+                for (int r = 0; r < 3; ++r) ours.push_back(float(toAp0[r * 3] * a[0] + toAp0[r * 3 + 1] * a[1] + toAp0[r * 3 + 2] * a[2]));
+            }
+            std::string err;
+            QVERIFY2(applyOcioBuiltin("ACES-LMT - ACES 1.3 Reference Gamut Compression", theirs.data(), theirs.size() / 3, false, &err), err.c_str());
+            for (size_t i = 0; i < ours.size(); ++i)
+                QVERIFY2(std::fabs(ours[i] - theirs[i]) < 0.002f, qPrintable(QString("%1: %2 vs %3").arg(i).arg(ours[i]).arg(theirs[i])));
+        }
+
+        // The effect, in the working space: an ACEScct sequence's out-of-gamut colour brought in, an in-gamut one alone;
+        // Inverse takes it back; LUT export holds it.
+        Project p = makeDefaultProject();
+        Effect e = makeEffect(p, "aces_gamut_compress");
+        const ColorSpace& cct = *findColorSpace("acescct");
+        const WorkingSpaceScope working(&cct);
+        float outCode[3] = {float(fromLinear(Transfer::AcesCct, 0.6)), float(fromLinear(Transfer::AcesCct, -0.05)),
+                            float(fromLinear(Transfer::AcesCct, 0.1))};
+        Image img = solid(1, 1, outCode[0], outCode[1], outCode[2]);
+        applyVideoEffect(e, 0, img, 1.0);
+        float lin[3] = {0.6f, -0.05f, 0.1f};
+        acesGamutCompress(lin);
+        QVERIFY(std::fabs(toLinear(Transfer::AcesCct, img.at(0, 0)[1]) - lin[1]) < 1e-4);
+        QVERIFY(toLinear(Transfer::AcesCct, img.at(0, 0)[1]) > -0.05);
+        e.params["direction"] = Param(1.0);
+        applyVideoEffect(e, 0, img, 1.0);
+        QVERIFY(std::fabs(img.at(0, 0)[1] - outCode[1]) < 1e-4f);
+        Image calm = solid(1, 1, 0.4f, 0.4f, 0.35f);
+        e.params["direction"] = Param(0.0);
+        applyVideoEffect(e, 0, calm, 1.0);
+        QVERIFY(std::fabs(calm.at(0, 0)[2] - 0.35f) < 1e-5f);
+        QVERIFY(isColorOnlyEffect(e, 0));
+
+        // On a clip of media it works on the media's colours, before the input transform clips them to the working
+        // gamut: an ACES2065-1 blue outside AP1 (and Rec.709) comes out compressed, not clipped.
+        QTemporaryDir dir;
+        const QString path = dir.filePath("ap0.png");
+        QImage q(8, 8, QImage::Format_RGBA64);
+        q.fill(QColor::fromRgbF(0.05f, 0.05f, 0.4f));
+        QVERIFY(q.save(path));
+        Project pm = makeDefaultProject();
+        MediaItem m;
+        QVERIFY(probeMedia(path.toStdString(), m));
+        m.id = pm.newId();
+        m.colorOverride = "aces2065-1";
+        pm.media.push_back(m);
+        Sequence& sm = *pm.active();
+        sm.width = sm.height = 8;
+        QVERIFY(edit::placeMedia(pm, sm, m.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        RenderOptions o;
+        float plain[4], compressed[4];
+        rgb(renderProgramFrame(pm, sm, 0, o), 4, 4, plain);
+        sm.videoTracks[0].clips[0].effects.push_back(makeEffect(pm, "aces_gamut_compress"));
+        rgb(renderProgramFrame(pm, sm, 0, o), 4, 4, compressed);
+        float want[3] = {std::round(0.05f * 65535) / 65535, std::round(0.05f * 65535) / 65535, std::round(0.4f * 65535) / 65535};
+        AcesGamutCompressor(*findColorSpace("aces2065-1"))(want);
+        convertPixel(want, *findColorSpace("aces2065-1"), rec709);
+        for (int i = 0; i < 3; ++i)
+            QVERIFY2(std::fabs(compressed[i] - want[i]) < 0.005f, qPrintable(QString("%1: %2 vs %3").arg(i).arg(compressed[i]).arg(want[i])));
+        QVERIFY2(std::fabs(compressed[1] - plain[1]) > 0.005f, qPrintable(QString("%1 / %2").arg(plain[1]).arg(compressed[1])));
+    }
+
+    void acesMetadataFiles() {
+        // Transform ids, ACES 1 and 2, and Montage's colour spaces both ways.
+        bool exact = false;
+        QCOMPARE(acesInputSpace("urn:ampas:aces:transformId:v1.5:IDT.ARRI.Alexa-v3-logC-EI800.a1.v2", &exact), std::string("logc3-awg3"));
+        QVERIFY(exact);
+        QCOMPARE(acesInputSpace("urn:ampas:aces:transformId:v1.5:IDT.ARRI.Alexa-v3-logC-EI1600.a1.v2", &exact), std::string("logc3-awg3"));
+        QVERIFY(!exact);  // (another exposure index's curve)
+        QCOMPARE(acesInputSpace("urn:ampas:aces:transformId:v2.0:CSC.Sony.Venice_SLog3_SGamut3Cine_to_ACES.a2.v1", &exact), std::string("slog3-sgamut3cine"));
+        QVERIFY(!exact);
+        QCOMPARE(acesInputSpace("urn:ampas:aces:transformId:v1.5:ACEScsc.Academy.ACEScct_to_ACES.a1.0.3"), std::string("acescct"));
+        QCOMPARE(acesInputSpace("urn:ampas:aces:transformId:v2.0:CSC.Canon.CLog2_CGamut_to_ACES.a1.v1"), std::string());
+        double peak = 0;
+        QCOMPARE(acesOutputSpace("urn:ampas:aces:transformId:v1.5:RRTODT.Academy.Rec2020_2000nits_15nits_ST2084.a1.1.0", &peak), std::string("rec2100pq"));
+        QCOMPARE(peak, 2000.0);
+        QCOMPARE(acesOutputSpace("urn:ampas:aces:transformId:v1.5:RRTODT.Academy.P3D65_108nits_7point2nits_ST2084.a1.1.0", &peak), std::string("p3d65pq"));
+        QCOMPARE(peak, 108.0);
+        QCOMPARE(acesOutputSpace("urn:ampas:aces:transformId:v2.0:Output.Academy.P3-D65_1000nit_in_Rec2100-D65_HLG.a2.v1"), std::string("rec2100hlg"));
+        QCOMPARE(acesOutputSpace("urn:ampas:aces:transformId:v1.5:ODT.Academy.P3D60_48nits.a1.0.3"), std::string());  // (cinema)
+        QCOMPARE(acesOutputSpace("urn:ampas:aces:transformId:v2.0:Output.Academy.P3-D65_48nit_in_P3-D65_Gamma2pt6.a2.v1"), std::string());
+        for (const auto& cs : colorSpaces()) {
+            const std::string in = acesInputTransformId(cs.id);
+            if (!in.empty()) QCOMPARE(acesInputSpace(in, &exact), cs.id);
+            const std::string out = acesOutputTransformId(cs.id, 1000);
+            if (!out.empty()) QCOMPARE(acesOutputSpace(out), cs.id);
+            if (cs.id == "rec709" || cs.id == "rec2100pq" || cs.id == "p3d65pq" || cs.id == "slog3-sgamut3cine") QVERIFY(!(in + out).empty());
+        }
+        QVERIFY(acesOutputTransformId("rec2100pq", 1200).find("_1000nit_") != std::string::npos);  // (the nearest ACES has)
+        QVERIFY(acesOutputTransformId("p3d65pq", 100).find("_108nit_") != std::string::npos);
+
+        // Reading: an ACES 1 pipeline for a camera clip, and an ACES 2 one with its CDL in a collection.
+        const std::string data = std::string(MONTAGE_TEST_DATA_DIR) + "/amf";
+        AmfDocument a;
+        std::string err;
+        QVERIFY2(readAmf(data + "/A001C012.amf", a, &err), err.c_str());
+        QCOMPARE(a.clipName, std::string("A001C012"));
+        QCOMPARE(a.clipSequence, std::string("A001_C012_AE0306_####.ari"));
+        QCOMPARE(a.sequenceMax, 240);
+        QVERIFY(a.hasInput && !a.inputApplied);
+        QCOMPARE(a.inputSpace, std::string("logc3-awg3"));
+        QCOMPARE(a.looks.size(), size_t(5));
+        QVERIFY(a.looks[0].applied && a.looks[0].cdl.slope[0] == 2.0 && a.looks[0].cdl.saturation == 0.5);  // (ASC_SOP, as ACES 1 wrote it)
+        QVERIFY(!a.looks[1].applied && a.looks[1].kind == AmfLook::Kind::Cdl);
+        QCOMPARE(a.looks[1].cdlSpace, std::string("acescct"));
+        QVERIFY(a.looks[1].cdl.slope[2] == 0.9 && a.looks[1].cdl.power[1] == 1.05 && a.looks[1].cdl.saturation == 0.9);
+        QCOMPARE(a.looks[2].file, data + "/show_look.clf");
+        QVERIFY(a.looks[3].kind == AmfLook::Kind::TransformId);
+        QCOMPARE(a.outputSpace, std::string("rec709"));
+        AmfDocument b;
+        QVERIFY2(readAmf(data + "/B002C003.amf", b, &err), err.c_str());
+        QCOMPARE(b.inputSpace, std::string("rec709"));  // an inverse output transform: video made for that display
+        QCOMPARE(b.looks.size(), size_t(1));
+        QVERIFY(b.looks[0].cdl.slope[2] == 1.08 && b.looks[0].cdl.saturation == 1.15);  // grade7 from grades.ccc
+        QCOMPARE(b.outputSpace, std::string("rec2100pq"));
+        QCOMPARE(b.outputPeakNits, 1000.0);
+        QVERIFY(!parseAmf("<aces:acesMetadataFile xmlns:aces=\"urn:ampas:aces:amf:v2.0\"/>", {}, b, &err));
+        QVERIFY(err.find("pipeline") != std::string::npos);
+        QVERIFY(!parseAmf("<ProcessList/>", {}, b, &err));
+
+        // Onto clips: the one its clip name matches (the camera file's), not the other.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        auto media = [&](const char* name, const char* space) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Video;
+            m.name = name;
+            m.path = std::string("/cards/") + name;
+            m.duration = 10;
+            m.width = 1920;
+            m.height = 1080;
+            m.fps = s.fps;
+            m.hasVideo = true;
+            m.colorSpace = space;
+            p.media.push_back(m);
+            QVERIFY(edit::placeMedia(p, s, m.id, s.duration(), 0, 24, {TrackKind::Video, 0}, {}, false).ok);
+        };
+        media("A001C012.mov", "");
+        media("B002C003.mxf", "");
+        const Id camera = s.videoTracks[0].clips[0].id, interview = s.videoTracks[0].clips[1].id;
+        AmfImportResult r = applyAmf(p, s, {}, a);
+        QCOMPARE(r.clips, 1);
+        QVERIFY(std::find_if(r.notes.begin(), r.notes.end(), [](const std::string& n) { return n.find("Bleach") != std::string::npos; }) != r.notes.end());
+        const Clip* cam = edit::clipById(s, camera);
+        QCOMPARE(p.findMedia(cam->mediaId)->colorOverride, std::string("logc3-awg3"));
+        QCOMPARE(p.findMedia(cam->mediaId)->metadata.at("amf_name"), std::string("A001C012.amf"));  // (as an ALE names it)
+        QCOMPARE(p.findMedia(cam->mediaId)->metadata.at("amf_uuid"), std::string("urn:uuid:0d6f5a8e-3b6c-4c55-9a51-7f0d2b1c9e01"));
+        QCOMPARE(cam->effects.size(), size_t(3));  // the CDL, the look and the gamut compression (not the applied one)
+        QCOMPARE(cam->effects[0].type, std::string("cdl"));
+        QCOMPARE(cam->effects[0].s("space"), std::string("ACEScct"));
+        Cdl g;
+        QVERIFY(clipCdl(*cam, 0, g) && g.slope[0] == 1.1 && g.saturation == 0.9);
+        QCOMPARE(cam->effects[1].type, std::string("lut"));
+        QCOMPARE(cam->effects[1].s("path"), data + "/show_look.clf");
+        QCOMPARE(cam->effects[1].s("space"), findColorSpace("aces2065-1")->label);
+        QCOMPARE(cam->effects[2].type, std::string("aces_gamut_compress"));
+        QVERIFY(edit::clipById(s, interview)->effects.empty());
+        QCOMPARE(s.colorSpace, std::string("rec709"));
+        // Again: the earlier AMF's effects give way; a hand-added effect stays. The other file onto a chosen clip, with
+        // its output transform's space for the sequence.
+        edit::clipById(s, camera)->effects.push_back(makeEffect(p, "hue_sat"));
+        QCOMPARE(applyAmf(p, s, {}, a).clips, 1);
+        QCOMPARE(edit::clipById(s, camera)->effects.size(), size_t(4));
+        QCOMPARE(edit::clipById(s, camera)->effects[3].type, std::string("hue_sat"));
+        AmfDocument named;
+        QVERIFY(readAmf(data + "/B002C003.amf", named));
+        named.clipName = "nothing here";
+        named.clipFile.clear();
+        QCOMPARE(applyAmf(p, s, {}, named).clips, 0);
+        // ... unless an ALE named the AMF for the media.
+        p.findMedia(edit::clipById(s, interview)->mediaId)->metadata["amf_uuid"] = named.uuid;
+        QVERIFY(amfMatchesClip(named, p, *edit::clipById(s, interview)));
+        p.findMedia(edit::clipById(s, interview)->mediaId)->metadata.erase("amf_uuid");
+        AmfImportOptions o;
+        o.setSequenceSpace = true;
+        QCOMPARE(applyAmf(p, s, {interview}, named, o).clips, 1);
+        QCOMPARE(s.colorSpace, std::string("rec2100pq"));
+        QCOMPARE(s.hdrPeakNits, 1000.0);
+        QCOMPARE(edit::clipById(s, interview)->effects.size(), size_t(1));
+
+        // Out again: the camera clip's AMF has its IDT, its looks and the sequence's output transform; the look file
+        // beside it. A clip of video gets an inverse output transform; a CDL in a space ACES has no id for, a CLF of it.
+        QTemporaryDir dir;
+        std::vector<std::string> notes;
+        const std::string camPath = dir.path().toStdString() + "/cam.amf";
+        QVERIFY2(writeClipAmf(p, s, *edit::clipById(s, camera), camPath, &notes, {}, &err), err.c_str());
+        QVERIFY(std::find_if(notes.begin(), notes.end(), [](const std::string& n) { return n.find("Hue / Saturation") != std::string::npos; }) != notes.end());
+        AmfDocument back;
+        QVERIFY2(readAmf(camPath, back, &err), err.c_str());
+        QCOMPARE(back.clipName, std::string("A001C012"));
+        QCOMPARE(back.clipFile, std::string("A001C012.mov"));
+        QCOMPARE(back.inputTransformId, acesInputTransformId("logc3-awg3"));
+        QCOMPARE(back.looks.size(), size_t(3));
+        QVERIFY(back.looks[0].cdl.sameGrade(g));
+        QCOMPARE(back.looks[0].cdlSpace, std::string("acescct"));
+        QCOMPARE(back.looks[1].file, dir.path().toStdString() + "/show_look.clf");
+        QVERIFY(QFileInfo::exists(QString::fromStdString(back.looks[1].file)));
+        QCOMPARE(back.looks[2].transformId, std::string("urn:ampas:aces:transformId:v2.0:Look.Academy.ReferenceGamutCompress.a2.v1"));
+        // Again into the same folder, its look found there already, not copied over itself; another LUT of the same
+        // name numbered beside it; the inverse gamut compression (no AMF id) left out.
+        QVERIFY(writeClipAmf(p, s, *edit::clipById(s, camera), camPath, &notes, {}, &err));
+        QVERIFY(readAmf(camPath, back) && back.looks[1].file == dir.path().toStdString() + "/show_look.clf");
+        QTemporaryDir other;
+        QFile odd(other.path() + "/show_look.clf");
+        QVERIFY(odd.open(QIODevice::WriteOnly) && odd.write(QByteArray::fromStdString(clfToAces("acescct"))) > 0);
+        odd.close();
+        Clip second = *edit::clipById(s, camera);
+        second.effects[1].strings["path"] = odd.fileName().toStdString();
+        second.effects[2].params["direction"] = Param(1.0);
+        QVERIFY(writeClipAmf(p, s, second, dir.path().toStdString() + "/second.amf", &notes, {}, &err));
+        QVERIFY(readAmf(dir.path().toStdString() + "/second.amf", back));
+        QCOMPARE(back.looks.size(), size_t(2));
+        QCOMPARE(back.looks[1].file, dir.path().toStdString() + "/show_look_2.clf");
+        QVERIFY(std::find_if(notes.begin(), notes.end(), [](const std::string& n) { return n.find("inverse gamut") != std::string::npos; }) != notes.end());
+        QVERIFY(QFileInfo::exists(QString::fromStdString(data + "/show_look.clf")));
+        QCOMPARE(back.outputSpace, std::string("rec2100pq"));
+        QCOMPARE(back.outputPeakNits, 1000.0);
+        Clip& iv = *edit::clipById(s, interview);
+        for (Effect& e : iv.effects) e.strings["space"] = "Working space";
+        const std::string ivPath = dir.path().toStdString() + "/interview.amf";
+        QVERIFY2(writeClipAmf(p, s, iv, ivPath, &notes, {}, &err), err.c_str());
+        QVERIFY(readAmf(ivPath, back, &err));
+        QCOMPARE(back.inputSpace, std::string("rec709"));
+        QVERIFY(back.inputTransformId.find(":InvOutput.Academy.Rec709-D65_100nit_in_Rec709-D65_BT1886") != std::string::npos);
+        QCOMPARE(back.looks.size(), size_t(1));
+        QCOMPARE(back.looks[0].cdlSpace, std::string("rec2100pq"));  // the working space, by the CLF Montage wrote for it
+        // That CLF is the space's code values in ACES2065-1.
+        auto clf = loadClf(dir.path().toStdString() + "/rec2100pq_to_ACES2065-1.clf", &err);
+        QVERIFY2(clf, err.c_str());
+        float v[3] = {0.5f, 0.3f, 0.7f};
+        clf->apply(v);
+        double m[9], l[3];
+        primariesMatrix(Primaries::Bt2020, Primaries::Ap0, m);
+        for (int i = 0; i < 3; ++i) l[i] = toLinear(Transfer::Pq, i == 0 ? 0.5 : i == 1 ? 0.3 : 0.7);
+        for (int i = 0; i < 3; ++i) QVERIFY(std::fabs(v[i] - (m[i * 3] * l[0] + m[i * 3 + 1] * l[1] + m[i * 3 + 2] * l[2])) < 2e-3);
+        if (ocioAvailable()) {
+            float o[3] = {0.5f, 0.3f, 0.7f};
+            QVERIFY2(applyOcioFile(dir.path().toStdString() + "/rec2100pq_to_ACES2065-1.clf", o, 1, &err), err.c_str());
+            for (int i = 0; i < 3; ++i) QVERIFY(std::fabs(o[i] - v[i]) < 1e-4);
+        }
+        // A LUT in another space cannot be an AMF look.
+        Effect lut = makeEffect(p, "lut");
+        lut.strings["path"] = data + "/show_look.clf";
+        lut.strings["space"] = "ACEScct";
+        iv.effects.push_back(lut);
+        QVERIFY(writeClipAmf(p, s, iv, ivPath, &notes, {}, &err));
+        QVERIFY(std::find_if(notes.begin(), notes.end(), [](const std::string& n) { return n.find("left out") != std::string::npos; }) != notes.end());
+        // What Montage writes is a valid AMF 2.0 (checked against the Academy's schema when it is at hand).
+        if (const char* xsd = getenv("MONTAGE_AMF_SCHEMA")) {
+            for (const std::string& f : {camPath, ivPath}) {
+                QProcess lint;
+                lint.start("xmllint", {"--noout", "--schema", xsd, QString::fromStdString(f)});
+                QVERIFY(lint.waitForFinished());
+                QVERIFY2(lint.exitCode() == 0, lint.readAllStandardError().constData());
+            }
+        }
+    }
+
+    void clfMatchesOcio() {
+        // Montage's CLF reader gives what OpenColorIO gives for the same files: every operator, integer bit depths,
+        // both 3D LUT interpolations, values outside 0..1.
+        if (!ocioAvailable()) QSKIP("Built without OpenColorIO");
+        std::vector<float> colours;
+        for (float r : {-0.1f, 0.0f, 0.18f, 0.37f, 0.5f, 0.73f, 1.0f, 1.2f})
+            for (float g : {0.0f, 0.05f, 0.42f, 0.9f, 1.0f})
+                for (float b : {-0.02f, 0.11f, 0.6f, 0.95f}) colours.insert(colours.end(), {r, g, b});
+        for (const char* name : {"operators.clf", "more_operators.clf", "lut3d_tetrahedral.clf", "lut3d_trilinear.clf"}) {
+            const std::string path = std::string(MONTAGE_TEST_DATA_DIR) + "/clf/" + name;
+            std::string error;
+            auto clf = loadClf(path, &error);
+            QVERIFY2(clf, error.c_str());
+            QVERIFY(!clf->description.empty());
+            std::vector<float> want = colours;
+            QVERIFY2(applyOcioFile(path, want.data(), want.size() / 3, &error), error.c_str());
+            double worst = 0;
+            for (size_t i = 0; i < colours.size(); i += 3) {
+                float v[3] = {colours[i], colours[i + 1], colours[i + 2]};
+                clf->apply(v);
+                for (int c = 0; c < 3; ++c) worst = std::max(worst, double(std::fabs(v[c] - want[i + size_t(c)])));
+            }
+            QVERIFY2(worst < 1e-4, (std::string(name) + " differs by " + std::to_string(worst)).c_str());
+            QCOMPARE(loadClf(path).get(), clf.get());  // (kept while the file is unchanged)
+        }
+        // The LUT effect applies a CLF as it is in the working space, or in the space it names (here ACEScct, by way of
+        // linear light), mixed by its strength.
+        const std::string ops = std::string(MONTAGE_TEST_DATA_DIR) + "/clf/operators.clf";
+        auto clf = loadClf(ops);
+        Project p;
+        Effect e = makeEffect(p, "lut");
+        e.strings["path"] = ops;
+        const float in[3] = {0.3f, 0.55f, 0.8f};
+        Image img = solid(2, 2, in[0], in[1], in[2]);
+        applyVideoEffect(e, 0, img, 1);
+        float c[4], want[3] = {in[0], in[1], in[2]};
+        clf->apply(want);
+        rgb(img, 0, 0, c);
+        for (int i = 0; i < 3; ++i) QVERIFY(std::fabs(c[i] - want[i]) < 1e-5);
+        e.strings["space"] = "ACEScct";
+        e.params["strength"] = 50.0;
+        img = solid(2, 2, in[0], in[1], in[2]);
+        applyVideoEffect(e, 0, img, 1);
+        const ColorSpace& rec = rec709Space();
+        double to[9], from[9], l[3], o[3];
+        primariesMatrix(rec.primaries, Primaries::Ap1, to);
+        primariesMatrix(Primaries::Ap1, rec.primaries, from);
+        for (int i = 0; i < 3; ++i) l[i] = toLinear(rec.transfer, in[i]);
+        for (int i = 0; i < 3; ++i) want[i] = float(fromLinear(Transfer::AcesCct, to[i * 3] * l[0] + to[i * 3 + 1] * l[1] + to[i * 3 + 2] * l[2]));
+        clf->apply(want);
+        for (int i = 0; i < 3; ++i) o[i] = toLinear(Transfer::AcesCct, want[i]);
+        for (int i = 0; i < 3; ++i) want[i] = float(fromLinear(rec.transfer, from[i * 3] * o[0] + from[i * 3 + 1] * o[1] + from[i * 3 + 2] * o[2]));
+        rgb(img, 0, 0, c);
+        for (int i = 0; i < 3; ++i) QVERIFY2(std::fabs(c[i] - (in[i] + want[i]) / 2) < 3e-3, std::to_string(c[i] - (in[i] + want[i]) / 2).c_str());
+
+        // Files that are not CLF, or use what is not read, say why.
+        std::string why;
+        QVERIFY(!parseClf("<ProcessList><LUT1D halfDomain=\"true\"><Array dim=\"2 1\">0 1</Array></LUT1D></ProcessList>", &why));
+        QVERIFY(why.find("Half") != std::string::npos);
+        QVERIFY(!parseClf("<ProcessList><LUT3D><Array dim=\"2 2 2 3\">0 1</Array></LUT3D></ProcessList>", &why));
+        QVERIFY(why.find("size") != std::string::npos);
+        QVERIFY(!parseClf("<ProcessList><LUT1D rawHalfs=\"true\"><Array dim=\"2 1\">0 1</Array></LUT1D></ProcessList>", &why));
+        QVERIFY(!parseClf("<ProcessList><LUT3D><Array dim=\"4194304 4194304 4194304 3\"></Array></LUT3D></ProcessList>", &why));
+        QVERIFY(why.find("size") != std::string::npos);  // (not an allocation that overflows)
+        QVERIFY(!parseClf("<ProcessList><Gamut /></ProcessList>", &why));
+        QVERIFY(why.find("Gamut") != std::string::npos);
+        QVERIFY(!parseClf("<Something />", &why));
+        QVERIFY(!parseClf("not xml", &why));
+        // Not-a-number in (from an EXR, or an earlier operator) comes out as a number, not a read outside a table.
+        for (const char* name : {"lut3d_tetrahedral.clf", "operators.clf"}) {
+            float nan[3] = {std::nanf(""), 0.5f, std::nanf("")};
+            loadClf(std::string(MONTAGE_TEST_DATA_DIR) + "/clf/" + name)->apply(nan);
+            QVERIFY(std::isfinite(nan[1]));
+        }
+        // A .ctf (Autodesk's CLF) as a LUT effect's file.
+        QTemporaryDir dir;
+        const QString ctf = dir.path() + "/look.ctf";
+        QVERIFY(QFile::copy(QString::fromStdString(ops), ctf));
+        e = makeEffect(p, "lut");
+        e.strings["path"] = ctf.toStdString();
+        img = solid(2, 2, in[0], in[1], in[2]);
+        applyVideoEffect(e, 0, img, 1);
+        float again[3] = {in[0], in[1], in[2]};
+        clf->apply(again);
+        rgb(img, 0, 0, c);
+        for (int i = 0; i < 3; ++i) QVERIFY(std::fabs(c[i] - again[i]) < 1e-5);
+    }
+
+    void colorSliceAndTexture() {
+        // Colour Slice in a Rec.709 sequence: each vector changes its own colours, density darkens richer colours more,
+        // subtractive saturation keeps the brightest channel, additive keeps the brightness, highlights can be kept.
+        Project p = makeDefaultProject();
+        const ColorSpace& rec = rec709Space();
+        auto code = [&](float r, float g, float b) {
+            return std::array<float, 3>{float(fromLinear(rec.transfer, r)), float(fromLinear(rec.transfer, g)), float(fromLinear(rec.transfer, b))};
+        };
+        auto run = [&](const Effect& e, std::array<float, 3> c) {
+            Image img = solid(1, 1, c[0], c[1], c[2]);
+            applyVideoEffect(e, 0, img, 1.0);
+            return std::array<float, 3>{float(toLinear(rec.transfer, img.at(0, 0)[0])), float(toLinear(rec.transfer, img.at(0, 0)[1])),
+                                        float(toLinear(rec.transfer, img.at(0, 0)[2]))};
+        };
+        auto lumaOf = [](std::array<float, 3> l) { return 0.2126f * l[0] + 0.7152f * l[1] + 0.0722f * l[2]; };
+        const auto red = code(0.4f, 0.03f, 0.03f), paleRed = code(0.4f, 0.25f, 0.25f), grey = code(0.3f, 0.3f, 0.3f),
+                   blue = code(0.03f, 0.03f, 0.4f), skinTone = code(0.4f, 0.22f, 0.15f), green = code(0.03f, 0.4f, 0.03f);
+        Effect e = makeEffect(p, "color_slice");
+        for (auto c : {red, grey, skinTone}) {
+            const auto out = run(e, c);
+            for (int k = 0; k < 3; ++k) QVERIFY(std::fabs(out[k] - toLinear(rec.transfer, c[size_t(k)])) < 1e-5);
+        }
+        e.params["protect_highlights"] = Param(0.0);
+        e.params["red_density"] = Param(1.0);
+        {
+            const auto r = run(e, red), pr = run(e, paleRed), g = run(e, grey), b = run(e, blue);
+            const float redStops = std::log2(0.4f / r[0]), paleStops = std::log2(0.4f / pr[0]);
+            QVERIFY2(redStops > 0.8f && redStops < 1.05f, qPrintable(QString::number(redStops)));
+            QVERIFY2(paleStops > 0.05f && paleStops < 0.5f * redStops, qPrintable(QString::number(paleStops)));
+            QVERIFY(std::fabs(r[1] / r[0] - 0.03f / 0.4f) < 1e-3);  // (darker, the same colour)
+            QVERIFY(std::fabs(g[0] - 0.3f) < 1e-4 && std::fabs(b[2] - 0.4f) < 1e-4 && std::fabs(b[0] - 0.03f) < 1e-4);
+        }
+        {
+            const float full = std::log2(0.4f / run(e, red)[0]);
+            e.params["depth"] = Param(50.0);
+            QVERIFY(std::fabs(std::log2(0.4f / run(e, red)[0]) - 0.5f * full) < 1e-3);
+        }
+        e = makeEffect(p, "color_slice");
+        e.params["protect_highlights"] = Param(0.0);
+        e.params["saturation"] = Param(1.5);
+        const auto warm = code(0.5f, 0.2f, 0.1f);
+        {
+            const auto sub = run(e, warm);
+            QVERIFY(std::fabs(sub[0] - 0.5f) < 1e-3 && sub[1] < 0.2f && sub[2] < 0.1f);
+            QVERIFY(lumaOf(sub) < lumaOf({0.5f, 0.2f, 0.1f}) - 0.02f);
+            e.params["subtractive"] = Param(0.0);
+            const auto add = run(e, warm);
+            QVERIFY(add[0] > 0.5f && add[1] < 0.2f);
+            QVERIFY(std::fabs(lumaOf(add) - lumaOf({0.5f, 0.2f, 0.1f})) < 2e-3);
+        }
+        // A hue shift turns red towards yellow, and skin's own vector leaves green alone.
+        e = makeEffect(p, "color_slice");
+        e.params["protect_highlights"] = Param(0.0);
+        e.params["red_hue"] = Param(30.0);
+        {
+            const auto r = run(e, red);
+            QVERIFY2(r[1] > 3 * r[2] && std::fabs(r[0] - 0.4f) < 1e-3, qPrintable(QString("%1 %2 %3").arg(r[0]).arg(r[1]).arg(r[2])));
+            QVERIFY(std::fabs(run(e, blue)[2] - 0.4f) < 1e-4);
+        }
+        e = makeEffect(p, "color_slice");
+        e.params["protect_highlights"] = Param(0.0);
+        e.params["skin_density"] = Param(1.0);
+        QVERIFY(run(e, skinTone)[0] < 0.37f);
+        QVERIFY(std::fabs(run(e, green)[1] - 0.4f) < 1e-4);
+        // Protect Highlights keeps colours at white; Mix 0 changes nothing.
+        e = makeEffect(p, "color_slice");
+        e.params["saturation"] = Param(1.5);
+        const auto bright = code(1.0f, 0.4f, 0.2f);
+        e.params["protect_highlights"] = Param(100.0);
+        QVERIFY(std::fabs(run(e, bright)[1] - 0.4f) < 1e-4);
+        e.params["protect_highlights"] = Param(0.0);
+        QVERIFY(run(e, bright)[1] < 0.35f);
+        e.params["mix"] = Param(0.0);
+        QVERIFY(std::fabs(run(e, bright)[1] - 0.4f) < 1e-4);
+        // Much more saturation never takes a channel below no light; a wide-gamut working space slices the same hues.
+        e = makeEffect(p, "color_slice");
+        e.params["protect_highlights"] = Param(0.0);
+        e.params["saturation"] = Param(2.0);
+        e.params["red_saturation"] = Param(2.0);
+        {
+            const auto r = run(e, red);
+            QVERIFY2(r[1] >= 0 && r[2] >= 0 && r[1] < 0.03f, qPrintable(QString("%1 %2").arg(r[1]).arg(r[2])));
+        }
+        {
+            e = makeEffect(p, "color_slice");
+            e.params["protect_highlights"] = Param(0.0);
+            e.params["red_density"] = Param(1.0);
+            const float in709 = run(e, red)[0];
+            const ColorSpace& wide = *findColorSpace("rec2020");
+            const WorkingSpaceScope working(&wide);
+            auto inWide = [&](std::array<float, 3> lin) {
+                float v[3] = {lin[0], lin[1], lin[2]};
+                double m[9];
+                primariesMatrix(Primaries::Bt709, Primaries::Bt2020, m);
+                float w[3];
+                for (int r = 0; r < 3; ++r) w[r] = float(m[r * 3] * v[0] + m[r * 3 + 1] * v[1] + m[r * 3 + 2] * v[2]);
+                Image img = solid(1, 1, float(fromLinear(wide.transfer, w[0])), float(fromLinear(wide.transfer, w[1])),
+                                  float(fromLinear(wide.transfer, w[2])));
+                applyVideoEffect(e, 0, img, 1.0);
+                float back[3];
+                for (int k = 0; k < 3; ++k) back[k] = float(toLinear(wide.transfer, img.at(0, 0)[k]));
+                primariesMatrix(Primaries::Bt2020, Primaries::Bt709, m);
+                return std::array<float, 3>{float(m[0] * back[0] + m[1] * back[1] + m[2] * back[2]),
+                                            float(m[3] * back[0] + m[4] * back[1] + m[5] * back[2]),
+                                            float(m[6] * back[0] + m[7] * back[1] + m[8] * back[2])};
+            };
+            const auto r = inWide({0.4f, 0.03f, 0.03f});
+            QVERIFY2(std::fabs(r[0] - in709) < 2e-3, qPrintable(QString("%1 %2").arg(r[0]).arg(in709)));
+            QVERIFY(std::fabs(inWide({0.03f, 0.4f, 0.03f})[1] - 0.4f) < 2e-3);
+        }
+        QVERIFY(isColorOnlyEffect(makeEffect(p, "color_slice"), 0));
+        QVERIFY(!isColorOnlyEffect(makeEffect(p, "texture_pop"), 0));
+
+        // Texture Pop and Mid-tone Detail: a flat picture stays as it is; texture grows above the noise floor and not below
+        // it; colours keep their balance; negative mid-tone detail softens; a strong edge gets little halo; sizes follow
+        // the preview's scale.
+        auto pattern = [&](int w, int h, double period, float amp, float r = 1, float g = 1, float b = 1) {
+            Image img(w, h);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    const float v = 0.18f * std::exp2(amp * float(std::sin(2 * M_PI * x / period) * std::sin(2 * M_PI * y / period)));
+                    float* px = img.at(x, y);
+                    px[0] = float(fromLinear(rec.transfer, v * r)), px[1] = float(fromLinear(rec.transfer, v * g));
+                    px[2] = float(fromLinear(rec.transfer, v * b)), px[3] = 1;
+                }
+            return img;
+        };
+        auto spread = [](const Image& img) {
+            double s = 0, s2 = 0;
+            const int n = img.width * img.height;
+            for (int y = 0; y < img.height; ++y)
+                for (int x = 0; x < img.width; ++x) s += img.at(x, y)[1], s2 += double(img.at(x, y)[1]) * img.at(x, y)[1];
+            return std::sqrt(std::max(0.0, s2 / n - (s / n) * (s / n)));
+        };
+        Effect tx = makeEffect(p, "texture_pop");
+        tx.params["texture_pop"] = Param(100.0);
+        tx.params["midtone_detail"] = Param(100.0);
+        {
+            Image flat = solid(32, 32, 0.4f, 0.4f, 0.4f);
+            applyVideoEffect(tx, 0, flat, 1.0);
+            QVERIFY(std::fabs(flat.at(16, 16)[0] - 0.4f) < 1e-5 && std::fabs(flat.at(0, 0)[2] - 0.4f) < 1e-5);
+        }
+        tx.params["midtone_detail"] = Param(0.0);
+        {
+            const Image fine = pattern(64, 64, 4, 0.5f);
+            Image popped = fine;
+            applyVideoEffect(tx, 0, popped, 1.0);
+            QVERIFY2(spread(popped) > 1.3 * spread(fine), qPrintable(QString("%1 %2").arg(spread(popped)).arg(spread(fine))));
+            const Image faint = pattern(64, 64, 4, 0.02f);
+            Image kept = faint;
+            tx.params["noise_floor"] = Param(100.0);
+            applyVideoEffect(tx, 0, kept, 1.0);
+            QVERIFY2(spread(kept) < 1.05 * spread(faint), qPrintable(QString("%1 %2").arg(spread(kept)).arg(spread(faint))));
+            tx.params["noise_floor"] = Param(0.0);
+            kept = faint;
+            applyVideoEffect(tx, 0, kept, 1.0);
+            QVERIFY(spread(kept) > 1.3 * spread(faint));
+            // (each pixel's channels in the same ratio as before)
+            Image tinted = pattern(32, 32, 4, 0.5f, 1.0f, 0.6f, 0.3f);
+            applyVideoEffect(tx, 0, tinted, 1.0);
+            for (int x = 0; x < 8; ++x) {
+                const float* px = tinted.at(x, 5);
+                const double rg = toLinear(rec.transfer, px[1]) / toLinear(rec.transfer, px[0]);
+                QVERIFY2(std::fabs(rg - 0.6) < 2e-3, qPrintable(QString::number(rg)));
+            }
+        }
+        {
+            // Texture Pop's size follows the preview too; and a matte's transparent surround is not taken for black.
+            tx.params["noise_floor"] = Param(0.0);
+            const Image full = pattern(96, 96, 6, 0.3f), half = pattern(48, 48, 3, 0.3f);
+            Image fullOut = full, halfOut = half;
+            applyVideoEffect(tx, 0, fullOut, 1.0);
+            applyVideoEffect(tx, 0, halfOut, 0.5);
+            const double fullRatio = spread(fullOut) / spread(full), halfRatio = spread(halfOut) / spread(half);
+            QVERIFY2(std::fabs(fullRatio - halfRatio) < 0.1 * fullRatio, qPrintable(QString("%1 %2").arg(fullRatio).arg(halfRatio)));
+            tx.params["midtone_detail"] = Param(100.0);
+            Image matte(48, 48);
+            const float grey = float(fromLinear(rec.transfer, 0.18));
+            for (int y = 12; y < 36; ++y)
+                for (int x = 12; x < 36; ++x) {
+                    float* px = matte.at(x, y);
+                    px[0] = px[1] = px[2] = grey, px[3] = 1;
+                }
+            applyVideoEffect(tx, 0, matte, 1.0);
+            for (int x : {12, 13, 24, 35})
+                QVERIFY2(std::fabs(matte.at(x, 12)[1] - grey) < 1e-4, qPrintable(QString("%1: %2").arg(x).arg(matte.at(x, 12)[1])));
+            QCOMPARE(matte.at(5, 5)[3], 0.0f);
+        }
+        tx = makeEffect(p, "texture_pop");
+        tx.params["midtone_detail"] = Param(-100.0);
+        {
+            const Image wide = pattern(128, 128, 48, 0.4f);
+            Image soft = wide;
+            applyVideoEffect(tx, 0, soft, 1.0);
+            QVERIFY2(spread(soft) < 0.85 * spread(wide), qPrintable(QString("%1 %2").arg(spread(soft)).arg(spread(wide))));
+            // Sizes follow the preview: the same picture at half size, half the scale, changes as much.
+            Image half = pattern(64, 64, 24, 0.4f), halfOut = half;
+            applyVideoEffect(tx, 0, halfOut, 0.5);
+            const double fullRatio = spread(soft) / spread(wide), halfRatio = spread(halfOut) / spread(half);
+            QVERIFY2(std::fabs(fullRatio - halfRatio) < 0.08, qPrintable(QString("%1 %2").arg(fullRatio).arg(halfRatio)));
+        }
+        tx.params["midtone_detail"] = Param(100.0);
+        {
+            // A step of four stops: next to it the dark side darkens and the bright side brightens by little.
+            Image step(96, 8);
+            for (int y = 0; y < 8; ++y)
+                for (int x = 0; x < 96; ++x) {
+                    const float v = float(fromLinear(rec.transfer, x < 48 ? 0.05 : 0.8));
+                    float* px = step.at(x, y);
+                    px[0] = px[1] = px[2] = v, px[3] = 1;
+                }
+            applyVideoEffect(tx, 0, step, 1.0);
+            const double darkStops = std::log2(0.05 / toLinear(rec.transfer, step.at(46, 4)[1])),
+                         brightStops = std::log2(toLinear(rec.transfer, step.at(49, 4)[1]) / 0.8);
+            QVERIFY2(std::fabs(darkStops) < 0.35 && std::fabs(brightStops) < 0.35, qPrintable(QString("%1 %2").arg(darkStops).arg(brightStops)));
+        }
+    }
+
     void ascCdlEffect() {
         // The cdl effect grades like the ASC's maths, in the working space or in the space the CDL was made in.
         Project p = makeDefaultProject();
@@ -2575,6 +3220,19 @@ colorspaces:
         QVERIFY(removeStill(folder, look));
         QVERIFY(galleryStills(folder, "Looks").empty());
         QVERIFY(!QFileInfo::exists(QString::fromStdString(look.picture)));
+        // Under a track matte the still is of the shot the matte cuts out, not of the hidden matte above it.
+        {
+            Clip fill = colorClip(p, 1, 0, 0, 0, 30);
+            fill.name = "Fill";
+            fill.effects = {makeEffect(p, "track_matte")};
+            QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, fill).ok);
+            Clip matte = colorClip(p, 1, 1, 1, 0, 30);
+            matte.name = "Matte";
+            QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 2}, matte).ok);
+            GalleryStill shot;
+            QVERIFY2(grabStill(p, s, 5, folder, kDefaultAlbum, shot, &err), err.c_str());
+            QCOMPARE(shot.clip, std::string("Fill"));
+        }
     }
 
     void trimPasses() {
@@ -4829,7 +5487,7 @@ colorspaces:
         QCOMPARE(at(s, 32, 18), stacked);
 
         // Parallel: gain on the left, invert on the right; unkeyed, their average.
-        QVERIFY(edit::flattenGrade(s, id).ok);
+        QVERIFY(edit::flattenGrade(p, s, id).ok);
         clip().effects = {gain};
         QVERIFY(edit::convertToNodes(s, id).ok);
         int right = 0;
@@ -4862,7 +5520,7 @@ colorspaces:
                  qPrintable(QString::number(both.data[(2 + 9 * (2 + 9 * 2)) * 3])));
 
         // Layer: invert over the picture where its window is.
-        QVERIFY(edit::flattenGrade(s, id).ok);
+        QVERIFY(edit::flattenGrade(p, s, id).ok);
         clip().effects = {};
         QVERIFY(edit::convertToNodes(s, id).ok);
         int top = 0;
@@ -4874,9 +5532,22 @@ colorspaces:
         for (GradeNode& n : clip().grade.nodes)
             if (n.kind == "layer") n.blend = {"multiply"};
         QVERIFY2(near(at(s, 8, 18), plain * inverted) || std::fabs(at(s, 8, 18) - plain * inverted) < 0.02f, qPrintable(QString::number(at(s, 8, 18))));
+        // The mixer's key is where its inputs are (here the base node chooses the left too, changing nothing): a node
+        // outside it grades the rest (the right), not nothing.
+        clip().effects.push_back(half(1, true));
+        int mixer = 0;
+        for (GradeNode& n : clip().grade.nodes)
+            if (n.kind == "layer") n.blend = {"normal"}, mixer = n.key;
+        int rest = 0;
+        QVERIFY(edit::addGradeNode(p, s, id, edit::NodeHow::Outside, mixer, &rest).ok);
+        Effect g2 = gain;
+        g2.node = rest;
+        clip().effects.push_back(g2);
+        QVERIFY2(near(at(s, 8, 18), inverted), qPrintable(QString::number(at(s, 8, 18))));
+        QVERIFY2(near(at(s, 56, 18), gained), qPrintable(QString::number(at(s, 56, 18))));
 
         // Outside: gain inside node 1's left half, invert outside it.
-        QVERIFY(edit::flattenGrade(s, id).ok);
+        QVERIFY(edit::flattenGrade(p, s, id).ok);
         clip().effects = {};
         Effect g1 = gain;
         QVERIFY(edit::convertToNodes(s, id).ok);
@@ -4890,7 +5561,7 @@ colorspaces:
         QVERIFY2(near(at(s, 56, 18), inverted), qPrintable(QString::number(at(s, 56, 18))));
 
         // A key input: node 1 only chooses the left half (no effects), its key limits node 2's invert.
-        QVERIFY(edit::flattenGrade(s, id).ok);
+        QVERIFY(edit::flattenGrade(p, s, id).ok);
         clip().effects = {};
         QVERIFY(edit::convertToNodes(s, id).ok);
         int second = 0;
@@ -4906,7 +5577,7 @@ colorspaces:
         QVERIFY(near(at(s, 8, 18), plain));
 
         // A shared node: one change seen on both clips using it.
-        QVERIFY(edit::flattenGrade(s, id).ok);
+        QVERIFY(edit::flattenGrade(p, s, id).ok);
         clip().effects = {gain};
         QVERIFY(edit::convertToNodes(s, id).ok);
         Id shared = 0;
@@ -5211,6 +5882,27 @@ colorspaces:
             QCOMPARE(at(stride * 3 + 4), 0x2003);  // row 1's second pair
             QCOMPARE(at(stride * 3 + 6), 0x3003);
         }
+        // An odd width: the last pixel's chroma packed too (no green column), and in UYVY the pixel itself.
+        {
+            Ycbcr422 pic(3, 1);
+            QCOMPARE(pic.chromaWidth(), 2);
+            pic.y = {0x1000, 0x1100, 0x1200};
+            pic.cb = {0x2000, 0x2100};
+            pic.cr = {0x3000, 0x3100};
+            const size_t stride = output::rowBytes(output::PixelFormat::P216, 3);
+            QCOMPARE(stride, size_t(8));
+            std::vector<uint8_t> out(stride * 2, 0);
+            packP216(pic, out.data(), stride);
+            auto at = [&](size_t byte) { return int(out[byte] | out[byte + 1] << 8); };
+            QCOMPARE(at(stride + 4), 0x2100);
+            QCOMPARE(at(stride + 6), 0x3100);
+            QCOMPARE(output::rowBytes(output::PixelFormat::Uyvy8, 3), size_t(8));
+            std::vector<uint8_t> uyvy(8, 0);
+            packUyvy(pic, uyvy.data(), 8);
+            QCOMPARE(int(uyvy[4]), 0x21);
+            QCOMPARE(int(uyvy[5]), 0x12);
+            QCOMPARE(int(uyvy[6]), 0x31);
+        }
         // 75 % colour bars in Y'CbCr: SMPTE RP 219's codes for BT.709 (white 721 512 512, yellow 674 176 543, cyan 581
         // 589 176, green 534 253 207, magenta 251 771 817, red 204 435 848, blue 111 848 481), black 64 512 512.
         {
@@ -5387,6 +6079,31 @@ colorspaces:
         sched.submit(22, grey(0.5f));
         QVERIFY(sendNext(22));
         sched.stop();
+        // A mode at another rate than the sequence's: timecode counts the output's frames (a 25 fps sequence's frame 5
+        // is 0.2 s, frame 10 at 50p), a frame a tick while playing.
+        cfg.videoOffset = 0;
+        s.colorSpace = "rec709";
+        s.fps = {25, 1};
+        const Mode fifty{"tiny50", 64, 36, {50, 1}, false, 0};
+        QVERIFY2(sched.start(d, fifty, s, cfg, &why), why.c_str());
+        sched.setPosition(5, 0);
+        sched.submit(5, grey(0.5f));
+        QVERIFY(sendNext(5));
+        QCOMPARE(dev->sent().back().timecode.frames, 10);
+        sched.setPosition(6, 1);
+        sched.submit(6, grey(0.5f));
+        QVERIFY(sendNext(6));
+        QCOMPARE(dev->sent().back().timecode.frames, 12);
+        QVERIFY(sendNext(6));
+        QCOMPARE(dev->sent().back().timecode.frames, 13);
+        // Played backwards it counts down.
+        sched.setPosition(6, -1);
+        QVERIFY(sendNext(6));
+        QCOMPARE(dev->sent().back().timecode.frames, 12);
+        QVERIFY(sendNext(6));
+        QCOMPARE(dev->sent().back().timecode.frames, 11);
+        sched.stop();
+        s.colorSpace = "rec2100pq";  // (HDR is not sent in 8 bits)
         cfg.depth = 8;
         QVERIFY(!sched.start(d, d.modes[0], s, cfg, &why));
     }
@@ -5914,6 +6631,208 @@ colorspaces:
         Effect bars = makeEffect(p, "bars");
         Image b = renderGenerator(bars, 0, 70, 40, 1);
         QVERIFY(near(b.at(5, 5)[0], 0.75f));  // first bar is 75% grey
+    }
+
+    // The GPU compositor draws a frame the same as the CPU renderer: media through its input transform, the colour
+    // effects it has (a LUT, Color Correct, Curves, Hue Curves), scaled, rotated and cropped layers in every blend mode,
+    // a cross dissolve, a layer made on the CPU, and the display conversion. Skipped where there is no GPU.
+    void gpuCompositorMatchesCpu() {
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        auto addPicture = [&](const char* name, int w, int h, bool alpha) {
+            QImage q(w, h, QImage::Format_RGBA64);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                    q.setPixelColor(x, y, QColor::fromRgbF(float(x) / w, float(y) / h, 0.5f + 0.4f * std::sin(x * 0.11f + y * 0.07f),
+                                                           alpha ? std::min(1.0f, 0.15f + 0.85f * float((x + 2 * y) % 97) / 96) : 1.0f));
+            const QString path = dir.filePath(name);
+            if (!q.save(path)) return Id{};
+            MediaItem m;
+            if (!probeMedia(path.toStdString(), m)) return Id{};
+            m.id = p.newId();
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id wide = addPicture("wide.png", 320, 180, false), small = addPicture("small.png", 211, 147, true),
+                 other = addPicture("other.png", 320, 180, false);
+        QVERIFY(wide && small && other);
+        // V1: the full-frame picture through a tinted LUT, then another picture dissolving in.
+        const std::string cube = (dir.path() + "/tint.cube").toStdString();
+        {
+            std::ofstream f(cube);
+            f << "LUT_3D_SIZE 3\n";
+            for (int b = 0; b < 3; ++b)
+                for (int g = 0; g < 3; ++g)
+                    for (int r = 0; r < 3; ++r) f << std::pow(r / 2.0, 1.3) << " " << g / 2.0 * 0.9 << " " << std::sqrt(b / 2.0) << "\n";
+        }
+        auto r1 = edit::placeMedia(p, s, wide, 0, 0, 40, {TrackKind::Video, 0}, {}, false);
+        QVERIFY(r1.ok);
+        QVERIFY(edit::placeMedia(p, s, other, 40, 0, 40, {TrackKind::Video, 0}, {}, false).ok);
+        Effect lut = makeEffect(p, "lut");
+        lut.strings["path"] = cube;
+        lut.params["strength"] = 80.0;
+        s.videoTracks[0].clips[0].effects.push_back(lut);
+        QVERIFY(edit::addTransition(p, s, r1.created[0], edit::Edge::Out, "cross_dissolve", 10).ok);
+        // V2: the small picture with transparency, scaled, rotated, cropped and faded, graded three ways.
+        auto r2 = edit::placeMedia(p, s, small, 0, 0, 80, {TrackKind::Video, 1}, {}, false);
+        QVERIFY(r2.ok);
+        Clip* top = edit::clipById(s, r2.created[0]);
+        QVERIFY(top);
+        top->motion.params["scale"] = 60.0;
+        top->motion.params["rotation"] = 17.0;
+        top->motion.params["pos_x"] = 23.0;
+        top->motion.params["pos_y"] = -11.0;
+        top->motion.params["crop_left"] = 7.0;
+        top->motion.params["crop_bottom"] = 12.0;
+        top->motion.params["opacity"] = 70.0;
+        Effect cc = makeEffect(p, "color_correct");
+        cc.params["exposure"] = 0.4;
+        cc.params["saturation"] = 1.3;
+        cc.params["temperature"] = 20.0;
+        cc.params["lift_b"] = 0.05;
+        cc.params["gamma"] = -0.1;
+        cc.params["gain_r"] = 1.1;
+        cc.params["highlights"] = -30.0;
+        cc.params["shadows"] = 25.0;
+        cc.params["vibrance"] = 40.0;
+        top->effects.push_back(cc);
+        Effect curves = makeEffect(p, "curves");
+        curves.strings["master"] = "0,0 0.3,0.22 0.7,0.8 1,1";
+        curves.strings["blue"] = "0,0.05 1,0.9";
+        curves.params["mix"] = 85.0;
+        top->effects.push_back(curves);
+        Effect hue = makeEffect(p, "hue_curves");
+        hue.strings["hue_sat"] = "0,0.5 0.3,0.8 0.6,0.3 0.9,0.5";
+        hue.strings["luma_sat"] = "0,0.3 0.5,0.5 1,0.6";
+        top->effects.push_back(hue);
+        // V3: a colour generator, made on the CPU and composited on the GPU.
+        Clip gen = colorClip(p, 0.2f, 0.9f, 0.4f, 0, 80);
+        gen.motion.params["scale"] = 30.0;
+        gen.motion.params["pos_x"] = 100.0;
+        gen.motion.params["pos_y"] = 50.0;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 2}, gen).ok);
+
+        auto compare = [&](FrameTime t, RenderOptions o, const QString& what) {
+            o.gpu = false;
+            const Image cpu = renderProgramFrame(p, s, t, o);
+            const long before = gpu::stats().gpuFrames;
+            o.gpu = true;
+            const Image onGpu = renderProgramFrame(p, s, t, o);
+            QVERIFY2(gpu::stats().gpuFrames == before + 1, qPrintable(what + ": fell back: " + QString::fromStdString(gpu::stats().lastFallback)));
+            QCOMPARE(onGpu.width, cpu.width);
+            QCOMPARE(onGpu.height, cpu.height);
+            double maxDiff = 0, sum = 0;
+            int mx = 0, my = 0;
+            for (int y = 0; y < cpu.height; ++y)
+                for (int x = 0; x < cpu.width; ++x)
+                    for (int c = 0; c < 4; ++c) {
+                        const double d = std::fabs(double(cpu.at(x, y)[c]) - onGpu.at(x, y)[c]);
+                        sum += d;
+                        if (d > maxDiff) maxDiff = d, mx = x, my = y;
+                    }
+            const double mean = sum / (double(cpu.width) * cpu.height * 4);
+            QVERIFY2(maxDiff <= 2e-3 && mean <= 2e-4,
+                     qPrintable(QString("%1: max %2 at %3,%4 (cpu %5 %6 %7 %8, gpu %9 %10 %11 %12), mean %13")
+                                    .arg(what).arg(maxDiff).arg(mx).arg(my)
+                                    .arg(cpu.at(mx, my)[0]).arg(cpu.at(mx, my)[1]).arg(cpu.at(mx, my)[2]).arg(cpu.at(mx, my)[3])
+                                    .arg(onGpu.at(mx, my)[0]).arg(onGpu.at(mx, my)[1]).arg(onGpu.at(mx, my)[2]).arg(onGpu.at(mx, my)[3])
+                                    .arg(mean)));
+            // The 8-bit picture for the viewer is the float one as toRgba8 gives it, to within a step.
+            o.gpu = true;
+            const QImage eight = renderProgramFrameRgba8(p, s, t, o);
+            const std::vector<uint8_t> want = toRgba8(cpu);
+            QCOMPARE(eight.width(), cpu.width);
+            QCOMPARE(eight.height(), cpu.height);
+            int worst = 0;
+            for (int y = 0; y < cpu.height; ++y) {
+                const uchar* a = eight.constScanLine(y);
+                const uint8_t* b = want.data() + size_t(y) * cpu.width * 4;
+                for (int i = 0; i < cpu.width * 4; ++i) worst = std::max(worst, std::abs(int(a[i]) - int(b[i])));
+            }
+            QVERIFY2(worst <= 1, qPrintable(what + QString(": 8-bit off by %1").arg(worst)));
+        };
+        RenderOptions o;
+        compare(10, o, "layers");
+        compare(37, o, "dissolve");
+        const char* modes[] = {"normal", "add", "multiply", "screen", "overlay", "darken", "lighten",
+                               "difference", "soft_light", "hard_light", "color_dodge", "color_burn", "subtract"};
+        for (const char* mode : modes) {
+            edit::clipById(s, r2.created[0])->blendMode = mode;
+            compare(20, o, mode);
+        }
+        edit::clipById(s, r2.created[0])->blendMode = "normal";
+        // At half size for playback, flipped.
+        RenderOptions half;
+        half.scale = 0.5;
+        compare(20, half, "half size");
+        edit::clipById(s, r2.created[0])->motion.params["flip_h"] = 1.0;
+        compare(20, o, "flipped");
+        // Nothing on screen: transparent, flattened to black.
+        compare(90, o, "empty");
+        // Camera log footage with a look applied in ACEScct, as an AMF has it: made on the camera's picture once.
+        p.findMedia(other)->colorOverride = "acescct";
+        Effect look = makeEffect(p, "lut");
+        look.strings["path"] = cube;
+        look.strings["space"] = "ACEScct";
+        s.videoTracks[0].clips[1].effects.push_back(look);
+        compare(60, o, "source look");
+        // An HDR sequence seen on an SDR display.
+        s.colorSpace = "rec2100pq";
+        o.displaySpace = "rec709";
+        compare(15, o, "pq to rec709");
+    }
+
+    // A frame the GPU cannot draw (an adjustment layer) falls back to the CPU whole, and a clip it cannot grade (a
+    // masked effect) is made on the CPU and composited there; either way the picture is the CPU's.
+    void gpuFallback() {
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 96;
+        s.height = 54;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, colorClip(p, 0.8f, 0.3f, 0.1f, 0, 30));
+        Clip masked = colorClip(p, 0.1f, 0.4f, 0.9f, 0, 30);
+        masked.motion.params["scale"] = 50.0;
+        Effect cc = makeEffect(p, "color_correct");
+        cc.params["saturation"] = 0.0;
+        cc.params["mask.shape"] = 1.0;
+        cc.params["mask.x"] = 0.5;
+        cc.params["mask.y"] = 0.5;
+        cc.params["mask.w"] = 0.5;
+        cc.params["mask.h"] = 0.5;
+        masked.effects.push_back(cc);
+        const Id maskedId = masked.id;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, masked).ok);
+        RenderOptions o;
+        auto same = [&](FrameTime t) {
+            o.gpu = false;
+            const Image cpu = renderProgramFrame(p, s, t, o);
+            o.gpu = true;
+            const Image onGpu = renderProgramFrame(p, s, t, o);
+            double worst = 0;
+            for (int y = 0; y < cpu.height; ++y)
+                for (int x = 0; x < cpu.width; ++x)
+                    for (int c = 0; c < 4; ++c) worst = std::max(worst, std::fabs(double(cpu.at(x, y)[c]) - onGpu.at(x, y)[c]));
+            return worst;
+        };
+        gpu::resetStats();
+        QVERIFY(same(5) <= 2e-3);
+        QCOMPARE(gpu::stats().gpuFrames, 1L);
+        QVERIFY(gpu::stats().cpuLayers >= 1);
+        QVERIFY(edit::clipById(s, maskedId));
+        Clip adj = makeGeneratorClip(p, "adjustment", 30);
+        adj.effects.push_back(makeEffect(p, "invert"));
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 2}, adj).ok);
+        gpu::resetStats();
+        QVERIFY(same(5) <= 1e-6);
+        QCOMPARE(gpu::stats().cpuFrames, 1L);
+        QVERIFY(!gpu::stats().lastFallback.empty());
     }
 };
 

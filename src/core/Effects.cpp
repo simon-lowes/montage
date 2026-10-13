@@ -197,10 +197,17 @@ std::vector<EffectInfo> buildCatalog() {
                  {angle("hue", "Hue Shift"), num("saturation", "Saturation", 0, 3, 1),
                   num("lightness", "Lightness", -1, 1, 0), num("vibrance", "Vibrance", -1, 1, 0)},
                  {}});
-    c.push_back({"lut", "LUT (.cube)", EffectCategory::VideoFilter, "Color",
-                 {pct("strength", "Strength", 0, 100, 100)},
-                 {str("path", "LUT File", StringKind::File)}});
-    c.back().strings[0].fileFilter = "LUT files (*.cube)";
+    {
+        // A .cube LUT or a Common LUT Format file (render/Clf.h, as ACES looks come), applied in the working space or
+        // in the space it was made for (a camera log, ACEScct, ACES2065-1).
+        std::vector<std::string> spaces{"Working space"};
+        for (const auto& cs : colorSpaces()) spaces.push_back(cs.label);
+        c.push_back({"lut", "LUT (.cube, .clf)", EffectCategory::VideoFilter, "Color",
+                     {pct("strength", "Strength", 0, 100, 100)},
+                     {str("path", "LUT File", StringKind::File), str("space", "Apply In", StringKind::Choice, "Working space")}});
+        c.back().strings[0].fileFilter = "LUT files (*.cube *.clf *.ctf)";
+        c.back().strings[1].choices = spaces;
+    }
     {
         // ASC CDL (core/Cdl.h): slope, offset and power per channel and saturation, as dailies carry it, applied in
         // the working space or in the space it was made in (a camera log, ACEScct).
@@ -219,6 +226,35 @@ std::vector<EffectInfo> buildCatalog() {
                        str("description", "Description", StringKind::Text)};
         cdl.strings[0].choices = spaces;
         c.push_back(cdl);
+    }
+    // ACES Reference Gamut Compression (render/Gamut.h): colours a camera saw outside AP1 brought smoothly inside it. On a
+    // clip of media it works on the media's colours as they come, before the input transform clips them to the working
+    // gamut; elsewhere (adjustment layers, nodes, LUT export) in the working space.
+    c.push_back({"aces_gamut_compress", "ACES Gamut Compress", EffectCategory::VideoFilter, "Color",
+                 {choice("direction", "Direction", {"Forward", "Inverse"}, 0)},
+                 {}});
+    {
+        // Colour Slice (render/ColorSlice.h; Resolve's ColorSlice): hue shift, saturation and density by hue vector in a
+        // log encoding, saturation subtractive as film's or additive (brightness kept), highlights protected.
+        EffectInfo slice{"color_slice", "Colour Slice", EffectCategory::VideoFilter, "Color",
+                         {num("density", "Density", -1, 1, 0), pct("depth", "Depth", 0, 200, 100), num("saturation", "Saturation", 0, 2, 1),
+                          boolean("subtractive", "Subtractive Saturation", true), pct("protect_highlights", "Protect Highlights", 0, 100, 50),
+                          pct("mix", "Mix", 0, 100, 100)},
+                         {}};
+        auto vector = [&](const std::string& n, const std::string& l) {
+            slice.params.push_back(num(n + "_hue", l + " Hue (°)", -60, 60, 0, 0.5));
+            slice.params.push_back(num(n + "_saturation", l + " Saturation", 0, 2, 1));
+            slice.params.push_back(num(n + "_density", l + " Density", -1, 1, 0));
+        };
+        for (const char* v : {"red", "yellow", "green", "cyan", "blue", "magenta"}) {
+            std::string l = v;
+            l[0] = char(std::toupper(l[0]));
+            vector(v, l);
+        }
+        vector("skin", "Skin");
+        slice.params.push_back(num("skin_centre", "Skin Centre (°)", 0, 90, 25, 0.5));
+        slice.params.push_back(num("skin_width", "Skin Width (°)", 5, 60, 25, 0.5));
+        c.push_back(slice);
     }
     {
         // Colour Space Transform: one clip from any space into another (render/ColorSpace.h).
@@ -349,6 +385,12 @@ std::vector<EffectInfo> buildCatalog() {
                  {num("radius", "Radius (px)", 0, 250, 10, 0.5),
                   choice("direction", "Direction", {"Both", "Horizontal", "Vertical"})},
                  {}});
+    // Mid-tone Detail and Texture Pop (render/ColorSlice.h): local contrast in brightness only, mid-tone detail through an
+    // edge-preserving filter, texture above a noise floor; Detail Scale scales both.
+    c.push_back({"texture_pop", "Texture Pop / Mid-tone Detail", EffectCategory::VideoFilter, "Color",
+                 {pct("midtone_detail", "Mid-tone Detail", -100, 100, 0), pct("texture_pop", "Texture Pop", 0, 200, 0),
+                  num("scale", "Detail Scale", 0.25, 4, 1), pct("noise_floor", "Noise Floor", 0, 100, 10)},
+                 {}});
     c.push_back({"sharpen", "Sharpen", EffectCategory::VideoFilter, "Blur & Sharpen",
                  {num("amount", "Amount", 0, 5, 1), num("radius", "Radius (px)", 0.5, 20, 1.5, 0.1)},
                  {}});
@@ -375,6 +417,10 @@ std::vector<EffectInfo> buildCatalog() {
     // Real-ESRGAN on the source frames when the clip is shown larger than it was shot (scaled up, or in a
     // bigger sequence); nothing happens at its own size or smaller.
     c.push_back({"super_scale", "Super Scale", EffectCategory::VideoFilter, "Blur & Sharpen",
+                 {pct("strength", "Strength", 0, 100, 100)},
+                 {}});
+    // NAFNet on the source frames: the smear of camera or subject motion taken out (media/MotionDeblur.h).
+    c.push_back({"motion_deblur", "Motion Deblur", EffectCategory::VideoFilter, "Blur & Sharpen",
                  {pct("strength", "Strength", 0, 100, 100)},
                  {}});
     // Depth (Depth Anything V2 on the clip's source frame): 0 is the farthest part of the picture, 100 the nearest.

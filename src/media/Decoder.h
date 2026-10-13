@@ -22,23 +22,27 @@ namespace montage {
 
 // Fills `out` (kind, duration, dimensions, codecs...) from the file at `path`.
 bool probeMedia(const std::string& path, MediaItem& out, std::string* error = nullptr);
+// Whether MV-HEVC spatial video is read as two eyes (FFmpeg 7.1 and later); without it such a file is its first view.
+bool multiviewDecoding();
 // What probing says about a file (duration, picture size and rate, streams, codecs, stereo packing), as opposed to
 // what a project sets on its media: copied over when the file changes on disk (`length` false keeps the duration, as a
 // subclip's range is its own), and compared.
 void copyProbedFacts(MediaItem& to, const MediaItem& from, bool length = true);
 bool sameProbedFacts(const MediaItem& a, const MediaItem& b, bool length = true);
-// A project saved before Montage read stereo packing: its stereo video files (side-by-side or top-and-bottom metadata)
-// are found from their headers and read again, so their items say so and give one eye's size, as they would imported
+// A project saved before Montage read stereo packing (or MV-HEVC spatial video): its stereo video files (side-by-side or
+// top-and-bottom metadata, or HEVC of two views) are found from their headers and read again, so their items say so and give one eye's size, as they would imported
 // now. Nothing happens once a project has been checked (Project::stereoChecked). ProRes RAW media saved by a build
 // that read them differently (with or without FFmpeg 9's colour) are probed again every time.
 void checkStereoMedia(Project& p);
 
-// Captions carried inside a video as CEA-608 (the A/53 caption data of H.264, HEVC and MPEG-2 frames, as broadcast
-// and camera files carry them): caption channel 1, timed in frames at `fps` of the media's own time. The whole video
-// is read. False (with `error`) if it holds none.
+// Captions carried inside a video (the A/53 caption data of H.264, HEVC and MPEG-2 frames, as broadcast and camera
+// files carry them): CTA-708 service 1 (core/Cea708.h) or CEA-608 caption channel 1; Auto takes 708 when it holds
+// pop-on captions, else 608 (roll-up and paint-on read from 608 when it has them). Timed in frames at `fps` of the media's own time. The whole video is read. False (with `error`)
+// if it holds none of the kind asked for.
+enum class CaptionStandard { Auto, Cea608, Cea708 };
 bool readEmbeddedCaptions(const std::string& path, Rational fps, std::vector<Caption>& out,
                           const std::function<void(double)>& progress = {}, const std::atomic<bool>* cancel = nullptr,
-                          std::string* error = nullptr);
+                          std::string* error = nullptr, CaptionStandard standard = CaptionStandard::Auto);
 
 struct ImageSequence;
 
@@ -115,8 +119,9 @@ private:
     double par_ = 0;
     std::string alpha_, fields_;
     Interpretation interp_;
-    std::string stereo_;  // stereoscopic footage's packing ("sbs", "sbs_half", "tb", "tb_half"), "" = flat
+    std::string stereo_;  // stereoscopic footage's packing ("sbs", "sbs_half", "tb", "tb_half", "mv"), "" = flat
     int eye_ = 0;         // the eye read (0 left, 1 right), after any swap
+    int viewId_ = -1;     // MV-HEVC: the view decoded when not the base view
     std::shared_ptr<VectorDocument> vector_;  // a Lottie animation or SVG, rendered instead of decoded
     AVFrame* raw_ = nullptr;                  // a camera raw still, developed once (RGB48), or a CinemaDNG run's current frame
     std::unique_ptr<ImageSequence> rawSequence_;  // a run of camera raw frames (media/ImageSequence.h)
@@ -156,10 +161,11 @@ bool decodeAudioStereoBlocks(const std::string& path, int sampleRate, size_t blo
                              const std::function<bool(const std::vector<float>& stereo)>& sink, std::string* error = nullptr,
                              const std::atomic<bool>* cancel = nullptr, const std::vector<int>& channels = {}, double from = 0);
 
-// The first-order ambisonic field (four channels: W, Y, Z, X in ACN order, SN3D) of the audio stream decodeAudio
-// mixes from; a higher-order file gives its first-order part. Aligned like decodeAudio.
+// The ambisonic field (ACN order, SN3D: W, Y, Z, X and on) of the audio stream decodeAudio mixes from, to the highest
+// order its channels hold or `maxOrder`, whichever is lower (third at most: 4, 9 or 16 channels). Aligned like
+// decodeAudio.
 AudioBufferPtr decodeAmbisonic(const std::string& path, int sampleRate, std::string* error = nullptr,
-                               const std::atomic<bool>* cancel = nullptr);
+                               const std::atomic<bool>* cancel = nullptr, int maxOrder = 3);
 
 // Min/max envelope for waveform drawing: one (min, max) pair per bucket.
 struct Peaks {

@@ -71,6 +71,7 @@ struct VideoFrame {
     const uint8_t* data = nullptr;
     FrameTime frame = 0;  // the sequence's frame (its timecode below)
     Timecode timecode;
+    FrameTime timecodeFrame = 0;  // the frames `timecode` counts, at `fps`
     Rational fps{25, 1};
 };
 // The audio that goes with it: `frames` samples of `channels` interleaved (none when no channels).

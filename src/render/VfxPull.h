@@ -21,6 +21,7 @@ struct VfxPullOptions {
     int handles = 8;             // frames either side, as far as the footage goes
     int cutIn = 1001;            // the frame number of the first frame of the cut
     std::string colorSpace;      // EXR: "" = Linear Rec.709; others: "" = the footage's own
+    bool amf = true;             // an ACES Metadata File beside each shot's frames (render/Amf.h): their space, the grade's looks
 };
 
 struct VfxShot {
@@ -31,6 +32,7 @@ struct VfxShot {
     int cutIn = 0, cutOut = 0;          // file numbers of the cut's first and last frames
     double sourceIn = 0, sourceOut = 0;  // seconds of the source pulled (handles included), out exclusive
     int headHandle = 0, tailHandle = 0;  // the handles there was footage for
+    std::string amf;                    // its ACES Metadata File, when written
 };
 
 // Pulls the clips (video clips of footage; titles and other generated clips

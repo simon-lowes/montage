@@ -9,6 +9,13 @@
 
 namespace montage {
 
+bool runsBeforeGrade(const std::string& type) {
+    static const std::set<std::string> types = {"video_denoise", "super_scale", "motion_deblur", "reframe_360", "redact_faces",
+                                                "stereo_3d",     "motion_blur", "deflicker",     "stabilize",   "rolling_shutter",
+                                                "lens_correction", "camera_track"};
+    return types.count(type) > 0;
+}
+
 bool isGradeMixer(const GradeNode& n) { return n.kind == "parallel" || n.kind == "layer"; }
 
 const GradeNode* findGradeNode(const GradeGraph& g, int key) {
@@ -229,6 +236,18 @@ void keepGraphAt(Project& p, Clip& c, size_t slot) {
 
 }  // namespace
 
+void separateEffectIds(Project& p, const Sequence& s, Clip& c) {
+    std::set<Id> taken;
+    for (const SharedNode& n : s.sharedNodes)
+        for (const Effect& e : n.effects) taken.insert(e.id);
+    std::set<Id> seen;
+    for (Effect& e : c.effects)
+        if (taken.count(e.id) || !seen.insert(e.id).second) {
+            e.id = p.newId();
+            seen.insert(e.id);
+        }
+}
+
 std::vector<Effect> flattenedEffects(const Sequence& s, const Clip& c) {
     if (c.grade.empty()) return c.effects;
     std::vector<Effect> graph;
@@ -339,9 +358,7 @@ Result convertToNodes(Sequence& s, Id clip) {
     const auto last = std::find_if(c->effects.rbegin(), c->effects.rend(), colour).base();
     for (auto it = first; it < last; ++it) {
         Effect& e = *it;
-        if (e.type == "grade_node" || e.type == "stabilize" || e.type == "rolling_shutter" || e.type == "lens_correction" ||
-            e.type == "camera_track")
-            continue;
+        if (e.type == "grade_node" || runsBeforeGrade(e.type)) continue;
         e.node = ++key;
         GradeNode n;
         n.key = key;
@@ -571,6 +588,7 @@ Result moveEffectToNode(Project& p, Sequence& s, Id clip, Id effect, int key) {
     for (Effect& e : c->effects)
         if (e.id == effect) {
             if (e.type == "grade_node") return Result::fail("That is a node's own settings");
+            if (key && runsBeforeGrade(e.type)) return Result::fail("That effect works on the picture as it comes, before the grade: it stays outside the nodes");
             if (e.node == key) return Result::fail("");
             const bool out = e.node && !key;
             e.node = key;
@@ -587,13 +605,14 @@ Result moveEffectToNode(Project& p, Sequence& s, Id clip, Id effect, int key) {
     return Result::fail("No such effect");
 }
 
-Result flattenGrade(Sequence& s, Id clip) {
+Result flattenGrade(Project& p, Sequence& s, Id clip) {
     Clip* c = videoClip(s, clip);
     if (!c) return Result::fail("No such clip");
     if (c->grade.empty()) return Result::fail("");
     // (where the graph ran; a node switched off adds nothing)
     c->effects = flattenedEffects(s, *c);
     c->grade = {};
+    separateEffectIds(p, s, *c);
     return {};
 }
 

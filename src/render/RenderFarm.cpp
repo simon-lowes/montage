@@ -168,6 +168,7 @@ void visitSettings(S& s, V& v) {
     v("embedCaptions", s.embedCaptions);
     v("captionTrack", s.captionTrack);
     v("cea608", s.cea608);
+    v("cea708", s.cea708);
     v("colorSpace", s.colorSpace);
     v("trimTarget", s.trimTarget);
     v("hdr10Plus", s.hdr10Plus);
@@ -313,7 +314,8 @@ bool exportSettingsFromJson(const QJsonObject& o, ExportSettings& s, std::string
 }
 
 bool renderExport(const Project& p, Id sequence, const ExportSettings& s, int stems, const ExportProgress& progress,
-                  const std::atomic<bool>* cancel, std::string* error, std::string* encoder) {
+                  const std::atomic<bool>* cancel, std::string* error, std::string* encoder, bool* keptUnsigned) {
+    if (keptUnsigned) *keptUnsigned = false;
     const Sequence* seq = p.findSequence(sequence);
     if (!seq) return fail(error, "The sequence no longer exists");
     try {
@@ -324,7 +326,7 @@ bool renderExport(const Project& p, Id sequence, const ExportSettings& s, int st
             });
         };
         std::string err;
-        bool ok = exportSequence(p, *seq, s, part(0, share), cancel, &err, encoder);
+        bool ok = exportSequence(p, *seq, s, part(0, share), cancel, &err, encoder, nullptr, nullptr, keptUnsigned);
         if (ok && stems) ok = exportStems(p, *seq, s, stems, nullptr, part(0.5, 0.5), cancel, &err);
         if (!ok) return fail(error, err);
         return true;
@@ -496,17 +498,24 @@ bool FarmHeartbeats::stale(const std::string& key, int64_t beat) {
 
 namespace {
 
-// Takes a job's claim away when `token` holds it: renamed aside (only one rename succeeds), read, and put back when
-// another holds it by now. Its status goes with it, so the job waits.
+// Takes a job's claim away when `token` holds it: read first (a claim another node holds by now is left where it is, or
+// that node would find it gone and stop rendering), then renamed aside (only one rename succeeds), read again, and put
+// back when another took the job in between (whose node also finds its claim aside meanwhile: Node::holds). Its status
+// goes with it, so the job waits.
 bool releaseClaim(const QDir& d, const std::string& token) {
     const QString claim = d.filePath(QStringLiteral("claim"));
+    {
+        QFile f(claim);
+        if (!f.open(QIODevice::ReadOnly) || f.readAll() != QByteArray::fromStdString(token)) return false;
+    }
     const QString aside = d.filePath(QStringLiteral(".claim-") + QString::number(QRandomGenerator::global()->generate64(), 16));
     if (!QFile::rename(claim, aside)) return false;
     QFile f(aside);
     const QByteArray held = f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
     f.close();
     if (held != QByteArray::fromStdString(token)) {
-        QFile::rename(aside, claim);  // (another's: given back to it)
+        // (Another's: given back to it; when a node claimed the job meanwhile, that claim stands and this one goes.)
+        if (!QFile::rename(aside, claim)) QFile::remove(aside);
         return false;
     }
     QFile::remove(d.filePath(QStringLiteral("status.json")));
@@ -553,10 +562,21 @@ struct Node {
                                           {"updated", qs(nowIso())},
                                           {"beat", double(++beat)}});
     }
-    // Whether this node still holds the job's claim (another may have taken it back while this one was silent).
+    // Whether this node still holds the job's claim (another may have taken it back while this one was silent). Its
+    // claim counts while another node has it aside for a moment, checking whether it was the stale one.
     bool holds(const QDir& d) const {
-        QFile f(d.filePath(QStringLiteral("claim")));
-        return f.open(QIODevice::ReadOnly) && f.readAll() == QByteArray::fromStdString(token);
+        const QString claim = d.filePath(QStringLiteral("claim"));
+        auto mine = [&](const QString& path) {
+            QFile f(path);
+            return f.open(QIODevice::ReadOnly) && f.readAll() == QByteArray::fromStdString(token);
+        };
+        if (mine(claim)) return true;
+        if (QFileInfo::exists(claim)) return false;  // another node's
+        // No claim: one aside holding this node's token counts while there is still none (a claim made meanwhile is
+        // another's, and wins); the claim is read again after, as it may have been put back while looking.
+        for (const QString& f : d.entryList({QStringLiteral(".claim-*")}, QDir::Files | QDir::Hidden))
+            if (mine(d.filePath(f))) return !QFileInfo::exists(claim) || mine(claim);
+        return mine(claim);
     }
 
     // Jobs whose node stopped answering wait again.
@@ -665,11 +685,11 @@ struct Node {
         // The render on its own thread; here, every half second, its status and heartbeats, and whether to stop.
         std::atomic<bool> cancel{false}, done{false};
         std::atomic<double> progress{0};
-        bool ok = false;
+        bool ok = false, kept = false;
         std::string encoder;
         err.clear();
         std::thread worker([&] {
-            ok = renderExport(p, seq, st, stems, [&progress](double f, FrameTime) { progress = f; }, &cancel, &err, &encoder);
+            ok = renderExport(p, seq, st, stems, [&progress](double f, FrameTime) { progress = f; }, &cancel, &err, &encoder, &kept);
             done = true;
         });
         bool cancelled = false, givenBack = false, lost = false;
@@ -687,16 +707,19 @@ struct Node {
             }
         }
         worker.join();
-        // The finished files (the output, its stems and sidecars, an image sequence's frames) put in place.
-        if (ok && holds(d)) {
+        // The finished files (the output, its stems and sidecars, an image sequence's frames) put in place; an export
+        // that could not be signed too (it is kept, unsigned, and the job fails saying where).
+        if ((ok || kept) && holds(d)) {
             for (const QFileInfo& f : QDir(scratch).entryInfoList(QDir::Files)) {
                 const QString to = outDir.filePath(f.fileName());
                 QFile::remove(to);
                 if (!QFile::rename(f.filePath(), to)) {
-                    ok = false;
+                    ok = kept = false;
                     err = "Cannot move the render into place as " + ss(to);
                 }
             }
+            if (kept)
+                if (const size_t at = err.rfind(st.path); at != std::string::npos) err.replace(at, st.path.size(), finalPath);
         }
         QDir(scratch).removeRecursively();
         if (lost || (ok && !holds(d))) {

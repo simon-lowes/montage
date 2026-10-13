@@ -67,6 +67,7 @@
 #include "media/Relink.h"
 #include "TranscribeDialog.h"
 #include "core/Slate.h"
+#include "core/Ambisonics.h"
 #include "core/AudioChannels.h"
 #include "media/ImageSequence.h"
 #include "media/Psd.h"
@@ -874,11 +875,13 @@ bool MediaBinWidget::setMediaAmbisonic(const std::vector<Id>& media, int order) 
     return state_->edit(tr("Ambisonic Audio"), [media, order](Project& p, Sequence&) {
         bool changed = false;
         for (Id id : media)
-            if (MediaItem* m = p.findMedia(id); m && m->hasAudio && m->channels >= 4 && m->kind != MediaKind::Sequence && m->ambisonic != order) {
-                m->ambisonic = order;
+            if (MediaItem* m = p.findMedia(id); m && m->hasAudio && m->channels >= 4 && m->kind != MediaKind::Sequence) {
+                const int o = order > 0 ? std::min(order, ambisonicOrderForChannels(m->channels)) : 0;
+                if (m->ambisonic == o) continue;
+                m->ambisonic = o;
                 changed = true;
                 for (MediaItem& sub : p.media)
-                    if (sub.subclipOf == id) sub.ambisonic = order;
+                    if (sub.subclipOf == id) sub.ambisonic = o;
             }
         return changed;
     });
@@ -1372,12 +1375,12 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
             }
         if (!fields.empty()) {
             QAction* field = menu.addAction(tr("Ambisonic Audio"), this, [this, fields, allAmbisonic] {
-                setMediaAmbisonic(fields, allAmbisonic ? 0 : 1);
+                setMediaAmbisonic(fields, allAmbisonic ? 0 : kMaxAmbisonicOrder);
             });
             field->setObjectName(QStringLiteral("mediaAmbisonic"));
             field->setCheckable(true);
             field->setChecked(allAmbisonic);
-            field->setToolTip(tr("The file's first four channels are a first-order ambisonic field (AmbiX: W, Y, Z, X)"));
+            field->setToolTip(tr("The file's channels are an ambisonic field (AmbiX: ACN order, SN3D), to the highest order they hold: four for first order, nine for second, 16 for third"));
         }
     }
     // Audio Channels (Premiere's Modify > Audio Channels): how new clips of files with several channels take them.

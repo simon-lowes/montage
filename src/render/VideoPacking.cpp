@@ -98,8 +98,9 @@ void packUyvy(const Ycbcr422& in, uint8_t* dst, size_t stride) {
             const uint16_t* u = in.cb.data() + size_t(row) * size_t(cw);
             const uint16_t* v = in.cr.data() + size_t(row) * size_t(cw);
             uint8_t* d = dst + size_t(row) * stride;
-            for (int x = 0; x + 1 < w; x += 2, d += 4) {
-                d[0] = eight(u[x / 2]), d[1] = eight(y[x]), d[2] = eight(v[x / 2]), d[3] = eight(y[x + 1]);
+            for (int x = 0; x < w; x += 2, d += 4) {
+                // (an odd width's last pixel twice)
+                d[0] = eight(u[x / 2]), d[1] = eight(y[x]), d[2] = eight(v[x / 2]), d[3] = eight(y[std::min(x + 1, w - 1)]);
             }
         }
     });
@@ -116,7 +117,7 @@ void packP216(const Ycbcr422& in, uint8_t* dst, size_t stride) {
             uint8_t* dy = dst + size_t(row) * stride;
             uint8_t* duv = uv + size_t(row) * stride;
             for (int x = 0; x < w; ++x) put16(dy + 2 * x, y[x]);
-            for (int i = 0; i < w / 2; ++i) {
+            for (int i = 0; i < cw; ++i) {
                 put16(duv + 4 * i, u[i]);
                 put16(duv + 4 * i + 2, v[i]);
             }

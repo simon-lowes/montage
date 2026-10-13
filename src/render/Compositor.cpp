@@ -16,6 +16,7 @@
 #include <QTransform>
 #include <algorithm>
 #include <functional>
+#include <string_view>
 #include <cmath>
 #include <cstring>
 #include <deque>
@@ -25,6 +26,7 @@
 #include "AudioFx.h"
 #include "ColorSpace.h"
 #include "Exporter.h"
+#include "GpuCompositor.h"
 #include "Processing.h"
 #include "Retime.h"
 #include "Shapes.h"
@@ -46,11 +48,13 @@
 #include "core/Surround.h"
 #include "core/History.h"
 #include "media/MediaPool.h"
+#include "media/Sofa.h"
 #include "media/Proxy.h"
 #include "media/Relink.h"
 #include "media/DepthMap.h"
 #include "media/Matting.h"
 #include "media/Faces.h"
+#include "media/MotionDeblur.h"
 #include "media/Rife.h"
 #include "media/SuperScale.h"
 #include "core/Interpretation.h"
@@ -441,10 +445,50 @@ double effectPixelScale(const Clip& c, FrameTime lt, double sx, double mw, int s
     return srcWidth / std::max(1.0, mw * fitX);
 }
 
-const Effect* superScaleEffect(const Clip& c) {
+}  // namespace
+
+// The clip's effects that take part, in order: its own that are on and outside its grade graph or in a node of it that
+// is on and feeds the output, and then the effects of the shared nodes it shows there. Effects that work on the picture
+// as it comes (Video NR, Super Scale, Motion Deblur, Reframe 360, Redact Faces, Stereo 3D, Motion Blur, Deflicker)
+// run there, before the graph, whichever of its nodes holds them; a node switched off or left out turns them off too.
+std::vector<const Effect*> liveEffects(const Sequence& seq, const Clip& c) {
+    std::vector<const Effect*> out;
+    if (c.grade.empty()) {
+        for (const Effect& e : c.effects)
+            if (e.enabled) out.push_back(&e);
+        return out;
+    }
+    const std::vector<int> order = gradeOrder(c.grade);
+    auto live = [&](int key) {
+        if (std::find(order.begin(), order.end(), key) == order.end()) return false;
+        const GradeNode* n = findGradeNode(c.grade, key);
+        return n && n->enabled;
+    };
     for (const Effect& e : c.effects)
-        if (e.type == "super_scale" && e.enabled) return &e;
+        if (e.enabled && (e.node == 0 || live(e.node))) out.push_back(&e);
+    for (int key : order)
+        if (const GradeNode* n = findGradeNode(c.grade, key); n && n->enabled && n->shared)
+            if (const SharedNode* sn = findSharedNode(seq, n->shared))
+                for (const Effect& e : sn->effects)
+                    if (e.enabled) out.push_back(&e);
+    return out;
+}
+
+namespace {
+
+const Effect* enabledEffect(const Sequence& seq, const Clip& c, const char* type) {
+    if (c.grade.empty()) {  // (the common case, without building a list)
+        for (const Effect& e : c.effects)
+            if (e.enabled && e.type == type) return &e;
+        return nullptr;
+    }
+    for (const Effect* e : liveEffects(seq, c))
+        if (e->type == type) return e;
     return nullptr;
+}
+
+const Effect* superScaleEffect(const Sequence& seq, const Clip& c) {
+    return enabledEffect(seq, c, "super_scale");
 }
 
 // The last few Super Scale results, by what went in (sampled) and the size asked for: a paused or
@@ -479,16 +523,67 @@ bool cachedSuperScale(const Image& in, int w, int h, double strength, Image& out
     return true;
 }
 
-const Effect* denoiseEffect(const Clip& c) {
-    for (const Effect& e : c.effects)
-        if (e.type == "video_denoise" && e.enabled) return &e;
-    return nullptr;
+// Motion Deblur's last results at full strength, by every pixel that went in (a strength change or a key mixes them again
+// without the model), up to a few hundred megabytes. With `run` false only a result already made is given.
+bool cachedDeblur(const Image& in, bool run, const std::atomic<bool>* cancel, Image& out, std::string* error) {
+    const uint64_t key = std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(in.px.data()), in.px.size() * sizeof(float))) ^
+                         (uint64_t(in.width) << 32 | uint64_t(in.height));
+    static std::mutex m;
+    static std::deque<std::pair<uint64_t, std::shared_ptr<const Image>>> cache;
+    auto find = [&] {
+        std::lock_guard lock(m);
+        for (const auto& [k, img] : cache)
+            if (k == key && img->width == in.width && img->height == in.height) {
+                out = *img;
+                return true;
+            }
+        return false;
+    };
+    if (find()) return true;
+    if (!run) return false;
+    // One run at a time, so two views asking for the same frame wait for the first rather than both running it.
+    static std::mutex running;
+    std::lock_guard one(running);
+    if (find()) return true;
+    Image result;
+    if (!motionDeblur(in, result, 1.0, error, cancel)) return false;
+    auto shared = std::make_shared<const Image>(result);
+    std::lock_guard lock(m);
+    cache.emplace_front(key, shared);
+    size_t bytes = 0, keep = 0;
+    for (const auto& [k, img] : cache) {
+        bytes += img->px.size() * sizeof(float);
+        if (keep >= 2 && bytes > (size_t(384) << 20)) break;
+        ++keep;
+    }
+    cache.resize(keep);
+    out = std::move(result);
+    return true;
 }
 
-const Effect* enabledEffect(const Clip& c, const char* type) {
-    for (const Effect& e : c.effects)
-        if (e.enabled && e.type == type) return &e;
-    return nullptr;
+// Motion Deblur on a clip's source picture (render/MotionDeblur.h): in deliveries and previews rendered ahead the model
+// runs; views that cannot wait (playback, scrubbing, thumbnails) take a result already made, else go without (noted as
+// not final). A missing model leaves it out, which a delivery reports.
+void applyMotionDeblur(const Effect& e, FrameTime lt, const RenderOptions& o, Image& src) {
+    const double strength = std::clamp(e.p("strength", lt, 100) / 100, 0.0, 1.0);
+    if (src.empty() || strength <= 0) return;
+    if (!deblurAvailable() || !deblurModel().installed()) {
+        if (o.issues && o.highQuality) o.issues->note("Motion Deblur needs its model: add the effect once in the app or run scripts/fetch-models.sh");
+        return;
+    }
+    Image sharp;
+    std::string why;
+    if (!cachedDeblur(src, o.highQuality || o.slowEffects, o.cancel, sharp, &why)) {
+        if (o.issues) o.issues->note(why.empty() ? "Motion Deblur is shown once the frames are rendered (Render In to Out)" : why);
+        return;
+    }
+    if (strength < 1)
+        for (size_t i = 0; i < sharp.px.size(); ++i) sharp.px[i] = src.px[i] + (sharp.px[i] - src.px[i]) * float(strength);
+    src = std::move(sharp);
+}
+
+const Effect* denoiseEffect(const Sequence& seq, const Clip& c) {
+    return enabledEffect(seq, c, "video_denoise");
 }
 
 // Deflicker's per-frame brightness, kept by media, size and frame: playing on needs one new frame's worth.
@@ -679,9 +774,46 @@ void sourceSize(const Geometry& g, double scale, int nativeW, int nativeH, int& 
     h = int(std::ceil(std::min<double>(nativeH, std::max(1.0, wantH))));
 }
 
-// `below` is what the tracks under the clip have made so far, for adjustment layers.
-Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
-                const Image* below = nullptr) {
+// A clip's picture as it comes (decoded, generated or rendered, through the effects that run on the source and the
+// input transform into the working space), where it goes, and what its effects need to know of it.
+struct ClipSource {
+    FrameTime t = 0, lt = 0;  // (Stop Motion holds frames)
+    Image src;
+    // Or, when asked to leave it (`deferFrame`), the decoded frame and the space it is in: nothing ran on it yet.
+    Frame16Ptr frame;
+    const ColorSpace* frameSpace = nullptr;
+    const Effect* sourceCdl = nullptr;  // a CDL applied in the media's own space, before the input transform
+    const Effect* sourceRgc = nullptr;  // the ACES gamut compression, likewise
+    std::vector<const Effect*> sourceLooks;  // CDLs and LUTs made on the camera's picture (an AMF's looks), likewise
+    double mw = 0, mh = 0;
+    Geometry g;
+    double sourceSeconds = -1;  // media time of the frame, for effects that follow the footage
+    uint64_t sourceMedia = 0;   // and its media, and whether it was reframed from 360° (or is a right eye), for analyses made from it
+    bool reframed = false;
+    ofx::FrameFetch ofxFetch;   // the clip's source at other clip frames, for OpenFX plugins that ask (render/Ofx.h)
+};
+
+// Whether any of the clip's looks run on the camera's picture before the input transform (as clipSource runs them).
+bool sourceStageLooks(const Clip& c, FrameTime lt, const ColorSpace& from, const MediaItem& m) {
+    if (from.sceneReferred)
+        for (const Effect& e : c.effects) {
+            if (!e.enabled || e.type == "video_denoise" || e.type == "super_scale" || e.type == "motion_deblur" ||
+                e.type == "reframe_360" || e.type == "redact_faces" || e.type == "stereo_3d")
+                continue;
+            if (e.node != 0 || hasMask(e, lt)) break;
+            if (e.type == "aces_gamut_compress" || sourceLookSpace(e)) return true;
+            break;
+        }
+    for (const Effect& e : c.effects)
+        if (e.enabled && e.node == 0 && ((e.type == "cdl" && e.s("space") == mediaColorSpace(m).label) ||
+                                         (e.type == "aces_gamut_compress" && !hasMask(e, lt))))
+            return true;
+    return false;
+}
+
+// False when the clip has no picture.
+bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, const Image* below,
+                bool deferFrame, ClipSource& out) {
     // Stop Motion: the clip steps, each frame held for a few.
     for (const Effect& e : c.effects)
         if (e.enabled && e.type == "stop_motion") {
@@ -689,18 +821,23 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             t -= (t - c.start) % hold;
         }
     const FrameTime lt = t - c.start;
+    out.t = t, out.lt = lt;
     const int SW = seq.width, SH = seq.height;
-    Image src;
-    const Effect* sourceCdl = nullptr;  // a CDL applied in the media's own space, before the input transform
-    double mw = SW, mh = SH;
-    Geometry g;
-    double sourceSeconds = -1;  // media time of the frame, for effects that follow the footage
-    uint64_t sourceMedia = 0;   // and its media, and whether it was reframed from 360° (or is a right eye), for analyses made from it
-    bool reframed = false;
-    ofx::FrameFetch ofxFetch;   // the clip's source at other clip frames, for OpenFX plugins that ask (render/Ofx.h)
+    Image& src = out.src;
+    const Effect*& sourceCdl = out.sourceCdl;
+    const Effect*& sourceRgc = out.sourceRgc;
+    std::vector<const Effect*>& sourceLooks = out.sourceLooks;
+    double& mw = out.mw;
+    double& mh = out.mh;
+    mw = SW, mh = SH;
+    Geometry& g = out.g;
+    double& sourceSeconds = out.sourceSeconds;
+    uint64_t& sourceMedia = out.sourceMedia;
+    bool& reframed = out.reframed;
+    ofx::FrameFetch& ofxFetch = out.ofxFetch;
     if (c.isGenerator() && c.generator.type == "adjustment") {
         // An adjustment layer's picture is the composite beneath it (already in the working space).
-        if (!below || below->empty()) return {};
+        if (!below || below->empty()) return false;
         g = clipGeometry(c, lt, SW, SH, SW, SH, seq.fpsValue());
         src = *below;
     } else if (c.isGenerator()) {
@@ -714,10 +851,10 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         convertColor(src, rec709Space(), sequenceColorSpace(seq), seq.hdrPeakNits);
     } else {
         const MediaItem* m = p.findMedia(c.mediaId);
-        if (!m) return {};
+        if (!m) return false;
         if (m->kind == MediaKind::Sequence) {
             const Sequence* nested = p.findSequence(m->sequenceId);
-            if (!nested || o.depth >= kMaxDepth || nested->id == seq.id) return {};
+            if (!nested || o.depth >= kMaxDepth || nested->id == seq.id) return false;
             // A graphic shows its own values for the fields its template publishes.
             Sequence filled;
             if (!nested->fields.empty() && !c.fields.empty()) {
@@ -735,18 +872,19 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (nested->multicam) no.soloVideoTrack = std::clamp(c.angle, 0, std::max(0, int(nested->videoTracks.size()) - 1));
             FrameTime nf = FrameTime(std::floor(c.sourceFrameAt(t) * nested->fpsValue() / seq.fpsValue() + 1e-6));
             src = renderSequenceFrame(p, *nested, nf, no);
-            if (const Effect* nr = denoiseEffect(c); nr && !src.empty())
+            if (const Effect* nr = denoiseEffect(seq, c); nr && !src.empty())
                 applyDenoise(*nr, lt, src, {}, {}, effectPixelScale(c, lt, g.sx, mw, src.width), -1);
+            if (const Effect* db = enabledEffect(seq, c, "motion_deblur")) applyMotionDeblur(*db, lt, o, src);
             convertColor(src, sequenceColorSpace(*nested), sequenceColorSpace(seq), seq.hdrPeakNits);
         } else if (m->kind == MediaKind::Video || m->kind == MediaKind::Image) {
-            if (!m->hasVideo && m->kind != MediaKind::Image) return {};
+            if (!m->hasVideo && m->kind != MediaKind::Image) return false;
             std::string path = pictureSource(*m, o.useProxies, o.offlineProxies);  // (viewing: an offline file plays its proxy)
             // Stereoscopic footage: the eye being rendered (a clip's Stereo 3D effect can swap them). A proxy holds
             // the left eye alone (it is made through a flat sequence), so the right eye is read from the file (or,
             // with the file offline, both eyes show the proxy).
             if (!m->stereo.empty()) {
                 int eye = o.eye;
-                if (const Effect* s3d = enabledEffect(c, "stereo_3d"); s3d && s3d->p("swap_eyes", lt, 0) > 0.5) eye = 1 - eye;
+                if (const Effect* s3d = enabledEffect(seq, c, "stereo_3d"); s3d && s3d->p("swap_eyes", lt, 0) > 0.5) eye = 1 - eye;
                 if (eye && (path == m->path || fileOnline(m->path))) path = eyePath(m->path, 1);
                 // Faces analysed in the left eye sit elsewhere in the right (the eyes' disparity): there they are found
                 // in the picture itself, so Redact Faces never leaves one uncovered.
@@ -756,7 +894,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             mw = m->width > 0 ? m->width : SW;
             mh = m->height > 0 ? m->height : SH;
             // Reframe 360: the clip is a view, at the sequence's shape, out of the whole sphere.
-            const Effect* vr = enabledEffect(c, "reframe_360");
+            const Effect* vr = enabledEffect(seq, c, "reframe_360");
             if (vr) mw = std::max(1.0, std::round(mh * SW / std::max(1, SH)));
             g = clipGeometry(c, lt, mw, mh, SW, SH, seq.fpsValue());
             int w, h;
@@ -774,7 +912,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             }
             // Super Scale: shown larger than it was shot, the frame is decoded at its own size and enlarged by
             // the model at the end (not on proxies, which are for speed).
-            const Effect* ss = superScaleEffect(c);
+            const Effect* ss = superScaleEffect(seq, c);
             // The size it is shown at (decoding stops at the media's own size), up to four times that.
             const int outW = int(std::ceil(std::clamp(g.mw * std::fabs(g.sx) * o.scale, 1.0, 4.0 * mw)));
             const int outH = int(std::ceil(std::clamp(g.mh * std::fabs(g.sy) * o.scale, 1.0, 4.0 * mh)));
@@ -792,7 +930,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             }
             Frame16Ptr f = MediaPool::instance().videoFrame(path, sec, w, h, o.highQuality);
             if (!f && original && isOffline(*m)) f = offlineSlate(w, h);
-            if (!f) return {};
+            if (!f) return false;
             if (m->kind == MediaKind::Video) sourceSeconds = sec;
             sourceMedia = m->id;
             if (m->kind == MediaKind::Video && std::any_of(c.effects.begin(), c.effects.end(), [](const Effect& e) { return e.type == "ofx" && e.enabled; })) {
@@ -814,6 +952,19 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     return true;
                 };
             }
+            // Left as it was decoded, for the GPU (render/GpuCompositor.h), when nothing runs on it before the input
+            // transform.
+            if (deferFrame) {
+                const int sampling = c.timing.empty() ? 0 : int(c.timing.p("sampling", lt, 0));
+                const ColorSpace& from = original ? mediaColorSpace(*m) : pictureColorSpace(*m, path);
+                if (!ofxFetch && !(sampling > 0 && m->kind == MediaKind::Video) && !denoiseEffect(seq, c) &&
+                    !enabledEffect(seq, c, "motion_deblur") && !enabledEffect(seq, c, "motion_blur") && !enabledEffect(seq, c, "deflicker") &&
+                    !upscale && !vr && !sourceStageLooks(c, lt, from, *m)) {
+                    out.frame = f;
+                    out.frameSpace = &from;
+                    return true;
+                }
+            }
             src = toImage(*f);
             Image decoded;  // the source frame itself, when src is an in-between
             // Slow motion between two source frames: blend them or follow the motion.
@@ -825,7 +976,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     Frame16Ptr fa = MediaPool::instance().videoFrame(path, (base + 0.25) / mf, w, h, o.highQuality);
                     Frame16Ptr fb = MediaPool::instance().videoFrame(path, next, w, h, o.highQuality);
                     if (fa && fb) {
-                        if (denoiseEffect(c)) decoded = src;
+                        if (denoiseEffect(seq, c)) decoded = src;
                         const Image a = toImage(*fa), b = toImage(*fb);
                         const std::string pair = path + '#' + std::to_string(int64_t(base)) + '@' + std::to_string(w) + 'x' + std::to_string(h);
                         // AI frames when RIFE is here, else optical flow.
@@ -837,7 +988,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 }
             }
             // Noise reduction, on the source frames with the frames either side (Resolve's temporal NR).
-            if (const Effect* nr = denoiseEffect(c)) {
+            if (const Effect* nr = denoiseEffect(seq, c)) {
                 std::vector<Image> around;
                 std::vector<int> offsets;
                 std::vector<MotionFn> motion;
@@ -867,9 +1018,11 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 applyDenoise(*nr, lt, src, around, motion, effectPixelScale(c, lt, g.sx, mw, src.width),
                              m->kind == MediaKind::Video ? sec : -1);
             }
+            // Motion Deblur, on the source frame as decoded (the size it is shown at); not on proxies, which are for speed.
+            if (const Effect* db = enabledEffect(seq, c, "motion_deblur"); db && original) applyMotionDeblur(*db, lt, o, src);
             // Motion Blur and Deflicker, from the source frames either side.
-            const Effect* blur = enabledEffect(c, "motion_blur");
-            const Effect* flicker = enabledEffect(c, "deflicker");
+            const Effect* blur = enabledEffect(seq, c, "motion_blur");
+            const Effect* flicker = enabledEffect(seq, c, "deflicker");
             if ((blur || flicker) && m->kind == MediaKind::Video && m->fps.valid()) {
                 const double mf = m->fps.toDouble();
                 const int64_t base = int64_t(std::floor(sec * mf + 1e-6));
@@ -932,19 +1085,70 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (vr)
                 src = reframeEquirect(src, vr->p("yaw", lt, 0), vr->p("pitch", lt, 0), vr->p("roll", lt, 0), vrFov, vrView, viewW, viewH,
                                       projectionSpan(m->projection));
+            const ColorSpace& from = original ? mediaColorSpace(*m) : pictureColorSpace(*m, path);
+            // Camera footage: the looks first in its chain made on the camera's picture (CDLs and LUTs applied in a
+            // scene-referred space, the ACES gamut compression), in their order, on the picture as it comes and before
+            // the input transform's display rendering, as an AMF's pipeline runs them.
+            if (from.sceneReferred)
+                for (const Effect& e : c.effects) {
+                    if (!e.enabled || e.type == "video_denoise" || e.type == "super_scale" || e.type == "motion_deblur" ||
+                        e.type == "reframe_360" || e.type == "redact_faces" || e.type == "stereo_3d")
+                        continue;  // (off, or run at the source already)
+                    if (e.node != 0 || hasMask(e, lt)) break;
+                    if (e.type == "aces_gamut_compress" && !sourceRgc) {
+                        applyAcesGamutCompress(e, lt, from, src);
+                        sourceRgc = &e;
+                    } else if (sourceLookSpace(e)) {
+                        applySourceLook(e, lt, from, src);
+                        if (!sourceCdl && e.type == "cdl" && e.s("space") == mediaColorSpace(*m).label) sourceCdl = &e;
+                    } else {
+                        break;
+                    }
+                    sourceLooks.push_back(&e);
+                }
             // A CDL made in the media's own space (an on-set grade on camera log) grades the picture as it comes, before the
             // input transform's display rendering.
+            // (Not one in a grade node: it runs there, with the node's window, key and switch.)
             for (const Effect& e : c.effects)
-                if (!sourceCdl && e.enabled && e.type == "cdl" && e.s("space") == mediaColorSpace(*m).label) {
+                if (!sourceCdl && e.enabled && e.node == 0 && e.type == "cdl" && e.s("space") == mediaColorSpace(*m).label) {
                     sourceCdl = &e;
                     applyCdlValues(e, lt, src);
                 }
+            // The ACES gamut compression too: on the colours the camera saw, before the input transform clips what is outside
+            // the working gamut (and as it comes after the camera's own transform in ACES, in AP1).
+            for (const Effect& e : c.effects)
+                if (!sourceRgc && e.enabled && e.node == 0 && e.type == "aces_gamut_compress" && !hasMask(e, lt)) {
+                    sourceRgc = &e;
+                    applyAcesGamutCompress(e, lt, from, src);
+                }
             // Input transform: the media's space (or its proxy's) into the sequence's working space.
-            convertColor(src, original ? mediaColorSpace(*m) : pictureColorSpace(*m, path), sequenceColorSpace(seq), seq.hdrPeakNits);
+            convertColor(src, from, sequenceColorSpace(seq), seq.hdrPeakNits);
         } else {
-            return {};
+            return false;
         }
     }
+    return !src.empty();
+}
+
+// The rest of a clip's layer from its source: its effects (and grade graph), then its transform onto the canvas.
+Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o, ClipSource& cs) {
+    const FrameTime lt = cs.lt;
+    const int SW = seq.width;
+    Image& src = cs.src;
+    if (cs.frame) {  // (left as decoded)
+        src = toImage(*cs.frame);
+        convertColor(src, *cs.frameSpace, sequenceColorSpace(seq), seq.hdrPeakNits);
+        cs.frame.reset();
+    }
+    const Effect* sourceCdl = cs.sourceCdl;
+    const Effect* sourceRgc = cs.sourceRgc;
+    const std::vector<const Effect*>& sourceLooks = cs.sourceLooks;
+    const double mw = cs.mw;
+    Geometry& g = cs.g;
+    const double sourceSeconds = cs.sourceSeconds;
+    const uint64_t sourceMedia = cs.sourceMedia;
+    const bool reframed = cs.reframed;
+    ofx::FrameFetch& ofxFetch = cs.ofxFetch;
     if (src.empty()) return {};
     // Filters run in source space (before the fixed transform), like most NLEs.
     const double pixelScale = effectPixelScale(c, lt, g.sx, mw, src.width);
@@ -974,11 +1178,20 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     FaceScope faceScope(faces);
     ofx::FetchScope fetchScope(ofxFetch);
     // Faces are covered first, where they are in the source, whatever moves the picture after (Stabilize, transforms).
-    for (const Effect* e : chain)
-        if (e->type == "redact_faces") applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
+    // (Its colour group's, and its own and its shared nodes' that take part.)
+    std::vector<const Effect*> redactions;
+    if (const ColorGroup* cg = colorGroupOf(seq, c)) {
+        for (const auto* v : {&cg->pre, &cg->post})
+            for (const Effect& e : *v)
+                if (e.enabled && e.type == "redact_faces") redactions.push_back(&e);
+    }
+    for (const Effect* e : liveEffects(seq, c))
+        if (e->type == "redact_faces") redactions.push_back(e);
+    for (const Effect* e : redactions) applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
     auto ranAlready = [&](const Effect& e) {
-        return e.type == "video_denoise" || e.type == "super_scale" || e.type == "reframe_360" || e.type == "redact_faces" ||
-               e.type == "stereo_3d" || &e == sourceCdl;  // those ran already (Stereo 3D is placed below)
+        return e.type == "video_denoise" || e.type == "super_scale" || e.type == "motion_deblur" || e.type == "reframe_360" || e.type == "redact_faces" ||
+               e.type == "stereo_3d" || &e == sourceCdl || &e == sourceRgc ||
+               std::find(sourceLooks.begin(), sourceLooks.end(), &e) != sourceLooks.end();  // those ran already (Stereo 3D is placed below)
     };
     // A node graph (core/GradeGraph.h) runs where its first node's effect is in the stack (or after the clip's own
     // effects); the effects in its nodes, and its shared nodes', run in it.
@@ -1006,12 +1219,20 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     // Stereo 3D: in a stereoscopic sequence the eyes are moved apart by the clip's depth (into the screen when
     // positive, out of it when negative); half the separation each way.
     if (seq.stereo3d && !(c.isGenerator() && c.generator.type == "adjustment"))
-        if (const Effect* s3d = enabledEffect(c, "stereo_3d")) {
+        if (const Effect* s3d = enabledEffect(seq, c, "stereo_3d")) {
             const double half = s3d->p("depth", lt, 0) / 100.0 * SW / 2;
             g.px += o.eye ? half : -half;
         }
-    if (identityLayer(src, g, SW, SH, o.scale)) return src;  // a full-frame clip: no copy
-    return transformLayer(src, g, SW, SH, o.scale);
+    if (identityLayer(src, g, SW, seq.height, o.scale)) return std::move(src);  // a full-frame clip: no copy
+    return transformLayer(src, g, SW, seq.height, o.scale);
+}
+
+// `below` is what the tracks under the clip have made so far, for adjustment layers.
+Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
+                const Image* below = nullptr) {
+    ClipSource cs;
+    if (!clipSource(p, seq, c, t, o, below, false, cs)) return {};
+    return finishClipLayer(seq, c, o, cs);
 }
 
 const Clip* findClip(const Track& t, Id id) {
@@ -1074,6 +1295,43 @@ std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t) {
     return hidden;
 }
 
+namespace {
+
+// A transition's picture at t (from to `to` on its track), on the CPU.
+Image transitionLayer(const Project& p, const Sequence& seq, const Track& track, const Transition& tr, FrameTime from, FrameTime to,
+                      FrameTime t, const RenderOptions& o, const Image* below, int W, int H) {
+    const Clip* A = findClip(track, tr.clipA);
+    const Clip* B = findClip(track, tr.clipB);
+    const double u = (double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from));
+    if (tr.type == "smooth_cut" && A && A->enabled && B && B->enabled) {
+        // The first frame of the transition morphs into its last along their optical flow
+        // (the pair is the same throughout, so its flow is measured once).
+        Image la = clipLayer(p, seq, *A, from, o, below), lb = clipLayer(p, seq, *B, to - 1, o, below);
+        if (la.width == W && la.height == H && lb.width == W && lb.height == H)
+            return interpolateFrames(la, lb, u,
+                                     "smooth#" + std::to_string(tr.id) + '@' + std::to_string(from) + '-' + std::to_string(to) + '#' +
+                                         std::to_string(W) + 'x' + std::to_string(H) + (o.eye ? "#R" : ""));
+        return transitionMix("cross_dissolve", tr.params, la, lb, u, W, H);
+    }
+    Image la = (A && A->enabled) ? clipLayer(p, seq, *A, t, o, below) : Image();
+    Image lb = (B && B->enabled) ? clipLayer(p, seq, *B, t, o, below) : Image();
+    return transitionMix(tr.type, tr.params, la, lb, u, W, H);
+}
+
+const Transition* activeTransition(const Track& track, FrameTime t, FrameTime& from, FrameTime& to) {
+    for (const auto& tr : track.transitions) {
+        FrameTime a, b;
+        if (edit::transitionRange(track, tr, a, b) && t >= a && t < b) {
+            from = a;
+            to = b;
+            return &tr;
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
 Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& opts) {
     const WorkingSpaceScope working(&sequenceColorSpace(seq));  // effects that work in light know whose
     const int solo = opts.soloVideoTrack;
@@ -1107,27 +1365,9 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
         if (active) {
             const Clip* A = findClip(track, active->clipA);
             const Clip* B = findClip(track, active->clipB);
-            double u = (double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from));
-            const Image* below = canvasEmpty ? nullptr : &canvas;
-            Image mixed;
-            if (active->type == "smooth_cut" && A && A->enabled && B && B->enabled) {
-                // The first frame of the transition morphs into its last along their optical flow
-                // (the pair is the same throughout, so its flow is measured once).
-                Image la = clipLayer(p, seq, *A, from, o, below), lb = clipLayer(p, seq, *B, to - 1, o, below);
-                if (la.width == W && la.height == H && lb.width == W && lb.height == H)
-                    mixed = interpolateFrames(la, lb, u,
-                                              "smooth#" + std::to_string(active->id) + '@' + std::to_string(from) + '-' +
-                                                  std::to_string(to) + '#' + std::to_string(W) + 'x' + std::to_string(H) +
-                                                  (o.eye ? "#R" : ""));
-                else
-                    mixed = transitionMix("cross_dissolve", active->params, la, lb, u, W, H);
-            } else {
-                Image la = (A && A->enabled) ? clipLayer(p, seq, *A, t, o, below) : Image();
-                Image lb = (B && B->enabled) ? clipLayer(p, seq, *B, t, o, below) : Image();
-                mixed = transitionMix(active->type, active->params, la, lb, u, W, H);
-            }
             const Clip* top = B ? B : A;
-            composite(std::move(mixed), top ? top->blendMode : "normal");
+            composite(transitionLayer(p, seq, track, *active, from, to, t, o, canvasEmpty ? nullptr : &canvas, W, H),
+                      top ? top->blendMode : "normal");
             continue;
         }
         if (const Clip* c = clipAt(track, t)) {
@@ -1142,7 +1382,7 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
                 }
             }
             // Behind People: the layer goes behind whoever is in the picture beneath it.
-            if (const Effect* bp = enabledEffect(*c, "behind_people"); bp && !layer.empty() && !canvasEmpty && mattingAvailable() &&
+            if (const Effect* bp = enabledEffect(seq, *c, "behind_people"); bp && !layer.empty() && !canvasEmpty && mattingAvailable() &&
                                                                         mattingModel().installed())
                 if (std::shared_ptr<const ValueMap> people = cachedPersonMatte(canvas)) {
                     const FrameTime lt = t - c->start;
@@ -1159,7 +1399,196 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
     return canvas;
 }
 
+namespace {
+
+// How a clip's layer is drawn on the GPU (render/GpuCompositor.h).
+enum class GpuLayerResult { Drawn, Nothing, Unsupported };
+
+GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, gpu::Layer& out) {
+    if (!c.grade.empty() || (c.isGenerator() && c.generator.type == "adjustment")) return GpuLayerResult::Unsupported;
+    // Its colour steps, each one the GPU draws (the ones on the source, such as noise reduction, are not). Those the
+    // GPU has no form for go to the CPU before anything is decoded, unless they may run on the camera's picture.
+    const FrameTime lt = t - c.start;
+    const std::vector<const Effect*> chain = gradeChain(seq, c);
+    std::vector<gpu::ColorOp> unused;
+    for (const Effect* e : chain)
+        if (e->enabled && e->type != "cdl" && e->type != "aces_gamut_compress" && !gpuColorOps(*e, lt, unused))
+            return GpuLayerResult::Unsupported;
+    ClipSource cs;
+    if (!clipSource(p, seq, c, t, o, nullptr, true, cs)) return GpuLayerResult::Nothing;
+    // Without the looks made on the camera's picture already (an AMF's CDLs and LUTs, the gamut compression).
+    for (const Effect* e : chain) {
+        if (!e->enabled || e == cs.sourceCdl || e == cs.sourceRgc ||
+            std::find(cs.sourceLooks.begin(), cs.sourceLooks.end(), e) != cs.sourceLooks.end())
+            continue;
+        if (!gpuColorOps(*e, lt, out.ops)) return GpuLayerResult::Unsupported;
+    }
+    int w = 0, h = 0;
+    if (cs.frame) {
+        out.frame = cs.frame;
+        out.input = conversionLut(*cs.frameSpace, sequenceColorSpace(seq), seq.hdrPeakNits);
+        w = cs.frame->width, h = cs.frame->height;
+    } else {
+        out.image = std::move(cs.src);
+        w = out.image.width, h = out.image.height;
+    }
+    // A picture wider or taller than the GPU takes is made on the CPU at the canvas's size instead.
+    const int maxSize = gpu::maxTextureSize();
+    if ((cs.frame ? w * 2 : w) > maxSize || h > maxSize) {
+        out = {};
+        return GpuLayerResult::Unsupported;
+    }
+    // Placed as transformLayer places it (worked out here in double).
+    const Geometry& g = cs.g;
+    const int SW = seq.width, SH = seq.height;
+    gpu::Placement& pl = out.place;
+    const int W = std::max(1, int(std::lround(SW * o.scale))), H = std::max(1, int(std::lround(SH * o.scale)));
+    Image probe;  // (identityLayer reads the size alone)
+    probe.width = w, probe.height = h;
+    if (identityLayer(probe, g, SW, SH, o.scale)) {
+        pl.full = w == W && h == H;
+        return GpuLayerResult::Drawn;
+    }
+    const double u0 = g.mw * g.cl, u1 = g.mw * (1 - g.cr), v0 = g.mh * g.ct, v1 = g.mh * (1 - g.cb);
+    if (g.sx == 0 || g.sy == 0 || g.opacity <= 0 || u1 <= u0 || v1 <= v0) {  // (a transparent layer)
+        out.frame.reset();
+        out.image = Image();
+        out.ops.clear();
+        return GpuLayerResult::Drawn;
+    }
+    const double cosr = std::cos(g.rot), sinr = std::sin(g.rot);
+    pl.scale = float(o.scale);
+    pl.opacity = float(g.opacity);
+    pl.axis = std::fabs(sinr) < 1e-9 && cosr > 0 && g.sx > 0 && g.sy > 0;
+    pl.cx = float(SW / 2.0 + g.px), pl.cy = float(SH / 2.0 + g.py), pl.cosr = float(cosr), pl.sinr = float(sinr);
+    pl.sx = float(g.sx), pl.sy = float(g.sy), pl.au = float(g.mw / 2 + g.ax), pl.av = float(g.mh / 2 + g.ay);
+    pl.u0 = float(u0), pl.u1 = float(u1), pl.v0 = float(v0), pl.v1 = float(v1);
+    pl.kx = float(w / g.mw), pl.ky = float(h / g.mh);
+    pl.px = float(std::fabs(g.sx) * o.scale), pl.py = float(std::fabs(g.sy) * o.scale);
+    return GpuLayerResult::Drawn;
+}
+
+// A layer made on the CPU, the canvas's size, for the GPU to blend.
+gpu::Layer cpuLayer(Image&& img) {
+    gpu::Layer l;
+    l.image = std::move(img);
+    l.place.full = true;
+    return l;
+}
+
+// The program frame drawn on the GPU where it can be, its layers that it cannot draw made on the CPU: false (counted,
+// with why) when the frame as a whole is for the CPU.
+bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& opts, Image* out, QImage* out8) {
+    std::string why;
+    auto fallback = [](const std::string& reason) {
+        gpu::countFallback(reason);
+        return false;
+    };
+    if (!gpu::available(&why)) return fallback("no GPU: " + why);
+    if (opts.depth != 0 || seq.stereo3d) return fallback("a stereoscopic sequence");
+    if (!opts.trimTarget.empty() && findTrimTarget(seq, opts.trimTarget)) return fallback("a trim pass");
+    const WorkingSpaceScope working(&sequenceColorSpace(seq));
+    const int solo = opts.soloVideoTrack;
+    RenderOptions o = opts;
+    o.soloVideoTrack = -1;
+    gpu::Frame frame;
+    frame.width = std::max(1, int(std::lround(seq.width * o.scale)));
+    frame.height = std::max(1, int(std::lround(seq.height * o.scale)));
+    const int W = frame.width, H = frame.height;
+    if (W > gpu::maxTextureSize() || H > gpu::maxTextureSize()) return fallback("a frame larger than the GPU takes");
+    const std::vector<bool> hiddenMatte = hiddenMatteTracks(seq, t);
+    if (std::find(hiddenMatte.begin(), hiddenMatte.end(), true) != hiddenMatte.end()) return fallback("a track matte");
+    // The clips on screen that need the canvas beneath them, or another track, go to the CPU whole.
+    for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
+        const Track& track = seq.videoTracks[ti];
+        if (solo >= 0 ? int(ti) != solo : track.muted) continue;
+        FrameTime from = 0, to = 0;
+        std::vector<const Clip*> shown;
+        if (const Transition* tr = activeTransition(track, t, from, to)) shown = {findClip(track, tr->clipA), findClip(track, tr->clipB)};
+        else shown = {clipAt(track, t)};
+        for (const Clip* c : shown)
+            if (c && c->enabled) {
+                if (c->isGenerator() && c->generator.type == "adjustment") return fallback("an adjustment layer");
+                if (trackMatteOf(*c)) return fallback("a track matte");
+                if (enabledEffect(seq, *c, "behind_people")) return fallback("Behind People");
+            }
+    }
+    auto layerOf = [&](const Clip& c, gpu::Layer& l) {
+        const GpuLayerResult r = gpuClipLayer(p, seq, c, t, o, l);
+        if (r == GpuLayerResult::Unsupported) {
+            l = {};
+            Image img = clipLayer(p, seq, c, t, o, nullptr);
+            if (img.empty()) return false;
+            l = cpuLayer(std::move(img));
+        }
+        gpu::countLayer(r != GpuLayerResult::Unsupported);
+        return r != GpuLayerResult::Nothing;
+    };
+    for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
+        const Track& track = seq.videoTracks[ti];
+        if (solo >= 0 ? int(ti) != solo : track.muted) continue;
+        FrameTime from = 0, to = 0;
+        if (const Transition* active = activeTransition(track, t, from, to)) {
+            const Clip* A = findClip(track, active->clipA);
+            const Clip* B = findClip(track, active->clipB);
+            const Clip* top = B ? B : A;
+            gpu::Item item;
+            item.blendMode = blendModeIndex(top ? top->blendMode : "normal");
+            if (active->type == "cross_dissolve") {
+                item.b.emplace();
+                if (A && A->enabled) layerOf(*A, item.a);
+                if (B && B->enabled) layerOf(*B, *item.b);
+                item.dissolve = float(std::clamp((double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from)), 0.0, 1.0));
+            } else {
+                item.a = cpuLayer(transitionLayer(p, seq, track, *active, from, to, t, o, nullptr, W, H));
+                gpu::countLayer(false);
+            }
+            frame.items.push_back(std::move(item));
+            continue;
+        }
+        if (const Clip* c = clipAt(track, t)) {
+            gpu::Item item;
+            item.blendMode = blendModeIndex(c->blendMode);
+            if (layerOf(*c, item.a)) frame.items.push_back(std::move(item));
+        }
+    }
+    // Captions are drawn on the CPU, before the display transform.
+    const CaptionTrack* captions = opts.captions ? captionTrackFor(seq) : nullptr;
+    if (captions && !captionAt(*captions, t)) captions = nullptr;
+    const ColorSpace* display = opts.displaySpace.empty() ? nullptr : findColorSpace(opts.displaySpace);
+    if (display && !captions) frame.display = conversionLut(trimTargetSpace(seq, {}), *display, trimTargetPeak(seq, {}));
+    Image img;
+    if (!gpu::execute(frame, captions || !out8 ? &img : nullptr, captions ? nullptr : out8)) return fallback("the GPU could not draw it");
+    if (captions) {
+        drawCaption(img, *captions, t, &trimTargetSpace(seq, {}));
+        if (display) convertColor(img, trimTargetSpace(seq, {}), *display, trimTargetPeak(seq, {}));
+        if (out8) {
+            *out8 = QImage(img.width, img.height, QImage::Format_RGBA8888);
+            toRgba8(img, out8->bits(), size_t(out8->bytesPerLine()));
+        }
+    }
+    if (out) *out = std::move(img);
+    return true;
+}
+
+}  // namespace
+
+QImage renderProgramFrameRgba8(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
+    QImage q;
+    if (o.gpu && o.depth == 0 && gpuProgramFrame(p, seq, t, o, nullptr, &q)) return q;
+    RenderOptions cpu = o;
+    cpu.gpu = false;
+    const Image img = renderProgramFrame(p, seq, t, cpu);
+    q = QImage(img.width, img.height, QImage::Format_RGBA8888);
+    if (img.width > 0) toRgba8(img, q.bits(), size_t(q.bytesPerLine()));
+    return q;
+}
+
 Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
+    if (o.gpu && o.depth == 0) {
+        Image img;
+        if (gpuProgramFrame(p, seq, t, o, &img, nullptr)) return img;
+    }
     // A trim pass: each eye as its target shows it, captions over that (as exports burn them in).
     const TrimTarget* trim = o.depth == 0 && !o.trimTarget.empty() ? findTrimTarget(seq, o.trimTarget) : nullptr;
     const std::string shown = trim ? trim->id : std::string();
@@ -1199,7 +1628,7 @@ bool clipGeometry(const Project& p, const Sequence& seq, const Clip& c, FrameTim
             if (m->width > 0) mw = m->width;
             if (m->height > 0) mh = m->height;
             // Reframe 360: a view at the sequence's shape (as clipLayer draws it).
-            if (enabledEffect(c, "reframe_360")) mw = std::max(1.0, std::round(mh * seq.width / std::max(1, seq.height)));
+            if (enabledEffect(seq, c, "reframe_360")) mw = std::max(1.0, std::round(mh * seq.width / std::max(1, seq.height)));
         }
     }
     g = clipGeometry(c, t - c.start, mw, mh, seq.width, seq.height, seq.fpsValue());
@@ -1783,11 +2212,27 @@ const float* AudioMixer::keySignal(Id trackId, int frames, int64_t keyAt) {
     return slot.samples.data();
 }
 
+AmbisonicBinaural& AudioMixer::binauralFor(Binaural& slot, int order, double sr) {
+    // Made again when the order or the rate changes, and in playback when the head chosen does (or a measured set
+    // finishes loading). An offline mix (an export) keeps the head it started with, so a file never changes head
+    // part way through.
+    const uint64_t generation = binauralHrtfGeneration();
+    if (slot.renderer && slot.renderer->order() == order && slot.renderer->sampleRate() == sr) {
+        if (slot.generation == generation || !nonBlocking_) return *slot.renderer;
+        slot.generation = generation;
+        if (binauralHrirs(sr, false) == slot.hrirs) return *slot.renderer;  // (another rate's set came in)
+    }
+    slot.hrirs = binauralHrirs(sr, !nonBlocking_);
+    slot.renderer = std::make_unique<AmbisonicBinaural>(order, sr, slot.hrirs);
+    slot.generation = generation;
+    return *slot.renderer;
+}
+
 void AudioMixer::resetLocked() {
     nextStart_ = -1;
     keyBufs_.clear();
     binaural_.clear();
-    if (monitor_) monitor_->reset();
+    if (monitor_.renderer) monitor_.renderer->reset();
     if (keyMixer_) keyMixer_->reset();
     // Plugins are expensive to load: keep them, clearing only their audio state.
     for (auto it = states_.begin(); it != states_.end();) {
@@ -1999,8 +2444,7 @@ void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int f
         mixInto(p, seq, start, frames, full.data(), trackLevels, 0, 0, -1, n);
         // An ambisonic mix heard binaurally (the decoder keeps its state from block to block).
         if (ambisonicLayout(seq.audioLayout) && ambisonicBinaural_) {
-            if (!monitor_ || monitor_->sampleRate() != seq.sampleRate) monitor_ = std::make_unique<FoaBinaural>(seq.sampleRate);
-            monitor_->process(full.data(), frames, out);
+            binauralFor(monitor_, ambisonicOrder(seq.audioLayout), seq.sampleRate).process(full.data(), frames, out);
             return;
         }
     }
@@ -2022,11 +2466,11 @@ void AudioMixer::mixLayout(const Project& p, const Sequence& seq, int64_t start,
 }
 
 bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Track& track, int64_t start, int frames,
-                               double sr, int depth, float* trackBuf, float* trackField, int64_t fieldStart) {
+                               double sr, int depth, float* trackBuf, float* trackField, int64_t fieldStart, int fieldChannels) {
     const double fps = seq.fpsValue();
     const int64_t end = start + frames;
     std::vector<float> clipBuf(size_t(frames) * 2);
-    std::vector<float> field;  // an ambisonic clip's turned field, kept for an ambisonic mix
+    std::vector<float> field;  // an ambisonic clip's turned field (or its speakers), kept for a surround mix
     bool any = false;
     for (const Clip& c : track.clips) {
         if (!c.enabled || edit::roleMuted(seq, c.role)) continue;
@@ -2055,9 +2499,16 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
         // A chain with latency is fed its source that many samples ahead, so its
         // output lines up with the picture; it starts that much before the clip.
         const int64_t lat = chainLatency(c.effects, c.id, sr);
-        if (pe <= start || ps - lat >= end) continue;
         const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
         if (!m) continue;
+        if (pe <= start || ps - lat >= end) {
+            // A kept field is read where the master is fed from, behind the track's window by the track's and bus's
+            // plugin latency: skipped only when it misses that window too.
+            const Sequence* inner = m->kind == MediaKind::Sequence ? p.findSequence(m->sequenceId) : nullptr;
+            const bool kept = trackField && (inner ? ambisonicLayout(inner->audioLayout)
+                                                   : m->ambisonic > 0 && c.channels.empty() && m->channels >= kFoaChannels);
+            if (!kept || pe <= fieldStart || ps >= fieldStart + frames) continue;
+        }
         std::fill(clipBuf.begin(), clipBuf.end(), 0.0f);
         field.clear();
         const int64_t rs = start + lat;  // the source window fed to the chain
@@ -2098,38 +2549,43 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                                         : m->ambisonic > 0 && c.channels.empty() && m->channels >= kFoaChannels;
         if (fieldSource) {
             // The field read sample for sample and turned (by the clip's Ambisonics effect and, while it follows, the
-            // linked picture's Reframe 360° view), then heard binaurally or as stereo, or kept as a field for an
-            // ambisonic mix.
+            // linked picture's Reframe 360° view), then heard binaurally or as stereo, or kept for a surround mix:
+            // as a field for an ambisonic one, decoded to the speakers (AllRAD) for the others.
             if (!nested && !m->hasAudio) continue;
+            const int order = nested ? ambisonicOrder(nested->audioLayout)
+                                     : std::clamp(std::min(m->ambisonic, ambisonicOrderForChannels(m->channels)), 1, kMaxAmbisonicOrder);
+            const int nch = ambisonicChannels(order);
             const bool keep = trackField != nullptr;
+            const int seqOrder = ambisonicOrder(seq.audioLayout);
             const int64_t base = keep ? fieldStart : rs;  // a kept field passes no clip or track (stereo) inserts
             const int64_t f0 = std::max(base, ps), f1 = std::min(base + frames, pe);
             AudioBufferPtr fb, stretched;
             std::vector<float> nf;
             const float* src = nullptr;
             int64_t n = 0, origin = 0;  // frames of `src`, and the source sample its first frame is
+            size_t stride = size_t(nch);  // channels of `src`
             if (nested) {
                 // The nested sequence mixed as a field over the span this block reads.
                 if (f1 > f0) {
                     const double lo = std::min(srcPos(f0), srcPos(f1 - 1)), hi = std::max(srcPos(f0), srcPos(f1 - 1));
                     origin = int64_t(std::floor(lo));
                     n = int64_t(std::floor(hi)) - origin + 2;
-                    nf.assign(size_t(n) * kFoaChannels, 0.0f);
-                    mixInto(p, *nested, origin, int(n), nf.data(), nullptr, depth + 1, int(sr), nested->multicam ? c.audioAngle : -1,
-                            kFoaChannels);
+                    nf.assign(size_t(n) * size_t(nch), 0.0f);
+                    mixInto(p, *nested, origin, int(n), nf.data(), nullptr, depth + 1, int(sr), nested->multicam ? c.audioAngle : -1, nch);
                     src = nf.data();
                 }
             } else {
-                const std::string key = ambisonicAudioKey(m->path);
+                const std::string key = ambisonicAudioKey(m->path, order);
                 fb = nonBlocking_ ? MediaPool::instance().audioIfReady(key, int(sr)) : MediaPool::instance().audio(key, int(sr));
-                if (!fb || fb->channels != kFoaChannels || fb->frames() < 2) continue;
-                // Noise reduction and the like: W cleaned, and what that did done to Y, Z and X (audio/SpeechCleanup.h).
+                if (!fb || fb->channels < nch || fb->frames() < 2) continue;
+                // Noise reduction and the like: W cleaned, and what that did done to the other channels
+                // (audio/SpeechCleanup.h).
                 std::vector<const Effect*> sourceFx;
                 for (const Effect& e : c.effects)
                     if (e.enabled && isSourceAudioEffect(e.type)) sourceFx.push_back(&e);
                 if (!sourceFx.empty())
-                    if (AudioBufferPtr clean = cleanedAudio(key, fb, sourceFx, !nonBlocking_)) fb = clean;
-                // Maintain Audio Pitch: the four channels stretched together along the time map.
+                    if (AudioBufferPtr clean = cleanedAudio(key, fb, sourceFx, !nonBlocking_); clean && clean->channels >= nch) fb = clean;
+                // Maintain Audio Pitch: the channels stretched together along the time map.
                 if (!c.reverse && c.timing.p("maintain_pitch", 0) > 0.5 && (ramped || std::fabs(c.speed - 1) > 1e-9)) {
                     const int hop = stretchHop(int(sr));
                     char head[160];
@@ -2143,10 +2599,11 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                         }
                         return positions;
                     }, hop, ce - cs, !nonBlocking_);
-                    if (stretched && stretched->channels != kFoaChannels) stretched.reset();
+                    if (stretched && stretched->channels != fb->channels) stretched.reset();
                 }
                 src = fb->samples.data();
                 n = fb->frames();
+                stride = size_t(fb->channels);
             }
             const Effect* amb = nullptr;
             for (const Effect& e : c.effects)
@@ -2159,7 +2616,7 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                         if (vc.linkGroup == c.linkGroup)
                             for (const Effect& e : vc.effects)
                                 if (e.enabled && e.type == "reframe_360") picture = &vc, view = &e;
-            field.assign(size_t(frames) * kFoaChannels, 0.0f);
+            std::vector<float> turned(size_t(frames) * size_t(nch), 0.0f);
             for (int64_t b = f0; b < f1 && src; b += 64) {
                 const int64_t e2 = std::min(f1, b + 64);
                 const FrameTime t = FrameTime(std::floor(double(b) * fps / sr));
@@ -2169,38 +2626,61 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                 if (view)
                     turn = foaCompose(turn, foaRotation(view->p("yaw", t - picture->start, 0), view->p("pitch", t - picture->start, 0),
                                                         view->p("roll", t - picture->start, 0)));
+                const AmbisonicRotation rot = ambisonicRotation(order, turn);
                 for (int64_t s = b; s < e2; ++s) {
                     const double pos = srcPos(s);
-                    float* d = &field[size_t(s - base) * kFoaChannels];
+                    float* d = &turned[size_t(s - base) * size_t(nch)];
                     if (stretched) {
                         const int64_t j = s - cs;
                         if (j < 0 || j >= stretched->frames()) continue;
-                        for (int k = 0; k < kFoaChannels; ++k) d[k] = stretched->samples[size_t(j) * kFoaChannels + size_t(k)];
+                        for (int k = 0; k < nch; ++k) d[k] = stretched->samples[size_t(j) * stride + size_t(k)];
                     } else {
                         const double rel = pos - double(origin);
                         if (rel < 0 || rel >= double(n - 1)) continue;
-                        const int64_t i = int64_t(rel);
+                        const size_t i = size_t(rel);
                         const float f = float(rel - double(i));
-                        for (int k = 0; k < kFoaChannels; ++k) d[k] = src[i * 4 + k] + (src[i * 4 + 4 + k] - src[i * 4 + k]) * f;
+                        const float *x0 = src + i * stride, *x1 = x0 + stride;
+                        for (int k = 0; k < nch; ++k) d[k] = x0[k] + (x1[k] - x0[k]) * f;
                     }
-                    foaRotate(turn, d);
+                    ambisonicRotate(rot, d);
                     if (!bleeps.empty()) {
                         // Covered in every direction; the tone in W, all round.
                         float tone = 0;
                         if (const float g = bleepAt(pos, tone); g > 0) {
-                            for (int k = 0; k < kFoaChannels; ++k) d[k] *= 1 - g;
+                            for (int k = 0; k < nch; ++k) d[k] *= 1 - g;
                             d[0] += tone * g;
                         }
                     }
                 }
             }
-            if (!keep) {
+            if (keep && seqOrder > 0) {
+                // Into the mix's field, to its order (a lower order's channels as they are, a higher one's cut).
+                const size_t w = size_t(fieldChannels), shared = std::min(w, size_t(nch));
+                field.assign(size_t(frames) * w, 0.0f);
+                for (int i = 0; i < frames; ++i)
+                    std::copy_n(&turned[size_t(i) * size_t(nch)], shared, &field[size_t(i) * w]);
+            } else if (keep) {
+                // Onto the speakers.
+                const std::vector<float>& dec = layoutDecoder(seq.audioLayout, order);
+                const size_t w = size_t(fieldChannels);
+                field.assign(size_t(frames) * w, 0.0f);
+                if (dec.size() == w * size_t(nch))
+                    for (int i = 0; i < frames; ++i) {
+                        const float* x = &turned[size_t(i) * size_t(nch)];
+                        float* d = &field[size_t(i) * w];
+                        for (size_t sp = 0; sp < w; ++sp) {
+                            const float* row = &dec[sp * size_t(nch)];
+                            float v = 0;
+                            for (int k = 0; k < nch; ++k) v += row[k] * x[k];
+                            d[sp] = v;
+                        }
+                    }
+            } else {
                 if (!amb || amb->p("decode", 0, 0) < 0.5) {
-                    auto& dec = binaural_[c.id];
-                    if (!dec || dec->sampleRate() != sr) dec = std::make_unique<FoaBinaural>(sr);
-                    dec->process(field.data(), frames, clipBuf.data());
+                    binauralFor(binaural_[c.id], order, sr).process(turned.data(), frames, clipBuf.data());
                 } else {
-                    for (int i = 0; i < frames; ++i) foaDecodeStereo(&field[size_t(i) * kFoaChannels], clipBuf[size_t(i) * 2], clipBuf[size_t(i) * 2 + 1]);
+                    for (int i = 0; i < frames; ++i)
+                        foaDecodeStereo(&turned[size_t(i) * size_t(nch)], clipBuf[size_t(i) * 2], clipBuf[size_t(i) * 2 + 1]);
                 }
                 field.clear();
             }
@@ -2333,8 +2813,8 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                 const float g = gainAt(s);
                 for (int64_t k = s; k < e2; ++k) {
                     const float gf = g * fadeAt(k);
-                    for (int ch = 0; ch < kFoaChannels; ++ch)
-                        trackField[size_t(k - fieldStart) * kFoaChannels + size_t(ch)] += field[size_t(k - fieldStart) * kFoaChannels + size_t(ch)] * gf;
+                    const size_t at = size_t(k - fieldStart) * size_t(fieldChannels);
+                    for (int ch = 0; ch < fieldChannels; ++ch) trackField[at + size_t(ch)] += field[at + size_t(ch)] * gf;
                 }
             }
         }
@@ -2371,7 +2851,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
     const double sr = rate > 0 ? rate : seq.sampleRate;
     // Surround: tracks and buses stay stereo inside and are panned onto the layout's speakers at their faders. Nested
     // sequences mix as stereo, except an ambisonic one wanted as its field.
-    const int nch = channels > 2 && (depth == 0 || (channels == kFoaChannels && ambisonicLayout(seq.audioLayout))) ? channels : 2;
+    const int nch = channels > 2 && (depth == 0 || (ambisonicLayout(seq.audioLayout) && channels == layoutChannels(seq.audioLayout))) ? channels : 2;
     const bool surround = nch > 2;
     const int lfeCh = [&] {
         const auto& sp = layoutSpeakers(seq.audioLayout);
@@ -2431,11 +2911,12 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         busLat[b.id] = chainLatency(b.effects, b.id, sr);
     }
     std::vector<float> trackBuf(size_t(frames) * 2), postBuf;
-    // An ambisonic mix: ambisonic clips add their field straight to it (W, Y, Z, X), beside the tracks' panned sound.
-    // The field passes no stereo inserts (clip, track or bus), so it is read where the master is fed from; a track
-    // routed to a bus sends it through the bus's mute and fader.
-    const bool fieldMix = surround && ambisonicLayout(seq.audioLayout) && nch == kFoaChannels;
-    std::vector<float> trackField(fieldMix ? size_t(frames) * kFoaChannels : 0);
+    // A surround mix: ambisonic clips add their field straight to it, beside the tracks' panned sound, as a field in
+    // an ambisonic mix (W, Y, Z, X, ...) and decoded to the speakers (AllRAD) in the others. It passes no stereo
+    // inserts (clip, track or bus), so it is read where the master is fed from; a track routed to a bus sends it
+    // through the bus's mute and fader.
+    const bool fieldMix = surround;
+    std::vector<float> trackField(fieldMix ? size_t(frames) * size_t(nch) : 0);
     const int64_t fieldStart = start + masterLat;
     std::map<Id, std::vector<float>> busFields;
     for (size_t ti = 0; ti < seq.audioTracks.size(); ++ti) {
@@ -2452,8 +2933,10 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         std::fill(trackBuf.begin(), trackBuf.end(), 0.0f);
         std::fill(trackField.begin(), trackField.end(), 0.0f);
         key_ = {&p, &seq, start + downstream + trackLat, sr, depth};
+        // (An ADM object's clips stay sound of its own, as the object is rendered from its track: no field kept.)
+        const bool keepsField = fieldMix && !(lfeOnly && !ambisonicLayout(seq.audioLayout));
         const bool any = mixTrackClips(p, seq, track, start + downstream + trackLat, frames, sr, depth, trackBuf.data(),
-                                       fieldMix ? trackField.data() : nullptr, fieldStart);
+                                       keepsField ? trackField.data() : nullptr, fieldStart, nch);
         // Track inserts keep running without clips, so reverb and delay tails ring out.
         if (!any && track.effects.empty()) continue;
         if (!track.effects.empty())
@@ -2467,7 +2950,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         if (readsLanes && track.muteAuto.animated()) {
             auto open = [&](int64_t at) { return laneMuted(track.muteAuto, false, double(at) * fps / sr) ? 0.0f : 1.0f; };
             rampGain(trackBuf.data(), 2, heard, open);
-            if (fieldMix) rampGain(trackField.data(), kFoaChannels, fieldStart, open);
+            if (fieldMix) rampGain(trackField.data(), nch, fieldStart, open);
         }
         // Aux sends (to a bus that exists, not muted): pre-fader ones take the sound here, after the inserts and the
         // mute; post-fader ones what leaves the fader and pan, below. Each at its own level, its lane gliding as the
@@ -2517,7 +3000,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
                     const float f1 = dbToLin(trackVolumeAt(track, double(fieldStart + e) * fps / sr));
                     for (int k = i; k < e; ++k) {
                         const float g = f0 + (f1 - f0) * float(k - i) / float(e - i);
-                        for (int ch = 0; ch < kFoaChannels; ++ch) trackField[size_t(k) * kFoaChannels + size_t(ch)] *= g;
+                        for (int ch = 0; ch < nch; ++ch) trackField[size_t(k) * size_t(nch) + size_t(ch)] *= g;
                     }
                 }
             }
@@ -2529,15 +3012,19 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
             float* to = master.data();
             if (bus != busBufs.end()) {
                 auto& bf = busFields[bus->first];
-                if (bf.empty()) bf.assign(size_t(frames) * kFoaChannels, 0.0f);
+                if (bf.empty()) bf.assign(size_t(frames) * size_t(nch), 0.0f);
                 to = bf.data();
             }
             for (int i = 0; i < frames; ++i) {
-                const float* f = &trackField[size_t(i) * kFoaChannels];
-                float* d = to + size_t(i) * kFoaChannels;
-                for (int ch = 0; ch < kFoaChannels; ++ch) d[ch] += f[ch] * tg;
-                lv.peakL = std::max(lv.peakL, std::fabs(f[0] * tg));
-                lv.peakR = std::max(lv.peakR, std::fabs(f[0] * tg));
+                const float* f = &trackField[size_t(i) * size_t(nch)];
+                float* d = to + size_t(i) * size_t(nch);
+                for (int ch = 0; ch < nch; ++ch) d[ch] += f[ch] * tg;
+                // Metered by W in a field; by its loudest speaker otherwise.
+                float peak = std::fabs(f[0]);
+                if (!ambisonicLayout(seq.audioLayout))
+                    for (int ch = 1; ch < nch; ++ch) peak = std::max(peak, std::fabs(f[ch]));
+                lv.peakL = std::max(lv.peakL, peak * tg);
+                lv.peakR = std::max(lv.peakR, peak * tg);
             }
         }
         if (surround && bus == busBufs.end()) {
@@ -2613,11 +3100,11 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
                 return laneMuted(b.muteAuto, false, f) ? 0.0f : dbToLin(busVolumeAt(b, f));
             };
             rampGain(bb.data(), 2, busHeard, gainAt);
-            if (bf != busFields.end()) rampGain(bf->second.data(), kFoaChannels, busHeard, gainAt);
+            if (bf != busFields.end()) rampGain(bf->second.data(), nch, busHeard, gainAt);
             g = 1;
         }
         if (bf != busFields.end())
-            for (size_t i = 0; i < bf->second.size(); ++i) master[i] += bf->second[i] * g;  // fieldMix: master is W, Y, Z, X
+            for (size_t i = 0; i < bf->second.size(); ++i) master[i] += bf->second[i] * g;  // (the master's channels)
         if (surround) {
             panInto(bb.data(), b.surround, g, master.data());
             continue;

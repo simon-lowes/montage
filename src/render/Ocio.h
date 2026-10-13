@@ -29,5 +29,7 @@ bool applyOcio(const Effect& e, Image& img, std::string* error = nullptr);
 // One of OCIO's built-in transforms (e.g. "ACEScct_to_ACES2065-1") on RGB
 // triples in place; used to check Montage's own colour maths.
 bool applyOcioBuiltin(const std::string& style, float* rgb, size_t count, bool inverse = false, std::string* error = nullptr);
+// A LUT or transform file OCIO reads (.clf, .cube, ...) on RGB triples in place; used to check Montage's own readers.
+bool applyOcioFile(const std::string& path, float* rgb, size_t count, std::string* error = nullptr);
 
 }  // namespace montage

@@ -164,8 +164,11 @@ void applyGradeGraph(const Sequence& s, const Clip& c, FrameTime lt, Image& img,
             const std::vector<const GradeLink*> ins = inputsOf(key);
             st.hasPic = true;
             if (ins.empty() || !n->enabled) {
+                // (switched off: its first input as it comes, with its key)
                 const GradeLink* first = ins.empty() ? nullptr : ins.front();
                 st.pic = pictureFrom(first ? first->from : 0);
+                if (first && first->from)
+                    if (auto it = out.find(first->from); it != out.end()) st.key = it->second.key;
                 out[key] = std::move(st);
                 continue;
             }
@@ -177,6 +180,18 @@ void applyGradeGraph(const Sequence& s, const Clip& c, FrameTime lt, Image& img,
                 keys.push_back(it == out.end() ? nullptr : &it->second.key);
             }
             st.pic = *pics.front();
+            // Its key, for an outside node or a key mixer: where any input's is (an input straight from the clip's
+            // picture changes nothing, so adds none; a node with no key of its own makes it everywhere).
+            {
+                bool everywhere = false;
+                for (size_t j = 0; j < keys.size(); ++j) everywhere = everywhere || (ins[j]->from && (!keys[j] || keys[j]->empty()));
+                if (!everywhere) {
+                    st.key.assign(N, 0.0f);
+                    for (size_t j = 0; j < keys.size(); ++j)
+                        if (ins[j]->from)
+                            for (size_t i = 0; i < N; ++i) st.key[i] = std::min(1.0f, st.key[i] + (*keys[j])[i]);
+                }
+            }
             if (n->kind == "parallel") {
                 for (size_t i = 0; i < N; ++i) {
                     float sum[4] = {0, 0, 0, 0}, mean[4] = {0, 0, 0, 0}, w = 0;

@@ -58,6 +58,7 @@ private:
     void addColorWheels(QFormLayout* form, const Target& target);
     // The HDR Palette: a zone picker, the zone's wheel and its sliders.
     void addHdrPalette(QFormLayout* form, const EffectInfo& info, const Target& target);
+    void addColorSlice(QFormLayout* form, const EffectInfo& info, const Target& target);
     void addParamRow(QFormLayout* form, const ParamInfo& pi, const Target& target);
     void addStringRow(QFormLayout* form, const StringParamInfo& si, const Target& target);
     // The effect stack of a clip, audio track, bus or master (by owner id), with its Add menu.
@@ -114,6 +115,7 @@ private:
     QVBoxLayout* layout_ = nullptr;
     QString signature_;
     std::vector<std::function<void()>> refreshers_;
+    int sliceVector_ = 0;  // the Colour Slice vector shown (0 Global, then Red to Magenta, then Skin)
     int hdrZone_ = 0;  // the HDR Palette zone shown (0 Global, then Black to Specular)
 };
 

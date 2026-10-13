@@ -1,7 +1,9 @@
 #include "RenderCache.h"
 #include "TrimPasses.h"
 #include "core/GradeGraph.h"
+#include "media/MotionDeblur.h"
 #include "media/Proxy.h"
+#include "media/SuperScale.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -45,7 +47,7 @@ QByteArray objectHash(const std::shared_ptr<const ObjectMask>& m) {
 }
 
 // The clip's settings that show in its pixels (not its id, name, place or label).
-void addClip(QCryptographicHash& h, const Clip& c) {
+void addClip(QCryptographicHash& h, const Sequence& seq, const Clip& c) {
     Clip k = c;
     k.id = 0;
     k.start = 0;
@@ -65,6 +67,10 @@ void addClip(QCryptographicHash& h, const Clip& c) {
     }
     h.addData(QByteArray::fromStdString(clipToJsonString(k)));
     for (const QByteArray& o : objects) h.addData(o);
+    // Effects whose model is downloaded later change the picture then (shared nodes' too).
+    for (const Effect* e : liveEffects(seq, c))
+        if (e->type == "motion_deblur") h.addData(deblurModel().installed() ? "deblur:1" : "deblur:0");
+        else if (e->type == "super_scale") h.addData(upscaleModel().installed() ? "upscale:1" : "upscale:0");
 }
 
 void addMedia(QCryptographicHash& h, const MediaItem& m, const RenderOptions& o) {
@@ -83,7 +89,7 @@ bool addFrame(QCryptographicHash& h, const Project& p, const Sequence& seq, Fram
 // One clip's part of the frame: its settings, how far into it t is, and what it shows.
 void addClipAt(QCryptographicHash& h, const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
                int depth) {
-    addClip(h, c);
+    addClip(h, seq, c);
     // Its colour group's grades run on it too.
     if (const ColorGroup* g = colorGroupOf(seq, c))
         for (const auto* chain : {&g->pre, &g->post}) {
@@ -276,7 +282,18 @@ int renderToCache(const Project& p, const Sequence& seq, FrameTime from, FrameTi
         if (cancel && cancel->load()) return -1;
         const QByteArray key = frameKey(p, seq, t, o);
         if (!key.isEmpty() && !cache.has(key)) {
-            const Image img = renderProgramFrame(p, seq, t, o);
+            // Rendered ahead, so effects that take seconds a frame run; a frame they could not finish is not kept.
+            RenderIssues issues;
+            RenderOptions ahead = o;
+            ahead.slowEffects = true;
+            ahead.issues = &issues;
+            ahead.cancel = cancel;
+            const Image img = renderProgramFrame(p, seq, t, ahead);
+            if (issues.incomplete) {
+                if (cancel && cancel->load()) return -1;
+                if (progress) progress(double(t - from + 1) / double(n));
+                continue;
+            }
             QImage q(img.width, img.height, QImage::Format_RGBA8888);
             toRgba8(img, q.bits(), size_t(q.bytesPerLine()));
             if (cache.store(key, q)) ++rendered;

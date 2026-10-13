@@ -164,6 +164,7 @@ InterpretFootageDialog::InterpretFootageDialog(const MediaItem& first, int count
     stereo_->addItem(tr("Side by side, squeezed (half width)"), QStringLiteral("sbs_half"));
     stereo_->addItem(tr("Top and bottom, full height eyes"), QStringLiteral("tb"));
     stereo_->addItem(tr("Top and bottom, squeezed (half height)"), QStringLiteral("tb_half"));
+    stereo_->addItem(tr("Two views (MV-HEVC spatial video)"), QStringLiteral("mv"));
     stereo_->setCurrentIndex(std::max(0, stereo_->findData(QString::fromStdString(now.stereo))));
     stereo_->setToolTip(tr("In a stereoscopic 3D sequence each eye reads its own half of the frame; elsewhere the left eye is shown"));
     stereo_->setEnabled(video);

@@ -61,6 +61,9 @@ struct ExportSettings {
     // The caption track as CEA-608 line-21 captions inside the video (A/53, as US broadcast and streaming platforms
     // take them): H.264 and HEVC only.
     bool cea608 = false;
+    // With cea608, the same captions as CTA-708 service 1 too (core/Cea708.h: the digital captions US broadcast
+    // requires, placed and coloured as the track shows them), beside the 608 bytes.
+    bool cea708 = true;
     // Delivery colour space (ColorSpace.h display space); "" = the sequence's.
     // An HDR sequence delivered in SDR is tone mapped. HDR output is 10-bit,
     // tagged, and PQ carries HDR10 mastering and light-level metadata.
@@ -178,10 +181,12 @@ std::string hdr10PlusCarriage(const Sequence& seq, const ExportSettings& s);
 // HDR exports measure their light levels as they render (`light`, when given); PQ files to MP4 and MOV carry the
 // measured MaxCLL and MaxFALL. Encoders that state them before the first frame (x265) use the sequence's analysed
 // levels, or the mastering peak when it has none.
+// An export rendered whole but not signed with its Content Credentials fails and is kept, unsigned (`keptUnsigned` set):
+// callers that clean up after a failure leave that file be.
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed = nullptr,
                     int* smartRendered = nullptr,  // frames copied by smart rendering
-                    LightLevels* light = nullptr);
+                    LightLevels* light = nullptr, bool* keptUnsigned = nullptr);
 
 // Renders an audio clip's sound with its effects (not its volume, pan or
 // fades) to a 24-bit WAV, from its first frame to its last.

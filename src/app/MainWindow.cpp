@@ -16,6 +16,8 @@
 #include "LoudnessReadout.h"
 #include "Voiceover.h"
 
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QAction>
 #include <QCheckBox>
 #include <QClipboard>
@@ -91,6 +93,7 @@
 #include "core/MarkerList.h"
 #include "render/AudioReactive.h"
 #include "render/VfxPull.h"
+#include "render/Amf.h"
 #include "render/LutExport.h"
 #include "media/TextReader.h"
 #include "media/Decoder.h"
@@ -130,6 +133,7 @@
 #include "MixerPanel.h"
 #include "ControlSurface.h"
 #include "OscControl.h"
+#include "SpeedEditorControl.h"
 #include "control/Midi.h"
 #include "MulticamPanel.h"
 #include "AdrPanel.h"
@@ -174,6 +178,7 @@
 #include "render/ClipAnalysis.h"
 #include "render/RenderCache.h"
 #include "render/Compositor.h"
+#include "render/GpuCompositor.h"
 #include "render/AutoBroll.h"
 #include "render/Highlights.h"
 #include "render/Shorts.h"
@@ -182,6 +187,7 @@
 #include "render/Hdr10Plus.h"
 #include "render/Versions.h"
 #include "media/MicBleed.h"
+#include "media/Sofa.h"
 #include "render/MusicEdit.h"
 #include "render/VoiceMatch.h"
 #include "render/Exporter.h"
@@ -601,6 +607,42 @@ void MainWindow::buildPanels() {
         if (ok) statusBar()->showMessage(tr("Rendered %1").arg(file), 8000);
         else if (j->status == RenderQueue::Status::Failed) statusBar()->showMessage(tr("Render failed: %1 (%2)").arg(file, j->error), 10000);
     });
+    // The Blackmagic Speed Editor and Editor Keyboard, when plugged in or paired.
+    {
+        SpeedEditorControl::Hooks hooks;
+        hooks.controller = [this] { return activeController(); };
+        hooks.showMonitor = [this](bool source) {
+            active_ = source ? Monitor::Source : Monitor::Program;
+            (source ? sourceDock_ : programDock_)->raise();
+        };
+        hooks.selectEdit = [this](int side) {
+            if (!selectNearestEdit()) return false;
+            // The side asked for where there is a clip on it (else the one there is).
+            if ((side == 0 && trimEdit_->outgoing && trimEdit_->incoming) || (side == 1 && trimEdit_->outgoing) || (side == 2 && trimEdit_->incoming))
+                trimEdit_->side = side;
+            showTrimEdit();
+            return true;
+        };
+        hooks.trimBy = [this](FrameTime frames) { return trimSelectedEdit(frames); };
+        hooks.trimming = [this] { return trimEdit_.has_value(); };
+        hooks.switchAngle = [this](int angle, bool cut) { return multicam_->currentClip() != 0 && multicam_->switchTo(angle, cut); };
+        hooks.angle = [this] {
+            const Sequence* s = state_->sequence();
+            const Id id = multicam_->currentClip();
+            const Clip* c = s && id ? edit::clipById(*s, id) : nullptr;
+            return c ? c->angle : -1;
+        };
+        speedEditor_ = new SpeedEditorControl(state_, this, std::move(hooks), this);
+        speedEditor_->setObjectName(QStringLiteral("speedEditor"));
+        speedEditor_->setBindingChanges(
+            QJsonDocument::fromJson(appSettings().value(QStringLiteral("speedEditor/bindings")).toString().toUtf8()).object());
+        connect(speedEditor_, &SpeedEditorControl::connectionChanged, this, [this] {
+            if (speedEditor_->isConnected()) state_->message(tr("%1 connected").arg(speedEditor_->deviceName()), 4000);
+        });
+        // (after the menus: its keys are their commands)
+        const bool on = appSettings().value(QStringLiteral("speedEditor/enabled"), true).toBool();
+        QTimer::singleShot(0, speedEditor_, [this, on] { speedEditor_->setEnabled(on); });
+    }
     // 1–9 cut to an angle (live while playing); Shift cuts at the playhead when stopped.
     for (int i = 0; i < 9; ++i) {
         auto* sw = new QShortcut(QKeySequence(Qt::Key_1 + i), this);
@@ -1097,6 +1139,28 @@ void MainWindow::buildMenus() {
         const QString want = filter.contains("*.ccc") ? "ccc" : filter.contains("*.cc") ? "cc" : "cdl";
         exportCdl(ext == "cdl" || ext == "cc" || ext == "ccc" ? path : path + "." + want);
     })->setObjectName(QStringLiteral("exportCdl"));
+    add(clipM, tr("Import ACES Metadata (AMF)…"), QKeySequence(), [this] {
+        const QString path = QFileDialog::getOpenFileName(this, tr("Import ACES Metadata"), QString(), tr("ACES Metadata File (*.amf);;All files (*)"));
+        if (!path.isEmpty()) importAmf(path);
+    })->setObjectName(QStringLiteral("importAmf"));
+    add(clipM, tr("Export ACES Metadata (AMF)…"), QKeySequence(), [this] {
+        const Sequence* s = state_->sequence();
+        int clips = 0;
+        for (Id id : state_->selectedClips())
+            if (const Clip* c = s ? edit::clipById(*s, id) : nullptr; c && c->mediaId && !c->isGenerator()) ++clips;
+        if (clips == 0) {
+            state_->message(tr("Select the clips of footage to write ACES Metadata Files for"), 6000);
+            return;
+        }
+        QString target;
+        if (clips == 1) {
+            target = QFileDialog::getSaveFileName(this, tr("Export ACES Metadata"), QString(), tr("ACES Metadata File (*.amf)"));
+            if (!target.isEmpty() && !target.endsWith(QLatin1String(".amf"), Qt::CaseInsensitive)) target += QStringLiteral(".amf");
+        } else {
+            target = QFileDialog::getExistingDirectory(this, tr("Folder for the ACES Metadata Files"));
+        }
+        if (!target.isEmpty()) exportAmf(target);
+    })->setObjectName(QStringLiteral("exportAmf"));
     add(clipM, tr("Find Similar S&hots"), QKeySequence(), [this] { findSimilarShots(); })->setObjectName(QStringLiteral("findSimilarShots"));
     add(clipM, tr("Checkerboard Dialogue by Speaker"), QKeySequence(), withSeq([this] {
             // The selected audio clips, each split where the speaker changes, a track per person.
@@ -1424,6 +1488,24 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Smart Insert"), QKeySequence(), [this] { state_->sourceEdit(EditorState::SourceEdit::SmartInsert); })
         ->setObjectName(QStringLiteral("smartInsert"));
     {
+        // Resolve's Video Only and Audio Only (the Speed Editor's keys): source edits bring one or the other.
+        QAction* video = add(clipM, tr("Edit Video Only"), QKeySequence(), [this](bool on) { state_->setSourceKinds(true, !on); });
+        QAction* audio = add(clipM, tr("Edit Audio Only"), QKeySequence(), [this](bool on) { state_->setSourceKinds(!on, true); });
+        video->setObjectName(QStringLiteral("editVideoOnly"));
+        audio->setObjectName(QStringLiteral("editAudioOnly"));
+        for (QAction* a : {video, audio}) a->setCheckable(true);
+        video->setToolTip(tr("Source edits bring only the picture"));
+        audio->setToolTip(tr("Source edits bring only the sound"));
+        connect(state_, &EditorState::sourceKindsChanged, this, [this, video, audio] {
+            video->setChecked(!state_->sourceAudio());
+            audio->setChecked(!state_->sourceVideo());
+            state_->message(!state_->sourceAudio()   ? tr("Source edits: video only")
+                            : !state_->sourceVideo() ? tr("Source edits: audio only")
+                                                     : tr("Source edits: video and audio"),
+                            3000);
+        });
+    }
+    {
         // Premiere's "insert and overwrite sequences as nests or individual clips".
         state_->setSequencesAsClips(appSettings().value("editing/sequencesAsClips", false).toBool());
         QAction* a = add(clipM, tr("Insert Sequences as Clips"), QKeySequence(), [this](bool on) {
@@ -1607,6 +1689,14 @@ void MainWindow::buildMenus() {
             state_->setOutPoint(-1);
         }
     });
+    add(seqM, tr("Clear In"), QKeySequence("Ctrl+Shift+I"), [this] {
+        if (active_ == Monitor::Source) state_->setSourceIn(-1);
+        else state_->setInPoint(-1);
+    })->setObjectName(QStringLiteral("clearIn"));
+    add(seqM, tr("Clear Out"), QKeySequence("Ctrl+Shift+O"), [this] {
+        if (active_ == Monitor::Source) state_->setSourceOut(-1);
+        else state_->setOutPoint(-1);
+    })->setObjectName(QStringLiteral("clearOut"));
     add(seqM, tr("Go to In"), QKeySequence("Shift+I"), [this] {
         FrameTime t = active_ == Monitor::Source ? state_->sourceIn() : (state_->sequence() ? state_->sequence()->inPoint : -1);
         if (t >= 0) activeController()->seek(t);
@@ -1793,6 +1883,38 @@ void MainWindow::buildMenus() {
         a->setChecked(hw);
         a->setToolTip(tr("Decode H.264, HEVC, VP9, AV1 and ProRes on the GPU or media engine "
                          "(VideoToolbox, D3D11, NVDEC, VAAPI) where supported"));
+        // GPU rendering (on by default where there is a GPU; MONTAGE_GPU=off overrides it): the program monitor's frames
+        // are composited and graded on the GPU, what it cannot draw on the CPU as before. The GPU is set up only when it
+        // is wanted (a driver that misbehaves is out of the way once it is turned off).
+        std::string why;
+        const bool onGpu = appSettings().value("playback/gpuRendering", true).toBool() && gpu::initialize(&why);
+        program_->setGpuRendering(onGpu);
+        QAction* g = add(play, tr("&GPU Rendering"), QKeySequence(), [](bool) {});
+        g->setObjectName(QStringLiteral("gpuRendering"));
+        g->setCheckable(true);
+        g->setChecked(onGpu);
+        auto describe = [g](const std::string& problem) {
+            g->setToolTip(problem.empty() ? tr("Composite and grade the program monitor's frames on the GPU; effects it has no GPU "
+                                               "form for render on the CPU")
+                                          : tr("No GPU rendering: %1").arg(QString::fromStdString(problem)));
+        };
+        describe(why);
+        connect(g, &QAction::triggered, this, [this, g, describe](bool on) {
+            std::string problem;
+            if (on && !gpu::initialize(&problem)) {
+                g->setChecked(false);
+                describe(problem);
+                statusBar()->showMessage(tr("No GPU rendering: %1").arg(QString::fromStdString(problem)), 5000);
+                return;
+            }
+            describe({});
+            program_->setGpuRendering(on);
+            appSettings().setValue("playback/gpuRendering", on);
+            statusBar()->showMessage(on ? tr("GPU rendering on (%1): layers, transforms and colour effects draw on the GPU")
+                                              .arg(QString::fromStdString(gpu::deviceName()))
+                                        : tr("GPU rendering off: frames render on the CPU"),
+                                     5000);
+        });
         play->addSeparator();
     }
     trimView_ = add(play, tr("Two-Up Trim View"), QKeySequence(), [](bool on) { appSettings().setValue("playback/twoUpTrim", on); });
@@ -1879,6 +2001,46 @@ void MainWindow::buildMenus() {
             a->setChecked(b == binaural);
             group->addAction(a);
         }
+        // The head heard through binaurally: a model, a measured dummy head, or a personal set (SOFA files).
+        ambiM->addSeparator();
+        auto* heads = new QActionGroup(ambiM);
+        struct Head {
+            const char* name;
+            QString text;
+            QString choice;  // "?" asks for a file
+        };
+        const Head choices[] = {{"hrtfHead", tr("Spherical Head Model"), QString()},
+                                {"hrtfKu100", tr("Measured Head (SADIE II KU100)"), QStringLiteral("ku100")},
+                                {"hrtfFile", tr("Personal HRTF (SOFA File)..."), QStringLiteral("?")}};
+        for (const Head& h : choices) {
+            QAction* a = ambiM->addAction(h.text, this, [this, choice = h.choice] {
+                QString c = choice;
+                if (c == "?") {
+                    c = QFileDialog::getOpenFileName(this, tr("Personal HRTF"), QString(), tr("SOFA files (*.sofa *.zip)"));
+                    if (c.isEmpty()) return;
+                }
+                setBinauralHrtfChoice(c);
+            });
+            a->setObjectName(QString::fromLatin1(h.name));
+            a->setCheckable(true);
+            a->setEnabled(h.choice.isEmpty() || sofaSupported());
+            if (!sofaSupported() && !h.choice.isEmpty()) a->setToolTip(tr("This build of Montage cannot read SOFA files (libmysofa)"));
+            heads->addAction(a);
+        }
+        // Checked as chosen now (automation can choose too).
+        auto showChoice = [ambiM] {
+            const std::string c = binauralHrtf();
+            ambiM->findChild<QAction*>(QStringLiteral("hrtfHead"))->setChecked(c.empty());
+            ambiM->findChild<QAction*>(QStringLiteral("hrtfKu100"))->setChecked(c == "ku100");
+            QAction* file = ambiM->findChild<QAction*>(QStringLiteral("hrtfFile"));
+            file->setChecked(!c.empty() && c != "ku100");
+            file->setText(!c.empty() && c != "ku100" ? tr("Personal HRTF (%1)...").arg(QFileInfo(QString::fromStdString(c)).fileName())
+                                                     : tr("Personal HRTF (SOFA File)..."));
+        };
+        connect(ambiM, &QMenu::aboutToShow, this, showChoice);
+        const QString saved = appSettings().value("playback/binauralHrtf").toString();
+        if (!saved.isEmpty() && !setBinauralHrtfChoice(saved, true)) appSettings().remove("playback/binauralHrtf");
+        showChoice();
     }
     // How the Program monitor shows a stereo 3D sequence's two eyes (render/Stereo.h).
     QMenu* stereoM = play->addMenu(tr("Stereo 3D View"));
@@ -2996,6 +3158,10 @@ void MainWindow::vfxPullDialog() {
     cutIn->setRange(0, 100000);
     cutIn->setValue(1001);
     form->addRow(tr("First frame of the cut:"), cutIn);
+    auto* amf = new QCheckBox(tr("Write ACES Metadata Files (the frames' colour space and the grade's CDL and looks)"), &dlg);
+    amf->setObjectName(QStringLiteral("vfxAmf"));
+    amf->setChecked(appSettings().value("vfx/amf", true).toBool());
+    form->addRow(amf);
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
@@ -3005,7 +3171,9 @@ void MainWindow::vfxPullDialog() {
     if (folder.isEmpty()) return;
     appSettings().setValue("vfx/folder", folder);
     appSettings().setValue("vfx/handles", handles->value());
+    appSettings().setValue("vfx/amf", amf->isChecked());
     VfxPullOptions o;
+    o.amf = amf->isChecked();
     o.folder = folder.toStdString();
     o.format = format->currentData().toString().toStdString();
     o.handles = handles->value();
@@ -3622,6 +3790,109 @@ bool MainWindow::exportCdl(const QString& path) {
     return true;
 }
 
+int MainWindow::importAmf(const QString& path, int setSpace) {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    AmfDocument amf;
+    std::string err;
+    if (!readAmf(path.toStdString(), amf, &err)) {
+        state_->message(QString::fromStdString(err), 6000);
+        return 0;
+    }
+    // The selected clips (those the AMF names, when it names some of them), else the clips it names.
+    std::vector<Id> clips, named;
+    for (Id id : state_->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Video) {
+            clips.push_back(id);
+            if (amfMatchesClip(amf, state_->project(), *edit::clipById(*s, id))) named.push_back(id);
+        }
+    if (!named.empty()) clips = named;
+    AmfImportOptions o;
+    if (!amf.outputSpace.empty() && (amf.outputSpace != s->colorSpace || (findColorSpace(amf.outputSpace)->hdr() && amf.outputPeakNits != s->hdrPeakNits))) {
+        if (setSpace < 0) {
+            const ColorSpace* out = findColorSpace(amf.outputSpace);
+            const QString what = out->hdr() ? tr("%1 at %2 nits").arg(QString::fromStdString(out->label)).arg(amf.outputPeakNits)
+                                            : QString::fromStdString(out->label);
+            setSpace = QMessageBox::question(this, tr("Import ACES Metadata"),
+                                             tr("Its output transform is for %1. Make that the sequence's colour space?").arg(what)) == QMessageBox::Yes;
+        }
+        o.setSequenceSpace = setSpace > 0;
+    }
+    AmfImportResult r;
+    state_->edit(tr("Import ACES Metadata"), [&](Project& p, Sequence& sq) {
+        r = applyAmf(p, sq, clips, amf, o);
+        return r.clips > 0;
+    });
+    QStringList notes;
+    for (const std::string& n : r.notes) notes << QString::fromStdString(n);
+    QString msg = r.clips ? tr("Gave %n clip(s) the ACES pipeline from %1", nullptr, r.clips).arg(QFileInfo(path).fileName()) : QString();
+    if (!notes.isEmpty()) msg = msg.isEmpty() ? notes.join(QStringLiteral("; ")) : msg + tr(" (%1)").arg(notes.join(QStringLiteral("; ")));
+    if (msg.isEmpty()) msg = tr("No clip here took the ACES Metadata File");
+    state_->message(msg, 10000);
+    return r.clips;
+}
+
+int MainWindow::exportAmf(const QString& target) {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    std::vector<const Clip*> clips;
+    for (Id id : state_->selectedClips())
+        if (const Clip* c = edit::clipById(*s, id); c && c->mediaId && !c->isGenerator()) clips.push_back(c);
+    if (clips.empty()) return 0;
+    int written = 0;
+    QStringList notes;
+    std::set<QString> used;
+    for (const Clip* c : clips) {
+        QString path = target;
+        if (clips.size() > 1) {
+            // One per clip in the folder, named after it.
+            QString base = QString::fromStdString(c->name).replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9_.-]+")), QStringLiteral("_"));
+            if (base.isEmpty() || base.startsWith(QLatin1Char('.'))) base = QStringLiteral("clip") + base;
+            QString name = base;
+            for (int n = 2; used.count(name); ++n) name = base + QStringLiteral("_%1").arg(n);
+            used.insert(name);
+            path = QDir(target).filePath(name + QStringLiteral(".amf"));
+        }
+        std::vector<std::string> said;
+        std::string err;
+        if (!writeClipAmf(state_->project(), *s, *c, path.toStdString(), &said, {}, &err)) {
+            state_->message(QString::fromStdString(err), 6000);
+            return written;
+        }
+        for (const std::string& n : said)
+            if (!notes.contains(QString::fromStdString(n))) notes << QString::fromStdString(n);
+        ++written;
+    }
+    QString msg = tr("Wrote %n ACES Metadata File(s)", nullptr, written);
+    if (!notes.isEmpty()) msg += tr(" (%1)").arg(notes.join(QStringLiteral("; ")));
+    state_->message(msg, 10000);
+    return written;
+}
+
+bool MainWindow::setBinauralHrtfChoice(const QString& choice, bool quiet) {
+    auto refuse = [&](const QString& why) {
+        if (!quiet) QMessageBox::warning(this, tr("Binaural Monitoring"), why);
+        return false;
+    };
+    if (!choice.isEmpty()) {
+        if (!sofaSupported()) return refuse(tr("This build of Montage cannot read SOFA files (it was built without libmysofa)."));
+        if (choice == "ku100") {
+            if (!sadieKu100Pack().installed() &&
+                (quiet || !ensureModelPack(this, sadieKu100Pack(), tr("Binaural Monitoring"),
+                                           tr("Ambisonic sound is heard through the head-related impulse responses of a Neumann KU100 "
+                                              "dummy head, measured for the University of York's SADIE II database (Apache-2.0)."))))
+                return false;
+        } else {
+            std::string why;
+            if (!readSofa(choice.toStdString(), 48000, &why))
+                return refuse(tr("%1 cannot be used: %2").arg(QFileInfo(choice).fileName(), QString::fromStdString(why)));
+        }
+    }
+    setBinauralHrtf(choice.toStdString());
+    appSettings().setValue("playback/binauralHrtf", choice);
+    return true;
+}
+
 int MainWindow::suggestChapterMarkers(double minSeconds, bool ask) {
     const Sequence* s = state_->sequence();
     if (!s) return 0;
@@ -3911,8 +4182,9 @@ void MainWindow::setColourReference() {
     }
     // Named after the top clip with a picture at the playhead.
     colourRefName_ = QString::fromStdString(s->name);
+    const std::vector<bool> mattes = hiddenMatteTracks(*s, t);
     for (int i = int(s->videoTracks.size()) - 1; i >= 0; --i)
-        if (const Clip* c = edit::clipAt(*s, TrackRef{TrackKind::Video, i}, t); c && !s->videoTracks[size_t(i)].muted) {
+        if (const Clip* c = edit::clipAt(*s, TrackRef{TrackKind::Video, i}, t); c && !s->videoTracks[size_t(i)].muted && !mattes[size_t(i)]) {
             colourRefName_ = QString::fromStdString(c->name);
             break;
         }
@@ -6018,7 +6290,109 @@ QDialog* MainWindow::controlSurfaceDialog() {
         list->resize(760, 520);
         list->show();
     });
+    // Blackmagic's Speed Editor and Editor Keyboard (HID, USB or Bluetooth).
+    auto* speedBox = new QGroupBox(tr("DaVinci Resolve Speed Editor and Editor Keyboard"), dlg);
+    auto* speedForm = new QFormLayout(speedBox);
+    auto* speedOn = new QCheckBox(tr("Use a Speed Editor or Editor Keyboard when one is plugged in or paired"), speedBox);
+    speedOn->setObjectName(QStringLiteral("speedEditorEnabled"));
+    speedOn->setChecked(speedEditor_->isEnabled());
+    speedOn->setToolTip(tr("DaVinci Resolve holds the device while it runs: quit it first"));
+    auto* speedStatus = new QLabel(speedBox);
+    speedStatus->setObjectName(QStringLiteral("speedEditorStatus"));
+    speedStatus->setWordWrap(true);
+    auto* speedKeys = new QPushButton(tr("Keys…"), speedBox);
+    speedKeys->setObjectName(QStringLiteral("speedEditorKeys"));
+    speedKeys->setToolTip(tr("What each key does (any key can do any menu command)"));
+    speedForm->addRow(speedOn);
+    speedForm->addRow(speedStatus);
+    speedForm->addRow(speedKeys);
+    form->addRow(speedBox);
+    auto showSpeed = [this, speedStatus] {
+        QString text;
+        if (speedEditor_->isConnected()) {
+            text = tr("Connected to %1").arg(speedEditor_->deviceName());
+            if (speedEditor_->batteryLevel() >= 0)
+                text += speedEditor_->charging() ? tr(" (battery %1 %, charging)").arg(speedEditor_->batteryLevel())
+                                                 : tr(" (battery %1 %)").arg(speedEditor_->batteryLevel());
+            text += QLatin1Char('.');
+        } else if (!speedEditor_->isEnabled()) {
+            text = tr("Off.");
+        } else {
+            text = speedEditor_->lastError().isEmpty() ? tr("Looking for one…") : speedEditor_->lastError();
+        }
+        speedStatus->setText(text);
+    };
+    showSpeed();
+    connect(speedEditor_, &SpeedEditorControl::connectionChanged, speedStatus, showSpeed);
+    connect(speedEditor_, &SpeedEditorControl::batteryChanged, speedStatus, showSpeed);
+    connect(speedOn, &QCheckBox::toggled, dlg, [this, showSpeed](bool on) {
+        appSettings().setValue(QStringLiteral("speedEditor/enabled"), on);
+        speedEditor_->setEnabled(on);
+        showSpeed();
+    });
+    connect(speedKeys, &QPushButton::clicked, dlg, [this, dlg] { speedEditorKeysDialog(dlg); });
     form->addRow(buttons);
+    dlg->show();
+    return dlg;
+}
+
+QDialog* MainWindow::speedEditorKeysDialog(QWidget* parent) {
+    auto* dlg = new QDialog(parent ? parent : this);
+    dlg->setObjectName(QStringLiteral("speedEditorKeysDialog"));
+    dlg->setWindowTitle(tr("Speed Editor Keys"));
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    auto* v = new QVBoxLayout(dlg);
+    auto* intro = new QLabel(tr("What each key does. Keys with a second function in brackets do it when pressed twice, "
+                                "while they do their own thing."),
+                             dlg);
+    intro->setWordWrap(true);
+    v->addWidget(intro);
+    auto* table = new QTableWidget(int(speed::allKeys().size()), 3, dlg);
+    table->setObjectName(QStringLiteral("speedEditorKeyTable"));
+    table->setHorizontalHeaderLabels({tr("Key"), tr("Pressed twice"), tr("Does")});
+    table->verticalHeader()->hide();
+    table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    // Every built-in function and menu command, by what it is called.
+    QList<std::pair<QString, QString>> choices = {{QString(), tr("Nothing")}};
+    for (const QString& id : SpeedEditorControl::builtIns()) choices.push_back({id, SpeedEditorControl::builtInLabel(id)});
+    for (QAction* a : keymap::actions(this))
+        if (const QString id = keymap::idOf(a); !id.isEmpty()) choices.push_back({id, id});
+    int row = 0;
+    for (speed::Key k : speed::allKeys()) {
+        QString label = QString::fromStdString(speed::keyLabel(k));
+        if (!speed::onSpeedEditor(k)) label += tr(" (Editor Keyboard)");
+        table->setItem(row, 0, new QTableWidgetItem(label));
+        table->setItem(row, 1, new QTableWidgetItem(QString::fromStdString(speed::keySecondLabel(k))));
+        auto* box = new QComboBox(table);
+        box->setObjectName(QStringLiteral("speedKey_") + QString::fromStdString(speed::keyName(k)));
+        for (const auto& [id, text] : choices) box->addItem(id == SpeedEditorControl::defaultBinding(k) ? tr("%1 (default)").arg(text) : text, id);
+        const int at = box->findData(speedEditor_->binding(k));
+        if (at < 0) box->addItem(speedEditor_->binding(k), speedEditor_->binding(k));  // (a command no longer there)
+        box->setCurrentIndex(at >= 0 ? at : box->count() - 1);
+        connect(box, &QComboBox::currentIndexChanged, dlg, [this, k, box] {
+            speedEditor_->setBinding(k, box->currentData().toString());
+            appSettings().setValue(QStringLiteral("speedEditor/bindings"),
+                                   QString::fromUtf8(QJsonDocument(speedEditor_->bindingChanges()).toJson(QJsonDocument::Compact)));
+            speedEditor_->refreshLeds();
+        });
+        table->setCellWidget(row, 2, box);
+        ++row;
+    }
+    table->resizeColumnsToContents();
+    v->addWidget(table);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, dlg);
+    QPushButton* reset = buttons->addButton(tr("Reset All"), QDialogButtonBox::ResetRole);
+    reset->setObjectName(QStringLiteral("speedEditorReset"));
+    connect(reset, &QPushButton::clicked, dlg, [this, table] {
+        int r = 0;
+        for (speed::Key k : speed::allKeys()) {
+            if (auto* box = qobject_cast<QComboBox*>(table->cellWidget(r++, 2))) box->setCurrentIndex(box->findData(SpeedEditorControl::defaultBinding(k)));
+        }
+    });
+    connect(buttons, &QDialogButtonBox::rejected, dlg, &QDialog::close);
+    v->addWidget(buttons);
+    dlg->resize(720, 640);
     dlg->show();
     return dlg;
 }

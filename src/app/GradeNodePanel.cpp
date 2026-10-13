@@ -618,7 +618,7 @@ bool GradeNodePanel::unshareSelected() {
 bool GradeNodePanel::flatten() {
     const Id id = clip();
     if (!id) return false;
-    if (!state_->apply(tr("Flatten Nodes"), [id](Project&, Sequence& s) { return edit::flattenGrade(s, id); })) return false;
+    if (!state_->apply(tr("Flatten Nodes"), [id](Project& p, Sequence& s) { return edit::flattenGrade(p, s, id); })) return false;
     selectNode(0);
     return true;
 }

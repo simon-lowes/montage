@@ -1,19 +1,26 @@
 // Montage — exposure checks on the monitors, as cinema cameras and Resolve show them: zebra stripes over what is at
 // or near clipping (or over a skin-tone band), and false colour, where the brightness of each pixel picks a colour
 // from a scale (ARRI's: purple for crushed black, blue just above it, green for 18 % grey, pink one stop over,
-// yellow near clipping, red clipped, grey elsewhere). Only the picture shown changes, never what is exported.
+// yellow near clipping, red clipped, grey elsewhere), and colours outside a delivery gamut (Rec.709 or P3) striped in
+// magenta, from the frame as delivered. Only the picture shown changes, never what is exported.
 #pragma once
 
 #include <QColor>
 #include <QImage>
+#include <QString>
+
+#include "render/ColorSpace.h"
 
 namespace montage {
 
-enum class ExposureView { Off, Zebras100, Zebras70, FalseColor };
+enum class ExposureView { Off, Zebras100, Zebras70, FalseColor, OutOfGamut709, OutOfGamutP3 };
 
 // Brightness is the picture's Rec.709 luma as shown (0 black, 1 white).
 QColor falseColorFor(double luma);
 // Zebras100 stripes pixels at 98 % or more; Zebras70 those between 65 and 75 % (faces exposed for skin).
 QImage exposureView(const QImage& img, ExposureView mode);
+// `picture` with the pixels whose colour in `signal` (the same frame as delivered: code values in `space`, any size)
+// is outside `target` striped.
+QImage gamutView(const QImage& picture, const QImage& signal, const QString& space, Primaries target);
 
 }  // namespace montage

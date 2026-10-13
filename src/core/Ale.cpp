@@ -54,6 +54,8 @@ const ColumnField kColumns[] = {
     {"Scene", "scene"},   {"Shot", "shot"},         {"Take", "take"},          {"Tape", "tape"},
     {"Camroll", "tape"},  {"Cam Roll", "tape"},     {"Camera", "camera"},      {"Description", "description"},
     {"Comments", "comment"}, {"Comment", "comment"},
+    // ACES Metadata Files' clip names and ids (render/Amf.h), as ACES dailies tools write them.
+    {"AMF_NAME", "amf_name"}, {"AMF_UUID", "amf_uuid"},
 };
 
 }  // namespace
@@ -294,12 +296,31 @@ AleTable aleFromMedia(const Project& p, const std::vector<Id>& ids, Rational fps
         t.columns.push_back("ASC_SOP");
         t.columns.push_back("ASC_SAT");
     }
-    for (auto& [row, cdl] : rows) {
+    // The AMF columns when any media has them.
+    bool anyAmf = false;
+    for (Id id : ids)
+        if (const MediaItem* m = p.findMedia(id); m && m->kind != MediaKind::Sequence && m->kind != MediaKind::Image)
+            anyAmf |= m->metadata.count("amf_name") || m->metadata.count("amf_uuid");
+    if (anyAmf) {
+        t.columns.push_back("AMF_NAME");
+        t.columns.push_back("AMF_UUID");
+    }
+    size_t row = 0;
+    for (Id id : ids) {
+        const MediaItem* m = p.findMedia(id);
+        if (!m || m->kind == MediaKind::Sequence || m->kind == MediaKind::Image) continue;
+        auto& [cells, cdl] = rows[row++];
         if (anyCdl) {
-            row.push_back(cdl.first ? cdlSopText(cdl.second) : std::string());
-            row.push_back(cdl.first ? cdlNumber(cdl.second.saturation) : std::string());
+            cells.push_back(cdl.first ? cdlSopText(cdl.second) : std::string());
+            cells.push_back(cdl.first ? cdlNumber(cdl.second.saturation) : std::string());
         }
-        t.rows.push_back(row);
+        if (anyAmf) {
+            for (const char* key : {"amf_name", "amf_uuid"}) {
+                const auto it = m->metadata.find(key);
+                cells.push_back(it == m->metadata.end() ? std::string() : it->second);
+            }
+        }
+        t.rows.push_back(cells);
     }
     return t;
 }

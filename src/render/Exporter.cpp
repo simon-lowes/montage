@@ -8,6 +8,7 @@
 #include "core/ColorGroups.h"
 #include "core/ClipAnimation.h"
 #include "core/Interpretation.h"
+#include "core/Cea708.h"
 #include "core/Chapters.h"
 #include "core/Surround.h"
 
@@ -1017,10 +1018,16 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         // fed every channel.
         AVChannelLayout layout = AV_CHANNEL_LAYOUT_STEREO;
         if (!s.downmixStereo && ambisonicLayout(seq.audioLayout)) {
-            // An ambisonic field: named as one for PCM, as four speakers (4.0, in ACN order) for AAC, which knows no
-            // other four-channel layout; the SA3D box written afterwards says what they are.
-            const AVChannelLayout field = AV_CHANNEL_LAYOUT_AMBISONIC_FIRST_ORDER, quad = AV_CHANNEL_LAYOUT_4POINT0;
-            layout = s.audioCodec.rfind("pcm_", 0) == 0 ? field : quad;
+            // An ambisonic field: named as one for PCM, as four speakers (4.0, in ACN order) for AAC (first order only,
+            // exportAudioLayout), which knows no other four-channel layout; the SA3D box written afterwards says what
+            // they are.
+            if (s.audioCodec.rfind("pcm_", 0) == 0) {
+                layout = AVChannelLayout{};
+                layout.order = AV_CHANNEL_ORDER_AMBISONIC;
+                layout.nb_channels = layoutChannels(seq.audioLayout);
+            } else {
+                layout = AV_CHANNEL_LAYOUT_4POINT0;
+            }
         } else if (!s.downmixStereo && !ffmpegLayout(seq.audioLayout, layout)) {
             return "This FFmpeg cannot describe the " + seq.audioLayout + " channel layout";
         }
@@ -1048,7 +1055,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (!ok) actx->sample_fmt = fmts[0];
         }
         const bool field = !mono && !s.downmixStereo && ambisonicLayout(seq.audioLayout);
-        if (s.audioCodec == "aac" || s.audioCodec == "libopus") actx->bit_rate = s.audioBitrate * (field ? 2 : 1);  // per pair of channels
+        if (s.audioCodec == "aac" || s.audioCodec == "libopus")
+            actx->bit_rate = s.audioBitrate * (field ? layoutChannels(seq.audioLayout) / 2 : 1);  // per pair of channels
         actx->time_base = AVRational{1, actx->sample_rate};
         if (o.oc->oformat->flags & AVFMT_GLOBALHEADER) actx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         AVDictionary* opts = nullptr;
@@ -1409,14 +1417,17 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     ro.highQuality = true;
     ro.useProxies = s.useProxies;
     ro.stereoView = stereoView;
+    // A frame an effect could not finish (its model missing or failing) fails the export rather than going out without it.
+    RenderIssues issues;
+    ro.issues = &issues;
+    ro.cancel = cancel;
     // Smart rendering: only where nothing would change the source's pictures for the whole export.
     std::unique_ptr<SmartRenderer> smart;
     if (wantVideo && s.smartRender && o.vctx && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height && !seq.stereo3d &&
         !s.useProxies && !s.burnInCaptions && !s.cea608 && !s.burnIn.any() && outSpace.id == seqSpace.id && !trim)
         smart = std::make_unique<SmartRenderer>(p, seq, seqSpace, o.vctx, o.vst, s.alpha, s.profile);
-    // CEA-608 captions in the video: the pairs due in each frame's span of the 29.97 Hz line-21 clock, padding between.
-    std::vector<Cc608Pair> cc608;
-    size_t ccNext = 0;
+    // CEA-608 (and CTA-708) captions in the video: each frame's A/53 cc_data (core/Cea708.h).
+    std::vector<std::vector<CcTriplet>> ccFrames;
     if (s.cea608 && wantVideo) {
         const std::string vc = o.vctx && o.vctx->codec ? o.vctx->codec->name : "";
         if (o.vctx->codec_id != AV_CODEC_ID_H264 && o.vctx->codec_id != AV_CODEC_ID_HEVC)
@@ -1429,21 +1440,17 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                 c.end = std::min(c.end, out) - in;
                 part.push_back(std::move(c));
             }
-            cc608 = captionsTo608(part, seq.fps);
+            ccFrames = captionCcData(part, seq.fps, out - in, true, s.cea708, t->style);
+        } else {
+            ccFrames = captionCcData({}, seq.fps, out - in, true, s.cea708);
         }
     }
     auto attach608 = [&](FrameTime rel) {
         if (!s.cea608) return true;
         av_frame_remove_side_data(o.vframe, AV_FRAME_DATA_A53_CC);
-        const double rate = 30000.0 / 1001.0, fpsv = seq.fpsValue();
-        const int64_t from = int64_t(std::floor(double(rel) / fpsv * rate + 1e-6)), to = int64_t(std::floor(double(rel + 1) / fpsv * rate + 1e-6));
+        if (rel < 0 || size_t(rel) >= ccFrames.size()) return true;
         std::vector<uint8_t> cc;
-        for (int64_t slot = from; slot < to; ++slot) {
-            uint16_t pair = 0x8080;  // padding (null characters with parity)
-            while (ccNext < cc608.size() && cc608[ccNext].frame < slot) ++ccNext;
-            if (ccNext < cc608.size() && cc608[ccNext].frame == slot) pair = cc608[ccNext++].pair;
-            cc.insert(cc.end(), {uint8_t(0xfc), uint8_t(pair >> 8), uint8_t(pair & 0xff)});  // valid, field 1
-        }
+        for (const CcTriplet& t : ccFrames[size_t(rel)]) cc.insert(cc.end(), t.begin(), t.end());
         if (cc.empty()) return true;
         AVFrameSideData* sd = av_frame_new_side_data(o.vframe, AV_FRAME_DATA_A53_CC, cc.size());
         if (!sd) return false;
@@ -1521,6 +1528,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             // copied from the source
         } else if (wantVideo) {
             Image img = deliveredFrame(f);
+            if (issues.incomplete) return fail(cancel && cancel->load() ? std::string("Export cancelled") : issues.reason());
             if (measure) meter.add(img, f, measured);
             if (floatFrames && img.width == W && img.height == H) {
                 // Planar float, green-blue-red(-alpha), unpremultiplied, values above 1 kept.
@@ -1718,9 +1726,12 @@ bool exportCodecCarries(const std::string& codecName, const std::string& layout)
 
 std::string exportAudioLayout(const std::string& layout, const std::string& codec) {
     if (codec.empty() || codec == "none") return layout;
-    // An ambisonic field goes into PCM or AAC (as YouTube takes it); anything else hears it as stereo.
-    if (ambisonicLayout(layout))
-        return codec.rfind("pcm_", 0) == 0 || codec == "aac" || codec == "libfdk_aac" || codec == "aac_at" ? layout : "stereo";
+    // An ambisonic field goes into PCM, or its first order into AAC (as YouTube takes it: AAC has no layouts for 9 or
+    // 16 channels); anything else hears it as stereo.
+    if (ambisonicLayout(layout)) {
+        if (codec.rfind("pcm_", 0) == 0) return layout;
+        return codec == "aac" || codec == "libfdk_aac" || codec == "aac_at" ? "ambix" : "stereo";
+    }
     if (exportCodecCarries(codec, layout)) return layout;
     const std::string ear = earLevelLayout(layout);
     if (ear != layout && exportCodecCarries(codec, ear)) return ear;
@@ -1744,8 +1755,9 @@ bool exportCarriesCredentials(const ExportSettings& s) {
 
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
-                    LightLevels* light) {
+                    LightLevels* light, bool* keptUnsigned) {
     bool opened = false;
+    if (keptUnsigned) *keptUnsigned = false;
     if (smartRendered) *smartRendered = 0;
     if (light) *light = LightLevels{};
     if (!s.credentialCertificate.empty()) {  // (refused before rendering rather than after)
@@ -1804,7 +1816,7 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
         // The export is good either way: without the box players hear four channels rather than a field, which is no
         // reason to throw the file away.
         std::string why;
-        if ((ext == ".mp4" || ext == ".m4a" || ext == ".mov" || ext == ".m4v") && !writeSpatialAudioBox(s.path, 1, &why))
+        if ((ext == ".mp4" || ext == ".m4a" || ext == ".mov" || ext == ".m4v") && !writeSpatialAudioBox(s.path, ambisonicOrder(layout), &why))
             qWarning("Spatial audio metadata not added to %s: %s", s.path.c_str(), why.c_str());
     }
     // Never leave a truncated file behind (the output is closed by now), but
@@ -1819,6 +1831,7 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
         if (!signContentCredentials(s.path, made, {s.credentialCertificate, s.credentialKey, {}}, o, &why)) {
             // The render is kept (it may have taken hours), unsigned, and said to be: it can be signed again later.
             if (error) *error = "Could not sign it with Content Credentials (" + why + "); the export is kept, unsigned, at " + s.path;
+            if (keptUnsigned) *keptUnsigned = true;
             return false;
         }
     }

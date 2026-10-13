@@ -138,7 +138,7 @@ std::string captionsToSrt(const std::vector<Caption>& captions, Rational fps);
 std::string captionsToVtt(const std::vector<Caption>& captions, Rational fps);
 
 // Reads any of the formats below, told apart by their content: SubRip,
-// WebVTT, Scenarist SCC, TTML / IMSC / DFXP, EBU STL and ASS / SSA. Markup is removed.
+// WebVTT, Scenarist SCC, MacCaption MCC, TTML / IMSC / DFXP, EBU STL and ASS / SSA. Markup is removed.
 bool parseSubtitles(const std::string& text, Rational fps, std::vector<Caption>& out, std::string* error = nullptr);
 
 // Scenarist SCC: CEA-608 pop-on captions on channel 1 at 29.97 fps drop frame,
@@ -186,7 +186,7 @@ bool parseStl(const std::string& data, Rational fps, std::vector<Caption>& out, 
 std::string captionsToAss(const std::vector<Caption>& captions, Rational fps, const CaptionStyle& style, int width, int height);
 bool parseAss(const std::string& text, Rational fps, std::vector<Caption>& out, std::string* error = nullptr);
 
-// A caption track in the format a file extension names: srt, vtt, scc, ttml
+// A caption track in the format a file extension names: srt, vtt, scc, mcc (core/Cea708.h), ttml
 // (also xml, dfxp), stl, ass (also ssa). Empty for an unknown extension.
 bool captionFormatKnown(const std::string& extension);
 std::string exportCaptions(const CaptionTrack& track, const Sequence& seq, const std::string& extension);

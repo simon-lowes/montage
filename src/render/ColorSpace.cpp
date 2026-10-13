@@ -230,6 +230,7 @@ const std::vector<ColorSpace>& colorSpaces() {
         {"di-dwg", "DaVinci Intermediate / Wide Gamut", Primaries::DavinciWideGamut, Transfer::DavinciIntermediate, true},
         {"acescct", "ACEScct", Primaries::Ap1, Transfer::AcesCct, true},
         {"aces2065-1", "ACES2065-1 (linear AP0)", Primaries::Ap0, Transfer::Linear, true},
+        {"acescg", "ACEScg (linear AP1)", Primaries::Ap1, Transfer::Linear, true},
         {"linear-rec709", "Linear Rec.709 (scene)", Primaries::Bt709, Transfer::Linear, true},
     };
     return spaces;
@@ -450,8 +451,8 @@ void convertPixel(float rgb[3], const ColorSpace& from, const ColorSpace& to, do
     convertPixelWith(rgb, from, to, hdrPeakNits, m);
 }
 
-void convertColor(Image& img, const ColorSpace& from, const ColorSpace& to, double hdrPeakNits) {
-    if (img.empty() || from.id == to.id) return;
+std::shared_ptr<const Lut3D> conversionLut(const ColorSpace& from, const ColorSpace& to, double hdrPeakNits) {
+    if (from.id == to.id) return nullptr;
     // The whole conversion as a 65^3 LUT, built once per pair.
     static std::mutex m;
     static std::map<std::tuple<std::string, std::string, int>, std::shared_ptr<Lut3D>> cache;
@@ -478,6 +479,12 @@ void convertColor(Image& img, const ColorSpace& from, const ColorSpace& to, doub
         }
         lut = slot;
     }
+    return lut;
+}
+
+void convertColor(Image& img, const ColorSpace& from, const ColorSpace& to, double hdrPeakNits) {
+    if (img.empty() || from.id == to.id) return;
+    const std::shared_ptr<const Lut3D> lut = conversionLut(from, to, hdrPeakNits);
     parallelRows(img.height, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
             float* p = img.row(y);

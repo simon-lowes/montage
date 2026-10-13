@@ -119,7 +119,7 @@ void RenderQueue::next() {
     std::atomic<double>* progress = &progress_;
     watcher_.setFuture(QtConcurrent::run([project, seq, settings, stems, cancel, progress]() -> Result {
         Result r;
-        r.ok = renderExport(*project, seq, settings, stems, [progress](double f, FrameTime) { *progress = f; }, cancel, &r.error, &r.encoder);
+        r.ok = renderExport(*project, seq, settings, stems, [progress](double f, FrameTime) { *progress = f; }, cancel, &r.error, &r.encoder, &r.keptUnsigned);
         return r;
     }));
 }
@@ -147,9 +147,10 @@ void RenderQueue::finished() {
         } else {
             j->status = cancelled ? Status::Cancelled : Status::Failed;
             j->error = cancelled ? tr("Cancelled") : QString::fromStdString(r.error);
-            // No half-written files, but nothing the render did not write.
+            // No half-written files, but nothing the render did not write (and not a whole one only left unsigned).
             const QFileInfo out(QString::fromStdString(j->settings.path));
-            if (out.exists() && (!j->fileExisted || out.lastModified() != j->fileModified)) QFile::remove(out.filePath());
+            if (!r.keptUnsigned && out.exists() && (!j->fileExisted || out.lastModified() != j->fileModified))
+                QFile::remove(out.filePath());
         }
     }
     emit changed();

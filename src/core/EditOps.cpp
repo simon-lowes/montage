@@ -284,7 +284,7 @@ Result insert(Project& p, Sequence& s, TrackRef r, Clip clip) {
 }
 
 Result placeMedia(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcIn, double srcOut,
-                  TrackRef videoTrack, TrackRef audioTrack, bool insertMode) {
+                  TrackRef videoTrack, TrackRef audioTrack, bool insertMode, bool useVideo, bool useAudio) {
     const MediaItem* m = p.findMedia(mediaId);
     if (!m) return Result::fail("Unknown media");
     bool wantVideo = m->hasVideo || m->kind == MediaKind::Image || m->kind == MediaKind::Sequence;
@@ -294,6 +294,10 @@ Result placeMedia(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcI
         wantAudio = nested && std::any_of(nested->audioTracks.begin(), nested->audioTracks.end(),
                                           [](const Track& t) { return !t.clips.empty(); });
     }
+    if ((wantVideo || wantAudio) && !(wantVideo && useVideo) && !(wantAudio && useAudio))
+        return Result::fail(useVideo ? "The media has no picture (Video Only)" : "The media has no sound (Audio Only)");
+    wantVideo = wantVideo && useVideo;
+    wantAudio = wantAudio && useAudio;
     Track* vt = trackAt(s, videoTrack);
     Track* at_ = trackAt(s, audioTrack);
     if (wantVideo && !editable(vt)) wantVideo = false;
@@ -348,12 +352,13 @@ struct Placed {
     FrameTime length = 1;
     bool video = false, audio = false;
 };
-Placed dryPlace(const Project& p, const Sequence& s, Id mediaId, FrameTime at, double srcIn, double srcOut) {
+Placed dryPlace(const Project& p, const Sequence& s, Id mediaId, FrameTime at, double srcIn, double srcOut, bool useVideo,
+                bool useAudio) {
     Project tp = p;
     Sequence ts = s;
     const TrackRef dv = addTrack(tp, ts, TrackKind::Video), da = addTrack(tp, ts, TrackKind::Audio);
     Placed out;
-    out.result = placeMedia(tp, ts, mediaId, std::max<FrameTime>(0, at), srcIn, srcOut, dv, da, false);
+    out.result = placeMedia(tp, ts, mediaId, std::max<FrameTime>(0, at), srcIn, srcOut, dv, da, false, useVideo, useAudio);
     for (Id id : out.result.created)
         if (const Clip* c = clipById(ts, id)) out.length = std::max(out.length, c->duration);
     out.video = !trackAt(ts, dv)->clips.empty();
@@ -363,8 +368,8 @@ Placed dryPlace(const Project& p, const Sequence& s, Id mediaId, FrameTime at, d
 }  // namespace
 
 Result placeOnTop(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcIn, double srcOut, TrackRef videoTrack,
-                  TrackRef audioTrack) {
-    const Placed dry = dryPlace(p, s, mediaId, at, srcIn, srcOut);
+                  TrackRef audioTrack, bool useVideo, bool useAudio) {
+    const Placed dry = dryPlace(p, s, mediaId, at, srcIn, srcOut, useVideo, useAudio);
     if (!dry.result.ok) return dry.result;
     at = std::max<FrameTime>(0, at);
     auto freeTrack = [&](TrackKind kind, int from) {
@@ -375,27 +380,38 @@ Result placeOnTop(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcI
     };
     if (dry.video) videoTrack = freeTrack(TrackKind::Video, videoTrack.index + 1);
     if (dry.audio) audioTrack = freeTrack(TrackKind::Audio, audioTrack.index);
-    return placeMedia(p, s, mediaId, at, srcIn, srcOut, videoTrack, audioTrack, false);
+    return placeMedia(p, s, mediaId, at, srcIn, srcOut, videoTrack, audioTrack, false, useVideo, useAudio);
 }
 
 Result rippleOverwrite(Project& p, Sequence& s, Id clipId, Id mediaId, double srcIn, double srcOut, TrackRef videoTrack,
-                       TrackRef audioTrack) {
-    const Clip* c = clipById(s, clipId);
-    if (!c) return Result::fail("Unknown clip");
+                       TrackRef audioTrack, bool useVideo, bool useAudio) {
+    if (!clipById(s, clipId)) return Result::fail("Unknown clip");
+    if (!useVideo && !useAudio) useVideo = useAudio = true;
+    // The clip and its links, of the kinds edited (Video Only leaves the sound there, Audio Only the picture).
+    std::vector<Id> replaced;
+    bool kept = false;  // a linked clip of the other kind stays
+    for (Id id : linkedClips(s, clipId))
+        if (auto loc = locate(s, id)) {
+            if (loc->track.kind == TrackKind::Video ? useVideo : useAudio) replaced.push_back(id);
+            else kept = true;
+        }
+    if (replaced.empty()) return Result::fail(useVideo ? "No picture there to replace (Video Only)" : "No sound there to replace (Audio Only)");
+    const Clip* c = clipById(s, std::find(replaced.begin(), replaced.end(), clipId) != replaced.end() ? clipId : replaced.front());
     const FrameTime a = c->start, b = c->end();
-    const Placed dry = dryPlace(p, s, mediaId, a, srcIn, srcOut);
+    const Placed dry = dryPlace(p, s, mediaId, a, srcIn, srcOut, useVideo, useAudio);
     if (!dry.result.ok) return dry.result;
     // The replaced clips' tracks close up or open by the difference after the old end; other sync-locked tracks
     // follow where they can (a clip across the old end stays put).
-    const std::vector<Id> replaced = linkedClips(s, clipId);
     std::vector<TrackRef> primary;
     for (Id id : replaced)
         if (auto loc = locate(s, id); loc && std::find(primary.begin(), primary.end(), loc->track) == primary.end())
             primary.push_back(loc->track);
     Result r = removeClips(p, s, replaced, false);
     if (!r.ok) return r;
-    rippleShift(s, rippleTracks(s, primary), primary, b, dry.length - (b - a));
-    return placeMedia(p, s, mediaId, a, srcIn, srcOut, videoTrack, audioTrack, false);
+    // With the other kind kept, a shorter clip leaves a gap rather than pulling what follows out of sync with it.
+    const FrameTime delta = dry.length - (b - a);
+    rippleShift(s, rippleTracks(s, primary), primary, b, kept ? std::max<FrameTime>(0, delta) : delta);
+    return placeMedia(p, s, mediaId, a, srcIn, srcOut, videoTrack, audioTrack, false, useVideo, useAudio);
 }
 
 const std::vector<std::string> kStandardRoles{"Dialogue", "Music", "Effects"};
@@ -1392,12 +1408,18 @@ bool sequenceUses(const Project& p, Id seq, Id target) {
 }
 
 Result placeSequenceClips(Project& p, Sequence& s, Id source, FrameTime in, FrameTime out, FrameTime at, int video, int audio,
-                          bool insert) {
+                          bool insert, bool useVideo, bool useAudio) {
     const Sequence* src = p.findSequence(source);
     if (!src) return Result::fail("Unknown sequence");
     if (sequenceUses(p, source, s.id)) return Result::fail("A sequence cannot be placed inside itself");
     if (!(src->fps == s.fps)) return Result::fail("That sequence runs at another frame rate; place it as a nested clip");
-    const SequenceRange r = copySequenceRange(*src, in, out);
+    SequenceRange r = copySequenceRange(*src, in, out);
+    if (!useVideo || !useAudio) {
+        auto left = [&](const TrackRef& t) { return t.kind == TrackKind::Video ? !useVideo : !useAudio; };
+        r.clips.erase(std::remove_if(r.clips.begin(), r.clips.end(), [&](const ClipboardItem& it) { return left(it.track); }), r.clips.end());
+        r.transitions.erase(std::remove_if(r.transitions.begin(), r.transitions.end(), [&](const auto& t) { return left(t.first); }),
+                            r.transitions.end());
+    }
     if (r.clips.empty()) return Result::fail("No clips there");
     return pasteRange(p, s, r, at, video, audio, insert);
 }

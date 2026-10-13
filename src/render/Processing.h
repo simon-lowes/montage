@@ -18,6 +18,14 @@ namespace montage {
 // the footage, such as Stabilize); -1 when there is none.
 void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds = -1);
 
+namespace gpu {
+struct ColorOp;
+}
+// The GPU compositor's form of a colour effect at frame t (render/GpuCompositor.h): Color Correct, Curves, Hue Curves
+// and .cube LUTs, unmasked, appended to `out` (nothing when the effect is off or changes nothing). False for any other
+// effect, which only the CPU draws.
+bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out);
+
 // The depth of the frame being worked on (media/DepthMap.h), for depth
 // effects and depth qualifiers: set by the compositor for the effects of one
 // clip on this thread, null when there is none.
@@ -81,6 +89,13 @@ private:
 struct ColorSpace;
 // An ASC CDL effect applied to the pixels as they are (the compositor's for a CDL made in the media's own space).
 void applyCdlValues(const Effect& e, FrameTime t, Image& img);
+// The ACES gamut compression effect on pixels in `space` (the compositor's on the media as it comes, in the media's space).
+void applyAcesGamutCompress(const Effect& e, FrameTime t, const ColorSpace& space, Image& img);
+// A CDL or LUT made on the camera's picture: its Apply In a scene-referred space (a camera log, ACEScct, ACES2065-1);
+// null for any other effect. The compositor runs those first in a clip's chain on the media as it comes, in that space,
+// before the input transform renders it for display (as an AMF's looks are).
+const ColorSpace* sourceLookSpace(const Effect& e);
+void applySourceLook(const Effect& e, FrameTime t, const ColorSpace& media, Image& img);
 const ColorSpace& currentWorkingSpace();
 class WorkingSpaceScope {
 public:

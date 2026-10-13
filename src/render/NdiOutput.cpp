@@ -116,8 +116,8 @@ public:
     bool send(const VideoFrame& f, const Audio& a) override {
         NDIlib_send_instance_t sender = sender_;
         if (!sender) return false;
-        // 100 ns units, from the frame's place in the sequence.
-        const int64_t timecode = f.fps.num > 0 ? f.frame * int64_t(10000000) * f.fps.den / f.fps.num : 0;
+        // 100 ns units, from the frame's timecode (the output's frames at its rate).
+        const int64_t timecode = f.fps.num > 0 ? f.timecodeFrame * int64_t(10000000) * f.fps.den / f.fps.num : 0;
         if (a.frames > 0 && a.channels > 0) {
             planar_.assign(size_t(a.frames) * size_t(a.channels), 0.0f);
             if (a.samples)

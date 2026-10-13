@@ -54,6 +54,7 @@
 #include "ColorWarperEditor.h"
 #include "CurveEditor.h"
 #include "render/ClipAnalysis.h"
+#include "render/ColorSlice.h"
 #include "render/Compositor.h"
 #include "render/OGraf.h"
 #include "render/Ocio.h"
@@ -814,6 +815,7 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
         QFormLayout* f = addSection(QString::fromStdString(info->displayName), tools);
         if (e.type == "color_correct") addColorWheels(f, target(eid));
         if (e.type == "hdr_palette") addHdrPalette(f, *info, target(eid));
+        else if (e.type == "color_slice") addColorSlice(f, *info, target(eid));
         else addParamRows(f, *info, target(eid));
         const bool onClip = state_->sequence() && edit::clipById(*state_->sequence(), owner);
         if ((e.type == "stabilize" || e.type == "rolling_shutter") && onClip) {
@@ -1295,7 +1297,10 @@ void InspectorWidget::addEffectMenu(TrackKind kind, Id owner, int node) {
     auto* btn = new QPushButton(kind == TrackKind::Video ? tr("Add Video Effect…") : tr("Add Audio Effect…"), content_);
     auto* menu = new QMenu(btn);
     std::map<std::string, QMenu*> groups;
+    // A shared node's menu leaves out the effects that run before the grade (they go on a clip, outside its nodes).
+    const bool sharedNode = state_->sequence() && findSharedNode(*state_->sequence(), owner);
     for (const EffectInfo* info : effectsInCategory(kind == TrackKind::Video ? EffectCategory::VideoFilter : EffectCategory::AudioFilter)) {
+        if (sharedNode && runsBeforeGrade(info->type)) continue;
         QMenu*& g = groups[info->group];
         if (!g) g = menu->addMenu(QString::fromStdString(info->group));
         std::string type = info->type;
@@ -1312,8 +1317,9 @@ void InspectorWidget::addEffectMenu(TrackKind kind, Id owner, int node) {
                 // filter (outside any colour node).
                 if (type == "stabilize" || type == "rolling_shutter" || type == "lens_correction") {
                     chain->insert(chain->begin(), e);
-                } else if (node) {
-                    // Into the colour node, after its own effects.
+                } else if (node && !runsBeforeGrade(type)) {
+                    // Into the colour node, after its own effects (those working on the picture as it comes stay outside,
+                    // after the clip's).
                     e.node = node;
                     auto at = chain->end();
                     for (auto it = chain->begin(); it != chain->end(); ++it)
@@ -1524,6 +1530,32 @@ void InspectorWidget::addHdrPalette(QFormLayout* form, const EffectInfo& info, c
     h->addWidget(addWheel(row, zone->currentText(), {prefix + "_r", prefix + "_g", prefix + "_b"}, 0.5, 0, target), 2);
     h->addStretch(1);
     form->addRow(row);
+    for (const std::string& n : names)
+        for (const ParamInfo& pi : info.params)
+            if (pi.name == n) addParamRow(form, pi, target);
+}
+
+void InspectorWidget::addColorSlice(QFormLayout* form, const EffectInfo& info, const Target& target) {
+    // One vector at a time (Global, the six hues, Skin): its hue, saturation and density.
+    auto* vector = new QComboBox(content_);
+    vector->setObjectName(QStringLiteral("sliceVector"));
+    vector->addItem(tr("Global"));
+    for (const HueVector& v : colorSliceVectors()) vector->addItem(tr(v.label));
+    vector->addItem(tr("Skin"));
+    sliceVector_ = std::clamp(sliceVector_, 0, vector->count() - 1);
+    vector->setCurrentIndex(sliceVector_);
+    connect(vector, &QComboBox::currentIndexChanged, this, [this](int i) {
+        sliceVector_ = i;
+        QTimer::singleShot(0, this, [this] { rebuild(); });  // not while the combo box is still signalling
+    });
+    form->addRow(tr("Vector"), vector);
+    std::vector<std::string> names{"density", "depth", "saturation", "subtractive", "protect_highlights", "mix"};
+    if (sliceVector_ > 0) {
+        const bool skin = sliceVector_ > int(colorSliceVectors().size());
+        const std::string prefix = skin ? "skin" : colorSliceVectors()[size_t(sliceVector_ - 1)].name;
+        names = {prefix + "_hue", prefix + "_saturation", prefix + "_density"};
+        if (skin) names.insert(names.end(), {"skin_centre", "skin_width"});
+    }
     for (const std::string& n : names)
         for (const ParamInfo& pi : info.params)
             if (pi.name == n) addParamRow(form, pi, target);

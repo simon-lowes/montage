@@ -825,7 +825,10 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     };
     for (Track& t : s.videoTracks)
         for (Clip& c : t.clips) {
-            if (!c.grade.empty() && !validGrade(c.grade)) edit::flattenGrade(s, c.id);
+            if (!c.grade.empty() && !validGrade(c.grade)) {
+                c.effects = flattenedEffects(s, c);  // (repeated ids made fresh once the project's ids are known)
+                c.grade = {};
+            }
             settle(c.effects, c.grade);
             for (GradeVersion& v : c.gradeVersions) settle(v.effects, v.grade);
         }
@@ -884,7 +887,7 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
                      {"name", qs(p.name)},
                      {"activeSequence", double(p.activeSequence)},
                      {"nextId", double(p.nextId)},
-                     {"mediaStereo", 1}};  // the media's stereo packing is recorded
+                     {"mediaStereo", 2}};  // the media's stereo packing is recorded (2: MV-HEVC's too)
     QJsonArray media;
     for (const auto& m : p.media) {
         QJsonObject o{{"id", double(m.id)},
@@ -1008,7 +1011,7 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
     p.name = ss(root.value("name"));
     p.activeSequence = Id(i64(root.value("activeSequence")));
     p.nextId = Id(i64(root.value("nextId"), 1));
-    p.stereoChecked = root.value("mediaStereo").toInt() >= 1;
+    p.stereoChecked = root.value("mediaStereo").toInt() >= 2;
     for (const auto& mv : root.value("media").toArray()) {
         QJsonObject o = mv.toObject();
         MediaItem m;
@@ -1147,6 +1150,10 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         }
     }
     p.nextId = std::max(p.nextId, maxId + 1);
+    // An effect id repeated in a clip (a graph flattened above, or saved so) given a fresh one.
+    for (Sequence& s : p.sequences)
+        for (Track& t : s.videoTracks)
+            for (Clip& c : t.clips) separateEffectIds(p, s, c);
     out = std::move(p);
     return true;
 }
