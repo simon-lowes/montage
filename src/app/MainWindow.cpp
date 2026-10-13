@@ -4149,8 +4149,9 @@ void MainWindow::setColourReference() {
     }
     // Named after the top clip with a picture at the playhead.
     colourRefName_ = QString::fromStdString(s->name);
+    const std::vector<bool> mattes = hiddenMatteTracks(*s, t);
     for (int i = int(s->videoTracks.size()) - 1; i >= 0; --i)
-        if (const Clip* c = edit::clipAt(*s, TrackRef{TrackKind::Video, i}, t); c && !s->videoTracks[size_t(i)].muted) {
+        if (const Clip* c = edit::clipAt(*s, TrackRef{TrackKind::Video, i}, t); c && !s->videoTracks[size_t(i)].muted && !mattes[size_t(i)]) {
             colourRefName_ = QString::fromStdString(c->name);
             break;
         }

@@ -749,8 +749,8 @@ void MonitorPanel::updateLookAround() {
     if (s)
         for (Id id : state_->selectedClips())
             if (const Clip* c = edit::clipById(*s, id); c && c->contains(t))
-                for (const Effect& e : c->effects)
-                    if (e.type == "reframe_360" && e.enabled) lookClip_ = id;
+                for (const Effect* e : liveEffects(*s, *c))
+                    if (e->type == "reframe_360") lookClip_ = id;
     if (!state_->inGesture() || !lookClip_) viewer_->setLookAround(lookClip_ != 0);
 }
 

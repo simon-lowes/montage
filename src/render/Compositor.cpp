@@ -444,6 +444,8 @@ double effectPixelScale(const Clip& c, FrameTime lt, double sx, double mw, int s
     return srcWidth / std::max(1.0, mw * fitX);
 }
 
+}  // namespace
+
 // The clip's effects that take part, in order: its own that are on and outside its grade graph or in a node of it that
 // is on and feeds the output, and then the effects of the shared nodes it shows there. Effects that work on the picture
 // as it comes (Video NR, Super Scale, Motion Deblur, Reframe 360, Redact Faces, Stereo 3D, Motion Blur, Deflicker)
@@ -470,6 +472,8 @@ std::vector<const Effect*> liveEffects(const Sequence& seq, const Clip& c) {
                     if (e.enabled) out.push_back(&e);
     return out;
 }
+
+namespace {
 
 const Effect* enabledEffect(const Sequence& seq, const Clip& c, const char* type) {
     if (c.grade.empty()) {  // (the common case, without building a list)
@@ -1050,15 +1054,16 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 }
             // A CDL made in the media's own space (an on-set grade on camera log) grades the picture as it comes, before the
             // input transform's display rendering.
+            // (Not one in a grade node: it runs there, with the node's window, key and switch.)
             for (const Effect& e : c.effects)
-                if (!sourceCdl && e.enabled && e.type == "cdl" && e.s("space") == mediaColorSpace(*m).label) {
+                if (!sourceCdl && e.enabled && e.node == 0 && e.type == "cdl" && e.s("space") == mediaColorSpace(*m).label) {
                     sourceCdl = &e;
                     applyCdlValues(e, lt, src);
                 }
             // The ACES gamut compression too: on the colours the camera saw, before the input transform clips what is outside
             // the working gamut (and as it comes after the camera's own transform in ACES, in AP1).
             for (const Effect& e : c.effects)
-                if (!sourceRgc && e.enabled && e.type == "aces_gamut_compress" && !hasMask(e, lt)) {
+                if (!sourceRgc && e.enabled && e.node == 0 && e.type == "aces_gamut_compress" && !hasMask(e, lt)) {
                     sourceRgc = &e;
                     applyAcesGamutCompress(e, lt, from, src);
                 }

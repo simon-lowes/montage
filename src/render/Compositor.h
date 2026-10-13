@@ -63,6 +63,10 @@ struct RenderOptions {
 // nothing is on screen; call flattenOver() to put it over black.
 Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o);
 
+// The clip's effects that take part, in order: its own that are on and outside its grade graph or in a node of it that
+// is on and feeds the output, then the effects of the shared nodes it shows there.
+std::vector<const Effect*> liveEffects(const Sequence& seq, const Clip& c);
+
 // The video tracks a Track Matte Key hides at t (they are its mattes, not seen themselves).
 std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t);
 

@@ -410,16 +410,20 @@ void Scheduler::sendLoop() {
         vf.format = signal_.format;
         vf.data = last->data.data();
         vf.frame = lastFrame >= 0 ? lastFrame : pos;
-        // RP188 counts the output's frames: the program's time at the mode's rate, running on a frame a tick while
-        // playing and within a few frames of it (a 24p sequence on a 60p output would otherwise step 2 or 3 at once).
+        // RP188 counts the output's frames: the program's time at the mode's rate (of the frame due, so a late one
+        // repeated does not hold it back), running on a frame a tick in the direction played while playing at normal
+        // speed and within a few frames of it (a 24p sequence on a 60p output would otherwise step 2 or 3 at once).
         if (std::fabs(modeFps - seqFps) < 1e-6) {
             tcFrame = vf.frame;
+            tcRunning = false;
         } else {
-            const FrameTime at = FrameTime(std::floor(double(vf.frame) * modeFps / std::max(1e-6, seqFps) + 1e-6));
-            tcFrame = playing && tcRunning && std::llabs(tcFrame + 1 - at) <= 3 ? tcFrame + 1 : at;
+            const FrameTime at = FrameTime(std::floor(double(playing ? target : vf.frame) * modeFps / std::max(1e-6, seqFps) + 1e-6));
+            const int step = speed == 1 ? 1 : speed == -1 ? -1 : 0;
+            tcFrame = step && tcRunning && std::llabs(tcFrame + step - at) <= 3 ? tcFrame + step : at;
+            tcRunning = step != 0;
         }
-        tcRunning = playing;
         vf.timecode = timecodeOf(tcFrame, mode_.fps);
+        vf.timecodeFrame = tcFrame;
         vf.fps = mode_.fps;
         Audio a;
         a.samples = audio.empty() ? nullptr : audio.data();

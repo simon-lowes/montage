@@ -514,7 +514,8 @@ bool releaseClaim(const QDir& d, const std::string& token) {
     const QByteArray held = f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
     f.close();
     if (held != QByteArray::fromStdString(token)) {
-        QFile::rename(aside, claim);  // (another's: given back to it)
+        // (Another's: given back to it; when a node claimed the job meanwhile, that claim stands and this one goes.)
+        if (!QFile::rename(aside, claim)) QFile::remove(aside);
         return false;
     }
     QFile::remove(d.filePath(QStringLiteral("status.json")));
@@ -564,14 +565,18 @@ struct Node {
     // Whether this node still holds the job's claim (another may have taken it back while this one was silent). Its
     // claim counts while another node has it aside for a moment, checking whether it was the stale one.
     bool holds(const QDir& d) const {
+        const QString claim = d.filePath(QStringLiteral("claim"));
         auto mine = [&](const QString& path) {
             QFile f(path);
             return f.open(QIODevice::ReadOnly) && f.readAll() == QByteArray::fromStdString(token);
         };
-        if (mine(d.filePath(QStringLiteral("claim")))) return true;
+        if (mine(claim)) return true;
+        if (QFileInfo::exists(claim)) return false;  // another node's
+        // No claim: one aside holding this node's token counts while there is still none (a claim made meanwhile is
+        // another's, and wins); the claim is read again after, as it may have been put back while looking.
         for (const QString& f : d.entryList({QStringLiteral(".claim-*")}, QDir::Files | QDir::Hidden))
-            if (mine(d.filePath(f))) return true;
-        return false;
+            if (mine(d.filePath(f))) return !QFileInfo::exists(claim) || mine(claim);
+        return mine(claim);
     }
 
     // Jobs whose node stopped answering wait again.

@@ -209,10 +209,12 @@ void ClipStripPanel::requestThumbnails() {
 void ClipStripPanel::markCurrent() {
     const Sequence* s = state_->sequence();
     if (!s) return;
-    // The top picture clip at the playhead.
+    // The top picture clip at the playhead (not a track matte's hidden source).
     Id current = 0;
+    const std::vector<bool> mattes = hiddenMatteTracks(*s, state_->playhead());
     for (int i = int(s->videoTracks.size()) - 1; i >= 0 && !current; --i)
-        if (const Clip* c = edit::clipAt(*s, TrackRef{TrackKind::Video, i}, state_->playhead()); c && keys_.contains(c->id)) current = c->id;
+        if (!mattes[size_t(i)])
+            if (const Clip* c = edit::clipAt(*s, TrackRef{TrackKind::Video, i}, state_->playhead()); c && keys_.contains(c->id)) current = c->id;
     const QSignalBlocker b(list_);
     for (int i = 0; i < list_->count(); ++i)
         if (Id(list_->item(i)->data(Qt::UserRole).toULongLong()) == current) {

@@ -996,7 +996,9 @@ void ExportDialog::stopAndWait() {
     const Result r = watcher_.result();
     if (r.ok)
         state_->message(tr("Exported %1").arg(QDir::toNativeSeparators(exportPath_)));
-    else if (!r.keptUnsigned)
+    else if (r.keptUnsigned)
+        state_->message(r.error, 10000);
+    else
         removePartialFile();
 }
 

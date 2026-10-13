@@ -5531,7 +5531,9 @@ colorspaces:
         for (GradeNode& n : clip().grade.nodes)
             if (n.kind == "layer") n.blend = {"multiply"};
         QVERIFY2(near(at(s, 8, 18), plain * inverted) || std::fabs(at(s, 8, 18) - plain * inverted) < 0.02f, qPrintable(QString::number(at(s, 8, 18))));
-        // The mixer's key is where its layers are: a node outside it grades the rest (the right), not nothing.
+        // The mixer's key is where its inputs are (here the base node chooses the left too, changing nothing): a node
+        // outside it grades the rest (the right), not nothing.
+        clip().effects.push_back(half(1, true));
         int mixer = 0;
         for (GradeNode& n : clip().grade.nodes)
             if (n.kind == "layer") n.blend = {"normal"}, mixer = n.key;
@@ -6093,6 +6095,12 @@ colorspaces:
         QCOMPARE(dev->sent().back().timecode.frames, 12);
         QVERIFY(sendNext(6));
         QCOMPARE(dev->sent().back().timecode.frames, 13);
+        // Played backwards it counts down.
+        sched.setPosition(6, -1);
+        QVERIFY(sendNext(6));
+        QCOMPARE(dev->sent().back().timecode.frames, 12);
+        QVERIFY(sendNext(6));
+        QCOMPARE(dev->sent().back().timecode.frames, 11);
         sched.stop();
         s.colorSpace = "rec2100pq";  // (HDR is not sent in 8 bits)
         cfg.depth = 8;
