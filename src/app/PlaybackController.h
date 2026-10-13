@@ -64,6 +64,9 @@ public:
     // Also render HDR sequences as light for the HDR viewer (hdrFrameRendered), beside their SDR pictures.
     void setHdrOutput(bool on);
     bool hdrOutput() const { return hdrOutput_; }
+    // Draw the program frames on the GPU where it can (render/GpuCompositor.h; the rest on the CPU as before).
+    void setGpuRendering(bool on);
+    bool gpuRendering() const { return gpu_; }
 
     // Reference output (render/ReferenceOutput.h): every frame rendered also goes to `out` (in the sequence's own
     // colour space, at its render scale, the render cache bypassed), with the playhead and the sound heard; null: none.
@@ -154,6 +157,7 @@ private:
     StereoView stereoView_ = StereoView::Left;
     std::string trimTarget_;
     bool hdrOutput_ = false;
+    bool gpu_ = false;
     double speed_ = 0;
     bool loop_ = false;
     FrameTime position_ = 0;

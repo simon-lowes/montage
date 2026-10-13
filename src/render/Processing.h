@@ -18,6 +18,14 @@ namespace montage {
 // the footage, such as Stabilize); -1 when there is none.
 void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds = -1);
 
+namespace gpu {
+struct ColorOp;
+}
+// The GPU compositor's form of a colour effect at frame t (render/GpuCompositor.h): Color Correct, Curves, Hue Curves
+// and .cube LUTs, unmasked, appended to `out` (nothing when the effect is off or changes nothing). False for any other
+// effect, which only the CPU draws.
+bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out);
+
 // The depth of the frame being worked on (media/DepthMap.h), for depth
 // effects and depth qualifiers: set by the compositor for the effects of one
 // clip on this thread, null when there is none.

@@ -21,6 +21,7 @@
 #include "FilmLook.h"
 #include "StyleFx.h"
 #include "Deconvolve.h"
+#include "GpuCompositor.h"
 #include "QualityCheck.h"
 #include "media/Tracking.h"
 #include "media/FaceTracks.h"
@@ -87,37 +88,59 @@ float toneShift(float l, float highlights, float shadows, float whites, float bl
     return l + 0.25f * (shadows * bump(x, 0.25f, 0.4f) + highlights * bump(x, 0.75f, 0.4f)) + 0.15f * (blacks * wBlacks + whites * wWhites);
 }
 
-void colorCorrect(const Effect& e, FrameTime t, Image& img) {
-    const float exposure = std::pow(2.0f, float(e.p("exposure", t)));
-    const float contrast = float(e.p("contrast", t, 1));
-    const float pivot = float(e.p("pivot", t, 0.435));
-    const float sat = float(e.p("saturation", t, 1));
+// Color Correct's settings at a frame, as the pixels use them (here and on the GPU, render/GpuCompositor.h).
+struct ColorCorrectSetup {
+    float exposure, contrast, pivot, sat, offset, vibrance;
+    float lift[3], gam[3], gain[3], wb[3];
+    bool tone;
+    static constexpr int kTone = 1024;
+    std::array<float, kTone + 1> toneLut{};  // luma after the tone controls, as a table over 0..2, kept rising
+};
+
+ColorCorrectSetup colorCorrectSetup(const Effect& e, FrameTime t) {
+    ColorCorrectSetup s;
+    s.exposure = std::pow(2.0f, float(e.p("exposure", t)));
+    s.contrast = float(e.p("contrast", t, 1));
+    s.pivot = float(e.p("pivot", t, 0.435));
+    s.sat = float(e.p("saturation", t, 1));
     const float temp = float(e.p("temperature", t)) / 100.0f;
     const float tint = float(e.p("tint", t)) / 100.0f;
-    const float offset = float(e.p("offset", t));
+    s.offset = float(e.p("offset", t));
     const float liftM = float(e.p("lift", t)), gammaM = float(e.p("gamma", t)), gainM = float(e.p("gain", t, 1));
-    const float lift[3] = {liftM + float(e.p("lift_r", t)), liftM + float(e.p("lift_g", t)), liftM + float(e.p("lift_b", t))};
-    const float gam[3] = {std::pow(2.0f, gammaM + float(e.p("gamma_r", t))),
-                          std::pow(2.0f, gammaM + float(e.p("gamma_g", t))),
-                          std::pow(2.0f, gammaM + float(e.p("gamma_b", t)))};
-    const float gain[3] = {gainM * float(e.p("gain_r", t, 1)), gainM * float(e.p("gain_g", t, 1)),
-                           gainM * float(e.p("gain_b", t, 1))};
+    const char* channel[3] = {"_r", "_g", "_b"};
+    for (int i = 0; i < 3; ++i) {
+        s.lift[i] = liftM + float(e.p(std::string("lift") + channel[i], t));
+        s.gam[i] = std::pow(2.0f, gammaM + float(e.p(std::string("gamma") + channel[i], t)));
+        s.gain[i] = gainM * float(e.p(std::string("gain") + channel[i], t, 1));
+    }
     // White balance as channel multipliers (normalised to keep luma roughly constant).
-    float wb[3] = {1 + 0.3f * temp + 0.1f * tint, 1 - 0.25f * tint, 1 - 0.3f * temp + 0.1f * tint};
-    float wl = luma(wb[0], wb[1], wb[2]);
-    for (float& w : wb) w /= wl;
+    s.wb[0] = 1 + 0.3f * temp + 0.1f * tint, s.wb[1] = 1 - 0.25f * tint, s.wb[2] = 1 - 0.3f * temp + 0.1f * tint;
+    const float wl = luma(s.wb[0], s.wb[1], s.wb[2]);
+    for (float& w : s.wb) w /= wl;
     const float highlights = float(e.p("highlights", t)) / 100, shadows = float(e.p("shadows", t)) / 100;
     const float whites = float(e.p("whites", t)) / 100, blacks = float(e.p("blacks", t)) / 100;
-    const float vibrance = float(e.p("vibrance", t)) / 100;
-    const bool tone = highlights != 0 || shadows != 0 || whites != 0 || blacks != 0;
+    s.vibrance = float(e.p("vibrance", t)) / 100;
+    s.tone = highlights != 0 || shadows != 0 || whites != 0 || blacks != 0;
     // As a table over 0..2, kept rising, so no setting can turn tones over.
-    constexpr int kTone = 1024;
-    std::array<float, kTone + 1> toneLut{};
-    if (tone)
-        for (int i = 0; i <= kTone; ++i) {
-            toneLut[size_t(i)] = toneShift(2.0f * float(i) / kTone, highlights, shadows, whites, blacks);
-            if (i) toneLut[size_t(i)] = std::max(toneLut[size_t(i)], toneLut[size_t(i - 1)]);
+    if (s.tone)
+        for (int i = 0; i <= s.kTone; ++i) {
+            s.toneLut[size_t(i)] = toneShift(2.0f * float(i) / s.kTone, highlights, shadows, whites, blacks);
+            if (i) s.toneLut[size_t(i)] = std::max(s.toneLut[size_t(i)], s.toneLut[size_t(i - 1)]);
         }
+    return s;
+}
+
+void colorCorrect(const Effect& e, FrameTime t, Image& img) {
+    const ColorCorrectSetup cs = colorCorrectSetup(e, t);
+    const float exposure = cs.exposure, contrast = cs.contrast, pivot = cs.pivot, sat = cs.sat, offset = cs.offset;
+    const float* lift = cs.lift;
+    const float* gam = cs.gam;
+    const float* gain = cs.gain;
+    const float* wb = cs.wb;
+    const float vibrance = cs.vibrance;
+    const bool tone = cs.tone;
+    constexpr int kTone = ColorCorrectSetup::kTone;
+    const auto& toneLut = cs.toneLut;
     auto toneAt = [&](float l) {
         if (l <= 0) return l + toneLut[0];
         if (l >= 2) return l - 2 + toneLut[kTone];
@@ -2801,6 +2824,72 @@ void applyAcesGamutCompress(const Effect& e, FrameTime t, const ColorSpace& spac
         rgc(v);
         r = v[0], g = v[1], b = v[2];
     });
+}
+
+bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out) {
+    if (!e.enabled) return true;
+    if (hasMask(e, t)) return false;
+    gpu::ColorOp op;
+    if (e.type == "color_correct") {
+        const ColorCorrectSetup s = colorCorrectSetup(e, t);
+        op.kind = gpu::ColorOp::ColorCorrect;
+        // In gpucolor.frag's order: p[1] exposure, contrast, pivot, saturation; p[2] offset, vibrance, tone; p[3..6]
+        // lift, gamma, gain, white balance.
+        const float head[8] = {s.exposure, s.contrast, s.pivot, s.sat, s.offset, s.vibrance, s.tone ? 1.0f : 0.0f, 0};
+        std::copy(head, head + 8, op.params);
+        for (int i = 0; i < 3; ++i) {
+            op.params[8 + i] = s.lift[i];
+            op.params[12 + i] = s.gam[i];
+            op.params[16 + i] = s.gain[i];
+            op.params[20 + i] = s.wb[i];
+        }
+        op.tableWidth = ColorCorrectSetup::kTone + 1;
+        op.table.assign(size_t(op.tableWidth) * 4, 0.0f);
+        for (int i = 0; i < op.tableWidth; ++i) op.table[size_t(i) * 4] = s.toneLut[size_t(i)];
+    } else if (e.type == "curves") {
+        op.kind = gpu::ColorOp::Curves;
+        const std::vector<float> c[4] = {buildCurve(e.s("master", "0,0 1,1")), buildCurve(e.s("red", "0,0 1,1")),
+                                         buildCurve(e.s("green", "0,0 1,1")), buildCurve(e.s("blue", "0,0 1,1"))};
+        op.params[0] = float(e.p("mix", t, 100)) / 100.0f;
+        op.tableWidth = int(c[0].size());
+        op.table.resize(size_t(op.tableWidth) * 4);
+        for (int i = 0; i < op.tableWidth; ++i)
+            for (int k = 0; k < 4; ++k) op.table[size_t(i) * 4 + size_t(k)] = c[k][size_t(i)];
+    } else if (e.type == "hue_curves") {
+        const std::string hh = e.s("hue_hue"), hs = e.s("hue_sat"), hl = e.s("hue_luma"), ls = e.s("luma_sat"), ss = e.s("sat_sat");
+        if (hh.empty() && hs.empty() && hl.empty() && ls.empty() && ss.empty()) return true;  // (nothing to do)
+        op.kind = gpu::ColorOp::HueCurves;
+        const std::vector<float> c[5] = {buildFlatCurve(hh, 360, true), buildFlatCurve(hs, 360, true), buildFlatCurve(hl, 360, true),
+                                         buildFlatCurve(ls, 360, false), buildFlatCurve(ss, 360, false)};
+        op.params[0] = float(std::clamp(e.p("mix", t, 100) / 100.0, 0.0, 1.0));
+        op.tableWidth = 361;
+        op.table.assign(size_t(op.tableWidth) * 8, 0.0f);  // two rows
+        for (int i = 0; i < op.tableWidth; ++i) {
+            for (int k = 0; k < 4; ++k) op.table[size_t(i) * 4 + size_t(k)] = c[k][size_t(i)];
+            op.table[size_t(op.tableWidth + i) * 4] = c[4][size_t(i)];
+        }
+    } else if (e.type == "lut") {
+        const std::string path = e.s("path");
+        if (path.empty()) return true;
+        const QString name = QString::fromStdString(path);
+        if (name.endsWith(QLatin1String(".clf"), Qt::CaseInsensitive) || name.endsWith(QLatin1String(".ctf"), Qt::CaseInsensitive))
+            return false;  // (CLF transforms run on the CPU)
+        auto lut = loadCubeLut(path, nullptr);
+        if (!lut) return true;  // (unreadable: the CPU leaves the picture alone too)
+        op.kind = gpu::ColorOp::Lut;
+        op.strength = float(e.p("strength", t, 100)) / 100.0f;
+        op.lut = lut;
+        if (const ColorSpace* space = applyInSpace(e)) {
+            const QFileInfo fi(name);
+            op.lut = bakedInSpace(*space, "lut|" + path + "|" + std::to_string(fi.size()) + "|" + std::to_string(fi.lastModified().toMSecsSinceEpoch()),
+                                  [lut](float v[3]) { lut->apply(v[0], v[1], v[2]); });
+            op.clampFirst = true;
+        }
+    } else {
+        return false;
+    }
+    out.push_back(std::move(op));
+    return true;
 }
 
 }  // namespace montage

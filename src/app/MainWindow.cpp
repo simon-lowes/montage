@@ -178,6 +178,7 @@
 #include "render/ClipAnalysis.h"
 #include "render/RenderCache.h"
 #include "render/Compositor.h"
+#include "render/GpuCompositor.h"
 #include "render/AutoBroll.h"
 #include "render/Highlights.h"
 #include "render/Shorts.h"
@@ -1882,6 +1883,28 @@ void MainWindow::buildMenus() {
         a->setChecked(hw);
         a->setToolTip(tr("Decode H.264, HEVC, VP9, AV1 and ProRes on the GPU or media engine "
                          "(VideoToolbox, D3D11, NVDEC, VAAPI) where supported"));
+        // GPU rendering (on by default where there is a GPU; MONTAGE_GPU=off overrides it): the program monitor's frames
+        // are composited and graded on the GPU, what it cannot draw on the CPU as before.
+        std::string why;
+        const bool hasGpu = gpu::initialize(&why);
+        const bool onGpu = hasGpu && appSettings().value("playback/gpuRendering", true).toBool();
+        program_->setGpuRendering(onGpu);
+        QAction* g = add(play, tr("&GPU Rendering"), QKeySequence(), [this](bool on) {
+            program_->setGpuRendering(on);
+            appSettings().setValue("playback/gpuRendering", on);
+            statusBar()->showMessage(on ? tr("GPU rendering on (%1): layers, transforms and colour effects draw on the GPU")
+                                              .arg(QString::fromStdString(gpu::deviceName()))
+                                        : tr("GPU rendering off: frames render on the CPU"),
+                                     5000);
+        });
+        g->setObjectName(QStringLiteral("gpuRendering"));
+        g->setCheckable(true);
+        g->setChecked(onGpu);
+        g->setEnabled(hasGpu);
+        g->setToolTip(hasGpu ? tr("Composite and grade the program monitor's frames on the GPU (%1); effects it has no "
+                                  "GPU form for render on the CPU")
+                                   .arg(QString::fromStdString(gpu::deviceName()))
+                             : tr("No GPU rendering: %1").arg(QString::fromStdString(why)));
         play->addSeparator();
     }
     trimView_ = add(play, tr("Two-Up Trim View"), QKeySequence(), [](bool on) { appSettings().setValue("playback/twoUpTrim", on); });

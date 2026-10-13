@@ -3,6 +3,7 @@
 // converted when a clip's media enters a sequence whose colour space differs.
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -10,6 +11,8 @@
 #include "media/Image.h"
 
 namespace montage {
+
+struct Lut3D;  // (render/Processing.h)
 
 enum class Transfer {
     Bt1886,   // SDR video (gamma 2.4 display)
@@ -80,6 +83,8 @@ void primariesToXyz(Primaries p, double m[9]);
 // SDR placed in HDR puts SDR white at 203 nits (BT.2408); scene-referred
 // sources get a filmic display rendering.
 void convertColor(Image& img, const ColorSpace& from, const ColorSpace& to, double hdrPeakNits = 1000);
+// That conversion as the 65^3 LUT it runs through (on colour clamped to 0..1), kept per pair; null for the same space.
+std::shared_ptr<const Lut3D> conversionLut(const ColorSpace& from, const ColorSpace& to, double hdrPeakNits = 1000);
 
 // Light in cd/m² (nits) for display spaces: PQ as coded, HLG on a 1000-nit display (its OOTF), SDR with white at
 // 100 nits. A neutral code value's light and back (scope graticules); `nits` below 0 for camera log and linear.

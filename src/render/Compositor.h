@@ -54,6 +54,8 @@ struct RenderOptions {
     // Effects that take seconds a frame (Motion Deblur) run in deliveries (highQuality) and when this is set (rendering
     // previews ahead); otherwise a result already made for the frame is used, else the frame goes without them.
     bool slowEffects = false;
+    // Program frames drawn on the GPU (render/GpuCompositor.h) where it can draw them, the CPU otherwise.
+    bool gpu = false;
     RenderIssues* issues = nullptr;               // told when a frame is not rendered in full
     const std::atomic<bool>* cancel = nullptr;    // stops a slow effect part way (the frame is then not final)
 };
@@ -72,6 +74,8 @@ std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t);
 
 // Same, flattened over black — what the program monitor and exports show.
 Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o);
+// Same as 8-bit RGBA (as toRgba8 makes it), for showing: from the GPU without a float frame in between when o.gpu.
+QImage renderProgramFrameRgba8(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o);
 
 // Maps between a clip's own frame (u, v as fractions of its media frame, as
 // masks use) and the sequence frame (pixels) at timeline frame t, following

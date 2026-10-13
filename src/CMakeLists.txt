@@ -172,6 +172,7 @@ add_library(montage_engine STATIC
   render/HdrView.h render/HdrView.cpp
   render/Ocio.h render/Ocio.cpp
   render/Compositor.h render/Compositor.cpp
+  render/GpuCompositor.h render/GpuCompositor.cpp
   render/OGraf.h render/OGraf.cpp
   render/Gallery.h render/Gallery.cpp
   render/TrimPasses.h render/TrimPasses.cpp
@@ -230,6 +231,23 @@ endif()
 target_compile_definitions(montage_engine PUBLIC MONTAGE_VERSION="${PROJECT_VERSION}")
 target_link_libraries(montage_engine PUBLIC Qt6::Core Qt6::Gui Qt6::Xml PkgConfig::FFMPEG Threads::Threads ${CMAKE_DL_LIBS})
 target_link_libraries(montage_engine PRIVATE Qt6::Network)  # (OGraf graphics: the browser's DevTools socket)
+# The GPU compositor (render/GpuCompositor.h): Qt's RHI, public from Qt 6.6 (in the private GUI module, which Qt 6.9 and
+# later only load when asked for by name). Older Qt builds render on the CPU, as before.
+if(MONTAGE_GPU AND Qt6_VERSION VERSION_GREATER_EQUAL 6.6)
+  if(NOT TARGET Qt6::GuiPrivate)
+    set(QT_NO_PRIVATE_MODULE_WARNING ON)
+    find_package(Qt6 QUIET COMPONENTS GuiPrivate)
+  endif()
+  if(TARGET Qt6::GuiPrivate)
+    target_link_libraries(montage_engine PRIVATE Qt6::GuiPrivate)
+    target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_GPU)
+    message(STATUS "GPU compositor: on (Qt ${Qt6_VERSION})")
+  else()
+    message(STATUS "GPU compositor: off (Qt's private GUI module was not found)")
+  endif()
+else()
+  message(STATUS "GPU compositor: off (Qt ${Qt6_VERSION}; it needs 6.6 or later)")
+endif()
 if(APPLE)
   target_sources(montage_engine PRIVATE audio/AuHost.cpp)
   target_link_libraries(montage_engine PUBLIC "-framework AudioToolbox" "-framework CoreFoundation" "-framework CoreMIDI" "-framework IOKit")

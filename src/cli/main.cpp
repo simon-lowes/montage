@@ -5,6 +5,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QGuiApplication>
+#include <QImage>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -65,6 +66,7 @@
 #endif
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
+#include "render/GpuCompositor.h"
 #include "render/Exporter.h"
 #include "render/RenderFarm.h"
 
@@ -115,7 +117,7 @@ int usage() {
                  "  montage-cli xml <project.montage> [-o out.xml]       (Final Cut Pro 7 XML)\n"
                  "  montage-cli fcpxml <project.montage> [-o out.fcpxml]\n"
                  "  montage-cli import <timeline.xml|.fcpxml|.otio|.edl> -o <project.montage> [--fps N]\n"
-                 "  montage-cli bench <project.montage> [--scale 0.5] [--frames 120]\n"
+                 "  montage-cli bench <project.montage> [--scale 0.5] [--frames 120] [--gpu]\n"
                  "  montage-cli transcribe <media> [--model base.en|PATH] [--language auto|en|...] [--translate] [--speakers [N]]\n"
                  "                     [--srt out.srt] [--vtt out.vtt] [--json out.json] [--txt out.txt]\n"
                  "  montage-cli models\n"
@@ -753,22 +755,42 @@ int cmdBench(const std::vector<std::string>& args) {
     if (args.empty()) return usage();
     double scale = 0.5;
     int frames = 120;
+    bool onGpu = false;
     for (size_t i = 1; i < args.size(); ++i) {
         if (args[i] == "--scale" && i + 1 < args.size()) scale = std::atof(args[++i].c_str());
         else if (args[i] == "--frames" && i + 1 < args.size()) frames = std::atoi(args[++i].c_str());
+        else if (args[i] == "--gpu") onGpu = true;
+    }
+    // On the GPU: the viewer's 8-bit frames, as the program monitor draws them.
+    std::string why;
+    if (onGpu && !gpu::initialize(&why)) {
+        std::fprintf(stderr, "No GPU rendering: %s\n", why.c_str());
+        return 1;
     }
     Project p;
     if (!load(args[0], p)) return 1;
     const Sequence& s = *p.active();
     RenderOptions o;
     o.scale = scale;
+    o.gpu = onGpu;
+    auto render = [&](FrameTime t) {
+        if (onGpu) renderProgramFrameRgba8(p, s, t, o);
+        else renderProgramFrame(p, s, t, o);
+    };
     frames = int(std::min<FrameTime>(frames, std::max<FrameTime>(1, s.duration())));
-    renderProgramFrame(p, s, 0, o);  // warm up decoders
+    render(0);  // warm up decoders
+    gpu::resetStats();
     auto t0 = std::chrono::steady_clock::now();
-    for (int f = 0; f < frames; ++f) renderProgramFrame(p, s, f, o);
+    for (int f = 0; f < frames; ++f) render(f);
     double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::printf("%d frames at %dx%d in %.2f s: %.1f fps (%.1f ms/frame), sequence rate %.2f fps\n", frames,
                 int(s.width * scale), int(s.height * scale), sec, frames / sec, sec * 1000 / frames, s.fpsValue());
+    if (onGpu) {
+        const gpu::Stats st = gpu::stats();
+        std::printf("GPU (%s): %ld frames drawn there, %ld on the CPU; layers %ld from the source, %ld made on the CPU%s%s\n",
+                    gpu::deviceName().c_str(), st.gpuFrames, st.cpuFrames, st.gpuLayers, st.cpuLayers,
+                    st.lastFallback.empty() ? "" : "; last fallback: ", st.lastFallback.c_str());
+    }
     return 0;
 }
 

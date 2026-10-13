@@ -38,6 +38,7 @@
 #include "render/Gamut.h"
 #include "render/HdrView.h"
 #include "render/Compositor.h"
+#include "render/GpuCompositor.h"
 #include "render/Dcp.h"
 #include "render/Imf.h"
 #include "render/Jpeg2000.h"
@@ -6630,6 +6631,193 @@ colorspaces:
         Effect bars = makeEffect(p, "bars");
         Image b = renderGenerator(bars, 0, 70, 40, 1);
         QVERIFY(near(b.at(5, 5)[0], 0.75f));  // first bar is 75% grey
+    }
+
+    // The GPU compositor draws a frame the same as the CPU renderer: media through its input transform, the colour
+    // effects it has (a LUT, Color Correct, Curves, Hue Curves), scaled, rotated and cropped layers in every blend mode,
+    // a cross dissolve, a layer made on the CPU, and the display conversion. Skipped where there is no GPU.
+    void gpuCompositorMatchesCpu() {
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320;
+        s.height = 180;
+        auto addPicture = [&](const char* name, int w, int h, bool alpha) {
+            QImage q(w, h, QImage::Format_RGBA64);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)
+                    q.setPixelColor(x, y, QColor::fromRgbF(float(x) / w, float(y) / h, 0.5f + 0.4f * std::sin(x * 0.11f + y * 0.07f),
+                                                           alpha ? std::min(1.0f, 0.15f + 0.85f * float((x + 2 * y) % 97) / 96) : 1.0f));
+            const QString path = dir.filePath(name);
+            if (!q.save(path)) return Id{};
+            MediaItem m;
+            if (!probeMedia(path.toStdString(), m)) return Id{};
+            m.id = p.newId();
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id wide = addPicture("wide.png", 320, 180, false), small = addPicture("small.png", 211, 147, true),
+                 other = addPicture("other.png", 320, 180, false);
+        QVERIFY(wide && small && other);
+        // V1: the full-frame picture through a tinted LUT, then another picture dissolving in.
+        const std::string cube = (dir.path() + "/tint.cube").toStdString();
+        {
+            std::ofstream f(cube);
+            f << "LUT_3D_SIZE 3\n";
+            for (int b = 0; b < 3; ++b)
+                for (int g = 0; g < 3; ++g)
+                    for (int r = 0; r < 3; ++r) f << std::pow(r / 2.0, 1.3) << " " << g / 2.0 * 0.9 << " " << std::sqrt(b / 2.0) << "\n";
+        }
+        auto r1 = edit::placeMedia(p, s, wide, 0, 0, 40, {TrackKind::Video, 0}, {}, false);
+        QVERIFY(r1.ok);
+        QVERIFY(edit::placeMedia(p, s, other, 40, 0, 40, {TrackKind::Video, 0}, {}, false).ok);
+        Effect lut = makeEffect(p, "lut");
+        lut.strings["path"] = cube;
+        lut.params["strength"] = 80.0;
+        s.videoTracks[0].clips[0].effects.push_back(lut);
+        QVERIFY(edit::addTransition(p, s, r1.created[0], edit::Edge::Out, "cross_dissolve", 10).ok);
+        // V2: the small picture with transparency, scaled, rotated, cropped and faded, graded three ways.
+        auto r2 = edit::placeMedia(p, s, small, 0, 0, 80, {TrackKind::Video, 1}, {}, false);
+        QVERIFY(r2.ok);
+        Clip* top = edit::clipById(s, r2.created[0]);
+        QVERIFY(top);
+        top->motion.params["scale"] = 60.0;
+        top->motion.params["rotation"] = 17.0;
+        top->motion.params["pos_x"] = 23.0;
+        top->motion.params["pos_y"] = -11.0;
+        top->motion.params["crop_left"] = 7.0;
+        top->motion.params["crop_bottom"] = 12.0;
+        top->motion.params["opacity"] = 70.0;
+        Effect cc = makeEffect(p, "color_correct");
+        cc.params["exposure"] = 0.4;
+        cc.params["saturation"] = 1.3;
+        cc.params["temperature"] = 20.0;
+        cc.params["lift_b"] = 0.05;
+        cc.params["gamma"] = -0.1;
+        cc.params["gain_r"] = 1.1;
+        cc.params["highlights"] = -30.0;
+        cc.params["shadows"] = 25.0;
+        cc.params["vibrance"] = 40.0;
+        top->effects.push_back(cc);
+        Effect curves = makeEffect(p, "curves");
+        curves.strings["master"] = "0,0 0.3,0.22 0.7,0.8 1,1";
+        curves.strings["blue"] = "0,0.05 1,0.9";
+        curves.params["mix"] = 85.0;
+        top->effects.push_back(curves);
+        Effect hue = makeEffect(p, "hue_curves");
+        hue.strings["hue_sat"] = "0,0.5 0.3,0.8 0.6,0.3 0.9,0.5";
+        hue.strings["luma_sat"] = "0,0.3 0.5,0.5 1,0.6";
+        top->effects.push_back(hue);
+        // V3: a colour generator, made on the CPU and composited on the GPU.
+        Clip gen = colorClip(p, 0.2f, 0.9f, 0.4f, 0, 80);
+        gen.motion.params["scale"] = 30.0;
+        gen.motion.params["pos_x"] = 100.0;
+        gen.motion.params["pos_y"] = 50.0;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 2}, gen).ok);
+
+        auto compare = [&](FrameTime t, RenderOptions o, const QString& what) {
+            o.gpu = false;
+            const Image cpu = renderProgramFrame(p, s, t, o);
+            const long before = gpu::stats().gpuFrames;
+            o.gpu = true;
+            const Image onGpu = renderProgramFrame(p, s, t, o);
+            QVERIFY2(gpu::stats().gpuFrames == before + 1, qPrintable(what + ": fell back: " + QString::fromStdString(gpu::stats().lastFallback)));
+            QCOMPARE(onGpu.width, cpu.width);
+            QCOMPARE(onGpu.height, cpu.height);
+            double maxDiff = 0, sum = 0;
+            int mx = 0, my = 0;
+            for (int y = 0; y < cpu.height; ++y)
+                for (int x = 0; x < cpu.width; ++x)
+                    for (int c = 0; c < 4; ++c) {
+                        const double d = std::fabs(double(cpu.at(x, y)[c]) - onGpu.at(x, y)[c]);
+                        sum += d;
+                        if (d > maxDiff) maxDiff = d, mx = x, my = y;
+                    }
+            const double mean = sum / (double(cpu.width) * cpu.height * 4);
+            QVERIFY2(maxDiff <= 2e-3 && mean <= 2e-4,
+                     qPrintable(QString("%1: max %2 at %3,%4 (cpu %5 %6 %7 %8, gpu %9 %10 %11 %12), mean %13")
+                                    .arg(what).arg(maxDiff).arg(mx).arg(my)
+                                    .arg(cpu.at(mx, my)[0]).arg(cpu.at(mx, my)[1]).arg(cpu.at(mx, my)[2]).arg(cpu.at(mx, my)[3])
+                                    .arg(onGpu.at(mx, my)[0]).arg(onGpu.at(mx, my)[1]).arg(onGpu.at(mx, my)[2]).arg(onGpu.at(mx, my)[3])
+                                    .arg(mean)));
+            // The 8-bit picture for the viewer is the float one as toRgba8 gives it, to within a step.
+            o.gpu = true;
+            const QImage eight = renderProgramFrameRgba8(p, s, t, o);
+            const std::vector<uint8_t> want = toRgba8(cpu);
+            QCOMPARE(eight.width(), cpu.width);
+            QCOMPARE(eight.height(), cpu.height);
+            int worst = 0;
+            for (int y = 0; y < cpu.height; ++y) {
+                const uchar* a = eight.constScanLine(y);
+                const uint8_t* b = want.data() + size_t(y) * cpu.width * 4;
+                for (int i = 0; i < cpu.width * 4; ++i) worst = std::max(worst, std::abs(int(a[i]) - int(b[i])));
+            }
+            QVERIFY2(worst <= 1, qPrintable(what + QString(": 8-bit off by %1").arg(worst)));
+        };
+        RenderOptions o;
+        compare(10, o, "layers");
+        compare(37, o, "dissolve");
+        const char* modes[] = {"normal", "add", "multiply", "screen", "overlay", "darken", "lighten",
+                               "difference", "soft_light", "hard_light", "color_dodge", "color_burn", "subtract"};
+        for (const char* mode : modes) {
+            edit::clipById(s, r2.created[0])->blendMode = mode;
+            compare(20, o, mode);
+        }
+        edit::clipById(s, r2.created[0])->blendMode = "normal";
+        // An HDR sequence seen on an SDR display.
+        s.colorSpace = "rec2100pq";
+        o.displaySpace = "rec709";
+        compare(15, o, "pq to rec709");
+    }
+
+    // A frame the GPU cannot draw (an adjustment layer) falls back to the CPU whole, and a clip it cannot grade (a
+    // masked effect) is made on the CPU and composited there; either way the picture is the CPU's.
+    void gpuFallback() {
+        std::string why;
+        if (!gpu::initialize(&why)) QSKIP(why.c_str());
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 96;
+        s.height = 54;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, colorClip(p, 0.8f, 0.3f, 0.1f, 0, 30));
+        Clip masked = colorClip(p, 0.1f, 0.4f, 0.9f, 0, 30);
+        masked.motion.params["scale"] = 50.0;
+        Effect cc = makeEffect(p, "color_correct");
+        cc.params["saturation"] = 0.0;
+        cc.params["mask.shape"] = 1.0;
+        cc.params["mask.x"] = 0.5;
+        cc.params["mask.y"] = 0.5;
+        cc.params["mask.w"] = 0.5;
+        cc.params["mask.h"] = 0.5;
+        masked.effects.push_back(cc);
+        const Id maskedId = masked.id;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, masked).ok);
+        RenderOptions o;
+        auto same = [&](FrameTime t) {
+            o.gpu = false;
+            const Image cpu = renderProgramFrame(p, s, t, o);
+            o.gpu = true;
+            const Image onGpu = renderProgramFrame(p, s, t, o);
+            double worst = 0;
+            for (int y = 0; y < cpu.height; ++y)
+                for (int x = 0; x < cpu.width; ++x)
+                    for (int c = 0; c < 4; ++c) worst = std::max(worst, std::fabs(double(cpu.at(x, y)[c]) - onGpu.at(x, y)[c]));
+            return worst;
+        };
+        gpu::resetStats();
+        QVERIFY(same(5) <= 2e-3);
+        QCOMPARE(gpu::stats().gpuFrames, 1L);
+        QVERIFY(gpu::stats().cpuLayers >= 1);
+        QVERIFY(edit::clipById(s, maskedId));
+        Clip adj = makeGeneratorClip(p, "adjustment", 30);
+        adj.effects.push_back(makeEffect(p, "invert"));
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 2}, adj).ok);
+        gpu::resetStats();
+        QVERIFY(same(5) <= 1e-6);
+        QCOMPARE(gpu::stats().cpuFrames, 1L);
+        QVERIFY(!gpu::stats().lastFallback.empty());
     }
 };
 

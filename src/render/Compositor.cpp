@@ -26,6 +26,7 @@
 #include "AudioFx.h"
 #include "ColorSpace.h"
 #include "Exporter.h"
+#include "GpuCompositor.h"
 #include "Processing.h"
 #include "Retime.h"
 #include "Shapes.h"
@@ -773,9 +774,46 @@ void sourceSize(const Geometry& g, double scale, int nativeW, int nativeH, int& 
     h = int(std::ceil(std::min<double>(nativeH, std::max(1.0, wantH))));
 }
 
-// `below` is what the tracks under the clip have made so far, for adjustment layers.
-Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
-                const Image* below = nullptr) {
+// A clip's picture as it comes (decoded, generated or rendered, through the effects that run on the source and the
+// input transform into the working space), where it goes, and what its effects need to know of it.
+struct ClipSource {
+    FrameTime t = 0, lt = 0;  // (Stop Motion holds frames)
+    Image src;
+    // Or, when asked to leave it (`deferFrame`), the decoded frame and the space it is in: nothing ran on it yet.
+    Frame16Ptr frame;
+    const ColorSpace* frameSpace = nullptr;
+    const Effect* sourceCdl = nullptr;  // a CDL applied in the media's own space, before the input transform
+    const Effect* sourceRgc = nullptr;  // the ACES gamut compression, likewise
+    std::vector<const Effect*> sourceLooks;  // CDLs and LUTs made on the camera's picture (an AMF's looks), likewise
+    double mw = 0, mh = 0;
+    Geometry g;
+    double sourceSeconds = -1;  // media time of the frame, for effects that follow the footage
+    uint64_t sourceMedia = 0;   // and its media, and whether it was reframed from 360° (or is a right eye), for analyses made from it
+    bool reframed = false;
+    ofx::FrameFetch ofxFetch;   // the clip's source at other clip frames, for OpenFX plugins that ask (render/Ofx.h)
+};
+
+// Whether any of the clip's looks run on the camera's picture before the input transform (as clipSource runs them).
+bool sourceStageLooks(const Clip& c, FrameTime lt, const ColorSpace& from, const MediaItem& m) {
+    if (from.sceneReferred)
+        for (const Effect& e : c.effects) {
+            if (!e.enabled || e.type == "video_denoise" || e.type == "super_scale" || e.type == "motion_deblur" ||
+                e.type == "reframe_360" || e.type == "redact_faces" || e.type == "stereo_3d")
+                continue;
+            if (e.node != 0 || hasMask(e, lt)) break;
+            if (e.type == "aces_gamut_compress" || sourceLookSpace(e)) return true;
+            break;
+        }
+    for (const Effect& e : c.effects)
+        if (e.enabled && e.node == 0 && ((e.type == "cdl" && e.s("space") == mediaColorSpace(m).label) ||
+                                         (e.type == "aces_gamut_compress" && !hasMask(e, lt))))
+            return true;
+    return false;
+}
+
+// False when the clip has no picture.
+bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, const Image* below,
+                bool deferFrame, ClipSource& out) {
     // Stop Motion: the clip steps, each frame held for a few.
     for (const Effect& e : c.effects)
         if (e.enabled && e.type == "stop_motion") {
@@ -783,20 +821,23 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             t -= (t - c.start) % hold;
         }
     const FrameTime lt = t - c.start;
+    out.t = t, out.lt = lt;
     const int SW = seq.width, SH = seq.height;
-    Image src;
-    const Effect* sourceCdl = nullptr;  // a CDL applied in the media's own space, before the input transform
-    const Effect* sourceRgc = nullptr;  // the ACES gamut compression, likewise
-    std::vector<const Effect*> sourceLooks;  // CDLs and LUTs made on the camera's picture (an AMF's looks), likewise
-    double mw = SW, mh = SH;
-    Geometry g;
-    double sourceSeconds = -1;  // media time of the frame, for effects that follow the footage
-    uint64_t sourceMedia = 0;   // and its media, and whether it was reframed from 360° (or is a right eye), for analyses made from it
-    bool reframed = false;
-    ofx::FrameFetch ofxFetch;   // the clip's source at other clip frames, for OpenFX plugins that ask (render/Ofx.h)
+    Image& src = out.src;
+    const Effect*& sourceCdl = out.sourceCdl;
+    const Effect*& sourceRgc = out.sourceRgc;
+    std::vector<const Effect*>& sourceLooks = out.sourceLooks;
+    double& mw = out.mw;
+    double& mh = out.mh;
+    mw = SW, mh = SH;
+    Geometry& g = out.g;
+    double& sourceSeconds = out.sourceSeconds;
+    uint64_t& sourceMedia = out.sourceMedia;
+    bool& reframed = out.reframed;
+    ofx::FrameFetch& ofxFetch = out.ofxFetch;
     if (c.isGenerator() && c.generator.type == "adjustment") {
         // An adjustment layer's picture is the composite beneath it (already in the working space).
-        if (!below || below->empty()) return {};
+        if (!below || below->empty()) return false;
         g = clipGeometry(c, lt, SW, SH, SW, SH, seq.fpsValue());
         src = *below;
     } else if (c.isGenerator()) {
@@ -810,10 +851,10 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         convertColor(src, rec709Space(), sequenceColorSpace(seq), seq.hdrPeakNits);
     } else {
         const MediaItem* m = p.findMedia(c.mediaId);
-        if (!m) return {};
+        if (!m) return false;
         if (m->kind == MediaKind::Sequence) {
             const Sequence* nested = p.findSequence(m->sequenceId);
-            if (!nested || o.depth >= kMaxDepth || nested->id == seq.id) return {};
+            if (!nested || o.depth >= kMaxDepth || nested->id == seq.id) return false;
             // A graphic shows its own values for the fields its template publishes.
             Sequence filled;
             if (!nested->fields.empty() && !c.fields.empty()) {
@@ -836,7 +877,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (const Effect* db = enabledEffect(seq, c, "motion_deblur")) applyMotionDeblur(*db, lt, o, src);
             convertColor(src, sequenceColorSpace(*nested), sequenceColorSpace(seq), seq.hdrPeakNits);
         } else if (m->kind == MediaKind::Video || m->kind == MediaKind::Image) {
-            if (!m->hasVideo && m->kind != MediaKind::Image) return {};
+            if (!m->hasVideo && m->kind != MediaKind::Image) return false;
             std::string path = pictureSource(*m, o.useProxies, o.offlineProxies);  // (viewing: an offline file plays its proxy)
             // Stereoscopic footage: the eye being rendered (a clip's Stereo 3D effect can swap them). A proxy holds
             // the left eye alone (it is made through a flat sequence), so the right eye is read from the file (or,
@@ -889,7 +930,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             }
             Frame16Ptr f = MediaPool::instance().videoFrame(path, sec, w, h, o.highQuality);
             if (!f && original && isOffline(*m)) f = offlineSlate(w, h);
-            if (!f) return {};
+            if (!f) return false;
             if (m->kind == MediaKind::Video) sourceSeconds = sec;
             sourceMedia = m->id;
             if (m->kind == MediaKind::Video && std::any_of(c.effects.begin(), c.effects.end(), [](const Effect& e) { return e.type == "ofx" && e.enabled; })) {
@@ -910,6 +951,19 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     convertColor(out, *from, *to, peak);
                     return true;
                 };
+            }
+            // Left as it was decoded, for the GPU (render/GpuCompositor.h), when nothing runs on it before the input
+            // transform.
+            if (deferFrame) {
+                const int sampling = c.timing.empty() ? 0 : int(c.timing.p("sampling", lt, 0));
+                const ColorSpace& from = original ? mediaColorSpace(*m) : pictureColorSpace(*m, path);
+                if (!ofxFetch && !(sampling > 0 && m->kind == MediaKind::Video) && !denoiseEffect(seq, c) &&
+                    !enabledEffect(seq, c, "motion_deblur") && !enabledEffect(seq, c, "motion_blur") && !enabledEffect(seq, c, "deflicker") &&
+                    !upscale && !vr && !sourceStageLooks(c, lt, from, *m)) {
+                    out.frame = f;
+                    out.frameSpace = &from;
+                    return true;
+                }
             }
             src = toImage(*f);
             Image decoded;  // the source frame itself, when src is an in-between
@@ -1070,9 +1124,31 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             // Input transform: the media's space (or its proxy's) into the sequence's working space.
             convertColor(src, from, sequenceColorSpace(seq), seq.hdrPeakNits);
         } else {
-            return {};
+            return false;
         }
     }
+    return !src.empty();
+}
+
+// The rest of a clip's layer from its source: its effects (and grade graph), then its transform onto the canvas.
+Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o, ClipSource& cs) {
+    const FrameTime lt = cs.lt;
+    const int SW = seq.width;
+    Image& src = cs.src;
+    if (cs.frame) {  // (left as decoded)
+        src = toImage(*cs.frame);
+        convertColor(src, *cs.frameSpace, sequenceColorSpace(seq), seq.hdrPeakNits);
+        cs.frame.reset();
+    }
+    const Effect* sourceCdl = cs.sourceCdl;
+    const Effect* sourceRgc = cs.sourceRgc;
+    const std::vector<const Effect*>& sourceLooks = cs.sourceLooks;
+    const double mw = cs.mw;
+    Geometry& g = cs.g;
+    const double sourceSeconds = cs.sourceSeconds;
+    const uint64_t sourceMedia = cs.sourceMedia;
+    const bool reframed = cs.reframed;
+    ofx::FrameFetch& ofxFetch = cs.ofxFetch;
     if (src.empty()) return {};
     // Filters run in source space (before the fixed transform), like most NLEs.
     const double pixelScale = effectPixelScale(c, lt, g.sx, mw, src.width);
@@ -1147,8 +1223,16 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             const double half = s3d->p("depth", lt, 0) / 100.0 * SW / 2;
             g.px += o.eye ? half : -half;
         }
-    if (identityLayer(src, g, SW, SH, o.scale)) return src;  // a full-frame clip: no copy
-    return transformLayer(src, g, SW, SH, o.scale);
+    if (identityLayer(src, g, SW, seq.height, o.scale)) return std::move(src);  // a full-frame clip: no copy
+    return transformLayer(src, g, SW, seq.height, o.scale);
+}
+
+// `below` is what the tracks under the clip have made so far, for adjustment layers.
+Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
+                const Image* below = nullptr) {
+    ClipSource cs;
+    if (!clipSource(p, seq, c, t, o, below, false, cs)) return {};
+    return finishClipLayer(seq, c, o, cs);
 }
 
 const Clip* findClip(const Track& t, Id id) {
@@ -1211,6 +1295,43 @@ std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t) {
     return hidden;
 }
 
+namespace {
+
+// A transition's picture at t (from to `to` on its track), on the CPU.
+Image transitionLayer(const Project& p, const Sequence& seq, const Track& track, const Transition& tr, FrameTime from, FrameTime to,
+                      FrameTime t, const RenderOptions& o, const Image* below, int W, int H) {
+    const Clip* A = findClip(track, tr.clipA);
+    const Clip* B = findClip(track, tr.clipB);
+    const double u = (double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from));
+    if (tr.type == "smooth_cut" && A && A->enabled && B && B->enabled) {
+        // The first frame of the transition morphs into its last along their optical flow
+        // (the pair is the same throughout, so its flow is measured once).
+        Image la = clipLayer(p, seq, *A, from, o, below), lb = clipLayer(p, seq, *B, to - 1, o, below);
+        if (la.width == W && la.height == H && lb.width == W && lb.height == H)
+            return interpolateFrames(la, lb, u,
+                                     "smooth#" + std::to_string(tr.id) + '@' + std::to_string(from) + '-' + std::to_string(to) + '#' +
+                                         std::to_string(W) + 'x' + std::to_string(H) + (o.eye ? "#R" : ""));
+        return transitionMix("cross_dissolve", tr.params, la, lb, u, W, H);
+    }
+    Image la = (A && A->enabled) ? clipLayer(p, seq, *A, t, o, below) : Image();
+    Image lb = (B && B->enabled) ? clipLayer(p, seq, *B, t, o, below) : Image();
+    return transitionMix(tr.type, tr.params, la, lb, u, W, H);
+}
+
+const Transition* activeTransition(const Track& track, FrameTime t, FrameTime& from, FrameTime& to) {
+    for (const auto& tr : track.transitions) {
+        FrameTime a, b;
+        if (edit::transitionRange(track, tr, a, b) && t >= a && t < b) {
+            from = a;
+            to = b;
+            return &tr;
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
 Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& opts) {
     const WorkingSpaceScope working(&sequenceColorSpace(seq));  // effects that work in light know whose
     const int solo = opts.soloVideoTrack;
@@ -1244,27 +1365,9 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
         if (active) {
             const Clip* A = findClip(track, active->clipA);
             const Clip* B = findClip(track, active->clipB);
-            double u = (double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from));
-            const Image* below = canvasEmpty ? nullptr : &canvas;
-            Image mixed;
-            if (active->type == "smooth_cut" && A && A->enabled && B && B->enabled) {
-                // The first frame of the transition morphs into its last along their optical flow
-                // (the pair is the same throughout, so its flow is measured once).
-                Image la = clipLayer(p, seq, *A, from, o, below), lb = clipLayer(p, seq, *B, to - 1, o, below);
-                if (la.width == W && la.height == H && lb.width == W && lb.height == H)
-                    mixed = interpolateFrames(la, lb, u,
-                                              "smooth#" + std::to_string(active->id) + '@' + std::to_string(from) + '-' +
-                                                  std::to_string(to) + '#' + std::to_string(W) + 'x' + std::to_string(H) +
-                                                  (o.eye ? "#R" : ""));
-                else
-                    mixed = transitionMix("cross_dissolve", active->params, la, lb, u, W, H);
-            } else {
-                Image la = (A && A->enabled) ? clipLayer(p, seq, *A, t, o, below) : Image();
-                Image lb = (B && B->enabled) ? clipLayer(p, seq, *B, t, o, below) : Image();
-                mixed = transitionMix(active->type, active->params, la, lb, u, W, H);
-            }
             const Clip* top = B ? B : A;
-            composite(std::move(mixed), top ? top->blendMode : "normal");
+            composite(transitionLayer(p, seq, track, *active, from, to, t, o, canvasEmpty ? nullptr : &canvas, W, H),
+                      top ? top->blendMode : "normal");
             continue;
         }
         if (const Clip* c = clipAt(track, t)) {
@@ -1296,7 +1399,178 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
     return canvas;
 }
 
+namespace {
+
+// How a clip's layer is drawn on the GPU (render/GpuCompositor.h).
+enum class GpuLayerResult { Drawn, Nothing, Unsupported };
+
+GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, gpu::Layer& out) {
+    if (!c.grade.empty() || (c.isGenerator() && c.generator.type == "adjustment")) return GpuLayerResult::Unsupported;
+    // Its colour steps, each one the GPU draws (the ones on the source, such as noise reduction, are not).
+    const FrameTime lt = t - c.start;
+    for (const Effect* e : gradeChain(seq, c))
+        if (e->enabled && !gpuColorOps(*e, lt, out.ops)) return GpuLayerResult::Unsupported;
+    ClipSource cs;
+    if (!clipSource(p, seq, c, t, o, nullptr, true, cs)) return GpuLayerResult::Nothing;
+    int w = 0, h = 0;
+    if (cs.frame) {
+        out.frame = cs.frame;
+        out.input = conversionLut(*cs.frameSpace, sequenceColorSpace(seq), seq.hdrPeakNits);
+        w = cs.frame->width, h = cs.frame->height;
+    } else {
+        out.image = std::move(cs.src);
+        w = out.image.width, h = out.image.height;
+    }
+    // Placed as transformLayer places it (worked out here in double).
+    const Geometry& g = cs.g;
+    const int SW = seq.width, SH = seq.height;
+    gpu::Placement& pl = out.place;
+    const int W = std::max(1, int(std::lround(SW * o.scale))), H = std::max(1, int(std::lround(SH * o.scale)));
+    Image probe;  // (identityLayer reads the size alone)
+    probe.width = w, probe.height = h;
+    if (identityLayer(probe, g, SW, SH, o.scale)) {
+        pl.full = w == W && h == H;
+        return GpuLayerResult::Drawn;
+    }
+    const double u0 = g.mw * g.cl, u1 = g.mw * (1 - g.cr), v0 = g.mh * g.ct, v1 = g.mh * (1 - g.cb);
+    if (g.sx == 0 || g.sy == 0 || g.opacity <= 0 || u1 <= u0 || v1 <= v0) {  // (a transparent layer)
+        out.frame.reset();
+        out.image = Image();
+        out.ops.clear();
+        return GpuLayerResult::Drawn;
+    }
+    const double cosr = std::cos(g.rot), sinr = std::sin(g.rot);
+    pl.scale = float(o.scale);
+    pl.opacity = float(g.opacity);
+    pl.axis = std::fabs(sinr) < 1e-9 && cosr > 0 && g.sx > 0 && g.sy > 0;
+    pl.cx = float(SW / 2.0 + g.px), pl.cy = float(SH / 2.0 + g.py), pl.cosr = float(cosr), pl.sinr = float(sinr);
+    pl.sx = float(g.sx), pl.sy = float(g.sy), pl.au = float(g.mw / 2 + g.ax), pl.av = float(g.mh / 2 + g.ay);
+    pl.u0 = float(u0), pl.u1 = float(u1), pl.v0 = float(v0), pl.v1 = float(v1);
+    pl.kx = float(w / g.mw), pl.ky = float(h / g.mh);
+    pl.px = float(std::fabs(g.sx) * o.scale), pl.py = float(std::fabs(g.sy) * o.scale);
+    return GpuLayerResult::Drawn;
+}
+
+// A layer made on the CPU, the canvas's size, for the GPU to blend.
+gpu::Layer cpuLayer(Image&& img) {
+    gpu::Layer l;
+    l.image = std::move(img);
+    l.place.full = true;
+    return l;
+}
+
+// The program frame drawn on the GPU where it can be, its layers that it cannot draw made on the CPU: false (counted,
+// with why) when the frame as a whole is for the CPU.
+bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& opts, Image* out, QImage* out8) {
+    std::string why;
+    auto fallback = [](const std::string& reason) {
+        gpu::countFallback(reason);
+        return false;
+    };
+    if (!gpu::available(&why)) return fallback("no GPU: " + why);
+    if (opts.depth != 0 || seq.stereo3d) return fallback("a stereoscopic sequence");
+    if (!opts.trimTarget.empty() && findTrimTarget(seq, opts.trimTarget)) return fallback("a trim pass");
+    const WorkingSpaceScope working(&sequenceColorSpace(seq));
+    const int solo = opts.soloVideoTrack;
+    RenderOptions o = opts;
+    o.soloVideoTrack = -1;
+    gpu::Frame frame;
+    frame.width = std::max(1, int(std::lround(seq.width * o.scale)));
+    frame.height = std::max(1, int(std::lround(seq.height * o.scale)));
+    const int W = frame.width, H = frame.height;
+    const std::vector<bool> hiddenMatte = hiddenMatteTracks(seq, t);
+    if (std::find(hiddenMatte.begin(), hiddenMatte.end(), true) != hiddenMatte.end()) return fallback("a track matte");
+    // The clips on screen that need the canvas beneath them, or another track, go to the CPU whole.
+    for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
+        const Track& track = seq.videoTracks[ti];
+        if (solo >= 0 ? int(ti) != solo : track.muted) continue;
+        FrameTime from = 0, to = 0;
+        std::vector<const Clip*> shown;
+        if (const Transition* tr = activeTransition(track, t, from, to)) shown = {findClip(track, tr->clipA), findClip(track, tr->clipB)};
+        else shown = {clipAt(track, t)};
+        for (const Clip* c : shown)
+            if (c && c->enabled) {
+                if (c->isGenerator() && c->generator.type == "adjustment") return fallback("an adjustment layer");
+                if (trackMatteOf(*c)) return fallback("a track matte");
+                if (enabledEffect(seq, *c, "behind_people")) return fallback("Behind People");
+            }
+    }
+    auto layerOf = [&](const Clip& c, gpu::Layer& l) {
+        const GpuLayerResult r = gpuClipLayer(p, seq, c, t, o, l);
+        if (r == GpuLayerResult::Unsupported) {
+            l = {};
+            Image img = clipLayer(p, seq, c, t, o, nullptr);
+            if (img.empty()) return false;
+            l = cpuLayer(std::move(img));
+        }
+        gpu::countLayer(r != GpuLayerResult::Unsupported);
+        return r != GpuLayerResult::Nothing;
+    };
+    for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
+        const Track& track = seq.videoTracks[ti];
+        if (solo >= 0 ? int(ti) != solo : track.muted) continue;
+        FrameTime from = 0, to = 0;
+        if (const Transition* active = activeTransition(track, t, from, to)) {
+            const Clip* A = findClip(track, active->clipA);
+            const Clip* B = findClip(track, active->clipB);
+            const Clip* top = B ? B : A;
+            gpu::Item item;
+            item.blendMode = blendModeIndex(top ? top->blendMode : "normal");
+            if (active->type == "cross_dissolve") {
+                item.b.emplace();
+                if (A && A->enabled) layerOf(*A, item.a);
+                if (B && B->enabled) layerOf(*B, *item.b);
+                item.dissolve = float(std::clamp((double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from)), 0.0, 1.0));
+            } else {
+                item.a = cpuLayer(transitionLayer(p, seq, track, *active, from, to, t, o, nullptr, W, H));
+                gpu::countLayer(false);
+            }
+            frame.items.push_back(std::move(item));
+            continue;
+        }
+        if (const Clip* c = clipAt(track, t)) {
+            gpu::Item item;
+            item.blendMode = blendModeIndex(c->blendMode);
+            if (layerOf(*c, item.a)) frame.items.push_back(std::move(item));
+        }
+    }
+    // Captions are drawn on the CPU, before the display transform.
+    const CaptionTrack* captions = opts.captions ? captionTrackFor(seq) : nullptr;
+    if (captions && !captionAt(*captions, t)) captions = nullptr;
+    const ColorSpace* display = opts.displaySpace.empty() ? nullptr : findColorSpace(opts.displaySpace);
+    if (display && !captions) frame.display = conversionLut(trimTargetSpace(seq, {}), *display, trimTargetPeak(seq, {}));
+    Image img;
+    if (!gpu::execute(frame, captions || !out8 ? &img : nullptr, captions ? nullptr : out8)) return fallback("the GPU could not draw it");
+    if (captions) {
+        drawCaption(img, *captions, t, &trimTargetSpace(seq, {}));
+        if (display) convertColor(img, trimTargetSpace(seq, {}), *display, trimTargetPeak(seq, {}));
+        if (out8) {
+            *out8 = QImage(img.width, img.height, QImage::Format_RGBA8888);
+            toRgba8(img, out8->bits(), size_t(out8->bytesPerLine()));
+        }
+    }
+    if (out) *out = std::move(img);
+    return true;
+}
+
+}  // namespace
+
+QImage renderProgramFrameRgba8(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
+    QImage q;
+    if (o.gpu && o.depth == 0 && gpuProgramFrame(p, seq, t, o, nullptr, &q)) return q;
+    RenderOptions cpu = o;
+    cpu.gpu = false;
+    const Image img = renderProgramFrame(p, seq, t, cpu);
+    q = QImage(img.width, img.height, QImage::Format_RGBA8888);
+    if (img.width > 0) toRgba8(img, q.bits(), size_t(q.bytesPerLine()));
+    return q;
+}
+
 Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
+    if (o.gpu && o.depth == 0) {
+        Image img;
+        if (gpuProgramFrame(p, seq, t, o, &img, nullptr)) return img;
+    }
     // A trim pass: each eye as its target shows it, captions over that (as exports burn them in).
     const TrimTarget* trim = o.depth == 0 && !o.trimTarget.empty() ? findTrimTarget(seq, o.trimTarget) : nullptr;
     const std::string shown = trim ? trim->id : std::string();

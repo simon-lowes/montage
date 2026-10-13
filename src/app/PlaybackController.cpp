@@ -50,6 +50,7 @@ public:
         StereoView stereoView = StereoView::Left;  // how a stereo 3D sequence's eyes are shown
         bool hdr = false;  // HDR sequences also as light for the HDR viewer
         std::string trim;  // the trim pass shown (render/TrimPasses.h), "" = the master
+        bool gpu = false;  // drawn on the GPU where it can be (render/GpuCompositor.h)
     };
     void request(const Request& r) {
         {
@@ -138,7 +139,7 @@ private:
     bool sameContext(const Request& r) const {
         return r.project == ctx_.project && r.sequence == ctx_.sequence && r.scale == ctx_.scale && r.proxies == ctx_.proxies &&
                r.captions == ctx_.captions && r.stereoView == ctx_.stereoView && r.hdr == ctx_.hdr &&
-               r.trim == ctx_.trim;
+               r.trim == ctx_.trim && r.gpu == ctx_.gpu;
     }
 
     Rendered render(const Request& r, FrameTime t) {
@@ -152,6 +153,7 @@ private:
         o.stereoView = r.stereoView;
         o.trimTarget = r.trim;
         o.displaySpace = "rec709";  // HDR and wide-gamut sequences are previewed tone mapped to SDR
+        o.gpu = r.gpu;
         // A rendered preview of this frame (kept at playback's scale) is used as it is, paused too.
         RenderOptions co = o;
         if (r.cacheScale > 0) co.scale = r.cacheScale;
@@ -166,6 +168,11 @@ private:
         Rendered out;
         RenderOptions own = o;
         const bool other = ownSpace(*s, r.trim);
+        // A Rec.709 frame for the viewer alone comes back from the GPU as 8-bit, with no float picture in between.
+        if (r.gpu && !other && !dest) {
+            out.view = renderProgramFrameRgba8(*r.project, *s, t, o);
+            return out;
+        }
         if (other) own.displaySpace.clear();
         Image img = renderProgramFrame(*r.project, *s, t, own);
         // To the reference output as rendered (moved there when the viewer's picture needs no conversion).
@@ -602,6 +609,12 @@ void PlaybackController::setHdrOutput(bool on) {
     requestFrame();
 }
 
+void PlaybackController::setGpuRendering(bool on) {
+    if (gpu_ == on) return;
+    gpu_ = on;
+    requestFrame();
+}
+
 void PlaybackController::setTrimTarget(const std::string& id) {
     if (trimTarget_ == id) return;
     trimTarget_ = id;
@@ -625,7 +638,7 @@ FrameTime PlaybackController::clampToSequence(FrameTime t) const { return std::m
 void PlaybackController::requestFrame() {
     if (!sequence()) return;
     // Paused frames render at full quality; playback uses the preview scale (a reference output its own).
-    worker_->request({project_, sequenceId_, position_, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_});
+    worker_->request({project_, sequenceId_, position_, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_});
 }
 
 void PlaybackController::seek(FrameTime t) {
@@ -812,7 +825,7 @@ void PlaybackController::tick() {
     }
     if (t != position_) {
         position_ = t;
-        worker_->request({project_, sequenceId_, t, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_});
+        worker_->request({project_, sequenceId_, t, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_});
         syncOutput();
         emit positionChanged(t);
     }
