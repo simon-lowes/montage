@@ -21,6 +21,7 @@
 
 #include "EditorState.h"
 #include "Settings.h"
+#include "media/ImageSequence.h"
 
 namespace montage {
 
@@ -247,6 +248,7 @@ bool CaptureDialog::record() {
     settings.setValue(QStringLiteral("capture/import"), import_->isChecked());
     settings.setValue(QStringLiteral("capture/options"), options_->text().trimmed());
     recording_ = true;
+    notedFrames_ = -1;
     record_->setText(tr("Stop"));
     tick_->start();
     refresh();
@@ -290,6 +292,13 @@ void CaptureDialog::refresh() {
         return;
     }
     const CaptureStatus st = recorder_->status();
+    // The file imported is being written by this program: said so as it records, not left to the system's notice of
+    // writes (late on macOS and Windows), so it is followed as growing at once.
+    if (st.recording && st.frames != notedFrames_)
+        if (const MediaItem* m = imported_ ? state_->project().findMedia(imported_) : nullptr) {
+            state_->noteMediaFileWritten(QString::fromStdString(mediaFileOnDisk(m->path)));
+            notedFrames_ = st.frames;
+        }
     QString text;
     if (st.recording && st.frames == 0) {
         text = tr("Waiting for the feed…");

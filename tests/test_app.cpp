@@ -1608,11 +1608,7 @@ private slots:
             grew = grew || state()->isMediaGrowing(id);
         }
         QVERIFY(!dlg->isRecording());
-#ifndef Q_OS_WIN
-        QVERIFY(grew);  // (Windows tells of another program's writes late, so it may only be seen once stopped there)
-#else
-        Q_UNUSED(grew);
-#endif
+        QVERIFY(grew);
         QTRY_VERIFY_WITH_TIMEOUT(std::fabs(state()->project().findMedia(id)->duration - 6.0) < 0.05 && !state()->isMediaGrowing(id), 20000);
         QVERIFY(dlg->statusText().startsWith("Recorded 00:00:06"));
         QVERIFY(dlg->statusText().contains("320×180") && dlg->statusText().contains("TC 01:00:00:00"));

@@ -245,6 +245,15 @@ AVPixelFormat dejpeg(AVPixelFormat f, bool& fullRange) {
     }
 }
 
+
+// A Magic Lantern recording's frame rate (23976/1000, as the camera writes it, is 24000/1001 as the rest of the
+// project names it, so frame k starts exactly where the sequence asks for it).
+Rational mlvFrameRate(const MlvInfo& mi) {
+    const double fps = double(mi.fpsNum) / mi.fpsDen;
+    const double whole = std::round(fps * 1.001);
+    return std::fabs(fps - whole / 1.001) < 0.002 && std::fabs(fps - whole) > 0.01 ? Rational{int(whole) * 1000, 1001} : Rational{mi.fpsNum, mi.fpsDen};
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -421,7 +430,7 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
             return true;
         }
     }
-    // Magic Lantern Video: its RAW frames developed here (ACEScct, as ProRes RAW), its sound read by FFmpeg.
+    // Magic Lantern Video: its RAW frames developed here (ACEScct, as ProRes RAW), and its PCM sound.
     if (isMlvPath(file)) {
         MlvInfo mi;
         if (!readMlvInfo(file, mi, error)) return false;
@@ -431,12 +440,10 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         m.kind = MediaKind::Video;
         m.hasVideo = true;
         mlvPictureSize(mi, false, m.width, m.height);
-        if (in.par > 0) m.width = int(std::lround(double(m.width) * in.par));
-        const double fileFps = double(mi.fpsNum) / mi.fpsDen;
-        // (23976/1000 is 24000/1001, as the rest of the project names it)
-        const double whole = std::round(fileFps * 1.001);
-        m.fps = std::fabs(fileFps - whole / 1.001) < 0.002 && std::fabs(fileFps - whole) > 0.01 ? Rational{int(whole) * 1000, 1001}
-                                                                                                : Rational{mi.fpsNum, mi.fpsDen};
+        const double par = in.par > 0 ? in.par : mi.pixelAspect;  // (anamorphic modes stretched as recorded)
+        if (par != 1) m.width = int(std::lround(double(m.width) * par));
+        m.fps = mlvFrameRate(mi);
+        const double fileFps = m.fps.toDouble();
         if (in.conformed()) m.fps = in.fps;
         m.duration = mi.frames / fileFps / in.timeScale();
         m.videoCodec = "mlv";
@@ -730,10 +737,11 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
         const MlvInfo& mi = reader->info();
         int w = 0, h = 0;
         mlvPictureSize(mi, false, w, h);
-        if (par_ > 0) w = int(std::lround(double(w) * par_));
+        const double par = par_ > 0 ? par_ : mi.pixelAspect;
+        if (par != 1) w = int(std::lround(double(w) * par));
         dispW_ = std::max(1, w);
         dispH_ = std::max(1, h);
-        fps_ = double(mi.fpsNum) / mi.fpsDen;
+        fps_ = mlvFrameRate(mi).toDouble();
         duration_ = mi.frames / fps_;
         still_ = false;
         rotation_ = 0;
@@ -1182,14 +1190,14 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
     return out;
 }
 
-bool VideoDecoder::loadRaw(const RawImage& img, std::string* error) {
-    if (!raw_ || raw_->width != img.width || raw_->height != img.height) {
+bool VideoDecoder::rawFrame(int width, int height, std::string* error) {
+    if (!raw_ || raw_->width != width || raw_->height != height) {
         if (raw_) av_frame_free(&raw_);
         raw_ = av_frame_alloc();
         if (!raw_) return false;
         raw_->format = AV_PIX_FMT_RGB48;  // host byte order, as LibRaw writes it
-        raw_->width = img.width;
-        raw_->height = img.height;
+        raw_->width = width;
+        raw_->height = height;
         raw_->color_range = AVCOL_RANGE_JPEG;
         if (av_frame_get_buffer(raw_, 0) < 0) {
             if (error) *error = "Out of memory developing " + path_;
@@ -1197,6 +1205,11 @@ bool VideoDecoder::loadRaw(const RawImage& img, std::string* error) {
             return false;
         }
     }
+    return true;
+}
+
+bool VideoDecoder::loadRaw(const RawImage& img, std::string* error) {
+    if (!rawFrame(img.width, img.height, error)) return false;
     for (int y = 0; y < img.height; ++y)
         std::memcpy(raw_->data[0] + size_t(y) * size_t(raw_->linesize[0]), img.rgb.data() + size_t(y) * size_t(img.width) * 3,
                     size_t(img.width) * 3 * sizeof(uint16_t));
@@ -1205,29 +1218,31 @@ bool VideoDecoder::loadRaw(const RawImage& img, std::string* error) {
 
 Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQuality) {
     if (mlv_) {
-        // The frame shown at `t` (the file's own time), developed once and kept while it is asked for again; at half
-        // size when it is shown at half or less (or Interpret Footage asks for half).
+        // The frame shown at `t` (media time), developed once and kept while it is asked for again; at half size when
+        // the sensor's samples (not the stretched picture's) are shown at half or less, or Interpret Footage asks for half.
         const int n = std::clamp(int(std::floor(std::max(0.0, t) * timeScale_ * fps_ + 1e-6)), 0, std::max(0, mlv_->info().frames - 1));
         if (targetW <= 0) targetW = dispW_;
         if (targetH <= 0) targetH = dispH_;
-        const bool half = rawSettings_.half || (targetW * 2 <= dispW_ && targetH * 2 <= dispH_);
+        int fullW = 0, fullH = 0;
+        mlvPictureSize(mlv_->info(), false, fullW, fullH);
+        const bool half = rawSettings_.half || (targetW * 2 <= fullW && targetH * 2 <= fullH);
         if (n != rawFrame_ || half != rawHalf_ || !raw_) {
             RawSettings s = rawSettings_;
             s.half = half;
-            DevelopedRaw d;
+            int w = 0, h = 0;
+            mlvPictureSize(mlv_->info(), half, w, h);
             std::string err;
-            if (!mlv_->develop(n, s, d, &err)) return nullptr;
-            RawImage img;
-            img.width = d.width;
-            img.height = d.height;
-            img.rgb = std::move(d.rgb);
-            if (!loadRaw(img, &err)) return nullptr;
+            rawFrame_ = -1;
+            // (developed straight into the frame converted from)
+            if (!rawFrame(w, h, &err) ||
+                !mlv_->develop(n, s, reinterpret_cast<uint16_t*>(raw_->data[0]), raw_->linesize[0] / ptrdiff_t(sizeof(uint16_t)), &err))
+                return nullptr;
             rawFrame_ = n;
             rawHalf_ = half;
             stillFrame_.reset();
         }
         if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH)
-            stillFrame_ = convert(raw_, double(n) / fps_, targetW, targetH, true);
+            stillFrame_ = convert(raw_, double(n) / fps_, targetW, targetH, highQuality);
         curPts_ = double(n) / fps_;
         return stillFrame_;
     }
@@ -1393,6 +1408,68 @@ Frame16 rotateFrame(const Frame16& f, int degrees) {
 
 namespace {
 
+// A Magic Lantern recording's sound (its PCM blocks, read here: FFmpeg's reader goes through every picture to reach
+// them), as decodeAudioStream hands it on.
+bool decodeMlvSound(const std::string& file, int sampleRate, int ordinal, std::vector<float>& samples, int& channels,
+                    std::string* error, const std::atomic<bool>* cancel, AVChannelLayout* layoutOut,
+                    const std::function<bool(std::vector<float>& samples, bool last)>* drain, double seekTo) {
+    MlvReader reader;
+    if (!reader.open(file, error)) return false;
+    const MlvInfo& mi = reader.info();
+    if (!mi.hasAudio || ordinal > 0) {
+        if (error) *error = "No audio stream";
+        return false;
+    }
+    struct Cleanup {
+        AVChannelLayout in{};
+        SwrContext* swr = nullptr;
+        ~Cleanup() {
+            swr_free(&swr);
+            av_channel_layout_uninit(&in);
+        }
+    } c;
+    av_channel_layout_default(&c.in, mi.channels);
+    if (layoutOut) av_channel_layout_copy(layoutOut, &c.in);
+    AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
+    const AVChannelLayout* outLayout = ordinal < 0 ? &stereo : &c.in;
+    channels = outLayout->nb_channels;
+    const int rc = swr_alloc_set_opts2(&c.swr, outLayout, AV_SAMPLE_FMT_FLT, sampleRate, &c.in, AV_SAMPLE_FMT_S32, mi.sampleRate, 0, nullptr);
+    if (rc < 0 || swr_init(c.swr) < 0) {
+        if (error) *error = "Cannot initialise resampler";
+        return false;
+    }
+    const size_t nch = size_t(channels);
+    const int64_t from = std::max<int64_t>(0, std::llround(seekTo * mi.sampleRate));  // (sample 0 is then seekTo)
+    samples.clear();
+    if (!drain) samples.reserve(size_t(double(std::max<int64_t>(0, mi.soundFrames - from)) / mi.sampleRate * sampleRate * double(nch)) + 4096);
+    std::vector<float> tmp;
+    auto append = [&](const uint8_t** in, int nb) {
+        const int maxOut = swr_get_out_samples(c.swr, nb);
+        if (maxOut <= 0) return;
+        tmp.resize(size_t(maxOut) * nch);
+        uint8_t* outPtr[1] = {reinterpret_cast<uint8_t*>(tmp.data())};
+        const int got = swr_convert(c.swr, outPtr, maxOut, in, nb);
+        if (got > 0) samples.insert(samples.end(), tmp.begin(), tmp.begin() + int64_t(got) * int64_t(nch));
+    };
+    bool cancelled = false, stopped = false;
+    const bool ok = reader.readSound(
+        from,
+        [&](const int32_t* pcm, size_t frames) {
+            if (cancel && cancel->load()) return !(cancelled = true);
+            const uint8_t* in[1] = {reinterpret_cast<const uint8_t*>(pcm)};
+            append(in, int(frames));
+            if (drain && !(*drain)(samples, false)) return !(stopped = true);
+            return true;
+        },
+        error);
+    if (!ok || cancelled) return false;
+    if (stopped) return true;
+    append(nullptr, 0);  // flush the resampler
+    if (drain) (*drain)(samples, true);
+    samples.shrink_to_fit();
+    return true;
+}
+
 // One audio stream decoded whole to float at `sampleRate`, aligned so sample 0 is media time 0: the best stream
 // mixed to stereo (ordinal -1), or the ordinal-th audio stream with its own channels. `channels` says how many.
 // With `drain`, it is handed `samples` after each decoded frame (it may take some off the front; false stops the decode)
@@ -1400,6 +1477,8 @@ namespace {
 bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std::vector<float>& samples, int& channels,
                        std::string* error, const std::atomic<bool>* cancel, AVChannelLayout* layoutOut = nullptr,
                        const std::function<bool(std::vector<float>& samples, bool last)>* drain = nullptr, double seekTo = 0) {
+    if (isMlvPath(uninterpretedPath(path)))
+        return decodeMlvSound(uninterpretedPath(path), sampleRate, ordinal, samples, channels, error, cancel, layoutOut, drain, seekTo);
     AVFormatContext* fmt = nullptr;
     int rc = openMediaInput(&fmt, path);
     if (rc < 0) {
@@ -1651,7 +1730,9 @@ AudioBufferPtr decodeAmbisonic(const std::string& path, int sampleRate, std::str
     }
     // The stream the stereo mix comes from, with its own channels.
     int ordinal = -1;
-    {
+    if (MlvInfo mi; isMlvPath(uninterpretedPath(path))) {
+        if (readMlvInfo(uninterpretedPath(path), mi, error) && mi.hasAudio) ordinal = 0;  // (its one sound stream)
+    } else {
         AVFormatContext* fmt = nullptr;
         if (int rc = openMediaInput(&fmt, path); rc < 0) {
             if (error) *error = averr(rc);
@@ -1734,7 +1815,9 @@ AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string*
     }
     // Chosen channels: each audio stream they come from, decoded with its own channels, then routed to stereo.
     std::vector<int> streams;  // channels per audio stream
-    {
+    if (MlvInfo mi; isMlvPath(uninterpretedPath(path))) {
+        if (readMlvInfo(uninterpretedPath(path), mi, error) && mi.hasAudio) streams.push_back(mi.channels);
+    } else {
         AVFormatContext* fmt = nullptr;
         if (int rc = openMediaInput(&fmt, path); rc < 0) {
             if (error) *error = averr(rc);

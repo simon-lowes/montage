@@ -76,6 +76,7 @@ private:
     Id imported_ = 0;
     bool recording_ = false;  // (until the recording's end has been taken in here)
     int generation_ = 0;      // the recording the recorder's notices are about
+    int64_t notedFrames_ = -1;  // the frames recorded when its writing was last noted
 };
 
 }  // namespace montage

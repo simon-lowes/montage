@@ -1,11 +1,17 @@
 #include "Mlv.h"
 
+#include <QDateTime>
 #include <QFile>
+#include <QFileInfo>
 #include <algorithm>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <mutex>
+
+#include "Image.h"
 
 namespace montage {
 
@@ -75,6 +81,7 @@ void colourFrom(const double xyzToCam[9], const double camWhite[3], MlvInfo& inf
     const double y1 = m[3] + m[4] + m[5];
     if (y1 <= 1e-9) return;
     for (int i = 0; i < 9; ++i) c.camToXyz[i] = m[i] / y1;
+    c.asShotX = x, c.asShotY = y;
 }
 
 std::string chunkPath(const std::string& path, int i) {
@@ -110,11 +117,11 @@ bool buildHuffman(const uint8_t counts[16], const uint8_t* values, int nvalues, 
         h.valptr[len] = k;
         h.mincode[len] = code;
         for (int i = 0; i < counts[len - 1]; ++i, ++k, ++code) {
+            if (code >= (1 << len)) return false;  // (more codes than this length has)
             if (len <= 9)
                 for (int fill = 0; fill < (1 << (9 - len)); ++fill) h.fast[(code << (9 - len)) | fill] = uint16_t((len << 8) | values[k]);
         }
         h.maxcode[len] = counts[len - 1] ? code - 1 : -1;
-        if (code > (1 << len)) return false;
         code <<= 1;
     }
     h.maxcode[17] = 0x7FFFFFFF;
@@ -200,7 +207,7 @@ int decodeDiff(BitReader& br, const Huffman& h) {
 }  // namespace
 
 bool decodeLosslessJpeg(const uint8_t* data, size_t size, std::vector<uint16_t>& out, int& width, int& height, int& components,
-                        int& bits, std::string* error) {
+                        int& bits, std::string* error, size_t samples) {
     auto fail = [&](const char* why) {
         if (error) *error = why;
         return false;
@@ -250,9 +257,11 @@ bool decodeLosslessJpeg(const uint8_t* data, size_t size, std::vector<uint16_t>&
         } else if (marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC) {
             return fail("Not a lossless JPEG frame (another process)");
         } else if (marker == 0xDD) {
+            if (len < 4) return fail("Damaged restart interval");
             restartInterval = (seg[0] << 8) | seg[1];
         } else if (marker == 0xDA) {
             if (!width) return fail("Scan before the frame header");
+            if (len < 3) return fail("Unsupported scan");
             const int ns = seg[0];
             if (ns != components || len < 6 + ns * 2) return fail("Unsupported scan");
             for (int i = 0; i < ns; ++i) {
@@ -269,7 +278,8 @@ bool decodeLosslessJpeg(const uint8_t* data, size_t size, std::vector<uint16_t>&
             p = segEnd;
             // The samples.
             const size_t rowLen = size_t(width) * size_t(components);
-            out.assign(rowLen * size_t(height), 0);
+            if (samples && rowLen * size_t(height) != samples) return fail("The lossless JPEG frame is not the picture's size");
+            out.resize(rowLen * size_t(height));  // (every sample written below)
             BitReader br(p, end);
             const int initial = 1 << std::max(0, bits - pt - 1);
             const int perRestart = restartInterval;
@@ -322,126 +332,181 @@ bool decodeLosslessJpeg(const uint8_t* data, size_t size, std::vector<uint16_t>&
 
 bool isMlvPath(const std::string& path) { return endsWithNoCase(path, ".mlv"); }
 
-MlvReader::MlvReader() = default;
-MlvReader::~MlvReader() = default;
+struct MlvIndex {
+    struct Block {
+        int chunk = 0;
+        int64_t offset = 0;  // the data's, in its chunk
+        int64_t size = 0;
+    };
+    MlvInfo info;
+    std::vector<std::string> chunks;
+    std::vector<Block> frames;  // by frame number less the first's (size 0: missing)
+    std::vector<Block> sound;   // in order
+};
 
-bool MlvReader::open(const std::string& path, std::string* error) {
-    files_.clear();
-    frames_.clear();
-    info_ = MlvInfo{};
+namespace {
+
+constexpr int kMaxSide = 16384;
+
+// The white of WBAL's presets (mlv.h's WB_ modes), as mlv_dump takes them; 0 for daylight (D65).
+int presetKelvin(int mode, int kelvin) {
+    switch (mode) {
+        case 1: return 5200;   // daylight
+        case 2: return 6000;   // cloudy
+        case 3: return 3200;   // tungsten
+        case 4: return 4000;   // fluorescent
+        case 5: return 5500;   // flash
+        case 8: return 7000;   // shade
+        case 9: return kelvin;  // the temperature set
+        default: return 0;     // auto (what it chose is not recorded)
+    }
+}
+
+std::shared_ptr<const MlvIndex> indexMlv(const std::string& path, std::string* error) {
     auto fail = [&](const std::string& why) {
         if (error) *error = why;
-        files_.clear();
-        frames_.clear();
-        return false;
+        return std::shared_ptr<const MlvIndex>();
     };
+    auto index = std::make_shared<MlvIndex>();
+    MlvInfo& info = index->info;
     bool rawi = false;
     double xyzToCam[9] = {};
     bool matrix = false;
     int wbMode = -1, wbKelvin = 0;
     uint32_t gain[3] = {0, 0, 0};
-    int audioFrames = 0;
-    for (int chunk = 0; chunk < 100; ++chunk) {
+    uint64_t guid = 0;
+    struct Numbered {
+        uint32_t n;
+        MlvIndex::Block block;
+    };
+    std::vector<Numbered> frames, sound;
+    for (int chunk = 0; chunk <= 100; ++chunk) {
         const std::string file = chunk == 0 ? path : chunkPath(path, chunk);
-        auto f = std::make_unique<QFile>(QString::fromStdString(file));
-        if (!f->open(QIODevice::ReadOnly)) {
+        QFile f(QString::fromStdString(file));
+        if (!f.open(QIODevice::ReadOnly)) {
             if (chunk == 0) return fail("Cannot open " + path);
             break;  // (no more chunks)
         }
         uint8_t head[52];
-        if (f->read(reinterpret_cast<char*>(head), 52) != 52 || std::memcmp(head, "MLVI", 4) != 0) {
+        if (f.read(reinterpret_cast<char*>(head), 52) != 52 || std::memcmp(head, "MLVI", 4) != 0) {
             if (chunk == 0) return fail(path + " is not a Magic Lantern Video file");
             break;
         }
         const uint32_t headerSize = u32(head + 4);
         if (chunk == 0) {
+            guid = u64(head + 8);
             const uint16_t videoClass = u16(head + 32);
-            info_.fpsNum = int(u32(head + 44));
-            info_.fpsDen = int(u32(head + 48));
-            info_.lossless = (videoClass & 0x20) != 0;
+            info.fpsNum = int(u32(head + 44));
+            info.fpsDen = int(u32(head + 48));
+            info.lossless = (videoClass & 0x20) != 0;
             if ((videoClass & 0x0F) != 0x01) return fail(path + " holds no RAW video (its frames are JPEG, H.264 or YUV)");
             if (videoClass & 0xC0) return fail(path + " is compressed with LZMA or delta frames (MLV App's own), which this does not read");
+        } else if (u64(head + 8) != guid) {
+            break;  // (another recording's chunk of the same name)
         }
-        const int64_t total = f->size();
+        const int c = int(index->chunks.size());
+        const int64_t total = f.size();
         int64_t at = std::max<int64_t>(16, headerSize);
         uint8_t b[256];
         while (at + 16 <= total) {
-            f->seek(at);
-            if (f->read(reinterpret_cast<char*>(b), 16) != 16) break;
+            f.seek(at);
+            if (f.read(reinterpret_cast<char*>(b), 16) != 16) break;
             const uint32_t blockSize = u32(b + 4);
             if (blockSize < 16 || at + blockSize > total) break;  // (a recording cut short: what came before is kept)
             const size_t want = std::min<size_t>(sizeof b, blockSize);
-            if (want > 16 && f->read(reinterpret_cast<char*>(b + 16), qint64(want - 16)) != qint64(want - 16)) break;
+            if (want > 16 && f.read(reinterpret_cast<char*>(b + 16), qint64(want - 16)) != qint64(want - 16)) break;
             auto is = [&](const char* t) { return std::memcmp(b, t, 4) == 0; };
             if (is("VIDF") && want >= 32) {
-                const uint32_t n = u32(b + 16), space = u32(b + 28);
-                if (n < 10000000 && 32 + int64_t(space) <= int64_t(blockSize)) {
-                    if (frames_.size() <= n) frames_.resize(size_t(n) + 1);
-                    frames_[n] = Frame{int(files_.size()), at + 32 + space, int64_t(blockSize) - 32 - space};
-                }
+                const uint32_t space = u32(b + 28);
+                if (32 + int64_t(space) < int64_t(blockSize)) frames.push_back({u32(b + 16), {c, at + 32 + space, int64_t(blockSize) - 32 - space}});
+            } else if (is("AUDF") && want >= 24) {
+                const uint32_t space = u32(b + 20);
+                if (24 + int64_t(space) < int64_t(blockSize)) sound.push_back({u32(b + 16), {c, at + 24 + space, int64_t(blockSize) - 24 - space}});
             } else if (is("RAWI") && want >= 180) {
                 rawi = true;
-                info_.width = u16(b + 16);
-                info_.height = u16(b + 18);
+                info.width = u16(b + 16);
+                info.height = u16(b + 18);
                 const uint8_t* r = b + 20;  // raw_info
-                info_.bitsPerPixel = i32(r + 24);
-                info_.black = i32(r + 28);
-                info_.white = i32(r + 32);
-                info_.cfa = i32(r + 76);
+                info.bitsPerPixel = i32(r + 24);
+                info.black = i32(r + 28);
+                info.white = i32(r + 32);
+                info.cfa = i32(r + 76);
                 matrix = false;
                 for (int i = 0; i < 9; ++i) {
                     const int num = i32(r + 84 + i * 8), den = i32(r + 88 + i * 8);
                     xyzToCam[i] = den ? double(num) / den : 0;
                     matrix = matrix || xyzToCam[i] != 0;
                 }
+            } else if (is("RAWC") && want >= 32) {
+                const int x = b[24] + b[25], y = b[26] + b[27];  // binning and skipping, across and down
+                if (x > 0 && y > 0) info.pixelAspect = double(x) / y;
             } else if (is("WAVI") && want >= 32) {
-                info_.channels = u16(b + 18);
-                info_.sampleRate = int(u32(b + 20));
-                info_.bitsPerSample = u16(b + 30);
-            } else if (is("AUDF")) {
-                ++audioFrames;
+                info.channels = u16(b + 18);
+                info.sampleRate = int(u32(b + 20));
+                info.bitsPerSample = u16(b + 30);
             } else if (is("IDNT") && want >= 84) {
-                info_.camera = text(b + 16, 32);
+                info.camera = text(b + 16, 32);
             } else if (is("LENS") && want >= 96) {
-                info_.focalLength = u16(b + 16);
-                info_.aperture = u16(b + 20) / 100.0;
-                info_.lens = text(b + 32, 32);
+                info.focalLength = u16(b + 16);
+                info.aperture = u16(b + 20) / 100.0;
+                info.lens = text(b + 32, 32);
             } else if (is("EXPO") && want >= 40) {
-                info_.iso = int(u32(b + 20));
-                info_.shutter = double(u64(b + 32)) / 1e6;
+                info.iso = int(u32(b + 20));
+                info.shutter = double(u64(b + 32)) / 1e6;
             } else if (is("WBAL") && want >= 44) {
                 wbMode = int(u32(b + 16));
                 wbKelvin = int(u32(b + 20));
                 gain[0] = u32(b + 24), gain[1] = u32(b + 28), gain[2] = u32(b + 32);
-            } else if (is("RTCI") && want >= 44 && info_.created.empty()) {
+            } else if (is("RTCI") && want >= 44 && info.created.empty()) {
                 char t[64];
                 std::snprintf(t, sizeof t, "%04d-%02d-%02dT%02d:%02d:%02d", 1900 + u16(b + 26), u16(b + 24) + 1, u16(b + 22), u16(b + 20),
                               u16(b + 18), u16(b + 16));
-                info_.created = t;
+                info.created = t;
             }
             at += blockSize;
         }
-        files_.push_back(std::move(f));
+        index->chunks.push_back(file);
         if (u16(head + 26) <= 1 && chunk == 0) {
             // (fileCount: a recording in one file, unless the chunks are there anyway)
             if (!QFile::exists(QString::fromStdString(chunkPath(path, 1)))) break;
         }
     }
-    if (!rawi || info_.width <= 0 || info_.height <= 0) return fail(path + " has no RAW frame description");
-    if (frames_.empty()) return fail(path + " has no frames");
-    if (info_.bitsPerPixel < 8 || info_.bitsPerPixel > 16) info_.bitsPerPixel = 14;
-    if (info_.white <= info_.black) info_.white = (1 << info_.bitsPerPixel) - 1;
-    if (info_.fpsNum <= 0 || info_.fpsDen <= 0) info_.fpsNum = 25, info_.fpsDen = 1;
-    info_.frames = int(frames_.size());
-    info_.chunks = int(files_.size());
-    info_.hasAudio = audioFrames > 0 && info_.sampleRate > 0 && info_.channels > 0;
-    info_.kelvin = wbKelvin;
+    if (!rawi || info.width < 2 || info.height < 2 || info.width > kMaxSide || info.height > kMaxSide)
+        return fail(path + " has no usable RAW frame description");
+    if (frames.empty()) return fail(path + " has no frames");
+    // Frames by number, from the first recorded (a number far past the frames there are is damage, left out).
+    auto byNumber = [](const Numbered& a, const Numbered& b) { return a.n < b.n; };
+    std::stable_sort(frames.begin(), frames.end(), byNumber);
+    const uint32_t first = frames.front().n;
+    const uint64_t limit = uint64_t(frames.size()) * 2 + 1000;
+    for (const Numbered& fr : frames) {
+        const uint64_t k = uint64_t(fr.n) - first;
+        if (k >= limit) break;
+        if (index->frames.size() <= k) index->frames.resize(size_t(k) + 1);
+        if (index->frames[size_t(k)].size == 0) index->frames[size_t(k)] = fr.block;
+    }
+    std::stable_sort(sound.begin(), sound.end(), byNumber);
+    if (info.bitsPerPixel < 8 || info.bitsPerPixel > 16) info.bitsPerPixel = 14;
+    if (info.white <= info.black) info.white = (1 << info.bitsPerPixel) - 1;
+    if (info.fpsNum <= 0 || info.fpsDen <= 0) info.fpsNum = 25, info.fpsDen = 1;
+    info.frames = int(index->frames.size());
+    info.chunks = int(index->chunks.size());
+    if (!(info.pixelAspect > 0.2 && info.pixelAspect < 5)) info.pixelAspect = 1;
+    if (info.sampleRate > 0 && info.channels > 0 && info.channels <= 64 && (info.bitsPerSample == 16 || info.bitsPerSample == 24)) {
+        const int64_t bytesPerFrame = int64_t(info.channels) * (info.bitsPerSample / 8);
+        for (const Numbered& a : sound) {
+            index->sound.push_back(a.block);
+            info.soundFrames += a.block.size / bytesPerFrame;
+        }
+    }
+    info.hasAudio = info.soundFrames > 0;
+    info.kelvin = presetKelvin(wbMode, wbKelvin);
     // Levels as fractions of 16 bits (the samples are scaled to 16 bits).
-    const double scale = double(1 << (16 - info_.bitsPerPixel)) / 65535.0;
-    info_.color.black = info_.black * scale;
-    info_.color.white = info_.white * scale;
-    info_.color.gain = 1;
-    // White balance as shot: Canon's custom gains, else its colour temperature, else daylight (D65).
+    const double scale = double(1 << (16 - info.bitsPerPixel)) / 65535.0;
+    info.color.black = info.black * scale;
+    info.color.white = info.white * scale;
+    info.color.gain = 1;
+    // White balance as shot: Canon's custom gains, else its preset's or set colour temperature, else daylight (D65).
     if (matrix) {
         double camWhite[3] = {1, 1, 1};
         auto fromXyz = [&](double x, double y) {
@@ -450,9 +515,9 @@ bool MlvReader::open(const std::string& path, std::string* error) {
         };
         if (wbMode == 6 && gain[0] && gain[1] && gain[2]) {
             camWhite[0] = double(gain[1]) / gain[0], camWhite[1] = 1, camWhite[2] = double(gain[1]) / gain[2];
-        } else if (wbKelvin >= 2000 && wbKelvin <= 25000) {
+        } else if (info.kelvin >= 2000 && info.kelvin <= 25000) {
             double x, y;
-            planckianChromaticity(wbKelvin, x, y);
+            planckianChromaticity(info.kelvin, x, y);
             fromXyz(x, y);
         } else {
             fromXyz(0.3127, 0.3290);
@@ -460,96 +525,209 @@ bool MlvReader::open(const std::string& path, std::string* error) {
         if (camWhite[0] > 0 && camWhite[1] > 0 && camWhite[2] > 0) {
             const double green = camWhite[1];
             for (double& v : camWhite) v /= green;
-            colourFrom(xyzToCam, camWhite, info_);
+            colourFrom(xyzToCam, camWhite, info);
         }
+    }
+    return index;
+}
+
+// The indexes of files read, while each is unchanged (its size and time), so the decoders, thumbnails and analyses
+// opening the same recording read its blocks once.
+std::shared_ptr<const MlvIndex> sharedIndex(const std::string& path, std::string* error) {
+    static std::mutex mutex;
+    static std::map<std::string, std::pair<std::string, std::shared_ptr<const MlvIndex>>> cache;
+    const QFileInfo fi(QString::fromStdString(path));
+    const std::string stamp = std::to_string(fi.size()) + ":" + std::to_string(fi.lastModified().toMSecsSinceEpoch());
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto it = cache.find(path);
+        if (it != cache.end() && it->second.first == stamp) return it->second.second;
+    }
+    auto index = indexMlv(path, error);
+    if (!index) return index;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (cache.size() >= 64) cache.clear();
+    cache[path] = {stamp, index};
+    return index;
+}
+
+}  // namespace
+
+MlvReader::MlvReader() = default;
+MlvReader::~MlvReader() = default;
+
+bool MlvReader::open(const std::string& path, std::string* error) {
+    index_.reset();
+    file_.reset();
+    fileChunk_ = -1;
+    index_ = sharedIndex(path, error);
+    return bool(index_);
+}
+
+const MlvInfo& MlvReader::info() const {
+    static const MlvInfo none;
+    return index_ ? index_->info : none;
+}
+
+bool MlvReader::readBlock(int chunk, int64_t offset, int64_t size, std::string* error) {
+    if (chunk != fileChunk_) {
+        file_ = std::make_unique<QFile>(QString::fromStdString(index_->chunks[size_t(chunk)]));
+        fileChunk_ = chunk;
+        if (!file_->open(QIODevice::ReadOnly)) {
+            fileChunk_ = -1;
+            if (error) *error = "Cannot open " + index_->chunks[size_t(chunk)];
+            return false;
+        }
+    }
+    buffer_.resize(size_t(size));
+    if (!file_->seek(offset) || file_->read(reinterpret_cast<char*>(buffer_.data()), qint64(size)) != qint64(size)) {
+        if (error) *error = "Cannot read " + index_->chunks[size_t(chunk)];
+        return false;
     }
     return true;
 }
 
-bool MlvReader::readMosaic(int n, std::vector<uint16_t>& out, std::string* error) {
-    if (frames_.empty()) return false;
-    n = std::clamp(n, 0, int(frames_.size()) - 1);
-    while (n > 0 && frames_[size_t(n)].size <= 0) --n;  // (a frame missing: the one before)
-    const Frame& fr = frames_[size_t(n)];
-    if (fr.size <= 0) {
-        if (error) *error = "The frame is missing";
-        return false;
-    }
-    QFile& f = *files_[size_t(fr.chunk)];
-    buffer_.resize(size_t(fr.size));
-    if (!f.seek(fr.offset) || f.read(reinterpret_cast<char*>(buffer_.data()), qint64(fr.size)) != qint64(fr.size)) {
-        if (error) *error = "Cannot read frame " + std::to_string(n);
-        return false;
-    }
-    const int w = info_.width, h = info_.height;
+bool MlvReader::loadMosaic(int n, std::string* error) {
+    if (!index_) return false;
+    const std::vector<MlvIndex::Block>& frames = index_->frames;
+    n = std::clamp(n, 0, int(frames.size()) - 1);
+    while (n > 0 && frames[size_t(n)].size <= 0) --n;  // (a frame missing: the one before; the first is there)
+    const MlvIndex::Block& fr = frames[size_t(n)];
+    if (!readBlock(fr.chunk, fr.offset, fr.size, error)) return false;
+    const MlvInfo& info = index_->info;
+    const int w = info.width, h = info.height;
     const size_t count = size_t(w) * size_t(h);
-    out.resize(count);
-    if (info_.lossless) {
-        std::vector<uint16_t> samples;
+    const int shift = 16 - info.bitsPerPixel;
+    if (info.lossless) {
         int jw = 0, jh = 0, jc = 0, jbits = 0;
-        if (!decodeLosslessJpeg(buffer_.data(), buffer_.size(), samples, jw, jh, jc, jbits, error)) return false;
-        if (samples.size() < count) {
-            if (error) *error = "The frame is smaller than the picture";
-            return false;
-        }
+        if (!decodeLosslessJpeg(buffer_.data(), buffer_.size(), mosaic_, jw, jh, jc, jbits, error, count)) return false;
         // (the samples in raster order, whatever the components; scaled to 16 bits)
-        const int shift = 16 - std::clamp(info_.bitsPerPixel, 8, 16);
-        for (size_t i = 0; i < count; ++i) out[i] = uint16_t(std::min<uint32_t>(65535, uint32_t(samples[i]) << shift));
+        if (shift > 0)
+            parallelRows(h, [&](int y0, int y1) {
+                for (size_t i = size_t(y0) * size_t(w), e = size_t(y1) * size_t(w); i < e; ++i)
+                    mosaic_[i] = uint16_t(std::min<uint32_t>(65535, uint32_t(mosaic_[i]) << shift));
+            });
         return true;
     }
     // Uncompressed: samples of bitsPerPixel bits, most significant first, in little-endian 16-bit words.
-    const int bpp = info_.bitsPerPixel;
+    const int bpp = info.bitsPerPixel;
     const size_t needBytes = (count * size_t(bpp) + 7) / 8;
     if (buffer_.size() < needBytes) {
         if (error) *error = "The frame is cut short";
         return false;
     }
+    mosaic_.resize(count);
     const uint8_t* src = buffer_.data();
     const size_t words = buffer_.size() / 2;
-    const int shift = 16 - bpp;
     const uint32_t mask = (1u << bpp) - 1;
-    uint64_t acc = 0;
-    int have = 0;
-    size_t w16 = 0;
-    for (size_t i = 0; i < count; ++i) {
-        while (have < bpp) {
-            const uint32_t word = w16 < words ? u16(src + w16 * 2) : 0;
-            ++w16;
-            acc = (acc << 16) | word;
-            have += 16;
+    parallelRows(h, [&](int y0, int y1) {
+        // (each row from its first sample's bit)
+        const uint64_t bit = uint64_t(y0) * uint64_t(w) * uint64_t(bpp);
+        size_t w16 = size_t(bit / 16);
+        int have = 0;
+        uint64_t acc = 0;
+        int skip = int(bit % 16);
+        uint16_t* out = mosaic_.data() + size_t(y0) * size_t(w);
+        const size_t n = size_t(y1 - y0) * size_t(w);
+        for (size_t i = 0; i < n; ++i) {
+            while (have < bpp + skip) {
+                const uint32_t word = w16 < words ? u16(src + w16 * 2) : 0;
+                ++w16;
+                acc = (acc << 16) | word;
+                have += 16;
+            }
+            have -= skip;
+            skip = 0;
+            have -= bpp;
+            out[i] = uint16_t(((acc >> have) & mask) << shift);
         }
-        have -= bpp;
-        out[i] = uint16_t(((acc >> have) & mask) << shift);
-    }
+    });
+    return true;
+}
+
+bool MlvReader::readMosaic(int n, std::vector<uint16_t>& out, std::string* error) {
+    if (!loadMosaic(n, error)) return false;
+    out = mosaic_;
     return true;
 }
 
 namespace {
+// The pattern's red site (as DNG's CFAPattern packs it, one byte a site: 0 red, 1 green, 2 blue); red, green / green,
+// blue if it is not a Bayer pattern.
 void redSite(const MlvInfo& info, int& sx, int& sy) {
-    int red = 0;
-    for (int i = 0; i < 4; ++i)
-        if (((info.cfa >> (i * 8)) & 0xFF) == 0) red = i;
+    int count[3] = {0, 0, 0}, red = 0;
+    for (int i = 0; i < 4; ++i) {
+        const int v = (info.cfa >> (i * 8)) & 0xFF;
+        if (v > 2) return void(sx = sy = 0);
+        ++count[v];
+        if (v == 0) red = i;
+    }
+    if (count[0] != 1 || count[1] != 2 || count[2] != 1) red = 0;
     sx = red & 1, sy = red >> 1;
+}
+
+// The mosaic developed: from the red site, in whole 2x2 cells.
+void developedMosaic(const MlvInfo& info, int& sx, int& sy, int& w, int& h) {
+    redSite(info, sx, sy);
+    w = (info.width - sx) & ~1;
+    h = (info.height - sy) & ~1;
 }
 }  // namespace
 
 void mlvPictureSize(const MlvInfo& info, bool half, int& width, int& height) {
-    int sx = 0, sy = 0;
-    redSite(info, sx, sy);
+    int sx, sy, w, h;
+    developedMosaic(info, sx, sy, w, h);
     const int crop[4] = {0, 0, 0, 0};
-    proResRawSize(info.width - sx, info.height - sy, crop, half, width, height);
+    proResRawSize(w, h, crop, half, width, height);
+}
+
+bool MlvReader::develop(int n, const RawSettings& settings, uint16_t* rgb, ptrdiff_t stride, std::string* error) {
+    if (!loadMosaic(n, error)) return false;
+    const MlvInfo& info = index_->info;
+    int sx, sy, w, h;
+    developedMosaic(info, sx, sy, w, h);
+    const int crop[4] = {0, 0, 0, 0};
+    developProResRaw(mosaic_.data() + size_t(sy) * size_t(info.width) + size_t(sx), w, h, info.width, info.color, settings, crop, rgb,
+                     stride);
+    return true;
 }
 
 bool MlvReader::develop(int n, const RawSettings& settings, DevelopedRaw& out, std::string* error) {
-    std::vector<uint16_t> mosaic;
-    if (!readMosaic(n, mosaic, error)) return false;
-    // The pattern's red site: the mosaic started there, so it reads as red, green / green, blue.
-    int sx = 0, sy = 0;
-    redSite(info_, sx, sy);
-    const int crop[4] = {0, 0, 0, 0};
-    developProResRaw(mosaic.data() + size_t(sy) * size_t(info_.width) + size_t(sx), info_.width - sx, info_.height - sy, info_.width, info_.color, settings,
-                     crop, out);
+    if (!index_) return false;
+    mlvPictureSize(index_->info, settings.half, out.width, out.height);
+    out.rgb.resize(size_t(out.width) * size_t(out.height) * 3);
+    if (!develop(n, settings, out.rgb.data(), ptrdiff_t(out.width) * 3, error)) return false;
     return out.width > 0 && out.height > 0;
+}
+
+bool MlvReader::readSound(int64_t from, const std::function<bool(const int32_t*, size_t)>& sink, std::string* error) {
+    if (!index_ || !index_->info.hasAudio) {
+        if (error) *error = "No audio stream";
+        return false;
+    }
+    const MlvInfo& info = index_->info;
+    const int bytes = info.bitsPerSample / 8;
+    const int64_t perFrame = int64_t(info.channels) * bytes;
+    int64_t at = 0;  // the sample frame each block starts at
+    for (const MlvIndex::Block& a : index_->sound) {
+        const int64_t frames = a.size / perFrame;
+        if (at + frames <= from) {
+            at += frames;
+            continue;
+        }
+        if (!readBlock(a.chunk, a.offset, frames * perFrame, error)) return false;
+        const int64_t skip = std::max<int64_t>(0, from - at);
+        const size_t n = size_t((frames - skip) * info.channels);
+        sound_.resize(n);
+        const uint8_t* p = buffer_.data() + skip * perFrame;
+        if (bytes == 2)
+            for (size_t i = 0; i < n; ++i, p += 2) sound_[i] = int32_t(uint32_t(u16(p)) << 16);
+        else
+            for (size_t i = 0; i < n; ++i, p += 3) sound_[i] = int32_t((uint32_t(p[0]) << 8) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 24));
+        if (!sink(sound_.data(), size_t(frames - skip))) return true;
+        at += frames;
+    }
+    return true;
 }
 
 bool readMlvInfo(const std::string& path, MlvInfo& out, std::string* error) {

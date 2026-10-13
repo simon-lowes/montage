@@ -754,11 +754,11 @@ private slots:
         double d65[3];
         for (int r = 0; r < 3; ++r) d65[r] = (cm[r * 3] * 0.95047 + cm[r * 3 + 1] * 1.0 + cm[r * 3 + 2] * 1.08883) / 10000.0;
         for (double& v : d65) v /= (cm[3] * 0.95047 + cm[4] + cm[5] * 1.08883) / 10000.0;
-        // The site's value (14 bits) in frame f: the grey a little brighter each frame, so frames differ.
+        // The site's value (14 bits) in frame f: the grey brighter each frame, so frames differ.
         auto site = [&](int x, int y, int f) {
             const int ch = (y & 1) ? ((x & 1) ? 2 : 1) : ((x & 1) ? 1 : 0);
             const double red[3] = {0.5, 0.05, 0.03};
-            const double v = x < W / 2 ? 0.18 * (1 + 0.01 * f) * d65[ch] : red[ch];
+            const double v = x < W / 2 ? 0.18 * (1 + 0.05 * f) * d65[ch] : red[ch];
             return uint16_t(std::lround(black + std::clamp(v, 0.0, 1.0) * (white - black)));
         };
         struct Le {
@@ -784,7 +784,7 @@ private slots:
             out.u16(fileNum), out.u16(fileCount);
             out.u32(0);
             out.u16(videoClass), out.u16(1);
-            out.u32(uint32_t(frames)), out.u32(uint32_t(frames));
+            out.u32(uint32_t(frames)), out.u32(0);  // (the sound's count is 0 until the camera finishes; not relied on)
             out.u32(uint32_t(fpsNum)), out.u32(uint32_t(fpsDen));
         };
         // Samples packed most significant bit first in little-endian 16-bit words, as Canon's raw buffer holds them.
@@ -868,6 +868,10 @@ private slots:
             bool audio = true;
             bool skipFrame3 = false;
             int videoClass = 0;  // (0: as the spec says)
+            int firstNumber = 0;  // the first frame's number
+            int rawiWidth = 0;    // (0: W)
+            int wbMode = -1, wbKelvin = 0;  // (-1: no WBAL)
+            bool anamorphic = false;  // RAWC: 1x3 binning
         };
         auto write = [&](const std::string& path, const Spec& sp) {
             std::vector<Le> files(size_t(sp.chunks));
@@ -875,7 +879,7 @@ private slots:
             for (int c = 0; c < sp.chunks; ++c) fileHeader(files[size_t(c)], videoClass, c, sp.chunks, sp.frames, 23976, 1000);
             Le& first = files[0];
             Le rawi;
-            rawi.u16(W), rawi.u16(H);
+            rawi.u16(sp.rawiWidth ? sp.rawiWidth : W), rawi.u16(H);
             rawi.u32(1), rawi.u32(0), rawi.u32(H), rawi.u32(W), rawi.u32(uint32_t(W * sp.bpp / 8)), rawi.u32(uint32_t(W * H * sp.bpp / 8));
             const int scale = 1 << (14 - std::min(sp.bpp, 14));
             rawi.u32(uint32_t(sp.bpp)), rawi.u32(uint32_t(black / scale)), rawi.u32(uint32_t(white / scale));
@@ -900,6 +904,16 @@ private slots:
             for (int v : {30, 15, 14, 9, 9, 125, 0, 0, 0, 0}) rtci.u16(v);  // 2025-10-09 14:15:30
             rtci.str("", 8);
             block(first, "RTCI", rtci.b);
+            if (sp.wbMode >= 0) {
+                Le wbal;
+                wbal.u32(uint32_t(sp.wbMode)), wbal.u32(uint32_t(sp.wbKelvin)), wbal.u32(0), wbal.u32(0), wbal.u32(0), wbal.u32(0), wbal.u32(0);
+                block(first, "WBAL", wbal.b);
+            }
+            if (sp.anamorphic) {
+                Le rawc;
+                rawc.u16(5796), rawc.u16(3870), rawc.u16(100), rawc.u16(0), rawc.u8(3), rawc.u8(0), rawc.u8(1), rawc.u8(0), rawc.u16(0), rawc.u16(0);
+                block(first, "RAWC", rawc.b);
+            }
             if (sp.audio) {
                 Le wavi;
                 wavi.u16(1), wavi.u16(2), wavi.u32(48000), wavi.u32(48000 * 4), wavi.u16(4), wavi.u16(16);
@@ -915,7 +929,7 @@ private slots:
                 const std::string data = sp.lossless ? lj92(mosaic, W / 2, H, 2, sp.bpp, sp.predictor) : pack(mosaic, sp.bpp);
                 if (!(sp.skipFrame3 && f == 3)) {
                     Le vidf;
-                    vidf.u32(uint32_t(f)), vidf.u16(0), vidf.u16(0), vidf.u16(0), vidf.u16(0), vidf.u32(8);
+                    vidf.u32(uint32_t(sp.firstNumber + f)), vidf.u16(0), vidf.u16(0), vidf.u16(0), vidf.u16(0), vidf.u32(8);
                     vidf.str("", 8);  // (frameSpace: padding before the frame, as the camera aligns it)
                     block(out, "VIDF", vidf.b + data, uint64_t(f) * 41708);
                 }
@@ -932,7 +946,7 @@ private slots:
                 }
             }
             for (int c = 0; c < sp.chunks; ++c) {
-                char ext[8];
+                char ext[16];
                 std::snprintf(ext, sizeof ext, "M%02d", c - 1);
                 const std::string p = c == 0 ? path : path.substr(0, path.size() - 3) + ext;
                 std::ofstream(p, std::ios::binary) << files[size_t(c)].b;
@@ -986,9 +1000,14 @@ private slots:
         QVERIFY2(std::fabs(gr - gg) < 0.004 && std::fabs(gb - gg) < 0.004, qPrintable(QString("%1 %2 %3").arg(gr).arg(gg).arg(gb)));
         const double rr = px(*f0, 70, 20, 0), rg = px(*f0, 70, 20, 1), rb = px(*f0, 70, 20, 2);
         QVERIFY(rr > rg + 0.1 && rr > rb + 0.1);
-        // Each frame its own (the grey 1 % brighter a frame), and at half size for a small picture.
-        Frame16Ptr f5 = dec.frameAt(5 / 23.976 + 0.001);
-        QVERIFY(f5 && px(*f5, 20, 20, 1) > gg + 0.002);
+        // Each frame its own (the grey 5 % brighter a frame), where the sequence asks for it (frame k at k x 1001/24000 s).
+        for (int k = 1; k < 6; ++k) {
+            Frame16Ptr fk = dec.frameAt(k * 1001 / 24000.0);
+            DevelopedRaw want;
+            QVERIFY(reader.develop(k, RawSettings{}, want, &err));
+            const double expected = want.rgb[(size_t(20) * size_t(want.width) + 20) * 3 + 1] / 65535.0;
+            QVERIFY2(fk && std::fabs(px(*fk, 20, 20, 1) - expected) < 0.0015, qPrintable(QString::number(k)));
+        }
         Frame16Ptr small = dec.frameAt(0, W / 2, H / 2);
         QVERIFY(small && small->width == W / 2);
         QVERIFY(std::fabs(px(*small, 10, 10, 1) - gg) < 0.004);
@@ -999,13 +1018,21 @@ private slots:
         QVERIFY(reader.develop(0, warm, dv, &err));
         const size_t at = (size_t(20) * size_t(dv.width) + 20) * 3;
         QVERIFY(dv.rgb[at + 2] > dv.rgb[at] + 1000);
-        // Its sound, through FFmpeg.
+        // Its sound (the header's count of sound blocks still 0, as a recording cut short leaves it), whole and from
+        // later on: the 1 kHz tone in step.
         AudioBufferPtr sound = decodeAudio(raw14, 48000, &err);
         QVERIFY2(sound, err.c_str());
         QVERIFY(std::abs(sound->frames() - int64_t(std::lround(6 / 23.976 * 48000))) < 100);
         float peak = 0;
         for (float s : sound->samples) peak = std::max(peak, std::fabs(s));
         QVERIFY(peak > 0.4f && peak < 0.6f);
+        std::vector<float> later;
+        QVERIFY2(decodeAudioStereoBlocks(raw14, 48000, 4096, [&](const std::vector<float>& b) { return later.insert(later.end(), b.begin(), b.end()), true; },
+                                         &err, nullptr, {}, 0.1),
+                 err.c_str());
+        QVERIFY(later.size() > 2000);
+        for (size_t i = 0; i < 1000; ++i)
+            QVERIFY(std::fabs(later[i * 2] - sound->samples[(4800 + i) * 2]) < 0.01f);
 
         // Lossless (LJ92, each predictor) and 12-bit, and chunks: the same mosaic.
         for (int predictor : {1, 4, 6, 7}) {
@@ -1054,7 +1081,67 @@ private slots:
             write(p, sp);
             MediaItem g;
             QVERIFY(probeMedia(p, g, &err));
-            QCOMPARE(g.width, W - 1);
+            QCOMPARE(g.width, W - 2);  // (whole cells, so the picture's size stays even)
+            QCOMPARE(g.height, H);
+        }
+        // Frames numbered from 100 (as a cut recording keeps them): its first is frame 0.
+        {
+            Spec sp;
+            sp.firstNumber = 100;
+            sp.audio = false;
+            const std::string p = path("from100.mlv");
+            write(p, sp);
+            MlvReader r;
+            QVERIFY(r.open(p, &err));
+            QCOMPARE(r.info().frames, 6);
+            std::vector<uint16_t> a, b;
+            QVERIFY(r.readMosaic(0, a, &err) && reader.readMosaic(0, b, &err) && a == b);
+        }
+        // White balance as shot: a preset's own light (daylight, whatever temperature was set before it), or the
+        // temperature set.
+        {
+            auto blueOverRed = [&](int mode, int kelvin, int expectKelvin) {
+                Spec sp;
+                sp.wbMode = mode, sp.wbKelvin = kelvin;
+                sp.audio = false;
+                const std::string p = path(("wb" + std::to_string(mode) + ".mlv").c_str());
+                write(p, sp);
+                MlvReader r;
+                if (!r.open(p, &err) || r.info().kelvin != expectKelvin) return -99999;
+                DevelopedRaw d;
+                if (!r.develop(0, RawSettings{}, d, &err)) return -99999;
+                const size_t i = (size_t(20) * size_t(d.width) + 20) * 3;
+                return int(d.rgb[i + 2]) - int(d.rgb[i]);
+            };
+            const int daylight = blueOverRed(1, 3200, 5200), tungsten = blueOverRed(9, 3200, 3200);
+            QVERIFY2(daylight > -99999 && tungsten > 1000 && std::abs(daylight) < tungsten / 2, qPrintable(QString("%1 %2").arg(daylight).arg(tungsten)));
+        }
+        // The 1x3 anamorphic modes: stretched three times across.
+        {
+            Spec sp;
+            sp.anamorphic = true;
+            sp.audio = false;
+            const std::string p = path("anamorphic.mlv");
+            write(p, sp);
+            MediaItem a;
+            QVERIFY(probeMedia(p, a, &err));
+            QCOMPARE(a.width, W * 3);
+            QCOMPARE(a.height, H);
+        }
+        // Damaged: a frame size past any sensor, a Huffman table with more codes than its lengths allow.
+        {
+            Spec sp;
+            sp.rawiWidth = 65535;
+            const std::string p = path("huge.mlv");
+            write(p, sp);
+            MlvReader r;
+            QVERIFY(!r.open(p, &err));
+            std::string jpeg{char(0xFF), char(0xD8), char(0xFF), char(0xC4), char(0x01), char(0x12), char(0x00), char(0xFF)};
+            jpeg += std::string(15, '\0') + std::string(255, '\x01');
+            std::vector<uint16_t> out;
+            int jw, jh, jc, jb;
+            QVERIFY(!decodeLosslessJpeg(reinterpret_cast<const uint8_t*>(jpeg.data()), jpeg.size(), out, jw, jh, jc, jb, &err));
+            QVERIFY(err.find("Huffman") != std::string::npos);
         }
         // Not read: another video class (H.264), and not MLV at all.
         {

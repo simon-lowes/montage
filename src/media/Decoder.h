@@ -131,6 +131,7 @@ private:
     bool rawHalf_ = false;                    // raw_ developed at half size
     RawSettings rawSettings_;                 // how raw pictures are developed (Interpret Footage)
     bool proResRaw_ = false;                  // ProRes RAW: each frame's mosaic developed (media/ProResRaw.h)
+    bool rawFrame(int width, int height, std::string* error);  // raw_ allocated at this size
     bool loadRaw(const RawImage& img, std::string* error);
 };
 
