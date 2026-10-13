@@ -1419,6 +1419,7 @@ bool gpuGradeOps(const Sequence& seq, const Clip& c, FrameTime lt, const std::fu
         const bool on = settings && settings->enabled;
         gpu::ColorOp mix;  // the node's matte, as applyGradeGraph makes it: its mask, by its mix
         mix.kind = gpu::ColorOp::Mix;
+        if (on && settings->p("mask.show", lt) > 0.5) return false;  // (its matte shown as grey)
         if (on && hasMask(*settings, lt) && !gpuMask(*settings, lt, mix, w, h, pixelScale)) return false;
         if (const double m = on ? std::clamp(settings->p("mix", lt, 100) / 100, 0.0, 1.0) : 1.0; m < 1) {
             if (!mix.masked) mix.masked = true, mix.maskParams[3] = 1;
@@ -1492,13 +1493,13 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
         w = out.image.width, h = out.image.height;
     }
     // Without the looks made on the camera's picture already (an AMF's CDLs and LUTs, the gamut compression); masks
-    // drawn at the picture's size, as finishClipLayer's effects see it.
-    const double pixelScale = effectPixelScale(c, lt, cs.g.sx, cs.mw, w);
+    // drawn at the picture's size, as finishClipLayer's effects see it, at the time the source was made for.
+    const double pixelScale = effectPixelScale(c, cs.lt, cs.g.sx, cs.mw, w);
     auto ranAlready = [&](const Effect& e) {
         return runOnSource(e) || &e == cs.sourceCdl || &e == cs.sourceRgc ||
                std::find(cs.sourceLooks.begin(), cs.sourceLooks.end(), &e) != cs.sourceLooks.end();
     };
-    if (!gpuChainOps(seq, c, lt, ranAlready, out.ops, w, h, pixelScale)) {
+    if (!gpuChainOps(seq, c, cs.lt, ranAlready, out.ops, w, h, pixelScale)) {
         out = {};
         return GpuLayerResult::Unsupported;
     }

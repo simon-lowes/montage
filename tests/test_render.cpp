@@ -6848,6 +6848,12 @@ colorspaces:
         gpu::resetStats();
         compare(20, o, "serial nodes");
         QCOMPARE(gpu::stats().cpuLayers, 0L);
+        // The faded node showing its matte as grey is left to the CPU.
+        edit::clipById(s, topId)->effects.back().params["mask.show"] = 1.0;
+        gpu::resetStats();
+        compare(20, o, "node shows its matte");
+        QVERIFY(gpu::stats().cpuLayers >= 1);
+        edit::clipById(s, topId)->effects.back().params["mask.show"] = 0.0;
         QVERIFY(edit::addGradeNode(p, s, topId, edit::NodeHow::Parallel, 3).ok);
         gpu::resetStats();
         compare(20, o, "parallel nodes");
