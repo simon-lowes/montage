@@ -1404,22 +1404,173 @@ namespace {
 // How a clip's layer is drawn on the GPU (render/GpuCompositor.h).
 enum class GpuLayerResult { Drawn, Nothing, Unsupported };
 
-// A grade graph's steps on the GPU: a chain of correctors, each node's effects in turn, through its mask and mix
-// (marked before and mixed after); false for mixers, keys passed between nodes and anything else only the CPU draws.
+// Any grade graph's steps on the GPU, as applyGradeGraph takes them: each node's picture and key kept in slots (slot 0
+// the picture coming in; a key of -1 is everywhere), correctors through their keys, mixers pass by pass.
+bool gpuGraphOps(const Sequence& seq, const Clip& c, FrameTime lt, const std::function<bool(const Effect&)>& ranAlready,
+                 std::vector<gpu::ColorOp>& ops, int w, int h, double pixelScale) {
+    using Op = gpu::ColorOp;
+    const GradeGraph& g = c.grade;
+    struct Out {
+        int pic = -1, key = -1;  // (no picture: a key mixer's)
+    };
+    std::map<int, Out> outs;
+    int nextSlot = 1;
+    auto store = [&](int slot) {
+        Op o;
+        o.kind = Op::Store;
+        o.slot = slot;
+        ops.push_back(std::move(o));
+    };
+    auto load = [&](int slot) {
+        Op o;
+        o.kind = Op::Load;
+        o.slot = slot;
+        ops.push_back(std::move(o));
+    };
+    auto pass = [&](int mode, int src, int table, int mask, std::initializer_list<float> params) {
+        Op o;
+        o.kind = Op::Pass;
+        o.passMode = mode;
+        o.in[0] = src, o.in[1] = table, o.in[2] = mask;
+        std::copy(params.begin(), params.end(), o.params);
+        o.out = nextSlot++;
+        ops.push_back(std::move(o));
+        return o.out;
+    };
+    auto pictureFrom = [&](int from) {
+        auto it = from ? outs.find(from) : outs.end();
+        return it != outs.end() && it->second.pic >= 0 ? it->second.pic : 0;
+    };
+    auto keyFrom = [&](int from) {
+        auto it = from ? outs.find(from) : outs.end();
+        return it == outs.end() ? -1 : it->second.key;
+    };
+    auto inputsOf = [&](int key) {
+        std::vector<const GradeLink*> ins;
+        for (const GradeLink& l : g.links)
+            if (l.to == key) ins.push_back(&l);
+        std::sort(ins.begin(), ins.end(), [](const GradeLink* a, const GradeLink* b) { return a->input < b->input; });
+        return ins;
+    };
+    store(0);
+    for (int key : gradeOrder(g)) {
+        const GradeNode* n = findGradeNode(g, key);
+        if (!n) continue;
+        Out st;
+        if (n->kind == "corrector") {
+            const GradeLink* in = gradeLinkInto(g, key, 0);
+            const int inPic = pictureFrom(in ? in->from : 0);
+            st.pic = inPic;
+            if (!n->enabled) {
+                outs[key] = st;
+                continue;
+            }
+            const Effect* settings = gradeNodeSettings(c, key);
+            const bool on = settings && settings->enabled;
+            const bool own = on && hasMask(*settings, lt);
+            const GradeLink* kl = gradeLinkInto(g, key, 1);
+            const double mix = on ? std::clamp(settings->p("mix", lt, 100) / 100, 0.0, 1.0) : 1.0;
+            int m = -1;
+            if (own || kl || mix < 1) {
+                const int kin = kl ? keyFrom(kl->from) : -1;
+                const float gain = on ? float(std::clamp(settings->p("key_gain", lt, 100) / 100, 0.0, 1.0)) : 1.0f;
+                const float invert = on && settings->p("key_invert", lt) > 0.5 ? 1 : 0;
+                const float join = on ? float(std::lround(settings->p("key_mode", lt))) : 0;
+                m = pass(11, inPic, kin, -1, {0, own ? 1.0f : 0.0f, kl ? 1.0f : 0.0f, invert, gain, join, float(mix), kin >= 0 ? 1.0f : 0.0f});
+                if (own && !gpuMask(*settings, lt, ops.back(), w, h, pixelScale, true)) return false;
+            }
+            if (on && settings->p("mask.show", lt) > 0.5) {
+                st.pic = pass(13, inPic, -1, m, {m >= 0 ? 1.0f : 0.0f});
+                st.key = m;
+                outs[key] = st;
+                continue;
+            }
+            const size_t before = ops.size();
+            load(inPic);
+            for (const Effect* e : gradeNodeEffects(seq, c, key))
+                if (e->enabled && !ranAlready(*e) && !gpuColorOps(*e, lt, ops, w, h, pixelScale)) return false;
+            if (ops.size() == before + 1) {
+                ops.pop_back();  // (nothing changes it)
+            } else {
+                const int made = nextSlot++;
+                store(made);
+                st.pic = m < 0 ? made : pass(12, inPic, made, m, {});
+            }
+            st.key = m;
+        } else if (n->kind == "key_mixer") {
+            // Its keys added; none: everywhere.
+            int k = -1;
+            for (const GradeLink* l : inputsOf(key)) {
+                const int in = keyFrom(l->from);
+                k = pass(14, -1, k, in, {k >= 0 ? 1.0f : 0.0f, in >= 0 ? 1.0f : 0.0f, 1, 1});
+            }
+            st.key = k;
+        } else {
+            const std::vector<const GradeLink*> ins = inputsOf(key);
+            if (ins.empty() || !n->enabled) {
+                const GradeLink* first = ins.empty() ? nullptr : ins.front();
+                st.pic = pictureFrom(first ? first->from : 0);
+                if (first && first->from) st.key = keyFrom(first->from);
+                outs[key] = st;
+                continue;
+            }
+            std::vector<int> pics, keys;
+            bool everywhere = false;
+            for (const GradeLink* l : ins) {
+                pics.push_back(pictureFrom(l->from));
+                keys.push_back(keyFrom(l->from));
+                everywhere = everywhere || (l->from && keys.back() < 0);
+            }
+            if (!everywhere) {
+                // Where any input's key is (an input from the clip's picture adds none).
+                int k = pass(14, -1, -1, -1, {0, 0, 1, 0});
+                for (size_t j = 0; j < ins.size(); ++j)
+                    if (ins[j]->from) k = pass(14, -1, k, keys[j], {1, 1, 1, 0});
+                st.key = k;
+            }
+            if (n->kind == "parallel") {
+                int sum = -1, plain = -1, weight = -1;
+                for (size_t j = 0; j < pics.size(); ++j) {
+                    sum = pass(15, pics[j], sum, keys[j], {sum >= 0 ? 1.0f : 0.0f, keys[j] >= 0 ? 1.0f : 0.0f});
+                    plain = pass(15, pics[j], plain, -1, {plain >= 0 ? 1.0f : 0.0f, 0});
+                    weight = pass(14, -1, weight, keys[j], {weight >= 0 ? 1.0f : 0.0f, keys[j] >= 0 ? 1.0f : 0.0f, 0, 1});
+                }
+                st.pic = pass(16, sum, plain, weight, {float(pics.size())});
+            } else {
+                st.pic = pics.front();
+                for (size_t j = 1; j < pics.size(); ++j) {
+                    const int mode = blendModeIndex(j - 1 < n->blend.size() ? n->blend[j - 1] : "normal");
+                    st.pic = pass(17, st.pic, pics[j], keys[j], {float(mode), keys[j] >= 0 ? 1.0f : 0.0f});
+                }
+            }
+        }
+        outs[key] = st;
+    }
+    const GradeLink* last = gradeLinkInto(g, 0, 0);
+    load(last && last->from ? pictureFrom(last->from) : 0);
+    return true;
+}
+
+// A grade graph's steps on the GPU. A chain of correctors (no keys passed, none showing its key): each node's effects
+// in turn, through its mask and mix (marked before and mixed after); any other graph through gpuGraphOps.
 bool gpuGradeOps(const Sequence& seq, const Clip& c, FrameTime lt, const std::function<bool(const Effect&)>& ranAlready,
                  std::vector<gpu::ColorOp>& ops, int w, int h, double pixelScale) {
     const GradeGraph& g = c.grade;
     if (!validGrade(g)) return true;  // (the CPU leaves the picture as it is)
-    if (!serialGrade(g)) return false;
+    bool chain = serialGrade(g);
+    for (const GradeNode& n : g.nodes) {
+        const Effect* st = gradeNodeSettings(c, n.key);
+        if (n.enabled && (gradeLinkInto(g, n.key, 1) || (st && st->enabled && st->p("mask.show", lt) > 0.5))) chain = false;
+    }
+    if (!chain) return gpuGraphOps(seq, c, lt, ranAlready, ops, w, h, pixelScale);
     for (int key : gradeOrder(g)) {
         const GradeNode* n = findGradeNode(g, key);
         if (!n || !n->enabled) continue;
-        if (n->kind != "corrector" || gradeLinkInto(g, key, 1)) return false;
+        if (n->kind != "corrector") return false;
         const Effect* settings = gradeNodeSettings(c, key);
         const bool on = settings && settings->enabled;
         gpu::ColorOp mix;  // the node's matte, as applyGradeGraph makes it: its mask, by its mix
         mix.kind = gpu::ColorOp::Mix;
-        if (on && settings->p("mask.show", lt) > 0.5) return false;  // (its matte shown as grey)
         if (on && hasMask(*settings, lt) && !gpuMask(*settings, lt, mix, w, h, pixelScale)) return false;
         if (const double m = on ? std::clamp(settings->p("mix", lt, 100) / 100, 0.0, 1.0) : 1.0; m < 1) {
             if (!mix.masked) mix.masked = true, mix.maskParams[3] = 1;

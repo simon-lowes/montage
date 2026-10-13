@@ -538,10 +538,84 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
         u->uploadTexture(cur, QRhiTextureUploadEntry(0, 0, d));
     }
     std::vector<QRhiTexture*> marked;  // pictures kept for a Mix
-    auto keep = [&](QRhiTexture* t) { return std::find(marked.begin(), marked.end(), t) != marked.end(); };
-    for (const ColorOp& op : l.ops) {
+    // A grade graph's slots, each let go after the last step that reads it.
+    std::vector<QRhiTexture*> kept;
+    std::vector<int> lastUse;
+    for (size_t i = 0; i < l.ops.size(); ++i) {
+        const ColorOp& op = l.ops[i];
+        auto use = [&](int s, bool read) {
+            if (s < 0) return;
+            if (size_t(s) >= kept.size()) kept.resize(size_t(s) + 1, nullptr), lastUse.resize(size_t(s) + 1, -1);
+            if (read) lastUse[size_t(s)] = int(i);
+        };
+        if (op.kind == ColorOp::Store) use(op.slot, false);
+        if (op.kind == ColorOp::Load) use(op.slot, true);
+        if (op.kind == ColorOp::Pass) {
+            for (int k : op.in) use(k, true);
+            use(op.out, false);
+        }
+    }
+    auto keep = [&](QRhiTexture* t) {
+        return std::find(marked.begin(), marked.end(), t) != marked.end() || std::find(kept.begin(), kept.end(), t) != kept.end();
+    };
+    auto sweep = [&](size_t i) {
+        for (size_t k = 0; k < kept.size(); ++k)
+            if (kept[k] && lastUse[k] <= int(i)) {
+                QRhiTexture* t = kept[k];
+                kept[k] = nullptr;
+                if (t != cur && !keep(t)) release(t);
+            }
+    };
+    const QSize base = cur->pixelSize();
+    for (size_t i = 0; i < l.ops.size(); ++i) {
+        const ColorOp& op = l.ops[i];
         if (op.kind == ColorOp::Mark) {
             marked.push_back(cur);
+            continue;
+        }
+        if (op.kind == ColorOp::Store || op.kind == ColorOp::Load) {
+            if (op.kind == ColorOp::Store) {
+                kept[size_t(op.slot)] = cur;
+            } else {
+                QRhiTexture* t = kept[size_t(op.slot)];
+                if (!t) return nullptr;
+                if (!keep(cur)) release(cur);
+                cur = t;
+            }
+            sweep(i);
+            continue;
+        }
+        if (op.kind == ColorOp::Pass) {
+            QRhiTexture* made = texture(T::RGBA32F, base.width(), base.height(), true);
+            if (!made) return nullptr;
+            std::fill(p, p + 64, 0.0f);
+            p[0] = float(op.passMode);
+            std::copy(op.params, op.params + 32, p + 4);
+            std::vector<std::pair<int, QRhiTexture*>> textures;
+            const int binding[3] = {1, 4, 5};
+            for (int k = 0; k < 3; ++k)
+                if (op.in[k] >= 0) {
+                    if (!kept[size_t(op.in[k])]) return nullptr;
+                    textures.push_back({binding[k], kept[size_t(op.in[k])]});
+                }
+            QRhiTexture* m = nullptr;  // (a node's drawn shape)
+            if (op.masked) {
+                std::copy(op.maskParams, op.maskParams + 12, p + 52);
+                if (!op.mask.empty() && op.in[2] < 0) {
+                    if (op.mask.size() != size_t(base.width()) * size_t(base.height())) return nullptr;
+                    m = texture(T::R32F, base.width(), base.height(), false);
+                    if (!m) return nullptr;
+                    QRhiTextureSubresourceUploadDescription d(op.mask.data(), quint32(op.mask.size() * sizeof(float)));
+                    u->uploadTexture(m, QRhiTextureUploadEntry(0, 0, d));
+                    textures.push_back({5, m});
+                }
+            }
+            QRhiBuffer* ub = uniforms(u, p);
+            pass(colorPs_, made, u, textures, ub);
+            u = rhi_->nextResourceUpdateBatch();
+            if (m) release(m);
+            kept[size_t(op.out)] = made;
+            sweep(i);
             continue;
         }
         const QSize size = cur->pixelSize();
@@ -598,6 +672,8 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
             if ((binding == 4 && op.kind != ColorOp::Lut && op.kind != ColorOp::Mix) || binding == 5) release(tex);
         cur = next;
     }
+    for (QRhiTexture* t : kept)
+        if (t && t != cur) release(t);
     return cur;
 }
 

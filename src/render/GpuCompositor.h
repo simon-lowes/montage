@@ -34,8 +34,14 @@ void shutdown();           // (before the application goes; initialize() again i
 // One colour step on a layer at its source size (render/Processing's colour effects, as they run there).
 struct ColorOp {
     // (Mark keeps the picture as it is, for a Mix later to mix what the steps between made with it, through its mask:
-    // a grade node's mask and mix.)
-    enum Kind { Lut, ColorCorrect, Curves, HueCurves, Cdl, Invert, BlackWhite, HueSat, Levels, Mark, Mix } kind = Lut;
+    // a grade node's mask and mix. A grade graph's other nodes keep pictures and keys in numbered slots: Store keeps
+    // the picture in `slot`, Load takes it up again, and Pass draws gpucolor.frag's `passMode` from the slots `in`
+    // (its source, table and mask; -1 for none) into the slot `out`, leaving the picture as it is.)
+    enum Kind { Lut, ColorCorrect, Curves, HueCurves, Cdl, Invert, BlackWhite, HueSat, Levels, Mark, Mix, Store, Load, Pass } kind = Lut;
+    int slot = 0;                // Store, Load
+    int passMode = 0;            // Pass
+    int in[3] = {-1, -1, -1};    // Pass
+    int out = -1;                // Pass
     std::shared_ptr<const Lut3D> lut;  // Lut
     bool clampFirst = false;           // Lut: the colour clamped to 0..1 first (a LUT baked into another space)
     float strength = 1;                // Lut
