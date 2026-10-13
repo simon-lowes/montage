@@ -1983,7 +1983,7 @@ void MainWindow::buildMenus() {
             QAction* a = ambiM->addAction(h.text, this, [this, choice = h.choice] {
                 QString c = choice;
                 if (c == "?") {
-                    c = QFileDialog::getOpenFileName(this, tr("Personal HRTF"), QString(), tr("SOFA files (*.sofa)"));
+                    c = QFileDialog::getOpenFileName(this, tr("Personal HRTF"), QString(), tr("SOFA files (*.sofa *.zip)"));
                     if (c.isEmpty()) return;
                 }
                 setBinauralHrtfChoice(c);

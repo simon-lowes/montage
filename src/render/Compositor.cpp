@@ -1880,12 +1880,18 @@ const float* AudioMixer::keySignal(Id trackId, int frames, int64_t keyAt) {
 }
 
 AmbisonicBinaural& AudioMixer::binauralFor(Binaural& slot, int order, double sr) {
-    // Made again when the order, the rate or the HRTF chosen changes (or a measured set finishes loading).
+    // Made again when the order or the rate changes, and in playback when the head chosen does (or a measured set
+    // finishes loading). An offline mix (an export) keeps the head it started with, so a file never changes head
+    // part way through.
     const uint64_t generation = binauralHrtfGeneration();
-    if (!slot.renderer || slot.renderer->order() != order || slot.renderer->sampleRate() != sr || slot.generation != generation) {
-        slot.renderer = std::make_unique<AmbisonicBinaural>(order, sr, binauralHrirs(sr, !nonBlocking_));
+    if (slot.renderer && slot.renderer->order() == order && slot.renderer->sampleRate() == sr) {
+        if (slot.generation == generation || !nonBlocking_) return *slot.renderer;
         slot.generation = generation;
+        if (binauralHrirs(sr, false) == slot.hrirs) return *slot.renderer;  // (another rate's set came in)
     }
+    slot.hrirs = binauralHrirs(sr, !nonBlocking_);
+    slot.renderer = std::make_unique<AmbisonicBinaural>(order, sr, slot.hrirs);
+    slot.generation = generation;
     return *slot.renderer;
 }
 
@@ -2160,9 +2166,16 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
         // A chain with latency is fed its source that many samples ahead, so its
         // output lines up with the picture; it starts that much before the clip.
         const int64_t lat = chainLatency(c.effects, c.id, sr);
-        if (pe <= start || ps - lat >= end) continue;
         const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
         if (!m) continue;
+        if (pe <= start || ps - lat >= end) {
+            // A kept field is read where the master is fed from, behind the track's window by the track's and bus's
+            // plugin latency: skipped only when it misses that window too.
+            const Sequence* inner = m->kind == MediaKind::Sequence ? p.findSequence(m->sequenceId) : nullptr;
+            const bool kept = trackField && (inner ? ambisonicLayout(inner->audioLayout)
+                                                   : m->ambisonic > 0 && c.channels.empty() && m->channels >= kFoaChannels);
+            if (!kept || pe <= fieldStart || ps >= fieldStart + frames) continue;
+        }
         std::fill(clipBuf.begin(), clipBuf.end(), 0.0f);
         field.clear();
         const int64_t rs = start + lat;  // the source window fed to the chain
@@ -2229,7 +2242,7 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                     src = nf.data();
                 }
             } else {
-                const std::string key = ambisonicAudioKey(m->path);
+                const std::string key = ambisonicAudioKey(m->path, order);
                 fb = nonBlocking_ ? MediaPool::instance().audioIfReady(key, int(sr)) : MediaPool::instance().audio(key, int(sr));
                 if (!fb || fb->channels < nch || fb->frames() < 2) continue;
                 // Noise reduction and the like: W cleaned, and what that did done to the other channels
@@ -2238,7 +2251,7 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                 for (const Effect& e : c.effects)
                     if (e.enabled && isSourceAudioEffect(e.type)) sourceFx.push_back(&e);
                 if (!sourceFx.empty())
-                    if (AudioBufferPtr clean = cleanedAudio(key, fb, sourceFx, !nonBlocking_)) fb = clean;
+                    if (AudioBufferPtr clean = cleanedAudio(key, fb, sourceFx, !nonBlocking_); clean && clean->channels >= nch) fb = clean;
                 // Maintain Audio Pitch: the channels stretched together along the time map.
                 if (!c.reverse && c.timing.p("maintain_pitch", 0) > 0.5 && (ramped || std::fabs(c.speed - 1) > 1e-9)) {
                     const int hop = stretchHop(int(sr));
@@ -2587,8 +2600,10 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         std::fill(trackBuf.begin(), trackBuf.end(), 0.0f);
         std::fill(trackField.begin(), trackField.end(), 0.0f);
         key_ = {&p, &seq, start + downstream + trackLat, sr, depth};
+        // (An ADM object's clips stay sound of its own, as the object is rendered from its track: no field kept.)
+        const bool keepsField = fieldMix && !(lfeOnly && !ambisonicLayout(seq.audioLayout));
         const bool any = mixTrackClips(p, seq, track, start + downstream + trackLat, frames, sr, depth, trackBuf.data(),
-                                       fieldMix ? trackField.data() : nullptr, fieldStart, nch);
+                                       keepsField ? trackField.data() : nullptr, fieldStart, nch);
         // Track inserts keep running without clips, so reverb and delay tails ring out.
         if (!any && track.effects.empty()) continue;
         if (!track.effects.empty())

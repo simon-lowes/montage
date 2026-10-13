@@ -1409,19 +1409,19 @@ void checkStereoMedia(Project& p) {
     }
 }
 
-AudioBufferPtr decodeAmbisonic(const std::string& path, int sampleRate, std::string* error, const std::atomic<bool>* cancel) {
+AudioBufferPtr decodeAmbisonic(const std::string& path, int sampleRate, std::string* error, const std::atomic<bool>* cancel, int maxOrder) {
     // A conformed file plays at its new speed, or stretched to its new length with its pitch kept, as decodeAudio does.
     if (Interpretation in; parseInterpretation(path, in) && in.conformed()) {
         const double k = in.timeScale();
         if (!in.keepPitch) {
             const int rate = int(std::clamp(std::llround(sampleRate / k), 1000LL, 1LL << 30));
-            AudioBufferPtr played = decodeAmbisonic(uninterpretedPath(path), rate, error, cancel);
+            AudioBufferPtr played = decodeAmbisonic(uninterpretedPath(path), rate, error, cancel, maxOrder);
             if (!played) return nullptr;
             auto out = std::make_shared<AudioBuffer>(*played);
             out->sampleRate = sampleRate;
             return out;
         }
-        AudioBufferPtr src = decodeAmbisonic(uninterpretedPath(path), sampleRate, error, cancel);
+        AudioBufferPtr src = decodeAmbisonic(uninterpretedPath(path), sampleRate, error, cancel, maxOrder);
         if (!src) return nullptr;
         const int hop = stretchHop(sampleRate);
         const int64_t outFrames = int64_t(std::llround(double(src->frames()) / k));
@@ -1470,7 +1470,7 @@ AudioBufferPtr decodeAmbisonic(const std::string& path, int sampleRate, std::str
     // channels as speakers (AAC's 4.0) gives them in its own channel order, which is the order FFmpeg's encoders took
     // them in (and Montage's exports write).
     av_channel_layout_uninit(&layout);
-    const int nch = ambisonicChannels(ambisonicOrderForChannels(n));
+    const int nch = ambisonicChannels(std::clamp(std::min(maxOrder, ambisonicOrderForChannels(n)), 1, kMaxAmbisonicOrder));
     auto buf = std::make_shared<AudioBuffer>();
     buf->sampleRate = sampleRate;
     buf->channels = nch;

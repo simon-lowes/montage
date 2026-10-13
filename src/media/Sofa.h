@@ -16,8 +16,8 @@ namespace montage {
 bool sofaSupported();
 
 // The HRIRs a SOFA file holds at binauralDirections() (each the nearest measured), resampled to `sampleRate`, the
-// longest 512 taps at 48 kHz. A zip holding SOFA files is read too (its 48 kHz one when it has several). Null with the
-// reason when it cannot be read.
+// longest 512 taps at 48 kHz. A zip holding SOFA files is read too (when it has several, the one at that rate, else
+// its 48 kHz one). Null with the reason when it cannot be read.
 std::shared_ptr<const Hrirs> readSofa(const std::string& path, double sampleRate, std::string* error = nullptr);
 
 // SADIE II's KU100 dummy head (University of York; Apache-2.0): the HRIRs in SOFA, in their zip.

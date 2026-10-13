@@ -627,7 +627,7 @@ void EditorState::startClipAudioDecodes() {
                 // An ambisonic file's field (core/Ambisonics.h), or the channels a clip picked.
                 const bool field = m->ambisonic > 0 && c.channels.empty();
                 if (c.channels.empty() && !field) continue;
-                std::string key = field ? ambisonicAudioKey(m->path) : audioKey(m->path, c.channels);
+                std::string key = field ? ambisonicAudioKey(m->path, m->ambisonic) : audioKey(m->path, c.channels);
                 if (!clipAudioRequested_.insert({key, rate}).second) continue;
                 (void)QtConcurrent::run([key, rate] { MediaPool::instance().audio(key, rate); });
             }

@@ -537,37 +537,40 @@ void fieldFft(std::vector<std::complex<double>>& a, bool inverse) {
     }
 }
 
-// An ambisonic field (W, Y, Z, X) through the effects. Cleaning each channel on its own would treat each direction
-// differently and smear the field, so W (the sound from all round) is processed as a sound of its own, and what that
-// did to it, frequency by frequency over time, is done to Y, Z and X too: every direction is turned down alike and the
-// field keeps its shape. Pitch Shift moves frequencies rather than turning them down, so a chain with it works on the
-// channels in pairs.
+// An ambisonic field (W, Y, Z, X and, to higher orders, on: any channel count) through the effects. Cleaning each
+// channel on its own would treat each direction differently and smear the field, so W (the sound from all round) is
+// processed as a sound of its own, and what that did to it, frequency by frequency over time, is done to the other
+// channels too: every direction is turned down alike and the field keeps its shape. Pitch Shift moves frequencies
+// rather than turning them down, so a chain with it works on the channels in pairs.
 AudioBufferPtr processField(const AudioBufferPtr& source, const std::vector<Effect>& effects, const std::atomic<bool>* cancel) {
     const int64_t n = source->frames();
+    const int nch = source->channels;
+    const size_t stride = size_t(nch);
     const auto& in = source->samples;
     auto pair = [&](int a, int b) {
         auto buf = std::make_shared<AudioBuffer>();
         buf->sampleRate = source->sampleRate;
         buf->samples.resize(size_t(n) * 2);
         for (int64_t i = 0; i < n; ++i) {
-            buf->samples[size_t(i) * 2] = in[size_t(i) * 4 + size_t(a)];
-            buf->samples[size_t(i) * 2 + 1] = in[size_t(i) * 4 + size_t(b)];
+            buf->samples[size_t(i) * 2] = in[size_t(i) * stride + size_t(a)];
+            buf->samples[size_t(i) * 2 + 1] = in[size_t(i) * stride + size_t(b)];
         }
         return AudioBufferPtr(buf);
     };
     auto out = std::make_shared<AudioBuffer>();
     out->sampleRate = source->sampleRate;
-    out->channels = 4;
-    out->samples.assign(size_t(n) * 4, 0.0f);
+    out->channels = nch;
+    out->samples.assign(size_t(n) * stride, 0.0f);
     const bool shifts = std::any_of(effects.begin(), effects.end(), [](const Effect& e) { return e.type == "pitch_shift"; });
     if (shifts) {
-        const AudioBufferPtr wy = process(pair(0, 1), effects, cancel), zx = process(pair(2, 3), effects, cancel);
-        if (cancel && cancel->load()) return source;
-        for (int64_t i = 0; i < n && i < wy->frames() && i < zx->frames(); ++i) {
-            out->samples[size_t(i) * 4] = wy->samples[size_t(i) * 2];
-            out->samples[size_t(i) * 4 + 1] = wy->samples[size_t(i) * 2 + 1];
-            out->samples[size_t(i) * 4 + 2] = zx->samples[size_t(i) * 2];
-            out->samples[size_t(i) * 4 + 3] = zx->samples[size_t(i) * 2 + 1];
+        for (int a = 0; a < nch; a += 2) {
+            const int b = std::min(a + 1, nch - 1);  // (an odd count's last channel paired with itself)
+            const AudioBufferPtr two = process(pair(a, b), effects, cancel);
+            if ((cancel && cancel->load()) || !two) return source;
+            for (int64_t i = 0; i < n && i < two->frames(); ++i) {
+                out->samples[size_t(i) * stride + size_t(a)] = two->samples[size_t(i) * 2];
+                out->samples[size_t(i) * stride + size_t(b)] = two->samples[size_t(i) * 2 + 1];
+            }
         }
         return out;
     }
@@ -579,7 +582,8 @@ AudioBufferPtr processField(const AudioBufferPtr& source, const std::vector<Effe
     std::vector<double> window(N);
     for (size_t i = 0; i < N; ++i) window[i] = 0.5 - 0.5 * std::cos(2 * M_PI * double(i) / double(N));
     const double norm = 1.5;  // a Hann window applied twice at a quarter hop adds up to 1.5
-    std::vector<double> acc(size_t(n + int64_t(N)) * 3, 0.0);
+    const size_t others = stride - 1;
+    std::vector<double> acc(size_t(n + int64_t(N)) * others, 0.0);
     std::vector<std::complex<double>> w(N), wc(N), x(N);
     auto sample = [&](const AudioBuffer& b, int64_t i, int ch, int stride) {
         return i >= 0 && i < b.frames() ? double(b.samples[size_t(i) * size_t(stride) + size_t(ch)]) : 0.0;
@@ -587,27 +591,27 @@ AudioBufferPtr processField(const AudioBufferPtr& source, const std::vector<Effe
     for (int64_t f = -int64_t(N); f < n; f += int64_t(hop)) {
         if (cancel && cancel->load()) return source;
         for (size_t i = 0; i < N; ++i) {
-            w[i] = sample(*source, f + int64_t(i), 0, 4) * window[i];
+            w[i] = sample(*source, f + int64_t(i), 0, nch) * window[i];
             wc[i] = sample(*cleaned, f + int64_t(i), 0, 2) * window[i];
         }
         fieldFft(w, false);
         fieldFft(wc, false);
         std::vector<double> gain(N);
         for (size_t k = 0; k < N; ++k) gain[k] = std::min(2.0, std::abs(wc[k]) / (std::abs(w[k]) + 1e-9));
-        for (int ch = 1; ch < 4; ++ch) {
-            for (size_t i = 0; i < N; ++i) x[i] = sample(*source, f + int64_t(i), ch, 4) * window[i];
+        for (int ch = 1; ch < nch; ++ch) {
+            for (size_t i = 0; i < N; ++i) x[i] = sample(*source, f + int64_t(i), ch, nch) * window[i];
             fieldFft(x, false);
             for (size_t k = 0; k < N; ++k) x[k] *= gain[k];
             fieldFft(x, true);
             for (size_t i = 0; i < N; ++i) {
                 const int64_t o = f + int64_t(i);
-                if (o >= 0 && o < n) acc[size_t(o) * 3 + size_t(ch - 1)] += x[i].real() / double(N) * window[i] / norm;
+                if (o >= 0 && o < n) acc[size_t(o) * others + size_t(ch - 1)] += x[i].real() / double(N) * window[i] / norm;
             }
         }
     }
     for (int64_t i = 0; i < n; ++i) {
-        out->samples[size_t(i) * 4] = float(sample(*cleaned, i, 0, 2));
-        for (int ch = 1; ch < 4; ++ch) out->samples[size_t(i) * 4 + size_t(ch)] = float(acc[size_t(i) * 3 + size_t(ch - 1)]);
+        out->samples[size_t(i) * stride] = float(sample(*cleaned, i, 0, 2));
+        for (int ch = 1; ch < nch; ++ch) out->samples[size_t(i) * stride + size_t(ch)] = float(acc[size_t(i) * others + size_t(ch - 1)]);
     }
     return out;
 }
@@ -645,7 +649,7 @@ AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& sourc
     std::vector<Effect> copies;
     for (const Effect* e : effects) copies.push_back(*e);
     auto run = [job, source, copies] {
-        AudioBufferPtr r = source->channels == 4 ? processField(source, copies, &job->cancel) : process(source, copies, &job->cancel);
+        AudioBufferPtr r = source->channels >= 4 ? processField(source, copies, &job->cancel) : process(source, copies, &job->cancel);
         {
             std::lock_guard lock(gCacheMutex);
             job->result = r;

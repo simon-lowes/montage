@@ -6,6 +6,7 @@
 #include <cmath>
 #include <map>
 #include <mutex>
+#include <system_error>
 #include <thread>
 
 #include "core/Zip.h"
@@ -24,21 +25,25 @@ bool sofaSupported() {
 #endif
 }
 
+#ifdef MONTAGE_WITH_MYSOFA
 namespace {
 
-// A zip's SOFA file: the only one, or the 48 kHz one.
-bool sofaFromZip(const std::string& path, std::string& out, std::string* error) {
+// A zip's SOFA file: the only one, or the one at the rate wanted ("44k", "48k", "96k" in its name), else the 48 kHz one.
+bool sofaFromZip(const std::string& path, double sampleRate, std::string& out, std::string* error) {
     ZipReader zip;
     if (!zip.openFile(path)) {
         if (error) *error = "Not a zip archive";
         return false;
     }
+    const std::string want = std::to_string(int(std::lround(sampleRate / 1000 - 0.05))) + "k";  // 44100 -> "44k"
     const ZipReader::Entry* pick = nullptr;
+    int best = -1;
     for (const auto& e : zip.entries()) {
         std::string name = e.name;
         for (char& c : name) c = char(std::tolower(static_cast<unsigned char>(c)));
         if (name.size() < 5 || name.compare(name.size() - 5, 5, ".sofa") != 0) continue;
-        if (!pick || name.find("48k") != std::string::npos) pick = &e;
+        const int score = name.find(want) != std::string::npos ? 2 : name.find("48k") != std::string::npos ? 1 : 0;
+        if (score > best) best = score, pick = &e;
     }
     if (!pick) {
         if (error) *error = "The archive holds no SOFA file";
@@ -48,6 +53,7 @@ bool sofaFromZip(const std::string& path, std::string& out, std::string* error) 
 }
 
 }  // namespace
+#endif
 
 std::shared_ptr<const Hrirs> readSofa(const std::string& path, double sampleRate, std::string* error) {
     auto fail = [&](const std::string& why) {
@@ -63,7 +69,7 @@ std::shared_ptr<const Hrirs> readSofa(const std::string& path, double sampleRate
     for (char& c : lower) c = char(std::tolower(static_cast<unsigned char>(c)));
     if (lower.size() > 4 && lower.compare(lower.size() - 4, 4, ".zip") == 0) {
         std::string why;
-        if (!sofaFromZip(path, bytes, &why)) return fail(why);
+        if (!sofaFromZip(path, sampleRate > 0 ? sampleRate : 48000, bytes, &why)) return fail(why);
     } else {
         QFile f(QString::fromStdString(path));
         if (!f.open(QIODevice::ReadOnly)) return fail("Cannot open " + path);
@@ -148,15 +154,23 @@ const ModelPack& sadieKu100Pack() {
 
 namespace {
 
-std::mutex hrtfMutex;
-std::string hrtfChoice;
-std::atomic<uint64_t> hrtfGeneration{1};
 struct Loaded {
     std::shared_ptr<const Hrirs> hrirs;
     std::string error;
     bool done = false;  // false while being read in the background
 };
-std::map<double, Loaded> hrtfCache;  // for the current choice, by rate
+// The choice and what has been read for it, by rate. Made once and never destroyed, so a background read still
+// running as the program exits finds it there.
+struct HrtfState {
+    std::mutex m;
+    std::string choice;
+    std::atomic<uint64_t> generation{1};
+    std::map<double, Loaded> cache;
+};
+HrtfState& hrtf() {
+    static HrtfState* s = new HrtfState;
+    return *s;
+}
 
 std::shared_ptr<const Hrirs> loadHrtf(const std::string& choice, double sampleRate, std::string& why) {
     if (choice == "ku100") {
@@ -173,49 +187,57 @@ std::shared_ptr<const Hrirs> loadHrtf(const std::string& choice, double sampleRa
 }  // namespace
 
 void setBinauralHrtf(const std::string& choice) {
-    std::lock_guard lock(hrtfMutex);
-    if (choice == hrtfChoice) return;
-    hrtfChoice = choice;
-    hrtfCache.clear();
-    ++hrtfGeneration;
+    HrtfState& st = hrtf();
+    std::lock_guard lock(st.m);
+    if (choice == st.choice) return;
+    st.choice = choice;
+    st.cache.clear();
+    ++st.generation;
 }
 
 std::string binauralHrtf() {
-    std::lock_guard lock(hrtfMutex);
-    return hrtfChoice;
+    HrtfState& st = hrtf();
+    std::lock_guard lock(st.m);
+    return st.choice;
 }
 
-uint64_t binauralHrtfGeneration() { return hrtfGeneration.load(); }
+uint64_t binauralHrtfGeneration() { return hrtf().generation.load(); }
 
 std::shared_ptr<const Hrirs> binauralHrirs(double sampleRate, bool wait, std::string* error) {
-    std::unique_lock lock(hrtfMutex);
-    if (hrtfChoice.empty()) return nullptr;
-    const std::string choice = hrtfChoice;
-    if (auto it = hrtfCache.find(sampleRate); it != hrtfCache.end() && (it->second.done || !wait)) {
+    HrtfState& st = hrtf();
+    std::unique_lock lock(st.m);
+    if (st.choice.empty()) return nullptr;
+    const std::string choice = st.choice;
+    if (auto it = st.cache.find(sampleRate); it != st.cache.end() && (it->second.done || !wait)) {
         if (error) *error = it->second.error;
         return it->second.hrirs;
     }
     if (!wait) {
         // Read in the background (a measured set takes a moment); the spherical head meanwhile, and renderers made
         // again (a new generation) once it is in.
-        hrtfCache[sampleRate] = Loaded{};
-        std::thread([choice, sampleRate] {
-            std::string why;
-            auto h = loadHrtf(choice, sampleRate, why);
-            std::lock_guard lock(hrtfMutex);
-            if (choice != hrtfChoice) return;
-            hrtfCache[sampleRate] = Loaded{h, why, true};
-            ++hrtfGeneration;
-        }).detach();
+        st.cache[sampleRate] = Loaded{};
+        try {
+            std::thread([choice, sampleRate] {
+                std::string why;
+                auto h = loadHrtf(choice, sampleRate, why);
+                HrtfState& st = hrtf();
+                std::lock_guard lock(st.m);
+                if (choice != st.choice) return;
+                st.cache[sampleRate] = Loaded{h, why, true};
+                ++st.generation;
+            }).detach();
+        } catch (const std::system_error&) {
+            st.cache[sampleRate] = Loaded{nullptr, "Cannot start reading the responses", true};
+        }
         return nullptr;
     }
     lock.unlock();
     std::string why;
     auto h = loadHrtf(choice, sampleRate, why);
     lock.lock();
-    if (choice == hrtfChoice && !hrtfCache[sampleRate].done) {
-        hrtfCache[sampleRate] = Loaded{h, why, true};
-        ++hrtfGeneration;  // (renderers made while it was read in the background)
+    if (choice == st.choice && !st.cache[sampleRate].done) {
+        st.cache[sampleRate] = Loaded{h, why, true};
+        ++st.generation;  // (renderers made while it was read in the background)
     }
     if (error) *error = why;
     return h;

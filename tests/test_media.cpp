@@ -15571,13 +15571,15 @@ if ui["pressed"] == "add":
     void higherOrderAmbisonics() {
         const int rate = 48000;
         // A third-order field (16 channels, ACN, SN3D) of a 3 kHz tone from the left, as a plain WAV.
-        auto writeField = [&](const std::string& file, int order, double angle, double elevation) {
+        // `gated`: the tone only in the first half of each half second (so noise reduction does not take it for noise).
+        auto writeField = [&](const std::string& file, int order, double angle, double elevation, bool gated = false) {
             const int nch = ambisonicChannels(order);
             float g[16];
             ambisonicEncode(order, angle, elevation, g);
             QByteArray data;
             for (int i = 0; i < rate; ++i) {
-                const float v = 0.3f * float(std::sin(2 * M_PI * 3000 * i / double(rate)));
+                const bool on = !gated || (i % 24000) < 12000;
+                const float v = on ? 0.3f * float(std::sin(2 * M_PI * 3000 * i / double(rate))) : 0.0f;
                 for (int k = 0; k < nch; ++k) {
                     const int16_t q = int16_t(std::lround(std::clamp(v * g[k], -1.0f, 1.0f) * 32767));
                     data.append(reinterpret_cast<const char*>(&q), 2);
@@ -15646,6 +15648,38 @@ if ui["pressed"] == "add":
             out = mixLayout(p, s);
             QVERIFY(std::fabs(rms(out, 16, 1, 4800, 24000) - w) < 0.01 * w);
             for (int k = 4; k < 16; ++k) QVERIFY(rms(out, 16, k, 4800, 24000) < 1e-5);
+        }
+        {
+            // The pool decodes only the order asked for (a third-order file marked first order costs four channels).
+            QCOMPARE(MediaPool::instance().audio(ambisonicAudioKey(third, 1), rate)->channels, 4);
+            QCOMPARE(MediaPool::instance().audio(ambisonicAudioKey(third, 2), rate)->channels, 9);
+            QCOMPARE(ambisonicAudioKeyOrder(ambisonicAudioKey(third, 3)), 3);
+            QCOMPARE(ambisonicAudioKeyOrder(third), 0);
+            AudioBufferPtr nine = decodeAmbisonic(third, rate, &err, nullptr, 2);
+            QVERIFY(nine && nine->channels == 9);
+            // Noise reduction on a third-order field: all 16 channels kept, cleaned alike, the field's shape held.
+            const std::string gated = path("hoa3-gated.wav");
+            writeField(gated, 3, -90, 0, true);
+            auto src = MediaPool::instance().audio(ambisonicAudioKey(gated, 3), rate);
+            Effect dn = makeEffect(p, "denoise");
+            dn.params["reduction_db"] = Param(20.0);
+            const AudioBufferPtr clean = cleanedAudio(ambisonicAudioKey(gated, 3), src, {&dn}, true);
+            QVERIFY(clean && clean->channels == 16 && clean->frames() == src->frames());
+            const double cw = rms(clean->samples, 16, 0, 2000, 10000);
+            QVERIFY2(cw > 0.1, qPrintable(QString::number(cw)));
+            for (int k : {1, 9, 15})
+                QVERIFY2(std::fabs(rms(clean->samples, 16, k, 2000, 10000) - std::fabs(want[k]) * cw) < 0.05 * cw, qPrintable(QString::number(k)));
+            // And in the mix, with Pitch Shift (the channels in pairs, an odd count's last with itself) too.
+            Sequence& s = fieldSequence(p, gated, 3, "ambix3");
+            s.audioTracks[0].clips[0].effects.push_back(dn);
+            auto out = mixLayout(p, s);
+            QVERIFY(rms(out, 16, 1, 2000, 10000) > 0.1);
+            Effect shift = makeEffect(p, "pitch_shift");
+            s.audioTracks[0].clips[0].effects = {shift};
+            s.audioLayout = "ambix2";
+            p.media.back().ambisonic = 2;
+            out = mixLayout(p, s);
+            QVERIFY(rms(out, 9, 8, 2000, 10000) > 0.01);
         }
         {
             // A first-order file in a third-order mix: its channels as they are, the higher orders silent.
@@ -15772,6 +15806,17 @@ if ui["pressed"] == "add":
             double diff = 0;
             for (size_t i = 0; i < model.size(); ++i) diff = std::max(diff, double(std::fabs(model[i] - measured[i])));
             QVERIFY(diff > 0.01);
+            // An offline mix (an export) keeps the head it started with when another is chosen part way through.
+            setBinauralHrtf("");
+            AudioMixer offline, steady;
+            std::vector<float> a(size_t(rate) * 2), b2(size_t(rate) * 2);
+            offline.mix(p, s, 0, rate / 2, a.data());
+            setBinauralHrtf(sofa);
+            offline.mix(p, s, rate / 2, rate / 2, a.data() + rate);
+            setBinauralHrtf("");
+            steady.mix(p, s, 0, rate, b2.data());
+            for (size_t i = 0; i < a.size(); ++i) QVERIFY(std::fabs(a[i] - b2[i]) < 1e-5);
+            setBinauralHrtf(sofa);
             // Not readable: the head model is heard, and why is said.
             setBinauralHrtf(third);
             QVERIFY(!binauralHrirs(rate, true, &err) && !err.empty());

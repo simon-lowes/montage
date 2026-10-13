@@ -206,7 +206,8 @@ private:
     bool ambisonicBinaural_ = false;
     struct Binaural {
         std::unique_ptr<AmbisonicBinaural> renderer;
-        uint64_t generation = 0;  // of the HRTF chosen (media/Sofa.h) when it was made
+        std::shared_ptr<const Hrirs> hrirs;  // what it was made with (null: the spherical head)
+        uint64_t generation = 0;  // of the HRTF chosen (media/Sofa.h) when it was last checked
     };
     // The renderer in `slot`, made for the order, rate and HRTF chosen now.
     AmbisonicBinaural& binauralFor(Binaural& slot, int order, double sr);

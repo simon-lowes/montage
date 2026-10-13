@@ -24,12 +24,21 @@ std::string audioKey(const std::string& path, const std::vector<int>& channels) 
     return key;
 }
 
-std::string ambisonicAudioKey(const std::string& path) { return path + kChannelMark + "ambix"; }
-
-bool isAmbisonicAudioKey(const std::string& key) {
-    const size_t mark = key.find(kChannelMark);
-    return mark != std::string::npos && key.compare(mark + 1, std::string::npos, "ambix") == 0;
+std::string ambisonicAudioKey(const std::string& path, int order) {
+    return path + kChannelMark + (order > 1 ? "ambix" + std::to_string(std::min(order, 3)) : std::string("ambix"));
 }
+
+int ambisonicAudioKeyOrder(const std::string& key) {
+    const size_t mark = key.find(kChannelMark);
+    if (mark == std::string::npos) return 0;
+    const std::string tail = key.substr(mark + 1);
+    if (tail == "ambix") return 1;
+    if (tail == "ambix2") return 2;
+    if (tail == "ambix3") return 3;
+    return 0;
+}
+
+bool isAmbisonicAudioKey(const std::string& key) { return ambisonicAudioKeyOrder(key) > 0; }
 
 std::string audioKeyFile(const std::string& key, std::vector<int>* channels) {
     const size_t mark = key.find(kChannelMark);
@@ -221,7 +230,8 @@ AudioBufferPtr MediaPool::audio(const std::string& path, int sampleRate) {
     }
     std::vector<int> channels;
     const std::string file = audioKeyFile(path, &channels);
-    AudioBufferPtr buf = isAmbisonicAudioKey(path) ? decodeAmbisonic(file, sampleRate) : decodeAudio(file, sampleRate, nullptr, nullptr, channels);
+    AudioBufferPtr buf = isAmbisonicAudioKey(path) ? decodeAmbisonic(file, sampleRate, nullptr, nullptr, ambisonicAudioKeyOrder(path))
+                                                   : decodeAudio(file, sampleRate, nullptr, nullptr, channels);
     if (!buf) buf = std::make_shared<AudioBuffer>();  // remember failures as silence
     PeaksPtr pk = computePeaks(*buf);
     std::function<void(const std::string&)> cb;
@@ -323,7 +333,8 @@ bool MediaPool::refreshAudio(const std::string& path) {
         if (!dl.owns_lock()) continue;  // (being decoded already: that read stands)
         std::vector<int> channels;
         const std::string f = audioKeyFile(key.first, &channels);
-        AudioBufferPtr buf = isAmbisonicAudioKey(key.first) ? decodeAmbisonic(f, key.second) : decodeAudio(f, key.second, nullptr, nullptr, channels);
+        AudioBufferPtr buf = isAmbisonicAudioKey(key.first) ? decodeAmbisonic(f, key.second, nullptr, nullptr, ambisonicAudioKeyOrder(key.first))
+                                                            : decodeAudio(f, key.second, nullptr, nullptr, channels);
         if (!buf) continue;  // (unreadable mid-write: the last read stays)
         PeaksPtr pk = computePeaks(*buf);
         std::function<void(const std::string&)> cb;
