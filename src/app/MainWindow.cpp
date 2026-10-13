@@ -110,6 +110,7 @@
 #include "ScriptCutDialog.h"
 #include "QualityCheckDialog.h"
 #include "OffloadDialog.h"
+#include "CaptureDialog.h"
 #include "ProductionPanel.h"
 #include "core/AafImport.h"
 #include "core/Production.h"
@@ -134,6 +135,7 @@
 #include "ControlSurface.h"
 #include "OscControl.h"
 #include "SpeedEditorControl.h"
+#include "TangentControl.h"
 #include "control/Midi.h"
 #include "MulticamPanel.h"
 #include "AdrPanel.h"
@@ -643,6 +645,18 @@ void MainWindow::buildPanels() {
         const bool on = appSettings().value(QStringLiteral("speedEditor/enabled"), true).toBool();
         QTimer::singleShot(0, speedEditor_, [this, on] { speedEditor_->setEnabled(on); });
     }
+    // Tangent's colour panels, through Tangent Hub when it runs.
+    {
+        TangentControl::Hooks hooks;
+        hooks.controller = [this] { return activeController(); };
+        tangent_ = new TangentControl(state_, this, std::move(hooks), this);
+        tangent_->setObjectName(QStringLiteral("tangent"));
+        connect(tangent_, &TangentControl::connectionChanged, this, [this] {
+            if (tangent_->isConnected()) state_->message(tr("Tangent panels connected"), 4000);
+        });
+        const bool on = appSettings().value(QStringLiteral("tangent/enabled"), true).toBool();
+        QTimer::singleShot(0, tangent_, [this, on] { tangent_->setEnabled(on); });
+    }
     // 1–9 cut to an angle (live while playing); Shift cuts at the playhead when stopped.
     for (int i = 0; i < 9; ++i) {
         auto* sw = new QShortcut(QKeySequence(Qt::Key_1 + i), this);
@@ -975,6 +989,12 @@ void MainWindow::buildMenus() {
             takeEdit_->setEnabled(state_->canTakeEdit());
         });
     }
+    add(file, tr("&Capture…"), QKeySequence(), [this] {
+        CaptureDialog* d = captureDialog();
+        d->show();
+        d->raise();
+        d->activateWindow();
+    })->setObjectName(QStringLiteral("capture"));
     add(file, tr("&Offload Card…"), QKeySequence(), [this] {
         OffloadDialog dlg(state_, this);
         dlg.exec();
@@ -2328,6 +2348,11 @@ void MainWindow::updateTitle() {
         name += state_->lockHolder().isEmpty() ? tr(" (Read-Only)") : tr(" (Read-Only: %1 is editing)").arg(state_->lockHolder());
     setWindowTitle(QString("%1[*] — Montage").arg(name));
     setWindowModified(state_->isModified());
+}
+
+CaptureDialog* MainWindow::captureDialog() {
+    if (!capture_) capture_ = new CaptureDialog(state_, this);
+    return capture_;
 }
 
 PlaybackController* MainWindow::activeController() const { return active_ == Monitor::Source ? source_ : program_; }
@@ -6331,6 +6356,36 @@ QDialog* MainWindow::controlSurfaceDialog() {
         showSpeed();
     });
     connect(speedKeys, &QPushButton::clicked, dlg, [this, dlg] { speedEditorKeysDialog(dlg); });
+    // Tangent panels.
+    auto* tangentBox = new QGroupBox(tr("Tangent panels (Elements, Ripple, Wave 2, Arc)"), dlg);
+    auto* tangentForm = new QFormLayout(tangentBox);
+    auto* tangentOn = new QCheckBox(tr("Use Tangent panels through Tangent Hub"), tangentBox);
+    tangentOn->setObjectName(QStringLiteral("tangentOn"));
+    tangentOn->setChecked(tangent_->isEnabled());
+    auto* tangentStatus = new QLabel(tangentBox);
+    tangentStatus->setObjectName(QStringLiteral("tangentStatus"));
+    tangentStatus->setWordWrap(true);
+    tangentForm->addRow(tangentOn);
+    tangentForm->addRow(tangentStatus);
+    form->addRow(tangentBox);
+    auto showTangent = [this, tangentStatus] {
+        QString text;
+        if (tangent_->isConnected())
+            text = tr("Connected to Tangent Hub. Montage's controls are in %1 for Tangent Mapper.")
+                       .arg(QDir::toNativeSeparators(tangent_->folder()));
+        else if (!tangent_->isEnabled())
+            text = tr("Off.");
+        else
+            text = tr("Waiting for Tangent Hub (installed with Tangent's Hub software).");
+        tangentStatus->setText(text);
+    };
+    showTangent();
+    connect(tangent_, &TangentControl::connectionChanged, tangentStatus, showTangent);
+    connect(tangentOn, &QCheckBox::toggled, dlg, [this, showTangent](bool on) {
+        appSettings().setValue(QStringLiteral("tangent/enabled"), on);
+        tangent_->setEnabled(on);
+        showTangent();
+    });
     form->addRow(buttons);
     dlg->show();
     return dlg;

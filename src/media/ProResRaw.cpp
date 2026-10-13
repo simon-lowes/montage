@@ -106,6 +106,9 @@ const AcesCctTable& acesCctTable() {
 
 }  // namespace
 
+void planckianChromaticity(double kelvin, double& x, double& y) { planckian(kelvin, x, y); }
+void bradfordAdaptation(double x1, double y1, double x2, double y2, double out[9]) { bradford(x1, y1, x2, y2, out); }
+
 bool proResRawAvailable() {
 #ifdef MONTAGE_PRORES_RAW
     return true;
@@ -134,7 +137,8 @@ void proResRawBalance(const ProResRawColor& color, const RawSettings& settings, 
         // The chosen light's white as the camera sees it once balanced as shot (the camera's matrix takes the as-shot
         // light to D65), made the new white: c = camToXyz^-1 · Bradford(as shot → D65) · XYZ(light).
         double ax = 0.3127, ay = 0.3290, kx, ky;
-        if (color.cct > 0) planckian(color.cct, ax, ay);
+        if (color.asShotX > 0 && color.asShotY > 0) ax = color.asShotX, ay = color.asShotY;
+        else if (color.cct > 0) planckian(color.cct, ax, ay);
         planckian(settings.temperature, kx, ky);
         double adapt[9], inv[9];
         bradford(ax, ay, 0.3127, 0.3290, adapt);

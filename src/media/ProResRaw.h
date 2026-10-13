@@ -28,9 +28,15 @@ struct ProResRawColor {
     double black = 256.0 / 65535, white = 61568.0 / 65535;  // the sensor's range, as fractions of 16 bits
     double wbRed = 1, wbBlue = 1;                            // as shot (green 1)
     unsigned cct = 0;                                        // the as-shot white balance in kelvin, 0 if not said
+    double asShotX = 0, asShotY = 0;                         // the as-shot light's chromaticity, when known exactly (else from cct)
     double camToXyz[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};        // white-balanced camera RGB to CIE XYZ (D65), rows
     double gain = 1;                                         // to scene-linear light
 };
+
+// A light's chromaticity on the Planckian locus (1667 K to 25000 K), and the Bradford adaptation (XYZ, 3x3 by rows)
+// from one white's chromaticity to another's (for other RAW formats' colour: media/Mlv.h).
+void planckianChromaticity(double kelvin, double& x, double& y);
+void bradfordAdaptation(double x1, double y1, double x2, double y2, double out[9]);
 
 // The developed picture's size: the mosaic less its recommended crop (left, top, right, bottom) exactly; with `half`,
 // whole 2x2 cells of it, halved.

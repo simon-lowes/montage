@@ -27,8 +27,10 @@ struct ColorOp;
 // any other effect or mask (people, objects, depth, Refine Edges, Show Mask), which only the CPU draws. The mask's
 // shape is drawn for a picture `width` by `height` (0: whether it could be, alone).
 bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, int width = 0, int height = 0, double pixelScale = 1);
-// An effect's (or a grade node's) mask in that form, into `op`; false when only the CPU can make it.
-bool gpuMask(const Effect& e, FrameTime t, gpu::ColorOp& op, int width = 0, int height = 0, double pixelScale = 1);
+// An effect's (or a grade node's) mask in that form, into `op`; false when only the CPU can make it. `showing`: Show
+// Mask is the caller's to draw (a grade node's).
+bool gpuMask(const Effect& e, FrameTime t, gpu::ColorOp& op, int width = 0, int height = 0, double pixelScale = 1,
+             bool showing = false);
 
 // The depth of the frame being worked on (media/DepthMap.h), for depth
 // effects and depth qualifiers: set by the compositor for the effects of one
