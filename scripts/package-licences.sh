@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Starts a package's licences folder with what every package carries, whatever it bundles: Montage's own licence,
+# exception and third-party notices, the licences of the headers vendored in third_party/, of the libraries compiled
+# into Montage (from the build's _deps), of the C2PA library's Rust crates, and of the FFmpeg build.
+#
+#   scripts/package-licences.sh <licenses-dir> <build-dir> [c2pa-prefix] [ffmpeg-share-dir]
+#
+# scripts/package-macos.sh and package-windows.sh then add the bundled shared libraries' licences and write
+# BUNDLED.txt, the index Help › Licences… shows.
+set -euo pipefail
+
+OUT=${1:?licenses dir}
+BUILD=${2:?build dir}
+C2PA=${3:-}
+FFSHARE=${4:-}
+
+rm -rf "$OUT"
+mkdir -p "$OUT/montage/third_party" "$OUT/compiled"
+cp LICENSE LICENSE-EXCEPTION THIRD_PARTY_NOTICES.md "$OUT/montage/"
+cp -R LICENSES "$OUT/montage/"
+for d in third_party/*/; do
+  name=$(basename "$d")
+  mkdir -p "$OUT/montage/third_party/$name"
+  find "$d" -maxdepth 1 -type f \( -iname 'LICENSE*' -o -iname 'COPYING*' -o -iname 'README.montage' \) -exec cp {} "$OUT/montage/third_party/$name/" \;
+done
+
+# Libraries compiled into Montage: every licence file of their sources, by path (ThorVG's include RapidJSON's and
+# JerryScript's). Lua's tarball has none; its licence is LICENSES/MIT-Lua.txt.
+for dep in whisper rnnoise thorvg; do
+  src="$BUILD/_deps/$dep-src"
+  [ -d "$src" ] || continue
+  (cd "$src" && find . -type f \( -iname 'LICENSE' -o -iname 'LICENSE.*' -o -iname 'LICENCE*' -o -iname 'COPYING' -o -iname 'COPYING.*' \) \
+      -not -path './.git/*' -not -path '*/test*/*' -not -path '*/examples/*' -not -path './bindings/*') |
+    while read -r f; do
+      mkdir -p "$OUT/compiled/$dep/$(dirname "$f")"
+      cp "$src/$f" "$OUT/compiled/$dep/$f"
+    done
+done
+
+if [ -n "$C2PA" ] && [ -d "$C2PA/licenses" ]; then cp -R "$C2PA/licenses" "$OUT/c2pa"; fi
+
+if [ -n "$FFSHARE" ] && [ -d "$FFSHARE" ]; then
+  mkdir -p "$OUT/ffmpeg"
+  cp "$FFSHARE"/LICENSE.md "$FFSHARE"/COPYING.* "$FFSHARE"/configure.txt "$OUT/ffmpeg/"
+  [ -s "$FFSHARE/buildconf.txt" ] && cp "$FFSHARE/buildconf.txt" "$OUT/ffmpeg/"
+fi
+echo "Licences for Montage, its vendored headers and compiled-in libraries are in $OUT"

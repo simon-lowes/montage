@@ -144,6 +144,7 @@
 #include "ReviewOverlay.h"
 #include "ChartMatchDialog.h"
 #include "LensCorrectionDialog.h"
+#include "LicencesDialog.h"
 #include "ReferenceOutputPanel.h"
 #include "SequenceIndexPanel.h"
 #include "StackedTimelineWidget.h"
@@ -2279,6 +2280,8 @@ void MainWindow::buildMenus() {
     syncWorkspaceUi();
     QMenu* help = menuBar()->addMenu(tr("&Help"));
     add(help, tr("&Keyboard Shortcuts"), QKeySequence(Qt::Key_F1), [this] { showShortcuts(); });
+    add(help, tr("&Licences…"), QKeySequence(), [this] { LicencesDialog(this).exec(); })->setObjectName("showLicences");
+    add(help, tr("About &Qt"), QKeySequence(), [] { QApplication::aboutQt(); });
     add(help, tr("&About Montage"), QKeySequence(), [this] { about(); });
 
     // Timeline context menus reuse the actions.
@@ -7756,8 +7759,17 @@ void MainWindow::about() {
     QMessageBox::about(this, tr("About Montage"),
                        tr("<h3>Montage %1</h3><p>A professional non-linear video editor written in C++ with Qt and FFmpeg.</p>"
                           "<p>Multi-track editing with ripple, roll, slip and slide tools; keyframed effects and colour correction; "
-                          "titles, transitions, scopes, an audio mixer and export to H.264, HEVC, ProRes, DNxHR, VP9 and AV1.</p>")
-                           .arg(MONTAGE_VERSION));
+                          "titles, transitions, scopes, an audio mixer and export to H.264, HEVC, ProRes, DNxHR, VP9 and AV1.</p>"
+                          "<p>Copyright © the Montage authors. Montage is free software under the GNU General Public License, "
+                          "version 3 or later, and comes with no warranty. "
+                          "<a href=\"https://github.com/simon-lowes/montage\">Source code</a>.</p>"
+                          "<p>It uses Qt %2 (LGPL-3.0) and FFmpeg %3 (%4), and the libraries listed in Help › Licences….</p>"
+                          "<p>Montage is an independent project, not affiliated with or endorsed by the makers of the "
+                          "products and formats it works with. NDI® is a registered trademark of Vizrt NDI AB "
+                          "(<a href=\"https://ndi.video\">ndi.video</a>). VST® is a registered trademark of Steinberg Media "
+                          "Technologies GmbH.</p>")
+                           .arg(QStringLiteral(MONTAGE_VERSION), QString::fromLatin1(qVersion()), ffmpegVersion().toHtmlEscaped(),
+                                ffmpegLicence().toHtmlEscaped()));
 }
 
 void MainWindow::raisePanel(const QString& name) {

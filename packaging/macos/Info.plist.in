@@ -18,6 +18,8 @@
   <string>${MACOSX_BUNDLE_BUNDLE_NAME}</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <key>NSHumanReadableCopyright</key>
+  <string>Copyright © the Montage authors. Free software under the GNU GPL, version 3 or later.</string>
   <key>CFBundleShortVersionString</key>
   <string>${MACOSX_BUNDLE_SHORT_VERSION_STRING}</string>
   <key>CFBundleVersion</key>

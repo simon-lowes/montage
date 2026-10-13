@@ -33,6 +33,7 @@
 #include <QScrollBar>
 #include <QSlider>
 #include <QPushButton>
+#include <QTextBrowser>
 #include <QColorDialog>
 #include <QMenu>
 #include <QPainter>
@@ -61,6 +62,7 @@
 #include "core/Ambisonics.h"
 #include "media/Sofa.h"
 #include "AutoMixDialog.h"
+#include "LicencesDialog.h"
 #include "CaptionsPanel.h"
 #include "CleanFeed.h"
 #include "ColorWarperEditor.h"
@@ -14267,6 +14269,26 @@ print("added " + ui["name"])
         state()->undo();
         c = edit::clipById(*state()->sequence(), red);
         QCOMPARE(c->motion.p("opacity", 0), 100.0);
+    }
+
+    void licencesShown() {
+        // Help offers the licences, About Qt and About Montage.
+        QAction* show = win_->findChild<QAction*>("showLicences");
+        QVERIFY(show);
+        // The dialog shows Montage's licence, the GPL itself and the third-party notices, all built in.
+        LicencesDialog dlg(win_.get());
+        auto* montagePage = dlg.findChild<QTextBrowser*>("licenceMontage");
+        QVERIFY(montagePage && montagePage->toPlainText().contains("either version 3 of the License"));
+        QVERIFY(montagePage->toPlainText().contains("additional permission under section 7"));
+        auto* gpl = dlg.findChild<QTextBrowser*>("licenceGpl");
+        QVERIFY(gpl && gpl->toPlainText().contains("GNU GENERAL PUBLIC LICENSE"));
+        auto* notices = dlg.findChild<QTextBrowser*>("licenceNotices");
+        QVERIFY(notices && notices->toPlainText().contains("lensfun") && notices->toPlainText().contains("Sylvain Munaut"));
+        // FFmpeg reports its own licence, which the dialog and About Montage repeat.
+        QVERIFY(!ffmpegLicence().isEmpty() && montagePage->toPlainText().contains(ffmpegLicence()));
+        // A build run from its build folder has no packaged licences folder to open.
+        QVERIFY(packagedLicencesFolder().isEmpty());
+        QVERIFY(!dlg.findChild<QPushButton*>("openLicencesFolder")->isEnabled());
     }
 
     void playbackAdvances() {

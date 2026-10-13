@@ -8,6 +8,9 @@ add_library(montage_ui STATIC ${MONTAGE_UI_SOURCES})
 target_link_libraries(montage_ui PUBLIC montage_engine Qt6::Widgets Qt6::Multimedia Qt6::Concurrent Qt6::Network)
 target_include_directories(montage_ui PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(montage_ui PROPERTIES AUTOMOC ON)
+# Help › Licences…: Montage's licence and the third-party notices, built in (LicencesDialog).
+qt_add_resources(montage_ui "licences" PREFIX "/montage/licences" BASE "${PROJECT_SOURCE_DIR}"
+  FILES ${PROJECT_SOURCE_DIR}/LICENSE ${PROJECT_SOURCE_DIR}/LICENSE-EXCEPTION ${PROJECT_SOURCE_DIR}/THIRD_PARTY_NOTICES.md)
 target_compile_options(montage_ui PRIVATE
   $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wno-unused-parameter>)
 # The HDR viewer (HdrSurface.h): Qt's RHI and its HDR swap chain information, from Qt 6.7 (a private module, which

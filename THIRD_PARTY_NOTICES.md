@@ -44,8 +44,8 @@ folder. The source code for each release, including every bundled library's, is 
 The packages bundle these shared libraries and their dependencies. Each package's `licenses/BUNDLED.txt` lists every
 one with its exact version, licence and source.
 
-- [FFmpeg](https://ffmpeg.org), built by `scripts/build-ffmpeg.sh` with `--enable-gpl --enable-version3`, which makes
-  this build GPL-3.0-or-later; with [x264](https://www.videolan.org/developers/x264.html) (GPL-2.0-or-later),
+- [FFmpeg](https://ffmpeg.org), built by `scripts/build-ffmpeg.sh` with `--enable-gpl` (and never `--enable-nonfree`),
+  which makes this build GPL-2.0-or-later; with [x264](https://www.videolan.org/developers/x264.html) (GPL-2.0-or-later),
   [x265](https://www.x265.org) (GPL-2.0-or-later), libvpx (BSD-3-Clause), SVT-AV1 (BSD-3-Clause-Clear), dav1d
   (BSD-2-Clause), Opus (BSD-3-Clause), OpenJPEG (BSD-2-Clause), SRT (MPL-2.0) and librist (BSD-2-Clause).
 - [Qt](https://www.qt.io) 6 (LGPL-3.0): Core, Gui, Widgets, Network, Concurrent, Xml and Multimedia. You may replace
