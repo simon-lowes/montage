@@ -6766,6 +6766,21 @@ colorspaces:
             compare(20, o, mode);
         }
         edit::clipById(s, r2.created[0])->blendMode = "normal";
+        // At half size for playback, flipped.
+        RenderOptions half;
+        half.scale = 0.5;
+        compare(20, half, "half size");
+        edit::clipById(s, r2.created[0])->motion.params["flip_h"] = 1.0;
+        compare(20, o, "flipped");
+        // Nothing on screen: transparent, flattened to black.
+        compare(90, o, "empty");
+        // Camera log footage with a look applied in ACEScct, as an AMF has it: made on the camera's picture once.
+        p.findMedia(other)->colorOverride = "acescct";
+        Effect look = makeEffect(p, "lut");
+        look.strings["path"] = cube;
+        look.strings["space"] = "ACEScct";
+        s.videoTracks[0].clips[1].effects.push_back(look);
+        compare(60, o, "source look");
         // An HDR sequence seen on an SDR display.
         s.colorSpace = "rec2100pq";
         o.displaySpace = "rec709";

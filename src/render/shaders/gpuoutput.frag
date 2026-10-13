@@ -1,7 +1,7 @@
 #version 440
 // The finished frame: over black (alpha made whole, as flattenOver does), through the display's LUT when it differs
 // from the working space (as convertColor does), and for an 8-bit target rounded as toRgba8 rounds.
-// p[0]: x flatten, y through the LUT, z 8-bit, w LUT size.
+// p[0]: x flatten, y through the LUT, z 8-bit, w LUT size; p[1].x a canvas drawn (none: transparent).
 layout(location = 0) out vec4 fragColor;
 layout(std140, binding = 0) uniform Params { vec4 p[16]; };
 layout(binding = 1) uniform sampler2D canvasTex;
@@ -23,7 +23,7 @@ vec3 applyLut(vec3 c) {
 }
 
 void main() {
-    vec4 c = texelFetch(canvasTex, ivec2(gl_FragCoord.xy), 0);
+    vec4 c = p[1].x > 0.5 ? texelFetch(canvasTex, ivec2(gl_FragCoord.xy), 0) : vec4(0.0);
     if (p[0].x > 0.5) c.a = 1.0;
     if (p[0].y > 0.5 && c.a > 0.0) c = vec4(applyLut(c.rgb / c.a) * c.a, c.a);
     if (p[0].z > 0.5) {

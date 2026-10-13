@@ -1406,12 +1406,23 @@ enum class GpuLayerResult { Drawn, Nothing, Unsupported };
 
 GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, gpu::Layer& out) {
     if (!c.grade.empty() || (c.isGenerator() && c.generator.type == "adjustment")) return GpuLayerResult::Unsupported;
-    // Its colour steps, each one the GPU draws (the ones on the source, such as noise reduction, are not).
+    // Its colour steps, each one the GPU draws (the ones on the source, such as noise reduction, are not). Those the
+    // GPU has no form for go to the CPU before anything is decoded, unless they may run on the camera's picture.
     const FrameTime lt = t - c.start;
-    for (const Effect* e : gradeChain(seq, c))
-        if (e->enabled && !gpuColorOps(*e, lt, out.ops)) return GpuLayerResult::Unsupported;
+    const std::vector<const Effect*> chain = gradeChain(seq, c);
+    std::vector<gpu::ColorOp> unused;
+    for (const Effect* e : chain)
+        if (e->enabled && e->type != "cdl" && e->type != "aces_gamut_compress" && !gpuColorOps(*e, lt, unused))
+            return GpuLayerResult::Unsupported;
     ClipSource cs;
     if (!clipSource(p, seq, c, t, o, nullptr, true, cs)) return GpuLayerResult::Nothing;
+    // Without the looks made on the camera's picture already (an AMF's CDLs and LUTs, the gamut compression).
+    for (const Effect* e : chain) {
+        if (!e->enabled || e == cs.sourceCdl || e == cs.sourceRgc ||
+            std::find(cs.sourceLooks.begin(), cs.sourceLooks.end(), e) != cs.sourceLooks.end())
+            continue;
+        if (!gpuColorOps(*e, lt, out.ops)) return GpuLayerResult::Unsupported;
+    }
     int w = 0, h = 0;
     if (cs.frame) {
         out.frame = cs.frame;
@@ -1420,6 +1431,12 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     } else {
         out.image = std::move(cs.src);
         w = out.image.width, h = out.image.height;
+    }
+    // A picture wider or taller than the GPU takes is made on the CPU at the canvas's size instead.
+    const int maxSize = gpu::maxTextureSize();
+    if ((cs.frame ? w * 2 : w) > maxSize || h > maxSize) {
+        out = {};
+        return GpuLayerResult::Unsupported;
     }
     // Placed as transformLayer places it (worked out here in double).
     const Geometry& g = cs.g;
@@ -1478,6 +1495,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
     frame.width = std::max(1, int(std::lround(seq.width * o.scale)));
     frame.height = std::max(1, int(std::lround(seq.height * o.scale)));
     const int W = frame.width, H = frame.height;
+    if (W > gpu::maxTextureSize() || H > gpu::maxTextureSize()) return fallback("a frame larger than the GPU takes");
     const std::vector<bool> hiddenMatte = hiddenMatteTracks(seq, t);
     if (std::find(hiddenMatte.begin(), hiddenMatte.end(), true) != hiddenMatte.end()) return fallback("a track matte");
     // The clips on screen that need the canvas beneath them, or another track, go to the CPU whole.

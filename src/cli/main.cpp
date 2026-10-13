@@ -761,7 +761,7 @@ int cmdBench(const std::vector<std::string>& args) {
         else if (args[i] == "--frames" && i + 1 < args.size()) frames = std::atoi(args[++i].c_str());
         else if (args[i] == "--gpu") onGpu = true;
     }
-    // On the GPU: the viewer's 8-bit frames, as the program monitor draws them.
+    // Frames as the program monitor shows them, on the CPU or the GPU.
     std::string why;
     if (onGpu && !gpu::initialize(&why)) {
         std::fprintf(stderr, "No GPU rendering: %s\n", why.c_str());
@@ -773,10 +773,7 @@ int cmdBench(const std::vector<std::string>& args) {
     RenderOptions o;
     o.scale = scale;
     o.gpu = onGpu;
-    auto render = [&](FrameTime t) {
-        if (onGpu) renderProgramFrameRgba8(p, s, t, o);
-        else renderProgramFrame(p, s, t, o);
-    };
+    auto render = [&](FrameTime t) { renderProgramFrameRgba8(p, s, t, o); };  // (the viewer's 8-bit picture either way)
     frames = int(std::min<FrameTime>(frames, std::max<FrameTime>(1, s.duration())));
     render(0);  // warm up decoders
     gpu::resetStats();

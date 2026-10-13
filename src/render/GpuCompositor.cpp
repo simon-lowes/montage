@@ -63,6 +63,7 @@ bool initialize(std::string* why) {
 }
 bool available(std::string* why) { return initialize(why); }
 std::string deviceName() { return {}; }
+int maxTextureSize() { return 0; }
 void shutdown() {}
 bool execute(const Frame&, Image*, QImage*) { return false; }
 
@@ -105,15 +106,16 @@ public:
     bool ready() const { return ready_; }
     const std::string& problem() const { return problem_; }
     const std::string& name() const { return name_; }
+    int maxTextureSize() const { return maxTexture_; }
 
     // fn run on the GPU's thread, waited for.
     template <typename F>
     auto run(F fn) -> decltype(fn()) {
-        std::packaged_task<decltype(fn())()> task(std::move(fn));
-        auto result = task.get_future();
+        auto task = std::make_shared<std::packaged_task<decltype(fn())()>>(std::move(fn));
+        auto result = task->get_future();
         {
             std::lock_guard lock(queueMutex_);
-            queue_.push_back([&task] { task(); });
+            queue_.push_back([task] { (*task)(); });
         }
         queueCv_.notify_one();
         return result.get();
@@ -133,7 +135,7 @@ private:
     };
     QRhiTexture* texture(QRhiTexture::Format format, int w, int h, bool target);
     void release(QRhiTexture* tex);  // back to the pool, for later passes of the frame
-    Target& target(QRhiTexture* tex);
+    Target* target(QRhiTexture* tex);  // (null, and the frame failed, when the device cannot draw into it)
     QRhiTexture* lutTexture(const std::shared_ptr<const Lut3D>& lut, QRhiResourceUpdateBatch* u, QRhiTexture** table1d);
     QRhiBuffer* uniforms(QRhiResourceUpdateBatch* u, const float (&p)[64]);
     void pass(QRhiGraphicsPipeline* ps, QRhiTexture* into, QRhiResourceUpdateBatch* u,
@@ -153,6 +155,7 @@ private:
     bool software_ = false;
     bool ready_ = false;
     std::string problem_, name_;
+    int maxTexture_ = 0;
 
     QRhi* rhi_ = nullptr;
     QRhiCommandBuffer* cb_ = nullptr;
@@ -161,12 +164,18 @@ private:
     QRhiShaderResourceBindings* layout_ = nullptr;
     QRhiGraphicsPipeline *colorPs_ = nullptr, *compositePs_ = nullptr, *outputPs_ = nullptr, *output8Ps_ = nullptr;
     QRhiRenderPassDescriptor *rpFloat_ = nullptr, *rp8_ = nullptr;
-    // Textures kept between frames (by format and size), lent out within one.
+    QRhiTexture *rpFloatTex_ = nullptr, *rp8Tex_ = nullptr;  // (the small targets they were made from)
+    // Textures kept between frames (by format and size), lent out within one. Only let go between frames: a pass
+    // recorded earlier in a frame may still read one given back.
     struct Pooled {
         QRhiTexture* tex;
         bool target, used;
+        long lastFrame;
+        size_t bytes;
     };
     std::vector<Pooled> pool_;
+    long frameNo_ = 0;
+    bool failed_ = false;  // a pass of this frame could not be drawn
     std::map<QRhiTexture*, Target> targets_;
     std::vector<QRhiBuffer*> ubufs_;
     size_t ubufUsed_ = 0;
@@ -322,11 +331,17 @@ bool Device::create() {
                           B::sampledTexture(4, B::FragmentStage, dummy2d_, sampler_)});
     layout_->create();
     // Render pass descriptors for float and 8-bit targets, from small targets of each.
-    QRhiTexture* f = texture(T::RGBA32F, 1, 1, true);
-    QRhiTexture* b = texture(T::RGBA8, 1, 1, true);
-    rpFloat_ = target(f).rp;
-    rp8_ = target(b).rp;
-    for (Pooled& p : pool_) p.used = false;
+    rpFloatTex_ = rhi_->newTexture(T::RGBA32F, QSize(1, 1), 1, T::RenderTarget);
+    rp8Tex_ = rhi_->newTexture(T::RGBA8, QSize(1, 1), 1, T::RenderTarget);
+    const Target* f = rpFloatTex_->create() ? target(rpFloatTex_) : nullptr;
+    const Target* b = rp8Tex_->create() ? target(rp8Tex_) : nullptr;
+    if (!f || !b) {
+        problem_ = "the graphics device cannot draw into float textures";
+        return false;
+    }
+    rpFloat_ = f->rp;
+    rp8_ = b->rp;
+    maxTexture_ = rhi_->resourceLimit(QRhi::TextureSizeMax);
     const QShader vert = shader(kQuadVertQsb, sizeof kQuadVertQsb);
     auto pipeline = [&](const unsigned char* frag, size_t size, QRhiRenderPassDescriptor* rp) {
         QRhiGraphicsPipeline* ps = rhi_->newGraphicsPipeline();
@@ -361,8 +376,8 @@ void Device::destroy() {
     colorPs_ = compositePs_ = outputPs_ = output8Ps_ = nullptr;
     rpFloat_ = rp8_ = nullptr;  // (the targets' own)
     delete layout_, layout_ = nullptr;
-    delete dummy2d_, delete dummy3d_, delete dummy16_;
-    dummy2d_ = dummy3d_ = dummy16_ = nullptr;
+    delete dummy2d_, delete dummy3d_, delete dummy16_, delete rpFloatTex_, delete rp8Tex_;
+    dummy2d_ = dummy3d_ = dummy16_ = rpFloatTex_ = rp8Tex_ = nullptr;
     delete sampler_, sampler_ = nullptr;
     delete rhi_, rhi_ = nullptr;
 }
@@ -371,26 +386,17 @@ QRhiTexture* Device::texture(QRhiTexture::Format format, int w, int h, bool isTa
     for (Pooled& p : pool_)
         if (!p.used && p.target == isTarget && p.tex->format() == format && p.tex->pixelSize() == QSize(w, h)) {
             p.used = true;
+            p.lastFrame = frameNo_;
             return p.tex;
         }
     QRhiTexture* t = rhi_->newTexture(format, QSize(w, h), 1, isTarget ? QRhiTexture::RenderTarget : QRhiTexture::Flags());
     if (!t->create()) {
         delete t;
+        failed_ = true;
         return nullptr;
     }
-    // A few sizes are kept: the oldest unused ones go when there are many.
-    if (pool_.size() > 48)
-        for (auto it = pool_.begin(); it != pool_.end(); ++it)
-            if (!it->used) {
-                if (auto tg = targets_.find(it->tex); tg != targets_.end()) {
-                    delete tg->second.rt, delete tg->second.rp;
-                    targets_.erase(tg);
-                }
-                delete it->tex;
-                pool_.erase(it);
-                break;
-            }
-    pool_.push_back({t, isTarget, true});
+    const size_t texel = format == QRhiTexture::RGBA32F ? 16 : 4;
+    pool_.push_back({t, isTarget, true, frameNo_, size_t(w) * size_t(h) * texel});
     return t;
 }
 
@@ -399,16 +405,21 @@ void Device::release(QRhiTexture* tex) {
         if (p.tex == tex) p.used = false;
 }
 
-Device::Target& Device::target(QRhiTexture* tex) {
+Device::Target* Device::target(QRhiTexture* tex) {
     Target& t = targets_[tex];
     if (!t.rt) {
         t.tex = tex;
         t.rt = rhi_->newTextureRenderTarget({QRhiColorAttachment(tex)});
         t.rp = t.rt->newCompatibleRenderPassDescriptor();
         t.rt->setRenderPassDescriptor(t.rp);
-        t.rt->create();
+        if (!t.rt->create()) {
+            delete t.rt, delete t.rp;
+            targets_.erase(tex);
+            failed_ = true;
+            return nullptr;
+        }
     }
-    return t;
+    return &t;
 }
 
 QRhiTexture* Device::lutTexture(const std::shared_ptr<const Lut3D>& lut, QRhiResourceUpdateBatch* u, QRhiTexture** table1d) {
@@ -475,8 +486,13 @@ void Device::pass(QRhiGraphicsPipeline* ps, QRhiTexture* into, QRhiResourceUpdat
                       B::sampledTexture(4, B::FragmentStage, bound[4], sampler_)});
     srb->create();
     frameSrbs_.push_back(srb);
-    Target& t = target(into);
-    cb_->beginPass(t.rt, Qt::transparent, {1.0f, 0}, u);
+    const Target* t = target(into);
+    if (!t) {
+        u->release();
+        if (after) after->release();
+        return;
+    }
+    cb_->beginPass(t->rt, Qt::transparent, {1.0f, 0}, u);
     cb_->setGraphicsPipeline(ps);
     const QSize size = into->pixelSize();
     cb_->setViewport({0, 0, float(size.width()), float(size.height())});
@@ -562,12 +578,34 @@ void Device::endFrame() {
     frameSrbs_.clear();
     for (Pooled& p : pool_) p.used = false;
     ubufUsed_ = 0;
+    // The frame is finished (offscreen frames wait for the GPU), so textures can go now: those not used for a few
+    // frames, then the least recently used while the pool holds more than its budget.
+    constexpr long kIdleFrames = 8;
+    constexpr size_t kBudget = size_t(768) << 20;
+    auto drop = [&](std::vector<Pooled>::iterator it) {
+        if (auto tg = targets_.find(it->tex); tg != targets_.end()) {
+            delete tg->second.rt, delete tg->second.rp;
+            targets_.erase(tg);
+        }
+        delete it->tex;
+        return pool_.erase(it);
+    };
+    for (auto it = pool_.begin(); it != pool_.end();) it = frameNo_ - it->lastFrame > kIdleFrames ? drop(it) : it + 1;
+    size_t bytes = 0;
+    for (const Pooled& p : pool_) bytes += p.bytes;
+    while (bytes > kBudget && !pool_.empty()) {
+        auto oldest = std::min_element(pool_.begin(), pool_.end(), [](const Pooled& a, const Pooled& b) { return a.lastFrame < b.lastFrame; });
+        bytes -= oldest->bytes;
+        drop(oldest);
+    }
+    ++frameNo_;
+    failed_ = false;
 }
 
 bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
     using T = QRhiTexture;
     const int W = frame.width, H = frame.height;
-    const int maxSize = rhi_->resourceLimit(QRhi::TextureSizeMax);
+    const int maxSize = maxTexture_;
     if (W <= 0 || H <= 0 || W > maxSize || H > maxSize) return false;
     for (const Item& it : frame.items)
         for (const Layer* l : {&it.a, it.b ? &*it.b : nullptr})
@@ -622,6 +660,7 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
         } else {
             std::fill(p, p + 64, 0.0f);
             p[0] = frame.flatten ? 1 : 0, p[1] = frame.display ? 1 : 0, p[2] = out8 ? 1 : 0, p[3] = frame.display ? float(frame.display->size) : 0;
+            p[4] = canvas ? 1 : 0;  // (nothing drawn: transparent)
             QRhiBuffer* ub = uniforms(u, p);
             QRhiResourceUpdateBatch* rb = rhi_->nextResourceUpdateBatch();
             rb->readBackTexture({final}, &result);
@@ -630,7 +669,7 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
         }
     }
     if (u) u->release();
-    if (rhi_->endOffscreenFrame() != QRhi::FrameOpSuccess) ok = false;
+    if (rhi_->endOffscreenFrame() != QRhi::FrameOpSuccess || failed_) ok = false;
     endFrame();
     if (!ok) return false;
     const size_t bytes = size_t(W) * H * (out8 ? 4 : 16);
@@ -675,6 +714,11 @@ bool available(std::string* why) {
 std::string deviceName() {
     std::shared_lock lock(gDeviceMutex);
     return gDevice && gDevice->ready() ? gDevice->name() : std::string();
+}
+
+int maxTextureSize() {
+    std::shared_lock lock(gDeviceMutex);
+    return gDevice && gDevice->ready() ? gDevice->maxTextureSize() : 0;
 }
 
 void shutdown() {

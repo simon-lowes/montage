@@ -28,6 +28,7 @@ namespace gpu {
 bool initialize(std::string* why = nullptr);
 bool available(std::string* why = nullptr);
 std::string deviceName();  // e.g. "OpenGL 4.5, llvmpipe (LLVM 20.1.2, 256 bits)"
+int maxTextureSize();      // the widest picture it takes (0 without a GPU)
 void shutdown();           // (before the application goes; initialize() again is allowed)
 
 // One colour step on a layer at its source size (render/Processing's colour effects, as they run there).

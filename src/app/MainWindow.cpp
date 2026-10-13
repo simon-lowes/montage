@@ -1884,12 +1884,30 @@ void MainWindow::buildMenus() {
         a->setToolTip(tr("Decode H.264, HEVC, VP9, AV1 and ProRes on the GPU or media engine "
                          "(VideoToolbox, D3D11, NVDEC, VAAPI) where supported"));
         // GPU rendering (on by default where there is a GPU; MONTAGE_GPU=off overrides it): the program monitor's frames
-        // are composited and graded on the GPU, what it cannot draw on the CPU as before.
+        // are composited and graded on the GPU, what it cannot draw on the CPU as before. The GPU is set up only when it
+        // is wanted (a driver that misbehaves is out of the way once it is turned off).
         std::string why;
-        const bool hasGpu = gpu::initialize(&why);
-        const bool onGpu = hasGpu && appSettings().value("playback/gpuRendering", true).toBool();
+        const bool onGpu = appSettings().value("playback/gpuRendering", true).toBool() && gpu::initialize(&why);
         program_->setGpuRendering(onGpu);
-        QAction* g = add(play, tr("&GPU Rendering"), QKeySequence(), [this](bool on) {
+        QAction* g = add(play, tr("&GPU Rendering"), QKeySequence(), [](bool) {});
+        g->setObjectName(QStringLiteral("gpuRendering"));
+        g->setCheckable(true);
+        g->setChecked(onGpu);
+        auto describe = [g](const std::string& problem) {
+            g->setToolTip(problem.empty() ? tr("Composite and grade the program monitor's frames on the GPU; effects it has no GPU "
+                                               "form for render on the CPU")
+                                          : tr("No GPU rendering: %1").arg(QString::fromStdString(problem)));
+        };
+        describe(why);
+        connect(g, &QAction::triggered, this, [this, g, describe](bool on) {
+            std::string problem;
+            if (on && !gpu::initialize(&problem)) {
+                g->setChecked(false);
+                describe(problem);
+                statusBar()->showMessage(tr("No GPU rendering: %1").arg(QString::fromStdString(problem)), 5000);
+                return;
+            }
+            describe({});
             program_->setGpuRendering(on);
             appSettings().setValue("playback/gpuRendering", on);
             statusBar()->showMessage(on ? tr("GPU rendering on (%1): layers, transforms and colour effects draw on the GPU")
@@ -1897,14 +1915,6 @@ void MainWindow::buildMenus() {
                                         : tr("GPU rendering off: frames render on the CPU"),
                                      5000);
         });
-        g->setObjectName(QStringLiteral("gpuRendering"));
-        g->setCheckable(true);
-        g->setChecked(onGpu);
-        g->setEnabled(hasGpu);
-        g->setToolTip(hasGpu ? tr("Composite and grade the program monitor's frames on the GPU (%1); effects it has no "
-                                  "GPU form for render on the CPU")
-                                   .arg(QString::fromStdString(gpu::deviceName()))
-                             : tr("No GPU rendering: %1").arg(QString::fromStdString(why)));
         play->addSeparator();
     }
     trimView_ = add(play, tr("Two-Up Trim View"), QKeySequence(), [](bool on) { appSettings().setValue("playback/twoUpTrim", on); });
