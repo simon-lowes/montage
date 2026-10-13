@@ -32,6 +32,7 @@ public:
     // The feed: a URL ("" kind), or a device of one of captureDeviceKinds() ("v4l2", "avfoundation", "dshow"...).
     void setSource(const QString& kind, const QString& url);
     void setSoundDevice(const QString& name);  // a sound device of the same kind ("" the feed's own sound)
+    void setOptions(const QString& options);   // FFmpeg's input options, "name=value" apart by spaces
     void setCodec(const QString& id);
     void setWrapper(const QString& ext);  // "mov" (imported while it records) or "mxf" (once done)
     void setFolder(const QString& dir);
@@ -52,13 +53,14 @@ signals:
 
 private:
     void refresh();
-    void finished(bool ok, const QString& error);
+    void finished(int generation, bool ok, const QString& message);
     void importNow();
 
     EditorState* state_;
     QComboBox* kind_;
     QLineEdit* url_;
     QLineEdit* sound_;
+    QLineEdit* options_;
     QComboBox* codec_;
     QComboBox* wrapper_;
     QLineEdit* folder_;
@@ -72,6 +74,8 @@ private:
     std::unique_ptr<Recorder> recorder_;
     QString path_, error_;
     Id imported_ = 0;
+    bool recording_ = false;  // (until the recording's end has been taken in here)
+    int generation_ = 0;      // the recording the recorder's notices are about
 };
 
 }  // namespace montage

@@ -414,7 +414,7 @@ bool MlvReader::open(const std::string& path, std::string* error) {
                 wbKelvin = int(u32(b + 20));
                 gain[0] = u32(b + 24), gain[1] = u32(b + 28), gain[2] = u32(b + 32);
             } else if (is("RTCI") && want >= 44 && info_.created.empty()) {
-                char t[32];
+                char t[64];
                 std::snprintf(t, sizeof t, "%04d-%02d-%02dT%02d:%02d:%02d", 1900 + u16(b + 26), u16(b + 24) + 1, u16(b + 22), u16(b + 20),
                               u16(b + 18), u16(b + 16));
                 info_.created = t;

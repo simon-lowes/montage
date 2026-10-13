@@ -68,6 +68,10 @@ CaptureDialog::CaptureDialog(EditorState* state, QWidget* parent) : QDialog(pare
     sound_->setObjectName(QStringLiteral("captureSound"));
     sound_->setPlaceholderText(tr("The feed's own sound"));
     form->addRow(tr("Sound device:"), sound_);
+    options_ = new QLineEdit(settings.value(QStringLiteral("capture/options")).toString(), this);
+    options_->setObjectName(QStringLiteral("captureOptions"));
+    options_->setPlaceholderText(tr("FFmpeg's input options, e.g. video_size=1920x1080 framerate=25"));
+    form->addRow(tr("Options:"), options_);
     auto placeholders = [this] {
         const QString k = kind_->currentData().toString();
         url_->setPlaceholderText(k.isEmpty() ? tr("srt://0.0.0.0:9000?mode=listener") : k == QLatin1String("v4l2") ? QStringLiteral("/dev/video0")
@@ -110,7 +114,7 @@ CaptureDialog::CaptureDialog(EditorState* state, QWidget* parent) : QDialog(pare
     form->addRow(tr("Clip name:"), name_);
     timecode_ = new QLineEdit(this);
     timecode_->setObjectName(QStringLiteral("captureTimecode"));
-    timecode_->setPlaceholderText(tr("The feed's own, else the time of day"));
+    timecode_->setPlaceholderText(tr("The feed's own, else the time of day (hh:mm:ss:ff, ; for drop frame)"));
     timecode_->setInputMask(QString());
     form->addRow(tr("Start timecode:"), timecode_);
     seconds_ = new QDoubleSpinBox(this);
@@ -143,11 +147,8 @@ CaptureDialog::CaptureDialog(EditorState* state, QWidget* parent) : QDialog(pare
 }
 
 CaptureDialog::~CaptureDialog() {
-    if (recorder_) {
-        recorder_->onFirstFragment = nullptr;
-        recorder_->onFinished = nullptr;
-        recorder_->stop();
-    }
+    // (the recorder's notices, queued to this, go with it)
+    if (recorder_) recorder_->stop();
 }
 
 void CaptureDialog::setSource(const QString& kind, const QString& url) {
@@ -155,6 +156,7 @@ void CaptureDialog::setSource(const QString& kind, const QString& url) {
     url_->setText(url);
 }
 void CaptureDialog::setSoundDevice(const QString& name) { sound_->setText(name); }
+void CaptureDialog::setOptions(const QString& options) { options_->setText(options); }
 void CaptureDialog::setCodec(const QString& id) {
     if (const int i = codec_->findData(id); i >= 0) codec_->setCurrentIndex(i);
 }
@@ -166,7 +168,7 @@ void CaptureDialog::setClipName(const QString& name) { name_->setText(name); }
 void CaptureDialog::setTimecode(const QString& tc) { timecode_->setText(tc); }
 void CaptureDialog::setSeconds(double s) { seconds_->setValue(s); }
 
-bool CaptureDialog::isRecording() const { return recorder_ && recorder_->recording(); }
+bool CaptureDialog::isRecording() const { return recording_; }
 
 bool CaptureDialog::record() {
     if (isRecording()) return false;
@@ -200,19 +202,34 @@ bool CaptureDialog::record() {
     const QString kind = kind_->currentData().toString();
     cs.video.device = kind.toStdString();
     cs.video.url = url_->text().trimmed().toStdString();
+    for (const QString& o : options_->text().split(QLatin1Char(' '), Qt::SkipEmptyParts)) {
+        const int eq = int(o.indexOf(QLatin1Char('=')));
+        if (eq <= 0) {
+            error_ = tr("Options are name=value, apart by spaces");
+            refresh();
+            return false;
+        }
+        cs.video.options[o.left(eq).toStdString()] = o.mid(eq + 1).toStdString();
+    }
     if (!kind.isEmpty() && !sound_->text().trimmed().isEmpty()) cs.audio = CaptureSource{sound_->text().trimmed().toStdString(), kind.toStdString(), {}};
     cs.codec = codec_->currentData().toString().toStdString();
     cs.path = path_.toStdString();
-    cs.timecode = QString(tc).replace(';', ':').toStdString();
+    cs.timecode = tc.toStdString();
     cs.seconds = seconds_->value();
+    if (recorder_) recorder_->stop();
     recorder_ = std::make_unique<Recorder>();
+    const int generation = ++generation_;
     QPointer<CaptureDialog> self(this);
-    recorder_->onFirstFragment = [self] {
-        if (self) QMetaObject::invokeMethod(self.data(), [self] { if (self) self->importNow(); }, Qt::QueuedConnection);
+    recorder_->onFirstFragment = [self, generation] {
+        QMetaObject::invokeMethod(self.data(), [self, generation] {
+            if (self && self->generation_ == generation) self->importNow();
+        }, Qt::QueuedConnection);
     };
-    recorder_->onFinished = [self](bool ok, const std::string& error) {
-        const QString e = QString::fromStdString(error);
-        if (self) QMetaObject::invokeMethod(self.data(), [self, ok, e] { if (self) self->finished(ok, e); }, Qt::QueuedConnection);
+    recorder_->onFinished = [self, generation](bool ok, const std::string& message) {
+        const QString m = QString::fromStdString(message);
+        QMetaObject::invokeMethod(self.data(), [self, generation, ok, m] {
+            if (self) self->finished(generation, ok, m);
+        }, Qt::QueuedConnection);
     };
     std::string err;
     if (!recorder_->start(cs, &err)) {
@@ -228,6 +245,8 @@ bool CaptureDialog::record() {
     settings.setValue(QStringLiteral("capture/wrapper"), ext);
     settings.setValue(QStringLiteral("capture/folder"), dir);
     settings.setValue(QStringLiteral("capture/import"), import_->isChecked());
+    settings.setValue(QStringLiteral("capture/options"), options_->text().trimmed());
+    recording_ = true;
     record_->setText(tr("Stop"));
     tick_->start();
     refresh();
@@ -248,10 +267,12 @@ void CaptureDialog::importNow() {
     refresh();
 }
 
-void CaptureDialog::finished(bool ok, const QString& error) {
+void CaptureDialog::finished(int generation, bool ok, const QString& message) {
+    if (generation != generation_) return;  // (an earlier recording's)
+    recording_ = false;
     tick_->stop();
     record_->setText(tr("Record"));
-    if (!ok) error_ = error;
+    if (!message.isEmpty()) error_ = message;  // (why it failed, or what went wrong in a recording kept)
     // (an MXF file, or a recording shorter than its first fragment, is imported now it is whole)
     if (ok) importNow();
     // The next clip's name: the next number.
@@ -280,7 +301,8 @@ void CaptureDialog::refresh() {
         if (st.dropped || st.repeated) text += QStringLiteral(" · ") + tr("%1 dropped, %2 repeated").arg(st.dropped).arg(st.repeated);
         if (!st.recording) text += QStringLiteral("\n") + QDir::toNativeSeparators(path_);
     }
-    if (!error_.isEmpty()) text += (text.isEmpty() ? QString() : QStringLiteral("\n")) + error_;
+    const QString note = !error_.isEmpty() ? error_ : QString::fromStdString(st.warning);
+    if (!note.isEmpty()) text += (text.isEmpty() ? QString() : QStringLiteral("\n")) + note;
     status_->setText(text.isEmpty() ? tr("Not recording") : text);
 }
 

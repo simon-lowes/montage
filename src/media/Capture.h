@@ -5,7 +5,9 @@
 // feed's own SMPTE 12-M timecode, one given, or the time of day). QuickTime files are written in fragments half a
 // second long, so the file can be imported and cut while it records (EditorState's growing media) and survives a crash;
 // MXF is written whole at the end. Recording runs on a thread of its own at the feed's frame rate (frames late or
-// missing repeated, frames early dropped, so the file keeps time) and stops when asked or after a set time.
+// missing repeated, frames early dropped; a jump in the feed's clock taken as a new start), its sound placed by its
+// time against the pictures' (silence where it is missing, trimmed where it runs early), and stops when asked, after
+// a set time, or when the feed stops (pictures and sound then end together).
 // SDI and HDMI cards (Blackmagic DeckLink) and NDI need their makers' runtimes and are not here.
 #pragma once
 
@@ -35,7 +37,7 @@ struct CaptureSettings {
     std::string codec = "prores_hq";     // prores_proxy, prores_lt, prores, prores_hq, dnxhr_lb, dnxhr_sq, dnxhr_hq, dnxhr_hqx
     std::string timecode;                // the first frame's ("hh:mm:ss:ff"); "" the feed's own, else the time of day
     double seconds = 0;                  // stop after this long (0: when stopped)
-    double openTimeout = 10;             // seconds to wait for the feed to start
+    double openTimeout = 10;             // seconds to wait for the feed to start (and to send again, at least 5)
 };
 
 // The codecs offered: id and name.
@@ -50,7 +52,8 @@ struct CaptureStatus {
     int width = 0, height = 0, channels = 0;
     double fps = 0;
     std::string timecode;  // the first frame's
-    std::string error;
+    std::string error;     // why it failed (nothing usable written)
+    std::string warning;   // what went wrong in a recording kept (the feed or the sound device stopped...)
 };
 
 class Recorder {
@@ -71,9 +74,10 @@ public:
     CaptureStatus status() const;
 
     // On the recording thread: the file's first second is written (it can be opened and imported now), and the
-    // recording ended (ok, or the reason it stopped: the feed lost, a disk full...).
+    // recording ended: ok (the file finished; `message` any warning) or not (`message` why: the feed not found, a
+    // disk full...).
     std::function<void()> onFirstFragment;
-    std::function<void(bool ok, const std::string& error)> onFinished;
+    std::function<void(bool ok, const std::string& message)> onFinished;
 
     struct State;
 

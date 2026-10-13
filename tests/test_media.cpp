@@ -4,6 +4,7 @@
 #include <QElapsedTimer>
 #include <QPainter>
 #include <QProcess>
+#include <QUdpSocket>
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QJsonObject>
@@ -674,7 +675,7 @@ private slots:
             mxf.codec = "dnxhr_sq";
             mxf.timecode.clear();
             mxf.seconds = 1;
-            mxf.video.url = "testsrc2=size=640x360:rate=25[out0];sine=sample_rate=48000[out1]";
+            mxf.video.url = "testsrc2=size=640x360:rate=25,realtime[out0];sine=sample_rate=48000,arealtime[out1]";
             Recorder rec2;
             QVERIFY2(rec2.start(mxf, &err), err.c_str());
             QVERIFY(rec2.wait(30));
@@ -687,9 +688,15 @@ private slots:
             QVERIFY(d.hasAudio);
         }
 
+        // A port no one sends to (one free just now).
+        auto freePort = [] {
+            QUdpSocket probe;
+            probe.bind(QHostAddress::LocalHost, 0);
+            return int(probe.localPort());
+        };
         // A feed that never comes: given up, nothing written.
         CaptureSettings none;
-        none.video.url = "udp://127.0.0.1:47391";
+        none.video.url = "udp://127.0.0.1:" + std::to_string(freePort());
         none.path = path("never.mov");
         none.openTimeout = 1;
         Recorder never;
@@ -706,10 +713,9 @@ private slots:
         probe.start(ffmpeg, {"-hide_banner", "-protocols"});
         probe.waitForFinished(20000);
         const QString protocols = QString::fromLocal8Bit(probe.readAllStandardOutput());
-        int port = 47400;
         for (const char* proto : {"udp", "srt"}) {
             if (!protocols.contains(QRegularExpression(QStringLiteral("\\n\\s*%1\\s*\\n").arg(proto)))) continue;
-            ++port;
+            const int port = freePort();
             CaptureSettings net;
             const QString receive = QString(proto) == "srt" ? QStringLiteral("srt://127.0.0.1:%1?mode=listener&latency=120000&transtype=live").arg(port)
                                                             : QStringLiteral("udp://127.0.0.1:%1").arg(port);
@@ -725,7 +731,7 @@ private slots:
             QThread::msleep(300);
             QProcess sender;
             sender.start(ffmpeg, {"-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25", "-f", "lavfi", "-i",
-                                  "sine=sample_rate=48000", "-t", "6", "-c:v", "mpeg2video", "-g", "12", "-b:v", "2M", "-c:a", "mp2", "-f", "mpegts", send});
+                                  "sine=sample_rate=48000", "-t", "60", "-c:v", "mpeg2video", "-g", "12", "-b:v", "2M", "-c:a", "mp2", "-f", "mpegts", send});
             QVERIFY(sender.waitForStarted(10000));
             const bool ended = r.wait(30);
             sender.kill();

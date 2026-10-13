@@ -24,6 +24,10 @@
   <string>${MACOSX_BUNDLE_BUNDLE_VERSION}</string>
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.video</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Montage records from cameras and capture devices you choose in File › Capture.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Montage records sound from the devices you choose (File › Capture, voice-over and ADR).</string>
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSPrincipalClass</key>

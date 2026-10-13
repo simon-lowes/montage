@@ -381,7 +381,8 @@ void TangentControl::watch() {
     // What the panels show: the clip, its node, and its values there.
     const Target t = target();
     sendDisplay(t);
-    // (while playing over a keyframed grade the Hub is told once playback stops, not at every tick)
+    // (while playing, the Hub is told once playback stops, not at every tick a keyframed grade or the next clip changes
+    // the values)
     if (PlaybackController* c = hooks_.controller ? hooks_.controller() : nullptr; c && c->isPlaying() && !watched_.isEmpty()) return;
     QString now = QStringLiteral("%1/%2/").arg(t.clip).arg(t.node);
     for (const auto& [id, name] : parameters_) now += QString::number(value(name, t), 'g', 9) + QLatin1Char(',');
@@ -473,6 +474,7 @@ void TangentControl::handle(const tangent::HubMessage& m) {
                 c->step(m.jog);
             }
             if (m.shuttle) {
+                if (!c->isPlaying()) shuttle_ = 0;  // (stopped some other way since: from the middle again)
                 // (the ring's turns add up: 1, 2, 4... 32 times either way, back to the middle to stop)
                 shuttle_ = std::clamp(shuttle_ + m.shuttle, -6, 6);
                 if (shuttle_ == 0) c->pause();
