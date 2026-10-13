@@ -49,12 +49,12 @@ void applyGradeGraph(const Sequence& s, const Clip& c, FrameTime lt, Image& img,
         const Effect* st = gradeNodeSettings(c, key);
         return st && hasMask(*st, lt);
     };
-    // A plain chain with nothing limiting its nodes: each node's effects in turn, in place.
+    // A plain chain with nothing limiting its nodes (or showing a node's key): each node's effects in turn, in place.
     if (serialGrade(g)) {
         bool plain = true;
         for (const GradeNode& n : g.nodes) {
             const Effect* st = gradeNodeSettings(c, n.key);
-            if (st && st->enabled && (hasMask(*st, lt) || st->p("mix", lt, 100) < 100)) plain = false;
+            if (st && st->enabled && (hasMask(*st, lt) || st->p("mix", lt, 100) < 100 || st->p("mask.show", lt) > 0.5)) plain = false;
         }
         if (plain) {
             for (int key : gradeOrder(g))

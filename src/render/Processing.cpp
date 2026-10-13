@@ -2833,9 +2833,9 @@ void applyAcesGamutCompress(const Effect& e, FrameTime t, const ColorSpace& spac
     });
 }
 
-bool gpuMask(const Effect& e, FrameTime t, gpu::ColorOp& op, int width, int height, double pixelScale) {
+bool gpuMask(const Effect& e, FrameTime t, gpu::ColorOp& op, int width, int height, double pixelScale, bool showing) {
     const int shape = int(std::lround(e.p("mask.shape", t)));
-    if (shape == 3 || shape == 4 || shape > 6 || e.p("mask.depth", t) > 0.5 || e.p("mask.show", t) > 0.5 ||
+    if (shape == 3 || shape == 4 || shape > 6 || e.p("mask.depth", t) > 0.5 || (!showing && e.p("mask.show", t) > 0.5) ||
         (shape > 0 && shape != 6 && e.p("mask.refine", t) > 0))
         return false;  // (what the picture holds, or the mask shown)
     // As effectMatte makes it: the shape (and its holes closed) here, the qualifier, inverting and fading there.

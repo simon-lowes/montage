@@ -5485,6 +5485,13 @@ colorspaces:
         const float stacked = at(s, 32, 18);
         QVERIFY(edit::convertToNodes(s, id).ok);
         QCOMPARE(at(s, 32, 18), stacked);
+        // Show Mask on a node with no window or mix of its own: its key (everywhere) as grey.
+        Effect shown = makeEffect(p, "grade_node");
+        shown.node = 1;
+        shown.params["mask.show"] = 1.0;
+        clip().effects.push_back(shown);
+        QVERIFY2(near(at(s, 32, 18), 1.0f), qPrintable(QString::number(at(s, 32, 18))));
+        clip().effects.pop_back();
 
         // Parallel: gain on the left, invert on the right; unkeyed, their average.
         QVERIFY(edit::flattenGrade(p, s, id).ok);
@@ -6831,6 +6838,17 @@ colorspaces:
         // through a parallel mixer, which the GPU leaves to the CPU.
         const Id topId = r2.created[0];
         QVERIFY(edit::convertToNodes(s, topId).ok);
+        // A plain chain with one node showing its key.
+        {
+            Effect shown = makeEffect(p, "grade_node");
+            shown.node = 1;
+            shown.params["mask.show"] = 1.0;
+            edit::clipById(s, topId)->effects.push_back(shown);
+            gpu::resetStats();
+            compare(20, o, "plain chain shows a key");
+            QCOMPARE(gpu::stats().cpuLayers, 0L);
+            edit::clipById(s, topId)->effects.pop_back();
+        }
         Effect window = makeEffect(p, "grade_node");
         window.node = 2;
         window.params["mask.shape"] = 1.0;
@@ -6848,16 +6866,45 @@ colorspaces:
         gpu::resetStats();
         compare(20, o, "serial nodes");
         QCOMPARE(gpu::stats().cpuLayers, 0L);
-        // The faded node showing its matte as grey is left to the CPU.
+        // The faded node showing its matte as grey.
         edit::clipById(s, topId)->effects.back().params["mask.show"] = 1.0;
         gpu::resetStats();
         compare(20, o, "node shows its matte");
-        QVERIFY(gpu::stats().cpuLayers >= 1);
+        QCOMPARE(gpu::stats().cpuLayers, 0L);
         edit::clipById(s, topId)->effects.back().params["mask.show"] = 0.0;
-        QVERIFY(edit::addGradeNode(p, s, topId, edit::NodeHow::Parallel, 3).ok);
+        // Mixers and keys: a node with a window beside node 3 through a parallel mixer; one in Screen beside node 2
+        // through a layer mixer, keyed by a key mixer of nodes 1 and 2 (node 1 has none: everywhere), inverted, at 80 %,
+        // added to its own qualifier; and an outside node (node 2's key inverted).
+        auto nodeEffect = [&](int node, const char* type, std::initializer_list<std::pair<const char*, double>> params) {
+            Effect e = makeEffect(p, type);
+            e.node = node;
+            for (const auto& [k, v] : params) e.params[k] = v;
+            edit::clipById(s, topId)->effects.push_back(e);
+        };
+        int par = 0, lay = 0, outside = 0;
+        QVERIFY(edit::addGradeNode(p, s, topId, edit::NodeHow::Parallel, 3, &par).ok);
+        nodeEffect(par, "black_white", {});
+        nodeEffect(par, "grade_node", {{"mask.shape", 2.0}, {"mask.x", 0.3}, {"mask.w", 0.5}, {"mask.h", 0.6}});
         gpu::resetStats();
         compare(20, o, "parallel nodes");
-        QVERIFY(gpu::stats().cpuLayers >= 1);
+        QCOMPARE(gpu::stats().cpuLayers, 0L);
+        QVERIFY(edit::addGradeNode(p, s, topId, edit::NodeHow::Layer, 2, &lay).ok);
+        for (GradeNode& n : edit::clipById(s, topId)->grade.nodes)
+            if (n.kind == "layer") n.blend = {"screen"};
+        nodeEffect(lay, "hue_sat", {{"hue", 90.0}});
+        gpu::resetStats();
+        compare(20, o, "layer nodes");
+        QCOMPARE(gpu::stats().cpuLayers, 0L);
+        QVERIFY(edit::addKeyMixer(s, topId, {1, 2}, lay).ok);
+        nodeEffect(lay, "grade_node", {{"mask.qualify", 1.0}, {"mask.sat_low", 30.0}, {"key_invert", 1.0}, {"key_gain", 80.0}, {"key_mode", 1.0}});
+        gpu::resetStats();
+        compare(20, o, "keys");
+        QCOMPARE(gpu::stats().cpuLayers, 0L);
+        QVERIFY(edit::addGradeNode(p, s, topId, edit::NodeHow::Outside, 2, &outside).ok);
+        nodeEffect(outside, "invert", {});
+        gpu::resetStats();
+        compare(20, o, "outside node");
+        QCOMPARE(gpu::stats().cpuLayers, 0L);
         // An HDR sequence seen on an SDR display.
         s.colorSpace = "rec2100pq";
         o.displaySpace = "rec709";

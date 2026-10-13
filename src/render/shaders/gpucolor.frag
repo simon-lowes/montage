@@ -5,6 +5,14 @@
 //   1  a LUT effect (.cube, 3D or 1D), clamped first when baked into another space, mixed by its strength
 //   2  Color Correct, 3  Curves, 4  Hue Curves, 5  ASC CDL, 6  Invert, 7  Black & White, 8  Hue/Saturation, 9  Levels
 //   10 a grade node's picture (table) mixed with what came into it (srcTex) through the node's mask and mix
+// and a grade graph's steps between its nodes, as render/GradeGraph does them (keys are in red, 1 where there is none):
+//   11 a node's key: its mask (on srcTex, the picture coming in) joined with the key it is given (table), by its mix
+//   12 a node's picture (table) mixed with what came in (srcTex) through its key (maskTex)
+//   13 a node's key shown: grey, under the picture's alpha
+//   14 keys added (table and maskTex, or a constant), clamped to 1 or not
+//   15 a parallel mixer's sums: what it has (table) and a branch (srcTex) by its key (maskTex)
+//   16 a parallel mixer's picture: the weighted sum (srcTex) by the weights (maskTex), else the plain one (table)
+//   17 a layer mixer's branch (table) blended onto what is under it (srcTex) where its key is (maskTex)
 // Through the effect's mask where it has one (p[13..15]): its shape drawn on the CPU (maskTex), an HSL qualifier on
 // the colour as it comes in, inverted and faded, and the picture mixed with what the effect made by it (all four
 // channels, premultiplied, as the CPU mixes them).
@@ -200,9 +208,95 @@ float maskAt(ivec2 xy, vec3 c, float a) {
     return (p[13].z > 0.5 ? 1.0 - m : m) * p[13].w;
 }
 
+// Blend modes as render/Processing's blendChannel (as gpucomposite.frag's).
+float blendChannel(int mode, float cb, float cs) {
+    if (mode == 1) return cb + cs;
+    if (mode == 2) return cb * cs;
+    if (mode == 3) return cb + cs - cb * cs;
+    if (mode == 4) return cb <= 0.5 ? 2.0 * cb * cs : 1.0 - 2.0 * (1.0 - cb) * (1.0 - cs);
+    if (mode == 5) return min(cb, cs);
+    if (mode == 6) return max(cb, cs);
+    if (mode == 7) return abs(cb - cs);
+    if (mode == 8) {
+        if (cs <= 0.5) return cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb);
+        const float dcb = cb <= 0.25 ? ((16.0 * cb - 12.0) * cb + 4.0) * cb : sqrt(max(cb, 0.0));
+        return cb + (2.0 * cs - 1.0) * (dcb - cb);
+    }
+    if (mode == 9) return cs <= 0.5 ? 2.0 * cb * cs : 1.0 - 2.0 * (1.0 - cb) * (1.0 - cs);
+    if (mode == 10) return cs >= 1.0 ? 1.0 : min(1.0, cb / (1.0 - cs));
+    if (mode == 11) return cs <= 0.0 ? 0.0 : 1.0 - min(1.0, (1.0 - cb) / cs);
+    if (mode == 12) return max(0.0, cb - cs);
+    return cs;
+}
+
+// A grade graph's step (modes 11 to 17).
+vec4 graphStep(ivec2 xy, int mode) {
+    if (mode == 11) {
+        // p[1]: y its own mask, z a key given, w inverted; p[2]: x gain, y how they join, z mix, w the key is a picture.
+        const vec4 px = texelFetch(srcTex, xy, 0);
+        const float a = px.a;
+        const vec3 c = a > 0.0 ? px.rgb * (1.0 / a) : vec3(0.0);
+        const float own = p[1].y > 0.5 ? maskAt(xy, c, a) : 1.0;
+        float m = own;
+        if (p[1].z > 0.5) {
+            float kin = p[2].w > 0.5 ? texelFetch(table, xy, 0).r : 1.0;
+            if (p[1].w > 0.5) kin = 1.0 - kin;
+            kin *= p[2].x;
+            const int join = int(p[2].y);
+            m = join == 1 ? min(1.0, own + kin) : join == 2 ? max(0.0, own - kin) : join == 3 ? kin : own * kin;
+        }
+        if (p[2].z < 1.0) m *= p[2].z;
+        return vec4(m);
+    }
+    if (mode == 12) {
+        const vec4 o = texelFetch(srcTex, xy, 0);
+        return o + (texelFetch(table, xy, 0) - o) * texelFetch(maskTex, xy, 0).r;
+    }
+    if (mode == 13) {
+        // p[1].x: a key (else 1)
+        const float a = texelFetch(srcTex, xy, 0).a;
+        const float m = p[1].x > 0.5 ? texelFetch(maskTex, xy, 0).r : 1.0;
+        return vec4(vec3(m * a), a);
+    }
+    if (mode == 14) {
+        // p[1]: x a sum so far (else 0), y a key to add (else w), z clamped to 1
+        const float acc = p[1].x > 0.5 ? texelFetch(table, xy, 0).r : 0.0;
+        const float k = p[1].y > 0.5 ? texelFetch(maskTex, xy, 0).r : p[1].w;
+        const float v = acc + k;
+        return vec4(p[1].z > 0.5 ? min(1.0, v) : v);
+    }
+    if (mode == 15) {
+        // p[1]: x a sum so far, y a key (else 1)
+        const vec4 acc = p[1].x > 0.5 ? texelFetch(table, xy, 0) : vec4(0.0);
+        const float w = p[1].y > 0.5 ? texelFetch(maskTex, xy, 0).r : 1.0;
+        return acc + texelFetch(srcTex, xy, 0) * w;
+    }
+    if (mode == 16) {
+        // p[1].x: how many branches
+        const float w = texelFetch(maskTex, xy, 0).r;
+        return w > 1e-6 ? texelFetch(srcTex, xy, 0) / w : texelFetch(table, xy, 0) / p[1].x;
+    }
+    // 17. p[1]: x blend mode, y a key (else 1)
+    const vec4 d = texelFetch(srcTex, xy, 0), b = texelFetch(table, xy, 0);
+    const float w = p[1].y > 0.5 ? texelFetch(maskTex, xy, 0).r : 1.0;
+    if (w <= 0.0) return d;
+    const float a = d.a, ab = b.a;
+    const float ia = a > 0.0 ? 1.0 / a : 0.0, ib = ab > 0.0 ? 1.0 / ab : 0.0;
+    vec3 o;
+    for (int ch = 0; ch < 3; ++ch) {
+        const float cb = d[ch] * ia, cs = b[ch] * ib;
+        o[ch] = (cb + (blendChannel(int(p[1].x), cb, cs) - cb) * w) * a;
+    }
+    return vec4(o, a);
+}
+
 void main() {
     const ivec2 xy = ivec2(gl_FragCoord.xy);
     const int mode = int(p[0].x);
+    if (mode >= 11) {
+        fragColor = graphStep(xy, mode);
+        return;
+    }
     if (mode == 0) {
         const vec4 lo = texelFetch(src16, ivec2(xy.x * 2, xy.y), 0), hi = texelFetch(src16, ivec2(xy.x * 2 + 1, xy.y), 0);
         const vec3 s = vec3(lo.r, lo.g, hi.r);
