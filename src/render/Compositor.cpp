@@ -1404,25 +1404,84 @@ namespace {
 // How a clip's layer is drawn on the GPU (render/GpuCompositor.h).
 enum class GpuLayerResult { Drawn, Nothing, Unsupported };
 
+// A grade graph's steps on the GPU: a chain of correctors, each node's effects in turn, through its mask and mix
+// (marked before and mixed after); false for mixers, keys passed between nodes and anything else only the CPU draws.
+bool gpuGradeOps(const Sequence& seq, const Clip& c, FrameTime lt, const std::function<bool(const Effect&)>& ranAlready,
+                 std::vector<gpu::ColorOp>& ops, int w, int h, double pixelScale) {
+    const GradeGraph& g = c.grade;
+    if (!validGrade(g)) return true;  // (the CPU leaves the picture as it is)
+    if (!serialGrade(g)) return false;
+    for (int key : gradeOrder(g)) {
+        const GradeNode* n = findGradeNode(g, key);
+        if (!n || !n->enabled) continue;
+        if (n->kind != "corrector" || gradeLinkInto(g, key, 1)) return false;
+        const Effect* settings = gradeNodeSettings(c, key);
+        const bool on = settings && settings->enabled;
+        gpu::ColorOp mix;  // the node's matte, as applyGradeGraph makes it: its mask, by its mix
+        mix.kind = gpu::ColorOp::Mix;
+        if (on && hasMask(*settings, lt) && !gpuMask(*settings, lt, mix, w, h, pixelScale)) return false;
+        if (const double m = on ? std::clamp(settings->p("mix", lt, 100) / 100, 0.0, 1.0) : 1.0; m < 1) {
+            if (!mix.masked) mix.masked = true, mix.maskParams[3] = 1;
+            mix.maskParams[3] *= float(m);
+        }
+        if (mix.masked) {
+            gpu::ColorOp mark;
+            mark.kind = gpu::ColorOp::Mark;
+            ops.push_back(std::move(mark));
+        }
+        for (const Effect* e : gradeNodeEffects(seq, c, key))
+            if (e->enabled && !ranAlready(*e) && !gpuColorOps(*e, lt, ops, w, h, pixelScale)) return false;
+        if (mix.masked) ops.push_back(std::move(mix));
+    }
+    return true;
+}
+
+// The clip's colour steps on the GPU in finishClipLayer's order (its grade graph where its nodes are in the stack);
+// false when one is only the CPU's. `ranAlready`: those run on the source.
+bool gpuChainOps(const Sequence& seq, const Clip& c, FrameTime lt, const std::function<bool(const Effect&)>& ranAlready,
+                 std::vector<gpu::ColorOp>& ops, int w, int h, double pixelScale) {
+    const bool graph = !c.grade.empty();
+    bool graphRan = false, ok = true;
+    auto in = [](const Effect* e, const std::vector<Effect>& v) { return !v.empty() && e >= v.data() && e < v.data() + v.size(); };
+    const ColorGroup* group = colorGroupOf(seq, c);
+    auto runGraph = [&] {
+        if (graph && !graphRan) ok = ok && gpuGradeOps(seq, c, lt, ranAlready, ops, w, h, pixelScale);
+        graphRan = true;
+    };
+    for (const Effect* e : gradeChain(seq, c)) {
+        const bool pre = group && in(e, group->pre), post = group && in(e, group->post), mine = in(e, c.effects);
+        if (graph) {
+            if (post) runGraph();
+            if (!pre && !post && !mine) continue;
+            if (mine && e->node != 0) {
+                runGraph();
+                continue;
+            }
+        }
+        if (!ranAlready(*e) && !gpuColorOps(*e, lt, ops, w, h, pixelScale)) return false;
+    }
+    runGraph();
+    return ok;
+}
+
+// Effects finishClipLayer leaves alone, having run on the source (Redact Faces is not: it runs there).
+bool runOnSource(const Effect& e) {
+    return e.type == "video_denoise" || e.type == "super_scale" || e.type == "motion_deblur" || e.type == "reframe_360" ||
+           e.type == "stereo_3d";
+}
+
 GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, gpu::Layer& out) {
-    if (!c.grade.empty() || (c.isGenerator() && c.generator.type == "adjustment")) return GpuLayerResult::Unsupported;
+    if (c.isGenerator() && c.generator.type == "adjustment") return GpuLayerResult::Unsupported;
     // Its colour steps, each one the GPU draws (the ones on the source, such as noise reduction, are not). Those the
     // GPU has no form for go to the CPU before anything is decoded, unless they may run on the camera's picture.
     const FrameTime lt = t - c.start;
-    const std::vector<const Effect*> chain = gradeChain(seq, c);
-    std::vector<gpu::ColorOp> unused;
-    for (const Effect* e : chain)
-        if (e->enabled && e->type != "cdl" && e->type != "aces_gamut_compress" && !gpuColorOps(*e, lt, unused))
+    {
+        std::vector<gpu::ColorOp> unused;
+        if (!gpuChainOps(seq, c, lt, [](const Effect& e) { return runOnSource(e) || e.type == "aces_gamut_compress"; }, unused, 0, 0, 1))
             return GpuLayerResult::Unsupported;
+    }
     ClipSource cs;
     if (!clipSource(p, seq, c, t, o, nullptr, true, cs)) return GpuLayerResult::Nothing;
-    // Without the looks made on the camera's picture already (an AMF's CDLs and LUTs, the gamut compression).
-    for (const Effect* e : chain) {
-        if (!e->enabled || e == cs.sourceCdl || e == cs.sourceRgc ||
-            std::find(cs.sourceLooks.begin(), cs.sourceLooks.end(), e) != cs.sourceLooks.end())
-            continue;
-        if (!gpuColorOps(*e, lt, out.ops)) return GpuLayerResult::Unsupported;
-    }
     int w = 0, h = 0;
     if (cs.frame) {
         out.frame = cs.frame;
@@ -1431,6 +1490,17 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     } else {
         out.image = std::move(cs.src);
         w = out.image.width, h = out.image.height;
+    }
+    // Without the looks made on the camera's picture already (an AMF's CDLs and LUTs, the gamut compression); masks
+    // drawn at the picture's size, as finishClipLayer's effects see it.
+    const double pixelScale = effectPixelScale(c, lt, cs.g.sx, cs.mw, w);
+    auto ranAlready = [&](const Effect& e) {
+        return runOnSource(e) || &e == cs.sourceCdl || &e == cs.sourceRgc ||
+               std::find(cs.sourceLooks.begin(), cs.sourceLooks.end(), &e) != cs.sourceLooks.end();
+    };
+    if (!gpuChainOps(seq, c, lt, ranAlready, out.ops, w, h, pixelScale)) {
+        out = {};
+        return GpuLayerResult::Unsupported;
     }
     // A picture wider or taller than the GPU takes is made on the CPU at the canvas's size instead.
     const int maxSize = gpu::maxTextureSize();

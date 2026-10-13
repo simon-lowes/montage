@@ -160,7 +160,7 @@ private:
     QRhi* rhi_ = nullptr;
     QRhiCommandBuffer* cb_ = nullptr;
     QRhiSampler* sampler_ = nullptr;
-    QRhiTexture *dummy2d_ = nullptr, *dummy3d_ = nullptr, *dummy16_ = nullptr;
+    QRhiTexture *dummy2d_ = nullptr, *dummy3d_ = nullptr, *dummy16_ = nullptr, *dummyR_ = nullptr;
     QRhiShaderResourceBindings* layout_ = nullptr;
     QRhiGraphicsPipeline *colorPs_ = nullptr, *compositePs_ = nullptr, *outputPs_ = nullptr, *output8Ps_ = nullptr;
     QRhiRenderPassDescriptor *rpFloat_ = nullptr, *rp8_ = nullptr;
@@ -305,6 +305,7 @@ bool Device::create() {
     }
     using T = QRhiTexture;
     if (!rhi_->isTextureFormatSupported(T::RGBA32F, T::RenderTarget) || !rhi_->isTextureFormatSupported(T::RG16) ||
+        !rhi_->isTextureFormatSupported(T::R32F) ||
         !rhi_->isFeatureSupported(QRhi::ThreeDimensionalTextures)) {
         problem_ = "the graphics device lacks float render targets, 16-bit textures or 3D textures";
         return false;
@@ -316,11 +317,12 @@ bool Device::create() {
     dummy2d_ = rhi_->newTexture(T::RGBA32F, QSize(1, 1));
     dummy3d_ = rhi_->newTexture(T::RGBA32F, 2, 2, 2, 1, T::ThreeDimensional);
     dummy16_ = rhi_->newTexture(T::RG16, QSize(2, 1));
-    if (!dummy2d_->create() || !dummy3d_->create() || !dummy16_->create()) {
+    dummyR_ = rhi_->newTexture(T::R32F, QSize(1, 1));
+    if (!dummy2d_->create() || !dummy3d_->create() || !dummy16_->create() || !dummyR_->create()) {
         problem_ = "the graphics device cannot make the compositor's textures";
         return false;
     }
-    // One layout for every pipeline: uniforms at 0, textures at 1 to 4 (gpucolor.frag uses all four).
+    // One layout for every pipeline: uniforms at 0, textures at 1 to 5 (gpucolor.frag uses them all).
     using B = QRhiShaderResourceBinding;
     layout_ = rhi_->newShaderResourceBindings();
     QRhiBuffer* ub = rhi_->newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, kUniformBytes);
@@ -328,7 +330,7 @@ bool Device::create() {
     ubufs_.push_back(ub);
     layout_->setBindings({B::uniformBuffer(0, B::FragmentStage, ub), B::sampledTexture(1, B::FragmentStage, dummy2d_, sampler_),
                           B::sampledTexture(2, B::FragmentStage, dummy16_, sampler_), B::sampledTexture(3, B::FragmentStage, dummy3d_, sampler_),
-                          B::sampledTexture(4, B::FragmentStage, dummy2d_, sampler_)});
+                          B::sampledTexture(4, B::FragmentStage, dummy2d_, sampler_), B::sampledTexture(5, B::FragmentStage, dummyR_, sampler_)});
     layout_->create();
     // Render pass descriptors for float and 8-bit targets, from small targets of each.
     rpFloatTex_ = rhi_->newTexture(T::RGBA32F, QSize(1, 1), 1, T::RenderTarget);
@@ -376,8 +378,8 @@ void Device::destroy() {
     colorPs_ = compositePs_ = outputPs_ = output8Ps_ = nullptr;
     rpFloat_ = rp8_ = nullptr;  // (the targets' own)
     delete layout_, layout_ = nullptr;
-    delete dummy2d_, delete dummy3d_, delete dummy16_, delete rpFloatTex_, delete rp8Tex_;
-    dummy2d_ = dummy3d_ = dummy16_ = rpFloatTex_ = rp8Tex_ = nullptr;
+    delete dummy2d_, delete dummy3d_, delete dummy16_, delete dummyR_, delete rpFloatTex_, delete rp8Tex_;
+    dummy2d_ = dummy3d_ = dummy16_ = dummyR_ = rpFloatTex_ = rp8Tex_ = nullptr;
     delete sampler_, sampler_ = nullptr;
     delete rhi_, rhi_ = nullptr;
 }
@@ -395,7 +397,7 @@ QRhiTexture* Device::texture(QRhiTexture::Format format, int w, int h, bool isTa
         failed_ = true;
         return nullptr;
     }
-    const size_t texel = format == QRhiTexture::RGBA32F ? 16 : 4;
+    const size_t texel = format == QRhiTexture::RGBA32F ? 16 : 4;  // (RGBA8, RG16 and R32F alike)
     pool_.push_back({t, isTarget, true, frameNo_, size_t(w) * size_t(h) * texel});
     return t;
 }
@@ -478,12 +480,12 @@ QRhiBuffer* Device::uniforms(QRhiResourceUpdateBatch* u, const float (&p)[64]) {
 void Device::pass(QRhiGraphicsPipeline* ps, QRhiTexture* into, QRhiResourceUpdateBatch* u,
                   const std::vector<std::pair<int, QRhiTexture*>>& textures, QRhiBuffer* ubuf, QRhiResourceUpdateBatch* after) {
     using B = QRhiShaderResourceBinding;
-    QRhiTexture* bound[5] = {nullptr, dummy2d_, dummy16_, dummy3d_, dummy2d_};
+    QRhiTexture* bound[6] = {nullptr, dummy2d_, dummy16_, dummy3d_, dummy2d_, dummyR_};
     for (const auto& [binding, tex] : textures) bound[binding] = tex;
     QRhiShaderResourceBindings* srb = rhi_->newShaderResourceBindings();
     srb->setBindings({B::uniformBuffer(0, B::FragmentStage, ubuf), B::sampledTexture(1, B::FragmentStage, bound[1], sampler_),
                       B::sampledTexture(2, B::FragmentStage, bound[2], sampler_), B::sampledTexture(3, B::FragmentStage, bound[3], sampler_),
-                      B::sampledTexture(4, B::FragmentStage, bound[4], sampler_)});
+                      B::sampledTexture(4, B::FragmentStage, bound[4], sampler_), B::sampledTexture(5, B::FragmentStage, bound[5], sampler_)});
     srb->create();
     frameSrbs_.push_back(srb);
     const Target* t = target(into);
@@ -535,13 +537,26 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
         QRhiTextureSubresourceUploadDescription d(l.image.px.data(), quint32(size_t(w) * h * 16));
         u->uploadTexture(cur, QRhiTextureUploadEntry(0, 0, d));
     }
+    std::vector<QRhiTexture*> marked;  // pictures kept for a Mix
+    auto keep = [&](QRhiTexture* t) { return std::find(marked.begin(), marked.end(), t) != marked.end(); };
     for (const ColorOp& op : l.ops) {
+        if (op.kind == ColorOp::Mark) {
+            marked.push_back(cur);
+            continue;
+        }
         const QSize size = cur->pixelSize();
         QRhiTexture* next = texture(T::RGBA32F, size.width(), size.height(), true);
         if (!next) return nullptr;
         std::fill(p, p + 64, 0.0f);
         std::vector<std::pair<int, QRhiTexture*>> textures = {{1, cur}};
-        if (op.kind == ColorOp::Lut) {
+        QRhiTexture* input = nullptr;  // (a Mix's: the picture marked)
+        if (op.kind == ColorOp::Mix) {
+            if (marked.empty()) return nullptr;
+            input = marked.back();
+            marked.pop_back();
+            p[0] = 10;
+            textures = {{1, input}, {4, cur}};
+        } else if (op.kind == ColorOp::Lut) {
             QRhiTexture* table = nullptr;
             QRhiTexture* lut = lutTexture(op.lut, u, &table);
             if (!lut || !op.lut) return nullptr;
@@ -550,8 +565,8 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
             p[12] = op.strength;
             textures.push_back({3, lut});
             textures.push_back({4, table});
-        } else {
-            p[0] = op.kind == ColorOp::ColorCorrect ? 2 : op.kind == ColorOp::Curves ? 3 : 4;
+        } else if (op.kind != ColorOp::Mix) {
+            p[0] = float(int(op.kind) + 1);  // (gpucolor.frag's modes: Color Correct 2 ... Levels 9)
             std::copy(op.params, op.params + 32, p + 4);  // from p[1]
             const int rows = op.tableWidth > 0 ? int(op.table.size() / (size_t(op.tableWidth) * 4)) : 0;
             if (rows > 0) {
@@ -562,12 +577,25 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
                 textures.push_back({4, table});
             }
         }
+        if (op.masked) {
+            p[48] = 1;  // p[12].x
+            std::copy(op.maskParams, op.maskParams + 12, p + 52);
+            if (!op.mask.empty()) {
+                if (op.mask.size() != size_t(size.width()) * size_t(size.height())) return nullptr;
+                QRhiTexture* m = texture(T::R32F, size.width(), size.height(), false);
+                if (!m) return nullptr;
+                QRhiTextureSubresourceUploadDescription d(op.mask.data(), quint32(op.mask.size() * sizeof(float)));
+                u->uploadTexture(m, QRhiTextureUploadEntry(0, 0, d));
+                textures.push_back({5, m});
+            }
+        }
         QRhiBuffer* ub = uniforms(u, p);
         pass(colorPs_, next, u, textures, ub);
         u = rhi_->nextResourceUpdateBatch();
-        release(cur);
+        if (!keep(cur)) release(cur);
+        if (input && !keep(input)) release(input);
         for (const auto& [binding, tex] : textures)
-            if (binding == 4 && op.kind != ColorOp::Lut) release(tex);
+            if ((binding == 4 && op.kind != ColorOp::Lut && op.kind != ColorOp::Mix) || binding == 5) release(tex);
         cur = next;
     }
     return cur;
