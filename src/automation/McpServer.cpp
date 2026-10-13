@@ -82,6 +82,7 @@
 #include "core/ProjectIO.h"
 #include "core/ScriptCut.h"
 #include "core/Ambisonics.h"
+#include "media/Sofa.h"
 #include "core/Surround.h"
 #include "core/TranscriptEdit.h"
 #include "media/DualSystem.h"
@@ -954,7 +955,7 @@ void McpServer::Impl::addTools() {
             "project":{"type":"string","description":"Path of the .montage file to write"},
             "media":{"type":"array","items":{"type":"string"},"description":"Media files, in order"},
             "width":{"type":"integer"},"height":{"type":"integer"},"fps":{"type":"number"},
-            "audio_layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4","ambix"],"default":"stereo"}},
+            "audio_layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4","ambix","ambix2","ambix3"],"default":"stereo"}},
             "required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l;
@@ -982,7 +983,7 @@ void McpServer::Impl::addTools() {
             if (a.contains("audio_layout")) {
                 const std::string layout = a.value("audio_layout").toString().toStdString();
                 if (std::find(audioLayouts().begin(), audioLayouts().end(), layout) == audioLayouts().end())
-                    throw ArgError{"\"audio_layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2, 7.1.4 or ambix"};
+                    throw ArgError{"\"audio_layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2, 7.1.4, ambix, ambix2 or ambix3"};
                 s.audioLayout = layout;
             }
             FrameTime at = 0;
@@ -4651,8 +4652,9 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_set_surround", "Set up a surround mix",
-        "Mix the active sequence in stereo, 5.1 (L R C LFE Ls Rs), 7.1 (L R C LFE Lb Rb Ls Rs) or an immersive layout with "
-        "overhead speakers (5.1.2, 5.1.4, 7.1.2 as the Dolby Atmos bed, 7.1.4), and place audio tracks among the speakers. A "
+        "Mix the active sequence in stereo, 5.1 (L R C LFE Ls Rs), 7.1 (L R C LFE Lb Rb Ls Rs), an immersive layout with "
+        "overhead speakers (5.1.2, 5.1.4, 7.1.2 as the Dolby Atmos bed, 7.1.4) or an ambisonic field (ambix, ambix2, ambix3: "
+        "first to third order), and place audio tracks among the speakers or in the field. A "
         "position is an angle (0 straight ahead, 90 right, -90 left, 180 behind) and a distance (1 at the speakers, 0 spread "
         "over all of them); height (0 at the ear to 1 overhead) lifts it in immersive layouts; width narrows a stereo track "
         "to a point (0, e.g. dialogue in the centre speaker); lfe_db sends it to the subwoofer (-100 off); object makes the "
@@ -4662,7 +4664,7 @@ void McpServer::Impl::addTools() {
         "master; an empty path stops it moving. A track routed to a bus is placed by its bus. Export with montage_render "
         "(downmix_stereo for a stereo copy).",
         R"json({"type":"object","properties":{"project":{"type":"string"},
-            "layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4","ambix"]},
+            "layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4","ambix","ambix2","ambix3"]},
             "tracks":{"type":"array","items":{"type":"object","properties":{
                 "track":{"type":"string","description":"Audio track, e.g. A1"},"angle":{"type":"number","default":0},
                 "distance":{"type":"number","default":1},"height":{"type":"number","default":0},"width":{"type":"number","default":1},
@@ -4676,7 +4678,7 @@ void McpServer::Impl::addTools() {
             if (a.contains("layout")) {
                 const std::string layout = a.value("layout").toString().toStdString();
                 if (std::find(audioLayouts().begin(), audioLayouts().end(), layout) == audioLayouts().end())
-                    throw ArgError{"\"layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2, 7.1.4 or ambix"};
+                    throw ArgError{"\"layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2, 7.1.4, ambix, ambix2 or ambix3"};
                 s.audioLayout = layout;
             }
             QJsonArray out;
@@ -7975,17 +7977,21 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_ambisonics", "Ambisonic audio",
-        "Ambisonic (spatial) sound, as Premiere's VR audio and YouTube's spatial audio take it: first-order AmbiX (W, Y, Z, "
-        "X; ACN, SN3D) from 360° cameras and ambisonic microphones, found from a file's spatial audio metadata or marked "
-        "here with `media` and `ambisonic`. With `clip` (an audio clip of ambisonic media): turn its field with `yaw` "
-        "(degrees right), `pitch` (up) and `roll` (clockwise), keyed at `at` when given; `follow_view` (default true) "
-        "turns it with the linked picture's Reframe 360° view so the sound follows the picture; `decode` binaural "
-        "(headphones, the default) or stereo (speakers) in a stereo or surround mix. A sequence whose audio layout is "
-        "\"ambix\" (montage_set_surround layout) mixes to a four-channel field (tracks placed in it by their surround panner, "
-        "ambisonic clips added as they are) and exports as AAC or PCM in MP4 or MOV with the SA3D box YouTube reads.",
+        "Ambisonic (spatial) sound, as Premiere's VR audio, Fairlight and YouTube's spatial audio take it: AmbiX (ACN, SN3D) "
+        "from first order (W, Y, Z, X: 360° cameras, ambisonic microphones) to third (16 channels), found from a file's "
+        "spatial audio metadata or marked here with `media` and `ambisonic` (to `order`, default the highest its channels "
+        "hold). With `clip` (an audio clip of ambisonic media): turn its field with `yaw` (degrees right), `pitch` (up) and "
+        "`roll` (clockwise), keyed at `at` when given; `follow_view` (default true) turns it with the linked picture's "
+        "Reframe 360° view so the sound follows the picture; `decode` binaural (headphones, the default) or stereo "
+        "(speakers) in a stereo mix (a surround mix decodes it to its speakers, AllRAD). A sequence whose audio layout is "
+        "\"ambix\", \"ambix2\" or \"ambix3\" (montage_set_surround layout) mixes to a field of that order (tracks placed in "
+        "it by their surround panner, ambisonic clips added as they are) and exports as PCM (or AAC) in MP4 or MOV with "
+        "the SA3D box YouTube reads (first order). `hrtf` picks what binaural listening hears through: \"head\" (a "
+        "spherical-head model), \"ku100\" (SADIE II's measured KU100 dummy head, once downloaded) or a SOFA file's path.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"media":{"type":"number"},"ambisonic":{"type":"boolean"},
+            "order":{"type":"integer","minimum":1,"maximum":3},
             "clip":{"type":"number"},"yaw":{"type":"number"},"pitch":{"type":"number"},"roll":{"type":"number"},"at":{"type":"integer"},
-            "follow_view":{"type":"boolean"},"decode":{"type":"string","enum":["binaural","stereo"]}},"required":["project"]})json",
+            "follow_view":{"type":"boolean"},"decode":{"type":"string","enum":["binaural","stereo"]},"hrtf":{"type":"string"}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             QStringList done;
@@ -7994,10 +8000,15 @@ void McpServer::Impl::addTools() {
                 if (!m || !m->hasAudio || m->kind == MediaKind::Sequence) throw ArgError{"No such sound media"};
                 const bool on = a.value("ambisonic").toBool(true);
                 if (on && m->channels < kFoaChannels) throw ArgError{"Ambisonic sound has at least four channels"};
-                m->ambisonic = on ? 1 : 0;
+                const int most = ambisonicOrderForChannels(m->channels);
+                const int order = a.contains("order") ? a.value("order").toInt() : most;
+                if (on && (order < 1 || order > most))
+                    throw ArgError{QStringLiteral("Its %1 channels hold orders 1 to %2").arg(m->channels).arg(most)};
+                m->ambisonic = on ? order : 0;
                 for (MediaItem& sub : l.project.media)
                     if (sub.subclipOf == m->id) sub.ambisonic = m->ambisonic;
-                done << QStringLiteral("%1 is %2").arg(QString::fromStdString(m->name), on ? "an ambisonic field" : "channels for speakers");
+                done << QStringLiteral("%1 is %2").arg(QString::fromStdString(m->name),
+                                                       on ? QStringLiteral("an ambisonic field (order %1)").arg(order) : QStringLiteral("channels for speakers"));
             }
             QJsonObject field;
             if (a.contains("clip")) {
@@ -8033,9 +8044,27 @@ void McpServer::Impl::addTools() {
                 done << QStringLiteral("Clip %1: turned %2° right, %3° up, %4° roll%5").arg(clip->id).arg(it->p("yaw", t)).arg(it->p("pitch", t))
                             .arg(it->p("roll", t)).arg(it->p("follow_view", t, 1) > 0.5 ? QStringLiteral(", following the 360° view") : QString());
             }
-            if (done.isEmpty()) throw ArgError{"Give media or clip"};
+            if (a.contains("hrtf")) {
+                const QString h = str(a, "hrtf");
+                std::string choice = h == "head" ? std::string() : h.toStdString();
+                if (!choice.empty()) {
+                    if (!sofaSupported()) throw ArgError{"This build of Montage cannot read SOFA files (it was built without libmysofa)"};
+                    if (choice == "ku100" && !sadieKu100Pack().installed())
+                        throw ArgError{"SADIE II's KU100 responses are not downloaded: run `scripts/fetch-models.sh --hrtf` or choose them once in the app"};
+                    std::string why;
+                    if (choice != "ku100" && !readSofa(choice, 48000, &why)) throw ArgError{QString::fromStdString(why)};
+                }
+                setBinauralHrtf(choice);
+                done << QStringLiteral("Binaural listening through %1").arg(choice.empty() ? QStringLiteral("the spherical head model") : h);
+            }
+            if (done.isEmpty()) throw ArgError{"Give media, clip or hrtf"};
             save(l);
-            return ok(done.join('\n'), QJsonObject{{"field", field}, {"sequence_ambisonic", ambisonicLayout(l.seq().audioLayout)}});
+            const std::string hrtf = binauralHrtf();
+            return ok(done.join('\n'), QJsonObject{{"field", field},
+                                                   {"sequence_ambisonic", ambisonicLayout(l.seq().audioLayout)},
+                                                   {"sequence_order", ambisonicOrder(l.seq().audioLayout)},
+                                                   {"hrtf", hrtf.empty() ? QStringLiteral("head") : QString::fromStdString(hrtf)},
+                                                   {"sofa_supported", sofaSupported()}});
         });
 
     add("montage_pan_follow", "Pan to follow the picture",

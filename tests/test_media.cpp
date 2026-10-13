@@ -73,6 +73,8 @@
 #include "media/Beats.h"
 #include "render/Spherical.h"
 #include "media/SpatialAudio.h"
+#include "core/Ambisonics.h"
+#include "media/Sofa.h"
 #include "render/ExtendClip.h"
 #include "render/ColorChart.h"
 #include "media/LensDatabase.h"
@@ -5303,6 +5305,21 @@ private slots:
         QCOMPARE(turned->effects.back().params.at("yaw").keys.size(), size_t(2));
         QCOMPARE(turned->effects.back().p("follow_view", 0, 1), 0.0);
         QCOMPARE(turned->effects.back().p("decode", 0), 1.0);
+        // An order its channels do not hold is refused; a third-order mix; the head binaural listening hears through.
+        QVERIFY(call("montage_ambisonics", {{"project", project}, {"media", double(wm.id)}, {"order", 2}}).value("isError").toBool());
+        res = call("montage_set_surround", {{"project", project}, {"layout", "ambix3"}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        res = call("montage_ambisonics", {{"project", project}, {"hrtf", "head"}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        QCOMPARE(res.value("structuredContent").toObject().value("sequence_order").toInt(), 3);
+        QCOMPARE(res.value("structuredContent").toObject().value("hrtf").toString(), QStringLiteral("head"));
+        const QString sofa = QStringLiteral(MONTAGE_TEST_DATA_DIR "/sofa/small.sofa");
+        res = call("montage_ambisonics", {{"project", project}, {"hrtf", sofa}});
+        QCOMPARE(res.value("isError").toBool(), !sofaSupported());
+        if (sofaSupported()) QCOMPARE(binauralHrtf(), sofa.toStdString());
+        QVERIFY(call("montage_ambisonics", {{"project", project}, {"hrtf", QString::fromStdString(fieldWav)}}).value("isError").toBool());
+        call("montage_ambisonics", {{"project", project}, {"hrtf", "head"}});
+        QVERIFY(binauralHrtf().empty());
     }
 
     void vfxPullsWithHandles() {
@@ -15549,6 +15566,231 @@ if ui["pressed"] == "add":
         // Nothing beneath: an error.
         QVERIFY(!trackClipFollow(p, s, footage, 0, true, MotionModel::Translation, 0.3, keys, {}, nullptr, &err));
         QVERIFY(!err.empty());
+    }
+
+    void higherOrderAmbisonics() {
+        const int rate = 48000;
+        // A third-order field (16 channels, ACN, SN3D) of a 3 kHz tone from the left, as a plain WAV.
+        auto writeField = [&](const std::string& file, int order, double angle, double elevation) {
+            const int nch = ambisonicChannels(order);
+            float g[16];
+            ambisonicEncode(order, angle, elevation, g);
+            QByteArray data;
+            for (int i = 0; i < rate; ++i) {
+                const float v = 0.3f * float(std::sin(2 * M_PI * 3000 * i / double(rate)));
+                for (int k = 0; k < nch; ++k) {
+                    const int16_t q = int16_t(std::lround(std::clamp(v * g[k], -1.0f, 1.0f) * 32767));
+                    data.append(reinterpret_cast<const char*>(&q), 2);
+                }
+            }
+            auto u32 = [](uint32_t v) { return std::string(reinterpret_cast<const char*>(&v), 4); };
+            auto u16 = [](uint16_t v) { return std::string(reinterpret_cast<const char*>(&v), 2); };
+            const std::string fmt = u16(1) + u16(uint16_t(nch)) + u32(uint32_t(rate)) + u32(uint32_t(rate * nch * 2)) + u16(uint16_t(nch * 2)) + u16(16);
+            const std::string chunks = "fmt " + u32(16) + fmt + "data" + u32(uint32_t(data.size())) + data.toStdString();
+            QFile f(QString::fromStdString(file));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QByteArray::fromStdString("RIFF" + u32(uint32_t(4 + chunks.size())) + "WAVE" + chunks));
+        };
+        auto rms = [](const std::vector<float>& b, int nch, int ch, int from, int to) {
+            double e = 0;
+            for (int i = from; i < to; ++i) e += double(b[size_t(i) * size_t(nch) + size_t(ch)]) * b[size_t(i) * size_t(nch) + size_t(ch)];
+            return std::sqrt(e / std::max(1, to - from));
+        };
+        const std::string third = path("hoa3-left.wav"), first = path("foa-left.wav");
+        writeField(third, 3, -90, 0);
+        writeField(first, 1, -90, 0);
+        // Decoded to its order: all 16 channels, as encoded.
+        std::string err;
+        AudioBufferPtr b = decodeAmbisonic(third, rate, &err);
+        QVERIFY2(b && b->channels == 16, err.c_str());
+        float want[16];
+        ambisonicEncode(3, -90, 0, want);
+        const double w0 = rms(b->samples, 16, 0, 4800, 24000);
+        for (int k = 0; k < 16; ++k)
+            QVERIFY2(std::fabs(rms(b->samples, 16, k, 4800, 24000) - std::fabs(want[k]) * w0) < 0.01, qPrintable(QString::number(k)));
+        // A sequence with the field on its first track, and its mix in a layout.
+        auto fieldSequence = [&](Project& p, const std::string& file, int order, const std::string& layout) -> Sequence& {
+            p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.fps = Rational{25, 1};
+            s.audioLayout = layout;
+            MediaItem m = probeOrFail(p, file);
+            m.ambisonic = order;
+            p.media.push_back(m);
+            Clip c = makeClip(p, m, TrackKind::Audio, s);
+            c.duration = 25;
+            edit::overwrite(p, s, {TrackKind::Audio, 0}, c);
+            return s;
+        };
+        auto mixLayout = [&](const Project& p, const Sequence& s) {
+            std::vector<float> out(size_t(rate) * size_t(layoutChannels(s.audioLayout)));
+            AudioMixer mixer;
+            mixer.mixLayout(p, s, 0, rate, out.data());
+            return out;
+        };
+        Project p;
+        {
+            // Kept whole in a third-order mix; cut to its first order in a first-order one.
+            Sequence& s = fieldSequence(p, third, 3, "ambix3");
+            QCOMPARE(p.media.back().channels, 16);
+            auto out = mixLayout(p, s);
+            const double w = rms(out, 16, 0, 4800, 24000);
+            QVERIFY2(w > 0.15, qPrintable(QString::number(w)));
+            for (int k = 0; k < 16; ++k) QVERIFY2(std::fabs(rms(out, 16, k, 4800, 24000) - std::fabs(want[k]) * w) < 0.01 * w + 1e-4, qPrintable(QString::number(k)));
+            s.audioLayout = "ambix";
+            out = mixLayout(p, s);
+            QVERIFY(std::fabs(rms(out, 4, 1, 4800, 24000) - w) < 0.01 * w);
+            // Media marked first order plays its first four channels, whatever else the file holds.
+            s.audioLayout = "ambix3";
+            p.media.back().ambisonic = 1;
+            out = mixLayout(p, s);
+            QVERIFY(std::fabs(rms(out, 16, 1, 4800, 24000) - w) < 0.01 * w);
+            for (int k = 4; k < 16; ++k) QVERIFY(rms(out, 16, k, 4800, 24000) < 1e-5);
+        }
+        {
+            // A first-order file in a third-order mix: its channels as they are, the higher orders silent.
+            Sequence& s = fieldSequence(p, first, 1, "ambix3");
+            QCOMPARE(p.media.back().channels, 4);
+            const auto out = mixLayout(p, s);
+            QVERIFY(rms(out, 16, 1, 4800, 24000) > 0.15);
+            for (int k = 4; k < 16; ++k) QVERIFY(rms(out, 16, k, 4800, 24000) < 1e-5);
+        }
+        {
+            // On 7.1.4's speakers (AllRAD): from the left, the left side speaker loudest, little on the right, nothing in
+            // the LFE; turned 90° left by its Ambisonics effect, the centre.
+            Sequence& s = fieldSequence(p, third, 3, "7.1.4");
+            const auto& sp = layoutSpeakers("7.1.4");
+            const int n = int(sp.size());
+            auto loudest = [&](const std::vector<float>& out) {
+                int best = 0;
+                for (int c = 1; c < n; ++c)
+                    if (rms(out, n, c, 4800, 24000) > rms(out, n, best, 4800, 24000)) best = c;
+                return std::string(sp[size_t(best)].name);
+            };
+            auto out = mixLayout(p, s);
+            QCOMPARE(loudest(out), std::string("Ls"));
+            QVERIFY(rms(out, n, 7, 4800, 24000) < 0.1 * rms(out, n, 6, 4800, 24000));  // Rs against Ls
+            QVERIFY(rms(out, n, 3, 4800, 24000) < 1e-6);
+            Effect amb = makeEffect(p, "ambisonics");
+            amb.params["yaw"] = -90.0;
+            s.audioTracks[0].clips[0].effects.push_back(amb);
+            out = mixLayout(p, s);
+            QCOMPARE(loudest(out), std::string("C"));
+            // The clip's gain moves it; the track's fader too.
+            s.audioTracks[0].clips[0].audio.params["gain_db"] = Param(-6.0);
+            s.audioTracks[0].volumeDb = -6;
+            const auto quieter = mixLayout(p, s);
+            QVERIFY2(std::fabs(rms(quieter, n, 2, 4800, 24000) / rms(out, n, 2, 4800, 24000) - 0.25) < 0.02,
+                     qPrintable(QString::number(rms(quieter, n, 2, 4800, 24000) / rms(out, n, 2, 4800, 24000))));
+            // Folded to stereo for listening: from the left again, on the left.
+            s.audioTracks[0].clips[0].effects.clear();
+            std::vector<float> st(size_t(rate) * 2);
+            AudioMixer mixer;
+            mixer.mix(p, s, 0, rate, st.data());
+            QVERIFY(rms(st, 2, 0, 4800, 24000) > 1.5 * rms(st, 2, 1, 4800, 24000));
+        }
+        {
+            // In a stereo mix, binaurally at its own order: the left ear louder.
+            Sequence& s = fieldSequence(p, third, 3, "stereo");
+            std::vector<float> st(size_t(rate) * 2);
+            AudioMixer mixer;
+            mixer.mix(p, s, 0, rate, st.data());
+            QVERIFY(rms(st, 2, 0, 4800, 24000) > 1.5 * rms(st, 2, 1, 4800, 24000));
+        }
+        {
+            // Exported as a third-order field: PCM in MOV, with an SA3D box of order 3 Montage reads back; AAC (which has
+            // no layout for 16 channels) takes its first order, as YouTube does.
+            Sequence& s = fieldSequence(p, third, 3, "ambix3");
+            QCOMPARE(exportAudioLayout("ambix3", "pcm_s24le"), std::string("ambix3"));
+            QCOMPARE(exportAudioLayout("ambix3", "aac"), std::string("ambix"));
+            QCOMPARE(exportAudioLayout("ambix2", "libopus"), std::string("stereo"));
+            for (const auto& [codec, file] : {std::pair<std::string, std::string>{"pcm_s24le", path("hoa3.mov")}, {"aac", path("hoa3.mp4")}}) {
+                const int order = codec == "aac" ? 1 : 3, nch = ambisonicChannels(order);
+                ExportSettings st;
+                st.path = file;
+                st.videoCodec = "none";
+                st.audioCodec = codec;
+                st.in = 0;
+                st.out = 25;
+                QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), (codec + ": " + err).c_str());
+                QCOMPARE(readSpatialAudioBox(file), order);
+                MediaItem back;
+                QVERIFY(probeMedia(file, back));
+                QCOMPARE(back.channels, nch);
+                QCOMPARE(back.ambisonic, order);
+                AudioBufferPtr fb = decodeAmbisonic(file, rate, &err);
+                QVERIFY2(fb && fb->channels == nch, err.c_str());
+                const double w = rms(fb->samples, nch, 0, 4800, 24000);
+                for (int k : {1, 4, 9, 15})
+                    if (k < nch)
+                        QVERIFY2(std::fabs(rms(fb->samples, nch, k, 4800, 24000) - std::fabs(want[k]) * w) < 0.05 * w + 1e-3,
+                                 qPrintable(QString("%1 %2").arg(QString::fromStdString(codec)).arg(k)));
+            }
+        }
+        // Measured heads from SOFA files (a made-up one here; SADIE II's KU100 when it is downloaded).
+        const std::string sofa = std::string(MONTAGE_TEST_DATA_DIR) + "/sofa/small.sofa";
+        if (!sofaSupported()) {
+            QVERIFY(!readSofa(sofa, rate, &err) && err.find("libmysofa") != std::string::npos);
+            QSKIP("Built without libmysofa");
+        }
+        for (const std::string& file : {sofa, std::string(MONTAGE_TEST_DATA_DIR) + "/sofa/small.zip"}) {
+            auto h = readSofa(file, rate, &err);
+            QVERIFY2(h, err.c_str());
+            QCOMPARE(h->sampleRate, double(rate));
+            QCOMPARE(h->directions.size(), binauralDirections().size());
+            QCOMPARE(h->name, std::string("Montage test head"));
+            QVERIFY(h->length >= 32 && h->length <= 40);  // 32 taps at 44.1 kHz, resampled
+            // binauralDirections()'s first is straight ahead (the ears alike); its third the left.
+            auto peak = [&](const std::vector<float>& ir, size_t k) {
+                size_t at = 0;
+                for (size_t i = 1; i < size_t(h->length); ++i)
+                    if (std::fabs(ir[k * size_t(h->length) + i]) > std::fabs(ir[k * size_t(h->length) + at])) at = i;
+                return std::pair{int(at), std::fabs(ir[k * size_t(h->length) + at])};
+            };
+            QVERIFY(std::fabs(binauralDirections()[2][0] + 90) < 1e-6);
+            const auto l = peak(h->left, 2), r = peak(h->right, 2);
+            QVERIFY2(l.first < r.first && l.second > 2 * r.second, qPrintable(QString("%1 %2 %3 %4").arg(l.first).arg(r.first).arg(l.second).arg(r.second)));
+        }
+        QVERIFY(!readSofa(third, rate, &err) && !err.empty());
+        QVERIFY(!readSofa(path("no-such.sofa"), rate, &err));
+        // Chosen for binaural listening: the mix hears through it (made again for the new head), and the head model
+        // again when chosen back.
+        {
+            Sequence& s = fieldSequence(p, third, 3, "stereo");
+            AudioMixer mixer;
+            std::vector<float> model(size_t(rate) * 2), measured(size_t(rate) * 2);
+            mixer.mix(p, s, 0, rate, model.data());
+            const uint64_t before = binauralHrtfGeneration();
+            setBinauralHrtf(sofa);
+            QCOMPARE(binauralHrtf(), sofa);
+            QVERIFY(binauralHrtfGeneration() != before);
+            QVERIFY(binauralHrirs(rate));
+            mixer.mix(p, s, rate, rate, measured.data());  // (a later block: the mixer keeps going)
+            AudioMixer fresh;
+            fresh.mix(p, s, 0, rate, measured.data());
+            QVERIFY(rms(measured, 2, 0, 4800, 24000) > 1.5 * rms(measured, 2, 1, 4800, 24000));
+            double diff = 0;
+            for (size_t i = 0; i < model.size(); ++i) diff = std::max(diff, double(std::fabs(model[i] - measured[i])));
+            QVERIFY(diff > 0.01);
+            // Not readable: the head model is heard, and why is said.
+            setBinauralHrtf(third);
+            QVERIFY(!binauralHrirs(rate, true, &err) && !err.empty());
+            setBinauralHrtf("");
+            QVERIFY(!binauralHrirs(rate));
+            AudioMixer again;
+            again.mix(p, s, 0, rate, measured.data());
+            for (size_t i = 0; i < model.size(); ++i) QVERIFY(std::fabs(model[i] - measured[i]) < 1e-5);
+        }
+        // SADIE II's KU100: 256 taps at 48 kHz; from the left, the left ear louder.
+        if (sadieKu100Pack().installed()) {
+            auto h = readSofa(sadieKu100Pack().path(sadieKu100Pack().files.front()), rate, &err);
+            QVERIFY2(h && h->length == 256, err.c_str());
+            double eL = 0, eR = 0;
+            for (int i = 0; i < 256; ++i) eL += h->left[2 * 256 + size_t(i)] * h->left[2 * 256 + size_t(i)], eR += h->right[2 * 256 + size_t(i)] * h->right[2 * 256 + size_t(i)];
+            QVERIFY2(eL > 4 * eR, qPrintable(QString("%1 %2").arg(eL).arg(eR)));
+        } else {
+            qInfo("SADIE II's KU100 is not downloaded (scripts/fetch-models.sh --hrtf, MONTAGE_HRTF_DIR): its check skipped");
+        }
     }
 
     void ambisonicReviewFixes() {

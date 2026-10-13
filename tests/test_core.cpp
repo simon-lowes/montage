@@ -6006,7 +6006,7 @@ private slots:
         foaDecodeStereo(g.data(), l, r);
         QVERIFY(near(l, r) && l > 0.5f);
         // Binaurally, a click from the left reaches the left ear first and louder.
-        FoaBinaural bin(48000);
+        AmbisonicBinaural bin(1, 48000);
         std::vector<float> in(size_t(512) * 4, 0.0f), out(size_t(512) * 2);
         g = foaEncode(-90, 0);
         for (int k = 0; k < 4; ++k) in[size_t(10) * 4 + size_t(k)] = g[size_t(k)];
@@ -6065,6 +6065,178 @@ private slots:
         // The Ambisonics effect: no turn, follows the view, heard binaurally.
         const Effect e = makeEffect(p, "ambisonics");
         QVERIFY(e.p("yaw", 0, 9) == 0 && e.p("follow_view", 0, 0) == 1 && e.p("decode", 0, 9) == 0);
+    }
+
+    void higherOrderAmbisonics() {
+        auto near = [](double a, double b, double tol = 1e-4) { return std::fabs(a - b) < tol; };
+        QCOMPARE(ambisonicChannels(3), 16);
+        QCOMPARE(ambisonicOrderForChannels(3), 0);
+        QCOMPARE(ambisonicOrderForChannels(8), 1);
+        QCOMPARE(ambisonicOrderForChannels(9), 2);
+        QCOMPARE(ambisonicOrderForChannels(25), 3);
+        // The harmonics are SN3D: over the sphere each one's mean square is 1/(2l + 1), and they are orthogonal (Lebedev's
+        // 50 directions integrate them exactly).
+        const auto& dirs = binauralDirections();
+        QCOMPARE(int(dirs.size()), 50);
+        double gram[16][16] = {};
+        for (size_t k = 0; k < dirs.size(); ++k) {
+            const double w = k < 6 ? 0.0126984126984127 : k < 18 ? 0.02257495590828924 : k < 26 ? 0.02109375 : 0.02017333553791887;
+            float h[16];
+            ambisonicEncode(3, dirs[k][0], dirs[k][1], h);
+            for (int a = 0; a < 16; ++a)
+                for (int b = 0; b < 16; ++b) gram[a][b] += w * h[a] * h[b];
+        }
+        for (int a = 0; a < 16; ++a)
+            for (int b = 0; b < 16; ++b) {
+                const int l = int(std::sqrt(a + 0.5));
+                QVERIFY2(near(gram[a][b], a == b ? 1.0 / (2 * l + 1) : 0.0, 1e-5), qPrintable(QString("%1 %2 %3").arg(a).arg(b).arg(gram[a][b])));
+            }
+        // First order is foaEncode; focus 0 leaves only W.
+        float h[16];
+        ambisonicEncode(3, 40, 20, h);
+        const auto f = foaEncode(40, 20);
+        for (int k = 0; k < 4; ++k) QVERIFY(near(h[k], f[size_t(k)]));
+        ambisonicEncode(3, 40, 20, h, 0);
+        QVERIFY(near(h[0], 1) && near(h[5], 0) && near(h[12], 0));
+        // Turning a field is the same as encoding the turned direction, to every order.
+        for (int order = 1; order <= 3; ++order)
+            for (const auto& [yaw, pitch, roll] : std::vector<std::array<double, 3>>{{90, 0, 0}, {30, 45, 0}, {-120, -30, 60}, {170, 80, -45}}) {
+                const FoaRotation turn = foaRotation(yaw, pitch, roll);
+                const AmbisonicRotation r = ambisonicRotation(order, turn);
+                for (const auto& [angle, el] : std::vector<std::array<double, 2>>{{0, 0}, {-90, 10}, {135, -40}, {20, 70}}) {
+                    float field[16], first[4];
+                    ambisonicEncode(order, angle, el, field);
+                    std::copy_n(field, 4, first);
+                    ambisonicRotate(r, field);
+                    foaRotate(turn, first);
+                    const double az = -std::atan2(first[1], first[3]) * 180 / M_PI, up = std::asin(std::clamp<double>(first[2], -1, 1)) * 180 / M_PI;
+                    float want[16];
+                    ambisonicEncode(order, az, up, want);
+                    for (int k = 0; k < ambisonicChannels(order); ++k) QVERIFY2(near(field[k], want[k], 1e-4), qPrintable(QString("o%1 ch%2").arg(order).arg(k)));
+                }
+            }
+        // The layouts: 9 and 16 channels, metered by W, panned by direction to their order, folded from first order.
+        QCOMPARE(ambisonicOrder("ambix3"), 3);
+        QCOMPARE(ambisonicOrder("ambix"), 1);
+        QCOMPARE(ambisonicOrder("7.1.4"), 0);
+        QCOMPARE(ambisonicLayoutFor(2), std::string("ambix2"));
+        QCOMPARE(layoutChannels("ambix2"), 9);
+        QCOMPARE(layoutChannels("ambix3"), 16);
+        QVERIFY(ambisonicLayout("ambix3") && !immersiveLayout("ambix3"));
+        QVERIFY(layoutSpeakers("ambix3")[0].loudnessWeight == 1 && layoutSpeakers("ambix3")[15].loudnessWeight == 0);
+        const auto pg = panGains("ambix3", -90, 1, 0);
+        ambisonicEncode(3, -90, 0, h);
+        QCOMPARE(int(pg.size()), 16);
+        for (int k = 0; k < 16; ++k) QVERIFY(near(pg[size_t(k)], h[k]));
+        std::vector<float> field(16 * 2, 0.0f), st(4);
+        ambisonicEncode(3, -90, 0, field.data());
+        ambisonicEncode(3, 90, 0, field.data() + 16);
+        downmixToStereo("ambix3", field.data(), 2, st.data());
+        QVERIFY(st[0] > 4 * st[1] && st[3] > 4 * st[2]);
+        // AllRAD onto 7.1.4: a sound at a speaker is loudest there, nothing goes to the LFE, a sound keeps about its
+        // power all round, and one from below fades.
+        const auto& sp = layoutSpeakers("7.1.4");
+        for (int order = 1; order <= 3; ++order) {
+            const std::vector<float>& dec = layoutDecoder("7.1.4", order);
+            const int nch = ambisonicChannels(order);
+            QCOMPARE(int(dec.size()), int(sp.size()) * nch);
+            auto heard = [&](double angle, double el) {
+                float x[16];
+                ambisonicEncode(order, angle, el, x);
+                std::vector<double> out(sp.size(), 0.0);
+                for (size_t s = 0; s < sp.size(); ++s)
+                    for (int k = 0; k < nch; ++k) out[s] += dec[s * size_t(nch) + size_t(k)] * x[k];
+                return out;
+            };
+            for (size_t s = 0; s < sp.size(); ++s) {
+                if (sp[s].lfe) continue;
+                const auto out = heard(sp[s].angle, sp[s].elevation);
+                const size_t loudest = size_t(std::max_element(out.begin(), out.end()) - out.begin());
+                QVERIFY2(loudest == s, qPrintable(QString("order %1 speaker %2 loudest %3").arg(order).arg(sp[s].name).arg(sp[loudest].name)));
+            }
+            for (size_t s = 0; s < sp.size(); ++s)
+                if (sp[s].lfe)
+                    for (int k = 0; k < nch; ++k) QCOMPARE(dec[s * size_t(nch) + size_t(k)], 0.0f);
+            for (const auto& [angle, el] : std::vector<std::array<double, 2>>{{0, 0}, {-90, 0}, {150, 0}, {60, 45}}) {
+                double power = 0;
+                for (double v : heard(angle, el)) power += v * v;
+                QVERIFY2(power > 0.5 && power < 2.0, qPrintable(QString("order %1 at %2,%3: %4").arg(order).arg(angle).arg(el).arg(power)));
+            }
+            double below = 0;
+            for (double v : heard(0, -80)) below += v * v;
+            // (First order is too broad to fade much.)
+            QVERIFY2(below < (order == 1 ? 0.9 : 0.5), qPrintable(QString("order %1 below %2").arg(order).arg(below)));
+        }
+        // Ear-level 5.1: what is overhead is spread over the ring; stereo and ambisonic layouts have no decoder.
+        {
+            const std::vector<float>& dec = layoutDecoder("5.1", 3);
+            float x[16];
+            ambisonicEncode(3, 0, 90, x);
+            int heardBy = 0;
+            for (size_t s = 0; s < 6; ++s) {
+                double v = 0;
+                for (int k = 0; k < 16; ++k) v += dec[s * 16 + size_t(k)] * x[k];
+                if (v > 0.1) ++heardBy;
+            }
+            QCOMPARE(heardBy, 5);
+            QVERIFY(layoutDecoder("stereo", 1).empty() && layoutDecoder("ambix", 1).empty());
+        }
+        // Binaurally to third order: from the left, the left ear first and louder; from the front, the ears agree; a
+        // higher order's image is sharper (more of it in the near ear).
+        double ratio[4] = {};
+        for (int order = 1; order <= 3; ++order) {
+            AmbisonicBinaural bin(order, 48000);
+            QCOMPARE(bin.order(), order);
+            QVERIFY(bin.hrirs() && bin.hrirs()->directions.size() == dirs.size());
+            const int nch = ambisonicChannels(order);
+            std::vector<float> in(size_t(512) * size_t(nch), 0.0f), out(size_t(512) * 2);
+            ambisonicEncode(order, -90, 0, &in[size_t(10) * size_t(nch)]);
+            bin.process(in.data(), 512, out.data());
+            int peakL = 0, peakR = 0;
+            double eL = 0, eR = 0;
+            for (int i = 0; i < 512; ++i) {
+                if (std::fabs(out[size_t(i) * 2]) > std::fabs(out[size_t(peakL) * 2])) peakL = i;
+                if (std::fabs(out[size_t(i) * 2 + 1]) > std::fabs(out[size_t(peakR) * 2 + 1])) peakR = i;
+                eL += out[size_t(i) * 2] * out[size_t(i) * 2];
+                eR += out[size_t(i) * 2 + 1] * out[size_t(i) * 2 + 1];
+            }
+            QVERIFY2(peakR - peakL >= 10 && eL > 2 * eR, qPrintable(QString("order %1: %2 %3 %4 %5").arg(order).arg(peakL).arg(peakR).arg(eL).arg(eR)));
+            ratio[order] = eL / eR;
+            bin.reset();
+            std::fill(in.begin(), in.end(), 0.0f);
+            ambisonicEncode(order, 0, 0, &in[size_t(10) * size_t(nch)]);
+            bin.process(in.data(), 512, out.data());
+            for (int i = 0; i < 512; ++i) QVERIFY(near(out[size_t(i) * 2], out[size_t(i) * 2 + 1], 1e-5));
+        }
+        QVERIFY(ratio[3] > ratio[1]);
+        // Every order as loud in a diffuse field: half its power at each ear.
+        for (int order = 1; order <= 3; ++order) {
+            const int nch = ambisonicChannels(order);
+            double energy = 0;
+            for (size_t k = 0; k < dirs.size(); ++k) {
+                AmbisonicBinaural bin(order, 48000);
+                std::vector<float> in(size_t(256) * size_t(nch), 0.0f), out(size_t(256) * 2);
+                ambisonicEncode(order, dirs[k][0], dirs[k][1], in.data());
+                bin.process(in.data(), 256, out.data());
+                const double w = k < 6 ? 0.0126984126984127 : k < 18 ? 0.02257495590828924 : k < 26 ? 0.02109375 : 0.02017333553791887;
+                for (float v : out) energy += w * v * v;
+            }
+            QVERIFY2(near(energy, 1, 1e-3), qPrintable(QString("order %1: %2").arg(order).arg(energy)));
+        }
+        // Processed in pieces as at once (the history carries over).
+        {
+            AmbisonicBinaural a(2, 48000), b(2, 48000);
+            std::vector<float> in(size_t(300) * 9), whole(600), parts(600);
+            for (size_t i = 0; i < in.size(); ++i) in[i] = float(std::sin(double(i) * 0.37));
+            a.process(in.data(), 300, whole.data());
+            b.process(in.data(), 100, parts.data());
+            b.process(in.data() + 900, 200, parts.data() + 200);
+            for (size_t i = 0; i < 600; ++i) QVERIFY(near(whole[i], parts[i], 1e-5));
+        }
+        // Responses for another rate are not used at this one (the spherical head is).
+        auto other = sphericalHeadHrirs(44100);
+        QCOMPARE(AmbisonicBinaural(1, 48000, other).hrirs()->sampleRate, 48000.0);
+        QCOMPARE(sphericalHeadHrirs(44100).get(), other.get());  // made once
     }
 
     void stereoInterpretation() {

@@ -25,6 +25,7 @@ option(MONTAGE_WITH_THORVG "Lottie animations and SVG graphics with ThorVG (MIT,
 option(MONTAGE_WITH_LUA "Lua scripting (Lua 5.4, MIT, fetched at configure time)" ON)
 option(MONTAGE_WITH_LV2 "Host LV2 audio plugins, when lilv is installed" ON)
 option(MONTAGE_WITH_LIBRAW "Camera raw stills (CR3, NEF, ARW, DNG...), when LibRaw 0.20+ is installed" ON)
+option(MONTAGE_WITH_MYSOFA "Measured HRTFs (SOFA files) for binaural ambisonics, when libmysofa is installed" ON)
 option(MONTAGE_WITH_OPENJPEG "IMF masters in the JPEG 2000 IMF profiles, when OpenJPEG 2.5+ is installed" ON)
 option(MONTAGE_WITH_OCIO "OpenColorIO configs and ACES transforms, when OpenColorIO 2.1+ is installed" ON)
 option(MONTAGE_WITH_ONNXRUNTIME "AI object masks (EdgeTAM), when ONNX Runtime 1.16+ is installed (ONNXRUNTIME_ROOT or the usual prefixes)" ON)

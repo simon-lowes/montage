@@ -58,6 +58,8 @@
 #include "AutoDuckDialog.h"
 #include "Settings.h"
 #include "media/MediaPool.h"
+#include "core/Ambisonics.h"
+#include "media/Sofa.h"
 #include "AutoMixDialog.h"
 #include "CaptionsPanel.h"
 #include "CleanFeed.h"
@@ -8978,6 +8980,75 @@ const auto seq = [this] { return state()->sequence(); };
         binaural->trigger();
         QVERIFY(program->controller()->ambisonicBinaural());
         appSettings().remove("playback/ambisonicBinaural");
+        state()->newProject();
+    }
+
+    void higherOrderAmbisonicsUi() {
+        // A third-order field (16 channels) as a WAV, which does not mark it as one.
+        const QString field = dir_.filePath("field-hoa3.wav");
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.fps = Rational{25, 1};
+            gs.audioLayout = "ambix3";
+            MediaItem speech;
+            QVERIFY(probeMedia(MONTAGE_TEST_DATA_DIR "/jfk.wav", speech));
+            speech.id = gen.newId();
+            gen.media.push_back(speech);
+            QVERIFY(edit::placeMedia(gen, gs, speech.id, 0, 0, 25, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            ExportSettings st = findExportPreset("Audio - WAV 24-bit")->settings;
+            st.path = field.toStdString();
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({field});
+        QCOMPARE(ids.size(), size_t(1));
+        QCOMPARE(state()->project().findMedia(ids[0])->channels, 16);
+        // Marked ambisonic from the media bin: to the highest order its channels hold.
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        QVERIFY(bin->setMediaAmbisonic(ids, kMaxAmbisonicOrder));
+        QCOMPARE(state()->project().findMedia(ids[0])->ambisonic, 3);
+        QVERIFY(bin->setMediaAmbisonic(ids, 1));
+        QCOMPARE(state()->project().findMedia(ids[0])->ambisonic, 1);
+        // Sequence Settings offers second- and third-order mixes.
+        {
+            SequenceSettingsDialog dlg(win_.get());
+            auto* layouts = dlg.findChild<QComboBox*>("audioLayout");
+            QVERIFY(layouts && layouts->findData("ambix2") >= 0 && layouts->findData("ambix3") >= 0);
+            NewSequenceSpec spec;
+            spec.audioLayout = "ambix3";
+            dlg.setSpec(spec);
+            QCOMPARE(dlg.spec().audioLayout, std::string("ambix3"));
+        }
+        // Playback › Ambisonic Monitoring › the head heard through: the model, SADIE II's KU100, or a SOFA file.
+        auto* head = win_->findChild<QAction*>("hrtfHead");
+        auto* ku100 = win_->findChild<QAction*>("hrtfKu100");
+        auto* file = win_->findChild<QAction*>("hrtfFile");
+        auto* menu = win_->findChild<QMenu*>("ambisonicMonitorMenu");
+        QVERIFY(head && ku100 && file && menu);
+        QCOMPARE(file->isEnabled(), sofaSupported());
+        QVERIFY(head->isChecked() && binauralHrtf().empty());
+        const QString sofa = QStringLiteral(MONTAGE_TEST_DATA_DIR "/sofa/small.sofa");
+        if (!sofaSupported()) {
+            QVERIFY(!win_->setBinauralHrtfChoice(sofa, true));
+            QSKIP("Built without libmysofa");
+        }
+        QVERIFY(win_->setBinauralHrtfChoice(sofa, true));
+        QCOMPARE(binauralHrtf(), sofa.toStdString());
+        QCOMPARE(appSettings().value("playback/binauralHrtf").toString(), sofa);
+        QMetaObject::invokeMethod(menu, "aboutToShow");
+        QVERIFY(file->isChecked() && !head->isChecked() && file->text().contains("small.sofa"));
+        // A file that is not one is refused, the choice kept.
+        QVERIFY(!win_->setBinauralHrtfChoice(field, true));
+        QCOMPARE(binauralHrtf(), sofa.toStdString());
+        // The KU100 when downloaded (not asked for here).
+        QCOMPARE(win_->setBinauralHrtfChoice("ku100", true), sadieKu100Pack().installed());
+        head->trigger();
+        QVERIFY(binauralHrtf().empty());
+        QMetaObject::invokeMethod(menu, "aboutToShow");
+        QVERIFY(head->isChecked() && !file->isChecked() && !ku100->isChecked());
+        appSettings().remove("playback/binauralHrtf");
         state()->newProject();
     }
 

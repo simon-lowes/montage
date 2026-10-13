@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install dependencies
         # Only the Qt modules Montage uses; the "qt" formula installs all of Qt.
-        run: brew install qtbase qtmultimedia ffmpeg opencolorio lilv libraw openjpeg onnxruntime ninja pkgconf
+        run: brew install qtbase qtmultimedia ffmpeg opencolorio lilv libraw openjpeg libmysofa onnxruntime ninja pkgconf
       - name: Rust version (part of the C2PA library's cache key)
         id: rust
         run: echo "version=$(rustc --version | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
@@ -113,7 +113,7 @@ jobs:
           install: zip curl
           pacboy: >-
             gcc:p cmake:p ninja:p pkgconf:p
-            qt6-base:p qt6-multimedia:p qt6-tools:p ffmpeg:p opencolorio:p lilv:p libraw:p openjpeg2:p onnxruntime:p rust:p
+            qt6-base:p qt6-multimedia:p qt6-tools:p ffmpeg:p opencolorio:p lilv:p libraw:p openjpeg2:p libmysofa:p onnxruntime:p rust:p
       - name: Rust version (part of the C2PA library's cache key)
         id: rust
         run: echo "version=$(rustc --version | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"

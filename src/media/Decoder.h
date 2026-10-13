@@ -158,8 +158,8 @@ bool decodeAudioStereoBlocks(const std::string& path, int sampleRate, size_t blo
                              const std::function<bool(const std::vector<float>& stereo)>& sink, std::string* error = nullptr,
                              const std::atomic<bool>* cancel = nullptr, const std::vector<int>& channels = {}, double from = 0);
 
-// The first-order ambisonic field (four channels: W, Y, Z, X in ACN order, SN3D) of the audio stream decodeAudio
-// mixes from; a higher-order file gives its first-order part. Aligned like decodeAudio.
+// The ambisonic field (ACN order, SN3D: W, Y, Z, X and on) of the audio stream decodeAudio mixes from, to the highest
+// order its channels hold (third at most: 4, 9 or 16 channels). Aligned like decodeAudio.
 AudioBufferPtr decodeAmbisonic(const std::string& path, int sampleRate, std::string* error = nullptr,
                                const std::atomic<bool>* cancel = nullptr);
 

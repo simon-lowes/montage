@@ -19,14 +19,16 @@
 #   <dir>/stems          Separate Stems     (MONTAGE_STEM_MODELS; 4 stems, and 2 and 5 with --stems)
 #   <dir>/voice-clone    Cloned voices      (MONTAGE_VOICE_CLONE_MODEL; 1.6 GB, only with --voice-clone)
 #   <dir>/lensfun-db     Lens Correction    (MONTAGE_LENS_DB; lensfun's lens profiles, CC BY-SA 3.0)
+#   <dir>/sadie-ku100    binaural ambisonics (MONTAGE_HRTF_DIR; SADIE II's KU100 HRIRs, Apache-2.0; only with --hrtf)
 #
-#   scripts/fetch-models.sh [dir] [--voice-clone] [--stems]      (default: ./models)
+#   scripts/fetch-models.sh [dir] [--voice-clone] [--stems] [--hrtf]      (default: ./models)
 set -euo pipefail
 VOICE_CLONE=0
 ALL_STEMS=0
+HRTF=0
 ARGS=()
 for a in "$@"; do
-  if [ "$a" = "--voice-clone" ]; then VOICE_CLONE=1; elif [ "$a" = "--stems" ]; then ALL_STEMS=1; else ARGS+=("$a"); fi
+  if [ "$a" = "--voice-clone" ]; then VOICE_CLONE=1; elif [ "$a" = "--stems" ]; then ALL_STEMS=1; elif [ "$a" = "--hrtf" ]; then HRTF=1; else ARGS+=("$a"); fi
 done
 DIR=${ARGS[0]:-models}
 sha256() { if command -v sha256sum > /dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
@@ -199,4 +201,9 @@ slr-ussr.xml 1fd6acc8a8f40373379bea2899ffd96fc34b22d9b044d0474dabd4c89af44efb
 slr-vivitar.xml c5c67e3fe38e8fa19044acadc7730047690435f66aac563f55ffe04997a88111
 slr-zeiss.xml 49aa211a41fd5fe391d26af5fa65bdf9428d60863ffff15d3916fa1c520dc101
 LENSES
+# SADIE II's KU100 dummy head (University of York, zenodo.org/records/12092466; media/Sofa.cpp names the same file).
+if [ "$HRTF" = 1 ]; then
+  fetch sadie-ku100 D1_HRIR_SOFA.zip "https://zenodo.org/records/12092466/files/D1_HRIR_SOFA.zip?download=1" 366321fa78f211bacc0ec6bea96701625b196a5db54ec16748b0eab0b9705f75
+  echo "KU100 HRIRs: MONTAGE_HRTF_DIR=$DIR/sadie-ku100"
+fi
 echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_DEBLUR_MODEL=$DIR/deblur MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife MONTAGE_MATTE_MODEL=$DIR/matte MONTAGE_TTS_MODEL=$DIR/tts MONTAGE_INPAINT_MODEL=$DIR/inpaint MONTAGE_SENTENCE_MODEL=$DIR/minilm-qa MONTAGE_OCR_MODEL=$DIR/ocr MONTAGE_SOUND_MODEL=$DIR/sound MONTAGE_STEM_MODELS=$DIR/stems MONTAGE_LENS_DB=$DIR/lensfun-db"

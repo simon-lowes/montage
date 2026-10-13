@@ -1018,10 +1018,16 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         // fed every channel.
         AVChannelLayout layout = AV_CHANNEL_LAYOUT_STEREO;
         if (!s.downmixStereo && ambisonicLayout(seq.audioLayout)) {
-            // An ambisonic field: named as one for PCM, as four speakers (4.0, in ACN order) for AAC, which knows no
-            // other four-channel layout; the SA3D box written afterwards says what they are.
-            const AVChannelLayout field = AV_CHANNEL_LAYOUT_AMBISONIC_FIRST_ORDER, quad = AV_CHANNEL_LAYOUT_4POINT0;
-            layout = s.audioCodec.rfind("pcm_", 0) == 0 ? field : quad;
+            // An ambisonic field: named as one for PCM, as four speakers (4.0, in ACN order) for AAC (first order only,
+            // exportAudioLayout), which knows no other four-channel layout; the SA3D box written afterwards says what
+            // they are.
+            if (s.audioCodec.rfind("pcm_", 0) == 0) {
+                layout = AVChannelLayout{};
+                layout.order = AV_CHANNEL_ORDER_AMBISONIC;
+                layout.nb_channels = layoutChannels(seq.audioLayout);
+            } else {
+                layout = AV_CHANNEL_LAYOUT_4POINT0;
+            }
         } else if (!s.downmixStereo && !ffmpegLayout(seq.audioLayout, layout)) {
             return "This FFmpeg cannot describe the " + seq.audioLayout + " channel layout";
         }
@@ -1049,7 +1055,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (!ok) actx->sample_fmt = fmts[0];
         }
         const bool field = !mono && !s.downmixStereo && ambisonicLayout(seq.audioLayout);
-        if (s.audioCodec == "aac" || s.audioCodec == "libopus") actx->bit_rate = s.audioBitrate * (field ? 2 : 1);  // per pair of channels
+        if (s.audioCodec == "aac" || s.audioCodec == "libopus")
+            actx->bit_rate = s.audioBitrate * (field ? layoutChannels(seq.audioLayout) / 2 : 1);  // per pair of channels
         actx->time_base = AVRational{1, actx->sample_rate};
         if (o.oc->oformat->flags & AVFMT_GLOBALHEADER) actx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         AVDictionary* opts = nullptr;
@@ -1719,9 +1726,12 @@ bool exportCodecCarries(const std::string& codecName, const std::string& layout)
 
 std::string exportAudioLayout(const std::string& layout, const std::string& codec) {
     if (codec.empty() || codec == "none") return layout;
-    // An ambisonic field goes into PCM or AAC (as YouTube takes it); anything else hears it as stereo.
-    if (ambisonicLayout(layout))
-        return codec.rfind("pcm_", 0) == 0 || codec == "aac" || codec == "libfdk_aac" || codec == "aac_at" ? layout : "stereo";
+    // An ambisonic field goes into PCM, or its first order into AAC (as YouTube takes it: AAC has no layouts for 9 or
+    // 16 channels); anything else hears it as stereo.
+    if (ambisonicLayout(layout)) {
+        if (codec.rfind("pcm_", 0) == 0) return layout;
+        return codec == "aac" || codec == "libfdk_aac" || codec == "aac_at" ? "ambix" : "stereo";
+    }
     if (exportCodecCarries(codec, layout)) return layout;
     const std::string ear = earLevelLayout(layout);
     if (ear != layout && exportCodecCarries(codec, ear)) return ear;
@@ -1805,7 +1815,7 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
         // The export is good either way: without the box players hear four channels rather than a field, which is no
         // reason to throw the file away.
         std::string why;
-        if ((ext == ".mp4" || ext == ".m4a" || ext == ".mov" || ext == ".m4v") && !writeSpatialAudioBox(s.path, 1, &why))
+        if ((ext == ".mp4" || ext == ".m4a" || ext == ".mov" || ext == ".m4v") && !writeSpatialAudioBox(s.path, ambisonicOrder(layout), &why))
             qWarning("Spatial audio metadata not added to %s: %s", s.path.c_str(), why.c_str());
     }
     // Never leave a truncated file behind (the output is closed by now), but

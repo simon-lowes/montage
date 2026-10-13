@@ -186,6 +186,7 @@
 #include "render/Hdr10Plus.h"
 #include "render/Versions.h"
 #include "media/MicBleed.h"
+#include "media/Sofa.h"
 #include "render/MusicEdit.h"
 #include "render/VoiceMatch.h"
 #include "render/Exporter.h"
@@ -1967,6 +1968,46 @@ void MainWindow::buildMenus() {
             a->setChecked(b == binaural);
             group->addAction(a);
         }
+        // The head heard through binaurally: a model, a measured dummy head, or a personal set (SOFA files).
+        ambiM->addSeparator();
+        auto* heads = new QActionGroup(ambiM);
+        struct Head {
+            const char* name;
+            QString text;
+            QString choice;  // "?" asks for a file
+        };
+        const Head choices[] = {{"hrtfHead", tr("Spherical Head Model"), QString()},
+                                {"hrtfKu100", tr("Measured Head (SADIE II KU100)"), QStringLiteral("ku100")},
+                                {"hrtfFile", tr("Personal HRTF (SOFA File)..."), QStringLiteral("?")}};
+        for (const Head& h : choices) {
+            QAction* a = ambiM->addAction(h.text, this, [this, choice = h.choice] {
+                QString c = choice;
+                if (c == "?") {
+                    c = QFileDialog::getOpenFileName(this, tr("Personal HRTF"), QString(), tr("SOFA files (*.sofa)"));
+                    if (c.isEmpty()) return;
+                }
+                setBinauralHrtfChoice(c);
+            });
+            a->setObjectName(QString::fromLatin1(h.name));
+            a->setCheckable(true);
+            a->setEnabled(h.choice.isEmpty() || sofaSupported());
+            if (!sofaSupported() && !h.choice.isEmpty()) a->setToolTip(tr("This build of Montage cannot read SOFA files (libmysofa)"));
+            heads->addAction(a);
+        }
+        // Checked as chosen now (automation can choose too).
+        auto showChoice = [ambiM] {
+            const std::string c = binauralHrtf();
+            ambiM->findChild<QAction*>(QStringLiteral("hrtfHead"))->setChecked(c.empty());
+            ambiM->findChild<QAction*>(QStringLiteral("hrtfKu100"))->setChecked(c == "ku100");
+            QAction* file = ambiM->findChild<QAction*>(QStringLiteral("hrtfFile"));
+            file->setChecked(!c.empty() && c != "ku100");
+            file->setText(!c.empty() && c != "ku100" ? tr("Personal HRTF (%1)...").arg(QFileInfo(QString::fromStdString(c)).fileName())
+                                                     : tr("Personal HRTF (SOFA File)..."));
+        };
+        connect(ambiM, &QMenu::aboutToShow, this, showChoice);
+        const QString saved = appSettings().value("playback/binauralHrtf").toString();
+        if (!saved.isEmpty() && !setBinauralHrtfChoice(saved, true)) appSettings().remove("playback/binauralHrtf");
+        showChoice();
     }
     // How the Program monitor shows a stereo 3D sequence's two eyes (render/Stereo.h).
     QMenu* stereoM = play->addMenu(tr("Stereo 3D View"));
@@ -3793,6 +3834,30 @@ int MainWindow::exportAmf(const QString& target) {
     if (!notes.isEmpty()) msg += tr(" (%1)").arg(notes.join(QStringLiteral("; ")));
     state_->message(msg, 10000);
     return written;
+}
+
+bool MainWindow::setBinauralHrtfChoice(const QString& choice, bool quiet) {
+    auto refuse = [&](const QString& why) {
+        if (!quiet) QMessageBox::warning(this, tr("Binaural Monitoring"), why);
+        return false;
+    };
+    if (!choice.isEmpty()) {
+        if (!sofaSupported()) return refuse(tr("This build of Montage cannot read SOFA files (it was built without libmysofa)."));
+        if (choice == "ku100") {
+            if (!sadieKu100Pack().installed() &&
+                (quiet || !ensureModelPack(this, sadieKu100Pack(), tr("Binaural Monitoring"),
+                                           tr("Ambisonic sound is heard through the head-related impulse responses of a Neumann KU100 "
+                                              "dummy head, measured for the University of York's SADIE II database (Apache-2.0)."))))
+                return false;
+        } else {
+            std::string why;
+            if (!readSofa(choice.toStdString(), 48000, &why))
+                return refuse(tr("%1 cannot be used: %2").arg(QFileInfo(choice).fileName(), QString::fromStdString(why)));
+        }
+    }
+    setBinauralHrtf(choice.toStdString());
+    appSettings().setValue("playback/binauralHrtf", choice);
+    return true;
 }
 
 int MainWindow::suggestChapterMarkers(double minSeconds, bool ask) {

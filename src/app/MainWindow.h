@@ -261,6 +261,10 @@ public:
     // file for one, a folder for more).
     int importAmf(const QString& path, int setSpace = -1);
     int exportAmf(const QString& target);
+    // Play › Ambisonic Monitoring › the head binaural listening hears through (media/Sofa.h): "" the spherical head
+    // model, "ku100" SADIE II's KU100 (downloaded when asked, after asking), or a SOFA file. False (with a message
+    // unless `quiet`) when it cannot be used; the choice is then left as it was.
+    bool setBinauralHrtfChoice(const QString& choice, bool quiet = false);
     // File › Link Media: the dialog for the offline media (shown by itself when a project opens with some), or a
     // message and nullptr when nothing is offline.
     LinkMediaDialog* showLinkMedia();

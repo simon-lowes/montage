@@ -109,6 +109,7 @@ add_library(montage_engine STATIC
   media/CameraSolve.h media/CameraSolve.cpp
   media/Reframe.h media/Reframe.cpp
   media/ModelFiles.h media/ModelFiles.cpp
+  media/Sofa.h media/Sofa.cpp
   media/LensDatabase.h media/LensDatabase.cpp
   media/Segmenter.h media/Segmenter.cpp
   media/Diarizer.h media/Diarizer.cpp
@@ -262,6 +263,16 @@ if(MONTAGE_WITH_LIBRAW)
     target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_LIBRAW)
   else()
     message(STATUS "LibRaw not found: camera raw stills are not read")
+  endif()
+endif()
+if(MONTAGE_WITH_MYSOFA)
+  pkg_check_modules(MYSOFA IMPORTED_TARGET GLOBAL libmysofa>=1.0)
+  if(MYSOFA_FOUND)
+    message(STATUS "libmysofa ${MYSOFA_VERSION}: SOFA HRTFs for binaural ambisonics enabled")
+    target_link_libraries(montage_engine PRIVATE PkgConfig::MYSOFA)
+    target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_MYSOFA)
+  else()
+    message(STATUS "libmysofa not found: ambisonics is heard binaurally through the spherical head model only")
   endif()
 endif()
 if(MONTAGE_WITH_OPENJPEG)

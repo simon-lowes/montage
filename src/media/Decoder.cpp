@@ -459,10 +459,10 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         m.channels = st->codecpar->ch_layout.nb_channels;
         // Ambisonic sound: the file's spatial audio metadata (MP4 SA3D) gives its layout as ambisonic components.
         if (st->codecpar->ch_layout.order == AV_CHANNEL_ORDER_AMBISONIC && m.channels >= kFoaChannels)
-            m.ambisonic = std::max(1, int(std::sqrt(double(m.channels) + 1e-9)) - 1);
+            m.ambisonic = ambisonicOrderForChannels(m.channels);
         // (Reading AAC to find its layout replaces that with the decoder's speakers: the box itself is read then.)
         if (!m.ambisonic && m.channels >= kFoaChannels && std::strstr(fmt->iformat->name, "mov"))
-            m.ambisonic = readSpatialAudioBox(uninterpretedPath(path));
+            m.ambisonic = std::min(readSpatialAudioBox(uninterpretedPath(path)), ambisonicOrderForChannels(m.channels));
         if (dur <= 0 && st->duration > 0) dur = double(st->duration) * av_q2d(st->time_base);
         m.audioStreams.clear();
         for (unsigned i = 0; i < fmt->nb_streams; ++i)
@@ -1466,17 +1466,18 @@ AudioBufferPtr decodeAmbisonic(const std::string& path, int sampleRate, std::str
         if (error) *error = "Ambisonic sound needs at least four channels";
         return nullptr;
     }
-    // ACN order (W, Y, Z, X) as decoded: a decoder that names four channels as speakers (AAC's 4.0) gives them in its
-    // own channel order, which is the order FFmpeg's encoders took them in (and Montage's exports write).
-    const int map[4] = {0, 1, 2, 3};
+    // ACN order as decoded, to the highest order the channels hold (third at most): a decoder that names four
+    // channels as speakers (AAC's 4.0) gives them in its own channel order, which is the order FFmpeg's encoders took
+    // them in (and Montage's exports write).
     av_channel_layout_uninit(&layout);
+    const int nch = ambisonicChannels(ambisonicOrderForChannels(n));
     auto buf = std::make_shared<AudioBuffer>();
     buf->sampleRate = sampleRate;
-    buf->channels = kFoaChannels;
+    buf->channels = nch;
     const size_t frames = raw.size() / size_t(n);
-    buf->samples.resize(frames * 4);
+    buf->samples.resize(frames * size_t(nch));
     for (size_t i = 0; i < frames; ++i)
-        for (int k = 0; k < 4; ++k) buf->samples[i * 4 + size_t(k)] = raw[i * size_t(n) + size_t(map[k])];
+        for (int k = 0; k < nch; ++k) buf->samples[i * size_t(nch) + size_t(k)] = raw[i * size_t(n) + size_t(k)];
     return buf;
 }
 

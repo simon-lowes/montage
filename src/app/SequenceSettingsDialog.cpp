@@ -158,6 +158,8 @@ SequenceSettingsDialog::SequenceSettingsDialog(QWidget* parent) : QDialog(parent
     audioLayout_->addItem(tr("7.1.2 immersive (7.1 and two overhead, the Atmos bed)"), QStringLiteral("7.1.2"));
     audioLayout_->addItem(tr("7.1.4 immersive (7.1 and four overhead)"), QStringLiteral("7.1.4"));
     audioLayout_->addItem(tr("Ambisonics (first order AmbiX, for 360° video)"), QStringLiteral("ambix"));
+    audioLayout_->addItem(tr("Ambisonics (second order, 9 channels)"), QStringLiteral("ambix2"));
+    audioLayout_->addItem(tr("Ambisonics (third order, 16 channels)"), QStringLiteral("ambix3"));
     audioLayout_->setToolTip(tr("The speakers the sequence mixes to. Surround mixes are heard folded down to stereo,\n"
                                 "and each track and bus gets a surround panner in the mixer."));
 

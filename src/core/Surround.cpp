@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
+#include <mutex>
 
 #include "Ambisonics.h"
 
@@ -53,17 +55,57 @@ const std::vector<Speaker>& layoutSpeakers(const std::string& layout) {
     static const std::vector<Speaker> ambix = {{"W", 0, false, 1.0, 0, ""}, {"Y", 0, false, 0.0, 0, ""},
                                                {"Z", 0, false, 0.0, 0, ""}, {"X", 0, false, 0.0, 0, ""}};
     if (layout == "ambix") return ambix;
+    // Higher orders: the components by ACN number.
+    auto components = [](int order) {
+        static const char* names[] = {"W", "Y", "Z", "X", "ACN4", "ACN5", "ACN6", "ACN7", "ACN8",
+                                      "ACN9", "ACN10", "ACN11", "ACN12", "ACN13", "ACN14", "ACN15"};
+        std::vector<Speaker> out;
+        for (int n = 0; n < ambisonicChannels(order); ++n) out.push_back({names[n], 0, false, n == 0 ? 1.0 : 0.0, 0, ""});
+        return out;
+    };
+    static const std::vector<Speaker> ambix2 = components(2), ambix3 = components(3);
+    if (layout == "ambix2") return ambix2;
+    if (layout == "ambix3") return ambix3;
     return stereo;
 }
 
 int layoutChannels(const std::string& layout) { return int(layoutSpeakers(layout).size()); }
 
 const std::vector<std::string>& audioLayouts() {
-    static const std::vector<std::string> l = {"stereo", "5.1", "7.1", "5.1.2", "5.1.4", "7.1.2", "7.1.4", "ambix"};
+    static const std::vector<std::string> l = {"stereo", "5.1", "7.1", "5.1.2", "5.1.4", "7.1.2", "7.1.4", "ambix", "ambix2", "ambix3"};
     return l;
 }
 
-bool ambisonicLayout(const std::string& layout) { return layout == "ambix"; }
+bool ambisonicLayout(const std::string& layout) { return ambisonicOrder(layout) > 0; }
+
+int ambisonicOrder(const std::string& layout) {
+    if (layout == "ambix") return 1;
+    if (layout == "ambix2") return 2;
+    if (layout == "ambix3") return 3;
+    return 0;
+}
+
+std::string ambisonicLayoutFor(int order) {
+    order = std::clamp(order, 1, kMaxAmbisonicOrder);
+    return order == 1 ? "ambix" : "ambix" + std::to_string(order);
+}
+
+const std::vector<float>& layoutDecoder(const std::string& layout, int order) {
+    static std::mutex m;
+    static std::map<std::pair<std::string, int>, std::vector<float>> made;
+    std::lock_guard lock(m);
+    auto it = made.find({layout, order});
+    if (it != made.end()) return it->second;
+    std::vector<float> dec;
+    const auto& sp = layoutSpeakers(layout);
+    if (!ambisonicLayout(layout) && sp.size() > 2) {
+        std::vector<std::array<double, 2>> dirs;
+        std::vector<bool> lfe;
+        for (const Speaker& s : sp) dirs.push_back({s.angle, s.elevation}), lfe.push_back(s.lfe);
+        dec = allradDecoder(order, dirs, lfe);
+    }
+    return made.emplace(std::make_pair(layout, order), std::move(dec)).first->second;
+}
 
 bool immersiveLayout(const std::string& layout) {
     for (const Speaker& sp : layoutSpeakers(layout))
@@ -117,10 +159,11 @@ void ringGains(const std::vector<Speaker>& sp, std::vector<size_t> ring, double 
 }  // namespace
 
 std::vector<float> panGains(const std::string& layout, double angle, double distance, double height) {
-    if (ambisonicLayout(layout)) {
+    if (const int order = ambisonicOrder(layout)) {
         // From the direction, overhead at height 1; the nearer the middle, the more it is heard all round.
-        const auto g = foaEncode(angle, std::clamp(height, 0.0, 1.0) * 90, std::clamp(distance, 0.0, 1.0));
-        return {g.begin(), g.end()};
+        std::vector<float> g(size_t(ambisonicChannels(order)));
+        ambisonicEncode(order, angle, std::clamp(height, 0.0, 1.0) * 90, g.data(), std::clamp(distance, 0.0, 1.0));
+        return g;
     }
     const auto& sp = layoutSpeakers(layout);
     std::vector<float> g(sp.size(), 0.0f);
@@ -154,8 +197,9 @@ SurroundGains surroundGains(const std::string& layout, const SurroundPan& p) {
 }
 
 void downmixToStereo(const std::string& layout, const float* in, int frames, float* out) {
-    if (ambisonicLayout(layout)) {
-        for (int i = 0; i < frames; ++i) foaDecodeStereo(in + size_t(i) * 4, out[size_t(i) * 2], out[size_t(i) * 2 + 1]);
+    if (const int order = ambisonicOrder(layout)) {
+        const size_t stride = size_t(ambisonicChannels(order));
+        for (int i = 0; i < frames; ++i) foaDecodeStereo(in + size_t(i) * stride, out[size_t(i) * 2], out[size_t(i) * 2 + 1]);
         return;
     }
     const auto& sp = layoutSpeakers(layout);
