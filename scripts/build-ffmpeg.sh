@@ -31,7 +31,12 @@ FLAGS=(
 )
 case "$(uname -s)" in
   MINGW* | MSYS*) FLAGS+=(--enable-amf --enable-nvenc --enable-libvpl) ;;
-  Darwin) FLAGS+=(--enable-videotoolbox --enable-audiotoolbox) ;;
+  Darwin)
+    FLAGS+=(--enable-videotoolbox --enable-audiotoolbox)
+    # LAME has no pkg-config file, and Homebrew's prefix is not on the compiler's own paths.
+    lame=$(brew --prefix lame)
+    FLAGS+=(--extra-cflags=-I$lame/include --extra-ldflags=-L$lame/lib)
+    ;;
 esac
 
 SHARE="$PREFIX/share/montage-ffmpeg"
