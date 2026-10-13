@@ -41,14 +41,14 @@ struct Codec {
     AVPixelFormat pix;
 };
 const Codec kCodecs[] = {
-    {"prores_proxy", "Apple ProRes 422 Proxy", "prores_ks", "proxy", AV_PIX_FMT_YUV422P10LE},
-    {"prores_lt", "Apple ProRes 422 LT", "prores_ks", "lt", AV_PIX_FMT_YUV422P10LE},
-    {"prores", "Apple ProRes 422", "prores_ks", "standard", AV_PIX_FMT_YUV422P10LE},
-    {"prores_hq", "Apple ProRes 422 HQ", "prores_ks", "hq", AV_PIX_FMT_YUV422P10LE},
-    {"dnxhr_lb", "Avid DNxHR LB", "dnxhd", "dnxhr_lb", AV_PIX_FMT_YUV422P},
-    {"dnxhr_sq", "Avid DNxHR SQ", "dnxhd", "dnxhr_sq", AV_PIX_FMT_YUV422P},
-    {"dnxhr_hq", "Avid DNxHR HQ", "dnxhd", "dnxhr_hq", AV_PIX_FMT_YUV422P},
-    {"dnxhr_hqx", "Avid DNxHR HQX (10-bit)", "dnxhd", "dnxhr_hqx", AV_PIX_FMT_YUV422P10LE},
+    {"prores_proxy", "ProRes 422 Proxy", "prores_ks", "proxy", AV_PIX_FMT_YUV422P10LE},
+    {"prores_lt", "ProRes 422 LT", "prores_ks", "lt", AV_PIX_FMT_YUV422P10LE},
+    {"prores", "ProRes 422", "prores_ks", "standard", AV_PIX_FMT_YUV422P10LE},
+    {"prores_hq", "ProRes 422 HQ", "prores_ks", "hq", AV_PIX_FMT_YUV422P10LE},
+    {"dnxhr_lb", "DNxHR LB", "dnxhd", "dnxhr_lb", AV_PIX_FMT_YUV422P},
+    {"dnxhr_sq", "DNxHR SQ", "dnxhd", "dnxhr_sq", AV_PIX_FMT_YUV422P},
+    {"dnxhr_hq", "DNxHR HQ", "dnxhd", "dnxhr_hq", AV_PIX_FMT_YUV422P},
+    {"dnxhr_hqx", "DNxHR HQX (10-bit)", "dnxhd", "dnxhr_hqx", AV_PIX_FMT_YUV422P10LE},
 };
 
 const Codec* findCodec(const std::string& id) {
