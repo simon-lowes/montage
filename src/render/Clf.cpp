@@ -43,9 +43,9 @@ bool numbers(const QString& text, std::vector<double>& out) {
     std::istringstream is(text.toStdString());
     std::string tok;
     while (is >> tok) {
-        char* end = nullptr;
-        const double v = std::strtod(tok.c_str(), &end);
-        if (!end || *end || !std::isfinite(v)) return false;
+        bool ok = false;
+        const double v = QByteArray::fromStdString(tok).toDouble(&ok);  // (whatever the locale: "0.5", never "0,5")
+        if (!ok || !std::isfinite(v)) return false;
         out.push_back(v);
     }
     return true;
@@ -58,7 +58,7 @@ bool numberOf(const QDomElement& e, double& out) {
     return true;
 }
 
-float clamp01(float v) { return std::clamp(v, 0.0f, 1.0f); }
+float clamp01(float v) { return !(v > 0) ? 0.0f : v > 1 ? 1.0f : v; }  // (NaN to 0: the result indexes tables)
 
 struct MatrixOp : ClfTransform::Op {
     double m[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};  // 3 x 4, offsets last
@@ -342,8 +342,12 @@ std::shared_ptr<const ClfTransform::Op> readOp(const QDomElement& e, std::string
         return op;
     }
     if (kind == "LUT1D") {
-        if (e.attribute("halfDomain") == "true") {
-            why = "Half-float-domain 1D LUTs are not read";
+        if (e.attribute("halfDomain") == "true" || e.attribute("rawHalfs") == "true") {
+            why = "Half-float 1D LUTs (halfDomain, rawHalfs) are not read";
+            return nullptr;
+        }
+        if (!child(e, "IndexMap").isNull()) {
+            why = "1D LUTs with an IndexMap (CLF 2) are not read";
             return nullptr;
         }
         const QDomElement arr = child(e, "Array");
@@ -355,7 +359,7 @@ std::shared_ptr<const ClfTransform::Op> readOp(const QDomElement& e, std::string
         auto op = std::make_shared<Lut1DOp>();
         op->n = dim[0].toInt();
         op->channels = dim[1].toInt();
-        if (op->n < 2 || (op->channels != 1 && op->channels != 3) || a.size() != size_t(op->n) * size_t(op->channels)) {
+        if (op->n < 2 || op->n > (1 << 20) || (op->channels != 1 && op->channels != 3) || a.size() != size_t(op->n) * size_t(op->channels)) {
             why = "A LUT1D's Array does not match its size";
             return nullptr;
         }
@@ -371,7 +375,11 @@ std::shared_ptr<const ClfTransform::Op> readOp(const QDomElement& e, std::string
         }
         auto op = std::make_shared<Lut3DOp>();
         op->n = dim[0].toInt();
-        if (op->n < 2 || dim[1].toInt() != op->n || dim[2].toInt() != op->n || dim[3].toInt() != 3 ||
+        if (!child(e, "IndexMap").isNull()) {
+            why = "3D LUTs with an IndexMap (CLF 2) are not read";
+            return nullptr;
+        }
+        if (op->n < 2 || op->n > 256 || dim[1].toInt() != op->n || dim[2].toInt() != op->n || dim[3].toInt() != 3 ||
             a.size() != size_t(op->n) * op->n * op->n * 3) {
             why = "A LUT3D's Array does not match its size";
             return nullptr;

@@ -138,6 +138,7 @@
 #endif
 #include "render/ClipAnalysis.h"
 #include "render/ColorSpace.h"
+#include "render/Clf.h"
 #include "render/AudioFx.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
@@ -732,6 +733,57 @@ private slots:
         convertPixel(plain, logc, rec709Space(), 1000);
         QVERIFY2(std::fabs(after - (plain[1] + 0.05f)) < 0.01f, qPrintable(QString("%1 vs %2").arg(after).arg(plain[1] + 0.05f)));
         QVERIFY(std::fabs(after - want[1]) > 0.01f);
+    }
+
+    void amfLooksOnTheCamerasPicture() {
+        // LogC3 footage given an AMF's pipeline in a Rec.709 sequence: its CDL (in ACEScct) and its look (a CLF in
+        // ACES2065-1) grade the camera's picture, each in its own space, before the display rendering, as dailies do.
+        QImage grey(64, 48, QImage::Format_RGB32);
+        grey.fill(qRgb(102, 110, 96));
+        QVERIFY(grey.save(QString::fromStdString(path("amf-grey.png"))));
+        Project p = makeDefaultProject();
+        MediaItem m = probeOrFail(p, path("amf-grey.png"));
+        m.name = "A001C012.png";
+        p.media.push_back(m);
+        Sequence& s = *p.active();
+        s.width = 64;
+        s.height = 48;
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 25, {TrackKind::Video, 0}, {}, false).ok);
+        AmfDocument amf;
+        std::string err;
+        QVERIFY2(readAmf(MONTAGE_TEST_DATA_DIR "/amf/A001C012.amf", amf, &err), err.c_str());
+        QCOMPARE(applyAmf(p, s, {}, amf).clips, 1);
+        const ColorSpace& logc = *findColorSpace("logc3-awg3");
+        QCOMPARE(p.findMedia(m.id)->colorOverride, logc.id);
+        RenderOptions ro;
+        const Image img = renderProgramFrame(p, s, 2, ro);
+        auto into = [](float v[3], const ColorSpace& a, const ColorSpace& b) {
+            double mat[9], l[3];
+            primariesMatrix(a.primaries, b.primaries, mat);
+            for (int i = 0; i < 3; ++i) l[i] = toLinear(a.transfer, v[i]);
+            for (int i = 0; i < 3; ++i) v[i] = float(fromLinear(b.transfer, mat[i * 3] * l[0] + mat[i * 3 + 1] * l[1] + mat[i * 3 + 2] * l[2]));
+        };
+        float want[3] = {102 / 255.0f, 110 / 255.0f, 96 / 255.0f};
+        const ColorSpace &cct = *findColorSpace("acescct"), &ap0 = *findColorSpace("aces2065-1");
+        into(want, logc, cct);
+        applyCdl(amf.looks[1].cdl, want[0], want[1], want[2]);
+        into(want, cct, logc);
+        into(want, logc, ap0);
+        loadClf(amf.looks[2].file)->apply(want);
+        into(want, ap0, logc);
+        float rgc[4] = {want[0], want[1], want[2], 1};
+        Image px(1, 1);
+        std::copy(rgc, rgc + 4, px.at(0, 0));
+        applyAcesGamutCompress(edit::clipById(s, s.videoTracks[0].clips[0].id)->effects[2], 0, logc, px);
+        std::copy(px.at(0, 0), px.at(0, 0) + 3, want);
+        convertPixel(want, logc, rec709Space(), 1000);
+        for (int c = 0; c < 3; ++c)
+            QVERIFY2(std::fabs(img.at(32, 24)[c] - want[c]) < 0.01f, qPrintable(QString("%1: %2 vs %3").arg(c).arg(img.at(32, 24)[c]).arg(want[c])));
+        // A dailies AMF whose output transform was applied: the pictures are Rec.709 video, with no looks to add.
+        amf.outputApplied = true;
+        QCOMPARE(applyAmf(p, s, {}, amf).clips, 1);
+        QCOMPARE(p.findMedia(m.id)->colorOverride, std::string("rec709"));
+        QVERIFY(s.videoTracks[0].clips[0].effects.empty());
     }
 
     void probeAndDecodeWav() {
@@ -5390,6 +5442,7 @@ private slots:
         QVERIFY(QFileInfo::exists(r.value("structuredContent").toObject().value("pull_list").toString()));
         QVERIFY2(readAmf(pulled[0].toObject().value("amf").toString().toStdString(), amf, &err), err.c_str());
         QVERIFY(amf.looks.size() == 1 && amf.looks[0].cdl.sameGrade(grade));
+        QCOMPARE(amf.inputSpace, std::string("rec709"));  // (TIFF frames are in the sequence's display space)
         // montage_amf: shot A's AMF out, read, and onto shot B.
         auto call = [&](const QJsonObject& args) {
             const QJsonObject q{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},

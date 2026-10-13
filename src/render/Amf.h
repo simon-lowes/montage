@@ -22,11 +22,13 @@ struct AmfLook {
     std::string cdlSpaceId;   // ... as the file names it (a transform id or file)
     std::string file;         // Kind::File: the LUT (CLF), as an absolute path when the AMF's folder was known
     std::string transformId;  // Kind::TransformId
+    std::string unreadable;   // why it cannot be used (a CDL file or correction missing, a look named only by uuid)
 };
 
 struct AmfDocument {
     std::string description;  // the file's (amfInfo)
-    std::string uuid;         // the file's, "urn:uuid:..."
+    std::string uuid;         // the file's, "urn:uuid:..." (what an ALE's AMF_UUID names)
+    std::string fileName;     // the file's name when it was read from one (an ALE's AMF_NAME)
     // The clip it is for (any may be empty).
     std::string clipName, clipFile, clipUuid;
     std::string clipSequence;  // a numbered file sequence, the number as '#' (e.g. "A001_C012_####.exr")
@@ -62,10 +64,15 @@ std::string acesOutputTransformId(const std::string& spaceId, double peakNits);
 // what ACES has no id for; Montage reads its own back as that space.
 std::string clfToAces(const std::string& spaceId);
 
+// Whether an AMF is for this clip: its media names the AMF (an ALE's AMF_UUID or AMF_NAME), or the AMF's clip name, file
+// or numbered sequence matches the clip's name, its media's, its file (frame numbers aside) or its tape.
+bool amfMatchesClip(const AmfDocument& amf, const Project& p, const Clip& clip);
+
 // Gives clips what an AMF describes: their media read as its input transform's space, its looks not yet applied as
-// effects first in their chains (an earlier AMF's replaced). `clips` empty: the sequence's video clips whose names (the
-// clip's, its media's, file or tape) match the AMF's clip; else those clips. The output transform can set the sequence's
-// colour space. `notes` says what could not be carried (an unknown transform, a missing look file).
+// effects first in their chains (an earlier AMF's replaced). When its output transform was applied too, the pictures
+// are that display's and are read so, with no looks. `clips` empty: the sequence's video clips amfMatchesClip finds;
+// else those clips. The output transform can set the sequence's colour space. `notes` says what could not be carried
+// (an unknown transform, a missing look file).
 struct AmfImportOptions {
     bool setSequenceSpace = false;
 };

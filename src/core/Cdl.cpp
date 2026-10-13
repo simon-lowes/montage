@@ -149,8 +149,9 @@ std::vector<Cdl> parseCdlXml(const std::string& xml, std::string* error) {
 }
 
 std::string withoutMediaExtension(const std::string& name) {
-    static const QStringList media{"mov", "mp4", "m4v", "mxf", "avi", "mkv", "mts", "m2ts", "braw", "r3d", "ari", "arx", "crm", "dng",
-                                   "cine", "nev", "rmf", "mpg", "mpeg", "wav", "bwf", "aif", "aiff", "mp3", "dpx", "exr", "tif", "tiff"};
+    static const QStringList media{"mov", "mp4", "m4v", "mxf", "avi", "mkv",  "mts", "m2ts", "braw", "r3d", "ari", "arx",
+                                   "crm", "dng", "cine", "nev", "rmf", "mpg",  "mpeg", "wav", "bwf", "aif", "aiff", "mp3",
+                                   "dpx", "exr", "tif", "tiff", "png", "jpg", "jpeg", "tga", "heic"};
     const QString n = QString::fromStdString(name);
     const int dot = n.lastIndexOf('.');
     if (dot <= 0 || !media.contains(n.mid(dot + 1).toLower())) return name;

@@ -205,7 +205,7 @@ std::vector<EffectInfo> buildCatalog() {
         c.push_back({"lut", "LUT (.cube, .clf)", EffectCategory::VideoFilter, "Color",
                      {pct("strength", "Strength", 0, 100, 100)},
                      {str("path", "LUT File", StringKind::File), str("space", "Apply In", StringKind::Choice, "Working space")}});
-        c.back().strings[0].fileFilter = "LUT files (*.cube *.clf)";
+        c.back().strings[0].fileFilter = "LUT files (*.cube *.clf *.ctf)";
         c.back().strings[1].choices = spaces;
     }
     {

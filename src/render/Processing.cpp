@@ -43,7 +43,7 @@ namespace {
 
 constexpr float kLumaR = 0.2126f, kLumaG = 0.7152f, kLumaB = 0.0722f;
 
-inline float clamp01(float v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+inline float clamp01(float v) { return !(v > 0) ? 0 : (v > 1 ? 1 : v); }  // (NaN to 0: the result indexes tables)
 inline float smoothstep(float e0, float e1, float x) {
     if (e1 == e0) return x < e0 ? 0.0f : 1.0f;
     float t = clamp01((x - e0) / (e1 - e0));
@@ -348,7 +348,8 @@ std::shared_ptr<const Lut3D> bakedInSpace(const ColorSpace& space, const std::st
 
 // A .cube or CLF file's transform on one colour; null (with the reason) when it cannot be read.
 std::function<void(float[3])> lutFileTransform(const std::string& path, std::string* error) {
-    if (QString::fromStdString(path).endsWith(QLatin1String(".clf"), Qt::CaseInsensitive)) {
+    const QString p = QString::fromStdString(path);
+    if (p.endsWith(QLatin1String(".clf"), Qt::CaseInsensitive) || p.endsWith(QLatin1String(".ctf"), Qt::CaseInsensitive)) {
         auto clf = loadClf(path, error);
         if (!clf) return nullptr;
         return [clf](float v[3]) { clf->apply(v); };
@@ -2746,6 +2747,50 @@ Image transitionMix(const std::string& type, const Effect& params, const Image& 
         }
     });
     return out;
+}
+
+const ColorSpace* sourceLookSpace(const Effect& e) {
+    if (e.type != "cdl" && e.type != "lut") return nullptr;
+    for (const auto& cs : colorSpaces())
+        if (cs.label == e.s("space")) return cs.sceneReferred ? &cs : nullptr;
+    return nullptr;
+}
+
+void applySourceLook(const Effect& e, FrameTime t, const ColorSpace& media, Image& img) {
+    const ColorSpace* space = sourceLookSpace(e);
+    if (!space) return;
+    std::function<void(float[3])> fn;
+    float strength = 1;
+    Cdl cdl;
+    if (e.type == "cdl") {
+        cdl = effectCdl(e, t);
+        if (cdl.identity()) return;
+        fn = [&cdl](float v[3]) { applyCdl(cdl, v[0], v[1], v[2]); };
+    } else {
+        if (e.s("path").empty()) return;
+        fn = lutFileTransform(e.s("path"), nullptr);
+        strength = float(e.p("strength", t, 100)) / 100.0f;
+        if (!fn || strength <= 0) return;
+    }
+    // Into the look's space and back exactly, by scene light (both are scene-referred, so nothing is clipped).
+    const bool same = space->id == media.id;
+    double to[9], from[9];
+    primariesMatrix(media.primaries, space->primaries, to);
+    primariesMatrix(space->primaries, media.primaries, from);
+    auto through = [](const double mat[9], Transfer a, Transfer b, float v[3]) {
+        double l[3];
+        for (int i = 0; i < 3; ++i) l[i] = toLinear(a, v[i]);
+        for (int i = 0; i < 3; ++i) v[i] = float(fromLinear(b, mat[i * 3] * l[0] + mat[i * 3 + 1] * l[1] + mat[i * 3 + 2] * l[2]));
+    };
+    perPixel(img, [&](float& r, float& g, float& b, float&) {
+        float v[3] = {r, g, b};
+        if (!same) through(to, media.transfer, space->transfer, v);
+        const float before[3] = {v[0], v[1], v[2]};
+        fn(v);
+        for (int i = 0; i < 3; ++i) v[i] = before[i] + (v[i] - before[i]) * strength;
+        if (!same) through(from, space->transfer, media.transfer, v);
+        r = v[0], g = v[1], b = v[2];
+    });
 }
 
 void applyAcesGamutCompress(const Effect& e, FrameTime t, const ColorSpace& space, Image& img) {

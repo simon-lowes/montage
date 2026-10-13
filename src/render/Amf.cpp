@@ -7,6 +7,7 @@
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QUrl>
 #include <QUuid>
 #include <QXmlStreamWriter>
 #include <algorithm>
@@ -58,7 +59,7 @@ QString idName(const std::string& id) {
 std::string absolute(const std::string& file, const std::string& folder) {
     if (file.empty() || folder.empty()) return file;
     QString f = QString::fromStdString(file);
-    if (f.startsWith(QLatin1String("file://"))) f = f.mid(7);
+    if (f.startsWith(QLatin1String("file:"))) f = QUrl(f).toLocalFile();  // (percent-encoded as URIs are)
     return QDir::cleanPath(QDir(QString::fromStdString(folder)).absoluteFilePath(f)).toStdString();
 }
 
@@ -208,7 +209,6 @@ std::string clfToAces(const std::string& spaceId) {
     const ColorSpace* cs = findColorSpace(spaceId);
     if (!cs) return {};
     std::string out;
-    char buf[160];
     out += "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
     out += "<ProcessList compCLFversion=\"3.0\" id=\"" + (kClfIdPrefix.toStdString() + spaceId + kClfIdSuffix.toStdString()) +
            "\" name=\"" + spaceId + " to ACES2065-1\">\n";
@@ -219,19 +219,16 @@ std::string clfToAces(const std::string& spaceId) {
     if (cs->transfer != Transfer::Linear) {
         const int n = 4096;
         out += "    <LUT1D inBitDepth=\"32f\" outBitDepth=\"32f\">\n        <Array dim=\"" + std::to_string(n) + " 1\">\n";
-        for (int i = 0; i < n; ++i) {
-            std::snprintf(buf, sizeof buf, "            %.9g\n", toLinear(cs->transfer, double(i) / (n - 1)));
-            out += buf;
-        }
+        for (int i = 0; i < n; ++i)
+            out += "            " + QByteArray::number(toLinear(cs->transfer, double(i) / (n - 1)), 'g', 9).toStdString() + "\n";
         out += "        </Array>\n    </LUT1D>\n";
     }
     double m[9];
     primariesMatrix(cs->primaries, Primaries::Ap0, m);
     out += "    <Matrix inBitDepth=\"32f\" outBitDepth=\"32f\">\n        <Array dim=\"3 3\">\n";
-    for (int r = 0; r < 3; ++r) {
-        std::snprintf(buf, sizeof buf, "            %.10f %.10f %.10f\n", m[r * 3], m[r * 3 + 1], m[r * 3 + 2]);
-        out += buf;
-    }
+    for (int r = 0; r < 3; ++r)
+        out += "            " + QByteArray::number(m[r * 3], 'f', 10).toStdString() + " " + QByteArray::number(m[r * 3 + 1], 'f', 10).toStdString() +
+               " " + QByteArray::number(m[r * 3 + 2], 'f', 10).toStdString() + "\n";
     out += "        </Array>\n    </Matrix>\n</ProcessList>\n";
     return out;
 }
@@ -300,8 +297,8 @@ bool parseAmf(const std::string& xml, const std::string& folder, AmfDocument& ou
                     if (f.open(QIODevice::ReadOnly)) cdls = parseCdlXml(f.readAll().toStdString());
                     const Cdl* found = matchCdl(cdls, {ref.attribute(QStringLiteral("ref")).toStdString()});
                     if (!found && cdls.size() == 1) found = &cdls.front();
-                    if (!found) return fail("The CDL " + ref.attribute(QStringLiteral("ref")).toStdString() + " is not in " + file);
-                    look.cdl = *found;
+                    if (found) look.cdl = *found;
+                    else look.unreadable = "its CDL " + ref.attribute(QStringLiteral("ref")).toStdString() + " is not in " + file;
                 } else {
                     if (!readTriple(sop, "Slope", look.cdl.slope) || !readTriple(sop, "Offset", look.cdl.offset) ||
                         !readTriple(sop, "Power", look.cdl.power))
@@ -322,7 +319,9 @@ bool parseAmf(const std::string& xml, const std::string& folder, AmfDocument& ou
                     look.kind = AmfLook::Kind::TransformId;
                     look.transformId = n.id;
                 } else {
-                    return fail("A look names no transform");
+                    look.kind = AmfLook::Kind::TransformId;
+                    look.transformId = text(e, "uuid");
+                    look.unreadable = look.transformId.empty() ? "it names no transform" : "it is named only by its uuid";
                 }
             }
             a.looks.push_back(look);
@@ -345,7 +344,9 @@ bool readAmf(const std::string& path, AmfDocument& out, std::string* error) {
         if (error) *error = "Cannot read " + path;
         return false;
     }
-    return parseAmf(f.readAll().toStdString(), QFileInfo(f).absolutePath().toStdString(), out, error);
+    if (!parseAmf(f.readAll().toStdString(), QFileInfo(f).absolutePath().toStdString(), out, error)) return false;
+    out.fileName = QFileInfo(f).fileName().toStdString();
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -476,8 +477,7 @@ std::vector<std::string> clipNames(const Project& p, const Clip& c) {
             if (parseImageSequencePath(path, seq)) names.push_back(QFileInfo(QString::fromStdString(seq.pattern)).fileName().toStdString());
             else names.push_back(QFileInfo(QString::fromStdString(path)).fileName().toStdString());
         }
-        for (const char* key : {"tape", "amf_name"})
-            if (auto it = m->metadata.find(key); it != m->metadata.end()) names.push_back(it->second);
+        if (auto it = m->metadata.find("tape"); it != m->metadata.end()) names.push_back(it->second);
     }
     return names;
 }
@@ -488,11 +488,18 @@ QString frameless(QString s) {
     return s.replace(number, QStringLiteral("#")).toLower();
 }
 
-bool matches(const AmfDocument& a, const Project& p, const Clip& c) {
-    const MediaItem* m = p.findMedia(c.mediaId);
-    if (!a.clipUuid.empty() && m)
-        if (auto it = m->metadata.find("amf_uuid"); it != m->metadata.end() && QString::fromStdString(it->second).compare(QString::fromStdString(a.clipUuid), Qt::CaseInsensitive) == 0)
-            return true;
+}  // namespace
+
+bool amfMatchesClip(const AmfDocument& a, const Project& p, const Clip& c) {
+    // The media names this AMF (an ALE's AMF_UUID, its amfInfo uuid; AMF_NAME, its file name).
+    if (const MediaItem* m = p.findMedia(c.mediaId)) {
+        auto same = [&](const char* key, const std::string& v) {
+            const auto it = m->metadata.find(key);
+            return !v.empty() && it != m->metadata.end() &&
+                   QString::fromStdString(it->second).trimmed().compare(QString::fromStdString(v), Qt::CaseInsensitive) == 0;
+        };
+        if (same("amf_uuid", a.uuid) || same("amf_name", a.fileName)) return true;
+    }
     const std::vector<std::string> names = clipNames(p, c);
     for (const std::string& want : {a.clipName, a.clipFile, a.clipSequence}) {
         if (want.empty()) continue;
@@ -506,6 +513,8 @@ bool matches(const AmfDocument& a, const Project& p, const Clip& c) {
     }
     return false;
 }
+
+namespace {
 
 void note(std::vector<std::string>& notes, const std::string& n) {
     if (std::find(notes.begin(), notes.end(), n) == notes.end()) notes.push_back(n);
@@ -525,7 +534,7 @@ AmfImportResult applyAmf(Project& p, Sequence& seq, const std::vector<Id>& clips
     for (Track& t : seq.videoTracks)
         for (Clip& c : t.clips) {
             if (c.isGenerator() || !c.mediaId) continue;
-            const bool chosen = clips.empty() ? matches(amf, p, c) : std::find(clips.begin(), clips.end(), c.id) != clips.end();
+            const bool chosen = clips.empty() ? amfMatchesClip(amf, p, c) : std::find(clips.begin(), clips.end(), c.id) != clips.end();
             if (chosen) targets.push_back(&c);
         }
     if (targets.empty()) {
@@ -533,9 +542,16 @@ AmfImportResult applyAmf(Project& p, Sequence& seq, const std::vector<Id>& clips
                                     : std::string("Select clips of footage"));
         return r;
     }
-    // The input transform: the space the media is read as (already in ACES when it was applied).
+    // The input transform: the space the media is read as (already in ACES when it was applied). When the output
+    // transform was applied too, the pictures are made for that display (dailies), with every look in them.
     std::string inputSpace;
-    if (amf.hasInput) {
+    const bool rendered = amf.hasOutput && amf.outputApplied;
+    if (rendered) {
+        inputSpace = amf.outputSpace;
+        if (inputSpace.empty())
+            note(r.notes, "Its pictures went through the output transform " + idName(amf.outputTransformId).toStdString() +
+                              ", for a display Montage does not have; the media is read as before");
+    } else if (amf.hasInput) {
         inputSpace = amf.inputApplied ? std::string("aces2065-1") : amf.inputSpace;
         bool exact = true;
         if (!amf.inputApplied && !amf.inputTransformId.empty()) acesInputSpace(amf.inputTransformId, &exact);
@@ -546,7 +562,12 @@ AmfImportResult applyAmf(Project& p, Sequence& seq, const std::vector<Id>& clips
     // The looks not yet in the pictures, as effects.
     std::vector<Effect> looks;
     for (const AmfLook& l : amf.looks) {
-        if (l.applied) continue;
+        if (l.applied || rendered) continue;
+        if (!l.unreadable.empty()) {
+            note(r.notes, "The look " + (l.description.empty() ? std::string("named ") + l.transformId : "\"" + l.description + "\"") +
+                              " was left out: " + l.unreadable);
+            continue;
+        }
         Effect e;
         if (l.kind == AmfLook::Kind::Cdl) {
             e = makeEffect(p, "cdl");
@@ -603,8 +624,9 @@ AmfImportResult applyAmf(Project& p, Sequence& seq, const std::vector<Id>& clips
     for (MediaItem& m : p.media) {
         if (!media.count(m.id)) continue;
         if (!inputSpace.empty()) m.colorOverride = inputSpace == m.colorSpace ? std::string() : inputSpace;
-        if (!amf.clipName.empty()) m.metadata["amf_name"] = amf.clipName;
-        if (!amf.clipUuid.empty()) m.metadata["amf_uuid"] = amf.clipUuid;
+        // (as an ALE would name the AMF)
+        if (!amf.fileName.empty()) m.metadata["amf_name"] = amf.fileName;
+        if (!amf.uuid.empty()) m.metadata["amf_uuid"] = amf.uuid;
     }
     if (amf.hasOutput) {
         if (amf.outputSpace.empty()) {
@@ -639,28 +661,23 @@ bool clipAmf(const Project& p, const Sequence& seq, const Clip& clip, const std:
     };
     AmfDocument a;
     a.description = clip.name.empty() ? m->name : clip.name;
-    if (auto it = m->metadata.find("amf_uuid"); it != m->metadata.end()) a.clipUuid = it->second;
-    const auto named = m->metadata.find("amf_name");
-    a.clipName = named != m->metadata.end() ? named->second : withoutMediaExtension(m->name.empty() ? clip.name : m->name);
+    a.clipName = withoutMediaExtension(m->name.empty() ? clip.name : m->name);
     const std::string path = uninterpretedPath(m->path);
     ImageSequence frames;
     if (parseImageSequencePath(path, frames)) {
-        a.clipSequence = frameless(QFileInfo(QString::fromStdString(frames.pattern)).fileName()).toStdString();
-        // (the number as wide as it is written: "#" for each digit)
-        static const QRegularExpression width(QStringLiteral("%0(\\d+)d"));
-        const auto w = width.match(QString::fromStdString(frames.pattern));
-        if (w.hasMatch()) {
-            QString pat = QFileInfo(QString::fromStdString(frames.pattern)).fileName();
-            pat.replace(width, QString(w.captured(1).toInt(), QLatin1Char('#')));
-            a.clipSequence = pat.toStdString();
-        }
+        // The number as wide as it is written, a '#' a digit (one for an unpadded number).
+        static const QRegularExpression width(QStringLiteral("%0?(\\d*)d"));
+        QString pat = QFileInfo(QString::fromStdString(frames.pattern)).fileName();
+        const auto w = width.match(pat);
+        if (w.hasMatch()) pat.replace(w.capturedStart(), w.capturedLength(), QString(std::max(1, w.captured(1).toInt()), QLatin1Char('#')));
+        a.clipSequence = pat.toStdString();
         a.sequenceMin = frames.first;
         a.sequenceMax = frames.last;
     } else if (!path.empty()) {
         a.clipFile = QFileInfo(QString::fromStdString(path)).fileName().toStdString();
     }
     // The input transform: the pictures' space into ACES.
-    const std::string space = !pictureSpace.empty() ? pictureSpace : !m->colorOverride.empty() ? m->colorOverride : m->colorSpace.empty() ? "rec709" : m->colorSpace;
+    const std::string space = !pictureSpace.empty() ? pictureSpace : mediaColorSpace(*m).id;
     const ColorSpace* cs = findColorSpace(space);
     if (cs && cs->id != "aces2065-1") {
         a.hasInput = true;
@@ -700,19 +717,41 @@ bool clipAmf(const Project& p, const Sequence& seq, const Clip& clip, const std:
                 continue;
             }
             l.kind = AmfLook::Kind::File;
-            // Beside the AMF, so the two travel together.
+            // Beside the AMF, so the two travel together: under its own name, or numbered when another file has it.
             const QFileInfo src(QString::fromStdString(file));
-            const QString there = dir.filePath(src.fileName());
-            if (QFileInfo(there).absoluteFilePath() != src.absoluteFilePath()) {
-                QFile::remove(there);
-                if (!QFile::copy(src.absoluteFilePath(), there)) note(said, "Cannot copy " + file + " beside the AMF");
+            QFile lutFile(src.absoluteFilePath());
+            if (!lutFile.open(QIODevice::ReadOnly)) {
+                note(said, "Cannot read the LUT " + file + "; it was left out");
+                continue;
             }
-            l.file = src.fileName().toStdString();
+            const QByteArray bytes = lutFile.readAll();
+            QString name = src.fileName();
+            for (int n = 2;; ++n) {
+                const QFileInfo there(dir.filePath(name));
+                if (!there.exists()) break;
+                if (there.canonicalFilePath() == src.canonicalFilePath()) break;  // (it is there already)
+                QFile have(there.absoluteFilePath());
+                if (have.open(QIODevice::ReadOnly) && have.readAll() == bytes) break;
+                name = src.completeBaseName() + QStringLiteral("_%1.").arg(n) + src.suffix();
+            }
+            const QFileInfo there(dir.filePath(name));
+            if (!there.exists()) {
+                QSaveFile out(there.absoluteFilePath());
+                if (!out.open(QIODevice::WriteOnly) || out.write(bytes) != bytes.size() || !out.commit()) {
+                    note(said, "Cannot copy " + file + " beside the AMF; it was left out");
+                    continue;
+                }
+            }
+            l.file = name.toStdString();
             l.description = !e.s("description").empty() ? e.s("description") : src.completeBaseName().toStdString();
         } else if (e.type == "aces_gamut_compress") {
+            if (e.p("direction", 0) >= 0.5) {
+                note(said, "The inverse gamut compression has no AMF look id; it was left out");
+                continue;
+            }
             l.kind = AmfLook::Kind::TransformId;
             l.description = "ACES Reference Gamut Compression";
-            l.transformId = kIdPrefix + (e.p("direction", 0) >= 0.5 ? "Inv" : "") + kGamutCompress;
+            l.transformId = kIdPrefix + kGamutCompress;
         } else {
             const EffectInfo* info = findEffectInfo(e.type);
             if (info && info->group == "Color" && info->category == EffectCategory::VideoFilter)

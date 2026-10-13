@@ -9,6 +9,7 @@
 #include <cstdio>
 
 #include "Amf.h"
+#include "ColorSpace.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 
@@ -124,10 +125,12 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
         if (!exportSequence(p, alone, st, prog, cancel, &why)) return fail(name + ": " + why);
         if (o.amf) {
             // The frames' space as the input transform and the cut's grade as looks, for the frames by their numbers.
-            const std::string space = !st.colorSpace.empty() ? st.colorSpace
-                                      : o.format == "exr"    ? std::string("linear-rec709")
-                                      : !m.colorOverride.empty() ? m.colorOverride
-                                                                 : m.colorSpace;
+            // (as the exporter chooses it: EXR any space asked for, else linear Rec.709; DPX the space asked for or the
+            // footage's; TIFF a display space asked for, else the sequence's)
+            const ColorSpace* chosen = findColorSpace(st.colorSpace);
+            const std::string space = o.format == "exr"                                     ? (chosen ? chosen->id : std::string("linear-rec709"))
+                                      : chosen && (o.format == "dpx" || !chosen->sceneReferred) ? chosen->id
+                                                                                               : sequenceColorSpace(alone).id;
             AmfDocument amf;
             if (!clipAmf(p, seq, c, shot.folder, amf, nullptr, space, &why)) return fail(name + ": " + why);
             amf.clipName = name;

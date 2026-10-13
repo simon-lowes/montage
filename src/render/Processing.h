@@ -83,6 +83,11 @@ struct ColorSpace;
 void applyCdlValues(const Effect& e, FrameTime t, Image& img);
 // The ACES gamut compression effect on pixels in `space` (the compositor's on the media as it comes, in the media's space).
 void applyAcesGamutCompress(const Effect& e, FrameTime t, const ColorSpace& space, Image& img);
+// A CDL or LUT made on the camera's picture: its Apply In a scene-referred space (a camera log, ACEScct, ACES2065-1);
+// null for any other effect. The compositor runs those first in a clip's chain on the media as it comes, in that space,
+// before the input transform renders it for display (as an AMF's looks are).
+const ColorSpace* sourceLookSpace(const Effect& e);
+void applySourceLook(const Effect& e, FrameTime t, const ColorSpace& media, Image& img);
 const ColorSpace& currentWorkingSpace();
 class WorkingSpaceScope {
 public:

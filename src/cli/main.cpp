@@ -1,4 +1,5 @@
 // montage-cli — headless rendering, probing and project assembly.
+#include <clocale>
 #include <QDateTime>
 #include <QFileInfo>
 #include <QJsonArray>
@@ -1613,6 +1614,8 @@ int cmdPresets() {
 int main(int argc, char** argv) {
     if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM")) qputenv("QT_QPA_PLATFORM", "offscreen");
     QGuiApplication app(argc, argv);  // fonts for title rendering
+    // (Qt takes the C library's locale from the environment; numbers in files must not follow it, as in the app.)
+    std::setlocale(LC_NUMERIC, "C");
     initInference();  // (the provider libraries and Tools › AI Models Run On, as the app has them)
     std::vector<std::string> args(argv + 1, argv + argc);
     if (args.empty()) return usage();

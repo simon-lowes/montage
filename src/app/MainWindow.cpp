@@ -3725,9 +3725,14 @@ int MainWindow::importAmf(const QString& path, int setSpace) {
         state_->message(QString::fromStdString(err), 6000);
         return 0;
     }
-    std::vector<Id> clips;
+    // The selected clips (those the AMF names, when it names some of them), else the clips it names.
+    std::vector<Id> clips, named;
     for (Id id : state_->selectedClips())
-        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Video) clips.push_back(id);
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Video) {
+            clips.push_back(id);
+            if (amfMatchesClip(amf, state_->project(), *edit::clipById(*s, id))) named.push_back(id);
+        }
+    if (!named.empty()) clips = named;
     AmfImportOptions o;
     if (!amf.outputSpace.empty() && (amf.outputSpace != s->colorSpace || (findColorSpace(amf.outputSpace)->hdr() && amf.outputPeakNits != s->hdrPeakNits))) {
         if (setSpace < 0) {
@@ -3767,9 +3772,10 @@ int MainWindow::exportAmf(const QString& target) {
         QString path = target;
         if (clips.size() > 1) {
             // One per clip in the folder, named after it.
-            QString name = QString::fromStdString(c->name).replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9_.-]+")), QStringLiteral("_"));
-            if (name.isEmpty()) name = QStringLiteral("clip");
-            for (int n = 2; used.count(name); ++n) name = QString::fromStdString(c->name) + QStringLiteral("_%1").arg(n);
+            QString base = QString::fromStdString(c->name).replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9_.-]+")), QStringLiteral("_"));
+            if (base.isEmpty() || base.startsWith(QLatin1Char('.'))) base = QStringLiteral("clip") + base;
+            QString name = base;
+            for (int n = 2; used.count(name); ++n) name = base + QStringLiteral("_%1").arg(n);
             used.insert(name);
             path = QDir(target).filePath(name + QStringLiteral(".amf"));
         }

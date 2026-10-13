@@ -328,7 +328,8 @@ private slots:
         QVERIFY(std::find_if(r.notes.begin(), r.notes.end(), [](const std::string& n) { return n.find("Bleach") != std::string::npos; }) != r.notes.end());
         const Clip* cam = edit::clipById(s, camera);
         QCOMPARE(p.findMedia(cam->mediaId)->colorOverride, std::string("logc3-awg3"));
-        QCOMPARE(p.findMedia(cam->mediaId)->metadata.at("amf_name"), std::string("A001C012"));
+        QCOMPARE(p.findMedia(cam->mediaId)->metadata.at("amf_name"), std::string("A001C012.amf"));  // (as an ALE names it)
+        QCOMPARE(p.findMedia(cam->mediaId)->metadata.at("amf_uuid"), std::string("urn:uuid:0d6f5a8e-3b6c-4c55-9a51-7f0d2b1c9e01"));
         QCOMPARE(cam->effects.size(), size_t(3));  // the CDL, the look and the gamut compression (not the applied one)
         QCOMPARE(cam->effects[0].type, std::string("cdl"));
         QCOMPARE(cam->effects[0].s("space"), std::string("ACEScct"));
@@ -351,6 +352,10 @@ private slots:
         named.clipName = "nothing here";
         named.clipFile.clear();
         QCOMPARE(applyAmf(p, s, {}, named).clips, 0);
+        // ... unless an ALE named the AMF for the media.
+        p.findMedia(edit::clipById(s, interview)->mediaId)->metadata["amf_uuid"] = named.uuid;
+        QVERIFY(amfMatchesClip(named, p, *edit::clipById(s, interview)));
+        p.findMedia(edit::clipById(s, interview)->mediaId)->metadata.erase("amf_uuid");
         AmfImportOptions o;
         o.setSequenceSpace = true;
         QCOMPARE(applyAmf(p, s, {interview}, named, o).clips, 1);
@@ -376,6 +381,23 @@ private slots:
         QCOMPARE(back.looks[1].file, dir.path().toStdString() + "/show_look.clf");
         QVERIFY(QFileInfo::exists(QString::fromStdString(back.looks[1].file)));
         QCOMPARE(back.looks[2].transformId, std::string("urn:ampas:aces:transformId:v2.0:Look.Academy.ReferenceGamutCompress.a2.v1"));
+        // Again into the same folder, its look found there already, not copied over itself; another LUT of the same
+        // name numbered beside it; the inverse gamut compression (no AMF id) left out.
+        QVERIFY(writeClipAmf(p, s, *edit::clipById(s, camera), camPath, &notes, {}, &err));
+        QVERIFY(readAmf(camPath, back) && back.looks[1].file == dir.path().toStdString() + "/show_look.clf");
+        QTemporaryDir other;
+        QFile odd(other.path() + "/show_look.clf");
+        QVERIFY(odd.open(QIODevice::WriteOnly) && odd.write(QByteArray::fromStdString(clfToAces("acescct"))) > 0);
+        odd.close();
+        Clip second = *edit::clipById(s, camera);
+        second.effects[1].strings["path"] = odd.fileName().toStdString();
+        second.effects[2].params["direction"] = Param(1.0);
+        QVERIFY(writeClipAmf(p, s, second, dir.path().toStdString() + "/second.amf", &notes, {}, &err));
+        QVERIFY(readAmf(dir.path().toStdString() + "/second.amf", back));
+        QCOMPARE(back.looks.size(), size_t(2));
+        QCOMPARE(back.looks[1].file, dir.path().toStdString() + "/show_look_2.clf");
+        QVERIFY(std::find_if(notes.begin(), notes.end(), [](const std::string& n) { return n.find("inverse gamut") != std::string::npos; }) != notes.end());
+        QVERIFY(QFileInfo::exists(QString::fromStdString(data + "/show_look.clf")));
         QCOMPARE(back.outputSpace, std::string("rec2100pq"));
         QCOMPARE(back.outputPeakNits, 1000.0);
         Clip& iv = *edit::clipById(s, interview);
@@ -427,7 +449,7 @@ private slots:
         for (float r : {-0.1f, 0.0f, 0.18f, 0.37f, 0.5f, 0.73f, 1.0f, 1.2f})
             for (float g : {0.0f, 0.05f, 0.42f, 0.9f, 1.0f})
                 for (float b : {-0.02f, 0.11f, 0.6f, 0.95f}) colours.insert(colours.end(), {r, g, b});
-        for (const char* name : {"operators.clf", "lut3d_tetrahedral.clf", "lut3d_trilinear.clf"}) {
+        for (const char* name : {"operators.clf", "more_operators.clf", "lut3d_tetrahedral.clf", "lut3d_trilinear.clf"}) {
             const std::string path = std::string(MONTAGE_TEST_DATA_DIR) + "/clf/" + name;
             std::string error;
             auto clf = loadClf(path, &error);
@@ -480,10 +502,31 @@ private slots:
         QVERIFY(why.find("Half") != std::string::npos);
         QVERIFY(!parseClf("<ProcessList><LUT3D><Array dim=\"2 2 2 3\">0 1</Array></LUT3D></ProcessList>", &why));
         QVERIFY(why.find("size") != std::string::npos);
+        QVERIFY(!parseClf("<ProcessList><LUT1D rawHalfs=\"true\"><Array dim=\"2 1\">0 1</Array></LUT1D></ProcessList>", &why));
+        QVERIFY(!parseClf("<ProcessList><LUT3D><Array dim=\"4194304 4194304 4194304 3\"></Array></LUT3D></ProcessList>", &why));
+        QVERIFY(why.find("size") != std::string::npos);  // (not an allocation that overflows)
         QVERIFY(!parseClf("<ProcessList><Gamut /></ProcessList>", &why));
         QVERIFY(why.find("Gamut") != std::string::npos);
         QVERIFY(!parseClf("<Something />", &why));
         QVERIFY(!parseClf("not xml", &why));
+        // Not-a-number in (from an EXR, or an earlier operator) comes out as a number, not a read outside a table.
+        for (const char* name : {"lut3d_tetrahedral.clf", "operators.clf"}) {
+            float nan[3] = {std::nanf(""), 0.5f, std::nanf("")};
+            loadClf(std::string(MONTAGE_TEST_DATA_DIR) + "/clf/" + name)->apply(nan);
+            QVERIFY(std::isfinite(nan[1]));
+        }
+        // A .ctf (Autodesk's CLF) as a LUT effect's file.
+        QTemporaryDir dir;
+        const QString ctf = dir.path() + "/look.ctf";
+        QVERIFY(QFile::copy(QString::fromStdString(ops), ctf));
+        e = makeEffect(p, "lut");
+        e.strings["path"] = ctf.toStdString();
+        img = solid(2, 2, in[0], in[1], in[2]);
+        applyVideoEffect(e, 0, img, 1);
+        float again[3] = {in[0], in[1], in[2]};
+        clf->apply(again);
+        rgb(img, 0, 0, c);
+        for (int i = 0; i < 3; ++i) QVERIFY(std::fabs(c[i] - again[i]) < 1e-5);
     }
 
     void colorSliceAndTexture() {

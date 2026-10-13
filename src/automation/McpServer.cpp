@@ -8241,8 +8241,15 @@ void McpServer::Impl::addTools() {
             if (chosen.empty()) throw ArgError{QStringLiteral("Give the clips to write ACES Metadata Files for")};
             QJsonArray files;
             std::vector<std::string> notes;
+            std::set<QString> used;
             for (const Clip* c : chosen) {
-                const QString file = chosen.size() == 1 ? path : QDir(path).filePath(QStringLiteral("%1_%2.amf").arg(QString::fromStdString(c->name).replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9_.-]+")), QStringLiteral("_"))).arg(qulonglong(c->id)));
+                // One per clip, named after it as the app names them (numbered when two share a name).
+                QString base = QString::fromStdString(c->name).replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9_.-]+")), QStringLiteral("_"));
+                if (base.isEmpty() || base.startsWith('.')) base = "clip" + base;
+                QString name = base;
+                for (int n = 2; used.count(name); ++n) name = base + QStringLiteral("_%1").arg(n);
+                used.insert(name);
+                const QString file = chosen.size() == 1 ? path : QDir(path).filePath(name + ".amf");
                 std::vector<std::string> said;
                 std::string err;
                 if (!writeClipAmf(l.project, s, *c, file.toStdString(), &said, {}, &err)) return fail(QString::fromStdString(err));

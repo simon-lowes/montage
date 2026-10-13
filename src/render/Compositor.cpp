@@ -754,6 +754,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     Image src;
     const Effect* sourceCdl = nullptr;  // a CDL applied in the media's own space, before the input transform
     const Effect* sourceRgc = nullptr;  // the ACES gamut compression, likewise
+    std::vector<const Effect*> sourceLooks;  // CDLs and LUTs made on the camera's picture (an AMF's looks), likewise
     double mw = SW, mh = SH;
     Geometry g;
     double sourceSeconds = -1;  // media time of the frame, for effects that follow the footage
@@ -997,6 +998,27 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (vr)
                 src = reframeEquirect(src, vr->p("yaw", lt, 0), vr->p("pitch", lt, 0), vr->p("roll", lt, 0), vrFov, vrView, viewW, viewH,
                                       projectionSpan(m->projection));
+            const ColorSpace& from = original ? mediaColorSpace(*m) : pictureColorSpace(*m, path);
+            // Camera footage: the looks first in its chain made on the camera's picture (CDLs and LUTs applied in a
+            // scene-referred space, the ACES gamut compression), in their order, on the picture as it comes and before
+            // the input transform's display rendering, as an AMF's pipeline runs them.
+            if (from.sceneReferred)
+                for (const Effect& e : c.effects) {
+                    if (!e.enabled || e.type == "video_denoise" || e.type == "super_scale" || e.type == "motion_deblur" ||
+                        e.type == "reframe_360" || e.type == "redact_faces" || e.type == "stereo_3d")
+                        continue;  // (off, or run at the source already)
+                    if (e.node != 0 || hasMask(e, lt)) break;
+                    if (e.type == "aces_gamut_compress" && !sourceRgc) {
+                        applyAcesGamutCompress(e, lt, from, src);
+                        sourceRgc = &e;
+                    } else if (sourceLookSpace(e)) {
+                        applySourceLook(e, lt, from, src);
+                        if (!sourceCdl && e.type == "cdl" && e.s("space") == mediaColorSpace(*m).label) sourceCdl = &e;
+                    } else {
+                        break;
+                    }
+                    sourceLooks.push_back(&e);
+                }
             // A CDL made in the media's own space (an on-set grade on camera log) grades the picture as it comes, before the
             // input transform's display rendering.
             for (const Effect& e : c.effects)
@@ -1006,7 +1028,6 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 }
             // The ACES gamut compression too: on the colours the camera saw, before the input transform clips what is outside
             // the working gamut (and as it comes after the camera's own transform in ACES, in AP1).
-            const ColorSpace& from = original ? mediaColorSpace(*m) : pictureColorSpace(*m, path);
             for (const Effect& e : c.effects)
                 if (!sourceRgc && e.enabled && e.type == "aces_gamut_compress" && !hasMask(e, lt)) {
                     sourceRgc = &e;
@@ -1051,7 +1072,8 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         if (e->type == "redact_faces") applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
     auto ranAlready = [&](const Effect& e) {
         return e.type == "video_denoise" || e.type == "super_scale" || e.type == "motion_deblur" || e.type == "reframe_360" || e.type == "redact_faces" ||
-               e.type == "stereo_3d" || &e == sourceCdl || &e == sourceRgc;  // those ran already (Stereo 3D is placed below)
+               e.type == "stereo_3d" || &e == sourceCdl || &e == sourceRgc ||
+               std::find(sourceLooks.begin(), sourceLooks.end(), &e) != sourceLooks.end();  // those ran already (Stereo 3D is placed below)
     };
     // A node graph (core/GradeGraph.h) runs where its first node's effect is in the stack (or after the clip's own
     // effects); the effects in its nodes, and its shared nodes', run in it.
