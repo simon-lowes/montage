@@ -46,10 +46,10 @@ jobs:
       - name: Install dependencies
         # Only the Qt modules Montage uses; the "qt" formula installs all of Qt.
         # FFmpeg itself is built below, from the libraries it uses.
-        run: brew install qtbase qtmultimedia opencolorio lilv libraw openjpeg libmysofa onnxruntime ninja pkgconf x264 x265 libvpx svt-av1 dav1d opus srt librist
+        run: brew install qtbase qtmultimedia opencolorio lilv libraw openjpeg libmysofa onnxruntime ninja pkgconf x264 x265 libvpx svt-av1 dav1d opus lame srt librist
       - name: FFmpeg's libraries (part of its cache key)
         id: ffdeps
-        run: echo "versions=$(brew list --versions x264 x265 libvpx svt-av1 dav1d opus openjpeg srt librist | shasum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+        run: echo "versions=$(brew list --versions x264 x265 libvpx svt-av1 dav1d opus lame openjpeg srt librist | shasum | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - name: Cache FFmpeg
         uses: actions/cache@v4
         with:
@@ -143,16 +143,16 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          install: zip curl jq make diffutils
+          install: zip curl jq make diffutils git
           # FFmpeg itself is built below, from the libraries it uses (Qt Multimedia still pulls in MSYS2's, which
           # this build replaces).
           pacboy: >-
             gcc:p cmake:p ninja:p pkgconf:p nasm:p
             qt6-base:p qt6-multimedia:p qt6-tools:p opencolorio:p lilv:p libraw:p openjpeg2:p libmysofa:p onnxruntime:p rust:p
-            x264:p x265:p libvpx:p svt-av1:p dav1d:p opus:p srt:p librist:p amf-headers:p ffnvcodec-headers:p libvpl:p
+            x264:p x265:p libvpx:p svt-av1:p dav1d:p opus:p lame:p srt:p librist:p amf-headers:p ffnvcodec-headers:p libvpl:p
       - name: FFmpeg's libraries (part of its cache key)
         id: ffdeps
-        run: echo "versions=$(pacman -Q $(printf 'mingw-w64-ucrt-x86_64-%s ' x264 x265 libvpx svt-av1 dav1d opus openjpeg2 srt librist amf-headers ffnvcodec-headers libvpl) | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+        run: echo "versions=$(pacman -Q $(printf 'mingw-w64-ucrt-x86_64-%s ' x264 x265 libvpx svt-av1 dav1d opus lame openjpeg2 srt librist amf-headers ffnvcodec-headers libvpl) | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - name: Cache FFmpeg
         uses: actions/cache@v4
         with:
@@ -163,7 +163,15 @@ jobs:
         run: |
           stage="$(cygpath -u "$RUNNER_TEMP")/ffmpeg-stage"
           scripts/build-ffmpeg.sh /ucrt64 "$stage"
-          pacman -Rdd --noconfirm mingw-w64-ucrt-x86_64-ffmpeg || true
+          # Qt Multimedia's FFmpeg plugin is built against MSYS2's FFmpeg, so it only loads this build while both
+          # are the same release.
+          want=$(sed -n 's/^VERSION=//p' scripts/build-ffmpeg.sh)
+          have=$(pacman -Q mingw-w64-ucrt-x86_64-ffmpeg | cut -d' ' -f2)
+          case "$have" in
+            "$want"-*) ;;
+            *) echo "MSYS2 has FFmpeg $have but scripts/build-ffmpeg.sh builds $want: update VERSION and SHA256 there" >&2; exit 1 ;;
+          esac
+          pacman -Rdd --noconfirm mingw-w64-ucrt-x86_64-ffmpeg
           cp -R "$stage/ucrt64/." /ucrt64/
       - name: Rust version (part of the C2PA library's cache key)
         id: rust

@@ -86,13 +86,19 @@ for fv in $formulae; do
   } >> "$index"
   if [ -n "$SOURCES" ]; then
     brew fetch --build-from-source --retry "$f" > /dev/null
-    cp "$(brew --cache --build-from-source "$f")" "$SOURCES/"
+    # The source archives, resources and patches it fetches are copied below, from Homebrew's downloads; a formula
+    # whose source is a git or svn checkout (x264's) is cached as a directory instead.
+    c=$(brew --cache --build-from-source "$f")
+    [ ! -d "$c" ] || tar -C "$(dirname "$c")" -czf "$SOURCES/$f-${fv#*/}.tar.gz" "$(basename "$c")"
     brew cat "$f" > "$SOURCES/$f.rb"
   fi
 done
+if [ -n "$SOURCES" ]; then
+  find "$(brew --cache)/downloads" -maxdepth 1 -type f ! -name '*bottle*' ! -name '*.incomplete' -exec cp {} "$SOURCES/" \;
+fi
 
-# Every library the bundle loads must be inside it: nothing from Homebrew (or
-# the app only works on this machine) and no bundle-relative path that is
+# Every library the bundle loads must be inside it: nothing from Homebrew or
+# the FFmpeg build (or the app only works on this machine) and no bundle-relative path that is
 # missing. (A library's own install name is listed too but is not loaded.)
 # (A function: macOS's bash 3.2 cannot parse a case statement inside $(...).)
 unresolved_libraries() {
@@ -101,7 +107,8 @@ unresolved_libraries() {
     otool -L "$f" 2>/dev/null | sed 1d | awk '{print $1}' | while read -r dep; do
       [ "$dep" = "$id" ] && continue
       case "$dep" in
-        /opt/homebrew/* | /usr/local/*) echo "$f -> $dep (outside the bundle)"; continue ;;
+        /usr/lib/* | /System/*) continue ;;
+        /*) echo "$f -> $dep (outside the bundle)"; continue ;;
         @executable_path/*) p="$APP/Contents/MacOS/${dep#@executable_path/}" ;;
         @loader_path/*) p="$(dirname "$f")/${dep#@loader_path/}" ;;
         @rpath/*) p="$APP/Contents/Frameworks/${dep#@rpath/}" ;;

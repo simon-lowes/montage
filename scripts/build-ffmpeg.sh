@@ -10,8 +10,8 @@
 # as it is. Also installs, under <prefix>/share/montage-ffmpeg, FFmpeg's licence files, its configure line and the
 # source tarball, which packaging copies into the licences folder and the release's sources.
 #
-# Needs the external libraries below (Homebrew: x264 x265 libvpx svt-av1 dav1d opus openjpeg srt librist nasm;
-# MSYS2 UCRT64: x264 x265 libvpx svt-av1 dav1d opus openjpeg2 srt librist nasm amf-headers ffnvcodec-headers libvpl).
+# Needs the external libraries below (Homebrew: x264 x265 libvpx svt-av1 dav1d opus lame openjpeg srt librist nasm;
+# MSYS2 UCRT64: x264 x265 libvpx svt-av1 dav1d opus lame openjpeg2 srt librist nasm amf-headers ffnvcodec-headers libvpl).
 #
 # The build is GPL-2.0-or-later (--enable-gpl, for x264 and x265) and never --enable-nonfree. Encoders Montage does
 # not offer for Dolby and DTS formats are left out.
@@ -26,8 +26,8 @@ FLAGS=(
   --enable-shared --disable-static --disable-doc --disable-debug --disable-ffplay
   --enable-gpl
   --enable-libx264 --enable-libx265 --enable-libvpx --enable-libsvtav1 --enable-libdav1d --enable-libopus
-  --enable-libopenjpeg --enable-libsrt --enable-librist
-  --disable-encoder=ac3,ac3_fixed,eac3,dca,truehd,mlp
+  --enable-libmp3lame --enable-libopenjpeg --enable-libsrt --enable-librist
+  --disable-encoder=ac3,ac3_fixed,ac3_mf,eac3,dca,truehd,mlp
 )
 case "$(uname -s)" in
   MINGW* | MSYS*) FLAGS+=(--enable-amf --enable-nvenc --enable-libvpl) ;;
@@ -59,6 +59,8 @@ make -C "$tmp/ffmpeg-$VERSION" install DESTDIR="$STAGE" > /dev/null
 mkdir -p "$STAGE$SHARE"
 for f in LICENSE.md COPYING.GPLv2 COPYING.GPLv3 COPYING.LGPLv2.1 COPYING.LGPLv3; do cp "$tmp/ffmpeg-$VERSION/$f" "$STAGE$SHARE/"; done
 cp "$tmp/$tarball" "$STAGE$SHARE/"
-"$STAGE$PREFIX/bin/ffmpeg" -hide_banner -buildconf > "$STAGE$SHARE/buildconf.txt" 2> /dev/null || true
+# The staged program finds the staged libraries only by these paths (its install names point at <prefix>).
+DYLD_LIBRARY_PATH="$STAGE$PREFIX/lib" LD_LIBRARY_PATH="$STAGE$PREFIX/lib" PATH="$STAGE$PREFIX/bin:$PATH" \
+  "$STAGE$PREFIX/bin/ffmpeg" -hide_banner -buildconf > "$STAGE$SHARE/buildconf.txt" 2> /dev/null || true
 echo "FFmpeg $VERSION: $CONFIGURE" > "$STAGE$SHARE/configure.txt"
 echo "FFmpeg $VERSION built and staged in $STAGE$PREFIX"

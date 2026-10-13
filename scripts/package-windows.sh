@@ -46,6 +46,16 @@ for _ in 1 2 3 4; do
   if [ "$(find "$OUT" -name '*.dll' | wc -l)" -eq "$before" ]; then break; fi
 done
 
+# An FFmpeg DLL that nothing provides means a Qt plugin was built against another FFmpeg than the bundled one
+# (the workflow checks MSYS2's is the same release), and the plugin would not load.
+missing=$(find "$OUT" \( -name '*.exe' -o -name '*.dll' \) -print0 | xargs -0 -n1 ldd 2>/dev/null |
+  awk '/not found/ {print $1}' | sort -u || true)
+if echo "$missing" | grep -Eqi '^(av|sw|postproc)'; then
+  echo "Bundled files need FFmpeg libraries that are not there: $missing" >&2
+  exit 1
+fi
+[ -z "$missing" ] || echo "Note: libraries not found (not FFmpeg's): $missing"
+
 cp README.md LICENSE "$OUT/"
 
 # The licences folder (Help › Licences…): Montage's and its compiled-in parts' (package-licences.sh), then each

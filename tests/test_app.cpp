@@ -9755,9 +9755,11 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(job.settings.width, 1920);
         queue->remove(job.id);
         // A preset remembered under its old name, with its maker's name in front, comes back under its new one.
+        const QVariant remembered = appSettings().value("export/preset");
         appSettings().setValue("export/preset", "Avid DNxHR HQ (MXF)");
-        ExportDialog again(state(), win_.get());
-        QCOMPARE(again.findChild<QComboBox*>("exportPreset")->currentText(), QStringLiteral("DNxHR HQ (MXF)"));
+        const QString restored = ExportDialog(state(), win_.get()).findChild<QComboBox*>("exportPreset")->currentText();
+        appSettings().setValue("export/preset", remembered);  // later tests export with the preset they had
+        QCOMPARE(restored, QStringLiteral("DNxHR HQ (MXF)"));
     }
 
     void renderQueueInTheBackground() {
