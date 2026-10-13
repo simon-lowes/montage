@@ -177,6 +177,18 @@ void applyGradeGraph(const Sequence& s, const Clip& c, FrameTime lt, Image& img,
                 keys.push_back(it == out.end() ? nullptr : &it->second.key);
             }
             st.pic = *pics.front();
+            // Its key: where any branch's is (a parallel mixer's every input, a layer mixer's layers over the first),
+            // for an outside node or a key mixer; a branch with no key of its own makes it everywhere.
+            {
+                const size_t from = n->kind == "parallel" ? 0 : 1;
+                bool everywhere = from >= keys.size();
+                for (size_t j = from; j < keys.size(); ++j) everywhere = everywhere || !keys[j] || keys[j]->empty();
+                if (!everywhere) {
+                    st.key.assign(N, 0.0f);
+                    for (size_t j = from; j < keys.size(); ++j)
+                        for (size_t i = 0; i < N; ++i) st.key[i] = std::min(1.0f, st.key[i] + (*keys[j])[i]);
+                }
+            }
             if (n->kind == "parallel") {
                 for (size_t i = 0; i < N; ++i) {
                     float sum[4] = {0, 0, 0, 0}, mean[4] = {0, 0, 0, 0}, w = 0;

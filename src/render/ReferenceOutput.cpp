@@ -75,8 +75,9 @@ const Mode* findMode(const std::vector<Mode>& modes, const std::string& name) {
 size_t rowBytes(PixelFormat f, int width) {
     switch (f) {
         case PixelFormat::V210: return video::v210RowBytes(width);
-        case PixelFormat::Uyvy8: return size_t(width) * 2;
-        case PixelFormat::P216: return size_t(width) * 2;
+        // (4:2:2 in pairs of pixels: an odd width's last pixel has a pair of its own, its chroma too)
+        case PixelFormat::Uyvy8: return size_t((width + 1) / 2) * 4;
+        case PixelFormat::P216: return size_t((width + 1) / 2) * 4;
     }
     return 0;
 }
@@ -356,7 +357,8 @@ void Scheduler::packLoop() {
 
 void Scheduler::sendLoop() {
     std::shared_ptr<const Packed> last = black_;
-    FrameTime lastFrame = -1;
+    FrameTime lastFrame = -1, tcFrame = -1;
+    bool tcRunning = false;  // the timecode running on from the last tick's (playing then too)
     int64_t tick = 0, cursor = 0;
     bool audioOn = false;
     std::vector<float> audio;
@@ -408,7 +410,16 @@ void Scheduler::sendLoop() {
         vf.format = signal_.format;
         vf.data = last->data.data();
         vf.frame = lastFrame >= 0 ? lastFrame : pos;
-        vf.timecode = timecodeOf(vf.frame, seqFps_);
+        // RP188 counts the output's frames: the program's time at the mode's rate, running on a frame a tick while
+        // playing and within a few frames of it (a 24p sequence on a 60p output would otherwise step 2 or 3 at once).
+        if (std::fabs(modeFps - seqFps) < 1e-6) {
+            tcFrame = vf.frame;
+        } else {
+            const FrameTime at = FrameTime(std::floor(double(vf.frame) * modeFps / std::max(1e-6, seqFps) + 1e-6));
+            tcFrame = playing && tcRunning && std::llabs(tcFrame + 1 - at) <= 3 ? tcFrame + 1 : at;
+        }
+        tcRunning = playing;
+        vf.timecode = timecodeOf(tcFrame, mode_.fps);
         vf.fps = mode_.fps;
         Audio a;
         a.samples = audio.empty() ? nullptr : audio.data();

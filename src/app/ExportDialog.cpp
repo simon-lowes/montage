@@ -925,7 +925,8 @@ void ExportDialog::startExport() {
             // With stems, the export fills the first half of the bar and the stems the second.
             const double share = stems > 0 ? 0.5 : 1.0;
             r.ok = exportSequence(
-                snap, *sq, s, [&](double f, FrameTime t) { onProgress(f * share, t); }, cancel, &error, &encoder);
+                snap, *sq, s, [&](double f, FrameTime t) { onProgress(f * share, t); }, cancel, &error, &encoder, nullptr,
+                nullptr, &r.keptUnsigned);
             if (r.ok && stems > 0)
                 r.ok = exportStems(
                     snap, *sq, s, stems, nullptr, [&](double f, FrameTime t) { onProgress(0.5 + f * 0.5, t); }, cancel, &error);
@@ -977,7 +978,7 @@ void ExportDialog::exportFinished() {
         accept();
         return;
     }
-    removePartialFile();
+    if (!r.keptUnsigned) removePartialFile();
     if (cancelled) {
         eta_->setText(tr("Export cancelled."));
         eta_->show();
@@ -995,7 +996,7 @@ void ExportDialog::stopAndWait() {
     const Result r = watcher_.result();
     if (r.ok)
         state_->message(tr("Exported %1").arg(QDir::toNativeSeparators(exportPath_)));
-    else
+    else if (!r.keptUnsigned)
         removePartialFile();
 }
 

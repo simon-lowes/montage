@@ -825,7 +825,10 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     };
     for (Track& t : s.videoTracks)
         for (Clip& c : t.clips) {
-            if (!c.grade.empty() && !validGrade(c.grade)) edit::flattenGrade(s, c.id);
+            if (!c.grade.empty() && !validGrade(c.grade)) {
+                c.effects = flattenedEffects(s, c);  // (repeated ids made fresh once the project's ids are known)
+                c.grade = {};
+            }
             settle(c.effects, c.grade);
             for (GradeVersion& v : c.gradeVersions) settle(v.effects, v.grade);
         }
@@ -1147,6 +1150,10 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         }
     }
     p.nextId = std::max(p.nextId, maxId + 1);
+    // An effect id repeated in a clip (a graph flattened above, or saved so) given a fresh one.
+    for (Sequence& s : p.sequences)
+        for (Track& t : s.videoTracks)
+            for (Clip& c : t.clips) separateEffectIds(p, s, c);
     out = std::move(p);
     return true;
 }

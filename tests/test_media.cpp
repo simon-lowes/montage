@@ -28,6 +28,7 @@
 #include <thread>
 #include <cstdio>
 
+#include "core/GradeGraph.h"
 #include "core/AudioChannels.h"
 #include "core/Aaf.h"
 #include "core/Bleep.h"
@@ -5649,6 +5650,66 @@ private slots:
         Project back;
         QVERIFY(loadProject(project.toStdString(), back));
         QCOMPARE(back.active()->videoTracks[0].clips.front().gradeVersions.size(), size_t(3));
+    }
+
+    void sourceEffectsInNodes() {
+        // Effects that work on the picture as it comes (here Reframe 360) run before the grade whichever node holds
+        // them: off with their node, and run from a shared node.
+        const std::string png = path("nodes-gradient.png");
+        {
+            QImage img(320, 180, QImage::Format_RGB32);
+            for (int y = 0; y < img.height(); ++y)
+                for (int x = 0; x < img.width(); ++x) img.setPixel(x, y, qRgb(x * 255 / 319, y * 255 / 179, 64));
+            QVERIFY(img.save(QString::fromStdString(png)));
+        }
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160, s.height = 90;
+        MediaItem m = probeOrFail(p, png);
+        p.media.push_back(m);
+        Clip c = makeClip(p, p.media.back(), TrackKind::Video, s);
+        c.duration = 10;
+        Effect cc = makeEffect(p, "color_correct");  // (as it is: the picture unchanged)
+        c.effects = {cc};
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok);
+        const Id id = s.videoTracks[0].clips[0].id;
+        auto clip = [&]() -> Clip& { return *edit::clipById(s, id); };
+        RenderOptions o;
+        auto diff = [&](const Image& a, const Image& b) {
+            float d = 0;
+            for (size_t i = 0; i < std::min(a.px.size(), b.px.size()); ++i) d = std::max(d, std::fabs(a.px[i] - b.px[i]));
+            return a.px.size() == b.px.size() ? d : 1e9f;
+        };
+        const Image plain = renderProgramFrame(p, s, 2, o);
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        Effect view = makeEffect(p, "reframe_360");
+        view.params["yaw"] = 90.0;
+        view.node = 1;  // (in a node, as an older project or a hand-made file has it)
+        clip().effects.push_back(view);
+        const Image turned = renderProgramFrame(p, s, 2, o);
+        QVERIFY2(diff(turned, plain) > 0.05f, qPrintable(QString::number(diff(turned, plain))));
+        // The node switched off: no turn.
+        clip().grade.nodes[0].enabled = false;
+        QVERIFY2(diff(renderProgramFrame(p, s, 2, o), plain) < 1e-4f, qPrintable(QString::number(diff(renderProgramFrame(p, s, 2, o), plain))));
+        clip().grade.nodes[0].enabled = true;
+        // Shared, the node's effects in the shared node: still turned; and not with the node off.
+        QVERIFY(edit::shareGradeNode(p, s, id, 1, "Look").ok);
+        QCOMPARE(s.sharedNodes.at(0).effects.size(), size_t(2));
+        QVERIFY2(diff(renderProgramFrame(p, s, 2, o), turned) < 1e-4f, qPrintable(QString::number(diff(renderProgramFrame(p, s, 2, o), turned))));
+        clip().grade.nodes[0].enabled = false;
+        QVERIFY(diff(renderProgramFrame(p, s, 2, o), plain) < 1e-4f);
+        // Such effects stay outside nodes: not moved into one, left out when converting.
+        Clip& d = clip();
+        d.grade = {};
+        Effect nr = makeEffect(p, "video_denoise");
+        d.effects = {cc, nr, makeEffect(p, "invert")};
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        QCOMPARE(clip().effects.at(1).type, std::string("video_denoise"));
+        QCOMPARE(clip().effects.at(1).node, 0);
+        QVERIFY(clip().effects.at(0).node != 0 && clip().effects.at(2).node != 0);
+        const edit::Result moved = edit::moveEffectToNode(p, s, id, clip().effects.at(1).id, clip().effects.at(0).node);
+        QVERIFY(!moved.ok);
+        QVERIFY(QString::fromStdString(moved.error).contains("outside the nodes"));
     }
 
     void gradeNodesOverMcp() {

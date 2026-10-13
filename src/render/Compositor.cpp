@@ -444,10 +444,46 @@ double effectPixelScale(const Clip& c, FrameTime lt, double sx, double mw, int s
     return srcWidth / std::max(1.0, mw * fitX);
 }
 
-const Effect* superScaleEffect(const Clip& c) {
+// The clip's effects that take part, in order: its own that are on and outside its grade graph or in a node of it that
+// is on and feeds the output, and then the effects of the shared nodes it shows there. Effects that work on the picture
+// as it comes (Video NR, Super Scale, Motion Deblur, Reframe 360, Redact Faces, Stereo 3D, Motion Blur, Deflicker)
+// run there, before the graph, whichever of its nodes holds them; a node switched off or left out turns them off too.
+std::vector<const Effect*> liveEffects(const Sequence& seq, const Clip& c) {
+    std::vector<const Effect*> out;
+    if (c.grade.empty()) {
+        for (const Effect& e : c.effects)
+            if (e.enabled) out.push_back(&e);
+        return out;
+    }
+    const std::vector<int> order = gradeOrder(c.grade);
+    auto live = [&](int key) {
+        if (std::find(order.begin(), order.end(), key) == order.end()) return false;
+        const GradeNode* n = findGradeNode(c.grade, key);
+        return n && n->enabled;
+    };
     for (const Effect& e : c.effects)
-        if (e.type == "super_scale" && e.enabled) return &e;
+        if (e.enabled && (e.node == 0 || live(e.node))) out.push_back(&e);
+    for (int key : order)
+        if (const GradeNode* n = findGradeNode(c.grade, key); n && n->enabled && n->shared)
+            if (const SharedNode* sn = findSharedNode(seq, n->shared))
+                for (const Effect& e : sn->effects)
+                    if (e.enabled) out.push_back(&e);
+    return out;
+}
+
+const Effect* enabledEffect(const Sequence& seq, const Clip& c, const char* type) {
+    if (c.grade.empty()) {  // (the common case, without building a list)
+        for (const Effect& e : c.effects)
+            if (e.enabled && e.type == type) return &e;
+        return nullptr;
+    }
+    for (const Effect* e : liveEffects(seq, c))
+        if (e->type == type) return e;
     return nullptr;
+}
+
+const Effect* superScaleEffect(const Sequence& seq, const Clip& c) {
+    return enabledEffect(seq, c, "super_scale");
 }
 
 // The last few Super Scale results, by what went in (sampled) and the size asked for: a paused or
@@ -541,16 +577,8 @@ void applyMotionDeblur(const Effect& e, FrameTime lt, const RenderOptions& o, Im
     src = std::move(sharp);
 }
 
-const Effect* denoiseEffect(const Clip& c) {
-    for (const Effect& e : c.effects)
-        if (e.type == "video_denoise" && e.enabled) return &e;
-    return nullptr;
-}
-
-const Effect* enabledEffect(const Clip& c, const char* type) {
-    for (const Effect& e : c.effects)
-        if (e.enabled && e.type == type) return &e;
-    return nullptr;
+const Effect* denoiseEffect(const Sequence& seq, const Clip& c) {
+    return enabledEffect(seq, c, "video_denoise");
 }
 
 // Deflicker's per-frame brightness, kept by media, size and frame: playing on needs one new frame's worth.
@@ -799,9 +827,9 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (nested->multicam) no.soloVideoTrack = std::clamp(c.angle, 0, std::max(0, int(nested->videoTracks.size()) - 1));
             FrameTime nf = FrameTime(std::floor(c.sourceFrameAt(t) * nested->fpsValue() / seq.fpsValue() + 1e-6));
             src = renderSequenceFrame(p, *nested, nf, no);
-            if (const Effect* nr = denoiseEffect(c); nr && !src.empty())
+            if (const Effect* nr = denoiseEffect(seq, c); nr && !src.empty())
                 applyDenoise(*nr, lt, src, {}, {}, effectPixelScale(c, lt, g.sx, mw, src.width), -1);
-            if (const Effect* db = enabledEffect(c, "motion_deblur")) applyMotionDeblur(*db, lt, o, src);
+            if (const Effect* db = enabledEffect(seq, c, "motion_deblur")) applyMotionDeblur(*db, lt, o, src);
             convertColor(src, sequenceColorSpace(*nested), sequenceColorSpace(seq), seq.hdrPeakNits);
         } else if (m->kind == MediaKind::Video || m->kind == MediaKind::Image) {
             if (!m->hasVideo && m->kind != MediaKind::Image) return {};
@@ -811,7 +839,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             // with the file offline, both eyes show the proxy).
             if (!m->stereo.empty()) {
                 int eye = o.eye;
-                if (const Effect* s3d = enabledEffect(c, "stereo_3d"); s3d && s3d->p("swap_eyes", lt, 0) > 0.5) eye = 1 - eye;
+                if (const Effect* s3d = enabledEffect(seq, c, "stereo_3d"); s3d && s3d->p("swap_eyes", lt, 0) > 0.5) eye = 1 - eye;
                 if (eye && (path == m->path || fileOnline(m->path))) path = eyePath(m->path, 1);
                 // Faces analysed in the left eye sit elsewhere in the right (the eyes' disparity): there they are found
                 // in the picture itself, so Redact Faces never leaves one uncovered.
@@ -821,7 +849,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             mw = m->width > 0 ? m->width : SW;
             mh = m->height > 0 ? m->height : SH;
             // Reframe 360: the clip is a view, at the sequence's shape, out of the whole sphere.
-            const Effect* vr = enabledEffect(c, "reframe_360");
+            const Effect* vr = enabledEffect(seq, c, "reframe_360");
             if (vr) mw = std::max(1.0, std::round(mh * SW / std::max(1, SH)));
             g = clipGeometry(c, lt, mw, mh, SW, SH, seq.fpsValue());
             int w, h;
@@ -839,7 +867,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             }
             // Super Scale: shown larger than it was shot, the frame is decoded at its own size and enlarged by
             // the model at the end (not on proxies, which are for speed).
-            const Effect* ss = superScaleEffect(c);
+            const Effect* ss = superScaleEffect(seq, c);
             // The size it is shown at (decoding stops at the media's own size), up to four times that.
             const int outW = int(std::ceil(std::clamp(g.mw * std::fabs(g.sx) * o.scale, 1.0, 4.0 * mw)));
             const int outH = int(std::ceil(std::clamp(g.mh * std::fabs(g.sy) * o.scale, 1.0, 4.0 * mh)));
@@ -890,7 +918,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     Frame16Ptr fa = MediaPool::instance().videoFrame(path, (base + 0.25) / mf, w, h, o.highQuality);
                     Frame16Ptr fb = MediaPool::instance().videoFrame(path, next, w, h, o.highQuality);
                     if (fa && fb) {
-                        if (denoiseEffect(c)) decoded = src;
+                        if (denoiseEffect(seq, c)) decoded = src;
                         const Image a = toImage(*fa), b = toImage(*fb);
                         const std::string pair = path + '#' + std::to_string(int64_t(base)) + '@' + std::to_string(w) + 'x' + std::to_string(h);
                         // AI frames when RIFE is here, else optical flow.
@@ -902,7 +930,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 }
             }
             // Noise reduction, on the source frames with the frames either side (Resolve's temporal NR).
-            if (const Effect* nr = denoiseEffect(c)) {
+            if (const Effect* nr = denoiseEffect(seq, c)) {
                 std::vector<Image> around;
                 std::vector<int> offsets;
                 std::vector<MotionFn> motion;
@@ -933,10 +961,10 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                              m->kind == MediaKind::Video ? sec : -1);
             }
             // Motion Deblur, on the source frame as decoded (the size it is shown at); not on proxies, which are for speed.
-            if (const Effect* db = enabledEffect(c, "motion_deblur"); db && original) applyMotionDeblur(*db, lt, o, src);
+            if (const Effect* db = enabledEffect(seq, c, "motion_deblur"); db && original) applyMotionDeblur(*db, lt, o, src);
             // Motion Blur and Deflicker, from the source frames either side.
-            const Effect* blur = enabledEffect(c, "motion_blur");
-            const Effect* flicker = enabledEffect(c, "deflicker");
+            const Effect* blur = enabledEffect(seq, c, "motion_blur");
+            const Effect* flicker = enabledEffect(seq, c, "deflicker");
             if ((blur || flicker) && m->kind == MediaKind::Video && m->fps.valid()) {
                 const double mf = m->fps.toDouble();
                 const int64_t base = int64_t(std::floor(sec * mf + 1e-6));
@@ -1069,8 +1097,16 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     FaceScope faceScope(faces);
     ofx::FetchScope fetchScope(ofxFetch);
     // Faces are covered first, where they are in the source, whatever moves the picture after (Stabilize, transforms).
-    for (const Effect* e : chain)
-        if (e->type == "redact_faces") applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
+    // (Its colour group's, and its own and its shared nodes' that take part.)
+    std::vector<const Effect*> redactions;
+    if (const ColorGroup* cg = colorGroupOf(seq, c)) {
+        for (const auto* v : {&cg->pre, &cg->post})
+            for (const Effect& e : *v)
+                if (e.enabled && e.type == "redact_faces") redactions.push_back(&e);
+    }
+    for (const Effect* e : liveEffects(seq, c))
+        if (e->type == "redact_faces") redactions.push_back(e);
+    for (const Effect* e : redactions) applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
     auto ranAlready = [&](const Effect& e) {
         return e.type == "video_denoise" || e.type == "super_scale" || e.type == "motion_deblur" || e.type == "reframe_360" || e.type == "redact_faces" ||
                e.type == "stereo_3d" || &e == sourceCdl || &e == sourceRgc ||
@@ -1102,7 +1138,7 @@ Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     // Stereo 3D: in a stereoscopic sequence the eyes are moved apart by the clip's depth (into the screen when
     // positive, out of it when negative); half the separation each way.
     if (seq.stereo3d && !(c.isGenerator() && c.generator.type == "adjustment"))
-        if (const Effect* s3d = enabledEffect(c, "stereo_3d")) {
+        if (const Effect* s3d = enabledEffect(seq, c, "stereo_3d")) {
             const double half = s3d->p("depth", lt, 0) / 100.0 * SW / 2;
             g.px += o.eye ? half : -half;
         }
@@ -1238,7 +1274,7 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
                 }
             }
             // Behind People: the layer goes behind whoever is in the picture beneath it.
-            if (const Effect* bp = enabledEffect(*c, "behind_people"); bp && !layer.empty() && !canvasEmpty && mattingAvailable() &&
+            if (const Effect* bp = enabledEffect(seq, *c, "behind_people"); bp && !layer.empty() && !canvasEmpty && mattingAvailable() &&
                                                                         mattingModel().installed())
                 if (std::shared_ptr<const ValueMap> people = cachedPersonMatte(canvas)) {
                     const FrameTime lt = t - c->start;
@@ -1295,7 +1331,7 @@ bool clipGeometry(const Project& p, const Sequence& seq, const Clip& c, FrameTim
             if (m->width > 0) mw = m->width;
             if (m->height > 0) mh = m->height;
             // Reframe 360: a view at the sequence's shape (as clipLayer draws it).
-            if (enabledEffect(c, "reframe_360")) mw = std::max(1.0, std::round(mh * seq.width / std::max(1, seq.height)));
+            if (enabledEffect(seq, c, "reframe_360")) mw = std::max(1.0, std::round(mh * seq.width / std::max(1, seq.height)));
         }
     }
     g = clipGeometry(c, t - c.start, mw, mh, seq.width, seq.height, seq.fpsValue());

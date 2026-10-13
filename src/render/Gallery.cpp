@@ -189,10 +189,11 @@ bool grabStill(const Project& p, const Sequence& s, FrameTime t, const std::stri
         return false;
     };
     if (!validAlbum(album)) return fail("An album needs a name without slashes");
-    // The clip it shows: the top one with a picture there.
+    // The clip it shows: the top one with a picture there (a track matte's hidden source is not it).
     const Clip* clip = nullptr;
+    const std::vector<bool> mattes = hiddenMatteTracks(s, t);
     for (int i = int(s.videoTracks.size()) - 1; i >= 0 && !clip; --i)
-        if (!s.videoTracks[size_t(i)].muted)
+        if (!s.videoTracks[size_t(i)].muted && !mattes[size_t(i)])
             if (const Clip* c = edit::clipAt(s, TrackRef{TrackKind::Video, i}, t); c && c->enabled) clip = c;
     if (!clip) return fail("No clip at the playhead to grab a still of");
     if (!QDir().mkpath(qs(folder) + "/" + qs(album))) return fail("Cannot make " + folder + "/" + album);

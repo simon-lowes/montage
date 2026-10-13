@@ -894,12 +894,22 @@ bool parseReviewNotes(const std::string& json, Rational fps, std::vector<ReviewN
     if (!doc.isObject() || !doc.object().contains("montageReview")) return fail("This is not a notes file saved from a Montage review page");
     const QJsonObject o = doc.object();
     if (title) *title = o.value("title").toString().toStdString();
-    // Frames in the review copy's rate, brought to `fps`.
+    // Frames in the review copy's rate, brought to `fps`. A rate that is not two whole numbers from 1 to a million, giving
+    // 1 to 1000 fps, is not the page's and is ignored.
     double scale = 1;
+    Rational noteFps = fps;
     const QJsonArray theirs = o.value("fps").toArray();
-    if (theirs.size() == 2 && theirs[0].toDouble() > 0 && theirs[1].toDouble() > 0 && fps.toDouble() > 0)
-        scale = fps.toDouble() / (theirs[0].toDouble() / theirs[1].toDouble());
-    const Rational noteFps = theirs.size() == 2 && theirs[1].toDouble() > 0 ? Rational{int(theirs[0].toDouble()), int(theirs[1].toDouble())} : fps;
+    auto whole = [](const QJsonValue& v) {
+        const double d = v.toDouble();
+        return d >= 1 && d <= 1e6 && d == std::floor(d);
+    };
+    if (theirs.size() == 2 && whole(theirs[0]) && whole(theirs[1])) {
+        const double rate = theirs[0].toDouble() / theirs[1].toDouble();
+        if (rate >= 1 && rate <= 1000) {
+            noteFps = Rational{int(theirs[0].toDouble()), int(theirs[1].toDouble())};
+            if (fps.toDouble() > 0) scale = fps.toDouble() / rate;
+        }
+    }
     const size_t before = out.size();
     for (const QJsonValue& v : o.value("notes").toArray()) {
         const QJsonObject n = v.toObject();

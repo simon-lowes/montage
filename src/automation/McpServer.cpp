@@ -1681,7 +1681,7 @@ void McpServer::Impl::addTools() {
             } else if (action == "remove_shared") {
                 r = edit::removeSharedNode(s, sharedArg());
             } else if (action == "flatten") {
-                r = edit::flattenGrade(s, id);
+                r = edit::flattenGrade(l.project, s, id);
             } else if (action != "list") {
                 throw ArgError{QStringLiteral("Unknown action \"%1\"").arg(action)};
             }
@@ -2180,8 +2180,8 @@ void McpServer::Impl::addTools() {
                           QJsonObject{{"effect_id", double(e.id)}});
             }
             if (a.contains("node") || a.contains("shared")) {
-                if (audioClip || type == "stabilize" || type == "rolling_shutter")
-                    throw ArgError{"A node takes picture effects that work on the picture it is given"};
+                if (audioClip || runsBeforeGrade(type))
+                    throw ArgError{"A node takes picture effects that work on the picture it is given (that one works on the picture as it comes: add it to the clip)"};
                 Id shared = Id(a.value("shared").toDouble());
                 if (a.contains("node")) {
                     const GradeNode* n = findGradeNode(c.grade, a.value("node").toInt());

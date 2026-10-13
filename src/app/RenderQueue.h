@@ -79,6 +79,7 @@ private:
     std::atomic<double> progress_{0};
     struct Result {
         bool ok = false;
+        bool keptUnsigned = false;  // failed signing; the export is kept
         std::string error, encoder;
     };
     QFutureWatcher<Result> watcher_;

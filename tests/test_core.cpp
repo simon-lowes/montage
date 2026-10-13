@@ -2504,7 +2504,7 @@ private slots:
         QVERIFY(edit::setGradeNode(s, id, renamed).ok);
         QCOMPARE(gradeNodeName(*findGradeNode(clip().grade, 3)), std::string("Skin"));
         // Flattened: the nodes' effects as a stack again, the nodes' settings gone.
-        QVERIFY(edit::flattenGrade(s, id).ok);
+        QVERIFY(edit::flattenGrade(p, s, id).ok);
         QVERIFY(clip().grade.empty());
         for (const Effect& e : clip().effects) QVERIFY(e.node == 0 && e.type != "grade_node");
         QCOMPARE(clip().effects.size(), size_t(2));  // the blur and the curves
@@ -2673,12 +2673,28 @@ private slots:
         QVERIFY(edit::moveEffectToNode(p, s, id, clip().effects[0].id, 0).ok);  // the curves: no own node effects left
         QCOMPARE(types(clip().effects), std::string("grade_node@1 curves posterize gaussian_blur "));  // held in place
         // Flattened with only a shared node's effects: they come back where the graph ran.
-        QVERIFY(edit::flattenGrade(s, id).ok);
+        QVERIFY(edit::flattenGrade(p, s, id).ok);
         QCOMPARE(types(clip().effects), std::string("color_correct curves posterize gaussian_blur "));
+        // A shared node shown twice, flattened: each copy its own id, none the shared node's.
+        QVERIFY(edit::convertToNodes(s, id).ok);
+        QVERIFY(edit::useSharedNode(p, s, id, shared).ok);
+        QVERIFY(edit::useSharedNode(p, s, id, shared).ok);
+        QVERIFY(edit::flattenGrade(p, s, id).ok);
+        {
+            std::set<Id> ids;
+            int copies = 0;
+            for (const Effect& e : clip().effects) {
+                QVERIFY(ids.insert(e.id).second);
+                QVERIFY(e.id != findSharedNode(s, shared)->effects.at(0).id);
+                copies += e.type == "color_correct";
+            }
+            QCOMPARE(copies, 3);  // (its own, from the earlier flatten, and the two)
+        }
+        clip().effects = {makeEffect(p, "color_correct"), makeEffect(p, "curves"), makeEffect(p, "posterize"), makeEffect(p, "gaussian_blur")};
         // A node's window goes onto its effects when flattened.
         QVERIFY(edit::convertToNodes(s, id).ok);
         QVERIFY(edit::setGradeNodeParams(p, s, id, 1, {{"mask.shape", 2}}).ok);
-        QVERIFY(edit::flattenGrade(s, id).ok);
+        QVERIFY(edit::flattenGrade(p, s, id).ok);
         QCOMPARE(clip().effects[0].p("mask.shape", 0), 2.0);
         // Layer mixer inputs keep their blend modes when one goes, and a mixer's input past the next is refused.
         clip().effects = {makeEffect(p, "color_correct")};
@@ -6491,6 +6507,19 @@ private slots:
         QVERIFY(parseReviewNotes(R"({"montageReview":1,"fps":[50,1],"notes":[{"frame":100,"duration":10,"author":"Sam","text":"x"}]})", s.fps, fast));
         QCOMPARE(fast.at(0).frame, FrameTime(50));
         QCOMPARE(fast.at(0).duration, FrameTime(5));
+        // A rate that is not a page's (too fast, a fraction, nought) is ignored: its timecodes read at the sequence's.
+        for (const char* rate : {"[1e20,1]", "[24,0.5]", "[24,0]", "[0,1]", "[1,100000]"}) {
+            fast.clear();
+            const std::string json = std::string(R"({"montageReview":1,"fps":)") + rate +
+                                     R"(,"notes":[{"timecode":"00:00:04:00","text":"x"}]})";
+            QVERIFY2(parseReviewNotes(json, s.fps, fast), rate);
+            QCOMPARE(fast.at(0).frame, FrameTime(4 * std::lround(s.fps.toDouble())));
+        }
+        // Timecode at a rate no sequence has reads at 30 rather than overflowing.
+        FrameTime huge = 0;
+        QVERIFY(parseTimecode("999999999:00:00:00", Rational{2000000000, 1}, huge));
+        QCOMPARE(huge, FrameTime(999999999LL * 3600 * 30));
+        QCOMPARE(formatTimecode(90, Rational{2000000000, 1}), std::string("00:00:03:00"));
         // Not notes, or none.
         QVERIFY(!parseReviewNotes("{\"notes\":[]}", s.fps, fast, nullptr, &err));
         QVERIFY(!parseReviewNotes(R"({"montageReview":1,"notes":[]})", s.fps, fast, nullptr, &err));

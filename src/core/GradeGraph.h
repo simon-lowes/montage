@@ -19,6 +19,10 @@ namespace montage {
 // The node kinds: "corrector" (effects, its window, qualifier and key input), "parallel" and "layer" (mixers),
 // "key_mixer" (keys combined).
 bool isGradeMixer(const GradeNode& n);
+// Effects that work on the picture as it comes, or reshape the whole frame, before any grade (Video NR, Super Scale,
+// Motion Deblur, Reframe 360, Redact Faces, Stereo 3D, Motion Blur, Deflicker, Stabilize, Rolling Shutter Repair, Lens
+// Correction, the camera tracker): they stay outside nodes (a node's window, key or mix could not apply to them).
+bool runsBeforeGrade(const std::string& type);
 const GradeNode* findGradeNode(const GradeGraph& g, int key);
 GradeNode* findGradeNode(GradeGraph& g, int key);
 // The link into `to`'s input `input` (to 0: the graph's output), or null.
@@ -50,6 +54,9 @@ void remapSharedNodes(GradeGraph& g, const std::map<Id, Id>& ids);
 // The clip's effects as a stack: its nodes' effects (shared ones copied in) in the order the graph runs them, where
 // it runs them, its nodes' settings dropped. Its effects as they are when it has no graph.
 std::vector<Effect> flattenedEffects(const Sequence& s, const Clip& c);
+// Fresh ids for the clip's effects whose id repeats an earlier one's or a shared node effect's (a shared node's effects
+// copied in when flattening, once for each node showing it), so edits and removal find the one meant.
+void separateEffectIds(Project& p, const Sequence& s, Clip& c);
 // The clips whose graphs show shared node `id`.
 int sharedNodeUsers(const Sequence& s, Id id);
 
@@ -75,8 +82,8 @@ Result disconnectGradeNodes(Sequence& s, Id clip, int to, int input);
 Result setGradeNode(Sequence& s, Id clip, const GradeNode& node);
 // The effect into corrector `key` (0: outside the graph, after it).
 Result moveEffectToNode(Project& p, Sequence& s, Id clip, Id effect, int key);
-// No graph: the nodes' effects stay, as a stack; the nodes' settings go.
-Result flattenGrade(Sequence& s, Id clip);
+// No graph: the nodes' effects stay, as a stack (shared nodes' copied in under fresh ids); the nodes' settings go.
+Result flattenGrade(Project& p, Sequence& s, Id clip);
 // Corrector `key`'s effects into a new shared node named `name`, which the node then shows.
 Result shareGradeNode(Project& p, Sequence& s, Id clip, int key, const std::string& name, Id* created = nullptr);
 // A new corrector at the end of the clip's graph showing shared node `shared`.

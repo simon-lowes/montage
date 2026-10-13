@@ -181,10 +181,12 @@ std::string hdr10PlusCarriage(const Sequence& seq, const ExportSettings& s);
 // HDR exports measure their light levels as they render (`light`, when given); PQ files to MP4 and MOV carry the
 // measured MaxCLL and MaxFALL. Encoders that state them before the first frame (x265) use the sequence's analysed
 // levels, or the mastering peak when it has none.
+// An export rendered whole but not signed with its Content Credentials fails and is kept, unsigned (`keptUnsigned` set):
+// callers that clean up after a failure leave that file be.
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed = nullptr,
                     int* smartRendered = nullptr,  // frames copied by smart rendering
-                    LightLevels* light = nullptr);
+                    LightLevels* light = nullptr, bool* keptUnsigned = nullptr);
 
 // Renders an audio clip's sound with its effects (not its volume, pan or
 // fades) to a 24-bit WAV, from its first frame to its last.

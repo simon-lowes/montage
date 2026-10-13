@@ -1297,7 +1297,10 @@ void InspectorWidget::addEffectMenu(TrackKind kind, Id owner, int node) {
     auto* btn = new QPushButton(kind == TrackKind::Video ? tr("Add Video Effect…") : tr("Add Audio Effect…"), content_);
     auto* menu = new QMenu(btn);
     std::map<std::string, QMenu*> groups;
+    // A shared node's menu leaves out the effects that run before the grade (they go on a clip, outside its nodes).
+    const bool sharedNode = state_->sequence() && findSharedNode(*state_->sequence(), owner);
     for (const EffectInfo* info : effectsInCategory(kind == TrackKind::Video ? EffectCategory::VideoFilter : EffectCategory::AudioFilter)) {
+        if (sharedNode && runsBeforeGrade(info->type)) continue;
         QMenu*& g = groups[info->group];
         if (!g) g = menu->addMenu(QString::fromStdString(info->group));
         std::string type = info->type;
@@ -1314,8 +1317,9 @@ void InspectorWidget::addEffectMenu(TrackKind kind, Id owner, int node) {
                 // filter (outside any colour node).
                 if (type == "stabilize" || type == "rolling_shutter" || type == "lens_correction") {
                     chain->insert(chain->begin(), e);
-                } else if (node) {
-                    // Into the colour node, after its own effects.
+                } else if (node && !runsBeforeGrade(type)) {
+                    // Into the colour node, after its own effects (those working on the picture as it comes stay outside,
+                    // after the clip's).
                     e.node = node;
                     auto at = chain->end();
                     for (auto it = chain->begin(); it != chain->end(); ++it)

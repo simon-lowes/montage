@@ -31,9 +31,10 @@ QJsonObject exportSettingsToJson(const ExportSettings& s);
 bool exportSettingsFromJson(const QJsonObject& o, ExportSettings& s, std::string* error = nullptr);
 
 // One render as the queue and the farm's nodes make it: the export, then its stems (StemGroups, 0 none) in the second
-// half of the progress.
+// half of the progress. `keptUnsigned` as exportSequence's (the export kept though it failed, its stems not made).
 bool renderExport(const Project& p, Id sequence, const ExportSettings& s, int stems, const ExportProgress& progress,
-                  const std::atomic<bool>* cancel, std::string* error, std::string* encoder = nullptr);
+                  const std::atomic<bool>* cancel, std::string* error, std::string* encoder = nullptr,
+                  bool* keptUnsigned = nullptr);
 
 // Path mapping: a path starting with `from` (a folder; "\" and "/" alike, letters' case kept) is given `to` in its
 // place, its separators made `to`'s. The first map that fits is used.

@@ -1755,8 +1755,9 @@ bool exportCarriesCredentials(const ExportSettings& s) {
 
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
-                    LightLevels* light) {
+                    LightLevels* light, bool* keptUnsigned) {
     bool opened = false;
+    if (keptUnsigned) *keptUnsigned = false;
     if (smartRendered) *smartRendered = 0;
     if (light) *light = LightLevels{};
     if (!s.credentialCertificate.empty()) {  // (refused before rendering rather than after)
@@ -1830,6 +1831,7 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
         if (!signContentCredentials(s.path, made, {s.credentialCertificate, s.credentialKey, {}}, o, &why)) {
             // The render is kept (it may have taken hours), unsigned, and said to be: it can be signed again later.
             if (error) *error = "Could not sign it with Content Credentials (" + why + "); the export is kept, unsigned, at " + s.path;
+            if (keptUnsigned) *keptUnsigned = true;
             return false;
         }
     }

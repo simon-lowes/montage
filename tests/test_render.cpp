@@ -3219,6 +3219,19 @@ colorspaces:
         QVERIFY(removeStill(folder, look));
         QVERIFY(galleryStills(folder, "Looks").empty());
         QVERIFY(!QFileInfo::exists(QString::fromStdString(look.picture)));
+        // Under a track matte the still is of the shot the matte cuts out, not of the hidden matte above it.
+        {
+            Clip fill = colorClip(p, 1, 0, 0, 0, 30);
+            fill.name = "Fill";
+            fill.effects = {makeEffect(p, "track_matte")};
+            QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, fill).ok);
+            Clip matte = colorClip(p, 1, 1, 1, 0, 30);
+            matte.name = "Matte";
+            QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 2}, matte).ok);
+            GalleryStill shot;
+            QVERIFY2(grabStill(p, s, 5, folder, kDefaultAlbum, shot, &err), err.c_str());
+            QCOMPARE(shot.clip, std::string("Fill"));
+        }
     }
 
     void trimPasses() {
@@ -5473,7 +5486,7 @@ colorspaces:
         QCOMPARE(at(s, 32, 18), stacked);
 
         // Parallel: gain on the left, invert on the right; unkeyed, their average.
-        QVERIFY(edit::flattenGrade(s, id).ok);
+        QVERIFY(edit::flattenGrade(p, s, id).ok);
         clip().effects = {gain};
         QVERIFY(edit::convertToNodes(s, id).ok);
         int right = 0;
@@ -5506,7 +5519,7 @@ colorspaces:
                  qPrintable(QString::number(both.data[(2 + 9 * (2 + 9 * 2)) * 3])));
 
         // Layer: invert over the picture where its window is.
-        QVERIFY(edit::flattenGrade(s, id).ok);
+        QVERIFY(edit::flattenGrade(p, s, id).ok);
         clip().effects = {};
         QVERIFY(edit::convertToNodes(s, id).ok);
         int top = 0;
@@ -5518,9 +5531,20 @@ colorspaces:
         for (GradeNode& n : clip().grade.nodes)
             if (n.kind == "layer") n.blend = {"multiply"};
         QVERIFY2(near(at(s, 8, 18), plain * inverted) || std::fabs(at(s, 8, 18) - plain * inverted) < 0.02f, qPrintable(QString::number(at(s, 8, 18))));
+        // The mixer's key is where its layers are: a node outside it grades the rest (the right), not nothing.
+        int mixer = 0;
+        for (GradeNode& n : clip().grade.nodes)
+            if (n.kind == "layer") n.blend = {"normal"}, mixer = n.key;
+        int rest = 0;
+        QVERIFY(edit::addGradeNode(p, s, id, edit::NodeHow::Outside, mixer, &rest).ok);
+        Effect g2 = gain;
+        g2.node = rest;
+        clip().effects.push_back(g2);
+        QVERIFY2(near(at(s, 8, 18), inverted), qPrintable(QString::number(at(s, 8, 18))));
+        QVERIFY2(near(at(s, 56, 18), gained), qPrintable(QString::number(at(s, 56, 18))));
 
         // Outside: gain inside node 1's left half, invert outside it.
-        QVERIFY(edit::flattenGrade(s, id).ok);
+        QVERIFY(edit::flattenGrade(p, s, id).ok);
         clip().effects = {};
         Effect g1 = gain;
         QVERIFY(edit::convertToNodes(s, id).ok);
@@ -5534,7 +5558,7 @@ colorspaces:
         QVERIFY2(near(at(s, 56, 18), inverted), qPrintable(QString::number(at(s, 56, 18))));
 
         // A key input: node 1 only chooses the left half (no effects), its key limits node 2's invert.
-        QVERIFY(edit::flattenGrade(s, id).ok);
+        QVERIFY(edit::flattenGrade(p, s, id).ok);
         clip().effects = {};
         QVERIFY(edit::convertToNodes(s, id).ok);
         int second = 0;
@@ -5550,7 +5574,7 @@ colorspaces:
         QVERIFY(near(at(s, 8, 18), plain));
 
         // A shared node: one change seen on both clips using it.
-        QVERIFY(edit::flattenGrade(s, id).ok);
+        QVERIFY(edit::flattenGrade(p, s, id).ok);
         clip().effects = {gain};
         QVERIFY(edit::convertToNodes(s, id).ok);
         Id shared = 0;
@@ -5855,6 +5879,27 @@ colorspaces:
             QCOMPARE(at(stride * 3 + 4), 0x2003);  // row 1's second pair
             QCOMPARE(at(stride * 3 + 6), 0x3003);
         }
+        // An odd width: the last pixel's chroma packed too (no green column), and in UYVY the pixel itself.
+        {
+            Ycbcr422 pic(3, 1);
+            QCOMPARE(pic.chromaWidth(), 2);
+            pic.y = {0x1000, 0x1100, 0x1200};
+            pic.cb = {0x2000, 0x2100};
+            pic.cr = {0x3000, 0x3100};
+            const size_t stride = output::rowBytes(output::PixelFormat::P216, 3);
+            QCOMPARE(stride, size_t(8));
+            std::vector<uint8_t> out(stride * 2, 0);
+            packP216(pic, out.data(), stride);
+            auto at = [&](size_t byte) { return int(out[byte] | out[byte + 1] << 8); };
+            QCOMPARE(at(stride + 4), 0x2100);
+            QCOMPARE(at(stride + 6), 0x3100);
+            QCOMPARE(output::rowBytes(output::PixelFormat::Uyvy8, 3), size_t(8));
+            std::vector<uint8_t> uyvy(8, 0);
+            packUyvy(pic, uyvy.data(), 8);
+            QCOMPARE(int(uyvy[4]), 0x21);
+            QCOMPARE(int(uyvy[5]), 0x12);
+            QCOMPARE(int(uyvy[6]), 0x31);
+        }
         // 75 % colour bars in Y'CbCr: SMPTE RP 219's codes for BT.709 (white 721 512 512, yellow 674 176 543, cyan 581
         // 589 176, green 534 253 207, magenta 251 771 817, red 204 435 848, blue 111 848 481), black 64 512 512.
         {
@@ -6031,6 +6076,25 @@ colorspaces:
         sched.submit(22, grey(0.5f));
         QVERIFY(sendNext(22));
         sched.stop();
+        // A mode at another rate than the sequence's: timecode counts the output's frames (a 25 fps sequence's frame 5
+        // is 0.2 s, frame 10 at 50p), a frame a tick while playing.
+        cfg.videoOffset = 0;
+        s.colorSpace = "rec709";
+        s.fps = {25, 1};
+        const Mode fifty{"tiny50", 64, 36, {50, 1}, false, 0};
+        QVERIFY2(sched.start(d, fifty, s, cfg, &why), why.c_str());
+        sched.setPosition(5, 0);
+        sched.submit(5, grey(0.5f));
+        QVERIFY(sendNext(5));
+        QCOMPARE(dev->sent().back().timecode.frames, 10);
+        sched.setPosition(6, 1);
+        sched.submit(6, grey(0.5f));
+        QVERIFY(sendNext(6));
+        QCOMPARE(dev->sent().back().timecode.frames, 12);
+        QVERIFY(sendNext(6));
+        QCOMPARE(dev->sent().back().timecode.frames, 13);
+        sched.stop();
+        s.colorSpace = "rec2100pq";  // (HDR is not sent in 8 bits)
         cfg.depth = 8;
         QVERIFY(!sched.start(d, d.modes[0], s, cfg, &why));
     }

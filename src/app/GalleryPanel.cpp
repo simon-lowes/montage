@@ -15,6 +15,7 @@
 
 #include "EditorState.h"
 #include "core/EditOps.h"
+#include "render/Compositor.h"
 #include "render/Gallery.h"
 
 namespace montage {
@@ -185,10 +186,12 @@ bool GalleryPanel::applyToSelection() {
     std::vector<Id> clips;
     for (Id id : state_->selectedClips())
         if (const auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Video) clips.push_back(id);
-    if (clips.empty())
+    if (clips.empty()) {
+        const std::vector<bool> mattes = hiddenMatteTracks(*s, state_->playhead());
         for (int i = int(s->videoTracks.size()) - 1; i >= 0 && clips.empty(); --i)
-            if (!s->videoTracks[size_t(i)].muted)  // (the one the picture shows, as Grab Still takes)
+            if (!s->videoTracks[size_t(i)].muted && !mattes[size_t(i)])  // (the one the picture shows, as Grab Still takes)
                 if (const Clip* c = edit::clipAt(*s, TrackRef{TrackKind::Video, i}, state_->playhead()); c && c->enabled) clips.push_back(c->id);
+    }
     if (clips.empty()) {
         state_->message(tr("Select the clips to grade"), 4000);
         return false;
