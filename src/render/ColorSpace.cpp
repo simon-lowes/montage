@@ -230,6 +230,7 @@ const std::vector<ColorSpace>& colorSpaces() {
         {"di-dwg", "DaVinci Intermediate / Wide Gamut", Primaries::DavinciWideGamut, Transfer::DavinciIntermediate, true},
         {"acescct", "ACEScct", Primaries::Ap1, Transfer::AcesCct, true},
         {"aces2065-1", "ACES2065-1 (linear AP0)", Primaries::Ap0, Transfer::Linear, true},
+        {"acescg", "ACEScg (linear AP1)", Primaries::Ap1, Transfer::Linear, true},
         {"linear-rec709", "Linear Rec.709 (scene)", Primaries::Bt709, Transfer::Linear, true},
     };
     return spaces;

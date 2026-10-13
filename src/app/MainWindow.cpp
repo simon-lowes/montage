@@ -93,6 +93,7 @@
 #include "core/MarkerList.h"
 #include "render/AudioReactive.h"
 #include "render/VfxPull.h"
+#include "render/Amf.h"
 #include "render/LutExport.h"
 #include "media/TextReader.h"
 #include "media/Decoder.h"
@@ -1136,6 +1137,28 @@ void MainWindow::buildMenus() {
         const QString want = filter.contains("*.ccc") ? "ccc" : filter.contains("*.cc") ? "cc" : "cdl";
         exportCdl(ext == "cdl" || ext == "cc" || ext == "ccc" ? path : path + "." + want);
     })->setObjectName(QStringLiteral("exportCdl"));
+    add(clipM, tr("Import ACES Metadata (AMF)…"), QKeySequence(), [this] {
+        const QString path = QFileDialog::getOpenFileName(this, tr("Import ACES Metadata"), QString(), tr("ACES Metadata File (*.amf);;All files (*)"));
+        if (!path.isEmpty()) importAmf(path);
+    })->setObjectName(QStringLiteral("importAmf"));
+    add(clipM, tr("Export ACES Metadata (AMF)…"), QKeySequence(), [this] {
+        const Sequence* s = state_->sequence();
+        int clips = 0;
+        for (Id id : state_->selectedClips())
+            if (const Clip* c = s ? edit::clipById(*s, id) : nullptr; c && c->mediaId && !c->isGenerator()) ++clips;
+        if (clips == 0) {
+            state_->message(tr("Select the clips of footage to write ACES Metadata Files for"), 6000);
+            return;
+        }
+        QString target;
+        if (clips == 1) {
+            target = QFileDialog::getSaveFileName(this, tr("Export ACES Metadata"), QString(), tr("ACES Metadata File (*.amf)"));
+            if (!target.isEmpty() && !target.endsWith(QLatin1String(".amf"), Qt::CaseInsensitive)) target += QStringLiteral(".amf");
+        } else {
+            target = QFileDialog::getExistingDirectory(this, tr("Folder for the ACES Metadata Files"));
+        }
+        if (!target.isEmpty()) exportAmf(target);
+    })->setObjectName(QStringLiteral("exportAmf"));
     add(clipM, tr("Find Similar S&hots"), QKeySequence(), [this] { findSimilarShots(); })->setObjectName(QStringLiteral("findSimilarShots"));
     add(clipM, tr("Checkerboard Dialogue by Speaker"), QKeySequence(), withSeq([this] {
             // The selected audio clips, each split where the speaker changes, a track per person.
@@ -3061,6 +3084,10 @@ void MainWindow::vfxPullDialog() {
     cutIn->setRange(0, 100000);
     cutIn->setValue(1001);
     form->addRow(tr("First frame of the cut:"), cutIn);
+    auto* amf = new QCheckBox(tr("Write ACES Metadata Files (the frames' colour space and the grade's CDL and looks)"), &dlg);
+    amf->setObjectName(QStringLiteral("vfxAmf"));
+    amf->setChecked(appSettings().value("vfx/amf", true).toBool());
+    form->addRow(amf);
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
@@ -3070,7 +3097,9 @@ void MainWindow::vfxPullDialog() {
     if (folder.isEmpty()) return;
     appSettings().setValue("vfx/folder", folder);
     appSettings().setValue("vfx/handles", handles->value());
+    appSettings().setValue("vfx/amf", amf->isChecked());
     VfxPullOptions o;
+    o.amf = amf->isChecked();
     o.folder = folder.toStdString();
     o.format = format->currentData().toString().toStdString();
     o.handles = handles->value();
@@ -3685,6 +3714,79 @@ bool MainWindow::exportCdl(const QString& path) {
     }
     state_->message(tr("Wrote %n CDL(s) to %1", nullptr, int(cdls.size())).arg(QFileInfo(path).fileName()), 6000);
     return true;
+}
+
+int MainWindow::importAmf(const QString& path, int setSpace) {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    AmfDocument amf;
+    std::string err;
+    if (!readAmf(path.toStdString(), amf, &err)) {
+        state_->message(QString::fromStdString(err), 6000);
+        return 0;
+    }
+    std::vector<Id> clips;
+    for (Id id : state_->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Video) clips.push_back(id);
+    AmfImportOptions o;
+    if (!amf.outputSpace.empty() && (amf.outputSpace != s->colorSpace || (findColorSpace(amf.outputSpace)->hdr() && amf.outputPeakNits != s->hdrPeakNits))) {
+        if (setSpace < 0) {
+            const ColorSpace* out = findColorSpace(amf.outputSpace);
+            const QString what = out->hdr() ? tr("%1 at %2 nits").arg(QString::fromStdString(out->label)).arg(amf.outputPeakNits)
+                                            : QString::fromStdString(out->label);
+            setSpace = QMessageBox::question(this, tr("Import ACES Metadata"),
+                                             tr("Its output transform is for %1. Make that the sequence's colour space?").arg(what)) == QMessageBox::Yes;
+        }
+        o.setSequenceSpace = setSpace > 0;
+    }
+    AmfImportResult r;
+    state_->edit(tr("Import ACES Metadata"), [&](Project& p, Sequence& sq) {
+        r = applyAmf(p, sq, clips, amf, o);
+        return r.clips > 0;
+    });
+    QStringList notes;
+    for (const std::string& n : r.notes) notes << QString::fromStdString(n);
+    QString msg = r.clips ? tr("Gave %n clip(s) the ACES pipeline from %1", nullptr, r.clips).arg(QFileInfo(path).fileName()) : QString();
+    if (!notes.isEmpty()) msg = msg.isEmpty() ? notes.join(QStringLiteral("; ")) : msg + tr(" (%1)").arg(notes.join(QStringLiteral("; ")));
+    if (msg.isEmpty()) msg = tr("No clip here took the ACES Metadata File");
+    state_->message(msg, 10000);
+    return r.clips;
+}
+
+int MainWindow::exportAmf(const QString& target) {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    std::vector<const Clip*> clips;
+    for (Id id : state_->selectedClips())
+        if (const Clip* c = edit::clipById(*s, id); c && c->mediaId && !c->isGenerator()) clips.push_back(c);
+    if (clips.empty()) return 0;
+    int written = 0;
+    QStringList notes;
+    std::set<QString> used;
+    for (const Clip* c : clips) {
+        QString path = target;
+        if (clips.size() > 1) {
+            // One per clip in the folder, named after it.
+            QString name = QString::fromStdString(c->name).replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9_.-]+")), QStringLiteral("_"));
+            if (name.isEmpty()) name = QStringLiteral("clip");
+            for (int n = 2; used.count(name); ++n) name = QString::fromStdString(c->name) + QStringLiteral("_%1").arg(n);
+            used.insert(name);
+            path = QDir(target).filePath(name + QStringLiteral(".amf"));
+        }
+        std::vector<std::string> said;
+        std::string err;
+        if (!writeClipAmf(state_->project(), *s, *c, path.toStdString(), &said, {}, &err)) {
+            state_->message(QString::fromStdString(err), 6000);
+            return written;
+        }
+        for (const std::string& n : said)
+            if (!notes.contains(QString::fromStdString(n))) notes << QString::fromStdString(n);
+        ++written;
+    }
+    QString msg = tr("Wrote %n ACES Metadata File(s)", nullptr, written);
+    if (!notes.isEmpty()) msg += tr(" (%1)").arg(notes.join(QStringLiteral("; ")));
+    state_->message(msg, 10000);
+    return written;
 }
 
 int MainWindow::suggestChapterMarkers(double minSeconds, bool ask) {

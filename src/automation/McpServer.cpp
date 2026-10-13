@@ -92,6 +92,7 @@
 #include "media/Translator.h"
 #include "render/AudioReactive.h"
 #include "render/VfxPull.h"
+#include "render/Amf.h"
 #include "render/AafExport.h"
 #include "render/AutoMix.h"
 #include "render/AutoBroll.h"
@@ -8171,15 +8172,100 @@ void McpServer::Impl::addTools() {
             return ok(done.join('\n'), res);
         });
 
+    add("montage_amf", "ACES Metadata Files (AMF)",
+        "read: what an AMF (`path`) holds: its clip, input transform, looks and output transform, and the colour spaces "
+        "Montage reads them as. import: the AMF onto `clips` (default: the video clips whose name, file or tape match its "
+        "clip): their media read as its input transform's colour space, its looks not yet applied (ASC CDL in its working "
+        "space, CLF or .cube look files, the Reference Gamut Compression) as effects first in their chains (an earlier "
+        "AMF's replaced); with `set_sequence_space` the sequence also delivers in its output transform's display space. "
+        "export: an AMF for each of `clips` (one clip: `path` is the file; more: a folder, one per clip): the media's "
+        "colour space as the input transform, its CDL, looks in ACES2065-1 and gamut compression as looks, the sequence's "
+        "space as the output transform. Notes say what could not be carried.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"action":{"type":"string","enum":["read","import","export"]},
+            "path":{"type":"string"},"clips":{"type":"array","items":{"type":"number"}},"set_sequence_space":{"type":"boolean"}},
+            "required":["project","action","path"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const QString action = need(a, "action");
+            const QString path = absolute(need(a, "path"));
+            std::vector<Id> clips;
+            for (const QJsonValue& v : a.value("clips").toArray()) clips.push_back(Id(v.toDouble()));
+            auto notesOf = [](const std::vector<std::string>& notes) {
+                QJsonArray arr;
+                for (const std::string& n : notes) arr.append(QString::fromStdString(n));
+                return arr;
+            };
+            if (action == "read" || action == "import") {
+                AmfDocument amf;
+                std::string err;
+                if (!readAmf(path.toStdString(), amf, &err)) return fail(QString::fromStdString(err));
+                if (action == "read") {
+                    QJsonArray looks;
+                    for (const AmfLook& lk : amf.looks) {
+                        QJsonObject o{{"applied", lk.applied}, {"description", QString::fromStdString(lk.description)}};
+                        if (lk.kind == AmfLook::Kind::Cdl) {
+                            o["kind"] = "cdl";
+                            o["asc_sop"] = QString::fromStdString(cdlSopText(lk.cdl));
+                            o["saturation"] = lk.cdl.saturation;
+                            o["space"] = QString::fromStdString(lk.cdlSpace);
+                        } else if (lk.kind == AmfLook::Kind::File) {
+                            o["kind"] = "file";
+                            o["file"] = QString::fromStdString(lk.file);
+                        } else {
+                            o["kind"] = "transform";
+                            o["transform_id"] = QString::fromStdString(lk.transformId);
+                        }
+                        looks.append(o);
+                    }
+                    const QJsonObject o{{"clip_name", QString::fromStdString(amf.clipName)}, {"clip_file", QString::fromStdString(amf.clipFile)},
+                                        {"clip_sequence", QString::fromStdString(amf.clipSequence)}, {"clip_uuid", QString::fromStdString(amf.clipUuid)},
+                                        {"input_transform", QString::fromStdString(amf.inputTransformId.empty() ? amf.inputFile : amf.inputTransformId)},
+                                        {"input_applied", amf.inputApplied}, {"input_space", QString::fromStdString(amf.inputSpace)},
+                                        {"looks", looks}, {"output_transform", QString::fromStdString(amf.outputTransformId)},
+                                        {"output_space", QString::fromStdString(amf.outputSpace)}, {"output_peak_nits", amf.outputPeakNits}};
+                    return ok(QString::fromUtf8(QJsonDocument(o).toJson(QJsonDocument::Compact)), o);
+                }
+                AmfImportOptions o;
+                o.setSequenceSpace = a.value("set_sequence_space").toBool(false);
+                const AmfImportResult r = applyAmf(l.project, l.seq(), clips, amf, o);
+                if (r.clips) save(l);
+                QString msg = QStringLiteral("Gave %1 clips the ACES pipeline").arg(r.clips);
+                for (const std::string& n : r.notes) msg += "\n" + QString::fromStdString(n);
+                return ok(msg, QJsonObject{{"clips", r.clips}, {"notes", notesOf(r.notes)}});
+            }
+            if (action != "export") throw ArgError{QStringLiteral("\"action\" is read, import or export")};
+            const Sequence& s = l.seq();
+            std::vector<const Clip*> chosen;
+            for (Id id : clips)
+                if (const Clip* c = edit::clipById(s, id)) chosen.push_back(c);
+            if (chosen.empty()) throw ArgError{QStringLiteral("Give the clips to write ACES Metadata Files for")};
+            QJsonArray files;
+            std::vector<std::string> notes;
+            for (const Clip* c : chosen) {
+                const QString file = chosen.size() == 1 ? path : QDir(path).filePath(QStringLiteral("%1_%2.amf").arg(QString::fromStdString(c->name).replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9_.-]+")), QStringLiteral("_"))).arg(qulonglong(c->id)));
+                std::vector<std::string> said;
+                std::string err;
+                if (!writeClipAmf(l.project, s, *c, file.toStdString(), &said, {}, &err)) return fail(QString::fromStdString(err));
+                for (const std::string& n : said)
+                    if (std::find(notes.begin(), notes.end(), n) == notes.end()) notes.push_back(n);
+                files.append(file);
+            }
+            QString msg = QStringLiteral("Wrote %1 ACES Metadata Files").arg(files.size());
+            for (const std::string& n : notes) msg += "\n" + QString::fromStdString(n);
+            return ok(msg, QJsonObject{{"files", files}, {"notes", notesOf(notes)}});
+        });
+
     add("montage_vfx_pull", "VFX pulls",
         "Pull shots for visual effects: each clip's source frames, untouched, at the footage's own size and rate, with "
         "`handles` frames either side (default 8, as far as the footage goes), as an image sequence in a folder per shot "
         "(format exr: half float in scene-linear light; dpx: 10-bit in the footage's own colour; tiff: 16-bit), numbered "
-        "so the cut's first frame is `cut_in` (default 1001), with a pull_list.csv. `clips` are clip ids (default: every "
-        "footage clip on the video tracks).",
+        "so the cut's first frame is `cut_in` (default 1001), with a pull_list.csv and (unless `amf` is false) an ACES "
+        "Metadata File per shot giving the frames' colour space and the clip's CDL and looks. `clips` are clip ids "
+        "(default: every footage clip on the video tracks).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string"},
             "clips":{"type":"array","items":{"type":"number"}},"format":{"type":"string","enum":["exr","dpx","tiff"],"default":"exr"},
-            "handles":{"type":"integer","default":8},"cut_in":{"type":"integer","default":1001}},"required":["project","folder"]})json",
+            "handles":{"type":"integer","default":8},"cut_in":{"type":"integer","default":1001},"amf":{"type":"boolean","default":true}},
+            "required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             VfxPullOptions o;
@@ -8187,6 +8273,7 @@ void McpServer::Impl::addTools() {
             o.format = str(a, "format", "exr").toStdString();
             o.handles = std::clamp(a.value("handles").toInt(8), 0, 1000);
             o.cutIn = a.value("cut_in").toInt(1001);
+            o.amf = a.value("amf").toBool(true);
             std::vector<Id> clips;
             for (const QJsonValue& v : a.value("clips").toArray()) clips.push_back(Id(v.toDouble()));
             if (clips.empty())
@@ -8201,7 +8288,7 @@ void McpServer::Impl::addTools() {
             for (const VfxShot& s : shots) {
                 list.append(QJsonObject{{"name", QString::fromStdString(s.name)}, {"folder", QString::fromStdString(s.folder)},
                                         {"first_frame", s.firstFrame}, {"cut_in", s.cutIn}, {"cut_out", s.cutOut}, {"last_frame", s.lastFrame},
-                                        {"head_handle", s.headHandle}, {"tail_handle", s.tailHandle}});
+                                        {"head_handle", s.headHandle}, {"tail_handle", s.tailHandle}, {"amf", QString::fromStdString(s.amf)}});
                 lines << QStringLiteral("%1: frames %2-%3 (cut %4-%5)").arg(QString::fromStdString(s.name)).arg(s.firstFrame).arg(s.lastFrame).arg(s.cutIn).arg(s.cutOut);
             }
             const QString csv = QDir(QString::fromStdString(o.folder)).filePath("pull_list.csv");

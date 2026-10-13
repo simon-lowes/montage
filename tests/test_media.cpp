@@ -83,6 +83,7 @@
 #include "media/Interpret.h"
 #include "render/AudioReactive.h"
 #include "render/VfxPull.h"
+#include "render/Amf.h"
 #include "render/AafExport.h"
 #include "core/Interpretation.h"
 #include "render/Adm.h"
@@ -5329,6 +5330,17 @@ private slots:
         const auto red = colour(file(shots[0], 1001, "exr")), blue = colour(file(shots[0], 1010, "exr"));
         QVERIFY2(red[0] > 0.6 && red[0] < 0.9 && red[2] < 0.05, qPrintable(QString("%1 %2 %3").arg(red[0]).arg(red[1]).arg(red[2])));
         QVERIFY2(blue[2] > 0.6 && blue[0] < 0.05, qPrintable(QString("%1 %2 %3").arg(blue[0]).arg(blue[1]).arg(blue[2])));
+        // Each shot's ACES Metadata File: its frames by number, in linear Rec.709 (a CLF beside it, ACES having no id
+        // for that), the cut's grade (none here) and the sequence's output transform.
+        AmfDocument amf;
+        QVERIFY2(readAmf(shots[0].amf, amf, &err), err.c_str());
+        QCOMPARE(amf.clipName, std::string("Shot_A"));
+        QCOMPARE(amf.clipSequence, std::string("Shot_A.####.exr"));
+        QVERIFY(amf.sequenceMin == 993 && amf.sequenceMax == 1018);
+        QCOMPARE(amf.inputSpace, std::string("linear-rec709"));
+        QVERIFY(QFileInfo::exists(QString::fromStdString(shots[0].folder + "/linear-rec709_to_ACES2065-1.clf")));
+        QVERIFY(amf.looks.empty());
+        QCOMPARE(amf.outputSpace, std::string("rec709"));
         // The pull list.
         QFile list(QString::fromStdString(o.folder + "/pull_list.csv"));
         QVERIFY(list.open(QIODevice::ReadOnly));
@@ -5355,7 +5367,11 @@ private slots:
         title.start = 40;
         edit::overwrite(p, s, {TrackKind::Video, 0}, title);
         QVERIFY(!exportVfxPulls(p, s, {title.id}, o, &shots, nullptr, nullptr, &err));
-        // Over MCP: every footage clip (the title skipped), as TIFF.
+        // Over MCP: every footage clip (the title skipped), as TIFF; shot A graded with a CDL, which its AMF carries.
+        Cdl grade;
+        grade.slope[0] = 1.2;
+        grade.saturation = 0.8;
+        setClipCdl(p, *edit::clipById(s, a.id), grade);
         const QString project = QString::fromStdString(path("pulls.montage"));
         QVERIFY(saveProject(p, project.toStdString()));
         McpServer server;
@@ -5372,6 +5388,33 @@ private slots:
         QCOMPARE(pulled.size(), 2);
         QCOMPARE(pulled[0].toObject().value("first_frame").toInt(), 997);
         QVERIFY(QFileInfo::exists(r.value("structuredContent").toObject().value("pull_list").toString()));
+        QVERIFY2(readAmf(pulled[0].toObject().value("amf").toString().toStdString(), amf, &err), err.c_str());
+        QVERIFY(amf.looks.size() == 1 && amf.looks[0].cdl.sameGrade(grade));
+        // montage_amf: shot A's AMF out, read, and onto shot B.
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject q{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_amf"}, {"arguments", args},
+                                                       {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                             {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto out = server.handle(QJsonDocument(q).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(out.back())).object().value("result").toObject();
+            return res;
+        };
+        const QString amfPath = QString::fromStdString(path("shotA.amf"));
+        QJsonObject res = call({{"project", project}, {"action", "export"}, {"path", amfPath}, {"clips", QJsonArray{double(a.id)}}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        res = call({{"project", project}, {"action", "read"}, {"path", amfPath}});
+        const QJsonObject held = res.value("structuredContent").toObject();
+        QCOMPARE(held.value("looks").toArray().at(0).toObject().value("kind").toString(), QString("cdl"));
+        QCOMPARE(held.value("output_space").toString(), QString("rec709"));
+        res = call({{"project", project}, {"action", "import"}, {"path", amfPath}, {"clips", QJsonArray{double(b.id)}}});
+        QCOMPARE(res.value("structuredContent").toObject().value("clips").toInt(), 1);
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        Cdl got;
+        QVERIFY(clipCdl(*edit::clipById(*back.active(), b.id), 0, got) && got.sameGrade(grade));
+        res = call({{"project", project}, {"action", "export"}, {"path", amfPath}});
+        QVERIFY(res.value("isError").toBool());  // (no clips)
     }
 
     void trimPassesOverMcp() {

@@ -8879,6 +8879,33 @@ private slots:
         QVERIFY(clipCdl(c0, 0, cc0) && cc0.sameGrade(h));
     }
 
+    void aleAmfColumns() {
+        // ACES dailies' AMF_NAME and AMF_UUID columns onto media, and out again only when some media has them.
+        Project p = makeDefaultProject();
+        for (const char* name : {"A001C001.mov", "A001C002.mov"}) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Video;
+            m.name = name;
+            m.path = std::string("/cards/") + name;
+            m.duration = 4;
+            m.fps = {25, 1};
+            m.hasVideo = true;
+            p.media.push_back(m);
+        }
+        AleTable t;
+        QVERIFY(parseAle("Heading\nFIELD_DELIM\tTABS\nFPS\t25\n\nColumn\nName\tAMF_NAME\tAMF_UUID\n\nData\n"
+                         "A001C001\tA001C001_graded\turn:uuid:797c7cd8-4eb1-4f67-afce-af2b0a1d0285\n", t));
+        QCOMPARE(applyAle(p, t, false).matched.size(), size_t(1));
+        QCOMPARE(p.media[0].metadata.at("amf_uuid"), std::string("urn:uuid:797c7cd8-4eb1-4f67-afce-af2b0a1d0285"));
+        QCOMPARE(p.media[0].metadata.at("amf_name"), std::string("A001C001_graded"));
+        const AleTable out = aleFromMedia(p, {p.media[0].id, p.media[1].id}, {25, 1});
+        QCOMPARE(out.value(0, "AMF_UUID"), std::string("urn:uuid:797c7cd8-4eb1-4f67-afce-af2b0a1d0285"));
+        QCOMPARE(out.value(1, "AMF_NAME"), std::string());
+        const AleTable plain = aleFromMedia(p, {p.media[1].id}, {25, 1});
+        QVERIFY(std::find(plain.columns.begin(), plain.columns.end(), "AMF_NAME") == plain.columns.end());
+    }
+
     void cdlAleReviewFixes() {
         Project p = makeDefaultProject();
         auto addMedia = [&](const char* name, std::string path, Rational fps, double tc) {

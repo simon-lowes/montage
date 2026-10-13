@@ -139,6 +139,7 @@
 #include "control/Osc.h"
 #include "control/SpeedEditor.h"
 #include "core/Cdl.h"
+#include "render/Amf.h"
 #include "control/Hui.h"
 #include "control/MackieControl.h"
 #include "MulticamPanel.h"
@@ -759,6 +760,51 @@ private slots:
         QVERIFY(af.open(QIODevice::ReadOnly));
         const QString aleText = QString::fromUtf8(af.readAll());
         QVERIFY2(aleText.contains("A001C005.mov") && aleText.contains("ASC_SOP") && aleText.contains("01:00:00:00"), qPrintable(aleText));
+    }
+
+    void amfFromTheMenus() {
+        state()->newProject();
+        QVERIFY(state()->edit("Media", [&](Project& p, Sequence& s) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Video;
+            m.name = "A001C012.mov";
+            m.path = "/cards/A001C012.mov";
+            m.duration = 8;
+            m.width = 1920;
+            m.height = 1080;
+            m.fps = s.fps;
+            m.hasVideo = true;
+            p.media.push_back(m);
+            return edit::placeMedia(p, s, m.id, 0, 0, 60, {TrackKind::Video, 0}, {}, false).ok;
+        }));
+        for (const char* name : {"importAmf", "exportAmf"}) QVERIFY(win_->findChild<QAction*>(name));
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        auto theClip = [&] { return edit::clipById(*state()->sequence(), clip); };
+        const QString data = QStringLiteral(MONTAGE_TEST_DATA_DIR "/amf");
+        // Nothing selected: the clip its clip name matches, as one undo step; the sequence's space kept when asked.
+        state()->setSelection({});
+        QCOMPARE(win_->importAmf(data + "/A001C012.amf", 0), 1);
+        QCOMPARE(theClip()->effects.size(), size_t(3));
+        QCOMPARE(state()->project().findMedia(theClip()->mediaId)->colorOverride, std::string("logc3-awg3"));
+        QVERIFY(win_->statusBar()->currentMessage().contains("Bleach"));  // the look it could not carry
+        state()->undo();
+        QVERIFY(theClip()->effects.empty());
+        // Another onto the selected clip, taking its output transform's space.
+        state()->setSelection({clip});
+        QCOMPARE(win_->importAmf(data + "/B002C003.amf", 1), 1);
+        QCOMPARE(state()->sequence()->colorSpace, std::string("rec2100pq"));
+        QCOMPARE(win_->importAmf(data + "/missing.amf", 0), 0);
+        // Out again for the selected clip; without a selection, a hint.
+        const QString out = dir_.path() + "/clip.amf";
+        QCOMPARE(win_->exportAmf(out), 1);
+        AmfDocument back;
+        QVERIFY(readAmf(out.toStdString(), back));
+        QCOMPARE(back.outputSpace, std::string("rec2100pq"));
+        QCOMPARE(back.looks.size(), size_t(1));
+        state()->setSelection({});
+        win_->findChild<QAction*>("exportAmf")->trigger();
+        QTRY_VERIFY(win_->statusBar()->currentMessage().contains("Select the clips"));
     }
 
     void controlSurfaceMackie() {

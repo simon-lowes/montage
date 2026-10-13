@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 
+#include "Amf.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 
@@ -121,6 +122,26 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
         };
         std::string why;
         if (!exportSequence(p, alone, st, prog, cancel, &why)) return fail(name + ": " + why);
+        if (o.amf) {
+            // The frames' space as the input transform and the cut's grade as looks, for the frames by their numbers.
+            const std::string space = !st.colorSpace.empty() ? st.colorSpace
+                                      : o.format == "exr"    ? std::string("linear-rec709")
+                                      : !m.colorOverride.empty() ? m.colorOverride
+                                                                 : m.colorSpace;
+            AmfDocument amf;
+            if (!clipAmf(p, seq, c, shot.folder, amf, nullptr, space, &why)) return fail(name + ": " + why);
+            amf.clipName = name;
+            amf.clipFile.clear();
+            amf.clipUuid.clear();
+            amf.clipSequence = name + ".####." + ext;
+            amf.sequenceMin = shot.firstFrame;
+            amf.sequenceMax = shot.lastFrame;
+            shot.amf = QDir(QString::fromStdString(shot.folder)).filePath(QString::fromStdString(name) + QStringLiteral(".amf")).toStdString();
+            const std::string xml = writeAmf(amf);
+            QFile f(QString::fromStdString(shot.amf));
+            if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(xml.data(), qint64(xml.size())) != qint64(xml.size()))
+                return fail("Cannot write " + shot.amf);
+        }
         shots.push_back(shot);
     }
     // The pull list.

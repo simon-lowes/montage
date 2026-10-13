@@ -256,6 +256,11 @@ public:
     // clips' CDLs (else every clip with one) as a .cc (one) or a .ccc or .cdl.
     int importCdl(const QString& path);
     bool exportCdl(const QString& path);
+    // ACES Metadata Files (render/Amf.h): one onto the selected clips (else the clips it names); `setSpace` -1 asks
+    // whether the sequence takes its output transform's space. Export writes one for each selected clip (`target` a
+    // file for one, a folder for more).
+    int importAmf(const QString& path, int setSpace = -1);
+    int exportAmf(const QString& target);
     // File › Link Media: the dialog for the offline media (shown by itself when a project opens with some), or a
     // message and nullptr when nothing is offline.
     LinkMediaDialog* showLinkMedia();

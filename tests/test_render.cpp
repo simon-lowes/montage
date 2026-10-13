@@ -2,6 +2,7 @@
 #include <QtTest>
 #include <map>
 #include <QTemporaryDir>
+#include <QProcess>
 
 #include <algorithm>
 #include <QDir>
@@ -32,6 +33,8 @@
 #include "render/ColorSpace.h"
 #include "render/ColorSlice.h"
 #include "render/Clf.h"
+#include "render/Amf.h"
+#include "core/Cdl.h"
 #include "render/Gamut.h"
 #include "render/HdrView.h"
 #include "render/Compositor.h"
@@ -239,6 +242,181 @@ private slots:
         for (int i = 0; i < 3; ++i)
             QVERIFY2(std::fabs(compressed[i] - want[i]) < 0.005f, qPrintable(QString("%1: %2 vs %3").arg(i).arg(compressed[i]).arg(want[i])));
         QVERIFY2(std::fabs(compressed[1] - plain[1]) > 0.005f, qPrintable(QString("%1 / %2").arg(plain[1]).arg(compressed[1])));
+    }
+
+    void acesMetadataFiles() {
+        // Transform ids, ACES 1 and 2, and Montage's colour spaces both ways.
+        bool exact = false;
+        QCOMPARE(acesInputSpace("urn:ampas:aces:transformId:v1.5:IDT.ARRI.Alexa-v3-logC-EI800.a1.v2", &exact), std::string("logc3-awg3"));
+        QVERIFY(exact);
+        QCOMPARE(acesInputSpace("urn:ampas:aces:transformId:v1.5:IDT.ARRI.Alexa-v3-logC-EI1600.a1.v2", &exact), std::string("logc3-awg3"));
+        QVERIFY(!exact);  // (another exposure index's curve)
+        QCOMPARE(acesInputSpace("urn:ampas:aces:transformId:v2.0:CSC.Sony.Venice_SLog3_SGamut3Cine_to_ACES.a2.v1", &exact), std::string("slog3-sgamut3cine"));
+        QVERIFY(!exact);
+        QCOMPARE(acesInputSpace("urn:ampas:aces:transformId:v1.5:ACEScsc.Academy.ACEScct_to_ACES.a1.0.3"), std::string("acescct"));
+        QCOMPARE(acesInputSpace("urn:ampas:aces:transformId:v2.0:CSC.Canon.CLog2_CGamut_to_ACES.a1.v1"), std::string());
+        double peak = 0;
+        QCOMPARE(acesOutputSpace("urn:ampas:aces:transformId:v1.5:RRTODT.Academy.Rec2020_2000nits_15nits_ST2084.a1.1.0", &peak), std::string("rec2100pq"));
+        QCOMPARE(peak, 2000.0);
+        QCOMPARE(acesOutputSpace("urn:ampas:aces:transformId:v1.5:RRTODT.Academy.P3D65_108nits_7point2nits_ST2084.a1.1.0", &peak), std::string("p3d65pq"));
+        QCOMPARE(peak, 108.0);
+        QCOMPARE(acesOutputSpace("urn:ampas:aces:transformId:v2.0:Output.Academy.P3-D65_1000nit_in_Rec2100-D65_HLG.a2.v1"), std::string("rec2100hlg"));
+        QCOMPARE(acesOutputSpace("urn:ampas:aces:transformId:v1.5:ODT.Academy.P3D60_48nits.a1.0.3"), std::string());  // (cinema)
+        QCOMPARE(acesOutputSpace("urn:ampas:aces:transformId:v2.0:Output.Academy.P3-D65_48nit_in_P3-D65_Gamma2pt6.a2.v1"), std::string());
+        for (const auto& cs : colorSpaces()) {
+            const std::string in = acesInputTransformId(cs.id);
+            if (!in.empty()) QCOMPARE(acesInputSpace(in, &exact), cs.id);
+            const std::string out = acesOutputTransformId(cs.id, 1000);
+            if (!out.empty()) QCOMPARE(acesOutputSpace(out), cs.id);
+            if (cs.id == "rec709" || cs.id == "rec2100pq" || cs.id == "p3d65pq" || cs.id == "slog3-sgamut3cine") QVERIFY(!(in + out).empty());
+        }
+        QVERIFY(acesOutputTransformId("rec2100pq", 1200).find("_1000nit_") != std::string::npos);  // (the nearest ACES has)
+        QVERIFY(acesOutputTransformId("p3d65pq", 100).find("_108nit_") != std::string::npos);
+
+        // Reading: an ACES 1 pipeline for a camera clip, and an ACES 2 one with its CDL in a collection.
+        const std::string data = std::string(MONTAGE_TEST_DATA_DIR) + "/amf";
+        AmfDocument a;
+        std::string err;
+        QVERIFY2(readAmf(data + "/A001C012.amf", a, &err), err.c_str());
+        QCOMPARE(a.clipName, std::string("A001C012"));
+        QCOMPARE(a.clipSequence, std::string("A001_C012_AE0306_####.ari"));
+        QCOMPARE(a.sequenceMax, 240);
+        QVERIFY(a.hasInput && !a.inputApplied);
+        QCOMPARE(a.inputSpace, std::string("logc3-awg3"));
+        QCOMPARE(a.looks.size(), size_t(5));
+        QVERIFY(a.looks[0].applied && a.looks[0].cdl.slope[0] == 2.0 && a.looks[0].cdl.saturation == 0.5);  // (ASC_SOP, as ACES 1 wrote it)
+        QVERIFY(!a.looks[1].applied && a.looks[1].kind == AmfLook::Kind::Cdl);
+        QCOMPARE(a.looks[1].cdlSpace, std::string("acescct"));
+        QVERIFY(a.looks[1].cdl.slope[2] == 0.9 && a.looks[1].cdl.power[1] == 1.05 && a.looks[1].cdl.saturation == 0.9);
+        QCOMPARE(a.looks[2].file, data + "/show_look.clf");
+        QVERIFY(a.looks[3].kind == AmfLook::Kind::TransformId);
+        QCOMPARE(a.outputSpace, std::string("rec709"));
+        AmfDocument b;
+        QVERIFY2(readAmf(data + "/B002C003.amf", b, &err), err.c_str());
+        QCOMPARE(b.inputSpace, std::string("rec709"));  // an inverse output transform: video made for that display
+        QCOMPARE(b.looks.size(), size_t(1));
+        QVERIFY(b.looks[0].cdl.slope[2] == 1.08 && b.looks[0].cdl.saturation == 1.15);  // grade7 from grades.ccc
+        QCOMPARE(b.outputSpace, std::string("rec2100pq"));
+        QCOMPARE(b.outputPeakNits, 1000.0);
+        QVERIFY(!parseAmf("<aces:acesMetadataFile xmlns:aces=\"urn:ampas:aces:amf:v2.0\"/>", {}, b, &err));
+        QVERIFY(err.find("pipeline") != std::string::npos);
+        QVERIFY(!parseAmf("<ProcessList/>", {}, b, &err));
+
+        // Onto clips: the one its clip name matches (the camera file's), not the other.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        auto media = [&](const char* name, const char* space) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Video;
+            m.name = name;
+            m.path = std::string("/cards/") + name;
+            m.duration = 10;
+            m.width = 1920;
+            m.height = 1080;
+            m.fps = s.fps;
+            m.hasVideo = true;
+            m.colorSpace = space;
+            p.media.push_back(m);
+            QVERIFY(edit::placeMedia(p, s, m.id, s.duration(), 0, 24, {TrackKind::Video, 0}, {}, false).ok);
+        };
+        media("A001C012.mov", "");
+        media("B002C003.mxf", "");
+        const Id camera = s.videoTracks[0].clips[0].id, interview = s.videoTracks[0].clips[1].id;
+        AmfImportResult r = applyAmf(p, s, {}, a);
+        QCOMPARE(r.clips, 1);
+        QVERIFY(std::find_if(r.notes.begin(), r.notes.end(), [](const std::string& n) { return n.find("Bleach") != std::string::npos; }) != r.notes.end());
+        const Clip* cam = edit::clipById(s, camera);
+        QCOMPARE(p.findMedia(cam->mediaId)->colorOverride, std::string("logc3-awg3"));
+        QCOMPARE(p.findMedia(cam->mediaId)->metadata.at("amf_name"), std::string("A001C012"));
+        QCOMPARE(cam->effects.size(), size_t(3));  // the CDL, the look and the gamut compression (not the applied one)
+        QCOMPARE(cam->effects[0].type, std::string("cdl"));
+        QCOMPARE(cam->effects[0].s("space"), std::string("ACEScct"));
+        Cdl g;
+        QVERIFY(clipCdl(*cam, 0, g) && g.slope[0] == 1.1 && g.saturation == 0.9);
+        QCOMPARE(cam->effects[1].type, std::string("lut"));
+        QCOMPARE(cam->effects[1].s("path"), data + "/show_look.clf");
+        QCOMPARE(cam->effects[1].s("space"), findColorSpace("aces2065-1")->label);
+        QCOMPARE(cam->effects[2].type, std::string("aces_gamut_compress"));
+        QVERIFY(edit::clipById(s, interview)->effects.empty());
+        QCOMPARE(s.colorSpace, std::string("rec709"));
+        // Again: the earlier AMF's effects give way; a hand-added effect stays. The other file onto a chosen clip, with
+        // its output transform's space for the sequence.
+        edit::clipById(s, camera)->effects.push_back(makeEffect(p, "hue_sat"));
+        QCOMPARE(applyAmf(p, s, {}, a).clips, 1);
+        QCOMPARE(edit::clipById(s, camera)->effects.size(), size_t(4));
+        QCOMPARE(edit::clipById(s, camera)->effects[3].type, std::string("hue_sat"));
+        AmfDocument named;
+        QVERIFY(readAmf(data + "/B002C003.amf", named));
+        named.clipName = "nothing here";
+        named.clipFile.clear();
+        QCOMPARE(applyAmf(p, s, {}, named).clips, 0);
+        AmfImportOptions o;
+        o.setSequenceSpace = true;
+        QCOMPARE(applyAmf(p, s, {interview}, named, o).clips, 1);
+        QCOMPARE(s.colorSpace, std::string("rec2100pq"));
+        QCOMPARE(s.hdrPeakNits, 1000.0);
+        QCOMPARE(edit::clipById(s, interview)->effects.size(), size_t(1));
+
+        // Out again: the camera clip's AMF has its IDT, its looks and the sequence's output transform; the look file
+        // beside it. A clip of video gets an inverse output transform; a CDL in a space ACES has no id for, a CLF of it.
+        QTemporaryDir dir;
+        std::vector<std::string> notes;
+        const std::string camPath = dir.path().toStdString() + "/cam.amf";
+        QVERIFY2(writeClipAmf(p, s, *edit::clipById(s, camera), camPath, &notes, {}, &err), err.c_str());
+        QVERIFY(std::find_if(notes.begin(), notes.end(), [](const std::string& n) { return n.find("Hue / Saturation") != std::string::npos; }) != notes.end());
+        AmfDocument back;
+        QVERIFY2(readAmf(camPath, back, &err), err.c_str());
+        QCOMPARE(back.clipName, std::string("A001C012"));
+        QCOMPARE(back.clipFile, std::string("A001C012.mov"));
+        QCOMPARE(back.inputTransformId, acesInputTransformId("logc3-awg3"));
+        QCOMPARE(back.looks.size(), size_t(3));
+        QVERIFY(back.looks[0].cdl.sameGrade(g));
+        QCOMPARE(back.looks[0].cdlSpace, std::string("acescct"));
+        QCOMPARE(back.looks[1].file, dir.path().toStdString() + "/show_look.clf");
+        QVERIFY(QFileInfo::exists(QString::fromStdString(back.looks[1].file)));
+        QCOMPARE(back.looks[2].transformId, std::string("urn:ampas:aces:transformId:v2.0:Look.Academy.ReferenceGamutCompress.a2.v1"));
+        QCOMPARE(back.outputSpace, std::string("rec2100pq"));
+        QCOMPARE(back.outputPeakNits, 1000.0);
+        Clip& iv = *edit::clipById(s, interview);
+        for (Effect& e : iv.effects) e.strings["space"] = "Working space";
+        const std::string ivPath = dir.path().toStdString() + "/interview.amf";
+        QVERIFY2(writeClipAmf(p, s, iv, ivPath, &notes, {}, &err), err.c_str());
+        QVERIFY(readAmf(ivPath, back, &err));
+        QCOMPARE(back.inputSpace, std::string("rec709"));
+        QVERIFY(back.inputTransformId.find(":InvOutput.Academy.Rec709-D65_100nit_in_Rec709-D65_BT1886") != std::string::npos);
+        QCOMPARE(back.looks.size(), size_t(1));
+        QCOMPARE(back.looks[0].cdlSpace, std::string("rec2100pq"));  // the working space, by the CLF Montage wrote for it
+        // That CLF is the space's code values in ACES2065-1.
+        auto clf = loadClf(dir.path().toStdString() + "/rec2100pq_to_ACES2065-1.clf", &err);
+        QVERIFY2(clf, err.c_str());
+        float v[3] = {0.5f, 0.3f, 0.7f};
+        clf->apply(v);
+        double m[9], l[3];
+        primariesMatrix(Primaries::Bt2020, Primaries::Ap0, m);
+        for (int i = 0; i < 3; ++i) l[i] = toLinear(Transfer::Pq, i == 0 ? 0.5 : i == 1 ? 0.3 : 0.7);
+        for (int i = 0; i < 3; ++i) QVERIFY(std::fabs(v[i] - (m[i * 3] * l[0] + m[i * 3 + 1] * l[1] + m[i * 3 + 2] * l[2])) < 2e-3);
+        if (ocioAvailable()) {
+            float o[3] = {0.5f, 0.3f, 0.7f};
+            QVERIFY2(applyOcioFile(dir.path().toStdString() + "/rec2100pq_to_ACES2065-1.clf", o, 1, &err), err.c_str());
+            for (int i = 0; i < 3; ++i) QVERIFY(std::fabs(o[i] - v[i]) < 1e-4);
+        }
+        // A LUT in another space cannot be an AMF look.
+        Effect lut = makeEffect(p, "lut");
+        lut.strings["path"] = data + "/show_look.clf";
+        lut.strings["space"] = "ACEScct";
+        iv.effects.push_back(lut);
+        QVERIFY(writeClipAmf(p, s, iv, ivPath, &notes, {}, &err));
+        QVERIFY(std::find_if(notes.begin(), notes.end(), [](const std::string& n) { return n.find("left out") != std::string::npos; }) != notes.end());
+        // What Montage writes is a valid AMF 2.0 (checked against the Academy's schema when it is at hand).
+        if (const char* xsd = getenv("MONTAGE_AMF_SCHEMA")) {
+            for (const std::string& f : {camPath, ivPath}) {
+                QProcess lint;
+                lint.start("xmllint", {"--noout", "--schema", xsd, QString::fromStdString(f)});
+                QVERIFY(lint.waitForFinished());
+                QVERIFY2(lint.exitCode() == 0, lint.readAllStandardError().constData());
+            }
+        }
     }
 
     void clfMatchesOcio() {

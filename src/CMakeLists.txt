@@ -167,6 +167,7 @@ add_library(montage_engine STATIC
   render/Gamut.h render/Gamut.cpp
   render/ColorSlice.h render/ColorSlice.cpp
   render/Clf.h render/Clf.cpp
+  render/Amf.h render/Amf.cpp
   render/HdrView.h render/HdrView.cpp
   render/Ocio.h render/Ocio.cpp
   render/Compositor.h render/Compositor.cpp
