@@ -1353,31 +1353,9 @@ void refineMatteEdges(std::vector<float>& matte, const Image& guide, double radi
     });
 }
 
-std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, double pixelScale, double sourceSeconds) {
-    std::vector<float> matte;
-    if (img.empty() || !hasMask(e, t)) return matte;
-    const int W = img.width, H = img.height;
-    matte.assign(size_t(W) * size_t(H), 1.0f);
-    const int shape = int(std::lround(e.p("mask.shape", t)));
-    if (shape == 3) {
-        // The objects picked by the model (those added, less those subtracted): nothing where none was segmented.
-        std::vector<float> logits;
-        if (e.object && sourceSeconds >= 0 && e.object->maskLogitsAt(sourceSeconds, logits))
-            matte = objectMatte(logits, W, H, e.p("mask.feather", t, 20) * pixelScale, e.p("mask.expansion", t) * pixelScale);
-        else
-            std::fill(matte.begin(), matte.end(), 0.f);
-    }
-    if (shape == 4) {
-        // The people in the picture; nothing without the model.
-        const ValueMap* person = currentPersonMatte();
-        if (person && !person->empty()) {
-            matte = person->resized(W, H);
-            refineMatte(matte, W, H, e.p("mask.expansion", t) * pixelScale, e.p("mask.feather", t, 20) * pixelScale,
-                        e.p("mask.feather", t, 20) * pixelScale * 0.25);
-        } else {
-            std::fill(matte.begin(), matte.end(), 0.f);
-        }
-    }
+namespace {
+// An effect mask's drawn shape (an ellipse, a rectangle, a path or a gradient) into `matte`, a picture's size.
+void drawMaskShape(const Effect& e, FrameTime t, int shape, std::vector<float>& matte, int W, int H, double pixelScale) {
     if (shape == 5) {
         // A drawn path, in the mask's box: nothing until it has three points.
         const std::vector<PathPoint> pts = maskPath(e, t);
@@ -1441,6 +1419,35 @@ std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, d
                 }
         });
     }
+}
+}  // namespace
+
+std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, double pixelScale, double sourceSeconds) {
+    std::vector<float> matte;
+    if (img.empty() || !hasMask(e, t)) return matte;
+    const int W = img.width, H = img.height;
+    matte.assign(size_t(W) * size_t(H), 1.0f);
+    const int shape = int(std::lround(e.p("mask.shape", t)));
+    if (shape == 3) {
+        // The objects picked by the model (those added, less those subtracted): nothing where none was segmented.
+        std::vector<float> logits;
+        if (e.object && sourceSeconds >= 0 && e.object->maskLogitsAt(sourceSeconds, logits))
+            matte = objectMatte(logits, W, H, e.p("mask.feather", t, 20) * pixelScale, e.p("mask.expansion", t) * pixelScale);
+        else
+            std::fill(matte.begin(), matte.end(), 0.f);
+    }
+    if (shape == 4) {
+        // The people in the picture; nothing without the model.
+        const ValueMap* person = currentPersonMatte();
+        if (person && !person->empty()) {
+            matte = person->resized(W, H);
+            refineMatte(matte, W, H, e.p("mask.expansion", t) * pixelScale, e.p("mask.feather", t, 20) * pixelScale,
+                        e.p("mask.feather", t, 20) * pixelScale * 0.25);
+        } else {
+            std::fill(matte.begin(), matte.end(), 0.f);
+        }
+    }
+    drawMaskShape(e, t, shape, matte, W, H, pixelScale);
     if (shape > 0 && shape != 6) {
         // The shape's holes and gaps closed (Consolidate), then its edge settled on the picture's own (Refine Edges,
         // as Photoshop's Refine Edge and Resolve's Smart Refine). A gradient has neither holes nor an object's edge.
@@ -2826,10 +2833,39 @@ void applyAcesGamutCompress(const Effect& e, FrameTime t, const ColorSpace& spac
     });
 }
 
-bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out) {
+bool gpuMask(const Effect& e, FrameTime t, gpu::ColorOp& op, int width, int height, double pixelScale) {
+    const int shape = int(std::lround(e.p("mask.shape", t)));
+    if (shape == 3 || shape == 4 || shape > 6 || e.p("mask.depth", t) > 0.5 || e.p("mask.show", t) > 0.5 ||
+        (shape > 0 && shape != 6 && e.p("mask.refine", t) > 0))
+        return false;  // (what the picture holds, or the mask shown)
+    // As effectMatte makes it: the shape (and its holes closed) here, the qualifier, inverting and fading there.
+    op.masked = true;
+    if (shape > 0 && width > 0 && height > 0) {
+        op.mask.assign(size_t(width) * size_t(height), 1.0f);
+        drawMaskShape(e, t, shape, op.mask, width, height, pixelScale);
+        if (shape != 6) consolidateMatte(op.mask, width, height, e.p("mask.consolidate", t) * pixelScale, e.p("mask.feather", t, 20) * pixelScale);
+    }
+    const bool qualify = e.p("mask.qualify", t) > 0.5;
+    const float m[12] = {shape > 0 ? 1.0f : 0.0f,
+                         qualify ? 1.0f : 0.0f,
+                         e.p("mask.invert", t) > 0.5 ? 1.0f : 0.0f,
+                         float(std::clamp(e.p("mask.opacity", t, 100) / 100.0, 0.0, 1.0)),
+                         float(e.p("mask.hue", t)),
+                         float(e.p("mask.hue_width", t, 60) / 2),
+                         float(std::clamp(e.p("mask.softness", t, 20) / 100.0, 0.0, 1.0)),
+                         float(e.p("mask.sat_low", t, 15) / 100),
+                         float(e.p("mask.sat_high", t, 100) / 100),
+                         float(e.p("mask.lum_low", t, 5) / 100),
+                         float(e.p("mask.lum_high", t, 100) / 100),
+                         0};
+    std::copy(m, m + 12, op.maskParams);
+    return true;
+}
+
+bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, int width, int height, double pixelScale) {
     if (!e.enabled) return true;
-    if (hasMask(e, t)) return false;
     gpu::ColorOp op;
+    if (hasMask(e, t) && !gpuMask(e, t, op, 0, 0, pixelScale)) return false;
     if (e.type == "color_correct") {
         const ColorCorrectSetup s = colorCorrectSetup(e, t);
         op.kind = gpu::ColorOp::ColorCorrect;
@@ -2885,9 +2921,57 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out) {
                                   [lut](float v[3]) { lut->apply(v[0], v[1], v[2]); });
             op.clampFirst = true;
         }
+    } else if (e.type == "cdl") {
+        const Cdl cdl = effectCdl(e, t);
+        if (cdl.identity()) return true;
+        if (const ColorSpace* space = applyInSpace(e)) {  // (baked as applyCdlEffect bakes it)
+            op.kind = gpu::ColorOp::Lut;
+            op.lut = bakedInSpace(*space, "cdl|" + cdlSopText(cdl) + cdlNumber(cdl.saturation),
+                                  [cdl](float v[3]) { applyCdl(cdl, v[0], v[1], v[2]); });
+            op.clampFirst = true;
+        } else {
+            op.kind = gpu::ColorOp::Cdl;
+            for (int i = 0; i < 3; ++i) {
+                op.params[i] = float(cdl.slope[i]);
+                op.params[4 + i] = float(cdl.offset[i]);
+                op.params[8 + i] = float(cdl.power[i]);
+            }
+            op.params[3] = float(cdl.saturation);
+        }
+    } else if (e.type == "color_space_transform") {
+        const ColorSpace* from = nullptr;
+        const ColorSpace* to = nullptr;
+        for (const auto& cs : colorSpaces()) {
+            if (cs.label == e.s("from")) from = &cs;
+            if (cs.label == e.s("to")) to = &cs;
+        }
+        if (!from || !to || from->id == to->id) return true;
+        op.kind = gpu::ColorOp::Lut;  // (convertColor's LUT, clamped first as it clamps)
+        op.lut = conversionLut(*from, *to, 1000);
+        op.clampFirst = true;
+    } else if (e.type == "invert") {
+        op.kind = gpu::ColorOp::Invert;
+        op.params[0] = float(e.p("amount", t, 100)) / 100.0f;
+    } else if (e.type == "black_white") {
+        op.kind = gpu::ColorOp::BlackWhite;
+        op.params[0] = float(e.p("amount", t, 100)) / 100.0f;
+        op.params[4] = float(e.p("tint.r", t, 1)), op.params[5] = float(e.p("tint.g", t, 1)), op.params[6] = float(e.p("tint.b", t, 1));
+    } else if (e.type == "hue_sat") {
+        op.kind = gpu::ColorOp::HueSat;
+        const float hue = float(e.p("hue", t)) * float(M_PI) / 180.0f;
+        op.params[0] = std::cos(hue), op.params[1] = std::sin(hue);
+        op.params[2] = float(e.p("saturation", t, 1)), op.params[3] = float(e.p("lightness", t));
+        op.params[4] = float(e.p("vibrance", t));
+    } else if (e.type == "levels") {
+        op.kind = gpu::ColorOp::Levels;
+        const float inB = float(e.p("in_black", t, 0)), inW = float(e.p("in_white", t, 1));
+        op.params[0] = inB, op.params[1] = std::max(1e-4f, inW - inB);
+        op.params[2] = 1.f / float(std::max(0.05, e.p("gamma", t, 1)));
+        op.params[4] = float(e.p("out_black", t, 0)), op.params[5] = float(e.p("out_white", t, 1));
     } else {
         return false;
     }
+    if (op.masked) gpuMask(e, t, op, width, height, pixelScale);  // (now with its shape drawn)
     out.push_back(std::move(op));
     return true;
 }

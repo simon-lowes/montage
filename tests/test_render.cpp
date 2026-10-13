@@ -6781,6 +6781,83 @@ colorspaces:
         look.strings["space"] = "ACEScct";
         s.videoTracks[0].clips[1].effects.push_back(look);
         compare(60, o, "source look");
+        // Masks: an ellipse, feathered and rotated, with a qualifier on reds and greens; a gradient, inverted and faded;
+        // a qualifier alone. And the other per-pixel effects the GPU has.
+        Clip* graded = edit::clipById(s, r2.created[0]);
+        graded->effects[0].params["mask.shape"] = 1.0;
+        graded->effects[0].params["mask.x"] = 0.4;
+        graded->effects[0].params["mask.y"] = 0.55;
+        graded->effects[0].params["mask.w"] = 0.5;
+        graded->effects[0].params["mask.h"] = 0.35;
+        graded->effects[0].params["mask.rotation"] = 25.0;
+        graded->effects[0].params["mask.feather"] = 12.0;
+        graded->effects[0].params["mask.qualify"] = 1.0;
+        graded->effects[0].params["mask.hue"] = 40.0;
+        graded->effects[0].params["mask.hue_width"] = 140.0;
+        graded->effects[1].params["mask.shape"] = 6.0;
+        graded->effects[1].params["mask.rotation"] = -30.0;
+        graded->effects[1].params["mask.invert"] = 1.0;
+        graded->effects[1].params["mask.opacity"] = 70.0;
+        graded->effects[2].params["mask.qualify"] = 1.0;
+        graded->effects[2].params["mask.lum_low"] = 30.0;
+        compare(20, o, "masks");
+        Effect cdl = makeEffect(p, "cdl");
+        cdl.params["slope.r"] = 1.2;
+        cdl.params["offset.b"] = 0.05;
+        cdl.params["power.g"] = 0.8;
+        cdl.params["saturation"] = 1.3;
+        Effect cst = makeEffect(p, "color_space_transform");
+        cst.strings["from"] = "Rec.709 (SDR video)";
+        cst.strings["to"] = "Display P3";
+        Effect inv = makeEffect(p, "invert");
+        inv.params["amount"] = 30.0;
+        inv.params["mask.shape"] = 2.0;
+        Effect bw = makeEffect(p, "black_white");
+        bw.params["amount"] = 40.0;
+        bw.params["tint.b"] = 0.8;
+        Effect hs = makeEffect(p, "hue_sat");
+        hs.params["hue"] = 25.0;
+        hs.params["vibrance"] = 0.4;
+        hs.params["lightness"] = -0.1;
+        Effect lv = makeEffect(p, "levels");
+        lv.params["in_black"] = 0.05;
+        lv.params["gamma"] = 1.3;
+        lv.params["out_white"] = 0.9;
+        for (const Effect& e : {cdl, cst, inv, bw, hs, lv}) graded->effects.push_back(e);
+        gpu::resetStats();
+        compare(20, o, "more effects");
+        QCOMPARE(gpu::stats().cpuLayers, 0L);
+        // As grade nodes in series, one with a window and a qualifier at 60 %, one faded to 50 %; then beside another
+        // through a parallel mixer, which the GPU leaves to the CPU.
+        const Id topId = r2.created[0];
+        QVERIFY(edit::convertToNodes(s, topId).ok);
+        Effect window = makeEffect(p, "grade_node");
+        window.node = 2;
+        window.params["mask.shape"] = 1.0;
+        window.params["mask.x"] = 0.6;
+        window.params["mask.w"] = 0.6;
+        window.params["mask.h"] = 0.7;
+        window.params["mask.qualify"] = 1.0;
+        window.params["mask.sat_low"] = 20.0;
+        window.params["mix"] = 60.0;
+        Effect faded = makeEffect(p, "grade_node");
+        faded.node = 4;
+        faded.params["mix"] = 50.0;
+        edit::clipById(s, topId)->effects.push_back(window);
+        edit::clipById(s, topId)->effects.push_back(faded);
+        gpu::resetStats();
+        compare(20, o, "serial nodes");
+        QCOMPARE(gpu::stats().cpuLayers, 0L);
+        // The faded node showing its matte as grey is left to the CPU.
+        edit::clipById(s, topId)->effects.back().params["mask.show"] = 1.0;
+        gpu::resetStats();
+        compare(20, o, "node shows its matte");
+        QVERIFY(gpu::stats().cpuLayers >= 1);
+        edit::clipById(s, topId)->effects.back().params["mask.show"] = 0.0;
+        QVERIFY(edit::addGradeNode(p, s, topId, edit::NodeHow::Parallel, 3).ok);
+        gpu::resetStats();
+        compare(20, o, "parallel nodes");
+        QVERIFY(gpu::stats().cpuLayers >= 1);
         // An HDR sequence seen on an SDR display.
         s.colorSpace = "rec2100pq";
         o.displaySpace = "rec709";
@@ -6788,7 +6865,7 @@ colorspaces:
     }
 
     // A frame the GPU cannot draw (an adjustment layer) falls back to the CPU whole, and a clip it cannot grade (a
-    // masked effect) is made on the CPU and composited there; either way the picture is the CPU's.
+    // mask with Refine Edges) is made on the CPU and composited there; either way the picture is the CPU's.
     void gpuFallback() {
         std::string why;
         if (!gpu::initialize(&why)) QSKIP(why.c_str());
@@ -6806,6 +6883,7 @@ colorspaces:
         cc.params["mask.y"] = 0.5;
         cc.params["mask.w"] = 0.5;
         cc.params["mask.h"] = 0.5;
+        cc.params["mask.refine"] = 50.0;
         masked.effects.push_back(cc);
         const Id maskedId = masked.id;
         QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, masked).ok);

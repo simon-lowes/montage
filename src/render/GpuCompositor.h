@@ -33,13 +33,20 @@ void shutdown();           // (before the application goes; initialize() again i
 
 // One colour step on a layer at its source size (render/Processing's colour effects, as they run there).
 struct ColorOp {
-    enum Kind { Lut, ColorCorrect, Curves, HueCurves } kind = Lut;
+    // (Mark keeps the picture as it is, for a Mix later to mix what the steps between made with it, through its mask:
+    // a grade node's mask and mix.)
+    enum Kind { Lut, ColorCorrect, Curves, HueCurves, Cdl, Invert, BlackWhite, HueSat, Levels, Mark, Mix } kind = Lut;
     std::shared_ptr<const Lut3D> lut;  // Lut
     bool clampFirst = false;           // Lut: the colour clamped to 0..1 first (a LUT baked into another space)
     float strength = 1;                // Lut
     float params[32] = {};             // ColorCorrect: see gpucolor.frag; Curves and HueCurves: [0] mix
     std::vector<float> table;          // RGBA rows of tableWidth (curves one a channel; Color Correct's tone in red)
     int tableWidth = 0;
+    // Through the effect's mask: its drawn shape (the layer's size; empty for none) and gpucolor.frag's p[13..15]
+    // (shape, qualifier, inverted, opacity; hue centre, half width, softness; saturation and luma ranges).
+    bool masked = false;
+    std::vector<float> mask;
+    float maskParams[12] = {};
 };
 
 // Where a layer goes on the canvas (render/Compositor's Geometry, worked out on the CPU).

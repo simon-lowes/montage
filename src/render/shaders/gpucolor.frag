@@ -3,13 +3,18 @@
 // without alpha left alone, premultiplied again after):
 //   0  a decoded frame (16-bit RGBA, two RG16 texels a pixel) premultiplied, through the input transform's LUT if any
 //   1  a LUT effect (.cube, 3D or 1D), clamped first when baked into another space, mixed by its strength
-//   2  Color Correct, 3  Curves, 4  Hue Curves
+//   2  Color Correct, 3  Curves, 4  Hue Curves, 5  ASC CDL, 6  Invert, 7  Black & White, 8  Hue/Saturation, 9  Levels
+//   10 a grade node's picture (table) mixed with what came into it (srcTex) through the node's mask and mix
+// Through the effect's mask where it has one (p[13..15]): its shape drawn on the CPU (maskTex), an HSL qualifier on
+// the colour as it comes in, inverted and faded, and the picture mixed with what the effect made by it (all four
+// channels, premultiplied, as the CPU mixes them).
 layout(location = 0) out vec4 fragColor;
 layout(std140, binding = 0) uniform Params { vec4 p[16]; };
 layout(binding = 1) uniform sampler2D srcTex;  // RGBA32F, premultiplied
 layout(binding = 2) uniform sampler2D src16;   // RG16
 layout(binding = 3) uniform sampler3D lut3;    // RGBA32F, red along x
 layout(binding = 4) uniform sampler2D table;   // RGBA32F: a 1D LUT, or curve tables (one a channel)
+layout(binding = 5) uniform sampler2D maskTex; // R32F: the mask's shape, the layer's size
 
 float clamp01(float v) { return v > 0.0 ? min(v, 1.0) : 0.0; }  // (NaN to 0, as the CPU does)
 float luma(vec3 c) { return 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b; }
@@ -127,6 +132,74 @@ vec3 hueCurves(vec3 c) {
     return c + (o + vec3(m) - c) * p[1].x;
 }
 
+// ASC CDL: p[1..3] slope, offset, power (rgb), p[1].w saturation.
+vec3 cdl(vec3 c) {
+    vec3 v;
+    for (int i = 0; i < 3; ++i) {
+        const float x = clamp01(c[i] * p[1][i] + p[2][i]);
+        v[i] = p[3][i] == 1.0 ? x : pow(x, p[3][i]);
+    }
+    if (p[1].w != 1.0) {
+        const float l = luma(v);
+        v = vec3(clamp01(l + p[1].w * (v.r - l)), clamp01(l + p[1].w * (v.g - l)), clamp01(l + p[1].w * (v.b - l)));
+    }
+    return v;
+}
+
+// Hue/Saturation: p[1] cos and sin of the hue turn, saturation, lightness; p[2].x vibrance.
+vec3 hueSat(vec3 c) {
+    float y = 0.299 * c.r + 0.587 * c.g + 0.114 * c.b;
+    const float i = 0.596 * c.r - 0.274 * c.g - 0.322 * c.b, q = 0.211 * c.r - 0.523 * c.g + 0.312 * c.b;
+    float i2 = i * p[1].x - q * p[1].y, q2 = i * p[1].y + q * p[1].x;
+    float s = p[1].z;
+    if (p[2].x != 0.0) s *= 1.0 + p[2].x * (1.0 - clamp01(sqrt(i2 * i2 + q2 * q2) * 1.6));
+    i2 *= s;
+    q2 *= s;
+    y += p[1].w * (p[1].w > 0.0 ? (1.0 - y) : y);
+    return vec3(y + 0.956 * i2 + 0.621 * q2, y - 0.272 * i2 - 0.647 * q2, y - 1.106 * i2 + 1.703 * q2);
+}
+
+// Levels: p[1] input black, span, 1 / gamma; p[2] output black and white.
+vec3 levels(vec3 c) {
+    vec3 o;
+    for (int k = 0; k < 3; ++k) {
+        const float u = pow(clamp((c[k] - p[1].x) / p[1].y, 0.0, 1.0), p[1].z);
+        o[k] = p[2].x + u * (p[2].y - p[2].x);
+    }
+    return o;
+}
+
+// The mask at this pixel (p[12].x: the effect has one): p[13] x shape drawn, y qualifier, z inverted, w opacity; p[14] hue centre and half width
+// (degrees), softness, saturation low; p[15] saturation high, luma low and high.
+float band(float v, float lo, float hi, float ramp) {
+    if (v >= lo && v <= hi) return 1.0;
+    const float o = v < lo ? lo - v : v - hi;
+    return ramp <= 0.0 ? 0.0 : max(0.0, 1.0 - o / ramp);
+}
+float maskAt(ivec2 xy, vec3 c, float a) {
+    float m = p[13].x > 0.5 ? texelFetch(maskTex, xy, 0).r : 1.0;
+    if (p[13].y > 0.5) {
+        if (a <= 1e-6) {
+            m = 0.0;
+        } else {
+            const float mx = max(c.r, max(c.g, c.b)), mn = min(c.r, min(c.g, c.b)), ch = mx - mn;
+            const float sat = mx > 1e-6 ? ch / mx : 0.0, l = luma(c);
+            float hue = 0.0;
+            if (ch > 1e-6) {
+                if (mx == c.r) hue = 60.0 * mod((c.g - c.b) / ch + 6.0, 6.0);
+                else if (mx == c.g) hue = 60.0 * ((c.b - c.r) / ch + 2.0);
+                else hue = 60.0 * ((c.r - c.g) / ch + 4.0);
+            }
+            float dh = abs(hue - p[14].x);
+            dh = min(dh, 360.0 - dh);
+            const float soft = p[14].z;
+            const float mh = p[14].y >= 180.0 ? 1.0 : band(dh, 0.0, p[14].y, 60.0 * soft + 1e-9);
+            m *= mh * band(sat, p[14].w, p[15].x, 0.25 * soft) * band(l, p[15].y, p[15].z, 0.25 * soft);
+        }
+    }
+    return (p[13].z > 0.5 ? 1.0 - m : m) * p[13].w;
+}
+
 void main() {
     const ivec2 xy = ivec2(gl_FragCoord.xy);
     const int mode = int(p[0].x);
@@ -140,6 +213,11 @@ void main() {
     }
     const vec4 px = texelFetch(srcTex, xy, 0);
     const float a = px.a;
+    if (mode == 10) {
+        const vec3 c = a > 0.0 ? px.rgb * (1.0 / a) : vec3(0.0);
+        fragColor = px + (texelFetch(table, xy, 0) - px) * maskAt(xy, c, a);
+        return;
+    }
     if (a <= 0.0) {
         fragColor = px;
         return;
@@ -149,6 +227,12 @@ void main() {
     if (mode == 1) o = c + (applyLut(c) - c) * p[3].x;
     else if (mode == 2) o = colorCorrect(c);
     else if (mode == 3) o = curves(c);
-    else o = hueCurves(c);
-    fragColor = vec4(o * a, a);
+    else if (mode == 4) o = hueCurves(c);
+    else if (mode == 5) o = cdl(c);
+    else if (mode == 6) o = c + (vec3(1.0) - 2.0 * c) * p[1].x;
+    else if (mode == 7) o = c + (luma(c) * p[2].xyz - c) * p[1].x;
+    else if (mode == 8) o = hueSat(c);
+    else o = levels(c);
+    const vec4 made = vec4(o * a, a);
+    fragColor = p[12].x > 0.5 ? px + (made - px) * maskAt(xy, c, a) : made;
 }

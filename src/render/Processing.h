@@ -21,10 +21,14 @@ void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScal
 namespace gpu {
 struct ColorOp;
 }
-// The GPU compositor's form of a colour effect at frame t (render/GpuCompositor.h): Color Correct, Curves, Hue Curves
-// and .cube LUTs, unmasked, appended to `out` (nothing when the effect is off or changes nothing). False for any other
-// effect, which only the CPU draws.
-bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out);
+// The GPU compositor's form of a colour effect at frame t (render/GpuCompositor.h): Color Correct, Curves, Hue Curves,
+// .cube LUTs, ASC CDL, Colour Space Transform, Invert, Black & White, Hue/Saturation and Levels, through a drawn mask
+// and an HSL qualifier if it has them, appended to `out` (nothing when the effect is off or changes nothing). False for
+// any other effect or mask (people, objects, depth, Refine Edges, Show Mask), which only the CPU draws. The mask's
+// shape is drawn for a picture `width` by `height` (0: whether it could be, alone).
+bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, int width = 0, int height = 0, double pixelScale = 1);
+// An effect's (or a grade node's) mask in that form, into `op`; false when only the CPU can make it.
+bool gpuMask(const Effect& e, FrameTime t, gpu::ColorOp& op, int width = 0, int height = 0, double pixelScale = 1);
 
 // The depth of the frame being worked on (media/DepthMap.h), for depth
 // effects and depth qualifiers: set by the compositor for the effects of one
