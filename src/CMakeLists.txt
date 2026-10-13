@@ -146,6 +146,7 @@ add_library(montage_engine STATIC
   control/Osc.h control/Osc.cpp
   control/Hid.h control/Hid.cpp
   control/SpeedEditor.h control/SpeedEditor.cpp
+  control/Tangent.h control/Tangent.cpp
   render/Versions.h render/Versions.cpp
   render/ReviewExport.h render/ReviewExport.cpp
   render/DcpMxf.h render/DcpMxf.cpp
