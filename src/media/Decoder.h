@@ -45,6 +45,7 @@ bool readEmbeddedCaptions(const std::string& path, Rational fps, std::vector<Cap
                           std::string* error = nullptr, CaptionStandard standard = CaptionStandard::Auto);
 
 struct ImageSequence;
+class MlvReader;
 
 // Frame-accurate video decoder. Not thread safe: use one per thread
 // (MediaPool hands them out).
@@ -59,7 +60,7 @@ public:
 
     bool open(const std::string& path, std::string* error = nullptr);
     void close();
-    bool isOpen() const { return ctx_ != nullptr || vector_ != nullptr || raw_ != nullptr || rawSequence_ != nullptr; }
+    bool isOpen() const { return ctx_ != nullptr || vector_ != nullptr || raw_ != nullptr || rawSequence_ != nullptr || mlv_ != nullptr; }
 
     // Frame displayed at media time `t` (seconds from the start of the file; of the conformed file when the path carries
     // an interpretation, core/Interpretation.h), converted to RGBA16 at exactly targetW x targetH (0 = native display size).
@@ -125,7 +126,9 @@ private:
     std::shared_ptr<VectorDocument> vector_;  // a Lottie animation or SVG, rendered instead of decoded
     AVFrame* raw_ = nullptr;                  // a camera raw still, developed once (RGB48), or a CinemaDNG run's current frame
     std::unique_ptr<ImageSequence> rawSequence_;  // a run of camera raw frames (media/ImageSequence.h)
-    int rawFrame_ = -1;                       // the run's frame in raw_
+    int rawFrame_ = -1;                       // the run's (or Magic Lantern Video's) frame in raw_
+    std::unique_ptr<MlvReader> mlv_;          // Magic Lantern Video: each frame's mosaic developed (media/Mlv.h)
+    bool rawHalf_ = false;                    // raw_ developed at half size
     RawSettings rawSettings_;                 // how raw pictures are developed (Interpret Footage)
     bool proResRaw_ = false;                  // ProRes RAW: each frame's mosaic developed (media/ProResRaw.h)
     bool loadRaw(const RawImage& img, std::string* error);

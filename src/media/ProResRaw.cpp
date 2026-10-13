@@ -106,6 +106,9 @@ const AcesCctTable& acesCctTable() {
 
 }  // namespace
 
+void planckianChromaticity(double kelvin, double& x, double& y) { planckian(kelvin, x, y); }
+void bradfordAdaptation(double x1, double y1, double x2, double y2, double out[9]) { bradford(x1, y1, x2, y2, out); }
+
 bool proResRawAvailable() {
 #ifdef MONTAGE_PRORES_RAW
     return true;

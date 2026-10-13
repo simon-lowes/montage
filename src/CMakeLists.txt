@@ -73,6 +73,7 @@ add_library(montage_engine STATIC
   media/Vector.h media/Vector.cpp
   media/CameraRaw.h media/CameraRaw.cpp
   media/ProResRaw.h media/ProResRaw.cpp
+  media/Mlv.h media/Mlv.cpp
   media/SuperScale.h media/SuperScale.cpp
   media/MotionDeblur.h media/MotionDeblur.cpp
   media/Faces.h media/Faces.cpp

@@ -32,6 +32,11 @@ struct ProResRawColor {
     double gain = 1;                                         // to scene-linear light
 };
 
+// A light's chromaticity on the Planckian locus (1667 K to 25000 K), and the Bradford adaptation (XYZ, 3x3 by rows)
+// from one white's chromaticity to another's (for other RAW formats' colour: media/Mlv.h).
+void planckianChromaticity(double kelvin, double& x, double& y);
+void bradfordAdaptation(double x1, double y1, double x2, double y2, double out[9]);
+
 // The developed picture's size: the mosaic less its recommended crop (left, top, right, bottom) exactly; with `half`,
 // whole 2x2 cells of it, halved.
 void proResRawSize(int width, int height, const int crop[4], bool half, int& outWidth, int& outHeight);

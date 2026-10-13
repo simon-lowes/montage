@@ -4,6 +4,7 @@
 
 #include "FieldRecorder.h"
 #include "ImageSequence.h"
+#include "Mlv.h"
 #include "ProResRaw.h"
 #include "Psd.h"
 #include "audio/TimeStretch.h"
@@ -420,6 +421,39 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
             return true;
         }
     }
+    // Magic Lantern Video: its RAW frames developed here (ACEScct, as ProRes RAW), its sound read by FFmpeg.
+    if (isMlvPath(file)) {
+        MlvInfo mi;
+        if (!readMlvInfo(file, mi, error)) return false;
+        MediaItem m = out;
+        m.path = path;
+        if (m.name.empty()) m.name = file.substr(file.find_last_of("/\\") + 1);
+        m.kind = MediaKind::Video;
+        m.hasVideo = true;
+        mlvPictureSize(mi, false, m.width, m.height);
+        if (in.par > 0) m.width = int(std::lround(double(m.width) * in.par));
+        const double fileFps = double(mi.fpsNum) / mi.fpsDen;
+        // (23976/1000 is 24000/1001, as the rest of the project names it)
+        const double whole = std::round(fileFps * 1.001);
+        m.fps = std::fabs(fileFps - whole / 1.001) < 0.002 && std::fabs(fileFps - whole) > 0.01 ? Rational{int(whole) * 1000, 1001}
+                                                                                                : Rational{mi.fpsNum, mi.fpsDen};
+        if (in.conformed()) m.fps = in.fps;
+        m.duration = mi.frames / fileFps / in.timeScale();
+        m.videoCodec = "mlv";
+        m.colorSpace = "acescct";
+        m.hasAudio = mi.hasAudio;
+        if (mi.hasAudio) {
+            m.audioCodec = mi.bitsPerSample == 24 ? "pcm_s24le" : "pcm_s16le";
+            m.sampleRate = mi.sampleRate;
+            m.channels = mi.channels;
+        }
+        if (m.created.empty()) m.created = mi.created;
+        if (!mi.camera.empty() && !m.metadata.count("camera")) m.metadata["camera"] = mi.camera;
+        if (!mi.lens.empty() && !m.metadata.count("lens")) m.metadata["lens"] = mi.lens;
+        if (mi.iso > 0 && !m.metadata.count("iso")) m.metadata["iso"] = std::to_string(mi.iso);
+        out = m;
+        return true;
+    }
     // A CinemaDNG run: numbered camera RAW frames, played as a video at the run's rate.
     if (ImageSequence seq; rawAvailable() && parseImageSequencePath(file, seq) && isRawPath(seq.pattern)) {
         RawInfo ri;
@@ -624,6 +658,7 @@ void VideoDecoder::close() {
     vector_.reset();
     if (raw_) av_frame_free(&raw_);
     rawSequence_.reset();
+    mlv_.reset();
     rawFrame_ = -1;
     proResRaw_ = false;
     viewId_ = -1;
@@ -688,6 +723,26 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
     }
     rawSettings_ = RawSettings{in.rawExposure, in.rawTemperature, in.rawTint,
                                in.rawHighlights == "blend" ? 1 : in.rawHighlights == "rebuild" ? 2 : 0, in.rawHalf};
+    // Magic Lantern Video: each frame's mosaic developed when it is shown.
+    if (isMlvPath(uninterpretedPath(path))) {
+        auto reader = std::make_unique<MlvReader>();
+        if (!reader->open(uninterpretedPath(path), error)) return false;
+        const MlvInfo& mi = reader->info();
+        int w = 0, h = 0;
+        mlvPictureSize(mi, false, w, h);
+        if (par_ > 0) w = int(std::lround(double(w) * par_));
+        dispW_ = std::max(1, w);
+        dispH_ = std::max(1, h);
+        fps_ = double(mi.fpsNum) / mi.fpsDen;
+        duration_ = mi.frames / fps_;
+        still_ = false;
+        rotation_ = 0;
+        origin_ = 0;
+        curPts_ = nextPts_ = -1;
+        rawFrame_ = -1;
+        mlv_ = std::move(reader);
+        return true;
+    }
     // A CinemaDNG run (numbered camera RAW frames): each frame developed when it is shown.
     if (ImageSequence seq; rawAvailable() && parseImageSequencePath(uninterpretedPath(path), seq) && isRawPath(seq.pattern)) {
         RawInfo info;
@@ -1149,6 +1204,33 @@ bool VideoDecoder::loadRaw(const RawImage& img, std::string* error) {
 }
 
 Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQuality) {
+    if (mlv_) {
+        // The frame shown at `t` (the file's own time), developed once and kept while it is asked for again; at half
+        // size when it is shown at half or less (or Interpret Footage asks for half).
+        const int n = std::clamp(int(std::floor(std::max(0.0, t) * timeScale_ * fps_ + 1e-6)), 0, std::max(0, mlv_->info().frames - 1));
+        if (targetW <= 0) targetW = dispW_;
+        if (targetH <= 0) targetH = dispH_;
+        const bool half = rawSettings_.half || (targetW * 2 <= dispW_ && targetH * 2 <= dispH_);
+        if (n != rawFrame_ || half != rawHalf_ || !raw_) {
+            RawSettings s = rawSettings_;
+            s.half = half;
+            DevelopedRaw d;
+            std::string err;
+            if (!mlv_->develop(n, s, d, &err)) return nullptr;
+            RawImage img;
+            img.width = d.width;
+            img.height = d.height;
+            img.rgb = std::move(d.rgb);
+            if (!loadRaw(img, &err)) return nullptr;
+            rawFrame_ = n;
+            rawHalf_ = half;
+            stillFrame_.reset();
+        }
+        if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH)
+            stillFrame_ = convert(raw_, double(n) / fps_, targetW, targetH, true);
+        curPts_ = double(n) / fps_;
+        return stillFrame_;
+    }
     if (rawSequence_) {
         // The frame of the run shown at `t`, developed once and kept while it is asked for again.
         const ImageSequence& seq = *rawSequence_;
