@@ -33,7 +33,8 @@ bool validFieldOrder(const std::string& fields) {
 bool validRawHighlights(const std::string& mode) { return mode.empty() || mode == "clip" || mode == "blend" || mode == "rebuild"; }
 
 bool validStereoLayout(const std::string& layout) {
-    return layout.empty() || layout == "none" || layout == "sbs" || layout == "sbs_half" || layout == "tb" || layout == "tb_half";
+    return layout.empty() || layout == "none" || layout == "sbs" || layout == "sbs_half" || layout == "tb" || layout == "tb_half" ||
+           layout == "mv";
 }
 
 std::string stereoLayout(const std::string& detected, const Interpretation& i) {

@@ -97,10 +97,68 @@ std::string streamProjection(const AVStream* st) {
     return {};
 }
 
+// MV-HEVC (Apple's spatial video, Vision Pro and iPhone): two views in one HEVC stream, decoded one at a time by FFmpeg
+// 7.1 and later (its multilayer decoding; earlier versions see the first view alone, a flat picture).
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 19, 100)
+#define MONTAGE_MULTIVIEW 1
+#endif
+
+// An MV-HEVC stream's views: the view ids of its left and right eyes and of its base view (the one decoded unless
+// another is asked for), and whether the stream itself says which eye each is.
+struct EyeViews {
+    int left = 0, right = 0, base = 0;
+    bool placed = false;
+};
+
+// The views of an open HEVC decoder: each eye's by the stream's 3D reference displays message when it has one, else the
+// base view on the left. False for a stream of one view.
+bool hevcEyeViews(AVCodecContext* ctx, EyeViews& v) {
+#ifdef MONTAGE_MULTIVIEW
+    unsigned n = 0;
+    if (av_opt_get_array_size(ctx, "view_ids_available", AV_OPT_SEARCH_CHILDREN, &n) < 0 || n < 2) return false;
+    std::vector<unsigned> ids(n), pos(n, unsigned(AV_STEREO3D_VIEW_UNSPEC));
+    if (av_opt_get_array(ctx, "view_ids_available", AV_OPT_SEARCH_CHILDREN, 0, n, AV_OPT_TYPE_UINT, ids.data()) < 0) return false;
+    unsigned np = 0;
+    if (av_opt_get_array_size(ctx, "view_pos_available", AV_OPT_SEARCH_CHILDREN, &np) >= 0 && np == n)
+        av_opt_get_array(ctx, "view_pos_available", AV_OPT_SEARCH_CHILDREN, 0, n, AV_OPT_TYPE_UINT, pos.data());
+    v = {int(ids[0]), int(ids[1]), int(ids[0]), false};
+    bool left = false, right = false;
+    for (unsigned i = 0; i < n; ++i)
+        if (pos[i] == unsigned(AV_STEREO3D_VIEW_LEFT)) v.left = int(ids[i]), left = true;
+        else if (pos[i] == unsigned(AV_STEREO3D_VIEW_RIGHT)) v.right = int(ids[i]), right = true;
+    v.placed = left && right;
+    return v.left != v.right;
+#else
+    (void)ctx, (void)v;
+    return false;
+#endif
+}
+
+// Whether an HEVC stream holds two views, and which (its parameter sets, read by opening a decoder of one thread, which
+// exports them at once: nothing is decoded).
+bool multiviewStream(const AVStream* st, EyeViews* views = nullptr) {
+#ifdef MONTAGE_MULTIVIEW
+    if (st->codecpar->codec_id != AV_CODEC_ID_HEVC) return false;
+    const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
+    if (!codec) return false;
+    std::unique_ptr<AVCodecContext, void (*)(AVCodecContext*)> ctx(avcodec_alloc_context3(codec), [](AVCodecContext* c) { avcodec_free_context(&c); });
+    if (!ctx || avcodec_parameters_to_context(ctx.get(), st->codecpar) < 0) return false;
+    ctx->thread_count = 1;
+    if (avcodec_open2(ctx.get(), codec, nullptr) < 0) return false;
+    EyeViews v;
+    if (!hevcEyeViews(ctx.get(), v)) return false;
+    if (views) *views = v;
+    return true;
+#else
+    (void)st, (void)views;
+    return false;
+#endif
+}
+
 // Stereoscopic 3D footage: how the stream's stereo metadata (MP4 st3d, Matroska StereoMode)
 // packs the eyes, "sbs" or "tb", and whether the right eye comes first. A frame-compatible file (each eye squeezed to
 // half the frame, as 3D TV and Blu-ray masters are) is told apart by its eyes' shape; 360° stereo is never squeezed.
-std::string streamStereo(const AVStream* st, bool& inverted, bool spherical) {
+std::string streamStereo(const AVStream* st, bool& inverted, bool spherical, EyeViews* views = nullptr) {
     inverted = false;
     const uint8_t* data = nullptr;
 #if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 29, 100)
@@ -118,7 +176,35 @@ std::string streamStereo(const AVStream* st, bool& inverted, bool spherical) {
     const double w = st->codecpar->width * (sar.num > 0 && sar.den > 0 ? av_q2d(sar) : 1.0), h = std::max(1, st->codecpar->height);
     if (s3d->type == AV_STEREO3D_SIDEBYSIDE) return !spherical && w / 2 / h < 1.0 ? "sbs_half" : "sbs";
     if (s3d->type == AV_STEREO3D_TOPBOTTOM) return !spherical && w / (h / 2) > 2.4 ? "tb_half" : "tb";
+#ifdef MONTAGE_MULTIVIEW
+    // Apple's eyes box (vexu): both eyes, as views of an MV-HEVC stream.
+    if (s3d->type == AV_STEREO3D_UNSPEC && s3d->view == AV_STEREO3D_VIEW_PACKED && multiviewStream(st, views)) return "mv";
+#endif
     return {};
+}
+
+// The stream's stereo layout: its metadata's, else "mv" for an HEVC stream of two views (which may have no eyes box;
+// without one, the second view's id 0 is an alpha layer's, not an eye's, unless the stream places the eyes).
+std::string detectedStereo(const AVStream* st, bool& inverted, bool spherical, EyeViews* views = nullptr) {
+    std::string layout = streamStereo(st, inverted, spherical, views);
+    if (EyeViews v; layout.empty() && multiviewStream(st, &v) && (v.placed || v.right != 0)) {
+        layout = "mv";
+        if (views) *views = v;
+    }
+    return layout;
+}
+
+// The layout a stream is read with (its own, or Interpret Footage's), as the decoder reads it: "mv" said of a stream of
+// one view (or by an FFmpeg before 7.1) is a flat picture. An MV-HEVC stream that places its eyes is not reversed again
+// by its eyes box.
+std::string readStereo(const AVStream* st, const Interpretation& in, bool& inverted, bool spherical, EyeViews* views = nullptr) {
+    EyeViews v;
+    const std::string detected = detectedStereo(st, inverted, spherical, &v);
+    std::string layout = stereoLayout(detected, in);
+    if (layout == "mv" && detected != "mv" && !multiviewStream(st, &v)) layout.clear();
+    if (layout == "mv" && v.placed) inverted = false;
+    if (views) *views = v;
+    return layout;
 }
 
 // One eye's size as shown, from the frame's.
@@ -275,6 +361,14 @@ bool sameProbedFacts(const MediaItem& a, const MediaItem& b, bool length) {
     return x == a;
 }
 
+bool multiviewDecoding() {
+#ifdef MONTAGE_MULTIVIEW
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
     Interpretation in;
     parseInterpretation(path, in);
@@ -425,7 +519,7 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         }
 #endif
         bool inverted = false;
-        m.stereo = stereoLayout(streamStereo(st, inverted, !m.projection.empty()), in);
+        m.stereo = readStereo(st, in, inverted, !m.projection.empty());
         stereoEyeSize(m.stereo, w, h);
         AVRational sar = st->sample_aspect_ratio.num ? st->sample_aspect_ratio : st->codecpar->sample_aspect_ratio;
         if (in.par > 0) w = int(std::lround(double(w) * in.par));  // Interpret Footage's pixel aspect
@@ -532,6 +626,7 @@ void VideoDecoder::close() {
     rawSequence_.reset();
     rawFrame_ = -1;
     proResRaw_ = false;
+    viewId_ = -1;
 }
 
 bool VideoDecoder::open(const std::string& path, std::string* error) {
@@ -648,7 +743,16 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
     // ProRes RAW: a Bayer mosaic and its colour, developed here (media/ProResRaw.h), in software.
     proResRaw_ = st->codecpar->codec_id == AV_CODEC_ID_PRORES_RAW;
 #endif
-    if (!openCodec(hwDecodeMode() == HwDecodeMode::Auto && !still_ && !proResRaw_, error)) {
+    // Stereoscopic footage: one eye is read, the one asked for (the file's right-first packing and Interpret Footage's
+    // swap each turn them round).
+    bool inverted = false;
+    EyeViews views;
+    stereo_ = readStereo(st, interp_, inverted, !streamProjection(st).empty(), &views);
+    eye_ = (interp_.eye != 0) != (inverted != interp_.swapEyes) ? 1 : 0;
+    // MV-HEVC: the eye's view decoded (the decoder outputs the base view unless asked for another), in software when it
+    // is not the base view (hardware decoders take the base view alone).
+    if (const int view = eye_ ? views.right : views.left; stereo_ == "mv" && view != views.base) viewId_ = view;
+    if (!openCodec(hwDecodeMode() == HwDecodeMode::Auto && !still_ && !proResRaw_ && viewId_ < 0, error)) {
         close();
         return false;
     }
@@ -667,11 +771,6 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
     int w = st->codecpar->width, h = st->codecpar->height;
     // (less its recommended crop, which the first frame says)
     if (ProResRawInfo info; proResRaw_ && probeProResRaw(uninterpretedPath(path), info)) w = info.width, h = info.height;
-    // Stereoscopic footage: one eye is read, the one asked for (the file's right-first packing and Interpret Footage's
-    // swap each turn them round).
-    bool inverted = false;
-    stereo_ = stereoLayout(streamStereo(st, inverted, !streamProjection(st).empty()), interp_);
-    eye_ = (interp_.eye != 0) != (inverted != interp_.swapEyes) ? 1 : 0;
     stereoEyeSize(stereo_, w, h);
     AVRational sar = st->sample_aspect_ratio.num ? st->sample_aspect_ratio : st->codecpar->sample_aspect_ratio;
     if (par_ > 0) w = int(std::lround(double(w) * par_));
@@ -724,6 +823,17 @@ bool VideoDecoder::openCodec(bool tryHardware, std::string* error) {
         // them one after another, and hold each seek's first frame back until eight were decoded.
         if (proResRaw_) ctx_->thread_type = FF_THREAD_SLICE;
     }
+#ifdef MONTAGE_MULTIVIEW
+    // (MV-HEVC: the one view wanted)
+    if (viewId_ >= 0) {
+        const int ids[1] = {viewId_};
+        if (const int rv = av_opt_set_array(ctx_, "view_ids", AV_OPT_SEARCH_CHILDREN, 0, 1, AV_OPT_TYPE_INT, ids); rv < 0) {
+            if (error) *error = "Cannot read view " + std::to_string(viewId_) + " of " + path_ + ": " + averr(rv);
+            freeCodec();
+            return false;
+        }
+    }
+#endif
     int rc = avcodec_open2(ctx_, codec, nullptr);
     if (rc < 0 && hwPixFmt_ >= 0) {
         freeCodec();
@@ -848,6 +958,31 @@ bool deinterlacePlane(uint8_t* data, int linesize, int width, int height, bool k
     return changed;
 }
 
+// Whether this swscale's bilinear conversion to 16-bit RGBA keeps its colours: FFmpeg 8.0's (fixed in 8.0.1) turns a
+// colour whose chroma is below the middle (blue, say) green when chroma rows are blended and luma rows are not (4:2:0
+// at its own height). Tried once, on a blue picture; where it fails, bicubic is used instead (another code path).
+bool bilinearRgba64Sound() {
+    static const bool sound = [] {
+        constexpr int w = 16, h = 16;
+        uint8_t y[w * h], u[w * h / 4], v[w * h / 4];
+        std::fill(std::begin(y), std::end(y), uint8_t(43));
+        std::fill(std::begin(u), std::end(u), uint8_t(234));
+        std::fill(std::begin(v), std::end(v), uint8_t(110));
+        SwsContext* sws = sws_getContext(w, h, AV_PIX_FMT_YUV420P, w, h, AV_PIX_FMT_RGBA64LE, SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!sws) return true;
+        std::vector<uint16_t> out(size_t(w) * h * 4);
+        const uint8_t* src[4] = {y, u, v, nullptr};
+        const int srcStride[4] = {w, w / 2, w / 2, 0};
+        uint8_t* dst[4] = {reinterpret_cast<uint8_t*>(out.data()), nullptr, nullptr, nullptr};
+        const int dstStride[4] = {w * 8, 0, 0, 0};
+        const bool ok = sws_scale(sws, src, srcStride, 0, h, dst, dstStride) == h;
+        sws_freeContext(sws);
+        const uint16_t* px = out.data() + (size_t(h / 2) * w + w / 2) * 4;
+        return !ok || (px[1] < 8000 && px[2] > 50000);  // (green near nothing, blue near full)
+    }();
+    return sound;
+}
+
 }  // namespace
 
 bool deinterlaceFrame(AVFrame* f) {
@@ -890,7 +1025,7 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
     }
     // Stereoscopic footage: the eye's half of the frame (squeezed halves are stretched back by the scaling below).
     std::unique_ptr<AVFrame, void (*)(AVFrame*)> eyeFrame(nullptr, [](AVFrame* fr) { av_frame_free(&fr); });
-    if (!stereo_.empty() && f->width > 1 && f->height > 1) {
+    if (!stereo_.empty() && stereo_ != "mv" && f->width > 1 && f->height > 1) {  // (an MV-HEVC view is the eye whole)
         eyeFrame.reset(av_frame_clone(f));
         if (AVFrame* e = eyeFrame.get()) {
             // Where the eyes meet, on a whole chroma sample (an odd offset would split packed 4:2:2 pairs).
@@ -915,7 +1050,7 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
     int sh = (rotation_ % 180) ? w : h;
     bool fullRange = f->color_range == AVCOL_RANGE_JPEG;
     AVPixelFormat srcFmt = dejpeg(AVPixelFormat(f->format), fullRange);
-    const int flags = hq ? (SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT) : SWS_BILINEAR;
+    const int flags = hq ? (SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT) : bilinearRgba64Sound() ? SWS_BILINEAR : SWS_BICUBIC;
     const int key[6] = {f->width, f->height, int(srcFmt), sw, sh, flags};
     if (!sws_ || !std::equal(key, key + 6, swsKey_)) {
         // A slice-threaded context: converting a 4K frame to 16-bit RGBA is
@@ -1396,7 +1531,7 @@ void checkStereoMedia(Project& p) {
             bool inverted = false;
             Interpretation in;
             parseInterpretation(m.path, in);
-            layout = stereoLayout(streamStereo(st, inverted, !streamProjection(st).empty()), in);
+            layout = readStereo(st, in, inverted, !streamProjection(st).empty());
         }
         avformat_close_input(&fmt);
         MediaItem fresh;

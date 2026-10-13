@@ -4816,6 +4816,111 @@ private slots:
         QCOMPARE(withDepth->effects.back().params.at("depth").keys.size(), size_t(1));
     }
 
+    void spatialVideo() {
+        // MV-HEVC (two views in one HEVC stream): each eye its own view, whole.
+        const std::string file = std::string(MONTAGE_TEST_DATA_DIR) + "/mvhevc/spatial.mov";
+        Project p = makeDefaultProject();
+        p.sequences.clear();
+        MediaItem m = probeOrFail(p, file);
+        QCOMPARE(m.width, 128);
+        QCOMPARE(m.height, 72);
+        if (!multiviewDecoding()) {
+            QVERIFY(m.stereo.empty());  // (its first view, flat)
+            QSKIP("This FFmpeg reads only the first view of MV-HEVC (7.1 and later read both)");
+        }
+        QCOMPARE(m.stereo, std::string("mv"));
+        auto px = [](const Image& img, int x, int y) { return QVector3D(img.at(x, y)[0], img.at(x, y)[1], img.at(x, y)[2]); };
+        auto isRed = [](QVector3D c) { return c.x() > 0.6f && c.y() < 0.25f && c.z() < 0.3f; };
+        auto isBlue = [](QVector3D c) { return c.z() > 0.6f && c.x() < 0.25f && c.y() < 0.25f; };
+        auto isGrey = [](QVector3D c) { return c.x() < 0.2f && c.y() < 0.2f && c.z() < 0.2f; };
+        auto describe = [&](QVector3D c) { return QString("%1 %2 %3").arg(c.x()).arg(c.y()).arg(c.z()); };
+        p.media.push_back(m);
+        Sequence& s3 = p.sequences.emplace_back(makeSequence(p, "Spatial", 128, 72, Rational{25, 1}, 2, 1));
+        p.activeSequence = s3.id;
+        s3.stereo3d = true;
+        QVERIFY(edit::placeMedia(p, s3, m.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        RenderOptions o;
+        o.eye = 0;
+        const Image left = renderSequenceFrame(p, s3, 3, o);
+        o.eye = 1;
+        const Image right = renderSequenceFrame(p, s3, 3, o);
+        QCOMPARE(left.width, 128);
+        // The left eye's square at x 20 to 44, the right eye's at 32 to 56.
+        QVERIFY2(isRed(px(left, 26, 32)) && isGrey(px(left, 50, 32)), qPrintable(describe(px(left, 26, 32)) + " / " + describe(px(left, 50, 32))));
+        QVERIFY2(isBlue(px(right, 50, 32)) && isGrey(px(right, 26, 32)), qPrintable(describe(px(right, 50, 32)) + " / " + describe(px(right, 26, 32))));
+        // Swapped eyes; and read as not stereo, its first view.
+        Interpretation how;
+        how.swapEyes = true;
+        QVERIFY(edit::interpretFootage(p, m.id, how).ok);
+        o.eye = 0;
+        QVERIFY(isBlue(px(renderSequenceFrame(p, s3, 3, o), 50, 32)));
+        o.eye = 1;
+        QVERIFY(isRed(px(renderSequenceFrame(p, s3, 3, o), 26, 32)));
+        how = {};
+        how.stereo = "none";
+        QVERIFY(edit::interpretFootage(p, m.id, how).ok);
+        QVERIFY(p.findMedia(m.id)->stereo.empty());
+        QCOMPARE(p.findMedia(m.id)->width, 128);
+        QVERIFY(isRed(px(renderSequenceFrame(p, s3, 3, o), 26, 32)));
+        // Apple's eyes box saying both eyes are there, the views the other way round: the left eye is the second view.
+        {
+            Project q = makeDefaultProject();
+            q.sequences.clear();
+            MediaItem e = probeOrFail(q, std::string(MONTAGE_TEST_DATA_DIR) + "/mvhevc/spatial-eyes.mov");
+            QCOMPARE(e.stereo, std::string("mv"));
+            q.media.push_back(e);
+            Sequence& se = q.sequences.emplace_back(makeSequence(q, "Eyes", 128, 72, Rational{25, 1}, 2, 1));
+            se.stereo3d = true;
+            QVERIFY(edit::placeMedia(q, se, e.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            o.eye = 0;
+            QVERIFY(isBlue(px(renderSequenceFrame(q, se, 3, o), 50, 32)));
+            o.eye = 1;
+            QVERIFY(isRed(px(renderSequenceFrame(q, se, 3, o), 26, 32)));
+        }
+        // Said to be two views, a file of one is read flat (as the decoder reads it).
+        {
+            Project q = makeDefaultProject();
+            q.sequences.clear();
+            Sequence& sf = q.sequences.emplace_back(makeSequence(q, "Flat", 64, 36, Rational{25, 1}, 2, 1));
+            QVERIFY(edit::overwrite(q, sf, {TrackKind::Video, 0}, makeGeneratorClip(q, "color", 5)).ok);
+            ExportSettings st;
+            st.path = path("mv-flat.mov");
+            st.videoCodec = "prores_ks";
+            std::string err;
+            QVERIFY2(exportSequence(q, sf, st, nullptr, nullptr, &err), err.c_str());
+            MediaItem one = probeOrFail(q, st.path);
+            q.media.push_back(one);
+            Interpretation forced;
+            forced.stereo = "mv";
+            QVERIFY(edit::interpretFootage(q, one.id, forced).ok);
+            QVERIFY(q.findMedia(one.id)->stereo.empty());
+            QCOMPARE(q.findMedia(one.id)->width, 64);
+        }
+        // A project saved before Montage read MV-HEVC: the item is found to be two views when it is opened.
+        {
+            Project old = makeDefaultProject();
+            MediaItem item = probeOrFail(old, file);
+            item.stereo.clear();
+            old.media.push_back(item);
+            const std::string saved = path("old-spatial.montage");
+            QVERIFY(saveProject(old, saved));
+            QFile f(QString::fromStdString(saved));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
+            f.close();
+            root["mediaStereo"] = 1;
+            QVERIFY(f.open(QIODevice::WriteOnly | QIODevice::Truncate));
+            f.write(QJsonDocument(root).toJson());
+            f.close();
+            Project loaded;
+            QVERIFY(loadProject(saved, loaded));
+            QVERIFY(!loaded.stereoChecked);
+            checkStereoMedia(loaded);
+            QCOMPARE(loaded.findMedia(item.id)->stereo, std::string("mv"));
+            QCOMPARE(loaded.findMedia(item.id)->width, 128);
+        }
+    }
+
     void stereoscopicEdgeCases() {
         // A side-by-side file with stereo metadata: the left eye red, the right blue, 160 x 96 an eye.
         auto solid = [](Project& pr, double r, double g, double b, FrameTime len) {

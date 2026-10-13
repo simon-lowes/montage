@@ -63,7 +63,7 @@ Interpretation interpretationOf(const MediaItem& m);
 bool validAlphaMode(const std::string& alpha);
 bool validFieldOrder(const std::string& fields);
 bool validRawHighlights(const std::string& mode);
-bool validStereoLayout(const std::string& layout);  // "", "none", "sbs", "sbs_half", "tb", "tb_half"
+bool validStereoLayout(const std::string& layout);  // "", "none", "sbs", "sbs_half", "tb", "tb_half", "mv"
 // The eyes' packing a media file is read with: the file's own (`detected`, from its stereo metadata) unless the
 // interpretation says otherwise; "" for a flat picture.
 std::string stereoLayout(const std::string& detected, const Interpretation& i);

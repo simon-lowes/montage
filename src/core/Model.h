@@ -135,7 +135,8 @@ struct MediaItem {
     // Ambisonic sound (core/Ambisonics.h): its order (1 = first-order AmbiX, four channels W Y Z X), from the file's
     // spatial audio metadata (MP4 SA3D) or set by hand; 0 = channels for speakers.
     int ambisonic = 0;
-    // Stereoscopic 3D footage: how its two eyes are packed ("sbs", "sbs_half", "tb", "tb_half"; core/Interpretation.h),
+    // Stereoscopic 3D footage: how its two eyes are packed ("sbs", "sbs_half", "tb", "tb_half"; core/Interpretation.h; "mv"
+    // for MV-HEVC spatial video, each eye a view of its own),
     // from the file's stereo metadata or Interpret Footage; "" = a flat picture. Its size is one eye's, as shown.
     std::string stereo;
     double timecode = -1;       // start timecode in seconds (for multicam sync), -1 = none

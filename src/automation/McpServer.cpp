@@ -6185,7 +6185,7 @@ void McpServer::Impl::addTools() {
             "raw_tint":{"type":"number","description":"Camera RAW: tint, + magenta, - green (-150 to 150)"},
             "raw_highlights":{"type":"string","enum":["clip","blend","rebuild"],"description":"Camera RAW stills and CinemaDNG (ProRes RAW clips at the sensor's white)"},
             "raw_half":{"type":"boolean","description":"Camera RAW: decode at half size for speed"},
-            "stereo":{"type":"string","enum":["file","none","sbs","sbs_half","tb","tb_half"],"description":"Stereoscopic 3D: how the eyes are packed (side by side or top and bottom, full size or squeezed), none for a flat picture"},
+            "stereo":{"type":"string","enum":["file","none","sbs","sbs_half","tb","tb_half","mv"],"description":"Stereoscopic 3D: how the eyes are packed (side by side or top and bottom, full size or squeezed, or mv for MV-HEVC's two views), none for a flat picture"},
             "swap_eyes":{"type":"boolean","description":"Stereoscopic 3D: the eyes are the other way round"},
             "reset":{"type":"boolean","description":"Read the files as they are"}},"required":["project","media"]})json",
         false, [](const QJsonObject& a) {
@@ -8135,11 +8135,11 @@ void McpServer::Impl::addTools() {
         "Stereoscopic 3D editing, as Premiere's and Resolve's stereo workflows: with `sequence_3d` make the active "
         "sequence stereoscopic (each eye rendered, stereo footage giving each its own picture) or flat, and with "
         "`vr180` mark a 360° sequence as VR180 (the front half of the sphere); with `media` and `layout` say how a "
-        "file packs its eyes (file, none, sbs, sbs_half, tb, tb_half) and `swap_eyes` if they are the other way round; "
+        "file packs its eyes (file, none, sbs, sbs_half, tb, tb_half, or mv for MV-HEVC spatial video's two views) and `swap_eyes` if they are the other way round; "
         "with `clip` and `depth` (% of the frame's width, -10 to 10: + further away, - nearer) set the clip's Stereo 3D "
         "convergence (titles and graphics placed in depth), keyed at `at` when given. Reports the sequence's stereo state.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"sequence_3d":{"type":"boolean"},"vr180":{"type":"boolean"},
-            "media":{"type":"number"},"layout":{"type":"string","enum":["file","none","sbs","sbs_half","tb","tb_half"]},"swap_eyes":{"type":"boolean"},
+            "media":{"type":"number"},"layout":{"type":"string","enum":["file","none","sbs","sbs_half","tb","tb_half","mv"]},"swap_eyes":{"type":"boolean"},
             "clip":{"type":"number"},"depth":{"type":"number"},"at":{"type":"integer"}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);

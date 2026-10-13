@@ -887,7 +887,7 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
                      {"name", qs(p.name)},
                      {"activeSequence", double(p.activeSequence)},
                      {"nextId", double(p.nextId)},
-                     {"mediaStereo", 1}};  // the media's stereo packing is recorded
+                     {"mediaStereo", 2}};  // the media's stereo packing is recorded (2: MV-HEVC's too)
     QJsonArray media;
     for (const auto& m : p.media) {
         QJsonObject o{{"id", double(m.id)},
@@ -1011,7 +1011,7 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
     p.name = ss(root.value("name"));
     p.activeSequence = Id(i64(root.value("activeSequence")));
     p.nextId = Id(i64(root.value("nextId"), 1));
-    p.stereoChecked = root.value("mediaStereo").toInt() >= 1;
+    p.stereoChecked = root.value("mediaStereo").toInt() >= 2;
     for (const auto& mv : root.value("media").toArray()) {
         QJsonObject o = mv.toObject();
         MediaItem m;

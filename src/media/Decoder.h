@@ -22,13 +22,15 @@ namespace montage {
 
 // Fills `out` (kind, duration, dimensions, codecs...) from the file at `path`.
 bool probeMedia(const std::string& path, MediaItem& out, std::string* error = nullptr);
+// Whether MV-HEVC spatial video is read as two eyes (FFmpeg 7.1 and later); without it such a file is its first view.
+bool multiviewDecoding();
 // What probing says about a file (duration, picture size and rate, streams, codecs, stereo packing), as opposed to
 // what a project sets on its media: copied over when the file changes on disk (`length` false keeps the duration, as a
 // subclip's range is its own), and compared.
 void copyProbedFacts(MediaItem& to, const MediaItem& from, bool length = true);
 bool sameProbedFacts(const MediaItem& a, const MediaItem& b, bool length = true);
-// A project saved before Montage read stereo packing: its stereo video files (side-by-side or top-and-bottom metadata)
-// are found from their headers and read again, so their items say so and give one eye's size, as they would imported
+// A project saved before Montage read stereo packing (or MV-HEVC spatial video): its stereo video files (side-by-side or
+// top-and-bottom metadata, or HEVC of two views) are found from their headers and read again, so their items say so and give one eye's size, as they would imported
 // now. Nothing happens once a project has been checked (Project::stereoChecked). ProRes RAW media saved by a build
 // that read them differently (with or without FFmpeg 9's colour) are probed again every time.
 void checkStereoMedia(Project& p);
@@ -117,8 +119,9 @@ private:
     double par_ = 0;
     std::string alpha_, fields_;
     Interpretation interp_;
-    std::string stereo_;  // stereoscopic footage's packing ("sbs", "sbs_half", "tb", "tb_half"), "" = flat
+    std::string stereo_;  // stereoscopic footage's packing ("sbs", "sbs_half", "tb", "tb_half", "mv"), "" = flat
     int eye_ = 0;         // the eye read (0 left, 1 right), after any swap
+    int viewId_ = -1;     // MV-HEVC: the view decoded when not the base view
     std::shared_ptr<VectorDocument> vector_;  // a Lottie animation or SVG, rendered instead of decoded
     AVFrame* raw_ = nullptr;                  // a camera raw still, developed once (RGB48), or a CinemaDNG run's current frame
     std::unique_ptr<ImageSequence> rawSequence_;  // a run of camera raw frames (media/ImageSequence.h)
