@@ -1,3 +1,6 @@
+<!-- A Montage test fixture in the lensfun database's format. Some of its profiles come from the lensfun database
+     (https://github.com/lensfun/lensfun), by the lensfun contributors, under CC BY-SA 3.0
+     (https://creativecommons.org/licenses/by-sa/3.0/); this file is shared under the same licence. -->
 <lensdatabase version="1">
     <mount>
         <name>Test E</name>

@@ -1,3 +1,7 @@
+// Parts of this file are ported from lensfun (https://github.com/lensfun/lensfun): guessFromName's patterns, group
+// table and excluded words (libs/lensfun/lens.cpp) and hermite() (_lf_interpolate in libs/lensfun/auxfun.cpp),
+// Copyright (C) 2007 Andrew Zabolotny and the lensfun contributors, under the GNU Lesser General Public License,
+// version 3 (LICENSES/LGPL-3.0.txt). See THIRD_PARTY_NOTICES.md.
 #include "LensProfile.h"
 
 #include <QDir>

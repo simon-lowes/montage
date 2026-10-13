@@ -1,0 +1,29 @@
+Montage: additional permission under GNU GPL version 3 section 7
+
+Montage is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version (see LICENSE).
+
+As an additional permission under section 7 of the GNU General Public License,
+version 3, the copyright holders of Montage give you permission to combine
+Montage, or a work based on it, with the following proprietary libraries,
+which their vendors distribute separately and which the user installs
+themselves, and to convey the resulting combination:
+
+  - the Blackmagic Design Desktop Video driver and its DeckLink API library;
+  - the NDI Runtime (Vizrt NDI AB);
+  - the Blackmagic RAW SDK libraries (Blackmagic Design).
+
+The Corresponding Source for a non-source form of such a combination need not
+include the source code of those libraries. Montage's packages do not include
+these libraries; Montage only loads them when the user has installed them.
+
+This permission applies only to the code of Montage itself. It does not change
+the licences of the other components Montage's packages include (such as
+FFmpeg, x264, x265 and Qt), which keep their own terms (see
+THIRD_PARTY_NOTICES.md).
+
+If you modify Montage, you may extend this additional permission to your
+version, but you are not obliged to do so. If you do not wish to, delete this
+permission from your version.
