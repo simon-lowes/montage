@@ -2962,6 +2962,37 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
         op.params[0] = std::cos(hue), op.params[1] = std::sin(hue);
         op.params[2] = float(e.p("saturation", t, 1)), op.params[3] = float(e.p("lightness", t));
         op.params[4] = float(e.p("vibrance", t));
+    } else if (e.type == "chroma_key") {
+        // (as chromaKey: the key's Cb and Cr, its strongest channel and the distance's scale worked out here)
+        op.kind = gpu::ColorOp::ChromaKey;
+        const float kr = float(e.p("key.r", t, 0)), kg = float(e.p("key.g", t, 1)), kb = float(e.p("key.b", t, 0));
+        const float ky = luma(kr, kg, kb), kcb = (kb - ky) / 1.8556f, kcr = (kr - ky) / 1.5748f;
+        op.params[0] = kcb, op.params[1] = kcr;
+        op.params[2] = std::max(0.05f, std::sqrt(kcb * kcb + kcr * kcr) * 2.0f);
+        op.params[3] = std::max(0.0f, float(e.p("tolerance", t, 0.25)) + float(e.p("choke", t, 0)) * 0.2f);
+        op.params[4] = std::max(0.001f, float(e.p("softness", t, 0.1)));
+        op.params[5] = float(e.p("spill", t, 0.6));
+        op.params[6] = float((kg >= kr && kg >= kb) ? 1 : (kb >= kr ? 2 : 0));
+        op.params[7] = e.p("show_matte", t) > 0.5 ? 1 : 0;
+    } else if (e.type == "luma_key") {
+        op.kind = gpu::ColorOp::LumaKey;
+        op.params[0] = float(e.p("threshold", t, 0.1)), op.params[1] = float(e.p("softness", t, 0.05));
+        op.params[2] = e.p("invert", t) > 0.5 ? 1 : 0;
+    } else if (e.type == "screen_key") {
+        // (as screenKey; a matte shrunk, grown or softened is the CPU's: those look at the pixels around)
+        const double shrink = e.p("shrink", t, 0) * pixelScale, soften = e.p("soften", t, 0) * pixelScale;
+        if (std::lround(shrink) != 0 || std::lround(soften / 2) != 0) return false;
+        op.kind = gpu::ColorOp::ScreenKey;
+        const float sk[3] = {float(e.p("key.r", t, 0.1)), float(e.p("key.g", t, 0.75)), float(e.p("key.b", t, 0.2))};
+        const int dom = (sk[1] >= sk[0] && sk[1] >= sk[2]) ? 1 : (sk[2] >= sk[0] ? 2 : 0);
+        const float balance = float(std::clamp(e.p("balance", t, 0.5), 0.0, 1.0));
+        const float a = sk[(dom + 1) % 3], b = sk[(dom + 2) % 3];
+        op.params[0] = float(dom), op.params[1] = balance, op.params[2] = float(std::max(0.05, e.p("gain", t, 1.1)));
+        op.params[3] = std::max(1e-3f, sk[dom] - (balance * std::max(a, b) + (1 - balance) * std::min(a, b)));
+        op.params[4] = float(e.p("clip_black", t, 0.05));
+        op.params[5] = float(std::max(e.p("clip_white", t, 1), e.p("clip_black", t, 0.05) + 0.01));
+        op.params[6] = float(e.p("despill", t, 100) / 100), op.params[7] = float(e.p("restore", t, 50) / 100);
+        op.params[8] = float(e.p("edge_desat", t, 0) / 100), op.params[9] = float(std::lround(e.p("view", t, 0)));
     } else if (e.type == "levels") {
         op.kind = gpu::ColorOp::Levels;
         const float inB = float(e.p("in_black", t, 0)), inW = float(e.p("in_white", t, 1));

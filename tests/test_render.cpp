@@ -6905,6 +6905,56 @@ colorspaces:
         gpu::resetStats();
         compare(20, o, "outside node");
         QCOMPARE(gpu::stats().cpuLayers, 0L);
+        // The keyers, which change the alpha too, on V1 (V2 over it, the gaps black): a chroma key (its matte shown, then
+        // the result), a luma key through a drawn mask, and a screen key (the result, its matte and its status view); a
+        // screen key with a softened matte is the CPU's.
+        Clip& under = s.videoTracks[0].clips[0];
+        auto keyedAway = [&](const QString& what) {  // (the keyer took some of the picture away: the test means something)
+            RenderOptions c = o;
+            c.gpu = false;
+            const Image with = renderProgramFrame(p, s, 20, c);
+            const Effect last = under.effects.back();
+            under.effects.pop_back();
+            const Image without = renderProgramFrame(p, s, 20, c);
+            under.effects.push_back(last);
+            double diff = 0;
+            for (size_t i = 0; i < with.px.size(); ++i) diff += std::fabs(with.px[i] - without.px[i]);
+            QVERIFY2(diff / double(with.px.size()) > 0.01, qPrintable(what));
+        };
+        Effect ck = makeEffect(p, "chroma_key");
+        ck.params["key.r"] = 0.5, ck.params["key.g"] = 0.3, ck.params["key.b"] = 0.6;
+        ck.params["tolerance"] = 0.2, ck.params["softness"] = 0.15, ck.params["spill"] = 0.5, ck.params["choke"] = 0.3;
+        ck.params["show_matte"] = 1.0;
+        under.effects.push_back(ck);
+        gpu::resetStats();
+        compare(20, o, "chroma key matte");
+        QCOMPARE(gpu::stats().cpuLayers, 0L);
+        under.effects.back().params["show_matte"] = 0.0;
+        compare(20, o, "chroma key");
+        keyedAway("chroma key");
+        Effect lk = makeEffect(p, "luma_key");
+        lk.params["threshold"] = 0.45, lk.params["softness"] = 0.1, lk.params["invert"] = 1.0, lk.params["mask.shape"] = 2.0;
+        under.effects.push_back(lk);
+        compare(20, o, "luma key");
+        keyedAway("luma key");
+        under.effects.erase(under.effects.end() - 2, under.effects.end());
+        Effect sk = makeEffect(p, "screen_key");
+        sk.params["key.r"] = 0.3, sk.params["key.g"] = 0.35, sk.params["key.b"] = 0.85;
+        sk.params["clip_black"] = 0.1, sk.params["clip_white"] = 0.9, sk.params["edge_desat"] = 40.0;
+        under.effects.push_back(sk);
+        for (int view : {0, 1, 2}) {
+            under.effects.back().params["view"] = double(view);
+            gpu::resetStats();
+            compare(20, o, QString("screen key view %1").arg(view));
+            QCOMPARE(gpu::stats().cpuLayers, 0L);
+        }
+        under.effects.back().params["view"] = 0.0;
+        keyedAway("screen key");
+        under.effects.back().params["soften"] = 6.0;
+        gpu::resetStats();
+        compare(20, o, "screen key softened");
+        QVERIFY(gpu::stats().cpuLayers > 0);
+        under.effects.pop_back();
         // An HDR sequence seen on an SDR display.
         s.colorSpace = "rec2100pq";
         o.displaySpace = "rec709";
