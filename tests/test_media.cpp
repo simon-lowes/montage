@@ -20097,9 +20097,12 @@ if ui["pressed"] == "add":
         std::vector<std::string> outs;
         for (const std::string& name : stemNames(3)) outs.push_back(path(("film-" + name + ".wav").c_str()));
         bool partway = false;  // (progress reported between the start and the end)
+        QElapsedTimer whole;
+        whole.start();
         QVERIFY2(separateStemsToFiles(path("film.wav"), 0, 13, {}, 3, outs, [&](double f) { partway = partway || (f > 0.2 && f < 0.8); }, nullptr, &err),
                  err.c_str());
         QVERIFY(partway);
+        const qint64 separating = whole.elapsed();  // (two chunks)
         std::vector<double> mixed(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) mixed[size_t(i)] = mono[size_t(i)] * std::sqrt(0.5);
         const double gain[3] = {12, 20, 20};  // dB better than the mix, at least
@@ -20132,8 +20135,8 @@ if ui["pressed"] == "add":
             const qint64 took = clock.elapsed() - cancelledAt;
             later.join();
             QCOMPARE(err, std::string("Cancelled"));
-            qInfo("stopped %lld ms after the cancel", took);
-            QVERIFY2(took < 5000, qPrintable(QString::number(took)));  // (a chunk takes 10 s or more)
+            qInfo("stopped %lld ms after the cancel (separating it all took %lld ms)", took, separating);
+            QVERIFY2(took < separating / 3, qPrintable(QStringLiteral("%1 of %2").arg(took).arg(separating)));  // (not the chunk's end)
             for (const std::string& d : dropped) QVERIFY(!QFile::exists(QString::fromStdString(d)));
         }
         // A stereo recording shorter than a chunk (looped to fill one): each channel separated on its own.
