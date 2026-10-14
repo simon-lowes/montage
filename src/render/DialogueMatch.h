@@ -37,6 +37,7 @@ struct DialogueMatchPlan {
     std::vector<std::pair<double, VoiceEq>> eqOverTime;
     // The level: the clip volume (dB) and the loudness (LUFS) of the reference and of the clip before and after.
     double gainDb = 0;
+    bool levelSet = false;  // (not when either's speech could not be measured)
     double referenceLufs = -70, targetLufs = -70, matchedLufs = -70;
 };
 

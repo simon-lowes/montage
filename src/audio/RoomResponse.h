@@ -7,6 +7,7 @@
 #include <array>
 #include <complex>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -16,6 +17,8 @@ namespace montage {
 
 // Octave bands, 125 Hz to 8 kHz.
 constexpr int kRoomBands = 7;
+// The Convolution Reverb effect's decay parameters, one per band.
+inline constexpr const char* kRoomDecayParams[kRoomBands] = {"rt_125", "rt_250", "rt_500", "rt_1k", "rt_2k", "rt_4k", "rt_8k"};
 const std::array<double, kRoomBands>& roomBandCentres();
 
 // In place, any power of two; the inverse is unscaled.
@@ -31,28 +34,38 @@ struct RoomShape {
 // after the pre-delay, with unit energy. Each channel (seed) is its own noise, so stereo is wide.
 std::vector<float> roomImpulse(int sampleRate, const RoomShape& room, uint32_t seed = 1);
 // An impulse response from a sound file, each channel at `sampleRate` (mono files give the same to both), scaled to
-// unit energy over both channels. False with `error` if it cannot be read or is silent.
+// unit energy over both channels, its silence at the end left out and at most 10 s kept. False with `error` if it
+// cannot be read or is silent.
 bool loadImpulseResponse(const std::string& path, int sampleRate, std::vector<float>& left, std::vector<float>& right,
                          std::string* error = nullptr);
+
+// An impulse response made ready for convolution in blocks: its first block of taps as they are (back to front), the
+// rest as the spectra of block-long parts. Made once, shared by every Convolver using it.
+struct ConvolutionKernel {
+    int block = 0;
+    std::vector<float> head;
+    std::vector<std::vector<std::complex<float>>> parts;
+};
+std::shared_ptr<const ConvolutionKernel> makeConvolutionKernel(const std::vector<float>& ir, int block = 512);
 
 // Convolution with an impulse response in real time and without latency: its first block of taps directly, the rest
 // in uniformly partitioned FFT blocks (overlap-save) that come due one block after their input is complete.
 class Convolver {
 public:
-    void setImpulse(const std::vector<float>& ir, int block = 512);
-    bool empty() const { return head_.empty(); }
+    void setImpulse(const std::vector<float>& ir, int block = 512) { setKernel(makeConvolutionKernel(ir, block)); }
+    void setKernel(std::shared_ptr<const ConvolutionKernel> kernel);  // (silence before: nothing carried over)
+    const std::shared_ptr<const ConvolutionKernel>& kernel() const { return kernel_; }
+    bool empty() const { return !kernel_ || kernel_->head.empty(); }
     void reset();
     // `n` samples of output (the response's alone, no dry sound) for `n` of input; `stride` steps through
     // interleaved buffers. `in` and `out` may be the same.
     void process(const float* in, float* out, int n, int stride = 1);
 
 private:
-    int block_ = 0;
-    std::vector<float> head_;                                // taps 0 .. block-1
-    std::vector<std::vector<std::complex<float>>> parts_;   // the spectra of the later blocks of taps
+    std::shared_ptr<const ConvolutionKernel> kernel_;
     std::vector<std::vector<std::complex<float>>> inputs_;  // the spectra of the latest input frames (a ring)
     size_t newest_ = 0;
-    std::vector<float> history_;  // the last `block` inputs (a ring), for the direct taps
+    std::vector<float> history_;  // the last `block` inputs, kept twice over
     size_t at_ = 0;
     std::vector<float> previous_, current_, tail_;  // the input frame before, this one, and the later taps' output now
     int pos_ = 0;

@@ -142,9 +142,11 @@ bool loadImpulseResponse(const std::string& path, int sampleRate, std::vector<fl
         return false;
     }
     // The silence after the response ends (90 dB below its peak) costs time and adds nothing.
-    size_t end = size_t(frames);
+    size_t end = std::min(size_t(frames), size_t(10) * size_t(std::max(1, sampleRate)));
     while (end > 1 && std::abs(left[end - 1]) < peak * 3e-5 && std::abs(right[end - 1]) < peak * 3e-5) --end;
     left.resize(end), right.resize(end);
+    energy = 0;
+    for (size_t i = 0; i < end; ++i) energy += double(left[i]) * left[i] + double(right[i]) * right[i];
     const float g = float(1 / std::sqrt(energy / 2));
     for (auto& v : left) v *= g;
     for (auto& v : right) v *= g;
@@ -153,27 +155,33 @@ bool loadImpulseResponse(const std::string& path, int sampleRate, std::vector<fl
 
 // ---- Convolution ----------------------------------------------------------------
 
-void Convolver::setImpulse(const std::vector<float>& ir, int block) {
-    block_ = 1;
-    while (block_ < std::max(16, block)) block_ <<= 1;
-    const size_t B = size_t(block_), bins = B + 1;
-    head_.assign(B, 0.0f);
+std::shared_ptr<const ConvolutionKernel> makeConvolutionKernel(const std::vector<float>& ir, int block) {
+    auto k = std::make_shared<ConvolutionKernel>();
+    k->block = 1;
+    while (k->block < std::max(16, block)) k->block <<= 1;
+    if (ir.empty()) return k;
+    const size_t B = size_t(k->block), bins = B + 1;
+    k->head.assign(B, 0.0f);
     // Stored back to front, so the direct taps run forward through the history.
-    for (size_t i = 0; i < std::min(B, ir.size()); ++i) head_[B - 1 - i] = ir[i];
-    parts_.clear();
+    for (size_t i = 0; i < std::min(B, ir.size()); ++i) k->head[B - 1 - i] = ir[i];
     std::vector<cfloat> frame(2 * B);
     for (size_t start = B; start < ir.size(); start += B) {
         std::fill(frame.begin(), frame.end(), cfloat());
         for (size_t i = 0; i < B && start + i < ir.size(); ++i) frame[i] = ir[start + i];
         fftInPlace(frame, false);
-        parts_.emplace_back(frame.begin(), frame.begin() + std::ptrdiff_t(bins));
+        k->parts.emplace_back(frame.begin(), frame.begin() + std::ptrdiff_t(bins));
     }
-    inputs_.assign(parts_.size(), std::vector<cfloat>(bins));
+    return k;
+}
+
+void Convolver::setKernel(std::shared_ptr<const ConvolutionKernel> kernel) {
+    kernel_ = std::move(kernel);
+    const size_t B = kernel_ ? size_t(kernel_->block) : 0, bins = B + 1;
+    inputs_.assign(kernel_ ? kernel_->parts.size() : 0, std::vector<cfloat>(bins));
     work_.assign(2 * B, cfloat());
     history_.assign(2 * B, 0.0f);
     previous_.assign(B, 0.0f), current_.assign(B, 0.0f), tail_.assign(B, 0.0f);
     newest_ = 0, at_ = 0, pos_ = 0;
-    if (ir.empty()) head_.clear();
 }
 
 void Convolver::reset() {
@@ -186,22 +194,25 @@ void Convolver::reset() {
 }
 
 void Convolver::process(const float* in, float* out, int n, int stride) {
-    if (head_.empty()) {
+    if (empty()) {
         for (int i = 0; i < n; ++i) out[size_t(i) * size_t(stride)] = 0;
         return;
     }
-    const size_t B = size_t(block_), bins = B + 1, P = parts_.size();
+    const auto& head = kernel_->head;
+    const auto& parts = kernel_->parts;
+    const int block = kernel_->block;
+    const size_t B = size_t(block), bins = B + 1, P = parts.size();
     for (int i = 0; i < n; ++i) {
         const float x = in[size_t(i) * size_t(stride)];
         // The history is kept twice over, so the last B inputs always lie in one run: history_[at_+1 .. at_+B].
         history_[at_] = history_[at_ + B] = x;
         const float* h = history_.data() + at_ + 1;
         float y = 0;
-        for (size_t k = 0; k < B; ++k) y += h[k] * head_[k];
+        for (size_t k = 0; k < B; ++k) y += h[k] * head[k];
         at_ = (at_ + 1) % B;
         out[size_t(i) * size_t(stride)] = y + tail_[size_t(pos_)];
         current_[size_t(pos_)] = x;
-        if (++pos_ < block_) continue;
+        if (++pos_ < block) continue;
         pos_ = 0;
         if (P) {
             // This frame's spectrum joins the ring; the later taps' output for the next block is every frame
@@ -213,7 +224,7 @@ void Convolver::process(const float* in, float* out, int n, int stride) {
             std::fill(work_.begin(), work_.end(), cfloat());
             for (size_t p = 0; p < P; ++p) {
                 const auto& X = inputs_[(newest_ + P - p) % P];
-                const auto& H = parts_[p];
+                const auto& H = parts[p];
                 for (size_t k = 0; k < bins; ++k) work_[k] += X[k] * H[k];
             }
             for (size_t k = 1; k < B; ++k) work_[2 * B - k] = std::conj(work_[k]);

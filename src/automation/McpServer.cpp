@@ -4765,8 +4765,8 @@ void McpServer::Impl::addTools() {
                 const Clip* c = edit::clipById(s, Id(v.toDouble()));
                 auto loc = c ? edit::locate(s, c->id) : std::nullopt;
                 if (!c || !loc || loc->track.kind != TrackKind::Audio || c->id == ref.id)
-                    throw ArgError{QStringLiteral("%1 is not an audio clip other than the reference").arg(v.toDouble())};
-                ids.push_back(c->id);
+                    throw ArgError{QStringLiteral("%1 is not an audio clip other than the reference").arg(qulonglong(v.toDouble()))};
+                if (std::find(ids.begin(), ids.end(), c->id) == ids.end()) ids.push_back(c->id);
             }
             std::vector<std::pair<Id, DialogueMatchPlan>> plans;
             std::string err;
@@ -4785,7 +4785,11 @@ void McpServer::Impl::addTools() {
                                        {"b4000_db", plan.eq.b3Db}, {"high_db", plan.eq.highDb}, {"gain_db", plan.gainDb},
                                        {"loudness_lufs", plan.matchedLufs}, {"reference_loudness_lufs", plan.referenceLufs}});
             }
-            return ok(QStringLiteral("Matched %1 clip(s) to %2").arg(n).arg(refName), QJsonObject{{"clips", out}});
+            // (a clip whose sound could not be read is left as it was)
+            QJsonArray skipped;
+            for (Id id : ids)
+                if (std::none_of(plans.begin(), plans.end(), [&](const auto& pl) { return pl.first == id; })) skipped.append(double(id));
+            return ok(QStringLiteral("Matched %1 clip(s) to %2").arg(n).arg(refName), QJsonObject{{"clips", out}, {"not_matched", skipped}});
         });
 
     add("montage_set_surround", "Set up a surround mix",

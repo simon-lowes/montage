@@ -618,7 +618,7 @@ std::vector<EffectInfo> buildCatalog() {
                  {}});
     // A room by convolution (audio/RoomResponse.h): one made to measure from its decay time in each octave, or an
     // impulse-response file (a made room stands in if the file cannot be read). Dialogue Match adds it to put ADR in
-    // the production take's room. The room's shape is rebuilt when it changes, so it is best left unkeyed.
+    // the production take's room. The room's shape (decays, pre-delay) is built once, not keyed; its levels can be.
     c.push_back({"convolution_reverb", "Convolution Reverb", EffectCategory::AudioFilter, "Time",
                  {num("wet_db", "Room Level (dB)", -60, 12, -12, 0.1), num("dry_db", "Direct Level (dB)", -60, 12, 0, 0.1),
                   num("predelay_ms", "Pre-Delay (ms)", 0, 200, 12, 1), num("rt_125", "Decay at 125 Hz (s)", 0.1, 10, 0.6, 0.01),
@@ -627,6 +627,8 @@ std::vector<EffectInfo> buildCatalog() {
                   num("rt_4k", "Decay at 4 kHz (s)", 0.1, 10, 0.5, 0.01), num("rt_8k", "Decay at 8 kHz (s)", 0.1, 10, 0.4, 0.01)},
                  {str("ir", "Impulse Response", StringKind::File)}});
     c.back().strings[0].fileFilter = "Impulse responses (*.wav *.aif *.aiff *.flac);;All files (*)";
+    for (auto& pi : c.back().params)
+        if (pi.name != "wet_db" && pi.name != "dry_db") pi.keyframeable = false;
     c.push_back({"channels", "Channel Tools", EffectCategory::AudioFilter, "Channels",
                  {choice("mode", "Channels", {"Stereo", "Mono (Sum)", "Left to Both", "Right to Both", "Swap Left and Right"}, 0),
                   boolean("invert_l", "Invert Left Polarity"), boolean("invert_r", "Invert Right Polarity")},

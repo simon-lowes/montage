@@ -1485,7 +1485,7 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Fit to Fill"), QKeySequence(), [this] { fitToFill(); })->setObjectName(QStringLiteral("fitToFill"));
     add(clipM, tr("Set Voice Reference"), QKeySequence(), [this] { setVoiceReference(); })->setObjectName(QStringLiteral("setVoiceReference"));
     add(clipM, tr("Match Voice to Reference"), QKeySequence(), [this] { matchVoice(); })->setObjectName(QStringLiteral("matchVoice"));
-    add(clipM, tr("Match Dialogue to Reference..."), QKeySequence(), [this] { matchDialogueDialog(); })
+    add(clipM, tr("Match Dialogue to Reference…"), QKeySequence(), [this] { matchDialogueDialog(); })
         ->setObjectName(QStringLiteral("matchDialogue"));
     add(clipM, tr("Convert Voice…"), QKeySequence(), [this] {
         const Sequence* s = state_->sequence();
@@ -4886,6 +4886,7 @@ bool MainWindow::setVoiceReference() {
     voiceRef_ = spectrum;
     voiceRefName_ = name;
     voiceRefClip_ = clip;
+    voiceRefGeneration_ = state_->projectGeneration();
     state_->message(tr("Voice reference: %1. Select dialogue clips and choose Match Voice to Reference.").arg(name), 6000);
     return true;
 }
@@ -4934,54 +4935,82 @@ int MainWindow::matchVoice() {
 int MainWindow::matchDialogue(const DialogueMatchOptions& o, bool roomTone) {
     const Sequence* s = state_->sequence();
     if (!s) return 0;
-    const Clip* ref = voiceRefClip_ ? edit::clipById(*s, voiceRefClip_) : nullptr;
+    const Clip* ref = voiceRefClip_ && voiceRefGeneration_ == state_->projectGeneration() ? edit::clipById(*s, voiceRefClip_) : nullptr;
     if (!ref) {
         state_->message(tr("Select the production take and choose Clip › Set Voice Reference first"), 5000);
         return 0;
     }
+    const Id refId = ref->id, seqId = s->id;
+    const QString refName = QString::fromStdString(ref->name);
+    const double refGain = ref->audio.p("gain_db", ref->duration / 2, 0);
     std::vector<Id> clips;
     for (Id id : state_->selectedClips())
-        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Audio && id != ref->id) clips.push_back(id);
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Audio && id != refId) clips.push_back(id);
     if (clips.empty()) {
         state_->message(tr("Select the audio clips to match"));
         return 0;
     }
     auto project = std::make_shared<Project>(state_->project());
-    const Id seqId = s->id, refId = ref->id;
     std::vector<std::pair<Id, DialogueMatchPlan>> plans;
+    RoomToneProfile tone;
     if (!runWithProgress(this, state_, tr("Matching dialogue..."), [&, project](const auto& progress, const auto* cancel, std::string* err) {
             Sequence* sq = project->findSequence(seqId);
-            return sq && montage::matchDialogue(*project, *sq, refId, clips, o, &plans, err, progress, cancel) > 0;
+            if (!sq || montage::matchDialogue(*project, *sq, refId, clips, o, &plans, err, progress, cancel) == 0) return false;
+            // (the room tone learned once, from the reference)
+            if (const Clip* k = roomTone ? edit::clipById(*sq, refId) : nullptr) {
+                std::string why;
+                clipRoomTone(*project, *sq, *k, tone, &why);
+            }
+            return true;
         }))
         return 0;
+    // Room tone for each clip's length, written beside the project and imported.
+    std::map<Id, Id> toneMedia;  // clip -> its room tone
+    if (roomTone && !tone.valid()) state_->message(tr("No room tone could be learned from %1").arg(refName), 5000);
+    if (roomTone && tone.valid()) {
+        QStringList paths;
+        std::vector<Id> forClip;
+        for (const auto& [id, plan] : plans) {
+            const Clip* k = edit::clipById(*s, id);
+            if (!k) continue;
+            const int64_t samples = int64_t(std::llround(double(k->duration) / s->fpsValue() * tone.sampleRate));
+            const QString path = newRoomTonePath(s->name);
+            std::string err;
+            if (!writeStereoWav(path.toStdString(), synthesizeRoomTone(tone, samples, uint32_t(k->start + 1)), tone.sampleRate, &err)) {
+                state_->message(QString::fromStdString(err), 6000);
+                break;
+            }
+            paths << path;
+            forClip.push_back(id);
+        }
+        const std::vector<Id> media = paths.isEmpty() ? std::vector<Id>{} : state_->importFiles(paths, nullptr, QStringLiteral("Room Tone"));
+        for (size_t i = 0; i < media.size() && i < forClip.size(); ++i) toneMedia[forClip[i]] = media[i];
+    }
+    s = nullptr;  // (importing changed the project)
+    // One step: each clip matched, and its room tone on the first audio track below it that is free there (a new one if
+    // none is), at the reference's volume.
     state_->edit(tr("Match Dialogue"), [&](Project& p, Sequence& sq) {
         for (const auto& [id, plan] : plans)
             if (Clip* k = edit::clipById(sq, id)) applyDialogueMatch(p, sq, *k, plan, o);
-        return true;
-    });
-    // Room tone under each, on the first audio track below it that is free there (a new one if none is).
-    if (roomTone)
-        for (const auto& [id, plan] : plans) {
-            const Sequence* sq = state_->sequence();
-            auto loc = sq ? edit::locate(*sq, id) : std::nullopt;
-            const Clip* k = sq ? edit::clipById(*sq, id) : nullptr;
+        for (const auto& [id, media] : toneMedia) {
+            auto loc = edit::locate(sq, id);
+            const Clip* k = edit::clipById(sq, id);
             if (!loc || !k) continue;
             const FrameTime from = k->start, to = k->end();
-            int under = -1;
-            for (int j = loc->track.index + 1; j < int(sq->audioTracks.size()) && under < 0; ++j) {
+            std::optional<TrackRef> under;
+            for (int j = loc->track.index + 1; j < int(sq.audioTracks.size()) && !under; ++j) {
                 TrackGap gap;
-                if (gapAt(*sq, {TrackKind::Audio, j}, from, gap) && gap.end >= to) under = j;
+                if (gapAt(sq, {TrackKind::Audio, j}, from, gap) && gap.end >= to) under = TrackRef{TrackKind::Audio, j};
             }
-            if (under < 0) {
-                state_->edit(tr("Add Track"), [&](Project& p, Sequence& q) {
-                    q.audioTracks.push_back(makeTrack(p, TrackKind::Audio, "A" + std::to_string(q.audioTracks.size() + 1)));
-                    under = int(q.audioTracks.size()) - 1;
-                    return true;
-                });
-            }
-            if (under >= 0) fillRoomTone({TrackKind::Audio, under}, from, to, refId);
+            if (!under) under = edit::addTrack(p, sq, TrackKind::Audio);
+            if (!edit::placeMedia(p, sq, media, from, 0, to - from, {TrackKind::Video, 0}, *under, false).ok) continue;
+            if (const Track* t = trackAt(sq, *under))
+                for (const Clip& c : t->clips)
+                    if (c.start == from && c.mediaId == media) edit::clipById(sq, c.id)->audio.params["gain_db"] = Param(refGain);
         }
-    state_->message(tr("Matched %n clip(s) to %1", "", int(plans.size())).arg(QString::fromStdString(ref->name)), 5000);
+        return true;
+    });
+    state_->message(tr("Matched %n clip(s) to %1", "", int(plans.size())).arg(refName), 5000);
     inspectorDock_->raise();
     return int(plans.size());
 }
@@ -5498,6 +5527,19 @@ void MainWindow::exportVersionsDialog() {
     exportVersions(chosen, folder->text(), captions->isChecked(), loud->currentData().toDouble(), format->currentText());
 }
 
+QString MainWindow::newRoomTonePath(const std::string& sequenceName) const {
+    const QString project = state_->filePath();
+    const QString folder = (project.isEmpty() ? QStandardPaths::writableLocation(QStandardPaths::MusicLocation) + QStringLiteral("/Montage")
+                                              : QFileInfo(project).absolutePath()) +
+                           QStringLiteral("/Room Tone");
+    QDir().mkpath(folder);
+    QString path;
+    int n = 1;
+    do path = folder + '/' + QString::fromStdString(sequenceName) + QStringLiteral(" Room Tone %1.wav").arg(n++);
+    while (QFileInfo::exists(path));
+    return path;
+}
+
 Id MainWindow::fillRoomTone(TrackRef track, FrameTime at, FrameTime to, Id source) {
     const Sequence* s = state_->sequence();
     const Track* t = s ? trackAt(*s, track) : nullptr;
@@ -5531,15 +5573,7 @@ Id MainWindow::fillRoomTone(TrackRef track, FrameTime at, FrameTime to, Id sourc
         return 0;
     const int64_t samples = int64_t(std::llround(double(end - from) / seq.fpsValue() * prof.sampleRate));
     const std::vector<float> tone = synthesizeRoomTone(prof, samples, uint32_t(from + 1));
-    const QString project = state_->filePath();
-    const QString folder = (project.isEmpty() ? QStandardPaths::writableLocation(QStandardPaths::MusicLocation) + QStringLiteral("/Montage")
-                                              : QFileInfo(project).absolutePath()) +
-                           QStringLiteral("/Room Tone");
-    QDir().mkpath(folder);
-    QString path;
-    int n = 1;
-    do path = folder + '/' + QString::fromStdString(seq.name) + QStringLiteral(" Room Tone %1.wav").arg(n++);
-    while (QFileInfo::exists(path));
+    const QString path = newRoomTonePath(seq.name);
     std::string err;
     if (!writeStereoWav(path.toStdString(), tone, prof.sampleRate, &err)) {
         state_->message(QString::fromStdString(err), 6000);

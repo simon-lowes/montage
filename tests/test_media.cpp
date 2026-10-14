@@ -116,6 +116,7 @@
 #include "render/AutoMix.h"
 #include "render/VideoDenoise.h"
 #include "render/DialogueMatch.h"
+#include "render/RoomTone.h"
 #include "render/VoiceMatch.h"
 #include "media/Segmenter.h"
 #include "media/Translator.h"
@@ -20868,6 +20869,50 @@ if ui["pressed"] == "add":
         float pulse[4] = {1, 0, 0, 0};
         conv.process(pulse, pulse, 4);
         QVERIFY(pulse[0] == 0.5f && pulse[1] == 0.25f && pulse[2] == 0 && pulse[3] == 0);
+        // Reset forgets the sound before it, and a second convolver sharing the response plays the same.
+        conv.setImpulse(ir, 256);
+        std::vector<float> before(sig.begin(), sig.begin() + 3000);
+        conv.process(before.data(), before.data(), 3000);
+        conv.reset();
+        Convolver twin;
+        twin.setKernel(conv.kernel());
+        QVERIFY(twin.kernel() == conv.kernel() && !twin.empty());
+        std::vector<float> once(sig.begin(), sig.begin() + 3000), again = once;
+        conv.process(once.data(), once.data(), 3000);
+        twin.process(again.data(), again.data(), 3000);
+        for (size_t i = 0; i < once.size(); ++i) QVERIFY(std::fabs(once[i] - offline[i]) < 1e-3 && once[i] == again[i]);
+
+        // A response from a file: both channels as they are, the silence after it left out, unit energy over both.
+        {
+            constexpr int rate = 48000;
+            std::vector<float> file(size_t(rate) * 2 * 2, 0.0f);  // 2 s, the response in the first 0.3 s
+            for (size_t i = 0; i < size_t(0.3 * rate); ++i) {
+                const float v = 0.2f * std::clamp(n01(rng), -3.0f, 3.0f) * float(std::exp(-double(i) / (0.05 * rate)));
+                file[2 * i] = v, file[2 * i + 1] = -0.5f * v;
+            }
+            const std::string irWav = path("response.wav");
+            QVERIFY(writeStereoWav(irWav, file, rate));
+            std::vector<float> l, r;
+            std::string err;
+            QVERIFY2(loadImpulseResponse(irWav, rate, l, r, &err), err.c_str());
+            QCOMPARE(l.size(), r.size());
+            QVERIFY2(l.size() >= size_t(0.29 * rate) && l.size() <= size_t(0.3 * rate), qPrintable(QString::number(l.size())));
+            double el = 0, er = 0, worstRatio = 0;
+            for (size_t i = 0; i < l.size(); ++i) {
+                el += double(l[i]) * l[i], er += double(r[i]) * r[i];
+                worstRatio = std::max(worstRatio, double(std::fabs(r[i] + 0.5f * l[i])));
+            }
+            QVERIFY(std::fabs(el + er - 2) < 1e-3 && std::fabs(er / el - 0.25) < 1e-3 && worstRatio < 1e-4);
+            // A mono file gives both channels the same; a silent or missing one is refused.
+            const std::string monoWav = path("response-mono.wav"), silentWav = path("response-silent.wav");
+            std::vector<float> mono(size_t(rate), 0.0f), silent(size_t(rate), 0.0f);
+            mono[10] = 0.5f, mono[20] = -0.25f;
+            QVERIFY(writeMonoWav(monoWav, mono, rate) && writeMonoWav(silentWav, silent, rate));
+            QVERIFY(loadImpulseResponse(monoWav, rate, l, r) && l == r && l.size() == 21);
+            QVERIFY(std::fabs(l[10] / l[20] + 2) < 1e-3);
+            QVERIFY(!loadImpulseResponse(silentWav, rate, l, r, &err) && !err.empty());
+            QVERIFY(!loadImpulseResponse(path("no-such-response.wav"), rate, l, r));
+        }
 
         // A made room decays at each octave's own rate (averaged over three rooms of that shape), with unit energy.
         constexpr int sr = 48000;
@@ -21010,6 +21055,37 @@ if ui["pressed"] == "add":
         QVERIFY(moving.eqOverTime.size() >= 15);
         QCOMPARE(moving.eqOverTime[1].first - moving.eqOverTime[0].first, 0.5);
         for (const auto& [t, g] : moving.eqOverTime) QVERIFY2(std::fabs(g.lowDb - moving.eq.lowDb) < 6, qPrintable(QString::number(t)));
+        // ... and it follows a reference whose tone changes: lows 8 dB down in its first half only.
+        {
+            std::vector<float> changing = dry;
+            std::vector<float> firstHalf(dry.begin(), dry.begin() + std::ptrdiff_t(dry.size() / 2));
+            VoiceEq thin;
+            thin.lowDb = -8;
+            applyVoiceEqTo(firstHalf, thin, sr);
+            std::copy(firstHalf.begin(), firstHalf.end(), changing.begin());
+            DialogueMatchOptions toneOnly;
+            toneOnly.room = false, toneOnly.level = false, toneOnly.toneOverTime = true;
+            const DialogueMatchPlan follow = planDialogueMatch(changing, dry, sr, toneOnly);
+            const double half = double(dry.size()) / sr / 2;
+            int early = 0, late = 0;
+            for (const auto& [t, g] : follow.eqOverTime) {
+                if (t < half - 1.5) {
+                    QVERIFY2(g.lowDb < -4, qPrintable(QString("%1: %2").arg(t).arg(g.lowDb)));
+                    ++early;
+                }
+                if (t > half + 1.5) {
+                    QVERIFY2(g.lowDb > -3, qPrintable(QString("%1: %2").arg(t).arg(g.lowDb)));
+                    ++late;
+                }
+            }
+            QVERIFY(early >= 3 && late >= 3);
+            // A reference too short to follow keeps the one fit; a short one against a long clip stays within itself.
+            const std::vector<float> shortRef(changing.begin(), changing.begin() + std::ptrdiff_t(sr * 3 / 2));
+            const std::vector<float> longTarget(dry.begin(), dry.begin() + std::ptrdiff_t(sr * 4));
+            QVERIFY(planDialogueMatch(shortRef, longTarget, sr, toneOnly).eqOverTime.empty());
+            const std::vector<float> ref25(dry.begin(), dry.begin() + std::ptrdiff_t(sr * 5 / 2));
+            QVERIFY(!planDialogueMatch(ref25, dry, sr, toneOnly).eqOverTime.empty());
+        }
 
         // In a project, over MCP: the ADR clip gets the EQ and the room (tagged, replacing an earlier Match Voice EQ)
         // and its volume, and the mixer plays it as the match planned it.
@@ -21082,6 +21158,53 @@ if ui["pressed"] == "add":
         QVERIFY(loadProject(project.toStdString(), back));
         c = edit::clipById(*back.active(), target);
         QVERIFY(c && c->effects.size() == 2 && c->effects[0].params.at("low_db").keys.size() >= 15);
+        // (keyed at the clip's own frames: the first fit is a second in)
+        QCOMPARE(c->effects[0].params.at("low_db").keys[0].t, FrameTime(std::llround(back.active()->fpsValue())));
+
+        // A response from a file through the mixer: a single tap 100 samples late echoes the clip exactly, and after
+        // a seek the room plays on as it would have (once its response has passed).
+        {
+            const std::string echoWav = path("echo.wav");
+            std::vector<float> tap(size_t(sr), 0.0f);
+            tap[100] = 0.5f;
+            QVERIFY(writeMonoWav(echoWav, tap, sr));
+            Project ep = makeDefaultProject();
+            Sequence& es = *ep.active();
+            MediaItem m;
+            QVERIFY(probeMedia(adrWav, m));
+            m.id = ep.newId();
+            ep.media.push_back(m);
+            QVERIFY(edit::placeMedia(ep, es, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            const int64_t len = sr * 2;
+            auto mixAll = [&](AudioMixer& mx, int64_t start, int64_t count) {
+                std::vector<float> o(size_t(count) * 2);
+                for (int64_t at = 0; at < count; at += 4800) mx.mix(ep, es, start + at, int(std::min<int64_t>(4800, count - at)), o.data() + at * 2);
+                return o;
+            };
+            AudioMixer plain;
+            const std::vector<float> direct = mixAll(plain, 0, len);
+            Effect room = makeEffect(ep, "convolution_reverb");
+            room.strings["ir"] = echoWav;
+            room.params["wet_db"] = Param(0.0);
+            room.params["dry_db"] = Param(-96.0);
+            room.params["predelay_ms"] = Param(0.0);
+            es.audioTracks[0].clips[0].effects.push_back(room);
+            AudioMixer mixer2;
+            const std::vector<float> echoed = mixAll(mixer2, 0, len);
+            double worst = 0, level = 0;
+            for (int64_t i = 0; i < len * 2; ++i) {
+                level = std::max(level, double(std::fabs(direct[size_t(i)])));
+                worst = std::max(worst, double(std::fabs(echoed[size_t(i)] - (i >= 200 ? direct[size_t(i - 200)] : 0.0f))));
+            }
+            qInfo("echo from a file: %.2g from the clip 100 samples late (peak %.2f)", worst, level);
+            QVERIFY(level > 0.1 && worst < 1e-5);
+            const int64_t seek = sr / 2;
+            const std::vector<float> resumed = mixAll(mixer2, seek, len - seek);
+            for (int64_t i = 0; i < (len - seek) * 2; ++i) {
+                const float want = i < 200 ? 0.0f : echoed[size_t(seek * 2 + i)];
+                QVERIFY2(std::fabs(resumed[size_t(i)] - want) < 1e-5, qPrintable(QString::number(i)));
+            }
+        }
     }
 
     void beatsAndFittingMusic() {

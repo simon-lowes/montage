@@ -218,6 +218,7 @@ public:
     // when `to` is given, within the gap) with room tone learned from `source` (0 = the clip before the gap, or after
     // it). The new clip (0 if none).
     Id fillRoomTone(TrackRef track, FrameTime at, FrameTime to = 0, Id source = 0);
+    QString newRoomTonePath(const std::string& sequenceName) const;  // a new file in the project's Room Tone folder
     // Clip › Extend Clip (render/ExtendClip.h): the video clip carried on `frames` past its end (holding its last frame
     // as its motion settles), with room tone under its linked sound, pushing what follows when `ripple`. One undo step;
     // the new clips (the picture first).
@@ -584,7 +585,8 @@ private:
     QImage colourRefView_;  // the reference at display size, for the compare
     std::vector<double> voiceRef_;  // Match Voice's reference spectrum
     QString voiceRefName_;
-    Id voiceRefClip_ = 0;  // and its clip, for Dialogue Match
+    Id voiceRefClip_ = 0;  // and its clip, for Dialogue Match (in the project of that generation)
+    uint64_t voiceRefGeneration_ = 0;
     QAction* compareRef_ = nullptr;
     QAction* trimView_ = nullptr;  // Playback › Two-Up Trim View
     class ReviewOverlay* reviewOverlay_ = nullptr;  // reviewers' drawings over the Program monitor

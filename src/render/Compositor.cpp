@@ -21,7 +21,11 @@
 #include <cstring>
 #include <deque>
 #include <memory>
+#include <map>
 #include <mutex>
+#include <set>
+#include <thread>
+#include <tuple>
 
 #include "AudioFx.h"
 #include "ColorSpace.h"
@@ -2292,6 +2296,68 @@ inline float dbToLin(double db) { return db <= -96 ? 0.0f : float(std::pow(10.0,
 
 }  // namespace
 
+namespace {
+
+// What a Convolution Reverb's room is built from: the rate, its file (or none), and its decays and pre-delay (to the
+// 1/100 s and 1 ms).
+struct RoomKey {
+    int rate = 0;
+    std::string ir;
+    std::array<long, kRoomBands + 1> shape{};
+    bool operator==(const RoomKey&) const = default;
+    bool operator<(const RoomKey& o) const { return std::tie(rate, ir, shape) < std::tie(o.rate, o.ir, o.shape); }
+};
+struct RoomKernels {
+    std::shared_ptr<const ConvolutionKernel> left, right;
+};
+
+std::shared_ptr<const RoomKernels> buildRoomKernels(const RoomKey& key, const RoomShape& room) {
+    std::vector<float> l, r;
+    if (!key.ir.empty() && loadImpulseResponse(key.ir, key.rate, l, r)) {
+        const size_t pre = size_t(room.predelayMs * 1e-3 * key.rate);
+        l.insert(l.begin(), pre, 0.0f), r.insert(r.begin(), pre, 0.0f);
+    } else {  // (a made room stands in for a file that cannot be read)
+        l = roomImpulse(key.rate, room, 1), r = roomImpulse(key.rate, room, 2);
+    }
+    auto k = std::make_shared<RoomKernels>();
+    k->left = makeConvolutionKernel(l), k->right = makeConvolutionKernel(r);
+    return k;
+}
+
+// Rooms built, shared by every mixer and kept for the latest few. Playback (`wait` false) gets null until a room is
+// built in the background, so a new room never holds up the sound; exports wait for it.
+std::shared_ptr<const RoomKernels> roomKernels(const RoomKey& key, const RoomShape& room, bool wait) {
+    struct Cache {
+        std::mutex mutex;
+        std::map<RoomKey, std::shared_ptr<const RoomKernels>> ready;
+        std::deque<RoomKey> order;
+        std::set<RoomKey> building;
+    };
+    static Cache* cache = new Cache;  // (never destroyed: builds may finish while the program exits)
+    auto keep = [](const RoomKey& k, std::shared_ptr<const RoomKernels> v) {
+        std::lock_guard lock(cache->mutex);
+        cache->building.erase(k);
+        if (cache->ready.emplace(k, std::move(v)).second) cache->order.push_back(k);
+        while (cache->order.size() > 8) {
+            cache->ready.erase(cache->order.front());
+            cache->order.pop_front();
+        }
+    };
+    {
+        std::lock_guard lock(cache->mutex);
+        if (auto it = cache->ready.find(key); it != cache->ready.end()) return it->second;
+        if (!wait) {
+            if (cache->building.insert(key).second) std::thread([key, room, keep] { keep(key, buildRoomKernels(key, room)); }).detach();
+            return nullptr;
+        }
+    }
+    auto built = buildRoomKernels(key, room);
+    keep(key, built);
+    return built;
+}
+
+}  // namespace
+
 struct AudioMixer::State {
     Biquad bq[3];
     fx::ParametricEq eq;
@@ -2320,9 +2386,9 @@ struct AudioMixer::State {
     bool pluginFailed = false;
     std::string pluginState;  // the effect's saved state the plugin last loaded
     std::vector<float> planar, keyPlanar;
-    // Convolution Reverb: each side's room, and what it was built from.
+    // Convolution Reverb: each side's room, and what it was built from (kept across seeks, as rooms take a while).
     Convolver roomL, roomR;
-    std::string roomKey;
+    RoomKey roomKey;
     std::vector<float> roomOut;
 };
 
@@ -2462,6 +2528,7 @@ void AudioMixer::resetLocked() {
     if (monitor_.renderer) monitor_.renderer->reset();
     if (keyMixer_) keyMixer_->reset();
     // Plugins are expensive to load: keep them, clearing only their audio state.
+    // So are rooms: kept, their sound cleared.
     for (auto it = states_.begin(); it != states_.end();) {
         if (auto plugin = std::move(it->second->plugin)) {
             plugin->reset();
@@ -2471,6 +2538,13 @@ void AudioMixer::resetLocked() {
             it->second->plugin = std::move(plugin);
             it->second->pluginRate = rate;
             it->second->pluginState = std::move(state);
+            ++it;
+        } else if (!it->second->roomL.empty()) {
+            Convolver l = std::move(it->second->roomL), r = std::move(it->second->roomR);
+            RoomKey key = std::move(it->second->roomKey);
+            l.reset(), r.reset();
+            *it->second = State{};
+            it->second->roomL = std::move(l), it->second->roomR = std::move(r), it->second->roomKey = std::move(key);
             ++it;
         } else {
             it = states_.erase(it);
@@ -2577,31 +2651,31 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
             st->reverb.process(buf, frames, sr, e.p("size", lt, 50) / 100, e.p("damping", lt, 50) / 100, e.p("width", lt, 100) / 100,
                                e.p("mix", lt, 25) / 100);
         } else if (e.type == "convolution_reverb") {
-            static const char* kRt[kRoomBands] = {"rt_125", "rt_250", "rt_500", "rt_1k", "rt_2k", "rt_4k", "rt_8k"};
             RoomShape room;
-            std::string key = std::to_string(int(sr)) + "|" + e.s("ir");
+            RoomKey key;
+            key.rate = int(sr);
+            if (auto it = e.strings.find("ir"); it != e.strings.end()) key.ir = it->second;
             for (int b = 0; b < kRoomBands; ++b) {
-                room.rt60[size_t(b)] = std::clamp(e.p(kRt[b], lt, room.rt60[size_t(b)]), 0.1, 10.0);
-                key += "|" + std::to_string(std::lround(room.rt60[size_t(b)] * 100));
+                room.rt60[size_t(b)] = std::clamp(e.p(kRoomDecayParams[b], lt, room.rt60[size_t(b)]), 0.1, 10.0);
+                key.shape[size_t(b)] = std::lround(room.rt60[size_t(b)] * 100);
             }
             room.predelayMs = std::clamp(e.p("predelay_ms", lt, 12), 0.0, 200.0);
-            key += "|" + std::to_string(std::lround(room.predelayMs));
-            if (key != st->roomKey) {
-                std::vector<float> l, r;
-                if (!e.s("ir").empty() && loadImpulseResponse(e.s("ir"), int(sr), l, r)) {
-                    const size_t pre = size_t(room.predelayMs * 1e-3 * sr);
-                    l.insert(l.begin(), pre, 0.0f), r.insert(r.begin(), pre, 0.0f);
-                } else {
-                    l = roomImpulse(int(sr), room, 1), r = roomImpulse(int(sr), room, 2);
+            key.shape[kRoomBands] = std::lround(room.predelayMs);
+            if (!(key == st->roomKey) || st->roomL.empty()) {
+                if (auto k = roomKernels(key, room, !nonBlocking_)) {
+                    st->roomL.setKernel(k->left), st->roomR.setKernel(k->right);
+                    st->roomKey = key;
                 }
-                st->roomL.setImpulse(l), st->roomR.setImpulse(r);
-                st->roomKey = key;
             }
             const float wet = dbToLin(e.p("wet_db", lt, -12)), dry = dbToLin(e.p("dry_db", lt, 0));
-            st->roomOut.resize(size_t(frames) * 2);
-            st->roomL.process(buf, st->roomOut.data(), frames, 2);
-            st->roomR.process(buf + 1, st->roomOut.data() + 1, frames, 2);
-            for (size_t i = 0; i < size_t(frames) * 2; ++i) buf[i] = buf[i] * dry + st->roomOut[i] * wet;
+            if (st->roomL.empty() || !(key == st->roomKey)) {  // (the room is being built: the direct sound meanwhile)
+                for (size_t i = 0; i < size_t(frames) * 2; ++i) buf[i] *= dry;
+            } else {
+                st->roomOut.resize(size_t(frames) * 2);
+                st->roomL.process(buf, st->roomOut.data(), frames, 2);
+                st->roomR.process(buf + 1, st->roomOut.data() + 1, frames, 2);
+                for (size_t i = 0; i < size_t(frames) * 2; ++i) buf[i] = buf[i] * dry + st->roomOut[i] * wet;
+            }
         } else if (e.type == "multiband") {
             fx::BandSettings b[3];
             const char* names[3] = {"low", "mid", "high"};

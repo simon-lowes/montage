@@ -7764,6 +7764,12 @@ private slots:
         QCOMPARE(after.audioTracks[1].clips.size(), size_t(1));
         QCOMPARE(after.audioTracks[1].clips[0].start, matched->start);
         QCOMPARE(after.audioTracks[1].clips[0].end(), matched->end());
+        // One undo takes the match and its room tone off together.
+        state()->undo();
+        QVERIFY(state()->sequence()->audioTracks[1].clips.empty());
+        QVERIFY(eqOf() && eqOf()->s("match") == "voice");
+        state()->redo();
+        QCOMPARE(state()->sequence()->audioTracks[1].clips.size(), size_t(1));
         // The reference itself is not matched to itself.
         state()->setSelection({good}, false);
         QCOMPARE(win_->matchDialogue(DialogueMatchOptions{}), 0);

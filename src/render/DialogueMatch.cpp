@@ -12,8 +12,6 @@ namespace montage {
 
 namespace {
 
-constexpr const char* kRtParams[kRoomBands] = {"rt_125", "rt_250", "rt_500", "rt_1k", "rt_2k", "rt_4k", "rt_8k"};
-
 // The decay time the late reverberation is judged at: the reference's broadband one, else its octaves' around speech.
 double judgingTime(const RoomEstimate& e) {
     if (e.broadband > 0) return e.broadband;
@@ -69,15 +67,15 @@ DialogueMatchPlan planDialogueMatch(const std::vector<float>& reference, const s
     if (o.tone) {
         const std::vector<double> refSpectrum = speechSpectrum(reference, rate);
         plan.eq = fitVoiceEq(speechSpectrum(now, rate), refSpectrum, rate);
-        if (o.toneOverTime && now.size() > size_t(rate) * 3) {
+        if (o.toneOverTime && now.size() > size_t(rate) * 3 && reference.size() >= size_t(rate) * 2) {
             // Two seconds every half second, against the same moment of the reference (in proportion, as a line said
             // again takes its own time), then each gain smoothed with its neighbours.
             const double length = double(now.size()) / rate, refLength = double(reference.size()) / rate;
             const size_t half = size_t(rate);
             std::vector<std::pair<double, VoiceEq>> fits;
             for (double t = 1; t + 1 <= length + 1e-9; t += 0.5) {
-                const size_t at = size_t(t * rate), ref = size_t(std::clamp(t * refLength / length, 1.0, refLength - 1) * rate);
-                if (ref + half > reference.size() || at + half > now.size()) break;
+                const size_t at = size_t(t * rate), ref = size_t(std::clamp(t * refLength / length, 1.0, std::max(1.0, refLength - 1)) * rate);
+                if (ref < half || ref + half > reference.size() || at + half > now.size()) break;
                 const std::vector<float> a(now.begin() + std::ptrdiff_t(at - half), now.begin() + std::ptrdiff_t(at + half));
                 const std::vector<float> b(reference.begin() + std::ptrdiff_t(ref - half), reference.begin() + std::ptrdiff_t(ref + half));
                 // (a window without speech in both keeps the fit for the whole)
@@ -101,7 +99,10 @@ DialogueMatchPlan planDialogueMatch(const std::vector<float>& reference, const s
     plan.referenceLufs = loudness(reference, rate);
     plan.targetLufs = loudness(target, rate);
     const double before = loudness(now, rate);
-    if (o.level && plan.referenceLufs > -60 && before > -60) plan.gainDb = std::clamp(plan.referenceLufs - before, -30.0, 24.0);
+    if (o.level && plan.referenceLufs > -60 && before > -60) {
+        plan.gainDb = std::clamp(plan.referenceLufs - before, -30.0, 24.0);
+        plan.levelSet = true;
+    }
     plan.matchedLufs = before + plan.gainDb;
     return plan;
 }
@@ -141,11 +142,11 @@ void applyDialogueMatch(Project& p, const Sequence& s, Clip& c, const DialogueMa
         room.params["wet_db"] = Param(plan.wetDb);
         room.params["dry_db"] = Param(0.0);
         room.params["predelay_ms"] = Param(plan.room.predelayMs);
-        for (int b = 0; b < kRoomBands; ++b) room.params[kRtParams[b]] = Param(plan.room.rt60[size_t(b)]);
+        for (int b = 0; b < kRoomBands; ++b) room.params[kRoomDecayParams[b]] = Param(plan.room.rt60[size_t(b)]);
         room.strings["match"] = "dialogue";
         c.effects.insert(c.effects.begin() + std::ptrdiff_t(at), std::move(room));
     }
-    if (o.level) c.audio.params["gain_db"] = Param(plan.gainDb);
+    if (plan.levelSet) c.audio.params["gain_db"] = Param(plan.gainDb);
 }
 
 int matchDialogue(Project& p, Sequence& s, Id reference, const std::vector<Id>& clips, const DialogueMatchOptions& o,
@@ -173,7 +174,7 @@ int matchDialogue(Project& p, Sequence& s, Id reference, const std::vector<Id>& 
         std::vector<float> audio;
         if (!clipSpeechAudio(p, s, *c, audio, error, kRate)) continue;
         DialogueMatchPlan plan = planDialogueMatch(refAudio, audio, kRate, o);
-        if (o.level) {
+        if (plan.levelSet) {
             plan.gainDb = std::clamp(plan.gainDb + refGain, -30.0, 24.0);
             plan.referenceLufs += refGain, plan.matchedLufs += refGain;
         }
