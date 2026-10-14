@@ -60,10 +60,10 @@ public:
         }
         QMetaObject::invokeMethod(this, &RenderWorker::process, Qt::QueuedConnection);
     }
-    // The reference output every frame rendered also goes to.
-    void setSink(std::shared_ptr<output::Scheduler> s) {
+    // The outputs every frame rendered also goes to (the reference output, the remote review stream).
+    void setSinks(std::vector<std::shared_ptr<output::Scheduler>> s) {
         QMutexLocker lock(&sinkM_);
-        sink_ = std::move(s);
+        sinks_ = std::move(s);
     }
 
 signals:
@@ -159,7 +159,8 @@ private:
         if (r.cacheScale > 0) co.scale = r.cacheScale;
         const QByteArray key = frameKey(*r.project, *s, t, co);
         const bool hdr = r.hdr && trimTargetSpace(*s, r.trim).hdr();  // (a rendered preview has only its SDR picture)
-        const std::shared_ptr<output::Scheduler> dest = sink();  // (a rendered preview has no picture for it either)
+        const std::vector<std::shared_ptr<output::Scheduler>> dests = sinks();  // (a rendered preview has no picture for them either)
+        const bool dest = !dests.empty();
         if (!hdr && !dest && RenderCache::instance().has(key)) {
             QImage cached = RenderCache::instance().load(key);
             if (!cached.isNull()) return {cached, {}};
@@ -179,7 +180,7 @@ private:
         std::shared_ptr<const Image> sent;
         if (dest) {
             sent = other ? std::make_shared<const Image>(img) : std::make_shared<const Image>(std::move(img));
-            dest->submit(t, sent);
+            for (const auto& d : dests) d->submit(t, sent);
         }
         const Image& shown = dest && !other ? *sent : img;
         if (other) {
@@ -199,9 +200,18 @@ private:
         return out;
     }
 
-    std::shared_ptr<output::Scheduler> sink() {
+    std::vector<std::shared_ptr<output::Scheduler>> sinks() {
         QMutexLocker lock(&sinkM_);
-        return sink_ && sink_->running() ? sink_ : nullptr;
+        std::vector<std::shared_ptr<output::Scheduler>> out;
+        for (const auto& s : sinks_)
+            if (s && s->running()) out.push_back(s);
+        return out;
+    }
+    // Whether an output still wants frame `t` (let go there, or never given it).
+    bool sinkWants(FrameTime t) {
+        for (const auto& s : sinks())
+            if (s->wants(t)) return true;
+        return false;
     }
 
     void process() {
@@ -221,8 +231,7 @@ private:
         ctx_.frame = r.frame;
         auto it = cache_.find(r.frame);
         // (A frame kept here but let go by the reference output is rendered again for it.)
-        const std::shared_ptr<output::Scheduler> dest = sink();
-        Rendered img = it != cache_.end() && (!dest || !dest->wants(r.frame)) ? it->second : render(r, r.frame);
+        Rendered img = it != cache_.end() && !sinkWants(r.frame) ? it->second : render(r, r.frame);
         if (img.view.isNull()) return;
         emitFrame(img, r, r.frame);
         cache_[r.frame] = img;
@@ -244,7 +253,7 @@ private:
         for (int k = 1, n = ahead(); k <= n; ++k) {
             FrameTime t = ctx_.frame + FrameTime(k) * ctx_.direction;
             if (t < 0 || t >= end) return;
-            if (cache_.count(t) && !(sink() && sink()->wants(t))) continue;
+            if (cache_.count(t) && !sinkWants(t)) continue;
             Rendered img = render(ctx_, t);
             if (img.view.isNull()) return;
             cache_[t] = img;
@@ -271,7 +280,7 @@ private:
     Request pending_;
     bool has_ = false;
     QMutex sinkM_;
-    std::shared_ptr<output::Scheduler> sink_;
+    std::vector<std::shared_ptr<output::Scheduler>> sinks_;
     Request ctx_;  // context of the cached frames (render-thread only)
     std::map<FrameTime, Rendered> cache_;
 };
@@ -446,6 +455,7 @@ struct OutputAudio {
     std::shared_ptr<const Project> project;
     Id sequence = 0;
     bool muted = false;
+    bool stereo = false;  // a stereo mix of any layout (else the sequence's own channels, the first of them sent)
     AudioMixer mixer;
     std::vector<float> buf;
 
@@ -454,7 +464,7 @@ struct OutputAudio {
         const Sequence* s = project ? project->findSequence(sequence) : nullptr;
         if (!s || muted) return;
         // The sequence's own channels (5.1 and 7.1 as they are), into the first of the output's.
-        const int n = std::max(2, layoutChannels(s->audioLayout));
+        const int n = stereo ? 2 : std::max(2, layoutChannels(s->audioLayout));
         buf.assign(size_t(frames) * size_t(n), 0.0f);
         if (n == 2) mixer.mix(*project, *s, start, frames, buf.data());
         else mixer.mixLayout(*project, *s, start, frames, buf.data());
@@ -492,7 +502,7 @@ PlaybackController::PlaybackController(QObject* parent) : QObject(parent) {
 }
 
 PlaybackController::~PlaybackController() {
-    worker_->setSink(nullptr);
+    worker_->setSinks({});
     stopAudio();
     renderThread_->quit();
     renderThread_->wait();
@@ -503,41 +513,60 @@ void PlaybackController::setProject(const Project& p, Id sequenceId) {
     sequenceId_ = sequenceId;
     updateHeard();
     device_->setProject(heard_);
-    if (output_) output_->clearFrames();  // (rendered again as they are asked for)
+    for (const auto& o : {output_, review_})
+        if (o) o->clearFrames();  // (rendered again as they are asked for)
     syncOutput();
 }
 
+namespace {
+
+// Sound for an output: the mixer's as the sequence's own channels (or a stereo mix, `stereo`).
+std::shared_ptr<OutputAudio> outputAudioFor(output::Scheduler& out, bool stereo) {
+    auto audio = std::make_shared<OutputAudio>();
+    audio->mixer.setNonBlocking(true);
+    audio->mixer.setOfflineProxies(true);
+    audio->mixer.setAmbisonicBinaural(false);  // (a monitor's speakers)
+    audio->stereo = stereo;
+    out.setAudioSource([audio](int64_t start, int frames, int channels, float* o) { audio->mix(start, frames, channels, o); });
+    return audio;
+}
+
+}  // namespace
+
 void PlaybackController::setReferenceOutput(std::shared_ptr<output::Scheduler> out) {
     output_ = std::move(out);
-    worker_->setSink(output_);
-    outputAudio_.reset();
-    if (output_) {
-        outputAudio_ = std::make_shared<OutputAudio>();
-        outputAudio_->mixer.setNonBlocking(true);
-        outputAudio_->mixer.setOfflineProxies(true);
-        outputAudio_->mixer.setAmbisonicBinaural(false);  // (a monitor's speakers)
-        std::shared_ptr<OutputAudio> audio = outputAudio_;
-        output_->setAudioSource([audio](int64_t start, int frames, int channels, float* o) { audio->mix(start, frames, channels, o); });
-    }
+    outputAudio_ = output_ ? outputAudioFor(*output_, false) : nullptr;
+    worker_->setSinks({output_, review_});
+    syncOutput();
+    requestFrame();
+}
+
+void PlaybackController::setReviewOutput(std::shared_ptr<output::Scheduler> out) {
+    review_ = std::move(out);
+    reviewAudio_ = review_ ? outputAudioFor(*review_, true) : nullptr;
+    worker_->setSinks({output_, review_});
     syncOutput();
     requestFrame();
 }
 
 void PlaybackController::syncOutput() {
-    if (!output_) return;
-    output_->setPosition(position_, speed_);
-    if (outputAudio_) {
-        std::lock_guard lock(outputAudio_->m);
-        outputAudio_->project = heard_;
-        outputAudio_->sequence = sequenceId_;
-        outputAudio_->muted = globalMute_;
+    for (const auto& [out, audio] : {std::pair{output_, outputAudio_}, std::pair{review_, reviewAudio_}}) {
+        if (!out) continue;
+        out->setPosition(position_, speed_);
+        if (audio) {
+            std::lock_guard lock(audio->m);
+            audio->project = heard_;
+            audio->sequence = sequenceId_;
+            audio->muted = globalMute_;
+        }
     }
 }
 
 double PlaybackController::renderScale() const {
     // While output is on: the mode's size playing (a UHD sequence on a 1080p mode at half); parked, the whole picture
     // or more, as the viewer and scopes show it.
-    const double out = output_ && output_->running() ? output_->renderScale() : 0;
+    // (the reference output's size first: a review stream takes what it renders, fitted)
+    const double out = output_ && output_->running() ? output_->renderScale() : review_ && review_->running() ? review_->renderScale() : 0;
     if (out > 0) return isPlaying() ? out : std::max(1.0, out);
     return isPlaying() ? scale_ : 1.0;
 }

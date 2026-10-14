@@ -27,6 +27,7 @@
 #include "render/DialogueMatch.h"
 #include "render/RoomTone.h"
 #include "render/Versions.h"
+#include "render/RemoteReview.h"
 
 class QAction;
 class QActionGroup;
@@ -46,6 +47,7 @@ class EditorState;
 class CompareDialog;
 class CleanFeedWindow;
 class ReferenceOutputController;
+class RemoteReviewController;
 struct ConsolidateOptions;
 class PlaybackController;
 class MonitorPanel;
@@ -476,6 +478,9 @@ private:
     void openSnapshot();
     void showShortcuts();
     void showReferenceOutput();
+    void showRemoteReview();
+    // Markers reviewers sent from a remote review (one undo step), on the sequence streamed.
+    int applyRemoteMarkers(Id sequence, const std::vector<output::RemoteMarker>& markers);
     void about();
 
     EditorState* state_;
@@ -507,6 +512,8 @@ private:
     CleanFeedWindow* cleanFeed_ = nullptr;
     // Playback › Video Output › Reference Output…: the Program to a DeckLink card or over NDI.
     ReferenceOutputController* referenceOutput_ = nullptr;
+    RemoteReviewController* remoteReview_ = nullptr;
+    QAction* remoteReviewAction_ = nullptr;
     QAction* referenceOutputAction_ = nullptr;
     MixerPanel* mixer_ = nullptr;
     ControlSurface* surface_ = nullptr;

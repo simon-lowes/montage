@@ -72,6 +72,9 @@ public:
     // colour space, at its render scale, the render cache bypassed), with the playhead and the sound heard; null: none.
     void setReferenceOutput(std::shared_ptr<output::Scheduler> out);
     std::shared_ptr<output::Scheduler> referenceOutput() const { return output_; }
+    // The remote review stream (render/RemoteReview.h): the same, beside the reference output, its sound a stereo mix.
+    void setReviewOutput(std::shared_ptr<output::Scheduler> out);
+    std::shared_ptr<output::Scheduler> reviewOutput() const { return review_; }
 
     bool isPlaying() const { return speed_ != 0; }
     // Global Mute (as in Premiere): playback and scrubbing are silent; clips, tracks and exports are untouched.
@@ -178,6 +181,8 @@ private:
     bool ambisonicBinaural_ = true;
     std::shared_ptr<output::Scheduler> output_;
     std::shared_ptr<OutputAudio> outputAudio_;
+    std::shared_ptr<output::Scheduler> review_;
+    std::shared_ptr<OutputAudio> reviewAudio_;
 };
 
 }  // namespace montage

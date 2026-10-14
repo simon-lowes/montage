@@ -9,6 +9,7 @@ endfunction()
 
 montage_test(test_core)
 montage_test(test_render)
+target_link_libraries(test_render PRIVATE Qt6::Network)  # (free ports for the remote review stream)
 montage_test(test_media)
 target_link_libraries(test_media PRIVATE Qt6::Network)  # (a free port for the capture tests)
 # Several minutes of real encoding, decoding and model runs: slow CI runners need more than the default.

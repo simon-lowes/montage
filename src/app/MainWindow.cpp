@@ -51,6 +51,7 @@
 #include <QProgressDialog>
 #include <QPageSize>
 #include <QDateTime>
+#include <QUuid>
 #include <QTextDocument>
 #include <QPdfWriter>
 #include <QPlainTextEdit>
@@ -91,6 +92,7 @@
 #include "core/Cdl.h"
 #include "core/ChapterSuggest.h"
 #include "core/MarkerList.h"
+#include "core/ReviewPage.h"
 #include "render/AudioReactive.h"
 #include "render/VfxPull.h"
 #include "render/Amf.h"
@@ -150,6 +152,7 @@
 #include "LensCorrectionDialog.h"
 #include "LicencesDialog.h"
 #include "ReferenceOutputPanel.h"
+#include "RemoteReviewPanel.h"
 #include "SequenceIndexPanel.h"
 #include "StackedTimelineWidget.h"
 #include "PanFollowDialog.h"
@@ -965,6 +968,10 @@ void MainWindow::buildMenus() {
     add(file, tr("Export &IMF Master…"), QKeySequence(), [this] { exportImfDialog(); })->setObjectName(QStringLiteral("exportImf"));
     add(file, tr("Export Immersive Master (&ADM BWF)…"), QKeySequence(), [this] { exportAdmDialog(); })
         ->setObjectName(QStringLiteral("exportAdm"));
+    add(file, tr("Watch Remote Review…"), QKeySequence(), [this] {
+        auto* w = new ReviewViewerWindow(this);
+        w->show();
+    })->setObjectName(QStringLiteral("watchRemoteReview"));
     add(file, tr("Import Review Notes…"), QKeySequence(), [this] {
         const QString path = QFileDialog::getOpenFileName(this, tr("Import Review Notes"), appSettings().value(QStringLiteral("export/lastDirectory")).toString(),
                                                           tr("Review notes (*.json);;Marker lists (*.csv *.txt *.tsv)"));
@@ -2008,6 +2015,7 @@ void MainWindow::buildMenus() {
         }
         output->addSeparator();
         output->addAction(referenceOutputAction_);
+        output->addAction(remoteReviewAction_);
     });
     // To a broadcast monitor: SDI/HDMI through a DeckLink card, or NDI (render/ReferenceOutput.h).
     referenceOutput_ = new ReferenceOutputController(program_, this);
@@ -2024,6 +2032,24 @@ void MainWindow::buildMenus() {
     if (liveLink_)
         liveLink_->addAppTool(ReferenceOutputController::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
             return referenceOutput_->runTool(args, structured, isError);
+        });
+    // To reviewers elsewhere, streamed live (render/RemoteReview.h); their notes come back as markers.
+    remoteReview_ = new RemoteReviewController(program_, this);
+    remoteReviewAction_ = new QAction(tr("Remote Review…"), this);
+    remoteReviewAction_->setObjectName(QStringLiteral("remoteReview"));
+    remoteReviewAction_->setToolTip(tr("Stream the Program live to reviewers elsewhere over SRT, with a passphrase; their notes come back as markers"));
+    remoteReviewAction_->setCheckable(true);
+    connect(remoteReviewAction_, &QAction::triggered, this, [this] {
+        remoteReviewAction_->setChecked(remoteReview_->running());
+        showRemoteReview();
+    });
+    connect(remoteReview_, &RemoteReviewController::runningChanged, remoteReviewAction_, &QAction::setChecked);
+    connect(remoteReview_, &RemoteReviewController::markersReceived, this,
+            [this](Id seq, const std::vector<output::RemoteMarker>& markers) { applyRemoteMarkers(seq, markers); });
+    addAction(remoteReviewAction_);
+    if (liveLink_)
+        liveLink_->addAppTool(RemoteReviewController::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
+            return remoteReview_->runTool(args, structured, isError);
         });
     // How ambisonic sound (core/Ambisonics.h) is heard: binaurally on headphones, or as stereo on speakers.
     {
@@ -2388,7 +2414,60 @@ void MainWindow::syncProgram() {
     if (!s) return;
     program_->setProject(state_->project(), s->id);
     if (referenceOutput_) referenceOutput_->sequenceChanged();
+    if (remoteReview_) remoteReview_->sequenceChanged();
     program_->requestFrame();
+}
+
+void MainWindow::showRemoteReview() {
+    if (auto* open = findChild<RemoteReviewPanel*>(QStringLiteral("remoteReviewDialog"))) {
+        open->raise();
+        open->activateWindow();
+        return;
+    }
+    (new RemoteReviewPanel(remoteReview_, this))->show();
+}
+
+int MainWindow::applyRemoteMarkers(Id sequence, const std::vector<output::RemoteMarker>& markers) {
+    // As review notes (core/ReviewPage.h): named after the reviewer, in their colour, their note as the comment, on
+    // the sequence the picture they marked was from (when it is still in the project), kept within it.
+    const std::string now = QDateTime::currentDateTimeUtc().toString(Qt::ISODate).toStdString();
+    std::map<Id, std::vector<ReviewNote>> bySequence;
+    for (const output::RemoteMarker& m : markers) {
+        const Id seq = m.sequence && state_->project().findSequence(m.sequence) ? m.sequence : sequence;
+        const Sequence* s = state_->project().findSequence(seq);
+        if (!s) continue;
+        const FrameTime end = std::max<FrameTime>(1, s->duration());
+        ReviewNote n;
+        n.frame = std::clamp<FrameTime>(m.frame, 0, end - 1);
+        n.duration = std::clamp<FrameTime>(m.duration, 0, end - n.frame);
+        n.author = m.author.empty() ? tr("Reviewer").toStdString() : m.author;
+        n.text = m.text;
+        n.drawing = m.drawing.empty() ? std::string() : reviewDrawingJson(parseReviewDrawing(m.drawing));
+        // (kept apart from review notes imported from files, which a live note must not overwrite)
+        n.id = "live-" + (m.id.empty() ? QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString() : m.id);
+        n.statusAt = now;
+        bySequence[seq].push_back(std::move(n));
+    }
+    if (bySequence.empty()) return 0;
+    MarkerImport result;
+    state_->edit(tr("Markers from Remote Review"), [&](Project& p, Sequence&) {
+        for (const auto& [id, notes] : bySequence)
+            if (Sequence* s = p.findSequence(id)) {
+                const MarkerImport r = addImportedMarkers(*s, reviewNotesToMarkers(notes));
+                result.added += r.added;
+                result.updated += r.updated;
+            }
+        return true;
+    });
+    const ReviewNote& last = std::prev(bySequence.end())->second.back();
+    const Sequence* s = state_->project().findSequence(std::prev(bySequence.end())->first);
+    statusBar()->showMessage(markers.size() == 1 ? tr("Marker from %1 at %2: %3")
+                                                       .arg(QString::fromStdString(last.author),
+                                                            QString::fromStdString(s ? formatTimecode(last.frame, s->fps) : std::string()),
+                                                            QString::fromStdString(last.text))
+                                                 : tr("%n marker(s) from remote review", nullptr, int(markers.size())),
+                             8000);
+    return result.added + result.updated;
 }
 
 void MainWindow::showReferenceOutput() {
