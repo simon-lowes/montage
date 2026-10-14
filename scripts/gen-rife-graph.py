@@ -10,6 +10,9 @@ authors.
 
 Needs torch and onnx. The network below is IFNet_HDv3.py from the release
 (4.26, fast mode, no ensemble) with warplayer.py's warp, transcribed.
+
+Practical-RIFE: Copyright (c) 2021 hzwer, under the MIT License
+(LICENSES/MIT-Practical-RIFE.txt). See THIRD_PARTY_NOTICES.md.
 """
 import io
 import sys

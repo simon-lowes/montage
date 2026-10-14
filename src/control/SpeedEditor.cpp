@@ -1,3 +1,5 @@
+// authResponse and the protocol are translated to C++ from blackmagic-misc's bmd.py, Copyright (C) 2021 Sylvain Munaut
+// <tnt@246tNt.com>, under the Apache License 2.0 (LICENSES/Apache-2.0.txt). See THIRD_PARTY_NOTICES.md.
 #include "SpeedEditor.h"
 
 #include <algorithm>

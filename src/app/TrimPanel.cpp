@@ -83,7 +83,7 @@ TrimPanel::TrimPanel(EditorState* state, QWidget* parent) : QWidget(parent), sta
     v->addLayout(buttons);
     queue_ = new QPushButton(tr("Queue Passes…"), this);
     queue_->setObjectName(QStringLiteral("queueTrimPasses"));
-    queue_->setToolTip(tr("Render every target into a folder (the render queue): HDR ones as 10-bit HEVC with HDR10+, SDR as H.264"));
+    queue_->setToolTip(tr("Render every target into a folder (the render queue): HDR ones as 10-bit HEVC with dynamic HDR metadata (ST 2094-40), SDR as H.264"));
     v->addWidget(queue_);
     v->addStretch(1);
 

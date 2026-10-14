@@ -72,8 +72,8 @@ struct Preset {
 
 const std::vector<Preset>& presetTable() {
     static const std::vector<Preset> table = {
-        {"Montage (Premiere Pro)", {}},
-        {"Final Cut Pro",
+        {"Montage", {}},
+        {"Final Cut Pro-style",
          {
              {"Tools/Select", "A"},
              {"Tools/Razor", "B"},
@@ -102,7 +102,7 @@ const std::vector<Preset>& presetTable() {
              {"Clip/Nudge Right", "."},
              {"Clip/Auto Colour", "Ctrl+Alt+B"},
          }},
-        {"DaVinci Resolve",
+        {"DaVinci Resolve-style",
          {
              {"Tools/Select", "A"},
              {"Tools/Razor", "B"},
@@ -127,7 +127,7 @@ const std::vector<Preset>& presetTable() {
              {"Sequence/Zoom Out", "Ctrl+-"},
              {"Sequence/Zoom to Fit", "Shift+Z"},
          }},
-        {"Avid Media Composer",
+        {"Avid Media Composer-style",
          {
              {"Tools/Select", ""},
              {"Tools/Razor", ""},
@@ -158,6 +158,21 @@ const std::vector<Preset>& presetTable() {
          }},
     };
     return table;
+}
+
+// A preset by its name, or by the name it had before ("Montage (Premiere Pro)", "Final Cut Pro"...), which saved
+// settings and scripts may still hold; null if there is none.
+const Preset* findPreset(const QString& name) {
+    static const std::pair<const char*, const char*> renamed[] = {{"Montage (Premiere Pro)", "Montage"},
+                                                                   {"Final Cut Pro", "Final Cut Pro-style"},
+                                                                   {"DaVinci Resolve", "DaVinci Resolve-style"},
+                                                                   {"Avid Media Composer", "Avid Media Composer-style"}};
+    QString now = name;
+    for (const auto& [was, is] : renamed)
+        if (name == QLatin1String(was)) now = QLatin1String(is);
+    for (const Preset& p : presetTable())
+        if (now == QLatin1String(p.name)) return &p;
+    return nullptr;
 }
 
 }  // namespace
@@ -239,14 +254,14 @@ QStringList presets() {
 
 QJsonObject presetKeys(const QString& preset) {
     QJsonObject out;
-    for (const Preset& p : presetTable())
-        if (preset == QLatin1String(p.name))
-            for (const auto& [id, key] : p.keys) out[QString::fromUtf8(id)] = QString::fromLatin1(key);
+    if (const Preset* p = findPreset(preset))
+        for (const auto& [id, key] : p->keys) out[QString::fromUtf8(id)] = QString::fromLatin1(key);
     return out;
 }
 
 bool applyPreset(QWidget* window, const QString& preset) {
-    if (!presets().contains(preset)) return false;
+    const Preset* p = findPreset(preset);
+    if (!p) return false;
     resetAll(window);
     const QJsonObject keys = presetKeys(preset);
     // Keys first taken away, then given, so a preset can move a key from one command to another.
@@ -258,7 +273,7 @@ bool applyPreset(QWidget* window, const QString& preset) {
     for (auto it = keys.begin(); it != keys.end(); ++it)
         if (!it.value().toString().isEmpty())
             assign(window, it.key(), QKeySequence::fromString(it.value().toString(), QKeySequence::PortableText), true);
-    appSettings().setValue(QStringLiteral("keymapPreset"), preset);
+    appSettings().setValue(QStringLiteral("keymapPreset"), QString::fromLatin1(p->name));
     return true;
 }
 
@@ -370,7 +385,7 @@ Dialog::Dialog(QWidget* window) : QDialog(window), window_(window) {
         if (i <= 0) return;
         applyPreset(window_, preset_->itemText(i));
         rebuild();
-        status_->setText(tr("Keys now follow %1.").arg(preset_->itemText(i)));
+        status_->setText(tr("Keys now follow the %1 layout.").arg(preset_->itemText(i)));
         preset_->setCurrentIndex(0);
     });
     connect(exportBtn, &QPushButton::clicked, this, [this] {

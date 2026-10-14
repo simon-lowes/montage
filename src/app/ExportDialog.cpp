@@ -246,9 +246,9 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     color_->setToolTip(tr("Deliver in another colour space: an HDR sequence delivered in Rec.709 is tone mapped.\n"
                           "HDR output is 10-bit and tagged; PQ carries HDR10 metadata."));
     form->addRow(tr("Colour:"), color_);
-    hdr10Plus_ = new QCheckBox(tr("HDR10+ metadata (scene by scene)"), form_);
+    hdr10Plus_ = new QCheckBox(tr("Dynamic HDR metadata (ST 2094-40, scene by scene)"), form_);
     hdr10Plus_->setObjectName(QStringLiteral("exportHdr10Plus"));
-    hdr10Plus_->setToolTip(tr("Each scene's light measured (SMPTE ST 2094-40) so HDR10+ televisions tone map it scene by scene: "
+    hdr10Plus_->setToolTip(tr("Each scene's light measured (SMPTE ST 2094-40) so televisions that read dynamic HDR metadata tone map it scene by scene: "
                               "carried in HEVC and AV1 video, and written beside the file as .hdr10plus.json for other formats. "
                               "Uses Analyse HDR Light Levels' measurements while the cut still matches them, else measures first."));
     hdr10Plus_->setChecked(appSettings().value("export/hdr10Plus", false).toBool());
@@ -281,7 +281,7 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     loudness_->addItem(tr("-27 LKFS dialogue, -2 dBTP (Netflix)"), QPointF(-27, -2));
     loudness_->setItemData(loudness_->count() - 1, true, Qt::UserRole + 1);
     loudness_->setItemData(loudness_->count() - 1,
-                           tr("Measures the mix over its speech (Montage's own estimate of Dolby's dialogue gating; over everything "
+                           tr("Measures the mix over its speech (speech-gated loudness, from Montage's own speech detection; over everything "
                               "when speech is under 15 %), then sets its level to the target"),
                            Qt::ToolTipRole);
     loudness_->setCurrentIndex(std::clamp(appSettings().value("export/loudness", 0).toInt(), 0, loudness_->count() - 1));
@@ -412,8 +412,9 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     layout->addWidget(buttons);
 
     // Restore the last preset; the path is derived from it in presetChanged().
-    const QString lastPreset = appSettings().value(kSettingsPreset).toString();
-    if (const int i = preset_->findText(lastPreset); i >= 0) preset_->setCurrentIndex(i);
+    // Looked up by name, so a preset saved under its old name ("Apple ProRes 422 HQ") comes back as it is now called.
+    const ExportPreset* lastPreset = findExportPreset(appSettings().value(kSettingsPreset).toString().toStdString());
+    if (const int i = lastPreset ? preset_->findText(QString::fromStdString(lastPreset->name)) : -1; i >= 0) preset_->setCurrentIndex(i);
 
     connect(preset_, &QComboBox::currentIndexChanged, this, [this] { presetChanged(); });
     connect(browse_, &QPushButton::clicked, this, [this] { browse(); });

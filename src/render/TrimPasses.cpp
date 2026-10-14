@@ -125,7 +125,7 @@ const std::vector<TrimControl>& trimControls() {
         {"gain", "Gain", 1, 0, 2},
         {"saturation", "Saturation", 1, 0, 2},
         {"highlights", "Highlight Roll-off", 0, 0, 1},
-        {"mid_detail", "Mid-tone Detail", 0, -1, 1},
+        {"mid_detail", "Mid-tone Contrast", 0, -1, 1},
     };
     return controls;
 }

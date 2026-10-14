@@ -234,9 +234,9 @@ std::vector<EffectInfo> buildCatalog() {
                  {choice("direction", "Direction", {"Forward", "Inverse"}, 0)},
                  {}});
     {
-        // Colour Slice (render/ColorSlice.h; Resolve's ColorSlice): hue shift, saturation and density by hue vector in a
+        // Hue Vectors (render/ColorSlice.h; as Resolve's ColorSlice): hue shift, saturation and density by hue vector in a
         // log encoding, saturation subtractive as film's or additive (brightness kept), highlights protected.
-        EffectInfo slice{"color_slice", "Colour Slice", EffectCategory::VideoFilter, "Color",
+        EffectInfo slice{"color_slice", "Hue Vectors", EffectCategory::VideoFilter, "Color",
                          {num("density", "Density", -1, 1, 0), pct("depth", "Depth", 0, 200, 100), num("saturation", "Saturation", 0, 2, 1),
                           boolean("subtractive", "Subtractive Saturation", true), pct("protect_highlights", "Protect Highlights", 0, 100, 50),
                           pct("mix", "Mix", 0, 100, 100)},
@@ -385,10 +385,10 @@ std::vector<EffectInfo> buildCatalog() {
                  {num("radius", "Radius (px)", 0, 250, 10, 0.5),
                   choice("direction", "Direction", {"Both", "Horizontal", "Vertical"})},
                  {}});
-    // Mid-tone Detail and Texture Pop (render/ColorSlice.h): local contrast in brightness only, mid-tone detail through an
-    // edge-preserving filter, texture above a noise floor; Detail Scale scales both.
-    c.push_back({"texture_pop", "Texture Pop / Mid-tone Detail", EffectCategory::VideoFilter, "Color",
-                 {pct("midtone_detail", "Mid-tone Detail", -100, 100, 0), pct("texture_pop", "Texture Pop", 0, 200, 0),
+    // Local Contrast (render/ColorSlice.h; as Resolve's Mid-tone Detail and Texture Pop): local contrast in brightness only,
+    // mid-tone contrast through an edge-preserving filter, fine texture above a noise floor; Detail Scale scales both.
+    c.push_back({"texture_pop", "Local Contrast", EffectCategory::VideoFilter, "Color",
+                 {pct("midtone_detail", "Mid-tone Contrast", -100, 100, 0), pct("texture_pop", "Fine Texture", 0, 200, 0),
                   num("scale", "Detail Scale", 0.25, 4, 1), pct("noise_floor", "Noise Floor", 0, 100, 10)},
                  {}});
     c.push_back({"sharpen", "Sharpen", EffectCategory::VideoFilter, "Blur & Sharpen",

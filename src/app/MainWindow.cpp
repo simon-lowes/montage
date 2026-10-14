@@ -146,6 +146,7 @@
 #include "ReviewOverlay.h"
 #include "ChartMatchDialog.h"
 #include "LensCorrectionDialog.h"
+#include "LicencesDialog.h"
 #include "ReferenceOutputPanel.h"
 #include "SequenceIndexPanel.h"
 #include "StackedTimelineWidget.h"
@@ -2299,6 +2300,8 @@ void MainWindow::buildMenus() {
     syncWorkspaceUi();
     QMenu* help = menuBar()->addMenu(tr("&Help"));
     add(help, tr("&Keyboard Shortcuts"), QKeySequence(Qt::Key_F1), [this] { showShortcuts(); });
+    add(help, tr("&Licences…"), QKeySequence(), [this] { LicencesDialog(this).exec(); })->setObjectName("showLicences");
+    add(help, tr("About &Qt"), QKeySequence(), [] { QApplication::aboutQt(); });
     add(help, tr("&About Montage"), QKeySequence(), [this] { about(); });
 
     // Timeline context menus reuse the actions.
@@ -5379,7 +5382,7 @@ void MainWindow::exportVersionsDialog() {
     loud->addItem(tr("As mixed"), 0.0);
     form->addRow(tr("Loudness:"), loud);
     auto* format = new QComboBox(&dlg);
-    for (const char* name : {"H.264 - High Quality", "H.265 / HEVC", "Apple ProRes 422 HQ"})
+    for (const char* name : {"H.264 - High Quality", "H.265 / HEVC", "ProRes 422 HQ"})
         if (findExportPreset(name)) format->addItem(QString::fromLatin1(name));
     form->addRow(tr("Format:"), format);
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
@@ -6496,7 +6499,7 @@ bool MainWindow::analyseHdrLightLevels(bool ask) {
         return edit::Result{};
     });
     const QLocale loc;
-    state_->message(pq ? tr("MaxCLL %1 nits, MaxFALL %2 nits, %3 HDR10+ scenes").arg(loc.toString(cll), loc.toString(fall)).arg(scenes.size())
+    state_->message(pq ? tr("MaxCLL %1 nits, MaxFALL %2 nits, %3 dynamic HDR metadata scenes").arg(loc.toString(cll), loc.toString(fall)).arg(scenes.size())
                        : tr("MaxCLL %1 nits, MaxFALL %2 nits").arg(loc.toString(cll), loc.toString(fall)),
                     8000);
     if (!ask) return true;
@@ -6508,7 +6511,7 @@ bool MainWindow::analyseHdrLightLevels(bool ask) {
     box.setObjectName(QStringLiteral("hdrLightLevelsDialog"));
     QString more = tr("Saved with the sequence: HDR10 exports state them (MP4 and MOV also measure what they render).");
     if (pq)
-        more += tr("\n\nHDR10+: %n scene(s) measured, used by exports with HDR10+ metadata while the cut still matches them.", "", int(scenes.size()));
+        more += tr("\n\nDynamic HDR metadata (ST 2094-40): %n scene(s) measured, used by exports with it while the cut still matches them.", "", int(scenes.size()));
     if (sequenceColorSpace(s).transfer == Transfer::Pq && cll > s.hdrPeakNits + 0.5)
         more = tr("Brighter than the %1-nit mastering peak: highlights above it will be clipped or tone mapped by displays.\n\n")
                    .arg(loc.toString(qRound(s.hdrPeakNits))) + more;
@@ -7811,8 +7814,17 @@ void MainWindow::about() {
     QMessageBox::about(this, tr("About Montage"),
                        tr("<h3>Montage %1</h3><p>A professional non-linear video editor written in C++ with Qt and FFmpeg.</p>"
                           "<p>Multi-track editing with ripple, roll, slip and slide tools; keyframed effects and colour correction; "
-                          "titles, transitions, scopes, an audio mixer and export to H.264, HEVC, ProRes, DNxHR, VP9 and AV1.</p>")
-                           .arg(MONTAGE_VERSION));
+                          "titles, transitions, scopes, an audio mixer and export to H.264, HEVC, ProRes, DNxHR, VP9 and AV1.</p>"
+                          "<p>Copyright © the Montage authors. Montage is free software under the GNU General Public License, "
+                          "version 3 or later, and comes with no warranty. "
+                          "<a href=\"https://github.com/simon-lowes/montage\">Source code</a>.</p>"
+                          "<p>It uses Qt %2 (LGPL-3.0) and FFmpeg %3 (%4), and the libraries listed in Help › Licences….</p>"
+                          "<p>Montage is an independent project, not affiliated with or endorsed by the makers of the "
+                          "products and formats it works with. NDI® is a registered trademark of Vizrt NDI AB "
+                          "(<a href=\"https://ndi.video\">ndi.video</a>). VST® is a registered trademark of Steinberg Media "
+                          "Technologies GmbH.</p>")
+                           .arg(QStringLiteral(MONTAGE_VERSION), QString::fromLatin1(qVersion()), ffmpegVersion().toHtmlEscaped(),
+                                ffmpegLicence().toHtmlEscaped()));
 }
 
 void MainWindow::raisePanel(const QString& name) {

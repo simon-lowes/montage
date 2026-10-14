@@ -1,7 +1,8 @@
 // Montage — learned constants of EdgeTAM's memory bank, which its ONNX graphs
 // leave to the host: the "no memory" embedding added to the first frame's
 // features, and the temporal position encoding of each memory slot.
-// From facebook/EdgeTAM (Apache-2.0), via the yonigozlan/EdgeTAM-hf checkpoint.
+// From facebook/EdgeTAM, Copyright Meta Platforms, Inc. and affiliates, under the Apache License 2.0
+// (LICENSES/Apache-2.0.txt), via the yonigozlan/EdgeTAM-hf checkpoint. See THIRD_PARTY_NOTICES.md.
 // Included by Segmenter.cpp only.
 
 // no_memory_embedding (256)

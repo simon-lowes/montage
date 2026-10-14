@@ -43,9 +43,10 @@ QAction* conflict(const QWidget* window, const QKeySequence& key, const QAction*
 bool assign(QWidget* window, const QString& id, const QKeySequence& key, bool takeOver);
 void resetAll(QWidget* window);
 
-// Presets: Montage's own keys, then other editors' layouts on top of them.
+// Presets: Montage's own keys, then layouts in the style of other editors on top of them.
 QStringList presets();
-// The keys a preset changes from Montage's own (id -> key, "" for none).
+// The keys a preset changes from Montage's own (id -> key, "" for none). A preset's old name ("Montage (Premiere Pro)",
+// "Final Cut Pro"...) finds it too, here and in applyPreset().
 QJsonObject presetKeys(const QString& preset);
 bool applyPreset(QWidget* window, const QString& preset);
 

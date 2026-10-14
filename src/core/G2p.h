@@ -5,6 +5,9 @@
 // pronunciations take their usual one; numbers, money, ordinals, years,
 // stems (-s, -ed, -ing) and the small function words that change with
 // what follows (a, an, the, to) are handled as misaki does.
+//
+// Ported from misaki (https://github.com/hexgrad/misaki), Copyright the misaki authors, under the Apache License 2.0
+// (LICENSES/Apache-2.0.txt); changed from Python to C++ and without the tagger. See THIRD_PARTY_NOTICES.md.
 #pragma once
 
 #include <map>

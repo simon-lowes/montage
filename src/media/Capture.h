@@ -1,7 +1,7 @@
 // Montage — recording a live feed (Resolve's Media page capture, Media Composer's Capture tool), through FFmpeg:
 // a network stream (SRT, RIST, UDP or RTP MPEG-TS, RTMP, HLS or any URL FFmpeg opens) or a capture device FFmpeg
 // reaches (V4L2 and ALSA or PulseAudio on Linux, AVFoundation on macOS, DirectShow on Windows; built with
-// libavdevice), recorded to Apple ProRes or Avid DNxHR with its sound (up to 16 channels, 24-bit) and timecode (the
+// libavdevice), recorded to ProRes or DNxHR with its sound (up to 16 channels, 24-bit) and timecode (the
 // feed's own SMPTE 12-M timecode, one given, or the time of day). QuickTime files are written in fragments half a
 // second long, so the file can be imported and cut while it records (EditorState's growing media) and survives a crash;
 // MXF is written whole at the end. Recording runs on a thread of its own at the feed's frame rate (frames late or

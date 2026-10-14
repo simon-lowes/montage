@@ -19,6 +19,8 @@ DisableProgramGroupPage=yes
 OutputDir=..\..\dist
 OutputBaseFilename=Montage-{#Version}-windows-x64-setup
 SetupIconFile=montage.ico
+; The GNU GPL, shown before installing; the bundled libraries' licences are in {app}\licenses.
+LicenseFile=..\..\LICENSE
 UninstallDisplayIcon={app}\montage.exe
 Compression=lzma2/max
 SolidCompression=yes

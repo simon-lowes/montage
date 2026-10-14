@@ -238,28 +238,28 @@ const std::vector<ExportPreset>& exportPresets() {
                            "hw_hevc", "aac", 22, "medium"));
         v.push_back(preset("H.265 / HEVC", "mp4", "Half the size of H.264 at similar quality", "libx265", "aac", 22, "medium"));
         v.push_back(preset("H.265 / HEVC 10-bit", "mp4", "10-bit HEVC for HDR-ready masters", "libx265", "aac", 20, "medium", "", "yuv420p10le"));
-        v.push_back(preset("Apple ProRes 422 HQ", "mov", "Intermediate / mastering, 10-bit 4:2:2", "prores_ks", "pcm_s24le", 0, "", "hq"));
-        v.push_back(preset("Apple ProRes 422", "mov", "Standard ProRes, 10-bit 4:2:2", "prores_ks", "pcm_s24le", 0, "", "standard"));
-        v.push_back(preset("Apple ProRes 422 LT", "mov", "Lighter ProRes for offline / proxies", "prores_ks", "pcm_s16le", 0, "", "lt"));
-        v.push_back(preset("Apple ProRes 422 Proxy", "mov", "The smallest ProRes, for offline editing", "prores_ks", "pcm_s16le", 0, "", "proxy"));
+        v.push_back(preset("ProRes 422 HQ", "mov", "Intermediate / mastering, 10-bit 4:2:2", "prores_ks", "pcm_s24le", 0, "", "hq"));
+        v.push_back(preset("ProRes 422", "mov", "Standard ProRes, 10-bit 4:2:2", "prores_ks", "pcm_s24le", 0, "", "standard"));
+        v.push_back(preset("ProRes 422 LT", "mov", "Lighter ProRes for offline / proxies", "prores_ks", "pcm_s16le", 0, "", "lt"));
+        v.push_back(preset("ProRes 422 Proxy", "mov", "The smallest ProRes, for offline editing", "prores_ks", "pcm_s16le", 0, "", "proxy"));
         {
-            ExportPreset p = preset("Apple ProRes 4444 (alpha)", "mov", "Keeps transparency for graphics", "prores_ks", "pcm_s24le", 0, "", "4444");
+            ExportPreset p = preset("ProRes 4444 (alpha)", "mov", "Keeps transparency for graphics", "prores_ks", "pcm_s24le", 0, "", "4444");
             p.settings.alpha = true;
             v.push_back(p);
-            ExportPreset xq = preset("Apple ProRes 4444 XQ (alpha)", "mov", "The highest-quality ProRes, with transparency", "prores_ks",
+            ExportPreset xq = preset("ProRes 4444 XQ (alpha)", "mov", "The highest-quality ProRes, with transparency", "prores_ks",
                                      "pcm_s24le", 0, "", "4444xq");
             xq.settings.alpha = true;
             v.push_back(xq);
         }
-        v.push_back(preset("Avid DNxHR HQ", "mov", "Avid-friendly 8-bit 4:2:2 intermediate", "dnxhd", "pcm_s24le", 0, "", "dnxhr_hq"));
-        v.push_back(preset("Avid DNxHR SQ", "mov", "Avid 8-bit 4:2:2, standard quality", "dnxhd", "pcm_s24le", 0, "", "dnxhr_sq"));
-        v.push_back(preset("Avid DNxHR LB", "mov", "Avid 8-bit 4:2:2, low bandwidth for offline", "dnxhd", "pcm_s16le", 0, "", "dnxhr_lb"));
-        v.push_back(preset("Avid DNxHR HQX (10-bit)", "mov", "Avid 10-bit 4:2:2 for finishing and HDR", "dnxhd", "pcm_s24le", 0, "", "dnxhr_hqx"));
-        v.push_back(preset("Avid DNxHR 444 (10-bit)", "mov", "Avid 10-bit 4:4:4 for finishing and keying", "dnxhd", "pcm_s24le", 0, "", "dnxhr_444"));
+        v.push_back(preset("DNxHR HQ", "mov", "Avid-friendly 8-bit 4:2:2 intermediate", "dnxhd", "pcm_s24le", 0, "", "dnxhr_hq"));
+        v.push_back(preset("DNxHR SQ", "mov", "8-bit 4:2:2, standard quality", "dnxhd", "pcm_s24le", 0, "", "dnxhr_sq"));
+        v.push_back(preset("DNxHR LB", "mov", "8-bit 4:2:2, low bandwidth for offline", "dnxhd", "pcm_s16le", 0, "", "dnxhr_lb"));
+        v.push_back(preset("DNxHR HQX (10-bit)", "mov", "10-bit 4:2:2 for finishing and HDR", "dnxhd", "pcm_s24le", 0, "", "dnxhr_hqx"));
+        v.push_back(preset("DNxHR 444 (10-bit)", "mov", "10-bit 4:4:4 for finishing and keying", "dnxhd", "pcm_s24le", 0, "", "dnxhr_444"));
         {
-            ExportPreset cf = preset("GoPro CineForm", "mov", "Wavelet intermediate, 10-bit 4:2:2 (12-bit RGB with alpha)", "cfhd", "pcm_s24le", 0, "");
+            ExportPreset cf = preset("CineForm", "mov", "Wavelet intermediate, 10-bit 4:2:2 (12-bit RGB with alpha)", "cfhd", "pcm_s24le", 0, "");
             v.push_back(cf);
-            cf.name = "GoPro CineForm (alpha)";
+            cf.name = "CineForm (alpha)";
             cf.description = "CineForm 12-bit RGBA, keeping transparency";
             cf.settings.alpha = true;
             v.push_back(cf);
@@ -283,7 +283,7 @@ const std::vector<ExportPreset>& exportPresets() {
             v.push_back(broadcast(preset("AVC-Intra 100 (MXF)", "mxf", "10-bit 4:2:2 intra H.264 at 100 Mb/s, four mono 24-bit tracks (as the DPP's AS-11 asks)",
                                          "libx264", "pcm_s24le", 0, "", "avci100", "yuv422p10le"),
                                   4));
-            ExportPreset dnx = broadcast(preset("Avid DNxHR HQ (MXF)", "mxf", "DNxHR HQ in MXF OP1a, each channel a mono track (Avid's layout)", "dnxhd",
+            ExportPreset dnx = broadcast(preset("DNxHR HQ (MXF)", "mxf", "DNxHR HQ in MXF OP1a, each channel a mono track (Avid's layout)", "dnxhd",
                                                 "pcm_s24le", 0, "", "dnxhr_hq"),
                                          2);
             dnx.settings.width = dnx.settings.height = 0;  // DNxHR takes any size
@@ -330,6 +330,12 @@ const std::vector<ExportPreset>& exportPresets() {
 const ExportPreset* findExportPreset(const std::string& name) {
     for (const auto& p : exportPresets())
         if (p.name == name) return &p;
+    // The names the ProRes, DNxHR and CineForm presets had before they lost their makers' names ("Apple ProRes 422 HQ",
+    // "Avid DNxHR HQ (MXF)", "GoPro CineForm"), so saved settings, scripts and MCP calls still find them.
+    for (const char* maker : {"Apple ", "Avid ", "GoPro "}) {
+        const size_t n = std::strlen(maker);
+        if (name.size() > n && name.compare(0, n, maker) == 0) return findExportPreset(name.substr(n));
+    }
     return nullptr;
 }
 
@@ -1498,7 +1504,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (progress) progress(renderFrom * f, in + FrameTime(std::floor(f * double(out - in - 1))));
         };
         if (!hdr10PlusForRange(p, seq, in, out, outSpace, peakNits, reuse, hdr10, &e, part, cancel, deliveredFrame, &toMeasure))
-            return fail(cancel && cancel->load() ? std::string("Export cancelled") : "HDR10+ analysis failed: " + e);
+            return fail(cancel && cancel->load() ? std::string("Export cancelled") : "Dynamic HDR metadata analysis failed: " + e);
         if (toMeasure == 0) renderFrom = 0;
         // In the video itself: an SEI message in each HEVC access unit, a metadata OBU in each AV1 temporal unit, the
         // scene's values on every frame of it.
@@ -1669,7 +1675,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             stem.erase(cut);
         }
         std::string e;
-        if (!writeHdr10PlusJson(stem + ".hdr10plus.json", hdr10, in, out, &e)) qWarning("HDR10+ JSON not written beside %s: %s", s.path.c_str(), e.c_str());
+        if (!writeHdr10PlusJson(stem + ".hdr10plus.json", hdr10, in, out, &e)) qWarning("Dynamic HDR metadata JSON not written beside %s: %s", s.path.c_str(), e.c_str());
     }
     if (smartRendered) *smartRendered = smart ? smart->copied() : 0;
     if (light) *light = measured;

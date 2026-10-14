@@ -2386,7 +2386,7 @@ void McpServer::Impl::addTools() {
         "it happens, over `from` to `to` (default the whole sequence). With `save` (the default) they are kept with the "
         "sequence so exports that state them before the first frame (x265, Matroska) use them; MP4 and MOV exports "
         "measure what they render anyway. Warns when MaxCLL is above the sequence's mastering peak. A PQ sequence's "
-        "HDR10+ scenes are measured in the same pass (each scene's brightest red, green and blue, average and spread, "
+        "scenes for dynamic HDR metadata are measured in the same pass (each scene's brightest red, green and blue, average and spread, "
         "as ST 2094-40 sends them) and kept too, for exports with `hdr10plus`.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"save":{"type":"boolean","default":true}},"required":["project"]})json",
@@ -2439,7 +2439,7 @@ void McpServer::Impl::addTools() {
                                             {"max_rgb", QJsonArray{sc.maxScl[0], sc.maxScl[1], sc.maxScl[2]}},
                                             {"average", sc.average}, {"percentile_99_98", sc.percentiles[6]}});
                 out["hdr10plus_scenes"] = list;
-                text += QStringLiteral("; HDR10+: %1 scene(s)").arg(scenes.size());
+                text += QStringLiteral("; dynamic HDR metadata: %1 scene(s)").arg(scenes.size());
             }
             if (a.value("save").toBool(true)) {
                 s.hdrMaxCll = cll, s.hdrMaxFall = fall;
@@ -2921,7 +2921,8 @@ void McpServer::Impl::addTools() {
         "(-27 LKFS ±2, true peaks under -2 dBTP), beside the programme's BS.1770 loudness, its true peak and the share of "
         "the sound that is speech (under 15 %, the programme figure is the one that counts: `value`). The speech is found "
         "from the Dialogue clips (`gate` roles), transcribed words (transcripts) or by listening (classifier); auto takes "
-        "the first the sequence has. Montage's own gate: an estimate of Dolby's Dialogue Intelligence, which Netflix's QC runs.",
+        "the first the sequence has. Speech-gated loudness from Montage's own speech detection: an estimate of the dialogue "
+        "measurement Netflix's QC makes.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"gate":{"type":"string","enum":["auto","roles","transcripts","classifier"],"default":"auto"},
             "surround":{"type":"boolean","default":false,"description":"Measure a surround sequence's own channels, not its stereo fold-down"}},
@@ -4653,7 +4654,7 @@ void McpServer::Impl::addTools() {
 
     add("montage_set_surround", "Set up a surround mix",
         "Mix the active sequence in stereo, 5.1 (L R C LFE Ls Rs), 7.1 (L R C LFE Lb Rb Ls Rs), an immersive layout with "
-        "overhead speakers (5.1.2, 5.1.4, 7.1.2 as the Dolby Atmos bed, 7.1.4) or an ambisonic field (ambix, ambix2, ambix3: "
+        "overhead speakers (5.1.2, 5.1.4, 7.1.2 with its overhead pair at the sides, 7.1.4) or an ambisonic field (ambix, ambix2, ambix3: "
         "first to third order), and place audio tracks among the speakers or in the field. A "
         "position is an angle (0 straight ahead, 90 right, -90 left, 180 behind) and a distance (1 at the speakers, 0 spread "
         "over all of them); height (0 at the ear to 1 overhead) lifts it in immersive layouts; width narrows a stereo track "
@@ -4722,7 +4723,7 @@ void McpServer::Impl::addTools() {
 
     add("montage_export_adm", "Export an immersive master (ADM BWF)",
         "Write the active sequence as an ADM BWF file (ITU-R BS.2076 metadata in a BS.2088 BW64 wave), the interchange "
-        "format of Dolby Atmos and the EBU ADM renderer: a bed of every track that is not an audio object, in the "
+        "format of immersive and object-based audio masters and of the EBU ADM renderer: a bed of every track that is not an audio object, in the "
         "sequence's layout (named by the BS.2094 common definitions), and one channel for each track marked as an object "
         "(montage_set_surround object), with its position. 48 kHz, 24 bits. Returns what the file holds.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"path":{"type":"string","description":"The .wav to write"},
@@ -4774,7 +4775,7 @@ void McpServer::Impl::addTools() {
 
     add("montage_captions", "Import or export captions",
         "Write a caption track to a file in the format its extension names: .srt (SubRip), .vtt (WebVTT), .scc "
-        "(Scenarist, CEA-608), .mcc (MacCaption: CEA-608 and CTA-708, with the track's places and colours), .ttml / .xml / .dfxp (TTML, IMSC 1.1 Text profile, with the track's colours), .stl "
+        "(Scenarist, CEA-608), .mcc (MCC captions: CEA-608 and CTA-708, with the track's places and colours), .ttml / .xml / .dfxp (TTML, IMSC 1.1 Text profile, with the track's colours), .stl "
         "(EBU Tech 3264, 25 or 30 fps) or .ass / .ssa (SubStation Alpha, with the track's style); or read any of them "
         "as a new caption track (`import`), or the closed captions inside a video clip's file (`import_embedded`: CTA-708 service 1, else CEA-608 channel 1). "
         "`track` is a caption track index (default: the visible one).",
@@ -7268,7 +7269,7 @@ void McpServer::Impl::addTools() {
                 "description":"Also write 24-bit WAV stems beside the output, one per audio track, per bus (plus Main) or per audio role"},
             "captions":{"type":"string","enum":["none","burn","embed","both"],"default":"none","description":"The visible caption track, burned into the picture and/or embedded as a subtitle stream"},
             "trim_target":{"type":"string","description":"A trim pass (montage_trim): deliver that target of the sequence (its space and peak, each shot's trim) instead of the master"},
-            "hdr10plus":{"type":"boolean","default":false,"description":"PQ exports: HDR10+ dynamic metadata, scene by scene, in HEVC and AV1 video and as name.hdr10plus.json beside the file (measured first unless montage_measure_hdr's analysis still matches the cut)"},
+            "hdr10plus":{"type":"boolean","default":false,"description":"PQ exports: dynamic HDR metadata (SMPTE ST 2094-40), scene by scene, in HEVC and AV1 video and as name.hdr10plus.json beside the file (measured first unless montage_measure_hdr's analysis still matches the cut)"},
             "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask): CEA-608 and CTA-708 service 1"},
             "cea708":{"type":"boolean","default":true,"description":"With cea608: the CTA-708 service beside the 608 bytes"},
             "all_captions":{"type":"boolean","default":false,"description":"With embed: every caption track as its own subtitle stream, language tagged"},
@@ -7411,9 +7412,9 @@ void McpServer::Impl::addTools() {
                 // Where HDR10+ went: in the video and beside it, beside it only, or nowhere (not PQ output).
                 const std::string carriage = hdr10PlusCarriage(s, st);
                 o["hdr10plus"] = carriage.empty() ? QStringLiteral("none") : QString::fromStdString(carriage);
-                text += carriage == "video" ? QStringLiteral("\nHDR10+ metadata in the video, and beside it as .hdr10plus.json")
-                        : carriage == "json" ? QStringLiteral("\nHDR10+ metadata beside it as .hdr10plus.json (this codec cannot carry it)")
-                                             : QStringLiteral("\nNo HDR10+ metadata: it is for PQ (HDR10) video");
+                text += carriage == "video" ? QStringLiteral("\nDynamic HDR metadata (ST 2094-40) in the video, and beside it as .hdr10plus.json")
+                        : carriage == "json" ? QStringLiteral("\nDynamic HDR metadata (ST 2094-40) beside it as .hdr10plus.json (this codec cannot carry it)")
+                                             : QStringLiteral("\nNo dynamic HDR metadata: it is for PQ (HDR10) video");
             }
             if (!st.credentialCertificate.empty()) {
                 // What the credentials say it was made with (core/Provenance.h).

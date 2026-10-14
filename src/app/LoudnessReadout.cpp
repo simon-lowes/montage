@@ -39,8 +39,8 @@ LoudnessReadout::LoudnessReadout(QWidget* parent) : QWidget(parent) {
     row(2, tr("I"), tr("Integrated loudness since the last reset (LUFS)"), i_);
     row(3, tr("LRA"), tr("Loudness range: how much the loudness varies (LU)"), lra_);
     row(4, tr("TP"), tr("Highest true peak (dBTP); keep it below -1 (-2 for Netflix and US broadcast)"), tp_);
-    const QString dialogueTip = tr("Dialogue loudness: integrated over speech only (LKFS), as Netflix measures it. Montage's own "
-                                   "estimate of Dolby's dialogue gating, from the Dialogue clips (or transcribed words) playing. Live, whole "
+    const QString dialogueTip = tr("Dialogue loudness: integrated over speech only (LKFS), as Netflix measures it. Speech-gated loudness "
+                                   "from Montage's own speech detection: the Dialogue clips (or transcribed words) playing. Live, whole "
                                    "Dialogue clips count, pauses too; Quality Check and exports measure only where they sound");
     row(5, tr("D"), dialogueTip, d_);
     row(6, tr("SP"), tr("How much of the sound is speech; under 15 % the integrated loudness counts instead"), sp_);

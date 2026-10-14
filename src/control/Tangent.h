@@ -1,10 +1,11 @@
 // Montage — Tangent's colour panels (Elements, Ripple, Wave 2, Arc) through Tangent Hub: the TUBE protocol (TIPC
 // revision 4 and later) the Hub speaks to an application over TCP on this computer, as Hammerspoon's hs.tangent and
-// CommandPost (both MIT) speak it. Each message is a 32-bit big-endian length then its commands, each a 32-bit
-// command id and its fields: 32-bit big-endian integers, IEEE floats and booleans, and strings as a length and their
-// bytes. The Hub starts (InitiateComms); the application names itself and the folder holding its controls.xml
-// (ApplicationDefinition), and the Hub sends the panels' turns and presses as parameter, menu and action ids that file
-// defines. This file only reads and writes the messages and the file; app/TangentControl talks to the Hub.
+// CommandPost (both MIT; LICENSES/MIT-Hammerspoon.txt, LICENSES/MIT-CommandPost.txt) speak it. Each message is a 32-bit
+// big-endian length then its commands, each a 32-bit command id and its fields: 32-bit big-endian integers, IEEE floats
+// and booleans, and strings as a length and their bytes. The Hub starts (InitiateComms); the application names itself
+// and the folder holding its controls.xml (ApplicationDefinition), and the Hub sends the panels' turns and presses as
+// parameter, menu and action ids that file defines. This file only reads and writes the messages and the file;
+// app/TangentControl talks to the Hub.
 #pragma once
 
 #include <cstdint>

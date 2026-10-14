@@ -1,3 +1,5 @@
+// Ported from misaki (https://github.com/hexgrad/misaki), Copyright the misaki authors, under the Apache License 2.0
+// (LICENSES/Apache-2.0.txt); changed from Python to C++. See THIRD_PARTY_NOTICES.md.
 #include "G2p.h"
 
 #include <QJsonDocument>

@@ -245,7 +245,7 @@ bool analyseHdr10Plus(const Project& p, const Sequence& s, FrameTime from, Frame
     if (light) *light = LightLevels{};
     Hdr10PlusMeter meter(out);
     if (!meter.valid()) {
-        if (error) *error = "HDR10+ metadata is for PQ (HDR10) pictures, not " + out.label;
+        if (error) *error = "Dynamic HDR metadata (ST 2094-40) is for PQ (HDR10) pictures, not " + out.label;
         return false;
     }
     from = std::max<FrameTime>(0, from);
@@ -551,7 +551,7 @@ bool readHdr10PlusJson(const std::string& path, std::vector<Hdr10PlusScene>& sce
     const QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &pe);
     const QJsonArray info = doc.object().value("SceneInfo").toArray();
     if (pe.error != QJsonParseError::NoError || info.isEmpty()) {
-        if (error) *error = path + " is not HDR10+ metadata JSON";
+        if (error) *error = path + " is not ST 2094-40 dynamic HDR metadata JSON";
         return false;
     }
     int lastId = -1;

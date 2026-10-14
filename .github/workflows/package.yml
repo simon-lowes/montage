@@ -3,7 +3,11 @@ name: Package
 # Builds the macOS DMG and the Windows installer + portable zip. Every run
 # uploads them as workflow artifacts. Pushing a tag like v0.1.0, or running
 # the workflow by hand with a release tag, also publishes them as a GitHub
-# Release (an existing release with that tag gets its files replaced).
+# Release (an existing release with that tag gets its files replaced), with
+# the source of Montage and of every library the packages bundle.
+#
+# Both packages bundle the FFmpeg scripts/build-ffmpeg.sh builds (a fixed
+# configuration, GPL-2.0-or-later, never nonfree), not a package manager's.
 on:
   push:
     branches: [main]
@@ -26,6 +30,10 @@ concurrency:
   group: package-${{ github.ref }}
   cancel-in-progress: false
 
+# A release run collects every bundled library's source here (scripts/package-*.sh), for the release.
+env:
+  MONTAGE_SOURCES_DIR: ${{ (startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != '') && 'release-sources' || '' }}
+
 jobs:
   macos:
     name: macOS DMG (Apple Silicon)
@@ -37,7 +45,22 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install dependencies
         # Only the Qt modules Montage uses; the "qt" formula installs all of Qt.
-        run: brew install qtbase qtmultimedia ffmpeg opencolorio lilv libraw openjpeg libmysofa onnxruntime ninja pkgconf
+        # FFmpeg itself is built below, from the libraries it uses.
+        run: brew install qtbase qtmultimedia opencolorio lilv libraw openjpeg libmysofa onnxruntime ninja pkgconf x264 x265 libvpx svt-av1 dav1d opus lame srt librist
+      - name: FFmpeg's libraries (part of its cache key)
+        id: ffdeps
+        run: echo "versions=$(brew list --versions x264 x265 libvpx svt-av1 dav1d opus lame openjpeg srt librist | shasum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - name: Cache FFmpeg
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ffmpeg-stage
+          key: ffmpeg-${{ runner.os }}-${{ hashFiles('scripts/build-ffmpeg.sh') }}-${{ steps.ffdeps.outputs.versions }}
+      - name: FFmpeg
+        run: |
+          scripts/build-ffmpeg.sh "$HOME/ffmpeg" "$RUNNER_TEMP/ffmpeg-stage"
+          mkdir -p "$HOME/ffmpeg" && cp -R "$RUNNER_TEMP/ffmpeg-stage$HOME/ffmpeg/." "$HOME/ffmpeg/"
+          echo "PKG_CONFIG_PATH=$HOME/ffmpeg/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "$HOME/ffmpeg/bin" >> "$GITHUB_PATH"
       - name: Rust version (part of the C2PA library's cache key)
         id: rust
         run: echo "version=$(rustc --version | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
@@ -86,6 +109,16 @@ jobs:
           name: montage-macos
           path: dist/*.dmg
           if-no-files-found: error
+          retention-days: 14
+      - name: Sources for the release
+        if: env.MONTAGE_SOURCES_DIR != ''
+        run: scripts/package-sources.sh macos-arm64
+      - uses: actions/upload-artifact@v4
+        if: env.MONTAGE_SOURCES_DIR != ''
+        with:
+          name: montage-macos-sources
+          path: dist/*-sources.tar
+          if-no-files-found: error
       - name: Launch the packaged app
         timeout-minutes: 3
         run: |
@@ -110,10 +143,36 @@ jobs:
         with:
           msystem: UCRT64
           update: true
-          install: zip curl
+          install: zip curl jq make diffutils git
+          # FFmpeg itself is built below, from the libraries it uses (Qt Multimedia still pulls in MSYS2's, which
+          # this build replaces).
           pacboy: >-
-            gcc:p cmake:p ninja:p pkgconf:p
-            qt6-base:p qt6-multimedia:p qt6-tools:p ffmpeg:p opencolorio:p lilv:p libraw:p openjpeg2:p libmysofa:p onnxruntime:p rust:p
+            gcc:p cmake:p ninja:p pkgconf:p nasm:p
+            qt6-base:p qt6-multimedia:p qt6-tools:p opencolorio:p lilv:p libraw:p openjpeg2:p libmysofa:p onnxruntime:p rust:p
+            x264:p x265:p libvpx:p svt-av1:p dav1d:p opus:p lame:p srt:p librist:p amf-headers:p ffnvcodec-headers:p libvpl:p
+      - name: FFmpeg's libraries (part of its cache key)
+        id: ffdeps
+        run: echo "versions=$(pacman -Q $(printf 'mingw-w64-ucrt-x86_64-%s ' x264 x265 libvpx svt-av1 dav1d opus lame openjpeg2 srt librist amf-headers ffnvcodec-headers libvpl) | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - name: Cache FFmpeg
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ffmpeg-stage
+          key: ffmpeg-${{ runner.os }}-ucrt64-${{ hashFiles('scripts/build-ffmpeg.sh') }}-${{ steps.ffdeps.outputs.versions }}
+      - name: FFmpeg
+        # Installed in /ucrt64 in place of MSYS2's FFmpeg, so Qt Multimedia's FFmpeg plugin loads this one too.
+        run: |
+          stage="$(cygpath -u "$RUNNER_TEMP")/ffmpeg-stage"
+          scripts/build-ffmpeg.sh /ucrt64 "$stage"
+          # Qt Multimedia's FFmpeg plugin is built against MSYS2's FFmpeg, so it only loads this build while both
+          # are the same release.
+          want=$(sed -n 's/^VERSION=//p' scripts/build-ffmpeg.sh)
+          have=$(pacman -Q mingw-w64-ucrt-x86_64-ffmpeg | cut -d' ' -f2)
+          case "$have" in
+            "$want"-*) ;;
+            *) echo "MSYS2 has FFmpeg $have but scripts/build-ffmpeg.sh builds $want: update VERSION and SHA256 there" >&2; exit 1 ;;
+          esac
+          pacman -Rdd --noconfirm mingw-w64-ucrt-x86_64-ffmpeg
+          cp -R "$stage/ucrt64/." /ucrt64/
       - name: Rust version (part of the C2PA library's cache key)
         id: rust
         run: echo "version=$(rustc --version | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
@@ -179,6 +238,16 @@ jobs:
           path: |
             dist/*.zip
             dist/*-setup.exe
+          if-no-files-found: error
+          retention-days: 14
+      - name: Sources for the release
+        if: env.MONTAGE_SOURCES_DIR != ''
+        run: scripts/package-sources.sh windows-x64
+      - uses: actions/upload-artifact@v4
+        if: env.MONTAGE_SOURCES_DIR != ''
+        with:
+          name: montage-windows-sources
+          path: dist/*-sources.tar
           if-no-files-found: error
       - name: Launch the packaged app
         timeout-minutes: 3

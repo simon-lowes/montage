@@ -4,6 +4,11 @@
 // come as input report 4 (up to six key codes), the jog wheel as report 3 (its mode and a value), the battery as
 // report 7; key lights are output report 2 (a bit each), the jog mode lights output report 4, the jog mode output
 // report 3.
+//
+// The authentication (authResponse) and the protocol are translated to C++ from blackmagic-misc's bmd.py,
+// Copyright (C) 2021 Sylvain Munaut <tnt@246tNt.com>, under the Apache License 2.0 (LICENSES/Apache-2.0.txt); the key
+// and light codes follow CommandPost (LICENSES/MIT-CommandPost.txt). Its keys come from that published work, not from
+// Blackmagic's software. See THIRD_PARTY_NOTICES.md.
 #pragma once
 
 #include <cstddef>

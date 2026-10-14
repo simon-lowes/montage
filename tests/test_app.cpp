@@ -33,6 +33,7 @@
 #include <QScrollBar>
 #include <QSlider>
 #include <QPushButton>
+#include <QTextBrowser>
 #include <QColorDialog>
 #include <QMenu>
 #include <QPainter>
@@ -61,6 +62,7 @@
 #include "core/Ambisonics.h"
 #include "media/Sofa.h"
 #include "AutoMixDialog.h"
+#include "LicencesDialog.h"
 #include "CaptionsPanel.h"
 #include "CleanFeed.h"
 #include "ColorWarperEditor.h"
@@ -8542,6 +8544,15 @@ const auto seq = [this] { return state()->sequence(); };
             for (auto it = keys.begin(); it != keys.end(); ++it)
                 QCOMPARE(keymap::find(w, it.key())->shortcut().toString(QKeySequence::PortableText), it.value().toString());
         }
+        // A preset's old name still finds it, and the new name is the one remembered.
+        QVERIFY(keymap::presets().contains(QStringLiteral("Montage")) && !keymap::presets().contains(QStringLiteral("Montage (Premiere Pro)")));
+        QVERIFY(!keymap::presetKeys("Final Cut Pro").isEmpty());
+        QVERIFY(keymap::presetKeys("Final Cut Pro") == keymap::presetKeys("Final Cut Pro-style"));
+        QVERIFY(keymap::applyPreset(w, "Avid Media Composer"));
+        QCOMPARE(appSettings().value("keymapPreset").toString(), QString("Avid Media Composer-style"));
+        QVERIFY(keymap::applyPreset(w, "Montage (Premiere Pro)"));
+        QCOMPARE(appSettings().value("keymapPreset").toString(), QString("Montage"));
+        QVERIFY(!keymap::applyPreset(w, "Nothing"));
         keymap::resetAll(w);
         // Resetting brings back every key, the second ones too.
         QAction* redo = keymap::find(w, "Edit/Redo");
@@ -9971,6 +9982,12 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(job.settings.startTimecode, formatTimecode(FrameTime(std::llround(36000 * state()->sequence()->fpsValue())), state()->sequence()->fps));
         QCOMPARE(job.settings.width, 1920);
         queue->remove(job.id);
+        // A preset remembered under its old name, with its maker's name in front, comes back under its new one.
+        const QVariant remembered = appSettings().value("export/preset");
+        appSettings().setValue("export/preset", "Avid DNxHR HQ (MXF)");
+        const QString restored = ExportDialog(state(), win_.get()).findChild<QComboBox*>("exportPreset")->currentText();
+        appSettings().setValue("export/preset", remembered);  // later tests export with the preset they had
+        QCOMPARE(restored, QStringLiteral("DNxHR HQ (MXF)"));
     }
 
     void renderQueueInTheBackground() {
@@ -14482,6 +14499,26 @@ print("added " + ui["name"])
         state()->undo();
         c = edit::clipById(*state()->sequence(), red);
         QCOMPARE(c->motion.p("opacity", 0), 100.0);
+    }
+
+    void licencesShown() {
+        // Help offers the licences, About Qt and About Montage.
+        QAction* show = win_->findChild<QAction*>("showLicences");
+        QVERIFY(show);
+        // The dialog shows Montage's licence, the GPL itself and the third-party notices, all built in.
+        LicencesDialog dlg(win_.get());
+        auto* montagePage = dlg.findChild<QTextBrowser*>("licenceMontage");
+        QVERIFY(montagePage && montagePage->toPlainText().contains("either version 3 of the License"));
+        QVERIFY(montagePage->toPlainText().contains("additional permission under section 7"));
+        auto* gpl = dlg.findChild<QTextBrowser*>("licenceGpl");
+        QVERIFY(gpl && gpl->toPlainText().contains("GNU GENERAL PUBLIC LICENSE"));
+        auto* notices = dlg.findChild<QTextBrowser*>("licenceNotices");
+        QVERIFY(notices && notices->toPlainText().contains("lensfun") && notices->toPlainText().contains("Sylvain Munaut"));
+        // FFmpeg reports its own licence, which the dialog and About Montage repeat.
+        QVERIFY(!ffmpegLicence().isEmpty() && montagePage->toPlainText().contains(ffmpegLicence()));
+        // A build run from its build folder has no packaged licences folder to open.
+        QVERIFY(packagedLicencesFolder().isEmpty());
+        QVERIFY(!dlg.findChild<QPushButton*>("openLicencesFolder")->isEnabled());
     }
 
     void playbackAdvances() {

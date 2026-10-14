@@ -15,6 +15,9 @@ spectrum:
 
   input  "magnitude" [N, 2, T, 1024]: |STFT| of the mix (channels, frames, bins), T a multiple of 64
   output "masks"     [N, S, 2, T, 1024]: one ratio mask per stem, summing to one
+
+Spleeter: Copyright (c) 2019-present, Deezer SA, under the MIT License
+(LICENSES/MIT-spleeter.txt). See THIRD_PARTY_NOTICES.md.
 """
 import struct
 import sys
