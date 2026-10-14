@@ -17,7 +17,7 @@ namespace montage {
 class EditorState;
 
 struct StemOptions {
-    int stems = 4;              // 2, 4 or 5
+    int stems = 4;              // 2, 3 (dialogue, music, effects), 4 or 5
     bool muteOriginal = true;   // disable the clip the stems came from
     double handles = 2.0;       // seconds of source separated either side of each clip, for trimming
 };

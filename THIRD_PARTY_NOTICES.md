@@ -23,6 +23,7 @@ folder. The source code for each release, including every bundled library's, is 
 | [pyaaf2](https://github.com/markreidvfx/pyaaf2) 1.7.1: the AAF MetaDictionary | `src/core/AafMetaDictionary.inc` | MIT | [LICENSES/MIT-pyaaf2.txt](LICENSES/MIT-pyaaf2.txt) |
 | [Practical-RIFE](https://github.com/hzwer/Practical-RIFE) 4.26: the network graph (without weights) | `src/media/rife-4.26.onnx` | MIT | [LICENSES/MIT-Practical-RIFE.txt](LICENSES/MIT-Practical-RIFE.txt) |
 | [Spleeter](https://github.com/deezer/spleeter): the separation network graphs (without weights) | `src/media/spleeter-*stems.onnx` | MIT | [LICENSES/MIT-spleeter.txt](LICENSES/MIT-spleeter.txt) |
+| [Bandit v2](https://github.com/kwatcharasupat/bandit-v2): the dialogue, music and effects network graph (without weights), made by `scripts/gen-bandit-graph.py` from the authors' code | `src/media/bandit-v2-eng.onnx` | Apache-2.0 | Copyright Karn N. Watcharasupat, Chih-Wei Wu and Alexander Lerch. [LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt) |
 | [SCOWL](http://wordlist.aspell.net/) word lists | `src/resources/dict/` | SCOWL licence (permissive) | Copyright 2000-2018 Kevin Atkinson; the notice is kept at the top of each list |
 
 ## Libraries compiled into Montage
@@ -63,4 +64,5 @@ when they are installed. NDI® is a registered trademark of Vizrt NDI AB ([ndi.v
 registered trademark of Steinberg Media Technologies GmbH.
 
 AI models are not included either: Montage downloads each one when a feature first needs it, and names the model and
-its licence when it asks to download it.
+its licence when it asks to download it. One is not under a software licence: Bandit v2's weights (dialogue, music and
+effects) are CC BY-SA 4.0, so they are downloaded from the authors' Zenodo record as they are and never repackaged.

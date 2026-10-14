@@ -9,6 +9,7 @@
 #include <mutex>
 #include <thread>
 
+#include "BanditSeparation.h"
 #include "Decoder.h"
 #include "core/Zip.h"
 
@@ -75,15 +76,18 @@ constexpr double kWindowCompensation = 2.0 / 3.0;  // the Hann windows of analys
 
 }  // namespace
 
+int stemRate(int stems) { return stems == 3 ? kDmeRate : kStemRate; }
+
 const ModelPack& stemModel(int stems) {
     static const ModelPack two = makePack(2), four = makePack(4), five = makePack(5);
-    return stems == 2 ? two : stems == 5 ? five : four;
+    return stems == 3 ? dmeModel() : stems == 2 ? two : stems == 5 ? five : four;
 }
 
 const std::vector<std::string>& stemNames(int stems) {
-    static const std::vector<std::string> two = {"vocals", "accompaniment"}, four = {"vocals", "drums", "bass", "other"},
+    static const std::vector<std::string> two = {"vocals", "accompaniment"}, three = {"dialogue", "music", "effects"},
+                                          four = {"vocals", "drums", "bass", "other"},
                                           five = {"vocals", "piano", "drums", "bass", "other"}, none;
-    return stems == 2 ? two : stems == 4 ? four : stems == 5 ? five : none;
+    return stems == 2 ? two : stems == 3 ? three : stems == 4 ? four : stems == 5 ? five : none;
 }
 
 std::string stemTitle(const std::string& stem) {
@@ -241,6 +245,7 @@ std::shared_ptr<Model> loadModel(int stems, std::string* error) {
 // The signal Spleeter separates is the input after a frame of silence (kN zeros), framed from 0 every kHop to the end
 // (the last frame padded with zeros); positions below are in that padded signal.
 struct StemSplitter::Impl {
+    std::unique_ptr<BanditSplitter> bandit;  // (dialogue, music and effects: all of the work is its)
     std::shared_ptr<Model> model;
     Output write;
     int stems = 0;
@@ -264,6 +269,14 @@ StemSplitter::StemSplitter() : d_(std::make_unique<Impl>()) {}
 StemSplitter::~StemSplitter() = default;
 
 std::unique_ptr<StemSplitter> StemSplitter::create(int stems, Output write, std::string* error) {
+    if (stems == 3) {
+        auto bandit = BanditSplitter::create(std::move(write), error);
+        if (!bandit) return nullptr;
+        std::unique_ptr<StemSplitter> s(new StemSplitter());
+        s->d_->bandit = std::move(bandit);
+        s->d_->stems = 3;
+        return s;
+    }
     auto model = loadModel(stems, error);
     if (!model) return nullptr;
     std::unique_ptr<StemSplitter> s(new StemSplitter());
@@ -280,7 +293,7 @@ std::unique_ptr<StemSplitter> StemSplitter::create(int stems, Output write, std:
 }
 
 int StemSplitter::stems() const { return d_->stems; }
-int64_t StemSplitter::done() const { return std::max<int64_t>(0, d_->emitted - kN); }
+int64_t StemSplitter::done() const { return d_->bandit ? d_->bandit->done() : std::max<int64_t>(0, d_->emitted - kN); }
 
 bool StemSplitter::Impl::handOut(int64_t upTo) {
     if (upTo <= emitted) return true;
@@ -378,6 +391,7 @@ bool StemSplitter::Impl::separateSegment(int64_t frames, std::string* error) {
 
 bool StemSplitter::push(const float* stereo, size_t frames, std::string* error) {
     Impl& d = *d_;
+    if (d.bandit) return d.bandit->push(stereo, frames, error);
     if (d.stopped) return false;
     d.in.insert(d.in.end(), stereo, stereo + frames * 2);
     d.received += int64_t(frames);
@@ -391,6 +405,7 @@ bool StemSplitter::push(const float* stereo, size_t frames, std::string* error) 
 
 bool StemSplitter::finish(std::string* error) {
     Impl& d = *d_;
+    if (d.bandit) return d.bandit->finish(error);
     if (d.stopped) return false;
     const int64_t length = kN + d.received;
     const int64_t frames = (length + kHop - 1) / kHop;  // TensorFlow's stft with pad_end
@@ -409,6 +424,7 @@ struct FloatWav {
     static constexpr qint64 kHeader = 80;
     QFile file;
     qint64 frames = 0;
+    uint32_t rate = kStemRate;
     bool open(const QString& path) {
         file.setFileName(path);
         if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
@@ -423,7 +439,7 @@ struct FloatWav {
         const bool large = riff > 0xFFFFFFFFULL;
         b.append(large ? "RF64" : "RIFF", 4), u32(large ? 0xFFFFFFFFU : uint32_t(riff)), b.append("WAVE", 4);
         b.append(large ? "ds64" : "JUNK", 4), u32(28), u64(large ? riff : 0), u64(large ? bytes : 0), u64(large ? uint64_t(frames) : 0), u32(0);
-        b.append("fmt ", 4), u32(16), u16(3), u16(2), u32(kStemRate), u32(kStemRate * 8), u16(8), u16(32);
+        b.append("fmt ", 4), u32(16), u16(3), u16(2), u32(rate), u32(rate * 8), u16(8), u16(32);
         b.append("data", 4), u32(large ? 0xFFFFFFFFU : uint32_t(bytes));
         return b;
     }
@@ -445,7 +461,7 @@ bool separateStemsToFiles(const std::string& path, double from, double to, const
                           const std::vector<std::string>& outPaths, const std::function<void(double)>& progress,
                           const std::atomic<bool>* cancel, std::string* error) {
     if (stemNames(stems).empty() || outPaths.size() != stemNames(stems).size()) {
-        if (error) *error = "Separation is into 2, 4 or 5 stems, one file each";
+        if (error) *error = "Separation is into 2, 3, 4 or 5 stems, one file each";
         return false;
     }
     if (to > 0 && to <= from) {
@@ -457,8 +473,10 @@ bool separateStemsToFiles(const std::string& path, double from, double to, const
         for (auto& f : files) f->file.close();
         for (const std::string& p : outPaths) QFile::remove(QString::fromStdString(p));
     };
+    const int rate = stemRate(stems);
     for (const std::string& p : outPaths) {
         files.push_back(std::make_unique<FloatWav>());
+        files.back()->rate = uint32_t(rate);
         if (!files.back()->open(QString::fromStdString(p))) {
             if (error) *error = "Cannot write " + p;
             removeAll();
@@ -474,12 +492,12 @@ bool separateStemsToFiles(const std::string& path, double from, double to, const
         removeAll();
         return false;
     }
-    const int64_t a = std::max<int64_t>(0, int64_t(std::llround(from * kStemRate)));
-    const int64_t b = to > 0 ? std::max(a, int64_t(std::llround(to * kStemRate))) : -1;
+    const int64_t a = std::max<int64_t>(0, int64_t(std::llround(from * rate)));
+    const int64_t b = to > 0 ? std::max(a, int64_t(std::llround(to * rate))) : -1;
     int64_t at = a;  // the media frame the next block starts at
     std::string err;
     const bool decoded = decodeAudioStereoBlocks(
-        path, kStemRate, size_t(kStemRate),
+        path, rate, size_t(rate),
         [&](const std::vector<float>& stereo) {
             const int64_t n = int64_t(stereo.size() / 2), lo = std::max(a, at), hi = b < 0 ? at + n : std::min(b, at + n);
             if (hi > lo && !splitter->push(stereo.data() + (lo - at) * 2, size_t(hi - lo), &err)) return false;
@@ -487,7 +505,7 @@ bool separateStemsToFiles(const std::string& path, double from, double to, const
             if (progress && b > a) progress(std::clamp(double(splitter->done()) / double(b - a), 0.0, 1.0));
             return (b < 0 || at < b) && !(cancel && cancel->load());
         },
-        &err, cancel, channels, double(a) / kStemRate);
+        &err, cancel, channels, double(a) / rate);
     if (cancel && cancel->load()) err = "Cancelled";
     else if (decoded && err.empty() && at <= a) err = "There is no sound there to separate";
     if (!decoded || !err.empty() || !splitter->finish(&err) || writeFailed) {
@@ -587,6 +605,7 @@ edit::Result placeStems(Project& p, Sequence& s, Id clip, const std::vector<Id>&
         stem.take = 0;
         stem.unrendered.clear();
         stem.audioAngle = -1;
+        if (titles[i] == "Dialogue" || titles[i] == "Music" || titles[i] == "Effects") stem.role = titles[i];
         const edit::Result r = edit::overwrite(p, s, {TrackKind::Audio, index}, stem);
         if (!r.ok) return r;
         all.created.insert(all.created.end(), r.created.begin(), r.created.end());

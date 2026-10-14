@@ -1163,10 +1163,19 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             e->normalise = want.normalise;
             e->seq = seq;
             for (const std::string& r : want.unmute) std::erase(e->seq.mutedRoles, r);
-            if (!want.role.empty())
+            if (!want.role.empty()) {
+                // ("Music+Effects": either)
+                std::vector<std::string> roles;
+                for (size_t from = 0;;) {
+                    const size_t plus = want.role.find('+', from);
+                    roles.push_back(want.role.substr(from, plus == std::string::npos ? std::string::npos : plus - from));
+                    if (plus == std::string::npos) break;
+                    from = plus + 1;
+                }
                 for (Track& t : e->seq.audioTracks)
                     for (Clip& c : t.clips)
-                        if ((c.role.empty() ? std::string("No Role") : c.role) != want.role) c.enabled = false;
+                        if (std::find(roles.begin(), roles.end(), c.role.empty() ? std::string("No Role") : c.role) == roles.end()) c.enabled = false;
+            }
             extras.push_back(std::move(e));
         }
     }
@@ -1849,7 +1858,10 @@ std::vector<ExportSettings::AudioStream> stemStreams(const Sequence& seq, int gr
     const std::string language = seq.captionTracks.empty() ? std::string() : seq.captionTracks.front().language;
     const size_t n = seq.audioTracks.size();
     auto hasClips = [&](size_t i) { return !seq.audioTracks[i].muted && !seq.audioTracks[i].clips.empty(); };
-    if (groups == StemsByRole) {
+    if (groups == StemsDialogueAndME) {
+        out.push_back({"Dialogue", language, {}, "Dialogue"});
+        out.push_back({"M&E", language, {}, "Music+Effects"});
+    } else if (groups == StemsByRole) {
         Sequence named = seq;
         for (Track& t : named.audioTracks)
             for (Clip& c : t.clips)

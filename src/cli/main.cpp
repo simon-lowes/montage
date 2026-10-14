@@ -124,7 +124,7 @@ int usage() {
                  "  montage-cli shots <project.montage> \"a red car at night\" [--max N]   (find shots by description)\n"
                  "  montage-cli sounds <project.montage> \"applause\" [--max N]   (find sounds by description)\n"
                  "  montage-cli people <project.montage> [--person NAME|ID]   (who is in the footage, and where)\n"
-                 "  montage-cli stems <file> [--stems 2|4|5] [--from S] [--to S] [-o folder]   (vocals, drums, bass... as WAVs)\n"
+                 "  montage-cli stems <file> [--stems 2|3|4|5] [--from S] [--to S] [-o folder]   (vocals, drums... or dialogue, music, effects as WAVs)\n"
                  "  montage-cli speak \"text\" -o voice.wav [--voice af_heart] [--speed 1]   (a voiceover from text; --phonemes prints them)\n"
                  "  montage-cli clone-speech \"text\" --voice sample.wav -o out.wav --consent [--language en] [--from S] [--to S]\n"
                  "              [--speed 1] [--exaggeration 0.5]   (in the voice of the sample, with its owner's consent; 23 languages)\n"
@@ -849,11 +849,12 @@ int cmdModels() {
     else
         std::printf("  %-22s %6.1f MB  %s\n", depthModel().id.c_str(), double(depthModel().bytes()) / 1e6,
                     depthModel().installed() ? "downloaded" : "");
-    std::printf("\nStem separation models (Spleeter, the authors' release, for Separate Stems; folder: %s)\n",
+    std::printf("\nStem separation models (Spleeter for music and Bandit v2 for dialogue, music and effects, the authors' "
+                "releases, for Separate Stems; folder: %s)\n",
                 std::filesystem::path(stemModel(4).directory()).parent_path().string().c_str());
     if (!stemSeparationAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
     else
-        for (const int n : {2, 4, 5})
+        for (const int n : {2, 4, 5, 3})
             std::printf("  %-22s %6.1f MB  %s\n", stemModel(n).id.c_str(), double(stemModel(n).bytes()) / 1e6,
                         stemModel(n).installed() ? "downloaded" : "");
     std::printf("\nRIFE 4.26 (the authors' release, for AI slow-motion frames; folder: %s)\n", rifeModel().directory().c_str());
@@ -1238,7 +1239,7 @@ int cmdStems(const std::vector<std::string>& args) {
         else if (args[i] == "-o" && i + 1 < args.size()) folder = args[++i];
         else return usage();
     if (stemNames(stems).empty()) {
-        std::fprintf(stderr, "error: --stems is 2, 4 or 5\n");
+        std::fprintf(stderr, "error: --stems is 2, 3 (dialogue, music, effects), 4 or 5\n");
         return 1;
     }
     if (!stemModel(stems).installed()) {
