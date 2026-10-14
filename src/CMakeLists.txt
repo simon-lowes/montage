@@ -167,6 +167,7 @@ add_library(montage_engine STATIC
   render/AutoBroll.h render/AutoBroll.cpp
   render/AutoMix.h render/AutoMix.cpp
   render/VoiceMatch.h render/VoiceMatch.cpp
+  render/DialogueMatch.h render/DialogueMatch.cpp
   render/ColorSpace.h render/ColorSpace.cpp
   render/Gamut.h render/Gamut.cpp
   render/ColorSlice.h render/ColorSlice.cpp
@@ -196,6 +197,7 @@ add_library(montage_engine STATIC
   audio/DynLib.h audio/DynLib.cpp
   audio/PluginEffect.h audio/PluginEffect.cpp
   audio/SpeechCleanup.h audio/SpeechCleanup.cpp
+  audio/RoomResponse.h audio/RoomResponse.cpp
   audio/AudioRepair.h audio/AudioRepair.cpp
   audio/SpectralRepair.h audio/SpectralRepair.cpp
   audio/TimeStretch.h audio/TimeStretch.cpp

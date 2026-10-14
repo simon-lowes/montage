@@ -7737,6 +7737,36 @@ private slots:
         state()->undo();
         state()->undo();
         QVERIFY(edit::clipById(*state()->sequence(), other)->effects.empty());
+        // Dialogue Match to the same reference, with room tone: the EQ (now Dialogue Match's), the volume brought to
+        // the reference's as heard, and the reference's room tone under the clip, for its length.
+        QVERIFY(win_->findChild<QAction*>("matchDialogue"));
+        state()->edit("Quieter", [&](Project&, Sequence& sq) {
+            edit::clipById(sq, good)->audio.params["gain_db"] = Param(-4.0);
+            return true;
+        });
+        QCOMPARE(win_->matchVoice(), 1);
+        state()->setSelection({other}, false);
+        const size_t tracks = state()->sequence()->audioTracks.size();
+        QCOMPARE(win_->matchDialogue(DialogueMatchOptions{}, true), 1);
+        const Sequence& after = *state()->sequence();
+        const Clip* matched = edit::clipById(after, other);
+        QVERIFY(matched && eqOf() && eqOf()->s("match") == "dialogue");
+        int eqs = 0;
+        for (const Effect& e : matched->effects) eqs += e.type == "parametric_eq";
+        QCOMPARE(eqs, 1);
+        std::vector<float> heardRef, heardOther;
+        QVERIFY(clipSpeechAudio(state()->project(), after, *edit::clipById(after, good), heardRef) &&
+                clipSpeechAudio(state()->project(), after, *matched, heardOther));
+        const double gain = matched->audio.p("gain_db", 0), planned = planDialogueMatch(heardRef, heardOther, 48000).gainDb - 4;
+        QVERIFY2(std::fabs(gain - planned) < 0.05, qPrintable(QString("%1 %2").arg(gain).arg(planned)));
+        // (on the next track down, free there; a track is added only when none below is)
+        QCOMPARE(after.audioTracks.size(), std::max<size_t>(tracks, 2));
+        QCOMPARE(after.audioTracks[1].clips.size(), size_t(1));
+        QCOMPARE(after.audioTracks[1].clips[0].start, matched->start);
+        QCOMPARE(after.audioTracks[1].clips[0].end(), matched->end());
+        // The reference itself is not matched to itself.
+        state()->setSelection({good}, false);
+        QCOMPARE(win_->matchDialogue(DialogueMatchOptions{}), 0);
         state()->newProject();
     }
 

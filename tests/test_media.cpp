@@ -45,6 +45,7 @@
 #include "core/Surround.h"
 #include "core/Transcript.h"
 #include "core/TranscriptEdit.h"
+#include "audio/RoomResponse.h"
 #include "audio/SpeechCleanup.h"
 #include "audio/TimeStretch.h"
 #include "core/ClipAnimation.h"
@@ -114,6 +115,7 @@
 #include "render/AutoBroll.h"
 #include "render/AutoMix.h"
 #include "render/VideoDenoise.h"
+#include "render/DialogueMatch.h"
 #include "render/VoiceMatch.h"
 #include "media/Segmenter.h"
 #include "media/Translator.h"
@@ -20834,6 +20836,251 @@ if ui["pressed"] == "add":
         const Clip* matched = edit::clipById(*back.active(), thinClip);
         QVERIFY(matched && !matched->effects.empty() && matched->effects[0].s("match") == "voice");
         QVERIFY(std::fabs(matched->effects[0].p("b3_db", 0) + 6) < 2);
+    }
+
+    void roomResponse() {
+        // Real-time convolution matches offline convolution, sample for sample, for a response longer than many blocks.
+        std::mt19937 rng(3);
+        std::normal_distribution<float> n01;
+        std::vector<float> sig(20000), ir(5000);
+        for (auto& v : sig) v = n01(rng);
+        for (size_t i = 0; i < ir.size(); ++i) ir[i] = n01(rng) * float(std::exp(-double(i) / 1500));
+        const std::vector<float> offline = convolve(sig, ir);
+        double worst = 0, direct = 0;
+        for (size_t i = 0; i < 3000; ++i) {
+            double acc = 0;
+            for (size_t k = 0; k <= i && k < ir.size(); ++k) acc += double(ir[k]) * sig[i - k];
+            direct = std::max(direct, std::fabs(acc - offline[i]));
+        }
+        Convolver conv;
+        conv.setImpulse(ir, 256);
+        std::vector<float> live(sig.size() * 2, 0.0f);
+        // Interleaved, in uneven pieces.
+        for (size_t i = 0; i < sig.size(); ++i) live[2 * i] = sig[i];
+        for (size_t at = 0, piece = 1; at < sig.size(); at += piece, piece = piece * 7 % 613 + 1)
+            conv.process(live.data() + 2 * at, live.data() + 2 * at, int(std::min(piece, sig.size() - at)), 2);
+        for (size_t i = 0; i < sig.size(); ++i) worst = std::max(worst, double(std::fabs(live[2 * i] - offline[i])));
+        qInfo("convolution: offline %.2g from direct, live %.2g from offline", direct, worst);
+        QVERIFY(direct < 1e-3 && worst < 1e-3);
+        // A response within its first block: the direct taps alone.
+        conv.setImpulse({0.5f, 0.25f});
+        float pulse[4] = {1, 0, 0, 0};
+        conv.process(pulse, pulse, 4);
+        QVERIFY(pulse[0] == 0.5f && pulse[1] == 0.25f && pulse[2] == 0 && pulse[3] == 0);
+
+        // A made room decays at each octave's own rate (averaged over three rooms of that shape), with unit energy.
+        constexpr int sr = 48000;
+        RoomShape shape;
+        shape.rt60 = {1.2, 1.0, 0.8, 0.7, 0.6, 0.5, 0.35};
+        std::array<double, kRoomBands> measured{};
+        for (uint32_t seed = 1; seed <= 3; ++seed) {
+            const std::vector<float> h = roomImpulse(sr, shape, seed);
+            double energy = 0;
+            for (float v : h) energy += double(v) * v;
+            QVERIFY(std::fabs(energy - 1) < 1e-3);
+            QCOMPARE(std::find_if(h.begin(), h.end(), [](float v) { return v != 0; }) - h.begin(), std::ptrdiff_t(0.012 * sr));
+            for (int b = 0; b < kRoomBands; ++b) {
+                // Measured as on a real response: each octave (smoothly band-passed by FFT), Schroeder's backward
+                // integration, T20 (-5 to -25 dB) times three.
+                const double c = roomBandCentres()[size_t(b)];
+                size_t N = 1;
+                while (N < h.size() + sr / 10) N <<= 1;
+                std::vector<std::complex<float>> X(N);
+                std::copy(h.begin(), h.end(), X.begin());
+                fftInPlace(X, false);
+                for (size_t k = 0; k < N; ++k) {
+                    const double f = double(std::min(k, N - k)) * sr / double(N), o = f > 0 ? std::log2(f / c) : -20;
+                    X[k] *= float(std::exp(-o * o / (2 * 0.3 * 0.3)));
+                }
+                fftInPlace(X, true);
+                std::vector<double> edc(N + 1, 0.0);
+                for (size_t i = N; i-- > 0;) edc[i] = edc[i + 1] + double(std::norm(X[i]));
+                const size_t start = size_t(shape.predelayMs * 1e-3 * sr);
+                size_t t5 = 0, t25 = 0;
+                for (size_t i = start; i < N && !t25; ++i) {
+                    const double db = 10 * std::log10(edc[i] / edc[start]);
+                    if (!t5 && db <= -5) t5 = i;
+                    if (db <= -25) t25 = i;
+                }
+                measured[size_t(b)] += 3.0 * double(t25 - t5) / sr / 3;
+            }
+        }
+        for (int b = 0; b < kRoomBands; ++b) {
+            qInfo("made room, %.0f Hz: RT60 %.2f s (asked %.2f s)", roomBandCentres()[size_t(b)], measured[size_t(b)], shape.rt60[size_t(b)]);
+            QVERIFY(std::fabs(measured[size_t(b)] / shape.rt60[size_t(b)] - 1) < 0.1);
+        }
+
+        // Speech in rooms: the decay found blind from the speech alone, broadband and octave by octave, and how much
+        // late reverberation there is, which grows with the room's share of the sound.
+        std::vector<float> dry;
+        std::string err;
+        QVERIFY2(decodeMono(MONTAGE_TEST_DATA_DIR "/jfk.wav", sr, dry, nullptr, &err), err.c_str());
+        auto inRoom = [&](const RoomShape& r, double drrDb) {
+            // (the response has unit energy, so its sound is as loud as the direct sound before the gain)
+            const std::vector<float> wet = convolve(dry, roomImpulse(sr, r));
+            std::vector<float> out(dry.size());
+            const float g = float(std::pow(10.0, -drrDb / 20));
+            for (size_t i = 0; i < dry.size(); ++i) out[i] = dry[i] + wet[i] * g;
+            return out;
+        };
+        for (double rt : {0.4, 0.8, 1.4}) {
+            RoomShape r;
+            r.rt60.fill(rt);
+            double previous = 100;
+            for (double drr : {-6.0, 0.0, 6.0, 12.0}) {
+                const std::vector<float> x = inRoom(r, drr);
+                const RoomEstimate e = estimateRoom(x, sr);
+                const double late = lateReverbDb(x, sr, rt);
+                QString bands;
+                for (double t : e.rt60) bands += QString(" %1").arg(t, 0, 'f', 2);
+                qInfo("room %.1f s, room %+.0f dB under the voice: broadband %.2f, octaves%s; late reverberation %.1f dB", rt, drr,
+                      e.broadband, qPrintable(bands), late);
+                QVERIFY(late < previous);
+                previous = late;
+                if (rt < 0.5 || drr > 6) continue;  // (a short or faint room: the speech's own decay is as fast)
+                QVERIFY2(std::fabs(e.broadband / rt - 1) < 0.15, qPrintable(QString::number(e.broadband)));
+                int found = 0;
+                for (int b = 2; b <= 5; ++b)
+                    if (e.rt60[size_t(b)] > 0) {
+                        ++found;
+                        QVERIFY2(std::fabs(e.rt60[size_t(b)] / rt - 1) < 0.3, qPrintable(QString::number(e.rt60[size_t(b)])));
+                    }
+                QVERIFY(found >= 3);
+                // Bands without a decay to follow take their neighbours'.
+                const RoomShape filled = e.shape();
+                for (double t : filled.rt60) QVERIFY(t > 0);
+            }
+            QVERIFY(previous > lateReverbDb(dry, sr, rt));
+        }
+    }
+
+    void dialogueMatch() {
+        // The production take: JFK in a room (decaying in 0.6 to 0.9 s, its sound 6 dB under the direct sound) on a
+        // boom that is thin in the lows, quieter; the ADR: the same voice, dry, on a flat microphone, louder.
+        constexpr int sr = 48000;
+        std::vector<float> dry;
+        std::string err;
+        QVERIFY2(decodeMono(MONTAGE_TEST_DATA_DIR "/jfk.wav", sr, dry, nullptr, &err), err.c_str());
+        RoomShape made;
+        made.rt60 = {0.9, 0.85, 0.8, 0.8, 0.75, 0.7, 0.6};
+        std::vector<float> production = convolve(dry, roomImpulse(sr, made, 7));
+        for (size_t i = 0; i < dry.size(); ++i) production[i] = dry[i] + production[i] * 0.5f;
+        VoiceEq boom;
+        boom.lowDb = -6, boom.b3Db = 3;
+        applyVoiceEqTo(production, boom, sr);
+        for (float& v : production) v *= 0.5f;
+        std::vector<float> adr = dry;
+        for (float& v : adr) v *= 1.4f;
+        const DialogueMatchPlan plan = planDialogueMatch(production, adr, sr);
+        QString bands;
+        for (double t : plan.room.rt60) bands += QString(" %1").arg(t, 0, 'f', 2);
+        qInfo("room%s (broadband %.2f), level %.1f dB; late reverberation %.1f -> %.1f (reference %.1f); EQ low %+.1f, 300 Hz %+.1f, "
+              "1.2 kHz %+.1f, 4 kHz %+.1f, high %+.1f, %.1f -> %.1f dB apart; gain %+.1f dB, %.1f -> %.1f LUFS (reference %.1f)",
+              qPrintable(bands), plan.measured.broadband, plan.wetDb, plan.targetLateDb, plan.matchedLateDb, plan.referenceLateDb,
+              plan.eq.lowDb, plan.eq.b1Db, plan.eq.b2Db, plan.eq.b3Db, plan.eq.highDb, plan.eq.beforeDb, plan.eq.afterDb, plan.gainDb,
+              plan.targetLufs, plan.matchedLufs, plan.referenceLufs);
+        QVERIFY(plan.roomAdded);
+        QVERIFY(std::fabs(plan.measured.broadband / 0.8 - 1) < 0.2);
+        QVERIFY(plan.referenceLateDb > plan.targetLateDb + 3);
+        QVERIFY(std::fabs(plan.matchedLateDb - plan.referenceLateDb) < 0.3);
+        QVERIFY(plan.eq.afterDb < 1 && plan.eq.lowDb < -2);
+        QVERIFY(std::fabs(plan.matchedLufs - plan.referenceLufs) < 0.1);
+        QVERIFY(plan.gainDb < -6);
+        // What it sounds like: the same spectrum within a dB (RMS over the third octaves), as loud, as reverberant.
+        const std::vector<float> matched = withDialogueMatch(adr, sr, plan);
+        auto apart = [&](const std::vector<float>& x, const std::vector<float>& to) {
+            const auto a = speechSpectrum(to, sr), b = speechSpectrum(x, sr);
+            double rms = 0;
+            for (size_t k = 0; k < a.size(); ++k) rms += (a[k] - b[k]) * (a[k] - b[k]);
+            return std::sqrt(rms / double(a.size()));
+        };
+        const double before = apart(adr, production), after = apart(matched, production);
+        qInfo("spectrum %.1f dB apart before, %.2f after", before, after);
+        QVERIFY(after < 1 && before > 3);
+        QVERIFY(std::fabs(classifyAudio(matched, sr).loudness - plan.referenceLufs) < 0.3);
+        QVERIFY(std::fabs(lateReverbDb(matched, sr, plan.measured.broadband) - plan.referenceLateDb) < 0.5);
+        // Matching the reference to itself changes nothing.
+        const DialogueMatchPlan same = planDialogueMatch(production, production, sr);
+        QVERIFY(!same.roomAdded && std::fabs(same.gainDb) < 0.05 && same.eq.afterDb < 0.05);
+        // Following the tone over time: an EQ every half second, each near the fit for the whole.
+        DialogueMatchOptions over;
+        over.toneOverTime = true;
+        const DialogueMatchPlan moving = planDialogueMatch(production, adr, sr, over);
+        QVERIFY(moving.eqOverTime.size() >= 15);
+        QCOMPARE(moving.eqOverTime[1].first - moving.eqOverTime[0].first, 0.5);
+        for (const auto& [t, g] : moving.eqOverTime) QVERIFY2(std::fabs(g.lowDb - moving.eq.lowDb) < 6, qPrintable(QString::number(t)));
+
+        // In a project, over MCP: the ADR clip gets the EQ and the room (tagged, replacing an earlier Match Voice EQ)
+        // and its volume, and the mixer plays it as the match planned it.
+        const std::string prodWav = path("production.wav"), adrWav = path("adr.wav");
+        QVERIFY(writeMonoWav(prodWav, production, sr) && writeMonoWav(adrWav, adr, sr));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        Id ids[2];
+        for (int i = 0; i < 2; ++i) {
+            MediaItem m;
+            QVERIFY(probeMedia(i == 0 ? prodWav : adrWav, m));
+            m.id = ids[i] = p.newId();
+            p.media.push_back(m);
+            QVERIFY(edit::placeMedia(p, s, m.id, i * 400, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        }
+        // (planned again from the files as the clips play them: 16-bit, so above JFK's 8 kHz there is the files' noise)
+        std::vector<float> refPlayed, adrPlayed;
+        QVERIFY(clipSpeechAudio(p, s, s.audioTracks[0].clips[0], refPlayed, &err) && clipSpeechAudio(p, s, s.audioTracks[0].clips[1], adrPlayed, &err));
+        const DialogueMatchPlan filePlan = planDialogueMatch(refPlayed, adrPlayed, sr);
+        Clip& refClip = s.audioTracks[0].clips[0];
+        refClip.audio.params["gain_db"] = Param(-2.0);
+        const Id ref = refClip.id, target = s.audioTracks[0].clips[1].id;
+        applyVoiceEq(p, *edit::clipById(s, target), VoiceEq{});
+        const QString project = QString::fromStdString(path("dialogue.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_match_dialogue"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const QJsonObject r = call({{"project", project}, {"reference", double(ref)}, {"clips", QJsonArray{double(target)}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject one = r.value("structuredContent").toObject().value("clips").toArray().at(0).toObject();
+        QVERIFY2(one.value("room_added").toBool() && std::fabs(one.value("gain_db").toDouble() - (filePlan.gainDb - 2)) < 0.05,
+                 QJsonDocument(one).toJson().constData());
+        // (the reference as the target is an error)
+        QVERIFY(call({{"project", project}, {"reference", double(ref)}, {"clips", QJsonArray{double(ref)}}}).value("isError").toBool());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        Sequence& bs = *back.active();
+        const Clip* c = edit::clipById(bs, target);
+        QVERIFY(c && c->effects.size() == 2);
+        QVERIFY(c->effects[0].type == "parametric_eq" && c->effects[0].s("match") == "dialogue");
+        QVERIFY(c->effects[1].type == "convolution_reverb" && c->effects[1].s("match") == "dialogue");
+        QVERIFY(std::fabs(c->effects[1].p("wet_db", 0, 0) - one.value("room_level_db").toDouble()) < 1e-6);
+        const double gain = c->audio.p("gain_db", 0, 0);
+        AudioMixer mixer;
+        const int64_t from = int64_t(c->start * sr / s.fpsValue()), n = int64_t(adr.size());
+        std::vector<float> out(size_t(n) * 2), left(static_cast<size_t>(n));
+        for (int64_t at = 0; at < n; at += 4800) mixer.mix(back, bs, from + at, int(std::min<int64_t>(4800, n - at)), out.data() + at * 2);
+        for (int64_t i = 0; i < n; ++i) left[size_t(i)] = out[size_t(i) * 2];
+        std::vector<float> refHeard = refPlayed;
+        for (float& v : refHeard) v *= float(std::pow(10.0, -2.0 / 20));
+        const double mixedLufs = classifyAudio(left, sr).loudness, mixedApart = apart(left, refHeard);
+        qInfo("mixed: %.1f LUFS (reference as played %.1f), spectrum %.2f dB apart, volume %+.1f dB", mixedLufs, filePlan.referenceLufs - 2,
+              mixedApart, gain);
+        QVERIFY(std::fabs(mixedLufs - (filePlan.referenceLufs - 2)) < 0.3);
+        // (the mixer plays exactly what the plan made offline, at the reference's volume as well)
+        const auto offline = speechSpectrum(withDialogueMatch(adrPlayed, sr, filePlan), sr), mixedSpectrum = speechSpectrum(left, sr);
+        for (size_t k = 0; k < offline.size(); ++k) QVERIFY(std::fabs(mixedSpectrum[k] - offline[k] + 2) < 0.1);
+        QVERIFY(mixedApart < 1.3);
+        // Matching again replaces the match.
+        QVERIFY(!call({{"project", project}, {"reference", double(ref)}, {"clips", QJsonArray{double(target)}}, {"tone_over_time", true}})
+                     .value("isError")
+                     .toBool());
+        QVERIFY(loadProject(project.toStdString(), back));
+        c = edit::clipById(*back.active(), target);
+        QVERIFY(c && c->effects.size() == 2 && c->effects[0].params.at("low_db").keys.size() >= 15);
     }
 
     void beatsAndFittingMusic() {

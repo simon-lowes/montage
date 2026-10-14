@@ -100,6 +100,7 @@
 #include "render/AutoBroll.h"
 #include "render/Highlights.h"
 #include "render/MusicEdit.h"
+#include "render/DialogueMatch.h"
 #include "render/VoiceMatch.h"
 #include "media/Analysis.h"
 #include "media/AutoDuck.h"
@@ -4738,6 +4739,53 @@ void McpServer::Impl::addTools() {
             if (n == 0) return fail("No clips to match");
             save(l);
             return ok(QStringLiteral("Matched %1 clip(s) to %2").arg(n).arg(QString::fromStdString(ref.name)), QJsonObject{{"clips", out}});
+        });
+
+    add("montage_match_dialogue", "Match dialogue to a reference",
+        "Make ADR or a pickup sound like the production take it sits with (the reference clip): the reference's room is "
+        "measured from its speech (decay time per octave) and added as a Convolution Reverb at the level that leaves as "
+        "much late reverberation as the reference has; a Parametric EQ is fitted to the result (with tone_over_time, "
+        "refitted every half second and keyed); the clip volume brings the speech to the reference's loudness. Matching "
+        "again replaces the earlier match (and a Match Voice EQ).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"reference":{"type":"number","description":"The production take"},
+            "clips":{"type":"array","items":{"type":"number"}},"room":{"type":"boolean","default":true},"tone":{"type":"boolean","default":true},
+            "tone_over_time":{"type":"boolean","default":false},"level":{"type":"boolean","default":true}},
+            "required":["project","reference","clips"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Clip& ref = clipArg(l, a, "reference");
+            DialogueMatchOptions o;
+            o.room = a.value("room").toBool(true);
+            o.tone = a.value("tone").toBool(true);
+            o.toneOverTime = a.value("tone_over_time").toBool(false);
+            o.level = a.value("level").toBool(true);
+            std::vector<Id> ids;
+            for (const QJsonValue& v : a.value("clips").toArray()) {
+                const Clip* c = edit::clipById(s, Id(v.toDouble()));
+                auto loc = c ? edit::locate(s, c->id) : std::nullopt;
+                if (!c || !loc || loc->track.kind != TrackKind::Audio || c->id == ref.id)
+                    throw ArgError{QStringLiteral("%1 is not an audio clip other than the reference").arg(v.toDouble())};
+                ids.push_back(c->id);
+            }
+            std::vector<std::pair<Id, DialogueMatchPlan>> plans;
+            std::string err;
+            const QString refName = QString::fromStdString(ref.name);
+            const int n = matchDialogue(l.project, s, ref.id, ids, o, &plans, &err);
+            if (n == 0) return fail(err.empty() ? QStringLiteral("No clips to match") : QString::fromStdString(err));
+            save(l);
+            QJsonArray out;
+            for (const auto& [id, plan] : plans) {
+                QJsonArray rt;
+                for (double t : plan.room.rt60) rt.append(t);
+                out.append(QJsonObject{{"clip", double(id)}, {"room_added", plan.roomAdded}, {"rt60", rt},
+                                       {"room_level_db", plan.wetDb}, {"late_reverb_db", plan.matchedLateDb},
+                                       {"reference_late_reverb_db", plan.referenceLateDb}, {"eq_keys", int(plan.eqOverTime.size())},
+                                       {"low_db", plan.eq.lowDb}, {"b300_db", plan.eq.b1Db}, {"b1200_db", plan.eq.b2Db},
+                                       {"b4000_db", plan.eq.b3Db}, {"high_db", plan.eq.highDb}, {"gain_db", plan.gainDb},
+                                       {"loudness_lufs", plan.matchedLufs}, {"reference_loudness_lufs", plan.referenceLufs}});
+            }
+            return ok(QStringLiteral("Matched %1 clip(s) to %2").arg(n).arg(refName), QJsonObject{{"clips", out}});
         });
 
     add("montage_set_surround", "Set up a surround mix",

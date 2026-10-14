@@ -38,6 +38,9 @@ void dereverb(const AudioBuffer& in, AudioBuffer& out, double amount, double rev
               const std::atomic<bool>* cancel = nullptr);
 // The room's reverberation time (RT60, seconds) from the fastest free decays in the sound; 0 if none was found.
 double estimateReverbTime(const AudioBuffer& in);
+// The same from a level already measured in 10 ms steps (dB): the lower quartile of the T20-style falls after loud
+// moments; 0 if fewer than three were found.
+double reverbTimeFromLevels(const std::vector<double>& level);
 
 // Keeps speech and removes everything else with RNNoise (Xiph, BSD), mixed
 // with the original by `amount` (0..100). False if unavailable.

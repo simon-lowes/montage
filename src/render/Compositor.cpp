@@ -34,6 +34,7 @@
 #include "TemporalFx.h"
 #include "VideoDenoise.h"
 #include "audio/PluginEffect.h"
+#include "audio/RoomResponse.h"
 #include "audio/SpeechCleanup.h"
 #include "audio/TimeStretch.h"
 #include "core/ProjectIO.h"
@@ -2319,6 +2320,10 @@ struct AudioMixer::State {
     bool pluginFailed = false;
     std::string pluginState;  // the effect's saved state the plugin last loaded
     std::vector<float> planar, keyPlanar;
+    // Convolution Reverb: each side's room, and what it was built from.
+    Convolver roomL, roomR;
+    std::string roomKey;
+    std::vector<float> roomOut;
 };
 
 namespace {
@@ -2571,6 +2576,32 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
         } else if (e.type == "reverb") {
             st->reverb.process(buf, frames, sr, e.p("size", lt, 50) / 100, e.p("damping", lt, 50) / 100, e.p("width", lt, 100) / 100,
                                e.p("mix", lt, 25) / 100);
+        } else if (e.type == "convolution_reverb") {
+            static const char* kRt[kRoomBands] = {"rt_125", "rt_250", "rt_500", "rt_1k", "rt_2k", "rt_4k", "rt_8k"};
+            RoomShape room;
+            std::string key = std::to_string(int(sr)) + "|" + e.s("ir");
+            for (int b = 0; b < kRoomBands; ++b) {
+                room.rt60[size_t(b)] = std::clamp(e.p(kRt[b], lt, room.rt60[size_t(b)]), 0.1, 10.0);
+                key += "|" + std::to_string(std::lround(room.rt60[size_t(b)] * 100));
+            }
+            room.predelayMs = std::clamp(e.p("predelay_ms", lt, 12), 0.0, 200.0);
+            key += "|" + std::to_string(std::lround(room.predelayMs));
+            if (key != st->roomKey) {
+                std::vector<float> l, r;
+                if (!e.s("ir").empty() && loadImpulseResponse(e.s("ir"), int(sr), l, r)) {
+                    const size_t pre = size_t(room.predelayMs * 1e-3 * sr);
+                    l.insert(l.begin(), pre, 0.0f), r.insert(r.begin(), pre, 0.0f);
+                } else {
+                    l = roomImpulse(int(sr), room, 1), r = roomImpulse(int(sr), room, 2);
+                }
+                st->roomL.setImpulse(l), st->roomR.setImpulse(r);
+                st->roomKey = key;
+            }
+            const float wet = dbToLin(e.p("wet_db", lt, -12)), dry = dbToLin(e.p("dry_db", lt, 0));
+            st->roomOut.resize(size_t(frames) * 2);
+            st->roomL.process(buf, st->roomOut.data(), frames, 2);
+            st->roomR.process(buf + 1, st->roomOut.data() + 1, frames, 2);
+            for (size_t i = 0; i < size_t(frames) * 2; ++i) buf[i] = buf[i] * dry + st->roomOut[i] * wet;
         } else if (e.type == "multiband") {
             fx::BandSettings b[3];
             const char* names[3] = {"low", "mid", "high"};

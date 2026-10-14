@@ -1485,6 +1485,8 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Fit to Fill"), QKeySequence(), [this] { fitToFill(); })->setObjectName(QStringLiteral("fitToFill"));
     add(clipM, tr("Set Voice Reference"), QKeySequence(), [this] { setVoiceReference(); })->setObjectName(QStringLiteral("setVoiceReference"));
     add(clipM, tr("Match Voice to Reference"), QKeySequence(), [this] { matchVoice(); })->setObjectName(QStringLiteral("matchVoice"));
+    add(clipM, tr("Match Dialogue to Reference..."), QKeySequence(), [this] { matchDialogueDialog(); })
+        ->setObjectName(QStringLiteral("matchDialogue"));
     add(clipM, tr("Convert Voice…"), QKeySequence(), [this] {
         const Sequence* s = state_->sequence();
         const Id clip = s ? voiceConversionClip(state_->project(), *s, state_->selectedClips()) : 0;
@@ -4883,6 +4885,7 @@ bool MainWindow::setVoiceReference() {
         return false;
     voiceRef_ = spectrum;
     voiceRefName_ = name;
+    voiceRefClip_ = clip;
     state_->message(tr("Voice reference: %1. Select dialogue clips and choose Match Voice to Reference.").arg(name), 6000);
     return true;
 }
@@ -4926,6 +4929,89 @@ int MainWindow::matchVoice() {
     state_->message(tr("Matched %n clip(s) to %1", "", int(fits.size())).arg(voiceRefName_), 5000);
     inspectorDock_->raise();
     return int(fits.size());
+}
+
+int MainWindow::matchDialogue(const DialogueMatchOptions& o, bool roomTone) {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    const Clip* ref = voiceRefClip_ ? edit::clipById(*s, voiceRefClip_) : nullptr;
+    if (!ref) {
+        state_->message(tr("Select the production take and choose Clip › Set Voice Reference first"), 5000);
+        return 0;
+    }
+    std::vector<Id> clips;
+    for (Id id : state_->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Audio && id != ref->id) clips.push_back(id);
+    if (clips.empty()) {
+        state_->message(tr("Select the audio clips to match"));
+        return 0;
+    }
+    auto project = std::make_shared<Project>(state_->project());
+    const Id seqId = s->id, refId = ref->id;
+    std::vector<std::pair<Id, DialogueMatchPlan>> plans;
+    if (!runWithProgress(this, state_, tr("Matching dialogue..."), [&, project](const auto& progress, const auto* cancel, std::string* err) {
+            Sequence* sq = project->findSequence(seqId);
+            return sq && montage::matchDialogue(*project, *sq, refId, clips, o, &plans, err, progress, cancel) > 0;
+        }))
+        return 0;
+    state_->edit(tr("Match Dialogue"), [&](Project& p, Sequence& sq) {
+        for (const auto& [id, plan] : plans)
+            if (Clip* k = edit::clipById(sq, id)) applyDialogueMatch(p, sq, *k, plan, o);
+        return true;
+    });
+    // Room tone under each, on the first audio track below it that is free there (a new one if none is).
+    if (roomTone)
+        for (const auto& [id, plan] : plans) {
+            const Sequence* sq = state_->sequence();
+            auto loc = sq ? edit::locate(*sq, id) : std::nullopt;
+            const Clip* k = sq ? edit::clipById(*sq, id) : nullptr;
+            if (!loc || !k) continue;
+            const FrameTime from = k->start, to = k->end();
+            int under = -1;
+            for (int j = loc->track.index + 1; j < int(sq->audioTracks.size()) && under < 0; ++j) {
+                TrackGap gap;
+                if (gapAt(*sq, {TrackKind::Audio, j}, from, gap) && gap.end >= to) under = j;
+            }
+            if (under < 0) {
+                state_->edit(tr("Add Track"), [&](Project& p, Sequence& q) {
+                    q.audioTracks.push_back(makeTrack(p, TrackKind::Audio, "A" + std::to_string(q.audioTracks.size() + 1)));
+                    under = int(q.audioTracks.size()) - 1;
+                    return true;
+                });
+            }
+            if (under >= 0) fillRoomTone({TrackKind::Audio, under}, from, to, refId);
+        }
+    state_->message(tr("Matched %n clip(s) to %1", "", int(plans.size())).arg(QString::fromStdString(ref->name)), 5000);
+    inspectorDock_->raise();
+    return int(plans.size());
+}
+
+void MainWindow::matchDialogueDialog() {
+    QDialog d(this);
+    d.setWindowTitle(tr("Match Dialogue to Reference"));
+    auto* form = new QVBoxLayout(&d);
+    form->addWidget(new QLabel(tr("Make the selected clips sound like the voice reference (the production take):"), &d));
+    auto box = [&](const QString& text, const char* name, bool on) {
+        auto* b = new QCheckBox(text, &d);
+        b->setObjectName(QLatin1String(name));
+        b->setChecked(on);
+        form->addWidget(b);
+        return b;
+    };
+    QCheckBox* room = box(tr("Room: its reverberation"), "room", true);
+    QCheckBox* tone = box(tr("Tone: its EQ"), "tone", true);
+    QCheckBox* overTime = box(tr("Follow its tone over time"), "toneOverTime", false);
+    QCheckBox* level = box(tr("Level: its loudness"), "level", true);
+    QCheckBox* fill = box(tr("Room tone under each clip"), "roomTone", false);
+    connect(tone, &QCheckBox::toggled, overTime, &QWidget::setEnabled);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &d);
+    connect(buttons, &QDialogButtonBox::accepted, &d, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &d, &QDialog::reject);
+    form->addWidget(buttons);
+    if (d.exec() != QDialog::Accepted) return;
+    DialogueMatchOptions o;
+    o.room = room->isChecked(), o.tone = tone->isChecked(), o.toneOverTime = o.tone && overTime->isChecked(), o.level = level->isChecked();
+    matchDialogue(o, fill->isChecked());
 }
 
 int MainWindow::addBeatMarkers(bool everyBeat) {

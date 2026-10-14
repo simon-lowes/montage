@@ -24,6 +24,7 @@
 #include "render/Imf.h"
 #include "render/Jpeg2000.h"
 #include "render/ExtendClip.h"
+#include "render/DialogueMatch.h"
 #include "render/RoomTone.h"
 #include "render/Versions.h"
 
@@ -131,6 +132,11 @@ public:
     bool setVoiceReference();
     bool hasVoiceReference() const { return !voiceRef_.empty(); }
     int matchVoice();
+    // Dialogue Match (render/DialogueMatch.h): the selected audio clips made to sound like the voice reference's clip
+    // (the production take): its room, tone and level, and with `roomTone` its room tone on a track under each.
+    // Returns how many were matched. The dialog asks which first.
+    int matchDialogue(const DialogueMatchOptions& o, bool roomTone = false);
+    void matchDialogueDialog();
     int addBeatMarkers(bool everyBeat);
     int cutMediaToBeat(int every, bool bars);  // the bin's selected media, cut on the music clip's beats
     Id makeHighlights(double seconds, const QString& lookFor = {});  // a new Highlights sequence; its id, or 0
@@ -578,6 +584,7 @@ private:
     QImage colourRefView_;  // the reference at display size, for the compare
     std::vector<double> voiceRef_;  // Match Voice's reference spectrum
     QString voiceRefName_;
+    Id voiceRefClip_ = 0;  // and its clip, for Dialogue Match
     QAction* compareRef_ = nullptr;
     QAction* trimView_ = nullptr;  // Playback › Two-Up Trim View
     class ReviewOverlay* reviewOverlay_ = nullptr;  // reviewers' drawings over the Program monitor
