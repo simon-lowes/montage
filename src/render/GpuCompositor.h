@@ -37,7 +37,8 @@ struct ColorOp {
     // a grade node's mask and mix. A grade graph's other nodes keep pictures and keys in numbered slots: Store keeps
     // the picture in `slot`, Load takes it up again, and Pass draws gpucolor.frag's `passMode` from the slots `in`
     // (its source, table and mask; -1 for none) into the slot `out`, leaving the picture as it is.)
-    // (ChromaKey, LumaKey and ScreenKey change the alpha too: render/Processing's keyers, gpucolor.frag's 18 to 20.)
+    // (ChromaKey, LumaKey and ScreenKey change the alpha too: render/Processing's keyers, gpucolor.frag's 18 to 20;
+    // a ScreenKey whose params[10] or [11] are set has its matte shrunk or grown and blurred by passes of its own.)
     enum Kind { Lut, ColorCorrect, Curves, HueCurves, Cdl, Invert, BlackWhite, HueSat, Levels, Mark, Mix, Store, Load, Pass, ChromaKey, LumaKey, ScreenKey } kind = Lut;
     int slot = 0;                // Store, Load
     int passMode = 0;            // Pass

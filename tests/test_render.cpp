@@ -6906,8 +6906,8 @@ colorspaces:
         compare(20, o, "outside node");
         QCOMPARE(gpu::stats().cpuLayers, 0L);
         // The keyers, which change the alpha too, on V1 (V2 over it, the gaps black): a chroma key (its matte shown, then
-        // the result), a luma key through a drawn mask, and a screen key (the result, its matte and its status view); a
-        // screen key with a softened matte is the CPU's.
+        // the result), a luma key through a drawn mask, and a screen key (the result, its matte and its status view, then
+        // its matte shrunk, grown and softened, each changing the picture).
         Clip& under = s.videoTracks[0].clips[0];
         auto keyedAway = [&](const QString& what) {  // (the keyer took some of the picture away: the test means something)
             RenderOptions c = o;
@@ -6950,11 +6950,58 @@ colorspaces:
         }
         under.effects.back().params["view"] = 0.0;
         keyedAway("screen key");
-        under.effects.back().params["soften"] = 6.0;
+        auto changes = [&](const QString& what, const Effect& before) {  // (the matte step did something)
+            RenderOptions c = o;
+            c.gpu = false;
+            const Image with = renderProgramFrame(p, s, 20, c);
+            const Effect now = under.effects.back();
+            under.effects.back() = before;
+            const Image without = renderProgramFrame(p, s, 20, c);
+            under.effects.back() = now;
+            double diff = 0;
+            for (size_t i = 0; i < with.px.size(); ++i) diff += std::fabs(with.px[i] - without.px[i]);
+            QVERIFY2(diff / double(with.px.size()) > 1e-3, qPrintable(what));
+        };
+        const Effect plain = under.effects.back();
+        const std::vector<std::pair<double, double>> morphs = {{3, 0}, {-2, 0}, {0, 6}, {-2, 9}};
+        for (const auto& [shrink, soften] : morphs)
+            for (int view : {0, 1, 2}) {
+                under.effects.back() = plain;
+                under.effects.back().params["shrink"] = shrink, under.effects.back().params["soften"] = soften;
+                under.effects.back().params["view"] = double(view);
+                const QString what = QString("screen key shrink %1 soften %2 view %3").arg(shrink).arg(soften).arg(view);
+                gpu::resetStats();
+                compare(20, o, what);
+                QCOMPARE(gpu::stats().cpuLayers, 0L);
+                Effect same = under.effects.back();
+                same.params["shrink"] = 0.0, same.params["soften"] = 0.0;
+                changes(what, same);
+            }
+        under.effects.back() = plain;
+        under.effects.back().params["soften"] = 6.0, under.effects.back().params["mask.shape"] = 2.0;
         gpu::resetStats();
-        compare(20, o, "screen key softened");
-        QVERIFY(gpu::stats().cpuLayers > 0);
+        compare(20, o, "screen key softened through a mask");
+        QCOMPARE(gpu::stats().cpuLayers, 0L);
+        // At half size the radii are halved before rounding (shrink 3 to 2, soften 5 to a blur of 1).
+        under.effects.back() = plain;
+        under.effects.back().params["shrink"] = 3.0, under.effects.back().params["soften"] = 5.0;
+        RenderOptions halfSize = o;
+        halfSize.scale = 0.5;
+        gpu::resetStats();
+        compare(20, halfSize, "screen key shrunk and softened at half size");
+        QCOMPARE(gpu::stats().cpuLayers, 0L);
         under.effects.pop_back();
+        // On V2's picture, partly transparent, after its grade.
+        Effect onTop = plain;
+        onTop.params["shrink"] = -2.0, onTop.params["soften"] = 4.0;
+        edit::clipById(s, topId)->effects.push_back(onTop);
+        for (int view : {0, 1, 2}) {
+            edit::clipById(s, topId)->effects.back().params["view"] = double(view);
+            gpu::resetStats();
+            compare(20, o, QString("screen key on a transparent picture, view %1").arg(view));
+            QCOMPARE(gpu::stats().cpuLayers, 0L);
+        }
+        edit::clipById(s, topId)->effects.pop_back();
         // An HDR sequence seen on an SDR display.
         s.colorSpace = "rec2100pq";
         o.displaySpace = "rec709";

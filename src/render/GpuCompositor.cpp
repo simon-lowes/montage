@@ -652,6 +652,37 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
                 textures.push_back({4, table});
             }
         }
+        if (op.kind == ColorOp::ScreenKey && (op.params[10] != 0 || op.params[11] != 0)) {
+            // Its matte first, shrunk or grown and softened as render/Processing's screenKey does (gpucolor.frag's
+            // 21 to 23), then read from the table.
+            QRhiTexture* matte = texture(T::RGBA32F, size.width(), size.height(), true);
+            if (!matte) return nullptr;
+            float q[64] = {};
+            std::copy(p, p + 64, q);
+            q[0] = 21;
+            pass(colorPs_, matte, u, {{1, cur}}, uniforms(u, q));
+            u = rhi_->nextResourceUpdateBatch();
+            auto step = [&](int mode, int radius, bool maximum, bool column) {
+                QRhiTexture* made = texture(T::RGBA32F, size.width(), size.height(), true);
+                if (!made) return false;
+                std::fill(q, q + 64, 0.0f);
+                q[0] = float(mode), q[4] = float(radius), q[5] = maximum ? 1 : 0, q[6] = column ? 1 : 0;
+                pass(colorPs_, made, u, {{1, matte}}, uniforms(u, q));
+                u = rhi_->nextResourceUpdateBatch();
+                release(matte);
+                matte = made;
+                return true;
+            };
+            const int shrink = int(op.params[10]), blur = int(op.params[11]);
+            bool made = true;
+            if (shrink != 0) made = step(22, std::abs(shrink), shrink < 0, false) && step(22, std::abs(shrink), shrink < 0, true);
+            for (int k = 0; made && blur > 0 && k < 3; ++k) made = step(23, blur, false, false) && step(23, blur, false, true);
+            if (!made) {
+                release(matte);
+                return nullptr;
+            }
+            textures.push_back({4, matte});  // (let go after the pass, as tables are)
+        }
         if (op.masked) {
             p[48] = 1;  // p[12].x
             std::copy(op.maskParams, op.maskParams + 12, p + 52);
