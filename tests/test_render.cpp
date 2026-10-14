@@ -6307,9 +6307,17 @@ colorspaces:
         QVERIFY2(same < 25 && next > same * 2, (std::to_string(same) + " " + std::to_string(next)).c_str());
         const std::vector<StreamTag> tags = rx.tags();
         QVERIFY(tags.size() >= 50);
-        int forward = 0;
-        for (size_t i = 1; i < tags.size(); ++i) forward += tags[i].frame > tags[i - 1].frame;
-        QVERIFY2(forward >= int(tags.size()) * 8 / 10, std::to_string(forward).c_str());
+        // In order, and keeping up with the playhead. Not every picture a new frame: the output's clock and the
+        // playhead's are not the same, so where their ticks fall close together a frame shows twice and the next is
+        // passed over, and a busy machine skips pictures it could not encode in time.
+        int backwards = 0, repeated = 0;
+        for (size_t i = 1; i < tags.size(); ++i) {
+            backwards += tags[i].frame < tags[i - 1].frame;
+            repeated += tags[i].frame == tags[i - 1].frame;
+        }
+        const double step = double(tags.back().frame - tags.front().frame) / double(tags.size() - 1);
+        qInfo("Pictures: %d, %d repeated, %.2f frames apart", int(tags.size()), repeated, step);
+        QVERIFY2(backwards <= 2 && step > 0.6 && step < 4, (std::to_string(backwards) + " " + std::to_string(step)).c_str());
         // Latency here: the frame a picture shows against the playhead as it arrives.
         std::vector<int> lags;
         int64_t seen = rx.status().pictures;
