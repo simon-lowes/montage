@@ -14776,7 +14776,7 @@ print("added " + ui["name"])
         viewer->findChild<QLineEdit*>("reviewAddress")->setText(QStringLiteral("srt://127.0.0.1:%1").arg(port));
         viewer->findChild<QLineEdit*>("reviewPassphrase")->setText(pass);
         viewer->findChild<QLineEdit*>("reviewAuthor")->setText(QStringLiteral("Ana"));
-        viewer->findChild<QSpinBox*>("reviewMarkersPort")->setValue(markersPort);
+        viewer->findChild<QLineEdit*>("reviewMarkersTo")->setText(QStringLiteral("127.0.0.1:%1").arg(markersPort));
         viewer->findChild<QPushButton*>("reviewConnect")->click();
         QTRY_VERIFY_WITH_TIMEOUT(viewer->shownTag().frame == 10, 20000);
         const Rational fps = state()->sequence()->fps;
@@ -14803,7 +14803,7 @@ print("added " + ui["name"])
         QCOMPARE(state()->sequence()->markers.size(), before);
         // A wrong passphrase gets nothing through.
         QString err;
-        output::RemoteMarker m{40, 0, "", "Eve", "Let me in", "", ""};
+        output::RemoteMarker m{40, 0, 0, "", "Eve", "Let me in", "", ""};
         std::string swhy;
         QVERIFY(!output::sendRemoteMarkers("127.0.0.1", markersPort, "the wrong passphrase", {m}, &swhy));
         QTest::qWait(400);

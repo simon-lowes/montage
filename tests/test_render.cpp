@@ -51,6 +51,8 @@
 #include "core/History.h"
 #include <QTcpServer>
 #include <QUdpSocket>
+#include <QTcpSocket>
+#include <thread>
 #include <QPainter>
 #include <QElapsedTimer>
 #include "core/ScriptCut.h"
@@ -6167,11 +6169,11 @@ colorspaces:
         QCOMPARE(markersPortFor(lan), -1);
 
         // The tag each picture carries, as written and as x265 writes it (after a UUID of its own).
-        StreamTag tag{1234, "00:00:49:09", {25, 1}};
+        StreamTag tag{1234, "00:00:49:09", {25, 1}, 7};
         std::vector<uint8_t> sei = streamTagPayload(tag);
         StreamTag back;
         QVERIFY(parseStreamTag(sei.data(), sei.size(), back));
-        QVERIFY(back.frame == 1234 && back.timecode == "00:00:49:09" && back.fps == (Rational{25, 1}));
+        QVERIFY(back.frame == 1234 && back.timecode == "00:00:49:09" && back.fps == (Rational{25, 1}) && back.sequence == 7);
         std::vector<uint8_t> x265(16, 0x2c);
         x265.insert(x265.end(), sei.begin(), sei.end());
         QVERIFY(parseStreamTag(x265.data(), x265.size(), back) && back.frame == 1234);
@@ -6233,6 +6235,7 @@ colorspaces:
                 const FrameTime t = 100 + clock.elapsed() * 25 / 1000;
                 sched.setPosition(t, 1);
                 playhead = t;
+                (void)sched.stats();  // (read while it streams, as the panel does)
                 while (submitted < t + 3) sched.submit(++submitted, ramp(submitted));
                 QThread::msleep(5);
             }
@@ -6247,6 +6250,7 @@ colorspaces:
         srt.bitrateKbps = 6000;
         srt.markersPort = freeTcp();
         stream->setSettings(srt);
+        stream->setSequence(s.id);
         Device dev = stream->devices()[0];
         const Mode mode{"stream", 320, 180, {25, 1}, false, 0};
         Config cfg;
@@ -6279,7 +6283,7 @@ colorspaces:
         QVERIFY(rx.status().audio);
         ReviewReceiver::Picture pic;
         QVERIFY(rx.latest(pic));
-        QVERIFY(pic.tagged && pic.tag.fps == (Rational{25, 1}) && pic.tag.frame >= 100);
+        QVERIFY(pic.tagged && pic.tag.fps == (Rational{25, 1}) && pic.tag.frame >= 100 && pic.tag.sequence == s.id);
         QCOMPARE(QString::fromStdString(pic.tag.timecode), QString::fromStdString(formatTimecode(pic.tag.frame, {25, 1}, true)));
         int off = 0, fine = 0;
         for (int x = 0; x < 320; ++x) {
@@ -6348,12 +6352,36 @@ colorspaces:
         QVERIFY(!sendRemoteMarkers("127.0.0.1", srt.markersPort, "not the passphrase", {note}, &why));
         QVERIFY2(QString::fromStdString(why).contains("passphrase"), why.c_str());
         QVERIFY(stream->takeMarkers().empty());
-        QVERIFY2(sendRemoteMarkers("127.0.0.1", srt.markersPort, srt.passphrase, {note, RemoteMarker{note.frame + 25, 10, "", "Bob", "Too long"}}, &why), why.c_str());
+        QVERIFY2(sendRemoteMarkers("127.0.0.1", srt.markersPort, srt.passphrase, {note, RemoteMarker{note.frame + 25, 10, 0, "", "Bob", "Too long"}}, &why), why.c_str());
         const std::vector<RemoteMarker> got = stream->takeMarkers();
         QCOMPARE(got.size(), size_t(2));
         QVERIFY(got[0].frame == note.frame && got[0].author == "Ana" && got[0].text == note.text && got[0].timecode == note.timecode);
         QVERIFY(got[1].frame == note.frame + 25 && got[1].duration == 10);
         QCOMPARE(stream->stats().markers, 2);
+        // A channel that cannot show it has the passphrase is not sent to.
+        {
+            QTcpServer fake;
+            QVERIFY(fake.listen(QHostAddress::LocalHost, 0));
+            std::string fakeWhy;
+            bool sent = true;
+            std::thread client([&] { sent = sendRemoteMarkers("127.0.0.1", fake.serverPort(), srt.passphrase, {note}, &fakeWhy, 5000); });
+            if (!fake.waitForNewConnection(5000)) {
+                client.join();
+                QFAIL("The client did not call");
+            }
+            QTcpSocket* c = fake.nextPendingConnection();
+            c->write(QJsonDocument(QJsonObject{{"montage", "review"}, {"version", 2}, {"salt", "00112233445566778899aabbccddeeff"}, {"iterations", 10000},
+                                               {"nonce", "0123456789abcdef0123456789abcdef"}}).toJson(QJsonDocument::Compact) + '\n');
+            c->flush();
+            while (!c->canReadLine() && c->waitForReadyRead(5000)) {
+            }
+            c->readLine();
+            c->write(QJsonDocument(QJsonObject{{"ok", true}, {"proof", "00"}}).toJson(QJsonDocument::Compact) + '\n');
+            c->flush();
+            client.join();
+            QVERIFY(!sent);
+            QVERIFY2(QString::fromStdString(fakeWhy).contains("could not show"), fakeWhy.c_str());
+        }
 
         // The viewer leaves; another can call in.
         rx.stop();

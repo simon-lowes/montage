@@ -565,9 +565,8 @@ void PlaybackController::syncOutput() {
 double PlaybackController::renderScale() const {
     // While output is on: the mode's size playing (a UHD sequence on a 1080p mode at half); parked, the whole picture
     // or more, as the viewer and scopes show it.
-    double out = 0;
-    for (const auto& o : {output_, review_})
-        if (o && o->running()) out = std::max(out, o->renderScale());
+    // (the reference output's size first: a review stream takes what it renders, fitted)
+    const double out = output_ && output_->running() ? output_->renderScale() : review_ && review_->running() ? review_->renderScale() : 0;
     if (out > 0) return isPlaying() ? out : std::max(1.0, out);
     return isPlaying() ? scale_ : 1.0;
 }

@@ -47,7 +47,8 @@ int markersPortFor(const StreamSettings& s);
 struct StreamTag {
     FrameTime frame = -1;
     std::string timecode;  // "01:00:10:05" (";" before the frames in drop frame)
-    Rational fps{0, 1};    // the sequence's
+    Rational fps{0, 1};    // the stream's (a sequence goes out at its own rate)
+    Id sequence = 0;       // the sequence streamed
 };
 // SEI user data (unregistered): Montage's UUID, then the tag as JSON.
 std::vector<uint8_t> streamTagPayload(const StreamTag& t);
@@ -71,6 +72,7 @@ void burnTimecode(Planes420& p, const std::string& text);
 // A marker a reviewer sent.
 struct RemoteMarker {
     FrameTime frame = 0, duration = 0;
+    Id sequence = 0;  // the stream tag's (0: the one streamed now)
     std::string timecode, author, text, drawing, id;  // drawing: core/ReviewPage.h's JSON ("" none)
 };
 
@@ -83,6 +85,8 @@ public:
     std::vector<Device> devices() override;
     // Taken by the next `open`.
     void setSettings(const StreamSettings& s);
+    // The sequence each picture's tag names.
+    void setSequence(Id id);
     StreamSettings settings() const;
     bool open(const Device& device, const Mode& mode, const Signal& signal, int audioChannels, int audioRate,
               std::string* error) override;
@@ -154,8 +158,9 @@ private:
     std::unique_ptr<Impl> d_;
 };
 
-// Sends markers to a Montage that streams (its marker channel at `host`:`port`), answering its challenge with the
-// passphrase; false and why when it would not take them.
+// Sends markers to a Montage that streams (its marker channel at `host`:`port`): each side proves it has the
+// passphrase (a key derived from it, never the passphrase itself), and each marker is signed. False and why when it
+// would not take them, or could not prove it has the passphrase.
 bool sendRemoteMarkers(const std::string& host, int port, const std::string& passphrase, const std::vector<RemoteMarker>& markers,
                        std::string* error = nullptr, int timeoutMs = 5000);
 

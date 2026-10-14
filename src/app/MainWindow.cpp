@@ -2428,34 +2428,42 @@ void MainWindow::showRemoteReview() {
 }
 
 int MainWindow::applyRemoteMarkers(Id sequence, const std::vector<output::RemoteMarker>& markers) {
-    // As review notes (core/ReviewPage.h): named after the reviewer, in their colour, their note as the comment.
-    std::vector<ReviewNote> notes;
+    // As review notes (core/ReviewPage.h): named after the reviewer, in their colour, their note as the comment, on
+    // the sequence the picture they marked was from (when it is still in the project), kept within it.
     const std::string now = QDateTime::currentDateTimeUtc().toString(Qt::ISODate).toStdString();
+    std::map<Id, std::vector<ReviewNote>> bySequence;
     for (const output::RemoteMarker& m : markers) {
+        const Id seq = m.sequence && state_->project().findSequence(m.sequence) ? m.sequence : sequence;
+        const Sequence* s = state_->project().findSequence(seq);
+        if (!s) continue;
+        const FrameTime end = std::max<FrameTime>(1, s->duration());
         ReviewNote n;
-        n.frame = m.frame;
-        n.duration = m.duration;
+        n.frame = std::clamp<FrameTime>(m.frame, 0, end - 1);
+        n.duration = std::clamp<FrameTime>(m.duration, 0, end - n.frame);
         n.author = m.author.empty() ? tr("Reviewer").toStdString() : m.author;
         n.text = m.text;
         n.drawing = m.drawing.empty() ? std::string() : reviewDrawingJson(parseReviewDrawing(m.drawing));
-        n.id = m.id.empty() ? "live-" + QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString() : m.id;
+        // (kept apart from review notes imported from files, which a live note must not overwrite)
+        n.id = "live-" + (m.id.empty() ? QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString() : m.id);
         n.statusAt = now;
-        notes.push_back(std::move(n));
+        bySequence[seq].push_back(std::move(n));
     }
-    const std::vector<Marker> made = reviewNotesToMarkers(notes);
+    if (bySequence.empty()) return 0;
     MarkerImport result;
-    const bool done = state_->edit(tr("Markers from Remote Review"), [&](Project& p, Sequence& active) {
-        Sequence* s = active.id == sequence ? &active : p.findSequence(sequence);
-        if (!s) return false;
-        result = addImportedMarkers(*s, made);
+    state_->edit(tr("Markers from Remote Review"), [&](Project& p, Sequence&) {
+        for (const auto& [id, notes] : bySequence)
+            if (Sequence* s = p.findSequence(id)) {
+                const MarkerImport r = addImportedMarkers(*s, reviewNotesToMarkers(notes));
+                result.added += r.added;
+                result.updated += r.updated;
+            }
         return true;
     });
-    if (!done) return 0;
-    const Sequence* s = state_->project().findSequence(sequence);
-    const output::RemoteMarker& last = markers.back();
+    const ReviewNote& last = std::prev(bySequence.end())->second.back();
+    const Sequence* s = state_->project().findSequence(std::prev(bySequence.end())->first);
     statusBar()->showMessage(markers.size() == 1 ? tr("Marker from %1 at %2: %3")
-                                                       .arg(QString::fromStdString(notes.back().author),
-                                                            QString::fromStdString(s ? formatTimecode(last.frame, s->fps) : last.timecode),
+                                                       .arg(QString::fromStdString(last.author),
+                                                            QString::fromStdString(s ? formatTimecode(last.frame, s->fps) : std::string()),
                                                             QString::fromStdString(last.text))
                                                  : tr("%n marker(s) from remote review", nullptr, int(markers.size())),
                              8000);

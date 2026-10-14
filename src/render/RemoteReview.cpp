@@ -9,6 +9,7 @@
 #include <QJsonObject>
 #include <QMessageAuthenticationCode>
 #include <QNetworkProxy>
+#include <QPasswordDigestor>
 #include <QRandomGenerator>
 #include <QTcpServer>
 #include <QTcpSocket>
@@ -147,6 +148,7 @@ std::vector<uint8_t> streamTagPayload(const StreamTag& t) {
     o["f"] = qint64(t.frame);
     o["tc"] = QString::fromStdString(t.timecode);
     o["fps"] = QStringLiteral("%1/%2").arg(t.fps.num).arg(t.fps.den);
+    if (t.sequence) o["seq"] = qint64(t.sequence);
     const QByteArray json = QJsonDocument(o).toJson(QJsonDocument::Compact);
     std::vector<uint8_t> out(kTagUuid, kTagUuid + 16);
     out.insert(out.end(), json.begin(), json.end());
@@ -164,6 +166,7 @@ bool parseStreamTag(const uint8_t* data, size_t size, StreamTag& out) {
         out.timecode = o.value("tc").toString().toStdString();
         const QStringList fps = o.value("fps").toString().split('/');
         out.fps = fps.size() == 2 ? Rational{fps[0].toInt(), std::max(1, fps[1].toInt())} : Rational{0, 1};
+        out.sequence = Id(o.value("seq").toInteger(0));
         return out.frame >= 0;
     }
     return false;
@@ -248,15 +251,27 @@ void burnTimecode(Planes420& p, const std::string& text) {
 }
 
 // ---------------------------------------------------------------------------
-// The marker channel: JSON lines over TCP. Montage greets each client with a nonce; the client answers with the
-// nonce's HMAC-SHA256 under the passphrase; then each {"marker": {...}} line is taken and acknowledged.
+// The marker channel: JSON lines over TCP, the passphrase never sent. Montage greets each client with a salt, an
+// iteration count and a nonce; both sides derive a key from the passphrase (PBKDF2-HMAC-SHA256), the client proves it
+// has it over both nonces, Montage proves it back, and every marker after that carries a sequence number and an
+// HMAC under a key for that connection alone. The notes themselves are not encrypted.
 
 namespace {
 
 QByteArray line(const QJsonObject& o) { return QJsonDocument(o).toJson(QJsonDocument::Compact) + '\n'; }
 
-QByteArray authCode(const QByteArray& nonce, const std::string& passphrase) {
-    return QMessageAuthenticationCode::hash(nonce, QByteArray::fromStdString(passphrase), QCryptographicHash::Sha256).toHex();
+QByteArray mac(const QByteArray& key, const QByteArray& text) {
+    return QMessageAuthenticationCode::hash(text, key, QCryptographicHash::Sha256).toHex();
+}
+
+QByteArray markerKey(const std::string& passphrase, const QByteArray& salt, int iterations) {
+    return QPasswordDigestor::deriveKeyPbkdf2(QCryptographicHash::Sha256, QByteArray::fromStdString(passphrase), salt, iterations, 32);
+}
+
+QByteArray randomHex(int bytes) {
+    QByteArray b(bytes, '\0');
+    QRandomGenerator::system()->fillRange(reinterpret_cast<quint32*>(b.data()), bytes / 4);
+    return b.toHex();
 }
 
 bool sameBytes(const QByteArray& a, const QByteArray& b) {
@@ -267,16 +282,20 @@ bool sameBytes(const QByteArray& a, const QByteArray& b) {
 }
 
 constexpr qsizetype kMaxLine = 1 << 20;  // (a marker's drawing can be long)
+constexpr qsizetype kMaxGreeting = 1024;  // before the client has proved it has the passphrase
+constexpr int kIterations = 100000;
 
 class MarkerServer {
 public:
     MarkerServer(std::string passphrase, std::function<void(RemoteMarker)> take) : pass_(std::move(passphrase)), take_(std::move(take)) {}
     ~MarkerServer() { stop(); }
 
-    bool start(int port, std::string* error) {
+    bool start(const QHostAddress& host, int port, std::string* error) {
+        salt_ = QByteArray::fromHex(randomHex(16));
+        key_ = markerKey(pass_, salt_, kIterations);
         std::promise<std::string> started;
         std::future<std::string> result = started.get_future();
-        thread_ = std::thread([this, port, &started] { run(port, started); });
+        thread_ = std::thread([this, host, port, &started] { run(host, port, started); });
         const std::string why = result.get();
         if (!why.empty()) {
             thread_.join();
@@ -291,47 +310,55 @@ public:
         {
             std::lock_guard lock(m_);
             if (loop_) QMetaObject::invokeMethod(loop_, &QEventLoop::quit, Qt::QueuedConnection);
-            stopping_ = true;
         }
         thread_.join();
     }
 
 private:
-    void run(int port, std::promise<std::string>& started) {
+    void run(const QHostAddress& host, int port, std::promise<std::string>& started) {
         QEventLoop loop;
         QTcpServer server;
         server.setMaxPendingConnections(16);
-        if (!server.listen(QHostAddress::Any, quint16(port))) {
+        if (!server.listen(host, quint16(port))) {
             started.set_value("The marker channel cannot listen on port " + std::to_string(port) + ": " + server.errorString().toStdString());
             return;
         }
         QObject::connect(&server, &QTcpServer::newConnection, &server, [this, &server] {
             while (QTcpSocket* c = server.nextPendingConnection()) {
                 QObject::connect(c, &QTcpSocket::disconnected, c, &QObject::deleteLater);
-                if (server.findChildren<QTcpSocket*>().size() > 32) {
-                    c->disconnectFromHost();
+                const QString peer = c->peerAddress().toString();
+                // Strangers are kept few: a handful waiting to log in (from any one address, fewer), and none from an
+                // address that has guessed wrong too often.
+                int waiting = 0, fromPeer = 0;
+                for (QTcpSocket* o : server.findChildren<QTcpSocket*>())
+                    if (o != c && !o->property("authed").toBool()) {
+                        ++waiting;
+                        fromPeer += o->peerAddress().toString() == peer;
+                    }
+                if (waiting >= 16 || fromPeer >= 4 || failures_[peer] >= 10 || server.findChildren<QTcpSocket*>().size() > 48) {
+                    c->abort();
+                    c->deleteLater();
                     continue;
                 }
-                QByteArray nonce(16, '\0');
-                QRandomGenerator::system()->fillRange(reinterpret_cast<quint32*>(nonce.data()), 4);
-                const QByteArray hex = nonce.toHex();
-                c->setProperty("nonce", hex);
+                c->setReadBufferSize(kMaxLine + 4096);
+                const QByteArray nonce = randomHex(16);
+                c->setProperty("nonce", nonce);
                 c->setProperty("authed", false);
-                QJsonObject hello{{"montage", "review"}, {"version", 1}, {"nonce", QString::fromLatin1(hex)}};
-                c->write(line(hello));
+                c->setProperty("seq", 0);
+                c->write(line({{"montage", "review"}, {"version", 2}, {"salt", QString::fromLatin1(salt_.toHex())}, {"iterations", kIterations},
+                               {"nonce", QString::fromLatin1(nonce)}}));
                 QObject::connect(c, &QTcpSocket::readyRead, c, [this, c] { read(c); });
-                // A client that says nothing for a while is let go.
+                // Ten seconds to log in; then ten minutes' quiet at most.
                 auto* idle = new QTimer(c);
                 idle->setObjectName("idle");
                 idle->setSingleShot(true);
-                idle->start(600000);
-                QObject::connect(idle, &QTimer::timeout, c, [c] { c->disconnectFromHost(); });
+                idle->start(10000);
+                QObject::connect(idle, &QTimer::timeout, c, [c] { c->abort(); });
             }
         });
         {
             std::lock_guard lock(m_);
             loop_ = &loop;
-            if (stopping_) return;
         }
         started.set_value({});
         loop.exec();
@@ -339,57 +366,80 @@ private:
         loop_ = nullptr;
     }
 
+    void refuse(QTcpSocket* c) {
+        // Each wrong answer is told a second after the one before it, whoever sent them: guesses come one a second.
+        c->setProperty("failed", true);
+        ++failures_[c->peerAddress().toString()];
+        const auto now = Clock::now();
+        nextRefusal_ = std::max(now, nextRefusal_) + std::chrono::seconds(1);
+        const int ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(nextRefusal_ - now).count());
+        QTimer::singleShot(ms, c, [c] {
+            c->write(line({{"error", "wrong passphrase"}}));
+            c->disconnectFromHost();
+        });
+    }
+
     void read(QTcpSocket* c) {
-        if (QTimer* idle = c->findChild<QTimer*>("idle")) idle->start(600000);
+        if (c->property("failed").toBool()) {
+            c->readAll();
+            return;
+        }
         while (c->canReadLine()) {
-            const QByteArray text = c->readLine(kMaxLine).trimmed();
+            const bool authed = c->property("authed").toBool();
+            const QByteArray text = c->readLine(authed ? kMaxLine : kMaxGreeting).trimmed();
             if (text.isEmpty()) continue;
             const QJsonObject o = QJsonDocument::fromJson(text).object();
-            if (!c->property("authed").toBool()) {
-                if (c->property("failed").toBool()) return;
-                const QByteArray want = authCode(c->property("nonce").toByteArray(), pass_);
-                if (sameBytes(o.value("auth").toString().toLatin1(), want)) {
-                    c->setProperty("authed", true);
-                    c->write(line({{"ok", true}}));
-                } else {
-                    // (answered a second later, so passphrases cannot be tried quickly)
-                    c->setProperty("failed", true);
-                    QTimer::singleShot(1000, c, [c] {
-                        c->write(line({{"error", "wrong passphrase"}}));
-                        c->disconnectFromHost();
-                    });
+            if (!authed) {
+                const QByteArray sn = c->property("nonce").toByteArray(), cn = o.value("nonce").toString().toLatin1();
+                if (cn.size() != 32 || !sameBytes(o.value("auth").toString().toLatin1(), mac(key_, "client|" + sn + "|" + cn))) {
+                    refuse(c);
+                    return;
                 }
+                c->setProperty("authed", true);
+                c->setProperty("session", mac(key_, "session|" + sn + "|" + cn));
+                c->write(line({{"ok", true}, {"proof", QString::fromLatin1(mac(key_, "server|" + sn + "|" + cn))}}));
+                if (QTimer* idle = c->findChild<QTimer*>("idle")) idle->start(600000);
                 continue;
             }
-            const QJsonObject m = o.value("marker").toObject();
-            if (m.isEmpty() || !m.contains("frame")) {
-                c->write(line({{"error", "expected {\"marker\": {\"frame\": …}}"}}));
-                continue;
+            if (QTimer* idle = c->findChild<QTimer*>("idle")) idle->start(600000);
+            const QByteArray session = c->property("session").toByteArray();
+            const int seq = c->property("seq").toInt() + 1;
+            const QByteArray body = o.value("marker").toString().toUtf8();
+            if (o.value("seq").toInt() != seq || !sameBytes(o.value("mac").toString().toLatin1(), mac(session, QByteArray::number(seq) + "|" + body))) {
+                c->write(line({{"error", "the marker's signature is wrong"}}));
+                c->disconnectFromHost();
+                return;
             }
+            c->setProperty("seq", seq);
+            const QJsonObject m = QJsonDocument::fromJson(body).object();
             RemoteMarker r;
             r.frame = FrameTime(m.value("frame").toInteger(-1));
             r.duration = std::max<FrameTime>(0, FrameTime(m.value("duration").toInteger(0)));
+            r.sequence = Id(m.value("sequence").toInteger(0));
             r.timecode = m.value("timecode").toString().left(32).toStdString();
             r.author = m.value("author").toString().left(100).toStdString();
             r.text = m.value("text").toString().left(10000).toStdString();
             r.drawing = m.value("drawing").toString().toStdString();
             r.id = m.value("id").toString().left(100).toStdString();
             if (r.frame < 0) {
-                c->write(line({{"error", "the frame is not one of the stream's"}}));
+                c->write(line({{"error", "the frame is not one of the stream's"}, {"seq", seq}}));
                 continue;
             }
             take_(std::move(r));
-            c->write(line({{"ok", true}, {"frame", qint64(m.value("frame").toInteger())}}));
+            c->write(line({{"ok", true}, {"seq", seq}, {"mac", QString::fromLatin1(mac(session, "ack|" + QByteArray::number(seq)))}}));
         }
-        if (c->bytesAvailable() > kMaxLine) c->disconnectFromHost();
+        // (a line longer than allowed is not waited for)
+        if (c->bytesAvailable() > (c->property("authed").toBool() ? kMaxLine : kMaxGreeting)) c->abort();
     }
 
     std::string pass_;
+    QByteArray salt_, key_;
     std::function<void(RemoteMarker)> take_;
     std::thread thread_;
     std::mutex m_;
     QEventLoop* loop_ = nullptr;
-    bool stopping_ = false;
+    std::map<QString, int> failures_;  // wrong answers by address (the server's thread only)
+    Clock::time_point nextRefusal_;
 };
 
 }  // namespace
@@ -407,23 +457,41 @@ bool sendRemoteMarkers(const std::string& host, int port, const std::string& pas
     auto readObject = [&](QJsonObject& o) {
         while (!sock.canReadLine())
             if (!sock.waitForReadyRead(timeoutMs)) return false;
-        o = QJsonDocument::fromJson(sock.readLine(kMaxLine)).object();
+        o = QJsonDocument::fromJson(sock.readLine(kMaxGreeting)).object();
         return true;
     };
     QJsonObject hello;
-    if (!readObject(hello) || hello.value("montage").toString() != "review") return fail("That is not a Montage marker channel");
-    sock.write(line({{"auth", QString::fromLatin1(authCode(hello.value("nonce").toString().toLatin1(), passphrase))}}));
+    if (!readObject(hello) || hello.value("montage").toString() != "review" || hello.value("version").toInt() != 2)
+        return fail("That is not a Montage marker channel (or not this version's)");
+    const QByteArray salt = QByteArray::fromHex(hello.value("salt").toString().toLatin1());
+    const int iterations = hello.value("iterations").toInt();
+    if (salt.size() < 16 || iterations < 10000 || iterations > 10000000) return fail("The marker channel's greeting is not sound");
+    const QByteArray key = markerKey(passphrase, salt, iterations);
+    const QByteArray sn = hello.value("nonce").toString().toLatin1(), cn = randomHex(16);
+    sock.write(line({{"nonce", QString::fromLatin1(cn)}, {"auth", QString::fromLatin1(mac(key, "client|" + sn + "|" + cn))}}));
     QJsonObject reply;
-    if (!readObject(reply) || !reply.value("ok").toBool())
+    // (twice the time: wrong answers are told late)
+    if (!readObject(reply) && !readObject(reply)) return fail("The marker channel did not answer");
+    if (!reply.value("ok").toBool())
         return fail(reply.value("error").toString() == "wrong passphrase" ? "The passphrase is wrong" : "The marker channel refused the connection");
+    if (!sameBytes(reply.value("proof").toString().toLatin1(), mac(key, "server|" + sn + "|" + cn)))
+        return fail("The marker channel could not show it has the passphrase: not sending to it");
+    const QByteArray session = mac(key, "session|" + sn + "|" + cn);
+    int seq = 0;
     for (const RemoteMarker& m : markers) {
         QJsonObject o{{"frame", qint64(m.frame)}, {"duration", qint64(m.duration)}, {"timecode", QString::fromStdString(m.timecode)},
                       {"author", QString::fromStdString(m.author)}, {"text", QString::fromStdString(m.text)}};
+        if (m.sequence) o["sequence"] = qint64(m.sequence);
         if (!m.drawing.empty()) o["drawing"] = QString::fromStdString(m.drawing);
         if (!m.id.empty()) o["id"] = QString::fromStdString(m.id);
-        sock.write(line({{"marker", o}}));
-        if (!readObject(reply) || !reply.value("ok").toBool())
+        const QByteArray body = QJsonDocument(o).toJson(QJsonDocument::Compact);
+        ++seq;
+        sock.write(line({{"seq", seq}, {"marker", QString::fromUtf8(body)}, {"mac", QString::fromLatin1(mac(session, QByteArray::number(seq) + "|" + body))}}));
+        if (!readObject(reply)) return fail("The marker channel did not answer");
+        if (!reply.value("ok").toBool())
             return fail(reply.contains("error") ? "Montage refused the marker: " + reply.value("error").toString().toStdString() : "The marker was not taken");
+        if (reply.value("seq").toInt() != seq || !sameBytes(reply.value("mac").toString().toLatin1(), mac(session, "ack|" + QByteArray::number(seq))))
+            return fail("The marker channel's answer is not signed");
     }
     sock.disconnectFromHost();
     if (sock.state() != QAbstractSocket::UnconnectedState) sock.waitForDisconnected(1000);
@@ -443,6 +511,7 @@ struct StreamBackend::Impl {
     int audioChannels = 0, audioRate = 48000;
     std::string url;
     bool srt = true;
+    Id sequence = 0;
     std::unique_ptr<MarkerServer> markers;
     std::vector<RemoteMarker> received;
     int markerCount = 0, markerPort = -1;
@@ -580,6 +649,7 @@ struct StreamBackend::Impl {
         av_frame_free(&vframe);
         av_frame_free(&aframe);
         av_packet_free(&pkt);
+        vcodec = nullptr;
     }
 
     void connectLoop() {
@@ -638,12 +708,15 @@ struct StreamBackend::Impl {
         if (r < 0) {
             avformat_free_context(oc);
             avio_closep(&io);
+            std::lock_guard lock(m);
+            connectError = "Cannot start the stream: " + averr(r);
             return false;
         }
         mux = oc;
-        connected = true;
         keyed = false;
         fresh = true;
+        std::lock_guard lock(m);
+        connected = true;
         encoded = skipped = 0;
         bytes.clear();
         return true;
@@ -656,9 +729,9 @@ struct StreamBackend::Impl {
             mux = nullptr;
             avio_closep(&io);
         }
+        std::lock_guard lock(m);
         connected = false;
         if (reconnect) {
-            std::lock_guard lock(m);
             needConnect = true;
             cv.notify_all();
         }
@@ -688,6 +761,7 @@ struct StreamBackend::Impl {
             av_packet_unref(pkt);
             if (w < 0) return false;
             const auto now = Clock::now();
+            std::lock_guard lock(m);
             bytes.emplace_back(now, size);
             while (!bytes.empty() && now - bytes.front().first > std::chrono::seconds(3)) bytes.pop_front();
         }
@@ -751,6 +825,7 @@ struct StreamBackend::Impl {
             t.frame = f.frame;
             t.timecode = timecodeText(f.timecode);
             t.fps = f.fps;
+            t.sequence = sequence;
             const std::vector<uint8_t> payload = streamTagPayload(t);
             if (AVFrameSideData* sd = av_frame_new_side_data(vframe, AV_FRAME_DATA_SEI_UNREGISTERED, payload.size()))
                 std::memcpy(sd->data, payload.data(), payload.size());
@@ -820,6 +895,11 @@ std::vector<Device> StreamBackend::devices() {
     return {d};
 }
 
+void StreamBackend::setSequence(Id id) {
+    std::lock_guard lock(d_->m);
+    d_->sequence = id;
+}
+
 void StreamBackend::setSettings(const StreamSettings& s) {
     std::lock_guard lock(d_->m);
     d_->settings = s;
@@ -868,7 +948,9 @@ bool StreamBackend::open(const Device&, const Mode& mode, const Signal& signal, 
             d_->received.push_back(std::move(r));
             ++d_->markerCount;
         });
-        if (!d.markers->start(d.markerPort, error)) {
+        // On the address the stream listens on when it is one of this computer's, else on all of them.
+        const QHostAddress at = d.srt && d.settings.listen && host != "0.0.0.0" && host != "::" ? QHostAddress(QString::fromStdString(host)) : QHostAddress::Any;
+        if (!d.markers->start(at.isNull() ? QHostAddress(QHostAddress::Any) : at, d.markerPort, error)) {
             d.markers.reset();
             d.freeEncoders();
             return false;
@@ -906,15 +988,16 @@ bool StreamBackend::send(const VideoFrame& frame, const Audio& audio) {
         // (They run on from one viewer to the next, the encoders being the same.)
         const int64_t due = std::llround(std::chrono::duration<double>(Clock::now() - d.t0).count() * fps);
         const int64_t pts = d.vpts < 0 || due > d.vpts + 2 ? std::max(due, d.vpts + 1) : d.vpts + 1;
-        if (!d.fresh) d.skipped += pts - d.vpts - 1;
+        const int64_t skipped = d.fresh ? 0 : pts - d.vpts - 1;
         const bool ok = d.encodePicture(frame, pts, d.fresh) && d.encodeSound(audio, pts);
         d.vpts = pts;
         d.fresh = false;
-        if (ok) {
-            ++d.encoded;
-        } else {
+        {
+            // (what the interface's thread reads, changed under the lock)
             std::lock_guard lock(d.m);
-            d.connectError = d.srt ? "The viewer went away" : "The stream could not be sent";
+            d.skipped += skipped;
+            if (ok) ++d.encoded;
+            else d.connectError = d.srt ? "The viewer went away" : "The stream could not be sent";
         }
         if (!ok) d.stopMux(true);
     }

@@ -149,7 +149,7 @@ private:
     QLineEdit* address_;
     QLineEdit* passphrase_;
     QLineEdit* author_;
-    QSpinBox* markersPort_;
+    QLineEdit* markersTo_;
     QPushButton* connect_;
     ReviewPicture* picture_;
     QLabel* timecode_;

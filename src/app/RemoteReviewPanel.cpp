@@ -127,7 +127,6 @@ bool RemoteReviewController::start(const output::StreamSettings& settings, const
     stop();
     settings_ = settings;
     options_ = options;
-    saveSettings(settings, options);
     auto fail = [&](const QString& why) {
         lastError_ = why;
         if (error) *error = why;
@@ -140,6 +139,7 @@ bool RemoteReviewController::start(const output::StreamSettings& settings, const
     std::string why;
     if (!backend->available(&why)) return fail(qs(why));
     backend->setSettings(settings);
+    backend->setSequence(s->id);
     output::Config config;
     config.backend = "Stream";
     config.depth = settings.codec == "h264" ? 8 : 10;
@@ -149,6 +149,7 @@ bool RemoteReviewController::start(const output::StreamSettings& settings, const
     const std::vector<output::Device> devices = backend->devices();
     auto sched = std::make_shared<output::Scheduler>(backend);
     if (!sched->start(devices.front(), modeFor(*s, options), *s, config, &why)) return fail(qs(why));
+    saveSettings(settings, options);
     backend_ = backend;
     scheduler_ = sched;
     sequence_ = s->id;
@@ -219,7 +220,7 @@ QString RemoteReviewController::status() const {
 
 QByteArray RemoteReviewController::toolJson() {
     return QByteArrayLiteral(R"json({"name":"montage_remote_review","title":"Live remote review",
-"description":"Streams the Program monitor to reviewers elsewhere as it plays or parks, at low latency: HEVC 10-bit (or H.264 8-bit) with stereo sound in an MPEG transport stream over SRT (AES-256 with a passphrase; Montage listening for a viewer, or calling a relay that viewers watch) or UDP, the timecode burnt in. Viewers watch in Montage (File > Watch Remote Review), VLC or ffplay; a Montage viewer's notes come back as markers at the frame they saw. \"status\": whether it is on, the viewer connected, its rate and the markers received. \"start\": settings left out are the last used (a passphrase is made when there is none; it is given back). \"stop\".",
+"description":"Streams the Program monitor to reviewers elsewhere as it plays or parks, at low latency: HEVC 10-bit (or H.264 8-bit) with stereo sound in an MPEG transport stream over SRT (AES-256 with a passphrase; Montage listening for a viewer, or calling a relay that viewers watch) or UDP, the timecode burnt in. Viewers watch in Montage (File > Watch Remote Review) or any player that reads SRT (ffplay); a Montage viewer's notes come back as markers at the frame they saw. \"status\": whether it is on, the viewer connected, its rate and the markers received. \"start\": settings left out are the last used (a passphrase is made when there is none; it is given back). \"stop\".",
 "inputSchema":{"type":"object","properties":{
 "action":{"type":"string","enum":["status","start","stop"]},
 "address":{"type":"string","description":"srt://0.0.0.0:9000 (listening on every address), srt://relay:port?streamid=… (with listen false) or udp://host:port"},
@@ -300,8 +301,9 @@ RemoteReviewPanel::RemoteReviewPanel(RemoteReviewController* controller, QWidget
     setAttribute(Qt::WA_DeleteOnClose);
     auto* v = new QVBoxLayout(this);
     auto* intro = new QLabel(tr("The Program streamed live to reviewers elsewhere, with its sound and the timecode burnt in. They watch in "
-                                "Montage (File › Watch Remote Review…, which can send notes back as markers), VLC or ffplay. Over SRT "
-                                "the stream is encrypted with the passphrase."),
+                                "Montage (File › Watch Remote Review…, which can send notes back as markers) or any player that reads "
+                                "SRT, such as FFmpeg's ffplay. Over SRT the stream is encrypted with the passphrase; the notes that come "
+                                "back are signed with it but not encrypted. The passphrase is kept in Montage's settings on this computer."),
                              this);
     intro->setWordWrap(true);
     v->addWidget(intro);
@@ -466,7 +468,15 @@ void RemoteReviewPanel::refresh() {
     text += tr(". In Montage: File › Watch Remote Review…");
     if (!at.isEmpty() && s.address.rfind("srt", 0) == 0 && s.listen)
         text += tr("; with FFmpeg: ffplay -fflags nobuffer \"%1?passphrase=%2\"").arg(at.front(), qs(s.passphrase));
-    if (const int port = output::markersPortFor(s); port >= 0) text += tr(". Notes come back as markers over TCP port %1.").arg(port);
+    if (const int port = output::markersPortFor(s); port >= 0) {
+        // (sent to this computer, whichever way the stream goes)
+        QStringList hosts;
+        for (const QHostAddress& a : QNetworkInterface::allAddresses())
+            if (a.protocol() == QAbstractSocket::IPv4Protocol && !a.isLoopback() && !a.isLinkLocal()) hosts << QStringLiteral("%1:%2").arg(a.toString()).arg(port);
+        if (hosts.isEmpty()) hosts << QStringLiteral("127.0.0.1:%1").arg(port);
+        text += s.listen && s.address.rfind("srt", 0) == 0 ? tr(". Notes come back as markers over TCP port %1.").arg(port)
+                                                            : tr(". Notes come back as markers: viewers set Markers to %1.").arg(hosts.join(tr(" or ")));
+    }
     howTo_->setText(text);
 }
 
@@ -532,17 +542,16 @@ ReviewViewerWindow::ReviewViewerWindow(QWidget* parent) : QWidget(parent, Qt::Wi
     note_->setPlaceholderText(tr("A note at this frame (Return sends it as a marker)"));
     mark_ = new QPushButton(tr("Add Marker"), this);
     mark_->setObjectName(QStringLiteral("reviewAddMarker"));
-    markersPort_ = new QSpinBox(this);
-    markersPort_->setObjectName(QStringLiteral("reviewMarkersPort"));
-    markersPort_->setRange(0, 65535);
-    markersPort_->setSpecialValueText(tr("port: stream's + 1"));
-    markersPort_->setValue(settings.value("reviewViewer/markersPort", 0).toInt());
-    markersPort_->setToolTip(tr("The TCP port of the editor's marker channel"));
+    markersTo_ = new QLineEdit(settings.value("reviewViewer/markersTo").toString(), this);
+    markersTo_->setObjectName(QStringLiteral("reviewMarkersTo"));
+    markersTo_->setPlaceholderText(tr("Markers to: the stream's host, port + 1"));
+    markersTo_->setToolTip(tr("Where the editor's Montage takes markers (host:port), when the stream comes through a server or over UDP"));
+    markersTo_->setMaximumWidth(220);
     bottom->addWidget(timecode_);
     bottom->addWidget(author_);
     bottom->addWidget(note_, 1);
     bottom->addWidget(mark_);
-    bottom->addWidget(markersPort_);
+    bottom->addWidget(markersTo_);
     v->addLayout(bottom);
     status_ = new QLabel(tr("Not watching"), this);
     status_->setObjectName(QStringLiteral("reviewStatus"));
@@ -621,10 +630,15 @@ void ReviewViewerWindow::poll() {
     }
     std::vector<float> sound = receiver_.takeAudio();
     if (sound_ && sink_ && !sound.empty()) {
-        const qint64 bytes = qint64(sound.size() * sizeof(float));
-        if (sink_->bytesFree() >= bytes) sound_->write(reinterpret_cast<const char*>(sound.data()), bytes);
+        // As much as there is room for, the latest kept (a review is live: sound that would lag is let go).
+        const qint64 room = sink_->bytesFree() / 8 * 8, bytes = std::min<qint64>(room, qint64(sound.size() * sizeof(float)));
+        if (bytes > 0) sound_->write(reinterpret_cast<const char*>(sound.data() + sound.size()) - bytes, bytes);
     }
     const output::ReviewReceiver::Status st = receiver_.status();
+    if (!st.connected && tag_.frame >= 0) {  // (a frame from before the stream dropped is not marked)
+        tag_ = {};
+        timecode_->setText(QStringLiteral("--:--:--:--"));
+    }
     QString text = st.connected ? tr("Watching: %1%2").arg(qs(st.video), st.audio ? tr(", with sound") : QString())
                                 : st.error.empty() ? tr("Connecting…") : qs(st.error);
     if (!sent_.isEmpty()) text += QStringLiteral(" · ") + sent_;
@@ -640,15 +654,27 @@ void ReviewViewerWindow::addMarker() {
     std::string scheme, host;
     int port = 0;
     output::parseStreamAddress(address_->text().trimmed().toStdString(), scheme, host, port);
-    const int markersPort = markersPort_->value() > 0 ? markersPort_->value() : port + 1;
+    int markersPort = port + 1;
+    if (const QString to = markersTo_->text().trimmed(); !to.isEmpty()) {
+        std::string s2, h2;
+        int p2 = 0;
+        if (!output::parseStreamAddress("tcp://" + to.toStdString(), s2, h2, p2)) {
+            sent_ = tr("Markers to is host:port");
+            poll();
+            return;
+        }
+        host = h2;
+        markersPort = p2;
+    }
     output::RemoteMarker m;
     m.frame = tag_.frame;
+    m.sequence = tag_.sequence;
     m.timecode = tag_.timecode;
     m.author = author_->text().trimmed().toStdString();
     m.text = note_->text().trimmed().toStdString();
     QSettings settings = appSettings();
     settings.setValue("reviewViewer/author", author_->text().trimmed());
-    settings.setValue("reviewViewer/markersPort", markersPort_->value());
+    settings.setValue("reviewViewer/markersTo", markersTo_->text().trimmed());
     note_->clear();
     const std::string pass = passphrase_->text().toStdString();
     ++sending_;
