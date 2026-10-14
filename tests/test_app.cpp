@@ -11,6 +11,7 @@
 #include <QAbstractScrollArea>
 #include <QAction>
 #include <QComboBox>
+#include <QStandardItemModel>
 #include <QCheckBox>
 #include <QFormLayout>
 #include <QClipboard>
@@ -11713,6 +11714,15 @@ const auto seq = [this] { return state()->sequence(); };
         };
         QTRY_VERIFY_WITH_TIMEOUT(effectOf("stabilize") && !effectOf("stabilize")->s("motion").empty(), 30000);
         QApplication::processEvents();
+        // This footage has no camera motion data: Camera Gyro is not offered, and the method stays as it was.
+        QComboBox* method = nullptr;
+        for (auto* b : win_->findChildren<QComboBox*>("choice_method"))
+            if (b->isVisibleTo(win_.get())) method = b;
+        QVERIFY(method && method->count() == 4);
+        auto* methods = qobject_cast<QStandardItemModel*>(method->model());
+        QVERIFY(methods && !methods->item(3)->isEnabled() && methods->item(2)->isEnabled());
+        QCOMPARE(method->currentIndex(), 2);
+        QVERIFY(effectOf("stabilize")->s("gyro").empty());
         QPushButton* again = nullptr;
         for (auto* b : win_->findChildren<QPushButton*>("analyzeStabilize"))
             if (b->isVisibleTo(win_.get())) again = b;

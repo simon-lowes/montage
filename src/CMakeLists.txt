@@ -87,6 +87,7 @@ add_library(montage_engine STATIC
   media/StemSeparation.h media/StemSeparation.cpp
   media/BanditSeparation.h media/BanditSeparation.cpp
   media/LtcTimecode.h media/LtcTimecode.cpp
+  media/MotionData.h media/MotionData.cpp
   media/Inpaint.h media/Inpaint.cpp
   media/ValueMap.h
   media/Rife.h media/Rife.cpp

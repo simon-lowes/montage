@@ -23,6 +23,7 @@
 #include "Deconvolve.h"
 #include "GpuCompositor.h"
 #include "QualityCheck.h"
+#include "media/MotionData.h"
 #include "media/Tracking.h"
 #include "media/FaceTracks.h"
 
@@ -1654,8 +1655,97 @@ void redactFacesEffect(const Effect& e, FrameTime t, Image& img, double sourceSe
     }
 }
 
+// Camera Gyro: the camera's orientation from its motion data (strings["gyro"]), smoothed and levelled; each frame
+// turned from where the camera pointed to the steady view, each row by where it pointed as that row was read.
+struct GyroPlan {
+    GyroPath path;
+    std::vector<GyroCorrection> corrections;
+    double zoom = 1, readout = 0;
+};
+
+std::shared_ptr<const GyroPlan> gyroPlan(const Effect& e, FrameTime t, double aspect) {
+    static std::mutex m;
+    static std::map<std::string, std::shared_ptr<const GyroPlan>> cache;
+    const std::string& data = e.s("gyro");
+    if (data.empty()) return nullptr;
+    GyroStabilizeSettings gs;
+    gs.smoothSeconds = e.p("smoothness", t, 1.5);
+    gs.horizon = std::clamp(e.p("horizon", t, 0) / 100, 0.0, 1.0);
+    gs.offset = e.p("gyro_offset", t, 0) / 1000;
+    const bool fill = e.p("framing", t, 0) < 0.5;
+    const double readoutParam = rollingReadout(e, t);
+    char key[160];
+    std::snprintf(key, sizeof key, "%.4f|%.4f|%.5f|%d|%.4f|%.4f|%zu", gs.smoothSeconds, gs.horizon, gs.offset, fill ? 1 : 0, aspect,
+                  readoutParam, std::hash<std::string>{}(data));
+    std::lock_guard lock(m);
+    auto& slot = cache[key];
+    if (slot) return slot;
+    auto plan = std::make_shared<GyroPlan>();
+    if (!gyroPathFromString(data, plan->path) || plan->path.focal <= 0) return nullptr;
+    plan->corrections = gyroCorrections(plan->path, gs);
+    // (Rolling Shutter at 0 takes the readout the data gives, when it gives one)
+    plan->readout = readoutParam > 0 ? readoutParam : plan->path.readout > 0 ? std::min(1.0, plan->path.readout * plan->path.fps) : 0.0;
+    plan->zoom = fill ? gyroZoom(plan->corrections, plan->path.focal, plan->readout, aspect) : 1.0;
+    if (cache.size() > 32) cache.clear();
+    slot = plan;
+    return plan;
+}
+
+bool gyroStabilize(const Effect& e, FrameTime t, Image& img, double sourceSeconds) {
+    auto plan = gyroPlan(e, t, double(img.height) / img.width);
+    if (!plan || plan->corrections.empty()) return false;
+    const long i = std::clamp<long>(std::lround((sourceSeconds - plan->path.start) * plan->path.fps), 0, long(plan->corrections.size()) - 1);
+    const GyroCorrection& c = plan->corrections[size_t(i)];
+    const double zoom = plan->zoom * (1 + e.p("extra_zoom", t, 0) / 100);
+    const Image src = img;
+    const double W = img.width, H = img.height, aspect = H / W, f = plan->path.focal, readout = plan->readout;
+    // The turn for each row of the source as it was read (the middle row's is none).
+    std::vector<std::array<double, 9>> turns;
+    if (readout > 0) {
+        turns.resize(size_t(img.height));
+        for (int r = 0; r < img.height; ++r) turns[size_t(r)] = gyroTurnAt(c, ((r + 0.5) / H - 0.5) * readout);
+    }
+    parallelRows(img.height, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            float* o = img.row(y);
+            for (int x = 0; x < img.width; ++x, o += 4) {
+                const double qx = ((x + 0.5) - W / 2) / W / zoom, qy = ((y + 0.5) - H / 2) / W / zoom;
+                const auto& r = c.r;
+                double cx = r[0] * qx / f + r[1] * qy / f + r[2], cy = r[3] * qx / f + r[4] * qy / f + r[5], cz = r[6] * qx / f + r[7] * qy / f + r[8];
+                bool ok = cz > 1e-6;
+                double sx = ok ? f * cx / cz : 0, sy = ok ? f * cy / cz : 0;
+                for (int it = 0; ok && readout > 0 && it < 2; ++it) {
+                    // Found on a row read earlier or later: where the camera pointed then.
+                    const int row = std::clamp(int(std::floor(sy * W + H / 2)), 0, img.height - 1);
+                    const auto& m = turns[size_t(row)];
+                    const double mx = m[0] * cx + m[1] * cy + m[2] * cz, my = m[3] * cx + m[4] * cy + m[5] * cz, mz = m[6] * cx + m[7] * cy + m[8] * cz;
+                    ok = mz > 1e-6;
+                    if (ok) sx = f * mx / mz, sy = f * my / mz;
+                }
+                const double px = sx * W + W / 2 - 0.5, py = sy * W + H / 2 - 0.5;
+                if (!ok || px < -1 || py < -1 || px > W || py > H) {
+                    o[0] = o[1] = o[2] = o[3] = 0;
+                    continue;
+                }
+                const int x0 = int(std::floor(px)), yy0 = int(std::floor(py));
+                const float fx = float(px - x0), fy = float(py - yy0);
+                const int xa = std::clamp(x0, 0, src.width - 1), xb = std::clamp(x0 + 1, 0, src.width - 1);
+                const int ya = std::clamp(yy0, 0, src.height - 1), yb = std::clamp(yy0 + 1, 0, src.height - 1);
+                const float *p00 = src.at(xa, ya), *p10 = src.at(xb, ya), *p01 = src.at(xa, yb), *p11 = src.at(xb, yb);
+                for (int k = 0; k < 4; ++k) {
+                    const float a = p00[k] + (p10[k] - p00[k]) * fx, b = p01[k] + (p11[k] - p01[k]) * fx;
+                    o[k] = a + (b - a) * fy;
+                }
+            }
+        }
+    });
+    return true;
+}
+
 void stabilize(const Effect& e, FrameTime t, Image& img, double sourceSeconds) {
     if (sourceSeconds < 0 || img.empty()) return;
+    // Camera Gyro, when the analysis found the camera's motion data (else the measured movement, with rotation).
+    if (e.type == "stabilize" && std::lround(e.p("method", t, 2)) == 3 && gyroStabilize(e, t, img, sourceSeconds)) return;
     auto plan = stabilizePlan(e, t, double(img.height) / img.width);
     if (!plan || plan->corrections.empty()) return;
     const long i = std::clamp<long>(std::lround((sourceSeconds - plan->start) * plan->fps), 0, long(plan->corrections.size()) - 1);

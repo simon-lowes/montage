@@ -19,10 +19,13 @@ namespace montage {
 
 // The camera motion over the part of the media the clip shows (with a second
 // either side, so smoothing has context), in the form the Stabilize effect
-// keeps in strings["motion"].
+// keeps in strings["motion"]. With `gyro`, the camera's own motion data too
+// when the media has some (media/MotionData.h), lined up with that motion, as
+// strings["gyro"] keeps it; empty, with why in `gyroNote`, when it has none or
+// it does not match.
 bool analyzeClipStabilization(const Project& p, const Sequence& s, const Clip& c, std::string& motion,
                               const TrackProgress& progress = {}, const std::atomic<bool>* cancel = nullptr,
-                              std::string* error = nullptr);
+                              std::string* error = nullptr, std::string* gyro = nullptr, std::string* gyroNote = nullptr);
 
 // Follows the mask of effect `e` from clip-local frame `fromLocal` to the
 // clip's end (forward) or start, as (clip-local frame, region) keys.

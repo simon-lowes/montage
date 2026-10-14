@@ -11,6 +11,7 @@
 #include "core/Effects.h"
 #include "core/Surround.h"
 #include "media/Decoder.h"
+#include "media/MotionData.h"
 #include "media/Reframe.h"
 #include "media/Segmenter.h"
 
@@ -36,7 +37,10 @@ const MediaItem* videoMedia(const Project& p, const Clip& c, std::string* error)
 }  // namespace
 
 bool analyzeClipStabilization(const Project& p, const Sequence& s, const Clip& c, std::string& motion,
-                              const TrackProgress& progress, const std::atomic<bool>* cancel, std::string* error) {
+                              const TrackProgress& progress, const std::atomic<bool>* cancel, std::string* error, std::string* gyro,
+                              std::string* gyroNote) {
+    if (gyro) gyro->clear();
+    if (gyroNote) gyroNote->clear();
     const MediaItem* m = videoMedia(p, c, error);
     if (!m) return false;
     const double a = sourceSeconds(s, c, 0), b = sourceSeconds(s, c, c.duration - 1);
@@ -45,6 +49,21 @@ bool analyzeClipStabilization(const Project& p, const Sequence& s, const Clip& c
     CameraMotion cm = analyzeCameraMotion(m->path, from, to, progress, cancel, error);
     if (cm.steps.empty()) return false;
     motion = cameraMotionToString(cm);
+    if (gyro && hasMotionData(m->path)) {
+        // The readings, lined up with the movement just measured.
+        MotionData d;
+        GyroSync sync;
+        std::string why;
+        if (readMotionData(m->path, d, &why) && syncMotionData(d, cm, sync, &why)) {
+            const double end = cm.start + double(cm.steps.size() - 1) / cm.fps;
+            refineGyroLens(m->path, d, sync, cm.fps, cm.start, end);  // (else the tracker's measure stands)
+            *gyro = gyroPathToString(gyroPath(d, sync, cm.fps, cm.start, end));
+        }
+        else if (gyroNote)
+            *gyroNote = why;
+    } else if (gyroNote) {
+        *gyroNote = "The clip has no camera motion data";
+    }
     return true;
 }
 

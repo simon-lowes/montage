@@ -268,11 +268,14 @@ std::vector<EffectInfo> buildCatalog() {
     }
     // Stabilize: the analysed camera path (strings["motion"], written by the
     // Inspector's Analyze) smoothed; render/Processing.cpp moves each frame.
+    // Camera Gyro turns each frame by the camera's own motion data instead
+    // (strings["gyro"], media/MotionData.h), with the horizon levelled from gravity.
     c.push_back({"stabilize", "Stabilize", EffectCategory::VideoFilter, "Transform",
                  {num("smoothness", "Smoothness (s)", 0, 10, 1.5, 0.1),
-                  choice("method", "Method", {"Position", "Position & Scale", "Position, Scale & Rotation"}, 2),
+                  choice("method", "Method", {"Position", "Position & Scale", "Position, Scale & Rotation", "Camera Gyro"}, 2),
                   choice("framing", "Framing", {"Zoom to Fill", "Show Edges"}, 0), pct("extra_zoom", "Extra Zoom", 0, 50, 0),
-                  pct("rolling_shutter", "Rolling Shutter", 0, 100, 0)},
+                  pct("rolling_shutter", "Rolling Shutter", 0, 100, 0), pct("horizon", "Horizon Lock (Camera Gyro)", 0, 100, 0),
+                  num("gyro_offset", "Gyro Offset (ms)", -500, 500, 0, 1)},
                  {}});
     for (auto& pi : c.back().params) pi.keyframeable = false;
     // 3D Camera Tracker (Fusion's Camera Tracker, After Effects' 3D Camera Tracker): the camera that filmed the clip,
