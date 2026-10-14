@@ -72,14 +72,19 @@ double vlen(const V& v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[
 
 // ---- Readings ----------------------------------------------------------------------------------------------------
 constexpr double kStandardGravity = 9.80665;
-const float kNoGyro = std::numeric_limits<float>::quiet_NaN();
 
 // Puts the readings in time order and gives each gyro reading the acceleration at its time (from accelerometer
-// readings sent apart from the gyro's, marked by a gyro of NaN).
+// readings sent apart from the gyro's).
 void finish(MotionData& d) {
+    // (readings that are not numbers, from a damaged file, are left out)
+    auto finite = [](const ImuSample& s) {
+        return std::isfinite(s.t) && std::isfinite(s.accel[0]) && std::isfinite(s.accel[1]) && std::isfinite(s.accel[2]) &&
+               (s.accelOnly || (std::isfinite(s.gyro[0]) && std::isfinite(s.gyro[1]) && std::isfinite(s.gyro[2])));
+    };
+    d.samples.erase(std::remove_if(d.samples.begin(), d.samples.end(), [&](const ImuSample& s) { return !finite(s); }), d.samples.end());
     std::stable_sort(d.samples.begin(), d.samples.end(), [](const ImuSample& a, const ImuSample& b) { return a.t < b.t; });
     std::vector<ImuSample> accel, gyro;
-    for (const ImuSample& s : d.samples) (std::isnan(s.gyro[0]) ? accel : gyro).push_back(s);
+    for (const ImuSample& s : d.samples) (s.accelOnly ? accel : gyro).push_back(s);
     if (!accel.empty()) {
         d.hasAccel = true;
         size_t j = 0;
@@ -167,6 +172,18 @@ void readGpmfStream(const uint8_t* p, size_t size, double t0, double t1, MotionD
             scale.clear();
             const size_t n = size_t(k.size) * size_t(k.repeat) / size_t(ts);
             for (size_t i = 0; i < n; ++i) scale.push_back(gpmfNumber(k, i));
+        } else if (k.key == fourcc("IORI") && ts > 0 && k.size == 4 * ts) {
+            // The turn the camera gave its picture to steady it (w, x, y, z): more than a degree, and the picture no
+            // longer moves as the gyro says.
+            for (int i = 0; i < k.repeat && !out.steadiedInCamera; ++i) {
+                double q[4];
+                for (int a = 0; a < 4; ++a) {
+                    const double sc = scale.empty() ? 1.0 : scale[std::min(size_t(a), scale.size() - 1)];
+                    q[a] = gpmfNumber(k, size_t(i) * 4 + size_t(a)) / (sc != 0 ? sc : 1.0);
+                }
+                const double n = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+                if (n > 0 && 2 * std::acos(std::min(1.0, std::fabs(q[0]) / n)) > M_PI / 180) out.steadiedInCamera = true;
+            }
         } else if ((k.key == fourcc("GYRO") || k.key == fourcc("ACCL")) && ts > 0 && k.size == 3 * ts && k.repeat > 0) {
             const bool gyro = k.key == fourcc("GYRO");
             const double span = t1 - t0;
@@ -181,7 +198,7 @@ void readGpmfStream(const uint8_t* p, size_t size, double t0, double t1, MotionD
                 if (gyro) {
                     s.gyro = v;
                 } else {
-                    s.gyro = {kNoGyro, kNoGyro, kNoGyro};
+                    s.accelOnly = true;
                     s.accel = v;
                 }
                 out.samples.push_back(s);
@@ -262,7 +279,7 @@ bool parseCamm(const uint8_t* data, size_t size, double t, MotionData& out) {
             return true;
         case 3:  // acceleration, metres a second squared
             if (size < 16) return false;
-            s.gyro = {kNoGyro, kNoGyro, kNoGyro};
+            s.accelOnly = true;
             s.accel = {f32(4), f32(8), f32(12)};
             out.samples.push_back(s);
             return true;
@@ -274,10 +291,11 @@ bool parseGcsv(const std::string& text, MotionData& out, std::string* error) {
     std::istringstream in(text);
     std::string line;
     if (!std::getline(in, line) || line.rfind("GYROFLOW IMU LOG", 0) != 0) {
-        if (error) *error = "Not a Gyroflow IMU log";
+        if (error) *error = "Not a .gcsv motion log";
         return false;
     }
     double tscale = 0.001, gscale = 1, ascale = 1;
+    bool readoutDown = true;
     std::vector<std::string> columns;
     auto num = [](const std::string& s, double fallback) {
         try {
@@ -300,7 +318,9 @@ bool parseGcsv(const std::string& text, MotionData& out, std::string* error) {
         else if (key == "gscale") gscale = num(value, gscale);
         else if (key == "ascale") ascale = num(value, ascale);
         else if (key == "frame_readout_time") out.readout = num(value, -1000) / 1000;  // milliseconds
+        else if (key == "frame_readout_direction") readoutDown = num(value, 0) == 0;    // 0: top to bottom
     }
+    if (!readoutDown || !(out.readout >= 0)) out.readout = -1;  // (the rows read the other way: not used)
     auto col = [&](const char* name) {
         const auto it = std::find(columns.begin(), columns.end(), name);
         return it == columns.end() ? -1 : int(it - columns.begin());
@@ -400,12 +420,16 @@ namespace {
 struct Integral {
     double t0 = 0, dt = 0.001;
     std::array<std::vector<double>, 3> c;
-    explicit Integral(const MotionData& d) {
-        t0 = d.samples.front().t;
-        const size_t n = size_t(std::ceil((d.samples.back().t - t0) / dt)) + 1;
+    // Over [from, to] only (within the readings).
+    Integral(const MotionData& d, double from, double to) {
+        t0 = std::max(from, d.samples.front().t);
+        const double t1 = std::max(t0, std::min(to, d.samples.back().t));
+        const size_t n = size_t(std::ceil((t1 - t0) / dt)) + 1;
         for (auto& v : c) v.assign(n, 0.0);
         std::array<double, 3> sum{};
-        size_t j = 0;
+        size_t j = size_t(std::lower_bound(d.samples.begin(), d.samples.end(), t0, [](const ImuSample& s, double t) { return s.t < t; }) -
+                          d.samples.begin());
+        j = j > 0 ? j - 1 : 0;
         for (size_t i = 1; i < n; ++i) {
             const double a = t0 + double(i - 1) * dt, b = a + dt, m = (a + b) / 2;
             while (j + 1 < d.samples.size() && d.samples[j + 1].t <= m) ++j;
@@ -452,14 +476,19 @@ struct Match {
 
 }  // namespace
 
-bool syncMotionData(const MotionData& d, const CameraMotion& tracked, GyroSync& out, std::string* error, double searchSeconds) {
+bool syncMotionData(const MotionData& d, const CameraMotion& tracked, GyroSync& out, std::string* error, double searchSeconds,
+                    const std::atomic<bool>* cancel) {
     out = GyroSync{};
     if (d.samples.size() < 16 || tracked.steps.size() < 16 || tracked.fps <= 0) {
         if (error) *error = "Too little to line the motion data up with";
         return false;
     }
-    const Integral in(d);
+    if (d.steadiedInCamera) {
+        if (error) *error = "The camera stabilised the picture itself, so it no longer moves as its motion data says";
+        return false;
+    }
     const size_t n = tracked.steps.size() - 1;
+    const Integral in(d, tracked.start - searchSeconds - 1, tracked.start + double(n + 1) / tracked.fps + searchSeconds + 1);
     // The picture's movement each frame: across (from the camera turning about y), down (about x) and its roll (z).
     std::array<std::vector<double>, 3> target;
     for (auto& v : target) v.resize(n);
@@ -497,13 +526,17 @@ bool syncMotionData(const MotionData& d, const CameraMotion& tracked, GyroSync& 
     // Coarse, then fine.
     Match best;
     double bestOffset = 0;
-    const double lo = std::max(-searchSeconds, d.samples.front().t - tracked.start);
+    const double lo = std::max(-searchSeconds, in.t0 - tracked.start);
     const double hi = std::min(searchSeconds, in.end() - (tracked.start + double(n + 1) / tracked.fps));
     if (hi < lo) {
         if (error) *error = "The motion data does not cover the clip";
         return false;
     }
     for (double o = lo; o <= hi + 1e-9; o += 0.002) {
+        if (cancel && cancel->load()) {
+            if (error) *error = "Cancelled";
+            return false;
+        }
         const Match m = match(o);
         if (m.score > best.score) best = m, bestOffset = o;
     }
@@ -544,7 +577,7 @@ bool syncMotionData(const MotionData& d, const CameraMotion& tracked, GyroSync& 
                           "barely moved, or the data is another clip's";
         return false;
     }
-    if (!(out.focal > 0.15 && out.focal < 6)) {
+    if (!(out.focal > 0.25 && out.focal < 6)) {  // (wider than 127°: not a flat picture)
         if (error) *error = "Could not measure the lens from the motion data";
         return false;
     }
@@ -660,7 +693,7 @@ bool gyroPathFromString(const std::string& s, GyroPath& p) {
     size_t n = 0;
     if (!(in >> p.fps >> p.start >> p.perFrame >> p.focal >> p.readout >> n) || p.fps <= 0 || p.perFrame < 1 || n > 100000000) return false;
     Q q{1, 0, 0, 0};
-    p.samples.reserve(n);
+    p.samples.reserve(std::min(n, s.size() / 12));  // (each takes a line of at least 12 characters)
     for (size_t i = 0; i < n; ++i) {
         long r[3], u[3];
         if (!(in >> r[0] >> r[1] >> r[2] >> u[0] >> u[1] >> u[2])) return false;
@@ -687,7 +720,7 @@ void pathAt(const GyroPath& p, double t, Q& q, V& up) {
 }  // namespace
 
 bool refineGyroLens(const std::string& videoPath, const MotionData& d, GyroSync& sync, double fps, double from, double to,
-                    std::string* error) {
+                    std::string* error, const std::atomic<bool>* cancel) {
     if (fps <= 0 || to - from < 4 / fps || sync.focal <= 0) {
         if (error) *error = "Too short to measure the lens";
         return false;
@@ -728,6 +761,10 @@ bool refineGyroLens(const std::string& videoPath, const MotionData& d, GyroSync&
     std::vector<Pair> pairs;
     size_t points = 0;
     for (int i : picks) {
+        if (cancel && cancel->load()) {
+            if (error) *error = "Cancelled";
+            return false;
+        }
         const Frame16Ptr fa = dec.frameAt(from + i / fps + 1e-4, aw, ah), fb = dec.frameAt(from + (i + 1) / fps + 1e-4, aw, ah);
         if (!fa || !fb) continue;
         const GrayImage ga = toGray(*fa), gb = toGray(*fb);
@@ -789,6 +826,15 @@ bool refineGyroLens(const std::string& videoPath, const MotionData& d, GyroSync&
     return true;
 }
 
+bool gyroPathSummary(const std::string& s, std::string& source, double& focal) {
+    std::istringstream in(s);
+    std::string line;
+    if (!std::getline(in, line) || line != "gyro 1" || !std::getline(in, source)) return false;
+    double fps = 0, start = 0;
+    int perFrame = 0;
+    return bool(in >> fps >> start >> perFrame >> focal) && fps > 0 && focal > 0;
+}
+
 // ---- Stabilising -------------------------------------------------------------------------------------------------------
 
 std::vector<GyroCorrection> gyroCorrections(const GyroPath& p, const GyroStabilizeSettings& s) {
@@ -811,28 +857,46 @@ std::vector<GyroCorrection> gyroCorrections(const GyroPath& p, const GyroStabili
         const V w = qlog(qmul(qconj(a), b));  // in the camera's axes, over 2h
         spin[i] = {w[0] / (2 * h * p.fps), w[1] / (2 * h * p.fps), w[2] / (2 * h * p.fps)};
     }
-    // The smoothed orientation: a Gaussian-weighted mean of the frames around (0 seconds: the first frame's).
+    // The smoothed orientation: a near-Gaussian mean of the frames around (three running means, so long clips and
+    // wide smoothing cost no more; the quaternions kept on one side, as their signs are free), 0 seconds: the first
+    // frame's.
     const double sigma = s.smoothSeconds * p.fps / 2;
+    using Row = std::array<double, 7>;  // the orientation (4) and the way up in the world (3)
+    std::vector<Row> path(frames);
+    for (size_t i = 0; i < frames; ++i) {
+        Q q = r[i];
+        if (i > 0 && qdot(q, Q{path[i - 1][0], path[i - 1][1], path[i - 1][2], path[i - 1][3]}) < 0)
+            for (double& v : q) v = -v;
+        path[i] = {q[0], q[1], q[2], q[3], upWorld[i][0], upWorld[i][1], upWorld[i][2]};
+    }
+    if (sigma > 0.01) {
+        // Three boxes of this half-width make a Gaussian of the same spread; beyond the ends, the end frames repeated.
+        const long half = std::max(1L, std::lround((std::sqrt(4 * sigma * sigma + 1) - 1) / 2));
+        const long last = long(frames) - 1;
+        std::vector<Row> pre(frames + 1), next(frames);
+        for (int pass = 0; pass < 3; ++pass) {
+            pre[0] = Row{};
+            for (size_t i = 0; i < frames; ++i)
+                for (size_t c = 0; c < 7; ++c) pre[i + 1][c] = pre[i][c] + path[i][c];
+            for (long i = 0; i <= last; ++i) {
+                const long a = i - half, b = i + half;
+                for (size_t c = 0; c < 7; ++c) {
+                    double sum = pre[size_t(std::min(b, last) + 1)][c] - pre[size_t(std::max(a, 0L))][c];
+                    if (a < 0) sum += double(-a) * path[0][c];
+                    if (b > last) sum += double(b - last) * path[size_t(last)][c];
+                    next[size_t(i)][c] = sum / double(2 * half + 1);
+                }
+            }
+            path.swap(next);
+        }
+    } else {
+        for (size_t i = 0; i < frames; ++i)
+            for (size_t c = 0; c < 4; ++c) path[i][c] = path[0][c];  // (held; the way up still each frame's)
+    }
     out.resize(frames);
     for (size_t i = 0; i < frames; ++i) {
-        Q smooth = r[0];
-        V upw = upWorld[0];
-        if (sigma > 0.01) {
-            const int radius = int(std::ceil(3 * sigma));
-            Q sum{0, 0, 0, 0};
-            V usum{0, 0, 0};
-            for (int k = -radius; k <= radius; ++k) {
-                const long j = std::clamp<long>(long(i) + k, 0, long(frames) - 1);
-                const double w = std::exp(-0.5 * k * k / (sigma * sigma));
-                const double sgn = qdot(r[size_t(j)], r[i]) < 0 ? -1 : 1;
-                for (int c = 0; c < 4; ++c) sum[size_t(c)] += sgn * w * r[size_t(j)][size_t(c)];
-                for (int c = 0; c < 3; ++c) usum[size_t(c)] += w * upWorld[size_t(j)][size_t(c)];
-            }
-            smooth = qnorm(sum);
-            upw = usum;
-        } else {
-            upw = upWorld[i];
-        }
+        Q smooth = qnorm(Q{path[i][0], path[i][1], path[i][2], path[i][3]});
+        const V upw{path[i][4], path[i][5], path[i][6]};
         // The horizon: turned about the view's axis until up is straight up in the picture (less when looking
         // nearly straight up or down, where there is no horizon to level).
         if (s.horizon > 0 && vlen(upw) > 1e-6) {

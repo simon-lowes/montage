@@ -2061,7 +2061,7 @@ void McpServer::Impl::addTools() {
         "remove_background cuts people out (keep 1 keeps the background instead), and mask.shape 4 limits any effect to "
         "the people in the picture. object_removal paints out whatever its mask covers and fills it in. stabilize and "
         "rolling_shutter (straightening the skew a rolling shutter gives pans; readout as a percentage of a frame) measure "
-        "the camera's movement when added; when the clip has camera motion data (a GoPro's, a CAMM track, a Gyroflow .gcsv "
+        "the camera's movement when added; when the clip has camera motion data (a GoPro GPMF track, a CAMM track, a .gcsv log "
         "beside it) stabilize lines it up and uses it (method 3, Camera Gyro, unless params give another method; horizon "
         "0-100 levels the horizon from gravity).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
@@ -2221,17 +2221,20 @@ void McpServer::Impl::addTools() {
                     return fail(QStringLiteral("Could not measure the camera's movement: %1").arg(QString::fromStdString(err)));
                 e.strings["motion"] = motion;
                 QString note;
+                bool usingGyro = false;
                 if (steady && !gyro.empty()) {
                     e.strings["gyro"] = gyro;
                     if (!a.value("params").toObject().contains("method")) e.params["method"] = Param(3);
-                    note = QStringLiteral(" (with the camera's motion data)");
+                    usingGyro = std::lround(e.p("method", 0, 2)) == 3;
+                    note = usingGyro ? QStringLiteral(" (with the camera's motion data)")
+                                     : QStringLiteral(" (camera motion data found: method 3 uses it)");
                 } else if (steady && !gyroNote.empty() && gyroNote != "The clip has no camera motion data") {
                     note = QStringLiteral(" (camera motion data not used: %1)").arg(QString::fromStdString(gyroNote));
                 }
                 c.effects.insert(c.effects.begin(), e);
                 save(l);
                 return ok(QStringLiteral("Added %1 to %2%3").arg(QString::fromStdString(displayName), QString::fromStdString(c.name), note),
-                          QJsonObject{{"effect_id", double(e.id)}, {"camera_gyro", !gyro.empty()}});
+                          QJsonObject{{"effect_id", double(e.id)}, {"camera_gyro", usingGyro}});
             }
             c.effects.push_back(e);
             save(l);

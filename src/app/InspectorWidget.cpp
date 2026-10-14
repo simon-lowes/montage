@@ -833,12 +833,13 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                                                                       : tr("Not analysed yet"));
             if (e.type == "stabilize") {
                 // Camera Gyro is offered once the analysis has found the camera's motion data and lined it up.
-                GyroPath gp;
-                const bool gyro = gyroPathFromString(e.s("gyro"), gp);
+                std::string source;
+                double focal = 0;
+                const bool gyro = gyroPathSummary(e.s("gyro"), source, focal);
                 if (gyro)
                     status->setText(status->text() + tr("; camera motion data: %1, %2° lens")
-                                                         .arg(QString::fromStdString(gp.source))
-                                                         .arg(2 * std::atan(0.5 / gp.focal) * 180 / M_PI, 0, 'f', 0));
+                                                         .arg(QString::fromStdString(source))
+                                                         .arg(2 * std::atan(0.5 / focal) * 180 / M_PI, 0, 'f', 0));
                 if (QWidget* section = f->parentWidget())
                     if (auto* method = section->findChild<QComboBox*>(QStringLiteral("choice_method")))
                         if (auto* model = qobject_cast<QStandardItemModel*>(method->model()))

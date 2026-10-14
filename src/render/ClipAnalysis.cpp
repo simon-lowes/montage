@@ -49,19 +49,24 @@ bool analyzeClipStabilization(const Project& p, const Sequence& s, const Clip& c
     CameraMotion cm = analyzeCameraMotion(m->path, from, to, progress, cancel, error);
     if (cm.steps.empty()) return false;
     motion = cameraMotionToString(cm);
-    if (gyro && hasMotionData(m->path)) {
+    if (gyro && !m->projection.empty()) {
+        if (gyroNote) *gyroNote = "360° footage: Camera Gyro works on flat pictures";
+    } else if (gyro && hasMotionData(m->path)) {
         // The readings, lined up with the movement just measured.
         MotionData d;
         GyroSync sync;
         std::string why;
-        if (readMotionData(m->path, d, &why) && syncMotionData(d, cm, sync, &why)) {
+        if (readMotionData(m->path, d, &why) && syncMotionData(d, cm, sync, &why, 2.0, cancel)) {
             const double end = cm.start + double(cm.steps.size() - 1) / cm.fps;
-            refineGyroLens(m->path, d, sync, cm.fps, cm.start, end);  // (else the tracker's measure stands)
+            refineGyroLens(m->path, d, sync, cm.fps, cm.start, end, nullptr, cancel);  // (else the tracker's measure stands)
+            if (cancel && cancel->load()) return false;
             *gyro = gyroPathToString(gyroPath(d, sync, cm.fps, cm.start, end));
-        }
-        else if (gyroNote)
+        } else if (cancel && cancel->load()) {
+            return false;
+        } else if (gyroNote) {
             *gyroNote = why;
-    } else if (gyroNote) {
+        }
+    } else if (gyro && gyroNote) {
         *gyroNote = "The clip has no camera motion data";
     }
     return true;

@@ -1581,8 +1581,8 @@ std::shared_ptr<const StabilizePlan> stabilizePlan(const Effect& e, FrameTime t,
         }
         if (fill) plan->zoom *= 1 + 2 * std::min(reach, 0.25);
     }
-    if (cache.size() > 32) cache.clear();
-    slot = plan;
+    if (cache.size() > 32) cache.clear();  // (then `slot` is gone: stored afresh)
+    cache[key] = plan;
     return plan;
 }
 
@@ -1666,8 +1666,9 @@ struct GyroPlan {
 std::shared_ptr<const GyroPlan> gyroPlan(const Effect& e, FrameTime t, double aspect) {
     static std::mutex m;
     static std::map<std::string, std::shared_ptr<const GyroPlan>> cache;
-    const std::string& data = e.s("gyro");
-    if (data.empty()) return nullptr;
+    const auto found = e.strings.find("gyro");  // (not copied: it can run to megabytes)
+    if (found == e.strings.end() || found->second.empty()) return nullptr;
+    const std::string& data = found->second;
     GyroStabilizeSettings gs;
     gs.smoothSeconds = e.p("smoothness", t, 1.5);
     gs.horizon = std::clamp(e.p("horizon", t, 0) / 100, 0.0, 1.0);
@@ -1686,8 +1687,8 @@ std::shared_ptr<const GyroPlan> gyroPlan(const Effect& e, FrameTime t, double as
     // (Rolling Shutter at 0 takes the readout the data gives, when it gives one)
     plan->readout = readoutParam > 0 ? readoutParam : plan->path.readout > 0 ? std::min(1.0, plan->path.readout * plan->path.fps) : 0.0;
     plan->zoom = fill ? gyroZoom(plan->corrections, plan->path.focal, plan->readout, aspect) : 1.0;
-    if (cache.size() > 32) cache.clear();
-    slot = plan;
+    if (cache.size() > 32) cache.clear();  // (then `slot` is gone: stored afresh)
+    cache[key] = plan;
     return plan;
 }
 

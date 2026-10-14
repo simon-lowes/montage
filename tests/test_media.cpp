@@ -21242,7 +21242,7 @@ private:
 
 private slots:
     void gyroStabilization() {
-        // The camera's footage, and its log as Gyroflow writes one (400 readings a second, 37 ms behind the picture).
+        // The camera's footage, and its .gcsv log (400 readings a second, 37 ms behind the picture).
         const ShakyCamera cam;
         std::vector<QImage> frames;
         for (int i = 0; i < cam.frames; ++i) frames.push_back(cam.view(i / cam.fps, true));
@@ -21308,6 +21308,13 @@ private slots:
         std::string motion, gyro, note;
         QVERIFY2(analyzeClipStabilization(p, s, clip, motion, {}, nullptr, &err, &gyro, &note), err.c_str());
         QVERIFY2(!gyro.empty(), note.c_str());
+        // The camera was held about level: up (against gravity) points up the picture, -y in the camera's axes.
+        GyroPath gp;
+        QVERIFY(gyroPathFromString(gyro, gp));
+        double upY = 0;
+        for (const GyroPath::Sample& u : gp.samples) upY += u.up[1];
+        upY /= double(gp.samples.size());
+        QVERIFY2(upY < -0.8, std::to_string(upY).c_str());
         Effect st = makeEffect(p, "stabilize");
         st.strings["motion"] = motion;
         st.strings["gyro"] = gyro;
@@ -21480,8 +21487,8 @@ private slots:
     }
 
     void goproGyro() {
-        // GoPro's sample clips (github.com/gopro/gpmf-parser): HERO5 Black and HERO6 Black, which leave the picture
-        // as shot; HERO8 Black stabilises its picture itself, so its gyro does not match the picture's movement.
+        // GoPro's sample clips (github.com/gopro/gpmf-parser): HERO5 Black, which leaves the picture as shot;
+        // HERO8 Black stabilises its picture itself, so its gyro does not match the picture's movement.
         const QString dir = qEnvironmentVariable("MONTAGE_GOPRO_SAMPLES");
         if (dir.isEmpty() || !QFile::exists(dir + "/hero5.mp4")) QSKIP("Set MONTAGE_GOPRO_SAMPLES to a folder holding GoPro's hero5.mp4 to run this");
         const std::string hero5 = (dir + "/hero5.mp4").toStdString();
@@ -21511,6 +21518,13 @@ private slots:
         std::string motion, gyro, note;
         QVERIFY2(analyzeClipStabilization(p, s, clip, motion, {}, nullptr, &err, &gyro, &note), err.c_str());
         QVERIFY2(!gyro.empty(), note.c_str());
+        // Held about level: up (against gravity) points up the picture, -y in the camera's axes.
+        GyroPath gp;
+        QVERIFY(gyroPathFromString(gyro, gp));
+        double upY = 0;
+        for (const GyroPath::Sample& u : gp.samples) upY += u.up[1];
+        upY /= double(gp.samples.size());
+        QVERIFY2(upY < -0.8, std::to_string(upY).c_str());
         Effect st = makeEffect(p, "stabilize");
         st.strings["motion"] = motion;
         st.strings["gyro"] = gyro;
@@ -21537,6 +21551,10 @@ private slots:
         const double before = shake(hero5), after = shake(out);
         qInfo("HERO5 shake: %.5f -> %.5f of the width a frame", before, after);
         QVERIFY2(after < before * 0.5, qPrintable(QString("%1 -> %2").arg(before).arg(after)));
+        // Taken for 360° footage, it is refused (its picture is not a flat lens's).
+        p.media.back().projection = "equirect";
+        QVERIFY(analyzeClipStabilization(p, s, clip, motion, {}, nullptr, &err, &gyro, &note));
+        QVERIFY(gyro.empty() && QString::fromStdString(note).contains("360"));
         // HERO8's picture is already steadied in the camera: the data is found but not used.
         const std::string hero8 = (dir + "/hero8.mp4").toStdString();
         if (QFile::exists(QString::fromStdString(hero8))) {
