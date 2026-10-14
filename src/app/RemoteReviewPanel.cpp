@@ -52,7 +52,10 @@ RemoteReviewController::RemoteReviewController(PlaybackController* program, QObj
     });
 }
 
-RemoteReviewController::~RemoteReviewController() { stop(); }
+RemoteReviewController::~RemoteReviewController() {
+    blockSignals(true);  // (the window going: nothing to hand markers to)
+    stop();
+}
 
 output::StreamSettings RemoteReviewController::loadSettings() {
     QSettings s = appSettings();

@@ -474,7 +474,7 @@ struct StreamBackend::Impl {
     static int interrupted(void* opaque) {
         auto* d = static_cast<Impl*>(opaque);
         std::lock_guard lock(d->m);
-        return d->closing ? 1 : 0;
+        return d->closing || d->woken ? 1 : 0;  // (a write held up by the network gives way when stopping)
     }
 
     bool openEncoders(std::string* error) {
