@@ -7855,7 +7855,8 @@ private slots:
         QCOMPARE(exportAudioLayout("7.1.4", "aac"), std::string("7.1"));
         QCOMPARE(exportAudioLayout("5.1.4", "flac"), std::string("5.1"));
         QCOMPARE(exportAudioLayout("7.1.4", "pcm_s24le"), std::string("7.1.4"));
-        QCOMPARE(exportAudioLayout("7.1", "ac3"), std::string("5.1"));
+        // (The FFmpeg the packages bundle has no AC-3 encoder, as scripts/build-ffmpeg.sh says, so there it is not offered.)
+        if (avcodec_find_encoder_by_name("ac3")) QCOMPARE(exportAudioLayout("7.1", "ac3"), std::string("5.1"));
         QCOMPARE(exportAudioLayout("5.1", "libmp3lame"), std::string("stereo"));
         QCOMPARE(exportAudioLayout("5.1.2", ""), std::string("5.1.2"));
         for (const char* layout : {"5.1.2", "5.1.4", "7.1.2", "7.1.4"})
