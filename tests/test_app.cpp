@@ -1,6 +1,7 @@
 // Application integration tests: drive the real main window offscreen —
 // timeline mouse gestures, tools, undo, inspector, monitors and playback.
 #include <QtTest>
+#include <limits>
 #include <QDialog>
 #include <QPointer>
 #include <QSignalSpy>
@@ -1764,6 +1765,9 @@ private slots:
         }));
         toHub(tangent::parameterChange(gain, 0.25f));
         QVERIFY((v = hear(tangent::ParameterValue, gain)) && std::fabs(v->value - 1.75f) < 1e-6f);
+        // A turn that is not a number changes nothing.
+        toHub(tangent::parameterChange(gain, std::numeric_limits<float>::quiet_NaN()));
+        QVERIFY((v = hear(tangent::ParameterValue, gain)) && std::fabs(v->value - 1.75f) < 1e-6f);
         const SharedNode* look = findSharedNode(*state()->sequence(), sharedId);
         QVERIFY(look && look->effects.size() == 1);
         QVERIFY(std::fabs(look->effects[0].p("gain", 10) - 1.75) < 1e-6);
@@ -1783,6 +1787,15 @@ private slots:
         toHub(tangent::transport(0, 1));
         QTRY_COMPARE(program->speed(), 2.0);
         toHub(tangent::transport(0, -2));
+        QTRY_COMPARE(program->speed(), 0.0);
+        // However far the ring is said to turn (from a turn already made, so the two add up), it stops at 32 times.
+        toHub(tangent::transport(0, 1));
+        QTRY_COMPARE(program->speed(), 1.0);
+        toHub(tangent::transport(0, std::numeric_limits<int32_t>::max()));
+        QTRY_COMPARE(program->speed(), 32.0);
+        toHub(tangent::transport(0, std::numeric_limits<int32_t>::min()));
+        QTRY_COMPARE(program->speed(), -32.0);
+        toHub(tangent::transport(0, 6));
         QTRY_COMPARE(program->speed(), 0.0);
         const QString addMarker = "Sequence/Add Marker";
         QVERIFY(keymap::find(win_.get(), addMarker) && tc->actionId(addMarker));

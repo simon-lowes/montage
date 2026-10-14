@@ -2775,7 +2775,7 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             // as a field for an ambisonic one, decoded to the speakers (AllRAD) for the others.
             if (!nested && !m->hasAudio) continue;
             const int order = nested ? ambisonicOrder(nested->audioLayout)
-                                     : std::clamp(std::min(m->ambisonic, ambisonicOrderForChannels(m->channels)), 1, kMaxAmbisonicOrder);
+                                     : std::max(1, playedAmbisonicOrder(m->ambisonic, m->channels));
             const int nch = ambisonicChannels(order);
             const bool keep = trackField != nullptr;
             const int seqOrder = ambisonicOrder(seq.audioLayout);

@@ -2544,6 +2544,88 @@ private slots:
         QCOMPARE(edit::clipById(bs, id)->effects, edit::clipById(s, id)->effects);
         QCOMPARE(bs.sharedNodes, s.sharedNodes);
         QVERIFY(back.nextId > shared);
+        {
+            // A project saved before Video NR and the like were kept out of nodes: in a node of the clip's own and in
+            // the shared node, they come out onto the clips, as they ran (the shared one onto each clip showing it).
+            Project old = p;
+            Sequence& os = *old.active();
+            Effect nr = makeEffect(old, "video_denoise");
+            nr.node = 1;
+            edit::clipById(os, id)->effects.push_back(nr);
+            Effect scale = makeEffect(old, "super_scale");
+            os.sharedNodes[0].effects.push_back(scale);
+            Project loaded;
+            QVERIFY2(projectFromJson(projectToJson(old), loaded, &err), err.c_str());
+            const Sequence& ls = *loaded.active();
+            QCOMPARE(ls.sharedNodes[0].effects.size(), size_t(1));
+            std::set<Id> ids;
+            for (Id clip : {id, otherId}) {
+                int nrs = 0, scales = 0;
+                for (const Effect& e : edit::clipById(ls, clip)->effects) {
+                    nrs += e.type == "video_denoise", scales += e.type == "super_scale";
+                    if (e.type == "video_denoise" || e.type == "super_scale") {
+                        QCOMPARE(e.node, 0);
+                        QVERIFY(e.enabled);
+                        QVERIFY(ids.insert(e.id).second);
+                    }
+                }
+                QCOMPARE(nrs, clip == id ? 1 : 0);
+                QCOMPARE(scales, 1);
+            }
+            QVERIFY(edit::clipById(ls, id)->grade == edit::clipById(s, id)->grade);
+        }
+        auto count = [](const Clip& c, const char* type, bool* on = nullptr) {
+            int n = 0;
+            for (const Effect& e : c.effects)
+                if (e.type == type) {
+                    ++n;
+                    if (on) *on = e.enabled;
+                    if (e.node != 0) return -1;
+                }
+            return n;
+        };
+        {
+            // In a node switched off: out, and off.
+            Project old = p;
+            Sequence& os = *old.active();
+            Effect nr = makeEffect(old, "video_denoise");
+            nr.node = 1;
+            edit::clipById(os, id)->effects.push_back(nr);
+            findGradeNode(edit::clipById(os, id)->grade, 1)->enabled = false;
+            Project loaded;
+            QVERIFY(projectFromJson(projectToJson(old), loaded, &err));
+            bool on = true;
+            QCOMPARE(count(*edit::clipById(*loaded.active(), id), "video_denoise", &on), 1);
+            QVERIFY(!on);
+            // Shared now, from a node switched off: it stays on the clip, off.
+            Sequence& os2 = *old.active();
+            Id look = 0;
+            QVERIFY(edit::shareGradeNode(old, os2, id, 1, "Off", &look).ok);
+            QCOMPARE(count(*edit::clipById(os2, id), "video_denoise", &on), 1);
+            QVERIFY(!on);
+            QVERIFY(findSharedNode(os2, look)->effects.size() == 1);
+        }
+        {
+            // In a stored grade version: onto the clip once, off (the version showing has none), and switching
+            // versions neither loses nor doubles it.
+            Project old = p;
+            Sequence& os = *old.active();
+            Effect nr = makeEffect(old, "video_denoise");
+            nr.node = 1;
+            edit::clipById(os, id)->effects.push_back(nr);
+            QVERIFY(edit::addGradeVersion(old, os, id, {}, true).ok);
+            QCOMPARE(count(*edit::clipById(os, id), "video_denoise"), 0);
+            Project loaded;
+            QVERIFY(projectFromJson(projectToJson(old), loaded, &err));
+            Sequence& ls = *loaded.active();
+            bool on = true;
+            QCOMPARE(count(*edit::clipById(ls, id), "video_denoise", &on), 1);
+            QVERIFY(!on);
+            for (int v : {0, 1, 0}) {
+                QVERIFY(edit::switchGradeVersion(ls, id, v).ok);
+                QCOMPARE(count(*edit::clipById(ls, id), "video_denoise"), 1);
+            }
+        }
         // Split: both halves keep the graph and their effects' nodes.
         QVERIFY(edit::razor(p, s, {TrackKind::Video, 0}, 30).ok);
         const Clip& right = s.videoTracks[0].clips.at(1);
@@ -6268,6 +6350,13 @@ private slots:
     void higherOrderAmbisonics() {
         auto near = [](double a, double b, double tol = 1e-4) { return std::fabs(a - b) < tol; };
         QCOMPARE(ambisonicChannels(3), 16);
+        // A file is played at the order marked, no higher than its channels hold (so the sound decoded ahead is the
+        // one the mixer reads), and not as a field under four channels.
+        QCOMPARE(playedAmbisonicOrder(3, 9), 2);
+        QCOMPARE(playedAmbisonicOrder(1, 16), 1);
+        QCOMPARE(playedAmbisonicOrder(5, 16), 3);
+        QCOMPARE(playedAmbisonicOrder(1, 2), 0);
+        QCOMPARE(playedAmbisonicOrder(0, 4), 0);
         QCOMPARE(ambisonicOrderForChannels(3), 0);
         QCOMPARE(ambisonicOrderForChannels(8), 1);
         QCOMPARE(ambisonicOrderForChannels(9), 2);

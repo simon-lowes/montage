@@ -187,6 +187,8 @@ private:
         bool is1D;
     };
     std::map<const Lut3D*, LutTex> luts_;
+    // Those first uploaded in this frame: forgotten if it fails, as their uploads may not have been submitted.
+    std::vector<const Lut3D*> lutsNew_;
 };
 
 bool Device::start(std::string* why) {
@@ -368,6 +370,7 @@ bool Device::create() {
 void Device::destroy() {
     for (auto& [lut, t] : luts_) delete t.tex;
     luts_.clear();
+    lutsNew_.clear();
     for (auto& [tex, t] : targets_) delete t.rt, delete t.rp;
     targets_.clear();
     for (Pooled& p : pool_) delete p.tex;
@@ -458,6 +461,7 @@ QRhiTexture* Device::lutTexture(const std::shared_ptr<const Lut3D>& lut, QRhiRes
         desc.setEntries(entries.cbegin(), entries.cend());
         u->uploadTexture(t, desc);
         it = luts_.emplace(lut.get(), LutTex{lut, t, lut->is1D}).first;
+        lutsNew_.push_back(lut.get());
     }
     if (it->second.is1D) {
         *table1d = it->second.tex;
@@ -806,6 +810,13 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
     }
     if (u) u->release();
     if (rhi_->endOffscreenFrame() != QRhi::FrameOpSuccess || failed_) ok = false;
+    if (!ok)
+        for (const Lut3D* l : lutsNew_)
+            if (auto it = luts_.find(l); it != luts_.end()) {
+                delete it->second.tex;
+                luts_.erase(it);
+            }
+    lutsNew_.clear();
     endFrame();
     if (!ok) return false;
     const size_t bytes = size_t(W) * H * (out8 ? 4 : 16);

@@ -19,6 +19,7 @@
 #include <set>
 #include <utility>
 
+#include "core/Ambisonics.h"
 #include "core/MediaLog.h"
 #include "core/ProjectIO.h"
 #include "core/ProjectLock.h"
@@ -625,9 +626,10 @@ void EditorState::startClipAudioDecodes() {
                 const MediaItem* m = project_.findMedia(c.mediaId);
                 if (!m || !m->hasAudio || m->path.empty()) continue;
                 // An ambisonic file's field (core/Ambisonics.h), or the channels a clip picked.
-                const bool field = m->ambisonic > 0 && c.channels.empty();
-                if (c.channels.empty() && !field) continue;
-                std::string key = field ? ambisonicAudioKey(m->path, m->ambisonic) : audioKey(m->path, c.channels);
+                // (at the order the mixer asks for: no higher than the file's channels hold)
+                const int order = c.channels.empty() ? playedAmbisonicOrder(m->ambisonic, m->channels) : 0;
+                if (c.channels.empty() && !order) continue;
+                std::string key = order ? ambisonicAudioKey(m->path, order) : audioKey(m->path, c.channels);
                 if (!clipAudioRequested_.insert({key, rate}).second) continue;
                 (void)QtConcurrent::run([key, rate] { MediaPool::instance().audio(key, rate); });
             }

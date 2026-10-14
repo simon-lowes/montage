@@ -776,11 +776,11 @@ private slots:
             h.u64(ts);
             out.b += h.b + payload;
         };
-        auto fileHeader = [](Le& out, int videoClass, int fileNum, int fileCount, int frames, int fpsNum, int fpsDen) {
+        auto fileHeader = [](Le& out, int videoClass, int fileNum, int fileCount, int frames, int fpsNum, int fpsDen, uint64_t guid) {
             out.b += "MLVI";
             out.u32(52);
             out.str("v2.0", 8);
-            out.u64(0xC0FFEE);
+            out.u64(guid);
             out.u16(fileNum), out.u16(fileCount);
             out.u32(0);
             out.u16(videoClass), out.u16(1);
@@ -872,11 +872,12 @@ private slots:
             int rawiWidth = 0;    // (0: W)
             int wbMode = -1, wbKelvin = 0;  // (-1: no WBAL)
             bool anamorphic = false;  // RAWC: 1x3 binning
+            uint64_t guid = 0xC0FFEE;  // the recording's
         };
         auto write = [&](const std::string& path, const Spec& sp) {
             std::vector<Le> files(size_t(sp.chunks));
             const int videoClass = sp.videoClass ? sp.videoClass : (sp.lossless ? 0x21 : 0x01);
-            for (int c = 0; c < sp.chunks; ++c) fileHeader(files[size_t(c)], videoClass, c, sp.chunks, sp.frames, 23976, 1000);
+            for (int c = 0; c < sp.chunks; ++c) fileHeader(files[size_t(c)], videoClass, c, sp.chunks, sp.frames, 23976, 1000, sp.guid);
             Le& first = files[0];
             Le rawi;
             rawi.u16(sp.rawiWidth ? sp.rawiWidth : W), rawi.u16(H);
@@ -1052,6 +1053,21 @@ private slots:
             std::vector<uint16_t> want;
             QVERIFY(reader.readMosaic(5, want, &err));
             QVERIFY2(lm == want, qPrintable(QString::number(predictor)));
+        }
+        {
+            // A chunk left over from another recording of the same name (another GUID) is not taken as this one's.
+            Spec sp, other;
+            sp.chunks = other.chunks = 3;
+            other.guid = 0xBADF00D;
+            const std::string p = path("mixed.mlv"), q = path("other.mlv");
+            write(p, sp);
+            write(q, other);
+            QVERIFY(QFile::remove(QString::fromStdString(path("mixed.M01"))));
+            QVERIFY(QFile::copy(QString::fromStdString(path("other.M01")), QString::fromStdString(path("mixed.M01"))));
+            MlvReader r;
+            QVERIFY2(r.open(p, &err), err.c_str());
+            QCOMPARE(r.info().chunks, 2);
+            QCOMPARE(r.info().frames, 4);
         }
         {
             Spec sp;

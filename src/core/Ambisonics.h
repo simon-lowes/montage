@@ -10,6 +10,7 @@
 // degrees above the ear.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <memory>
 #include <string>
@@ -24,6 +25,12 @@ constexpr int kMaxAmbisonicOrder = 3;
 inline int ambisonicChannels(int order) { return (order + 1) * (order + 1); }
 // The highest order `channels` hold (1 to 3), or 0 under four.
 int ambisonicOrderForChannels(int channels);
+// The order a file marked as an ambisonic field of `marked` order is played at: no higher than its `channels` hold;
+// 0 if it is not played as a field (not marked, or under four channels).
+inline int playedAmbisonicOrder(int marked, int channels) {
+    const int held = ambisonicOrderForChannels(channels);
+    return marked > 0 && held > 0 ? std::min(std::min(marked, held), kMaxAmbisonicOrder) : 0;
+}
 
 // The four channel gains of a sound from a direction (W 1; Y, Z, X its direction scaled by `focus`, 0 heard
 // everywhere alike, 1 a point).
