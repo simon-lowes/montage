@@ -6323,7 +6323,7 @@ private slots:
 
     void sourceEffectsInNodes() {
         // Effects that work on the picture as it comes (here Reframe 360) run before the grade whichever node holds
-        // them: off with their node, and run from a shared node.
+        // them, off with their node; sharing the node leaves them on the clip.
         const std::string png = path("nodes-gradient.png");
         {
             QImage img(320, 180, QImage::Format_RGB32);
@@ -6361,12 +6361,13 @@ private slots:
         clip().grade.nodes[0].enabled = false;
         QVERIFY2(diff(renderProgramFrame(p, s, 2, o), plain) < 1e-4f, qPrintable(QString::number(diff(renderProgramFrame(p, s, 2, o), plain))));
         clip().grade.nodes[0].enabled = true;
-        // Shared, the node's effects in the shared node: still turned; and not with the node off.
+        // Shared: the node's own effects go into the shared node, the turn stays on the clip outside the graph (where
+        // it always ran); still turned.
         QVERIFY(edit::shareGradeNode(p, s, id, 1, "Look").ok);
-        QCOMPARE(s.sharedNodes.at(0).effects.size(), size_t(2));
+        QCOMPARE(s.sharedNodes.at(0).effects.size(), size_t(1));
+        QCOMPARE(clip().effects.back().type, std::string("reframe_360"));
+        QVERIFY(clip().effects.back().node == 0 && clip().effects.back().enabled);
         QVERIFY2(diff(renderProgramFrame(p, s, 2, o), turned) < 1e-4f, qPrintable(QString::number(diff(renderProgramFrame(p, s, 2, o), turned))));
-        clip().grade.nodes[0].enabled = false;
-        QVERIFY(diff(renderProgramFrame(p, s, 2, o), plain) < 1e-4f);
         // Such effects stay outside nodes: not moved into one, left out when converting.
         Clip& d = clip();
         d.grade = {};
