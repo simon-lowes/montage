@@ -965,6 +965,18 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         for (const auto& f : p.watchFolders) folders.append(qs(f));
         root["watchFolders"] = folders;
     }
+    if (!p.script.text.empty()) {
+        QJsonArray lines;
+        for (const auto& line : p.script.readings) {
+            QJsonArray takes;
+            for (const ScriptReading& r : line)
+                takes.append(QJsonObject{{"media", double(r.media)}, {"start", r.start}, {"end", r.end}, {"coverage", r.coverage},
+                                         {"extra", r.extraWords}, {"score", r.score}});
+            lines.append(takes);
+        }
+        root["script"] = QJsonObject{{"name", qs(p.script.name)}, {"format", qs(p.script.format)}, {"text", qs(p.script.text)},
+                                     {"readings", lines}};
+    }
     if (!p.fillerWords.empty()) {
         QJsonArray words;
         for (const auto& w : p.fillerWords) words.append(qs(w));
@@ -1088,6 +1100,24 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         if (!f.toString().isEmpty()) p.watchFolders.push_back(ss(f));
     for (const auto& w : root.value("fillerWords").toArray())
         if (!w.toString().trimmed().isEmpty()) p.fillerWords.push_back(ss(w));
+    if (const QJsonObject so = root.value("script").toObject(); !so.isEmpty()) {
+        p.script.name = ss(so.value("name"));
+        p.script.format = ss(so.value("format"));
+        p.script.text = ss(so.value("text"));
+        for (const auto& lv : so.value("readings").toArray()) {
+            std::vector<ScriptReading> line;
+            for (const auto& tv : lv.toArray()) {
+                const QJsonObject t = tv.toObject();
+                ScriptReading r;
+                r.media = Id(i64(t.value("media")));
+                r.start = t.value("start").toDouble(), r.end = t.value("end").toDouble();
+                r.coverage = t.value("coverage").toDouble(), r.extraWords = t.value("extra").toInt();
+                r.score = t.value("score").toDouble();
+                if (r.media) line.push_back(r);
+            }
+            p.script.readings.push_back(std::move(line));
+        }
+    }
     for (const auto& bv : root.value("smartBins").toArray()) {
         const QJsonObject o = bv.toObject();
         SmartBin b;

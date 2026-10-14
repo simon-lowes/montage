@@ -5240,6 +5240,188 @@ private slots:
         QCOMPARE(none.missing, 1);
     }
 
+    void screenplays() {
+        using K = ScriptBlock::Kind;
+        auto kinds = [](const Screenplay& sp) {
+            std::vector<K> out;
+            for (const ScriptBlock& b : sp.blocks) out.push_back(b.kind);
+            return out;
+        };
+        // Plain text: the lines are parseScript's, and what it leaves out stays on the page in order.
+        const std::string plain = "INT. KITCHEN - DAY\n\nJOHN\nI never thought we would make it this far.\n\n"
+                                  "MARY (V.O.)\n(quietly)\nNeither did I, but here we are.\n\nCUT TO:\n\n"
+                                  "Narrator: The end of a long road.\n";
+        const Screenplay text = plainScreenplay(plain);
+        QCOMPARE(text.lines, parseScript(plain));
+        QCOMPARE(kinds(text), (std::vector<K>{K::Heading, K::Character, K::Dialogue, K::Character, K::Parenthetical, K::Dialogue,
+                                              K::Transition, K::Character, K::Dialogue}));
+        QCOMPARE(text.blocks[5].firstLine, 1);
+        QCOMPARE(text.blocks[5].lineCount, 1);
+        QCOMPARE(text.blocks[4].text, std::string("(quietly)"));
+
+        // Fountain: a title page, headings (one forced, one numbered), action over two lines, cues with an extension,
+        // a dual cue and a forced one, a parenthetical between two parts of a speech, a transition, centred text, a
+        // lyric, a page break, and notes, boneyard, sections and emphasis left off the page.
+        const std::string fountain = "Title: **The Long Road**\nCredit: written by\nAuthor: Someone\n\n"
+                                     "# Act one\n\nINT. KITCHEN - DAY #12A#\n\n"
+                                     "The kettle *boils*. [[a note]]\nJohn waits.\n\n"
+                                     "JOHN (V.O.)\nI never thought we would make it this far.\n(beat)\nBut here we are.\n\n"
+                                     "MARY ^\nNeither did I.\n\n"
+                                     "/* an old scene\n\nBOB\nCut words.\n*/\n"
+                                     "@McCLANE\nYippee.\n\n"
+                                     "!SHOUTING FROM OUTSIDE.\n\n"
+                                     "CUT TO:\n\n.FLASHBACK\n\n> THE END <\n\n~Sing a song\n\n===\n\n= a synopsis\n\n"
+                                     "EXT. ROAD - NIGHT\n\n>SMASH CUT TO:\n";
+        const Screenplay fs = parseFountain(fountain);
+        QCOMPARE(fs.title, std::string("The Long Road"));
+        QCOMPARE(kinds(fs), (std::vector<K>{K::Heading, K::Action, K::Character, K::Dialogue, K::Parenthetical, K::Dialogue,
+                                            K::Character, K::Dialogue, K::Character, K::Dialogue, K::Action, K::Transition,
+                                            K::Heading, K::Centered, K::Lyric, K::PageBreak, K::Heading, K::Transition}));
+        QCOMPARE(fs.blocks[0].text, std::string("INT. KITCHEN - DAY"));
+        QCOMPARE(fs.blocks[1].text, std::string("The kettle boils.\nJohn waits."));
+        QCOMPARE(fs.blocks[2].text, std::string("JOHN (V.O.)"));
+        QCOMPARE(fs.blocks[6].text, std::string("MARY"));
+        QCOMPARE(fs.blocks[8].text, std::string("McCLANE"));
+        QCOMPARE(fs.blocks[10].text, std::string("SHOUTING FROM OUTSIDE."));
+        QCOMPARE(fs.blocks[12].text, std::string("FLASHBACK"));
+        QCOMPARE(fs.blocks[13].text, std::string("THE END"));
+        QCOMPARE(fs.blocks[17].text, std::string("SMASH CUT TO:"));
+        QCOMPARE(fs.lines.size(), size_t(4));
+        QCOMPARE(fs.lines[0], (ScriptLine{"John", "I never thought we would make it this far."}));
+        QCOMPARE(fs.lines[1], (ScriptLine{"John", "But here we are."}));
+        QCOMPARE(fs.lines[2], (ScriptLine{"Mary", "Neither did I."}));
+        QCOMPARE(fs.lines[3], (ScriptLine{"Mcclane", "Yippee."}));
+        QCOMPARE(fs.blocks[5].firstLine, 1);
+        // A note on a line of its own and Fountain's two-space line keep a speech going; a title page may open with
+        // any key; a "#" line in plain text leaves the paragraph whole, as parseScript always did.
+        const Screenplay kept = parseFountain("Format: short\nTitle: Kept\n\nANNA\nFirst part.\n[[a note]]\nSecond part.\n  \nThird part.\n");
+        QCOMPARE(kept.title, std::string("Kept"));
+        QCOMPARE(kinds(kept), (std::vector<K>{K::Character, K::Dialogue}));
+        QCOMPARE(kept.lines, (std::vector<ScriptLine>{{"Anna", "First part. Second part. Third part."}}));
+        QCOMPARE(parseScript("JOHN\nHi there.\n#\nBye now.\n"), (std::vector<ScriptLine>{{"John", "Hi there. Bye now."}}));
+        QCOMPARE(scriptFormat("", "@ANNA\nHello.\n"), std::string("fountain"));
+        // An all-capitals line with a blank line after it is action, not a cue.
+        QCOMPARE(kinds(parseFountain("\nBANG!\n\nNothing.\n")), (std::vector<K>{K::Action, K::Action}));
+        // A screenplay that opens on FADE IN: has no title page.
+        QCOMPARE(parseFountain("FADE IN:\n\nINT. HALL - DAY\n").blocks.size(), size_t(2));
+
+        // Final Draft, through Fountain: each paragraph as the file says it is.
+        const std::string fdx = R"(<?xml version="1.0"?><FinalDraft DocumentType="Script"><Content>
+            <Paragraph Type="Scene Heading"><Text>INT. HALL - NIGHT</Text></Paragraph>
+            <Paragraph Type="Action"><Text>ALL CAPS ACTION.</Text></Paragraph>
+            <Paragraph Type="Character"><Text>Mary</Text></Paragraph>
+            <Paragraph Type="Parenthetical"><Text>whispering</Text></Paragraph>
+            <Paragraph Type="Dialogue"><Text>Is anyone </Text><Text>there?</Text></Paragraph>
+            <Paragraph Type="Transition"><Text>FADE OUT.</Text></Paragraph></Content></FinalDraft>)";
+        const Screenplay fd = parseFountain(fdxToFountain(fdx));
+        QCOMPARE(kinds(fd), (std::vector<K>{K::Heading, K::Action, K::Character, K::Parenthetical, K::Dialogue, K::Transition}));
+        QCOMPARE(fd.blocks[3].text, std::string("(whispering)"));
+        QCOMPARE(fd.lines, (std::vector<ScriptLine>{{"Mary", "Is anyone there?"}}));
+
+        QCOMPARE(scriptFormat("a.fdx", "x"), std::string("fdx"));
+        QCOMPARE(scriptFormat("", fdx), std::string("fdx"));
+        QCOMPARE(scriptFormat("a.fountain", "x"), std::string("fountain"));
+        QCOMPARE(scriptFormat("", "Title: X\n\nINT. A"), std::string("fountain"));
+        QCOMPARE(scriptFormat("notes.txt", plain), std::string("text"));
+    }
+
+    void projectScript() {
+        // Two takes, as in scriptCut: the first flubs line one and has line two, the second has lines one and three
+        // (line three twice: its best reading is kept).
+        auto said = [](Transcript& t, double at, const std::string& text) {
+            TranscriptSegment seg;
+            seg.start = at;
+            seg.text = text;
+            for (const QString& w : QString::fromStdString(text).split(' ')) {
+                seg.words.push_back({at, at + 0.35, w.toStdString(), -1, {}});
+                at += 0.4;
+            }
+            seg.end = at;
+            t.segments.push_back(seg);
+        };
+        Fixture fx;
+        Project& p = fx.p;
+        Transcript t1, t2;
+        said(t1, 1.0, "um I never thought we we would make it this far");
+        said(t1, 6.0, "neither did I but here we are");
+        said(t2, 2.0, "I never thought we would make it this far");
+        said(t2, 8.0, "the end of a long road the end of a long road");
+        p.findMedia(fx.media)->transcript = std::make_shared<const Transcript>(t1);
+        MediaItem m2 = *p.findMedia(fx.media);
+        m2.id = p.newId();
+        m2.name = "take2.mov";
+        m2.duration = 20;
+        m2.transcript = std::make_shared<const Transcript>(t2);
+        p.media.push_back(m2);
+        const std::string script = "Title: Road\n\nJOHN\nI never thought we would make it this far.\n\n"
+                                   "MARY\nNeither did I, but here we are.\n\nNARRATOR\nThe end of a long road.\n\n"
+                                   "JOHN\nSomething nobody said at all.\n";
+        QCOMPARE(setProjectScript(p, "road.fountain", "", script), 3);
+        QCOMPARE(p.script.format, std::string("fountain"));
+        QCOMPARE(p.script.readings.size(), size_t(4));
+        QCOMPARE(p.script.readings[0].size(), size_t(2));
+        QCOMPARE(p.script.readings[0][0].media, m2.id);  // the clean reading first
+        QCOMPARE(p.script.readings[1].size(), size_t(1));
+        QCOMPARE(p.script.readings[2].size(), size_t(2));  // the second take says it twice: both kept
+        QCOMPARE(p.script.readings[2][0].media, m2.id);
+        QCOMPARE(p.script.readings[2][1].media, m2.id);
+        QVERIFY(p.script.readings[3].empty());
+        // Saved and read back with the project.
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(p), back));
+        QCOMPARE(back.script, p.script);
+        // Which lines the cut uses: a cut built from the script uses each found line's best reading; without it, the
+        // other take's reading once its clip is turned on.
+        const auto res = buildScriptCut(p, matchScript(p, readScreenplay(p.script).lines), "Cut");
+        Sequence& cut = *p.findSequence(res.sequence);
+        QCOMPARE(scriptLinesInCut(p, cut), (std::vector<int>{0, 0, 0, -1}));
+        cut.videoTracks[0].clips.erase(cut.videoTracks[0].clips.begin());
+        cut.audioTracks[0].clips.erase(cut.audioTracks[0].clips.begin());
+        QCOMPARE(scriptLinesInCut(p, cut), (std::vector<int>{-1, 0, 0, -1}));  // (the alternate above is off)
+        cut.videoTracks[1].clips[0].enabled = true;
+        QCOMPARE(scriptLinesInCut(p, cut), (std::vector<int>{1, 0, 0, -1}));
+        for (Track& t : cut.videoTracks)
+            for (Clip& c : t.clips) c.enabled = false;
+        for (Track& t : cut.audioTracks)
+            for (Clip& c : t.clips) c.enabled = false;
+        QCOMPARE(scriptLinesInCut(p, cut), (std::vector<int>{-1, -1, -1, -1}));
+        // A reading other than a take's best counts too (its second saying of line three), and so do clips inside a
+        // compound clip.
+        for (Track& t : cut.videoTracks)
+            for (Clip& c : t.clips) c.enabled = true;
+        for (Track& t : cut.audioTracks)
+            for (Clip& c : t.clips) c.enabled = true;
+        const ScriptReading second = p.script.readings[2][1];
+        Sequence& flat = p.sequences.front();
+        for (Track& t : flat.videoTracks) t.clips.clear();
+        for (Track& t : flat.audioTracks) t.clips.clear();
+        QVERIFY(edit::placeMedia(p, flat, m2.id, 0, second.start * flat.fpsValue(), second.end * flat.fpsValue(),
+                                 {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QCOMPARE(scriptLinesInCut(p, flat)[2], 1);
+        Sequence outer = makeSequence(p, "Outer", 1920, 1080, flat.fps, 1, 1);
+        MediaItem compound;
+        compound.id = p.newId();
+        compound.kind = MediaKind::Sequence;
+        compound.sequenceId = flat.id;
+        compound.hasVideo = compound.hasAudio = true;
+        compound.duration = 30;
+        compound.name = "Compound";
+        p.media.push_back(compound);
+        QVERIFY(edit::placeMedia(p, outer, compound.id, 10, 0, 30 * flat.fpsValue(), {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QCOMPARE(scriptLinesInCut(p, outer)[2], 1);
+        // Matched again once the missing line has been transcribed.
+        said(t2, 14.0, "something nobody said at all");
+        p.findMedia(m2.id)->transcript = std::make_shared<const Transcript>(t2);
+        QCOMPARE(matchProjectScript(p), 4);
+        // Circled takes, as the field recorder notes them.
+        QVERIFY(!isCircledTake(*p.findMedia(m2.id)));
+        p.findMedia(m2.id)->metadata["circled"] = "Yes";
+        QVERIFY(isCircledTake(*p.findMedia(m2.id)));
+        // No text: no script.
+        QCOMPARE(setProjectScript(p, "x", "", "  \n"), 0);
+        QCOMPARE(p.script, ProjectScript{});
+    }
+
     void subclips() {
         Fixture fx;
         Project& p = fx.p;

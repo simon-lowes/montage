@@ -65,6 +65,7 @@ class ShotSearchPanel;
 class PeoplePanel;
 class MulticamPanel;
 class AdrPanel;
+class LinedScriptPanel;
 class StackedTimelineWidget;
 class ProductionPanel;
 class AudioDescriptionDialog;
@@ -506,6 +507,7 @@ private:
     CaptureDialog* capture_ = nullptr;
     MulticamPanel* multicam_ = nullptr;
     AdrPanel* adr_ = nullptr;
+    LinedScriptPanel* linedScript_ = nullptr;
     ProductionPanel* production_ = nullptr;
     QDockWidget* productionDock_ = nullptr;
     QAction* takeEdit_ = nullptr;
@@ -558,6 +560,7 @@ private:
     StackedTimelineWidget* stacked_ = nullptr;
     QDockWidget* multicamDock_ = nullptr;
     QDockWidget* adrDock_ = nullptr;
+    QDockWidget* linedScriptDock_ = nullptr;
     QDockWidget* queueDock_ = nullptr;
     QDockWidget* keyframesDock_ = nullptr;
     QDockWidget* nodesDock_ = nullptr;

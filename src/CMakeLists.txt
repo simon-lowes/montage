@@ -178,6 +178,7 @@ add_library(montage_engine STATIC
   render/GpuCompositor.h render/GpuCompositor.cpp
   render/OGraf.h render/OGraf.cpp
   render/Gallery.h render/Gallery.cpp
+  render/LinedScript.h render/LinedScript.cpp
   render/TrimPasses.h render/TrimPasses.cpp
   render/DialogueLoudness.h render/DialogueLoudness.cpp
   render/RenderCache.h render/RenderCache.cpp

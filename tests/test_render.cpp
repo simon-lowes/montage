@@ -46,6 +46,9 @@
 #include "media/Decoder.h"
 #include "render/Exporter.h"
 #include "render/Gallery.h"
+#include "render/LinedScript.h"
+#include <QPainter>
+#include "core/ScriptCut.h"
 #include "render/TrimPasses.h"
 #include "render/RoomTone.h"
 #include "render/Ocio.h"
@@ -7006,6 +7009,150 @@ colorspaces:
         s.colorSpace = "rec2100pq";
         o.displaySpace = "rec709";
         compare(15, o, "pq to rec709");
+    }
+
+    // The lined script: pages of the screenplay with a line per take down what it reads, ticks for what the cut uses,
+    // red bars for lines nobody read, circled takes ringed; the same pages as a PDF.
+    void linedScript() {
+        Project p = makeDefaultProject();
+        auto take = [&](const std::string& name, const std::vector<std::string>& said) {
+            MediaItem m;
+            m.id = p.newId();
+            m.name = name;
+            m.path = "/nonexistent/" + name;
+            m.duration = 600;
+            m.hasVideo = m.hasAudio = true;
+            m.width = 1920, m.height = 1080, m.fps = {25, 1};
+            auto t = std::make_shared<Transcript>();
+            double at = 1;
+            for (const std::string& words : said) {
+                TranscriptSegment seg;
+                seg.start = at;
+                seg.text = words;
+                for (const QString& w : QString::fromStdString(words).split(' ')) {
+                    seg.words.push_back({at, at + 0.35, w.toStdString(), -1, {}});
+                    at += 0.4;
+                }
+                seg.end = at;
+                at += 1;
+                t->segments.push_back(seg);
+            }
+            m.transcript = t;
+            p.media.push_back(m);
+            return m.id;
+        };
+        // Forty speeches (over two pages); the first take reads the even ones and the second all but the last.
+        std::string script = "Title: Lined\n\nINT. HALL - DAY\n\nPeople talk.\n\n";
+        std::vector<std::string> even, most;
+        for (int i = 0; i < 40; ++i) {
+            std::string line;  // (words of its own, so no line reads as another)
+            for (const char* w : {"a", "b", "c", "d", "e", "f"}) line += (line.empty() ? "" : " ") + std::string("word") + std::to_string(i) + w;
+            script += (i % 2 ? "MARY\n" : "JOHN\n") + line + ".\n\n";
+            if (i % 2 == 0) even.push_back(line);
+            if (i < 39) most.push_back(line);
+        }
+        const Id a = take("a.mov", even), b = take("b.mov", most);
+        p.findMedia(a)->metadata["scene"] = "12";
+        p.findMedia(a)->metadata["take"] = "3";
+        p.findMedia(b)->metadata["circled"] = "Yes";
+        p.findMedia(b)->metadata["camera"] = "B";
+        QCOMPARE(setProjectScript(p, "lined.fountain", "", script), 39);
+        const auto res = buildScriptCut(p, matchScript(p, readScreenplay(p.script).lines), "Cut");
+        QVERIFY(res.sequence);
+        const LinedScriptLayout l = layoutLinedScript(p, p.findSequence(res.sequence));
+        QCOMPARE(l.title, QString("Lined"));
+        QVERIFY(l.pages >= 2);
+        for (const auto& r : l.rows) {
+            QVERIFY(r.page >= 0 && r.page < l.pages);
+            QVERIFY(r.x >= 0 && r.x + r.text.size() * 7.2 <= 520);
+            QVERIFY(r.y >= 60 && r.y + LinedScriptLayout::kRow <= LinedScriptLayout::kPageHeight - 30);
+        }
+        // No cue is left alone at the foot of a page: its speech follows it.
+        for (size_t i = 0; i < l.rows.size(); ++i)
+            if (l.rows[i].kind == ScriptBlock::Kind::Character) {
+                QVERIFY(i + 1 < l.rows.size());
+                QCOMPARE(l.rows[i + 1].page, l.rows[i].page);
+            }
+        // Both takes on the first page, the first labelled by scene and take, the second circled.
+        std::vector<const LinedScriptLayout::Column*> first;
+        for (const auto& c : l.columns)
+            if (c.page == 0) first.push_back(&c);
+        QCOMPARE(first.size(), size_t(2));
+        QCOMPARE(first[0]->label, QString("12-3"));
+        QVERIFY(!first[0]->circled);
+        QCOMPARE(first[1]->label, QString("b.mov"));
+        QVERIFY(first[1]->circled);
+        QVERIFY(first[0]->x > 500 && first[1]->x > first[0]->x);
+        // Line 0 is read by both (the cut uses one), line 1 by the second take only, line 39 by none.
+        auto segmentsOf = [&](int line) {
+            std::vector<const LinedScriptLayout::Segment*> out;
+            for (const auto& sg : l.segments)
+                if (sg.line == line) out.push_back(&sg);
+            return out;
+        };
+        const auto line0 = segmentsOf(0);
+        QCOMPARE(line0.size(), size_t(2));
+        QCOMPARE(int(std::count_if(line0.begin(), line0.end(), [](auto* sg) { return sg->inCut; })), 1);
+        QCOMPARE(segmentsOf(1).size(), size_t(1));
+        QCOMPARE(l.columns[size_t(segmentsOf(1)[0]->column)].media, b);
+        QVERIFY(segmentsOf(39).empty());
+        auto markOf = [&](int line) {
+            for (const auto& m : l.marks)
+                if (m.line == line) return m.state;
+            return 99;
+        };
+        QCOMPARE(markOf(0), 1);
+        QCOMPARE(markOf(39), -1);
+        // A point on a line's row finds the line; one on a take's stretch finds that reading.
+        const LinedScriptLayout::Segment* s1 = segmentsOf(1)[0];
+        QCOMPARE(l.lineAt(s1->page, {200, (s1->y0 + s1->y1) / 2}), 1);
+        QCOMPARE(l.lineAt(s1->page, {200, 20}), -1);
+        const LinedScriptLayout::Segment* hit = l.segmentAt(s1->page, {l.columns[size_t(s1->column)].x + 2, (s1->y0 + s1->y1) / 2});
+        QVERIFY(hit);
+        QCOMPARE(hit->line, 1);
+        QCOMPARE(hit->reading, 0);
+        // The page as painted: the text in black, the takes' lines in their colours, a red bar by line 39.
+        auto pageImage = [&](int page) {
+            QImage img(int(LinedScriptLayout::kPageWidth), int(LinedScriptLayout::kPageHeight), QImage::Format_RGB32);
+            QPainter painter(&img);
+            paintLinedScriptPage(painter, l, page);
+            return img;
+        };
+        const QImage page0 = pageImage(0);
+        auto inked = [](const QImage& img, QRect r) {
+            int n = 0;
+            for (int y = r.top(); y <= r.bottom(); ++y)
+                for (int x = r.left(); x <= r.right(); ++x) n += qGray(img.pixel(x, y)) < 160;
+            return n;
+        };
+        QVERIFY(inked(page0, QRect(54, 72, 400, 400)) > 500);  // the script
+        const QPointF c1(l.columns[size_t(s1->column)].x, (s1->y0 + s1->y1) / 2);
+        QVERIFY(qGray(page0.pixel(c1.toPoint())) < 200);
+        int last = -1;
+        for (const auto& m : l.marks)
+            if (m.line == 39) last = m.page;
+        const QImage lastPage = pageImage(last);
+        bool red = false;
+        for (const auto& m : l.marks)
+            if (m.line == 39) {
+                const QColor px = lastPage.pixelColor(54 - 13, int((m.y0 + m.y1) / 2));
+                red = px.red() > 150 && px.green() < 100;
+            }
+        QVERIFY(red);
+        // The PDF: one page each.
+        QTemporaryDir dir;
+        const QString pdf = dir.filePath("lined.pdf");
+        QString error;
+        QVERIFY2(exportLinedScriptPdf(l, pdf, &error), qPrintable(error));
+        QFile f(pdf);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        const QByteArray bytes = f.readAll();
+        QVERIFY(bytes.startsWith("%PDF"));
+        QCOMPARE(int(bytes.count("/Type /Page\n") + bytes.count("/Type /Page ") + bytes.count("/Type /Page/") + bytes.count("/Type /Page>")), l.pages);
+        // No script: nothing to lay out or write.
+        Project none = makeDefaultProject();
+        QCOMPARE(layoutLinedScript(none, nullptr).pages, 0);
+        QVERIFY(!exportLinedScriptPdf(layoutLinedScript(none, nullptr), dir.filePath("none.pdf")));
     }
 
     // A frame the GPU cannot draw (an adjustment layer) falls back to the CPU whole, and a clip it cannot grade (a

@@ -90,6 +90,7 @@
 #include "automation/McpServer.h"
 #include "render/OGraf.h"
 #include "GalleryPanel.h"
+#include "LinedScriptPanel.h"
 #include "TrimPanel.h"
 #include "render/Gallery.h"
 #include "ClipStripPanel.h"
@@ -11116,6 +11117,76 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(trims->shown(), QString());
         QCOMPARE(program->trimTarget(), std::string());
         QVERIFY(state()->sequence()->trimTargets.empty());
+    }
+
+    void linedScriptPanel() {
+        // Two takes of a speech (the second a copy of the first file), each read by its transcript.
+        state()->newProject();
+        const QString jfk = QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav"), copy = dir_.path() + "/take2.wav";
+        QFile::remove(copy);
+        QVERIFY(QFile::copy(jfk, copy));
+        const auto ids = state()->importFiles({jfk, copy});
+        QCOMPARE(ids.size(), size_t(2));
+        auto said = [](double at, const QString& text) {
+            auto t = std::make_shared<Transcript>();
+            TranscriptSegment seg;
+            seg.start = at;
+            seg.text = text.toStdString();
+            for (const QString& w : text.split(' ')) {
+                seg.words.push_back({at, at + 0.3, w.toStdString(), -1, {}});
+                at += 0.4;
+            }
+            seg.end = at;
+            t->segments.push_back(seg);
+            return t;
+        };
+        QVERIFY(state()->edit("Transcribe", [&](Project& p, Sequence&) {
+            p.findMedia(ids[0])->transcript = said(1.0, "ask not what your country can do for you");
+            p.findMedia(ids[1])->transcript = said(2.0, "ask not what your country can do for you ask what you can do for your country");
+            return true;
+        }));
+        win_->findChild<QAction*>("showLinedScript")->trigger();
+        auto* panel = win_->findChild<LinedScriptPanel*>();
+        QVERIFY(panel);
+        QTRY_VERIFY(panel->isVisible());
+        QVERIFY(panel->setScript("ask.fountain", "Title: Ask\n\nJFK\nAsk not what your country can do for you.\n\n"
+                                                 "JFK\nAsk what you can do for your country.\n\nJFK\nA line nobody says.\n"));
+        const ProjectScript& script = state()->project().script;
+        QCOMPARE(script.format, std::string("fountain"));
+        QCOMPARE(script.readings.size(), size_t(3));
+        QCOMPARE(script.readings[0].size(), size_t(2));
+        QVERIFY(script.readings[1].size() >= 2);  // (line one says most of its words too, in another order)
+        QCOMPARE(script.readings[1][0].media, ids[1]);
+        QVERIFY(script.readings[2].empty());
+        QCOMPARE(panel->layout().pages, 1);
+        QVERIFY(win_->findChild<QLabel*>("linedScriptSummary")->text().contains("2 of 3"));
+        // A click on a take's line opens that take in the Source monitor, its reading of the line marked.
+        const LinedScriptLayout::Segment* seg = nullptr;
+        for (const auto& sg : panel->layout().segments)
+            if (sg.line == 1 && sg.reading == 0) seg = &sg;
+        QVERIFY(seg);
+        QWidget* pages = panel->pagesWidget();
+        const double scale = (pages->width() - 20.0) / LinedScriptLayout::kPageWidth;
+        const QPoint at(int(10 + panel->layout().columns[size_t(seg->column)].x * scale), int(10 + (seg->y0 + seg->y1) / 2 * scale));
+        QTest::mouseClick(pages, Qt::LeftButton, {}, at);
+        const ScriptReading& r = script.readings[1][0];
+        QCOMPARE(r.media, ids[1]);
+        QCOMPARE(state()->sourceMedia(), ids[1]);
+        const double fps = state()->sequence()->fpsValue();
+        QCOMPARE(state()->sourceIn(), FrameTime(std::floor(r.start * fps)));
+        QCOMPARE(state()->sourceOut(), FrameTime(std::ceil(r.end * fps)) - 1);  // (Out is the last frame played)
+        QCOMPARE(panel->selectedLine(), 1);
+        // A line with no take: nothing opens. Line one's other take, by its reading.
+        QVERIFY(!panel->cueLine(2));
+        QVERIFY(panel->cueLine(0, 1));
+        QCOMPARE(state()->sourceMedia(), script.readings[0][1].media);
+        // Exported as a PDF; Set Script was one undo step.
+        QVERIFY(panel->exportPdf(dir_.path() + "/ask.pdf"));
+        QVERIFY(QFileInfo(dir_.path() + "/ask.pdf").size() > 1000);
+        state()->undo();
+        QVERIFY(state()->project().script.text.empty());
+        QTRY_COMPARE(panel->layout().pages, 0);
+        state()->newProject();
     }
 
     void galleryAndClipStrip() {

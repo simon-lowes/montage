@@ -13596,6 +13596,52 @@ if ui["pressed"] == "add":
         // Nothing to go on: an error, not an empty sequence.
         r = call(QJsonObject{{"project", project}, {"script", "Lines nobody ever said."}});
         QVERIFY(r.value("isError").toBool());
+
+        // The script kept in the project as a lined script: each line with its takes, best first, the circled one
+        // marked and the one the cut (the sequence just built) uses; then as a PDF; then taken away.
+        back.findMedia(t2)->metadata["circled"] = "Yes";
+        QVERIFY(saveProject(back, project.toStdString()));
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        auto script = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_script"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        r = script(QJsonObject{{"project", project}});
+        QVERIFY(r.value("isError").toBool() && text(r).contains("no script"));
+        r = script(QJsonObject{{"project", project}, {"action", "set"}, {"script_file", fdx}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject st = r.value("structuredContent").toObject();
+        QCOMPARE(st.value("format").toString(), QString("fdx"));
+        QCOMPARE(st.value("read").toInt(), 2);
+        QCOMPARE(st.value("in_cut").toInt(), 2);
+        lines = st.value("lines").toArray();
+        QCOMPARE(lines.size(), 2);
+        QJsonArray takes = lines[0].toObject().value("takes").toArray();
+        QCOMPARE(takes.size(), 2);
+        QCOMPARE(takes[0].toObject().value("media").toString(), QString("take1"));
+        QVERIFY(takes[0].toObject().value("in_cut").toBool());
+        QVERIFY(!takes[0].toObject().value("circled").toBool());
+        QCOMPARE(takes[1].toObject().value("media").toString(), QString("take2"));
+        QVERIFY(takes[1].toObject().value("circled").toBool());
+        QVERIFY(!takes[1].toObject().value("in_cut").toBool());
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.script.readings.size(), size_t(2));
+        r = script(QJsonObject{{"project", project}, {"action", "match"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("read").toInt(), 2);
+        const QString pdf = QString::fromStdString(path("lined.pdf"));
+        r = script(QJsonObject{{"project", project}, {"action", "pdf"}, {"path", pdf}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("pages").toInt(), 1);
+        QVERIFY(QFileInfo(pdf).size() > 1000);
+        r = script(QJsonObject{{"project", project}, {"action", "remove"}});
+        QVERIFY(!r.value("isError").toBool());
+        QVERIFY(loadProject(project.toStdString(), back));
+        QVERIFY(back.script.text.empty());
     }
 
     void autoBroll() {

@@ -149,7 +149,7 @@ bool ScriptCutDialog::loadScript(const QString& path, QString* error) {
         return false;
     }
     const QByteArray data = f.readAll();
-    if (path.endsWith(QStringLiteral(".fdx"), Qt::CaseInsensitive)) setScript(QString::fromStdString(fdxToScript(data.toStdString())));
+    if (scriptFormat(path.toStdString(), data.toStdString()) == "fdx") setScript(QString::fromStdString(fdxToFountain(data.toStdString())));
     else setScript(QString::fromUtf8(data));
     return true;
 }
@@ -177,7 +177,7 @@ const std::vector<ScriptMatch>& ScriptCutDialog::matches() {
 void ScriptCutDialog::refresh() {
     debounce_->stop();
     stale_ = false;
-    matches_ = matchScript(state_->project(), parseScript(script().toStdString()), options());
+    matches_ = matchScript(state_->project(), scriptLines(script().toStdString()), options());
     preview_->clear();
     int found = 0;
     for (const ScriptMatch& m : matches_) {
@@ -208,7 +208,7 @@ void ScriptCutDialog::refresh() {
 
 ScriptCutResult ScriptCutDialog::build(EditorState* state, const QString& script, const ScriptCutOptions& o, const QString& name) {
     ScriptCutResult res;
-    const auto lines = parseScript(script.toStdString());
+    const auto lines = scriptLines(script.toStdString());
     if (lines.empty()) return res;
     state->edit(tr("Build Cut from Script"), [&](Project& p, Sequence&) {
         res = buildScriptCut(p, matchScript(p, lines, o), name.toStdString(), o);

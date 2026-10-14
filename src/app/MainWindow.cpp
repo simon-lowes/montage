@@ -139,6 +139,7 @@
 #include "control/Midi.h"
 #include "MulticamPanel.h"
 #include "AdrPanel.h"
+#include "LinedScriptPanel.h"
 #include "AudioDescriptionDialog.h"
 #include "CaptionsPanel.h"
 #include "MaskOverlay.h"
@@ -554,6 +555,16 @@ void MainWindow::buildPanels() {
     keyframesDock_ = makeDock(tr("Keyframes"), "keyframes", new KeyframePanel(state_, this));
     gradeNodes_ = new GradeNodePanel(state_, this);
     nodesDock_ = makeDock(tr("Nodes"), "nodes", gradeNodes_);
+    // The lined script (the screenplay with each take's line down what it reads).
+    linedScript_ = new LinedScriptPanel(state_, this);
+    linedScriptDock_ = makeDock(tr("Script"), "linedScript", linedScript_);
+    connect(linedScript_, &LinedScriptPanel::openRequested, this, [this](Id media, FrameTime in, FrameTime out, FrameTime at) {
+        // The take at the line, marked in the Source monitor and ready to edit in.
+        openInSource(media);
+        state_->setSourceIn(in);
+        state_->setSourceOut(out);
+        source_->seek(at);
+    });
     // The colour page's stills and clips (Resolve's Gallery and thumbnail timeline).
     gallery_ = new GalleryPanel(state_, this);
     galleryDock_ = makeDock(tr("Gallery"), "gallery", gallery_);
@@ -792,7 +803,7 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         resizeDocks({sourceDock_}, {h / 2 + 40}, Qt::Vertical);
     } else {  // Editing
         arrangeDocks({{sourceDock_, inspectorDock_, scopesDock_, mixerDock_, captionsDock_, multicamDock_, keyframesDock_}, {programDock_}},
-                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, peopleDock_, indexDock_, stackedDock_, queueDock_, assistantDock_, nodesDock_, galleryDock_, clipsDock_, trimsDock_}},
+                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, peopleDock_, indexDock_, stackedDock_, queueDock_, assistantDock_, nodesDock_, galleryDock_, clipsDock_, trimsDock_, linedScriptDock_}},
                      {{meterDock_}});
         resizeDocks({binDock_}, {380}, Qt::Horizontal);
         resizeDocks({meterDock_}, {70}, Qt::Horizontal);
@@ -1631,6 +1642,11 @@ void MainWindow::buildMenus() {
     add(seqM, tr("Make &Shorts…"), QKeySequence(), [this] { shortsDialog(); })->setObjectName(QStringLiteral("makeShorts"));
     add(seqM, tr("Build Cut from &Script…"), QKeySequence(), [this] { scriptCutDialog(); })
         ->setObjectName(QStringLiteral("buildScriptCut"));
+    add(seqM, tr("&Lined Script"), QKeySequence(), [this] {
+        // The screenplay with each take's line down what it reads, beside the Source monitor.
+        linedScriptDock_->show();
+        linedScriptDock_->raise();
+    })->setObjectName(QStringLiteral("showLinedScript"));
     add(seqM, tr("Auto &Mix…"), QKeySequence(), [this] { AutoMixDialog::run(state_, this); })->setObjectName(QStringLiteral("autoMix"));
     add(seqM, tr("Record &Voiceover…"), QKeySequence("Ctrl+Alt+R"), [this] {
         if (!state_->sequence()) return;
