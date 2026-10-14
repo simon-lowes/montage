@@ -187,6 +187,8 @@ private:
         bool is1D;
     };
     std::map<const Lut3D*, LutTex> luts_;
+    // Those first uploaded in this frame: forgotten if it fails, as their uploads may not have been submitted.
+    std::vector<const Lut3D*> lutsNew_;
 };
 
 bool Device::start(std::string* why) {
@@ -368,6 +370,7 @@ bool Device::create() {
 void Device::destroy() {
     for (auto& [lut, t] : luts_) delete t.tex;
     luts_.clear();
+    lutsNew_.clear();
     for (auto& [tex, t] : targets_) delete t.rt, delete t.rp;
     targets_.clear();
     for (Pooled& p : pool_) delete p.tex;
@@ -458,6 +461,7 @@ QRhiTexture* Device::lutTexture(const std::shared_ptr<const Lut3D>& lut, QRhiRes
         desc.setEntries(entries.cbegin(), entries.cend());
         u->uploadTexture(t, desc);
         it = luts_.emplace(lut.get(), LutTex{lut, t, lut->is1D}).first;
+        lutsNew_.push_back(lut.get());
     }
     if (it->second.is1D) {
         *table1d = it->second.tex;
@@ -652,6 +656,37 @@ QRhiTexture* Device::layer(const Layer& l, QRhiResourceUpdateBatch*& u) {
                 textures.push_back({4, table});
             }
         }
+        if (op.kind == ColorOp::ScreenKey && (op.params[10] != 0 || op.params[11] != 0)) {
+            // Its matte first, shrunk or grown and softened as render/Processing's screenKey does (gpucolor.frag's
+            // 21 to 23), then read from the table.
+            QRhiTexture* matte = texture(T::RGBA32F, size.width(), size.height(), true);
+            if (!matte) return nullptr;
+            float q[64] = {};
+            std::copy(p, p + 64, q);
+            q[0] = 21;
+            pass(colorPs_, matte, u, {{1, cur}}, uniforms(u, q));
+            u = rhi_->nextResourceUpdateBatch();
+            auto step = [&](int mode, int radius, bool maximum, bool column) {
+                QRhiTexture* made = texture(T::RGBA32F, size.width(), size.height(), true);
+                if (!made) return false;
+                std::fill(q, q + 64, 0.0f);
+                q[0] = float(mode), q[4] = float(radius), q[5] = maximum ? 1 : 0, q[6] = column ? 1 : 0;
+                pass(colorPs_, made, u, {{1, matte}}, uniforms(u, q));
+                u = rhi_->nextResourceUpdateBatch();
+                release(matte);
+                matte = made;
+                return true;
+            };
+            const int shrink = int(op.params[10]), blur = int(op.params[11]);
+            bool made = true;
+            if (shrink != 0) made = step(22, std::abs(shrink), shrink < 0, false) && step(22, std::abs(shrink), shrink < 0, true);
+            for (int k = 0; made && blur > 0 && k < 3; ++k) made = step(23, blur, false, false) && step(23, blur, false, true);
+            if (!made) {
+                release(matte);
+                return nullptr;
+            }
+            textures.push_back({4, matte});  // (let go after the pass, as tables are)
+        }
         if (op.masked) {
             p[48] = 1;  // p[12].x
             std::copy(op.maskParams, op.maskParams + 12, p + 52);
@@ -775,6 +810,13 @@ bool Device::draw(const Frame& frame, Image* out, QImage* out8) {
     }
     if (u) u->release();
     if (rhi_->endOffscreenFrame() != QRhi::FrameOpSuccess || failed_) ok = false;
+    if (!ok)
+        for (const Lut3D* l : lutsNew_)
+            if (auto it = luts_.find(l); it != luts_.end()) {
+                delete it->second.tex;
+                luts_.erase(it);
+            }
+    lutsNew_.clear();
     endFrame();
     if (!ok) return false;
     const size_t bytes = size_t(W) * H * (out8 ? 4 : 16);

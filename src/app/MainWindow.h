@@ -24,6 +24,7 @@
 #include "render/Imf.h"
 #include "render/Jpeg2000.h"
 #include "render/ExtendClip.h"
+#include "render/DialogueMatch.h"
 #include "render/RoomTone.h"
 #include "render/Versions.h"
 
@@ -65,6 +66,7 @@ class ShotSearchPanel;
 class PeoplePanel;
 class MulticamPanel;
 class AdrPanel;
+class LinedScriptPanel;
 class StackedTimelineWidget;
 class ProductionPanel;
 class AudioDescriptionDialog;
@@ -130,6 +132,11 @@ public:
     bool setVoiceReference();
     bool hasVoiceReference() const { return !voiceRef_.empty(); }
     int matchVoice();
+    // Dialogue Match (render/DialogueMatch.h): the selected audio clips made to sound like the voice reference's clip
+    // (the production take): its room, tone and level, and with `roomTone` its room tone on a track under each.
+    // Returns how many were matched. The dialog asks which first.
+    int matchDialogue(const DialogueMatchOptions& o, bool roomTone = false);
+    void matchDialogueDialog();
     int addBeatMarkers(bool everyBeat);
     int cutMediaToBeat(int every, bool bars);  // the bin's selected media, cut on the music clip's beats
     Id makeHighlights(double seconds, const QString& lookFor = {});  // a new Highlights sequence; its id, or 0
@@ -211,6 +218,7 @@ public:
     // when `to` is given, within the gap) with room tone learned from `source` (0 = the clip before the gap, or after
     // it). The new clip (0 if none).
     Id fillRoomTone(TrackRef track, FrameTime at, FrameTime to = 0, Id source = 0);
+    QString newRoomTonePath(const std::string& sequenceName) const;  // a new file in the project's Room Tone folder
     // Clip › Extend Clip (render/ExtendClip.h): the video clip carried on `frames` past its end (holding its last frame
     // as its motion settles), with room tone under its linked sound, pushing what follows when `ripple`. One undo step;
     // the new clips (the picture first).
@@ -506,6 +514,7 @@ private:
     CaptureDialog* capture_ = nullptr;
     MulticamPanel* multicam_ = nullptr;
     AdrPanel* adr_ = nullptr;
+    LinedScriptPanel* linedScript_ = nullptr;
     ProductionPanel* production_ = nullptr;
     QDockWidget* productionDock_ = nullptr;
     QAction* takeEdit_ = nullptr;
@@ -558,6 +567,7 @@ private:
     StackedTimelineWidget* stacked_ = nullptr;
     QDockWidget* multicamDock_ = nullptr;
     QDockWidget* adrDock_ = nullptr;
+    QDockWidget* linedScriptDock_ = nullptr;
     QDockWidget* queueDock_ = nullptr;
     QDockWidget* keyframesDock_ = nullptr;
     QDockWidget* nodesDock_ = nullptr;
@@ -575,6 +585,8 @@ private:
     QImage colourRefView_;  // the reference at display size, for the compare
     std::vector<double> voiceRef_;  // Match Voice's reference spectrum
     QString voiceRefName_;
+    Id voiceRefClip_ = 0;  // and its clip, for Dialogue Match (in the project of that generation)
+    uint64_t voiceRefGeneration_ = 0;
     QAction* compareRef_ = nullptr;
     QAction* trimView_ = nullptr;  // Playback › Two-Up Trim View
     class ReviewOverlay* reviewOverlay_ = nullptr;  // reviewers' drawings over the Program monitor

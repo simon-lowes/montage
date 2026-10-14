@@ -23,6 +23,9 @@ bool isGradeMixer(const GradeNode& n);
 // Motion Deblur, Reframe 360, Redact Faces, Stereo 3D, Motion Blur, Deflicker, Stabilize, Rolling Shutter Repair, Lens
 // Correction, the camera tracker): they stay outside nodes (a node's window, key or mix could not apply to them).
 bool runsBeforeGrade(const std::string& type);
+// Of those, the ones the renderer always ran ahead of the graph even inside a node (all but Stabilize, Rolling Shutter
+// Repair and Lens Correction, which ran in their node), so an old project's are taken out of its nodes when read.
+bool alwaysRanBeforeGrade(const std::string& type);
 const GradeNode* findGradeNode(const GradeGraph& g, int key);
 GradeNode* findGradeNode(GradeGraph& g, int key);
 // The link into `to`'s input `input` (to 0: the graph's output), or null.
@@ -33,6 +36,8 @@ const GradeLink* gradeLinkInto(const GradeGraph& g, int to, int input);
 bool validGrade(const GradeGraph& g, std::string* why = nullptr);
 // The nodes the output depends on, each after those feeding it (by key where there is a choice).
 std::vector<int> gradeOrder(const GradeGraph& g);
+// Whether a node takes part: there, switched on and feeding the output.
+bool liveGradeNode(const GradeGraph& g, int key);
 // Whether it is a plain chain of correctors from the picture to the output (with nothing keyed between them).
 bool serialGrade(const GradeGraph& g);
 // A key for a new node.

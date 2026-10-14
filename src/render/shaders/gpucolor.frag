@@ -13,8 +13,9 @@
 //   15 a parallel mixer's sums: what it has (table) and a branch (srcTex) by its key (maskTex)
 //   16 a parallel mixer's picture: the weighted sum (srcTex) by the weights (maskTex), else the plain one (table)
 //   17 a layer mixer's branch (table) blended onto what is under it (srcTex) where its key is (maskTex)
-// and the keyers, which change the alpha as well: 18 Chroma Key, 19 Luma Key, 20 Screen Key (without shrinking or
-// softening its matte, which only the CPU does).
+// and the keyers, which change the alpha as well: 18 Chroma Key, 19 Luma Key, 20 Screen Key (its matte shrunk, grown
+// or softened beforehand in red of `table` where p[3].z or p[3].w says so), with the Screen Key's matte steps:
+//   21 its matte, 22 a running minimum or maximum along a row or column, 23 a box blur along a row or column.
 // Through the effect's mask where it has one (p[13..15]): its shape drawn on the CPU (maskTex), an HSL qualifier on
 // the colour as it comes in, inverted and faded, and the picture mixed with what the effect made by it (all four
 // channels, premultiplied, as the CPU mixes them).
@@ -293,8 +294,45 @@ vec4 graphStep(ivec2 xy, int mode) {
     return vec4(o, a);
 }
 
+// A Screen Key's matte (p as mode 20's): 1 where the subject is, 0 on the screen.
+float screenMatte(vec3 c, float a) {
+    if (a <= 0.0) return 0.0;
+    const int dom = int(p[1].x), o1 = (dom + 1) % 3, o2 = (dom + 2) % 3;
+    const float others = p[1].y * max(c[o1], c[o2]) + (1.0 - p[1].y) * min(c[o1], c[o2]);
+    const float m = clamp(1.0 - (c[dom] - others) / p[1].w * p[1].z, 0.0, 1.0);
+    return clamp((m - p[2].x) / (p[2].y - p[2].x), 0.0, 1.0);
+}
+
+// The Screen Key's matte steps (modes 21 to 23), as render/Processing's minMaxFilter and boxBlurPlane: the window
+// held inside the picture. 22 and 23 have p[1]: the radius, a maximum (else a minimum), along a column (else a row).
+vec4 matteStep(ivec2 xy, int mode) {
+    if (mode == 21) {
+        const vec4 px = texelFetch(srcTex, xy, 0);
+        const float m = screenMatte(px.a > 0.0 ? px.rgb * (1.0 / px.a) : vec3(0.0), px.a);
+        return vec4(m, m, m, 1.0);
+    }
+    const int r = int(p[1].x);
+    const bool column = p[1].z > 0.5;
+    const ivec2 size = textureSize(srcTex, 0);
+    const int at = column ? xy.y : xy.x, last = (column ? size.y : size.x) - 1;
+    const int k0 = max(0, at - r), k1 = min(last, at + r);
+    float v = texelFetch(srcTex, xy, 0).r;
+    if (mode == 22) {
+        const bool maximum = p[1].y > 0.5;
+        for (int k = k0; k <= k1; ++k) {
+            const float o = texelFetch(srcTex, column ? ivec2(xy.x, k) : ivec2(k, xy.y), 0).r;
+            v = maximum ? max(v, o) : min(v, o);
+        }
+    } else {
+        float acc = 0.0;
+        for (int k = k0; k <= k1; ++k) acc += texelFetch(srcTex, column ? ivec2(xy.x, k) : ivec2(k, xy.y), 0).r;
+        v = acc / float(k1 - k0 + 1);
+    }
+    return vec4(v, v, v, 1.0);
+}
+
 // The keyers (modes 18 to 20), on the pixel's straight colour `c` and alpha `a`: what they make, premultiplied.
-vec4 keyer(int mode, vec3 c, float a) {
+vec4 keyer(int mode, vec3 c, float a, ivec2 xy) {
     if (mode == 18) {
         // Chroma Key. p[1]: the key's Cb and Cr, the distance's scale, tolerance; p[2]: softness, spill, the key's
         // strongest channel, the matte shown.
@@ -318,14 +356,10 @@ vec4 keyer(int mode, vec3 c, float a) {
         return vec4(c * (a * m), a * m);
     }
     // Screen Key. p[1]: the screen's channel, balance, gain, the screen's strength; p[2]: clip black and white,
-    // despill, restore; p[3]: edge desaturation, the view (0 the result, 1 the matte, 2 status).
+    // despill, restore; p[3]: edge desaturation, the view (0 the result, 1 the matte, 2 status), and the matte's
+    // shrink (negative: grow) and blur radii (either set: the matte made beforehand, in `table`).
     const int dom = int(p[1].x), o1 = (dom + 1) % 3, o2 = (dom + 2) % 3;
-    float m = 0.0;
-    if (a > 0.0) {
-        const float others = p[1].y * max(c[o1], c[o2]) + (1.0 - p[1].y) * min(c[o1], c[o2]);
-        m = clamp(1.0 - (c[dom] - others) / p[1].w * p[1].z, 0.0, 1.0);
-        m = clamp((m - p[2].x) / (p[2].y - p[2].x), 0.0, 1.0);
-    }
+    const float m = p[3].z != 0.0 || p[3].w != 0.0 ? texelFetch(table, xy, 0).r : screenMatte(c, a);
     const float na = a * m;
     const int view = int(p[3].y);
     if (view == 1) return vec4(vec3(na), 1.0);
@@ -345,6 +379,10 @@ vec4 keyer(int mode, vec3 c, float a) {
 void main() {
     const ivec2 xy = ivec2(gl_FragCoord.xy);
     const int mode = int(p[0].x);
+    if (mode >= 21) {
+        fragColor = matteStep(xy, mode);
+        return;
+    }
     if (mode >= 18) {
         const vec4 px = texelFetch(srcTex, xy, 0);
         const float a = px.a;
@@ -353,7 +391,7 @@ void main() {
             return;
         }
         const vec3 c = a > 0.0 ? px.rgb * (1.0 / a) : vec3(0.0);
-        const vec4 made = keyer(mode, c, a);
+        const vec4 made = keyer(mode, c, a, xy);
         fragColor = p[12].x > 0.5 ? px + (made - px) * maskAt(xy, c, a) : made;
         return;
     }

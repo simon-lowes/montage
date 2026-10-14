@@ -189,27 +189,60 @@ QString nameKey(const std::string& s) { return norm(QString::fromStdString(s)); 
 
 }  // namespace
 
-std::vector<ScriptLine> parseScript(const std::string& text) {
-    std::vector<ScriptLine> out;
-    const QStringList raw = QString::fromStdString(text).split('\n');
-    std::vector<QStringList> paragraphs(1);
-    for (QString l : raw) {
+Screenplay plainScreenplay(const std::string& text) {
+    using K = ScriptBlock::Kind;
+    Screenplay sp;
+    // Paragraphs (separated by blank lines) and, where they come, the lines left out of them.
+    struct Entry {
+        QStringList lines;  // a paragraph
+        QStringList asides;  // the parentheticals left out of it, shown under its cue
+        K kind = K::Dialogue;
+        QString skipped;    // or a line left out (kind: what it is)
+        bool left = false;  // (which of the two)
+    };
+    std::vector<Entry> entries;
+    bool open = false;  // a paragraph is being read
+    for (QString l : QString::fromStdString(text).split('\n')) {
         l = l.trimmed();
         if (l.isEmpty()) {
-            if (!paragraphs.back().isEmpty()) paragraphs.emplace_back();
+            open = false;
             continue;
         }
-        if (isSceneHeading(l) || isTransition(l) || isDirection(l)) continue;
-        paragraphs.back() << l;
+        if (isSceneHeading(l) || isTransition(l) || isDirection(l)) {
+            if (open && l.startsWith('(')) {
+                std::find_if(entries.rbegin(), entries.rend(), [](const Entry& e) { return !e.left; })->asides << l;
+                continue;
+            }
+            Entry e;
+            e.kind = isSceneHeading(l) ? K::Heading : isTransition(l) ? K::Transition : l.startsWith('(') ? K::Parenthetical : K::Action;
+            e.skipped = l.startsWith('#') ? l.mid(1).trimmed() : l;
+            e.left = true;
+            entries.push_back(e);
+            continue;
+        }
+        if (!open) {
+            entries.emplace_back();
+            open = true;
+        }
+        // (a paragraph goes on after a line left out of it)
+        auto it = std::find_if(entries.rbegin(), entries.rend(), [](const Entry& e) { return !e.left; });
+        it->lines << l;
     }
     QString pending;  // a cue alone in its paragraph names the next one's speaker
-    for (QStringList& lines : paragraphs) {
+    for (Entry& e : entries) {
+        if (e.left) {
+            if (!e.skipped.isEmpty()) sp.blocks.push_back({e.kind, e.skipped.toStdString()});
+            continue;
+        }
+        QStringList& lines = e.lines;
         if (lines.isEmpty()) continue;
         QString speaker = pending;
         pending.clear();
         if (isCue(lines.front())) {
+            sp.blocks.push_back({K::Character, lines.front().toStdString()});
             if (lines.size() == 1) {
                 pending = speakerOf(lines.front());
+                for (const QString& a : e.asides) sp.blocks.push_back({K::Parenthetical, a.toStdString()});
                 continue;
             }
             speaker = speakerOf(lines.takeFirst());
@@ -220,11 +253,19 @@ std::vector<ScriptLine> parseScript(const std::string& text) {
             const QString who = m.captured(1).trimmed();
             speaker = who == who.toUpper() ? speakerOf(who) : who;
             body = m.captured(2).trimmed();
+            sp.blocks.push_back({K::Character, who.toUpper().toStdString()});
         }
-        if (!words(body).empty()) addSpeech(out, speaker, body);
+        for (const QString& a : e.asides) sp.blocks.push_back({K::Parenthetical, a.toStdString()});
+        if (words(body).empty()) continue;
+        ScriptBlock b{K::Dialogue, body.toStdString(), int(sp.lines.size())};
+        addSpeech(sp.lines, speaker, body);
+        b.lineCount = int(sp.lines.size()) - b.firstLine;
+        sp.blocks.push_back(b);
     }
-    return out;
+    return sp;
 }
+
+std::vector<ScriptLine> parseScript(const std::string& text) { return plainScreenplay(text).lines; }
 
 std::string fdxToScript(const std::string& xml) {
     QXmlStreamReader r(QByteArray::fromStdString(xml));
@@ -247,6 +288,191 @@ std::string fdxToScript(const std::string& xml) {
         }
     }
     return out.toStdString();
+}
+
+namespace {
+
+// Fountain's emphasis (*italic*, **bold**, _underline_) shown plain; \* stays a star.
+QString plainFountain(QString s) {
+    s.replace(QStringLiteral("\\*"), QStringLiteral("\x01")).replace(QStringLiteral("\\_"), QStringLiteral("\x02"));
+    static const QRegularExpression stars(QStringLiteral("\\*{1,3}([^*\\n]+?)\\*{1,3}")), under(QStringLiteral("_([^_\\n]+?)_"));
+    s.replace(stars, QStringLiteral("\\1")).replace(under, QStringLiteral("\\1"));
+    return s.replace(QChar(1), QChar('*')).replace(QChar(2), QChar('_')).trimmed();
+}
+
+bool fountainHeading(const QString& l) {
+    static const QRegularExpression re(QStringLiteral("^(INT|EXT|EST|INT\\.?/EXT|I/E)[\\. ]"), QRegularExpression::CaseInsensitiveOption);
+    return re.match(l).hasMatch();
+}
+
+// A character cue: capitals (an extension in brackets may be lower case), at least one letter.
+bool fountainCue(QString l) {
+    static const QRegularExpression extension(QStringLiteral("\\([^)]*\\)")), letter(QStringLiteral("[A-Z]"));
+    if (l.endsWith('^')) l.chop(1);
+    l.remove(extension);
+    l = l.trimmed();
+    return !l.isEmpty() && l == l.toUpper() && l.contains(letter);
+}
+
+}  // namespace
+
+Screenplay parseFountain(const std::string& source) {
+    using K = ScriptBlock::Kind;
+    Screenplay sp;
+    QString text = QString::fromStdString(source);
+    text.remove('\r');
+    text.remove(QRegularExpression(QStringLiteral("/\\*.*?\\*/"), QRegularExpression::DotMatchesEverythingOption));
+    // (a note on a line of its own goes with its line, so it does not end a speech)
+    text.remove(QRegularExpression(QStringLiteral("^[ \\t]*\\[\\[(?:(?!\\]\\]).)*\\]\\][ \\t]*\\n"),
+                                   QRegularExpression::DotMatchesEverythingOption | QRegularExpression::MultilineOption));
+    text.remove(QRegularExpression(QStringLiteral("\\[\\[.*?\\]\\]"), QRegularExpression::DotMatchesEverythingOption));
+    QStringList raw = text.split('\n');
+    size_t i = 0;
+    // The title page: "Key: value" lines (values may go on, indented, below) up to the first blank line.
+    static const QRegularExpression key(QStringLiteral("^([A-Za-z][A-Za-z ]*):\\s*(.*)$"));
+    while (i < size_t(raw.size()) && raw[qsizetype(i)].trimmed().isEmpty()) ++i;
+    static const QRegularExpression titleKey(
+        QStringLiteral("^(Title|Credit|Authors?|Source|Draft date|Date|Contact|Copyright|Notes|Revision):"), QRegularExpression::CaseInsensitiveOption);
+    // (any "Key: value" opens one, but not a transition such as FADE IN:)
+    auto opensTitlePage = [&](const QString& l) {
+        if (titleKey.match(l).hasMatch()) return true;
+        const auto m = key.match(l);
+        return m.hasMatch() && m.captured(1) != m.captured(1).toUpper() && !fountainHeading(l);
+    };
+    if (i < size_t(raw.size()) && opensTitlePage(raw[qsizetype(i)])) {
+        QString current;
+        for (; i < size_t(raw.size()) && !raw[qsizetype(i)].trimmed().isEmpty(); ++i) {
+            const QString& l = raw[qsizetype(i)];
+            if (const auto m = key.match(l); m.hasMatch() && !l.startsWith(' ') && !l.startsWith('\t')) {
+                current = m.captured(1).trimmed().toLower();
+                if (current == QLatin1String("title") && !m.captured(2).trimmed().isEmpty()) sp.title = plainFountain(m.captured(2)).toStdString();
+            } else if (current == QLatin1String("title")) {
+                sp.title += (sp.title.empty() ? "" : " ") + plainFountain(l).toStdString();
+            }
+        }
+    }
+    // (a line of two spaces is Fountain's empty line inside a speech, not a blank one)
+    auto blankAt = [&](size_t k) {
+        return k >= size_t(raw.size()) || (raw[qsizetype(k)].trimmed().isEmpty() && !raw[qsizetype(k)].startsWith(QLatin1String("  ")));
+    };
+    bool prevBlank = true;
+    for (; i < size_t(raw.size()); ++i) {
+        const QString l = raw[qsizetype(i)].trimmed();
+        if (l.isEmpty()) {
+            prevBlank = true;
+            continue;
+        }
+        const bool wasBlank = prevBlank;
+        prevBlank = false;
+        if (l.size() >= 3 && l.count('=') == l.size()) {
+            sp.blocks.push_back({K::PageBreak, {}});
+            continue;
+        }
+        if (l.startsWith('#') || l.startsWith('=')) continue;  // sections and synopses: not printed
+        if (l.startsWith('~')) {
+            sp.blocks.push_back({K::Lyric, plainFountain(l.mid(1)).toStdString()});
+            continue;
+        }
+        if ((l.startsWith('.') && !l.startsWith(QLatin1String(".."))) || (wasBlank && fountainHeading(l))) {
+            QString h = l.startsWith('.') ? l.mid(1) : l;
+            h.remove(QRegularExpression(QStringLiteral("\\s*#[^#]*#\\s*$")));  // a scene number
+            sp.blocks.push_back({K::Heading, plainFountain(h).toUpper().toStdString()});
+            continue;
+        }
+        if (l.startsWith('>') && l.endsWith('<')) {
+            sp.blocks.push_back({K::Centered, plainFountain(l.mid(1, l.size() - 2)).toStdString()});
+            continue;
+        }
+        if (l.startsWith('>') || (wasBlank && blankAt(i + 1) && l == l.toUpper() && l.endsWith(QLatin1String("TO:")))) {
+            sp.blocks.push_back({K::Transition, plainFountain(l.startsWith('>') ? l.mid(1) : l).toUpper().toStdString()});
+            continue;
+        }
+        if (!l.startsWith('!') && (l.startsWith('@') || (wasBlank && !blankAt(i + 1) && fountainCue(l)))) {
+            QString cue = l.startsWith('@') ? l.mid(1).trimmed() : l;
+            if (cue.endsWith('^')) cue.chop(1);
+            cue = cue.trimmed();
+            sp.blocks.push_back({K::Character, plainFountain(cue).toStdString()});
+            const QString speaker = speakerOf(cue);
+            // Its dialogue and parentheticals, up to the next blank line.
+            QString speech;
+            auto flush = [&] {
+                const QString body = withoutAsides(plainFountain(speech));
+                speech.clear();
+                if (words(body).empty()) return;
+                ScriptBlock b{K::Dialogue, body.toStdString(), int(sp.lines.size())};
+                addSpeech(sp.lines, speaker, body);
+                b.lineCount = int(sp.lines.size()) - b.firstLine;
+                sp.blocks.push_back(b);
+            };
+            for (; !blankAt(i + 1); ++i) {
+                const QString d = raw[qsizetype(i + 1)].trimmed();
+                if (d.startsWith('(') && d.endsWith(')')) {
+                    flush();
+                    sp.blocks.push_back({K::Parenthetical, plainFountain(d).toStdString()});
+                } else {
+                    speech += (speech.isEmpty() ? QString() : QStringLiteral(" ")) + d;
+                }
+            }
+            flush();
+            continue;
+        }
+        // Action: this line and those up to the next blank one.
+        QString action = l.startsWith('!') ? l.mid(1) : l;
+        for (; !blankAt(i + 1); ++i) action += '\n' + raw[qsizetype(i + 1)].trimmed();
+        sp.blocks.push_back({K::Action, plainFountain(action).toStdString()});
+    }
+    return sp;
+}
+
+std::string fdxToFountain(const std::string& xml) {
+    QXmlStreamReader r(QByteArray::fromStdString(xml));
+    QString out, type, text;
+    bool inParagraph = false;
+    while (!r.atEnd()) {
+        r.readNext();
+        if (r.isStartElement() && r.name() == QLatin1String("Paragraph")) {
+            inParagraph = true;
+            type = r.attributes().value(QLatin1String("Type")).toString();
+            text.clear();
+        } else if (inParagraph && r.isStartElement() && r.name() == QLatin1String("Text")) {
+            text += r.readElementText(QXmlStreamReader::IncludeChildElements);
+        } else if (r.isEndElement() && r.name() == QLatin1String("Paragraph")) {
+            inParagraph = false;
+            text = text.simplified();
+            if (text.isEmpty()) continue;
+            // (each forced, so Fountain reads it as Final Draft says it is)
+            if (type == QLatin1String("Scene Heading")) out += QStringLiteral("\n.") + text + '\n';
+            else if (type == QLatin1String("Character")) out += QStringLiteral("\n@") + text + '\n';
+            else if (type == QLatin1String("Parenthetical")) out += (text.startsWith('(') ? text : '(' + text + ')') + '\n';
+            else if (type == QLatin1String("Dialogue")) out += text + '\n';
+            else if (type == QLatin1String("Transition")) out += QStringLiteral("\n>") + text + '\n';
+            else out += QStringLiteral("\n!") + text + '\n';
+        }
+    }
+    return out.toStdString();
+}
+
+std::string scriptFormat(const std::string& fileName, const std::string& text) {
+    const QString name = QString::fromStdString(fileName).toLower();
+    const QString head = QString::fromStdString(text.substr(0, 4096));
+    if (name.endsWith(QLatin1String(".fdx")) || head.contains(QLatin1String("<FinalDraft"))) return "fdx";
+    if (name.endsWith(QLatin1String(".fountain")) || name.endsWith(QLatin1String(".spmd"))) return "fountain";
+    static const QRegularExpression titlePage(QStringLiteral("^\\s*Title:"), QRegularExpression::CaseInsensitiveOption),
+        forcedCue(QStringLiteral("(^|\\n)@\\S"));
+    return titlePage.match(head).hasMatch() || forcedCue.match(head).hasMatch() ? "fountain" : "text";
+}
+
+std::vector<ScriptLine> scriptLines(const std::string& text, const std::string& fileName) {
+    ProjectScript s;
+    s.format = scriptFormat(fileName, text);
+    s.text = text;
+    return readScreenplay(s).lines;
+}
+
+Screenplay readScreenplay(const ProjectScript& s) {
+    if (s.format == "fdx") return parseFountain(fdxToFountain(s.text));
+    if (s.format == "fountain") return parseFountain(s.text);
+    return plainScreenplay(s.text);
 }
 
 std::vector<ScriptMatch> matchScript(const Project& p, const std::vector<ScriptLine>& lines, const ScriptCutOptions& o) {
@@ -449,6 +675,102 @@ ScriptCutResult buildScriptCut(Project& p, const std::vector<ScriptMatch>& match
     p.sequences.push_back(std::move(s));
     p.media.push_back(std::move(item));
     return res;
+}
+
+}  // namespace montage
+
+namespace montage {
+
+int matchProjectScript(Project& p, const ScriptCutOptions& o) {
+    p.script.readings.clear();
+    if (p.script.text.empty()) return 0;
+    const Screenplay sp = readScreenplay(p.script);
+    int found = 0;
+    for (const ScriptMatch& m : matchScript(p, sp.lines, o)) {
+        // Every reading, best first (a take may say the line more than once: a reset without a cut).
+        std::vector<ScriptReading> line;
+        for (const ScriptTake& t : m.takes) {
+            line.push_back({t.mediaId, t.start, t.end, t.coverage, t.extraWords, t.score});
+            if (line.size() >= 32) break;
+        }
+        found += line.empty() ? 0 : 1;
+        p.script.readings.push_back(std::move(line));
+    }
+    return found;
+}
+
+int setProjectScript(Project& p, const std::string& name, const std::string& format, const std::string& text, const ScriptCutOptions& o) {
+    p.script = {};
+    if (QString::fromStdString(text).trimmed().isEmpty()) return 0;
+    p.script.name = name;
+    p.script.format = format.empty() ? scriptFormat(name, text) : format;
+    p.script.text = text;
+    return matchProjectScript(p, o);
+}
+
+namespace {
+
+using Played = std::map<Id, std::vector<std::pair<double, double>>>;
+
+// What the sequence's enabled clips play of each media item between `from` and `to` (its own seconds), in media
+// seconds; through compound clips into their sequences, and through multicam clips into the angle they show.
+void collectPlayed(const Project& p, const Sequence& s, double from, double to, Played& out, int depth, int onlyVideo = -2,
+                   int onlyAudio = -2) {
+    const double fps = s.fpsValue() > 0 ? s.fpsValue() : 30.0;
+    auto walk = [&](const std::vector<Track>& tracks, bool video) {
+        for (size_t ti = 0; ti < tracks.size(); ++ti) {
+            const int only = video ? onlyVideo : onlyAudio;
+            if (only == -1 || (only >= 0 && int(ti) != only)) continue;
+            for (const Clip& c : tracks[ti].clips) {
+                if (!c.enabled || !c.mediaId) continue;
+                const double a = std::max(from, c.start / fps), b = std::min(to, c.end() / fps);
+                if (b <= a) continue;
+                double ma = c.sourceAt(a * fps - double(c.start)) / fps, mb = c.sourceAt(b * fps - double(c.start)) / fps;
+                if (mb < ma) std::swap(ma, mb);
+                const MediaItem* m = p.findMedia(c.mediaId);
+                const Sequence* inner = m && m->sequenceId ? p.findSequence(m->sequenceId) : nullptr;
+                if (inner && inner != &s && depth < 4) {
+                    if (!inner->multicam) collectPlayed(p, *inner, ma, mb, out, depth + 1);
+                    else if (video) collectPlayed(p, *inner, ma, mb, out, depth + 1, c.angle, -1);
+                    else collectPlayed(p, *inner, ma, mb, out, depth + 1, -1, c.audioAngle >= 0 ? c.audioAngle : -2);
+                    continue;
+                }
+                out[c.mediaId].push_back({ma, mb});
+            }
+        }
+    };
+    walk(s.videoTracks, true);
+    walk(s.audioTracks, false);
+}
+
+}  // namespace
+
+std::vector<int> scriptLinesInCut(const Project& p, const Sequence& s) {
+    std::vector<int> out(p.script.readings.size(), -1);
+    Played played;
+    collectPlayed(p, s, -1e18, 1e18, played, 0);
+    for (size_t line = 0; line < out.size(); ++line) {
+        const auto& readings = p.script.readings[line];
+        for (size_t k = 0; k < readings.size() && out[line] < 0; ++k) {
+            const ScriptReading& r = readings[k];
+            const auto it = played.find(r.media);
+            if (it == played.end()) continue;
+            const double len = std::max(1e-3, r.end - r.start);
+            for (const auto& [a, b] : it->second)
+                if (std::min(b, r.end) - std::max(a, r.start) >= len * 0.5) {
+                    out[line] = int(k);
+                    break;
+                }
+        }
+    }
+    return out;
+}
+
+bool isCircledTake(const MediaItem& m) {
+    const auto it = m.metadata.find("circled");
+    if (it == m.metadata.end()) return false;
+    const QString v = QString::fromStdString(it->second).trimmed().toLower();
+    return v == QLatin1String("yes") || v == QLatin1String("true") || v == QLatin1String("1");
 }
 
 }  // namespace montage

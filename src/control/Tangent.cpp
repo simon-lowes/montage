@@ -1,6 +1,7 @@
 #include "Tangent.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -144,14 +145,17 @@ bool Decoder::feed(const std::string& bytes, std::vector<HubMessage>& out, std::
                 case ParameterChange:
                     m.id = r.u32();
                     m.increment = r.f32();
+                    // (a NaN or infinity from the socket would be written into the grade)
+                    if (!std::isfinite(m.increment)) m.increment = 0;
                     break;
                 case MenuChange:
                     m.id = r.u32();
-                    m.steps = int32_t(r.u32());
+                    m.steps = std::clamp(int32_t(r.u32()), -1000, 1000);
                     break;
                 case Transport:
-                    m.jog = int32_t(r.u32());
-                    m.shuttle = int32_t(r.u32());
+                    // (clamped, so adding them up cannot overflow)
+                    m.jog = std::clamp(int32_t(r.u32()), -1000, 1000);
+                    m.shuttle = std::clamp(int32_t(r.u32()), -1000, 1000);
                     break;
                 case ParameterReset:
                 case ParameterValueRequest:

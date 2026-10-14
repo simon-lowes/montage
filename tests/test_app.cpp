@@ -1,6 +1,7 @@
 // Application integration tests: drive the real main window offscreen —
 // timeline mouse gestures, tools, undo, inspector, monitors and playback.
 #include <QtTest>
+#include <limits>
 #include <QDialog>
 #include <QPointer>
 #include <QSignalSpy>
@@ -92,6 +93,7 @@
 #include "automation/McpServer.h"
 #include "render/OGraf.h"
 #include "GalleryPanel.h"
+#include "LinedScriptPanel.h"
 #include "TrimPanel.h"
 #include "render/Gallery.h"
 #include "ClipStripPanel.h"
@@ -1765,6 +1767,9 @@ private slots:
         }));
         toHub(tangent::parameterChange(gain, 0.25f));
         QVERIFY((v = hear(tangent::ParameterValue, gain)) && std::fabs(v->value - 1.75f) < 1e-6f);
+        // A turn that is not a number changes nothing.
+        toHub(tangent::parameterChange(gain, std::numeric_limits<float>::quiet_NaN()));
+        QVERIFY((v = hear(tangent::ParameterValue, gain)) && std::fabs(v->value - 1.75f) < 1e-6f);
         const SharedNode* look = findSharedNode(*state()->sequence(), sharedId);
         QVERIFY(look && look->effects.size() == 1);
         QVERIFY(std::fabs(look->effects[0].p("gain", 10) - 1.75) < 1e-6);
@@ -1785,6 +1790,29 @@ private slots:
         QTRY_COMPARE(program->speed(), 2.0);
         toHub(tangent::transport(0, -2));
         QTRY_COMPARE(program->speed(), 0.0);
+        // However far the ring is said to turn (from a turn already made, so the two add up), it stops at 32 times.
+        // (from the middle of ten hours, so playing at 32 times reaches neither end before the next turn)
+        const FrameTime far = FrameTime(std::llround(state()->sequence()->fpsValue() * 36000));
+        QVERIFY(state()->edit("Far", [shot, far](Project& p, Sequence& s) {
+            auto loc = edit::locate(s, shot);
+            if (!loc) return false;
+            Clip copy = *edit::clipById(s, shot);
+            copy.id = p.newId();
+            copy.start = far;
+            trackAt(s, loc->track)->clips.push_back(copy);
+            return true;
+        }));
+        state()->setPlayhead(far / 2);
+        program->seek(far / 2);
+        toHub(tangent::transport(0, 1));
+        QTRY_COMPARE(program->speed(), 1.0);
+        toHub(tangent::transport(0, std::numeric_limits<int32_t>::max()));
+        QTRY_COMPARE(program->speed(), 32.0);
+        toHub(tangent::transport(0, std::numeric_limits<int32_t>::min()));
+        QTRY_COMPARE(program->speed(), -32.0);
+        toHub(tangent::transport(0, 6));
+        QTRY_COMPARE(program->speed(), 0.0);
+        state()->undo();
         const QString addMarker = "Sequence/Add Marker";
         QVERIFY(keymap::find(win_.get(), addMarker) && tc->actionId(addMarker));
         const size_t markers = state()->sequence()->markers.size();
@@ -7725,6 +7753,42 @@ private slots:
         state()->undo();
         state()->undo();
         QVERIFY(edit::clipById(*state()->sequence(), other)->effects.empty());
+        // Dialogue Match to the same reference, with room tone: the EQ (now Dialogue Match's), the volume brought to
+        // the reference's as heard, and the reference's room tone under the clip, for its length.
+        QVERIFY(win_->findChild<QAction*>("matchDialogue"));
+        state()->edit("Quieter", [&](Project&, Sequence& sq) {
+            edit::clipById(sq, good)->audio.params["gain_db"] = Param(-4.0);
+            return true;
+        });
+        QCOMPARE(win_->matchVoice(), 1);
+        state()->setSelection({other}, false);
+        const size_t tracks = state()->sequence()->audioTracks.size();
+        QCOMPARE(win_->matchDialogue(DialogueMatchOptions{}, true), 1);
+        const Sequence& after = *state()->sequence();
+        const Clip* matched = edit::clipById(after, other);
+        QVERIFY(matched && eqOf() && eqOf()->s("match") == "dialogue");
+        int eqs = 0;
+        for (const Effect& e : matched->effects) eqs += e.type == "parametric_eq";
+        QCOMPARE(eqs, 1);
+        std::vector<float> heardRef, heardOther;
+        QVERIFY(clipSpeechAudio(state()->project(), after, *edit::clipById(after, good), heardRef) &&
+                clipSpeechAudio(state()->project(), after, *matched, heardOther));
+        const double gain = matched->audio.p("gain_db", 0), planned = planDialogueMatch(heardRef, heardOther, 48000).gainDb - 4;
+        QVERIFY2(std::fabs(gain - planned) < 0.05, qPrintable(QString("%1 %2").arg(gain).arg(planned)));
+        // (on the next track down, free there; a track is added only when none below is)
+        QCOMPARE(after.audioTracks.size(), std::max<size_t>(tracks, 2));
+        QCOMPARE(after.audioTracks[1].clips.size(), size_t(1));
+        QCOMPARE(after.audioTracks[1].clips[0].start, matched->start);
+        QCOMPARE(after.audioTracks[1].clips[0].end(), matched->end());
+        // One undo takes the match and its room tone off together.
+        state()->undo();
+        QVERIFY(state()->sequence()->audioTracks[1].clips.empty());
+        QVERIFY(eqOf() && eqOf()->s("match") == "voice");
+        state()->redo();
+        QCOMPARE(state()->sequence()->audioTracks[1].clips.size(), size_t(1));
+        // The reference itself is not matched to itself.
+        state()->setSelection({good}, false);
+        QCOMPARE(win_->matchDialogue(DialogueMatchOptions{}), 0);
         state()->newProject();
     }
 
@@ -11133,6 +11197,76 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(trims->shown(), QString());
         QCOMPARE(program->trimTarget(), std::string());
         QVERIFY(state()->sequence()->trimTargets.empty());
+    }
+
+    void linedScriptPanel() {
+        // Two takes of a speech (the second a copy of the first file), each read by its transcript.
+        state()->newProject();
+        const QString jfk = QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav"), copy = dir_.path() + "/take2.wav";
+        QFile::remove(copy);
+        QVERIFY(QFile::copy(jfk, copy));
+        const auto ids = state()->importFiles({jfk, copy});
+        QCOMPARE(ids.size(), size_t(2));
+        auto said = [](double at, const QString& text) {
+            auto t = std::make_shared<Transcript>();
+            TranscriptSegment seg;
+            seg.start = at;
+            seg.text = text.toStdString();
+            for (const QString& w : text.split(' ')) {
+                seg.words.push_back({at, at + 0.3, w.toStdString(), -1, {}});
+                at += 0.4;
+            }
+            seg.end = at;
+            t->segments.push_back(seg);
+            return t;
+        };
+        QVERIFY(state()->edit("Transcribe", [&](Project& p, Sequence&) {
+            p.findMedia(ids[0])->transcript = said(1.0, "ask not what your country can do for you");
+            p.findMedia(ids[1])->transcript = said(2.0, "ask not what your country can do for you ask what you can do for your country");
+            return true;
+        }));
+        win_->findChild<QAction*>("showLinedScript")->trigger();
+        auto* panel = win_->findChild<LinedScriptPanel*>();
+        QVERIFY(panel);
+        QTRY_VERIFY(panel->isVisible());
+        QVERIFY(panel->setScript("ask.fountain", "Title: Ask\n\nJFK\nAsk not what your country can do for you.\n\n"
+                                                 "JFK\nAsk what you can do for your country.\n\nJFK\nA line nobody says.\n"));
+        const ProjectScript& script = state()->project().script;
+        QCOMPARE(script.format, std::string("fountain"));
+        QCOMPARE(script.readings.size(), size_t(3));
+        QCOMPARE(script.readings[0].size(), size_t(2));
+        QVERIFY(script.readings[1].size() >= 2);  // (line one says most of its words too, in another order)
+        QCOMPARE(script.readings[1][0].media, ids[1]);
+        QVERIFY(script.readings[2].empty());
+        QCOMPARE(panel->layout().pages, 1);
+        QVERIFY(win_->findChild<QLabel*>("linedScriptSummary")->text().contains("2 of 3"));
+        // A click on a take's line opens that take in the Source monitor, its reading of the line marked.
+        const LinedScriptLayout::Segment* seg = nullptr;
+        for (const auto& sg : panel->layout().segments)
+            if (sg.line == 1 && sg.reading == 0) seg = &sg;
+        QVERIFY(seg);
+        QWidget* pages = panel->pagesWidget();
+        const double scale = (pages->width() - 20.0) / LinedScriptLayout::kPageWidth;
+        const QPoint at(int(10 + panel->layout().columns[size_t(seg->column)].x * scale), int(10 + (seg->y0 + seg->y1) / 2 * scale));
+        QTest::mouseClick(pages, Qt::LeftButton, {}, at);
+        const ScriptReading& r = script.readings[1][0];
+        QCOMPARE(r.media, ids[1]);
+        QCOMPARE(state()->sourceMedia(), ids[1]);
+        const double fps = state()->sequence()->fpsValue();
+        QCOMPARE(state()->sourceIn(), FrameTime(std::floor(r.start * fps)));
+        QCOMPARE(state()->sourceOut(), FrameTime(std::ceil(r.end * fps)) - 1);  // (Out is the last frame played)
+        QCOMPARE(panel->selectedLine(), 1);
+        // A line with no take: nothing opens. Line one's other take, by its reading.
+        QVERIFY(!panel->cueLine(2));
+        QVERIFY(panel->cueLine(0, 1));
+        QCOMPARE(state()->sourceMedia(), script.readings[0][1].media);
+        // Exported as a PDF; Set Script was one undo step.
+        QVERIFY(panel->exportPdf(dir_.path() + "/ask.pdf"));
+        QVERIFY(QFileInfo(dir_.path() + "/ask.pdf").size() > 1000);
+        state()->undo();
+        QVERIFY(state()->project().script.text.empty());
+        QTRY_COMPARE(panel->layout().pages, 0);
+        state()->newProject();
     }
 
     void galleryAndClipStrip() {

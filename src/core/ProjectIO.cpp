@@ -823,12 +823,39 @@ Sequence sequenceFromJson(const QJsonObject& o) {
         for (Effect& e : effects)
             if (e.node && !findGradeNode(g, e.node)) e.node = 0;
     };
+    // Effects the renderer always ran ahead of the grade wherever they sat (Video NR, Super Scale...), left in a node by
+    // a project saved before they were kept out of nodes: on the clip, outside the graph, as they ran (the node's
+    // window, key and mix never applied to them), and off where the node had them off. They no longer belong to a
+    // grade version: a stored version's go onto the clip, switched off, when the clip has none of that kind.
+    auto takeOut = [](Clip& c) {
+        for (Effect& e : c.effects)
+            if (e.node && alwaysRanBeforeGrade(e.type)) {
+                e.enabled = e.enabled && (!findGradeNode(c.grade, e.node) || liveGradeNode(c.grade, e.node));
+                e.node = 0;
+            }
+        for (GradeVersion& v : c.gradeVersions)
+            for (size_t i = 0; i < v.effects.size();) {
+                if (!v.effects[i].node || !alwaysRanBeforeGrade(v.effects[i].type)) {
+                    ++i;
+                    continue;
+                }
+                Effect e = std::move(v.effects[i]);
+                v.effects.erase(v.effects.begin() + std::ptrdiff_t(i));
+                if (i < v.anchors.size()) v.anchors.erase(v.anchors.begin() + std::ptrdiff_t(i));
+                if (std::none_of(c.effects.begin(), c.effects.end(), [&](const Effect& x) { return x.type == e.type; })) {
+                    e.node = 0;
+                    e.enabled = false;
+                    c.effects.push_back(std::move(e));
+                }
+            }
+    };
     for (Track& t : s.videoTracks)
         for (Clip& c : t.clips) {
             if (!c.grade.empty() && !validGrade(c.grade)) {
                 c.effects = flattenedEffects(s, c);  // (repeated ids made fresh once the project's ids are known)
                 c.grade = {};
             }
+            takeOut(c);
             settle(c.effects, c.grade);
             for (GradeVersion& v : c.gradeVersions) settle(v.effects, v.grade);
         }
@@ -965,6 +992,18 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         for (const auto& f : p.watchFolders) folders.append(qs(f));
         root["watchFolders"] = folders;
     }
+    if (!p.script.text.empty()) {
+        QJsonArray lines;
+        for (const auto& line : p.script.readings) {
+            QJsonArray takes;
+            for (const ScriptReading& r : line)
+                takes.append(QJsonObject{{"media", double(r.media)}, {"start", r.start}, {"end", r.end}, {"coverage", r.coverage},
+                                         {"extra", r.extraWords}, {"score", r.score}});
+            lines.append(takes);
+        }
+        root["script"] = QJsonObject{{"name", qs(p.script.name)}, {"format", qs(p.script.format)}, {"text", qs(p.script.text)},
+                                     {"readings", lines}};
+    }
     if (!p.fillerWords.empty()) {
         QJsonArray words;
         for (const auto& w : p.fillerWords) words.append(qs(w));
@@ -1088,6 +1127,24 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         if (!f.toString().isEmpty()) p.watchFolders.push_back(ss(f));
     for (const auto& w : root.value("fillerWords").toArray())
         if (!w.toString().trimmed().isEmpty()) p.fillerWords.push_back(ss(w));
+    if (const QJsonObject so = root.value("script").toObject(); !so.isEmpty()) {
+        p.script.name = ss(so.value("name"));
+        p.script.format = ss(so.value("format"));
+        p.script.text = ss(so.value("text"));
+        for (const auto& lv : so.value("readings").toArray()) {
+            std::vector<ScriptReading> line;
+            for (const auto& tv : lv.toArray()) {
+                const QJsonObject t = tv.toObject();
+                ScriptReading r;
+                r.media = Id(i64(t.value("media")));
+                r.start = t.value("start").toDouble(), r.end = t.value("end").toDouble();
+                r.coverage = t.value("coverage").toDouble(), r.extraWords = t.value("extra").toInt();
+                r.score = t.value("score").toDouble();
+                if (r.media) line.push_back(r);
+            }
+            p.script.readings.push_back(std::move(line));
+        }
+    }
     for (const auto& bv : root.value("smartBins").toArray()) {
         const QJsonObject o = bv.toObject();
         SmartBin b;
@@ -1150,6 +1207,35 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         }
     }
     p.nextId = std::max(p.nextId, maxId + 1);
+    // The same left in a shared node: onto each clip showing it, on where one of its nodes showing it takes part (off
+    // when only a stored grade version shows it, and then only if the clip has none of that kind).
+    for (Sequence& s : p.sequences)
+        for (SharedNode& n : s.sharedNodes) {
+            std::vector<Effect> before;
+            for (auto it = n.effects.begin(); it != n.effects.end();)
+                if (alwaysRanBeforeGrade(it->type)) before.push_back(std::move(*it)), it = n.effects.erase(it);
+                else ++it;
+            if (before.empty()) continue;
+            auto shows = [&](const GradeGraph& g) {
+                return std::any_of(g.nodes.begin(), g.nodes.end(), [&](const GradeNode& x) { return x.shared == n.id; });
+            };
+            for (Track& t : s.videoTracks)
+                for (Clip& c : t.clips) {
+                    const bool now = shows(c.grade);
+                    if (!now && std::none_of(c.gradeVersions.begin(), c.gradeVersions.end(), [&](const GradeVersion& v) { return shows(v.grade); }))
+                        continue;
+                    bool live = false;
+                    for (const GradeNode& g : c.grade.nodes) live = live || (g.shared == n.id && liveGradeNode(c.grade, g.key));
+                    for (const Effect& e : before) {
+                        if (!now && std::any_of(c.effects.begin(), c.effects.end(), [&](const Effect& x) { return x.type == e.type; })) continue;
+                        Effect x = e;
+                        x.id = p.newId();
+                        x.node = 0;
+                        x.enabled = x.enabled && live;
+                        c.effects.push_back(std::move(x));
+                    }
+                }
+        }
     // An effect id repeated in a clip (a graph flattened above, or saved so) given a fresh one.
     for (Sequence& s : p.sequences)
         for (Track& t : s.videoTracks)

@@ -219,25 +219,41 @@ Effect voiceEqEffect(Project& p, const VoiceEq& g) {
     return e;
 }
 
-bool clipSpeechSpectrum(const Project& p, const Sequence& s, const Clip& c, std::vector<double>& out, std::string* error) {
+void applyVoiceEqTo(std::vector<float>& mono, const VoiceEq& g, double rate) {
+    fx::ParametricEq eq = makeEq(g, rate);
+    std::vector<float> stereo(mono.size() * 2);
+    for (size_t i = 0; i < mono.size(); ++i) stereo[i * 2] = stereo[i * 2 + 1] = mono[i];
+    for (size_t at = 0; at < mono.size(); at += 4096) eq.process(stereo.data() + at * 2, int(std::min<size_t>(4096, mono.size() - at)));
+    for (size_t i = 0; i < mono.size(); ++i) mono[i] = stereo[i * 2];
+}
+
+bool clipSpeechAudio(const Project& p, const Sequence& s, const Clip& c, std::vector<float>& mono, std::string* error, int rate) {
     const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
     if (!m || !m->hasAudio || m->path.empty()) {
         if (error) *error = "The clip has no sound";
         return false;
     }
-    AudioBufferPtr buf = decodeAudio(m->path, kRate, error, nullptr, c.channels);
+    AudioBufferPtr buf = decodeAudio(m->path, rate, error, nullptr, c.channels);
     if (!buf) return false;
     const double fps = s.fpsValue();
     double a = c.sourceFrameAt(c.start) / fps, b = c.sourceFrameAt(c.end() - 1) / fps;
     if (a > b) std::swap(a, b);
-    const int64_t first = std::clamp<int64_t>(int64_t(a * kRate), 0, buf->frames());
-    const int64_t last = std::clamp<int64_t>(int64_t((b + 1 / fps) * kRate), first, buf->frames());
-    if (last - first < kRate) {
+    const int64_t first = std::clamp<int64_t>(int64_t(a * rate), 0, buf->frames());
+    const int64_t last = std::clamp<int64_t>(int64_t((b + 1 / fps) * rate), first, buf->frames());
+    if (last - first < rate) {
         if (error) *error = "The clip is too short to measure its voice";
         return false;
     }
-    std::vector<float> mono(size_t(last - first));
-    for (int64_t i = first; i < last; ++i) mono[size_t(i - first)] = 0.5f * (buf->samples[size_t(i) * 2] + buf->samples[size_t(i) * 2 + 1]);
+    const size_t ch = size_t(std::max(1, buf->channels));
+    mono.resize(size_t(last - first));
+    for (int64_t i = first; i < last; ++i)
+        mono[size_t(i - first)] = 0.5f * (buf->samples[size_t(i) * ch] + buf->samples[size_t(i) * ch + (ch > 1 ? 1 : 0)]);
+    return true;
+}
+
+bool clipSpeechSpectrum(const Project& p, const Sequence& s, const Clip& c, std::vector<double>& out, std::string* error) {
+    std::vector<float> mono;
+    if (!clipSpeechAudio(p, s, c, mono, error, kRate)) return false;
     out = speechSpectrum(mono, kRate);
     return true;
 }

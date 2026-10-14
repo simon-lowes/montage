@@ -16,6 +16,10 @@ bool runsBeforeGrade(const std::string& type) {
     return types.count(type) > 0;
 }
 
+bool alwaysRanBeforeGrade(const std::string& type) {
+    return runsBeforeGrade(type) && type != "stabilize" && type != "rolling_shutter" && type != "lens_correction";
+}
+
 bool isGradeMixer(const GradeNode& n) { return n.kind == "parallel" || n.kind == "layer"; }
 
 const GradeNode* findGradeNode(const GradeGraph& g, int key) {
@@ -80,6 +84,13 @@ bool validGrade(const GradeGraph& g, std::string* why) {
     for (const GradeNode& n : g.nodes)
         if (!visit(n.key)) return fail("The links would make a loop");
     return true;
+}
+
+bool liveGradeNode(const GradeGraph& g, int key) {
+    const GradeNode* n = findGradeNode(g, key);
+    if (!n || !n->enabled) return false;
+    const std::vector<int> order = gradeOrder(g);
+    return std::find(order.begin(), order.end(), key) != order.end();
 }
 
 std::vector<int> gradeOrder(const GradeGraph& g) {
@@ -627,7 +638,10 @@ Result shareGradeNode(Project& p, Sequence& s, Id clip, int key, const std::stri
     sn.id = p.newId();
     sn.name = name.empty() ? "Shared Node " + std::to_string(s.sharedNodes.size() + 1) : name;
     std::vector<Effect> rest;
+    // (an old project's that ran ahead of the graph wherever they were stay on the clip, off if the node was)
+    const bool live = liveGradeNode(c->grade, key);
     for (Effect& e : c->effects) {
+        if (e.node == key && alwaysRanBeforeGrade(e.type)) e.node = 0, e.enabled = e.enabled && live;
         if (e.node == key && e.type != "grade_node") {
             Effect moved = e;
             moved.node = 0;

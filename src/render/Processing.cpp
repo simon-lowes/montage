@@ -2979,9 +2979,8 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
         op.params[0] = float(e.p("threshold", t, 0.1)), op.params[1] = float(e.p("softness", t, 0.05));
         op.params[2] = e.p("invert", t) > 0.5 ? 1 : 0;
     } else if (e.type == "screen_key") {
-        // (as screenKey; a matte shrunk, grown or softened is the CPU's: those look at the pixels around)
+        // (as screenKey, the matte shrunk or grown and softened by passes of its own when asked)
         const double shrink = e.p("shrink", t, 0) * pixelScale, soften = e.p("soften", t, 0) * pixelScale;
-        if (std::lround(shrink) != 0 || std::lround(soften / 2) != 0) return false;
         op.kind = gpu::ColorOp::ScreenKey;
         const float sk[3] = {float(e.p("key.r", t, 0.1)), float(e.p("key.g", t, 0.75)), float(e.p("key.b", t, 0.2))};
         const int dom = (sk[1] >= sk[0] && sk[1] >= sk[2]) ? 1 : (sk[2] >= sk[0] ? 2 : 0);
@@ -2993,6 +2992,7 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
         op.params[5] = float(std::max(e.p("clip_white", t, 1), e.p("clip_black", t, 0.05) + 0.01));
         op.params[6] = float(e.p("despill", t, 100) / 100), op.params[7] = float(e.p("restore", t, 50) / 100);
         op.params[8] = float(e.p("edge_desat", t, 0) / 100), op.params[9] = float(std::lround(e.p("view", t, 0)));
+        op.params[10] = float(std::lround(shrink)), op.params[11] = float(std::lround(soften / 2));
     } else if (e.type == "levels") {
         op.kind = gpu::ColorOp::Levels;
         const float inB = float(e.p("in_black", t, 0)), inW = float(e.p("in_white", t, 1));

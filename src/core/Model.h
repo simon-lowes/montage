@@ -526,6 +526,24 @@ struct Sequence {
     bool operator==(const Sequence&) const = default;
 };
 
+// The screenplay the project is cut from (core/ScriptCut.h readScreenplay): its text as written and, for each of its
+// lines (in the order readScreenplay gives them), the takes that read it, best first, found in the transcripts.
+struct ScriptReading {
+    Id media = 0;
+    double start = 0, end = 0;  // media seconds, first to last word of the line
+    double coverage = 0;        // share of the line's words said (0..1)
+    int extraWords = 0;         // words said in that range that are not the line's
+    double score = 0;
+    bool operator==(const ScriptReading&) const = default;
+};
+struct ProjectScript {
+    std::string name;    // the file it was read from, or what it was called ("" for none)
+    std::string format;  // "fountain", "fdx" or "text"
+    std::string text;    // "" when the project has no script
+    std::vector<std::vector<ScriptReading>> readings;  // per line; empty until matched
+    bool operator==(const ProjectScript&) const = default;
+};
+
 struct Project {
     std::string name = "Untitled";
     std::vector<MediaItem> media;
@@ -536,6 +554,7 @@ struct Project {
     std::vector<std::string> fillerWords;  // the editor's own filler words or phrases (core/TranscriptEdit.h)
     std::vector<std::string> vocabulary;   // names and terms speech-to-text should expect (core/TranscriptCorrect.h)
     std::vector<std::string> watchFolders;  // folders whose arriving media files are imported (app/EditorState)
+    ProjectScript script;  // the screenplay and its lined coverage (core/ScriptCut.h)
     Id activeSequence = 0;
     Id nextId = 1;
     // Whether its media's stereo packing (MediaItem::stereo) has been read: false for a project saved before Montage

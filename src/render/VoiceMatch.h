@@ -31,7 +31,13 @@ Effect voiceEqEffect(Project& p, const VoiceEq& eq);
 // Applies an EQ to a spectrum (for checking a match).
 std::vector<double> withVoiceEq(const std::vector<double>& spectrum, const VoiceEq& eq, double rate = 48000);
 
-// The spectrum of what a clip plays (its source range, decoded).
+// Runs the EQ over mono audio (for measuring what it does).
+void applyVoiceEqTo(std::vector<float>& mono, const VoiceEq& eq, double rate = 48000);
+
+// What a clip plays (its source range, decoded) as mono at `rate`; at least a second of it.
+bool clipSpeechAudio(const Project& p, const Sequence& s, const Clip& c, std::vector<float>& mono, std::string* error = nullptr,
+                     int rate = 48000);
+// The spectrum of what a clip plays.
 bool clipSpeechSpectrum(const Project& p, const Sequence& s, const Clip& c, std::vector<double>& out, std::string* error = nullptr);
 // Puts the EQ first in the clip's effects, replacing an earlier Match Voice EQ.
 void applyVoiceEq(Project& p, Clip& c, const VoiceEq& eq);

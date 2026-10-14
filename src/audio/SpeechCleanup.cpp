@@ -199,7 +199,12 @@ double estimateReverbTime(const AudioBuffer& in) {
             acc = 0;
         }
     }
+    return reverbTimeFromLevels(level);
+}
+
+double reverbTimeFromLevels(const std::vector<double>& level) {
     const size_t n = level.size();
+    if (n < 100) return 0;
     std::vector<double> sm(n);
     for (size_t i = 0; i < n; ++i) {
         double sum = 0;

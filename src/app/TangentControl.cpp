@@ -313,6 +313,7 @@ bool TangentControl::change(const std::string& name, double to, bool reset) {
         state_->message(tr("Select a clip to grade"), 3000);
         return false;
     }
+    if (!reset && !std::isfinite(to)) return false;
     const double v = reset ? info->def : std::clamp(to, info->min, info->max);
     const QString label = tr("%1 (Tangent)").arg(QString::fromStdString(info->label));
     // (a run of turns on the node, a trackball's three colours interleaved, is one undo step)
@@ -417,7 +418,7 @@ void TangentControl::handle(const tangent::HubMessage& m) {
             break;
         case tangent::ParameterChange:
             if (auto it = parameters_.find(m.id); it != parameters_.end()) {
-                change(it->second, value(it->second) + double(m.increment), false);
+                if (m.increment != 0) change(it->second, value(it->second) + double(m.increment), false);
                 sendValue(m.id);
                 watched_.clear();  // (its own change: the Hub knows)
                 watch();

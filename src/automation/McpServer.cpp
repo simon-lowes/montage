@@ -81,6 +81,7 @@
 #include "core/MediaLog.h"
 #include "core/ProjectIO.h"
 #include "core/ScriptCut.h"
+#include "render/LinedScript.h"
 #include "core/Ambisonics.h"
 #include "media/Sofa.h"
 #include "core/Surround.h"
@@ -99,6 +100,7 @@
 #include "render/AutoBroll.h"
 #include "render/Highlights.h"
 #include "render/MusicEdit.h"
+#include "render/DialogueMatch.h"
 #include "render/VoiceMatch.h"
 #include "media/Analysis.h"
 #include "media/AutoDuck.h"
@@ -3622,13 +3624,16 @@ void McpServer::Impl::addTools() {
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             std::string text = a.value("script").toString().toStdString();
-            if (const QString file = a.value("script_file").toString(); !file.isEmpty()) {
+            const QString file = a.value("script_file").toString();
+            if (!file.isEmpty()) {
                 QFile f(absolute(file));
                 if (!f.open(QIODevice::ReadOnly)) return fail(QStringLiteral("Cannot open %1").arg(file));
                 text = f.readAll().toStdString();
-                if (file.endsWith(QStringLiteral(".fdx"), Qt::CaseInsensitive)) text = fdxToScript(text);
             }
-            const auto lines = parseScript(text);
+            ProjectScript given;
+            given.format = scriptFormat(file.toStdString(), text);
+            given.text = text;
+            const auto lines = readScreenplay(given).lines;
             if (lines.empty()) return fail("No script lines (pass script or script_file)");
             ScriptCutOptions o;
             o.minCoverage = std::clamp(a.value("min_coverage").toDouble(0.6), 0.2, 1.0);
@@ -3667,6 +3672,91 @@ void McpServer::Impl::addTools() {
                           .arg(r.missing),
                       QJsonObject{{"sequence", name}, {"placed", r.placed}, {"alternates", r.alternates}, {"missing", r.missing},
                                   {"duration", tc(s.duration(), s)}, {"lines", report}});
+        });
+
+    add("montage_script", "The project's script and its lined coverage",
+        "Keep a screenplay in the project and see which takes read each of its lines (the lined script): action \"set\" "
+        "reads a script (text or a file: Fountain, Final Draft .fdx or plain text) and finds each line in the transcribed "
+        "takes; \"match\" finds them again after more takes are transcribed; \"status\" lists the lines with their takes "
+        "(best first, circled ones marked) and which one the active sequence uses; \"pdf\" writes the lined script; "
+        "\"remove\" takes the script away. Transcribe the takes first.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "action":{"type":"string","enum":["set","match","status","pdf","remove"],"default":"status"},
+            "script":{"type":"string","description":"set: the script's text"},
+            "script_file":{"type":"string","description":"set: or a file holding it"},
+            "min_coverage":{"type":"number","default":0.6,"description":"set, match: share of a line a reading must say (0.2-1)"},
+            "path":{"type":"string","description":"pdf: where to write it"}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const QString action = a.value("action").toString(QStringLiteral("status"));
+            ScriptCutOptions o;
+            o.minCoverage = std::clamp(a.value("min_coverage").toDouble(0.6), 0.2, 1.0);
+            auto status = [&](const QString& message) {
+                const Screenplay sp = readScreenplay(l.project.script);
+                const std::vector<int> used = l.project.active() ? scriptLinesInCut(l.project, *l.project.active()) : std::vector<int>();
+                QJsonArray lines;
+                int read = 0, inCut = 0;
+                for (size_t i = 0; i < sp.lines.size(); ++i) {
+                    QJsonObject line{{"line", int(i)}, {"text", QString::fromStdString(sp.lines[i].text)}};
+                    if (!sp.lines[i].speaker.empty()) line["speaker"] = QString::fromStdString(sp.lines[i].speaker);
+                    QJsonArray takes;
+                    const auto* readings = i < l.project.script.readings.size() ? &l.project.script.readings[i] : nullptr;
+                    for (size_t k = 0; readings && k < readings->size(); ++k) {
+                        const ScriptReading& r = (*readings)[k];
+                        const MediaItem* m = l.project.findMedia(r.media);
+                        if (!m) continue;
+                        QJsonObject t{{"media", QString::fromStdString(m->name)}, {"start", r.start}, {"end", r.end},
+                                      {"coverage", r.coverage}, {"extra_words", r.extraWords}};
+                        if (isCircledTake(*m)) t["circled"] = true;
+                        if (i < used.size() && used[i] == int(k)) t["in_cut"] = true;
+                        takes.append(t);
+                    }
+                    read += takes.isEmpty() ? 0 : 1;
+                    inCut += i < used.size() && used[i] >= 0 ? 1 : 0;
+                    line["takes"] = takes;
+                    lines.append(line);
+                }
+                return ok(message.isEmpty() ? QStringLiteral("%1 of %2 line(s) read by a take, %3 in the cut").arg(read).arg(sp.lines.size()).arg(inCut)
+                                            : message,
+                          QJsonObject{{"name", QString::fromStdString(l.project.script.name)},
+                                      {"format", QString::fromStdString(l.project.script.format)},
+                                      {"title", QString::fromStdString(sp.title)}, {"read", read}, {"in_cut", inCut}, {"lines", lines}});
+            };
+            if (action == QLatin1String("set")) {
+                std::string text = a.value("script").toString().toStdString();
+                QString name = QStringLiteral("Script");
+                if (const QString file = a.value("script_file").toString(); !file.isEmpty()) {
+                    QFile f(absolute(file));
+                    if (!f.open(QIODevice::ReadOnly)) return fail(QStringLiteral("Cannot open %1").arg(file));
+                    text = f.readAll().toStdString();
+                    name = absolute(file);
+                }
+                if (QString::fromStdString(text).trimmed().isEmpty()) return fail("Pass script or script_file");
+                const int found = setProjectScript(l.project, name.toStdString(), "", text, o);
+                save(l);
+                return status(QStringLiteral("Found %1 of %2 line(s) in the takes").arg(found).arg(readScreenplay(l.project.script).lines.size()));
+            }
+            if (l.project.script.text.empty()) return fail("The project has no script (use action \"set\")");
+            if (action == QLatin1String("match")) {
+                matchProjectScript(l.project, o);
+                save(l);
+                return status({});
+            }
+            if (action == QLatin1String("remove")) {
+                l.project.script = {};
+                save(l);
+                return ok(QStringLiteral("Script removed"), {});
+            }
+            if (action == QLatin1String("pdf")) {
+                const QString path = a.value("path").toString();
+                if (path.isEmpty()) return fail("Pass path");
+                const LinedScriptLayout layout = layoutLinedScript(l.project, l.project.active());
+                QString error;
+                if (!exportLinedScriptPdf(layout, absolute(path), &error)) return fail(error);
+                return ok(QStringLiteral("Wrote %1 page(s)").arg(layout.pages), QJsonObject{{"path", absolute(path)}, {"pages", layout.pages}});
+            }
+            if (action != QLatin1String("status")) return fail(QStringLiteral("Unknown action %1").arg(action));
+            return status({});
         });
 
     add("montage_beat_markers", "Mark the beat",
@@ -4650,6 +4740,57 @@ void McpServer::Impl::addTools() {
             if (n == 0) return fail("No clips to match");
             save(l);
             return ok(QStringLiteral("Matched %1 clip(s) to %2").arg(n).arg(QString::fromStdString(ref.name)), QJsonObject{{"clips", out}});
+        });
+
+    add("montage_match_dialogue", "Match dialogue to a reference",
+        "Make ADR or a pickup sound like the production take it sits with (the reference clip): the reference's room is "
+        "measured from its speech (decay time per octave) and added as a Convolution Reverb at the level that leaves as "
+        "much late reverberation as the reference has; a Parametric EQ is fitted to the result (with tone_over_time, "
+        "refitted every half second and keyed); the clip volume brings the speech to the reference's loudness. Matching "
+        "again replaces the earlier match (and a Match Voice EQ).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"reference":{"type":"number","description":"The production take"},
+            "clips":{"type":"array","items":{"type":"number"}},"room":{"type":"boolean","default":true},"tone":{"type":"boolean","default":true},
+            "tone_over_time":{"type":"boolean","default":false},"level":{"type":"boolean","default":true}},
+            "required":["project","reference","clips"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Clip& ref = clipArg(l, a, "reference");
+            DialogueMatchOptions o;
+            o.room = a.value("room").toBool(true);
+            o.tone = a.value("tone").toBool(true);
+            o.toneOverTime = a.value("tone_over_time").toBool(false);
+            o.level = a.value("level").toBool(true);
+            std::vector<Id> ids;
+            for (const QJsonValue& v : a.value("clips").toArray()) {
+                const Clip* c = edit::clipById(s, Id(v.toDouble()));
+                auto loc = c ? edit::locate(s, c->id) : std::nullopt;
+                if (!c || !loc || loc->track.kind != TrackKind::Audio || c->id == ref.id)
+                    throw ArgError{QStringLiteral("%1 is not an audio clip other than the reference").arg(qulonglong(v.toDouble()))};
+                if (std::find(ids.begin(), ids.end(), c->id) == ids.end()) ids.push_back(c->id);
+            }
+            std::vector<std::pair<Id, DialogueMatchPlan>> plans;
+            std::string err;
+            const QString refName = QString::fromStdString(ref.name);
+            const int n = matchDialogue(l.project, s, ref.id, ids, o, &plans, &err);
+            if (n == 0) return fail(err.empty() ? QStringLiteral("No clips to match") : QString::fromStdString(err));
+            save(l);
+            QJsonArray out;
+            for (const auto& [id, plan] : plans) {
+                QJsonArray rt;
+                for (double t : plan.room.rt60) rt.append(t);
+                out.append(QJsonObject{{"clip", double(id)}, {"room_added", plan.roomAdded}, {"rt60", rt},
+                                       {"room_level_db", plan.wetDb}, {"late_reverb_db", plan.matchedLateDb},
+                                       {"reference_late_reverb_db", plan.referenceLateDb}, {"eq_keys", int(plan.eqOverTime.size())},
+                                       {"low_db", plan.eq.lowDb}, {"b300_db", plan.eq.b1Db}, {"b1200_db", plan.eq.b2Db},
+                                       {"b4000_db", plan.eq.b3Db}, {"high_db", plan.eq.highDb}, {"gain_db", plan.gainDb},
+                                       {"loudness_lufs", plan.matchedLufs}, {"reference_loudness_lufs", plan.referenceLufs}});
+            }
+            // (a clip whose sound could not be read is left as it was)
+            QJsonArray skipped;
+            for (Id id : ids)
+                if (std::none_of(plans.begin(), plans.end(), [&](const auto& pl) { return pl.first == id; })) skipped.append(double(id));
+            return ok(QStringLiteral("Matched %1 clip(s) to %2").arg(n).arg(refName), QJsonObject{{"clips", out}, {"not_matched", skipped}});
         });
 
     add("montage_set_surround", "Set up a surround mix",

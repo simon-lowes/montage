@@ -395,14 +395,14 @@ std::shared_ptr<const MlvIndex> indexMlv(const std::string& path, std::string* e
         }
         const uint32_t headerSize = u32(head + 4);
         if (chunk == 0) {
-            guid = u64(head + 8);
+            guid = u64(head + 16);
             const uint16_t videoClass = u16(head + 32);
             info.fpsNum = int(u32(head + 44));
             info.fpsDen = int(u32(head + 48));
             info.lossless = (videoClass & 0x20) != 0;
             if ((videoClass & 0x0F) != 0x01) return fail(path + " holds no RAW video (its frames are JPEG, H.264 or YUV)");
             if (videoClass & 0xC0) return fail(path + " is compressed with LZMA or delta frames (MLV App's own), which this does not read");
-        } else if (u64(head + 8) != guid) {
+        } else if (u64(head + 16) != guid) {
             break;  // (another recording's chunk of the same name)
         }
         const int c = int(index->chunks.size());

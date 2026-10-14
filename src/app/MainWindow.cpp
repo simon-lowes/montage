@@ -139,6 +139,7 @@
 #include "control/Midi.h"
 #include "MulticamPanel.h"
 #include "AdrPanel.h"
+#include "LinedScriptPanel.h"
 #include "AudioDescriptionDialog.h"
 #include "CaptionsPanel.h"
 #include "MaskOverlay.h"
@@ -555,6 +556,16 @@ void MainWindow::buildPanels() {
     keyframesDock_ = makeDock(tr("Keyframes"), "keyframes", new KeyframePanel(state_, this));
     gradeNodes_ = new GradeNodePanel(state_, this);
     nodesDock_ = makeDock(tr("Nodes"), "nodes", gradeNodes_);
+    // The lined script (the screenplay with each take's line down what it reads).
+    linedScript_ = new LinedScriptPanel(state_, this);
+    linedScriptDock_ = makeDock(tr("Script"), "linedScript", linedScript_);
+    connect(linedScript_, &LinedScriptPanel::openRequested, this, [this](Id media, FrameTime in, FrameTime out, FrameTime at) {
+        // The take at the line, marked in the Source monitor and ready to edit in.
+        openInSource(media);
+        state_->setSourceIn(in);
+        state_->setSourceOut(out);
+        source_->seek(at);
+    });
     // The colour page's stills and clips (Resolve's Gallery and thumbnail timeline).
     gallery_ = new GalleryPanel(state_, this);
     galleryDock_ = makeDock(tr("Gallery"), "gallery", gallery_);
@@ -793,7 +804,7 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         resizeDocks({sourceDock_}, {h / 2 + 40}, Qt::Vertical);
     } else {  // Editing
         arrangeDocks({{sourceDock_, inspectorDock_, scopesDock_, mixerDock_, captionsDock_, multicamDock_, keyframesDock_}, {programDock_}},
-                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, peopleDock_, indexDock_, stackedDock_, queueDock_, assistantDock_, nodesDock_, galleryDock_, clipsDock_, trimsDock_}},
+                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, peopleDock_, indexDock_, stackedDock_, queueDock_, assistantDock_, nodesDock_, galleryDock_, clipsDock_, trimsDock_, linedScriptDock_}},
                      {{meterDock_}});
         resizeDocks({binDock_}, {380}, Qt::Horizontal);
         resizeDocks({meterDock_}, {70}, Qt::Horizontal);
@@ -1475,6 +1486,8 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Fit to Fill"), QKeySequence(), [this] { fitToFill(); })->setObjectName(QStringLiteral("fitToFill"));
     add(clipM, tr("Set Voice Reference"), QKeySequence(), [this] { setVoiceReference(); })->setObjectName(QStringLiteral("setVoiceReference"));
     add(clipM, tr("Match Voice to Reference"), QKeySequence(), [this] { matchVoice(); })->setObjectName(QStringLiteral("matchVoice"));
+    add(clipM, tr("Match Dialogue to Reference…"), QKeySequence(), [this] { matchDialogueDialog(); })
+        ->setObjectName(QStringLiteral("matchDialogue"));
     add(clipM, tr("Convert Voice…"), QKeySequence(), [this] {
         const Sequence* s = state_->sequence();
         const Id clip = s ? voiceConversionClip(state_->project(), *s, state_->selectedClips()) : 0;
@@ -1632,6 +1645,11 @@ void MainWindow::buildMenus() {
     add(seqM, tr("Make &Shorts…"), QKeySequence(), [this] { shortsDialog(); })->setObjectName(QStringLiteral("makeShorts"));
     add(seqM, tr("Build Cut from &Script…"), QKeySequence(), [this] { scriptCutDialog(); })
         ->setObjectName(QStringLiteral("buildScriptCut"));
+    add(seqM, tr("&Lined Script"), QKeySequence(), [this] {
+        // The screenplay with each take's line down what it reads, beside the Source monitor.
+        linedScriptDock_->show();
+        linedScriptDock_->raise();
+    })->setObjectName(QStringLiteral("showLinedScript"));
     add(seqM, tr("Auto &Mix…"), QKeySequence(), [this] { AutoMixDialog::run(state_, this); })->setObjectName(QStringLiteral("autoMix"));
     add(seqM, tr("Record &Voiceover…"), QKeySequence("Ctrl+Alt+R"), [this] {
         if (!state_->sequence()) return;
@@ -4870,6 +4888,8 @@ bool MainWindow::setVoiceReference() {
         return false;
     voiceRef_ = spectrum;
     voiceRefName_ = name;
+    voiceRefClip_ = clip;
+    voiceRefGeneration_ = state_->projectGeneration();
     state_->message(tr("Voice reference: %1. Select dialogue clips and choose Match Voice to Reference.").arg(name), 6000);
     return true;
 }
@@ -4913,6 +4933,117 @@ int MainWindow::matchVoice() {
     state_->message(tr("Matched %n clip(s) to %1", "", int(fits.size())).arg(voiceRefName_), 5000);
     inspectorDock_->raise();
     return int(fits.size());
+}
+
+int MainWindow::matchDialogue(const DialogueMatchOptions& o, bool roomTone) {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    const Clip* ref = voiceRefClip_ && voiceRefGeneration_ == state_->projectGeneration() ? edit::clipById(*s, voiceRefClip_) : nullptr;
+    if (!ref) {
+        state_->message(tr("Select the production take and choose Clip › Set Voice Reference first"), 5000);
+        return 0;
+    }
+    const Id refId = ref->id, seqId = s->id;
+    const QString refName = QString::fromStdString(ref->name);
+    const double refGain = ref->audio.p("gain_db", ref->duration / 2, 0);
+    std::vector<Id> clips;
+    for (Id id : state_->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Audio && id != refId) clips.push_back(id);
+    if (clips.empty()) {
+        state_->message(tr("Select the audio clips to match"));
+        return 0;
+    }
+    auto project = std::make_shared<Project>(state_->project());
+    std::vector<std::pair<Id, DialogueMatchPlan>> plans;
+    RoomToneProfile tone;
+    if (!runWithProgress(this, state_, tr("Matching dialogue..."), [&, project](const auto& progress, const auto* cancel, std::string* err) {
+            Sequence* sq = project->findSequence(seqId);
+            if (!sq || montage::matchDialogue(*project, *sq, refId, clips, o, &plans, err, progress, cancel) == 0) return false;
+            // (the room tone learned once, from the reference)
+            if (const Clip* k = roomTone ? edit::clipById(*sq, refId) : nullptr) {
+                std::string why;
+                clipRoomTone(*project, *sq, *k, tone, &why);
+            }
+            return true;
+        }))
+        return 0;
+    // Room tone for each clip's length, written beside the project and imported.
+    std::map<Id, Id> toneMedia;  // clip -> its room tone
+    if (roomTone && !tone.valid()) state_->message(tr("No room tone could be learned from %1").arg(refName), 5000);
+    if (roomTone && tone.valid()) {
+        QStringList paths;
+        std::vector<Id> forClip;
+        for (const auto& [id, plan] : plans) {
+            const Clip* k = edit::clipById(*s, id);
+            if (!k) continue;
+            const int64_t samples = int64_t(std::llround(double(k->duration) / s->fpsValue() * tone.sampleRate));
+            const QString path = newRoomTonePath(s->name);
+            std::string err;
+            if (!writeStereoWav(path.toStdString(), synthesizeRoomTone(tone, samples, uint32_t(k->start + 1)), tone.sampleRate, &err)) {
+                state_->message(QString::fromStdString(err), 6000);
+                break;
+            }
+            paths << path;
+            forClip.push_back(id);
+        }
+        const std::vector<Id> media = paths.isEmpty() ? std::vector<Id>{} : state_->importFiles(paths, nullptr, QStringLiteral("Room Tone"));
+        for (size_t i = 0; i < media.size() && i < forClip.size(); ++i) toneMedia[forClip[i]] = media[i];
+    }
+    s = nullptr;  // (importing changed the project)
+    // One step: each clip matched, and its room tone on the first audio track below it that is free there (a new one if
+    // none is), at the reference's volume.
+    state_->edit(tr("Match Dialogue"), [&](Project& p, Sequence& sq) {
+        for (const auto& [id, plan] : plans)
+            if (Clip* k = edit::clipById(sq, id)) applyDialogueMatch(p, sq, *k, plan, o);
+        for (const auto& [id, media] : toneMedia) {
+            auto loc = edit::locate(sq, id);
+            const Clip* k = edit::clipById(sq, id);
+            if (!loc || !k) continue;
+            const FrameTime from = k->start, to = k->end();
+            std::optional<TrackRef> under;
+            for (int j = loc->track.index + 1; j < int(sq.audioTracks.size()) && !under; ++j) {
+                TrackGap gap;
+                if (gapAt(sq, {TrackKind::Audio, j}, from, gap) && gap.end >= to) under = TrackRef{TrackKind::Audio, j};
+            }
+            if (!under) under = edit::addTrack(p, sq, TrackKind::Audio);
+            if (!edit::placeMedia(p, sq, media, from, 0, to - from, {TrackKind::Video, 0}, *under, false).ok) continue;
+            if (const Track* t = trackAt(sq, *under))
+                for (const Clip& c : t->clips)
+                    if (c.start == from && c.mediaId == media) edit::clipById(sq, c.id)->audio.params["gain_db"] = Param(refGain);
+        }
+        return true;
+    });
+    state_->message(tr("Matched %n clip(s) to %1", "", int(plans.size())).arg(refName), 5000);
+    inspectorDock_->raise();
+    return int(plans.size());
+}
+
+void MainWindow::matchDialogueDialog() {
+    QDialog d(this);
+    d.setWindowTitle(tr("Match Dialogue to Reference"));
+    auto* form = new QVBoxLayout(&d);
+    form->addWidget(new QLabel(tr("Make the selected clips sound like the voice reference (the production take):"), &d));
+    auto box = [&](const QString& text, const char* name, bool on) {
+        auto* b = new QCheckBox(text, &d);
+        b->setObjectName(QLatin1String(name));
+        b->setChecked(on);
+        form->addWidget(b);
+        return b;
+    };
+    QCheckBox* room = box(tr("Room: its reverberation"), "room", true);
+    QCheckBox* tone = box(tr("Tone: its EQ"), "tone", true);
+    QCheckBox* overTime = box(tr("Follow its tone over time"), "toneOverTime", false);
+    QCheckBox* level = box(tr("Level: its loudness"), "level", true);
+    QCheckBox* fill = box(tr("Room tone under each clip"), "roomTone", false);
+    connect(tone, &QCheckBox::toggled, overTime, &QWidget::setEnabled);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &d);
+    connect(buttons, &QDialogButtonBox::accepted, &d, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &d, &QDialog::reject);
+    form->addWidget(buttons);
+    if (d.exec() != QDialog::Accepted) return;
+    DialogueMatchOptions o;
+    o.room = room->isChecked(), o.tone = tone->isChecked(), o.toneOverTime = o.tone && overTime->isChecked(), o.level = level->isChecked();
+    matchDialogue(o, fill->isChecked());
 }
 
 int MainWindow::addBeatMarkers(bool everyBeat) {
@@ -5399,6 +5530,19 @@ void MainWindow::exportVersionsDialog() {
     exportVersions(chosen, folder->text(), captions->isChecked(), loud->currentData().toDouble(), format->currentText());
 }
 
+QString MainWindow::newRoomTonePath(const std::string& sequenceName) const {
+    const QString project = state_->filePath();
+    const QString folder = (project.isEmpty() ? QStandardPaths::writableLocation(QStandardPaths::MusicLocation) + QStringLiteral("/Montage")
+                                              : QFileInfo(project).absolutePath()) +
+                           QStringLiteral("/Room Tone");
+    QDir().mkpath(folder);
+    QString path;
+    int n = 1;
+    do path = folder + '/' + QString::fromStdString(sequenceName) + QStringLiteral(" Room Tone %1.wav").arg(n++);
+    while (QFileInfo::exists(path));
+    return path;
+}
+
 Id MainWindow::fillRoomTone(TrackRef track, FrameTime at, FrameTime to, Id source) {
     const Sequence* s = state_->sequence();
     const Track* t = s ? trackAt(*s, track) : nullptr;
@@ -5432,15 +5576,7 @@ Id MainWindow::fillRoomTone(TrackRef track, FrameTime at, FrameTime to, Id sourc
         return 0;
     const int64_t samples = int64_t(std::llround(double(end - from) / seq.fpsValue() * prof.sampleRate));
     const std::vector<float> tone = synthesizeRoomTone(prof, samples, uint32_t(from + 1));
-    const QString project = state_->filePath();
-    const QString folder = (project.isEmpty() ? QStandardPaths::writableLocation(QStandardPaths::MusicLocation) + QStringLiteral("/Montage")
-                                              : QFileInfo(project).absolutePath()) +
-                           QStringLiteral("/Room Tone");
-    QDir().mkpath(folder);
-    QString path;
-    int n = 1;
-    do path = folder + '/' + QString::fromStdString(seq.name) + QStringLiteral(" Room Tone %1.wav").arg(n++);
-    while (QFileInfo::exists(path));
+    const QString path = newRoomTonePath(seq.name);
     std::string err;
     if (!writeStereoWav(path.toStdString(), tone, prof.sampleRate, &err)) {
         state_->message(QString::fromStdString(err), 6000);
