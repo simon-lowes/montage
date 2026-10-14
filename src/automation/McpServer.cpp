@@ -120,6 +120,7 @@
 #include "media/TextToSpeech.h"
 #include "media/VoiceClone.h"
 #include "media/SoundSearch.h"
+#include "media/LtcTimecode.h"
 #include "media/StemSeparation.h"
 #include "media/Transcriber.h"
 #include "media/VisualSearch.h"
@@ -7899,6 +7900,101 @@ void McpServer::Impl::addTools() {
             if (!e && c->generator.id == Id(a.value("effect").toDouble())) e = &c->generator;
             const int keys = e ? int(e->params.at(param).keys.size()) : 0;
             return ok(QStringLiteral("%1 follows the sound with %2 keys").arg(QString::fromStdString(param)).arg(keys), QJsonObject{{"keys", keys}});
+        });
+
+    add("montage_ltc", "Timecode from LTC",
+        "Linear timecode (SMPTE or EBU LTC) recorded on a sound channel, as timecode generators feed cameras and recorders. "
+        "read: finds the channel carrying it in each of `media` (the first `seconds` of every channel) and gives its "
+        "rate, the timecode at the file's start and the first word read; with apply (the default) that becomes the "
+        "media's timecode (the file's own kept), so merging clips, syncing dailies and multicam sync by timecode use it, "
+        "and the LTC channel stops being played by its clips (one playing only it is disabled; new clips leave it out). "
+        "file: back to the files' own timecode. generate: LTC of the active sequence's timecode (In to Out, else all of "
+        "it) written as a WAV in a Timecode folder beside the project and placed on a new, muted audio track named LTC.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "action":{"type":"string","enum":["read","file","generate"],"default":"read"},
+            "media":{"type":"array","items":{"type":"number"}},"apply":{"type":"boolean","default":true},
+            "seconds":{"type":"number","default":30,"maximum":120}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const QString action = str(a, "action", "read");
+            if (action != "read" && action != "file" && action != "generate") throw ArgError{"action is read, file or generate"};
+            if (action == "generate") {
+                Sequence& s = l.seq();
+                const FrameTime from = s.inPoint >= 0 && s.outPoint >= s.inPoint ? s.inPoint : 0;
+                const FrameTime to = s.inPoint >= 0 && s.outPoint >= s.inPoint ? s.outPoint + 1 : s.duration();
+                Rational rate;
+                int per = 1;
+                if (!ltcRateFor(s.fps, rate, per)) return fail("LTC runs at 23.976, 24, 25, 29.97 or 30 frames a second (or twice that)");
+                const FrameTime at = from / per * per;
+                const QString folder = QFileInfo(absolute(need(a, "project"))).absolutePath() + QStringLiteral("/Timecode");
+                QDir().mkpath(folder);
+                QString base = QString::fromStdString(s.name);
+                for (const QChar bad : QStringLiteral("/\\:*?\"<>|")) base.replace(bad, '_');
+                QString path = folder + '/' + base + QStringLiteral(" LTC.wav");
+                for (int k = 2; QFileInfo::exists(path); ++k) path = folder + '/' + base + QStringLiteral(" LTC %1.wav").arg(k);
+                std::string err;
+                if (to <= at || !writeSequenceLtc(path.toStdString(), s.fps, at, to, 48000, &err))
+                    return fail(err.empty() ? QStringLiteral("The sequence is empty") : QString::fromStdString(err));
+                const Id media = mediaFor(l.project, path);
+                if (MediaItem* m = l.project.findMedia(media)) {
+                    m->timecode = double(at) / s.fpsValue();
+                    m->metadata["comment"] = "LTC of " + s.name;
+                }
+                const Id clip = placeLtcTrack(l.project, s, media, at);
+                if (!clip) return fail("The LTC could not be placed");
+                save(l);
+                return ok(QStringLiteral("LTC of %1 from %2 on a new muted track, LTC").arg(base, QString::fromStdString(formatTimecode(at, s.fps))),
+                          QJsonObject{{"file", path}, {"media", double(media)}, {"clip", double(clip)},
+                                      {"fps", QStringLiteral("%1/%2").arg(rate.num).arg(rate.den)}});
+            }
+            std::vector<Id> ids;
+            for (const QJsonValue& v : a.value("media").toArray()) {
+                const MediaItem* m = l.project.findMedia(Id(v.toDouble()));
+                if (!m) throw ArgError{QStringLiteral("No media %1").arg(qulonglong(v.toDouble()))};
+                ids.push_back(m->id);
+            }
+            if (ids.empty()) throw ArgError{"\"media\" lists the media"};
+            if (action == "file") {
+                int n = 0;
+                for (Id id : ids) n += useFileTimecode(l.project, id);
+                if (!n) return fail("None of them takes its timecode from LTC");
+                save(l);
+                return ok(QStringLiteral("%1 media item(s) back to their own timecode").arg(n), QJsonObject{{"changed", n}});
+            }
+            const bool apply = a.value("apply").toBool(true);
+            const double seconds = std::clamp(a.value("seconds").toDouble(30), 1.0, 120.0);
+            QJsonArray out;
+            int found = 0;
+            for (Id id : ids) {
+                const MediaItem* m = l.project.findMedia(id);
+                LtcReading r;
+                std::string err;
+                QJsonObject o{{"media", double(id)}, {"name", QString::fromStdString(m->name)}};
+                if (m->path.empty() || !readLtc(m->path, r, &err, seconds, nullptr, m->hasVideo ? m->fps : Rational{0, 1})) {
+                    o["error"] = QString::fromStdString(err.empty() ? "Not a file" : err);
+                    out.append(o);
+                    continue;
+                }
+                const double fileTc = usesLtcTimecode(*m) ? m->fileTimecode : m->timecode;
+                o["channel"] = r.channel + 1;
+                o["fps"] = QStringLiteral("%1/%2").arg(r.fps.num).arg(r.fps.den);
+                o["drop_frame"] = r.dropFrame;
+                o["start"] = QString::fromStdString(r.startLabel());
+                o["start_seconds"] = r.start;
+                o["first_word"] = QString::fromStdString(r.label);
+                o["first_word_at"] = r.at;
+                o["words"] = r.words;
+                o["speed"] = r.speed;
+                o["user_bits"] = QStringLiteral("%1").arg(r.userBits, 8, 16, QChar('0'));
+                if (fileTc >= 0) o["file_timecode_seconds"] = fileTc;
+                if (apply) useLtcTimecode(l.project, id, r);
+                ++found;
+                out.append(o);
+            }
+            if (apply && found) save(l);
+            return found ? ok(QStringLiteral("LTC in %1 of %2 media item(s)%3").arg(found).arg(ids.size()).arg(apply ? ", now their timecode" : ""),
+                              QJsonObject{{"media", out}})
+                         : ToolResult{QStringLiteral("No LTC found"), QJsonObject{{"media", out}}, {}, true};
         });
 
     add("montage_audio_channels", "Audio channels",

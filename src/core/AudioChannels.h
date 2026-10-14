@@ -18,6 +18,13 @@ std::vector<std::string> sourceChannelNames(const MediaItem& m);
 // A short label for channels a clip plays: "Boom", "Ch 1+2", "" for the default mix.
 std::string channelsLabel(const MediaItem& m, const std::vector<int>& channels);
 
+// The channels the default mix (a clip's empty Clip::channels) plays: those of the first audio stream.
+std::vector<int> mixedChannels(const MediaItem& m);
+// What a new clip of the media plays: the default mix (empty), unless that holds the channel carrying LTC
+// (MediaItem::ltcChannel), then its others (or, when it is only that, the second stream's). Empty when nothing else is
+// left to play.
+std::vector<int> newClipChannels(const MediaItem& m);
+
 // MediaItem::audioChannelMode values: how new clips of the media take its channels.
 inline constexpr const char* kChannelsMix = "";        // the main stream mixed to stereo (the default)
 inline constexpr const char* kChannelsMono = "mono";   // a mono clip per channel, on tracks below each other

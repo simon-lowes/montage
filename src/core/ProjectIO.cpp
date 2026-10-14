@@ -941,6 +941,9 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         if (m.ambisonic > 0) o["ambisonic"] = m.ambisonic;
         if (!m.stereo.empty()) o["stereo"] = qs(m.stereo);
         if (m.timecode >= 0) o["timecode"] = m.timecode;
+        if (m.ltcChannel >= 0) o["ltcChannel"] = m.ltcChannel;
+        if (m.ltcTimecode >= 0) o["ltcTimecode"] = m.ltcTimecode;
+        if (m.fileTimecode >= 0) o["fileTimecode"] = m.fileTimecode;
         if (!m.audioChannelMode.empty()) o["audioChannelMode"] = qs(m.audioChannelMode);
         if (m.audioStreams.size() > 1) {
             QJsonArray st;
@@ -1105,6 +1108,9 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         m.ambisonic = std::clamp(o.value("ambisonic").toInt(0), 0, 7);
         m.stereo = ss(o.value("stereo"));
         m.timecode = o.value("timecode").toDouble(-1);
+        m.ltcChannel = o.value("ltcChannel").toInt(-1);
+        m.ltcTimecode = o.value("ltcTimecode").toDouble(-1);
+        m.fileTimecode = o.value("fileTimecode").toDouble(-1);
         for (const auto& v : o.value("audioStreams").toArray()) m.audioStreams.push_back(std::max(1, v.toInt(1)));
         m.audioChannelMode = ss(o.value("audioChannelMode"));
         m.rating = std::clamp(o.value("rating").toInt(0), -1, 5);

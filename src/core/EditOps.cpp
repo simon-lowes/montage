@@ -333,6 +333,7 @@ Result placeMedia(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcI
         Clip a = base;
         a.id = p.newId();
         a.linkGroup = group;
+        a.channels = newClipChannels(*m);
         Result r = overwrite(p, s, audioTrack, a);
         res.created.insert(res.created.end(), r.created.begin(), r.created.end());
         // Media set to take its channels apart: a clip per channel or pair, on the tracks below.
@@ -1761,6 +1762,7 @@ Result replaceClip(Project& p, Sequence& s, Id clipId, Id mediaId, double srcAli
         const bool video = l->track.kind == TrackKind::Video;
         if (video ? !(m->hasVideo || m->kind == MediaKind::Image) : !m->hasAudio) continue;
         Clip fresh = makeClip(p, *m, l->track.kind, s);
+        if (c.mediaId != mediaId) c.channels = fresh.channels;  // another file's channels
         c.mediaId = mediaId;
         c.name = fresh.name;
         c.sourceIn = std::max(0.0, sourceIn);

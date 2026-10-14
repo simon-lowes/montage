@@ -95,6 +95,7 @@
 #include "render/VfxPull.h"
 #include "render/Amf.h"
 #include "render/LutExport.h"
+#include "media/LtcTimecode.h"
 #include "media/TextReader.h"
 #include "media/Decoder.h"
 #include "media/HwAccel.h"
@@ -1650,6 +1651,7 @@ void MainWindow::buildMenus() {
         linedScriptDock_->show();
         linedScriptDock_->raise();
     })->setObjectName(QStringLiteral("showLinedScript"));
+    add(seqM, tr("Add LTC &Track"), QKeySequence(), [this] { addLtcTrack(); })->setObjectName(QStringLiteral("addLtcTrack"));
     add(seqM, tr("Auto &Mix…"), QKeySequence(), [this] { AutoMixDialog::run(state_, this); })->setObjectName(QStringLiteral("autoMix"));
     add(seqM, tr("Record &Voiceover…"), QKeySequence("Ctrl+Alt+R"), [this] {
         if (!state_->sequence()) return;
@@ -5541,6 +5543,54 @@ QString MainWindow::newRoomTonePath(const std::string& sequenceName) const {
     do path = folder + '/' + QString::fromStdString(sequenceName) + QStringLiteral(" Room Tone %1.wav").arg(n++);
     while (QFileInfo::exists(path));
     return path;
+}
+
+Id MainWindow::addLtcTrack() {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    const bool marked = s->inPoint >= 0 && s->outPoint >= s->inPoint;
+    Rational rate;
+    int per = 1;
+    if (!ltcRateFor(s->fps, rate, per)) {
+        state_->message(tr("LTC runs at 23.976, 24, 25, 29.97 or 30 frames a second (or twice that)"), 6000);
+        return 0;
+    }
+    const FrameTime at = (marked ? s->inPoint : 0) / per * per, to = marked ? s->outPoint + 1 : s->duration();
+    if (to <= at) {
+        state_->message(tr("The sequence is empty"));
+        return 0;
+    }
+    const Rational fps = s->fps;
+    const std::string name = s->name;
+    const QString project = state_->filePath();
+    const QString folder = (project.isEmpty() ? QStandardPaths::writableLocation(QStandardPaths::MusicLocation) + QStringLiteral("/Montage")
+                                              : QFileInfo(project).absolutePath()) +
+                           QStringLiteral("/Timecode");
+    QDir().mkpath(folder);
+    QString path;
+    int n = 1;
+    QString base = QString::fromStdString(name);
+    for (const QChar bad : QStringLiteral("/\\:*?\"<>|")) base.replace(bad, '_');
+    do path = folder + '/' + base + QStringLiteral(" LTC %1.wav").arg(n++);
+    while (QFileInfo::exists(path));
+    std::string err;
+    if (!writeSequenceLtc(path.toStdString(), fps, at, to, 48000, &err)) {
+        state_->message(QString::fromStdString(err), 6000);
+        return 0;
+    }
+    const std::vector<Id> media = state_->importFiles({path}, nullptr, QStringLiteral("Timecode"));
+    if (media.empty()) return 0;
+    Id made = 0;
+    state_->edit(tr("Add LTC Track"), [&](Project& pr, Sequence& sq) {
+        if (MediaItem* m = pr.findMedia(media[0])) {
+            m->timecode = double(at) / sq.fpsValue();
+            m->metadata["comment"] = "LTC of " + sq.name;
+        }
+        made = placeLtcTrack(pr, sq, media[0], at);
+        return made != 0;
+    });
+    if (made) state_->message(tr("LTC from %1 on a new track, LTC, muted: unmute it to send the timecode out").arg(QString::fromStdString(formatTimecode(at, fps))), 6000);
+    return made;
 }
 
 Id MainWindow::fillRoomTone(TrackRef track, FrameTime at, FrameTime to, Id source) {

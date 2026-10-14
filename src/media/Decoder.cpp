@@ -14,6 +14,7 @@
 #include "core/Interpretation.h"
 
 #include <algorithm>
+#include <numeric>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -1609,7 +1610,55 @@ bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std
     return true;
 }
 
+// The channels in each audio stream, in file order.
+bool audioStreamChannels(const std::string& path, std::vector<int>& streams, std::string* error) {
+    streams.clear();
+    if (MlvInfo mi; isMlvPath(uninterpretedPath(path))) {
+        if (!readMlvInfo(uninterpretedPath(path), mi, error)) return false;
+        if (mi.hasAudio) streams.push_back(mi.channels);
+        return true;
+    }
+    AVFormatContext* fmt = nullptr;
+    if (int rc = openMediaInput(&fmt, path); rc < 0) {
+        if (error) *error = averr(rc);
+        return false;
+    }
+    if (avformat_find_stream_info(fmt, nullptr) >= 0)
+        for (unsigned i = 0; i < fmt->nb_streams; ++i)
+            if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+                streams.push_back(std::max(1, fmt->streams[i]->codecpar->ch_layout.nb_channels));
+    avformat_close_input(&fmt);
+    return true;
+}
+
 }  // namespace
+
+bool decodeSourceChannels(const std::string& path, int sampleRate, double seconds,
+                          const std::function<void(int channel, int count, const float* samples, size_t frames)>& sink,
+                          int* channels, std::string* error, const std::atomic<bool>* cancel) {
+    std::vector<int> streams;
+    if (!audioStreamChannels(path, streams, error)) return false;
+    if (channels) *channels = std::accumulate(streams.begin(), streams.end(), 0);
+    const size_t want = size_t(std::max(0.0, seconds) * sampleRate);
+    int first = 0;
+    for (int s = 0; s < int(streams.size()); first += streams[size_t(s)], ++s) {
+        std::vector<float> samples;
+        int count = 0;
+        size_t given = 0;
+        const std::function<bool(std::vector<float>&, bool)> drain = [&](std::vector<float>& got, bool) {
+            const size_t frames = std::min(want - given, got.size() / size_t(std::max(1, count)));
+            if (frames) sink(first, count, got.data(), frames);
+            given += frames;
+            got.clear();
+            return given < want;
+        };
+        if (!decodeAudioStream(path, sampleRate, s, samples, count, nullptr, cancel, nullptr, &drain) && cancel && cancel->load()) {
+            if (error) *error = "Cancelled";
+            return false;
+        }
+    }
+    return true;
+}
 
 bool decodeAudioBlocks(const std::string& path, int sampleRate, size_t block, const std::function<bool(const std::vector<float>& mono)>& sink,
                        std::string* error, const std::atomic<bool>* cancel) {
@@ -1818,21 +1867,7 @@ AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string*
     }
     // Chosen channels: each audio stream they come from, decoded with its own channels, then routed to stereo.
     std::vector<int> streams;  // channels per audio stream
-    if (MlvInfo mi; isMlvPath(uninterpretedPath(path))) {
-        if (!readMlvInfo(uninterpretedPath(path), mi, error)) return nullptr;
-        if (mi.hasAudio) streams.push_back(mi.channels);
-    } else {
-        AVFormatContext* fmt = nullptr;
-        if (int rc = openMediaInput(&fmt, path); rc < 0) {
-            if (error) *error = averr(rc);
-            return nullptr;
-        }
-        if (avformat_find_stream_info(fmt, nullptr) >= 0)
-            for (unsigned i = 0; i < fmt->nb_streams; ++i)
-                if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
-                    streams.push_back(std::max(1, fmt->streams[i]->codecpar->ch_layout.nb_channels));
-        avformat_close_input(&fmt);
-    }
+    if (!audioStreamChannels(path, streams, error)) return nullptr;
     std::map<int, std::pair<std::vector<float>, int>> decoded;  // stream ordinal -> samples, channels
     auto locate = [&](int ch, int& stream, int& local) {
         for (stream = 0; stream < int(streams.size()); ++stream) {

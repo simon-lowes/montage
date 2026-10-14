@@ -219,6 +219,8 @@ public:
     // it). The new clip (0 if none).
     Id fillRoomTone(TrackRef track, FrameTime at, FrameTime to = 0, Id source = 0);
     QString newRoomTonePath(const std::string& sequenceName) const;  // a new file in the project's Room Tone folder
+    // Sequence > Add LTC Track: the sequence's timecode as LTC (In to Out, else all of it) on a new muted audio track.
+    Id addLtcTrack();
     // Clip › Extend Clip (render/ExtendClip.h): the video clip carried on `frames` past its end (holding its last frame
     // as its motion settles), with room tone under its linked sound, pushing what follows when `ripple`. One undo step;
     // the new clips (the picture first).
