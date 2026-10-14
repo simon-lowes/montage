@@ -1789,6 +1789,19 @@ private slots:
         toHub(tangent::transport(0, -2));
         QTRY_COMPARE(program->speed(), 0.0);
         // However far the ring is said to turn (from a turn already made, so the two add up), it stops at 32 times.
+        // (from the middle of ten hours, so playing at 32 times reaches neither end before the next turn)
+        const FrameTime far = FrameTime(std::llround(state()->sequence()->fpsValue() * 36000));
+        QVERIFY(state()->edit("Far", [shot, far](Project& p, Sequence& s) {
+            auto loc = edit::locate(s, shot);
+            if (!loc) return false;
+            Clip copy = *edit::clipById(s, shot);
+            copy.id = p.newId();
+            copy.start = far;
+            trackAt(s, loc->track)->clips.push_back(copy);
+            return true;
+        }));
+        state()->setPlayhead(far / 2);
+        program->seek(far / 2);
         toHub(tangent::transport(0, 1));
         QTRY_COMPARE(program->speed(), 1.0);
         toHub(tangent::transport(0, std::numeric_limits<int32_t>::max()));
@@ -1797,6 +1810,7 @@ private slots:
         QTRY_COMPARE(program->speed(), -32.0);
         toHub(tangent::transport(0, 6));
         QTRY_COMPARE(program->speed(), 0.0);
+        state()->undo();
         const QString addMarker = "Sequence/Add Marker";
         QVERIFY(keymap::find(win_.get(), addMarker) && tc->actionId(addMarker));
         const size_t markers = state()->sequence()->markers.size();
