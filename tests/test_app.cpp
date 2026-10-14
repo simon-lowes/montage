@@ -52,6 +52,7 @@
 #include "core/ProjectLock.h"
 #include "ProductionPanel.h"
 #include "ReferenceOutputPanel.h"
+#include "RemoteReviewPanel.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -14730,6 +14731,110 @@ print("added " + ui["name"])
         QCOMPARE(program->speed(), 2.0);
         program->shuttle(0);
         QCOMPARE(program->speed(), 0.0);
+    }
+
+    void remoteReviewRoundTrip() {
+        loadDemo();
+        std::string why;
+        if (!output::StreamBackend().available(&why)) QSKIP(why.c_str());
+        QUdpSocket udp;
+        udp.bind(QHostAddress::LocalHost, 0);
+        const int port = udp.localPort();
+        udp.close();
+        QTcpServer tcp;
+        tcp.listen(QHostAddress::Any, 0);
+        const int markersPort = tcp.serverPort();
+        tcp.close();
+        // Started from Playback › Video Output › Remote Review…, a passphrase made for it.
+        auto* action = win_->findChild<QAction*>("remoteReview");
+        QVERIFY(action);
+        action->trigger();
+        auto* dlg = win_->findChild<QDialog*>("remoteReviewDialog");
+        QVERIFY(dlg);
+        dlg->findChild<QLineEdit*>("reviewStreamAddress")->setText(QStringLiteral("srt://127.0.0.1:%1").arg(port));
+        const QString pass = dlg->findChild<QLineEdit*>("reviewStreamPassphrase")->text();
+        QCOMPARE(pass.size(), 20);
+        auto* size = dlg->findChild<QComboBox*>("reviewStreamSize");
+        size->setCurrentIndex(size->findData(540));
+        dlg->findChild<QCheckBox*>("reviewStreamHardware")->setChecked(false);
+        dlg->findChild<QSpinBox*>("reviewStreamMarkersPort")->setValue(markersPort);
+        state()->setPlayhead(10);
+        dlg->findChild<QPushButton*>("reviewStreamStart")->click();
+        auto* controller = win_->findChild<RemoteReviewController*>();
+        QVERIFY(controller);
+        QVERIFY2(controller->running(), qPrintable(controller->status()));
+        QVERIFY(action->isChecked());
+        QVERIFY(controller->scheduler()->mode().height <= 540);
+        QVERIFY(dlg->findChild<QLabel*>("reviewStreamHowTo")->text().contains(pass));
+
+        // A reviewer watches in File › Watch Remote Review…: the frame at the playhead, its timecode.
+        auto* watch = win_->findChild<QAction*>("watchRemoteReview");
+        QVERIFY(watch);
+        watch->trigger();
+        auto* viewer = win_->findChild<ReviewViewerWindow*>("reviewViewer");
+        QVERIFY(viewer);
+        viewer->findChild<QLineEdit*>("reviewAddress")->setText(QStringLiteral("srt://127.0.0.1:%1").arg(port));
+        viewer->findChild<QLineEdit*>("reviewPassphrase")->setText(pass);
+        viewer->findChild<QLineEdit*>("reviewAuthor")->setText(QStringLiteral("Ana"));
+        viewer->findChild<QSpinBox*>("reviewMarkersPort")->setValue(markersPort);
+        viewer->findChild<QPushButton*>("reviewConnect")->click();
+        QTRY_VERIFY_WITH_TIMEOUT(viewer->shownTag().frame == 10, 20000);
+        const Rational fps = state()->sequence()->fps;
+        QCOMPARE(viewer->findChild<QLabel*>("reviewTimecode")->text(), QString::fromStdString(formatTimecode(10, fps)));
+        QVERIFY(!viewer->findChild<ReviewPicture*>("reviewPicture")->image().isNull());
+        QTRY_VERIFY_WITH_TIMEOUT(dlg->findChild<QLabel*>("reviewStreamStatus")->text().contains(tr("Streaming to a viewer")), 5000);
+        // The editor seeks; the reviewer sees it.
+        state()->setPlayhead(40);
+        QTRY_VERIFY_WITH_TIMEOUT(viewer->shownTag().frame == 40, 10000);
+
+        // A note sent from there lands as a marker at that frame, named after the reviewer, in one undo step.
+        const size_t before = state()->sequence()->markers.size();
+        viewer->findChild<QLineEdit*>("reviewNote")->setText(QStringLiteral("Warmer here"));
+        viewer->findChild<QPushButton*>("reviewAddMarker")->click();
+        QTRY_COMPARE_WITH_TIMEOUT(state()->sequence()->markers.size(), before + 1, 10000);
+        auto it = std::find_if(state()->sequence()->markers.begin(), state()->sequence()->markers.end(),
+                               [](const Marker& m) { return m.comment == "Warmer here"; });
+        QVERIFY(it != state()->sequence()->markers.end());
+        QCOMPARE(it->t, FrameTime(40));
+        QVERIFY(QString::fromStdString(it->name).contains("Ana"));
+        QVERIFY(!it->reviewId.empty());
+        QTRY_VERIFY_WITH_TIMEOUT(viewer->findChild<QLabel*>("reviewStatus")->text().contains(tr("Marker sent")), 5000);
+        state()->undo();
+        QCOMPARE(state()->sequence()->markers.size(), before);
+        // A wrong passphrase gets nothing through.
+        QString err;
+        output::RemoteMarker m{40, 0, "", "Eve", "Let me in", "", ""};
+        std::string swhy;
+        QVERIFY(!output::sendRemoteMarkers("127.0.0.1", markersPort, "the wrong passphrase", {m}, &swhy));
+        QTest::qWait(400);
+        QCOMPARE(state()->sequence()->markers.size(), before);
+
+        // An agent sees it running with the viewer connected, and stops it.
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject answer;
+            const QJsonObject msg{{"jsonrpc", "2.0"}, {"id", 3}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_remote_review"}, {"arguments", args}}}};
+            win_->liveLink()->handle(QJsonDocument(msg).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+            return answer;
+        };
+        QJsonObject r = call({{"action", "status"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(r.value("structuredContent").toObject().value("viewer_connected").toBool());
+        viewer->close();
+        r = call({{"action", "stop"}});
+        QVERIFY(!r.value("isError").toBool() && !controller->running());
+        QVERIFY(!action->isChecked());
+        // Started by an agent with no passphrase: one is made and given back.
+        r = call({{"action", "start"}, {"address", QStringLiteral("srt://127.0.0.1:%1").arg(port)}, {"passphrase", ""}, {"hardware", false}, {"markers_port", -1}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("passphrase").toString().size(), 20);
+        QVERIFY(controller->running());
+        r = call({{"action", "start"}, {"address", "rtmp://example.com:1935"}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"action", "stop"}});
+        QVERIFY(!controller->running());
+        dlg->close();
     }
 
     void referenceOutputFollowsProgram() {

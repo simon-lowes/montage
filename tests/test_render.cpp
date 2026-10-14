@@ -47,7 +47,12 @@
 #include "render/Exporter.h"
 #include "render/Gallery.h"
 #include "render/LinedScript.h"
+#include "render/RemoteReview.h"
+#include "core/History.h"
+#include <QTcpServer>
+#include <QUdpSocket>
 #include <QPainter>
+#include <QElapsedTimer>
 #include "core/ScriptCut.h"
 #include "render/TrimPasses.h"
 #include "render/RoomTone.h"
@@ -6132,6 +6137,254 @@ colorspaces:
         QVERIFY(!dl->open(d, standardModes()[0], Signal{}, 2, 48000, &why));
         QVERIFY(!why.empty());
         QCOMPARE(dl->receivers(), -1);
+    }
+
+    void remoteReviewStream() {
+        using namespace montage::output;
+        // Settings: SRT needs a passphrase of 10 to 79 characters, and so do markers; addresses need a port.
+        StreamSettings st;
+        QVERIFY(!checkStreamSettings(st).empty());
+        st.passphrase = "too short";
+        QVERIFY(QString::fromStdString(checkStreamSettings(st)).contains("passphrase"));
+        st.passphrase = generatePassphrase();
+        QCOMPARE(st.passphrase.size(), size_t(20));
+        QVERIFY(st.passphrase != generatePassphrase());
+        QVERIFY2(checkStreamSettings(st).empty(), checkStreamSettings(st).c_str());
+        QCOMPARE(markersPortFor(st), 9001);
+        st.address = "rtmp://example.com:1935";
+        QVERIFY(!checkStreamSettings(st).empty());
+        st.address = "srt://example.com";
+        QVERIFY(!checkStreamSettings(st).empty());
+        std::string scheme, host;
+        int port = 0;
+        QVERIFY(parseStreamAddress("srt://[::1]:9000?streamid=publish:review", scheme, host, port));
+        QVERIFY(scheme == "srt" && host == "::1" && port == 9000);
+        QVERIFY(parseStreamAddress("udp://239.1.1.1:5000", scheme, host, port) && scheme == "udp" && port == 5000);
+        StreamSettings lan;
+        lan.address = "udp://239.1.1.1:5000";
+        lan.markersPort = -1;
+        QVERIFY(checkStreamSettings(lan).empty());  // (a local network: neither encrypted nor taking markers)
+        QCOMPARE(markersPortFor(lan), -1);
+
+        // The tag each picture carries, as written and as x265 writes it (after a UUID of its own).
+        StreamTag tag{1234, "00:00:49:09", {25, 1}};
+        std::vector<uint8_t> sei = streamTagPayload(tag);
+        StreamTag back;
+        QVERIFY(parseStreamTag(sei.data(), sei.size(), back));
+        QVERIFY(back.frame == 1234 && back.timecode == "00:00:49:09" && back.fps == (Rational{25, 1}));
+        std::vector<uint8_t> x265(16, 0x2c);
+        x265.insert(x265.end(), sei.begin(), sei.end());
+        QVERIFY(parseStreamTag(x265.data(), x265.size(), back) && back.frame == 1234);
+        sei[3] ^= 1;
+        QVERIFY(!parseStreamTag(sei.data(), sei.size(), back));
+
+        // Burnt in: white figures on a black box at the bottom, the rest of the picture as it was.
+        Planes420 burn(320, 180);
+        std::fill(burn.y.begin(), burn.y.end(), uint16_t(500));
+        burnTimecode(burn, "01:23:45:12");
+        const Rect box = burnInBox(320, 180, 11);
+        QVERIFY(box.x % 2 == 0 && box.y % 2 == 0 && box.y + box.height <= 180 && box.width < 320);
+        int white = 0, black = 0, elsewhere = 0;
+        for (int y = 0; y < 180; ++y)
+            for (int x = 0; x < 320; ++x) {
+                const uint16_t v = burn.y[size_t(y) * 320 + size_t(x)];
+                const bool in = x >= box.x && x < box.x + box.width && y >= box.y && y < box.y + box.height;
+                if (!in) elsewhere += v != 500;
+                else (v == 940 ? white : black) += v == 940 || v == 64;
+            }
+        QCOMPARE(elsewhere, 0);
+        QVERIFY(white > 100 && black > white);
+
+        StreamBackend probe;
+        std::string why;
+        if (!probe.available(&why)) QSKIP(why.c_str());
+        auto freeUdp = [] {
+            QUdpSocket s;
+            s.bind(QHostAddress::LocalHost, 0);
+            return int(s.localPort());
+        };
+        auto freeTcp = [] {
+            QTcpServer s;
+            s.listen(QHostAddress::Any, 0);
+            return int(s.serverPort());
+        };
+
+        // A grey ramp across the picture, the frame in a bar's brightness.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1}, s.sampleRate = 48000, s.colorSpace = "rec709";
+        auto ramp = [&](FrameTime) {
+            auto img = std::make_shared<Image>(320, 180);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) {
+                    float* px = img->at(x, y);
+                    px[0] = px[1] = px[2] = float(x) / 319.0f;
+                    px[3] = 1;
+                }
+            return std::shared_ptr<const Image>(img);
+        };
+        // Plays from frame 100 in real time, as playback does, until `done`.
+        FrameTime playhead = 100;
+        auto play = [&](Scheduler& sched, const std::function<bool()>& done, int seconds) {
+            QElapsedTimer clock;
+            clock.start();
+            FrameTime submitted = 99;
+            while (!done() && clock.elapsed() < seconds * 1000) {
+                const FrameTime t = 100 + clock.elapsed() * 25 / 1000;
+                sched.setPosition(t, 1);
+                playhead = t;
+                while (submitted < t + 3) sched.submit(++submitted, ramp(submitted));
+                QThread::msleep(5);
+            }
+            return done();
+        };
+
+        auto stream = std::make_shared<StreamBackend>();
+        StreamSettings srt;
+        srt.address = "srt://127.0.0.1:" + std::to_string(freeUdp());
+        srt.passphrase = generatePassphrase();
+        srt.hardware = false;
+        srt.bitrateKbps = 6000;
+        srt.markersPort = freeTcp();
+        stream->setSettings(srt);
+        Device dev = stream->devices()[0];
+        const Mode mode{"stream", 320, 180, {25, 1}, false, 0};
+        Config cfg;
+        cfg.depth = 10;
+        cfg.audioChannels = 2;
+        Scheduler sched(stream);
+        QVERIFY2(sched.start(dev, mode, s, cfg, &why), why.c_str());
+        QCOMPARE(sched.signal().format, PixelFormat::P216);
+        sched.setAudioSource([](int64_t start, int frames, int channels, float* out) {
+            for (int i = 0; i < frames; ++i)
+                for (int c = 0; c < channels; ++c) out[size_t(i) * size_t(channels) + size_t(c)] = 0.25f * float(std::sin(2 * M_PI * 1000 * double(start + i) / 48000));
+        });
+        QCOMPARE(stream->stats().encoder, std::string("libx265"));
+        QCOMPARE(stream->receivers(), 0);
+
+        // A viewer with the wrong passphrase is refused.
+        {
+            ReviewReceiver wrong;
+            QVERIFY(wrong.start(srt.address, "not the passphrase", 120, false, &why));
+            play(sched, [&] { return !wrong.status().error.empty(); }, 10);
+            QVERIFY(!wrong.status().error.empty());
+            QCOMPARE(wrong.status().pictures, int64_t(0));
+        }
+        // The right one sees 10-bit HEVC, its frames tagged in order with their timecodes burnt in, and hears the tone.
+        ReviewReceiver rx;
+        QVERIFY(rx.start(srt.address, srt.passphrase, 120, false, &why));
+        QVERIFY2(play(sched, [&] { return rx.status().pictures >= 60; }, 30), rx.status().error.c_str());
+        QCOMPARE(stream->receivers(), 1);
+        QVERIFY2(QString::fromStdString(rx.status().video).startsWith("hevc 320x180 10-bit"), rx.status().video.c_str());
+        QVERIFY(rx.status().audio);
+        ReviewReceiver::Picture pic;
+        QVERIFY(rx.latest(pic));
+        QVERIFY(pic.tagged && pic.tag.fps == (Rational{25, 1}) && pic.tag.frame >= 100);
+        QCOMPARE(QString::fromStdString(pic.tag.timecode), QString::fromStdString(formatTimecode(pic.tag.frame, {25, 1}, true)));
+        int off = 0, fine = 0;
+        for (int x = 0; x < 320; ++x) {
+            const int got = pic.y[20 * 320 + size_t(x)], want = int(std::lround(64 + 876 * x / 319.0));
+            off = std::max(off, std::abs(got - want));
+            fine += got % 4 != 0;
+        }
+        QVERIFY2(off <= 6, std::to_string(off).c_str());
+        QVERIFY2(fine > 100, std::to_string(fine).c_str());  // (codes an 8-bit picture could not have)
+        // The figures burnt in are this picture's timecode's, not the next one's.
+        auto boxDiff = [&](const std::string& text) {
+            Planes420 want(320, 180);
+            burnTimecode(want, text);
+            const Rect b = burnInBox(320, 180, text.size());
+            double sum = 0;
+            for (int y = b.y; y < b.y + b.height; ++y)
+                for (int x = b.x; x < b.x + b.width; ++x) sum += std::abs(int(pic.y[size_t(y) * 320 + size_t(x)]) - int(want.y[size_t(y) * 320 + size_t(x)]));
+            return sum / (b.width * b.height);
+        };
+        const double same = boxDiff(pic.tag.timecode), next = boxDiff(formatTimecode(pic.tag.frame + 1, {25, 1}, true));
+        QVERIFY2(same < 25 && next > same * 2, (std::to_string(same) + " " + std::to_string(next)).c_str());
+        const std::vector<StreamTag> tags = rx.tags();
+        QVERIFY(tags.size() >= 50);
+        int forward = 0;
+        for (size_t i = 1; i < tags.size(); ++i) forward += tags[i].frame > tags[i - 1].frame;
+        QVERIFY2(forward >= int(tags.size()) * 8 / 10, std::to_string(forward).c_str());
+        // Latency here: the frame a picture shows against the playhead as it arrives.
+        std::vector<int> lags;
+        int64_t seen = rx.status().pictures;
+        play(sched, [&] {
+            ReviewReceiver::Picture q;
+            if (rx.latest(q, seen) && q.tagged) {
+                seen = q.serial;
+                lags.push_back(int(playhead - q.tag.frame));
+            }
+            return lags.size() >= 25;
+        }, 10);
+        QVERIFY(lags.size() >= 25);
+        std::sort(lags.begin(), lags.end());
+        qInfo("Latency: %d frames", lags[lags.size() / 2]);
+        QVERIFY2(lags[lags.size() / 2] <= 10, std::to_string(lags[lags.size() / 2]).c_str());  // (0.4 s)
+        std::vector<float> heard;
+        play(sched, [&] {
+            const std::vector<float> a = rx.takeAudio();
+            heard.insert(heard.end(), a.begin(), a.end());
+            return heard.size() >= 48000;
+        }, 10);
+        QVERIFY(heard.size() >= 48000);
+        double sum = 0, re = 0, im = 0;
+        const size_t n = 24000;
+        for (size_t i = 0; i < n; ++i) {
+            const double v = heard[heard.size() - 2 * n + 2 * i];
+            sum += v * v;
+            re += v * std::cos(2 * M_PI * 1000 * double(i) / 48000);
+            im += v * std::sin(2 * M_PI * 1000 * double(i) / 48000);
+        }
+        const double rms = std::sqrt(sum / n), tone = 2 * std::hypot(re, im) / n;
+        QVERIFY2(std::fabs(rms - 0.25 / std::sqrt(2.0)) < 0.03 && std::fabs(tone - 0.25) < 0.04, (std::to_string(rms) + " " + std::to_string(tone)).c_str());
+
+        // Markers come back over the side channel with the passphrase, at the frame the viewer was shown.
+        RemoteMarker note;
+        note.frame = pic.tag.frame;
+        note.timecode = pic.tag.timecode;
+        note.author = "Ana";
+        note.text = "Lift the shadows here";
+        QVERIFY(!sendRemoteMarkers("127.0.0.1", srt.markersPort, "not the passphrase", {note}, &why));
+        QVERIFY2(QString::fromStdString(why).contains("passphrase"), why.c_str());
+        QVERIFY(stream->takeMarkers().empty());
+        QVERIFY2(sendRemoteMarkers("127.0.0.1", srt.markersPort, srt.passphrase, {note, RemoteMarker{note.frame + 25, 10, "", "Bob", "Too long"}}, &why), why.c_str());
+        const std::vector<RemoteMarker> got = stream->takeMarkers();
+        QCOMPARE(got.size(), size_t(2));
+        QVERIFY(got[0].frame == note.frame && got[0].author == "Ana" && got[0].text == note.text && got[0].timecode == note.timecode);
+        QVERIFY(got[1].frame == note.frame + 25 && got[1].duration == 10);
+        QCOMPARE(stream->stats().markers, 2);
+
+        // The viewer leaves; another can call in.
+        rx.stop();
+        QVERIFY(play(sched, [&] { return stream->receivers() == 0; }, 15));
+        ReviewReceiver again;
+        QVERIFY(again.start(srt.address, srt.passphrase, 120, false, &why));
+        QVERIFY2(play(sched, [&] { return again.status().pictures >= 10; }, 30), again.status().error.c_str());
+        again.stop();
+        sched.stop();
+
+        // H.264 (8-bit) over UDP to a viewer on this computer, still tagged; HDR refused on it.
+        auto udp = std::make_shared<StreamBackend>();
+        StreamSettings plain;
+        plain.address = "udp://127.0.0.1:" + std::to_string(freeUdp());
+        plain.codec = "h264";
+        plain.hardware = false;
+        plain.markersPort = -1;
+        udp->setSettings(plain);
+        ReviewReceiver lanViewer;
+        QVERIFY(lanViewer.start(plain.address, "", 120, false, &why));
+        QThread::msleep(300);
+        Scheduler sched8(udp);
+        QVERIFY2(sched8.start(dev, mode, s, cfg, &why), why.c_str());
+        QVERIFY2(play(sched8, [&] { return lanViewer.status().pictures >= 20; }, 30), lanViewer.status().error.c_str());
+        QVERIFY2(QString::fromStdString(lanViewer.status().video).startsWith("h264 320x180 8-bit"), lanViewer.status().video.c_str());
+        QVERIFY(lanViewer.latest(pic) && pic.tagged);
+        sched8.stop();
+        lanViewer.stop();
+        Signal pq;
+        pq.eotf = Eotf::Pq;
+        QVERIFY(!udp->open(dev, mode, pq, 2, 48000, &why) && QString::fromStdString(why).contains("HDR"));
     }
 
     void ndiOutput() {
