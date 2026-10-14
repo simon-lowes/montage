@@ -1,6 +1,7 @@
 // Montage — linear timecode (LTC, SMPTE ST 12-1; EBU's is the same at 25 fps): each video frame's timecode sent as an
-// 80-bit word in biphase mark code on a sound channel, as lockit boxes, field recorders and cameras record it. Reading
-// it at any sample rate (its speed found from the signal and followed as it drifts, either polarity) and writing it.
+// 80-bit word in biphase mark code on a sound channel, as timecode generators feed it to cameras and field recorders.
+// Reading it at any sample rate (its speed found from the signal and followed as it drifts, either polarity) and
+// writing it.
 #pragma once
 
 #include <array>
@@ -44,8 +45,14 @@ std::string ltcLabel(const LtcFrame& f);
 std::vector<float> encodeLtc(int64_t start, int64_t count, Rational fps, bool dropFrame, int sampleRate, float level = 0.5f,
                              uint32_t userBits = 0);
 
-// Reads LTC from a stream of samples (one channel). Bit periods from 0.33 to 0.66 ms are taken (23.976 to 30 fps and
-// some way either side); the bit length is followed as the speed drifts.
+// The same in pieces, for long runs: words [from, to) of the run that starts with frame `start` at sample 0, as its
+// samples from ceil(from * samples a word) up to ceil(to * samples a word). `state` carries the signal from one piece
+// to the next (-1 before the first).
+std::vector<float> encodeLtcPiece(int64_t start, int64_t from, int64_t to, Rational fps, bool dropFrame, int sampleRate,
+                                  float level, uint32_t userBits, double& state);
+
+// Reads LTC from a stream of samples (one channel). It locks on to bits of 0.33 to 0.66 ms (23.976 to 30 fps and some
+// way either side), then follows the bit length as the speed drifts (to 0.26 to 0.79 ms).
 class LtcDecoder {
 public:
     explicit LtcDecoder(int sampleRate);

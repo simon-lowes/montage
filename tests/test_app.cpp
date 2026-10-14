@@ -4072,7 +4072,7 @@ private slots:
     }
 
     void timecodeFromLtcInTheBin() {
-        // A recorder's file with a lockit's LTC (from 10:00:00:00, 25 fps) on its second channel, and one without.
+        // A recorder's file with a timecode generator's LTC (from 10:00:00:00, 25 fps) on its second channel, and one without.
         const int sr = 48000;
         const std::vector<float> ltc = encodeLtc(ltcFrameNumber({10, 0, 0, 0}, 25), 100, {25, 1}, false, sr);
         std::vector<float> withLtc(ltc.size() * 2), without(ltc.size() * 2);
@@ -4100,7 +4100,8 @@ private slots:
         state()->undo();
         QVERIFY(!usesLtcTimecode(*state()->project().findMedia(ids[0])));
         QVERIFY(state()->sequence()->audioTracks[0].clips[0].channels.empty());
-        // Sequence > Add LTC Track: the sequence's timecode on a new muted track.
+        // Sequence > Add LTC Track: the sequence's timecode on a new muted track, in a Timecode folder beside the project.
+        QVERIFY(state()->save(dir_.path() + "/ltc.montage"));
         const size_t tracks = state()->sequence()->audioTracks.size();
         auto* add = win_->findChild<QAction*>("addLtcTrack");
         QVERIFY(add);
@@ -4109,7 +4110,9 @@ private slots:
         QCOMPARE(s->audioTracks.size(), tracks + 1);
         QVERIFY(s->audioTracks.back().name == "LTC" && s->audioTracks.back().muted && s->audioTracks.back().clips.size() == 1);
         LtcReading r;
-        QVERIFY2(readLtc(state()->project().findMedia(s->audioTracks.back().clips[0].mediaId)->path, r, &err), err.c_str());
+        const std::string written = state()->project().findMedia(s->audioTracks.back().clips[0].mediaId)->path;
+        QVERIFY2(QString::fromStdString(written).startsWith(dir_.path() + "/Timecode/"), written.c_str());
+        QVERIFY2(readLtc(written, r, &err), err.c_str());
         QVERIFY(std::fabs(r.start) < 1e-5);
         state()->newProject();
     }

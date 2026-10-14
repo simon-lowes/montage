@@ -147,10 +147,14 @@ using AudioBufferPtr = std::shared_ptr<const AudioBuffer>;
 // Opens media for reading with FFmpeg: a file, or a numbered image sequence's path (media/ImageSequence.h).
 int openMediaInput(struct AVFormatContext** fmt, const std::string& path);
 
-// Each channel of every audio stream on its own (in file order, numbered as Clip::channels numbers them) at
-// `sampleRate`, the first `seconds` of each (sample 0 is media time 0). Empty without sound.
-bool decodeSourceChannels(const std::string& path, int sampleRate, double seconds, std::vector<std::vector<float>>& out,
-                          std::string* error = nullptr, const std::atomic<bool>* cancel = nullptr);
+// Every audio stream with its own channels at `sampleRate`, the first `seconds` of each (sample 0 is media time 0),
+// handed to `sink` as it is decoded: `channel` is the stream's first channel (numbered across the streams as
+// Clip::channels numbers them), `count` its channels, `samples` `frames` interleaved frames. A stream that cannot be
+// decoded is passed over, its channels keeping their numbers. `channels` (if given) gets how many there are in all.
+// False with `error` if the file cannot be read, or when cancelled.
+bool decodeSourceChannels(const std::string& path, int sampleRate, double seconds,
+                          const std::function<void(int channel, int count, const float* samples, size_t frames)>& sink,
+                          int* channels = nullptr, std::string* error = nullptr, const std::atomic<bool>* cancel = nullptr);
 
 // Decodes the whole first audio stream to stereo float at `sampleRate`,
 // aligned so that sample 0 is media time 0 (same origin as VideoDecoder).

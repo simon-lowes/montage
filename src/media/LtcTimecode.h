@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "audio/Ltc.h"
 #include "core/Model.h"
 
 namespace montage {
@@ -25,12 +26,17 @@ struct LtcReading {
     std::string startLabel() const;  // `start` as a label at `fps`
 };
 
-// LTC in one channel's samples: the longest run of words that follow on from each other. False with fewer than 8.
-bool findLtc(const std::vector<float>& samples, int sampleRate, LtcReading& out);
+// The timecode words read from one channel (LtcDecoder) make a reading: the longest run of words that follow on from
+// each other. Its whole frames a second come from how long a word lasts; whether it is pulled down (23.976, 29.97)
+// from the rate the words came at, over 1.5 s or more, else from `hint` (the picture's rate, say: 23.976 or 47.952
+// for 23.976, 29.97 or 59.94 for 29.97) or drop frame. False with fewer than 8 in a run.
+bool ltcFromWords(const std::vector<LtcFrame>& words, int sampleRate, LtcReading& out, Rational hint = {0, 1});
+// The same from one channel's samples.
+bool findLtc(const std::vector<float>& samples, int sampleRate, LtcReading& out, Rational hint = {0, 1});
 // Reads the first `seconds` of every channel of the file; the one with the longest run of LTC. False with `error`
 // when none carries it.
 bool readLtc(const std::string& path, LtcReading& out, std::string* error = nullptr, double seconds = 30,
-             const std::atomic<bool>* cancel = nullptr);
+             const std::atomic<bool>* cancel = nullptr, Rational hint = {0, 1});
 
 // Whether the media's timecode is the one its LTC gives.
 bool usesLtcTimecode(const MediaItem& m);
@@ -39,8 +45,10 @@ bool usesLtcTimecode(const MediaItem& m);
 // channel is set apart: clips of it on audio tracks of every sequence stop playing it (one playing only it is
 // disabled), and new clips leave it out.
 void useLtcTimecode(Project& p, Id media, const LtcReading& r);
-// Back to the file's own timecode (the LTC channel stays left out). False when it does not use its LTC's.
+// Back to the file's own timecode and its rate (the LTC channel stays left out). False when it does not use its LTC's.
 bool useFileTimecode(Project& p, Id media);
+// Forgets the media's LTC (another recording in its place): its own timecode's rate back, the LTC fields cleared.
+void forgetLtc(MediaItem& m);
 
 // LTC from frame number `startFrame` (at the rate's whole frames a second: 24, 25 or 30) for `frames` frames as a
 // mono 16-bit WAV at `sampleRate`, at -12 dBFS; its first word starts at its first sample.

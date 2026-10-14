@@ -93,7 +93,8 @@ Result interpretFootage(Project& p, Id media, Interpretation i) {
     if (!still) {
         m->fps = probe.fps;
         m->duration = probe.duration;
-        if (m->timecode >= 0) m->timecode *= ratio;
+        for (double* tc : {&m->timecode, &m->ltcTimecode, &m->fileTimecode})
+            if (*tc >= 0) *tc *= ratio;
     }
     if (ratio != 1.0) {
         for (Sequence& s : p.sequences)

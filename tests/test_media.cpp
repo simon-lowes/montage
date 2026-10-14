@@ -21145,7 +21145,47 @@ if ui["pressed"] == "add":
             }
         }
 
-        // Files: a camera whose own timecode is 01:00:00:00 recording a lockit's LTC (from 14:03:22:00, 25 fps) on its
+        // Writing a sequence's LTC: 29.97 drop frame from frame 100, and at 50 fps a word every two frames.
+        for (const Rational fps : {Rational{30000, 1001}, Rational{50, 1}}) {
+            const std::string out = path("ltc-seq.wav");
+            std::string err;
+            QVERIFY2(writeSequenceLtc(out, fps, 100, 400, 48000, &err), err.c_str());
+            QVERIFY2(readLtc(out, r, &err), err.c_str());
+            QCOMPARE(r.dropFrame, fps.num == 30000);
+            QVERIFY2(std::fabs(r.start - 100 / fps.toDouble()) < 1e-5, qPrintable(QString::number(r.start, 'f', 6)));
+        }
+        Rational ltcRate;
+        int per = 0;
+        QVERIFY(!ltcRateFor({15, 1}, ltcRate, per));
+
+        // A word read wrong (a frame 27 at 25 fps) does not change the rate; a second of 23.976 takes the picture's rate
+        // as its hint.
+        {
+            LtcDecoder d(48000);
+            const std::vector<float> x = encodeLtc(1000, 60, {25, 1}, false, 48000);
+            d.write(x.data(), x.size());
+            std::vector<LtcFrame> words = d.take();
+            QVERIFY(words.size() > 50);
+            words[20].frames = 27;
+            QVERIFY(ltcFromWords(words, 48000, r));
+            QVERIFY(r.fps == Rational(25, 1) && std::fabs(r.start - 40) < 5e-6);
+            const std::vector<float> y = encodeLtc(36000, 24, {24000, 1001}, false, 48000);
+            QVERIFY(findLtc(y, 48000, r) && r.fps == Rational(24, 1));
+            QVERIFY(findLtc(y, 48000, r, {24000, 1001}) && r.fps == Rational(24000, 1001));
+            QVERIFY(std::fabs(r.start - 36000 * 1001 / 24000.0) < 5e-6);
+            QVERIFY(findLtc(y, 48000, r, {48000, 1001}) && r.fps == Rational(24000, 1001));
+        }
+        // A long run written a minute at a time is the same as all at once.
+        {
+            double state = -1;
+            std::vector<float> pieces;
+            for (int64_t from = 0; from < 70; from += 30) {
+                const std::vector<float> p = encodeLtcPiece(5000, from, std::min<int64_t>(70, from + 30), {30000, 1001}, true, 48000, 0.5f, 0, state);
+                pieces.insert(pieces.end(), p.begin(), p.end());
+            }
+            QVERIFY(pieces == encodeLtc(5000, 70, {30000, 1001}, true, 48000));
+        }
+        // Files: a camera whose own timecode is 01:00:00:00 recording a timecode generator's LTC (from 14:03:22:00, 25 fps) on its
         // right channel, compressed to AAC; a field recorder with the same LTC on its first channel from two seconds
         // earlier.
         const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg");
@@ -21191,7 +21231,7 @@ if ui["pressed"] == "add":
         p.media.push_back(recItem);
         QVERIFY(edit::placeMedia(p, s, camItem.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
         QVERIFY(s.audioTracks[0].clips[0].channels.empty());
-        // Taking the LTC: the camera's timecode is the lockit's (its own kept), shown at its frames; the sound file's at
+        // Taking the LTC: the camera's timecode is the generator's (its own kept), shown at its frames; the sound file's at
         // the LTC's rate.
         useLtcTimecode(p, camItem.id, camLtc);
         useLtcTimecode(p, recItem.id, recLtc);
@@ -21202,6 +21242,7 @@ if ui["pressed"] == "add":
         QCOMPARE(cm->ltcChannel, 1);
         QCOMPARE(mediaFieldText(*cm, "timecode", nullptr), std::string("14:03:22:00"));
         QCOMPARE(mediaFieldText(*rm, "timecode", nullptr), std::string("14:03:20:00"));
+        QCOMPARE(rm->metadata.at("timecode_rate"), std::string("25/1"));
         // The clip already cut stops playing the LTC; new clips leave it out; what they play has no timecode in it.
         QCOMPARE(s.audioTracks[0].clips[0].channels, std::vector<int>{0});
         QVERIFY(edit::placeMedia(p, s, camItem.id, 300, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
@@ -21229,6 +21270,7 @@ if ui["pressed"] == "add":
         QVERIFY(useFileTimecode(p, camItem.id));
         QCOMPARE(p.findMedia(camItem.id)->timecode, 3600.0);
         QVERIFY(!usesLtcTimecode(*p.findMedia(camItem.id)) && !useFileTimecode(p, camItem.id));
+        QVERIFY(useFileTimecode(p, recItem.id) && !p.findMedia(recItem.id)->metadata.count("timecode_rate"));  // it had none
         // The default mix plays the first audio stream: LTC in another stream is left alone, in it taken out. A camera
         // set to a clip per channel gets none for the LTC.
         {
@@ -21242,6 +21284,8 @@ if ui["pressed"] == "add":
             mxf.audioStreams = {2, 2};
             mxf.ltcChannel = 0;
             QCOMPARE(newClipChannels(mxf), std::vector<int>{1});
+            mxf.audioStreams = {1, 1, 1};  // a mono stream a channel, the LTC on the first: the second's
+            QCOMPARE(newClipChannels(mxf), std::vector<int>{1});
             p.findMedia(camItem.id)->audioChannelMode = kChannelsMono;
             const size_t clips = s.audioTracks[0].clips.size();
             QVERIFY(edit::placeMedia(p, s, camItem.id, 600, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
@@ -21249,18 +21293,6 @@ if ui["pressed"] == "add":
             QVERIFY(s.audioTracks.size() == 1 || s.audioTracks[1].clips.empty());
             QCOMPARE(s.audioTracks[0].clips.back().channels, std::vector<int>{0});
         }
-
-        // Writing a sequence's LTC: 29.97 drop frame from frame 100, and at 50 fps a word every two frames.
-        for (const Rational fps : {Rational{30000, 1001}, Rational{50, 1}}) {
-            const std::string out = path("ltc-seq.wav");
-            QVERIFY2(writeSequenceLtc(out, fps, 100, 400, sr, &err), err.c_str());
-            QVERIFY2(readLtc(out, r, &err), err.c_str());
-            QCOMPARE(r.dropFrame, fps.num == 30000);
-            QVERIFY2(std::fabs(r.start - 100 / fps.toDouble()) < 1e-5, qPrintable(QString::number(r.start, 'f', 6)));
-        }
-        Rational ltcRate;
-        int per = 0;
-        QVERIFY(!ltcRateFor({15, 1}, ltcRate, per));
 
         // Over MCP: read and apply, back to the file's, and the sequence's own LTC on a new muted track.
         const QString project = QString::fromStdString(path("ltc-mcp.montage"));

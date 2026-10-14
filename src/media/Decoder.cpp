@@ -14,6 +14,7 @@
 #include "core/Interpretation.h"
 
 #include <algorithm>
+#include <numeric>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -1632,23 +1633,28 @@ bool audioStreamChannels(const std::string& path, std::vector<int>& streams, std
 
 }  // namespace
 
-bool decodeSourceChannels(const std::string& path, int sampleRate, double seconds, std::vector<std::vector<float>>& out,
-                          std::string* error, const std::atomic<bool>* cancel) {
-    out.clear();
+bool decodeSourceChannels(const std::string& path, int sampleRate, double seconds,
+                          const std::function<void(int channel, int count, const float* samples, size_t frames)>& sink,
+                          int* channels, std::string* error, const std::atomic<bool>* cancel) {
     std::vector<int> streams;
     if (!audioStreamChannels(path, streams, error)) return false;
+    if (channels) *channels = std::accumulate(streams.begin(), streams.end(), 0);
     const size_t want = size_t(std::max(0.0, seconds) * sampleRate);
-    for (int s = 0; s < int(streams.size()); ++s) {
+    int first = 0;
+    for (int s = 0; s < int(streams.size()); first += streams[size_t(s)], ++s) {
         std::vector<float> samples;
         int count = 0;
-        const std::function<bool(std::vector<float>&, bool)> enough = [&](std::vector<float>& got, bool) {
-            return got.size() / size_t(std::max(1, count)) < want;
+        size_t given = 0;
+        const std::function<bool(std::vector<float>&, bool)> drain = [&](std::vector<float>& got, bool) {
+            const size_t frames = std::min(want - given, got.size() / size_t(std::max(1, count)));
+            if (frames) sink(first, count, got.data(), frames);
+            given += frames;
+            got.clear();
+            return given < want;
         };
-        if (!decodeAudioStream(path, sampleRate, s, samples, count, error, cancel, nullptr, &enough)) return false;
-        const size_t n = std::min(want, samples.size() / size_t(std::max(1, count)));
-        for (int c = 0; c < count; ++c) {
-            std::vector<float>& ch = out.emplace_back(n);
-            for (size_t i = 0; i < n; ++i) ch[i] = samples[i * size_t(count) + size_t(c)];
+        if (!decodeAudioStream(path, sampleRate, s, samples, count, nullptr, cancel, nullptr, &drain) && cancel && cancel->load()) {
+            if (error) *error = "Cancelled";
+            return false;
         }
     }
     return true;

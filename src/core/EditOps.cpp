@@ -1762,6 +1762,7 @@ Result replaceClip(Project& p, Sequence& s, Id clipId, Id mediaId, double srcAli
         const bool video = l->track.kind == TrackKind::Video;
         if (video ? !(m->hasVideo || m->kind == MediaKind::Image) : !m->hasAudio) continue;
         Clip fresh = makeClip(p, *m, l->track.kind, s);
+        if (c.mediaId != mediaId) c.channels = fresh.channels;  // another file's channels
         c.mediaId = mediaId;
         c.name = fresh.name;
         c.sourceIn = std::max(0.0, sourceIn);

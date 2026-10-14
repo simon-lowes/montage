@@ -21,7 +21,8 @@ std::string channelsLabel(const MediaItem& m, const std::vector<int>& channels);
 // The channels the default mix (a clip's empty Clip::channels) plays: those of the first audio stream.
 std::vector<int> mixedChannels(const MediaItem& m);
 // What a new clip of the media plays: the default mix (empty), unless that holds the channel carrying LTC
-// (MediaItem::ltcChannel) and others, then the others.
+// (MediaItem::ltcChannel), then its others (or, when it is only that, the second stream's). Empty when nothing else is
+// left to play.
 std::vector<int> newClipChannels(const MediaItem& m);
 
 // MediaItem::audioChannelMode values: how new clips of the media take its channels.

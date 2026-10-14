@@ -5569,7 +5569,9 @@ Id MainWindow::addLtcTrack() {
     QDir().mkpath(folder);
     QString path;
     int n = 1;
-    do path = folder + '/' + QString::fromStdString(name) + QStringLiteral(" LTC %1.wav").arg(n++);
+    QString base = QString::fromStdString(name);
+    for (const QChar bad : QStringLiteral("/\\:*?\"<>|")) base.replace(bad, '_');
+    do path = folder + '/' + base + QStringLiteral(" LTC %1.wav").arg(n++);
     while (QFileInfo::exists(path));
     std::string err;
     if (!writeSequenceLtc(path.toStdString(), fps, at, to, 48000, &err)) {

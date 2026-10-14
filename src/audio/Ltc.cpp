@@ -101,20 +101,22 @@ std::string ltcLabel(const LtcFrame& f) {
     return s;
 }
 
-std::vector<float> encodeLtc(int64_t start, int64_t count, Rational fps, bool dropFrame, int sampleRate, float level, uint32_t userBits) {
+std::vector<float> encodeLtcPiece(int64_t start, int64_t from, int64_t to, Rational fps, bool dropFrame, int sampleRate,
+                                  float level, uint32_t userBits, double& state) {
     std::vector<float> out;
-    if (count <= 0 || sampleRate <= 0 || !fps.valid()) return out;
+    if (to <= from || sampleRate <= 0 || !fps.valid()) return out;
     const int base = baseOf(fps);
     dropFrame = dropFrame && base == 30 && fps.den != 1;
     const double perWord = double(sampleRate) * fps.den / fps.num;
     const double bit = perWord / 80;
-    out.assign(size_t(std::ceil(perWord * double(count))), 0.0f);
+    const int64_t first = int64_t(std::ceil(double(from) * perWord));
+    out.assign(size_t(int64_t(std::ceil(double(to) * perWord)) - first), 0.0f);
     // Each sample is the square wave's average over a window about 25 µs wide (rising 10 to 90 % in 0.8 of it), so
     // the edges are neither too steep nor aliased.
     const double w = std::max(1.0, 31.25e-6 * sampleRate);
-    double level0 = -1;  // the level just before the word starts
+    if (state != 1) state = -1;  // the level just before the word starts
     std::vector<double> edges;
-    for (int64_t k = 0; k < count; ++k) {
+    for (int64_t k = from; k < to; ++k) {
         LtcFrame f = ltcFrameAt(start + k, base, dropFrame);
         f.userBits = userBits;
         const auto bits = ltcBits(f, base);
@@ -125,12 +127,12 @@ std::vector<float> encodeLtc(int64_t start, int64_t count, Rational fps, bool dr
             if (bits[size_t(j)]) edges.push_back(t0 + (j + 0.5) * bit);
         }
         edges.push_back(double(k + 1) * perWord);  // the next word's first edge
-        const int64_t from = int64_t(std::ceil(t0)), to = std::min<int64_t>(int64_t(out.size()), int64_t(std::ceil(double(k + 1) * perWord)));
+        const int64_t lo = int64_t(std::ceil(t0)), hi = int64_t(std::ceil(double(k + 1) * perWord));
         size_t e = 0;
-        for (int64_t i = from; i < to; ++i) {
+        for (int64_t i = lo; i < hi; ++i) {
             const double a = double(i) - w / 2, b = double(i) + w / 2;
             while (e < edges.size() && edges[e] <= a) ++e;
-            double lv = (e % 2 == 0) ? level0 : -level0;  // the level at a
+            double lv = (e % 2 == 0) ? state : -state;  // the level at a
             double sum = 0, at = a;
             for (size_t x = e; x < edges.size() && edges[x] < b; ++x) {
                 sum += lv * (edges[x] - at);
@@ -138,11 +140,16 @@ std::vector<float> encodeLtc(int64_t start, int64_t count, Rational fps, bool dr
                 lv = -lv;
             }
             sum += lv * (b - at);
-            out[size_t(i)] = float(level * sum / w);
+            out[size_t(i - first)] = float(level * sum / w);
         }
-        if ((edges.size() - 1) % 2) level0 = -level0;
+        if ((edges.size() - 1) % 2) state = -state;
     }
     return out;
+}
+
+std::vector<float> encodeLtc(int64_t start, int64_t count, Rational fps, bool dropFrame, int sampleRate, float level, uint32_t userBits) {
+    double state = -1;
+    return encodeLtcPiece(start, 0, count, fps, dropFrame, sampleRate, level, userBits, state);
 }
 
 LtcDecoder::LtcDecoder(int sampleRate) : rate_(std::max(1, sampleRate)) {

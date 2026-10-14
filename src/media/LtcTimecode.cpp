@@ -25,21 +25,18 @@ std::string LtcReading::startLabel() const {
     return ltcLabel(ltcFrameAt(std::llround(start * fps.toDouble()), baseOf(fps), dropFrame));
 }
 
-bool findLtc(const std::vector<float>& samples, int sampleRate, LtcReading& out) {
-    LtcDecoder decoder(sampleRate);
-    decoder.write(samples.data(), samples.size());
-    const std::vector<LtcFrame> words = decoder.take();
-    if (words.size() < 8) return false;
-    // The rate's whole frames a second: from how long a word lasts, raised if a higher frame number is seen.
+bool ltcFromWords(const std::vector<LtcFrame>& words, int sampleRate, LtcReading& out, Rational hint) {
+    if (words.size() < 8 || sampleRate <= 0) return false;
+    // The rate's whole frames a second, from how long a word lasts (24, 25 and 30 are 4 % or more apart; a frame
+    // label is not trusted for it, as one word read wrong would change everything).
     std::vector<double> lengths;
     for (const LtcFrame& w : words) lengths.push_back(w.end - w.start);
     std::nth_element(lengths.begin(), lengths.begin() + std::ptrdiff_t(lengths.size() / 2), lengths.end());
     const double perWord = lengths[lengths.size() / 2];
     const double wordsPerSecond = sampleRate / perWord;
-    int base = wordsPerSecond < 24.5 ? 24 : wordsPerSecond < 27.5 ? 25 : 30;
-    int highest = 0, drop = 0;
-    for (const LtcFrame& w : words) highest = std::max(highest, w.frames), drop += w.dropFrame;
-    if (highest >= base) base = highest >= 25 ? 30 : 25;
+    const int base = wordsPerSecond < 24.5 ? 24 : wordsPerSecond < 27.5 ? 25 : 30;
+    int drop = 0;
+    for (const LtcFrame& w : words) drop += w.dropFrame;
     const bool dropFrame = base == 30 && drop * 2 > int(words.size());
     const int64_t day = ltcFramesPerDay(base, dropFrame);
     // Runs of words that follow on from each other: as many frames on as word lengths later (a word lost here and
@@ -51,6 +48,7 @@ bool findLtc(const std::vector<float>& samples, int sampleRate, LtcReading& out)
     std::vector<Run> runs;
     for (size_t i = 0; i < words.size(); ++i) {
         LtcFrame w = words[i];
+        if (w.frames >= base) continue;  // not a frame at this rate
         w.dropFrame = dropFrame;
         const int64_t n = ltcFrameNumber(w, base);
         bool placed = false;
@@ -67,6 +65,7 @@ bool findLtc(const std::vector<float>& samples, int sampleRate, LtcReading& out)
         }
         if (!placed) runs.push_back({{i}, {n}});
     }
+    if (runs.empty()) return false;
     const Run& best = *std::max_element(runs.begin(), runs.end(), [](const Run& a, const Run& b) { return a.words.size() < b.words.size(); });
     if (best.words.size() < 8) return false;
     // Frame number against time, fitted: the frame number at the first sample, and the rate the words came at.
@@ -87,8 +86,11 @@ bool findLtc(const std::vector<float>& samples, int sampleRate, LtcReading& out)
     Rational fps{base, 1};
     if (base != 25) {
         const Rational pulled{base * 1000, 1001};
-        // Drop frame is only ever at 29.97; otherwise the rate tells a pulled-down timecode from a whole one.
-        if (dropFrame || (span >= 1.5 && std::fabs(measured - pulled.toDouble()) < std::fabs(measured - base))) fps = pulled;
+        // Drop frame is only ever at 29.97; otherwise the rate the words came at tells a pulled-down timecode from a
+        // whole one, if there is enough of it to tell 0.1 % apart; failing that, the hint.
+        const double h = hint.valid() ? hint.toDouble() : 0;
+        const bool hinted = std::fabs(h - pulled.toDouble()) < 1e-3 || std::fabs(h - 2 * pulled.toDouble()) < 2e-3;
+        if (dropFrame || (span >= 1.5 ? std::fabs(measured - pulled.toDouble()) < std::fabs(measured - base) : hinted)) fps = pulled;
     }
     LtcReading r;
     r.fps = fps;
@@ -106,19 +108,42 @@ bool findLtc(const std::vector<float>& samples, int sampleRate, LtcReading& out)
     return true;
 }
 
-bool readLtc(const std::string& path, LtcReading& out, std::string* error, double seconds, const std::atomic<bool>* cancel) {
+bool findLtc(const std::vector<float>& samples, int sampleRate, LtcReading& out, Rational hint) {
+    LtcDecoder decoder(sampleRate);
+    decoder.write(samples.data(), samples.size());
+    return ltcFromWords(decoder.take(), sampleRate, out, hint);
+}
+
+bool readLtc(const std::string& path, LtcReading& out, std::string* error, double seconds, const std::atomic<bool>* cancel, Rational hint) {
     constexpr int kRate = 48000;
-    std::vector<std::vector<float>> channels;
-    if (!decodeSourceChannels(path, kRate, seconds, channels, error, cancel)) return false;
-    if (channels.empty()) {
+    // A decoder per channel, fed as the sound is decoded.
+    std::vector<LtcDecoder> decoders;
+    std::vector<std::vector<LtcFrame>> words;
+    std::vector<float> one;
+    int channels = 0;
+    const bool read = decodeSourceChannels(
+        path, kRate, seconds,
+        [&](int channel, int count, const float* samples, size_t frames) {
+            while (int(decoders.size()) < channel + count) decoders.emplace_back(kRate), words.emplace_back();
+            one.resize(frames);
+            for (int c = 0; c < count; ++c) {
+                for (size_t i = 0; i < frames; ++i) one[i] = samples[i * size_t(count) + size_t(c)];
+                LtcDecoder& d = decoders[size_t(channel + c)];
+                d.write(one.data(), frames);
+                std::vector<LtcFrame> got = d.take();
+                words[size_t(channel + c)].insert(words[size_t(channel + c)].end(), got.begin(), got.end());
+            }
+        },
+        &channels, error, cancel);
+    if (!read) return false;
+    if (channels == 0) {
         if (error) *error = "The file has no sound";
         return false;
     }
     LtcReading best;
-    for (size_t c = 0; c < channels.size(); ++c) {
-        if (cancel && cancel->load()) return false;
+    for (size_t c = 0; c < words.size(); ++c) {
         LtcReading r;
-        if (findLtc(channels[c], kRate, r) && r.words > best.words) {
+        if (ltcFromWords(words[c], kRate, r, hint) && r.words > best.words) {
             best = r;
             best.channel = int(c);
         }
@@ -133,6 +158,34 @@ bool readLtc(const std::string& path, LtcReading& out, std::string* error, doubl
 
 bool usesLtcTimecode(const MediaItem& m) { return m.ltcTimecode >= 0 && m.timecode == m.ltcTimecode; }
 
+namespace {
+
+// The rate and drop-frame flag of the file's own timecode, kept while the LTC's are in use.
+constexpr const char* kRateKeys[2] = {"timecode_rate", "timecode_drop"};
+
+void keepFileRate(MediaItem& m) {
+    for (const char* key : kRateKeys) {
+        const std::string kept = std::string("file_") + key;
+        auto it = m.metadata.find(key);
+        if (it != m.metadata.end() && !it->second.empty()) m.metadata[kept] = it->second;
+        else m.metadata.erase(kept);
+    }
+}
+
+// (only while the LTC's are in use)
+void restoreFileRate(MediaItem& m) {
+    for (const char* key : kRateKeys) {
+        const std::string kept = std::string("file_") + key;
+        m.metadata.erase(key);
+        if (auto it = m.metadata.find(kept); it != m.metadata.end()) {
+            m.metadata[key] = it->second;
+            m.metadata.erase(kept);
+        }
+    }
+}
+
+}  // namespace
+
 void useLtcTimecode(Project& p, Id media, const LtcReading& r) {
     MediaItem* m = p.findMedia(media);
     if (m && m->subclipOf) m = p.findMedia(m->subclipOf);
@@ -142,16 +195,22 @@ void useLtcTimecode(Project& p, Id media, const LtcReading& r) {
     for (MediaItem& x : p.media) {
         if (x.id != m->id && x.subclipOf != m->id) continue;
         const double in = x.subclipOf ? x.subclipIn : 0;
-        if (!usesLtcTimecode(x)) x.fileTimecode = x.timecode;
+        if (!usesLtcTimecode(x)) {
+            x.fileTimecode = x.timecode;
+            keepFileRate(x);
+        }
         x.ltcTimecode = r.start + in;
         x.timecode = x.ltcTimecode;
         x.ltcChannel = r.channel;
         x.metadata["timecode_rate"] = rate;
+        if (r.dropFrame) x.metadata["timecode_drop"] = "1";
+        else x.metadata.erase("timecode_drop");
         if (x.subclipOf) ids.push_back(x.id);
     }
-    // Clips stop playing the LTC channel, where they did.
-    const std::vector<int> mixed = mixedChannels(*m);
+    // Clips stop playing the LTC channel, where they did; one that played only it plays what a new clip would, or
+    // nothing.
     if (sourceChannelCount(*m) < 2 || r.channel < 0) return;
+    const std::vector<int> mixed = mixedChannels(*m), fresh = newClipChannels(*m);
     for (Sequence& s : p.sequences)
         for (Track& t : s.audioTracks)
             for (Clip& c : t.clips) {
@@ -159,8 +218,9 @@ void useLtcTimecode(Project& p, Id media, const LtcReading& r) {
                 std::vector<int> playing = c.channels.empty() ? mixed : c.channels;
                 if (std::find(playing.begin(), playing.end(), r.channel) == playing.end()) continue;
                 std::erase(playing, r.channel);
-                if (playing.empty()) c.enabled = false;
-                else c.channels = playing;
+                if (!playing.empty()) c.channels = playing;
+                else if (!fresh.empty()) c.channels = fresh;
+                else c.enabled = false;
             }
 }
 
@@ -172,13 +232,23 @@ bool useFileTimecode(Project& p, Id media) {
         if ((x.id == m->id || x.subclipOf == m->id) && usesLtcTimecode(x)) {
             x.timecode = x.fileTimecode;
             x.fileTimecode = -1;
+            restoreFileRate(x);
         }
     return true;
 }
 
+void forgetLtc(MediaItem& m) {
+    if (usesLtcTimecode(m)) restoreFileRate(m);
+    m.ltcChannel = -1;
+    m.ltcTimecode = m.fileTimecode = -1;
+}
+
 bool writeLtcWav(const std::string& path, int64_t startFrame, int64_t frames, Rational fps, bool dropFrame, int sampleRate,
                  std::string* error) {
-    const std::vector<float> ltc = encodeLtc(startFrame, frames, fps, dropFrame, sampleRate, 0.25f);
+    if (frames <= 0 || sampleRate <= 0 || !fps.valid()) {
+        if (error) *error = "Nothing to write";
+        return false;
+    }
     std::ofstream f(path, std::ios::binary);
     if (!f) {
         if (error) *error = "Cannot write " + path;
@@ -186,9 +256,14 @@ bool writeLtcWav(const std::string& path, int64_t startFrame, int64_t frames, Ra
     }
     auto u32 = [&](uint32_t v) { f.write(reinterpret_cast<const char*>(&v), 4); };  // little-endian hosts only
     auto u16 = [&](uint16_t v) { f.write(reinterpret_cast<const char*>(&v), 2); };
-    const uint32_t bytes = uint32_t(ltc.size() * 2);
+    const double perWord = double(sampleRate) * fps.den / fps.num;
+    const uint64_t bytes = uint64_t(std::ceil(perWord * double(frames))) * 2;
+    if (bytes > 0xFFFFFFFFull - 36) {
+        if (error) *error = "Too long for a WAV file";
+        return false;
+    }
     f.write("RIFF", 4);
-    u32(36 + bytes);
+    u32(uint32_t(36 + bytes));
     f.write("WAVEfmt ", 8);
     u32(16);
     u16(1);  // PCM
@@ -198,10 +273,17 @@ bool writeLtcWav(const std::string& path, int64_t startFrame, int64_t frames, Ra
     u16(2);
     u16(16);
     f.write("data", 4);
-    u32(bytes);
-    std::vector<int16_t> pcm(ltc.size());
-    for (size_t i = 0; i < ltc.size(); ++i) pcm[i] = int16_t(std::lround(std::clamp(ltc[i], -1.0f, 1.0f) * 32767));
-    f.write(reinterpret_cast<const char*>(pcm.data()), std::streamsize(pcm.size() * 2));
+    u32(uint32_t(bytes));
+    // A minute's words at a time.
+    double state = -1;
+    std::vector<int16_t> pcm;
+    for (int64_t from = 0; from < frames && f; from += 1800) {
+        const std::vector<float> ltc =
+            encodeLtcPiece(startFrame, from, std::min(frames, from + 1800), fps, dropFrame, sampleRate, 0.25f, 0, state);
+        pcm.resize(ltc.size());
+        for (size_t i = 0; i < ltc.size(); ++i) pcm[i] = int16_t(std::lround(std::clamp(ltc[i], -1.0f, 1.0f) * 32767));
+        f.write(reinterpret_cast<const char*>(pcm.data()), std::streamsize(pcm.size() * 2));
+    }
     if (!f) {
         if (error) *error = "Cannot write " + path;
         return false;

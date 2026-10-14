@@ -51,6 +51,7 @@
 #include <QVBoxLayout>
 #include <QtConcurrent>
 #include <algorithm>
+#include <thread>
 #include <memory>
 
 #include "EditorState.h"
@@ -1177,7 +1178,7 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
             })->setObjectName(QStringLiteral("syncDailies"));
     }
     {
-        // Timecode recorded as sound (LTC from a lockit box), and back to the file's own.
+        // Timecode recorded as sound (LTC from a timecode generator), and back to the file's own.
         std::vector<Id> sounding, fromLtc;
         for (Id id : ids)
             if (const MediaItem* m = state_->project().findMedia(id); m && m->hasAudio && !m->path.empty() && m->kind != MediaKind::Sequence) {
@@ -1740,22 +1741,35 @@ void MediaBinWidget::createProxies(const std::vector<Id>& ids, const ProxyOption
 }
 
 int MediaBinWidget::timecodeFromLtc(const std::vector<Id>& media) {
-    std::vector<std::pair<Id, std::string>> files;
+    struct File {
+        Id id;
+        std::string path;
+        Rational hint;  // the picture's rate, for a short run of LTC
+    };
+    std::vector<File> files;
     for (Id id : media)
-        if (const MediaItem* m = state_->project().findMedia(id); m && m->hasAudio && !m->path.empty()) files.push_back({id, m->path});
+        if (const MediaItem* m = state_->project().findMedia(id); m && m->hasAudio && !m->path.empty())
+            files.push_back({id, m->path, m->hasVideo ? m->fps : Rational{0, 1}});
     if (files.empty()) return 0;
     QProgressDialog progress(tr("Reading LTC…"), tr("Cancel"), 0, int(files.size()), window());
     progress.setWindowModality(Qt::WindowModal);
     progress.setMinimumDuration(400);
     std::vector<std::pair<Id, LtcReading>> found;
     QStringList read;
+    std::atomic<bool> cancel{false};
     for (size_t i = 0; i < files.size() && !progress.wasCanceled(); ++i) {
         progress.setValue(int(i));
-        QCoreApplication::processEvents();
+        // Read away from the interface, so it stays live and Cancel stops a file part way.
         LtcReading r;
-        if (!readLtc(files[i].second, r)) continue;
-        found.push_back({files[i].first, r});
-        read << tr("%1 %2 (channel %3)").arg(QString::fromStdString(state_->project().findMedia(files[i].first)->name),
+        QFuture<bool> reading = QtConcurrent::run([&r, &cancel, f = files[i]] { return readLtc(f.path, r, nullptr, 30, &cancel, f.hint); });
+        while (!reading.isFinished()) {
+            QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+            if (progress.wasCanceled()) cancel = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!reading.result()) continue;
+        found.push_back({files[i].id, r});
+        read << tr("%1 %2 (channel %3)").arg(QString::fromStdString(state_->project().findMedia(files[i].id)->name),
                                            QString::fromStdString(r.startLabel()))
                     .arg(r.channel + 1);
     }

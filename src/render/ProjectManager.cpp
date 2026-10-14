@@ -213,6 +213,7 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
             m.faces.reset();
             for (double* tc : {&m.timecode, &m.ltcTimecode, &m.fileTimecode})
                 if (*tc >= 0) *tc += from;
+            m.ltcChannel = -1;  // the new file's sound is what its clips played, without the LTC
             // What was said, moved to the new file's time.
             if (m.transcript) {
                 auto shifted = std::make_shared<Transcript>(*m.transcript);

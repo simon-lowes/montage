@@ -43,10 +43,14 @@ std::vector<int> mixedChannels(const MediaItem& m) {
 }
 
 std::vector<int> newClipChannels(const MediaItem& m) {
-    if (m.ltcChannel < 0) return {};
     std::vector<int> out = mixedChannels(m);
-    if (out.size() < 2 || std::find(out.begin(), out.end(), m.ltcChannel) == out.end()) return {};
+    if (m.ltcChannel < 0 || std::find(out.begin(), out.end(), m.ltcChannel) == out.end()) return {};
     std::erase(out, m.ltcChannel);
+    // A first stream that is only the LTC (a mono stream a channel): the next stream's.
+    if (out.empty() && m.audioStreams.size() > 1) {
+        out.resize(size_t(m.audioStreams[1]));
+        std::iota(out.begin(), out.end(), m.audioStreams[0]);
+    }
     return out;
 }
 
@@ -135,6 +139,7 @@ Result splitAudioChannels(Project& p, Sequence& s, Id clip, bool pairs) {
     if (playing.empty()) {
         playing.resize(size_t(n));
         std::iota(playing.begin(), playing.end(), 0);
+        if (n > 1) std::erase(playing, m->ltcChannel);  // the channel carrying LTC is not one to play
     }
     std::vector<std::vector<int>> groups;
     for (size_t i = 0; i < playing.size(); i += pairs ? 2 : 1) {

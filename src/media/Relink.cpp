@@ -11,6 +11,7 @@
 #include <map>
 
 #include "Decoder.h"
+#include "LtcTimecode.h"
 
 namespace montage {
 
@@ -64,9 +65,8 @@ void takeDetails(MediaItem& m, const MediaItem& n, bool replace) {
     if (!n.projection.empty()) m.projection = n.projection;
     if (!m.subclipOf) m.duration = n.duration;
     if (replace) {
+        forgetLtc(m);  // another recording: its LTC is not read yet
         m.timecode = n.timecode;
-        m.ltcChannel = -1;  // another recording: its LTC is not read yet
-        m.ltcTimecode = m.fileTimecode = -1;
         m.created = n.created;
         m.proxyPath.clear();
         m.transcript.reset();

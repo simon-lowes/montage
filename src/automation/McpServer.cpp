@@ -7903,7 +7903,7 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_ltc", "Timecode from LTC",
-        "Linear timecode (SMPTE or EBU LTC) recorded on a sound channel, as lockit boxes feed cameras and recorders. "
+        "Linear timecode (SMPTE or EBU LTC) recorded on a sound channel, as timecode generators feed cameras and recorders. "
         "read: finds the channel carrying it in each of `media` (the first `seconds` of every channel) and gives its "
         "rate, the timecode at the file's start and the first word read; with apply (the default) that becomes the "
         "media's timecode (the file's own kept), so merging clips, syncing dailies and multicam sync by timecode use it, "
@@ -7913,10 +7913,11 @@ void McpServer::Impl::addTools() {
         R"json({"type":"object","properties":{"project":{"type":"string"},
             "action":{"type":"string","enum":["read","file","generate"],"default":"read"},
             "media":{"type":"array","items":{"type":"number"}},"apply":{"type":"boolean","default":true},
-            "seconds":{"type":"number","default":30}},"required":["project"]})json",
+            "seconds":{"type":"number","default":30,"maximum":120}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             const QString action = str(a, "action", "read");
+            if (action != "read" && action != "file" && action != "generate") throw ArgError{"action is read, file or generate"};
             if (action == "generate") {
                 Sequence& s = l.seq();
                 const FrameTime from = s.inPoint >= 0 && s.outPoint >= s.inPoint ? s.inPoint : 0;
@@ -7960,9 +7961,8 @@ void McpServer::Impl::addTools() {
                 save(l);
                 return ok(QStringLiteral("%1 media item(s) back to their own timecode").arg(n), QJsonObject{{"changed", n}});
             }
-            if (action != "read") throw ArgError{"action is read, file or generate"};
             const bool apply = a.value("apply").toBool(true);
-            const double seconds = std::clamp(a.value("seconds").toDouble(30), 1.0, 600.0);
+            const double seconds = std::clamp(a.value("seconds").toDouble(30), 1.0, 120.0);
             QJsonArray out;
             int found = 0;
             for (Id id : ids) {
@@ -7970,7 +7970,7 @@ void McpServer::Impl::addTools() {
                 LtcReading r;
                 std::string err;
                 QJsonObject o{{"media", double(id)}, {"name", QString::fromStdString(m->name)}};
-                if (m->path.empty() || !readLtc(m->path, r, &err, seconds)) {
+                if (m->path.empty() || !readLtc(m->path, r, &err, seconds, nullptr, m->hasVideo ? m->fps : Rational{0, 1})) {
                     o["error"] = QString::fromStdString(err.empty() ? "Not a file" : err);
                     out.append(o);
                     continue;
