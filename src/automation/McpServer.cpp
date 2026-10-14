@@ -5650,21 +5650,24 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_separate_stems", "Separate stems",
-        "Split the sound of audio clips into stems with Spleeter (Deezer Research, on this computer): 4 (vocals, drums, bass, "
-        "other), 5 (vocals, piano, drums, bass, other) or 2 (vocals, accompaniment). Each stem is a 44.1 kHz WAV in the "
-        "Stems folder beside the project, separated from the source the clip plays plus handles seconds either side, and "
-        "played by a copy of the clip (timing, speed, volume, pan) on an audio track named for the stem (Vocals, Drums...; "
-        "reused where free, else added), linked with the clip. The clip itself is disabled unless mute_original is false. "
-        "Needs the model (montage-cli models lists it; the app downloads it on first use).",
+        "Split the sound of audio clips into stems, on this computer. Music with Spleeter (Deezer Research): 4 (vocals, "
+        "drums, bass, other), 5 (vocals, piano, drums, bass, other) or 2 (vocals, accompaniment), as 44.1 kHz WAVs. A "
+        "film's finished mix with Bandit v2 (Watcharasupat, Wu and Lerch; CC BY-SA 4.0): 3 (dialogue, music, effects), as "
+        "48 kHz WAVs whose clips get the Dialogue, Music and Effects roles, so montage_export audio_streams dme puts the "
+        "dialogue and an M&E in a master; dialogue is the cleanest, music and effects less exact on real film mixes. Each stem is in "
+        "the Stems folder beside the project, separated from the source the clip plays plus handles seconds either side, "
+        "and played by a copy of the clip (timing, speed, volume, pan) on an audio track named for the stem (Vocals, "
+        "Dialogue...; reused where free, else added), linked with the clip. The clip itself is disabled unless "
+        "mute_original is false. Needs the model (montage-cli models lists it; the app downloads it on first use).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clips":{"type":"array","items":{"type":"number"}},
-            "stems":{"type":"integer","enum":[2,4,5],"default":4},"mute_original":{"type":"boolean","default":true},
+            "stems":{"type":"integer","enum":[2,3,4,5],"default":4},"mute_original":{"type":"boolean","default":true},
             "handles":{"type":"number","default":2}},"required":["project","clips"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
             const int stems = a.value("stems").toInt(4);
             const std::vector<std::string>& names = stemNames(stems);
-            if (names.empty()) throw ArgError{"\"stems\" is 2, 4 or 5"};
+            if (names.empty()) throw ArgError{"\"stems\" is 2, 3, 4 or 5"};
             if (!stemSeparationAvailable()) return fail("This build of Montage has no ONNX Runtime");
             if (!stemModel(stems).installed()) return fail(QString::fromStdString("The " + stemModel(stems).title + " is not downloaded"));
             std::vector<Id> ids;
@@ -5718,7 +5721,7 @@ void McpServer::Impl::addTools() {
                     if (MediaItem* mi = l.project.findMedia(media.back())) {
                         mi->metadata["comment"] = titles[k] + " separated from " + clipName + " (" +
                                                   QFileInfo(QString::fromStdString(uninterpretedPath(source))).fileName().toStdString() +
-                                                  ") with Spleeter in Montage";
+                                                  ") with " + (stems == 3 ? "Bandit v2" : "Spleeter") + " in Montage";
                         if (std::find(mi->keywords.begin(), mi->keywords.end(), "Stem") == mi->keywords.end()) mi->keywords.push_back("Stem");
                     }
                 }
@@ -7414,8 +7417,8 @@ void McpServer::Impl::addTools() {
             "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask): CEA-608 and CTA-708 service 1"},
             "cea708":{"type":"boolean","default":true,"description":"With cea608: the CTA-708 service beside the 608 bytes"},
             "all_captions":{"type":"boolean","default":false,"description":"With embed: every caption track as its own subtitle stream, language tagged"},
-            "audio_streams":{"description":"More audio streams after the mix (a master's M&E, dialogue, dubs): \"roles\" (one per role), \"tracks\" (one per track), or a list of {name, language, tracks:[\"A2\",...], role}",
-                "anyOf":[{"type":"string","enum":["mix","roles","tracks"]},{"type":"array","items":{"type":"object","properties":{
+            "audio_streams":{"description":"More audio streams after the mix (a master's M&E, dialogue, dubs): \"roles\" (one per role), \"tracks\" (one per track), \"dme\" (the Dialogue role, then an M&E of Music and Effects; each left out when none of its roles is heard), or a list of {name, language, tracks:[\"A2\",...], role (several joined by +, as Music+Effects)}",
+                "anyOf":[{"type":"string","enum":["mix","roles","tracks","dme"]},{"type":"array","items":{"type":"object","properties":{
                     "name":{"type":"string"},"language":{"type":"string"},"tracks":{"type":"array","items":{"type":"string"}},"role":{"type":"string"}}}}]},
             "audio_name":{"type":"string","description":"The mix stream's title"},"audio_language":{"type":"string","description":"The mix stream's language (ISO 639-1)"},
             "start_timecode":{"type":"string","description":"The file's starting timecode (MXF and MOV), e.g. 10:00:00:00 as broadcasters ask"},
@@ -7496,8 +7499,10 @@ void McpServer::Impl::addTools() {
             st.audioLanguage = a.value("audio_language").toString().toStdString();
             const QJsonValue streams = a.value("audio_streams");
             if (streams.isString() && streams.toString() != "mix") {
-                if (streams.toString() != "roles" && streams.toString() != "tracks") throw ArgError{"\"audio_streams\" is mix, roles, tracks or a list"};
-                st.extraAudio = stemStreams(s, streams.toString() == "roles" ? StemsByRole : StemsByTrack);
+                const QString kind = streams.toString();
+                if (kind != "roles" && kind != "tracks" && kind != "dme") throw ArgError{"\"audio_streams\" is mix, roles, tracks, dme or a list"};
+                st.extraAudio = stemStreams(s, kind == "roles" ? StemsByRole : kind == "dme" ? StemsDialogueAndME : StemsByTrack);
+                if (kind == "dme" && st.extraAudio.empty()) return fail("No clip heard has the Dialogue, Music or Effects role (montage_set_roles)");
             } else if (streams.isArray()) {
                 for (const QJsonValue& v : streams.toArray()) {
                     const QJsonObject o = v.toObject();

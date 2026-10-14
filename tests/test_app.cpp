@@ -643,7 +643,8 @@ private slots:
             QVERIFY(smart->isEnabled());
             // More audio streams in a master (a MOV with sound), not in a GIF; every caption language needs two tracks.
             auto* streams = ed.findChild<QComboBox*>("exportAudioStreams");
-            QVERIFY(streams && streams->isEnabled() && streams->count() == 3);
+            QVERIFY(streams && streams->isEnabled() && streams->count() == 4);  // the mix only, roles, tracks, dialogue and M&E
+            QVERIFY(streams->itemText(3).contains("M&E"));
             preset->setCurrentIndex(presetIndex("gif"));
             QVERIFY(!streams->isEnabled());
             QVERIFY(!ed.findChild<QCheckBox*>("exportAllCaptions")->isEnabled());
@@ -13551,9 +13552,15 @@ print("added " + ui["name"])
         {
             StemsDialog dlg(win_.get());
             auto* stems = dlg.findChild<QComboBox*>("stems");
-            QVERIFY(stems && stems->count() == 3);
+            QVERIFY(stems && stems->count() == 4);
             QCOMPARE(dlg.options().stems, 4);
             QVERIFY(dlg.options().muteOriginal);
+            // A film's mix into dialogue, music and effects: the note says which model and how big.
+            auto* note = dlg.findChild<QLabel*>("stemsNote");
+            QVERIFY(note && note->text().contains("Spleeter"));
+            stems->setCurrentIndex(stems->findData(3));
+            QCOMPARE(dlg.options().stems, 3);
+            QVERIFY(note->text().contains("Bandit") && note->text().contains("447 MB"));
             stems->setCurrentIndex(stems->findData(2));
             dlg.findChild<QCheckBox*>("muteOriginal")->setChecked(false);
             QCOMPARE(dlg.options().stems, 2);

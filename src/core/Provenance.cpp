@@ -51,10 +51,11 @@ void effectUses(Provenance& out, const Effect& e) {
 
 void mediaUses(Provenance& out, const MediaItem& m) {
     auto has = [&](const char* k) { return std::find(m.keywords.begin(), m.keywords.end(), k) != m.keywords.end(); };
-    if (has("Stem")) add(out, {"Stem Separation", "Spleeter", AiRole::Enhanced});  // (one part of a mix, split by a model)
-    if (!has("AI voice")) return;
     const auto note = m.metadata.find("comment");
     const std::string said = note == m.metadata.end() ? std::string() : note->second;
+    if (has("Stem"))  // (one part of a mix, split by a model; its note says which)
+        add(out, {"Stem Separation", said.find("with Bandit v2") != std::string::npos ? "Bandit v2" : "Spleeter", AiRole::Enhanced});
+    if (!has("AI voice")) return;
     if (said.find(" converted to a voice") != std::string::npos) add(out, {"Voice Conversion", "Chatterbox", AiRole::Generated});
     else if (said.find("cloned") != std::string::npos) add(out, {"Cloned Voice", "Chatterbox Multilingual", AiRole::Generated});
     else add(out, {"Generated Speech", "Kokoro", AiRole::Generated});

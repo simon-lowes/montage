@@ -213,9 +213,10 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     streams_->addItem(tr("The mix only"));
     streams_->addItem(tr("The mix, then one per role"));
     streams_->addItem(tr("The mix, then one per track"));
+    streams_->addItem(tr("The mix, then dialogue and M&E"));
     streams_->setToolTip(tr("A master with more audio streams after the mix (Dialogue, Music, Effects, or each track and dub), "
                             "each named and tagged with its language"));
-    streams_->setCurrentIndex(std::clamp(appSettings().value("export/audioStreams", 0).toInt(), 0, 2));
+    streams_->setCurrentIndex(std::clamp(appSettings().value("export/audioStreams", 0).toInt(), 0, 3));
     form->addRow(tr("Audio streams:"), streams_);
     described_ = new QCheckBox(tr("Audio description: the programme with its descriptions as a stream after the mix"), form_);
     described_->setObjectName(QStringLiteral("exportDescribed"));
@@ -790,7 +791,8 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     s.hdr10Plus = hdr10Plus_->isEnabled() && hdr10Plus_->isChecked();
     settings.setValue("export/hdr10Plus", hdr10Plus_->isChecked());
     if (streams_->isEnabled() && streams_->currentIndex() > 0 && state_->sequence()) {
-        s.extraAudio = stemStreams(*state_->sequence(), streams_->currentIndex() == 1 ? StemsByRole : StemsByTrack);
+        const int index = streams_->currentIndex();
+        s.extraAudio = stemStreams(*state_->sequence(), index == 1 ? StemsByRole : index == 3 ? StemsDialogueAndME : StemsByTrack);
         s.audioName = "Mix";
         if (!state_->sequence()->captionTracks.empty()) s.audioLanguage = state_->sequence()->captionTracks.front().language;
     }

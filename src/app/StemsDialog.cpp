@@ -49,7 +49,7 @@ std::vector<Id> separateStems(EditorState* state, const std::vector<Id>& clips, 
     };
     const Sequence* s = state->sequence();
     const std::vector<std::string>& names = stemNames(o.stems);
-    if (!s || names.empty()) return fail(QObject::tr("Separation is into 2, 4 or 5 stems"));
+    if (!s || names.empty()) return fail(QObject::tr("Separation is into 2, 3, 4 or 5 stems"));
     if (state->readOnly()) return fail(QObject::tr("This project is open read-only"));
     std::vector<Job> jobs;
     QString why;
@@ -70,8 +70,10 @@ std::vector<Id> separateStems(EditorState* state, const std::vector<Id>& clips, 
     }
     if (jobs.empty()) return fail(why.isEmpty() ? QObject::tr("Select the audio clips to separate") : why);
     if (!stemSeparationAvailable()) return fail(QObject::tr("This build of Montage has no ONNX Runtime"));
-    if (!ensureModelPack(parent, stemModel(o.stems), QObject::tr("Separate Stems"),
-                         QObject::tr("Separating stems uses Spleeter (Deezer Research, MIT), which runs on this computer.")))
+    const QString model = o.stems == 3 ? QObject::tr("Separating dialogue, music and effects uses Bandit v2 (Watcharasupat, Wu and Lerch; "
+                                                     "the model is licensed CC BY-SA 4.0), which runs on this computer.")
+                                       : QObject::tr("Separating stems uses Spleeter (Deezer Research, MIT), which runs on this computer.");
+    if (!ensureModelPack(parent, stemModel(o.stems), QObject::tr("Separate Stems"), model))
         return {};
     // Beside the project, as recorded takes are.
     const QString project = state->filePath();
@@ -142,7 +144,8 @@ std::vector<Id> separateStems(EditorState* state, const std::vector<Id>& clips, 
         m.bin = "Stems";
         // Where it came from.
         m.metadata["comment"] = stemTitle(n) + " separated from " + j.name + " (" +
-                                QFileInfo(QString::fromStdString(uninterpretedPath(j.path))).fileName().toStdString() + ") with Spleeter in Montage";
+                                QFileInfo(QString::fromStdString(uninterpretedPath(j.path))).fileName().toStdString() + ") with " +
+                                (o.stems == 3 ? "Bandit v2" : "Spleeter") + " in Montage";
         m.keywords.push_back("Stem");
         items.push_back(std::move(m));
     }
@@ -189,15 +192,27 @@ StemsDialog::StemsDialog(QWidget* parent) : QDialog(parent) {
     stems_->addItem(tr("Vocals, drums, bass and other (4 stems)"), 4);
     stems_->addItem(tr("Vocals, piano, drums, bass and other (5 stems)"), 5);
     stems_->addItem(tr("Vocals and accompaniment (2 stems)"), 2);
+    stems_->addItem(tr("Dialogue, music and effects (a film's mix)"), 3);
     form->addRow(tr("Separate into:"), stems_);
     mute_ = new QCheckBox(tr("Mute the original clip"), this);
     mute_->setObjectName(QStringLiteral("muteOriginal"));
     mute_->setChecked(true);
     form->addRow(QString(), mute_);
-    auto* note = new QLabel(tr("Each stem goes on its own track, linked with the clip. Spleeter (Deezer Research) runs on this "
-                               "computer; the model is downloaded the first time (73 to 183 MB)."),
-                            this);
+    auto* note = new QLabel(this);
+    note->setObjectName(QStringLiteral("stemsNote"));
     note->setWordWrap(true);
+    auto describe = [this, note] {
+        if (stems_->currentData().toInt() == 3)
+            note->setText(tr("Each stem goes on its own track (with the Dialogue, Music or Effects role), linked with the clip. Bandit v2 "
+                             "runs on this computer, slower than real time without a GPU; the model is downloaded the first time "
+                             "(447 MB). Dialogue comes out cleanest: music and effects are less exact on real film mixes, so check "
+                             "an M&E built from them."));
+        else
+            note->setText(tr("Each stem goes on its own track, linked with the clip. Spleeter (Deezer Research) runs on this "
+                             "computer; the model is downloaded the first time (73 to 183 MB)."));
+    };
+    describe();
+    connect(stems_, &QComboBox::currentIndexChanged, this, describe);
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     buttons->button(QDialogButtonBox::Ok)->setText(tr("Separate"));
     connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);

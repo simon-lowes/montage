@@ -16,27 +16,29 @@
 #   <dir>/minilm-qa      Find What's Said   (MONTAGE_SENTENCE_MODEL)
 #   <dir>/ocr            Reading text       (MONTAGE_OCR_MODEL)
 #   <dir>/sound          What's Heard       (MONTAGE_SOUND_MODEL)
-#   <dir>/stems          Separate Stems     (MONTAGE_STEM_MODELS; 4 stems, and 2 and 5 with --stems)
+#   <dir>/stems          Separate Stems     (MONTAGE_STEM_MODELS; 4 stems, and 2 and 5 with --stems; dialogue,
+#                                           music and effects with --dme: 447 MB, CC BY-SA 4.0)
 #   <dir>/voice-clone    Cloned voices      (MONTAGE_VOICE_CLONE_MODEL; 1.6 GB, only with --voice-clone)
 #   <dir>/lensfun-db     Lens Correction    (MONTAGE_LENS_DB; lensfun's lens profiles, CC BY-SA 3.0)
 #   <dir>/sadie-ku100    binaural ambisonics (MONTAGE_HRTF_DIR; SADIE II's KU100 HRIRs, Apache-2.0; only with --hrtf)
 #
-#   scripts/fetch-models.sh [dir] [--voice-clone] [--stems] [--hrtf]      (default: ./models)
+#   scripts/fetch-models.sh [dir] [--voice-clone] [--stems] [--dme] [--hrtf]      (default: ./models)
 set -euo pipefail
 VOICE_CLONE=0
 ALL_STEMS=0
+DME=0
 HRTF=0
 ARGS=()
 for a in "$@"; do
-  if [ "$a" = "--voice-clone" ]; then VOICE_CLONE=1; elif [ "$a" = "--stems" ]; then ALL_STEMS=1; elif [ "$a" = "--hrtf" ]; then HRTF=1; else ARGS+=("$a"); fi
+  if [ "$a" = "--voice-clone" ]; then VOICE_CLONE=1; elif [ "$a" = "--stems" ]; then ALL_STEMS=1; elif [ "$a" = "--dme" ]; then DME=1; elif [ "$a" = "--hrtf" ]; then HRTF=1; else ARGS+=("$a"); fi
 done
 DIR=${ARGS[0]:-models}
 sha256() { if command -v sha256sum > /dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
-fetch() {  # folder, file name, URL, SHA-256
+fetch() {  # folder, file name, URL, SHA-256[, seconds allowed]
   mkdir -p "$DIR/$1"
   local f="$DIR/$1/$2"
   if [ -s "$f" ] && [ "$(sha256 "$f")" = "$4" ]; then return; fi
-  curl -fsSL --retry 3 --max-time 600 -o "$f.part" "$3"
+  curl -fsSL --retry 3 --max-time "${5:-600}" -o "$f.part" "$3"
   local got
   got=$(sha256 "$f.part")
   if [ "$got" != "$4" ]; then
@@ -126,6 +128,11 @@ fetch stems/spleeter-4stems 4stems.tar.gz "$SPLEETER/4stems.tar.gz" 3adb4a50ad4e
 if [ "$ALL_STEMS" = 1 ]; then
   fetch stems/spleeter-2stems 2stems.tar.gz "$SPLEETER/2stems.tar.gz" f3a90b39dd2874269e8b05a48a86745df897b848c61f3958efc80a39152bd692
   fetch stems/spleeter-5stems 5stems.tar.gz "$SPLEETER/5stems.tar.gz" 25a1e87eb5f75cc72a4d2d5467a0a50ac75f05611f877c278793742513cc7218
+fi
+if [ "$DME" = 1 ]; then
+  # Bandit v2's English model (Watcharasupat, Wu and Lerch; CC BY-SA 4.0), from the authors' Zenodo record.
+  fetch stems/bandit-v2-eng checkpoint-eng.ckpt https://zenodo.org/records/12701995/files/checkpoint-eng.ckpt \
+    3d14c48399ddb42be6fca6c316adc1b7d67d0e648e4e937359811aa6fa8b8cd2 1800
 fi
 if [ "$VOICE_CLONE" = 1 ]; then
   CHATTERBOX=https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/452d3f434aa592098f1eedac9099f33642ab2da5

@@ -1163,10 +1163,27 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             e->normalise = want.normalise;
             e->seq = seq;
             for (const std::string& r : want.unmute) std::erase(e->seq.mutedRoles, r);
-            if (!want.role.empty())
+            if (!want.role.empty()) {
+                // ("Music+Effects": either, unless a role has that very name)
+                auto roleOf = [](const Clip& c) { return c.role.empty() ? std::string("No Role") : c.role; };
+                bool named = false;
+                for (const Track& t : seq.audioTracks)
+                    for (const Clip& c : t.clips) named = named || roleOf(c) == want.role;
+                std::vector<std::string> roles;
+                for (size_t from = 0; !named;) {
+                    const size_t plus = want.role.find('+', from);
+                    std::string r = want.role.substr(from, plus == std::string::npos ? std::string::npos : plus - from);
+                    r.erase(0, r.find_first_not_of(' '));
+                    r.erase(r.find_last_not_of(' ') + 1);
+                    roles.push_back(r);
+                    if (plus == std::string::npos) break;
+                    from = plus + 1;
+                }
+                if (named) roles = {want.role};
                 for (Track& t : e->seq.audioTracks)
                     for (Clip& c : t.clips)
-                        if ((c.role.empty() ? std::string("No Role") : c.role) != want.role) c.enabled = false;
+                        if (std::find(roles.begin(), roles.end(), roleOf(c)) == roles.end()) c.enabled = false;
+            }
             extras.push_back(std::move(e));
         }
     }
@@ -1849,19 +1866,29 @@ std::vector<ExportSettings::AudioStream> stemStreams(const Sequence& seq, int gr
     const std::string language = seq.captionTracks.empty() ? std::string() : seq.captionTracks.front().language;
     const size_t n = seq.audioTracks.size();
     auto hasClips = [&](size_t i) { return !seq.audioTracks[i].muted && !seq.audioTracks[i].clips.empty(); };
-    if (groups == StemsByRole) {
+    // A role heard: not muted, with an enabled clip on a track that plays ("No Role" for clips without one).
+    auto heard = [&](const std::string& r) {
+        if (edit::roleMuted(seq, r)) return false;
+        for (size_t i = 0; i < n; ++i)
+            if (hasClips(i))
+                for (const Clip& c : seq.audioTracks[i].clips)
+                    if (c.enabled && (c.role.empty() ? std::string("No Role") : c.role) == r) return true;
+        return false;
+    };
+    if (groups == StemsDialogueAndME) {
+        // (each left out when none of its roles is heard; the M&E names only those that are)
+        if (heard("Dialogue")) out.push_back({"Dialogue", language, {}, "Dialogue"});
+        std::string me;
+        for (const char* r : {"Music", "Effects"})
+            if (heard(r)) me += (me.empty() ? "" : "+") + std::string(r);
+        if (!me.empty()) out.push_back({"M&E", language, {}, me});
+    } else if (groups == StemsByRole) {
         Sequence named = seq;
         for (Track& t : named.audioTracks)
             for (Clip& c : t.clips)
                 if (c.role.empty()) c.role = "No Role";
-        for (const std::string& r : edit::sequenceRoles(named)) {
-            if (edit::roleMuted(seq, r)) continue;
-            bool used = false;
-            for (size_t i = 0; i < n && !used; ++i)
-                if (hasClips(i))
-                    for (const Clip& c : named.audioTracks[i].clips) used = used || (c.enabled && c.role == r);
-            if (used) out.push_back({r, language, {}, r});
-        }
+        for (const std::string& r : edit::sequenceRoles(named))
+            if (heard(r)) out.push_back({r, language, {}, r});
     } else {
         for (size_t i = 0; i < n; ++i) {
             if (!hasClips(i)) continue;

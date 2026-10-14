@@ -95,8 +95,8 @@ struct ExportSettings {
     bool smartRender = true;
     // Masters with several audio streams (Resolve 21.1's separate output tracks, broadcast and streaming deliverables):
     // the mix first (named and tagged with a language), then one stream for each of these, each hearing only its
-    // tracks (empty = all) and, when given, only clips of its role ("Dialogue", "Music", "Effects", "No Role"): an
-    // M&E, a dialogue stem, a dubbed language. They are not loudness-normalised.
+    // tracks (empty = all) and, when given, only clips of its role ("Dialogue", "Music", "Effects", "No Role", or several
+    // joined by "+", as "Music+Effects", unless a role has that very name): an M&E, a dialogue stem, a dubbed language. They are not loudness-normalised.
     struct AudioStream {
         std::string name;
         std::string language;  // ISO 639-1
@@ -152,15 +152,17 @@ using ExportProgress = std::function<void(double fraction, FrameTime frame)>;
 // through its effects, fader and pan exactly as in the full mix, in the
 // sequence's channel layout (or stereo with downmixStereo). Written beside
 // `s.path` as "<name> - <stem>.wav"; silent and muted groups are skipped.
-enum StemGroups : int { StemsByTrack = 1, StemsByBus = 2, StemsByRole = 3 };
+enum StemGroups : int { StemsByTrack = 1, StemsByBus = 2, StemsByRole = 3, StemsDialogueAndME = 4 };
 struct StemFile {
     std::string name;
     std::string path;
 };
 bool exportStems(const Project& p, const Sequence& seq, const ExportSettings& s, int groups, std::vector<StemFile>* written,
                  const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr, std::string* error = nullptr);
-// The streams a master can carry after its mix, split as stems are: one per audio track with clips, or one per role
-// in use (StemsByTrack or StemsByRole), each named for it and in the language of the sequence's first caption track.
+// The streams a master can carry after its mix, split as stems are: one per audio track with clips, one per role in
+// use (StemsByTrack or StemsByRole), or the dialogue and the M&E (StemsDialogueAndME: the Dialogue role, then Music and
+// Effects together), each named for it and in the language of the sequence's first caption track. A role muted or with
+// no clip heard gets no stream (nor a part of the M&E).
 std::vector<ExportSettings::AudioStream> stemStreams(const Sequence& seq, int groups);
 
 // Whether audio encoder `codec` opens with a sequence layout's channels (FFmpeg's layout for it).
