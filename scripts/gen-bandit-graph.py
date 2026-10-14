@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Generates src/media/bandit-v2.onnx: the Bandit v2 cinematic source separation network
+# The network's structure and its musical band layout (musical_bands) are transcribed from Bandit v2,
+# src/models/bandit/{bandit,bandsplit,tfmodel,maskestim,utils}.py at kwatcharasupat/bandit-v2 d5563d9,
+# Copyright Karn N. Watcharasupat, Chih-Wei Wu and Alexander Lerch, licensed under the Apache License,
+# Version 2.0 (LICENSES/Apache-2.0.txt); modified: rewritten as ONNX graph construction for Montage.
+"""Generates src/media/bandit-v2-eng.onnx (one graph per language's checkpoint): the Bandit v2 cinematic source separation network
 (Watcharasupat, Wu and Lerch; code Apache-2.0, checkpoints CC BY-SA 4.0) as an ONNX graph without
 its weights. Each weight is external data naming its bytes inside the authors' own checkpoint
 (checkpoint-<language>.ckpt from https://zenodo.org/records/12701995, a PyTorch zip whose tensors

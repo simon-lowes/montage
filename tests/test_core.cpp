@@ -8409,6 +8409,10 @@ private slots:
         fx.p.findMedia(fx.media)->keywords = {"Stem"};
         made = sequenceProvenance(fx.p, fx.s());
         QVERIFY(std::find(made.ai.begin(), made.ai.end(), AiUse{"Stem Separation", "Spleeter", AiRole::Enhanced}) != made.ai.end());
+        fx.p.findMedia(fx.media)->metadata["comment"] = "Dialogue separated from Reel 1 (mix.wav) with Bandit v2 in Montage";
+        made = sequenceProvenance(fx.p, fx.s());
+        QVERIFY(std::find(made.ai.begin(), made.ai.end(), AiUse{"Stem Separation", "Bandit v2", AiRole::Enhanced}) != made.ai.end());
+        fx.p.findMedia(fx.media)->metadata.erase("comment");
         fx.p.findMedia(fx.media)->keywords.clear();
 
         // AI frames for slow motion generate pictures.

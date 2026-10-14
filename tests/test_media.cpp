@@ -134,6 +134,7 @@
 #include "media/TextToSpeech.h"
 #include "media/VoiceClone.h"
 #include "media/SoundSearch.h"
+#include "media/BanditSeparation.h"
 #include "media/StemSeparation.h"
 #include "media/Inpaint.h"
 #include "media/VisualSearch.h"
@@ -2675,19 +2676,54 @@ private slots:
         QCOMPARE(title, std::string("Music"));
         QVERIFY(level(score, 880) > 20 * level(score, 440));
         QVERIFY(decodeAudioStream(st.path, 3).empty());
-        // The dialogue, then an M&E hearing the Music and Effects roles.
-        const auto dme = stemStreams(s, StemsDialogueAndME);
+        // The dialogue, then an M&E hearing the Music and Effects roles (effects at 1320 Hz on A3); each left out, or
+        // the M&E naming only what is there, when a role is not heard.
+        QCOMPARE(stemStreams(s, StemsDialogueAndME).size(), size_t(2));
+        QCOMPARE(stemStreams(s, StemsDialogueAndME)[1].role, std::string("Music"));  // (no Effects clip here)
+        Project q = p;
+        Sequence& qs = *q.active();
+        edit::addTrack(q, qs, TrackKind::Audio);
+        MediaItem bang = probeOrFail(q, tone("effects.wav", 1320));
+        q.media.push_back(bang);
+        Clip fx = makeClip(q, bang, TrackKind::Audio, qs);
+        fx.role = "Effects";
+        edit::overwrite(q, qs, {TrackKind::Audio, int(qs.audioTracks.size()) - 1}, fx);
+        const auto dme = stemStreams(qs, StemsDialogueAndME);
         QVERIFY(dme.size() == 2 && dme[0].role == "Dialogue" && dme[1].name == "M&E" && dme[1].role == "Music+Effects" && dme[1].language == "en");
+        {
+            Sequence muted = qs;
+            muted.mutedRoles = {"Dialogue"};
+            QVERIFY(stemStreams(muted, StemsDialogueAndME).size() == 1 && stemStreams(muted, StemsDialogueAndME)[0].name == "M&E");
+            for (Track& t : muted.audioTracks)
+                for (Clip& c : t.clips) c.role.clear();
+            muted.mutedRoles.clear();
+            QVERIFY(stemStreams(muted, StemsDialogueAndME).empty());
+        }
         {
             ExportSettings d = st;
             d.path = path("dme.mkv");
             d.extraAudio = dme;
             d.embedCaptions = false;
             d.extraCaptions.clear();
-            QVERIFY2(exportSequence(p, s, d, nullptr, nullptr, &err), err.c_str());
+            QVERIFY2(exportSequence(q, qs, d, nullptr, nullptr, &err), err.c_str());
+            const std::vector<float> spoken = decodeAudioStream(d.path, 1, &title);
+            QCOMPARE(title, std::string("Dialogue"));
+            QVERIFY(level(spoken, 440) > 20 * level(spoken, 1320));
             const std::vector<float> me = decodeAudioStream(d.path, 2, &title);
             QCOMPARE(title, std::string("M&E"));
-            QVERIFY2(level(me, 880) > 20 * level(me, 440), qPrintable(QString("%1 %2").arg(level(me, 880)).arg(level(me, 440))));
+            QVERIFY2(level(me, 880) > 20 * level(me, 440) && level(me, 1320) > 20 * level(me, 440),
+                     qPrintable(QString("%1 %2 %3").arg(level(me, 880)).arg(level(me, 1320)).arg(level(me, 440))));
+            // A role whose own name has a "+" is that role, not two.
+            for (Track& t : qs.audioTracks)
+                for (Clip& c : t.clips)
+                    if (c.role == "Effects") c.role = "Foley+BG";
+            d.path = path("foley.mkv");
+            d.extraAudio = {{"Foley", "", {}, "Foley+BG"}, {"Score", "", {}, "Music + Foley+BG"}};
+            QVERIFY2(exportSequence(q, qs, d, nullptr, nullptr, &err), err.c_str());
+            const std::vector<float> foley = decodeAudioStream(d.path, 1);
+            QVERIFY(level(foley, 1320) > 0.05 && level(foley, 1320) > 20 * level(foley, 880));
+            const std::vector<float> score = decodeAudioStream(d.path, 2);  // ("Music" and "Foley" and "BG", spaces trimmed)
+            QVERIFY(level(score, 880) > 0.05 && level(score, 880) > 20 * level(score, 1320));
         }
         // Both subtitle streams, each with its language.
         AVFormatContext* fmt = nullptr;
@@ -19976,6 +20012,47 @@ if ui["pressed"] == "add":
         QCOMPARE(int(QDir(QString::fromStdString(path("mcp-stems/Stems"))).entryList(QDir::Files).size()), before);
     }
 
+    void dialogueMusicEffectsChunks() {
+        // The chunks on their own, masks of 1, 0.5 and 0 in place of the network: each stem is the input times its mask,
+        // to the sample, at lengths about the chunks' edges (8 s each, every 6 s), pushed in uneven blocks, stereo and
+        // mono (separated once).
+        constexpr size_t per = size_t(8 * kDmeRate / 512 + 1) * 1025 * 2;
+        const BanditSplitter::Masks masks = [](int channels, const float*, float* m) {
+            for (int c = 0; c < channels; ++c)
+                for (int k = 0; k < 2; ++k) {  // (the third stays silent)
+                    float* dst = m + (size_t(c) * 3 + size_t(k)) * per;
+                    for (size_t i = 0; i < per; i += 2) dst[i] = k == 0 ? 1.0f : 0.5f;
+                }
+        };
+        if (!BanditSplitter::createWithMasks([](const std::vector<std::vector<float>>&) { return true; }, masks))
+            QSKIP("This build of Montage has no ONNX Runtime");
+        const int64_t sec = kDmeRate;
+        for (const int64_t length : {int64_t(1), sec, 8 * sec - 1, 8 * sec, 8 * sec + 1, 14 * sec, 14 * sec + 1, 20 * sec, 21 * sec + sec / 2})
+            for (const bool mono : {false, true}) {
+                std::vector<float> x(size_t(length) * 2);
+                uint64_t lcg = uint64_t(length) * 2 + (mono ? 1 : 0);
+                for (size_t i = 0; i < x.size(); ++i) {
+                    lcg = (1103515245 * lcg + 12345) % 2147483648ULL;
+                    x[i] = mono && i % 2 ? x[i - 1] : float(0.5 * (double(lcg) / 1073741824.0 - 1.0));
+                }
+                std::vector<std::vector<float>> got(3);
+                auto s = BanditSplitter::createWithMasks([&](const std::vector<std::vector<float>>& blocks) {
+                    for (size_t k = 0; k < 3; ++k) got[k].insert(got[k].end(), blocks[k].begin(), blocks[k].end());
+                    return true;
+                }, masks);
+                for (int64_t at = 0; at < length; at += 7919) QVERIFY(s->push(x.data() + at * 2, size_t(std::min<int64_t>(7919, length - at))));
+                QVERIFY(s->finish());
+                QCOMPARE(s->done(), length);
+                const float gain[3] = {1, 0.5f, 0};
+                for (size_t k = 0; k < 3; ++k) {
+                    QCOMPARE(got[k].size(), x.size());
+                    float worst = 0;
+                    for (size_t i = 0; i < x.size(); ++i) worst = std::max(worst, std::fabs(got[k][i] - gain[k] * x[i]));
+                    QVERIFY2(worst < 1e-4f, qPrintable(QStringLiteral("%1 s, %2, stem %3: %4").arg(double(length) / sec).arg(mono).arg(k).arg(worst)));
+                }
+            }
+    }
+
     void dialogueMusicEffects() {
         if (!stemSeparationAvailable() || !stemModel(3).installed())
             QSKIP("Set MONTAGE_STEM_MODELS to a folder holding bandit-v2-eng (checkpoint-eng.ckpt) to run this");
@@ -20019,9 +20096,10 @@ if ui["pressed"] == "add":
         };
         std::vector<std::string> outs;
         for (const std::string& name : stemNames(3)) outs.push_back(path(("film-" + name + ".wav").c_str()));
-        double progressed = 0;
-        QVERIFY2(separateStemsToFiles(path("film.wav"), 0, 0, {}, 3, outs, [&](double f) { progressed = f; }, nullptr, &err), err.c_str());
-        QVERIFY(progressed > 0);
+        bool partway = false;  // (progress reported between the start and the end)
+        QVERIFY2(separateStemsToFiles(path("film.wav"), 0, 13, {}, 3, outs, [&](double f) { partway = partway || (f > 0.2 && f < 0.8); }, nullptr, &err),
+                 err.c_str());
+        QVERIFY(partway);
         std::vector<double> mixed(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) mixed[size_t(i)] = mono[size_t(i)] * std::sqrt(0.5);
         const double gain[3] = {12, 20, 20};  // dB better than the mix, at least
@@ -20036,6 +20114,27 @@ if ui["pressed"] == "add":
             const double end = sdr(parts[k], left, size_t(10 * sr), size_t(n));  // the last chunk's own
             qInfo("%s: %.1f dB (the mix %.1f), from 10 s %.1f dB", stemNames(3)[size_t(k)].c_str(), got, was, end);
             QVERIFY2(got > was + gain[k] && end > was + gain[k] - 6, qPrintable(QStringLiteral("%1: %2 %3").arg(k).arg(got).arg(end)));
+        }
+        // Cancelled partway through a chunk: it stops then, not when the chunk is done, and leaves nothing behind.
+        {
+            std::atomic<bool> stop{false};
+            std::atomic<qint64> cancelledAt{0};
+            QElapsedTimer clock;
+            clock.start();
+            std::thread later([&] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+                cancelledAt = clock.elapsed();
+                stop = true;
+            });
+            std::vector<std::string> dropped;
+            for (const std::string& name : stemNames(3)) dropped.push_back(path(("cancelled-" + name + ".wav").c_str()));
+            QVERIFY(!separateStemsToFiles(path("film.wav"), 0, 0, {}, 3, dropped, {}, &stop, &err));
+            const qint64 took = clock.elapsed() - cancelledAt;
+            later.join();
+            QCOMPARE(err, std::string("Cancelled"));
+            qInfo("stopped %lld ms after the cancel", took);
+            QVERIFY2(took < 5000, qPrintable(QString::number(took)));  // (a chunk takes 10 s or more)
+            for (const std::string& d : dropped) QVERIFY(!QFile::exists(QString::fromStdString(d)));
         }
         // A stereo recording shorter than a chunk (looped to fill one): each channel separated on its own.
         {

@@ -5653,8 +5653,8 @@ void McpServer::Impl::addTools() {
         "Split the sound of audio clips into stems, on this computer. Music with Spleeter (Deezer Research): 4 (vocals, "
         "drums, bass, other), 5 (vocals, piano, drums, bass, other) or 2 (vocals, accompaniment), as 44.1 kHz WAVs. A "
         "film's finished mix with Bandit v2 (Watcharasupat, Wu and Lerch; CC BY-SA 4.0): 3 (dialogue, music, effects), as "
-        "48 kHz WAVs whose clips get the Dialogue, Music and Effects roles, so montage_export stems roles writes the "
-        "dialogue and an M&E; dialogue is the cleanest, music and effects less exact on real film mixes. Each stem is in "
+        "48 kHz WAVs whose clips get the Dialogue, Music and Effects roles, so montage_export audio_streams dme puts the "
+        "dialogue and an M&E in a master; dialogue is the cleanest, music and effects less exact on real film mixes. Each stem is in "
         "the Stems folder beside the project, separated from the source the clip plays plus handles seconds either side, "
         "and played by a copy of the clip (timing, speed, volume, pan) on an audio track named for the stem (Vocals, "
         "Dialogue...; reused where free, else added), linked with the clip. The clip itself is disabled unless "
@@ -7417,7 +7417,7 @@ void McpServer::Impl::addTools() {
             "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask): CEA-608 and CTA-708 service 1"},
             "cea708":{"type":"boolean","default":true,"description":"With cea608: the CTA-708 service beside the 608 bytes"},
             "all_captions":{"type":"boolean","default":false,"description":"With embed: every caption track as its own subtitle stream, language tagged"},
-            "audio_streams":{"description":"More audio streams after the mix (a master's M&E, dialogue, dubs): \"roles\" (one per role), \"tracks\" (one per track), \"dme\" (the Dialogue role, then an M&E of Music and Effects), or a list of {name, language, tracks:[\"A2\",...], role (several joined by +, as Music+Effects)}",
+            "audio_streams":{"description":"More audio streams after the mix (a master's M&E, dialogue, dubs): \"roles\" (one per role), \"tracks\" (one per track), \"dme\" (the Dialogue role, then an M&E of Music and Effects; each left out when none of its roles is heard), or a list of {name, language, tracks:[\"A2\",...], role (several joined by +, as Music+Effects)}",
                 "anyOf":[{"type":"string","enum":["mix","roles","tracks","dme"]},{"type":"array","items":{"type":"object","properties":{
                     "name":{"type":"string"},"language":{"type":"string"},"tracks":{"type":"array","items":{"type":"string"}},"role":{"type":"string"}}}}]},
             "audio_name":{"type":"string","description":"The mix stream's title"},"audio_language":{"type":"string","description":"The mix stream's language (ISO 639-1)"},
@@ -7502,6 +7502,7 @@ void McpServer::Impl::addTools() {
                 const QString kind = streams.toString();
                 if (kind != "roles" && kind != "tracks" && kind != "dme") throw ArgError{"\"audio_streams\" is mix, roles, tracks, dme or a list"};
                 st.extraAudio = stemStreams(s, kind == "roles" ? StemsByRole : kind == "dme" ? StemsDialogueAndME : StemsByTrack);
+                if (kind == "dme" && st.extraAudio.empty()) return fail("No clip heard has the Dialogue, Music or Effects role (montage_set_roles)");
             } else if (streams.isArray()) {
                 for (const QJsonValue& v : streams.toArray()) {
                     const QJsonObject o = v.toObject();

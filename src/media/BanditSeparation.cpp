@@ -4,7 +4,9 @@
 #include <QString>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <complex>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 
@@ -58,7 +60,9 @@ std::unique_ptr<BanditSplitter> BanditSplitter::create(StemSplitter::Output, std
 }
 bool BanditSplitter::push(const float*, size_t, std::string*) { return false; }
 bool BanditSplitter::finish(std::string*) { return false; }
+std::unique_ptr<BanditSplitter> BanditSplitter::createWithMasks(StemSplitter::Output, Masks) { return nullptr; }
 int64_t BanditSplitter::done() const { return 0; }
+void BanditSplitter::setCancel(const std::atomic<bool>*) {}
 
 #else
 
@@ -123,6 +127,7 @@ std::shared_ptr<Model> loadModel(std::string* error) {
 
 struct BanditSplitter::Impl {
     std::shared_ptr<Model> model;
+    Masks masker;  // (instead of the model)
     StemSplitter::Output write;
     std::vector<float> window, fadeIn, envelope;
     float norm = 1;          // the spectrogram's normalisation (the window's energy, square-rooted)
@@ -134,6 +139,7 @@ struct BanditSplitter::Impl {
     int64_t outBase = 0;
     int64_t emitted = 0;
     bool stopped = false;
+    const std::atomic<bool>* cancel = nullptr;
 
     // `last`: no chunk follows, so this one is heard at full weight to its end.
     bool separateChunk(bool last, std::string* error);
@@ -146,9 +152,15 @@ BanditSplitter::~BanditSplitter() = default;
 std::unique_ptr<BanditSplitter> BanditSplitter::create(StemSplitter::Output write, std::string* error) {
     auto model = loadModel(error);
     if (!model) return nullptr;
+    auto s = createWithMasks(std::move(write), {});
+    s->d_->model = model;
+    return s;
+}
+
+std::unique_ptr<BanditSplitter> BanditSplitter::createWithMasks(StemSplitter::Output write, Masks masks) {
     std::unique_ptr<BanditSplitter> s(new BanditSplitter());
     Impl& d = *s->d_;
-    d.model = model;
+    d.masker = std::move(masks);
     d.write = std::move(write);
     // Periodic Hann windows, as torch.hann_window makes them.
     d.window.resize(kN);
@@ -169,6 +181,7 @@ std::unique_ptr<BanditSplitter> BanditSplitter::create(StemSplitter::Output writ
 }
 
 int64_t BanditSplitter::done() const { return d_->emitted; }
+void BanditSplitter::setCancel(const std::atomic<bool>* cancel) { d_->cancel = cancel; }
 
 bool BanditSplitter::Impl::handOut(int64_t upTo) {
     if (upTo <= emitted) return true;
@@ -221,15 +234,50 @@ bool BanditSplitter::Impl::separateChunk(bool last, std::string* error) {
         }
     }
     // The masks [2, S, T, F, 2].
+    const size_t want = size_t(channels) * kStems * kFrames * kBins * 2;
     std::vector<float> masks;
-    try {
+    if (masker) {
+        masks.assign(want, 0.0f);
+        masker(channels, spec.data(), masks.data());
+    } else try {
         Ort::MemoryInfo cpu = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
         const int64_t shape[4] = {channels, kFrames, kBins, 2};
         Ort::Value input = Ort::Value::CreateTensor<float>(cpu, spec.data(), spec.size(), shape, 4);
         const char* inName = "spectrogram";
         const char* outName = "masks";
-        auto result = model->session->Run(Ort::RunOptions{nullptr}, &inName, &input, 1, &outName, 1);
-        const size_t want = size_t(channels) * kStems * kFrames * kBins * 2;
+        // A chunk takes seconds: a cancel stops it partway (ONNX Runtime ends the run with an error).
+        Ort::RunOptions options;
+        std::mutex guard;
+        std::condition_variable wake;
+        bool ran = false;
+        std::thread watch;
+        if (cancel)
+            watch = std::thread([&] {
+                std::unique_lock lock(guard);
+                while (!ran && !cancel->load()) wake.wait_for(lock, std::chrono::milliseconds(50));
+                if (!ran) options.SetTerminate();
+            });
+        auto finished = [&] {
+            if (!watch.joinable()) return;
+            {
+                std::lock_guard lock(guard);
+                ran = true;
+            }
+            wake.notify_one();
+            watch.join();
+        };
+        std::vector<Ort::Value> result;
+        try {
+            result = model->session->Run(options, &inName, &input, 1, &outName, 1);
+        } catch (...) {
+            finished();
+            if (cancel && cancel->load()) {
+                if (error) *error = "Cancelled";
+                return false;
+            }
+            throw;
+        }
+        finished();
         if (result.empty() || result[0].GetTensorTypeAndShapeInfo().GetElementCount() != want) {
             if (error) *error = "The separation model gave masks of the wrong size";
             return false;

@@ -47,6 +47,8 @@ public:
     bool finish(std::string* error = nullptr);
     // Frames of input separated so far.
     int64_t done() const;
+    // A flag that, once set, stops the separation partway through a chunk too (push or finish then fail).
+    void setCancel(const std::atomic<bool>* cancel);
 
     struct Impl;
 

@@ -190,6 +190,7 @@ int StemSplitter::stems() const { return 0; }
 bool StemSplitter::push(const float*, size_t, std::string*) { return false; }
 bool StemSplitter::finish(std::string*) { return false; }
 int64_t StemSplitter::done() const { return 0; }
+void StemSplitter::setCancel(const std::atomic<bool>*) {}
 
 #else
 
@@ -293,6 +294,9 @@ std::unique_ptr<StemSplitter> StemSplitter::create(int stems, Output write, std:
 }
 
 int StemSplitter::stems() const { return d_->stems; }
+void StemSplitter::setCancel(const std::atomic<bool>* cancel) {
+    if (d_->bandit) d_->bandit->setCancel(cancel);  // (Spleeter's segments take a moment each: between them is enough)
+}
 int64_t StemSplitter::done() const { return d_->bandit ? d_->bandit->done() : std::max<int64_t>(0, d_->emitted - kN); }
 
 bool StemSplitter::Impl::handOut(int64_t upTo) {
@@ -492,6 +496,7 @@ bool separateStemsToFiles(const std::string& path, double from, double to, const
         removeAll();
         return false;
     }
+    splitter->setCancel(cancel);
     const int64_t a = std::max<int64_t>(0, int64_t(std::llround(from * rate)));
     const int64_t b = to > 0 ? std::max(a, int64_t(std::llround(to * rate))) : -1;
     int64_t at = a;  // the media frame the next block starts at
