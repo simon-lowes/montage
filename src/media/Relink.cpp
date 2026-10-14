@@ -65,6 +65,8 @@ void takeDetails(MediaItem& m, const MediaItem& n, bool replace) {
     if (!m.subclipOf) m.duration = n.duration;
     if (replace) {
         m.timecode = n.timecode;
+        m.ltcChannel = -1;  // another recording: its LTC is not read yet
+        m.ltcTimecode = m.fileTimecode = -1;
         m.created = n.created;
         m.proxyPath.clear();
         m.transcript.reset();

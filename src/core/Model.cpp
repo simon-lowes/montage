@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "AudioChannels.h"
 #include "Effects.h"
 
 namespace montage {
@@ -304,7 +305,7 @@ Clip makeClip(Project& p, const MediaItem& media, TrackKind kind, const Sequence
     c.motion = makeEffect(p, "transform");
     c.audio = makeEffect(p, "volume");
     c.timing = makeEffect(p, "time");
-    (void)kind;
+    if (kind == TrackKind::Audio) c.channels = newClipChannels(media);
     return c;
 }
 

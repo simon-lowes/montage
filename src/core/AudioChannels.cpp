@@ -35,6 +35,21 @@ std::vector<std::string> sourceChannelNames(const MediaItem& m) {
     return names;
 }
 
+std::vector<int> mixedChannels(const MediaItem& m) {
+    const int n = sourceChannelCount(m);
+    std::vector<int> out(size_t(m.audioStreams.size() > 1 ? std::min(n, m.audioStreams[0]) : n));
+    std::iota(out.begin(), out.end(), 0);
+    return out;
+}
+
+std::vector<int> newClipChannels(const MediaItem& m) {
+    if (m.ltcChannel < 0) return {};
+    std::vector<int> out = mixedChannels(m);
+    if (out.size() < 2 || std::find(out.begin(), out.end(), m.ltcChannel) == out.end()) return {};
+    std::erase(out, m.ltcChannel);
+    return out;
+}
+
 std::string channelsLabel(const MediaItem& m, const std::vector<int>& channels) {
     if (channels.empty()) return {};
     const std::vector<std::string> names = sourceChannelNames(m);

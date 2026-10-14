@@ -1609,7 +1609,50 @@ bool decodeAudioStream(const std::string& path, int sampleRate, int ordinal, std
     return true;
 }
 
+// The channels in each audio stream, in file order.
+bool audioStreamChannels(const std::string& path, std::vector<int>& streams, std::string* error) {
+    streams.clear();
+    if (MlvInfo mi; isMlvPath(uninterpretedPath(path))) {
+        if (!readMlvInfo(uninterpretedPath(path), mi, error)) return false;
+        if (mi.hasAudio) streams.push_back(mi.channels);
+        return true;
+    }
+    AVFormatContext* fmt = nullptr;
+    if (int rc = openMediaInput(&fmt, path); rc < 0) {
+        if (error) *error = averr(rc);
+        return false;
+    }
+    if (avformat_find_stream_info(fmt, nullptr) >= 0)
+        for (unsigned i = 0; i < fmt->nb_streams; ++i)
+            if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+                streams.push_back(std::max(1, fmt->streams[i]->codecpar->ch_layout.nb_channels));
+    avformat_close_input(&fmt);
+    return true;
+}
+
 }  // namespace
+
+bool decodeSourceChannels(const std::string& path, int sampleRate, double seconds, std::vector<std::vector<float>>& out,
+                          std::string* error, const std::atomic<bool>* cancel) {
+    out.clear();
+    std::vector<int> streams;
+    if (!audioStreamChannels(path, streams, error)) return false;
+    const size_t want = size_t(std::max(0.0, seconds) * sampleRate);
+    for (int s = 0; s < int(streams.size()); ++s) {
+        std::vector<float> samples;
+        int count = 0;
+        const std::function<bool(std::vector<float>&, bool)> enough = [&](std::vector<float>& got, bool) {
+            return got.size() / size_t(std::max(1, count)) < want;
+        };
+        if (!decodeAudioStream(path, sampleRate, s, samples, count, error, cancel, nullptr, &enough)) return false;
+        const size_t n = std::min(want, samples.size() / size_t(std::max(1, count)));
+        for (int c = 0; c < count; ++c) {
+            std::vector<float>& ch = out.emplace_back(n);
+            for (size_t i = 0; i < n; ++i) ch[i] = samples[i * size_t(count) + size_t(c)];
+        }
+    }
+    return true;
+}
 
 bool decodeAudioBlocks(const std::string& path, int sampleRate, size_t block, const std::function<bool(const std::vector<float>& mono)>& sink,
                        std::string* error, const std::atomic<bool>* cancel) {
@@ -1818,21 +1861,7 @@ AudioBufferPtr decodeAudio(const std::string& path, int sampleRate, std::string*
     }
     // Chosen channels: each audio stream they come from, decoded with its own channels, then routed to stereo.
     std::vector<int> streams;  // channels per audio stream
-    if (MlvInfo mi; isMlvPath(uninterpretedPath(path))) {
-        if (!readMlvInfo(uninterpretedPath(path), mi, error)) return nullptr;
-        if (mi.hasAudio) streams.push_back(mi.channels);
-    } else {
-        AVFormatContext* fmt = nullptr;
-        if (int rc = openMediaInput(&fmt, path); rc < 0) {
-            if (error) *error = averr(rc);
-            return nullptr;
-        }
-        if (avformat_find_stream_info(fmt, nullptr) >= 0)
-            for (unsigned i = 0; i < fmt->nb_streams; ++i)
-                if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
-                    streams.push_back(std::max(1, fmt->streams[i]->codecpar->ch_layout.nb_channels));
-        avformat_close_input(&fmt);
-    }
+    if (!audioStreamChannels(path, streams, error)) return nullptr;
     std::map<int, std::pair<std::vector<float>, int>> decoded;  // stream ordinal -> samples, channels
     auto locate = [&](int ch, int& stream, int& local) {
         for (stream = 0; stream < int(streams.size()); ++stream) {

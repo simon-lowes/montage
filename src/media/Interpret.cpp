@@ -142,6 +142,9 @@ Result interpretFootage(Project& p, Id media, Interpretation i) {
             sub.fps = m->fps;
             sub.duration = sub.subclipOut - sub.subclipIn;
             if (m->timecode >= 0) sub.timecode = m->timecode + sub.subclipIn;
+            sub.ltcTimecode = m->ltcTimecode >= 0 ? m->ltcTimecode + sub.subclipIn : -1;
+            sub.fileTimecode = m->fileTimecode >= 0 ? m->fileTimecode + sub.subclipIn : -1;
+            sub.ltcChannel = m->ltcChannel;
         }
     }
     return {};

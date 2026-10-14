@@ -86,6 +86,7 @@ add_library(montage_engine STATIC
   media/SoundSearch.h media/SoundSearch.cpp
   media/StemSeparation.h media/StemSeparation.cpp
   media/BanditSeparation.h media/BanditSeparation.cpp
+  media/LtcTimecode.h media/LtcTimecode.cpp
   media/Inpaint.h media/Inpaint.cpp
   media/ValueMap.h
   media/Rife.h media/Rife.cpp
@@ -199,6 +200,7 @@ add_library(montage_engine STATIC
   audio/PluginEffect.h audio/PluginEffect.cpp
   audio/SpeechCleanup.h audio/SpeechCleanup.cpp
   audio/RoomResponse.h audio/RoomResponse.cpp
+  audio/Ltc.h audio/Ltc.cpp
   audio/AudioRepair.h audio/AudioRepair.cpp
   audio/SpectralRepair.h audio/SpectralRepair.cpp
   audio/TimeStretch.h audio/TimeStretch.cpp

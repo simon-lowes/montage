@@ -211,7 +211,8 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
             m.visual.reset();
             m.sounds.reset();
             m.faces.reset();
-            if (m.timecode >= 0) m.timecode += from;
+            for (double* tc : {&m.timecode, &m.ltcTimecode, &m.fileTimecode})
+                if (*tc >= 0) *tc += from;
             // What was said, moved to the new file's time.
             if (m.transcript) {
                 auto shifted = std::make_shared<Transcript>(*m.transcript);

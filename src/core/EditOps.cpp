@@ -333,6 +333,7 @@ Result placeMedia(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcI
         Clip a = base;
         a.id = p.newId();
         a.linkGroup = group;
+        a.channels = newClipChannels(*m);
         Result r = overwrite(p, s, audioTrack, a);
         res.created.insert(res.created.end(), r.created.begin(), r.created.end());
         // Media set to take its channels apart: a clip per channel or pair, on the tracks below.

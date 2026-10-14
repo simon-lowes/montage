@@ -4,6 +4,7 @@
 #include <QString>
 #include <QStringList>
 #include <algorithm>
+#include <cstdio>
 #include <cmath>
 #include <iterator>
 #include <set>
@@ -364,7 +365,8 @@ std::optional<MediaItem> makeSubclip(const Project& p, Id media, double in, doub
     m.duration = out - in;
     m.rating = 0;
     m.bin = src->bin;
-    if (base->timecode >= 0) m.timecode = base->timecode + in;
+    for (double* tc : {&m.timecode, &m.ltcTimecode, &m.fileTimecode})
+        if (*tc >= 0) *tc += in;
     if (name.empty()) {
         int n = 1;
         for (const MediaItem& o : p.media) n += o.subclipOf == base->id;
@@ -430,7 +432,13 @@ std::string mediaFieldText(const MediaItem& m, const std::string& key, const std
     if (key == "height") return m.hasVideo && m.height > 0 ? std::to_string(m.height) : "";
     if (key == "fps") return m.hasVideo && m.fps.valid() && m.kind != MediaKind::Image ? fmtNumber(m.fps.toDouble(), 3) : "";
     if (key == "timecode") {
-        if (m.timecode < 0 || !m.fps.valid()) return "";
+        if (m.timecode < 0) return "";
+        // Sound files at the rate their recorder or their LTC gives ("30000/1001 DF").
+        auto it = m.metadata.find("timecode_rate");
+        Rational rate{0, 1};
+        if (!m.hasVideo && it != m.metadata.end() && std::sscanf(it->second.c_str(), "%d/%d", &rate.num, &rate.den) == 2 && rate.valid())
+            return formatTimecode(FrameTime(std::llround(m.timecode * rate.toDouble())), rate, it->second.find("DF") != std::string::npos);
+        if (!m.fps.valid()) return "";
         return formatTimecode(FrameTime(std::llround(m.timecode * m.fps.toDouble())), m.fps);
     }
     if (key == "videoCodec") return m.hasVideo ? m.videoCodec : "";

@@ -29,6 +29,7 @@
 #include "core/ProjectIO.h"
 #include "core/Provenance.h"
 #include "core/Transcript.h"
+#include "media/LtcTimecode.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
 #include "media/Analysis.h"
@@ -124,6 +125,8 @@ int usage() {
                  "  montage-cli shots <project.montage> \"a red car at night\" [--max N]   (find shots by description)\n"
                  "  montage-cli sounds <project.montage> \"applause\" [--max N]   (find sounds by description)\n"
                  "  montage-cli people <project.montage> [--person NAME|ID]   (who is in the footage, and where)\n"
+                 "  montage-cli ltc <file> [--seconds 30]   (the LTC timecode recorded on a sound channel)\n"
+                 "  montage-cli ltc -o ltc.wav --start 01:00:00:00 --duration S [--fps 25] [--rate 48000]   (write LTC)\n"
                  "  montage-cli stems <file> [--stems 2|3|4|5] [--from S] [--to S] [-o folder]   (vocals, drums... or dialogue, music, effects as WAVs)\n"
                  "  montage-cli speak \"text\" -o voice.wav [--voice af_heart] [--speed 1]   (a voiceover from text; --phonemes prints them)\n"
                  "  montage-cli clone-speech \"text\" --voice sample.wav -o out.wav --consent [--language en] [--from S] [--to S]\n"
@@ -656,6 +659,52 @@ int cmdLoudness(const std::vector<std::string>& args) {
     if (!r.valid) std::printf("Integrated: silent (below -70 LUFS)\n");
     else std::printf("Integrated: %.1f LUFS\n", r.integrated);
     std::printf("Peak:       %.1f dBFS\n", r.truePeakDb);
+    return 0;
+}
+
+// montage-cli ltc <file> [--seconds N] | ltc -o out.wav --start TC --duration S [--fps R] [--rate HZ]
+int cmdLtc(const std::vector<std::string>& args) {
+    std::string in, out, start = "00:00:00:00";
+    double seconds = 30, duration = 0;
+    Rational fps{25, 1};
+    int rate = 48000;
+    for (size_t i = 0; i < args.size(); ++i) {
+        const bool more = i + 1 < args.size();
+        if (args[i] == "-o" && more) out = args[++i];
+        else if (args[i] == "--seconds" && more) seconds = std::atof(args[++i].c_str());
+        else if (args[i] == "--start" && more) start = args[++i];
+        else if (args[i] == "--duration" && more) duration = std::atof(args[++i].c_str());
+        else if (args[i] == "--rate" && more) rate = std::atoi(args[++i].c_str());
+        else if (args[i] == "--fps" && more) {
+            if (!parseFps(args[++i], fps)) return usage();
+        } else if (in.empty() && args[i][0] != '-') in = args[i];
+        else return usage();
+    }
+    std::string err;
+    if (!out.empty()) {
+        Rational ltc;
+        int per = 1;
+        FrameTime first = 0;
+        if (!ltcRateFor(fps, ltc, per) || per != 1 || duration <= 0 || rate < 8000 || !parseTimecode(start, ltc, first)) return usage();
+        const bool drop = ltc.den != 1 && std::lround(ltc.toDouble()) == 30;
+        if (!writeLtcWav(out, first, int64_t(std::ceil(duration * ltc.toDouble())), ltc, drop, rate, &err)) {
+            std::fprintf(stderr, "error: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("Wrote %s: LTC from %s at %d/%d%s\n", out.c_str(), formatTimecode(first, ltc, drop).c_str(), ltc.num, ltc.den, drop ? " drop frame" : "");
+        return 0;
+    }
+    if (in.empty()) return usage();
+    LtcReading r;
+    if (!readLtc(in, r, &err, std::max(1.0, seconds))) {
+        std::fprintf(stderr, "error: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf("Channel:    %d\n", r.channel + 1);
+    std::printf("Rate:       %d/%d%s\n", r.fps.num, r.fps.den, r.dropFrame ? " drop frame" : "");
+    std::printf("File start: %s\n", r.startLabel().c_str());
+    std::printf("First word: %s at %.3f s (%d words in step)\n", r.label.c_str(), r.at, r.words);
+    if (std::fabs(r.speed - 1) > 1e-4) std::printf("Speed:      %.5f of the sound's clock\n", r.speed);
     return 0;
 }
 
@@ -1690,6 +1739,7 @@ int main(int argc, char** argv) {
     if (cmd == "shots") return cmdShots(args);
     if (cmd == "sounds") return cmdSounds(args);
     if (cmd == "stems") return cmdStems(args);
+    if (cmd == "ltc") return cmdLtc(args);
     if (cmd == "people") return cmdPeople(args);
     if (cmd == "speak") return cmdSpeak(args);
     if (cmd == "clone-speech") return cmdCloneSpeech(args);

@@ -117,6 +117,8 @@
 #include "render/VideoDenoise.h"
 #include "render/DialogueMatch.h"
 #include "render/RoomTone.h"
+#include "audio/Ltc.h"
+#include "media/LtcTimecode.h"
 #include "render/VoiceMatch.h"
 #include "media/Segmenter.h"
 #include "media/Translator.h"
@@ -21078,6 +21080,233 @@ if ui["pressed"] == "add":
         const Clip* matched = edit::clipById(*back.active(), thinClip);
         QVERIFY(matched && !matched->effects.empty() && matched->effects[0].s("match") == "voice");
         QVERIFY(std::fabs(matched->effects[0].p("b3_db", 0) + 6) < 2);
+    }
+
+    void ltcTimecode() {
+        // The codec: at each rate the words are read back, the start found to well under a sample, from LTC recorded
+        // loud or 26 dB down in noise, either way up, at 44.1, 48 and 96 kHz.
+        struct Case {
+            Rational fps;
+            bool drop;
+            int rate;
+            float gain, noise;
+        };
+        for (const Case& c : {Case{{25, 1}, false, 48000, 1, 0}, Case{{30000, 1001}, true, 48000, 0.1f, 0.01f},
+                              Case{{24000, 1001}, false, 44100, 1, 0.05f}, Case{{24, 1}, false, 48000, 1, 0},
+                              Case{{30, 1}, false, 96000, 1, 0}, Case{{30000, 1001}, false, 48000, 1, 0},
+                              Case{{25, 1}, false, 48000, -0.5f, 0.02f}}) {
+            const int base = int(std::lround(c.fps.toDouble()));
+            LtcFrame label{10, 59, 58, 3};
+            label.dropFrame = c.drop;
+            const int64_t first = ltcFrameNumber(label, base);
+            std::vector<float> x(size_t(0.3 * c.rate), 0.0f);  // 0.3 s before the timecode starts
+            const std::vector<float> ltc = encodeLtc(first, int64_t(5 * c.fps.toDouble()), c.fps, c.drop, c.rate, 0.5f, 0x12345678);
+            x.insert(x.end(), ltc.begin(), ltc.end());
+            std::mt19937 rng(1);
+            std::normal_distribution<float> n01;
+            for (float& v : x) v = v * c.gain + c.noise * n01(rng);
+            LtcReading r;
+            QVERIFY2(findLtc(x, c.rate, r), qPrintable(QStringLiteral("%1/%2").arg(c.fps.num).arg(c.fps.den)));
+            QCOMPARE(r.fps, c.fps);
+            QCOMPARE(r.dropFrame, c.drop);
+            QVERIFY2(std::fabs(r.start - (double(first) / c.fps.toDouble() - 0.3)) < 5e-6, qPrintable(QString::number(r.start, 'f', 7)));
+            QCOMPARE(r.userBits, 0x12345678u);
+            QVERIFY(r.words >= int(4.5 * c.fps.toDouble()));
+            QVERIFY(std::fabs(r.speed - 1) < 1e-5);
+        }
+        // Drop-frame labels: none skipped or repeated over a day, and the first of a minute that is not a tenth is 02.
+        for (int64_t n = 0; n < ltcFramesPerDay(30, true); n += 7) QCOMPARE(ltcFrameNumber(ltcFrameAt(n, 30, true), 30), n);
+        QCOMPARE(ltcLabel(ltcFrameAt(1800, 30, true)), std::string("00:01:00;02"));
+        QCOMPARE(ltcLabel(ltcFrameAt(17982, 30, true)), std::string("00:10:00;00"));
+        // Across midnight; a sound clock 0.1 % slow (a recorder at 48.048 kHz read as 48); LTC that drops out for 50 ms
+        // every second.
+        LtcReading r;
+        QVERIFY(findLtc(encodeLtc(ltcFrameNumber({23, 59, 58, 0}, 25), 125, {25, 1}, false, 48000), 48000, r));
+        QVERIFY(std::fabs(r.start - 86398) < 5e-6);
+        QVERIFY(findLtc(encodeLtc(1000, 500, {25, 1}, false, 48048), 48000, r));
+        QVERIFY(r.fps == Rational(25, 1) && std::fabs(r.speed - 0.999) < 1e-4);
+        {
+            std::vector<float> x = encodeLtc(1000, 250, {24, 1}, false, 48000);
+            for (size_t i = 0; i < x.size(); ++i)
+                if (i % 48000 < 2400) x[i] = 0;
+            QVERIFY(findLtc(x, 48000, r));
+            QVERIFY(std::fabs(r.start - 1000 / 24.0) < 5e-6 && r.words > 200);
+        }
+        // Noise and tones are not timecode.
+        {
+            std::mt19937 rng(2);
+            std::normal_distribution<float> n01;
+            std::vector<float> x(480000);
+            for (float& v : x) v = 0.3f * n01(rng);
+            QVERIFY(!findLtc(x, 48000, r));
+            for (double hz : {1000.0, 1200.0, 2400.0}) {
+                for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.5 * std::sin(2 * M_PI * hz * double(i) / 48000));
+                QVERIFY(!findLtc(x, 48000, r));
+            }
+        }
+
+        // Files: a camera whose own timecode is 01:00:00:00 recording a lockit's LTC (from 14:03:22:00, 25 fps) on its
+        // right channel, compressed to AAC; a field recorder with the same LTC on its first channel from two seconds
+        // earlier.
+        const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg");
+        if (ffmpeg.isEmpty()) QSKIP("Needs the ffmpeg program");
+        constexpr int sr = 48000;
+        auto twoChannels = [&](const std::vector<float>& left, const std::vector<float>& right) {
+            std::vector<float> st(std::min(left.size(), right.size()) * 2);
+            for (size_t i = 0; i < st.size() / 2; ++i) st[i * 2] = left[i], st[i * 2 + 1] = right[i];
+            return st;
+        };
+        auto tone = [&](double hz, double seconds) {
+            std::vector<float> t(size_t(seconds * sr));
+            for (size_t i = 0; i < t.size(); ++i) t[i] = float(0.3 * std::sin(2 * M_PI * hz * double(i) / sr));
+            return t;
+        };
+        const int64_t camFirst = ltcFrameNumber({14, 3, 22, 0}, 25), recFirst = ltcFrameNumber({14, 3, 20, 0}, 25);
+        const std::string camSound = path("ltc-camera-sound.wav"), cam = path("ltc-camera.mov"), rec = path("ltc-recorder.wav");
+        std::string err;
+        QVERIFY(writeStereoWav(camSound, twoChannels(tone(440, 8), encodeLtc(camFirst, 200, {25, 1}, false, sr)), sr, &err));
+        QVERIFY(writeStereoWav(rec, twoChannels(encodeLtc(recFirst, 300, {25, 1}, false, sr), tone(880, 12)), sr, &err));
+        {
+            QProcess run;
+            run.start(ffmpeg, {"-v", "error", "-y", "-f", "lavfi", "-i", "color=c=gray:s=64x36:r=25:d=8", "-i", QString::fromStdString(camSound),
+                               "-map", "0:v", "-map", "1:a", "-c:v", "mpeg4", "-c:a", "aac", "-b:a", "192k", "-timecode", "01:00:00:00",
+                               "-shortest", QString::fromStdString(cam)});
+            QVERIFY(run.waitForFinished(60000));
+            QVERIFY2(run.exitCode() == 0, run.readAllStandardError().constData());
+        }
+        LtcReading camLtc, recLtc;
+        QVERIFY2(readLtc(cam, camLtc, &err), err.c_str());
+        QVERIFY2(readLtc(rec, recLtc, &err), err.c_str());
+        QCOMPARE(camLtc.channel, 1);
+        QCOMPARE(recLtc.channel, 0);
+        QCOMPARE(camLtc.fps, Rational(25, 1));
+        QVERIFY2(std::fabs(camLtc.start - 50602) < 5e-4, qPrintable(QString::number(camLtc.start, 'f', 6)));  // through AAC
+        QVERIFY2(std::fabs(recLtc.start - 50600) < 1e-5, qPrintable(QString::number(recLtc.start, 'f', 6)));
+        QCOMPARE(camLtc.startLabel(), std::string("14:03:22:00"));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        MediaItem camItem = probeOrFail(p, cam), recItem = probeOrFail(p, rec);
+        QCOMPARE(camItem.timecode, 3600.0);
+        p.media.push_back(camItem);
+        p.media.push_back(recItem);
+        QVERIFY(edit::placeMedia(p, s, camItem.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(s.audioTracks[0].clips[0].channels.empty());
+        // Taking the LTC: the camera's timecode is the lockit's (its own kept), shown at its frames; the sound file's at
+        // the LTC's rate.
+        useLtcTimecode(p, camItem.id, camLtc);
+        useLtcTimecode(p, recItem.id, recLtc);
+        const MediaItem* cm = p.findMedia(camItem.id);
+        const MediaItem* rm = p.findMedia(recItem.id);
+        QVERIFY(usesLtcTimecode(*cm) && usesLtcTimecode(*rm));
+        QCOMPARE(cm->fileTimecode, 3600.0);
+        QCOMPARE(cm->ltcChannel, 1);
+        QCOMPARE(mediaFieldText(*cm, "timecode", nullptr), std::string("14:03:22:00"));
+        QCOMPARE(mediaFieldText(*rm, "timecode", nullptr), std::string("14:03:20:00"));
+        // The clip already cut stops playing the LTC; new clips leave it out; what they play has no timecode in it.
+        QCOMPARE(s.audioTracks[0].clips[0].channels, std::vector<int>{0});
+        QVERIFY(edit::placeMedia(p, s, camItem.id, 300, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QCOMPARE(s.audioTracks[0].clips[1].channels, std::vector<int>{0});
+        {
+            AudioBufferPtr played = decodeAudio(cam, sr, &err, nullptr, s.audioTracks[0].clips[0].channels);
+            QVERIFY(played);
+            std::vector<float> right(size_t(played->frames()));
+            for (size_t i = 0; i < right.size(); ++i) right[i] = played->samples[i * 2 + 1];
+            QVERIFY(!findLtc(right, sr, r));
+        }
+        // Synced by it: the recording started two seconds before the picture.
+        const auto pairs = matchByTimecode(p, {camItem.id}, {recItem.id});
+        QCOMPARE(pairs.size(), size_t(1));
+        QVERIFY2(std::fabs(pairs[0].offset + 2) < 5e-4, qPrintable(QString::number(pairs[0].offset, 'f', 6)));
+        // A subclip keeps its place in the LTC; saved and loaded, all of it stays.
+        const std::optional<MediaItem> sub = makeSubclip(p, camItem.id, 1.0, 3.0, "sub");
+        QVERIFY(sub && std::fabs(sub->timecode - 50603) < 5e-4 && usesLtcTimecode(*sub) && sub->ltcChannel == 1);
+        const std::string saved = path("ltc.montage");
+        QVERIFY(saveProject(p, saved));
+        Project back;
+        QVERIFY(loadProject(saved, back));
+        QVERIFY(*back.findMedia(camItem.id) == *cm);
+        // Back to the file's own.
+        QVERIFY(useFileTimecode(p, camItem.id));
+        QCOMPARE(p.findMedia(camItem.id)->timecode, 3600.0);
+        QVERIFY(!usesLtcTimecode(*p.findMedia(camItem.id)) && !useFileTimecode(p, camItem.id));
+        // The default mix plays the first audio stream: LTC in another stream is left alone, in it taken out. A camera
+        // set to a clip per channel gets none for the LTC.
+        {
+            MediaItem mxf;
+            mxf.kind = MediaKind::Video;
+            mxf.hasAudio = true;
+            mxf.channels = 1;
+            mxf.audioStreams = {1, 1, 1, 1};
+            mxf.ltcChannel = 3;
+            QVERIFY(newClipChannels(mxf).empty());
+            mxf.audioStreams = {2, 2};
+            mxf.ltcChannel = 0;
+            QCOMPARE(newClipChannels(mxf), std::vector<int>{1});
+            p.findMedia(camItem.id)->audioChannelMode = kChannelsMono;
+            const size_t clips = s.audioTracks[0].clips.size();
+            QVERIFY(edit::placeMedia(p, s, camItem.id, 600, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            QCOMPARE(s.audioTracks[0].clips.size(), clips + 1);
+            QVERIFY(s.audioTracks.size() == 1 || s.audioTracks[1].clips.empty());
+            QCOMPARE(s.audioTracks[0].clips.back().channels, std::vector<int>{0});
+        }
+
+        // Writing a sequence's LTC: 29.97 drop frame from frame 100, and at 50 fps a word every two frames.
+        for (const Rational fps : {Rational{30000, 1001}, Rational{50, 1}}) {
+            const std::string out = path("ltc-seq.wav");
+            QVERIFY2(writeSequenceLtc(out, fps, 100, 400, sr, &err), err.c_str());
+            QVERIFY2(readLtc(out, r, &err), err.c_str());
+            QCOMPARE(r.dropFrame, fps.num == 30000);
+            QVERIFY2(std::fabs(r.start - 100 / fps.toDouble()) < 1e-5, qPrintable(QString::number(r.start, 'f', 6)));
+        }
+        Rational ltcRate;
+        int per = 0;
+        QVERIFY(!ltcRateFor({15, 1}, ltcRate, per));
+
+        // Over MCP: read and apply, back to the file's, and the sequence's own LTC on a new muted track.
+        const QString project = QString::fromStdString(path("ltc-mcp.montage"));
+        {
+            Project q = makeDefaultProject();
+            MediaItem a = probeOrFail(q, cam), b = probeOrFail(q, rec);
+            q.media.push_back(a);
+            q.media.push_back(b);
+            QVERIFY(edit::placeMedia(q, *q.active(), a.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            QVERIFY(saveProject(q, project.toStdString()));
+            camItem.id = a.id, recItem.id = b.id;
+        }
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_ltc"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject res = call({{"project", project}, {"media", QJsonArray{double(camItem.id), double(recItem.id)}}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        const QJsonArray read = res.value("structuredContent").toObject().value("media").toArray();
+        QCOMPARE(read.at(0).toObject().value("channel").toInt(), 2);
+        QCOMPARE(read.at(0).toObject().value("start").toString(), QStringLiteral("14:03:22:00"));
+        QCOMPARE(read.at(1).toObject().value("fps").toString(), QStringLiteral("25/1"));
+        {
+            Project q;
+            QVERIFY(loadProject(project.toStdString(), q));
+            QVERIFY(usesLtcTimecode(*q.findMedia(camItem.id)) && q.active()->audioTracks[0].clips[0].channels == std::vector<int>{0});
+        }
+        res = call({{"project", project}, {"action", "file"}, {"media", QJsonArray{double(camItem.id)}}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        res = call({{"project", project}, {"action", "generate"}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        {
+            Project q;
+            QVERIFY(loadProject(project.toStdString(), q));
+            QCOMPARE(q.findMedia(camItem.id)->timecode, 3600.0);
+            const Track& t = q.active()->audioTracks.back();
+            QVERIFY(t.name == "LTC" && t.muted && t.clips.size() == 1 && t.clips[0].role == "Timecode");
+            QVERIFY2(readLtc(q.findMedia(t.clips[0].mediaId)->path, r, &err), err.c_str());
+            QVERIFY(std::fabs(r.start) < 1e-5 && r.fps == q.active()->fps);
+        }
+        QVERIFY(call({{"project", project}, {"media", QJsonArray{double(camItem.id)}}, {"seconds", 1}, {"action", "nope"}}).value("isError").toBool());
     }
 
     void roomResponse() {

@@ -89,6 +89,9 @@ public:
     // Log Slate from Picture: the scene, shot and take on a slate in the first seconds of each video read off its
     // picture (media/TextReader.h) into its metadata, one undo step. How many were logged.
     int logSlatesFromPicture(const std::vector<Id>& media);
+    // Timecode from LTC: the LTC recorded on a sound channel of each file (media/LtcTimecode.h) becomes its timecode,
+    // the LTC channel no longer played; one undo step. How many had LTC.
+    int timecodeFromLtc(const std::vector<Id>& media);
 
     // Logging, each one undo step.
     bool setRating(const std::vector<Id>& ids, int rating);

@@ -140,6 +140,11 @@ struct MediaItem {
     // from the file's stereo metadata or Interpret Footage; "" = a flat picture. Its size is one eye's, as shown.
     std::string stereo;
     double timecode = -1;       // start timecode in seconds (for multicam sync), -1 = none
+    // Timecode read from its sound (media/LtcTimecode.h): the channel carrying LTC, which new clips leave out (-1 =
+    // none); the start the LTC gives (seconds, -1 = not read); and, while `timecode` is that, the file's own (-1 = none).
+    int ltcChannel = -1;
+    double ltcTimecode = -1;
+    double fileTimecode = -1;
     // Speech-to-text of the media's audio (shared: undo snapshots copy the pointer).
     std::shared_ptr<const Transcript> transcript;
     // What the footage shows, for search by description (shared like the transcript).
