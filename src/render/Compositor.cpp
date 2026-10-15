@@ -32,6 +32,7 @@
 #include "Exporter.h"
 #include "GpuCompositor.h"
 #include "Processing.h"
+#include "Restoration.h"
 #include "Retime.h"
 #include "Shapes.h"
 #include "Title3D.h"
@@ -803,7 +804,8 @@ bool sourceStageLooks(const Clip& c, FrameTime lt, const ColorSpace& from, const
     if (from.sceneReferred)
         for (const Effect& e : c.effects) {
             if (!e.enabled || e.type == "video_denoise" || e.type == "super_scale" || e.type == "motion_deblur" ||
-                e.type == "reframe_360" || e.type == "redact_faces" || e.type == "stereo_3d")
+                e.type == "reframe_360" || e.type == "redact_faces" || e.type == "stereo_3d" || e.type == "dirt_removal" ||
+                e.type == "dust_spots")
                 continue;
             if (e.node != 0 || hasMask(e, lt)) break;
             if (e.type == "aces_gamut_compress" || sourceLookSpace(e)) return true;
@@ -964,6 +966,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 const ColorSpace& from = original ? mediaColorSpace(*m) : pictureColorSpace(*m, path);
                 if (!ofxFetch && !(sampling > 0 && m->kind == MediaKind::Video) && !denoiseEffect(seq, c) &&
                     !enabledEffect(seq, c, "motion_deblur") && !enabledEffect(seq, c, "motion_blur") && !enabledEffect(seq, c, "deflicker") &&
+                    !enabledEffect(seq, c, "dirt_removal") && !enabledEffect(seq, c, "dust_spots") &&
                     !upscale && !vr && !sourceStageLooks(c, lt, from, *m)) {
                     out.frame = f;
                     out.frameSpace = &from;
@@ -971,7 +974,8 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 }
             }
             src = toImage(*f);
-            Image decoded;  // the source frame itself, when src is an in-between
+            Image decoded;  // the source frame itself, when src is an in-between (and noise reduction needs it)
+            bool between = false;  // src is an in-between
             // Slow motion between two source frames: blend them or follow the motion.
             const int sampling = c.timing.empty() ? 0 : int(c.timing.p("sampling", lt, 0));
             if (sampling > 0 && m->kind == MediaKind::Video && m->fps.valid()) {
@@ -981,6 +985,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     Frame16Ptr fa = MediaPool::instance().videoFrame(path, (base + 0.25) / mf, w, h, o.highQuality);
                     Frame16Ptr fb = MediaPool::instance().videoFrame(path, next, w, h, o.highQuality);
                     if (fa && fb) {
+                        between = true;
                         if (denoiseEffect(seq, c)) decoded = src;
                         const Image a = toImage(*fa), b = toImage(*fb);
                         const std::string pair = path + '#' + std::to_string(int64_t(base)) + '@' + std::to_string(w) + 'x' + std::to_string(h);
@@ -991,6 +996,53 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                         else src = interpolateFrames(a, b, frac, pair);
                     }
                 }
+            }
+            // Dirt Removal and Dust Spot Removal (render/Restoration.h), each one on the clip in its order, from the source
+            // frames either side followed along the motion; before noise reduction, which would spread a speck into its
+            // neighbours. Whole source frames only: an in-between of slow motion is left as it is made.
+            std::vector<const Effect*> restore;
+            if (!between) {
+                if (c.grade.empty()) {
+                    for (const Effect& e : c.effects)
+                        if (e.enabled && (e.type == "dirt_removal" || e.type == "dust_spots")) restore.push_back(&e);
+                } else {
+                    for (const Effect* e : liveEffects(seq, c))
+                        if (e->type == "dirt_removal" || e->type == "dust_spots") restore.push_back(e);
+                }
+            }
+            std::erase_if(restore, [lt](const Effect* e) { return e->type == "dust_spots" && !hasDustSpotAt(e->s("spots"), lt); });
+            if (!restore.empty()) {
+                const double ps = effectPixelScale(c, lt, g.sx, mw, src.width);
+                Image prev, next;
+                bool hp = false, hn = false;
+                std::vector<MotionFn> motion(2);
+                if (m->kind == MediaKind::Video && m->fps.valid()) {
+                    const double mf = m->fps.toDouble();
+                    const int64_t base = int64_t(std::floor(sec * mf + 1e-6));
+                    auto fetch = [&](int64_t i, Image& into) {
+                        const double at = (double(i) + 0.25) / mf;
+                        if (at < 0 || at >= m->duration) return false;
+                        Frame16Ptr nf = MediaPool::instance().videoFrame(path, at, w, h, o.highQuality);
+                        if (nf) into = toImage(*nf);
+                        return bool(nf);
+                    };
+                    hp = fetch(base - 1, prev);
+                    hn = fetch(base + 1, next);
+                    const Image& self = src;
+                    motion = chainedMotion(path + '@' + std::to_string(w) + 'x' + std::to_string(h), base, {-1, 1},
+                                           [&](int64_t i) -> const Image* {
+                                               if (i == base) return &self;
+                                               if (i == base - 1) return hp ? &prev : nullptr;
+                                               if (i == base + 1) return hn ? &next : nullptr;
+                                               return nullptr;
+                                           });
+                    if (!hp) motion[0] = nullptr;
+                    if (!hn) motion[1] = nullptr;
+                }
+                const double at = m->kind == MediaKind::Video ? sec : -1;
+                for (const Effect* e : restore)
+                    (e->type == "dirt_removal" ? applyDirtRemoval : applyDustSpots)(*e, lt, src, hp ? &prev : nullptr, hn ? &next : nullptr,
+                                                                                    motion[0], motion[1], ps, at);
             }
             // Noise reduction, on the source frames with the frames either side (Resolve's temporal NR).
             if (const Effect* nr = denoiseEffect(seq, c)) {
@@ -1097,7 +1149,8 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (from.sceneReferred)
                 for (const Effect& e : c.effects) {
                     if (!e.enabled || e.type == "video_denoise" || e.type == "super_scale" || e.type == "motion_deblur" ||
-                        e.type == "reframe_360" || e.type == "redact_faces" || e.type == "stereo_3d")
+                        e.type == "reframe_360" || e.type == "redact_faces" || e.type == "stereo_3d" || e.type == "dirt_removal" ||
+                        e.type == "dust_spots")
                         continue;  // (off, or run at the source already)
                     if (e.node != 0 || hasMask(e, lt)) break;
                     if (e.type == "aces_gamut_compress" && !sourceRgc) {
@@ -1195,7 +1248,7 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
     for (const Effect* e : redactions) applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
     auto ranAlready = [&](const Effect& e) {
         return e.type == "video_denoise" || e.type == "super_scale" || e.type == "motion_deblur" || e.type == "reframe_360" || e.type == "redact_faces" ||
-               e.type == "stereo_3d" || &e == sourceCdl || &e == sourceRgc ||
+               e.type == "stereo_3d" || e.type == "dirt_removal" || e.type == "dust_spots" || &e == sourceCdl || &e == sourceRgc ||
                std::find(sourceLooks.begin(), sourceLooks.end(), &e) != sourceLooks.end();  // those ran already (Stereo 3D is placed below)
     };
     // A node graph (core/GradeGraph.h) runs where its first node's effect is in the stack (or after the clip's own
@@ -1624,7 +1677,7 @@ bool gpuChainOps(const Sequence& seq, const Clip& c, FrameTime lt, const std::fu
 // Effects finishClipLayer leaves alone, having run on the source (Redact Faces is not: it runs there).
 bool runOnSource(const Effect& e) {
     return e.type == "video_denoise" || e.type == "super_scale" || e.type == "motion_deblur" || e.type == "reframe_360" ||
-           e.type == "stereo_3d";
+           e.type == "stereo_3d" || e.type == "dirt_removal" || e.type == "dust_spots";
 }
 
 GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, gpu::Layer& out) {

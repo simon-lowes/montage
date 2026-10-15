@@ -168,6 +168,8 @@
 #include "core/AudioDescription.h"
 #include "core/Adr.h"
 #include "MaskOverlay.h"
+#include "PaintOverlay.h"
+#include "render/Restoration.h"
 #include "TransformOverlay.h"
 #include "render/ClipPlacement.h"
 #include "media/ImageSequence.h"
@@ -12432,6 +12434,139 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(std::fabs(pin.p("br_x", 10) - 1) < 1e-9);  // the others stay
         state()->undo();
         QVERIFY(std::fabs(edit::clipById(*state()->sequence(), red)->effects.back().p("tl_x", 10)) < 1e-9);
+        state()->setSelection({}, false);
+    }
+
+    void restorationPaintInProgramMonitor() {
+        loadDemo();
+        // A Paint effect on the red clip, armed from the Inspector, painted on the Program monitor.
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        Id paintId = 0;
+        QVERIFY(state()->edit("Paint", [red, &paintId](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "paint");
+            paintId = e.id;
+            edit::clipById(s, red)->effects.push_back(e);
+            return true;
+        }));
+        state()->setSelection({red}, false);
+        state()->setPlayhead(10);
+        const int64_t lt = 10 - clipNamed(*state()->sequence(), "Red")->start;
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        QTRY_VERIFY_WITH_TIMEOUT(!viewer->image().isNull(), 5000);
+        QVERIFY(viewer->findChild<PaintOverlay*>());
+        QPushButton* arm = nullptr;
+        QTRY_VERIFY((arm = win_->findChild<QPushButton*>(QStringLiteral("paintOnMonitor"))) != nullptr);
+        arm->click();
+        QCOMPARE(state()->paintEffect(), paintId);
+        const QRectF r = viewer->imageRect();
+        auto at = [&r](double u, double v) { return QPointF(r.left() + u * r.width(), r.top() + v * r.height()).toPoint(); };
+        auto fx = [&]() -> const Effect& { return *edit::ownedEffect(const_cast<Sequence&>(*state()->sequence()), red, paintId); };
+
+        // Alt-click picks where to copy from; a drag paints one stroke, one undo step.
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::AltModifier, at(0.2, 0.5));
+        QVERIFY(fx().s("strokes").empty());
+        QTest::mousePress(viewer, Qt::LeftButton, Qt::NoModifier, at(0.5, 0.5));
+        for (double u = 0.52; u <= 0.6001; u += 0.02) {
+            const QPointF to(at(u, 0.5));
+            QMouseEvent move(QEvent::MouseMove, to, viewer->mapToGlobal(to), Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(viewer, &move);
+        }
+        QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, at(0.6, 0.5));
+        std::vector<PaintStroke> strokes = paintStrokesFromString(fx().s("strokes"));
+        QCOMPARE(strokes.size(), size_t(1));
+        const PaintStroke& st = strokes[0];
+        QCOMPARE(st.frame, lt);
+        QVERIFY(!st.heal && !st.hold);
+        QVERIFY2(st.points.size() >= 3, qPrintable(QString::number(st.points.size())));
+        const double px = 1.0 / r.width();
+        QVERIFY(std::fabs(st.points.front()[0] - 0.5) < 2 * px && std::fabs(st.points.back()[0] - 0.6) < 2 * px);
+        QVERIFY2(std::fabs(st.dx + 0.3) < 2 * px && std::fabs(st.dy) < 2 * px, qPrintable(QString("%1 %2").arg(st.dx).arg(st.dy)));
+        QVERIFY(std::fabs(fx().p("source_x", lt) - st.dx) < 1e-5);  // later strokes keep the offset
+        QVERIFY(st.radius > 0.005 && st.radius < 0.1);
+        state()->undo();
+        QVERIFY(paintStrokesFromString(fx().s("strokes")).empty());
+        state()->redo();
+        QCOMPARE(paintStrokesFromString(fx().s("strokes")).size(), size_t(1));
+        // A second stroke without Alt keeps the offset; Clear This Frame takes both away.
+        QTest::mousePress(viewer, Qt::LeftButton, Qt::NoModifier, at(0.5, 0.7));
+        QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, at(0.55, 0.7));
+        strokes = paintStrokesFromString(fx().s("strokes"));
+        QCOMPARE(strokes.size(), size_t(2));
+        QVERIFY(std::fabs(strokes[1].dx - strokes[0].dx) < 1e-5);
+        QPushButton* clearFrame = nullptr;
+        QTRY_VERIFY((clearFrame = win_->findChild<QPushButton*>(QStringLiteral("paintClearFrame"))) != nullptr);
+        clearFrame->click();
+        QVERIFY(paintStrokesFromString(fx().s("strokes")).empty());
+        // Esc stops painting; the Inspector's button follows.
+        QTest::keyClick(viewer, Qt::Key_Escape);
+        QCOMPARE(state()->paintEffect(), Id(0));
+        QTRY_VERIFY((arm = win_->findChild<QPushButton*>(QStringLiteral("paintOnMonitor"))) && !arm->isChecked());
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.5, 0.5));
+        QVERIFY(paintStrokesFromString(fx().s("strokes")).empty());
+
+        // Dust Spot Removal: not on a generator (spots are taken out where a file is read)...
+        Id dustId = 0;
+        QVERIFY(state()->edit("Dust", [red, &dustId](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "dust_spots");
+            dustId = e.id;
+            edit::clipById(s, red)->effects.push_back(e);
+            return true;
+        }));
+        QTRY_VERIFY(win_->findChildren<QPushButton*>(QStringLiteral("paintOnMonitor")).size() == 2);
+        QVERIFY(!win_->findChildren<QPushButton*>(QStringLiteral("paintOnMonitor")).back()->isEnabled());
+        state()->setPaintEffect(dustId);
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.4, 0.3));
+        QVERIFY(edit::ownedEffect(const_cast<Sequence&>(*state()->sequence()), red, dustId)->s("spots").empty());
+        state()->setPaintEffect(0);
+
+        // ...but on a picture: a click marks a spot on this frame, Ctrl-click removes it.
+        const QString png = dir_.filePath("dusty.png");
+        {
+            QImage q(320, 180, QImage::Format_RGB32);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) q.setPixel(x, y, qRgb(x * 255 / 319, y * 255 / 179, 90));
+            QVERIFY(q.save(png));
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({png});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, 30, V1, A1, false); }));
+        const Id still = trackAt(*state()->sequence(), V1)->clips.at(0).id;
+        QVERIFY(state()->edit("Dust", [still, &dustId](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "dust_spots");
+            dustId = e.id;
+            edit::clipById(s, still)->effects.push_back(e);
+            return true;
+        }));
+        state()->setSelection({still}, false);
+        state()->setPlayhead(10);
+        QTRY_VERIFY_WITH_TIMEOUT(!viewer->image().isNull(), 5000);
+        QTRY_VERIFY((arm = win_->findChild<QPushButton*>(QStringLiteral("paintOnMonitor"))) && arm->isEnabled());
+        arm->click();
+        QCOMPARE(state()->paintEffect(), dustId);
+        const QRectF rs = viewer->imageRect();
+        auto spotAt = [&rs](double u, double v) { return QPointF(rs.left() + u * rs.width(), rs.top() + v * rs.height()).toPoint(); };
+        const double spx = 1.0 / rs.width();
+        auto dust = [&] { return dustSpotsFromString(edit::ownedEffect(const_cast<Sequence&>(*state()->sequence()), still, dustId)->s("spots")); };
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, spotAt(0.4, 0.3));
+        QCOMPARE(dust().size(), size_t(1));
+        QCOMPARE(dust()[0].frame, int64_t(10));
+        QVERIFY(std::fabs(dust()[0].x - 0.4) < 2 * spx && std::fabs(dust()[0].y - 0.3) < 2.0 / rs.height());
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, spotAt(0.7, 0.6));
+        QCOMPARE(dust().size(), size_t(2));
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::ControlModifier, spotAt(0.7, 0.6));
+        QCOMPARE(dust().size(), size_t(1));
+        QVERIFY(std::fabs(dust()[0].x - 0.4) < 2 * spx);
+        // A spot only on another frame is left alone by a Ctrl-click there.
+        state()->setPlayhead(11);
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::ControlModifier, spotAt(0.4, 0.3));
+        QCOMPARE(dust().size(), size_t(1));
+        state()->setPaintEffect(0);
         state()->setSelection({}, false);
     }
 

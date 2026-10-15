@@ -76,6 +76,7 @@
 #include "media/Tracking.h"
 #include "media/CameraSolve.h"
 #include "render/OGraf.h"
+#include "render/Restoration.h"
 #include "media/Vector.h"
 #include "media/Beats.h"
 #include "render/Spherical.h"
@@ -21155,14 +21156,15 @@ private:
     };
 
     // Writes the frames as a video, each a still one frame long.
-    void writeFrames(const std::string& file, const std::vector<QImage>& frames, double fps) {
+    void writeFrames(const std::string& file, const std::vector<QImage>& frames, double fps, int crf = 8) {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
         s.width = frames[0].width();
         s.height = frames[0].height();
         s.fps = {int(fps), 1};
         for (size_t i = 0; i < frames.size(); ++i) {
-            const QString png = QString::fromStdString(path(("frame" + std::to_string(i) + ".png").c_str()));
+            // Named after the video, so another call's frames are not taken from the cache.
+            const QString png = QString::fromStdString(file + ".frame" + std::to_string(i) + ".png");
             frames[i].save(png);
             MediaItem m = probeOrFail(p, png.toStdString());
             p.media.push_back(m);
@@ -21174,7 +21176,7 @@ private:
         ExportSettings st;
         st.path = file;
         st.audioCodec = "none";
-        st.crf = 8;
+        st.crf = crf;
         st.preset = "ultrafast";
         std::string err;
         QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
@@ -21565,6 +21567,102 @@ private slots:
             QVERIFY(!syncMotionData(d8, m8, s8, &err));
             QVERIFY(QString::fromStdString(err).contains("stabilised the picture itself"));
         }
+    }
+
+    void restorationOnFootage() {
+        // Footage panning over fine detail, 3 pixels across and 1 down a frame; the dirty copy has specks of dirt on
+        // frame 6 and a smudge too big to be found by itself.
+        const int W = 320, H = 180, frames = 12;
+        auto tex = [](double x, double y) {
+            return 0.45 + 0.15 * std::sin(x * 0.21) * std::cos(y * 0.17) + 0.1 * std::sin((x + 2 * y) * 0.07);
+        };
+        struct Speck {
+            int x, y, r, v;  // v: the grey it is
+        };
+        const std::vector<Speck> specks = {{60, 50, 2, 20}, {150, 90, 3, 235}, {250, 40, 2, 15}, {200, 140, 2, 240}};
+        const Speck smudge{100, 130, 9, 30};
+        std::vector<QImage> clean, dirty;
+        for (int f = 0; f < frames; ++f) {
+            QImage img(W, H, QImage::Format_RGB32);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const int v = std::clamp(int(std::lround(255 * tex(x + 3 * f, y + f))), 0, 255);
+                    img.setPixel(x, y, qRgb(v, v * 9 / 10, v * 8 / 10));
+                }
+            clean.push_back(img);
+            if (f == 6) {
+                for (const Speck& sp : specks)
+                    for (int y = -sp.r; y <= sp.r; ++y)
+                        for (int x = -sp.r; x <= sp.r; ++x)
+                            if (x * x + y * y <= sp.r * sp.r) img.setPixel(sp.x + x, sp.y + y, qRgb(sp.v, sp.v, sp.v));
+                for (int y = -smudge.r; y <= smudge.r; ++y)
+                    for (int x = -smudge.r; x <= smudge.r; ++x)
+                        if (x * x + y * y <= smudge.r * smudge.r) img.setPixel(smudge.x + x, smudge.y + y, qRgb(30, 30, 30));
+            }
+            dirty.push_back(img);
+        }
+        const std::string cleanFile = path("restore-clean.mp4"), dirtyFile = path("restore-dirty.mp4");
+        writeFrames(cleanFile, clean, 25, 0);  // (lossless, so the two differ only where the dirt is)
+        writeFrames(dirtyFile, dirty, 25, 0);
+        auto open = [&](Project& p, const std::string& file) -> Clip& {
+            Sequence& s = *p.active();
+            s.width = W, s.height = H, s.fps = {25, 1};
+            MediaItem m = probeOrFail(p, file);
+            p.media.push_back(m);
+            edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            return s.videoTracks[0].clips.at(0);
+        };
+        Project pc = makeDefaultProject(), pd = makeDefaultProject();
+        open(pc, cleanFile);
+        Clip& clip = open(pd, dirtyFile);
+        const Image truth = renderSequenceFrame(pc, *pc.active(), 6, {}), before = renderSequenceFrame(pd, *pd.active(), 6, {});
+        auto near = [](int x, int y, const Speck& sp, int pad) { return std::hypot(x - sp.x, y - sp.y) <= sp.r + pad; };
+        auto worstAt = [&](const Image& img, const Speck& sp) {
+            float e = 0;
+            for (int y = sp.y - sp.r - 1; y <= sp.y + sp.r + 1; ++y)
+                for (int x = sp.x - sp.r - 1; x <= sp.x + sp.r + 1; ++x)
+                    for (int k = 0; k < 3; ++k) e = std::max(e, std::fabs(img.at(x, y)[k] - truth.at(x, y)[k]));
+            return e;
+        };
+        QVERIFY(worstAt(before, specks[1]) > 0.3f);
+        // Dirt Removal: the specks are gone, the frame otherwise as it was (the smudge too).
+        clip.effects.push_back(makeEffect(pd, "dirt_removal"));
+        const Image after = renderSequenceFrame(pd, *pd.active(), 6, {});
+        for (const Speck& sp : specks) QVERIFY2(worstAt(after, sp) < 0.06f, std::to_string(worstAt(after, sp)).c_str());
+        // Nothing else changed (the smudge neither).
+        int changed = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                bool speck = false;
+                for (const Speck& sp : specks) speck = speck || near(x, y, sp, 6);  // (each grown to its soft edge)
+                if (!speck) changed += after.at(x, y)[1] != before.at(x, y)[1];
+            }
+        QVERIFY2(changed == 0, std::to_string(changed).c_str());
+        QVERIFY(after.at(smudge.x, smudge.y)[1] < 0.2f);
+        // A clean frame is left exactly as it was.
+        QVERIFY(renderSequenceFrame(pd, *pd.active(), 4, {}).px == renderSequenceFrame(pd, *pd.active(), 4, {}).px);
+        clip.effects.back().enabled = false;
+        const Image frame4 = renderSequenceFrame(pd, *pd.active(), 4, {});
+        clip.effects.back().enabled = true;
+        QVERIFY(renderSequenceFrame(pd, *pd.active(), 4, {}).px == frame4.px);
+        // Show Detected marks the specks red.
+        clip.effects.back().params["show"] = 1.0;
+        const Image shown = renderSequenceFrame(pd, *pd.active(), 6, {});
+        QVERIFY(shown.at(specks[0].x, specks[0].y)[0] > 0.9f && shown.at(specks[0].x, specks[0].y)[1] < 0.1f);
+        clip.effects.pop_back();
+
+        // Dust Spot Removal: a spot marked on the smudge, on frame 6, takes it out from the frames either side; frame 7 has
+        // no spot and is left alone.
+        Effect dust = makeEffect(pd, "dust_spots");
+        dust.strings["spots"] = dustSpotsToString({{6, (smudge.x + 0.5) / W, (smudge.y + 0.5) / H, 13.0 / W}});
+        clip.effects.push_back(dust);
+        const Image busted = renderSequenceFrame(pd, *pd.active(), 6, {});
+        QVERIFY2(worstAt(busted, smudge) < 0.06f, std::to_string(worstAt(busted, smudge)).c_str());
+        QVERIFY(worstAt(busted, specks[1]) > 0.3f);  // only where it was marked
+        clip.effects.back().enabled = false;
+        const Image frame7 = renderSequenceFrame(pd, *pd.active(), 7, {});
+        clip.effects.back().enabled = true;
+        QVERIFY(renderSequenceFrame(pd, *pd.active(), 7, {}).px == frame7.px);
     }
 
     void ltcTimecode() {

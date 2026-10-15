@@ -23,6 +23,7 @@
 #include "Deconvolve.h"
 #include "GpuCompositor.h"
 #include "QualityCheck.h"
+#include "Restoration.h"
 #include "media/MotionData.h"
 #include "media/Tracking.h"
 #include "media/FaceTracks.h"
@@ -1797,6 +1798,7 @@ void stabilize(const Effect& e, FrameTime t, Image& img, double sourceSeconds) {
 
 namespace {
 thread_local const ColorSpace* tWorkingSpace = nullptr;
+void paintStrokes(const Effect& e, FrameTime t, Image& img);  // (Paint, below)
 }  // namespace
 
 const ColorSpace& currentWorkingSpace() { return tWorkingSpace ? *tWorkingSpace : rec709Space(); }
@@ -1851,6 +1853,25 @@ void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScal
         Image filled;
         cachedInpaint(img, matte, filled);
         img = std::move(filled);
+        return;
+    }
+    if (e.type == "patch_fill") {
+        // The mask is where the patch goes; it is copied from the same shape moved by Source X and Y.
+        if (!hasMask(e, t)) return;
+        const std::vector<float> matte = effectMatte(e, t, img, pixelScale, sourceSeconds);
+        if (e.p("mask.show", t) > 0.5) {
+            for (size_t i = 0; i < matte.size(); ++i) {
+                float* p = &img.px[i * 4];
+                p[0] = p[1] = p[2] = matte[i] * p[3];
+            }
+            return;
+        }
+        pasteShifted(img, matte, e.p("source_x", t, 0.15) * img.width, e.p("source_y", t, 0) * img.height, std::lround(e.p("blend", t, 0)) == 0);
+        return;
+    }
+    if (e.type == "paint") {
+        // Its mask is not a limit: it is what tracked strokes follow.
+        paintStrokes(e, t, img);
         return;
     }
     if (!hasMask(e, t)) {
@@ -1941,8 +1962,132 @@ void depthEffect(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     });
 }
 
+}  // namespace
+
+namespace {
+
+// What a restoration effect found, shown in red over the picture.
+void showFound(Image& img, const std::vector<float>& matte) {
+    for (size_t i = 0; i < matte.size() && i * 4 < img.px.size(); ++i) {
+        float* p = &img.px[i * 4];
+        const float m = matte[i];
+        p[0] += (p[3] - p[0]) * m;
+        p[1] -= p[1] * m;
+        p[2] -= p[2] * m;
+    }
+}
+
+// Through the effect's mask, when it has one: `fn` changes a copy, mixed back by the mask.
+void throughMask(const Effect& e, FrameTime lt, Image& src, double pixelScale, double sourceSeconds, const std::function<void(Image&)>& fn) {
+    if (!hasMask(e, lt)) {
+        fn(src);
+        return;
+    }
+    const std::vector<float> matte = effectMatte(e, lt, src, pixelScale, sourceSeconds);
+    if (e.p("mask.show", lt) > 0.5) {
+        for (size_t i = 0; i < matte.size(); ++i) {
+            float* q = &src.px[i * 4];
+            q[0] = q[1] = q[2] = matte[i] * q[3];
+        }
+        return;
+    }
+    Image done = src;
+    fn(done);
+    for (size_t i = 0; i < matte.size() && i * 4 < src.px.size(); ++i)
+        for (int k = 0; k < 4; ++k) src.px[i * 4 + size_t(k)] += (done.px[i * 4 + size_t(k)] - src.px[i * 4 + size_t(k)]) * matte[i];
+}
+
+void paintStrokes(const Effect& e, FrameTime t, Image& img) {
+    for (const PaintStrokeAt& s : paintStrokesAt(e, t, img.width, img.height))
+        paintStroke(img, s.points, s.radius, s.softness, s.dx, s.dy, s.heal);
+}
+
+}  // namespace
+
+std::vector<PaintStrokeAt> paintStrokesAt(const Effect& e, FrameTime t, int W, int H) {
+    std::vector<PaintStrokeAt> out;
+    if (W <= 0 || H <= 0) return out;
+    for (const PaintStroke& s : paintStrokesFromString(e.s("strokes"))) {
+        if (!s.hold && s.frame != t) continue;
+        PaintStrokeAt a;
+        a.heal = s.heal;
+        a.radius = s.radius * W;
+        a.softness = s.softness;
+        // A tracked stroke moves as the mask's box has since the frame it was drawn on (its source offset too).
+        const MaskBox from = maskBox(e, FrameTime(s.frame)), to = maskBox(e, t);
+        auto place = [&](double u, double v, double& x, double& y) {
+            if (s.track) {
+                double bx, by;
+                frameToBox(from, W, H, u, v, bx, by);
+                boxToFrame(to, W, H, bx, by, u, v);
+            }
+            x = u * W - 0.5, y = v * H - 0.5;
+        };
+        for (const auto& p : s.points) {
+            double x, y;
+            place(p[0], p[1], x, y);
+            a.points.push_back({x, y});
+        }
+        double sx, sy;
+        place(s.points[0][0] + s.dx, s.points[0][1] + s.dy, sx, sy);
+        a.dx = sx - a.points[0][0], a.dy = sy - a.points[0][1];
+        if (s.track) a.radius *= std::sqrt(std::max(1e-6, (to.w * to.h) / std::max(1e-12, from.w * from.h)));
+        out.push_back(std::move(a));
+    }
+    return out;
+}
+
+void applyDirtRemoval(const Effect& e, FrameTime lt, Image& src, const Image* prev, const Image* next, const MotionFn& toPrev,
+                      const MotionFn& toNext, double pixelScale, double sourceSeconds) {
+    if (!e.enabled || !prev || !next) return;
+    throughMask(e, lt, src, pixelScale, sourceSeconds, [&](Image& img) {
+        DirtSettings s;
+        s.sensitivity = e.p("sensitivity", lt, 50);
+        s.maxSize = std::max(1.0, e.p("size", lt, 12) * pixelScale);
+        const std::vector<float> m = detectDirt(img, *prev, *next, toPrev, toNext, s);
+        if (m.empty()) return;
+        if (e.p("show", lt) > 0.5) showFound(img, m);
+        else fillFromNeighbours(img, m, *prev, *next, toPrev, toNext, s.maxSize / 2 + 4);
+    });
+}
+
+void applyDustSpots(const Effect& e, FrameTime lt, Image& src, const Image* prev, const Image* next, const MotionFn& toPrev,
+                     const MotionFn& toNext, double pixelScale, double sourceSeconds) {
+    if (!e.enabled) return;
+    std::vector<DustSpot> here;
+    for (const DustSpot& d : dustSpotsFromString(e.s("spots")))
+        if (d.frame == lt) here.push_back(d);
+    if (here.empty()) return;
+    throughMask(e, lt, src, pixelScale, sourceSeconds, [&](Image& img) {
+        const double sensitivity = e.p("sensitivity", lt, 50);
+        const bool both = prev && next;
+        for (const DustSpot& d : here) {
+            const LocalMatte m = dustArea(img, prev, next, toPrev, toNext, d, sensitivity);
+            if (e.p("show", lt) > 0.5) showFound(img, m.full(img.width, img.height));
+            else if (both) fillFromNeighbours(img, m, *prev, *next, toPrev, toNext, d.r * img.width + 4);
+            else fillFromSurround(img, m);
+        }
+    });
+}
+
+namespace {
+
 void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     const std::string& ty = e.type;
+    if (ty == "scratch_removal") {
+        ScratchSettings s;
+        s.sensitivity = e.p("sensitivity", t, 50);
+        s.maxWidth = std::max(1.0, e.p("width", t, 4) * pixelScale);
+        s.polarity = int(std::lround(e.p("polarity", t, 0)));
+        const std::vector<float> m = detectScratches(img, s);
+        if (e.p("show", t) > 0.5) showFound(img, m);
+        else fillAcross(img, m);
+        return;
+    }
+    if (ty == "paint") {
+        paintStrokes(e, t, img);
+        return;
+    }
     if (ty == "color_correct") colorCorrect(e, t, img);
     else if (ty == "chart_match") applyChartMatch(e, t, img);
     else if (ty == "curves") curves(e, t, img);

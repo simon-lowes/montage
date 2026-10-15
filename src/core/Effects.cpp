@@ -756,6 +756,35 @@ std::vector<EffectInfo> buildCatalog() {
                      {num("frames", "Frames Either Side", 1, 12, 3, 1), choice("area", "Even Out", {"Whole Frame", "Each Area (16 x 9)"}, 1),
                       pct("strength", "Strength", 0, 100, 100)},
                      {}});
+        // Restoration (render/Restoration.h). Dirt Removal and Dust Spot Removal use the frames either side, so they run where
+        // the source frame is read; Dust Spot Removal's spots and Paint's strokes are kept as text ("spots", "strokes"), marked
+        // on the Program monitor. Patch Fill copies its mask's area from the same shape moved by Source X and Y.
+        c.push_back({"dirt_removal", "Dirt Removal", EffectCategory::VideoFilter, "Repair",
+                     {pct("sensitivity", "Sensitivity", 0, 100, 50), num("size", "Largest Speck (px)", 1, 100, 12, 1),
+                      boolean("show", "Show Detected")},
+                     {}});
+        c.push_back({"dust_spots", "Dust Spot Removal", EffectCategory::VideoFilter, "Repair",
+                     {pct("sensitivity", "Sensitivity", 0, 100, 50), num("brush", "Brush Size (px)", 2, 400, 24, 1),
+                      boolean("show", "Show Detected")},
+                     {}});
+        c.push_back({"scratch_removal", "Scratch Removal", EffectCategory::VideoFilter, "Repair",
+                     {pct("sensitivity", "Sensitivity", 0, 100, 50), num("width", "Widest Scratch (px)", 1, 32, 4, 1),
+                      choice("polarity", "Scratches", {"Dark and Light", "Dark", "Light"}, 0), boolean("show", "Show Detected")},
+                     {}});
+        c.push_back({"patch_fill", "Patch Fill", EffectCategory::VideoFilter, "Repair",
+                     {num("source_x", "Source X (of the width)", -1, 1, 0.15, 0.001), num("source_y", "Source Y (of the height)", -1, 1, 0, 0.001),
+                      choice("blend", "Blend", {"Seamless", "Copy"}, 0)},
+                     {}});
+        c.push_back({"paint", "Paint (Clone and Heal)", EffectCategory::VideoFilter, "Repair",
+                     {choice("tool", "Brush", {"Clone", "Heal"}, 0), num("brush", "Brush Size (px)", 2, 400, 30, 1),
+                      pct("softness", "Brush Softness", 0, 100, 50), choice("span", "Strokes Last", {"This Frame", "Whole Clip"}, 0),
+                      boolean("track", "Strokes Follow the Mask Track"), num("source_x", "Source X (of the width)", -1, 1, 0.05, 0.001),
+                      num("source_y", "Source Y (of the height)", -1, 1, 0, 0.001)},
+                     {}});
+        for (size_t i = c.size() - 5; i < c.size(); ++i)
+            for (auto& pi : c[i].params)
+                if (pi.name != "sensitivity")
+                    pi.keyframeable = c[i].type == "patch_fill" && (pi.name == "source_x" || pi.name == "source_y");
         c.push_back({"tilt_shift", "Tilt-Shift Blur", EffectCategory::VideoFilter, "Blur & Sharpen",
                      {pct("focus", "Focus Position", 0, 100, 50), pct("width", "Focus Width", 0, 100, 20), num("blur", "Blur (px)", 0, 200, 12, 0.5),
                       angle("angle", "Angle", 0), pct("saturation", "Saturation", 0, 200, 120)},

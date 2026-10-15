@@ -1,6 +1,7 @@
 // Montage — image processing kernels for video effects, blending and transitions.
 #pragma once
 
+#include <array>
 #include <memory>
 #include <string>
 #include <utility>
@@ -8,6 +9,7 @@
 
 #include "core/Model.h"
 #include "media/Image.h"
+#include "render/VideoDenoise.h"
 
 namespace montage {
 
@@ -17,6 +19,20 @@ namespace montage {
 // `sourceSeconds` is the media time of the frame (for effects that follow
 // the footage, such as Stabilize); -1 when there is none.
 void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds = -1);
+
+// Dirt Removal and Dust Spot Removal (render/Restoration.h), which need the source frames either side, followed along the
+// motion (either may be missing): run where the clip's source frame is read, through the effect's mask if it has one.
+void applyDirtRemoval(const Effect& e, FrameTime lt, Image& src, const Image* prev, const Image* next, const MotionFn& toPrev,
+                      const MotionFn& toNext, double pixelScale, double sourceSeconds = -1);
+void applyDustSpots(const Effect& e, FrameTime lt, Image& src, const Image* prev, const Image* next, const MotionFn& toPrev,
+                     const MotionFn& toNext, double pixelScale, double sourceSeconds = -1);
+// A Paint effect's strokes at clip frame t, in the frame's pixels (each tracked one moved with the mask box).
+struct PaintStrokeAt {
+    bool heal = false;
+    double dx = 0, dy = 0, radius = 1, softness = 0.5;
+    std::vector<std::array<double, 2>> points;
+};
+std::vector<PaintStrokeAt> paintStrokesAt(const Effect& e, FrameTime t, int width, int height);
 
 namespace gpu {
 struct ColorOp;

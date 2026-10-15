@@ -111,6 +111,10 @@ public:
     // choice of what to work on, not a change to the project: it makes no undo step and works in a read-only project.
     int maskObject(const Effect& e) const;
     void setMaskObject(Id effect, int which);
+    // The Paint or Dust Spot Removal effect whose strokes or spots are being marked on the Program monitor (0: none). Also a
+    // choice of what to work on, not an edit.
+    Id paintEffect() const { return paintEffect_; }
+    void setPaintEffect(Id effect);
     // The single clip shown in the inspector (first selected), or nullptr.
     const Clip* primaryClip() const;
     // The colour node picked in the Nodes panel (core/GradeGraph.h): its key in the graph of the clip shown in the
@@ -255,6 +259,7 @@ signals:
     void projectChanged();            // anything in the project changed
     void selectionChanged();
     void maskObjectChanged();         // a different object chosen in an object mask
+    void paintEffectChanged();        // painting on the monitor started, stopped or moved to another effect
     void gradeNodeSelected();         // a different colour node picked
     void playheadChanged(montage::FrameTime t);
     void sequenceSwitched();          // a different sequence became active / project replaced
@@ -321,6 +326,7 @@ private:
     Id selectedTransition_ = 0;
     Id inspectedChain_ = 0;
     std::map<Id, int> maskObjects_;  // effect -> object being picked
+    Id paintEffect_ = 0;
     Id gradeNodeClip_ = 0;           // the clip whose colour node is picked, and the node
     int gradeNodeKey_ = 0;
     int targetVideo_ = 0;

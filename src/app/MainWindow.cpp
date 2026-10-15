@@ -146,6 +146,7 @@
 #include "AudioDescriptionDialog.h"
 #include "CaptionsPanel.h"
 #include "MaskOverlay.h"
+#include "PaintOverlay.h"
 #include "TransformOverlay.h"
 #include "ReviewOverlay.h"
 #include "ChartMatchDialog.h"
@@ -390,6 +391,7 @@ void MainWindow::buildPanels() {
     new MaskOverlay(state_, programPanel_->viewer());
     reviewOverlay_ = new ReviewOverlay(state_, programPanel_->viewer());
     reviewOverlay_->setShown(appSettings().value("playback/reviewDrawings", true).toBool());
+    new PaintOverlay(state_, programPanel_->viewer());  // last, so an armed brush gets the pointer first
     connect(programPanel_, &MonitorPanel::exportFrameRequested, this, &MainWindow::exportFrame);
     connect(timeline_, &TimelineWidget::trimViewChanged, this,
             [this](FrameTime left, FrameTime right, const QString& leftLabel, const QString& rightLabel) {

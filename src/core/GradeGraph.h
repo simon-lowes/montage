@@ -21,7 +21,8 @@ namespace montage {
 bool isGradeMixer(const GradeNode& n);
 // Effects that work on the picture as it comes, or reshape the whole frame, before any grade (Video NR, Super Scale,
 // Motion Deblur, Reframe 360, Redact Faces, Stereo 3D, Motion Blur, Deflicker, Stabilize, Rolling Shutter Repair, Lens
-// Correction, the camera tracker): they stay outside nodes (a node's window, key or mix could not apply to them).
+// Correction, the camera tracker, Dirt Removal, Dust Spot Removal): they stay outside nodes (a node's window, key or
+// mix could not apply to them).
 bool runsBeforeGrade(const std::string& type);
 // Of those, the ones the renderer always ran ahead of the graph even inside a node (all but Stabilize, Rolling Shutter
 // Repair and Lens Correction, which ran in their node), so an old project's are taken out of its nodes when read.
