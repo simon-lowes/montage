@@ -1,7 +1,9 @@
-// Montage — restoration painting on the Program monitor: while a Paint effect is armed (its Inspector button), drag
-// to paint a clone or heal stroke (Alt-click first to choose where it copies from; after that the same offset is kept),
-// and while a Dust Spot Removal is armed, click dirt to mark a spot on that frame (Ctrl/Cmd-click a spot to remove it). The
-// brush shows as a circle, the source as a cross; this frame's strokes and spots are outlined. Esc stops.
+// Montage — painting and picking on the Program monitor: while a Paint effect is armed (its Inspector button), drag
+// to paint a clone or heal stroke (Alt-click first to choose where it copies from; after that the same offset is kept);
+// while a Dust Spot Removal is armed, click dirt to mark a spot on that frame (Ctrl/Cmd-click a spot to remove it);
+// while a Lens Blur (Depth) is armed, click what to focus on (a key there when its focus point is keyed, so clicks on
+// two frames make a rack). The brush shows as a circle, the source as a cross, the focus point as a target; this
+// frame's strokes and spots are outlined. Esc stops.
 #pragma once
 
 #include <QObject>
@@ -29,7 +31,8 @@ public:
     struct Target {
         Id clip = 0;
         Id effect = 0;
-        bool dust = false;    // Dust Spot Removal (else Paint)
+        bool dust = false;    // Dust Spot Removal
+        bool focus = false;   // Lens Blur (Depth): a click picks the focus point (else Paint)
         FrameTime lt = 0;     // the clip frame at the playhead
         double brush = 30;    // the brush's size, sequence pixels
     };
@@ -46,6 +49,7 @@ private:
     double brushRadius(const Target& t, const QPointF& at) const;
     void finishStroke();
     bool markSpot(const Target& t, const QPointF& pos, bool remove);
+    void pickFocus(const Target& t, double u, double v);
 
     EditorState* state_;
     ViewerWidget* viewer_;

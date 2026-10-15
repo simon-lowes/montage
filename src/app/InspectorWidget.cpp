@@ -860,6 +860,24 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             connect(analyze, &QPushButton::clicked, this,
                     [this, owner, eid] { QTimer::singleShot(0, this, [this, owner, eid] { analyzeStabilize(owner, eid); }); });
         }
+        if (e.type == "depth_blur" && onClip) {
+            // Click to focus on the Program monitor (app/PaintOverlay); with Focus Point keyed, each click keys it.
+            auto* pick = new QPushButton(tr("Pick Focus on the Monitor"), content_);
+            pick->setObjectName(QStringLiteral("pickFocus"));
+            pick->setCheckable(true);
+            pick->setChecked(state_->paintEffect() == eid);
+            pick->setToolTip(tr("Click what to focus on in the Program monitor. Key Focus Point X and Y, then click on two "
+                                "frames for a focus pull between them. Esc stops."));
+            f->addRow(QString(), pick);
+            connect(pick, &QPushButton::toggled, this, [this, eid](bool on) {
+                if (on) state_->setPaintEffect(eid);
+                else if (state_->paintEffect() == eid) state_->setPaintEffect(0);
+            });
+            connect(state_, &EditorState::paintEffectChanged, pick, [this, pick, eid] {
+                const QSignalBlocker block(pick);
+                pick->setChecked(state_->paintEffect() == eid);
+            });
+        }
         if ((e.type == "paint" || e.type == "dust_spots") && onClip) {
             // Strokes and spots are drawn on the Program monitor while the effect is armed (app/PaintOverlay).
             const bool dust = e.type == "dust_spots";

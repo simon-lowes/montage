@@ -12437,6 +12437,61 @@ const auto seq = [this] { return state()->sequence(); };
         state()->setSelection({}, false);
     }
 
+    void pickFocusInProgramMonitor() {
+        loadDemo();
+        // Lens Blur (Depth) on the red clip: Pick Focus, then a click in the Program monitor focuses on that point.
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        Id lensId = 0;
+        QVERIFY(state()->edit("Lens", [red, &lensId](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "depth_blur");
+            lensId = e.id;
+            edit::clipById(s, red)->effects.push_back(e);
+            return true;
+        }));
+        state()->setSelection({red}, false);
+        state()->setPlayhead(10);
+        const int64_t lt = 10 - clipNamed(*state()->sequence(), "Red")->start;
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        QTRY_VERIFY_WITH_TIMEOUT(!viewer->image().isNull(), 5000);
+        QPushButton* pick = nullptr;
+        QTRY_VERIFY((pick = win_->findChild<QPushButton*>(QStringLiteral("pickFocus"))) != nullptr);
+        pick->click();
+        QCOMPARE(state()->paintEffect(), lensId);
+        const QRectF r = viewer->imageRect();
+        auto at = [&r](double u, double v) { return QPointF(r.left() + u * r.width(), r.top() + v * r.height()).toPoint(); };
+        auto fx = [&]() -> const Effect& { return *edit::ownedEffect(const_cast<Sequence&>(*state()->sequence()), red, lensId); };
+        const double px = 2.0 / r.width(), py = 2.0 / r.height();
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.3, 0.4));
+        QCOMPARE(std::lround(fx().p("follow", lt)), 1L);
+        QVERIFY(std::fabs(fx().p("point_x", lt) - 0.3) < px && std::fabs(fx().p("point_y", lt) - 0.4) < py);
+        QVERIFY(!fx().params.at("point_x").animated());
+        // Keyed: each click keys both, eased, so two frames make a rack.
+        QVERIFY(state()->edit("Key", [red, lensId](Project&, Sequence& s) {
+            Effect* e = edit::ownedEffect(s, red, lensId);
+            e->params["point_x"].addKey(0, 0.7, Interp::Smooth);
+            return true;
+        }));
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.2, 0.6));
+        const Keyframe* kx = fx().params.at("point_x").keyAt(lt);
+        const Keyframe* ky = fx().params.at("point_y").keyAt(lt);
+        QVERIFY(kx && ky);
+        QVERIFY(std::fabs(kx->v - 0.2) < px && std::fabs(ky->v - 0.6) < py && kx->interp == Interp::Smooth);
+        QVERIFY(std::fabs(fx().p("point_x", 0) - 0.7) < 1e-9);  // the earlier key stays
+        state()->undo();
+        QVERIFY(!fx().params.at("point_x").keyAt(lt));
+        // Esc stops picking; a click then leaves it alone.
+        QTest::keyClick(viewer, Qt::Key_Escape);
+        QCOMPARE(state()->paintEffect(), Id(0));
+        QTRY_VERIFY((pick = win_->findChild<QPushButton*>(QStringLiteral("pickFocus"))) && !pick->isChecked());
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.6, 0.6));
+        QVERIFY(!fx().params.at("point_x").keyAt(lt));
+        state()->setSelection({}, false);
+    }
+
     void restorationPaintInProgramMonitor() {
         loadDemo();
         // A Paint effect on the red clip, armed from the Inspector, painted on the Program monitor.

@@ -45,7 +45,7 @@ std::optional<PaintOverlay::Target> PaintOverlay::target() const {
         for (const Effect& e : c.effects)
             if (e.enabled && e.type == "stop_motion") lt -= lt % std::max<FrameTime>(1, FrameTime(std::lround(e.p("hold", lt, 3))));
         for (const Effect& e : c.effects)
-            if (e.id == armed && e.enabled && (e.type == "paint" || e.type == "dust_spots")) {
+            if (e.id == armed && e.enabled && (e.type == "paint" || e.type == "dust_spots" || e.type == "depth_blur")) {
                 // Dust spots are taken out where a video or picture file is read (not in nested sequences or generators).
                 const MediaItem* m = state_->project().findMedia(c.mediaId);
                 if (e.type == "dust_spots" && (!m || (m->kind != MediaKind::Video && m->kind != MediaKind::Image))) return std::nullopt;
@@ -53,6 +53,7 @@ std::optional<PaintOverlay::Target> PaintOverlay::target() const {
                 tg.clip = c.id;
                 tg.effect = e.id;
                 tg.dust = e.type == "dust_spots";
+                tg.focus = e.type == "depth_blur";
                 tg.lt = lt;
                 tg.brush = e.p("brush", tg.lt, tg.dust ? 24 : 30);
                 return tg;
@@ -105,6 +106,22 @@ void PaintOverlay::paint(QPainter& p, const QRectF& picture) {
     p.setRenderHint(QPainter::Antialiasing);
     p.setBrush(Qt::NoBrush);
     const double wpx = picture.width() / seq->width;  // widget pixels a sequence pixel
+    if (t->focus) {
+        // The focus point (when it focuses on one), and a target under the mouse.
+        auto target = [&](QPointF at, const QColor& colour) {
+            p.setPen(QPen(QColor(0, 0, 0, 160), 3));
+            p.drawEllipse(at, 9, 9);
+            p.setPen(QPen(colour, 1.5));
+            p.drawEllipse(at, 9, 9);
+            for (QPointF d : {QPointF(1, 0), QPointF(-1, 0), QPointF(0, 1), QPointF(0, -1)}) p.drawLine(at + d * 5, at + d * 14);
+        };
+        QPointF at;
+        if (std::lround(e->p("follow", t->lt, 0)) == 1 && toWidget(t->clip, e->p("point_x", t->lt, 0.5), e->p("point_y", t->lt, 0.5), at))
+            target(at, QColor(255, 200, 0, 230));
+        if (inside_) target(mouse_, QColor(255, 255, 255, 200));
+        p.restore();
+        return;
+    }
     // This frame's spots or strokes.
     p.setPen(QPen(QColor(255, 200, 0, 200), 1.2, Qt::DashLine));
     if (t->dust) {
@@ -156,6 +173,27 @@ void PaintOverlay::paint(QPainter& p, const QRectF& picture) {
         }
     }
     p.restore();
+}
+
+void PaintOverlay::pickFocus(const Target& t, double u, double v) {
+    const Id clip = t.clip, effect = t.effect;
+    const FrameTime lt = t.lt;
+    state_->edit(tr("Pick Focus"), [=](Project&, Sequence& sq) {
+        Effect* e = edit::ownedEffect(sq, clip, effect);
+        if (!e) return false;
+        e->params["follow"] = Param(1.0);
+        // Already keyed: a key here on both (eased, so a rack from one to the next starts and ends gently).
+        Param& px = e->params["point_x"];
+        Param& py = e->params["point_y"];
+        if (px.animated() || py.animated()) {
+            px.addKey(lt, u, Interp::Smooth);
+            py.addKey(lt, v, Interp::Smooth);
+        } else {
+            px = Param(u);
+            py = Param(v);
+        }
+        return true;
+    });
 }
 
 bool PaintOverlay::markSpot(const Target& t, const QPointF& pos, bool remove) {
@@ -254,6 +292,10 @@ bool PaintOverlay::eventFilter(QObject* obj, QEvent* e) {
         if (!fromWidget(t->clip, mouse_, u, v)) return true;
         if (t->dust) {
             markSpot(*t, mouse_, me->modifiers() & Qt::ControlModifier);
+            return true;
+        }
+        if (t->focus) {
+            pickFocus(*t, u, v);
             return true;
         }
         if (me->modifiers() & Qt::AltModifier) {
