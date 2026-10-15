@@ -363,6 +363,9 @@ public:
     static const QStringList& builtInWorkspaces();
     QStringList workspaces() const;  // the built-in ones, then saved ones by name
     QString currentWorkspace() const { return workspace_; }
+    // gpu::initialize, marked in the settings until the GPU has drawn a frame (or Montage quits), so a launch a driver
+    // crash ends leaves GPU rendering off the next time.
+    bool startGpuGuarded(std::string* why);
     bool applyWorkspace(const QString& name);
     bool saveWorkspace(const QString& name);    // false for an empty name, a built-in's or one with a slash
     bool deleteWorkspace(const QString& name);  // saved ones only

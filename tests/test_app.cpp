@@ -14670,6 +14670,25 @@ print("added " + ui["name"])
         QTRY_COMPARE(ids(), std::string());
     }
 
+    void gpuStartupGuard() {
+        // Turning GPU rendering on marks the settings until the GPU has drawn a frame, so a driver crash while starting
+        // it leaves it off the next launch; a GPU that can't start leaves no mark.
+        auto* gpuAction = win_->findChild<QAction*>(QStringLiteral("gpuRendering"));
+        QVERIFY(gpuAction);
+        const bool was = gpuAction->isChecked();
+        if (was) gpuAction->trigger();  // (off first)
+        QVERIFY(!gpuAction->isChecked());
+        gpuAction->trigger();
+        if (gpuAction->isChecked()) {
+            loadDemo();
+            state()->setPlayhead(5);
+            QTRY_VERIFY_WITH_TIMEOUT(!appSettings().contains("playback/gpuStarting"), 10000);
+        } else {
+            QVERIFY(!appSettings().contains("playback/gpuStarting"));
+        }
+        if (gpuAction->isChecked() != was) gpuAction->trigger();
+    }
+
     void objectMaskFromViewer() {
         // A red ball crossing textured ground, 320 x 180 at 25 fps.
         QImage bg(320, 180, QImage::Format_RGB32), ball(320, 180, QImage::Format_ARGB32);
