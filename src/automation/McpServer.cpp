@@ -136,6 +136,7 @@
 #include "render/Shorts.h"
 #include "render/Letterbox.h"
 #include "render/Processing.h"
+#include "render/Restoration.h"
 #include "media/LensDatabase.h"
 #include "core/Production.h"
 #include "core/ProjectLock.h"
@@ -2063,7 +2064,15 @@ void McpServer::Impl::addTools() {
         "rolling_shutter (straightening the skew a rolling shutter gives pans; readout as a percentage of a frame) measure "
         "the camera's movement when added; when the clip has camera motion data (a GoPro GPMF track, a CAMM track, a .gcsv log "
         "beside it) stabilize lines it up and uses it (method 3, Camera Gyro, unless params give another method; horizon "
-        "0-100 levels the horizon from gravity).",
+        "0-100 levels the horizon from gravity). "
+        "Restoration: dirt_removal takes out specks that are on one frame only (compared with the frames either side, "
+        "following the motion); dust_spots replaces hand-marked spots (strings.spots, lines of \"frame x y radius\": the "
+        "frame counted from the clip's start in sequence frames, the centre as fractions of the frame's width and height, "
+        "the radius as a fraction of its width); scratch_removal fills thin vertical scratches; patch_fill covers its mask "
+        "with the picture source_x / source_y away (fractions of the frame), blended seamlessly; paint draws clone or heal "
+        "strokes (strings.strokes, lines of \"clone|heal frame hold track dx dy radius softness x y x y ...\": frame as for "
+        "spots, hold 1 for every frame, track 1 to follow the mask's track, dx dy to where it copies from and the points "
+        "as fractions of the frame's width and height, radius a fraction of its width, softness 0-1).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
             "params":{"type":"object","additionalProperties":{"type":"number"}},
             "strings":{"type":"object","additionalProperties":{"type":"string"},"description":"Text settings: curves (\"x,y x,y\"), hue curves, a LUT file, the Colour Warper's mesh (\"spoke,ring,hue,sat,luma;...\": spokes 0-11 every 30 degrees from red, rings 1-4 for saturation 25-100 %, hue moved in degrees, saturation in 0-1 units, brightness in stops)..."},
@@ -2115,6 +2124,19 @@ void McpServer::Impl::addTools() {
                     if (!e.strings.count(key))
                         throw ArgError{QStringLiteral("\"%1\" has no text setting \"%2\"").arg(QString::fromStdString(displayName), it.key())};
                     e.strings[key] = it.value().toString().toStdString();
+                    continue;
+                }
+                if ((type == "dust_spots" && name == "spots") || (type == "paint" && name == "strokes")) {
+                    // Spots and strokes are drawn on the Program monitor in the app; here they are given as text.
+                    const std::string value = it.value().toString().toStdString();
+                    size_t lines = 0;
+                    for (const QString& line : it.value().toString().split('\n'))
+                        if (!line.trimmed().isEmpty()) ++lines;
+                    const size_t parsed = type == "paint" ? paintStrokesFromString(value).size() : dustSpotsFromString(value).size();
+                    if (parsed != lines)
+                        throw ArgError{type == "paint" ? QStringLiteral("strokes are lines of \"clone|heal frame hold track dx dy radius softness x y x y ...\"")
+                                                       : QStringLiteral("spots are lines of \"frame x y radius\"")};
+                    e.strings[name] = value;
                     continue;
                 }
                 const auto si = std::find_if(info->strings.begin(), info->strings.end(), [&](const StringParamInfo& x) { return x.name == name; });

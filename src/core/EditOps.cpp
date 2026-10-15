@@ -5,10 +5,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <map>
 #include <set>
+#include <sstream>
 
 #include "AudioChannels.h"
 #include "Effects.h"
@@ -105,6 +107,32 @@ bool trackEmpty(const Track& t, FrameTime a, FrameTime b, const std::vector<Id>&
 // ---------------------------------------------------------------------------
 // Primitives
 
+namespace {
+
+// Restoration marks kept as text, a line each with its clip frame as field `field` (render/Restoration.h: Dust Spot
+// Removal's spots, Paint's strokes), moved by delta frames as keys are.
+void shiftFrameLines(std::string& text, int field, FrameTime delta) {
+    if (text.empty()) return;
+    std::istringstream in(text);
+    std::ostringstream out;
+    std::string line;
+    while (std::getline(in, line)) {
+        std::istringstream l(line);
+        std::vector<std::string> words;
+        for (std::string w; l >> w;) words.push_back(w);
+        if (int(words.size()) > field) {
+            char* end = nullptr;
+            const long long f = std::strtoll(words[size_t(field)].c_str(), &end, 10);
+            if (end && *end == 0) words[size_t(field)] = std::to_string(f + delta);
+        }
+        for (size_t i = 0; i < words.size(); ++i) out << (i ? " " : "") << words[i];
+        out << '\n';
+    }
+    text = out.str();
+}
+
+}  // namespace
+
 void shiftKeyframes(Clip& c, FrameTime delta) {
     if (delta == 0) return;
     shiftParamKeys(c.motion, delta);
@@ -112,6 +140,11 @@ void shiftKeyframes(Clip& c, FrameTime delta) {
     shiftParamKeys(c.generator, delta);
     shiftParamKeys(c.timing, delta);
     for (auto& e : c.effects) shiftParamKeys(e, delta);
+    for (auto& e : c.effects) {
+        auto spots = e.strings.find("spots"), strokes = e.strings.find("strokes");
+        if (e.type == "dust_spots" && spots != e.strings.end()) shiftFrameLines(spots->second, 0, delta);
+        if (e.type == "paint" && strokes != e.strings.end()) shiftFrameLines(strokes->second, 1, delta);
+    }
     for (auto& [target, e] : c.trims) shiftParamKeys(e, delta);
 }
 

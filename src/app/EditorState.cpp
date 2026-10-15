@@ -278,6 +278,12 @@ void EditorState::setMaskObject(Id effect, int which) {
     emit maskObjectChanged();
 }
 
+void EditorState::setPaintEffect(Id effect) {
+    if (paintEffect_ == effect) return;
+    paintEffect_ = effect;
+    emit paintEffectChanged();
+}
+
 int EditorState::selectedGradeNode() const {
     const Clip* c = primaryClip();
     return c && c->id == gradeNodeClip_ && findGradeNode(c->grade, gradeNodeKey_) ? gradeNodeKey_ : 0;
@@ -1188,6 +1194,7 @@ bool EditorState::open(const QString& path, QString* error, Access access) {
     if (gesture_) gesture_.reset();
     ++projectGeneration_;
     maskObjects_.clear();
+    paintEffect_ = 0;
     project_ = std::move(p);
     // The last project's files are let go (idle decoders keep them open, which on Windows stops their folder being
     // moved or renamed, as when a card is relinked).
@@ -1267,6 +1274,7 @@ bool EditorState::reloadFromDisk() {
     if (gesture_) gesture_.reset();
     ++projectGeneration_;
     maskObjects_.clear();
+    paintEffect_ = 0;
     std::set<std::string> known;
     for (const MediaItem& m : project_.media) known.insert(m.path);
     project_ = std::move(p);
@@ -1327,6 +1335,7 @@ void EditorState::newProject() {
     if (gesture_) gesture_.reset();
     ++projectGeneration_;
     maskObjects_.clear();
+    paintEffect_ = 0;
     project_ = makeDefaultProject();
     MediaPool::instance().clear();  // let the last project's files go
     history_.clear();

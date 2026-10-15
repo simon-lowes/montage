@@ -80,6 +80,7 @@
 #include "render/ReferenceOutput.h"
 #include "audio/DynLib.h"
 #include <random>
+#include "render/Restoration.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -1999,6 +2000,226 @@ colorspaces:
         Image still = leaning();
         applyVideoEffect(stab, 5, still, 1.0, 5 / 25.0);
         QVERIFY(bar(still, 95) - bar(still, 5) > 14);
+    }
+
+    void restorationKernels() {
+        // A picture with fine detail panning 3 px across and 1 down a frame, a little noise in each frame.
+        auto tex = [](double x, double y) {
+            return 0.45 + 0.15 * std::sin(x * 0.21) * std::cos(y * 0.17) + 0.1 * std::sin((x + 2 * y) * 0.07);
+        };
+        const int W = 160, H = 96;
+        auto frame = [&](int k) {
+            Image f(W, H);
+            std::mt19937 rng(unsigned(k + 7));
+            std::normal_distribution<float> noise(0, 0.004f);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const float v = float(tex(x + 3 * k, y + k));
+                    float* q = f.at(x, y);
+                    q[0] = v + noise(rng), q[1] = v * 0.9f + noise(rng), q[2] = v * 0.8f + noise(rng), q[3] = 1;
+                }
+            return f;
+        };
+        const Image prev = frame(-1), clean = frame(0), next = frame(1);
+        const MotionFn toPrev = [](double, double) { return Point2{3, 1}; };
+        const MotionFn toNext = [](double, double) { return Point2{-3, -1}; };
+        // Specks of dirt, dark and light, one to three pixels across, and a blot too big to be dirt.
+        struct Speck {
+            int x, y;
+            double r;
+            float d;
+        };
+        const std::vector<Speck> specks = {{20, 20, 2, -0.3f}, {60, 30, 1.5, 0.35f}, {100, 70, 3, -0.25f},
+                                           {130, 15, 2, 0.3f}, {40, 80, 2.5, -0.4f}, {90, 45, 1, 0.3f}};
+        Image dirty = clean;
+        auto blot = [&](int cx, int cy, double r, float d) {
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    if (std::hypot(x - cx, y - cy) <= r)
+                        for (int k = 0; k < 3; ++k) dirty.at(x, y)[k] = std::clamp(dirty.at(x, y)[k] + d, 0.0f, 1.0f);
+        };
+        for (const Speck& sp : specks) blot(sp.x, sp.y, sp.r, sp.d);
+        blot(140, 70, 9, -0.3f);
+        DirtSettings ds;
+        int count = -1;
+        QVERIFY(detectDirt(clean, prev, next, toPrev, toNext, ds, &count).size() == size_t(W) * H);
+        QCOMPARE(count, 0);  // nothing found in the clean frame
+        const std::vector<float> matte = detectDirt(dirty, prev, next, toPrev, toNext, ds, &count);
+        QCOMPARE(count, int(specks.size()));
+        Image fixed = dirty;
+        fillFromNeighbours(fixed, matte, prev, next, toPrev, toNext);
+        auto nearSpeck = [&](int x, int y) {
+            for (const Speck& sp : specks)
+                if (std::hypot(x - sp.x, y - sp.y) <= sp.r + 5) return true;
+            return false;
+        };
+        float worst = 0, elsewhere = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                for (int k = 0; k < 3; ++k) {
+                    const float e = std::fabs(fixed.at(x, y)[k] - clean.at(x, y)[k]);
+                    if (nearSpeck(x, y)) worst = std::max(worst, e);
+                    else elsewhere = std::max(elsewhere, std::fabs(fixed.at(x, y)[k] - dirty.at(x, y)[k]));
+                }
+        QVERIFY2(worst < 0.03f, std::to_string(worst).c_str());  // the specks are gone
+        QVERIFY2(elsewhere == 0, std::to_string(elsewhere).c_str());  // and nothing else changed, the blot included
+        QVERIFY(fixed.at(140, 70)[0] < clean.at(140, 70)[0] - 0.2f);
+
+        // Scratches: a dark one a pixel wide all the way down and a light one three wide in the top half; a 12-pixel bar
+        // and an edge in the picture are not scratches.
+        const int SW = 200, SH = 128;
+        Image plain(SW, SH);
+        for (int y = 0; y < SH; ++y)
+            for (int x = 0; x < SW; ++x) {
+                const float v = float(0.4 + 0.06 * std::sin(x * 0.21) * std::cos(y * 0.17) + (x >= 180 ? 0.2 : 0) - (x >= 160 && x < 172 ? 0.3 : 0));
+                float* q = plain.at(x, y);
+                q[0] = v, q[1] = v, q[2] = v, q[3] = 1;
+            }
+        Image scratched = plain;
+        for (int y = 0; y < SH; ++y) {
+            for (int k = 0; k < 3; ++k) scratched.at(50, y)[k] -= 0.25f;
+            if (y < 64)
+                for (int x = 120; x <= 122; ++x)
+                    for (int k = 0; k < 3; ++k) scratched.at(x, y)[k] += 0.2f;
+        }
+        ScratchSettings ss;
+        const std::vector<float> sm = detectScratches(scratched, ss, &count);
+        QVERIFY2(count >= 8 + 4, std::to_string(count).c_str());
+        int dark = 0, lightTop = 0, lightBottom = 0, wrong = 0;
+        for (int y = 0; y < SH; ++y) {
+            dark += sm[size_t(y) * SW + 50] >= 1;
+            if (y < 64) lightTop += sm[size_t(y) * SW + 121] >= 1;
+            else lightBottom += sm[size_t(y) * SW + 121] > 0;
+            for (int x : {30, 100, 158, 160, 165, 171, 179, 180, 185}) wrong += sm[size_t(y) * SW + x] > 0;
+        }
+        QCOMPARE(dark, SH);
+        QCOMPARE(lightTop, 64);
+        QCOMPARE(lightBottom, 0);
+        QCOMPARE(wrong, 0);
+        Image unscratched = scratched;
+        fillAcross(unscratched, sm);
+        float scratchError = 0;
+        for (int y = 0; y < SH; ++y)
+            for (int x : {50, 120, 121, 122}) scratchError = std::max(scratchError, std::fabs(unscratched.at(x, y)[0] - plain.at(x, y)[0]));
+        QVERIFY2(scratchError < 0.03f, std::to_string(scratchError).c_str());
+        // A setting for dark scratches leaves the light one.
+        ss.polarity = 1;
+        const std::vector<float> darkOnly = detectScratches(scratched, ss);
+        QVERIFY(darkOnly[size_t(10) * SW + 50] >= 1 && darkOnly[size_t(10) * SW + 121] == 0);
+
+        // Patch Fill: a logo on a wall lit brighter to the right, covered from the same wall 80 pixels left (two
+        // periods of its pattern), seamlessly: the light matches and no edge shows. Copied plainly, it is too dark.
+        auto wall = [](int x, int y) { return float(0.3 + 0.4 * x / 200.0 + 0.05 * std::sin(x * 2 * M_PI / 40) * std::sin(y * 2 * M_PI / 40)); };
+        Image withLogo(SW, SH);
+        for (int y = 0; y < SH; ++y)
+            for (int x = 0; x < SW; ++x) {
+                const float v = x >= 120 && x < 150 && y >= 40 && y < 70 ? 0.95f : wall(x, y);
+                float* q = withLogo.at(x, y);
+                q[0] = v, q[1] = v, q[2] = v, q[3] = 1;
+            }
+        Effect patch = makeEffect("patch_fill", 1);
+        patch.params["mask.shape"] = 2.0;
+        patch.params["mask.x"] = 135.0 / SW;
+        patch.params["mask.y"] = 55.0 / SH;
+        patch.params["mask.w"] = 40.0 / SW;
+        patch.params["mask.h"] = 40.0 / SH;
+        patch.params["mask.feather"] = 0.0;
+        patch.params["source_x"] = -80.0 / SW;
+        auto patchError = [&](const Image& img, bool inside) {
+            float e = 0;
+            for (int y = 0; y < SH; ++y)
+                for (int x = 0; x < SW; ++x) {
+                    const bool in = x >= 114 && x < 156 && y >= 34 && y < 76;
+                    if (in == inside) e = std::max(e, std::fabs(img.at(x, y)[0] - (inside ? wall(x, y) : withLogo.at(x, y)[0])));
+                }
+            return e;
+        };
+        Image seamless = withLogo;
+        applyVideoEffect(patch, 0, seamless, 1.0);
+        QVERIFY2(patchError(seamless, true) < 0.01f, std::to_string(patchError(seamless, true)).c_str());
+        QCOMPARE(patchError(seamless, false), 0.0f);
+        patch.params["blend"] = 1.0;
+        Image copied = withLogo;
+        applyVideoEffect(patch, 0, copied, 1.0);
+        QVERIFY(patchError(copied, true) > 0.1f);
+
+        // Paint: a heal stroke over the logo on frame 3 only; strokes kept as text.
+        Effect paint = makeEffect("paint", 2);
+        PaintStroke heal;
+        heal.heal = true;
+        heal.frame = 3;
+        heal.dx = -80.0 / SW;
+        heal.radius = 25.0 / SW;
+        heal.softness = 0.2;
+        heal.points = {{134.5 / SW, 54.5 / SH}, {135.5 / SW, 55.5 / SH}};
+        PaintStroke clone = heal;
+        clone.heal = false;
+        clone.hold = true;
+        clone.track = true;
+        clone.frame = 0;
+        clone.radius = 4.0 / SW;
+        clone.points = {{40.5 / SW, 100.5 / SH}};
+        paint.strings["strokes"] = paintStrokesToString({heal, clone});
+        const std::vector<PaintStroke> back = paintStrokesFromString(paint.strings["strokes"]);
+        QCOMPARE(int(back.size()), 2);
+        QVERIFY(back[0].heal && !back[0].hold && back[0].frame == 3 && back[0].points.size() == 2 && !back[1].heal && back[1].hold && back[1].track);
+        QVERIFY(std::fabs(back[0].dx - heal.dx) < 1e-6 && std::fabs(back[1].points[0][1] - clone.points[0][1]) < 1e-6);
+        Image healed = withLogo;
+        applyVideoEffect(paint, 3, healed, 1.0);
+        float healError = 0;
+        for (int y = 40; y < 70; ++y)
+            for (int x = 120; x < 150; ++x) healError = std::max(healError, std::fabs(healed.at(x, y)[0] - wall(x, y)));
+        QVERIFY2(healError < 0.015f, std::to_string(healError).c_str());
+        // The clone stroke copies exactly at its centre (from 80 pixels left, off the frame's edge held).
+        QVERIFY(std::fabs(healed.at(40, 100)[0] - withLogo.at(0, 100)[0]) < 1e-4f);
+        Image later = withLogo;
+        applyVideoEffect(paint, 4, later, 1.0);  // the heal was on frame 3 alone
+        QVERIFY(later.at(135, 55)[0] > 0.9f);
+        // A tracked stroke follows the mask's box: moved 20 pixels right by frame 5.
+        paint.params["mask.x"].addKey(0, 0.5);
+        paint.params["mask.x"].addKey(5, 0.6);
+        const std::vector<PaintStrokeAt> at5 = paintStrokesAt(paint, 5, SW, SH);
+        QCOMPARE(int(at5.size()), 1);
+        QVERIFY(std::fabs(at5[0].points[0][0] - 60.0) < 1e-6 && std::fabs(at5[0].dx + 80) < 1e-6);
+        // The mask does not limit the strokes: one outside the box still paints.
+        Effect outside = makeEffect("paint", 1);
+        outside.params["mask.shape"] = Param(2.0);
+        outside.params["mask.w"] = Param(0.1);
+        outside.params["mask.h"] = Param(0.1);
+        PaintStroke corner;
+        corner.frame = 0;
+        corner.dx = 0.25;
+        corner.radius = 0.03;
+        corner.points = {{0.1, 0.5}};
+        outside.strings["strokes"] = paintStrokesToString({corner});
+        Image painted = withLogo;
+        applyVideoEffect(outside, 0, painted, 1.0);
+        QVERIFY(std::fabs(painted.at(int(0.1 * SW), SH / 2)[0] - withLogo.at(int(0.35 * SW), SH / 2)[0]) < 1e-3f);
+
+        // A razor cut and a head trim keep spots and strokes on their pictures' frames.
+        Clip clip;
+        clip.start = 0;
+        clip.duration = 100;
+        Effect spots = makeEffect("dust_spots", 2), strokes = makeEffect("paint", 3);
+        spots.strings["spots"] = dustSpotsToString({{60, 0.5, 0.5, 0.02}, {20, 0.4, 0.4, 0.02}});
+        PaintStroke at70;
+        at70.frame = 70;
+        at70.points = {{0.5, 0.5}};
+        strokes.strings["strokes"] = paintStrokesToString({at70});
+        clip.effects = {spots, strokes};
+        const Clip right = edit::subClip(clip, 50, 100);
+        const std::vector<DustSpot> moved = dustSpotsFromString(right.effects[0].s("spots"));
+        QCOMPARE(int(moved.size()), 2);
+        QCOMPARE(moved[0].frame, int64_t(10));
+        QCOMPARE(moved[1].frame, int64_t(-30));  // (before the part: never shown, kept for an undo of the trim)
+        QVERIFY(std::fabs(moved[0].x - 0.5) < 1e-9 && std::fabs(moved[0].r - 0.02) < 1e-9);
+        QCOMPARE(paintStrokesFromString(right.effects[1].s("strokes"))[0].frame, int64_t(20));
+        QVERIFY(hasDustSpotAt(right.effects[0].s("spots"), 10) && !hasDustSpotAt(right.effects[0].s("spots"), 60));
+
+        // Scratch Removal on a picture narrower than two scratch widths finds nothing (and reads nothing outside it).
+        ScratchSettings wide;
+        wide.maxWidth = 32;
+        QVERIFY(detectScratches(Image(64, 64), wide) == std::vector<float>(64 * 64, 0.0f));
     }
 
     void effectMasks() {

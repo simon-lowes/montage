@@ -59,6 +59,7 @@
 #include "render/ColorSlice.h"
 #include "render/Compositor.h"
 #include "render/OGraf.h"
+#include "render/Restoration.h"
 #include "render/Ocio.h"
 
 namespace montage {
@@ -858,6 +859,84 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             // Deferred: the analysis waits in an event loop, and the Inspector may rebuild meanwhile.
             connect(analyze, &QPushButton::clicked, this,
                     [this, owner, eid] { QTimer::singleShot(0, this, [this, owner, eid] { analyzeStabilize(owner, eid); }); });
+        }
+        if ((e.type == "paint" || e.type == "dust_spots") && onClip) {
+            // Strokes and spots are drawn on the Program monitor while the effect is armed (app/PaintOverlay).
+            const bool dust = e.type == "dust_spots";
+            const char* key = dust ? "spots" : "strokes";
+            auto* row = new QWidget(content_);
+            auto* rv = new QVBoxLayout(row);
+            rv->setContentsMargins(0, 0, 0, 0);
+            auto* status = new QLabel(row);
+            status->setObjectName(QStringLiteral("paintStatus"));
+            status->setWordWrap(true);
+            const int n = dust ? int(dustSpotsFromString(e.s(key)).size()) : int(paintStrokesFromString(e.s(key)).size());
+            status->setText(dust ? tr("%n spot(s) marked. Click dirt on the Program monitor to mark it on that frame; "
+                                      "Ctrl-click a spot to remove it.", "", n)
+                                 : tr("%n stroke(s). Alt-click the Program monitor where to copy from, then paint; Esc stops.", "", n));
+            auto* buttons = new QWidget(row);
+            auto* bh = new QHBoxLayout(buttons);
+            bh->setContentsMargins(0, 0, 0, 0);
+            auto* arm = new QPushButton(dust ? tr("Mark Spots on the Monitor") : tr("Paint on the Monitor"), buttons);
+            arm->setObjectName(QStringLiteral("paintOnMonitor"));
+            arm->setCheckable(true);
+            arm->setChecked(state_->paintEffect() == eid);
+            if (dust) {
+                // Spots are taken out where a video or picture file is read.
+                const Clip* c = edit::clipById(*state_->sequence(), owner);
+                const MediaItem* m = c ? state_->project().findMedia(c->mediaId) : nullptr;
+                if (!m || (m->kind != MediaKind::Video && m->kind != MediaKind::Image)) {
+                    arm->setEnabled(false);
+                    arm->setToolTip(tr("Dust spots are taken out of video and picture files, not nested sequences or generators"));
+                }
+            }
+            auto* clearFrame = new QPushButton(tr("Clear This Frame"), buttons);
+            clearFrame->setObjectName(QStringLiteral("paintClearFrame"));
+            clearFrame->setToolTip(dust ? tr("Remove the spots marked on this frame") : tr("Remove the strokes drawn on this frame"));
+            auto* clearAll = new QPushButton(tr("Clear All"), buttons);
+            clearAll->setObjectName(QStringLiteral("paintClearAll"));
+            bh->addWidget(arm);
+            bh->addWidget(clearFrame);
+            bh->addWidget(clearAll);
+            bh->addStretch(1);
+            rv->addWidget(status);
+            rv->addWidget(buttons);
+            f->addRow(QString(), row);
+            connect(arm, &QPushButton::toggled, this, [this, eid](bool on) {
+                if (on) state_->setPaintEffect(eid);
+                else if (state_->paintEffect() == eid) state_->setPaintEffect(0);
+            });
+            connect(state_, &EditorState::paintEffectChanged, arm, [this, arm, eid] {
+                const QSignalBlocker block(arm);
+                arm->setChecked(state_->paintEffect() == eid);
+            });
+            auto clear = [this, owner, eid, dust, key](bool frameOnly) {
+                const Sequence* sq = state_->sequence();
+                const Clip* c = sq ? edit::clipById(*sq, owner) : nullptr;
+                if (!c || (frameOnly && !c->contains(state_->playhead()))) return;
+                const int64_t lt = state_->playhead() - c->start;
+                state_->edit(frameOnly ? tr("Clear Frame") : tr("Clear All"), [=](Project&, Sequence& s) {
+                    Effect* ef = edit::ownedEffect(s, owner, eid);
+                    if (!ef || ef->s(key).empty()) return false;
+                    if (!frameOnly) {
+                        ef->strings.erase(key);
+                        return true;
+                    }
+                    size_t removed = 0;
+                    if (dust) {
+                        std::vector<DustSpot> spots = dustSpotsFromString(ef->s(key));
+                        removed = std::erase_if(spots, [lt](const DustSpot& d) { return d.frame == lt; });
+                        ef->strings[key] = dustSpotsToString(spots);
+                    } else {
+                        std::vector<PaintStroke> strokes = paintStrokesFromString(ef->s(key));
+                        removed = std::erase_if(strokes, [lt](const PaintStroke& p) { return p.frame == lt; });
+                        ef->strings[key] = paintStrokesToString(strokes);
+                    }
+                    return removed > 0;
+                });
+            };
+            connect(clearFrame, &QPushButton::clicked, this, [clear] { clear(true); });
+            connect(clearAll, &QPushButton::clicked, this, [clear] { clear(false); });
         }
         if (e.type == "camera_track" && onClip) {
             // The solve lives in the effect; titles are placed from it, and it is exported for 3D programs.
