@@ -65,8 +65,9 @@ struct CryptomatteFrame {
     std::vector<float> matte(const std::vector<float>& ids) const;
 };
 bool readCryptomatte(const std::string& file, const std::string& name, CryptomatteFrame& out, std::string* error = nullptr);
-// The same, kept for the few frames last asked for (a mask reads the same frame for every effect that uses it).
-std::shared_ptr<const CryptomatteFrame> cachedCryptomatte(const std::string& file, const std::string& name);
+// The same, kept for the few frames last asked for (a mask reads the same frame for every effect that uses it); with
+// `read` false, only one already kept (null otherwise), for the GUI thread.
+std::shared_ptr<const CryptomatteFrame> cachedCryptomatte(const std::string& file, const std::string& name, bool read = true);
 
 // Cryptomatte's ids: MurmurHash3 (x86, 32-bit, seed 0) of the name, its bits a float (never a NaN, infinity or
 // denormal); written in manifests and in Montage's lists as 8 hex digits.

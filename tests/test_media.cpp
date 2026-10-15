@@ -21504,7 +21504,7 @@ private slots:
         // bare Z, 32-bit) and a Cryptomatte naming the left "ball" and the right "floor".
         const int W = 64, H = 36;
         const float ball = cryptomatteId("ball"), floor = cryptomatteId("floor");
-        QCOMPARE(cryptomatteHex(cryptomatteId("bunny")), std::string("13851a76"));  // (as Psyop's sample manifest gives it)
+        QCOMPARE(cryptomatteHex(cryptomatteId("bunny")), std::string("13851a76"));  // (as Cryptomatte's sample manifest gives it)
         auto frame = [&](int n) {
             std::vector<ExrOutLayer> layers(4);
             layers[0].channels = {"R", "G", "B", "A"};
@@ -21661,10 +21661,23 @@ private slots:
         res = call("montage_place_media", {{"project", project}, {"media", QString::fromStdString(path("render.0001.exr"))}, {"image_sequence", true},
                                         {"fps", 24}, {"layer", "specular"}});
         QVERIFY(res.value("isError").toBool());
+        // A mask of the Cryptomatte's ball, added over MCP; ids that aren't hex are refused.
+        const double mcpClip = double(back.active()->videoTracks[0].clips.at(0).id);
+        res = call("montage_add_effect", {{"project", project}, {"clip", mcpClip}, {"effect", "invert"}, {"params", QJsonObject{{"mask.shape", 7}}},
+                                          {"strings", QJsonObject{{"mask.crypto_layer", "CryptoObject"}, {"mask.crypto_ids", QString::fromStdString(cryptomatteHex(ball))}}}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        res = call("montage_add_effect", {{"project", project}, {"clip", mcpClip}, {"effect", "invert"}, {"strings", QJsonObject{{"mask.crypto_ids", "ball"}}}});
+        QVERIFY(res.value("isError").toBool());
+        QVERIFY(loadProject(project.toStdString(), back));
+        bool masked = false;
+        for (const Clip& bc : back.active()->videoTracks[0].clips)
+            for (const Effect& e : bc.effects)
+                masked |= e.type == "invert" && e.s("mask.crypto_ids") == cryptomatteHex(ball) && e.s("mask.crypto_layer") == "CryptoObject";
+        QVERIFY(masked);
     }
 
     void cryptomatteSamples() {
-        // Psyop's sample renders (github.com/Psyop/Cryptomatte, sample_images): manifests in the header and beside it,
+        // Cryptomatte's sample renders (github.com/Psyop/Cryptomatte, sample_images): manifests in the header and beside it,
         // names that aren't ASCII, several Cryptomattes and layers in one file.
         const QString dir = qEnvironmentVariable("MONTAGE_CRYPTOMATTE_SAMPLES");
         if (!exrAvailable() || dir.isEmpty() || !QFile::exists(dir + "/bunny_CryptoObject.exr"))

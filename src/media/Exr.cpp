@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <list>
 #include <mutex>
 #include <set>
@@ -151,14 +152,11 @@ void readManifest(const std::string& file, const Imf::Header& h, const std::stri
     if (json.empty()) {
         // A sidecar beside the file (never above it).
         const std::string side = stringAttr(h, "cryptomatte/" + key + "/manif_file");
-        if (!side.empty() && side.find("..") == std::string::npos && side[0] != '/' && side[0] != '\\') {
-            const auto path = std::filesystem::u8path(file).parent_path() / std::filesystem::u8path(side);
-            if (FILE* f = std::fopen(path.string().c_str(), "rb")) {
-                char buf[65536];
-                size_t n;
-                while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) json.append(buf, n);
-                std::fclose(f);
-            }
+        const auto rel = std::filesystem::u8path(side);
+        if (!side.empty() && side.find("..") == std::string::npos && !rel.is_absolute() && !rel.has_root_name() && !rel.has_root_directory()) {
+            // (a stream opened by path, not by narrow string, so folders with names that aren't ASCII open on Windows)
+            std::ifstream f(std::filesystem::u8path(file).parent_path() / rel, std::ios::binary);
+            json.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
         }
     }
     if (json.empty()) return;
@@ -178,6 +176,7 @@ bool locate(const Imf::MultiPartInputFile& in, const std::string& layer, Located
         Located l;
         l.part = p;
         for (auto it = h.channels().begin(); it != h.channels().end(); ++it) {
+            if (it.channel().xSampling != 1 || it.channel().ySampling != 1) continue;  // (luminance-chroma's RY, BY: Y alone, grey)
             std::string prefix, suffix;
             splitChannel(it.name(), prefix, suffix);
             const int slot = slotOf(suffix);
@@ -293,6 +292,7 @@ bool readExrInfo(const std::string& file, ExrInfo& out, std::string* error) {
             std::map<std::string, ExrLayer> layers;
             std::vector<std::string> order;
             for (auto it = h.channels().begin(); it != h.channels().end(); ++it) {
+                if (it.channel().xSampling != 1 || it.channel().ySampling != 1) continue;  // (subsampled chroma: not read)
                 std::string prefix, suffix;
                 splitChannel(it.name(), prefix, suffix);
                 if (cryptoPrefixes.count(prefix)) continue;
@@ -393,25 +393,34 @@ bool readExrChannels(const std::string& file, int& width, int& height, std::vect
         const Imath::Box2i disp = in.header(0).displayWindow();
         width = disp.max.x - disp.min.x + 1;
         height = disp.max.y - disp.min.y + 1;
+        std::set<std::string> takenCryptoNames;
         for (int p = 0; p < in.parts(); ++p) {
             const Imf::Header& h = in.header(p);
             if (h.hasType() && h.type().find("deep") != std::string::npos) continue;
             const std::string part = partPrefix(h, in.parts());
-            // Which Cryptomatte each channel prefix belongs to, and the header entries naming them.
-            std::map<std::string, std::string> cryptoOf;
+            // Which Cryptomatte each channel prefix belongs to (its listed name, and the prefix it is copied under), and
+            // the header entries naming them. A Cryptomatte keeps its own name, so readers find it, unless another part's
+            // already took it; then it and its key are made the part's.
+            std::map<std::string, std::pair<std::string, std::string>> cryptoOf;
             for (const auto& [key, name] : cryptoKeys(h)) {
+                const std::string outName = takenCryptoNames.insert(name).second ? name : joinName(part, name);
+                takenCryptoNames.insert(outName);
+                std::string outKey = key;
+                if (attributes && attributes->count("cryptomatte/" + key + "/name")) outKey = cryptomatteHex(cryptomatteId(outName)).substr(0, 7);
                 for (auto it = h.channels().begin(); it != h.channels().end(); ++it) {
                     std::string prefix, suffix;
                     splitChannel(it.name(), prefix, suffix);
-                    if (cryptoGroup(prefix, name) >= 0 || prefix == name) cryptoOf[prefix] = joinName(part, name);
+                    if (cryptoGroup(prefix, name) >= 0 || prefix == name)
+                        cryptoOf[prefix] = {joinName(part, name), outName + prefix.substr(name.size())};
                 }
                 if (!attributes) continue;
-                for (const char* k : {"name", "hash", "conversion"})
-                    if (const std::string v = stringAttr(h, "cryptomatte/" + key + "/" + k); !v.empty()) (*attributes)["cryptomatte/" + key + "/" + k] = v;
+                (*attributes)["cryptomatte/" + outKey + "/name"] = outName;
+                for (const char* k : {"hash", "conversion"})
+                    if (const std::string v = stringAttr(h, "cryptomatte/" + key + "/" + k); !v.empty()) (*attributes)["cryptomatte/" + outKey + "/" + k] = v;
                 if (const Cryptomatte* c = info.cryptomatte(joinName(part, name)); c && !c->objects.empty()) {
                     QJsonObject manifest;
                     for (const auto& [object, id] : c->objects) manifest[QString::fromStdString(object)] = QString::fromStdString(cryptomatteHex(id));
-                    (*attributes)["cryptomatte/" + key + "/manifest"] = QJsonDocument(manifest).toJson(QJsonDocument::Compact).toStdString();
+                    (*attributes)["cryptomatte/" + outKey + "/manifest"] = QJsonDocument(manifest).toJson(QJsonDocument::Compact).toStdString();
                 }
             }
             // The channels in groups, read as floats over the data window.
@@ -428,7 +437,8 @@ bool readExrChannels(const std::string& file, int& width, int& height, std::vect
                 ExrCopiedLayer key;
                 key.layer.name = joinName(part, prefix);
                 if (const auto c = cryptoOf.find(prefix); c != cryptoOf.end()) {
-                    key.listedAs = c->second;
+                    key.listedAs = c->second.first;
+                    key.layer.name = c->second.second;
                     key.cryptomatte = true;
                 } else {
                     key.listedAs = prefix.empty() && !mainChannel(suffix) ? joinName(part, suffix) : key.layer.name;
@@ -540,21 +550,25 @@ bool readCryptomatte(const std::string& file, const std::string& name, Cryptomat
         out.ranks = int(c->channels.size() / 2);
         out.crypto = *c;
         const int n = int(c->channels.size()), dwW = dw.max.x - dw.min.x + 1, dwH = dw.max.y - dw.min.y + 1;
-        std::vector<float> data(size_t(dwW) * dwH * n, 0.0f);
+        // Read straight into the frame when the data window is the display window (as renders mostly write them).
+        const bool whole = dw == disp;
+        std::vector<float> data;
+        out.pairs.assign(size_t(out.width) * out.height * n, 0.0f);
+        float* const into = whole ? out.pairs.data() : (data.assign(size_t(dwW) * dwH * n, 0.0f), data.data());
         Imf::FrameBuffer fb;
         for (int k = 0; k < n; ++k) {
-            char* base = reinterpret_cast<char*>(data.data() + k) - (ptrdiff_t(dw.min.y) * dwW + dw.min.x) * ptrdiff_t(n * sizeof(float));
+            char* base = reinterpret_cast<char*>(into + k) - (ptrdiff_t(dw.min.y) * dwW + dw.min.x) * ptrdiff_t(n * sizeof(float));
             // (ids must be read as stored: 32-bit floats, never through half)
             fb.insert(c->channels[size_t(k)], Imf::Slice(Imf::FLOAT, base, n * sizeof(float), size_t(dwW) * n * sizeof(float)));
         }
         Imf::InputPart ip(in, part);
         ip.setFrameBuffer(fb);
         ip.readPixels(dw.min.y, dw.max.y);
-        out.pairs.assign(size_t(out.width) * out.height * n, 0.0f);
-        for (int y = std::max(dw.min.y, disp.min.y); y <= std::min(dw.max.y, disp.max.y); ++y)
-            std::memcpy(&out.pairs[(size_t(y - disp.min.y) * out.width + size_t(std::max(dw.min.x, disp.min.x) - disp.min.x)) * n],
-                        &data[(size_t(y - dw.min.y) * dwW + size_t(std::max(dw.min.x, disp.min.x) - dw.min.x)) * n],
-                        size_t(std::max(0, std::min(dw.max.x, disp.max.x) - std::max(dw.min.x, disp.min.x) + 1)) * n * sizeof(float));
+        const int x0 = std::max(dw.min.x, disp.min.x), x1 = std::min(dw.max.x, disp.max.x);
+        if (!whole && x1 >= x0)
+            for (int y = std::max(dw.min.y, disp.min.y); y <= std::min(dw.max.y, disp.max.y); ++y)
+                std::memcpy(&out.pairs[(size_t(y - disp.min.y) * out.width + size_t(x0 - disp.min.x)) * n],
+                            &data[(size_t(y - dw.min.y) * dwW + size_t(x0 - dw.min.x)) * n], size_t(x1 - x0 + 1) * n * sizeof(float));
         return true;
     } catch (const std::exception& e) {
         if (error) *error = "Cannot read " + file + ": " + e.what();
@@ -597,7 +611,7 @@ std::shared_ptr<const ExrInfo> cachedExrInfo(const std::string& file) {
     return info;
 }
 
-std::shared_ptr<const CryptomatteFrame> cachedCryptomatte(const std::string& file, const std::string& name) {
+std::shared_ptr<const CryptomatteFrame> cachedCryptomatte(const std::string& file, const std::string& name, bool read) {
     static std::mutex mutex;
     static std::list<std::pair<std::string, std::shared_ptr<const CryptomatteFrame>>> recent;  // newest first
     const std::string key = fileKey(file) + '\n' + name;
@@ -609,11 +623,20 @@ std::shared_ptr<const CryptomatteFrame> cachedCryptomatte(const std::string& fil
                 return it->second;
             }
     }
+    if (!read) return nullptr;
     auto frame = std::make_shared<CryptomatteFrame>();
     if (!readCryptomatte(file, name, *frame)) frame.reset();
     std::lock_guard<std::mutex> lock(mutex);
     recent.emplace_front(key, frame);
-    while (recent.size() > 6) recent.pop_back();
+    // A few frames, as long as they stay small: a 4K frame of six ranks is over 400 MB.
+    size_t bytes = 0, kept = 0;
+    for (auto it = recent.begin(); it != recent.end(); ++it, ++kept) {
+        bytes += it->second ? it->second->pairs.size() * sizeof(float) : 0;
+        if (kept >= 6 || (kept >= 1 && bytes > (size_t(512) << 20))) {
+            recent.erase(it, recent.end());
+            break;
+        }
+    }
     return frame;
 }
 

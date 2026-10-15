@@ -486,7 +486,8 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         m.kind = sequence ? MediaKind::Video : MediaKind::Image;
         m.hasVideo = true;
         m.hasAudio = false;
-        m.width = info.width;
+        const double par = in.par > 0 ? in.par : info.pixelAspect;
+        m.width = std::max(1, int(std::lround(info.width * (par > 0 ? par : 1.0))));
         m.height = info.height;
         m.fps = sequence ? seq.fps : m.fps;
         m.duration = sequence ? seq.frames() / seq.fps.toDouble() : 0;
@@ -774,8 +775,10 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
         }
         exr_ = std::make_unique<ImageSequence>(seq);
         if (!sequence) exrFile_ = uninterpretedPath(path), exr_->first = exr_->last = 0;
+        exrLayer_ = in.layer.empty() && !info.hasLayer("") && !info.layers.empty() ? info.layers[0].name : in.layer;
         rawFrame_ = -1;
-        dispW_ = info.width;
+        const double par = par_ > 0 ? par_ : info.pixelAspect;  // (Interpret Footage's, else the file's)
+        dispW_ = std::max(1, int(std::lround(info.width * (par > 0 ? par : 1.0))));
         dispH_ = info.height;
         fps_ = sequence ? seq.fps.toDouble() : 25.0;
         duration_ = sequence ? seq.frames() / fps_ : 0;
@@ -1317,7 +1320,7 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
             int w = 0, h = 0;
             std::vector<float> rgba;
             std::string err;
-            if (!readExrLayer(exrFile_.empty() ? imageSequenceFrame(seq, n) : exrFile_, interp_.layer, w, h, rgba, &err) ||
+            if (!readExrLayer(exrFile_.empty() ? imageSequenceFrame(seq, n) : exrFile_, exrLayer_, w, h, rgba, &err) ||
                 !rawFrame(w, h, &err, AV_PIX_FMT_RGBA64))
                 return nullptr;
             parallelRows(h, [&](int y0, int y1) {

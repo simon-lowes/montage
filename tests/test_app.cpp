@@ -14654,6 +14654,9 @@ print("added " + ui["name"])
         QTRY_VERIFY(static_cast<QLabel*>(visible("cryptomatteStatus"))->text() == "ball");
         QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(260, 90));
         QTRY_VERIFY(static_cast<QLabel*>(visible("cryptomatteStatus"))->text() == "ball, floor");
+        // Choosing the Cryptomatte already shown (the file's first, none named) keeps the picks.
+        emit static_cast<QComboBox*>(visible("cryptomatteLayer"))->activated(0);
+        QCOMPARE(parseCryptomatteIds(ids()).size(), size_t(2));
         // The matte: the inverted ball (diffuse red becomes cyan) and floor.
         const Image both = renderProgramFrame(state()->project(), *state()->sequence(), 0, RenderOptions{});
         QVERIFY(both.at(60, 90)[0] < 0.05f && both.at(260, 90)[1] < 0.05f);

@@ -100,6 +100,12 @@ if(MONTAGE_WITH_OPENEXR)
     GIT_TAG v3.5.2
     GIT_SHALLOW TRUE)
   FetchContent_MakeAvailable(openexr)
+  if(NOT WIN32)
+    # zstd marks its API visibility("default") over OpenEXRCore's hidden default, so the executable would export its
+    # zstd and shared libraries that use the system libzstd (Qt, libtiff) would bind to this copy instead.
+    target_compile_definitions(OpenEXRCore PRIVATE "ZSTDLIB_VISIBLE=__attribute__((visibility(\"hidden\")))"
+                                                   "ZSTDERRORLIB_VISIBLE=__attribute__((visibility(\"hidden\")))")
+  endif()
   set(BUILD_SHARED_LIBS ${MONTAGE_SAVED_BUILD_SHARED_LIBS})
   set(BUILD_TESTING ${MONTAGE_SAVED_BUILD_TESTING})
   set(CMAKE_POSITION_INDEPENDENT_CODE ${MONTAGE_SAVED_PIC})

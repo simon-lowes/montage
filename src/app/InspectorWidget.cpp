@@ -1216,11 +1216,23 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                 layer->setCurrentIndex(std::max(0, layer->findData(QString::fromStdString(chosen))));
                 layer->setEnabled(layer->count() > 1);
                 mf->addRow(tr("Cryptomatte:"), layer);
-                connect(layer, &QComboBox::activated, this, [this, owner, eid, layer](int idx) {
+                // Kept up with undo, redo and edits from elsewhere ("" is the file's first).
+                refreshers_.push_back([this, owner, eid, layer] {
+                    const Sequence* s = state_->sequence();
+                    const Effect* ef = s ? edit::ownedEffect(const_cast<Sequence&>(*s), owner, eid) : nullptr;
+                    if (!ef) return;
+                    const QSignalBlocker block(layer);
+                    layer->setCurrentIndex(std::max(0, layer->findData(QString::fromStdString(ef->s("mask.crypto_layer")))));
+                });
+                connect(layer, &QComboBox::activated, this, [this, owner, eid, layer, exr](int idx) {
                     const std::string name = layer->itemData(idx).toString().toStdString();
-                    state_->edit(tr("Choose Cryptomatte"), [owner, eid, name](Project&, Sequence& s) {
+                    state_->edit(tr("Choose Cryptomatte"), [owner, eid, name, exr](Project&, Sequence& s) {
                         Effect* ef = edit::ownedEffect(s, owner, eid);
-                        if (!ef || ef->s("mask.crypto_layer") == name) return false;
+                        if (!ef) return false;
+                        // (choosing the one shown again, the file's first when none was named, changes nothing)
+                        const std::string old = ef->s("mask.crypto_layer");
+                        const Cryptomatte* was = exr ? exr->cryptomatte(old) : nullptr;
+                        if (old == name || (was && was->name == name)) return false;
                         // Ids belong to one Cryptomatte: picks in another name other things.
                         ef->strings["mask.crypto_layer"] = name;
                         ef->strings["mask.crypto_ids"].clear();

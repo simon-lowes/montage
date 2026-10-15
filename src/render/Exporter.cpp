@@ -1563,8 +1563,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (issues.incomplete) return fail(cancel && cancel->load() ? std::string("Export cancelled") : issues.reason());
             if (measure) meter.add(img, f, measured);
             if (exrLibrary) {
-                // Through the OpenEXR library: the picture as half floats (alpha as FFmpeg's writer leaves it), then any
-                // more layers, under the file name FFmpeg's image writer would give it.
+                // Through the OpenEXR library: the picture as half floats, premultiplied as OpenEXR files are (and as the
+                // layers copied beside it and Montage's own reader take them), then any more layers, under the file name
+                // FFmpeg's image writer would give it.
                 if (img.width != W || img.height != H) img = resizeImage(img, W, H);
                 std::vector<ExrOutLayer> layers(1);
                 layers[0].channels = s.alpha ? std::vector<std::string>{"R", "G", "B", "A"} : std::vector<std::string>{"R", "G", "B"};
@@ -1575,11 +1576,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                         const float* src = img.row(y);
                         float* dst = &layers[0].data[size_t(y) * size_t(W) * nc];
                         for (int x = 0; x < W; ++x, src += 4, dst += nc) {
-                            const float al = src[3], k = s.alpha && al > 1e-6f ? 1.0f / al : s.alpha ? 0.0f : 1.0f;
-                            dst[0] = src[0] * k;
-                            dst[1] = src[1] * k;
-                            dst[2] = src[2] * k;
-                            if (s.alpha) dst[3] = al;
+                            dst[0] = src[0];
+                            dst[1] = src[1];
+                            dst[2] = src[2];
+                            if (s.alpha) dst[3] = src[3];
                         }
                     }
                 });

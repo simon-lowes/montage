@@ -2177,6 +2177,19 @@ void McpServer::Impl::addTools() {
                     e.strings[name] = value;
                     continue;
                 }
+                if (name == "mask.crypto_layer" || name == "mask.crypto_ids") {
+                    // The mask's Cryptomatte (mask.shape 7), as the mask's own params are taken.
+                    if (!supportsMask(type)) throw ArgError{QStringLiteral("\"%1\" cannot have a mask").arg(QString::fromStdString(type))};
+                    const std::string value = it.value().toString().toStdString();
+                    if (name == "mask.crypto_ids") {
+                        float id;
+                        for (const QString& hex : it.value().toString().split(QRegularExpression("[,\\s]+"), Qt::SkipEmptyParts))
+                            if (!parseCryptomatteHex(hex.toStdString(), id))
+                                throw ArgError{QStringLiteral("mask.crypto_ids are ids of 8 hex digits, separated by commas")};
+                    }
+                    e.strings[name] = value;
+                    continue;
+                }
                 const auto si = std::find_if(info->strings.begin(), info->strings.end(), [&](const StringParamInfo& x) { return x.name == name; });
                 if (si == info->strings.end())
                     throw ArgError{QStringLiteral("\"%1\" has no text setting \"%2\"").arg(QString::fromStdString(type), it.key())};

@@ -137,8 +137,11 @@ private:
     bool objectPress(const QPointF& pos);
     void objectRelease(const QPointF& pos, Qt::KeyboardModifiers mods);
 
-    mutable QImage cryptoTint_;
-    mutable QString cryptoTintKey_;
+    void requestCryptoTint(const CryptoTarget& t, const QString& key) const;
+    // Each Cryptomatte mask's picked objects tinted, by effect: what it shows (frame, Cryptomatte, picks) and the tint,
+    // made in the background so playing or scrubbing never waits on the file.
+    mutable std::map<Id, std::pair<QString, QImage>> cryptoTints_;
+    mutable bool cryptoTinting_ = false;
     QString cryptoHover_;  // the object under the pointer
     QPointF hoverPos_;
     EditorState* state_;

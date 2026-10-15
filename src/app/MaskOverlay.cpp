@@ -462,35 +462,54 @@ bool MaskOverlay::cryptoPress(const QPointF& pos, Qt::KeyboardModifiers mods) {
     return false;
 }
 
+void MaskOverlay::requestCryptoTint(const CryptoTarget& t, const QString& key) const {
+    if (cryptoTinting_) return;  // (one at a time; the next paint asks for whatever is shown then)
+    cryptoTinting_ = true;
+    auto* self = const_cast<MaskOverlay*>(this);
+    auto* watcher = new QFutureWatcher<QImage>(self);
+    const Id effect = t.effect;
+    connect(watcher, &QFutureWatcher<QImage>::finished, self, [this, watcher, effect, key] {
+        watcher->deleteLater();
+        cryptoTinting_ = false;
+        cryptoTints_[effect] = {key, watcher->result()};
+        viewer_->update();
+    });
+    watcher->setFuture(QtConcurrent::run([file = t.file, layer = t.layer, ids = t.ids] {
+        const auto cm = cachedCryptomatte(file, layer);
+        if (!cm || cm->width <= 0) return QImage();
+        const std::vector<float> matte = cm->matte(parseCryptomatteIds(ids));
+        QImage img(cm->width, cm->height, QImage::Format_ARGB32_Premultiplied);
+        for (int y = 0; y < cm->height; ++y) {
+            auto* row = reinterpret_cast<QRgb*>(img.scanLine(y));
+            for (int x = 0; x < cm->width; ++x)
+                row[x] = qPremultiply(qRgba(70, 160, 255, int(matte[size_t(y) * size_t(cm->width) + size_t(x)] * 0.45f * 255)));
+        }
+        return img;
+    }));
+}
+
 void MaskOverlay::paintCryptomattes(QPainter& p) const {
     const auto targets = cryptoTargets();
     if (targets.empty()) return;
     p.save();
     p.setRenderHint(QPainter::Antialiasing);
     p.setRenderHint(QPainter::SmoothPixmapTransform);
+    for (auto it = cryptoTints_.begin(); it != cryptoTints_.end();)  // (masks no longer shown)
+        it = std::none_of(targets.begin(), targets.end(), [&](const CryptoTarget& t) { return t.effect == it->first; }) ? cryptoTints_.erase(it) : std::next(it);
     for (const CryptoTarget& t : targets) {
-        const auto cm = cachedCryptomatte(t.file, t.layer);
-        if (!cm || cm->width <= 0) continue;
+        // The picked objects tinted; until a new frame's or new picks' tint is made, the last one stays.
+        const QString key = QString::fromStdString(t.file + '\n' + t.layer + '\n' + t.ids);
+        const auto& [shown, tint] = cryptoTints_[t.effect];
+        if (shown != key) requestCryptoTint(t, key);
+        if (tint.isNull()) continue;
         QPointF c00, c10, c11, c01;
         if (!toWidget(t.clip, 0, 0, c00) || !toWidget(t.clip, 1, 0, c10) || !toWidget(t.clip, 1, 1, c11) || !toWidget(t.clip, 0, 1, c01))
             continue;
         QTransform tr;
-        if (!QTransform::quadToQuad(QPolygonF(QRectF(0, 0, cm->width, cm->height)), QPolygonF({c00, c10, c11, c01}), tr)) continue;
-        // The picked objects tinted, made again only when the frame or the picks change.
-        const QString key = QString::fromStdString(t.file + '\n' + t.layer + '\n' + t.ids);
-        if (key != cryptoTintKey_) {
-            const std::vector<float> matte = cm->matte(parseCryptomatteIds(t.ids));
-            cryptoTint_ = QImage(cm->width, cm->height, QImage::Format_ARGB32_Premultiplied);
-            for (int y = 0; y < cm->height; ++y) {
-                auto* row = reinterpret_cast<QRgb*>(cryptoTint_.scanLine(y));
-                for (int x = 0; x < cm->width; ++x)
-                    row[x] = qPremultiply(qRgba(70, 160, 255, int(matte[size_t(y) * size_t(cm->width) + size_t(x)] * 0.45f * 255)));
-            }
-            cryptoTintKey_ = key;
-        }
+        if (!QTransform::quadToQuad(QPolygonF(QRectF(0, 0, tint.width(), tint.height())), QPolygonF({c00, c10, c11, c01}), tr)) continue;
         p.save();
         p.setTransform(tr, true);
-        p.drawImage(QRectF(0, 0, cm->width, cm->height), cryptoTint_);
+        p.drawImage(QRectF(0, 0, tint.width(), tint.height()), tint);
         p.restore();
     }
     if (!cryptoHover_.isEmpty()) {
@@ -960,7 +979,7 @@ bool MaskOverlay::eventFilter(QObject* obj, QEvent* e) {
             for (const CryptoTarget& t : cryptoTargets()) {
                 double u, v;
                 if (!fromWidget(t.clip, me->position(), u, v) || u < 0 || v < 0 || u >= 1 || v >= 1) continue;
-                if (const auto cm = cachedCryptomatte(t.file, t.layer); cm && cm->width > 0)
+                if (const auto cm = cachedCryptomatte(t.file, t.layer, false); cm && cm->width > 0)  // (read by the tint)
                     if (const float id = cm->idAt(int(std::floor(u * cm->width)), int(std::floor(v * cm->height))); id != 0) {
                         const std::string name = cm->crypto.objectName(id);
                         hover = QString::fromStdString(name.empty() ? cryptomatteHex(id) : name);
