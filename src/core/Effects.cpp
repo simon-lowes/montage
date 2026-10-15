@@ -427,14 +427,25 @@ std::vector<EffectInfo> buildCatalog() {
                  {pct("strength", "Strength", 0, 100, 100)},
                  {}});
     // Depth (Depth Anything V2 on the clip's source frame): 0 is the farthest part of the picture, 100 the nearest.
+    // Lens Blur (render/LensBlur.h): focus on a depth, on a point (keys rack between the points' depths) or on the
+    // nearest face; the blur is its radius at f/2.8, scaled by the F-Stop.
     c.push_back({"depth_blur", "Lens Blur (Depth)", EffectCategory::VideoFilter, "Depth",
-                 {pct("focus", "Focus Depth", 0, 100, 80), pct("range", "In Focus Range", 0, 100, 10),
+                 {choice("follow", "Focus On", {"Focus Depth", "Focus Point", "Nearest Face"}, 0),
+                  pct("focus", "Focus Depth", 0, 100, 80), num("point_x", "Focus Point X", 0, 1, 0.5, 0.005),
+                  num("point_y", "Focus Point Y", 0, 1, 0.5, 0.005), pct("range", "In Focus Range", 0, 100, 10),
                   pct("falloff", "Falloff", 1, 100, 30), num("radius", "Blur (px)", 0, 100, 12, 0.5),
-                  boolean("near", "Blur Nearer Than Focus", true)},
+                  num("fstop", "F-Stop", 0.7, 22, 2.8, 0.1), boolean("near", "Blur Nearer Than Focus", true),
+                  num("blades", "Aperture Blades (0 Round, 3 to 12)", 0, 12, 0, 1), angle("blade_rotation", "Blade Rotation", 0),
+                  num("squeeze", "Anamorphic Squeeze", 1, 2, 1, 0.05), pct("cat_eye", "Cat's Eye Toward the Edges", 0, 100, 0),
+                  pct("highlights", "Bokeh Highlights", 0, 100, 0), pct("threshold", "Highlight Threshold", 5, 100, 80),
+                  pct("breathing", "Focus Breathing", 0, 100, 0)},
                  {}});
+    for (auto& pi : c.back().params)
+        if (pi.name == "blades") pi.keyframeable = false;
     c.push_back({"depth_fog", "Depth Fog", EffectCategory::VideoFilter, "Depth",
                  {color("color", "Color", 0.78, 0.82, 0.88), pct("amount", "Amount", 0, 100, 70), pct("start", "Starts At Depth", 0, 100, 60),
-                  num("curve", "Thickening", 0.2, 5, 1.5, 0.05)},
+                  num("curve", "Thickening", 0.2, 5, 1.5, 0.05), pct("height", "Thinning With Height", 0, 100, 0),
+                  pct("horizon", "Horizon (From the Top)", 0, 100, 50)},
                  {}});
     c.push_back({"relight", "Relight", EffectCategory::VideoFilter, "Depth",
                  {angle("direction", "Light Direction", 135), num("elevation", "Light Height", 0, 90, 35, 0.5),
@@ -1028,7 +1039,8 @@ bool hasMask(const Effect& e, FrameTime t) {
 }
 
 bool needsFaces(const Effect& e) {
-    return e.enabled && (e.type == "face_refine" || e.type == "blemish_remover" || e.type == "redact_faces");
+    return e.enabled && (e.type == "face_refine" || e.type == "blemish_remover" || e.type == "redact_faces" ||
+                         (e.type == "depth_blur" && std::lround(e.p("follow", 0, 0)) == 2));
 }
 
 bool needsPersonMatte(const Effect& e, FrameTime t) {

@@ -24,6 +24,7 @@
 #include "GpuCompositor.h"
 #include "QualityCheck.h"
 #include "Restoration.h"
+#include "LensBlur.h"
 #include "media/MotionData.h"
 #include "media/Tracking.h"
 #include "media/FaceTracks.h"
@@ -1897,6 +1898,44 @@ void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScal
     }
 }
 
+double depthBlurFocus(const Effect& e, FrameTime t, const std::vector<float>& depth, int W, int H) {
+    const int follow = int(std::lround(e.p("follow", t, 0)));
+    const double manual = e.p("focus", t, 80) / 100;
+    if (follow == 2) {
+        // The nearest face: the median depth of the middle of each face's box, the nearest of them.
+        const std::vector<FaceBox>* faces = currentFaces();
+        double nearest = -1;
+        if (faces)
+            for (const FaceBox& f : *faces) nearest = std::max(nearest, depthAt(depth, W, H, f.x + f.w / 2, f.y + f.h / 2));
+        return nearest >= 0 ? nearest : manual;
+    }
+    if (follow != 1) return manual;
+    // A point: the depth there. With keys, a rack: the depths at the keys either side, on this frame, mixed as the
+    // keys ease from one to the other (so the focus moves in depth, not across the picture).
+    const auto px = e.params.find("point_x"), py = e.params.find("point_y");
+    auto at = [&](FrameTime k) { return depthAt(depth, W, H, e.p("point_x", k, 0.5), e.p("point_y", k, 0.5)); };
+    std::vector<FrameTime> keys;
+    for (auto it : {px, py})
+        if (it != e.params.end())
+            for (const Keyframe& k : it->second.keys) keys.push_back(k.t);
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    if (keys.size() < 2 || t <= keys.front() || t >= keys.back()) return at(t);
+    const auto next = std::upper_bound(keys.begin(), keys.end(), t);
+    const FrameTime a = *(next - 1), b = *next;
+    if (a == t) return at(t);
+    double w = double(t - a) / double(b - a);
+    for (const char* name : {"point_x", "point_y"}) {
+        const double va = e.p(name, a, 0.5), vb = e.p(name, b, 0.5);
+        if (std::fabs(vb - va) > 1e-9) {
+            w = (e.p(name, t, 0.5) - va) / (vb - va);
+            break;
+        }
+    }
+    const double da = at(a), db = at(b);
+    return da + (db - da) * std::clamp(w, 0.0, 1.0);
+}
+
 namespace {
 // Depth Map, Depth Fog and Lens Blur (Depth), from currentDepth(); nothing without one.
 void depthEffect(const Effect& e, FrameTime t, Image& img, double pixelScale) {
@@ -1919,47 +1958,40 @@ void depthEffect(const Effect& e, FrameTime t, Image& img, double pixelScale) {
         const double start = std::max(0.01, e.p("start", t, 60) / 100), amount = std::clamp(e.p("amount", t, 70) / 100, 0.0, 1.0);
         const double curve = std::max(0.05, e.p("curve", t, 1.5));
         const float col[3] = {float(e.p("color.r", t, 0.78)), float(e.p("color.g", t, 0.82)), float(e.p("color.b", t, 0.88))};
+        // Thinning with height above the horizon (haze lies low), by up to e^-8 at the top of the frame.
+        const double horizon = std::clamp(e.p("horizon", t, 50) / 100, 0.0, 1.0), lift = std::clamp(e.p("height", t, 0) / 100, 0.0, 1.0) * 8;
         for (size_t i = 0; i < d.size(); ++i) {
             const double far = std::clamp((start - d[i]) / start, 0.0, 1.0);
-            const float f = float(amount * std::pow(far, curve));
+            const double above = std::max(0.0, horizon - (double(i / size_t(W)) + 0.5) / H);
+            const float f = float(amount * std::pow(far, curve) * std::exp(-lift * above));
             float* p = &img.px[i * 4];
             for (int c = 0; c < 3; ++c) p[c] += (col[c] * p[3] - p[c]) * f;
         }
         return;
     }
-    // Lens Blur: sharp within the focus range, blurring over the falloff to the full radius. The
-    // frame is blurred at a few radii and each pixel takes the two nearest its own.
-    const double focus = e.p("focus", t, 80) / 100, half = e.p("range", t, 10) / 200;
-    const double falloff = std::max(0.01, e.p("falloff", t, 30) / 100);
-    const bool blurNear = e.p("near", t, 1) > 0.5;
-    const double radius = std::max(0.0, e.p("radius", t, 12) * pixelScale);
-    if (radius < 0.25) return;
-    std::vector<float> amount(d.size());
-    for (size_t i = 0; i < d.size(); ++i) {
-        double off = std::fabs(d[i] - focus) - half;
-        if (!blurNear && d[i] > focus) off = 0;
-        amount[i] = float(std::clamp(off / falloff, 0.0, 1.0));
-    }
-    constexpr int kLevels = 5;  // 0, 1/4, 1/2, 3/4 and the full radius
-    std::vector<Image> levels(kLevels);
-    levels[0] = img;
-    for (int l = 1; l < kLevels; ++l) {
-        levels[size_t(l)] = img;
-        gaussianBlur(levels[size_t(l)], radius * l / (kLevels - 1));
-    }
-    parallelRows(H, [&](int y0, int y1) {
-        for (int y = y0; y < y1; ++y)
-            for (int x = 0; x < W; ++x) {
-                const size_t i = size_t(y) * size_t(W) + size_t(x);
-                const float pos = amount[i] * (kLevels - 1);
-                const int a = std::min(kLevels - 2, int(pos));
-                const float f = pos - a;
-                const float* pa = &levels[size_t(a)].px[i * 4];
-                const float* pb = &levels[size_t(a + 1)].px[i * 4];
-                float* o = &img.px[i * 4];
-                for (int c = 0; c < 4; ++c) o[c] = pa[c] + (pb[c] - pa[c]) * f;
-            }
-    });
+    // Lens Blur (render/LensBlur.h): each pixel blurred by its own circle of confusion, in layers far to near.
+    LensBlurSettings ls;
+    ls.focus = depthBlurFocus(e, t, d, W, H);
+    ls.half = e.p("range", t, 10) / 200;
+    ls.falloff = std::max(0.01, e.p("falloff", t, 30) / 100);
+    ls.blurNear = e.p("near", t, 1) > 0.5;
+    // The radius is the blur at f/2.8; a wider aperture blurs more, in proportion.
+    ls.radius = std::max(0.0, e.p("radius", t, 12) * pixelScale) * 2.8 / std::clamp(e.p("fstop", t, 2.8), 0.7, 64.0);
+    ls.aperture.blades = int(std::lround(e.p("blades", t, 0)));
+    if (ls.aperture.blades > 0 && ls.aperture.blades < 3) ls.aperture.blades = 3;  // the fewest a polygon has
+    ls.aperture.rotation = e.p("blade_rotation", t, 0);
+    ls.aperture.squeeze = std::max(1.0, e.p("squeeze", t, 1));
+    ls.aperture.catEye = std::clamp(e.p("cat_eye", t, 0) / 100, 0.0, 1.0);
+    ls.highlights = std::clamp(e.p("highlights", t, 0) / 100, 0.0, 1.0);
+    ls.threshold = std::clamp(e.p("threshold", t, 80) / 100, 0.05, 1.0);
+    const ColorSpace& working = currentWorkingSpace();
+    std::unique_ptr<TransferTables> tables;
+    if (working.transfer != Transfer::Linear) tables = std::make_unique<TransferTables>(working.transfer);
+    lensBlur(img, d, ls, tables.get());
+    // Focus breathing: the picture a little larger focused near (up to 4 %) and as it is focused farthest, so its
+    // edges are never pulled in.
+    const double breathing = std::clamp(e.p("breathing", t, 0) / 100, 0.0, 1.0);
+    if (breathing > 0) breathe(img, 1 + 0.04 * breathing * ls.focus);
 }
 
 }  // namespace

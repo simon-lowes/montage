@@ -81,6 +81,9 @@
 #include "audio/DynLib.h"
 #include <random>
 #include "render/Restoration.h"
+#include "render/LensBlur.h"
+#include "render/TransferTables.h"
+#include "media/DepthMap.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -2000,6 +2003,238 @@ colorspaces:
         Image still = leaning();
         applyVideoEffect(stab, 5, still, 1.0, 5 / 25.0);
         QVERIFY(bar(still, 95) - bar(still, 5) > 14);
+    }
+
+    void syntheticFocus() {
+        // A checked backdrop far away (depth 0.2) and a pale square near (0.9).
+        const int W = 160, H = 100;
+        Image scene(W, H);
+        std::vector<float> depth(size_t(W) * H, 0.2f);
+        const float pale[3] = {1.0f, 0.9f, 0.8f};
+        auto inSquare = [](int x, int y) { return x >= 60 && x < 100 && y >= 30 && y < 70; };
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = scene.at(x, y);
+                const float g = ((x / 8 + y / 8) % 2) ? 0.5f : 0.3f;
+                for (int c = 0; c < 3; ++c) p[c] = inSquare(x, y) ? pale[c] : g;
+                p[3] = 1;
+                if (inSquare(x, y)) depth[size_t(y) * W + x] = 0.9f;
+            }
+        const TransferTables video(Transfer::Bt1886);
+        auto lum = [](const Image& im, int x, int y) {
+            const float* q = im.at(x, y);
+            return 0.2126f * q[0] + 0.7152f * q[1] + 0.0722f * q[2];
+        };
+        const float paleLum = 0.2126f * pale[0] + 0.7152f * pale[1] + 0.0722f * pale[2];
+        LensBlurSettings s;
+        s.half = 0.02;
+        s.falloff = 0.3;
+        s.radius = 8;
+
+        // Focused far: the backdrop away from the square is as it was; the square's edge blurs both ways, over the
+        // backdrop outside it and with the backdrop showing through inside it (no hard inner edge).
+        s.focus = 0.2;
+        Image far = scene;
+        lensBlur(far, depth, s, &video);
+        float worst = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                if (x < 45 || x >= 115 || y < 15 || y >= 85)
+                    for (int c = 0; c < 4; ++c) worst = std::max(worst, std::fabs(far.at(x, y)[c] - scene.at(x, y)[c]));
+        QVERIFY2(worst < 2e-3f, std::to_string(worst).c_str());
+        QVERIFY(std::fabs(lum(far, 80, 50) - paleLum) < 0.01f);  // the middle of the square
+        QVERIFY2(lum(far, 56, 50) > lum(scene, 56, 50) + 0.1f, std::to_string(lum(far, 56, 50)).c_str());
+        QVERIFY2(lum(far, 61, 50) < paleLum - 0.08f, std::to_string(lum(far, 61, 50)).c_str());
+        // And nothing darker than both: the edge goes from one to the other.
+        for (int x = 50; x < 70; ++x) QVERIFY(lum(far, x, 50) > 0.29f);
+
+        // Focused near: the square, edges and all, stays exactly sharp; the backdrop blurs without taking the
+        // square's colour.
+        s.focus = 0.9;
+        Image nearFocus = scene;
+        lensBlur(nearFocus, depth, s, &video);
+        worst = 0;
+        for (int y = 30; y < 70; ++y)
+            for (int x = 60; x < 100; ++x)
+                for (int c = 0; c < 4; ++c) worst = std::max(worst, std::fabs(nearFocus.at(x, y)[c] - scene.at(x, y)[c]));
+        QVERIFY2(worst < 2e-3f, std::to_string(worst).c_str());
+        auto spread = [&](const Image& im) {
+            double sum = 0, sum2 = 0;
+            int n = 0;
+            for (int y = 10; y < 20; ++y)
+                for (int x = 10; x < 40; ++x, ++n) sum += lum(im, x, y), sum2 += double(lum(im, x, y)) * lum(im, x, y);
+            return std::sqrt(std::max(0.0, sum2 / n - (sum / n) * (sum / n)));
+        };
+        QVERIFY2(spread(nearFocus) < 0.4 * spread(scene), qPrintable(QString("%1 %2").arg(spread(nearFocus)).arg(spread(scene))));
+        QVERIFY2(nearFocus.at(57, 50)[2] < 0.55f, std::to_string(nearFocus.at(57, 50)[2]).c_str());  // not the square's
+
+        // Aperture shapes: a hexagon's flat sides are cos 30 degrees of its corners from the centre; anamorphic
+        // squeeze makes the disc taller; the cat's eye cuts it toward the frame's edge.
+        Aperture hex;
+        hex.blades = 6;
+        QVERIFY(apertureWeight(hex, 19, 0, 20) > 0.99f && apertureWeight(hex, 21, 0, 20) < 0.01f);
+        const double c30 = std::cos(M_PI / 6), s30 = std::sin(M_PI / 6);
+        QVERIFY(apertureWeight(hex, 16.5 * c30, 16.5 * s30, 20) > 0.99f && apertureWeight(hex, 18.3 * c30, 18.3 * s30, 20) < 0.01f);
+        hex.rotation = 30;  // a corner where the side was
+        QVERIFY(apertureWeight(hex, 19 * c30, 19 * s30, 20) > 0.99f && apertureWeight(hex, 19, 0, 20) < 0.01f);
+        Aperture tall;
+        tall.squeeze = 2;
+        QVERIFY(apertureWeight(tall, 0, 38, 20) > 0.99f && apertureWeight(tall, 0, 42, 20) < 0.01f && apertureWeight(tall, 21, 0, 20) < 0.01f);
+        Aperture round;
+        QVERIFY(apertureWeight(round, 15, 0, 20, 10, 0) > 0.99f && apertureWeight(round, -15, 0, 20, 10, 0) < 0.01f);
+
+        // A point of light out of focus opens into a disc: taller with squeeze; brighter with Bokeh Highlights; and
+        // an in-focus highlight keeps its value.
+        const int PW = 120, PH = 120;
+        auto point = [&](int px, int py, const Aperture& a, double highlights, float focusDepth) {
+            Image im(PW, PH);
+            for (float& v : im.px) v = 0;
+            for (int y = 0; y < PH; ++y)
+                for (int x = 0; x < PW; ++x) im.at(x, y)[3] = 1;
+            for (int c = 0; c < 3; ++c) im.at(px, py)[c] = 1;
+            LensBlurSettings ps;
+            ps.focus = focusDepth;
+            ps.half = 0.01;
+            ps.falloff = 0.1;
+            ps.radius = 8;
+            ps.aperture = a;
+            ps.highlights = highlights;
+            lensBlur(im, std::vector<float>(size_t(PW) * PH, 0.2f), ps, &video);
+            return im;
+        };
+        auto extent = [&](const Image& im, int px, int py, bool vertical) {
+            const float peak = im.at(px, py)[1];
+            int n = 0;
+            for (int k = -40; k <= 40; ++k) {
+                const int x = vertical ? px : px + k, y = vertical ? py + k : py;
+                if (x >= 0 && y >= 0 && x < PW && y < PH && im.at(x, y)[1] > 0.3f * peak) ++n;
+            }
+            return n;
+        };
+        const Image disc = point(60, 60, round, 0, 0.9f), oval = point(60, 60, tall, 0, 0.9f);
+        const double ratio = double(extent(oval, 60, 60, true)) / extent(oval, 60, 60, false);
+        QVERIFY2(ratio > 1.6 && ratio < 2.4, std::to_string(ratio).c_str());
+        QVERIFY(std::abs(extent(disc, 60, 60, true) - extent(disc, 60, 60, false)) <= 1);
+        QVERIFY2(extent(disc, 60, 60, false) >= 15 && extent(disc, 60, 60, false) <= 21, std::to_string(extent(disc, 60, 60, false)).c_str());
+        const Image bright = point(60, 60, round, 1, 0.9f);
+        QVERIFY2(video.decode(bright.at(60, 60)[1]) > 2.5f * video.decode(disc.at(60, 60)[1]),  // (in light)
+                 qPrintable(QString("%1 %2").arg(bright.at(60, 60)[1]).arg(disc.at(60, 60)[1])));
+        const Image sharp = point(60, 60, round, 1, 0.2f);
+        QVERIFY(std::fabs(sharp.at(60, 60)[1] - 1) < 2e-3f && sharp.at(61, 60)[1] < 1e-4f);
+        Aperture eye;
+        eye.catEye = 1;
+        auto area = [&](const Image& im) {
+            int n = 0;
+            for (int y = 0; y < PH; ++y)
+                for (int x = 0; x < PW; ++x) n += im.at(x, y)[1] > 1e-3f;
+            return n;
+        };
+        const Image middle = point(60, 60, eye, 0, 0.9f), corner = point(100, 100, eye, 0, 0.9f);
+        QVERIFY2(area(corner) < 0.8 * area(middle), qPrintable(QString("%1 %2").arg(area(corner)).arg(area(middle))));
+        // (cut across the line to the centre: narrower that way than across it)
+        auto across = [&](const Image& im, int px, int py, int dx, int dy) {
+            float peak = 0;
+            for (size_t i = 1; i < im.px.size(); i += 4) peak = std::max(peak, im.px[i]);
+            int n = 0;
+            for (int k = -20; k <= 20; ++k) {
+                const int x = px + k * dx, y = py + k * dy;
+                if (x >= 0 && y >= 0 && x < PW && y < PH) n += im.at(x, y)[1] > 0.5f * peak;
+            }
+            return n;
+        };
+        // (through the shape's middle, which the cut moves toward the centre)
+        double mx = 0, my = 0, mw = 0;
+        for (int y = 0; y < PH; ++y)
+            for (int x = 0; x < PW; ++x) {
+                const double v = corner.at(x, y)[1];
+                mx += v * x, my += v * y, mw += v;
+            }
+        const int gx = int(std::lround(mx / mw)), gy = int(std::lround(my / mw));
+        QVERIFY2(across(corner, gx, gy, 1, 1) + 2 <= across(corner, gx, gy, 1, -1),
+                 qPrintable(QString("%1 %2 at %3 %4").arg(across(corner, gx, gy, 1, 1)).arg(across(corner, gx, gy, 1, -1)).arg(gx).arg(gy)));
+
+        // A blurred near layer at the frame's edge keeps its colour there (taps past the frame don't thin it into
+        // what is behind).
+        {
+            const int EW = 96, EH = 64;
+            Image edge(EW, EH);
+            std::vector<float> edgeDepth(size_t(EW) * EH);
+            for (int y = 0; y < EH; ++y)
+                for (int x = 0; x < EW; ++x) {
+                    const bool nearSide = x >= EW / 2;
+                    float* q = edge.at(x, y);
+                    q[0] = q[1] = q[2] = nearSide ? 0.8f : 0.2f, q[3] = 1;
+                    edgeDepth[size_t(y) * EW + x] = nearSide ? 1.0f : 0.0f;
+                }
+            LensBlurSettings es;
+            es.focus = 0, es.radius = 8;
+            lensBlur(edge, edgeDepth, es, nullptr);
+            QVERIFY2(std::fabs(edge.at(EW - 1, EH / 2)[0] - 0.8f) < 0.02f && std::fabs(edge.at(EW - 1, 0)[0] - 0.8f) < 0.02f,
+                     qPrintable(QString("%1 %2").arg(edge.at(EW - 1, EH / 2)[0]).arg(edge.at(EW - 1, 0)[0])));
+            QVERIFY(edge.at(5, EH / 2)[0] == 0.2f);  // sharp and untouched: its own value back
+        }
+
+        // Where it focuses: its Focus Depth, the depth at its Focus Point, the nearest face's; keys on the point rack
+        // in depth (half way through, half way between the two depths, though the point is then on the backdrop).
+        Effect lens = makeEffect("depth_blur", 1);
+        lens.params["focus"] = Param(40.0);
+        QVERIFY(std::fabs(depthBlurFocus(lens, 0, depth, W, H) - 0.4) < 1e-9);
+        lens.params["follow"] = Param(1.0);
+        lens.params["point_x"] = Param(0.5);
+        lens.params["point_y"] = Param(0.5);
+        QVERIFY(std::fabs(depthBlurFocus(lens, 0, depth, W, H) - 0.9) < 1e-6);
+        lens.params["point_x"] = Param();
+        lens.params["point_x"].addKey(0, 0.1, Interp::Smooth);
+        lens.params["point_x"].addKey(10, 0.5, Interp::Smooth);
+        QVERIFY(std::fabs(depthBlurFocus(lens, 0, depth, W, H) - 0.2) < 1e-6);
+        QVERIFY(std::fabs(depthBlurFocus(lens, 10, depth, W, H) - 0.9) < 1e-6);
+        const double mid = depthBlurFocus(lens, 5, depth, W, H), early = depthBlurFocus(lens, 2, depth, W, H);
+        QVERIFY2(std::fabs(mid - 0.55) < 0.02, std::to_string(mid).c_str());
+        QVERIFY(early > 0.2 && early < mid);
+        lens.params["follow"] = Param(2.0);
+        QVERIFY(std::fabs(depthBlurFocus(lens, 0, depth, W, H) - 0.4) < 1e-9);  // no faces: the Focus Depth
+        {
+            FaceBox face;
+            face.x = 0.4f, face.y = 0.35f, face.w = 0.2f, face.h = 0.3f;
+            FaceBox small;
+            small.x = 0.05f, small.y = 0.05f, small.w = 0.05f, small.h = 0.05f;
+            FaceScope scope(std::make_shared<const std::vector<FaceBox>>(std::vector<FaceBox>{small, face}));
+            QVERIFY(std::fabs(depthBlurFocus(lens, 0, depth, W, H) - 0.9) < 1e-6);
+        }
+
+        // Through the effect: Focus Point on the square keeps it sharp; Focus Breathing makes the picture a little
+        // larger focused near.
+        auto map = std::make_shared<DepthMap>();
+        map->width = W, map->height = H, map->values = depth;
+        DepthScope depthScope(map);
+        Effect fx = makeEffect("depth_blur", 2);
+        fx.params["follow"] = Param(1.0);
+        fx.params["radius"] = Param(8.0);
+        fx.params["range"] = Param(4.0);
+        Image viaEffect = scene;
+        applyVideoEffect(fx, 0, viaEffect, 1.0);
+        QVERIFY(std::fabs(viaEffect.at(61, 31)[0] - scene.at(61, 31)[0]) < 2e-3f);
+        QVERIFY(spread(viaEffect) < 0.4 * spread(scene));
+        fx.params["breathing"] = Param(100.0);
+        Image breathed = scene;
+        applyVideoEffect(fx, 0, breathed, 1.0);
+        // (1.036 times focused on the square: its right edge, 20 pixels from the centre, moves out about 0.7 pixel)
+        QVERIFY(lum(breathed, 100, 50) > lum(viaEffect, 100, 50) + 0.05f);
+
+        // Depth Fog thinning with height: at the top of the frame the fog is far thinner than at the bottom.
+        Effect fog = makeEffect("depth_fog", 3);
+        fog.params["amount"] = Param(100.0);
+        fog.params["start"] = Param(100.0);
+        fog.params["height"] = Param(100.0);
+        fog.params["horizon"] = Param(100.0);
+        auto flatMap = std::make_shared<DepthMap>();
+        flatMap->width = W, flatMap->height = H, flatMap->values.assign(size_t(W) * H, 0.0f);
+        DepthScope flat(flatMap);
+        Image black(W, H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) black.at(x, y)[3] = 1;
+        applyVideoEffect(fog, 0, black, 1.0);
+        QVERIFY2(lum(black, 80, 0) < 0.01f && lum(black, 80, H - 1) > 0.7f, qPrintable(QString("%1 %2").arg(lum(black, 80, 0)).arg(lum(black, 80, H - 1))));
     }
 
     void restorationKernels() {

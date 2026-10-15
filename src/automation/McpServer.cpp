@@ -2058,7 +2058,10 @@ void McpServer::Impl::addTools() {
         "`mask_smooth` gives points without handles smooth automatic ones); "
         "or to a range of distances: mask.depth 1, with mask.depth_low and mask.depth_high from 0 (farthest) to 100 (nearest). "
         "depth_blur (lens blur keeping one distance sharp), depth_fog, depth_map and relight (a virtual light) work from "
-        "the picture's depth. "
+        "the picture's depth. depth_blur focuses on its focus depth (follow 0), the depth at point_x / point_y (follow 1; "
+        "keys on the point rack between the keyed points' depths) or the nearest face (follow 2); fstop scales its blur, "
+        "blades / blade_rotation / squeeze / cat_eye shape the aperture, highlights lifts bokeh highlights and breathing "
+        "scales the picture with the focus. "
         "remove_background cuts people out (keep 1 keeps the background instead), and mask.shape 4 limits any effect to "
         "the people in the picture. object_removal paints out whatever its mask covers and fills it in. stabilize and "
         "rolling_shutter (straightening the skew a rolling shutter gives pans; readout as a percentage of a frame) measure "
@@ -2183,7 +2186,7 @@ void McpServer::Impl::addTools() {
             if (type == "object_removal" && (!inpaintAvailable() || !inpaintModel().installed()))
                 return fail("Object Removal needs its model: run `scripts/fetch-models.sh` or add it once in the app");
             if (needsFaces(e) && (!faceSearchAvailable() || !faceModel().installed()))
-                return fail("Face Refinement, Blemish Remover and Redact Faces need the face models: run `scripts/fetch-models.sh` or add them once in the app");
+                return fail("Face Refinement, Blemish Remover, Redact Faces and Lens Blur (Depth) following the nearest face need the face models: run `scripts/fetch-models.sh` or add them once in the app");
             if ((needsPersonMatte(e, 0) || type == "behind_people") && (!mattingAvailable() || !mattingModel().installed()))
                 return fail("Remove Background, Behind People and People masks need their model: run `scripts/fetch-models.sh` or add one once in the app");
             if (needsDepth(e, 0) && (!depthAvailable() || !depthModel().installed()))

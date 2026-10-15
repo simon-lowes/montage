@@ -11843,6 +11843,15 @@ if ui["pressed"] == "add":
                  qPrintable(QString("%1 vs %2").arg(detail(shown, 0.62, 0.24)).arg(detail(plain, 0.62, 0.24))));
         QVERIFY2(detail(shown, 0.25, 0.72) > 0.9 * detail(plain, 0.25, 0.72),
                  qPrintable(QString("%1 vs %2").arg(detail(shown, 0.25, 0.72)).arg(detail(plain, 0.25, 0.72))));
+        // Focused by a click on the face behind instead (Focus Point): the face sharp, the helmet blurred.
+        clip.effects.back().params["follow"] = Param(1.0);
+        clip.effects.back().params["point_x"] = Param(0.62);
+        clip.effects.back().params["point_y"] = Param(0.24);
+        shown = renderSequenceFrame(p, s, 0, {});
+        QVERIFY2(detail(shown, 0.62, 0.24) > 0.8 * detail(plain, 0.62, 0.24),
+                 qPrintable(QString("%1 vs %2").arg(detail(shown, 0.62, 0.24)).arg(detail(plain, 0.62, 0.24))));
+        QVERIFY2(detail(shown, 0.25, 0.72) < 0.5 * detail(plain, 0.25, 0.72),
+                 qPrintable(QString("%1 vs %2").arg(detail(shown, 0.25, 0.72)).arg(detail(plain, 0.25, 0.72))));
 
         // Relight from the left, then the right: the helmet's lit side follows the light.
         clip.effects.clear();

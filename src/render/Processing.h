@@ -54,6 +54,9 @@ bool gpuMask(const Effect& e, FrameTime t, gpu::ColorOp& op, int width = 0, int 
 struct DepthMap;
 struct ValueMap;
 const DepthMap* currentDepth();
+// The depth Lens Blur (Depth) focuses at on frame t (`depth` W x H, 0 far .. 1 near): its Focus Depth, the depth at
+// its Focus Point (between keys, the keys' depths eased from one to the other), or the nearest face's (currentFaces()).
+double depthBlurFocus(const Effect& e, FrameTime t, const std::vector<float>& depth, int W, int H);
 class DepthScope {
 public:
     explicit DepthScope(std::shared_ptr<const DepthMap> depth);

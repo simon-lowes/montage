@@ -42,6 +42,7 @@ void effectUses(Provenance& out, const Effect& e) {
     else if (t == "redact_faces") add(out, {"Redact Faces", "YuNet", AiRole::Assisted});
     else if (t == "remove_background" || t == "behind_people") add(out, {"People Matte", "MODNet", AiRole::Assisted});
     else if (t == "depth_blur" || t == "depth_fog" || t == "depth_map") add(out, {"Depth", "Depth Anything V2", AiRole::Assisted});
+    if (t == "depth_blur" && std::lround(e.p("follow", 0)) == 2) add(out, {"Focus on Faces", "YuNet", AiRole::Assisted});
     // Masks: an object picked out, people, or depth.
     const long s = std::lround(e.p("mask.shape", 0));
     if (s == 3 && e.object) add(out, {"Object Mask", "EdgeTAM", AiRole::Assisted});
