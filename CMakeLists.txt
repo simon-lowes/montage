@@ -134,6 +134,10 @@ if(MONTAGE_WITH_BMX)
     GIT_SHALLOW TRUE
     GIT_SUBMODULES "")
   FetchContent_MakeAvailable(bmx)
+  if(MINGW)
+    # libMXF's Windows memory-mapped file guards its copies with MSVC's __try / __except, which GCC lacks.
+    target_compile_options(MXF PRIVATE -include ${CMAKE_SOURCE_DIR}/third_party/bmx/mingw-seh.h)
+  endif()
   set(BUILD_SHARED_LIBS ${MONTAGE_SAVED_BUILD_SHARED_LIBS})
   set(BUILD_TESTING ${MONTAGE_SAVED_BUILD_TESTING})
 endif()
