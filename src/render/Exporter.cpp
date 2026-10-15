@@ -755,6 +755,15 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     // Image sequences: numbered files, no sound.
     const bool imageSequence = s.videoCodec == "png" || s.videoCodec == "tiff" || s.videoCodec == "exr" || s.videoCodec == "dpx";
     const bool floatFrames = s.videoCodec == "exr";  // written straight from the float picture, not through 16 bits
+    // (by the OpenEXR library for another compression or more layers)
+    const bool exrLibrary = floatFrames && (!s.exrCompression.empty() || s.exrLayers);
+    if ((!s.exrCompression.empty() || s.exrLayers) && wantVideo) {
+        if (!floatFrames) return fail("OpenEXR compression and layers are for OpenEXR frames");
+        if (!exrAvailable()) return fail("This build of Montage writes OpenEXR only through FFmpeg (ZIP compression, one layer)");
+        const auto names = exrCompressions();
+        if (!s.exrCompression.empty() && std::find(names.begin(), names.end(), s.exrCompression) == names.end())
+            return fail("Unknown OpenEXR compression " + s.exrCompression);
+    }
     std::string outPath = s.path;
     if (imageSequence) {
         if (wantAudio) return fail("An image sequence has no sound: choose no audio codec");
@@ -1553,7 +1562,36 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             Image img = deliveredFrame(f);
             if (issues.incomplete) return fail(cancel && cancel->load() ? std::string("Export cancelled") : issues.reason());
             if (measure) meter.add(img, f, measured);
-            if (floatFrames && img.width == W && img.height == H) {
+            if (exrLibrary) {
+                // Through the OpenEXR library: the picture as half floats, premultiplied as OpenEXR files are (and as the
+                // layers copied beside it and Montage's own reader take them), then any more layers, under the file name
+                // FFmpeg's image writer would give it.
+                if (img.width != W || img.height != H) img = resizeImage(img, W, H);
+                std::vector<ExrOutLayer> layers(1);
+                layers[0].channels = s.alpha ? std::vector<std::string>{"R", "G", "B", "A"} : std::vector<std::string>{"R", "G", "B"};
+                const size_t nc = layers[0].channels.size();
+                layers[0].data.resize(size_t(W) * size_t(H) * nc);
+                parallelRows(H, [&](int y0, int y1) {
+                    for (int y = y0; y < y1; ++y) {
+                        const float* src = img.row(y);
+                        float* dst = &layers[0].data[size_t(y) * size_t(W) * nc];
+                        for (int x = 0; x < W; ++x, src += 4, dst += nc) {
+                            dst[0] = src[0];
+                            dst[1] = src[1];
+                            dst[2] = src[2];
+                            if (s.alpha) dst[3] = src[3];
+                        }
+                    }
+                });
+                std::map<std::string, std::string> attributes;
+                std::string why;
+                if (s.exrLayers && !s.exrLayers(f, W, H, layers, attributes, why)) return fail(why);
+                char name[4096];
+                if (av_get_frame_filename2(name, sizeof name, outPath.c_str(), s.startNumber + int(f - in), 0) < 0)
+                    return fail("The file name " + outPath + " has no frame number");
+                if (!writeExr(name, W, H, layers, s.exrCompression.empty() ? "zip" : s.exrCompression, attributes, &why))
+                    return fail(why);
+            } else if (floatFrames && img.width == W && img.height == H) {
                 // Planar float, green-blue-red(-alpha), unpremultiplied, values above 1 kept.
                 if (av_frame_make_writable(o.vframe) < 0) return fail("Out of memory");
                 const bool alphaPlane = o.vctx->pix_fmt == AV_PIX_FMT_GBRAPF32LE;

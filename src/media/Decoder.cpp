@@ -3,6 +3,7 @@
 #include "Decoder.h"
 
 #include "FieldRecorder.h"
+#include "Exr.h"
 #include "ImageSequence.h"
 #include "Mlv.h"
 #include "ProResRaw.h"
@@ -41,6 +42,18 @@ extern "C" {
 namespace montage {
 
 namespace {
+
+// OpenEXR read with the OpenEXR library rather than FFmpeg: a layer asked for, or a compression FFmpeg's reader lacks.
+bool exrByLibrary(const std::string& file, const Interpretation& in, ImageSequence* seq) {
+    if (!exrAvailable()) return false;
+    ImageSequence s;
+    const bool sequence = parseImageSequencePath(file, s);
+    if (!isExrPath(sequence ? s.pattern : file)) return false;
+    if (seq) *seq = s;
+    if (!in.layer.empty()) return true;
+    ExrInfo info;
+    return readExrInfo(sequence ? imageSequenceFrame(s, s.first) : file, info) && exrNeedsLibrary(info.compression);
+}
 
 // Keep FFmpeg quiet unless something is actually wrong.
 const bool kQuietLogs = [] {
@@ -462,6 +475,26 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         out = m;
         return true;
     }
+    // OpenEXR in a compression FFmpeg doesn't read (HTJ2K, zstd), or one layer of it: read with OpenEXR.
+    if (ImageSequence seq; exrByLibrary(file, in, &seq)) {
+        const bool sequence = isImageSequencePath(file);
+        ExrInfo info;
+        if (!readExrInfo(sequence ? imageSequenceFrame(seq, seq.first) : file, info, error)) return false;
+        MediaItem m = out;
+        m.path = path;
+        if (m.name.empty()) m.name = sequence ? imageSequenceName(seq) : file.substr(file.find_last_of("/\\") + 1);
+        m.kind = sequence ? MediaKind::Video : MediaKind::Image;
+        m.hasVideo = true;
+        m.hasAudio = false;
+        const double par = in.par > 0 ? in.par : info.pixelAspect;
+        m.width = std::max(1, int(std::lround(info.width * (par > 0 ? par : 1.0))));
+        m.height = info.height;
+        m.fps = sequence ? seq.fps : m.fps;
+        m.duration = sequence ? seq.frames() / seq.fps.toDouble() : 0;
+        m.videoCodec = "exr";
+        out = m;
+        return true;
+    }
     // A CinemaDNG run: numbered camera RAW frames, played as a video at the run's rate.
     if (ImageSequence seq; rawAvailable() && parseImageSequencePath(file, seq) && isRawPath(seq.pattern)) {
         RawInfo ri;
@@ -667,6 +700,8 @@ void VideoDecoder::close() {
     if (raw_) av_frame_free(&raw_);
     rawSequence_.reset();
     mlv_.reset();
+    exr_.reset();
+    exrFile_.clear();
     rawFrame_ = -1;
     proResRaw_ = false;
     viewId_ = -1;
@@ -728,6 +763,30 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
             curPts_ = nextPts_ = -1;
             return true;
         }
+    }
+    // OpenEXR read with the OpenEXR library: a layer of a multi-layer file, or a compression FFmpeg doesn't read.
+    if (ImageSequence seq; exrByLibrary(uninterpretedPath(path), in, &seq)) {
+        const bool sequence = isImageSequencePath(uninterpretedPath(path));
+        ExrInfo info;
+        if (!readExrInfo(sequence ? imageSequenceFrame(seq, seq.first) : uninterpretedPath(path), info, error)) return false;
+        if (!in.layer.empty() && !info.hasLayer(in.layer)) {
+            if (error) *error = uninterpretedPath(path) + " has no layer \"" + in.layer + "\"";
+            return false;
+        }
+        exr_ = std::make_unique<ImageSequence>(seq);
+        if (!sequence) exrFile_ = uninterpretedPath(path), exr_->first = exr_->last = 0;
+        exrLayer_ = in.layer.empty() && !info.hasLayer("") && !info.layers.empty() ? info.layers[0].name : in.layer;
+        rawFrame_ = -1;
+        const double par = par_ > 0 ? par_ : info.pixelAspect;  // (Interpret Footage's, else the file's)
+        dispW_ = std::max(1, int(std::lround(info.width * (par > 0 ? par : 1.0))));
+        dispH_ = info.height;
+        fps_ = sequence ? seq.fps.toDouble() : 25.0;
+        duration_ = sequence ? seq.frames() / fps_ : 0;
+        still_ = !sequence;
+        rotation_ = 0;
+        origin_ = 0;
+        curPts_ = nextPts_ = -1;
+        return true;
     }
     rawSettings_ = RawSettings{in.rawExposure, in.rawTemperature, in.rawTint,
                                in.rawHighlights == "blend" ? 1 : in.rawHighlights == "rebuild" ? 2 : 0, in.rawHalf};
@@ -1191,12 +1250,13 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
     return out;
 }
 
-bool VideoDecoder::rawFrame(int width, int height, std::string* error) {
-    if (!raw_ || raw_->width != width || raw_->height != height) {
+bool VideoDecoder::rawFrame(int width, int height, std::string* error, int format) {
+    if (format < 0) format = AV_PIX_FMT_RGB48;
+    if (!raw_ || raw_->width != width || raw_->height != height || raw_->format != format) {
         if (raw_) av_frame_free(&raw_);
         raw_ = av_frame_alloc();
         if (!raw_) return false;
-        raw_->format = AV_PIX_FMT_RGB48;  // host byte order, as LibRaw writes it
+        raw_->format = format;  // host byte order (RGB48 as LibRaw writes it)
         raw_->width = width;
         raw_->height = height;
         raw_->color_range = AVCOL_RANGE_JPEG;
@@ -1247,6 +1307,38 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
             stillHq_ = highQuality;
         }
         curPts_ = double(n) / fps_;
+        return stillFrame_;
+    }
+    if (exr_) {
+        // The frame shown at `t`, read once and kept while it is asked for again; as FFmpeg's reader gives it (the values
+        // as stored, alpha premultiplied as OpenEXR keeps it), clamped to the 16 bits frames are kept in.
+        const ImageSequence& seq = *exr_;
+        const int n = seq.first + std::clamp(int(std::floor(std::max(0.0, t) * fps_ + 1e-6)), 0, seq.frames() - 1);
+        if (targetW <= 0) targetW = dispW_;
+        if (targetH <= 0) targetH = dispH_;
+        if (n != rawFrame_ || !raw_) {
+            int w = 0, h = 0;
+            std::vector<float> rgba;
+            std::string err;
+            if (!readExrLayer(exrFile_.empty() ? imageSequenceFrame(seq, n) : exrFile_, exrLayer_, w, h, rgba, &err) ||
+                !rawFrame(w, h, &err, AV_PIX_FMT_RGBA64))
+                return nullptr;
+            parallelRows(h, [&](int y0, int y1) {
+                for (int y = y0; y < y1; ++y) {
+                    auto* o = reinterpret_cast<uint16_t*>(raw_->data[0] + size_t(y) * size_t(raw_->linesize[0]));
+                    const float* q = &rgba[size_t(y) * size_t(w) * 4];
+                    for (int i = 0; i < w * 4; ++i) {
+                        const float v = q[i];
+                        o[i] = uint16_t(std::lround(std::clamp(v == v ? v : 0.0f, 0.0f, 1.0f) * 65535.0f));
+                    }
+                }
+            });
+            rawFrame_ = n;
+            stillFrame_.reset();
+        }
+        if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH)
+            stillFrame_ = convert(raw_, double(n - seq.first) / fps_, targetW, targetH, true);
+        curPts_ = double(n - seq.first) / fps_;
         return stillFrame_;
     }
     if (rawSequence_) {

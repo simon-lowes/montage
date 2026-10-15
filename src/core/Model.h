@@ -324,6 +324,8 @@ struct Clip {
     // streams, in order (MediaItem::audioStreams). Empty = the main audio stream mixed to stereo. One channel plays
     // in the centre, two as left and right; with more, the first, third... go left and the others right.
     std::vector<int> channels;
+    // A multi-layer OpenEXR's layer (AOV) the clip shows (media/Exr.h): "" the main picture.
+    std::string layer;
 
     FrameTime end() const { return start + duration; }
     bool contains(FrameTime t) const { return t >= start && t < end(); }

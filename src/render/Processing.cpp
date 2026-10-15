@@ -14,6 +14,7 @@
 #include "core/ColorWarp.h"
 #include "core/MaskPath.h"
 #include "media/DepthMap.h"
+#include "media/Exr.h"
 #include "media/Matting.h"
 #include "media/Inpaint.h"
 #include "FaceRefine.h"
@@ -1111,6 +1112,10 @@ DepthScope::~DepthScope() { tDepth = std::move(previous_); }
 const ValueMap* currentPersonMatte() { return tPerson.get(); }
 PersonScope::PersonScope(std::shared_ptr<const ValueMap> matte) : previous_(std::move(tPerson)) { tPerson = std::move(matte); }
 PersonScope::~PersonScope() { tPerson = std::move(previous_); }
+thread_local std::string tCryptoFile;
+const std::string& currentCryptomatteFile() { return tCryptoFile; }
+CryptomatteScope::CryptomatteScope(std::string file) : previous_(std::move(tCryptoFile)) { tCryptoFile = std::move(file); }
+CryptomatteScope::~CryptomatteScope() { tCryptoFile = std::move(previous_); }
 
 void refineMatte(std::vector<float>& matte, int W, int H, double expand, double feather, double blur) {
     if (matte.size() != size_t(W) * size_t(H)) return;
@@ -1449,6 +1454,21 @@ std::vector<float> effectMatte(const Effect& e, FrameTime t, const Image& img, d
         } else {
             std::fill(matte.begin(), matte.end(), 0.f);
         }
+    }
+    if (shape == 7) {
+        // The objects picked from the render's Cryptomatte: their coverage, as exact as the render's own edges (motion
+        // blur, depth of field and transparency included), grown or shrunk by Expansion; nothing where the frame has
+        // no Cryptomatte.
+        std::fill(matte.begin(), matte.end(), 0.f);
+        const std::string& file = currentCryptomatteFile();
+        const std::vector<float> ids = parseCryptomatteIds(e.s("mask.crypto_ids"));
+        if (!file.empty() && !ids.empty())
+            if (const auto cm = cachedCryptomatte(file, e.s("mask.crypto_layer")); cm && cm->width > 0) {
+                ValueMap full;
+                full.width = cm->width, full.height = cm->height, full.values = cm->matte(ids);
+                matte = W == full.width && H == full.height ? std::move(full.values) : full.resized(W, H);
+                if (const double grow = e.p("mask.expansion", t) * pixelScale; grow != 0) refineMatte(matte, W, H, grow, 0, 0);
+            }
     }
     drawMaskShape(e, t, shape, matte, W, H, pixelScale);
     if (shape > 0 && shape != 6) {

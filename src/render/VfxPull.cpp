@@ -10,8 +10,16 @@
 
 #include "Amf.h"
 #include "ColorSpace.h"
+#include "Compositor.h"
+#include "Processing.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
+#include "core/Interpretation.h"
+#include "media/DepthMap.h"
+#include "media/Exr.h"
+#include "media/Image.h"
+#include "media/Matting.h"
+#include "media/MediaPool.h"
 
 namespace montage {
 
@@ -31,6 +39,96 @@ std::string csvField(const std::string& v) {
     for (char c : v) out += c == '"' ? std::string("\"\"") : std::string(1, c);
     return out + "\"";
 }
+
+// `from` (w x h, n channels) in a w2 x h2 picture, from its top left corner; the rest 0.
+std::vector<float> placed(const std::vector<float>& from, int w, int h, size_t n, int w2, int h2) {
+    if (w == w2 && h == h2) return from;
+    std::vector<float> out(size_t(w2) * size_t(h2) * n, 0.0f);
+    for (int y = 0; y < std::min(h, h2); ++y)
+        std::copy_n(&from[size_t(y) * size_t(w) * n], size_t(std::min(w, w2)) * n, &out[size_t(y) * size_t(w2) * n]);
+    return out;
+}
+
+// The layers an OpenEXR pull adds to each frame: the source render's others, and the clip's masks as mattes.
+struct PullLayers {
+    const Project* project = nullptr;
+    const Sequence* seq = nullptr;
+    const Clip* clip = nullptr;
+    const MediaItem* media = nullptr;
+    int64_t first = 0;  // the media frame of the pull's first
+    double mediaFps = 25;
+    bool sourceLayers = false;
+    std::vector<std::pair<const Effect*, std::string>> mattes;
+    std::vector<std::string>* names = nullptr;  // the layers written, from the first frame
+
+    bool operator()(FrameTime f, int W, int H, std::vector<ExrOutLayer>& layers, std::map<std::string, std::string>& attributes,
+                    std::string& error) const {
+        const MediaItem& m = *media;
+        const double sec = double(first + f) / mediaFps;
+        const std::string file = exrFrameFile(m.path, sec);
+        std::vector<std::string> listed;  // (as readExrInfo lists them: a Cryptomatte once, by its name)
+        auto note = [&](const std::string& n) {
+            if (std::find(listed.begin(), listed.end(), n) == listed.end()) listed.push_back(n);
+        };
+        if (sourceLayers && !file.empty()) {
+            int w = 0, h = 0;
+            std::vector<ExrCopiedLayer> copied;
+            if (!readExrChannels(file, w, h, copied, &attributes, &error)) return false;
+            for (ExrCopiedLayer& l : copied) {
+                // (the picture the plate shows is in it already; the main picture, when the plate is another layer,
+                // goes under "main")
+                if (!l.cryptomatte && l.listedAs == clip->layer) continue;
+                if (l.layer.name.empty() && !l.cryptomatte && l.listedAs.empty()) l.layer.name = l.listedAs = "main";
+                note(l.listedAs);
+                l.layer.data = placed(l.layer.data, w, h, l.layer.channels.size(), W, H);
+                layers.push_back(std::move(l.layer));
+            }
+        }
+        if (!mattes.empty()) {
+            // The masks as the compositor draws them on this frame of the clip (handles: the clip's ends held).
+            const Sequence& s = *seq;
+            const Clip& c = *clip;
+            const FrameTime lt = FrameTime(std::llround(c.localForSource(sec * s.fpsValue())));
+            const int mw = std::max(1, m.width), mh = std::max(1, m.height);
+            Frame16Ptr frame = MediaPool::instance().videoFrame(c.layer.empty() ? m.path : layerPath(m.path, c.layer), sec, mw, mh);
+            if (!frame) {
+                error = "Cannot read the frame at " + std::to_string(sec) + " s of " + m.path;
+                return false;
+            }
+            Image src = toImage(*frame);
+            convertColor(src, mediaColorSpace(m), sequenceColorSpace(s), s.hdrPeakNits);
+            // (sizes in sequence pixels to source pixels, as the clip's fit scales them)
+            const int fit = int(c.motion.p("fit", lt, 0));
+            const double fx = fit == 0 ? std::min(s.width / double(mw), s.height / double(mh))
+                              : fit == 1 ? std::max(s.width / double(mw), s.height / double(mh))
+                              : fit == 2 ? s.width / double(mw)
+                                         : 1.0;
+            const double pixelScale = 1 / std::max(1e-6, fx);
+            std::shared_ptr<const DepthMap> depth;
+            std::shared_ptr<const ValueMap> people;
+            for (const auto& [e, name] : mattes) {
+                if (!depth && needsDepth(*e, lt) && depthAvailable() && depthModel().installed()) depth = cachedDepth(src);
+                if (!people && needsPersonMatte(*e, lt) && mattingAvailable() && mattingModel().installed()) people = cachedPersonMatte(src);
+            }
+            DepthScope depthScope(depth);
+            PersonScope personScope(people);
+            CryptomatteScope cryptoScope(file);
+            TrackedSourceScope trackedSource(m.id, false);
+            for (const auto& [e, name] : mattes) {
+                std::vector<float> matte = effectMatte(*e, lt, src, pixelScale, sec);
+                if (matte.empty()) matte.assign(size_t(mw) * size_t(mh), 1.0f);  // (no mask on this frame: all of it)
+                ExrOutLayer l;
+                l.name = name;
+                l.channels = {"A"};
+                l.data = placed(matte, src.width, src.height, 1, W, H);
+                layers.push_back(std::move(l));
+                note(name);
+            }
+        }
+        if (names && names->empty()) *names = listed;
+        return true;
+    }
+};
 
 }  // namespace
 
@@ -88,6 +186,7 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
         plate.duration = frames;
         plate.sourceIn = double(first);
         plate.motion = makeEffect("transform", 2);
+        plate.layer = c.layer;  // (a multi-layer render's layer the cut shows)
         alone.videoTracks[0].clips.push_back(plate);
         // Names: the clip's, numbered when two shots share one.
         std::string name = safeName(c.name.empty() ? m.name : c.name);
@@ -121,6 +220,32 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
         auto prog = [&, index](double f, FrameTime t) {
             if (progress) progress((double(index) + f) / double(chosen.size()), t);
         };
+        if (o.format == "exr") {
+            st.exrCompression = o.compression;
+            if (o.sourceLayers || o.mattes) {
+                if (!exrAvailable()) return fail("Layers and mattes in OpenEXR pulls need Montage built with the OpenEXR library");
+                PullLayers pl;
+                pl.project = &p;
+                pl.seq = &seq;
+                pl.clip = &c;
+                pl.media = &m;
+                pl.first = first;
+                pl.mediaFps = mf;
+                pl.sourceLayers = o.sourceLayers;
+                pl.names = &shot.layers;
+                if (o.mattes)
+                    for (const Effect* e : liveEffects(seq, c)) {
+                        if (!e->enabled || !supportsMask(e->type) || (!hasMask(*e, 0) && !hasMask(*e, std::max<FrameTime>(0, c.duration - 1))))
+                            continue;
+                        const EffectInfo* info = findEffectInfo(e->type);
+                        std::string matte = "matte_" + safeName(info ? info->displayName : e->type);
+                        for (int k = 2; std::any_of(pl.mattes.begin(), pl.mattes.end(), [&](const auto& x) { return x.second == matte; }); ++k)
+                            matte = "matte_" + safeName(info ? info->displayName : e->type) + "_" + std::to_string(k);
+                        pl.mattes.emplace_back(e, matte);
+                    }
+                st.exrLayers = pl;
+            }
+        }
         std::string why;
         if (!exportSequence(p, alone, st, prog, cancel, &why)) return fail(name + ": " + why);
         if (o.amf) {
@@ -148,14 +273,17 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
         shots.push_back(shot);
     }
     // The pull list.
-    std::string csv = "Shot,Source File,Source In (s),Source Out (s),Head Handle,Tail Handle,First Frame,Cut In,Cut Out,Last Frame,Folder\n";
+    std::string csv = "Shot,Source File,Source In (s),Source Out (s),Head Handle,Tail Handle,First Frame,Cut In,Cut Out,Last Frame,Folder,Layers\n";
     char num[64];
     for (const VfxShot& s : shots) {
         csv += csvField(s.name) + "," + csvField(s.media) + ",";
         std::snprintf(num, sizeof num, "%.6f,%.6f,", s.sourceIn, s.sourceOut);
         csv += num;
         csv += std::to_string(s.headHandle) + "," + std::to_string(s.tailHandle) + "," + std::to_string(s.firstFrame) + "," +
-               std::to_string(s.cutIn) + "," + std::to_string(s.cutOut) + "," + std::to_string(s.lastFrame) + "," + csvField(s.folder) + "\n";
+               std::to_string(s.cutIn) + "," + std::to_string(s.cutOut) + "," + std::to_string(s.lastFrame) + "," + csvField(s.folder) + ",";
+        std::string layers;
+        for (const std::string& l : s.layers) layers += (layers.empty() ? "" : " ") + l;
+        csv += csvField(layers) + "\n";
     }
     QFile list(QDir(QString::fromStdString(o.folder)).filePath(QStringLiteral("pull_list.csv")));
     if (!list.open(QIODevice::WriteOnly | QIODevice::Truncate) || list.write(csv.data(), qint64(csv.size())) != qint64(csv.size()))

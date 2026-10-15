@@ -64,6 +64,7 @@
 #include "media/Rife.h"
 #include "media/SuperScale.h"
 #include "core/Interpretation.h"
+#include "media/Exr.h"
 
 namespace montage {
 
@@ -796,6 +797,7 @@ struct ClipSource {
     double sourceSeconds = -1;  // media time of the frame, for effects that follow the footage
     uint64_t sourceMedia = 0;   // and its media, and whether it was reframed from 360° (or is a right eye), for analyses made from it
     bool reframed = false;
+    std::string exrFile;        // the OpenEXR file the frame was read from (its Cryptomattes), "" for any other
     ofx::FrameFetch ofxFetch;   // the clip's source at other clip frames, for OpenFX plugins that ask (render/Ofx.h)
 };
 
@@ -841,6 +843,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     double& sourceSeconds = out.sourceSeconds;
     uint64_t& sourceMedia = out.sourceMedia;
     bool& reframed = out.reframed;
+    std::string& exrFile = out.exrFile;
     ofx::FrameFetch& ofxFetch = out.ofxFetch;
     if (c.isGenerator() && c.generator.type == "adjustment") {
         // An adjustment layer's picture is the composite beneath it (already in the working space).
@@ -897,6 +900,11 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 // in the picture itself, so Redact Faces never leaves one uncovered.
                 if (eye) reframed = true;
             }
+            // One layer (AOV) of a multi-layer OpenEXR, read from the file (a proxy holds the main picture alone).
+            if (!c.layer.empty()) {
+                const bool proxy = !m->proxyPath.empty() && path == m->proxyPath;
+                if (!proxy || fileOnline(m->path)) path = layerPath(proxy ? m->path : path, c.layer);
+            }
             const bool original = m->proxyPath.empty() || path != m->proxyPath;  // the file itself, not its proxy
             mw = m->width > 0 ? m->width : SW;
             mh = m->height > 0 ? m->height : SH;
@@ -940,6 +948,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (!f) return false;
             if (m->kind == MediaKind::Video) sourceSeconds = sec;
             sourceMedia = m->id;
+            exrFile = exrFrameFile(m->path, sec);
             if (m->kind == MediaKind::Video && std::any_of(c.effects.begin(), c.effects.end(), [](const Effect& e) { return e.type == "ofx" && e.enabled; })) {
                 const double duration = m->duration, frameSeconds = m->fps.valid() ? 1.0 / m->fps.toDouble() : 1.0 / 30, seqFps = seq.fpsValue();
                 const bool hq = o.highQuality;
@@ -1224,6 +1233,8 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
         mattingModel().installed())
         people = cachedPersonMatte(src);
     PersonScope personScope(people);
+    // And the OpenEXR file the frame came from, for Cryptomatte masks.
+    CryptomatteScope cryptoScope(std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsCryptomatte(*e, lt); }) ? cs.exrFile : std::string());
     // And the faces, for Face Refinement, Blemish Remover and Redact Faces.
     TrackedSourceScope trackedSource(sourceMedia, reframed);
     std::shared_ptr<const std::vector<FaceBox>> faces;

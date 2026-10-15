@@ -288,6 +288,7 @@ QJsonObject clipToJson(const Clip& c) {
     if (!fx.isEmpty()) o["effects"] = fx;
     if (!c.unrendered.empty()) o["unrendered"] = qs(c.unrendered);
     if (c.angle != 0) o["angle"] = c.angle;
+    if (!c.layer.empty()) o["layer"] = qs(c.layer);
     if (c.audioAngle != -1) o["audioAngle"] = c.audioAngle;
     if (!c.channels.empty()) {
         QJsonArray ch;
@@ -363,6 +364,7 @@ Clip clipFromJson(const QJsonObject& o) {
     for (const auto& e : o.value("effects").toArray()) c.effects.push_back(effectFromJson(e));
     c.unrendered = ss(o.value("unrendered"));
     c.angle = std::max(0, o.value("angle").toInt(0));
+    c.layer = ss(o.value("layer"));
     c.audioAngle = std::max(-1, o.value("audioAngle").toInt(-1));
     for (const auto& v : o.value("channels").toArray())
         if (v.toInt(-1) >= 0) c.channels.push_back(v.toInt());

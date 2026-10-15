@@ -14,6 +14,7 @@
 #include "ModelPacks.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
+#include "media/Exr.h"
 #include "render/ClipAnalysis.h"
 #include "render/Compositor.h"
 
@@ -315,6 +316,7 @@ void MaskOverlay::paint(QPainter& p, const QRectF&) const {
     p.restore();
     paintPins(p);
     paintObjects(p);
+    paintCryptomattes(p);
     paintScenePoints(p);
 }
 
@@ -398,6 +400,128 @@ void MaskOverlay::applyPin(const Pin& pin) {
             }
         return false;
     }, QStringLiteral("pin-%1-%2").arg(pin.effect).arg(dragSerial_));
+}
+
+// ---- Cryptomatte masks -------------------------------------------------------------
+
+std::vector<MaskOverlay::CryptoTarget> MaskOverlay::cryptoTargets() const {
+    std::vector<CryptoTarget> out;
+    const Sequence* s = state_->sequence();
+    const FrameTime t = state_->playhead();
+    if (!s || !exrAvailable()) return out;
+    for (Id id : state_->selectedClips()) {
+        auto loc = edit::locate(*s, id);
+        if (!loc || loc->track.kind != TrackKind::Video) continue;
+        const Clip& c = trackAt(*s, loc->track)->clips[loc->index];
+        const MediaItem* m = c.mediaId ? state_->project().findMedia(c.mediaId) : nullptr;
+        if (!c.contains(t) || !m || (m->kind != MediaKind::Video && m->kind != MediaKind::Image)) continue;
+        const FrameTime lt = t - c.start;
+        // (the frame the compositor reads: render/Compositor.cpp clipSource)
+        double sec = 0;
+        if (m->kind == MediaKind::Video) {
+            const double fd = m->fps.valid() ? 1.0 / m->fps.toDouble() : 1.0 / 30;
+            sec = std::clamp(c.sourceFrameAt(t) / s->fpsValue(), 0.0, std::max(0.0, m->duration - fd * 0.5));
+        }
+        const std::string file = exrFrameFile(m->path, sec);
+        if (file.empty()) continue;
+        for (const Effect& e : c.effects)
+            if (e.enabled && std::lround(e.p("mask.shape", lt)) == 7)
+                out.push_back({c.id, e.id, file, e.s("mask.crypto_layer"), e.s("mask.crypto_ids")});
+    }
+    return out;
+}
+
+bool MaskOverlay::pickCryptomatte(const CryptoTarget& t, double u, double v, bool remove) {
+    const auto cm = cachedCryptomatte(t.file, t.layer);
+    if (!cm || cm->width <= 0) return false;
+    const float id = cm->idAt(int(std::floor(u * cm->width)), int(std::floor(v * cm->height)));
+    if (id == 0) return false;
+    std::vector<float> ids = parseCryptomatteIds(t.ids);
+    const auto at = std::find_if(ids.begin(), ids.end(), [&](float x) { return cryptomatteHex(x) == cryptomatteHex(id); });
+    if (remove == (at == ids.end())) return true;  // (already as asked)
+    if (remove) ids.erase(at);
+    else ids.push_back(id);
+    const Id clip = t.clip, effect = t.effect;
+    const std::string list = cryptomatteIdList(ids);
+    state_->edit(remove ? tr("Remove Cryptomatte Object") : tr("Add Cryptomatte Object"), [clip, effect, list](Project&, Sequence& sq) {
+        Effect* e = edit::ownedEffect(sq, clip, effect);
+        if (!e) return false;
+        e->strings["mask.crypto_ids"] = list;
+        return true;
+    });
+    return true;
+}
+
+bool MaskOverlay::cryptoPress(const QPointF& pos, Qt::KeyboardModifiers mods) {
+    for (const CryptoTarget& t : cryptoTargets()) {
+        double u, v;
+        if (!fromWidget(t.clip, pos, u, v) || u < 0 || v < 0 || u >= 1 || v >= 1) continue;
+        pickCryptomatte(t, u, v, mods & (Qt::ControlModifier | Qt::MetaModifier));
+        return true;
+    }
+    return false;
+}
+
+void MaskOverlay::requestCryptoTint(const CryptoTarget& t, const QString& key) const {
+    if (cryptoTinting_) return;  // (one at a time; the next paint asks for whatever is shown then)
+    cryptoTinting_ = true;
+    auto* self = const_cast<MaskOverlay*>(this);
+    auto* watcher = new QFutureWatcher<QImage>(self);
+    const Id effect = t.effect;
+    connect(watcher, &QFutureWatcher<QImage>::finished, self, [this, watcher, effect, key] {
+        watcher->deleteLater();
+        cryptoTinting_ = false;
+        cryptoTints_[effect] = {key, watcher->result()};
+        viewer_->update();
+    });
+    watcher->setFuture(QtConcurrent::run([file = t.file, layer = t.layer, ids = t.ids] {
+        const auto cm = cachedCryptomatte(file, layer);
+        if (!cm || cm->width <= 0) return QImage();
+        const std::vector<float> matte = cm->matte(parseCryptomatteIds(ids));
+        QImage img(cm->width, cm->height, QImage::Format_ARGB32_Premultiplied);
+        for (int y = 0; y < cm->height; ++y) {
+            auto* row = reinterpret_cast<QRgb*>(img.scanLine(y));
+            for (int x = 0; x < cm->width; ++x)
+                row[x] = qPremultiply(qRgba(70, 160, 255, int(matte[size_t(y) * size_t(cm->width) + size_t(x)] * 0.45f * 255)));
+        }
+        return img;
+    }));
+}
+
+void MaskOverlay::paintCryptomattes(QPainter& p) const {
+    const auto targets = cryptoTargets();
+    if (targets.empty()) return;
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing);
+    p.setRenderHint(QPainter::SmoothPixmapTransform);
+    for (auto it = cryptoTints_.begin(); it != cryptoTints_.end();)  // (masks no longer shown)
+        it = std::none_of(targets.begin(), targets.end(), [&](const CryptoTarget& t) { return t.effect == it->first; }) ? cryptoTints_.erase(it) : std::next(it);
+    for (const CryptoTarget& t : targets) {
+        // The picked objects tinted; until a new frame's or new picks' tint is made, the last one stays.
+        const QString key = QString::fromStdString(t.file + '\n' + t.layer + '\n' + t.ids);
+        const auto& [shown, tint] = cryptoTints_[t.effect];
+        if (shown != key) requestCryptoTint(t, key);
+        if (tint.isNull()) continue;
+        QPointF c00, c10, c11, c01;
+        if (!toWidget(t.clip, 0, 0, c00) || !toWidget(t.clip, 1, 0, c10) || !toWidget(t.clip, 1, 1, c11) || !toWidget(t.clip, 0, 1, c01))
+            continue;
+        QTransform tr;
+        if (!QTransform::quadToQuad(QPolygonF(QRectF(0, 0, tint.width(), tint.height())), QPolygonF({c00, c10, c11, c01}), tr)) continue;
+        p.save();
+        p.setTransform(tr, true);
+        p.drawImage(QRectF(0, 0, tint.width(), tint.height()), tint);
+        p.restore();
+    }
+    if (!cryptoHover_.isEmpty()) {
+        // The object under the pointer, by its name in the render's manifest.
+        const QRectF box = QRectF(p.fontMetrics().boundingRect(cryptoHover_)).adjusted(-5, -3, 5, 3).translated(hoverPos_ + QPointF(14, 22));
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(0, 0, 0, 170));
+        p.drawRoundedRect(box, 4, 4);
+        p.setPen(Qt::white);
+        p.drawText(box, Qt::AlignCenter, cryptoHover_);
+    }
+    p.restore();
 }
 
 // ---- Object masks ------------------------------------------------------------------
@@ -834,6 +958,7 @@ bool MaskOverlay::eventFilter(QObject* obj, QEvent* e) {
                 return true;
             }
         }
+        if (cryptoPress(pos, me->modifiers())) return true;
         return objectPress(pos);
     }
     if (objectGesture_ && e->type() == QEvent::MouseMove) {
@@ -849,6 +974,23 @@ bool MaskOverlay::eventFilter(QObject* obj, QEvent* e) {
     if (e->type() == QEvent::MouseMove) {
         auto* me = static_cast<QMouseEvent*>(e);
         if (grab_ == Grab::None) {
+            // The Cryptomatte object under the pointer, named.
+            QString hover;
+            for (const CryptoTarget& t : cryptoTargets()) {
+                double u, v;
+                if (!fromWidget(t.clip, me->position(), u, v) || u < 0 || v < 0 || u >= 1 || v >= 1) continue;
+                if (const auto cm = cachedCryptomatte(t.file, t.layer, false); cm && cm->width > 0)  // (read by the tint)
+                    if (const float id = cm->idAt(int(std::floor(u * cm->width)), int(std::floor(v * cm->height))); id != 0) {
+                        const std::string name = cm->crypto.objectName(id);
+                        hover = QString::fromStdString(name.empty() ? cryptomatteHex(id) : name);
+                    }
+                break;
+            }
+            if (hover != cryptoHover_ || (!hover.isEmpty() && me->position() != hoverPos_)) {
+                cryptoHover_ = hover;
+                hoverPos_ = me->position();
+                viewer_->update();
+            }
             // Hover feedback.
             bool over = false;
             bool draw = false;
