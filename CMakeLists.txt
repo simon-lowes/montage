@@ -28,6 +28,7 @@ option(MONTAGE_WITH_LIBRAW "Camera raw stills (CR3, NEF, ARW, DNG...), when LibR
 option(MONTAGE_WITH_MYSOFA "Measured HRTFs (SOFA files) for binaural ambisonics, when libmysofa is installed" ON)
 option(MONTAGE_WITH_OPENJPEG "IMF masters in the JPEG 2000 IMF profiles, when OpenJPEG 2.5+ is installed" ON)
 option(MONTAGE_WITH_OPENEXR "Multi-layer OpenEXR, Cryptomatte and HTJ2K (OpenEXR with Imath and OpenJPH, BSD, fetched at configure time)" ON)
+option(MONTAGE_WITH_BMX "Broadcast MXF by the book: AS-11, RDD 9 and ST 436 ancillary data (the EBU's bmx with libMXF, BSD, fetched at configure time)" ON)
 option(MONTAGE_GPU "The GPU compositor through Qt's RHI, where Qt is 6.6 or later" ON)
 option(MONTAGE_WITH_OCIO "OpenColorIO configs and ACES transforms, when OpenColorIO 2.1+ is installed" ON)
 option(MONTAGE_WITH_ONNXRUNTIME "AI object masks (EdgeTAM), when ONNX Runtime 1.16+ is installed (ONNXRUNTIME_ROOT or the usual prefixes)" ON)
@@ -109,6 +110,32 @@ if(MONTAGE_WITH_OPENEXR)
   set(BUILD_SHARED_LIBS ${MONTAGE_SAVED_BUILD_SHARED_LIBS})
   set(BUILD_TESTING ${MONTAGE_SAVED_BUILD_TESTING})
   set(CMAKE_POSITION_INDEPENDENT_CODE ${MONTAGE_SAVED_PIC})
+endif()
+
+if(MONTAGE_WITH_BMX)
+  # bmx 1.7 (the EBU's MXF library, with its libMXF and libMXF++) as static libraries for AS-11 and RDD 9 files;
+  # uriparser built from source, expat the system's (shared libraries such as fontconfig use it too).
+  include(FetchContent)
+  set(MONTAGE_SAVED_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+  set(MONTAGE_SAVED_BUILD_TESTING ${BUILD_TESTING})
+  set(BUILD_SHARED_LIBS OFF)
+  set(BUILD_TESTING OFF)
+  foreach(opt BMX_BUILD_TESTING BMX_BUILD_APPS BMX_BUILD_TOOLS BMX_BUILD_WITH_LIBCURL BMX_BUILD_EXPAT_SOURCE)
+    set(${opt} OFF CACHE BOOL "" FORCE)
+  endforeach()
+  foreach(opt BMX_BUILD_LIB_ONLY BMX_BUILD_URIPARSER_SOURCE)
+    set(${opt} ON CACHE BOOL "" FORCE)
+  endforeach()
+  set(LIBMXF_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+  set(LIBMXFPP_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(bmx
+    GIT_REPOSITORY https://github.com/ebu/bmx.git
+    GIT_TAG v1.7
+    GIT_SHALLOW TRUE
+    GIT_SUBMODULES "")
+  FetchContent_MakeAvailable(bmx)
+  set(BUILD_SHARED_LIBS ${MONTAGE_SAVED_BUILD_SHARED_LIBS})
+  set(BUILD_TESTING ${MONTAGE_SAVED_BUILD_TESTING})
 endif()
 
 if(MONTAGE_WITH_RNNOISE)

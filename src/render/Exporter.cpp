@@ -9,6 +9,8 @@
 #include "core/ClipAnimation.h"
 #include "core/Interpretation.h"
 #include "core/Cea708.h"
+#include "core/Teletext.h"
+#include "render/BroadcastMxf.h"
 #include "core/Chapters.h"
 #include "core/Surround.h"
 
@@ -855,6 +857,13 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (s.smartRender && isIntraCodec(c)) o.vctx->thread_type = FF_THREAD_SLICE;
         if (s.videoBitrate > 0) o.vctx->bit_rate = s.videoBitrate;
         if (o.oc->oformat->flags & AVFMT_GLOBALHEADER) o.vctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        if (s.interlaced) {
+            // Coded as two fields, the top first: a progressive picture's two halves (PsF), as 1080i deliveries ask.
+            if (c != "mpeg2video" && c != "libx264" && c != "prores_ks" && c != "dnxhd")
+                return fail("Interlaced output is for MPEG-2, H.264 (AVC-Intra), ProRes and DNxHD, not " + c);
+            o.vctx->flags |= AV_CODEC_FLAG_INTERLACED_DCT | AV_CODEC_FLAG_INTERLACED_ME;
+            o.vctx->field_order = AV_FIELD_TT;
+        }
         AVDictionary* opts = nullptr;
         const bool hwEncoder = hasSuffix(c, "_videotoolbox") || hasSuffix(c, "_nvenc") || hasSuffix(c, "_qsv") ||
                                hasSuffix(c, "_amf") || hasSuffix(c, "_mf");
@@ -1456,7 +1465,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     // Smart rendering: only where nothing would change the source's pictures for the whole export.
     std::unique_ptr<SmartRenderer> smart;
     if (wantVideo && s.smartRender && o.vctx && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height && !seq.stereo3d &&
-        !s.useProxies && !s.burnInCaptions && !s.cea608 && !s.burnIn.any() && outSpace.id == seqSpace.id && !trim)
+        !s.useProxies && !s.burnInCaptions && !s.cea608 && !s.interlaced && !s.burnIn.any() && outSpace.id == seqSpace.id && !trim)
         smart = std::make_unique<SmartRenderer>(p, seq, seqSpace, o.vctx, o.vst, s.alpha, s.profile);
     // CEA-608 (and CTA-708) captions in the video: each frame's A/53 cc_data (core/Cea708.h).
     std::vector<std::vector<CcTriplet>> ccFrames;
@@ -1610,6 +1619,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                     }
                 }
                 o.vframe->pts = f - in;
+                if (s.interlaced) o.vframe->flags |= AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST;
                 if (!attach608(f - in)) return fail("Out of memory");
                 if ((rc = avcodec_send_frame(o.vctx, o.vframe)) < 0) return fail("Video encoding failed: " + averr(rc));
                 if ((rc = drain(o, o.vctx, o.vst)) < 0) return fail("Writing video failed: " + averr(rc));
@@ -1629,6 +1639,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             int srcStride[4] = {img.width * 8, 0, 0, 0};
             sws_scale(o.sws, srcData, srcStride, 0, img.height, o.vframe->data, o.vframe->linesize);
             o.vframe->pts = f - in;
+            if (s.interlaced) o.vframe->flags |= AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST;
             if (!attach608(f - in)) return fail("Out of memory");
             if ((rc = avcodec_send_frame(o.vctx, o.vframe)) < 0) return fail("Video encoding failed: " + averr(rc));
             if ((rc = drain(o, o.vctx, o.vst)) < 0) return fail("Writing video failed: " + averr(rc));
@@ -1814,9 +1825,193 @@ bool exportCarriesCredentials(const ExportSettings& s) {
     return contentCredentialsFormat(s.path) && !frames.count(s.videoCodec);
 }
 
+namespace {
+
+std::string lowered(std::string t) {
+    for (char& c : t) c = char(std::tolower(static_cast<unsigned char>(c)));
+    return t;
+}
+
+// The ancillary packets, AS-11 metadata and parts of a broadcast MXF delivery for the sequence's range.
+bool broadcastMxfOptions(const Sequence& seq, const ExportSettings& s, FrameTime in, FrameTime out, BroadcastMxfOptions& o,
+                         std::string* error) {
+    o.shim = s.mxfDelivery;
+    o.startTimecode = s.startTimecode;
+    o.clipName = seq.name;
+    const int64_t frames = out - in;
+    const CaptionTrack* track = captionTrackFor(seq, s.captionTrack);
+    std::vector<Caption> part;
+    if (track)
+        for (Caption c : track->captions) {
+            if (c.end <= in || c.start >= out) continue;
+            c.start = std::max(c.start, in) - in;
+            c.end = std::min(c.end, out) - in;
+            part.push_back(std::move(c));
+        }
+    const bool interlaced = s.interlaced || s.mxfDelivery == "as11-dpp";
+    if ((s.ancCaptions || s.ancTeletext) && frames > 0) {
+        o.anc.assign(size_t(frames), {});
+        if (s.ancCaptions) {
+            const auto cc = captionCcData(part, seq.fps, frames, true, true, track ? track->style : CaptionStyle{});
+            for (int64_t f = 0; f < frames; ++f) o.anc[size_t(f)].push_back({9, 0x61, 0x01, captionCdp(cc[size_t(f)], seq.fps, uint16_t(f))});
+        }
+        if (s.ancTeletext) {
+            const auto fields = teletextSubtitleFields(part, seq.fps, frames, s.teletextPage, interlaced);
+            uint16_t sequence = 0;
+            const int perFrame = interlaced ? 2 : 1;
+            for (int64_t f = 0; f < frames; ++f)
+                for (int k = 0; k < perFrame; ++k)
+                    o.anc[size_t(f)].push_back({uint16_t(k ? 575 : 12), 0x43, 0x02,
+                                                op47Sdp(fields[size_t(f * perFrame + k)], sequence++, k == 0)});
+        }
+    }
+    if (s.mxfDelivery.rfind("as11", 0) != 0) return true;
+    // The metadata given, by framework.
+    std::set<std::string> core(as11CoreProperties().begin(), as11CoreProperties().end());
+    std::set<std::string> dpp(ukDppProperties().begin(), ukDppProperties().end());
+    for (const std::string& line : s.as11Metadata) {
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) eq = line.find(':');
+        auto trim = [](std::string t) {
+            while (!t.empty() && std::isspace(static_cast<unsigned char>(t.back()))) t.pop_back();
+            while (!t.empty() && std::isspace(static_cast<unsigned char>(t.front()))) t.erase(t.begin());
+            return t;
+        };
+        if (trim(line).empty()) continue;
+        if (eq == std::string::npos) {
+            if (error) *error = "AS-11 metadata is Name=value: " + line;
+            return false;
+        }
+        std::string name = trim(line.substr(0, eq)), value = trim(line.substr(eq + 1));
+        if (name.rfind("AS11", 0) == 0) name.erase(0, 4);
+        else if (name.rfind("UKDPP", 0) == 0) name.erase(0, 5);
+        if (core.count(name)) o.core[name] = value;
+        else if (dpp.count(name)) o.dpp[name] = value;
+        else {
+            if (error) *error = "Not an AS-11 or UK DPP property: " + name;
+            return false;
+        }
+    }
+    auto def = [](std::map<std::string, std::string>& m, const char* k, const std::string& v) {
+        if (!m.count(k)) m[k] = v;
+    };
+    def(o.core, "ProgrammeTitle", seq.name);
+    std::string language = s.audioLanguage;
+    if (language.empty() && !seq.captionTracks.empty()) language = seq.captionTracks.front().language;
+    const char* lang3 = iso639_2(language);
+    def(o.core, "PrimaryAudioLanguage", lang3 ? lang3 : "und");
+    const bool captioned = track && (s.ancCaptions || s.ancTeletext);
+    def(o.core, "ClosedCaptionsPresent", captioned ? "true" : "false");
+    if (captioned) {
+        def(o.core, "ClosedCaptionsType", "0");  // hard of hearing
+        const char* c3 = iso639_2(track->language);
+        if (c3) def(o.core, "ClosedCaptionsLanguage", c3);
+    }
+    // Markers for the DPP's line-up and clock, and the parts.
+    std::vector<MxfPart> parts;
+    int64_t lineUp = -1, identClock = -1;
+    for (const Marker& m : seq.markers) {
+        if (m.t < in || m.t >= out) continue;
+        const std::string n = lowered(m.name);
+        auto starts = [&](const char* w) { return n.rfind(w, 0) == 0; };
+        if (m.duration > 0 && starts("part")) {
+            const int64_t end = std::min<int64_t>(m.t + m.duration, out);
+            parts.push_back({m.t - in, end - m.t, 0, 0});
+        } else if (starts("line-up") || starts("line up") || starts("lineup") || starts("bars")) {
+            lineUp = m.t - in;
+        } else if (starts("clock") || starts("ident")) {
+            identClock = m.t - in;
+        }
+    }
+    std::sort(parts.begin(), parts.end(), [](const MxfPart& a, const MxfPart& b) { return a.start < b.start; });
+    for (size_t i = 0; i < parts.size(); ++i) {
+        parts[i].number = int(i + 1);
+        parts[i].total = int(parts.size());
+        if (i + 1 < parts.size() && parts[i].start + parts[i].duration > parts[i + 1].start) {
+            if (error) *error = "The part markers overlap";
+            return false;
+        }
+    }
+    o.parts = parts;
+    if (s.mxfDelivery == "as11-dpp" || !o.dpp.empty()) {
+        if (lineUp >= 0) def(o.dpp, "LineUpStart", std::to_string(lineUp));
+        if (identClock >= 0) def(o.dpp, "IdentClockStart", std::to_string(identClock));
+        def(o.dpp, "AudioLoudnessStandard", std::fabs(s.loudnessTarget + 23) < 0.05 ? "1" : "0");  // EBU R 128
+        def(o.dpp, "AudioDescriptionPresent", s.describedStream && hasDescriptionClips(seq) ? "true" : "false");
+        def(o.dpp, "OpenCaptionsPresent", s.burnInCaptions && track ? "true" : "false");
+        if (s.burnInCaptions && track)
+            if (const char* c3 = iso639_2(track->language)) def(o.dpp, "OpenCaptionsLanguage", c3);
+        def(o.dpp, "PictureRatio", "16/9");
+    }
+    const std::vector<std::string> missing = missingAs11(o);
+    if (!missing.empty()) {
+        std::string list;
+        for (const std::string& m : missing) list += (list.empty() ? "" : ", ") + m;
+        if (error) *error = "The UK DPP's metadata needs " + list;
+        return false;
+    }
+    return true;
+}
+
+// A broadcast MXF delivery: rendered by FFmpeg beside the file, then rewrapped into it.
+bool exportBroadcastMxf(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
+                        const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered, LightLevels* light) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    const std::string& d = s.mxfDelivery;
+    if (d != "rdd9" && d != "as11-dpp" && d != "as11-x2" && d != "as11-x8") return fail("Unknown broadcast MXF delivery \"" + d + "\"");
+    if (!broadcastMxfAvailable()) return fail("This build of Montage cannot write broadcast MXF (it has no bmx)");
+    if (lowered(std::filesystem::path(s.path).extension().string()) != ".mxf") return fail("Broadcast MXF deliveries are .mxf files");
+    const bool mpeg2 = d == "rdd9" || d == "as11-x8";
+    if (mpeg2 && s.videoCodec != "mpeg2video") return fail("RDD 9 and AS-11 X8 carry XDCAM HD422 (MPEG-2) video");
+    if (!mpeg2 && !(s.videoCodec == "libx264" && s.profile == "avci100"))
+        return fail("AS-11 UK DPP HD and X2 carry AVC-Intra 100 video");
+    if (d == "as11-dpp" && !(seq.fps == Rational{25, 1})) return fail("UK DPP HD is 25 frames a second (1080i25)");
+    if (s.audioCodec != "pcm_s24le" && s.audioCodec != "pcm_s16le") return fail("Broadcast MXF sound is PCM");
+    if (s.videoCodec == "none" || s.audioCodec == "none") return fail("Broadcast MXF deliveries have picture and sound");
+    if (mpeg2 && s.monoAudioTracks != 2 && s.monoAudioTracks != 4 && s.monoAudioTracks != 8)
+        return fail("RDD 9 carries 2, 4 or 8 mono sound tracks");
+    FrameTime in = s.in >= 0 ? s.in : 0;
+    FrameTime out = s.out >= 0 ? s.out : seq.duration();
+    if (seq.duration() > 0) out = std::min(out, seq.duration());
+    BroadcastMxfOptions o;
+    if (!broadcastMxfOptions(seq, s, in, out, o, error)) return false;
+
+    ExportSettings staged = s;
+    staged.mxfDelivery.clear();
+    staged.path = s.path + ".render.mxf";
+    if (d == "as11-dpp") staged.interlaced = true;
+    auto render = [&](double f, FrameTime t) {
+        if (progress) progress(f * 0.97, t);
+    };
+    const bool ok = exportSequence(p, seq, staged, render, cancel, error, encoderUsed, smartRendered, light);
+    if (!ok) {
+        std::remove(staged.path.c_str());
+        return false;
+    }
+    std::string why;
+    const bool rewrapped = rewrapBroadcastMxf(staged.path, s.path, o, &why);
+    std::remove(staged.path.c_str());
+    if (!rewrapped) return fail(why);
+    if (progress) progress(1.0, out);
+    return true;
+}
+
+}  // namespace
+
 bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings& s, const ExportProgress& progress,
                     const std::atomic<bool>* cancel, std::string* error, std::string* encoderUsed, int* smartRendered,
                     LightLevels* light, bool* keptUnsigned) {
+    if (!s.mxfDelivery.empty()) {
+        if (keptUnsigned) *keptUnsigned = false;
+        if (!s.credentialCertificate.empty()) {
+            if (error) *error = "Content Credentials cannot go in this kind of file";
+            return false;
+        }
+        return exportBroadcastMxf(p, seq, s, progress, cancel, error, encoderUsed, smartRendered, light);
+    }
     bool opened = false;
     if (keptUnsigned) *keptUnsigned = false;
     if (smartRendered) *smartRendered = 0;

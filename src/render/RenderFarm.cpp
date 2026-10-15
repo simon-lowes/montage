@@ -187,6 +187,12 @@ void visitSettings(S& s, V& v) {
     v("monoAudioTracks", s.monoAudioTracks);
     v("startTimecode", s.startTimecode);
     v("extraCaptions", s.extraCaptions);
+    v("interlaced", s.interlaced);
+    v("mxfDelivery", s.mxfDelivery);
+    v("as11Metadata", s.as11Metadata);
+    v("ancCaptions", s.ancCaptions);
+    v("ancTeletext", s.ancTeletext);
+    v("teletextPage", s.teletextPage);
     v("credentialCertificate", s.credentialCertificate);
     v("credentialKey", s.credentialKey);
     v("credentialAllowAiTraining", s.credentialAllowAiTraining);

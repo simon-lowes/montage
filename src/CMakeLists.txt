@@ -13,6 +13,7 @@ add_library(montage_engine STATIC
   core/Captions.h core/Captions.cpp
   core/CaptionFormats.cpp
   core/Cea708.h core/Cea708.cpp
+  core/Teletext.h core/Teletext.cpp
   core/CaptionTools.h core/CaptionTools.cpp
   core/TranscriptEdit.h core/TranscriptEdit.cpp
   core/Slate.h core/Slate.cpp
@@ -131,6 +132,7 @@ add_library(montage_engine STATIC
   render/Jpeg2000.h render/Jpeg2000.cpp
   render/PackageFiles.h render/PackageFiles.cpp
   render/Imf.h render/Imf.cpp
+  render/BroadcastMxf.h render/BroadcastMxf.cpp
   render/Adm.h render/Adm.cpp
   render/Relight.h render/Relight.cpp
   render/FilmLook.h render/FilmLook.cpp
@@ -468,6 +470,10 @@ if(MONTAGE_WITH_OPENEXR)
   target_include_directories(montage_engine PRIVATE ${openexr_SOURCE_DIR}/external/OpenJPH/src/core/common
                                                     ${openexr_SOURCE_DIR}/external/OpenJPH/src/core/openjph)
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_OPENEXR)
+endif()
+if(MONTAGE_WITH_BMX)
+  target_link_libraries(montage_engine PRIVATE bmx)
+  target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_BMX)
 endif()
 if(MONTAGE_WITH_THORVG)
   target_link_libraries(montage_engine PRIVATE montage_thorvg)

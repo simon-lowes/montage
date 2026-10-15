@@ -592,16 +592,7 @@ std::string captionsToMcc(const std::vector<Caption>& captions, Rational fps, co
     }
     const bool drop = isDropFrameRate(rate);
     for (int64_t f = 0; f < frames; ++f) {
-        const std::vector<CcTriplet>& cc = data[size_t(f)];
-        const uint16_t seq = uint16_t(f & 0xFFFF);
-        std::vector<uint8_t> cdp{0x96, 0x69, 0, uint8_t((mr.cdpCode << 4) | 0x0F), 0x43, uint8_t(seq >> 8), uint8_t(seq & 0xFF), 0x72,
-                                 uint8_t(0xE0 | cc.size())};
-        for (const CcTriplet& t : cc) cdp.insert(cdp.end(), t.begin(), t.end());
-        cdp.insert(cdp.end(), {0x74, uint8_t(seq >> 8), uint8_t(seq & 0xFF), 0});
-        cdp[2] = uint8_t(cdp.size());
-        unsigned sum = 0;
-        for (uint8_t v : cdp) sum += v;
-        cdp.back() = uint8_t((256 - (sum & 0xFF)) & 0xFF);  // the packet's bytes add up to 0
+        const std::vector<uint8_t> cdp = captionCdp(data[size_t(f)], rate, uint16_t(f & 0xFFFF));
         std::vector<uint8_t> anc{0x61, 0x01, uint8_t(cdp.size())};
         anc.insert(anc.end(), cdp.begin(), cdp.end());
         unsigned ancSum = 0;
@@ -621,7 +612,6 @@ bool parseMcc(const std::string& text, Rational fps, std::vector<Caption>& out, 
     if (text.compare(skip, 26, "File Format=MacCaption_MCC") != 0) return fail("Not an MCC caption file");
     Rational rate{30000, 1001};
     std::vector<std::pair<double, CcTriplet>> triplets;
-    std::vector<std::pair<double, uint16_t>> pairs;
     std::istringstream lines(text.substr(skip));
     std::string line;
     std::vector<uint8_t> bytes;
@@ -645,21 +635,59 @@ bool parseMcc(const std::string& text, Rational fps, std::vector<Caption>& out, 
         if (const size_t dot = tc.find('.'); dot != std::string::npos && dot > 8) tc.erase(dot);  // (a field flag)
         FrameTime frame = 0;
         if (!parseTimecode(tc, rate, frame) || !mccBytes(line.substr(tab + 1), bytes)) continue;
-        size_t at = bytes.size() >= 3 && bytes[0] == 0x61 && bytes[1] == 0x01 ? 3 : 0;
-        if (at + 9 > bytes.size() || bytes[at] != 0x96 || bytes[at + 1] != 0x69) continue;
-        const uint8_t flags = bytes[at + 4];
-        size_t i = at + 7;
-        if (flags & 0x80) i += 5;  // time code section
-        if (!(flags & 0x40) || i + 2 > bytes.size() || bytes[i] != 0x72) continue;
-        const size_t count = bytes[i + 1] & 0x1F;
-        i += 2;
+        const size_t at = bytes.size() >= 3 && bytes[0] == 0x61 && bytes[1] == 0x01 ? 3 : 0;
+        std::vector<CcTriplet> cc;
+        if (!parseCdp(bytes.data() + at, bytes.size() - at, cc, false)) continue;
         const double t = double(frame) / rate.toDouble();
-        int k = 0;
-        for (size_t n = 0; n < count && i + 3 <= bytes.size(); ++n, i += 3) {
-            const CcTriplet cc{bytes[i], bytes[i + 1], bytes[i + 2]};
-            triplets.push_back({t, cc});
-            if ((cc[0] & 0x04) && (cc[0] & 0x03) == 0) pairs.push_back({t + double(k++) * 1001.0 / 30000.0, uint16_t((cc[1] << 8) | cc[2])});
-        }
+        for (const CcTriplet& c : cc) triplets.push_back({t, c});
+    }
+    if (!captionsFromCc(triplets, fps, out)) return fail("No captions found in the MCC file");
+    return true;
+}
+
+std::vector<uint8_t> captionCdp(const std::vector<CcTriplet>& cc, Rational fps, uint16_t seq) {
+    std::vector<uint8_t> cdp{0x96, 0x69, 0, uint8_t((mccRateFor(fps).cdpCode << 4) | 0x0F), 0x43, uint8_t(seq >> 8), uint8_t(seq & 0xFF), 0x72,
+                             uint8_t(0xE0 | std::min<size_t>(cc.size(), 31))};
+    for (size_t i = 0; i < cc.size() && i < 31; ++i) cdp.insert(cdp.end(), cc[i].begin(), cc[i].end());
+    cdp.insert(cdp.end(), {0x74, uint8_t(seq >> 8), uint8_t(seq & 0xFF), 0});
+    cdp[2] = uint8_t(cdp.size());
+    unsigned sum = 0;
+    for (uint8_t v : cdp) sum += v;
+    cdp.back() = uint8_t((256 - (sum & 0xFF)) & 0xFF);  // the packet's bytes add up to 0
+    return cdp;
+}
+
+bool parseCdp(const uint8_t* bytes, size_t size, std::vector<CcTriplet>& out, bool checksum) {
+    if (size < 9 || bytes[0] != 0x96 || bytes[1] != 0x69) return false;
+    if (checksum) {
+        const size_t len = bytes[2];
+        if (len > size || len < 9) return false;
+        unsigned sum = 0;
+        for (size_t i = 0; i < len; ++i) sum += bytes[i];
+        if (sum & 0xFF) return false;
+    }
+    const uint8_t flags = bytes[4];
+    size_t i = 7;
+    if (flags & 0x80) i += 5;  // time code section
+    if (!(flags & 0x40) || i + 2 > size || bytes[i] != 0x72) return false;
+    const size_t count = bytes[i + 1] & 0x1F;
+    i += 2;
+    for (size_t n = 0; n < count && i + 3 <= size; ++n, i += 3) out.push_back({bytes[i], bytes[i + 1], bytes[i + 2]});
+    return true;
+}
+
+bool captionsFromCc(const std::vector<std::pair<double, CcTriplet>>& triplets, Rational fps, std::vector<Caption>& out, std::string* error) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    // The 608 pairs of field 1, on the line-21 clock from the frame each came in.
+    std::vector<std::pair<double, uint16_t>> pairs;
+    double last = -1;
+    int k = 0;
+    for (const auto& [t, cc] : triplets) {
+        if (t != last) last = t, k = 0;
+        if ((cc[0] & 0x04) && (cc[0] & 0x03) == 0) pairs.push_back({t + double(k++) * 1001.0 / 30000.0, uint16_t((cc[1] << 8) | cc[2])});
     }
     std::string why;
     std::vector<Caption> from708;
@@ -670,7 +698,7 @@ bool parseMcc(const std::string& text, Rational fps, std::vector<Caption>& out, 
     if (have708 && !painted) return out = std::move(from708), true;
     if (!pairs.empty() && captionsFrom608(pairs, fps, out, &why)) return true;
     if (have708) return out = std::move(from708), true;
-    return fail("No captions found in the MCC file");
+    return fail("No captions found");
 }
 
 }  // namespace montage

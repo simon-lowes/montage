@@ -55,6 +55,7 @@ private:
     void widthChanged(int w);
     void heightChanged(int h);
     void updateControls();
+    void editAs11Metadata();  // the AS-11 metadata, "Name=value" a line
     void updateSummary();
     bool rangeIsInOut() const;
     bool rangeFrames(FrameTime& in, FrameTime& out) const;  // false if empty
@@ -89,6 +90,16 @@ private:
     QComboBox* exrCompression_ = nullptr;  // OpenEXR frames' compression
     QCheckBox* smart_ = nullptr;
     QLineEdit* startTc_ = nullptr;   // the file's starting timecode (MXF, MOV)
+    // Broadcast MXF by the book (render/BroadcastMxf.h): the delivery, its AS-11 metadata, captions as ancillary
+    // data, interlaced coding.
+    QComboBox* mxfDelivery_ = nullptr;
+    QPushButton* as11Metadata_ = nullptr;
+    QCheckBox* ancCaptions_ = nullptr;
+    QCheckBox* ancTeletext_ = nullptr;
+    QSpinBox* teletextPage_ = nullptr;
+    QCheckBox* interlaced_ = nullptr;
+    QString as11Text_;  // "Name=value" lines
+    bool initialisedMxf_ = false;
     QComboBox* color_ = nullptr;
     QComboBox* stereo_ = nullptr;  // a stereoscopic sequence: how its eyes are delivered
     QComboBox* loudness_ = nullptr;

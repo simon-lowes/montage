@@ -224,6 +224,7 @@
 #include "render/ClipAnalysis.h"
 #include "render/Compositor.h"
 #include "render/RenderCache.h"
+#include "render/BroadcastMxf.h"
 #include "render/Exporter.h"
 #include "render/Ocio.h"
 
@@ -10089,9 +10090,21 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(tc);
         preset->setCurrentIndex(mp4);
         QVERIFY(!tc->isEnabled());  // MP4 keeps no timecode
+        auto* delivery = ed.findChild<QComboBox*>("exportMxfDelivery");
+        auto* interlaced = ed.findChild<QCheckBox*>("exportInterlaced");
+        QVERIFY(delivery && interlaced);
+        QVERIFY(!delivery->isEnabled());
         preset->setCurrentIndex(xdcam);
         QVERIFY(tc->isEnabled());
         tc->setText("10:00:00:00");
+        // XDCAM HD422's deliveries: as encoded, RDD 9, AS-11 X8; AS-11 X8 with its metadata, coded interlaced.
+        QCOMPARE(delivery->isEnabled(), broadcastMxfAvailable());
+        QCOMPARE(delivery->count(), 3);
+        QCOMPARE(delivery->itemData(2).toString(), QStringLiteral("as11-x8"));
+        delivery->setCurrentIndex(2);
+        QVERIFY(ed.findChild<QPushButton*>("exportAs11Metadata")->isEnabled() == broadcastMxfAvailable());
+        QVERIFY(interlaced->isEnabled());
+        interlaced->setChecked(true);
         ed.findChild<QLineEdit*>("exportPath")->setText(dir_.path() + "/delivery.mxf");
         ed.findChild<QPushButton*>("addToQueue")->click();
         QCOMPARE(ed.result(), int(QDialog::Accepted));
@@ -10101,7 +10114,11 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(job.settings.monoAudioTracks, 8);
         QCOMPARE(job.settings.startTimecode, formatTimecode(FrameTime(std::llround(36000 * state()->sequence()->fpsValue())), state()->sequence()->fps));
         QCOMPARE(job.settings.width, 1920);
+        QVERIFY(job.settings.interlaced);
+        QCOMPARE(job.settings.mxfDelivery, broadcastMxfAvailable() ? std::string("as11-x8") : std::string());
         queue->remove(job.id);
+        appSettings().remove("export/mxfDelivery");
+        appSettings().remove("export/interlaced");
         // A preset remembered under its old name, with its maker's name in front, comes back under its new one.
         const QVariant remembered = appSettings().value("export/preset");
         appSettings().setValue("export/preset", "Avid DNxHR HQ (MXF)");

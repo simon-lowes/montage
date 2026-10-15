@@ -39,6 +39,7 @@
 #include "render/Dcp.h"
 #include "render/Adm.h"
 #include "render/Imf.h"
+#include "render/BroadcastMxf.h"
 #include "render/LightLevel.h"
 #include "render/Hdr10Plus.h"
 #include "render/Spherical.h"
@@ -7482,6 +7483,54 @@ void McpServer::Impl::addTools() {
                       QJsonObject{{"problems", found}, {"ok", found.isEmpty()}});
         });
 
+    add("montage_read_broadcast_mxf", "Read a broadcast MXF file",
+        "Read a broadcast MXF file's delivery metadata (with the EBU's bmx): the picture essence and whether it is "
+        "interlaced, sound tracks, duration and start timecode, the AS-11 specification, core and UK DPP metadata and "
+        "parts, and the captions in its ST 436 ancillary data (CEA-708 or 608, and OP-47 teletext subtitles on a page).",
+        R"json({"type":"object","properties":{"file":{"type":"string"},"teletext_page":{"type":"integer","default":888}},"required":["file"]})json",
+        true, [](const QJsonObject& a) {
+            const QString file = absolute(need(a, "file"));
+            BroadcastMxfInfo info;
+            std::string why;
+            if (!readBroadcastMxf(file.toStdString(), info, &why)) throw ArgError{QString::fromStdString(why)};
+            auto map = [](const std::map<std::string, std::string>& m) {
+                QJsonObject o;
+                for (const auto& [k, v] : m) o.insert(QString::fromStdString(k), QString::fromStdString(v));
+                return o;
+            };
+            QJsonArray parts;
+            for (const MxfPart& p : info.parts)
+                parts.append(QJsonObject{{"number", p.number}, {"total", p.total}, {"start", double(p.start)}, {"duration", double(p.duration)}});
+            std::vector<Caption> cea, teletext;
+            ancCaptions(info, a.value("teletext_page").toInt(888), cea, teletext);
+            auto captions = [](const std::vector<Caption>& v) {
+                QJsonArray out;
+                for (const Caption& c : v)
+                    out.append(QJsonObject{{"start", double(c.start)}, {"end", double(c.end)}, {"text", QString::fromStdString(c.text)}});
+                return out;
+            };
+            QJsonObject out{{"picture", QString::fromStdString(info.pictureEssence)},
+                            {"interlaced", info.separateFields},
+                            {"sound_tracks", info.soundTracks},
+                            {"duration", double(info.duration)},
+                            {"edit_rate", QStringLiteral("%1/%2").arg(info.editRate.num).arg(info.editRate.den)},
+                            {"start_timecode", QString::fromStdString(info.startTimecode)},
+                            {"as11_spec", QString::fromStdString(info.as11Spec)},
+                            {"core", map(info.core)},
+                            {"dpp", map(info.dpp)},
+                            {"parts", parts},
+                            {"anc_frames", int(info.anc.size())},
+                            {"cea708_captions", captions(cea)},
+                            {"teletext_subtitles", captions(teletext)}};
+            const QString shim = info.core.count("ShimName") ? QString::fromStdString(info.core.at("ShimName")) : QStringLiteral("no AS-11 metadata");
+            return ok(QStringLiteral("%1, %2; %3 part(s), %4 caption(s), %5 subtitle(s)")
+                          .arg(QString::fromStdString(info.pictureEssence), shim)
+                          .arg(info.parts.size())
+                          .arg(cea.size())
+                          .arg(teletext.size()),
+                      out);
+        });
+
     add("montage_render", "Render",
         "Render the active sequence (or its in-out range) to a file with an export preset (default \"H.264 - High Quality\"), "
         "optionally normalising the mix's loudness for where it is going. Broadcast deliveries: the XDCAM HD422, AVC-Intra 100 "
@@ -7513,6 +7562,11 @@ void McpServer::Impl::addTools() {
             "audio_name":{"type":"string","description":"The mix stream's title"},"audio_language":{"type":"string","description":"The mix stream's language (ISO 639-1)"},
             "start_timecode":{"type":"string","description":"The file's starting timecode (MXF and MOV), e.g. 10:00:00:00 as broadcasters ask"},
             "mono_tracks":{"type":"integer","description":"Write the mix (then each audio stream) as mono tracks, padded with silence to this many, as broadcast MXF takes it; the MXF presets set 8, 4 or 2"},
+            "interlaced":{"type":"boolean","default":false,"description":"Code the video as interlaced fields, top first (each picture as both fields: PsF), as 1080i deliveries ask: MPEG-2, AVC-Intra, ProRes, DNxHD"},
+            "mxf_delivery":{"type":"string","enum":["op1a","rdd9","as11-dpp","as11-x2","as11-x8"],"default":"op1a","description":"Broadcast MXF by the book (rewrapped with the EBU's bmx): rdd9 = RDD 9 (the XDCAM HD422 preset); AS-11 with its descriptive metadata and parts: as11-dpp (UK DPP HD: the AVC-Intra 100 preset at 25 fps, coded 1080i25), as11-x2 (AVC-Intra HD), as11-x8 (XDCAM HD422 in RDD 9, the NABA's)"},
+            "as11":{"type":"object","additionalProperties":{"type":["string","number","boolean"]},"description":"AS-11 metadata by the names AS-11 gives them: core (SeriesTitle, ProgrammeTitle, EpisodeTitleNumber, ShimName, ShimVersion, AudioTrackLayout, PrimaryAudioLanguage, ClosedCaptionsPresent/Type/Language) and UK DPP (ProductionNumber, Synopsis, Originator, CopyrightYear, Distributor, PSEPass, SecondaryAudioLanguage, LineUpStart, IdentClockStart, CompletionDate, ContactEmail, ContactTelephoneNumber...). Unset ones come from the sequence: its name, languages, captions; line-up and clock from markers named Line-up and Clock, parts from markers with a duration named Part ..."},
+            "anc_captions":{"type":"string","enum":["none","cea708","teletext","both"],"default":"none","description":"In a broadcast MXF delivery: the caption track as ancillary data (ST 436): CEA-708 caption packets (with 608) and/or OP-47 teletext subtitles"},
+            "teletext_page":{"type":"integer","default":888,"description":"The teletext subtitle page (100 to 899)"},
             "credentials":{"type":"object","description":"Sign it with Content Credentials (C2PA, as Premiere does): a signed record in the file that Montage made it, each AI model that generated or changed what is in the range, and the credentials its sources carried. MP4, MOV, WAV, MP3, JPEG, PNG and TIFF",
                 "properties":{"certificate":{"type":"string","description":"The signing certificate chain (PEM, the signing certificate first; issued by a certificate authority, for digital signatures with e-mail protection or document signing use)"},
                     "key":{"type":"string","description":"Its private key (PEM)"},
@@ -7540,6 +7594,34 @@ void McpServer::Impl::addTools() {
             }
             if (a.contains("in")) st.in = timeArg(a.value("in"), s, "in");
             if (a.contains("out")) st.out = timeArg(a.value("out"), s, "out");
+            st.interlaced = a.value("interlaced").toBool(st.interlaced);
+            if (a.contains("mxf_delivery")) {
+                const std::string d = str(a, "mxf_delivery").toStdString();
+                if (d != "op1a" && d != "rdd9" && d != "as11-dpp" && d != "as11-x2" && d != "as11-x8")
+                    throw ArgError{"\"mxf_delivery\" is op1a, rdd9, as11-dpp, as11-x2 or as11-x8"};
+                st.mxfDelivery = d == "op1a" ? std::string() : d;
+            }
+            if (a.value("as11").isObject()) {
+                const QJsonObject m = a.value("as11").toObject();
+                for (auto it = m.begin(); it != m.end(); ++it) {
+                    const QJsonValue v = it.value();
+                    const QString text = v.isBool() ? (v.toBool() ? QStringLiteral("true") : QStringLiteral("false"))
+                                         : v.isDouble() ? QString::number(v.toDouble(), 'g', 12) : v.toString();
+                    st.as11Metadata.push_back((it.key() + "=" + text).toStdString());
+                }
+            }
+            if (a.contains("anc_captions")) {
+                const QString c = str(a, "anc_captions");
+                if (c != "none" && c != "cea708" && c != "teletext" && c != "both") throw ArgError{"\"anc_captions\" is none, cea708, teletext or both"};
+                st.ancCaptions = c == "cea708" || c == "both";
+                st.ancTeletext = c == "teletext" || c == "both";
+            }
+            if (a.contains("teletext_page")) {
+                st.teletextPage = a.value("teletext_page").toInt();
+                if (st.teletextPage < 100 || st.teletextPage > 899) throw ArgError{"\"teletext_page\" is 100 to 899"};
+            }
+            if ((st.ancCaptions || st.ancTeletext || !st.as11Metadata.empty()) && st.mxfDelivery.empty())
+                throw ArgError{"\"anc_captions\" and \"as11\" go with an \"mxf_delivery\""};
             if (a.contains("exr_compression")) {
                 if (st.videoCodec != "exr") throw ArgError{"\"exr_compression\" is for the OpenEXR preset"};
                 st.exrCompression = str(a, "exr_compression").toStdString();
