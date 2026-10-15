@@ -120,6 +120,11 @@ if(MONTAGE_WITH_BMX)
   set(MONTAGE_SAVED_BUILD_TESTING ${BUILD_TESTING})
   set(BUILD_SHARED_LIBS OFF)
   set(BUILD_TESTING OFF)
+  # bmx and its libraries ask for CMake 3.12, so their option(BUILD_SHARED_LIBS ... ON) would replace the OFF above
+  # with a cached ON (shared libraries on a first configure, and ON for everything after) unless options defer to
+  # variables.
+  set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
+  set(URIPARSER_SHARED_LIBS OFF CACHE BOOL "" FORCE)
   foreach(opt BMX_BUILD_TESTING BMX_BUILD_APPS BMX_BUILD_TOOLS BMX_BUILD_WITH_LIBCURL BMX_BUILD_EXPAT_SOURCE)
     set(${opt} OFF CACHE BOOL "" FORCE)
   endforeach()
@@ -138,8 +143,14 @@ if(MONTAGE_WITH_BMX)
     # libMXF's Windows memory-mapped file guards its copies with MSVC's __try / __except, which GCC lacks.
     target_compile_options(MXF PRIVATE -include ${CMAKE_SOURCE_DIR}/third_party/bmx/mingw-seh.h)
   endif()
-  set(BUILD_SHARED_LIBS ${MONTAGE_SAVED_BUILD_SHARED_LIBS})
-  set(BUILD_TESTING ${MONTAGE_SAVED_BUILD_TESTING})
+  unset(CMAKE_POLICY_DEFAULT_CMP0077)
+  foreach(var BUILD_SHARED_LIBS BUILD_TESTING)
+    if("${MONTAGE_SAVED_${var}}" STREQUAL "")
+      unset(${var})
+    else()
+      set(${var} ${MONTAGE_SAVED_${var}})
+    endif()
+  endforeach()
 endif()
 
 if(MONTAGE_WITH_RNNOISE)

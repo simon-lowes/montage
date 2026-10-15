@@ -859,8 +859,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (o.oc->oformat->flags & AVFMT_GLOBALHEADER) o.vctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         if (s.interlaced) {
             // Coded as two fields, the top first: a progressive picture's two halves (PsF), as 1080i deliveries ask.
-            if (c != "mpeg2video" && c != "libx264" && c != "prores_ks" && c != "dnxhd")
-                return fail("Interlaced output is for MPEG-2, H.264 (AVC-Intra), ProRes and DNxHD, not " + c);
+            // (FFmpeg codes DNxHR, the only DNx Montage writes, progressive only.)
+            if (c != "mpeg2video" && c != "libx264" && c != "prores_ks")
+                return fail("Interlaced output is for MPEG-2, H.264 (AVC-Intra) and ProRes, not " + c);
             o.vctx->flags |= AV_CODEC_FLAG_INTERLACED_DCT | AV_CODEC_FLAG_INTERLACED_ME;
             o.vctx->field_order = AV_FIELD_TT;
         }
@@ -1965,10 +1966,12 @@ bool exportBroadcastMxf(const Project& p, const Sequence& seq, const ExportSetti
     if (!broadcastMxfAvailable()) return fail("This build of Montage cannot write broadcast MXF (it has no bmx)");
     if (lowered(std::filesystem::path(s.path).extension().string()) != ".mxf") return fail("Broadcast MXF deliveries are .mxf files");
     const bool mpeg2 = d == "rdd9" || d == "as11-x8";
-    if (mpeg2 && s.videoCodec != "mpeg2video") return fail("RDD 9 and AS-11 X8 carry XDCAM HD422 (MPEG-2) video");
+    if (mpeg2 && s.videoCodec != "mpeg2video") return fail("RDD 9 and AS-11 X8 carry MPEG-2 HD 4:2:2 video");
     if (!mpeg2 && !(s.videoCodec == "libx264" && s.profile == "avci100"))
         return fail("AS-11 UK DPP HD and X2 carry AVC-Intra 100 video");
     if (d == "as11-dpp" && !(seq.fps == Rational{25, 1})) return fail("UK DPP HD is 25 frames a second (1080i25)");
+    if (d == "as11-dpp" && ((s.width > 0 ? s.width : seq.width) != 1920 || (s.height > 0 ? s.height : seq.height) != 1080))
+        return fail("UK DPP HD is 1920 by 1080 (1080i25)");
     if (s.audioCodec != "pcm_s24le" && s.audioCodec != "pcm_s16le") return fail("Broadcast MXF sound is PCM");
     if (s.videoCodec == "none" || s.audioCodec == "none") return fail("Broadcast MXF deliveries have picture and sound");
     if (mpeg2 && s.monoAudioTracks != 2 && s.monoAudioTracks != 4 && s.monoAudioTracks != 8)
@@ -1978,6 +1981,7 @@ bool exportBroadcastMxf(const Project& p, const Sequence& seq, const ExportSetti
     if (seq.duration() > 0) out = std::min(out, seq.duration());
     BroadcastMxfOptions o;
     if (!broadcastMxfOptions(seq, s, in, out, o, error)) return false;
+    if (!checkAs11Metadata(o, error)) return false;  // before the render, not after it
 
     ExportSettings staged = s;
     staged.mxfDelivery.clear();
@@ -1986,14 +1990,19 @@ bool exportBroadcastMxf(const Project& p, const Sequence& seq, const ExportSetti
     auto render = [&](double f, FrameTime t) {
         if (progress) progress(f * 0.97, t);
     };
+    std::error_code ec;
+    const std::filesystem::path stagedPath = std::filesystem::u8path(staged.path);
     const bool ok = exportSequence(p, seq, staged, render, cancel, error, encoderUsed, smartRendered, light);
     if (!ok) {
-        std::remove(staged.path.c_str());
+        std::filesystem::remove(stagedPath, ec);
         return false;
     }
     std::string why;
-    const bool rewrapped = rewrapBroadcastMxf(staged.path, s.path, o, &why);
-    std::remove(staged.path.c_str());
+    const bool rewrapped = rewrapBroadcastMxf(staged.path, s.path, o, &why, [&](double f) {
+        if (progress) progress(0.97 + 0.03 * f, in + FrameTime(std::lround(f * double(out - in))));
+        return !(cancel && cancel->load());
+    });
+    std::filesystem::remove(stagedPath, ec);
     if (!rewrapped) return fail(why);
     if (progress) progress(1.0, out);
     return true;

@@ -3,6 +3,7 @@
 #include <QDate>
 #include <QTemporaryFile>
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <filesystem>
@@ -31,6 +32,9 @@
 #include <bmx/mxf_reader/MXFFileReader.h>
 #include <bmx/rdd9_mxf/RDD9File.h>
 #include <bmx/st436/ST436Element.h>
+#include <mxf/mxf_memory_file.h>
+
+#include "MxfFiles.h"
 #endif
 
 namespace montage {
@@ -69,7 +73,8 @@ void ancCaptions(const BroadcastMxfInfo& info, int page, std::vector<Caption>& c
     const Rational rate = info.editRate.valid() ? info.editRate : Rational{25, 1};
     std::vector<std::pair<double, CcTriplet>> triplets;
     std::vector<std::vector<TeletextPacket>> fields;
-    size_t perFrame = 1;
+    // Teletext's fields: as many a frame as the most any frame carries, from frame 0 (frames without them count).
+    size_t perFrame = 0;
     for (const std::vector<AncPacket>& frame : info.anc) {
         size_t sdps = 0;
         for (const AncPacket& p : frame)
@@ -90,18 +95,23 @@ void ancCaptions(const BroadcastMxfInfo& info, int page, std::vector<Caption>& c
                 ++sdps;
             }
         }
-        if (!fields.empty())
-            for (; sdps < perFrame; ++sdps) fields.emplace_back();  // (a field without its packet)
+        for (; sdps < perFrame; ++sdps) fields.emplace_back();  // (a field without its packet)
     }
     if (!triplets.empty()) captionsFromCc(triplets, rate, cea);
-    if (!fields.empty()) teletextSubtitles(fields, rate, page, teletext, perFrame == 2);
+    if (perFrame) teletextSubtitles(fields, rate, page, teletext, perFrame == 2);
 }
 
 #ifndef MONTAGE_WITH_BMX
 
 bool broadcastMxfAvailable() { return false; }
 
-bool rewrapBroadcastMxf(const std::string&, const std::string&, const BroadcastMxfOptions&, std::string* error) {
+bool rewrapBroadcastMxf(const std::string&, const std::string&, const BroadcastMxfOptions&, std::string* error,
+                        const std::function<bool(double)>&) {
+    if (error) *error = "This build of Montage has no broadcast MXF writer (bmx)";
+    return false;
+}
+
+bool checkAs11Metadata(const BroadcastMxfOptions&, std::string* error) {
     if (error) *error = "This build of Montage has no broadcast MXF writer (bmx)";
     return false;
 }
@@ -201,11 +211,96 @@ std::string tcText(const bmx::Timecode& tc) {
 
 std::string boolText(bool b) { return b ? "true" : "false"; }
 
+// The AS-11 metadata `o` gives, with the defaults for what it leaves out, set on `helper`; false with `why` for a
+// shim or property AS-11 has not.
+bool setAs11Metadata(bmx::AS11Helper& helper, const BroadcastMxfOptions& o, std::string& why) {
+    auto no = [&](const std::string& w) {
+        why = w;
+        return false;
+    };
+    auto known = [](const std::vector<std::string>& names, const std::string& k) { return std::find(names.begin(), names.end(), k) != names.end(); };
+    if (o.shim != "as11-dpp" && !helper.ParseSpecificationId(o.shim)) return no("Unknown AS-11 shim " + o.shim);
+    // (Empty values count as not given: bmx would leave them out.)
+    auto given = [](const std::map<std::string, std::string>& m) {
+        std::map<std::string, std::string> out;
+        for (const auto& [k, v] : m)
+            if (!v.empty()) out[k] = v;
+        return out;
+    };
+    std::map<std::string, std::string> core = given(o.core);
+    auto def = [](std::map<std::string, std::string>& m, const char* k, const std::string& v) {
+        if (!m.count(k)) m[k] = v;
+    };
+    def(core, "ProgrammeTitle", o.clipName);
+    if (core["ProgrammeTitle"].empty()) return no("AS-11 needs a programme title");
+    // A one-off's series and episode are its programme title, as the DPP's guidance has it.
+    def(core, "SeriesTitle", core["ProgrammeTitle"]);
+    def(core, "EpisodeTitleNumber", core["ProgrammeTitle"]);
+    def(core, "ShimName", o.shim == "as11-dpp" ? "UK DPP HD" : o.shim == "as11-x2" ? "AS-11 X2" : "AS-11 X8");
+    def(core, "ShimVersion", o.shim == "as11-dpp" ? "1.1" : "1.0");
+    def(core, "AudioTrackLayout", "3");  // EBU R 48: 2a, the programme's stereo on tracks 1 and 2
+    def(core, "PrimaryAudioLanguage", "und");
+    def(core, "ClosedCaptionsPresent", "false");
+    for (const auto& [k, v] : core)
+        if (!known(as11CoreProperties(), k) || !helper.SetFrameworkProperty("as11", k.c_str(), v.c_str())) return no("Not an AS-11 core property: " + k);
+    if (o.shim == "as11-dpp" || !o.dpp.empty()) {
+        std::map<std::string, std::string> dpp = given(o.dpp);
+        def(dpp, "CopyrightYear", std::to_string(QDate::currentDate().year()));
+        def(dpp, "ThreeD", "false");
+        def(dpp, "PSEPass", "2");  // not tested
+        def(dpp, "SecondaryAudioLanguage", "zxx");
+        def(dpp, "TertiaryAudioLanguage", "zxx");
+        def(dpp, "AudioLoudnessStandard", "0");
+        def(dpp, "LineUpStart", "0");
+        def(dpp, "IdentClockStart", "0");
+        def(dpp, "AudioDescriptionPresent", "false");
+        def(dpp, "OpenCaptionsPresent", "false");
+        def(dpp, "SigningPresent", "1");  // no
+        def(dpp, "CompletionDate", QDate::currentDate().toString(Qt::ISODate).toStdString());
+        for (const auto& [k, v] : dpp)
+            if (!known(ukDppProperties(), k) || !helper.SetFrameworkProperty("dpp", k.c_str(), v.c_str())) return no("Not a UK DPP property: " + k);
+    }
+    return true;
+}
+
 }  // namespace
 
 bool broadcastMxfAvailable() { return true; }
 
-bool rewrapBroadcastMxf(const std::string& in, const std::string& out, const BroadcastMxfOptions& o, std::string* error) {
+bool checkAs11Metadata(const BroadcastMxfOptions& o, std::string* error) {
+    using namespace bmx;
+    if (o.shim.rfind("as11", 0) != 0) return true;
+    BmxSession session;
+    try {
+        // The metadata set on a clip of the shim's kind, in memory, as the rewrap will: bmx reads and checks the values.
+        MXFMemoryFile* memory = nullptr;
+        if (!mxf_mem_file_open_new(1 << 16, 0, &memory)) return fail(error, "Could not check the AS-11 metadata");
+        auto* file = new mxfpp::File(mxf_mem_file_get_file(memory));
+        const mxfRational rate = {25, 1};
+        std::unique_ptr<ClipWriter> clip(o.shim == "as11-x8" ? ClipWriter::OpenNewRDD9Clip(RDD9_AS11_FLAVOUR, file, rate)
+                                                             : ClipWriter::OpenNewOP1AClip(OP1A_DEFAULT_FLAVOUR | OP1A_AS11_FLAVOUR, file, rate));
+        clip->CreateTrack(o.shim == "as11-x8" ? MPEG2LG_422P_HL_1080I : AVCI100_1080I);
+        for (int i = 0; i < 2; ++i) {  // (RDD 9 has sound)
+            ClipWriterTrack* t = clip->CreateTrack(WAVE_PCM);
+            t->SetSamplingRate({48000, 1});
+            t->SetQuantizationBits(24);
+            t->SetChannelCount(1);
+        }
+        clip->PrepareHeaderMetadata();
+        AS11Helper helper;
+        std::string why;
+        if (!setAs11Metadata(helper, o, why)) return fail(error, why);
+        helper.AddMetadata(clip.get());
+        return true;
+    } catch (const std::exception& e) {
+        return fail(error, withLog(std::string("AS-11 metadata refused: ") + e.what()));
+    } catch (...) {
+        return fail(error, withLog("AS-11 metadata refused"));
+    }
+}
+
+bool rewrapBroadcastMxf(const std::string& in, const std::string& out, const BroadcastMxfOptions& o, std::string* error,
+                        const std::function<bool(double)>& progress) {
     using namespace bmx;
     const bool as11 = o.shim.rfind("as11", 0) == 0;
     const bool rdd9 = o.shim == "rdd9" || o.shim == "as11-x8";
@@ -223,6 +318,7 @@ bool rewrapBroadcastMxf(const std::string& in, const std::string& out, const Bro
     };
     try {
         MXFFileReader reader;
+        reader.SetFileFactory(new Utf8MxfFileFactory, true);
         const MXFFileReader::OpenResult r = reader.Open(in);
         if (r != MXFFileReader::MXF_RESULT_SUCCESS) return failed("Could not read the MXF file to rewrap: " + MXFFileReader::ResultToString(r));
         if (!reader.IsComplete()) return failed("The MXF file to rewrap is incomplete");
@@ -258,14 +354,14 @@ bool rewrapBroadcastMxf(const std::string& in, const std::string& out, const Bro
         if (!picture) return failed("The MXF file to rewrap has no picture");
         const EssenceType pictureType = picture->essence_type;
         if (rdd9 && !isMpeg2Hd(pictureType))
-            return failed(std::string(o.shim == "rdd9" ? "RDD 9" : "AS-11 X8") + " carries MPEG-2 HD (XDCAM HD422), not " +
+            return failed(std::string(o.shim == "rdd9" ? "RDD 9" : "AS-11 X8") + " carries MPEG-2 HD 4:2:2 long GOP, not " +
                           essence_type_to_string(pictureType));
         if (!rdd9 && !isAvcIntra(pictureType)) return failed("AS-11 " + std::string(o.shim == "as11-dpp" ? "UK DPP HD" : "X2") +
                                                              " carries AVC-Intra, not " + essence_type_to_string(pictureType));
         if (o.shim == "as11-dpp" && (pictureType != AVCI100_1080I || !(rate == Rational{25, 1})))
             return failed("UK DPP HD is AVC-Intra 100 at 1080i25 (interlaced, 25 frames a second)");
 
-        DefaultMXFFileFactory files;
+        Utf8MxfFileFactory files;
         int flavour;
         if (rdd9) {
             flavour = as11 ? RDD9_AS11_FLAVOUR : 0;
@@ -333,39 +429,8 @@ bool rewrapBroadcastMxf(const std::string& in, const std::string& out, const Bro
         AS11Helper helper;
         QTemporaryFile segments;
         if (as11) {
-            if (o.shim != "as11-dpp" && !helper.ParseSpecificationId(o.shim)) return failed("Unknown AS-11 shim " + o.shim);
-            std::map<std::string, std::string> core = o.core;
-            auto def = [](std::map<std::string, std::string>& m, const char* k, const std::string& v) {
-                if (!m.count(k)) m[k] = v;
-            };
-            def(core, "ProgrammeTitle", o.clipName);
-            // A one-off's series and episode are its programme title, as the DPP's guidance has it.
-            def(core, "SeriesTitle", core["ProgrammeTitle"]);
-            def(core, "EpisodeTitleNumber", core["ProgrammeTitle"]);
-            def(core, "ShimName", o.shim == "as11-dpp" ? "UK DPP HD" : o.shim == "as11-x2" ? "AS-11 X2" : "AS-11 X8");
-            def(core, "ShimVersion", o.shim == "as11-dpp" ? "1.1" : "1.0");
-            def(core, "AudioTrackLayout", "3");  // EBU R 48: 2a, the programme's stereo on tracks 1 and 2
-            def(core, "PrimaryAudioLanguage", "und");
-            def(core, "ClosedCaptionsPresent", "false");
-            for (const auto& [k, v] : core)
-                if (!helper.SetFrameworkProperty("as11", k.c_str(), v.c_str())) return failed("Not an AS-11 core property: " + k);
-            if (o.shim == "as11-dpp" || !o.dpp.empty()) {
-                std::map<std::string, std::string> dpp = o.dpp;
-                def(dpp, "CopyrightYear", std::to_string(QDate::currentDate().year()));
-                def(dpp, "ThreeD", "false");
-                def(dpp, "PSEPass", "2");  // not tested
-                def(dpp, "SecondaryAudioLanguage", "zxx");
-                def(dpp, "TertiaryAudioLanguage", "zxx");
-                def(dpp, "AudioLoudnessStandard", "0");
-                def(dpp, "LineUpStart", "0");
-                def(dpp, "IdentClockStart", "0");
-                def(dpp, "AudioDescriptionPresent", "false");
-                def(dpp, "OpenCaptionsPresent", "false");
-                def(dpp, "SigningPresent", "1");  // no
-                def(dpp, "CompletionDate", QDate::currentDate().toString(Qt::ISODate).toStdString());
-                for (const auto& [k, v] : dpp)
-                    if (!helper.SetFrameworkProperty("dpp", k.c_str(), v.c_str())) return failed("Not a UK DPP property: " + k);
-            }
+            std::string why;
+            if (!setAs11Metadata(helper, o, why)) return failed(why);
             // The parts, as bmx reads them: part/total, the start and end timecodes.
             std::vector<MxfPart> parts = o.parts;
             if (parts.empty()) parts.push_back({0, duration, 1, 1});
@@ -382,13 +447,17 @@ bool rewrapBroadcastMxf(const std::string& in, const std::string& out, const Bro
             if (!segments.open()) return failed("Could not write the AS-11 parts");
             segments.write(text.data(), qint64(text.size()));
             segments.close();
-            if (!helper.ParseSegmentationFile(segments.fileName().toLocal8Bit().constData(), editRate)) return failed("AS-11 parts refused");
+            const std::string segmentsPath = fopenPath(segments.fileName().toStdString());
+            if (segmentsPath.empty()) return failed("The AS-11 parts' temporary file has no name bmx can open");
+            if (!helper.ParseSegmentationFile(segmentsPath.c_str(), editRate)) return failed("AS-11 parts refused");
         }
 
         clip->PrepareHeaderMetadata();
         if (as11) helper.AddMetadata(clip.get());
         clip->PrepareWrite();
 
+        // Ancillary data lines in a progressive picture are wrapped as its frame's, else as an interlaced frame's.
+        const ANCWrappingType ancWrapping = picture->frame_layout == MXF_FULL_FRAME ? VANC_PROGRESSIVE_FRAME : VANC_FRAME;
         ByteArray buffer, ancBuffer;
         int64_t frame = 0;
         while (frame < duration) {
@@ -431,7 +500,7 @@ bool rewrapBroadcastMxf(const std::string& in, const std::string& out, const Bro
                 for (const AncPacket& p : size_t(frame) < o.anc.size() ? o.anc[size_t(frame)] : std::vector<AncPacket>{}) {
                     ST436Line line(false);
                     line.line_number = p.line;
-                    line.wrapping_type = VANC_FRAME;
+                    line.wrapping_type = ancWrapping;
                     line.payload_sample_coding = ANC_8_BIT_COMP_LUMA;
                     line.payload_sample_count = uint16_t(payloads[k].size());
                     line.payload_data = payloads[k].data();
@@ -444,6 +513,7 @@ bool rewrapBroadcastMxf(const std::string& in, const std::string& out, const Bro
                 clip->WriteSamples(ancOutput, ancBuffer.GetBytes(), ancBuffer.GetSize(), 1);
             }
             ++frame;
+            if (progress && !progress(double(frame) / double(duration))) return failed("Export cancelled");
         }
         if (frame < duration) return failed("The MXF file to rewrap could not be read to its end");
         if (as11) helper.Complete();
@@ -465,6 +535,7 @@ bool readBroadcastMxf(const std::string& path, BroadcastMxfInfo& info, std::stri
     BmxSession session;
     try {
         MXFFileReader reader;
+        reader.SetFileFactory(new Utf8MxfFileFactory, true);
         AS11Info::RegisterExtensions(reader.GetHeaderMetadata());
         const MXFFileReader::OpenResult r = reader.Open(path);
         if (r != MXFFileReader::MXF_RESULT_SUCCESS) return fail(error, withLog("Could not read " + path + ": " + MXFFileReader::ResultToString(r)));

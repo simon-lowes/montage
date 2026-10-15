@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -68,10 +69,16 @@ bool broadcastMxfAvailable();
 const std::vector<std::string>& as11CoreProperties();
 const std::vector<std::string>& ukDppProperties();
 
+// Whether AS-11 takes the metadata `o` gives (with the defaults the rewrap fills in): false with `error` naming what
+// it refuses, so a delivery can be refused before it is rendered. True for deliveries without AS-11.
+bool checkAs11Metadata(const BroadcastMxfOptions& o, std::string* error = nullptr);
+
 // `in` (an MXF OP1a file of one picture track, MPEG-2 422P@HL long GOP or AVC-Intra, and mono or multichannel PCM)
-// rewrapped into `out` as `o` says. False with `error` (and no file left at `out`) for a picture bmx cannot carry in
-// the shim, metadata AS-11 refuses, or parts past the end.
-bool rewrapBroadcastMxf(const std::string& in, const std::string& out, const BroadcastMxfOptions& o, std::string* error = nullptr);
+// rewrapped into `out` as `o` says, telling `progress` the fraction done after each frame (false from it stops). False
+// with `error` (and no file left at `out`) for a picture bmx cannot carry in the shim, metadata AS-11 refuses, parts
+// past the end, or a stop.
+bool rewrapBroadcastMxf(const std::string& in, const std::string& out, const BroadcastMxfOptions& o, std::string* error = nullptr,
+                        const std::function<bool(double)>& progress = {});
 
 struct BroadcastMxfInfo {
     std::string pictureEssence;      // bmx's name for it: "AVCI_100_1080i", "MPEG_2_Long_GOP_422P_HL_1080i"...

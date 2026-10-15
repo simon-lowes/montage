@@ -248,7 +248,7 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
         h->setContentsMargins(0, 0, 0, 0);
         mxfDelivery_ = new QComboBox(row);
         mxfDelivery_->setObjectName(QStringLiteral("exportMxfDelivery"));
-        mxfDelivery_->setToolTip(tr("MXF as broadcasters' ingest checks it: RDD 9 for XDCAM HD422, or AMWA AS-11 with its "
+        mxfDelivery_->setToolTip(tr("MXF as broadcasters' ingest checks it: RDD 9 for MPEG-2 HD 4:2:2, or AMWA AS-11 with its "
                                     "programme metadata and parts (from markers named Part 1, Part 2... with a duration)"));
         as11Metadata_ = new QPushButton(tr("AS-11 Metadata..."), row);
         as11Metadata_->setObjectName(QStringLiteral("exportAs11Metadata"));
@@ -720,12 +720,12 @@ void ExportDialog::updateControls() {
     chapters_->setEnabled(chapterFile && anyChapters);
     startTc_->setEnabled(ext == QLatin1String("mxf") || ext == QLatin1String("mov"));
     {
-        // The deliveries the preset's codec can make: RDD 9 and X8 for XDCAM HD422, the DPP's and X2 for AVC-Intra.
+        // The deliveries the preset's codec can make: RDD 9 and X8 for MPEG-2 HD, the DPP's and X2 for AVC-Intra.
         const std::string vc = p ? p->settings.videoCodec : std::string();
         const bool mpeg2 = vc == "mpeg2video", avci = vc == "libx264" && p && p->settings.profile == "avci100";
         const QString was = mxfDelivery_->currentData().toString();
         QList<QPair<QString, QString>> items = {{tr("OP1a as encoded"), QString()}};
-        if (mpeg2) items += {{tr("RDD 9 (XDCAM HD422)"), QStringLiteral("rdd9")}, {tr("AS-11 X8 (NABA, MPEG-2 HD)"), QStringLiteral("as11-x8")}};
+        if (mpeg2) items += {{tr("RDD 9 (MPEG-2 HD 4:2:2)"), QStringLiteral("rdd9")}, {tr("AS-11 X8 (NABA, MPEG-2 HD)"), QStringLiteral("as11-x8")}};
         if (avci) items += {{tr("AS-11 UK DPP HD (1080i25)"), QStringLiteral("as11-dpp")}, {tr("AS-11 X2 (AVC-Intra HD)"), QStringLiteral("as11-x2")}};
         bool same = mxfDelivery_->count() == items.size();
         for (int i = 0; same && i < items.size(); ++i) same = mxfDelivery_->itemData(i).toString() == items[i].second;
@@ -747,9 +747,9 @@ void ExportDialog::updateControls() {
         teletextPage_->setEnabled(ancTeletext_->isEnabled());
         if (!mxfDelivery_->isEnabled())
             mxfDelivery_->setToolTip(!broadcastMxfAvailable() ? tr("This build of Montage has no broadcast MXF writer (bmx)")
-                                                               : tr("For the XDCAM HD422 and AVC-Intra 100 MXF presets"));
+                                                               : tr("For the MPEG-2 HD and AVC-Intra 100 MXF presets"));
         // The DPP's HD is 1080i: coded interlaced whatever the box says.
-        interlaced_->setEnabled(video && (vc == "mpeg2video" || vc == "libx264" || vc == "prores_ks" || vc == "dnxhd") && d != "as11-dpp");
+        interlaced_->setEnabled(video && (vc == "mpeg2video" || vc == "libx264" || vc == "prores_ks") && d != "as11-dpp");
     }
     if (credentials_) {
         ExportSettings would = p ? p->settings : ExportSettings{};

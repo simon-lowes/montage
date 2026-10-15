@@ -305,12 +305,12 @@ bool teletextSubtitles(const std::vector<std::vector<TeletextPacket>>& fields, R
     struct Showing {
         std::string text;
         int64_t start = 0;
-        int firstRow = 0, align = kCaptionCentre;
+        int firstRow = 0, lastRow = 0, align = kCaptionCentre;
     } current;
-    // The boxed text on screen, its first row and alignment.
-    auto boxed = [&](const std::array<std::string, 25>& page, int& firstRow, int& align) {
+    // The boxed text on screen, its first and last rows and alignment.
+    auto boxed = [&](const std::array<std::string, 25>& page, int& firstRow, int& lastRow, int& align) {
         std::string text;
-        firstRow = 0;
+        firstRow = lastRow = 0;
         align = kCaptionCentre;
         for (int r = 1; r < 25; ++r) {
             const std::string& row = page[size_t(r)];
@@ -333,6 +333,7 @@ bool teletextSubtitles(const std::vector<std::vector<TeletextPacket>>& fields, R
             while (!line.empty() && line.back() == ' ') line.pop_back();
             while (!line.empty() && line.front() == ' ') line.erase(line.begin());
             if (line.empty()) continue;
+            lastRow = r;
             if (!firstRow) {
                 firstRow = r;
                 // Where the box sits: against the left edge, the right, or about the middle.
@@ -345,21 +346,26 @@ bool teletextSubtitles(const std::vector<std::vector<TeletextPacket>>& fields, R
         return text;
     };
     auto change = [&](int64_t frame) {
-        int firstRow = 0, align = kCaptionCentre;
-        const std::string text = boxed(shown, firstRow, align);
+        int firstRow = 0, lastRow = 0, align = kCaptionCentre;
+        const std::string text = boxed(shown, firstRow, lastRow, align);
         if (text == current.text) return;
         if (!current.text.empty() && frame > current.start) {
             Caption c;
             c.start = current.start;
             c.end = frame;
             c.text = current.text;
-            c.vertical = current.firstRow && current.firstRow < 12 ? kCaptionTop : kCaptionBottom;
+            // Top from the first rows, bottom down to the last ones, else about the middle.
+            c.vertical = current.firstRow && current.firstRow <= 5 ? kCaptionTop
+                         : !current.lastRow || current.lastRow >= 20 ? kCaptionBottom
+                                                                     : kCaptionMiddle;
             c.align = current.align;
             out.push_back(std::move(c));
         }
-        current = {text, frame, firstRow, align};
+        current = {text, frame, firstRow, lastRow, align};
     };
-    int64_t frame = 0;
+    // A page shows from the frame its header came in, though it is complete only when the next header ends it (a
+    // page filling its field ends in the next).
+    int64_t frame = 0, pageFrame = 0;
     for (size_t fi = 0; fi < fields.size(); ++fi) {
         frame = int64_t(fi) / perFrame;
         for (const TeletextPacket& p : fields[fi]) {
@@ -371,13 +377,14 @@ bool teletextSubtitles(const std::vector<std::vector<TeletextPacket>>& fields, R
                 // A header ends the page before it in this magazine.
                 if (collecting) {
                     shown = rows;
-                    change(frame);
+                    change(pageFrame);
                 }
                 collecting = false;
                 const int units = unham(p[2]), tens = unham(p[3]), s2c4 = unham(p[5]);
                 if (units < 0 || tens < 0 || s2c4 < 0) continue;
                 if (((tens << 4) | units) != pageHex) continue;
                 seen = collecting = true;
+                pageFrame = frame;
                 if (s2c4 & 8) {  // erase: the page starts empty
                     rows = {};
                     // (An erased page with nothing sent after it clears the screen when it ends.)
@@ -394,7 +401,7 @@ bool teletextSubtitles(const std::vector<std::vector<TeletextPacket>>& fields, R
     }
     if (collecting) {
         shown = rows;
-        change(frame);
+        change(pageFrame);
     }
     shown = {};
     change(int64_t(fields.size() + perFrame - 1) / perFrame);

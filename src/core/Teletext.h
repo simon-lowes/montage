@@ -40,8 +40,9 @@ std::vector<uint8_t> op47Sdp(const std::vector<TeletextPacket>& packets, uint16_
 bool parseOp47Sdp(const uint8_t* data, size_t size, std::vector<TeletextPacket>& out);
 
 // The subtitles on `page` from the packets each field carried (two fields a frame with `interlaced`): a caption for
-// each time the page shows different boxed text, timed in frames at `fps`, placed at the top when its first row is
-// above row 12. False if the page never came.
+// each time the page shows different boxed text, from the frame its header came in, timed in frames at `fps`; placed
+// at the top when it starts in the first five rows, at the bottom when it reaches row 20, else in the middle. False
+// if the page never came.
 bool teletextSubtitles(const std::vector<std::vector<TeletextPacket>>& fields, Rational fps, int page, std::vector<Caption>& out,
                        bool interlaced = false, std::string* error = nullptr);
 

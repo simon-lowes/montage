@@ -7562,8 +7562,8 @@ void McpServer::Impl::addTools() {
             "audio_name":{"type":"string","description":"The mix stream's title"},"audio_language":{"type":"string","description":"The mix stream's language (ISO 639-1)"},
             "start_timecode":{"type":"string","description":"The file's starting timecode (MXF and MOV), e.g. 10:00:00:00 as broadcasters ask"},
             "mono_tracks":{"type":"integer","description":"Write the mix (then each audio stream) as mono tracks, padded with silence to this many, as broadcast MXF takes it; the MXF presets set 8, 4 or 2"},
-            "interlaced":{"type":"boolean","default":false,"description":"Code the video as interlaced fields, top first (each picture as both fields: PsF), as 1080i deliveries ask: MPEG-2, AVC-Intra, ProRes, DNxHD"},
-            "mxf_delivery":{"type":"string","enum":["op1a","rdd9","as11-dpp","as11-x2","as11-x8"],"default":"op1a","description":"Broadcast MXF by the book (rewrapped with the EBU's bmx): rdd9 = RDD 9 (the XDCAM HD422 preset); AS-11 with its descriptive metadata and parts: as11-dpp (UK DPP HD: the AVC-Intra 100 preset at 25 fps, coded 1080i25), as11-x2 (AVC-Intra HD), as11-x8 (XDCAM HD422 in RDD 9, the NABA's)"},
+            "interlaced":{"type":"boolean","default":false,"description":"Code the video as interlaced fields, top first (each picture as both fields: PsF), as 1080i deliveries ask: MPEG-2, AVC-Intra, ProRes"},
+            "mxf_delivery":{"type":"string","enum":["op1a","rdd9","as11-dpp","as11-x2","as11-x8"],"default":"op1a","description":"Broadcast MXF by the book (rewrapped with the EBU's bmx): rdd9 = RDD 9 (the MPEG-2 HD 4:2:2 MXF preset); AS-11 with its descriptive metadata and parts: as11-dpp (UK DPP HD: the AVC-Intra 100 preset at 25 fps, coded 1080i25), as11-x2 (AVC-Intra HD), as11-x8 (MPEG-2 HD 4:2:2 in RDD 9, the NABA's)"},
             "as11":{"type":"object","additionalProperties":{"type":["string","number","boolean"]},"description":"AS-11 metadata by the names AS-11 gives them: core (SeriesTitle, ProgrammeTitle, EpisodeTitleNumber, ShimName, ShimVersion, AudioTrackLayout, PrimaryAudioLanguage, ClosedCaptionsPresent/Type/Language) and UK DPP (ProductionNumber, Synopsis, Originator, CopyrightYear, Distributor, PSEPass, SecondaryAudioLanguage, LineUpStart, IdentClockStart, CompletionDate, ContactEmail, ContactTelephoneNumber...). Unset ones come from the sequence: its name, languages, captions; line-up and clock from markers named Line-up and Clock, parts from markers with a duration named Part ..."},
             "anc_captions":{"type":"string","enum":["none","cea708","teletext","both"],"default":"none","description":"In a broadcast MXF delivery: the caption track as ancillary data (ST 436): CEA-708 caption packets (with 608) and/or OP-47 teletext subtitles"},
             "teletext_page":{"type":"integer","default":888,"description":"The teletext subtitle page (100 to 899)"},
@@ -7606,7 +7606,10 @@ void McpServer::Impl::addTools() {
                 for (auto it = m.begin(); it != m.end(); ++it) {
                     const QJsonValue v = it.value();
                     const QString text = v.isBool() ? (v.toBool() ? QStringLiteral("true") : QStringLiteral("false"))
-                                         : v.isDouble() ? QString::number(v.toDouble(), 'g', 12) : v.toString();
+                                         : v.isDouble() ? (v.toDouble() == std::floor(v.toDouble()) && std::fabs(v.toDouble()) < 9e15
+                                                               ? QString::number(qint64(v.toDouble()))
+                                                               : QString::number(v.toDouble(), 'g', 15))
+                                                        : v.toString();
                     st.as11Metadata.push_back((it.key() + "=" + text).toStdString());
                 }
             }
@@ -7622,6 +7625,8 @@ void McpServer::Impl::addTools() {
             }
             if ((st.ancCaptions || st.ancTeletext || !st.as11Metadata.empty()) && st.mxfDelivery.empty())
                 throw ArgError{"\"anc_captions\" and \"as11\" go with an \"mxf_delivery\""};
+            if (!st.as11Metadata.empty() && st.mxfDelivery.rfind("as11", 0) != 0)
+                throw ArgError{"\"as11\" metadata goes with an AS-11 \"mxf_delivery\" (as11-dpp, as11-x2 or as11-x8)"};
             if (a.contains("exr_compression")) {
                 if (st.videoCodec != "exr") throw ArgError{"\"exr_compression\" is for the OpenEXR preset"};
                 st.exrCompression = str(a, "exr_compression").toStdString();

@@ -3967,17 +3967,19 @@ private slots:
         // The DPP's line-up and clock, and two parts, from markers.
         s.markers = {{0, 0, "Line-up"}, {2, 0, "Clock"}, {5, 20, "Part 1"}, {30, 15, "Part 2"}};
 
-        // AS-11 X8: XDCAM HD422 in RDD 9, the titles given, captions as CEA-708 and teletext in the ST 436 track.
+        // AS-11 X8: MPEG-2 HD in RDD 9, the titles given, captions as CEA-708 and teletext in the ST 436 track; to a
+        // file whose name is not ASCII.
         const ExportPreset* xd = findExportPreset("XDCAM HD422 (MXF)");
         QVERIFY(xd);
         ExportSettings st = xd->settings;
-        st.path = path("as11-x8.mxf");
+        st.path = path("as11-x8 \xC3\x89pisode.mxf");
         st.mxfDelivery = "as11-x8";
         st.as11Metadata = {"SeriesTitle=Test Series", "EpisodeTitleNumber: 1", "AS11ProgrammeTitle=Pilot Episode"};
         st.ancCaptions = st.ancTeletext = true;
         st.startTimecode = "10:00:00:00";
         std::string err;
         QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        QVERIFY(QFileInfo::exists(QString::fromStdString(st.path)));
         QVERIFY(!QFileInfo::exists(QString::fromStdString(st.path + ".render.mxf")));
         BroadcastMxfInfo info;
         QVERIFY2(readBroadcastMxf(st.path, info, &err), err.c_str());
@@ -4012,7 +4014,7 @@ private slots:
         // FFmpeg still reads it: the picture and the eight tracks.
         {
             AVFormatContext* fmt = nullptr;
-            QVERIFY(avformat_open_input(&fmt, st.path.c_str(), nullptr, nullptr) >= 0);
+            QVERIFY(avformat_open_input(&fmt, st.path.c_str(), nullptr, nullptr) >= 0);  // (FFmpeg's paths are UTF-8)
             avformat_find_stream_info(fmt, nullptr);
             int video = 0, audio = 0;
             for (unsigned i = 0; i < fmt->nb_streams; ++i) {
@@ -4086,12 +4088,33 @@ private slots:
         QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err));
         QVERIFY2(err.find("Colour") != std::string::npos, err.c_str());
         QVERIFY(!QFileInfo::exists(QString::fromStdString(st.path)));
+        // A value AS-11 does not take, refused before the render rather than after it.
+        int renderedFrames = 0;
+        st.as11Metadata = {"ClosedCaptionsPresent=yes"};
+        QVERIFY(!exportSequence(p, s, st, [&](double, FrameTime) { ++renderedFrames; }, nullptr, &err));
+        QVERIFY2(err.find("ClosedCaptionsPresent") != std::string::npos, err.c_str());
+        QCOMPARE(renderedFrames, 0);
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(st.path)) && !QFileInfo::exists(QString::fromStdString(st.path + ".render.mxf")));
         Sequence ntsc = s;
         ntsc.fps = Rational{30000, 1001};
         st.as11Metadata.clear();
         st.mxfDelivery = "as11-dpp";
         QVERIFY(!exportSequence(p, ntsc, st, nullptr, nullptr, &err));
         QVERIFY2(err.find("25") != std::string::npos, err.c_str());
+
+        // A rewrap told to stop part way leaves no file, and one let run reports its progress to the end.
+        st = xd->settings;
+        st.path = path("op1a.mxf");
+        st.out = 10;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        BroadcastMxfOptions rdd9;
+        double reached = 0;
+        QVERIFY(!rewrapBroadcastMxf(st.path, path("stopped.mxf"), rdd9, &err, [&](double f) { return (reached = f) < 0.5; }));
+        QCOMPARE(err, std::string("Export cancelled"));
+        QVERIFY(reached >= 0.5 && reached < 0.7);
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(path("stopped.mxf"))));
+        QVERIFY2(rewrapBroadcastMxf(st.path, path("whole.mxf"), rdd9, &err, [&](double f) { return (reached = f) <= 1; }), err.c_str());
+        QCOMPARE(reached, 1.0);
 
         // Over MCP: AS-11 X2 with metadata, then read back.
         const QString project = QString::fromStdString(path("bmx.montage"));
@@ -4118,6 +4141,10 @@ private slots:
         QCOMPARE(read.value("parts").toArray().size(), 1);  // (part 1 cut at the range's end; part 2 outside it)
         QCOMPARE(read.value("teletext_subtitles").toArray().size(), 1);
         r = call("montage_render", {{"project", project}, {"output", mcpOut}, {"preset", "AVC-Intra 100 (MXF)"}, {"anc_captions", "both"}});
+        QVERIFY(r.contains("error") || r.value("result").toObject().value("isError").toBool());
+        // AS-11 metadata for a delivery without AS-11 is refused, not dropped.
+        r = call("montage_render", {{"project", project}, {"output", QString::fromStdString(path("r.mxf"))}, {"preset", "XDCAM HD422 (MXF)"},
+                                    {"mxf_delivery", "rdd9"}, {"as11", QJsonObject{{"SeriesTitle", "Lost"}}}});
         QVERIFY(r.contains("error") || r.value("result").toObject().value("isError").toBool());
     }
 

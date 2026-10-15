@@ -2239,6 +2239,20 @@ private slots:
         QCOMPARE(out[2].text, std::string("A rather long subtitle line that\nhas to wrap onto two rows"));
         QCOMPARE(out[2].end, FrameTime(30));
 
+        // Progressive, a four-row caption a frame long (its page ends a frame later) and one in the middle: each on
+        // its own frames, where it was placed.
+        std::vector<Caption> short4 = {{6, 7, "One\nTwo\nThree\nFour", {}}, {12, 18, "Halfway", {}}};
+        short4[1].vertical = kCaptionMiddle;
+        out.clear();
+        QVERIFY(teletextSubtitles(teletextSubtitleFields(short4, pal, 24, 888), pal, 888, out));
+        QCOMPARE(out.size(), size_t(2));
+        QCOMPARE(out[0].start, FrameTime(6));
+        QCOMPARE(out[0].end, FrameTime(7));
+        QCOMPARE(out[0].vertical, int(kCaptionBottom));
+        QCOMPARE(out[1].start, FrameTime(12));
+        QCOMPARE(out[1].end, FrameTime(18));
+        QCOMPARE(out[1].vertical, int(kCaptionMiddle));
+
         // The English set: accents folded, its own characters kept.
         QCOMPARE(teletextText("caf\xC3\xA9 \xE2\x80\x9Cok\xE2\x80\x9D"), std::string("cafe \"ok\""));
         QCOMPARE(teletextToUtf8(teletextText("\xC2\xA3 \xC2\xBD # \xE2\x80\x94")), std::string("\xC2\xA3 \xC2\xBD # \xE2\x80\x94"));
