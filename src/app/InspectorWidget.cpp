@@ -41,6 +41,7 @@
 #include "LensCorrectionDialog.h"
 #include "ModelPacks.h"
 #include "media/DepthMap.h"
+#include "media/Exr.h"
 #include "media/Faces.h"
 #include "media/Matting.h"
 #include "media/MotionData.h"
@@ -156,10 +157,12 @@ QString InspectorWidget::signature() const {
         for (const TemplateField& f : liveFields(*g))
             sig += QString(":%1/%2/%3").arg(QString::fromStdString(f.id), QString::fromStdString(f.kind), QString::fromStdString(f.label));
     }
-    // Object and Bézier masks have their own controls: rebuild when one is chosen.
+    // The OpenEXR layer it shows (a missing one is listed only while chosen).
+    sig += "|L" + QString::fromStdString(c->layer);
+    // Object, Bézier and Cryptomatte masks have their own controls: rebuild when one is chosen.
     for (const auto& e : c->effects) {
         const long shape = std::lround(e.p("mask.shape", 0));
-        sig += QString(":%1%2%3n%4").arg(e.id).arg(e.enabled ? "+" : "-").arg(shape == 3 ? "o" : shape == 5 ? "p" : "").arg(e.node);
+        sig += QString(":%1%2%3n%4").arg(e.id).arg(e.enabled ? "+" : "-").arg(shape == 3 ? "o" : shape == 5 ? "p" : shape == 7 ? "c" : "").arg(e.node);
     }
     // Its colour nodes: rebuild when one is added, picked, renamed or shared, or a shared one's effects change.
     if (!c->grade.empty()) {
@@ -440,6 +443,33 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
             versions->setCurrentIndex(c->gradeVersions.empty() ? 0 : c->gradeVersion);
             versions->setEnabled(c->gradeVersions.size() > 1);
         });
+        // A multi-layer OpenEXR render: which of its layers (AOVs) the clip shows.
+        const MediaItem* em = clip.mediaId ? state_->project().findMedia(clip.mediaId) : nullptr;
+        const auto exr = em && exrAvailable() ? cachedExrInfo(exrFrameFile(em->path, 0)) : nullptr;
+        if (exr && (exr->layers.size() > 1 || !exr->hasLayer(clip.layer))) {
+            auto* layers = new QComboBox(content_);
+            layers->setObjectName(QStringLiteral("exrLayer"));
+            layers->setToolTip(tr("The layer of this OpenEXR render the clip shows"));
+            for (const ExrLayer& l : exr->layers)
+                layers->addItem(l.name.empty() ? tr("RGBA (main)") : QString::fromStdString(l.name), QString::fromStdString(l.name));
+            if (!exr->hasLayer(clip.layer)) layers->addItem(tr("%1 (missing)").arg(QString::fromStdString(clip.layer)), QString::fromStdString(clip.layer));
+            form->addRow(tr("Layer"), layers);
+            connect(layers, &QComboBox::activated, this, [this, clipId, layers](int idx) {
+                const std::string layer = layers->itemData(idx).toString().toStdString();
+                state_->edit(tr("Choose Layer"), [clipId, layer](Project&, Sequence& s) {
+                    Clip* c = edit::clipById(s, clipId);
+                    if (!c || c->layer == layer) return false;
+                    c->layer = layer;
+                    return true;
+                });
+            });
+            refreshers_.push_back([=, this] {
+                const Clip* c = clipNow();
+                if (!c) return;
+                QSignalBlocker b(layers);
+                layers->setCurrentIndex(std::max(0, layers->findData(QString::fromStdString(c->layer))));
+            });
+        }
     }
     refreshers_.push_back([=, this] {
         const Clip* c = clipNow();
@@ -1165,6 +1195,75 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                     editPath(on ? tr("Animate Mask Path") : tr("Stop Animating Mask Path"), [on](Effect& ef, FrameTime lt, double, double) {
                         if (maskPathCount(ef) == 0 || maskPathAnimated(ef) == on) return false;
                         setMaskPathAnimated(ef, lt, on);
+                        return true;
+                    });
+                });
+            }
+            if (onClip && std::lround(e.p("mask.shape", localTime())) == 7) {
+                // Objects of a multi-layer OpenEXR render, picked by clicking them in the viewer.
+                const Sequence* sq = state_->sequence();
+                const Clip* cl = sq ? edit::clipById(*sq, owner) : nullptr;
+                const MediaItem* em = cl && cl->mediaId ? state_->project().findMedia(cl->mediaId) : nullptr;
+                const auto exr = em && exrAvailable() ? cachedExrInfo(exrFrameFile(em->path, 0)) : nullptr;
+                auto* layer = new QComboBox(content_);
+                layer->setObjectName(QStringLiteral("cryptomatteLayer"));
+                layer->setToolTip(tr("Which Cryptomatte of the render: objects, materials or assets"));
+                if (exr)
+                    for (const Cryptomatte& cm : exr->cryptomattes) layer->addItem(QString::fromStdString(cm.name), QString::fromStdString(cm.name));
+                const std::string chosen = e.s("mask.crypto_layer");
+                if (!chosen.empty() && layer->findData(QString::fromStdString(chosen)) < 0)
+                    layer->addItem(tr("%1 (missing)").arg(QString::fromStdString(chosen)), QString::fromStdString(chosen));
+                layer->setCurrentIndex(std::max(0, layer->findData(QString::fromStdString(chosen))));
+                layer->setEnabled(layer->count() > 1);
+                mf->addRow(tr("Cryptomatte:"), layer);
+                connect(layer, &QComboBox::activated, this, [this, owner, eid, layer](int idx) {
+                    const std::string name = layer->itemData(idx).toString().toStdString();
+                    state_->edit(tr("Choose Cryptomatte"), [owner, eid, name](Project&, Sequence& s) {
+                        Effect* ef = edit::ownedEffect(s, owner, eid);
+                        if (!ef || ef->s("mask.crypto_layer") == name) return false;
+                        // Ids belong to one Cryptomatte: picks in another name other things.
+                        ef->strings["mask.crypto_layer"] = name;
+                        ef->strings["mask.crypto_ids"].clear();
+                        return true;
+                    });
+                });
+                auto* status = new QLabel(content_);
+                status->setObjectName(QStringLiteral("cryptomatteStatus"));
+                status->setWordWrap(true);
+                status->setTextInteractionFlags(Qt::TextSelectableByMouse);
+                auto* clear = new QToolButton(content_);
+                clear->setText(tr("Clear"));
+                clear->setObjectName(QStringLiteral("cryptomatteClear"));
+                clear->setToolTip(tr("Remove every picked object from the mask"));
+                auto refresh = [this, owner, eid, status, clear, exr] {
+                    const Sequence* s = state_->sequence();
+                    const Effect* ef = s ? edit::ownedEffect(const_cast<Sequence&>(*s), owner, eid) : nullptr;
+                    if (!ef) return;
+                    if (!exr || exr->cryptomattes.empty()) {
+                        status->setText(exrAvailable() ? tr("This clip's media has no Cryptomatte: it needs an OpenEXR render with one.")
+                                                       : tr("This build of Montage can't read OpenEXR Cryptomattes."));
+                        clear->setEnabled(false);
+                        return;
+                    }
+                    const Cryptomatte* cm = exr->cryptomatte(ef->s("mask.crypto_layer"));
+                    QStringList names;
+                    for (float id : parseCryptomatteIds(ef->s("mask.crypto_ids"))) {
+                        const std::string name = cm ? cm->objectName(id) : std::string();
+                        names << QString::fromStdString(name.empty() ? cryptomatteHex(id) : name);
+                    }
+                    status->setText(names.isEmpty() ? tr("Click objects in the viewer to add them; Ctrl-click (Cmd-click) removes one.")
+                                                    : names.join(QStringLiteral(", ")));
+                    clear->setEnabled(!names.isEmpty());
+                };
+                refresh();
+                refreshers_.push_back(refresh);
+                mf->addRow(tr("Objects:"), status);
+                mf->addRow(QString(), clear);
+                connect(clear, &QToolButton::clicked, this, [this, owner, eid] {
+                    state_->edit(tr("Clear Cryptomatte"), [owner, eid](Project&, Sequence& s) {
+                        Effect* ef = edit::ownedEffect(s, owner, eid);
+                        if (!ef || ef->s("mask.crypto_ids").empty()) return false;
+                        ef->strings["mask.crypto_ids"].clear();
                         return true;
                     });
                 });

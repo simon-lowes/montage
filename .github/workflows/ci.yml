@@ -58,6 +58,23 @@ jobs:
               || { rm -f "$d/$name"; echo "::warning::Could not download GoPro's $name; its part of the gyro test will be skipped"; }
           done
           [ -s "$d/hero5.mp4" ] && echo "MONTAGE_GOPRO_SAMPLES=$d" >> "$GITHUB_ENV" || true
+      - name: Cryptomatte's sample renders for the OpenEXR test
+        run: |
+          d="$HOME/cryptomatte-samples"
+          mkdir -p "$d"
+          base="https://raw.githubusercontent.com/Psyop/Cryptomatte/968d5e4b6171e29ba5f89d554117132a164e747e/sample_images"
+          for f in bunny_CryptoObject.exr:259ab8eafda2b1282500960ea29bc14e70839aefe73103e9984e875f53f7b73b \
+                   debug_images/multichannel.exr:41f3a864fe08cf2b981ee9ab267bd589abb9f1122a776557c6a7e493757b789e \
+                   debug_images/sidecar_manifest.exr:b4ca37ae66763431b8a535b5b81552a9bcf2849f78537d445e6e2a5ab24d076e \
+                   debug_images/sidecar_manifest.crypto_asset.json:443727159ca176685e4fed1951576c08efaecafa9195075d81dce5b696806a13 \
+                   debug_images/special_chars.exr:a86dee943aa28dcc691b41c552b7ade871a6a40dc24098d02dacc23d49c1ed60; do
+            path="${f%%:*}"
+            name="$(basename "$path")"
+            curl -fsSL --retry 3 -o "$d/$name" "$base/$path" \
+              && [ "$(sha256sum "$d/$name" | cut -d' ' -f1)" = "${f#*:}" ] \
+              || { rm -f "$d/$name"; echo "::warning::Could not download Cryptomatte's $name; the sample test will be skipped"; }
+          done
+          [ "$(ls "$d" | wc -l)" -eq 5 ] && echo "MONTAGE_CRYPTOMATTE_SAMPLES=$d" >> "$GITHUB_ENV" || true
       - name: Cache the AI models
         uses: actions/cache@v4
         with:

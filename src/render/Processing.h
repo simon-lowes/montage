@@ -79,6 +79,18 @@ public:
 private:
     std::shared_ptr<const ValueMap> previous_;
 };
+// And the OpenEXR file the frame was read from, for Cryptomatte masks (its ID mattes; media/Exr.h); "" for any other.
+const std::string& currentCryptomatteFile();
+class CryptomatteScope {
+public:
+    explicit CryptomatteScope(std::string file);
+    ~CryptomatteScope();
+    CryptomatteScope(const CryptomatteScope&) = delete;
+    CryptomatteScope& operator=(const CryptomatteScope&) = delete;
+
+private:
+    std::string previous_;
+};
 // And the faces in the frame (media/Faces.h), for Face Refinement.
 struct FaceBox;
 const std::vector<FaceBox>* currentFaces();

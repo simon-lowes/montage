@@ -113,6 +113,9 @@ bool needsDepth(const Effect& e, FrameTime t);
 bool needsFaces(const Effect& e);
 // The effect works from the people in the picture (Remove Background, or a People mask).
 bool needsPersonMatte(const Effect& e, FrameTime t);
+// The effect is masked by Cryptomatte ID mattes (mask.shape 7): its strings mask.crypto_layer (the Cryptomatte, ""
+// the file's first) and mask.crypto_ids (the objects picked, as 8-digit hex ids, media/Exr.h).
+bool needsCryptomatte(const Effect& e, FrameTime t);
 
 // Builds an Effect of the given type populated with default values.
 Effect makeEffect(Project& p, const std::string& type);

@@ -86,6 +86,7 @@ bool validKind(const std::string& k) {
 class ImfEncoderPool {
 public:
     ImfEncoderPool(int w, int h, int bits, uint16_t rsiz, size_t maxBytes, int threads) {
+        // (an HTJ2K Rsiz codes through OpenJPH, the rest through OpenJPEG)
         for (int i = 0; i < threads; ++i)
             workers_.emplace_back([this, w, h, bits, rsiz, maxBytes] {
                 for (;;) {
@@ -102,7 +103,8 @@ public:
                     std::string err;
                     bool ok = false;
                     try {
-                        ok = encodeJpeg2000(job.second.data(), w, h, bits, rsiz, maxBytes, cs, &err);
+                        ok = rsiz == kHtj2kRsiz ? encodeHtj2k(job.second.data(), w, h, bits, cs, &err)
+                                                : encodeJpeg2000(job.second.data(), w, h, bits, rsiz, maxBytes, cs, &err);
                     } catch (const std::bad_alloc&) {
                         err = "Out of memory coding the pictures: try fewer encoders at once";
                     } catch (const std::exception& e) {
@@ -225,6 +227,15 @@ void pictureDescriptor(QXmlStreamWriter& x, const dcp::ImfPictureWriter& w, int6
     x.writeEndElement();
     x.writeTextElement("r1:CodingStyleDefault", hex(j.cod));
     x.writeTextElement("r1:QuantizationDefault", hex(j.qcd));
+    if (j.pcap) {
+        // (HTJ2K) its CAP marker: the parts it needs and their capabilities.
+        x.writeStartElement("r1:J2KExtendedCapabilities");
+        x.writeTextElement("r2:Pcap", QString::number(j.pcap));
+        x.writeStartElement("r2:Ccapi");
+        for (uint16_t c : j.ccap) x.writeTextElement("r2:UInt16", QString::number(c));
+        x.writeEndElement();
+        x.writeEndElement();
+    }
     rgbaComponents(x, "J2CLayout", w.bits());
     x.writeEndElement();  // JPEG2000SubDescriptor
     x.writeEndElement();  // SubDescriptors
@@ -384,6 +395,8 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
     const int bits = settings.bits ? settings.bits : (hdrOut ? 12 : 10);
     if (bits != 10 && bits != 12) return fail("IMF pictures here are 10 or 12 bits");
     if (!settings.lossless && !(settings.megabitsPerSecond >= 20)) return fail("A lossy master needs at least 20 Mbit/s");
+    if (settings.htj2k && !settings.lossless) return fail("HTJ2K masters here are lossless");
+    if (settings.htj2k && !htj2kAvailable()) return fail("This build of Montage has no HTJ2K encoder");
     const dcp::EditRate rate{uint32_t(canonical.num), uint32_t(canonical.den)};  // as written, not as the sequence stores it
     const double fps = rate.value();
     FrameTime first = 0, end = s.duration();
@@ -394,8 +407,10 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
     const int64_t programme = end - first;
     int64_t frames = programme;
     while ((frames * 48000 * int64_t(rate.den)) % int64_t(rate.num) != 0) ++frames;
-    const uint16_t rsiz = imfRsiz(W, H, 3, fps, settings.lossless, settings.megabitsPerSecond);
-    if (!rsiz) return fail("No JPEG 2000 IMF profile takes that picture at that rate");
+    // (HTJ2K: the codestream declares no Part 1 profile, but is held to the size and rate one would take)
+    const uint16_t profile = imfRsiz(W, H, 3, fps, settings.lossless, settings.megabitsPerSecond);
+    if (!profile) return fail("No JPEG 2000 IMF profile takes that picture at that rate");
+    const uint16_t rsiz = settings.htj2k ? kHtj2kRsiz : profile;
     uint8_t coding[16];
     imfPictureCoding(rsiz, coding);
     if (std::all_of(std::begin(coding), std::end(coding), [](uint8_t b) { return b == 0; }))
@@ -496,7 +511,8 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
                 if (written == 0) {
                     dcp::J2kHeader h;
                     if (!dcp::parseJ2kHeader(cs.data(), cs.size(), h) || h.rsiz != rsiz) {
-                        err = "OpenJPEG could not code the picture in the JPEG 2000 IMF profile";
+                        err = rsiz == kHtj2kRsiz ? "OpenJPH could not code the picture as HTJ2K"
+                                                 : "OpenJPEG could not code the picture in the JPEG 2000 IMF profile";
                         return false;
                     }
                 }
@@ -616,7 +632,9 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         x.writeTextElement("EditRate", editRate);
         x.writeTextElement("TotalRunningTime", running);
         x.writeStartElement("ExtensionProperties");
-        x.writeTextElement("cc:ApplicationIdentification", "http://www.smpte-ra.org/ns/2067-21/2021");
+        // (HTJ2K pictures came with the 2023 edition)
+        x.writeTextElement("cc:ApplicationIdentification", settings.htj2k ? "http://www.smpte-ra.org/ns/2067-21/2023"
+                                                                          : "http://www.smpte-ra.org/ns/2067-21/2021");
         x.writeEndElement();
         x.writeStartElement("SegmentList");
         x.writeStartElement("Segment");
@@ -908,7 +926,9 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
                 picture = true;
                 dcp::J2kHeader h;
                 if (!t.ok || t.codec != "jpeg2000") issue(QStringLiteral("%1 is not JPEG 2000 pictures").arg(assets[r.file].path));
-                else if (!dcp::parseJ2kHeader(t.firstPacket.data(), t.firstPacket.size(), h) || (h.rsiz & 0xff00) < 0x0400 || (h.rsiz & 0xff00) > 0x0900)
+                else if (!dcp::parseJ2kHeader(t.firstPacket.data(), t.firstPacket.size(), h) ||
+                         (h.rsiz == kHtj2kRsiz ? !(h.pcap & 0x00020000)  // (HTJ2K: its CAP marker names Part 15)
+                                               : (h.rsiz & 0xff00) < 0x0400 || (h.rsiz & 0xff00) > 0x0900))
                     issue(QStringLiteral("%1 is not in a JPEG 2000 IMF profile").arg(assets[r.file].path));
                 else if (r.intrinsic >= 0 && t.packets != r.intrinsic)
                     issue(QStringLiteral("%1 has %2 frames; the composition says %3").arg(assets[r.file].path).arg(t.packets).arg(r.intrinsic));

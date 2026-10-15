@@ -30,6 +30,7 @@ struct ImfSettings {
     std::string size = "sequence";  // "sequence", "hd" (1920 x 1080), "uhd" (3840 x 2160), "4k" (4096 x 2160)
     int bits = 0;                  // 10 or 12 (0: 10 for SDR, 12 for HDR)
     bool lossless = true;          // the reversible profiles; else lossy within megabitsPerSecond
+    bool htj2k = false;            // High-Throughput JPEG 2000 (ST 2067-21:2023; lossless only): far faster to code and decode
     double megabitsPerSecond = 400;
     double masteringPeak = 0;      // HDR: the mastering display's peak in cd/m^2 (0: the sequence's HDR peak, at least 1000)
     bool inOut = false;            // only In to Out (both included)

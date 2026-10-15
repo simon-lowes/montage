@@ -3,7 +3,9 @@
 // size and rate, with handles either side, as an image sequence a compositor
 // can work on (OpenEXR half float in scene-linear light, 10-bit DPX, or
 // 16-bit TIFF), numbered so the first frame of the cut is 1001, plus a pull
-// list (CSV) saying what came from where.
+// list (CSV) saying what came from where. An OpenEXR pull can carry more:
+// the source render's other layers and Cryptomattes, and the clip's masks as
+// mattes, in any of OpenEXR's compressions (HTJ2K and zstd too).
 #pragma once
 
 #include <atomic>
@@ -22,6 +24,10 @@ struct VfxPullOptions {
     int cutIn = 1001;            // the frame number of the first frame of the cut
     std::string colorSpace;      // EXR: "" = Linear Rec.709; others: "" = the footage's own
     bool amf = true;             // an ACES Metadata File beside each shot's frames (render/Amf.h): their space, the grade's looks
+    // OpenEXR, with the OpenEXR library (media/Exr.h):
+    std::string compression;     // "" = ZIP (16 lines); or any of exrCompressions(), HTJ2K and zstd among them
+    bool sourceLayers = false;   // a multi-layer OpenEXR source's other layers (AOVs) and Cryptomattes, copied as they are
+    bool mattes = false;         // the clip's masks, each a one-channel layer "matte_<effect>" (A, 1 inside)
 };
 
 struct VfxShot {
@@ -33,6 +39,7 @@ struct VfxShot {
     double sourceIn = 0, sourceOut = 0;  // seconds of the source pulled (handles included), out exclusive
     int headHandle = 0, tailHandle = 0;  // the handles there was footage for
     std::string amf;                    // its ACES Metadata File, when written
+    std::vector<std::string> layers;    // OpenEXR: the layers and Cryptomattes written beside the plate (its own is the main picture)
 };
 
 // Pulls the clips (video clips of footage; titles and other generated clips

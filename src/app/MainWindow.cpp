@@ -95,6 +95,8 @@
 #include "core/ReviewPage.h"
 #include "render/AudioReactive.h"
 #include "render/VfxPull.h"
+#include "render/Jpeg2000.h"
+#include "media/Exr.h"
 #include "render/Amf.h"
 #include "render/LutExport.h"
 #include "media/LtcTimecode.h"
@@ -3291,6 +3293,34 @@ void MainWindow::vfxPullDialog() {
     amf->setObjectName(QStringLiteral("vfxAmf"));
     amf->setChecked(appSettings().value("vfx/amf", true).toBool());
     form->addRow(amf);
+    // OpenEXR: its compressions, and more layers in each frame.
+    auto* compression = new QComboBox(&dlg);
+    compression->setObjectName(QStringLiteral("vfxCompression"));
+    auto* sourceLayers = new QCheckBox(tr("Copy the source render's other layers and Cryptomattes"), &dlg);
+    sourceLayers->setObjectName(QStringLiteral("vfxSourceLayers"));
+    sourceLayers->setChecked(appSettings().value("vfx/sourceLayers", false).toBool());
+    auto* mattes = new QCheckBox(tr("Add the clips' masks as mattes"), &dlg);
+    mattes->setObjectName(QStringLiteral("vfxMattes"));
+    mattes->setChecked(appSettings().value("vfx/mattes", false).toBool());
+    if (exrAvailable()) {
+        for (const std::string& c : exrCompressions()) compression->addItem(QString::fromStdString(exrCompressionLabel(c)), QString::fromStdString(c));
+        compression->setCurrentIndex(std::max(0, compression->findData(appSettings().value("vfx/compression", "zip").toString())));
+        form->addRow(tr("OpenEXR compression:"), compression);
+        form->addRow(sourceLayers);
+        form->addRow(mattes);
+        auto update = [=] {
+            const bool exr = format->currentData().toString() == QLatin1String("exr");
+            compression->setEnabled(exr);
+            sourceLayers->setEnabled(exr);
+            mattes->setEnabled(exr);
+        };
+        connect(format, &QComboBox::currentIndexChanged, &dlg, update);
+        update();
+    } else {
+        compression->hide();
+        sourceLayers->hide();
+        mattes->hide();
+    }
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
@@ -3303,6 +3333,15 @@ void MainWindow::vfxPullDialog() {
     appSettings().setValue("vfx/amf", amf->isChecked());
     VfxPullOptions o;
     o.amf = amf->isChecked();
+    if (exrAvailable() && format->currentData().toString() == QLatin1String("exr")) {
+        appSettings().setValue("vfx/compression", compression->currentData());
+        appSettings().setValue("vfx/sourceLayers", sourceLayers->isChecked());
+        appSettings().setValue("vfx/mattes", mattes->isChecked());
+        o.compression = compression->currentData().toString().toStdString();
+        if (o.compression == "zip") o.compression.clear();  // (FFmpeg's writer, unless layers are wanted)
+        o.sourceLayers = sourceLayers->isChecked();
+        o.mattes = mattes->isChecked();
+    }
     o.folder = folder.toStdString();
     o.format = format->currentData().toString().toStdString();
     o.handles = handles->value();
@@ -6132,6 +6171,7 @@ void MainWindow::exportImfDialog() {
     auto* coding = new QComboBox(&dlg);
     coding->setObjectName(QStringLiteral("imfCoding"));
     coding->addItem(tr("Lossless"), 0);
+    if (htj2kAvailable()) coding->addItem(tr("Lossless, High-Throughput (HTJ2K)"), -1);
     for (int mbps : {800, 400, 200}) coding->addItem(tr("Lossy, %1 Mbit/s").arg(mbps), mbps);
     form->addRow(tr("JPEG 2000:"), coding);
     auto* language = new QLineEdit(QStringLiteral("en"), &dlg);
@@ -6171,7 +6211,8 @@ void MainWindow::exportImfDialog() {
     st.size = size->currentData().toString().toStdString();
     st.colour = colour->currentData().toString().toStdString();
     st.bits = bits->currentData().toInt();
-    st.lossless = coding->currentData().toInt() == 0;
+    st.lossless = coding->currentData().toInt() <= 0;
+    st.htj2k = coding->currentData().toInt() < 0;
     if (!st.lossless) st.megabitsPerSecond = coding->currentData().toInt();
     st.language = language->text().trimmed().toStdString();
     st.issuer = issuer->text().trimmed().toStdString();

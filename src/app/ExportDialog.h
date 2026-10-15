@@ -86,6 +86,7 @@ private:
     QCheckBox* allCaptions_ = nullptr;  // every caption track as its own subtitle stream
     QCheckBox* cea608_ = nullptr;       // the caption track as CEA-608 inside H.264/HEVC
     QCheckBox* hdr10Plus_ = nullptr;    // HDR10+ dynamic metadata (PQ)
+    QComboBox* exrCompression_ = nullptr;  // OpenEXR frames' compression
     QCheckBox* smart_ = nullptr;
     QLineEdit* startTc_ = nullptr;   // the file's starting timecode (MXF, MOV)
     QComboBox* color_ = nullptr;

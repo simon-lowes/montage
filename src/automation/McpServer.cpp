@@ -56,6 +56,7 @@
 #include "media/MediaPool.h"
 #include "render/Ofx.h"
 #include "media/Psd.h"
+#include "media/Exr.h"
 #include "core/AutoTag.h"
 #include "core/Automation.h"
 #include "core/CaptionTools.h"
@@ -311,6 +312,7 @@ QJsonObject clipJson(const Project& p, const Sequence& s, const Clip& c) {
     if (!c.enabled) o["enabled"] = false;
     if (c.linkGroup) o["linked_group"] = double(c.linkGroup);
     if (!c.role.empty()) o["role"] = QString::fromStdString(c.role);
+    if (!c.layer.empty()) o["layer"] = QString::fromStdString(c.layer);
     QJsonArray fx;
     for (const Effect& e : c.effects) fx.append(QJsonObject{{"id", double(e.id)}, {"type", QString::fromStdString(e.type)}});
     if (!fx.isEmpty()) o["effects"] = fx;
@@ -372,6 +374,7 @@ QJsonObject interpretationJson(const MediaItem& m) {
     if (i.rawHalf) o["raw_half"] = true;
     if (!i.stereo.empty()) o["stereo"] = QString::fromStdString(i.stereo);
     if (i.swapEyes) o["swap_eyes"] = true;
+    if (!i.layer.empty()) o["layer"] = QString::fromStdString(i.layer);
     return o;
 }
 
@@ -723,13 +726,32 @@ McpServer::Impl::CloneVoice McpServer::Impl::cloneVoiceArg(const QJsonObject& a,
 }
 
 void McpServer::Impl::addTools() {
-    add("montage_probe_media", "Probe media", "Describe a video, audio or image file: duration, size, frame rate and codecs.",
+    add("montage_probe_media", "Probe media",
+        "Describe a video, audio or image file: duration, size, frame rate and codecs; for an OpenEXR render its layers "
+        "(AOVs, \"\" the main picture) and Cryptomattes with their object names.",
         R"json({"type":"object","properties":{"path":{"type":"string","description":"Media file"}},"required":["path"]})json", true,
         [](const QJsonObject& a) {
             MediaItem m;
             std::string err;
             if (!probeMedia(absolute(need(a, "path")).toStdString(), m, &err)) return fail(QString::fromStdString(err));
-            const QJsonObject o = mediaJson(m);
+            QJsonObject o = mediaJson(m);
+            if (const auto exr = exrAvailable() ? cachedExrInfo(exrFrameFile(m.path, 0)) : nullptr) {
+                QJsonArray layers, mattes;
+                for (const ExrLayer& l : exr->layers) {
+                    QJsonArray ch;
+                    for (const std::string& c : l.channels) ch.append(QString::fromStdString(c));
+                    layers.append(QJsonObject{{"name", QString::fromStdString(l.name)}, {"channels", ch}});
+                }
+                for (const Cryptomatte& cm : exr->cryptomattes) {
+                    QJsonArray objects;
+                    for (const auto& [name, id] : cm.objects)
+                        if (objects.size() < 500) objects.append(QJsonObject{{"name", QString::fromStdString(name)}, {"id", QString::fromStdString(cryptomatteHex(id))}});
+                    mattes.append(QJsonObject{{"name", QString::fromStdString(cm.name)}, {"objects", objects}, {"object_count", int(cm.objects.size())}});
+                }
+                o["exr_compression"] = QString::fromStdString(exr->compression);
+                o["exr_layers"] = layers;
+                if (!mattes.isEmpty()) o["cryptomattes"] = mattes;
+            }
             return ok(json(o), o);
         });
 
@@ -1121,7 +1143,7 @@ void McpServer::Impl::addTools() {
             "fps":{"type":"number","description":"The image sequence's frame rate; default the sequence's"},
             "psd_mode":{"type":"string","enum":["merged","layer","sequence"],"default":"merged",
                         "description":"A Photoshop file: merged as one still, one `layer` of it, or its layers as a nested sequence (a track per layer with its blend mode, opacity, visibility, group and clipping)"},
-            "layer":{"type":["number","string"],"description":"With psd_mode layer: the layer's name or index (0 = the bottom)"},
+            "layer":{"type":["number","string"],"description":"With psd_mode layer: the layer's name or index (0 = the bottom). For an OpenEXR render: the layer (AOV) the clip shows, as montage_probe_media lists them"},
             "mode":{"type":"string","enum":["overwrite","insert","place_on_top","ripple_overwrite","smart_insert"],
                     "description":"Default overwrite (insert, when insert is true)"}},
             "required":["project","media"]})json",
@@ -1220,6 +1242,17 @@ void McpServer::Impl::addTools() {
             if (sub)
                 for (Id id : r.created)
                     if (Clip* c = edit::clipById(s, id)) c->name = subName;
+            // An OpenEXR render's layer (AOV).
+            if (!psdMedia && a.value("layer").isString()) {
+                const MediaItem* m = l.project.findMedia(media);
+                const auto exr = m && exrAvailable() ? cachedExrInfo(exrFrameFile(m->path, 0)) : nullptr;
+                const std::string layer = a.value("layer").toString().toStdString();
+                if (!exr) throw ArgError{"\"layer\" is for OpenEXR renders and Photoshop files (with psd_mode layer)"};
+                if (!exr->hasLayer(layer)) throw ArgError{QStringLiteral("%1 has no layer \"%2\"").arg(need(a, "media"), QString::fromStdString(layer))};
+                for (Id id : r.created)
+                    if (auto loc = edit::locate(s, id); loc && loc->track.kind == TrackKind::Video)
+                        if (Clip* c = edit::clipById(s, id)) c->layer = layer;
+            }
             save(l);
             QJsonArray created;
             for (Id id : r.created)
@@ -2063,7 +2096,9 @@ void McpServer::Impl::addTools() {
         "blades / blade_rotation / squeeze / cat_eye shape the aperture, highlights lifts bokeh highlights and breathing "
         "scales the picture with the focus. "
         "remove_background cuts people out (keep 1 keeps the background instead), and mask.shape 4 limits any effect to "
-        "the people in the picture. object_removal paints out whatever its mask covers and fills it in. stabilize and "
+        "the people in the picture. mask.shape 7 limits it to objects of an OpenEXR render's Cryptomatte: strings "
+        "mask.crypto_layer (which Cryptomatte, default the file's first) and mask.crypto_ids (the objects' ids as 8 hex "
+        "digits, comma separated, as montage_probe_media lists them). object_removal paints out whatever its mask covers and fills it in. stabilize and "
         "rolling_shutter (straightening the skew a rolling shutter gives pans; readout as a percentage of a frame) measure "
         "the camera's movement when added; when the clip has camera motion data (a GoPro GPMF track, a CAMM track, a .gcsv log "
         "beside it) stabilize lines it up and uses it (method 3, Camera Gyro, unless params give another method; horizon "
@@ -7372,13 +7407,14 @@ void McpServer::Impl::addTools() {
         "by default) as full-range RGB 4:4:4 of 10 or 12 bits in Rec.709, P3-D65 PQ, Rec.2020 PQ or Rec.2020 HLG (HDR "
         "with mastering display metadata), 24-bit 48 kHz sound in stereo, 5.1 or 7.1 DS with multichannel labels, a "
         "composition playlist with the essence descriptors, packing list with hashes and asset map, in a new folder under "
-        "`folder`. The package is checked when done (as montage_verify_imf).",
+        "`folder`. The package is checked when done (as montage_verify_imf). `htj2k` codes the pictures as High-Throughput "
+        "JPEG 2000 instead (ST 2067-21:2023, lossless), far faster to code and decode.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string","description":"Where to make the IMF folder"},
             "title":{"type":"string"},"kind":{"type":"string","enum":["feature","episode","short","trailer","teaser","advertisement","promotion","test"],"default":"feature"},
             "colour":{"type":"string","enum":["rec709","p3d65-pq","rec2020-pq","rec2020-hlg"],"description":"Default: as the sequence is graded"},
             "size":{"type":"string","enum":["sequence","hd","uhd","4k"],"default":"sequence"},
             "bits":{"type":"integer","enum":[10,12],"description":"Default: 10 for SDR, 12 for HDR"},
-            "lossless":{"type":"boolean","default":true},"megabits_per_second":{"type":"number","minimum":20,"maximum":6400,"description":"Lossy: the cap (default 400)"},
+            "lossless":{"type":"boolean","default":true},"htj2k":{"type":"boolean","default":false},"megabits_per_second":{"type":"number","minimum":20,"maximum":6400,"description":"Lossy: the cap (default 400)"},
             "mastering_peak":{"type":"number","minimum":100,"maximum":10000,"description":"HDR: the mastering display's peak, cd/m^2"},
             "language":{"type":"string","default":"en"},"issuer":{"type":"string"},
             "in_out":{"type":"boolean","default":false,"description":"Only In to Out"}},"required":["project","folder"]})json",
@@ -7393,6 +7429,7 @@ void McpServer::Impl::addTools() {
             st.size = str(a, "size", "sequence").toStdString();
             st.bits = a.value("bits").toInt(0);
             st.lossless = a.value("lossless").toBool(true);
+            st.htj2k = a.value("htj2k").toBool(false);
             st.megabitsPerSecond = a.value("megabits_per_second").toDouble(400);
             st.masteringPeak = a.value("mastering_peak").toDouble(0);
             st.language = str(a, "language", "en").toStdString();
@@ -7468,6 +7505,7 @@ void McpServer::Impl::addTools() {
                     "key":{"type":"string","description":"Its private key (PEM)"},
                     "allow_ai_training":{"type":"boolean","default":false,"description":"false: the credentials ask that it not be used to train AI models"}},"required":["certificate","key"]},
             "stereo_view":{"type":"string","enum":["sbs","sbs_half","tb","tb_half","left","right","anaglyph"],"default":"sbs","description":"A stereoscopic 3D sequence: the eyes side by side or top and bottom (full size, or squeezed into one frame), or one picture"},
+            "exr_compression":{"type":"string","enum":["none","rle","zips","zip","piz","pxr24","b44","b44a","dwaa","dwab","zstd","htj2k256","htj2k32"],"description":"OpenEXR presets: the frames' compression (default zip); HTJ2K is High-Throughput JPEG 2000, lossless"},
             "farm":{"type":"string","description":"A render farm folder: send the render there for its render nodes (montage-cli node) instead of rendering now; returns the job's id. The output is where the nodes write (each maps paths to its own)"}},
             "required":["project","output"]})json",
         false, [this](const QJsonObject& a) {
@@ -7489,6 +7527,10 @@ void McpServer::Impl::addTools() {
             }
             if (a.contains("in")) st.in = timeArg(a.value("in"), s, "in");
             if (a.contains("out")) st.out = timeArg(a.value("out"), s, "out");
+            if (a.contains("exr_compression")) {
+                if (st.videoCodec != "exr") throw ArgError{"\"exr_compression\" is for the OpenEXR preset"};
+                st.exrCompression = str(a, "exr_compression").toStdString();
+            }
             if (a.contains("stereo_view")) {
                 StereoView v;
                 st.stereo = str(a, "stereo_view").toStdString();
@@ -8579,10 +8621,14 @@ void McpServer::Impl::addTools() {
         "(format exr: half float in scene-linear light; dpx: 10-bit in the footage's own colour; tiff: 16-bit), numbered "
         "so the cut's first frame is `cut_in` (default 1001), with a pull_list.csv and (unless `amf` is false) an ACES "
         "Metadata File per shot giving the frames' colour space and the clip's CDL and looks. `clips` are clip ids "
-        "(default: every footage clip on the video tracks).",
+        "(default: every footage clip on the video tracks). OpenEXR pulls can carry more in each frame: `source_layers` "
+        "copies a multi-layer OpenEXR source's other layers (AOVs) and Cryptomattes as they are, `mattes` adds each of the "
+        "clip's masks as a one-channel layer matte_<effect>; `compression` is any of OpenEXR's (none, rle, zips, zip, "
+        "piz, pxr24, b44, b44a, dwaa, dwab, zstd, htj2k256, htj2k32; default zip).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string"},
             "clips":{"type":"array","items":{"type":"number"}},"format":{"type":"string","enum":["exr","dpx","tiff"],"default":"exr"},
-            "handles":{"type":"integer","default":8},"cut_in":{"type":"integer","default":1001},"amf":{"type":"boolean","default":true}},
+            "handles":{"type":"integer","default":8},"cut_in":{"type":"integer","default":1001},"amf":{"type":"boolean","default":true},
+            "compression":{"type":"string"},"source_layers":{"type":"boolean","default":false},"mattes":{"type":"boolean","default":false}},
             "required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -8592,6 +8638,9 @@ void McpServer::Impl::addTools() {
             o.handles = std::clamp(a.value("handles").toInt(8), 0, 1000);
             o.cutIn = a.value("cut_in").toInt(1001);
             o.amf = a.value("amf").toBool(true);
+            o.compression = str(a, "compression").toStdString();
+            o.sourceLayers = a.value("source_layers").toBool();
+            o.mattes = a.value("mattes").toBool();
             std::vector<Id> clips;
             for (const QJsonValue& v : a.value("clips").toArray()) clips.push_back(Id(v.toDouble()));
             if (clips.empty())
@@ -8607,6 +8656,13 @@ void McpServer::Impl::addTools() {
                 list.append(QJsonObject{{"name", QString::fromStdString(s.name)}, {"folder", QString::fromStdString(s.folder)},
                                         {"first_frame", s.firstFrame}, {"cut_in", s.cutIn}, {"cut_out", s.cutOut}, {"last_frame", s.lastFrame},
                                         {"head_handle", s.headHandle}, {"tail_handle", s.tailHandle}, {"amf", QString::fromStdString(s.amf)}});
+                if (!s.layers.empty()) {
+                    QJsonArray layers;
+                    for (const std::string& n : s.layers) layers.append(QString::fromStdString(n));
+                    QJsonObject sh = list.last().toObject();
+                    sh["layers"] = layers;
+                    list.last() = sh;
+                }
                 lines << QStringLiteral("%1: frames %2-%3 (cut %4-%5)").arg(QString::fromStdString(s.name)).arg(s.firstFrame).arg(s.lastFrame).arg(s.cutIn).arg(s.cutOut);
             }
             const QString csv = QDir(QString::fromStdString(o.folder)).filePath("pull_list.csv");

@@ -62,6 +62,8 @@
 #include "AutoDuckDialog.h"
 #include "Settings.h"
 #include "media/MediaPool.h"
+#include "media/Exr.h"
+#include "media/ImageSequence.h"
 #include "core/Ambisonics.h"
 #include "media/Sofa.h"
 #include "AutoMixDialog.h"
@@ -14560,6 +14562,109 @@ print("added " + ui["name"])
         // The bin's search finds people by name.
         QVERIFY(panel->rename(neil, "Neil Armstrong"));
         QVERIFY(mediaMatchesSearch(*state()->project().findMedia(ids[2]), "neil", &state()->project()));
+    }
+
+    void cryptomattePicking() {
+        if (!exrAvailable()) QSKIP("Built without OpenEXR");
+        // A render with a diffuse layer and a Cryptomatte: "ball" on the left half, "floor" on the right.
+        const int W = 320, H = 180;
+        const float ball = cryptomatteId("ball"), floor = cryptomatteId("floor");
+        for (int n = 1; n <= 6; ++n) {
+            std::vector<ExrOutLayer> layers(3);
+            layers[0].channels = {"R", "G", "B", "A"};
+            layers[1].name = "diffuse", layers[1].channels = {"R", "G", "B"};
+            layers[2].name = "CryptoObject00", layers[2].channels = {"R", "G", "B", "A"}, layers[2].fullFloat = true;
+            for (auto& l : layers) l.data.assign(size_t(W) * H * l.channels.size(), 0.0f);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const size_t i = size_t(y) * W + x;
+                    const bool left = x < W / 2;
+                    std::fill_n(&layers[0].data[i * 4], 3, 0.5f);
+                    layers[0].data[i * 4 + 3] = 1;
+                    layers[1].data[i * 3 + (left ? 0 : 1)] = 1;
+                    layers[2].data[i * 4] = left ? ball : floor;
+                    layers[2].data[i * 4 + 1] = 1;
+                }
+            const std::map<std::string, std::string> attrs{
+                {"cryptomatte/0a1b2c3/name", "CryptoObject"}, {"cryptomatte/0a1b2c3/hash", "MurmurHash3_32"},
+                {"cryptomatte/0a1b2c3/conversion", "uint32_to_float32"},
+                {"cryptomatte/0a1b2c3/manifest", "{\"ball\":\"" + cryptomatteHex(ball) + "\",\"floor\":\"" + cryptomatteHex(floor) + "\"}"}};
+            std::string err;
+            QVERIFY2(writeExr(QString(dir_.path() + "/pick.%1.exr").arg(n, 4, 10, QChar('0')).toStdString(), W, H, layers, "zip", attrs, &err),
+                     err.c_str());
+        }
+        ImageSequence seq;
+        QVERIFY(detectImageSequence((dir_.path() + "/pick.0001.exr").toStdString(), seq));
+        seq.fps = {25, 1};
+        state()->newProject();
+        state()->apply("Place", [&](Project& p, Sequence& s) {
+            s.width = W, s.height = H, s.fps = {25, 1};
+            MediaItem m;
+            m.id = p.newId();
+            if (!probeMedia(imageSequencePath(seq), m)) return edit::Result{};
+            p.media.push_back(m);
+            return edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {}, false);
+        });
+        QCOMPARE(state()->sequence()->videoTracks[0].clips.size(), size_t(1));
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        state()->setSelection({clip}, false);
+        state()->setPlayhead(0);
+        win_->findChild<QDockWidget*>("inspector")->show();
+        win_->findChild<QDockWidget*>("inspector")->raise();
+        QApplication::processEvents();
+        auto visible = [&](const char* name) -> QWidget* {
+            for (auto* w : win_->findChildren<QWidget*>(name))
+                if (w->isVisibleTo(win_.get())) return w;
+            return nullptr;
+        };
+        // The clip's layer, chosen in the Inspector as one undo step.
+        QTRY_VERIFY(visible("exrLayer"));
+        auto* layer = static_cast<QComboBox*>(visible("exrLayer"));
+        QCOMPARE(layer->count(), 2);
+        const int diffuse = layer->findData(QStringLiteral("diffuse"));
+        QVERIFY(diffuse > 0);
+        layer->setCurrentIndex(diffuse);
+        emit layer->activated(diffuse);
+        QTRY_COMPARE(edit::clipById(*state()->sequence(), clip)->layer, std::string("diffuse"));
+        state()->undo();
+        QTRY_COMPARE(edit::clipById(*state()->sequence(), clip)->layer, std::string());
+        state()->redo();
+        // A Cryptomatte mask: its controls, then objects picked in the Program monitor.
+        state()->edit("Invert", [clip](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "invert");
+            e.params["mask.shape"] = Param(7.0);
+            edit::clipById(s, clip)->effects.push_back(e);
+            return true;
+        });
+        QTRY_VERIFY(visible("cryptomatteStatus"));
+        QVERIFY(static_cast<QLabel*>(visible("cryptomatteStatus"))->text().contains("Click objects"));
+        QCOMPARE(static_cast<QComboBox*>(visible("cryptomatteLayer"))->currentText(), QString("CryptoObject"));
+        QVERIFY(!visible("cryptomatteClear")->isEnabled());
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        QTRY_VERIFY_WITH_TIMEOUT(!viewer->image().isNull(), 5000);
+        const QRectF r = viewer->imageRect();
+        auto at = [&](double x, double y) { return QPointF(r.left() + x * r.width() / W, r.top() + y * r.height() / H).toPoint(); };
+        auto ids = [&]() { return edit::clipById(*state()->sequence(), clip)->effects.back().s("mask.crypto_ids"); };
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(60, 90));
+        QTRY_COMPARE(ids(), cryptomatteHex(ball));
+        QTRY_VERIFY(static_cast<QLabel*>(visible("cryptomatteStatus"))->text() == "ball");
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(260, 90));
+        QTRY_VERIFY(static_cast<QLabel*>(visible("cryptomatteStatus"))->text() == "ball, floor");
+        // The matte: the inverted ball (diffuse red becomes cyan) and floor.
+        const Image both = renderProgramFrame(state()->project(), *state()->sequence(), 0, RenderOptions{});
+        QVERIFY(both.at(60, 90)[0] < 0.05f && both.at(260, 90)[1] < 0.05f);
+        // Ctrl-click takes one away (one undo step each); Clear takes them all.
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::ControlModifier, at(60, 90));
+        QTRY_COMPARE(ids(), cryptomatteHex(floor));
+        state()->undo();
+        QTRY_COMPARE(parseCryptomatteIds(ids()).size(), size_t(2));
+        QTRY_VERIFY(visible("cryptomatteClear") && visible("cryptomatteClear")->isEnabled());
+        static_cast<QToolButton*>(visible("cryptomatteClear"))->click();
+        QTRY_COMPARE(ids(), std::string());
     }
 
     void objectMaskFromViewer() {

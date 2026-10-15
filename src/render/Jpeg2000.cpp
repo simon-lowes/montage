@@ -8,6 +8,14 @@
 #ifdef MONTAGE_WITH_OPENJPEG
 #include <openjpeg.h>
 #endif
+#ifdef MONTAGE_WITH_OPENEXR
+#include <ojph_codestream.h>
+#include <ojph_file.h>
+#include <ojph_mem.h>
+#include <ojph_message.h>
+#include <ojph_params.h>
+#include <stdexcept>
+#endif
 
 namespace montage {
 
@@ -53,6 +61,7 @@ uint16_t imfRsiz(int width, int height, int components, double fps, bool lossles
 
 void imfPictureCoding(uint16_t rsiz, uint8_t out[16]) {
     std::memset(out, 0, 16);
+    if (rsiz == kHtj2kRsiz) return htj2kPictureCoding(out);
     const int profile = rsiz & 0xff00, main = rsiz & 0xf, sub = (rsiz >> 4) & 0xf;
     uint8_t kind;
     switch (profile) {
@@ -68,6 +77,77 @@ void imfPictureCoding(uint16_t rsiz, uint8_t out[16]) {
     const uint8_t ul[16] = {0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x0d, 0x04, 0x01, 0x02, 0x02, 0x03, 0x01, kind,
                             uint8_t(base[main] + sub)};
     std::memcpy(out, ul, 16);
+}
+
+bool htj2kAvailable() {
+#ifdef MONTAGE_WITH_OPENEXR
+    return true;
+#else
+    return false;
+#endif
+}
+
+void htj2kPictureCoding(uint8_t out[16]) {
+    const uint8_t ul[16] = {0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x0d, 0x04, 0x01, 0x02, 0x02, 0x03, 0x01, 0x08, 0x01};
+    std::memcpy(out, ul, 16);
+}
+
+bool encodeHtj2k(const uint16_t* rgb, int width, int height, int bits, std::vector<uint8_t>& out, std::string* error) {
+#ifdef MONTAGE_WITH_OPENEXR
+    if (!rgb || width <= 0 || height <= 0 || bits < 8 || bits > 16) {
+        if (error) *error = "Nothing to encode";
+        return false;
+    }
+    static std::once_flag quiet;
+    std::call_once(quiet, [] { ojph::set_message_level(ojph::OJPH_MSG_LEVEL::OJPH_MSG_ERROR); });
+    try {
+        ojph::codestream cs;
+        ojph::param_siz siz = cs.access_siz();
+        siz.set_image_extent(ojph::point(ojph::ui32(width), ojph::ui32(height)));
+        siz.set_num_components(3);
+        for (ojph::ui32 c = 0; c < 3; ++c) siz.set_component(c, ojph::point(1, 1), ojph::ui32(bits), false);
+        siz.set_image_offset(ojph::point(0, 0));
+        siz.set_tile_size(ojph::size(ojph::ui32(width), ojph::ui32(height)));
+        siz.set_tile_offset(ojph::point(0, 0));
+        ojph::param_cod cod = cs.access_cod();
+        // (the decompositions the IMF profiles allow at each size, as OpenJPEG chooses them)
+        cod.set_num_decomposition(width <= 2048 && height <= 1556 ? 5 : width <= 4096 && height <= 3112 ? 6 : 7);
+        cod.set_block_dims(32, 32);
+        ojph::size precincts[2] = {ojph::size(128, 128), ojph::size(256, 256)};
+        cod.set_precinct_size(2, precincts);
+        cod.set_progression_order("CPRL");
+        cod.set_color_transform(true);
+        cod.set_reversible(true);
+        cs.set_planar(false);
+        cs.set_profile("IMF");
+        cs.set_tilepart_divisions(false, true);
+        cs.request_tlm_marker(true);
+        ojph::mem_outfile file;
+        file.open(size_t(width) * size_t(height) * 3);
+        cs.write_headers(&file);
+        ojph::ui32 next = 0;
+        ojph::line_buf* line = cs.exchange(nullptr, next);
+        for (int y = 0; y < height; ++y)
+            for (int c = 0; c < 3; ++c) {
+                if (int(next) != c) throw std::runtime_error("components out of order");
+                const uint16_t* q = rgb + size_t(y) * size_t(width) * 3 + size_t(c);
+                ojph::si32* d = line->i32;
+                for (int x = 0; x < width; ++x, q += 3) d[x] = ojph::si32(*q);
+                line = cs.exchange(line, next);
+            }
+        cs.flush();
+        out.assign(file.get_data(), file.get_data() + file.tell());
+        cs.close();
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = std::string("HTJ2K: ") + e.what();
+        return false;
+    }
+#else
+    (void)rgb, (void)width, (void)height, (void)bits, (void)out;
+    if (error) *error = "This build has no HTJ2K encoder (OpenJPH comes with OpenEXR)";
+    return false;
+#endif
 }
 
 #ifdef MONTAGE_WITH_OPENJPEG

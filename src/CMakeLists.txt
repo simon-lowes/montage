@@ -70,6 +70,7 @@ add_library(montage_engine STATIC
   automation/McpServer.h automation/McpServer.cpp
   media/Image.h media/Image.cpp
   media/Decoder.h media/Decoder.cpp
+  media/Exr.h media/Exr.cpp
   media/Vector.h media/Vector.cpp
   media/CameraRaw.h media/CameraRaw.cpp
   media/ProResRaw.h media/ProResRaw.cpp
@@ -460,6 +461,13 @@ if(MONTAGE_WITH_C2PA)
   else()
     message(STATUS "C2PA library not found: exports are not signed with Content Credentials")
   endif()
+endif()
+if(MONTAGE_WITH_OPENEXR)
+  target_link_libraries(montage_engine PRIVATE OpenEXR::OpenEXR)
+  # OpenJPH's own API (HTJ2K codestreams for IMF), compiled into OpenEXRCore.
+  target_include_directories(montage_engine PRIVATE ${openexr_SOURCE_DIR}/external/OpenJPH/src/core/common
+                                                    ${openexr_SOURCE_DIR}/external/OpenJPH/src/core/openjph)
+  target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_OPENEXR)
 endif()
 if(MONTAGE_WITH_THORVG)
   target_link_libraries(montage_engine PRIVATE montage_thorvg)

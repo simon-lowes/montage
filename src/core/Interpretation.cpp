@@ -3,6 +3,7 @@
 #include "Numbers.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
@@ -42,6 +43,38 @@ std::string stereoLayout(const std::string& detected, const Interpretation& i) {
     return i.stereo.empty() ? detected : i.stereo;
 }
 
+// A free-text value kept clear of the list's own marks (percent-encoded).
+static std::string escapeValue(const std::string& v) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string out;
+    for (unsigned char c : v) {
+        if (c == ';' || c == '=' || c == '%' || c < 0x20) out += '%', out += hex[c >> 4], out += hex[c & 15];
+        else out += char(c);
+    }
+    return out;
+}
+
+static std::string unescapeValue(const std::string& v) {
+    std::string out;
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (v[i] == '%' && i + 2 < v.size() && std::isxdigit(static_cast<unsigned char>(v[i + 1])) &&
+            std::isxdigit(static_cast<unsigned char>(v[i + 2]))) {
+            out += char(std::stoi(v.substr(i + 1, 2), nullptr, 16));
+            i += 2;
+        } else {
+            out += v[i];
+        }
+    }
+    return out;
+}
+
+std::string layerPath(const std::string& path, const std::string& layer) {
+    Interpretation i;
+    parseInterpretation(path, i);
+    i.layer = layer;
+    return interpretedPath(path, i);
+}
+
 std::string eyePath(const std::string& path, int eye) {
     Interpretation i;
     parseInterpretation(path, i);
@@ -73,6 +106,7 @@ bool parseInterpretation(const std::string& path, Interpretation& out) {
         else if (key == "stereo" && validStereoLayout(value)) out.stereo = value;
         else if (key == "swap") out.swapEyes = value == "1";
         else if (key == "eye") out.eye = value == "1" ? 1 : 0;
+        else if (key == "layer") out.layer = unescapeValue(value);
     }
     if (!out.conformed()) out.fps = out.fileFps = Rational{0, 1};
     return !out.empty();
@@ -105,6 +139,7 @@ std::string interpretedPath(const std::string& path, const Interpretation& i) {
     if (!i.stereo.empty()) add("stereo=" + i.stereo);
     if (i.swapEyes) add("swap=1");
     if (i.eye) add("eye=1");
+    if (!i.layer.empty()) add("layer=" + escapeValue(i.layer));
     return items.empty() ? out : out + kMark + items;
 }
 

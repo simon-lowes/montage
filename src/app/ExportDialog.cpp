@@ -31,6 +31,7 @@
 #include "core/AudioDescription.h"
 #include "core/Surround.h"
 #include "media/ContentCredentials.h"
+#include "media/Exr.h"
 #include "SequenceSettingsDialog.h"
 #include "Theme.h"
 #include "core/History.h"
@@ -254,6 +255,14 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
                               "Uses Analyse HDR Light Levels' measurements while the cut still matches them, else measures first."));
     hdr10Plus_->setChecked(appSettings().value("export/hdr10Plus", false).toBool());
     form->addRow(QString(), hdr10Plus_);
+    // OpenEXR frames: any of OpenEXR's compressions (HTJ2K and zstd through the OpenEXR library).
+    exrCompression_ = new QComboBox(form_);
+    exrCompression_->setObjectName(QStringLiteral("exportExrCompression"));
+    for (const std::string& c : exrCompressions()) exrCompression_->addItem(QString::fromStdString(exrCompressionLabel(c)), QString::fromStdString(c));
+    exrCompression_->setCurrentIndex(std::max(0, exrCompression_->findData(appSettings().value("export/exrCompression", "zip").toString())));
+    exrCompression_->setToolTip(tr("How OpenEXR frames are compressed: ZIP, PIZ, Zstandard and HTJ2K keep every value; PXR24, B44 and DWA are smaller and lossy"));
+    if (exrAvailable()) form->addRow(tr("OpenEXR compression:"), exrCompression_);
+    else exrCompression_->hide();
     // A stereoscopic 3D sequence: how its eyes are delivered (render/Stereo.h).
     stereo_ = new QComboBox(form_);
     stereo_->setObjectName(QStringLiteral("exportStereo"));
@@ -589,6 +598,7 @@ void ExportDialog::updateControls() {
         const ColorSpace* out = chosen ? chosen : sq ? &sequenceColorSpace(*sq) : nullptr;
         const std::string vc = p ? p->settings.videoCodec : std::string();
         hdr10Plus_->setEnabled(video && out && out->transfer == Transfer::Pq && vc != "exr" && vc != "gif");
+        exrCompression_->setEnabled(video && vc == "exr" && exrAvailable());
     }
     loudness_->setEnabled(p && hasAudio(p->settings));
     quality_->setEnabled(p && usesCrf(p->settings.videoCodec));
@@ -790,6 +800,11 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     settings.setValue("export/cea608", cea608_->isChecked());
     s.hdr10Plus = hdr10Plus_->isEnabled() && hdr10Plus_->isChecked();
     settings.setValue("export/hdr10Plus", hdr10Plus_->isChecked());
+    if (exrCompression_->isEnabled()) {
+        const std::string c = exrCompression_->currentData().toString().toStdString();
+        s.exrCompression = c == "zip" ? std::string() : c;  // (ZIP: FFmpeg's writer, as before)
+        settings.setValue("export/exrCompression", exrCompression_->currentData());
+    }
     if (streams_->isEnabled() && streams_->currentIndex() > 0 && state_->sequence()) {
         const int index = streams_->currentIndex();
         s.extraAudio = stemStreams(*state_->sequence(), index == 1 ? StemsByRole : index == 3 ? StemsDialogueAndME : StemsByTrack);

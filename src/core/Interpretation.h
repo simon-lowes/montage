@@ -39,10 +39,13 @@ struct Interpretation {
     std::string stereo;
     bool swapEyes = false;
     int eye = 0;
+    // One layer (AOV) of a multi-layer OpenEXR, read with OpenEXR (media/Exr.h); "" the main picture. Set per clip by
+    // the renderer, as the eye is.
+    std::string layer;
     bool hasRaw() const { return rawExposure != 0 || rawTemperature > 0 || rawTint != 0 || !rawHighlights.empty() || rawHalf; }
     bool empty() const {
         return !conformed() && par <= 0 && (alpha.empty() || alpha == "straight") && fields.empty() && !hasRaw() && stereo.empty() && !swapEyes &&
-               eye == 0;
+               eye == 0 && layer.empty();
     }
     bool conformed() const { return fps.valid() && fileFps.valid() && !(fps == fileFps); }
     // Seconds of the file per second of media time (the new rate over the file's); 1 when not conformed.
@@ -69,5 +72,7 @@ bool validStereoLayout(const std::string& layout);  // "", "none", "sbs", "sbs_h
 std::string stereoLayout(const std::string& detected, const Interpretation& i);
 // `path` with the right (1) or left (0) eye of a stereoscopic file read from it.
 std::string eyePath(const std::string& path, int eye);
+// `path` with one layer of a multi-layer OpenEXR read from it ("" the main picture).
+std::string layerPath(const std::string& path, const std::string& layer);
 
 }  // namespace montage

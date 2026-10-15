@@ -135,6 +135,7 @@
 #include "media/Faces.h"
 #include "media/FaceTracks.h"
 #include "media/DepthMap.h"
+#include "media/Exr.h"
 #include "media/Rife.h"
 #include "media/Matting.h"
 #include "media/TextToSpeech.h"
@@ -21495,6 +21496,208 @@ private slots:
         for (ImuSample& r : d.samples) r.gyro = {noise(rng), noise(rng), noise(rng)};
         GyroSync wrong;
         QVERIFY(!syncMotionData(d, cm, wrong, &err));
+    }
+
+    void multiLayerOpenExr() {
+        if (!exrAvailable()) QSKIP("Built without OpenEXR");
+        // A render of 12 frames in HTJ2K: the beauty, a diffuse layer (red on the left, green on the right), depth (a
+        // bare Z, 32-bit) and a Cryptomatte naming the left "ball" and the right "floor".
+        const int W = 64, H = 36;
+        const float ball = cryptomatteId("ball"), floor = cryptomatteId("floor");
+        QCOMPARE(cryptomatteHex(cryptomatteId("bunny")), std::string("13851a76"));  // (as Psyop's sample manifest gives it)
+        auto frame = [&](int n) {
+            std::vector<ExrOutLayer> layers(4);
+            layers[0].channels = {"R", "G", "B", "A"};
+            layers[1].name = "diffuse", layers[1].channels = {"R", "G", "B"};
+            layers[2].channels = {"Z"}, layers[2].fullFloat = true;
+            layers[3].name = "CryptoObject00", layers[3].channels = {"R", "G", "B", "A"}, layers[3].fullFloat = true;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const bool left = x < W / 2;
+                    const float main[4] = {0.2f, 0.4f, 0.6f, 1.0f}, diffuse[3] = {left ? 1.0f : 0.0f, left ? 0.0f : 1.0f, 0.0f},
+                                crypto[4] = {left ? ball : floor, 1.0f, 0.0f, 0.0f};
+                    for (auto* l : {&layers[0], &layers[1], &layers[2], &layers[3]}) {
+                        const size_t nc = l->channels.size();
+                        l->data.resize(size_t(W) * H * nc);
+                        float* d = &l->data[(size_t(y) * W + x) * nc];
+                        for (size_t k = 0; k < nc; ++k)
+                            d[k] = l == &layers[0] ? main[k] : l == &layers[1] ? diffuse[k] : l == &layers[2] ? 5.0f + float(n) : crypto[k];
+                    }
+                }
+            const std::map<std::string, std::string> attrs{
+                {"cryptomatte/0a1b2c3/name", "CryptoObject"}, {"cryptomatte/0a1b2c3/hash", "MurmurHash3_32"},
+                {"cryptomatte/0a1b2c3/conversion", "uint32_to_float32"},
+                {"cryptomatte/0a1b2c3/manifest", "{\"ball\":\"" + cryptomatteHex(ball) + "\",\"floor\":\"" + cryptomatteHex(floor) + "\"}"}};
+            char name[64];
+            std::snprintf(name, sizeof name, "render.%04d.exr", n);
+            std::string err;
+            return writeExr(path(name), W, H, layers, "htj2k256", attrs, &err) ? std::string() : err;
+        };
+        for (int n = 1; n <= 12; ++n) QCOMPARE(frame(n), std::string());
+        // What is in it.
+        ExrInfo info;
+        std::string err;
+        QVERIFY2(readExrInfo(path("render.0001.exr"), info, &err), err.c_str());
+        QCOMPARE(info.compression, std::string("htj2k256"));
+        QString found;
+        for (const ExrLayer& l : info.layers) found += QString::fromStdString(l.name) + "|";
+        QVERIFY2(info.width == W && info.height == H && info.layers.size() == 3 && info.hasLayer("") && info.hasLayer("diffuse") && info.hasLayer("Z"),
+                 qPrintable(found));
+        QCOMPARE(info.layers[0].name, std::string());  // the main picture first
+        QVERIFY(info.cryptomattes.size() == 1 && info.cryptomattes[0].name == "CryptoObject" && info.cryptomattes[0].objects.size() == 2);
+        QCOMPARE(info.cryptomattes[0].objectName(ball), std::string("ball"));
+        CryptomatteFrame cm;
+        QVERIFY2(readCryptomatte(path("render.0001.exr"), "", cm, &err), err.c_str());
+        QVERIFY(cm.ranks == 2 && cm.idAt(5, 5) == ball && cm.idAt(W - 5, 5) == floor);
+        const std::vector<float> ballMatte = cm.matte(parseCryptomatteIds(cryptomatteHex(ball)));
+        QVERIFY(ballMatte[5] == 1.0f && ballMatte[W - 5] == 0.0f);
+        QCOMPARE(parseCryptomatteIds(cryptomatteIdList({ball, floor})).size(), size_t(2));
+        // Read as a clip: the main picture, or a layer of it, as stored (HTJ2K needs OpenEXR's reader).
+        ImageSequence seq;
+        QVERIFY(detectImageSequence(path("render.0001.exr"), seq));
+        seq.fps = {24, 1};
+        const std::string media = imageSequencePath(seq);
+        auto pixel = [&](const std::string& file, int x) {
+            VideoDecoder dec;
+            std::array<double, 3> c{-1, -1, -1};
+            if (!dec.open(file)) return c;
+            const Frame16Ptr f = dec.frameAt(0);
+            if (!f) return c;
+            const Image img = toImage(*f);
+            for (int k = 0; k < 3; ++k) c[size_t(k)] = img.at(x, 18)[k];
+            return c;
+        };
+        const auto plain = pixel(media, 5), red = pixel(layerPath(media, "diffuse"), 5), green = pixel(layerPath(media, "diffuse"), W - 5);
+        QVERIFY2(std::fabs(plain[0] - 0.2) < 0.01 && std::fabs(plain[2] - 0.6) < 0.01, qPrintable(QString("%1 %2").arg(plain[0]).arg(plain[2])));
+        QVERIFY(red[0] > 0.99 && red[1] < 0.01 && green[1] > 0.99 && green[0] < 0.01);
+        QCOMPARE(pixel(layerPath(media, "nothing"), 5)[0], -1.0);  // (a layer the file hasn't: not opened)
+        // On the timeline: the clip shows its diffuse layer, and Invert limited to the ball by the Cryptomatte.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = {24, 1};
+        MediaItem m = probeOrFail(p, media);
+        p.media.push_back(m);
+        Clip c = makeClip(p, m, TrackKind::Video, s);
+        c.duration = 12;
+        c.layer = "diffuse";
+        Effect inv = makeEffect(p, "invert");
+        inv.params["mask.shape"] = Param(7.0);
+        inv.params["mask.feather"] = Param(0.0);
+        inv.strings["mask.crypto_ids"] = cryptomatteHex(ball);
+        c.effects.push_back(inv);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        RenderOptions ro;
+        const Image shown = renderProgramFrame(p, s, 3, ro);
+        const float* l = shown.at(5, 18);
+        const float* r = shown.at(W - 5, 18);
+        QVERIFY2(l[0] < 0.05 && l[1] > 0.95 && l[2] > 0.95, qPrintable(QString("%1 %2 %3").arg(l[0]).arg(l[1]).arg(l[2])));  // red, inverted
+        QVERIFY2(r[0] < 0.05 && r[1] > 0.95 && r[2] < 0.05, qPrintable(QString("%1 %2 %3").arg(r[0]).arg(r[1]).arg(r[2])));  // green, left
+        // Saved and loaded.
+        const QString project = QString::fromStdString(path("layers.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->videoTracks[0].clips.at(0).layer, std::string("diffuse"));
+        // Pulled with the render's other layers, its Cryptomatte and the Invert's matte, zstd compressed.
+        VfxPullOptions o;
+        o.folder = path("exr-pulls");
+        o.handles = 2;
+        o.compression = "zstd";
+        o.sourceLayers = true;
+        o.mattes = true;
+        std::vector<VfxShot> shots;
+        const Id clipId = s.videoTracks[0].clips.at(0).id;
+        QVERIFY2(exportVfxPulls(p, s, {clipId}, o, &shots, nullptr, nullptr, &err), err.c_str());
+        QCOMPARE(shots.size(), size_t(1));
+        QString names;
+        for (const std::string& n : shots[0].layers) names += QString::fromStdString(n) + " ";
+        for (const char* want : {"main ", "Z ", "CryptoObject ", "matte_Invert "}) QVERIFY2(names.contains(want), qPrintable(names));
+        QVERIFY(!names.contains("diffuse"));  // (the plate is it)
+        const std::string pulled = shots[0].folder + "/" + shots[0].name + ".1001.exr";
+        ExrInfo pi;
+        QVERIFY2(readExrInfo(pulled, pi, &err), err.c_str());
+        QCOMPARE(pi.compression, std::string("zstd"));
+        QVERIFY(pi.hasLayer("main") && pi.hasLayer("Z") && pi.hasLayer("matte_Invert"));
+        QVERIFY(pi.cryptomattes.size() == 1 && pi.cryptomattes[0].objectName(floor) == "floor");  // (the manifest carried)
+        int pw = 0, ph = 0;
+        std::vector<float> rgba;
+        QVERIFY2(readExrLayer(pulled, "matte_Invert", pw, ph, rgba, &err), err.c_str());
+        QVERIFY(pw == W && ph == H && rgba[(18 * W + 5) * 4] > 0.99f && rgba[(18 * W + W - 5) * 4] < 0.01f);
+        QVERIFY2(readExrLayer(pulled, "", pw, ph, rgba, &err), err.c_str());
+        QVERIFY(rgba[(18 * W + 5) * 4] > 0.95f && rgba[(18 * W + 5) * 4 + 1] < 0.05f);  // the plate: diffuse, untouched (red)
+        QVERIFY2(readExrLayer(pulled, "Z", pw, ph, rgba, &err), err.c_str());
+        QCOMPARE(rgba[0], 5.0f + 1.0f);  // render frame 1 is the pull's 1001 (the cut starts at its first frame, no head handle)
+        // An export in HTJ2K (32 lines), and in FFmpeg's ZIP as before.
+        ExportSettings st;
+        st.videoCodec = "exr";
+        st.audioCodec = "none";
+        st.exrCompression = "htj2k32";
+        st.path = path("ht_%04d.exr");
+        st.in = 0, st.out = 2;
+        QVERIFY2(exportSequence(p, s, st, {}, nullptr, &err), err.c_str());
+        QVERIFY2(readExrInfo(path("ht_0000.exr"), pi, &err), err.c_str());
+        QCOMPARE(pi.compression, std::string("htj2k32"));
+        st.exrCompression = "bogus";
+        QVERIFY(!exportSequence(p, s, st, {}, nullptr, &err) && err.find("bogus") != std::string::npos);
+        // Over MCP: the layers and Cryptomattes probed, and a clip placed showing one.
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject res = call("montage_probe_media", {{"path", QString::fromStdString(path("render.0001.exr"))}});
+        const QJsonObject probed = res.value("structuredContent").toObject();
+        QCOMPARE(probed.value("exr_layers").toArray().size(), 3);
+        QCOMPARE(probed.value("cryptomattes").toArray().at(0).toObject().value("objects").toArray().size(), 2);
+        res = call("montage_place_media", {{"project", project}, {"media", QString::fromStdString(path("render.0001.exr"))}, {"image_sequence", true},
+                                        {"fps", 24}, {"layer", "Z"}});
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        QVERIFY2(res.value("structuredContent").toObject().value("clips").toArray().at(0).toObject().value("layer").toString() == "Z",
+                 QJsonDocument(res).toJson().constData());
+        res = call("montage_place_media", {{"project", project}, {"media", QString::fromStdString(path("render.0001.exr"))}, {"image_sequence", true},
+                                        {"fps", 24}, {"layer", "specular"}});
+        QVERIFY(res.value("isError").toBool());
+    }
+
+    void cryptomatteSamples() {
+        // Psyop's sample renders (github.com/Psyop/Cryptomatte, sample_images): manifests in the header and beside it,
+        // names that aren't ASCII, several Cryptomattes and layers in one file.
+        const QString dir = qEnvironmentVariable("MONTAGE_CRYPTOMATTE_SAMPLES");
+        if (!exrAvailable() || dir.isEmpty() || !QFile::exists(dir + "/bunny_CryptoObject.exr"))
+            QSKIP("Set MONTAGE_CRYPTOMATTE_SAMPLES to a folder of Cryptomatte's sample_images to run this");
+        auto file = [&](const char* f) { return (dir + "/" + f).toStdString(); };
+        ExrInfo info;
+        std::string err;
+        QVERIFY2(readExrInfo(file("bunny_CryptoObject.exr"), info, &err), err.c_str());
+        QVERIFY(info.width == 1280 && info.height == 720 && info.cryptomattes.size() == 1 && info.layers.empty());
+        const Cryptomatte& objects = info.cryptomattes[0];
+        QCOMPARE(objects.name, std::string("uCryptoObject"));
+        QVERIFY(objects.channels.size() == 12 && objects.objects.size() > 30000);
+        for (size_t i = 0; i < objects.objects.size(); i += 997)  // the ids are the names' hashes
+            QCOMPARE(cryptomatteHex(cryptomatteId(objects.objects[i].first)), cryptomatteHex(objects.objects[i].second));
+        CryptomatteFrame cm;
+        QVERIFY2(readCryptomatte(file("bunny_CryptoObject.exr"), "uCryptoObject", cm, &err), err.c_str());
+        const float centre = cm.idAt(640, 360);
+        QCOMPARE(objects.objectName(centre), std::string("plant.smallLeaf1.:3694"));
+        const std::vector<float> matte = cm.matte({centre});
+        QVERIFY(matte[size_t(360) * 1280 + 640] > 0.0f);
+        double total = 0;
+        for (float v : matte) total += v;
+        QVERIFY(total >= matte[size_t(360) * 1280 + 640] && total < 1280.0 * 720 / 4);
+        // Several in one file, beside layers.
+        QVERIFY2(readExrInfo(file("multichannel.exr"), info, &err), err.c_str());
+        QVERIFY(info.hasLayer("") && info.hasLayer("Cd") && info.hasLayer("pscale") && info.hasLayer("shape") && info.cryptomattes.size() == 3);
+        QVERIFY(info.cryptomatte("crypto_material") && info.cryptomatte("crypto_material")->objects.size() == 4);
+        // A manifest beside the file; names in UTF-8 with quotes.
+        QVERIFY2(readExrInfo(file("sidecar_manifest.exr"), info, &err), err.c_str());
+        QCOMPARE(info.cryptomattes.at(0).objects.size(), size_t(8));
+        QVERIFY2(readExrInfo(file("special_chars.exr"), info, &err), err.c_str());
+        QVERIFY2(readCryptomatte(file("special_chars.exr"), "", cm, &err), err.c_str());
+        QCOMPARE(QString::fromStdString(info.cryptomattes.at(0).objectName(cm.idAt(32, 32))), QString::fromUtf8("равнина"));
     }
 
     void goproGyro() {

@@ -33,6 +33,8 @@ struct J2kHeader {
     uint32_t xsiz = 0, ysiz = 0, xosiz = 0, yosiz = 0, xtsiz = 0, ytsiz = 0, xtosiz = 0, ytosiz = 0;
     std::vector<std::array<uint8_t, 3>> components;  // Ssiz, XRsiz, YRsiz
     std::vector<uint8_t> cod, qcd;                   // the COD and QCD marker segments' bodies
+    uint32_t pcap = 0;                               // the CAP marker's (HTJ2K): the parts it needs, 0 without one
+    std::vector<uint16_t> ccap;                      // and their capabilities, one for each bit of pcap
 };
 bool parseJ2kHeader(const uint8_t* data, size_t size, J2kHeader& out);
 

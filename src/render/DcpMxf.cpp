@@ -248,6 +248,7 @@ const PrimerEntry kImfPicturePrimer[] = {
     {0x3405, "060e2b34010101050401040401000000"}, {0xfff1, "060e2b340101010e040106030e000000"},
     {0xfff0, "060e2b340101010e0420040101010000"}, {0xffef, "060e2b340101010e0420040101020000"},
     {0xffee, "060e2b340101010e0420040101030000"}, {0xffed, "060e2b340101010e0420040101040000"},
+    {0xffec, "060e2b340101010e040106030f000000"},  // J2KExtendedCapabilities (HTJ2K)
 };
 const PrimerEntry kImfSoundPrimer[] = {
     {0x3d01, "060e2b34010101040402030304000000"}, {0x3d02, "060e2b34010101040402030104000000"},
@@ -684,6 +685,10 @@ bool parseJ2kHeader(const uint8_t* d, size_t n, J2kHeader& out) {
         } else if (marker == 0x5c) {
             out.qcd.assign(body, body + bodyLen);
             qcd = true;
+        } else if (marker == 0x50 && bodyLen >= 4) {
+            out.pcap = readBe(body, 4);
+            out.ccap.clear();
+            for (size_t k = 4; k + 2 <= bodyLen; k += 2) out.ccap.push_back(uint16_t(readBe(body + k, 2)));
         }
         i += 2 + len;
     }
@@ -1157,6 +1162,14 @@ std::vector<uint8_t> ImfPictureWriter::headerMetadata(int64_t duration) const {
         s.item(0xfff4, sizing);
         s.item(0xfff3, j2k_.cod);
         s.item(0xfff2, j2k_.qcd);
+        if (j2k_.pcap) {
+            Bytes caps;  // Pcap, then the Ccap values as a batch
+            put32(caps, j2k_.pcap);
+            put32(caps, j2k_.ccap.size());
+            put32(caps, 2);
+            for (uint16_t c : j2k_.ccap) put16(caps, c);
+            s.item(0xffec, caps);
+        }
         s.item(0xfff1, layout);
         putBytes(out, setKlv(0x5a, s));
     }

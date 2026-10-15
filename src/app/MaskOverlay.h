@@ -10,7 +10,8 @@
 // picture is pinned to (then track it from the Inspector). Object masks are
 // picked here too: click the object (Alt-click: not the
 // object, drag: a box around it, Ctrl/Cmd-click a point: remove it), and the
-// model segments that frame in the background. A 3D Camera Tracker's points show where its solve puts them (green
+// model segments that frame in the background. Cryptomatte masks are picked here too: click an object of the render to
+// add it, Ctrl/Cmd-click it to take it out (the picked ones are tinted; the name under the pointer shows). A 3D Camera Tracker's points show where its solve puts them (green
 // when they fit it well, amber, then red), those tracked in the frame on screen.
 #pragma once
 
@@ -84,6 +85,17 @@ public:
         int which = 0;      // the mask's object being clicked (render/ClipAnalysis.h currentObject)
     };
     std::vector<ObjectTarget> objectTargets() const;
+    // The selected clip's effects with a Cryptomatte mask, at the playhead: the OpenEXR frame on screen and its picks.
+    struct CryptoTarget {
+        Id clip = 0;
+        Id effect = 0;
+        std::string file;   // the frame's OpenEXR file
+        std::string layer;  // the Cryptomatte ("" the file's first)
+        std::string ids;    // the objects picked (media/Exr.h)
+    };
+    std::vector<CryptoTarget> cryptoTargets() const;
+    // Adds the object at (u, v) of the target's frame to its mask, or takes it out; false when nothing is there.
+    bool pickCryptomatte(const CryptoTarget& t, double u, double v, bool remove);
     // Replaces the clicks on the playhead's frame and segments it (asking to
     // download the model first if needed).
     void pickObject(const ObjectTarget& t, const std::vector<ObjectPoint>& points);
@@ -119,10 +131,16 @@ private:
     bool toWidget(Id clip, double u, double v, QPointF& out) const;
     bool fromWidget(Id clip, const QPointF& pt, double& u, double& v) const;
     void paintObjects(QPainter& p) const;
+    void paintCryptomattes(QPainter& p) const;
+    bool cryptoPress(const QPointF& pos, Qt::KeyboardModifiers mods);
     void paintScenePoints(QPainter& p) const;
     bool objectPress(const QPointF& pos);
     void objectRelease(const QPointF& pos, Qt::KeyboardModifiers mods);
 
+    mutable QImage cryptoTint_;
+    mutable QString cryptoTintKey_;
+    QString cryptoHover_;  // the object under the pointer
+    QPointF hoverPos_;
     EditorState* state_;
     ViewerWidget* viewer_;
     Grab grab_ = Grab::None;

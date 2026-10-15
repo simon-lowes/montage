@@ -3,10 +3,12 @@
 
 #include <atomic>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
 #include "core/Model.h"
+#include "media/Exr.h"
 #include "render/LightLevel.h"
 
 namespace montage {
@@ -64,6 +66,16 @@ struct ExportSettings {
     // With cea608, the same captions as CTA-708 service 1 too (core/Cea708.h: the digital captions US broadcast
     // requires, placed and coloured as the track shows them), beside the 608 bytes.
     bool cea708 = true;
+    // OpenEXR frames written with the OpenEXR library (media/Exr.h) in this compression: none, rle, zips, zip, piz,
+    // pxr24, b44, b44a, dwaa, dwab, zstd, htj2k256 or htj2k32 (High-Throughput JPEG 2000, lossless); "" = FFmpeg's
+    // writer, ZIP in blocks of 16 lines.
+    std::string exrCompression;
+    // More layers in each OpenEXR frame (a VFX pull's source layers and mattes, render/VfxPull.h), written with the
+    // OpenEXR library: called with the frame's sequence time and the picture's size, adding to `layers` (the picture is
+    // the first, "") and header `attributes`. False stops the export with `error`.
+    std::function<bool(FrameTime f, int width, int height, std::vector<ExrOutLayer>& layers, std::map<std::string, std::string>& attributes,
+                       std::string& error)>
+        exrLayers;
     // Delivery colour space (ColorSpace.h display space); "" = the sequence's.
     // An HDR sequence delivered in SDR is tone mapped. HDR output is 10-bit,
     // tagged, and PQ carries HDR10 mastering and light-level metadata.

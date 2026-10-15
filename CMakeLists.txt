@@ -27,6 +27,7 @@ option(MONTAGE_WITH_LV2 "Host LV2 audio plugins, when lilv is installed" ON)
 option(MONTAGE_WITH_LIBRAW "Camera raw stills (CR3, NEF, ARW, DNG...), when LibRaw 0.20+ is installed" ON)
 option(MONTAGE_WITH_MYSOFA "Measured HRTFs (SOFA files) for binaural ambisonics, when libmysofa is installed" ON)
 option(MONTAGE_WITH_OPENJPEG "IMF masters in the JPEG 2000 IMF profiles, when OpenJPEG 2.5+ is installed" ON)
+option(MONTAGE_WITH_OPENEXR "Multi-layer OpenEXR, Cryptomatte and HTJ2K (OpenEXR with Imath and OpenJPH, BSD, fetched at configure time)" ON)
 option(MONTAGE_GPU "The GPU compositor through Qt's RHI, where Qt is 6.6 or later" ON)
 option(MONTAGE_WITH_OCIO "OpenColorIO configs and ACES transforms, when OpenColorIO 2.1+ is installed" ON)
 option(MONTAGE_WITH_ONNXRUNTIME "AI object masks (EdgeTAM), when ONNX Runtime 1.16+ is installed (ONNXRUNTIME_ROOT or the usual prefixes)" ON)
@@ -73,6 +74,35 @@ if(MONTAGE_WITH_WHISPER)
     GIT_SHALLOW TRUE)
   FetchContent_MakeAvailable(whisper)
   set(BUILD_SHARED_LIBS ${MONTAGE_SAVED_BUILD_SHARED_LIBS})
+endif()
+
+if(MONTAGE_WITH_OPENEXR)
+  # OpenEXR 3.5 as static libraries, with its own Imath and its bundled libdeflate, zstd and OpenJPH (HTJ2K), so every
+  # platform reads and writes the same compressions; no tools, examples, tests or install.
+  include(FetchContent)
+  foreach(opt OPENEXR_BUILD_TOOLS OPENEXR_INSTALL_TOOLS OPENEXR_BUILD_EXAMPLES OPENEXR_BUILD_PYTHON OPENEXR_TEST_LIBRARIES
+              OPENEXR_TEST_TOOLS OPENEXR_TEST_PYTHON OPENEXR_INSTALL OPENEXR_INSTALL_PKG_CONFIG OPENEXR_INSTALL_DOCS
+              BUILD_WEBSITE IMATH_INSTALL IMATH_INSTALL_PKG_CONFIG PYTHON)
+    set(${opt} OFF CACHE BOOL "" FORCE)
+  endforeach()
+  foreach(opt OPENEXR_FORCE_INTERNAL_IMATH OPENEXR_FORCE_INTERNAL_DEFLATE OPENEXR_FORCE_INTERNAL_OPENJPH
+              OPENEXR_FORCE_INTERNAL_ZSTD)
+    set(${opt} ON CACHE BOOL "" FORCE)
+  endforeach()
+  set(MONTAGE_SAVED_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+  set(MONTAGE_SAVED_BUILD_TESTING ${BUILD_TESTING})
+  set(BUILD_SHARED_LIBS OFF)
+  set(MONTAGE_SAVED_PIC ${CMAKE_POSITION_INDEPENDENT_CODE})
+  set(BUILD_TESTING OFF)
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+  FetchContent_Declare(openexr
+    GIT_REPOSITORY https://github.com/AcademySoftwareFoundation/openexr.git
+    GIT_TAG v3.5.2
+    GIT_SHALLOW TRUE)
+  FetchContent_MakeAvailable(openexr)
+  set(BUILD_SHARED_LIBS ${MONTAGE_SAVED_BUILD_SHARED_LIBS})
+  set(BUILD_TESTING ${MONTAGE_SAVED_BUILD_TESTING})
+  set(CMAKE_POSITION_INDEPENDENT_CODE ${MONTAGE_SAVED_PIC})
 endif()
 
 if(MONTAGE_WITH_RNNOISE)

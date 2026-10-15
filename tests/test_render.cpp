@@ -5334,6 +5334,42 @@ colorspaces:
         QVERIFY(readImfFrame(hout.filePath(hout.entryList({"VIDEO_*.mxf"}).value(0)).toStdString(), 0, rgb, w, h, bits, &err) && bits == 12);
         mid = &rgb[(size_t(90) * 320 + 160) * 3];
         QVERIFY(mid[0] > mid[1] && mid[2] > mid[0] && mid[2] < 4095);  // the matte in PQ, its order kept
+        if (htj2kAvailable()) {
+            // High-Throughput JPEG 2000 (ST 2067-21:2023): lossless, Rsiz 0x4000 with a CAP marker naming Part 15, the
+            // HTJ2K coding label and the extended capabilities in the descriptors; OpenJPEG decodes it to the same codes.
+            ImfSettings ht;
+            ht.title = "HT";
+            ht.threads = 2;
+            ht.htj2k = true;
+            ImfResult hr;
+            QVERIFY2(exportImf(p, s, ht, dir.path().toStdString(), &hr, {}, &err), err.c_str());
+            QCOMPARE(int(hr.rsiz), 0x4000);
+            issues = verifyImf(hr.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            const QDir hto(QString::fromStdString(hr.folder));
+            QFile htc(hto.filePath(hto.entryList({"CPL_*.xml"}).value(0)));
+            QVERIFY(htc.open(QIODevice::ReadOnly));
+            const QString httext = QString::fromUtf8(htc.readAll());
+            for (const char* want : {"http://www.smpte-ra.org/ns/2067-21/2023</cc:ApplicationIdentification>", "<r1:Rsiz>16384</r1:Rsiz>",
+                                     "<r1:PictureCompression>urn:smpte:ul:060e2b34.0401010d.04010202.03010801</r1:PictureCompression>",
+                                     "<r1:J2KExtendedCapabilities>", "<r2:Pcap>131072</r2:Pcap>", "<r2:Ccapi>"})
+                QVERIFY2(httext.contains(want), want);
+            const std::string video = hto.filePath(hto.entryList({"VIDEO_*.mxf"}).value(0)).toStdString();
+            QVERIFY2(readImfFrame(video, 5, rgb, w, h, bits, &err), err.c_str());
+            QVERIFY(w == 320 && h == 180 && bits == 10);
+            mid = &rgb[(size_t(90) * 320 + 160) * 3];
+            QVERIFY2(std::abs(mid[0] - 512) <= 1 && std::abs(mid[1] - 256) <= 1 && std::abs(mid[2] - 767) <= 1,
+                     qPrintable(QString("%1 %2 %3").arg(mid[0]).arg(mid[1]).arg(mid[2])));
+            // The track file's descriptor carries the CAP marker's values too.
+            QFile mxf(QString::fromStdString(video));
+            QVERIFY(mxf.open(QIODevice::ReadOnly));
+            const QByteArray head = mxf.read(65536);
+            QVERIFY(head.contains(QByteArray::fromHex("060e2b340101010e040106030f000000")));  // (the primer's J2KExtendedCapabilities)
+            QVERIFY(head.contains(QByteArray::fromHex("060e2b340401010d0401020203010801")));  // HTJ2KPictureCodingSchemeGeneric
+            ht.lossless = false;
+            ht.title = "HT lossy";
+            QVERIFY(!exportImf(p, s, ht, dir.path().toStdString(), nullptr, {}, &err) && err.find("lossless") != std::string::npos);
+        }
         // Refused: an unknown colour, a frame rate Application #2E does not take, a picture larger than 4096 x 3112.
         st.colour = "sepia";
         QVERIFY(!exportImf(p, s, st, dir.path().toStdString(), nullptr, {}, &err) && err.find("colour") != std::string::npos);
