@@ -2136,7 +2136,10 @@ colorspaces:
             float peak = 0;
             for (size_t i = 1; i < im.px.size(); i += 4) peak = std::max(peak, im.px[i]);
             int n = 0;
-            for (int k = -20; k <= 20; ++k) n += im.at(px + k * dx, py + k * dy)[1] > 0.5f * peak;
+            for (int k = -20; k <= 20; ++k) {
+                const int x = px + k * dx, y = py + k * dy;
+                if (x >= 0 && y >= 0 && x < PW && y < PH) n += im.at(x, y)[1] > 0.5f * peak;
+            }
             return n;
         };
         // (through the shape's middle, which the cut moves toward the centre)
