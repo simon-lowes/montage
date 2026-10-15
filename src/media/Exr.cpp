@@ -573,7 +573,7 @@ namespace {
 std::string fileKey(const std::string& file) {
     std::error_code ec;
     const auto when = std::filesystem::last_write_time(std::filesystem::u8path(file), ec);
-    return file + '\n' + (ec ? std::string() : std::to_string(when.time_since_epoch().count()));
+    return file + '\n' + (ec ? std::string() : std::to_string(static_cast<long long>(when.time_since_epoch().count())));
 }
 }  // namespace
 
