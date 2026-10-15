@@ -41,6 +41,7 @@
 #include "LensCorrectionDialog.h"
 #include "ModelPacks.h"
 #include "media/DepthMap.h"
+#include "media/Faces.h"
 #include "media/Matting.h"
 #include "media/MotionData.h"
 #include "media/Rife.h"
@@ -869,6 +870,17 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             pick->setToolTip(tr("Click what to focus on in the Program monitor. Key Focus Point X and Y, then click on two "
                                 "frames for a focus pull between them. Esc stops."));
             f->addRow(QString(), pick);
+            if (std::lround(e.p("follow", localTime())) == 2 && faceSearchAvailable() && !faceModel().installed()) {
+                // Nearest Face finds no face (and keeps the Focus Depth) until the model is here.
+                auto* get = new QPushButton(tr("Download Face Model…"), content_);
+                get->setObjectName(QStringLiteral("getFaceModel"));
+                connect(get, &QPushButton::clicked, this, [this] {
+                    QTimer::singleShot(0, this, [this] {
+                        if (ensureEffectModel(window(), "focus.face")) state_->amend([](Project&, Sequence&) { return true; });
+                    });
+                });
+                f->addRow(tr("Faces:"), get);
+            }
             connect(pick, &QPushButton::toggled, this, [this, eid](bool on) {
                 if (on) state_->setPaintEffect(eid);
                 else if (state_->paintEffect() == eid) state_->setPaintEffect(0);

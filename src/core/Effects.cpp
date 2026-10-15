@@ -435,7 +435,7 @@ std::vector<EffectInfo> buildCatalog() {
                   num("point_y", "Focus Point Y", 0, 1, 0.5, 0.005), pct("range", "In Focus Range", 0, 100, 10),
                   pct("falloff", "Falloff", 1, 100, 30), num("radius", "Blur (px)", 0, 100, 12, 0.5),
                   num("fstop", "F-Stop", 0.7, 22, 2.8, 0.1), boolean("near", "Blur Nearer Than Focus", true),
-                  num("blades", "Aperture Blades (0 Round)", 0, 12, 0, 1), angle("blade_rotation", "Blade Rotation", 0),
+                  num("blades", "Aperture Blades (0 Round, 3 to 12)", 0, 12, 0, 1), angle("blade_rotation", "Blade Rotation", 0),
                   num("squeeze", "Anamorphic Squeeze", 1, 2, 1, 0.05), pct("cat_eye", "Cat's Eye Toward the Edges", 0, 100, 0),
                   pct("highlights", "Bokeh Highlights", 0, 100, 0), pct("threshold", "Highlight Threshold", 5, 100, 80),
                   pct("breathing", "Focus Breathing", 0, 100, 0)},

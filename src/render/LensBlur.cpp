@@ -152,7 +152,7 @@ double depthAt(const std::vector<float>& depth, int w, int h, double u, double v
 }
 
 void breathe(Image& img, double scale) {
-    if (img.empty() || std::fabs(scale - 1) < 1e-6 || scale <= 0) return;
+    if (img.empty() || std::fabs(scale - 1) < 1e-4 || scale <= 0) return;
     const Image src = img;
     const int W = img.width, H = img.height;
     const double cx = W / 2.0, cy = H / 2.0;
@@ -225,6 +225,8 @@ void lensBlur(Image& img, const std::vector<float>& depth, const LensBlurSetting
             }
         }
     std::vector<float> acc(N * 4, 0), accA(N, 0);
+    // Pixels wholly in the sharp layer that nothing blurred covers keep their own value (no round trip to light).
+    std::vector<uint8_t> keep(N, 0);
     const double cx = W / 2.0, cy = H / 2.0, corner = std::hypot(cx, cy);
     const Aperture& ap = s.aperture;
     const double sq = std::max(1.0, ap.squeeze);
@@ -242,6 +244,7 @@ void lensBlur(Image& img, const std::vector<float>& depth, const LensBlurSetting
                     const size_t i = size_t(y) * W + x;
                     const float w = weight(i);
                     if (w <= 0) continue;
+                    keep[i] = w >= 1;
                     for (int c = 0; c < 4; ++c) acc[i * 4 + c] = lin[i * 4 + c] * w + acc[i * 4 + c] * (1 - w);
                     accA[i] = w + accA[i] * (1 - w);
                 }
@@ -299,8 +302,11 @@ void lensBlur(Image& img, const std::vector<float>& depth, const LensBlurSetting
                         float w = t.w;
                         if (catEye) w = std::min(w, float(std::clamp(rr - std::hypot(t.kx - ox, (t.ky - oy) / sq) + 0.5, 0.0, 1.0)));
                         if (w <= 0) continue;
-                        norm += w;
                         const int sx = x + t.dx, sy = y + t.dy;
+                        // Taps past the frame's edge don't count (the edge would fade); past only the window's they
+                        // are empty picture and do.
+                        if ((sx < 0 && x0 == 0) || (sx >= lw && x1 == W - 1) || (sy < 0 && y0 == 0) || (sy >= lh && y1 == H - 1)) continue;
+                        norm += w;
                         if (sx < 0 || sy < 0 || sx >= lw || sy >= lh) continue;
                         const size_t j = size_t(sy) * lw + sx;
                         if (la[j] <= 0) continue;
@@ -333,6 +339,7 @@ void lensBlur(Image& img, const std::vector<float>& depth, const LensBlurSetting
                     const float A = std::min(1.0f, at(ba, 0, 1));
                     if (A <= 0) continue;
                     const size_t i = size_t(y) * W + x;
+                    keep[i] = 0;
                     for (int c = 0; c < 4; ++c) acc[i * 4 + c] = at(bc, c, 4) + acc[i * 4 + c] * (1 - A);
                     accA[i] = A + accA[i] * (1 - A);
                 }
@@ -345,7 +352,7 @@ void lensBlur(Image& img, const std::vector<float>& depth, const LensBlurSetting
         for (int y = ya; y < yb; ++y)
             for (int x = 0; x < W; ++x) {
                 const size_t i = size_t(y) * W + x;
-                if (accA[i] <= 1e-4f) continue;
+                if (keep[i] || accA[i] <= 1e-4f) continue;
                 float q[4];
                 for (int c = 0; c < 4; ++c) q[c] = acc[i * 4 + c] / accA[i];
                 lift.apply(q, false);

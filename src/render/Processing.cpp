@@ -1902,13 +1902,12 @@ double depthBlurFocus(const Effect& e, FrameTime t, const std::vector<float>& de
     const int follow = int(std::lround(e.p("follow", t, 0)));
     const double manual = e.p("focus", t, 80) / 100;
     if (follow == 2) {
-        // The nearest face: the largest, at the median depth of the middle of its box.
+        // The nearest face: the median depth of the middle of each face's box, the nearest of them.
         const std::vector<FaceBox>* faces = currentFaces();
-        const FaceBox* best = nullptr;
+        double nearest = -1;
         if (faces)
-            for (const FaceBox& f : *faces)
-                if (!best || f.w * f.h > best->w * best->h) best = &f;
-        return best ? depthAt(depth, W, H, best->x + best->w / 2, best->y + best->h / 2) : manual;
+            for (const FaceBox& f : *faces) nearest = std::max(nearest, depthAt(depth, W, H, f.x + f.w / 2, f.y + f.h / 2));
+        return nearest >= 0 ? nearest : manual;
     }
     if (follow != 1) return manual;
     // A point: the depth there. With keys, a rack: the depths at the keys either side, on this frame, mixed as the
@@ -1979,6 +1978,7 @@ void depthEffect(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     // The radius is the blur at f/2.8; a wider aperture blurs more, in proportion.
     ls.radius = std::max(0.0, e.p("radius", t, 12) * pixelScale) * 2.8 / std::clamp(e.p("fstop", t, 2.8), 0.7, 64.0);
     ls.aperture.blades = int(std::lround(e.p("blades", t, 0)));
+    if (ls.aperture.blades > 0 && ls.aperture.blades < 3) ls.aperture.blades = 3;  // the fewest a polygon has
     ls.aperture.rotation = e.p("blade_rotation", t, 0);
     ls.aperture.squeeze = std::max(1.0, e.p("squeeze", t, 1));
     ls.aperture.catEye = std::clamp(e.p("cat_eye", t, 0) / 100, 0.0, 1.0);
@@ -1988,9 +1988,10 @@ void depthEffect(const Effect& e, FrameTime t, Image& img, double pixelScale) {
     std::unique_ptr<TransferTables> tables;
     if (working.transfer != Transfer::Linear) tables = std::make_unique<TransferTables>(working.transfer);
     lensBlur(img, d, ls, tables.get());
-    // Focus breathing: the picture a little larger focused near than far (up to 4 % between the two).
+    // Focus breathing: the picture a little larger focused near (up to 4 %) and as it is focused farthest, so its
+    // edges are never pulled in.
     const double breathing = std::clamp(e.p("breathing", t, 0) / 100, 0.0, 1.0);
-    if (breathing > 0) breathe(img, 1 + 0.04 * breathing * (ls.focus - 0.5));
+    if (breathing > 0) breathe(img, 1 + 0.04 * breathing * ls.focus);
 }
 
 }  // namespace

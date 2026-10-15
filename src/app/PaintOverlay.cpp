@@ -295,7 +295,7 @@ bool PaintOverlay::eventFilter(QObject* obj, QEvent* e) {
             return true;
         }
         if (t->focus) {
-            pickFocus(*t, u, v);
+            if (u >= 0 && u <= 1 && v >= 0 && v <= 1) pickFocus(*t, u, v);  // (not beside the clip's picture)
             return true;
         }
         if (me->modifiers() & Qt::AltModifier) {

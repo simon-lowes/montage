@@ -2150,6 +2150,27 @@ colorspaces:
         QVERIFY2(across(corner, gx, gy, 1, 1) + 2 <= across(corner, gx, gy, 1, -1),
                  qPrintable(QString("%1 %2 at %3 %4").arg(across(corner, gx, gy, 1, 1)).arg(across(corner, gx, gy, 1, -1)).arg(gx).arg(gy)));
 
+        // A blurred near layer at the frame's edge keeps its colour there (taps past the frame don't thin it into
+        // what is behind).
+        {
+            const int EW = 96, EH = 64;
+            Image edge(EW, EH);
+            std::vector<float> edgeDepth(size_t(EW) * EH);
+            for (int y = 0; y < EH; ++y)
+                for (int x = 0; x < EW; ++x) {
+                    const bool nearSide = x >= EW / 2;
+                    float* q = edge.at(x, y);
+                    q[0] = q[1] = q[2] = nearSide ? 0.8f : 0.2f, q[3] = 1;
+                    edgeDepth[size_t(y) * EW + x] = nearSide ? 1.0f : 0.0f;
+                }
+            LensBlurSettings es;
+            es.focus = 0, es.radius = 8;
+            lensBlur(edge, edgeDepth, es, nullptr);
+            QVERIFY2(std::fabs(edge.at(EW - 1, EH / 2)[0] - 0.8f) < 0.02f && std::fabs(edge.at(EW - 1, 0)[0] - 0.8f) < 0.02f,
+                     qPrintable(QString("%1 %2").arg(edge.at(EW - 1, EH / 2)[0]).arg(edge.at(EW - 1, 0)[0])));
+            QVERIFY(edge.at(5, EH / 2)[0] == 0.2f);  // sharp and untouched: its own value back
+        }
+
         // Where it focuses: its Focus Depth, the depth at its Focus Point, the nearest face's; keys on the point rack
         // in depth (half way through, half way between the two depths, though the point is then on the backdrop).
         Effect lens = makeEffect("depth_blur", 1);
@@ -2194,7 +2215,7 @@ colorspaces:
         fx.params["breathing"] = Param(100.0);
         Image breathed = scene;
         applyVideoEffect(fx, 0, breathed, 1.0);
-        // (1.016 times: the square's right edge, 20 pixels from the centre, moves out by about a third of a pixel)
+        // (1.036 times focused on the square: its right edge, 20 pixels from the centre, moves out about 0.7 pixel)
         QVERIFY(lum(breathed, 100, 50) > lum(viaEffect, 100, 50) + 0.05f);
 
         // Depth Fog thinning with height: at the top of the frame the fog is far thinner than at the bottom.

@@ -2186,7 +2186,7 @@ void McpServer::Impl::addTools() {
             if (type == "object_removal" && (!inpaintAvailable() || !inpaintModel().installed()))
                 return fail("Object Removal needs its model: run `scripts/fetch-models.sh` or add it once in the app");
             if (needsFaces(e) && (!faceSearchAvailable() || !faceModel().installed()))
-                return fail("Face Refinement, Blemish Remover and Redact Faces need the face models: run `scripts/fetch-models.sh` or add them once in the app");
+                return fail("Face Refinement, Blemish Remover, Redact Faces and Lens Blur (Depth) following the nearest face need the face models: run `scripts/fetch-models.sh` or add them once in the app");
             if ((needsPersonMatte(e, 0) || type == "behind_people") && (!mattingAvailable() || !mattingModel().installed()))
                 return fail("Remove Background, Behind People and People masks need their model: run `scripts/fetch-models.sh` or add one once in the app");
             if (needsDepth(e, 0) && (!depthAvailable() || !depthModel().installed()))
