@@ -2061,7 +2061,9 @@ void McpServer::Impl::addTools() {
         "remove_background cuts people out (keep 1 keeps the background instead), and mask.shape 4 limits any effect to "
         "the people in the picture. object_removal paints out whatever its mask covers and fills it in. stabilize and "
         "rolling_shutter (straightening the skew a rolling shutter gives pans; readout as a percentage of a frame) measure "
-        "the camera's movement when added.",
+        "the camera's movement when added; when the clip has camera motion data (a GoPro GPMF track, a CAMM track, a .gcsv log "
+        "beside it) stabilize lines it up and uses it (method 3, Camera Gyro, unless params give another method; horizon "
+        "0-100 levels the horizon from gravity).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
             "params":{"type":"object","additionalProperties":{"type":"number"}},
             "strings":{"type":"object","additionalProperties":{"type":"string"},"description":"Text settings: curves (\"x,y x,y\"), hue curves, a LUT file, the Colour Warper's mesh (\"spoke,ring,hue,sat,luma;...\": spokes 0-11 every 30 degrees from red, rings 1-4 for saturation 25-100 %, hue moved in degrees, saturation in 0-1 units, brightness in stops)..."},
@@ -2213,14 +2215,26 @@ void McpServer::Impl::addTools() {
             }
             if (type == "stabilize" || type == "rolling_shutter") {
                 // They work from the camera's movement, measured now, and move the whole frame (so they go first).
-                std::string motion, err;
-                if (!analyzeClipStabilization(l.project, l.seq(), c, motion, {}, nullptr, &err))
+                std::string motion, err, gyro, gyroNote;
+                const bool steady = type == "stabilize";
+                if (!analyzeClipStabilization(l.project, l.seq(), c, motion, {}, nullptr, &err, steady ? &gyro : nullptr, &gyroNote))
                     return fail(QStringLiteral("Could not measure the camera's movement: %1").arg(QString::fromStdString(err)));
                 e.strings["motion"] = motion;
+                QString note;
+                bool usingGyro = false;
+                if (steady && !gyro.empty()) {
+                    e.strings["gyro"] = gyro;
+                    if (!a.value("params").toObject().contains("method")) e.params["method"] = Param(3);
+                    usingGyro = std::lround(e.p("method", 0, 2)) == 3;
+                    note = usingGyro ? QStringLiteral(" (with the camera's motion data)")
+                                     : QStringLiteral(" (camera motion data found: method 3 uses it)");
+                } else if (steady && !gyroNote.empty() && gyroNote != "The clip has no camera motion data") {
+                    note = QStringLiteral(" (camera motion data not used: %1)").arg(QString::fromStdString(gyroNote));
+                }
                 c.effects.insert(c.effects.begin(), e);
                 save(l);
-                return ok(QStringLiteral("Added %1 to %2").arg(QString::fromStdString(displayName), QString::fromStdString(c.name)),
-                          QJsonObject{{"effect_id", double(e.id)}});
+                return ok(QStringLiteral("Added %1 to %2%3").arg(QString::fromStdString(displayName), QString::fromStdString(c.name), note),
+                          QJsonObject{{"effect_id", double(e.id)}, {"camera_gyro", usingGyro}});
             }
             c.effects.push_back(e);
             save(l);

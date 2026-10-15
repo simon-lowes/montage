@@ -18,6 +18,8 @@
 #include <functional>
 #include <array>
 #include <QImage>
+#include <QMatrix4x4>
+#include <QTextStream>
 #include <QVector3D>
 #include <QDir>
 #include <QFileInfo>
@@ -119,6 +121,7 @@
 #include "render/RoomTone.h"
 #include "audio/Ltc.h"
 #include "media/LtcTimecode.h"
+#include "media/MotionData.h"
 #include "render/VoiceMatch.h"
 #include "media/Segmenter.h"
 #include "media/Translator.h"
@@ -21080,6 +21083,488 @@ if ui["pressed"] == "add":
         const Clip* matched = edit::clipById(*back.active(), thinClip);
         QVERIFY(matched && !matched->effects.empty() && matched->effects[0].s("match") == "voice");
         QVERIFY(std::fabs(matched->effects[0].p("b3_db", 0) + 6) < 2);
+    }
+
+private:
+    // ---- Camera motion data ----------------------------------------------------------------------------------------
+    // A world all round (random cards on a sphere) seen by a camera that shakes, rolled 0.1 rad off level, its
+    // sensor read out over 60 % of a frame; and what its gyro and accelerometer read, in a sensor turned on its side.
+    struct ShakyCamera {
+        QImage world;
+        double fps = 25, focal = 0.6, readout = 0.6, roll0 = 0.1;
+        int width = 320, height = 180, frames = 50;
+        ShakyCamera() : world(1024, 512, QImage::Format_RGB32) {
+            world.fill(QColor(80, 80, 80));
+            QPainter pa(&world);
+            std::mt19937 rng(5);
+            std::uniform_int_distribution<int> x(0, 1010), y(100, 400), sz(6, 30), c(0, 255);
+            for (int i = 0; i < 1400; ++i) pa.fillRect(x(rng), y(rng), sz(rng), sz(rng), QColor(c(rng), c(rng), c(rng)));
+        }
+        // Pitch, yaw and roll (a rotation vector), none but the roll at the start.
+        std::array<double, 3> turn(double t) const {
+            const double w = 2 * M_PI;
+            return {0.05 * std::sin(w * 1.3 * t) + 0.02 * std::sin(w * 3.1 * t), 0.07 * std::sin(w * 0.9 * t) + 0.03 * std::sin(w * 2.7 * t),
+                    roll0 + 0.03 * std::sin(w * 1.7 * t)};
+        }
+        static QMatrix4x4 rotation(const std::array<double, 3>& v) {
+            const double a = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+            QMatrix4x4 m;
+            if (a > 0) m.rotate(float(a * 180 / M_PI), float(v[0] / a), float(v[1] / a), float(v[2] / a));
+            return m;
+        }
+        // The camera's view at time t (each row at its own time when `rolling`), or turned by `fixed` when given.
+        QImage view(double t, bool rolling, const std::array<double, 3>* fixed = nullptr) const {
+            QImage img(width, height, QImage::Format_RGB32);
+            const double f = focal * width;
+            for (int y = 0; y < height; ++y) {
+                const double rt = t + (rolling ? ((y + 0.5) / height - 0.5) * readout / fps : 0);
+                const QMatrix4x4 r = rotation(fixed ? *fixed : turn(rt));
+                auto* line = reinterpret_cast<QRgb*>(img.scanLine(y));
+                for (int x = 0; x < width; ++x) {
+                    const QVector3D d = r.map(QVector3D(float(x + 0.5 - width / 2.0), float(y + 0.5 - height / 2.0), float(f))).normalized();
+                    const double lon = std::atan2(d.x(), d.z()), lat = std::asin(std::clamp(double(d.y()), -1.0, 1.0));
+                    const double u = (lon / (2 * M_PI) + 0.5) * world.width() - 0.5, v = (lat / M_PI + 0.5) * world.height() - 0.5;
+                    const int u0 = int(std::floor(u)), v0 = int(std::floor(v));
+                    const double fu = u - u0, fv = v - v0;
+                    double c[3] = {0, 0, 0};
+                    for (int k = 0; k < 4; ++k) {
+                        const int uu = ((u0 + (k & 1)) % world.width() + world.width()) % world.width();
+                        const int vv = std::clamp(v0 + (k >> 1), 0, world.height() - 1);
+                        const double wgt = ((k & 1) ? fu : 1 - fu) * ((k >> 1) ? fv : 1 - fv);
+                        const QRgb px = world.pixel(uu, vv);
+                        c[0] += qRed(px) * wgt, c[1] += qGreen(px) * wgt, c[2] += qBlue(px) * wgt;
+                    }
+                    line[x] = qRgb(int(c[0] + 0.5), int(c[1] + 0.5), int(c[2] + 0.5));
+                }
+            }
+            return img;
+        }
+        // The turning speed in the camera's axes (x right, y down, z forward), and the push against gravity.
+        std::array<double, 3> spin(double t) const {
+            const double h = 1e-4;
+            const QMatrix4x4 a = rotation(turn(t - h)), b = rotation(turn(t + h));
+            const QMatrix4x4 d = a.transposed() * b;  // (rotations: the transpose is the inverse)
+            return {(d(2, 1) - d(1, 2)) / (4 * h), (d(0, 2) - d(2, 0)) / (4 * h), (d(1, 0) - d(0, 1)) / (4 * h)};
+        }
+        std::array<double, 3> push(double t) const {
+            const QVector3D up = rotation(turn(t)).transposed().map(QVector3D(0, -1, 0));
+            return {9.80665 * up.x(), 9.80665 * up.y(), 9.80665 * up.z()};
+        }
+        // The sensor's channels: (-z, -x, y) of the camera's.
+        static std::array<double, 3> sensor(const std::array<double, 3>& v) { return {-v[2], -v[0], v[1]}; }
+    };
+
+    // Writes the frames as a video, each a still one frame long.
+    void writeFrames(const std::string& file, const std::vector<QImage>& frames, double fps) {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = frames[0].width();
+        s.height = frames[0].height();
+        s.fps = {int(fps), 1};
+        for (size_t i = 0; i < frames.size(); ++i) {
+            const QString png = QString::fromStdString(path(("frame" + std::to_string(i) + ".png").c_str()));
+            frames[i].save(png);
+            MediaItem m = probeOrFail(p, png.toStdString());
+            p.media.push_back(m);
+            Clip c = makeClip(p, m, TrackKind::Video, s);
+            c.start = FrameTime(i);
+            c.duration = 1;
+            edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        }
+        ExportSettings st;
+        st.path = file;
+        st.audioCodec = "none";
+        st.crf = 8;
+        st.preset = "ultrafast";
+        std::string err;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+    }
+
+    // Copies a video's picture into a new file with a data track of the given packets (seconds, bytes), tagged gpmd;
+    // `camm` then renames the tag in the file.
+    void addDataTrack(const std::string& in, const std::string& out, const std::vector<std::pair<double, std::vector<uint8_t>>>& packets,
+                      double packetSeconds, bool camm) {
+        AVFormatContext* src = nullptr;
+        QVERIFY(avformat_open_input(&src, in.c_str(), nullptr, nullptr) >= 0);
+        QVERIFY(avformat_find_stream_info(src, nullptr) >= 0);
+        AVFormatContext* dst = nullptr;
+        QVERIFY(avformat_alloc_output_context2(&dst, nullptr, "mov", out.c_str()) >= 0);
+        AVStream* v = avformat_new_stream(dst, nullptr);
+        avcodec_parameters_copy(v->codecpar, src->streams[0]->codecpar);
+        v->codecpar->codec_tag = 0;
+        v->time_base = src->streams[0]->time_base;
+        AVStream* d = avformat_new_stream(dst, nullptr);
+        d->codecpar->codec_type = AVMEDIA_TYPE_DATA;
+        d->codecpar->codec_id = AV_CODEC_ID_BIN_DATA;
+        d->codecpar->codec_tag = MKTAG('g', 'p', 'm', 'd');
+        d->time_base = {1, 1000000};
+        QVERIFY(avio_open(&dst->pb, out.c_str(), AVIO_FLAG_WRITE) >= 0);
+        QVERIFY2(avformat_write_header(dst, nullptr) >= 0, "the data track was refused");
+        AVPacket* pkt = av_packet_alloc();
+        size_t next = 0;
+        auto flushData = [&](double until) {
+            for (; next < packets.size() && packets[next].first <= until; ++next) {
+                AVPacket* dp = av_packet_alloc();
+                av_new_packet(dp, int(packets[next].second.size()));
+                std::memcpy(dp->data, packets[next].second.data(), packets[next].second.size());
+                dp->stream_index = 1;
+                dp->pts = dp->dts = av_rescale_q(std::llround(packets[next].first * 1e6), {1, 1000000}, d->time_base);
+                dp->duration = av_rescale_q(std::llround(packetSeconds * 1e6), {1, 1000000}, d->time_base);
+                av_interleaved_write_frame(dst, dp);
+                av_packet_free(&dp);
+            }
+        };
+        while (av_read_frame(src, pkt) >= 0) {
+            if (pkt->stream_index == 0) {
+                flushData(double(pkt->dts) * av_q2d(src->streams[0]->time_base));
+                av_packet_rescale_ts(pkt, src->streams[0]->time_base, v->time_base);
+                pkt->stream_index = 0;
+                av_interleaved_write_frame(dst, pkt);
+            }
+            av_packet_unref(pkt);
+        }
+        flushData(1e9);
+        av_packet_free(&pkt);
+        av_write_trailer(dst);
+        avio_closep(&dst->pb);
+        avformat_free_context(dst);
+        avformat_close_input(&src);
+        if (camm) {
+            QFile f(QString::fromStdString(out));
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            QByteArray bytes = f.readAll();
+            QVERIFY(bytes.count("gpmd") >= 1);
+            bytes.replace("gpmd", "camm");
+            f.seek(0);
+            f.write(bytes);
+        }
+    }
+
+private slots:
+    void gyroStabilization() {
+        // The camera's footage, and its .gcsv log (400 readings a second, 37 ms behind the picture).
+        const ShakyCamera cam;
+        std::vector<QImage> frames;
+        for (int i = 0; i < cam.frames; ++i) frames.push_back(cam.view(i / cam.fps, true));
+        const std::string video = path("shaky-gyro.mp4");
+        writeFrames(video, frames, cam.fps);
+        const double lag = 0.037;
+        {
+            QFile log(QString::fromStdString(path("shaky-gyro.gcsv")));
+            QVERIFY(log.open(QIODevice::WriteOnly));
+            QTextStream o(&log);
+            o << "GYROFLOW IMU LOG\nversion,1.1\nid,test_logger\norientation,XYZ\nframe_readout_time," << cam.readout / cam.fps * 1000
+              << "\ntscale,0.001\ngscale,0.0001\nascale,0.000244140625\nt,gx,gy,gz,ax,ay,az\n";
+            for (double tau = 0; tau < cam.frames / cam.fps + 0.5; tau += 1 / 400.0) {
+                const auto g = ShakyCamera::sensor(cam.spin(tau - lag)), a = ShakyCamera::sensor(cam.push(tau - lag));
+                o << QString::number(tau * 1000, 'f', 3) << ',' << std::lround(g[0] / 1e-4) << ',' << std::lround(g[1] / 1e-4) << ','
+                  << std::lround(g[2] / 1e-4) << ',' << std::lround(a[0] / 9.80665 * 4096) << ',' << std::lround(a[1] / 9.80665 * 4096) << ','
+                  << std::lround(a[2] / 9.80665 * 4096) << '\n';
+            }
+        }
+        QVERIFY(hasMotionData(video));
+        MotionData d;
+        std::string err;
+        QVERIFY2(readMotionData(video, d, &err), err.c_str());
+        QCOMPARE(QString::fromStdString(d.source), QStringLiteral(".gcsv log"));
+        QVERIFY(d.hasAccel && std::fabs(d.rate() - 400) < 1 && std::fabs(d.readout - 0.024) < 1e-6);
+        QVERIFY(std::fabs(std::hypot(d.samples[10].accel[0], d.samples[10].accel[1], d.samples[10].accel[2]) - 9.80665) < 0.01);
+
+        // Lined up with the picture's movement: the lag, the sensor's axes and the lens found.
+        CameraMotion cm = analyzeCameraMotion(video, 0, cam.frames / cam.fps, {}, nullptr, &err);
+        GyroSync sync;
+        QVERIFY2(syncMotionData(d, cm, sync, &err), err.c_str());
+        QVERIFY2(std::fabs(sync.offset - lag) < 0.003, std::to_string(sync.offset).c_str());
+        QVERIFY2(sync.axis == (std::array<int, 3>{1, 2, 0}) && sync.sign == (std::array<int, 3>{-1, 1, -1}),
+                 (std::to_string(sync.axis[0]) + std::to_string(sync.axis[1]) + std::to_string(sync.axis[2]) + " " +
+                  std::to_string(sync.sign[0]) + std::to_string(sync.sign[1]) + std::to_string(sync.sign[2]))
+                     .c_str());
+        QVERIFY(sync.score > 0.8);
+        // The lens: roughly from the movement (a mean over the picture overstates it), exactly from points followed.
+        QVERIFY2(std::fabs(sync.focal - cam.focal) < 0.1, std::to_string(sync.focal).c_str());
+        QVERIFY2(refineGyroLens(video, d, sync, cam.fps, 0, (cam.frames - 1) / cam.fps, &err), err.c_str());
+        QVERIFY2(std::fabs(sync.focal - cam.focal) < 0.012, std::to_string(sync.focal).c_str());
+        QCOMPARE(sync.readout, -1.0);  // (the log gives it)
+        // The path kept as text reads back the same (to a microradian a step).
+        const GyroPath path0 = gyroPath(d, sync, cam.fps, 0, (cam.frames - 1) / cam.fps);
+        QCOMPARE(int(path0.samples.size()), 2 * (cam.frames - 1) + 1);
+        GyroPath back;
+        QVERIFY(gyroPathFromString(gyroPathToString(path0), back));
+        QCOMPARE(back.samples.size(), path0.samples.size());
+        for (size_t i = 0; i < back.samples.size(); ++i)
+            for (int k = 0; k < 4; ++k) QVERIFY(std::fabs(back.samples[i].q[size_t(k)] - path0.samples[i].q[size_t(k)]) < 2e-5);
+        QCOMPARE(back.source, std::string(".gcsv log"));
+        QVERIFY(std::fabs(back.readout - 0.024) < 1e-9 && std::fabs(back.focal - sync.focal) < 1e-9);
+
+        // On the timeline: Analyze finds the data and Camera Gyro holds the view (Smoothness 0) where it started,
+        // levelled; each frame against what a still, level camera with a global shutter sees.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = cam.width, s.height = cam.height, s.fps = {25, 1};
+        MediaItem mi = probeOrFail(p, video);
+        p.media.push_back(mi);
+        QVERIFY(edit::placeMedia(p, s, mi.id, 0, 0, cam.frames, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& clip = trackAt(s, {TrackKind::Video, 0})->clips.at(0);
+        std::string motion, gyro, note;
+        QVERIFY2(analyzeClipStabilization(p, s, clip, motion, {}, nullptr, &err, &gyro, &note), err.c_str());
+        QVERIFY2(!gyro.empty(), note.c_str());
+        // The camera was held about level: up (against gravity) points up the picture, -y in the camera's axes.
+        GyroPath gp;
+        QVERIFY(gyroPathFromString(gyro, gp));
+        double upY = 0;
+        for (const GyroPath::Sample& u : gp.samples) upY += u.up[1];
+        upY /= double(gp.samples.size());
+        QVERIFY2(upY < -0.8, std::to_string(upY).c_str());
+        Effect st = makeEffect(p, "stabilize");
+        st.strings["motion"] = motion;
+        st.strings["gyro"] = gyro;
+        st.params["method"] = Param(3.0);
+        st.params["smoothness"] = Param(0.0);
+        st.params["horizon"] = Param(100.0);
+        st.params["framing"] = Param(1.0);
+        clip.effects.push_back(st);
+        // What a still camera with a global shutter sees, through the same rendering.
+        auto still = [&](const std::array<double, 3>& turn, const char* name) {
+            const QString png = QString::fromStdString(path(name));
+            cam.view(0, false, &turn).save(png);
+            Project sp = makeDefaultProject();
+            Sequence& ss = *sp.active();
+            ss.width = cam.width, ss.height = cam.height, ss.fps = {25, 1};
+            MediaItem m = probeOrFail(sp, png.toStdString());
+            sp.media.push_back(m);
+            Clip c = makeClip(sp, m, TrackKind::Video, ss);
+            c.duration = 1;
+            edit::overwrite(sp, ss, {TrackKind::Video, 0}, c);
+            return renderProgramFrame(sp, ss, 0, {});
+        };
+        const Image levelView = still({0, 0, 0}, "level.png"), tiltedView = still({0, 0, cam.roll0}, "tilted.png");
+        auto difference = [&](const Image& a, const Image& ref) {
+            double sum = 0;
+            int n = 0;
+            for (int y = 40; y < 140; ++y)
+                for (int x = 70; x < 250; ++x, ++n) sum += std::fabs(a.at(x, y)[1] - ref.at(x, y)[1]);
+            return sum / n;
+        };
+        auto frameDiff = [&](int f, const Image& ref) { return difference(renderProgramFrame(p, s, f, {}), ref); };
+        const double shaky = [&] {
+            clip.effects.back().enabled = false;
+            const double v = (frameDiff(12, levelView) + frameDiff(31, levelView)) / 2;
+            clip.effects.back().enabled = true;
+            return v;
+        }();
+        const double steady = (frameDiff(12, levelView) + frameDiff(31, levelView)) / 2;
+        QVERIFY2(steady < shaky * 0.25 && steady < 0.03, (std::to_string(shaky) + " " + std::to_string(steady)).c_str());
+        // Without the horizon lock, held as it started (rolled); with the rolling shutter taken as almost none, worse.
+        clip.effects.back().params["horizon"] = Param(0.0);
+        auto across = [&](const Image& ref) {
+            double sum = 0;
+            for (int f = 4; f < cam.frames; f += 5) sum += frameDiff(f, ref);
+            return sum / 10;
+        };
+        const double asShot = across(tiltedView);
+        QVERIFY2(asShot < 0.03 && asShot < frameDiff(31, levelView) * 0.5, std::to_string(asShot).c_str());
+        clip.effects.back().params["rolling_shutter"] = Param(1.0);
+        const double noReadout = across(tiltedView);
+        QVERIFY2(noReadout > asShot * 1.25, (std::to_string(asShot) + " " + std::to_string(noReadout)).c_str());
+        // Zoom to Fill crops just enough to hide every edge.
+        clip.effects.back().params["rolling_shutter"] = Param(0.0);
+        clip.effects.back().params["framing"] = Param(0.0);
+        for (int f : {0, 12, 31, 49}) {
+            const Image img = renderProgramFrame(p, s, f, {});
+            for (int y : {0, cam.height - 1})
+                for (int x : {0, cam.width / 2, cam.width - 1}) QVERIFY2(img.at(x, y)[3] > 0.99, qPrintable(QString("%1 %2 %3").arg(f).arg(x).arg(y)));
+        }
+
+        // Through MCP: adding Stabilize finds the data and uses it.
+        {
+            Project fresh = p;
+            trackAt(*fresh.active(), {TrackKind::Video, 0})->clips.at(0).effects.clear();
+            const QString file = QString::fromStdString(path("gyro.montage"));
+            QVERIFY(saveProject(fresh, file.toStdString()));
+            McpServer server;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_add_effect"},
+                                                         {"arguments", QJsonObject{{"project", file}, {"clip", double(clip.id)}, {"effect", "stabilize"}}},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            const QString said = r.value("content").toArray().at(0).toObject().value("text").toString();
+            QVERIFY2(!r.value("isError").toBool() && said.contains("with the camera's motion data"), qPrintable(said));
+            Project loaded;
+            QVERIFY(loadProject(file.toStdString(), loaded));
+            const Effect& added = trackAt(*loaded.active(), {TrackKind::Video, 0})->clips.at(0).effects.at(0);
+            QVERIFY(added.type == "stabilize" && std::lround(added.p("method", 0)) == 3 && !added.s("gyro").empty());
+        }
+
+        // The same readings in a CAMM track (gyro, acceleration, exposure) and in GoPro's GPMF (a payload a second).
+        std::vector<std::pair<double, std::vector<uint8_t>>> camm;
+        auto put32 = [](std::vector<uint8_t>& b, uint32_t v) {
+            for (int k = 0; k < 4; ++k) b.push_back(uint8_t(v >> (8 * k)));
+        };
+        auto putFloat = [&](std::vector<uint8_t>& b, float f) {
+            uint32_t u;
+            std::memcpy(&u, &f, 4);
+            put32(b, u);
+        };
+        {
+            std::vector<uint8_t> e = {0, 0, 1, 0};
+            put32(e, 10000000);
+            put32(e, uint32_t(cam.readout / cam.fps * 1e9));
+            camm.push_back({0, e});
+        }
+        for (double tau = 0.001; tau < cam.frames / cam.fps + 0.3; tau += 1 / 200.0) {
+            const auto g = ShakyCamera::sensor(cam.spin(tau - lag)), a = ShakyCamera::sensor(cam.push(tau - lag));
+            std::vector<uint8_t> gb = {0, 0, 2, 0}, ab = {0, 0, 3, 0};
+            for (int k = 0; k < 3; ++k) putFloat(gb, float(g[size_t(k)])), putFloat(ab, float(a[size_t(k)]));
+            camm.push_back({tau, gb});
+            camm.push_back({tau + 0.0025, ab});
+        }
+        const std::string cammVideo = path("shaky-camm.mov");
+        addDataTrack(video, cammVideo, camm, 0.0025, true);
+        MotionData dc;
+        QVERIFY2(readMotionData(cammVideo, dc, &err), err.c_str());
+        QCOMPARE(QString::fromStdString(dc.source), QStringLiteral("CAMM"));
+        QVERIFY2(dc.hasAccel && std::fabs(dc.rate() - 200) < 2 && std::fabs(dc.readout - 0.024) < 1e-6, std::to_string(dc.rate()).c_str());
+        GyroSync sc;
+        QVERIFY2(syncMotionData(dc, cm, sc, &err), err.c_str());
+        QVERIFY2(std::fabs(sc.offset - lag) < 0.004 && sc.axis == sync.axis && sc.sign == sync.sign, std::to_string(sc.offset).c_str());
+
+        std::vector<std::pair<double, std::vector<uint8_t>>> gpmf;
+        auto klv = [](const char* key, char type, int size, int repeat, const std::vector<uint8_t>& data) {
+            std::vector<uint8_t> b(key, key + 4);
+            b.push_back(uint8_t(type));
+            b.push_back(uint8_t(size));
+            b.push_back(uint8_t(repeat >> 8));
+            b.push_back(uint8_t(repeat));
+            b.insert(b.end(), data.begin(), data.end());
+            while (b.size() % 4) b.push_back(0);
+            return b;
+        };
+        auto be16 = [](std::vector<uint8_t>& b, int v) {
+            b.push_back(uint8_t(uint16_t(v) >> 8));
+            b.push_back(uint8_t(v));
+        };
+        for (int second = 0; second < 3; ++second) {
+            std::vector<uint8_t> gyroData, accelData;
+            const int n = 200;
+            for (int i = 0; i < n; ++i) {
+                const double tau = second + double(i) / n;
+                const auto g = ShakyCamera::sensor(cam.spin(tau - lag)), a = ShakyCamera::sensor(cam.push(tau - lag));
+                for (int k = 0; k < 3; ++k) be16(gyroData, int(std::lround(g[size_t(k)] * 939))), be16(accelData, int(std::lround(a[size_t(k)] * 418)));
+            }
+            std::vector<uint8_t> gs = klv("SCAL", 's', 2, 1, {0x03, 0xab}), as = klv("SCAL", 's', 2, 1, {0x01, 0xa2});  // 939, 418
+            std::vector<uint8_t> gstrm = gs, astrm = as;
+            const auto gk = klv("GYRO", 's', 6, n, gyroData), ak = klv("ACCL", 's', 6, n, accelData);
+            gstrm.insert(gstrm.end(), gk.begin(), gk.end());
+            astrm.insert(astrm.end(), ak.begin(), ak.end());
+            std::vector<uint8_t> devc = klv("STRM", 0, 1, int(gstrm.size()), gstrm);
+            const auto second2 = klv("STRM", 0, 1, int(astrm.size()), astrm);
+            devc.insert(devc.end(), second2.begin(), second2.end());
+            gpmf.push_back({double(second), klv("DEVC", 0, 1, int(devc.size()), devc)});
+        }
+        const std::string gpmfVideo = path("shaky-gpmf.mp4");
+        addDataTrack(video, gpmfVideo, gpmf, 1.0, false);
+        MotionData dg;
+        QVERIFY2(readMotionData(gpmfVideo, dg, &err), err.c_str());
+        QCOMPARE(QString::fromStdString(dg.source), QStringLiteral("GoPro GPMF"));
+        QVERIFY2(dg.hasAccel && std::fabs(dg.rate() - 200) < 2 && int(dg.samples.size()) == 600, std::to_string(dg.samples.size()).c_str());
+        QVERIFY(std::fabs(dg.samples[0].gyro[1] - float(ShakyCamera::sensor(cam.spin(-lag))[1])) < 0.002);
+        GyroSync sg;
+        QVERIFY2(syncMotionData(dg, cm, sg, &err), err.c_str());
+        QVERIFY2(std::fabs(sg.offset - lag) < 0.004 && sg.axis == sync.axis && sg.sign == sync.sign, std::to_string(sg.offset).c_str());
+        // GPMF says nothing of the readout: the lens is measured as for a global shutter, close enough.
+        QVERIFY2(refineGyroLens(gpmfVideo, dg, sg, cam.fps, 0, (cam.frames - 1) / cam.fps, &err), err.c_str());
+        QVERIFY2(std::fabs(sg.focal - cam.focal) < 0.02 && sg.readout < 0, qPrintable(QString("%1 %2").arg(sg.focal).arg(sg.readout)));
+
+        // A clip without any, or with another clip's: none taken.
+        QVERIFY(!hasMotionData(path("frame0.png")));
+        std::mt19937 rng(3);
+        std::normal_distribution<float> noise(0, 0.3f);
+        for (ImuSample& r : d.samples) r.gyro = {noise(rng), noise(rng), noise(rng)};
+        GyroSync wrong;
+        QVERIFY(!syncMotionData(d, cm, wrong, &err));
+    }
+
+    void goproGyro() {
+        // GoPro's sample clips (github.com/gopro/gpmf-parser): HERO5 Black, which leaves the picture as shot;
+        // HERO8 Black stabilises its picture itself, so its gyro does not match the picture's movement.
+        const QString dir = qEnvironmentVariable("MONTAGE_GOPRO_SAMPLES");
+        if (dir.isEmpty() || !QFile::exists(dir + "/hero5.mp4")) QSKIP("Set MONTAGE_GOPRO_SAMPLES to a folder holding GoPro's hero5.mp4 to run this");
+        const std::string hero5 = (dir + "/hero5.mp4").toStdString();
+        MotionData d;
+        std::string err;
+        QVERIFY2(readMotionData(hero5, d, &err), err.c_str());
+        QCOMPARE(QString::fromStdString(d.source), QStringLiteral("GoPro GPMF"));
+        QVERIFY2(std::fabs(d.rate() - 400) < 10 && d.samples.back().t > 33, std::to_string(d.rate()).c_str());
+        double g = 0;
+        for (const ImuSample& s : d.samples) g += std::hypot(s.accel[0], s.accel[1], s.accel[2]);
+        QVERIFY(std::fabs(g / double(d.samples.size()) - 9.8) < 0.5);
+        const double seconds = 8;
+        CameraMotion cm = analyzeCameraMotion(hero5, 0, seconds, {}, nullptr, &err);
+        GyroSync sync;
+        QVERIFY2(syncMotionData(d, cm, sync, &err), err.c_str());
+        QVERIFY2(sync.score > 0.85 && std::fabs(sync.offset) < 0.05 && sync.focal > 0.35 && sync.focal < 0.7,
+                 qPrintable(QString("%1 %2 %3").arg(sync.score).arg(sync.offset).arg(sync.focal)));
+        // Stabilised (1.5 s), the picture's shake is mostly gone: its frame-to-frame turn, less the smooth part.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 854, s.height = 480, s.fps = {24000, 1001};
+        MediaItem mi = probeOrFail(p, hero5);
+        p.media.push_back(mi);
+        const int frames = int(seconds * 24000 / 1001);
+        QVERIFY(edit::placeMedia(p, s, mi.id, 0, 0, frames, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& clip = trackAt(s, {TrackKind::Video, 0})->clips.at(0);
+        std::string motion, gyro, note;
+        QVERIFY2(analyzeClipStabilization(p, s, clip, motion, {}, nullptr, &err, &gyro, &note), err.c_str());
+        QVERIFY2(!gyro.empty(), note.c_str());
+        // Held about level: up (against gravity) points up the picture, -y in the camera's axes.
+        GyroPath gp;
+        QVERIFY(gyroPathFromString(gyro, gp));
+        double upY = 0;
+        for (const GyroPath::Sample& u : gp.samples) upY += u.up[1];
+        upY /= double(gp.samples.size());
+        QVERIFY2(upY < -0.8, std::to_string(upY).c_str());
+        Effect st = makeEffect(p, "stabilize");
+        st.strings["motion"] = motion;
+        st.strings["gyro"] = gyro;
+        st.params["method"] = Param(3.0);
+        clip.effects.push_back(st);
+        const std::string out = path("hero5-stabilised.mp4");
+        ExportSettings es;
+        es.path = out;
+        es.audioCodec = "none";
+        es.crf = 16;
+        es.preset = "ultrafast";
+        QVERIFY2(exportSequence(p, s, es, nullptr, nullptr, &err), err.c_str());
+        auto shake = [&](const std::string& file) {
+            const CameraMotion m = analyzeCameraMotion(file, 0.5, seconds - 0.5, {}, nullptr, &err);
+            // The jitter: each step less the mean of its neighbours (what smoothing would keep).
+            double sum = 0;
+            for (size_t i = 2; i + 2 < m.steps.size(); ++i) {
+                const double mx = (m.steps[i - 2].tx + m.steps[i - 1].tx + m.steps[i + 1].tx + m.steps[i + 2].tx) / 4;
+                const double my = (m.steps[i - 2].ty + m.steps[i - 1].ty + m.steps[i + 1].ty + m.steps[i + 2].ty) / 4;
+                sum += std::hypot(m.steps[i].tx - mx, m.steps[i].ty - my);
+            }
+            return sum / double(m.steps.size());
+        };
+        const double before = shake(hero5), after = shake(out);
+        qInfo("HERO5 shake: %.5f -> %.5f of the width a frame", before, after);
+        QVERIFY2(after < before * 0.5, qPrintable(QString("%1 -> %2").arg(before).arg(after)));
+        // Taken for 360° footage, it is refused (its picture is not a flat lens's).
+        p.media.back().projection = "equirect";
+        QVERIFY(analyzeClipStabilization(p, s, clip, motion, {}, nullptr, &err, &gyro, &note));
+        QVERIFY(gyro.empty() && QString::fromStdString(note).contains("360"));
+        // HERO8's picture is already steadied in the camera: the data is found but not used.
+        const std::string hero8 = (dir + "/hero8.mp4").toStdString();
+        if (QFile::exists(QString::fromStdString(hero8))) {
+            MotionData d8;
+            QVERIFY(readMotionData(hero8, d8, &err));
+            CameraMotion m8 = analyzeCameraMotion(hero8, 0, 8, {}, nullptr, &err);
+            GyroSync s8;
+            QVERIFY(!syncMotionData(d8, m8, s8, &err));
+            QVERIFY(QString::fromStdString(err).contains("stabilised the picture itself"));
+        }
     }
 
     void ltcTimecode() {

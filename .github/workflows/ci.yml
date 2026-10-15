@@ -47,6 +47,17 @@ jobs:
               || { rm -f "$f"; echo "::warning::Could not download the speech model; transcription tests will be skipped"; }
           fi
           [ -s "$f" ] && echo "MONTAGE_TEST_WHISPER_MODEL=$f" >> "$GITHUB_ENV" || true
+      - name: GoPro's sample clips for the gyro stabilisation test
+        run: |
+          d="$HOME/gopro-samples"
+          mkdir -p "$d"
+          for f in hero5.mp4:04e45b2f41dff195b525fa18b7ed5517e5fc2d651127d1b57d1d931de306f915 hero8.mp4:0e068f543ebf59bccb4228e7b5950a4f681753d2bbbf1c838ae60336bc75c1bd; do
+            name="${f%%:*}"
+            curl -fsSL --retry 3 -o "$d/$name" "https://raw.githubusercontent.com/gopro/gpmf-parser/main/samples/$name" \
+              && [ "$(sha256sum "$d/$name" | cut -d' ' -f1)" = "${f#*:}" ] \
+              || { rm -f "$d/$name"; echo "::warning::Could not download GoPro's $name; its part of the gyro test will be skipped"; }
+          done
+          [ -s "$d/hero5.mp4" ] && echo "MONTAGE_GOPRO_SAMPLES=$d" >> "$GITHUB_ENV" || true
       - name: Cache the AI models
         uses: actions/cache@v4
         with:

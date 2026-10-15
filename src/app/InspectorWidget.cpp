@@ -7,6 +7,7 @@
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QComboBox>
+#include <QStandardItemModel>
 #include <QInputDialog>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -41,6 +42,7 @@
 #include "ModelPacks.h"
 #include "media/DepthMap.h"
 #include "media/Matting.h"
+#include "media/MotionData.h"
 #include "media/Rife.h"
 #include "PluginEditorWindow.h"
 #include "Theme.h"
@@ -824,9 +826,29 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             auto* rh = new QHBoxLayout(row);
             rh->setContentsMargins(0, 0, 0, 0);
             auto* status = new QLabel(row);
+            status->setObjectName(QStringLiteral("stabilizeStatus"));
+            status->setWordWrap(true);
             CameraMotion cm;
             status->setText(cameraMotionFromString(e.s("motion"), cm) ? tr("Analysed: %n frame(s)", "", int(cm.steps.size()))
                                                                       : tr("Not analysed yet"));
+            if (e.type == "stabilize") {
+                // Camera Gyro is offered once the analysis has found the camera's motion data and lined it up.
+                std::string source;
+                double focal = 0;
+                const bool gyro = gyroPathSummary(e.s("gyro"), source, focal);
+                if (gyro)
+                    status->setText(status->text() + tr("; camera motion data: %1, %2° lens")
+                                                         .arg(QString::fromStdString(source))
+                                                         .arg(2 * std::atan(0.5 / focal) * 180 / M_PI, 0, 'f', 0));
+                if (QWidget* section = f->parentWidget())
+                    if (auto* method = section->findChild<QComboBox*>(QStringLiteral("choice_method")))
+                        if (auto* model = qobject_cast<QStandardItemModel*>(method->model()))
+                            if (QStandardItem* item = model->item(3)) {
+                                item->setEnabled(gyro);
+                                item->setToolTip(gyro ? tr("Turn each frame by the camera's own motion data")
+                                                      : tr("Analyze a clip with camera motion data (a GoPro GPMF or CAMM track, or a .gcsv log beside it) first"));
+                            }
+            }
             auto* analyze = new QPushButton(tr("Analyze"), row);
             analyze->setObjectName(QStringLiteral("analyzeStabilize"));
             analyze->setToolTip(tr("Measure the camera's movement in this clip"));
@@ -1805,6 +1827,7 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
         }
         case ParamKind::Choice: {
             auto* combo = new QComboBox(row);
+            combo->setObjectName(QStringLiteral("choice_") + QString::fromStdString(name));
             for (const auto& c : pi.choices) combo->addItem(tr(c.c_str()));
             h->addWidget(combo, 1);
             connect(combo, &QComboBox::activated, this, [write, name](int idx) { write({{name, double(idx)}}); });
@@ -2441,19 +2464,35 @@ void InspectorWidget::analyzeStabilize(Id clip, Id effect) {
     // The analysis reads a copy: editing can go on meanwhile.
     auto project = std::make_shared<const Project>(state_->project());
     const Id seqId = s->id;
-    std::string motion;
+    std::string motion, gyro, gyroNote;
     const bool ok = runAnalysis(tr("Analysing camera movement..."), [&, project, seqId, clip](const auto& progress, const auto* cancel, std::string* err) {
         const Sequence* sq = project->findSequence(seqId);
         const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
-        return cl && analyzeClipStabilization(*project, *sq, *cl, motion, progress, cancel, err);
+        return cl && analyzeClipStabilization(*project, *sq, *cl, motion, progress, cancel, err, &gyro, &gyroNote);
     });
     if (!ok) return;
-    state_->edit(tr("Analyze Stabilization"), [clip, effect, motion](Project&, Sequence& sq) {
+    // Motion data found switches Stabilize to Camera Gyro (once: a method picked afterwards stays).
+    bool usingGyro = false;
+    state_->edit(tr("Analyze Stabilization"), [clip, effect, motion, gyro, &usingGyro](Project&, Sequence& sq) {
         Effect* e = edit::ownedEffect(sq, clip, effect);
         if (!e) return false;
         e->strings["motion"] = motion;
+        if (e->type == "stabilize") {
+            const bool had = !e->s("gyro").empty();
+            if (gyro.empty()) {
+                e->strings.erase("gyro");
+                if (std::lround(e->p("method", 0, 2)) == 3) e->params["method"] = Param(2);
+            } else {
+                e->strings["gyro"] = gyro;
+                if (!had) e->params["method"] = Param(3);
+                usingGyro = std::lround(e->p("method", 0, 2)) == 3;
+            }
+        }
         return true;
     });
+    if (usingGyro) state_->message(tr("Stabilizing with the camera's motion data"), 5000);
+    else if (!gyroNote.empty() && gyroNote != "The clip has no camera motion data")
+        state_->message(tr("Camera motion data not used: %1").arg(QString::fromStdString(gyroNote)), 8000);
 }
 
 void InspectorWidget::solveCameraTrack(Id clip, Id effect) {
