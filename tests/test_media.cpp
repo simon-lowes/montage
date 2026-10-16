@@ -12288,6 +12288,7 @@ if ui["pressed"] == "add":
     }
 
     void lipSyncDubbing() {
+        std::string err;
         // What a video frame hears, cut as MuseTalk cuts it: ten encoding frames from two video frames' worth before
         // it (encoding frame j filled with j + 1 here), silence before the start and past the end.
         const size_t fs = size_t(kLipSyncLayers) * kLipSyncWidth;
@@ -12308,6 +12309,61 @@ if ui["pressed"] == "add":
         const std::vector<float> late = lipSyncWindow(20, 25, feature);
         QCOMPARE(late[3 * fs], 40.0f);
         QCOMPARE(late[4 * fs], 0.0f);
+
+        int64_t first = -1, last = -1;
+        lipSyncSegments(0, 25, first, last);
+        QVERIFY(first == 0 && last == 0);
+        lipSyncSegments(748, 25, first, last);  // (encoding frames 1492..1501: both stretches)
+        QVERIFY(first == 0 && last == 1);
+        lipSyncSegments(800, 25, first, last);
+        QVERIFY(first == 1 && last == 1);
+
+        // What it hears: each clip of the track over its own span (a dub is a clip a line), from where it is trimmed,
+        // the track named heard even muted, and every track that is not muted when none is.
+        {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            MediaItem words = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/jfk.wav");
+            p.media.push_back(words);
+            QVERIFY(edit::placeMedia(p, s, words.id, 0, 30, 55, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false, false, true).ok);
+            QVERIFY(edit::placeMedia(p, s, words.id, 50, 100, 125, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false, false, true).ok);
+            QCOMPARE(s.audioTracks[1].clips.size(), size_t(2));
+            const double fps = s.fpsValue();
+            AudioBufferPtr ref = decodeAudio(MONTAGE_TEST_DATA_DIR "/jfk.wav", kLipSyncRate, &err);
+            QVERIFY(ref);
+            auto refAt = [&](double frame) {
+                const size_t i = size_t(std::floor(frame * kLipSyncRate / fps));
+                return 0.5f * (ref->samples[i * 2] + ref->samples[i * 2 + 1]);
+            };
+            const int n = int(std::lround(100 / fps * kLipSyncRate));
+            auto check = [&](const std::vector<float>& heard, bool audible) {
+                QCOMPARE(int(heard.size()), n);
+                double gap = 0, lines = 0, missed = 0;
+                for (int i = 0; i < n; ++i) {
+                    const double f = i * fps / kLipSyncRate;
+                    // (not the samples right at a clip's edge)
+                    static const double edges[] = {25, 50, 75};
+                    if (std::any_of(std::begin(edges), std::end(edges), [&](double edge) { return std::fabs(f - edge) < 2 * fps / kLipSyncRate; }))
+                        continue;
+                    if ((f >= 25 && f < 50) || f >= 75) gap += std::fabs(heard[size_t(i)]);
+                    else {
+                        const float want = audible ? refAt(f < 25 ? 30 + f : 100 + f - 50) : 0.0f;
+                        lines += std::fabs(want), missed += std::fabs(heard[size_t(i)] - want);
+                    }
+                }
+                QCOMPARE(gap, 0.0);
+                QVERIFY2(missed <= 0.02 * std::max(1.0, lines), qPrintable(QString("%1 of %2").arg(missed).arg(lines)));
+                if (audible) QVERIFY(lines > 1);
+            };
+            check(trackSoundFrom(p, s, 2, 0, n, kLipSyncRate), true);
+            check(trackSoundFrom(p, s, 0, 0, n, kLipSyncRate), true);
+            s.audioTracks[1].muted = true;
+            check(trackSoundFrom(p, s, 2, 0, n, kLipSyncRate), true);
+            check(trackSoundFrom(p, s, 0, 0, n, kLipSyncRate), false);
+            QCOMPARE(lipSyncTrack(s, std::to_string(s.audioTracks[1].id)), 2);
+            QCOMPARE(lipSyncTrack(s, ""), 0);
+            QCOMPARE(lipSyncTrack(s, "999999"), -1);
+        }
 
         // The crop and the mask from a face's mesh: an oval face 80 x 100 about (100, 100), the bridge of its nose at
         // y 90. The crop runs across the jaw, from as far above the bridge as the chin is below it to a little under the
@@ -12387,7 +12443,6 @@ if ui["pressed"] == "add":
         if (!lipSyncModel().installed() || !faceModel().installed() || !faceMeshModel().installed())
             QSKIP("Set MONTAGE_LIPSYNC_MODEL to the lip sync model and MONTAGE_FACE_MODEL to the face models (with the face mesh)");
         VideoDecoder dec;
-        std::string err;
         Frame16Ptr frame;
         if (dec.open(MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg", &err)) frame = dec.frameAt(0);
         QVERIFY2(frame, err.c_str());
@@ -12428,12 +12483,15 @@ if ui["pressed"] == "add":
         QVERIFY(closed >= 0);
         double widest = 0;
         Image spoken;
+        QElapsedTimer drawing;
+        drawing.start();
         for (int64_t index = 15; index <= 240; index += 15) {
             Image said = jfk;
             QVERIFY2(lipSyncFace(said, mesh, windowOf(speech, index), 1.0, &err), err.c_str());
             if (const double o = opening(said); o > widest) widest = o, spoken = said;
         }
-        qInfo("Lips apart: %.3f of the face hearing silence, %.3f at most through the speech", closed, widest);
+        qInfo("Lips apart: %.3f of the face hearing silence, %.3f at most through the speech; %.2f s a frame (with the mesh)", closed,
+              widest, drawing.elapsed() / 16000.0);
         QVERIFY2(widest > closed + 0.02, qPrintable(QString("shut %1, widest %2").arg(closed).arg(widest)));
         // Only the face below the nose changes; the eyes and everything round the face stay as they were.
         const LipSyncBox box = lipSyncBox(mesh, jfk.width, jfk.height);

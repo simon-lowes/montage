@@ -597,14 +597,19 @@ const Effect* denoiseEffect(const Sequence& seq, const Clip& c) {
     return enabledEffect(seq, c, "video_denoise");
 }
 
-// Lip Sync's sound: what the chosen audio track (every track, when none is) plays, from the clip's start, at 16 kHz.
-// Whisper's encoding of it 30 s at a time, kept by the sound's content for the few stretches last used.
-std::shared_ptr<const std::vector<float>> lipSyncFeatures(const Project& p, const Sequence& seq, const Clip& c, int track, int64_t segment,
-                                                          bool run, std::string* error) {
-    const double fps = seq.fpsValue();
-    const std::vector<float> sound =
-        trackSoundAt(p, seq, track, double(c.start) + (double(segment) * 30 + 15) * fps, kLipSyncSegment, kLipSyncRate);
-    const uint64_t key = std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(sound.data()), sound.size() * sizeof(float)));
+// Lip Sync's sound: what its track (every track not muted, when none is named) plays over 30 s stretch `segment` from the
+// clip's start, at 16 kHz, each clip over its own span.
+std::vector<float> lipSyncSound(const Project& p, const Sequence& seq, const Clip& c, int track, int64_t segment) {
+    const double from = double(c.start) + double(segment) * kLipSyncSegment / kLipSyncRate * seq.fpsValue();
+    return trackSoundFrom(p, seq, track, from, kLipSyncSegment, kLipSyncRate);
+}
+
+uint64_t soundHash(const std::vector<float>& sound) {
+    return std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(sound.data()), sound.size() * sizeof(float)));
+}
+
+// Whisper's encoding of a stretch of sound, kept by its content for the few stretches last used.
+std::shared_ptr<const std::vector<float>> lipSyncFeatures(const std::vector<float>& sound, uint64_t key, std::string* error) {
     static std::mutex m;
     static std::deque<std::pair<uint64_t, std::shared_ptr<const std::vector<float>>>> cache;
     {
@@ -612,7 +617,6 @@ std::shared_ptr<const std::vector<float>> lipSyncFeatures(const Project& p, cons
         for (const auto& [k, f] : cache)
             if (k == key) return f;
     }
-    if (!run) return nullptr;
     auto features = std::make_shared<std::vector<float>>();
     if (!lipSyncEncodeSound(sound, *features, error)) return nullptr;
     std::lock_guard lock(m);
@@ -622,25 +626,33 @@ std::shared_ptr<const std::vector<float>> lipSyncFeatures(const Project& p, cons
 }
 
 // Lip Sync on a clip's source picture (media/LipSync.h): the largest face's mouth drawn again to speak the chosen
-// track's sound. Like Motion Deblur it takes about a second a frame, so it runs in deliveries and previews rendered
-// ahead, and other views take a result already made (by the picture and the sound around the frame) or go without.
+// track's sound. Like Motion Deblur it takes seconds a frame, so it runs in deliveries and previews rendered
+// ahead, and other views take a result already made (by the picture, the sound its window draws on, the frame and the
+// amount) or go without.
 void applyLipSync(const Project& p, const Sequence& seq, const Clip& c, const Effect& e, FrameTime lt, const RenderOptions& o, Image& src) {
     const double amount = std::clamp(e.p("amount", lt, 100) / 100, 0.0, 1.0);
     if (src.empty() || amount <= 0) return;
+    const int track = lipSyncTrack(seq, e.s("track"));
+    if (track < 0) return;  // (its track deleted: nothing to speak)
     if (!lipSyncAvailable() || !lipSyncModel().installed() || !faceModel().installed() || !faceMeshModel().installed()) {
         if (o.issues && o.highQuality) o.issues->note("Lip Sync needs its models: add the effect once in the app or run scripts/fetch-models.sh --lipsync");
         return;
     }
-    int track = 0;  // (every audio track)
-    if (const std::string id = e.s("track"); !id.empty())
-        for (size_t i = 0; i < seq.audioTracks.size(); ++i)
-            if (std::to_string(seq.audioTracks[i].id) == id) track = int(i) + 1;
     const double fps = std::max(1.0, seq.fpsValue());
     const bool run = o.highQuality || o.slowEffects;
-    // The result, by the picture, the sound about the frame (what its window hears, and more) and the amount.
-    const std::vector<float> near = trackSoundAt(p, seq, track, double(c.start + lt), kLipSyncRate / 2, kLipSyncRate);
+    // The stretches of sound the frame's window draws on (whisper hears each whole).
+    int64_t first = 0, last = 0;
+    lipSyncSegments(lt, fps, first, last);
+    std::map<int64_t, std::pair<std::vector<float>, uint64_t>> sounds;
     uint64_t key = std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(src.px.data()), src.px.size() * sizeof(float)));
-    key = key * 1000003u ^ std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(near.data()), near.size() * sizeof(float)));
+    for (int64_t s = first; s <= last; ++s) {
+        std::vector<float> sound = lipSyncSound(p, seq, c, track, s);
+        const uint64_t h = soundHash(sound);
+        key = key * 1000003u ^ h;
+        sounds.emplace(s, std::make_pair(std::move(sound), h));
+    }
+    key = key * 1000003u ^ std::hash<int64_t>{}(lt);
+    key = key * 1000003u ^ std::hash<double>{}(fps);
     key = key * 1000003u ^ std::hash<double>{}(amount) ^ (uint64_t(src.width) << 32 | uint64_t(src.height));
     static std::mutex m;
     static std::deque<std::pair<uint64_t, std::shared_ptr<const Image>>> cache;
@@ -662,38 +674,35 @@ void applyLipSync(const Project& p, const Sequence& seq, const Clip& c, const Ef
     std::lock_guard one(running);
     if (find()) return;
     std::string why;
-    // The ten encoding frames the frame hears, from the 30 s stretches they are in.
     std::map<int64_t, std::shared_ptr<const std::vector<float>>> segments;
-    bool heard = true;
-    const std::vector<float> window = lipSyncWindow(lt, fps, [&](int64_t j) -> const float* {
-        const int64_t perSegment = kLipSyncSegment / kLipSyncRate * kLipSyncFeatureRate;
-        const int64_t s = j / perSegment;
-        auto it = segments.find(s);
-        if (it == segments.end()) it = segments.emplace(s, lipSyncFeatures(p, seq, c, track, s, true, &why)).first;
-        if (!it->second) {
-            heard = false;
-            return nullptr;
+    for (const auto& [s, sound] : sounds) {
+        std::shared_ptr<const std::vector<float>> f = lipSyncFeatures(sound.first, sound.second, &why);
+        if (!f) {
+            if (o.issues) o.issues->note(why.empty() ? std::string("Lip Sync could not hear the sound") : why);
+            return;
         }
-        return it->second->data() + size_t(j - s * perSegment) * kLipSyncLayers * kLipSyncWidth;
-    });
-    if (!heard) {
-        if (o.issues) o.issues->note(why.empty() ? std::string("Lip Sync could not hear the sound") : why);
-        return;
+        segments.emplace(s, std::move(f));
     }
+    const int64_t perSegment = int64_t(kLipSyncSegment) / kLipSyncRate * kLipSyncFeatureRate;
+    const std::vector<float> window = lipSyncWindow(lt, fps, [&](int64_t j) -> const float* {
+        const auto it = segments.find(j / perSegment);
+        return it == segments.end() ? nullptr : it->second->data() + size_t(j % perSegment) * kLipSyncLayers * kLipSyncWidth;
+    });
+    if (o.cancel && o.cancel->load()) return;
     Image out = src;
     std::shared_ptr<const std::vector<FaceBox>> faces = cachedFaces(src);
     if (faces && !faces->empty())
         if (std::shared_ptr<const std::vector<FaceMesh>> meshes = cachedFaceMeshes(src, *faces)) {
-            // The largest face (the one speaking, as a rule).
+            // The largest face (the one speaking, as a rule); one too small to draw counts as none.
             const FaceMesh* best = nullptr;
             int64_t bestArea = 0;
             for (const FaceMesh& f : *meshes) {
                 const LipSyncBox b = lipSyncBox(f, src.width, src.height);
                 const int64_t area = int64_t(b.x1 - b.x0) * (b.y1 - b.y0);
-                if (!b.empty() && area > bestArea) best = &f, bestArea = area;
+                if (b.x1 - b.x0 >= 8 && b.y1 - b.y0 >= 8 && area > bestArea) best = &f, bestArea = area;
             }
             if (best && !lipSyncFace(out, *best, window, amount, &why, o.cancel)) {
-                if (o.issues) o.issues->note(why);
+                if (o.issues && !(o.cancel && o.cancel->load())) o.issues->note(why);
                 return;
             }
         }

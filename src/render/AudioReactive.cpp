@@ -40,6 +40,40 @@ std::vector<float> trackSoundAt(const Project& p, const Sequence& seq, int track
     return out;
 }
 
+std::vector<float> trackSoundFrom(const Project& p, const Sequence& seq, int track, double from, int samples, int rate) {
+    std::vector<float> out(size_t(std::max(0, samples)), 0.0f);
+    const double fps = seq.fpsValue(), perSample = fps / rate;
+    const double to = from + samples * perSample;
+    for (size_t k = 0; k < seq.audioTracks.size(); ++k) {
+        if (track > 0 && int(k) != track - 1) continue;
+        const Track& tr = seq.audioTracks[k];
+        if (track == 0 && tr.muted) continue;
+        for (const Clip& c : tr.clips) {
+            if (!c.enabled || !c.mediaId || double(c.end()) <= from || double(c.start) >= to) continue;
+            const MediaItem* m = p.findMedia(c.mediaId);
+            if (!m || !m->hasAudio || m->path.empty()) continue;
+            AudioBufferPtr buf = MediaPool::instance().audio(audioKey(m->path, c.channels), rate);
+            if (!buf || buf->samples.empty()) continue;
+            const int64_t n = buf->frames();
+            const int i0 = std::max(0, int(std::ceil((double(c.start) - from) / perSample)));
+            const int i1 = std::min(samples, int(std::ceil((double(c.end()) - from) / perSample)));
+            // (where the source is, a frame at a time, in between linearly: a speed ramp integrates its keys)
+            double frame = -1, at0 = 0, at1 = 0;
+            for (int i = i0; i < i1; ++i) {
+                const double local = from + i * perSample - double(c.start);
+                if (std::floor(local) != frame) {
+                    frame = std::floor(local);
+                    at0 = c.sourceAt(frame), at1 = c.sourceAt(frame + 1);
+                }
+                const int64_t s = int64_t(std::floor((at0 + (at1 - at0) * (local - frame)) * rate / fps));
+                if (s < 0 || s >= n) continue;
+                out[size_t(i)] += 0.5f * (buf->samples[size_t(s) * 2] + buf->samples[size_t(s) * 2 + 1]);
+            }
+        }
+    }
+    return out;
+}
+
 std::vector<float> spectrum(const std::vector<float>& x) {
     const size_t n = x.size();
     if (n < 2 || (n & (n - 1))) return {};

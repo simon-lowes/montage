@@ -3,7 +3,7 @@
 // crop of the face in one pass of a UNet over the crop's latents (sd-vae-ft-mse's, MIT), guided by whisper-tiny's
 // encoding of the sound around the frame (Apache-2.0). The graphs are src/media/lipsync-*.onnx
 // (scripts/gen-lipsync-graphs.py), their weights read from the three authors' files where they lie. The face's crop and
-// the region blended back come from its mesh (media/FaceMesh.h). A frame takes about a second on a processor, so the
+// the region blended back come from its mesh (media/FaceMesh.h). A frame takes about 4 s on four cores, so the
 // effect is shown once rendered (Render In to Out) and in deliveries.
 #pragma once
 
@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "FaceMesh.h"
+#include "core/Model.h"
 #include "Image.h"
 #include "ModelFiles.h"
 
@@ -39,6 +40,14 @@ bool lipSyncEncodeSound(const std::vector<float>& segment, std::vector<float>& f
 // kLipSyncWidth). `feature(j)` gives encoding frame j (kLipSyncLayers x kLipSyncWidth), or nullptr for silence (before
 // the start).
 std::vector<float> lipSyncWindow(int64_t index, double fps, const std::function<const float*(int64_t)>& feature);
+
+// The 30 s stretches of sound (counted from the sound's start, each kLipSyncSegment samples) that video frame `index`'s
+// window draws on: first..last.
+void lipSyncSegments(int64_t index, double fps, int64_t& first, int64_t& last);
+
+// The audio track a Lip Sync's Sound From (a track id, "" for every track) names in `seq`: 1-based, 0 for every track,
+// -1 for a track no longer there.
+int lipSyncTrack(const Sequence& seq, const std::string& id);
 
 // The box MuseTalk crops a face to (pixels, x1 and y1 exclusive), from its mesh: across the jaw, from as far above the
 // nose's bridge as the chin is below it down to a little under the chin.

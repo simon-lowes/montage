@@ -221,7 +221,7 @@ std::string audioTrackId(const QString& ref, const Sequence& s) {
     for (const Track& t : s.audioTracks)
         if (QString::fromStdString(t.name).compare(ref.trimmed(), Qt::CaseInsensitive) == 0) return std::to_string(t.id);
     const TrackRef r = trackArg(ref, s, false);
-    if (r.kind != TrackKind::Audio) throw ArgError{QStringLiteral("A sidechain is an audio track (A1, A2... or its name)")};
+    if (r.kind != TrackKind::Audio) throw ArgError{QStringLiteral("That setting names an audio track (A1, A2... or its name)")};
     return std::to_string(s.audioTracks[size_t(r.index)].id);
 }
 
@@ -2129,7 +2129,7 @@ void McpServer::Impl::addTools() {
         "as fractions of the frame's width and height, radius a fraction of its width, softness 0-1). "
         "lip_sync redraws the largest face's mouth and jaw to speak an audio track's sound (strings.track, e.g. \"A2\"; "
         "every track when empty), as a dub needs (MuseTalk; amount mixes it); it needs consent: true (the person shown has "
-        "agreed) and its models (scripts/fetch-models.sh --lipsync), and runs in exports and renders (about a second a frame).",
+        "agreed) and its models (scripts/fetch-models.sh --lipsync), and runs in exports and renders (about 4 s a frame on four cores).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
             "consent":{"type":"boolean","description":"lip_sync: the person shown has agreed to it"},
             "params":{"type":"object","additionalProperties":{"type":"number"}},

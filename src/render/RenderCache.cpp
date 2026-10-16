@@ -92,20 +92,30 @@ bool addFrame(QCryptographicHash& h, const Project& p, const Sequence& seq, Fram
 void addClipAt(QCryptographicHash& h, const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
                int depth) {
     addClip(h, seq, c);
-    // Lip Sync's picture follows the sound its track plays under the clip (whisper hears it 30 s at a time).
+    // Lip Sync's picture follows the sound its track plays over the 30 s stretches (from the clip's start) its window
+    // draws on: each clip there, where it is against the clip, and which tracks are heard.
     for (const Effect* e : liveEffects(seq, c))
         if (e->type == "lip_sync" && e->enabled) {
             h.addData(lipSyncModel().installed() ? "lipsync:1" : "lipsync:0");
-            const std::string track = e->s("track");
-            for (const Track& at : seq.audioTracks) {
-                if (!track.empty() && std::to_string(at.id) != track) continue;
+            const int track = lipSyncTrack(seq, e->s("track"));
+            h.addData(QByteArray::number(track));
+            if (track < 0) continue;
+            int64_t first = 0, last = 0;
+            lipSyncSegments(t - c.start, std::max(1.0, seq.fpsValue()), first, last);
+            const double span = double(kLipSyncSegment) / kLipSyncRate * seq.fpsValue();
+            const double from = double(c.start) + double(first) * span, to = double(c.start) + double(last + 1) * span;
+            h.addData(QByteArray::number(first) + ':' + QByteArray::number(last));
+            for (size_t k = 0; k < seq.audioTracks.size(); ++k) {
+                const Track& at = seq.audioTracks[k];
+                if ((track > 0 && int(k) != track - 1) || (track == 0 && at.muted)) continue;
+                h.addData("|track" + QByteArray::number(qint64(k)));
                 for (const Clip& a : at.clips) {
-                    if (a.end() <= c.start || a.start >= c.end()) continue;
-                    Clip k = a;
-                    k.id = 0;
-                    k.linkGroup = 0;
-                    k.start -= c.start;
-                    h.addData(QByteArray::fromStdString(clipToJsonString(k)));
+                    if (double(a.end()) <= from || double(a.start) >= to) continue;
+                    Clip k2 = a;
+                    k2.id = 0;
+                    k2.linkGroup = 0;
+                    k2.start -= c.start;
+                    h.addData(QByteArray::fromStdString(clipToJsonString(k2)));
                     if (const MediaItem* m = a.mediaId ? p.findMedia(a.mediaId) : nullptr) addMedia(h, *m, o);
                 }
             }

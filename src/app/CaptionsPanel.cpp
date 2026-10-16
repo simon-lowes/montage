@@ -634,7 +634,7 @@ void CaptionsPanel::dubDialog() {
     const bool cloning = voice->currentData().toString() == QLatin1String("clone");
     const bool lipSync = lips->isChecked();
     if ((cloning || lipSync) && !consent->isChecked()) return;
-    if (lipSync && !ensureEffectModel(window(), "lip_sync")) return;
+    if (lipSync && !ensureLipSyncModels(window())) return;
     const std::string to = cloning ? language->currentData().toString().toStdString() : "en";
     for (const ModelPack* pack : from == to ? std::vector<const ModelPack*>{} : translationRoute(from, to))
         if (!ensureModelPack(window(), *pack, tr("Dub"),

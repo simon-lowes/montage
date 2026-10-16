@@ -1,3 +1,6 @@
+// The sound window (lipSyncWindow, from musetalk/utils/audio_processor.py get_whisper_chunk), the face's crop and the
+// blend's feather are ported from MuseTalk 1.5, Copyright (c) 2024 Tencent Music Entertainment Group, MIT
+// (LICENSES/MIT-MuseTalk.txt).
 #include "LipSync.h"
 
 #include <QFile>
@@ -58,6 +61,21 @@ std::vector<float> lipSyncWindow(int64_t index, double fps, const std::function<
         if (const int64_t j = first + k; j >= 0)
             if (const float* f = feature(j)) std::copy(f, f + frameSize, out.begin() + ptrdiff_t(size_t(k) * frameSize));
     return out;
+}
+
+void lipSyncSegments(int64_t index, double fps, int64_t& first, int64_t& last) {
+    const double perFrame = kLipSyncFeatureRate / std::max(1.0, fps);
+    const int64_t start = std::max<int64_t>(0, int64_t(std::floor(double(index) * perFrame)) - 2 * int64_t(std::ceil(perFrame)));
+    const int64_t perSegment = int64_t(kLipSyncSegment) / kLipSyncRate * kLipSyncFeatureRate;
+    first = start / perSegment;
+    last = (start + kLipSyncTokens / kLipSyncLayers - 1) / perSegment;
+}
+
+int lipSyncTrack(const Sequence& seq, const std::string& id) {
+    if (id.empty()) return 0;
+    for (size_t i = 0; i < seq.audioTracks.size(); ++i)
+        if (std::to_string(seq.audioTracks[i].id) == id) return int(i) + 1;
+    return -1;
 }
 
 namespace {

@@ -53,5 +53,8 @@ bool ensureVoiceCloneModel(QWidget* parent);
 // True when effects of `type` can run: no model needed, or theirs is ready
 // (asking and downloading if needed, e.g. Enhance Speech).
 bool ensureEffectModel(QWidget* parent, const std::string& type);
+// Lip Sync's models (faces, face mesh, MuseTalk), each downloaded if missing after asking; the caller has the consent of
+// the person shown (ensureEffectModel("lip_sync") asks for it first).
+bool ensureLipSyncModels(QWidget* parent);
 
 }  // namespace montage

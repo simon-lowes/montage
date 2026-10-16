@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-# The networks' structure is transcribed from MuseTalk 1.5 (Tencent Music Entertainment; MIT: musetalk/models/unet.py,
-# musetalk/utils/audio_processor.py and musetalk/models/vae.py at TMElyralab/MuseTalk), which runs diffusers'
-# UNet2DConditionModel and AutoencoderKL (Apache-2.0) and the encoder of OpenAI's Whisper through transformers'
-# WhisperModel (Apache-2.0; the feature extractor's log-mel spectrogram included); rewritten as ONNX graph construction
-# for Montage.
+# The networks' structure is transcribed from MuseTalk 1.5 (musetalk/models/unet.py, musetalk/utils/audio_processor.py
+# and musetalk/models/vae.py at TMElyralab/MuseTalk 2bcb936), Copyright (c) 2024 Tencent Music Entertainment Group,
+# MIT (LICENSES/MIT-MuseTalk.txt); from the models it runs: diffusers' UNet2DConditionModel and AutoencoderKL and
+# transformers' WhisperModel and WhisperFeatureExtractor, Copyright The HuggingFace Team, licensed under the Apache
+# License, Version 2.0 (LICENSES/Apache-2.0.txt), the encoder being OpenAI's Whisper, Copyright (c) 2022 OpenAI, MIT
+# (LICENSES/MIT-whisper.txt); and librosa.filters.mel, Copyright (c) 2013--2026 librosa development team, ISC
+# (LICENSES/ISC-librosa.txt). Modified: rewritten as ONNX graph construction for Montage.
 """Generates the lip-sync networks (media/LipSync) as ONNX graphs without their weights. Each weight is external data
 naming its bytes inside its authors' own file, which Montage downloads, so the weights come only from them:
 
