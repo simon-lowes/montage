@@ -58,6 +58,7 @@
 #include "media/Proxy.h"
 #include "media/Relink.h"
 #include "media/DepthMap.h"
+#include "SkyReplace.h"
 #include "media/Matting.h"
 #include "media/Faces.h"
 #include "media/MotionDeblur.h"
@@ -1353,37 +1354,53 @@ void applyTrackMatte(Image& layer, const Image& matte, bool luma, bool reverse) 
     });
 }
 
+// A clip's Sky Replacement taking its sky from a track (as compositing finds it), or null.
+const Effect* skyTrackEffect(const Sequence& seq, const Clip& c, FrameTime t) {
+    const Effect* e = enabledEffect(seq, c, "sky_replace");
+    return e && std::lround(e->p("source", t - c.start, 0)) == 0 ? e : nullptr;
+}
+
 }  // namespace
 
 std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t) {
     std::vector<bool> hidden(seq.videoTracks.size(), false);
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti)
-        if (const Clip* c = clipAt(seq.videoTracks[ti], t))
+        if (const Clip* c = clipAt(seq.videoTracks[ti], t)) {
             if (const Effect* e = trackMatteOf(*c); e && e->p("hide", t - c->start, 1) > 0.5)
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
+            if (const Effect* e = skyTrackEffect(seq, *c, t); e && e->p("hide", t - c->start, 1) > 0.5)
+                if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
+        }
     return hidden;
 }
 
 namespace {
 
 // A transition's picture at t (from to `to` on its track), on the CPU.
+// (`finish`, when given, does what compositing does to each clip's layer at the time it shows: Sky Replacement)
 Image transitionLayer(const Project& p, const Sequence& seq, const Track& track, const Transition& tr, FrameTime from, FrameTime to,
-                      FrameTime t, const RenderOptions& o, const Image* below, int W, int H) {
+                      FrameTime t, const RenderOptions& o, const Image* below, int W, int H,
+                      const std::function<void(const Clip&, FrameTime, Image&)>& finish = {}) {
     const Clip* A = findClip(track, tr.clipA);
     const Clip* B = findClip(track, tr.clipB);
     const double u = (double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from));
+    auto layerOf = [&](const Clip& c, FrameTime at) {
+        Image l = clipLayer(p, seq, c, at, o, below);
+        if (finish) finish(c, at, l);
+        return l;
+    };
     if (tr.type == "smooth_cut" && A && A->enabled && B && B->enabled) {
         // The first frame of the transition morphs into its last along their optical flow
         // (the pair is the same throughout, so its flow is measured once).
-        Image la = clipLayer(p, seq, *A, from, o, below), lb = clipLayer(p, seq, *B, to - 1, o, below);
+        Image la = layerOf(*A, from), lb = layerOf(*B, to - 1);
         if (la.width == W && la.height == H && lb.width == W && lb.height == H)
             return interpolateFrames(la, lb, u,
                                      "smooth#" + std::to_string(tr.id) + '@' + std::to_string(from) + '-' + std::to_string(to) + '#' +
                                          std::to_string(W) + 'x' + std::to_string(H) + (o.eye ? "#R" : ""));
         return transitionMix("cross_dissolve", tr.params, la, lb, u, W, H);
     }
-    Image la = (A && A->enabled) ? clipLayer(p, seq, *A, t, o, below) : Image();
-    Image lb = (B && B->enabled) ? clipLayer(p, seq, *B, t, o, below) : Image();
+    Image la = (A && A->enabled) ? layerOf(*A, t) : Image();
+    Image lb = (B && B->enabled) ? layerOf(*B, t) : Image();
     return transitionMix(tr.type, tr.params, la, lb, u, W, H);
 }
 
@@ -1397,6 +1414,28 @@ const Transition* activeTransition(const Track& track, FrameTime t, FrameTime& f
         }
     }
     return nullptr;
+}
+
+// What track `m` shows at t (a transition's mix while one runs), on the CPU.
+Image trackPicture(const Project& p, const Sequence& seq, size_t m, FrameTime t, const RenderOptions& o, int W, int H) {
+    const Track& track = seq.videoTracks[m];
+    FrameTime from = 0, to = 0;
+    if (const Transition* tr = activeTransition(track, t, from, to)) return transitionLayer(p, seq, track, *tr, from, to, t, o, nullptr, W, H);
+    if (const Clip* c = clipAt(track, t)) return clipLayer(p, seq, *c, t, o, nullptr);
+    return {};
+}
+
+// Sky Replacement on clip `c` (on track `ti`) at t: the sky found in its layer and another put in its place
+// (render/SkyReplace.h).
+void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c, FrameTime t, const RenderOptions& o, Image& layer, int W,
+                int H) {
+    const Effect* sr = enabledEffect(seq, c, "sky_replace");
+    if (!sr || layer.empty()) return;
+    const FrameTime lt = t - c.start;
+    Image sky;
+    if (std::lround(sr->p("source", lt, 0)) == 0)
+        if (const int m = matteTrack(seq, ti, c, *sr, t); m >= 0) sky = trackPicture(p, seq, size_t(m), t, o, W, H);
+    applySkyReplacement(seq, c, *sr, lt, layer, &sky, o.scale, c.sourceFrameAt(t) / seq.fpsValue());
 }
 
 }  // namespace
@@ -1435,7 +1474,8 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
             const Clip* A = findClip(track, active->clipA);
             const Clip* B = findClip(track, active->clipB);
             const Clip* top = B ? B : A;
-            composite(transitionLayer(p, seq, track, *active, from, to, t, o, canvasEmpty ? nullptr : &canvas, W, H),
+            composite(transitionLayer(p, seq, track, *active, from, to, t, o, canvasEmpty ? nullptr : &canvas, W, H,
+                                      [&](const Clip& c, FrameTime at, Image& l) { replaceSky(p, seq, ti, c, at, o, l, W, H); }),
                       top ? top->blendMode : "normal");
             continue;
         }
@@ -1450,6 +1490,7 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
                     applyTrackMatte(layer, matte, e->p("composite", lt, 0) > 0.5, e->p("reverse", lt, 0) > 0.5);
                 }
             }
+            replaceSky(p, seq, ti, *c, t, o, layer, W, H);
             // Behind People: the layer goes behind whoever is in the picture beneath it.
             if (const Effect* bp = enabledEffect(seq, *c, "behind_people"); bp && !layer.empty() && !canvasEmpty && mattingAvailable() &&
                                                                         mattingModel().installed())
@@ -1802,6 +1843,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
                 if (c->isGenerator() && c->generator.type == "adjustment") return fallback("an adjustment layer");
                 if (trackMatteOf(*c)) return fallback("a track matte");
                 if (enabledEffect(seq, *c, "behind_people")) return fallback("Behind People");
+                if (enabledEffect(seq, *c, "sky_replace")) return fallback("Sky Replacement");
             }
     }
     auto layerOf = [&](const Clip& c, gpu::Layer& l) {

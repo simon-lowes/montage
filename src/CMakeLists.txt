@@ -202,6 +202,7 @@ add_library(montage_engine STATIC
   render/VideoPacking.h render/VideoPacking.cpp
   render/ReferenceOutput.h render/ReferenceOutput.cpp render/NdiOutput.cpp render/DeckLinkOutput.cpp
   render/RemoteReview.h render/RemoteReview.cpp
+  render/SkyReplace.h render/SkyReplace.cpp
   render/MonitorCalibration.h render/MonitorCalibration.cpp
   audio/Plugins.h audio/PluginScan.cpp audio/ClapHost.cpp
   audio/DynLib.h audio/DynLib.cpp

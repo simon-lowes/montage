@@ -352,6 +352,21 @@ std::vector<EffectInfo> buildCatalog() {
                   choice("composite", "Composite Using", {"Matte Alpha", "Matte Luma"}, 0), boolean("reverse", "Reverse"),
                   boolean("hide", "Hide the Matte", true)},
                  {}});
+    // The sky found, keyed and replaced by another track's picture or a gradient (handled when tracks are composited,
+    // render/SkyReplace.h). Its strings["motion"] holds the camera motion an analysis measured, to move the sky with.
+    c.push_back({"sky_replace", "Sky Replacement", EffectCategory::VideoFilter, "Keying",
+                 {choice("source", "Sky", {"Track", "Gradient"}, 0), num("track", "Sky Track (V number, 0: the one above)", 0, 99, 0, 1),
+                  boolean("hide", "Hide the Sky Track", true), color("zenith", "Gradient Top", 0.16, 0.36, 0.72),
+                  color("horizon", "Gradient Horizon", 0.72, 0.82, 0.92), pct("sensitivity", "Sensitivity", 0, 100, 50),
+                  pct("lowest", "Lowest Sky (% of height)", 5, 100, 80), boolean("use_depth", "Use Depth", true),
+                  pct("refine", "Refine Edges", 0, 100, 70), num("shift", "Edge Shift (px)", -20, 20, 0, 0.5),
+                  num("soften", "Soften (px)", 0, 40, 1, 0.5),
+                  choice("follow", "Follow Camera", {"Off", "Analysed Camera Motion", "3D Camera Track"}, 1),
+                  pct("follow_amount", "Follow Amount", 0, 200, 100), num("sky_exposure", "Sky Exposure (stops)", -4, 4, 0),
+                  num("sky_blur", "Sky Defocus (px)", 0, 50, 0, 0.5), pct("match", "Match Foreground", 0, 100, 30),
+                  pct("wrap", "Light Wrap", 0, 100, 20), num("wrap_width", "Light Wrap Width (px)", 1, 100, 20, 0.5),
+                  choice("view", "View", {"Composite", "Sky Matte"}, 0)},
+                 {}});
     c.push_back({"luma_key", "Luma Key", EffectCategory::VideoFilter, "Keying",
                  {num("threshold", "Threshold", 0, 1, 0.1), num("softness", "Softness", 0, 1, 0.05),
                   boolean("invert", "Key Out Brights")},

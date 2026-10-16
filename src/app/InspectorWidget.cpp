@@ -852,7 +852,7 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
         else if (e.type == "color_slice") addColorSlice(f, *info, target(eid));
         else addParamRows(f, *info, target(eid));
         const bool onClip = state_->sequence() && edit::clipById(*state_->sequence(), owner);
-        if ((e.type == "stabilize" || e.type == "rolling_shutter") && onClip) {
+        if ((e.type == "stabilize" || e.type == "rolling_shutter" || e.type == "sky_replace") && onClip) {
             // The analysis lives in the effect; it is redone on demand.
             auto* row = new QWidget(content_);
             auto* rh = new QHBoxLayout(row);
@@ -883,13 +883,38 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
             }
             auto* analyze = new QPushButton(tr("Analyze"), row);
             analyze->setObjectName(QStringLiteral("analyzeStabilize"));
-            analyze->setToolTip(tr("Measure the camera's movement in this clip"));
+            analyze->setToolTip(e.type == "sky_replace" ? tr("Measure the camera's movement in this clip, for the new sky to follow")
+                                                        : tr("Measure the camera's movement in this clip"));
             rh->addWidget(status, 1);
             rh->addWidget(analyze);
             f->addRow(QString(), row);
             // Deferred: the analysis waits in an event loop, and the Inspector may rebuild meanwhile.
             connect(analyze, &QPushButton::clicked, this,
                     [this, owner, eid] { QTimer::singleShot(0, this, [this, owner, eid] { analyzeStabilize(owner, eid); }); });
+            if (e.type == "sky_replace" && depthAvailable() && !depthModel().installed()) {
+                // It finds the sky without depth; with it, pale walls and water reaching the sky stay out of it.
+                auto* depth = new QPushButton(tr("Find the Sky Better with Depth…"), content_);
+                depth->setObjectName(QStringLiteral("skyDepthModel"));
+                depth->setToolTip(tr("Get the depth model, so near things that look like sky (a pale wall, water) are kept"));
+                f->addRow(QString(), depth);
+                connect(depth, &QPushButton::clicked, this, [this, owner, eid] {
+                    if (!ensureEffectModel(window(), "depth_map")) return;
+                    // Use Depth turned on if it was off; the picture drawn again either way.
+                    const Clip* c = state_->sequence() ? edit::clipById(*state_->sequence(), owner) : nullptr;
+                    const Effect* now = nullptr;
+                    for (size_t i = 0; c && i < c->effects.size(); ++i)
+                        if (c->effects[i].id == eid) now = &c->effects[i];
+                    auto turnOn = [owner, eid](Project&, Sequence& sq) {
+                        Effect* e = edit::ownedEffect(sq, owner, eid);
+                        if (!e) return false;
+                        if (e->p("use_depth", 0, 1) <= 0.5) e->params["use_depth"] = Param(1.0);
+                        return true;
+                    };
+                    if (now && now->p("use_depth", 0, 1) <= 0.5) state_->edit(tr("Use Depth"), turnOn);
+                    else state_->amend(turnOn);
+                    state_->message(tr("Sky Replacement now uses depth"), 4000);
+                });
+            }
         }
         if (e.type == "depth_blur" && onClip) {
             // Click to focus on the Program monitor (app/PaintOverlay); with Focus Point keyed, each click keys it.
@@ -1574,6 +1599,12 @@ void InspectorWidget::addEffectMenu(TrackKind kind, Id owner, int node) {
             });
             if ((type == "stabilize" || type == "rolling_shutter") && added && state_->sequence() && edit::clipById(*state_->sequence(), owner))
                 QTimer::singleShot(0, this, [this, owner, added] { analyzeStabilize(owner, added); });
+            // Sky Replacement on footage: the camera's movement measured now, for the new sky to follow.
+            if (type == "sky_replace" && added && state_->sequence())
+                if (const Clip* c = edit::clipById(*state_->sequence(), owner))
+                    if (const MediaItem* m = c->mediaId ? state_->project().findMedia(c->mediaId) : nullptr;
+                        m && m->kind == MediaKind::Video && m->hasVideo)
+                        QTimer::singleShot(0, this, [this, owner, added] { analyzeStabilize(owner, added); });
             if (type == "lens_correction" && added && state_->sequence() && edit::clipById(*state_->sequence(), owner))
                 QTimer::singleShot(0, this, [this, owner] { correctLens(window(), state_, owner); });
         });
@@ -2685,15 +2716,20 @@ void InspectorWidget::analyzeStabilize(Id clip, Id effect) {
     auto project = std::make_shared<const Project>(state_->project());
     const Id seqId = s->id;
     std::string motion, gyro, gyroNote;
+    // (camera motion data is for Stabilize only)
+    bool steadies = false;
+    for (const Effect& e : c->effects)
+        if (e.id == effect) steadies = e.type == "stabilize";
     const bool ok = runAnalysis(tr("Analysing camera movement..."), [&, project, seqId, clip](const auto& progress, const auto* cancel, std::string* err) {
         const Sequence* sq = project->findSequence(seqId);
         const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
-        return cl && analyzeClipStabilization(*project, *sq, *cl, motion, progress, cancel, err, &gyro, &gyroNote);
+        return cl && analyzeClipStabilization(*project, *sq, *cl, motion, progress, cancel, err, steadies ? &gyro : nullptr,
+                                              steadies ? &gyroNote : nullptr);
     });
     if (!ok) return;
     // Motion data found switches Stabilize to Camera Gyro (once: a method picked afterwards stays).
     bool usingGyro = false;
-    state_->edit(tr("Analyze Stabilization"), [clip, effect, motion, gyro, &usingGyro](Project&, Sequence& sq) {
+    state_->edit(steadies ? tr("Analyze Stabilization") : tr("Analyze Camera Motion"), [clip, effect, motion, gyro, &usingGyro](Project&, Sequence& sq) {
         Effect* e = edit::ownedEffect(sq, clip, effect);
         if (!e) return false;
         e->strings["motion"] = motion;

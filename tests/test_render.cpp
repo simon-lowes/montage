@@ -81,6 +81,8 @@
 #include "render/VideoPacking.h"
 #include "render/ReferenceOutput.h"
 #include "render/MonitorCalibration.h"
+#include "render/SkyReplace.h"
+#include "media/CameraSolve.h"
 #include "audio/DynLib.h"
 #include <random>
 #include "render/Restoration.h"
@@ -6700,6 +6702,265 @@ colorspaces:
         QVERIFY(!dl->open(d, standardModes()[0], Signal{}, 2, 48000, &why));
         QVERIFY(!why.empty());
         QCOMPARE(dl->receivers(), -1);
+    }
+
+    void skyReplacement() {
+        // A rendered scene with a known sky: a blue gradient over rolling hills of textured ground, a tree whose thin
+        // branches cross the sky (closing a gap of sky between them), a soft white cloud and a small dark bird.
+        const int W = 320, H = 180;
+        Image scene(W, H);
+        std::vector<uint8_t> isSky(size_t(W) * H, 0);
+        auto hill = [](int x) { return 112 + 14 * std::sin(x / 23.0); };
+        auto onBranch = [](int x, int y) {
+            // The trunk, and branches as 2-pixel lines from its top.
+            if (x >= 56 && x < 64 && y >= 50) return true;
+            const double ends[4][2] = {{20, 18}, {45, 8}, {95, 12}, {118, 34}};
+            for (const auto& e : ends) {
+                const double ax = 60, ay = 52, dx = e[0] - ax, dy = e[1] - ay, len2 = dx * dx + dy * dy;
+                const double u = std::clamp(((x + 0.5 - ax) * dx + (y + 0.5 - ay) * dy) / len2, 0.0, 1.0);
+                if (std::hypot(x + 0.5 - (ax + u * dx), y + 0.5 - (ay + u * dy)) < 1.1) return true;
+            }
+            // A cross branch closing a pocket of sky between two others.
+            return y == 30 && x >= 36 && x <= 84;
+        };
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = scene.at(x, y);
+                p[3] = 1;
+                if (y >= hill(x)) {  // ground: green-brown, textured
+                    const float n = 0.12f * float(std::sin(x * 1.7 + y * 2.3) * std::cos(x * 0.9 - y * 1.3));
+                    p[0] = 0.25f + n, p[1] = 0.38f + n, p[2] = 0.15f + n * 0.5f;
+                } else if (onBranch(x, y)) {
+                    p[0] = 0.18f, p[1] = 0.12f, p[2] = 0.08f;
+                } else if (x >= 150 && x < 154 && y >= 28 && y < 31) {  // the bird
+                    p[0] = p[1] = p[2] = 0.05f;
+                } else {
+                    const float v = float(y) / 120;
+                    p[0] = 0.30f + 0.35f * v, p[1] = 0.50f + 0.28f * v, p[2] = 0.85f + 0.08f * v;
+                    // The cloud: soft white.
+                    const double d = std::hypot((x - 225) / 28.0, (y - 40) / 12.0);
+                    const float c = float(std::clamp(1.4 - d, 0.0, 1.0));
+                    for (int k = 0; k < 3; ++k) p[k] += (0.97f - p[k]) * c;
+                    isSky[size_t(y) * W + x] = 1;
+                }
+            }
+        // Pixels at least `r` from any of the other kind: the sure answer.
+        auto sure = [&](int x, int y, int r) {
+            const uint8_t s = isSky[size_t(y) * W + x];
+            for (int dy = -r; dy <= r; ++dy)
+                for (int dx = -r; dx <= r; ++dx) {
+                    const int nx = std::clamp(x + dx, 0, W - 1), ny = std::clamp(y + dy, 0, H - 1);
+                    if (isSky[size_t(ny) * W + nx] != s) return false;
+                }
+            return true;
+        };
+        std::vector<float> m = skyMatte(scene, nullptr, 0.5, 0.8, 0.7);
+        QCOMPARE(int(m.size()), W * H);
+        int wrongSky = 0, wrongGround = 0, sureSky = 0, sureGround = 0;
+        double inter = 0, uni = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const float v = m[size_t(y) * W + x];
+                const bool s = isSky[size_t(y) * W + x];
+                inter += s ? v : 0;
+                uni += s ? 1 : v;
+                if (!sure(x, y, 3)) continue;
+                if (s) ++sureSky, wrongSky += v < 0.9f;
+                else ++sureGround, wrongGround += v > 0.1f;
+            }
+        QVERIFY2(wrongSky < sureSky / 100 && wrongGround < sureGround / 100,
+                 qPrintable(QString("%1/%2 %3/%4").arg(wrongSky).arg(sureSky).arg(wrongGround).arg(sureGround)));
+        QVERIFY2(inter / uni > 0.93, qPrintable(QString::number(inter / uni)));
+        // The pocket of sky shut in by branches, the cloud's middle; not the bird, the trunk or the branches.
+        QVERIFY2(m[size_t(26) * W + 60] > 0.8f, qPrintable(QString::number(m[size_t(26) * W + 60])));
+        QVERIFY2(m[size_t(40) * W + 225] > 0.9f, qPrintable(QString::number(m[size_t(40) * W + 225])));
+        QVERIFY2(m[size_t(29) * W + 151] < 0.5f, qPrintable(QString::number(m[size_t(29) * W + 151])));
+        QVERIFY(m[size_t(80) * W + 60] < 0.1f);
+        QVERIFY2(m[size_t(30) * W + 60] < 0.5f, qPrintable(QString::number(m[size_t(30) * W + 60])));
+        // Lowest Sky keeps it above that line; nothing found in a picture of the ground alone.
+        const std::vector<float> high = skyMatte(scene, nullptr, 0.5, 0.3, 0.7);
+        for (int x = 0; x < W; x += 7) QVERIFY(high[size_t(80) * W + x] < 0.05f);
+        Image ground = scene;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const float n = 0.12f * float(std::sin(x * 1.7 + y * 2.3) * std::cos(x * 0.9 - y * 1.3));
+                float* q = ground.at(x, y);
+                q[0] = 0.25f + n, q[1] = 0.38f + n, q[2] = 0.15f + n * 0.5f;
+            }
+        for (float v : skyMatte(ground, nullptr, 0.5, 0.8, 0.7)) QVERIFY(v < 0.01f);
+        // Depth: a pale smooth building reaching the top of the frame looks like sky, until its depth says it is near.
+        Image town = scene;
+        DepthMap depth;
+        depth.width = W, depth.height = H;
+        depth.values.assign(size_t(W) * H, 0.f);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                if (!isSky[size_t(y) * W + x]) depth.values[size_t(y) * W + x] = 0.4f + 0.5f * float(y) / H;
+                if (x >= 280 && y < 120) {
+                    float* p = town.at(x, y);
+                    p[0] = 0.62f, p[1] = 0.74f, p[2] = 0.9f;
+                    depth.values[size_t(y) * W + x] = 0.6f;
+                }
+            }
+        QVERIFY(skyMatte(town, nullptr, 0.5, 0.8, 0.7)[size_t(60) * W + 300] > 0.5f);
+        const std::vector<float> withDepth = skyMatte(town, &depth, 0.5, 0.8, 0.7);
+        QVERIFY2(withDepth[size_t(60) * W + 300] < 0.1f, qPrintable(QString::number(withDepth[size_t(60) * W + 300])));
+        QVERIFY(withDepth[size_t(60) * W + 200] > 0.9f);
+
+        // Composited: a red sky in, the ground untouched without matching or wrap, the bird kept.
+        const Image red = solid(W, H, 0.9f, 0.2f, 0.1f);
+        Image plain = scene;
+        composeSky(plain, red, m, 0, 0, 0);
+        float c[4];
+        rgb(plain, 200, 15, c);
+        QVERIFY(near(c[0], 0.9f) && near(c[1], 0.2f) && near(c[2], 0.1f));
+        QVERIFY(std::equal(plain.at(0, 170), plain.at(0, 170) + 4, scene.at(0, 170)));
+        rgb(plain, 151, 29, c);
+        QVERIFY(c[0] < 0.4f);
+        // Matched: the ground warms toward the red sky; wrapped: more so at the horizon than deep in the ground.
+        Image matched = scene;
+        composeSky(matched, red, m, 1, 0, 0);
+        const float* g0 = scene.at(200, 170);
+        const float* g1 = matched.at(200, 170);
+        QVERIFY2(g1[0] / g0[0] > 1.2f && g1[2] / g0[2] < 0.8f, qPrintable(QString("%1 %2").arg(g1[0] / g0[0]).arg(g1[2] / g0[2])));
+        Image wrapped = scene;
+        composeSky(wrapped, red, m, 0, 1, 12);
+        const int edge = int(std::ceil(hill(200))) + 2;
+        const float lift = wrapped.at(200, edge)[0] - scene.at(200, edge)[0], deep = wrapped.at(200, 175)[0] - scene.at(200, 175)[0];
+        QVERIFY2(lift > 0.1f && deep < 0.01f, qPrintable(QString("%1 %2").arg(lift).arg(deep)));
+
+        // A gradient sky from the top to the sky's lowest row.
+        const float top[3] = {0.1f, 0.2f, 0.6f}, low[3] = {0.8f, 0.7f, 0.6f};
+        const double horizon = skyHorizonRow(m, W, H);
+        QVERIFY2(horizon > 98 && horizon < 128, qPrintable(QString::number(horizon)));
+        const Image grad = skyGradient(W, H, top, low, horizon);
+        QVERIFY(near(grad.at(5, 0)[2], 0.6f, 0.01f) && near(grad.at(5, H - 1)[0], 0.8f));
+        // Moved: a sky warped 10 px right and the edge carried on.
+        Homography shift;
+        shift.h[2] = 10;
+        const Image moved = warpSky(grad, shift);
+        Image stripes(W, H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) stripes.at(x, y)[0] = float(x % 40) / 40, stripes.at(x, y)[3] = 1;
+        const Image movedStripes = warpSky(stripes, shift);
+        QVERIFY(near(movedStripes.at(50, 10)[0], stripes.at(40, 10)[0], 1e-4f));
+        QVERIFY(near(movedStripes.at(3, 10)[0], stripes.at(7, 10)[0], 1e-4f));  // (mirrored past the edge)
+        QVERIFY(near(moved.at(100, 50)[1], grad.at(100, 50)[1], 1e-4f));
+
+        // Following the camera: the analysed motion (a pan of 1% of the width a frame) moves the sky with it from the
+        // clip's middle frame, by Follow Amount; a 3D camera solve turning the camera moves it as far as a point at
+        // infinity moves.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H;
+        Clip clip = colorClip(p, 0, 0, 0, 0, 60);
+        Effect sky = makeEffect(p, "sky_replace");
+        CameraMotion cm;
+        cm.fps = s.fpsValue();
+        cm.steps.assign(60, Similarity{});
+        for (size_t i = 1; i < cm.steps.size(); ++i) cm.steps[i].tx = 0.01;
+        sky.strings["motion"] = cameraMotionToString(cm);
+        Homography follow;
+        QVERIFY(skyMotion(s, clip, sky, 40, W, H, follow));
+        QVERIFY2(near(float(follow.apply({100, 50}).x), 100 + 0.1f * W, 0.5f), qPrintable(QString::number(follow.apply({100, 50}).x)));
+        QVERIFY(skyMotion(s, clip, sky, 10, W, H, follow) && near(float(follow.apply({100, 50}).x), 100 - 0.2f * W, 0.5f));
+        sky.params["follow_amount"] = 50.0;
+        QVERIFY(skyMotion(s, clip, sky, 40, W, H, follow) && near(float(follow.apply({100, 50}).x), 100 + 0.05f * W, 0.5f));
+        QVERIFY(skyMotion(s, clip, sky, 30, W, H, follow) && near(float(follow.apply({100, 50}).x), 100, 1e-3f));
+        sky.params["follow"] = 0.0;
+        QVERIFY(!skyMotion(s, clip, sky, 10, W, H, follow));
+        sky.params["follow"] = 2.0;
+        sky.params["follow_amount"] = 100.0;
+        QVERIFY(!skyMotion(s, clip, sky, 10, W, H, follow));  // (no solve)
+        CameraSolve solve;
+        solve.width = W * 2, solve.height = H * 2, solve.focal = 400, solve.fps = s.fpsValue();
+        for (int i = 0; i < 60; ++i) {
+            SolvedCamera cam;
+            cam.valid = true;
+            const double a = 0.005 * i;  // turning about the vertical
+            cam.R = {std::cos(a), 0, -std::sin(a), 0, 1, 0, std::sin(a), 0, std::cos(a)};
+            solve.cameras.push_back(cam);
+        }
+        Effect track = makeEffect(p, "camera_track");
+        track.strings["solve"] = cameraSolveToString(solve);
+        clip.effects.push_back(track);
+        QVERIFY(skyMotion(s, clip, sky, 10, W, H, follow));
+        const Point2 centre = follow.apply({W / 2.0, H / 2.0});
+        // (turned 0.1 rad back from the middle frame: what was ahead is f tan 0.1 to the right; focal 400 at twice the size)
+        const double expect = 200 * std::tan(0.1);
+        QVERIFY2(std::fabs(centre.x - W / 2.0 - expect) < 0.5 && std::fabs(centre.y - H / 2.0) < 0.5,
+                 qPrintable(QString("%1 %2 (%3)").arg(centre.x).arg(centre.y).arg(expect)));
+
+        // In a sequence: the scene on V1 with Sky Replacement taking the red clip on V2 (hidden) as its sky.
+        QTemporaryDir dir;
+        QImage q(W, H, QImage::Format_RGBA64);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const float* sp = scene.at(x, y);
+                q.setPixelColor(x, y, QColor::fromRgbF(sp[0], sp[1], sp[2], 1));
+            }
+        QVERIFY(q.save(dir.filePath("scene.png")));
+        MediaItem media;
+        QVERIFY(probeMedia(dir.filePath("scene.png").toStdString(), media));
+        media.id = p.newId();
+        p.media.push_back(media);
+        auto placed = edit::placeMedia(p, s, media.id, 0, 0, 60, {TrackKind::Video, 0}, {}, false);
+        QVERIFY(placed.ok);
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, colorClip(p, 0.9f, 0.2f, 0.1f, 0, 60)).ok);
+        Clip* shot = edit::clipById(s, placed.created[0]);
+        Effect replace = makeEffect(p, "sky_replace");
+        replace.params["use_depth"] = 0.0;  // (the same with the depth model installed or not)
+        shot->effects.push_back(replace);
+        QVERIFY(hiddenMatteTracks(s, 5)[1]);
+        RenderOptions o;
+        Image frame = renderProgramFrame(p, s, 5, o);
+        rgb(frame, 200, 15, c);
+        QVERIFY2(near(c[0], 0.9f) && near(c[1], 0.2f) && near(c[2], 0.1f), qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
+        rgb(frame, 200, 172, c);
+        float g[4];
+        rgb(scene, 200, 172, g);
+        QVERIFY2(c[0] > g[0] && c[2] < g[2] && std::fabs(c[1] - g[1]) < 0.15f,  // (warmed by Match Foreground, not covered)
+                 qPrintable(QString("%1 %2 %3 / %4 %5 %6").arg(c[0]).arg(c[1]).arg(c[2]).arg(g[0]).arg(g[1]).arg(g[2])));
+        // The gradient instead (and the track shows again); the matte view.
+        Effect& e = shot->effects.back();
+        e.params["source"] = 1.0;
+        QVERIFY(!hiddenMatteTracks(s, 5)[1]);
+        e.params["zenith.r"] = 0.1, e.params["zenith.g"] = 0.2, e.params["zenith.b"] = 0.6;
+        // (V2 is drawn over it now: muted to look)
+        s.videoTracks[1].muted = true;
+        frame = renderProgramFrame(p, s, 5, o);
+        rgb(frame, 200, 0, c);
+        QVERIFY2(near(c[0], 0.1f, 0.03f) && near(c[2], 0.6f, 0.03f), qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
+        e.params["view"] = 1.0;
+        frame = renderProgramFrame(p, s, 5, o);
+        QVERIFY(near(frame.at(200, 15)[0], 1) && near(frame.at(200, 172)[0], 0));
+        e.params["view"] = 0.0;
+        // A picture in picture: the sky found and replaced within the clip's own picture (its top half is the canvas's
+        // middle).
+        shot->motion.params["scale"] = 50.0;
+        frame = renderProgramFrame(p, s, 5, o);
+        rgb(frame, 160, 50, c);  // (the scene's (160, 10): sky, near the gradient's top; the old sky there is 0.33 0.52 0.86)
+        QVERIFY2(c[0] < 0.25f && c[1] < 0.35f && c[2] > 0.55f, qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
+        rgb(frame, 160, 130, c);  // (the scene's (160, 170): ground)
+        QVERIFY2(c[1] > c[2], qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
+        shot->motion.params["scale"] = 100.0;
+        // Dissolving into the shot: the new sky is there through the transition.
+        e.params["source"] = 0.0;
+        s.videoTracks[1].muted = false;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, colorClip(p, 0, 0, 1, 0, 20)).ok);
+        Clip* after = edit::clipById(s, placed.created[0]);
+        QVERIFY(after && after->start == 20);
+        QVERIFY(edit::addTransition(p, s, after->id, edit::Edge::In, "cross_dissolve", 10).ok);
+        FrameTime mid = -1;
+        for (FrameTime t = 10; t < 30 && mid < 0; ++t) {
+            frame = renderProgramFrame(p, s, t, o);
+            rgb(frame, 200, 172, g);
+            if (g[2] > 0.3f && g[1] > 0.15f) mid = t;  // (blue and the ground both showing)
+        }
+        QVERIFY(mid >= 0);
+        rgb(frame, 200, 15, c);
+        QVERIFY2(c[0] > 0.25f && c[0] > 2 * c[1], qPrintable(QString("%1 %2 %3 at %4").arg(c[0]).arg(c[1]).arg(c[2]).arg(mid)));
+        QVERIFY(findEffectInfo("sky_replace") && findEffectInfo("sky_replace")->group == "Keying");
     }
 
     void monitorCalibration() {

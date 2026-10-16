@@ -11886,6 +11886,32 @@ const auto seq = [this] { return state()->sequence(); };
             if (b->isVisibleTo(win_.get())) again = b;
         QVERIFY(again);
 
+        // Sky Replacement on footage measures the camera's movement when added too, for its sky to follow.
+        add = nullptr;
+        for (auto* b : win_->findChildren<QPushButton*>())
+            if (b->text().startsWith("Add Video Effect") && b->isVisibleTo(win_.get())) add = b;
+        QVERIFY(add);
+        QAction* skyAction = nullptr;
+        std::function<void(QMenu*)> findSky = [&](QMenu* menu) {
+            for (QAction* a : menu->actions()) {
+                if (a->menu()) findSky(a->menu());
+                else if (a->text() == "Sky Replacement") skyAction = a;
+            }
+        };
+        findSky(add->menu());
+        QVERIFY(skyAction);
+        skyAction->trigger();
+        QTRY_VERIFY_WITH_TIMEOUT(effectOf("sky_replace") && !effectOf("sky_replace")->s("motion").empty(), 30000);
+        QApplication::processEvents();
+        int analyzers = 0;
+        for (auto* b : win_->findChildren<QPushButton*>("analyzeStabilize")) analyzers += b->isVisibleTo(win_.get());
+        QCOMPARE(analyzers, 2);
+        state()->edit("No Sky", [clip](Project&, Sequence& s) {
+            auto& fx = edit::clipById(s, clip)->effects;
+            fx.erase(std::remove_if(fx.begin(), fx.end(), [](const Effect& e) { return e.type == "sky_replace"; }), fx.end());
+            return true;
+        });
+
         // A masked blur, tracked forwards from the playhead.
         state()->edit("Blur", [clip](Project& p, Sequence& s) {
             Effect e = makeEffect(p, "gaussian_blur");

@@ -24,6 +24,19 @@ std::string iptcSourceType(AiRole role) {
 
 namespace {
 
+std::function<bool(const std::string&)>& optionalModelCheck() {
+    static std::function<bool(const std::string&)> check;
+    return check;
+}
+
+bool optionalModelThere(const std::string& model) { return !optionalModelCheck() || optionalModelCheck()(model); }
+
+}  // namespace
+
+void setOptionalModelCheck(std::function<bool(const std::string& model)> check) { optionalModelCheck() = std::move(check); }
+
+namespace {
+
 void add(Provenance& out, AiUse use) {
     if (std::find(out.ai.begin(), out.ai.end(), use) == out.ai.end()) out.ai.push_back(std::move(use));
 }
@@ -42,6 +55,7 @@ void effectUses(Provenance& out, const Effect& e) {
     else if (t == "redact_faces") add(out, {"Redact Faces", "YuNet", AiRole::Assisted});
     else if (t == "remove_background" || t == "behind_people") add(out, {"People Matte", "MODNet", AiRole::Assisted});
     else if (t == "depth_blur" || t == "depth_fog" || t == "depth_map") add(out, {"Depth", "Depth Anything V2", AiRole::Assisted});
+    else if (t == "sky_replace" && e.p("use_depth", 0, 1) > 0.5 && optionalModelThere("depth")) add(out, {"Sky Replacement", "Depth Anything V2", AiRole::Assisted});
     if (t == "depth_blur" && std::lround(e.p("follow", 0)) == 2) add(out, {"Focus on Faces", "YuNet", AiRole::Assisted});
     // Masks: an object picked out, people, or depth.
     const long s = std::lround(e.p("mask.shape", 0));
