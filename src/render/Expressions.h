@@ -14,7 +14,7 @@ namespace montage::edit {
 Result setExpression(Project& p, Sequence& s, Id clip, Id effect, const std::string& param, const std::string& expr);
 
 // Replaces the expression on `param` with what it gives: a key a frame through the clip, thinned to the ones needed to
-// stay within a thousandth of the setting's range (held keys for switches and choices).
+// stay within a thousandth of the span of its values (held keys for switches and choices).
 Result bakeExpression(Project& p, Sequence& s, Id clip, Id effect, const std::string& param);
 
 }  // namespace montage::edit

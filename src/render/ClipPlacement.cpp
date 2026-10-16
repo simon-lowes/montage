@@ -47,8 +47,13 @@ Result alignClip(Project& p, Sequence& s, Id clip, FrameTime t, Align where, dou
     const double dy = top ? m - y0 : bottom ? (H - m) - y1 : H / 2 - (y0 + y1) / 2;
     if (c->motion.empty()) c->motion = makeEffect(p, "transform");
     const FrameTime lt = t - c->start;
-    c->motion.params["pos_x"].set(lt, c->motion.p("pos_x", lt) + dx);
-    c->motion.params["pos_y"].set(lt, c->motion.p("pos_y", lt) + dy);
+    // (Moves the keyed position: an expression on it goes on adding to it.)
+    auto keyed = [&](const char* n) {
+        auto it = c->motion.params.find(n);
+        return it == c->motion.params.end() ? c->motion.p(n, lt) : it->second.keyedAt(lt);
+    };
+    c->motion.params["pos_x"].set(lt, keyed("pos_x") + dx);
+    c->motion.params["pos_y"].set(lt, keyed("pos_y") + dy);
     return {};
 }
 

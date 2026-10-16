@@ -1839,6 +1839,15 @@ void InspectorWidget::addColorSlice(QFormLayout* form, const EffectInfo& info, c
             if (pi.name == n) addParamRow(form, pi, target);
 }
 
+bool InspectorWidget::ownSetting(const Target& target) const {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s && target.clip ? edit::clipById(*s, target.clip) : nullptr;
+    const Effect* e = c ? target.resolve(const_cast<Sequence&>(*s)) : nullptr;
+    if (!e) return false;
+    if (e == &c->motion || e == &c->generator || e == &c->audio) return true;
+    return std::any_of(c->effects.begin(), c->effects.end(), [e](const Effect& x) { return &x == e; });
+}
+
 std::vector<Id> InspectorWidget::otherSelected(const Target& target) const {
     std::vector<Id> out;
     const Sequence* s = state_->sequence();
@@ -1927,7 +1936,7 @@ void InspectorWidget::editExpression(const Target& target, const std::string& pa
         dlg.accept();
     });
     // Checked as it is typed: compiled, then run at the playhead.
-    auto check = [&, clipId = target.clip, time = target.time] {
+    auto check = [&, clipId = target.clip, effectId = effect->id, time = target.time] {
         const std::string expr = text->toPlainText().trimmed().toStdString();
         bake->setEnabled(false);
         if (expr.empty()) {
@@ -1943,10 +1952,11 @@ void InspectorWidget::editExpression(const Target& target, const std::string& pa
         }
         Param trial = base;
         trial.expr = expr;
+        if (trial.exprSeed == 0) trial.exprSeed = expressionSeed(clipId, effectId, param);  // (as setExpression will)
         const Sequence* s = state_->sequence();
         ExpressionScope scope(&state_->project(), s, s ? edit::clipById(*s, clipId) : nullptr);
-        const double v = trial.at(time());
-        why = expressionError(expr);
+        const FrameTime t = time();
+        const double v = evaluateExpression(trial, t, trial.keyedAt(t), &why);
         status->setText(why.empty() ? tr("At the playhead: %1").arg(v, 0, 'g', 6)
                                     : tr("Fails at the playhead (the keyed value is used): %1").arg(QString::fromStdString(why)));
         apply->setEnabled(true);
@@ -2246,18 +2256,24 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
             connect(spin, &QWidget::customContextMenuRequested, this, [spin, write, name, def, target, label, this](const QPoint& p) {
                 QMenu m;
                 m.addAction(tr("Reset to Default"), this, [write, name, def] { write({{name, def}}); });
-                if (target.clip && target.keyframes && expressionsAvailable())
+                if (target.clip && target.keyframes && expressionsAvailable() && ownSetting(target))
                     m.addAction(tr("Expression…"), this, [this, target, name, label, def] { editExpression(target, name, label, def); });
                 if (target.publishClip) m.addAction(tr("Publish to Graphic…"), this, [this, target, name, label] { publishParameter(target, name, label); });
                 m.exec(spin->mapToGlobal(p));
             });
-            refreshWidget = [spin, slider, read, name, pi] {
+            refreshWidget = [this, spin, slider, read, readParam, name, pi] {
                 double v = read(name);
                 QSignalBlocker b(spin);
                 spin->setValue(v);
+                // (Shows what its expression gives; set by the expression, so not edited here.)
+                const Param* q = readParam(name);
+                const bool driven = q && !q->expr.empty();
+                spin->setEnabled(!driven);
+                spin->setToolTip(driven ? tr("Set by its expression (=)") : QString());
                 if (slider) {
                     QSignalBlocker b2(slider);
                     slider->setValue(int(std::lround((v - pi.min) / (pi.max - pi.min) * 1000.0)));
+                    slider->setEnabled(!driven);
                 }
             };
             break;
@@ -2275,13 +2291,16 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
         for (QToolButton* b : {watch, prev, key, next}) h->addWidget(b);
         // An expression drives it (a clip's own settings; one value each, so not colours).
         QToolButton* formula = nullptr;
-        if (target.clip && pi.kind != ParamKind::Color && expressionsAvailable()) {
+        if (target.clip && pi.kind != ParamKind::Color && expressionsAvailable() && ownSetting(target)) {
             formula = smallButton(row, QStringLiteral("="), tr("Expression"));
             formula->setObjectName(QStringLiteral("expression_%1_%2").arg(target.effect).arg(QString::fromStdString(name)));
             formula->setCheckable(true);
             h->addWidget(formula);
             const double def = pi.def;
-            connect(formula, &QToolButton::clicked, this, [this, target, name, label, def] { editExpression(target, name, label, def); });
+            connect(formula, &QToolButton::clicked, this, [this, target, name, label, def, formula] {
+                formula->setChecked(!formula->isChecked());  // (whether it has one is shown by refreshing, after the dialog)
+                editExpression(target, name, label, def);
+            });
         }
         connect(watch, &QToolButton::clicked, this, [this, target, names, label](bool on) {
             FrameTime t = target.time();
@@ -2290,7 +2309,7 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
                 if (!e) return false;
                 for (const auto& n : names) {
                     Param& p = e->params[n];
-                    double v = p.at(t);
+                    double v = p.keyedAt(t);  // (the keys', not what an expression makes of them)
                     if (on) p.addKey(t, v);
                     else {
                         p.keys.clear();
@@ -2309,7 +2328,7 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
                 for (const auto& n : names) {
                     Param& p = e->params[n];
                     if (p.keyAt(t)) p.removeKey(t);
-                    else p.addKey(t, p.at(t));
+                    else p.addKey(t, p.keyedAt(t));
                 }
                 if (target.afterWrite) target.afterWrite(s);
                 return true;
@@ -2335,7 +2354,9 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
             if (formula) {
                 // Checked while there is one; red while it fails (the keyed value is used then).
                 const std::string expr = p ? p->expr : std::string();
-                const std::string why = expr.empty() ? std::string() : expressionError(expr);
+                const Sequence* s = state_->sequence();
+                const Effect* e = s && !expr.empty() ? target.resolve(const_cast<Sequence&>(*s)) : nullptr;
+                const std::string why = e ? expressionError(target.clip, e->id, names[0]) : std::string();
                 QSignalBlocker b0(formula);
                 formula->setChecked(!expr.empty());
                 formula->setToolTip(expr.empty() ? tr("Expression") : why.empty() ? tr("Expression: %1").arg(QString::fromStdString(expr))

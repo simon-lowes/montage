@@ -17,6 +17,7 @@
 #include "core/Captions.h"
 #include "core/ColorGroups.h"
 #include "core/EditOps.h"
+#include "core/Expression.h"
 #include "core/GraphicsTemplate.h"
 #include "core/ProjectIO.h"
 
@@ -169,6 +170,7 @@ bool addFrame(QCryptographicHash& h, const Project& p, const Sequence& seq, Fram
 }  // namespace
 
 QByteArray frameKey(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
+    if (usesExpressions(p)) return {};  // (not cached: what they give can depend on what the key does not cover)
     QCryptographicHash h(QCryptographicHash::Sha1);
     h.addData(QByteArray("montage-frame-") + QByteArray::number(kCacheVersion));
     h.addData(QByteArray::number(o.scale, 'g', 10) + (o.useProxies ? "P" : "") + (o.highQuality ? "H" : "") + '#' +

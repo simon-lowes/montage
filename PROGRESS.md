@@ -1160,5 +1160,27 @@ The sixth gap analysis (`docs/research/phase7-roadmap.md`, October 2026) ranks w
     - Moving the lids with the gaze. Up and down are limited because of this, so someone reading a script well below the lens is only partly corrected.
     - A learned gaze model. Look at Lens redraws the iris and does not re-render the eye.
     - Steadying the mesh over time. Each frame is fitted on its own, so a strong reshape can shimmer slightly on moving footage.
-- [ ] 14. Parameter expressions and links: drive any keyframable parameter with a short formula (time, frame, wiggle, loops, another clip's parameter, an audio level), and bake it to keys (S)
+- [x] 14. Parameter expressions and links: drive any keyframable parameter with a short formula (time, frame, wiggle, loops, another clip's parameter, an audio level), and bake it to keys (S)
+  - `Param::expr` holds a Lua 5.4 formula (or statements ending in `return`); `Param::at` runs it on the keyed value (`keyedAt`), so every render path, the GPU compositor, the mixer and the Keyframes panel see it. It can use `value`, `time`, `frame`, `fps`, `duration`, `wiggle(freq, amount [, octaves, falloff, seed])`, `noise`, `random([lo, hi])`, `loopOut(cycle|pingpong|offset|continue)`, `param([clip,] name or effect.name)` (another setting at the same moment on the timeline), `audio([track [, low|mid|high]])` (a track's level), `linear`, `ease`, `clamp` and Lua's maths by name.
+  - render/Expressions: one sandboxed state per thread (no files, programs, clocks, loading, error catching, metatables, string matching or repeating; the libraries read-only; 64 MB and two million instructions an evaluation). Noise and random numbers come from `Param::exprSeed` (set when the expression is), so a frame is the same on any thread and after saving. Time counts from `Param::exprFrom`, which moves with the keys, so a split clip carries on where it was. Results are kept within the setting's range (angles may turn on), switches and choices whole. A failing expression gives the keyed value; its error is kept per setting for the Inspector. Expressions reading each other in a loop stop at 16 deep with an error.
+  - `ExpressionScope` says which project, sequence and clip expressions belong to on a thread; the compositor, mixer and image row threads (and OpenFX plug-in threads) set or carry it, the app's window falls back to its open project. It caches where each setting is for its life.
+  - Inspector: an "=" button (and Expression… on the box's menu) on a clip's own Transform, generator, sound and effect settings (not speed) opens an editor that checks the formula as it is typed and shows its value at the playhead; Bake to Keyframes and Remove. The button is checked while there is one and red while it fails; the box shows the result and is not editable then. The Keyframes panel draws it as a curve ("=" after the name). Projects save it. MCP `montage_expression` (set, bake, get). Bake samples every frame and thins to keys within a thousandth of the values' span (held keys for switches).
+  - Frames using expressions are not put in the render cache, and a clip whose Transform has one is not copied through by smart rendering.
+  - Tests:
+    - media `parameterExpressions`: time, frame and the keyed value; statements with their own variables; wiggle within its amount, smooth, the same on another thread and after saving, different per setting, and carried on across a cut; random steady per frame; the four loopOut kinds; another clip's setting by name and id; the tone's level (about 25 % at -3 dB) and its band; eighteen ways out of the sandbox or into a hang refused with the keyed value and an error; the range clamp and angles past a turn; a loop between two clips stopped; a fade rendered; saved and loaded; baked to two or three keys; MCP set, error, bake and get.
+    - app `inspectorExpressions`: the editor refusing a broken formula and applying one in one undo step; the box disabled; the Keyframes row; the failing button; bake and remove.
+  - Review fixes:
+    - `pcall` could catch the time limit and `string.rep`/`gsub` ran long in C: no error catching, matching or repeating now, and `table.move` is gone.
+    - Expressions could change the shared libraries or metatables for every later one: they are read-only now and metatables out of reach; math's names no longer overwrite `type`.
+    - Memory running out while setting up a call would abort: it is now set up protected, and a panic restarts the thread's state.
+    - Every evaluation searched the sequence for its setting and took a lock: the scope caches it and errors are only written when they change.
+    - Errors were kept per formula text, so two settings with the same formula shared one; they are kept per setting.
+    - Seeds came from the clip and effect ids, so a split, pasted or duplicated clip changed its wiggle; and trimming a clip's head restarted its time. Both now travel with the setting.
+    - The render cache and smart rendering could reuse frames an expression changes.
+    - Keyframe buttons, Add Key, nudging and pasting wrote the expression's result into the keys; they use the keyed value.
+    - Speed accepted an expression (a clip's length cannot follow one); the "=" button showed on trims, grade nodes and groups, where expressions do not run.
+    - Results outside a setting's range, unrounded choices, NaN in whole-number arguments and fractional clip ids in `param` are handled.
+  - Not done:
+    - Expressions in AAF, OpenTimelineIO or OpenFX interchange: bake first.
+    - The Keyframes panel does not cache an expression's curve, and baking a long clip holds the window briefly.
 - [ ] 15. Lip-synced dubbing: re-render the mouth to match a dub or regenerated words (M–L)

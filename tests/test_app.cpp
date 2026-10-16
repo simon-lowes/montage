@@ -11131,8 +11131,11 @@ const auto seq = [this] { return state()->sequence(); };
         auto useDialog = [&](const QString& text, const char* press, QString* status = nullptr, bool* okEnabled = nullptr) {
             bool seen = false;
             QTimer::singleShot(0, this, [&, text, press] {
-                auto* dlg = QApplication::activeModalWidget();
-                QVERIFY(dlg && dlg->objectName() == "expressionDialog");
+                auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+                if (!dlg || dlg->objectName() != "expressionDialog") {  // (left unseen: the check after it fails)
+                    if (dlg) dlg->reject();
+                    return;
+                }
                 auto* edit = dlg->findChild<QPlainTextEdit*>("expressionText");
                 edit->setPlainText(text);
                 if (status) *status = dlg->findChild<QLabel*>("expressionStatus")->text();
@@ -11155,6 +11158,9 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(opacity().expr, std::string("linear(frame, 0, 10, 0, 100)"));
         QCOMPARE(opacity().at(5), 50.0);
         QTRY_VERIFY(button()->isChecked() && !button()->property("failing").toBool());
+        // Its box shows what it gives, and is not edited while it drives the setting.
+        auto* box = inspector->findChild<QDoubleSpinBox*>(QStringLiteral("param_%1_opacity").arg(motion));
+        QTRY_VERIFY(box && !box->isEnabled());
         // The Keyframes panel shows it as a curve.
         win_->raisePanel("keyframes");
         auto* panel = win_->findChild<KeyframePanel*>();

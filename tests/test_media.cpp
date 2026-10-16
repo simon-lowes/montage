@@ -4506,6 +4506,16 @@ private slots:
             elsewhere = at(lead, "anchor_x", 37);
         }).join();
         QCOMPARE(elsewhere, wx[37]);
+        // Cut in two, the second part carries on where the wiggle was (its time and seed go with it).
+        {
+            Project q = p;
+            Sequence& qs = *q.active();
+            QVERIFY(edit::razor(q, qs, {TrackKind::Video, 0}, lead.start + 40).ok);
+            const Clip* second = edit::clipAt(qs, {TrackKind::Video, 0}, lead.start + 40);
+            QVERIFY(second && second->start == lead.start + 40);
+            ExpressionScope there(&q, &qs);
+            for (FrameTime t : {0, 7, 30}) QCOMPARE(second->motion.params.at("anchor_x").at(t), wx[size_t(40 + t)]);
+        }
         // Random: steady at a frame, new at the next; noise smooth.
         set(lead, "scale_x", "random(50, 150)");
         const double r1 = at(lead, "scale_x", 7);
@@ -4533,25 +4543,38 @@ private slots:
         QVERIFY2(std::fabs(loud - 25) < 1, qPrintable(QString::number(loud)));
         QVERIFY2(std::fabs(band - 25) < 3, qPrintable(QString::number(band)));
         // Errors: the keyed value instead, and why.
+        // (Nothing that could catch the time limit, run long in C, or change what other evaluations share.)
         follower.motion.params["rotation"] = Param(12);
+        auto failure = [&] { return expressionError(follower.id, follower.motion.id, "rotation"); };
         for (const std::string bad : {"nil + 1", "os.execute('true')", "io.open('x')", "require('os')", "load('return 1')()",
-                                      "while true do end", "string.rep('x', 1 << 30)", "\"text\"", "1 / 0", "param(\"Nobody\", \"pos_x\")"}) {
+                                      "while true do end", "string.rep('x', 1 << 30)", "('x'):rep(1 << 30)", "\"text\"", "1 / 0",
+                                      "param(\"Nobody\", \"pos_x\")", "param(1.5, \"pos_x\")", "pcall(function() while true do end end)",
+                                      "('x'):find(string.rep and 'x' or '(.-)*$')", "getmetatable('').__index", "string.upper = nil",
+                                      "math.pi = 3", "table.move({}, 1, 1 << 40, 2)"}) {
             follower.motion.params["rotation"].expr = bad;
             QCOMPARE(at(follower, "rotation", 3), 12.0);
-            QVERIFY2(!expressionError(bad).empty(), bad.c_str());
+            QVERIFY2(!failure().empty(), bad.c_str());
         }
+        follower.motion.params["rotation"].expr = "(type(1) == 'number' and math.pi == pi and string.upper('a') == 'A') and 5 or 0";
+        QCOMPARE(at(follower, "rotation", 3), 5.0);
         QVERIFY(!checkExpression("value +"));
         QVERIFY(!edit::setExpression(p, s, follower.id, 0, "rotation", "value +").ok);
         QVERIFY(!edit::setExpression(p, s, follower.id, 0, "nonsense", "1").ok);
         follower.motion.params["rotation"].expr = "value * 2";
         QCOMPARE(at(follower, "rotation", 3), 24.0);
-        QVERIFY(expressionError("value * 2").empty());
+        QVERIFY(failure().empty());
+        // Within the setting's range (an angle turns on past a turn).
+        set(lead, "opacity", "value * 5");
+        QCOMPARE(at(lead, "opacity", 3), 100.0);
+        set(lead, "opacity", "");
+        follower.motion.params["rotation"].expr = "720 + frame";
+        QCOMPARE(at(follower, "rotation", 3), 723.0);
         // Expressions reading each other in a loop stop, with the error.
         set(lead, "crop_left", "param(\"Follower\", \"crop_left\") + 1");
         set(follower, "crop_left", "param(\"Lead\", \"crop_left\") + 1");
         const double looped = at(lead, "crop_left", 30);
         QVERIFY(std::isfinite(looped));
-        QVERIFY(!expressionError("param(\"Lead\", \"crop_left\") + 1").empty());
+        QVERIFY(!expressionError(lead.id, lead.motion.id, "crop_left").empty());
         // In the picture: the follower, red over black, fades in over its first second.
         for (const char* name : {"pos_y", "anchor_x", "anchor_y", "crop_left"}) follower.motion.params[name] = Param(0.0);
         set(follower, "opacity", "linear(time, 0, 1, 0, 100)");
@@ -4570,6 +4593,12 @@ private slots:
         const Clip* again = edit::clipById(*back.active(), follower.id);
         QVERIFY(again && again->motion.params.at("opacity").expr == "linear(time, 0, 1, 0, 100)");
         QCOMPARE(again->motion.params.at("pos_y").expr, follower.motion.params.at("pos_y").expr);
+        const Param& wiggled = edit::clipById(*back.active(), lead.id)->motion.params.at("anchor_x");
+        QVERIFY(wiggled.exprSeed != 0 && wiggled.exprSeed == lead.motion.params.at("anchor_x").exprSeed);
+        {
+            ExpressionScope there(&back, back.active());
+            QCOMPARE(wiggled.at(37), wx[37]);
+        }
         // Baked to keys: as few as needed, the same values, no expression left.
         const edit::Result baked = edit::bakeExpression(p, s, follower.id, 0, "opacity");
         QVERIFY2(baked.ok, baked.error.c_str());
@@ -4602,6 +4631,8 @@ private slots:
         QVERIFY(loadProject(project.toStdString(), fromMcp));
         const Param& turned = edit::clipById(*fromMcp.active(), follower.id)->motion.params.at("rotation");
         QVERIFY(turned.expr.empty() && turned.keys.size() == 2 && turned.at(10) == 30);
+        r = call({{"project", project}, {"clip", double(follower.id)}, {"param", "rotation"}, {"action", "get"}, {"at", 10}});
+        QVERIFY(!r.value("isError").toBool() && r.value("structuredContent").toObject().value("value").toDouble() == 30);
     }
 
     void imageSequences() {

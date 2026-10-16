@@ -749,7 +749,7 @@ void KeyframePanel::mouseDoubleClickEvent(QMouseEvent* e) {
             }
             Param* p = cc ? findParam(*cc, addr) : nullptr;
             if (!p || p->keyAt(t)) return false;
-            p->addKey(t, p->at(t));
+            p->addKey(t, p->keyedAt(t));
             return true;
         }))
         selection_ = {{addr, t}};

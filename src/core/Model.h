@@ -62,8 +62,12 @@ struct Param {
     // After the last key: hold its value, play the keys again (Loop), back and forth (PingPong), or again carrying
     // on from where the last cycle ended (Offset: a value climbing by the same step each cycle). Needs two keys.
     Repeat repeat = Repeat::Hold;
-    // An expression that gives the value at each frame from the keyed one (core/Expression.h); "" = none.
+    // An expression that gives the value at each frame from the keyed one (core/Expression.h); "" = none. Its time
+    // counts from clip frame exprFrom (moved with the keys when the clip's head is trimmed or split off), and its noise
+    // and random numbers come from exprSeed (kept by copies, so a split clip carries on where it was).
     std::string expr;
+    FrameTime exprFrom = 0;
+    uint32_t exprSeed = 0;
 
     Param() = default;
     Param(double v) : value(v) {}  // NOLINT(google-explicit-constructor)

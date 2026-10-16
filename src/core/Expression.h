@@ -18,7 +18,9 @@
 //                                         by name (sin, abs, pi...) as well as in math
 #pragma once
 
+#include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 
 #include "core/Model.h"
@@ -29,8 +31,9 @@ struct Project;
 struct Sequence;
 struct Clip;
 
-// The value of `p` at clip frame `t` from its keyed value `keyed` (Param::at calls it when it has an expression).
-double evaluateExpression(const Param& p, FrameTime t, double keyed);
+// The value of `p` at clip frame `t` from its keyed value `keyed` (Param::at calls it when it has an expression), within
+// its setting's range; the keyed value when it fails, with why in `error`.
+double evaluateExpression(const Param& p, FrameTime t, double keyed, std::string* error = nullptr);
 
 // What expressions evaluated on this thread belong to, while it lives: the project and sequence, and the clip when it
 // is known (else the clip whose setting it is is looked up). Scopes nest. Renders set one; without any, the thread's
@@ -46,6 +49,9 @@ public:
     const Sequence* sequence;
     const Clip* clip;
     ExpressionScope* previous;
+    // Where the settings evaluated in it are (found once a scope: the project does not change while it lives).
+    struct Owners;
+    std::unique_ptr<Owners> owners;
 };
 
 struct ExpressionContext {
@@ -58,10 +64,18 @@ ExpressionContext currentExpressionContext();
 // For this thread: where expressions evaluated outside any scope belong (the app's window: its open project).
 void setExpressionFallback(std::function<ExpressionContext()> fallback);
 
+// Whether any setting of `e`, or of any clip in the project, has an expression (what it gives can depend on other clips
+// and the sound, which a frame's cache key or a copied-through frame does not account for).
+bool usesExpressions(const Effect& e);
+bool usesExpressions(const Project& p);
+
 bool expressionsAvailable();  // built with Lua
 // Whether `expr` compiles; false with the error.
 bool checkExpression(const std::string& expr, std::string* error = nullptr);
-// The error `expr` last gave when it ran (on any thread), "" when it last ran without one.
-std::string expressionError(const std::string& expr);
+// The error the expression on a clip's setting (`effect` the id of the effect holding it) last gave when it ran, on any
+// thread; "" when it last ran without one.
+std::string expressionError(Id clip, Id effect, const std::string& param);
+// The seed a new expression on that setting gets (Param::exprSeed): never 0.
+uint32_t expressionSeed(Id clip, Id effect, const std::string& param);
 
 }  // namespace montage

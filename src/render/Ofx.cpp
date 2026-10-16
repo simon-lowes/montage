@@ -24,6 +24,7 @@
 
 #include "audio/DynLib.h"
 #include "core/Effects.h"
+#include "core/Expression.h"
 #include "media/SuperScale.h"
 #include "ofxCore.h"
 #include "ofxImageEffect.h"
@@ -835,8 +836,10 @@ OfxStatus multiThread(OfxThreadFunctionV1 func, unsigned int n, void* arg) {
     if (!func) return kOfxStatErrBadHandle;
     n = std::max(1u, n);
     std::vector<std::thread> threads;
+    const ExpressionContext where = currentExpressionContext();  // (settings the plug-in reads on its threads)
     for (unsigned i = 1; i < n; ++i)
         threads.emplace_back([=] {
+            ExpressionScope scope(where.project, where.sequence, where.clip);
             tThreadIndex = i;
             tSpawned = true;
             func(i, n, arg);

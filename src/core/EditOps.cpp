@@ -23,8 +23,10 @@ namespace {
 std::vector<Track>& listFor(Sequence& s, TrackKind k) { return k == TrackKind::Video ? s.videoTracks : s.audioTracks; }
 
 void shiftParamKeys(Effect& e, FrameTime delta) {
-    for (auto& [name, param] : e.params)
+    for (auto& [name, param] : e.params) {
         for (auto& k : param.keys) k.t += delta;
+        if (!param.expr.empty()) param.exprFrom += delta;  // (its time counts on from where it was)
+    }
 }
 
 bool editable(const Track* t) { return t && !t->locked; }

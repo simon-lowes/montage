@@ -8115,9 +8115,10 @@ void McpServer::Impl::addTools() {
         "param([clip name or id,] name or effect.name), audio([track [, all|low|mid|high]]) (a track's level 0..1), "
         "linear/ease(t, t0, t1, v0, v1), clamp and Lua's math functions. Noise and random numbers are seeded, so renders "
         "repeat exactly; an expression that fails gives the keyed value. bake: replaces the expression with keys (thinned) "
-        "for interchange. Returns the value at the clip's first frame (`at`: another clip frame) and any error.",
+        "for interchange. get: changes nothing. Returns the value at the clip's first frame (`at`: another clip frame) and any "
+        "error.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"number"},
-            "param":{"type":"string"},"action":{"type":"string","enum":["set","bake"],"default":"set"},
+            "param":{"type":"string"},"action":{"type":"string","enum":["set","bake","get"],"default":"set"},
             "expression":{"type":"string"},"at":{"type":"integer","default":0}},"required":["project","clip","param"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -8130,10 +8131,10 @@ void McpServer::Impl::addTools() {
                 check(edit::setExpression(l.project, l.seq(), id, effect, param, a.value("expression").toString().toStdString()));
             } else if (action == "bake") {
                 check(edit::bakeExpression(l.project, l.seq(), id, effect, param));
-            } else {
-                throw ArgError{"action is set or bake"};
+            } else if (action != "get") {
+                throw ArgError{"action is set, bake or get"};
             }
-            save(l);
+            if (action != "get") save(l);
             const Clip* c = edit::clipById(l.seq(), id);
             const Effect* e = effect == 0 ? &c->motion : nullptr;
             for (const Effect* x : {&c->motion, &c->generator, &c->audio, &c->timing})
@@ -8143,8 +8144,8 @@ void McpServer::Impl::addTools() {
             const Param* prm = e && e->params.count(param) ? &e->params.at(param) : nullptr;
             const FrameTime at = std::clamp<FrameTime>(a.value("at").toInt(0), 0, std::max<FrameTime>(0, c->duration - 1));
             ExpressionScope scope(&l.project, &l.seq(), c);
-            const double value = prm ? prm->at(at) : 0.0;
-            const std::string why = prm && !prm->expr.empty() ? expressionError(prm->expr) : std::string();
+            std::string why;
+            const double value = !prm ? 0.0 : prm->expr.empty() ? prm->at(at) : evaluateExpression(*prm, at, prm->keyedAt(at), &why);
             QJsonObject out{{"value", value}, {"expression", prm ? QString::fromStdString(prm->expr) : QString()},
                             {"keys", prm ? int(prm->keys.size()) : 0}};
             if (!why.empty()) out["error"] = QString::fromStdString(why);

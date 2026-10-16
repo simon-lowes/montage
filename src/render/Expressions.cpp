@@ -2,11 +2,13 @@
 #include "core/Expression.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -29,18 +31,58 @@ namespace {
 thread_local ExpressionScope* tScope = nullptr;
 thread_local std::function<ExpressionContext()> tFallback;
 
+// Where a setting is, and its range.
+struct Owner {
+    const Clip* clip = nullptr;
+    const Effect* effect = nullptr;
+    std::string name;
+    bool described = false;  // (kind and range known)
+    ParamKind kind = ParamKind::Number;
+    double min = 0, max = 0;
+    bool noted = false;      // (its error, as last recorded from this scope)
+    std::string lastError;
+};
+
+// The errors expressions last gave, by clip, effect and setting. (Kept to the end: render threads may still note one
+// while the program exits.)
+using ErrorKey = std::tuple<Id, Id, std::string>;
 std::mutex gErrorMutex;
-std::map<std::string, std::string>& errors() {
-    static std::map<std::string, std::string> e;
-    return e;
+std::atomic<int> gErrors{0};
+std::map<ErrorKey, std::string>& errors() {
+    static auto* e = new std::map<ErrorKey, std::string>;
+    return *e;
 }
-void noteError(const std::string& expr, const std::string& error) {
+void noteError(Owner& o, const std::string& error) {
+    if (!o.effect || !o.clip) return;
+    if (o.noted && o.lastError == error) return;
+    o.noted = true;
+    o.lastError = error;
+    if (error.empty() && gErrors.load(std::memory_order_relaxed) == 0) return;
     std::lock_guard<std::mutex> lock(gErrorMutex);
-    if (error.empty()) errors().erase(expr);
-    else errors()[expr] = error;
+    const ErrorKey key{o.clip->id, o.effect->id, o.name};
+    if (error.empty()) {
+        if (errors().erase(key)) --gErrors;
+    } else if (errors().insert_or_assign(key, error).second) {
+        ++gErrors;
+    }
+}
+
+uint64_t mix64(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ull;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+}
+uint64_t hashText(const std::string& s, uint64_t h = 1469598103934665603ull) {
+    for (unsigned char ch : s) h = (h ^ ch) * 1099511628211ull;
+    return h;
 }
 
 }  // namespace
+
+struct ExpressionScope::Owners {
+    std::unordered_map<const Param*, Owner> found;
+};
 
 ExpressionScope::ExpressionScope(const Project* p, const Sequence* s, const Clip* c) : project(p), sequence(s), clip(c), previous(tScope) {
     tScope = this;
@@ -54,10 +96,33 @@ ExpressionContext currentExpressionContext() {
     return tFallback ? tFallback() : ExpressionContext{};
 }
 
-std::string expressionError(const std::string& expr) {
+std::string expressionError(Id clip, Id effect, const std::string& param) {
+    if (gErrors.load(std::memory_order_relaxed) == 0) return {};
     std::lock_guard<std::mutex> lock(gErrorMutex);
-    auto it = errors().find(expr);
+    auto it = errors().find({clip, effect, param});
     return it == errors().end() ? std::string() : it->second;
+}
+
+bool usesExpressions(const Effect& e) {
+    return std::any_of(e.params.begin(), e.params.end(), [](const auto& kv) { return !kv.second.expr.empty(); });
+}
+
+bool usesExpressions(const Project& p) {
+    for (const Sequence& s : p.sequences)
+        for (const auto* tracks : {&s.videoTracks, &s.audioTracks})
+            for (const Track& t : *tracks)
+                for (const Clip& c : t.clips) {
+                    for (const Effect* e : {&c.motion, &c.generator, &c.audio, &c.timing})
+                        if (usesExpressions(*e)) return true;
+                    for (const Effect& e : c.effects)
+                        if (usesExpressions(e)) return true;
+                }
+    return false;
+}
+
+uint32_t expressionSeed(Id clip, Id effect, const std::string& param) {
+    const auto s = uint32_t(mix64(clip * 1000003u + effect) ^ hashText(param));
+    return s ? s : 1;
 }
 
 #ifndef MONTAGE_WITH_LUA
@@ -67,8 +132,8 @@ bool checkExpression(const std::string&, std::string* error) {
     if (error) *error = "Expressions need Montage built with Lua";
     return false;
 }
-double evaluateExpression(const Param& p, FrameTime, double keyed) {
-    noteError(p.expr, "Expressions need Montage built with Lua");
+double evaluateExpression(const Param&, FrameTime, double keyed, std::string* error) {
+    if (error) *error = "Expressions need Montage built with Lua";
     return keyed;
 }
 
@@ -78,13 +143,7 @@ namespace {
 
 // ---- Where a setting is ------------------------------------------------------------------------------------------
 
-struct Owner {
-    const Clip* clip = nullptr;
-    const Effect* effect = nullptr;
-    std::string name;
-};
-
-// The effects of a clip that hold its settings.
+// The effects of a clip whose settings expressions read.
 template <typename F>
 bool eachEffect(const Clip& c, F&& f) {
     for (const Effect* e : {&c.motion, &c.generator, &c.audio, &c.timing})
@@ -101,7 +160,7 @@ bool findOwner(const Sequence& s, const Clip* only, const Param* p, Owner& out) 
         return eachEffect(c, [&](const Effect& e) {
             for (const auto& [n, q] : e.params)
                 if (&q == p) {
-                    out = {&c, &e, n};
+                    out.clip = &c, out.effect = &e, out.name = n;
                     return true;
                 }
             return false;
@@ -113,6 +172,39 @@ bool findOwner(const Sequence& s, const Clip* only, const Param* p, Owner& out) 
             for (const Clip& c : t.clips)
                 if (inClip(c)) return true;
     return false;
+}
+
+// Where `p` is in `where` (with its range when it is an effect's setting).
+Owner locate(const ExpressionContext& where, const Param& p) {
+    Owner o;
+    if (!where.sequence) return o;
+    if (!findOwner(*where.sequence, where.clip, &p, o) && where.clip && !findOwner(*where.sequence, nullptr, &p, o))
+        o.clip = where.clip;  // (a setting not in the sequence, such as a copy being tried out: the scope's clip)
+    if (o.effect) {
+        for (const ParamInfo& pi : effectParams(*o.effect))
+            if (pi.name == o.name) {
+                o.described = true, o.kind = pi.kind, o.min = pi.min, o.max = pi.max;
+                break;
+            }
+    }
+    return o;
+}
+
+// The owner of `p`: found once a scope (the scope's project is not edited while it lives), else every time.
+Owner& ownerOf(const ExpressionContext& where, const Param& p, Owner& scratch) {
+    if (tScope && tScope->sequence == where.sequence) {
+        if (!tScope->owners) tScope->owners = std::make_unique<ExpressionScope::Owners>();
+        auto [it, added] = tScope->owners->found.try_emplace(&p);
+        Owner& o = it->second;
+        if (!added && o.effect) {  // (still there: not a setting gone, its place taken by another)
+            auto at = o.effect->params.find(o.name);
+            if (at == o.effect->params.end() || &at->second != &p) added = true;
+        }
+        if (added) o = locate(where, p);
+        return o;
+    }
+    scratch = locate(where, p);
+    return scratch;
 }
 
 const Clip* findClip(const Sequence& s, const std::string& name, Id id) {
@@ -141,16 +233,6 @@ const Param* findSetting(const Clip& c, const std::string& name, const Effect** 
 
 // ---- Seeded noise --------------------------------------------------------------------------------------------------
 
-uint64_t mix64(uint64_t x) {
-    x += 0x9e3779b97f4a7c15ull;
-    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
-    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
-    return x ^ (x >> 31);
-}
-uint64_t hashText(const std::string& s, uint64_t h = 1469598103934665603ull) {
-    for (unsigned char ch : s) h = (h ^ ch) * 1099511628211ull;
-    return h;
-}
 double unit(uint64_t h) { return double(h >> 11) * (1.0 / 9007199254740992.0); }  // 0..1
 
 // Smooth value noise, -1..1: random values at whole x, eased between.
@@ -163,24 +245,38 @@ double noise1(double x, uint64_t seed) {
     return a + (b - a) * s;
 }
 
+// A number from Lua as a whole number within lo..hi (0 for not-a-number).
+int64_t whole(double v, int64_t lo, int64_t hi) {
+    if (!std::isfinite(v)) return v > 0 ? hi : v < 0 ? lo : std::clamp<int64_t>(0, lo, hi);
+    return int64_t(std::clamp(std::floor(v), double(lo), double(hi)));
+}
+
 // ---- The state on each thread ----------------------------------------------------------------------------------
 
 // What the expression running now is evaluated for (innermost last: param() runs others').
 struct Eval {
     const Param* param = nullptr;
-    FrameTime t = 0;
+    FrameTime t = 0;       // clip frame (the keys')
+    FrameTime local = 0;   // frames since the expression's start (Param::exprFrom)
     double keyed = 0;
     double fps = 25;
     const Project* project = nullptr;
     const Sequence* sequence = nullptr;
-    Owner owner;
+    const Clip* clip = nullptr;
     uint64_t seed = 0;
     int randoms = 0;
 };
 thread_local std::vector<Eval> tEval;
 thread_local bool tLooped = false;  // an expression this one reads went round in a loop
 
-constexpr int kMaxDepth = 8;          // param() into param() ...
+struct Evaluating {
+    explicit Evaluating(const Eval& e) { tEval.push_back(e); }
+    ~Evaluating() { tEval.pop_back(); }
+    Evaluating(const Evaluating&) = delete;
+    Evaluating& operator=(const Evaluating&) = delete;
+};
+
+constexpr int kMaxDepth = 16;         // param() into param() ...
 constexpr int kBudget = 2000;         // x 1000 instructions an evaluation
 constexpr size_t kMemory = 64 << 20;  // bytes a state
 constexpr size_t kCompiled = 512;     // expressions kept compiled a thread
@@ -196,6 +292,12 @@ struct State {
         if (L) lua_close(L);
     }
 };
+thread_local std::unique_ptr<State> tState;
+
+// A Lua error with nothing to catch it (memory running out while setting up a call): the state cannot be trusted
+// after it, so it is thrown out to the outermost evaluation, which starts the thread's state again.
+struct Panic {};
+int panic(lua_State*) { throw Panic{}; }
 
 void* allocate(void* ud, void* ptr, size_t osize, size_t nsize) {
     auto* st = static_cast<State*>(ud);
@@ -211,23 +313,24 @@ void* allocate(void* ud, void* ptr, size_t osize, size_t nsize) {
     return p;
 }
 
-State* state();
-
 void budget(lua_State* L, lua_Debug*) {
-    if (++state()->ticks > kBudget) luaL_error(L, "the expression took too long");
+    if (++tState->ticks > kBudget) luaL_error(L, "the expression took too long");
 }
 
-Eval& current() { return tEval.back(); }
+Eval& current(lua_State* L) {
+    if (tEval.empty()) luaL_error(L, "expression helpers only work while an expression runs");
+    return tEval.back();
+}
 
 double numberArg(lua_State* L, int i, double def) { return lua_isnoneornil(L, i) ? def : luaL_checknumber(L, i); }
 
 int luaWiggle(lua_State* L) {
-    const Eval& e = current();
+    const Eval& e = current(L);
     const double freq = luaL_checknumber(L, 1), amount = luaL_checknumber(L, 2);
-    const int octaves = std::clamp(int(numberArg(L, 3, 1)), 1, 10);
+    const int octaves = int(whole(numberArg(L, 3, 1), 1, 10));
     const double falloff = numberArg(L, 4, 0.5);
-    const uint64_t seed = e.seed ^ mix64(uint64_t(int64_t(numberArg(L, 5, 0))));
-    const double x = double(e.t) / e.fps * freq;
+    const uint64_t seed = e.seed ^ mix64(uint64_t(whole(numberArg(L, 5, 0), INT32_MIN, INT32_MAX)));
+    const double x = double(e.local) / e.fps * freq;
     double sum = 0, a = 1, norm = 0, f = 1;
     for (int o = 0; o < octaves; ++o) {
         sum += a * noise1(x * f, mix64(seed + uint64_t(o)));
@@ -241,13 +344,14 @@ int luaWiggle(lua_State* L) {
 
 int luaNoise(lua_State* L) {
     const double x = luaL_checknumber(L, 1);
-    lua_pushnumber(L, noise1(x, current().seed ^ mix64(uint64_t(int64_t(numberArg(L, 2, 0))) + 7)));
+    if (!std::isfinite(x) || std::abs(x) > 9e15) return luaL_error(L, "noise: %f is too far", x);
+    lua_pushnumber(L, noise1(x, current(L).seed ^ mix64(uint64_t(whole(numberArg(L, 2, 0), INT32_MIN, INT32_MAX)) + 7)));
     return 1;
 }
 
 int luaRandom(lua_State* L) {
-    Eval& e = current();
-    const double u = unit(mix64(e.seed ^ mix64(uint64_t(e.t)) ^ mix64(uint64_t(++e.randoms) << 32)));
+    Eval& e = current(L);
+    const double u = unit(mix64(e.seed ^ mix64(uint64_t(e.local)) ^ mix64(uint64_t(++e.randoms) << 32)));
     if (lua_isnoneornil(L, 1)) lua_pushnumber(L, u);
     else if (lua_isnoneornil(L, 2)) lua_pushnumber(L, u * luaL_checknumber(L, 1));
     else {
@@ -258,7 +362,7 @@ int luaRandom(lua_State* L) {
 }
 
 int luaLoopOut(lua_State* L) {
-    const Eval& e = current();
+    const Eval& e = current(L);
     const std::string kind = luaL_optstring(L, 1, "cycle");
     Param keys = *e.param;
     keys.expr.clear();
@@ -280,13 +384,19 @@ int luaLoopOut(lua_State* L) {
 }
 
 int luaParam(lua_State* L) {
-    const Eval& e = current();
-    const Clip* c = e.owner.clip;
+    const Eval& e = current(L);
+    const Clip* c = e.clip;
     std::string name;
     if (lua_gettop(L) >= 2) {
         if (!e.sequence) return luaL_error(L, "param: no sequence to find the clip in");
-        if (lua_type(L, 1) == LUA_TNUMBER) c = findClip(*e.sequence, {}, Id(lua_tointeger(L, 1)));
-        else c = findClip(*e.sequence, luaL_checkstring(L, 1), 0);
+        if (lua_type(L, 1) == LUA_TNUMBER) {
+            int whole = 0;
+            const lua_Integer id = lua_tointegerx(L, 1, &whole);
+            if (!whole || id <= 0) return luaL_error(L, "param: %s is not a clip's id", luaL_tolstring(L, 1, nullptr));
+            c = findClip(*e.sequence, {}, Id(id));
+        } else {
+            c = findClip(*e.sequence, luaL_checkstring(L, 1), 0);
+        }
         if (!c) return luaL_error(L, "param: no clip %s", luaL_tolstring(L, 1, nullptr));
         name = luaL_checkstring(L, 2);
     } else {
@@ -296,10 +406,11 @@ int luaParam(lua_State* L) {
     const Effect* in = nullptr;
     const Param* p = findSetting(*c, name, &in);
     // At the same moment on the timeline (a setting without a value of its own is at its default).
-    const FrameTime t = (e.owner.clip ? e.owner.clip->start : 0) + e.t - c->start;
+    const FrameTime t = (e.clip ? e.clip->start : 0) + e.t - c->start;
     if (!p) {
-        const std::string type = name.find('.') == std::string::npos ? std::string("transform") : name.substr(0, name.find('.'));
-        const std::string key = name.substr(name.find('.') == std::string::npos ? 0 : name.find('.') + 1);
+        const size_t dot = name.find('.');
+        const std::string type = dot == std::string::npos ? std::string("transform") : name.substr(0, dot);
+        const std::string key = dot == std::string::npos ? name : name.substr(dot + 1);
         const EffectInfo* info = findEffectInfo(type);
         const ParamInfo* pi = nullptr;
         if (info)
@@ -316,15 +427,15 @@ int luaParam(lua_State* L) {
 }
 
 int luaAudio(lua_State* L) {
-    const Eval& e = current();
-    const int track = int(numberArg(L, 1, 0));
+    const Eval& e = current(L);
+    const int track = int(whole(numberArg(L, 1, 0), -1, 1 << 20));
     const std::string band = luaL_optstring(L, 2, "all");
     if (!e.project || !e.sequence) {
         lua_pushnumber(L, 0);
         return 1;
     }
     if (track < 0 || track > int(e.sequence->audioTracks.size())) return luaL_error(L, "audio: no audio track %d", track);
-    const double frame = double((e.owner.clip ? e.owner.clip->start : 0) + e.t);
+    const double frame = double((e.clip ? e.clip->start : 0) + e.t);
     constexpr int kRate = 48000;
     if (band == "all") {
         // Loudness over a frame: the root mean square of its samples (a full-scale sine is about 0.71).
@@ -352,7 +463,8 @@ int luaAudio(lua_State* L) {
 }
 
 int luaClamp(lua_State* L) {
-    lua_pushnumber(L, std::clamp(luaL_checknumber(L, 1), luaL_checknumber(L, 2), std::max(luaL_checknumber(L, 2), luaL_checknumber(L, 3))));
+    const double x = luaL_checknumber(L, 1), lo = luaL_checknumber(L, 2), hi = luaL_checknumber(L, 3);
+    lua_pushnumber(L, std::isnan(x) ? lo : std::clamp(x, lo, std::max(lo, hi)));
     return 1;
 }
 
@@ -363,6 +475,7 @@ int ramp(lua_State* L, bool smooth) {
     if (lua_gettop(L) >= 5) t0 = luaL_checknumber(L, 2), t1 = luaL_checknumber(L, 3), v0 = luaL_checknumber(L, 4), v1 = luaL_checknumber(L, 5);
     else v0 = luaL_checknumber(L, 2), v1 = luaL_checknumber(L, 3);
     double u = t1 == t0 ? (t >= t1 ? 1.0 : 0.0) : std::clamp((t - t0) / (t1 - t0), 0.0, 1.0);
+    if (std::isnan(u)) u = 0;
     if (smooth) u = u * u * (3 - 2 * u);
     lua_pushnumber(L, v0 + (v1 - v0) * u);
     return 1;
@@ -370,22 +483,55 @@ int ramp(lua_State* L, bool smooth) {
 int luaLinear(lua_State* L) { return ramp(L, false); }
 int luaEase(lua_State* L) { return ramp(L, true); }
 
+int readOnly(lua_State* L) { return luaL_error(L, "%s cannot be changed", luaL_tolstring(L, 2, nullptr)); }
+
+// Replaces the library table at `index` with one expressions can read but not change.
+void protect(lua_State* L, int base, const char* name) {
+    lua_newtable(L);
+    lua_newtable(L);
+    lua_getfield(L, base, name);
+    lua_setfield(L, -2, "__index");
+    lua_pushcfunction(L, readOnly);
+    lua_setfield(L, -2, "__newindex");
+    lua_setmetatable(L, -2);
+    lua_setfield(L, base, name);
+}
+
 State* state() {
-    thread_local std::unique_ptr<State> st;
-    if (st) return st.get();
-    st = std::make_unique<State>();
-    lua_State* L = lua_newstate(allocate, st.get());
+    if (tState) return tState.get();
+    tState = std::make_unique<State>();
+    State* st = tState.get();
+    lua_State* L = lua_newstate(allocate, st);
+    if (!L) throw std::bad_alloc();
     st->L = L;
-    // Only what computes: no files, programs, clocks, module loading or loading code from strings.
+    lua_atpanic(L, panic);
+    // Only what computes: no files, programs, clocks, module loading or loading code from strings; nothing that catches
+    // errors (the time limit could not stop it) or reaches metatables (shared by every evaluation); no string matching
+    // or repeating (they run in C, where the time limit is not looked at).
     luaL_requiref(L, LUA_GNAME, luaopen_base, 1);
     luaL_requiref(L, LUA_MATHLIBNAME, luaopen_math, 1);
     luaL_requiref(L, LUA_STRLIBNAME, luaopen_string, 1);
     luaL_requiref(L, LUA_TABLIBNAME, luaopen_table, 1);
     lua_pop(L, 4);
+    lua_getglobal(L, LUA_STRLIBNAME);  // (the strings' own metatable reads it, so they go from the table itself)
+    for (const char* name : {"find", "match", "gmatch", "gsub", "rep", "pack", "packsize", "unpack", "dump"}) {
+        lua_pushnil(L);
+        lua_setfield(L, -2, name);
+    }
+    lua_pop(L, 1);
+    lua_getglobal(L, LUA_TABLIBNAME);
+    lua_pushnil(L);
+    lua_setfield(L, -2, "move");
+    lua_pop(L, 1);
+    lua_getglobal(L, LUA_MATHLIBNAME);  // (without its clock-seeded random numbers: random() is seeded by the setting)
+    lua_pushnil(L);
+    lua_setfield(L, -2, "random");
+    lua_pushnil(L);
+    lua_setfield(L, -2, "randomseed");
+    lua_pop(L, 1);
     lua_newtable(L);  // the globals expressions read
     const int base = lua_gettop(L);
-    for (const char* name : {"assert", "error", "ipairs", "pairs", "next", "pcall", "select", "tonumber", "tostring", "type", "xpcall",
-                             "rawequal", "rawget", "rawlen", "getmetatable", "setmetatable"}) {
+    for (const char* name : {"assert", "error", "ipairs", "pairs", "next", "select", "tonumber", "tostring", "type", "rawequal", "rawget", "rawlen"}) {
         lua_getglobal(L, name);
         lua_setfield(L, base, name);
     }
@@ -393,28 +539,31 @@ State* state() {
         lua_getglobal(L, lib);
         lua_setfield(L, base, lib);
     }
-    // math without its clock-seeded random numbers (random() is seeded by the setting); its functions by name too.
-    lua_getfield(L, base, LUA_MATHLIBNAME);
-    lua_pushnil(L);
-    lua_setfield(L, -2, "random");
-    lua_pushnil(L);
-    lua_setfield(L, -2, "randomseed");
-    lua_pushnil(L);
-    while (lua_next(L, -2)) {
-        lua_pushvalue(L, -2);
-        lua_insert(L, -2);
-        lua_settable(L, base);
-    }
-    lua_pop(L, 1);
     const luaL_Reg helpers[] = {{"wiggle", luaWiggle}, {"noise", luaNoise},   {"random", luaRandom}, {"loopOut", luaLoopOut},
                                 {"param", luaParam},   {"audio", luaAudio},   {"clamp", luaClamp},   {"linear", luaLinear},
                                 {"ease", luaEase},     {nullptr, nullptr}};
     lua_pushvalue(L, base);
     luaL_setfuncs(L, helpers, 0);
     lua_pop(L, 1);
+    // math's functions by name too (not over the ones already there: math.type is not type).
+    lua_getfield(L, base, LUA_MATHLIBNAME);
+    lua_pushnil(L);
+    while (lua_next(L, -2)) {
+        lua_pushvalue(L, -2);
+        if (lua_rawget(L, base) == LUA_TNIL) {
+            lua_pop(L, 1);
+            lua_pushvalue(L, -2);
+            lua_insert(L, -2);
+            lua_rawset(L, base);
+        } else {
+            lua_pop(L, 2);
+        }
+    }
+    lua_pop(L, 1);
+    for (const char* lib : {LUA_MATHLIBNAME, LUA_STRLIBNAME, LUA_TABLIBNAME}) protect(L, base, lib);
     st->base = luaL_ref(L, LUA_REGISTRYINDEX);
     lua_sethook(L, budget, LUA_MASKCOUNT, 1000);
-    return st.get();
+    return st;
 }
 
 // Pushes the compiled function for `expr`; false with the error.
@@ -435,14 +584,13 @@ bool compiled(State& st, const std::string& expr, std::string* error) {
     }
     // A formula, or statements that return the value; its globals are the table it is called with (so the same
     // expression can run inside itself, through param(), each with its own).
-    std::string why;
     const std::string asExpression = "local _ENV = ...; return " + expr, asStatements = "local _ENV = ...; " + expr;
     if (luaL_loadbufferx(L, asExpression.data(), asExpression.size(), "=expression", "t") != LUA_OK) {
         lua_pop(L, 1);
-        if (luaL_loadbufferx(L, asStatements.data(), asStatements.size(), "=expression", "t") != LUA_OK) {
-            why = lua_tostring(L, -1) ? lua_tostring(L, -1) : "does not compile";
+        if (const int status = luaL_loadbufferx(L, asStatements.data(), asStatements.size(), "=expression", "t"); status != LUA_OK) {
+            const std::string why = lua_tostring(L, -1) ? lua_tostring(L, -1) : "does not compile";
             lua_pop(L, 1);
-            st.bad[expr] = why;
+            if (status == LUA_ERRSYNTAX) st.bad[expr] = why;  // (not running out of memory: it may compile next time)
             if (error) *error = why;
             return false;
         }
@@ -452,63 +600,91 @@ bool compiled(State& st, const std::string& expr, std::string* error) {
     return true;
 }
 
+// Runs the compiled expression (its one argument) with its own globals for this evaluation, reading the shared ones:
+// what one evaluation sets does not leak into the next. (A C function called protected: making the table can fail.)
+int run(lua_State* L) {
+    const Eval& e = current(L);
+    lua_newtable(L);
+    lua_newtable(L);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, tState->base);
+    lua_setfield(L, -2, "__index");
+    lua_setmetatable(L, -2);
+    lua_pushnumber(L, e.keyed);
+    lua_setfield(L, -2, "value");
+    lua_pushnumber(L, double(e.local) / e.fps);
+    lua_setfield(L, -2, "time");
+    lua_pushinteger(L, lua_Integer(e.local));
+    lua_setfield(L, -2, "frame");
+    lua_pushnumber(L, e.fps);
+    lua_setfield(L, -2, "fps");
+    lua_pushnumber(L, e.clip ? double(e.clip->duration) / e.fps : 0.0);
+    lua_setfield(L, -2, "duration");
+    lua_call(L, 1, 1);
+    return 1;
+}
+
 }  // namespace
 
 bool expressionsAvailable() { return true; }
 
 bool checkExpression(const std::string& expr, std::string* error) {
-    State& st = *state();
-    if (!compiled(st, expr, error)) return false;
-    lua_pop(st.L, 1);
-    return true;
+    try {
+        State& st = *state();
+        if (!compiled(st, expr, error)) return false;
+        lua_pop(st.L, 1);
+        return true;
+    } catch (...) {
+        if (!tEval.empty()) throw;  // (inside an expression: Lua's own error, for the call around it)
+        tState.reset();
+        if (error) *error = "out of memory";
+        return false;
+    }
 }
 
-double evaluateExpression(const Param& p, FrameTime t, double keyed) {
-    if (tEval.empty()) tLooped = false;
+double evaluateExpression(const Param& p, FrameTime t, double keyed, std::string* errorOut) {
+    const bool outermost = tEval.empty();
+    if (outermost) tLooped = false;
+    const ExpressionContext where = currentExpressionContext();
+    Owner scratch;
+    Owner& owner = ownerOf(where, p, scratch);
+    std::string error;
+    double out = keyed;
+    auto finish = [&]() {
+        noteError(owner, error);
+        if (errorOut) *errorOut = error;
+        if (!error.empty()) return keyed;
+        // Within the setting's range (angles turn on past a turn); switches and choices whole.
+        if (owner.described) {
+            if (owner.kind == ParamKind::Bool) out = out >= 0.5 ? 1.0 : 0.0;
+            else if (owner.kind == ParamKind::Choice) out = std::round(out);
+            if (owner.kind != ParamKind::Angle && owner.max > owner.min) out = std::clamp(out, owner.min, owner.max);
+        }
+        return out;
+    };
     if (int(tEval.size()) >= kMaxDepth) {
         tLooped = true;
-        noteError(p.expr, "Expressions read each other in a loop");
-        return keyed;
+        error = "Expressions read each other in a loop";
+        return finish();
     }
     Eval e;
     e.param = &p;
     e.t = t;
+    e.local = t - p.exprFrom;
     e.keyed = keyed;
-    const ExpressionContext where = currentExpressionContext();
-    const Clip* clip = where.clip;
     e.project = where.project, e.sequence = where.sequence;
-    if (e.sequence) {
-        e.fps = std::max(1.0, e.sequence->fpsValue());
-        if (!findOwner(*e.sequence, clip, &p, e.owner) && clip && !findOwner(*e.sequence, nullptr, &p, e.owner))
-            e.owner.clip = clip;  // (a setting not in the sequence, such as a copy being tried out: the scope's clip)
-    }
-    e.seed = e.owner.effect ? mix64(uint64_t(e.owner.clip ? e.owner.clip->id : 0) * 1000003u + uint64_t(e.owner.effect->id)) ^ hashText(e.owner.name)
-                            : hashText(p.expr);
-    State& st = *state();
-    lua_State* L = st.L;
-    const int top = lua_gettop(L);
-    std::string error;
-    double out = keyed;
-    tEval.push_back(e);
-    if (compiled(st, p.expr, &error)) {
-        // Its own globals each time, reading the shared ones: what one evaluation sets does not leak into the next.
-        lua_newtable(L);
-        lua_newtable(L);
-        lua_rawgeti(L, LUA_REGISTRYINDEX, st.base);
-        lua_setfield(L, -2, "__index");
-        lua_setmetatable(L, -2);
-        lua_pushnumber(L, keyed);
-        lua_setfield(L, -2, "value");
-        lua_pushnumber(L, double(t) / e.fps);
-        lua_setfield(L, -2, "time");
-        lua_pushinteger(L, lua_Integer(t));
-        lua_setfield(L, -2, "frame");
-        lua_pushnumber(L, e.fps);
-        lua_setfield(L, -2, "fps");
-        lua_pushnumber(L, e.owner.clip ? double(e.owner.clip->duration) / e.fps : 0.0);
-        lua_setfield(L, -2, "duration");
-        if (tEval.size() == 1) st.ticks = 0;  // (the ones it reads through param() share its time)
-        try {
+    e.clip = owner.clip;
+    if (e.sequence) e.fps = std::max(1.0, e.sequence->fpsValue());
+    e.seed = p.exprSeed                    ? mix64(p.exprSeed)
+             : owner.effect && owner.clip ? mix64(expressionSeed(owner.clip->id, owner.effect->id, owner.name))
+                                          : hashText(p.expr);
+    try {
+        State& st = *state();
+        lua_State* L = st.L;
+        const int top = lua_gettop(L);
+        Evaluating evaluating(e);
+        lua_pushcfunction(L, run);
+        if (compiled(st, p.expr, &error)) {
+            if (outermost) st.ticks = 0;  // (the ones it reads through param() share its time)
             if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
                 error = lua_tostring(L, -1) ? lua_tostring(L, -1) : "failed";
             } else if (lua_isboolean(L, -1)) {
@@ -520,14 +696,14 @@ double evaluateExpression(const Param& p, FrameTime t, double keyed) {
             } else {
                 out = v;
             }
-        } catch (const std::exception& x) {  // (out of memory and the like)
-            error = x.what();
         }
+        lua_settop(L, top);
+    } catch (...) {
+        if (!outermost) throw;  // (Lua's own error, unwinding to the call around this one)
+        tState.reset();        // (a panic: start again)
+        error = "out of memory";
     }
-    tEval.pop_back();
-    lua_settop(L, top);
-    noteError(p.expr, error);
-    return error.empty() ? out : keyed;
+    return finish();
 }
 
 #endif
@@ -550,6 +726,10 @@ Effect* settingOf(Project& p, Clip& c, Id effect, const std::string& param, Para
     }
     if (!e) {
         *error = "No such effect on the clip";
+        return nullptr;
+    }
+    if (e == &c.timing) {  // (the clip's length follows its speed: it cannot come from a formula run a frame at a time)
+        *error = "Speed cannot have an expression";
         return nullptr;
     }
     // (Plug-ins' settings too: effectParams describes them from the effect.)
@@ -583,7 +763,10 @@ Result setExpression(Project& p, Sequence& s, Id clipId, Id effect, const std::s
         if (expr.empty()) return {};
         it = e->params.emplace(param, Param(info.def)).first;
     }
-    it->second.expr = expr;
+    Param& prm = it->second;
+    prm.expr = expr;
+    if (expr.empty()) prm.exprFrom = 0, prm.exprSeed = 0;
+    else if (prm.exprSeed == 0) prm.exprSeed = expressionSeed(c->id, e->id, param);
     return {};
 }
 
@@ -601,8 +784,9 @@ Result bakeExpression(Project& p, Sequence& s, Id clipId, Id effect, const std::
     {
         ExpressionScope scope(&p, &s, c);
         for (FrameTime f = 0; f < c->duration; ++f) {
-            const double v = prm.at(f);
-            if (const std::string why = expressionError(prm.expr); !why.empty()) return Result::fail("The expression fails at frame " + std::to_string(f) + ": " + why);
+            std::string why;
+            const double v = evaluateExpression(prm, f, prm.keyedAt(f), &why);
+            if (!why.empty()) return Result::fail("The expression fails at frame " + std::to_string(f) + ": " + why);
             keys.push_back({f, v});
         }
     }
@@ -614,11 +798,16 @@ Result bakeExpression(Project& p, Sequence& s, Id clipId, Id effect, const std::
             if (changes.empty() || k.v != changes.back().v) changes.push_back(k);
         keys = std::move(changes);
     } else {
-        thinKeys(keys, std::max(1e-9, (info.max - info.min) * 0.001));
+        // (Within a thousandth of what it spans: the setting's whole range could be far wider than its movement.)
+        double lo = keys.empty() ? 0.0 : keys.front().v, hi = lo;
+        for (const Keyframe& k : keys) lo = std::min(lo, k.v), hi = std::max(hi, k.v);
+        thinKeys(keys, std::max(1e-9, (hi - lo) * 0.001));
     }
     Param& out = it->second;
     out.keys = std::move(keys);
     out.expr.clear();
+    out.exprFrom = 0;
+    out.exprSeed = 0;
     out.repeat = Repeat::Hold;
     if (!out.keys.empty()) out.value = out.keys.front().v;
     return {};

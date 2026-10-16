@@ -41,6 +41,9 @@ private:
     // The other selected clips a change to `target` also goes to (Resolve's multi-clip Inspector), and applying
     // `fn` to their matching effects at their own times, inside an edit.
     std::vector<Id> otherSelected(const Target& target) const;
+    // Whether `target` is one of its clip's own settings an expression can drive (its Transform, generator, sound or an
+    // effect it carries; not its speed, a trim, a grade node or a group's).
+    bool ownSetting(const Target& target) const;
     void applyToOthers(Sequence& s, const Target& target, const std::vector<Id>& others, FrameTime playhead,
                        const std::function<void(Effect&, FrameTime)>& fn) const;
 
