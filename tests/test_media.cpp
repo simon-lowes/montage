@@ -43,7 +43,9 @@
 #include "core/MediaLog.h"
 #include "core/Multicam.h"
 #include "core/Effects.h"
+#include "core/Expression.h"
 #include "core/ProjectIO.h"
+#include "render/Expressions.h"
 #include "core/Surround.h"
 #include "core/Transcript.h"
 #include "core/TranscriptEdit.h"
@@ -135,6 +137,7 @@
 #include "render/Hdr10Plus.h"
 #include "media/Faces.h"
 #include "media/FaceMesh.h"
+#include "media/LipSync.h"
 #include "render/FaceShape.h"
 #include "media/FaceTracks.h"
 #include "media/DepthMap.h"
@@ -4440,6 +4443,197 @@ private slots:
         const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         QVERIFY(r.value("structuredContent").toObject().value("keys").toInt() >= 2);
+    }
+
+    void parameterExpressions() {
+        if (!expressionsAvailable()) QSKIP("Built without Lua");
+        constexpr int sr = 48000;
+        // A 1 kHz tone, silent for its first second and loud for the next, on A1 from frame 10; two colour clips above.
+        std::vector<float> mono(size_t(sr) * 2);
+        for (size_t i = size_t(sr); i < mono.size(); ++i) mono[i] = float(0.5 * std::sin(2 * M_PI * 1000 * double(i) / sr));
+        const std::string wav = path("expr.wav");
+        QVERIFY(writeMonoWav(wav, mono, sr));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = Rational{50, 1};
+        MediaItem m = probeOrFail(p, wav);
+        p.media.push_back(m);
+        Clip tone = makeClip(p, m, TrackKind::Audio, s);
+        tone.start = 10;
+        edit::overwrite(p, s, {TrackKind::Audio, 0}, tone);
+        Clip a = makeGeneratorClip(p, "color", 100);
+        a.name = "Lead";
+        a.start = 10;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, a);
+        Clip b = makeGeneratorClip(p, "color", 100);
+        b.name = "Follower";
+        b.start = 30;
+        edit::overwrite(p, s, {TrackKind::Video, 1}, b);
+        Clip& lead = *edit::clipById(s, a.id);
+        Clip& follower = *edit::clipById(s, b.id);
+        ExpressionScope scope(&p, &s);
+        auto set = [&](Clip& c, const std::string& name, const std::string& expr) {
+            const edit::Result r = edit::setExpression(p, s, c.id, 0, name, expr);
+            QVERIFY2(r.ok, r.error.c_str());
+        };
+        auto at = [&](const Clip& c, const std::string& name, FrameTime t) { return c.motion.params.at(name).at(t); };
+        // Time in seconds at the sequence's rate, frames, and the keyed value.
+        set(lead, "pos_x", "value + time * 100 + frame");
+        QCOMPARE(at(lead, "pos_x", 25), 0 + 50.0 + 25);
+        lead.motion.params["pos_x"].addKey(0, 0);
+        lead.motion.params["pos_x"].addKey(10, 100);
+        QCOMPARE(at(lead, "pos_x", 5), 50 + 10.0 + 5);
+        // Statements work too, with their own variables each time.
+        set(lead, "rotation", "x = (x or 0) + 1 local y = x * 10 return y");
+        QCOMPARE(at(lead, "rotation", 3), 10.0);
+        QCOMPARE(at(lead, "rotation", 3), 10.0);
+        // Wiggle: smooth, within its amount around the value, the same every time and on any thread, and different for
+        // another setting with the same expression.
+        set(lead, "anchor_x", "wiggle(2, 30)");
+        set(lead, "anchor_y", "wiggle(2, 30)");
+        std::vector<double> wx, wy;
+        for (FrameTime t = 0; t < 100; ++t) wx.push_back(at(lead, "anchor_x", t)), wy.push_back(at(lead, "anchor_y", t));
+        double spread = 0, jump = 0, apart = 0;
+        for (size_t i = 0; i < wx.size(); ++i) {
+            QVERIFY(std::fabs(wx[i]) <= 30.0001);
+            spread = std::max(spread, std::fabs(wx[i]));
+            apart = std::max(apart, std::fabs(wx[i] - wy[i]));
+            if (i) jump = std::max(jump, std::fabs(wx[i] - wx[i - 1]));
+        }
+        QVERIFY2(spread > 5 && jump < 6 && apart > 5, qPrintable(QString("%1 %2 %3").arg(spread).arg(jump).arg(apart)));
+        double elsewhere = 0;
+        std::thread([&] {
+            ExpressionScope there(&p, &s);
+            elsewhere = at(lead, "anchor_x", 37);
+        }).join();
+        QCOMPARE(elsewhere, wx[37]);
+        // Cut in two, the second part carries on where the wiggle was (its time and seed go with it).
+        {
+            Project q = p;
+            Sequence& qs = *q.active();
+            QVERIFY(edit::razor(q, qs, {TrackKind::Video, 0}, lead.start + 40).ok);
+            const Clip* second = edit::clipAt(qs, {TrackKind::Video, 0}, lead.start + 40);
+            QVERIFY(second && second->start == lead.start + 40);
+            ExpressionScope there(&q, &qs);
+            for (FrameTime t : {0, 7, 30}) QCOMPARE(second->motion.params.at("anchor_x").at(t), wx[size_t(40 + t)]);
+        }
+        // Random: steady at a frame, new at the next; noise smooth.
+        set(lead, "scale_x", "random(50, 150)");
+        const double r1 = at(lead, "scale_x", 7);
+        QCOMPARE(at(lead, "scale_x", 7), r1);
+        QVERIFY(r1 >= 50 && r1 <= 150 && at(lead, "scale_x", 8) != r1);
+        // Keys played again after the last one.
+        Param& loop = lead.motion.params["scale_y"];
+        loop.addKey(0, 0);
+        loop.addKey(10, 10);
+        for (const auto& [kind, want] : std::vector<std::pair<std::string, double>>{{"cycle", 3}, {"pingpong", 7}, {"offset", 13}, {"continue", 13}}) {
+            set(lead, "scale_y", "loopOut(\"" + kind + "\")");
+            QCOMPARE(at(lead, "scale_y", 13), want);
+        }
+        // Another clip's setting at the same moment on the timeline, and this clip's own.
+        set(follower, "pos_y", "param(\"Lead\", \"pos_x\") + param(\"opacity\")");
+        QCOMPARE(at(follower, "pos_y", 0), at(lead, "pos_x", 20) + 100);
+        set(follower, "pos_y", "param(" + std::to_string(lead.id) + ", \"transform.pos_x\")");
+        QCOMPARE(at(follower, "pos_y", 5), at(lead, "pos_x", 25));
+        // The sound: silent in the first second, about 0.25 after (the tone's root mean square: 0.5 at -3 dB, as mono plays on
+        // both channels); in the mids, not the lows.
+        set(follower, "anchor_x", "audio(1) * 100");
+        set(follower, "anchor_y", "audio(1, \"mid\") * 100 + audio(1, \"low\") * 1000");
+        QVERIFY2(at(follower, "anchor_x", 10 + 25 - 30) < 0.1, qPrintable(QString::number(at(follower, "anchor_x", 5))));
+        const double loud = at(follower, "anchor_x", 10 + 75 - 30), band = at(follower, "anchor_y", 10 + 75 - 30);
+        QVERIFY2(std::fabs(loud - 25) < 1, qPrintable(QString::number(loud)));
+        QVERIFY2(std::fabs(band - 25) < 3, qPrintable(QString::number(band)));
+        // Errors: the keyed value instead, and why.
+        // (Nothing that could catch the time limit, run long in C, or change what other evaluations share.)
+        follower.motion.params["rotation"] = Param(12);
+        auto failure = [&] { return expressionError(follower.id, follower.motion.id, "rotation"); };
+        for (const std::string bad : {"nil + 1", "os.execute('true')", "io.open('x')", "require('os')", "load('return 1')()",
+                                      "while true do end", "string.rep('x', 1 << 30)", "('x'):rep(1 << 30)", "\"text\"", "1 / 0",
+                                      "param(\"Nobody\", \"pos_x\")", "param(1.5, \"pos_x\")", "pcall(function() while true do end end)",
+                                      "('x'):find(string.rep and 'x' or '(.-)*$')", "getmetatable('').__index", "string.upper = nil",
+                                      "math.pi = 3", "table.move({}, 1, 1 << 40, 2)"}) {
+            follower.motion.params["rotation"].expr = bad;
+            QCOMPARE(at(follower, "rotation", 3), 12.0);
+            QVERIFY2(!failure().empty(), bad.c_str());
+        }
+        follower.motion.params["rotation"].expr = "(type(1) == 'number' and math.pi == pi and string.upper('a') == 'A') and 5 or 0";
+        QCOMPARE(at(follower, "rotation", 3), 5.0);
+        QVERIFY(!checkExpression("value +"));
+        QVERIFY(!edit::setExpression(p, s, follower.id, 0, "rotation", "value +").ok);
+        QVERIFY(!edit::setExpression(p, s, follower.id, 0, "nonsense", "1").ok);
+        follower.motion.params["rotation"].expr = "value * 2";
+        QCOMPARE(at(follower, "rotation", 3), 24.0);
+        QVERIFY(failure().empty());
+        // Within the setting's range (an angle turns on past a turn).
+        set(lead, "opacity", "value * 5");
+        QCOMPARE(at(lead, "opacity", 3), 100.0);
+        set(lead, "opacity", "");
+        follower.motion.params["rotation"].expr = "720 + frame";
+        QCOMPARE(at(follower, "rotation", 3), 723.0);
+        // Expressions reading each other in a loop stop, with the error.
+        set(lead, "crop_left", "param(\"Follower\", \"crop_left\") + 1");
+        set(follower, "crop_left", "param(\"Lead\", \"crop_left\") + 1");
+        const double looped = at(lead, "crop_left", 30);
+        QVERIFY(std::isfinite(looped));
+        QVERIFY(!expressionError(lead.id, lead.motion.id, "crop_left").empty());
+        // In the picture: the follower, red over black, fades in over its first second.
+        for (const char* name : {"pos_y", "anchor_x", "anchor_y", "crop_left"}) follower.motion.params[name] = Param(0.0);
+        set(follower, "opacity", "linear(time, 0, 1, 0, 100)");
+        for (const char* c : {"color.r", "color.g", "color.b"}) {
+            lead.generator.params[c] = Param(0.0);
+            follower.generator.params[c] = Param(std::strcmp(c, "color.r") ? 0.0 : 1.0);
+        }
+        RenderOptions o;
+        auto red = [&](FrameTime t) { const Image img = renderSequenceFrame(p, s, t, o); return img.at(32, 18)[0]; };
+        const float lit0 = red(30), lit1 = red(30 + 25), lit2 = red(30 + 60);
+        QVERIFY2(lit0 < lit1 && lit1 < lit2 && std::fabs(lit2 - 1.0f) < 0.02, qPrintable(QString("%1 %2 %3").arg(lit0).arg(lit1).arg(lit2)));
+        // Saved and loaded.
+        QVERIFY(saveProject(p, path("expr.montage")));
+        Project back;
+        QVERIFY(loadProject(path("expr.montage"), back));
+        const Clip* again = edit::clipById(*back.active(), follower.id);
+        QVERIFY(again && again->motion.params.at("opacity").expr == "linear(time, 0, 1, 0, 100)");
+        QCOMPARE(again->motion.params.at("pos_y").expr, follower.motion.params.at("pos_y").expr);
+        const Param& wiggled = edit::clipById(*back.active(), lead.id)->motion.params.at("anchor_x");
+        QVERIFY(wiggled.exprSeed != 0 && wiggled.exprSeed == lead.motion.params.at("anchor_x").exprSeed);
+        {
+            ExpressionScope there(&back, back.active());
+            QCOMPARE(wiggled.at(37), wx[37]);
+        }
+        // Baked to keys: as few as needed, the same values, no expression left.
+        const edit::Result baked = edit::bakeExpression(p, s, follower.id, 0, "opacity");
+        QVERIFY2(baked.ok, baked.error.c_str());
+        const Param& fade = follower.motion.params.at("opacity");
+        QVERIFY(fade.expr.empty() && fade.keys.size() >= 2 && fade.keys.size() <= 3);
+        QVERIFY(std::fabs(fade.at(25) - 50) < 0.2 && std::fabs(fade.at(80) - 100) < 1e-9);
+        QVERIFY(!edit::bakeExpression(p, s, follower.id, 0, "opacity").ok);  // nothing to bake now
+        // Over MCP: set, with its value and error, and baked.
+        const QString project = QString::fromStdString(path("expr-mcp.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_expression"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"project", project}, {"clip", double(follower.id)}, {"param", "rotation"}, {"expression", "frame * 3"}, {"at", 4}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("value").toDouble(), 12.0);
+        r = call({{"project", project}, {"clip", double(follower.id)}, {"param", "rotation"}, {"expression", "nil + frame"}});
+        QVERIFY(!r.value("isError").toBool() && r.value("structuredContent").toObject().contains("error"));
+        QVERIFY(call({{"project", project}, {"clip", double(follower.id)}, {"param", "rotation"}, {"expression", "frame +"}}).value("isError").toBool());
+        call({{"project", project}, {"clip", double(follower.id)}, {"param", "rotation"}, {"expression", "frame * 3"}});
+        r = call({{"project", project}, {"clip", double(follower.id)}, {"param", "rotation"}, {"action", "bake"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project fromMcp;
+        QVERIFY(loadProject(project.toStdString(), fromMcp));
+        const Param& turned = edit::clipById(*fromMcp.active(), follower.id)->motion.params.at("rotation");
+        QVERIFY(turned.expr.empty() && turned.keys.size() == 2 && turned.at(10) == 30);
+        r = call({{"project", project}, {"clip", double(follower.id)}, {"param", "rotation"}, {"action", "get"}, {"at", 10}});
+        QVERIFY(!r.value("isError").toBool() && r.value("structuredContent").toObject().value("value").toDouble() == 30);
     }
 
     void imageSequences() {
@@ -12091,6 +12285,258 @@ if ui["pressed"] == "add":
             QVERIFY2(before > 3 && std::hypot(ax - hx - (tx - bx), ay - hy - (ty - by)) < 1.5,
                      qPrintable(QString("highlight (%1, %2) -> (%3, %4), iris (%5, %6) to (%7, %8)").arg(hx).arg(hy).arg(ax).arg(ay).arg(bx).arg(by).arg(tx).arg(ty)));
         }
+    }
+
+    void lipSyncDubbing() {
+        std::string err;
+        // What a video frame hears, cut as MuseTalk cuts it: ten encoding frames from two video frames' worth before
+        // it (encoding frame j filled with j + 1 here), silence before the start and past the end.
+        const size_t fs = size_t(kLipSyncLayers) * kLipSyncWidth;
+        std::vector<std::vector<float>> encoded(40);
+        for (size_t j = 0; j < encoded.size(); ++j) encoded[j].assign(fs, float(j + 1));
+        auto feature = [&](int64_t j) -> const float* { return j < int64_t(encoded.size()) ? encoded[size_t(j)].data() : nullptr; };
+        const std::vector<float> w0 = lipSyncWindow(0, 25, feature);
+        QCOMPARE(w0.size(), size_t(kLipSyncTokens) * kLipSyncWidth);
+        QCOMPARE(w0[0], 0.0f);
+        QCOMPARE(w0[3 * fs], 0.0f);
+        QCOMPARE(w0[4 * fs], 1.0f);
+        QCOMPARE(w0[9 * fs + fs - 1], 6.0f);
+        const std::vector<float> w10 = lipSyncWindow(10, 25, feature);
+        QCOMPARE(w10[0], 17.0f);
+        QCOMPARE(w10[9 * fs], 26.0f);
+        // (at 30 fps a video frame is 5/3 encoding frames, and two of them round up to four: frame 3 starts at 5 - 4)
+        QCOMPARE(lipSyncWindow(3, 30, feature)[0], 2.0f);
+        const std::vector<float> late = lipSyncWindow(20, 25, feature);
+        QCOMPARE(late[3 * fs], 40.0f);
+        QCOMPARE(late[4 * fs], 0.0f);
+
+        int64_t first = -1, last = -1;
+        lipSyncSegments(0, 25, first, last);
+        QVERIFY(first == 0 && last == 0);
+        lipSyncSegments(748, 25, first, last);  // (encoding frames 1492..1501: both stretches)
+        QVERIFY(first == 0 && last == 1);
+        lipSyncSegments(800, 25, first, last);
+        QVERIFY(first == 1 && last == 1);
+
+        // What it hears: each clip of the track over its own span (a dub is a clip a line), from where it is trimmed,
+        // the track named heard even muted, and every track that is not muted when none is.
+        {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            MediaItem words = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/jfk.wav");
+            p.media.push_back(words);
+            QVERIFY(edit::placeMedia(p, s, words.id, 0, 30, 55, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false, false, true).ok);
+            QVERIFY(edit::placeMedia(p, s, words.id, 50, 100, 125, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false, false, true).ok);
+            QCOMPARE(s.audioTracks[1].clips.size(), size_t(2));
+            const double fps = s.fpsValue();
+            AudioBufferPtr ref = decodeAudio(MONTAGE_TEST_DATA_DIR "/jfk.wav", kLipSyncRate, &err);
+            QVERIFY(ref);
+            auto refAt = [&](double frame) {
+                const size_t i = size_t(std::floor(frame * kLipSyncRate / fps));
+                return 0.5f * (ref->samples[i * 2] + ref->samples[i * 2 + 1]);
+            };
+            const int n = int(std::lround(100 / fps * kLipSyncRate));
+            auto check = [&](const std::vector<float>& heard, bool audible) {
+                QCOMPARE(int(heard.size()), n);
+                double gap = 0, lines = 0, missed = 0;
+                for (int i = 0; i < n; ++i) {
+                    const double f = i * fps / kLipSyncRate;
+                    // (not the samples right at a clip's edge)
+                    static const double edges[] = {25, 50, 75};
+                    if (std::any_of(std::begin(edges), std::end(edges), [&](double edge) { return std::fabs(f - edge) < 2 * fps / kLipSyncRate; }))
+                        continue;
+                    if ((f >= 25 && f < 50) || f >= 75) gap += std::fabs(heard[size_t(i)]);
+                    else {
+                        const float want = audible ? refAt(f < 25 ? 30 + f : 100 + f - 50) : 0.0f;
+                        lines += std::fabs(want), missed += std::fabs(heard[size_t(i)] - want);
+                    }
+                }
+                QCOMPARE(gap, 0.0);
+                QVERIFY2(missed <= 0.02 * std::max(1.0, lines), qPrintable(QString("%1 of %2").arg(missed).arg(lines)));
+                if (audible) QVERIFY(lines > 1);
+            };
+            check(trackSoundFrom(p, s, 2, 0, n, kLipSyncRate), true);
+            check(trackSoundFrom(p, s, 0, 0, n, kLipSyncRate), true);
+            s.audioTracks[1].muted = true;
+            check(trackSoundFrom(p, s, 2, 0, n, kLipSyncRate), true);
+            check(trackSoundFrom(p, s, 0, 0, n, kLipSyncRate), false);
+            QCOMPARE(lipSyncTrack(s, std::to_string(s.audioTracks[1].id)), 2);
+            QCOMPARE(lipSyncTrack(s, ""), 0);
+            QCOMPARE(lipSyncTrack(s, "999999"), -1);
+        }
+
+        // The crop and the mask from a face's mesh: an oval face 80 x 100 about (100, 100), the bridge of its nose at
+        // y 90. The crop runs across the jaw, from as far above the bridge as the chin is below it to a little under the
+        // chin; the mask covers the face below the nose, down past the chin, and nothing else.
+        {
+            static const int oval[] = {10,  338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377,
+                                       152, 148, 176, 149, 150, 136, 172, 58,  132, 93,  234, 127, 162, 21,  54,  103, 67,  109};
+            FaceMesh f;
+            f.points.assign(size_t(kFaceMeshAllPoints) * 3, 100.0f);
+            for (int i = 0; i < 36; ++i) {
+                const double a = (-90.0 + 10.0 * i) * M_PI / 180;
+                f.points[size_t(oval[i]) * 3] = float(100 + 40 * std::cos(a));
+                f.points[size_t(oval[i]) * 3 + 1] = float(100 + 50 * std::sin(a));
+            }
+            f.points[195 * 3 + 1] = 90;
+            const LipSyncBox box = lipSyncBox(f, 200, 200);
+            QCOMPARE(box.x0, 60);
+            QCOMPARE(box.x1, 140);
+            QCOMPARE(box.y0, 30);
+            QCOMPARE(box.y1, 155);
+            const std::vector<float> mask = lipSyncMask(f, box, 200, 200);
+            auto at = [&](int x, int y) { return mask[size_t(y) * 200 + size_t(x)]; };
+            QVERIFY(at(100, 130) > 0.99f && at(80, 120) > 0.99f);
+            QVERIFY(at(100, 152) > 0.5f);  // (under the chin, for a jaw that opens further)
+            QVERIFY(at(100, 60) < 0.01f && at(10, 10) == 0.0f && at(100, 170) < 0.01f && at(150, 120) < 0.01f);
+            FaceMesh flat = f;
+            flat.points[195 * 3 + 1] = 160;  // (no face: the bridge below the chin)
+            QVERIFY(lipSyncBox(flat, 200, 200).empty());
+        }
+
+        // Lip Sync given to the picture under a dub: the clips from media that play while its track sounds, once.
+        {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            QVERIFY(s.audioTracks.size() >= 2 && !s.videoTracks.empty());
+            auto clip = [&](FrameTime start, FrameTime length, Id media) {
+                Clip c;
+                c.id = p.newId();
+                c.mediaId = media;
+                c.start = start;
+                c.duration = length;
+                return c;
+            };
+            s.videoTracks[0].clips = {clip(0, 50, 7), clip(100, 50, 7), clip(200, 50, 0)};
+            s.videoTracks[0].clips[2].generator = makeEffect(p, "color");
+            s.audioTracks[1].clips = {clip(40, 20, 8), clip(210, 10, 8)};
+            QCOMPARE(edit::lipSyncToTrack(p, s, 1), 1);
+            const auto& fx = s.videoTracks[0].clips[0].effects;
+            QVERIFY(fx.size() == 1 && fx[0].type == "lip_sync" && fx[0].s("track") == std::to_string(s.audioTracks[1].id));
+            QVERIFY(s.videoTracks[0].clips[1].effects.empty() && s.videoTracks[0].clips[2].effects.empty());
+            QCOMPARE(edit::lipSyncToTrack(p, s, 1), 0);  // (already)
+            s.videoTracks[0].clips[0].effects[0].strings["track"] = std::to_string(s.audioTracks[0].id);
+            QCOMPARE(edit::lipSyncToTrack(p, s, 1), 1);
+            QCOMPARE(s.videoTracks[0].clips[0].effects.size(), size_t(1));
+            QCOMPARE(edit::lipSyncToTrack(p, s, 5), 0);
+        }
+        // Through MCP it needs the person's consent.
+        {
+            Project p = makeDefaultProject();
+            Clip c = makeGeneratorClip(p, "color", 10);
+            edit::overwrite(p, *p.active(), {TrackKind::Video, 0}, c);
+            const QString project = QString::fromStdString(path("lipsync-mcp.montage"));
+            QVERIFY(saveProject(p, project.toStdString()));
+            McpServer server;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_add_effect"},
+                                                         {"arguments", QJsonObject{{"project", project}, {"clip", double(c.id)}, {"effect", "lip_sync"}}},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            QVERIFY(r.value("isError").toBool());
+            QVERIFY(QJsonDocument(r).toJson().contains("consent"));
+        }
+
+        if (!lipSyncAvailable()) QSKIP("Built without ONNX Runtime");
+        if (!lipSyncModel().installed() || !faceModel().installed() || !faceMeshModel().installed())
+            QSKIP("Set MONTAGE_LIPSYNC_MODEL to the lip sync model and MONTAGE_FACE_MODEL to the face models (with the face mesh)");
+        VideoDecoder dec;
+        Frame16Ptr frame;
+        if (dec.open(MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg", &err)) frame = dec.frameAt(0);
+        QVERIFY2(frame, err.c_str());
+        const Image jfk = toImage(*frame);
+        auto meshOf = [](const Image& img, FaceMesh& mesh) {
+            std::shared_ptr<const std::vector<FaceBox>> faces = cachedFaces(img);
+            return faces && !faces->empty() && fitFaceMesh(img, faces->front(), mesh);
+        };
+        FaceMesh mesh;
+        QVERIFY(meshOf(jfk, mesh));
+        // How far the lips part, for the face's height.
+        auto opening = [&](const Image& img) {
+            FaceMesh m;
+            if (!meshOf(img, m)) return -1.0;
+            return double(m.y(14) - m.y(13)) / double(m.y(152) - m.y(10));
+        };
+        // Whisper's encoding of JFK's words and of silence; a frame that hears silence keeps its mouth shut, and among
+        // frames through the speech some open it well beyond that.
+        AudioBufferPtr sound = decodeAudio(MONTAGE_TEST_DATA_DIR "/jfk.wav", kLipSyncRate, &err);
+        QVERIFY2(sound, err.c_str());
+        std::vector<float> mono(size_t(sound->frames()));
+        for (size_t i = 0; i < mono.size(); ++i) {
+            float sum = 0;
+            for (int c = 0; c < sound->channels; ++c) sum += sound->samples[i * size_t(sound->channels) + size_t(c)];
+            mono[i] = sum / float(sound->channels);
+        }
+        std::vector<float> speech, silence;
+        QVERIFY2(lipSyncEncodeSound(mono, speech, &err), err.c_str());
+        QCOMPARE(speech.size(), size_t(kLipSyncSegment / kLipSyncRate * kLipSyncFeatureRate) * fs);
+        QVERIFY(lipSyncEncodeSound({}, silence, &err));
+        for (float v : speech) QVERIFY(std::isfinite(v));
+        auto windowOf = [&](const std::vector<float>& enc, int64_t index) {
+            return lipSyncWindow(index, 25, [&](int64_t j) { return enc.data() + size_t(j) * fs; });
+        };
+        Image shut = jfk;
+        QVERIFY2(lipSyncFace(shut, mesh, windowOf(silence, 50), 1.0, &err), err.c_str());
+        const double closed = opening(shut);
+        QVERIFY(closed >= 0);
+        double widest = 0;
+        Image spoken;
+        QElapsedTimer drawing;
+        drawing.start();
+        for (int64_t index = 15; index <= 240; index += 15) {
+            Image said = jfk;
+            QVERIFY2(lipSyncFace(said, mesh, windowOf(speech, index), 1.0, &err), err.c_str());
+            if (const double o = opening(said); o > widest) widest = o, spoken = said;
+        }
+        qInfo("Lips apart: %.3f of the face hearing silence, %.3f at most through the speech; %.2f s a frame (with the mesh)", closed,
+              widest, drawing.elapsed() / 16000.0);
+        QVERIFY2(widest > closed + 0.02, qPrintable(QString("shut %1, widest %2").arg(closed).arg(widest)));
+        // Only the face below the nose changes; the eyes and everything round the face stay as they were.
+        const LipSyncBox box = lipSyncBox(mesh, jfk.width, jfk.height);
+        double changedIn = 0, changedOut = 0;
+        for (int y = 0; y < jfk.height; ++y)
+            for (int x = 0; x < jfk.width; ++x) {
+                const double d = std::fabs(spoken.at(x, y)[0] - jfk.at(x, y)[0]) + std::fabs(spoken.at(x, y)[1] - jfk.at(x, y)[1]);
+                (x >= box.x0 && x < box.x1 && y >= box.y0 && y < box.y1 ? changedIn : changedOut) += d;
+            }
+        QVERIFY2(changedIn > 0 && changedOut == 0, qPrintable(QString("%1 %2").arg(changedIn).arg(changedOut)));
+        const int eye = std::lround(mesh.y(33)), eyeX = std::lround(mesh.x(33));
+        QVERIFY(std::equal(spoken.at(eyeX, eye), spoken.at(eyeX, eye) + 4, jfk.at(eyeX, eye)));
+        Image untouched = jfk;
+        QVERIFY(lipSyncFace(untouched, mesh, windowOf(speech, 30), 0.0, &err));
+        QCOMPARE(untouched.px, jfk.px);
+
+        // As a clip effect on the portrait with the speech on a track below: a view that cannot wait goes without it;
+        // rendered ahead it is there, and the view has it after.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = jfk.width;
+        s.height = jfk.height;
+        MediaItem still = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg");
+        p.media.push_back(still);
+        MediaItem words = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/jfk.wav");
+        p.media.push_back(words);
+        QVERIFY(edit::placeMedia(p, s, still.id, 0, 0, 100, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, words.id, 0, 0, 100, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false, false, true).ok);
+        const Image without = renderSequenceFrame(p, s, 30, {});
+        QCOMPARE(edit::lipSyncToTrack(p, s, 1), 1);
+        RenderIssues quick;
+        RenderOptions interactive;
+        interactive.issues = &quick;
+        QCOMPARE(renderSequenceFrame(p, s, 30, interactive).px, without.px);
+        QVERIFY(quick.incomplete);
+        RenderIssues full;
+        RenderOptions ahead;
+        ahead.slowEffects = true;
+        ahead.issues = &full;
+        const Image with = renderSequenceFrame(p, s, 30, ahead);
+        QVERIFY2(!full.incomplete, full.reason().c_str());
+        QVERIFY(with.px != without.px);
+        QCOMPARE(renderSequenceFrame(p, s, 30, {}).px, with.px);
+        const Provenance prov = sequenceProvenance(p, s);
+        QVERIFY(std::any_of(prov.ai.begin(), prov.ai.end(), [](const AiUse& u) { return u.model.find("MuseTalk") != std::string::npos && u.role == AiRole::Generated; }));
     }
 
     void depthMaps() {

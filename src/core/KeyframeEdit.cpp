@@ -214,7 +214,7 @@ int pasteKeys(Clip& target, const CopiedKeys& keys, FrameTime at) {
         Effect* owner = pasteOwner(target, lane);
         if (!owner) continue;
         Param& p = owner->params[lane.address.param];
-        if (p.keys.empty()) p.value = p.at(0);
+        if (p.keys.empty()) p.value = p.keyedAt(0);
         for (Keyframe k : lane.keys) {
             k.t += std::max<FrameTime>(0, at);
             auto it = std::lower_bound(p.keys.begin(), p.keys.end(), k.t, [](const Keyframe& x, FrameTime t) { return x.t < t; });

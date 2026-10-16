@@ -23,8 +23,10 @@ namespace {
 std::vector<Track>& listFor(Sequence& s, TrackKind k) { return k == TrackKind::Video ? s.videoTracks : s.audioTracks; }
 
 void shiftParamKeys(Effect& e, FrameTime delta) {
-    for (auto& [name, param] : e.params)
+    for (auto& [name, param] : e.params) {
         for (auto& k : param.keys) k.t += delta;
+        if (!param.expr.empty()) param.exprFrom += delta;  // (its time counts on from where it was)
+    }
 }
 
 bool editable(const Track* t) { return t && !t->locked; }
@@ -472,6 +474,33 @@ int setClipRole(Sequence& s, const std::vector<Id>& clips, const std::string& ro
                 c.role = role;
                 ++changed;
             }
+    return changed;
+}
+
+int lipSyncToTrack(Project& p, Sequence& s, int audioTrack) {
+    if (audioTrack < 0 || audioTrack >= int(s.audioTracks.size())) return 0;
+    const Track& sound = s.audioTracks[size_t(audioTrack)];
+    const std::string id = std::to_string(sound.id);
+    int changed = 0;
+    for (Track& t : s.videoTracks)
+        for (Clip& c : t.clips) {
+            if (c.isGenerator() || !c.mediaId) continue;
+            const bool heard = std::any_of(sound.clips.begin(), sound.clips.end(),
+                                           [&](const Clip& a) { return a.start < c.end() && c.start < a.end(); });
+            if (!heard) continue;
+            auto it = std::find_if(c.effects.begin(), c.effects.end(), [](const Effect& e) { return e.type == "lip_sync"; });
+            if (it == c.effects.end()) {
+                Effect e = makeEffect(p, "lip_sync");
+                e.strings["track"] = id;
+                c.effects.push_back(std::move(e));
+            } else if (it->s("track") != id || !it->enabled) {
+                it->strings["track"] = id;
+                it->enabled = true;
+            } else {
+                continue;
+            }
+            ++changed;
+        }
     return changed;
 }
 

@@ -3,6 +3,7 @@
 #include <QtTest>
 #include <limits>
 #include <QDialog>
+#include <QDialogButtonBox>
 #include <QPointer>
 #include <QSignalSpy>
 #include <QStandardPaths>
@@ -217,6 +218,7 @@
 #include "core/MergeClips.h"
 #include "core/AudioChannels.h"
 #include "core/Effects.h"
+#include "core/Expression.h"
 #include "core/Multicam.h"
 #include "core/ProjectIO.h"
 #include "media/Decoder.h"
@@ -11111,6 +11113,77 @@ const auto seq = [this] { return state()->sequence(); };
         drag(pointFor(50, V1), pointFor(40, V1));
         QVERIFY2(std::llabs(length() - 40) <= 2, qPrintable(QString::number(length())));
         state()->undo();
+    }
+
+    void inspectorExpressions() {
+        if (!expressionsAvailable()) QSKIP("Built without Lua");
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        const Id motion = clipNamed(*state()->sequence(), "Red")->motion.id;
+        state()->setSelection({red}, false);
+        QApplication::processEvents();
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QVERIFY(inspector);
+        auto button = [&] { return inspector->findChild<QToolButton*>(QStringLiteral("expression_%1_opacity").arg(motion)); };
+        QTRY_VERIFY(button());
+        auto opacity = [&]() -> const Param& { return edit::clipById(*state()->sequence(), red)->motion.params.at("opacity"); };
+        // Typed into the dialog: checked as it is typed, then applied in one undo step.
+        auto useDialog = [&](const QString& text, const char* press, QString* status = nullptr, bool* okEnabled = nullptr) {
+            bool seen = false;
+            QTimer::singleShot(0, this, [&, text, press] {
+                auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+                if (!dlg || dlg->objectName() != "expressionDialog") {  // (left unseen: the check after it fails)
+                    if (dlg) dlg->reject();
+                    return;
+                }
+                auto* edit = dlg->findChild<QPlainTextEdit*>("expressionText");
+                edit->setPlainText(text);
+                if (status) *status = dlg->findChild<QLabel*>("expressionStatus")->text();
+                auto* box = dlg->findChild<QDialogButtonBox*>();
+                if (okEnabled) *okEnabled = box->button(QDialogButtonBox::Ok)->isEnabled();
+                seen = true;
+                if (!std::strcmp(press, "ok")) box->button(QDialogButtonBox::Ok)->click();
+                else if (!std::strcmp(press, "cancel")) box->button(QDialogButtonBox::Cancel)->click();
+                else dlg->findChild<QPushButton*>(press)->click();
+            });
+            button()->click();
+            QVERIFY(seen);
+        };
+        QString status;
+        bool okEnabled = true;
+        useDialog("value +", "cancel", &status, &okEnabled);
+        QVERIFY2(status.startsWith("Does not work") && !okEnabled, qPrintable(status));
+        useDialog("linear(frame, 0, 10, 0, 100)", "ok", &status, &okEnabled);
+        QVERIFY2(status.startsWith("At the playhead") && okEnabled, qPrintable(status));
+        QCOMPARE(opacity().expr, std::string("linear(frame, 0, 10, 0, 100)"));
+        QCOMPARE(opacity().at(5), 50.0);
+        QTRY_VERIFY(button()->isChecked() && !button()->property("failing").toBool());
+        // Its box shows what it gives, and is not edited while it drives the setting.
+        auto* box = inspector->findChild<QDoubleSpinBox*>(QStringLiteral("param_%1_opacity").arg(motion));
+        QTRY_VERIFY(box && !box->isEnabled());
+        // The Keyframes panel shows it as a curve.
+        win_->raisePanel("keyframes");
+        auto* panel = win_->findChild<KeyframePanel*>();
+        QTRY_VERIFY(panel && panel->clip() == red);
+        QTRY_VERIFY(std::any_of(panel->rows().begin(), panel->rows().end(), [](const auto& r) { return r.address.param == "opacity" && r.label.endsWith("="); }));
+        state()->undo();
+        QVERIFY(opacity().expr.empty());
+        state()->redo();
+        // A failing one shows on its button; the keyed value is used.
+        useDialog("nil + frame", "ok");
+        state()->setPlayhead(clipNamed(*state()->sequence(), "Red")->start + 3);
+        QApplication::processEvents();
+        QTRY_VERIFY(button()->property("failing").toBool());
+        QCOMPARE(opacity().at(3), opacity().keyedAt(3));
+        // Baked: keys in its place.
+        useDialog("linear(frame, 0, 10, 0, 100)", "expressionBake");
+        QVERIFY(opacity().expr.empty() && opacity().keys.size() == 3);
+        QCOMPARE(opacity().at(5), 50.0);
+        QTRY_VERIFY(!button()->isChecked());
+        state()->undo();
+        QCOMPARE(opacity().expr, std::string("nil + frame"));
+        useDialog("", "expressionRemove");
+        QVERIFY(opacity().expr.empty());
     }
 
     void keyframePanelEditsKeys() {

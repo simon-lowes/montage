@@ -81,6 +81,9 @@ std::vector<std::string> sequenceRoles(const Sequence& s);
 // Gives the audio clips among `clips`, and the audio clips linked to video ones among them, the role ("" clears it).
 // Returns how many changed.
 int setClipRole(Sequence& s, const std::vector<Id>& clips, const std::string& role);
+// Lip Sync (media/LipSync.h) to audio track `audioTrack` (0-based) on every picture clip (not generated) playing while
+// one of its clips plays: added, or its Sound From pointed at the track where it has one. Returns how many clips changed.
+int lipSyncToTrack(Project& p, Sequence& s, int audioTrack);
 bool roleMuted(const Sequence& s, const std::string& role);
 void setRoleMuted(Sequence& s, const std::string& role, bool muted);
 // Reverse Match Frame (Premiere's): where the timeline shows a source frame (in sequence frames of the media) of a

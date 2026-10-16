@@ -39,6 +39,7 @@
 #include "EditorState.h"
 #include "core/ProjectIO.h"
 #include "ModelPacks.h"
+#include "media/LipSync.h"
 #include "SpeechDialog.h"
 #include "core/EditOps.h"
 #include "media/AutoDuck.h"
@@ -509,7 +510,7 @@ void CaptionsPanel::translateDialog() {
     if (!translateTrack(to, &error) && !error.isEmpty()) QMessageBox::warning(this, tr("Translate Captions"), error);
 }
 
-CaptionsPanel::DubResult CaptionsPanel::dub(const std::string& voice, double duckDb, QString* error, const ClonedVoice* clone) {
+CaptionsPanel::DubResult CaptionsPanel::dub(const std::string& voice, double duckDb, QString* error, const ClonedVoice* clone, bool lipSync) {
     DubResult r;
     const CaptionTrack* src = track();
     if (!src || src->captions.empty()) {
@@ -529,7 +530,7 @@ CaptionsPanel::DubResult CaptionsPanel::dub(const std::string& voice, double duc
     if (!at) return r;
     r.audioTrack = at->track.index;
     // Part of the same undo step as the speech.
-    state_->amend([&](Project&, Sequence& sq) {
+    state_->amend([&](Project& p, Sequence& sq) {
         const CloneLanguage* lang = findCloneLanguage(to);
         sq.audioTracks[size_t(r.audioTrack)].name =
             (clone && lang ? tr("Dub (%1)").arg(QString::fromUtf8(lang->name)) : tr("Dub (English)")).toStdString();
@@ -541,6 +542,7 @@ CaptionsPanel::DubResult CaptionsPanel::dub(const std::string& voice, double duc
                 if (i != r.audioTrack)
                     for (Clip& c : sq.audioTracks[size_t(i)].clips) r.ducked += duckClip(c, sq, spans, o) ? 1 : 0;
         }
+        if (lipSync) r.lipSynced = edit::lipSyncToTrack(p, sq, r.audioTrack);
         return true;
     });
     return r;
@@ -593,7 +595,12 @@ void CaptionsPanel::dubDialog() {
     for (const CloneLanguage* l : cloneTargets) language->addItem(QString::fromUtf8(l->name), QString::fromUtf8(l->code));
     language->setCurrentIndex(std::max(0, language->findData(QStringLiteral("en"))));
     form->addRow(tr("Into:"), language);
-    auto* consent = new QCheckBox(tr("I have the speaker's consent to clone their voice"), &dlg);
+    // The picture under the dub with its speaker's mouth redrawn to say it (Lip Sync on those clips).
+    auto* lips = new QCheckBox(tr("Lip-sync the speaker's picture to the dub"), &dlg);
+    lips->setObjectName(QStringLiteral("dubLipSync"));
+    lips->setVisible(lipSyncAvailable());
+    form->addRow(QString(), lips);
+    auto* consent = new QCheckBox(&dlg);
     consent->setObjectName(QStringLiteral("dubConsent"));
     form->addRow(QString(), consent);
     auto* duck = new QDoubleSpinBox(&dlg);
@@ -610,18 +617,24 @@ void CaptionsPanel::dubDialog() {
     connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
     lay->addWidget(buttons);
     auto update = [&] {
-        const bool clone = voice->currentData().toString() == QLatin1String("clone");
-        for (QWidget* w : {static_cast<QWidget*>(language), static_cast<QWidget*>(consent)}) {
-            w->setVisible(clone);
-            if (QWidget* label = form->labelForField(w)) label->setVisible(clone);
-        }
-        buttons->button(QDialogButtonBox::Ok)->setEnabled(!clone || consent->isChecked());
+        const bool clone = voice->currentData().toString() == QLatin1String("clone"), synced = lips->isChecked();
+        language->setVisible(clone);
+        if (QWidget* label = form->labelForField(language)) label->setVisible(clone);
+        consent->setVisible(clone || synced);
+        consent->setText(clone && synced ? tr("I have the speaker's consent to clone their voice and redraw their mouth")
+                         : clone         ? tr("I have the speaker's consent to clone their voice")
+                                         : tr("I have the speaker's consent to redraw their mouth"));
+        buttons->button(QDialogButtonBox::Ok)->setEnabled(!(clone || synced) || consent->isChecked());
     };
     connect(voice, &QComboBox::currentIndexChanged, &dlg, update);
+    connect(lips, &QCheckBox::toggled, &dlg, update);
     connect(consent, &QCheckBox::toggled, &dlg, update);
     update();
     if (dlg.exec() != QDialog::Accepted) return;
     const bool cloning = voice->currentData().toString() == QLatin1String("clone");
+    const bool lipSync = lips->isChecked();
+    if ((cloning || lipSync) && !consent->isChecked()) return;
+    if (lipSync && !ensureLipSyncModels(window())) return;
     const std::string to = cloning ? language->currentData().toString().toStdString() : "en";
     for (const ModelPack* pack : from == to ? std::vector<const ModelPack*>{} : translationRoute(from, to))
         if (!ensureModelPack(window(), *pack, tr("Dub"),
@@ -631,19 +644,23 @@ void CaptionsPanel::dubDialog() {
     ClonedVoice clone;
     if (cloning) {
         // The voice heard under the first caption.
-        if (!consent->isChecked()) return;
         if (!voiceAt(state_->project(), *state_->sequence(), src->captions.front().start, clone, &error)) {
             QMessageBox::warning(this, tr("Dub"), error);
             return;
         }
         clone.language = to;
     }
-    const DubResult r = dub(voice->currentData().toString().toStdString(), duck->value(), &error, cloning ? &clone : nullptr);
+    const DubResult r = dub(voice->currentData().toString().toStdString(), duck->value(), &error, cloning ? &clone : nullptr, lipSync);
     if (r.clips.empty()) {
         if (!error.isEmpty() && error != QLatin1String("Cancelled")) QMessageBox::warning(this, tr("Dub"), error);
         return;
     }
-    state_->message(tr("Dubbed %1 captions onto %2").arg(r.clips.size()).arg(QString::fromStdString(state_->sequence()->audioTracks[size_t(r.audioTrack)].name)));
+    const QString name = QString::fromStdString(state_->sequence()->audioTracks[size_t(r.audioTrack)].name);
+    state_->message(lipSync ? tr("Dubbed %1 captions onto %2, with Lip Sync on %3 picture clip(s) (shown once rendered)")
+                                  .arg(r.clips.size())
+                                  .arg(name)
+                                  .arg(r.lipSynced)
+                            : tr("Dubbed %1 captions onto %2").arg(r.clips.size()).arg(name));
 }
 
 void CaptionsPanel::addTrack() {

@@ -55,10 +55,13 @@ public:
         int audioTrack = -1;  // the dub's audio track
         std::vector<Id> clips;
         int ducked = 0;       // clips lowered under it
+        int lipSynced = 0;    // picture clips given Lip Sync to it
     };
     // With `clone`, into clone->language (translated first unless the track is in it already) in that cloned voice
-    // (the caller has the speaker's consent), on "Dub (<language>)".
-    DubResult dub(const std::string& voice, double duckDb = -18, QString* error = nullptr, const ClonedVoice* clone = nullptr);
+    // (the caller has the speaker's consent), on "Dub (<language>)". With `lipSync` (the caller has their consent too),
+    // the picture clips under the dub get Lip Sync to it (edit::lipSyncToTrack).
+    DubResult dub(const std::string& voice, double duckDb = -18, QString* error = nullptr, const ClonedVoice* clone = nullptr,
+                  bool lipSync = false);
 
     // Subtitle tools. The reading limits (remembered between sessions) and what each caption of the current
     // track breaks; the selected captions (rows), or all of them when none are.

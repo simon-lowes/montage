@@ -23,6 +23,7 @@
 #include "media/Rife.h"
 #include "media/TextToSpeech.h"
 #include "media/VoiceClone.h"
+#include "media/LipSync.h"
 #include "media/MotionDeblur.h"
 #include "media/SuperScale.h"
 #include "media/SpeechEnhance.h"
@@ -182,6 +183,27 @@ bool ensureVoiceCloneModel(QWidget* parent) {
                                        "generated, and from whose voice."));
 }
 
+bool ensureLipSyncModels(QWidget* parent) {
+    const QString title = QObject::tr("Lip Sync");
+    if (!lipSyncAvailable() || !faceSearchAvailable() || !faceMeshAvailable()) {
+        QMessageBox::information(parent, title, QObject::tr("This build of Montage cannot use Lip Sync: it was built without ONNX Runtime."));
+        return false;
+    }
+    if (!ensureModelPack(parent, faceModel(), title,
+                         QObject::tr("Lip Sync finds faces with YuNet and SFace (MIT and Apache-2.0), which run on this computer.")))
+        return false;
+    if (!ensureModelPack(parent, faceMeshModel(), title,
+                         QObject::tr("Lip Sync fits a mesh of 478 points to each face with MediaPipe's Face Mesh V2 (Apache-2.0), "
+                                     "which runs on this computer.")))
+        return false;
+    return ensureModelPack(parent, lipSyncModel(), title,
+                           QObject::tr("Lip Sync redraws the speaker's mouth to say another track's sound (a dub) with MuseTalk 1.5 "
+                                       "(MIT), whisper-tiny (Apache-2.0) and sd-vae-ft-mse (MIT), which run on this computer. "
+                                       "Signed exports' Content Credentials name it as AI-generated. It takes about 4 s a frame "
+                                       "on four cores, so the monitors show it once the frames are rendered (Sequence › Render In to Out); "
+                                       "exports always include it."));
+}
+
 bool ensureEffectModel(QWidget* parent, const std::string& type) {
     if (type == "lens_correction") {
         if (lensDatabase()) return true;
@@ -256,6 +278,15 @@ bool ensureEffectModel(QWidget* parent, const std::string& type) {
                                QObject::tr("%1 fits a mesh of 478 points (the irises with it) to each face with MediaPipe's "
                                            "Face Mesh V2 (Apache-2.0), which runs on this computer.")
                                    .arg(title));
+    }
+    if (type == "lip_sync") {
+        const QString title = QObject::tr("Lip Sync");
+        const auto answer = QMessageBox::question(
+            parent, title,
+            QObject::tr("Lip Sync redraws the mouth of the person shown to say what another track says. Do you have their consent?"),
+            QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
+        if (answer != QMessageBox::Yes) return false;
+        return ensureLipSyncModels(parent);
     }
     if (type == "remove_background" || type == "mask.people" || type == "behind_people") {
         if (!mattingAvailable()) {

@@ -101,12 +101,13 @@ void KeyframePanel::rebuild() {
             if (!effect || effect->empty()) continue;
             const EffectInfo* info = findEffectInfo(effect->type);
             for (const auto& [name, param] : effect->params) {
-                if (!param.animated() || (isMaskPathParam(name) && name != kMaskPathParam)) continue;
+                if (!param.varies() || (isMaskPathParam(name) && name != kMaskPathParam)) continue;
                 QString label = QString::fromStdString(name);
                 if (info)
                     for (const ParamInfo& pi : info->params)
                         if (pi.name == name) label = QString::fromStdString(pi.label);
                 if (name == kMaskPathParam) label = tr("Mask Path");
+                if (!param.expr.empty()) label += QStringLiteral(" =");  // (driven by an expression: its curve in the graph)
                 ParamAddress a = addr;
                 a.param = name;
                 rows_.push_back({QString::fromStdString(info ? info->displayName : effect->type) + QStringLiteral(" · ") + label, a});
@@ -305,8 +306,8 @@ std::pair<double, double> KeyframePanel::graphRange(int row) const {
     if (auto it = frozen_.find(row); it != frozen_.end()) return it->second;
     const Clip* c = currentClip();
     const Param* p = c && row >= 0 && row < int(rows_.size()) ? findParam(*c, rows_[size_t(row)].address) : nullptr;
-    if (!p || p->keys.empty()) return {0, 1};
-    double lo = p->keys.front().v, hi = lo;
+    if (!p || !p->varies()) return {0, 1};
+    double lo = p->at(0), hi = lo;
     const FrameTime step = std::max<FrameTime>(1, c->duration / 400);
     for (FrameTime t = 0; t < c->duration; t += step) lo = std::min(lo, p->at(t)), hi = std::max(hi, p->at(t));
     for (size_t i = 0; i < p->keys.size(); ++i) {
@@ -748,7 +749,7 @@ void KeyframePanel::mouseDoubleClickEvent(QMouseEvent* e) {
             }
             Param* p = cc ? findParam(*cc, addr) : nullptr;
             if (!p || p->keyAt(t)) return false;
-            p->addKey(t, p->at(t));
+            p->addKey(t, p->keyedAt(t));
             return true;
         }))
         selection_ = {{addr, t}};

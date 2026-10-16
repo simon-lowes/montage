@@ -21,6 +21,11 @@ namespace montage {
 // play their media (not through effects or faders).
 std::vector<float> trackSoundAt(const Project& p, const Sequence& seq, int track, double t, int samples, int rate = 48000);
 
+// The sound of an audio track (1-based; 0 = every audio track that is not muted) from timeline frame `from` on:
+// `samples` mono samples at `rate`, each clip heard over its own span only, as it plays its media (not through effects
+// or faders). A track named is heard muted or not (what it says, not what is being monitored).
+std::vector<float> trackSoundFrom(const Project& p, const Sequence& seq, int track, double from, int samples, int rate);
+
 // Magnitudes of a Hann-windowed FFT of `x` (its size a power of two): size/2 bins.
 std::vector<float> spectrum(const std::vector<float>& x);
 

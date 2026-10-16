@@ -1,5 +1,6 @@
 #include "EditorState.h"
 
+#include "core/Expression.h"
 #include "core/GradeGraph.h"
 #include "render/ClipAnalysis.h"
 
@@ -40,6 +41,11 @@ EditorState::EditorState(QObject* parent) : QObject(parent), project_(makeDefaul
     // Decodes finish on worker threads, possibly after this object is gone:
     // hop to the application object and re-check before emitting.
     QPointer<EditorState> self(this);
+    // Expressions evaluated on this (the window's) thread outside a render belong to the open project (core/Expression.h).
+    setExpressionFallback([self]() -> ExpressionContext {
+        if (!self) return {};
+        return {&self->project_, self->sequence()};
+    });
     MediaPool::instance().setReadyCallback([self](const std::string& path) {
         QCoreApplication* app = QCoreApplication::instance();
         if (!app) return;
