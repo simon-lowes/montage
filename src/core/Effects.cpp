@@ -381,6 +381,19 @@ std::vector<EffectInfo> buildCatalog() {
                   pct("eyes_bright", "Brighten Eyes", 0, 100, 20), pct("eyes_sharp", "Sharpen Eyes", 0, 100, 30),
                   boolean("show", "Show Face Mask")},
                  {}});
+    // Faces reshaped by moving the face mesh's points (render/FaceShape.h).
+    c.push_back({"face_shape", "Face Shape", EffectCategory::VideoFilter, "Refine",
+                 {pct("face_width", "Face Width", -100, 100, 0), pct("jaw", "Jaw", -100, 100, 0), pct("chin", "Chin Length", -100, 100, 0),
+                  pct("forehead", "Forehead Height", -100, 100, 0), pct("nose_width", "Nose Width", -100, 100, 0),
+                  pct("nose_length", "Nose Length", -100, 100, 0), pct("eye_size", "Eye Size", -100, 100, 0),
+                  pct("eye_distance", "Eye Distance", -100, 100, 0), pct("mouth_width", "Mouth Width", -100, 100, 0),
+                  pct("mouth_height", "Lip Height", -100, 100, 0), boolean("show", "Show Face Mesh")},
+                 {}});
+    // Each open eye's iris turned to the lens, for a presenter reading a script near it (render/FaceShape.h).
+    c.push_back({"look_at_lens", "Look at Lens", EffectCategory::VideoFilter, "Refine",
+                 {pct("amount", "Amount", 0, 100, 100), num("limit", "Largest Gaze Corrected (degrees)", 5, 40, 20, 1),
+                  boolean("show", "Show Irises Found")},
+                 {}});
     // Spots, pimples and small marks on faces found and healed from the skin round them.
     c.push_back({"blemish_remover", "Blemish Remover", EffectCategory::VideoFilter, "Refine",
                  {pct("amount", "Amount", 0, 100, 100), pct("sensitivity", "Sensitivity", 0, 100, 50),
@@ -1054,7 +1067,8 @@ bool hasMask(const Effect& e, FrameTime t) {
 }
 
 bool needsFaces(const Effect& e) {
-    return e.enabled && (e.type == "face_refine" || e.type == "blemish_remover" || e.type == "redact_faces" ||
+    return e.enabled && (e.type == "face_refine" || e.type == "blemish_remover" || e.type == "redact_faces" || e.type == "face_shape" ||
+                         e.type == "look_at_lens" ||
                          (e.type == "depth_blur" && std::lround(e.p("follow", 0, 0)) == 2));
 }
 

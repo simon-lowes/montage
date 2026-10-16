@@ -18,6 +18,8 @@
 #include "media/Matting.h"
 #include "media/Inpaint.h"
 #include "FaceRefine.h"
+#include "FaceShape.h"
+#include "media/FaceMesh.h"
 #include "Relight.h"
 #include "FilmLook.h"
 #include "StyleFx.h"
@@ -2231,6 +2233,27 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
             fs.showMask = e.p("show", t) > 0.5;
             refineFaces(img, *faces, fs);
         }
+    } else if (ty == "face_shape" || ty == "look_at_lens") {
+        const std::vector<FaceBox>* faces = currentFaces();
+        if (faces && !faces->empty() && faceMeshAvailable() && faceMeshModel().installed())
+            if (std::shared_ptr<const std::vector<FaceMesh>> meshes = cachedFaceMeshes(img, *faces)) {
+                if (ty == "face_shape") {
+                    FaceShapeSettings fs;
+                    fs.faceWidth = e.p("face_width", t) / 100, fs.jaw = e.p("jaw", t) / 100, fs.chin = e.p("chin", t) / 100;
+                    fs.forehead = e.p("forehead", t) / 100, fs.noseWidth = e.p("nose_width", t) / 100;
+                    fs.noseLength = e.p("nose_length", t) / 100, fs.eyeSize = e.p("eye_size", t) / 100;
+                    fs.eyeDistance = e.p("eye_distance", t) / 100, fs.mouthWidth = e.p("mouth_width", t) / 100;
+                    fs.mouthHeight = e.p("mouth_height", t) / 100;
+                    fs.showMesh = e.p("show", t) > 0.5;
+                    reshapeFaces(img, *meshes, fs);
+                } else {
+                    LookAtLensSettings ls;
+                    ls.amount = e.p("amount", t, 100) / 100;
+                    ls.limit = e.p("limit", t, 20);
+                    ls.showIrises = e.p("show", t) > 0.5;
+                    lookAtLens(img, *meshes, ls);
+                }
+            }
     } else if (ty == "redact_faces") {
         redactFacesEffect(e, t, img, tSourceSeconds);
     } else if (ty == "blemish_remover") {

@@ -134,6 +134,8 @@
 #include "media/Diarizer.h"
 #include "render/Hdr10Plus.h"
 #include "media/Faces.h"
+#include "media/FaceMesh.h"
+#include "render/FaceShape.h"
 #include "media/FaceTracks.h"
 #include "media/DepthMap.h"
 #include "media/Exr.h"
@@ -11969,6 +11971,104 @@ if ui["pressed"] == "add":
         MediaItem m;
         QVERIFY2(probeMedia(MONTAGE_TEST_DATA_DIR "/faces/armstrong.jpg", m, &err), err.c_str());
         QCOMPARE(int(m.kind), int(MediaKind::Image));
+    }
+
+    void faceShapeAndLookAtLens() {
+        if (!faceSearchAvailable() || !faceModel().installed() || !faceMeshModel().installed())
+            QSKIP("Set MONTAGE_FACE_MODEL to the face models (with the face mesh)");
+        auto load = [](const char* name) {
+            VideoDecoder dec;
+            std::string err;
+            Frame16Ptr f;
+            if (dec.open(std::string(MONTAGE_TEST_DATA_DIR "/faces/") + name, &err)) f = dec.frameAt(0);
+            return f ? toImage(*f) : Image();
+        };
+        const Image jfk = load("jfk-color.jpg");
+        QVERIFY(!jfk.empty());
+        std::shared_ptr<const std::vector<FaceBox>> faces = cachedFaces(jfk);
+        QVERIFY(faces && !faces->empty());
+        FaceMesh mesh;
+        std::string err;
+        QVERIFY2(fitFaceMesh(jfk, faces->front(), mesh, &err), err.c_str());
+        // The mesh sits on the face: the nose tip inside its box, the eyes' outer corners either side of it, the chin
+        // below them; the head turned only a little.
+        const FaceBox& box = faces->front();
+        QVERIFY(mesh.x(1) > box.x * jfk.width && mesh.x(1) < (box.x + box.w) * jfk.width);
+        QVERIFY(mesh.x(33) < mesh.x(1) && mesh.x(263) > mesh.x(1) && mesh.y(152) > mesh.y(1) && mesh.y(10) < mesh.y(33));
+        QVERIFY2(std::fabs(mesh.yaw) < 35 && std::fabs(mesh.pitch) < 30, qPrintable(QString("%1 %2").arg(mesh.yaw).arg(mesh.pitch)));
+        // Reshaped by a known amount: each point that moves (the cheeks out, the eyes' outlines larger) shows, where it
+        // goes, what was at it, to within a small part of the move.
+        FaceShapeSettings wide;
+        wide.faceWidth = 1;
+        wide.eyeSize = 1;
+        const std::vector<std::array<float, 2>> to = faceShapeTargets(mesh, wide);
+        QVERIFY(to[454][0] - mesh.x(454) > 3 && to[234][0] - mesh.x(234) < -3);
+        Image reshaped = jfk;
+        reshapeFaces(reshaped, {mesh}, wide);
+        // (the warp measured on a picture of its own coordinates: each target should show what was at its point)
+        Image coords = jfk;
+        for (int y = 0; y < jfk.height; ++y)
+            for (int x = 0; x < jfk.width; ++x) {
+                float* c = coords.at(x, y);
+                c[0] = x + 0.5f, c[1] = y + 0.5f, c[2] = 0, c[3] = 1;
+            }
+        reshapeFaces(coords, {mesh}, wide);
+        double asked = 0, missed = 0;
+        int moving = 0;
+        for (int i = 0; i < kFaceMeshPoints; ++i) {
+            const auto& t = to[size_t(i)];
+            const double move = std::hypot(t[0] - mesh.x(i), t[1] - mesh.y(i));
+            if (move < 1.5) continue;
+            const int px = std::clamp(int(t[0]), 0, jfk.width - 1), py = std::clamp(int(t[1]), 0, jfk.height - 1);
+            const float* c = coords.at(px, py);
+            // (less the step from the target to the pixel's middle, which carries what is there with it)
+            ++moving, asked += move;
+            missed += std::hypot(c[0] - (px + 0.5 - t[0]) - mesh.x(i), c[1] - (py + 0.5 - t[1]) - mesh.y(i));
+        }
+        QVERIFY2(moving >= 20 && missed < 0.2 * asked, qPrintable(QString("%1 points, %2 of %3 missed").arg(moving).arg(missed).arg(asked)));
+        QVERIFY(reshaped.px != jfk.px);
+        // Far from the face nothing moves.
+        QVERIFY(std::equal(reshaped.at(5, 5), reshaped.at(5, 5) + 4, jfk.at(5, 5)));
+        // Look at Lens: in the portrait looking up, the irises move toward where looking at the lens puts them.
+        const Image up = load("jfk-looking-up-close.jpg");
+        std::shared_ptr<const std::vector<FaceBox>> upFaces = cachedFaces(up);
+        QVERIFY(upFaces && !upFaces->empty());
+        FaceMesh upMesh;
+        QVERIFY(fitFaceMesh(up, upFaces->front(), upMesh));
+        Image marked = up;
+        LookAtLensSettings show;
+        show.showIrises = true;
+        QCOMPARE(lookAtLens(marked, {upMesh}, show), 0);  // (marked, not moved)
+        QVERIFY(marked.px != up.px);
+        Image turned = up;
+        LookAtLensSettings ls;
+        ls.limit = 40;
+        const int moved = lookAtLens(turned, {upMesh}, ls);
+        QVERIFY2(moved >= 1, qPrintable(QString::number(moved)));
+        // (each iris found again in what was made, by matching its middle, the pupil and its highlight)
+        for (bool left : {false, true}) {
+            float bx = 0, by = 0, br = 0, tx = 0, ty = 0;
+            if (!gazeTarget(upMesh, left, tx, ty)) continue;
+            upMesh.iris(left, bx, by, br);
+            const int core = std::max(2, int(br * 0.5f)), reach = int(br);
+            double best = 1e30;
+            int mx = 0, my = 0;
+            for (int oy = -reach; oy <= reach; ++oy)
+                for (int ox = -reach; ox <= reach; ++ox) {
+                    double ssd = 0;
+                    for (int v = -core; v <= core; ++v)
+                        for (int u = -core; u <= core; ++u) {
+                            if (u * u + v * v > core * core) continue;
+                            const float* a = up.at(int(bx) + u, int(by) + v);
+                            const float* c = turned.at(int(bx) + u + ox, int(by) + v + oy);
+                            for (int ch = 0; ch < 3; ++ch) ssd += (a[ch] - c[ch]) * (a[ch] - c[ch]);
+                        }
+                    if (ssd < best) best = ssd, mx = ox, my = oy;
+                }
+            const double before = std::hypot(bx - tx, by - ty), now = std::hypot(bx + mx - tx, by + my - ty);
+            QVERIFY2(before > 3 && now < 0.25 * before + 1,
+                     qPrintable(QString("(%1, %2) moved (%3, %4), lens at (%5, %6)").arg(bx).arg(by).arg(mx).arg(my).arg(tx).arg(ty)));
+        }
     }
 
     void depthMaps() {

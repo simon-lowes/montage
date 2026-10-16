@@ -82,6 +82,7 @@
 #include "render/ReferenceOutput.h"
 #include "render/MonitorCalibration.h"
 #include "render/SkyReplace.h"
+#include "render/FaceShape.h"
 #include "media/CameraSolve.h"
 #include "audio/DynLib.h"
 #include <random>
@@ -6702,6 +6703,93 @@ colorspaces:
         QVERIFY(!dl->open(d, standardModes()[0], Signal{}, 2, 48000, &why));
         QVERIFY(!why.empty());
         QCOMPARE(dl->receivers(), -1);
+    }
+
+    void faceShapeWarpAndIris() {
+        // The warp: a point moved 6 px right carries the picture under it, the ring and what is far off hold still.
+        Image grid(200, 200);
+        for (int y = 0; y < 200; ++y)
+            for (int x = 0; x < 200; ++x) {
+                float* p = grid.at(x, y);
+                p[0] = float(x) / 200, p[1] = float(y) / 200, p[2] = 0.5f, p[3] = 1;
+            }
+        std::vector<std::array<float, 2>> from = {{100, 100}, {70, 100}, {130, 100}, {100, 70}, {100, 130}}, to = from;
+        to[0] = {106, 100};
+        Image warped = grid;
+        warpPoints(warped, from, to, 100, 100, 80);
+        // (what was at x = 100 is now at x = 106: red there reads 0.5)
+        QVERIFY2(std::fabs(warped.at(106, 100)[0] - 0.5f) < 0.01f, qPrintable(QString::number(warped.at(106, 100)[0] * 200)));
+        QVERIFY(std::fabs(warped.at(70, 100)[0] - grid.at(70, 100)[0]) < 0.01f);
+        QVERIFY(std::equal(warped.at(10, 10), warped.at(10, 10) + 4, grid.at(10, 10)));
+        QVERIFY(std::equal(warped.at(100, 185), warped.at(100, 185) + 4, grid.at(100, 185)));
+        // Nothing moved, nothing changes.
+        Image same = grid;
+        warpPoints(same, from, from, 100, 100, 80);
+        for (int y = 30; y < 170; y += 7)
+            for (int x = 30; x < 170; x += 7) QVERIFY(std::fabs(same.at(x, y)[0] - grid.at(x, y)[0]) < 1e-3f);
+
+        // An eye: skin round an almond of white with a dark iris 6 px right of its middle.
+        Image face(120, 80);
+        std::vector<std::array<float, 2>> lids;
+        for (int k = 0; k < 16; ++k) {
+            const double a = 2 * M_PI * k / 16;
+            lids.push_back({float(60 + 30 * std::cos(a)), float(40 + 12 * std::sin(a) * (0.6 + 0.4 * std::fabs(std::sin(a))))});
+        }
+        auto drawEye = [&](float irisX) {
+            for (int y = 0; y < 80; ++y)
+                for (int x = 0; x < 120; ++x) {
+                    float* p = face.at(x, y);
+                    p[3] = 1;
+                    const bool in = std::fabs(x + 0.5 - 60) < 30 && std::fabs(y + 0.5 - 40) < 12;
+                    const double d = std::hypot(x + 0.5 - irisX, y + 0.5 - 40);
+                    if (in && d < 9) p[0] = 0.25f, p[1] = 0.15f, p[2] = 0.1f;
+                    else if (in) p[0] = p[1] = p[2] = 0.9f;
+                    else p[0] = 0.8f, p[1] = 0.6f, p[2] = 0.5f;
+                }
+        };
+        drawEye(66);
+        // (the middle of what is dark inside the lids)
+        auto irisAt = [&](float& x, float& y) {
+            double n = 0, sx = 0, sy = 0;
+            for (int py = 0; py < 80; ++py)
+                for (int px = 0; px < 120; ++px)
+                    if (face.at(px, py)[0] < 0.5f && std::fabs(px + 0.5 - 60) < 30 && std::fabs(py + 0.5 - 40) < 12) n += 1, sx += px + 0.5, sy += py + 0.5;
+            x = float(sx / std::max(1.0, n)), y = float(sy / std::max(1.0, n));
+            return n;
+        };
+        float ix = 0, iy = 0;
+        irisAt(ix, iy);
+        QVERIFY(std::fabs(ix - 66) < 1 && std::fabs(iy - 40) < 1);
+        const Image before = face;
+        moveIris(face, lids, 66, 40, 9, 60, 40, 1);
+        float nx = 0, ny = 0;
+        const double area = irisAt(nx, ny);
+        QVERIFY2(std::fabs(nx - 60) < 1.5 && std::fabs(ny - 40) < 1, qPrintable(QString("%1 %2").arg(nx).arg(ny)));
+        // (as large as it was, the white filled in behind it: no dark left where it was)
+        QVERIFY2(area > 0.8 * M_PI * 81 && area < 1.2 * M_PI * 81, qPrintable(QString::number(area)));
+        QVERIFY(face.at(73, 40)[0] > 0.8f);
+        // The skin outside the lids is untouched; half the way, half the move.
+        QVERIFY(std::equal(face.at(10, 10), face.at(10, 10) + 4, before.at(10, 10)));
+        QVERIFY(std::equal(face.at(60, 70), face.at(60, 70) + 4, before.at(60, 70)));
+        drawEye(66);
+        moveIris(face, lids, 66, 40, 9, 60, 40, 0.5);
+        QVERIFY(irisAt(nx, ny) > 0 && std::fabs(nx - 63) < 1.5);
+
+        // Head pose from the mesh: a face turned 20 degrees to the picture's right and up 10.
+        FaceMesh m;
+        m.points.assign(size_t(kFaceMeshAllPoints) * 3, 0.f);
+        auto put = [&](int i, double x, double y, double z) {
+            const double yaw = 20 * M_PI / 180, pitch = 10 * M_PI / 180;
+            // (turned about the vertical, then tilted up; z away from the camera)
+            const double x1 = x * std::cos(yaw) - z * std::sin(yaw), z1 = x * std::sin(yaw) + z * std::cos(yaw);
+            const double y2 = y * std::cos(pitch) + z1 * std::sin(pitch), z2 = -y * std::sin(pitch) + z1 * std::cos(pitch);
+            m.points[size_t(i) * 3] = float(100 + x1), m.points[size_t(i) * 3 + 1] = float(100 + y2), m.points[size_t(i) * 3 + 2] = float(z2);
+        };
+        put(33, -30, 0, 0), put(263, 30, 0, 0), put(10, 0, -50, 0), put(152, 0, 60, 0);
+        faceMeshPose(m);
+        // (the eyes' line, turned and tilted, leans a little in the picture)
+        QVERIFY2(std::fabs(m.yaw - 20) < 1 && std::fabs(m.pitch - 10) < 2 && std::fabs(m.roll) < 5,
+                 qPrintable(QString("%1 %2 %3").arg(m.yaw).arg(m.pitch).arg(m.roll)));
     }
 
     void skyReplacement() {
