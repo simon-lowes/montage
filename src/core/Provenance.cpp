@@ -51,6 +51,7 @@ void effectUses(Provenance& out, const Effect& e) {
     else if (t == "blemish_remover") add(out, {"Blemish Remover", "YuNet", AiRole::Enhanced});
     else if (t == "face_shape") add(out, {"Face Shape", "YuNet, MediaPipe Face Mesh V2", AiRole::Enhanced});
     else if (t == "look_at_lens") add(out, {"Look at Lens", "YuNet, MediaPipe Face Mesh V2", AiRole::Enhanced});
+    else if (t == "lip_sync") add(out, {"Lip Sync", "MuseTalk 1.5, whisper-tiny, sd-vae-ft-mse, YuNet, MediaPipe Face Mesh V2", AiRole::Generated});
     else if (t == "relight") add(out, {"Relight", "Depth Anything V2", AiRole::Enhanced});
     else if (t == "enhance_speech") add(out, {"Enhance Speech", "DeepFilterNet3", AiRole::Enhanced});
     else if (t == "voice_isolate") add(out, {"Voice Isolation", "RNNoise", AiRole::Enhanced});

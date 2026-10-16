@@ -2607,10 +2607,11 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
             combo->setObjectName(QString::fromStdString("track_" + name));
             form->addRow(label, combo);
             connect(combo, &QComboBox::activated, this, [combo, write](int i) { write(combo->itemData(i).toString()); });
-            refreshers_.push_back([this, combo, read, target] {
+            const QString none = si.choices.empty() ? tr("None") : tr(si.choices.front().c_str());
+            refreshers_.push_back([this, combo, read, target, none] {
                 QSignalBlocker b(combo);
                 combo->clear();
-                combo->addItem(tr("None"), QString());
+                combo->addItem(none, QString());
                 if (const Sequence* s = state_->sequence()) {
                     // Not the track the effect is on (a key cannot be its own signal): the track itself, or the clip's.
                     Id own = target.owner;

@@ -1,6 +1,7 @@
 #include "RenderCache.h"
 #include "TrimPasses.h"
 #include "core/GradeGraph.h"
+#include "media/LipSync.h"
 #include "media/MotionDeblur.h"
 #include "media/Proxy.h"
 #include "media/SuperScale.h"
@@ -91,6 +92,24 @@ bool addFrame(QCryptographicHash& h, const Project& p, const Sequence& seq, Fram
 void addClipAt(QCryptographicHash& h, const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
                int depth) {
     addClip(h, seq, c);
+    // Lip Sync's picture follows the sound its track plays under the clip (whisper hears it 30 s at a time).
+    for (const Effect* e : liveEffects(seq, c))
+        if (e->type == "lip_sync" && e->enabled) {
+            h.addData(lipSyncModel().installed() ? "lipsync:1" : "lipsync:0");
+            const std::string track = e->s("track");
+            for (const Track& at : seq.audioTracks) {
+                if (!track.empty() && std::to_string(at.id) != track) continue;
+                for (const Clip& a : at.clips) {
+                    if (a.end() <= c.start || a.start >= c.end()) continue;
+                    Clip k = a;
+                    k.id = 0;
+                    k.linkGroup = 0;
+                    k.start -= c.start;
+                    h.addData(QByteArray::fromStdString(clipToJsonString(k)));
+                    if (const MediaItem* m = a.mediaId ? p.findMedia(a.mediaId) : nullptr) addMedia(h, *m, o);
+                }
+            }
+        }
     // Its colour group's grades run on it too.
     if (const ColorGroup* g = colorGroupOf(seq, c))
         for (const auto* chain : {&g->pre, &g->post}) {

@@ -19,18 +19,20 @@
 #   <dir>/stems          Separate Stems     (MONTAGE_STEM_MODELS; 4 stems, and 2 and 5 with --stems; dialogue,
 #                                           music and effects with --dme: 447 MB, CC BY-SA 4.0)
 #   <dir>/voice-clone    Cloned voices      (MONTAGE_VOICE_CLONE_MODEL; 1.6 GB, only with --voice-clone)
+#   <dir>/lipsync        Lip Sync           (MONTAGE_LIPSYNC_MODEL; 3.9 GB, only with --lipsync)
 #   <dir>/lensfun-db     Lens Correction    (MONTAGE_LENS_DB; lensfun's lens profiles, CC BY-SA 3.0)
 #   <dir>/sadie-ku100    binaural ambisonics (MONTAGE_HRTF_DIR; SADIE II's KU100 HRIRs, Apache-2.0; only with --hrtf)
 #
-#   scripts/fetch-models.sh [dir] [--voice-clone] [--stems] [--dme] [--hrtf]      (default: ./models)
+#   scripts/fetch-models.sh [dir] [--voice-clone] [--stems] [--dme] [--hrtf] [--lipsync]      (default: ./models)
 set -euo pipefail
 VOICE_CLONE=0
 ALL_STEMS=0
 DME=0
 HRTF=0
+LIPSYNC=0
 ARGS=()
 for a in "$@"; do
-  if [ "$a" = "--voice-clone" ]; then VOICE_CLONE=1; elif [ "$a" = "--stems" ]; then ALL_STEMS=1; elif [ "$a" = "--dme" ]; then DME=1; elif [ "$a" = "--hrtf" ]; then HRTF=1; else ARGS+=("$a"); fi
+  if [ "$a" = "--voice-clone" ]; then VOICE_CLONE=1; elif [ "$a" = "--stems" ]; then ALL_STEMS=1; elif [ "$a" = "--dme" ]; then DME=1; elif [ "$a" = "--hrtf" ]; then HRTF=1; elif [ "$a" = "--lipsync" ]; then LIPSYNC=1; else ARGS+=("$a"); fi
 done
 DIR=${ARGS[0]:-models}
 sha256() { if command -v sha256sum > /dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
@@ -150,6 +152,19 @@ if [ "$VOICE_CLONE" = 1 ]; then
   fetch voice-clone tokenizer.json "$CHATTERBOX/tokenizer.json" 29d48c4a178f6af3ad5130097c34744639e9294847b38a7b912c8c68027cb819
   fetch voice-clone Cangjie5_TC.json "$CHATTERBOX/Cangjie5_TC.json" 7073fd9de919443ae88e0bd2449917a65fe54898a4413ed1edcc4b67f28bce8c
   echo "Voice cloning model: MONTAGE_VOICE_CLONE_MODEL=$DIR/voice-clone"
+fi
+if [ "$LIPSYNC" = 1 ]; then
+  # MuseTalk 1.5's UNet (MIT), Stability AI's sd-vae-ft-mse (MIT) and OpenAI's whisper-tiny (Apache-2.0), at the
+  # revisions media/LipSync.cpp pins; the graphs that run them are written beside them on first use.
+  fetch lipsync unet.pth https://huggingface.co/TMElyralab/MuseTalk/resolve/2bcb936e2fddb4d86db4c62fd45b387d0c061571/musetalkV15/unet.pth \
+    7ebf6c98c181e20838e4c0054e96e944ac60d5d692cc01db42839fe11b787007 3600
+  fetch lipsync sd-vae-ft-mse.safetensors \
+    https://huggingface.co/stabilityai/sd-vae-ft-mse/resolve/31f26fdeee1355a5c34592e401dd41e45d25a493/diffusion_pytorch_model.safetensors \
+    a1d993488569e928462932c8c38a0760b874d166399b14414135bd9c42df5815
+  fetch lipsync whisper-tiny.safetensors \
+    https://huggingface.co/openai/whisper-tiny/resolve/169d4a4341b33bc18d8881c4b69c2e104e1cc0af/model.safetensors \
+    7ebd0e69e78190ffe1438491fa05cc1f5c1aa3a4c4db3bc1723adbb551ea2395
+  echo "Lip sync model: MONTAGE_LIPSYNC_MODEL=$DIR/lipsync"
 fi
 # lensfun's database at a pinned commit (media/LensDatabase.cpp lists the same files).
 LENSFUN=https://raw.githubusercontent.com/lensfun/lensfun/43f9e001ab66c4fcdd4f400463f13b72f94b2288/data/db

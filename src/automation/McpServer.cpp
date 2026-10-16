@@ -92,6 +92,7 @@
 #include "media/DualSystem.h"
 #include "media/Relink.h"
 #include "media/SpeechEnhance.h"
+#include "media/LipSync.h"
 #include "media/MotionDeblur.h"
 #include "media/SuperScale.h"
 #include "media/Translator.h"
@@ -2125,8 +2126,12 @@ void McpServer::Impl::addTools() {
         "with the picture source_x / source_y away (fractions of the frame), blended seamlessly; paint draws clone or heal "
         "strokes (strings.strokes, lines of \"clone|heal frame hold track dx dy radius softness x y x y ...\": frame as for "
         "spots, hold 1 for every frame, track 1 to follow the mask's track, dx dy to where it copies from and the points "
-        "as fractions of the frame's width and height, radius a fraction of its width, softness 0-1).",
+        "as fractions of the frame's width and height, radius a fraction of its width, softness 0-1). "
+        "lip_sync redraws the largest face's mouth and jaw to speak an audio track's sound (strings.track, e.g. \"A2\"; "
+        "every track when empty), as a dub needs (MuseTalk; amount mixes it); it needs consent: true (the person shown has "
+        "agreed) and its models (scripts/fetch-models.sh --lipsync), and runs in exports and renders (about a second a frame).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
+            "consent":{"type":"boolean","description":"lip_sync: the person shown has agreed to it"},
             "params":{"type":"object","additionalProperties":{"type":"number"}},
             "strings":{"type":"object","additionalProperties":{"type":"string"},"description":"Text settings: curves (\"x,y x,y\"), hue curves, a LUT file, the Colour Warper's mesh (\"spoke,ring,hue,sat,luma;...\": spokes 0-11 every 30 degrees from red, rings 1-4 for saturation 25-100 %, hue moved in degrees, saturation in 0-1 units, brightness in stops)..."},
             "mask_path":{"type":"array","items":{"type":["array","object"]},"description":"A closed Bezier mask: three or more points, fractions of the clip's frame"},
@@ -2158,6 +2163,12 @@ void McpServer::Impl::addTools() {
                 return fail("Super Scale needs its model: run `scripts/fetch-models.sh` or add the effect once in the app");
             if (type == "motion_deblur" && (!deblurAvailable() || !deblurModel().installed()))
                 return fail("Motion Deblur needs its model: run `scripts/fetch-models.sh` or add the effect once in the app");
+            if (type == "lip_sync") {
+                if (!a.value("consent").toBool())
+                    throw ArgError{"Lip Sync redraws a person's mouth to say other words: pass consent: true once the person shown has agreed"};
+                if (!lipSyncAvailable() || !lipSyncModel().installed() || !faceModel().installed() || !faceMeshModel().installed())
+                    return fail("Lip Sync needs its models: run `scripts/fetch-models.sh --lipsync` or add the effect once in the app");
+            }
             Effect e = plugin ? *plugin : makeEffect(l.project, type);
             const QJsonObject params = a.value("params").toObject();
             for (auto it = params.begin(); it != params.end(); ++it) {
@@ -6121,7 +6132,9 @@ void McpServer::Impl::addTools() {
         "The translated captions are added as a hidden track. The voice is an English AI voice (Kokoro; a little faster where "
         "a cue is short), or with voice: \"clone\" the speaker's own voice cloned (Chatterbox; from voice_clip, voice_media, "
         "or the clip heard under the first caption) into `to`, any of ar da de el en es fi fr he hi it ko ms nl no pl pt ru "
-        "sv sw tr zh (not Japanese: translations come in kanji, which the voice model cannot read), which needs consent: true. Needs the translation and speech models (the app asks the first time; or "
+        "sv sw tr zh (not Japanese: translations come in kanji, which the voice model cannot read), which needs consent: true. "
+        "lip_sync: true also gives the picture clips under the dub Lip Sync to it (their speaker's mouth redrawn to speak "
+        "the dub; needs consent: true and scripts/fetch-models.sh --lipsync). Needs the translation and speech models (the app asks the first time; or "
         "scripts/fetch-models.sh).",
         R"json({"type":"object","properties":{"project":{"type":"string"},
             "track":{"type":"integer","default":0,"description":"Caption track index"},
@@ -6130,7 +6143,7 @@ void McpServer::Impl::addTools() {
             "to":{"type":"string","default":"en","description":"With voice clone: the dub's language"},
             "consent":{"type":"boolean"},"voice_clip":{"type":"integer"},"voice_media":{"type":"string"},
             "voice_from":{"type":"number"},"voice_to":{"type":"number"},
-            "duck_db":{"type":"number","default":-18}},"required":["project"]})json",
+            "duck_db":{"type":"number","default":-18},"lip_sync":{"type":"boolean","default":false}},"required":["project"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
@@ -6140,6 +6153,13 @@ void McpServer::Impl::addTools() {
             if (!ttsAvailable() || !translatorAvailable()) return fail("This build of Montage cannot dub (no ONNX Runtime)");
             const std::string voice = str(a, "voice", "af_heart").toStdString();
             const bool cloning = voice == "clone";
+            const bool lipSync = a.value("lip_sync").toBool();
+            if (lipSync) {
+                if (!lipSyncAvailable() || !lipSyncModel().installed() || !faceModel().installed() || !faceMeshModel().installed())
+                    return fail("Lip Sync needs its models: run `scripts/fetch-models.sh --lipsync` or add the effect once in the app");
+                if (!a.value("consent").toBool())
+                    throw ArgError{"lip_sync redraws the speaker's mouth to say the dub: pass consent: true once they have agreed"};
+            }
             std::optional<CloneVoice> clone;
             std::string to = "en";
             if (cloning) {
@@ -6202,6 +6222,7 @@ void McpServer::Impl::addTools() {
                     if (i != dub.index)
                         for (Clip& c : s.audioTracks[size_t(i)].clips) ducked += duckClip(c, s, spans, o) ? 1 : 0;
             }
+            const int synced = lipSync ? edit::lipSyncToTrack(l.project, s, dub.index) : 0;
             save(l);
             QJsonArray sample;
             for (size_t i = 0; i < std::min<size_t>(3, lines.size()); ++i) sample.append(QString::fromStdString(lines[i].text));
@@ -6209,9 +6230,10 @@ void McpServer::Impl::addTools() {
                           .arg(lines.size())
                           .arg(dub.index + 1)
                           .arg(total, 0, 'f', 1)
-                          .arg(ducked),
+                              .arg(ducked) +
+                          (synced ? QStringLiteral("; Lip Sync on %1 picture clip(s)").arg(synced) : QString()),
                       QJsonObject{{"captions_track", english}, {"audio_track", QStringLiteral("A%1").arg(dub.index + 1)}, {"clips", placed},
-                                  {"ducked", ducked}, {"first", sample}});
+                                  {"ducked", ducked}, {"lip_synced", synced}, {"first", sample}});
         });
 
     add("montage_refresh_media", "Refresh media from disk",

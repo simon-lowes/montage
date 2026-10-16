@@ -62,6 +62,8 @@
 #include "SkyReplace.h"
 #include "media/Matting.h"
 #include "media/Faces.h"
+#include "media/FaceMesh.h"
+#include "media/LipSync.h"
 #include "media/MotionDeblur.h"
 #include "media/Rife.h"
 #include "media/SuperScale.h"
@@ -595,6 +597,122 @@ const Effect* denoiseEffect(const Sequence& seq, const Clip& c) {
     return enabledEffect(seq, c, "video_denoise");
 }
 
+// Lip Sync's sound: what the chosen audio track (every track, when none is) plays, from the clip's start, at 16 kHz.
+// Whisper's encoding of it 30 s at a time, kept by the sound's content for the few stretches last used.
+std::shared_ptr<const std::vector<float>> lipSyncFeatures(const Project& p, const Sequence& seq, const Clip& c, int track, int64_t segment,
+                                                          bool run, std::string* error) {
+    const double fps = seq.fpsValue();
+    const std::vector<float> sound =
+        trackSoundAt(p, seq, track, double(c.start) + (double(segment) * 30 + 15) * fps, kLipSyncSegment, kLipSyncRate);
+    const uint64_t key = std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(sound.data()), sound.size() * sizeof(float)));
+    static std::mutex m;
+    static std::deque<std::pair<uint64_t, std::shared_ptr<const std::vector<float>>>> cache;
+    {
+        std::lock_guard lock(m);
+        for (const auto& [k, f] : cache)
+            if (k == key) return f;
+    }
+    if (!run) return nullptr;
+    auto features = std::make_shared<std::vector<float>>();
+    if (!lipSyncEncodeSound(sound, *features, error)) return nullptr;
+    std::lock_guard lock(m);
+    cache.emplace_front(key, features);
+    if (cache.size() > 6) cache.pop_back();
+    return features;
+}
+
+// Lip Sync on a clip's source picture (media/LipSync.h): the largest face's mouth drawn again to speak the chosen
+// track's sound. Like Motion Deblur it takes about a second a frame, so it runs in deliveries and previews rendered
+// ahead, and other views take a result already made (by the picture and the sound around the frame) or go without.
+void applyLipSync(const Project& p, const Sequence& seq, const Clip& c, const Effect& e, FrameTime lt, const RenderOptions& o, Image& src) {
+    const double amount = std::clamp(e.p("amount", lt, 100) / 100, 0.0, 1.0);
+    if (src.empty() || amount <= 0) return;
+    if (!lipSyncAvailable() || !lipSyncModel().installed() || !faceModel().installed() || !faceMeshModel().installed()) {
+        if (o.issues && o.highQuality) o.issues->note("Lip Sync needs its models: add the effect once in the app or run scripts/fetch-models.sh --lipsync");
+        return;
+    }
+    int track = 0;  // (every audio track)
+    if (const std::string id = e.s("track"); !id.empty())
+        for (size_t i = 0; i < seq.audioTracks.size(); ++i)
+            if (std::to_string(seq.audioTracks[i].id) == id) track = int(i) + 1;
+    const double fps = std::max(1.0, seq.fpsValue());
+    const bool run = o.highQuality || o.slowEffects;
+    // The result, by the picture, the sound about the frame (what its window hears, and more) and the amount.
+    const std::vector<float> near = trackSoundAt(p, seq, track, double(c.start + lt), kLipSyncRate / 2, kLipSyncRate);
+    uint64_t key = std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(src.px.data()), src.px.size() * sizeof(float)));
+    key = key * 1000003u ^ std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(near.data()), near.size() * sizeof(float)));
+    key = key * 1000003u ^ std::hash<double>{}(amount) ^ (uint64_t(src.width) << 32 | uint64_t(src.height));
+    static std::mutex m;
+    static std::deque<std::pair<uint64_t, std::shared_ptr<const Image>>> cache;
+    auto find = [&] {
+        std::lock_guard lock(m);
+        for (const auto& [k, img] : cache)
+            if (k == key && img->width == src.width && img->height == src.height) {
+                src = *img;
+                return true;
+            }
+        return false;
+    };
+    if (find()) return;
+    if (!run) {
+        if (o.issues) o.issues->note("Lip Sync is shown once the frames are rendered (Render In to Out)");
+        return;
+    }
+    static std::mutex running;  // (one at a time: two views asking for a frame wait for the first)
+    std::lock_guard one(running);
+    if (find()) return;
+    std::string why;
+    // The ten encoding frames the frame hears, from the 30 s stretches they are in.
+    std::map<int64_t, std::shared_ptr<const std::vector<float>>> segments;
+    bool heard = true;
+    const std::vector<float> window = lipSyncWindow(lt, fps, [&](int64_t j) -> const float* {
+        const int64_t perSegment = kLipSyncSegment / kLipSyncRate * kLipSyncFeatureRate;
+        const int64_t s = j / perSegment;
+        auto it = segments.find(s);
+        if (it == segments.end()) it = segments.emplace(s, lipSyncFeatures(p, seq, c, track, s, true, &why)).first;
+        if (!it->second) {
+            heard = false;
+            return nullptr;
+        }
+        return it->second->data() + size_t(j - s * perSegment) * kLipSyncLayers * kLipSyncWidth;
+    });
+    if (!heard) {
+        if (o.issues) o.issues->note(why.empty() ? std::string("Lip Sync could not hear the sound") : why);
+        return;
+    }
+    Image out = src;
+    std::shared_ptr<const std::vector<FaceBox>> faces = cachedFaces(src);
+    if (faces && !faces->empty())
+        if (std::shared_ptr<const std::vector<FaceMesh>> meshes = cachedFaceMeshes(src, *faces)) {
+            // The largest face (the one speaking, as a rule).
+            const FaceMesh* best = nullptr;
+            int64_t bestArea = 0;
+            for (const FaceMesh& f : *meshes) {
+                const LipSyncBox b = lipSyncBox(f, src.width, src.height);
+                const int64_t area = int64_t(b.x1 - b.x0) * (b.y1 - b.y0);
+                if (!b.empty() && area > bestArea) best = &f, bestArea = area;
+            }
+            if (best && !lipSyncFace(out, *best, window, amount, &why, o.cancel)) {
+                if (o.issues) o.issues->note(why);
+                return;
+            }
+        }
+    if (o.cancel && o.cancel->load()) return;
+    auto shared = std::make_shared<const Image>(out);
+    {
+        std::lock_guard lock(m);
+        cache.emplace_front(key, shared);
+        size_t bytes = 0, keep = 0;
+        for (const auto& [k, img] : cache) {
+            bytes += img->px.size() * sizeof(float);
+            if (keep >= 2 && bytes > (size_t(384) << 20)) break;
+            ++keep;
+        }
+        cache.resize(keep);
+    }
+    src = std::move(out);
+}
+
 // Deflicker's per-frame brightness, kept by media, size and frame: playing on needs one new frame's worth.
 bool cachedTileStats(const std::string& key, TileStats& out, const std::function<bool(TileStats&)>& make) {
     static std::mutex m;
@@ -809,7 +927,7 @@ bool sourceStageLooks(const Clip& c, FrameTime lt, const ColorSpace& from, const
         for (const Effect& e : c.effects) {
             if (!e.enabled || e.type == "video_denoise" || e.type == "super_scale" || e.type == "motion_deblur" ||
                 e.type == "reframe_360" || e.type == "redact_faces" || e.type == "stereo_3d" || e.type == "dirt_removal" ||
-                e.type == "dust_spots")
+                e.type == "dust_spots" || e.type == "lip_sync")
                 continue;
             if (e.node != 0 || hasMask(e, lt)) break;
             if (e.type == "aces_gamut_compress" || sourceLookSpace(e)) return true;
@@ -887,6 +1005,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (const Effect* nr = denoiseEffect(seq, c); nr && !src.empty())
                 applyDenoise(*nr, lt, src, {}, {}, effectPixelScale(c, lt, g.sx, mw, src.width), -1);
             if (const Effect* db = enabledEffect(seq, c, "motion_deblur")) applyMotionDeblur(*db, lt, o, src);
+            if (const Effect* ls = enabledEffect(seq, c, "lip_sync")) applyLipSync(p, seq, c, *ls, lt, o, src);
             convertColor(src, sequenceColorSpace(*nested), sequenceColorSpace(seq), seq.hdrPeakNits);
         } else if (m->kind == MediaKind::Video || m->kind == MediaKind::Image) {
             if (!m->hasVideo && m->kind != MediaKind::Image) return false;
@@ -977,7 +1096,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 const ColorSpace& from = original ? mediaColorSpace(*m) : pictureColorSpace(*m, path);
                 if (!ofxFetch && !(sampling > 0 && m->kind == MediaKind::Video) && !denoiseEffect(seq, c) &&
                     !enabledEffect(seq, c, "motion_deblur") && !enabledEffect(seq, c, "motion_blur") && !enabledEffect(seq, c, "deflicker") &&
-                    !enabledEffect(seq, c, "dirt_removal") && !enabledEffect(seq, c, "dust_spots") &&
+                    !enabledEffect(seq, c, "dirt_removal") && !enabledEffect(seq, c, "dust_spots") && !enabledEffect(seq, c, "lip_sync") &&
                     !upscale && !vr && !sourceStageLooks(c, lt, from, *m)) {
                     out.frame = f;
                     out.frameSpace = &from;
@@ -1088,6 +1207,8 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             }
             // Motion Deblur, on the source frame as decoded (the size it is shown at); not on proxies, which are for speed.
             if (const Effect* db = enabledEffect(seq, c, "motion_deblur"); db && original) applyMotionDeblur(*db, lt, o, src);
+            // Lip Sync, likewise (after the picture is cleaned up, before it is coloured).
+            if (const Effect* ls = enabledEffect(seq, c, "lip_sync"); ls && original) applyLipSync(p, seq, c, *ls, lt, o, src);
             // Motion Blur and Deflicker, from the source frames either side.
             const Effect* blur = enabledEffect(seq, c, "motion_blur");
             const Effect* flicker = enabledEffect(seq, c, "deflicker");
@@ -1161,7 +1282,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 for (const Effect& e : c.effects) {
                     if (!e.enabled || e.type == "video_denoise" || e.type == "super_scale" || e.type == "motion_deblur" ||
                         e.type == "reframe_360" || e.type == "redact_faces" || e.type == "stereo_3d" || e.type == "dirt_removal" ||
-                        e.type == "dust_spots")
+                        e.type == "dust_spots" || e.type == "lip_sync")
                         continue;  // (off, or run at the source already)
                     if (e.node != 0 || hasMask(e, lt)) break;
                     if (e.type == "aces_gamut_compress" && !sourceRgc) {
@@ -1261,7 +1382,8 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
     for (const Effect* e : redactions) applyVideoEffect(*e, lt, src, pixelScale, sourceSeconds);
     auto ranAlready = [&](const Effect& e) {
         return e.type == "video_denoise" || e.type == "super_scale" || e.type == "motion_deblur" || e.type == "reframe_360" || e.type == "redact_faces" ||
-               e.type == "stereo_3d" || e.type == "dirt_removal" || e.type == "dust_spots" || &e == sourceCdl || &e == sourceRgc ||
+               e.type == "stereo_3d" || e.type == "dirt_removal" || e.type == "dust_spots" || e.type == "lip_sync" || &e == sourceCdl ||
+               &e == sourceRgc ||
                std::find(sourceLooks.begin(), sourceLooks.end(), &e) != sourceLooks.end();  // those ran already (Stereo 3D is placed below)
     };
     // A node graph (core/GradeGraph.h) runs where its first node's effect is in the stack (or after the clip's own
@@ -1733,7 +1855,7 @@ bool gpuChainOps(const Sequence& seq, const Clip& c, FrameTime lt, const std::fu
 // Effects finishClipLayer leaves alone, having run on the source (Redact Faces is not: it runs there).
 bool runOnSource(const Effect& e) {
     return e.type == "video_denoise" || e.type == "super_scale" || e.type == "motion_deblur" || e.type == "reframe_360" ||
-           e.type == "stereo_3d" || e.type == "dirt_removal" || e.type == "dust_spots";
+           e.type == "stereo_3d" || e.type == "dirt_removal" || e.type == "dust_spots" || e.type == "lip_sync";
 }
 
 GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, gpu::Layer& out) {

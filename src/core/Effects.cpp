@@ -394,6 +394,12 @@ std::vector<EffectInfo> buildCatalog() {
                  {pct("amount", "Amount", 0, 100, 100), num("limit", "Largest Gaze Corrected (degrees)", 5, 40, 20, 1),
                   boolean("show", "Show Irises Found")},
                  {}});
+    // The largest face's mouth and jaw drawn again to speak an audio track's sound (a dub), with MuseTalk (media/LipSync.h).
+    {
+        StringParamInfo sound = str("track", "Sound From", StringKind::Track);
+        sound.choices = {"Every Track"};  // (shown for "": every audio track)
+        c.push_back({"lip_sync", "Lip Sync", EffectCategory::VideoFilter, "Refine", {pct("amount", "Amount", 0, 100, 100)}, {sound}});
+    }
     // Spots, pimples and small marks on faces found and healed from the skin round them.
     c.push_back({"blemish_remover", "Blemish Remover", EffectCategory::VideoFilter, "Refine",
                  {pct("amount", "Amount", 0, 100, 100), pct("sensitivity", "Sensitivity", 0, 100, 50),
@@ -1068,7 +1074,7 @@ bool hasMask(const Effect& e, FrameTime t) {
 
 bool needsFaces(const Effect& e) {
     return e.enabled && (e.type == "face_refine" || e.type == "blemish_remover" || e.type == "redact_faces" || e.type == "face_shape" ||
-                         e.type == "look_at_lens" ||
+                         e.type == "look_at_lens" || e.type == "lip_sync" ||
                          (e.type == "depth_blur" && std::lround(e.p("follow", 0, 0)) == 2));
 }
 
