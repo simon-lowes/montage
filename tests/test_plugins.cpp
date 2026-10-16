@@ -372,7 +372,8 @@ private slots:
         Project back;
         QVERIFY(loadProject(path("ofx.montage").toStdString(), back));
         QVERIFY(near([&] {
-            const float* px = renderSequenceFrame(back, *back.active(), 3, o).at(32, 18);
+            const Image img = renderSequenceFrame(back, *back.active(), 3, o);  // kept: the pixel pointer is into it
+            const float* px = img.at(32, 18);
             return std::array<float, 3>{px[0], px[1], px[2]};
         }(), {0.8f, 0.3f, 0.4f}));
         // The temporal plugin reads the frames either side through the host.
