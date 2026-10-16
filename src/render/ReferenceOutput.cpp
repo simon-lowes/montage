@@ -8,6 +8,7 @@
 
 #include "core/History.h"
 #include "render/ColorSpace.h"
+#include "render/MonitorCalibration.h"
 
 namespace montage::output {
 
@@ -219,7 +220,13 @@ bool Scheduler::start(const Device& device, const Mode& mode, const Sequence& s,
     }
     const Rect r = fitRect(s.width, s.height, mode.width, mode.height, config.scaling);
     renderScale_ = s.width > 0 ? double(r.width) / s.width : 1;
-    black_ = pack(Image(mode.width, mode.height));
+    Image black(mode.width, mode.height, Image::Uninitialized{});
+    black.fill(0, 0, 0, 1);
+    {
+        std::shared_ptr<const Packed> b = pack(black, calibration());  // (through the calibration: the monitor's black as it is corrected)
+        std::lock_guard lock(m_);
+        black_ = std::move(b);
+    }
     if (!backend_->open(device, mode, signal_, audioChannels_, audioRate_, error)) return false;
     {
         std::lock_guard lock(m_);
@@ -281,6 +288,32 @@ void Scheduler::clearFrames() {
     packed_.clear();
 }
 
+void Scheduler::setCalibration(std::shared_ptr<const Lut3D> lut) {
+    // Black (shown before the first frame and after patches) through it too, once the device is open.
+    std::shared_ptr<const Packed> black;
+    if (running_) {
+        Image b(mode_.width, mode_.height, Image::Uninitialized{});
+        b.fill(0, 0, 0, 1);
+        black = pack(b, lut);
+    }
+    std::lock_guard lock(m_);
+    calibration_ = std::move(lut);
+    ++calibrationGeneration_;
+    if (black) black_ = std::move(black);
+    packed_.clear();  // (wanted again, so playback renders them again)
+}
+
+std::shared_ptr<const Lut3D> Scheduler::calibration() const {
+    std::lock_guard lock(m_);
+    return calibration_;
+}
+
+void Scheduler::setPatch(std::shared_ptr<const Image> patch) {
+    std::shared_ptr<const Packed> p = patch ? packRaw(*patch) : nullptr;
+    std::lock_guard lock(m_);
+    patch_ = std::move(p);
+}
+
 void Scheduler::setPosition(FrameTime t, double speed) {
     std::lock_guard lock(m_);
     position_ = t;
@@ -299,7 +332,7 @@ Scheduler::Stats Scheduler::stats() const {
     return s;
 }
 
-std::shared_ptr<const Scheduler::Packed> Scheduler::pack(const Image& img) const {
+std::shared_ptr<const Scheduler::Packed> Scheduler::pack(const Image& img, const std::shared_ptr<const Lut3D>& lut) const {
     const Image* src = &img;
     Image converted;
     if (seqSpace_ != signal_.colorSpace) {
@@ -311,6 +344,25 @@ std::shared_ptr<const Scheduler::Packed> Scheduler::pack(const Image& img) const
             src = &converted;
         }
     }
+    Image fitted;
+    if (src->width != mode_.width || src->height != mode_.height) {
+        fitted = fitInto(*src, mode_.width, mode_.height, config_.scaling);
+        src = &fitted;
+    }
+    // The monitor's calibration, last.
+    Image calibrated;
+    if (lut) {
+        if (src == &fitted) calibrated = std::move(fitted);
+        else if (src == &converted) calibrated = std::move(converted);
+        else calibrated = img;
+        calibrateImage(calibrated, *lut);
+        src = &calibrated;
+    }
+    return packRaw(*src);
+}
+
+std::shared_ptr<const Scheduler::Packed> Scheduler::packRaw(const Image& img) const {
+    const Image* src = &img;
     Image fitted;
     if (src->width != mode_.width || src->height != mode_.height) {
         fitted = fitInto(*src, mode_.width, mode_.height, config_.scaling);
@@ -344,8 +396,16 @@ void Scheduler::packLoop() {
             img = std::move(best->second);
             pending_.erase(best);
         }
-        std::shared_ptr<const Packed> p = pack(*img);
+        std::shared_ptr<const Lut3D> lut;
+        uint64_t generation = 0;
+        {
+            std::lock_guard lock(m_);
+            lut = calibration_;
+            generation = calibrationGeneration_;
+        }
+        std::shared_ptr<const Packed> p = pack(*img, lut);
         std::lock_guard lock(m_);
+        if (generation != calibrationGeneration_) continue;  // (through a calibration since changed: wanted again)
         packed_[t] = std::move(p);
         // Kept: the frames nearest the playhead.
         while (packed_.size() > 40) {
@@ -356,9 +416,14 @@ void Scheduler::packLoop() {
 }
 
 void Scheduler::sendLoop() {
-    std::shared_ptr<const Packed> last = black_;
+    std::shared_ptr<const Packed> last;
+    {
+        std::lock_guard lock(m_);
+        last = black_;
+    }
     FrameTime lastFrame = -1, tcFrame = -1;
     bool tcRunning = false;  // the timecode running on from the last tick's (playing then too)
+    bool lastPatch = false;
     int64_t tick = 0, cursor = 0;
     bool audioOn = false;
     std::vector<float> audio;
@@ -369,6 +434,7 @@ void Scheduler::sendLoop() {
         double speed = 0;
         AudioSource source;
         std::shared_ptr<const Packed> frame;
+        bool patch = false;
         {
             std::lock_guard lock(m_);
             pos = position_;
@@ -377,7 +443,9 @@ void Scheduler::sendLoop() {
             const int dir = speed > 0 ? 1 : speed < 0 ? -1 : 0;
             target = pos + FrameTime(config_.videoOffset) * dir;
             auto it = packed_.find(target);
-            if (it != packed_.end()) frame = it->second;
+            patch = patch_ != nullptr;
+            if (patch) frame = patch_;  // (measuring the monitor)
+            else if (it != packed_.end()) frame = it->second;
             // Frames passed are let go.
             if (dir > 0) packed_.erase(packed_.begin(), packed_.lower_bound(target - 2));
             else if (dir < 0) packed_.erase(packed_.upper_bound(target + 2), packed_.end());
@@ -386,7 +454,11 @@ void Scheduler::sendLoop() {
         if (frame) {
             last = frame;
             lastFrame = target;
+        } else if (lastPatch) {
+            std::lock_guard lock(m_);
+            last = black_;  // (not the patch, after measuring)
         }
+        lastPatch = patch;
         const bool late = !frame && playing;
         // This output frame's samples: 48000 / 29.97 alternates 1601 and 1602 (8008 in five frames).
         const int n = int(std::llround((tick + 1) * audioRate_ / modeFps) - std::llround(tick * audioRate_ / modeFps));

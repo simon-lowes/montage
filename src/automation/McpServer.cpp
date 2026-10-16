@@ -114,6 +114,7 @@
 #include "render/QualityCheck.h"
 #include "media/Decoder.h"
 #include "media/Faces.h"
+#include "media/FaceMesh.h"
 #include "media/FaceTracks.h"
 #include "media/DepthMap.h"
 #include "media/Matting.h"
@@ -2104,6 +2105,17 @@ void McpServer::Impl::addTools() {
         "the camera's movement when added; when the clip has camera motion data (a GoPro GPMF track, a CAMM track, a .gcsv log "
         "beside it) stabilize lines it up and uses it (method 3, Camera Gyro, unless params give another method; horizon "
         "0-100 levels the horizon from gravity). "
+        "sky_replace finds the sky (bright, smooth, open to the top of the frame, far away when the depth model is "
+        "installed) and puts the picture on another track (source 0; track 0 is the one above, hidden unless hide 0) or a "
+        "gradient (source 1, colours zenith and horizon) in its place; sensitivity, lowest (the lowest the sky reaches, % "
+        "of the height), refine, shift and soften shape its key, view 1 shows it; the sky follows the camera (follow 1, "
+        "measured when added; follow 2 uses the clip's camera_track solve) by follow_amount; sky_exposure, sky_blur, "
+        "match (the foreground's colour moved toward the new sky's) and wrap / wrap_width (its light round the "
+        "foreground's edges) tie it in; a mask limits where the sky may be. "
+        "face_shape reshapes each face by its mesh (percent, -100..100): face_width, jaw, chin, forehead, nose_width, "
+        "nose_length, eye_size, eye_distance, mouth_width, mouth_height; show draws the mesh. look_at_lens turns each open "
+        "eye's iris to the lens (amount; limit, the largest gaze off the lens in degrees it corrects, fading over the next "
+        "10; show marks the irises). "
         "Restoration: dirt_removal takes out specks that are on one frame only (compared with the frames either side, "
         "following the motion); dust_spots replaces hand-marked spots (strings.spots, lines of \"frame x y radius\": the "
         "frame counted from the clip's start in sequence frames, the centre as fractions of the frame's width and height, "
@@ -2235,7 +2247,9 @@ void McpServer::Impl::addTools() {
             if (type == "object_removal" && (!inpaintAvailable() || !inpaintModel().installed()))
                 return fail("Object Removal needs its model: run `scripts/fetch-models.sh` or add it once in the app");
             if (needsFaces(e) && (!faceSearchAvailable() || !faceModel().installed()))
-                return fail("Face Refinement, Blemish Remover, Redact Faces and Lens Blur (Depth) following the nearest face need the face models: run `scripts/fetch-models.sh` or add them once in the app");
+                return fail("Face Refinement, Blemish Remover, Redact Faces, Face Shape, Look at Lens and Lens Blur (Depth) following the nearest face need the face models: run `scripts/fetch-models.sh` or add them once in the app");
+            if ((type == "face_shape" || type == "look_at_lens") && (!faceMeshAvailable() || !faceMeshModel().installed()))
+                return fail("Face Shape and Look at Lens need the face mesh model: run `scripts/fetch-models.sh` or add one once in the app");
             if ((needsPersonMatte(e, 0) || type == "behind_people") && (!mattingAvailable() || !mattingModel().installed()))
                 return fail("Remove Background, Behind People and People masks need their model: run `scripts/fetch-models.sh` or add one once in the app");
             if (needsDepth(e, 0) && (!depthAvailable() || !depthModel().installed()))
@@ -2310,9 +2324,16 @@ void McpServer::Impl::addTools() {
                 return ok(QStringLiteral("Added %1 to %2%3").arg(QString::fromStdString(displayName), QString::fromStdString(c.name), note),
                           QJsonObject{{"effect_id", double(e.id)}, {"camera_gyro", usingGyro}});
             }
+            QString note;
+            if (type == "sky_replace" && std::lround(e.p("follow", 0, 1)) == 1) {
+                // The new sky moves with the camera, measured now (a still, or a clip it fails on, keeps the sky still).
+                std::string motion, err;
+                if (analyzeClipStabilization(l.project, l.seq(), c, motion, {}, nullptr, &err)) e.strings["motion"] = motion;
+                else note = QStringLiteral(" (the sky stays still: %1)").arg(QString::fromStdString(err));
+            }
             c.effects.push_back(e);
             save(l);
-            return ok(QStringLiteral("Added %1 to %2").arg(QString::fromStdString(displayName), QString::fromStdString(c.name)),
+            return ok(QStringLiteral("Added %1 to %2%3").arg(QString::fromStdString(displayName), QString::fromStdString(c.name), note),
                       QJsonObject{{"effect_id", double(e.id)}});
         });
 

@@ -70,6 +70,9 @@
 #include "LicencesDialog.h"
 #include "CaptionsPanel.h"
 #include "CleanFeed.h"
+#include "DisplayCalibration.h"
+#include "MonitorCalibrationDialog.h"
+#include "PatchGenerator.h"
 #include "ColorWarperEditor.h"
 #include "ColorWheel.h"
 #include "CurveEditor.h"
@@ -4650,6 +4653,140 @@ private slots:
         QVERIFY(win_->cleanFeed()->isVisible());
         win_->findChild<QAction*>("fullScreenProgram")->trigger();
         QVERIFY(!win_->cleanFeed()->isVisible());
+        state()->setPlayhead(0);
+    }
+
+    void monitorCalibration() {
+        loadDemo();
+        MonitorPanel* program = nullptr;
+        for (MonitorPanel* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        QTemporaryDir dir;
+        const QString lutPath = dir.filePath(QStringLiteral("half.cube"));
+        {
+            QFile f(lutPath);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write("LUT_3D_SIZE 2\n0 0 0\n0.5 0 0\n0 0.5 0\n0.5 0.5 0\n0 0 0.5\n0.5 0 0.5\n0 0.5 0.5\n0.5 0.5 0.5\n");
+        }
+        DisplayCalibration& cal = DisplayCalibration::instance();
+        cal.setBypassed(false);
+        const QString screen = DisplayCalibration::screenTarget(viewer->screen());
+        QString why;
+        QVERIFY(!cal.setLutPath(screen, dir.filePath(QStringLiteral("missing.cube")), &why) && !why.isEmpty());
+        QVERIFY2(cal.setLutPath(screen, lutPath, &why), qPrintable(why));
+        // The viewer draws its picture through its screen's LUT; the picture itself (the scopes', the renders') is as it was.
+        state()->setPlayhead(10);  // the red clip
+        QTRY_VERIFY(!viewer->image().isNull() && qRed(viewer->image().pixel(viewer->image().width() / 2, viewer->image().height() / 2)) > 200);
+        const QPoint mid(viewer->image().width() / 2, viewer->image().height() / 2);
+        const int red = qRed(viewer->image().pixel(mid));
+        QVERIFY(std::abs(qRed(viewer->drawnImage().pixel(mid)) - red / 2) <= 1);
+        // The full-screen output on that screen too.
+        CleanFeedWindow* feed = win_->showCleanFeed(0);
+        QTRY_VERIFY(!feed->frame().isNull());
+        const QPoint fmid(feed->frame().width() / 2, feed->frame().height() / 2);
+        if (QGuiApplication::screens().at(0) == viewer->screen())
+            QVERIFY(std::abs(qRed(feed->drawnFrame().pixel(fmid)) - qRed(feed->frame().pixel(fmid)) / 2) <= 1);
+        feed->close();
+        // Bypassed: as it was.
+        cal.setBypassed(true);
+        QCOMPARE(qRed(viewer->drawnImage().pixel(mid)), red);
+        cal.setBypassed(false);
+        QVERIFY(cal.screenLut(viewer->screen()) && !cal.screenLut(viewer->screen(), true));
+
+        // The dialog: each screen's LUTs, cleared there.
+        win_->findChild<QAction*>("monitorCalibrationAction")->trigger();
+        auto* dlg = win_->findChild<MonitorCalibrationDialog*>("monitorCalibration");
+        QVERIFY(dlg);
+        auto* file = dlg->findChild<QLabel*>(QStringLiteral("lutFile:") + screen);
+        QVERIFY(file);
+        QCOMPARE(file->text(), QStringLiteral("half.cube"));
+        dlg->findChild<QPushButton*>(QStringLiteral("lutClear:") + screen)->click();
+        QVERIFY(cal.lutPath(screen).isEmpty());
+        QCOMPARE(qRed(viewer->drawnImage().pixel(mid)), red);
+        QTRY_COMPARE(dlg->findChild<QLabel*>(QStringLiteral("lutFile:") + screen)->text(), QStringLiteral("None"));
+
+        // The patch generator, measured through by calibration software (a stand-in listening here).
+        QTcpServer software;
+        QVERIFY(software.listen(QHostAddress::LocalHost));
+        auto frame = [](const QByteArray& xml) {
+            QByteArray out(4, '\0');
+            const quint32 n = quint32(xml.size());
+            out[0] = char(n >> 24), out[1] = char(n >> 16 & 255), out[2] = char(n >> 8 & 255), out[3] = char(n & 255);
+            return out + xml;
+        };
+        dlg->findChild<QLineEdit*>("patchHost")->setText(QStringLiteral("127.0.0.1"));
+        dlg->findChild<QSpinBox*>("patchPort")->setValue(software.serverPort());
+        auto* target = dlg->findChild<QComboBox*>("patchTarget");
+        target->setCurrentIndex(0);
+        auto* startStop = dlg->findChild<QPushButton*>("patchStartStop");
+        auto* status = dlg->findChild<QLabel*>("patchStatus");
+        auto* gen = win_->findChild<PatchGenerator*>();
+        QVERIFY(gen);
+        startStop->click();
+        QVERIFY(gen->active());
+        QVERIFY(gen->window() && gen->window()->isVisible() && gen->window()->isFullScreen());
+        QTRY_VERIFY(software.hasPendingConnections() || software.waitForNewConnection(100));
+        QTcpSocket* client = software.nextPendingConnection();
+        QVERIFY(client);
+        QTRY_VERIFY(status->text().contains("waiting for the first patch"));
+        client->write(frame("<?xml version=\"1.0\" encoding=\"UTF-8\" ?><calibration><color red=\"940\" green=\"64\" blue=\"64\" bits=\"10\"/>"
+                            "<background red=\"0\" green=\"0\" blue=\"0\" bits=\"10\"/><geometry x=\"0.4000\" y=\"0.4000\" cx=\"0.2000\" cy=\"0.2000\"/></calibration>"));
+        client->flush();
+        QTRY_COMPARE(gen->patches(), 1);
+        QVERIFY(status->text().contains("R 940 G 64 B 64 (10-bit)"));
+        const QImage shown = gen->window()->picture();
+        QCOMPARE(qRed(shown.pixel(shown.width() / 2, shown.height() / 2)), int(std::lround(940.0 / 1023 * 255)));
+        QCOMPARE(qRed(shown.pixel(2, 2)), 0);
+        // The software going away: waited for again, then stopped from the dialog.
+        client->disconnectFromHost();
+        QTRY_VERIFY(status->text().contains("Waiting for the calibration software"));
+        QTRY_VERIFY(software.hasPendingConnections() || software.waitForNewConnection(100));  // (tried again)
+        startStop->click();
+        QVERIFY(!gen->active() && !gen->window()->isVisible());
+        QCOMPARE(status->text(), QStringLiteral("Off"));
+        while (QTcpSocket* stale = software.nextPendingConnection()) stale->deleteLater();  // (its tries)
+
+        // On the reference output (which must be running): its own LUT, and patches in place of the program.
+        gen->setReferenceOutput(true);
+        QVERIFY(!gen->start(QStringLiteral("127.0.0.1"), software.serverPort(), &why) && why.contains("reference output"));
+        QVERIFY(!gen->active());
+        target->setCurrentIndex(target->findData(-1));
+        qputenv("MONTAGE_VIRTUAL_OUTPUT", "1");
+        auto* controller = win_->findChild<ReferenceOutputController*>();
+        const output::Config saved = ReferenceOutputController::loadConfig();
+        output::Config cfg = saved;
+        cfg.backend = "Virtual";
+        cfg.device = "";
+        cfg.mode = "";  // (the sequence's)
+        cfg.depth = 10;
+        QVERIFY2(controller->start(cfg, &why), qPrintable(why));
+        QVERIFY2(cal.setLutPath(controller->calibrationTarget(), lutPath, &why), qPrintable(why));
+        QVERIFY(controller->scheduler()->calibration());
+        QVERIFY(controller->status().contains("calibrated"));
+        QTRY_VERIFY(dlg->findChild<QLabel*>(QStringLiteral("lutFile:") + controller->calibrationTarget()));
+        auto dev = std::dynamic_pointer_cast<output::VirtualBackend>(controller->backend());
+        startStop->click();
+        QVERIFY(gen->active() && gen->referenceOutput());
+        QTRY_VERIFY(software.hasPendingConnections() || software.waitForNewConnection(100));
+        client = software.nextPendingConnection();
+        client->write(frame("<calibration><color red=\"1023\" green=\"1023\" blue=\"1023\" bits=\"10\"/></calibration>"));
+        client->flush();
+        QTRY_COMPARE(gen->patches(), 1);
+        // White, not through the LUT (which halves): 10-bit video levels' white.
+        auto luma = [](const output::VirtualBackend::Sent& x) {
+            const uint32_t w0 = x.data[0] | x.data[1] << 8 | x.data[2] << 16 | uint32_t(x.data[3]) << 24;
+            return int(w0 >> 10 & 1023);
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(!dev->sent().empty() && luma(dev->sent().back()) == 940, 5000);
+        startStop->click();
+        QTRY_VERIFY_WITH_TIMEOUT(luma(dev->sent().back()) != 940, 5000);  // (the program again)
+        controller->stop();
+        ReferenceOutputController::saveConfig(saved);
+        cal.setLutPath(DisplayCalibration::outputTarget(QStringLiteral("Virtual"), QStringLiteral("virtual")), QString());
+        qunsetenv("MONTAGE_VIRTUAL_OUTPUT");
+        dlg->close();
         state()->setPlayhead(0);
     }
 
@@ -11748,6 +11885,32 @@ const auto seq = [this] { return state()->sequence(); };
         for (auto* b : win_->findChildren<QPushButton*>("analyzeStabilize"))
             if (b->isVisibleTo(win_.get())) again = b;
         QVERIFY(again);
+
+        // Sky Replacement on footage measures the camera's movement when added too, for its sky to follow.
+        add = nullptr;
+        for (auto* b : win_->findChildren<QPushButton*>())
+            if (b->text().startsWith("Add Video Effect") && b->isVisibleTo(win_.get())) add = b;
+        QVERIFY(add);
+        QAction* skyAction = nullptr;
+        std::function<void(QMenu*)> findSky = [&](QMenu* menu) {
+            for (QAction* a : menu->actions()) {
+                if (a->menu()) findSky(a->menu());
+                else if (a->text() == "Sky Replacement") skyAction = a;
+            }
+        };
+        findSky(add->menu());
+        QVERIFY(skyAction);
+        skyAction->trigger();
+        QTRY_VERIFY_WITH_TIMEOUT(effectOf("sky_replace") && !effectOf("sky_replace")->s("motion").empty(), 30000);
+        QApplication::processEvents();
+        int analyzers = 0;
+        for (auto* b : win_->findChildren<QPushButton*>("analyzeStabilize")) analyzers += b->isVisibleTo(win_.get());
+        QCOMPARE(analyzers, 2);
+        state()->edit("No Sky", [clip](Project&, Sequence& s) {
+            auto& fx = edit::clipById(s, clip)->effects;
+            fx.erase(std::remove_if(fx.begin(), fx.end(), [](const Effect& e) { return e.type == "sky_replace"; }), fx.end());
+            return true;
+        });
 
         // A masked blur, tracked forwards from the playhead.
         state()->edit("Blur", [clip](Project& p, Sequence& s) {

@@ -49,6 +49,33 @@ std::vector<float> placed(const std::vector<float>& from, int w, int h, size_t n
     return out;
 }
 
+// `from` (w x h, n channels) stretched to w2 x h2 (an anamorphic render's stored width to its shown width): linearly,
+// or for ids (a Cryptomatte's) the nearest sample.
+std::vector<float> stretched(const std::vector<float>& from, int w, int h, size_t n, int w2, int h2, bool nearest) {
+    if (w == w2 && h == h2) return from;
+    if (w <= 0 || h <= 0) return std::vector<float>(size_t(w2) * size_t(h2) * n, 0.0f);
+    std::vector<float> out(size_t(w2) * size_t(h2) * n);
+    auto at = [&](int x, int y) { return &from[(size_t(std::clamp(y, 0, h - 1)) * size_t(w) + size_t(std::clamp(x, 0, w - 1))) * n]; };
+    parallelRows(h2, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            const double sy = (y + 0.5) * h / h2 - 0.5;
+            for (int x = 0; x < w2; ++x) {
+                const double sx = (x + 0.5) * w / w2 - 0.5;
+                float* d = &out[(size_t(y) * size_t(w2) + size_t(x)) * n];
+                if (nearest) {
+                    std::copy_n(at(int(std::lround(sx)), int(std::lround(sy))), n, d);
+                    continue;
+                }
+                const int ix = int(std::floor(sx)), iy = int(std::floor(sy));
+                const float fx = float(sx - ix), fy = float(sy - iy);
+                const float *a = at(ix, iy), *b = at(ix + 1, iy), *c = at(ix, iy + 1), *e = at(ix + 1, iy + 1);
+                for (size_t k = 0; k < n; ++k) d[k] = (a[k] * (1 - fx) + b[k] * fx) * (1 - fy) + (c[k] * (1 - fx) + e[k] * fx) * fy;
+            }
+        }
+    });
+    return out;
+}
+
 // The layers an OpenEXR pull adds to each frame: the source render's others, and the clip's masks as mattes.
 struct PullLayers {
     const Project* project = nullptr;
@@ -80,7 +107,12 @@ struct PullLayers {
                 if (!l.cryptomatte && l.listedAs == clip->layer) continue;
                 if (l.layer.name.empty() && !l.cryptomatte && l.listedAs.empty()) l.layer.name = l.listedAs = "main";
                 note(l.listedAs);
-                l.layer.data = placed(l.layer.data, w, h, l.layer.channels.size(), W, H);
+                // (an anamorphic render's layers are stored squeezed: stretched as its picture is shown)
+                // (colour blended; data such as ids, depth and vectors by the nearest sample, not mixed across edges)
+                const bool colour = std::all_of(l.layer.channels.begin(), l.layer.channels.end(), [](const std::string& ch) {
+                    return ch == "R" || ch == "G" || ch == "B" || ch == "A";
+                });
+                l.layer.data = stretched(l.layer.data, w, h, l.layer.channels.size(), W, H, l.cryptomatte || !colour);
                 layers.push_back(std::move(l.layer));
             }
         }

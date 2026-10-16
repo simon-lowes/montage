@@ -5,6 +5,7 @@
 // masks, depth, finding faces to redact).
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -34,6 +35,10 @@ struct Provenance {
 // What the enabled clips of the sequence from `from` up to `to` (timeline frames, `to` not included, as an export's
 // range; -1: its start or end), and the sequences nested in them, use.
 Provenance sequenceProvenance(const Project& p, const Sequence& s, FrameTime from = -1, FrameTime to = -1);
+
+// Whether a model an effect only uses when it is there (Sky Replacement's "depth") is: set by the engine
+// (render/SkyReplace.cpp); unset, it is taken to be there.
+void setOptionalModelCheck(std::function<bool(const std::string& model)> check);
 
 // The IPTC digital source type for a role ("" for Assisted).
 std::string iptcSourceType(AiRole role);

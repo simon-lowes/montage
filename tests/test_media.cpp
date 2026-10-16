@@ -134,9 +134,22 @@
 #include "media/Diarizer.h"
 #include "render/Hdr10Plus.h"
 #include "media/Faces.h"
+#include "media/FaceMesh.h"
+#include "render/FaceShape.h"
 #include "media/FaceTracks.h"
 #include "media/DepthMap.h"
 #include "media/Exr.h"
+#ifdef MONTAGE_WITH_OPENEXR
+#include <ImfChannelList.h>
+#include <ImfFrameBuffer.h>
+#include <ImfHeader.h>
+#include <ImfMultiPartOutputFile.h>
+#include <ImfOutputFile.h>
+#include <ImfRgba.h>
+#include <ImfOutputPart.h>
+#include <ImfPartType.h>
+#include <ImfStringAttribute.h>
+#endif
 #include "media/Rife.h"
 #include "media/Matting.h"
 #include "media/TextToSpeech.h"
@@ -11960,6 +11973,126 @@ if ui["pressed"] == "add":
         QCOMPARE(int(m.kind), int(MediaKind::Image));
     }
 
+    void faceShapeAndLookAtLens() {
+        if (!faceSearchAvailable() || !faceModel().installed() || !faceMeshModel().installed())
+            QSKIP("Set MONTAGE_FACE_MODEL to the face models (with the face mesh)");
+        auto load = [](const char* name) {
+            VideoDecoder dec;
+            std::string err;
+            Frame16Ptr f;
+            if (dec.open(std::string(MONTAGE_TEST_DATA_DIR "/faces/") + name, &err)) f = dec.frameAt(0);
+            return f ? toImage(*f) : Image();
+        };
+        const Image jfk = load("jfk-color.jpg");
+        QVERIFY(!jfk.empty());
+        std::shared_ptr<const std::vector<FaceBox>> faces = cachedFaces(jfk);
+        QVERIFY(faces && !faces->empty());
+        FaceMesh mesh;
+        std::string err;
+        QVERIFY2(fitFaceMesh(jfk, faces->front(), mesh, &err), err.c_str());
+        // The mesh sits on the face: the nose tip inside its box, the eyes' outer corners either side of it, the chin
+        // below them; the head turned only a little.
+        const FaceBox& box = faces->front();
+        QVERIFY(mesh.x(1) > box.x * jfk.width && mesh.x(1) < (box.x + box.w) * jfk.width);
+        QVERIFY(mesh.x(33) < mesh.x(1) && mesh.x(263) > mesh.x(1) && mesh.y(152) > mesh.y(1) && mesh.y(10) < mesh.y(33));
+        QVERIFY2(std::fabs(mesh.yaw) < 35 && std::fabs(mesh.pitch) < 30, qPrintable(QString("%1 %2").arg(mesh.yaw).arg(mesh.pitch)));
+        // Reshaped by a known amount: each point that moves (the cheeks out, the eyes' outlines larger) shows, where it
+        // goes, what was at it, to within a small part of the move.
+        FaceShapeSettings wide;
+        wide.faceWidth = 1;
+        wide.eyeSize = 1;
+        const std::vector<std::array<float, 2>> to = faceShapeTargets(mesh, wide);
+        QVERIFY(to[454][0] - mesh.x(454) > 3 && to[234][0] - mesh.x(234) < -3);
+        Image reshaped = jfk;
+        reshapeFaces(reshaped, {mesh}, wide);
+        // (the warp measured on a picture of its own coordinates: each target should show what was at its point)
+        Image coords = jfk;
+        for (int y = 0; y < jfk.height; ++y)
+            for (int x = 0; x < jfk.width; ++x) {
+                float* c = coords.at(x, y);
+                c[0] = x + 0.5f, c[1] = y + 0.5f, c[2] = 0, c[3] = 1;
+            }
+        reshapeFaces(coords, {mesh}, wide);
+        double asked = 0, missed = 0;
+        int moving = 0;
+        for (int i = 0; i < kFaceMeshPoints; ++i) {
+            const auto& t = to[size_t(i)];
+            const double move = std::hypot(t[0] - mesh.x(i), t[1] - mesh.y(i));
+            if (move < 1.5) continue;
+            const int px = std::clamp(int(t[0]), 0, jfk.width - 1), py = std::clamp(int(t[1]), 0, jfk.height - 1);
+            const float* c = coords.at(px, py);
+            // (less the step from the target to the pixel's middle, which carries what is there with it)
+            ++moving, asked += move;
+            missed += std::hypot(c[0] - (px + 0.5 - t[0]) - mesh.x(i), c[1] - (py + 0.5 - t[1]) - mesh.y(i));
+        }
+        QVERIFY2(moving >= 20 && missed < 0.2 * asked, qPrintable(QString("%1 points, %2 of %3 missed").arg(moving).arg(missed).arg(asked)));
+        QVERIFY(reshaped.px != jfk.px);
+        // Far from the face nothing moves.
+        QVERIFY(std::equal(reshaped.at(5, 5), reshaped.at(5, 5) + 4, jfk.at(5, 5)));
+        // Where looking at the lens puts an iris, against portraits: Armstrong looks at the lens with his head near
+        // frontal, so each iris is already about there.
+        {
+            const Image arm = load("armstrong.jpg");
+            std::shared_ptr<const std::vector<FaceBox>> armFaces = cachedFaces(arm);
+            QVERIFY(armFaces && !armFaces->empty());
+            FaceMesh am;
+            QVERIFY(fitFaceMesh(arm, armFaces->front(), am));
+            QVERIFY2(std::fabs(am.yaw) < 10 && std::fabs(am.pitch) < 10, qPrintable(QString("%1 %2").arg(am.yaw).arg(am.pitch)));
+            for (bool left : {false, true}) {
+                float ix = 0, iy = 0, ir = 0, tx = 0, ty = 0;
+                QVERIFY(gazeTarget(am, left, tx, ty));
+                am.iris(left, ix, iy, ir);
+                const double width = std::hypot(am.x(left ? 263 : 33) - am.x(left ? 362 : 133), am.y(left ? 263 : 33) - am.y(left ? 362 : 133));
+                QVERIFY2(std::hypot(ix - tx, iy - ty) < 0.1 * width,
+                         qPrintable(QString("(%1, %2) lens at (%3, %4), eye %5 wide").arg(ix).arg(iy).arg(tx).arg(ty).arg(width)));
+            }
+        }
+        // Look at Lens: in the portrait looking up, the irises move toward where looking at the lens puts them.
+        const Image up = load("jfk-looking-up-close.jpg");
+        std::shared_ptr<const std::vector<FaceBox>> upFaces = cachedFaces(up);
+        QVERIFY(upFaces && !upFaces->empty());
+        FaceMesh upMesh;
+        QVERIFY(fitFaceMesh(up, upFaces->front(), upMesh));
+        QVERIFY2(upMesh.pitch > 4 && std::fabs(upMesh.yaw) < 15, qPrintable(QString("%1 %2").arg(upMesh.yaw).arg(upMesh.pitch)));  // (tilted up)
+        Image marked = up;
+        LookAtLensSettings show;
+        show.showIrises = true;
+        QCOMPARE(lookAtLens(marked, {upMesh}, show), 0);  // (marked, not moved)
+        QVERIFY(marked.px != up.px);
+        Image turned = up;
+        LookAtLensSettings ls;
+        ls.limit = 40;
+        const int moved = lookAtLens(turned, {upMesh}, ls);
+        QVERIFY2(moved >= 1, qPrintable(QString::number(moved)));
+        // (each iris followed by its highlight, the brightest thing in it, which moves with it)
+        for (bool left : {false, true}) {
+            float bx = 0, by = 0, br = 0, tx = 0, ty = 0;
+            if (!gazeTarget(upMesh, left, tx, ty)) continue;
+            upMesh.iris(left, bx, by, br);
+            // (within r of (cx, cy) and inside the iris round (ix, iy), not the white beside it)
+            auto highlight = [&](const Image& img, double cx, double cy, double r, double ix, double iy, double& hx, double& hy) {
+                auto in = [&](int x, int y) { return std::hypot(x + 0.5 - cx, y + 0.5 - cy) < r && std::hypot(x + 0.5 - ix, y + 0.5 - iy) < br - 2; };
+                float top = 0;
+                auto luma = [&](int x, int y) { const float* p = img.at(x, y); return 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]; };
+                for (int y = int(cy - r); y <= int(cy + r); ++y)
+                    for (int x = int(cx - r); x <= int(cx + r); ++x)
+                        if (in(x, y)) top = std::max(top, luma(x, y));
+                double n = 0;
+                hx = hy = 0;
+                for (int y = int(cy - r); y <= int(cy + r); ++y)
+                    for (int x = int(cx - r); x <= int(cx + r); ++x)
+                        if (in(x, y) && luma(x, y) > 0.92f * top) n += 1, hx += x + 0.5, hy += y + 0.5;
+                hx /= n, hy /= n;
+            };
+            double hx = 0, hy = 0, ax = 0, ay = 0;
+            highlight(up, bx, by, br, bx, by, hx, hy);
+            highlight(turned, hx + (tx - bx), hy + (ty - by), 0.5 * br, tx, ty, ax, ay);
+            const double before = std::hypot(bx - tx, by - ty);
+            QVERIFY2(before > 3 && std::hypot(ax - hx - (tx - bx), ay - hy - (ty - by)) < 1.5,
+                     qPrintable(QString("highlight (%1, %2) -> (%3, %4), iris (%5, %6) to (%7, %8)").arg(hx).arg(hy).arg(ax).arg(ay).arg(bx).arg(by).arg(tx).arg(ty)));
+        }
+    }
+
     void depthMaps() {
         if (!depthAvailable() || !depthModel().installed()) QSKIP("Set MONTAGE_DEPTH_MODEL to Depth Anything V2 Small");
         const std::string still = MONTAGE_TEST_DATA_DIR "/faces/armstrong.jpg";
@@ -21759,6 +21892,44 @@ private slots:
         const std::vector<float> ballMatte = cm.matte(parseCryptomatteIds(cryptomatteHex(ball)));
         QVERIFY(ballMatte[5] == 1.0f && ballMatte[W - 5] == 0.0f);
         QCOMPARE(parseCryptomatteIds(cryptomatteIdList({ball, floor})).size(), size_t(2));
+#ifdef MONTAGE_WITH_OPENEXR
+        // A multi-part file with a Cryptomatte of the same name in each part: each read from its own part.
+        {
+            const int w = 8, h = 4;
+            std::vector<Imf::Header> headers;
+            for (int k = 0; k < 2; ++k) {
+                Imf::Header hd(w, h);
+                hd.setName(k ? "right" : "left");
+                hd.setType(Imf::SCANLINEIMAGE);
+                for (const char* ch : {"R", "G", "B", "A"}) hd.channels().insert(std::string("CryptoObject00.") + ch, Imf::Channel(Imf::FLOAT));
+                hd.insert("cryptomatte/0a1b2c3/name", Imf::StringAttribute("CryptoObject"));
+                hd.insert("cryptomatte/0a1b2c3/hash", Imf::StringAttribute("MurmurHash3_32"));
+                hd.insert("cryptomatte/0a1b2c3/conversion", Imf::StringAttribute("uint32_to_float32"));
+                headers.push_back(hd);
+            }
+            {
+                Imf::MultiPartOutputFile out(path("parts.exr").c_str(), headers.data(), 2);
+                for (int k = 0; k < 2; ++k) {
+                    std::vector<float> d(size_t(w) * h * 4);
+                    for (size_t i = 0; i < d.size(); i += 4) d[i] = k ? floor : ball, d[i + 1] = 1, d[i + 2] = d[i + 3] = 0;
+                    Imf::FrameBuffer fb;
+                    for (int c = 0; c < 4; ++c)
+                        fb.insert(std::string("CryptoObject00.") + "RGBA"[c], Imf::Slice(Imf::FLOAT, reinterpret_cast<char*>(d.data() + c), 4 * sizeof(float), size_t(w) * 4 * sizeof(float)));
+                    Imf::OutputPart part(out, k);
+                    part.setFrameBuffer(fb);
+                    part.writePixels(h);
+                }
+            }
+            ExrInfo parts;
+            QVERIFY2(readExrInfo(path("parts.exr"), parts, &err), err.c_str());
+            QCOMPARE(parts.cryptomattes.size(), size_t(2));
+            CryptomatteFrame right, left;
+            QVERIFY2(readCryptomatte(path("parts.exr"), "right.CryptoObject", right, &err), err.c_str());
+            QVERIFY2(readCryptomatte(path("parts.exr"), "left.CryptoObject", left, &err), err.c_str());
+            QCOMPARE(right.idAt(2, 2), floor);
+            QCOMPARE(left.idAt(2, 2), ball);
+        }
+#endif
         // Read as a clip: the main picture, or a layer of it, as stored (HTJ2K needs OpenEXR's reader).
         ImageSequence seq;
         QVERIFY(detectImageSequence(path("render.0001.exr"), seq));
@@ -21834,6 +22005,71 @@ private slots:
         QVERIFY(rgba[(18 * W + 5) * 4] > 0.95f && rgba[(18 * W + 5) * 4 + 1] < 0.05f);  // the plate: diffuse, untouched (red)
         QVERIFY2(readExrLayer(pulled, "Z", pw, ph, rgba, &err), err.c_str());
         QCOMPARE(rgba[0], 5.0f + 1.0f);  // render frame 1 is the pull's 1001 (the cut starts at its first frame, no head handle)
+#ifdef MONTAGE_WITH_OPENEXR
+        // An anamorphic render (2:1 pixels, stored half as wide): its other layers pulled stretched as its picture
+        // is, a Cryptomatte's ids by the nearest sample.
+        {
+            const int sw = W / 2;
+            Imf::Header hd(sw, H);
+            hd.pixelAspectRatio() = 2;
+            for (const char* ch : {"R", "G", "B", "A"}) hd.channels().insert(ch, Imf::Channel(Imf::HALF));
+            hd.channels().insert("Z", Imf::Channel(Imf::FLOAT));
+            for (const char* ch : {"R", "G", "B", "A"}) hd.channels().insert(std::string("CryptoObject00.") + ch, Imf::Channel(Imf::FLOAT));
+            hd.insert("cryptomatte/0a1b2c3/name", Imf::StringAttribute("CryptoObject"));
+            hd.insert("cryptomatte/0a1b2c3/hash", Imf::StringAttribute("MurmurHash3_32"));
+            hd.insert("cryptomatte/0a1b2c3/conversion", Imf::StringAttribute("uint32_to_float32"));
+            std::vector<Imf::Rgba> rgbaPx(size_t(sw) * H, Imf::Rgba(0.5f, 0.5f, 0.5f, 1.0f));
+            std::vector<float> z(size_t(sw) * H), crypto(size_t(sw) * H * 4, 0.0f);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < sw; ++x) {
+                    const bool left = x < sw / 2;
+                    z[size_t(y) * sw + x] = left ? 1.0f : 2.0f;
+                    crypto[(size_t(y) * sw + x) * 4] = left ? ball : floor;
+                    crypto[(size_t(y) * sw + x) * 4 + 1] = 1;
+                }
+            QDir().mkpath(QString::fromStdString(path("ana")));
+            for (int n = 1; n <= 4; ++n) {
+                char name[64];
+                std::snprintf(name, sizeof name, "ana/squeezed.%04d.exr", n);
+                Imf::OutputFile out(path(name).c_str(), hd);
+                Imf::FrameBuffer fb;
+                const char* rgbaNames[4] = {"R", "G", "B", "A"};
+                for (int k = 0; k < 4; ++k)
+                    fb.insert(rgbaNames[k], Imf::Slice(Imf::HALF, reinterpret_cast<char*>(&rgbaPx[0]) + k * sizeof(half), sizeof(Imf::Rgba), size_t(sw) * sizeof(Imf::Rgba)));
+                fb.insert("Z", Imf::Slice(Imf::FLOAT, reinterpret_cast<char*>(z.data()), sizeof(float), size_t(sw) * sizeof(float)));
+                for (int k = 0; k < 4; ++k)
+                    fb.insert(std::string("CryptoObject00.") + rgbaNames[k],
+                              Imf::Slice(Imf::FLOAT, reinterpret_cast<char*>(crypto.data() + k), 4 * sizeof(float), size_t(sw) * 4 * sizeof(float)));
+                out.setFrameBuffer(fb);
+                out.writePixels(H);
+            }
+            ImageSequence aseq;
+            QVERIFY(detectImageSequence(path("ana/squeezed.0001.exr"), aseq));
+            aseq.fps = {24, 1};
+            Project ap = makeDefaultProject();
+            Sequence& as = *ap.active();
+            as.width = W, as.height = H, as.fps = {24, 1};
+            MediaItem am = probeOrFail(ap, imageSequencePath(aseq));
+            QCOMPARE(am.width, W);  // (shown at its pixels' shape)
+            ap.media.push_back(am);
+            Clip ac = makeClip(ap, am, TrackKind::Video, as);
+            ac.duration = 4;
+            edit::overwrite(ap, as, {TrackKind::Video, 0}, ac);
+            VfxPullOptions ao;
+            ao.folder = path("ana-pulls");
+            ao.sourceLayers = true;
+            std::vector<VfxShot> ashots;
+            QVERIFY2(exportVfxPulls(ap, as, {as.videoTracks[0].clips.at(0).id}, ao, &ashots, nullptr, nullptr, &err), err.c_str());
+            const std::string apulled = ashots.at(0).folder + "/" + ashots[0].name + ".1001.exr";
+            QVERIFY2(readExrLayer(apulled, "Z", pw, ph, rgba, &err), err.c_str());
+            QCOMPARE(pw, W);
+            QCOMPARE(rgba[(18 * W + 5) * 4], 1.0f);
+            QCOMPARE(rgba[(18 * W + W - 5) * 4], 2.0f);  // (not black past the stored width)
+            CryptomatteFrame acm;
+            QVERIFY2(readCryptomatte(apulled, "", acm, &err), err.c_str());
+            QVERIFY(acm.idAt(5, 18) == ball && acm.idAt(W - 5, 18) == floor);
+        }
+#endif
         // An export in HTJ2K (32 lines), and in FFmpeg's ZIP as before.
         ExportSettings st;
         st.videoCodec = "exr";

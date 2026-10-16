@@ -12,6 +12,9 @@ montage_test(test_render)
 target_link_libraries(test_render PRIVATE Qt6::Network)  # (free ports for the remote review stream)
 montage_test(test_media)
 target_link_libraries(test_media PRIVATE Qt6::Network)  # (a free port for the capture tests)
+if(TARGET OpenEXR::OpenEXR)
+  target_link_libraries(test_media PRIVATE OpenEXR::OpenEXR)  # (writing multi-part files)
+endif()
 # Several minutes of real encoding, decoding and model runs: slow CI runners need more than the default.
 set_tests_properties(test_media PROPERTIES TIMEOUT 900)
 target_compile_definitions(test_media PRIVATE MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"

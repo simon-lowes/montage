@@ -25,6 +25,7 @@
 #include <QFutureWatcher>
 #include <QtConcurrent>
 
+#include "DisplayCalibration.h"
 #include "EditorState.h"
 #include "HdrSurface.h"
 #include "PlaybackController.h"
@@ -43,6 +44,12 @@ namespace montage {
 ViewerWidget::ViewerWidget(QWidget* parent) : QWidget(parent) {
     setMinimumSize(160, 90);
     setAttribute(Qt::WA_OpaquePaintEvent);
+    connect(&DisplayCalibration::instance(), &DisplayCalibration::changed, this, qOverload<>(&QWidget::update));
+}
+
+QImage ViewerWidget::drawnImage() {
+    if (image_.isNull()) return {};
+    return calibrated_[0].get(exposure_ ? shownImage() : image_, DisplayCalibration::instance().screenLut(screen()));
 }
 
 void ViewerWidget::setImage(const QImage& img, FrameTime t) {
@@ -132,17 +139,28 @@ void ViewerWidget::paintEvent(QPaintEvent*) {
 
 void ViewerWidget::showEvent(QShowEvent* e) {
     QWidget::showEvent(e);
+    if (QWindow* top = window()->windowHandle(); top && top != calibrationWindow_) {
+        // Moved to another screen: drawn through that screen's calibration (paused too).
+        disconnect(calibrationWatch_);
+        calibrationWindow_ = top;
+        calibrationWatch_ = connect(top, &QWindow::screenChanged, this, [this] {
+            update();
+            emit displayMoved();
+        });
+    }
     updateHdr();  // (nothing was sent while hidden)
 }
 
 void ViewerWidget::paintContent(QPainter& p, bool picture) {
     p.fillRect(rect(), QColor(0x0e, 0x0f, 0x11));
+    // The pictures through this display's calibration, last (render/MonitorCalibration.h).
+    const std::shared_ptr<const Lut3D> lut = DisplayCalibration::instance().screenLut(screen());
     if (twoUp_) {
         p.setRenderHint(QPainter::SmoothPixmapTransform);
         for (int i = 0; i < 2; ++i) {
             const QRectF r = twoUpRect(i == 1);
             if (twoUpImages_[i].isNull()) p.fillRect(r, Qt::black);
-            else p.drawImage(r, twoUpImages_[i]);
+            else p.drawImage(r, calibrated_[2 + i].get(twoUpImages_[i], lut));
             p.setPen(QPen(QColor(255, 255, 255, 60), 1));
             p.drawRect(r.adjusted(-0.5, -0.5, 0.5, 0.5));
             p.setPen(QColor(235, 235, 235));
@@ -158,7 +176,8 @@ void ViewerWidget::paintContent(QPainter& p, bool picture) {
     const QRectF r = imageRect();
     p.setRenderHint(QPainter::SmoothPixmapTransform);
     if (picture || exposure_) {
-        p.drawImage(r, exposure_ ? shownImage() : image_);  // (the exposure check is an SDR picture, drawn over HDR too)
+        // (the exposure check is an SDR picture, drawn over HDR too)
+        p.drawImage(r, calibrated_[0].get(exposure_ ? shownImage() : image_, lut));
     } else {
         // Where the HDR surface's picture shows through.
         p.save();
@@ -181,7 +200,7 @@ void ViewerWidget::paintContent(QPainter& p, bool picture) {
         p.save();
         p.setClipRect(QRectF(r.left(), r.top(), x - r.left(), r.height()));
         p.fillRect(r, QColor(0x0e, 0x0f, 0x11));
-        p.drawImage(rr, compare_);
+        p.drawImage(rr, calibrated_[1].get(compare_, lut));
         p.restore();
         p.setPen(QPen(QColor(255, 255, 255, 200), 1));
         p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()));
@@ -271,6 +290,13 @@ bool ViewerWidget::hdrShowing() const {
 #else
     return false;
 #endif
+}
+
+double ViewerWidget::hdrSdrWhiteNits() const {
+#ifdef MONTAGE_HDR_VIEWER
+    if (surface_ && surface_->sdrWhiteNits() > 0) return surface_->sdrWhiteNits();
+#endif
+    return 203;
 }
 
 double ViewerWidget::hdrHeadroom() const {
@@ -676,7 +702,15 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
         if (mode_ == Mode::Source && !state_->sourceMedia()) return;
         viewer_->setHdrPicture(std::move(picture));
     });
-    connect(viewer_, &ViewerWidget::hdrChanged, this, [this] {
+    // The HDR viewer's pictures through its display's calibration for PQ (applied as they are rendered).
+    auto hdrCalibration = [this] {
+        controller_->setHdrCalibration(viewer_->hdrViewer() ? DisplayCalibration::instance().screenLut(viewer_->screen(), true) : nullptr,
+                                       viewer_->hdrSdrWhiteNits());
+    };
+    connect(&DisplayCalibration::instance(), &DisplayCalibration::changed, this, hdrCalibration);
+    connect(viewer_, &ViewerWidget::displayMoved, this, hdrCalibration);
+    connect(viewer_, &ViewerWidget::hdrChanged, this, [this, hdrCalibration] {
+        hdrCalibration();
         // HDR light is only rendered while it can be shown.
         controller_->setHdrOutput(viewer_->hdrViewer() && viewer_->hdrStatus().isEmpty());
         hdrBadge_->setVisible(viewer_->hdrShowing());

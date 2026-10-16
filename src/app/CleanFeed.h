@@ -8,6 +8,8 @@
 #include <QImage>
 #include <QWidget>
 
+#include "DisplayCalibration.h"
+
 namespace montage {
 
 class CleanFeedWindow : public QWidget {
@@ -17,6 +19,8 @@ public:
 
     void setFrame(const QImage& image);
     const QImage& frame() const { return frame_; }
+    // The frame through this screen's calibration LUT (app/DisplayCalibration.h), as drawn.
+    const QImage& drawnFrame();
     // Where the frame is drawn (fitted, centred).
     QRect pictureRect() const;
 
@@ -31,6 +35,7 @@ protected:
 
 private:
     QImage frame_;
+    CalibratedPicture calibrated_;
 };
 
 }  // namespace montage

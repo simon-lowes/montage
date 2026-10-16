@@ -79,7 +79,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/montage-models
-          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30-clipq4-d15189d-dfn3-888f33c-esrgan-899dc1e-nafnet-f1f2551-faces-3cc26e7-3d70824-depth-4472b73-rife-01fdc7e-modnet-fa2fa54-kokoro-1939ad2-lama-c3c0c9e-minilm-3c96c1d-ocr-1cfba2e-7b02d0a-clap-c28f288-spleeter4-v140
+          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30-clipq4-d15189d-dfn3-888f33c-esrgan-899dc1e-nafnet-f1f2551-faces-3cc26e7-3d70824-575c338-depth-4472b73-rife-01fdc7e-modnet-fa2fa54-kokoro-1939ad2-lama-c3c0c9e-minilm-3c96c1d-ocr-1cfba2e-7b02d0a-clap-c28f288-spleeter4-v140
       - name: AI models for the object mask, speaker and visual search tests
         run: |
           scripts/fetch-models.sh ~/montage-models \
@@ -191,7 +191,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/montage-models
-          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30-clipq4-d15189d-dfn3-888f33c-esrgan-899dc1e-nafnet-f1f2551-faces-3cc26e7-3d70824-depth-4472b73-rife-01fdc7e-modnet-fa2fa54-kokoro-1939ad2-lama-c3c0c9e-minilm-3c96c1d-ocr-1cfba2e-7b02d0a-clap-c28f288-spleeter4-v140
+          key: models-edgetam-8ca3d3e-speakers-9403a69-0743f30-clipq4-d15189d-dfn3-888f33c-esrgan-899dc1e-nafnet-f1f2551-faces-3cc26e7-3d70824-575c338-depth-4472b73-rife-01fdc7e-modnet-fa2fa54-kokoro-1939ad2-lama-c3c0c9e-minilm-3c96c1d-ocr-1cfba2e-7b02d0a-clap-c28f288-spleeter4-v140
       - name: AI models for the object mask, speaker and visual search tests
         run: |
           dir="$(cygpath -u "$USERPROFILE")/montage-models"  # where actions/cache's ~ points

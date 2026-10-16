@@ -46,6 +46,8 @@ class RedactFacesDialog;
 class EditorState;
 class CompareDialog;
 class CleanFeedWindow;
+class MonitorCalibrationDialog;
+class PatchGenerator;
 class ReferenceOutputController;
 class RemoteReviewController;
 struct ConsolidateOptions;
@@ -481,6 +483,7 @@ private:
     void openSnapshot();
     void showShortcuts();
     void showReferenceOutput();
+    MonitorCalibrationDialog* showMonitorCalibration();
     void showRemoteReview();
     // Markers reviewers sent from a remote review (one undo step), on the sequence streamed.
     int applyRemoteMarkers(Id sequence, const std::vector<output::RemoteMarker>& markers);
@@ -518,6 +521,8 @@ private:
     RemoteReviewController* remoteReview_ = nullptr;
     QAction* remoteReviewAction_ = nullptr;
     QAction* referenceOutputAction_ = nullptr;
+    PatchGenerator* patchGenerator_ = nullptr;
+    QAction* monitorCalibrationAction_ = nullptr;
     MixerPanel* mixer_ = nullptr;
     ControlSurface* surface_ = nullptr;
     OscControl* osc_ = nullptr;

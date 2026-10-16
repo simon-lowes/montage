@@ -19,6 +19,7 @@
 #include "media/Matting.h"
 #include "media/Inpaint.h"
 #include "media/Faces.h"
+#include "media/FaceMesh.h"
 #include "media/Rife.h"
 #include "media/TextToSpeech.h"
 #include "media/VoiceClone.h"
@@ -241,6 +242,20 @@ bool ensureEffectModel(QWidget* parent, const std::string& type) {
                                QObject::tr("Face Refinement, Blemish Remover, Redact Faces and Lens Blur's Nearest Face find faces with "
                                            "YuNet and SFace (MIT and Apache-2.0), which run on this computer. Without them no face "
                                            "is found."));
+    }
+    if (type == "face_shape" || type == "look_at_lens") {
+        const QString title = type == "face_shape" ? QObject::tr("Face Shape") : QObject::tr("Look at Lens");
+        if (!faceSearchAvailable() || !faceMeshAvailable()) {
+            QMessageBox::information(parent, title, QObject::tr("This build of Montage cannot find faces: it was built without ONNX Runtime."));
+            return false;
+        }
+        if (!ensureModelPack(parent, faceModel(), title,
+                             QObject::tr("%1 finds faces with YuNet and SFace (MIT and Apache-2.0), which run on this computer.").arg(title)))
+            return false;
+        return ensureModelPack(parent, faceMeshModel(), title,
+                               QObject::tr("%1 fits a mesh of 478 points (the irises with it) to each face with MediaPipe's "
+                                           "Face Mesh V2 (Apache-2.0), which runs on this computer.")
+                                   .arg(title));
     }
     if (type == "remove_background" || type == "mask.people" || type == "behind_people") {
         if (!mattingAvailable()) {

@@ -108,7 +108,7 @@ void dilate(std::vector<float>& m, int W, int H, int r, float w) {
 
 // ---- Laplace's equation (the membrane through known values) ----
 
-// Solves for the unknown cells of v (3 values a cell) so each is the mean of its neighbours, the known cells held:
+// Solves for the unknown cells of v (4 values a cell: RGBA) so each is the mean of its neighbours, the known cells held:
 // first on a grid half the size (an unknown coarse cell where any of its four is), which starts the iterations here.
 void membrane(std::vector<float>& v, const std::vector<uint8_t>& unknown, int w, int h) {
     size_t unknowns = 0;
@@ -117,24 +117,24 @@ void membrane(std::vector<float>& v, const std::vector<uint8_t>& unknown, int w,
     const bool coarse = w > 12 && h > 12;
     if (coarse) {
         const int cw = (w + 1) / 2, ch = (h + 1) / 2;
-        std::vector<float> cv(size_t(cw) * ch * 3, 0);
+        std::vector<float> cv(size_t(cw) * ch * 4, 0);
         std::vector<uint8_t> cu(size_t(cw) * ch, 0);
         for (int y = 0; y < ch; ++y)
             for (int x = 0; x < cw; ++x) {
                 const size_t c = size_t(y) * cw + x;
                 int n = 0;
-                float sum[3] = {0, 0, 0};
+                float sum[4] = {0, 0, 0, 0};
                 for (int dy = 0; dy < 2; ++dy)
                     for (int dx = 0; dx < 2; ++dx) {
                         const int xx = 2 * x + dx, yy = 2 * y + dy;
                         if (xx >= w || yy >= h) continue;
                         const size_t i = size_t(yy) * w + xx;
                         if (unknown[i]) cu[c] = 1;
-                        for (int k = 0; k < 3; ++k) sum[k] += v[i * 3 + k];
+                        for (int k = 0; k < 4; ++k) sum[k] += v[i * 4 + k];
                         ++n;
                     }
                 if (!cu[c])
-                    for (int k = 0; k < 3; ++k) cv[c * 3 + k] = sum[k] / float(n);
+                    for (int k = 0; k < 4; ++k) cv[c * 4 + k] = sum[k] / float(n);
             }
         membrane(cv, cu, cw, ch);
         for (int y = 0; y < h; ++y)
@@ -142,20 +142,20 @@ void membrane(std::vector<float>& v, const std::vector<uint8_t>& unknown, int w,
                 const size_t i = size_t(y) * w + x;
                 if (!unknown[i]) continue;
                 const size_t c = size_t(y / 2) * cw + x / 2;
-                for (int k = 0; k < 3; ++k) v[i * 3 + k] = cv[c * 3 + k];
+                for (int k = 0; k < 4; ++k) v[i * 4 + k] = cv[c * 4 + k];
             }
     } else {
         // A small grid: start from the known values' mean.
-        double sum[3] = {0, 0, 0};
+        double sum[4] = {0, 0, 0, 0};
         size_t n = 0;
         for (size_t i = 0; i < unknown.size(); ++i)
             if (!unknown[i]) {
-                for (int k = 0; k < 3; ++k) sum[k] += v[i * 3 + k];
+                for (int k = 0; k < 4; ++k) sum[k] += v[i * 4 + k];
                 ++n;
             }
         for (size_t i = 0; i < unknown.size(); ++i)
             if (unknown[i])
-                for (int k = 0; k < 3; ++k) v[i * 3 + k] = n ? float(sum[k] / double(n)) : 0.0f;
+                for (int k = 0; k < 4; ++k) v[i * 4 + k] = n ? float(sum[k] / double(n)) : 0.0f;
     }
     // Over-relaxed Gauss-Seidel, red-black (each colour's cells depend only on the other's, so a large area is swept
     // in parallel); few sweeps when the coarse solution started it.
@@ -173,10 +173,10 @@ void membrane(std::vector<float>& v, const std::vector<uint8_t>& unknown, int w,
         for (int ci = c0; ci < c1; ++ci) {
             const size_t i = colour[size_t(ci)];
             const int x = int(i % size_t(w)), y = int(i / size_t(w));
-            float sum[3] = {0, 0, 0};
+            float sum[4] = {0, 0, 0, 0};
             int n = 0;
             auto add = [&](size_t j) {
-                for (int k = 0; k < 3; ++k) sum[k] += v[j * 3 + k];
+                for (int k = 0; k < 4; ++k) sum[k] += v[j * 4 + k];
                 ++n;
             };
             if (x > 0) add(i - 1);
@@ -184,9 +184,9 @@ void membrane(std::vector<float>& v, const std::vector<uint8_t>& unknown, int w,
             if (y > 0) add(i - size_t(w));
             if (y + 1 < h) add(i + size_t(w));
             if (!n) continue;
-            for (int k = 0; k < 3; ++k) {
-                const float target = sum[k] / float(n), d = (target - v[i * 3 + k]) * omega;
-                v[i * 3 + k] += d;
+            for (int k = 0; k < 4; ++k) {
+                const float target = sum[k] / float(n), d = (target - v[i * 4 + k]) * omega;
+                v[i * 4 + k] += d;
                 local = std::max(local, std::fabs(d));
             }
         }
@@ -211,14 +211,14 @@ bool matteBox(const std::vector<float>& matte, int W, int H, int& x0, int& y0, i
     return x1 >= 0;
 }
 
-// The area (x0, y0) w x h of img, its matte `m` (w x h), replaced by `source` (w x h x 3; null for black): copied, or by
+// The area (x0, y0) w x h of img, its matte `m` (w x h), replaced by `source` (w x h x 4, RGBA; null for black): copied, or by
 // its gradients levelled to the known pixels round it (Poisson). The area should hold a pixel round the matte.
 void pasteArea(Image& img, int x0, int y0, int w, int h, const std::vector<float>& m, const float* source, bool seamless) {
-    auto src = [&](size_t i, int k) { return source ? source[i * 3 + size_t(k)] : 0.0f; };
+    auto src = [&](size_t i, int k) { return source ? source[i * 4 + size_t(k)] : 0.0f; };
     std::vector<float> v;
     std::vector<uint8_t> unknown;
     if (seamless) {
-        v.assign(size_t(w) * h * 3, 0);
+        v.assign(size_t(w) * h * 4, 0);
         unknown.assign(size_t(w) * h, 0);
         for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x) {
@@ -228,7 +228,7 @@ void pasteArea(Image& img, int x0, int y0, int w, int h, const std::vector<float
                     continue;
                 }
                 const float* a = img.at(x + x0, y + y0);
-                for (int k = 0; k < 3; ++k) v[i * 3 + size_t(k)] = a[k] - src(i, k);
+                for (int k = 0; k < 4; ++k) v[i * 4 + size_t(k)] = a[k] - src(i, k);
             }
         // An area that touches the frame's edge has no known values there: those sides are left free.
         membrane(v, unknown, w, h);
@@ -239,20 +239,20 @@ void pasteArea(Image& img, int x0, int y0, int w, int h, const std::vector<float
             const float a = std::min(1.0f, m[i]);
             if (a <= 0) continue;
             float* q = img.at(x + x0, y + y0);
-            for (int k = 0; k < 3; ++k) q[k] += (src(i, k) + (seamless ? v[i * 3 + size_t(k)] : 0.0f) - q[k]) * a;
+            for (int k = 0; k < 4; ++k) q[k] += (src(i, k) + (seamless ? v[i * 4 + size_t(k)] : 0.0f) - q[k]) * a;
         }
 }
 
 // img's own picture (dx, dy) away over the area, the edges held, read before anything is written.
 std::vector<float> shiftedArea(const Image& img, int x0, int y0, int w, int h, double dx, double dy) {
-    std::vector<float> out(size_t(w) * h * 3);
+    std::vector<float> out(size_t(w) * h * 4);
     const int W = img.width, H = img.height;
     float q[4];
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) {
             const double sx = std::clamp(x + x0 + dx, 0.0, double(W - 1)), sy = std::clamp(y + y0 + dy, 0.0, double(H - 1));
             sampleInside(img, sx, sy, q);
-            std::copy_n(q, 3, &out[(size_t(y) * w + x) * 3]);
+            std::copy_n(q, 4, &out[(size_t(y) * w + x) * 4]);
         }
     return out;
 }
@@ -371,7 +371,7 @@ void fillFromNeighbours(Image& cur, const std::vector<float>& matte, const Image
                 const bool ha = follow(prev, mp, x, y, a), hb = follow(next, mn, x, y, b);
                 if (!ha && !hb) continue;
                 float* q = cur.at(x, y);
-                for (int k = 0; k < 3; ++k) {
+                for (int k = 0; k < 4; ++k) {
                     const float v = ha && hb ? 0.5f * (a[k] + b[k]) : ha ? a[k] : b[k];
                     q[k] += (v - q[k]) * m;
                 }
@@ -483,7 +483,7 @@ void fillFromNeighbours(Image& cur, const LocalMatte& matte, const Image& prev, 
             const bool ha = follow(prev, mp, X, Y, a), hb = follow(next, mn, X, Y, b);
             if (!ha && !hb) continue;
             float* q = cur.at(X, Y);
-            for (int k = 0; k < 3; ++k) {
+            for (int k = 0; k < 4; ++k) {
                 const float v = ha && hb ? 0.5f * (a[k] + b[k]) : ha ? a[k] : b[k];
                 q[k] += (v - q[k]) * m;
             }
@@ -587,7 +587,7 @@ void fillAcross(Image& img, const std::vector<float>& matte) {
                 for (int c = x; c <= e; ++c) {
                     const float t = float(c - l) / float(r - l);
                     float* q = img.at(c, y);
-                    for (int k = 0; k < 3; ++k) q[k] += (a[k] + (b[k] - a[k]) * t - q[k]) * m[c];
+                    for (int k = 0; k < 4; ++k) q[k] += (a[k] + (b[k] - a[k]) * t - q[k]) * m[c];
                 }
                 x = e + 1;
             }
@@ -615,9 +615,9 @@ void seamlessPaste(Image& img, const Image& source, const std::vector<float>& ma
     int x0, y0, w, h;
     std::vector<float> m;
     if (source.width != W || source.height != H || !cutMatte(matte, W, H, x0, y0, w, h, m)) return;
-    std::vector<float> s(size_t(w) * h * 3);
+    std::vector<float> s(size_t(w) * h * 4);
     for (int y = 0; y < h; ++y)
-        for (int x = 0; x < w; ++x) std::copy_n(source.at(x + x0, y + y0), 3, &s[(size_t(y) * w + x) * 3]);
+        for (int x = 0; x < w; ++x) std::copy_n(source.at(x + x0, y + y0), 4, &s[(size_t(y) * w + x) * 4]);
     pasteArea(img, x0, y0, w, h, m, s.data(), true);
 }
 
@@ -639,8 +639,9 @@ void paintStroke(Image& img, const std::vector<std::array<double, 2>>& points, d
                  double dy, bool heal) {
     const int W = img.width, H = img.height;
     if (points.empty() || radius <= 0 || W <= 0 || H <= 0) return;
-    // Only the stroke's box (and a pixel round it) is worked on.
-    const double r = std::max(0.5, radius) + 2;
+    // Only the stroke's box is worked on: as far as its soft edge reaches, and a ring of pixels it leaves alone round
+    // that (heal's known boundary).
+    const double rr = std::max(0.5, radius), r = rr + (std::clamp(softness, 0.0, 1.0) * rr + 0.5) / 2 + 2;
     double lx = 1e18, ly = 1e18, hx = -1e18, hy = -1e18;
     for (const auto& q : points) lx = std::min(lx, q[0]), ly = std::min(ly, q[1]), hx = std::max(hx, q[0]), hy = std::max(hy, q[1]);
     const int x0 = std::max(0, int(std::floor(lx - r))), y0 = std::max(0, int(std::floor(ly - r)));
@@ -697,8 +698,9 @@ std::vector<float> strokeMatte(const std::vector<std::array<double, 2>>& pts, do
     for (size_t i = 0; i == 0 || i + 1 < pts.size(); ++i) {
         const auto& a = pts[i];
         const auto& b = i + 1 < pts.size() ? pts[i + 1] : pts[i];
-        const int x0 = std::max(0, int(std::floor(std::min(a[0], b[0]) - r - 1))), x1 = std::min(w - 1, int(std::ceil(std::max(a[0], b[0]) + r + 1)));
-        const int y0 = std::max(0, int(std::floor(std::min(a[1], b[1]) - r - 1))), y1 = std::min(h - 1, int(std::ceil(std::max(a[1], b[1]) + r + 1)));
+        const double reach = r + soft / 2 + 1;  // (where the soft edge reaches nothing)
+        const int x0 = std::max(0, int(std::floor(std::min(a[0], b[0]) - reach))), x1 = std::min(w - 1, int(std::ceil(std::max(a[0], b[0]) + reach)));
+        const int y0 = std::max(0, int(std::floor(std::min(a[1], b[1]) - reach))), y1 = std::min(h - 1, int(std::ceil(std::max(a[1], b[1]) + reach)));
         const double vx = b[0] - a[0], vy = b[1] - a[1], len = vx * vx + vy * vy;
         for (int y = y0; y <= y1; ++y)
             for (int x = x0; x <= x1; ++x) {

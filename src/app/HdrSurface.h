@@ -42,6 +42,8 @@ public:
     double headroom() const { return headroom_; }
     // What 1.0 (SDR white) is written as: 1 on macOS, SDR white's nits / 80 for Windows' scRGB.
     float scale() const { return scale_; }
+    // SDR white in nits where the system says (Windows), else 0 (macOS EDR is relative to the display's brightness).
+    double sdrWhiteNits() const { return absoluteWhite_ ? double(scale_) * 80 : 0; }
     // Why HDR stopped or was refused (empty while it shows).
     const QString& problem() const { return problem_; }
 
@@ -78,6 +80,7 @@ private:
     bool hdrActive_ = false;
     double headroom_ = 1;
     float scale_ = 1;
+    bool absoluteWhite_ = false;
     int frames_ = 0;
     QString problem_;
     QElapsedTimer displayRead_;  // since the display's HDR range was last asked

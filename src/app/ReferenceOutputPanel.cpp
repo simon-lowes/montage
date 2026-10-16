@@ -1,4 +1,6 @@
 #include "ReferenceOutputPanel.h"
+
+#include "DisplayCalibration.h"
 #include "render/TrimPasses.h"
 
 #include <QCheckBox>
@@ -36,6 +38,18 @@ ReferenceOutputController::ReferenceOutputController(PlaybackController* program
         stop();
         lastError_ = why.empty() ? tr("The output stopped") : qs(why);
     });
+    // A calibration chosen or changed while it runs applies straight away.
+    connect(&DisplayCalibration::instance(), &DisplayCalibration::changed, this, [this] {
+        if (!scheduler_) return;
+        const auto lut = DisplayCalibration::instance().lut(calibrationTarget());
+        if (lut == scheduler_->calibration()) return;
+        scheduler_->setCalibration(lut);
+        if (program_) program_->requestFrame();
+    });
+}
+
+QString ReferenceOutputController::calibrationTarget() const {
+    return backend_ ? DisplayCalibration::outputTarget(qs(backend_->name()), qs(device_.id)) : QString();
 }
 
 ReferenceOutputController::~ReferenceOutputController() { stop(); }
@@ -142,6 +156,8 @@ bool ReferenceOutputController::start(const output::Config& config, QString* err
         mode = *m;
     }
     auto sched = std::make_shared<output::Scheduler>(b);
+    // The monitor's calibration (app/DisplayCalibration.h), last.
+    sched->setCalibration(DisplayCalibration::instance().lut(DisplayCalibration::outputTarget(qs(b->name()), qs(d->id))));
     if (!sched->start(*d, mode, signalSequence(*s), config, &why)) return fail(qs(why));
     backend_ = b;
     device_ = *d;
@@ -184,6 +200,7 @@ QString ReferenceOutputController::status() const {
                        .arg(st.sent)
                        .arg(st.late);
     if (st.receivers >= 0) text += tr(", %n receiver(s)", "", st.receivers);
+    if (scheduler_->calibration()) text += tr(", calibrated");
     return text;
 }
 

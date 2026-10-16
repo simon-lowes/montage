@@ -26,6 +26,7 @@
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/HdrView.h"
+#include "render/MonitorCalibration.h"
 #include "render/ReferenceOutput.h"
 
 namespace montage {
@@ -51,6 +52,8 @@ public:
         bool hdr = false;  // HDR sequences also as light for the HDR viewer
         std::string trim;  // the trim pass shown (render/TrimPasses.h), "" = the master
         bool gpu = false;  // drawn on the GPU where it can be (render/GpuCompositor.h)
+        std::shared_ptr<const Lut3D> hdrCalibration;  // the HDR viewer's display's calibration (render/MonitorCalibration.h)
+        double hdrWhite = 203;                         // the nits that display shows SDR white at
     };
     void request(const Request& r) {
         {
@@ -139,7 +142,7 @@ private:
     bool sameContext(const Request& r) const {
         return r.project == ctx_.project && r.sequence == ctx_.sequence && r.scale == ctx_.scale && r.proxies == ctx_.proxies &&
                r.captions == ctx_.captions && r.stereoView == ctx_.stereoView && r.hdr == ctx_.hdr &&
-               r.trim == ctx_.trim && r.gpu == ctx_.gpu;
+               r.trim == ctx_.trim && r.gpu == ctx_.gpu && r.hdrCalibration == ctx_.hdrCalibration && r.hdrWhite == ctx_.hdrWhite;
     }
 
     Rendered render(const Request& r, FrameTime t) {
@@ -191,6 +194,7 @@ private:
                 pic->height = img.height;
                 pic->contentPeak = hdrContentPeak(trimTargetSpace(*s, r.trim), trimTargetPeak(*s, r.trim));
                 hdrViewImage(img, trimTargetSpace(*s, r.trim), trimTargetPeak(*s, r.trim), pic->contentPeak, pic->rgba);  // (rolled off as drawn)
+                if (r.hdrCalibration) calibrateHdrPicture(pic->rgba, pic->width, pic->height, *r.hdrCalibration, r.hdrWhite);
                 out.hdr = std::move(pic);
             }
             convertColor(img, trimTargetSpace(*s, r.trim), rec709Space(), trimTargetPeak(*s, r.trim));
@@ -638,6 +642,13 @@ void PlaybackController::setHdrOutput(bool on) {
     requestFrame();
 }
 
+void PlaybackController::setHdrCalibration(std::shared_ptr<const Lut3D> lut, double sdrWhiteNits) {
+    if (hdrCalibration_ == lut && hdrWhite_ == sdrWhiteNits) return;
+    hdrCalibration_ = std::move(lut);
+    hdrWhite_ = sdrWhiteNits;
+    if (hdrOutput_) requestFrame();
+}
+
 void PlaybackController::setGpuRendering(bool on) {
     if (gpu_ == on) return;
     gpu_ = on;
@@ -667,7 +678,7 @@ FrameTime PlaybackController::clampToSequence(FrameTime t) const { return std::m
 void PlaybackController::requestFrame() {
     if (!sequence()) return;
     // Paused frames render at full quality; playback uses the preview scale (a reference output its own).
-    worker_->request({project_, sequenceId_, position_, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_});
+    worker_->request({project_, sequenceId_, position_, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_});
 }
 
 void PlaybackController::seek(FrameTime t) {
@@ -854,7 +865,7 @@ void PlaybackController::tick() {
     }
     if (t != position_) {
         position_ = t;
-        worker_->request({project_, sequenceId_, t, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_});
+        worker_->request({project_, sequenceId_, t, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_});
         syncOutput();
         emit positionChanged(t);
     }
