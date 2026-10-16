@@ -74,6 +74,28 @@ void sampleInto(const Image& src, double x, double y, float* out) {
     for (int k = 0; k < 4; ++k) out[k] = (a[k] * (1 - fx) + b[k] * fx) * (1 - fy) + (c[k] * (1 - fx) + d[k] * fx) * fy;
 }
 
+// A copy of part of a picture, read in the picture's own coordinates (clamped to the picture's edges, as sampleInto).
+struct Region {
+    Image img;
+    int ox = 0, oy = 0, fullW = 0, fullH = 0;
+    void sample(double x, double y, float* out) const {
+        x = std::clamp(x, 0.5, fullW - 0.5) - ox, y = std::clamp(y, 0.5, fullH - 0.5) - oy;
+        sampleInto(img, x, y, out);
+    }
+    const float* at(int x, int y) const { return img.at(std::clamp(x - ox, 0, img.width - 1), std::clamp(y - oy, 0, img.height - 1)); }
+};
+
+Region copyRegion(const Image& img, int x0, int y0, int x1, int y1) {
+    Region r;
+    r.fullW = img.width, r.fullH = img.height;
+    x0 = std::clamp(x0, 0, img.width - 1), x1 = std::clamp(x1, 0, img.width - 1);
+    y0 = std::clamp(y0, 0, img.height - 1), y1 = std::clamp(y1, 0, img.height - 1);
+    r.ox = x0, r.oy = y0;
+    r.img = Image(x1 - x0 + 1, y1 - y0 + 1, Image::Uninitialized{});
+    for (int y = y0; y <= y1; ++y) std::copy(img.at(x0, y), img.at(x1, y) + 4, r.img.at(0, y - y0));
+    return r;
+}
+
 void dot(Image& img, double x, double y, double r, const float rgb[3]) {
     for (int py = int(std::floor(y - r)); py <= int(std::ceil(y + r)); ++py)
         for (int px = int(std::floor(x - r)); px <= int(std::ceil(x + r)); ++px) {
@@ -98,9 +120,9 @@ std::vector<Pt> eyeOutline(const FaceMesh& m, bool left) {
 }
 
 std::vector<Pt> faceShapeTargets(const FaceMesh& m, const FaceShapeSettings& s) {
-    std::vector<Pt> to(kFaceMeshPoints);
-    for (int i = 0; i < kFaceMeshPoints; ++i) to[size_t(i)] = {m.x(i), m.y(i)};
+    std::vector<Pt> to(kFaceMeshPoints, Pt{0, 0});
     if (!m.valid()) return to;
+    for (int i = 0; i < kFaceMeshPoints; ++i) to[size_t(i)] = {m.x(i), m.y(i)};
     const Frame f = faceFrame(m);
     const double top = f.down(m.x(10), m.y(10));
     auto move = [&](int i, double a, double b) {  // across and down, pixels
@@ -152,12 +174,13 @@ void warpPoints(Image& img, const std::vector<Pt>& from, const std::vector<Pt>& 
     const int x0 = std::max(0, int(std::floor(cx - radius))), x1 = std::min(img.width - 1, int(std::ceil(cx + radius)));
     const int y0 = std::max(0, int(std::floor(cy - radius))), y1 = std::min(img.height - 1, int(std::ceil(cy + radius)));
     if (x1 < x0 || y1 < y0) return;
-    // The move worked out on a grid and spread between its nodes.
-    const int step = std::max(1, int(radius / 100));
-    const int gw = (x1 - x0) / step + 2, gh = (y1 - y0) / step + 2;
+    // The move worked out on a grid (about 200 nodes across, whatever the size) and spread between its nodes.
+    const double step = std::max(1.0, radius / 100);
+    const int gw = int((x1 - x0) / step) + 2, gh = int((y1 - y0) / step) + 2;
     std::vector<float> dx(size_t(gw) * size_t(gh), 0.f), dy(dx.size(), 0.f);
     const double eps = std::pow(0.01 * radius, 2);
     parallelRows(gh, [&](int r0, int r1) {
+        std::vector<double> w(p.size());
         for (int gy = r0; gy < r1; ++gy)
             for (int gx = 0; gx < gw; ++gx) {
                 const double vx = x0 + gx * step + 0.5, vy = y0 + gy * step + 0.5;
@@ -165,7 +188,6 @@ void warpPoints(Image& img, const std::vector<Pt>& from, const std::vector<Pt>& 
                 if (dist >= radius) continue;
                 // Affine moving least squares (Schaefer, McPhail and Warren 2006).
                 double sw = 0, px = 0, py = 0, qx = 0, qy = 0;
-                std::vector<double> w(p.size());
                 for (size_t i = 0; i < p.size(); ++i) {
                     w[i] = 1 / ((p[i][0] - vx) * (p[i][0] - vx) + (p[i][1] - vy) * (p[i][1] - vy) + eps);
                     sw += w[i];
@@ -192,20 +214,23 @@ void warpPoints(Image& img, const std::vector<Pt>& from, const std::vector<Pt>& 
                 dx[n] = float((fx - vx) * fade), dy[n] = float((fy - vy) * fade);
             }
     });
-    const Image src = img;
+    // Only the part that is read is kept: the circle and as far past it as anything reaches.
+    float reach = 0;
+    for (size_t n = 0; n < dx.size(); ++n) reach = std::max(reach, std::max(std::fabs(dx[n]), std::fabs(dy[n])));
+    const Region src = copyRegion(img, x0 - int(reach) - 2, y0 - int(reach) - 2, x1 + int(reach) + 2, y1 + int(reach) + 2);
     parallelRows(y1 - y0 + 1, [&](int r0, int r1) {
         for (int y = y0 + r0; y < y0 + r1; ++y)
             for (int x = x0; x <= x1; ++x) {
-                const float gx = float(x - x0) / float(step), gy = float(y - y0) / float(step);
+                const double gx = (x - x0) / step, gy = (y - y0) / step;
                 const int ax = std::min(int(gx), gw - 2), ay = std::min(int(gy), gh - 2);
-                const float fx = gx - float(ax), fy = gy - float(ay);
+                const float fx = float(gx - ax), fy = float(gy - ay);
                 auto at = [&](const std::vector<float>& v) {
                     const size_t n = size_t(ay) * size_t(gw) + size_t(ax);
                     return (v[n] * (1 - fx) + v[n + 1] * fx) * (1 - fy) + (v[n + size_t(gw)] * (1 - fx) + v[n + size_t(gw) + 1] * fx) * fy;
                 };
                 const float mx = at(dx), my = at(dy);
                 if (std::fabs(mx) < 1e-3f && std::fabs(my) < 1e-3f) continue;
-                sampleInto(src, x + 0.5 + mx, y + 0.5 + my, img.at(x, y));
+                src.sample(x + 0.5 + mx, y + 0.5 + my, img.at(x, y));
             }
     });
 }
@@ -289,6 +314,69 @@ bool eyePixels(const Image& img, const std::vector<Pt>& lids, std::vector<EyePix
     return true;
 }
 
+// The hole's pixels (RGBA, w x h) made the smoothest blend of what is round them: each the mean of its four neighbours,
+// solved on a coarser copy first so that a large hole settles in a few passes.
+void membrane(std::vector<float>& v, const std::vector<uint8_t>& hole, int w, int h) {
+    int passes = 0;
+    if (w > 24 && h > 24) {
+        const int cw = (w + 1) / 2, chh = (h + 1) / 2;
+        std::vector<float> cv(size_t(cw) * size_t(chh) * 4, 0.f);
+        std::vector<uint8_t> chole(size_t(cw) * size_t(chh), 1);
+        for (int j = 0; j < chh; ++j)
+            for (int i = 0; i < cw; ++i) {
+                double sum[4] = {0, 0, 0, 0};
+                int n = 0;
+                for (int b = 2 * j; b < std::min(h, 2 * j + 2); ++b)
+                    for (int a = 2 * i; a < std::min(w, 2 * i + 2); ++a) {
+                        const size_t at = size_t(b) * size_t(w) + size_t(a);
+                        if (hole[at]) continue;
+                        for (int c = 0; c < 4; ++c) sum[c] += v[at * 4 + size_t(c)];
+                        ++n;
+                    }
+                const size_t at = size_t(j) * size_t(cw) + size_t(i);
+                if (n == 0) continue;
+                chole[at] = 0;
+                for (int c = 0; c < 4; ++c) cv[at * 4 + size_t(c)] = float(sum[c] / n);
+            }
+        membrane(cv, chole, cw, chh);
+        for (int j = 0; j < h; ++j)
+            for (int i = 0; i < w; ++i) {
+                const size_t at = size_t(j) * size_t(w) + size_t(i);
+                if (!hole[at]) continue;
+                const double gx = std::clamp((i + 0.5) / 2 - 0.5, 0.0, cw - 1.0), gy = std::clamp((j + 0.5) / 2 - 0.5, 0.0, chh - 1.0);
+                const int ax = std::min(int(gx), cw - 2), ay = std::min(int(gy), chh - 2);
+                const float fx = float(gx - ax), fy = float(gy - ay);
+                const size_t n = size_t(ay) * size_t(cw) + size_t(ax);
+                for (size_t c = 0; c < 4; ++c)
+                    v[at * 4 + c] = (cv[n * 4 + c] * (1 - fx) + cv[(n + 1) * 4 + c] * fx) * (1 - fy) +
+                                    (cv[(n + size_t(cw)) * 4 + c] * (1 - fx) + cv[(n + size_t(cw) + 1) * 4 + c] * fx) * fy;
+            }
+        passes = 12;
+    } else {
+        double sum[4] = {0, 0, 0, 0}, n = 0;
+        for (size_t at = 0; at < hole.size(); ++at)
+            if (!hole[at]) {
+                for (int c = 0; c < 4; ++c) sum[c] += v[at * 4 + size_t(c)];
+                n += 1;
+            }
+        for (size_t at = 0; at < hole.size(); ++at)
+            if (hole[at])
+                for (int c = 0; c < 4; ++c) v[at * 4 + size_t(c)] = float(sum[c] / std::max(1.0, n));
+        passes = 3 * std::max(w, h) + 20;
+    }
+    // (over-relaxed Gauss-Seidel; a hole never touches the border)
+    for (int pass = 0; pass < passes; ++pass)
+        for (int j = 1; j < h - 1; ++j)
+            for (int i = 1; i < w - 1; ++i) {
+                const size_t at = size_t(j) * size_t(w) + size_t(i);
+                if (!hole[at]) continue;
+                for (size_t c = 0; c < 4; ++c) {
+                    const float m = 0.25f * (v[(at - 1) * 4 + c] + v[(at + 1) * 4 + c] + v[(at - size_t(w)) * 4 + c] + v[(at + size_t(w)) * 4 + c]);
+                    v[at * 4 + c] += 1.8f * (m - v[at * 4 + c]);
+                }
+            }
+}
+
 double eyeWidthOf(const std::vector<Pt>& lids) {
     // (the outline runs from the outer corner round to the inner one halfway)
     return std::hypot(lids[lids.size() / 2][0] - lids[0][0], lids[lids.size() / 2][1] - lids[0][1]);
@@ -302,8 +390,12 @@ void moveIris(Image& img, const std::vector<Pt>& lids, float x, float y, float r
     if (!eyePixels(img, lids, px)) return;
     const double ex = x + (tx - x) * amount, ey = y + (ty - y) * amount;  // where the iris ends up
     const double r = radius;
-    const Image src = img;
-    auto sample = [&](double sx, double sy, float* out) { sampleInto(src, sx, sy, out); };
+    float bx0 = 1e30f, by0 = 1e30f, bx1 = -1e30f, by1 = -1e30f;
+    for (const Pt& p : lids) bx0 = std::min(bx0, p[0]), bx1 = std::max(bx1, p[0]), by0 = std::min(by0, p[1]), by1 = std::max(by1, p[1]);
+    // (what is read: the eye and round the iris, not the whole picture)
+    const Region src = copyRegion(img, int(std::min(double(bx0), x - r)) - 4, int(std::min(double(by0), y - r)) - 4,
+                                  int(std::max(double(bx1), x + r)) + 4, int(std::max(double(by1), y + r)) + 4);
+    auto sample = [&](double sx, double sy, float* out) { src.sample(sx, sy, out); };
     // What fills where the iris was: the smoothest blend of what is round it (the white beside it, the lids' shadow
     // above), a membrane stretched over the hole.
     const int fx0 = std::max(0, int(std::floor(x - r - 3))), fy0 = std::max(0, int(std::floor(y - r - 3)));
@@ -314,33 +406,14 @@ void moveIris(Image& img, const std::vector<Pt>& lids, float x, float y, float r
     if (fw > 2 && fh > 2) {
         fill.resize(size_t(fw) * size_t(fh) * 4);
         hole.assign(size_t(fw) * size_t(fh), 0);
-        double edge[4] = {0, 0, 0, 0}, n = 0;
         for (int j = 0; j < fh; ++j)
             for (int i = 0; i < fw; ++i) {
                 const double px_ = fx0 + i + 0.5, py_ = fy0 + j + 0.5;
                 const size_t at = size_t(j) * size_t(fw) + size_t(i);
                 std::copy(src.at(fx0 + i, fy0 + j), src.at(fx0 + i, fy0 + j) + 4, &fill[at * 4]);
                 hole[at] = i > 0 && j > 0 && i < fw - 1 && j < fh - 1 && std::hypot(px_ - x, py_ - y) < r + 1 && insidePolygon(lids, px_, py_);
-                if (!hole[at])
-                    for (int ch = 0; ch < 4; ++ch) edge[ch] += fill[at * 4 + size_t(ch)];
-                n += !hole[at];
             }
-        for (size_t at = 0; at < hole.size(); ++at)
-            if (hole[at])
-                for (int ch = 0; ch < 4; ++ch) fill[at * 4 + size_t(ch)] = float(edge[ch] / std::max(1.0, n));
-        // (over-relaxed Gauss-Seidel: each hole pixel the mean of its four neighbours)
-        const int passes = 3 * std::max(fw, fh) + 20;
-        for (int pass = 0; pass < passes; ++pass)
-            for (int j = 1; j < fh - 1; ++j)
-                for (int i = 1; i < fw - 1; ++i) {
-                    const size_t at = size_t(j) * size_t(fw) + size_t(i);
-                    if (!hole[at]) continue;
-                    for (size_t ch = 0; ch < 4; ++ch) {
-                        const float m = 0.25f * (fill[(at - 1) * 4 + ch] + fill[(at + 1) * 4 + ch] + fill[(at - size_t(fw)) * 4 + ch] +
-                                                 fill[(at + size_t(fw)) * 4 + ch]);
-                        fill[at * 4 + ch] += 1.8f * (m - fill[at * 4 + ch]);
-                    }
-                }
+        membrane(fill, hole, fw, fh);
     }
     // The iris's tone at each distance from its middle (the pupil, the iris, its darker rim), from what shows of it
     // but its highlights, for the part that was under a lid.
@@ -369,8 +442,6 @@ void moveIris(Image& img, const std::vector<Pt>& lids, float x, float y, float r
         if (ring[4] > 1)
             for (int k = 0; k < 4; ++k) ring[size_t(k)] /= ring[4];
     if (profile[0][4] <= 0) return;  // (no iris shows)
-    float bx0 = 1e30f, by0 = 1e30f, bx1 = -1e30f, by1 = -1e30f;
-    for (const Pt& p : lids) bx0 = std::min(bx0, p[0]), bx1 = std::max(bx1, p[0]), by0 = std::min(by0, p[1]), by1 = std::max(by1, p[1]);
     // (the lids' edges, their lashes and shadow, kept as they are: what is drawn eases in over a margin inside them)
     const double margin = std::max(1.0, 0.05 * eyeWidthOf(lids));
     for (int py = std::max(0, int(by0)); py <= std::min(img.height - 1, int(by1)); ++py)
@@ -417,11 +488,11 @@ bool gazeTarget(const FaceMesh& m, bool left, float& tx, float& ty, double* eyeb
     const double r = 0.4 * width;
     const double across = -r * std::sin(m.yaw * M_PI / 180), down = r * std::sin(m.pitch * M_PI / 180);
     // Up or down only as far as leaves the iris showing as much as it can between the lids (they would follow the
-    // eye, but are not moved): its middle within a band about theirs.
+    // eye, but are not moved): its middle within a band about theirs, at least a third of its radius either way.
     float ix = 0, iy = 0, ir = 0;
     m.iris(left, ix, iy, ir);
     const double mid = f.down((m.x(upper) + m.x(lower)) / 2, (m.y(upper) + m.y(lower)) / 2);
-    const double slack = std::max(0.0, open / 2 - 0.6 * ir);
+    const double slack = std::max(0.3 * ir, open / 2 - 0.6 * ir);
     const double now = f.down(ix, iy) - mid;
     double to = std::clamp(down, -slack, slack);
     if (std::fabs(now) > slack) to = std::clamp(to, std::min(now, 0.0), std::max(now, 0.0));  // (never further out)

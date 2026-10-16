@@ -49,8 +49,8 @@ void effectUses(Provenance& out, const Effect& e) {
     else if (t == "motion_deblur") add(out, {"Motion Deblur", "NAFNet", AiRole::Enhanced});
     else if (t == "face_refine") add(out, {"Face Refinement", "YuNet", AiRole::Enhanced});
     else if (t == "blemish_remover") add(out, {"Blemish Remover", "YuNet", AiRole::Enhanced});
-    else if (t == "face_shape") add(out, {"Face Shape", "MediaPipe Face Mesh V2", AiRole::Enhanced});
-    else if (t == "look_at_lens") add(out, {"Look at Lens", "MediaPipe Face Mesh V2", AiRole::Enhanced});
+    else if (t == "face_shape") add(out, {"Face Shape", "YuNet, MediaPipe Face Mesh V2", AiRole::Enhanced});
+    else if (t == "look_at_lens") add(out, {"Look at Lens", "YuNet, MediaPipe Face Mesh V2", AiRole::Enhanced});
     else if (t == "relight") add(out, {"Relight", "Depth Anything V2", AiRole::Enhanced});
     else if (t == "enhance_speech") add(out, {"Enhance Speech", "DeepFilterNet3", AiRole::Enhanced});
     else if (t == "voice_isolate") add(out, {"Voice Isolation", "RNNoise", AiRole::Enhanced});

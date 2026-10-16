@@ -12029,12 +12029,31 @@ if ui["pressed"] == "add":
         QVERIFY(reshaped.px != jfk.px);
         // Far from the face nothing moves.
         QVERIFY(std::equal(reshaped.at(5, 5), reshaped.at(5, 5) + 4, jfk.at(5, 5)));
+        // Where looking at the lens puts an iris, against portraits: Armstrong looks at the lens with his head near
+        // frontal, so each iris is already about there.
+        {
+            const Image arm = load("armstrong.jpg");
+            std::shared_ptr<const std::vector<FaceBox>> armFaces = cachedFaces(arm);
+            QVERIFY(armFaces && !armFaces->empty());
+            FaceMesh am;
+            QVERIFY(fitFaceMesh(arm, armFaces->front(), am));
+            QVERIFY2(std::fabs(am.yaw) < 10 && std::fabs(am.pitch) < 10, qPrintable(QString("%1 %2").arg(am.yaw).arg(am.pitch)));
+            for (bool left : {false, true}) {
+                float ix = 0, iy = 0, ir = 0, tx = 0, ty = 0;
+                QVERIFY(gazeTarget(am, left, tx, ty));
+                am.iris(left, ix, iy, ir);
+                const double width = std::hypot(am.x(left ? 263 : 33) - am.x(left ? 362 : 133), am.y(left ? 263 : 33) - am.y(left ? 362 : 133));
+                QVERIFY2(std::hypot(ix - tx, iy - ty) < 0.1 * width,
+                         qPrintable(QString("(%1, %2) lens at (%3, %4), eye %5 wide").arg(ix).arg(iy).arg(tx).arg(ty).arg(width)));
+            }
+        }
         // Look at Lens: in the portrait looking up, the irises move toward where looking at the lens puts them.
         const Image up = load("jfk-looking-up-close.jpg");
         std::shared_ptr<const std::vector<FaceBox>> upFaces = cachedFaces(up);
         QVERIFY(upFaces && !upFaces->empty());
         FaceMesh upMesh;
         QVERIFY(fitFaceMesh(up, upFaces->front(), upMesh));
+        QVERIFY2(upMesh.pitch > 4 && std::fabs(upMesh.yaw) < 15, qPrintable(QString("%1 %2").arg(upMesh.yaw).arg(upMesh.pitch)));  // (tilted up)
         Image marked = up;
         LookAtLensSettings show;
         show.showIrises = true;

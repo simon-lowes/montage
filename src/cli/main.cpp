@@ -55,6 +55,7 @@
 #include "media/VisualSearch.h"
 #include "media/SoundSearch.h"
 #include "media/StemSeparation.h"
+#include "media/FaceMesh.h"
 #include "media/Faces.h"
 #include "media/DepthMap.h"
 #include "media/Rife.h"
@@ -908,6 +909,12 @@ int cmdModels() {
     else
         std::printf("  %-22s %6.1f MB  %s\n", faceModel().id.c_str(), double(faceModel().bytes()) / 1e6,
                     faceModel().installed() ? "downloaded" : "");
+    std::printf("\nFace mesh model (MediaPipe Face Mesh V2, for Face Shape and Look at Lens; folder: %s)\n",
+                faceMeshModel().directory().c_str());
+    if (!faceMeshAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        std::printf("  %-22s %6.1f MB  %s\n", "face mesh", double(faceMeshModel().bytes()) / 1e6,
+                    faceMeshModel().installed() ? "downloaded" : "");
     std::printf("\nDepth model (Depth Anything V2 Small, for depth effects; folder: %s)\n", depthModel().directory().c_str());
     if (!depthAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
     else

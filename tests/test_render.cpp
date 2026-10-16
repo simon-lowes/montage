@@ -6721,7 +6721,11 @@ colorspaces:
         QVERIFY2(std::fabs(warped.at(106, 100)[0] - 0.5f) < 0.01f, qPrintable(QString::number(warped.at(106, 100)[0] * 200)));
         QVERIFY(std::fabs(warped.at(70, 100)[0] - grid.at(70, 100)[0]) < 0.01f);
         QVERIFY(std::equal(warped.at(10, 10), warped.at(10, 10) + 4, grid.at(10, 10)));
-        QVERIFY(std::equal(warped.at(100, 185), warped.at(100, 185) + 4, grid.at(100, 185)));
+        // (inside the circle by its ring, nearly still; far within it, moved)
+        for (const auto& [x, y] : {std::pair{100, 179}, std::pair{21, 100}, std::pair{150, 158}})
+            QVERIFY2(std::fabs(warped.at(x, y)[0] - grid.at(x, y)[0]) * 200 < 0.3f && std::fabs(warped.at(x, y)[1] - grid.at(x, y)[1]) * 200 < 0.3f,
+                     qPrintable(QString("%1 %2").arg(x).arg(y)));
+        QVERIFY(std::fabs(warped.at(103, 100)[0] - grid.at(103, 100)[0]) * 200 > 1.5f);
         // Nothing moved, nothing changes.
         Image same = grid;
         warpPoints(same, from, from, 100, 100, 80);
@@ -6774,6 +6778,30 @@ colorspaces:
         drawEye(66);
         moveIris(face, lids, 66, 40, 9, 60, 40, 0.5);
         QVERIFY(irisAt(nx, ny) > 0 && std::fabs(nx - 63) < 1.5);
+        // An iris half under the upper lid, moved down to the middle: what was hidden is drawn in its own tone (dark, no
+        // hole of white or skin in it), and the lids' edges keep theirs.
+        auto insidePolygon = [](const std::vector<std::array<float, 2>>& poly, double x, double y) {
+            bool in = false;
+            for (size_t i = 0, j = poly.size() - 1; i < poly.size(); j = i++)
+                if ((poly[i][1] > y) != (poly[j][1] > y) && x < (poly[j][0] - poly[i][0]) * (y - poly[i][1]) / (poly[j][1] - poly[i][1]) + poly[i][0])
+                    in = !in;
+            return in;
+        };
+        for (int y = 0; y < 80; ++y)
+            for (int x = 0; x < 120; ++x) {
+                float* p = face.at(x, y);
+                p[3] = 1;
+                const bool in = insidePolygon(lids, x + 0.5, y + 0.5);
+                const double d = std::hypot(x + 0.5 - 60, y + 0.5 - 31);
+                if (in && d < 9) p[0] = 0.25f, p[1] = 0.15f, p[2] = 0.1f;
+                else if (in) p[0] = p[1] = p[2] = 0.9f;
+                else p[0] = 0.8f, p[1] = 0.6f, p[2] = 0.5f;
+            }
+        const Image hidden = face;
+        moveIris(face, lids, 60, 31, 9, 60, 40, 1);
+        for (int y = 36; y <= 44; ++y) QVERIFY2(face.at(60, y)[0] < 0.4f, qPrintable(QString("%1: %2").arg(y).arg(face.at(60, y)[0])));
+        QVERIFY(std::equal(face.at(60, 10), face.at(60, 10) + 4, hidden.at(60, 10)));
+        QVERIFY(std::equal(face.at(60, 52), face.at(60, 52) + 4, hidden.at(60, 52)));
 
         // Head pose from the mesh: a face turned 20 degrees to the picture's right and up 10.
         FaceMesh m;
