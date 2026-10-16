@@ -78,7 +78,7 @@ SurroundPan surroundFromJson(const QJsonValue& v) {
 }
 
 QJsonValue paramToJson(const Param& p) {
-    if (p.keys.empty()) return p.value;
+    if (p.keys.empty() && p.expr.empty()) return p.value;
     QJsonArray keys;
     for (const auto& k : p.keys) {
         QJsonArray a{double(k.t), k.v, interpName(k.interp)};
@@ -87,6 +87,7 @@ QJsonValue paramToJson(const Param& p) {
     }
     QJsonObject o{{"value", p.value}, {"keys", keys}};
     if (p.repeat != Repeat::Hold) o["repeat"] = p.repeat == Repeat::Loop ? "loop" : p.repeat == Repeat::PingPong ? "pingpong" : "offset";
+    if (!p.expr.empty()) o["expr"] = QString::fromStdString(p.expr);
     return o;
 }
 
@@ -98,6 +99,7 @@ Param paramFromJson(const QJsonValue& v) {
     }
     QJsonObject o = v.toObject();
     p.value = o.value("value").toDouble();
+    p.expr = o.value("expr").toString().toStdString();
     const QString repeat = o.value("repeat").toString();
     p.repeat = repeat == "loop" ? Repeat::Loop : repeat == "pingpong" ? Repeat::PingPong : repeat == "offset" ? Repeat::Offset : Repeat::Hold;
     for (const auto& kv : o.value("keys").toArray()) {

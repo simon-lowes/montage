@@ -43,7 +43,9 @@
 #include "core/MediaLog.h"
 #include "core/Multicam.h"
 #include "core/Effects.h"
+#include "core/Expression.h"
 #include "core/ProjectIO.h"
+#include "render/Expressions.h"
 #include "core/Surround.h"
 #include "core/Transcript.h"
 #include "core/TranscriptEdit.h"
@@ -4440,6 +4442,166 @@ private slots:
         const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         QVERIFY(r.value("structuredContent").toObject().value("keys").toInt() >= 2);
+    }
+
+    void parameterExpressions() {
+        if (!expressionsAvailable()) QSKIP("Built without Lua");
+        constexpr int sr = 48000;
+        // A 1 kHz tone, silent for its first second and loud for the next, on A1 from frame 10; two colour clips above.
+        std::vector<float> mono(size_t(sr) * 2);
+        for (size_t i = size_t(sr); i < mono.size(); ++i) mono[i] = float(0.5 * std::sin(2 * M_PI * 1000 * double(i) / sr));
+        const std::string wav = path("expr.wav");
+        QVERIFY(writeMonoWav(wav, mono, sr));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = Rational{50, 1};
+        MediaItem m = probeOrFail(p, wav);
+        p.media.push_back(m);
+        Clip tone = makeClip(p, m, TrackKind::Audio, s);
+        tone.start = 10;
+        edit::overwrite(p, s, {TrackKind::Audio, 0}, tone);
+        Clip a = makeGeneratorClip(p, "color", 100);
+        a.name = "Lead";
+        a.start = 10;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, a);
+        Clip b = makeGeneratorClip(p, "color", 100);
+        b.name = "Follower";
+        b.start = 30;
+        edit::overwrite(p, s, {TrackKind::Video, 1}, b);
+        Clip& lead = *edit::clipById(s, a.id);
+        Clip& follower = *edit::clipById(s, b.id);
+        ExpressionScope scope(&p, &s);
+        auto set = [&](Clip& c, const std::string& name, const std::string& expr) {
+            const edit::Result r = edit::setExpression(p, s, c.id, 0, name, expr);
+            QVERIFY2(r.ok, r.error.c_str());
+        };
+        auto at = [&](const Clip& c, const std::string& name, FrameTime t) { return c.motion.params.at(name).at(t); };
+        // Time in seconds at the sequence's rate, frames, and the keyed value.
+        set(lead, "pos_x", "value + time * 100 + frame");
+        QCOMPARE(at(lead, "pos_x", 25), 0 + 50.0 + 25);
+        lead.motion.params["pos_x"].addKey(0, 0);
+        lead.motion.params["pos_x"].addKey(10, 100);
+        QCOMPARE(at(lead, "pos_x", 5), 50 + 10.0 + 5);
+        // Statements work too, with their own variables each time.
+        set(lead, "rotation", "x = (x or 0) + 1 local y = x * 10 return y");
+        QCOMPARE(at(lead, "rotation", 3), 10.0);
+        QCOMPARE(at(lead, "rotation", 3), 10.0);
+        // Wiggle: smooth, within its amount around the value, the same every time and on any thread, and different for
+        // another setting with the same expression.
+        set(lead, "anchor_x", "wiggle(2, 30)");
+        set(lead, "anchor_y", "wiggle(2, 30)");
+        std::vector<double> wx, wy;
+        for (FrameTime t = 0; t < 100; ++t) wx.push_back(at(lead, "anchor_x", t)), wy.push_back(at(lead, "anchor_y", t));
+        double spread = 0, jump = 0, apart = 0;
+        for (size_t i = 0; i < wx.size(); ++i) {
+            QVERIFY(std::fabs(wx[i]) <= 30.0001);
+            spread = std::max(spread, std::fabs(wx[i]));
+            apart = std::max(apart, std::fabs(wx[i] - wy[i]));
+            if (i) jump = std::max(jump, std::fabs(wx[i] - wx[i - 1]));
+        }
+        QVERIFY2(spread > 5 && jump < 6 && apart > 5, qPrintable(QString("%1 %2 %3").arg(spread).arg(jump).arg(apart)));
+        double elsewhere = 0;
+        std::thread([&] {
+            ExpressionScope there(&p, &s);
+            elsewhere = at(lead, "anchor_x", 37);
+        }).join();
+        QCOMPARE(elsewhere, wx[37]);
+        // Random: steady at a frame, new at the next; noise smooth.
+        set(lead, "scale_x", "random(50, 150)");
+        const double r1 = at(lead, "scale_x", 7);
+        QCOMPARE(at(lead, "scale_x", 7), r1);
+        QVERIFY(r1 >= 50 && r1 <= 150 && at(lead, "scale_x", 8) != r1);
+        // Keys played again after the last one.
+        Param& loop = lead.motion.params["scale_y"];
+        loop.addKey(0, 0);
+        loop.addKey(10, 10);
+        for (const auto& [kind, want] : std::vector<std::pair<std::string, double>>{{"cycle", 3}, {"pingpong", 7}, {"offset", 13}, {"continue", 13}}) {
+            set(lead, "scale_y", "loopOut(\"" + kind + "\")");
+            QCOMPARE(at(lead, "scale_y", 13), want);
+        }
+        // Another clip's setting at the same moment on the timeline, and this clip's own.
+        set(follower, "pos_y", "param(\"Lead\", \"pos_x\") + param(\"opacity\")");
+        QCOMPARE(at(follower, "pos_y", 0), at(lead, "pos_x", 20) + 100);
+        set(follower, "pos_y", "param(" + std::to_string(lead.id) + ", \"transform.pos_x\")");
+        QCOMPARE(at(follower, "pos_y", 5), at(lead, "pos_x", 25));
+        // The sound: silent in the first second, about 0.25 after (the tone's root mean square: 0.5 at -3 dB, as mono plays on
+        // both channels); in the mids, not the lows.
+        set(follower, "anchor_x", "audio(1) * 100");
+        set(follower, "anchor_y", "audio(1, \"mid\") * 100 + audio(1, \"low\") * 1000");
+        QVERIFY2(at(follower, "anchor_x", 10 + 25 - 30) < 0.1, qPrintable(QString::number(at(follower, "anchor_x", 5))));
+        const double loud = at(follower, "anchor_x", 10 + 75 - 30), band = at(follower, "anchor_y", 10 + 75 - 30);
+        QVERIFY2(std::fabs(loud - 25) < 1, qPrintable(QString::number(loud)));
+        QVERIFY2(std::fabs(band - 25) < 3, qPrintable(QString::number(band)));
+        // Errors: the keyed value instead, and why.
+        follower.motion.params["rotation"] = Param(12);
+        for (const std::string bad : {"nil + 1", "os.execute('true')", "io.open('x')", "require('os')", "load('return 1')()",
+                                      "while true do end", "string.rep('x', 1 << 30)", "\"text\"", "1 / 0", "param(\"Nobody\", \"pos_x\")"}) {
+            follower.motion.params["rotation"].expr = bad;
+            QCOMPARE(at(follower, "rotation", 3), 12.0);
+            QVERIFY2(!expressionError(bad).empty(), bad.c_str());
+        }
+        QVERIFY(!checkExpression("value +"));
+        QVERIFY(!edit::setExpression(p, s, follower.id, 0, "rotation", "value +").ok);
+        QVERIFY(!edit::setExpression(p, s, follower.id, 0, "nonsense", "1").ok);
+        follower.motion.params["rotation"].expr = "value * 2";
+        QCOMPARE(at(follower, "rotation", 3), 24.0);
+        QVERIFY(expressionError("value * 2").empty());
+        // Expressions reading each other in a loop stop, with the error.
+        set(lead, "crop_left", "param(\"Follower\", \"crop_left\") + 1");
+        set(follower, "crop_left", "param(\"Lead\", \"crop_left\") + 1");
+        const double looped = at(lead, "crop_left", 30);
+        QVERIFY(std::isfinite(looped));
+        QVERIFY(!expressionError("param(\"Lead\", \"crop_left\") + 1").empty());
+        // In the picture: the follower, red over black, fades in over its first second.
+        for (const char* name : {"pos_y", "anchor_x", "anchor_y", "crop_left"}) follower.motion.params[name] = Param(0.0);
+        set(follower, "opacity", "linear(time, 0, 1, 0, 100)");
+        for (const char* c : {"color.r", "color.g", "color.b"}) {
+            lead.generator.params[c] = Param(0.0);
+            follower.generator.params[c] = Param(std::strcmp(c, "color.r") ? 0.0 : 1.0);
+        }
+        RenderOptions o;
+        auto red = [&](FrameTime t) { const Image img = renderSequenceFrame(p, s, t, o); return img.at(32, 18)[0]; };
+        const float lit0 = red(30), lit1 = red(30 + 25), lit2 = red(30 + 60);
+        QVERIFY2(lit0 < lit1 && lit1 < lit2 && std::fabs(lit2 - 1.0f) < 0.02, qPrintable(QString("%1 %2 %3").arg(lit0).arg(lit1).arg(lit2)));
+        // Saved and loaded.
+        QVERIFY(saveProject(p, path("expr.montage")));
+        Project back;
+        QVERIFY(loadProject(path("expr.montage"), back));
+        const Clip* again = edit::clipById(*back.active(), follower.id);
+        QVERIFY(again && again->motion.params.at("opacity").expr == "linear(time, 0, 1, 0, 100)");
+        QCOMPARE(again->motion.params.at("pos_y").expr, follower.motion.params.at("pos_y").expr);
+        // Baked to keys: as few as needed, the same values, no expression left.
+        const edit::Result baked = edit::bakeExpression(p, s, follower.id, 0, "opacity");
+        QVERIFY2(baked.ok, baked.error.c_str());
+        const Param& fade = follower.motion.params.at("opacity");
+        QVERIFY(fade.expr.empty() && fade.keys.size() >= 2 && fade.keys.size() <= 3);
+        QVERIFY(std::fabs(fade.at(25) - 50) < 0.2 && std::fabs(fade.at(80) - 100) < 1e-9);
+        QVERIFY(!edit::bakeExpression(p, s, follower.id, 0, "opacity").ok);  // nothing to bake now
+        // Over MCP: set, with its value and error, and baked.
+        const QString project = QString::fromStdString(path("expr-mcp.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_expression"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"project", project}, {"clip", double(follower.id)}, {"param", "rotation"}, {"expression", "frame * 3"}, {"at", 4}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("value").toDouble(), 12.0);
+        r = call({{"project", project}, {"clip", double(follower.id)}, {"param", "rotation"}, {"expression", "nil + frame"}});
+        QVERIFY(!r.value("isError").toBool() && r.value("structuredContent").toObject().contains("error"));
+        QVERIFY(call({{"project", project}, {"clip", double(follower.id)}, {"param", "rotation"}, {"expression", "frame +"}}).value("isError").toBool());
+        call({{"project", project}, {"clip", double(follower.id)}, {"param", "rotation"}, {"expression", "frame * 3"}});
+        r = call({{"project", project}, {"clip", double(follower.id)}, {"param", "rotation"}, {"action", "bake"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        Project fromMcp;
+        QVERIFY(loadProject(project.toStdString(), fromMcp));
+        const Param& turned = edit::clipById(*fromMcp.active(), follower.id)->motion.params.at("rotation");
+        QVERIFY(turned.expr.empty() && turned.keys.size() == 2 && turned.at(10) == 30);
     }
 
     void imageSequences() {

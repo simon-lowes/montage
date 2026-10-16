@@ -62,12 +62,17 @@ struct Param {
     // After the last key: hold its value, play the keys again (Loop), back and forth (PingPong), or again carrying
     // on from where the last cycle ended (Offset: a value climbing by the same step each cycle). Needs two keys.
     Repeat repeat = Repeat::Hold;
+    // An expression that gives the value at each frame from the keyed one (core/Expression.h); "" = none.
+    std::string expr;
 
     Param() = default;
     Param(double v) : value(v) {}  // NOLINT(google-explicit-constructor)
 
     bool animated() const { return !keys.empty(); }
+    // Whether the value can change over time: keys or an expression.
+    bool varies() const { return !keys.empty() || !expr.empty(); }
     double at(FrameTime t) const;
+    double keyedAt(FrameTime t) const;  // the keys' (or the still) value, without the expression
     // Sets the value at t: adds/replaces a keyframe if animated, else the static value.
     void set(FrameTime t, double v);
     void addKey(FrameTime t, double v, Interp interp = Interp::Linear);

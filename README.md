@@ -65,6 +65,7 @@ such as Kdenlive, Shotcut and Olive also build on C++, Qt and FFmpeg.
 **Effects and colour**
 - Transform on every clip: position, scale, rotation, anchor, crop, opacity, flip, and fit/fill/stretch
 - **Motion paths**: an animated position shows its path over the Program monitor, a dot a frame so their spacing shows the speed and a square at each keyframe; drag a square to move that keyframe (one undo step) while the box still moves the clip at the playhead.
+- **Expressions**: any keyframeable number setting of a clip can be driven by a short Lua formula (the **=** button beside its keyframe buttons, or Expression… on its menu), such as `value + wiggle(2, 10)`, `loopOut("pingpong")`, `param("Logo", "pos_x") + 50` (follow another clip's setting) or `100 * audio(1, "low")` (pulse with the bass). It is checked as it is typed and shows its value at the playhead; noise and random numbers are seeded, so every render matches, and each render thread runs its own sandboxed Lua (no files, programs or clocks). The Keyframes panel draws it as a curve, a failing one shows red and plays its keyed value, and Bake to Keyframes turns it into keys for other applications. Saved in the project; MCP `montage_expression`.
 - 13 blend modes
 - Primary colour correction: lift, gamma and gain per channel, plus exposure, contrast, pivot, saturation, temperature, tint and offset
 - One-click Auto Colour (grey-world balance and level stretch)

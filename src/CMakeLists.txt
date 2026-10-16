@@ -170,6 +170,7 @@ add_library(montage_engine STATIC
   render/Stereo.h render/Stereo.cpp
   render/ClipPlacement.h render/ClipPlacement.cpp
   render/AudioReactive.h render/AudioReactive.cpp
+  core/Expression.h render/Expressions.cpp
   render/QualityCheck.h render/QualityCheck.cpp
   render/LutExport.h render/LutExport.cpp
   render/ProjectManager.h render/ProjectManager.cpp

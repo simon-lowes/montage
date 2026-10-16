@@ -73,6 +73,8 @@ private:
 
     // Publishes a clip's setting as a field of the graphic its sequence is, asking for its label.
     void publishParameter(const Target& target, const std::string& param, const QString& label);
+    // The expression on a clip's setting (core/Expression.h): written, tried as it is typed, removed or baked to keys.
+    void editExpression(const Target& target, const std::string& param, const QString& label, double def);
     // A graphic's own values for the fields its template publishes (core/GraphicsTemplate.h).
     void addGraphicSection(const Clip& clip);
     // An OGraf graphic's data, a row per field of its schema, and rendering it ahead.

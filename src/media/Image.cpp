@@ -1,5 +1,7 @@
 #include "Image.h"
 
+#include "core/Expression.h"
+
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -168,11 +170,16 @@ void parallelRows(int height, const std::function<void(int, int)>& fn) {
     int remaining = bands;
     std::mutex m;
     std::condition_variable cv;
+    // Expressions evaluated in a band belong where the caller's do (core/Expression.h).
+    const ExpressionContext where = currentExpressionContext();
     for (int b = 0; b < bands; ++b) {
         int y0 = int(int64_t(height) * b / bands);
         int y1 = int(int64_t(height) * (b + 1) / bands);
         p.submit([&, y0, y1] {
-            fn(y0, y1);
+            {
+                ExpressionScope scope(where.project, where.sequence, where.clip);
+                fn(y0, y1);
+            }
             std::lock_guard lock(m);
             if (--remaining == 0) cv.notify_one();
         });

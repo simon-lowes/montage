@@ -78,6 +78,7 @@
 #include "core/Adr.h"
 #include "core/AudioDescription.h"
 #include "core/Effects.h"
+#include "core/Expression.h"
 #include "core/History.h"
 #include "core/Interchange.h"
 #include "core/MediaLog.h"
@@ -95,6 +96,7 @@
 #include "media/SuperScale.h"
 #include "media/Translator.h"
 #include "render/AudioReactive.h"
+#include "render/Expressions.h"
 #include "render/VfxPull.h"
 #include "render/Amf.h"
 #include "render/AafExport.h"
@@ -8102,6 +8104,56 @@ void McpServer::Impl::addTools() {
             if (!e && c->generator.id == Id(a.value("effect").toDouble())) e = &c->generator;
             const int keys = e ? int(e->params.at(param).keys.size()) : 0;
             return ok(QStringLiteral("%1 follows the sound with %2 keys").arg(QString::fromStdString(param)).arg(keys), QJsonObject{{"keys", keys}});
+        });
+
+    add("montage_expression", "Parameter expression",
+        "Drive a clip's setting with a Lua expression evaluated at each frame, or bake one to keys. `param` of the effect "
+        "`effect` (an effect id; omitted = the clip's Transform: pos_x, pos_y, scale, rotation, opacity...). set: puts "
+        "`expression` on it (\"\" takes it off), e.g. \"value + wiggle(2, 10)\" or \"param('Logo', 'pos_x') + 50\"; "
+        "it can use value (the keyed value), time and frame (from the clip's start), fps, duration, wiggle(freq, amount "
+        "[, octaves, falloff, seed]), noise(x), random([lo, hi]), loopOut(cycle|pingpong|offset|continue), "
+        "param([clip name or id,] name or effect.name), audio([track [, all|low|mid|high]]) (a track's level 0..1), "
+        "linear/ease(t, t0, t1, v0, v1), clamp and Lua's math functions. Noise and random numbers are seeded, so renders "
+        "repeat exactly; an expression that fails gives the keyed value. bake: replaces the expression with keys (thinned) "
+        "for interchange. Returns the value at the clip's first frame (`at`: another clip frame) and any error.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"number"},
+            "param":{"type":"string"},"action":{"type":"string","enum":["set","bake"],"default":"set"},
+            "expression":{"type":"string"},"at":{"type":"integer","default":0}},"required":["project","clip","param"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Id id = clipArg(l, a).id;
+            const Id effect = Id(a.value("effect").toDouble(0));
+            const std::string param = need(a, "param").toStdString();
+            const QString action = str(a, "action", "set");
+            if (action == "set") {
+                if (!a.contains("expression")) throw ArgError{"expression is required to set one (\"\" takes it off)"};
+                check(edit::setExpression(l.project, l.seq(), id, effect, param, a.value("expression").toString().toStdString()));
+            } else if (action == "bake") {
+                check(edit::bakeExpression(l.project, l.seq(), id, effect, param));
+            } else {
+                throw ArgError{"action is set or bake"};
+            }
+            save(l);
+            const Clip* c = edit::clipById(l.seq(), id);
+            const Effect* e = effect == 0 ? &c->motion : nullptr;
+            for (const Effect* x : {&c->motion, &c->generator, &c->audio, &c->timing})
+                if (effect && x->id == effect) e = x;
+            for (const Effect& x : c->effects)
+                if (effect && x.id == effect) e = &x;
+            const Param* prm = e && e->params.count(param) ? &e->params.at(param) : nullptr;
+            const FrameTime at = std::clamp<FrameTime>(a.value("at").toInt(0), 0, std::max<FrameTime>(0, c->duration - 1));
+            ExpressionScope scope(&l.project, &l.seq(), c);
+            const double value = prm ? prm->at(at) : 0.0;
+            const std::string why = prm && !prm->expr.empty() ? expressionError(prm->expr) : std::string();
+            QJsonObject out{{"value", value}, {"expression", prm ? QString::fromStdString(prm->expr) : QString()},
+                            {"keys", prm ? int(prm->keys.size()) : 0}};
+            if (!why.empty()) out["error"] = QString::fromStdString(why);
+            const QString text = action == "bake" ? QStringLiteral("Baked %1 to %2 keys").arg(QString::fromStdString(param)).arg(out["keys"].toInt())
+                                 : prm && !prm->expr.empty()
+                                     ? (why.empty() ? QStringLiteral("%1 = %2 at frame %3").arg(QString::fromStdString(param)).arg(value).arg(at)
+                                                    : QStringLiteral("The expression fails at frame %1 (the keyed value is used): %2").arg(at).arg(QString::fromStdString(why)))
+                                     : QStringLiteral("%1 has no expression").arg(QString::fromStdString(param));
+            return ok(text, out);
         });
 
     add("montage_ltc", "Timecode from LTC",

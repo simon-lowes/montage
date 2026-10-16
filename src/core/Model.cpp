@@ -5,6 +5,7 @@
 
 #include "AudioChannels.h"
 #include "Effects.h"
+#include "Expression.h"
 
 namespace montage {
 
@@ -75,6 +76,11 @@ double evalKeys(const std::vector<Keyframe>& keys, FrameTime t) {
 }  // namespace
 
 double Param::at(FrameTime t) const {
+    const double keyed = keyedAt(t);
+    return expr.empty() ? keyed : evaluateExpression(*this, t, keyed);
+}
+
+double Param::keyedAt(FrameTime t) const {
     if (keys.empty()) return value;
     if (repeat != Repeat::Hold && keys.size() >= 2 && t > keys.back().t && keys.back().t > keys.front().t) {
         const FrameTime first = keys.front().t, span = keys.back().t - first;

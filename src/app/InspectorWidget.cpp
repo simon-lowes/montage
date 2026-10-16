@@ -7,6 +7,8 @@
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QStandardItemModel>
 #include <QInputDialog>
 #include <QJsonArray>
@@ -17,6 +19,7 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFontComboBox>
+#include <QFontDatabase>
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -40,6 +43,7 @@
 #include "EditorState.h"
 #include "LensCorrectionDialog.h"
 #include "ModelPacks.h"
+#include "render/Expressions.h"
 #include "media/DepthMap.h"
 #include "media/Exr.h"
 #include "media/Faces.h"
@@ -50,6 +54,7 @@
 #include "Theme.h"
 #include "audio/PluginEffect.h"
 #include "core/ClipAnimation.h"
+#include "core/Expression.h"
 #include "core/GradeVersions.h"
 #include "core/EditOps.h"
 #include "core/GraphicsTemplate.h"
@@ -1874,6 +1879,98 @@ QString InspectorWidget::publishField(Id clip, Id effect, const std::string& par
     return why;
 }
 
+void InspectorWidget::editExpression(const Target& target, const std::string& param, const QString& label, double def) {
+    const Sequence* seq = state_->sequence();
+    const Clip* clip = seq ? edit::clipById(*seq, target.clip) : nullptr;
+    const Effect* effect = clip ? target.resolve(const_cast<Sequence&>(*seq)) : nullptr;
+    if (!effect) return;
+    const auto found = effect->params.find(param);
+    const Param base = found == effect->params.end() ? Param(def) : found->second;  // tried with what is typed
+    QDialog dlg(this);
+    dlg.setObjectName(QStringLiteral("expressionDialog"));
+    dlg.setWindowTitle(tr("Expression: %1").arg(label));
+    auto* layout = new QVBoxLayout(&dlg);
+    auto* help = new QLabel(tr("A Lua formula for the value at each frame, such as <code>value + wiggle(2, 10)</code>. It can use "
+                               "<code>value</code> (the keyed value), <code>time</code>, <code>frame</code>, <code>wiggle(per second, amount)</code>, "
+                               "<code>random(lo, hi)</code>, <code>loopOut(\"cycle\")</code>, <code>param(\"clip\", \"setting\")</code>, "
+                               "<code>audio(track)</code>, <code>linear</code>, <code>ease</code> and Lua's maths (<code>sin</code>, <code>abs</code>, …)."),
+                            &dlg);
+    help->setWordWrap(true);
+    layout->addWidget(help);
+    auto* text = new QPlainTextEdit(QString::fromStdString(base.expr), &dlg);
+    text->setObjectName(QStringLiteral("expressionText"));
+    text->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+    text->setFixedHeight(text->fontMetrics().lineSpacing() * 5 + 12);
+    layout->addWidget(text);
+    auto* status = new QLabel(&dlg);
+    status->setObjectName(QStringLiteral("expressionStatus"));
+    status->setWordWrap(true);
+    layout->addWidget(status);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    QPushButton* apply = buttons->button(QDialogButtonBox::Ok);
+    QPushButton* bake = buttons->addButton(tr("Bake to Keyframes"), QDialogButtonBox::ActionRole);
+    bake->setObjectName(QStringLiteral("expressionBake"));
+    bake->setToolTip(tr("Replace the expression with keyframes that give the same values (for other applications)"));
+    QPushButton* remove = buttons->addButton(tr("Remove"), QDialogButtonBox::ActionRole);
+    remove->setObjectName(QStringLiteral("expressionRemove"));
+    remove->setEnabled(!base.expr.empty());
+    layout->addWidget(buttons);
+    enum class Action { Apply, Bake, Remove } action = Action::Apply;
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    connect(bake, &QPushButton::clicked, &dlg, [&] {
+        action = Action::Bake;
+        dlg.accept();
+    });
+    connect(remove, &QPushButton::clicked, &dlg, [&] {
+        action = Action::Remove;
+        dlg.accept();
+    });
+    // Checked as it is typed: compiled, then run at the playhead.
+    auto check = [&, clipId = target.clip, time = target.time] {
+        const std::string expr = text->toPlainText().trimmed().toStdString();
+        bake->setEnabled(false);
+        if (expr.empty()) {
+            status->setText(tr("No expression: the keyed value is used."));
+            apply->setEnabled(true);
+            return;
+        }
+        std::string why;
+        if (!checkExpression(expr, &why)) {
+            status->setText(tr("Does not work: %1").arg(QString::fromStdString(why)));
+            apply->setEnabled(false);
+            return;
+        }
+        Param trial = base;
+        trial.expr = expr;
+        const Sequence* s = state_->sequence();
+        ExpressionScope scope(&state_->project(), s, s ? edit::clipById(*s, clipId) : nullptr);
+        const double v = trial.at(time());
+        why = expressionError(expr);
+        status->setText(why.empty() ? tr("At the playhead: %1").arg(v, 0, 'g', 6)
+                                    : tr("Fails at the playhead (the keyed value is used): %1").arg(QString::fromStdString(why)));
+        apply->setEnabled(true);
+        bake->setEnabled(why.empty());
+    };
+    connect(text, &QPlainTextEdit::textChanged, &dlg, check);
+    check();
+    if (dlg.exec() != QDialog::Accepted) return;
+    const std::string expr = action == Action::Remove ? std::string() : text->toPlainText().trimmed().toStdString();
+    if (action == Action::Apply && expr == base.expr) return;
+    const Id clipId = target.clip, effectId = target.effect;
+    QString error;
+    state_->edit(action == Action::Bake      ? tr("Bake Expression on %1").arg(label)
+                 : expr.empty()              ? tr("Remove Expression on %1").arg(label)
+                                             : tr("Expression on %1").arg(label),
+                 [clipId, effectId, param, expr, action, &error](Project& p, Sequence& s) {
+                     edit::Result r = edit::setExpression(p, s, clipId, effectId, param, expr);
+                     if (r.ok && action == Action::Bake) r = edit::bakeExpression(p, s, clipId, effectId, param);
+                     if (!r.ok) error = QString::fromStdString(r.error);
+                     return r.ok;
+                 });
+    if (!error.isEmpty()) state_->message(error, 5000);
+}
+
 void InspectorWidget::publishParameter(const Target& target, const std::string& param, const QString& label) {
     bool ok = false;
     const QString name = QInputDialog::getText(this, tr("Publish to Graphic"),
@@ -2149,6 +2246,8 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
             connect(spin, &QWidget::customContextMenuRequested, this, [spin, write, name, def, target, label, this](const QPoint& p) {
                 QMenu m;
                 m.addAction(tr("Reset to Default"), this, [write, name, def] { write({{name, def}}); });
+                if (target.clip && target.keyframes && expressionsAvailable())
+                    m.addAction(tr("Expression…"), this, [this, target, name, label, def] { editExpression(target, name, label, def); });
                 if (target.publishClip) m.addAction(tr("Publish to Graphic…"), this, [this, target, name, label] { publishParameter(target, name, label); });
                 m.exec(spin->mapToGlobal(p));
             });
@@ -2174,6 +2273,16 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
         key->setCheckable(true);
         auto* next = smallButton(row, QStringLiteral("▸"), tr("Next keyframe"));
         for (QToolButton* b : {watch, prev, key, next}) h->addWidget(b);
+        // An expression drives it (a clip's own settings; one value each, so not colours).
+        QToolButton* formula = nullptr;
+        if (target.clip && pi.kind != ParamKind::Color && expressionsAvailable()) {
+            formula = smallButton(row, QStringLiteral("="), tr("Expression"));
+            formula->setObjectName(QStringLiteral("expression_%1_%2").arg(target.effect).arg(QString::fromStdString(name)));
+            formula->setCheckable(true);
+            h->addWidget(formula);
+            const double def = pi.def;
+            connect(formula, &QToolButton::clicked, this, [this, target, name, label, def] { editExpression(target, name, label, def); });
+        }
         connect(watch, &QToolButton::clicked, this, [this, target, names, label](bool on) {
             FrameTime t = target.time();
             state_->edit(on ? tr("Animate %1").arg(label) : tr("Stop Animating %1").arg(label), [target, names, on, t](Project&, Sequence& s) {
@@ -2220,9 +2329,20 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
         connect(prev, &QToolButton::clicked, this, [jump] { jump(false); });
         connect(next, &QToolButton::clicked, this, [jump] { jump(true); });
         auto inner = refreshWidget;
-        refreshWidget = [inner, watch, key, prev, next, readParam, names, target] {
+        refreshWidget = [this, inner, watch, key, prev, next, formula, readParam, names, target] {
             inner();
             const Param* p = readParam(names[0]);
+            if (formula) {
+                // Checked while there is one; red while it fails (the keyed value is used then).
+                const std::string expr = p ? p->expr : std::string();
+                const std::string why = expr.empty() ? std::string() : expressionError(expr);
+                QSignalBlocker b0(formula);
+                formula->setChecked(!expr.empty());
+                formula->setToolTip(expr.empty() ? tr("Expression") : why.empty() ? tr("Expression: %1").arg(QString::fromStdString(expr))
+                                                                                  : tr("Expression failed: %1").arg(QString::fromStdString(why)));
+                formula->setStyleSheet(why.empty() ? QString() : QStringLiteral("color: #ff6b6b;"));
+                formula->setProperty("failing", !why.empty());
+            }
             bool animated = p && p->animated();
             bool onKey = p && p->keyAt(target.time());
             QSignalBlocker b1(watch), b2(key);

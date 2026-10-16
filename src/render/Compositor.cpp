@@ -4,6 +4,7 @@
 #include "Ofx.h"
 
 #include "core/ColorGroups.h"
+#include "core/Expression.h"
 #include "core/GradeGraph.h"
 #include "GradeGraph.h"
 #include "core/Automation.h"
@@ -1300,6 +1301,7 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
 // `below` is what the tracks under the clip have made so far, for adjustment layers.
 Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
                 const Image* below = nullptr) {
+    ExpressionScope expressions(&p, &seq, &c);  // (core/Expression.h)
     ClipSource cs;
     if (!clipSource(p, seq, c, t, o, below, false, cs)) return {};
     return finishClipLayer(seq, c, o, cs);
@@ -1418,6 +1420,7 @@ const Transition* activeTransition(const Track& track, FrameTime t, FrameTime& f
 
 // What track `m` shows at t (a transition's mix while one runs), on the CPU.
 Image trackPicture(const Project& p, const Sequence& seq, size_t m, FrameTime t, const RenderOptions& o, int W, int H) {
+    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
     const Track& track = seq.videoTracks[m];
     FrameTime from = 0, to = 0;
     if (const Transition* tr = activeTransition(track, t, from, to)) return transitionLayer(p, seq, track, *tr, from, to, t, o, nullptr, W, H);
@@ -1441,6 +1444,7 @@ void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c,
 }  // namespace
 
 Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& opts) {
+    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
     const WorkingSpaceScope working(&sequenceColorSpace(seq));  // effects that work in light know whose
     const int solo = opts.soloVideoTrack;
     RenderOptions o = opts;
@@ -1733,6 +1737,7 @@ bool runOnSource(const Effect& e) {
 }
 
 GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, gpu::Layer& out) {
+    ExpressionScope expressions(&p, &seq, &c);  // (core/Expression.h)
     if (c.isGenerator() && c.generator.type == "adjustment") return GpuLayerResult::Unsupported;
     // Its colour steps, each one the GPU draws (the ones on the source, such as noise reduction, are not). Those the
     // GPU has no form for go to the CPU before anything is decoded, unless they may run on the camera's picture.
@@ -1811,6 +1816,7 @@ gpu::Layer cpuLayer(Image&& img) {
 // The program frame drawn on the GPU where it can be, its layers that it cannot draw made on the CPU: false (counted,
 // with why) when the frame as a whole is for the CPU.
 bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& opts, Image* out, QImage* out8) {
+    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
     std::string why;
     auto fallback = [](const std::string& reason) {
         gpu::countFallback(reason);
@@ -1907,6 +1913,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
 }  // namespace
 
 QImage renderProgramFrameRgba8(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
+    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
     QImage q;
     if (o.gpu && o.depth == 0 && gpuProgramFrame(p, seq, t, o, nullptr, &q)) return q;
     RenderOptions cpu = o;
@@ -1918,6 +1925,7 @@ QImage renderProgramFrameRgba8(const Project& p, const Sequence& seq, FrameTime 
 }
 
 Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
+    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
     if (o.gpu && o.depth == 0) {
         Image img;
         if (gpuProgramFrame(p, seq, t, o, &img, nullptr)) return img;
@@ -1947,6 +1955,7 @@ Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, con
 
 namespace {
 bool clipGeometry(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, Geometry& g) {
+    ExpressionScope expressions(&p, &seq, &c);  // (core/Expression.h)
     double mw = seq.width, mh = seq.height;
     if (!c.isGenerator()) {
         const MediaItem* m = p.findMedia(c.mediaId);
@@ -1970,6 +1979,7 @@ bool clipGeometry(const Project& p, const Sequence& seq, const Clip& c, FrameTim
 }  // namespace
 
 bool clipFrameSize(const Project& p, const Sequence& seq, const Clip& c, double& w, double& h) {
+    ExpressionScope expressions(&p, &seq, &c);  // (core/Expression.h)
     Geometry g;
     if (!clipGeometry(p, seq, c, c.start, g)) return false;
     w = g.mw;
@@ -1979,6 +1989,7 @@ bool clipFrameSize(const Project& p, const Sequence& seq, const Clip& c, double&
 
 bool clipFrameToSequence(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, double u, double v,
                          double& x, double& y) {
+    ExpressionScope expressions(&p, &seq, &c);  // (core/Expression.h)
     Geometry g;
     if (!clipGeometry(p, seq, c, t, g)) return false;
     const double rx = (u * g.mw - g.mw / 2 - g.ax) * g.sx, ry = (v * g.mh - g.mh / 2 - g.ay) * g.sy;
@@ -1990,6 +2001,7 @@ bool clipFrameToSequence(const Project& p, const Sequence& seq, const Clip& c, F
 
 bool sequenceToClipFrame(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, double x, double y,
                          double& u, double& v) {
+    ExpressionScope expressions(&p, &seq, &c);  // (core/Expression.h)
     Geometry g;
     if (!clipGeometry(p, seq, c, t, g)) return false;
     const double pxs = x - seq.width / 2.0 - g.px, pys = y - seq.height / 2.0 - g.py;
@@ -2168,6 +2180,7 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const Color
 }
 
 Image colourReferenceFrame(const Project& p, const Sequence& s, FrameTime t) {
+    ExpressionScope expressions(&p, &s);  // (core/Expression.h)
     RenderOptions o;
     o.scale = std::min(1.0, 480.0 / std::max(1, s.width));
     o.displaySpace = "rec709";  // as renderMediaFrame gives the clips' own frames
@@ -2845,6 +2858,7 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
 
 void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
                      std::vector<MeterLevels>* trackLevels) {
+    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
     const int n = layoutChannels(seq.audioLayout);
     if (n == 2) {
         std::lock_guard lock(m_);
@@ -2885,6 +2899,7 @@ void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int f
 }
 
 void AudioMixer::mixLayout(const Project& p, const Sequence& seq, int64_t start, int frames, float* out) {
+    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
     const int n = layoutChannels(seq.audioLayout);
     std::lock_guard lock(m_);
     if (start != nextStart_) {
@@ -3281,6 +3296,7 @@ int AudioMixer::maxLatency(const Sequence& seq, double sr) {
 
 void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
                          std::vector<MeterLevels>* trackLevels, int depth, int rate, int onlyTrack, int channels) {
+    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
     const double sr = rate > 0 ? rate : seq.sampleRate;
     // Surround: tracks and buses stay stereo inside and are panned onto the layout's speakers at their faders. Nested
     // sequences mix as stereo, except an ambisonic one wanted as its field.
