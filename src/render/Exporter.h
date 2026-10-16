@@ -130,6 +130,25 @@ struct ExportSettings {
     int monoAudioTracks = 0;
     // The file's starting timecode ("10:00:00:00"; "" = none), where the container keeps one (MXF, MOV).
     std::string startTimecode;
+    // Coded as interlaced fields, the top first (each picture's two halves: PsF), as 1080i deliveries ask: MPEG-2,
+    // H.264 (AVC-Intra), ProRes and DNxHD.
+    bool interlaced = false;
+    // Broadcast MXF by the book (render/BroadcastMxf.h), for an .mxf in XDCAM HD422 (MPEG-2) or AVC-Intra, rewrapped
+    // after the render with the EBU's bmx: "" = FFmpeg's OP1a as it writes it; "rdd9" = RDD 9 (XDCAM HD422);
+    // AS-11 "as11-dpp" (UK DPP HD: AVC-Intra 100, 1080i25, coded interlaced whatever `interlaced` says), "as11-x2"
+    // (AVC-Intra HD), "as11-x8" (XDCAM HD422 in RDD 9, the NABA's).
+    std::string mxfDelivery;
+    // AS-11 descriptive metadata, "Name=value" a line, by the names AS-11 gives them (as11CoreProperties and
+    // ukDppProperties). What is not given comes from the sequence: the programme title its name, the audio and caption
+    // languages, captions present, EBU R 128 loudness when normalising to -23, audio description, open captions; the
+    // DPP's line-up and ident clock from markers named "Line-up" (or "Bars") and "Clock" (or "Ident"), and the parts
+    // from markers with a duration named "Part ...", in order (none: the programme is one part).
+    std::vector<std::string> as11Metadata;
+    // In such an MXF, the caption track as ancillary data in an ST 436 track: CEA-708 caption packets (with the 608
+    // bytes, line 9), and OP-47 teletext subtitles on teletextPage (line 12, and 575 for the second field).
+    bool ancCaptions = false;
+    bool ancTeletext = false;
+    int teletextPage = 888;
     // With embedCaptions, these caption tracks too, each as its own subtitle stream (every language at once).
     std::vector<Id> extraCaptions;
     // Content Credentials (media/ContentCredentials.h): the file signed with this certificate chain and key (PEM),

@@ -148,7 +148,7 @@ jobs:
           # this build replaces).
           pacboy: >-
             gcc:p cmake:p ninja:p pkgconf:p nasm:p
-            qt6-base:p qt6-multimedia:p qt6-tools:p opencolorio:p lilv:p libraw:p openjpeg2:p libmysofa:p onnxruntime:p rust:p
+            qt6-base:p qt6-multimedia:p qt6-tools:p opencolorio:p lilv:p libraw:p openjpeg2:p libmysofa:p onnxruntime:p rust:p expat:p
             x264:p x265:p libvpx:p svt-av1:p dav1d:p opus:p lame:p srt:p librist:p amf-headers:p ffnvcodec-headers:p libvpl:p
       - name: FFmpeg's libraries (part of its cache key)
         id: ffdeps

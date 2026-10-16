@@ -837,6 +837,30 @@ QStringList MainWindow::workspaces() const {
     return names;
 }
 
+bool MainWindow::startGpuGuarded(std::string* why) {
+    appSettings().setValue("playback/gpuStarting", true);
+    appSettings().sync();
+    if (!gpu::initialize(why)) {
+        appSettings().remove("playback/gpuStarting");
+        return false;
+    }
+    // Cleared once a frame has been drawn on the GPU, or when Montage quits normally, whichever comes first.
+    auto* watch = new QTimer(this);
+    const long before = gpu::stats().gpuFrames;
+    auto clear = [watch] {
+        watch->stop();
+        watch->deleteLater();
+        appSettings().remove("playback/gpuStarting");
+    };
+    connect(watch, &QTimer::timeout, this, [clear, before] {
+        if (gpu::stats().gpuFrames > before) clear();
+    });
+    connect(qApp, &QCoreApplication::aboutToQuit, watch, clear);
+    connect(watch, &QObject::destroyed, [] { appSettings().remove("playback/gpuStarting"); });  // (the window closed)
+    watch->start(500);
+    return true;
+}
+
 bool MainWindow::applyWorkspace(const QString& name) {
     if (builtInWorkspaces().contains(name)) {
         layOutBuiltIn(name);
@@ -1937,9 +1961,20 @@ void MainWindow::buildMenus() {
                          "(VideoToolbox, D3D11, NVDEC, VAAPI) where supported"));
         // GPU rendering (on by default where there is a GPU; MONTAGE_GPU=off overrides it): the program monitor's frames
         // are composited and graded on the GPU, what it cannot draw on the CPU as before. The GPU is set up only when it
-        // is wanted (a driver that misbehaves is out of the way once it is turned off).
+        // is wanted (a driver that misbehaves is out of the way once it is turned off). A launch that ended while the GPU
+        // was being set up or drawing its first frame (a driver crash takes Montage with it) leaves it off the next time.
         std::string why;
-        const bool onGpu = appSettings().value("playback/gpuRendering", true).toBool() && gpu::initialize(&why);
+        bool wantGpu = appSettings().value("playback/gpuRendering", true).toBool();
+        if (wantGpu && appSettings().value("playback/gpuStarting", false).toBool()) {
+            wantGpu = false;
+            appSettings().setValue("playback/gpuRendering", false);
+            appSettings().remove("playback/gpuStarting");
+            why = tr("turned off because Montage closed while starting it last time; turn it on again in the Playback menu").toStdString();
+            QTimer::singleShot(0, this, [this, why] {
+                statusBar()->showMessage(tr("GPU rendering is off: %1").arg(QString::fromStdString(why)), 15000);
+            });
+        }
+        const bool onGpu = wantGpu && startGpuGuarded(&why);
         program_->setGpuRendering(onGpu);
         QAction* g = add(play, tr("&GPU Rendering"), QKeySequence(), [](bool) {});
         g->setObjectName(QStringLiteral("gpuRendering"));
@@ -1953,7 +1988,7 @@ void MainWindow::buildMenus() {
         describe(why);
         connect(g, &QAction::triggered, this, [this, g, describe](bool on) {
             std::string problem;
-            if (on && !gpu::initialize(&problem)) {
+            if (on && !startGpuGuarded(&problem)) {
                 g->setChecked(false);
                 describe(problem);
                 statusBar()->showMessage(tr("No GPU rendering: %1").arg(QString::fromStdString(problem)), 5000);

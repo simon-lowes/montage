@@ -23,6 +23,7 @@
 #include "core/ClipAnimation.h"
 #include "core/Captions.h"
 #include "core/Cea708.h"
+#include "core/Teletext.h"
 #include "core/ColorWarp.h"
 #include "core/Bleep.h"
 #include "core/Cfb.h"
@@ -2146,6 +2147,128 @@ private slots:
         t.captions = caps;
         QVERIFY(captionFormatKnown(".mcc"));
         QCOMPARE(exportCaptions(t, *p.active(), ".mcc").substr(0, 26), std::string("File Format=MacCaption_MCC"));
+    }
+
+    void teletextSubtitlePages() {
+        const Rational pal{25, 1};
+        // A caption at frame 5: the page header (magazine 8 sent as 0, page 88, erase and subtitle flags), its row, and the
+        // dummy header 8FF that ends the page; the frames before carry only the dummy, after a clear at the start.
+        const std::vector<Caption> one = {{5, 20, "Hello \xC2\xA3" "5 #1", {}}};
+        const auto fields = teletextSubtitleFields(one, pal, 30, 888);
+        QCOMPARE(fields.size(), size_t(30));
+        QCOMPARE(fields[0].size(), size_t(2));  // the clear, then the dummy
+        QCOMPARE(fields[1].size(), size_t(1));
+        const std::vector<TeletextPacket>& at5 = fields[5];
+        QCOMPARE(at5.size(), size_t(3));
+        const TeletextPacket& head = at5[0];
+        QCOMPARE(int(head[0]), 0x15);  // magazine 0 (8), row 0
+        QCOMPARE(int(head[1]), 0x15);
+        QCOMPARE(int(head[2]), 0xD0);  // page units 8
+        QCOMPARE(int(head[3]), 0xD0);  // page tens 8
+        QCOMPARE(int(head[5]), 0xD0);  // C4 erase
+        QCOMPARE(int(head[7]), 0xD0);  // C6 subtitle
+        QCOMPARE(int(at5[2][2]), 0xEA);  // the dummy's page units F
+        // Row 22 (magazine 0, row bits 0 then 11), every display byte with odd parity, boxed double height.
+        const TeletextPacket& row = at5[1];
+        QCOMPARE(int(row[0]), 0x15);
+        QCOMPARE(int(row[1]), 0x9B);  // the row's high bits, 11
+        for (size_t i = 2; i < 42; ++i) {
+            int ones = 0;
+            for (int b = 0; b < 8; ++b) ones += (row[i] >> b) & 1;
+            QVERIFY(ones & 1);
+        }
+        std::string cells;
+        for (size_t i = 2; i < 42; ++i) cells += char(row[i] & 0x7F);
+        QVERIFY(cells.find("\x07\x0D\x0B\x0BHello #5 _1\x0A\x0A") != std::string::npos);  // (£ is 23h, # is 5Fh in the English set)
+
+        // The OP-47 subtitling distribution packet: identifier, length, format, descriptors, 45 bytes a packet, footer,
+        // a checksum that makes the bytes add up to 0; read back.
+        const std::vector<uint8_t> sdp = op47Sdp(at5, 7);
+        QCOMPARE(sdp.size(), size_t(4 + 5 + 3 * 45 + 4));
+        QCOMPARE(int(sdp[0]), 0x51);
+        QCOMPARE(int(sdp[1]), 0x15);
+        QCOMPARE(int(sdp[2]), int(sdp.size()));
+        QCOMPARE(int(sdp[3]), 0x02);
+        QCOMPARE(int(sdp[4]), 0x80 | 19);
+        QCOMPARE(int(sdp[6]), 0x80 | 21);
+        QCOMPARE(int(sdp[7]), 0);
+        QCOMPARE(int(sdp[9]), 0x55);
+        QCOMPARE(int(sdp[11]), 0x27);
+        QCOMPARE(int(sdp[sdp.size() - 4]), 0x74);
+        QCOMPARE(int(sdp[sdp.size() - 2]), 7);
+        unsigned sum = 0;
+        for (uint8_t v : sdp) sum += v;
+        QCOMPARE(sum & 0xFF, 0u);
+        std::vector<TeletextPacket> back;
+        QVERIFY(parseOp47Sdp(sdp.data(), sdp.size(), back));
+        QVERIFY(back == at5);
+        std::vector<uint8_t> bad = sdp;
+        bad[20] ^= 1;
+        back.clear();
+        QVERIFY(!parseOp47Sdp(bad.data(), bad.size(), back));
+        QCOMPARE(int(op47Sdp(at5, 1, false)[4]), 19);  // the second field
+
+        // Decoded again: the caption, on its frames.
+        std::vector<Caption> out;
+        QVERIFY(teletextSubtitles(fields, pal, 888, out));
+        QCOMPARE(out.size(), size_t(1));
+        QCOMPARE(out[0].start, FrameTime(5));
+        QCOMPARE(out[0].end, FrameTime(20));
+        QCOMPARE(out[0].text, std::string("Hello \xC2\xA3" "5 #1"));
+        QVERIFY(!teletextSubtitles(fields, pal, 801, out));  // no such page
+
+        // Interlaced, two captions back to back (the second at the top, four rows: five packets, the dummy a field later),
+        // and a long line wrapped.
+        std::vector<Caption> two = {{4, 10, "First", {}}, {10, 16, "One\nTwo\nThree\nFour", {}},
+                                    {20, 30, "A rather long subtitle line that has to wrap onto two rows", {}}};
+        two[1].vertical = kCaptionTop;
+        two[1].align = kCaptionLeft;
+        const auto both = teletextSubtitleFields(two, pal, 32, 801, true);
+        QCOMPARE(both.size(), size_t(64));
+        QCOMPARE(both[20].size(), size_t(5));
+        QCOMPARE(both[21].size(), size_t(1));
+        out.clear();
+        QVERIFY(teletextSubtitles(both, pal, 801, out, true));
+        QCOMPARE(out.size(), size_t(3));
+        QCOMPARE(out[0].end, FrameTime(10));
+        QCOMPARE(out[1].start, FrameTime(10));
+        QCOMPARE(out[1].text, std::string("One\nTwo\nThree\nFour"));
+        QCOMPARE(out[1].vertical, int(kCaptionTop));
+        QCOMPARE(out[1].align, int(kCaptionLeft));
+        QCOMPARE(out[0].vertical, int(kCaptionBottom));
+        QCOMPARE(out[2].text, std::string("A rather long subtitle line that\nhas to wrap onto two rows"));
+        QCOMPARE(out[2].end, FrameTime(30));
+
+        // Progressive, a four-row caption a frame long (its page ends a frame later) and one in the middle: each on
+        // its own frames, where it was placed.
+        std::vector<Caption> short4 = {{6, 7, "One\nTwo\nThree\nFour", {}}, {12, 18, "Halfway", {}}};
+        short4[1].vertical = kCaptionMiddle;
+        out.clear();
+        QVERIFY(teletextSubtitles(teletextSubtitleFields(short4, pal, 24, 888), pal, 888, out));
+        QCOMPARE(out.size(), size_t(2));
+        QCOMPARE(out[0].start, FrameTime(6));
+        QCOMPARE(out[0].end, FrameTime(7));
+        QCOMPARE(out[0].vertical, int(kCaptionBottom));
+        QCOMPARE(out[1].start, FrameTime(12));
+        QCOMPARE(out[1].end, FrameTime(18));
+        QCOMPARE(out[1].vertical, int(kCaptionMiddle));
+
+        // The English set: accents folded, its own characters kept.
+        QCOMPARE(teletextText("caf\xC3\xA9 \xE2\x80\x9Cok\xE2\x80\x9D"), std::string("cafe \"ok\""));
+        QCOMPARE(teletextToUtf8(teletextText("\xC2\xA3 \xC2\xBD # \xE2\x80\x94")), std::string("\xC2\xA3 \xC2\xBD # \xE2\x80\x94"));
+
+        // A caption distribution packet for the same cc_data, and back.
+        const auto cc = captionCcData(one, pal, 30, true, true);
+        const std::vector<uint8_t> cdp = captionCdp(cc[5], pal, 5);
+        QCOMPARE(int(cdp[0]), 0x96);
+        QCOMPARE(int(cdp[3]) >> 4, 3);  // 25 frames a second
+        std::vector<CcTriplet> ccBack;
+        QVERIFY(parseCdp(cdp.data(), cdp.size(), ccBack));
+        QVERIFY(ccBack == cc[5]);
+        std::vector<uint8_t> broken = cdp;
+        broken[12] ^= 0x10;
+        ccBack.clear();
+        QVERIFY(!parseCdp(broken.data(), broken.size(), ccBack));
     }
 
     void suggestingChapters() {

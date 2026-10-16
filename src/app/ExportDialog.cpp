@@ -15,6 +15,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QPlainTextEdit>
 #include <QPointF>
 #include <QProgressBar>
 #include <QPushButton>
@@ -35,6 +36,7 @@
 #include "SequenceSettingsDialog.h"
 #include "Theme.h"
 #include "core/History.h"
+#include "render/BroadcastMxf.h"
 #include "render/ColorSpace.h"
 #include "render/Stereo.h"
 
@@ -235,6 +237,52 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     startTc_->setToolTip(tr("The file's starting timecode, as broadcasters ask (often 10:00:00:00); MXF and MOV keep it"));
     startTc_->setText(appSettings().value("export/startTimecode").toString());
     form->addRow(tr("Start timecode:"), startTc_);
+    interlaced_ = new QCheckBox(tr("Interlaced, top field first"), form_);
+    interlaced_->setObjectName(QStringLiteral("exportInterlaced"));
+    interlaced_->setToolTip(tr("Coded as two fields, the top first (each picture as both fields: PsF), as 1080i deliveries ask"));
+    interlaced_->setChecked(appSettings().value("export/interlaced", false).toBool());
+    form->addRow(QString(), interlaced_);
+    {
+        auto* row = new QWidget(form_);
+        auto* h = new QHBoxLayout(row);
+        h->setContentsMargins(0, 0, 0, 0);
+        mxfDelivery_ = new QComboBox(row);
+        mxfDelivery_->setObjectName(QStringLiteral("exportMxfDelivery"));
+        mxfDelivery_->setToolTip(tr("MXF as broadcasters' ingest checks it: RDD 9 for MPEG-2 HD 4:2:2, or AMWA AS-11 with its "
+                                    "programme metadata and parts (from markers named Part 1, Part 2... with a duration)"));
+        as11Metadata_ = new QPushButton(tr("AS-11 Metadata..."), row);
+        as11Metadata_->setObjectName(QStringLiteral("exportAs11Metadata"));
+        h->addWidget(mxfDelivery_, 1);
+        h->addWidget(as11Metadata_);
+        form->addRow(tr("MXF delivery:"), row);
+        as11Text_ = appSettings().value("export/as11Metadata").toString();
+        connect(mxfDelivery_, &QComboBox::currentIndexChanged, this, [this] { updateControls(); });
+        connect(as11Metadata_, &QPushButton::clicked, this, [this] { editAs11Metadata(); });
+    }
+    {
+        auto* row = new QWidget(form_);
+        auto* h = new QHBoxLayout(row);
+        h->setContentsMargins(0, 0, 0, 0);
+        ancCaptions_ = new QCheckBox(tr("CEA-708 captions"), row);
+        ancCaptions_->setObjectName(QStringLiteral("exportAncCaptions"));
+        ancCaptions_->setToolTip(tr("The caption track as caption distribution packets (CEA-708 with the 608 bytes) in the file's "
+                                    "ancillary data track (ST 436), as North American broadcasters take them"));
+        ancCaptions_->setChecked(appSettings().value("export/ancCaptions", false).toBool());
+        ancTeletext_ = new QCheckBox(tr("Teletext subtitles, page"), row);
+        ancTeletext_->setObjectName(QStringLiteral("exportAncTeletext"));
+        ancTeletext_->setToolTip(tr("The caption track as OP-47 teletext subtitles in the ancillary data track, as UK, European "
+                                    "and Australian broadcasters take them"));
+        ancTeletext_->setChecked(appSettings().value("export/ancTeletext", false).toBool());
+        teletextPage_ = new QSpinBox(row);
+        teletextPage_->setObjectName(QStringLiteral("exportTeletextPage"));
+        teletextPage_->setRange(100, 899);
+        teletextPage_->setValue(appSettings().value("export/teletextPage", 888).toInt());
+        h->addWidget(ancCaptions_);
+        h->addWidget(ancTeletext_);
+        h->addWidget(teletextPage_);
+        h->addStretch(1);
+        form->addRow(tr("Ancillary data:"), row);
+    }
     smart_ = new QCheckBox(tr("Copy untouched footage (smart render)"), form_);
     smart_->setObjectName(QStringLiteral("exportSmartRender"));
     smart_->setChecked(appSettings().value("export/smartRender", true).toBool());
@@ -584,6 +632,51 @@ bool ExportDialog::rangeFrames(FrameTime& in, FrameTime& out) const {
     return out > in;
 }
 
+void ExportDialog::editAs11Metadata() {
+    QDialog d(this);
+    d.setWindowTitle(tr("AS-11 Metadata"));
+    d.setObjectName(QStringLiteral("as11MetadataDialog"));
+    auto* layout = new QVBoxLayout(&d);
+    auto* help = new QLabel(tr("One property a line, as Name=value, by the names AS-11 and the DPP give them. What is left out "
+                               "comes from the sequence: its name as the titles, the languages, captions, loudness standard, "
+                               "the line-up and clock from markers named Line-up and Clock, and the parts from markers with a "
+                               "duration named Part 1, Part 2... The DPP also needs ProductionNumber, Synopsis, Originator, "
+                               "ContactEmail and ContactTelephoneNumber."),
+                            &d);
+    help->setWordWrap(true);
+    layout->addWidget(help);
+    auto* edit = new QPlainTextEdit(&d);
+    edit->setObjectName(QStringLiteral("as11MetadataText"));
+    QString text = as11Text_;
+    if (text.trimmed().isEmpty()) {
+        // A start: the DPP's properties that have no default, then the titles.
+        for (const char* k : {"SeriesTitle", "ProgrammeTitle", "EpisodeTitleNumber", "ProductionNumber", "Synopsis", "Originator",
+                              "ContactEmail", "ContactTelephoneNumber"})
+            text += QString::fromLatin1(k) + QStringLiteral("=\n");
+    }
+    edit->setPlainText(text);
+    QStringList names;
+    for (const std::string& n : as11CoreProperties()) names << QString::fromStdString(n);
+    for (const std::string& n : ukDppProperties()) names << QString::fromStdString(n);
+    edit->setToolTip(names.join(QStringLiteral(", ")));
+    layout->addWidget(edit, 1);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &d);
+    connect(buttons, &QDialogButtonBox::accepted, &d, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &d, &QDialog::reject);
+    layout->addWidget(buttons);
+    d.resize(560, 420);
+    if (d.exec() != QDialog::Accepted) return;
+    // Lines with nothing after the = are left out (their defaults apply).
+    QStringList kept;
+    for (const QString& line : edit->toPlainText().split(QLatin1Char('\n'))) {
+        const int eq = line.indexOf(QLatin1Char('='));
+        if (line.trimmed().isEmpty()) continue;
+        if (eq > 0 && line.mid(eq + 1).trimmed().isEmpty()) continue;
+        kept << line.trimmed();
+    }
+    as11Text_ = kept.join(QLatin1Char('\n'));
+}
+
 void ExportDialog::updateControls() {
     const ExportPreset* p = currentPreset();
     const bool video = p && hasVideo(p->settings);
@@ -626,6 +719,38 @@ void ExportDialog::updateControls() {
     const bool anyChapters = seq && std::any_of(seq->markers.begin(), seq->markers.end(), [](const Marker& m) { return m.chapter; });
     chapters_->setEnabled(chapterFile && anyChapters);
     startTc_->setEnabled(ext == QLatin1String("mxf") || ext == QLatin1String("mov"));
+    {
+        // The deliveries the preset's codec can make: RDD 9 and X8 for MPEG-2 HD, the DPP's and X2 for AVC-Intra.
+        const std::string vc = p ? p->settings.videoCodec : std::string();
+        const bool mpeg2 = vc == "mpeg2video", avci = vc == "libx264" && p && p->settings.profile == "avci100";
+        const QString was = mxfDelivery_->currentData().toString();
+        QList<QPair<QString, QString>> items = {{tr("OP1a as encoded"), QString()}};
+        if (mpeg2) items += {{tr("RDD 9 (MPEG-2 HD 4:2:2)"), QStringLiteral("rdd9")}, {tr("AS-11 X8 (NABA, MPEG-2 HD)"), QStringLiteral("as11-x8")}};
+        if (avci) items += {{tr("AS-11 UK DPP HD (1080i25)"), QStringLiteral("as11-dpp")}, {tr("AS-11 X2 (AVC-Intra HD)"), QStringLiteral("as11-x2")}};
+        bool same = mxfDelivery_->count() == items.size();
+        for (int i = 0; same && i < items.size(); ++i) same = mxfDelivery_->itemData(i).toString() == items[i].second;
+        if (!same) {
+            const QSignalBlocker block(mxfDelivery_);
+            mxfDelivery_->clear();
+            for (const auto& [label, key] : items) mxfDelivery_->addItem(label, key);
+            const QString wanted = was.isEmpty() && !initialisedMxf_ ? appSettings().value("export/mxfDelivery").toString() : was;
+            mxfDelivery_->setCurrentIndex(std::max(0, mxfDelivery_->findData(wanted)));
+            initialisedMxf_ = true;
+        }
+        const bool deliverable = ext == QLatin1String("mxf") && (mpeg2 || avci) && broadcastMxfAvailable();
+        mxfDelivery_->setEnabled(deliverable);
+        const QString d = deliverable ? mxfDelivery_->currentData().toString() : QString();
+        as11Metadata_->setEnabled(d.startsWith(QLatin1String("as11")));
+        const bool anyCaptions = ct && !ct->captions.empty();
+        ancCaptions_->setEnabled(!d.isEmpty() && anyCaptions);
+        ancTeletext_->setEnabled(!d.isEmpty() && anyCaptions);
+        teletextPage_->setEnabled(ancTeletext_->isEnabled());
+        if (!mxfDelivery_->isEnabled())
+            mxfDelivery_->setToolTip(!broadcastMxfAvailable() ? tr("This build of Montage has no broadcast MXF writer (bmx)")
+                                                               : tr("For the MPEG-2 HD and AVC-Intra 100 MXF presets"));
+        // The DPP's HD is 1080i: coded interlaced whatever the box says.
+        interlaced_->setEnabled(video && (vc == "mpeg2video" || vc == "libx264" || vc == "prores_ks") && d != "as11-dpp");
+    }
     if (credentials_) {
         ExportSettings would = p ? p->settings : ExportSettings{};
         would.path = ("x." + ext).toStdString();
@@ -826,6 +951,21 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         s.startTimecode = formatTimecode(t, fps);
     }
     settings.setValue("export/startTimecode", startTc_->text().trimmed());
+    s.interlaced = interlaced_->isEnabled() && interlaced_->isChecked();
+    settings.setValue("export/interlaced", interlaced_->isChecked());
+    if (mxfDelivery_->isEnabled()) {
+        s.mxfDelivery = mxfDelivery_->currentData().toString().toStdString();
+        settings.setValue("export/mxfDelivery", mxfDelivery_->currentData());
+        if (s.mxfDelivery.rfind("as11", 0) == 0)
+            for (const QString& line : as11Text_.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) s.as11Metadata.push_back(line.trimmed().toStdString());
+        s.ancCaptions = ancCaptions_->isEnabled() && ancCaptions_->isChecked();
+        s.ancTeletext = ancTeletext_->isEnabled() && ancTeletext_->isChecked();
+        s.teletextPage = teletextPage_->value();
+    }
+    settings.setValue("export/ancCaptions", ancCaptions_->isChecked());
+    settings.setValue("export/ancTeletext", ancTeletext_->isChecked());
+    settings.setValue("export/teletextPage", teletextPage_->value());
+    settings.setValue("export/as11Metadata", as11Text_);
     s.smartRender = smart_->isChecked();
     settings.setValue("export/smartRender", smart_->isChecked());
     if (hasVideo(s)) s.colorSpace = color_->currentData().toString().toStdString();

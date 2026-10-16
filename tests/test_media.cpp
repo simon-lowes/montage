@@ -75,6 +75,7 @@
 #include "media/SpeakerSwitch.h"
 #include "media/Tracking.h"
 #include "media/CameraSolve.h"
+#include "render/BroadcastMxf.h"
 #include "render/OGraf.h"
 #include "render/Restoration.h"
 #include "media/Vector.h"
@@ -3938,6 +3939,212 @@ private slots:
         QCOMPARE(timecode, std::string("01:00:00:00"));
         QCOMPARE(streams.size(), size_t(5));
         r = call({{"project", project}, {"output", mcpOut}, {"preset", "DNxHR HQ (MXF)"}, {"start_timecode", "ten o'clock"}});
+        QVERIFY(r.contains("error") || r.value("result").toObject().value("isError").toBool());
+    }
+
+    void broadcastMxfByTheBook() {
+        if (!broadcastMxfAvailable()) QSKIP("Built without bmx");
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.name = "Pilot";
+        s.width = 320;
+        s.height = 180;
+        s.fps = Rational{25, 1};
+        edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "color", 50));
+        {
+            std::vector<float> mono(48000 * 2);
+            for (size_t i = 0; i < mono.size(); ++i) mono[i] = float(0.3 * std::sin(2 * M_PI * 440 * double(i) / 48000));
+            writeMonoWav(path("bmx-tone.wav"), mono, 48000);
+            MediaItem tone = probeOrFail(p, path("bmx-tone.wav"));
+            p.media.push_back(tone);
+            edit::overwrite(p, s, {TrackKind::Audio, 0}, makeClip(p, tone, TrackKind::Audio, s));
+        }
+        CaptionTrack captions;
+        captions.language = "en";
+        captions.captions = {{5, 20, "Hello there", {}}, {25, 40, "Second caption\nat the top", {}}};
+        captions.captions[1].vertical = kCaptionTop;
+        s.captionTracks.push_back(captions);
+        // The DPP's line-up and clock, and two parts, from markers.
+        s.markers = {{0, 0, "Line-up"}, {2, 0, "Clock"}, {5, 20, "Part 1"}, {30, 15, "Part 2"}};
+
+        // AS-11 X8: MPEG-2 HD in RDD 9, the titles given, captions as CEA-708 and teletext in the ST 436 track; to a
+        // file whose name is not ASCII.
+        const ExportPreset* xd = findExportPreset("XDCAM HD422 (MXF)");
+        QVERIFY(xd);
+        ExportSettings st = xd->settings;
+        st.path = path("as11-x8 \xC3\x89pisode.mxf");
+        st.mxfDelivery = "as11-x8";
+        st.as11Metadata = {"SeriesTitle=Test Series", "EpisodeTitleNumber: 1", "AS11ProgrammeTitle=Pilot Episode"};
+        st.ancCaptions = st.ancTeletext = true;
+        st.startTimecode = "10:00:00:00";
+        std::string err;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        QVERIFY(QFileInfo::exists(QString::fromStdString(st.path)));
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(st.path + ".render.mxf")));
+        BroadcastMxfInfo info;
+        QVERIFY2(readBroadcastMxf(st.path, info, &err), err.c_str());
+        QVERIFY2(info.pictureEssence.rfind("MPEG_2_Long_GOP_422P_HL_1080", 0) == 0, info.pictureEssence.c_str());
+        QCOMPARE(info.soundTracks, 8);
+        QCOMPARE(info.duration, int64_t(50));
+        QCOMPARE(info.startTimecode, std::string("10:00:00:00"));
+        QCOMPARE(info.as11Spec, std::string("as11-x8"));
+        QCOMPARE(info.core["ShimName"], std::string("AS-11 X8"));
+        QCOMPARE(info.core["SeriesTitle"], std::string("Test Series"));
+        QCOMPARE(info.core["ProgrammeTitle"], std::string("Pilot Episode"));
+        QCOMPARE(info.core["EpisodeTitleNumber"], std::string("1"));
+        QCOMPARE(info.core["PrimaryAudioLanguage"], std::string("eng"));
+        QCOMPARE(info.core["ClosedCaptionsPresent"], std::string("true"));
+        QCOMPARE(info.core["ClosedCaptionsLanguage"], std::string("eng"));
+        QVERIFY(info.dpp.empty());
+        QCOMPARE(info.parts.size(), size_t(2));
+        QVERIFY((info.parts[0] == MxfPart{5, 20, 1, 2}));
+        QVERIFY((info.parts[1] == MxfPart{30, 15, 2, 2}));
+        QCOMPARE(info.anc.size(), size_t(50));
+        std::vector<Caption> cea, teletext;
+        ancCaptions(info, 888, cea, teletext);
+        QCOMPARE(teletext.size(), size_t(2));
+        QCOMPARE(teletext[0].text, std::string("Hello there"));
+        QCOMPARE(teletext[0].start, FrameTime(5));
+        QCOMPARE(teletext[0].end, FrameTime(20));
+        QCOMPARE(teletext[1].text, std::string("Second caption\nat the top"));
+        QCOMPARE(teletext[1].vertical, int(kCaptionTop));
+        QCOMPARE(cea.size(), size_t(2));
+        QCOMPARE(cea[0].text, std::string("Hello there"));
+        QVERIFY2(std::llabs(cea[0].start - 5) <= 1 && std::llabs(cea[1].start - 25) <= 1, qPrintable(QString::number(cea[0].start)));
+        // FFmpeg still reads it: the picture and the eight tracks.
+        {
+            AVFormatContext* fmt = nullptr;
+            QVERIFY(avformat_open_input(&fmt, st.path.c_str(), nullptr, nullptr) >= 0);  // (FFmpeg's paths are UTF-8)
+            avformat_find_stream_info(fmt, nullptr);
+            int video = 0, audio = 0;
+            for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+                video += fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO;
+                audio += fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO;
+            }
+            avformat_close_input(&fmt);
+            QCOMPARE(video, 1);
+            QCOMPARE(audio, 8);
+        }
+
+        // UK DPP HD: AVC-Intra 100 coded 1080i25, the DPP's framework with the line-up, clock and parts from the markers.
+        const ExportPreset* avci = findExportPreset("AVC-Intra 100 (MXF)");
+        QVERIFY(avci);
+        st = avci->settings;
+        st.path = path("dpp.mxf");
+        st.mxfDelivery = "as11-dpp";
+        st.loudnessTarget = -23;
+        st.as11Metadata = {"ProductionNumber=ABC/123/01", "Synopsis=A test.", "ContactEmail=test@example.com"};
+        QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err));  // (refused before rendering)
+        QCOMPARE(err, std::string("The UK DPP's metadata needs Originator, ContactTelephoneNumber"));
+        st.as11Metadata.push_back("Originator=Test Productions");
+        st.as11Metadata.push_back("ContactTelephoneNumber=020 7946 0000");
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        QVERIFY2(readBroadcastMxf(st.path, info, &err), err.c_str());
+        QCOMPARE(info.pictureEssence, std::string("AVCI_100_1080i"));
+        QVERIFY(info.separateFields);
+        QCOMPARE(info.soundTracks, 4);
+        QCOMPARE(info.core["ShimName"], std::string("UK DPP HD"));
+        QCOMPARE(info.core["ShimVersion"], std::string("1.1"));
+        QCOMPARE(info.core["ProgrammeTitle"], std::string("Pilot"));
+        QCOMPARE(info.core["SeriesTitle"], std::string("Pilot"));
+        QCOMPARE(info.core["ClosedCaptionsPresent"], std::string("false"));
+        QCOMPARE(info.dpp["ProductionNumber"], std::string("ABC/123/01"));
+        QCOMPARE(info.dpp["Synopsis"], std::string("A test."));
+        QCOMPARE(info.dpp["ContactEmail"], std::string("test@example.com"));
+        QCOMPARE(info.dpp["LineUpStart"], std::string("0"));
+        QCOMPARE(info.dpp["IdentClockStart"], std::string("2"));
+        QCOMPARE(info.dpp["TotalNumberOfParts"], std::string("2"));
+        QCOMPARE(info.dpp["TotalProgrammeDuration"], std::string("35"));
+        QCOMPARE(info.dpp["AudioLoudnessStandard"], std::string("1"));
+        QCOMPARE(info.dpp["PictureRatio"], std::string("16/9"));
+        QCOMPARE(info.dpp["CompletionDate"], QDate::currentDate().toString(Qt::ISODate).toStdString());
+        QVERIFY(info.anc.empty());
+        {
+            AVFormatContext* fmt = nullptr;
+            QVERIFY(avformat_open_input(&fmt, st.path.c_str(), nullptr, nullptr) >= 0);
+            avformat_find_stream_info(fmt, nullptr);
+            QCOMPARE(int(fmt->streams[0]->codecpar->field_order), int(AV_FIELD_TT));
+            avformat_close_input(&fmt);
+        }
+
+        // Plain RDD 9: no AS-11 metadata; the whole programme one part when there are no part markers.
+        st = xd->settings;
+        st.path = path("rdd9.mxf");
+        st.mxfDelivery = "rdd9";
+        st.out = 10;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        QVERIFY2(readBroadcastMxf(st.path, info, &err), err.c_str());
+        QVERIFY(info.core.empty() && info.parts.empty() && info.as11Spec.empty());
+        QCOMPARE(info.duration, int64_t(10));
+
+        // Refused before rendering: the wrong codec for the delivery, a property AS-11 has not, not 25 for the DPP.
+        st.mxfDelivery = "as11-x2";
+        QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err));
+        QVERIFY2(err.find("AVC-Intra") != std::string::npos, err.c_str());
+        st = avci->settings;
+        st.path = path("bad.mxf");
+        st.mxfDelivery = "as11-x2";
+        st.as11Metadata = {"Colour=red"};
+        QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err));
+        QVERIFY2(err.find("Colour") != std::string::npos, err.c_str());
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(st.path)));
+        // A value AS-11 does not take, refused before the render rather than after it.
+        int renderedFrames = 0;
+        st.as11Metadata = {"ClosedCaptionsPresent=yes"};
+        QVERIFY(!exportSequence(p, s, st, [&](double, FrameTime) { ++renderedFrames; }, nullptr, &err));
+        QVERIFY2(err.find("ClosedCaptionsPresent") != std::string::npos, err.c_str());
+        QCOMPARE(renderedFrames, 0);
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(st.path)) && !QFileInfo::exists(QString::fromStdString(st.path + ".render.mxf")));
+        Sequence ntsc = s;
+        ntsc.fps = Rational{30000, 1001};
+        st.as11Metadata.clear();
+        st.mxfDelivery = "as11-dpp";
+        QVERIFY(!exportSequence(p, ntsc, st, nullptr, nullptr, &err));
+        QVERIFY2(err.find("25") != std::string::npos, err.c_str());
+
+        // A rewrap told to stop part way leaves no file, and one let run reports its progress to the end.
+        st = xd->settings;
+        st.path = path("op1a.mxf");
+        st.out = 10;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        BroadcastMxfOptions rdd9;
+        double reached = 0;
+        QVERIFY(!rewrapBroadcastMxf(st.path, path("stopped.mxf"), rdd9, &err, [&](double f) { return (reached = f) < 0.5; }));
+        QCOMPARE(err, std::string("Export cancelled"));
+        QVERIFY(reached >= 0.5 && reached < 0.7);
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(path("stopped.mxf"))));
+        QVERIFY2(rewrapBroadcastMxf(st.path, path("whole.mxf"), rdd9, &err, [&](double f) { return (reached = f) <= 1; }), err.c_str());
+        QCOMPARE(reached, 1.0);
+
+        // Over MCP: AS-11 X2 with metadata, then read back.
+        const QString project = QString::fromStdString(path("bmx.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QString& tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object();
+        };
+        const QString mcpOut = QString::fromStdString(path("x2.mxf"));
+        QJsonObject r = call("montage_render", {{"project", project}, {"output", mcpOut}, {"preset", "AVC-Intra 100 (MXF)"}, {"out", "00:00:00:20"},
+                                                {"mxf_delivery", "as11-x2"}, {"interlaced", true}, {"anc_captions", "teletext"},
+                                                {"as11", QJsonObject{{"SeriesTitle", "Over MCP"}, {"AudioTrackLayout", 3}}}});
+        QVERIFY2(!r.value("result").toObject().value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call("montage_read_broadcast_mxf", {{"file", mcpOut}});
+        const QJsonObject read = r.value("result").toObject().value("structuredContent").toObject();
+        QVERIFY2(read.value("as11_spec").toString() == "as11-x2", QJsonDocument(r).toJson().constData());
+        QCOMPARE(read.value("interlaced").toBool(), true);
+        QCOMPARE(read.value("core").toObject().value("SeriesTitle").toString(), QStringLiteral("Over MCP"));
+        QCOMPARE(read.value("parts").toArray().size(), 1);  // (part 1 cut at the range's end; part 2 outside it)
+        QCOMPARE(read.value("teletext_subtitles").toArray().size(), 1);
+        r = call("montage_render", {{"project", project}, {"output", mcpOut}, {"preset", "AVC-Intra 100 (MXF)"}, {"anc_captions", "both"}});
+        QVERIFY(r.contains("error") || r.value("result").toObject().value("isError").toBool());
+        // AS-11 metadata for a delivery without AS-11 is refused, not dropped.
+        r = call("montage_render", {{"project", project}, {"output", QString::fromStdString(path("r.mxf"))}, {"preset", "XDCAM HD422 (MXF)"},
+                                    {"mxf_delivery", "rdd9"}, {"as11", QJsonObject{{"SeriesTitle", "Lost"}}}});
         QVERIFY(r.contains("error") || r.value("result").toObject().value("isError").toBool());
     }
 

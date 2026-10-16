@@ -45,4 +45,14 @@ std::string captionsToMcc(const std::vector<Caption>& captions, Rational fps, co
 // Reads MCC: its 708 service 1 when it has pop-on captions, else 608 channel 1 (else the 708 there is).
 bool parseMcc(const std::string& text, Rational fps, std::vector<Caption>& out, std::string* error = nullptr);
 
+// A SMPTE 334-2 caption distribution packet (CDP) of one frame's cc_data (at most 31 entries) at `fps` (the CDP's
+// rate code: 23.976 to 60, else 29.97), numbered `sequence`: what an ANC packet with DID 61h and SDID 01h carries in
+// SDI, MCC files and MXF ST 436 tracks. And its cc_data back (with `checksum`, only when its bytes add up to 0).
+std::vector<uint8_t> captionCdp(const std::vector<CcTriplet>& cc, Rational fps, uint16_t sequence);
+bool parseCdp(const uint8_t* data, size_t size, std::vector<CcTriplet>& out, bool checksum = true);
+// Captions from cc_data and when each came (seconds, in order), as parseMcc reads them: 708 service 1 when it has
+// pop-on captions, else 608 channel 1 (else the 708 there is).
+bool captionsFromCc(const std::vector<std::pair<double, CcTriplet>>& triplets, Rational fps, std::vector<Caption>& out,
+                    std::string* error = nullptr);
+
 }  // namespace montage
