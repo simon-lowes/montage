@@ -272,6 +272,7 @@ bool readExrInfo(const std::string& file, ExrInfo& out, std::string* error) {
             for (const auto& [key, name] : cryptoKeys(h)) {
                 Cryptomatte c;
                 c.name = name;
+                c.part = p;
                 std::map<int, std::array<std::string, 4>> groups;
                 for (auto it = h.channels().begin(); it != h.channels().end(); ++it) {
                     std::string prefix, suffix;
@@ -536,13 +537,10 @@ bool readCryptomatte(const std::string& file, const std::string& name, Cryptomat
     }
     try {
         Imf::MultiPartInputFile in(file.c_str());
-        // The part holding its channels.
-        int part = 0;
-        for (int p = 0; p < in.parts(); ++p)
-            if (in.header(p).channels().findChannel(c->channels[0])) {
-                part = p;
-                break;
-            }
+        // The part holding its channels (parts' channels are named alike: CryptoObject00 in each).
+        const int part = c->part;
+        if (part < 0 || part >= in.parts() || !in.header(part).channels().findChannel(c->channels[0]))
+            throw std::runtime_error("its Cryptomatte is not where its header said");
         const Imf::Header& h = in.header(part);
         const Imath::Box2i disp = in.header(0).displayWindow(), dw = h.dataWindow();
         out.width = disp.max.x - disp.min.x + 1;

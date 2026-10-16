@@ -9,6 +9,7 @@
 #include <memory>
 
 #include "core/Model.h"
+#include "DisplayCalibration.h"
 #include "render/HdrView.h"
 
 class QLabel;
@@ -40,6 +41,8 @@ public:
     void setSignal(const QImage& signal, montage::FrameTime t, const QString& space);
     // The picture as drawn (with the exposure check), for testing.
     QImage shownImage() const;
+    // That through the display's calibration LUT (app/DisplayCalibration.h), as it reaches the screen.
+    QImage drawnImage();
     void setDragSource(bool on) { dragSource_ = on; }
     // Drawn over the picture, in the order added; each gets the rectangle the picture occupies.
     void addOverlay(std::function<void(QPainter&, const QRectF&)> paint) { overlays_.push_back(std::move(paint)); }
@@ -75,7 +78,9 @@ public:
     bool hdrViewer() const { return hdrWanted_; }
     void setHdrPicture(montage::HdrPicturePtr picture);  // null: none (an SDR sequence)
     bool hdrShowing() const;
-    double hdrHeadroom() const;  // the display's peak over its SDR white, 1 when not showing HDR
+    double hdrHeadroom() const;
+    // The nits the HDR viewer shows SDR white at, where the system says; else BT.2408's 203.
+    double hdrSdrWhiteNits() const;  // the display's peak over its SDR white, 1 when not showing HDR
     QString hdrStatus() const { return hdrStatus_; }  // why HDR is not showing, when asked for
     // The viewer's drawing without the picture (its area transparent), as the HDR surface draws it over the picture.
     QImage overlayImage();
@@ -83,6 +88,7 @@ public:
 
 signals:
     void hdrChanged();
+    void displayMoved();  // its window moved to another screen
     void dragRequested();
     void lookStarted();
     void lookMoved(double dx, double dy);  // since the press
@@ -103,6 +109,7 @@ private:
     void refreshOverlay(bool changed);  // false: uploaded only if it differs from the last
 
     QImage image_;
+    CalibratedPicture calibrated_[4];  // the picture, the compare reference, the two-up halves
     QImage compare_;
     QString compareLabel_;
     bool twoUp_ = false;
@@ -132,6 +139,8 @@ private:
     QImage lastOverlay_;
     QPointer<QWindow> watchedWindow_;  // the top-level window whose display changes are watched
     QMetaObject::Connection screenWatch_;
+    QPointer<QWindow> calibrationWindow_;  // the top-level window whose screen picks the calibration
+    QMetaObject::Connection calibrationWatch_;
     bool lastShowing_ = false, lastWanted_ = false;  // what hdrChanged last said
     double lastHeadroom_ = 1;
     QString lastStatus_;

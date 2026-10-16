@@ -1,4 +1,6 @@
 #include "MainWindow.h"
+#include "MonitorCalibrationDialog.h"
+#include "PatchGenerator.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
 #include "render/OGraf.h"
@@ -2055,6 +2057,8 @@ void MainWindow::buildMenus() {
         output->addSeparator();
         output->addAction(referenceOutputAction_);
         output->addAction(remoteReviewAction_);
+        output->addSeparator();
+        output->addAction(monitorCalibrationAction_);
     });
     // To a broadcast monitor: SDI/HDMI through a DeckLink card, or NDI (render/ReferenceOutput.h).
     referenceOutput_ = new ReferenceOutputController(program_, this);
@@ -2086,6 +2090,13 @@ void MainWindow::buildMenus() {
     connect(remoteReview_, &RemoteReviewController::markersReceived, this,
             [this](Id seq, const std::vector<output::RemoteMarker>& markers) { applyRemoteMarkers(seq, markers); });
     addAction(remoteReviewAction_);
+    // Each display's calibration LUT, and the patch generator calibration software measures them through.
+    patchGenerator_ = new PatchGenerator(referenceOutput_, this, this);
+    monitorCalibrationAction_ = new QAction(tr("Monitor Calibration…"), this);
+    monitorCalibrationAction_->setObjectName(QStringLiteral("monitorCalibrationAction"));
+    monitorCalibrationAction_->setToolTip(tr("A calibration LUT for each display and the reference output, and a patch generator for calibration software"));
+    connect(monitorCalibrationAction_, &QAction::triggered, this, [this] { showMonitorCalibration(); });
+    addAction(monitorCalibrationAction_);
     if (liveLink_)
         liveLink_->addAppTool(RemoteReviewController::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
             return remoteReview_->runTool(args, structured, isError);
@@ -2516,6 +2527,18 @@ void MainWindow::showReferenceOutput() {
         return;
     }
     (new ReferenceOutputPanel(referenceOutput_, this))->show();
+}
+
+MonitorCalibrationDialog* MainWindow::showMonitorCalibration() {
+    if (auto* open = findChild<MonitorCalibrationDialog*>(QStringLiteral("monitorCalibration"))) {
+        open->raise();
+        open->activateWindow();
+        return open;
+    }
+    auto* d = new MonitorCalibrationDialog(patchGenerator_, referenceOutput_, this);
+    d->setAttribute(Qt::WA_DeleteOnClose);
+    d->show();
+    return d;
 }
 
 void MainWindow::rebuildSourceProject() {

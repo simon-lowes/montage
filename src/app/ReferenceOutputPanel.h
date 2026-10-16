@@ -41,6 +41,8 @@ public:
     std::shared_ptr<output::Scheduler> scheduler() const { return scheduler_; }
     std::shared_ptr<output::Backend> backend() const { return backend_; }
     const output::Device& device() const { return device_; }
+    // Its device's calibration target (app/DisplayCalibration.h); empty when not running.
+    QString calibrationTarget() const;
 
     // The agent link's montage_reference_output (app/LiveLink.h): list, status, start or stop.
     static QByteArray toolJson();

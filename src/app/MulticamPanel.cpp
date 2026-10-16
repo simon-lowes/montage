@@ -1,5 +1,6 @@
 #include "MulticamPanel.h"
 #include "Settings.h"
+#include "DisplayCalibration.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -49,6 +50,7 @@ public:
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
         setCursor(Qt::PointingHandCursor);
         setObjectName(QStringLiteral("angle%1").arg(index + 1));
+        connect(&DisplayCalibration::instance(), &DisplayCalibration::changed, this, qOverload<>(&QWidget::update));
     }
     void setImage(const QImage& img) {
         image_ = img;
@@ -75,7 +77,7 @@ protected:
             QRect r(QPoint(0, 0), s);
             r.moveCenter(rect().center());
             p.setRenderHint(QPainter::SmoothPixmapTransform);
-            p.drawImage(r, image_);
+            p.drawImage(r, calibrated_.get(image_, DisplayCalibration::instance().screenLut(screen())));  // (this display's calibration)
         }
         QFont f = p.font();
         f.setBold(true);
@@ -102,6 +104,7 @@ private:
     int index_;
     MulticamPanel* panel_;
     QImage image_;
+    CalibratedPicture calibrated_;
     QString name_;
     bool live_ = false, playing_ = false;
 };

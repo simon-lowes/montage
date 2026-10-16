@@ -137,6 +137,17 @@
 #include "media/FaceTracks.h"
 #include "media/DepthMap.h"
 #include "media/Exr.h"
+#ifdef MONTAGE_WITH_OPENEXR
+#include <ImfChannelList.h>
+#include <ImfFrameBuffer.h>
+#include <ImfHeader.h>
+#include <ImfMultiPartOutputFile.h>
+#include <ImfOutputFile.h>
+#include <ImfRgba.h>
+#include <ImfOutputPart.h>
+#include <ImfPartType.h>
+#include <ImfStringAttribute.h>
+#endif
 #include "media/Rife.h"
 #include "media/Matting.h"
 #include "media/TextToSpeech.h"
@@ -21759,6 +21770,44 @@ private slots:
         const std::vector<float> ballMatte = cm.matte(parseCryptomatteIds(cryptomatteHex(ball)));
         QVERIFY(ballMatte[5] == 1.0f && ballMatte[W - 5] == 0.0f);
         QCOMPARE(parseCryptomatteIds(cryptomatteIdList({ball, floor})).size(), size_t(2));
+#ifdef MONTAGE_WITH_OPENEXR
+        // A multi-part file with a Cryptomatte of the same name in each part: each read from its own part.
+        {
+            const int w = 8, h = 4;
+            std::vector<Imf::Header> headers;
+            for (int k = 0; k < 2; ++k) {
+                Imf::Header hd(w, h);
+                hd.setName(k ? "right" : "left");
+                hd.setType(Imf::SCANLINEIMAGE);
+                for (const char* ch : {"R", "G", "B", "A"}) hd.channels().insert(std::string("CryptoObject00.") + ch, Imf::Channel(Imf::FLOAT));
+                hd.insert("cryptomatte/0a1b2c3/name", Imf::StringAttribute("CryptoObject"));
+                hd.insert("cryptomatte/0a1b2c3/hash", Imf::StringAttribute("MurmurHash3_32"));
+                hd.insert("cryptomatte/0a1b2c3/conversion", Imf::StringAttribute("uint32_to_float32"));
+                headers.push_back(hd);
+            }
+            {
+                Imf::MultiPartOutputFile out(path("parts.exr").c_str(), headers.data(), 2);
+                for (int k = 0; k < 2; ++k) {
+                    std::vector<float> d(size_t(w) * h * 4);
+                    for (size_t i = 0; i < d.size(); i += 4) d[i] = k ? floor : ball, d[i + 1] = 1, d[i + 2] = d[i + 3] = 0;
+                    Imf::FrameBuffer fb;
+                    for (int c = 0; c < 4; ++c)
+                        fb.insert(std::string("CryptoObject00.") + "RGBA"[c], Imf::Slice(Imf::FLOAT, reinterpret_cast<char*>(d.data() + c), 4 * sizeof(float), size_t(w) * 4 * sizeof(float)));
+                    Imf::OutputPart part(out, k);
+                    part.setFrameBuffer(fb);
+                    part.writePixels(h);
+                }
+            }
+            ExrInfo parts;
+            QVERIFY2(readExrInfo(path("parts.exr"), parts, &err), err.c_str());
+            QCOMPARE(parts.cryptomattes.size(), size_t(2));
+            CryptomatteFrame right, left;
+            QVERIFY2(readCryptomatte(path("parts.exr"), "right.CryptoObject", right, &err), err.c_str());
+            QVERIFY2(readCryptomatte(path("parts.exr"), "left.CryptoObject", left, &err), err.c_str());
+            QCOMPARE(right.idAt(2, 2), floor);
+            QCOMPARE(left.idAt(2, 2), ball);
+        }
+#endif
         // Read as a clip: the main picture, or a layer of it, as stored (HTJ2K needs OpenEXR's reader).
         ImageSequence seq;
         QVERIFY(detectImageSequence(path("render.0001.exr"), seq));
@@ -21834,6 +21883,71 @@ private slots:
         QVERIFY(rgba[(18 * W + 5) * 4] > 0.95f && rgba[(18 * W + 5) * 4 + 1] < 0.05f);  // the plate: diffuse, untouched (red)
         QVERIFY2(readExrLayer(pulled, "Z", pw, ph, rgba, &err), err.c_str());
         QCOMPARE(rgba[0], 5.0f + 1.0f);  // render frame 1 is the pull's 1001 (the cut starts at its first frame, no head handle)
+#ifdef MONTAGE_WITH_OPENEXR
+        // An anamorphic render (2:1 pixels, stored half as wide): its other layers pulled stretched as its picture
+        // is, a Cryptomatte's ids by the nearest sample.
+        {
+            const int sw = W / 2;
+            Imf::Header hd(sw, H);
+            hd.pixelAspectRatio() = 2;
+            for (const char* ch : {"R", "G", "B", "A"}) hd.channels().insert(ch, Imf::Channel(Imf::HALF));
+            hd.channels().insert("Z", Imf::Channel(Imf::FLOAT));
+            for (const char* ch : {"R", "G", "B", "A"}) hd.channels().insert(std::string("CryptoObject00.") + ch, Imf::Channel(Imf::FLOAT));
+            hd.insert("cryptomatte/0a1b2c3/name", Imf::StringAttribute("CryptoObject"));
+            hd.insert("cryptomatte/0a1b2c3/hash", Imf::StringAttribute("MurmurHash3_32"));
+            hd.insert("cryptomatte/0a1b2c3/conversion", Imf::StringAttribute("uint32_to_float32"));
+            std::vector<Imf::Rgba> rgbaPx(size_t(sw) * H, Imf::Rgba(0.5f, 0.5f, 0.5f, 1.0f));
+            std::vector<float> z(size_t(sw) * H), crypto(size_t(sw) * H * 4, 0.0f);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < sw; ++x) {
+                    const bool left = x < sw / 2;
+                    z[size_t(y) * sw + x] = left ? 1.0f : 2.0f;
+                    crypto[(size_t(y) * sw + x) * 4] = left ? ball : floor;
+                    crypto[(size_t(y) * sw + x) * 4 + 1] = 1;
+                }
+            QDir().mkpath(QString::fromStdString(path("ana")));
+            for (int n = 1; n <= 4; ++n) {
+                char name[64];
+                std::snprintf(name, sizeof name, "ana/squeezed.%04d.exr", n);
+                Imf::OutputFile out(path(name).c_str(), hd);
+                Imf::FrameBuffer fb;
+                const char* rgbaNames[4] = {"R", "G", "B", "A"};
+                for (int k = 0; k < 4; ++k)
+                    fb.insert(rgbaNames[k], Imf::Slice(Imf::HALF, reinterpret_cast<char*>(&rgbaPx[0]) + k * sizeof(half), sizeof(Imf::Rgba), size_t(sw) * sizeof(Imf::Rgba)));
+                fb.insert("Z", Imf::Slice(Imf::FLOAT, reinterpret_cast<char*>(z.data()), sizeof(float), size_t(sw) * sizeof(float)));
+                for (int k = 0; k < 4; ++k)
+                    fb.insert(std::string("CryptoObject00.") + rgbaNames[k],
+                              Imf::Slice(Imf::FLOAT, reinterpret_cast<char*>(crypto.data() + k), 4 * sizeof(float), size_t(sw) * 4 * sizeof(float)));
+                out.setFrameBuffer(fb);
+                out.writePixels(H);
+            }
+            ImageSequence aseq;
+            QVERIFY(detectImageSequence(path("ana/squeezed.0001.exr"), aseq));
+            aseq.fps = {24, 1};
+            Project ap = makeDefaultProject();
+            Sequence& as = *ap.active();
+            as.width = W, as.height = H, as.fps = {24, 1};
+            MediaItem am = probeOrFail(ap, imageSequencePath(aseq));
+            QCOMPARE(am.width, W);  // (shown at its pixels' shape)
+            ap.media.push_back(am);
+            Clip ac = makeClip(ap, am, TrackKind::Video, as);
+            ac.duration = 4;
+            edit::overwrite(ap, as, {TrackKind::Video, 0}, ac);
+            VfxPullOptions ao;
+            ao.folder = path("ana-pulls");
+            ao.sourceLayers = true;
+            std::vector<VfxShot> ashots;
+            QVERIFY2(exportVfxPulls(ap, as, {as.videoTracks[0].clips.at(0).id}, ao, &ashots, nullptr, nullptr, &err), err.c_str());
+            const std::string apulled = ashots.at(0).folder + "/" + ashots[0].name + ".1001.exr";
+            QVERIFY2(readExrLayer(apulled, "Z", pw, ph, rgba, &err), err.c_str());
+            QCOMPARE(pw, W);
+            QCOMPARE(rgba[(18 * W + 5) * 4], 1.0f);
+            QCOMPARE(rgba[(18 * W + W - 5) * 4], 2.0f);  // (not black past the stored width)
+            CryptomatteFrame acm;
+            QVERIFY2(readCryptomatte(apulled, "", acm, &err), err.c_str());
+            QVERIFY(acm.idAt(5, 18) == ball && acm.idAt(W - 5, 18) == floor);
+        }
+#endif
         // An export in HTJ2K (32 lines), and in FFmpeg's ZIP as before.
         ExportSettings st;
         st.videoCodec = "exr";

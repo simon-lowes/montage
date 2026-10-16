@@ -28,6 +28,7 @@ struct ExrLayer {
 struct Cryptomatte {
     std::string name;                                // e.g. CryptoObject
     std::vector<std::string> channels;               // id, coverage, id, coverage... by rank
+    int part = 0;                                    // the file's part holding them
     std::vector<std::pair<std::string, float>> objects;  // the manifest: names and their ids, by name
     std::string objectName(float id) const;          // "" when the manifest doesn't have it
 };

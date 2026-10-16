@@ -13,6 +13,7 @@
 #include <cmath>
 #include <complex>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <set>
@@ -52,6 +53,7 @@
 #include <QTcpServer>
 #include <QUdpSocket>
 #include <QTcpSocket>
+#include <QNetworkProxy>
 #include <thread>
 #include <QPainter>
 #include <QElapsedTimer>
@@ -78,6 +80,7 @@
 #include "render/VideoFx.h"
 #include "render/VideoPacking.h"
 #include "render/ReferenceOutput.h"
+#include "render/MonitorCalibration.h"
 #include "audio/DynLib.h"
 #include <random>
 #include "render/Restoration.h"
@@ -2235,6 +2238,72 @@ colorspaces:
             for (int x = 0; x < W; ++x) black.at(x, y)[3] = 1;
         applyVideoEffect(fog, 0, black, 1.0);
         QVERIFY2(lum(black, 80, 0) < 0.01f && lum(black, 80, H - 1) > 0.7f, qPrintable(QString("%1 %2").arg(lum(black, 80, 0)).arg(lum(black, 80, H - 1))));
+    }
+
+    void restorationEdgesAndAlpha() {
+        // A clone at the default softness: every pixel its soft edge reaches is blended by its coverage, none left out
+        // by the box worked on (no square outline).
+        const int W = 120, H = 80;
+        Image img(W, H, Image::Uninitialized{});
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = img.at(x, y);
+                p[0] = p[1] = p[2] = x < 30 ? 1.0f : 0.0f, p[3] = 1;
+            }
+        const Image before = img;
+        const std::vector<std::array<double, 2>> pts{{70, 40}};
+        paintStroke(img, pts, 15, 0.5, -60, 0, false);  // (from the white on the left)
+        const std::vector<float> m = strokeMatte(pts, 15, 0.5, W, H);
+        double worst = 0;
+        int reached = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const float* src = before.at(std::clamp(x - 60, 0, W - 1), y);
+                const float want = before.at(x, y)[0] + (src[0] - before.at(x, y)[0]) * m[size_t(y) * W + x];
+                worst = std::max(worst, double(std::fabs(img.at(x, y)[0] - want)));
+                reached += m[size_t(y) * W + x] > 0 && std::hypot(x - 70.0, y - 40.0) > 17;
+            }
+        QVERIFY2(worst < 1e-5, std::to_string(worst).c_str());
+        QVERIFY(reached > 0);  // (the soft edge runs past the radius and 2 pixels)
+        // Heal is seamless all round: no step where the stroke's area meets the picture.
+        Image grad(W, H, Image::Uninitialized{});
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* p = grad.at(x, y);
+                p[0] = p[1] = p[2] = 0.2f + 0.004f * float(x), p[3] = 1;
+            }
+        Image healed = grad;
+        paintStroke(healed, pts, 15, 0.5, -40, 0, true);
+        double step = 0;
+        for (int y = 1; y < H - 1; ++y)
+            for (int x = 1; x < W - 1; ++x) step = std::max(step, double(std::fabs((healed.at(x + 1, y)[0] - healed.at(x, y)[0]) - 0.004f)));
+        QVERIFY2(step < 0.004, std::to_string(step).c_str());
+
+        // Into a transparent area from an opaque one (premultiplied): alpha follows the colour.
+        Image cut(W, H);  // transparent black
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < 30; ++x) {
+                float* p = cut.at(x, y);
+                p[0] = 0.8f, p[1] = 0.4f, p[2] = 0.2f, p[3] = 1;
+            }
+        Image cloned = cut;
+        paintStroke(cloned, pts, 15, 0.5, -60, 0, false);
+        const float* c = cloned.at(70, 40);
+        QVERIFY(std::fabs(c[3] - 1) < 1e-5f && std::fabs(c[0] - 0.8f) < 1e-5f);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) QVERIFY(cloned.at(x, y)[0] <= cloned.at(x, y)[3] + 1e-5f);
+        Image patched = cut;
+        std::vector<float> square(size_t(W) * H, 0.0f);
+        for (int y = 30; y < 50; ++y)
+            for (int x = 60; x < 80; ++x) square[size_t(y) * W + x] = 1;
+        pasteShifted(patched, square, -50, 0, false);
+        QVERIFY(std::fabs(patched.at(70, 40)[3] - 1) < 1e-5f);  // (copied: opaque)
+        // Blended seamlessly into the transparent area round it: its colour and alpha alike, never more colour than alpha.
+        patched = cut;
+        pasteShifted(patched, square, -50, 0, true);
+        for (int y = 28; y < 52; ++y)
+            for (int x = 58; x < 82; ++x)
+                for (int k = 0; k < 3; ++k) QVERIFY(patched.at(x, y)[k] <= patched.at(x, y)[3] + 0.01f);
     }
 
     void restorationKernels() {
@@ -6633,6 +6702,271 @@ colorspaces:
         QCOMPARE(dl->receivers(), -1);
     }
 
+    void monitorCalibration() {
+        using namespace montage::output;
+        // A .3dl: 5-point lattice (10-bit input), 12-bit output, blue varying fastest. This one swaps red and blue and
+        // halves green, so the order shows.
+        auto make3dl = [](bool header, int points) {
+            std::string t = header ? "3DMESH\nMesh 2 12\n" : "# a test LUT\n";
+            for (int i = 0; i < points; ++i) t += std::to_string(i * 1023 / (points - 1)) + (i + 1 < points ? " " : "\n");
+            for (int r = 0; r < points; ++r)
+                for (int g = 0; g < points; ++g)
+                    for (int b = 0; b < points; ++b) {
+                        auto v = [&](int i, double k) { return std::to_string(int(std::lround(double(i) / (points - 1) * k * 4095))); };
+                        t += v(b, 1) + " " + v(g, 0.5) + " " + v(r, 1) + "\n";
+                    }
+            return t;
+        };
+        std::string why;
+        for (bool header : {false, true}) {
+            auto lut = parse3dl(make3dl(header, 5), &why);
+            QVERIFY2(lut, why.c_str());
+            QCOMPARE(lut->size, 5);
+            float r = 0.25f, g = 0.5f, b = 1.0f;
+            lut->apply(r, g, b);
+            QVERIFY(std::fabs(r - 1.0f) < 1e-3f && std::fabs(g - 0.25f) < 1e-3f && std::fabs(b - 0.25f) < 1e-3f);
+        }
+        std::string cut3dl = make3dl(false, 5);
+        cut3dl.resize(cut3dl.rfind('\n', cut3dl.size() - 2) + 1);  // (the last entry missing)
+        QVERIFY(!parse3dl(cut3dl, &why));
+        QVERIFY(QString::fromStdString(why).contains("entries"));
+        std::string wrongMesh = make3dl(true, 5);
+        wrongMesh.replace(wrongMesh.find("Mesh 2"), 6, "Mesh 4");
+        QVERIFY(!parse3dl(wrongMesh, &why) && QString::fromStdString(why).contains("17 points"));
+        QVERIFY(!parse3dl("0 512 1023\n1 2\n", &why));
+
+        // Read from files: .cube, .3dl and CLF (baked); anything else refused; a file rewritten is read again.
+        QTemporaryDir dir;
+        auto write = [&](const QString& name, const std::string& text) {
+            const QString path = dir.filePath(name);
+            QFile f(path);
+            f.open(QIODevice::WriteOnly);
+            f.write(text.data(), qint64(text.size()));
+            return path.toStdString();
+        };
+        auto cube = [](float scale) {
+            std::string t = "LUT_3D_SIZE 2\n";
+            for (int b = 0; b < 2; ++b)
+                for (int g = 0; g < 2; ++g)
+                    for (int r = 0; r < 2; ++r) t += std::to_string(r * scale) + " " + std::to_string(g * scale) + " " + std::to_string(b * scale) + "\n";
+            return t;
+        };
+        const std::string cubePath = write(QStringLiteral("display é.cube"), cube(0.5f));
+        auto c1 = loadCalibrationLut(cubePath, &why);
+        QVERIFY2(c1, why.c_str());
+        float r = 1, g = 1, b = 1;
+        c1->apply(r, g, b);
+        QCOMPARE(r, 0.5f);
+        QCOMPARE(loadCalibrationLut(cubePath).get(), c1.get());  // (kept)
+        write(QStringLiteral("display é.cube"), cube(0.25f));
+        std::filesystem::last_write_time(std::filesystem::path(std::u8string(cubePath.begin(), cubePath.end())), std::filesystem::file_time_type::clock::now() + std::chrono::seconds(5));
+        auto c2 = loadCalibrationLut(cubePath, &why);
+        QVERIFY(c2 && c2.get() != c1.get());
+        r = g = b = 1;
+        c2->apply(r, g, b);
+        QCOMPARE(r, 0.25f);
+        QVERIFY2(loadCalibrationLut(write(QStringLiteral("d.3dl"), make3dl(true, 5)), &why), why.c_str());
+        const std::string clf =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ProcessList id=\"half\" compCLFversion=\"3\">\n"
+            "<Matrix inBitDepth=\"32f\" outBitDepth=\"32f\"><Array dim=\"3 3\">0.5 0 0 0 0.5 0 0 0 0.5</Array></Matrix>\n</ProcessList>\n";
+        auto c3 = loadCalibrationLut(write(QStringLiteral("d.clf"), clf), &why);
+        QVERIFY2(c3, why.c_str());
+        QCOMPARE(c3->size, 65);
+        r = 0.8f, g = 0.4f, b = 0.2f;
+        c3->apply(r, g, b);
+        QVERIFY(std::fabs(r - 0.4f) < 1e-4f && std::fabs(g - 0.2f) < 1e-4f && std::fabs(b - 0.1f) < 1e-4f);
+        QVERIFY(!loadCalibrationLut(write(QStringLiteral("d.png"), "x"), &why) && QString::fromStdString(why).contains(".3dl"));
+        QVERIFY(!loadCalibrationLut(dir.filePath(QStringLiteral("missing.cube")).toStdString(), &why));
+        // A file that cannot be read is not read again until it changes (the reason kept).
+        const std::string bad = write(QStringLiteral("bad.cube"), "LUT_3D_SIZE 2\n0 0 0\n");
+        std::string why1, why2;
+        QVERIFY(!loadCalibrationLut(bad, &why1) && !loadCalibrationLut(bad, &why2) && !why1.empty() && why1 == why2);
+        write(QStringLiteral("bad.cube"), cube(1.0f));
+        std::filesystem::last_write_time(std::filesystem::path(std::u8string(bad.begin(), bad.end())), std::filesystem::file_time_type::clock::now() + std::chrono::seconds(9));
+        QVERIFY(loadCalibrationLut(bad, &why));
+
+        // 8-bit pictures through a LUT as Lut3D::apply interpolates it (a curved 17-point LUT, every level checked).
+        auto curved = std::make_shared<Lut3D>();
+        curved->size = 17;
+        for (int bb = 0; bb < 17; ++bb)
+            for (int gg = 0; gg < 17; ++gg)
+                for (int rr = 0; rr < 17; ++rr) {
+                    const float x = rr / 16.0f, y = gg / 16.0f, z = bb / 16.0f;
+                    curved->data.insert(curved->data.end(), {std::pow(x, 1.2f) * 0.9f + 0.02f * z, std::sqrt(y) * 0.95f, z * z * 0.5f + 0.4f * x});
+                }
+        QImage pic(256, 4, QImage::Format_RGB32);  // (converted)
+        for (int y = 0; y < 4; ++y)
+            for (int x = 0; x < 256; ++x) pic.setPixel(x, y, qRgb(x, (x * 7 + y * 50) & 255, 255 - x));
+        const QImage out = calibratedImage(pic, *curved);
+        QCOMPARE(out.format(), QImage::Format_RGBA8888);
+        int worst = 0;
+        for (int y = 0; y < 4; ++y)
+            for (int x = 0; x < 256; ++x) {
+                const QRgb in = pic.pixel(x, y);
+                float v[3] = {qRed(in) / 255.0f, qGreen(in) / 255.0f, qBlue(in) / 255.0f};
+                curved->apply(v[0], v[1], v[2]);
+                const QRgb got = out.pixel(x, y);
+                worst = std::max({worst, std::abs(qRed(got) - int(v[0] * 255 + 0.5f)), std::abs(qGreen(got) - int(v[1] * 255 + 0.5f)),
+                                  std::abs(qBlue(got) - int(v[2] * 255 + 0.5f)), std::abs(qAlpha(got) - 255)});
+            }
+        QVERIFY2(worst <= 1, qPrintable(QString::number(worst)));
+        // A 1D LUT too.
+        auto oneD = std::make_shared<Lut3D>();
+        oneD->size = 2, oneD->is1D = true, oneD->data = {0.1f, 0, 0, 0.9f, 1, 0.5f};
+        const QImage o1 = calibratedImage(pic, *oneD);
+        QCOMPARE(qRed(o1.pixel(255, 0)), 230);
+        QCOMPARE(qBlue(o1.pixel(255, 0)), 0);
+        // Frames as shown over black: transparent black takes the LUT's black, opaque after.
+        auto lift = std::make_shared<Lut3D>();
+        lift->size = 2;
+        for (int i = 0; i < 8; ++i)
+            for (int c = 0; c < 3; ++c) lift->data.push_back(0.1f + 0.8f * float((i >> c) & 1));
+        Image frame(2, 1);
+        frame.at(1, 0)[0] = frame.at(1, 0)[1] = frame.at(1, 0)[2] = frame.at(1, 0)[3] = 1;
+        calibrateImage(frame, *lift);
+        QVERIFY(std::fabs(frame.at(0, 0)[0] - 0.1f) < 1e-6f && frame.at(0, 0)[3] == 1);
+        QVERIFY(std::fabs(frame.at(1, 0)[2] - 0.9f) < 1e-6f);
+
+        // HDR viewer pictures through a LUT for PQ BT.2020: an identity changes nothing (to half precision); one that
+        // lowers the PQ code darkens it.
+        auto identity = std::make_shared<Lut3D>();
+        identity->size = 33;
+        for (int bb = 0; bb < 33; ++bb)
+            for (int gg = 0; gg < 33; ++gg)
+                for (int rr = 0; rr < 33; ++rr) identity->data.insert(identity->data.end(), {rr / 32.0f, gg / 32.0f, bb / 32.0f});
+        const std::vector<float> light{0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 4.0f, 0.5f, 0.1f, 1.0f, 0.02f, 0.01f, 0.3f, 1.0f};
+        std::vector<uint16_t> halves(light.size());
+        qFloatToFloat16(reinterpret_cast<qfloat16*>(halves.data()), light.data(), qsizetype(light.size()));
+        std::vector<uint16_t> same = halves;
+        calibrateHdrPicture(same, 4, 1, *identity);
+        std::vector<float> back(light.size());
+        qFloatFromFloat16(back.data(), reinterpret_cast<const qfloat16*>(same.data()), qsizetype(back.size()));
+        for (size_t i = 0; i < light.size(); ++i)
+            QVERIFY2(std::fabs(back[i] - light[i]) <= 0.01f * std::max(light[i], 0.1f), qPrintable(QStringLiteral("%1: %2 vs %3").arg(i).arg(back[i]).arg(light[i])));
+        auto lower = std::make_shared<Lut3D>(*identity);
+        for (float& v : lower->data) v *= 0.9f;
+        std::vector<uint16_t> darker = halves;
+        calibrateHdrPicture(darker, 4, 1, *lower);
+        qFloatFromFloat16(back.data(), reinterpret_cast<const qfloat16*>(darker.data()), qsizetype(back.size()));
+        QVERIFY(back[4] < 0.8f && back[4] > 0.3f && back[3 + 4] == 1.0f);
+        // Placed on PQ by the nits the display shows SDR white at: a LUT giving 203 nits everywhere gives SDR white
+        // where that is 203 nits, twice it where SDR white is 101.5.
+        auto at203 = std::make_shared<Lut3D>(*identity);
+        const float pq203 = float(fromLinear(Transfer::Pq, 1.0));
+        for (float& v : at203->data) v = pq203;
+        for (double white : {203.0, 101.5}) {
+            std::vector<uint16_t> flat = halves;
+            calibrateHdrPicture(flat, 4, 1, *at203, white);
+            qFloatFromFloat16(back.data(), reinterpret_cast<const qfloat16*>(flat.data()), qsizetype(back.size()));
+            QVERIFY2(std::fabs(back[4] - 203 / white) < 0.01 * 203 / white, qPrintable(QString::number(back[4])));
+        }
+
+        // Patch messages: a colour over a background in a rectangle, at a bit depth.
+        const std::string msg =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" ?><calibration><color red=\"940\" green=\"64\" blue=\"512\" bits=\"10\"/>"
+            "<background red=\"64\" green=\"64\" blue=\"64\" bits=\"10\"/><geometry x=\"0.2500\" y=\"0.2500\" cx=\"0.5000\" cy=\"0.5000\"/></calibration>";
+        CalibrationPatch patch;
+        QVERIFY2(parseCalibrationPatch(msg, patch, &why), why.c_str());
+        QCOMPARE(patch.bits, 10);
+        QCOMPARE(patch.shapes.size(), size_t(1));
+        QCOMPARE(patch.shapes[0].rgb[0], 940);
+        QCOMPARE(patch.background[2], 64);
+        QCOMPARE(patch.shapes[0].width, 0.5);
+        // Rectangles in a list, the depth taken from the values when not given.
+        CalibrationPatch shapes;
+        QVERIFY(parseCalibrationPatch("<calibration><shapes><rectangle><color red=\"255\" green=\"0\" blue=\"0\"/><geometry x=\"0\" y=\"0\" cx=\"0.5\" cy=\"1\"/></rectangle>"
+                                      "<rectangle><color red=\"0\" green=\"0\" blue=\"255\"/><geometry x=\"0.5\" y=\"0\" cx=\"0.5\" cy=\"1\"/></rectangle></shapes></calibration>",
+                                      shapes, &why));
+        QCOMPARE(shapes.shapes.size(), size_t(2));
+        QCOMPARE(shapes.bits, 8);
+        QVERIFY(!parseCalibrationPatch("<other/>", shapes, &why) && QString::fromStdString(why).contains("Not a calibration"));
+        QVERIFY(!parseCalibrationPatch("<calibration><color red=\"1\"", shapes, &why));
+        QVERIFY(!parseCalibrationPatch("<calibration/>", shapes, &why));
+        // Framed by a 4-byte big-endian length, arriving in pieces or several at once.
+        auto frame4 = [](const std::string& xml) {
+            std::string out(4, '\0');
+            const uint32_t n = uint32_t(xml.size());
+            out[0] = char(n >> 24), out[1] = char(n >> 16 & 255), out[2] = char(n >> 8 & 255), out[3] = char(n & 255);
+            return out + xml;
+        };
+        const std::string wire = frame4(msg) + frame4("<calibration><color red=\"10\" green=\"20\" blue=\"30\"/></calibration>");
+        PatchStream stream;
+        std::vector<CalibrationPatch> got;
+        for (size_t i = 0; i < wire.size(); i += 7) {
+            const auto part = stream.feed(wire.data() + i, std::min<size_t>(7, wire.size() - i));
+            got.insert(got.end(), part.begin(), part.end());
+        }
+        QCOMPARE(got.size(), size_t(2));
+        QCOMPARE(got[1].shapes[0].rgb[2], 30);
+        QCOMPARE(got[1].shapes[0].width, 1.0);  // (full screen when no geometry)
+        PatchStream both;
+        QCOMPARE(both.feed(wire.data(), wire.size()).size(), size_t(2));
+        QVERIFY(!both.broken());
+        QVERIFY(both.feed("\x7f\0\0\0", 4).empty() && !both.error().empty() && both.broken());
+        QVERIFY(both.feed(wire.data(), wire.size()).empty());  // (out of step: nothing more read until connected again)
+        // With no depth given, the deepest needed so far: a dark patch after a 10-bit one is 10-bit too.
+        PatchStream guessed;
+        const std::string twoMsgs = frame4("<calibration><color red=\"940\" green=\"0\" blue=\"0\"/></calibration>") +
+                                    frame4("<calibration><color red=\"100\" green=\"0\" blue=\"0\"/></calibration>");
+        const auto gp = guessed.feed(twoMsgs.data(), twoMsgs.size());
+        QVERIFY(gp.size() == 2 && gp[0].bits == 10 && gp[1].bits == 10);
+        // As pictures: the 10-bit values exactly for the output, rounded to 8 bits for a screen.
+        const Image pf = patchFrame(patch, 8, 8);
+        QCOMPARE(pf.at(4, 4)[0], float(940.0 / 1023.0));
+        QCOMPARE(pf.at(0, 0)[1], float(64.0 / 1023.0));
+        QCOMPARE(pf.at(1, 1)[2], float(64.0 / 1023.0));  // (outside the rectangle at 2..5)
+        const QImage pi = patchImage(patch, 8, 8);
+        QCOMPARE(qRed(pi.pixel(4, 4)), int(std::lround(940.0 / 1023 * 255)));
+        QCOMPARE(qRed(pi.pixel(7, 7)), int(std::lround(64.0 / 1023 * 255)));
+        QCOMPARE(qRed(patchImage(patch, 8, 8, c2.get()).pixel(4, 4)), int(std::lround(940.0 / 1023 * 0.25 * 255)));
+
+        // On the reference output: the calibration last (on the signal's code values), the patch as sent.
+        auto dev = std::make_shared<VirtualBackend>();
+        dev->setManual(true);
+        Device d = dev->devices()[0];
+        d.modes = {Mode{"tiny", 64, 36, {25, 1}, false, 0}};
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = {25, 1}, s.sampleRate = 48000;
+        Scheduler sched(dev);
+        sched.setCalibration(c1);  // (halves)
+        Config cfg;
+        cfg.audioChannels = 0;
+        QVERIFY2(sched.start(d, d.modes[0], s, cfg, &why), why.c_str());
+        auto lumaOf = [&](const VirtualBackend::Sent& x) {
+            const uint32_t w0 = x.data[0] | x.data[1] << 8 | x.data[2] << 16 | uint32_t(x.data[3]) << 24;
+            return int(w0 >> 10 & 1023);
+        };
+        auto sendOne = [&] {
+            const size_t n = dev->sent().size();
+            dev->step(1);
+            return dev->waitSent(n + 1);
+        };
+        auto grey = std::make_shared<Image>(64, 36);
+        grey->fill(1, 1, 1, 1);
+        sched.setPosition(3, 0);
+        sched.submit(3, grey);
+        for (int i = 0; i < 500 && !sched.ready(3); ++i) QThread::msleep(2);
+        QVERIFY(sendOne());
+        QCOMPARE(lumaOf(dev->sent().back()), 64 + 438);  // white through the LUT: half
+        sched.setPatch(std::make_shared<const Image>(patchFrame(got[1], 64, 36)));
+        QVERIFY(sendOne());
+        const int patchLuma = lumaOf(dev->sent().back());
+        // (BT.709 Y' of 10, 20, 30 at 8 bits, in 10-bit video levels; not halved)
+        QVERIFY(std::abs(patchLuma - int(std::lround(64 + 876 * (0.2126 * 10 + 0.7152 * 20 + 0.0722 * 30) / 255))) <= 1);
+        sched.setPatch(nullptr);
+        QVERIFY(sendOne());
+        QCOMPARE(lumaOf(dev->sent().back()), 64 + 438);  // the program again
+        // A calibration changed: frames packed again (wanted again), through the new one.
+        sched.setCalibration(nullptr);
+        QVERIFY(sched.wants(3));
+        sched.submit(3, grey);
+        for (int i = 0; i < 500 && !sched.ready(3); ++i) QThread::msleep(2);
+        QVERIFY(sendOne());
+        QCOMPARE(lumaOf(dev->sent().back()), 940);
+        sched.stop();
+    }
+
     void remoteReviewStream() {
         using namespace montage::output;
         // Settings: SRT needs a passphrase of 10 to 79 characters, and so do markers; addresses need a port.
@@ -6858,6 +7192,40 @@ colorspaces:
         QVERIFY(got[0].frame == note.frame && got[0].author == "Ana" && got[0].text == note.text && got[0].timecode == note.timecode);
         QVERIFY(got[1].frame == note.frame + 25 && got[1].duration == 10);
         QCOMPARE(stream->stats().markers, 2);
+        // Many at once are taken at the pace the channel allows (the client slowing down when told), with their
+        // drawings.
+        {
+            std::vector<RemoteMarker> many(60, note);
+            for (size_t i = 0; i < many.size(); ++i) many[i].drawing = std::string(1000, char('a' + i % 26));
+            QElapsedTimer took;
+            took.start();
+            QVERIFY2(sendRemoteMarkers("127.0.0.1", srt.markersPort, srt.passphrase, many, &why), why.c_str());
+            QCOMPARE(stream->takeMarkers().size(), size_t(60));
+            QVERIFY(took.elapsed() >= 500);  // (50 at once, then 10 a second)
+        }
+#ifdef Q_OS_LINUX
+        // Idle strangers from several addresses waiting to log in do not keep a reviewer out (on Linux every 127.x
+        // address is this computer).
+        {
+            std::vector<std::unique_ptr<QTcpSocket>> idle;
+            for (int a = 2; a <= 5; ++a)
+                for (int k = 0; k < 4; ++k) {
+                    auto c = std::make_unique<QTcpSocket>();
+                    c->setProxy(QNetworkProxy::NoProxy);
+                    if (!c->bind(QHostAddress(QStringLiteral("127.0.0.%1").arg(a)))) continue;
+                    c->connectToHost(QStringLiteral("127.0.0.1"), quint16(srt.markersPort));
+                    if (c->waitForConnected(2000)) idle.push_back(std::move(c));
+                }
+            QCOMPARE(idle.size(), size_t(16));
+            QThread::msleep(200);
+            QVERIFY2(sendRemoteMarkers("127.0.0.1", srt.markersPort, srt.passphrase, {note}, &why), why.c_str());
+            QCOMPARE(stream->takeMarkers().size(), size_t(1));
+            // (one of the strangers made room)
+            bool evicted = false;
+            for (auto& c : idle) evicted = evicted || c->state() != QAbstractSocket::ConnectedState || c->waitForDisconnected(50);
+            QVERIFY(evicted);
+        }
+#endif
         // A channel that cannot show it has the passphrase is not sent to.
         {
             QTcpServer fake;

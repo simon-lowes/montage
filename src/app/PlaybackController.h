@@ -64,6 +64,8 @@ public:
     // Also render HDR sequences as light for the HDR viewer (hdrFrameRendered), beside their SDR pictures.
     void setHdrOutput(bool on);
     bool hdrOutput() const { return hdrOutput_; }
+    // The calibration LUT of the display the HDR viewer is on (made for PQ BT.2020), applied to its pictures; null: none.
+    void setHdrCalibration(std::shared_ptr<const Lut3D> lut, double sdrWhiteNits = 203);
     // Draw the program frames on the GPU where it can (render/GpuCompositor.h; the rest on the CPU as before).
     void setGpuRendering(bool on);
     bool gpuRendering() const { return gpu_; }
@@ -160,6 +162,8 @@ private:
     StereoView stereoView_ = StereoView::Left;
     std::string trimTarget_;
     bool hdrOutput_ = false;
+    std::shared_ptr<const Lut3D> hdrCalibration_;
+    double hdrWhite_ = 203;
     bool gpu_ = false;
     double speed_ = 0;
     bool loop_ = false;

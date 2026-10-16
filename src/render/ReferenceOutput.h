@@ -20,6 +20,10 @@
 #include "media/Image.h"
 #include "render/VideoPacking.h"
 
+namespace montage {
+struct Lut3D;  // (render/Processing.h)
+}
+
 namespace montage::output {
 
 // A video mode: its frame size and frame rate (an interlaced mode's frames are its field pairs).
@@ -164,6 +168,13 @@ public:
     bool wants(FrameTime t) const;
     // Frames submitted before are let go (the project changed).
     void clearFrames();
+    // The monitor's calibration LUT (render/MonitorCalibration.h), applied to the signal's code values last, after the
+    // conversion and framing; null for none. Frames packed before are packed again.
+    void setCalibration(std::shared_ptr<const Lut3D> lut);
+    std::shared_ptr<const Lut3D> calibration() const;
+    // A calibration patch sent in place of the program while set (null: the program again): a mode-sized frame of the
+    // signal's code values, sent as they are (no conversion or calibration).
+    void setPatch(std::shared_ptr<const Image> patch);
     // Mixes `frames` samples from sample `start` into `out` (`channels` interleaved, zeroed).
     using AudioSource = std::function<void(int64_t start, int frames, int channels, float* out)>;
     void setAudioSource(AudioSource source);
@@ -183,7 +194,8 @@ private:
     };
     void packLoop();
     void sendLoop();
-    std::shared_ptr<const Packed> pack(const Image& img) const;
+    std::shared_ptr<const Packed> pack(const Image& img, const std::shared_ptr<const Lut3D>& lut) const;
+    std::shared_ptr<const Packed> packRaw(const Image& img) const;
 
     std::shared_ptr<Backend> backend_;
     Device device_;
@@ -203,6 +215,9 @@ private:
     std::map<FrameTime, std::shared_ptr<const Image>> pending_;
     std::map<FrameTime, std::shared_ptr<const Packed>> packed_;
     std::shared_ptr<const Packed> black_;
+    std::shared_ptr<const Packed> patch_;
+    std::shared_ptr<const Lut3D> calibration_;
+    uint64_t calibrationGeneration_ = 0;
     FrameTime position_ = 0;
     double speed_ = 0;
     AudioSource audio_;

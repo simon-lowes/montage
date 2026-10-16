@@ -1,5 +1,7 @@
 #include "CleanFeed.h"
 
+#include "DisplayCalibration.h"
+
 #include <QCloseEvent>
 #include <QCoreApplication>
 #include <QKeyEvent>
@@ -13,6 +15,7 @@ CleanFeedWindow::CleanFeedWindow(QWidget* parent) : QWidget(parent, Qt::Window |
     setCursor(Qt::BlankCursor);
     setFocusPolicy(Qt::StrongFocus);
     setToolTip(QString());
+    connect(&DisplayCalibration::instance(), &DisplayCalibration::changed, this, qOverload<>(&QWidget::update));
 }
 
 void CleanFeedWindow::setFrame(const QImage& image) {
@@ -33,8 +36,10 @@ void CleanFeedWindow::paintEvent(QPaintEvent*) {
     p.fillRect(rect(), Qt::black);
     if (frame_.isNull()) return;
     p.setRenderHint(QPainter::SmoothPixmapTransform);
-    p.drawImage(pictureRect(), frame_);
+    p.drawImage(pictureRect(), drawnFrame());  // (through this display's calibration, last)
 }
+
+const QImage& CleanFeedWindow::drawnFrame() { return calibrated_.get(frame_, DisplayCalibration::instance().screenLut(screen())); }
 
 void CleanFeedWindow::keyPressEvent(QKeyEvent* e) {
     if (e->key() == Qt::Key_Escape) {

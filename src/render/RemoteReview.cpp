@@ -13,6 +13,7 @@
 #include <QRandomGenerator>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QThread>
 #include <QTimer>
 #include <algorithm>
 #include <chrono>
@@ -283,6 +284,9 @@ bool sameBytes(const QByteArray& a, const QByteArray& b) {
 
 constexpr qsizetype kMaxLine = 1 << 20;  // (a marker's drawing can be long)
 constexpr qsizetype kMaxGreeting = 1024;  // before the client has proved it has the passphrase
+constexpr int kMarkerRate = 10, kMarkerBurst = 50;
+constexpr qsizetype kDrawingRate = 256 * 1024, kDrawingBurst = 4 * 1024 * 1024;
+constexpr std::chrono::minutes kFailureMemory{15};
 constexpr int kIterations = 100000;
 
 class MarkerServer {
@@ -328,18 +332,37 @@ private:
                 QObject::connect(c, &QTcpSocket::disconnected, c, &QObject::deleteLater);
                 const QString peer = c->peerAddress().toString();
                 // Strangers are kept few: a handful waiting to log in (from any one address, fewer), and none from an
-                // address that has guessed wrong too often.
-                int waiting = 0, fromPeer = 0;
+                // address that has guessed wrong too often lately. When as many are waiting as are let wait, the one
+                // waiting longest from the address with most waiting makes room: idle connections from a few addresses
+                // cannot keep a reviewer out.
+                std::map<QString, std::vector<QTcpSocket*>> waiting;
+                int count = 0;
                 for (QTcpSocket* o : server.findChildren<QTcpSocket*>())
-                    if (o != c && !o->property("authed").toBool()) {
-                        ++waiting;
-                        fromPeer += o->peerAddress().toString() == peer;
+                    if (o != c && !o->property("authed").toBool() && o->state() == QAbstractSocket::ConnectedState) {
+                        waiting[o->peerAddress().toString()].push_back(o);
+                        ++count;
                     }
-                if (waiting >= 16 || fromPeer >= 4 || failures_[peer] >= 10 || server.findChildren<QTcpSocket*>().size() > 48) {
+                const bool guessed = blocked(peer);
+                if (waiting[peer].size() >= 4 || guessed || server.findChildren<QTcpSocket*>().size() > 48) {
                     c->abort();
                     c->deleteLater();
                     continue;
                 }
+                if (count >= 16) {
+                    // (among addresses with as many waiting, the connection waiting longest of all theirs)
+                    size_t most = 0;
+                    for (const auto& [address, socks] : waiting) most = std::max(most, socks.size());
+                    QTcpSocket* oldest = nullptr;
+                    for (const auto& [address, socks] : waiting)
+                        if (socks.size() == most)
+                            for (QTcpSocket* o : socks)
+                                if (!oldest || o->property("since").toLongLong() < oldest->property("since").toLongLong()) oldest = o;
+                    if (oldest) oldest->abort();
+                }
+                c->setProperty("since", qint64(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count()));
+                c->setProperty("markerBudget", double(kMarkerBurst));
+                c->setProperty("drawingBudget", double(kDrawingBurst));
+                c->setProperty("budgetAt", c->property("since"));
                 c->setReadBufferSize(kMaxLine + 4096);
                 const QByteArray nonce = randomHex(16);
                 c->setProperty("nonce", nonce);
@@ -369,7 +392,14 @@ private:
     void refuse(QTcpSocket* c) {
         // Each wrong answer is told a second after the one before it, whoever sent them: guesses come one a second.
         c->setProperty("failed", true);
-        ++failures_[c->peerAddress().toString()];
+        const auto at = Clock::now();
+        // Wrong answers are counted for a while from the last (and only so many addresses kept).
+        for (auto it = failures_.begin(); it != failures_.end();) it = at - it->second.last > kFailureMemory ? failures_.erase(it) : std::next(it);
+        while (failures_.size() > 4096)
+            failures_.erase(std::min_element(failures_.begin(), failures_.end(), [](const auto& a, const auto& b) { return a.second.last < b.second.last; }));
+        Failures& f = failures_[c->peerAddress().toString()];
+        ++f.count;
+        f.last = at;
         const auto now = Clock::now();
         nextRefusal_ = std::max(now, nextRefusal_) + std::chrono::seconds(1);
         const int ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(nextRefusal_ - now).count());
@@ -412,6 +442,11 @@ private:
             }
             c->setProperty("seq", seq);
             const QJsonObject m = QJsonDocument::fromJson(body).object();
+            const QString drawing = m.value("drawing").toString();
+            if (!budget(c, drawing.size())) {
+                c->write(line({{"error", "too many markers or drawings at once: send them more slowly"}, {"seq", seq}}));
+                continue;
+            }
             RemoteMarker r;
             r.frame = FrameTime(m.value("frame").toInteger(-1));
             r.duration = std::max<FrameTime>(0, FrameTime(m.value("duration").toInteger(0)));
@@ -419,7 +454,7 @@ private:
             r.timecode = m.value("timecode").toString().left(32).toStdString();
             r.author = m.value("author").toString().left(100).toStdString();
             r.text = m.value("text").toString().left(10000).toStdString();
-            r.drawing = m.value("drawing").toString().toStdString();
+            r.drawing = drawing.toStdString();
             r.id = m.value("id").toString().left(100).toStdString();
             if (r.frame < 0) {
                 c->write(line({{"error", "the frame is not one of the stream's"}, {"seq", seq}}));
@@ -438,7 +473,30 @@ private:
     std::thread thread_;
     std::mutex m_;
     QEventLoop* loop_ = nullptr;
-    std::map<QString, int> failures_;  // wrong answers by address (the server's thread only)
+    struct Failures {
+        int count = 0;
+        Clock::time_point last;
+    };
+    std::map<QString, Failures> failures_;  // wrong answers by address (the server's thread only)
+
+    bool blocked(const QString& peer) const {
+        auto it = failures_.find(peer);
+        return it != failures_.end() && it->second.count >= 10 && Clock::now() - it->second.last <= kFailureMemory;
+    }
+    // Markers come at most kMarkerRate a second (kMarkerBurst at once), and their drawings at most kDrawingRate
+    // characters a second (kDrawingBurst at once), on each connection: what a reviewer can send is bounded.
+    static bool budget(QTcpSocket* c, qsizetype drawing) {
+        const qint64 now = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now().time_since_epoch()).count();
+        const double seconds = double(now - c->property("budgetAt").toLongLong()) / 1000.0;
+        double markers = std::min(double(kMarkerBurst), c->property("markerBudget").toDouble() + seconds * kMarkerRate);
+        double drawn = std::min(double(kDrawingBurst), c->property("drawingBudget").toDouble() + seconds * kDrawingRate);
+        const bool ok = markers >= 1 && drawn >= double(drawing);
+        if (ok) markers -= 1, drawn -= double(drawing);
+        c->setProperty("markerBudget", markers);
+        c->setProperty("drawingBudget", drawn);
+        c->setProperty("budgetAt", now);
+        return ok;
+    }
     Clock::time_point nextRefusal_;
 };
 
@@ -485,9 +543,14 @@ bool sendRemoteMarkers(const std::string& host, int port, const std::string& pas
         if (!m.drawing.empty()) o["drawing"] = QString::fromStdString(m.drawing);
         if (!m.id.empty()) o["id"] = QString::fromStdString(m.id);
         const QByteArray body = QJsonDocument(o).toJson(QJsonDocument::Compact);
-        ++seq;
-        sock.write(line({{"seq", seq}, {"marker", QString::fromUtf8(body)}, {"mac", QString::fromLatin1(mac(session, QByteArray::number(seq) + "|" + body))}}));
-        if (!readObject(reply)) return fail("The marker channel did not answer");
+        // (sent again, a little later, while the channel says they come too fast)
+        for (int tries = 0;; ++tries) {
+            ++seq;
+            sock.write(line({{"seq", seq}, {"marker", QString::fromUtf8(body)}, {"mac", QString::fromLatin1(mac(session, QByteArray::number(seq) + "|" + body))}}));
+            if (!readObject(reply)) return fail("The marker channel did not answer");
+            if (reply.value("ok").toBool() || !reply.value("error").toString().contains("more slowly") || tries >= 100) break;
+            QThread::msleep(150);
+        }
         if (!reply.value("ok").toBool())
             return fail(reply.contains("error") ? "Montage refused the marker: " + reply.value("error").toString().toStdString() : "The marker was not taken");
         if (reply.value("seq").toInt() != seq || !sameBytes(reply.value("mac").toString().toLatin1(), mac(session, "ack|" + QByteArray::number(seq))))

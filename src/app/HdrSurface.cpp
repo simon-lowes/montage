@@ -349,6 +349,7 @@ void HdrSurface::readDisplay() {
             }
             h = d.maxNits / white;
             sc = float(white / 80);
+            absoluteWhite_ = true;
             h = std::max(1.0, std::isfinite(h) ? h : 1.0);
             if (std::fabs(h - headroom_) > 0.01 || sc != scale_) {
                 headroom_ = h;
@@ -361,11 +362,13 @@ void HdrSurface::readDisplay() {
         const QRhiSwapChainHdrInfo info = gpu_->sc->hdrInfo();
         if (info.limitsType == QRhiSwapChainHdrInfo::ColorComponentValue) {
             h = info.limits.colorComponentValue.maxColorComponentValue;  // macOS EDR: 1.0 is SDR white
+            absoluteWhite_ = false;
         } else {
             // Windows scRGB: 1.0 is 80 nits; SDR white is the user's setting.
             const double white = info.sdrWhiteLevel > 0 ? info.sdrWhiteLevel : 80;
             h = info.limits.luminanceInNits.maxLuminance / white;
             sc = float(white / 80);
+            absoluteWhite_ = true;
         }
     } else {
         return;
