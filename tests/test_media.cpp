@@ -12064,29 +12064,32 @@ if ui["pressed"] == "add":
         ls.limit = 40;
         const int moved = lookAtLens(turned, {upMesh}, ls);
         QVERIFY2(moved >= 1, qPrintable(QString::number(moved)));
-        // (each iris found again in what was made, by matching its middle, the pupil and its highlight)
+        // (each iris followed by its highlight, the brightest thing in it, which moves with it)
         for (bool left : {false, true}) {
             float bx = 0, by = 0, br = 0, tx = 0, ty = 0;
             if (!gazeTarget(upMesh, left, tx, ty)) continue;
             upMesh.iris(left, bx, by, br);
-            const int core = std::max(2, int(br * 0.5f)), reach = int(br);
-            double best = 1e30;
-            int mx = 0, my = 0;
-            for (int oy = -reach; oy <= reach; ++oy)
-                for (int ox = -reach; ox <= reach; ++ox) {
-                    double ssd = 0;
-                    for (int v = -core; v <= core; ++v)
-                        for (int u = -core; u <= core; ++u) {
-                            if (u * u + v * v > core * core) continue;
-                            const float* a = up.at(int(bx) + u, int(by) + v);
-                            const float* c = turned.at(int(bx) + u + ox, int(by) + v + oy);
-                            for (int ch = 0; ch < 3; ++ch) ssd += (a[ch] - c[ch]) * (a[ch] - c[ch]);
-                        }
-                    if (ssd < best) best = ssd, mx = ox, my = oy;
-                }
-            const double before = std::hypot(bx - tx, by - ty), now = std::hypot(bx + mx - tx, by + my - ty);
-            QVERIFY2(before > 3 && now < 0.25 * before + 1,
-                     qPrintable(QString("(%1, %2) moved (%3, %4), lens at (%5, %6)").arg(bx).arg(by).arg(mx).arg(my).arg(tx).arg(ty)));
+            // (within r of (cx, cy) and inside the iris round (ix, iy), not the white beside it)
+            auto highlight = [&](const Image& img, double cx, double cy, double r, double ix, double iy, double& hx, double& hy) {
+                auto in = [&](int x, int y) { return std::hypot(x + 0.5 - cx, y + 0.5 - cy) < r && std::hypot(x + 0.5 - ix, y + 0.5 - iy) < br - 2; };
+                float top = 0;
+                auto luma = [&](int x, int y) { const float* p = img.at(x, y); return 0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]; };
+                for (int y = int(cy - r); y <= int(cy + r); ++y)
+                    for (int x = int(cx - r); x <= int(cx + r); ++x)
+                        if (in(x, y)) top = std::max(top, luma(x, y));
+                double n = 0;
+                hx = hy = 0;
+                for (int y = int(cy - r); y <= int(cy + r); ++y)
+                    for (int x = int(cx - r); x <= int(cx + r); ++x)
+                        if (in(x, y) && luma(x, y) > 0.92f * top) n += 1, hx += x + 0.5, hy += y + 0.5;
+                hx /= n, hy /= n;
+            };
+            double hx = 0, hy = 0, ax = 0, ay = 0;
+            highlight(up, bx, by, br, bx, by, hx, hy);
+            highlight(turned, hx + (tx - bx), hy + (ty - by), 0.5 * br, tx, ty, ax, ay);
+            const double before = std::hypot(bx - tx, by - ty);
+            QVERIFY2(before > 3 && std::hypot(ax - hx - (tx - bx), ay - hy - (ty - by)) < 1.5,
+                     qPrintable(QString("highlight (%1, %2) -> (%3, %4), iris (%5, %6) to (%7, %8)").arg(hx).arg(hy).arg(ax).arg(ay).arg(bx).arg(by).arg(tx).arg(ty)));
         }
     }
 
