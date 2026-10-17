@@ -6773,7 +6773,8 @@ private slots:
             auto* kind = dlg->findChild<QComboBox*>("dcpSubtitleKind");
             auto* encrypt = dlg->findChild<QCheckBox*>("dcpEncrypt");
             offered = resolution && resolution->count() == 2 && stereo && !stereo->isEnabled() && subtitles && subtitles->count() == 2 &&
-                      subtitles->currentText().startsWith("French") && kind && kind->isEnabled() && kind->count() == 3 && encrypt &&
+                      subtitles->currentIndex() == 0 && subtitles->itemText(1).startsWith("French") && kind && !kind->isEnabled() &&
+                      kind->count() == 3 && encrypt &&
                       encrypt->isEnabled() == dcp::securityAvailable();
             dlg->reject();
         });

@@ -7567,13 +7567,17 @@ void McpServer::Impl::addTools() {
             st.resolution = str(a, "resolution", "2k").toStdString();
             st.stereo = a.value("stereo").toBool();
             st.encrypt = a.value("encrypt").toBool();
+            const QString as = str(a, "subtitles_as", "subtitles");
+            if (as != QLatin1String("subtitles") && as != QLatin1String("closed_captions") && as != QLatin1String("burn_in"))
+                throw ArgError{"subtitles_as is subtitles, closed_captions or burn_in"};
+            if (str(a, "subtitles").isEmpty() && (a.contains("subtitles_as") || a.contains("subtitle_language")))
+                throw ArgError{"subtitles_as and subtitle_language need subtitles (a caption track)"};
             if (const QString want = str(a, "subtitles"); !want.isEmpty()) {
                 for (const CaptionTrack& t : s.captionTracks)
                     if (QString::fromStdString(t.name).compare(want, Qt::CaseInsensitive) == 0) st.subtitles = t.id;
                 for (const CaptionTrack& t : s.captionTracks)
                     if (!st.subtitles && QString::fromStdString(t.language).compare(want, Qt::CaseInsensitive) == 0) st.subtitles = t.id;
                 if (!st.subtitles) throw ArgError{"subtitles names no caption track of the sequence"};
-                const QString as = str(a, "subtitles_as", "subtitles");
                 st.closedCaptions = as == QLatin1String("closed_captions");
                 st.burnIn = as == QLatin1String("burn_in");
                 st.subtitleLanguage = str(a, "subtitle_language").toStdString();

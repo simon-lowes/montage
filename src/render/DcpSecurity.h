@@ -40,6 +40,9 @@ bool signerCertificateChain(CertificateChain& out, std::string* error = nullptr,
 std::string signerFolder();
 // Where Montage keeps the DKDMs of the encrypted DCPs it made: dkdm in its data folder (MONTAGE_DCP_DKDMS overrides it).
 std::string dkdmFolder();
+// Writes a file whole or not at all (a temporary file put in place); `secret`: readable by its owner only from the
+// moment it is created (POSIX; on Windows the data folder is the user's own).
+bool writeWholeFile(const std::string& path, const std::string& text, bool secret = false);
 
 struct CertificateInfo {
     std::string subject, issuer;    // RFC 2253, as XML signatures and KDMs name certificates
@@ -56,9 +59,15 @@ std::vector<std::string> splitCertificates(const std::string& text);
 
 // Signs a composition playlist or packing list in place: Signer and ds:Signature after the root's last child.
 bool signXml(std::string& xml, const CertificateChain& chain, std::string* error = nullptr);
-// Checks an enveloped signature: the digest of the document without it, the signature by the first KeyInfo
-// certificate, and that each certificate there is signed by the next.
-bool verifyXmlSignature(const std::string& xml, std::string* error = nullptr);
+// Checks an enveloped signature: the digest of what each reference covers, the signature by the first KeyInfo
+// certificate, and that each certificate there is issued and signed by the next, a certificate authority. `check`
+// (when given) gets the references ("" the whole document, "#Id" an element) and the signer's thumbprint, so the
+// caller can require what must be covered.
+struct SignatureCheck {
+    std::vector<std::string> references;
+    std::string signerThumbprint;  // base64 SHA-1, as CertificateInfo::thumbprint
+};
+bool verifyXmlSignature(const std::string& xml, std::string* error = nullptr, SignatureCheck* check = nullptr);
 
 // A track file's AES-128 content key and its id (the key id the composition and KDMs name), with its ST 430-1 type:
 // "MDIK" picture, "MDAK" sound, "MDSK" subtitles.
@@ -67,7 +76,8 @@ struct ContentKey {
     std::array<uint8_t, 16> key{};
     std::string type = "MDIK";
 };
-ContentKey newContentKey(const std::string& type);
+// A new key from the system's random source; `ok` false (and the key not to be used) when that fails.
+ContentKey newContentKey(const std::string& type, bool* ok = nullptr);
 
 struct KdmSettings {
     std::string cplId;                   // the composition's UUID
@@ -84,11 +94,13 @@ bool makeKdm(const KdmSettings& settings, const CertificateChain& signer, std::s
 
 struct KdmContents {
     std::string cplId, contentTitle, annotation, notValidBefore, notValidAfter;
+    std::string signerThumbprint;  // the certificate that signed it (base64 SHA-1)
     std::string recipientSubject, recipientIssuer, recipientSerial;
     std::vector<ContentKey> keys;  // with `privateKey`: each key; without, their ids and types only
 };
-// Reads a KDM; with the recipient's private key (PEM), opens its keys too (checking each block's structure, signer
-// thumbprint and composition). False when the signature does not hold.
+// Reads a KDM: only what its signature covers (the public and private parts, each signed by reference); with the
+// recipient's private key (PEM), opens its keys too (checking each block's structure, signer thumbprint, composition,
+// key and window against the public part). False when the signature does not hold.
 bool readKdm(const std::string& xml, const std::string& privateKey, KdmContents& out, std::string* error = nullptr);
 
 // ST 429-6 track file encryption: AES-128-CBC of the essence after its plaintext offset, a check value under the same

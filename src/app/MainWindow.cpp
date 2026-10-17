@@ -6358,7 +6358,6 @@ void MainWindow::exportDcpDialog() {
     for (const CaptionTrack& t : s->captionTracks)
         subtitles->addItem(tr("%1 (%2, %3 captions)").arg(QString::fromStdString(t.name), QString::fromStdString(t.language)).arg(t.captions.size()),
                            QVariant::fromValue<qulonglong>(t.id));
-    if (subtitles->count() > 1) subtitles->setCurrentIndex(1);
     form->addRow(tr("Subtitles:"), subtitles);
     auto* subtitleKind = new QComboBox(&dlg);
     subtitleKind->setObjectName(QStringLiteral("dcpSubtitleKind"));

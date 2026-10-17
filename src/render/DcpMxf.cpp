@@ -1391,14 +1391,23 @@ std::string hexOf(const uint8_t* p) {
 
 struct File {
     std::FILE* f = nullptr;
+    uint64_t size = 0;
     ~File() {
         if (f) std::fclose(f);
     }
     bool seek(uint64_t at) {
+        if (at > size) return false;
 #ifdef _WIN32
         return _fseeki64(f, int64_t(at), SEEK_SET) == 0;
 #else
         return fseeko(f, off_t(at), SEEK_SET) == 0;
+#endif
+    }
+    uint64_t tell() {
+#ifdef _WIN32
+        return uint64_t(_ftelli64(f));
+#else
+        return uint64_t(ftello(f));
 #endif
     }
     bool read(uint8_t* p, size_t n) { return std::fread(p, 1, n, f) == n; }
@@ -1409,7 +1418,7 @@ struct File {
         header = 17;
         if (b < 0x80) {
             length = b;
-            return true;
+            return fits(length);
         }
         const int n = b & 0x7f;
         if (n > 8) return false;
@@ -1418,7 +1427,12 @@ struct File {
         length = 0;
         for (int i = 0; i < n; ++i) length = length << 8 | v[i];
         header += uint64_t(n);
-        return true;
+        return fits(length);
+    }
+    // Whether `length` bytes from here are in the file (a damaged or hostile length is not read).
+    bool fits(uint64_t length) {
+        const uint64_t at = tell();
+        return at <= size && length <= size - at;
     }
 };
 
@@ -1428,7 +1442,10 @@ bool openRead(File& file, const std::string& path) {
 #else
     file.f = std::fopen(path.c_str(), "rb");
 #endif
-    return file.f != nullptr;
+    if (!file.f) return false;
+    if (std::fseek(file.f, 0, SEEK_END) != 0) return false;
+    file.size = file.tell();
+    return std::fseek(file.f, 0, SEEK_SET) == 0;
 }
 
 // A BER length inside a value (the triplet's own items).
@@ -1475,13 +1492,9 @@ bool TrackFileReader::open(const std::string& path, std::string* error) {
     path_ = path;
     File file;
     if (!openRead(file, path)) return fail("Cannot open " + path);
-    std::fseek(file.f, 0, SEEK_END);
-#ifdef _WIN32
-    fileSize_ = uint64_t(_ftelli64(file.f));
-#else
-    fileSize_ = uint64_t(ftello(file.f));
-#endif
-    // The random index pack at the end: where each partition is.
+    fileSize_ = file.size;
+    // The random index pack at the end: where each partition is. Every length below has been checked against the
+    // file's size (File::kl), so a damaged or hostile file is refused, not read past.
     uint8_t tail[4];
     if (fileSize_ < 64 || !file.seek(fileSize_ - 4) || !file.read(tail, 4)) return fail(path + " is not an MXF file");
     const uint64_t ripSize = readBe(tail, 4);
@@ -1489,18 +1502,19 @@ bool TrackFileReader::open(const std::string& path, std::string* error) {
     uint64_t length = 0, header = 0;
     if (ripSize > fileSize_ || !file.seek(fileSize_ - ripSize) || !file.kl(key, length, header) || !sameKey(key, "060e2b34020501010d01020101110100"))
         return fail(path + " has no random index pack");
+    if (length < 4) return fail(path + " has a damaged random index pack");
     Bytes rip(static_cast<size_t>(length));
     if (!file.read(rip.data(), rip.size())) return fail(path + " is cut short");
     rip_.clear();
     for (size_t i = 0; i + 12 <= rip.size() - 4; i += 12) rip_.emplace_back(readBe(rip.data() + i, 4), uint64_t(readBe(rip.data() + i + 4, 4)) << 32 | readBe(rip.data() + i + 8, 4));
     // The header partition and its metadata.
-    if (!file.seek(0) || !file.kl(key, length, header) || length < 64) return fail(path + " is not an MXF file");
+    if (!file.seek(0) || !file.kl(key, length, header) || length < 64 || length > (1 << 20)) return fail(path + " is not an MXF file");
     Bytes pack(static_cast<size_t>(length));
     if (!file.read(pack.data(), pack.size())) return fail(path + " is cut short");
     const uint64_t footer = beOf(Bytes(pack.begin() + 24, pack.begin() + 32));
     const uint64_t headerBytes = beOf(Bytes(pack.begin() + 32, pack.begin() + 40));
     uint64_t at = header + length;
-    const uint64_t end = at + headerBytes;
+    const uint64_t end = headerBytes > fileSize_ - std::min(at, fileSize_) ? fileSize_ : at + headerBytes;
     std::map<std::string, uint16_t> tags;  // the primer: label to local tag
     auto tag = [&](const char* label) {
         const auto it = tags.find(label);
@@ -1578,14 +1592,16 @@ bool TrackFileReader::open(const std::string& path, std::string* error) {
         };
         const uint64_t unit = beOf(get(0x3f05));
         if (unit > 0) {
-            const int64_t n = containerDuration_ > 0 ? containerDuration_ : int64_t(beOf(get(0x3f0d)));
-            for (int64_t k = 0; k < n; ++k) offsets_.push_back(uint64_t(k) * unit);
+            // As many edit units as the file can hold, whatever the duration says.
+            const uint64_t n = std::min<uint64_t>(containerDuration_ > 0 ? uint64_t(containerDuration_) : beOf(get(0x3f0d)), fileSize_ / unit);
+            for (uint64_t k = 0; k < n; ++k) offsets_.push_back(k * unit);
             continue;
         }
         const Bytes e = get(0x3f0a);
         if (e.size() < 8) continue;
-        const uint32_t count = readBe(e.data(), 4), size = readBe(e.data() + 4, 4);
-        for (uint32_t k = 0; k < count && 8 + size_t(k + 1) * size <= e.size(); ++k)
+        const uint64_t count = readBe(e.data(), 4), size = readBe(e.data() + 4, 4);
+        if (size < 11 || count > (e.size() - 8) / size) return fail(path + " has a damaged index");
+        for (uint64_t k = 0; k < count; ++k)
             offsets_.push_back(beOf(Bytes(e.begin() + ptrdiff_t(8 + k * size + 3), e.begin() + ptrdiff_t(8 + k * size + 11))));
     }
     return true;
@@ -1619,7 +1635,7 @@ bool TrackFileReader::element(uint64_t at, uint64_t sequence, std::vector<uint8_
     File file;
     uint8_t k[16];
     uint64_t length = 0, header = 0;
-    if (!openRead(file, path_) || !file.seek(at) || !file.kl(k, length, header) || at + header + length > fileSize_) return fail(path_ + " is cut short");
+    if (!openRead(file, path_) || !file.seek(at) || !file.kl(k, length, header)) return fail(path_ + " is cut short");
     if (next) *next = at + header + length;
     Bytes v(static_cast<size_t>(length));
     if (!file.read(v.data(), v.size())) return fail(path_ + " is cut short");
@@ -1642,8 +1658,9 @@ bool TrackFileReader::element(uint64_t at, uint64_t sequence, std::vector<uint8_
     if (!berAt(v, i, n) || n != 8 || i + 8 > v.size()) return fail(path_ + ": a damaged encrypted element");
     sourceLength = beOf(Bytes(v.begin() + ptrdiff_t(i), v.begin() + ptrdiff_t(i + 8)));
     i += 8;
-    if (!berAt(v, i, esvLength) || i + esvLength > v.size() || offset > sourceLength ||
-        esvLength != offset + (sourceLength - offset) - (sourceLength - offset) % 16 + 48)
+    // Every length against the element's own size (so none can wrap around).
+    if (!berAt(v, i, esvLength) || esvLength > v.size() - i || offset > sourceLength || sourceLength > v.size() || esvLength < 48 ||
+        offset > esvLength - 48 || esvLength != offset + (sourceLength - offset) - (sourceLength - offset) % 16 + 48)
         return fail(path_ + ": a damaged encrypted element");
     const uint8_t* esv = v.data() + i;
     // The check value and the encrypted blocks are one CBC chain; the plaintext part sits between them.
@@ -1652,7 +1669,9 @@ bool TrackFileReader::element(uint64_t at, uint64_t sequence, std::vector<uint8_
     Bytes plain(chained.size());
     if (!aesCbcDecrypt(key, esv, chained.data(), chained.size(), plain.data())) return fail("This build cannot decrypt (it has no OpenSSL)");
     if (std::memcmp(plain.data(), kCheckValue, 16) != 0) return fail(path_ + ": that is not its content key");
-    if (hmac_) {
+    // DCI asks for the integrity pack on every encrypted element: a file without one cannot show it is unaltered.
+    if (!hmac_) return fail(path_ + " has no integrity check (MIC) on its encrypted essence");
+    {
         const size_t pack = i + size_t(esvLength);
         if (pack + 56 > v.size()) return fail(path_ + ": an encrypted element has no integrity pack");
         size_t j = pack;

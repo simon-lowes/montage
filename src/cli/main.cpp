@@ -1704,6 +1704,10 @@ int cmdPresets() {
 
 int main(int argc, char** argv) {
     if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM")) qputenv("QT_QPA_PLATFORM", "offscreen");
+    // The app's names, so its data folder is the app's: the models it downloaded, the DCP signing chain and the DKDMs
+    // (a DCP encrypted from here can have KDMs made in the app, and the other way round).
+    QGuiApplication::setApplicationName("Montage");
+    QGuiApplication::setOrganizationName("Montage");
     QGuiApplication app(argc, argv);  // fonts for title rendering
     // (Qt takes the C library's locale from the environment; numbers in files must not follow it, as in the app.)
     std::setlocale(LC_NUMERIC, "C");

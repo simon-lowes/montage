@@ -59,6 +59,7 @@
 #include <thread>
 #include <QPainter>
 #include <QElapsedTimer>
+#include <QRandomGenerator>
 #include "core/ScriptCut.h"
 #include "render/TrimPasses.h"
 #include "render/RoomTone.h"
@@ -5841,6 +5842,25 @@ colorspaces:
         QVERIFY(!dcp::readKdm(kdm, chain.privateKey, opened, &err));
         kr.notAfter = kr.notBefore + 20 * 365 * 86400LL;
         QVERIFY(!makeKdms(kr, nullptr, &err) && err.find("ends after") != std::string::npos);
+        // A DKDM encrypted to Montage's leaf (whose certificate any signed package carries) but signed by someone else
+        // is not Montage's own.
+        {
+            dcp::KdmSettings foreign;
+            foreign.cplId = r.cplId;
+            foreign.contentTitle = "Secret";
+            foreign.notValidBefore = dcp::kdmTime(kr.notBefore - 60);
+            foreign.notValidAfter = dcp::kdmTime(kr.notBefore + 30 * 86400LL);
+            foreign.keys = keys.keys;
+            foreign.recipient = chain.certificates.back();
+            std::string text;
+            QVERIFY2(dcp::makeKdm(foreign, cinema, text, &err), err.c_str());
+            const QString path = dir.filePath("foreign-dkdm.xml");
+            QVERIFY(dcp::writeWholeFile(path.toStdString(), text));
+            KdmRequest other = kr;
+            other.dkdm = path.toStdString();
+            other.notAfter = other.notBefore + 86400;
+            QVERIFY(!makeKdms(other, nullptr, &err) && err.find("not made by this signer") != std::string::npos);
+        }
         // ClairMeta (when MONTAGE_TEST_CLAIRMETA names a Python with it) passes the package and opens it with the KDM.
         const QString python = qEnvironmentVariable("MONTAGE_TEST_CLAIRMETA");
         auto clairMeta = [&](const std::string& folder, const QStringList& extra) {
@@ -6029,6 +6049,35 @@ colorspaces:
             QVERIFY2(r.readStream(10, got, k, &err), err.c_str());
             QVERIFY(got == font.data);
         }
+        // Damaged files (cut short anywhere, or bytes overwritten with 0xff, which reads as the longest lengths) are
+        // refused or read as far as they go, never read past.
+        for (const char* name : {"stereo-encrypted.mxf", "subtitles-encrypted.mxf", "sound-encrypted.mxf"}) {
+            QFile f(dir.filePath(name));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QByteArray whole = f.readAll();
+            f.close();
+            QRandomGenerator rng(7);
+            for (int trial = 0; trial < 60; ++trial) {
+                QByteArray bad = whole;
+                if (trial < 20) {
+                    bad.truncate(qsizetype(rng.bounded(quint32(whole.size()))));
+                } else {
+                    const qsizetype at = qsizetype(rng.bounded(quint32(whole.size() - 8)));
+                    for (int b = 0; b < 8; ++b) bad[at + b] = char(trial % 2 ? 0xff : rng.bounded(256));
+                }
+                const QString path = dir.filePath("damaged.mxf");
+                QFile out(path);
+                QVERIFY(out.open(QIODevice::WriteOnly | QIODevice::Truncate));
+                out.write(bad);
+                out.close();
+                dcp::TrackFileReader r;
+                if (!r.open(path.toStdString(), &err)) continue;
+                std::vector<uint8_t> got;
+                for (int64_t i = 0; i < std::min<int64_t>(r.editUnits(), 4); ++i)
+                    for (int eye = 0; eye < (r.stereo() ? 2 : 1); ++eye) r.read(i, eye, got, key.key.data(), &err);
+                for (uint32_t sid : r.streams()) r.readStream(sid, got, key.key.data(), &err);
+            }
+        }
         // asdcplib reads them all back, decrypting and checking each element's MIC.
         const QString tools = qEnvironmentVariable("MONTAGE_TEST_ASDCP");
         if (tools.isEmpty()) return;
@@ -6088,6 +6137,9 @@ colorspaces:
         std::string err;
         o.id = "ID_y";
         QVERIFY(canonicalXml(doc, o, &err).empty() && err.find("ID_y") != std::string::npos);
+        // Characters past U+FFFF (a clapper board, a rare ideograph) stay one UTF-8 character each.
+        QCOMPARE(canonicalXml("<a t=\"\xF0\x9F\x8E\xAC&amp;\">\xF0\x9F\x8E\xAC x \xF0\xA0\x80\x80</a>"),
+                 std::string("<a t=\"\xF0\x9F\x8E\xAC&amp;\">\xF0\x9F\x8E\xAC x \xF0\xA0\x80\x80</a>"));
         QCOMPARE(dcp::kdmTime(0, 60), std::string("1970-01-01T01:00:00+01:00"));
         QCOMPARE(dcp::kdmTime(86400, -330), std::string("1970-01-01T18:30:00-05:30"));
         if (!dcp::securityAvailable()) QSKIP("This build has no OpenSSL");
@@ -6100,6 +6152,17 @@ colorspaces:
         QVERIFY(chain.certificates.size() == 3 && !chain.privateKey.empty());
         QVERIFY2(dcp::signerCertificateChain(again, &err, folder), err.c_str());
         QVERIFY(again.certificates == chain.certificates && again.privateKey == chain.privateKey);
+#ifndef _WIN32
+        QCOMPARE(QFile::permissions(QDir(QString::fromStdString(folder)).filePath("leaf.key")) & 0x0077, QFileDevice::Permissions());
+#endif
+        // A chain with a file missing is reported, not replaced (the DKDMs are encrypted to its leaf).
+        QVERIFY(QFile::rename(QDir(QString::fromStdString(folder)).filePath("root.pem"), dir.filePath("root.pem")));
+        QVERIFY(!dcp::signerCertificateChain(again, &err, folder) && err.find("incomplete") != std::string::npos);
+        {
+            QFile key(QDir(QString::fromStdString(folder)).filePath("leaf.key"));
+            QVERIFY(key.open(QIODevice::ReadOnly) && key.readAll().toStdString() == chain.privateKey);
+        }
+        QVERIFY(QFile::rename(dir.filePath("root.pem"), QDir(QString::fromStdString(folder)).filePath("root.pem")));
         dcp::CertificateInfo root, middle, leaf;
         QVERIFY(dcp::readCertificate(chain.certificates[0], root) && dcp::readCertificate(chain.certificates[1], middle) &&
                 dcp::readCertificate(chain.certificates[2], leaf));
@@ -6121,6 +6184,17 @@ colorspaces:
         std::string changed = cpl;
         changed.replace(changed.find("Test &amp; film"), 15, "Test &amp; filn");
         QVERIFY(!dcp::verifyXmlSignature(changed, &err) && err.find("changed") != std::string::npos);
+        dcp::SignatureCheck check;
+        QVERIFY(dcp::verifyXmlSignature(cpl, &err, &check) && check.references == std::vector<std::string>{""} && check.signerThumbprint == leaf.thumbprint);
+        // An emoji in the title: its digest is the one any checker computes from the UTF-8 (ClairMeta's own C14N in
+        // exportsEncryptedStereoDcpWithSubtitles; here, that a change to it is seen).
+        std::string emoji = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompositionPlaylist xmlns=\"http://www.smpte-ra.org/schemas/429-7/2006/CPL\">\n"
+                "  <ContentTitleText>Film \xF0\x9F\x8E\xAC</ContentTitleText>\n</CompositionPlaylist>\n";
+        QVERIFY2(dcp::signXml(emoji, chain, &err), err.c_str());
+        QVERIFY2(dcp::verifyXmlSignature(emoji, &err), err.c_str());
+        changed = emoji;
+        changed.replace(changed.find("\xF0\x9F\x8E\xAC"), 4, "\xF0\x9F\x8E\xAD");
+        QVERIFY(!dcp::verifyXmlSignature(changed, &err));
 
         // A KDM with two keys to a cinema's certificate opens with its key only.
         dcp::CertificateChain cinema;
@@ -6155,6 +6229,12 @@ colorspaces:
         std::string forged = kdm;
         forged.replace(forged.find("For the test cinema"), 3, "Not");
         QVERIFY(!dcp::readKdm(forged, cinema.privateKey, c, &err));
+        // A window put outside the signed parts is not read (the signature still holds; the window is the signed one).
+        forged = kdm;
+        forged.insert(forged.rfind("</"), "<ContentKeysNotValidAfter>2099-01-01T00:00:00+00:00</ContentKeysNotValidAfter>");
+        QVERIFY2(dcp::readKdm(forged, cinema.privateKey, c, &err), err.c_str());
+        QCOMPARE(c.notValidAfter, k.notValidAfter);
+        QVERIFY(dcp::readKdm(kdm, {}, c, &err) && c.signerThumbprint == leaf.thumbprint);
         k.notValidAfter = "tomorrow";
         QVERIFY(!dcp::makeKdm(k, chain, kdm, &err));
 

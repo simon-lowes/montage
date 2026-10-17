@@ -7,6 +7,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include <QTimeZone>
 #include <QXmlStreamReader>
@@ -16,6 +17,11 @@
 #include <ctime>
 #include <map>
 #include <memory>
+#include <mutex>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #include "XmlCanonical.h"
 
@@ -89,6 +95,39 @@ std::string kdmTime(int64_t seconds, int offsetMinutes) {
     return (t.toString(QStringLiteral("yyyy-MM-ddTHH:mm:ss")) + (offsetMinutes < 0 ? '-' : '+') +
             QStringLiteral("%1:%2").arg(m / 60, 2, 10, QChar('0')).arg(m % 60, 2, 10, QChar('0')))
         .toStdString();
+}
+
+bool writeWholeFile(const std::string& file, const std::string& text, bool secret) {
+    const QString path = QString::fromStdString(file);
+#ifndef _WIN32
+    if (secret) {
+        // Created owner-only (not made and then narrowed), in full, then put in place.
+        const QByteArray tmp = QFile::encodeName(path + QStringLiteral(".partial"));
+        const int fd = ::open(tmp.constData(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) return false;
+        size_t done = 0;
+        while (done < text.size()) {
+            const ssize_t n = ::write(fd, text.data() + done, text.size() - done);
+            if (n <= 0) break;
+            done += size_t(n);
+        }
+        const bool whole = done == text.size() && ::fsync(fd) == 0;
+        if (::close(fd) != 0 || !whole || ::rename(tmp.constData(), QFile::encodeName(path).constData()) != 0) {
+            ::unlink(tmp.constData());
+            return false;
+        }
+        return true;
+    }
+#else
+    (void)secret;  // (the data folder is the user's own on Windows)
+#endif
+    QSaveFile f(path);
+    if (!f.open(QIODevice::WriteOnly)) return false;
+    if (f.write(text.data(), qint64(text.size())) != qint64(text.size())) {
+        f.cancelWriting();
+        return false;
+    }
+    return f.commit();
 }
 
 std::string signerFolder() {
@@ -384,45 +423,52 @@ bool makeCertificateChain(const std::string& organisation, CertificateChain& out
 }
 
 bool signerCertificateChain(CertificateChain& out, std::string* error, const std::string& folderPath) {
-    const QDir dir(QString::fromStdString(folderPath.empty() ? signerFolder() : folderPath));
-    const char* files[] = {"root.pem", "intermediate.pem", "leaf.pem"};
-    auto read = [&](const char* name, std::string& text) {
-        QFile f(dir.filePath(QString::fromLatin1(name)));
-        if (!f.open(QIODevice::ReadOnly)) return false;
-        text = f.readAll().toStdString();
-        return !text.empty();
+    // One chain for good: the DKDMs (the only copies of encrypted packages' keys) are encrypted to its leaf, so a chain
+    // with a file missing is reported, never replaced; and two exports at once make it once.
+    static std::mutex making;
+    const std::lock_guard<std::mutex> lock(making);
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
     };
-    CertificateChain chain;
-    bool have = true;
-    for (const char* name : files) {
-        std::string pem;
-        have = have && read(name, pem);
-        chain.certificates.push_back(pem);
-    }
-    have = have && read("leaf.key", chain.privateKey);
-    if (have) {
-        out = chain;
+    const QDir dir(QString::fromStdString(folderPath.empty() ? signerFolder() : folderPath));
+    const char* files[] = {"root.pem", "intermediate.pem", "leaf.pem", "leaf.key"};
+    int present = 0;
+    for (const char* name : files) present += QFileInfo::exists(dir.filePath(QString::fromLatin1(name))) ? 1 : 0;
+    if (present == 4) {
+        CertificateChain chain;
+        for (const char* name : files) {
+            QFile f(dir.filePath(QString::fromLatin1(name)));
+            if (!f.open(QIODevice::ReadOnly)) return fail("Cannot read " + f.fileName().toStdString());
+            std::string text = f.readAll().toStdString();
+            if (text.empty()) return fail(f.fileName().toStdString() + " is empty: restore it from a backup (DKDMs need this signing chain)");
+            if (std::strcmp(name, "leaf.key") == 0) chain.privateKey = std::move(text);
+            else chain.certificates.push_back(std::move(text));
+        }
+        out = std::move(chain);
         return true;
     }
+    if (present > 0)
+        return fail("The DCP signing chain in " + dir.path().toStdString() +
+                    " is incomplete: restore its missing files from a backup (DKDMs need this chain; a new one cannot open them)");
+    CertificateChain chain;
     if (!makeCertificateChain("Montage", chain, error)) return false;
-    if (!QDir().mkpath(dir.path())) {
-        if (error) *error = "Cannot make " + dir.path().toStdString();
-        return false;
-    }
+    // A folder only its owner reads, the key file likewise from the moment it exists; each file written whole.
+    if (!QDir().mkpath(dir.path())) return fail("Cannot make " + dir.path().toStdString());
+    QFile::setPermissions(dir.path(), QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+    std::vector<QString> written;
     auto write = [&](const char* name, const std::string& text, bool secret) {
-        QFile f(dir.filePath(QString::fromLatin1(name)));
-        if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
-        if (secret) f.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
-        return f.write(text.data(), qint64(text.size())) == qint64(text.size());
+        const QString path = dir.filePath(QString::fromLatin1(name));
+        if (!writeWholeFile(path.toStdString(), text, secret)) return false;
+        written.push_back(path);
+        return true;
     };
-    for (int i = 0; i < 3; ++i)
-        if (!write(files[i], chain.certificates[size_t(i)], false)) {
-            if (error) *error = "Cannot write the certificates to " + dir.path().toStdString();
-            return false;
-        }
-    if (!write("leaf.key", chain.privateKey, true)) {
-        if (error) *error = "Cannot write the signing key to " + dir.path().toStdString();
-        return false;
+    bool ok = true;
+    for (int i = 0; i < 3 && ok; ++i) ok = write(files[i], chain.certificates[size_t(i)], false);
+    ok = ok && write("leaf.key", chain.privateKey, true);
+    if (!ok) {
+        for (const QString& f : written) QFile::remove(f);  // nothing depends on a chain not yet whole
+        return fail("Cannot write the DCP signing chain to " + dir.path().toStdString());
     }
     out = std::move(chain);
     return true;
@@ -500,7 +546,7 @@ bool signXml(std::string& xml, const CertificateChain& chain, std::string* error
     return true;
 }
 
-bool verifyXmlSignature(const std::string& xml, std::string* error) {
+bool verifyXmlSignature(const std::string& xml, std::string* error, SignatureCheck* check) {
     auto fail = [&](const std::string& why) {
         if (error) *error = why;
         ERR_clear_error();
@@ -509,6 +555,7 @@ bool verifyXmlSignature(const std::string& xml, std::string* error) {
     SignatureParts parts;
     if (!readSignature(xml, parts)) return fail("The document has no signature");
     if (parts.certificates.empty()) return fail("The signature names no certificate");
+    if (parts.references.empty()) return fail("The signature covers nothing");
     for (const auto& r : parts.references) {
         const EVP_MD* md = digestFor(r.digestMethod);
         if (!md) return fail("Unknown digest method " + r.digestMethod.toStdString());
@@ -531,19 +578,30 @@ bool verifyXmlSignature(const std::string& xml, std::string* error) {
     const EVP_MD* md = parts.method.endsWith(QLatin1String("rsa-sha256")) ? EVP_sha256() : parts.method.endsWith(QLatin1String("rsa-sha1")) ? EVP_sha1() : nullptr;
     if (!md) return fail("Unknown signature method " + parts.method.toStdString());
     if (!verifyWith(X509_get0_pubkey(leaf.get()), md, signedInfo, unbase64(parts.value))) return fail("The signature does not match its certificate");
-    // Each certificate signed by the next, the last by itself.
+    // Each certificate issued (names and key identifiers) and signed by the next, a certificate authority; the last by
+    // itself.
     for (size_t i = 0; i < parts.certificates.size(); ++i) {
         Ptr<X509> c = certificateFrom(parts.certificates[i]);
-        Ptr<X509> by = certificateFrom(parts.certificates[std::min(i + 1, parts.certificates.size() - 1)]);
-        if (!c || !by || X509_verify(c.get(), X509_get0_pubkey(by.get())) != 1) return fail("The signer's certificate chain is broken");
+        const bool last = i + 1 == parts.certificates.size();
+        Ptr<X509> by = certificateFrom(parts.certificates[last ? i : i + 1]);
+        if (!c || !by || X509_verify(c.get(), X509_get0_pubkey(by.get())) != 1 || X509_check_issued(by.get(), c.get()) != X509_V_OK ||
+            (parts.certificates.size() > 1 && X509_check_ca(by.get()) == 0))
+            return fail("The signer's certificate chain is broken");
+    }
+    if (check) {
+        check->references.clear();
+        for (const auto& r : parts.references) check->references.push_back(r.uri.toStdString());
+        check->signerThumbprint = base64(thumbprintBytes(leaf.get()));
     }
     return true;
 }
 
-ContentKey newContentKey(const std::string& type) {
+ContentKey newContentKey(const std::string& type, bool* ok) {
     ContentKey k;
     k.id = newUuid();
-    RAND_bytes(k.key.data(), int(k.key.size()));
+    const bool made = RAND_bytes(k.key.data(), int(k.key.size())) == 1;
+    if (!made) k.key.fill(0);
+    if (ok) *ok = made;
     k.type = type;
     return k;
 }
@@ -681,32 +739,54 @@ bool readKdm(const std::string& xml, const std::string& privateKey, KdmContents&
         return false;
     };
     std::string err;
-    if (!verifyXmlSignature(xml, &err)) return fail("The KDM's signature does not hold: " + err);
+    SignatureCheck signature;
+    if (!verifyXmlSignature(xml, &err, &signature)) return fail("The KDM's signature does not hold: " + err);
     SignatureParts parts;
     readSignature(xml, parts);
     Ptr<X509> signer = certificateFrom(parts.certificates.front());
     const std::string thumb = signer ? thumbprintBytes(signer.get()) : std::string();
     KdmContents k;
+    k.signerThumbprint = signature.signerThumbprint;
     std::vector<std::string> ciphers;
     QXmlStreamReader x(QByteArray(xml.data(), qsizetype(xml.size())));
+    x.setNamespaceProcessing(true);
     std::vector<QString> stack;
+    QString publicId, privateId;
+    int part = 0;  // 1 inside the public part, 2 inside the private part (the only parts read: the ones signed)
+    int partDepth = 0;
+    std::map<QString, int> seen;  // fields that must appear once
+    auto once = [&](const QString& name) { return ++seen[name] == 1; };
+    bool twice = false;
     while (!x.atEnd()) {
         x.readNext();
         if (x.isStartElement()) {
             stack.push_back(x.name().toString());
-            if (x.name() == QLatin1String("TypedKeyId")) k.keys.emplace_back();
-            if (x.name() == QLatin1String("CipherValue")) ciphers.emplace_back();
+            if (!part && (x.name() == QLatin1String("AuthenticatedPublic") || x.name() == QLatin1String("AuthenticatedPrivate"))) {
+                part = x.name() == QLatin1String("AuthenticatedPublic") ? 1 : 2;
+                partDepth = int(stack.size());
+                (part == 1 ? publicId : privateId) = x.attributes().value(QLatin1String("Id")).toString();
+                if (!once(x.name().toString())) twice = true;
+            }
+            if (part == 1 && x.name() == QLatin1String("TypedKeyId")) k.keys.emplace_back();
+            for (const char* field : {"CompositionPlaylistId", "ContentTitleText", "ContentKeysNotValidBefore", "ContentKeysNotValidAfter"})
+                if (part == 1 && x.name() == QLatin1String(field) && !once(x.name().toString())) twice = true;
+            if (part == 2 && x.name() == QLatin1String("CipherValue") && x.namespaceUri() == QLatin1String("http://www.w3.org/2001/04/xmlenc#"))
+                ciphers.emplace_back();
         } else if (x.isEndElement()) {
+            if (part && int(stack.size()) == partDepth) part = 0;
             if (!stack.empty()) stack.pop_back();
-        } else if (x.isCharacters() && !stack.empty()) {
+        } else if (x.isCharacters() && !stack.empty() && part) {
             const QString name = stack.back(), up = stack.size() > 1 ? stack[stack.size() - 2] : QString();
             const std::string text = x.text().toString().trimmed().toStdString();
             auto bare = [](std::string s) { return s.rfind("urn:uuid:", 0) == 0 ? s.substr(9) : s; };
-            if (name == QLatin1String("CompositionPlaylistId")) k.cplId = bare(text);
-            else if (name == QLatin1String("ContentTitleText")) k.contentTitle = text;
-            else if (name == QLatin1String("AnnotationText") && up == QLatin1String("AuthenticatedPublic")) k.annotation = text;
-            else if (name == QLatin1String("ContentKeysNotValidBefore")) k.notValidBefore = text;
-            else if (name == QLatin1String("ContentKeysNotValidAfter")) k.notValidAfter = text;
+            const std::string raw = x.text().toString().toStdString();  // (a field's text can come in pieces)
+            if (part == 2) {
+                if (name == QLatin1String("CipherValue") && !ciphers.empty()) ciphers.back() += x.text().toString().toStdString();
+            } else if (name == QLatin1String("CompositionPlaylistId")) k.cplId += raw;
+            else if (name == QLatin1String("ContentTitleText")) k.contentTitle += raw;
+            else if (name == QLatin1String("AnnotationText") && up == QLatin1String("AuthenticatedPublic")) k.annotation += raw;
+            else if (name == QLatin1String("ContentKeysNotValidBefore")) k.notValidBefore += raw;
+            else if (name == QLatin1String("ContentKeysNotValidAfter")) k.notValidAfter += raw;
             else if (name == QLatin1String("X509SubjectName") && up == QLatin1String("Recipient")) k.recipientSubject = text;
             else if (name == QLatin1String("X509IssuerName") && up == QLatin1String("X509IssuerSerial") && stack.size() > 2 &&
                      stack[stack.size() - 3] == QLatin1String("Recipient"))
@@ -716,10 +796,18 @@ bool readKdm(const std::string& xml, const std::string& privateKey, KdmContents&
                 k.recipientSerial = text;
             else if (name == QLatin1String("KeyType") && !k.keys.empty()) k.keys.back().type = text;
             else if (name == QLatin1String("KeyId") && !k.keys.empty()) parseUuid(bare(text), k.keys.back().id);
-            else if (name == QLatin1String("CipherValue") && !ciphers.empty()) ciphers.back() += x.text().toString().toStdString();
         }
     }
     if (x.hasError()) return fail("The KDM is not well-formed");
+    if (twice) return fail("The KDM gives a part or a field twice");
+    for (std::string* field : {&k.cplId, &k.contentTitle, &k.annotation, &k.notValidBefore, &k.notValidAfter})
+        *field = QString::fromStdString(*field).trimmed().toStdString();
+    if (k.cplId.rfind("urn:uuid:", 0) == 0) k.cplId = k.cplId.substr(9);
+    // Both parts, and only they, signed (by reference to their ids).
+    std::vector<std::string> wanted{"#" + publicId.toStdString(), "#" + privateId.toStdString()}, covered = signature.references;
+    std::sort(wanted.begin(), wanted.end());
+    std::sort(covered.begin(), covered.end());
+    if (publicId.isEmpty() || privateId.isEmpty() || covered != wanted) return fail("The KDM's signature does not cover its public and private parts");
     if (!privateKey.empty()) {
         Ptr<EVP_PKEY> key = privateKeyFrom(privateKey);
         if (!key) return fail("The private key cannot be read");
@@ -743,6 +831,9 @@ bool readKdm(const std::string& xml, const std::string& privateKey, KdmContents&
             Uuid id{};
             std::memcpy(id.data(), block.data() + 56, 16);
             if (id != k.keys[i].id || block.compare(52, 4, k.keys[i].type) != 0) return fail("A key block does not match its key id");
+            // The window the key is given for is the block's (encrypted with the key); the public part must agree.
+            if (block.compare(72, 25, k.notValidBefore) != 0 || block.compare(97, 25, k.notValidAfter) != 0)
+                return fail("A key block's window is not the KDM's");
             std::memcpy(k.keys[i].key.data(), block.data() + 122, 16);
         }
     }
@@ -789,11 +880,12 @@ bool makeCertificateChain(const std::string&, CertificateChain&, std::string* er
 bool signerCertificateChain(CertificateChain&, std::string* error, const std::string&) { return none(error); }
 bool readCertificate(const std::string&, CertificateInfo&, std::string* error) { return none(error); }
 bool signXml(std::string&, const CertificateChain&, std::string* error) { return none(error); }
-bool verifyXmlSignature(const std::string&, std::string* error) { return none(error); }
-ContentKey newContentKey(const std::string& type) {
+bool verifyXmlSignature(const std::string&, std::string* error, SignatureCheck*) { return none(error); }
+ContentKey newContentKey(const std::string& type, bool* ok) {
     ContentKey k;
     k.id = newUuid();
     k.type = type;
+    if (ok) *ok = false;
     return k;
 }
 bool makeKdm(const KdmSettings&, const CertificateChain&, std::string&, std::string* error) { return none(error); }

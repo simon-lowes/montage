@@ -452,7 +452,11 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
         if (!dcp::signerCertificateChain(chain, &err, settings.certificates)) return fail("Cannot sign the package: " + err);
     }
     dcp::ContentKey pictureKey, soundKey, subtitleKey;
-    if (settings.encrypt) pictureKey = dcp::newContentKey("MDIK"), soundKey = dcp::newContentKey("MDAK"), subtitleKey = dcp::newContentKey("MDSK");
+    if (settings.encrypt) {
+        bool a = false, b = false, c = false;
+        pictureKey = dcp::newContentKey("MDIK", &a), soundKey = dcp::newContentKey("MDAK", &b), subtitleKey = dcp::newContentKey("MDSK", &c);
+        if (!a || !b || !c) return fail("Cannot make the content keys (the system's random source failed)");
+    }
     auto encryption = [](const dcp::ContentKey& k) {
         dcp::TrackEncryption e;
         e.key = k.key;
@@ -647,8 +651,7 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
         std::string xmlText = f.readAll().toStdString();
         f.close();
         std::string err;
-        if (!dcp::signXml(xmlText, chain, &err) || !f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
-        return f.write(xmlText.data(), qint64(xmlText.size())) == qint64(xmlText.size());
+        return dcp::signXml(xmlText, chain, &err) && dcp::writeWholeFile(f.fileName().toStdString(), xmlText);
     };
     auto keyId = [&](QXmlStreamWriter& x, const dcp::ContentKey& k) {
         if (settings.encrypt) writeText(x, "KeyId", urn(k.id));
@@ -852,13 +855,16 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
         dcp::CertificateInfo leaf;
         dcp::readCertificate(chain.certificates.back(), leaf);
         const QDateTime until = QDateTime::fromString(QString::fromStdString(leaf.notAfter), Qt::ISODate);
+        // KDMs can only be made inside the DKDM's window, which ends with the signing certificate.
+        if (!until.isValid() || until.toSecsSinceEpoch() < QDateTime::currentSecsSinceEpoch() + 30 * 86400LL)
+            return fail("The signing certificate ends within 30 days (" + leaf.notAfter + "): the package's keys could not be given out after that");
         dcp::KdmSettings k;
         k.cplId = dcp::uuidString(cplId);
         k.contentTitle = name;
         k.annotation = "DKDM for " + name;
         const int64_t now = QDateTime::currentSecsSinceEpoch();
         k.notValidBefore = dcp::kdmTime(now - 60);
-        k.notValidAfter = dcp::kdmTime(std::max<int64_t>(now + 86400, until.toSecsSinceEpoch() - 86400));
+        k.notValidAfter = dcp::kdmTime(until.toSecsSinceEpoch() - 86400);
         k.keys = {pictureKey, soundKey};
         if (subtitleTrack) k.keys.push_back(subtitleKey);
         k.recipient = chain.certificates.back();
@@ -867,8 +873,7 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
         const QDir keep(QString::fromStdString(settings.dkdms.empty() ? dcp::dkdmFolder() : settings.dkdms));
         if (!QDir().mkpath(keep.path())) return fail("Cannot make " + keep.path().toStdString());
         dkdmPath = keep.filePath(QStringLiteral("DKDM_%1_%2.xml").arg(QString::fromStdString(name), QString::fromStdString(dcp::uuidString(cplId)))).toStdString();
-        QFile f(QString::fromStdString(dkdmPath));
-        if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(xmlText.data(), qint64(xmlText.size())) != qint64(xmlText.size()))
+        if (!dcp::writeWholeFile(dkdmPath, xmlText))
             return fail("Cannot write the DKDM to " + dkdmPath + ": without it the package can never be opened");
     }
     if (progress) progress(1.0);
@@ -905,15 +910,19 @@ bool makeKdms(const KdmRequest& r, std::vector<std::string>* files, std::string*
     if (!f.open(QIODevice::ReadOnly)) return fail("Cannot read the DKDM " + r.dkdm);
     dcp::KdmContents dkdm;
     if (!dcp::readKdm(f.readAll().toStdString(), chain.privateKey, dkdm, &err)) return fail("The DKDM cannot be opened with this signer's key: " + err);
+    // Montage's own: signed by its leaf too (anyone can encrypt to that leaf, whose certificate every signed CPL carries).
+    dcp::CertificateInfo own;
+    if (!dcp::readCertificate(chain.certificates.back(), own) || dkdm.signerThumbprint != own.thumbprint)
+        return fail("The DKDM was not made by this signer");
     if (r.notAfter <= r.notBefore) return fail("The KDM's window ends before it starts");
     if (r.recipients.empty()) return fail("No cinema server certificates");
-    if (!QDir().mkpath(QString::fromStdString(r.folder))) return fail("Cannot make " + r.folder);
     // The window must sit inside the DKDM's (the keys are not to be given out for longer than they were kept for).
     const QDateTime from = QDateTime::fromString(QString::fromStdString(dkdm.notValidBefore), Qt::ISODate);
     const QDateTime to = QDateTime::fromString(QString::fromStdString(dkdm.notValidAfter), Qt::ISODate);
     if (to.isValid() && r.notAfter > to.toSecsSinceEpoch()) return fail("The window ends after the DKDM's (" + dkdm.notValidAfter + ")");
     if (from.isValid() && r.notBefore < from.toSecsSinceEpoch() - 86400) return fail("The window starts before the DKDM's (" + dkdm.notValidBefore + ")");
-    std::vector<std::string> made;
+    // Each server's leaf first, so a bad certificate makes no KDMs at all.
+    std::vector<std::pair<std::string, dcp::CertificateInfo>> servers;
     for (const std::string& given : r.recipients) {
         std::string pem = given;
         if (pem.find("-----BEGIN") == std::string::npos) {
@@ -929,8 +938,22 @@ bool makeKdms(const KdmRequest& r, std::vector<std::string>* files, std::string*
             if (dcp::readCertificate(c, info) && !info.ca) leafPem = c, leaf = info;
         }
         if (leafPem.empty()) return fail("No server certificate in " + (given.size() < 200 ? given : std::string("the text given")));
+        const QDateTime certStart = QDateTime::fromString(QString::fromStdString(leaf.notBefore), Qt::ISODate);
         const QDateTime certEnd = QDateTime::fromString(QString::fromStdString(leaf.notAfter), Qt::ISODate);
-        if (certEnd.isValid() && r.notAfter > certEnd.toSecsSinceEpoch()) return fail("The window ends after the certificate of " + leaf.commonName + " does");
+        if (!certStart.isValid() || !certEnd.isValid()) return fail("The certificate of " + leaf.commonName + " has no validity dates");
+        if (r.notAfter > certEnd.toSecsSinceEpoch()) return fail("The window ends after the certificate of " + leaf.commonName + " does");
+        if (r.notBefore < certStart.toSecsSinceEpoch()) return fail("The window starts before the certificate of " + leaf.commonName + " does");
+        servers.emplace_back(leafPem, leaf);
+    }
+    if (!QDir().mkpath(QString::fromStdString(r.folder))) return fail("Cannot make " + r.folder);
+    auto safe = [](const std::string& text) {
+        QString n = QString::fromStdString(text);
+        n.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9._-]+")), QStringLiteral("_"));
+        n.replace(QRegularExpression(QStringLiteral("^[._]+")), QString());  // (no "..", no hidden files)
+        return n.left(60).isEmpty() ? QStringLiteral("KDM") : n.left(60);
+    };
+    std::vector<std::string> made;
+    for (const auto& [leafPem, leaf] : servers) {
         dcp::KdmSettings k;
         k.cplId = dkdm.cplId;
         k.contentTitle = dkdm.contentTitle;
@@ -941,14 +964,13 @@ bool makeKdms(const KdmRequest& r, std::vector<std::string>* files, std::string*
         k.recipient = leafPem;
         std::string xml;
         if (!dcp::makeKdm(k, chain, xml, &err)) return fail(err);
-        QString server = QString::fromStdString(leaf.commonName);
-        server.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9._-]+")), QStringLiteral("_"));
-        const QString file = QDir(QString::fromStdString(r.folder))
-                                 .filePath(QStringLiteral("KDM_%1_%2_%3.xml").arg(QString::fromStdString(dkdm.contentTitle).left(60), server.left(60),
-                                                                                 QDateTime::fromSecsSinceEpoch(r.notBefore).toUTC().toString("yyyyMMdd")));
-        QFile out(file);
-        if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate) || out.write(xml.data(), qint64(xml.size())) != qint64(xml.size()))
-            return fail("Cannot write " + file.toStdString());
+        // Named by the title, the server and the day; two servers of one name told apart by their certificates.
+        const QString stem = QStringLiteral("KDM_%1_%2_%3").arg(safe(dkdm.contentTitle), safe(leaf.commonName),
+                                                               QDateTime::fromSecsSinceEpoch(r.notBefore).toUTC().toString("yyyyMMdd"));
+        QString file = QDir(QString::fromStdString(r.folder)).filePath(stem + ".xml");
+        if (std::find(made.begin(), made.end(), file.toStdString()) != made.end())
+            file = QDir(QString::fromStdString(r.folder)).filePath(stem + "_" + safe(leaf.serial) + ".xml");
+        if (!dcp::writeWholeFile(file.toStdString(), xml)) return fail("Cannot write " + file.toStdString());
         made.push_back(file.toStdString());
     }
     if (files) *files = made;
@@ -1098,7 +1120,11 @@ std::vector<std::string> verifyDcp(const std::string& folderPath, const std::fun
         const std::string text = f.readAll().toStdString();
         if (text.find("xmldsig#") == std::string::npos || text.find("Signature") == std::string::npos) return;
         std::string err;
-        if (dcp::securityAvailable() && !dcp::verifyXmlSignature(text, &err)) issue(QStringLiteral("%1's signature does not hold: %2").arg(path, QString::fromStdString(err)));
+        dcp::SignatureCheck check;
+        if (!dcp::securityAvailable()) return;
+        if (!dcp::verifyXmlSignature(text, &err, &check)) issue(QStringLiteral("%1's signature does not hold: %2").arg(path, QString::fromStdString(err)));
+        else if (std::find(check.references.begin(), check.references.end(), std::string()) == check.references.end())
+            issue(path + "'s signature does not cover the whole document");
     };
     for (auto& [id, a] : assets)
         if (a.packingList) signature(a.path);

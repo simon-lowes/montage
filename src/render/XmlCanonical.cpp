@@ -12,30 +12,45 @@ namespace {
 
 const QString kXmlDsig = QStringLiteral("http://www.w3.org/2000/09/xmldsig#");
 
-void escapeText(std::string& out, const QString& s) {
-    for (const QChar c : s) {
-        switch (c.unicode()) {
-        case '&': out += "&amp;"; break;
-        case '<': out += "&lt;"; break;
-        case '>': out += "&gt;"; break;
-        case '\r': out += "&#xD;"; break;
-        default: out += QString(c).toStdString();
-        }
+// The characters between escapes go out as UTF-8 in runs, so a pair of surrogates (a character past U+FFFF) stays
+// one character.
+template <typename Escape>
+void escapeWith(std::string& out, const QString& s, Escape escape) {
+    qsizetype from = 0;
+    for (qsizetype i = 0; i < s.size(); ++i) {
+        const char* e = escape(s[i].unicode());
+        if (!e) continue;
+        out += s.mid(from, i - from).toStdString();
+        out += e;
+        from = i + 1;
     }
+    out += s.mid(from).toStdString();
+}
+
+void escapeText(std::string& out, const QString& s) {
+    escapeWith(out, s, [](char16_t c) -> const char* {
+        switch (c) {
+        case '&': return "&amp;";
+        case '<': return "&lt;";
+        case '>': return "&gt;";
+        case '\r': return "&#xD;";
+        default: return nullptr;
+        }
+    });
 }
 
 void escapeAttribute(std::string& out, const QString& s) {
-    for (const QChar c : s) {
-        switch (c.unicode()) {
-        case '&': out += "&amp;"; break;
-        case '<': out += "&lt;"; break;
-        case '"': out += "&quot;"; break;
-        case '\t': out += "&#x9;"; break;
-        case '\n': out += "&#xA;"; break;
-        case '\r': out += "&#xD;"; break;
-        default: out += QString(c).toStdString();
+    escapeWith(out, s, [](char16_t c) -> const char* {
+        switch (c) {
+        case '&': return "&amp;";
+        case '<': return "&lt;";
+        case '"': return "&quot;";
+        case '\t': return "&#x9;";
+        case '\n': return "&#xA;";
+        case '\r': return "&#xD;";
+        default: return nullptr;
         }
-    }
+    });
 }
 
 QString prefixOf(QStringView qualified) {
