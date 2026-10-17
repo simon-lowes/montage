@@ -934,6 +934,55 @@ private slots:
         QVERIFY(exportCaptions(track, seq, ".docx").empty());
     }
 
+    void italicAndCinemaCaptions() {
+        const Rational fps{24, 1};
+        Caption song{24, 72, "\xE2\x99\xAA Far away\nand home"};
+        song.italic = true;
+        Caption said{96, 120, "Said <aloud> & clear"};
+        said.vertical = kCaptionTop, said.align = kCaptionLeft;
+        const std::vector<Caption> caps = {song, said};
+        std::string err;
+        // Italics travel through each format and back; a caption only partly in italics stays upright.
+        CaptionStyle style;
+        for (const std::string& text : {captionsToSrt(caps, fps), captionsToVtt(caps, fps), captionsToTtml(caps, fps, "en", style),
+                                        captionsToAss(caps, fps, style, 1920, 1080)}) {
+            std::vector<Caption> back;
+            QVERIFY2(parseSubtitles(text, fps, back, &err), err.c_str());
+            QCOMPARE(back.size(), size_t(2));
+            QVERIFY2(back[0].italic && !back[1].italic, text.c_str());
+        }
+        std::vector<Caption> partly;
+        QVERIFY(parseSubtitles("1\n00:00:01,000 --> 00:00:02,000\n<i>Half</i> and half\n", fps, partly, &err));
+        QVERIFY(partly.size() == 1 && !partly[0].italic);
+        // Digital cinema subtitles (ST 428-7): times in edit units, lines placed from the edge, italics in a Font, the
+        // escapes; and back with the document's id, language and font.
+        DcstInfo info;
+        info.id = "8b0c4bb7-2b1e-4a2d-9f3a-0c1d2e3f4a5b";
+        info.title = "Film";
+        info.language = "fr";
+        info.fontUuid = "1d2c3b4a-5f6e-4a7b-8c9d-0e1f2a3b4c5d";
+        const std::string dcst = captionsToDcst(caps, style, info);
+        QVERIFY(dcst.find("<SubtitleReel xmlns=\"http://www.smpte-ra.org/schemas/428-7/2014/DCST\"") != std::string::npos);
+        QVERIFY(dcst.find("<Id>urn:uuid:8b0c4bb7-2b1e-4a2d-9f3a-0c1d2e3f4a5b</Id>") != std::string::npos);
+        QVERIFY(dcst.find("<Language>fr</Language>") != std::string::npos && dcst.find("<EditRate>24 1</EditRate>") != std::string::npos);
+        QVERIFY(dcst.find("urn:uuid:1d2c3b4a-5f6e-4a7b-8c9d-0e1f2a3b4c5d") != std::string::npos);
+        QVERIFY2(dcst.find("Italic=\"yes\"") != std::string::npos && dcst.find("Said &lt;aloud&gt; &amp; clear") != std::string::npos, dcst.c_str());
+        std::vector<Caption> back;
+        DcstInfo got;
+        QVERIFY2(parseDcst(dcst, fps, back, &err, &got), err.c_str());
+        QCOMPARE(back.size(), size_t(2));
+        QVERIFY(back[0].start == 24 && back[0].end == 72 && back[0].text == song.text && back[0].italic && back[0].vertical == kCaptionBottom);
+        QVERIFY(back[1].text == said.text && !back[1].italic && back[1].vertical == kCaptionTop && back[1].align == kCaptionLeft);
+        QVERIFY(got.id == info.id && got.language == "fr" && got.editRate == 24);
+        // Interop's DCSubtitle counts 4 ms ticks.
+        const std::string interop =
+            "<DCSubtitle Version=\"1.0\"><SubtitleID>a</SubtitleID><Language>English</Language><Font Id=\"f\">"
+            "<Subtitle SpotNumber=\"1\" TimeIn=\"00:00:01:125\" TimeOut=\"00:00:03:000\"><Text VAlign=\"bottom\" VPosition=\"10\">One</Text>"
+            "<Text VAlign=\"bottom\" VPosition=\"4\">two</Text></Subtitle></Font></DCSubtitle>";
+        QVERIFY2(parseDcst(interop, fps, back, &err), err.c_str());
+        QVERIFY(back.size() == 1 && back[0].start == 36 && back[0].end == 72 && back[0].text == "One\ntwo");
+    }
+
     void captionChecksAndTools() {
         const Rational fps{24, 1};
         std::vector<Caption> caps = {{0, 48, "Short and fine"},

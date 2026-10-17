@@ -429,6 +429,9 @@ private slots:
         // Settings of their own: nothing the app saved (window layout, workspace, presets) leaks into the tests.
         for (auto format : {QSettings::NativeFormat, QSettings::IniFormat})
             QSettings::setPath(format, QSettings::UserScope, dir_.filePath(QStringLiteral("settings")));
+        // DCP signing certificates and DKDMs of their own too.
+        qputenv("MONTAGE_DCP_CERTIFICATES", dir_.filePath(QStringLiteral("dcp-certificates")).toUtf8());
+        qputenv("MONTAGE_DCP_DKDMS", dir_.filePath(QStringLiteral("dkdm")).toUtf8());
         win_ = std::make_unique<MainWindow>();
         win_->resize(1600, 1000);
         win_->show();

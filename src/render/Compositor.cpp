@@ -2192,6 +2192,7 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const Color
     const double px = std::max(4.0, st.size * img.height * (anim == 4 ? 1.8 : 1.0));
     f.setPixelSize(int(std::lround(px)));
     f.setBold(st.bold || anim == 4);
+    f.setItalic(cap->italic);
     f.setHintingPreference(QFont::PreferNoHinting);
     const QFontMetricsF fm(f);
     // The words of each line, numbered through the caption.

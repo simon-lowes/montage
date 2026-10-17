@@ -186,7 +186,10 @@ CaptionsPanel::CaptionsPanel(EditorState* state, QWidget* parent) : QWidget(pare
         state_->message(n ? tr("Moved %1 captions to the top, clear of titles").arg(n) : tr("No caption is over a low title"), 3000);
     })->setObjectName(QStringLiteral("raiseCaptions"));
     place->setMenu(placeMenu);
-    for (QToolButton* b : {add, split, merge, del, place}) bottom->addWidget(b);
+    auto* italic = button(this, tr("Italic"), tr("Put the selected captions in italics (a voice off screen, a song), or back upright"));
+    italic->setObjectName(QStringLiteral("italicCaptions"));
+    connect(italic, &QToolButton::clicked, this, [this] { toggleItalic(); });
+    for (QToolButton* b : {add, split, merge, del, place, italic}) bottom->addWidget(b);
     bottom->addStretch();
     lay->addLayout(bottom);
 
@@ -294,6 +297,11 @@ void CaptionsPanel::rebuild() {
             auto* in = new QTableWidgetItem(QString::fromStdString(formatTimecode(c.start, s->fps)));
             auto* out = new QTableWidgetItem(QString::fromStdString(formatTimecode(c.end, s->fps)));
             auto* text = new QTableWidgetItem(QString::fromStdString(c.text));
+            if (c.italic) {
+                QFont f = text->font();
+                f.setItalic(true);
+                text->setFont(f);
+            }
             // What it breaks, if anything: a warning sign with the details as its tooltip.
             auto* check = new QTableWidgetItem(problems[i] || !spelling[i].empty() ? QStringLiteral("\u26A0") : QString());
             check->setFlags(check->flags() & ~Qt::ItemIsEditable);
@@ -1196,6 +1204,25 @@ bool CaptionsPanel::placeCaptions(int vertical, int align) {
     }
     const QString label = vertical == kCaptionTop ? tr("Captions to Top") : vertical >= 0 ? tr("Place Captions") : tr("Line Up Captions");
     return editTrack(label, [&](CaptionTrack& ct) { return montage::placeCaptions(ct.captions, rows, vertical, align); });
+}
+
+bool CaptionsPanel::toggleItalic() {
+    const CaptionTrack* t = track();
+    if (!t) return false;
+    std::vector<size_t> rows = selectedCaptions();
+    if (rows.empty()) {
+        const Caption* at = captionAt(*t, state_->playhead());
+        if (!at) return false;
+        rows = {size_t(at - t->captions.data())};
+    }
+    bool all = true;
+    for (size_t r : rows) all = all && r < t->captions.size() && t->captions[r].italic;
+    return editTrack(all ? tr("Captions Upright") : tr("Captions in Italics"), [&](CaptionTrack& ct) {
+        bool changed = false;
+        for (size_t r : rows)
+            if (r < ct.captions.size() && ct.captions[r].italic == all) ct.captions[r].italic = !all, changed = true;
+        return changed;
+    });
 }
 
 int CaptionsPanel::raiseOverTitles() {

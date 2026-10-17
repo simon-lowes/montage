@@ -379,8 +379,10 @@ QString stripMarkup(QString s) {
 std::string captionsToSrt(const std::vector<Caption>& captions, Rational fps) {
     // A caption out of its usual place leads with the {\an} tag players read in SubRip.
     std::vector<Cue> cues = toCues(captions, fps);
-    for (size_t i = 0; i < cues.size(); ++i)
+    for (size_t i = 0; i < cues.size(); ++i) {
+        if (captions[i].italic) cues[i].text = "<i>" + cues[i].text + "</i>";
         if (const int k = captionKeypad(captions[i]); k != 2) cues[i].text = "{\\an" + std::to_string(k) + "}" + cues[i].text;
+    }
     return cuesToSrt(cues);
 }
 
@@ -388,6 +390,7 @@ std::string captionsToVtt(const std::vector<Caption>& captions, Rational fps) {
     std::vector<Cue> cues = toCues(captions, fps);
     for (size_t i = 0; i < cues.size(); ++i) {
         const Caption& c = captions[i];
+        if (c.italic) cues[i].text = "<i>" + cues[i].text + "</i>";
         std::string& s = cues[i].settings;
         if (c.vertical == kCaptionTop) s = "line:10%";
         else if (c.vertical == kCaptionMiddle) s = "line:50%,center";
@@ -404,6 +407,9 @@ bool parseSubtitles(const std::string& text, Rational fps, std::vector<Caption>&
     const std::string head = text.substr(skip, 4096);
     if (head.rfind("Scenarist_SCC", 0) == 0) return parseScc(text, fps, out, error);
     if (head.rfind("File Format=MacCaption_MCC", 0) == 0) return parseMcc(text, fps, out, error);
+    if ((head.find("<SubtitleReel") != std::string::npos || head.find("<DCSubtitle") != std::string::npos) &&
+        head.find("-->") == std::string::npos)
+        return parseDcst(text, fps, out, error);
     if (head.find("<tt") != std::string::npos && head.find("-->") == std::string::npos) return parseTtml(text, fps, out, error);
     if (head.find("[Script Info]") != std::string::npos || head.find("[Events]") != std::string::npos) return parseAss(text, fps, out, error);
     const double f = fps.valid() ? fps.toDouble() : 30.0;
@@ -426,18 +432,26 @@ bool parseSubtitles(const std::string& text, Rational fps, std::vector<Caption>&
         const double a = parseCueTime(parts[0]);
         const double b = parseCueTime(parts[1].trimmed().section(QRegularExpression(QStringLiteral("\\s+")), 0, 0));
         if (a < 0 || b < 0) continue;
-        QStringList body;
+        QStringList body, raw;
         int keypad = 0;
         for (int i = timing + 1; i < lines.size(); ++i) {
             if (!keypad) keypad = alignmentTag(lines[i]);
-            if (const QString l = stripMarkup(lines[i]); !l.isEmpty()) body << l;
+            if (const QString l = stripMarkup(lines[i]); !l.isEmpty()) body << l, raw << lines[i];
         }
+        // In italics throughout: <i> opening it and </i> closing it (after any {\an} tag), none closed between.
+        static const QRegularExpression lead(QStringLiteral("^(\\{[^}]*\\}\\s*)*"));
+        QString whole = raw.join('\n').trimmed();
+        whole.remove(lead);
+        const bool italic = whole.startsWith(QStringLiteral("<i>"), Qt::CaseInsensitive) &&
+                            whole.endsWith(QStringLiteral("</i>"), Qt::CaseInsensitive) &&
+                            whole.indexOf(QStringLiteral("</i>"), 0, Qt::CaseInsensitive) == whole.size() - 4;
         Caption c;
         c.start = FrameTime(std::llround(a * f));
         c.end = FrameTime(std::llround(b * f));
         c.text = body.join('\n').toStdString();
         placeFromVtt(parts[1].trimmed().section(QRegularExpression(QStringLiteral("\\s+")), 1), c);
         if (keypad) setCaptionKeypad(c, keypad);
+        c.italic = italic;
         caps.push_back(std::move(c));
     }
     normalizeCaptions(caps);

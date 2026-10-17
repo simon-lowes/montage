@@ -79,6 +79,9 @@ public:
     // Moves the selected captions (else the one under the playhead) up or down (`vertical`, -1 to
     // keep) and lines them up (`align`, -1 to keep); one undo step. False if none moved.
     bool placeCaptions(int vertical, int align);
+    // Puts the selected captions (else the one under the playhead) in italics, or back upright when all of them
+    // already are; one undo step.
+    bool toggleItalic();
     // Moves captions shown over low titles (lower thirds, crawls) to the top; how many moved.
     int raiseOverTitles();
     // Caption looks: the built-in ones (by id) and the editor's own saved ones (by name, remembered between sessions).

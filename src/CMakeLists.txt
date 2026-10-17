@@ -164,6 +164,8 @@ add_library(montage_engine STATIC
   render/ReviewExport.h render/ReviewExport.cpp
   render/DcpMxf.h render/DcpMxf.cpp
   render/Dcp.h render/Dcp.cpp
+  render/DcpSecurity.h render/DcpSecurity.cpp
+  render/XmlCanonical.h render/XmlCanonical.cpp
   render/RoomTone.h render/RoomTone.cpp
   render/ExtendClip.h render/ExtendClip.cpp
   render/PaperEdit.h render/PaperEdit.cpp
@@ -285,6 +287,9 @@ set_target_properties(montage_engine PROPERTIES AUTOMOC OFF)
 # Spelling word lists (core/SpellCheck.h), built in.
 qt_add_resources(montage_engine "dictionaries" PREFIX "/montage/dict" BASE "${CMAKE_CURRENT_SOURCE_DIR}/resources/dict"
   FILES resources/dict/english.txt resources/dict/american.txt resources/dict/british.txt)
+# The font DCP subtitles are drawn in (render/Dcp.h; SIL OFL 1.1, LICENSES/OFL-1.1-Liberation.txt).
+qt_add_resources(montage_engine "fonts" PREFIX "/montage/fonts" BASE "${CMAKE_CURRENT_SOURCE_DIR}/resources/fonts"
+  FILES resources/fonts/LiberationSans-Regular.ttf)
 
 if(MONTAGE_WITH_LV2)
   pkg_check_modules(LILV IMPORTED_TARGET GLOBAL lilv-0>=0.24)
@@ -350,6 +355,16 @@ if(MONTAGE_WITH_OPENJPEG)
     target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_OPENJPEG)
   else()
     message(STATUS "OpenJPEG 2.5 not found: IMF masters cannot be made")
+  endif()
+endif()
+if(MONTAGE_WITH_OPENSSL)
+  find_package(OpenSSL 3 QUIET COMPONENTS Crypto)
+  if(OPENSSL_FOUND)
+    message(STATUS "OpenSSL ${OPENSSL_VERSION}: encrypted DCPs and KDMs enabled")
+    target_link_libraries(montage_engine PRIVATE OpenSSL::Crypto)
+    target_compile_definitions(montage_engine PRIVATE MONTAGE_WITH_OPENSSL)
+  else()
+    message(STATUS "OpenSSL 3 not found: DCPs cannot be encrypted")
   endif()
 endif()
 if(MONTAGE_WITH_OCIO)
