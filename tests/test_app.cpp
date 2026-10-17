@@ -84,6 +84,7 @@
 #include "media/ContentCredentials.h"
 #include "ExposureView.h"
 #include "QualityCheckDialog.h"
+#include "ConformCheckDialog.h"
 #include "OffloadDialog.h"
 #include "CaptureDialog.h"
 #include "media/Capture.h"
@@ -720,6 +721,82 @@ private slots:
         QVERIFY(ranged.runCheck());
         QCOMPARE(ranged.issues().size(), size_t(1));
         QVERIFY(ranged.issues()[0].start == 60 && ranged.issues()[0].end == 120);
+    }
+
+    void conformCheckDialog() {
+        // A shot and the offline cut's reference movie of it, reframed to 110 %: the dialog finds the reframe and
+        // puts it right as one undo step.
+        QVERIFY(win_->findChild<QAction*>("conformCheck"));
+        const QString shot = dir_.path() + "/conform-shot.mp4", reference = dir_.path() + "/conform-reference.mp4";
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 320, gs.height = 180, gs.fps = {25, 1};
+            QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 0}, makeGeneratorClip(gen, "bars", 25)).ok);
+            Clip t = makeGeneratorClip(gen, "title", 25);
+            t.generator.strings["text"] = "CONFORM 42";
+            t.generator.params["size"] = 40.0;
+            QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 1}, t).ok);
+            ExportSettings st;
+            st.path = shot.toStdString();
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        {
+            Project ref = makeDefaultProject();
+            Sequence& rs = *ref.active();
+            rs.width = 320, rs.height = 180, rs.fps = {25, 1};
+            MediaItem m;
+            m.id = ref.newId();
+            QVERIFY(probeMedia(shot.toStdString(), m));
+            ref.media.push_back(m);
+            Clip c = makeClip(ref, m, TrackKind::Video, rs);
+            c.motion.params["scale"] = Param(110.0);
+            QVERIFY(edit::overwrite(ref, rs, {TrackKind::Video, 0}, c).ok);
+            ExportSettings st;
+            st.path = reference.toStdString();
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            st.burnIn.timecode = true;
+            std::string err;
+            QVERIFY2(exportSequence(ref, rs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({shot, reference});
+        QCOMPARE(ids.size(), size_t(2));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = 320, s.height = 180, s.fps = {25, 1};
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        ConformCheckDialog dlg(state(), win_.get());
+        auto* refBox = dlg.findChild<QComboBox*>("conformReference");
+        QCOMPARE(refBox->count(), 2);
+        QCOMPARE(refBox->currentData().toLongLong(), qint64(ids[1]));  // the one not cut in
+        auto* applyAll = dlg.findChild<QPushButton*>("conformApplyAll");
+        QVERIFY(!applyAll->isEnabled());
+        dlg.findChild<QLineEdit*>("conformStart")->setText("not a time");
+        QVERIFY(!dlg.runCheck());
+        dlg.setReferenceStart(0);
+        QVERIFY(dlg.runCheck());
+        QCOMPARE(dlg.shots().size(), size_t(1));
+        QCOMPARE(dlg.shots()[0].verdict, ConformVerdict::Reframed);
+        auto* table = dlg.findChild<QTableWidget*>("conformShots");
+        QCOMPARE(table->item(0, 2)->text(), QString("Reframed"));
+        QVERIFY(applyAll->isEnabled());
+        QVERIFY(dlg.findChild<QPushButton*>("conformMarkers")->isEnabled());
+        QCOMPARE(dlg.applyFixes(true), 1);
+        const Clip& c = state()->sequence()->videoTracks[0].clips[0];
+        QVERIFY2(std::fabs(c.motion.p("scale", 0, 100) - 110) < 0.5, std::to_string(c.motion.p("scale", 0, 100)).c_str());
+        QVERIFY(table->item(0, 2)->text().startsWith("Fixed"));
+        QVERIFY(!applyAll->isEnabled());
+        QVERIFY(!dlg.findChild<QPushButton*>("conformMarkers")->isEnabled());
+        QVERIFY(dlg.runCheck());
+        QCOMPARE(dlg.shots()[0].verdict, ConformVerdict::Matches);
+        QVERIFY(dlg.findChild<QLabel*>("conformSummary")->text().contains("match"));
+        state()->undo();
+        QCOMPARE(state()->sequence()->videoTracks[0].clips[0].motion.p("scale", 0, 100), 100.0);
     }
 
     void aleAndCdlFromTheMenus() {

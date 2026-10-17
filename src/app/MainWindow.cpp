@@ -116,6 +116,7 @@
 #include "AutoMixDialog.h"
 #include "ScriptCutDialog.h"
 #include "QualityCheckDialog.h"
+#include "ConformCheckDialog.h"
 #include "OffloadDialog.h"
 #include "CaptureDialog.h"
 #include "ProductionPanel.h"
@@ -1837,6 +1838,12 @@ void MainWindow::buildMenus() {
                                                    names, 0, false, &ok);
         if (ok) compareWith(ids[size_t(names.indexOf(pick))]);
     })->setObjectName(QStringLiteral("compareSequences"));
+    add(seqM, tr("Conform Check…"), QKeySequence(), [this] {
+        if (!state_->sequence()) return;
+        auto* dlg = new ConformCheckDialog(state_, this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->show();
+    })->setObjectName(QStringLiteral("conformCheck"));
     add(seqM, tr("Export Markers…"), QKeySequence(), [this] {
         QString filter;
         const QString path = QFileDialog::getSaveFileName(this, tr("Export Markers"), QString(),

@@ -142,6 +142,7 @@ add_library(montage_engine STATIC
   render/VideoDenoise.h render/VideoDenoise.cpp
   render/Restoration.h render/Restoration.cpp
   render/LensBlur.h render/LensBlur.cpp
+  render/ConformCheck.h render/ConformCheck.cpp
   render/Shapes.h render/Shapes.cpp
   render/Title3D.h render/Title3D.cpp
   render/AafExport.h render/AafExport.cpp

@@ -80,6 +80,7 @@
 #include "render/BroadcastMxf.h"
 #include "render/OGraf.h"
 #include "render/Restoration.h"
+#include "render/ConformCheck.h"
 #include "media/Vector.h"
 #include "media/Beats.h"
 #include "render/Spherical.h"
@@ -22681,6 +22682,170 @@ private slots:
             QVERIFY(!syncMotionData(d8, m8, s8, &err));
             QVERIFY(QString::fromStdString(err).contains("stabilised the picture itself"));
         }
+    }
+
+    void conformCheck() {
+        // Two takes of a scene, each a camera panning over fine detail (3 pixels across, 1 down a frame). The offline
+        // cut: take A reframed (112 %, 1.5°, moved 40 right and 20 up), take A graded, then take B; its reference
+        // movie carries burnt-in timecode. Then a push across take A, and a last shot of take B. The conformed sequence
+        // lost the reframe and the push, is 3 frames early on the second shot, has take A for the third and leaves out
+        // the last.
+        const int W = 480, H = 270, frames = 110;
+        auto hash = [](uint32_t seed, int x, int y) {
+            uint32_t h = seed * 374761393u + uint32_t(x) * 668265263u + uint32_t(y) * 2246822519u;
+            h = (h ^ (h >> 13)) * 1274126177u;
+            return double(h ^ (h >> 16)) / 4294967295.0;
+        };
+        auto noise = [&](uint32_t seed, double x, double y, double cell) {
+            const double fx = x / cell, fy = y / cell;
+            const int ix = int(std::floor(fx)), iy = int(std::floor(fy));
+            const double u = fx - ix, v = fy - iy, su = u * u * (3 - 2 * u), sv = v * v * (3 - 2 * v);
+            return (hash(seed, ix, iy) * (1 - su) + hash(seed, ix + 1, iy) * su) * (1 - sv) +
+                   (hash(seed, ix, iy + 1) * (1 - su) + hash(seed, ix + 1, iy + 1) * su) * sv;
+        };
+        auto take = [&](uint32_t seed) {
+            std::vector<QImage> out;
+            for (int f = 0; f < frames; ++f) {
+                QImage img(W, H, QImage::Format_RGB32);
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        const double X = x + 3 * f, Y = y + f;
+                        const double l = 0.5 * noise(seed, X, Y, 26) + 0.32 * noise(seed + 1, X, Y, 9) + 0.18 * noise(seed + 2, X, Y, 4);
+                        const double c = noise(seed + 3, X, Y, 60) - 0.5;
+                        const int v = std::clamp(int(std::lround(255 * l)), 0, 255);
+                        img.setPixel(x, y, qRgb(std::clamp(int(v + 60 * c), 0, 255), v, std::clamp(int(v - 60 * c), 0, 255)));
+                    }
+                out.push_back(img);
+            }
+            return out;
+        };
+        const std::string takeA = path("conform-take-a.mp4"), takeB = path("conform-take-b.mp4");
+        writeFrames(takeA, take(11), 25);
+        writeFrames(takeB, take(29), 25);
+        auto build = [&](Project& p) {
+            Sequence& s = *p.active();
+            s.width = W, s.height = H, s.fps = {25, 1};
+            for (const std::string& f : {takeA, takeB}) {
+                MediaItem m = probeOrFail(p, f);
+                m.metadata["scene"] = "12";
+                p.media.push_back(m);
+            }
+        };
+        auto place = [&](Project& p, int media, FrameTime at, double sourceIn) -> Clip& {
+            Sequence& s = *p.active();
+            Clip c = makeClip(p, p.media[size_t(media)], TrackKind::Video, s);
+            c.start = at, c.sourceIn = sourceIn, c.duration = 25;
+            const bool placed = edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok;
+            if (!placed) qWarning("could not place a clip at %lld", (long long)at);
+            for (Clip& on : s.videoTracks[0].clips)
+                if (on.start == at) return on;
+            return s.videoTracks[0].clips.back();
+        };
+        std::string err;
+        Project off = makeDefaultProject();
+        build(off);
+        {
+            Clip& reframed = place(off, 0, 0, 10);
+            reframed.motion.params["scale"] = Param(112.0);
+            reframed.motion.params["rotation"] = Param(1.5);
+            reframed.motion.params["pos_x"] = Param(40.0);
+            reframed.motion.params["pos_y"] = Param(-20.0);
+            Clip& graded = place(off, 0, 25, 50);
+            Effect cdl = makeEffect(off, "cdl");
+            for (const char* ch : {"r", "g", "b"}) {
+                cdl.params[std::string("slope.") + ch] = Param(1.35);
+                cdl.params[std::string("offset.") + ch] = Param(-0.06);
+            }
+            cdl.params["saturation"] = Param(0.7);
+            graded.effects.push_back(cdl);
+            place(off, 1, 50, 20);
+            // A push across: moved 60 pixels right over the shot.
+            Clip& pushed = place(off, 0, 75, 80);
+            pushed.motion.params["scale"] = Param(115.0);
+            pushed.motion.params["pos_x"].addKey(0, 0);
+            pushed.motion.params["pos_x"].addKey(24, 60);
+            place(off, 1, 100, 60);  // (left out of the conform)
+        }
+        ExportSettings st;
+        st.path = path("conform-reference.mp4");
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        st.burnIn.timecode = true;
+        st.burnIn.size = 0.07;
+        QVERIFY2(exportSequence(off, *off.active(), st, nullptr, nullptr, &err), err.c_str());
+
+        Project p = makeDefaultProject();
+        build(p);
+        p.media.push_back(probeOrFail(p, st.path));
+        const Id ref = p.media.back().id, idB = p.media[1].id;
+        place(p, 0, 0, 10);
+        place(p, 0, 25, 47);
+        place(p, 0, 50, 20);
+        place(p, 0, 75, 80);
+        Sequence& s = *p.active();
+        QCOMPARE(s.videoTracks[0].clips.size(), size_t(4));
+        std::vector<ConformShot> shots = montage::conformCheck(p, s, ref, {}, {}, nullptr, &err);
+        QVERIFY2(shots.size() == 5, err.c_str());
+        for (const ConformShot& sh : shots) qInfo("%s: %s (%.3f)", conformVerdictName(sh.verdict), sh.details.c_str(), sh.score);
+        QCOMPARE(shots[0].verdict, ConformVerdict::Reframed);
+        QCOMPARE(shots[0].keys.size(), size_t(1));
+        const ConformKey& k = shots[0].keys[0];
+        QVERIFY2(std::fabs(k.posX - 40) < 0.5 && std::fabs(k.posY + 20) < 0.5, shots[0].details.c_str());
+        QVERIFY2(std::fabs(k.scale - 112) < 0.2 && std::fabs(k.rotation - 1.5) < 0.1, shots[0].details.c_str());
+        QCOMPARE(shots[1].verdict, ConformVerdict::Slipped);
+        QCOMPARE(shots[1].slip, FrameTime(3));
+        QCOMPARE(shots[2].verdict, ConformVerdict::OtherTake);
+        QCOMPARE(shots[2].media, idB);
+        QVERIFY2(std::fabs(shots[2].sourceIn - 20) < 0.5, std::to_string(shots[2].sourceIn).c_str());
+        // The push, keyed: a key every 12 frames and the last, each where the offline Transform had it.
+        QCOMPARE(shots[3].verdict, ConformVerdict::Reframed);
+        QCOMPARE(shots[3].keys.size(), size_t(3));
+        for (const ConformKey& kf : shots[3].keys) {
+            const double x = 60.0 * double(kf.at) / 24;
+            QVERIFY2(std::fabs(kf.posX - x) < 0.6 && std::fabs(kf.posY) < 0.6 && std::fabs(kf.scale - 115) < 0.3 && std::fabs(kf.rotation) < 0.1,
+                     shots[3].details.c_str());
+        }
+        // The last shot left out: missing.
+        QCOMPARE(shots[4].verdict, ConformVerdict::Missing);
+        QVERIFY(shots[4].clip == 0 && shots[4].start == 100 && shots[4].length == 25);
+        QVERIFY(!shots[4].fixable());
+        // Put right by the MCP tool (a marker on each shot first), every shot matches.
+        const QString project = QString::fromStdString(path("conform.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_conform_check"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"reference", QString::fromStdString(st.path)},
+                                                                               {"apply", true}, {"markers", true}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject out = r.value("structuredContent").toObject();
+        QCOMPARE(out.value("fixed").toInt(), 4);
+        QCOMPARE(out.value("markers").toInt(), 5);
+        const QJsonArray listed = out.value("shots").toArray();
+        QCOMPARE(listed.size(), 5);
+        QCOMPARE(listed[1].toObject().value("verdict").toString(), QString("slipped"));
+        QCOMPARE(listed[1].toObject().value("slip").toInt(), 3);
+        QCOMPARE(listed[2].toObject().value("verdict").toString(), QString("other_take"));
+        QCOMPARE(listed[2].toObject().value("media").toString(), QString("conform-take-b.mp4"));
+        QCOMPARE(listed[3].toObject().value("transform").toArray().size(), 3);
+        QVERIFY(loadProject(project.toStdString(), p));
+        Sequence& fixedSeq = *p.active();
+        QCOMPARE(fixedSeq.markers.size(), size_t(5));
+        QCOMPARE(fixedSeq.videoTracks[0].clips[2].mediaId, idB);
+        shots = montage::conformCheck(p, fixedSeq, ref, {}, {}, nullptr, &err);
+        QCOMPARE(shots.size(), size_t(5));
+        shots.pop_back();  // (still missing)
+        for (const ConformShot& sh : shots)
+            QVERIFY2(sh.verdict == ConformVerdict::Matches, (std::string(conformVerdictName(sh.verdict)) + " " + sh.details).c_str());
+        QVERIFY(!applyConformFix(p, fixedSeq, shots[0]));
+        // A reference that is not there.
+        err.clear();
+        QVERIFY(montage::conformCheck(p, fixedSeq, 999999, {}, {}, nullptr, &err).empty());
+        QVERIFY(!err.empty());
     }
 
     void restorationOnFootage() {

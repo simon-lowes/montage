@@ -115,6 +115,7 @@
 #include "render/LutExport.h"
 #include "render/ProjectManager.h"
 #include "render/QualityCheck.h"
+#include "render/ConformCheck.h"
 #include "media/Decoder.h"
 #include "media/Faces.h"
 #include "media/FaceMesh.h"
@@ -4215,6 +4216,88 @@ void McpServer::Impl::addTools() {
             }
             return ok(changes.empty() ? QStringLiteral("No differences") : QStringLiteral("%1 change(s)").arg(changes.size()),
                       QJsonObject{{"changes", list}});
+        });
+
+    add("montage_conform_check", "Conform check against the offline reference",
+        "Each shot of the sequence (each stretch where one clip from media is the picture on top) compared with the "
+        "offline cut's reference movie, as an editor checks a conform from an XML, AAF or EDL: matches; reframed (the "
+        "reposition the list lost, solved as scale, rotation and position, keyed where it moves); slipped (the source "
+        "frames off by `slip`); other_take (the reference shows another take: `media`, `source_in`); no_match; or missing "
+        "(a gap here where the reference has a picture: `clip` 0). "
+        "Grades are not counted and the reference's burnt-in timecode and overlays are masked. apply puts right every "
+        "shot that can be (one save); markers adds a coloured marker on each shot that differs.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "reference":{"type":"string","description":"The reference movie: a media item's name or path, or a file (added to the project)"},
+            "reference_start":{"type":["number","string"],"description":"The sequence time the reference's first frame belongs at (default 0)"},
+            "apply":{"type":"boolean","default":false},"markers":{"type":"boolean","default":false}},
+            "required":["project","reference"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Id ref = 0;
+            bool added = false;
+            try {
+                ref = projectMedia(l.project, need(a, "reference")).id;
+            } catch (const ArgError&) {
+                const size_t before = l.project.media.size();
+                ref = mediaFor(l.project, need(a, "reference"));
+                added = l.project.media.size() > before;
+            }
+            Sequence& s = l.seq();
+            ConformOptions o;
+            if (a.contains("reference_start")) o.referenceStart = timeArg(a.value("reference_start"), s, "reference_start");
+            std::string err;
+            const std::vector<ConformShot> shots = conformCheck(l.project, s, ref, o, {}, nullptr, &err);
+            if (shots.empty() && !err.empty()) return fail(QString::fromStdString(err));
+            QJsonArray list;
+            std::map<ConformVerdict, int> n;
+            for (const ConformShot& c : shots) {
+                ++n[c.verdict];
+                const Clip* clip = edit::clipById(s, c.clip);
+                QJsonObject row{{"clip", double(c.clip)},
+                              {"name", QString::fromStdString(clip ? clip->name : std::string())},
+                              {"at", tc(c.start, s)},
+                              {"at_seconds", secs(c.start, s)},
+                              {"length", double(c.length)},
+                              {"verdict", QString::fromLatin1(conformVerdictName(c.verdict)).toLower().replace(' ', '_')},
+                              {"likeness", std::round(c.score * 1000) / 1000},
+                              {"details", QString::fromStdString(c.details)}};
+                if (c.verdict == ConformVerdict::Slipped || (c.verdict == ConformVerdict::OtherTake && c.slip)) row["slip"] = double(c.slip);
+                if (c.verdict == ConformVerdict::OtherTake) {
+                    const MediaItem* m = l.project.findMedia(c.media);
+                    row["media"] = QString::fromStdString(m ? m->name : std::string());
+                    row["source_in"] = c.sourceIn / s.fpsValue();
+                }
+                if (!c.keys.empty()) {
+                    QJsonArray keys;
+                    for (const ConformKey& k : c.keys)
+                        keys.append(QJsonObject{{"at", double(k.at)}, {"pos_x", k.posX}, {"pos_y", k.posY}, {"scale", k.scale}, {"rotation", k.rotation}});
+                    row["transform"] = keys;
+                }
+                list.append(row);
+            }
+            int fixed = 0, marked = 0;
+            if (a.value("markers").toBool()) {
+                static const std::map<ConformVerdict, const char*> colours{{ConformVerdict::Reframed, "Cerulean"}, {ConformVerdict::Slipped, "Yellow"},
+                                                                            {ConformVerdict::OtherTake, "Violet"}, {ConformVerdict::NoMatch, "Red"},
+                                                                            {ConformVerdict::Missing, "Mango"}};
+                for (const ConformShot& c : shots)
+                    if (c.verdict != ConformVerdict::Matches) {
+                        edit::addMarker(s, Marker{c.start, c.length, std::string("Conform: ") + conformVerdictName(c.verdict), c.details,
+                                                  labelFromName(colours.at(c.verdict))});
+                        ++marked;
+                    }
+            }
+            if (a.value("apply").toBool())
+                for (const ConformShot& c : shots) fixed += applyConformFix(l.project, s, c) ? 1 : 0;
+            if (fixed || marked || added) save(l);
+            QStringList parts;
+            for (ConformVerdict v : {ConformVerdict::Matches, ConformVerdict::Reframed, ConformVerdict::Slipped, ConformVerdict::OtherTake,
+                                     ConformVerdict::NoMatch, ConformVerdict::Missing})
+                if (n[v]) parts << QStringLiteral("%1 %2").arg(n[v]).arg(QString::fromLatin1(conformVerdictName(v)).toLower());
+            QString text = shots.empty() ? QStringLiteral("No shots from media to check") : QStringLiteral("%1 shot(s): %2").arg(shots.size()).arg(parts.join(", "));
+            if (fixed) text += QStringLiteral("; fixed %1").arg(fixed);
+            if (marked) text += QStringLiteral("; %1 marker(s)").arg(marked);
+            return ok(text, QJsonObject{{"shots", list}, {"fixed", fixed}, {"markers", marked}});
         });
 
     add("montage_reconform", "Change list and re-conform to a new cut",
