@@ -30,6 +30,7 @@
 #include <random>
 #include <complex>
 #include <tuple>
+#include <map>
 #include <sstream>
 #include <thread>
 #include <cstdio>
@@ -516,7 +517,7 @@ std::vector<float> decodeAudioStream(const std::string& path, int n, std::string
 // A recording as a camera or recorder might make one, by FFmpeg's encoders and muxer: a textured picture that moves
 // and a tone that glides, `frames` frames at 25 fps (320 x 180) with 48 kHz stereo; `seed` changes both.
 bool writeRecording(const std::string& file, const char* format, const char* vcodec, const char* acodec, int frames, int seed,
-                    std::string* why) {
+                    std::string* why, bool stream = false) {
     AVFormatContext* oc = nullptr;
     if (avformat_alloc_output_context2(&oc, nullptr, format, file.c_str()) < 0) return *why = "no muxer", false;
     struct Enc {
@@ -562,6 +563,7 @@ bool writeRecording(const std::string& file, const char* format, const char* vco
         open(a, codec);
     }
     if (ok && avio_open(&oc->pb, file.c_str(), AVIO_FLAG_WRITE) < 0) *why = "cannot write", ok = false;
+    if (ok && stream) oc->pb->seekable = 0;  // as a recorder writes it: nothing goes back to finish the header
     if (ok && avformat_write_header(oc, nullptr) < 0) *why = "no header", ok = false;
     AVPacket* pkt = av_packet_alloc();
     auto encode = [&](Enc& e, AVFrame* f) {
@@ -633,6 +635,62 @@ bool writeRecording(const std::string& file, const char* format, const char* vco
     if (oc->pb) avio_closep(&oc->pb);
     avformat_free_context(oc);
     return ok;
+}
+
+// The boxes in b[from, to) of an MP4 or MOV: type, start, size (32-bit sizes only; enough for FFmpeg's files).
+std::vector<std::tuple<QByteArray, int, int>> boxesIn(const QByteArray& b, int from, int to) {
+    std::vector<std::tuple<QByteArray, int, int>> out;
+    for (int p = from; p + 8 <= to;) {
+        const int size = int(qFromBigEndian<quint32>(b.constData() + p));
+        if (size < 8 || p + size > to) break;
+        out.push_back({b.mid(p + 4, 4), p, size});
+        p += size;
+    }
+    return out;
+}
+// The start of the first `type` box under the box at `at` (8-byte headers).
+int boxUnder(const QByteArray& b, int at, const char* type, int skip = 0) {
+    for (const auto& [t, p, size] : boxesIn(b, at + 8 + skip, at + int(qFromBigEndian<quint32>(b.constData() + at))))
+        if (t == type) return p;
+    return -1;
+}
+
+// The index table entries of an MXF file's VBR index segments, by edit unit: temporal offset, key frame offset, flags
+// and stream offset.
+std::map<int64_t, std::tuple<int, int, int, uint64_t>> mxfIndexEntries(const QByteArray& b) {
+    std::map<int64_t, std::tuple<int, int, int, uint64_t>> out;
+    auto u8 = [&](int64_t p) { return uint8_t(b[int(p)]); };
+    auto be = [&](int64_t p, int n) {
+        uint64_t v = 0;
+        for (int i = 0; i < n; ++i) v = v << 8 | u8(p + i);
+        return v;
+    };
+    for (int64_t p = 0; p + 17 <= b.size();) {
+        int64_t len = u8(p + 16), v = p + 17;
+        if (len & 0x80) {
+            const int n = int(len & 0x7f);
+            len = int64_t(be(v, n));
+            v += n;
+        }
+        if (v + len > b.size()) break;
+        if (be(p, 4) == 0x060e2b34 && u8(p + 5) == 0x53 && u8(p + 13) == 0x10 && u8(p + 14) == 0x01) {
+            int64_t start = 0;
+            for (int64_t q = v; q + 4 <= v + len;) {
+                const int tag = int(be(q, 2)), n = int(be(q + 2, 2));
+                if (tag == 0x3f0c) start = int64_t(be(q + 4, 8));
+                if (tag == 0x3f0a) {
+                    const int64_t count = int64_t(be(q + 4, 4)), size = int64_t(be(q + 8, 4));
+                    for (int64_t i = 0; i < count; ++i) {
+                        const int64_t e = q + 12 + i * size;
+                        out[start + i] = {int8_t(u8(e)), int8_t(u8(e + 1)), u8(e + 2), be(e + 3, 8)};
+                    }
+                }
+                q += 4 + n;
+            }
+        }
+        p = v + len;
+    }
+    return out;
 }
 
 // Every picture of a file's first video stream in display order, each as an MD5 of its planes.
@@ -7403,9 +7461,90 @@ private slots:
             QVERIFY2(std::equal(soundAfter.begin(), soundAfter.end(), soundBefore.begin()), cam.name);
             QVERIFY(std::abs(report.seconds - after.size() / 25.0) < 0.1);
             if (std::string(cam.name) == "h264aac") QVERIFY(std::abs(report.timecode - (36912 + 16 / 25.0)) < 1e-6);
-            // A reference from another camera finds nothing it knows.
-            if (std::string(cam.name) == "prorespcm")
+
+            QFile refFile(QString::fromStdString(ref));
+            QVERIFY(refFile.open(QIODevice::ReadOnly));
+            const QByteArray refBytes = refFile.readAll();
+            refFile.close();
+            int moov = -1, moovSize = 0;
+            for (const auto& [t, p, size] : boxesIn(refBytes, 0, int(refBytes.size())))
+                if (t == "moov") moov = p, moovSize = size;
+            QVERIFY(moov > 0 && moov + moovSize == refBytes.size());  // (FFmpeg puts it last, so no chunk moves)
+            auto writeFile = [](const QString& f, const QByteArray& b) {
+                QFile out(f);
+                return out.open(QIODevice::WriteOnly) && out.write(b) == b.size();
+            };
+            QFile fixedFile(fixed);
+            QVERIFY(fixedFile.open(QIODevice::ReadOnly));
+            const QByteArray fixedBytes = fixedFile.readAll();
+            fixedFile.close();
+            if (std::string(cam.name) == "h264aac") {
+                // The repair never replaces the damaged file or the reference.
+                const qint64 damagedSize = QFileInfo(damaged).size();
+                QVERIFY(!repairRecording(damaged, QString::fromStdString(ref), damaged, &report, &err));
+                QVERIFY(!repairRecording(damaged, QString::fromStdString(ref), QString::fromStdString(ref), &report, &err));
+                QVERIFY(!repairRecording(damaged, QString::fromStdString(ref), QFileInfo(damaged).dir().filePath("./" + QFileInfo(damaged).fileName()), &report, &err));
+                QCOMPARE(QFileInfo(damaged).size(), damagedSize);
+                QCOMPARE(QFileInfo(QString::fromStdString(ref)).size(), qint64(refBytes.size()));
+
+                // A reference whose first track has a 64-bit box size rebuilds the same file.
+                const int trak = boxUnder(refBytes, moov, "trak");
+                QVERIFY(trak > 0);
+                const quint32 trakSize = qFromBigEndian<quint32>(refBytes.constData() + trak);
+                QByteArray wide = refBytes.left(trak);
+                wide += QByteArray("\0\0\0\x01trak", 8);
+                wide += QByteArray(8, '\0');
+                qToBigEndian<quint64>(trakSize + 8, wide.data() + trak + 8);
+                wide += refBytes.mid(trak + 8);
+                qToBigEndian<quint32>(quint32(moovSize + 8), wide.data() + moov);
+                const QString wideRef = QString::fromStdString(path("h264aac_wide.mov")), wideOut = QString::fromStdString(path("h264aac_wide_out.mov"));
+                QVERIFY(writeFile(wideRef, wide));
+                QVERIFY2(repairRecording(damaged, wideRef, wideOut, &report, &err), qPrintable(err));
+                QFile w(wideOut);
+                QVERIFY(w.open(QIODevice::ReadOnly));
+                QVERIFY(w.readAll() == fixedBytes);
+
+                // A reference with damaged tables does no harm: each try fails or rebuilds something.
+                uint32_t seed = 12345;
+                const QString hostile = QString::fromStdString(path("hostile.mov")), hostileOut = QString::fromStdString(path("hostile_out.mov"));
+                for (int round = 0; round < 60; ++round) {
+                    QByteArray b = refBytes;
+                    for (int k = 0; k < 1 + round % 3; ++k) {
+                        seed = seed * 1664525u + 1013904223u;
+                        const int at = moov + 8 + int((seed >> 8) % uint32_t(moovSize - 12));
+                        static const quint32 values[] = {0xffffffffu, 0x7fffffffu, 0, 0x80000000u, 1, 0x10000u};
+                        qToBigEndian<quint32>(values[(seed >> 4) % 6], b.data() + at);
+                    }
+                    QVERIFY(writeFile(hostile, b));
+                    QFile::remove(hostileOut);
+                    repairRecording(damaged, hostile, hostileOut, &report, &err);
+                }
+            }
+            if (std::string(cam.name) == "prorespcm") {
+                // QuickTime's older way with uncompressed sound: one byte a sample in stsz, each sample a frame.
+                QByteArray legacy = refBytes;
+                int soundStsz = -1;
+                for (const auto& [t, p, size] : boxesIn(refBytes, moov + 8, moov + moovSize)) {
+                    if (t != "trak") continue;
+                    const int mdia = boxUnder(refBytes, p, "mdia"), hdlr = boxUnder(refBytes, mdia, "hdlr");
+                    if (refBytes.mid(hdlr + 16, 4) != "soun") continue;
+                    soundStsz = boxUnder(refBytes, boxUnder(refBytes, boxUnder(refBytes, mdia, "minf"), "stbl"), "stsz");
+                }
+                QVERIFY(soundStsz > 0 && qFromBigEndian<quint32>(refBytes.constData() + soundStsz + 12) == 6);
+                qToBigEndian<quint32>(1, legacy.data() + soundStsz + 12);
+                const QString legacyRef = QString::fromStdString(path("prorespcm_legacy.mov")), legacyOut = QString::fromStdString(path("prorespcm_legacy_out.mov"));
+                QVERIFY(writeFile(legacyRef, legacy));
+                QVERIFY2(decodeAudioStream(legacyRef.toStdString(), 0) == decodeAudioStream(ref, 0), "FFmpeg reads the older way alike");
+                QVERIFY2(repairRecording(damaged, legacyRef, legacyOut, &report, &err), qPrintable(err));
+                QVERIFY(decodeAudioStream(legacyOut.toStdString(), 0) == soundAfter);
+                QVERIFY(pictureHashes(legacyOut.toStdString()) == after);
+
+                // A reference from another camera finds no pictures it knows, even where its sound is PCM too.
                 QVERIFY(!repairRecording(QString::fromStdString(path("h264aac_cut.mov")), QString::fromStdString(ref), fixed + ".x", &report, &err));
+                QVERIFY(!repairRecording(damaged, QString::fromStdString(path("hevcpcm_ref.mp4")), fixed + ".y", &report, &err));
+                QVERIFY2(err.contains("same camera"), qPrintable(err));
+                QVERIFY(!QFileInfo::exists(fixed + ".x") && !QFileInfo::exists(fixed + ".y"));
+            }
         }
 
         // Over MCP, into a project: labelled, with the sidecar's timecode.
@@ -7441,9 +7580,10 @@ private slots:
 
         // An MXF whose footer was never written.
         {
+            // Written as a recorder writes it, with nothing gone back to: the header stays open and incomplete.
             const std::string whole = path("xdcam_whole.mxf"), cut = path("xdcam_cut.mxf");
             std::string why;
-            QVERIFY2(writeRecording(whole, "mxf", "mpeg2video", "pcm_s16le", 100, 3, &why), why.c_str());
+            QVERIFY2(writeRecording(whole, "mxf", "mpeg2video", "pcm_s16le", 100, 3, &why, true), why.c_str());
             {
                 QFile in(QString::fromStdString(whole)), out(QString::fromStdString(cut));
                 QVERIFY(in.open(QIODevice::ReadOnly) && out.open(QIODevice::WriteOnly));
@@ -7465,6 +7605,22 @@ private slots:
             const std::vector<float> soundBefore = decodeAudioStream(whole, 0), soundAfter = decodeAudioStream(fixed.toStdString(), 0);
             QVERIFY(soundAfter.size() >= size_t(report.videoFrames) * 1920 * 2 - 2 * 1920 * 2);
             QVERIFY(std::equal(soundAfter.begin(), soundAfter.end(), soundBefore.begin()));
+            // The header is closed and complete now, and the new index is the one the whole file's footer has.
+            QFile wf(QString::fromStdString(whole)), ff(fixed);
+            QVERIFY(wf.open(QIODevice::ReadOnly) && ff.open(QIODevice::ReadOnly));
+            const QByteArray wholeBytes = wf.readAll(), fixedBytes = ff.readAll();
+            QCOMPARE(int(wholeBytes[14]), 0x01);
+            QCOMPARE(int(fixedBytes[14]), 0x04);
+            const auto wholeIndex = mxfIndexEntries(wholeBytes), fixedIndex = mxfIndexEntries(fixedBytes);
+            QCOMPARE(int64_t(fixedIndex.size()), int64_t(report.videoFrames));
+            for (const auto& [unit, entry] : fixedIndex) {
+                QVERIFY(wholeIndex.count(unit));
+                const auto& [t1, k1, f1, o1] = wholeIndex.at(unit);
+                const auto& [t2, k2, f2, o2] = entry;
+                if (unit + t1 >= report.videoFrames) continue;  // (displayed from a picture the cut lost)
+                QVERIFY2(t1 == t2 && k1 == k2 && f1 == f2 && o1 == o2,
+                         qPrintable(QString("unit %1: %2 %3 %4 %5, not %6 %7 %8 %9").arg(unit).arg(t2).arg(k2).arg(f2, 0, 16).arg(o2).arg(t1).arg(k1).arg(f1, 0, 16).arg(o1)));
+            }
             // Seeking uses the new index: the picture at 2 s is the original's.
             AVFormatContext* fmt = nullptr;
             QVERIFY(avformat_open_input(&fmt, fixed.toUtf8().constData(), nullptr, nullptr) >= 0);

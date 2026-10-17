@@ -138,6 +138,7 @@ enum class Codec { Other, H264, Hevc, ProRes, Aac, Pcm };
 struct RefTrack {
     bool video = false;
     QByteArray trak;  // the whole trak box
+    QByteArray stsd;  // its sample descriptions
     uint32_t entry = 0;
     Codec codec = Codec::Other;
     uint32_t timescale = 0;
@@ -160,13 +161,14 @@ struct RefTrack {
 };
 
 struct Reference {
-    QByteArray ftyp, mvhd, udta;
+    QByteArray ftyp, mvhd;
     uint32_t movieTimescale = 600;
     int video = -1, audio = -1;  // in tracks
     std::vector<RefTrack> tracks;
     std::vector<int64_t> otherSizes, gapSizes;  // chunks of tracks not rebuilt, and bytes between chunks; most common first
     int64_t maxOther = 0;
     std::map<std::pair<int, int>, int> transitions;  // chunk kind followed by chunk kind, counted
+    int dropped = 0;  // picture and sound tracks after the first of each, which are not rebuilt
 };
 
 enum Kind { KVideo = 0, KAudio = 1, KOther = 2, KGap = 3, KStart = 4, KResync = 5 };
@@ -304,8 +306,8 @@ void readSampleEntry(const u8* d, const Box& stsd, RefTrack& t) {
         double rate;
         const uint64_t r = be64(d + e0 + 40);
         std::memcpy(&rate, &r, 8);
-        t.rate = int(std::lround(rate));
-        t.channels = int(be32(d + e0 + 48));
+        t.rate = rate > 0 && rate < 1e7 ? int(std::lround(rate)) : 0;
+        t.channels = int(std::min<uint32_t>(be32(d + e0 + 48), 1024));
         bytesPerFrame = int(be32(d + e0 + 64));
     }
     if (f == fcc("mp4a")) {
@@ -358,7 +360,7 @@ public:
         if (a.rate > 0) ctx_->sample_rate = a.rate;
         if (a.channels > 0) av_channel_layout_default(&ctx_->ch_layout, a.channels);
         ctx_->err_recognition = AV_EF_EXPLODE | AV_EF_BITSTREAM | AV_EF_BUFFER;
-        av_log_set_level(std::min(av_log_get_level(), AV_LOG_FATAL));
+        ctx_->log_level_offset = AV_LOG_DEBUG;  // its complaints about the bytes tried are expected
         if (avcodec_open2(ctx_, codec, nullptr) < 0) return false;
         pkt_ = av_packet_alloc();
         frame_ = av_frame_alloc();
@@ -559,6 +561,7 @@ public:
         const auto it = aacCache_.find(q);
         if (it != aacCache_.end()) return it->second;
         const int n = aac_.frameAt(d_ + q, end_ - q, aacMax_);
+        if (aacCache_.size() > (1u << 20)) aacCache_.clear();
         aacCache_[q] = n;
         return n;
     }
@@ -624,12 +627,15 @@ public:
                 for (int64_t s : a_->chunkSizes)
                     if (p + s <= end_ && followOk(p + s, 1) && seen.insert(s).second) out.push_back({KAudio, s});
                 int found = 0;
-                for (int64_t s = step; s <= pcmScan_ && p + s <= end_ && found < 4; s += step)
+                for (int64_t s = step; s <= pcmScan_ && p + s <= end_ && found < 4; s += step) {
+                    if ((s / step & 4095) == 0 && !poll(p)) break;
                     if (!seen.count(s) && (strictVideo(p + s) || followOk(p + s, 1)) && seen.insert(s).second) {
                         out.push_back({KAudio, s});
                         ++found;
                     }
-                if (end_ - p <= pcmScan_) {
+                }
+                // The sound the file ends in, once there have been pictures.
+                if (prev != KStart && end_ - p <= pcmScan_) {
                     const int64_t n = (end_ - p) / step * step;
                     if (n > 0 && !seen.count(n)) out.push_back({KAudio, n});
                 }
@@ -641,6 +647,7 @@ public:
         if (resync && out.empty()) {
             // Past damage: the next place two pictures (or a sound frame and what follows it) start.
             for (int64_t q = p + 1; q < end_; ++q) {
+                if (((q - p) & 0xffff) == 0 && !poll(q)) break;
                 bool k2;
                 if (strictVideo(q)) {
                     const int64_t n = au(q, &k2);
@@ -668,9 +675,11 @@ public:
         std::vector<Frame> stack;
         std::unordered_set<int64_t> dead;
         path.clear();
+        progress_ = &progress;
         stack.push_back({start, KStart, candidates(start, KStart, resync)});
         int64_t steps = 0;
         while (!stack.empty()) {
+            if (cancelled_) return false;
             Frame& f = stack.back();
             if ((++steps & 1023) == 0 && progress && !progress(double(f.pos - begin_) / double(std::max<int64_t>(1, end_ - begin_))))
                 return false;
@@ -694,8 +703,16 @@ public:
         return false;
     }
     int64_t end() const { return end_; }
+    bool cancelled() const { return cancelled_; }
 
 private:
+    // Asks the caller whether to go on, during a long scan at `at`.
+    bool poll(int64_t at) {
+        if (!cancelled_ && progress_ && *progress_ && !(*progress_)(double(at - begin_) / double(std::max<int64_t>(1, end_ - begin_))))
+            cancelled_ = true;
+        return !cancelled_;
+    }
+
     const u8* d_;
     int64_t begin_, end_;
     const Reference& ref_;
@@ -705,6 +722,8 @@ private:
     int aacMax_ = 0;
     AacProbe aac_;
     std::unordered_map<int64_t, int> aacCache_;
+    const std::function<bool(double)>* progress_ = nullptr;
+    bool cancelled_ = false;
 };
 
 // ---- The reference clip ----
@@ -719,13 +738,12 @@ bool readReference(const u8* d, int64_t n, Reference& ref, QString* error) {
     if (const Box* f = child(top, fcc("ftyp"))) ref.ftyp = QByteArray(reinterpret_cast<const char*>(d + f->start), int(f->end - f->start));
     const auto mv = children(d, moov->body, moov->end);
     const Box* mvhd = child(mv, fcc("mvhd"));
-    if (!mvhd || mvhd->end - mvhd->body < 20) {
+    if (!mvhd || mvhd->end - mvhd->body < 20 || (d[mvhd->body] == 1 && mvhd->end - mvhd->body < 28)) {
         *error = QObject::tr("The reference clip's index cannot be read");
         return false;
     }
     ref.mvhd = QByteArray(reinterpret_cast<const char*>(d + mvhd->start), int(mvhd->end - mvhd->start));
     ref.movieTimescale = be32(d + mvhd->body + (d[mvhd->body] == 1 ? 20 : 12));
-    if (const Box* u = child(mv, fcc("udta"))) ref.udta = QByteArray(reinterpret_cast<const char*>(d + u->start), int(u->end - u->start));
     if (!ref.movieTimescale) ref.movieTimescale = 600;
 
     struct ChunkAt {
@@ -742,7 +760,9 @@ bool readReference(const u8* d, int64_t n, Reference& ref, QString* error) {
         if (!mdia) continue;
         const auto mc = children(d, mdia->body, mdia->end);
         const Box *mdhd = child(mc, fcc("mdhd")), *hdlr = child(mc, fcc("hdlr")), *minf = child(mc, fcc("minf"));
-        if (!mdhd || !hdlr || !minf || hdlr->end - hdlr->body < 12) continue;
+        if (!mdhd || !hdlr || !minf || hdlr->end - hdlr->body < 12 || mdhd->end - mdhd->body < 20 ||
+            (d[mdhd->body] == 1 && mdhd->end - mdhd->body < 28) || tb.end - tb.start > (256 << 20))
+            continue;
         const uint32_t handler = be32(d + hdlr->body + 8);
         const auto ic = children(d, minf->body, minf->end);
         const Box* stbl = child(ic, fcc("stbl"));
@@ -756,10 +776,18 @@ bool readReference(const u8* d, int64_t n, Reference& ref, QString* error) {
         t.video = handler == fcc("vide");
         const bool sound = handler == fcc("soun");
         t.trak = QByteArray(reinterpret_cast<const char*>(d + tb.start), int(tb.end - tb.start));
+        t.stsd = QByteArray(reinterpret_cast<const char*>(d + stsd->start), int(stsd->end - stsd->start));
         t.timescale = be32(d + mdhd->body + (d[mdhd->body] == 1 ? 20 : 12));
         t.ctts = child(sc, fcc("ctts")) != nullptr;
         t.stss = child(sc, fcc("stss")) != nullptr;
         if (t.video || sound) readSampleEntry(d, *stsd, t);
+        if (sound && t.rate <= 0) t.rate = int(std::min<uint32_t>(t.timescale, 10000000));
+        // PCM by the frame: stsz's one size, unless it is QuickTime's 1 (each sample a frame of `step` bytes).
+        t.constSize = stsz->end - stsz->body >= 12 ? be32(d + stsz->body + 4) : 0;
+        if (t.codec == Codec::Pcm) {
+            if (t.constSize > 1) t.step = t.constSize > (1u << 20) ? 0 : int(t.constSize);
+            if (t.step <= 0 || t.step > (1 << 20)) t.codec = Codec::Other;
+        }
         if (stts && stts->end - stts->body >= 8) {
             std::map<uint32_t, uint64_t> count;
             const uint32_t entries = be32(d + stts->body + 4);
@@ -785,45 +813,58 @@ bool readReference(const u8* d, int64_t n, Reference& ref, QString* error) {
                 }
             }
         }
-        // Sample sizes and chunks.
-        t.constSize = stsz->end - stsz->body >= 12 ? be32(d + stsz->body + 4) : 0;
-        const uint32_t count = stsz->end - stsz->body >= 12 ? be32(d + stsz->body + 8) : 0;
+        // Sample sizes and chunks, as far as the tables are whole and point into the file.
+        const int64_t unit = t.constSize ? (t.codec == Codec::Pcm ? t.step : t.constSize) : 0;  // each sample's bytes; 0 = its own
         std::vector<uint32_t> sizes;
+        uint64_t count = stsz->end - stsz->body >= 12 ? be32(d + stsz->body + 8) : 0;
         if (!t.constSize) {
-            for (uint32_t i = 0; i < count && stsz->body + 16 + 4 * int64_t(i) <= stsz->end; ++i) {
+            for (uint64_t i = 0; i < count && stsz->body + 16 + 4 * int64_t(i) <= stsz->end; ++i) {
                 sizes.push_back(be32(d + stsz->body + 12 + 4 * i));
                 t.maxSize = std::max(t.maxSize, sizes.back());
             }
+            count = sizes.size();
         } else {
-            t.maxSize = t.constSize;
+            count = std::min<uint64_t>(count, uint64_t(n / std::max<int64_t>(1, unit)));
+            t.maxSize = uint32_t(std::min<int64_t>(unit, 0xffffffffLL));
         }
-        std::vector<int64_t> offsets;
+        auto entries = [&](const Box* b) { return b->end - b->body >= 8 ? be32(d + b->body + 4) : 0u; };
+        std::vector<int64_t> offsets;  // -1 where a chunk points outside the file
+        auto offset = [&](uint64_t o) { return o < uint64_t(n) ? int64_t(o) : int64_t(-1); };
         if (co64) {
-            for (uint32_t i = 0, e = be32(d + co64->body + 4); i < e && co64->body + 16 + 8 * int64_t(i) <= co64->end; ++i)
-                offsets.push_back(int64_t(be64(d + co64->body + 8 + 8 * i)));
+            for (uint32_t i = 0, e = entries(co64); i < e && co64->body + 16 + 8 * int64_t(i) <= co64->end; ++i)
+                offsets.push_back(offset(be64(d + co64->body + 8 + 8 * i)));
         } else {
-            for (uint32_t i = 0, e = be32(d + stco->body + 4); i < e && stco->body + 12 + 4 * int64_t(i) <= stco->end; ++i)
-                offsets.push_back(be32(d + stco->body + 8 + 4 * i));
+            for (uint32_t i = 0, e = entries(stco); i < e && stco->body + 12 + 4 * int64_t(i) <= stco->end; ++i)
+                offsets.push_back(offset(be32(d + stco->body + 8 + 4 * i)));
         }
         std::vector<std::pair<uint32_t, uint32_t>> runs;  // first chunk (from 1), samples per chunk
-        for (uint32_t i = 0, e = be32(d + stsc->body + 4); i < e && stsc->body + 20 + 12 * int64_t(i) <= stsc->end; ++i)
+        for (uint32_t i = 0, e = entries(stsc); i < e && stsc->body + 20 + 12 * int64_t(i) <= stsc->end; ++i)
             runs.push_back({be32(d + stsc->body + 8 + 12 * i), be32(d + stsc->body + 12 + 12 * i)});
         const bool keep = (t.video && t.codec != Codec::Other && ref.video < 0) ||
-                          (sound && t.codec != Codec::Other && ref.audio < 0 && (t.codec != Codec::Pcm || t.step > 0));
+                          (sound && t.codec != Codec::Other && ref.audio < 0);
+        if ((t.video || sound) && !keep && t.codec != Codec::Other) ++ref.dropped;
         const int kind = keep ? (t.video ? KVideo : KAudio) : KOther;
         std::vector<int64_t> samples;  // offsets of the first few hundred samples
-        size_t s = 0;
+        std::vector<uint32_t> sampleSizes;
+        uint64_t s = 0;
         std::vector<int64_t> chunkBytes;
-        for (size_t c = 0, r = 0; c < offsets.size(); ++c) {
+        for (size_t c = 0, r = 0; c < offsets.size() && s < count; ++c) {
             while (r + 1 < runs.size() && runs[r + 1].first <= c + 1) ++r;
-            const uint32_t spc = runs.empty() ? 1 : runs[r].second;
-            int64_t bytes = 0, at = offsets[c];
-            for (uint32_t i = 0; i < spc && s < count; ++i, ++s) {
-                const int64_t size = t.constSize ? t.constSize : sizes[s];
-                if (samples.size() < 2000) samples.push_back(at);
-                at += size;
-                bytes += size;
+            const uint64_t spc = std::min<uint64_t>(runs.empty() ? 1 : runs[r].second, count - s);
+            int64_t bytes = 0;
+            if (unit) {
+                bytes = int64_t(spc) * unit;
+                for (uint64_t i = 0; i < spc && samples.size() < 2000 && offsets[c] >= 0; ++i)
+                    samples.push_back(offsets[c] + int64_t(i) * unit), sampleSizes.push_back(uint32_t(unit));
+            } else {
+                for (uint64_t i = 0; i < spc; ++i) {
+                    if (samples.size() < 2000 && offsets[c] >= 0 && offsets[c] + bytes < n)
+                        samples.push_back(offsets[c] + bytes), sampleSizes.push_back(sizes[s + i]);
+                    bytes += sizes[s + i];
+                }
             }
+            s += spc;
+            if (offsets[c] < 0 || offsets[c] + bytes > n) continue;
             layout.push_back({offsets[c], bytes, kind});
             chunkBytes.push_back(bytes);
             if (kind == KOther) otherChunks.push_back(bytes);
@@ -831,15 +872,14 @@ bool readReference(const u8* d, int64_t n, Reference& ref, QString* error) {
         if (keep && t.codec == Codec::Pcm) {
             t.chunkSizes = byFrequency(chunkBytes, 8);
             for (int64_t b : chunkBytes) t.maxChunk = std::max(t.maxChunk, b);
-            if (t.constSize > 1) t.step = int(t.constSize);
         }
         if (keep && t.codec == Codec::Aac)
             for (size_t i = 0; i < samples.size(); ++i)
-                if (samples[i] < n && (t.constSize || sizes[i] > 0)) t.aacHeads.insert(d[samples[i]] >> 1);
+                if (samples[i] < n && sampleSizes[i] > 0) t.aacHeads.insert(d[samples[i]] >> 1);
         if (keep && (t.codec == Codec::H264 || t.codec == Codec::Hevc)) {
             const bool hevc = t.codec == Codec::Hevc;
             for (size_t i = 0; i < samples.size(); ++i) {
-                const int64_t b = samples[i], e = std::min<int64_t>(n, b + (t.constSize ? t.constSize : sizes[i]));
+                const int64_t b = samples[i], e = std::min<int64_t>(n, b + sampleSizes[i]);
                 for (int64_t p = b; p + t.nalLen + 2 <= e;) {
                     uint64_t len = 0;
                     for (int k = 0; k < t.nalLen; ++k) len = len << 8 | d[p + k];
@@ -886,6 +926,20 @@ bool readReference(const u8* d, int64_t n, Reference& ref, QString* error) {
 
 // ---- The new index ----
 
+// An mvhd, tkhd or mdhd made and changed at `when` (seconds since 1904).
+QByteArray withTimes(const QByteArray& b, uint64_t when) {
+    QByteArray out = b;
+    const int h = be32(reinterpret_cast<const u8*>(b.constData())) == 1 ? 16 : 8;
+    if (out.size() < h + 4) return out;
+    const bool v1 = out[h] == 1;
+    if (out.size() < h + (v1 ? 20 : 12)) return out;
+    if (v1)
+        set64(out, h + 4, when), set64(out, h + 12, when);
+    else
+        set32(out, h + 4, uint32_t(when)), set32(out, h + 8, uint32_t(when));
+    return out;
+}
+
 QByteArray withDuration(const QByteArray& b, uint32_t type, uint64_t duration) {
     QByteArray out = b;
     const int h = be32(reinterpret_cast<const u8*>(b.constData())) == 1 ? 16 : 8;
@@ -908,7 +962,7 @@ struct TrackOut {
     uint64_t presented = 0;      // the edit's length, in the track's timescale
 };
 
-QByteArray tableStbl(const RefTrack& t, const u8* rd, const std::vector<Item>& items, int kind, int64_t shift,
+QByteArray tableStbl(const RefTrack& t, const std::vector<Item>& items, int kind, int64_t shift,
                      const std::vector<int>& ranks, int64_t delay, uint64_t* samplesOut) {
     // Chunks: runs of this track's items with nothing between them.
     std::vector<std::pair<int64_t, uint32_t>> chunks;  // offset, samples
@@ -923,7 +977,7 @@ QByteArray tableStbl(const RefTrack& t, const u8* rd, const std::vector<Item>& i
             continue;
         }
         uint32_t n = 1;
-        if (t.codec == Codec::Pcm) n = uint32_t(it.size / std::max<int64_t>(1, t.constSize > 1 ? t.constSize : (t.constSize ? 1 : t.step)));
+        if (t.codec == Codec::Pcm) n = uint32_t(it.size / std::max(1, t.step));  // frames
         if (it.offset == lastEnd && !chunks.empty())
             chunks.back().second += n;
         else
@@ -938,18 +992,7 @@ QByteArray tableStbl(const RefTrack& t, const u8* rd, const std::vector<Item>& i
     *samplesOut = samples;
     QByteArray b;
     // stsd as the reference has it.
-    {
-        const auto tc = children(reinterpret_cast<const u8*>(t.trak.constData()), 8, t.trak.size());
-        Q_UNUSED(rd);
-        const u8* d = reinterpret_cast<const u8*>(t.trak.constData());
-        const Box* mdia = child(tc, fcc("mdia"));
-        const auto mc = children(d, mdia->body, mdia->end);
-        const auto ic = children(d, child(mc, fcc("minf"))->body, child(mc, fcc("minf"))->end);
-        const Box* stbl = child(ic, fcc("stbl"));
-        const auto sc = children(d, stbl->body, stbl->end);
-        const Box* stsd = child(sc, fcc("stsd"));
-        b += QByteArray(reinterpret_cast<const char*>(d + stsd->start), int(stsd->end - stsd->start));
-    }
+    b += t.stsd;
     QByteArray p;
     put32(p, 1);
     put32(p, uint32_t(samples));
@@ -1000,16 +1043,16 @@ QByteArray tableStbl(const RefTrack& t, const u8* rd, const std::vector<Item>& i
     return box(fcc("stbl"), b);
 }
 
-QByteArray rebuildTrak(const TrackOut& o, uint32_t movieTimescale) {
+QByteArray rebuildTrak(const TrackOut& o, uint32_t movieTimescale, uint64_t when) {
     const u8* d = reinterpret_cast<const u8*>(o.ref->trak.constData());
     const int64_t n = o.ref->trak.size();
-    const auto tc = children(d, 8, n);
+    const auto tc = children(d, be32(d) == 1 ? 16 : 8, n);
     auto raw = [&](const Box& b) { return QByteArray(reinterpret_cast<const char*>(d + b.start), int(b.end - b.start)); };
     const uint64_t movieDuration = o.ref->timescale ? o.presented * movieTimescale / o.ref->timescale : 0;
     QByteArray out;
     for (const Box& b : tc) {
         if (b.type == fcc("tkhd")) {
-            out += withDuration(raw(b), fcc("tkhd"), movieDuration);
+            out += withDuration(withTimes(raw(b), when), fcc("tkhd"), movieDuration);
             if (o.mediaTime >= 0) {
                 QByteArray e;
                 put32(e, 1);
@@ -1027,7 +1070,7 @@ QByteArray rebuildTrak(const TrackOut& o, uint32_t movieTimescale) {
             QByteArray m;
             for (const Box& c : children(d, b.body, b.end)) {
                 if (c.type == fcc("mdhd")) {
-                    m += withDuration(raw(c), fcc("mdhd"), o.mediaDuration);
+                    m += withDuration(withTimes(raw(c), when), fcc("mdhd"), o.mediaDuration);
                 } else if (c.type == fcc("minf")) {
                     QByteArray i;
                     for (const Box& x : children(d, c.body, c.end)) i += x.type == fcc("stbl") ? o.stbl : raw(x);
@@ -1056,6 +1099,7 @@ std::vector<int> presentationRanks(const RefTrack& v, const u8* d, const std::ve
     ctx->extradata_size = int(v.extradata.size());
     ctx->skip_loop_filter = AVDISCARD_ALL;
     ctx->skip_idct = AVDISCARD_ALL;
+    ctx->log_level_offset = AV_LOG_DEBUG;
     ctx->thread_count = 0;
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
@@ -1143,7 +1187,16 @@ bool repairMovie(const QString& damaged, const QString& reference, const QString
         if (size == 1 && p + 16 <= n) size = be64(d + p + 8), hdr = 16;
         if (type == fcc("mdat")) {
             begin = p + hdr;
-            if (size >= uint64_t(hdr) && size <= uint64_t(n - p)) end = p + int64_t(size);
+            // Its size, when the camera wrote one and a box follows it (else the data runs on to the end).
+            if (size >= uint64_t(hdr) && size < uint64_t(n - p) - 8) {
+                const int64_t q = p + int64_t(size);
+                const uint32_t next = be32(d + q + 4);
+                bool named = true;
+                for (int i = 0; i < 4; ++i) named = named && std::isprint(int(next >> (8 * i) & 0xff));
+                if (named) end = q;  // (perhaps a moov the file was cut in)
+            } else if (size == uint64_t(n - p)) {
+                end = n;
+            }
             break;
         }
         if (size < uint64_t(hdr) || size > uint64_t(n - p)) break;
@@ -1167,10 +1220,12 @@ bool repairMovie(const QString& damaged, const QString& reference, const QString
     std::vector<Item> items;
     bool resynced = false;
     if (!w.walk(begin, false, items, walkProgress)) {
-        if (progress && !progress(0)) return *error = QObject::tr("Cancelled"), false;
+        if (w.cancelled() || (progress && !progress(0))) return *error = QObject::tr("Cancelled"), false;
         Walker w2(d, begin, end, ref);
         if (!w2.openAac() || !w2.walk(begin, true, items, walkProgress))
-            return *error = progress && !progress(0) ? QObject::tr("Cancelled") : QObject::tr("No samples matching the reference clip were found"), false;
+            return *error = w2.cancelled() || (progress && !progress(0)) ? QObject::tr("Cancelled")
+                                                                          : QObject::tr("No samples matching the reference clip were found"),
+                   false;
         resynced = true;
     }
     int videoCount = 0, audioItems = 0;
@@ -1181,7 +1236,12 @@ bool repairMovie(const QString& damaged, const QString& reference, const QString
         if (it.kind == KResync) skipped += it.size;
         lastEnd = std::max(lastEnd, it.offset + it.size);
     }
-    if (!videoCount && !audioItems) return *error = QObject::tr("No samples matching the reference clip were found"), false;
+    // A reference with pictures that finds none is from another camera or other settings (its sound alone could match
+    // by chance).
+    if ((!videoCount && !audioItems) || (v && !videoCount))
+        return *error = QObject::tr("No pictures matching the reference clip were found: choose a clip from the same camera, recorded "
+                                    "with the same settings"),
+               false;
 
     // Composition offsets from the decoder's picture order.
     std::vector<int> ranks;
@@ -1223,7 +1283,7 @@ bool repairMovie(const QString& damaged, const QString& reference, const QString
         const int kind = int(i) == ref.video ? KVideo : KAudio;
         TrackOut o{&t, {}, 0, -1, 0};
         uint64_t samples = 0;
-        o.stbl = tableStbl(t, d, items, kind, shift, kind == KVideo ? ranks : std::vector<int>{}, delay, &samples);
+        o.stbl = tableStbl(t, items, kind, shift, kind == KVideo ? ranks : std::vector<int>{}, delay, &samples);
         if (!samples) continue;
         o.mediaDuration = samples * t.delta;
         if (kind == KVideo) {
@@ -1241,9 +1301,12 @@ bool repairMovie(const QString& damaged, const QString& reference, const QString
         if (t.timescale) movieDuration = std::max(movieDuration, o.presented * ref.movieTimescale / t.timescale);
         outs.push_back(std::move(o));
     }
-    QByteArray moov = withDuration(ref.mvhd, fcc("mvhd"), movieDuration);
-    for (const TrackOut& o : outs) moov += rebuildTrak(o, ref.movieTimescale);
-    moov += ref.udta;
+    // Made when the damaged file's recording started (its last change, less its length), not when the reference was;
+    // the reference's user data (its date, place and the like) is left out.
+    const qint64 changed = QFileInfo(damaged).lastModified().toSecsSinceEpoch();
+    const uint64_t when = uint64_t(std::max<qint64>(0, changed - qint64(movieDuration / ref.movieTimescale) + 2082844800));
+    QByteArray moov = withDuration(withTimes(ref.mvhd, when), fcc("mvhd"), movieDuration);
+    for (const TrackOut& o : outs) moov += rebuildTrak(o, ref.movieTimescale, when);
     moov = box(fcc("moov"), moov);
 
     QSaveFile out(output);
@@ -1262,8 +1325,10 @@ bool repairMovie(const QString& damaged, const QString& reference, const QString
     if (v && v->delta) report.timecode = sidecarTimecode(damaged, double(v->timescale) / v->delta);
     if (resynced)
         report.notes << QObject::tr("%1 damaged bytes in the middle were skipped").arg(skipped);
-    if (v && !report.videoFrames) report.notes << QObject::tr("No pictures were found, only sound");
     if (a && !report.audioSamples) report.notes << QObject::tr("No sound was found, only pictures");
+    if (ref.dropped)
+        report.notes << QObject::tr("The reference clip has %n more picture or sound track(s); only the first of each is rebuilt",
+                                    nullptr, ref.dropped);
     return true;
 }
 
@@ -1273,6 +1338,7 @@ bool repairMovie(const QString& damaged, const QString& reference, const QString
 struct WavLayout {
     bool rf64 = false;
     int64_t ds64 = -1;       // the ds64 (or a JUNK placeholder for it) chunk's start
+    int64_t shortDs64 = -1;  // a ds64 too short for its sizes, which becomes JUNK
     int64_t dataHeader = -1;  // the data chunk's header
     int64_t dataSize = -1;    // as it should be
     int64_t after = -1;       // the chunks after the data that are whole run from here to the end
@@ -1291,9 +1357,12 @@ bool readWav(const u8* d, int64_t n, WavLayout& w, QString* error) {
     while (p + 8 <= n) {
         const u8* c = d + p;
         uint64_t size = le32(c + 4);
-        if (!std::memcmp(c, "ds64", 4) || (!std::memcmp(c, "JUNK", 4) && p == 12 && size >= 28)) {
+        if ((!std::memcmp(c, "ds64", 4) || (!std::memcmp(c, "JUNK", 4) && p == 12)) && size >= 28 && w.ds64 < 0) {
             w.ds64 = p;
             if (!std::memcmp(c, "ds64", 4) && p + 8 + 16 <= n) riff = le64(c + 8), ds64Data = le64(c + 16);
+        } else if (!std::memcmp(c, "ds64", 4)) {
+            w.shortDs64 = p;
+            if (size >= 16 && p + 8 + 16 <= n) riff = le64(c + 8), ds64Data = le64(c + 16);
         }
         if (!std::memcmp(c, "fmt ", 4) && p + 8 + 16 <= n) w.blockAlign = std::max<int>(1, c[8 + 12] | c[8 + 13] << 8);
         if (!std::memcmp(c, "data", 4)) {
@@ -1303,13 +1372,14 @@ bool readWav(const u8* d, int64_t n, WavLayout& w, QString* error) {
             // Whole when it fits and what follows it is whole chunks to the end.
             bool whole = size > 0 && size != 0xffffffffu && int64_t(size) <= avail;
             if (whole) {
+                // (A few stray bytes at the very end are allowed.)
                 int64_t q = start + int64_t(size) + int64_t(size & 1);
-                while (q + 8 <= n) {
+                while (whole && q + 8 <= n) {
                     const uint64_t s = le32(d + q + 4);
-                    if (!std::isprint(d[q]) || q + 8 + int64_t(s) > n) break;
+                    whole = std::isprint(d[q]) && q + 8 + int64_t(s) <= n;
                     q += 8 + int64_t(s) + int64_t(s & 1);
                 }
-                whole = q >= n - 1 && q <= n + 1;
+                whole = whole && q <= n + 1;
             }
             if (whole) {
                 w.dataSize = int64_t(size);
@@ -1341,7 +1411,10 @@ bool repairWav(const QString& damaged, const QString& output, RepairReport& repo
     if (!readWav(d, f.size(), w, error)) return false;
     // Everything before the data as it is, then the data at its true size, then the whole chunks after it.
     const int64_t dataStart = w.dataHeader + 8;
+    if (w.dataHeader > (64 << 20)) return *error = QObject::tr("The WAV file's chunks before its sound are too large"), false;
     QByteArray head(reinterpret_cast<const char*>(d), int(w.dataHeader));
+    if (w.shortDs64 >= 0) std::memcpy(head.data() + w.shortDs64, "JUNK", 4);
+    if (f.size() - w.after > (64 << 20)) return *error = QObject::tr("The WAV file's chunks after its sound are too large"), false;
     const QByteArray tail = w.after < f.size() ? QByteArray(reinterpret_cast<const char*>(d + w.after), int(f.size() - w.after)) : QByteArray();
     const QByteArray pad = (w.dataSize & 1) ? QByteArray(1, '\0') : QByteArray();
     auto le32put = [](QByteArray& b, int at, uint32_t v) {
@@ -1391,7 +1464,7 @@ bool repairWav(const QString& damaged, const QString& output, RepairReport& repo
     for (int64_t p = 12; p + 16 <= w.dataHeader;) {
         if (!std::memcmp(d + p, "fmt ", 4)) rate = int(le32(d + p + 12));
         const uint32_t s = le32(d + p + 4);
-        p += 8 + s + (s & 1);
+        p += 8 + int64_t(s) + (s & 1);
     }
     report.audioSamples = w.dataSize / std::max(1, frame);
     if (rate > 0) report.seconds = double(report.audioSamples) / rate;
@@ -1410,6 +1483,11 @@ bool isRip(const u8* k) { return !std::memcmp(k, kPartitionKey, 13) && k[13] == 
 bool isIndexSegment(const u8* k) { return !std::memcmp(k, kIndexKey, 13) && k[13] == 0x10 && k[14] == 0x01; }
 bool isEssence(const u8* k) {
     return be32(k) == 0x060e2b34 && k[4] == 0x01 && k[5] == 0x02 && k[6] == 0x01 && be32(k + 8) == 0x0d010301;
+}
+// A generic container's system item (SMPTE 385, 394), which starts its content package when there is one.
+bool isSystemItem(const u8* k) {
+    return be32(k) == 0x060e2b34 && k[4] == 0x02 && (k[5] == 0x05 || k[5] == 0x53) && be32(k + 8) == 0x0d010301 &&
+           (k[12] == 0x04 || k[12] == 0x14);
 }
 bool isMetadataSet(const u8* k) { return be32(k) == 0x060e2b34 && k[4] == 0x02 && k[5] == 0x53 && be32(k + 8) == 0x0d010101; }
 
@@ -1466,14 +1544,30 @@ struct MxfLayout {
     std::vector<std::pair<int, int>> durationRates;
 };
 
-bool readMxf(const u8* d, int64_t n, MxfLayout& m, QString* error) {
-    // A run-in of up to 64 KiB may come first.
-    int64_t p = -1;
+// Where an MXF file's header partition starts (after a run-in of up to 64 KiB), or -1 when it is not MXF.
+int64_t mxfStart(const u8* d, int64_t n) {
     for (int64_t q = 0; q + 16 <= std::min<int64_t>(n, 65536 + 16); ++q)
-        if (isPartition(d + q) && d[q + 13] == 2) {
-            p = q;
-            break;
-        }
+        if (isPartition(d + q) && d[q + 13] == 2) return q;
+    return -1;
+}
+
+// Whether an MXF file has its footer partition, by its random index pack at the end or its header's pointer to it
+// (without walking the file).
+bool mxfHasFooter(const u8* d, int64_t n, int64_t run) {
+    auto footerAt = [&](uint64_t at) {
+        return at > 0 && at < uint64_t(n) && uint64_t(run) + at + 16 <= uint64_t(n) && isPartition(d + run + at) &&
+               d[run + int64_t(at) + 13] == 4;
+    };
+    if (n >= 20 + 12) {
+        const uint32_t len = be32(d + n - 4);
+        if (len >= 32 && len <= n && isRip(d + n - len) && footerAt(be64(d + n - 12))) return true;
+    }
+    Klv k;
+    return klvAt(d, n, run, k) && k.end - k.value >= 32 && footerAt(be64(d + k.value + 24));
+}
+
+bool readMxf(const u8* d, int64_t n, MxfLayout& m, QString* error) {
+    int64_t p = mxfStart(d, n);
     if (p < 0) return *error = QObject::tr("This is not an MXF file"), false;
     m.run = p;
     QByteArray firstKey;
@@ -1490,6 +1584,10 @@ bool readMxf(const u8* d, int64_t n, MxfLayout& m, QString* error) {
     };
     std::vector<DurationAt> durs;
     std::vector<std::pair<int, int>> rates;
+    struct Segment {
+        int64_t start, duration, end;
+    };
+    std::vector<Segment> segments;  // the file's own VBR index segments
     Klv k;
     while (klvAt(d, n, p, k)) {
         const u8* key = d + p;
@@ -1501,7 +1599,7 @@ bool readMxf(const u8* d, int64_t n, MxfLayout& m, QString* error) {
             part.pack = QByteArray(reinterpret_cast<const char*>(d + p), int(k.end - p));
             if (k.end - k.value >= 88) {
                 const u8* v = d + k.value;
-                part.kag = std::max<uint32_t>(1, be32(v + 4));
+                part.kag = std::clamp<uint32_t>(be32(v + 4), 1, 1 << 20);
                 part.headerBytes = be64(v + 32);
                 part.indexBytes = be64(v + 40);
                 part.indexSid = be32(v + 48);
@@ -1524,7 +1622,7 @@ bool readMxf(const u8* d, int64_t n, MxfLayout& m, QString* error) {
             }
             if (sid) m.indexSid = sid;
             if (bytes) m.cbrBytes = bytes;
-            else m.indexed = std::max(m.indexed, start + duration);
+            else if (start >= 0 && duration > 0) segments.push_back({start, duration, k.end});
         } else if (isMetadataSet(key) && m.parts.size() == 1) {
             QByteArray uid, seq;
             std::vector<QByteArray> comps;
@@ -1550,7 +1648,7 @@ bool readMxf(const u8* d, int64_t n, MxfLayout& m, QString* error) {
             if (!comps.empty()) sequenceOfComponent[uid] = uid;
             for (int64_t at : here) durs.push_back({at, uid});
             if (container >= 0) durs.push_back({container, uid, sn > 0 ? sn : -1, sd > 0 ? sd : 1});
-        } else if (isEssence(key)) {
+        } else if (isEssence(key) || isSystemItem(key)) {
             MxfPartition& part = m.parts.back();
             if (part.essence < 0) {
                 const int64_t counted = part.packEnd + int64_t(part.headerBytes + part.indexBytes);
@@ -1560,9 +1658,10 @@ bool readMxf(const u8* d, int64_t n, MxfLayout& m, QString* error) {
             const QByteArray thisKey(reinterpret_cast<const char*>(key), 16);
             if (firstKey.isEmpty()) firstKey = thisKey;
             if (thisKey == firstKey) {
+                // The content package before is whole: the next one starts.
                 if (!m.units.empty()) {
                     if (!perUnit) perUnit = inUnit;
-                    if (inUnit == perUnit) wholeEnds.push_back(unitEnd);
+                    wholeEnds.push_back(unitEnd);
                 }
                 m.units.push_back(p);
                 m.unitPart.push_back(int(m.parts.size()) - 1);
@@ -1580,8 +1679,8 @@ bool readMxf(const u8* d, int64_t n, MxfLayout& m, QString* error) {
         p = k.end;
     }
     if (m.parts.empty()) return *error = QObject::tr("This is not an MXF file"), false;
-    // The last content package counts when it has all its elements and the file went on past it.
-    if (!m.units.empty() && perUnit && inUnit == perUnit) wholeEnds.push_back(unitEnd);
+    // The last content package counts when it has as many elements as the first, or the file has its footer.
+    if (!m.units.empty() && perUnit && inUnit >= perUnit) wholeEnds.push_back(unitEnd);
     if (!m.units.empty() && !perUnit && m.footer >= 0) wholeEnds.push_back(unitEnd);
     m.units.resize(wholeEnds.size());
     m.unitPart.resize(wholeEnds.size());
@@ -1589,6 +1688,10 @@ bool readMxf(const u8* d, int64_t n, MxfLayout& m, QString* error) {
     m.pictureLen.resize(wholeEnds.size());
     if (m.units.empty()) return *error = QObject::tr("The MXF file has no whole frames"), false;
     m.cut = wholeEnds.back();
+    // The packages the file's own index segments cover, from the first on without a gap, in what is kept.
+    std::sort(segments.begin(), segments.end(), [](const Segment& a, const Segment& b) { return a.start < b.start; });
+    for (const Segment& sg : segments)
+        if (sg.end <= m.cut && sg.start <= m.indexed) m.indexed = std::max(m.indexed, sg.start + sg.duration);
     m.indexed = std::min<int64_t>(m.indexed, int64_t(m.units.size()));
     // The edit rate of the content packages: the index's, else the slowest track's.
     if (m.rateNum <= 0 || m.rateDen <= 0) {
@@ -1614,7 +1717,8 @@ bool readMxf(const u8* d, int64_t n, MxfLayout& m, QString* error) {
     return true;
 }
 
-// Each content package's index flags, from its picture: random access and, for MPEG-2, its place in display order.
+// Each content package's index flags, from its picture: random access and, for MPEG-2, its place in display order and
+// its prediction (as FFmpeg's MXF muxer indexes them, which readers expect).
 struct UnitIndex {
     int8_t temporal = 0, keyOffset = 0;
     u8 flags = 0x80;
@@ -1623,17 +1727,19 @@ std::vector<UnitIndex> indexUnits(const u8* d, const MxfLayout& m) {
     const size_t n = m.units.size();
     std::vector<UnitIndex> out(n);
     std::vector<int> tref(n, -1);
-    int lastKey = 0;
+    std::vector<bool> intra(n, true), sequence(n, false);
+    bool coded = false, closedGop = false;  // (until a P picture, after which it no longer matters)
     for (size_t i = 0; i < n; ++i) {
         const int64_t p = m.picture[i], len = std::min<int64_t>(m.pictureLen[i], 8192);
         if (p < 0) continue;
         const u8* v = d + p;
-        bool mpeg2 = false, avc = false, seq = false;
+        bool mpeg2 = false, avc = false, closed = false;
         int type = 1;
-        for (int64_t q = 0; q + 6 <= len; ++q) {
+        for (int64_t q = 0; q + 8 <= len; ++q) {
             if (v[q] || v[q + 1] || v[q + 2] != 1) continue;
             const u8 code = v[q + 3];
-            if (code == 0xb3) seq = true, mpeg2 = true;
+            if (code == 0xb3) sequence[i] = true, mpeg2 = true;
+            if (code == 0xb8) closed = closedGop = v[q + 7] & 0x40, mpeg2 = true;
             if (code == 0x00) {
                 mpeg2 = true;
                 tref[i] = v[q + 4] << 2 | v[q + 5] >> 6;
@@ -1648,16 +1754,24 @@ std::vector<UnitIndex> indexUnits(const u8* d, const MxfLayout& m) {
             if (!mpeg2 && (code & 0x80) == 0 && (code & 31) == 9) avc = true;
         }
         if (!mpeg2 && !avc) continue;  // intra: every package a random access point
-        out[i].flags = type == 1 ? (seq ? 0xc0 : 0x80) : type == 2 ? 0x22 : 0x33;
-        if (type == 1) lastKey = int(i);
-        out[i].keyOffset = int8_t(std::clamp<int>(lastKey - int(i), -128, 0));
+        coded = true;
+        intra[i] = type == 1;
+        if (avc) {
+            out[i].flags = type == 1 ? 0x80 : 0x22;
+        } else {
+            // I: a sequence header (0x40), random access when its GOP is closed; P forward; B both ways, or only
+            // backward in a closed GOP.
+            out[i].flags = type == 1 ? u8((sequence[i] ? 0x40 : 0) | (sequence[i] && closed ? 0x80 : 0)) : type == 2 ? 0x22 : 0x33;
+            if (type == 3 && closedGop) out[i].flags = 0x13;
+            if (type == 2) closedGop = false;
+        }
     }
+    if (!coded) return out;
     // MPEG-2 reordering: the entry at a display slot names where that picture is stored.
     for (size_t key = 0; key < n;) {
         size_t end = key + 1;
-        while (end < n && !(out[end].flags & 0x80)) ++end;
+        while (end < n && !intra[end]) ++end;
         for (size_t i = key; i < end; ++i) {
-            if (tref[i] < 0) continue;
             const int slot = int(i - key);
             for (size_t j = key; j < end; ++j)
                 if (tref[j] == slot) {
@@ -1666,6 +1780,19 @@ std::vector<UnitIndex> indexUnits(const u8* d, const MxfLayout& m) {
                 }
         }
         key = end;
+    }
+    // Key frame offsets: a B picture predicted both ways counts back to the key frame before the one its GOP opens with
+    // until a P picture follows that one.
+    int key = 0, lastKey = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (!(out[i].flags & 0x33)) lastKey = key, key = int(i);
+        if ((out[i].flags & 0x30) == 0x30) {
+            out[i].keyOffset = int8_t(std::clamp(lastKey - int(i), -128, 0));
+        } else {
+            out[i].keyOffset = int8_t(std::clamp(key - int(i), -128, 0));
+            if (out[i].flags & 0x20) lastKey = key;
+        }
+        if (!(out[i].flags & 0x33) && (out[i].flags & 0x40) && !out[i].temporal) out[i].flags |= 0x80;
     }
     return out;
 }
@@ -1693,7 +1820,9 @@ bool repairMxf(const QString& damaged, const QString& output, RepairReport& repo
     MxfLayout m;
     if (!readMxf(d, f.size(), m, error)) return false;
     const MxfPartition& header = m.parts.front();
-    if (header.pack.size() < 17 + 88) return *error = QObject::tr("The MXF header cannot be read"), false;
+    Klv hk;
+    if (!klvAt(reinterpret_cast<const u8*>(header.pack.constData()), header.pack.size(), 0, hk) || hk.end - hk.value < 88)
+        return *error = QObject::tr("The MXF header cannot be read"), false;
     const int64_t units = int64_t(m.units.size());
     std::vector<const MxfPartition*> kept;
     for (const MxfPartition& p : m.parts)
@@ -1742,12 +1871,7 @@ bool repairMxf(const QString& damaged, const QString& output, RepairReport& repo
             segment(s, std::min<int64_t>(4096, units - s), entries);
         }
     }
-    QByteArray footerValue;
-    {
-        Klv hk;
-        klvAt(reinterpret_cast<const u8*>(header.pack.constData()), header.pack.size(), 0, hk);
-        footerValue = header.pack.mid(int(hk.value));
-    }
+    QByteArray footerValue = header.pack.mid(int(hk.value));
     const int64_t prevPart = kept.back()->at - m.run;
     u8 footerKey[16];
     std::memcpy(footerKey, kPartitionKey, 13);
@@ -1778,7 +1902,7 @@ bool repairMxf(const QString& damaged, const QString& output, RepairReport& repo
     std::vector<std::pair<int64_t, QByteArray>> patches;
     for (const MxfPartition* p : kept) {
         Klv pk;
-        klvAt(d, f.size(), p->at, pk);
+        if (!klvAt(d, f.size(), p->at, pk) || pk.end - pk.value < 88) continue;
         QByteArray at8;
         put64(at8, uint64_t(footerAt));
         patches.push_back({pk.value + 24, at8});
@@ -1842,7 +1966,8 @@ RepairCheck checkRecording(const QString& path, bool probe) {
     const int64_t n = f.size();
     c.opens = probe && opensWithStreams(path);
     QString error;
-    if (n >= 12 && (!std::memcmp(d, "RIFF", 4) || !std::memcmp(d, "RF64", 4) || !std::memcmp(d, "BW64", 4))) {
+    if (n >= 12 && (!std::memcmp(d, "RIFF", 4) || !std::memcmp(d, "RF64", 4) || !std::memcmp(d, "BW64", 4)) &&
+        !std::memcmp(d + 8, "WAVE", 4)) {
         WavLayout w;
         if (!readWav(d, n, w, &error)) {
             c.problem = error;
@@ -1855,11 +1980,8 @@ RepairCheck checkRecording(const QString& path, bool probe) {
         }
         return c;
     }
-    if (n >= 16 && be32(d) == 0x060e2b34 && be32(d + 4) == 0x02050101 && be32(d + 8) == 0x0d010201 && d[12] == 0x01 && d[13] == 0x02) {
-        MxfLayout m;
-        if (!readMxf(d, n, m, &error)) {
-            c.problem = error;
-        } else if (m.footer < 0) {
+    if (const int64_t run = mxfStart(d, n); run >= 0) {
+        if (!mxfHasFooter(d, n, run)) {
             c.kind = RepairKind::Mxf;
             c.problem = QObject::tr("The MXF file has no footer (the recording was interrupted)");
         }
@@ -1933,6 +2055,16 @@ double sidecarTimecode(const QString& path, double fps) {
     return -1;
 }
 
+bool sameFile(const QString& a, const QString& b) {
+    const QFileInfo fa(a), fb(b);
+    QString pa = fa.exists() ? fa.canonicalFilePath() : fa.absoluteFilePath(), pb = fb.exists() ? fb.canonicalFilePath() : fb.absoluteFilePath();
+#if defined(Q_OS_WIN) || defined(Q_OS_MACOS)
+    return pa.compare(pb, Qt::CaseInsensitive) == 0;  // (their file systems mostly ignore case)
+#else
+    return pa == pb;
+#endif
+}
+
 QString repairedPath(const QString& damaged) {
     const QFileInfo fi(damaged);
     const QString base = fi.completeBaseName(), ext = fi.suffix().isEmpty() ? QString() : "." + fi.suffix();
@@ -1948,7 +2080,9 @@ bool repairRecording(const QString& damaged, const QString& reference, const QSt
     r = RepairReport{};
     QString err;
     QString& e = error ? *error : err;
-    const RepairCheck check = checkRecording(damaged);
+    if (sameFile(output, damaged) || (!reference.isEmpty() && sameFile(output, reference)))
+        return e = QObject::tr("Save the repair as a new file: the damaged file and the good clip are kept as they are"), false;
+    const RepairCheck check = checkRecording(damaged, false);
     bool ok = false;
     switch (check.kind) {
     case RepairKind::Movie:

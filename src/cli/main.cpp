@@ -127,7 +127,7 @@ int usage() {
                  "  montage-cli shots <project.montage> \"a red car at night\" [--max N]   (find shots by description)\n"
                  "  montage-cli sounds <project.montage> \"applause\" [--max N]   (find sounds by description)\n"
                  "  montage-cli people <project.montage> [--person NAME|ID]   (who is in the footage, and where)\n"
-                 "  montage-cli repair <file> [--reference good.mov] [-o out]   (an interrupted recording: an MP4 or MOV without its\n"
+                 "  montage-cli repair <file> [--reference good.mov] [-o out] [--overwrite]   (an interrupted recording: an MP4 or MOV without its\n"
                  "              index, rebuilt from a good clip from the same camera; an MXF without its footer; a WAV with wrong sizes)\n"
                  "  montage-cli ltc <file> [--seconds 30]   (the LTC timecode recorded on a sound channel)\n"
                  "  montage-cli ltc -o ltc.wav --start 01:00:00:00 --duration S [--fps 25] [--non-drop] [--rate 48000]   (write LTC)\n"
@@ -669,9 +669,11 @@ int cmdLoudness(const std::vector<std::string>& args) {
 // montage-cli ltc <file> [--seconds N] | ltc -o out.wav --start TC --duration S [--fps R] [--rate HZ]
 int cmdRepair(const std::vector<std::string>& args) {
     std::string in, reference, out;
+    bool overwrite = false;
     for (size_t i = 0; i < args.size(); ++i) {
         const bool more = i + 1 < args.size();
         if (args[i] == "-o" && more) out = args[++i];
+        else if (args[i] == "--overwrite") overwrite = true;
         else if (args[i] == "--reference" && more) reference = args[++i];
         else if (in.empty() && args[i][0] != '-') in = args[i];
         else return usage();
@@ -685,6 +687,10 @@ int cmdRepair(const std::vector<std::string>& args) {
     }
     std::printf("%s\n", qPrintable(check.problem));
     const QString target = out.empty() ? repairedPath(file) : QString::fromStdString(out);
+    if (QFileInfo::exists(target) && !overwrite && !sameFile(target, file)) {
+        std::fprintf(stderr, "error: %s exists (pass --overwrite to replace it)\n", qPrintable(target));
+        return 1;
+    }
     RepairReport report;
     QString err;
     if (!repairRecording(file, QString::fromStdString(reference), target, &report, &err)) {

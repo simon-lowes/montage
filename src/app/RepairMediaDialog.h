@@ -46,6 +46,7 @@ private:
     QPlainTextEdit* report_;
     QPushButton* start_ = nullptr;
     QString bin_, reportText_;
+    QString replace_;  // an existing file the save dialog was told to replace
     RepairCheck checked_;
     Id imported_ = 0;
 };

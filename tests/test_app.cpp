@@ -6515,6 +6515,18 @@ private slots:
         bin->repairDialogHook_ = {};
         QCOMPARE(shown, 1);
         QVERIFY(QFileInfo::exists(dir_.path() + "/drive3/A008/A008C001_repaired.wav"));
+        // A name that is taken is not written over unless the save dialog was asked.
+        {
+            RepairMediaDialog taken(state(), win_.get());
+            taken.setDamaged(r.damaged.front());
+            taken.findChild<QLineEdit*>("repairOutput")->setText(dir_.path() + "/drive3/A008/A008C001_repaired.wav");
+            taken.findChild<QCheckBox*>("repairImport")->setChecked(false);
+            QVERIFY(!taken.run());
+            QVERIFY2(taken.report().contains("already exists"), qPrintable(taken.report()));
+            taken.findChild<QLineEdit*>("repairOutput")->setText(r.damaged.front());
+            QVERIFY(!taken.run());
+            QVERIFY2(taken.report().contains("new file"), qPrintable(taken.report()));
+        }
         // A file that opens has nothing to repair.
         RepairMediaDialog again(state(), win_.get());
         again.setDamaged(dir_.path() + "/drive3/A008/A008C001_repaired.wav");

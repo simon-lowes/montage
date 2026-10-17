@@ -919,10 +919,11 @@ void McpServer::Impl::addTools() {
         "or MOV without its index (moov) from a good clip from the same camera and settings (`reference`; H.264, HEVC and "
         "ProRes pictures, AAC and PCM sound), an MXF without its footer (closed header with the duration, footer with an "
         "index table), or a WAV, BWF or RF64 whose sizes were never written (bext and iXML kept). The damaged file is not "
-        "changed; `output` defaults to <name>_repaired.<ext> beside it. With `project`, the repaired file is imported into "
+        "changed; `output` (a relative one is beside it) defaults to <name>_repaired.<ext>, and an existing one is only "
+        "replaced with `overwrite`. With `project`, the repaired file is imported into "
         "it with the keyword Recovered (and the start timecode a camera sidecar gives).",
         R"json({"type":"object","properties":{"file":{"type":"string"},"reference":{"type":"string"},"output":{"type":"string"},
-            "project":{"type":"string","description":"Import the repaired file into this project"},
+            "overwrite":{"type":"boolean","default":false},"project":{"type":"string","description":"Import the repaired file into this project"},
             "bin":{"type":"string"}},"required":["file"]})json",
         false, [this](const QJsonObject& a) {
             const QString file = absolute(need(a, "file"));
@@ -933,8 +934,16 @@ void McpServer::Impl::addTools() {
             }
             if (check.needsReference && !a.contains("reference"))
                 throw ArgError{"\"reference\" is a good clip from the same camera, needed to rebuild an MP4 or MOV"};
-            const QString output = a.contains("output") ? absolute(str(a, "output")) : repairedPath(file);
-            if (QFileInfo(output).absoluteFilePath() == QFileInfo(file).absoluteFilePath()) throw ArgError{"\"output\" must be a new file"};
+            QString output = repairedPath(file);
+            if (a.contains("output")) {
+                output = str(a, "output");
+                if (QFileInfo(output).isRelative()) output = QFileInfo(file).dir().filePath(output);
+                output = QFileInfo(output).absoluteFilePath();
+            }
+            if (sameFile(output, file) || (check.needsReference && sameFile(output, absolute(str(a, "reference")))))
+                throw ArgError{"\"output\" must be a new file, not the damaged file or the reference"};
+            if (QFileInfo::exists(output) && !a.value("overwrite").toBool())
+                throw ArgError{"\"output\" exists: pass overwrite to replace it"};
             std::optional<Loaded> l;
             if (a.contains("project")) l = open(a);
             RepairReport r;

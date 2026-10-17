@@ -30,8 +30,9 @@ QString guessReferenceClip(const QString& damaged) {
             o.completeBaseName().contains(QStringLiteral("_repaired")))
             continue;
         if (++tried > 8) break;
-        const RepairCheck c = checkRecording(o.absoluteFilePath());
-        if (c.opens && c.kind == RepairKind::None) return o.absoluteFilePath();
+        // By its structure only (FFmpeg is not asked to open each one here, on the interface's thread).
+        const RepairCheck c = checkRecording(o.absoluteFilePath(), false);
+        if (c.kind == RepairKind::None && c.problem.isEmpty()) return o.absoluteFilePath();
     }
     return {};
 }
@@ -82,7 +83,7 @@ RepairMediaDialog::RepairMediaDialog(EditorState* state, QWidget* parent) : QDia
     auto* chooseOutput = new QPushButton(tr("Choose…"), this);
     connect(chooseOutput, &QPushButton::clicked, this, [this] {
         const QString f = QFileDialog::getSaveFileName(this, tr("Repaired File"), output_->text());
-        if (!f.isEmpty()) output_->setText(QDir::toNativeSeparators(f));
+        if (!f.isEmpty()) output_->setText(QDir::toNativeSeparators(f)), replace_ = f;  // (the save dialog asked)
     });
     form->addRow(tr("Save as:"), row(output_, chooseOutput));
     import_ = new QCheckBox(tr("Import the repaired file, labelled Recovered"), this);
@@ -140,8 +141,13 @@ bool RepairMediaDialog::run() {
                   reference = checked_.needsReference ? QDir::fromNativeSeparators(reference_->text()) : QString(),
                   output = QDir::fromNativeSeparators(output_->text().trimmed());
     QStringList lines;
-    if (output.isEmpty() || QFileInfo(output).absoluteFilePath() == QFileInfo(damaged).absoluteFilePath()) {
-        reportText_ = tr("Save it as a new file: the damaged one is kept as it is.");
+    if (output.isEmpty() || sameFile(output, damaged) || (!reference.isEmpty() && sameFile(output, reference))) {
+        reportText_ = tr("Save it as a new file: the damaged one and the good clip are kept as they are.");
+        report_->setPlainText(reportText_);
+        return false;
+    }
+    if (QFileInfo::exists(output) && !sameFile(output, replace_)) {
+        reportText_ = tr("%1 already exists: choose another name, or choose it with Choose… to replace it.").arg(QFileInfo(output).fileName());
         report_->setPlainText(reportText_);
         return false;
     }

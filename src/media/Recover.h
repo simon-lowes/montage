@@ -8,6 +8,7 @@
 //    duration in a closed header and a footer carrying an index table;
 //  - a WAV, BWF or RF64 whose RIFF and data sizes were never filled in, set from the file's length (RF64 past 4 GiB),
 //    keeping bext and iXML.
+// Clip-wrapped MXF (one KLV for the whole clip, as P2's OP-Atom files are) is not re-indexed: only frame-wrapped.
 // The damaged file is never changed; the repair is written to a new file. Nothing here comes from untrunc (GPL-2.0
 // only).
 #pragma once
@@ -42,11 +43,15 @@ struct RepairReport {
     QStringList notes;
 };
 
+// Whether two paths name the same file (by case too on Windows and macOS, whose file systems mostly ignore it).
+bool sameFile(const QString& a, const QString& b);
+
 // The file a repair of `damaged` is written to: beside it, "<name>_repaired.<ext>", numbered if that exists.
 QString repairedPath(const QString& damaged);
 
-// Repairs `damaged` into `output`. `reference` is a good clip from the same camera (MP4 and MOV only). `progress`
-// gets 0..1 and returns false to cancel.
+// Repairs `damaged` into `output`, which may be neither it nor `reference` (an existing `output` is replaced: callers
+// ask first). `reference` is a good clip from the same camera (MP4 and MOV only). `progress` gets 0..1 and returns
+// false to cancel.
 bool repairRecording(const QString& damaged, const QString& reference, const QString& output, RepairReport* report,
                      QString* error, const std::function<bool(double)>& progress = {});
 
