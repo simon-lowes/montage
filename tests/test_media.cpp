@@ -531,6 +531,7 @@ bool writeRecording(const std::string& file, const char* format, const char* vco
         e.st = avformat_new_stream(oc, nullptr);
         avcodec_parameters_from_context(e.st->codecpar, e.c);
         e.st->time_base = e.c->time_base;
+        e.st->avg_frame_rate = e.c->framerate;  // (FFmpeg 8's MXF muxer takes the frame rate from here)
         return true;
     };
     const std::string vname = vcodec ? vcodec : "";
