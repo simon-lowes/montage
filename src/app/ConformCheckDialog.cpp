@@ -109,6 +109,17 @@ ConformCheckDialog::ConformCheckDialog(EditorState* state, QWidget* parent) : QD
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     lay->addWidget(buttons);
     updateButtons();
+    connect(state_, &EditorState::projectChanged, this, [this] {
+        if (!editing_ && !shots_.empty()) forget();
+    });
+}
+
+void ConformCheckDialog::forget() {
+    shots_.clear();
+    fixed_.clear();
+    table_->setRowCount(0);
+    summary_->setText(tr("The project has changed since the check: check again."));
+    updateButtons();
 }
 
 void ConformCheckDialog::setReference(Id media) {
@@ -159,8 +170,10 @@ bool ConformCheckDialog::runCheck() {
     progress.close();
     if (*cancel) return false;
     const Outcome out = watcher.result();
+    if (!state_->project().findSequence(sequence_)) return false;  // (deleted while it ran)
     shots_ = out.shots;
     fixed_.assign(shots_.size(), false);
+    marked_ = false;
     if (shots_.empty() && !out.error.empty()) {
         summary_->setText(QString::fromStdString(out.error));
         table_->setRowCount(0);
@@ -197,7 +210,7 @@ bool ConformCheckDialog::runCheck() {
 }
 
 void ConformCheckDialog::activate(int row) {
-    if (row < 0 || row >= int(shots_.size())) return;
+    if (row < 0 || row >= int(shots_.size()) || !state_->project().findSequence(sequence_)) return;
     if (state_->sequence() && state_->sequence()->id != sequence_) state_->setActiveSequence(sequence_);
     if (shots_[size_t(row)].clip) state_->setSelection({shots_[size_t(row)].clip});
     state_->setPlayhead(shots_[size_t(row)].start);
@@ -213,14 +226,17 @@ int ConformCheckDialog::applyFixes(bool all) {
     std::vector<int> todo;
     for (int r : rows)
         if (r < int(shots_.size()) && !fixed_[size_t(r)] && shots_[size_t(r)].fixable()) todo.push_back(r);
-    if (todo.empty()) return 0;
+    if (todo.empty() || !state_->project().findSequence(sequence_)) return 0;
     if (state_->sequence() && state_->sequence()->id != sequence_) state_->setActiveSequence(sequence_);
+    if (!state_->sequence() || state_->sequence()->id != sequence_) return 0;
     std::vector<int> done;
+    editing_ = true;
     state_->edit(todo.size() == 1 ? tr("Apply Conform Fix") : tr("Apply Conform Fixes"), [&](Project& p, Sequence& s) {
         for (int r : todo)
             if (applyConformFix(p, s, shots_[size_t(r)])) done.push_back(r);
         return !done.empty();
     });
+    editing_ = false;
     for (int r : done) {
         fixed_[size_t(r)] = true;
         table_->item(r, 2)->setText(tr("Fixed (%1)").arg(QString::fromLatin1(conformVerdictName(shots_[size_t(r)].verdict)).toLower()));
@@ -234,9 +250,11 @@ int ConformCheckDialog::addMarkers() {
     std::vector<ConformShot> differ;
     for (size_t i = 0; i < shots_.size(); ++i)
         if (shots_[i].verdict != ConformVerdict::Matches && !fixed_[i]) differ.push_back(shots_[i]);
-    if (differ.empty()) return 0;
+    if (differ.empty() || marked_ || !state_->project().findSequence(sequence_)) return 0;
     if (state_->sequence() && state_->sequence()->id != sequence_) state_->setActiveSequence(sequence_);
+    if (!state_->sequence() || state_->sequence()->id != sequence_) return 0;
     int n = 0;
+    editing_ = true;
     state_->edit(tr("Add Conform Markers"), [&](Project&, Sequence& s) {
         for (const ConformShot& c : differ) {
             edit::addMarker(s, Marker{c.start, c.length, std::string("Conform: ") + conformVerdictName(c.verdict), c.details, labelFor(c.verdict)});
@@ -244,6 +262,9 @@ int ConformCheckDialog::addMarkers() {
         }
         return n > 0;
     });
+    editing_ = false;
+    marked_ = n > 0;
+    updateButtons();
     return n;
 }
 
@@ -259,7 +280,7 @@ void ConformCheckDialog::updateButtons() {
             if (i.row() < int(shots_.size()) && !fixed_[size_t(i.row())] && shots_[size_t(i.row())].fixable()) selected = true;
     applyButton_->setEnabled(selected);
     applyAllButton_->setEnabled(any);
-    markersButton_->setEnabled(differs);
+    markersButton_->setEnabled(differs && !marked_);
 }
 
 }  // namespace montage

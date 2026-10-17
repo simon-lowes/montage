@@ -31,12 +31,15 @@ struct ConformShot {
     FrameTime start = 0, length = 0;  // the part of the timeline where it is the picture on top (Missing: the gap)
     ConformVerdict verdict = ConformVerdict::NoMatch;
     double score = 0;                 // 0..1: how alike the reference and the shot (as fixed) are
-    FrameTime slip = 0;               // Slipped: the source frames to move it by (as edit::slip takes them)
+    FrameTime slip = 0;               // Slipped: the frames to slip it by (as edit::slip takes them: at the clip's head speed)
     Id media = 0;                     // OtherTake: the take the reference shows
     double sourceIn = 0;              // OtherTake: where the clip starts in it (sequence frames, as Clip::sourceIn)
-    std::vector<ConformKey> keys;     // Reframed: the Transform (one key: still; more: it moves)
+    std::vector<ConformKey> keys;     // the Transform it needs (one key: still; more: it moves); also with a slip or take
     std::string details;              // e.g. "scale 112.0 %, rotation 1.5°, position (40, -20)", "3 frames late"
-    bool fixable() const { return verdict == ConformVerdict::Reframed || verdict == ConformVerdict::Slipped || verdict == ConformVerdict::OtherTake; }
+    bool fixable() const {
+        return (verdict == ConformVerdict::Reframed && !keys.empty()) || (verdict == ConformVerdict::Slipped && slip) ||
+               verdict == ConformVerdict::OtherTake;
+    }
 };
 
 struct ConformOptions {
@@ -57,7 +60,8 @@ std::vector<ConformShot> conformCheck(const Project& p, const Sequence& seq, Id 
                                       std::string* error = nullptr);
 
 // Puts right what a shot's check found (its Transform keyed, its source slipped, or the other take put in, with its
-// linked sound); false when there is nothing to fix or the clip is gone.
+// linked sound); false, changing nothing, when there is nothing to fix, the clip is gone or on a locked track, or the
+// fix does not fit (the slip or the take runs past its media).
 bool applyConformFix(Project& p, Sequence& seq, const ConformShot& shot);
 
 }  // namespace montage

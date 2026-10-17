@@ -797,6 +797,15 @@ private slots:
         QVERIFY(dlg.findChild<QLabel*>("conformSummary")->text().contains("match"));
         state()->undo();
         QCOMPARE(state()->sequence()->videoTracks[0].clips[0].motion.p("scale", 0, 100), 100.0);
+        // The undo leaves the results stale: dropped, to be checked again. Markers go on once for a check.
+        QVERIFY(dlg.shots().empty());
+        QCOMPARE(table->rowCount(), 0);
+        QVERIFY(dlg.runCheck());
+        QCOMPARE(dlg.shots()[0].verdict, ConformVerdict::Reframed);
+        QCOMPARE(dlg.addMarkers(), 1);
+        QCOMPARE(dlg.addMarkers(), 0);
+        QVERIFY(!dlg.findChild<QPushButton*>("conformMarkers")->isEnabled());
+        QCOMPARE(dlg.shots().size(), size_t(1));  // (its own markers do not make the results stale)
     }
 
     void aleAndCdlFromTheMenus() {

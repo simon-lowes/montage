@@ -4238,6 +4238,7 @@ void McpServer::Impl::addTools() {
             try {
                 ref = projectMedia(l.project, need(a, "reference")).id;
             } catch (const ArgError&) {
+                if (!QFileInfo(absolute(need(a, "reference"))).isFile()) throw;  // (not in the project, and no such file)
                 const size_t before = l.project.media.size();
                 ref = mediaFor(l.project, need(a, "reference"));
                 added = l.project.media.size() > before;
@@ -4261,7 +4262,7 @@ void McpServer::Impl::addTools() {
                               {"verdict", QString::fromLatin1(conformVerdictName(c.verdict)).toLower().replace(' ', '_')},
                               {"likeness", std::round(c.score * 1000) / 1000},
                               {"details", QString::fromStdString(c.details)}};
-                if (c.verdict == ConformVerdict::Slipped || (c.verdict == ConformVerdict::OtherTake && c.slip)) row["slip"] = double(c.slip);
+                if (c.verdict == ConformVerdict::Slipped) row["slip"] = double(c.slip);
                 if (c.verdict == ConformVerdict::OtherTake) {
                     const MediaItem* m = l.project.findMedia(c.media);
                     row["media"] = QString::fromStdString(m ? m->name : std::string());

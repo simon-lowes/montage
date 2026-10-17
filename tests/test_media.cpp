@@ -22687,7 +22687,8 @@ private slots:
     void conformCheck() {
         // Two takes of a scene, each a camera panning over fine detail (3 pixels across, 1 down a frame). The offline
         // cut: take A reframed (112 %, 1.5°, moved 40 right and 20 up), take A graded, then take B; its reference
-        // movie carries burnt-in timecode. Then a push across take A, and a last shot of take B. The conformed sequence
+        // movie carries burnt-in timecode. Then a push across take A (flipped), and a last shot of take B. Take B is
+        // twice the size, and the second shot cropped. The conformed sequence
         // lost the reframe and the push, is 3 frames early on the second shot, has take A for the third and leaves out
         // the last.
         const int W = 480, H = 270, frames = 110;
@@ -22703,13 +22704,13 @@ private slots:
             return (hash(seed, ix, iy) * (1 - su) + hash(seed, ix + 1, iy) * su) * (1 - sv) +
                    (hash(seed, ix, iy + 1) * (1 - su) + hash(seed, ix + 1, iy + 1) * su) * sv;
         };
-        auto take = [&](uint32_t seed) {
+        auto take = [&](uint32_t seed, int size) {  // (size: 2 is twice the sequence's width and height)
             std::vector<QImage> out;
             for (int f = 0; f < frames; ++f) {
-                QImage img(W, H, QImage::Format_RGB32);
-                for (int y = 0; y < H; ++y)
-                    for (int x = 0; x < W; ++x) {
-                        const double X = x + 3 * f, Y = y + f;
+                QImage img(W * size, H * size, QImage::Format_RGB32);
+                for (int y = 0; y < H * size; ++y)
+                    for (int x = 0; x < W * size; ++x) {
+                        const double X = double(x) / size + 3 * f, Y = double(y) / size + f;
                         const double l = 0.5 * noise(seed, X, Y, 26) + 0.32 * noise(seed + 1, X, Y, 9) + 0.18 * noise(seed + 2, X, Y, 4);
                         const double c = noise(seed + 3, X, Y, 60) - 0.5;
                         const int v = std::clamp(int(std::lround(255 * l)), 0, 255);
@@ -22720,8 +22721,8 @@ private slots:
             return out;
         };
         const std::string takeA = path("conform-take-a.mp4"), takeB = path("conform-take-b.mp4");
-        writeFrames(takeA, take(11), 25);
-        writeFrames(takeB, take(29), 25);
+        writeFrames(takeA, take(11, 1), 25);
+        writeFrames(takeB, take(29, 2), 25);  // (shot on a bigger camera)
         auto build = [&](Project& p) {
             Sequence& s = *p.active();
             s.width = W, s.height = H, s.fps = {25, 1};
@@ -22751,6 +22752,7 @@ private slots:
             reframed.motion.params["pos_x"] = Param(40.0);
             reframed.motion.params["pos_y"] = Param(-20.0);
             Clip& graded = place(off, 0, 25, 50);
+            graded.motion.params["crop_left"] = Param(15.0);
             Effect cdl = makeEffect(off, "cdl");
             for (const char* ch : {"r", "g", "b"}) {
                 cdl.params[std::string("slope.") + ch] = Param(1.35);
@@ -22761,6 +22763,7 @@ private slots:
             place(off, 1, 50, 20);
             // A push across: moved 60 pixels right over the shot.
             Clip& pushed = place(off, 0, 75, 80);
+            pushed.motion.params["flip_h"] = Param(1.0);
             pushed.motion.params["scale"] = Param(115.0);
             pushed.motion.params["pos_x"].addKey(0, 0);
             pushed.motion.params["pos_x"].addKey(24, 60);
@@ -22779,9 +22782,9 @@ private slots:
         p.media.push_back(probeOrFail(p, st.path));
         const Id ref = p.media.back().id, idB = p.media[1].id;
         place(p, 0, 0, 10);
-        place(p, 0, 25, 47);
+        place(p, 0, 25, 47).motion.params["crop_left"] = Param(15.0);  // (the crop and the flip came through the list)
         place(p, 0, 50, 20);
-        place(p, 0, 75, 80);
+        place(p, 0, 75, 80).motion.params["flip_h"] = Param(1.0);
         Sequence& s = *p.active();
         QCOMPARE(s.videoTracks[0].clips.size(), size_t(4));
         std::vector<ConformShot> shots = montage::conformCheck(p, s, ref, {}, {}, nullptr, &err);

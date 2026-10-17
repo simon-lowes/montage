@@ -4,8 +4,10 @@
 #include <cmath>
 #include <cstdio>
 #include <map>
+#include <memory>
 
 #include "Compositor.h"
+#include "core/ClipAnimation.h"
 #include "core/EditOps.h"
 #include "media/Tracking.h"
 
@@ -50,6 +52,8 @@ Affine fromSimilarity(const Similarity& s) {
 struct Picture {
     GrayImage g;
     std::vector<uint8_t> valid;  // 1 where it shows the shot (inside a warped picture, outside the mask)
+    mutable std::vector<Point2> corners;  // a reference's features to follow, outside the mask (found once)
+    mutable bool cornersFound = false;
 };
 
 void normalise(Picture& p, const std::vector<uint8_t>* mask) {
@@ -74,8 +78,13 @@ GrayImage grey(const Image& img) {
     return g;
 }
 
-// `src` drawn into a w x h frame through `toFrame` (src pixel -> frame pixel).
-Picture warp(const GrayImage& src, const Affine& toFrame, int w, int h) {
+// What a clip's Transform crops off its picture, as fractions of each side.
+struct Crop {
+    double left = 0, right = 0, top = 0, bottom = 0;
+};
+
+// `src` drawn into a w x h frame through `toFrame` (src pixel -> frame pixel), less what `crop` takes off.
+Picture warp(const GrayImage& src, const Affine& toFrame, int w, int h, const Crop& crop = {}) {
     Picture out;
     out.g.width = w;
     out.g.height = h;
@@ -85,7 +94,9 @@ Picture warp(const GrayImage& src, const Affine& toFrame, int w, int h) {
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) {
             const Point2 q = back.apply({x + 0.5, y + 0.5});
-            if (q.x < 0 || q.y < 0 || q.x > src.width || q.y > src.height) continue;
+            if (q.x < crop.left * src.width || q.y < crop.top * src.height || q.x > (1 - crop.right) * src.width ||
+                q.y > (1 - crop.bottom) * src.height)
+                continue;
             const size_t i = size_t(y) * size_t(w) + size_t(x);
             out.g.px[i] = src.sample(q.x - 0.5, q.y - 0.5);
             out.valid[i] = 1;
@@ -136,6 +147,8 @@ struct Checker {
         return refCache.emplace(t, std::move(pic)).first->second;
     }
 
+    Crop crop;                  // the shot's (set for each shot)
+
     // How the clip's media sits in the frame before its own Transform (its Fit), as a factor per axis.
     void fit(const Clip& c, const MediaItem& m, FrameTime lt, double& fx, double& fy) const {
         const double mw = std::max(1, m.width), mh = std::max(1, m.height);
@@ -147,56 +160,85 @@ struct Checker {
             default: break;
         }
     }
-    // The media at sequence frame `src` (source frames, as Clip::sourceIn), at the size its Fit gives it in the
-    // analysis frame.
-    const GrayImage& media(const MediaItem& m, double fx, double fy, double src) {
-        const int64_t frame = int64_t(std::floor(src + 1e-6));
+    // The media at sequence frame `src` (source frames, as Clip::sourceIn), uniformly scaled to about the size that
+    // fills the analysis frame (how a clip then places it is the placement's business).
+    const GrayImage& media(const MediaItem& m, double src) {
+        const bool still = m.kind == MediaKind::Image;
+        const int64_t frame = still ? 0 : int64_t(std::floor(src + 1e-6));
         const auto key = std::make_pair(m.id, frame);
         auto it = mediaCache.find(key);
         if (it != mediaCache.end()) return it->second;
-        const int tw = std::max(8, int(std::lround(std::max(1, m.width) * fx * k)));
-        const int th = std::max(8, int(std::lround(std::max(1, m.height) * fy * k)));
-        GrayImage g = grey(renderMediaFrame(p, m, m.kind == MediaKind::Image ? 0.0 : std::max(0.0, double(frame) / fps), tw, th));
-        if (mediaCache.size() > 160) mediaCache.clear();
+        const double mw = std::max(1, m.width), mh = std::max(1, m.height);
+        const double u = std::max(seq.width / mw, seq.height / mh) * k;
+        const int tw = std::max(8, int(std::lround(mw * u))), th = std::max(8, int(std::lround(mh * u)));
+        GrayImage g = grey(renderMediaFrame(p, m, still ? 0.0 : std::max(0.0, double(frame) / fps), tw, th));
+        if (mediaCache.size() > cacheLimit) mediaCache.clear();
         return mediaCache.emplace(key, std::move(g)).first->second;
     }
-    // Media thumbnail pixels -> analysis frame, under a Transform's values (anchor in media pixels).
-    Affine placement(const GrayImage& t, const MediaItem& m, double fx, double fy, double posX, double posY, double scale,
-                     double scaleX, double scaleY, double rotation, double anchorX, double anchorY) const {
+    size_t cacheLimit = 160;
+    // The clip's Transform at clip-local frame lt as the compositor applies it (render/Compositor.cpp clipGeometry):
+    // per-axis scale with its Fit and flips, rotation, position, anchor, and the animation presets on top.
+    struct Pose {
+        double sx = 1, sy = 1, rotation = 0, posX = 0, posY = 0, anchorX = 0, anchorY = 0;
+    };
+    Pose pose(const Clip& c, const MediaItem& m, FrameTime lt) const {
+        const Effect& mo = c.motion;
+        double fx = 1, fy = 1;
+        fit(c, m, lt, fx, fy);
+        Pose q;
+        const double s = mo.p("scale", lt, 100) / 100;
+        q.sx = fx * s * mo.p("scale_x", lt, 100) / 100 * (mo.p("flip_h", lt) > 0.5 ? -1 : 1);
+        q.sy = fy * s * mo.p("scale_y", lt, 100) / 100 * (mo.p("flip_v", lt) > 0.5 ? -1 : 1);
+        q.rotation = mo.p("rotation", lt);
+        q.posX = mo.p("pos_x", lt), q.posY = mo.p("pos_y", lt);
+        q.anchorX = mo.p("anchor_x", lt), q.anchorY = mo.p("anchor_y", lt);
+        if (hasClipAnimation(c)) {
+            const AnimationPose a = clipAnimationPose(c, double(lt), fps);
+            q.posX += a.dx * seq.width, q.posY += a.dy * seq.height;
+            q.sx *= a.scale, q.sy *= a.scale;
+            q.rotation += a.rotation;
+        }
+        return q;
+    }
+    // Media thumbnail pixels -> analysis frame, under a pose (anchor in media pixels).
+    Affine placement(const GrayImage& t, const MediaItem& m, const Pose& q) const {
         const double mw = std::max(1, m.width), mh = std::max(1, m.height);
         // q (thumbnail) -> u (media) -> frame: C + pos + R * diag(sx, sy) * (u - mc - anchor), all times k.
         const double ux = mw / t.width, uy = mh / t.height;
-        const double sx = fx * scale / 100 * scaleX / 100 * k, sy = fy * scale / 100 * scaleY / 100 * k;
-        const double r = rotation * M_PI / 180, cr = std::cos(r), sr = std::sin(r);
+        const double sx = q.sx * k, sy = q.sy * k;
+        const double r = q.rotation * M_PI / 180, cr = std::cos(r), sr = std::sin(r);
         Affine a;
         a.a = cr * sx * ux, a.b = -sr * sy * uy;
         a.d = sr * sx * ux, a.e = cr * sy * uy;
-        const double ox = -(mw / 2 + anchorX), oy = -(mh / 2 + anchorY);
-        a.c = aw / 2.0 + posX * k + cr * sx * ox - sr * sy * oy;
-        a.f = ah / 2.0 + posY * k + sr * sx * ox + cr * sy * oy;
+        const double ox = -(mw / 2 + q.anchorX), oy = -(mh / 2 + q.anchorY);
+        a.c = aw / 2.0 + q.posX * k + cr * sx * ox - sr * sy * oy;
+        a.f = ah / 2.0 + q.posY * k + sr * sx * ox + cr * sy * oy;
         return a;
     }
-    Affine current(const Clip& c, const GrayImage& t, const MediaItem& m, FrameTime lt) const {
-        double fx = 1, fy = 1;
-        fit(c, m, lt, fx, fy);
-        const Effect& mo = c.motion;
-        return placement(t, m, fx, fy, mo.p("pos_x", lt), mo.p("pos_y", lt), mo.p("scale", lt, 100), mo.p("scale_x", lt, 100),
-                         mo.p("scale_y", lt, 100), mo.p("rotation", lt), mo.p("anchor_x", lt), mo.p("anchor_y", lt));
-    }
+    Affine current(const Clip& c, const GrayImage& t, const MediaItem& m, FrameTime lt) const { return placement(t, m, pose(c, m, lt)); }
+    Picture place(const GrayImage& t, const Affine& a) const { return warp(t, a, aw, ah, crop); }
     // The placement that best lays `t` over the reference, from `guess`: features of the reference followed into the
     // picture as `guess` places it, a similarity fitted to them (twice, the second from the first's placement). `wide`:
     // when that does not match, a coarse search first (sizes and positions far from `guess`), then the same.
     bool solve(const Picture& reference, const GrayImage& t, Affine guess, Affine& out, bool wide = false) {
-        std::vector<Point2> corners;
-        for (const Point2& q : goodFeatures(reference.g, 500, std::max(4.0, aw / 64.0))) {
-            const size_t i = size_t(std::clamp(int(q.y), 0, ah - 1)) * size_t(aw) + size_t(std::clamp(int(q.x), 0, aw - 1));
-            if (!mask[i]) corners.push_back(q);
+        if (!reference.cornersFound) {
+            // Found with the mask flattened out: a burnt-in timecode's sharp digits would otherwise set the bar for
+            // what counts as a corner, and leave few of the picture's own.
+            GrayImage flat = reference.g;
+            for (size_t i = 0; i < flat.px.size(); ++i)
+                if (mask[i]) flat.px[i] = 0.5f;
+            for (const Point2& q : goodFeatures(flat, 250, std::max(4.0, aw / 64.0))) {
+                const size_t i = size_t(std::clamp(int(q.y), 0, ah - 1)) * size_t(aw) + size_t(std::clamp(int(q.x), 0, aw - 1));
+                if (!mask[i]) reference.corners.push_back(q);
+            }
+            reference.cornersFound = true;
         }
+        const std::vector<Point2>& corners = reference.corners;
         if (corners.size() < 8) return false;
         auto follow = [&](Affine from, Affine& to) {
             bool any = false;
             for (int round = 0; round < 2; ++round) {
-                Picture placed = warp(t, from, aw, ah);
+                Picture placed = place(t, from);
                 normalise(placed, &mask);
                 std::vector<Point2> tracked;
                 std::vector<bool> ok;
@@ -228,55 +270,86 @@ struct Checker {
             out = closeBy;
             return true;
         }
-        Affine distant;
-        if (!follow(coarse(reference, t, guess), distant) || score(reference, t, distant) <= nearScore) {
-            if (found) out = closeBy;
-            return found;
+        // (Each of the coarse search's best few followed, the one that then matches best taken: at that size a fine
+        // texture can look most alike a little way off.)
+        double bestScore = nearScore;
+        bool any = found;
+        out = closeBy;
+        for (const Affine& start : coarse(reference, t, guess)) {
+            Affine distant;
+            if (!follow(start, distant)) continue;
+            const double sc = score(reference, t, distant);
+            if (sc > bestScore) bestScore = sc, out = distant, any = true;
+            if (bestScore >= o.matchScore) break;
         }
-        out = distant;
-        return true;
+        return any;
     }
-    // The size (about the frame's centre) and position that best lay `t`, as `guess` places it, over the reference, at
-    // about 64 pixels across; `guess` with them added.
-    Affine coarse(const Picture& reference, const GrayImage& t, const Affine& guess) {
-        const int f = std::max(1, aw / 64), w = aw / f, h = ah / f;
-        if (w < 8 || h < 8) return guess;
-        const Picture placed = warp(t, guess, aw, ah);
-        // Both pictures boxed down; a small pixel counts when all of it shows the shot and none of it is masked.
+    // Sizes (about the frame's centre) and positions that lay `t`, as `guess` places it, over the reference, best
+    // first: every size and position searched at about 64 pixels across, the best few searched again near where they
+    // are at about 160; `guess` with each added.
+    std::vector<Affine> coarse(const Picture& reference, const GrayImage& t, const Affine& guess) {
+        const Picture placed = place(t, guess);
+        const int f1 = std::max(1, aw / 64), f2 = std::max(1, aw / 160);
+        std::vector<Peak> peaks = search(reference, placed, f1, {1.0, 1.06, 1.12, 1.2, 1.3, 1.42, 1.56, 1.75, 2.0, 0.94, 0.88, 0.8}, -1, {}, 4);
+        if (f2 < f1)
+            for (Peak& pk : peaks) {
+                std::vector<double> near;
+                for (int i = -4; i <= 4; ++i) near.push_back(pk.scale * (1 + 0.0125 * i));
+                if (const std::vector<Peak> fine = search(reference, placed, f2, near, f1 / f2 + 1, pk, 1); !fine.empty()) pk = fine[0];
+            }
+        std::vector<Affine> out;
+        const double fcx = aw / 2.0, fcy = ah / 2.0;
+        for (const Peak& pk : peaks)  // (scaled about the frame's centre, then moved)
+            out.push_back(guess.then(Affine{pk.scale, 0, fcx - pk.scale * fcx + pk.x, 0, pk.scale, fcy - pk.scale * fcy + pk.y}));
+        return out;
+    }
+    struct Peak {
+        double r = -2, scale = 1, x = 0, y = 0;  // likeness; size; move in analysis pixels
+    };
+    // One pass of that, the pictures boxed down by `f`: each of `scales`, at every position (range -1) or within
+    // `range` small pixels of `around`; the `count` best, apart from each other (none when nothing overlaps enough).
+    std::vector<Peak> search(const Picture& reference, const Picture& placed, int f, const std::vector<double>& scales, int range,
+                             const Peak& around, size_t count) const {
+        const int w = aw / f, h = ah / f;
+        if (w < 8 || h < 8) return {};
+        // A small pixel counts when all of it shows the shot and none of it is masked.
         std::vector<float> ref(size_t(w) * size_t(h)), pic(ref.size());
         std::vector<uint8_t> refOk(ref.size()), picOk(ref.size());
         for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x) {
-                double a = 0, b = 0;
+                double sa = 0, sb = 0;
                 bool masked = false, shows = true;
                 for (int yy = y * f; yy < (y + 1) * f; ++yy)
                     for (int xx = x * f; xx < (x + 1) * f; ++xx) {
                         const size_t i = size_t(yy) * size_t(aw) + size_t(xx);
-                        a += reference.g.px[i], b += placed.g.px[i];
+                        sa += reference.g.px[i], sb += placed.g.px[i];
                         masked = masked || mask[i];
                         shows = shows && placed.valid[i];
                     }
                 const size_t j = size_t(y) * size_t(w) + size_t(x);
-                ref[j] = float(a / (f * f)), pic[j] = float(b / (f * f));
+                ref[j] = float(sa / (f * f)), pic[j] = float(sb / (f * f));
                 refOk[j] = !masked, picOk[j] = shows;
             }
         GrayImage small;
         small.width = w, small.height = h, small.px = pic;
-        double best = -2, bestScale = 1, bestX = 0, bestY = 0;
+        const int cx0 = int(std::lround(around.x / f)), cy0 = int(std::lround(around.y / f));
+        const int x0 = range < 0 ? -w / 2 : cx0 - range, x1 = range < 0 ? w / 2 : cx0 + range;
+        const int y0 = range < 0 ? -h / 2 : cy0 - range, y1 = range < 0 ? h / 2 : cy0 + range;
+        std::vector<Peak> all;
         std::vector<float> scaled(ref.size());
         std::vector<uint8_t> scaledOk(ref.size());
         const double cx = w / 2.0, cy = h / 2.0;
-        for (double s : {1.0, 1.06, 1.12, 1.2, 1.3, 1.42, 1.56, 1.75, 2.0, 0.94, 0.88, 0.8}) {
+        for (double sc : scales) {
             for (int y = 0; y < h; ++y)
                 for (int x = 0; x < w; ++x) {
-                    const double sx = cx + (x + 0.5 - cx) / s - 0.5, sy = cy + (y + 0.5 - cy) / s - 0.5;
+                    const double sx = cx + (x + 0.5 - cx) / sc - 0.5, sy = cy + (y + 0.5 - cy) / sc - 0.5;
                     const size_t j = size_t(y) * size_t(w) + size_t(x);
                     const int ix = int(std::lround(sx)), iy = int(std::lround(sy));
                     scaledOk[j] = ix >= 0 && iy >= 0 && ix < w && iy < h && picOk[size_t(iy) * size_t(w) + size_t(ix)];
                     scaled[j] = scaledOk[j] ? small.sample(sx, sy) : 0.0f;
                 }
-            for (int dy = -h / 2; dy <= h / 2; ++dy)
-                for (int dx = -w / 2; dx <= w / 2; ++dx) {
+            for (int dy = y0; dy <= y1; ++dy)
+                for (int dx = x0; dx <= x1; ++dx) {
                     double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
                     int n = 0;
                     for (int y = std::max(0, dy); y < std::min(h, h + dy); ++y)
@@ -289,30 +362,49 @@ struct Checker {
                     if (n < w * h / 3) continue;
                     const double cov = sab - sa * sb / n, va = saa - sa * sa / n, vb = sbb - sb * sb / n;
                     if (va <= 1e-12 || vb <= 1e-12) continue;
-                    if (const double r = cov / std::sqrt(va * vb); r > best) best = r, bestScale = s, bestX = dx, bestY = dy;
+                    all.push_back({cov / std::sqrt(va * vb), sc, double(dx * f), double(dy * f)});
                 }
         }
-        // Scaled about the frame's centre, then moved.
-        const double fcx = aw / 2.0, fcy = ah / 2.0;
-        const Affine around{bestScale, 0, fcx - bestScale * fcx + bestX * f, 0, bestScale, fcy - bestScale * fcy + bestY * f};
-        return guess.then(around);
+        std::sort(all.begin(), all.end(), [](const Peak& a, const Peak& b) { return a.r > b.r; });
+        std::vector<Peak> best;
+        for (const Peak& pk : all) {
+            if (best.size() >= count) break;
+            const bool apart = std::all_of(best.begin(), best.end(), [&](const Peak& b) {
+                return std::hypot(pk.x - b.x, pk.y - b.y) > 2.5 * f || std::fabs(pk.scale / b.scale - 1) > 0.05;
+            });
+            if (apart) best.push_back(pk);
+        }
+        return best;
     }
     double score(const Picture& reference, const GrayImage& t, const Affine& a) {
-        Picture placed = warp(t, a, aw, ah);
+        Picture placed = place(t, a);
         normalise(placed, &mask);
         return likeness(reference, placed, mask);
     }
-    // A placement as the Transform's values (Fit kept; anchor, width and height scales back to their defaults).
-    ConformKey key(const Affine& a, const GrayImage& t, const MediaItem& m, double fx, FrameTime lt) const {
-        const double mw = std::max(1, m.width);
-        const double unit = fx * k * mw / t.width;  // analysis pixels per thumbnail pixel at 100 %
+    // A placement as the Transform's values: Fit, flips, width and height scales and the animation presets kept, the
+    // anchor back to the centre.
+    ConformKey key(const Affine& a, const GrayImage& t, const Clip& c, const MediaItem& m, FrameTime lt) const {
+        const double mw = std::max(1, m.width), mh = std::max(1, m.height);
+        const double ux = mw / t.width, uy = mh / t.height;
+        // Sequence pixels per media pixel, with what the clip keeps (its pose at scale 100, rotation 0) taken out.
+        Pose keep = pose(c, m, lt);
+        const double s = c.motion.p("scale", lt, 100) / 100;
+        keep.sx /= s, keep.sy /= s;
+        double animScale = 1, animRotation = 0, animX = 0, animY = 0;
+        if (hasClipAnimation(c)) {
+            const AnimationPose an = clipAnimationPose(c, double(lt), fps);
+            animScale = an.scale, animRotation = an.rotation, animX = an.dx * seq.width, animY = an.dy * seq.height;
+            keep.sx /= an.scale, keep.sy /= an.scale;  // (the presets' scale goes back in below)
+        }
+        const double m00 = a.a / ux / k / keep.sx, m01 = a.b / uy / k / keep.sy;
+        const double m10 = a.d / ux / k / keep.sx, m11 = a.e / uy / k / keep.sy;
         ConformKey kf;
         kf.at = lt;
-        kf.scale = std::sqrt(std::max(0.0, a.a * a.e - a.b * a.d)) / unit * 100;
-        kf.rotation = std::atan2(a.d, a.a) * 180 / M_PI;
+        kf.scale = std::sqrt(std::fabs(m00 * m11 - m01 * m10)) / animScale * 100;
+        kf.rotation = std::atan2(m10, m00) * 180 / M_PI - animRotation;
         const Point2 centre = a.apply({t.width / 2.0, t.height / 2.0});
-        kf.posX = (centre.x - aw / 2.0) / k;
-        kf.posY = (centre.y - ah / 2.0) / k;
+        kf.posX = (centre.x - aw / 2.0) / k - animX;
+        kf.posY = (centre.y - ah / 2.0) / k - animY;
         return kf;
     }
 };
@@ -420,6 +512,7 @@ std::vector<ConformShot> conformCheck(const Project& p, const Sequence& seq, Id 
         }
     }
 
+    std::unique_ptr<Checker> tiny;  // the other takes, compared small
     for (size_t si = 0; si < shots.size(); ++si) {
         if (cancel && cancel->load()) return {};
         if (progress) progress(double(si) / double(shots.size()));
@@ -437,13 +530,17 @@ std::vector<ConformShot> conformCheck(const Project& p, const Sequence& seq, Id 
             shot.details = "Outside the reference";
             continue;
         }
-        double fx = 1, fy = 1;
-        ck.fit(*c, *m, 0, fx, fy);
+        {
+            const Effect& mo = c->motion;
+            const FrameTime lt = at[at.size() / 2] - c->start;
+            auto side = [&](const char* name) { return std::clamp(mo.p(name, lt) / 100.0, 0.0, 1.0); };
+            ck.crop = Crop{side("crop_left"), side("crop_right"), side("crop_top"), side("crop_bottom")};
+        }
         auto sourceAt = [&](const Clip& clip, FrameTime t) { return clip.sourceAt(double(t - clip.start)); };
         // As it is.
         double worst = 1;
         for (FrameTime t : at) {
-            const GrayImage& g = ck.media(*m, fx, fy, sourceAt(*c, t));
+            const GrayImage& g = ck.media(*m, sourceAt(*c, t));
             worst = std::min(worst, ck.score(ck.reference(t), g, ck.current(*c, g, *m, t - c->start)));
         }
         shot.score = worst;
@@ -453,7 +550,7 @@ std::vector<ConformShot> conformCheck(const Project& p, const Sequence& seq, Id 
         }
         // The same frames framed otherwise: a placement solved at each.
         auto solvedAt = [&](const MediaItem& med, double src, FrameTime t, const Affine* from, Affine& out, double& s) {
-            const GrayImage& g = ck.media(med, fx, fy, src);
+            const GrayImage& g = ck.media(med, src);
             const Affine guess = from ? *from : ck.current(*c, g, med, t - c->start);
             if (!ck.solve(ck.reference(t), g, guess, out, true)) out = guess;
             s = ck.score(ck.reference(t), g, out);
@@ -489,8 +586,8 @@ std::vector<ConformShot> conformCheck(const Project& p, const Sequence& seq, Id 
                 Affine a;
                 double s = 0;
                 if (solvedAt(med, sourceAt(*c, t) + offset, t, nullptr, a, s) < options.matchScore) continue;
-                const GrayImage& g = ck.media(med, fx, fy, sourceAt(*c, t) + offset);
-                all.push_back(ck.key(a, g, med, fx, t - c->start));
+                const GrayImage& g = ck.media(med, sourceAt(*c, t) + offset);
+                all.push_back(ck.key(a, g, *c, med, t - c->start));
             }
             if (all.empty()) return;
             // Still within what the measure itself wanders by (about half a pixel, a third of a percent and a tenth of a
@@ -552,17 +649,25 @@ std::vector<ConformShot> conformCheck(const Project& p, const Sequence& seq, Id 
             shot.verdict = ConformVerdict::Reframed;
             shot.details = shot.keys.size() == 1 ? formatKey(shot.keys[0]) : std::to_string(shot.keys.size()) + " keys, from " + formatKey(shot.keys[0]);
         };
+        // A still has no other frames, and is not taken for another take.
+        if (m->kind == MediaKind::Image) {
+            if (reframed) asReframed();
+            else shot.details = "nothing near matches";
+            continue;
+        }
         // Another frame of its source, placed as it is: the middle frame searched either side, then the others checked.
         const FrameTime mid = at[at.size() / 2];
         const double speed = c->speedAt(double(mid - c->start)) > 1e-9 ? c->speedAt(double(mid - c->start)) : 1.0;
+        // (edit::slip moves the source by frames at the clip's head speed.)
+        const double headSpeed = c->speedAt(0) > 1e-9 ? c->speedAt(0) : 1.0;
         auto inSource = [&](double src) { return src >= 0 && (m->kind == MediaKind::Image || src / ck.fps <= m->duration); };
         auto asPlaced = [&](double offset, FrameTime t) {
-            const GrayImage& g = ck.media(*m, fx, fy, sourceAt(*c, t) + offset);
+            const GrayImage& g = ck.media(*m, sourceAt(*c, t) + offset);
             return ck.score(ck.reference(t), g, ck.current(*c, g, *m, t - c->start));
         };
         auto slipped = [&](int d, double score) {
             shot.verdict = ConformVerdict::Slipped;
-            shot.slip = d;
+            shot.slip = FrameTime(std::llround(d * speed / headSpeed));
             shot.score = score;
             char buf[96];
             std::snprintf(buf, sizeof buf, "%d frame%s %s", std::abs(d), std::abs(d) == 1 ? "" : "s",
@@ -571,9 +676,11 @@ std::vector<ConformShot> conformCheck(const Project& p, const Sequence& seq, Id 
         };
         double best = 0;
         int bestSlip = 0;
-        for (int d = -range; d <= range; ++d)
+        for (int d = -range; d <= range; ++d) {
+            if (cancel && cancel->load()) return {};
             if (d && inSource(sourceAt(*c, mid) + d * speed))
                 if (const double sc = asPlaced(d * speed, mid); sc > best) best = sc, bestSlip = d;
+        }
         if (best >= options.matchScore) {
             double held = 1;
             for (FrameTime t : at) held = std::min(held, asPlaced(bestSlip * speed, t));
@@ -593,9 +700,10 @@ std::vector<ConformShot> conformCheck(const Project& p, const Sequence& seq, Id 
         double both = 0;
         int bothSlip = 0;
         for (int d = -range; d <= range; ++d) {
+            if (cancel && cancel->load()) return {};
             const double src = sourceAt(*c, mid) + d * speed;
             if (!d || !inSource(src)) continue;
-            const GrayImage& g = ck.media(*m, fx, fy, src);
+            const GrayImage& g = ck.media(*m, src);
             Affine a;
             const Affine guess = ck.current(*c, g, *m, mid - c->start);
             if (!ck.solve(ck.reference(mid), g, guess, a)) a = guess;
@@ -630,28 +738,31 @@ std::vector<ConformShot> conformCheck(const Project& p, const Sequence& seq, Id 
             double coarse;
         };
         std::vector<Candidate> candidates;
-        Checker tiny{p, seq, *ref, options};
-        tiny.fps = ck.fps;
-        tiny.aw = std::max(16, std::min(ck.aw, 128));
-        tiny.k = double(tiny.aw) / std::max(1, seq.width);
-        tiny.ah = std::max(9, int(std::lround(seq.height * tiny.k)));
-        tiny.mask.assign(size_t(tiny.aw) * size_t(tiny.ah), 0);
-        for (int y = 0; y < tiny.ah; ++y)
-            for (int x = 0; x < tiny.aw; ++x)
-                tiny.mask[size_t(y) * size_t(tiny.aw) + size_t(x)] =
-                    ck.mask[size_t(std::min(ck.ah - 1, y * ck.ah / tiny.ah)) * size_t(ck.aw) + size_t(std::min(ck.aw - 1, x * ck.aw / tiny.aw))];
-        const Picture& small = tiny.reference(mid);
+        if (!tiny) {
+            tiny = std::make_unique<Checker>(Checker{p, seq, *ref, options});
+            tiny->fps = ck.fps;
+            tiny->aw = std::max(16, std::min(ck.aw, 128));
+            tiny->k = double(tiny->aw) / std::max(1, seq.width);
+            tiny->ah = std::max(9, int(std::lround(seq.height * tiny->k)));
+            tiny->cacheLimit = 1500;  // (each take's samples, kept for the next shot)
+            tiny->mask.assign(size_t(tiny->aw) * size_t(tiny->ah), 0);
+            for (int y = 0; y < tiny->ah; ++y)
+                for (int x = 0; x < tiny->aw; ++x)
+                    tiny->mask[size_t(y) * size_t(tiny->aw) + size_t(x)] =
+                        ck.mask[size_t(std::min(ck.ah - 1, y * ck.ah / tiny->ah)) * size_t(ck.aw) + size_t(std::min(ck.aw - 1, x * ck.aw / tiny->aw))];
+        }
+        tiny->crop = ck.crop;
+        const Picture small = tiny->reference(mid);
         for (const MediaItem& o : p.media) {
-            if (o.id == m->id || o.id == ref->id || !o.hasVideo || o.kind == MediaKind::Image || o.duration <= 0) continue;
+            // (Movies of their own: not nested sequences, multicam or merged clips, subclips or stills.)
+            if (o.id == m->id || o.id == ref->id || !o.hasVideo || o.kind != MediaKind::Video || o.subclipOf || o.duration <= 0) continue;
             if (!scene.empty() && sceneOf(o) != scene) continue;
             const double step = std::max(0.2, o.duration / 300);
             Candidate cand{&o, 0, 0};
             for (double sec = 0; sec < o.duration; sec += step) {
                 if (cancel && cancel->load()) return {};
-                double ofx = 1, ofy = 1;
-                tiny.fit(*c, o, 0, ofx, ofy);
-                const GrayImage& g = tiny.media(o, ofx, ofy, sec * ck.fps);
-                const double s = tiny.score(small, g, tiny.current(*c, g, o, mid - c->start));
+                const GrayImage& g = tiny->media(o, sec * ck.fps);
+                const double s = tiny->score(small, g, tiny->current(*c, g, o, mid - c->start));
                 if (s > cand.coarse) cand.coarse = s, cand.src = sec * ck.fps;
             }
             candidates.push_back(cand);
@@ -664,9 +775,10 @@ std::vector<ConformShot> conformCheck(const Project& p, const Sequence& seq, Id 
             const int around = int(std::ceil(std::max(0.2, o.duration / 300) * ck.fps)) + 2;
             double bestHere = 0, bestSrc = 0;
             for (int d = -around; d <= around; ++d) {
+                if (cancel && cancel->load()) return {};
                 const double src = std::floor(cand.src) + d;
                 if (src < 0 || src / ck.fps > o.duration) continue;
-                const GrayImage& g = ck.media(o, fx, fy, src);
+                const GrayImage& g = ck.media(o, src);
                 Affine a;
                 const Affine guess = ck.current(*c, g, o, mid - c->start);
                 if (!ck.solve(ck.reference(mid), g, guess, a)) a = guess;
@@ -686,6 +798,12 @@ std::vector<ConformShot> conformCheck(const Project& p, const Sequence& seq, Id 
                 shot.keys = keys;
                 shot.details += "; reframed: " + formatKey(keys[0]);
             }
+            // Sound recorded apart (another media item linked to the picture) is not the take's: it stays as it is.
+            for (Id id : edit::linkedClips(seq, c->id))
+                if (const Clip* l = edit::clipById(seq, id); l && id != c->id && l->mediaId != c->mediaId) {
+                    shot.details += "; its separate sound stays as it is";
+                    break;
+                }
             found = true;
             break;
         }
@@ -739,21 +857,45 @@ std::vector<ConformShot> conformCheck(const Project& p, const Sequence& seq, Id 
 
 bool applyConformFix(Project& p, Sequence& seq, const ConformShot& shot) {
     if (!shot.fixable()) return false;
-    Clip* c = edit::clipById(seq, shot.clip);
-    if (!c) return false;
-    if (shot.verdict == ConformVerdict::Slipped && !edit::slip(p, seq, shot.clip, shot.slip).ok) return false;
+    const auto at = edit::locate(seq, shot.clip);
+    if (!at) return false;
+    const Track* track = shot.clip ? (at->track.kind == TrackKind::Video ? &seq.videoTracks[size_t(at->track.index)] : nullptr) : nullptr;
+    if (!track || track->locked) return false;
+    // Tried on a copy first, so a fix that does not fit changes nothing.
+    Sequence s = seq;
+    Clip* c = edit::clipById(s, shot.clip);
+    if (shot.verdict == ConformVerdict::Slipped) {
+        const edit::Result r = edit::slip(p, s, shot.clip, shot.slip);
+        if (!r.ok || r.applied != shot.slip) return false;
+    }
     if (shot.verdict == ConformVerdict::OtherTake) {
         const MediaItem* to = p.findMedia(shot.media);
         if (!to) return false;
-        // The picture and the sound linked to it that plays the same media.
         const Id from = c->mediaId;
+        if (!c->takes.empty()) {
+            // An audition: the take picked when it is one of its takes (its own offsets kept), else left alone.
+            int index = -1;
+            for (size_t i = 0; i < c->takes.size(); ++i)
+                if (c->takes[i].mediaId == to->id) index = int(i);
+            if (index < 0 || !edit::pickTake(p, s, shot.clip, index).ok) return false;
+            c = edit::clipById(s, shot.clip);
+        }
+        // The picture and the sound linked to it that plays the same media, all by the same amount.
         const double shift = shot.sourceIn - c->sourceIn;
-        for (Id id : edit::linkedClips(seq, shot.clip))
-            if (Clip* l = edit::clipById(seq, id); l && l->mediaId == from) {
-                l->mediaId = to->id;
-                l->sourceIn = std::max(0.0, l->sourceIn + shift);
-            }
-        c = edit::clipById(seq, shot.clip);
+        const Id now = c->mediaId;
+        for (Id id : edit::linkedClips(s, shot.clip)) {
+            Clip* l = edit::clipById(s, id);
+            if (!l || (l->mediaId != from && l->mediaId != now) || (!l->takes.empty() && id != shot.clip)) continue;
+            if (const auto la = edit::locate(s, id); !la || (la->track.kind == TrackKind::Video ? s.videoTracks : s.audioTracks)[size_t(la->track.index)].locked)
+                return false;
+            if (const MediaItem* was = p.findMedia(l->mediaId); was && l->name == was->name) l->name = to->name;
+            l->mediaId = to->id;
+            l->sourceIn += shift;
+            if (l->sourceIn < -1e-6) return false;
+            if (const FrameTime limit = edit::sourceLimit(p, s, *l); limit < kInfiniteFrames && l->sourceIn + l->sourceExtent() > double(limit) + 1e-6)
+                return false;
+            if (!l->takes.empty()) l->takes[size_t(l->take)].mediaId = to->id;
+        }
     }
     if (!shot.keys.empty()) {
         Effect& mo = c->motion;
@@ -768,9 +910,9 @@ bool applyConformFix(Project& p, Sequence& seq, const ConformShot& shot) {
         set("pos_y", &ConformKey::posY);
         set("scale", &ConformKey::scale);
         set("rotation", &ConformKey::rotation);
-        for (const char* name : {"scale_x", "scale_y"}) mo.params[name] = Param(100.0);
         for (const char* name : {"anchor_x", "anchor_y"}) mo.params[name] = Param(0.0);
     }
+    seq = std::move(s);
     return true;
 }
 
