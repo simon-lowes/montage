@@ -22,6 +22,8 @@ constexpr int kBands = 40, kCeps = 6, kDim = 2 * kCeps + 2;
 constexpr double kLevelWeight = 6;
 constexpr double kAnalysisRate = 16000;  // speech features need no more
 constexpr float kInf = std::numeric_limits<float>::infinity();
+constexpr double kMaxAlignSeconds = 120;  // the longest line aligned at once (the path's table grows with its length)
+constexpr double kMaxOffset = 3600;       // seconds a warp may move a sound (a point beyond is not read)
 
 std::vector<float> monoOf(const AudioBuffer& b) {
     const int64_t n = b.frames();
@@ -125,7 +127,7 @@ Frames analyse(const std::vector<float>& x, double rate, double hop) {
         }
     }
     // Speech: more than 12 dB over the quiet (the tenth percentile, but never more than 60 dB under the loudest) and
-    // no more than 45 dB under the loudest; filled across gaps under 60 ms and widened 20 ms either side.
+    // no more than 45 dB under the loudest; filled across gaps under 30 ms and widened 10 ms either side.
     const double peak = percentile(f.level, 0.99);
     const double floor = std::max(percentile(f.level, 0.10), peak - 60);
     const double gate = std::max(floor + 12, peak - 45);
@@ -230,6 +232,26 @@ AudioBuffer slice(const AudioBuffer& b, double from, double to) {
     return out;
 }
 
+// `seconds` of a sound from `u` as a warp plays it (read between samples linearly: for measuring, not for listening).
+AudioBuffer warpedSlice(const AudioBuffer& b, const DialogueWarp& warp, double u, double seconds) {
+    if (warp.empty()) return slice(b, u, u + seconds);
+    AudioBuffer out;
+    out.sampleRate = b.sampleRate;
+    out.channels = b.channels;
+    const size_t nch = size_t(std::max(1, b.channels));
+    const int64_t n = int64_t(std::llround(seconds * b.sampleRate));
+    out.samples.assign(size_t(std::max<int64_t>(0, n)) * nch, 0.0f);
+    for (int64_t i = 0; i < n; ++i) {
+        const double at = dialogueWarpAt(warp, u + double(i) / b.sampleRate) * b.sampleRate;
+        const int64_t k = int64_t(std::floor(at));
+        const float f = float(at - double(k));
+        if (k < 0 || k + 1 >= b.frames()) continue;
+        for (size_t c = 0; c < nch; ++c)
+            out.samples[size_t(i) * nch + c] = b.samples[size_t(k) * nch + c] * (1 - f) + b.samples[size_t(k + 1) * nch + c] * f;
+    }
+    return out;
+}
+
 // A windowed sinc (Blackman, 16 taps either side) for reading between samples.
 double sincTap(double x) {
     constexpr double half = 16;
@@ -267,6 +289,7 @@ DialogueWarp dialogueWarpFromString(const std::string& text) {
         const char* wText = item.c_str() + colon + 1;
         const double w = std::strtod(wText, &end);
         if (end == wText || !std::isfinite(u) || !std::isfinite(w)) continue;
+        if (std::fabs(u) > 1e7 || std::fabs(w - u) > kMaxOffset) continue;
         if (!out.empty() && (u <= out.back().u || w < out.back().w)) continue;
         out.push_back({u, w});
     }
@@ -299,7 +322,8 @@ void applyDialogueWarp(const AudioBuffer& in, const DialogueWarp& warp, bool inv
     const size_t nch = size_t(std::max(1, in.channels));
     const int64_t n = in.frames();
     const double lastOffset = warp.empty() ? 0 : warp.back().w - warp.back().u;
-    const int64_t nOut = std::max<int64_t>(0, n - int64_t(std::llround(lastOffset * rate)));
+    // At most a minute of silence past the file's own length (an offset the string guard let through).
+    const int64_t nOut = std::clamp<int64_t>(n - int64_t(std::llround(lastOffset * rate)), 0, n + int64_t(60 * rate));
     const bool fixed = std::all_of(warp.begin(), warp.end(), [&](const AlignPoint& p) { return std::fabs(p.w - p.u - lastOffset) < 1e-9; });
     if (fixed) {
         // A delay: each sample read `lastOffset` later, between samples through the sinc.
@@ -335,7 +359,7 @@ void applyDialogueWarp(const AudioBuffer& in, const DialogueWarp& warp, bool inv
     std::vector<double> positions;
     positions.reserve(size_t(nOut / hop + 3));
     for (int64_t k = 0; k <= nOut / hop + 2; ++k) positions.push_back(dialogueWarpAt(warp, double(k * hop) / rate) * rate);
-    wsolaStretch(in, positions, hop, nOut, out);
+    wsolaStretch(in, positions, hop, nOut, out, cancel);
     if (invert)
         for (float& v : out.samples) v = -v;
 }
@@ -682,17 +706,32 @@ DialogueShift findDialogueShift(const AudioBuffer& ref, const AudioBuffer& other
     return r;
 }
 
-namespace edit {
-
 namespace {
 
-Effect* alignmentFor(Clip& c, Id media) {
-    for (Effect& e : c.effects)
-        if (e.type == "dialogue_align" && (e.s("media").empty() || e.s("media") == std::to_string(media))) return &e;
-    return nullptr;
+std::string channelsText(const std::vector<int>& channels) {
+    std::string out;
+    for (int c : channels) out += (out.empty() ? "" : ",") + std::to_string(c);
+    return out;
 }
 
 }  // namespace
+
+bool dialogueAlignmentApplies(const Effect& e, const Clip& c) {
+    if (e.type != "dialogue_align") return true;
+    if (!e.s("media").empty() && e.s("media") != std::to_string(c.mediaId)) return false;
+    if (e.strings.count("channels") && e.s("channels") != channelsText(c.channels)) return false;
+    // The part of the file it was made for, in source frames: another take from the same file plays another part.
+    if (const std::string span = e.s("span"); !span.empty()) {
+        double a = 0, b = 0;
+        if (std::sscanf(span.c_str(), "%lf:%lf", &a, &b) == 2) {
+            const double c0 = c.sourceIn, c1 = c.sourceIn + std::max(1.0, c.sourceExtent());
+            if (std::min(b, c1) <= std::max(a, c0)) return false;
+        }
+    }
+    return true;
+}
+
+namespace edit {
 
 Result alignDialogue(Project& p, Sequence& s, Id takeId, Id guideId, const DialogueAlignOptions& o, DialogueAlignReport* report,
                      const std::atomic<bool>* cancel) {
@@ -719,15 +758,18 @@ Result alignDialogue(Project& p, Sequence& s, Id takeId, Id guideId, const Dialo
     from = std::max({from, take.start, guide.start});
     to = std::min(to, guide.end());
     if (to - from < 2) return Result::fail("The take and the guide do not overlap there");
+    const double length = double(to - from) / fps;
+    if (!o.shift && length > kMaxAlignSeconds)
+        return Result::fail("A line can be aligned two minutes at a time: choose a range within it");
 
     // Times of each clip's own file: the guide's through any alignment of its own, the take's through the one being
     // replaced (so it is found where it was heard).
     DialogueWarp guideWarp, oldWarp;
     for (const Effect& e : guide.effects)
-        if (e.enabled && e.type == "dialogue_align" && (e.s("media").empty() || e.s("media") == std::to_string(guide.mediaId)))
-            guideWarp = dialogueWarpFromString(e.s("warp"));
-    if (const Effect* e = alignmentFor(take, take.mediaId); e && e->enabled) oldWarp = dialogueWarpFromString(e->s("warp"));
-    auto guideAt = [&](FrameTime t) { return dialogueWarpAt(guideWarp, (guide.sourceIn + double(t - guide.start)) / fps); };
+        if (e.enabled && e.type == "dialogue_align" && dialogueAlignmentApplies(e, guide)) guideWarp = dialogueWarpFromString(e.s("warp"));
+    for (const Effect& e : take.effects)
+        if (e.enabled && e.type == "dialogue_align" && dialogueAlignmentApplies(e, take)) oldWarp = dialogueWarpFromString(e.s("warp"));
+    auto guideU = [&](FrameTime t) { return (guide.sourceIn + double(t - guide.start)) / fps; };
     auto takeU = [&](FrameTime t) { return (take.sourceIn + double(t - take.start)) / fps; };
     auto takeAt = [&](FrameTime t) { return dialogueWarpAt(oldWarp, takeU(t)); };
     const std::string guideKey = audioKey(gm->path, guide.channels), takeKey = audioKey(tm->path, take.channels);
@@ -736,83 +778,82 @@ Result alignDialogue(Project& p, Sequence& s, Id takeId, Id guideId, const Dialo
     bool invert = false;
     DialogueAlignReport rep;
     rep.from = double(from) / fps, rep.to = double(to) / fps;
-    if (o.shift) {
-        const int rate = s.sampleRate > 0 ? s.sampleRate : 48000;
-        const AudioBufferPtr gb = MediaPool::instance().audio(guideKey, rate);
-        const AudioBufferPtr tb = MediaPool::instance().audio(takeKey, rate);
-        if (!gb || !tb || gb->frames() == 0 || tb->frames() == 0) return Result::fail("Could not read the sound");
-        const double length = double(to - from) / fps;
-        const AudioBuffer ref = slice(*gb, guideAt(from), guideAt(from) + length);
-        const AudioBuffer other = slice(*tb, takeAt(from), takeAt(from) + length);
-        const DialogueShift sh = findDialogueShift(ref, other, std::max(0.05, o.handles));
-        if (!sh.found) return Result::fail("The take does not sound like the guide there (no common sound to line up)");
-        warp = {{takeU(from), takeAt(from) + sh.delay}};
-        invert = sh.inverted;
-        rep.delay = sh.delay, rep.inverted = sh.inverted, rep.confidence = sh.confidence;
-        rep.anchors = 1;
-    } else {
-        const int rate = int(kAnalysisRate);
-        const AudioBufferPtr gb = MediaPool::instance().audio(guideKey, rate);
-        const AudioBufferPtr tb = MediaPool::instance().audio(takeKey, rate);
-        if (!gb || !tb || gb->frames() == 0 || tb->frames() == 0) return Result::fail("Could not read the sound");
-        const double length = double(to - from) / fps;
-        const AudioBuffer ref = slice(*gb, guideAt(from), guideAt(from) + length);
-        // The take with handles: what the band may reach (a quarter of the line, at most three seconds) beyond them.
-        const double handles = std::max(0.0, o.handles) + std::min(3.0, 0.25 * length);
-        const double fileEnd = double(tb->frames()) / rate;
-        const double t0 = takeAt(from), t1 = takeAt(to);
-        const double a = std::max(0.0, t0 - handles), b = std::min(fileEnd, t1 + handles);
-        if (b - a < 0.1) return Result::fail("The take's file does not reach the guide's range");
-        const AudioBuffer other = slice(*tb, a, b);
-        std::string err;
-        const SpeechAlignment al = alignSpeech(ref, other, std::max(0.0, t0 - a), std::max(0.0, b - t1), o.precision, cancel, &err);
-        if (al.anchors.empty()) return Result::fail(err.empty() ? "Could not align the take" : err);
-        const double u0 = takeU(from);
-        for (const auto& [gs, ts] : al.anchors) {
-            const AlignPoint pt{u0 + gs, a + ts};
-            if (!warp.empty() && (pt.u <= warp.back().u || pt.w < warp.back().w)) continue;
-            warp.push_back(pt);
+    try {
+        if (o.shift) {
+            const int rate = s.sampleRate > 0 ? s.sampleRate : 48000;
+            const AudioBufferPtr gb = MediaPool::instance().audio(guideKey, rate);
+            const AudioBufferPtr tb = MediaPool::instance().audio(takeKey, rate);
+            if (!gb || !tb || gb->frames() == 0 || tb->frames() == 0) return Result::fail("Could not read the sound");
+            const AudioBuffer ref = warpedSlice(*gb, guideWarp, guideU(from), length);
+            const AudioBuffer other = slice(*tb, takeAt(from), takeAt(from) + length);
+            const DialogueShift sh = findDialogueShift(ref, other, std::max(0.05, o.handles));
+            if (!sh.found) return Result::fail("The take does not sound like the guide there (no common sound to line up)");
+            warp = {{takeU(from), takeAt(from) + sh.delay}};
+            invert = sh.inverted;
+            rep.delay = sh.delay, rep.inverted = sh.inverted, rep.confidence = sh.confidence;
+            rep.anchors = 1;
+        } else {
+            const int rate = int(kAnalysisRate);
+            const AudioBufferPtr gb = MediaPool::instance().audio(guideKey, rate);
+            const AudioBufferPtr tb = MediaPool::instance().audio(takeKey, rate);
+            if (!gb || !tb || gb->frames() == 0 || tb->frames() == 0) return Result::fail("Could not read the sound");
+            const AudioBuffer ref = warpedSlice(*gb, guideWarp, guideU(from), length);
+            // The take with handles: what the band may reach (a quarter of the line, at most three seconds) beyond them.
+            const double handles = std::max(0.0, o.handles) + std::min(3.0, 0.25 * length);
+            const double fileEnd = double(tb->frames()) / rate;
+            const double t0 = takeAt(from), t1 = takeAt(to);
+            const double a = std::max(0.0, t0 - handles), b = std::min(fileEnd, t1 + handles);
+            if (b - a < 0.1) return Result::fail("The take's file does not reach the guide's range");
+            const AudioBuffer other = slice(*tb, a, b);
+            std::string err;
+            const SpeechAlignment al = alignSpeech(ref, other, std::max(0.0, t0 - a), std::max(0.0, b - t1), o.precision, cancel, &err);
+            if (al.anchors.empty()) return Result::fail(err.empty() ? "Could not align the take" : err);
+            const double u0 = takeU(from);
+            for (const auto& [gs, ts] : al.anchors) {
+                const AlignPoint pt{u0 + gs, a + ts};
+                if (!warp.empty() && (pt.u <= warp.back().u || pt.w < warp.back().w)) continue;
+                warp.push_back(pt);
+            }
+            rep.anchors = int(warp.size());
+            rep.minRate = al.minRate, rep.maxRate = al.maxRate;
+            rep.confidence = std::clamp(1 - al.distance / 3, 0.0, 1.0);
         }
-        rep.anchors = int(warp.size());
-        rep.minRate = al.minRate, rep.maxRate = al.maxRate;
-        rep.confidence = std::clamp(1 - al.distance / 3, 0.0, 1.0);
+    } catch (const std::bad_alloc&) {
+        return Result::fail("Not enough memory to align a line this long");
     }
     if (cancel && cancel->load()) return Result::fail("Cancelled");
 
-    take.effects.erase(std::remove_if(take.effects.begin(), take.effects.end(),
-                                      [&](const Effect& e) {
-                                          return e.type == "dialogue_align" &&
-                                                 (e.s("media").empty() || e.s("media") == std::to_string(take.mediaId));
-                                      }),
-                       take.effects.end());
+    std::erase_if(take.effects, [&](const Effect& e) { return e.type == "dialogue_align" && dialogueAlignmentApplies(e, take); });
     Effect e = makeEffect(p, "dialogue_align");
     e.strings["warp"] = dialogueWarpToString(warp);
     e.strings["media"] = std::to_string(take.mediaId);
+    e.strings["channels"] = channelsText(take.channels);
+    char span[64];
+    std::snprintf(span, sizeof span, "%.3f:%.3f", take.sourceIn, take.sourceIn + double(take.duration));
+    e.strings["span"] = span;
     e.params["invert"] = Param(invert ? 1.0 : 0.0);
     take.effects.push_back(std::move(e));
-    // A take that stops short of the guide's range is lengthened to it, where its track has room.
+    // A take that stops short of the guide's range is lengthened to it, where its track has room and its file reaches.
     if (take.end() < to && take.linkGroup == 0) {
-        const Track* tr = trackAt(s, takeLoc->track);
-        FrameTime limit = to;
-        if (tr)
-            for (const Clip& c : tr->clips)
+        FrameTime limit = std::min(to, take.start + FrameTime(std::floor(sourceLimit(p, s, take) - take.sourceIn)));
+        if (track)
+            for (const Clip& c : track->clips)
                 if (c.id != take.id && c.start >= take.end()) limit = std::min(limit, c.start);
-        Clip* t = clipById(s, takeId);
-        if (t && limit > t->end()) t->duration = limit - t->start;
+        if (limit > take.end()) take.duration = limit - take.start;
     }
     if (report) *report = rep;
     return {};
 }
 
-bool removeDialogueAlignment(Project&, Sequence& s, Id clip) {
+Result removeDialogueAlignment(Project&, Sequence& s, Id clip) {
     Clip* c = clipById(s, clip);
-    if (!c) return false;
+    const auto loc = locate(s, clip);
+    if (!c || !loc) return Result::fail("No such clip");
+    if (const Track* t = trackAt(s, loc->track); t && t->locked) return Result::fail("The clip's track is locked");
     const size_t before = c->effects.size();
-    const std::string media = std::to_string(c->mediaId);
-    c->effects.erase(std::remove_if(c->effects.begin(), c->effects.end(),
-                                    [&](const Effect& e) { return e.type == "dialogue_align" && (e.s("media").empty() || e.s("media") == media); }),
-                     c->effects.end());
-    return c->effects.size() != before;
+    std::erase_if(c->effects, [&](const Effect& e) { return e.type == "dialogue_align" && dialogueAlignmentApplies(e, *c); });
+    if (c->effects.size() == before) return Result::fail("The clip has no Dialogue Alignment");
+    return {};
 }
 
 }  // namespace edit

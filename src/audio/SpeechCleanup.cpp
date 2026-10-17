@@ -33,11 +33,6 @@ bool isSourceAudioEffect(const std::string& type) {
            type == "dereverb" || type == "spectral_repair" || type == "dialogue_align";
 }
 
-bool sourceEffectApplies(const Effect& e, Id media) {
-    if (e.type != "dialogue_align") return true;
-    const std::string made = e.s("media");
-    return made.empty() || made == std::to_string(media);
-}
 
 bool hasVoiceIsolation() {
 #ifdef MONTAGE_WITH_RNNOISE
@@ -676,9 +671,13 @@ AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& sourc
             }
             flush();
             if (job->cancel.load()) break;
-            auto out = std::make_shared<AudioBuffer>();
-            applyDialogueWarp(*r, dialogueWarpFromString(e.s("warp")), e.p("invert", 0) > 0.5, *out, &job->cancel);
-            r = out;
+            try {
+                auto out = std::make_shared<AudioBuffer>();
+                applyDialogueWarp(*r, dialogueWarpFromString(e.s("warp")), e.p("invert", 0) > 0.5, *out, &job->cancel);
+                r = out;
+            } catch (const std::exception&) {
+                // Out of memory (a warp edited by hand): the sound plays as it was.
+            }
         }
         flush();
         if (job->cancel.load()) r = source;

@@ -283,7 +283,7 @@ constexpr size_t kMemory = 64 << 20;  // bytes a state
 // The longest string. Copying, comparing or changing the case of a string runs in C as one instruction, out of the
 // time limit's sight; a megabyte at most keeps a thousand of them (between two looks at the clock) to a moment.
 constexpr size_t kMaxString = 1 << 20;
-constexpr double kSeconds = 1.0;  // the time limit on the clock, whatever the instructions were
+constexpr double kSeconds = 5.0;  // the time limit on the clock, whatever the instructions were
 constexpr size_t kCompiled = 512;     // expressions kept compiled a thread
 
 struct State {

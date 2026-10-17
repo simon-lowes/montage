@@ -22992,18 +22992,31 @@ private slots:
         // Without it the take is out by far more.
         {
             const Effect kept = take->effects[0];
-            QVERIFY(edit::removeDialogueAlignment(p, s, takeClip));
-            QVERIFY(!edit::removeDialogueAlignment(p, s, takeClip));
+            QVERIFY(edit::removeDialogueAlignment(p, s, takeClip).ok);
+            QVERIFY(!edit::removeDialogueAlignment(p, s, takeClip).ok);
             const std::vector<double> raw = envelope(mixOf(1), sr / 1000);
             int rawWorst = 0;
             for (size_t i : onsets) rawWorst = std::max(rawWorst, std::abs(lagAt(gms, raw, i * 5)));
             QVERIFY2(rawWorst > 30, std::to_string(rawWorst).c_str());
             edit::clipById(s, takeClip)->effects.push_back(kept);
         }
-        // Made for this take only: on an audition, another take plays as it is.
+        // Made for this take only: on an audition, another take (another file, other channels, or another part of
+        // the same file) plays as it is.
         Effect other = makeEffect(p, "dialogue_align");
         other.strings["media"] = "12345";
-        QVERIFY(!sourceEffectApplies(other, 999) && sourceEffectApplies(other, 12345));
+        other.strings["channels"] = "0";
+        other.strings["span"] = "100.000:200.000";
+        Clip same;
+        same.mediaId = 12345, same.channels = {0}, same.sourceIn = 150, same.duration = 25;
+        QVERIFY(dialogueAlignmentApplies(other, same));
+        Clip elsewhere = same;
+        elsewhere.mediaId = 999;
+        QVERIFY(!dialogueAlignmentApplies(other, elsewhere));
+        elsewhere = same, elsewhere.channels = {1};
+        QVERIFY(!dialogueAlignmentApplies(other, elsewhere));
+        elsewhere = same, elsewhere.sourceIn = 400;
+        QVERIFY(!dialogueAlignmentApplies(other, elsewhere));
+        QVERIFY(dialogueAlignmentApplies(makeEffect(p, "denoise"), elsewhere));
         QVERIFY(isSourceAudioEffect("dialogue_align"));
 
         // Prefer Shifting: a second microphone, 3.2 ms behind the boom and wired the other way round, with a little

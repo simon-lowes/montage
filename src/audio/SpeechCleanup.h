@@ -19,8 +19,7 @@ namespace montage {
 // Effect types processed this way ("denoise", "voice_isolate", "enhance_speech",
 // "declick" and "pitch_shift" from AudioRepair.h, and "dialogue_align" from DialogueAlign.h).
 bool isSourceAudioEffect(const std::string& type);
-// Whether a source effect is for the media a clip plays: a Dialogue Alignment is made for one take of an audition.
-bool sourceEffectApplies(const Effect& e, Id media);
+// (A Dialogue Alignment is for one take of an audition: DialogueAlign.h dialogueAlignmentApplies.)
 // True if this build includes the RNNoise voice model.
 bool hasVoiceIsolation();
 

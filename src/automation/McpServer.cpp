@@ -5021,7 +5021,7 @@ void McpServer::Impl::addTools() {
             const Clip& take = clipArg(l, a, "clip");
             const Id takeId = take.id;
             if (a.value("remove").toBool(false)) {
-                if (!edit::removeDialogueAlignment(l.project, s, takeId)) return fail("The clip has no Dialogue Alignment");
+                if (const edit::Result r = edit::removeDialogueAlignment(l.project, s, takeId); !r.ok) return fail(QString::fromStdString(r.error));
                 save(l);
                 return ok(QStringLiteral("Took the alignment off %1").arg(QString::fromStdString(take.name)), QJsonObject{{"clip", double(takeId)}});
             }

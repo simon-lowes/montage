@@ -12,8 +12,8 @@
 //
 // The result is a source-audio effect, "dialogue_align" (audio/SpeechCleanup.h): its "warp" string maps times of the
 // sound the clip plays to times of the take's own file, in seconds, so it is cached like Noise Reduction, undone like
-// any edit and taken off by removing it. Its "media" string names the take it was made for: on an audition only that
-// take is warped. Shifting is the same effect with one pair (a fixed delay, played at sub-sample precision) and
+// any edit and taken off by removing it. Its "media", "channels" and "span" (source frames) strings name the take it
+// was made for: on an audition only that take is warped. Shifting is the same effect with one pair (a fixed delay, played at sub-sample precision) and
 // "invert" when the polarity was flipped.
 #pragma once
 
@@ -86,6 +86,10 @@ struct DialogueAlignReport {
     double from = 0, to = 0;           // the guide's range, timeline seconds
 };
 
+// Whether a source effect plays on what the clip plays now: anything but a Dialogue Alignment, and one only for the take
+// it was made for (its media, its channels and the part of the file it played: several takes can come from one file).
+bool dialogueAlignmentApplies(const Effect& e, const Clip& c);
+
 namespace edit {
 // Aligns the take clip's sound (an audio clip; on an audition, the take it plays) to the guide clip's over the range:
 // a "dialogue_align" effect on the take clip, replacing an earlier one for the same take. The clip stays where it is;
@@ -93,8 +97,8 @@ namespace edit {
 // at their own speed, forwards.
 Result alignDialogue(Project& p, Sequence& s, Id takeClip, Id guideClip, const DialogueAlignOptions& o,
                      DialogueAlignReport* report = nullptr, const std::atomic<bool>* cancel = nullptr);
-// Takes the alignment off the clip's current take; false when it had none.
-bool removeDialogueAlignment(Project& p, Sequence& s, Id clip);
+// Takes the alignment off the clip's current take; fails when it has none or its track is locked.
+Result removeDialogueAlignment(Project& p, Sequence& s, Id clip);
 }  // namespace edit
 
 }  // namespace montage

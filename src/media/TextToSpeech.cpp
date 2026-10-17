@@ -272,7 +272,7 @@ bool synthesizeSpeech(const std::string& text, const std::string& voiceId, doubl
             // asked to speak slowly): said at another pace instead and stretched to the speed asked, its pitch kept.
             const float asked = sp;
             for (float other : {1.0f, 1.1f, 0.9f, 1.2f, 1.3f}) {
-                if (finite(piece)) break;
+                if (finite(piece) || (cancel && cancel->load())) break;
                 if (std::fabs(other - asked) < 1e-3f) continue;
                 sp = other;
                 std::vector<float> made = run();
@@ -292,7 +292,7 @@ bool synthesizeSpeech(const std::string& text, const std::string& voiceId, doubl
             }
             sp = asked;
             if (!finite(piece)) {
-                if (error) *error = "Speech synthesis failed: the voice model gave no sound";
+                if (error) *error = cancel && cancel->load() ? "Cancelled" : "Speech synthesis failed: the voice model gave no sound";
                 return false;
             }
             if (!out.empty()) out.insert(out.end(), size_t(kTtsSampleRate * 0.12), 0.0f);  // between pieces

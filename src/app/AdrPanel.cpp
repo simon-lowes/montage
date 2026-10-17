@@ -1,13 +1,14 @@
 #include "AdrPanel.h"
 
 #include <QAbstractItemView>
-#include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDoubleSpinBox>
+#include <QEventLoop>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFutureWatcher>
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -17,12 +18,15 @@
 #include <QPainter>
 #include <QPointer>
 #include <QProgressBar>
+#include <QProgressDialog>
 #include <QPushButton>
 #include <QSpinBox>
 #include <QTableWidget>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QtConcurrent>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 
 #include "EditorState.h"
@@ -701,16 +705,54 @@ bool AdrPanel::alignToGuide(AlignPrecision precision) {
     DialogueAlignOptions o;
     o.precision = precision;
     o.from = q->start, o.to = q->end;
-    DialogueAlignReport rep;
-    QApplication::setOverrideCursor(Qt::WaitCursor);
-    const bool ok = state_->apply(tr("Align to Guide"), [&](Project& p, Sequence& sq) { return edit::alignDialogue(p, sq, clip, guide, o, &rep); });
-    QApplication::restoreOverrideCursor();
+    // Reading and matching the two sounds can take a while: on copies in the background, with progress, the result
+    // then applied as one edit (the dialog is modal, so nothing else changes meanwhile).
+    struct Out {
+        edit::Result result;
+        DialogueAlignReport report;
+        Clip take;
+    };
+    const Project project = state_->project();
+    const Sequence sequence = *s;
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    QProgressDialog progress(tr("Aligning to the guide…"), tr("Cancel"), 0, 0, this);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(400);
+    connect(&progress, &QProgressDialog::canceled, &progress, [cancel] { *cancel = true; });
+    QFutureWatcher<Out> watcher;
+    QEventLoop wait;
+    connect(&watcher, &QFutureWatcher<Out>::finished, &wait, &QEventLoop::quit);
+    watcher.setFuture(QtConcurrent::run([project, sequence, clip, guide, o, cancel] {
+        Out out;
+        Project p = project;
+        Sequence sq = sequence;
+        out.result = edit::alignDialogue(p, sq, clip, guide, o, &out.report, cancel.get());
+        if (const Clip* c = edit::clipById(sq, clip)) out.take = *c;
+        return out;
+    }));
+    if (!watcher.isFinished()) wait.exec();
+    disconnect(&progress, &QProgressDialog::canceled, nullptr, nullptr);
+    progress.close();
+    const Out r = watcher.result();
+    if (*cancel) return false;
+    const bool ok = state_->apply(tr("Align to Guide"), [&](Project& p, Sequence& sq) {
+        if (!r.result.ok) return r.result;
+        Clip* c = edit::clipById(sq, clip);
+        if (!c) return edit::Result::fail("No such clip");
+        std::vector<Id> had;
+        for (const Effect& e : c->effects) had.push_back(e.id);
+        c->effects = r.take.effects;
+        for (Effect& e : c->effects)
+            if (std::find(had.begin(), had.end(), e.id) == had.end()) e.id = p.newId();  // made on the copy
+        c->duration = r.take.duration;
+        return edit::Result{};
+    });
     refresh();
     if (ok)
         statusLabel_->setText(tr("Aligned to the guide: %1 anchors, stretched %2–%3 %")
-                                  .arg(rep.anchors)
-                                  .arg(std::lround(100 * rep.minRate))
-                                  .arg(std::lround(100 * rep.maxRate)));
+                                  .arg(r.report.anchors)
+                                  .arg(std::lround(100 * r.report.minRate))
+                                  .arg(std::lround(100 * r.report.maxRate)));
     return ok;
 }
 
