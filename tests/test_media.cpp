@@ -2,6 +2,8 @@
 #include <clocale>
 #include <QtTest>
 #include <QElapsedTimer>
+#include <QCryptographicHash>
+#include <QtEndian>
 #include <QPainter>
 #include <QProcess>
 #include <QUdpSocket>
@@ -17,6 +19,7 @@
 #include <fstream>
 #include <functional>
 #include <array>
+#include <set>
 #include <QImage>
 #include <QMatrix4x4>
 #include <QTextStream>
@@ -71,6 +74,7 @@
 #include "media/HwAccel.h"
 #include "media/Loudness.h"
 #include "media/Offload.h"
+#include "media/Recover.h"
 #include "core/AafImport.h"
 #include "core/ProjectLock.h"
 #include "media/MediaPool.h"
@@ -200,6 +204,8 @@ extern "C" {
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/hdr_dynamic_metadata.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
 }
 
 using namespace montage;
@@ -502,6 +508,166 @@ std::vector<float> decodeAudioStream(const std::string& path, int n, std::string
     av_frame_free(&fr);
     av_packet_free(&pkt);
     swr_free(&swr);
+    avcodec_free_context(&ctx);
+    avformat_close_input(&fmt);
+    return out;
+}
+
+// A recording as a camera or recorder might make one, by FFmpeg's encoders and muxer: a textured picture that moves
+// and a tone that glides, `frames` frames at 25 fps (320 x 180) with 48 kHz stereo; `seed` changes both.
+bool writeRecording(const std::string& file, const char* format, const char* vcodec, const char* acodec, int frames, int seed,
+                    std::string* why) {
+    AVFormatContext* oc = nullptr;
+    if (avformat_alloc_output_context2(&oc, nullptr, format, file.c_str()) < 0) return *why = "no muxer", false;
+    struct Enc {
+        AVCodecContext* c = nullptr;
+        AVStream* st = nullptr;
+    } v, a;
+    bool ok = true;
+    auto open = [&](Enc& e, const AVCodec* codec) {
+        if (oc->oformat->flags & AVFMT_GLOBALHEADER) e.c->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        if (avcodec_open2(e.c, codec, nullptr) < 0) return *why = std::string(codec->name) + " did not open", ok = false;
+        e.st = avformat_new_stream(oc, nullptr);
+        avcodec_parameters_from_context(e.st->codecpar, e.c);
+        e.st->time_base = e.c->time_base;
+        return true;
+    };
+    const std::string vname = vcodec ? vcodec : "";
+    if (vcodec) {
+        const AVCodec* codec = avcodec_find_encoder_by_name(vcodec);
+        if (!codec) return avformat_free_context(oc), *why = vname + " is missing", false;
+        v.c = avcodec_alloc_context3(codec);
+        v.c->width = 320;
+        v.c->height = 180;
+        v.c->time_base = {1, 25};
+        v.c->framerate = {25, 1};
+        v.c->pix_fmt = vname == "prores_ks" ? AV_PIX_FMT_YUV422P10LE : vname == "mpeg2video" ? AV_PIX_FMT_YUV422P : AV_PIX_FMT_YUV420P;
+        if (vname != "prores_ks") v.c->gop_size = 12, v.c->max_b_frames = 2;
+        if (vname == "mpeg2video") v.c->bit_rate = 3000000;
+        if (vname == "libx264" || vname == "libx265") av_opt_set(v.c->priv_data, "preset", "ultrafast", 0);
+        if (vname == "libx265") av_opt_set(v.c->priv_data, "x265-params", "log-level=none", 0);
+        open(v, codec);
+    }
+    if (ok && acodec) {
+        const AVCodec* codec = avcodec_find_encoder_by_name(acodec);
+        if (!codec) return avformat_free_context(oc), *why = std::string(acodec) + " is missing", false;
+        a.c = avcodec_alloc_context3(codec);
+        a.c->sample_rate = 48000;
+        a.c->time_base = {1, 48000};
+        const AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
+        av_channel_layout_copy(&a.c->ch_layout, &stereo);
+        a.c->sample_fmt = codec->sample_fmts[0];
+        a.c->bit_rate = 128000;
+        open(a, codec);
+    }
+    if (ok && avio_open(&oc->pb, file.c_str(), AVIO_FLAG_WRITE) < 0) *why = "cannot write", ok = false;
+    if (ok && avformat_write_header(oc, nullptr) < 0) *why = "no header", ok = false;
+    AVPacket* pkt = av_packet_alloc();
+    auto encode = [&](Enc& e, AVFrame* f) {
+        if (avcodec_send_frame(e.c, f) < 0) return;
+        while (avcodec_receive_packet(e.c, pkt) == 0) {
+            av_packet_rescale_ts(pkt, e.c->time_base, e.st->time_base);
+            pkt->stream_index = e.st->index;
+            av_interleaved_write_frame(oc, pkt);
+        }
+    };
+    const int64_t total = int64_t(frames) * 1920;
+    const int chunk = a.c && a.c->frame_size > 0 ? a.c->frame_size : 1024;
+    int vi = 0;
+    int64_t ai = 0;
+    double phase = 0;
+    while (ok && ((v.c && vi < frames) || (a.c && ai < total))) {
+        AVFrame* f = av_frame_alloc();
+        if (v.c && vi < frames && (!a.c || ai >= total || int64_t(vi) * 1920 <= ai)) {
+            f->format = v.c->pix_fmt;
+            f->width = 320;
+            f->height = 180;
+            av_frame_get_buffer(f, 0);
+            const bool ten = v.c->pix_fmt == AV_PIX_FMT_YUV422P10LE;
+            for (int p = 0; p < 3; ++p) {
+                const int w = p ? 160 : 320, h = p && v.c->pix_fmt == AV_PIX_FMT_YUV420P ? 90 : 180;
+                for (int y = 0; y < h; ++y)
+                    for (int x = 0; x < w; ++x) {
+                        const double s = std::sin((x + 3.0 * vi + seed * 17) / 9.0) * std::cos((y - 2.0 * vi + p * 5) / 7.0);
+                        const int c = std::clamp(int(128 + 60 * s + ((x / 8 + y / 8 + vi / 4 + seed) % 2) * 30 - p * 10), 0, 255);
+                        if (ten)
+                            reinterpret_cast<uint16_t*>(f->data[p] + y * f->linesize[p])[x] = uint16_t(c * 4);
+                        else
+                            f->data[p][y * f->linesize[p] + x] = uint8_t(c);
+                    }
+            }
+            f->pts = vi++;
+            encode(v, f);
+        } else {
+            const int n = int(std::min<int64_t>(chunk, total - ai));
+            f->format = a.c->sample_fmt;
+            f->nb_samples = n;
+            f->sample_rate = 48000;
+            av_channel_layout_copy(&f->ch_layout, &a.c->ch_layout);
+            av_frame_get_buffer(f, 0);
+            for (int i = 0; i < n; ++i) {
+                phase += 2 * M_PI * (300 + 50 * seed + 100.0 * double(ai + i) / 48000) / 48000;
+                for (int c = 0; c < 2; ++c) {
+                    const double x = 0.25 * std::sin(phase * (c + 1));
+                    switch (f->format) {
+                    case AV_SAMPLE_FMT_FLTP: reinterpret_cast<float*>(f->data[c])[i] = float(x); break;
+                    case AV_SAMPLE_FMT_S16: reinterpret_cast<int16_t*>(f->data[0])[2 * i + c] = int16_t(std::lround(x * 32767)); break;
+                    case AV_SAMPLE_FMT_S32: reinterpret_cast<int32_t*>(f->data[0])[2 * i + c] = int32_t(std::lround(x * 8388607)) * 256; break;
+                    default: break;
+                    }
+                }
+            }
+            f->pts = ai;
+            ai += n;
+            encode(a, f);
+        }
+        av_frame_free(&f);
+    }
+    if (v.c) encode(v, nullptr);
+    if (a.c) encode(a, nullptr);
+    if (ok) av_write_trailer(oc);
+    av_packet_free(&pkt);
+    avcodec_free_context(&v.c);
+    avcodec_free_context(&a.c);
+    if (oc->pb) avio_closep(&oc->pb);
+    avformat_free_context(oc);
+    return ok;
+}
+
+// Every picture of a file's first video stream in display order, each as an MD5 of its planes.
+std::vector<QByteArray> pictureHashes(const std::string& file, int64_t* duration = nullptr) {
+    std::vector<QByteArray> out;
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return out;
+    avformat_find_stream_info(fmt, nullptr);
+    const int idx = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (idx < 0) return avformat_close_input(&fmt), out;
+    if (duration) *duration = fmt->streams[idx]->duration;
+    const AVCodec* codec = avcodec_find_decoder(fmt->streams[idx]->codecpar->codec_id);
+    AVCodecContext* ctx = avcodec_alloc_context3(codec);
+    avcodec_parameters_to_context(ctx, fmt->streams[idx]->codecpar);
+    ctx->thread_count = 1;
+    avcodec_open2(ctx, codec, nullptr);
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* fr = av_frame_alloc();
+    auto drain = [&] {
+        while (avcodec_receive_frame(ctx, fr) == 0) {
+            const int size = av_image_get_buffer_size(AVPixelFormat(fr->format), fr->width, fr->height, 1);
+            QByteArray bytes(size, '\0');
+            av_image_copy_to_buffer(reinterpret_cast<uint8_t*>(bytes.data()), size, fr->data, fr->linesize, AVPixelFormat(fr->format),
+                                    fr->width, fr->height, 1);
+            out.push_back(QCryptographicHash::hash(bytes, QCryptographicHash::Md5));
+            av_frame_unref(fr);
+        }
+    };
+    while (av_read_frame(fmt, pkt) >= 0) {
+        if (pkt->stream_index == idx && avcodec_send_packet(ctx, pkt) >= 0) drain();
+        av_packet_unref(pkt);
+    }
+    avcodec_send_packet(ctx, nullptr);
+    drain();
+    av_frame_free(&fr);
+    av_packet_free(&pkt);
     avcodec_free_context(&ctx);
     avformat_close_input(&fmt);
     return out;
@@ -7176,6 +7342,192 @@ private slots:
         // The gain recovers over the release after the burst: well down soon after, nearly back 5 releases later.
         QVERIFY(std::fabs(out[size_t(25000 + delay) * 2]) < 0.9f * std::fabs(in[size_t(25000) * 2]) + 1e-6f || std::fabs(in[size_t(25000) * 2]) < 0.01f);
         for (int i = 45000; i < 45100; ++i) QVERIFY(std::fabs(out[size_t(i + delay) * 2] - in[size_t(i) * 2]) < 0.002f);
+    }
+
+    void recoverInterruptedRecordings() {
+        // A clip from the camera that played, and one whose recording stopped at 70 % before its index was written.
+        struct Camera {
+            const char *name, *format, *video, *audio, *ext;
+        };
+        const Camera cameras[] = {{"h264aac", "mov", "libx264", "aac", "mov"},
+                                  {"hevcpcm", "mp4", "libx265", "pcm_s16le", "mp4"},
+                                  {"prorespcm", "mov", "prores_ks", "pcm_s24le", "mov"}};
+        for (const Camera& cam : cameras) {
+            const std::string ref = path((std::string(cam.name) + "_ref." + cam.ext).c_str());
+            const std::string whole = path((std::string(cam.name) + "_whole." + cam.ext).c_str());
+            const std::string cut = path((std::string(cam.name) + "_cut." + cam.ext).c_str());
+            std::string why;
+            if (!writeRecording(ref, cam.format, cam.video, cam.audio, 40, 1, &why)) {
+                qWarning("%s: %s, not tried", cam.name, why.c_str());
+                continue;
+            }
+            QVERIFY2(writeRecording(whole, cam.format, cam.video, cam.audio, 150, 2, &why), why.c_str());
+            {
+                QFile in(QString::fromStdString(whole)), out(QString::fromStdString(cut));
+                QVERIFY(in.open(QIODevice::ReadOnly) && out.open(QIODevice::WriteOnly));
+                out.write(in.read(in.size() * 7 / 10));
+            }
+            // A Sony-style sidecar with the start timecode, 10:15:12:16 at 25 fps.
+            if (std::string(cam.name) == "h264aac") {
+                QFile x(QString::fromStdString(path("h264aac_cutM01.XML")));
+                QVERIFY(x.open(QIODevice::WriteOnly));
+                x.write("<?xml version=\"1.0\"?>\n<NonRealTimeMeta><LtcChangeTable tcFps=\"25\"><LtcChange frameCount=\"0\" "
+                        "value=\"16121510\" status=\"increment\"/></LtcChangeTable></NonRealTimeMeta>\n");
+            }
+            const QString damaged = QString::fromStdString(cut);
+            const RepairCheck check = checkRecording(damaged);
+            QVERIFY2(check.kind == RepairKind::Movie && check.needsReference && !check.opens, cam.name);
+            QVERIFY(checkRecording(QString::fromStdString(ref)).kind == RepairKind::None);
+            const QString fixed = repairedPath(damaged);
+            QVERIFY(fixed.endsWith(QString("_cut_repaired.") + cam.ext));
+            RepairReport report;
+            QString err;
+            QVERIFY2(!repairRecording(damaged, QString(), fixed, &report, &err), cam.name);  // a reference is needed
+            QVERIFY2(repairRecording(damaged, QString::fromStdString(ref), fixed, &report, &err), qPrintable(err));
+            QVERIFY(checkRecording(fixed).kind == RepairKind::None && checkRecording(fixed).opens);
+            // Every whole picture is the original's.
+            const std::vector<QByteArray> before = pictureHashes(whole), after = pictureHashes(fixed.toStdString());
+            QVERIFY(before.size() >= 148);
+            QVERIFY2(after.size() >= 95 && after.size() < before.size(), qPrintable(QString("%1: %2 pictures").arg(cam.name).arg(after.size())));
+            QCOMPARE(report.videoFrames, int(after.size()));
+            const std::set<QByteArray> known(before.begin(), before.end());
+            for (size_t i = 0; i < after.size(); ++i) {
+                QVERIFY2(known.count(after[i]), qPrintable(QString("%1: picture %2 is not one of the original's").arg(cam.name).arg(i)));
+                if (i + 3 < after.size()) QVERIFY2(after[i] == before[i], qPrintable(QString("%1: picture %2 moved").arg(cam.name).arg(i)));
+            }
+            // And the sound is sample for sample the original's as far as it goes.
+            const std::vector<float> soundBefore = decodeAudioStream(whole, 0), soundAfter = decodeAudioStream(fixed.toStdString(), 0);
+            QVERIFY2(soundAfter.size() > soundBefore.size() / 2 && soundAfter.size() < soundBefore.size(),
+                     qPrintable(QString("%1: %2 of %3 samples").arg(cam.name).arg(soundAfter.size()).arg(soundBefore.size())));
+            QVERIFY2(std::equal(soundAfter.begin(), soundAfter.end(), soundBefore.begin()), cam.name);
+            QVERIFY(std::abs(report.seconds - after.size() / 25.0) < 0.1);
+            if (std::string(cam.name) == "h264aac") QVERIFY(std::abs(report.timecode - (36912 + 16 / 25.0)) < 1e-6);
+            // A reference from another camera finds nothing it knows.
+            if (std::string(cam.name) == "prorespcm")
+                QVERIFY(!repairRecording(QString::fromStdString(path("h264aac_cut.mov")), QString::fromStdString(ref), fixed + ".x", &report, &err));
+        }
+
+        // Over MCP, into a project: labelled, with the sidecar's timecode.
+        {
+            const QString project = QString::fromStdString(path("recovered.montage"));
+            QVERIFY(saveProject(makeDefaultProject(), project.toStdString()));
+            McpServer server;
+            auto call = [&](const QString& tool, const QJsonObject& args) {
+                const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                      {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                             {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                                   {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+                const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+                return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            };
+            const QString cut = QString::fromStdString(path("h264aac_cut.mov")), ref = QString::fromStdString(path("h264aac_ref.mov"));
+            if (QFileInfo::exists(cut)) {
+                QJsonObject res = call("montage_repair_media", {{"file", cut}, {"reference", ref}, {"output", QString::fromStdString(path("mcp.mov"))},
+                                                                {"project", project}, {"bin", "Card A"}});
+                QVERIFY2(!res.value("isError").toBool(), qPrintable(QJsonDocument(res).toJson()));
+                const QJsonObject sc = res.value("structuredContent").toObject();
+                QVERIFY(sc.value("repaired").toBool() && sc.value("kind").toString() == "movie" && sc.value("frames").toInt() >= 95);
+                Project back;
+                QVERIFY(loadProject(project.toStdString(), back));
+                QCOMPARE(back.media.size(), size_t(1));
+                QCOMPARE(back.media[0].bin, std::string("Card A"));
+                QVERIFY(std::find(back.media[0].keywords.begin(), back.media[0].keywords.end(), "Recovered") != back.media[0].keywords.end());
+                QVERIFY(std::abs(back.media[0].timecode - (36912 + 16 / 25.0)) < 1e-6);
+                QVERIFY(call("montage_repair_media", {{"file", cut}}).value("isError").toBool());  // no reference
+                QVERIFY(!call("montage_repair_media", {{"file", ref}}).value("structuredContent").toObject().value("repaired").toBool());
+            }
+        }
+
+        // An MXF whose footer was never written.
+        {
+            const std::string whole = path("xdcam_whole.mxf"), cut = path("xdcam_cut.mxf");
+            std::string why;
+            QVERIFY2(writeRecording(whole, "mxf", "mpeg2video", "pcm_s16le", 100, 3, &why), why.c_str());
+            {
+                QFile in(QString::fromStdString(whole)), out(QString::fromStdString(cut));
+                QVERIFY(in.open(QIODevice::ReadOnly) && out.open(QIODevice::WriteOnly));
+                out.write(in.read(in.size() * 7 / 10));
+            }
+            const RepairCheck check = checkRecording(QString::fromStdString(cut));
+            QVERIFY(check.kind == RepairKind::Mxf && !check.needsReference);
+            const QString fixed = repairedPath(QString::fromStdString(cut));
+            RepairReport report;
+            QString err;
+            QVERIFY2(repairRecording(QString::fromStdString(cut), QString(), fixed, &report, &err), qPrintable(err));
+            QVERIFY(checkRecording(fixed).kind == RepairKind::None && checkRecording(fixed).opens);
+            int64_t duration = 0;
+            const std::vector<QByteArray> before = pictureHashes(whole), after = pictureHashes(fixed.toStdString(), &duration);
+            QVERIFY(before.size() >= 98);
+            QVERIFY2(after.size() >= 60 && after.size() < before.size(), qPrintable(QString::number(after.size())));
+            QCOMPARE(int64_t(report.videoFrames), duration);  // the header's duration is what is there
+            for (size_t i = 0; i + 3 < after.size(); ++i) QVERIFY2(after[i] == before[i], qPrintable(QString::number(i)));
+            const std::vector<float> soundBefore = decodeAudioStream(whole, 0), soundAfter = decodeAudioStream(fixed.toStdString(), 0);
+            QVERIFY(soundAfter.size() >= size_t(report.videoFrames) * 1920 * 2 - 2 * 1920 * 2);
+            QVERIFY(std::equal(soundAfter.begin(), soundAfter.end(), soundBefore.begin()));
+            // Seeking uses the new index: the picture at 2 s is the original's.
+            AVFormatContext* fmt = nullptr;
+            QVERIFY(avformat_open_input(&fmt, fixed.toUtf8().constData(), nullptr, nullptr) >= 0);
+            avformat_find_stream_info(fmt, nullptr);
+            const int vs = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            QVERIFY(av_seek_frame(fmt, vs, 50, AVSEEK_FLAG_BACKWARD) >= 0);
+            AVPacket* pkt = av_packet_alloc();
+            int64_t first = -1;
+            while (first < 0 && av_read_frame(fmt, pkt) >= 0) {
+                if (pkt->stream_index == vs) first = pkt->dts;
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+            avformat_close_input(&fmt);
+            QVERIFY2(first >= 36 && first <= 50, qPrintable(QString::number(first)));
+        }
+
+        // WAV and RF64 recordings whose sizes were never filled in, with their bext and iXML.
+        {
+            auto u32 = [](uint32_t v) { return QByteArray(reinterpret_cast<const char*>(&v), 4); };
+            auto u16 = [](uint16_t v) { return QByteArray(reinterpret_cast<const char*>(&v), 2); };
+            QByteArray bext(602, '\0');
+            bext.replace(0, 7, "Sc12 T3");
+            const uint64_t ref = uint64_t(9 * 3600) * 48000;  // 09:00:00
+            for (int i = 0; i < 8; ++i) bext[338 + i] = char(ref >> (8 * i) & 0xff);
+            const QByteArray ixml = "<?xml version=\"1.0\"?><BWFXML><PROJECT>Recovered</PROJECT><SCENE>12</SCENE><TAKE>3</TAKE></BWFXML> ";
+            QByteArray samples;
+            for (int i = 0; i < 48000 * 3 / 2; ++i)
+                for (int c = 0; c < 2; ++c) samples += u16(uint16_t(int16_t(std::lround(8000 * std::sin(i * 0.01 * (c + 1))))));
+            const QByteArray fmtChunk = "fmt " + u32(16) + u16(1) + u16(2) + u32(48000) + u32(192000) + u16(4) + u16(16);
+            const QByteArray chunks = fmtChunk + "bext" + u32(602) + bext + "iXML" + u32(uint32_t(ixml.size())) + ixml;
+            for (const bool rf64 : {false, true}) {
+                const QString file = QString::fromStdString(path(rf64 ? "take_rf64.wav" : "take.wav"));
+                QFile f(file);
+                QVERIFY(f.open(QIODevice::WriteOnly));
+                if (rf64)
+                    f.write("RF64" + u32(0xffffffffu) + "WAVE" + "ds64" + u32(28) + QByteArray(28, '\0') + chunks + "data" + u32(0xffffffffu) + samples);
+                else
+                    f.write("RIFF" + u32(0) + "WAVE" + chunks + "data" + u32(0) + samples);
+                f.close();
+                QVERIFY(checkRecording(file).kind == RepairKind::Wav);
+                const QString fixed = repairedPath(file);
+                RepairReport report;
+                QString err;
+                QVERIFY2(repairRecording(file, QString(), fixed, &report, &err), qPrintable(err));
+                QVERIFY(checkRecording(fixed).kind == RepairKind::None);
+                QCOMPARE(report.audioSamples, int64_t(72000));
+                QFile r(fixed);
+                QVERIFY(r.open(QIODevice::ReadOnly));
+                const QByteArray b = r.readAll();
+                QCOMPARE(b.left(4), QByteArray("RIFF"));
+                QCOMPARE(qFromLittleEndian<quint32>(b.constData() + 4), quint32(b.size() - 8));
+                QVERIFY(b.endsWith(samples));
+                QCOMPARE(qFromLittleEndian<quint32>(b.constData() + b.size() - samples.size() - 4), quint32(samples.size()));
+                FieldRecording fr;
+                QVERIFY(readFieldRecording(fixed.toStdString(), fr));
+                QCOMPARE(fr.scene, std::string("12"));
+                QCOMPARE(fr.take, std::string("3"));
+                QCOMPARE(fr.startSeconds, 9.0 * 3600);
+                const std::vector<float> heard = decodeAudioStream(fixed.toStdString(), 0);
+                QCOMPARE(heard.size(), size_t(144000));
+                QVERIFY(std::abs(heard[1001] - float(int16_t(std::lround(8000 * std::sin(500 * 0.02)))) / 32768.0f) < 1e-6);
+            }
+        }
     }
 
     void cardOffloadWithMhl() {

@@ -27,6 +27,8 @@ class QDialog;
 
 namespace montage {
 
+class RepairMediaDialog;
+
 class EditorState;
 class MediaBinModel;
 class StoryboardView;
@@ -69,6 +71,10 @@ public:
     int attachProxiesFrom(const std::vector<Id>& ids, const QString& folder);
     // (Tests: called with the options dialog before it runs, to fill it and accept it.)
     std::function<void(QDialog*)> proxyDialogHook_;
+    // Repair Media… for each of `files` (or one chosen in the dialog when none).
+    void repairMedia(const QStringList& files);
+    // (Tests: called with each Repair Media dialog instead of showing it.)
+    std::function<void(RepairMediaDialog*)> repairDialogHook_;
     enum class View { Icons, List, Board };
 
     explicit MediaBinWidget(EditorState* state, QWidget* parent = nullptr);

@@ -112,6 +112,7 @@ add_library(montage_engine STATIC
   media/SpeakerSwitch.h media/SpeakerSwitch.cpp
   media/AutoDuck.h media/AutoDuck.cpp
   media/Offload.h media/Offload.cpp
+  media/Recover.h media/Recover.cpp
   media/MicBleed.h media/MicBleed.cpp
   media/Tracking.h media/Tracking.cpp
   media/CameraSolve.h media/CameraSolve.cpp

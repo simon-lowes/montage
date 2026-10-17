@@ -86,6 +86,7 @@
 #include "QualityCheckDialog.h"
 #include "ConformCheckDialog.h"
 #include "OffloadDialog.h"
+#include "RepairMediaDialog.h"
 #include "CaptureDialog.h"
 #include "media/Capture.h"
 #include "SpellUi.h"
@@ -6468,6 +6469,56 @@ private slots:
         const MhlVerifyResult v = verifyMhlWithProgress(win_.get(), dir_.path() + "/drive2/A007", true, &report);
         QVERIFY2(v.ok && v.verified == 2 && !v.generation.isEmpty(), qPrintable(report));
         QVERIFY2(report.contains("match"), qPrintable(report));
+    }
+
+    void repairMediaDialog() {
+        state()->newProject();
+        // A card with a recorder's take that was interrupted: its RIFF and data sizes never written.
+        const QString card = dir_.path() + "/cards/A008";
+        QVERIFY(QDir().mkpath(card));
+        {
+            auto u32 = [](uint32_t v) { return QByteArray(reinterpret_cast<const char*>(&v), 4); };
+            auto u16 = [](uint16_t v) { return QByteArray(reinterpret_cast<const char*>(&v), 2); };
+            QFile f(card + "/A008C001.wav");
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write("RIFF" + u32(0) + "WAVE" + "fmt " + u32(16) + u16(1) + u16(1) + u32(48000) + u32(96000) + u16(2) + u16(16) + "data" + u32(0) +
+                    QByteArray(96000, '\x10'));
+        }
+        // Offload Card names it and offers to repair it.
+        OffloadDialog dlg(state(), win_.get());
+        dlg.findChild<QListWidget*>("offloadDestinations")->clear();
+        dlg.setSource(card);
+        dlg.addDestination(dir_.path() + "/drive3");
+        dlg.findChild<QCheckBox*>("offloadImport")->setChecked(false);
+        const OffloadResult r = dlg.run();
+        QVERIFY2(r.ok && r.damaged.size() == 1, qPrintable(dlg.report()));
+        QVERIFY(dlg.report().contains("Repair Media"));
+        QVERIFY(!dlg.findChild<QPushButton*>("offloadRepair")->isHidden());
+        // The bin's Repair Media… for it.
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        QVERIFY(bin);
+        int shown = 0;
+        bin->repairDialogHook_ = [&](RepairMediaDialog* d) {
+            ++shown;
+            QVERIFY(d->findChild<QLineEdit*>("repairDamaged")->text().endsWith("A008C001.wav"));
+            QVERIFY(d->findChild<QLabel*>("repairProblem")->text().contains("size"));
+            QVERIFY(!d->findChild<QLineEdit*>("repairReference")->isEnabled());  // a WAV needs no reference
+            QVERIFY2(d->run(), qPrintable(d->report()));
+            QVERIFY2(d->report().contains("Imported"), qPrintable(d->report()));
+            const MediaItem* m = state()->project().findMedia(d->imported());
+            QVERIFY(m);
+            QVERIFY(std::find(m->keywords.begin(), m->keywords.end(), "Recovered") != m->keywords.end());
+            QVERIFY(QString::fromStdString(m->metadata.at("comment")).contains("A008C001.wav"));
+            QVERIFY(std::abs(m->duration - 1.0) < 0.01);
+        };
+        bin->repairMedia(r.damaged);
+        bin->repairDialogHook_ = {};
+        QCOMPARE(shown, 1);
+        QVERIFY(QFileInfo::exists(dir_.path() + "/drive3/A008/A008C001_repaired.wav"));
+        // A file that opens has nothing to repair.
+        RepairMediaDialog again(state(), win_.get());
+        again.setDamaged(dir_.path() + "/drive3/A008/A008C001_repaired.wav");
+        QVERIFY(!again.run());
     }
 
     void syncIndicators() {

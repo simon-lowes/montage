@@ -50,6 +50,7 @@
 #include "core/Provenance.h"
 #include "media/ContentCredentials.h"
 #include "media/Offload.h"
+#include "media/Recover.h"
 #include "media/Proxy.h"
 #include "media/SpeechSearch.h"
 #include "media/TextReader.h"
@@ -838,6 +839,7 @@ void McpServer::Impl::addTools() {
             for (const OffloadIssue& i : r.issues) text += QStringLiteral("\n  %1: %2").arg(i.path, i.problem);
             for (const QString& note : r.notes) text += QStringLiteral("\n  ") + note;
             if (!r.notes.isEmpty()) out["notes"] = QJsonArray::fromStringList(r.notes);
+            if (!r.damaged.isEmpty()) out["damaged"] = QJsonArray::fromStringList(r.damaged);  // for montage_repair_media
             if (l && !r.copies.isEmpty()) {
                 const std::string bin = QFileInfo(r.copies.front()).fileName().toStdString();
                 int imported = 0;
@@ -909,6 +911,63 @@ void McpServer::Impl::addTools() {
                                 : QStringLiteral("%1 match; %2 missing, %3 changed.").arg(v.verified).arg(v.missing.size()).arg(v.changed.size());
             if (!v.added.isEmpty()) text += QStringLiteral(" %1 not in the hash list.").arg(v.added.size());
             if (!v.generation.isEmpty()) text += QStringLiteral(" Recorded as %1.").arg(v.generation);
+            return ok(text, out);
+        });
+
+    add("montage_repair_media", "Repair an interrupted recording",
+        "Rebuild a recording the camera or recorder never finished (a flat battery, a pulled card) into a new file: an MP4 "
+        "or MOV without its index (moov) from a good clip from the same camera and settings (`reference`; H.264, HEVC and "
+        "ProRes pictures, AAC and PCM sound), an MXF without its footer (closed header with the duration, footer with an "
+        "index table), or a WAV, BWF or RF64 whose sizes were never written (bext and iXML kept). The damaged file is not "
+        "changed; `output` defaults to <name>_repaired.<ext> beside it. With `project`, the repaired file is imported into "
+        "it with the keyword Recovered (and the start timecode a camera sidecar gives).",
+        R"json({"type":"object","properties":{"file":{"type":"string"},"reference":{"type":"string"},"output":{"type":"string"},
+            "project":{"type":"string","description":"Import the repaired file into this project"},
+            "bin":{"type":"string"}},"required":["file"]})json",
+        false, [this](const QJsonObject& a) {
+            const QString file = absolute(need(a, "file"));
+            const RepairCheck check = checkRecording(file);
+            if (check.kind == RepairKind::None) {
+                if (!check.opens) return fail(check.problem.isEmpty() ? QStringLiteral("It cannot be read") : check.problem);
+                return ok(QStringLiteral("%1 opens: nothing to repair.").arg(QFileInfo(file).fileName()), QJsonObject{{"repaired", false}});
+            }
+            if (check.needsReference && !a.contains("reference"))
+                throw ArgError{"\"reference\" is a good clip from the same camera, needed to rebuild an MP4 or MOV"};
+            const QString output = a.contains("output") ? absolute(str(a, "output")) : repairedPath(file);
+            if (QFileInfo(output).absoluteFilePath() == QFileInfo(file).absoluteFilePath()) throw ArgError{"\"output\" must be a new file"};
+            std::optional<Loaded> l;
+            if (a.contains("project")) l = open(a);
+            RepairReport r;
+            QString err;
+            if (!repairRecording(file, check.needsReference ? absolute(str(a, "reference")) : QString(), output, &r, &err, [this](double f) {
+                    progress(f, "Repairing");
+                    return true;
+                }))
+                return fail(err);
+            static const char* kinds[] = {"none", "movie", "mxf", "wav"};
+            QJsonObject out{{"repaired", true}, {"kind", kinds[int(r.kind)]}, {"output", output}, {"seconds", r.seconds},
+                            {"frames", r.videoFrames}, {"audio_samples", double(r.audioSamples)}, {"bytes_used", double(r.bytesUsed)},
+                            {"bytes_left", double(r.bytesLeft)}, {"problem", check.problem}};
+            if (r.timecode >= 0) out["timecode"] = r.timecode;
+            if (!r.notes.isEmpty()) out["notes"] = QJsonArray::fromStringList(r.notes);
+            QString text = QStringLiteral("%1. Repaired into %2: %3 s").arg(check.problem, QFileInfo(output).fileName()).arg(r.seconds, 0, 'f', 2);
+            if (r.videoFrames) text += QStringLiteral(", %1 frames").arg(r.videoFrames);
+            text += QStringLiteral("; %1 bytes at the end were not whole.").arg(r.bytesLeft);
+            for (const QString& n : r.notes) text += QStringLiteral("\n  ") + n;
+            if (l) {
+                MediaItem m;
+                std::string perr;
+                if (!probeMedia(output.toStdString(), m, &perr)) return fail(QStringLiteral("Repaired, but it does not open: %1").arg(QString::fromStdString(perr)));
+                m.id = l->project.newId();
+                m.bin = str(a, "bin").toStdString();
+                m.keywords.push_back("Recovered");
+                m.metadata["comment"] = QStringLiteral("Recovered from %1 by Repair Media").arg(QFileInfo(file).fileName()).toStdString();
+                if (r.timecode >= 0) m.timecode = r.timecode;
+                l->project.media.push_back(m);
+                save(*l);
+                out["media"] = double(m.id);
+                text += QStringLiteral("\nImported as %1.").arg(QString::fromStdString(m.name));
+            }
             return ok(text, out);
         });
 
