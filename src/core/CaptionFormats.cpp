@@ -122,6 +122,7 @@ std::string captionsToTtml(const std::vector<Caption>& captions, Rational fps, c
            (style.boxOpacity > 0 ? std::string(" tts:backgroundColor=\"") + box + "\"" : std::string()) +
            (style.bold ? " tts:fontWeight=\"bold\"" : "") + "/>\n";
     out += "      <style xml:id=\"left\" tts:textAlign=\"left\"/>\n      <style xml:id=\"right\" tts:textAlign=\"right\"/>\n";
+    out += "      <style xml:id=\"italic\" tts:fontStyle=\"italic\"/>\n";
     out += "    </styling>\n    <layout>\n";
     // Captions sit at the bottom; ones moved to the top keep the same margin from it.
     out += "      <region xml:id=\"bottom\" tts:origin=\"10% 10%\" tts:extent=\"80% " + std::to_string(bottom - 10) +
@@ -143,7 +144,8 @@ std::string captionsToTtml(const std::vector<Caption>& captions, Rational fps, c
         if (c.align == kCaptionLeft) place += " style=\"left\"";
         else if (c.align == kCaptionRight) place += " style=\"right\"";
         out += "      <p xml:id=\"c" + std::to_string(++n) + "\" begin=\"" + ttmlClock(double(c.start) / f) + "\" end=\"" +
-               ttmlClock(double(c.end) / f) + "\"" + place + "><span style=\"caption\">" + body + "</span></p>\n";
+               ttmlClock(double(c.end) / f) + "\"" + place + "><span style=\"caption" + (c.italic ? " italic" : "") + "\">" + body +
+               "</span></p>\n";
     }
     out += "    </div>\n  </body>\n</tt>\n";
     return out;
@@ -159,14 +161,17 @@ bool parseTtml(const std::string& text, Rational fps, std::vector<Caption>& out,
         double begin, end;
         QString region;  // the region its content goes to (inherited)
         int align;       // its text alignment (inherited), -1 if none was given
+        bool italic;     // in italics (inherited)
     };
     std::vector<Span> stack;
     bool inP = false;
     QString buf;
     double pBegin = 0, pEnd = 0;
+    int italicText = 0, uprightText = 0;  // the paragraph's letters each way
     Caption placed;  // the paragraph's place
     // Where each region puts text (the third of the frame it lands in) and each style's alignment.
     std::map<QString, int> regionPlace, regionAlign, styleAlign;
+    std::map<QString, bool> styleItalic;
     auto alignOf = [](const QString& v) {
         if (v == QStringLiteral("left") || v == QStringLiteral("start")) return int(kCaptionLeft);
         if (v == QStringLiteral("right") || v == QStringLiteral("end")) return int(kCaptionRight);
@@ -216,16 +221,22 @@ bool parseTtml(const std::string& text, Rational fps, std::vector<Caption>& out,
                 if (const int al = alignOf(attr(a, "textAlign")); al >= 0) regionAlign[id] = al;
             } else if (name == QStringLiteral("style") && !id.isEmpty()) {
                 if (const int al = alignOf(attr(a, "textAlign")); al >= 0) styleAlign[id] = al;
+                if (const QString v = attr(a, "fontStyle"); !v.isEmpty()) styleItalic[id] = v == QStringLiteral("italic") || v == QStringLiteral("oblique");
             }
-            Span span{begin, end, stack.empty() ? QString() : stack.back().region, stack.empty() ? -1 : stack.back().align};
+            Span span{begin, end, stack.empty() ? QString() : stack.back().region, stack.empty() ? -1 : stack.back().align,
+                      !stack.empty() && stack.back().italic};
             if (const QString r = attr(a, "region"); !r.isEmpty()) span.region = r;
-            for (const QString& st : attr(a, "style").split(' ', Qt::SkipEmptyParts))
+            for (const QString& st : attr(a, "style").split(' ', Qt::SkipEmptyParts)) {
                 if (auto it = styleAlign.find(st); it != styleAlign.end()) span.align = it->second;
+                if (auto it = styleItalic.find(st); it != styleItalic.end()) span.italic = it->second;
+            }
             if (const int al = alignOf(attr(a, "textAlign")); al >= 0) span.align = al;
+            if (const QString v = attr(a, "fontStyle"); !v.isEmpty()) span.italic = v == QStringLiteral("italic") || v == QStringLiteral("oblique");
             stack.push_back(span);
             if (name == QStringLiteral("p")) {
                 inP = true;
                 buf.clear();
+                italicText = uprightText = 0;
                 pBegin = begin;
                 pEnd = end;
                 placed = {};
@@ -241,6 +252,7 @@ bool parseTtml(const std::string& text, Rational fps, std::vector<Caption>& out,
             QString t = x.text().toString();
             t.replace('\n', ' ').replace('\t', ' ').replace('\r', ' ');
             buf += t;
+            (!stack.empty() && stack.back().italic ? italicText : uprightText) += int(t.trimmed().size());
         } else if (x.isEndElement()) {
             if (!stack.empty()) stack.pop_back();
             if (local(x.qualifiedName()) == QStringLiteral("p") && inP) {
@@ -253,6 +265,7 @@ bool parseTtml(const std::string& text, Rational fps, std::vector<Caption>& out,
                     c.start = toFrames(pBegin, f);
                     c.end = toFrames(pEnd, f);
                     c.text = lines.join('\n').toStdString();
+                    c.italic = italicText > 0 && uprightText == 0;
                     caps.push_back(std::move(c));
                 }
             }
@@ -618,6 +631,7 @@ std::string captionsToAss(const std::vector<Caption>& captions, Rational fps, co
         QString t = lines.join(QStringLiteral("\\N"));
         if (style.allCaps) t = t.toUpper();  // the line breaks are \N already
         t.replace('{', '(').replace('}', ')');  // braces open override tags
+        if (c.italic) t.prepend(QStringLiteral("{\\i1}"));
         if (const int k = captionKeypad(c); k != 2) t.prepend(QStringLiteral("{\\an%1}").arg(k));
         out += "Dialogue: 0," + assTime(double(c.start) / f) + "," + assTime(double(c.end) / f) + ",Default,,0,0,0,," +
                t.toStdString() + "\n";
@@ -632,6 +646,7 @@ bool parseAss(const std::string& text, Rational fps, std::vector<Caption>& out, 
     QStringList format = {"layer", "start", "end", "style", "name", "marginl", "marginr", "marginv", "effect", "text"};
     QStringList styleFormat;
     std::map<QString, int> styleKeypad;  // each style's alignment
+    std::map<QString, bool> styleItalic;
     bool events = false, styles = false, legacy = false;
     static const QRegularExpression an(QStringLiteral("\\\\(an?)(\\d+)"));
     static const QRegularExpression overrides(QStringLiteral("\\{[^}]*\\}"));
@@ -653,6 +668,8 @@ bool parseAss(const std::string& text, Rational fps, std::vector<Caption>& out, 
                 const int ni = styleFormat.indexOf(QStringLiteral("name")), ai = styleFormat.indexOf(QStringLiteral("alignment"));
                 if (ni >= 0 && ai >= 0 && ai < v.size() && ni < v.size())
                     if (const int k = keypadFromAss(v[ai].trimmed().toInt(), legacy)) styleKeypad[v[ni].trimmed()] = k;
+                if (const int ii = styleFormat.indexOf(QStringLiteral("italic")); ni >= 0 && ii >= 0 && ii < v.size() && ni < v.size())
+                    styleItalic[v[ni].trimmed()] = v[ii].trimmed().toInt() != 0;
             }
             continue;
         }
@@ -682,8 +699,16 @@ bool parseAss(const std::string& text, Rational fps, std::vector<Caption>& out, 
         QString t = fields[ti];
         // Its place: the style's, or an alignment tag in the text.
         int keypad = 2;
-        if (const int si = format.indexOf(QStringLiteral("style")); si >= 0)
-            if (auto it = styleKeypad.find(fields[si].trimmed().remove('*')); it != styleKeypad.end()) keypad = it->second;
+        bool italic = false;
+        if (const int si = format.indexOf(QStringLiteral("style")); si >= 0) {
+            const QString style = fields[si].trimmed().remove('*');
+            if (auto it = styleKeypad.find(style); it != styleKeypad.end()) keypad = it->second;
+            if (auto it = styleItalic.find(style); it != styleItalic.end()) italic = it->second;
+        }
+        // Italics throughout: the style's, or \i1 before the text with no \i0 after it.
+        static const QRegularExpression italicOn(QStringLiteral("^\\{[^}]*\\\\i1[^}]*\\}")), italicOff(QStringLiteral("\\\\i0"));
+        if (italicOn.match(t).hasMatch()) italic = true;
+        if (t.contains(italicOff)) italic = false;
         for (auto it = overrides.globalMatch(t); it.hasNext();)
             if (const auto m = an.match(it.next().captured()); m.hasMatch())
                 if (const int k = keypadFromAss(m.captured(2).toInt(), m.captured(1) == QStringLiteral("a"))) keypad = k;
@@ -696,6 +721,7 @@ bool parseAss(const std::string& text, Rational fps, std::vector<Caption>& out, 
         if (lines.isEmpty()) continue;
         Caption c{toFrames(a, f), toFrames(b, f), lines.join('\n').toStdString(), {}};
         setCaptionKeypad(c, keypad);
+        c.italic = italic;
         caps.push_back(std::move(c));
     }
     normalizeCaptions(caps);
@@ -703,6 +729,205 @@ bool parseAss(const std::string& text, Rational fps, std::vector<Caption>& out, 
         if (error) *error = "No dialogue found in the ASS file";
         return false;
     }
+    out = std::move(caps);
+    return true;
+}
+
+// ---- Digital cinema subtitles (ST 428-7) ------------------------------------------------
+
+namespace {
+
+std::string dcstTime(int64_t frames, int rate) {
+    rate = std::max(1, rate);
+    frames = std::max<int64_t>(0, frames);
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%02lld:%02lld:%02lld:%02lld", (long long)(frames / (3600LL * rate)), (long long)(frames / (60LL * rate) % 60),
+                  (long long)(frames / rate % 60), (long long)(frames % rate));
+    return buf;
+}
+
+std::string argb(double r, double g, double b) {
+    char buf[16];
+    std::snprintf(buf, sizeof buf, "FF%02X%02X%02X", byte01(r), byte01(g), byte01(b));
+    return buf;
+}
+
+}  // namespace
+
+std::string captionsToDcst(const std::vector<Caption>& captions, const CaptionStyle& style, const DcstInfo& info) {
+    const int rate = std::max(1, info.editRate);
+    // ST 428-7 sizes are points of a screen 11 inches high.
+    const int points = std::clamp(int(std::lround(style.size * 11 * 72)), 10, 200);
+    const double line = std::clamp(style.size, 0.02, 0.2) * 100 * 1.2;  // percent of the height from line to line
+    const double margin = std::clamp((1 - style.position) * 100, 2.0, 40.0);
+    std::string effect = "none", effectColour = "FF000000";
+    if (style.outline > 0) effect = "border", effectColour = argb(style.outlineR, style.outlineG, style.outlineB);
+    else if (style.shadow > 0) effect = "shadow";
+    else if (style.boxOpacity > 0) effect = "border", effectColour = argb(style.boxR, style.boxG, style.boxB);
+    std::string out = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
+    out += "<SubtitleReel xmlns=\"http://www.smpte-ra.org/schemas/428-7/2014/DCST\">\n";  // one namespace only (Bv2.1)
+    out += "  <Id>urn:uuid:" + xmlEscape(info.id) + "</Id>\n";
+    out += "  <ContentTitleText>" + xmlEscape(info.title.empty() ? "Untitled" : info.title) + "</ContentTitleText>\n";
+    if (!info.annotation.empty()) out += "  <AnnotationText>" + xmlEscape(info.annotation) + "</AnnotationText>\n";
+    out += "  <IssueDate>" + xmlEscape(info.issueDate) + "</IssueDate>\n";
+    out += "  <ReelNumber>" + std::to_string(std::max(1, info.reel)) + "</ReelNumber>\n";
+    out += "  <Language>" + xmlEscape(info.language.empty() ? "en" : info.language) + "</Language>\n";
+    out += "  <EditRate>" + std::to_string(rate) + " 1</EditRate>\n";
+    out += "  <TimeCodeRate>" + std::to_string(rate) + "</TimeCodeRate>\n";
+    out += "  <StartTime>00:00:00:00</StartTime>\n";
+    out += "  <LoadFont ID=\"" + xmlEscape(info.fontId) + "\">urn:uuid:" + xmlEscape(info.fontUuid) + "</LoadFont>\n";
+    out += "  <SubtitleList>\n";
+    out += "    <Font ID=\"" + xmlEscape(info.fontId) + "\" Size=\"" + std::to_string(points) + "\" Color=\"" +
+           argb(style.textR, style.textG, style.textB) + "\" Effect=\"" + effect + "\" EffectColor=\"" + effectColour +
+           "\" Weight=\"" + (style.bold ? "bold" : "normal") + "\" Italic=\"no\" Script=\"normal\" AspectAdjust=\"1.0\" Underline=\"no\">\n";
+    int spot = 0;
+    char num[32];
+    for (const Caption& c : captions) {
+        QStringList lines = captionLines(c.text);
+        if (lines.isEmpty() || c.end <= c.start) continue;
+        if (style.allCaps)
+            for (QString& l : lines) l = l.toUpper();
+        out += "      <Subtitle SpotNumber=\"" + std::to_string(++spot) + "\" TimeIn=\"" + dcstTime(c.start, rate) + "\" TimeOut=\"" +
+               dcstTime(c.end, rate) + "\" FadeUpTime=\"00:00:00:00\" FadeDownTime=\"00:00:00:00\">\n";
+        const int n = int(lines.size());
+        for (int i = 0; i < n; ++i) {
+            // Each line's place: counted up from the bottom, down from the top, or around the middle.
+            std::string valign;
+            double v = 0;
+            if (c.vertical == kCaptionTop) valign = "top", v = margin + line * (i + 1);
+            else if (c.vertical == kCaptionMiddle) valign = "top", v = 50 + line * (i + 1 - n / 2.0);
+            else valign = "bottom", v = margin + line * (n - 1 - i);
+            std::snprintf(num, sizeof num, "%.1f", std::clamp(v, 1.0, 99.0));
+            std::string place = "Valign=\"" + valign + "\" Vposition=\"" + num + "\"";
+            if (c.align == kCaptionLeft) place += " Halign=\"left\" Hposition=\"10\"";
+            else if (c.align == kCaptionRight) place += " Halign=\"right\" Hposition=\"10\"";
+            else place += " Halign=\"center\" Hposition=\"0\"";
+            const std::string text = xmlEscape(lines[i].toStdString());
+            out += "        <Text " + place + " Direction=\"ltr\">" +
+                   (c.italic ? "<Font Italic=\"yes\">" + text + "</Font>" : text) + "</Text>\n";
+        }
+        out += "      </Subtitle>\n";
+    }
+    out += "    </Font>\n  </SubtitleList>\n</SubtitleReel>\n";
+    return out;
+}
+
+bool parseDcst(const std::string& xml, Rational fps, std::vector<Caption>& out, std::string* error, DcstInfo* info) {
+    const double f = frameRate(fps, 24);
+    QXmlStreamReader x(QByteArray(xml.data(), qsizetype(xml.size())));
+    bool interop = false, sawRoot = false;
+    int rate = 24;
+    double start = 0;  // seconds
+    DcstInfo got;
+    // SMPTE: HH:MM:SS:EE at TimeCodeRate; Interop: HH:MM:SS:TTT in 4 ms ticks (or HH:MM:SS.sss).
+    auto seconds = [&](const QString& t) -> double {
+        const QStringList p = t.trimmed().split(':');
+        if (p.size() == 3 && p[2].contains('.')) return p[0].toDouble() * 3600 + p[1].toDouble() * 60 + p[2].toDouble();
+        if (p.size() != 4) return -1;
+        const double whole = p[0].toDouble() * 3600 + p[1].toDouble() * 60 + p[2].toDouble();
+        return whole + (interop ? p[3].toDouble() / 250 : p[3].toDouble() / std::max(1, rate));
+    };
+    struct Open {
+        bool italic;
+    };
+    std::vector<Open> fonts;  // the Font elements open around here
+    std::vector<Caption> caps;
+    Caption cur;
+    bool inSubtitle = false, inText = false;
+    QString textBuf, element;
+    int italicChars = 0, uprightChars = 0;
+    QStringList lines;
+    int topLine = -1;  // the first line's place, for the caption's
+    while (!x.atEnd()) {
+        x.readNext();
+        if (x.isStartElement()) {
+            const QString name = x.name().toString();
+            const QXmlStreamAttributes a = x.attributes();
+            auto at = [&](const char* n) {
+                for (const auto& attr : a)
+                    if (attr.name().compare(QLatin1String(n), Qt::CaseInsensitive) == 0) return attr.value().toString();
+                return QString();
+            };
+            element = name;
+            if (!sawRoot) {
+                sawRoot = true;
+                interop = name == QStringLiteral("DCSubtitle");
+                if (!interop && name != QStringLiteral("SubtitleReel")) break;
+            } else if (name == QStringLiteral("Font")) {
+                const QString it = at("Italic");
+                fonts.push_back({it.isEmpty() ? (!fonts.empty() && fonts.back().italic) : it == QStringLiteral("yes")});
+            } else if (name == QStringLiteral("Subtitle")) {
+                cur = {};
+                const double a0 = seconds(at("TimeIn")), b0 = seconds(at("TimeOut"));
+                inSubtitle = a0 >= 0 && b0 > a0;
+                cur.start = toFrames(std::max(0.0, a0 - start), f);
+                cur.end = toFrames(std::max(0.0, b0 - start), f);
+                lines.clear();
+                italicChars = uprightChars = 0;
+                topLine = -1;
+            } else if (name == QStringLiteral("Text") && inSubtitle) {
+                inText = true;
+                textBuf.clear();
+                if (topLine < 0) {
+                    topLine = 1;
+                    const QString v = at("Valign"), h = at("Halign");
+                    const double pos = at("Vposition").toDouble();
+                    if (v == QStringLiteral("top")) cur.vertical = pos >= 33 ? kCaptionMiddle : kCaptionTop;
+                    else if (v == QStringLiteral("center")) cur.vertical = kCaptionMiddle;
+                    else cur.vertical = pos >= 33 ? kCaptionMiddle : kCaptionBottom;
+                    cur.align = h == QStringLiteral("left") ? kCaptionLeft : h == QStringLiteral("right") ? kCaptionRight : kCaptionCentre;
+                }
+            } else if (name == QStringLiteral("LoadFont")) {
+                got.fontId = (interop ? at("Id") : at("ID")).toStdString();
+            }
+        } else if (x.isCharacters()) {
+            if (inText) {
+                const QString t = x.text().toString();
+                textBuf += t;
+                (!fonts.empty() && fonts.back().italic ? italicChars : uprightChars) += int(t.trimmed().size());
+            } else if (element == QStringLiteral("TimeCodeRate")) {
+                rate = std::max(1, x.text().toString().trimmed().toInt());
+            } else if (element == QStringLiteral("EditRate") && !x.text().trimmed().isEmpty()) {
+                got.editRate = std::max(1, x.text().toString().trimmed().section(' ', 0, 0).toInt());
+            } else if (element == QStringLiteral("StartTime") && !x.text().trimmed().isEmpty()) {
+                start = std::max(0.0, seconds(x.text().toString()));
+            } else if ((element == QStringLiteral("Id") || element == QStringLiteral("SubtitleID")) && !x.text().trimmed().isEmpty()) {
+                got.id = x.text().toString().trimmed().remove(QStringLiteral("urn:uuid:")).toStdString();
+            } else if (element == QStringLiteral("Language") && !x.text().trimmed().isEmpty()) {
+                got.language = x.text().toString().trimmed().toStdString();
+            } else if ((element == QStringLiteral("ContentTitleText") || element == QStringLiteral("MovieTitle")) && !x.text().trimmed().isEmpty()) {
+                got.title = x.text().toString().trimmed().toStdString();
+            } else if (element == QStringLiteral("LoadFont") && !x.text().trimmed().isEmpty()) {
+                got.fontUuid = x.text().toString().trimmed().remove(QStringLiteral("urn:uuid:")).toStdString();
+            }
+        } else if (x.isEndElement()) {
+            const QString name = x.name().toString();
+            element.clear();
+            if (name == QStringLiteral("Font") && !fonts.empty()) fonts.pop_back();
+            else if (name == QStringLiteral("Text") && inText) {
+                inText = false;
+                if (const QString l = textBuf.simplified(); !l.isEmpty()) lines << l;
+            } else if (name == QStringLiteral("Subtitle") && inSubtitle) {
+                inSubtitle = false;
+                if (!lines.isEmpty()) {
+                    // Lines placed from the top come in order down the screen; from the bottom, the same.
+                    cur.text = lines.join('\n').toStdString();
+                    cur.italic = italicChars > 0 && uprightChars == 0;
+                    caps.push_back(cur);
+                }
+            }
+        }
+    }
+    if (!sawRoot || x.hasError()) {
+        if (error) *error = x.hasError() ? "The subtitle file is not well-formed: " + x.errorString().toStdString() : "Not a DCP subtitle file";
+        return false;
+    }
+    normalizeCaptions(caps);
+    if (caps.empty()) {
+        if (error) *error = "No subtitles found in the DCP subtitle file";
+        return false;
+    }
+    if (info) *info = got;
     out = std::move(caps);
     return true;
 }

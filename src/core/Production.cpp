@@ -158,6 +158,14 @@ std::vector<Id> importFromProject(Project& into, const Project& from, const std:
                                 }
                     remap(c.mediaId);
                     for (Take& tk : c.takes) remap(tk.mediaId);
+                    // A Dialogue Alignment names the take it was made for (audio/DialogueAlign.h): its media's new id.
+                    std::erase_if(c.effects, [&](Effect& e) {
+                        if (e.type != "dialogue_align" || e.s("media").empty()) return false;
+                        Id made = Id(std::strtoull(e.s("media").c_str(), nullptr, 10));
+                        remap(made);
+                        e.strings["media"] = std::to_string(made);
+                        return made == 0;
+                    });
                 }
         // In under a temporary id, then copied with new ids for everything in it (tracks, clips, links, effects).
         s.id = into.newId();

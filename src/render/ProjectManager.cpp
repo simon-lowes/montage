@@ -8,6 +8,7 @@
 #include <set>
 
 #include "Exporter.h"
+#include "audio/DialogueAlign.h"
 #include "core/GraphicsTemplate.h"
 #include "core/Interpretation.h"
 #include "core/EditOps.h"
@@ -228,8 +229,16 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
             // Clips and subclips now count from the span's start.
             for (Sequence& s : q.sequences)
                 for (TrackRef r : allTracks(s))
-                    for (Clip& c : trackAt(s, r)->clips)
+                    for (Clip& c : trackAt(s, r)->clips) {
                         if (c.mediaId == m.id) c.sourceIn -= from * s.fpsValue();
+                        // A Dialogue Alignment made for this media: its warp is in the file's seconds too.
+                        for (Effect& e : c.effects)
+                            if (e.type == "dialogue_align" && e.s("media") == std::to_string(m.id)) {
+                                DialogueWarp warp = dialogueWarpFromString(e.s("warp"));
+                                for (AlignPoint& pt : warp) pt.u -= from, pt.w -= from;
+                                e.strings["warp"] = dialogueWarpToString(warp);
+                            }
+                    }
             for (MediaItem& sub : q.media)
                 if (sub.subclipOf == m.id) {
                     sub.subclipIn = std::max(0.0, sub.subclipIn - from);

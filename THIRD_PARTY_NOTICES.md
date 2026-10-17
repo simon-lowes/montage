@@ -25,6 +25,7 @@ folder. The source code for each release, including every bundled library's, is 
 | [Spleeter](https://github.com/deezer/spleeter): the separation network graphs (without weights) | `src/media/spleeter-*stems.onnx` | MIT | [LICENSES/MIT-spleeter.txt](LICENSES/MIT-spleeter.txt) |
 | [Bandit v2](https://github.com/kwatcharasupat/bandit-v2): the dialogue, music and effects network graph (without weights), and the script that builds it, transcribed from the authors' code | `scripts/gen-bandit-graph.py`, `src/media/bandit-v2-eng.onnx` | Apache-2.0 | Copyright Karn N. Watcharasupat, Chih-Wei Wu and Alexander Lerch. [LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt) |
 | [MuseTalk](https://github.com/TMElyralab/MuseTalk) 1.5, with the autoencoder of [sd-vae-ft-mse](https://huggingface.co/stabilityai/sd-vae-ft-mse) and the encoder of [Whisper](https://github.com/openai/whisper): the lip sync network graphs (without weights), and the script that builds them, transcribed from the authors' code, the [diffusers](https://github.com/huggingface/diffusers) and [transformers](https://github.com/huggingface/transformers) model classes they use and [librosa](https://librosa.org)'s mel filter bank; and MuseTalk's sound window, face crop and blending | `scripts/gen-lipsync-graphs.py`, `src/media/lipsync-*.onnx`, `src/media/LipSync.cpp` | MIT; diffusers and transformers Apache-2.0; librosa ISC | Copyright 2024 Tencent Music Entertainment Group; 2022 OpenAI; The HuggingFace Team; 2013–2026 librosa development team. Modified (rewritten as ONNX graph construction and C++). [LICENSES/MIT-MuseTalk.txt](LICENSES/MIT-MuseTalk.txt), [LICENSES/MIT-whisper.txt](LICENSES/MIT-whisper.txt), [LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt), [LICENSES/ISC-librosa.txt](LICENSES/ISC-librosa.txt) |
+| [Liberation Sans](https://github.com/liberationfonts/liberation-fonts) 2.1.5 (Regular): the font a DCP's subtitles are drawn in, carried in its timed text track file | `src/resources/fonts/LiberationSans-Regular.ttf` | SIL OFL 1.1 | Copyright (c) 2010 Google Corporation with Reserved Font Arimo, Tinos and Cousine; Copyright (c) 2012 Red Hat, Inc. with Reserved Font Name Liberation. Unmodified. [LICENSES/OFL-1.1-Liberation.txt](LICENSES/OFL-1.1-Liberation.txt) |
 | [SCOWL](http://wordlist.aspell.net/) word lists | `src/resources/dict/` | SCOWL licence (permissive) | Copyright 2000-2018 Kevin Atkinson; the notice is kept at the top of each list |
 
 ## Libraries compiled into Montage
@@ -57,8 +58,8 @@ one with its exact version, licence and source.
   the bundled Qt libraries with your own build of the same version.
 - [OpenColorIO](https://opencolorio.org) (BSD-3-Clause), [ONNX Runtime](https://onnxruntime.ai) (MIT, with its own
   third-party notices), [LibRaw](https://www.libraw.org) (LGPL-2.1 or CDDL-1.0), [lilv](https://drobilla.net/software/lilv)
-  (ISC), [libmysofa](https://github.com/hoene/libmysofa) (BSD-3-Clause) and [OpenJPEG](https://www.openjpeg.org)
-  (BSD-2-Clause).
+  (ISC), [libmysofa](https://github.com/hoene/libmysofa) (BSD-3-Clause), [OpenJPEG](https://www.openjpeg.org)
+  (BSD-2-Clause) and [OpenSSL](https://www.openssl.org) 3 (Apache-2.0; encrypted DCPs, signatures and KDMs).
 
 ## Not included
 

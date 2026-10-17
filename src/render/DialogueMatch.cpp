@@ -125,13 +125,18 @@ void applyDialogueMatch(Project& p, const Sequence& s, Clip& c, const DialogueMa
         Effect eq = voiceEqEffect(p, plan.eq);
         eq.strings["match"] = "dialogue";
         if (!plan.eqOverTime.empty()) {
-            // Keys at the clip's own frames (its sound at its speed).
-            const double fps = s.fpsValue(), speed = std::max(1e-6, std::fabs(c.speed));
+            // Keys at the clip's own frames: each measured time (seconds of its sound from the earliest moment it plays,
+            // in the file's order) where the clip plays it, reversed or speed-ramped as it is.
+            const double fps = s.fpsValue();
+            const double first = std::min(c.sourceFrameAt(c.start), c.sourceFrameAt(c.end() - 1));
             const std::pair<const char*, double VoiceEq::*> gains[] = {
                 {"low_db", &VoiceEq::lowDb}, {"b1_db", &VoiceEq::b1Db}, {"b2_db", &VoiceEq::b2Db}, {"b3_db", &VoiceEq::b3Db}, {"high_db", &VoiceEq::highDb}};
             for (const auto& [name, member] : gains) {
                 Param& prm = eq.params[name];
-                for (const auto& [t, g] : plan.eqOverTime) prm.addKey(FrameTime(std::llround(t * fps / speed)), g.*member);
+                for (const auto& [t, g] : plan.eqOverTime) {
+                    const double local = c.localForSource(first + t * fps);
+                    prm.addKey(std::clamp<FrameTime>(FrameTime(std::llround(local)), 0, std::max<FrameTime>(0, c.duration - 1)), g.*member);
+                }
             }
         }
         c.effects.insert(c.effects.begin(), std::move(eq));

@@ -248,6 +248,9 @@ public:
     // progress bar and checked when done. The folder it made ("" if it failed or was cancelled); what the check found.
     QString exportDcpTo(const QString& parent, const DcpSettings& settings, QStringList* problems = nullptr);
     void exportDcpDialog();
+    // File › Make KDMs…: keys for cinema servers to play an encrypted DCP (render/Dcp.h makeKdms), from its DKDM, for
+    // the servers' certificates and a window.
+    void makeKdmsDialog();
     QString exportImfTo(const QString& parent, const ImfSettings& settings, QStringList* problems = nullptr);
     void exportImfDialog();
     // File › Export Immersive Master (ADM BWF)…: the bed and the audio objects (render/Adm.h), in the background.
@@ -568,6 +571,7 @@ private:
     QDockWidget* peopleDock_ = nullptr;
     QDockWidget* assistantDock_ = nullptr;
     AssistantPanel* assistant_ = nullptr;
+    DcpResult lastDcp_;  // the DCP this session made last (Make KDMs starts from its DKDM)
     // Tools › Scripts: Lua scripts on the open project (app/ScriptConsole.h).
     QDockWidget* scriptsDock_ = nullptr;
     ScriptConsole* scripts_ = nullptr;

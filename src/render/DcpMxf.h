@@ -7,6 +7,12 @@
 // then a random index pack. The layout and every label match what CineCert's asdcplib (the reference implementation
 // every DCP tool and server is checked against) writes, so its tools read these files back.
 //
+// Stereoscopic pictures (ST 429-10) put each frame's left and right codestreams one after the other, an edit unit
+// to the pair. Subtitles and captions (ST 429-5) are one ST 428-7 XML document in the body with each font or image it
+// loads in a generic stream partition of its own. Any of them can be encrypted (ST 429-6): each element becomes an
+// encrypted triplet, AES-128-CBC under the track's content key with an HMAC-SHA1 check value (the MIC) under a key
+// derived from it, and the header carries the cryptographic context that names the key.
+//
 // IMF track files (SMPTE ST 2067-5, the AS-02 layout) are OP1a: one track in each package and no timecode track,
 // JPEG 2000 frame-wrapped as progressive frames with RGBA and JPEG 2000 sub-descriptors that carry the colour
 // (primaries, transfer, coding equations, mastering display) and the component layout, or PCM clip-wrapped in a single
@@ -43,9 +49,21 @@ struct EditRate {
     double value() const { return den ? double(num) / den : 0; }
 };
 
+// A track file's content key (AES-128) and its id, as the composition and KDMs name it.
+struct TrackEncryption {
+    std::array<uint8_t, 16> key{};
+    Uuid keyId{};
+};
+
+// The MIC key ST 429-6 derives from a content key (the FIPS 186-2 generator's second value).
+std::array<uint8_t, 16> micKey(const std::array<uint8_t, 16>& contentKey);
+
 class TrackFileWriter {
 public:
     virtual ~TrackFileWriter();
+    // Encrypts every essence element with the key (call before opening; DCP track files only).
+    void encryptWith(const TrackEncryption& e);
+    bool encrypted() const { return encrypted_; }
     int64_t frames() const { return int64_t(offsets_.size()); }
     // The edit units in the file: frames, or for clip-wrapped sound its samples.
     virtual int64_t duration() const { return frames(); }
@@ -59,10 +77,15 @@ protected:
     bool openFile(const std::string& path, const Uuid& asset, int fps, std::string* error);
     bool openImfFile(const std::string& path, const Uuid& asset, EditRate rate, std::string* error);
     bool writeRaw(const uint8_t* data, size_t size, std::string* error);
-    bool writeElement(const uint8_t key[16], const uint8_t* data, size_t size, std::string* error);
+    // One essence element (an encrypted triplet when encrypting); `index`: an edit unit starts with it.
+    bool writeElement(const uint8_t key[16], const uint8_t* data, size_t size, std::string* error, bool index = true);
+    // A generic stream partition (body stream `sid`) after the essence, for one element of its own.
+    bool startStream(uint32_t sid, std::string* error);
     virtual std::vector<uint8_t> headerMetadata(int64_t duration) const = 0;  // primer and sets
     virtual std::vector<uint8_t> indexSegments() const = 0;
     virtual std::array<uint8_t, 16> essenceContainer() const = 0;
+    // The essence container the partitions and preface name: the encrypted one's label when encrypting.
+    std::array<uint8_t, 16> containerLabel() const;
     std::vector<uint8_t> partitionPack(const uint8_t key[16], uint64_t thisPartition, uint64_t previous, uint64_t footer,
                                        uint64_t headerBytes, uint64_t indexBytes, uint32_t indexSid, uint32_t bodySid) const;
 
@@ -79,13 +102,25 @@ protected:
     // Identities fixed when the file is opened, so the header written at the end matches the first one.
     std::array<Uuid, 48> ids_{};
     std::string created_;  // timestamp bytes
+    bool encrypted_ = false;
+    TrackEncryption crypto_;
+    std::array<uint8_t, 16> micKey_{};
+    uint64_t elements_ = 0;  // essence elements written (the MIC's sequence numbers count them)
+    std::vector<std::pair<uint32_t, uint64_t>> streams_;  // generic stream partitions: body stream and file offset
 };
 
-// SMPTE ST 429-4: one JPEG 2000 codestream per frame (2K or 4K DCI profile, XYZ 12-bit).
+// SMPTE ST 429-4: one JPEG 2000 codestream per frame (2K or 4K DCI profile, XYZ 12-bit); ST 429-10 when stereoscopic,
+// the left eye's then the right eye's to each frame.
 class PictureMxfWriter : public TrackFileWriter {
 public:
     bool open(const std::string& path, const Uuid& asset, int fps, std::string* error = nullptr) { return openFile(path, asset, fps, error); }
+    bool open(const std::string& path, const Uuid& asset, int fps, bool stereo, std::string* error) {
+        stereo_ = stereo;
+        return openFile(path, asset, fps, error);
+    }
     bool write(const uint8_t* codestream, size_t size, std::string* error = nullptr);
+    bool writeStereo(const uint8_t* left, size_t leftSize, const uint8_t* right, size_t rightSize, std::string* error = nullptr);
+    bool stereo() const { return stereo_; }
 
 protected:
     std::vector<uint8_t> headerMetadata(int64_t duration) const override;
@@ -93,8 +128,74 @@ protected:
     std::array<uint8_t, 16> essenceContainer() const override;
 
 private:
+    bool header(const uint8_t* codestream, size_t size, std::string* error);
     J2kHeader j2k_;
     bool haveHeader_ = false;
+    bool stereo_ = false;
+};
+
+// SMPTE ST 429-5: a reel's subtitles or captions, the ST 428-7 XML with the fonts and images it loads.
+struct TimedTextResource {
+    Uuid id{};                 // as the XML loads it (LoadFont, Image)
+    std::string mime;          // "application/x-font-opentype" or "image/png"
+    std::vector<uint8_t> data;
+};
+class TimedTextMxfWriter : public TrackFileWriter {
+public:
+    bool open(const std::string& path, const Uuid& asset, int fps, std::string* error = nullptr) { return openFile(path, asset, fps, error); }
+    // The XML (its Id `resourceId`, a different UUID from the asset's), `duration` edit units long, and its resources.
+    bool write(const std::string& xml, const Uuid& resourceId, int64_t duration, const std::string& language,
+               const std::vector<TimedTextResource>& resources, std::string* error = nullptr);
+    int64_t duration() const override { return duration_; }
+
+protected:
+    std::vector<uint8_t> headerMetadata(int64_t duration) const override;
+    std::vector<uint8_t> indexSegments() const override;
+    std::array<uint8_t, 16> essenceContainer() const override;
+
+private:
+    Uuid resourceId_{};
+    std::string namespace_, language_;
+    int64_t duration_ = 0;
+    std::vector<std::pair<Uuid, std::string>> resources_;  // id and type, in stream order
+    std::vector<Uuid> resourceSets_;
+};
+
+// Reads DCP track files back as cinema servers do: the index, each edit unit's element (the right eye's after the
+// left), the generic streams, decrypting with the content key and checking each MIC when given one.
+class TrackFileReader {
+public:
+    bool open(const std::string& path, std::string* error = nullptr);
+    int64_t editUnits() const { return int64_t(offsets_.size()); }
+    int64_t containerDuration() const { return containerDuration_; }
+    EditRate editRate() const { return rate_; }
+    bool stereo() const { return stereo_; }
+    bool encrypted() const { return encrypted_; }
+    bool hmac() const { return hmac_; }
+    const Uuid& asset() const { return asset_; }
+    const Uuid& keyId() const { return keyId_; }
+    bool timedText() const { return timedText_; }
+    // The largest edit unit in bytes (both eyes when stereoscopic): what the bit rate limit is checked against.
+    uint64_t largestEditUnit() const;
+    // Edit unit `index`'s essence (`eye` 1: the right one), decrypted with `key` (16 bytes) when encrypted.
+    bool read(int64_t index, int eye, std::vector<uint8_t>& out, const uint8_t* key = nullptr, std::string* error = nullptr);
+    // A generic stream's element (timed text resources: streams 10, 11, ... in the descriptor's order).
+    bool readStream(uint32_t sid, std::vector<uint8_t>& out, const uint8_t* key = nullptr, std::string* error = nullptr);
+    std::vector<uint32_t> streams() const;
+    // Timed text: each resource's id and stream, in order.
+    const std::vector<std::pair<Uuid, uint32_t>>& resources() const { return resourceStreams_; }
+
+private:
+    bool element(uint64_t at, uint64_t sequence, std::vector<uint8_t>& out, const uint8_t* key, std::string* error, uint64_t* next = nullptr);
+    std::string path_;
+    std::vector<uint64_t> offsets_;
+    std::vector<std::pair<uint32_t, uint64_t>> rip_;
+    uint64_t bodyStart_ = 0, fileSize_ = 0;
+    int64_t containerDuration_ = 0;
+    EditRate rate_;
+    bool stereo_ = false, encrypted_ = false, hmac_ = false, timedText_ = false;
+    Uuid asset_{}, keyId_{}, context_{};
+    std::vector<std::pair<Uuid, uint32_t>> resourceStreams_;
 };
 
 // SMPTE ST 429-3: 24-bit PCM at 48 kHz, one picture frame of samples per KLV, with multichannel audio labels for

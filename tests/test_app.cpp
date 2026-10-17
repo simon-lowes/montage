@@ -84,6 +84,7 @@
 #include "media/ContentCredentials.h"
 #include "ExposureView.h"
 #include "QualityCheckDialog.h"
+#include "ConformCheckDialog.h"
 #include "OffloadDialog.h"
 #include "CaptureDialog.h"
 #include "media/Capture.h"
@@ -92,6 +93,7 @@
 #include "core/Interpretation.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
+#include "render/DcpSecurity.h"
 #include "render/Ofx.h"
 #include "Assistant.h"
 #include "AssistantPanel.h"
@@ -428,6 +430,9 @@ private slots:
         // Settings of their own: nothing the app saved (window layout, workspace, presets) leaks into the tests.
         for (auto format : {QSettings::NativeFormat, QSettings::IniFormat})
             QSettings::setPath(format, QSettings::UserScope, dir_.filePath(QStringLiteral("settings")));
+        // DCP signing certificates and DKDMs of their own too.
+        qputenv("MONTAGE_DCP_CERTIFICATES", dir_.filePath(QStringLiteral("dcp-certificates")).toUtf8());
+        qputenv("MONTAGE_DCP_DKDMS", dir_.filePath(QStringLiteral("dkdm")).toUtf8());
         win_ = std::make_unique<MainWindow>();
         win_->resize(1600, 1000);
         win_->show();
@@ -720,6 +725,91 @@ private slots:
         QVERIFY(ranged.runCheck());
         QCOMPARE(ranged.issues().size(), size_t(1));
         QVERIFY(ranged.issues()[0].start == 60 && ranged.issues()[0].end == 120);
+    }
+
+    void conformCheckDialog() {
+        // A shot and the offline cut's reference movie of it, reframed to 110 %: the dialog finds the reframe and
+        // puts it right as one undo step.
+        QVERIFY(win_->findChild<QAction*>("conformCheck"));
+        const QString shot = dir_.path() + "/conform-shot.mp4", reference = dir_.path() + "/conform-reference.mp4";
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 320, gs.height = 180, gs.fps = {25, 1};
+            QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 0}, makeGeneratorClip(gen, "bars", 25)).ok);
+            Clip t = makeGeneratorClip(gen, "title", 25);
+            t.generator.strings["text"] = "CONFORM 42";
+            t.generator.params["size"] = 40.0;
+            QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 1}, t).ok);
+            ExportSettings st;
+            st.path = shot.toStdString();
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        {
+            Project ref = makeDefaultProject();
+            Sequence& rs = *ref.active();
+            rs.width = 320, rs.height = 180, rs.fps = {25, 1};
+            MediaItem m;
+            m.id = ref.newId();
+            QVERIFY(probeMedia(shot.toStdString(), m));
+            ref.media.push_back(m);
+            Clip c = makeClip(ref, m, TrackKind::Video, rs);
+            c.motion.params["scale"] = Param(110.0);
+            QVERIFY(edit::overwrite(ref, rs, {TrackKind::Video, 0}, c).ok);
+            ExportSettings st;
+            st.path = reference.toStdString();
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            st.burnIn.timecode = true;
+            std::string err;
+            QVERIFY2(exportSequence(ref, rs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({shot, reference});
+        QCOMPARE(ids.size(), size_t(2));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = 320, s.height = 180, s.fps = {25, 1};
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        ConformCheckDialog dlg(state(), win_.get());
+        auto* refBox = dlg.findChild<QComboBox*>("conformReference");
+        QCOMPARE(refBox->count(), 2);
+        QCOMPARE(refBox->currentData().toLongLong(), qint64(ids[1]));  // the one not cut in
+        auto* applyAll = dlg.findChild<QPushButton*>("conformApplyAll");
+        QVERIFY(!applyAll->isEnabled());
+        dlg.findChild<QLineEdit*>("conformStart")->setText("not a time");
+        QVERIFY(!dlg.runCheck());
+        dlg.setReferenceStart(0);
+        QVERIFY(dlg.runCheck());
+        QCOMPARE(dlg.shots().size(), size_t(1));
+        QCOMPARE(dlg.shots()[0].verdict, ConformVerdict::Reframed);
+        auto* table = dlg.findChild<QTableWidget*>("conformShots");
+        QCOMPARE(table->item(0, 2)->text(), QString("Reframed"));
+        QVERIFY(applyAll->isEnabled());
+        QVERIFY(dlg.findChild<QPushButton*>("conformMarkers")->isEnabled());
+        QCOMPARE(dlg.applyFixes(true), 1);
+        const Clip& c = state()->sequence()->videoTracks[0].clips[0];
+        QVERIFY2(std::fabs(c.motion.p("scale", 0, 100) - 110) < 0.5, std::to_string(c.motion.p("scale", 0, 100)).c_str());
+        QVERIFY(table->item(0, 2)->text().startsWith("Fixed"));
+        QVERIFY(!applyAll->isEnabled());
+        QVERIFY(!dlg.findChild<QPushButton*>("conformMarkers")->isEnabled());
+        QVERIFY(dlg.runCheck());
+        QCOMPARE(dlg.shots()[0].verdict, ConformVerdict::Matches);
+        QVERIFY(dlg.findChild<QLabel*>("conformSummary")->text().contains("match"));
+        state()->undo();
+        QCOMPARE(state()->sequence()->videoTracks[0].clips[0].motion.p("scale", 0, 100), 100.0);
+        // The undo leaves the results stale: dropped, to be checked again. Markers go on once for a check.
+        QVERIFY(dlg.shots().empty());
+        QCOMPARE(table->rowCount(), 0);
+        QVERIFY(dlg.runCheck());
+        QCOMPARE(dlg.shots()[0].verdict, ConformVerdict::Reframed);
+        QCOMPARE(dlg.addMarkers(), 1);
+        QCOMPARE(dlg.addMarkers(), 0);
+        QVERIFY(!dlg.findChild<QPushButton*>("conformMarkers")->isEnabled());
+        QCOMPARE(dlg.shots().size(), size_t(1));  // (its own markers do not make the results stale)
     }
 
     void aleAndCdlFromTheMenus() {
@@ -6661,6 +6751,66 @@ private slots:
         QVERIFY(!r.value("structuredContent").toObject().value("ok").toBool());
         QVERIFY(call("montage_export_dcp", {{"project", dir_.filePath("dcp.montage")}, {"folder", dir_.filePath("mcp")}, {"container", "imax"}})
                     .value("isError").toBool());
+        // The dialog offers 4K, 3D (only for a stereoscopic sequence), the caption tracks and encryption.
+        QVERIFY(state()->edit("Subtitles", [&](Project& p, Sequence& s) {
+            CaptionTrack t;
+            t.id = p.newId();
+            t.name = "French";
+            t.language = "fr";
+            Caption c;
+            c.start = 4, c.end = 20, c.text = "Bonjour";
+            t.captions = {c};
+            s.captionTracks.push_back(t);
+            return true;
+        }));
+        bool offered = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+            if (!dlg || dlg->objectName() != QLatin1String("exportDcpDialog")) return;
+            auto* resolution = dlg->findChild<QComboBox*>("dcpResolution");
+            auto* stereo = dlg->findChild<QCheckBox*>("dcpStereo");
+            auto* subtitles = dlg->findChild<QComboBox*>("dcpSubtitles");
+            auto* kind = dlg->findChild<QComboBox*>("dcpSubtitleKind");
+            auto* encrypt = dlg->findChild<QCheckBox*>("dcpEncrypt");
+            offered = resolution && resolution->count() == 2 && stereo && !stereo->isEnabled() && subtitles && subtitles->count() == 2 &&
+                      subtitles->currentIndex() == 0 && subtitles->itemText(1).startsWith("French") && kind && !kind->isEnabled() &&
+                      kind->count() == 3 && encrypt &&
+                      encrypt->isEnabled() == dcp::securityAvailable();
+            dlg->reject();
+        });
+        win_->exportDcpDialog();
+        QVERIFY(offered);
+        // Encrypted with the subtitles over MCP, then KDMs for a cinema's server from the DKDM it kept.
+        if (dcp::securityAvailable()) {
+            QVERIFY(state()->save(dir_.filePath("dcp.montage")));
+            r = call("montage_export_dcp", {{"project", dir_.filePath("dcp.montage")}, {"folder", dir_.filePath("mcp")}, {"title", "Locked"},
+                                            {"subtitles", "fr"}, {"encrypt", true}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            const QJsonObject locked = r.value("structuredContent").toObject();
+            QVERIFY2(locked.value("problems").toArray().isEmpty(), QJsonDocument(locked).toJson().constData());
+            QVERIFY(locked.value("encrypted").toBool() && locked.value("signed").toBool() && locked.value("subtitles").toInt() == 1);
+            QVERIFY(QFileInfo::exists(locked.value("dkdm").toString()));
+            dcp::CertificateChain cinema;
+            std::string err;
+            QVERIFY(dcp::makeCertificateChain("Cinema", cinema, &err));
+            const QString server = dir_.filePath("server.pem");
+            QFile f(server);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QByteArray::fromStdString(cinema.certificates.back()));
+            f.close();
+            r = call("montage_make_kdm", {{"dkdm", locked.value("dkdm")}, {"servers", QJsonArray{server}}, {"folder", dir_.filePath("kdms")}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            const QJsonArray kdms = r.value("structuredContent").toObject().value("kdms").toArray();
+            QCOMPARE(kdms.size(), 1);
+            QFile k(kdms.at(0).toString());
+            QVERIFY(k.open(QIODevice::ReadOnly));
+            dcp::KdmContents opened;
+            QVERIFY2(dcp::readKdm(k.readAll().toStdString(), cinema.privateKey, opened, &err), err.c_str());
+            QVERIFY(opened.cplId == locked.value("cpl_id").toString().toStdString() && opened.keys.size() == 3);
+            QVERIFY(call("montage_make_kdm", {{"dkdm", locked.value("dkdm")}, {"servers", QJsonArray{server}}, {"folder", dir_.filePath("kdms")},
+                                              {"until", "2099-01-01T00:00:00Z"}})
+                        .value("isError").toBool());
+        }
         state()->newProject();
     }
 
@@ -9113,6 +9263,19 @@ const auto seq = [this] { return state()->sequence(); };
         // A take can be said again in the guide's voice (none on the guide track here).
         QTRY_VERIFY(panel->findChild<QPushButton*>("adrConvertVoice")->isEnabled());
         QCOMPARE(panel->guideClip(), Id(0));
+        // Aligned to the guide only once there is one; a take with no speech in it is refused, saying why.
+        auto* align = panel->findChild<QPushButton*>("adrAlign");
+        QVERIFY(align && !align->isEnabled());
+        const auto speech = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(speech.size(), size_t(1));
+        QVERIFY(state()->apply("Guide", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, speech.front(), 150, 0, -1, {TrackKind::Video, -1}, {TrackKind::Audio, 0}, false);
+        }));
+        QTRY_VERIFY(panel->guideClip() != 0);
+        QTRY_VERIFY(align->isEnabled());
+        QVERIFY(!panel->alignToGuide());
+        QVERIFY(said.last().at(0).toString().contains("no speech"));
+        QVERIFY(edit::clipById(*state()->sequence(), clip)->effects.empty());
         const Clip* c = edit::clipById(*state()->sequence(), clip);
         QVERIFY(c && c->start == 150 && c->duration == 60);
         QCOMPARE(c->sourceIn, double(150 - cyc.playFrom));

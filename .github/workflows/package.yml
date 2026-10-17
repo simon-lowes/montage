@@ -46,7 +46,7 @@ jobs:
       - name: Install dependencies
         # Only the Qt modules Montage uses; the "qt" formula installs all of Qt.
         # FFmpeg itself is built below, from the libraries it uses.
-        run: brew install qtbase qtmultimedia opencolorio lilv libraw openjpeg libmysofa onnxruntime ninja pkgconf x264 x265 libvpx svt-av1 dav1d opus lame srt librist
+        run: brew install qtbase qtmultimedia opencolorio lilv libraw openjpeg libmysofa onnxruntime openssl@3 ninja pkgconf x264 x265 libvpx svt-av1 dav1d opus lame srt librist
       - name: FFmpeg's libraries (part of its cache key)
         id: ffdeps
         run: echo "versions=$(brew list --versions x264 x265 libvpx svt-av1 dav1d opus lame openjpeg srt librist | shasum | cut -c1-16)" >> "$GITHUB_OUTPUT"
@@ -72,7 +72,7 @@ jobs:
       - name: C2PA library (Content Credentials)
         run: scripts/build-c2pa.sh ~/c2pa
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)" -DMONTAGE_REQUIRE_ONNXRUNTIME=ON -DC2PA_ROOT="$HOME/c2pa" -DMONTAGE_REQUIRE_C2PA=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)" -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" -DMONTAGE_REQUIRE_ONNXRUNTIME=ON -DMONTAGE_REQUIRE_OPENSSL=ON -DC2PA_ROOT="$HOME/c2pa" -DMONTAGE_REQUIRE_C2PA=ON
       - name: Build
         run: cmake --build build
       - name: Cache the AI models
@@ -148,7 +148,7 @@ jobs:
           # this build replaces).
           pacboy: >-
             gcc:p cmake:p ninja:p pkgconf:p nasm:p
-            qt6-base:p qt6-multimedia:p qt6-tools:p opencolorio:p lilv:p libraw:p openjpeg2:p libmysofa:p onnxruntime:p rust:p expat:p
+            qt6-base:p qt6-multimedia:p qt6-tools:p opencolorio:p lilv:p libraw:p openjpeg2:p libmysofa:p onnxruntime:p openssl:p rust:p expat:p
             x264:p x265:p libvpx:p svt-av1:p dav1d:p opus:p lame:p srt:p librist:p amf-headers:p ffnvcodec-headers:p libvpl:p
       - name: FFmpeg's libraries (part of its cache key)
         id: ffdeps
@@ -184,7 +184,7 @@ jobs:
       - name: C2PA library (Content Credentials)
         run: scripts/build-c2pa.sh "$(cygpath -u "$USERPROFILE")/c2pa"  # where actions/cache's ~ points
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMONTAGE_REQUIRE_ONNXRUNTIME=ON -DC2PA_ROOT="$(cygpath -m "$USERPROFILE")/c2pa" -DMONTAGE_REQUIRE_C2PA=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMONTAGE_REQUIRE_ONNXRUNTIME=ON -DMONTAGE_REQUIRE_OPENSSL=ON -DC2PA_ROOT="$(cygpath -m "$USERPROFILE")/c2pa" -DMONTAGE_REQUIRE_C2PA=ON
       - name: Build
         run: cmake --build build
       - name: Cache the AI models

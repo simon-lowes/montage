@@ -39,6 +39,7 @@
 #include "Title3D.h"
 #include "TemporalFx.h"
 #include "VideoDenoise.h"
+#include "audio/DialogueAlign.h"
 #include "audio/PluginEffect.h"
 #include "audio/RoomResponse.h"
 #include "audio/SpeechCleanup.h"
@@ -1559,6 +1560,8 @@ Image trackPicture(const Project& p, const Sequence& seq, size_t m, FrameTime t,
     return {};
 }
 
+bool clipGeometry(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, Geometry& g);  // (below)
+
 // Sky Replacement on clip `c` (on track `ti`) at t: the sky found in its layer and another put in its place
 // (render/SkyReplace.h).
 void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c, FrameTime t, const RenderOptions& o, Image& layer, int W,
@@ -1569,7 +1572,42 @@ void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c,
     Image sky;
     if (std::lround(sr->p("source", lt, 0)) == 0)
         if (const int m = matteTrack(seq, ti, c, *sr, t); m >= 0) sky = trackPicture(p, seq, size_t(m), t, o, W, H);
-    applySkyReplacement(seq, c, *sr, lt, layer, &sky, o.scale, c.sourceFrameAt(t) / seq.fpsValue());
+    // A mask on the effect is drawn over the clip's own frame, as every effect's is: made there, from the layer seen
+    // back through the clip's transform, and carried onto the canvas the same way (so a moved, turned or keyed picture
+    // keeps it in place).
+    std::vector<float> mask;
+    Geometry g;
+    if (hasMask(*sr, lt) && clipGeometry(p, seq, c, t, g)) {
+        const double cr = std::cos(g.rot), sn = std::sin(g.rot);
+        const int pw = std::clamp(int(std::lround(g.mw * std::fabs(g.sx) * o.scale)), 1, 4 * W);
+        const int ph = std::clamp(int(std::lround(g.mh * std::fabs(g.sy) * o.scale)), 1, 4 * H);
+        Image pic(pw, ph);
+        for (int j = 0; j < ph; ++j)
+            for (int i = 0; i < pw; ++i) {
+                const double rx = ((i + 0.5) / pw * g.mw - g.mw / 2 - g.ax) * g.sx, ry = ((j + 0.5) / ph * g.mh - g.mh / 2 - g.ay) * g.sy;
+                const int X = int(std::floor((seq.width / 2.0 + g.px + rx * cr - ry * sn) * o.scale));
+                const int Y = int(std::floor((seq.height / 2.0 + g.py + rx * sn + ry * cr) * o.scale));
+                if (X >= 0 && Y >= 0 && X < layer.width && Y < layer.height) std::copy(layer.at(X, Y), layer.at(X, Y) + 4, pic.at(i, j));
+            }
+        const std::vector<float> m = effectMatte(*sr, lt, pic, effectPixelScale(c, lt, g.sx, g.mw, pw), c.sourceFrameAt(t) / seq.fpsValue());
+        if (m.size() == size_t(pw) * size_t(ph)) {
+            mask.assign(size_t(layer.width) * size_t(layer.height), 0.0f);
+            for (int Y = 0; Y < layer.height; ++Y)
+                for (int X = 0; X < layer.width; ++X) {
+                    const double xs = (X + 0.5) / o.scale - seq.width / 2.0 - g.px, ys = (Y + 0.5) / o.scale - seq.height / 2.0 - g.py;
+                    const double rx = xs * cr + ys * sn, ry = -xs * sn + ys * cr;
+                    const double u = (rx / g.sx + g.mw / 2 + g.ax) / g.mw * pw - 0.5, v = (ry / g.sy + g.mh / 2 + g.ay) / g.mh * ph - 0.5;
+                    if (u < -0.5 || v < -0.5 || u > pw - 0.5 || v > ph - 0.5) continue;
+                    const int i0 = std::clamp(int(std::floor(u)), 0, pw - 1), j0 = std::clamp(int(std::floor(v)), 0, ph - 1);
+                    const int i1 = std::min(i0 + 1, pw - 1), j1 = std::min(j0 + 1, ph - 1);
+                    const float fu = float(std::clamp(u - i0, 0.0, 1.0)), fv = float(std::clamp(v - j0, 0.0, 1.0));
+                    auto at = [&](int i, int j) { return m[size_t(j) * size_t(pw) + size_t(i)]; };
+                    mask[size_t(Y) * size_t(layer.width) + size_t(X)] =
+                        (at(i0, j0) * (1 - fu) + at(i1, j0) * fu) * (1 - fv) + (at(i0, j1) * (1 - fu) + at(i1, j1) * fu) * fv;
+                }
+        }
+    }
+    applySkyReplacement(seq, c, *sr, lt, layer, &sky, o.scale, c.sourceFrameAt(t) / seq.fpsValue(), mask.empty() ? nullptr : &mask);
 }
 
 }  // namespace
@@ -2154,6 +2192,7 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const Color
     const double px = std::max(4.0, st.size * img.height * (anim == 4 ? 1.8 : 1.0));
     f.setPixelSize(int(std::lround(px)));
     f.setBold(st.bold || anim == 4);
+    f.setItalic(cap->italic);
     f.setHintingPreference(QFont::PreferNoHinting);
     const QFontMetricsF fm(f);
     // The words of each line, numbered through the caption.
@@ -3161,7 +3200,7 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                 // (audio/SpeechCleanup.h).
                 std::vector<const Effect*> sourceFx;
                 for (const Effect& e : c.effects)
-                    if (e.enabled && isSourceAudioEffect(e.type)) sourceFx.push_back(&e);
+                    if (e.enabled && isSourceAudioEffect(e.type) && dialogueAlignmentApplies(e, c)) sourceFx.push_back(&e);
                 if (!sourceFx.empty())
                     if (AudioBufferPtr clean = cleanedAudio(key, fb, sourceFx, !nonBlocking_); clean && clean->channels >= nch) fb = clean;
                 // Maintain Audio Pitch: the channels stretched together along the time map.
@@ -3296,7 +3335,7 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             // original plays until the cleaned copy is ready in real time).
             std::vector<const Effect*> sourceFx;
             for (const Effect& e : c.effects)
-                if (e.enabled && isSourceAudioEffect(e.type)) sourceFx.push_back(&e);
+                if (e.enabled && isSourceAudioEffect(e.type) && dialogueAlignmentApplies(e, c)) sourceFx.push_back(&e);
             if (!sourceFx.empty())
                 if (AudioBufferPtr clean = cleanedAudio(source, buf, sourceFx, !nonBlocking_)) buf = clean;
             const int64_t n = buf->frames();

@@ -209,12 +209,29 @@ std::shared_ptr<const std::vector<FaceMesh>> cachedFaceMeshes(const Image& img, 
         std::memcpy(&bits, &img.px[i], 4);
         mix(bits);
     }
-    for (const FaceBox& f : faces)
+    // Every value around each face (as far as its fit can look: its crop is 1.5 times the face, turned, so a square
+    // of 2.2 times the box's longer side holds it), so a frame where only the eyes moved is not taken for the last one.
+    for (const FaceBox& f : faces) {
         for (float v : {f.x, f.y, f.w, f.h}) {
             uint32_t bits;
             std::memcpy(&bits, &v, 4);
             mix(bits);
         }
+        if (!std::isfinite(f.x) || !std::isfinite(f.y) || !std::isfinite(f.w) || !std::isfinite(f.h)) continue;
+        const double side = 2.2 * std::max(f.w * img.width, f.h * img.height);
+        const double cx = (f.x + f.w / 2) * img.width, cy = (f.y + f.h / 2) * img.height;
+        auto clampTo = [](double v, int hi) { return int(std::clamp(v, 0.0, double(hi))); };
+        const int x0 = clampTo(cx - side / 2, img.width), x1 = clampTo(cx + side / 2 + 1, img.width);
+        const int y0 = clampTo(cy - side / 2, img.height), y1 = clampTo(cy + side / 2 + 1, img.height);
+        for (int y = y0; y < y1; ++y) {
+            const float* row = img.at(x0, y);
+            for (int i = 0; i < (x1 - x0) * 4; ++i) {
+                uint32_t bits;
+                std::memcpy(&bits, &row[i], 4);
+                mix(bits);
+            }
+        }
+    }
     static std::mutex m;
     static std::deque<std::pair<uint64_t, std::shared_ptr<const std::vector<FaceMesh>>>> cache;
     {

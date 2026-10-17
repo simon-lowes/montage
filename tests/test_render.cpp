@@ -44,6 +44,8 @@
 #include "render/Imf.h"
 #include "render/Jpeg2000.h"
 #include "render/DcpMxf.h"
+#include "render/DcpSecurity.h"
+#include "render/XmlCanonical.h"
 #include "media/Decoder.h"
 #include "render/Exporter.h"
 #include "render/Gallery.h"
@@ -57,6 +59,7 @@
 #include <thread>
 #include <QPainter>
 #include <QElapsedTimer>
+#include <QRandomGenerator>
 #include "core/ScriptCut.h"
 #include "render/TrimPasses.h"
 #include "render/RoomTone.h"
@@ -129,7 +132,15 @@ Clip colorClip(Project& p, float r, float g, float b, FrameTime start, FrameTime
 
 class TestRender : public QObject {
     Q_OBJECT
+    QTemporaryDir keys_;
+
 private slots:
+    void initTestCase() {
+        // DCPs signed with a chain of the tests' own, their DKDMs kept with it (not in the user's data folder).
+        qputenv("MONTAGE_DCP_CERTIFICATES", keys_.filePath(QStringLiteral("dcp-certificates")).toUtf8());
+        qputenv("MONTAGE_DCP_DKDMS", keys_.filePath(QStringLiteral("dkdm")).toUtf8());
+    }
+
     void gamutTools() {
         auto near = [](Xy a, double x, double y, double tol) { return std::fabs(a.x - x) < tol && std::fabs(a.y - y) < tol; };
         // Chromaticities: white is D65, the primaries where the standards put them (Rec.709 red, Rec.2020 green, P3 blue).
@@ -5710,6 +5721,544 @@ colorspaces:
         QVERIFY(dcpContainer("full", cw, ch) && cw == 2048 && ch == 1080 && !dcpContainer("imax", cw, ch));
     }
 
+    void exportsEncryptedStereoDcpWithSubtitles() {
+        if (!dcp::securityAvailable()) QSKIP("This build has no OpenSSL");
+        QTemporaryDir dir;
+        // A second of a light box set into the screen (each eye shifted its way), with French subtitles: encrypted 3D.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = Rational{24, 1};
+        s.stereo3d = true;
+        Clip c = colorClip(p, 0.8f, 0.8f, 0.8f, 0, 24);
+        c.motion.params["scale"] = 50.0;
+        Effect depth = makeEffect(p, "stereo_3d");
+        depth.params["depth"] = 20.0;
+        c.effects.push_back(depth);
+        s.videoTracks[0].clips.push_back(c);
+        CaptionTrack track;
+        track.id = p.newId();
+        track.language = "fr";
+        Caption hello;
+        hello.start = 2, hello.end = 14, hello.text = "Bonjour\nle monde";
+        Caption bye;
+        bye.start = 16, bye.end = 23, bye.text = "Au revoir", bye.vertical = kCaptionTop, bye.italic = true;
+        track.captions = {hello, bye};
+        s.captionTracks.push_back(track);
+        DcpSettings st;
+        st.title = "Secret";
+        st.stereo = true;
+        st.subtitles = track.id;
+        st.encrypt = true;
+        st.threads = 2;
+        DcpResult r;
+        std::string err;
+        QVERIFY2(exportDcp(p, s, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+        QVERIFY(r.stereo && r.encrypted && r.signedPackage && r.subtitleCount == 2 && !r.dkdm.empty() && QFileInfo::exists(QString::fromStdString(r.dkdm)));
+        QVERIFY2(QString::fromStdString(r.name).startsWith("Secret_FTR-3D_F_EN-FR_XX_51_2K_"), r.name.c_str());
+        std::vector<std::string> issues = verifyDcp(r.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        const QDir out(QString::fromStdString(r.folder));
+        QFile cplFile(QString::fromStdString(r.cpl));
+        QVERIFY(cplFile.open(QIODevice::ReadOnly));
+        const QString cpl = QString::fromUtf8(cplFile.readAll());
+        cplFile.close();
+        QVERIFY(cpl.contains("msp-cpl:MainStereoscopicPicture") && cpl.contains("<FrameRate>48 1</FrameRate>") && cpl.count("<KeyId>") == 3);
+        QVERIFY(cpl.contains("<MainSubtitle>") && cpl.contains("<Language>fr</Language>") && cpl.contains("<meta:MainSubtitleLanguageList>fr<"));
+        QVERIFY(cpl.contains("<dsig:Signature") && dcp::verifyXmlSignature(cpl.toStdString()));
+        // The keys are in the DKDM, which only Montage's own key opens.
+        dcp::CertificateChain chain;
+        QVERIFY2(dcp::signerCertificateChain(chain, &err), err.c_str());
+        QFile dkdmFile(QString::fromStdString(r.dkdm));
+        QVERIFY(dkdmFile.open(QIODevice::ReadOnly));
+        dcp::KdmContents keys;
+        QVERIFY2(dcp::readKdm(dkdmFile.readAll().toStdString(), chain.privateKey, keys, &err), err.c_str());
+        QVERIFY(keys.cplId == r.cplId && keys.keys.size() == 3);
+        auto keyOf = [&](const char* type) {
+            for (const dcp::ContentKey& k : keys.keys)
+                if (k.type == type) return k.key;
+            return std::array<uint8_t, 16>{};
+        };
+        // Each eye decrypts with the picture key: the box to the left in the left eye, to the right in the right.
+        const QStringList pictures = out.entryList({"j2c_*.mxf"});
+        QCOMPARE(pictures.size(), 1);
+        const std::string picture = out.filePath(pictures[0]).toStdString();
+        std::vector<uint16_t> leftEye, rightEye;
+        int w = 0, h = 0;
+        QVERIFY(!readDcpFrame(picture, 3, leftEye, w, h, &err) && err.find("key") != std::string::npos);
+        const auto pictureKey = keyOf("MDIK");
+        QVERIFY2(readDcpFrame(picture, 3, leftEye, w, h, &err, pictureKey.data(), 0), err.c_str());
+        QVERIFY2(readDcpFrame(picture, 3, rightEye, w, h, &err, pictureKey.data(), 1), err.c_str());
+        QVERIFY(w == 1998 && h == 1080);
+        auto boxCentre = [&](const std::vector<uint16_t>& xyz) {
+            double sum = 0, weight = 0;
+            for (int x = 0; x < w; ++x) {
+                const double v = xyz[(size_t(540) * size_t(w) + size_t(x)) * 3 + 1];
+                if (v > 1000) sum += x * v, weight += v;
+            }
+            return weight > 0 ? sum / weight : -1;
+        };
+        const double lc = boxCentre(leftEye), rc = boxCentre(rightEye);
+        QVERIFY2(lc > 0 && rc > lc + 100, qPrintable(QString("%1 %2").arg(lc).arg(rc)));
+        // The subtitles decrypt and read back: their lines, place and italics.
+        const QStringList subtitleFiles = out.entryList({"sub_*.mxf"});
+        QCOMPARE(subtitleFiles.size(), 1);
+        dcp::TrackFileReader subtitleTrack;
+        QVERIFY(subtitleTrack.open(out.filePath(subtitleFiles[0]).toStdString(), &err) && subtitleTrack.encrypted());
+        std::vector<uint8_t> xml;
+        const auto subtitleKey = keyOf("MDSK");
+        QVERIFY2(subtitleTrack.read(0, 0, xml, subtitleKey.data(), &err), err.c_str());
+        std::vector<Caption> back;
+        QVERIFY2(parseDcst(std::string(xml.begin(), xml.end()), Rational{24, 1}, back, &err), err.c_str());
+        QCOMPARE(back.size(), size_t(2));
+        QVERIFY(back[0].start == 2 && back[0].end == 14 && back[0].text == "Bonjour\nle monde" && !back[0].italic);
+        QVERIFY(back[1].text == "Au revoir" && back[1].italic && back[1].vertical == kCaptionTop);
+        std::vector<uint8_t> font;
+        QVERIFY(subtitleTrack.readStream(10, font, subtitleKey.data(), &err) && font.size() > 100000);
+        // A KDM for a cinema's server from the DKDM: its key opens it, and the window must sit inside the DKDM's.
+        dcp::CertificateChain cinema;
+        QVERIFY(dcp::makeCertificateChain("Test Cinema", cinema, &err));
+        const QString serverFile = dir.filePath("server-chain.pem");
+        {
+            QFile f(serverFile);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            for (const std::string& pem : cinema.certificates) f.write(pem.data(), qint64(pem.size()));
+        }
+        KdmRequest kr;
+        kr.dkdm = r.dkdm;
+        kr.recipients = {serverFile.toStdString()};
+        kr.notBefore = QDateTime::currentSecsSinceEpoch();
+        kr.notAfter = kr.notBefore + 7 * 86400;
+        kr.offsetMinutes = 60;
+        kr.folder = dir.filePath("kdms").toStdString();
+        std::vector<std::string> kdms;
+        QVERIFY2(makeKdms(kr, &kdms, &err), err.c_str());
+        QCOMPARE(kdms.size(), size_t(1));
+        QFile kdmFile(QString::fromStdString(kdms[0]));
+        QVERIFY(kdmFile.open(QIODevice::ReadOnly));
+        const std::string kdm = kdmFile.readAll().toStdString();
+        dcp::KdmContents opened;
+        QVERIFY2(dcp::readKdm(kdm, cinema.privateKey, opened, &err), err.c_str());
+        QVERIFY(opened.cplId == r.cplId && opened.keys.size() == 3 && opened.notValidAfter.size() == 25);
+        QVERIFY(!dcp::readKdm(kdm, chain.privateKey, opened, &err));
+        kr.notAfter = kr.notBefore + 20 * 365 * 86400LL;
+        QVERIFY(!makeKdms(kr, nullptr, &err) && err.find("ends after") != std::string::npos);
+        // A DKDM encrypted to Montage's leaf (whose certificate any signed package carries) but signed by someone else
+        // is not Montage's own.
+        {
+            dcp::KdmSettings foreign;
+            foreign.cplId = r.cplId;
+            foreign.contentTitle = "Secret";
+            foreign.notValidBefore = dcp::kdmTime(kr.notBefore - 60);
+            foreign.notValidAfter = dcp::kdmTime(kr.notBefore + 30 * 86400LL);
+            foreign.keys = keys.keys;
+            foreign.recipient = chain.certificates.back();
+            std::string text;
+            QVERIFY2(dcp::makeKdm(foreign, cinema, text, &err), err.c_str());
+            const QString path = dir.filePath("foreign-dkdm.xml");
+            QVERIFY(dcp::writeWholeFile(path.toStdString(), text));
+            KdmRequest other = kr;
+            other.dkdm = path.toStdString();
+            other.notAfter = other.notBefore + 86400;
+            QVERIFY(!makeKdms(other, nullptr, &err) && err.find("not made by this signer") != std::string::npos);
+        }
+        // ClairMeta (when MONTAGE_TEST_CLAIRMETA names a Python with it) passes the package and opens it with the KDM.
+        const QString python = qEnvironmentVariable("MONTAGE_TEST_CLAIRMETA");
+        auto clairMeta = [&](const std::string& folder, const QStringList& extra) {
+            QProcess cm;
+            cm.start(python, QStringList{"-m", "clairmeta.cli", "check", "-type", "dcp", QString::fromStdString(folder)} + extra);
+            if (!cm.waitForFinished(600000)) return QStringLiteral("ClairMeta did not finish");
+            const QString report = QString::fromUtf8(cm.readAllStandardOutput() + cm.readAllStandardError());
+            if (qEnvironmentVariableIsSet("MONTAGE_TEST_CLAIRMETA_REPORT")) qInfo().noquote() << report;
+            return cm.exitCode() == 0 ? QString() : report;
+        };
+        if (!python.isEmpty()) {
+            const QString keyFile = dir.filePath("server.key");
+            QFile k(keyFile);
+            QVERIFY(k.open(QIODevice::WriteOnly));
+            k.write(cinema.privateKey.data(), qint64(cinema.privateKey.size()));
+            k.close();
+            const QString report = clairMeta(r.folder, {"-kdm", QString::fromStdString(kdms[0]), "-key", keyFile});
+            QVERIFY2(report.isEmpty(), qPrintable(report));
+        }
+        // A changed composition no longer checks.
+        QVERIFY(cplFile.open(QIODevice::WriteOnly | QIODevice::Truncate));
+        QString changed = cpl;
+        changed.replace("<meta:FullContentTitleText>Secret<", "<meta:FullContentTitleText>Secrets<");
+        QVERIFY(changed != cpl);
+        cplFile.write(changed.toUtf8());
+        cplFile.close();
+        issues = verifyDcp(r.folder);
+        QVERIFY(std::any_of(issues.begin(), issues.end(), [](const std::string& i) { return i.find("signature") != std::string::npos; }));
+        // Closed captions instead: the composition's ClosedCaption, "-CCAP" in the name; a flat sequence refuses 3D.
+        s.stereo3d = false;
+        QVERIFY(!exportDcp(p, s, st, dir.path().toStdString(), nullptr, {}, &err) && err.find("stereoscopic") != std::string::npos);
+        st.stereo = false, st.encrypt = false, st.closedCaptions = true, st.title = "Captioned";
+        QVERIFY2(exportDcp(p, s, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+        QVERIFY2(QString::fromStdString(r.name).startsWith("Captioned_FTR_F_EN-XX-CCAP_XX_51_2K_"), r.name.c_str());
+        // It checks out; Bv2.1 advises captions from 4 seconds in and 15 frames long at least.
+        std::vector<std::string> advice;
+        issues = verifyDcp(r.folder, {}, &advice);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        auto advised = [&](const char* what) { return std::any_of(advice.begin(), advice.end(), [&](const std::string& a) { return a.find(what) != std::string::npos; }); };
+        QVERIFY(advised("first 4 seconds") && advised("15 frames"));
+        if (!python.isEmpty()) {
+            const QString report = clairMeta(r.folder, {});
+            QVERIFY2(report.isEmpty(), qPrintable(report));
+        }
+        QFile captioned(QString::fromStdString(r.cpl));
+        QVERIFY(captioned.open(QIODevice::ReadOnly));
+        const QString ccpl = QString::fromUtf8(captioned.readAll());
+        QVERIFY(ccpl.contains("tt:ClosedCaption") && ccpl.contains("<tt:Language>fr</tt:Language>") && !ccpl.contains("MainSubtitleLanguageList"));
+        // Burned in: lower case in the name.
+        st.closedCaptions = false, st.burnIn = true, st.subtitleLanguage = "fr";
+        QVERIFY(dcpName(st, 6, "20261017").find("_EN-fr_") != std::string::npos);
+    }
+
+    void exportsDigitalCinemaPackage4k() {
+        if (!openJpegAvailable()) QSKIP("This build has no OpenJPEG");
+        QTemporaryDir dir;
+        // A second of grey as a 4K Flat DCP: 3996 x 2160 in the DCI 4K profile (six tile parts, one progression change).
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = Rational{24, 1};
+        s.videoTracks[0].clips.push_back(colorClip(p, 0.5f, 0.5f, 0.5f, 0, 24));
+        DcpSettings st;
+        st.title = "Big";
+        st.resolution = "4k";
+        st.threads = 4;
+        DcpResult r;
+        std::string err;
+        QVERIFY2(exportDcp(p, s, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+        QVERIFY(r.width == 3996 && r.height == 2160 && r.cinemaProfile);
+        QVERIFY2(QString::fromStdString(r.name).contains("_51_4K_"), r.name.c_str());
+        const std::vector<std::string> issues = verifyDcp(r.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        const QDir out(QString::fromStdString(r.folder));
+        const QStringList pictures = out.entryList({"j2c_*.mxf"});
+        QCOMPARE(pictures.size(), 1);
+        std::vector<uint16_t> xyz;
+        int w = 0, h = 0;
+        QVERIFY2(readDcpFrame(out.filePath(pictures[0]).toStdString(), 0, xyz, w, h, &err), err.c_str());
+        QVERIFY(w == 3996 && h == 2160);
+        if (const QString python = qEnvironmentVariable("MONTAGE_TEST_CLAIRMETA"); !python.isEmpty()) {
+            QProcess cm;
+            cm.start(python, {"-m", "clairmeta.cli", "check", "-type", "dcp", QString::fromStdString(r.folder)});
+            QVERIFY(cm.waitForFinished(600000));
+            QVERIFY2(cm.exitCode() == 0, qPrintable(QString::fromUtf8(cm.readAllStandardOutput() + cm.readAllStandardError())));
+        }
+    }
+
+    void dcpTrackFiles() {
+        // Stereoscopic, timed text and encrypted track files, read back as servers read them (and by asdcplib's tools
+        // when MONTAGE_TEST_ASDCP names the folder they are in).
+        if (!openJpegAvailable()) QSKIP("This build has no OpenJPEG");
+        QTemporaryDir dir;
+        auto codestream = [](uint16_t level) {
+            std::vector<uint16_t> grey(size_t(64) * 32 * 3, level);
+            std::vector<uint8_t> out;
+            std::string err;
+            encodeJpeg2000(grey.data(), 64, 32, 12, 0, 1 << 20, out, &err);
+            return out;
+        };
+        const std::vector<uint8_t> left = codestream(1000), right = codestream(3000);
+        QVERIFY(!left.empty() && left != right);
+        dcp::TrackEncryption key;
+        QVERIFY(dcp::randomBytes(key.key.data(), 16));
+        key.keyId = dcp::newUuid();
+        std::string err;
+        for (bool encrypted : {false, true}) {
+            const QString file = dir.filePath(encrypted ? "stereo-encrypted.mxf" : "stereo.mxf");
+            dcp::PictureMxfWriter w;
+            if (encrypted) w.encryptWith(key);
+            QVERIFY(w.open(file.toStdString(), dcp::newUuid(), 24, true, &err));
+            QVERIFY(!w.write(left.data(), left.size(), &err));
+            for (int k = 0; k < 3; ++k) QVERIFY2(w.writeStereo(left.data(), left.size(), right.data(), right.size(), &err), err.c_str());
+            QVERIFY2(w.close(&err), err.c_str());
+            dcp::TrackFileReader r;
+            QVERIFY2(r.open(file.toStdString(), &err), err.c_str());
+            QVERIFY(r.stereo() && r.editUnits() == 3 && r.containerDuration() == 3 && r.editRate().num == 24 && r.encrypted() == encrypted);
+            QVERIFY(r.asset() == w.asset());
+            std::vector<uint8_t> got;
+            const uint8_t* k = encrypted ? key.key.data() : nullptr;
+            QVERIFY2(r.read(1, 1, got, k, &err), err.c_str());
+            QVERIFY(got == right);
+            QVERIFY2(r.read(2, 0, got, k, &err), err.c_str());
+            QVERIFY(got == left);
+            QVERIFY(r.largestEditUnit() >= left.size() + right.size());
+            if (!encrypted) continue;
+            QVERIFY(r.hmac() && r.keyId() == key.keyId);
+            QVERIFY(!r.read(0, 0, got, nullptr, &err) && err.find("key") != std::string::npos);
+            dcp::TrackEncryption other;
+            other.key[0] = 1;
+            QVERIFY(!r.read(0, 0, got, other.key.data(), &err));
+            // A changed byte in the last frame's right eye fails its check value.
+            QFile f(file);
+            QVERIFY(f.open(QIODevice::ReadWrite));
+            QByteArray all = f.readAll();
+            const int last = all.lastIndexOf(QByteArray::fromHex("060e2b34020401010d010301027e0100"));
+            QVERIFY(last > 0);
+            all[last + 130] = char(all[last + 130] ^ 0x40);
+            f.seek(0);
+            f.write(all);
+            f.close();
+            QVERIFY(r.read(2, 0, got, key.key.data(), &err));
+            QVERIFY(!r.read(2, 1, got, key.key.data(), &err) && err.find("check value") != std::string::npos);
+        }
+        // Encrypted sound: a constant size to each frame (the index is by bytes per frame).
+        {
+            const QString file = dir.filePath("sound-encrypted.mxf");
+            dcp::SoundMxfWriter w;
+            w.encryptWith(key);
+            QVERIFY(w.open(file.toStdString(), dcp::newUuid(), 24, 6, "en", &err));
+            std::vector<float> samples(size_t(w.samplesPerFrame()) * 6, 0.0f);
+            for (int k = 0; k < 3; ++k) {
+                samples[0] = float(k) / 4;
+                QVERIFY(w.write(samples.data(), &err));
+            }
+            QVERIFY(w.close(&err));
+            dcp::TrackFileReader r;
+            QVERIFY2(r.open(file.toStdString(), &err), err.c_str());
+            QVERIFY(r.encrypted() && r.editUnits() == 3);
+            std::vector<uint8_t> got;
+            QVERIFY2(r.read(2, 0, got, key.key.data(), &err), err.c_str());
+            QCOMPARE(got.size(), size_t(2000 * 6 * 3));
+            QCOMPARE(int(int8_t(got[2])), int(std::lround(0.5 * 8388607.0)) >> 16);
+        }
+        // Timed text: the XML in the body, the font in a generic stream of its own.
+        const std::string xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<SubtitleReel xmlns=\"http://www.smpte-ra.org/schemas/428-7/2014/DCST\">"
+                                "<Id>urn:uuid:" + dcp::uuidString(dcp::newUuid()) + "</Id></SubtitleReel>\n";
+        dcp::TimedTextResource font;
+        font.id = dcp::newUuid();
+        font.mime = "application/x-font-opentype";
+        font.data.assign(5000, 7);
+        for (bool encrypted : {false, true}) {
+            const QString file = dir.filePath(encrypted ? "subtitles-encrypted.mxf" : "subtitles.mxf");
+            dcp::TimedTextMxfWriter w;
+            if (encrypted) w.encryptWith(key);
+            QVERIFY(w.open(file.toStdString(), dcp::newUuid(), 24, &err));
+            QVERIFY2(w.write(xml, dcp::newUuid(), 96, "en", {font}, &err), err.c_str());
+            QVERIFY2(w.close(&err), err.c_str());
+            dcp::TrackFileReader r;
+            QVERIFY2(r.open(file.toStdString(), &err), err.c_str());
+            QVERIFY(r.timedText() && r.containerDuration() == 96 && r.editUnits() == 1 && r.encrypted() == encrypted);
+            QVERIFY(r.resources().size() == 1 && r.resources()[0].first == font.id && r.resources()[0].second == 10);
+            std::vector<uint8_t> got;
+            const uint8_t* k = encrypted ? key.key.data() : nullptr;
+            QVERIFY2(r.read(0, 0, got, k, &err), err.c_str());
+            QCOMPARE(std::string(got.begin(), got.end()), xml);
+            QVERIFY2(r.readStream(10, got, k, &err), err.c_str());
+            QVERIFY(got == font.data);
+        }
+        // Damaged files (cut short anywhere, or bytes overwritten with 0xff, which reads as the longest lengths) are
+        // refused or read as far as they go, never read past.
+        for (const char* name : {"stereo-encrypted.mxf", "subtitles-encrypted.mxf", "sound-encrypted.mxf"}) {
+            QFile f(dir.filePath(name));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QByteArray whole = f.readAll();
+            f.close();
+            QRandomGenerator rng(7);
+            for (int trial = 0; trial < 60; ++trial) {
+                QByteArray bad = whole;
+                if (trial < 20) {
+                    bad.truncate(qsizetype(rng.bounded(quint32(whole.size()))));
+                } else {
+                    const qsizetype at = qsizetype(rng.bounded(quint32(whole.size() - 8)));
+                    for (int b = 0; b < 8; ++b) bad[at + b] = char(trial % 2 ? 0xff : rng.bounded(256));
+                }
+                const QString path = dir.filePath("damaged.mxf");
+                QFile out(path);
+                QVERIFY(out.open(QIODevice::WriteOnly | QIODevice::Truncate));
+                out.write(bad);
+                out.close();
+                dcp::TrackFileReader r;
+                if (!r.open(path.toStdString(), &err)) continue;
+                std::vector<uint8_t> got;
+                for (int64_t i = 0; i < std::min<int64_t>(r.editUnits(), 4); ++i)
+                    for (int eye = 0; eye < (r.stereo() ? 2 : 1); ++eye) r.read(i, eye, got, key.key.data(), &err);
+                for (uint32_t sid : r.streams()) r.readStream(sid, got, key.key.data(), &err);
+            }
+        }
+        // asdcplib reads them all back, decrypting and checking each element's MIC.
+        const QString tools = qEnvironmentVariable("MONTAGE_TEST_ASDCP");
+        if (tools.isEmpty()) return;
+        const QString hexKey = QString::fromLatin1(QByteArray(reinterpret_cast<const char*>(key.key.data()), 16).toHex());
+        auto run = [&](const QString& tool, const QStringList& args) {
+            QProcess p;
+            p.start(QDir(tools).filePath(tool), args);
+            p.waitForFinished(60000);
+            return std::make_pair(p.exitCode(), QString::fromUtf8(p.readAllStandardOutput() + p.readAllStandardError()));
+        };
+        for (const char* name : {"stereo.mxf", "subtitles.mxf", "subtitles-encrypted.mxf", "sound-encrypted.mxf"}) {
+            const auto [code, text] = run("asdcp-info", {"-i", dir.filePath(name)});
+            QVERIFY2(code == 0, qPrintable(QString::fromLatin1(name) + ": " + text));
+            QVERIFY2(text.contains("EncryptedEssence: ") && text.contains(QString(name).contains("encrypted") ? "EncryptedEssence: Yes" : "EncryptedEssence: No"), qPrintable(text));
+        }
+        QVERIFY(QDir(dir.path()).mkpath("out"));
+        const auto [code, text] = run("asdcp-unwrap", {"-3", "-m", "-k", hexKey, dir.filePath("stereo-encrypted.mxf"), dir.filePath("out/eye_")});
+        // The last frame's right eye was changed above: the first two frames come out, then its MIC fails.
+        QVERIFY2(code != 0 && text.contains("HMAC"), qPrintable(text));
+        QFile l(dir.filePath("out/eye_000001L.j2c")), r(dir.filePath("out/eye_000001R.j2c"));
+        QVERIFY2(l.open(QIODevice::ReadOnly) && r.open(QIODevice::ReadOnly), qPrintable(text));
+        QVERIFY(l.readAll() == QByteArray(reinterpret_cast<const char*>(left.data()), qsizetype(left.size())));
+        QVERIFY(r.readAll() == QByteArray(reinterpret_cast<const char*>(right.data()), qsizetype(right.size())));
+        const auto [code2, text2] = run("asdcp-unwrap", {"-m", "-k", hexKey, dir.filePath("subtitles-encrypted.mxf"), dir.filePath("out/subs.xml")});
+        QVERIFY2(code2 == 0, qPrintable(text2));
+        QFile x(dir.filePath("out/subs.xml"));
+        QVERIFY(x.open(QIODevice::ReadOnly) && x.readAll().toStdString() == xml);
+        QFile fontOut(dir.filePath("out/" + QString::fromStdString(dcp::uuidString(font.id))));
+        QVERIFY(fontOut.open(QIODevice::ReadOnly) && fontOut.readAll() == QByteArray(5000, 7));
+        const auto [code3, text3] = run("asdcp-unwrap", {"-m", "-k", hexKey, dir.filePath("sound-encrypted.mxf"), dir.filePath("out/sound")});
+        QVERIFY2(code3 == 0, qPrintable(text3));
+    }
+
+    void dcpSecurity() {
+        // Canonical XML matches what lxml writes for the same document.
+        const std::string doc =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!-- top -->\n"
+            "<doc xmlns=\"http://a/\" xmlns:b=\"http://b/\" xmlns:u=\"http://unused/\">\n"
+            "  <e1   attr2=\"2\" b:attr=\"x\" attr1=\"1\"/>\n"
+            "  <e2 Id=\"ID_x\"><b:c>t &amp; &lt; &gt; \"q\"&#13;</b:c><!-- c --></e2>\n"
+            "  <e3 xmlns=\"\" a=\"&#9;&#10;'\"/>\n</doc>\n";
+        const std::string body =
+            "<doc xmlns=\"http://a/\" xmlns:b=\"http://b/\" xmlns:u=\"http://unused/\">\n"
+            "  <e1 attr1=\"1\" attr2=\"2\" b:attr=\"x\"></e1>\n"
+            "  <e2 Id=\"ID_x\"><b:c>t &amp; &lt; &gt; \"q\"&#xD;</b:c>@</e2>\n"
+            "  <e3 xmlns=\"\" a=\"&#x9;&#xA;'\"></e3>\n</doc>";
+        auto with = [](std::string s, const std::string& comment) { return s.replace(s.find('@'), 1, comment); };
+        QCOMPARE(canonicalXml(doc), with(body, ""));
+        CanonicalOptions o;
+        o.comments = true;
+        QCOMPARE(canonicalXml(doc, o), "<!-- top -->\n" + with(body, "<!-- c -->"));
+        o.id = "ID_x";
+        QCOMPARE(canonicalXml(doc, o), std::string("<e2 xmlns=\"http://a/\" xmlns:b=\"http://b/\" xmlns:u=\"http://unused/\" Id=\"ID_x\">"
+                                                   "<b:c>t &amp; &lt; &gt; \"q\"&#xD;</b:c><!-- c --></e2>"));
+        o.exclusive = true, o.comments = false;
+        QCOMPARE(canonicalXml(doc, o), std::string("<e2 xmlns=\"http://a/\" Id=\"ID_x\"><b:c xmlns:b=\"http://b/\">t &amp; &lt; &gt; \"q\"&#xD;</b:c></e2>"));
+        std::string err;
+        o.id = "ID_y";
+        QVERIFY(canonicalXml(doc, o, &err).empty() && err.find("ID_y") != std::string::npos);
+        // Characters past U+FFFF (a clapper board, a rare ideograph) stay one UTF-8 character each.
+        QCOMPARE(canonicalXml("<a t=\"\xF0\x9F\x8E\xAC&amp;\">\xF0\x9F\x8E\xAC x \xF0\xA0\x80\x80</a>"),
+                 std::string("<a t=\"\xF0\x9F\x8E\xAC&amp;\">\xF0\x9F\x8E\xAC x \xF0\xA0\x80\x80</a>"));
+        QCOMPARE(dcp::kdmTime(0, 60), std::string("1970-01-01T01:00:00+01:00"));
+        QCOMPARE(dcp::kdmTime(86400, -330), std::string("1970-01-01T18:30:00-05:30"));
+        if (!dcp::securityAvailable()) QSKIP("This build has no OpenSSL");
+
+        // The signer's chain: made once in its folder, then read back.
+        QTemporaryDir dir;
+        const std::string folder = dir.filePath("signer").toStdString();
+        dcp::CertificateChain chain, again;
+        QVERIFY2(dcp::signerCertificateChain(chain, &err, folder), err.c_str());
+        QVERIFY(chain.certificates.size() == 3 && !chain.privateKey.empty());
+        QVERIFY2(dcp::signerCertificateChain(again, &err, folder), err.c_str());
+        QVERIFY(again.certificates == chain.certificates && again.privateKey == chain.privateKey);
+#ifndef _WIN32
+        QCOMPARE(QFile::permissions(QDir(QString::fromStdString(folder)).filePath("leaf.key")) & 0x0077, QFileDevice::Permissions());
+#endif
+        // A chain with a file missing is reported, not replaced (the DKDMs are encrypted to its leaf).
+        QVERIFY(QFile::rename(QDir(QString::fromStdString(folder)).filePath("root.pem"), dir.filePath("root.pem")));
+        QVERIFY(!dcp::signerCertificateChain(again, &err, folder) && err.find("incomplete") != std::string::npos);
+        {
+            QFile key(QDir(QString::fromStdString(folder)).filePath("leaf.key"));
+            QVERIFY(key.open(QIODevice::ReadOnly) && key.readAll().toStdString() == chain.privateKey);
+        }
+        QVERIFY(QFile::rename(dir.filePath("root.pem"), QDir(QString::fromStdString(folder)).filePath("root.pem")));
+        dcp::CertificateInfo root, middle, leaf;
+        QVERIFY(dcp::readCertificate(chain.certificates[0], root) && dcp::readCertificate(chain.certificates[1], middle) &&
+                dcp::readCertificate(chain.certificates[2], leaf));
+        QVERIFY(root.ca && middle.ca && !leaf.ca && leaf.bits == 2048);
+        QVERIFY(root.subject == root.issuer && middle.issuer == root.subject && leaf.issuer == middle.subject);
+        QVERIFY(root.commonName.rfind(".", 0) == 0 && leaf.commonName.rfind("CS.", 0) == 0);
+        QVERIFY(leaf.dnQualifier.size() == 28 && leaf.dnQualifier != root.dnQualifier && leaf.thumbprint.size() == 28);
+        QVERIFY(leaf.notBefore < leaf.notAfter && leaf.notAfter <= middle.notAfter && middle.notAfter <= root.notAfter);
+        QCOMPARE(dcp::splitCertificates(chain.certificates[0] + chain.certificates[1] + chain.certificates[2]).size(), size_t(3));
+
+        // A signed composition checks, and stops checking once changed.
+        std::string cpl = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                          "<CompositionPlaylist xmlns=\"http://www.smpte-ra.org/schemas/429-7/2006/CPL\">\n"
+                          "  <Id>urn:uuid:" + dcp::uuidString(dcp::newUuid()) + "</Id>\n"
+                          "  <ContentTitleText>Test &amp; film</ContentTitleText>\n</CompositionPlaylist>\n";
+        QVERIFY2(dcp::signXml(cpl, chain, &err), err.c_str());
+        QVERIFY(cpl.find("<Signer") < cpl.find("<dsig:Signature") && cpl.find("</CompositionPlaylist>") > cpl.find("</dsig:Signature>"));
+        QVERIFY2(dcp::verifyXmlSignature(cpl, &err), err.c_str());
+        std::string changed = cpl;
+        changed.replace(changed.find("Test &amp; film"), 15, "Test &amp; filn");
+        QVERIFY(!dcp::verifyXmlSignature(changed, &err) && err.find("changed") != std::string::npos);
+        dcp::SignatureCheck check;
+        QVERIFY(dcp::verifyXmlSignature(cpl, &err, &check) && check.references == std::vector<std::string>{""} && check.signerThumbprint == leaf.thumbprint);
+        // An emoji in the title: its digest is the one any checker computes from the UTF-8 (ClairMeta's own C14N in
+        // exportsEncryptedStereoDcpWithSubtitles; here, that a change to it is seen).
+        std::string emoji = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompositionPlaylist xmlns=\"http://www.smpte-ra.org/schemas/429-7/2006/CPL\">\n"
+                "  <ContentTitleText>Film \xF0\x9F\x8E\xAC</ContentTitleText>\n</CompositionPlaylist>\n";
+        QVERIFY2(dcp::signXml(emoji, chain, &err), err.c_str());
+        QVERIFY2(dcp::verifyXmlSignature(emoji, &err), err.c_str());
+        changed = emoji;
+        changed.replace(changed.find("\xF0\x9F\x8E\xAC"), 4, "\xF0\x9F\x8E\xAD");
+        QVERIFY(!dcp::verifyXmlSignature(changed, &err));
+
+        // A KDM with two keys to a cinema's certificate opens with its key only.
+        dcp::CertificateChain cinema;
+        QVERIFY2(dcp::makeCertificateChain("Test Cinema", cinema, &err), err.c_str());
+        dcp::KdmSettings k;
+        k.cplId = dcp::uuidString(dcp::newUuid());
+        k.contentTitle = "Test & film";
+        k.annotation = "For the test cinema";
+        const int64_t now = QDateTime::currentSecsSinceEpoch();
+        k.notValidBefore = dcp::kdmTime(now);
+        k.notValidAfter = dcp::kdmTime(now + 7 * 86400, 60);
+        k.keys = {dcp::newContentKey("MDIK"), dcp::newContentKey("MDAK")};
+        QVERIFY(k.keys[0].id != k.keys[1].id && k.keys[0].key != k.keys[1].key);
+        k.recipient = cinema.certificates.back();
+        std::string kdm;
+        QVERIFY2(dcp::makeKdm(k, chain, kdm, &err), err.c_str());
+        dcp::KdmContents c;
+        QVERIFY2(dcp::readKdm(kdm, cinema.privateKey, c, &err), err.c_str());
+        QCOMPARE(c.cplId, k.cplId);
+        QCOMPARE(c.contentTitle, k.contentTitle);
+        QCOMPARE(c.annotation, k.annotation);
+        QVERIFY(c.notValidBefore == k.notValidBefore && c.notValidAfter == k.notValidAfter);
+        dcp::CertificateInfo server;
+        QVERIFY(dcp::readCertificate(cinema.certificates.back(), server));
+        QVERIFY(c.recipientSubject == server.subject && c.recipientIssuer == server.issuer && c.recipientSerial == server.serial);
+        QCOMPARE(c.keys.size(), size_t(2));
+        for (size_t i = 0; i < 2; ++i)
+            QVERIFY(c.keys[i].id == k.keys[i].id && c.keys[i].key == k.keys[i].key && c.keys[i].type == k.keys[i].type);
+        QVERIFY(!dcp::readKdm(kdm, chain.privateKey, c, &err));
+        dcp::KdmContents ids;
+        QVERIFY(dcp::readKdm(kdm, {}, ids) && ids.keys.size() == 2 && ids.keys[1].id == k.keys[1].id);
+        std::string forged = kdm;
+        forged.replace(forged.find("For the test cinema"), 3, "Not");
+        QVERIFY(!dcp::readKdm(forged, cinema.privateKey, c, &err));
+        // A window put outside the signed parts is not read (the signature still holds; the window is the signed one).
+        forged = kdm;
+        forged.insert(forged.rfind("</"), "<ContentKeysNotValidAfter>2099-01-01T00:00:00+00:00</ContentKeysNotValidAfter>");
+        QVERIFY2(dcp::readKdm(forged, cinema.privateKey, c, &err), err.c_str());
+        QCOMPARE(c.notValidAfter, k.notValidAfter);
+        QVERIFY(dcp::readKdm(kdm, {}, c, &err) && c.signerThumbprint == leaf.thumbprint);
+        k.notValidAfter = "tomorrow";
+        QVERIFY(!dcp::makeKdm(k, chain, kdm, &err));
+
+        // The track file primitives: AES-128-CBC both ways, and HMAC-SHA1 (RFC 2202, case 1).
+        uint8_t key[16], iv[16], plain[64], cipher[64], back[64];
+        QVERIFY(dcp::randomBytes(key, 16) && dcp::randomBytes(iv, 16) && dcp::randomBytes(plain, 64));
+        QVERIFY(dcp::aesCbcEncrypt(key, iv, plain, 64, cipher) && std::memcmp(plain, cipher, 64) != 0);
+        QVERIFY(dcp::aesCbcDecrypt(key, iv, cipher, 64, back) && std::memcmp(plain, back, 64) == 0);
+        QVERIFY(!dcp::aesCbcEncrypt(key, iv, plain, 63, cipher));
+        uint8_t hkey[20], mac[20];
+        std::memset(hkey, 0x0b, 20);
+        QVERIFY(dcp::hmacSha1(hkey, 20, reinterpret_cast<const uint8_t*>("Hi There"), 8, mac));
+        QCOMPARE(QByteArray(reinterpret_cast<char*>(mac), 20).toHex(), QByteArray("b617318655057264e28bc0b6fb378c8ef146be00"));
+        if (const QByteArray keep = qgetenv("MONTAGE_TEST_KEEP_DCP_SECURITY"); !keep.isEmpty()) {
+            auto save = [&](const char* name, const std::string& text) {
+                QFile f(QDir(QString::fromUtf8(keep)).filePath(QString::fromLatin1(name)));
+                if (f.open(QIODevice::WriteOnly)) f.write(text.data(), qint64(text.size()));
+            };
+            save("cpl.xml", cpl);
+            save("kdm.xml", kdm);
+            save("cinema.key", cinema.privateKey);
+        }
+    }
+
     void lutExport() {
         Project p = makeDefaultProject();
         QTemporaryDir dir;
@@ -7059,6 +7608,18 @@ colorspaces:
         QVERIFY2(c[0] < 0.25f && c[1] < 0.35f && c[2] > 0.55f, qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
         rgb(frame, 160, 130, c);  // (the scene's (160, 170): ground)
         QVERIFY2(c[1] > c[2], qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
+        // A mask over the left half of the clip's frame: the sky replaced there only, wherever the picture is (here half
+        // off the canvas's right edge, from x 230: its frame's middle is at 310).
+        e.params["mask.shape"] = 2.0, e.params["mask.x"] = 0.25, e.params["mask.w"] = 0.5, e.params["mask.y"] = 0.5;
+        e.params["mask.h"] = 1.0, e.params["mask.feather"] = 0.0;
+        shot->motion.params["pos_x"] = 150.0;
+        frame = renderProgramFrame(p, s, 5, o);
+        rgb(frame, 300, 50, c);  // (the scene's (140, 10), in the mask)
+        QVERIFY2(c[0] < 0.25f && c[1] < 0.35f && c[2] > 0.55f, qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
+        rgb(frame, 318, 50, c);  // (the scene's (176, 10), outside it: the old sky)
+        QVERIFY2(c[0] > 0.28f && c[2] > 0.8f, qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
+        e.params["mask.shape"] = 0.0;
+        shot->motion.params["pos_x"] = 0.0;
         shot->motion.params["scale"] = 100.0;
         // Dissolving into the shot: the new sky is there through the transition.
         e.params["source"] = 0.0;

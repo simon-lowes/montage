@@ -49,6 +49,7 @@
 #include "core/Surround.h"
 #include "core/Transcript.h"
 #include "core/TranscriptEdit.h"
+#include "audio/DialogueAlign.h"
 #include "audio/RoomResponse.h"
 #include "audio/SpeechCleanup.h"
 #include "audio/TimeStretch.h"
@@ -80,6 +81,7 @@
 #include "render/BroadcastMxf.h"
 #include "render/OGraf.h"
 #include "render/Restoration.h"
+#include "render/ConformCheck.h"
 #include "media/Vector.h"
 #include "media/Beats.h"
 #include "render/Spherical.h"
@@ -4551,7 +4553,11 @@ private slots:
                                       "while true do end", "string.rep('x', 1 << 30)", "('x'):rep(1 << 30)", "\"text\"", "1 / 0",
                                       "param(\"Nobody\", \"pos_x\")", "param(1.5, \"pos_x\")", "pcall(function() while true do end end)",
                                       "('x'):find(string.rep and 'x' or '(.-)*$')", "getmetatable('').__index", "string.upper = nil",
-                                      "math.pi = 3", "table.move({}, 1, 1 << 40, 2)"}) {
+                                      "math.pi = 3", "table.move({}, 1, 1 << 40, 2)", "table.unpack({1})", "('a'):byte()",
+                                      "wiggle(1 / 0, 1)", "wiggle(1e300, 1)",
+                                      // (a string of up to a megabyte: copying it again and again counts as time)
+                                      "local s = 'x' for i = 1, 24 do s = s .. s end return #s",
+                                      "local s = 'x' for i = 1, 19 do s = s .. s end local n = 0 for i = 1, 1e9 do n = n + #s:upper() end return n"}) {
             follower.motion.params["rotation"].expr = bad;
             QCOMPARE(at(follower, "rotation", 3), 12.0);
             QVERIFY2(!failure().empty(), bad.c_str());
@@ -13275,6 +13281,13 @@ if ui["pressed"] == "add":
         QVERIFY(peak > 0.1f && peak <= 1.0f);
         QVERIFY(synthesizeSpeech("Hello and welcome to Montage.", "bm_george", 0.7, slow, &err));
         QVERIFY(slow.size() > audio.size() * 1.2);
+        // (Slow speech once came out of the half-precision model as NaN throughout.)
+        float slowPeak = 0;
+        for (float v : slow) {
+            QVERIFY(std::isfinite(v));
+            slowPeak = std::max(slowPeak, std::abs(v));
+        }
+        QVERIFY(slowPeak > 0.1f);
         QVERIFY(!synthesizeSpeech("Hello", "nobody", 1, audio, &err));
         const std::string wav = path("tts.wav");
         QVERIFY(synthesizeSpeech("Hello and welcome to Montage.", "af_heart", 1.0, audio, &err));
@@ -22683,6 +22696,390 @@ private slots:
         }
     }
 
+    void conformCheck() {
+        // Two takes of a scene, each a camera panning over fine detail (3 pixels across, 1 down a frame). The offline
+        // cut: take A reframed (112 %, 1.5°, moved 40 right and 20 up), take A graded, then take B; its reference
+        // movie carries burnt-in timecode. Then a push across take A (flipped), and a last shot of take B. Take B is
+        // twice the size, and the second shot cropped. The conformed sequence
+        // lost the reframe and the push, is 3 frames early on the second shot, has take A for the third and leaves out
+        // the last.
+        const int W = 480, H = 270, frames = 110;
+        auto hash = [](uint32_t seed, int x, int y) {
+            uint32_t h = seed * 374761393u + uint32_t(x) * 668265263u + uint32_t(y) * 2246822519u;
+            h = (h ^ (h >> 13)) * 1274126177u;
+            return double(h ^ (h >> 16)) / 4294967295.0;
+        };
+        auto noise = [&](uint32_t seed, double x, double y, double cell) {
+            const double fx = x / cell, fy = y / cell;
+            const int ix = int(std::floor(fx)), iy = int(std::floor(fy));
+            const double u = fx - ix, v = fy - iy, su = u * u * (3 - 2 * u), sv = v * v * (3 - 2 * v);
+            return (hash(seed, ix, iy) * (1 - su) + hash(seed, ix + 1, iy) * su) * (1 - sv) +
+                   (hash(seed, ix, iy + 1) * (1 - su) + hash(seed, ix + 1, iy + 1) * su) * sv;
+        };
+        auto take = [&](uint32_t seed, int size) {  // (size: 2 is twice the sequence's width and height)
+            std::vector<QImage> out;
+            for (int f = 0; f < frames; ++f) {
+                QImage img(W * size, H * size, QImage::Format_RGB32);
+                for (int y = 0; y < H * size; ++y)
+                    for (int x = 0; x < W * size; ++x) {
+                        const double X = double(x) / size + 3 * f, Y = double(y) / size + f;
+                        const double l = 0.5 * noise(seed, X, Y, 26) + 0.32 * noise(seed + 1, X, Y, 9) + 0.18 * noise(seed + 2, X, Y, 4);
+                        const double c = noise(seed + 3, X, Y, 60) - 0.5;
+                        const int v = std::clamp(int(std::lround(255 * l)), 0, 255);
+                        img.setPixel(x, y, qRgb(std::clamp(int(v + 60 * c), 0, 255), v, std::clamp(int(v - 60 * c), 0, 255)));
+                    }
+                out.push_back(img);
+            }
+            return out;
+        };
+        const std::string takeA = path("conform-take-a.mp4"), takeB = path("conform-take-b.mp4");
+        writeFrames(takeA, take(11, 1), 25);
+        writeFrames(takeB, take(29, 2), 25);  // (shot on a bigger camera)
+        auto build = [&](Project& p) {
+            Sequence& s = *p.active();
+            s.width = W, s.height = H, s.fps = {25, 1};
+            for (const std::string& f : {takeA, takeB}) {
+                MediaItem m = probeOrFail(p, f);
+                m.metadata["scene"] = "12";
+                p.media.push_back(m);
+            }
+        };
+        auto place = [&](Project& p, int media, FrameTime at, double sourceIn) -> Clip& {
+            Sequence& s = *p.active();
+            Clip c = makeClip(p, p.media[size_t(media)], TrackKind::Video, s);
+            c.start = at, c.sourceIn = sourceIn, c.duration = 25;
+            const bool placed = edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok;
+            if (!placed) qWarning("could not place a clip at %lld", (long long)at);
+            for (Clip& on : s.videoTracks[0].clips)
+                if (on.start == at) return on;
+            return s.videoTracks[0].clips.back();
+        };
+        std::string err;
+        Project off = makeDefaultProject();
+        build(off);
+        {
+            Clip& reframed = place(off, 0, 0, 10);
+            reframed.motion.params["scale"] = Param(112.0);
+            reframed.motion.params["rotation"] = Param(1.5);
+            reframed.motion.params["pos_x"] = Param(40.0);
+            reframed.motion.params["pos_y"] = Param(-20.0);
+            Clip& graded = place(off, 0, 25, 50);
+            graded.motion.params["crop_left"] = Param(15.0);
+            Effect cdl = makeEffect(off, "cdl");
+            for (const char* ch : {"r", "g", "b"}) {
+                cdl.params[std::string("slope.") + ch] = Param(1.35);
+                cdl.params[std::string("offset.") + ch] = Param(-0.06);
+            }
+            cdl.params["saturation"] = Param(0.7);
+            graded.effects.push_back(cdl);
+            place(off, 1, 50, 20);
+            // A push across: moved 60 pixels right over the shot.
+            Clip& pushed = place(off, 0, 75, 80);
+            pushed.motion.params["flip_h"] = Param(1.0);
+            pushed.motion.params["scale"] = Param(115.0);
+            pushed.motion.params["pos_x"].addKey(0, 0);
+            pushed.motion.params["pos_x"].addKey(24, 60);
+            place(off, 1, 100, 60);  // (left out of the conform)
+        }
+        ExportSettings st;
+        st.path = path("conform-reference.mp4");
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        st.burnIn.timecode = true;
+        st.burnIn.size = 0.07;
+        QVERIFY2(exportSequence(off, *off.active(), st, nullptr, nullptr, &err), err.c_str());
+
+        Project p = makeDefaultProject();
+        build(p);
+        p.media.push_back(probeOrFail(p, st.path));
+        const Id ref = p.media.back().id, idB = p.media[1].id;
+        place(p, 0, 0, 10);
+        place(p, 0, 25, 47).motion.params["crop_left"] = Param(15.0);  // (the crop and the flip came through the list)
+        place(p, 0, 50, 20);
+        place(p, 0, 75, 80).motion.params["flip_h"] = Param(1.0);
+        Sequence& s = *p.active();
+        QCOMPARE(s.videoTracks[0].clips.size(), size_t(4));
+        std::vector<ConformShot> shots = montage::conformCheck(p, s, ref, {}, {}, nullptr, &err);
+        QVERIFY2(shots.size() == 5, err.c_str());
+        for (const ConformShot& sh : shots) qInfo("%s: %s (%.3f)", conformVerdictName(sh.verdict), sh.details.c_str(), sh.score);
+        QCOMPARE(shots[0].verdict, ConformVerdict::Reframed);
+        QCOMPARE(shots[0].keys.size(), size_t(1));
+        const ConformKey& k = shots[0].keys[0];
+        QVERIFY2(std::fabs(k.posX - 40) < 0.5 && std::fabs(k.posY + 20) < 0.5, shots[0].details.c_str());
+        QVERIFY2(std::fabs(k.scale - 112) < 0.2 && std::fabs(k.rotation - 1.5) < 0.1, shots[0].details.c_str());
+        QCOMPARE(shots[1].verdict, ConformVerdict::Slipped);
+        QCOMPARE(shots[1].slip, FrameTime(3));
+        QCOMPARE(shots[2].verdict, ConformVerdict::OtherTake);
+        QCOMPARE(shots[2].media, idB);
+        QVERIFY2(std::fabs(shots[2].sourceIn - 20) < 0.5, std::to_string(shots[2].sourceIn).c_str());
+        // The push, keyed: a key every 12 frames and the last, each where the offline Transform had it.
+        QCOMPARE(shots[3].verdict, ConformVerdict::Reframed);
+        QCOMPARE(shots[3].keys.size(), size_t(3));
+        for (const ConformKey& kf : shots[3].keys) {
+            const double x = 60.0 * double(kf.at) / 24;
+            QVERIFY2(std::fabs(kf.posX - x) < 0.6 && std::fabs(kf.posY) < 0.6 && std::fabs(kf.scale - 115) < 0.3 && std::fabs(kf.rotation) < 0.1,
+                     shots[3].details.c_str());
+        }
+        // The last shot left out: missing.
+        QCOMPARE(shots[4].verdict, ConformVerdict::Missing);
+        QVERIFY(shots[4].clip == 0 && shots[4].start == 100 && shots[4].length == 25);
+        QVERIFY(!shots[4].fixable());
+        // Put right by the MCP tool (a marker on each shot first), every shot matches.
+        const QString project = QString::fromStdString(path("conform.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_conform_check"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"reference", QString::fromStdString(st.path)},
+                                                                               {"apply", true}, {"markers", true}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject out = r.value("structuredContent").toObject();
+        QCOMPARE(out.value("fixed").toInt(), 4);
+        QCOMPARE(out.value("markers").toInt(), 5);
+        const QJsonArray listed = out.value("shots").toArray();
+        QCOMPARE(listed.size(), 5);
+        QCOMPARE(listed[1].toObject().value("verdict").toString(), QString("slipped"));
+        QCOMPARE(listed[1].toObject().value("slip").toInt(), 3);
+        QCOMPARE(listed[2].toObject().value("verdict").toString(), QString("other_take"));
+        QCOMPARE(listed[2].toObject().value("media").toString(), QString("conform-take-b.mp4"));
+        QCOMPARE(listed[3].toObject().value("transform").toArray().size(), 3);
+        QVERIFY(loadProject(project.toStdString(), p));
+        Sequence& fixedSeq = *p.active();
+        QCOMPARE(fixedSeq.markers.size(), size_t(5));
+        QCOMPARE(fixedSeq.videoTracks[0].clips[2].mediaId, idB);
+        shots = montage::conformCheck(p, fixedSeq, ref, {}, {}, nullptr, &err);
+        QCOMPARE(shots.size(), size_t(5));
+        shots.pop_back();  // (still missing)
+        for (const ConformShot& sh : shots)
+            QVERIFY2(sh.verdict == ConformVerdict::Matches, (std::string(conformVerdictName(sh.verdict)) + " " + sh.details).c_str());
+        QVERIFY(!applyConformFix(p, fixedSeq, shots[0]));
+        // A reference that is not there.
+        err.clear();
+        QVERIFY(montage::conformCheck(p, fixedSeq, 999999, {}, {}, nullptr, &err).empty());
+        QVERIFY(!err.empty());
+    }
+
+    void dialogueAlignment() {
+        // The warp as text, read back; between and beyond its points.
+        const DialogueWarp table = {{1, 1.5}, {2, 2.25}, {3, 3.25}};
+        QCOMPARE(dialogueWarpFromString(dialogueWarpToString(table)), table);
+        QCOMPARE(dialogueWarpFromString("1:1,0.5:2,x:3,2:1.5"), (DialogueWarp{{1, 1}, {2, 1.5}}));
+        QCOMPARE(dialogueWarpAt(table, 0), 0.5);
+        QCOMPARE(dialogueWarpAt(table, 1.5), 1.875);
+        QCOMPARE(dialogueWarpAt(table, 5), 5.25);
+        QCOMPARE(dialogueWarpInverse(table, 1.875), 1.5);
+
+        // An ADR take: the line said again, its timing changed by a known curve of up to 20 % either way (and its
+        // pitch kept), starting 0.3 s into its file.
+        constexpr int sr = 48000;
+        std::string err;
+        AudioBufferPtr jfk = decodeAudio(MONTAGE_TEST_DATA_DIR "/jfk.wav", sr, &err);
+        QVERIFY2(jfk, err.c_str());
+        std::vector<float> guide(size_t(jfk->frames()));
+        for (size_t i = 0; i < guide.size(); ++i)
+            guide[i] = 0.5f * (jfk->samples[i * size_t(jfk->channels)] + jfk->samples[i * size_t(jfk->channels) + (jfk->channels > 1 ? 1 : 0)]);
+        const double G = double(guide.size()) / sr, pad = 0.3;
+        const double breaks[] = {0, 2.2, 4.5, 6.8, 9.0, 1e9}, rates[] = {1.2, 0.8, 1.15, 0.85, 1.0};
+        auto takeTime = [&](double g) {  // where the guide's moment g is in the take (before its lead-in)
+            double t = 0;
+            for (int k = 0; k < 5 && g > breaks[k]; ++k) t += (std::min(g, breaks[k + 1]) - breaks[k]) * rates[k];
+            return t;
+        };
+        auto guideTime = [&](double t) {
+            double lo = 0, hi = 2 * G;
+            for (int i = 0; i < 60; ++i) (takeTime((lo + hi) / 2) < t ? lo : hi) = (lo + hi) / 2;
+            return (lo + hi) / 2;
+        };
+        AudioBuffer mono;
+        mono.sampleRate = sr, mono.channels = 1, mono.samples = guide;
+        const int hop = stretchHop(sr);
+        const int64_t said = int64_t(takeTime(G) * sr);
+        std::vector<double> positions;
+        for (int64_t k = 0; k <= said / hop + 2; ++k) positions.push_back(guideTime(double(k * hop) / sr) * sr);
+        AudioBuffer stretched;
+        wsolaStretch(mono, positions, hop, said, stretched);
+        std::vector<float> takeSound(size_t(pad * sr), 0.0f);
+        takeSound.insert(takeSound.end(), stretched.samples.begin(), stretched.samples.end());
+        takeSound.resize(takeSound.size() + sr / 2, 0.0f);
+        const std::string guidePath = path("align-guide.wav"), takePath = path("align-take.wav");
+        QVERIFY(writeMonoWav(guidePath, guide, sr));
+        QVERIFY(writeMonoWav(takePath, takeSound, sr));
+
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        s.sampleRate = sr;
+        while (s.audioTracks.size() < 3) edit::addTrack(p, s, TrackKind::Audio);
+        auto place = [&](const std::string& file, int track) {
+            MediaItem m = probeOrFail(p, file);
+            p.media.push_back(m);
+            Clip c = makeClip(p, p.media.back(), TrackKind::Audio, s);
+            c.start = 0;
+            const edit::Result r = edit::overwrite(p, s, {TrackKind::Audio, track}, c);
+            if (!r.ok || r.created.empty()) qWarning("could not place %s", file.c_str());
+            return r.created.empty() ? Id(0) : r.created[0];
+        };
+        const Id guideClip = place(guidePath, 0), takeClip = place(takePath, 1);
+        QVERIFY(guideClip && takeClip);
+        DialogueAlignReport rep;
+        const edit::Result aligned = edit::alignDialogue(p, s, takeClip, guideClip, {}, &rep);
+        QVERIFY2(aligned.ok, aligned.error.c_str());
+        qInfo("%d anchors, stretched %.2f..%.2f, confidence %.2f", rep.anchors, rep.minRate, rep.maxRate, rep.confidence);
+        QVERIFY(rep.anchors > 20);
+        const int normalAnchors = rep.anchors;
+        const Clip* take = edit::clipById(s, takeClip);
+        QVERIFY(take && take->effects.size() == 1 && take->effects[0].type == "dialogue_align");
+        QCOMPARE(take->effects[0].s("media"), std::to_string(take->mediaId));
+        const DialogueWarp warp = dialogueWarpFromString(take->effects[0].s("warp"));
+        // The guide's onsets (where its level jumps, 5 ms steps), each found in the take within 10 ms.
+        auto envelope = [&](const std::vector<float>& x, size_t step) {
+            std::vector<double> e;
+            for (size_t i = 0; i + step <= x.size(); i += step) {
+                double sum = 0;
+                for (size_t k = 0; k < step; ++k) sum += double(x[i + k]) * x[i + k];
+                e.push_back(std::sqrt(sum / double(step)));
+            }
+            return e;
+        };
+        const std::vector<double> ge = envelope(guide, sr / 200);
+        std::vector<size_t> onsets;
+        for (size_t i = 8; i + 8 < ge.size(); ++i) {
+            double before = 0, after = 0;
+            for (int k = 1; k <= 4; ++k) before += ge[i - size_t(k)], after += ge[i + size_t(k) - 1];
+            if (after > 4 * before && after > 4 * 0.02 && (onsets.empty() || i - onsets.back() > 20)) onsets.push_back(i);
+        }
+        QVERIFY2(onsets.size() >= 8, std::to_string(onsets.size()).c_str());
+        double worst = 0;
+        for (size_t i : onsets) {
+            const double g = double(i) * 0.005;
+            worst = std::max(worst, std::fabs(dialogueWarpAt(warp, g) - (pad + takeTime(g))));
+        }
+        QVERIFY2(worst < 0.010, std::to_string(worst).c_str());
+        // As heard: the take alone lines up with the guide at every onset (within 10 ms), for as long as the guide.
+        QVERIFY(take->end() >= edit::clipById(s, guideClip)->end());
+        auto mixOf = [&](int track) {
+            for (size_t k = 0; k < s.audioTracks.size(); ++k) s.audioTracks[k].muted = int(k) != track;
+            AudioMixer mixer;
+            std::vector<float> out(size_t(G * sr) * 2);
+            mixer.mix(p, s, 0, int(G * sr), out.data());
+            std::vector<float> left(out.size() / 2);
+            for (size_t i = 0; i < left.size(); ++i) left[i] = out[i * 2];
+            return left;
+        };
+        auto lagAt = [&](const std::vector<double>& a, const std::vector<double>& b, size_t i) {
+            int best = 0;
+            double top = -1;
+            for (int lag = -40; lag <= 40; ++lag) {
+                double c = 0, na = 0, nb = 0;
+                for (int k = -20; k < 40; ++k) {
+                    const int64_t x = int64_t(i) + k, y = x + lag;
+                    if (x < 0 || y < 0 || x >= int64_t(a.size()) || y >= int64_t(b.size())) continue;
+                    c += a[size_t(x)] * b[size_t(y)], na += a[size_t(x)] * a[size_t(x)], nb += b[size_t(y)] * b[size_t(y)];
+                }
+                c /= std::sqrt(na * nb + 1e-12);
+                if (c > top) top = c, best = lag;
+            }
+            return best;  // milliseconds
+        };
+        const std::vector<double> gms = envelope(guide, sr / 1000), heard = envelope(mixOf(1), sr / 1000);
+        int heardWorst = 0;
+        for (size_t i : onsets) heardWorst = std::max(heardWorst, std::abs(lagAt(gms, heard, i * 5)));
+        QVERIFY2(heardWorst <= 10, std::to_string(heardWorst).c_str());
+        // Without it the take is out by far more.
+        {
+            const Effect kept = take->effects[0];
+            QVERIFY(edit::removeDialogueAlignment(p, s, takeClip).ok);
+            QVERIFY(!edit::removeDialogueAlignment(p, s, takeClip).ok);
+            const std::vector<double> raw = envelope(mixOf(1), sr / 1000);
+            int rawWorst = 0;
+            for (size_t i : onsets) rawWorst = std::max(rawWorst, std::abs(lagAt(gms, raw, i * 5)));
+            QVERIFY2(rawWorst > 30, std::to_string(rawWorst).c_str());
+            edit::clipById(s, takeClip)->effects.push_back(kept);
+        }
+        // Made for this take only: on an audition, another take (another file, other channels, or another part of
+        // the same file) plays as it is.
+        Effect other = makeEffect(p, "dialogue_align");
+        other.strings["media"] = "12345";
+        other.strings["channels"] = "0";
+        other.strings["span"] = "100.000:200.000";
+        Clip same;
+        same.mediaId = 12345, same.channels = {0}, same.sourceIn = 150, same.duration = 25;
+        QVERIFY(dialogueAlignmentApplies(other, same));
+        Clip elsewhere = same;
+        elsewhere.mediaId = 999;
+        QVERIFY(!dialogueAlignmentApplies(other, elsewhere));
+        elsewhere = same, elsewhere.channels = {1};
+        QVERIFY(!dialogueAlignmentApplies(other, elsewhere));
+        elsewhere = same, elsewhere.sourceIn = 400;
+        QVERIFY(!dialogueAlignmentApplies(other, elsewhere));
+        QVERIFY(dialogueAlignmentApplies(makeEffect(p, "denoise"), elsewhere));
+        QVERIFY(isSourceAudioEffect("dialogue_align"));
+
+        // Prefer Shifting: a second microphone, 3.2 ms behind the boom and wired the other way round, with a little
+        // hiss of its own; it is moved alone (no stretch) to within a sample, and its polarity put right.
+        std::vector<float> mic(guide.size());
+        uint32_t seed = 7;
+        for (size_t i = 0; i < mic.size(); ++i) {
+            const double at = double(i) - 0.0032 * sr;
+            const int64_t a = int64_t(std::floor(at));
+            const double f = at - double(a);
+            const double v = a >= 0 && a + 1 < int64_t(guide.size()) ? guide[size_t(a)] * (1 - f) + guide[size_t(a + 1)] * f : 0.0;
+            seed = seed * 1664525u + 1013904223u;
+            mic[i] = float(-0.8 * v + 0.002 * (double(seed >> 8) / 16777216.0 - 0.5));
+        }
+        const std::string micPath = path("align-mic.wav");
+        QVERIFY(writeMonoWav(micPath, mic, sr));
+        const Id micClip = place(micPath, 2);
+        DialogueAlignOptions shift;
+        shift.shift = true;
+        const edit::Result shifted = edit::alignDialogue(p, s, micClip, guideClip, shift, &rep);
+        QVERIFY2(shifted.ok, shifted.error.c_str());
+        qInfo("delay %.4f ms, inverted %d, confidence %.2f", rep.delay * 1000, int(rep.inverted), rep.confidence);
+        QVERIFY2(std::fabs(rep.delay - 0.0032) < 1.0 / sr, std::to_string(rep.delay).c_str());
+        QVERIFY(rep.inverted && rep.confidence > 0.9);
+        const Clip* micShifted = edit::clipById(s, micClip);
+        QVERIFY(micShifted && micShifted->effects.size() == 1);
+        QCOMPARE(dialogueWarpFromString(micShifted->effects[0].s("warp")).size(), size_t(1));
+        // Heard now: in step with the boom, the right way up.
+        AudioBuffer boom, heardMic;
+        boom.sampleRate = heardMic.sampleRate = sr;
+        boom.channels = heardMic.channels = 1;
+        boom.samples = guide;
+        heardMic.samples = mixOf(2);
+        const DialogueShift after = findDialogueShift(boom, heardMic);
+        QVERIFY2(after.found && std::fabs(after.delay) < 1.0 / sr && !after.inverted, std::to_string(after.delay).c_str());
+
+        // Over MCP (and refused for a clip that is not a take of sound).
+        const QString project = QString::fromStdString(path("align.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_align_dialogue"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call({{"project", project}, {"clip", double(takeClip)}, {"guide", double(guideClip)}, {"precision", "tight"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(r.value("structuredContent").toObject().value("anchors").toInt() > normalAnchors);
+        r = call({{"project", project}, {"clip", double(micClip)}, {"remove", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call({{"project", project}, {"clip", double(takeClip)}, {"guide", double(takeClip)}});
+        QVERIFY(r.value("isError").toBool());
+        r = call({{"project", project}, {"clip", double(takeClip)}, {"guide", double(guideClip)}, {"precision", "exact"}});
+        QVERIFY(r.value("isError").toBool());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QVERIFY(edit::clipById(*back.active(), micClip)->effects.empty());
+        QCOMPARE(edit::clipById(*back.active(), takeClip)->effects.size(), size_t(1));
+    }
+
     void restorationOnFootage() {
         // Footage panning over fine detail, 3 pixels across and 1 down a frame; the dirty copy has specks of dirt on
         // frame 6 and a smudge too big to be found by itself.
@@ -23277,6 +23674,17 @@ private slots:
                 }
             }
             QVERIFY(early >= 3 && late >= 3);
+            // Keyed where the clip plays each moment: reversed, the reference's thin first half is the clip's end.
+            {
+                Project kp = makeDefaultProject();
+                Clip back;
+                back.duration = FrameTime(std::llround(double(dry.size()) / sr * kp.active()->fpsValue()));
+                back.reverse = true;
+                applyDialogueMatch(kp, *kp.active(), back, follow, toneOnly);
+                const Param& low = back.effects.at(0).params.at("low_db");
+                QVERIFY2(low.at(back.duration - 10) < -4 && low.at(10) > -3,
+                         qPrintable(QString("%1 %2").arg(low.at(back.duration - 10)).arg(low.at(10))));
+            }
             // A reference too short to follow keeps the one fit; a short one against a long clip stays within itself.
             const std::vector<float> shortRef(changing.begin(), changing.begin() + std::ptrdiff_t(sr * 3 / 2));
             const std::vector<float> longTarget(dry.begin(), dry.begin() + std::ptrdiff_t(sr * 4));

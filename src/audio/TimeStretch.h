@@ -6,6 +6,8 @@
 // stays smooth and nothing is resampled.
 #pragma once
 
+#include <atomic>
+
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -22,7 +24,9 @@ int stretchHop(int sampleRate);
 // sample `positions[k]` (fractional; the last position is held past the end).
 // `outFrames` frames are made at the input's rate and channels, pitch kept (an ambisonic field's four channels cut
 // together, guided by W).
-void wsolaStretch(const AudioBuffer& in, const std::vector<double>& positions, int hop, int64_t outFrames, AudioBuffer& out);
+// Stops early (the rest silent) when `cancel` is set.
+void wsolaStretch(const AudioBuffer& in, const std::vector<double>& positions, int hop, int64_t outFrames, AudioBuffer& out,
+                  const std::atomic<bool>* cancel = nullptr);
 
 // The same, cached under `key` (which must name the source and the time map;
 // `positions` is only asked for when it is not cached): made now with

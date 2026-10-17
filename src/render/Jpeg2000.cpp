@@ -233,12 +233,13 @@ bool encodeJpeg2000(const uint16_t* rgb, int width, int height, int bits, uint16
     opj_cparameters_t p;
     opj_set_default_encoder_parameters(&p);
     p.rsiz = rsiz;
-    // The DCI cinema profiles (Rsiz 3 and 4) take X'Y'Z' as it is, 9-7 coded, each frame and component capped; the IMF
-    // ones RGB through the component transform.
+    // The DCI cinema profiles (Rsiz 3 and 4) take X'Y'Z' 9-7 coded through the irreversible component transform (as
+    // DCI codestreams signal it and Bv2.1 checks), each frame and component capped; the IMF ones RGB the same way.
     const bool cinema = rsiz == 0x0003 || rsiz == 0x0004;
-    p.tcp_mct = cinema ? 0 : 1;
+    p.tcp_mct = 1;
     const bool lossless = !cinema && (rsiz & 0xff00) >= 0x0700;
     p.irreversible = lossless ? 0 : 1;
+    if (rsiz == 0x0004) p.numresolution = 7;  // DCI 4K: six decompositions (OpenJPEG's default is five, the 2K count)
     p.tcp_numlayers = 1;
     p.tcp_rates[0] = 0;
     p.cp_disto_alloc = 1;
@@ -253,6 +254,15 @@ bool encodeJpeg2000(const uint16_t* rgb, int width, int height, int bits, uint16
     opj_set_warning_handler(codec, Messages::quiet, nullptr);
     opj_set_info_handler(codec, Messages::quiet, nullptr);
     bool ok = codec && opj_setup_encoder(codec, &p, image);
+    if (ok && cinema) {
+        // What the SMPTE Bv2.1 profile adds to DCI's: a TLM marker (servers find the tile parts by it) and the guard
+        // bits it names (1 at 2K, 2 at 4K). Older OpenJPEG versions know neither; their codestreams still play.
+        const char* tlm[] = {"TLM=YES", nullptr};
+        opj_encoder_set_extra_options(codec, tlm);
+        const std::string guard = rsiz == 0x0004 ? "GUARD_BITS=2" : "GUARD_BITS=1";
+        const char* bits[] = {guard.c_str(), nullptr};
+        opj_encoder_set_extra_options(codec, bits);
+    }
     out.clear();
     Buffer buf;
     buf.out = &out;

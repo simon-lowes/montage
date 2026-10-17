@@ -1,4 +1,5 @@
 #include "DcpMxf.h"
+#include "DcpSecurity.h"
 #include "Jpeg2000.h"
 
 #include <algorithm>
@@ -8,6 +9,7 @@
 #include <cmath>
 #include <cstring>
 #include <ctime>
+#include <map>
 #include <random>
 
 #ifdef _WIN32
@@ -145,6 +147,8 @@ Bytes setKlv(uint8_t kind, const Set& s) {
     return klv(key, s.body);
 }
 
+Bytes setKlv(const char* key, const Set& s) { return klv(ul(key), s.body); }
+
 // A UMID (SMPTE 330) whose material number is a UUID: how asdcplib names packages, the file package by the asset id.
 Bytes umid(const Uuid& material) {
     Bytes b;
@@ -213,6 +217,21 @@ const PrimerEntry kSoundPrimer[] = {
     {0xfffd, "060e2b340101010e0103070105000000"}, {0xfffe, "060e2b340101010e0103070101000000"},
 };
 
+// The descriptive metadata of an encrypted file: its cryptographic framework and context (ST 429-6), and the
+// timed text descriptor's items (ST 429-5).
+const PrimerEntry kCryptoPrimer[] = {
+    {0x0602, "060e2b34010101020530040401000000"}, {0x6101, "060e2b340101010506010104020c0000"},
+    {0xff86, "060e2b340101010906010104020d0000"}, {0xff85, "060e2b34010101090101151100000000"},
+    {0xff84, "060e2b34010101090601010202000000"}, {0xff83, "060e2b34010101090209030101000000"},
+    {0xff82, "060e2b34010101090209030201000000"}, {0xff81, "060e2b34010101090209030102000000"},
+};
+const PrimerEntry kTimedTextPrimer[] = {
+    {0x3e01, "060e2b34010101030403030200000000"}, {0xfffe, "060e2b340101010c0101151200000000"},
+    {0xfffd, "060e2b340101010c0409050000000000"}, {0xfffc, "060e2b34010101080102010501000000"},
+    {0xfffb, "060e2b340101010e0301010202160000"}, {0xfffa, "060e2b340101010c0101151300000000"},
+    {0xfff9, "060e2b34010101070409020100000000"},
+};
+
 Bytes primerOf(const std::vector<PrimerEntry>& entries) {
     Bytes v;
     put32(v, entries.size());
@@ -225,19 +244,11 @@ Bytes primerOf(const std::vector<PrimerEntry>& entries) {
 }
 
 template <size_t N, size_t M>
-Bytes primer(const PrimerEntry (&common)[N], const PrimerEntry (&extra)[M]) {
-    Bytes v;
-    put32(v, N + M);
-    put32(v, 18);
-    for (const PrimerEntry& e : common) {
-        put16(v, e.tag);
-        putUl(v, e.ul);
-    }
-    for (const PrimerEntry& e : extra) {
-        put16(v, e.tag);
-        putUl(v, e.ul);
-    }
-    return klv(ul("060e2b34020501010d01020101050100"), v);
+Bytes primer(const PrimerEntry (&common)[N], const PrimerEntry (&extra)[M], bool encrypted = false) {
+    std::vector<PrimerEntry> entries(std::begin(common), std::end(common));
+    entries.insert(entries.end(), std::begin(extra), std::end(extra));
+    if (encrypted) entries.insert(entries.end(), std::begin(kCryptoPrimer), std::end(kCryptoPrimer));
+    return primerOf(entries);
 }
 
 // IMF (AS-02): the colour items, J2CLayout and mastering display the picture descriptors add, and the ST 2067-2
@@ -275,6 +286,20 @@ constexpr const char* kPictureDef = "060e2b34040101010103020201000000";
 constexpr const char* kSoundDef = "060e2b34040101010103020202000000";
 constexpr const char* kPictureElement = "060e2b34010201010d01030115010801";
 constexpr const char* kSoundElement = "060e2b34010201010d01030116010101";
+constexpr const char* kDataDef = "060e2b34040101010103020203000000";
+constexpr const char* kTimedTextContainer = "060e2b340401010a0d01030102130101";  // ST 429-5, clip wrapped
+constexpr const char* kTimedTextElement = "060e2b34010201010d01030117010b01";
+constexpr const char* kStreamElement = "060e2b340101010c0d01050901000000";       // a generic stream's data
+constexpr const char* kStreamPartition = "060e2b34020501010d01020101031100";
+constexpr const char* kEncryptedContainer = "060e2b34040101070d010301020b0100";
+constexpr const char* kEncryptedElement = "060e2b34020401010d010301027e0100";     // an encrypted triplet
+constexpr const char* kCryptoScheme = "060e2b34040101070d01040102010100";         // the DM scheme of the context
+constexpr const char* kDescriptiveDef = "060e2b34040101010103020110000000";
+constexpr const char* kCryptoFramework = "060e2b34025301010d01040102010000";
+constexpr const char* kCryptoContext = "060e2b34025301010d01040102020000";
+constexpr const char* kAes = "060e2b34040101070209020101000000";
+constexpr const char* kHmacSha1 = "060e2b34040101070209020201000000";
+const uint8_t kCheckValue[16] = {'C', 'H', 'U', 'K', 'C', 'H', 'U', 'K', 'C', 'H', 'U', 'K', 'C', 'H', 'U', 'K'};
 constexpr uint32_t kIndexSid = 129, kBodySid = 1;
 constexpr uint64_t kHeaderSize = 16384;  // the header partition is padded to this, so it can be rewritten in place
 constexpr size_t kEntriesPerSegment = 5000;  // index entries per index table segment (a local item holds 64 KiB)
@@ -310,13 +335,21 @@ Bytes productVersion() {
 enum Id : size_t {
     kPreface, kIdentification, kGeneration, kStorage, kContainerData, kMaterial, kMpTcTrack, kMpTcSeq, kMpTc, kMpTrack,
     kMpSeq, kMpClip, kSource, kFpTcTrack, kFpTcSeq, kFpTc, kFpTrack, kFpSeq, kFpClip, kDescriptor, kSub, kMaterialUmid,
-    kSoundfieldLink, kChannelSet0, kChannelLink0 = kChannelSet0 + 8
+    kSoundfieldLink, kChannelSet0, kChannelLink0 = kChannelSet0 + 8, kStaticTrack = kChannelLink0 + 8, kDmSeq, kDmSegment,
+    kFramework, kContext, kContextId, kStereoSub
+};
+
+// What an encrypted file's header says about it.
+struct Crypto {
+    bool on = false;
+    Uuid context{}, key{};
+    const char* wrapping = nullptr;  // the plain essence container
 };
 
 // The metadata both kinds share: everything but the essence descriptor and its sub-descriptors.
 Bytes packages(const std::array<Uuid, 48>& ids, const Uuid& asset, int fps, int64_t duration, const std::string& created,
                const char* container, const char* dataDef, const std::string& trackName, uint32_t trackNumber,
-               const std::string& packageName) {
+               const std::string& packageName, const Crypto& crypto = {}) {
     Bytes out;
     {
         Set s;
@@ -332,12 +365,13 @@ Bytes packages(const std::array<Uuid, 48>& ids, const Uuid& asset, int fps, int6
         put32(ecs, 2);
         put32(ecs, 16);
         putUl(ecs, kGenericContainer);
-        putUl(ecs, container);
+        putUl(ecs, crypto.on ? kEncryptedContainer : container);
         s.item(0x3b0a, ecs);
-        Bytes none;
-        put32(none, 0);
-        put32(none, 16);
-        s.item(0x3b0b, none);
+        Bytes schemes;
+        put32(schemes, crypto.on ? 1 : 0);
+        put32(schemes, 16);
+        if (crypto.on) putUl(schemes, kCryptoScheme);
+        s.item(0x3b0b, schemes);
         putBytes(out, setKlv(0x2f, s));
     }
     {
@@ -435,7 +469,9 @@ Bytes packages(const std::array<Uuid, 48>& ids, const Uuid& asset, int fps, int6
         s.text(0x4402, packageName);
         s.item(0x4405, stamp(created));
         s.item(0x4404, stamp(created));
-        s.refs(0x4403, {ids[kFpTcTrack], ids[kFpTrack]});
+        std::vector<Uuid> tracks = {ids[kFpTcTrack], ids[kFpTrack]};
+        if (crypto.on) tracks.push_back(ids[kStaticTrack]);
+        s.refs(0x4403, tracks);
         s.uuid(0x4701, ids[kDescriptor]);
         putBytes(out, setKlv(0x37, s));
     }
@@ -445,6 +481,49 @@ Bytes packages(const std::array<Uuid, 48>& ids, const Uuid& asset, int fps, int6
     track(kFpTrack, kFpSeq, 2, trackNumber, trackName);
     sequence(kFpSeq, kFpClip, dataDef);
     clip(kFpClip, Bytes(32, 0), 0);  // the end of the chain
+    if (crypto.on) {
+        // A static descriptive track whose one segment holds the cryptographic framework and its context.
+        {
+            Set s;
+            s.uuid(0x3c0a, ids[kStaticTrack]);
+            s.u32(0x4801, 3);
+            s.u32(0x4804, 0);
+            s.text(0x4802, "Descriptive Track");
+            s.uuid(0x4803, ids[kDmSeq]);
+            putBytes(out, setKlv(0x3a, s));
+        }
+        {
+            Set s;
+            s.uuid(0x3c0a, ids[kDmSeq]);
+            s.label(0x0201, kDescriptiveDef);
+            s.refs(0x1001, {ids[kDmSegment]});
+            putBytes(out, setKlv(0x0f, s));
+        }
+        {
+            Set s;
+            s.uuid(0x3c0a, ids[kDmSegment]);
+            s.label(0x0201, kDescriptiveDef);
+            s.text(0x0602, "AS-DCP KLV Encryption");
+            s.uuid(0x6101, ids[kFramework]);
+            putBytes(out, setKlv(0x41, s));
+        }
+        {
+            Set s;
+            s.uuid(0x3c0a, ids[kFramework]);
+            s.uuid(0xff86, ids[kContext]);
+            putBytes(out, setKlv(kCryptoFramework, s));
+        }
+        {
+            Set s;
+            s.uuid(0x3c0a, ids[kContext]);
+            s.uuid(0xff85, crypto.context);
+            s.label(0xff84, crypto.wrapping);
+            s.label(0xff83, kAes);
+            s.label(0xff82, kHmacSha1);
+            s.uuid(0xff81, crypto.key);
+            putBytes(out, setKlv(kCryptoContext, s));
+        }
+    }
     return out;
 }
 
@@ -695,6 +774,73 @@ bool parseJ2kHeader(const uint8_t* d, size_t n, J2kHeader& out) {
     return siz && cod && qcd;
 }
 
+// ---- Encryption ---------------------------------------------------------------------------------------------------
+
+namespace {
+
+// SHA-1's compression of one 64-byte block (no padding: the FIPS 186-2 generator's G function).
+void sha1Block(uint32_t h[5], const uint8_t* p) {
+    auto rol = [](uint32_t v, int n) { return v << n | v >> (32 - n); };
+    uint32_t w[80];
+    for (int i = 0; i < 16; ++i) w[i] = readBe(p + 4 * i, 4);
+    for (int i = 16; i < 80; ++i) w[i] = rol(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+    for (int i = 0; i < 80; ++i) {
+        uint32_t f, k;
+        if (i < 20) f = (b & c) | (~b & d), k = 0x5a827999;
+        else if (i < 40) f = b ^ c ^ d, k = 0x6ed9eba1;
+        else if (i < 60) f = (b & c) | (b & d) | (c & d), k = 0x8f1bbcdc;
+        else f = b ^ c ^ d, k = 0xca62c1d6;
+        const uint32_t t = rol(a, 5) + f + e + k + w[i];
+        e = d, d = c, c = rol(b, 30), b = a, a = t;
+    }
+    h[0] += a, h[1] += b, h[2] += c, h[3] += d, h[4] += e;
+}
+
+// The 56 bytes after an encrypted triplet's value: the track file, the element's sequence number and its MIC (over
+// the encrypted value and the 36 bytes before the MIC).
+Bytes integrityPack(const Uuid& asset, uint64_t sequence, const uint8_t* esv, size_t esvSize, const std::array<uint8_t, 16>& mic) {
+    Bytes b;
+    putBer4(b, 16);
+    putUuid(b, asset);
+    putBer4(b, 8);
+    put64(b, sequence);
+    putBer4(b, 20);
+    Bytes data(esv, esv + esvSize);
+    putBytes(data, b);
+    uint8_t mac[20];
+    hmacSha1(mic.data(), mic.size(), data.data(), data.size(), mac);
+    putBytes(b, mac, 20);
+    return b;
+}
+
+}  // namespace
+
+std::array<uint8_t, 16> micKey(const std::array<uint8_t, 16>& contentKey) {
+    // ST 430-6 7.10: x1 of the FIPS 186-2 (change notice 1) general purpose generator seeded with the content key.
+    uint8_t xkey[64] = {};
+    std::memcpy(xkey, contentKey.data(), 16);
+    auto g = [&](uint8_t out[20]) {
+        uint32_t h[5] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0};
+        sha1Block(h, xkey);
+        for (int i = 0; i < 5; ++i)
+            for (int k = 0; k < 4; ++k) out[4 * i + k] = uint8_t(h[i] >> (24 - 8 * k));
+    };
+    uint8_t x0[20], x1[20];
+    g(x0);
+    unsigned carry = 1;  // XKEY = (1 + XKEY + x0) mod 2^160
+    for (int i = 19; i >= 0; --i) {
+        const unsigned sum = unsigned(xkey[i]) + x0[i] + carry;
+        xkey[i] = uint8_t(sum);
+        carry = sum >> 8;
+    }
+    std::memset(xkey + 20, 0, 44);
+    g(x1);
+    std::array<uint8_t, 16> out{};
+    std::memcpy(out.data(), x1, 16);
+    return out;
+}
+
 // ---- Track files --------------------------------------------------------------------------------------------------
 
 TrackFileWriter::~TrackFileWriter() {
@@ -720,6 +866,14 @@ bool TrackFileWriter::writeRaw(const uint8_t* data, size_t size, std::string* er
 
 const Uuid& TrackFileWriter::descriptorId() const { return ids_[kDescriptor]; }
 
+void TrackFileWriter::encryptWith(const TrackEncryption& e) {
+    encrypted_ = true;
+    crypto_ = e;
+    micKey_ = micKey(e.key);
+}
+
+std::array<uint8_t, 16> TrackFileWriter::containerLabel() const { return encrypted_ ? ul(kEncryptedContainer) : essenceContainer(); }
+
 bool TrackFileWriter::openFile(const std::string& path, const Uuid& asset, int fps, std::string* error) {
     path_ = path;
     asset_ = asset;
@@ -727,6 +881,12 @@ bool TrackFileWriter::openFile(const std::string& path, const Uuid& asset, int f
     rate_ = {uint32_t(fps), 1};
     for (Uuid& u : ids_) u = newUuid();
     created_ = nowStamp();
+    elements_ = 0;
+    streams_.clear();
+    if (encrypted_ && imf_) {
+        if (error) *error = "IMF track files are not encrypted here";
+        return false;
+    }
 #ifdef _WIN32
     f_ = _wfopen(QString::fromStdString(path).toStdWString().c_str(), L"wb+");  // the path is UTF-8
 #else
@@ -764,15 +924,54 @@ std::vector<uint8_t> TrackFileWriter::partitionPack(const uint8_t key[16], uint6
     put32(v, 2);
     put32(v, 16);
     putUl(v, kGenericContainer);
-    const auto ec = essenceContainer();
+    const auto ec = containerLabel();
     putBytes(v, ec.data(), 16);
     std::array<uint8_t, 16> k;
     std::memcpy(k.data(), key, 16);
     return klv(k, v);
 }
 
-bool TrackFileWriter::writeElement(const uint8_t key[16], const uint8_t* data, size_t size, std::string* error) {
+bool TrackFileWriter::writeElement(const uint8_t key[16], const uint8_t* data, size_t size, std::string* error, bool index) {
     if (!f_) return false;
+    ++elements_;
+    if (encrypted_) {
+        // The triplet: the context, the plaintext offset (none: the codestream's header is encrypted too, as
+        // asdcplib does by default), the plain element's key and length, then the encrypted value (IV, the check value
+        // and the essence in one CBC chain, the last block padded 00 01 02 ...) and the integrity pack.
+        const size_t whole = size - size % 16;
+        Bytes plain(kCheckValue, kCheckValue + 16);
+        plain.insert(plain.end(), data, data + size);
+        for (uint8_t i = 0; plain.size() < 16 + whole + 16; ++i) plain.push_back(i);
+        Bytes esv(16 + plain.size());
+        if (!randomBytes(esv.data(), 16) || !aesCbcEncrypt(crypto_.key.data(), esv.data(), plain.data(), plain.size(), esv.data() + 16)) {
+            if (error) *error = "Cannot encrypt " + path_ + " (this build has no OpenSSL)";
+            return false;
+        }
+        const Bytes pack = integrityPack(asset_, elements_, esv.data(), esv.size(), micKey_);
+        const bool large = esv.size() >= (size_t(1) << 24) - 200;
+        Bytes head;
+        auto ber = [&](Bytes& b, uint64_t n) { large ? putBer8(b, n) : putBer4(b, size_t(n)); };
+        putUl(head, kEncryptedElement);
+        const uint64_t length = 20 + 12 + 20 + 12 + (large ? 8 : 4) + esv.size() + pack.size();
+        ber(head, length);
+        putBer4(head, 16);
+        putUuid(head, ids_[kContextId]);
+        putBer4(head, 8);
+        put64(head, 0);
+        putBer4(head, 16);
+        putBytes(head, key, 16);
+        putBer4(head, 8);
+        put64(head, size);
+        ber(head, esv.size());
+        if (std::fwrite(head.data(), 1, head.size(), f_) != head.size() || std::fwrite(esv.data(), 1, esv.size(), f_) != esv.size() ||
+            std::fwrite(pack.data(), 1, pack.size(), f_) != pack.size()) {
+            if (error) *error = "Cannot write " + path_ + " (is the disk full?)";
+            return false;
+        }
+        if (index) offsets_.push_back(essenceBytes_);
+        essenceBytes_ += head.size() + esv.size() + pack.size();
+        return true;
+    }
     Bytes kl(key, key + 16);
     // A frame of 16 MiB or more (lossless UHD and 4K can be) needs the 8-byte length.
     if (size < (size_t(1) << 24)) putBer4(kl, size);
@@ -781,8 +980,17 @@ bool TrackFileWriter::writeElement(const uint8_t key[16], const uint8_t* data, s
         if (error) *error = "Cannot write " + path_ + " (is the disk full?)";
         return false;
     }
-    offsets_.push_back(essenceBytes_);
+    if (index) offsets_.push_back(essenceBytes_);
     essenceBytes_ += kl.size() + size;
+    return true;
+}
+
+bool TrackFileWriter::startStream(uint32_t sid, std::string* error) {
+    const uint64_t at = kHeaderSize + 140 + essenceBytes_;
+    const uint64_t previous = streams_.empty() ? kHeaderSize : streams_.back().second;
+    const Bytes pack = partitionPack(ul(kStreamPartition).data(), at, previous, 0, 0, 0, 0, sid);
+    if (!writeRaw(pack.data(), pack.size(), error)) return false;
+    streams_.emplace_back(sid, at);
     return true;
 }
 
@@ -834,11 +1042,15 @@ bool TrackFileWriter::close(std::string* error) {
     }
     const uint64_t footerAt = bodyStart + 20 + 120 + essenceBytes_;
     const Bytes index = indexSegments();
-    Bytes tail = partitionPack(ul("060e2b34020501010d01020101040400").data(), footerAt, bodyStart, footerAt, 0, index.size(), kIndexSid, 0);
+    const uint64_t previous = streams_.empty() ? bodyStart : streams_.back().second;
+    Bytes tail = partitionPack(ul("060e2b34020501010d01020101040400").data(), footerAt, previous, footerAt, 0, index.size(), kIndexSid, 0);
     putBytes(tail, index);
     // Random index pack: where each partition is.
+    std::vector<std::pair<uint32_t, uint64_t>> partitions = {{0, 0}, {kBodySid, bodyStart}};
+    partitions.insert(partitions.end(), streams_.begin(), streams_.end());
+    partitions.emplace_back(0, footerAt);
     Bytes rip;
-    for (auto [sid, at] : {std::pair<uint32_t, uint64_t>{0, 0}, {kBodySid, bodyStart}, {0, footerAt}}) {
+    for (auto [sid, at] : partitions) {
         put32(rip, sid);
         put64(rip, at);
     }
@@ -860,7 +1072,7 @@ bool TrackFileWriter::close(std::string* error) {
 
 // ---- Picture ------------------------------------------------------------------------------------------------------
 
-bool PictureMxfWriter::write(const uint8_t* codestream, size_t size, std::string* error) {
+bool PictureMxfWriter::header(const uint8_t* codestream, size_t size, std::string* error) {
     if (!haveHeader_) {
         if (!parseJ2kHeader(codestream, size, j2k_)) {
             if (error) *error = "Not a JPEG 2000 codestream";
@@ -868,24 +1080,45 @@ bool PictureMxfWriter::write(const uint8_t* codestream, size_t size, std::string
         }
         haveHeader_ = true;
     }
-    return writeElement(ul(kPictureElement).data(), codestream, size, error);
+    return true;
+}
+
+bool PictureMxfWriter::write(const uint8_t* codestream, size_t size, std::string* error) {
+    if (stereo_) {
+        if (error) *error = "A stereoscopic track file takes both eyes at once";
+        return false;
+    }
+    return header(codestream, size, error) && writeElement(ul(kPictureElement).data(), codestream, size, error);
+}
+
+bool PictureMxfWriter::writeStereo(const uint8_t* left, size_t leftSize, const uint8_t* right, size_t rightSize, std::string* error) {
+    if (!stereo_) {
+        if (error) *error = "Not a stereoscopic track file";
+        return false;
+    }
+    // The right eye straight after the left, the index pointing at the left (ST 429-10).
+    return header(left, leftSize, error) && writeElement(ul(kPictureElement).data(), left, leftSize, error) &&
+           writeElement(ul(kPictureElement).data(), right, rightSize, error, false);
 }
 
 std::array<uint8_t, 16> PictureMxfWriter::essenceContainer() const { return ul(kJ2kContainer); }
 
 std::vector<uint8_t> PictureMxfWriter::headerMetadata(int64_t duration) const {
-    Bytes out = primer(kCommonPrimer, kPicturePrimer);
+    Bytes out = primer(kCommonPrimer, kPicturePrimer, encrypted_);
     putBytes(out, packages(ids_, asset_, fps_, duration, created_, kJ2kContainer, kPictureDef, "Picture Track", 0x15010801,
-                           "File Package: SMPTE 429-4 frame wrapping of JPEG 2000 codestreams"));
+                           stereo_ ? "File Package: SMPTE 429-10 frame wrapping of stereoscopic JPEG 2000 codestreams"
+                                   : "File Package: SMPTE 429-4 frame wrapping of JPEG 2000 codestreams",
+                           {encrypted_, ids_[kContextId], crypto_.keyId, kJ2kContainer}));
     const uint32_t w = j2k_.xsiz - j2k_.xosiz, h = j2k_.ysiz - j2k_.yosiz;
     // The DCI profile the codestream declares (Rsiz 3: 2K, 4: 4K).
     const char* coding = j2k_.rsiz == 4 ? "060e2b34040101090401020203010104" : "060e2b34040101090401020203010103";
     {
         Set s;
         s.uuid(0x3c0a, ids_[kDescriptor]);
-        s.refs(0xffff, {ids_[kSub]});
+        if (stereo_) s.refs(0xffff, {ids_[kSub], ids_[kStereoSub]});
+        else s.refs(0xffff, {ids_[kSub]});
         s.u32(0x3006, 2);
-        s.rational(0x3001, uint32_t(fps_), 1);
+        s.rational(0x3001, uint32_t(stereo_ ? 2 * fps_ : fps_), 1);  // stereoscopic: the codestreams' rate, two to a frame
         s.i64(0x3002, duration);
         s.label(0x3004, kJ2kContainer);
         s.u8(0x320c, 0);  // full frame
@@ -919,6 +1152,11 @@ std::vector<uint8_t> PictureMxfWriter::headerMetadata(int64_t duration) const {
         s.item(0xfff3, j2k_.cod);
         s.item(0xfff2, j2k_.qcd);
         putBytes(out, setKlv(0x5a, s));
+    }
+    if (stereo_) {
+        Set s;
+        s.uuid(0x3c0a, ids_[kStereoSub]);
+        putBytes(out, setKlv(0x63, s));
     }
     return out;
 }
@@ -985,9 +1223,9 @@ bool SoundMxfWriter::write(const float* samples, std::string* error) {
 std::array<uint8_t, 16> SoundMxfWriter::essenceContainer() const { return ul(kWaveContainer); }
 
 std::vector<uint8_t> SoundMxfWriter::headerMetadata(int64_t duration) const {
-    Bytes out = primer(kCommonPrimer, kSoundPrimer);
+    Bytes out = primer(kCommonPrimer, kSoundPrimer, encrypted_);
     putBytes(out, packages(ids_, asset_, fps_, duration, created_, kWaveContainer, kSoundDef, "Sound Track", 0x16010101,
-                           "File Package: SMPTE 382M frame wrapping of wave audio"));
+                           "File Package: SMPTE 382M frame wrapping of wave audio", {encrypted_, ids_[kContextId], crypto_.keyId, kWaveContainer}));
     struct Channel {
         const char* symbol;
         const char* name;
@@ -1055,12 +1293,431 @@ std::vector<uint8_t> SoundMxfWriter::headerMetadata(int64_t duration) const {
 
 std::vector<uint8_t> SoundMxfWriter::indexSegments() const {
     Set s;
-    indexBase(s, rate_, 0, frames(), uint32_t(20 + size_t(samplesPerFrame()) * size_t(channels_) * 3));
+    const size_t bytes = size_t(samplesPerFrame()) * size_t(channels_) * 3;
+    // Each frame's KLV, or its encrypted triplet (68 bytes of context, the value, 56 of integrity pack).
+    const size_t unit = encrypted_ ? 20 + 68 + (bytes - bytes % 16 + 48) + 56 : 20 + bytes;
+    indexBase(s, rate_, 0, frames(), uint32_t(unit));
     Bytes entries;
     put32(entries, 0);
     put32(entries, 11);
     s.item(0x3f0a, entries);
     return klv(ul("060e2b34025301010d01020101100100"), s.body);
+}
+
+// ---- Timed text ---------------------------------------------------------------------------------------------------
+
+bool TimedTextMxfWriter::write(const std::string& xml, const Uuid& resourceId, int64_t duration, const std::string& language,
+                               const std::vector<TimedTextResource>& resources, std::string* error) {
+    resourceId_ = resourceId;
+    duration_ = duration;
+    language_ = language;
+    // The root element's namespace, as the descriptor repeats it.
+    namespace_.clear();
+    for (size_t at = xml.find('<'); at != std::string::npos; at = xml.find('<', at + 1)) {
+        if (xml.compare(at, 2, "<?") == 0 || xml.compare(at, 2, "<!") == 0) continue;
+        const size_t end = xml.find('>', at);
+        const std::string tag = xml.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        if (const size_t ns = tag.find("xmlns=\""); ns != std::string::npos) namespace_ = tag.substr(ns + 7, tag.find('"', ns + 7) - ns - 7);
+        break;
+    }
+    if (!writeElement(ul(kTimedTextElement).data(), reinterpret_cast<const uint8_t*>(xml.data()), xml.size(), error)) return false;
+    // Each resource in a generic stream partition of its own, streams 10, 11, ... in the descriptor's order.
+    uint32_t sid = 10;
+    for (const TimedTextResource& r : resources) {
+        resources_.emplace_back(r.id, r.mime);
+        resourceSets_.push_back(newUuid());
+        if (!startStream(sid++, error) || !writeElement(ul(kStreamElement).data(), r.data.data(), r.data.size(), error, false)) return false;
+    }
+    return true;
+}
+
+std::array<uint8_t, 16> TimedTextMxfWriter::essenceContainer() const { return ul(kTimedTextContainer); }
+
+std::vector<uint8_t> TimedTextMxfWriter::headerMetadata(int64_t duration) const {
+    std::vector<PrimerEntry> entries(std::begin(kCommonPrimer), std::end(kCommonPrimer));
+    entries.insert(entries.end(), std::begin(kTimedTextPrimer), std::end(kTimedTextPrimer));
+    if (encrypted_) entries.insert(entries.end(), std::begin(kCryptoPrimer), std::end(kCryptoPrimer));
+    Bytes out = primerOf(entries);
+    // The file package's track number is 0, as asdcplib writes it.
+    putBytes(out, packages(ids_, asset_, fps_, duration, created_, kTimedTextContainer, kDataDef, "Timed Text Track", 0,
+                           "File Package: SMPTE 429-5 clip wrapping of D-Cinema Timed Text data",
+                           {encrypted_, ids_[kContextId], crypto_.keyId, kTimedTextContainer}));
+    {
+        Set s;
+        s.uuid(0x3c0a, ids_[kDescriptor]);
+        if (!resourceSets_.empty()) s.refs(0xffff, resourceSets_);
+        s.u32(0x3006, 2);
+        s.rational(0x3001, uint32_t(fps_), 1);
+        s.i64(0x3002, duration);
+        s.label(0x3004, kTimedTextContainer);
+        s.item(0x3e01, Bytes(16, 0));
+        s.uuid(0xfffe, resourceId_);
+        s.text(0xfffd, "UTF-8");
+        s.text(0xfffc, namespace_);
+        s.text(0xfffb, language_);
+        putBytes(out, setKlv(0x64, s));
+    }
+    for (size_t i = 0; i < resources_.size(); ++i) {
+        Set s;
+        s.uuid(0x3c0a, resourceSets_[i]);
+        s.uuid(0xfffa, resources_[i].first);
+        s.text(0xfff9, resources_[i].second);
+        s.u32(0x3f07, uint32_t(10 + i));
+        putBytes(out, setKlv(0x65, s));
+    }
+    return out;
+}
+
+std::vector<uint8_t> TimedTextMxfWriter::indexSegments() const { return vbrIndex(offsets_, rate_); }
+
+// ---- Reading ------------------------------------------------------------------------------------------------------
+
+namespace {
+
+// Whether two keys are the same, their version bytes (7) aside.
+bool sameKey(const uint8_t* a, const char* hex) {
+    const auto b = ul(hex);
+    for (int i = 0; i < 16; ++i)
+        if (i != 7 && a[i] != b[size_t(i)]) return false;
+    return true;
+}
+
+std::string hexOf(const uint8_t* p) {
+    static const char* digits = "0123456789abcdef";
+    std::string h;
+    for (int i = 0; i < 16; ++i) h += digits[p[i] >> 4], h += digits[p[i] & 15];
+    return h;
+}
+
+struct File {
+    std::FILE* f = nullptr;
+    uint64_t size = 0;
+    ~File() {
+        if (f) std::fclose(f);
+    }
+    bool seek(uint64_t at) {
+        if (at > size) return false;
+#ifdef _WIN32
+        return _fseeki64(f, int64_t(at), SEEK_SET) == 0;
+#else
+        return fseeko(f, off_t(at), SEEK_SET) == 0;
+#endif
+    }
+    uint64_t tell() {
+#ifdef _WIN32
+        return uint64_t(_ftelli64(f));
+#else
+        return uint64_t(ftello(f));
+#endif
+    }
+    bool read(uint8_t* p, size_t n) { return std::fread(p, 1, n, f) == n; }
+    // A key and its BER length: the value's size, and the bytes before it.
+    bool kl(uint8_t key[16], uint64_t& length, uint64_t& header) {
+        uint8_t b;
+        if (!read(key, 16) || !read(&b, 1)) return false;
+        header = 17;
+        if (b < 0x80) {
+            length = b;
+            return fits(length);
+        }
+        const int n = b & 0x7f;
+        if (n > 8) return false;
+        uint8_t v[8];
+        if (!read(v, size_t(n))) return false;
+        length = 0;
+        for (int i = 0; i < n; ++i) length = length << 8 | v[i];
+        header += uint64_t(n);
+        return fits(length);
+    }
+    // Whether `length` bytes from here are in the file (a damaged or hostile length is not read).
+    bool fits(uint64_t length) {
+        const uint64_t at = tell();
+        return at <= size && length <= size - at;
+    }
+};
+
+bool openRead(File& file, const std::string& path) {
+#ifdef _WIN32
+    file.f = _wfopen(QString::fromStdString(path).toStdWString().c_str(), L"rb");
+#else
+    file.f = std::fopen(path.c_str(), "rb");
+#endif
+    if (!file.f) return false;
+    if (std::fseek(file.f, 0, SEEK_END) != 0) return false;
+    file.size = file.tell();
+    return std::fseek(file.f, 0, SEEK_SET) == 0;
+}
+
+// A BER length inside a value (the triplet's own items).
+bool berAt(const Bytes& v, size_t& at, uint64_t& out) {
+    if (at >= v.size()) return false;
+    const uint8_t b = v[at++];
+    if (b < 0x80) {
+        out = b;
+        return true;
+    }
+    const int n = b & 0x7f;
+    if (n > 8 || at + size_t(n) > v.size()) return false;
+    out = 0;
+    for (int i = 0; i < n; ++i) out = out << 8 | v[at++];
+    return true;
+}
+
+// A local set's items by tag.
+std::map<uint16_t, Bytes> items(const Bytes& v) {
+    std::map<uint16_t, Bytes> out;
+    for (size_t i = 0; i + 4 <= v.size();) {
+        const uint16_t tag = uint16_t(v[i] << 8 | v[i + 1]);
+        const size_t n = size_t(v[i + 2] << 8 | v[i + 3]);
+        if (i + 4 + n > v.size()) break;
+        out[tag] = Bytes(v.begin() + ptrdiff_t(i + 4), v.begin() + ptrdiff_t(i + 4 + n));
+        i += 4 + n;
+    }
+    return out;
+}
+
+uint64_t beOf(const Bytes& b) {
+    uint64_t v = 0;
+    for (uint8_t c : b) v = v << 8 | c;
+    return v;
+}
+
+}  // namespace
+
+bool TrackFileReader::open(const std::string& path, std::string* error) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    path_ = path;
+    File file;
+    if (!openRead(file, path)) return fail("Cannot open " + path);
+    fileSize_ = file.size;
+    // The random index pack at the end: where each partition is. Every length below has been checked against the
+    // file's size (File::kl), so a damaged or hostile file is refused, not read past.
+    uint8_t tail[4];
+    if (fileSize_ < 64 || !file.seek(fileSize_ - 4) || !file.read(tail, 4)) return fail(path + " is not an MXF file");
+    const uint64_t ripSize = readBe(tail, 4);
+    uint8_t key[16];
+    uint64_t length = 0, header = 0;
+    if (ripSize > fileSize_ || !file.seek(fileSize_ - ripSize) || !file.kl(key, length, header) || !sameKey(key, "060e2b34020501010d01020101110100"))
+        return fail(path + " has no random index pack");
+    if (length < 4) return fail(path + " has a damaged random index pack");
+    Bytes rip(static_cast<size_t>(length));
+    if (!file.read(rip.data(), rip.size())) return fail(path + " is cut short");
+    rip_.clear();
+    for (size_t i = 0; i + 12 <= rip.size() - 4; i += 12) rip_.emplace_back(readBe(rip.data() + i, 4), uint64_t(readBe(rip.data() + i + 4, 4)) << 32 | readBe(rip.data() + i + 8, 4));
+    // The header partition and its metadata.
+    if (!file.seek(0) || !file.kl(key, length, header) || length < 64 || length > (1 << 20)) return fail(path + " is not an MXF file");
+    Bytes pack(static_cast<size_t>(length));
+    if (!file.read(pack.data(), pack.size())) return fail(path + " is cut short");
+    const uint64_t footer = beOf(Bytes(pack.begin() + 24, pack.begin() + 32));
+    const uint64_t headerBytes = beOf(Bytes(pack.begin() + 32, pack.begin() + 40));
+    uint64_t at = header + length;
+    const uint64_t end = headerBytes > fileSize_ - std::min(at, fileSize_) ? fileSize_ : at + headerBytes;
+    std::map<std::string, uint16_t> tags;  // the primer: label to local tag
+    auto tag = [&](const char* label) {
+        const auto it = tags.find(label);
+        return it == tags.end() ? uint16_t(0) : it->second;
+    };
+    bool haveRate = false;
+    resourceStreams_.clear();
+    while (at < end && file.seek(at) && file.kl(key, length, header)) {
+        Bytes v(static_cast<size_t>(length));
+        if (!file.read(v.data(), v.size())) return fail(path + " is cut short");
+        at += header + length;
+        if (sameKey(key, "060e2b34020501010d01020101050100")) {
+            for (size_t i = 8; i + 18 <= v.size(); i += 18) tags[hexOf(v.data() + i + 2)] = uint16_t(v[i] << 8 | v[i + 1]);
+            continue;
+        }
+        const auto set = items(v);
+        auto get = [&](uint16_t t) {
+            const auto it = set.find(t);
+            return it == set.end() ? Bytes() : it->second;
+        };
+        if (std::memcmp(key, ul(kCryptoContext).data(), 16) == 0) {
+            encrypted_ = true;
+            const Bytes context = get(tag("060e2b34010101090101151100000000")), id = get(tag("060e2b34010101090209030102000000"));
+            const Bytes mic = get(tag("060e2b34010101090209030201000000"));
+            if (context.size() == 16) std::memcpy(context_.data(), context.data(), 16);
+            if (id.size() == 16) std::memcpy(keyId_.data(), id.data(), 16);
+            hmac_ = mic.size() == 16 && sameKey(mic.data(), kHmacSha1);
+            continue;
+        }
+        const auto prefix = ul("060e2b34025301010d01010101010000");
+        if (std::memcmp(key, prefix.data(), 14) != 0) continue;
+        switch (key[14]) {
+        case 0x3b:  // a track: the first one's rate is the file's
+            if (!haveRate) {
+                const Bytes r = get(0x4b01);
+                if (r.size() == 8) rate_ = {readBe(r.data(), 4), readBe(r.data() + 4, 4)}, haveRate = true;
+            }
+            break;
+        case 0x37:  // the file package: the asset is its UMID's material number
+            if (const Bytes u = get(0x4401); u.size() == 32) std::memcpy(asset_.data(), u.data() + 16, 16);
+            break;
+        case 0x63: stereo_ = true; break;
+        case 0x64: timedText_ = true; [[fallthrough]];
+        case 0x29:
+        case 0x48:
+            containerDuration_ = int64_t(beOf(get(0x3002)));
+            break;
+        case 0x65: {
+            const Bytes id = get(tag("060e2b340101010c0101151300000000"));
+            Uuid u{};
+            if (id.size() == 16) std::memcpy(u.data(), id.data(), 16);
+            resourceStreams_.emplace_back(u, uint32_t(beOf(get(0x3f07))));
+            break;
+        }
+        default: break;
+        }
+    }
+    // The essence starts after the body partition's pack.
+    bodyStart_ = 0;
+    for (const auto& [sid, offset] : rip_)
+        if (sid == 1 && file.seek(offset) && file.kl(key, length, header)) bodyStart_ = offset + header + length;
+    if (!bodyStart_) return fail(path + " has no body partition");
+    // The index, in the footer.
+    offsets_.clear();
+    if (!file.seek(footer) || !file.kl(key, length, header)) return fail(path + " has no footer");
+    at = footer + header + length;
+    while (at + 20 < fileSize_ && file.seek(at) && file.kl(key, length, header) && sameKey(key, "060e2b34025301010d01020101100100")) {
+        Bytes v(static_cast<size_t>(length));
+        if (!file.read(v.data(), v.size())) return fail(path + " is cut short");
+        at += header + length;
+        const auto set = items(v);
+        auto get = [&](uint16_t t) {
+            const auto it = set.find(t);
+            return it == set.end() ? Bytes() : it->second;
+        };
+        const uint64_t unit = beOf(get(0x3f05));
+        if (unit > 0) {
+            // As many edit units as the file can hold, whatever the duration says.
+            const uint64_t n = std::min<uint64_t>(containerDuration_ > 0 ? uint64_t(containerDuration_) : beOf(get(0x3f0d)), fileSize_ / unit);
+            for (uint64_t k = 0; k < n; ++k) offsets_.push_back(k * unit);
+            continue;
+        }
+        const Bytes e = get(0x3f0a);
+        if (e.size() < 8) continue;
+        const uint64_t count = readBe(e.data(), 4), size = readBe(e.data() + 4, 4);
+        if (size < 11 || count > (e.size() - 8) / size) return fail(path + " has a damaged index");
+        for (uint64_t k = 0; k < count; ++k)
+            offsets_.push_back(beOf(Bytes(e.begin() + ptrdiff_t(8 + k * size + 3), e.begin() + ptrdiff_t(8 + k * size + 11))));
+    }
+    return true;
+}
+
+std::vector<uint32_t> TrackFileReader::streams() const {
+    std::vector<uint32_t> out;
+    for (const auto& [sid, offset] : rip_)
+        if (sid >= 2) out.push_back(sid);
+    return out;
+}
+
+uint64_t TrackFileReader::largestEditUnit() const {
+    // Up to the next partition after the body: a generic stream's or the footer.
+    uint64_t end = fileSize_;
+    for (const auto& [sid, offset] : rip_)
+        if (offset > bodyStart_) end = std::min(end, offset);
+    uint64_t largest = 0;
+    for (size_t i = 0; i < offsets_.size(); ++i) {
+        const uint64_t next = i + 1 < offsets_.size() ? offsets_[i + 1] : end - bodyStart_;
+        largest = std::max(largest, next - offsets_[i]);
+    }
+    return largest;
+}
+
+bool TrackFileReader::element(uint64_t at, uint64_t sequence, std::vector<uint8_t>& out, const uint8_t* key, std::string* error, uint64_t* next) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    File file;
+    uint8_t k[16];
+    uint64_t length = 0, header = 0;
+    if (!openRead(file, path_) || !file.seek(at) || !file.kl(k, length, header)) return fail(path_ + " is cut short");
+    if (next) *next = at + header + length;
+    Bytes v(static_cast<size_t>(length));
+    if (!file.read(v.data(), v.size())) return fail(path_ + " is cut short");
+    if (!sameKey(k, kEncryptedElement)) {
+        out = std::move(v);
+        return true;
+    }
+    if (!key) return fail(path_ + " is encrypted: its content key is needed");
+    // The triplet's context, plaintext offset, source key and length, then the encrypted value and integrity pack.
+    size_t i = 0;
+    uint64_t n = 0, offset = 0, sourceLength = 0, esvLength = 0;
+    if (!berAt(v, i, n) || n != 16 || i + 16 > v.size() || std::memcmp(v.data() + i, context_.data(), 16) != 0)
+        return fail(path_ + ": an element names another cryptographic context");
+    i += 16;
+    if (!berAt(v, i, n) || n != 8 || i + 8 > v.size()) return fail(path_ + ": a damaged encrypted element");
+    offset = beOf(Bytes(v.begin() + ptrdiff_t(i), v.begin() + ptrdiff_t(i + 8)));
+    i += 8;
+    if (!berAt(v, i, n) || n != 16) return fail(path_ + ": a damaged encrypted element");
+    i += 16;
+    if (!berAt(v, i, n) || n != 8 || i + 8 > v.size()) return fail(path_ + ": a damaged encrypted element");
+    sourceLength = beOf(Bytes(v.begin() + ptrdiff_t(i), v.begin() + ptrdiff_t(i + 8)));
+    i += 8;
+    // Every length against the element's own size (so none can wrap around).
+    if (!berAt(v, i, esvLength) || esvLength > v.size() - i || offset > sourceLength || sourceLength > v.size() || esvLength < 48 ||
+        offset > esvLength - 48 || esvLength != offset + (sourceLength - offset) - (sourceLength - offset) % 16 + 48)
+        return fail(path_ + ": a damaged encrypted element");
+    const uint8_t* esv = v.data() + i;
+    // The check value and the encrypted blocks are one CBC chain; the plaintext part sits between them.
+    Bytes chained(esv + 16, esv + 32);
+    chained.insert(chained.end(), esv + 32 + offset, esv + esvLength);
+    Bytes plain(chained.size());
+    if (!aesCbcDecrypt(key, esv, chained.data(), chained.size(), plain.data())) return fail("This build cannot decrypt (it has no OpenSSL)");
+    if (std::memcmp(plain.data(), kCheckValue, 16) != 0) return fail(path_ + ": that is not its content key");
+    // DCI asks for the integrity pack on every encrypted element: a file without one cannot show it is unaltered.
+    if (!hmac_) return fail(path_ + " has no integrity check (MIC) on its encrypted essence");
+    {
+        const size_t pack = i + size_t(esvLength);
+        if (pack + 56 > v.size()) return fail(path_ + ": an encrypted element has no integrity pack");
+        size_t j = pack;
+        if (!berAt(v, j, n) || n != 16 || std::memcmp(v.data() + j, asset_.data(), 16) != 0) return fail(path_ + ": an element from another track file");
+        j += 16;
+        if (!berAt(v, j, n) || n != 8) return fail(path_ + ": a damaged integrity pack");
+        const uint64_t seq = beOf(Bytes(v.begin() + ptrdiff_t(j), v.begin() + ptrdiff_t(j + 8)));
+        if (sequence && seq != sequence) return fail(path_ + ": an element out of its place");
+        std::array<uint8_t, 16> k16;
+        std::memcpy(k16.data(), key, 16);
+        const Bytes expected = integrityPack(asset_, seq, esv, size_t(esvLength), micKey(k16));
+        if (std::memcmp(expected.data(), v.data() + pack, 56) != 0) return fail(path_ + ": an element's check value does not match (damaged or altered)");
+    }
+    out.assign(esv + 32, esv + 32 + offset);
+    out.insert(out.end(), plain.begin() + 16, plain.begin() + 16 + ptrdiff_t(sourceLength - offset));
+    return true;
+}
+
+bool TrackFileReader::read(int64_t index, int eye, std::vector<uint8_t>& out, const uint8_t* key, std::string* error) {
+    if (index < 0 || index >= editUnits() || (eye && !stereo_)) {
+        if (error) *error = "No edit unit " + std::to_string(index) + (eye ? " (right eye)" : "") + " in " + path_;
+        return false;
+    }
+    const uint64_t at = bodyStart_ + offsets_[size_t(index)];
+    const uint64_t sequence = stereo_ ? uint64_t(2 * index + eye + 1) : uint64_t(index + 1);
+    if (!eye) return element(at, sequence, out, key, error);
+    uint64_t next = 0;
+    std::vector<uint8_t> left;
+    // The right eye's element follows the left's: find where that ends without decrypting it.
+    if (!element(at, 0, left, nullptr, nullptr, &next) && !next) return element(at, sequence, out, key, error);
+    return element(next, sequence, out, key, error);
+}
+
+bool TrackFileReader::readStream(uint32_t sid, std::vector<uint8_t>& out, const uint8_t* key, std::string* error) {
+    uint64_t sequence = 0;
+    for (const auto& [s, offset] : rip_) {
+        if (s > 0) ++sequence;
+        if (s != sid) continue;
+        File file;
+        uint8_t k[16];
+        uint64_t length = 0, header = 0;
+        if (!openRead(file, path_) || !file.seek(offset) || !file.kl(k, length, header)) break;
+        return element(offset + header + length, sequence, out, key, error);
+    }
+    if (error) *error = "No stream " + std::to_string(sid) + " in " + path_;
+    return false;
 }
 
 // ---- IMF picture ---------------------------------------------------------------------------------------------------

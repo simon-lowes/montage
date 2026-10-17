@@ -65,6 +65,7 @@ struct Caption {
     std::vector<double> wordTimes;
     int vertical = kCaptionBottom;
     int align = kCaptionCentre;
+    bool italic = false;  // the whole caption in italics (a voice off screen, a song, a thought), as subtitles mark them
     bool operator==(const Caption&) const = default;
 };
 
@@ -138,7 +139,8 @@ std::string captionsToSrt(const std::vector<Caption>& captions, Rational fps);
 std::string captionsToVtt(const std::vector<Caption>& captions, Rational fps);
 
 // Reads any of the formats below, told apart by their content: SubRip,
-// WebVTT, Scenarist SCC, MacCaption MCC, TTML / IMSC / DFXP, EBU STL and ASS / SSA. Markup is removed.
+// WebVTT, Scenarist SCC, MacCaption MCC, TTML / IMSC / DFXP, EBU STL and ASS / SSA. Markup is removed; a caption in
+// italics throughout (SubRip's and WebVTT's <i>, TTML's fontStyle, ASS's \i1) is marked italic.
 bool parseSubtitles(const std::string& text, Rational fps, std::vector<Caption>& out, std::string* error = nullptr);
 
 // Scenarist SCC: CEA-608 pop-on captions on channel 1 at 29.97 fps drop frame,
@@ -185,6 +187,27 @@ bool parseStl(const std::string& data, Rational fps, std::vector<Caption>& out, 
 // outline, height) at the frame size, so players draw it as the viewer does.
 std::string captionsToAss(const std::vector<Caption>& captions, Rational fps, const CaptionStyle& style, int width, int height);
 bool parseAss(const std::string& text, Rational fps, std::vector<Caption>& out, std::string* error = nullptr);
+
+// Digital cinema subtitles (SMPTE ST 428-7:2014, the SubtitleReel a DCP's timed text track file carries): one Font
+// with the track's size (points of a screen 11 inches high), colour and outline or shadow (a box becomes a border, as
+// cinema servers draw no boxes), a Subtitle per caption with a Text per line placed from the bottom, top or middle,
+// left, centre or right, and italic captions in an italic Font. Times count `editRate` frames a second from the reel's
+// start (the captions' own times, already in those frames).
+struct DcstInfo {
+    std::string id;                 // the document's UUID (the track file's resource id)
+    std::string title;              // ContentTitleText
+    std::string annotation;
+    std::string issueDate;          // xs:dateTime
+    std::string language = "en";    // RFC 5646
+    int editRate = 24;
+    int reel = 1;
+    std::string fontUuid;           // the LoadFont resource's UUID (the font in the track file)
+    std::string fontId = "Font1";
+};
+std::string captionsToDcst(const std::vector<Caption>& captions, const CaptionStyle& style, const DcstInfo& info);
+// Reads ST 428-7 (2007, 2010 and 2014) and Interop DCSubtitle XML: times (edit units, or Interop's 4 ms ticks) from
+// StartTime on, lines, place, italics; `info` (when given) gets the id, language, edit rate and font id.
+bool parseDcst(const std::string& xml, Rational fps, std::vector<Caption>& out, std::string* error = nullptr, DcstInfo* info = nullptr);
 
 // A caption track in the format a file extension names: srt, vtt, scc, mcc (core/Cea708.h), ttml
 // (also xml, dfxp), stl, ass (also ssa). Empty for an unknown extension.

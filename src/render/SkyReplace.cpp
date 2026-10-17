@@ -508,7 +508,7 @@ bool skyMotion(const Sequence& seq, const Clip& c, const Effect& e, FrameTime lo
 }
 
 void applySkyReplacement(const Sequence& seq, const Clip& c, const Effect& e, FrameTime local, Image& full, const Image* skyLayer,
-                         double scale, double sourceSeconds) {
+                         double scale, double sourceSeconds, const std::vector<float>* mask) {
     if (full.empty()) return;
     const bool gradient = std::lround(e.p("source", local, 0)) == 1, showMatte = std::lround(e.p("view", local, 0)) == 1;
     const bool hasSky = gradient || (skyLayer && skyLayer->width == full.width && skyLayer->height == full.height);
@@ -539,11 +539,13 @@ void applySkyReplacement(const Sequence& seq, const Clip& c, const Effect& e, Fr
                                         e.p("refine", local, 70) / 100);
     const double shift = e.p("shift", local, 0) * scale, soften = e.p("soften", local, 1) * scale;
     if (std::fabs(shift) >= 0.25 || soften >= 0.25) refineMatte(matte, W, H, shift, soften, soften);
-    // A mask on the effect says where the sky may be (over the clip's picture).
+    // A mask on the effect says where the sky may be: over the whole layer (where the picture was moved, turned or
+    // keyed its opaque bounds are not its frame), the bounds taken from it.
     if (hasMask(e, local)) {
-        const std::vector<float> limit = effectMatte(e, local, layer, scale, sourceSeconds);
-        if (limit.size() == matte.size())
-            for (size_t i = 0; i < matte.size(); ++i) matte[i] *= limit[i];
+        const std::vector<float> limit = mask ? *mask : effectMatte(e, local, full, scale, sourceSeconds);
+        if (limit.size() == size_t(full.width) * size_t(full.height))
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) matte[size_t(y) * size_t(W) + size_t(x)] *= limit[size_t(y0 + y) * size_t(full.width) + size_t(x0 + x)];
     }
     if (showMatte) {
         for (size_t i = 0; i < matte.size(); ++i) {

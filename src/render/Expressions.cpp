@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -279,12 +280,17 @@ struct Evaluating {
 constexpr int kMaxDepth = 16;         // param() into param() ...
 constexpr int kBudget = 2000;         // x 1000 instructions an evaluation
 constexpr size_t kMemory = 64 << 20;  // bytes a state
+// The longest string. Copying, comparing or changing the case of a string runs in C as one instruction, out of the
+// time limit's sight; a megabyte at most keeps a thousand of them (between two looks at the clock) to a moment.
+constexpr size_t kMaxString = 1 << 20;
+constexpr double kSeconds = 5.0;  // the time limit on the clock, whatever the instructions were
 constexpr size_t kCompiled = 512;     // expressions kept compiled a thread
 
 struct State {
     lua_State* L = nullptr;
     size_t used = 0;
     int ticks = 0;
+    std::chrono::steady_clock::time_point started;  // of the outermost evaluation
     int base = LUA_NOREF;  // the read-only globals expressions see
     std::unordered_map<std::string, int> compiled;  // expression -> its function (registry ref)
     std::unordered_map<std::string, std::string> bad;  // expression -> why it does not compile
@@ -301,6 +307,7 @@ int panic(lua_State*) { throw Panic{}; }
 
 void* allocate(void* ud, void* ptr, size_t osize, size_t nsize) {
     auto* st = static_cast<State*>(ud);
+    const bool newString = !ptr && osize == LUA_TSTRING;  // (a new object's "old size" is its type)
     if (!ptr) osize = 0;
     if (nsize == 0) {
         st->used -= osize;
@@ -308,13 +315,19 @@ void* allocate(void* ud, void* ptr, size_t osize, size_t nsize) {
         return nullptr;
     }
     if (nsize > osize && st->used + (nsize - osize) > kMemory) return nullptr;
+    if (newString && nsize > kMaxString) return nullptr;
     void* p = std::realloc(ptr, nsize);
-    if (p) st->used += nsize - osize;
+    if (p) {
+        st->used += nsize - osize;
+        if (nsize > osize) st->ticks += int((nsize - osize) >> 16);  // memory made counts as time too (64 kB a tick)
+    }
     return p;
 }
 
 void budget(lua_State* L, lua_Debug*) {
-    if (++tState->ticks > kBudget) luaL_error(L, "the expression took too long");
+    if (++tState->ticks > kBudget ||
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - tState->started).count() > kSeconds)
+        luaL_error(L, "the expression took too long");
 }
 
 Eval& current(lua_State* L) {
@@ -331,6 +344,7 @@ int luaWiggle(lua_State* L) {
     const double falloff = numberArg(L, 4, 0.5);
     const uint64_t seed = e.seed ^ mix64(uint64_t(whole(numberArg(L, 5, 0), INT32_MIN, INT32_MAX)));
     const double x = double(e.local) / e.fps * freq;
+    if (!std::isfinite(x) || std::abs(x) * std::ldexp(1.0, octaves - 1) > 9e15) return luaL_error(L, "wiggle: %f is too fast", freq);
     double sum = 0, a = 1, norm = 0, f = 1;
     for (int o = 0; o < octaves; ++o) {
         sum += a * noise1(x * f, mix64(seed + uint64_t(o)));
@@ -506,22 +520,25 @@ State* state() {
     st->L = L;
     lua_atpanic(L, panic);
     // Only what computes: no files, programs, clocks, module loading or loading code from strings; nothing that catches
-    // errors (the time limit could not stop it) or reaches metatables (shared by every evaluation); no string matching
-    // or repeating (they run in C, where the time limit is not looked at).
+    // errors (the time limit could not stop it) or reaches metatables (shared by every evaluation); no string matching,
+    // repeating or splitting into bytes, and no moving or unpacking tables (they run in C, where the time limit is not
+    // looked at).
     luaL_requiref(L, LUA_GNAME, luaopen_base, 1);
     luaL_requiref(L, LUA_MATHLIBNAME, luaopen_math, 1);
     luaL_requiref(L, LUA_STRLIBNAME, luaopen_string, 1);
     luaL_requiref(L, LUA_TABLIBNAME, luaopen_table, 1);
     lua_pop(L, 4);
     lua_getglobal(L, LUA_STRLIBNAME);  // (the strings' own metatable reads it, so they go from the table itself)
-    for (const char* name : {"find", "match", "gmatch", "gsub", "rep", "pack", "packsize", "unpack", "dump"}) {
+    for (const char* name : {"find", "match", "gmatch", "gsub", "rep", "pack", "packsize", "unpack", "dump", "byte"}) {
         lua_pushnil(L);
         lua_setfield(L, -2, name);
     }
     lua_pop(L, 1);
-    lua_getglobal(L, LUA_TABLIBNAME);
-    lua_pushnil(L);
-    lua_setfield(L, -2, "move");
+    lua_getglobal(L, LUA_TABLIBNAME);  // (moving or unpacking a whole table is one instruction too)
+    for (const char* name : {"move", "unpack"}) {
+        lua_pushnil(L);
+        lua_setfield(L, -2, name);
+    }
     lua_pop(L, 1);
     lua_getglobal(L, LUA_MATHLIBNAME);  // (without its clock-seeded random numbers: random() is seeded by the setting)
     lua_pushnil(L);
@@ -684,7 +701,7 @@ double evaluateExpression(const Param& p, FrameTime t, double keyed, std::string
         Evaluating evaluating(e);
         lua_pushcfunction(L, run);
         if (compiled(st, p.expr, &error)) {
-            if (outermost) st.ticks = 0;  // (the ones it reads through param() share its time)
+            if (outermost) st.ticks = 0, st.started = std::chrono::steady_clock::now();  // (param()'s share its time)
             if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
                 error = lua_tostring(L, -1) ? lua_tostring(L, -1) : "failed";
             } else if (lua_isboolean(L, -1)) {

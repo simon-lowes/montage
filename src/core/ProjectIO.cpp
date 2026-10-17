@@ -536,12 +536,13 @@ QJsonObject captionTrackToJson(const CaptionTrack& t) {
     for (const Caption& c : t.captions) {
         QJsonArray item{double(c.start), double(c.end), qs(c.text)};
         const int keypad = captionKeypad(c);
-        if (!c.wordTimes.empty() || keypad != 2) {
+        if (!c.wordTimes.empty() || keypad != 2 || c.italic) {
             QJsonArray w;
             for (double f : c.wordTimes) w.append(std::round(f * 10000) / 10000);
             item.append(w);
         }
-        if (keypad != 2) item.append(keypad);  // out of its usual place: where, as a keypad digit
+        if (keypad != 2 || c.italic) item.append(keypad);  // out of its usual place: where, as a keypad digit
+        if (c.italic) item.append(1);
         items.append(item);
     }
     return QJsonObject{{"id", double(t.id)},        {"name", qs(t.name)}, {"language", qs(t.language)},
@@ -580,6 +581,7 @@ CaptionTrack captionTrackFromJson(const QJsonObject& o) {
         Caption c{i64(a.at(0)), i64(a.at(1)), ss(a.at(2)), {}};
         for (const auto& w : a.at(3).toArray()) c.wordTimes.push_back(w.toDouble());
         setCaptionKeypad(c, a.at(4).toInt(2));
+        c.italic = a.at(5).toInt(0) == 1;
         t.captions.push_back(std::move(c));
     }
     normalizeCaptions(t.captions);

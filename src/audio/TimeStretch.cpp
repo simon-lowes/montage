@@ -56,7 +56,8 @@ std::atomic<int> gRunning{0};
 
 int stretchHop(int sampleRate) { return std::max(64, int(std::lround(sampleRate * 0.012))); }
 
-void wsolaStretch(const AudioBuffer& in, const std::vector<double>& positions, int hop, int64_t outFrames, AudioBuffer& out) {
+void wsolaStretch(const AudioBuffer& in, const std::vector<double>& positions, int hop, int64_t outFrames, AudioBuffer& out,
+                  const std::atomic<bool>* cancel) {
     out.sampleRate = in.sampleRate;
     out.channels = std::max(1, in.channels);
     const size_t nch = size_t(out.channels);  // every channel cut at the same places, so a field keeps its directions
@@ -73,6 +74,7 @@ void wsolaStretch(const AudioBuffer& in, const std::vector<double>& positions, i
     int64_t prev = std::numeric_limits<int64_t>::min();  // where the last grain started in the source
     const int64_t grains = outFrames / hop + 2;
     for (int64_t k = 0; k < grains; ++k) {
+        if (cancel && (k & 255) == 0 && cancel->load()) break;
         const double at = positions[size_t(std::min<int64_t>(k, int64_t(positions.size()) - 1))];
         const int64_t nominal = int64_t(std::llround(at)) - half;  // the grain centred on its source position
         int64_t start = nominal;

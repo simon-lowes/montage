@@ -22,6 +22,7 @@ extern "C" {
 #endif
 
 #include "AudioRepair.h"
+#include "DialogueAlign.h"
 #include "SpectralRepair.h"
 #include "media/SpeechEnhance.h"
 
@@ -29,8 +30,9 @@ namespace montage {
 
 bool isSourceAudioEffect(const std::string& type) {
     return type == "denoise" || type == "voice_isolate" || type == "enhance_speech" || type == "declick" || type == "pitch_shift" ||
-           type == "dereverb" || type == "spectral_repair";
+           type == "dereverb" || type == "spectral_repair" || type == "dialogue_align";
 }
+
 
 bool hasVoiceIsolation() {
 #ifdef MONTAGE_WITH_RNNOISE
@@ -654,7 +656,31 @@ AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& sourc
     std::vector<Effect> copies;
     for (const Effect* e : effects) copies.push_back(*e);
     auto run = [job, source, copies] {
-        AudioBufferPtr r = source->channels >= 4 ? processField(source, copies, &job->cancel) : process(source, copies, &job->cancel);
+        // Dialogue Alignment re-times the sound (every channel cut at the same places, so a field keeps its
+        // directions): the effects either side of it run as a chain of their own.
+        AudioBufferPtr r = source;
+        std::vector<Effect> chain;
+        auto flush = [&] {
+            if (!chain.empty()) r = r->channels >= 4 ? processField(r, chain, &job->cancel) : process(r, chain, &job->cancel);
+            chain.clear();
+        };
+        for (const Effect& e : copies) {
+            if (e.type != "dialogue_align") {
+                chain.push_back(e);
+                continue;
+            }
+            flush();
+            if (job->cancel.load()) break;
+            try {
+                auto out = std::make_shared<AudioBuffer>();
+                applyDialogueWarp(*r, dialogueWarpFromString(e.s("warp")), e.p("invert", 0) > 0.5, *out, &job->cancel);
+                r = out;
+            } catch (const std::exception&) {
+                // Out of memory (a warp edited by hand): the sound plays as it was.
+            }
+        }
+        flush();
+        if (job->cancel.load()) r = source;
         {
             std::lock_guard lock(gCacheMutex);
             job->result = r;

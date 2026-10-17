@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 
+#include "audio/TimeStretch.h"
 #include "core/G2p.h"
 #include "core/Zip.h"
 
@@ -260,11 +261,42 @@ bool synthesizeSpeech(const std::string& text, const std::string& voiceId, doubl
                                     Ort::Value::CreateTensor<float>(cpu, &sp, 1, speedShape, 1)};
             const char* inNames[] = {"input_ids", "style", "speed"};
             const char* outNames[] = {"waveform"};
-            auto result = model->session->Run(Ort::RunOptions{nullptr}, inNames, inputs, 3, outNames, 1);
-            const float* w = result[0].GetTensorData<float>();
-            const size_t count = result[0].GetTensorTypeAndShapeInfo().GetElementCount();
+            auto run = [&] {
+                auto result = model->session->Run(Ort::RunOptions{nullptr}, inNames, inputs, 3, outNames, 1);
+                const float* w = result[0].GetTensorData<float>();
+                return std::vector<float>(w, w + result[0].GetTensorTypeAndShapeInfo().GetElementCount());
+            };
+            std::vector<float> piece = run();
+            auto finite = [](const std::vector<float>& v) { return std::all_of(v.begin(), v.end(), [](float x) { return std::isfinite(x); }); };
+            // The half-precision model can overflow at some speeds for some lines (every sample NaN, most often when
+            // asked to speak slowly): said at another pace instead and stretched to the speed asked, its pitch kept.
+            const float asked = sp;
+            for (float other : {1.0f, 1.1f, 0.9f, 1.2f, 1.3f}) {
+                if (finite(piece) || (cancel && cancel->load())) break;
+                if (std::fabs(other - asked) < 1e-3f) continue;
+                sp = other;
+                std::vector<float> made = run();
+                if (!finite(made)) continue;
+                AudioBuffer in;
+                in.sampleRate = kTtsSampleRate;
+                in.channels = 1;
+                in.samples = std::move(made);
+                const double ratio = double(other) / asked;  // the made sound's seconds per second asked for
+                const int hop = stretchHop(kTtsSampleRate);
+                const int64_t frames = int64_t(std::llround(double(in.frames()) * ratio));
+                std::vector<double> positions;
+                for (int64_t k = 0; k <= frames / hop + 2; ++k) positions.push_back(double(k * hop) / ratio);
+                AudioBuffer stretched;
+                wsolaStretch(in, positions, hop, frames, stretched);
+                piece = std::move(stretched.samples);
+            }
+            sp = asked;
+            if (!finite(piece)) {
+                if (error) *error = cancel && cancel->load() ? "Cancelled" : "Speech synthesis failed: the voice model gave no sound";
+                return false;
+            }
             if (!out.empty()) out.insert(out.end(), size_t(kTtsSampleRate * 0.12), 0.0f);  // between pieces
-            out.insert(out.end(), w, w + count);
+            out.insert(out.end(), piece.begin(), piece.end());
             if (progress) progress(double(n + 1) / pieces.size());
         }
     } catch (const Ort::Exception& e) {
