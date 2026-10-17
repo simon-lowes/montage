@@ -7537,23 +7537,47 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_export_dcp", "Export a DCP",
-        "Make a Digital Cinema Package of the active sequence for cinemas and festivals: SMPTE (Bv2.1), 2K JPEG 2000 "
-        "pictures in DCI X'Y'Z' in the Flat, Scope or full container (the frame fitted on black), 24-bit 48 kHz sound in "
+        "Make a Digital Cinema Package of the active sequence for cinemas and festivals: SMPTE (Bv2.1), 2K or 4K JPEG 2000 "
+        "pictures in DCI X'Y'Z' in the Flat, Scope or full container (the frame fitted on black), both eyes of a "
+        "stereoscopic sequence with `stereo` (2K), 24-bit 48 kHz sound in "
         "5.1 (7.1 DS from a 7.1 sequence; a stereo mix on left and right), a composition playlist, packing list with "
         "hashes and asset map, in a folder under `folder` named by the Digital Cinema Naming Convention. 23.976 plays at "
-        "24. The package is checked when done (as montage_verify_dcp); returns its name, folder and anything the check found.",
+        "24. `subtitles` names a caption track to send as SMPTE subtitles (or closed captions, or burned in). `encrypt` "
+        "encrypts the track files and keeps their keys in a DKDM, from which montage_make_kdm makes KDMs for cinemas. "
+        "The package is checked when done (as montage_verify_dcp); returns its name, folder, anything the check found and "
+        "what Bv2.1 advises.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string","description":"Where to make the DCP folder"},
             "title":{"type":"string"},"kind":{"type":"string","enum":["feature","short","trailer","teaser","advertisement","test","rating","psa"],"default":"feature"},
             "container":{"type":"string","enum":["flat","scope","full"],"description":"Default: Scope for sequences 2:1 or wider, else Flat"},
             "fps":{"type":"integer","enum":[24,25,30,48],"description":"Default: the sequence's, to the nearest"},
             "language":{"type":"string","default":"en"},"territory":{"type":"string","default":"XX"},
             "issuer":{"type":"string"},"studio":{"type":"string"},"facility":{"type":"string"},
-            "in_out":{"type":"boolean","default":false,"description":"Only In to Out"}},"required":["project","folder"]})json",
+            "in_out":{"type":"boolean","default":false,"description":"Only In to Out"},
+            "resolution":{"type":"string","enum":["2k","4k"],"default":"2k"},
+            "stereo":{"type":"boolean","default":false,"description":"Stereoscopic 3D: both eyes (the sequence must be stereoscopic; 2K)"},
+            "subtitles":{"type":"string","description":"A caption track, by name or language, to go with it"},
+            "subtitles_as":{"type":"string","enum":["subtitles","closed_captions","burn_in"],"default":"subtitles"},
+            "subtitle_language":{"type":"string","description":"RFC 5646; default: the caption track's"},
+            "encrypt":{"type":"boolean","default":false,"description":"Encrypted track files; cinemas need KDMs (montage_make_kdm)"}},"required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             const Sequence& s = l.seq();
             if (s.duration() == 0) return fail("The sequence is empty");
             DcpSettings st;
+            st.resolution = str(a, "resolution", "2k").toStdString();
+            st.stereo = a.value("stereo").toBool();
+            st.encrypt = a.value("encrypt").toBool();
+            if (const QString want = str(a, "subtitles"); !want.isEmpty()) {
+                for (const CaptionTrack& t : s.captionTracks)
+                    if (QString::fromStdString(t.name).compare(want, Qt::CaseInsensitive) == 0) st.subtitles = t.id;
+                for (const CaptionTrack& t : s.captionTracks)
+                    if (!st.subtitles && QString::fromStdString(t.language).compare(want, Qt::CaseInsensitive) == 0) st.subtitles = t.id;
+                if (!st.subtitles) throw ArgError{"subtitles names no caption track of the sequence"};
+                const QString as = str(a, "subtitles_as", "subtitles");
+                st.closedCaptions = as == QLatin1String("closed_captions");
+                st.burnIn = as == QLatin1String("burn_in");
+                st.subtitleLanguage = str(a, "subtitle_language").toStdString();
+            }
             st.title = str(a, "title", QFileInfo(need(a, "project")).completeBaseName()).toStdString();
             st.kind = str(a, "kind", "feature").toStdString();
             st.container = str(a, "container", QString::fromStdString(defaultDcpContainer(s))).toStdString();
@@ -7575,12 +7599,18 @@ void McpServer::Impl::addTools() {
                     return true;
                 }, &err))
                 return fail(QString::fromStdString(err));
-            QJsonArray found;
-            for (const std::string& i : verifyDcp(r.folder)) found.append(QString::fromStdString(i));
+            QJsonArray found, advised;
+            std::vector<std::string> advice;
+            for (const std::string& i : verifyDcp(r.folder, {}, &advice)) found.append(QString::fromStdString(i));
+            for (const std::string& i : advice) advised.append(QString::fromStdString(i));
             const QJsonObject out{{"name", QString::fromStdString(r.name)}, {"folder", QString::fromStdString(r.folder)},
-                                  {"cpl", QString::fromStdString(r.cpl)}, {"frames", double(r.frames)}, {"fps", r.fps},
+                                  {"cpl", QString::fromStdString(r.cpl)}, {"cpl_id", QString::fromStdString(r.cplId)},
+                                  {"frames", double(r.frames)}, {"fps", r.fps},
                                   {"width", r.width}, {"height", r.height}, {"channels", r.channels},
-                                  {"dci_profile", r.cinemaProfile}, {"problems", found}};
+                                  {"dci_profile", r.cinemaProfile}, {"stereo", r.stereo}, {"encrypted", r.encrypted},
+                                  {"signed", r.signedPackage}, {"subtitles", r.subtitleCount},
+                                  {"dkdm", r.dkdm.empty() ? QJsonValue() : QJsonValue(QString::fromStdString(r.dkdm))},
+                                  {"problems", found}, {"advice", advised}};
             return ok(found.isEmpty() ? QStringLiteral("Made %1 and checked it: no problems").arg(QString::fromStdString(r.name))
                                       : QStringLiteral("Made %1; the check found %2 problem(s)").arg(QString::fromStdString(r.name)).arg(found.size()),
                       out);
@@ -7597,6 +7627,46 @@ void McpServer::Impl::addTools() {
             for (const std::string& i : verifyDcp(folder.toStdString())) found.append(QString::fromStdString(i));
             return ok(found.isEmpty() ? QStringLiteral("The DCP checks out") : QStringLiteral("%1 problem(s): %2").arg(found.size()).arg(found.at(0).toString()),
                       QJsonObject{{"problems", found}, {"ok", found.isEmpty()}});
+        });
+
+    add("montage_make_kdm", "Make KDMs for an encrypted DCP",
+        "Make Key Delivery Messages (SMPTE ST 430-1) so cinema servers can play an encrypted DCP: one for each server "
+        "certificate (the files the cinema sends; a chain file's leaf is used), its keys valid from `from` to `until`, made "
+        "from the DKDM montage_export_dcp kept, signed by Montage's certificate chain. The window must sit inside the "
+        "DKDM's and the server certificate's. Returns the KDM files.",
+        R"json({"type":"object","properties":{"dkdm":{"type":"string","description":"The DCP's DKDM (montage_export_dcp returns it)"},
+            "servers":{"type":"array","items":{"type":"string"},"description":"The servers' certificate files (PEM)"},
+            "from":{"type":"string","description":"ISO 8601 date and time; default now"},
+            "until":{"type":"string","description":"ISO 8601 date and time; default a week after from"},
+            "folder":{"type":"string","description":"Where to write the KDMs"},
+            "annotation":{"type":"string"}},"required":["dkdm","servers","folder"]})json",
+        false, [](const QJsonObject& a) {
+            KdmRequest r;
+            r.dkdm = absolute(need(a, "dkdm")).toStdString();
+            for (const QJsonValue& v : a.value("servers").toArray()) r.recipients.push_back(absolute(v.toString()).toStdString());
+            if (r.recipients.empty()) throw ArgError{"servers names no certificate"};
+            auto when = [&](const char* key, const QDateTime& fallback) {
+                const QString text = str(a, key);
+                if (text.isEmpty()) return fallback;
+                const QDateTime t = QDateTime::fromString(text, Qt::ISODate);
+                if (!t.isValid()) throw ArgError{QStringLiteral("%1 is not an ISO 8601 date and time").arg(key)};
+                return t;
+            };
+            const QDateTime from = when("from", QDateTime::currentDateTime());
+            const QDateTime until = when("until", from.addDays(7));
+            r.notBefore = from.toSecsSinceEpoch();
+            r.notAfter = until.toSecsSinceEpoch();
+            r.offsetMinutes = from.offsetFromUtc() / 60;
+            r.annotation = str(a, "annotation").toStdString();
+            const QString folder = absolute(need(a, "folder"));
+            QDir().mkpath(folder);
+            r.folder = folder.toStdString();
+            std::vector<std::string> files;
+            std::string err;
+            if (!makeKdms(r, &files, &err)) return fail(QString::fromStdString(err));
+            QJsonArray made;
+            for (const std::string& f : files) made.append(QString::fromStdString(f));
+            return ok(QStringLiteral("Made %1 KDM(s) in %2").arg(files.size()).arg(folder), QJsonObject{{"kdms", made}});
         });
 
     add("montage_export_imf", "Export an IMF master",

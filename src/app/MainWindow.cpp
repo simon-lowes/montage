@@ -3,6 +3,7 @@
 #include "PatchGenerator.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
+#include "render/DcpSecurity.h"
 #include "render/OGraf.h"
 #include "render/Ofx.h"
 #include "AssistantPanel.h"
@@ -53,6 +54,7 @@
 #include <QProgressDialog>
 #include <QPageSize>
 #include <QDateTime>
+#include <QDateTimeEdit>
 #include <QUuid>
 #include <QTextDocument>
 #include <QPdfWriter>
@@ -996,6 +998,7 @@ void MainWindow::buildMenus() {
     add(file, tr("Export &Versions…"), QKeySequence(), [this] { exportVersionsDialog(); })->setObjectName(QStringLiteral("exportVersions"));
     add(file, tr("Export for Re&view…"), QKeySequence(), [this] { exportForReviewDialog(); })->setObjectName(QStringLiteral("exportForReview"));
     add(file, tr("Export &DCP (Digital Cinema)…"), QKeySequence(), [this] { exportDcpDialog(); })->setObjectName(QStringLiteral("exportDcp"));
+    add(file, tr("Make &KDMs…"), QKeySequence(), [this] { makeKdmsDialog(); })->setObjectName(QStringLiteral("makeKdms"));
     add(file, tr("Export &IMF Master…"), QKeySequence(), [this] { exportImfDialog(); })->setObjectName(QStringLiteral("exportImf"));
     add(file, tr("Export Immersive Master (&ADM BWF)…"), QKeySequence(), [this] { exportAdmDialog(); })
         ->setObjectName(QStringLiteral("exportAdm"));
@@ -5995,7 +5998,7 @@ QString MainWindow::exportDcpTo(const QString& parent, const DcpSettings& settin
     connect(&tick, &QTimer::timeout, this, [&] { progress.setValue(done.load()); });
     tick.start(100);
     // Then checked as a server would, reading every file back (also off the UI thread: a feature is many gigabytes).
-    std::vector<std::string> issues;
+    std::vector<std::string> issues, advice;
     std::atomic<bool> checking{false};
     connect(&tick, &QTimer::timeout, this, [&] {
         if (checking.load()) progress.setLabelText(tr("Checking the DCP of %1...").arg(QString::fromStdString(seq.name)));
@@ -6010,7 +6013,7 @@ QString MainWindow::exportDcpTo(const QString& parent, const DcpSettings& settin
         issues = verifyDcp(result.folder, [&](double f) {
             done = 850 + int(f * 150);
             return !cancel.load();
-        });
+        }, &advice);
         return true;
     }));
     if (!watcher.isFinished()) loop.exec();
@@ -6034,14 +6037,24 @@ QString MainWindow::exportDcpTo(const QString& parent, const DcpSettings& settin
         state_->message(tr("DCP %1 made, but this FFmpeg has no OpenJPEG, so the pictures are not in the DCI profile most cinema servers need")
                             .arg(QString::fromStdString(result.name)),
                         12000);
-    else
-        state_->message(tr("DCP %1 made and checked (%2 fps, %3 x %4, %5 channels): copy the folder to a drive for the cinema")
-                            .arg(QString::fromStdString(result.name))
-                            .arg(result.fps)
-                            .arg(result.width)
-                            .arg(result.height)
-                            .arg(result.channels),
-                        12000);
+    else {
+        // What else to know: the keys an encrypted one needs, and what Bv2.1 advises about its subtitles.
+        QString more;
+        if (result.encrypted) more += tr(" It is encrypted: make KDMs for the cinemas' servers with File › Make KDMs (its keys are kept in %1).")
+                                          .arg(QDir::toNativeSeparators(QString::fromStdString(result.dkdm)));
+        if (!advice.empty())
+            more += tr(" Advice: %1").arg(QString::fromStdString(advice.front())) +
+                    (advice.size() > 1 ? tr(" (and %n more)", nullptr, int(advice.size() - 1)) : QString());
+        state_->message(tr("DCP %1 made and checked (%2 fps, %3 x %4, %5 channels): copy the folder to a drive for the cinema.")
+                                .arg(QString::fromStdString(result.name))
+                                .arg(result.fps)
+                                .arg(result.width)
+                                .arg(result.height)
+                                .arg(result.channels) +
+                            more,
+                        15000);
+    }
+    lastDcp_ = result;
     return folder;
 }
 
@@ -6297,7 +6310,7 @@ void MainWindow::exportDcpDialog() {
     dlg.setObjectName(QStringLiteral("exportDcpDialog"));
     dlg.setWindowTitle(tr("Export DCP"));
     auto* form = new QFormLayout(&dlg);
-    auto* intro = new QLabel(tr("A Digital Cinema Package of %1 for cinema servers and festivals (SMPTE, 2K JPEG 2000, 24-bit sound), "
+    auto* intro = new QLabel(tr("A Digital Cinema Package of %1 for cinema servers and festivals (SMPTE, JPEG 2000, 24-bit sound), "
                                 "checked when it is done. Copy the folder it makes to a drive (ext2/3 or NTFS) for the cinema.")
                                  .arg(QString::fromStdString(s->name)),
                              &dlg);
@@ -6323,6 +6336,44 @@ void MainWindow::exportDcpDialog() {
     container->addItem(tr("Full container (1.90:1, 2048 x 1080)"), "full");
     container->setCurrentIndex(container->findData(QString::fromStdString(defaultDcpContainer(*s))));
     form->addRow(tr("Picture:"), container);
+    auto* resolution = new QComboBox(&dlg);
+    resolution->setObjectName(QStringLiteral("dcpResolution"));
+    resolution->addItem(tr("2K"), "2k");
+    resolution->addItem(tr("4K (twice the size each way; Flat 3996 x 2160)"), "4k");
+    form->addRow(tr("Resolution:"), resolution);
+    auto* stereo = new QCheckBox(tr("Stereoscopic 3D (both eyes, 2K)"), &dlg);
+    stereo->setObjectName(QStringLiteral("dcpStereo"));
+    stereo->setEnabled(s->stereo3d);
+    stereo->setChecked(s->stereo3d);
+    if (!s->stereo3d) stereo->setToolTip(tr("The sequence is not stereoscopic (Sequence Settings)"));
+    form->addRow(QString(), stereo);
+    connect(resolution, &QComboBox::currentIndexChanged, &dlg, [=] {
+        const bool fourK = resolution->currentData().toString() == QLatin1String("4k");
+        stereo->setEnabled(s->stereo3d && !fourK);
+        if (fourK) stereo->setChecked(false);
+    });
+    auto* subtitles = new QComboBox(&dlg);
+    subtitles->setObjectName(QStringLiteral("dcpSubtitles"));
+    subtitles->addItem(tr("None"), QVariant::fromValue<qulonglong>(0));
+    for (const CaptionTrack& t : s->captionTracks)
+        subtitles->addItem(tr("%1 (%2, %3 captions)").arg(QString::fromStdString(t.name), QString::fromStdString(t.language)).arg(t.captions.size()),
+                           QVariant::fromValue<qulonglong>(t.id));
+    if (subtitles->count() > 1) subtitles->setCurrentIndex(1);
+    form->addRow(tr("Subtitles:"), subtitles);
+    auto* subtitleKind = new QComboBox(&dlg);
+    subtitleKind->setObjectName(QStringLiteral("dcpSubtitleKind"));
+    subtitleKind->addItem(tr("On screen, drawn by the server"), "subtitles");
+    subtitleKind->addItem(tr("Closed captions, for viewers' own devices"), "closed");
+    subtitleKind->addItem(tr("Burned into the picture"), "burn");
+    form->addRow(tr("Shown as:"), subtitleKind);
+    auto updateSubtitles = [=] { subtitleKind->setEnabled(subtitles->currentIndex() > 0); };
+    connect(subtitles, &QComboBox::currentIndexChanged, &dlg, updateSubtitles);
+    updateSubtitles();
+    auto* encrypt = new QCheckBox(tr("Encrypt (cinemas need a KDM to play it: File › Make KDMs…)"), &dlg);
+    encrypt->setObjectName(QStringLiteral("dcpEncrypt"));
+    encrypt->setEnabled(dcp::securityAvailable());
+    if (!dcp::securityAvailable()) encrypt->setToolTip(tr("This build has no OpenSSL"));
+    form->addRow(QString(), encrypt);
     auto* rate = new QComboBox(&dlg);
     rate->setObjectName(QStringLiteral("dcpRate"));
     rate->addItem(tr("As the sequence (%1 fps)").arg(dcpFrameRate(*s, 0)), 0);
@@ -6382,11 +6433,97 @@ void MainWindow::exportDcpDialog() {
     st.studio = studio->text().trimmed().toStdString();
     st.facility = facility->text().trimmed().toStdString();
     st.inOut = range->isChecked() && marked;
+    st.resolution = resolution->currentData().toString().toStdString();
+    st.stereo = stereo->isEnabled() && stereo->isChecked();
+    st.subtitles = Id(subtitles->currentData().toULongLong());
+    st.closedCaptions = st.subtitles && subtitleKind->currentData().toString() == QLatin1String("closed");
+    st.burnIn = st.subtitles && subtitleKind->currentData().toString() == QLatin1String("burn");
+    st.encrypt = encrypt->isEnabled() && encrypt->isChecked();
     appSettings().setValue(QStringLiteral("export/lastDirectory"), folder->text());
     appSettings().setValue(QStringLiteral("dcp/issuer"), issuer->text().trimmed());
     appSettings().setValue(QStringLiteral("dcp/studio"), studio->text().trimmed());
     appSettings().setValue(QStringLiteral("dcp/facility"), facility->text().trimmed());
     exportDcpTo(folder->text(), st);
+}
+
+void MainWindow::makeKdmsDialog() {
+    if (!dcp::securityAvailable()) {
+        state_->message(tr("This build has no OpenSSL, so it cannot make KDMs"));
+        return;
+    }
+    QDialog dlg(this);
+    dlg.setObjectName(QStringLiteral("makeKdmsDialog"));
+    dlg.setWindowTitle(tr("Make KDMs"));
+    auto* form = new QFormLayout(&dlg);
+    auto* intro = new QLabel(tr("Keys for cinema servers to play an encrypted DCP: one KDM for each server certificate, valid "
+                                "between the times given. The cinema sends its servers' certificates; the DKDM is the file Montage kept "
+                                "when it made the DCP."),
+                             &dlg);
+    intro->setWordWrap(true);
+    form->addRow(intro);
+    auto fileRow = [&](QLineEdit* edit, const QString& caption, const QString& filter, bool many) {
+        auto* browse = new QPushButton(tr("Choose…"), &dlg);
+        connect(browse, &QPushButton::clicked, &dlg, [=, &dlg] {
+            const QString from = edit->text().isEmpty() ? QString::fromStdString(dcp::dkdmFolder()) : QFileInfo(edit->text().split(';').front()).path();
+            if (many) {
+                const QStringList f = QFileDialog::getOpenFileNames(&dlg, caption, from, filter);
+                if (!f.isEmpty()) edit->setText(f.join(';'));
+            } else if (const QString f = QFileDialog::getOpenFileName(&dlg, caption, from, filter); !f.isEmpty()) {
+                edit->setText(f);
+            }
+        });
+        auto* row = new QHBoxLayout;
+        row->addWidget(edit, 1);
+        row->addWidget(browse);
+        return row;
+    };
+    auto* dkdm = new QLineEdit(QString::fromStdString(lastDcp_.dkdm), &dlg);
+    dkdm->setObjectName(QStringLiteral("kdmDkdm"));
+    form->addRow(tr("DKDM:"), fileRow(dkdm, tr("Choose the DCP's DKDM"), tr("KDMs (*.xml)"), false));
+    auto* servers = new QLineEdit(&dlg);
+    servers->setObjectName(QStringLiteral("kdmServers"));
+    servers->setPlaceholderText(tr("the servers' certificates (.pem, .crt), separated by ;"));
+    form->addRow(tr("Servers:"), fileRow(servers, tr("Choose the Servers' Certificates"), tr("Certificates (*.pem *.crt *.cer);;All files (*)"), true));
+    const QDateTime now = QDateTime::currentDateTime();
+    auto* from = new QDateTimeEdit(now, &dlg);
+    from->setObjectName(QStringLiteral("kdmFrom"));
+    from->setCalendarPopup(true);
+    form->addRow(tr("Valid from:"), from);
+    auto* until = new QDateTimeEdit(now.addDays(7), &dlg);
+    until->setObjectName(QStringLiteral("kdmUntil"));
+    until->setCalendarPopup(true);
+    form->addRow(tr("Until:"), until);
+    auto* folder = new QLineEdit(appSettings().value(QStringLiteral("dcp/kdmFolder"), QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)).toString(), &dlg);
+    folder->setObjectName(QStringLiteral("kdmFolder"));
+    auto* browse = new QPushButton(tr("Choose…"), &dlg);
+    connect(browse, &QPushButton::clicked, &dlg, [&] {
+        if (const QString d = QFileDialog::getExistingDirectory(&dlg, tr("Put the KDMs In"), folder->text()); !d.isEmpty()) folder->setText(d);
+    });
+    auto* row = new QHBoxLayout;
+    row->addWidget(folder, 1);
+    row->addWidget(browse);
+    form->addRow(tr("Put them in:"), row);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    buttons->button(QDialogButtonBox::Ok)->setText(tr("Make KDMs"));
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+    if (dlg.exec() != QDialog::Accepted) return;
+    KdmRequest r;
+    r.dkdm = dkdm->text().trimmed().toStdString();
+    for (const QString& f : servers->text().split(';', Qt::SkipEmptyParts)) r.recipients.push_back(f.trimmed().toStdString());
+    r.notBefore = from->dateTime().toSecsSinceEpoch();
+    r.notAfter = until->dateTime().toSecsSinceEpoch();
+    r.offsetMinutes = from->dateTime().offsetFromUtc() / 60;
+    r.folder = folder->text().toStdString();
+    appSettings().setValue(QStringLiteral("dcp/kdmFolder"), folder->text());
+    std::vector<std::string> made;
+    std::string err;
+    if (!makeKdms(r, &made, &err)) {
+        state_->message(tr("No KDMs: %1").arg(QString::fromStdString(err)), 10000);
+        return;
+    }
+    state_->message(tr("Made %n KDM(s) in %1: send each to its cinema", nullptr, int(made.size())).arg(QDir::toNativeSeparators(folder->text())), 10000);
 }
 
 namespace {

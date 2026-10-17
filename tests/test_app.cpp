@@ -93,6 +93,7 @@
 #include "core/Interpretation.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
+#include "render/DcpSecurity.h"
 #include "render/Ofx.h"
 #include "Assistant.h"
 #include "AssistantPanel.h"
@@ -6750,6 +6751,65 @@ private slots:
         QVERIFY(!r.value("structuredContent").toObject().value("ok").toBool());
         QVERIFY(call("montage_export_dcp", {{"project", dir_.filePath("dcp.montage")}, {"folder", dir_.filePath("mcp")}, {"container", "imax"}})
                     .value("isError").toBool());
+        // The dialog offers 4K, 3D (only for a stereoscopic sequence), the caption tracks and encryption.
+        QVERIFY(state()->edit("Subtitles", [&](Project& p, Sequence& s) {
+            CaptionTrack t;
+            t.id = p.newId();
+            t.name = "French";
+            t.language = "fr";
+            Caption c;
+            c.start = 4, c.end = 20, c.text = "Bonjour";
+            t.captions = {c};
+            s.captionTracks.push_back(t);
+            return true;
+        }));
+        bool offered = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+            if (!dlg || dlg->objectName() != QLatin1String("exportDcpDialog")) return;
+            auto* resolution = dlg->findChild<QComboBox*>("dcpResolution");
+            auto* stereo = dlg->findChild<QCheckBox*>("dcpStereo");
+            auto* subtitles = dlg->findChild<QComboBox*>("dcpSubtitles");
+            auto* kind = dlg->findChild<QComboBox*>("dcpSubtitleKind");
+            auto* encrypt = dlg->findChild<QCheckBox*>("dcpEncrypt");
+            offered = resolution && resolution->count() == 2 && stereo && !stereo->isEnabled() && subtitles && subtitles->count() == 2 &&
+                      subtitles->currentText().startsWith("French") && kind && kind->isEnabled() && kind->count() == 3 && encrypt &&
+                      encrypt->isEnabled() == dcp::securityAvailable();
+            dlg->reject();
+        });
+        win_->exportDcpDialog();
+        QVERIFY(offered);
+        // Encrypted with the subtitles over MCP, then KDMs for a cinema's server from the DKDM it kept.
+        if (dcp::securityAvailable()) {
+            QVERIFY(state()->save(dir_.filePath("dcp.montage")));
+            r = call("montage_export_dcp", {{"project", dir_.filePath("dcp.montage")}, {"folder", dir_.filePath("mcp")}, {"title", "Locked"},
+                                            {"subtitles", "fr"}, {"encrypt", true}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            const QJsonObject locked = r.value("structuredContent").toObject();
+            QVERIFY2(locked.value("problems").toArray().isEmpty(), QJsonDocument(locked).toJson().constData());
+            QVERIFY(locked.value("encrypted").toBool() && locked.value("signed").toBool() && locked.value("subtitles").toInt() == 1);
+            QVERIFY(QFileInfo::exists(locked.value("dkdm").toString()));
+            dcp::CertificateChain cinema;
+            std::string err;
+            QVERIFY(dcp::makeCertificateChain("Cinema", cinema, &err));
+            const QString server = dir_.filePath("server.pem");
+            QFile f(server);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QByteArray::fromStdString(cinema.certificates.back()));
+            f.close();
+            r = call("montage_make_kdm", {{"dkdm", locked.value("dkdm")}, {"servers", QJsonArray{server}}, {"folder", dir_.filePath("kdms")}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            const QJsonArray kdms = r.value("structuredContent").toObject().value("kdms").toArray();
+            QCOMPARE(kdms.size(), 1);
+            QFile k(kdms.at(0).toString());
+            QVERIFY(k.open(QIODevice::ReadOnly));
+            dcp::KdmContents opened;
+            QVERIFY2(dcp::readKdm(k.readAll().toStdString(), cinema.privateKey, opened, &err), err.c_str());
+            QVERIFY(opened.cplId == locked.value("cpl_id").toString().toStdString() && opened.keys.size() == 3);
+            QVERIFY(call("montage_make_kdm", {{"dkdm", locked.value("dkdm")}, {"servers", QJsonArray{server}}, {"folder", dir_.filePath("kdms")},
+                                              {"until", "2099-01-01T00:00:00Z"}})
+                        .value("isError").toBool());
+        }
         state()->newProject();
     }
 

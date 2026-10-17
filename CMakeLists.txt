@@ -34,6 +34,7 @@ option(MONTAGE_GPU "The GPU compositor through Qt's RHI, where Qt is 6.6 or late
 option(MONTAGE_WITH_OCIO "OpenColorIO configs and ACES transforms, when OpenColorIO 2.1+ is installed" ON)
 option(MONTAGE_WITH_ONNXRUNTIME "AI object masks (EdgeTAM), when ONNX Runtime 1.16+ is installed (ONNXRUNTIME_ROOT or the usual prefixes)" ON)
 option(MONTAGE_REQUIRE_ONNXRUNTIME "Fail to configure without ONNX Runtime (release builds)" OFF)
+option(MONTAGE_REQUIRE_OPENSSL "Fail to configure without OpenSSL 3 (release builds)" OFF)
 option(MONTAGE_WITH_C2PA "Content Credentials (C2PA), when scripts/build-c2pa.sh has built c2pa-rs (C2PA_ROOT or /opt/c2pa)" ON)
 option(MONTAGE_REQUIRE_C2PA "Fail to configure without the C2PA library (release builds)" OFF)
 

@@ -58,8 +58,8 @@ one with its exact version, licence and source.
   the bundled Qt libraries with your own build of the same version.
 - [OpenColorIO](https://opencolorio.org) (BSD-3-Clause), [ONNX Runtime](https://onnxruntime.ai) (MIT, with its own
   third-party notices), [LibRaw](https://www.libraw.org) (LGPL-2.1 or CDDL-1.0), [lilv](https://drobilla.net/software/lilv)
-  (ISC), [libmysofa](https://github.com/hoene/libmysofa) (BSD-3-Clause) and [OpenJPEG](https://www.openjpeg.org)
-  (BSD-2-Clause).
+  (ISC), [libmysofa](https://github.com/hoene/libmysofa) (BSD-3-Clause), [OpenJPEG](https://www.openjpeg.org)
+  (BSD-2-Clause) and [OpenSSL](https://www.openssl.org) 3 (Apache-2.0; encrypted DCPs, signatures and KDMs).
 
 ## Not included
 
