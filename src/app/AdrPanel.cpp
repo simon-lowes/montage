@@ -1,6 +1,7 @@
 #include "AdrPanel.h"
 
 #include <QAbstractItemView>
+#include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDoubleSpinBox>
@@ -29,6 +30,7 @@
 #include "PlaybackController.h"
 #include "Settings.h"
 #include "VoiceConvert.h"
+#include "audio/DialogueAlign.h"
 #include "Voiceover.h"
 #include "core/History.h"
 
@@ -134,6 +136,10 @@ AdrPanel::AdrPanel(EditorState* state, PlaybackController* program, ViewerWidget
     convert_->setObjectName(QStringLiteral("adrConvertVoice"));
     convert_->setToolTip(tr("Say the chosen take again in the guide's voice (with the speaker's consent), as a new take"));
     cueRow->addWidget(convert_);
+    align_ = new QPushButton(tr("Align to Guide"), this);
+    align_->setObjectName(QStringLiteral("adrAlign"));
+    align_->setToolTip(tr("Fit the chosen take to the guide's timing over the line, its pitch kept (Dialogue Alignment on the take)"));
+    cueRow->addWidget(align_);
     root->addLayout(cueRow);
     connect(status_, &QComboBox::activated, this, [this](int k) { setCueStatus(k); });
     connect(takes_, &QComboBox::activated, this, [this](int k) { pickTake(k); });
@@ -227,6 +233,7 @@ AdrPanel::AdrPanel(EditorState* state, PlaybackController* program, ViewerWidget
         dlg.exec();
         refresh();
     });
+    connect(align_, &QPushButton::clicked, this, [this] { alignToGuide(); });
     connect(record_, &QPushButton::clicked, this, &AdrPanel::record);
     connect(stop_, &QPushButton::clicked, this, &AdrPanel::stop);
 
@@ -391,6 +398,7 @@ void AdrPanel::updateButtons() {
     const Sequence* s = state_->sequence();
     const AdrCue* q = s && cue ? findAdrCue(*s, currentCue()) : nullptr;
     convert_->setEnabled(q && q->clip && !cycle_);
+    align_->setEnabled(q && q->clip && !cycle_ && guideClip() != 0);
     if (!cycle_) statusLabel_->setText(cue ? tr("Ready") : tr("Add cues: from captions, range markers, In/Out, or a cue sheet"));
 }
 
@@ -682,6 +690,28 @@ Id AdrPanel::guideClip() const {
         if (c.mediaId && overlap > most) best = c.id, most = overlap;
     }
     return best;
+}
+
+bool AdrPanel::alignToGuide(AlignPrecision precision) {
+    const Sequence* s = state_->sequence();
+    const AdrCue* q = s ? findAdrCue(*s, currentCue()) : nullptr;
+    const Id guide = guideClip();
+    if (!q || !q->clip || cycle_ || !guide) return false;
+    const Id clip = q->clip;
+    DialogueAlignOptions o;
+    o.precision = precision;
+    o.from = q->start, o.to = q->end;
+    DialogueAlignReport rep;
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    const bool ok = state_->apply(tr("Align to Guide"), [&](Project& p, Sequence& sq) { return edit::alignDialogue(p, sq, clip, guide, o, &rep); });
+    QApplication::restoreOverrideCursor();
+    refresh();
+    if (ok)
+        statusLabel_->setText(tr("Aligned to the guide: %1 anchors, stretched %2–%3 %")
+                                  .arg(rep.anchors)
+                                  .arg(std::lround(100 * rep.minRate))
+                                  .arg(std::lround(100 * rep.maxRate)));
+    return ok;
 }
 
 void AdrPanel::pickTake(int index) {

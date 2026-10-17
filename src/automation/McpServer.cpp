@@ -44,6 +44,7 @@
 #include "render/Hdr10Plus.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
+#include "audio/DialogueAlign.h"
 #include "audio/SpeechCleanup.h"
 #include "core/AafImport.h"
 #include "core/Provenance.h"
@@ -4998,6 +4999,60 @@ void McpServer::Impl::addTools() {
             for (Id id : ids)
                 if (std::none_of(plans.begin(), plans.end(), [&](const auto& pl) { return pl.first == id; })) skipped.append(double(id));
             return ok(QStringLiteral("Matched %1 clip(s) to %2").arg(n).arg(refName), QJsonObject{{"clips", out}, {"not_matched", skipped}});
+        });
+
+    add("montage_align_dialogue", "Align dialogue to a guide",
+        "Fit an ADR take, a pickup or a converted voice (clip, an audio clip; on an audition, the take it plays) to the "
+        "timing of the guide clip's speech (the production sound), its pitch kept: both are compared as speech, the take "
+        "stretched and squeezed (pauses most) to land on the guide's syllables, as a Dialogue Alignment effect on the clip "
+        "(aligning again replaces it; remove takes it off). mode shift lines up another microphone of the same take with "
+        "the boom by moving it alone, to a fraction of a sample, flipping its polarity when that was reversed. from and to "
+        "(seconds or timecode) narrow the guide's range (default: where the two clips overlap); precision thins the "
+        "anchors (loose, normal, tight). The clip stays where it is, lengthened to the end of the range if it stops "
+        "short and its track has room.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number","description":"The take"},
+            "guide":{"type":"number","description":"The guide (production sound)"},"mode":{"type":"string","enum":["warp","shift"],"default":"warp"},
+            "precision":{"type":"string","enum":["loose","normal","tight"],"default":"normal"},
+            "from":{"type":["number","string"]},"to":{"type":["number","string"]},"handles":{"type":"number","default":0.5},
+            "remove":{"type":"boolean","default":false}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Clip& take = clipArg(l, a, "clip");
+            const Id takeId = take.id;
+            if (a.value("remove").toBool(false)) {
+                if (!edit::removeDialogueAlignment(l.project, s, takeId)) return fail("The clip has no Dialogue Alignment");
+                save(l);
+                return ok(QStringLiteral("Took the alignment off %1").arg(QString::fromStdString(take.name)), QJsonObject{{"clip", double(takeId)}});
+            }
+            if (!a.contains("guide")) throw ArgError{"\"guide\" is needed (the clip to align to)"};
+            const Clip& guide = clipArg(l, a, "guide");
+            DialogueAlignOptions o;
+            const QString mode = a.value("mode").toString("warp");
+            if (mode != "warp" && mode != "shift") throw ArgError{"\"mode\" must be warp or shift"};
+            o.shift = mode == "shift";
+            if (a.contains("precision") && !parseAlignPrecision(a.value("precision").toString().toStdString(), o.precision))
+                throw ArgError{"\"precision\" must be loose, normal or tight"};
+            if (a.contains("from")) o.from = timeArg(a.value("from"), s, "from");
+            if (a.contains("to")) o.to = timeArg(a.value("to"), s, "to");
+            o.handles = std::clamp(a.value("handles").toDouble(0.5), 0.0, 10.0);
+            DialogueAlignReport rep;
+            const edit::Result r = edit::alignDialogue(l.project, s, takeId, guide.id, o, &rep);
+            if (!r.ok) return fail(QString::fromStdString(r.error));
+            save(l);
+            QJsonObject out{{"clip", double(takeId)}, {"mode", mode}, {"from", rep.from}, {"to", rep.to}, {"confidence", rep.confidence}};
+            if (o.shift) {
+                out["delay_ms"] = rep.delay * 1000;
+                out["inverted"] = rep.inverted;
+            } else {
+                out["anchors"] = rep.anchors;
+                out["min_rate"] = rep.minRate;
+                out["max_rate"] = rep.maxRate;
+            }
+            const QString name = QString::fromStdString(edit::clipById(s, takeId)->name);
+            return ok(o.shift ? QStringLiteral("Shifted %1 by %2 ms%3").arg(name).arg(rep.delay * 1000, 0, 'f', 2).arg(rep.inverted ? " (polarity flipped)" : "")
+                              : QStringLiteral("Aligned %1 to the guide (%2 anchors)").arg(name).arg(rep.anchors),
+                      out);
         });
 
     add("montage_set_surround", "Set up a surround mix",

@@ -620,6 +620,11 @@ std::vector<EffectInfo> buildCatalog() {
     // drawn in the Spectral Repair editor (Clip menu) or set over MCP; kept in the "regions" string.
     c.push_back({"spectral_repair", "Spectral Repair", EffectCategory::AudioFilter, "Restoration", {}, {}});
     c.back().hidden = true;
+    // A take fitted to the guide's timing (audio/DialogueAlign.h): the "warp" string (result seconds to the file's,
+    // for the take named by "media"), made by Align to Guide in the ADR panel or over MCP.
+    c.push_back({"dialogue_align", "Dialogue Alignment", EffectCategory::AudioFilter, "Restoration",
+                 {num("invert", "Invert Polarity", 0, 1, 0, 1)}, {}});
+    c.back().hidden = true;
     c.push_back({"dehum", "De-Hum", EffectCategory::AudioFilter, "Restoration",
                  {choice("mains", "Mains", {"50 Hz", "60 Hz"}, 0), num("harmonics", "Harmonics", 1, 16, 6, 1),
                   num("reduction_db", "Reduction (dB)", 0, 60, 30, 0.5), num("width_hz", "Notch Width (Hz)", 0.5, 10, 2, 0.1)},

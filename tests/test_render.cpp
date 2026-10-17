@@ -7059,6 +7059,18 @@ colorspaces:
         QVERIFY2(c[0] < 0.25f && c[1] < 0.35f && c[2] > 0.55f, qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
         rgb(frame, 160, 130, c);  // (the scene's (160, 170): ground)
         QVERIFY2(c[1] > c[2], qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
+        // A mask over the left half of the clip's frame: the sky replaced there only, wherever the picture is (here half
+        // off the canvas's right edge, from x 230: its frame's middle is at 310).
+        e.params["mask.shape"] = 2.0, e.params["mask.x"] = 0.25, e.params["mask.w"] = 0.5, e.params["mask.y"] = 0.5;
+        e.params["mask.h"] = 1.0, e.params["mask.feather"] = 0.0;
+        shot->motion.params["pos_x"] = 150.0;
+        frame = renderProgramFrame(p, s, 5, o);
+        rgb(frame, 300, 50, c);  // (the scene's (140, 10), in the mask)
+        QVERIFY2(c[0] < 0.25f && c[1] < 0.35f && c[2] > 0.55f, qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
+        rgb(frame, 318, 50, c);  // (the scene's (176, 10), outside it: the old sky)
+        QVERIFY2(c[0] > 0.28f && c[2] > 0.8f, qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
+        e.params["mask.shape"] = 0.0;
+        shot->motion.params["pos_x"] = 0.0;
         shot->motion.params["scale"] = 100.0;
         // Dissolving into the shot: the new sky is there through the transition.
         e.params["source"] = 0.0;

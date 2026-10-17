@@ -43,8 +43,9 @@ bool skyMotion(const Sequence& seq, const Clip& c, const Effect& e, FrameTime lo
 // The whole effect on `layer` (the clip's composited layer at clip-local `local`), with `skyLayer` the picture on the
 // sky track (null or empty: nothing to put in). It works within the clip's picture (its opaque bounds on the canvas),
 // with depth when Use Depth is on and the model installed. `scale` is pixels per sequence pixel; `sourceSeconds` the
-// media time.
+// media time. `mask` is the effect's mask over the whole layer (made over the clip's frame and carried through its
+// transform); null: made over the layer as it is.
 void applySkyReplacement(const Sequence& seq, const Clip& c, const Effect& e, FrameTime local, Image& layer, const Image* skyLayer,
-                         double scale, double sourceSeconds);
+                         double scale, double sourceSeconds, const std::vector<float>* mask = nullptr);
 
 }  // namespace montage

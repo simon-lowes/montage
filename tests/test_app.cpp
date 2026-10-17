@@ -9199,6 +9199,19 @@ const auto seq = [this] { return state()->sequence(); };
         // A take can be said again in the guide's voice (none on the guide track here).
         QTRY_VERIFY(panel->findChild<QPushButton*>("adrConvertVoice")->isEnabled());
         QCOMPARE(panel->guideClip(), Id(0));
+        // Aligned to the guide only once there is one; a take with no speech in it is refused, saying why.
+        auto* align = panel->findChild<QPushButton*>("adrAlign");
+        QVERIFY(align && !align->isEnabled());
+        const auto speech = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(speech.size(), size_t(1));
+        QVERIFY(state()->apply("Guide", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, speech.front(), 150, 0, -1, {TrackKind::Video, -1}, {TrackKind::Audio, 0}, false);
+        }));
+        QTRY_VERIFY(panel->guideClip() != 0);
+        QTRY_VERIFY(align->isEnabled());
+        QVERIFY(!panel->alignToGuide());
+        QVERIFY(said.last().at(0).toString().contains("no speech"));
+        QVERIFY(edit::clipById(*state()->sequence(), clip)->effects.empty());
         const Clip* c = edit::clipById(*state()->sequence(), clip);
         QVERIFY(c && c->start == 150 && c->duration == 60);
         QCOMPARE(c->sourceIn, double(150 - cyc.playFrom));

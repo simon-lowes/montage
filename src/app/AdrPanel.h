@@ -3,12 +3,13 @@
 // again and records the actor, the take joining the cue's audition clip on the ADR track (the newest the pick); Loop
 // records take after take until stopped. The guide (the production sound) can be muted while recording, and the
 // takes already made are muted too. Convert Voice… says the chosen take again in the guide's voice (app/VoiceConvert.h),
-// as a new take.
+// as a new take; Align to Guide fits the chosen take to the guide's timing.
 #pragma once
 
 #include <QWidget>
 #include <optional>
 
+#include "audio/DialogueAlign.h"
 #include "core/Adr.h"
 
 class QCheckBox;
@@ -66,6 +67,9 @@ public:
     void pickTake(int index);
     // The guide's clip under the current cue (the voice Convert Voice… offers first); 0 for none.
     Id guideClip() const;
+    // Align to Guide: the current cue's chosen take fitted to the guide's timing over the line (audio/DialogueAlign.h),
+    // one undo step; false (with the reason shown) when it could not be.
+    bool alignToGuide(AlignPrecision precision = AlignPrecision::Normal);
 
 signals:
     void takeRecorded(montage::Id cue, montage::Id clip);
@@ -102,6 +106,7 @@ private:
     QPushButton* record_;
     QPushButton* stop_;
     QPushButton* convert_;
+    QPushButton* align_;
     QProgressBar* meter_;
     QLabel* statusLabel_;
     std::optional<AdrCycle> cycle_;
