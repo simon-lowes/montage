@@ -556,7 +556,8 @@ bool writeRecording(const std::string& file, const char* format, const char* vco
         a.c->time_base = {1, 48000};
         const AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
         av_channel_layout_copy(&a.c->ch_layout, &stereo);
-        a.c->sample_fmt = codec->sample_fmts[0];
+        const std::string aname = acodec;  // (their one format each; AVCodec's list is gone in FFmpeg 8)
+        a.c->sample_fmt = aname == "pcm_s16le" ? AV_SAMPLE_FMT_S16 : aname == "pcm_s24le" ? AV_SAMPLE_FMT_S32 : AV_SAMPLE_FMT_FLTP;
         a.c->bit_rate = 128000;
         open(a, codec);
     }
