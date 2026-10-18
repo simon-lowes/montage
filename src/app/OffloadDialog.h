@@ -40,6 +40,8 @@ private:
     QLineEdit* author_;
     QPlainTextEdit* report_;
     QPushButton* start_ = nullptr;
+    QPushButton* repair_ = nullptr;  // Repair Media for the copies of interrupted recordings
+    QStringList damaged_;
     QString reportText_;
     bool running_ = false;
 };

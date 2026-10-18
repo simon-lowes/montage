@@ -1,4 +1,5 @@
 #include "MediaBinWidget.h"
+#include "RepairMediaDialog.h"
 
 #include <filesystem>
 #include <set>
@@ -566,7 +567,38 @@ void MediaBinWidget::importInto(const QStringList& files, const QString& bin) {
             }
     }
     if (!rest.isEmpty()) state_->importFiles(rest, &errors, bin);
-    if (!errors.isEmpty()) QMessageBox::warning(this, tr("Import"), errors.join("\n"));
+    // Files that did not come in because their recording was interrupted: offered for repair.
+    QStringList damaged;
+    if (!errors.isEmpty()) {
+        std::set<std::string> have;
+        for (const MediaItem& m : state_->project().media) have.insert(m.path);
+        for (const QString& f : rest)
+            if (!have.count(QFileInfo(f).absoluteFilePath().toStdString()) && checkRecording(f, false).kind != RepairKind::None) damaged << f;
+    }
+    if (!damaged.isEmpty()) {
+        QMessageBox ask(QMessageBox::Warning, tr("Import"),
+                        errors.join("\n") + "\n\n" +
+                            tr("%n file(s) look like recordings that were interrupted before they were finished. Repair them?", nullptr,
+                               int(damaged.size())),
+                        QMessageBox::Close, this);
+        ask.setObjectName(QStringLiteral("repairOffer"));
+        QPushButton* repair = ask.addButton(tr("Repair…"), QMessageBox::AcceptRole);
+        ask.exec();
+        if (ask.clickedButton() == repair) repairMedia(damaged);
+    } else if (!errors.isEmpty()) {
+        QMessageBox::warning(this, tr("Import"), errors.join("\n"));
+    }
+}
+
+void MediaBinWidget::repairMedia(const QStringList& files) {
+    const QStringList each = files.isEmpty() ? QStringList{QString()} : files;
+    for (const QString& f : each) {
+        RepairMediaDialog dlg(state_, this);
+        dlg.setBin(smart_ ? QString() : bin_);
+        if (!f.isEmpty()) dlg.setDamaged(f);
+        if (repairDialogHook_) repairDialogHook_(&dlg);
+        else dlg.exec();
+    }
 }
 
 void MediaBinWidget::rebuild() {
@@ -1481,6 +1513,7 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
     menu.addSeparator();
     menu.addAction(tr("New Bin"), this, [this] { newBin(smart_ ? QString() : bin_); });
     menu.addAction(tr("Import..."), this, &MediaBinWidget::importDialog);
+    menu.addAction(tr("Repair Media…"), this, [this] { repairMedia({}); })->setObjectName(QStringLiteral("repairMedia"));
     QAction* scrub = menu.addAction(tr("Hover Scrub"), this, [this](bool on) { setHoverScrub(on); });
     scrub->setCheckable(true);
     scrub->setChecked(hoverScrub_);

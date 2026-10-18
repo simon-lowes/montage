@@ -1,5 +1,7 @@
 #include "Offload.h"
 
+#include "Recover.h"
+
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
@@ -1030,6 +1032,19 @@ OffloadResult offloadCard(const QString& source, const QStringList& destinations
                 .isEmpty())
             res.issues.push_back({QString(), err});
     }
+    // Recordings the camera never finished (a flat battery, a pulled card) copy as they are; they are named so they
+    // can be repaired from the first copy.
+    if (!res.copies.isEmpty())
+        for (const Item& it : cw.items) {
+            if (it.dir) continue;
+            const QString copy = res.copies.front() + '/' + it.path;
+            const QString ext = QFileInfo(it.path).suffix().toLower();
+            if (!QStringList{"mp4", "mov", "m4v", "mxf", "wav", "bwf"}.contains(ext) || !QFileInfo::exists(copy)) continue;
+            const RepairCheck c = checkRecording(copy, false);
+            if (c.kind == RepairKind::None) continue;
+            res.damaged << copy;
+            res.notes << QStringLiteral("%1: %2. Repair Media in the Media bin can rebuild it").arg(it.path, c.problem);
+        }
     if (progress) progress(1.0, QString());
     res.ok = res.issues.empty();
     return res;

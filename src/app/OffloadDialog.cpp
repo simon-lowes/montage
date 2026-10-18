@@ -25,49 +25,13 @@
 #include <memory>
 
 #include "Settings.h"
+#include "WorkProgress.h"
+#include "RepairMediaDialog.h"
 #include "EditorState.h"
 
 namespace montage {
 
 namespace {
-
-// Runs `work` off the interface thread behind a progress dialog that can cancel it.
-template <typename R, typename Work>
-R withProgress(QWidget* parent, const QString& label, Work work) {
-    auto cancel = std::make_shared<std::atomic<bool>>(false);
-    auto done = std::make_shared<std::atomic<int>>(0);
-    auto file = std::make_shared<QString>();
-    auto lock = std::make_shared<QMutex>();
-    QProgressDialog progress(label, QObject::tr("Cancel"), 0, 1000, parent);
-    progress.setWindowModality(Qt::WindowModal);
-    progress.setMinimumDuration(300);
-    QObject::connect(&progress, &QProgressDialog::canceled, &progress, [cancel] { *cancel = true; });
-    QTimer tick;
-    QObject::connect(&tick, &QTimer::timeout, &progress, [&progress, done, file, lock, label] {
-        progress.setValue(done->load());
-        QMutexLocker l(lock.get());
-        if (!file->isEmpty()) progress.setLabelText(label + QStringLiteral("\n") + *file);
-    });
-    tick.start(100);
-    QFutureWatcher<R> watcher;
-    QEventLoop wait;
-    QObject::connect(&watcher, &QFutureWatcher<R>::finished, &wait, &QEventLoop::quit);
-    watcher.setFuture(QtConcurrent::run([work, cancel, done, file, lock] {
-        return work([cancel, done, file, lock](double f, const QString& at) {
-            *done = int(f * 999);
-            if (!at.isEmpty()) {
-                QMutexLocker l(lock.get());
-                *file = at;
-            }
-            return !cancel->load();
-        });
-    }));
-    if (!watcher.isFinished()) wait.exec();
-    tick.stop();
-    QObject::disconnect(&progress, &QProgressDialog::canceled, nullptr, nullptr);
-    progress.close();
-    return watcher.result();
-}
 
 QString sizeText(qint64 bytes) {
     if (bytes >= qint64(1) << 30) return QObject::tr("%1 GB").arg(double(bytes) / double(qint64(1) << 30), 0, 'f', 2);
@@ -151,6 +115,17 @@ OffloadDialog::OffloadDialog(EditorState* state, QWidget* parent) : QDialog(pare
     start_ = buttons->addButton(tr("Offload"), QDialogButtonBox::AcceptRole);
     start_->setObjectName(QStringLiteral("offloadStart"));
     connect(start_, &QPushButton::clicked, this, [this] { run(); });
+    repair_ = buttons->addButton(tr("Repair…"), QDialogButtonBox::ActionRole);
+    repair_->setObjectName(QStringLiteral("offloadRepair"));
+    repair_->setToolTip(tr("Rebuild the copies of recordings that were interrupted"));
+    repair_->hide();
+    connect(repair_, &QPushButton::clicked, this, [this] {
+        for (const QString& f : damaged_) {
+            RepairMediaDialog dlg(state_, this);
+            dlg.setDamaged(f);
+            dlg.exec();
+        }
+    });
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     layout->addWidget(buttons);
 }
@@ -221,6 +196,8 @@ OffloadResult OffloadDialog::run() {
         const auto ids = state_->importFiles(files, &errors, bin);
         lines << tr("Imported %n clip(s) into the bin \"%1\".", nullptr, int(ids.size())).arg(bin);
     }
+    damaged_ = r.damaged;
+    repair_->setVisible(!damaged_.isEmpty());
     reportText_ = lines.join('\n');
     report_->setPlainText(reportText_);
     return r;

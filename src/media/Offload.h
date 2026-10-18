@@ -77,6 +77,7 @@ struct OffloadResult {
     int alreadyThere = 0;  // files a destination already had, identical (counted once per destination)
     std::vector<OffloadIssue> issues;
     QStringList notes;  // worth knowing, not failures (a damaged earlier copy replaced, a hash Montage cannot check)
+    QStringList damaged;  // recordings at the first destination that were interrupted and can be repaired (media/Recover.h)
 };
 
 // Copies the folder `source` (a camera card, or any folder) into each of `destinations` as <destination>/<its name>

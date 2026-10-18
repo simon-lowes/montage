@@ -43,6 +43,7 @@
 #include "automation/ScriptPanel.h"
 #include "media/Inference.h"
 #include "media/Proxy.h"
+#include "media/Recover.h"
 #ifdef MONTAGE_LIVE_BRIDGE
 #include "app/LiveBridge.h"
 #endif
@@ -126,6 +127,8 @@ int usage() {
                  "  montage-cli shots <project.montage> \"a red car at night\" [--max N]   (find shots by description)\n"
                  "  montage-cli sounds <project.montage> \"applause\" [--max N]   (find sounds by description)\n"
                  "  montage-cli people <project.montage> [--person NAME|ID]   (who is in the footage, and where)\n"
+                 "  montage-cli repair <file> [--reference good.mov] [-o out] [--overwrite]   (an interrupted recording: an MP4 or MOV without its\n"
+                 "              index, rebuilt from a good clip from the same camera; an MXF without its footer; a WAV with wrong sizes)\n"
                  "  montage-cli ltc <file> [--seconds 30]   (the LTC timecode recorded on a sound channel)\n"
                  "  montage-cli ltc -o ltc.wav --start 01:00:00:00 --duration S [--fps 25] [--non-drop] [--rate 48000]   (write LTC)\n"
                  "  montage-cli stems <file> [--stems 2|3|4|5] [--from S] [--to S] [-o folder]   (vocals, drums... or dialogue, music, effects as WAVs)\n"
@@ -664,6 +667,45 @@ int cmdLoudness(const std::vector<std::string>& args) {
 }
 
 // montage-cli ltc <file> [--seconds N] | ltc -o out.wav --start TC --duration S [--fps R] [--rate HZ]
+int cmdRepair(const std::vector<std::string>& args) {
+    std::string in, reference, out;
+    bool overwrite = false;
+    for (size_t i = 0; i < args.size(); ++i) {
+        const bool more = i + 1 < args.size();
+        if (args[i] == "-o" && more) out = args[++i];
+        else if (args[i] == "--overwrite") overwrite = true;
+        else if (args[i] == "--reference" && more) reference = args[++i];
+        else if (in.empty() && args[i][0] != '-') in = args[i];
+        else return usage();
+    }
+    if (in.empty()) return usage();
+    const QString file = QString::fromStdString(in);
+    const RepairCheck check = checkRecording(file);
+    if (check.kind == RepairKind::None) {
+        std::printf("%s\n", check.problem.isEmpty() ? "Nothing to repair: it opens" : qPrintable(check.problem));
+        return check.problem.isEmpty() ? 0 : 1;
+    }
+    std::printf("%s\n", qPrintable(check.problem));
+    const QString target = out.empty() ? repairedPath(file) : QString::fromStdString(out);
+    if (QFileInfo::exists(target) && !overwrite && !sameFile(target, file)) {
+        std::fprintf(stderr, "error: %s exists (pass --overwrite to replace it)\n", qPrintable(target));
+        return 1;
+    }
+    RepairReport report;
+    QString err;
+    if (!repairRecording(file, QString::fromStdString(reference), target, &report, &err)) {
+        std::fprintf(stderr, "error: %s\n", qPrintable(err));
+        return 1;
+    }
+    std::printf("Repaired: %s\n  %.2f s", qPrintable(target), report.seconds);
+    if (report.videoFrames) std::printf(", %d frames", report.videoFrames);
+    if (report.audioSamples) std::printf(", %lld sound samples", static_cast<long long>(report.audioSamples));
+    std::printf("; %lld bytes used, %lld left at the end\n", static_cast<long long>(report.bytesUsed), static_cast<long long>(report.bytesLeft));
+    if (report.timecode >= 0) std::printf("  Start timecode from the camera's sidecar: %.3f s\n", report.timecode);
+    for (const QString& n : report.notes) std::printf("  %s\n", qPrintable(n));
+    return 0;
+}
+
 int cmdLtc(const std::vector<std::string>& args) {
     std::string in, out, start = "00:00:00:00";
     double seconds = 30, duration = 0;
@@ -1766,6 +1808,7 @@ int main(int argc, char** argv) {
     if (cmd == "sounds") return cmdSounds(args);
     if (cmd == "stems") return cmdStems(args);
     if (cmd == "ltc") return cmdLtc(args);
+    if (cmd == "repair") return cmdRepair(args);
     if (cmd == "people") return cmdPeople(args);
     if (cmd == "speak") return cmdSpeak(args);
     if (cmd == "clone-speech") return cmdCloneSpeech(args);
