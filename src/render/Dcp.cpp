@@ -350,21 +350,22 @@ std::string dcpName(const DcpSettings& settings, int channels, const std::string
                                                          {"psa", "PSA"},   {"policy", "POL"}};
     const auto kind = kinds.find(settings.kind);
     const QString aspect = settings.container == "scope" ? "S" : settings.container == "full" ? "C" : "F";
-    QString language = QString::fromStdString(settings.language).section('-', 0, 0).toUpper();
-    if (language.isEmpty()) language = "XX";
-    QString territory = QString::fromStdString(settings.territory).toUpper();
-    if (territory.isEmpty()) territory = "XX";
+    // (letters and digits only: every part goes into the folder's name)
     auto code = [](const std::string& c) {
         QString out;
         for (QChar ch : QString::fromStdString(c).toUpper())
             if (ch.isLetterOrNumber() && ch.unicode() < 128) out += ch;
         return out;
     };
+    QString language = code(QString::fromStdString(settings.language).section('-', 0, 0).toStdString());
+    if (language.isEmpty()) language = "XX";
+    QString territory = code(settings.territory);
+    if (territory.isEmpty()) territory = "XX";
     // Subtitles after the audio's language (in lower case when burned in), "-CCAP" for closed captions; "-3D" after
     // the content kind.
     QString subtitle = QStringLiteral("XX");
     if (settings.subtitles && !settings.closedCaptions) {
-        subtitle = QString::fromStdString(settings.subtitleLanguage).section('-', 0, 0).toUpper();
+        subtitle = code(QString::fromStdString(settings.subtitleLanguage).section('-', 0, 0).toStdString());
         if (subtitle.isEmpty()) subtitle = QStringLiteral("XX");
         if (settings.burnIn) subtitle = subtitle.toLower();
     }

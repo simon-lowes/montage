@@ -143,6 +143,7 @@
 #include "SequenceSettingsDialog.h"
 #include "media/Vector.h"
 #include "SurroundPanner.h"
+#include "audio/DialogueAlign.h"
 #include "audio/Plugins.h"
 #include "MainWindow.h"
 #include "media/Beats.h"
@@ -9433,6 +9434,23 @@ const auto seq = [this] { return state()->sequence(); };
         QTRY_COMPARE(takes->count(), 5);
         panel->pickTake(0);
         QCOMPARE(edit::clipById(*state()->sequence(), clip)->take, 0);
+        // A take that says the guide's line is aligned to it: the alignment added to the clip as it is then, its
+        // other effects kept.
+        QVERIFY(state()->apply("Say the line", [&](Project& p, Sequence& s) {
+            Clip* t = edit::clipById(s, clip);
+            t->mediaId = speech.front(), t->sourceIn = 0;
+            Effect kept;
+            kept.id = p.newId();
+            kept.type = "denoise";
+            t->effects = {kept};
+            return edit::Result{};
+        }));
+        QVERIFY(panel->alignToGuide());
+        {
+            const Clip* t = edit::clipById(*state()->sequence(), clip);
+            QVERIFY(t->effects.size() == 2 && t->effects[0].type == "denoise" && t->effects[1].type == "dialogue_align" &&
+                    dialogueAlignmentApplies(t->effects[1], *t));
+        }
 
         // The cue sheet, out and back in.
         const QString sheet = dir_.path() + "/cues.csv";

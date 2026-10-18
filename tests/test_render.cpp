@@ -5986,6 +5986,10 @@ colorspaces:
         named.language = "fr-CA";
         named.territory = "ca";
         QCOMPARE(dcpName(named, 8, "20261009"), std::string("MidnightRun_FTR_F_FR-XX_CA_71_2K_DI_20261009_MTG_SMPTE_OV"));
+        // Language and territory go into the folder's name: nothing but letters and digits of them.
+        named.language = "en/../../x";
+        named.territory = "../up";
+        QCOMPARE(dcpName(named, 8, "20261009"), std::string("MidnightRun_FTR_F_ENX-XX_UP_71_2K_DI_20261009_MTG_SMPTE_OV"));
         QVERIFY(dcpContainer("full", cw, ch) && cw == 2048 && ch == 1080 && !dcpContainer("imax", cw, ch));
     }
 

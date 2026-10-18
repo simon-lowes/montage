@@ -12183,7 +12183,12 @@ if ui["pressed"] == "add":
         for (const MediaItem& m : collected.media) QVERIFY2(QString::fromStdString(m.path).contains("/collected/Media/"), m.path.c_str());
         QVERIFY(frame(collected, 10).px == before.px);
 
-        // Consolidate the first sequence only, with half a second of handles: A becomes 0.5 to 2.5 s.
+        // Consolidate the first sequence only, with half a second of handles: A becomes 0.5 to 2.5 s. A Dialogue
+        // Alignment made for A's clip goes along (its span, in source frames, moved with the clip).
+        Effect align;
+        align.type = "dialogue_align";
+        align.strings = {{"media", std::to_string(a.id)}, {"span", "25.000:75.000"}, {"warp", ""}};
+        p.findSequence(mainId)->videoTracks[0].clips[0].effects.push_back(align);
         o.folder = path("trimmed");
         o.trim = true;
         o.handles = 0.5;
@@ -12198,6 +12203,8 @@ if ui["pressed"] == "add":
         QVERIFY(ta && QString::fromStdString(ta->path).endsWith("_trim.mov"));
         QVERIFY2(std::fabs(ta->duration - 2.0) < 0.1, qPrintable(QString::number(ta->duration)));
         QCOMPARE(trimmed.active()->videoTracks[0].clips[0].sourceIn, 12.5);
+        const Clip& aligned = trimmed.active()->videoTracks[0].clips[0];
+        QVERIFY(!aligned.effects.empty() && aligned.effects.back().s("span") == "12.500:62.500" && dialogueAlignmentApplies(aligned.effects.back(), aligned));
         const Image after = frame(trimmed, 10);
         float worst = 0;
         for (size_t i = 0; i < after.px.size(); ++i) worst = std::max(worst, std::fabs(after.px[i] - before.px[i]));

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <map>
@@ -237,6 +238,13 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
                                 DialogueWarp warp = dialogueWarpFromString(e.s("warp"));
                                 for (AlignPoint& pt : warp) pt.u -= from, pt.w -= from;
                                 e.strings["warp"] = dialogueWarpToString(warp);
+                                // and the part of the file it was made for, in source frames like sourceIn
+                                double a = 0, b = 0;
+                                if (std::sscanf(e.s("span").c_str(), "%lf:%lf", &a, &b) == 2) {
+                                    char span[64];
+                                    std::snprintf(span, sizeof span, "%.3f:%.3f", a - from * s.fpsValue(), b - from * s.fpsValue());
+                                    e.strings["span"] = span;
+                                }
                             }
                     }
             for (MediaItem& sub : q.media)

@@ -706,7 +706,8 @@ bool AdrPanel::alignToGuide(AlignPrecision precision) {
     o.precision = precision;
     o.from = q->start, o.to = q->end;
     // Reading and matching the two sounds can take a while: on copies in the background, with progress, the result
-    // then applied as one edit (the dialog is modal, so nothing else changes meanwhile).
+    // then applied as one edit. Edits can still come meanwhile (the dialog shows late and is only window-modal, and
+    // MCP carries on): only the alignment is taken over, onto the clip as it is then, and not if it has moved.
     struct Out {
         edit::Result result;
         DialogueAlignReport report;
@@ -735,16 +736,36 @@ bool AdrPanel::alignToGuide(AlignPrecision precision) {
     progress.close();
     const Out r = watcher.result();
     if (*cancel) return false;
+    const Clip* was = edit::clipById(sequence, clip);
     const bool ok = state_->apply(tr("Align to Guide"), [&](Project& p, Sequence& sq) {
         if (!r.result.ok) return r.result;
         Clip* c = edit::clipById(sq, clip);
-        if (!c) return edit::Result::fail("No such clip");
-        std::vector<Id> had;
-        for (const Effect& e : c->effects) had.push_back(e.id);
-        c->effects = r.take.effects;
-        for (Effect& e : c->effects)
-            if (std::find(had.begin(), had.end(), e.id) == had.end()) e.id = p.newId();  // made on the copy
-        c->duration = r.take.duration;
+        if (!c || !was) return edit::Result::fail("No such clip");
+        if (c->start != was->start || c->duration != was->duration || c->sourceIn != was->sourceIn || c->mediaId != was->mediaId ||
+            c->channels != was->channels || c->speed != was->speed)
+            return edit::Result::fail("The take changed while it was being aligned: align it again");
+        // The alignment made on the copy, in place of the clip's own for that take.
+        const auto made = std::find_if(r.take.effects.begin(), r.take.effects.end(),
+                                       [&](const Effect& e) { return e.type == "dialogue_align" && dialogueAlignmentApplies(e, r.take); });
+        if (made == r.take.effects.end()) return edit::Result::fail("The alignment was not made");
+        size_t at = size_t(made - r.take.effects.begin());
+        for (size_t i = 0; i < c->effects.size();)
+            if (c->effects[i].type == "dialogue_align" && dialogueAlignmentApplies(c->effects[i], *c)) {
+                at = std::min(at, i);
+                c->effects.erase(c->effects.begin() + ptrdiff_t(i));
+            } else {
+                ++i;
+            }
+        Effect e = *made;
+        if (std::none_of(was->effects.begin(), was->effects.end(), [&](const Effect& x) { return x.id == e.id; })) e.id = p.newId();
+        c->effects.insert(c->effects.begin() + ptrdiff_t(std::min(at, c->effects.size())), e);
+        // (longer to the next clip, as it is now)
+        FrameTime duration = r.take.duration;
+        for (Track& t : sq.audioTracks)
+            if (std::any_of(t.clips.begin(), t.clips.end(), [&](const Clip& x) { return &x == c; }))
+                for (const Clip& x : t.clips)
+                    if (&x != c && x.start >= c->start && x.start < c->start + duration) duration = std::max(c->duration, x.start - c->start);
+        c->duration = duration;
         return edit::Result{};
     });
     refresh();

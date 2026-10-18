@@ -23,6 +23,7 @@ constexpr double kLevelWeight = 6;
 constexpr double kAnalysisRate = 16000;  // speech features need no more
 constexpr float kInf = std::numeric_limits<float>::infinity();
 constexpr double kMaxAlignSeconds = 120;  // the longest line aligned at once (the path's table grows with its length)
+constexpr double kShiftSeconds = 60;     // what Prefer Shifting compares, from the start of the overlap
 constexpr double kMaxOffset = 3600;       // seconds a warp may move a sound (a point beyond is not read)
 
 std::vector<float> monoOf(const AudioBuffer& b) {
@@ -784,8 +785,11 @@ Result alignDialogue(Project& p, Sequence& s, Id takeId, Id guideId, const Dialo
             const AudioBufferPtr gb = MediaPool::instance().audio(guideKey, rate);
             const AudioBufferPtr tb = MediaPool::instance().audio(takeKey, rate);
             if (!gb || !tb || gb->frames() == 0 || tb->frames() == 0) return Result::fail("Could not read the sound");
-            const AudioBuffer ref = warpedSlice(*gb, guideWarp, guideU(from), length);
-            const AudioBuffer other = slice(*tb, takeAt(from), takeAt(from) + length);
+            // (a shift is found in the first minute: what is compared stays small however long the clips overlap,
+            // an hour of lav included)
+            const double heard = std::min(length, kShiftSeconds);
+            const AudioBuffer ref = warpedSlice(*gb, guideWarp, guideU(from), heard);
+            const AudioBuffer other = slice(*tb, takeAt(from), takeAt(from) + heard);
             const DialogueShift sh = findDialogueShift(ref, other, std::max(0.05, o.handles));
             if (!sh.found) return Result::fail("The take does not sound like the guide there (no common sound to line up)");
             warp = {{takeU(from), takeAt(from) + sh.delay}};
