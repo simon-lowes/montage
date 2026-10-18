@@ -724,11 +724,13 @@ std::shared_ptr<const dcp::ImfTrackReader> imfPicture(const std::string& file, i
     static std::mutex lock;
     static std::map<std::string, Known> known;
     std::error_code ec;
-    const auto size = std::filesystem::file_size(file, ec);
+    const std::filesystem::path at = std::filesystem::u8path(file);
+    const auto size = std::filesystem::file_size(at, ec);
     if (ec) return nullptr;
-    const auto when = std::filesystem::last_write_time(file, ec);
+    const auto when = std::filesystem::last_write_time(at, ec);
     if (ec) return nullptr;
-    const std::string key = file + '|' + std::to_string(size) + '|' + std::to_string(when.time_since_epoch().count());
+    const std::string key = file + '|' + std::to_string(static_cast<unsigned long long>(size)) + '|' +
+                            std::to_string(static_cast<long long>(when.time_since_epoch().count()));
     {
         std::lock_guard<std::mutex> g(lock);
         if (auto it = known.find(key); it != known.end()) {
