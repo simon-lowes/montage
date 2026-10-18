@@ -9,6 +9,7 @@
 
 #include "core/Effects.h"
 #include "core/Model.h"
+#include "render/FollowFocus.h"
 
 class QVBoxLayout;
 class QFormLayout;
@@ -100,6 +101,11 @@ public:
     void trackMask(Id clip, Id effect, bool forward, int model);
     // Follows the object of `effect`'s Object mask from the playhead to the clip's end (or start).
     void trackObject(Id clip, Id effect, bool forward);
+    // Analyses the depth over `clip` (media/VideoDepth.h), so its depth effects hold still.
+    void analyzeDepth(Id clip);
+    // Keys Lens Blur (Depth) `effect`'s Focus Depth to follow `target` (render/FollowFocus.h): its Focus Point at the
+    // playhead, its Object mask, or the face nearest the point.
+    void followFocusOn(Id clip, Id effect, FocusTarget target);
     // Follows the surface under the corners of Corner Pin `effect` on `clip`
     // (in the clip beneath it, or its own footage) from the playhead to the
     // clip's end (forward) or start, keying the corners.

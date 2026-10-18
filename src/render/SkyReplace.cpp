@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <deque>
 #include <map>
 #include <memory>
@@ -13,6 +14,7 @@
 #include "core/Effects.h"
 #include "core/Provenance.h"
 #include "media/DepthMap.h"
+#include "media/VideoDepth.h"
 #include "media/CameraSolve.h"
 #include "media/ValueMap.h"
 
@@ -140,20 +142,32 @@ std::shared_ptr<const CameraSolve> clipSolve(const Clip& c) {
                                               return model != "depth" || (depthAvailable() && depthModel().installed());
                                           }),
                                           true);
+[[maybe_unused]] const bool analysedCheck = (setAnalysedDepthCheck([](const std::string& path) {
+                                                 double from, to;
+                                                 return analysedDepthRange(path, from, to);
+                                             }),
+                                             true);
 
 double localSeconds(const Sequence& seq, const Clip& c, FrameTime local) { return c.sourceFrameAt(c.start + local) / seq.fpsValue(); }
 
 }  // namespace
 
-std::vector<float> skyMatte(const Image& img, const ValueMap* depth, double sensitivity, double lowest, double refine) {
+namespace {
+
+// The sky found on a smaller copy (the sky is large and smooth): 1 where it is on a grid of f x f pixel cells.
+struct CoarseSky {
+    int w = 0, h = 0, f = 1;
+    std::vector<float> grid;
+};
+CoarseSky coarseSky(const Image& img, const ValueMap* depth, double sensitivity, double lowest) {
     const int W = img.width, H = img.height;
-    std::vector<float> out(size_t(std::max(0, W)) * size_t(std::max(0, H)), 0.f);
+    CoarseSky out;
+    const int f = out.f = std::max(1, int(std::ceil(std::max(W, H) / 320.0)));
     if (W <= 0 || H <= 0) return out;
     const double sens = std::clamp(sensitivity, 0.0, 1.0);
-    // Found on a smaller copy (the sky is large and smooth), its edges then put back on the picture's own.
-    const int f = std::max(1, int(std::ceil(std::max(W, H) / 320.0)));
-    const int w = (W + f - 1) / f, h = (H + f - 1) / f;
+    const int w = out.w = (W + f - 1) / f, h = out.h = (H + f - 1) / f;
     const size_t m = size_t(w) * size_t(h);
+    out.grid.assign(m, 0.f);
     std::vector<float> col(m * 3, 0.f), alpha(m, 0.f);
     parallelRows(h, [&](int y0, int y1) {
         for (int sy = y0; sy < y1; ++sy)
@@ -312,9 +326,16 @@ std::vector<float> skyMatte(const Image& img, const ValueMap* depth, double sens
                 for (int i : part) sky[size_t(i)] = 3;
         }
     }
-    // Back at full size, smoothly, then the edges put on the picture's own.
-    std::vector<float> coarse(m);
-    for (size_t i = 0; i < m; ++i) coarse[i] = sky[i] ? 1.f : 0.f;
+    for (size_t i = 0; i < m; ++i) out.grid[i] = sky[i] ? 1.f : 0.f;
+    return out;
+}
+
+// Back at full size, smoothly (before its edges are put on the picture's own).
+std::vector<float> fullSize(const CoarseSky& c, int W, int H) {
+    std::vector<float> out(size_t(std::max(0, W)) * size_t(std::max(0, H)), 0.f);
+    if (c.grid.empty()) return out;
+    const int f = c.f, w = c.w, h = c.h;
+    const std::vector<float>& coarse = c.grid;
     parallelRows(H, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
             const float gy = std::clamp((y + 0.5f) / float(f) - 0.5f, 0.f, float(h - 1));
@@ -330,8 +351,143 @@ std::vector<float> skyMatte(const Image& img, const ValueMap* depth, double sens
             }
         }
     });
-    if (refine > 0) refineMatteEdges(out, img, 1.5 * f + 2, refine);
-    for (size_t i = 0; i < out.size(); ++i) out[i] = img.px[i * 4 + 3] > 1e-3f ? std::clamp(out[i], 0.f, 1.f) : 0.f;
+    return out;
+}
+
+// Its edges on the picture's own, and nothing where the picture is transparent.
+void finishSky(std::vector<float>& matte, const Image& img, double radius, double refine) {
+    if (refine > 0) refineMatteEdges(matte, img, radius, refine);
+    for (size_t i = 0; i < matte.size(); ++i) matte[i] = img.px[i * 4 + 3] > 1e-3f ? std::clamp(matte[i], 0.f, 1.f) : 0.f;
+}
+
+}  // namespace
+
+std::vector<float> skyMatte(const Image& img, const ValueMap* depth, double sensitivity, double lowest, double refine) {
+    const CoarseSky c = coarseSky(img, depth, sensitivity, lowest);
+    std::vector<float> out = fullSize(c, img.width, img.height);
+    finishSky(out, img, 1.5 * c.f + 2, refine);
+    return out;
+}
+
+namespace {
+
+// What a frame's sky is carried from: its picture in grey (at most 320 wide) and its coarse sky, kept for the frames
+// around it, by what decides the frame.
+struct SkyLook {
+    GrayImage gray;
+    CoarseSky sky;
+};
+
+std::mutex gSkyMutex;
+std::deque<std::pair<std::string, std::shared_ptr<const SkyLook>>> gSkyLooks;
+std::deque<std::pair<std::string, std::shared_ptr<const FlowField>>> gSkyFlows;
+
+template <typename T>
+std::shared_ptr<const T> keptLook(std::deque<std::pair<std::string, std::shared_ptr<const T>>>& kept, const std::string& key) {
+    if (key.empty()) return nullptr;
+    std::lock_guard lock(gSkyMutex);
+    for (const auto& [k, v] : kept)
+        if (k == key) return v;
+    return nullptr;
+}
+template <typename T>
+void keepLook(std::deque<std::pair<std::string, std::shared_ptr<const T>>>& kept, const std::string& key, std::shared_ptr<const T> v,
+              size_t most) {
+    if (key.empty()) return;
+    std::lock_guard lock(gSkyMutex);
+    kept.emplace_front(key, std::move(v));
+    if (kept.size() > most) kept.pop_back();
+}
+
+}  // namespace
+
+std::vector<float> steadySkyMatte(const Image& img, const ValueMap* depth, const SkyShot& shot, double sensitivity, double lowest,
+                                  double refine) {
+    const int W = img.width, H = img.height;
+    auto look = std::make_shared<SkyLook>();
+    look->gray = toGray(img, 320);
+    look->sky = coarseSky(img, depth, sensitivity, lowest);
+    const CoarseSky& own = look->sky;
+    std::string settings;
+    {
+        char buf[96];
+        std::snprintf(buf, sizeof buf, "|%dx%d|%.4f|%.4f", W, H, sensitivity, lowest);
+        settings = buf;
+    }
+    const std::string ownKey = shot.key ? shot.key(0) : std::string();
+    if (!ownKey.empty()) keepLook(gSkyLooks, ownKey + settings, std::shared_ptr<const SkyLook>(look), 24);
+    std::vector<float> out = fullSize(own, W, H);
+    if (own.grid.empty() || !shot.frame) {
+        finishSky(out, img, 1.5 * own.f + 2, refine);
+        return out;
+    }
+    const double kg = double(look->gray.width) / W;  // full-size pixels to grey ones
+    // The grid cells' centres in grey pixels, followed frame by frame along the flow.
+    std::vector<float> sum = own.grid, weight(own.grid.size(), 1.0f);
+    for (int dir : {-1, 1}) {
+        std::shared_ptr<const SkyLook> from = look;
+        std::string fromKey = ownKey;
+        std::vector<Point2> at(own.grid.size());
+        std::vector<uint8_t> alive(own.grid.size(), 1);
+        for (int gy = 0; gy < own.h; ++gy)
+            for (int gx = 0; gx < own.w; ++gx)
+                at[size_t(gy) * size_t(own.w) + size_t(gx)] = {((gx + 0.5) * own.f - 0.5) * kg, ((gy + 0.5) * own.f - 0.5) * kg};
+        for (int k = 1; k <= 3; ++k) {
+            const int offset = dir * k;
+            const std::string key = ownKey.empty() ? std::string() : shot.key(offset);
+            std::shared_ptr<const SkyLook> next = key.empty() ? nullptr : keptLook(gSkyLooks, key + settings);
+            if (!next) {
+                Image picture;
+                std::shared_ptr<const ValueMap> theirDepth;
+                if (!shot.frame(offset, picture, theirDepth) || picture.width != W || picture.height != H) break;
+                auto made = std::make_shared<SkyLook>();
+                made->gray = toGray(picture, 320);
+                made->sky = coarseSky(picture, theirDepth.get(), sensitivity, lowest);
+                next = made;
+                if (!key.empty()) keepLook(gSkyLooks, key + settings, next, 24);
+            }
+            if (next->sky.grid.size() != own.grid.size() || next->gray.width != look->gray.width) break;
+            // The flow from the last frame to this one (kept too).
+            const std::string flowKey = fromKey.empty() || key.empty() ? std::string() : fromKey + ">" + key + settings;
+            std::shared_ptr<const FlowField> flow = keptLook(gSkyFlows, flowKey);
+            if (!flow) {
+                flow = std::make_shared<const FlowField>(denseFlow(from->gray, next->gray, 4));
+                keepLook(gSkyFlows, flowKey, flow, 24);
+            }
+            const float wt = float(std::exp(-k * k / 8.0));  // (nearer frames count for more)
+            const GrayImage& g0 = look->gray;
+            const GrayImage& gk = next->gray;
+            for (size_t i = 0; i < at.size(); ++i) {
+                if (!alive[i]) continue;
+                const Point2 d = flow->at(at[i].x, at[i].y);
+                at[i].x += d.x, at[i].y += d.y;
+                if (at[i].x < 0 || at[i].y < 0 || at[i].x > gk.width - 1 || at[i].y > gk.height - 1) {
+                    alive[i] = 0;
+                    continue;
+                }
+                // Only where the two pictures agree once carried (not something that moved in front).
+                const int gx = int(i % size_t(own.w)), gy = int(i / size_t(own.w));
+                const double hx = ((gx + 0.5) * own.f - 0.5) * kg, hy = ((gy + 0.5) * own.f - 0.5) * kg;
+                const float diff = std::fabs(g0.sample(hx, hy) - gk.sample(at[i].x, at[i].y));
+                const float agree = std::exp(-(diff / 0.06f) * (diff / 0.06f));
+                // Their sky there (on their grid).
+                const double cx = std::clamp((at[i].x / kg + 0.5) / own.f - 0.5, 0.0, double(own.w - 1));
+                const double cy = std::clamp((at[i].y / kg + 0.5) / own.f - 0.5, 0.0, double(own.h - 1));
+                const int x0 = int(cx), y0 = int(cy), x1 = std::min(x0 + 1, own.w - 1), y1 = std::min(y0 + 1, own.h - 1);
+                const float fx = float(cx - x0), fy = float(cy - y0);
+                auto g = [&](int x, int y) { return next->sky.grid[size_t(y) * size_t(own.w) + size_t(x)]; };
+                const float m = (g(x0, y0) * (1 - fx) + g(x1, y0) * fx) * (1 - fy) + (g(x0, y1) * (1 - fx) + g(x1, y1) * fx) * fy;
+                sum[i] += m * wt * agree;
+                weight[i] += wt * agree;
+            }
+            from = next;
+            fromKey = key;
+        }
+    }
+    CoarseSky held = own;
+    for (size_t i = 0; i < held.grid.size(); ++i) held.grid[i] = sum[i] / weight[i];
+    out = fullSize(held, W, H);
+    finishSky(out, img, 1.5 * own.f + 2, refine);
     return out;
 }
 
@@ -508,7 +664,8 @@ bool skyMotion(const Sequence& seq, const Clip& c, const Effect& e, FrameTime lo
 }
 
 void applySkyReplacement(const Sequence& seq, const Clip& c, const Effect& e, FrameTime local, Image& full, const Image* skyLayer,
-                         double scale, double sourceSeconds, const std::vector<float>* mask) {
+                         double scale, double sourceSeconds, const std::vector<float>* mask, const ValueMap* fullDepth,
+                         const SkyShot& shot) {
     if (full.empty()) return;
     const bool gradient = std::lround(e.p("source", local, 0)) == 1, showMatte = std::lround(e.p("view", local, 0)) == 1;
     const bool hasSky = gradient || (skyLayer && skyLayer->width == full.width && skyLayer->height == full.height);
@@ -533,10 +690,46 @@ void applySkyReplacement(const Sequence& seq, const Clip& c, const Effect& e, Fr
     };
     Image part = whole ? Image() : crop(full);
     Image& layer = whole ? full : part;
-    std::shared_ptr<const DepthMap> depth;
-    if (e.p("use_depth", local, 1) > 0.5 && depthAvailable() && depthModel().installed()) depth = cachedDepth(layer);
-    std::vector<float> matte = skyMatte(layer, depth.get(), e.p("sensitivity", local, 50) / 100, e.p("lowest", local, 80) / 100,
-                                        e.p("refine", local, 70) / 100);
+    const bool useDepth = e.p("use_depth", local, 1) > 0.5;
+    // The depth over the clip's picture: as given (cropped), or found in it.
+    auto depthOf = [&](const Image& picture, const ValueMap* over) -> std::shared_ptr<const ValueMap> {
+        if (!useDepth) return nullptr;
+        if (over && over->width == full.width && over->height == full.height) {
+            if (whole) return std::make_shared<ValueMap>(*over);
+            auto d = std::make_shared<ValueMap>();
+            d->width = W, d->height = H;
+            d->values.resize(size_t(W) * size_t(H));
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) d->values[size_t(y) * size_t(W) + size_t(x)] = over->values[size_t(y0 + y) * size_t(full.width) + size_t(x0 + x)];
+            return d;
+        }
+        if (depthAvailable() && depthModel().installed()) return cachedDepth(picture);
+        return nullptr;
+    };
+    const std::shared_ptr<const ValueMap> depth = depthOf(layer, fullDepth);
+    const double sensitivity = e.p("sensitivity", local, 50) / 100, lowest = e.p("lowest", local, 80) / 100, refine = e.p("refine", local, 70) / 100;
+    std::vector<float> matte;
+    if (shot.frame && e.p("steady", local, 1) > 0.5) {
+        // The frames around it, cut to the same part of the canvas.
+        SkyShot cut;
+        cut.frame = [&](int offset, Image& picture, std::shared_ptr<const ValueMap>& theirDepth) {
+            Image other;
+            std::shared_ptr<const ValueMap> otherDepth;
+            if (!shot.frame(offset, other, otherDepth) || other.width != full.width || other.height != full.height) return false;
+            picture = whole ? std::move(other) : crop(other);
+            theirDepth = depthOf(picture, otherDepth.get());
+            return true;
+        };
+        if (shot.key)
+            cut.key = [&](int offset) {
+                const std::string k = shot.key(offset);
+                return k.empty() ? k : k + "|" + std::to_string(x0) + "," + std::to_string(y0) + "," + std::to_string(W) + "x" + std::to_string(H) +
+                                           (useDepth ? "|d" : "");
+            };
+        matte = steadySkyMatte(layer, depth.get(), cut, sensitivity, lowest, refine);
+    } else {
+        matte = skyMatte(layer, depth.get(), sensitivity, lowest, refine);
+    }
     const double shift = e.p("shift", local, 0) * scale, soften = e.p("soften", local, 1) * scale;
     if (std::fabs(shift) >= 0.25 || soften >= 0.25) refineMatte(matte, W, H, shift, soften, soften);
     // A mask on the effect says where the sky may be: over the whole layer (where the picture was moved, turned or

@@ -59,6 +59,7 @@
 #include "media/FaceMesh.h"
 #include "media/Faces.h"
 #include "media/DepthMap.h"
+#include "media/VideoDepth.h"
 #include "media/Rife.h"
 #include "media/Matting.h"
 #include "media/TextToSpeech.h"
@@ -962,6 +963,13 @@ int cmdModels() {
     else
         std::printf("  %-22s %6.1f MB  %s\n", depthModel().id.c_str(), double(depthModel().bytes()) / 1e6,
                     depthModel().installed() ? "downloaded" : "");
+    std::printf("\nVideo depth model (Video Depth Anything Small, the authors' release, for steady depth on video and Follow Focus; "
+                "folder: %s)\n",
+                videoDepthModel().directory().c_str());
+    if (!videoDepthAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        std::printf("  %-22s %6.1f MB  %s\n", videoDepthModel().id.c_str(), double(videoDepthModel().bytes()) / 1e6,
+                    videoDepthModel().installed() ? "downloaded" : "");
     std::printf("\nStem separation models (Spleeter for music and Bandit v2 for dialogue, music and effects, the authors' "
                 "releases, for Separate Stems; folder: %s)\n",
                 std::filesystem::path(stemModel(4).directory()).parent_path().string().c_str());

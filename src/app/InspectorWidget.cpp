@@ -45,6 +45,7 @@
 #include "ModelPacks.h"
 #include "render/Expressions.h"
 #include "media/DepthMap.h"
+#include "media/VideoDepth.h"
 #include "media/Exr.h"
 #include "media/Faces.h"
 #include "media/Matting.h"
@@ -945,6 +946,28 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                 if (on) state_->setPaintEffect(eid);
                 else if (state_->paintEffect() == eid) state_->setPaintEffect(0);
             });
+            // Follow Focus: keys on the Focus Depth that keep the focus on a tracked point, the mask's object or a face.
+            auto* follow = new QWidget(content_);
+            auto* fh = new QHBoxLayout(follow);
+            fh->setContentsMargins(0, 0, 0, 0);
+            const struct {
+                const char* name;
+                QString text, tip;
+                FocusTarget target;
+            } targets[3] = {{"followPoint", tr("Point"), tr("Track the Focus Point from the playhead through the clip and focus on it"), FocusTarget::Point},
+                            {"followObject", tr("Object"), tr("Focus on this effect's Object mask (pick and track it first)"), FocusTarget::Object},
+                            {"followFace", tr("Face"), tr("Follow the face nearest the Focus Point through the clip and focus on it"), FocusTarget::Face}};
+            for (const auto& t : targets) {
+                auto* b = new QPushButton(t.text, follow);
+                b->setObjectName(QString::fromLatin1(t.name));
+                b->setToolTip(t.tip + tr(". The focus is eased as a focus puller eases it and written as keys."));
+                fh->addWidget(b);
+                connect(b, &QPushButton::clicked, this, [this, owner, eid, target = t.target] {
+                    QTimer::singleShot(0, this, [this, owner, eid, target] { followFocusOn(owner, eid, target); });
+                });
+            }
+            fh->addStretch(1);
+            f->addRow(tr("Follow Focus:"), follow);
             connect(state_, &EditorState::paintEffectChanged, pick, [this, pick, eid] {
                 const QSignalBlocker block(pick);
                 pick->setChecked(state_->paintEffect() == eid);
@@ -1127,6 +1150,31 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                     QTimer::singleShot(0, this, [this, owner, eid, forward] { trackCorners(owner, eid, forward); });
                 });
         }
+        if (onClip && (needsDepth(e, localTime()) || (e.type == "sky_replace" && e.p("use_depth", localTime(), 1) > 0.5)) && videoDepthAvailable())
+            if (const Clip* c = state_->sequence() ? edit::clipById(*state_->sequence(), owner) : nullptr) {
+                std::string file;
+                double from, to;
+                if (clipMediaRange(state_->project(), *state_->sequence(), *c, file, from, to)) {
+                    // Depth worked out frame by frame shimmers on video; analysed over the clip it holds still.
+                    auto* row = new QWidget(content_);
+                    auto* rh = new QHBoxLayout(row);
+                    rh->setContentsMargins(0, 0, 0, 0);
+                    auto* status = new QLabel(row);
+                    status->setObjectName(QStringLiteral("steadyDepthStatus"));
+                    status->setWordWrap(true);
+                    const bool analysed = clipDepthAnalysed(state_->project(), *state_->sequence(), *c);
+                    status->setText(analysed ? tr("Analysed over the clip: steady") : tr("Frame by frame (may shimmer)"));
+                    auto* analyze = new QPushButton(analysed ? tr("Analyse Again") : tr("Analyse Depth"), row);
+                    analyze->setObjectName(QStringLiteral("analyzeDepth"));
+                    analyze->setToolTip(tr("Work out the depth over the whole clip, 32 frames at a time, so it holds still as the camera "
+                                           "and the picture move. Kept for the clip's file."));
+                    rh->addWidget(status, 1);
+                    rh->addWidget(analyze);
+                    f->addRow(tr("Steady Depth:"), row);
+                    connect(analyze, &QPushButton::clicked, this,
+                            [this, owner] { QTimer::singleShot(0, this, [this, owner] { analyzeDepth(owner); }); });
+                }
+            }
         if (kind == TrackKind::Video && supportsMask(e.type)) {
             // Shape masks and the HSL qualifier; folded away until one is used.
             QFormLayout* mf = addSection(tr("%1 Mask").arg(QString::fromStdString(info->displayName)), nullptr,
@@ -3054,6 +3102,55 @@ void InspectorWidget::trackObject(Id clip, Id effect, bool forward) {
         return true;
     });
     state_->message(tr("Tracked the object: %n frame(s) segmented", "", int(result->object(which).frames.size())), 4000);
+}
+
+void InspectorWidget::analyzeDepth(Id clip) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
+    if (!c || !ensureEffectModel(window(), "video_depth")) return;
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    const bool ok = runAnalysis(tr("Analysing depth over the clip..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
+        const Sequence* sq = project->findSequence(seqId);
+        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
+        return cl && analyzeClipDepth(*project, *sq, *cl, 518, [&](double f) { progress(f); return !*cancel; }, err);
+    });
+    if (!ok) return;
+    // Drawn again with it (nothing in the project changed).
+    state_->amend([](Project&, Sequence&) { return true; });
+    state_->message(tr("Depth analysed over the clip: depth effects on it are steady"), 4000);
+}
+
+void InspectorWidget::followFocusOn(Id clip, Id effect, FocusTarget target) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
+    const Effect* e = c ? edit::ownedEffect(const_cast<Sequence&>(*s), clip, effect) : nullptr;
+    if (!c || !e) return;
+    if (target == FocusTarget::Face && !ensureEffectModel(window(), "focus.face")) return;
+    if (!clipDepthAnalysed(state_->project(), *s, *c) && !ensureEffectModel(window(), "video_depth")) return;
+    FollowFocusSettings fs;
+    fs.target = target;
+    fs.at = std::clamp<FrameTime>(state_->playhead() - c->start, 0, c->duration - 1);
+    fs.x = e->p("point_x", fs.at, 0.5), fs.y = e->p("point_y", fs.at, 0.5);
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    Param focus;
+    const bool ok = runAnalysis(tr("Following focus..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
+        Sequence* sq = const_cast<Sequence*>(project->findSequence(seqId));
+        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
+        const Effect* ef = sq ? edit::ownedEffect(*sq, clip, effect) : nullptr;
+        return cl && ef && followFocus(*project, *sq, *cl, *ef, fs, focus, [&](double f) { progress(f); return !*cancel; }, err);
+    });
+    if (!ok) return;
+    // The Focus Depth keyed, and focused on it.
+    state_->edit(tr("Follow Focus"), [clip, effect, focus](Project&, Sequence& sq) {
+        Effect* ef = edit::ownedEffect(sq, clip, effect);
+        if (!ef) return false;
+        ef->params["focus"] = focus;
+        ef->params["follow"] = Param(0.0);
+        return true;
+    });
+    state_->message(tr("Follow Focus: %n key(s) on Focus Depth", "", int(focus.keys.size())), 4000);
 }
 
 }  // namespace montage

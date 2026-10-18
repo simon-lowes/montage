@@ -37,6 +37,25 @@ void setOptionalModelCheck(std::function<bool(const std::string& model)> check) 
 
 namespace {
 
+std::function<bool(const std::string&)>& analysedDepthCheck() {
+    static std::function<bool(const std::string&)> check;
+    return check;
+}
+
+// Whether the effect works from the picture's depth.
+bool usesDepth(const Effect& e) {
+    if (!e.enabled) return false;
+    const std::string& t = e.type;
+    return t == "depth_blur" || t == "depth_fog" || t == "depth_map" || t == "relight" || e.p("mask.depth", 0) > 0.5 ||
+           (t == "sky_replace" && e.p("use_depth", 0, 1) > 0.5 && optionalModelThere("depth"));
+}
+
+}  // namespace
+
+void setAnalysedDepthCheck(std::function<bool(const std::string& path)> check) { analysedDepthCheck() = std::move(check); }
+
+namespace {
+
 void add(Provenance& out, AiUse use) {
     if (std::find(out.ai.begin(), out.ai.end(), use) == out.ai.end()) out.ai.push_back(std::move(use));
 }
@@ -96,6 +115,11 @@ void walk(Provenance& out, const Project& p, const Sequence& s, std::set<Id>& se
                     continue;
                 }
                 mediaUses(out, *m);
+                if (m->kind == MediaKind::Video && analysedDepthCheck()) {
+                    const auto chain = gradeChain(s, c);
+                    if (std::any_of(chain.begin(), chain.end(), [](const Effect* e) { return usesDepth(*e); }) && analysedDepthCheck()(m->path))
+                        add(out, {"Steady Depth", "Video Depth Anything Small", AiRole::Assisted});
+                }
                 if (!m->path.empty() && std::find(out.sources.begin(), out.sources.end(), m->path) == out.sources.end())
                     out.sources.push_back(m->path);
             }

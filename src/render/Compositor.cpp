@@ -60,6 +60,8 @@
 #include "media/Proxy.h"
 #include "media/Relink.h"
 #include "media/DepthMap.h"
+#include "media/VideoDepth.h"
+#include "RenderCache.h"
 #include "SkyReplace.h"
 #include "media/Matting.h"
 #include "media/Faces.h"
@@ -927,6 +929,7 @@ struct ClipSource {
     double sourceSeconds = -1;  // media time of the frame, for effects that follow the footage
     uint64_t sourceMedia = 0;   // and its media, and whether it was reframed from 360° (or is a right eye), for analyses made from it
     bool reframed = false;
+    std::string sourcePath;     // the video file, for its analysed depth (media/VideoDepth.h); "" for any other picture
     std::string exrFile;        // the OpenEXR file the frame was read from (its Cryptomattes), "" for any other
     ofx::FrameFetch ofxFetch;   // the clip's source at other clip frames, for OpenFX plugins that ask (render/Ofx.h)
 };
@@ -1078,6 +1081,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (!f && original && isOffline(*m)) f = offlineSlate(w, h);
             if (!f) return false;
             if (m->kind == MediaKind::Video) sourceSeconds = sec;
+            if (m->kind == MediaKind::Video && c.layer.empty()) out.sourcePath = m->path;
             sourceMedia = m->id;
             exrFile = exrFrameFile(m->path, sec);
             if (m->kind == MediaKind::Video && std::any_of(c.effects.begin(), c.effects.end(), [](const Effect& e) { return e.type == "ofx" && e.enabled; })) {
@@ -1356,9 +1360,9 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
     const std::vector<const Effect*> chain = gradeChain(seq, c);
     // The picture's depth, once, for the effects that work by distance.
     std::shared_ptr<const DepthMap> depth;
-    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsDepth(*e, lt); }) && depthAvailable() &&
-        depthModel().installed())
-        depth = cachedDepth(src);
+    // (The clip's analysed depth where it has one, steady through the shot: not of a reframed view or the other eye.)
+    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsDepth(*e, lt); }))
+        depth = frameDepth(src, reframed ? std::string() : cs.sourcePath, sourceSeconds);
     DepthScope depthScope(depth);
     // And the people in it, for Remove Background and People masks.
     std::shared_ptr<const ValueMap> people;
@@ -1562,6 +1566,16 @@ Image trackPicture(const Project& p, const Sequence& seq, size_t m, FrameTime t,
 
 bool clipGeometry(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, Geometry& g);  // (below)
 
+// Where canvas pixel (X, Y) of a layer at `scale` falls in the clip's own frame (fractions of it), through its
+// transform; false beyond the frame.
+bool canvasToFrame(const Sequence& seq, const Geometry& g, double scale, int X, int Y, double& u, double& v) {
+    const double cr = std::cos(g.rot), sn = std::sin(g.rot);
+    const double xs = (X + 0.5) / scale - seq.width / 2.0 - g.px, ys = (Y + 0.5) / scale - seq.height / 2.0 - g.py;
+    const double rx = xs * cr + ys * sn, ry = -xs * sn + ys * cr;
+    u = (rx / g.sx + g.mw / 2 + g.ax) / g.mw, v = (ry / g.sy + g.mh / 2 + g.ay) / g.mh;
+    return u >= 0 && v >= 0 && u <= 1 && v <= 1;
+}
+
 // Sky Replacement on clip `c` (on track `ti`) at t: the sky found in its layer and another put in its place
 // (render/SkyReplace.h).
 void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c, FrameTime t, const RenderOptions& o, Image& layer, int W,
@@ -1594,10 +1608,9 @@ void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c,
             mask.assign(size_t(layer.width) * size_t(layer.height), 0.0f);
             for (int Y = 0; Y < layer.height; ++Y)
                 for (int X = 0; X < layer.width; ++X) {
-                    const double xs = (X + 0.5) / o.scale - seq.width / 2.0 - g.px, ys = (Y + 0.5) / o.scale - seq.height / 2.0 - g.py;
-                    const double rx = xs * cr + ys * sn, ry = -xs * sn + ys * cr;
-                    const double u = (rx / g.sx + g.mw / 2 + g.ax) / g.mw * pw - 0.5, v = (ry / g.sy + g.mh / 2 + g.ay) / g.mh * ph - 0.5;
-                    if (u < -0.5 || v < -0.5 || u > pw - 0.5 || v > ph - 0.5) continue;
+                    double u, v;
+                    if (!canvasToFrame(seq, g, o.scale, X, Y, u, v)) continue;
+                    u = u * pw - 0.5, v = v * ph - 0.5;
                     const int i0 = std::clamp(int(std::floor(u)), 0, pw - 1), j0 = std::clamp(int(std::floor(v)), 0, ph - 1);
                     const int i1 = std::min(i0 + 1, pw - 1), j1 = std::min(j0 + 1, ph - 1);
                     const float fu = float(std::clamp(u - i0, 0.0, 1.0)), fv = float(std::clamp(v - j0, 0.0, 1.0));
@@ -1607,7 +1620,50 @@ void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c,
                 }
         }
     }
-    applySkyReplacement(seq, c, *sr, lt, layer, &sky, o.scale, c.sourceFrameAt(t) / seq.fpsValue(), mask.empty() ? nullptr : &mask);
+    // The clip's analysed depth carried onto the layer (null: found in the layer, if at all), and the frames either side
+    // for a steady sky.
+    auto analysedOnLayer = [&](FrameTime at, int w, int h) -> std::shared_ptr<const ValueMap> {
+        const MediaItem* m = c.isGenerator() ? nullptr : p.findMedia(c.mediaId);
+        if (!m || m->kind != MediaKind::Video || !c.layer.empty() || !m->stereo.empty() || enabledEffect(seq, c, "reframe_360")) return nullptr;
+        const double fd = m->fps.valid() ? 1.0 / m->fps.toDouble() : 1.0 / 30;
+        const double sec = std::clamp(c.sourceFrameAt(at) / seq.fpsValue(), 0.0, std::max(0.0, m->duration - fd * 0.5));
+        std::shared_ptr<const DepthMap> d = analysedDepth(m->path, sec);
+        Geometry ag;
+        if (!d || !clipGeometry(p, seq, c, at, ag)) return nullptr;
+        auto out = std::make_shared<ValueMap>();
+        out->width = w, out->height = h;
+        out->values.assign(size_t(w) * size_t(h), 0.0f);
+        for (int Y = 0; Y < h; ++Y)
+            for (int X = 0; X < w; ++X)
+                if (double u, v; canvasToFrame(seq, ag, o.scale, X, Y, u, v)) out->values[size_t(Y) * size_t(w) + size_t(X)] = d->at(u, v);
+        return out;
+    };
+    const std::shared_ptr<const ValueMap> depth = sr->p("use_depth", lt, 1) > 0.5 ? analysedOnLayer(t, layer.width, layer.height) : nullptr;
+    SkyShot shot;
+    if (!(c.isGenerator() && c.generator.type == "adjustment")) {
+        auto inClip = [&](int offset) { return t + offset >= c.start && t + offset < c.start + c.duration; };
+        shot.frame = [&, inClip](int offset, Image& other, std::shared_ptr<const ValueMap>& otherDepth) {
+            if (!inClip(offset)) return false;
+            other = clipLayer(p, seq, c, t + offset, o);
+            if (other.width != layer.width || other.height != layer.height) return false;
+            if (sr->p("use_depth", lt, 1) > 0.5) otherDepth = analysedOnLayer(t + offset, other.width, other.height);
+            return true;
+        };
+        // (what decides the frame: everything on screen then, render/RenderCache.h)
+        shot.key = [&, inClip](int offset) {
+            if (!inClip(offset)) return std::string();
+            const QByteArray k = frameKey(p, seq, t + offset, o);
+            if (k.isEmpty()) return std::string();
+            // (and whether the clip's depth was analysed, which the sky found in it can take)
+            std::string analysed;
+            double from, to;
+            if (const MediaItem* m = c.isGenerator() ? nullptr : p.findMedia(c.mediaId); m && analysedDepthRange(m->path, from, to))
+                analysed = "|" + std::to_string(from) + "-" + std::to_string(to);
+            return std::to_string(c.id) + "|" + k.toStdString() + analysed;
+        };
+    }
+    applySkyReplacement(seq, c, *sr, lt, layer, &sky, o.scale, c.sourceFrameAt(t) / seq.fpsValue(), mask.empty() ? nullptr : &mask, depth.get(),
+                        shot);
 }
 
 }  // namespace

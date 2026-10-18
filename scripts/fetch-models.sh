@@ -9,6 +9,7 @@
 #   <dir>/deblur         Motion Deblur      (MONTAGE_DEBLUR_MODEL)
 #   <dir>/faces          Find People, Face Shape, Look at Lens (MONTAGE_FACE_MODEL)
 #   <dir>/depth          depth effects      (MONTAGE_DEPTH_MODEL)
+#   <dir>/video-depth    steady video depth (MONTAGE_VIDEO_DEPTH_MODEL)
 #   <dir>/rife           AI slow motion     (MONTAGE_RIFE_MODEL)
 #   <dir>/matte          Remove Background  (MONTAGE_MATTE_MODEL)
 #   <dir>/tts            Generate Voiceover (MONTAGE_TTS_MODEL)
@@ -87,6 +88,9 @@ fetch faces face_landmarks.onnx \
 fetch depth depth_anything_v2_small.onnx \
   https://huggingface.co/onnx-community/depth-anything-v2-small/resolve/4472b7362082ad9968fee890ca0f1e5aca36b93d/onnx/model.onnx \
   afb6a5c28f3b6bf1618c6e43f02073ef9dfdc70e937502d51603e57b0a1df10c
+fetch video-depth video_depth_anything_vits.pth \
+  https://huggingface.co/depth-anything/Video-Depth-Anything-Small/resolve/256875362cff76724b920335dfb4b29dd611f66e/video_depth_anything_vits.pth \
+  13379300b739e659f076a59d52e9801bd8d38c541a7e71f73bbca4dcfb013609
 fetch rife RIFEv4.26_0921.zip \
   https://huggingface.co/hzwer/RIFE/resolve/01fdc7e97404120c243c3ea7b427046e5dc7643e/RIFEv4.26_0921.zip \
   1fa9b9cda3d9b8c3e301359e2595960902f97bf926c08598b0e9957a3f3f760e
@@ -231,4 +235,4 @@ if [ "$HRTF" = 1 ]; then
   fetch sadie-ku100 D1_HRIR_SOFA.zip "https://zenodo.org/records/12092466/files/D1_HRIR_SOFA.zip?download=1" 366321fa78f211bacc0ec6bea96701625b196a5db54ec16748b0eab0b9705f75
   echo "KU100 HRIRs: MONTAGE_HRTF_DIR=$DIR/sadie-ku100"
 fi
-echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_DEBLUR_MODEL=$DIR/deblur MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_RIFE_MODEL=$DIR/rife MONTAGE_MATTE_MODEL=$DIR/matte MONTAGE_TTS_MODEL=$DIR/tts MONTAGE_INPAINT_MODEL=$DIR/inpaint MONTAGE_SENTENCE_MODEL=$DIR/minilm-qa MONTAGE_OCR_MODEL=$DIR/ocr MONTAGE_SOUND_MODEL=$DIR/sound MONTAGE_STEM_MODELS=$DIR/stems MONTAGE_LENS_DB=$DIR/lensfun-db"
+echo "Models in $DIR: MONTAGE_OBJECT_MODEL=$DIR/edgetam-video MONTAGE_SPEAKER_MODEL=$DIR/speakers MONTAGE_VISUAL_MODEL=$DIR/clip-vit-b32 MONTAGE_SPEECH_MODEL=$DIR/speech-enhance MONTAGE_UPSCALE_MODEL=$DIR/upscale MONTAGE_DEBLUR_MODEL=$DIR/deblur MONTAGE_FACE_MODEL=$DIR/faces MONTAGE_DEPTH_MODEL=$DIR/depth MONTAGE_VIDEO_DEPTH_MODEL=$DIR/video-depth MONTAGE_RIFE_MODEL=$DIR/rife MONTAGE_MATTE_MODEL=$DIR/matte MONTAGE_TTS_MODEL=$DIR/tts MONTAGE_INPAINT_MODEL=$DIR/inpaint MONTAGE_SENTENCE_MODEL=$DIR/minilm-qa MONTAGE_OCR_MODEL=$DIR/ocr MONTAGE_SOUND_MODEL=$DIR/sound MONTAGE_STEM_MODELS=$DIR/stems MONTAGE_LENS_DB=$DIR/lensfun-db"

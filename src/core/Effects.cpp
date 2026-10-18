@@ -360,7 +360,7 @@ std::vector<EffectInfo> buildCatalog() {
                   color("horizon", "Gradient Horizon", 0.72, 0.82, 0.92), pct("sensitivity", "Sensitivity", 0, 100, 50),
                   pct("lowest", "Lowest Sky (% of height)", 5, 100, 80), boolean("use_depth", "Use Depth", true),
                   pct("refine", "Refine Edges", 0, 100, 70), num("shift", "Edge Shift (px)", -20, 20, 0, 0.5),
-                  num("soften", "Soften (px)", 0, 40, 1, 0.5),
+                  num("soften", "Soften (px)", 0, 40, 1, 0.5), boolean("steady", "Steady Through the Shot", true),
                   choice("follow", "Follow Camera", {"Off", "Analysed Camera Motion", "3D Camera Track"}, 1),
                   pct("follow_amount", "Follow Amount", 0, 200, 100), num("sky_exposure", "Sky Exposure (stops)", -4, 4, 0),
                   num("sky_blur", "Sky Defocus (px)", 0, 50, 0, 0.5), pct("match", "Match Foreground", 0, 100, 30),

@@ -16,6 +16,7 @@
 #include "media/LensDatabase.h"
 #include "media/Segmenter.h"
 #include "media/DepthMap.h"
+#include "media/VideoDepth.h"
 #include "media/Matting.h"
 #include "media/Inpaint.h"
 #include "media/Faces.h"
@@ -241,6 +242,17 @@ bool ensureEffectModel(QWidget* parent, const std::string& type) {
         return ensureModelPack(parent, depthModel(), QObject::tr("Depth"),
                                QObject::tr("Depth effects use Depth Anything V2 Small (Apache-2.0), a model that works out how near each "
                                            "part of the picture is. It runs on this computer."));
+    }
+    if (type == "video_depth") {
+        if (!videoDepthAvailable()) {
+            QMessageBox::information(parent, QObject::tr("Steady Depth"),
+                                     QObject::tr("This build of Montage cannot see depth: it was built without ONNX Runtime."));
+            return false;
+        }
+        return ensureModelPack(parent, videoDepthModel(), QObject::tr("Steady Depth"),
+                               QObject::tr("Steady depth uses Video Depth Anything Small (Apache-2.0), a model that works out how near "
+                                           "each part of the picture is from 32 frames at a time, so depth holds still as the camera moves. "
+                                           "It runs on this computer; a clip is analysed once and kept."));
     }
     if (type == "object_removal") {
         if (!inpaintAvailable()) {

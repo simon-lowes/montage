@@ -16,6 +16,7 @@
 #include "core/Effects.h"
 #include "core/Interpretation.h"
 #include "media/DepthMap.h"
+#include "media/VideoDepth.h"
 #include "media/Exr.h"
 #include "media/Image.h"
 #include "media/Matting.h"
@@ -139,7 +140,7 @@ struct PullLayers {
             std::shared_ptr<const DepthMap> depth;
             std::shared_ptr<const ValueMap> people;
             for (const auto& [e, name] : mattes) {
-                if (!depth && needsDepth(*e, lt) && depthAvailable() && depthModel().installed()) depth = cachedDepth(src);
+                if (!depth && needsDepth(*e, lt)) depth = frameDepth(src, c.layer.empty() && m.kind == MediaKind::Video ? m.path : std::string(), sec);
                 if (!people && needsPersonMatte(*e, lt) && mattingAvailable() && mattingModel().installed()) people = cachedPersonMatte(src);
             }
             DepthScope depthScope(depth);
