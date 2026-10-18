@@ -15,7 +15,8 @@ namespace montage {
 Rational fileFrameRate(const MediaItem& m) {
     if (m.kind != MediaKind::Video) return Rational{0, 1};
     const Interpretation now = interpretationOf(m);
-    return now.conformed() ? now.fileFps : m.fps;
+    if (now.conformed()) return now.fileFps;
+    return now.pulldown.empty() ? m.fps : pulldownFileRate(m.fps);  // (pulldown removed: played at four fifths of it)
 }
 
 bool isRawMedia(const MediaItem& m) {

@@ -6680,7 +6680,7 @@ void McpServer::Impl::addTools() {
             "alpha":{"type":"string","enum":["file","straight","premultiplied","ignore","invert"]},
             "field_order":{"type":"string","enum":["file","progressive","upper","lower"]},
             "keep_pitch":{"type":"boolean","description":"A conformed sound keeps its pitch"},
-            "remove_pulldown":{"type":"string","enum":["off","auto","A","B","C","D"],"description":"29.97 or 30 frame video carrying 23.976 or 24 frame pictures with 2:3 pulldown: woven back into those frames (it then plays at 23.976 or 24, with no combed or repeated frames). auto finds the cadence from the fields, stretch by stretch (an edit made after the pulldown breaks it); A to D say which frame of the cadence the file starts on (A A, B B, B C, C D), the fields in field_order (upper unless lower)"},
+            "remove_pulldown":{"type":"string","enum":["off","auto","A","B","C","D"],"description":"29.97 or 30 frame video carrying 23.976 or 24 frame pictures with 2:3 pulldown: woven back into those frames (it then plays at 23.976 or 24, with no combed or repeated frames). auto finds the cadence from the fields, stretch by stretch (an edit made after the pulldown breaks it); A to D say which frame of the cadence the file starts on (A A, B B, B C, C D), the fields in field_order (or as the file says)"},
             "raw_exposure":{"type":"number","description":"Camera RAW, CinemaDNG, ProRes RAW and Magic Lantern Video: exposure in stops (-5 to 5)"},
             "raw_temperature":{"type":["number","string"],"description":"Camera RAW: the light's colour temperature in kelvin (2000 to 25000), or \"as_shot\""},
             "raw_tint":{"type":"number","description":"Camera RAW: tint, + magenta, - green (-150 to 150)"},
@@ -6728,7 +6728,7 @@ void McpServer::Impl::addTools() {
                             throw ArgError{QStringLiteral("%1: %2").arg(QString::fromStdString(m->name), QString::fromStdString(why))};
                         i.pulldown = pulldownValue(st);
                     } else if (pd.size() == 1 && pd[0] >= 'A' && pd[0] <= 'D') {
-                        i.pulldown = pulldownStartingAt(pd[0].toLatin1() - 'A', i.fields != "lower");
+                        i.pulldown = pulldownStartingAt(pd[0].toLatin1() - 'A', i.fields.empty() ? fileTopFieldFirst(uninterpretedPath(m->path)) : i.fields != "lower");
                     } else {
                         throw ArgError{"\"remove_pulldown\" is off, auto or A to D"};
                     }

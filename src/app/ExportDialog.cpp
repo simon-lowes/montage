@@ -280,8 +280,8 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
         for (Rational r : {Rational{24000, 1001}, Rational{24, 1}, Rational{25, 1}, Rational{30000, 1001}, Rational{30, 1}, Rational{50, 1},
                            Rational{60000, 1001}, Rational{60, 1}})
             if (std::fabs(r.toDouble() - own.toDouble()) > 1e-3) add(tr("%1, converted (motion compensated)").arg(name(r)), QStringLiteral("convert"), r);
-        const int at = rate_->findData(appSettings().value("export/rate").toString());
-        rate_->setCurrentIndex(std::max(0, at));
+        // (always as the sequence to start with: a programme 4 % shorter, or converted, is never a surprise)
+        rate_->setCurrentIndex(0);
         connect(rate_, &QComboBox::currentIndexChanged, this, [this] { updateControls(); });
     }
     interlaced_ = new QCheckBox(tr("Interlaced, top field first"), form_);
@@ -1021,7 +1021,6 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         if (!r[2].isEmpty()) s.cadence = r[2].toStdString();
         s.rateKeepPitch = ratePitch_->isChecked();
     }
-    settings.setValue("export/rate", rate_->currentData());
     settings.setValue("export/ratePitch", ratePitch_->isChecked());
     if (mxfDelivery_->isEnabled()) {
         s.mxfDelivery = mxfDelivery_->currentData().toString().toStdString();

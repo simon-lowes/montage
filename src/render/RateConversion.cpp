@@ -145,7 +145,14 @@ Sequence deliveredSequence(const Sequence& seq, const RateConversion& c, FrameTi
     Sequence d = seq;
     if (!c.active()) return d;
     d.fps = c.to;
-    auto at = [&](FrameTime f) { return deliveredFrameOf(c, f - in); };
+    // (the range's end is the delivered end, which rounds the last frames up)
+    auto at = [&](FrameTime f) { return f >= out ? deliveredFrames(c, out - in) : deliveredFrameOf(c, f - in); };
+    for (TrackRef r : allTracks(d))
+        for (Clip& clip : trackAt(d, r)->clips) {
+            const FrameTime start = deliveredFrameOf(c, clip.start - in), end = at(clip.start + clip.duration);
+            clip.start = start;
+            clip.duration = std::max<FrameTime>(1, end - start);
+        }
     for (CaptionTrack& t : d.captionTracks) {
         std::vector<Caption> kept;
         for (Caption cap : t.captions) {

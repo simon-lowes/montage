@@ -24963,6 +24963,18 @@ private slots:
                                                  {10, -1}, {11, 10}, {12, 12}, {13, 13}, {14, 14}};
         QCOMPARE(frames.size(), want.size());
         for (size_t i = 0; i < want.size(); ++i) QVERIFY2(frames[i] == want[i], std::to_string(i).c_str());
+        // Found by time: each stretch keeps time with the file from where it starts (the second here at file frame 10, its
+        // cadence starting at 8: B's lone field from 10, C from 10.5, D from 11.75).
+        const PulldownMap map = pulldownMap({{0, 0, true}, {10, 2, true}}, 15);
+        QCOMPARE(map.frames.size(), want.size());
+        QCOMPARE(map.frameAt(0), int64_t(0));
+        QCOMPARE(map.frameAt(9.9), int64_t(7));    // D, file frame 9
+        QCOMPARE(map.frameAt(10.2), int64_t(8));   // B's lone field
+        QCOMPARE(map.frameAt(10.7), int64_t(9));   // C
+        QCOMPARE(map.frameAt(12), int64_t(10));    // D
+        QCOMPARE(map.frameAt(100), int64_t(12));   // (the last)
+        QCOMPARE(map.startOf(9), 10.5);
+        QCOMPARE(pulldownFileRate(Rational{24000, 1001}), (Rational{30000, 1001}));
         // Video with no pulldown keeps time by leaving out one frame in five.
         QCOMPARE(pulldownFrames({{0, -1, true}}, 10).size(), size_t(8));
 
@@ -25043,25 +25055,40 @@ private slots:
         const MediaItem* now = p.findMedia(telItem.id);
         QCOMPARE(now->fps, (Rational{24000, 1001}));
         QVERIFY2(std::fabs(now->duration - telItem.duration) < 0.01, qPrintable(QString::number(now->duration)));
-        // Every whole frame is the original, exactly; the B at the break left with one field is close to it.
+        // Every whole frame is the original, exactly, at the time it was shown: the edit cut two frames of the video (a
+        // picture and a field), so the pictures after it are the originals from two later; the B left with one field at
+        // the break is shown for the field's time, close to its original.
         VideoDecoder removedDec, filmDec;
         QVERIFY(removedDec.open(now->path, &err) && filmDec.open(film, &err));
         QVERIFY(std::fabs(removedDec.fps() - 24000.0 / 1001.0) < 1e-6);
         const double fps = 24000.0 / 1001.0;
-        for (int n = 0; n < 79; ++n) {
+        for (int n = 0; n < 78; ++n) {
             Frame16Ptr got = removedDec.frameAt((n + 0.5) / fps);
-            Frame16Ptr orig = filmDec.frameAt(((n < 40 ? n : n + 1) + 0.5) / fps);
+            Frame16Ptr orig = filmDec.frameAt(((n < 40 ? n : n + 2) + 0.5) / fps);
             QVERIFY2(got && orig && got->width == 320 && got->px.size() == orig->px.size(), std::to_string(n).c_str());
-            if (n == 40) {
-                double diff = 0;
-                for (size_t i = 0; i < got->px.size(); ++i) diff += std::abs(int(got->px[i]) - int(orig->px[i]));
-                diff /= double(got->px.size()) * 65535.0;
-                QVERIFY2(diff < 0.02, qPrintable(QString::number(diff)));
-            } else {
-                QVERIFY2(std::equal(got->px.begin(), got->px.end(), orig->px.begin()), std::to_string(n).c_str());
-            }
+            QVERIFY2(std::equal(got->px.begin(), got->px.end(), orig->px.begin()), std::to_string(n).c_str());
         }
-        QVERIFY(!removedDec.frameAt(80.5 / fps) || removedDec.frameAt(80.5 / fps)->pts <= 79.0 / fps);
+        {
+            Frame16Ptr got = removedDec.frameAt(40.2 / fps), orig = filmDec.frameAt(41.5 / fps);
+            QVERIFY(got && orig);
+            double diff = 0;
+            for (size_t i = 0; i < got->px.size(); ++i) diff += std::abs(int(got->px[i]) - int(orig->px[i]));
+            diff /= double(got->px.size()) * 65535.0;
+            QVERIFY2(diff < 0.02, qPrintable(QString::number(diff)));
+        }
+        // The last frame is the last picture, and stays.
+        Frame16Ptr last = removedDec.frameAt(78.0 / fps), after = removedDec.frameAt(90.0 / fps), lastOrig = filmDec.frameAt(79.5 / fps);
+        QVERIFY(last && after && lastOrig && std::equal(after->px.begin(), after->px.end(), lastOrig->px.begin()));
+        // Changed again with the pulldown kept (its file's rate is still 29.97), and put back.
+        Interpretation alsoAlpha = removed;
+        alsoAlpha.alpha = "ignore";
+        QVERIFY(edit::interpretFootage(p, telItem.id, alsoAlpha).ok);
+        QCOMPARE(fileFrameRate(*p.findMedia(telItem.id)), (Rational{30000, 1001}));
+        QCOMPARE(p.findMedia(telItem.id)->fps, (Rational{24000, 1001}));
+        QVERIFY(edit::interpretFootage(p, telItem.id, Interpretation{}).ok);
+        QCOMPARE(p.findMedia(telItem.id)->fps, (Rational{30000, 1001}));
+        QVERIFY(edit::interpretFootage(p, telItem.id, removed).ok);
+        now = p.findMedia(telItem.id);
 
         // Pulldown added on export: a 23.976 sequence as 29.97 interlaced video (2:3), pulled up again by FFmpeg's field
         // matching and decimation, gives back the frames the 23.976 export has, exactly.

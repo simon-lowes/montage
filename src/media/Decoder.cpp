@@ -970,9 +970,12 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
     fps_ = (fr.num > 0 && fr.den > 0) ? av_q2d(fr) : 25.0;
     duration_ = fmt_->duration > 0 ? double(fmt_->duration) / AV_TIME_BASE : 0;
     if (std::vector<PulldownStretch> stretches; !in.pulldown.empty() && parsePulldown(in.pulldown, stretches)) {
-        // Pulldown removed: four frames for each five of the file's, as its cadence gives them.
-        pulldown_ = std::make_shared<const std::vector<PulldownFrame>>(
-            pulldownFrames(stretches, std::max<int64_t>(1, int64_t(std::llround(duration_ * fps_)))));
+        // Pulldown removed: four frames for each five of the file's, as its cadence gives them; the video's own length
+        // (its frame count or duration; the file's when it says neither, or an hour).
+        int64_t frames = st->nb_frames > 0 ? int64_t(st->nb_frames) : 0;
+        if (frames <= 0 && st->duration > 0 && st->duration != AV_NOPTS_VALUE) frames = std::llround(double(st->duration) * timeBase_ * fps_);
+        if (frames <= 0) frames = duration_ > 0 ? std::llround(duration_ * fps_) : std::llround(3600 * fps_);
+        pulldown_ = std::make_shared<const PulldownMap>(pulldownMap(stretches, std::max<int64_t>(1, frames)));
         pulldownFps_ = fps_ * 0.8;
     }
     rotation_ = streamRotation(st);
@@ -1526,9 +1529,9 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
     if (pulldown_) {
         // Pulldown removed (media/Pulldown.h): the frame woven from the fields its cadence gives, kept while it is asked
         // for again.
-        const std::vector<PulldownFrame>& map = *pulldown_;
-        if (map.empty()) return nullptr;
-        const int64_t n = std::clamp<int64_t>(int64_t(std::floor(std::max(0.0, t) * pulldownFps_ + 1e-6)), 0, int64_t(map.size()) - 1);
+        const std::vector<PulldownFrame>& map = pulldown_->frames;
+        const int64_t n = pulldown_->frameAt(std::max(0.0, t) * fps_);
+        if (n < 0) return nullptr;
         if (n != wovenIndex_ || !woven_) {
             const PulldownFrame& pf = map[size_t(n)];
             av_frame_free(&woven_);
@@ -1552,7 +1555,7 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
             if (!woven_) return nullptr;
             wovenIndex_ = n;
         }
-        return convert(woven_, double(n) / pulldownFps_, targetW, targetH, highQuality);
+        return convert(woven_, pulldown_->startOf(n) / std::max(1.0, fps_), targetW, targetH, highQuality);
     }
     double pts = 0;
     const AVFrame* f = decodedAt(t, &pts);

@@ -45,7 +45,7 @@ bool readEmbeddedCaptions(const std::string& path, Rational fps, std::vector<Cap
                           std::string* error = nullptr, CaptionStandard standard = CaptionStandard::Auto);
 
 struct ImageSequence;
-struct PulldownFrame;
+struct PulldownMap;
 class MlvReader;
 namespace dcp {
 class ImfTrackReader;
@@ -139,7 +139,7 @@ private:
     std::unique_ptr<ImageSequence> exr_;      // OpenEXR read with OpenEXR (a layer, or a compression FFmpeg lacks): its frames
     std::string exrFile_;                     // (a single file: first = last = 0)
     // Pulldown removed (media/Pulldown.h): the frames the cadence gives, their rate, and the last one woven.
-    std::shared_ptr<const std::vector<PulldownFrame>> pulldown_;
+    std::shared_ptr<const PulldownMap> pulldown_;
     double pulldownFps_ = 0;
     AVFrame* woven_ = nullptr;
     int64_t wovenIndex_ = -1;

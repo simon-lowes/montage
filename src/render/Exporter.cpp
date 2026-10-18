@@ -1313,17 +1313,25 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     const int64_t audioStart = audioCursor;
     std::unique_ptr<SpeedStream> mainSpeed;
     if (conv.mode == RateConversion::Mode::Speed) {
+        // (the speed change reads a little ahead: nothing after the range's end is heard)
+        const int64_t audioEnd = int64_t(std::llround(double(out) * mixRate / seq.fpsValue()));
+        auto silenceAfterEnd = [nch, audioEnd](int64_t at, int frames, float* dst) {
+            if (at + frames > audioEnd)
+                std::fill(dst + size_t(std::clamp<int64_t>(audioEnd - at, 0, frames)) * size_t(nch), dst + size_t(frames) * size_t(nch), 0.0f);
+        };
         int64_t mainAt = audioStart;
-        mainSpeed = std::make_unique<SpeedStream>(nch, mixRate, conv.speed(), conv.keepPitch, [&, mainAt](int frames, float* dst) mutable {
+        mainSpeed = std::make_unique<SpeedStream>(nch, mixRate, conv.speed(), conv.keepPitch, [&, mainAt, silenceAfterEnd](int frames, float* dst) mutable {
             mixBlock(mixer, mainAt, frames, dst);
+            silenceAfterEnd(mainAt, frames, dst);
             mainAt += frames;
         });
         for (auto& x : extras) {
             ExtraAudio* e = x.get();
             int64_t at = audioStart;
-            e->speed = std::make_unique<SpeedStream>(nch, mixRate, conv.speed(), conv.keepPitch, [&, e, at](int frames, float* dst) mutable {
+            e->speed = std::make_unique<SpeedStream>(nch, mixRate, conv.speed(), conv.keepPitch, [&, e, at, silenceAfterEnd](int frames, float* dst) mutable {
                 if (nch > 2) e->mixer.mixLayout(p, e->seq, at, frames, dst);
                 else e->mixer.mix(p, e->seq, at, frames, dst);
+                silenceAfterEnd(at, frames, dst);
                 at += frames;
             });
         }
@@ -1586,6 +1594,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     };
     // Delivered at another rate: the programme's pictures kept while the frames round them use them again (a standards
     // conversion's in-betweens and its cut test, pulldown's fields), each with its look.
+    static std::atomic<uint64_t> exportRuns{0};
+    const uint64_t exportRun = ++exportRuns;
     std::map<FrameTime, std::shared_ptr<const Image>> held;
     std::map<FrameTime, ShotLook> looks;
     auto heldFrame = [&](FrameTime f) -> std::shared_ptr<const Image> {
@@ -1620,7 +1630,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (pic.t <= 0 || pic.woven || b == a) return *heldFrame(a);
         if (cutAfter(a)) return *heldFrame(pic.t < 0.5 ? a : b);  // never a blend of two shots
         const std::shared_ptr<const Image> A = heldFrame(a), B = heldFrame(b);
-        const std::string key = "export#" + std::to_string(reinterpret_cast<uintptr_t>(&seq)) + "#" + std::to_string(a);
+        // (the flow and in-between caches outlive the export: keyed by this export, and the size)
+        const std::string key = "export#" + std::to_string(exportRun) + "#" + std::to_string(A->width) + "x" + std::to_string(A->height) + "#" +
+                                std::to_string(a);
         Image mid;
         if (rifeAvailable() && rifeModel().installed() && cachedRife(*A, *B, pic.t, key, mid)) return mid;
         return interpolateFrames(*A, *B, pic.t, key);
@@ -2100,7 +2112,8 @@ bool exportBroadcastMxf(const Project& p, const Sequence& seq, const ExportSetti
     if (mpeg2 && s.videoCodec != "mpeg2video") return fail("RDD 9 and AS-11 X8 carry MPEG-2 HD 4:2:2 video");
     if (!mpeg2 && !(s.videoCodec == "libx264" && s.profile == "avci100"))
         return fail("AS-11 UK DPP HD and X2 carry AVC-Intra 100 video");
-    if (d == "as11-dpp" && !(seq.fps == Rational{25, 1}) && !(s.rateChange == "speed" && s.rate == Rational{25, 1}))
+    // (delivered at 25: the sequence's rate, or sped or converted to it)
+    if (d == "as11-dpp" && !((s.rateChange.empty() ? seq.fps : s.rate) == Rational{25, 1} && s.rateChange != "pulldown"))
         return fail("UK DPP HD is 25 frames a second (1080i25)");
     if (d == "as11-dpp" && ((s.width > 0 ? s.width : seq.width) != 1920 || (s.height > 0 ? s.height : seq.height) != 1080))
         return fail("UK DPP HD is 1920 by 1080 (1080i25)");

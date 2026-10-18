@@ -1,6 +1,7 @@
 #include "Pulldown.h"
 
 extern "C" {
+#include <libavformat/avformat.h>
 #include <libavutil/frame.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/pixdesc.h>
@@ -52,12 +53,78 @@ std::vector<PulldownFrame> pulldownFrames(const std::vector<PulldownStretch>& st
     return out;
 }
 
+PulldownMap pulldownMap(const std::vector<PulldownStretch>& stretches, int64_t fileFrames) {
+    PulldownMap m;
+    for (size_t k = 0; k < stretches.size(); ++k) {
+        const PulldownStretch& st = stretches[k];
+        const int64_t s = std::min(st.start, fileFrames);
+        const int64_t e = k + 1 < stretches.size() ? std::min(stretches[k + 1].start, fileFrames) : fileFrames;
+        if (e <= s) continue;
+        std::vector<PulldownFrame> part = pulldownFrames({{0, st.position, st.topFirst}}, e - s);
+        PulldownMap::Stretch x;
+        x.fileStart = s;
+        x.first = int64_t(m.frames.size());
+        x.count = int64_t(part.size());
+        // The cadence's A A frame (where its four pictures start) is `position` frames before the stretch; its first
+        // frame is the cadence's picture 0 (A), 1 (B: from B B, or B C's lone field), 2 (C D's lone C) or 3 (D).
+        const int j = std::max(0, st.position);
+        static const int picture[5] = {0, 1, 1, 2, 3};
+        x.origin = double(s - j) * 0.8 + picture[j];
+        for (PulldownFrame& f : part) {
+            if (f.first >= 0) f.first += s;
+            if (f.second >= 0) f.second += s;
+            m.frames.push_back(f);
+        }
+        m.stretches.push_back(x);
+    }
+    return m;
+}
+
+int64_t PulldownMap::frameAt(double fileFrame) const {
+    if (frames.empty() || stretches.empty()) return -1;
+    // (the last stretch starting at or before it)
+    auto it = std::upper_bound(stretches.begin(), stretches.end(), fileFrame + 1e-6,
+                               [](double v, const Stretch& x) { return v < double(x.fileStart); });
+    if (it != stretches.begin()) --it;
+    const Stretch& x = *it;
+    if (x.count == 0) return std::clamp<int64_t>(x.first - 1, 0, int64_t(frames.size()) - 1);
+    const int64_t picture = int64_t(std::floor(std::max(fileFrame, double(x.fileStart)) * 0.8 + 1e-6 - x.origin));
+    return x.first + std::clamp<int64_t>(picture, 0, x.count - 1);
+}
+
+double PulldownMap::startOf(int64_t n) const {
+    for (const Stretch& x : stretches)
+        if (n >= x.first && n < x.first + x.count) return std::max(double(x.fileStart), (x.origin + double(n - x.first)) / 0.8);
+    return 0;
+}
+
 std::string pulldownStartingAt(int position, bool topFirst) { return pulldownValue({{0, std::clamp(position, 0, 4), topFirst}}); }
 
 Rational pulldownRate(Rational fileFps) {
     if (fileFps == Rational{30000, 1001}) return Rational{24000, 1001};
     if (fileFps == Rational{30, 1}) return Rational{24, 1};
     return Rational{fileFps.num * 4, fileFps.den * 5};
+}
+
+Rational pulldownFileRate(Rational removedFps) {
+    if (removedFps == Rational{24000, 1001}) return Rational{30000, 1001};
+    if (removedFps == Rational{24, 1}) return Rational{30, 1};
+    return Rational{removedFps.num * 5, removedFps.den * 4};
+}
+
+bool fileTopFieldFirst(const std::string& path) {
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return true;
+    bool top = true;
+    if (avformat_find_stream_info(fmt, nullptr) >= 0) {
+        const int v = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+        if (v >= 0) {
+            const AVFieldOrder o = fmt->streams[v]->codecpar->field_order;
+            top = o != AV_FIELD_BB && o != AV_FIELD_TB;  // (TB: the top field coded first, the bottom shown first)
+        }
+    }
+    avformat_close_input(&fmt);
+    return top;
 }
 
 bool pulldownRateValid(Rational fileFps) {

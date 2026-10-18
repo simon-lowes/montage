@@ -54,8 +54,8 @@ struct DeliveredPicture {
 DeliveredPicture deliveredPicture(const RateConversion& c, int64_t o, int64_t frames);
 
 // The sequence as delivered: at the new rate, its caption tracks and markers on the delivered frames, counted from the
-// range's start (programme frame `in` is delivered frame 0), anything outside [in, out) left out. Its clips are the
-// programme's, still on its own frames (it is rendered and mixed as the programme, not as this).
+// range's start (programme frame `in` is delivered frame 0), anything outside [in, out) left out. Its clips are placed
+// on the delivered frames too, for where its cuts fall (it is rendered and mixed as the programme, not as this).
 Sequence deliveredSequence(const Sequence& seq, const RateConversion& c, FrameTime in, FrameTime out);
 
 // Whether programme frames f - 1 and f are either side of an edit: a clip starting or ending there on a video track

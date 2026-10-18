@@ -32,6 +32,25 @@ struct PulldownFrame {
 // The frames a file of `fileFrames` frames gives with its cadence `stretches` removed, in order.
 std::vector<PulldownFrame> pulldownFrames(const std::vector<PulldownStretch>& stretches, int64_t fileFrames);
 
+// The frames of a file with its cadence removed, each found by the time it is shown: a stretch's frames keep time with
+// the file from the frame it starts at, as its cadence places them (an edit that broke the cadence cut the picture
+// there, so the frames after it are not a frame late for each break).
+struct PulldownMap {
+    std::vector<PulldownFrame> frames;
+    struct Stretch {
+        int64_t fileStart = 0;  // the file frame it starts at
+        int64_t first = 0;      // its first frame in `frames`, and how many it has
+        int64_t count = 0;
+        double origin = 0;      // where its cadence's pictures start, in pictures from the file's start (four in five frames)
+    };
+    std::vector<Stretch> stretches;
+    // The frame shown at file frame position `fileFrame` (the time times the file's rate); -1 when there are none.
+    int64_t frameAt(double fileFrame) const;
+    // Where frame `n` starts being shown, as a file frame position.
+    double startOf(int64_t n) const;
+};
+PulldownMap pulldownMap(const std::vector<PulldownStretch>& stretches, int64_t fileFrames);
+
 // A cadence of one stretch, the file starting at `position` (0 A A, 1 B B, 2 B C, 3 C D), as an Interpretation's
 // pulldown value: Interpret Footage's "starting on A" to "D".
 std::string pulldownStartingAt(int position, bool topFirst);
@@ -40,6 +59,10 @@ std::string pulldownStartingAt(int position, bool topFirst);
 Rational pulldownRate(Rational fileFps);
 // Whether a file at this rate can have 2:3 pulldown removed (29.97 or 30 frames a second).
 bool pulldownRateValid(Rational fileFps);
+// The file's own rate, from the rate it plays at with its pulldown removed (23.976 to 29.97, 24 to 30).
+Rational pulldownFileRate(Rational removedFps);
+// Whether the video at `path` (a file path) says its top field is first: true unless it says the bottom one is.
+bool fileTopFieldFirst(const std::string& path);
 
 // The cadence of the video at `path` (a file path, without an interpretation), found from its fields: its stretches,
 // a break wherever an edit made after the pulldown changed it. Stretches of video with no pulldown in it are given as

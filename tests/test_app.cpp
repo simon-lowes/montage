@@ -10597,20 +10597,51 @@ const auto seq = [this] { return state()->sequence(); };
         const MediaItem* m = state()->project().findMedia(ids[0]);
         QCOMPARE(m->fps, (Rational{24000, 1001}));
         QCOMPARE(interpretationOf(*m).pulldown, std::string("0:0:t"));
-        // Opened again it says the pulldown is removed, and keeps it.
+        // Opened again it says the pulldown is removed and keeps it while something else changes; then it is put back.
         QTimer::singleShot(0, this, [&] {
             auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
             if (!dlg) return;
-            shown = dlg->findChild<QComboBox*>("interpretPulldown")->currentData().toString() == "keep";
+            auto* pulldown = dlg->findChild<QComboBox*>("interpretPulldown");
+            shown = pulldown->isEnabled() && pulldown->currentData().toString() == "keep";
+            dlg->findChild<QComboBox*>("interpretAlpha")->setCurrentIndex(2);  // ignore
             dlg->accept();
         });
         shown = false;
         bin->interpretFootageDialog({ids[0]});
         QVERIFY(shown);
         QCOMPARE(interpretationOf(*state()->project().findMedia(ids[0])).pulldown, std::string("0:0:t"));
-        state()->undo();
+        QCOMPARE(interpretationOf(*state()->project().findMedia(ids[0])).alpha, std::string("ignore"));
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+            if (!dlg) return;
+            auto* pulldown = dlg->findChild<QComboBox*>("interpretPulldown");
+            pulldown->setCurrentIndex(pulldown->findData(QString()));
+            dlg->accept();
+        });
+        bin->interpretFootageDialog({ids[0]});
         QCOMPARE(state()->project().findMedia(ids[0])->fps, (Rational{30000, 1001}));
+        QVERIFY(interpretationOf(*state()->project().findMedia(ids[0])).pulldown.empty());
         QCOMPARE(state()->sequence()->fps, (Rational{24000, 1001}));
+        // Found from the fields, in the background (a moving pattern telecined by FFmpeg).
+        if (const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg"); !ffmpeg.isEmpty()) {
+            const QString moving = dir_.filePath("telecined-pattern.mkv");
+            QProcess pr;
+            pr.start(ffmpeg, {"-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=24000/1001", "-frames:v", "40",
+                              "-vf", "telecine=first_field=top:pattern=23", "-c:v", "ffv1", "-pix_fmt", "yuv420p", moving});
+            QVERIFY(pr.waitForFinished(120000) && pr.exitCode() == 0);
+            const auto found = state()->importFiles({moving});
+            QCOMPARE(found.size(), size_t(1));
+            QTimer::singleShot(0, this, [&] {
+                auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+                if (!dlg) return;
+                auto* pulldown = dlg->findChild<QComboBox*>("interpretPulldown");
+                pulldown->setCurrentIndex(pulldown->findData("auto"));
+                dlg->accept();
+            });
+            bin->interpretFootageDialog({found[0]});
+            QTRY_COMPARE_WITH_TIMEOUT(state()->project().findMedia(found[0])->fps, (Rational{24000, 1001}), 60000);
+            QCOMPARE(interpretationOf(*state()->project().findMedia(found[0])).pulldown, std::string("0:0:t"));
+        }
 
         // The export dialog offers the 23.976 sequence's deliveries: pulldown, PAL's speed-up, conversions.
         RenderQueue* queue = win_->renderQueue();
@@ -10645,9 +10676,8 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(job.settings.rate, (Rational{25, 1}));
         QVERIFY(!job.settings.rateKeepPitch);
         queue->remove(job.id);
-        // Remembered for the next export.
-        QCOMPARE(ExportDialog(state(), win_.get()).findChild<QComboBox*>("exportRate")->currentData().toString(), QStringLiteral("speed|25/1|"));
-        appSettings().remove("export/rate");
+        // The next export starts as the sequence again (a speed change is never a surprise).
+        QCOMPARE(ExportDialog(state(), win_.get()).findChild<QComboBox*>("exportRate")->currentData().toString(), QString());
         appSettings().remove("export/ratePitch");
         appSettings().setValue("export/preset", rememberedPreset);
         state()->newProject();

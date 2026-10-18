@@ -554,9 +554,12 @@ void MediaBinWidget::interpretFootageDialog(const std::vector<Id>& media) {
         if (!m) continue;
         if (m->subclipOf) m = state_->project().findMedia(m->subclipOf);
         if (!m) continue;
-        if (choice == QLatin1String("keep")) pulldowns[id] = interpretationOf(*m).pulldown;
-        else if (choice.size() == 1) pulldowns[id] = pulldownStartingAt(choice[0].toLatin1() - 'A', how.fields != "lower");
-        else if (choice == QLatin1String("auto") && m->kind == MediaKind::Video) toFind.push_back({id, uninterpretedPath(m->path)});
+        // (an item pulldown is not removed from, in a selection with others, keeps how it is read)
+        const bool can = m->kind == MediaKind::Video && pulldownRateValid(fileFrameRate(*m));
+        if (choice == QLatin1String("keep") || (!can && !choice.isEmpty())) pulldowns[id] = interpretationOf(*m).pulldown;
+        else if (choice.size() == 1)
+            pulldowns[id] = pulldownStartingAt(choice[0].toLatin1() - 'A', how.fields.empty() ? fileTopFieldFirst(uninterpretedPath(m->path)) : how.fields != "lower");
+        else if (choice == QLatin1String("auto")) pulldowns[id] = interpretationOf(*m).pulldown, toFind.push_back({id, uninterpretedPath(m->path)});
         else pulldowns[id].clear();
     }
     if (toFind.empty()) {
@@ -575,17 +578,17 @@ void MediaBinWidget::interpretFootageDialog(const std::vector<Id>& media) {
     QPointer<QProgressDialog> guard(progress);
     connect(watcher, &QFutureWatcher<Found>::finished, this, [this, watcher, progress, media, how, keepHighlights, pulldowns, cancel]() mutable {
         const Found found = watcher->result();
+        const bool cancelled = cancel->load();
+        // (closing the dialog says it was cancelled)
+        progress->disconnect(this);
         progress->close();
         progress->deleteLater();
         watcher->deleteLater();
-        if (cancel->load()) return;
+        if (cancelled) return;
         for (const auto& [id, value] : found.first) pulldowns[id] = value;
         if (!found.second.isEmpty()) QMessageBox::warning(this, tr("Interpret Footage"), found.second.join(QLatin1Char('\n')));
-        // (items whose cadence was not found keep how they were read)
-        std::vector<Id> ready;
-        for (Id id : media)
-            if (pulldowns.count(id)) ready.push_back(id);
-        if (!ready.empty()) interpretFootage(ready, how, keepHighlights, &pulldowns);
+        // (items whose cadence was not found keep their pulldown as it was, and take the rest)
+        interpretFootage(media, how, keepHighlights, &pulldowns);
     });
     watcher->setFuture(QtConcurrent::run([toFind, cancel, guard]() {
         Found out;
