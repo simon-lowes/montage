@@ -1861,7 +1861,7 @@ std::vector<McaLabel> imfChannels(int channels) {
 }
 
 bool ImfSoundWriter::open(const std::string& path, const Uuid& asset, int channels, const std::string& language, const std::string& title,
-                          const std::string& titleVersion, std::string* error) {
+                          const std::string& titleVersion, std::string* error, const std::string& contentKind) {
     if (channels != 2 && channels != 6 && channels != 8) {
         if (error) *error = "IMF sound here is stereo, 5.1 or 7.1";
         return false;
@@ -1870,6 +1870,7 @@ bool ImfSoundWriter::open(const std::string& path, const Uuid& asset, int channe
     language_ = language.empty() ? "en" : language;
     title_ = title.empty() ? "Untitled" : title;
     version_ = titleVersion.empty() ? "1" : titleVersion;
+    kind_ = contentKind.empty() ? "PRM" : contentKind;
     if (!openImfFile(path, asset, {48000, 1}, error)) return false;
     // The one KLV the sound is wrapped in: its length (an eight-byte BER) is written when the file is closed.
     Bytes kl;
@@ -1887,6 +1888,20 @@ bool ImfSoundWriter::write(const float* samples, size_t frames, std::string* err
     buf_.resize(n * 3);
     for (size_t i = 0; i < n; ++i) {
         const int32_t s = int32_t(std::lround(std::clamp(double(samples[i]), -1.0, 1.0) * 8388607.0));
+        buf_[i * 3] = uint8_t(s);
+        buf_[i * 3 + 1] = uint8_t(s >> 8);
+        buf_[i * 3 + 2] = uint8_t(s >> 16);
+    }
+    if (!writeRaw(buf_.data(), buf_.size(), error)) return false;
+    samples_ += int64_t(frames);
+    return true;
+}
+
+bool ImfSoundWriter::writePcm(const int32_t* samples, size_t frames, std::string* error) {
+    const size_t n = frames * size_t(channels_);
+    buf_.resize(n * 3);
+    for (size_t i = 0; i < n; ++i) {
+        const int32_t s = std::clamp(samples[i], -8388607, 8388607);
         buf_[i * 3] = uint8_t(s);
         buf_[i * 3 + 1] = uint8_t(s >> 8);
         buf_[i * 3 + 2] = uint8_t(s >> 16);
@@ -1941,7 +1956,7 @@ std::vector<uint8_t> ImfSoundWriter::headerMetadata(int64_t duration) const {
         s.item(0xfffa, language);
         s.text(0xfff9, title_);
         s.text(0xfff8, version_);
-        s.text(0xfff7, "PRM");   // the primary programme
+        s.text(0xfff7, kind_);   // the programme, music and effects, or described
         s.text(0xfff6, "FCMP");  // its full mix
         putBytes(out, setKlv(0x6c, s));
     }
@@ -1969,5 +1984,163 @@ std::vector<uint8_t> ImfSoundWriter::indexSegments() const {
     s.item(0x3f0a, entries);
     return klv(ul("060e2b34025301010d01020101100100"), s.body);
 }
+
+// ---- IMF timed text -----------------------------------------------------------------------------------------------
+
+bool ImfTimedTextWriter::write(const std::string& xml, int64_t duration, const std::string& language, std::string* error) {
+    resourceId_ = newUuid();
+    duration_ = duration;
+    language_ = language.empty() ? "en" : language;
+    return writeElement(ul(kTimedTextElement).data(), reinterpret_cast<const uint8_t*>(xml.data()), xml.size(), error);
+}
+
+std::array<uint8_t, 16> ImfTimedTextWriter::essenceContainer() const { return ul(kTimedTextContainer); }
+
+std::vector<uint8_t> ImfTimedTextWriter::headerMetadata(int64_t duration) const {
+    std::vector<PrimerEntry> entries(std::begin(kCommonPrimer), std::end(kCommonPrimer));
+    entries.insert(entries.end(), std::begin(kTimedTextPrimer), std::end(kTimedTextPrimer));
+    Bytes out = primerOf(entries);
+    putBytes(out, packagesImf(ids_, asset_, rate_, duration, created_, kTimedTextContainer, kDataDef, "Data Track", 0x17010b01,
+                              "File Package: SMPTE 429-5 clip wrapping of IMF Timed Text data"));
+    Set s;
+    s.uuid(0x3c0a, ids_[kDescriptor]);
+    s.u32(0x3006, 1);
+    s.rational(0x3001, rate_.num, rate_.den);
+    s.i64(0x3002, duration);
+    s.label(0x3004, kTimedTextContainer);
+    s.item(0x3e01, Bytes(16, 0));
+    s.uuid(0xfffe, resourceId_);
+    s.text(0xfffd, "UTF-8");
+    s.text(0xfffc, kProfile);
+    s.text(0xfffb, language_);
+    putBytes(out, setKlv(0x64, s));
+    return out;
+}
+
+std::vector<uint8_t> ImfTimedTextWriter::indexSegments() const { return vbrIndex(offsets_, rate_); }
+
+// ---- Reading IMF track files --------------------------------------------------------------------------------------
+
+bool ImfTrackReader::open(const std::string& path, std::string* error) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    path_ = path;
+    kind_ = Kind::Unknown;
+    asset_ = {};
+    channels_ = 0;
+    rate_ = {};
+    op1a_ = rgba_ = j2k_ = false;
+    elements_.clear();
+    clipAt_ = clipSize_ = 0;
+    File file;
+    if (!openRead(file, path)) return fail("Cannot open " + path);
+    // Every KLV in turn: the header's sets (the file package's id, the sound's channels) and the essence elements
+    // (06.0e.2b.34.01.02.01.01.0d.01.03.01, byte 12 the item: 15 picture, 16 sound, 17 data).
+    bool sound = false, text = false;
+    for (uint64_t at = 0; at + 17 <= file.size;) {
+        uint8_t key[16];
+        uint64_t length = 0, head = 0;
+        if (!file.seek(at) || !file.kl(key, length, head)) break;
+        const uint64_t value = at + head;
+        static const uint8_t essence[12] = {0x06, 0x0e, 0x2b, 0x34, 0x01, 0x02, 0x01, 0x01, 0x0d, 0x01, 0x03, 0x01};
+        static const uint8_t set[6] = {0x06, 0x0e, 0x2b, 0x34, 0x02, 0x53};
+        if (std::memcmp(key, essence, 12) == 0) {
+            if (key[12] == 0x15) {
+                elements_.emplace_back(value, length);
+            } else if (key[12] == 0x16 || key[12] == 0x17) {
+                if (clipSize_ || sound || text) return fail(path + " is not clip-wrapped");
+                (key[12] == 0x16 ? sound : text) = true;
+                clipAt_ = value;
+                clipSize_ = length;
+            }
+        } else if (std::memcmp(key, set, 6) == 0 && length < (1u << 20) && (key[14] == 0x2f || key[14] == 0x37 || key[14] == 0x48 || key[14] == 0x29 || key[14] == 0x28 || key[14] == 0x64)) {
+            Bytes v(static_cast<size_t>(length));
+            if (!file.read(v.data(), v.size())) return fail(path + " is damaged");
+            const auto it = items(v);
+            if (key[14] == 0x2f) {
+                // (the preface's operational pattern: OP1a is 06.0e.2b.34.04.01.01.xx.0d.01.02.01.01.01, then its qualifier)
+                if (auto op = it.find(0x3b09); op != it.end() && op->second.size() == 16) {
+                    const Bytes& u = op->second;
+                    op1a_ = u[8] == 0x0d && u[9] == 0x01 && u[10] == 0x02 && u[11] == 0x01 && u[12] == 0x01 && u[13] == 0x01;
+                }
+            } else if (key[14] == 0x37) {
+                // (the file package's UMID: the material number, a UUID, after its 16-byte label)
+                if (auto u = it.find(0x4401); u != it.end() && u->second.size() == 32) std::copy(u->second.begin() + 16, u->second.end(), asset_.begin());
+            } else {
+                if (auto c = it.find(0x3d07); c != it.end() && key[14] == 0x48) channels_ = int(beOf(c->second));
+                if (key[14] == 0x29) rgba_ = true;
+                // (the essence container: the JPEG 2000 mapping, 06.0e.2b.34.04.01.01.xx.0d.01.03.01.02.0c)
+                if (auto ec = it.find(0x3004); ec != it.end() && ec->second.size() == 16 && (key[14] == 0x29 || key[14] == 0x28))
+                    j2k_ = ec->second[8] == 0x0d && ec->second[9] == 0x01 && ec->second[10] == 0x03 && ec->second[11] == 0x01 &&
+                           ec->second[12] == 0x02 && ec->second[13] == 0x0c;
+                if (auto r = it.find(0x3001); r != it.end() && r->second.size() == 8)
+                    rate_ = EditRate{uint32_t(beOf(Bytes(r->second.begin(), r->second.begin() + 4))), uint32_t(beOf(Bytes(r->second.begin() + 4, r->second.end())))};
+            }
+        }
+        at = value + length;
+    }
+    if (!elements_.empty() && !sound && !text) kind_ = Kind::Picture;
+    else if (sound && elements_.empty() && channels_ > 0 && channels_ <= 64) kind_ = Kind::Sound;
+    else if (text && elements_.empty()) kind_ = Kind::TimedText;
+    else return fail(path + " is not an IMF track file Montage reads");
+    return true;
+}
+
+bool ImfTrackReader::frame(int64_t index, std::vector<uint8_t>& out, std::string* error) const {
+    if (index < 0 || index >= frames()) {
+        if (error) *error = "No such frame";
+        return false;
+    }
+    File file;
+    const auto [at, size] = elements_[size_t(index)];
+    if (!openRead(file, path_) || !file.seek(at) || !file.fits(size)) {
+        if (error) *error = "Cannot read " + path_;
+        return false;
+    }
+    out.resize(size_t(size));
+    if (!file.read(out.data(), out.size())) {
+        if (error) *error = "Cannot read " + path_;
+        return false;
+    }
+    return true;
+}
+
+bool ImfTrackReader::pcm(int64_t first, int64_t count, std::vector<int32_t>& out, std::string* error) const {
+    const uint64_t frame = 3 * uint64_t(std::max(1, channels_));
+    File file;
+    if (kind_ != Kind::Sound || first < 0 || count < 0 || first + count > samples() || !openRead(file, path_) ||
+        !file.seek(clipAt_ + uint64_t(first) * frame)) {
+        if (error) *error = "Cannot read the sound of " + path_;
+        return false;
+    }
+    Bytes b(size_t(uint64_t(count) * frame));
+    if (!file.read(b.data(), b.size())) {
+        if (error) *error = "Cannot read the sound of " + path_;
+        return false;
+    }
+    out.resize(b.size() / 3);
+    for (size_t i = 0; i < out.size(); ++i) {
+        const uint32_t v = uint32_t(b[3 * i]) | uint32_t(b[3 * i + 1]) << 8 | uint32_t(b[3 * i + 2]) << 16;
+        out[i] = int32_t(v << 8) >> 8;
+    }
+    return true;
+}
+
+bool ImfTrackReader::text(std::string& out, std::string* error) const {
+    File file;
+    if (kind_ != Kind::TimedText || clipSize_ > (uint64_t(64) << 20) || !openRead(file, path_) || !file.seek(clipAt_)) {
+        if (error) *error = "Cannot read the timed text of " + path_;
+        return false;
+    }
+    out.resize(size_t(clipSize_));
+    if (!file.read(reinterpret_cast<uint8_t*>(out.data()), out.size())) {
+        if (error) *error = "Cannot read the timed text of " + path_;
+        return false;
+    }
+    return true;
+}
+
 
 }  // namespace montage::dcp

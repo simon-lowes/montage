@@ -10,16 +10,43 @@
 // (ST 2067-3) whose essence descriptor list repeats each file's descriptors (as RegXML), with the Application #2E
 // identification, a Packing List with each file's SHA-1 (ST 2067-2) and an Asset Map (ST 429-9). Netflix's Photon,
 // the reference IMF checker, passes these packages.
+//
+// Versions: each caption track becomes a timed text virtual track (an IMSC 1.1 Text document wrapped as a track file,
+// with its language): subtitles, captions for the deaf and hard of hearing, or forced narrative. Several sound
+// versions each get a main audio virtual track and a track file: the programme in its language (the main mix or a dub,
+// heard through the roles chosen), music and effects (without the Dialogue role), or the described version (with the
+// Description role). A supplemental package carries only what changed since an earlier package (the latest of a chain,
+// as Netflix asks: each supplemental built on the one before): the pictures the editor changed (the old cut compared
+// with the new one, each reused stretch checked against the old package's frames), the sound where its samples
+// differ, timed text that is new; its composition plays the earlier packages' track files by id around them. An IMF
+// package, original or supplemental, can also be opened as a sequence.
 #pragma once
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
+#include "core/Interchange.h"
 #include "core/Model.h"
 
 namespace montage {
+
+// A sound version: a main audio virtual track and its track file.
+struct ImfSound {
+    std::string language = "en";  // RFC 5646
+    std::string kind = "PRM";      // MCA audio content kind: "PRM" the programme (main or dubbed), "ME" music and effects, "DV" described
+    // The roles heard (Clip::role; clips without one are always heard). Empty: the sequence's mix as it plays, without
+    // the descriptions (ME: without Dialogue too; DV: with the descriptions).
+    std::vector<std::string> roles;
+};
+
+// A caption track as a timed text virtual track.
+struct ImfText {
+    Id track = 0;                    // Sequence::captionTracks id
+    std::string kind = "subtitles";  // "subtitles", "captions" (for the deaf and hard of hearing) or "forced" (forced narrative)
+};
 
 struct ImfSettings {
     std::string title;
@@ -35,6 +62,15 @@ struct ImfSettings {
     double masteringPeak = 0;      // HDR: the mastering display's peak in cd/m^2 (0: the sequence's HDR peak, at least 1000)
     bool inOut = false;            // only In to Out (both included)
     int threads = 0;               // JPEG 2000 encoders at once (0: one per processor core)
+    std::vector<ImfSound> sounds;  // empty: the mix, the programme in `language`
+    bool captions = true;          // caption tracks as timed text
+    std::vector<ImfText> texts;    // which, and as what; empty: every caption track (but the audio description's) as subtitles
+    // A supplemental package of the earlier one in this folder (its picture's size, colour, depth and coding are kept);
+    // the track files it plays are looked for there and in the packages beside it.
+    std::string supplementOf;
+    // The sequence that package was mastered from, kept as it was (a copy made before the changes): its cut is
+    // compared with this one to find the pictures that changed. 0: the picture has not changed (new sound or text).
+    Id originalSequence = 0;
 };
 
 struct ImfResult {
@@ -44,7 +80,54 @@ struct ImfResult {
     int width = 0, height = 0, bits = 0, channels = 0;
     uint16_t rsiz = 0;  // the JPEG 2000 profile the pictures declare
     std::string colour;
+    int sounds = 0, texts = 0;   // virtual tracks
+    bool supplemental = false;
+    int64_t codedFrames = 0;     // pictures in the package's own track file (a supplemental's: those that changed)
+    int64_t newSamples = 0;      // sample frames in its own sound track files
+    std::vector<std::string> trackFiles;  // the track files written
 };
+
+// A composition playlist as read back: its virtual tracks (each Resource with the track file it plays), and what the
+// essence descriptors say.
+struct ImfResource {
+    std::string trackFile;  // the track file's id (bare UUID, lower case)
+    std::string encoding;   // its essence descriptor's id
+    std::string hash;
+    int64_t entry = 0, duration = 0, intrinsic = 0, repeat = 1;
+    uint32_t rateNum = 24, rateDen = 1;
+};
+struct ImfVirtualTrack {
+    std::string kind;  // "MainImageSequence", "MainAudioSequence", "SubtitlesSequence", ...
+    std::string id;    // TrackId
+    std::vector<ImfResource> resources;  // every segment's, in order
+    std::string language, contentKind;   // sound and timed text (from the descriptors)
+    int channels = 0;
+    int64_t length() const;  // edit units
+};
+struct ImfComposition {
+    std::string path, id, title, issued;
+    uint32_t rateNum = 24, rateDen = 1;
+    int width = 0, height = 0, bits = 0;
+    uint16_t rsiz = 0;
+    std::string colour;  // as ImfSettings::colour ("" when not one of those)
+    double masteringPeak = 0;
+    std::vector<ImfVirtualTrack> tracks;
+    std::map<std::string, std::string> descriptors;  // id: the descriptor's RegXML, as written
+    const ImfVirtualTrack* picture() const;
+};
+bool readImfComposition(const std::string& cpl, ImfComposition& out, std::string* error = nullptr);
+// A package's composition playlist (the latest issued, when it holds several), or "".
+std::string imfCompositionIn(const std::string& folder);
+// The track files a package can play, by id: its own and those of the packages in the folders beside it.
+std::map<std::string, std::string> imfTrackFiles(const std::string& folder);
+
+// Opens a composition (a CPL file, or a package folder: its latest) as a new sequence: the pictures on V1, each sound
+// virtual track on an audio track of its own (the first programme heard, the others muted), each timed text track as a
+// caption track, the track files found in its package and those beside it.
+ImportResult importImf(Project& p, const std::string& path, const MediaProber& probe = {});
+// Whether `path` is an IMF package to open with importImf: a folder with an asset map, an asset map, or a composition
+// playlist.
+bool isImfPackage(const std::string& path);
 
 // The colour a sequence is mastered in, and whether IMF Application #2E takes its frame rate (24, 23.976, 25, 29.97,
 // 30, 50, 59.94, 60, and 120 above HD). At 29.97 and 59.94 a master is padded with black and silence to a multiple of
@@ -63,9 +146,11 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
                const std::function<bool(double)>& progress = {}, std::string* error = nullptr);
 
 // Checks a package: the asset map, every file at its size, the packing list's hashes, the composition's resources in
-// the package with durations within them and their essence descriptors listed, the Application #2E identification, the
-// picture track files JPEG 2000 in an IMF profile with as many frames as the composition says, the sound 24-bit 48 kHz
-// with as many samples. An empty list means it passed; `progress` may return false to stop ("Stopped").
+// the package (or, for a supplemental, in the packages beside it, against the composition's hashes) with durations
+// within them and their essence descriptors listed, every virtual track as long as the picture, the Application #2E
+// identification, the picture track files JPEG 2000 in an IMF profile with as many frames as the composition says, the
+// sound 24-bit 48 kHz with as many samples, the timed text TTML. An empty list means it passed; `progress` may return
+// false to stop ("Stopped").
 std::vector<std::string> verifyImf(const std::string& folder, const std::function<bool(double)>& progress = {});
 
 // Frame `index` of an IMF picture track file decoded to RGB samples.

@@ -472,8 +472,11 @@ public:
 private:
     // Imports an OTIO, EDL or FCP XML timeline as a new sequence (one undo step).
     void importTimeline();
+    void importImfPackage();
     void addTitle();
 public:
+    // Reads a timeline file, or an IMF package (a folder, its ASSETMAP.xml or a CPL), into a new sequence.
+    void importTimelineFrom(QString path);
     // Adds the OGraf graphic `file` (asked for when "") at the playhead, its data its defaults; the clip, or 0.
     Id addOGrafGraphic(const QString& file = {});
 private:

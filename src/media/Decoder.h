@@ -46,6 +46,9 @@ bool readEmbeddedCaptions(const std::string& path, Rational fps, std::vector<Cap
 
 struct ImageSequence;
 class MlvReader;
+namespace dcp {
+class ImfTrackReader;
+}
 
 // Frame-accurate video decoder. Not thread safe: use one per thread
 // (MediaPool hands them out).
@@ -60,7 +63,7 @@ public:
 
     bool open(const std::string& path, std::string* error = nullptr);
     void close();
-    bool isOpen() const { return ctx_ != nullptr || vector_ != nullptr || raw_ != nullptr || rawSequence_ != nullptr || mlv_ != nullptr || exr_ != nullptr; }
+    bool isOpen() const { return ctx_ != nullptr || vector_ != nullptr || raw_ != nullptr || rawSequence_ != nullptr || mlv_ != nullptr || exr_ != nullptr || imf_ != nullptr; }
 
     // Frame displayed at media time `t` (seconds from the start of the file; of the conformed file when the path carries
     // an interpretation, core/Interpretation.h), converted to RGBA16 at exactly targetW x targetH (0 = native display size).
@@ -129,6 +132,7 @@ private:
     std::unique_ptr<ImageSequence> rawSequence_;  // a run of camera raw frames (media/ImageSequence.h)
     int rawFrame_ = -1;                       // the run's (or Magic Lantern Video's) frame in raw_
     std::unique_ptr<MlvReader> mlv_;          // Magic Lantern Video: each frame's mosaic developed (media/Mlv.h)
+    std::unique_ptr<dcp::ImfTrackReader> imf_;  // an IMF picture track file: each frame decoded with OpenJPEG, its codes kept
     std::unique_ptr<ImageSequence> exr_;      // OpenEXR read with OpenEXR (a layer, or a compression FFmpeg lacks): its frames
     std::string exrFile_;                     // (a single file: first = last = 0)
     std::string exrLayer_;                    // the layer shown (with no main picture and none chosen, the file's first)
