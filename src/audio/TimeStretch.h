@@ -36,4 +36,42 @@ AudioBufferPtr stretchedAudio(const std::string& key, const AudioBufferPtr& sour
 // Stretches still being made in the background.
 int stretchesRunning();
 
+// Sound sped up or slowed down as it streams (a programme's speed change on export, render/RateConversion.h), read in
+// order from `source`, which fills `frames` frames from its next sample on: varispeed (resampled with a windowed sinc,
+// its pitch moving with the speed) or its pitch kept (WSOLA, as wsolaStretch, grain by grain). `speed` is source
+// samples per output sample (25 / 24 for PAL's speed-up).
+class SpeedStream {
+public:
+    using Source = std::function<void(int frames, float* out)>;
+    SpeedStream(int channels, int sampleRate, double speed, bool keepPitch, Source source);
+    // The next `frames` output frames, interleaved.
+    void read(int frames, float* out);
+
+private:
+    void need(int64_t until);   // the source read up to (not including) sample `until`
+    float sample(int64_t at, int c) const;
+    void grain();               // one more WSOLA grain overlapped in
+    int nch_;
+    double speed_;
+    bool keepPitch_;
+    Source source_;
+    std::vector<float> src_;    // source samples from srcBase_ on
+    std::vector<float> mono_;   // the same as mono, for lining grains up
+    int64_t srcBase_ = 0;
+    int64_t outDone_ = 0;       // output frames handed out
+    // Varispeed: its filter.
+    static constexpr int kPhases = 512;
+    int taps_ = 0;
+    double cutoff_ = 1;
+    std::vector<float> kernel_;
+    // WSOLA: the hop, its window, the grains so far, and output overlapped but not yet handed out (from accBase_ on).
+    int hop_ = 0;
+    std::vector<float> window_;
+    int64_t grains_ = 0;
+    int64_t prev_ = 0;
+    bool havePrev_ = false;
+    std::vector<float> acc_, weight_;
+    int64_t accBase_ = 0;
+};
+
 }  // namespace montage

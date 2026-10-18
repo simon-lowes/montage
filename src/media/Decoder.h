@@ -45,6 +45,7 @@ bool readEmbeddedCaptions(const std::string& path, Rational fps, std::vector<Cap
                           std::string* error = nullptr, CaptionStandard standard = CaptionStandard::Auto);
 
 struct ImageSequence;
+struct PulldownMap;
 class MlvReader;
 namespace dcp {
 class ImfTrackReader;
@@ -71,7 +72,7 @@ public:
 
     int displayWidth() const { return dispW_; }
     int displayHeight() const { return dispH_; }
-    double fps() const { return fps_ / timeScale_; }
+    double fps() const { return pulldown_ ? pulldownFps_ : fps_ / timeScale_; }
     double duration() const { return duration_ / timeScale_; }
     bool isStill() const { return still_; }
     // Media time of the most recently decoded frame (for pool scheduling).
@@ -87,6 +88,8 @@ private:
     bool decodeNext(AVFrame* into);  // false at EOF / error
     bool seek(double t);
     Frame16Ptr convert(const AVFrame* f, double pts, int w, int h, bool hq);
+    // The file's frame shown at `t` (its own time), decoded (cur_ or next_), with its time in `pts`; null at the end.
+    const AVFrame* decodedAt(double t, double* pts);
 
     std::string path_;
     AVFormatContext* fmt_ = nullptr;
@@ -135,6 +138,11 @@ private:
     std::shared_ptr<const dcp::ImfTrackReader> imf_;  // an IMF picture track file: each frame decoded with OpenJPEG, its codes kept
     std::unique_ptr<ImageSequence> exr_;      // OpenEXR read with OpenEXR (a layer, or a compression FFmpeg lacks): its frames
     std::string exrFile_;                     // (a single file: first = last = 0)
+    // Pulldown removed (media/Pulldown.h): the frames the cadence gives, their rate, and the last one woven.
+    std::shared_ptr<const PulldownMap> pulldown_;
+    double pulldownFps_ = 0;
+    AVFrame* woven_ = nullptr;
+    int64_t wovenIndex_ = -1;
     std::string exrLayer_;                    // the layer shown (with no main picture and none chosen, the file's first)
     bool rawHalf_ = false;                    // raw_ developed at half size
     RawSettings rawSettings_;                 // how raw pictures are developed (Interpret Footage)

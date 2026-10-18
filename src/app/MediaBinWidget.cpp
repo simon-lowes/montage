@@ -7,6 +7,7 @@
 #include "InterpretFootageDialog.h"
 #include "media/LtcTimecode.h"
 #include "media/Interpret.h"
+#include "media/Pulldown.h"
 #include <QCoreApplication>
 #include "media/TextReader.h"
 #include "Settings.h"
@@ -516,8 +517,10 @@ bool MediaBinWidget::setImageSequenceRate(Id media, double fps) {
     return state_->apply(tr("Interpret Frame Rate"), [media, rate](Project& p, Sequence&) { return edit::setImageSequenceRate(p, media, rate); });
 }
 
-bool MediaBinWidget::interpretFootage(const std::vector<Id>& media, const Interpretation& how, bool keepHighlights) {
-    return state_->apply(tr("Interpret Footage"), [media, how, keepHighlights](Project& p, Sequence&) {
+bool MediaBinWidget::interpretFootage(const std::vector<Id>& media, const Interpretation& how, bool keepHighlights,
+                                      const std::map<Id, std::string>* pulldowns) {
+    const std::map<Id, std::string> each = pulldowns ? *pulldowns : std::map<Id, std::string>{};
+    return state_->apply(tr("Interpret Footage"), [media, how, keepHighlights, each](Project& p, Sequence&) {
         edit::Result out = edit::Result::fail("");
         for (Id id : media) {
             const MediaItem* m = p.findMedia(id);
@@ -526,6 +529,7 @@ bool MediaBinWidget::interpretFootage(const std::vector<Id>& media, const Interp
             if (m->kind == MediaKind::Image) i.fps = Rational{0, 1};
             if (!isRawMedia(*m)) i.rawExposure = 0, i.rawTemperature = 0, i.rawTint = 0, i.rawHighlights.clear(), i.rawHalf = false;
             else if (keepHighlights) i.rawHighlights = interpretationOf(*m).rawHighlights;
+            if (auto it = each.find(id); it != each.end()) i.pulldown = it->second;
             const edit::Result r = edit::interpretFootage(p, id, i);
             if (!r.ok && !r.error.empty()) return edit::Result::fail(m->name + ": " + r.error);
             if (r.ok) out = {};
@@ -538,7 +542,71 @@ void MediaBinWidget::interpretFootageDialog(const std::vector<Id>& media) {
     const MediaItem* first = media.empty() ? nullptr : state_->project().findMedia(media.front());
     if (!first) return;
     InterpretFootageDialog dlg(*first, int(media.size()), this);
-    if (dlg.exec() == QDialog::Accepted) interpretFootage(media, dlg.interpretation(), !dlg.highlightsShown());
+    if (dlg.exec() != QDialog::Accepted) return;
+    const Interpretation how = dlg.interpretation();
+    const bool keepHighlights = !dlg.highlightsShown();
+    const QString choice = dlg.pulldownChoice();
+    // Each item's pulldown: kept, none, or starting where asked (its fields in the order chosen).
+    std::map<Id, std::string> pulldowns;
+    std::vector<std::pair<Id, std::string>> toFind;
+    for (Id id : media) {
+        const MediaItem* m = state_->project().findMedia(id);
+        if (!m) continue;
+        if (m->subclipOf) m = state_->project().findMedia(m->subclipOf);
+        if (!m) continue;
+        // (an item pulldown is not removed from, in a selection with others, keeps how it is read)
+        const bool can = m->kind == MediaKind::Video && pulldownRateValid(fileFrameRate(*m));
+        if (choice == QLatin1String("keep") || (!can && !choice.isEmpty())) pulldowns[id] = interpretationOf(*m).pulldown;
+        else if (choice.size() == 1)
+            pulldowns[id] = pulldownStartingAt(choice[0].toLatin1() - 'A', how.fields.empty() ? fileTopFieldFirst(uninterpretedPath(m->path)) : how.fields != "lower");
+        else if (choice == QLatin1String("auto")) pulldowns[id] = interpretationOf(*m).pulldown, toFind.push_back({id, uninterpretedPath(m->path)});
+        else pulldowns[id].clear();
+    }
+    if (toFind.empty()) {
+        interpretFootage(media, how, keepHighlights, &pulldowns);
+        return;
+    }
+    // Finding a cadence reads the whole file: in the background, then the items are interpreted.
+    auto* progress = new QProgressDialog(tr("Finding the pulldown cadence..."), tr("Cancel"), 0, 1000, this);
+    progress->setObjectName(QStringLiteral("pulldownProgress"));
+    progress->setWindowModality(Qt::WindowModal);
+    progress->setMinimumDuration(300);
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    connect(progress, &QProgressDialog::canceled, this, [cancel] { *cancel = true; });
+    using Found = std::pair<std::map<Id, std::string>, QStringList>;
+    auto* watcher = new QFutureWatcher<Found>(this);
+    QPointer<QProgressDialog> guard(progress);
+    connect(watcher, &QFutureWatcher<Found>::finished, this, [this, watcher, progress, media, how, keepHighlights, pulldowns, cancel]() mutable {
+        const Found found = watcher->result();
+        const bool cancelled = cancel->load();
+        // (closing the dialog says it was cancelled)
+        progress->disconnect(this);
+        progress->close();
+        progress->deleteLater();
+        watcher->deleteLater();
+        if (cancelled) return;
+        for (const auto& [id, value] : found.first) pulldowns[id] = value;
+        if (!found.second.isEmpty()) QMessageBox::warning(this, tr("Interpret Footage"), found.second.join(QLatin1Char('\n')));
+        // (items whose cadence was not found keep their pulldown as it was, and take the rest)
+        interpretFootage(media, how, keepHighlights, &pulldowns);
+    });
+    watcher->setFuture(QtConcurrent::run([toFind, cancel, guard]() {
+        Found out;
+        for (size_t k = 0; k < toFind.size() && !cancel->load(); ++k) {
+            std::vector<PulldownStretch> st;
+            std::string why;
+            auto step = [&](double f) {
+                const int v = int((double(k) + f) / double(toFind.size()) * 1000);
+                QMetaObject::invokeMethod(qApp, [guard, v] {
+                    if (guard) guard->setValue(v);
+                });
+            };
+            if (detectPulldown(toFind[k].second, st, step, cancel.get(), &why)) out.first[toFind[k].first] = pulldownValue(st);
+            else if (!cancel->load())
+                out.second << QStringLiteral("%1: %2").arg(QFileInfo(QString::fromStdString(toFind[k].second)).fileName(), QString::fromStdString(why));
+        }
+        return out;
+    }));
 }
 
 void MediaBinWidget::importInto(const QStringList& files, const QString& bin) {

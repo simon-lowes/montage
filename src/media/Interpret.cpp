@@ -8,13 +8,15 @@
 #include "Decoder.h"
 #include "ImageSequence.h"
 #include "ProResRaw.h"
+#include "Pulldown.h"
 
 namespace montage {
 
 Rational fileFrameRate(const MediaItem& m) {
     if (m.kind != MediaKind::Video) return Rational{0, 1};
     const Interpretation now = interpretationOf(m);
-    return now.conformed() ? now.fileFps : m.fps;
+    if (now.conformed()) return now.fileFps;
+    return now.pulldown.empty() ? m.fps : pulldownFileRate(m.fps);  // (pulldown removed: played at four fifths of it)
 }
 
 bool isRawMedia(const MediaItem& m) {
@@ -78,13 +80,21 @@ Result interpretFootage(Project& p, Id media, Interpretation i) {
     }
     i.fileFps = fileFrameRate(*m);
     if (!i.conformed()) i.fps = i.fileFps = Rational{0, 1}, i.keepPitch = false;
+    if (still) i.pulldown.clear();
+    if (std::vector<PulldownStretch> stretches; !i.pulldown.empty()) {
+        if (!parsePulldown(i.pulldown, stretches)) return Result::fail("That is not a pulldown cadence Montage reads");
+        if (i.conformed()) return Result::fail("Remove the pulldown or conform the frame rate, not both");
+        if (!pulldownRateValid(fileFrameRate(*m))) return Result::fail("Pulldown is removed from 29.97 or 30 frame video");
+    }
     const std::string path = interpretedPath(m->path, i);
     if (path == m->path) return changed ? Result{} : Result::fail("");
     MediaItem probe;
     std::string err;
     if (!probeMedia(path, probe, &err)) return Result::fail(err.empty() ? "It cannot be read that way" : err);
     // New media seconds per old one, so everything keeps to the same frame.
-    const double ratio = !still && m->fps.valid() && probe.fps.valid() ? m->fps.toDouble() / probe.fps.toDouble() : 1.0;
+    // (Pulldown removed plays four frames for each five over the same time.)
+    auto pace = [](const MediaItem& x, const Interpretation& in) { return x.fps.toDouble() * (in.pulldown.empty() ? 1.0 : 1.25); };
+    const double ratio = !still && m->fps.valid() && probe.fps.valid() ? pace(*m, interpretationOf(*m)) / pace(probe, i) : 1.0;
     m->path = path;
     m->proxyPath.clear();
     m->width = probe.width;

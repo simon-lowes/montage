@@ -31,6 +31,36 @@ bool validFieldOrder(const std::string& fields) {
     return fields.empty() || fields == "progressive" || fields == "upper" || fields == "lower";
 }
 
+bool parsePulldown(const std::string& value, std::vector<PulldownStretch>& out) {
+    out.clear();
+    if (value.empty()) return true;
+    std::stringstream items(value);
+    std::string item;
+    while (std::getline(items, item, ',')) {
+        long long start = -1;
+        int position = -1;
+        char order = 0, extra = 0;
+        // (position "v": video with no pulldown)
+        const bool video = std::sscanf(item.c_str(), "%lld:v:%c%c", &start, &order, &extra) == 2;
+        if (!video && std::sscanf(item.c_str(), "%lld:%d:%c%c", &start, &position, &order, &extra) != 3) start = -1;
+        if (start < 0 || (!video && (position < 0 || position > 4)) ||
+            (order != 't' && order != 'b') || (!out.empty() && start <= out.back().start) || (out.empty() && start != 0)) {
+            out.clear();
+            return false;
+        }
+        out.push_back({int64_t(start), video ? -1 : position, order == 't'});
+    }
+    return !out.empty();
+}
+
+std::string pulldownValue(const std::vector<PulldownStretch>& stretches) {
+    std::string out;
+    for (const PulldownStretch& s : stretches)
+        out += (out.empty() ? "" : ",") + std::to_string(s.start) + ":" + (s.position < 0 ? std::string("v") : std::to_string(s.position)) + ":" +
+               (s.topFirst ? "t" : "b");
+    return out;
+}
+
 bool validRawHighlights(const std::string& mode) { return mode.empty() || mode == "clip" || mode == "blend" || mode == "rebuild"; }
 
 bool validStereoLayout(const std::string& layout) {
@@ -97,7 +127,9 @@ bool parseInterpretation(const std::string& path, Interpretation& out) {
         else if (key == "par") out.par = std::max(0.0, parseNumber(value));
         else if (key == "alpha" && validAlphaMode(value)) out.alpha = value == "straight" ? "" : value;
         else if (key == "fields" && validFieldOrder(value)) out.fields = value;
-        else if (key == "pitch") out.keepPitch = value == "1";
+        else if (key == "pulldown") {
+            if (std::vector<PulldownStretch> st; parsePulldown(value, st)) out.pulldown = value;
+        } else if (key == "pitch") out.keepPitch = value == "1";
         else if (key == "rawexp") out.rawExposure = parseNumber(value);
         else if (key == "rawtemp") out.rawTemperature = std::max(0.0, parseNumber(value));
         else if (key == "rawtint") out.rawTint = parseNumber(value);
@@ -130,6 +162,7 @@ std::string interpretedPath(const std::string& path, const Interpretation& i) {
     if (i.par > 0) add("par=" + formatNumber(i.par, 6));
     if (!i.alpha.empty() && i.alpha != "straight") add("alpha=" + i.alpha);
     if (!i.fields.empty()) add("fields=" + i.fields);
+    if (!i.pulldown.empty()) add("pulldown=" + i.pulldown);
     auto number = [](double v) { return formatNumber(v, 6); };
     if (i.rawExposure != 0) add("rawexp=" + number(i.rawExposure));
     if (i.rawTemperature > 0) add("rawtemp=" + number(i.rawTemperature));

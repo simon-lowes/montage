@@ -7,6 +7,7 @@
 #include "render/DcpMxf.h"
 #include "render/Jpeg2000.h"
 #include "ImageSequence.h"
+#include "Pulldown.h"
 #include "Mlv.h"
 #include "ProResRaw.h"
 #include "Psd.h"
@@ -613,6 +614,8 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
             m.fps = in.fps;
             fr = AVRational{in.fps.num, in.fps.den};
         }
+        // Pulldown removed: four frames for each five of the file's, over the same time (its timecode read at the file's rate).
+        if (!in.pulldown.empty() && !in.conformed()) m.fps = pulldownRate(m.fps);
         // Start timecode (camera files carry it in the stream, the container or a tmcd track).
         const AVDictionaryEntry* tc = av_dict_get(st->metadata, "timecode", nullptr, 0);
         if (!tc) tc = av_dict_get(fmt->metadata, "timecode", nullptr, 0);
@@ -706,6 +709,9 @@ void VideoDecoder::close() {
     mlv_.reset();
     exr_.reset();
     imf_.reset();
+    pulldown_.reset();
+    av_frame_free(&woven_);
+    wovenIndex_ = -1;
     exrFile_.clear();
     rawFrame_ = -1;
     proResRaw_ = false;
@@ -963,6 +969,15 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
     AVRational fr = av_guess_frame_rate(fmt_, st, nullptr);
     fps_ = (fr.num > 0 && fr.den > 0) ? av_q2d(fr) : 25.0;
     duration_ = fmt_->duration > 0 ? double(fmt_->duration) / AV_TIME_BASE : 0;
+    if (std::vector<PulldownStretch> stretches; !in.pulldown.empty() && parsePulldown(in.pulldown, stretches)) {
+        // Pulldown removed: four frames for each five of the file's, as its cadence gives them; the video's own length
+        // (its frame count or duration; the file's when it says neither, or an hour).
+        int64_t frames = st->nb_frames > 0 ? int64_t(st->nb_frames) : 0;
+        if (frames <= 0 && st->duration > 0 && st->duration != AV_NOPTS_VALUE) frames = std::llround(double(st->duration) * timeBase_ * fps_);
+        if (frames <= 0) frames = duration_ > 0 ? std::llround(duration_ * fps_) : std::llround(3600 * fps_);
+        pulldown_ = std::make_shared<const PulldownMap>(pulldownMap(stretches, std::max<int64_t>(1, frames)));
+        pulldownFps_ = fps_ * 0.8;
+    }
     rotation_ = streamRotation(st);
     int w = st->codecpar->width, h = st->codecpar->height;
     // (less its recommended crop, which the first frame says)
@@ -1213,7 +1228,8 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
     std::unique_ptr<AVFrame, void (*)(AVFrame*)> deint(nullptr, [](AVFrame* fr) { av_frame_free(&fr); });
     const AVFrame* f = in;
     // Interpret Footage can say the frames are progressive, or which field comes first, whatever their flags say.
-    const int dominance = fields_ == "progressive" ? 0 : fields_ == "upper" ? 1 : fields_ == "lower" ? 2 : fieldDominance(in);
+    // (Woven with its pulldown removed, it is whole.)
+    const int dominance = pulldown_ || fields_ == "progressive" ? 0 : fields_ == "upper" ? 1 : fields_ == "lower" ? 2 : fieldDominance(in);
     if (dominance) {
         deint.reset(av_frame_clone(in));
         if (deint) setFieldDominance(deint.get(), dominance);
@@ -1510,6 +1526,43 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
         return stillFrame_;
     }
 
+    if (pulldown_) {
+        // Pulldown removed (media/Pulldown.h): the frame woven from the fields its cadence gives, kept while it is asked
+        // for again.
+        const std::vector<PulldownFrame>& map = pulldown_->frames;
+        const int64_t n = pulldown_->frameAt(std::max(0.0, t) * fps_);
+        if (n < 0) return nullptr;
+        if (n != wovenIndex_ || !woven_) {
+            const PulldownFrame& pf = map[size_t(n)];
+            av_frame_free(&woven_);
+            wovenIndex_ = -1;
+            // (decoded in file order, so the decoder runs forward)
+            AVFrame* fields[2] = {nullptr, nullptr};
+            const int64_t which[2] = {pf.first, pf.second};
+            const int order = pf.first >= 0 && pf.second >= 0 && pf.second < pf.first ? 1 : 0;
+            for (int k = 0; k < 2; ++k) {
+                const int at = order ? 1 - k : k;
+                if (which[at] < 0) continue;
+                if (k == 1 && which[at] == which[1 - at] && fields[1 - at]) {
+                    fields[at] = av_frame_clone(fields[1 - at]);
+                    continue;
+                }
+                if (const AVFrame* d = decodedAt((double(which[at]) + 0.25) / std::max(1.0, fps_), nullptr)) fields[at] = av_frame_clone(d);
+            }
+            if (fields[0] || fields[1]) woven_ = weaveFields(fields[0], fields[1], pf.topFirst);
+            av_frame_free(&fields[0]);
+            av_frame_free(&fields[1]);
+            if (!woven_) return nullptr;
+            wovenIndex_ = n;
+        }
+        return convert(woven_, pulldown_->startOf(n) / std::max(1.0, fps_), targetW, targetH, highQuality);
+    }
+    double pts = 0;
+    const AVFrame* f = decodedAt(t, &pts);
+    return f ? convert(f, pts, targetW, targetH, highQuality) : nullptr;
+}
+
+const AVFrame* VideoDecoder::decodedAt(double t, double* pts) {
     const double fd = 1.0 / std::max(1.0, fps_);
     const double eps = fd * 0.25;
     t = std::max(0.0, t);
@@ -1521,8 +1574,10 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
     };
 
     // Same frame as last time?
-    if (haveCur_ && curPts_ <= t + eps && haveNext_ && nextPts_ > t + eps)
-        return convert(cur_, curPts_, targetW, targetH, highQuality);
+    if (haveCur_ && curPts_ <= t + eps && haveNext_ && nextPts_ > t + eps) {
+        if (pts) *pts = curPts_;
+        return cur_;
+    }
 
     bool sequential = haveCur_ && t + eps >= curPts_ && t - curPts_ < 2.0;
     if (!sequential) {
@@ -1573,8 +1628,14 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
             break;
         }
     }
-    if (haveCur_) return convert(cur_, curPts_, targetW, targetH, highQuality);
-    if (haveNext_) return convert(next_, nextPts_, targetW, targetH, highQuality);
+    if (haveCur_) {
+        if (pts) *pts = curPts_;
+        return cur_;
+    }
+    if (haveNext_) {
+        if (pts) *pts = nextPts_;
+        return next_;
+    }
     return nullptr;
 }
 

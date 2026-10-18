@@ -98,6 +98,8 @@ private:
     QCheckBox* ancTeletext_ = nullptr;
     QSpinBox* teletextPage_ = nullptr;
     QCheckBox* interlaced_ = nullptr;
+    QComboBox* rate_ = nullptr;      // the frame rate delivered (render/RateConversion.h)
+    QCheckBox* ratePitch_ = nullptr;
     QString as11Text_;  // "Name=value" lines
     bool initialisedMxf_ = false;
     QComboBox* color_ = nullptr;

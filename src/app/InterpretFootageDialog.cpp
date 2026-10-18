@@ -16,6 +16,7 @@
 
 #include "media/ImageSequence.h"
 #include "media/Interpret.h"
+#include "media/Pulldown.h"
 
 namespace montage {
 
@@ -152,8 +153,29 @@ InterpretFootageDialog::InterpretFootageDialog(const MediaItem& first, int count
     fields_->addItem(tr("Lower field first"), QStringLiteral("lower"));
     fields_->setCurrentIndex(std::max(0, fields_->findData(QString::fromStdString(now.fields))));
     fields_->setEnabled(video);
+    // 2:3 pulldown removed (media/Pulldown.h): 29.97 or 30 frame video carrying 23.976 or 24 frame pictures.
+    pulldown_ = new QComboBox(this);
+    pulldown_->setObjectName(QStringLiteral("interpretPulldown"));
+    pulldown_->addItem(tr("None"), QString());
+    if (!now.pulldown.empty()) {
+        std::vector<PulldownStretch> st;
+        parsePulldown(now.pulldown, st);
+        pulldown_->addItem(st.size() > 1 ? tr("Removed (%1 stretches of cadence)").arg(st.size()) : tr("Removed"), QStringLiteral("keep"));
+    }
+    pulldown_->addItem(tr("Remove 2:3 pulldown: find the cadence"), QStringLiteral("auto"));
+    pulldown_->addItem(tr("Remove 2:3 pulldown: starts on A (A A)"), QStringLiteral("A"));
+    pulldown_->addItem(tr("Remove 2:3 pulldown: starts on B (B B)"), QStringLiteral("B"));
+    pulldown_->addItem(tr("Remove 2:3 pulldown: starts on C (B C)"), QStringLiteral("C"));
+    pulldown_->addItem(tr("Remove 2:3 pulldown: starts on D (C D)"), QStringLiteral("D"));
+    pulldown_->setCurrentIndex(now.pulldown.empty() ? 0 : 1);
+    pulldown_->setToolTip(tr("29.97 or 30 frame video made from 23.976 or 24 frame pictures (film, or a 23.976 camera through "
+                             "2:3 pulldown): its fields woven back into those frames, so it plays at 23.976 or 24 with no "
+                             "combed or repeated frames. Finding the cadence reads the whole file, and starts again wherever "
+                             "an edit made after the pulldown broke it"));
+    pulldown_->setEnabled(video && !sequence && pulldownRateValid(fileFrameRate(first)));
     form->addRow(tr("Alpha:"), alpha_);
     form->addRow(tr("Field order:"), fields_);
+    form->addRow(tr("Pulldown:"), pulldown_);
     // Stereoscopic 3D: how the two eyes are packed in each frame, for files whose metadata says nothing (or is wrong).
     stereo_ = new QComboBox(this);
     stereo_->setObjectName(QStringLiteral("interpretStereo"));
@@ -248,6 +270,8 @@ InterpretFootageDialog::InterpretFootageDialog(const MediaItem& first, int count
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
     lay->addWidget(buttons);
 }
+
+QString InterpretFootageDialog::pulldownChoice() const { return pulldown_->isEnabled() ? pulldown_->currentData().toString() : QStringLiteral("keep"); }
 
 Interpretation InterpretFootageDialog::interpretation() const {
     Interpretation i;

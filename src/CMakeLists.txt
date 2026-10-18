@@ -107,6 +107,7 @@ add_library(montage_engine STATIC
   media/FieldRecorder.h media/FieldRecorder.cpp
   media/ImageSequence.h media/ImageSequence.cpp
   media/Interpret.h media/Interpret.cpp
+  media/Pulldown.h media/Pulldown.cpp
   media/Psd.h media/Psd.cpp
   media/DualSystem.h media/DualSystem.cpp
   media/SpeakerSwitch.h media/SpeakerSwitch.cpp
@@ -140,6 +141,7 @@ add_library(montage_engine STATIC
   render/Relight.h render/Relight.cpp
   render/FilmLook.h render/FilmLook.cpp
   render/Retime.h render/Retime.cpp
+  render/RateConversion.h render/RateConversion.cpp
   render/VideoDenoise.h render/VideoDenoise.cpp
   render/Restoration.h render/Restoration.cpp
   render/LensBlur.h render/LensBlur.cpp

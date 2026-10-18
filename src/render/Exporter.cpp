@@ -14,6 +14,10 @@
 #include "render/BroadcastMxf.h"
 #include "core/Chapters.h"
 #include "core/Surround.h"
+#include "render/RateConversion.h"
+#include "render/Retime.h"
+#include "audio/TimeStretch.h"
+#include "media/Rife.h"
 
 #include <QImage>
 #include <QString>
@@ -47,6 +51,7 @@ extern "C" {
 #include <libavutil/stereo3d.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/mastering_display_metadata.h>
+#include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
@@ -755,6 +760,15 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     if (!s.trimTarget.empty() && !trim) return fail("The sequence has no trim target " + s.trimTarget);
     if (trim && wantVideo && (s.videoCodec == "gif" || s.videoCodec == "exr"))
         return fail("A trim pass is delivered as video or PNG, TIFF or DPX frames, not " + s.videoCodec);
+    // Delivered at another frame rate: the programme (seq, frames [in, out)) rendered and mixed as it is, written as the
+    // delivered sequence (dseq, frames [din, dout)): its rate, captions and markers.
+    RateConversion conv;
+    if (std::string why; !planRateConversion(seq, s, conv, &why)) return fail(why);
+    const Sequence deliveredSeq = conv.active() ? deliveredSequence(seq, conv, in, out) : Sequence{};
+    const Sequence& dseq = conv.active() ? deliveredSeq : seq;
+    const FrameTime din = conv.active() ? 0 : in, dout = conv.active() ? deliveredFrames(conv, out - in) : out;
+    // Coded as fields: asked for, or pulldown into them.
+    const bool interlacedOut = s.interlaced || conv.fields;
     if (s.videoCodec == "gif") return exportGif(p, seq, s, in, out, progress, cancel, error, opened);
     // Image sequences: numbered files, no sound.
     const bool imageSequence = s.videoCodec == "png" || s.videoCodec == "tiff" || s.videoCodec == "exr" || s.videoCodec == "dpx";
@@ -782,7 +796,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     if (rc < 0 || !o.oc) return fail("Unknown output format for " + s.path);
     if (imageSequence) av_opt_set_int(o.oc->priv_data, "start_number", s.startNumber, 0);
     o.pkt = av_packet_alloc();
-    const AVRational fps{seq.fps.num, seq.fps.den};
+    const AVRational fps{dseq.fps.num, dseq.fps.den};
     // A stereoscopic sequence: its eyes packed as asked (two eyes across or down make the frame twice the size).
     StereoView stereoView = StereoView::Left;
     if (seq.stereo3d && !stereoViewFromName(s.stereo.empty() ? "sbs" : s.stereo, stereoView))
@@ -847,7 +861,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         o.vctx->sample_aspect_ratio = AVRational{1, 1};
         o.vctx->pix_fmt = defaultPixFmt(s, c);
         if (outSpace.hdr() && s.pixFmt.empty()) o.vctx->pix_fmt = tenBitFormat(o.vctx->pix_fmt, o.vctx, codec);
-        o.vctx->gop_size = s.gop > 0 ? s.gop : std::max(1, int(std::lround(seq.fpsValue() * 2)));
+        o.vctx->gop_size = s.gop > 0 ? s.gop : std::max(1, int(std::lround(dseq.fpsValue() * 2)));
         if (s.gop == 1) o.vctx->max_b_frames = 0;
         const ColorTags tags = colorTags(outSpace);
         o.vctx->color_primaries = tags.primaries;
@@ -859,11 +873,12 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (s.smartRender && isIntraCodec(c)) o.vctx->thread_type = FF_THREAD_SLICE;
         if (s.videoBitrate > 0) o.vctx->bit_rate = s.videoBitrate;
         if (o.oc->oformat->flags & AVFMT_GLOBALHEADER) o.vctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-        if (s.interlaced) {
+        if (interlacedOut) {
             // Coded as two fields, the top first: a progressive picture's two halves (PsF), as 1080i deliveries ask.
-            // (FFmpeg codes DNxHR, the only DNx Montage writes, progressive only.)
-            if (c != "mpeg2video" && c != "libx264" && c != "prores_ks")
-                return fail("Interlaced output is for MPEG-2, H.264 (AVC-Intra) and ProRes, not " + c);
+            // (FFmpeg codes DNxHR, the only DNx Montage writes, progressive only; FFV1 keeps the woven frame losslessly,
+            // as archives keep interlaced tape, its field order in the file.)
+            if (c != "mpeg2video" && c != "libx264" && c != "prores_ks" && c != "ffv1")
+                return fail("Interlaced output is for MPEG-2, H.264 (AVC-Intra), ProRes and FFV1, not " + c);
             o.vctx->flags |= AV_CODEC_FLAG_INTERLACED_DCT | AV_CODEC_FLAG_INTERLACED_ME;
             o.vctx->field_order = AV_FIELD_TT;
         }
@@ -874,7 +889,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             // Hardware encoders are rate controlled: aim for a bitrate by pixel rate.
             if (s.videoBitrate <= 0) {
                 const double bitsPerPixel = c.rfind("hevc", 0) == 0 ? 0.10 : 0.16;
-                o.vctx->bit_rate = int64_t(std::clamp(double(W) * H * seq.fpsValue() * bitsPerPixel, 2e6, 150e6));
+                o.vctx->bit_rate = int64_t(std::clamp(double(W) * H * dseq.fpsValue() * bitsPerPixel, 2e6, 150e6));
             }
             if (hasSuffix(c, "_videotoolbox")) av_dict_set(&opts, "allow_sw", "1", 0);
             if (hasSuffix(c, "_nvenc")) {
@@ -895,7 +910,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             o.vctx->bit_rate = o.vctx->rc_min_rate = o.vctx->rc_max_rate = rate;
             o.vctx->rc_buffer_size = 17825792;
             o.vctx->rc_initial_buffer_occupancy = 17825792;
-            o.vctx->gop_size = s.gop > 0 ? s.gop : (std::lround(seq.fpsValue()) % 25 == 0 ? 12 : 15);
+            o.vctx->gop_size = s.gop > 0 ? s.gop : (std::lround(dseq.fpsValue()) % 25 == 0 ? 12 : 15);
             o.vctx->max_b_frames = 2;
             o.vctx->intra_dc_precision = 2;
             o.vctx->qmin = 1;
@@ -1124,6 +1139,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         int64_t delay = 0;
         std::vector<float> fifo;
         int64_t pts = 0, cursor = 0;
+        std::unique_ptr<SpeedStream> speed;  // a speed change's, reading this stream's sound
         ~ExtraAudio() {
             av_frame_free(&frame);
             avcodec_free_context(&ctx);
@@ -1211,7 +1227,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     if (o.actx && o.actx->sample_rate != sr && s.audioCodec != "libopus") return fail("Unsupported sample rate");
 
     // Captions as subtitle streams, in the text format the container takes: the chosen track, then any others asked for.
-    const CaptionTrack* captions = (s.embedCaptions || s.burnInCaptions) ? captionTrackFor(seq, s.captionTrack) : nullptr;
+    const CaptionTrack* captions = (s.embedCaptions || s.burnInCaptions) ? captionTrackFor(dseq, s.captionTrack) : nullptr;
+    // (burnt into the programme's pictures, on its own frames)
+    const CaptionTrack* burnCaptions = s.burnInCaptions ? captionTrackFor(seq, s.captionTrack) : nullptr;
     struct CaptionOut {
         const CaptionTrack* track = nullptr;
         AVCodecContext* ctx = nullptr;
@@ -1224,7 +1242,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     if (s.embedCaptions && captions && !captions->captions.empty()) embedded.push_back(captions);
     if (s.embedCaptions)
         for (Id id : s.extraCaptions)
-            for (const CaptionTrack& t : seq.captionTracks)
+            for (const CaptionTrack& t : dseq.captionTracks)
                 if (t.id == id && &t != captions && !t.captions.empty()) embedded.push_back(&t);
     for (const CaptionTrack* track : embedded) {
         auto out = std::make_unique<CaptionOut>();
@@ -1251,7 +1269,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         out->st->time_base = out->ctx->time_base;
         tagStream(out->st, track->name, track->language);
         if (captionOuts.empty() && embedded.size() > 1) out->st->disposition |= AV_DISPOSITION_DEFAULT;
-        out->next = captionIndexAt(*track, in);
+        out->next = captionIndexAt(*track, din);
         captionOuts.push_back(std::move(out));
     }
 
@@ -1262,7 +1280,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     }
     av_dict_set(&o.oc->metadata, "encoder", "Montage", 0);
     if (!s.startTimecode.empty()) av_dict_set(&o.oc->metadata, "timecode", s.startTimecode.c_str(), 0);
-    if (s.chapters) addChapters(o.oc, seq, in, out);
+    if (s.chapters) addChapters(o.oc, dseq, din, dout);
     if ((rc = avformat_write_header(o.oc, nullptr)) < 0) return fail("Cannot write header: " + averr(rc));
     o.headerWritten = true;
 
@@ -1290,6 +1308,50 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         e->cursor = audioCursor;
         e->seq.sampleRate = mixRate;
     }
+    // A speed change: each stream's sound read through its own speed change, from where the programme starts (the
+    // cursors then count delivered samples).
+    const int64_t audioStart = audioCursor;
+    std::unique_ptr<SpeedStream> mainSpeed;
+    if (conv.mode == RateConversion::Mode::Speed) {
+        // (the speed change reads a little ahead: nothing after the range's end is heard)
+        const int64_t audioEnd = int64_t(std::llround(double(out) * mixRate / seq.fpsValue()));
+        auto silenceAfterEnd = [nch, audioEnd](int64_t at, int frames, float* dst) {
+            if (at + frames > audioEnd)
+                std::fill(dst + size_t(std::clamp<int64_t>(audioEnd - at, 0, frames)) * size_t(nch), dst + size_t(frames) * size_t(nch), 0.0f);
+        };
+        int64_t mainAt = audioStart;
+        mainSpeed = std::make_unique<SpeedStream>(nch, mixRate, conv.speed(), conv.keepPitch, [&, mainAt, silenceAfterEnd](int frames, float* dst) mutable {
+            mixBlock(mixer, mainAt, frames, dst);
+            silenceAfterEnd(mainAt, frames, dst);
+            mainAt += frames;
+        });
+        for (auto& x : extras) {
+            ExtraAudio* e = x.get();
+            int64_t at = audioStart;
+            e->speed = std::make_unique<SpeedStream>(nch, mixRate, conv.speed(), conv.keepPitch, [&, e, at, silenceAfterEnd](int frames, float* dst) mutable {
+                if (nch > 2) e->mixer.mixLayout(p, e->seq, at, frames, dst);
+                else e->mixer.mix(p, e->seq, at, frames, dst);
+                silenceAfterEnd(at, frames, dst);
+                at += frames;
+            });
+        }
+    }
+    // The next `frames` of the mix (or an extra stream's) from `pos`: the programme's, or through its speed change.
+    auto mixMain = [&](int64_t pos, int frames, float* dst) {
+        if (mainSpeed) mainSpeed->read(frames, dst);
+        else mixBlock(mixer, pos, frames, dst);
+    };
+    auto mixExtra = [&](ExtraAudio& e, int64_t pos, int frames, float* dst) {
+        if (e.speed) e.speed->read(frames, dst);
+        else if (nch > 2) e.mixer.mixLayout(p, e.seq, pos, frames, dst);
+        else e.mixer.mix(p, e.seq, pos, frames, dst);
+    };
+    // Where the mix has reached by the end of delivered frame `f` (in samples from the programme's start, as the cursors
+    // count them).
+    auto audioUntil = [&](FrameTime f) {
+        if (!conv.active()) return int64_t(std::llround(double(f + 1) * mixRate / seq.fpsValue()));
+        return audioStart + int64_t(std::llround(double(f - din + 1) * mixRate / dseq.fpsValue()));
+    };
     std::vector<uint16_t> rgba16;
     // Loudness normalisation: measure the whole mix first, then play it through a gain and a limiter.
     double normGain = 1;
@@ -1330,7 +1392,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         limiterDelay = limiter->latency();
         // Fill the limiter's look-ahead so its output starts at the first sample.
         std::vector<float> prime(size_t(limiterDelay) * size_t(nch));
-        mixBlock(mixer, audioCursor, int(limiterDelay), prime.data());
+        mixMain(audioCursor, int(limiterDelay), prime.data());
         for (float& v : prime) v = float(v * normGain);
         limiter->process(prime.data(), prime.data(), int(limiterDelay));
         audioCursor += limiterDelay;
@@ -1357,8 +1419,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             e->limiter = std::make_unique<PeakLimiter>(mixRate, s.peakCeiling - 0.5, 5, 80, nch);
             e->delay = e->limiter->latency();
             std::vector<float> ep(size_t(e->delay) * size_t(nch));
-            if (nch > 2) e->mixer.mixLayout(p, e->seq, e->cursor, int(e->delay), ep.data());
-            else e->mixer.mix(p, e->seq, e->cursor, int(e->delay), ep.data());
+            mixExtra(*e, e->cursor, int(e->delay), ep.data());
             for (float& v : ep) v = float(v * e->gain);
             e->limiter->process(ep.data(), ep.data(), int(e->delay));
             e->cursor += e->delay;
@@ -1419,13 +1480,13 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     // Writes the captions that start before frame `until` (export range only), on every caption stream.
     std::vector<uint8_t> subBuf(1 << 16);
     auto writeCaptions = [&](FrameTime until) -> bool {
-        const double msPerFrame = 1000.0 / seq.fpsValue();
+        const double msPerFrame = 1000.0 / dseq.fpsValue();
         for (auto& co : captionOuts)
         for (; co->next < co->track->captions.size() && co->track->captions[co->next].start < until; ++co->next) {
             const Caption& c = co->track->captions[co->next];
-            const FrameTime a = std::max(c.start, in), b = std::min(c.end, out);
+            const FrameTime a = std::max(c.start, din), b = std::min(c.end, dout);
             if (b <= a) continue;
-            const int64_t startMs = std::llround(double(a - in) * msPerFrame);
+            const int64_t startMs = std::llround(double(a - din) * msPerFrame);
             const int64_t durMs = std::max<int64_t>(1, std::llround(double(b - a) * msPerFrame));
             AVSubtitle sub{};
             sub.format = 1;  // text
@@ -1452,7 +1513,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         return true;
     };
 
-    const int64_t total = out - in;
+    const int64_t total = dout - din;
     // The burn-in logo, loaded once.
     const QImage watermark = s.burnIn.watermark.empty() ? QImage() : QImage(QString::fromStdString(s.burnIn.watermark));
     if (!s.burnIn.watermark.empty() && watermark.isNull()) return fail("Cannot read the watermark image " + s.burnIn.watermark);
@@ -1468,7 +1529,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     // Smart rendering: only where nothing would change the source's pictures for the whole export.
     std::unique_ptr<SmartRenderer> smart;
     if (wantVideo && s.smartRender && o.vctx && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height && !seq.stereo3d &&
-        !s.useProxies && !s.burnInCaptions && !s.cea608 && !s.interlaced && !s.burnIn.any() && outSpace.id == seqSpace.id && !trim)
+        !s.useProxies && !s.burnInCaptions && !s.cea608 && !interlacedOut && !s.burnIn.any() && outSpace.id == seqSpace.id && !trim &&
+        !conv.active())
         smart = std::make_unique<SmartRenderer>(p, seq, seqSpace, o.vctx, o.vst, s.alpha, s.profile);
     // CEA-608 (and CTA-708) captions in the video: each frame's A/53 cc_data (core/Cea708.h).
     std::vector<std::vector<CcTriplet>> ccFrames;
@@ -1476,17 +1538,17 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         const std::string vc = o.vctx && o.vctx->codec ? o.vctx->codec->name : "";
         if (o.vctx->codec_id != AV_CODEC_ID_H264 && o.vctx->codec_id != AV_CODEC_ID_HEVC)
             return fail("CEA-608 captions go in H.264 or HEVC video, not " + vc);
-        if (const CaptionTrack* t = captionTrackFor(seq, s.captionTrack)) {
+        if (const CaptionTrack* t = captionTrackFor(dseq, s.captionTrack)) {
             std::vector<Caption> part;
             for (Caption c : t->captions) {
-                if (c.end <= in || c.start >= out) continue;
-                c.start = std::max(c.start, in) - in;
-                c.end = std::min(c.end, out) - in;
+                if (c.end <= din || c.start >= dout) continue;
+                c.start = std::max(c.start, din) - din;
+                c.end = std::min(c.end, dout) - din;
                 part.push_back(std::move(c));
             }
-            ccFrames = captionCcData(part, seq.fps, out - in, true, s.cea708, t->style);
+            ccFrames = captionCcData(part, dseq.fps, dout - din, true, s.cea708, t->style);
         } else {
-            ccFrames = captionCcData({}, seq.fps, out - in, true, s.cea708);
+            ccFrames = captionCcData({}, dseq.fps, dout - din, true, s.cea708);
         }
     }
     auto attach608 = [&](FrameTime rel) {
@@ -1503,10 +1565,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     };
     const bool burns = (s.burnInCaptions && captions) || s.burnIn.any();
     const bool packedEyes = seq.stereo3d && stereoView != StereoView::Left && stereoView != StereoView::Right && stereoView != StereoView::Anaglyph;
-    // A frame as delivered: rendered, captions and burn-ins drawn, in the output space.
-    auto deliveredFrame = [&](FrameTime f) {
+    // A frame of the programme: rendered, captions and burn-ins drawn, in the output space.
+    auto programmeFrame = [&](FrameTime f) {
         auto burn = [&](Image& img) {
-            if (s.burnInCaptions && captions) drawCaption(img, *captions, f, &seqSpace);
+            if (burnCaptions) drawCaption(img, *burnCaptions, f, &seqSpace);
             if (s.burnIn.any()) drawBurnIns(img, p, seq, f, s.burnIn, watermark.isNull() ? nullptr : &watermark, &seqSpace);
         };
         Image img;
@@ -1530,6 +1592,51 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         convertColor(img, seqSpace, outSpace, peakNits);
         return img;
     };
+    // Delivered at another rate: the programme's pictures kept while the frames round them use them again (a standards
+    // conversion's in-betweens and its cut test, pulldown's fields), each with its look.
+    static std::atomic<uint64_t> exportRuns{0};
+    const uint64_t exportRun = ++exportRuns;
+    std::map<FrameTime, std::shared_ptr<const Image>> held;
+    std::map<FrameTime, ShotLook> looks;
+    auto heldFrame = [&](FrameTime f) -> std::shared_ptr<const Image> {
+        f = std::clamp<FrameTime>(f, in, out - 1);
+        if (auto it = held.find(f); it != held.end()) return it->second;
+        while (held.size() >= 5) held.erase(held.begin());
+        auto img = std::make_shared<const Image>(programmeFrame(f));
+        held[f] = img;
+        return img;
+    };
+    auto lookOf = [&](FrameTime f) -> const ShotLook& {
+        if (auto it = looks.find(f); it != looks.end()) return it->second;
+        while (looks.size() >= 8) looks.erase(looks.begin());
+        return looks[f] = shotLook(*heldFrame(f));
+    };
+    // Whether a cut falls between programme frames f and f + 1: an edit there, or two pictures that are plainly
+    // different shots (a cut inside a clip, as a programme imported whole has).
+    auto cutAfter = [&](FrameTime f) {
+        if (editBetween(seq, f + 1)) return true;
+        const ShotLook& a = lookOf(f);
+        const ShotLook& b = lookOf(f + 1);
+        const ShotLook* before = f > in ? &lookOf(f - 1) : nullptr;
+        const ShotLook* after = f + 2 < out ? &lookOf(f + 2) : nullptr;
+        return looksLikeCut(a, b, before, after);
+    };
+    // A frame as delivered: the programme's, or (at another rate) the frame its conversion makes. Pulldown's woven frames
+    // are their first field's frame here, the second field woven in after the conversion to the encoder's format.
+    auto deliveredFrame = [&](FrameTime o) -> Image {
+        if (!conv.active()) return programmeFrame(o);
+        const DeliveredPicture pic = deliveredPicture(conv, o - din, out - in);
+        const FrameTime a = in + pic.a, b = in + pic.b;
+        if (pic.t <= 0 || pic.woven || b == a) return *heldFrame(a);
+        if (cutAfter(a)) return *heldFrame(pic.t < 0.5 ? a : b);  // never a blend of two shots
+        const std::shared_ptr<const Image> A = heldFrame(a), B = heldFrame(b);
+        // (the flow and in-between caches outlive the export: keyed by this export, and the size)
+        const std::string key = "export#" + std::to_string(exportRun) + "#" + std::to_string(A->width) + "x" + std::to_string(A->height) + "#" +
+                                std::to_string(a);
+        Image mid;
+        if (rifeAvailable() && rifeModel().installed() && cachedRife(*A, *B, pic.t, key, mid)) return mid;
+        return interpolateFrames(*A, *B, pic.t, key);
+    };
     // HDR10+: each scene's metadata for the frames exported. The sequence's analysis is used where it still matches
     // the cut (not when burn-ins or packed eyes change the picture from what was analysed); the rest is measured now on
     // the frames as delivered, as the first part of the progress.
@@ -1541,7 +1648,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         const auto part = [&](double f) {
             if (progress) progress(renderFrom * f, in + FrameTime(std::floor(f * double(out - in - 1))));
         };
-        if (!hdr10PlusForRange(p, seq, in, out, outSpace, peakNits, reuse, hdr10, &e, part, cancel, deliveredFrame, &toMeasure))
+        // (at another rate, the delivered frames are measured)
+        if (!hdr10PlusForRange(p, dseq, din, dout, outSpace, peakNits, reuse && !conv.active(), hdr10, &e, part, cancel, deliveredFrame, &toMeasure))
             return fail(cancel && cancel->load() ? std::string("Export cancelled") : "Dynamic HDR metadata analysis failed: " + e);
         if (toMeasure == 0) renderFrom = 0;
         // In the video itself: an SEI message in each HEVC access unit, a metadata OBU in each AV1 temporal unit, the
@@ -1553,7 +1661,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             auto messages = std::make_shared<std::vector<std::vector<uint8_t>>>();
             for (const Hdr10PlusScene& sc : hdr10) messages->push_back(hdr10PlusT35(sc));
             const auto scenes = std::make_shared<std::vector<Hdr10PlusScene>>(hdr10);
-            const FrameTime first = in;
+            const FrameTime first = din;
             o.videoPacket = [scenes, messages, av1, lengthSize, first](AVPacket* pkt) {
                 if (pkt->pts == AV_NOPTS_VALUE) return false;
                 const FrameTime f = first + pkt->pts;
@@ -1565,7 +1673,13 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             };
         }
     }
-    for (FrameTime f = in; f < out; ++f) {
+    // Pulldown's second fields: the frame they come from, in the encoder's format.
+    AVFrame* secondField = nullptr;
+    struct FreeFrame {
+        AVFrame*& f;
+        ~FreeFrame() { av_frame_free(&f); }
+    } freeSecond{secondField};
+    for (FrameTime f = din; f < dout; ++f) {
         if (cancel && cancel->load()) return fail("Export cancelled");
         if (!writeCaptions(f + 1)) return fail("Writing captions failed");
         if (wantVideo && smart && smart->copy(f, in, o.oc)) {
@@ -1599,7 +1713,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                 std::string why;
                 if (s.exrLayers && !s.exrLayers(f, W, H, layers, attributes, why)) return fail(why);
                 char name[4096];
-                if (av_get_frame_filename2(name, sizeof name, outPath.c_str(), s.startNumber + int(f - in), 0) < 0)
+                if (av_get_frame_filename2(name, sizeof name, outPath.c_str(), s.startNumber + int(f - din), 0) < 0)
                     return fail("The file name " + outPath + " has no frame number");
                 if (!writeExr(name, W, H, layers, s.exrCompression.empty() ? "zip" : s.exrCompression, attributes, &why))
                     return fail(why);
@@ -1621,9 +1735,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                         if (a) a[x] = al;
                     }
                 }
-                o.vframe->pts = f - in;
-                if (s.interlaced) o.vframe->flags |= AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST;
-                if (!attach608(f - in)) return fail("Out of memory");
+                o.vframe->pts = f - din;
+                if (interlacedOut) o.vframe->flags |= AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST;
+                if (!attach608(f - din)) return fail("Out of memory");
                 if ((rc = avcodec_send_frame(o.vctx, o.vframe)) < 0) return fail("Video encoding failed: " + averr(rc));
                 if ((rc = drain(o, o.vctx, o.vst)) < 0) return fail("Writing video failed: " + averr(rc));
             } else {
@@ -1641,19 +1755,45 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             const uint8_t* srcData[4] = {reinterpret_cast<const uint8_t*>(rgba16.data()), nullptr, nullptr, nullptr};
             int srcStride[4] = {img.width * 8, 0, 0, 0};
             sws_scale(o.sws, srcData, srcStride, 0, img.height, o.vframe->data, o.vframe->linesize);
-            o.vframe->pts = f - in;
-            if (s.interlaced) o.vframe->flags |= AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST;
-            if (!attach608(f - in)) return fail("Out of memory");
+            if (const DeliveredPicture pic = conv.active() ? deliveredPicture(conv, f - din, out - in) : DeliveredPicture{}; pic.woven) {
+                // Pulldown's B C and C D frames: the second (bottom) field from the next picture, woven in the encoder's
+                // format, each plane's lines alternating (4:2:0 chroma too, as FFmpeg's telecine and field matching
+                // weave it).
+                Image second = *heldFrame(in + pic.b);
+                if (second.width != img.width || second.height != img.height) second = resizeImage(second, img.width, img.height);
+                toRgba16(second, rgba16);
+                const uint8_t* secondData[4] = {reinterpret_cast<const uint8_t*>(rgba16.data()), nullptr, nullptr, nullptr};
+                if (!secondField) {
+                    secondField = av_frame_alloc();
+                    if (!secondField) return fail("Out of memory");
+                    secondField->format = o.vframe->format;
+                    secondField->width = W;
+                    secondField->height = H;
+                    if (av_frame_get_buffer(secondField, 0) < 0) return fail("Out of memory");
+                }
+                sws_scale(o.sws, secondData, srcStride, 0, img.height, secondField->data, secondField->linesize);
+                const AVPixFmtDescriptor* fd = av_pix_fmt_desc_get(AVPixelFormat(o.vframe->format));
+                for (int pl = 0; pl < 4 && o.vframe->data[pl]; ++pl) {
+                    const int bytes = av_image_get_linesize(AVPixelFormat(o.vframe->format), W, pl);
+                    const int rows = (pl == 1 || pl == 2) && fd ? AV_CEIL_RSHIFT(H, fd->log2_chroma_h) : H;
+                    for (int y = 1; y < rows; y += 2)
+                        std::memcpy(o.vframe->data[pl] + size_t(y) * size_t(o.vframe->linesize[pl]),
+                                    secondField->data[pl] + size_t(y) * size_t(secondField->linesize[pl]), size_t(bytes));
+                }
+            }
+            o.vframe->pts = f - din;
+            if (interlacedOut) o.vframe->flags |= AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST;
+            if (!attach608(f - din)) return fail("Out of memory");
             if ((rc = avcodec_send_frame(o.vctx, o.vframe)) < 0) return fail("Video encoding failed: " + averr(rc));
             if ((rc = drain(o, o.vctx, o.vst)) < 0) return fail("Writing video failed: " + averr(rc));
             }
         }
         if (wantAudio) {
-            int64_t target = int64_t(std::llround(double(f + 1) * mixRate / seq.fpsValue())) + limiterDelay;
+            int64_t target = audioUntil(f) + limiterDelay;
             int n = int(target - audioCursor);
             if (n > 0) {
                 mixBuf.resize(size_t(n) * size_t(nch));
-                mixBlock(mixer, audioCursor, n, mixBuf.data());
+                mixMain(audioCursor, n, mixBuf.data());
                 if (limiter) {
                     for (float& v : mixBuf) v = float(v * normGain);
                     limiter->process(mixBuf.data(), mixBuf.data(), n);
@@ -1676,12 +1816,11 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             // The other streams, sample for sample with the mix (stems keep their levels; the described stream is
             // normalised and limited as the mix is).
             for (auto& e : extras) {
-                const int64_t until = int64_t(std::llround(double(f + 1) * mixRate / seq.fpsValue())) + e->delay;
+                const int64_t until = audioUntil(f) + e->delay;
                 const int m = int(until - e->cursor);
                 if (m <= 0) continue;
                 mixBuf.resize(size_t(m) * size_t(nch));
-                if (nch > 2) e->mixer.mixLayout(p, e->seq, e->cursor, m, mixBuf.data());
-                else e->mixer.mix(p, e->seq, e->cursor, m, mixBuf.data());
+                mixExtra(*e, e->cursor, m, mixBuf.data());
                 if (e->limiter) {
                     for (float& v : mixBuf) v = float(v * e->gain);
                     e->limiter->process(mixBuf.data(), mixBuf.data(), m);
@@ -1699,7 +1838,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             for (auto& mo : monos)
                 if (!encodeFifo(mo->ctx, mo->st, mo->frame, mo->fifo, mo->pts, false)) return fail("Audio encoding failed");
         }
-        if (progress && ((f - in) % 5 == 0 || f + 1 == out)) progress(renderFrom + (1 - renderFrom) * double(f - in + 1) / double(total), f);
+        if (progress && ((f - din) % 5 == 0 || f + 1 == dout))
+            progress(renderFrom + (1 - renderFrom) * double(f - din + 1) / double(total),
+                     conv.active() ? in + FrameTime(double(f - din) * double(out - in) / double(total)) : f);
     }
     // Flush the encoders; errors here (e.g. a full disk) must fail the export.
     if (wantAudio) {
@@ -1744,7 +1885,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             stem.erase(cut);
         }
         std::string e;
-        if (!writeHdr10PlusJson(stem + ".hdr10plus.json", hdr10, in, out, &e)) qWarning("Dynamic HDR metadata JSON not written beside %s: %s", s.path.c_str(), e.c_str());
+        if (!writeHdr10PlusJson(stem + ".hdr10plus.json", hdr10, din, dout, &e)) qWarning("Dynamic HDR metadata JSON not written beside %s: %s", s.path.c_str(), e.c_str());
     }
     if (smartRendered) *smartRendered = smart ? smart->copied() : 0;
     if (light) *light = measured;
@@ -1971,7 +2112,9 @@ bool exportBroadcastMxf(const Project& p, const Sequence& seq, const ExportSetti
     if (mpeg2 && s.videoCodec != "mpeg2video") return fail("RDD 9 and AS-11 X8 carry MPEG-2 HD 4:2:2 video");
     if (!mpeg2 && !(s.videoCodec == "libx264" && s.profile == "avci100"))
         return fail("AS-11 UK DPP HD and X2 carry AVC-Intra 100 video");
-    if (d == "as11-dpp" && !(seq.fps == Rational{25, 1})) return fail("UK DPP HD is 25 frames a second (1080i25)");
+    // (delivered at 25: the sequence's rate, or sped or converted to it)
+    if (d == "as11-dpp" && !((s.rateChange.empty() ? seq.fps : s.rate) == Rational{25, 1} && s.rateChange != "pulldown"))
+        return fail("UK DPP HD is 25 frames a second (1080i25)");
     if (d == "as11-dpp" && ((s.width > 0 ? s.width : seq.width) != 1920 || (s.height > 0 ? s.height : seq.height) != 1080))
         return fail("UK DPP HD is 1920 by 1080 (1080i25)");
     if (s.audioCodec != "pcm_s24le" && s.audioCodec != "pcm_s16le") return fail("Broadcast MXF sound is PCM");
@@ -1981,8 +2124,15 @@ bool exportBroadcastMxf(const Project& p, const Sequence& seq, const ExportSetti
     FrameTime in = s.in >= 0 ? s.in : 0;
     FrameTime out = s.out >= 0 ? s.out : seq.duration();
     if (seq.duration() > 0) out = std::min(out, seq.duration());
+    // Delivered at another rate: the file's frames, captions, markers and parts are the delivered sequence's.
+    RateConversion conv;
+    if (std::string why; !planRateConversion(seq, s, conv, &why)) return fail(why);
+    const Sequence delivered = conv.active() ? deliveredSequence(seq, conv, in, out) : seq;
+    ExportSettings described = s;
+    if (conv.fields) described.interlaced = true;
+    const FrameTime din = conv.active() ? 0 : in, dout = conv.active() ? deliveredFrames(conv, out - in) : out;
     BroadcastMxfOptions o;
-    if (!broadcastMxfOptions(seq, s, in, out, o, error)) return false;
+    if (!broadcastMxfOptions(delivered, described, din, dout, o, error)) return false;
     if (!checkAs11Metadata(o, error)) return false;  // before the render, not after it
 
     ExportSettings staged = s;
@@ -2001,7 +2151,7 @@ bool exportBroadcastMxf(const Project& p, const Sequence& seq, const ExportSetti
     }
     std::string why;
     const bool rewrapped = rewrapBroadcastMxf(staged.path, s.path, o, &why, [&](double f) {
-        if (progress) progress(0.97 + 0.03 * f, in + FrameTime(std::lround(f * double(out - in))));
+        if (progress) progress(0.97 + 0.03 * f, in + FrameTime(std::lround(f * double(out - in))));  // (programme frames)
         return !(cancel && cancel->load());
     });
     std::filesystem::remove(stagedPath, ec);
