@@ -444,13 +444,13 @@ bool signerCertificateChain(CertificateChain& out, std::string* error, const std
     // (and two programs at once, the app and the command-line tool sharing the folder: a lock file in it while one
     // is made, and another look once it is held)
     std::optional<QLockFile> others;
-    if (present != 4) {
-        if (!QDir().mkpath(dir.path())) return fail("Cannot make " + dir.path().toStdString());
-        QFile::setPermissions(dir.path(), QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+    if (present != 4 && QDir().mkpath(dir.path())) {
         others.emplace(dir.filePath(QStringLiteral(".chain.lock")));
         others->setStaleLockTime(120000);
-        if (!others->tryLock(60000)) return fail("Another program is making the DCP signing chain in " + dir.path().toStdString() + ": try again");
-        present = count();
+        if (others->tryLock(60000)) present = count();
+        else if (others->error() == QLockFile::LockFailedError)
+            return fail("Another program is making the DCP signing chain in " + dir.path().toStdString() + ": try again");
+        // (a folder it cannot lock in: said below, as the chain is incomplete or cannot be written there)
     }
     if (present == 4) {
         CertificateChain chain;
@@ -470,7 +470,9 @@ bool signerCertificateChain(CertificateChain& out, std::string* error, const std
                     " is incomplete: restore its missing files from a backup (DKDMs need this chain; a new one cannot open them)");
     CertificateChain chain;
     if (!makeCertificateChain("Montage", chain, error)) return false;
-    // A folder only its owner reads (above), the key file likewise from the moment it exists; each file written whole.
+    // A folder only its owner reads, the key file likewise from the moment it exists; each file written whole.
+    if (!QDir().mkpath(dir.path())) return fail("Cannot make " + dir.path().toStdString());
+    QFile::setPermissions(dir.path(), QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
     std::vector<QString> written;
     auto write = [&](const char* name, const std::string& text, bool secret) {
         const QString path = dir.filePath(QString::fromLatin1(name));

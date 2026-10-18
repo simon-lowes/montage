@@ -1755,7 +1755,7 @@ std::vector<UnitIndex> indexUnits(const u8* d, const MxfLayout& m) {
         const int64_t p = m.picture[i], len = std::min<int64_t>(m.pictureLen[i], 8192);
         if (p < 0) continue;
         const u8* v = d + p;
-        bool mpeg2 = false, avc = false, closed = false;
+        bool mpeg2 = false, avc = false, closed = false, entry = false;  // entry: an SPS or a recovery point before the slice
         int type = 1;
         for (int64_t q = 0; q + 8 <= len; ++q) {
             if (v[q] || v[q + 1] || v[q + 2] != 1) continue;
@@ -1770,11 +1770,14 @@ std::vector<UnitIndex> indexUnits(const u8* d, const MxfLayout& m) {
             }
             if (!mpeg2 && (code & 0x80) == 0 && ((code & 31) == 1 || (code & 31) == 5)) {
                 avc = true;
-                // (an I picture that is not IDR, as open GOPs have: a random access point too)
-                type = (code & 31) == 5 || avcSliceType(v + q + 4, len - q - 4) == 1 ? 1 : 2;
+                // (an I picture that is not IDR, as open GOPs have, is a random access point where the encoder marks
+                // it one: with its SPS or a recovery point; other I pictures can be followed by pictures that look
+                // past them)
+                type = (code & 31) == 5 || (entry && avcSliceType(v + q + 4, len - q - 4) == 1) ? 1 : 2;
                 break;
             }
             if (!mpeg2 && (code & 0x80) == 0 && (code & 31) == 9) avc = true;
+            if (!mpeg2 && (code & 0x80) == 0 && ((code & 31) == 7 || ((code & 31) == 6 && v[q + 4] == 6))) avc = true, entry = true;
         }
         if (!mpeg2 && !avc) continue;  // intra: every package a random access point
         coded = true;
