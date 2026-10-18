@@ -4,6 +4,8 @@
 
 #include "FieldRecorder.h"
 #include "Exr.h"
+#include "render/DcpMxf.h"
+#include "render/Jpeg2000.h"
 #include "ImageSequence.h"
 #include "Mlv.h"
 #include "ProResRaw.h"
@@ -18,7 +20,9 @@
 #include <numeric>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <map>
+#include <mutex>
 #include <thread>
 
 extern "C" {
@@ -701,11 +705,59 @@ void VideoDecoder::close() {
     rawSequence_.reset();
     mlv_.reset();
     exr_.reset();
+    imf_.reset();
     exrFile_.clear();
     rawFrame_ = -1;
     proResRaw_ = false;
     viewId_ = -1;
 }
+
+namespace {
+
+// An IMF picture track file, read once per file (decoders open it again and again: the media pool, thumbnails), with
+// its picture size; nullptr for any other MXF.
+std::shared_ptr<const dcp::ImfTrackReader> imfPicture(const std::string& file, int& w, int& h) {
+    struct Known {
+        std::shared_ptr<const dcp::ImfTrackReader> reader;
+        int w = 0, h = 0;
+    };
+    static std::mutex lock;
+    static std::map<std::string, Known> known;
+    std::error_code ec;
+    const std::filesystem::path at = std::filesystem::u8path(file);
+    const auto size = std::filesystem::file_size(at, ec);
+    if (ec) return nullptr;
+    const auto when = std::filesystem::last_write_time(at, ec);
+    if (ec) return nullptr;
+    const std::string key = file + '|' + std::to_string(static_cast<unsigned long long>(size)) + '|' +
+                            std::to_string(static_cast<long long>(when.time_since_epoch().count()));
+    {
+        std::lock_guard<std::mutex> g(lock);
+        if (auto it = known.find(key); it != known.end()) {
+            w = it->second.w, h = it->second.h;
+            return it->second.reader;
+        }
+    }
+    Known k;
+    auto reader = std::make_shared<dcp::ImfTrackReader>();
+    if (reader->open(file, nullptr, true) && reader->imfRgbJpeg2000()) {
+        k.w = reader->width(), k.h = reader->height();
+        std::vector<uint8_t> cs;
+        std::vector<uint16_t> rgb;
+        int components = 0, bits = 0;
+        // (the size from the first picture when the descriptor does not give it)
+        if ((k.w > 0 && k.h > 0) ||
+            (reader->frame(0, cs) && decodeJpeg2000(cs.data(), cs.size(), rgb, k.w, k.h, components, bits) && components == 3))
+            k.reader = std::move(reader);
+    }
+    std::lock_guard<std::mutex> g(lock);
+    if (known.size() > 256) known.clear();
+    known[key] = k;
+    w = k.w, h = k.h;
+    return k.reader;
+}
+
+}  // namespace
 
 bool VideoDecoder::open(const std::string& path, std::string* error) {
     close();
@@ -787,6 +839,27 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
         origin_ = 0;
         curPts_ = nextPts_ = -1;
         return true;
+    }
+    // An IMF picture track file (JPEG 2000 or HTJ2K, full-range RGB): decoded with OpenJPEG, so the codes come through
+    // as they were coded (HTJ2K too, which FFmpeg 6 does not read).
+    const std::string file = uninterpretedPath(path);
+    std::string ext = file.size() >= 4 ? file.substr(file.size() - 4) : std::string();
+    for (char& ch : ext) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+    if (ext == ".mxf" && openJpegAvailable()) {
+        int w = 0, h = 0;
+        if (std::shared_ptr<const dcp::ImfTrackReader> reader = imfPicture(file, w, h)) {
+            imf_ = std::move(reader);
+            rawFrame_ = -1;
+            dispW_ = std::max(1, int(std::lround(w * (par_ > 0 ? par_ : 1.0))));
+            dispH_ = h;
+            fps_ = imf_->rate().value() > 0 ? imf_->rate().value() : 24.0;
+            duration_ = double(imf_->frames()) / fps_;
+            still_ = false;
+            rotation_ = 0;
+            origin_ = 0;
+            curPts_ = nextPts_ = -1;
+            return true;
+        }
     }
     rawSettings_ = RawSettings{in.rawExposure, in.rawTemperature, in.rawTint,
                                in.rawHighlights == "blend" ? 1 : in.rawHighlights == "rebuild" ? 2 : 0, in.rawHalf};
@@ -1300,6 +1373,41 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
                 return nullptr;
             rawFrame_ = n;
             rawHalf_ = half;
+            stillFrame_.reset();
+        }
+        if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH || (highQuality && !stillHq_)) {
+            stillFrame_ = convert(raw_, double(n) / fps_, targetW, targetH, highQuality);
+            stillHq_ = highQuality;
+        }
+        curPts_ = double(n) / fps_;
+        return stillFrame_;
+    }
+    if (imf_) {
+        // The frame shown at `t`, decoded once and kept while it is asked for again, its codes scaled to 16 bits.
+        const int64_t n = std::clamp(int64_t(std::floor(std::min(std::max(0.0, t) * timeScale_ * fps_ + 1e-6, 1e15))), int64_t(0),
+                                     std::max<int64_t>(0, imf_->frames() - 1));
+        if (targetW <= 0) targetW = dispW_;
+        if (targetH <= 0) targetH = dispH_;
+        if (n != rawFrame_ || !raw_) {
+            std::vector<uint8_t> cs;
+            std::vector<uint16_t> rgb;
+            int w = 0, h = 0, components = 0, bits = 0;
+            std::string err;
+            if (!imf_->frame(n, cs, &err) || !decodeJpeg2000(cs.data(), cs.size(), rgb, w, h, components, bits, &err) || components != 3 ||
+                bits < 1 || bits > 16 || !rawFrame(w, h, &err, AV_PIX_FMT_RGBA64))
+                return nullptr;
+            const uint32_t top = (1u << bits) - 1;
+            parallelRows(h, [&](int y0, int y1) {
+                for (int y = y0; y < y1; ++y) {
+                    auto* o = reinterpret_cast<uint16_t*>(raw_->data[0] + size_t(y) * size_t(raw_->linesize[0]));
+                    const uint16_t* q = &rgb[size_t(y) * size_t(w) * 3];
+                    for (int x = 0; x < w; ++x) {
+                        for (int c = 0; c < 3; ++c) o[4 * x + c] = uint16_t((std::min<uint32_t>(q[3 * x + c], top) * 65535u + top / 2) / top);
+                        o[4 * x + 3] = 65535;
+                    }
+                }
+            });
+            rawFrame_ = n;
             stillFrame_.reset();
         }
         if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH || (highQuality && !stillHq_)) {

@@ -7734,6 +7734,58 @@ private slots:
         QCOMPARE(std::string(changeKindName(ChangeKind::Trimmed)), std::string("Trimmed"));
     }
 
+    void picturesKeptBetweenCuts() {
+        // The old cut: a 0-40 (source 0), b 40-70 (source 100), c 70-90 (source 200). The new one: a new shot at the
+        // head pushes it along 10 frames, b loses 5 frames at its head, c is blurred.
+        Fixture fx;
+        Sequence& old = fx.s();
+        fx.put(V1, 0, 40, 0);
+        const Id b = fx.put(V1, 40, 30, 100);
+        const Id c = fx.put(V1, 70, 20, 200);
+        Sequence cut = old;
+        cut.id = fx.p.newId();
+        for (Clip& x : cut.videoTracks[0].clips) x.start += 10;
+        Clip* nb = clipById(cut, b);
+        nb->sourceIn = 105, nb->duration = 25, nb->start = 50;
+        Clip* nc = clipById(cut, c);
+        nc->start = 75;
+        nc->effects.push_back(makeEffect("gaussian_blur", fx.p.newId()));
+        Clip fresh = makeClip(fx.p, *fx.p.findMedia(fx.media), TrackKind::Video, cut);
+        fresh.start = 0, fresh.duration = 10, fresh.sourceIn = 300;
+        cut.videoTracks[0].clips.insert(cut.videoTracks[0].clips.begin(), fresh);
+        std::vector<FrameTime> same = samePictureFrames(fx.p, old, cut, 0, 100);
+        QCOMPARE(same.size(), size_t(100));
+        for (FrameTime t = 0; t < 10; ++t) QCOMPARE(same[size_t(t)], FrameTime(-1));   // the new shot
+        for (FrameTime t = 10; t < 50; ++t) QCOMPARE(same[size_t(t)], t - 10);         // a, slid along
+        for (FrameTime t = 50; t < 75; ++t) QCOMPARE(same[size_t(t)], t - 5);          // b, trimmed: its source 105 was frame 45
+        for (FrameTime t = 75; t < 95; ++t) QCOMPARE(same[size_t(t)], FrameTime(-1));  // c, blurred
+        for (FrameTime t = 95; t < 100; ++t) QCOMPARE(same[size_t(t)], t);             // after both: black in both
+        // From a later frame on; a trimmed clip that fades in is new (its fade falls on other frames); another size is new.
+        same = samePictureFrames(fx.p, old, cut, 40, 20);
+        QVERIFY(same[0] == 30 && same[10] == 45);
+        clipById(cut, b)->animIn.type = "fade";
+        same = samePictureFrames(fx.p, old, cut, 0, 100);
+        QVERIFY(same[20] == 10 && same[50] == -1 && same[74] == -1);
+        clipById(cut, b)->animIn = {};
+        // A new role or label changes no picture; a graphic's text, a grade, or keyed motion on a trimmed clip does.
+        Clip* na = &cut.videoTracks[0].clips[1];
+        na->role = "Dialogue", na->colorLabel = 3;
+        QCOMPARE(samePictureFrames(fx.p, old, cut, 0, 100)[20], FrameTime(10));
+        na->fields["title"] = "Fixed typo";
+        QCOMPARE(samePictureFrames(fx.p, old, cut, 0, 100)[20], FrameTime(-1));
+        na->fields.clear();
+        na->grade.nodes.emplace_back();
+        QCOMPARE(samePictureFrames(fx.p, old, cut, 0, 100)[20], FrameTime(-1));
+        na->grade = {};
+        clipById(cut, b)->motion.params["opacity"].addKey(0, 1);
+        clipById(cut, b)->motion.params["opacity"].addKey(10, 0.5);
+        same = samePictureFrames(fx.p, old, cut, 0, 100);
+        QVERIFY(same[20] == 10 && same[60] == -1);
+        cut.width = 1280;
+        same = samePictureFrames(fx.p, old, cut, 0, 100);
+        QVERIFY(std::all_of(same.begin(), same.end(), [](FrameTime t) { return t == -1; }));
+    }
+
     void reconformToNewCut() {
         // The old cut: A 0-60 (from 0), B 60-100 (from 0), A 100-150 (from 100), B 150-180 (from 100).
         Fixture fx;

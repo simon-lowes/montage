@@ -1070,6 +1070,7 @@ void MainWindow::buildMenus() {
     add(file, tr("Export &Frame…"), QKeySequence("Ctrl+Shift+E"), [this] { exportFrame(); });
     add(file, tr("Export &VFX Pulls…"), QKeySequence(), [this] { vfxPullDialog(); })->setObjectName(QStringLiteral("vfxPulls"));
     add(file, tr("&Import Timeline (FCP XML, FCPXML, OTIO, EDL, AAF)…"), QKeySequence(), [this] { importTimeline(); });
+    add(file, tr("Import IMF &Package…"), QKeySequence(), [this] { importImfPackage(); })->setObjectName(QStringLiteral("importImf"));
     add(file, tr("Import A&LE (Avid Log Exchange)…"), QKeySequence(), [this] {
         const QString path = QFileDialog::getOpenFileName(this, tr("Import ALE"), QString(), tr("Avid Log Exchange (*.ale *.ALE);;All files (*)"));
         if (!path.isEmpty()) importAle(path);
@@ -6252,9 +6253,98 @@ void MainWindow::exportImfDialog() {
     if (htj2kAvailable()) coding->addItem(tr("Lossless, High-Throughput (HTJ2K)"), -1);
     for (int mbps : {800, 400, 200}) coding->addItem(tr("Lossy, %1 Mbit/s").arg(mbps), mbps);
     form->addRow(tr("JPEG 2000:"), coding);
-    auto* language = new QLineEdit(QStringLiteral("en"), &dlg);
-    language->setObjectName(QStringLiteral("imfLanguage"));
-    form->addRow(tr("Sound language:"), language);
+    // Sound versions: a row each, its language, what it is and the roles it hears.
+    auto* sounds = new QTableWidget(0, 3, &dlg);
+    sounds->setObjectName(QStringLiteral("imfSounds"));
+    sounds->setHorizontalHeaderLabels({tr("Language"), tr("Version"), tr("Roles heard (empty: as it plays)")});
+    sounds->horizontalHeader()->setStretchLastSection(true);
+    sounds->verticalHeader()->hide();
+    sounds->setMinimumHeight(110);
+    auto addSound = [this, sounds](const QString& language, const QString& kind, const QString& roles) {
+        const int row = sounds->rowCount();
+        sounds->insertRow(row);
+        sounds->setItem(row, 0, new QTableWidgetItem(language));
+        auto* k = new QComboBox;
+        k->addItem(tr("Programme (main or dubbed)"), "PRM");
+        k->addItem(tr("Music and effects"), "ME");
+        k->addItem(tr("Described (with the descriptions)"), "DV");
+        k->setCurrentIndex(std::max(0, k->findData(kind)));
+        sounds->setCellWidget(row, 1, k);
+        sounds->setItem(row, 2, new QTableWidgetItem(roles));
+    };
+    addSound(QStringLiteral("en"), QStringLiteral("PRM"), QString());
+    auto* addRow = new QPushButton(tr("Add Version"), &dlg);
+    auto* removeRow = new QPushButton(tr("Remove"), &dlg);
+    connect(addRow, &QPushButton::clicked, &dlg, [=] { addSound(QString(), QStringLiteral("PRM"), QString()); });
+    connect(removeRow, &QPushButton::clicked, &dlg, [sounds] {
+        if (sounds->rowCount() > 1) sounds->removeRow(sounds->currentRow() >= 0 ? sounds->currentRow() : sounds->rowCount() - 1);
+    });
+    auto* soundButtons = new QHBoxLayout;
+    soundButtons->addWidget(addRow);
+    soundButtons->addWidget(removeRow);
+    soundButtons->addStretch(1);
+    auto* soundBox = new QVBoxLayout;
+    soundBox->addWidget(sounds);
+    soundBox->addLayout(soundButtons);
+    form->addRow(tr("Sound:"), soundBox);
+    // Each caption track as timed text: subtitles, captions for the deaf and hard of hearing, forced narrative, or left out.
+    auto* texts = new QTableWidget(0, 2, &dlg);
+    texts->setObjectName(QStringLiteral("imfTexts"));
+    texts->setHorizontalHeaderLabels({tr("Caption track"), tr("As")});
+    texts->horizontalHeader()->setStretchLastSection(true);
+    texts->verticalHeader()->hide();
+    for (const CaptionTrack& t : s->captionTracks) {
+        if (t.name == kDescriptionTrackName) continue;
+        const int row = texts->rowCount();
+        texts->insertRow(row);
+        auto* item = new QTableWidgetItem(QStringLiteral("%1 (%2)").arg(QString::fromStdString(t.name), QString::fromStdString(t.language)));
+        item->setData(Qt::UserRole, qulonglong(t.id));
+        item->setFlags(item->flags() & ~Qt::ItemIsEditable);
+        texts->setItem(row, 0, item);
+        auto* k = new QComboBox;
+        k->addItem(tr("Subtitles"), "subtitles");
+        k->addItem(tr("Captions (deaf and hard of hearing)"), "captions");
+        k->addItem(tr("Forced narrative"), "forced");
+        k->addItem(tr("Left out"), QString());
+        if (t.captions.empty()) k->setCurrentIndex(k->count() - 1);  // (nothing to send)
+        texts->setCellWidget(row, 1, k);
+    }
+    if (texts->rowCount()) {
+        texts->setMinimumHeight(std::min(160, 40 + 28 * texts->rowCount()));
+        form->addRow(tr("Text:"), texts);
+    }
+    // A supplemental package: only what changed since an earlier package, which it plays the rest of.
+    auto* supplemental = new QCheckBox(tr("Supplemental package (only what changed since an earlier one)"), &dlg);
+    supplemental->setObjectName(QStringLiteral("imfSupplemental"));
+    form->addRow(QString(), supplemental);
+    auto* earlier = new QLineEdit(&dlg);
+    earlier->setObjectName(QStringLiteral("imfEarlier"));
+    earlier->setPlaceholderText(tr("The earlier package's folder (the latest of the chain)"));
+    auto* browseEarlier = new QPushButton(tr("Choose…"), &dlg);
+    connect(browseEarlier, &QPushButton::clicked, &dlg, [&] {
+        const QString d = QFileDialog::getExistingDirectory(&dlg, tr("The Earlier IMF Package"), earlier->text());
+        if (!d.isEmpty()) earlier->setText(d);
+    });
+    auto* earlierRow = new QHBoxLayout;
+    earlierRow->addWidget(earlier, 1);
+    earlierRow->addWidget(browseEarlier);
+    form->addRow(tr("Earlier package:"), earlierRow);
+    auto* original = new QComboBox(&dlg);
+    original->setObjectName(QStringLiteral("imfOriginal"));
+    original->addItem(tr("None: the picture has not changed"), qulonglong(0));
+    for (const Sequence& q : state_->project().sequences)
+        if (q.id != s->id) original->addItem(QString::fromStdString(q.name), qulonglong(q.id));
+    original->setToolTip(tr("The sequence the earlier package was mastered from, kept as it was: its cut is compared with this one "
+                            "to find the pictures that changed"));
+    form->addRow(tr("Mastered from:"), original);
+    auto syncSupplemental = [=] {
+        for (QWidget* w : {static_cast<QWidget*>(earlier), static_cast<QWidget*>(browseEarlier), static_cast<QWidget*>(original)}) w->setEnabled(supplemental->isChecked());
+        // (a supplemental keeps the earlier picture's size, colour, depth and coding)
+        for (QWidget* w : {static_cast<QWidget*>(size), static_cast<QWidget*>(colour), static_cast<QWidget*>(bits), static_cast<QWidget*>(coding)})
+            w->setEnabled(!supplemental->isChecked());
+    };
+    connect(supplemental, &QCheckBox::toggled, &dlg, syncSupplemental);
+    syncSupplemental();
     auto* issuer = new QLineEdit(appSettings().value(QStringLiteral("imf/issuer"), QStringLiteral("Montage")).toString(), &dlg);
     issuer->setObjectName(QStringLiteral("imfIssuer"));
     form->addRow(tr("Issuer:"), issuer);
@@ -6277,6 +6367,13 @@ void MainWindow::exportImfDialog() {
     row->addWidget(folder, 1);
     row->addWidget(browse);
     form->addRow(tr("Make it in:"), row);
+    // (a supplemental is made beside the earlier package)
+    auto syncFolder = [=] {
+        folder->setEnabled(!supplemental->isChecked());
+        browse->setEnabled(!supplemental->isChecked());
+    };
+    connect(supplemental, &QCheckBox::toggled, &dlg, syncFolder);
+    syncFolder();
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     buttons->button(QDialogButtonBox::Ok)->setText(tr("Make IMF Master"));
     connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
@@ -6292,11 +6389,37 @@ void MainWindow::exportImfDialog() {
     st.lossless = coding->currentData().toInt() <= 0;
     st.htj2k = coding->currentData().toInt() < 0;
     if (!st.lossless) st.megabitsPerSecond = coding->currentData().toInt();
-    st.language = language->text().trimmed().toStdString();
+    for (int row = 0; row < sounds->rowCount(); ++row) {
+        ImfSound v;
+        v.language = sounds->item(row, 0) ? sounds->item(row, 0)->text().trimmed().toStdString() : std::string();
+        v.kind = static_cast<QComboBox*>(sounds->cellWidget(row, 1))->currentData().toString().toStdString();
+        for (const QString& r : (sounds->item(row, 2) ? sounds->item(row, 2)->text() : QString()).split(',', Qt::SkipEmptyParts))
+            if (!r.trimmed().isEmpty()) v.roles.push_back(r.trimmed().toStdString());
+        st.sounds.push_back(v);
+    }
+    if (!st.sounds.empty()) st.language = st.sounds.front().language;
+    for (int row = 0; row < texts->rowCount(); ++row) {
+        const QString kind = static_cast<QComboBox*>(texts->cellWidget(row, 1))->currentData().toString();
+        if (!kind.isEmpty()) st.texts.push_back({Id(texts->item(row, 0)->data(Qt::UserRole).toULongLong()), kind.toStdString()});
+    }
+    st.captions = !st.texts.empty();
+    if (supplemental->isChecked()) {
+        st.supplementOf = earlier->text().trimmed().toStdString();
+        st.originalSequence = Id(original->currentData().toULongLong());
+        if (st.supplementOf.empty()) {
+            state_->message(tr("Choose the earlier package the supplemental adds to"), 8000);
+            return;
+        }
+    }
     st.issuer = issuer->text().trimmed().toStdString();
     st.inOut = range->isChecked() && marked;
-    appSettings().setValue(QStringLiteral("export/lastDirectory"), folder->text());
     appSettings().setValue(QStringLiteral("imf/issuer"), issuer->text().trimmed());
+    // A supplemental goes beside the earlier package, whose files it plays.
+    if (supplemental->isChecked()) {
+        exportImfTo(QFileInfo(QDir(earlier->text().trimmed()).absolutePath()).absolutePath(), st);
+        return;
+    }
+    appSettings().setValue(QStringLiteral("export/lastDirectory"), folder->text());
     exportImfTo(folder->text(), st);
 }
 
@@ -8027,17 +8150,35 @@ void MainWindow::importTimeline() {
     QString path = QFileDialog::getOpenFileName(this, tr("Import Timeline"), st.value("lastImportTimelineDir").toString(),
                                                 tr("Timelines (*.xml *.fcpxml *.otio *.edl *.aaf);;Final Cut Pro 7 XML (*.xml);;"
                                                    "FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl);;"
-                                                   "AAF (Media Composer, Pro Tools) (*.aaf)"));
+                                                   "AAF (Media Composer, Pro Tools) (*.aaf);;IMF composition (CPL*.xml ASSETMAP.xml)"));
     if (path.isEmpty()) return;
-    if (QFileInfo(path).isDir()) path += "/Info.fcpxml";  // an .fcpxmld bundle
+    importTimelineFrom(path);
+}
+
+void MainWindow::importImfPackage() {
+    QSettings st = appSettings();
+    const QString dir = QFileDialog::getExistingDirectory(this, tr("Import IMF Package"), st.value("lastImportTimelineDir").toString());
+    if (dir.isEmpty()) return;
+    if (!isImfPackage(dir.toStdString())) {
+        QMessageBox::warning(this, tr("Import IMF Package"), tr("%1 is not an IMF package: it has no ASSETMAP.xml").arg(QDir::toNativeSeparators(dir)));
+        return;
+    }
+    importTimelineFrom(dir);
+}
+
+void MainWindow::importTimelineFrom(QString path) {
+    QSettings st = appSettings();
+    // An IMF package: its folder, asset map or a composition playlist.
+    const bool imf = isImfPackage(path.toStdString());
+    if (!imf && QFileInfo(path).isDir()) path += "/Info.fcpxml";  // an .fcpxmld bundle
     QFile f(path);
-    if (!f.open(QIODevice::ReadOnly)) {
+    if (!(imf && QFileInfo(path).isDir()) && !f.open(QIODevice::ReadOnly)) {
         QMessageBox::warning(this, tr("Import Timeline"), tr("Cannot read %1").arg(path));
         return;
     }
     st.setValue("lastImportTimelineDir", QFileInfo(path).absolutePath());
     const QString suffix = QFileInfo(path).suffix().toLower();
-    const std::string text = suffix == QLatin1String("aaf") ? std::string() : f.readAll().toStdString();
+    const std::string text = suffix == QLatin1String("aaf") || imf ? std::string() : f.readAll().toStdString();
     const MediaProber prober = [](const std::string& file, MediaItem& m) { return probeMedia(file, m, nullptr); };
     const QString ext = QFileInfo(path).suffix().toLower();
     // EDLs do not say their rate: take the open sequence's.
@@ -8046,7 +8187,8 @@ void MainWindow::importTimeline() {
     ImportResult r;
     QApplication::setOverrideCursor(Qt::WaitCursor);
     state_->edit(tr("Import Timeline"), [&](Project& p, Sequence&) {
-        r = ext == "aaf"                      ? importAaf(p, path.toStdString(), prober)
+        r = imf                               ? importImf(p, path.toStdString(), prober)
+            : ext == "aaf"                    ? importAaf(p, path.toStdString(), prober)
             : ext == "edl"                    ? importEdl(p, text, fps, prober, dir)
             : ext == "xml" || ext == "fcpxml" ? importXmlTimeline(p, text, prober)
                                               : importOtio(p, text, prober);

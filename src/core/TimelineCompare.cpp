@@ -1,5 +1,7 @@
 #include "TimelineCompare.h"
 
+#include "EditOps.h"
+
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -93,16 +95,8 @@ std::string join(const std::vector<std::string>& parts) {
     return s;
 }
 
-}  // namespace
-
-std::vector<TimelineChange> compareSequences(const Project& p, const Sequence& before, const Sequence& after) {
-    return compareSequences(p, before, p, after);
-}
-
-std::vector<TimelineChange> compareSequences(const Project& pBefore, const Sequence& before, const Project& pAfter,
-                                             const Sequence& after) {
-    std::vector<Entry> A = entries(pBefore, before), B = entries(pAfter, after);
-    const double fps = after.fpsValue();
+// Each clip of the new version's match among the old one's (an index into A, or -1).
+std::vector<int> matchEntries(std::vector<Entry>& A, const std::vector<Entry>& B) {
     // Each clip of the new version against the unmatched clips of the old one playing the same thing on the same
     // kind of track: the most source in common, then the same track, then the nearest start.
     std::vector<int> match(B.size(), -1);
@@ -132,6 +126,23 @@ std::vector<TimelineChange> compareSequences(const Project& pBefore, const Seque
             A[size_t(best)].matched = true;
         }
     }
+    return match;
+}
+
+}  // namespace
+
+std::vector<TimelineChange> compareSequences(const Project& p, const Sequence& before, const Sequence& after) {
+    return compareSequences(p, before, p, after);
+}
+
+std::vector<TimelineChange> compareSequences(const Project& pBefore, const Sequence& before, const Project& pAfter,
+                                             const Sequence& after) {
+    std::vector<Entry> A = entries(pBefore, before), B = entries(pAfter, after);
+    const double fps = after.fpsValue();
+    const std::vector<int> match = matchEntries(A, B);
+    std::vector<size_t> order(B.size());
+    for (size_t i = 0; i < B.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t x, size_t y) { return B[x].clip->start < B[y].clip->start; });
     // Order changes: on each track of the new version, the matched clips whose old order does not follow the rest
     // (outside the longest run keeping their old order) moved.
     std::vector<bool> reordered(B.size(), false);
@@ -233,6 +244,115 @@ std::vector<TimelineChange> compareSequences(const Project& pBefore, const Seque
         return std::make_tuple(x.at, int(x.track.kind), x.track.index) < std::make_tuple(y.at, int(y.track.kind), y.track.index);
     });
     return kept;
+}
+
+namespace {
+
+// Whether two clips show the same picture where they show the same moment: everything the renderer reads but where
+// they sit and what they cover (and what is only heard or only labels them).
+bool samePicture(const Clip& a, const Clip& b) {
+    Clip x = a, y = b;
+    for (Clip* c : {&x, &y}) {
+        c->id = 0, c->start = 0, c->duration = 1, c->sourceIn = 0, c->linkGroup = 0, c->colorLabel = 0;
+        c->name.clear(), c->role.clear(), c->unrendered.clear(), c->markers.clear(), c->takes.clear(), c->take = 0;
+        c->gradeVersions.clear(), c->gradeVersion = 0, c->audio = Effect(), c->audioAngle = -1, c->channels.clear();
+    }
+    return x == y;
+}
+
+bool varies(const Effect& e) {
+    for (const auto& [name, p] : e.params)
+        if (p.varies()) return true;
+    return false;
+}
+
+// Whether a clip's picture changes with its own time (keys, expressions, animation presets): then a frame is the same
+// only at the same clip time.
+bool animated(const Clip& c) {
+    if (!c.animIn.type.empty() || !c.animOut.type.empty() || !c.animLoop.type.empty()) return true;
+    if (varies(c.motion) || varies(c.timing) || varies(c.generator)) return true;
+    for (const Effect& e : c.effects)
+        if (varies(e)) return true;
+    for (const auto& [id, e] : c.trims)
+        if (varies(e)) return true;
+    return false;
+}
+
+}  // namespace
+
+std::vector<FrameTime> samePictureFrames(const Project& p, const Sequence& before, const Sequence& after, FrameTime from,
+                                         FrameTime count) {
+    std::vector<FrameTime> out(size_t(std::max<FrameTime>(0, count)), -1);
+    if (before.width != after.width || before.height != after.height || !(before.fps == after.fps) ||
+        before.colorSpace != after.colorSpace || before.hdrPeakNits != after.hdrPeakNits || before.colorGroups != after.colorGroups ||
+        before.sharedNodes != after.sharedNodes || before.stereo3d != after.stereo3d || before.spherical != after.spherical)
+        return out;
+    std::vector<Entry> A = entries(p, before), B = entries(p, after);
+    const std::vector<int> match = matchEntries(A, B);
+    std::map<const Clip*, size_t> entryOf;
+    for (size_t i = 0; i < B.size(); ++i) entryOf[B[i].clip] = i;
+    // The clips seen at t, bottom track first; false inside a transition.
+    auto layers = [](const Sequence& s, FrameTime t, std::vector<const Clip*>& seen) {
+        seen.clear();
+        for (const Track& tr : s.videoTracks) {
+            if (tr.muted) continue;
+            for (const Transition& x : tr.transitions) {
+                FrameTime a = 0, b = 0;
+                if (edit::transitionRange(tr, x, a, b) && t >= a && t < b) return false;
+            }
+            for (const Clip& c : tr.clips)
+                if (c.enabled && c.contains(t)) seen.push_back(&c);
+        }
+        return true;
+    };
+    std::vector<const Clip*> now, then;
+    std::vector<signed char> kept(B.size(), -1);  // whether each matched clip shows what its match did (-1: not yet known)
+    for (FrameTime k = 0; k < count; ++k) {
+        const FrameTime t = from + k;
+        if (!layers(after, t, now)) continue;
+        FrameTime target = -1;
+        bool same = true;
+        std::vector<const Clip*> wanted;
+        for (const Clip* c : now) {
+            const size_t bi = entryOf[c];
+            if (match[bi] < 0) {
+                same = false;
+                break;
+            }
+            const Entry& a = A[size_t(match[bi])];
+            const Clip& o = *a.clip;
+            if (kept[bi] < 0) {
+                // (a nested or multicam sequence may have changed inside since: its pictures are coded afresh)
+                const MediaItem* m = c->isGenerator() ? nullptr : p.findMedia(c->mediaId);
+                kept[bi] = a.track == B[bi].track && samePicture(o, *c) && !(m && m->kind == MediaKind::Sequence);
+            }
+            if (!kept[bi]) {
+                same = false;
+                break;
+            }
+            FrameTime at;
+            if (c->isGenerator()) {
+                at = o.start + (t - c->start);
+                if (o.duration != c->duration) same = false;
+            } else {
+                const double source = c->sourceFrameAt(t);
+                at = o.start + FrameTime(std::llround(o.localForSource(source)));
+                if (!o.contains(at) || std::fabs(o.sourceFrameAt(at) - source) > 1e-6) same = false;
+                if ((at - o.start != t - c->start || o.duration != c->duration) && (animated(o) || animated(*c))) same = false;
+            }
+            if (!same || (target >= 0 && at != target)) {
+                same = false;
+                break;
+            }
+            target = at;
+            wanted.push_back(&o);
+        }
+        if (!same) continue;
+        if (now.empty()) target = t;  // a gap: the same frame of the old version, if that is a gap too
+        if (target < 0 || !layers(before, target, then) || then != wanted) continue;
+        out[size_t(k)] = target;
+    }
+    return out;
 }
 
 }  // namespace montage

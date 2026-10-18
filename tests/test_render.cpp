@@ -111,6 +111,22 @@ Image solid(int w, int h, float r, float g, float b, float a = 1) {
 
 bool near(float a, float b, float tol = 0.02f) { return std::fabs(a - b) <= tol; }
 
+// Netflix's Photon (the reference IMF checker) on a package: its errors, or {"skipped"} when MONTAGE_TEST_PHOTON (a
+// folder of Photon's jar and its dependencies) is not set.
+QStringList photonErrors(const QString& folder) {
+    const QString jars = qEnvironmentVariable("MONTAGE_TEST_PHOTON");
+    if (jars.isEmpty()) return {"skipped"};
+    QProcess java;
+    java.setProcessChannelMode(QProcess::MergedChannels);
+    java.start("java", {"-cp", jars + "/*", "com.netflix.imflibrary.app.IMPAnalyzer", folder});
+    if (!java.waitForFinished(600000)) return {"Photon did not finish"};
+    QStringList errors;
+    for (const QString& line : QString::fromUtf8(java.readAll()).split('\n'))
+        if (line.contains("ERROR-")) errors << line.mid(line.indexOf("ERROR-")).trimmed();
+    if (java.exitCode() != 0 && errors.isEmpty()) errors << QStringLiteral("Photon exited with %1").arg(java.exitCode());
+    return errors;
+}
+
 // Unpremultiplied colour at a pixel.
 void rgb(const Image& img, int x, int y, float out[4]) {
     const float* p = img.at(x, y);
@@ -5347,6 +5363,10 @@ colorspaces:
         QVERIFY(videos.size() == 1 && audios.size() == 1 && cpls.size() == 1 && out.entryList({"PKL_*.xml"}).size() == 1 && out.exists("ASSETMAP.xml"));
         std::vector<std::string> issues = verifyImf(r.folder);
         QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        {
+            const QStringList photon = photonErrors(out.path());
+            QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+        }
         // The composition: Application #2E, the rate, both resources with their essence descriptors (as the files'), the
         // picture's profile, colour and component layout, the sound's stereo labels.
         QFile cplFile(out.filePath(cpls[0]));
@@ -5558,6 +5578,254 @@ colorspaces:
         }
     }
 
+    void exportsImfVersions() {
+        if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
+        QTemporaryDir dir;
+        // A cut of three shots (mattes, 8 frames each at 24 fps) over English dialogue (a 1 kHz tone), music (220 Hz) and
+        // a German dub of the dialogue (660 Hz, its own role, not heard in the main mix).
+        Project p = makeDefaultProject();
+        p.sequences.reserve(4);
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = Rational{24, 1};
+        s.videoTracks[0].clips = {colorClip(p, 0.8f, 0.1f, 0.1f, 0, 8), colorClip(p, 0.1f, 0.8f, 0.1f, 8, 8), colorClip(p, 0.1f, 0.1f, 0.8f, 16, 8)};
+        auto tone = [&](const QString& name, double hz, const std::string& role, int track) {
+            const QString wav = dir.filePath(name);
+            QFile f(wav);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            const int n = 96000;
+            QByteArray d;
+            auto u32 = [&](uint32_t v) { d.append(reinterpret_cast<const char*>(&v), 4); };
+            auto u16 = [&](uint16_t v) { d.append(reinterpret_cast<const char*>(&v), 2); };
+            d.append("RIFF");
+            u32(36 + n * 2);
+            d.append("WAVEfmt ");
+            u32(16), u16(1), u16(1), u32(48000), u32(96000), u16(2), u16(16);
+            d.append("data");
+            u32(n * 2);
+            for (int i = 0; i < n; ++i) u16(uint16_t(int16_t(std::lround(0.2 * 32767 * std::sin(2 * M_PI * hz * i / 48000.0)))));
+            f.write(d);
+            f.close();
+            MediaItem m;
+            m.id = p.newId();
+            QVERIFY(probeMedia(wav.toStdString(), m));
+            p.media.push_back(m);
+            Clip a = makeClip(p, m, TrackKind::Audio, s);
+            a.duration = 24;
+            a.role = role;
+            while (int(s.audioTracks.size()) <= track) s.audioTracks.push_back(makeTrack(p, TrackKind::Audio, "A"));
+            s.audioTracks[size_t(track)].clips.push_back(a);
+        };
+        tone("dialogue.wav", 1000, "Dialogue", 0);
+        tone("music.wav", 220, "Music", 1);
+        tone("dub.wav", 660, "Dialogue German", 2);
+        s.mutedRoles = {"Dialogue German"};
+        // The original package: the picture and the English programme.
+        Sequence cut1 = s;
+        cut1.id = p.newId();
+        cut1.name = "Cut 1";
+        p.sequences.push_back(cut1);
+        Sequence& now = *p.active();
+        ImfSettings st;
+        st.title = "Versions";
+        st.threads = 2;
+        st.captions = false;
+        ImfResult r1;
+        std::string err;
+        QVERIFY2(exportImf(p, now, st, dir.path().toStdString(), &r1, {}, &err), err.c_str());
+        QVERIFY(!r1.supplemental && r1.codedFrames == 24 && r1.sounds == 1 && r1.texts == 0 && r1.trackFiles.size() == 2);
+        std::vector<std::string> issues = verifyImf(r1.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        QStringList photon = photonErrors(QString::fromStdString(r1.folder));
+        QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+
+        // The new cut: the middle shot replaced by a longer one (12 frames, the last shot pushed along), the sound running
+        // on to the end; English subtitles. Its supplemental: the new shot's pictures only, the German programme, the
+        // subtitles as IMSC 1.1, the English sound only where it is new.
+        now.videoTracks[0].clips[1] = colorClip(p, 0.9f, 0.9f, 0.2f, 8, 12);
+        now.videoTracks[0].clips[2].start = 20;
+        for (Track& t : now.audioTracks) t.clips[0].duration = 28;
+        CaptionTrack subs;
+        subs.id = p.newId();
+        subs.name = "English";
+        subs.language = "en";
+        Caption hello, evening;
+        hello.start = 2, hello.end = 10, hello.text = "Hello there";
+        evening.start = 14, evening.end = 26, evening.text = "Good evening";
+        subs.captions = {hello, evening};
+        now.captionTracks.push_back(subs);
+        ImfSettings sup = st;
+        sup.supplementOf = r1.folder;
+        sup.originalSequence = cut1.id;
+        sup.captions = true;
+        sup.sounds = {{"en", "PRM", {}}, {"de", "PRM", {"Dialogue German", "Music"}}};
+        sup.size = "uhd";  // (ignored: a supplemental keeps the original's picture)
+        ImfResult r2;
+        QVERIFY2(exportImf(p, now, sup, dir.path().toStdString(), &r2, {}, &err), err.c_str());
+        QVERIFY(r2.supplemental && r2.width == 320 && r2.frames == 28 && r2.sounds == 2 && r2.texts == 1);
+        QCOMPARE(r2.codedFrames, int64_t(12));  // only the new shot's pictures
+        issues = verifyImf(r2.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        const QDir out2(QString::fromStdString(r2.folder));
+        QVERIFY(out2.dirName().startsWith("Versions_IMF_SUPP_"));
+        QCOMPARE(out2.entryList({"VIDEO_*.mxf"}).size(), 1);
+        QCOMPARE(out2.entryList({"TEXT_*.mxf"}).size(), 1);
+        // English: its first 24 frames are the original's samples, so its own file is the last 4 frames'; German is new.
+        QCOMPARE(out2.entryList({"AUDIO_*.mxf"}).size(), 2);
+        QCOMPARE(r2.newSamples, int64_t(4 * 2000 + 28 * 2000));
+        {
+            const std::string video = out2.filePath(out2.entryList({"VIDEO_*.mxf"})[0]).toStdString();
+            dcp::ImfTrackReader v;
+            QVERIFY(v.open(video, &err) && v.frames() == 12 && v.imfRgbJpeg2000());
+            std::vector<uint16_t> rgb;
+            int w = 0, h = 0, bits = 0;
+            QVERIFY2(readImfFrame(video, 0, rgb, w, h, bits, &err), err.c_str());
+            const uint16_t* mid = &rgb[(size_t(90) * 320 + 160) * 3];
+            QVERIFY2(mid[0] > 850 && mid[1] > 850 && mid[2] < 300, qPrintable(QString("%1 %2 %3").arg(mid[0]).arg(mid[1]).arg(mid[2])));  // the new shot
+        }
+        // The composition: the original's picture and sound files by id around the new ones, German and IMSC 1.1 English.
+        ImfComposition c, c1;
+        QVERIFY2(readImfComposition(r2.cpl, c, &err), err.c_str());
+        QVERIFY2(readImfComposition(r1.cpl, c1, &err), err.c_str());
+        const ImfVirtualTrack* pic = c.picture();
+        QVERIFY(pic && c1.picture() && pic->length() == 28 && pic->resources.size() == 3);
+        QCOMPARE(pic->resources[0].duration, int64_t(8));
+        QCOMPARE(pic->resources[1].duration, int64_t(12));
+        QCOMPARE(pic->resources[2].entry, int64_t(16));
+        QVERIFY(pic->resources[0].trackFile == pic->resources[2].trackFile && pic->resources[0].trackFile != pic->resources[1].trackFile);
+        QCOMPARE(pic->resources[0].trackFile, c1.picture()->resources[0].trackFile);
+        QCOMPARE(pic->id, c1.picture()->id);  // the same virtual track as the original's
+        int german = 0, english = 0, subtitles = 0;
+        for (const ImfVirtualTrack& t : c.tracks) {
+            if (t.kind == "MainAudioSequence" && t.language == "de") ++german;
+            if (t.kind == "MainAudioSequence" && t.language == "en") {
+                ++english;
+                QVERIFY(t.resources.size() == 2 && t.resources[0].duration == 48000 && t.resources[1].duration == 8000);
+            }
+            if (t.kind == "SubtitlesSequence" && t.language == "en") ++subtitles;
+        }
+        QVERIFY(german == 1 && english == 1 && subtitles == 1);
+        {
+            QFile f(QString::fromStdString(r2.cpl));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QString text = QString::fromUtf8(f.readAll());
+            for (const char* want : {"<cc:SubtitlesSequence>", "<r0:DCTimedTextDescriptor", "imsc1.1/text</r1:NamespaceURI>",
+                                     "<r1:RFC5646LanguageTagList>en</r1:RFC5646LanguageTagList>",
+                                     "<r1:RFC5646SpokenLanguage>de</r1:RFC5646SpokenLanguage>"})
+                QVERIFY2(text.contains(want), want);
+        }
+        // Photon passes the supplemental (it checks the files a package carries; the original's were checked above).
+        photon = photonErrors(QString::fromStdString(r2.folder));
+        QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+        // Nothing changed since: a supplemental of the supplemental holds a composition only.
+        ImfSettings again = sup;
+        again.supplementOf = r2.folder;
+        again.originalSequence = 0;
+        again.title = "Versions again";
+        ImfResult r3;
+        QVERIFY2(exportImf(p, now, again, dir.path().toStdString(), &r3, {}, &err), err.c_str());
+        QVERIFY(r3.codedFrames == 0 && r3.newSamples == 0 && r3.trackFiles.empty());
+        issues = verifyImf(r3.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+
+        // Opened as a sequence, the supplemental plays as the new cut does: the same pictures, the subtitles, English
+        // heard and German muted.
+        Project q = makeDefaultProject();
+        const ImportResult in = importImf(q, r2.folder, [](const std::string& f, MediaItem& m) { return probeMedia(f, m, nullptr); });
+        QVERIFY2(in.ok, in.error.c_str());
+        const Sequence* opened = q.findSequence(in.sequence);
+        QVERIFY(opened && opened->width == 320 && opened->fps == (Rational{24, 1}) && opened->duration() == 28);
+        QCOMPARE(opened->audioTracks.size(), size_t(2));
+        QVERIFY(!opened->audioTracks[0].muted && opened->audioTracks[1].muted);
+        QCOMPARE(opened->captionTracks.size(), size_t(1));
+        QCOMPARE(opened->captionTracks[0].captions.size(), size_t(2));
+        QVERIFY(opened->captionTracks[0].captions[1].start == 14 && opened->captionTracks[0].captions[1].end == 26);
+        RenderOptions o;
+        for (FrameTime k = 0; k < 28; ++k) {
+            const Image a = renderProgramFrame(p, now, k, o), b = renderProgramFrame(q, *opened, k, o);
+            QVERIFY(a.width == b.width && a.height == b.height);
+            for (int y = 0; y < a.height; y += 7)
+                for (int x = 0; x < a.width; x += 5)
+                    for (int ch = 0; ch < 3; ++ch)
+                        QVERIFY2(std::lround(a.row(y)[x * 4 + ch] * 1023) == std::lround(b.row(y)[x * 4 + ch] * 1023),
+                                 qPrintable(QString("frame %1 at %2,%3").arg(k).arg(x).arg(y)));
+        }
+        // A supplemental at another rate, or of a cut that is not the original's, is refused.
+        Sequence other = now;
+        other.fps = Rational{25, 1};
+        sup.title = "Wrong rate";
+        QVERIFY(!exportImf(p, other, sup, dir.path().toStdString(), nullptr, {}, &err) && err.find("frame rate") != std::string::npos);
+        p.sequences.back().videoTracks[0].clips[2].duration = 30;
+        sup.title = "Wrong cut";
+        QVERIFY(!exportImf(p, now, sup, dir.path().toStdString(), nullptr, {}, &err) && err.find("mastered from") != std::string::npos);
+    }
+
+    void exportsImfSupplementalAt2997() {
+        if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
+        // A lossy 29.97 master of 7 frames (padded to 10, so the sound fills whole frames), then a supplemental with
+        // the second shot regraded and a German version: only that shot's pictures are new, at the original's rate.
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        p.sequences.reserve(3);
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = Rational{30000, 1001};
+        s.videoTracks[0].clips = {colorClip(p, 0.8f, 0.1f, 0.1f, 0, 4), colorClip(p, 0.1f, 0.6f, 0.1f, 4, 3)};
+        Sequence master = s;
+        master.id = p.newId();
+        master.name = "Master";
+        p.sequences.push_back(master);
+        Sequence& now = *p.active();
+        ImfSettings st;
+        st.title = "Drop";
+        st.threads = 2;
+        st.lossless = false;
+        st.megabitsPerSecond = 100;
+        ImfResult r1, r2;
+        std::string err;
+        QVERIFY2(exportImf(p, now, st, dir.path().toStdString(), &r1, {}, &err), err.c_str());
+        QVERIFY(r1.frames == 10 && r1.rateNum == 30000 && r1.rateDen == 1001);
+        now.videoTracks[0].clips[1].generator.params["color.g"] = 0.7;
+        ImfSettings sup = st;
+        sup.megabitsPerSecond = 800;  // (ignored: the earlier pictures' rate is kept)
+        sup.supplementOf = r1.folder;
+        sup.originalSequence = master.id;
+        sup.sounds = {{"en", "PRM", {}}, {"de", "PRM", {}}};
+        QVERIFY2(exportImf(p, now, sup, dir.path().toStdString(), &r2, {}, &err), err.c_str());
+        QCOMPARE(r2.codedFrames, int64_t(3));
+        QCOMPARE(r2.newSamples, int64_t(16016));  // the German version's 10 frames; English is the original's
+        std::vector<std::string> issues = verifyImf(r2.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        QStringList photon = photonErrors(QString::fromStdString(r2.folder));
+        QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+        dcp::ImfTrackReader before, after;
+        const QDir out1(QString::fromStdString(r1.folder)), out2(QString::fromStdString(r2.folder));
+        QVERIFY(before.open(out1.filePath(out1.entryList({"VIDEO_*.mxf"})[0]).toStdString()));
+        QVERIFY(after.open(out2.filePath(out2.entryList({"VIDEO_*.mxf"})[0]).toStdString()));
+        QVERIFY(after.frames() == 3 && after.largestFrame() <= before.largestFrame());
+        // A second supplemental the same day gets a folder of its own; one made elsewhere is refused.
+        ImfResult r3;
+        QVERIFY2(exportImf(p, now, sup, dir.path().toStdString(), &r3, {}, &err), err.c_str());
+        QVERIFY(QFileInfo(QString::fromStdString(r3.folder)).fileName().endsWith("_2"));
+        QDir(dir.path()).mkdir("elsewhere");
+        QVERIFY(!exportImf(p, now, sup, dir.filePath("elsewhere").toStdString(), nullptr, {}, &err) && err.find("beside") != std::string::npos);
+        // A composition from elsewhere that would repeat a resource for ever is refused, not opened.
+        {
+            QFile f(QString::fromStdString(r1.cpl));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QByteArray cpl = f.readAll();
+            const qsizetype at = cpl.indexOf("<SourceDuration>");
+            QVERIFY(at > 0);
+            cpl.insert(at, "<RepeatCount>1000000000000</RepeatCount>");
+            QFile g(dir.filePath("hostile.xml"));
+            QVERIFY(g.open(QIODevice::WriteOnly) && g.write(cpl) == cpl.size());
+            g.close();
+            ImfComposition c;
+            QVERIFY(!readImfComposition(g.fileName().toStdString(), c, &err) && err.find("does not make sense") != std::string::npos);
+        }
+        // A role no clip has is refused (it would leave the version silent).
+        sup.sounds = {{"de", "PRM", {"Dialog"}}};
+        QVERIFY(!exportImf(p, now, sup, dir.path().toStdString(), nullptr, {}, &err) && err.find("Dialog") != std::string::npos);
+    }
+
     void exportsDigitalCinemaPackage() {
         QTemporaryDir dir;
         // A second of a mid-grey matte (Rec.709, 16:9) with a 1 kHz tone, as a 2K Scope DCP.
@@ -5718,6 +5986,10 @@ colorspaces:
         named.language = "fr-CA";
         named.territory = "ca";
         QCOMPARE(dcpName(named, 8, "20261009"), std::string("MidnightRun_FTR_F_FR-XX_CA_71_2K_DI_20261009_MTG_SMPTE_OV"));
+        // Language and territory go into the folder's name: nothing but letters and digits of them.
+        named.language = "en/../../x";
+        named.territory = "../up";
+        QCOMPARE(dcpName(named, 8, "20261009"), std::string("MidnightRun_FTR_F_ENX-XX_UP_71_2K_DI_20261009_MTG_SMPTE_OV"));
         QVERIFY(dcpContainer("full", cw, ch) && cw == 2048 && ch == 1080 && !dcpContainer("imax", cw, ch));
     }
 

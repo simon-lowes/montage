@@ -268,13 +268,18 @@ struct McaLabel {
 McaLabel imfSoundfield(int channels);  // stereo (sgST), 5.1 (sg51) or 7.1 DS (sg71)
 std::vector<McaLabel> imfChannels(int channels);
 
-// SMPTE ST 382 clip-wrapped 24-bit PCM at 48 kHz with ST 2067-2 multichannel labels.
+// SMPTE ST 382 clip-wrapped 24-bit PCM at 48 kHz with ST 2067-2 multichannel labels. `contentKind` is the MCA audio
+// content kind (ST 377-41): "PRM" the programme (the main or a dubbed language), "ME" music and effects, "DV" described
+// video.
 class ImfSoundWriter : public TrackFileWriter {
 public:
     bool open(const std::string& path, const Uuid& asset, int channels, const std::string& language, const std::string& title,
-              const std::string& titleVersion, std::string* error = nullptr);
+              const std::string& titleVersion, std::string* error = nullptr, const std::string& contentKind = "PRM");
+    const std::string& contentKind() const { return kind_; }
     // `frames` interleaved sample frames of channels() channels, -1..1.
     bool write(const float* samples, size_t frames, std::string* error = nullptr);
+    // The same as 24-bit integers.
+    bool writePcm(const int32_t* samples, size_t frames, std::string* error = nullptr);
     int channels() const { return channels_; }
     int64_t duration() const override { return samples_; }
     // The label sub-descriptors' identities: the soundfield group's instance and link, each channel's instance and link.
@@ -294,8 +299,70 @@ protected:
 private:
     int channels_ = 6;
     int64_t samples_ = 0;
-    std::string language_ = "en", title_, version_;
+    std::string language_ = "en", title_, version_, kind_ = "PRM";
     std::vector<uint8_t> buf_;
+};
+
+// SMPTE ST 2067-2 timed text: one IMSC 1.1 Text document (the whole composition's, times from its start) clip-wrapped
+// as ST 429-5 has it, in the AS-02 layout, its descriptor naming the IMSC 1.1 Text profile and the RFC 5646 language.
+class ImfTimedTextWriter : public TrackFileWriter {
+public:
+    bool open(const std::string& path, const Uuid& asset, EditRate rate, std::string* error = nullptr) {
+        return openImfFile(path, asset, rate, error);
+    }
+    // The document, `duration` edit units long.
+    bool write(const std::string& xml, int64_t duration, const std::string& language, std::string* error = nullptr);
+    int64_t duration() const override { return duration_; }
+    EditRate rate() const { return rate_; }
+    const Uuid& resourceId() const { return resourceId_; }
+    const std::string& language() const { return language_; }
+    static constexpr const char* kProfile = "http://www.w3.org/ns/ttml/profile/imsc1.1/text";
+
+protected:
+    std::vector<uint8_t> headerMetadata(int64_t duration) const override;
+    std::vector<uint8_t> indexSegments() const override;
+    std::array<uint8_t, 16> essenceContainer() const override;
+
+private:
+    Uuid resourceId_{};
+    std::string language_ = "en";
+    int64_t duration_ = 0;
+};
+
+// Reads an IMF (AS-02) track file back: what it carries, its track file id (the file package's), each picture
+// frame, the samples of clip-wrapped sound, or the timed text document. Every length is checked against the file.
+class ImfTrackReader {
+public:
+    enum class Kind { Unknown, Picture, Sound, TimedText };
+    // `imfPictureOnly`: give up at the end of the header unless it is an IMF picture (imfRgbJpeg2000), without walking
+    // the rest of a file that is not.
+    bool open(const std::string& path, std::string* error = nullptr, bool imfPictureOnly = false);
+    Kind kind() const { return kind_; }
+    const Uuid& asset() const { return asset_; }
+    int64_t frames() const { return int64_t(elements_.size()); }  // picture
+    uint64_t largestFrame() const;                                // picture: the largest codestream's bytes
+    int channels() const { return channels_; }                    // sound
+    EditRate rate() const { return rate_; }                       // the descriptor's sample rate
+    int width() const { return width_; }                          // picture: the stored size (0: not given)
+    int height() const { return height_; }
+    // An IMF picture: OP1a, JPEG 2000 in an RGBA descriptor (full-range RGB), as Application #2E has it (a DCP's
+    // OP-Atom pictures and other MXF are not).
+    bool imfRgbJpeg2000() const { return kind_ == Kind::Picture && op1a_ && rgba_ && j2k_; }
+    int64_t samples() const { return channels_ > 0 ? int64_t(clipSize_ / (3 * uint64_t(channels_))) : 0; }
+    bool frame(int64_t index, std::vector<uint8_t>& out, std::string* error = nullptr) const;
+    // `count` sample frames from `first`, interleaved, as 24-bit integers (past the end: false).
+    bool pcm(int64_t first, int64_t count, std::vector<int32_t>& out, std::string* error = nullptr) const;
+    bool text(std::string& out, std::string* error = nullptr) const;
+
+private:
+    std::string path_;
+    Kind kind_ = Kind::Unknown;
+    Uuid asset_{};
+    int channels_ = 0, width_ = 0, height_ = 0;
+    EditRate rate_;
+    bool op1a_ = false, rgba_ = false, j2k_ = false;
+    std::vector<std::pair<uint64_t, uint64_t>> elements_;  // picture frames: offset and size of each value
+    uint64_t clipAt_ = 0, clipSize_ = 0;                    // sound or timed text: the one element's value
 };
 
 }  // namespace montage::dcp

@@ -1723,17 +1723,39 @@ struct UnitIndex {
     int8_t temporal = 0, keyOffset = 0;
     u8 flags = 0x80;
 };
+// An H.264 slice's type from its header (first_mb_in_slice, then slice_type, both Exp-Golomb), as 1 intra or 2
+// predicted (-1: cannot tell).
+int avcSliceType(const u8* v, int64_t len) {
+    int64_t bit = 0;
+    auto read = [&]() -> int64_t {
+        int zeros = 0;
+        while (bit < len * 8 && !(v[bit >> 3] >> (7 - (bit & 7)) & 1)) ++zeros, ++bit;
+        if (zeros > 31 || bit >= len * 8) return -1;
+        ++bit;
+        int64_t x = 0;
+        for (int k = 0; k < zeros; ++k, ++bit) {
+            if (bit >= len * 8) return -1;
+            x = x << 1 | (v[bit >> 3] >> (7 - (bit & 7)) & 1);
+        }
+        return (int64_t(1) << zeros) - 1 + x;
+    };
+    if (read() < 0) return -1;
+    const int64_t type = read();
+    if (type < 0 || type > 9) return -1;
+    return type % 5 == 2 || type % 5 == 4 ? 1 : 2;  // (I and SI)
+}
+
 std::vector<UnitIndex> indexUnits(const u8* d, const MxfLayout& m) {
     const size_t n = m.units.size();
     std::vector<UnitIndex> out(n);
     std::vector<int> tref(n, -1);
     std::vector<bool> intra(n, true), sequence(n, false);
-    bool coded = false, closedGop = false;  // (until a P picture, after which it no longer matters)
+    bool coded = false, closedGop = false, anyMpeg2 = false;  // (closedGop: until a P picture, after which it no longer matters)
     for (size_t i = 0; i < n; ++i) {
         const int64_t p = m.picture[i], len = std::min<int64_t>(m.pictureLen[i], 8192);
         if (p < 0) continue;
         const u8* v = d + p;
-        bool mpeg2 = false, avc = false, closed = false;
+        bool mpeg2 = false, avc = false, closed = false, entry = false;  // entry: an SPS or a recovery point before the slice
         int type = 1;
         for (int64_t q = 0; q + 8 <= len; ++q) {
             if (v[q] || v[q + 1] || v[q + 2] != 1) continue;
@@ -1748,13 +1770,18 @@ std::vector<UnitIndex> indexUnits(const u8* d, const MxfLayout& m) {
             }
             if (!mpeg2 && (code & 0x80) == 0 && ((code & 31) == 1 || (code & 31) == 5)) {
                 avc = true;
-                type = (code & 31) == 5 ? 1 : 2;
+                // (an I picture that is not IDR, as open GOPs have, is a random access point where the encoder marks
+                // it one: with its SPS or a recovery point; other I pictures can be followed by pictures that look
+                // past them)
+                type = (code & 31) == 5 || (entry && avcSliceType(v + q + 4, len - q - 4) == 1) ? 1 : 2;
                 break;
             }
             if (!mpeg2 && (code & 0x80) == 0 && (code & 31) == 9) avc = true;
+            if (!mpeg2 && (code & 0x80) == 0 && ((code & 31) == 7 || ((code & 31) == 6 && v[q + 4] == 6))) avc = true, entry = true;
         }
         if (!mpeg2 && !avc) continue;  // intra: every package a random access point
         coded = true;
+        anyMpeg2 = anyMpeg2 || mpeg2;
         intra[i] = type == 1;
         if (avc) {
             out[i].flags = type == 1 ? 0x80 : 0x22;
@@ -1767,18 +1794,16 @@ std::vector<UnitIndex> indexUnits(const u8* d, const MxfLayout& m) {
         }
     }
     if (!coded) return out;
-    // MPEG-2 reordering: the entry at a display slot names where that picture is stored.
-    for (size_t key = 0; key < n;) {
+    // MPEG-2 reordering: the entry at a display slot names where that picture is stored (each GOP's pictures by their
+    // temporal reference, once: a GOP can be the whole file).
+    for (size_t key = 0; anyMpeg2 && key < n;) {
         size_t end = key + 1;
         while (end < n && !intra[end]) ++end;
-        for (size_t i = key; i < end; ++i) {
-            const int slot = int(i - key);
-            for (size_t j = key; j < end; ++j)
-                if (tref[j] == slot) {
-                    out[i].temporal = int8_t(std::clamp<int>(int(j) - int(i), -128, 127));
-                    break;
-                }
-        }
+        std::vector<int64_t> stored(std::min<size_t>(end - key, 1024), -1);
+        for (size_t j = key; j < end; ++j)
+            if (tref[j] >= 0 && size_t(tref[j]) < stored.size() && stored[size_t(tref[j])] < 0) stored[size_t(tref[j])] = int64_t(j);
+        for (size_t i = key; i < end && i - key < stored.size(); ++i)
+            if (stored[i - key] >= 0) out[i].temporal = int8_t(std::clamp<int64_t>(stored[i - key] - int64_t(i), -128, 127));
         key = end;
     }
     // Key frame offsets: a B picture predicted both ways counts back to the key frame before the one its GOP opens with

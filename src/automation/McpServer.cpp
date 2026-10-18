@@ -7748,7 +7748,12 @@ void McpServer::Impl::addTools() {
         "with mastering display metadata), 24-bit 48 kHz sound in stereo, 5.1 or 7.1 DS with multichannel labels, a "
         "composition playlist with the essence descriptors, packing list with hashes and asset map, in a new folder under "
         "`folder`. The package is checked when done (as montage_verify_imf). `htj2k` codes the pictures as High-Throughput "
-        "JPEG 2000 instead (ST 2067-21:2023, lossless), far faster to code and decode.",
+        "JPEG 2000 instead (ST 2067-21:2023, lossless), far faster to code and decode. Versions: `sounds` makes a sound "
+        "track per language and kind (each mixed from the roles it hears), the caption tracks become IMSC 1.1 subtitles, "
+        "captions or forced narratives (`texts`), and `supplement_of` (an earlier package's folder) makes a supplemental "
+        "package carrying only what changed since it: the composition plays the earlier package's track files where the "
+        "pictures and sound are the same. Give `original_sequence`, the sequence that package was mastered from (kept as "
+        "it was), when the cut has changed.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string","description":"Where to make the IMF folder"},
             "title":{"type":"string"},"kind":{"type":"string","enum":["feature","episode","short","trailer","teaser","advertisement","promotion","test"],"default":"feature"},
             "colour":{"type":"string","enum":["rec709","p3d65-pq","rec2020-pq","rec2020-hlg"],"description":"Default: as the sequence is graded"},
@@ -7757,7 +7762,16 @@ void McpServer::Impl::addTools() {
             "lossless":{"type":"boolean","default":true},"htj2k":{"type":"boolean","default":false},"megabits_per_second":{"type":"number","minimum":20,"maximum":6400,"description":"Lossy: the cap (default 400)"},
             "mastering_peak":{"type":"number","minimum":100,"maximum":10000,"description":"HDR: the mastering display's peak, cd/m^2"},
             "language":{"type":"string","default":"en"},"issuer":{"type":"string"},
-            "in_out":{"type":"boolean","default":false,"description":"Only In to Out"}},"required":["project","folder"]})json",
+            "in_out":{"type":"boolean","default":false,"description":"Only In to Out"},
+            "sounds":{"type":"array","description":"Sound tracks (default: the mix as the programme in `language`)","items":{"type":"object","properties":{
+                "language":{"type":"string","description":"RFC 5646, e.g. de"},"kind":{"type":"string","enum":["PRM","ME","DV"],"default":"PRM","description":"Programme, music and effects, or described"},
+                "roles":{"type":"array","items":{"type":"string"},"description":"The roles heard (default: the mix as it plays)"}},"required":["language"]}},
+            "captions":{"type":"boolean","default":true,"description":"Caption tracks as IMSC 1.1 timed text"},
+            "texts":{"type":"array","description":"Which caption tracks, and as what (default: all as subtitles)","items":{"type":"object","properties":{
+                "track":{"type":"string","description":"The caption track's name"},"kind":{"type":"string","enum":["subtitles","captions","forced"],"default":"subtitles"}},"required":["track"]}},
+            "supplement_of":{"type":"string","description":"An earlier IMF package's folder: make a supplemental package of it (beside it: `folder` must be the folder holding it)"},
+            "original_sequence":{"type":"string","description":"Supplemental: the sequence the earlier package was mastered from (default: the picture has not changed)"}},
+            "required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             const Sequence& s = l.seq();
@@ -7775,6 +7789,32 @@ void McpServer::Impl::addTools() {
             st.language = str(a, "language", "en").toStdString();
             st.issuer = str(a, "issuer", "Montage").toStdString();
             st.inOut = a.value("in_out").toBool();
+            for (const QJsonValue& v : a.value("sounds").toArray()) {
+                const QJsonObject o = v.toObject();
+                ImfSound snd;
+                snd.language = str(o, "language", "en").toStdString();
+                snd.kind = str(o, "kind", "PRM").toStdString();
+                snd.roles = stringList(o, "roles");
+                st.sounds.push_back(snd);
+            }
+            st.captions = a.value("captions").toBool(true);
+            for (const QJsonValue& v : a.value("texts").toArray()) {
+                const QJsonObject o = v.toObject();
+                const QString name = need(o, "track");
+                ImfText t;
+                for (const CaptionTrack& c : s.captionTracks)
+                    if (QString::fromStdString(c.name) == name) t.track = c.id;
+                if (!t.track) throw ArgError{QStringLiteral("No caption track named \"%1\"").arg(name)};
+                t.kind = str(o, "kind", "subtitles").toStdString();
+                st.texts.push_back(t);
+            }
+            if (a.contains("supplement_of")) st.supplementOf = absolute(need(a, "supplement_of")).toStdString();
+            if (a.contains("original_sequence")) {
+                const QString name = need(a, "original_sequence");
+                for (const Sequence& sq : l.project.sequences)
+                    if (QString::fromStdString(sq.name) == name) st.originalSequence = sq.id;
+                if (!st.originalSequence) throw ArgError{QStringLiteral("No sequence named \"%1\"").arg(name)};
+            }
             const QString folder = absolute(need(a, "folder"));
             QDir().mkpath(folder);
             ImfResult r;
@@ -7789,7 +7829,9 @@ void McpServer::Impl::addTools() {
             const QJsonObject out{{"folder", QString::fromStdString(r.folder)}, {"cpl", QString::fromStdString(r.cpl)},
                                   {"frames", double(r.frames)}, {"edit_rate", QStringLiteral("%1/%2").arg(r.rateNum).arg(r.rateDen)},
                                   {"width", r.width}, {"height", r.height}, {"bits", r.bits}, {"channels", r.channels},
-                                  {"colour", QString::fromStdString(r.colour)}, {"rsiz", r.rsiz}, {"problems", found}};
+                                  {"colour", QString::fromStdString(r.colour)}, {"rsiz", r.rsiz}, {"sounds", r.sounds}, {"texts", r.texts},
+                                  {"supplemental", r.supplemental}, {"coded_frames", double(r.codedFrames)},
+                                  {"new_samples", double(r.newSamples)}, {"problems", found}};
             const QString name = QFileInfo(QString::fromStdString(r.folder)).fileName();
             return ok(found.isEmpty() ? QStringLiteral("Made %1 and checked it: no problems").arg(name)
                                       : QStringLiteral("Made %1; the check found %2 problem(s)").arg(name).arg(found.size()),
@@ -7800,7 +7842,8 @@ void McpServer::Impl::addTools() {
         "Check an IMF package folder: asset map, every file present at its size, packing list hashes, each composition's "
         "resources in the package with their essence descriptors and durations, the Application #2E identification, "
         "picture track files JPEG 2000 in an IMF profile with the right number of frames, sound 24-bit 48 kHz with the "
-        "right number of samples. Returns the problems found (none: it passed).",
+        "right number of samples, timed text that reads. A supplemental package's track files from earlier packages are "
+        "looked for in the folders beside it. Returns the problems found (none: it passed).",
         R"json({"type":"object","properties":{"folder":{"type":"string"}},"required":["folder"]})json", true, [](const QJsonObject& a) {
             const QString folder = absolute(need(a, "folder"));
             QJsonArray found;
@@ -9192,11 +9235,25 @@ void McpServer::Impl::addTools() {
     add("montage_import_timeline", "Import a timeline",
         "Make a project from an EDL, OpenTimelineIO, Final Cut Pro 7 XML, FCPXML or AAF file (Media Composer and Pro "
         "Tools sequences: picture and sound tracks, clips followed to their files, dissolves, audio gain, markers; media "
-        "found by path, else beside the file).",
+        "found by path, else beside the file), or an IMF package (its folder, asset map or a composition playlist: the "
+        "pictures, each sound track by language and kind with the first programme heard, the timed text as caption "
+        "tracks; a supplemental's track files found in the packages beside it).",
         R"json({"type":"object","properties":{"input":{"type":"string"},"project":{"type":"string","description":"The .montage file to write"},
             "fps":{"type":"number","description":"Frame rate for an EDL (default 30)"}},"required":["input","project"]})json",
         false, [](const QJsonObject& a) {
             std::string in = absolute(need(a, "input")).toStdString();
+            const MediaProber prober = [](const std::string& file, MediaItem& m) { return probeMedia(file, m, nullptr); };
+            if (isImfPackage(in)) {
+                Loaded l;
+                l.path = absolute(need(a, "project"));
+                const ImportResult r = importImf(l.project, in, prober);
+                if (!r.ok) return fail(QString::fromStdString(r.error));
+                save(l);
+                QString note = QStringLiteral("Opened the IMF composition as %1 in %2").arg(QString::fromStdString(l.seq().name), l.path);
+                for (const auto& o : r.offline) note += "\nOffline: " + QString::fromStdString(o);
+                for (const auto& w : r.warnings) note += "\nWarning: " + QString::fromStdString(w);
+                return ok(note, projectJson(l.project));
+            }
             if (std::filesystem::is_directory(in)) in += "/Info.fcpxml";
             std::ifstream f(in, std::ios::binary);
             if (!f) return fail(QStringLiteral("Cannot read %1").arg(QString::fromStdString(in)));
@@ -9207,7 +9264,6 @@ void McpServer::Impl::addTools() {
             Loaded l;
             l.path = absolute(need(a, "project"));
             l.project.name = std::filesystem::path(in).stem().string();
-            const MediaProber prober = [](const std::string& file, MediaItem& m) { return probeMedia(file, m, nullptr); };
             const double fps = a.value("fps").toDouble(30);
             const Rational rate = std::fabs(fps - std::round(fps)) < 1e-6 ? Rational{int(std::lround(fps)), 1} : Rational{int(std::lround(fps * 1001)), 1001};
             const ImportResult r = ext == ".aaf" ? importAaf(l.project, in, prober)

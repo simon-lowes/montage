@@ -5,6 +5,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QLockFile>
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QSaveFile>
@@ -18,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
@@ -433,8 +435,23 @@ bool signerCertificateChain(CertificateChain& out, std::string* error, const std
     };
     const QDir dir(QString::fromStdString(folderPath.empty() ? signerFolder() : folderPath));
     const char* files[] = {"root.pem", "intermediate.pem", "leaf.pem", "leaf.key"};
-    int present = 0;
-    for (const char* name : files) present += QFileInfo::exists(dir.filePath(QString::fromLatin1(name))) ? 1 : 0;
+    auto count = [&] {
+        int n = 0;
+        for (const char* name : files) n += QFileInfo::exists(dir.filePath(QString::fromLatin1(name))) ? 1 : 0;
+        return n;
+    };
+    int present = count();
+    // (and two programs at once, the app and the command-line tool sharing the folder: a lock file in it while one
+    // is made, and another look once it is held)
+    std::optional<QLockFile> others;
+    if (present != 4 && QDir().mkpath(dir.path())) {
+        others.emplace(dir.filePath(QStringLiteral(".chain.lock")));
+        others->setStaleLockTime(120000);
+        if (others->tryLock(60000)) present = count();
+        else if (others->error() == QLockFile::LockFailedError)
+            return fail("Another program is making the DCP signing chain in " + dir.path().toStdString() + ": try again");
+        // (a folder it cannot lock in: said below, as the chain is incomplete or cannot be written there)
+    }
     if (present == 4) {
         CertificateChain chain;
         for (const char* name : files) {

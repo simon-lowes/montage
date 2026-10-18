@@ -143,6 +143,7 @@
 #include "SequenceSettingsDialog.h"
 #include "media/Vector.h"
 #include "SurroundPanner.h"
+#include "audio/DialogueAlign.h"
 #include "audio/Plugins.h"
 #include "MainWindow.h"
 #include "media/Beats.h"
@@ -6917,6 +6918,50 @@ private slots:
         QVERIFY(!r.value("structuredContent").toObject().value("ok").toBool());
         QVERIFY(call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-imf")}, {"colour", "sepia"}})
                     .value("isError").toBool());
+        // A supplemental over MCP with a German version added: no new pictures, the German sound only.
+        r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-versions")}, {"title", "Original"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-versions")}, {"title", "German"},
+                                        {"supplement_of", r.value("structuredContent").toObject().value("folder").toString()},
+                                        {"sounds", QJsonArray{QJsonObject{{"language", "en"}}, QJsonObject{{"language", "de"}, {"kind", "PRM"}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject supp = r.value("structuredContent").toObject();
+        QVERIFY2(supp.value("supplemental").toBool() && supp.value("coded_frames").toInt() == 0 && supp.value("new_samples").toInt() == 48000 &&
+                     supp.value("sounds").toInt() == 2 && supp.value("problems").toArray().isEmpty(),
+                 QJsonDocument(supp).toJson().constData());
+        // Opened from the File menu's import as a sequence: English heard, German muted.
+        QVERIFY(win_->findChild<QAction*>("importImf"));
+        const size_t before = state()->project().sequences.size();
+        win_->importTimelineFrom(supp.value("folder").toString());
+        QCOMPARE(state()->project().sequences.size(), before + 1);
+        const Sequence* opened = state()->sequence();
+        QVERIFY(opened && opened->duration() == 25 && opened->audioTracks.size() == 2 && opened->audioTracks[1].muted);
+        // The dialog offers the sound versions, the caption tracks and the supplemental's choices.
+        QVERIFY(state()->edit("Subtitles", [&](Project& p, Sequence& s) {
+            CaptionTrack t;
+            t.id = p.newId();
+            t.name = "English";
+            t.language = "en";
+            s.captionTracks.push_back(t);
+            return true;
+        }));
+        bool offered = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+            if (!dlg || dlg->objectName() != QLatin1String("exportImfDialog")) return;
+            auto* sounds = dlg->findChild<QTableWidget*>("imfSounds");
+            auto* texts = dlg->findChild<QTableWidget*>("imfTexts");
+            auto* supplemental = dlg->findChild<QCheckBox*>("imfSupplemental");
+            auto* earlier = dlg->findChild<QLineEdit*>("imfEarlier");
+            auto* originalSeq = dlg->findChild<QComboBox*>("imfOriginal");
+            offered = sounds && sounds->rowCount() == 1 && sounds->item(0, 0)->text() == "en" && texts && texts->rowCount() == 1 && supplemental &&
+                      !supplemental->isChecked() && earlier && !earlier->isEnabled() && originalSeq && originalSeq->count() >= 2;
+            if (supplemental) supplemental->setChecked(true);
+            offered = offered && earlier->isEnabled() && !dlg->findChild<QComboBox*>("imfSize")->isEnabled();
+            dlg->reject();
+        });
+        win_->exportImfDialog();
+        QVERIFY(offered);
         state()->newProject();
     }
 
@@ -9389,6 +9434,23 @@ const auto seq = [this] { return state()->sequence(); };
         QTRY_COMPARE(takes->count(), 5);
         panel->pickTake(0);
         QCOMPARE(edit::clipById(*state()->sequence(), clip)->take, 0);
+        // A take that says the guide's line is aligned to it: the alignment added to the clip as it is then, its
+        // other effects kept.
+        QVERIFY(state()->apply("Say the line", [&](Project& p, Sequence& s) {
+            Clip* t = edit::clipById(s, clip);
+            t->mediaId = speech.front(), t->sourceIn = 0;
+            Effect kept;
+            kept.id = p.newId();
+            kept.type = "denoise";
+            t->effects = {kept};
+            return edit::Result{};
+        }));
+        QVERIFY(panel->alignToGuide());
+        {
+            const Clip* t = edit::clipById(*state()->sequence(), clip);
+            QVERIFY(t->effects.size() == 2 && t->effects[0].type == "denoise" && t->effects[1].type == "dialogue_align" &&
+                    dialogueAlignmentApplies(t->effects[1], *t));
+        }
 
         // The cue sheet, out and back in.
         const QString sheet = dir_.path() + "/cues.csv";
