@@ -7769,7 +7769,7 @@ void McpServer::Impl::addTools() {
             "captions":{"type":"boolean","default":true,"description":"Caption tracks as IMSC 1.1 timed text"},
             "texts":{"type":"array","description":"Which caption tracks, and as what (default: all as subtitles)","items":{"type":"object","properties":{
                 "track":{"type":"string","description":"The caption track's name"},"kind":{"type":"string","enum":["subtitles","captions","forced"],"default":"subtitles"}},"required":["track"]}},
-            "supplement_of":{"type":"string","description":"An earlier IMF package's folder: make a supplemental package of it"},
+            "supplement_of":{"type":"string","description":"An earlier IMF package's folder: make a supplemental package of it (beside it: `folder` must be the folder holding it)"},
             "original_sequence":{"type":"string","description":"Supplemental: the sequence the earlier package was mastered from (default: the picture has not changed)"}},
             "required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {

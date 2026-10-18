@@ -246,6 +246,40 @@ std::vector<TimelineChange> compareSequences(const Project& pBefore, const Seque
     return kept;
 }
 
+namespace {
+
+// Whether two clips show the same picture where they show the same moment: everything the renderer reads but where
+// they sit and what they cover (and what is only heard or only labels them).
+bool samePicture(const Clip& a, const Clip& b) {
+    Clip x = a, y = b;
+    for (Clip* c : {&x, &y}) {
+        c->id = 0, c->start = 0, c->duration = 1, c->sourceIn = 0, c->linkGroup = 0, c->colorLabel = 0;
+        c->name.clear(), c->role.clear(), c->unrendered.clear(), c->markers.clear(), c->takes.clear(), c->take = 0;
+        c->gradeVersions.clear(), c->gradeVersion = 0, c->audio = Effect(), c->audioAngle = -1, c->channels.clear();
+    }
+    return x == y;
+}
+
+bool varies(const Effect& e) {
+    for (const auto& [name, p] : e.params)
+        if (p.varies()) return true;
+    return false;
+}
+
+// Whether a clip's picture changes with its own time (keys, expressions, animation presets): then a frame is the same
+// only at the same clip time.
+bool animated(const Clip& c) {
+    if (!c.animIn.type.empty() || !c.animOut.type.empty() || !c.animLoop.type.empty()) return true;
+    if (varies(c.motion) || varies(c.timing) || varies(c.generator)) return true;
+    for (const Effect& e : c.effects)
+        if (varies(e)) return true;
+    for (const auto& [id, e] : c.trims)
+        if (varies(e)) return true;
+    return false;
+}
+
+}  // namespace
+
 std::vector<FrameTime> samePictureFrames(const Project& p, const Sequence& before, const Sequence& after, FrameTime from,
                                          FrameTime count) {
     std::vector<FrameTime> out(size_t(std::max<FrameTime>(0, count)), -1);
@@ -271,8 +305,8 @@ std::vector<FrameTime> samePictureFrames(const Project& p, const Sequence& befor
         }
         return true;
     };
-    auto animated = [](const Clip& c) { return !c.animIn.type.empty() || !c.animOut.type.empty() || !c.animLoop.type.empty(); };
     std::vector<const Clip*> now, then;
+    std::vector<signed char> kept(B.size(), -1);  // whether each matched clip shows what its match did (-1: not yet known)
     for (FrameTime k = 0; k < count; ++k) {
         const FrameTime t = from + k;
         if (!layers(after, t, now)) continue;
@@ -287,7 +321,12 @@ std::vector<FrameTime> samePictureFrames(const Project& p, const Sequence& befor
             }
             const Entry& a = A[size_t(match[bi])];
             const Clip& o = *a.clip;
-            if (a.track != B[bi].track || !otherChanges(o, *c).empty() || o.angle != c->angle || o.layer != c->layer) {
+            if (kept[bi] < 0) {
+                // (a nested or multicam sequence may have changed inside since: its pictures are coded afresh)
+                const MediaItem* m = c->isGenerator() ? nullptr : p.findMedia(c->mediaId);
+                kept[bi] = a.track == B[bi].track && samePicture(o, *c) && !(m && m->kind == MediaKind::Sequence);
+            }
+            if (!kept[bi]) {
                 same = false;
                 break;
             }

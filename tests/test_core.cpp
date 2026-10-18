@@ -7766,6 +7766,21 @@ private slots:
         clipById(cut, b)->animIn.type = "fade";
         same = samePictureFrames(fx.p, old, cut, 0, 100);
         QVERIFY(same[20] == 10 && same[50] == -1 && same[74] == -1);
+        clipById(cut, b)->animIn = {};
+        // A new role or label changes no picture; a graphic's text, a grade, or keyed motion on a trimmed clip does.
+        Clip* na = &cut.videoTracks[0].clips[1];
+        na->role = "Dialogue", na->colorLabel = 3;
+        QCOMPARE(samePictureFrames(fx.p, old, cut, 0, 100)[20], FrameTime(10));
+        na->fields["title"] = "Fixed typo";
+        QCOMPARE(samePictureFrames(fx.p, old, cut, 0, 100)[20], FrameTime(-1));
+        na->fields.clear();
+        na->grade.nodes.emplace_back();
+        QCOMPARE(samePictureFrames(fx.p, old, cut, 0, 100)[20], FrameTime(-1));
+        na->grade = {};
+        clipById(cut, b)->motion.params["opacity"].addKey(0, 1);
+        clipById(cut, b)->motion.params["opacity"].addKey(10, 0.5);
+        same = samePictureFrames(fx.p, old, cut, 0, 100);
+        QVERIFY(same[20] == 10 && same[60] == -1);
         cut.width = 1280;
         same = samePictureFrames(fx.p, old, cut, 0, 100);
         QVERIFY(std::all_of(same.begin(), same.end(), [](FrameTime t) { return t == -1; }));

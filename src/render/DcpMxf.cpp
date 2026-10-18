@@ -2021,7 +2021,7 @@ std::vector<uint8_t> ImfTimedTextWriter::indexSegments() const { return vbrIndex
 
 // ---- Reading IMF track files --------------------------------------------------------------------------------------
 
-bool ImfTrackReader::open(const std::string& path, std::string* error) {
+bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfPictureOnly) {
     auto fail = [&](const std::string& why) {
         if (error) *error = why;
         return false;
@@ -2029,7 +2029,7 @@ bool ImfTrackReader::open(const std::string& path, std::string* error) {
     path_ = path;
     kind_ = Kind::Unknown;
     asset_ = {};
-    channels_ = 0;
+    channels_ = width_ = height_ = 0;
     rate_ = {};
     op1a_ = rgba_ = j2k_ = false;
     elements_.clear();
@@ -2047,7 +2047,11 @@ bool ImfTrackReader::open(const std::string& path, std::string* error) {
         static const uint8_t essence[12] = {0x06, 0x0e, 0x2b, 0x34, 0x01, 0x02, 0x01, 0x01, 0x0d, 0x01, 0x03, 0x01};
         static const uint8_t set[6] = {0x06, 0x0e, 0x2b, 0x34, 0x02, 0x53};
         if (std::memcmp(key, essence, 12) == 0) {
+            // (past the header: what it said is all there is)
+            if (imfPictureOnly && !(op1a_ && rgba_ && j2k_)) return fail(path + " is not an IMF picture track file");
             if (key[12] == 0x15) {
+                // (a frame a few bytes long, by the million: a damaged or hostile file, not pictures)
+                if (elements_.size() >= (size_t(1) << 24)) return fail(path + " has too many frames");
                 elements_.emplace_back(value, length);
             } else if (key[12] == 0x16 || key[12] == 0x17) {
                 if (clipSize_ || sound || text) return fail(path + " is not clip-wrapped");
@@ -2071,6 +2075,18 @@ bool ImfTrackReader::open(const std::string& path, std::string* error) {
             } else {
                 if (auto c = it.find(0x3d07); c != it.end() && key[14] == 0x48) channels_ = int(beOf(c->second));
                 if (key[14] == 0x29) rgba_ = true;
+                if (key[14] == 0x29 || key[14] == 0x28) {
+                    auto size = [&](uint16_t tag) {
+                        const auto x = it.find(tag);
+                        return x != it.end() && x->second.size() == 4 ? int(std::min<uint64_t>(beOf(x->second), 65536)) : 0;
+                    };
+                    width_ = size(0x3203), height_ = size(0x3202);
+                }
+                // Sound Montage reads: 24-bit PCM at 48 or 96 kHz.
+                if (key[14] == 0x48) {
+                    if (auto q = it.find(0x3d01); q != it.end() && q->second.size() == 4 && beOf(q->second) != 24)
+                        return fail(path + " is not 24-bit sound");
+                }
                 // (the essence container: the JPEG 2000 mapping, 06.0e.2b.34.04.01.01.xx.0d.01.03.01.02.0c)
                 if (auto ec = it.find(0x3004); ec != it.end() && ec->second.size() == 16 && (key[14] == 0x29 || key[14] == 0x28))
                     j2k_ = ec->second[8] == 0x0d && ec->second[9] == 0x01 && ec->second[10] == 0x03 && ec->second[11] == 0x01 &&
@@ -2081,11 +2097,20 @@ bool ImfTrackReader::open(const std::string& path, std::string* error) {
         }
         at = value + length;
     }
+    // (an edit rate a frame count can be turned into a time with)
+    if (!text && (rate_.num == 0 || rate_.den == 0 || rate_.value() < 1 || rate_.value() > 192000))
+        return fail(path + " has no edit rate Montage reads");
     if (!elements_.empty() && !sound && !text) kind_ = Kind::Picture;
     else if (sound && elements_.empty() && channels_ > 0 && channels_ <= 64) kind_ = Kind::Sound;
     else if (text && elements_.empty()) kind_ = Kind::TimedText;
     else return fail(path + " is not an IMF track file Montage reads");
     return true;
+}
+
+uint64_t ImfTrackReader::largestFrame() const {
+    uint64_t most = 0;
+    for (const auto& e : elements_) most = std::max(most, e.second);
+    return most;
 }
 
 bool ImfTrackReader::frame(int64_t index, std::vector<uint8_t>& out, std::string* error) const {
@@ -2110,7 +2135,7 @@ bool ImfTrackReader::frame(int64_t index, std::vector<uint8_t>& out, std::string
 bool ImfTrackReader::pcm(int64_t first, int64_t count, std::vector<int32_t>& out, std::string* error) const {
     const uint64_t frame = 3 * uint64_t(std::max(1, channels_));
     File file;
-    if (kind_ != Kind::Sound || first < 0 || count < 0 || first + count > samples() || !openRead(file, path_) ||
+    if (kind_ != Kind::Sound || first < 0 || count < 0 || first > samples() || count > samples() - first || !openRead(file, path_) ||
         !file.seek(clipAt_ + uint64_t(first) * frame)) {
         if (error) *error = "Cannot read the sound of " + path_;
         return false;

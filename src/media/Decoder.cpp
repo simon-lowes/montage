@@ -20,7 +20,9 @@
 #include <numeric>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <map>
+#include <mutex>
 #include <thread>
 
 extern "C" {
@@ -710,6 +712,51 @@ void VideoDecoder::close() {
     viewId_ = -1;
 }
 
+namespace {
+
+// An IMF picture track file, read once per file (decoders open it again and again: the media pool, thumbnails), with
+// its picture size; nullptr for any other MXF.
+std::shared_ptr<const dcp::ImfTrackReader> imfPicture(const std::string& file, int& w, int& h) {
+    struct Known {
+        std::shared_ptr<const dcp::ImfTrackReader> reader;
+        int w = 0, h = 0;
+    };
+    static std::mutex lock;
+    static std::map<std::string, Known> known;
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(file, ec);
+    if (ec) return nullptr;
+    const auto when = std::filesystem::last_write_time(file, ec);
+    if (ec) return nullptr;
+    const std::string key = file + '|' + std::to_string(size) + '|' + std::to_string(when.time_since_epoch().count());
+    {
+        std::lock_guard<std::mutex> g(lock);
+        if (auto it = known.find(key); it != known.end()) {
+            w = it->second.w, h = it->second.h;
+            return it->second.reader;
+        }
+    }
+    Known k;
+    auto reader = std::make_shared<dcp::ImfTrackReader>();
+    if (reader->open(file, nullptr, true) && reader->imfRgbJpeg2000()) {
+        k.w = reader->width(), k.h = reader->height();
+        std::vector<uint8_t> cs;
+        std::vector<uint16_t> rgb;
+        int components = 0, bits = 0;
+        // (the size from the first picture when the descriptor does not give it)
+        if ((k.w > 0 && k.h > 0) ||
+            (reader->frame(0, cs) && decodeJpeg2000(cs.data(), cs.size(), rgb, k.w, k.h, components, bits) && components == 3))
+            k.reader = std::move(reader);
+    }
+    std::lock_guard<std::mutex> g(lock);
+    if (known.size() > 256) known.clear();
+    known[key] = k;
+    w = k.w, h = k.h;
+    return k.reader;
+}
+
+}  // namespace
+
 bool VideoDecoder::open(const std::string& path, std::string* error) {
     close();
     path_ = path;
@@ -797,12 +844,8 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
     std::string ext = file.size() >= 4 ? file.substr(file.size() - 4) : std::string();
     for (char& ch : ext) ch = char(std::tolower(static_cast<unsigned char>(ch)));
     if (ext == ".mxf" && openJpegAvailable()) {
-        auto reader = std::make_unique<dcp::ImfTrackReader>();
-        std::vector<uint8_t> cs;
-        std::vector<uint16_t> rgb;
-        int w = 0, h = 0, components = 0, bits = 0;
-        if (reader->open(file) && reader->imfRgbJpeg2000() && reader->frame(0, cs) &&
-            decodeJpeg2000(cs.data(), cs.size(), rgb, w, h, components, bits) && components == 3) {
+        int w = 0, h = 0;
+        if (std::shared_ptr<const dcp::ImfTrackReader> reader = imfPicture(file, w, h)) {
             imf_ = std::move(reader);
             rawFrame_ = -1;
             dispW_ = std::max(1, int(std::lround(w * (par_ > 0 ? par_ : 1.0))));
@@ -1339,7 +1382,8 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
     }
     if (imf_) {
         // The frame shown at `t`, decoded once and kept while it is asked for again, its codes scaled to 16 bits.
-        const int n = std::clamp(int(std::floor(std::max(0.0, t) * timeScale_ * fps_ + 1e-6)), 0, int(std::max<int64_t>(0, imf_->frames() - 1)));
+        const int64_t n = std::clamp(int64_t(std::floor(std::min(std::max(0.0, t) * timeScale_ * fps_ + 1e-6, 1e15))), int64_t(0),
+                                     std::max<int64_t>(0, imf_->frames() - 1));
         if (targetW <= 0) targetW = dispW_;
         if (targetH <= 0) targetH = dispH_;
         if (n != rawFrame_ || !raw_) {

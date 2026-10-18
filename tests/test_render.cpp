@@ -5759,6 +5759,73 @@ colorspaces:
         QVERIFY(!exportImf(p, now, sup, dir.path().toStdString(), nullptr, {}, &err) && err.find("mastered from") != std::string::npos);
     }
 
+    void exportsImfSupplementalAt2997() {
+        if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
+        // A lossy 29.97 master of 7 frames (padded to 10, so the sound fills whole frames), then a supplemental with
+        // the second shot regraded and a German version: only that shot's pictures are new, at the original's rate.
+        QTemporaryDir dir;
+        Project p = makeDefaultProject();
+        p.sequences.reserve(3);
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = Rational{30000, 1001};
+        s.videoTracks[0].clips = {colorClip(p, 0.8f, 0.1f, 0.1f, 0, 4), colorClip(p, 0.1f, 0.6f, 0.1f, 4, 3)};
+        Sequence master = s;
+        master.id = p.newId();
+        master.name = "Master";
+        p.sequences.push_back(master);
+        Sequence& now = *p.active();
+        ImfSettings st;
+        st.title = "Drop";
+        st.threads = 2;
+        st.lossless = false;
+        st.megabitsPerSecond = 100;
+        ImfResult r1, r2;
+        std::string err;
+        QVERIFY2(exportImf(p, now, st, dir.path().toStdString(), &r1, {}, &err), err.c_str());
+        QVERIFY(r1.frames == 10 && r1.rateNum == 30000 && r1.rateDen == 1001);
+        now.videoTracks[0].clips[1].generator.params["color.g"] = 0.7;
+        ImfSettings sup = st;
+        sup.megabitsPerSecond = 800;  // (ignored: the earlier pictures' rate is kept)
+        sup.supplementOf = r1.folder;
+        sup.originalSequence = master.id;
+        sup.sounds = {{"en", "PRM", {}}, {"de", "PRM", {}}};
+        QVERIFY2(exportImf(p, now, sup, dir.path().toStdString(), &r2, {}, &err), err.c_str());
+        QCOMPARE(r2.codedFrames, int64_t(3));
+        QCOMPARE(r2.newSamples, int64_t(16016));  // the German version's 10 frames; English is the original's
+        std::vector<std::string> issues = verifyImf(r2.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        QStringList photon = photonErrors(QString::fromStdString(r2.folder));
+        QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+        dcp::ImfTrackReader before, after;
+        const QDir out1(QString::fromStdString(r1.folder)), out2(QString::fromStdString(r2.folder));
+        QVERIFY(before.open(out1.filePath(out1.entryList({"VIDEO_*.mxf"})[0]).toStdString()));
+        QVERIFY(after.open(out2.filePath(out2.entryList({"VIDEO_*.mxf"})[0]).toStdString()));
+        QVERIFY(after.frames() == 3 && after.largestFrame() <= before.largestFrame());
+        // A second supplemental the same day gets a folder of its own; one made elsewhere is refused.
+        ImfResult r3;
+        QVERIFY2(exportImf(p, now, sup, dir.path().toStdString(), &r3, {}, &err), err.c_str());
+        QVERIFY(QFileInfo(QString::fromStdString(r3.folder)).fileName().endsWith("_2"));
+        QDir(dir.path()).mkdir("elsewhere");
+        QVERIFY(!exportImf(p, now, sup, dir.filePath("elsewhere").toStdString(), nullptr, {}, &err) && err.find("beside") != std::string::npos);
+        // A composition from elsewhere that would repeat a resource for ever is refused, not opened.
+        {
+            QFile f(QString::fromStdString(r1.cpl));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QByteArray cpl = f.readAll();
+            const qsizetype at = cpl.indexOf("<SourceDuration>");
+            QVERIFY(at > 0);
+            cpl.insert(at, "<RepeatCount>1000000000000</RepeatCount>");
+            QFile g(dir.filePath("hostile.xml"));
+            QVERIFY(g.open(QIODevice::WriteOnly) && g.write(cpl) == cpl.size());
+            g.close();
+            ImfComposition c;
+            QVERIFY(!readImfComposition(g.fileName().toStdString(), c, &err) && err.find("does not make sense") != std::string::npos);
+        }
+        // A role no clip has is refused (it would leave the version silent).
+        sup.sounds = {{"de", "PRM", {"Dialog"}}};
+        QVERIFY(!exportImf(p, now, sup, dir.path().toStdString(), nullptr, {}, &err) && err.find("Dialog") != std::string::npos);
+    }
+
     void exportsDigitalCinemaPackage() {
         QTemporaryDir dir;
         // A second of a mid-grey matte (Rec.709, 16:9) with a 1 kHz tone, as a 2K Scope DCP.

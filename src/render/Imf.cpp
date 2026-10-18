@@ -395,6 +395,12 @@ QString textSequence(const std::string& kind) {
     return {};
 }
 
+// Whether a virtual track kind is timed text (the three Montage writes and the others ST 2067-2 has).
+bool isTextSequence(const QString& kind) {
+    return kind == "SubtitlesSequence" || kind == "HearingImpairedCaptionsSequence" || kind == "ForcedNarrativeSequence" ||
+           kind == "VisuallyImpairedTextSequence" || kind == "CommentarySequence" || kind == "KaraokeSequence";
+}
+
 // The first sample of frame `frame` at 48 kHz.
 int64_t sampleAt(int64_t frame, dcp::EditRate r) { return frame * 48000 * int64_t(r.den) / int64_t(r.num); }
 
@@ -413,16 +419,23 @@ void addRun(std::vector<Run>& runs, bool old, int64_t at, int64_t n) {
 std::vector<ImfResource> slice(const ImfVirtualTrack& t, int64_t at, int64_t n) {
     std::vector<ImfResource> out;
     int64_t pos = 0;
-    for (const ImfResource& r : t.resources)
-        for (int64_t k = 0; k < std::max<int64_t>(1, r.repeat); ++k, pos += r.duration) {
-            const int64_t a = std::max(at, pos), b = std::min(at + n, pos + r.duration);
+    for (const ImfResource& r : t.resources) {
+        const int64_t repeat = std::max<int64_t>(1, r.repeat);
+        if (r.duration <= 0) continue;
+        // (only the repeats that fall in the stretch)
+        int64_t k = at > pos ? (at - pos) / r.duration : 0;
+        for (int64_t start = pos + k * r.duration; k < repeat && start < at + n; ++k, start += r.duration) {
+            const int64_t a = std::max(at, start), b = std::min(at + n, start + r.duration);
             if (a >= b) continue;
             ImfResource c = r;
-            c.entry = r.entry + (a - pos);
+            c.entry = r.entry + (a - start);
             c.duration = b - a;
             c.repeat = 1;
             out.push_back(c);
         }
+        pos += r.duration * repeat;
+        if (pos >= at + n) break;
+    }
     return out;
 }
 
@@ -453,31 +466,44 @@ public:
     ComposedPcm(const ImfVirtualTrack& t, TrackFiles& files) : t_(t), files_(files), length_(t.length()) {}
     // `n` sample frames from the composition's sample `at` (interleaved), or nullptr past the end or when a file
     // cannot be read.
+    // Two windows, so that trying two offsets in turn (the one used last and the one the picture moved by) does not
+    // read the same stretch again and again.
     const int32_t* read(int64_t at, int64_t n) {
-        if (at < 0 || n < 0 || at + n > length_ || t_.channels <= 0) return nullptr;
-        if (at < from_ || at + n > from_ + have_) {
-            from_ = at;
-            have_ = std::min<int64_t>(std::max<int64_t>(n, 480000), length_ - at);
-            window_.resize(size_t(have_ * t_.channels));
-            int64_t put = 0;
-            for (const ImfResource& r : slice(t_, from_, have_)) {
-                const dcp::ImfTrackReader* f = files_.get(r.trackFile);
-                if (!f || f->channels() != t_.channels || !f->pcm(r.entry, r.duration, part_)) {
-                    have_ = 0;
-                    return nullptr;
-                }
-                std::copy(part_.begin(), part_.end(), window_.begin() + ptrdiff_t(put * t_.channels));
-                put += r.duration;
+        if (at < 0 || n < 0 || at > length_ - n || t_.channels <= 0) return nullptr;
+        ++clock_;
+        for (Window& w : windows_)
+            if (at >= w.from && at + n <= w.from + w.have) {
+                w.used = clock_;
+                return w.samples.data() + (at - w.from) * t_.channels;
             }
+        Window& w = windows_[0].used <= windows_[1].used ? windows_[0] : windows_[1];
+        w.used = clock_;
+        w.from = at;
+        w.have = std::min<int64_t>(std::max<int64_t>(n, 480000), length_ - at);
+        w.samples.resize(size_t(w.have * t_.channels));
+        int64_t put = 0;
+        for (const ImfResource& r : slice(t_, w.from, w.have)) {
+            const dcp::ImfTrackReader* f = files_.get(r.trackFile);
+            if (!f || f->channels() != t_.channels || !f->pcm(r.entry, r.duration, part_)) {
+                w.have = 0;
+                return nullptr;
+            }
+            std::copy(part_.begin(), part_.end(), w.samples.begin() + ptrdiff_t(put * t_.channels));
+            put += r.duration;
         }
-        return window_.data() + (at - from_) * t_.channels;
+        return w.samples.data();
     }
 
 private:
+    struct Window {
+        int64_t from = 0, have = 0, used = 0;
+        std::vector<int32_t> samples;
+    };
     const ImfVirtualTrack& t_;
     TrackFiles& files_;
-    int64_t length_ = 0, from_ = 0, have_ = 0;
-    std::vector<int32_t> window_, part_;
+    int64_t length_ = 0, clock_ = 0;
+    Window windows_[2];
+    std::vector<int32_t> part_;
 };
 
 // The earlier composition's picture `m`, decoded.
@@ -555,6 +581,10 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         if (!oldPicture || old.width <= 0 || old.height <= 0 || (old.bits != 10 && old.bits != 12) || !old.rsiz || old.colour.empty())
             return fail("The earlier package's picture is not one Montage makes supplementals of");
         oldPaths = imfTrackFiles(settings.supplementOf);
+        // (its composition plays the earlier package's files from the folder beside it)
+        const QString earlierParent = QFileInfo(QDir(QString::fromStdString(settings.supplementOf)).absolutePath()).absolutePath();
+        if (QFileInfo(earlierParent).canonicalFilePath() != QFileInfo(QString::fromStdString(parent)).canonicalFilePath())
+            return fail("A supplemental package goes beside the earlier one: make it in " + earlierParent.toStdString());
     }
     TrackFiles oldFiles(oldPaths);
     int W = 0, H = 0;
@@ -575,7 +605,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
     if (bits != 10 && bits != 12) return fail("IMF pictures here are 10 or 12 bits");
     const bool htj2k = supplemental ? old.rsiz == kHtj2kRsiz : settings.htj2k;
     const bool lossless = supplemental ? htj2k || (old.rsiz & 0xff00) >= 0x0700 : settings.lossless;
-    if (!lossless && !(settings.megabitsPerSecond >= 20)) return fail("A lossy master needs at least 20 Mbit/s");
+    if (!lossless && !supplemental && !(settings.megabitsPerSecond >= 20)) return fail("A lossy master needs at least 20 Mbit/s");
     if (htj2k && !lossless) return fail("HTJ2K masters here are lossless");
     if (htj2k && !htj2kAvailable()) return fail("This build of Montage has no HTJ2K encoder");
     const dcp::EditRate rate{uint32_t(canonical.num), uint32_t(canonical.den)};  // as written, not as the sequence stores it
@@ -599,7 +629,15 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
     imfPictureCoding(rsiz, coding);
     if (std::all_of(std::begin(coding), std::end(coding), [](uint8_t b) { return b == 0; }))
         return fail("No JPEG 2000 IMF profile takes that picture at that bit rate");
-    const size_t maxBytes = lossless ? 0 : size_t(settings.megabitsPerSecond * 1e6 / 8 / fps);
+    size_t maxBytes = lossless ? 0 : size_t(settings.megabitsPerSecond * 1e6 / 8 / fps);
+    // A lossy supplemental's new pictures at the earlier ones' rate: no larger than its largest (within its level).
+    if (supplemental && !lossless) {
+        size_t most = 0;
+        for (const ImfResource& r : oldPicture->resources)
+            if (const dcp::ImfTrackReader* f = oldFiles.get(r.trackFile)) most = std::max(most, size_t(f->largestFrame()));
+        if (!most) return fail("The earlier package's pictures are neither in it nor in the packages beside it");
+        maxBytes = most;
+    }
     // Immersive mixes fold their heights down; an ambisonic field is heard through two virtual cardioids (stereo).
     const int seqChannels = ambisonicLayout(s.audioLayout) ? 2 : layoutChannels(earLevelLayout(s.audioLayout));
     const int channels = seqChannels == 8 ? 8 : seqChannels == 6 ? 6 : 2;
@@ -613,6 +651,10 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         if (v.kind != "PRM" && v.kind != "ME" && v.kind != "DV") return fail("A sound version is PRM, ME or DV, not " + v.kind);
         for (size_t j = 0; j < i; ++j)
             if (sounds[j].language == v.language && sounds[j].kind == v.kind) return fail("Two sound versions are " + v.kind + " in " + v.language);
+        // (a role mistyped would leave the version silent but for the clips without one)
+        const std::vector<std::string> roles = edit::sequenceRoles(s);
+        for (const std::string& r : v.roles)
+            if (std::find(roles.begin(), roles.end(), r) == roles.end()) return fail("No clip in the sequence has the role \"" + r + "\"");
     }
     struct TextPlan {
         const CaptionTrack* track = nullptr;
@@ -685,14 +727,17 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         }
         for (int64_t k = 0; k < programme; ++k)
             if (was[size_t(k)] >= oldFirst && was[size_t(k)] < oldEnd) same[size_t(k)] = was[size_t(k)] - oldFirst;
-        // The checks: each stretch's first and last frame, and one every ten seconds.
+        // The black after the programme (at 29.97 and 59.94): the earlier package's own, where it has as much.
+        for (int64_t k = programme; k < frames; ++k)
+            if (oldEnd - oldFirst + (k - programme) < oldFrames) same[size_t(k)] = oldEnd - oldFirst + (k - programme);
+        // The checks: each stretch's first and last frame, and one every second.
         std::vector<std::pair<int64_t, int64_t>> stretches;
         for (int64_t k = 0; k < frames; ++k) {
             if (same[size_t(k)] < 0) continue;
             if (!stretches.empty() && stretches.back().second == k && same[size_t(k)] == same[size_t(k - 1)] + 1) ++stretches.back().second;
             else stretches.push_back({k, k + 1});
         }
-        const int64_t every = std::max<int64_t>(1, std::llround(10 * fps));
+        const int64_t every = std::max<int64_t>(1, std::llround(fps));
         int64_t checked = 0, toCheck = 0;
         for (const auto& [a, b] : stretches) toCheck += 2 + (b - a) / every;
         for (const auto& [a, b] : stretches) {
@@ -708,10 +753,27 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
                 if (alike && lossless) {
                     for (size_t i = 0; i < mine.size() && alike; ++i) alike = std::abs(int(mine[i]) - int(theirs[i])) <= 1;
                 } else if (alike) {
-                    double sum = 0;
-                    for (size_t i = 0; i < mine.size(); ++i) sum += double(int(mine[i]) - int(theirs[i])) * double(int(mine[i]) - int(theirs[i]));
-                    const double mse = sum / double(mine.size());
-                    alike = mse <= 0 || 10 * std::log10(maxCode * maxCode / mse) >= 38;
+                    // Lossy: coding noise is small everywhere and averages out; a change (a grade, a word of a title)
+                    // moves the average or stands out in a block of the picture.
+                    double mean[3] = {0, 0, 0}, worst = 0;
+                    const int B = 32;
+                    for (int by = 0; by < H; by += B)
+                        for (int bx = 0; bx < W; bx += B) {
+                            double sum = 0;
+                            size_t n = 0;
+                            for (int y = by; y < std::min(H, by + B); ++y)
+                                for (int x = bx; x < std::min(W, bx + B); ++x)
+                                    for (int c = 0; c < 3; ++c, ++n) {
+                                        const size_t i = (size_t(y) * size_t(W) + size_t(x)) * 3 + size_t(c);
+                                        const double d = double(int(mine[i]) - int(theirs[i]));
+                                        sum += d * d;
+                                        mean[c] += d;
+                                    }
+                            worst = std::max(worst, sum / double(std::max<size_t>(1, n)));
+                        }
+                    const double pixels = double(W) * double(H);
+                    for (double m : mean) alike = alike && std::fabs(m / pixels) <= maxCode / 1000;
+                    alike = alike && (worst <= 0 || 10 * std::log10(maxCode * maxCode / worst) >= 30);
                 }
                 if (progress && !progress(0.05 * double(++checked) / double(std::max<int64_t>(1, toCheck)))) return fail("Stopped");
                 if (!alike) break;
@@ -723,9 +785,16 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
 
     // The folder.
     const QString title = QString::fromStdString(settings.title.empty() ? "Untitled" : settings.title);
-    const QString name = safeTitle(title.toStdString()) + (supplemental ? "_IMF_SUPP_" : "_IMF_") + QDate::currentDate().toString(QStringLiteral("yyyyMMdd"));
+    // (a second supplemental of the day gets a number: a chain can grow by several)
+    const QString stem = safeTitle(title.toStdString()) + (supplemental ? "_IMF_SUPP_" : "_IMF_") + QDate::currentDate().toString(QStringLiteral("yyyyMMdd"));
+    QString name = stem;
+    if (!supplemental && QFileInfo::exists(QDir(QString::fromStdString(parent)).filePath(name)))
+        return fail("There is already a folder called " + name.toStdString() + " there");
+    for (int n = 2; QFileInfo::exists(QDir(QString::fromStdString(parent)).filePath(name)); ++n) {
+        if (n > 99) return fail("There are already 99 folders called " + stem.toStdString() + " there");
+        name = stem + QStringLiteral("_%1").arg(n);
+    }
     const QString folder = QDir(QString::fromStdString(parent)).filePath(name);
-    if (QFileInfo::exists(folder)) return fail("There is already a folder called " + name.toStdString() + " there");
     if (!QDir().mkpath(folder)) return fail("Cannot make the folder " + folder.toStdString());
     bool finished = false;
     struct Cleanup {
@@ -777,7 +846,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         vt.editRate = QStringLiteral("48000 1");
         for (const ImfVirtualTrack& t : old.tracks)
             if (t.kind == "MainAudioSequence" && t.language == v.language && (t.contentKind.empty() ? "PRM" : t.contentKind) == v.kind &&
-                t.channels == channels)
+                t.channels == channels && !t.resources.empty() && t.resources.front().rateNum == 48000 && t.resources.front().rateDen == 1)
                 vt.old = &t;
         vt.trackId = trackIdFor(vt.old);
         std::optional<ComposedPcm> before;
@@ -868,6 +937,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
 
     // Timed text: each caption track's IMSC 1.1 document (times from the composition's start), unless the earlier
     // package has the same document in the same language and kind.
+    std::set<std::string> textTracksUsed;
     for (const TextPlan& plan : textPlans) {
         Virtual vt;
         vt.kind = textSequence(plan.kind);
@@ -879,14 +949,19 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
             if (c.end > c.start) captions.push_back(c);
         }
         const std::string xml = captionsToTtml(captions, s.fps, plan.track->language, plan.track->style);
-        for (const ImfVirtualTrack& t : old.tracks) {
-            if (QString::fromStdString(t.kind) != vt.kind || t.language != plan.track->language || t.length() != frames) continue;
-            const std::vector<ImfResource> all = slice(t, 0, frames);
+        // The earlier version of the same kind and language: its virtual track carried on (a corrected one too), its
+        // file played again when the document is the same.
+        const ImfVirtualTrack* was = nullptr;
+        for (const ImfVirtualTrack& t : old.tracks)
+            if (!was && QString::fromStdString(t.kind) == vt.kind && t.language == plan.track->language && !textTracksUsed.count(t.id)) was = &t;
+        if (was) {
+            textTracksUsed.insert(was->id);
+            const std::vector<ImfResource> all = was->length() == frames ? slice(*was, 0, frames) : std::vector<ImfResource>();
             const dcp::ImfTrackReader* f = all.size() == 1 ? oldFiles.get(all[0].trackFile) : nullptr;
             std::string theirs;
-            if (f && f->text(theirs) && theirs == xml) vt.old = &t;
+            if (f && f->text(theirs) && theirs == xml) vt.old = was;
         }
-        vt.trackId = trackIdFor(vt.old);
+        vt.trackId = trackIdFor(was);
         if (vt.old) {
             addRun(vt.runs, true, 0, frames);
         } else {
@@ -1043,6 +1118,8 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         }
         resources.push_back(std::move(list));
     }
+    // (the descriptors' places, by a mark no copied descriptor can hold)
+    const QString marker = QString::fromStdString(dcp::uuidString(dcp::newUuid()));
     auto writeXml = [&](const QString& file, const std::function<void(QXmlStreamWriter&)>& body) {
         QByteArray bytes;
         QXmlStreamWriter x(&bytes);
@@ -1054,7 +1131,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         if (x.hasError()) return false;
         // The descriptors, written in place of their markers.
         for (size_t i = 0; i < descriptors.size(); ++i)
-            bytes.replace(QStringLiteral("<!--montage-descriptor-%1-->").arg(i).toUtf8(), descriptors[i].second.toUtf8());
+            bytes.replace(QStringLiteral("<!--montage-descriptor-%1-%2-->").arg(marker).arg(i).toUtf8(), descriptors[i].second.toUtf8());
         QFile f(QDir(folder).filePath(file));
         return f.open(QIODevice::WriteOnly | QIODevice::Truncate) && f.write(bytes) == bytes.size() && f.flush();
     };
@@ -1095,7 +1172,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         for (size_t i = 0; i < descriptors.size(); ++i) {
             x.writeStartElement("EssenceDescriptor");
             x.writeTextElement("Id", descriptors[i].first);
-            x.writeComment(QStringLiteral("montage-descriptor-%1").arg(i));
+            x.writeComment(QStringLiteral("montage-descriptor-%1-%2").arg(marker).arg(i));
             x.writeEndElement();
         }
         x.writeEndElement();
@@ -1377,7 +1454,8 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
         for (const ImfVirtualTrack& t : comp.tracks) {
             const QString kind = QString::fromStdString(t.kind);
             const bool image = t.kind == "MainImageSequence", sound = t.kind == "MainAudioSequence";
-            const bool text = kind.endsWith("Sequence") && !image && !sound;
+            const bool text = isTextSequence(kind);
+            if (!image && !sound && !text) continue;  // (markers, and kinds other tools write that Montage does not read)
             // Every virtual track as long as the picture.
             if (picture && !t.resources.empty()) {
                 const ImfResource& r0 = t.resources.front();
@@ -1398,6 +1476,18 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
                 }
                 const QString name = inside ? assets[id].path : QFileInfo(QString::fromStdString(out->second)).fileName();
                 const std::string file = inside ? dir.filePath(assets[id].path).toStdString() : out->second;
+                // Another package's file: the one the composition names, by its hash.
+                if (!inside && !r.hash.empty()) {
+                    const QString hash = packageFileHash(QString::fromStdString(file), nullptr, reading);
+                    if (stopped) {
+                        issue("Stopped");
+                        return issues;
+                    }
+                    if (hash != QString::fromStdString(r.hash)) {
+                        issue(QStringLiteral("%1 (beside the package) does not match its hash in %2").arg(QString::fromStdString(file), c.path));
+                        continue;
+                    }
+                }
                 if (text || !inside) {
                     // Read as Montage reads track files (those of other packages without reading all their essence).
                     dcp::ImfTrackReader reader;
@@ -1554,7 +1644,8 @@ bool readImfComposition(const std::string& cplPath, ImfComposition& out, std::st
                     for (const QXmlStreamNamespaceDeclaration& n : scopes.back()) inScope.erase(n.prefix().toString());
                     inject.clear();
                     for (const auto& [prefix, uri] : inScope)
-                        inject += prefix.isEmpty() ? QStringLiteral(" xmlns=\"%1\"").arg(uri) : QStringLiteral(" xmlns:%1=\"%2\"").arg(prefix, uri);
+                        inject += prefix.isEmpty() ? QStringLiteral(" xmlns=\"%1\"").arg(uri.toHtmlEscaped())
+                                                   : QStringLiteral(" xmlns:%1=\"%2\"").arg(prefix, uri.toHtmlEscaped());
                 }
             } else if (d > 4 && descriptorStart >= 0) {
                 static const QStringList fields = {"StoredWidth", "StoredHeight", "Rsiz", "ComponentSize", "TransferCharacteristic", "ColorPrimaries",
@@ -1606,7 +1697,7 @@ bool readImfComposition(const std::string& cplPath, ImfComposition& out, std::st
                     if (name == "IntrinsicDuration") res.intrinsic = value.toLongLong();
                     if (name == "EntryPoint") res.entry = value.toLongLong();
                     if (name == "SourceDuration") res.duration = value.toLongLong();
-                    if (name == "RepeatCount") res.repeat = std::max<qlonglong>(1, value.toLongLong());
+                    if (name == "RepeatCount") res.repeat = value.toLongLong();
                     if (name == "SourceEncoding") res.encoding = packageBareId(value).toStdString();
                     if (name == "TrackFileId") res.trackFile = packageBareId(value).toStdString();
                     if (name == "Hash") res.hash = value.toStdString();
@@ -1631,10 +1722,18 @@ bool readImfComposition(const std::string& cplPath, ImfComposition& out, std::st
     }
     if (r.hasError()) return fail(cplPath + " does not read: " + r.errorString().toStdString());
     if (!out.rateNum || !out.rateDen) return fail(cplPath + " has no edit rate");
+    // (a package from anywhere: numbers that would play for ever, backwards or past what a track can hold refused)
+    constexpr int64_t kMaxUnits = int64_t(1) << 40;  // edit units in a virtual track: years of 96 kHz sound
+    int64_t plays = 0;                               // resources played, repeats counted (each opens as a clip)
     for (ImfVirtualTrack& t : out.tracks) {
+        int64_t length = 0;
         for (ImfResource& res : t.resources) {
             if (!res.rateNum || !res.rateDen) res.rateNum = out.rateNum, res.rateDen = out.rateDen;
             if (res.duration < 0) res.duration = std::max<int64_t>(0, res.intrinsic - res.entry);
+            if (res.entry < 0 || res.entry > kMaxUnits || res.duration > kMaxUnits || res.intrinsic > kMaxUnits || res.repeat < 1 ||
+                res.repeat > 100000 || res.duration * res.repeat > kMaxUnits - length || (plays += res.repeat) > 1000000)
+                return fail(cplPath + " has a resource that does not make sense (its entry point, duration or repeat count)");
+            length += res.duration * res.repeat;
         }
         if (t.resources.empty()) continue;
         const auto it = info.find(t.resources.front().encoding);
@@ -1784,9 +1883,7 @@ ImportResult importImf(Project& p, const std::string& path, const MediaProber& p
     // Timed text: a caption track each, the document's captions placed where its resources play them.
     for (const ImfVirtualTrack& t : c.tracks) {
         const QString kind = QString::fromStdString(t.kind);
-        if (kind != "SubtitlesSequence" && kind != "HearingImpairedCaptionsSequence" && kind != "ForcedNarrativeSequence" &&
-            kind != "VisuallyImpairedTextSequence" && kind != "CommentarySequence" && kind != "KaraokeSequence")
-            continue;
+        if (!isTextSequence(kind)) continue;
         CaptionTrack track;
         track.id = p.newId();
         track.language = t.language.empty() ? "en" : t.language;

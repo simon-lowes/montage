@@ -132,7 +132,7 @@ private:
     std::unique_ptr<ImageSequence> rawSequence_;  // a run of camera raw frames (media/ImageSequence.h)
     int rawFrame_ = -1;                       // the run's (or Magic Lantern Video's) frame in raw_
     std::unique_ptr<MlvReader> mlv_;          // Magic Lantern Video: each frame's mosaic developed (media/Mlv.h)
-    std::unique_ptr<dcp::ImfTrackReader> imf_;  // an IMF picture track file: each frame decoded with OpenJPEG, its codes kept
+    std::shared_ptr<const dcp::ImfTrackReader> imf_;  // an IMF picture track file: each frame decoded with OpenJPEG, its codes kept
     std::unique_ptr<ImageSequence> exr_;      // OpenEXR read with OpenEXR (a layer, or a compression FFmpeg lacks): its frames
     std::string exrFile_;                     // (a single file: first = last = 0)
     std::string exrLayer_;                    // the layer shown (with no main picture and none chosen, the file's first)

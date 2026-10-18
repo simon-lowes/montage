@@ -334,12 +334,17 @@ private:
 class ImfTrackReader {
 public:
     enum class Kind { Unknown, Picture, Sound, TimedText };
-    bool open(const std::string& path, std::string* error = nullptr);
+    // `imfPictureOnly`: give up at the end of the header unless it is an IMF picture (imfRgbJpeg2000), without walking
+    // the rest of a file that is not.
+    bool open(const std::string& path, std::string* error = nullptr, bool imfPictureOnly = false);
     Kind kind() const { return kind_; }
     const Uuid& asset() const { return asset_; }
     int64_t frames() const { return int64_t(elements_.size()); }  // picture
+    uint64_t largestFrame() const;                                // picture: the largest codestream's bytes
     int channels() const { return channels_; }                    // sound
     EditRate rate() const { return rate_; }                       // the descriptor's sample rate
+    int width() const { return width_; }                          // picture: the stored size (0: not given)
+    int height() const { return height_; }
     // An IMF picture: OP1a, JPEG 2000 in an RGBA descriptor (full-range RGB), as Application #2E has it (a DCP's
     // OP-Atom pictures and other MXF are not).
     bool imfRgbJpeg2000() const { return kind_ == Kind::Picture && op1a_ && rgba_ && j2k_; }
@@ -353,7 +358,7 @@ private:
     std::string path_;
     Kind kind_ = Kind::Unknown;
     Uuid asset_{};
-    int channels_ = 0;
+    int channels_ = 0, width_ = 0, height_ = 0;
     EditRate rate_;
     bool op1a_ = false, rgba_ = false, j2k_ = false;
     std::vector<std::pair<uint64_t, uint64_t>> elements_;  // picture frames: offset and size of each value

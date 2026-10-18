@@ -6306,6 +6306,7 @@ void MainWindow::exportImfDialog() {
         k->addItem(tr("Captions (deaf and hard of hearing)"), "captions");
         k->addItem(tr("Forced narrative"), "forced");
         k->addItem(tr("Left out"), QString());
+        if (t.captions.empty()) k->setCurrentIndex(k->count() - 1);  // (nothing to send)
         texts->setCellWidget(row, 1, k);
     }
     if (texts->rowCount()) {
@@ -6339,7 +6340,8 @@ void MainWindow::exportImfDialog() {
     auto syncSupplemental = [=] {
         for (QWidget* w : {static_cast<QWidget*>(earlier), static_cast<QWidget*>(browseEarlier), static_cast<QWidget*>(original)}) w->setEnabled(supplemental->isChecked());
         // (a supplemental keeps the earlier picture's size, colour, depth and coding)
-        for (QWidget* w : {static_cast<QWidget*>(size), static_cast<QWidget*>(colour), static_cast<QWidget*>(bits)}) w->setEnabled(!supplemental->isChecked());
+        for (QWidget* w : {static_cast<QWidget*>(size), static_cast<QWidget*>(colour), static_cast<QWidget*>(bits), static_cast<QWidget*>(coding)})
+            w->setEnabled(!supplemental->isChecked());
     };
     connect(supplemental, &QCheckBox::toggled, &dlg, syncSupplemental);
     syncSupplemental();
@@ -6365,6 +6367,13 @@ void MainWindow::exportImfDialog() {
     row->addWidget(folder, 1);
     row->addWidget(browse);
     form->addRow(tr("Make it in:"), row);
+    // (a supplemental is made beside the earlier package)
+    auto syncFolder = [=] {
+        folder->setEnabled(!supplemental->isChecked());
+        browse->setEnabled(!supplemental->isChecked());
+    };
+    connect(supplemental, &QCheckBox::toggled, &dlg, syncFolder);
+    syncFolder();
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     buttons->button(QDialogButtonBox::Ok)->setText(tr("Make IMF Master"));
     connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
@@ -6404,8 +6413,13 @@ void MainWindow::exportImfDialog() {
     }
     st.issuer = issuer->text().trimmed().toStdString();
     st.inOut = range->isChecked() && marked;
-    appSettings().setValue(QStringLiteral("export/lastDirectory"), folder->text());
     appSettings().setValue(QStringLiteral("imf/issuer"), issuer->text().trimmed());
+    // A supplemental goes beside the earlier package, whose files it plays.
+    if (supplemental->isChecked()) {
+        exportImfTo(QFileInfo(QDir(earlier->text().trimmed()).absolutePath()).absolutePath(), st);
+        return;
+    }
+    appSettings().setValue(QStringLiteral("export/lastDirectory"), folder->text());
     exportImfTo(folder->text(), st);
 }
 
@@ -8144,7 +8158,12 @@ void MainWindow::importTimeline() {
 void MainWindow::importImfPackage() {
     QSettings st = appSettings();
     const QString dir = QFileDialog::getExistingDirectory(this, tr("Import IMF Package"), st.value("lastImportTimelineDir").toString());
-    if (!dir.isEmpty()) importTimelineFrom(dir);
+    if (dir.isEmpty()) return;
+    if (!isImfPackage(dir.toStdString())) {
+        QMessageBox::warning(this, tr("Import IMF Package"), tr("%1 is not an IMF package: it has no ASSETMAP.xml").arg(QDir::toNativeSeparators(dir)));
+        return;
+    }
+    importTimelineFrom(dir);
 }
 
 void MainWindow::importTimelineFrom(QString path) {

@@ -32,8 +32,9 @@ std::vector<TimelineChange> compareSequences(const Project& pBefore, const Seque
 
 // For each of `count` frames of `after` from `from`, the frame of `before` that shows the same picture, or -1: where every
 // clip seen is one of `before`'s (matched as compareSequences matches them) on the same track, changed in nothing but
-// its place or trims (and trimmed only when it has no in, out or loop animation), showing the same source frame over
-// the same clips there. Frames in transitions, gaps where `before` has pictures, and frames of sequences that differ in
+// its place, trims and what is only heard or labels it (and, when its picture moves with its own time, at the same
+// clip time), showing the same source frame over the same clips there. Frames in transitions, of nested or multicam
+// sequences (which may have changed inside), gaps where `before` has pictures, and frames of sequences that differ in
 // size, rate or colour are -1. Supplemental IMF packages use it to send only the pictures that changed.
 std::vector<FrameTime> samePictureFrames(const Project& p, const Sequence& before, const Sequence& after, FrameTime from,
                                          FrameTime count);
