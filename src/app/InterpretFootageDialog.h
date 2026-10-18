@@ -26,6 +26,8 @@ public:
     // Whether the RAW highlight mode was offered (not for ProRes RAW, which clips at the sensor's white): when not,
     // each item keeps its own.
     bool highlightsShown() const { return highlightsShown_; }
+    // Pulldown: "" none, "keep" as each item has it, "auto" each item's cadence to be found, "A" to "D" where it starts.
+    QString pulldownChoice() const;
 
 private:
     QRadioButton* fileRate_ = nullptr;
@@ -38,6 +40,7 @@ private:
     QDoubleSpinBox* par_ = nullptr;
     QComboBox* alpha_ = nullptr;
     QComboBox* fields_ = nullptr;
+    QComboBox* pulldown_ = nullptr;
     QComboBox* stereo_ = nullptr;
     QCheckBox* swapEyes_ = nullptr;
     // Camera RAW (stills and CinemaDNG).

@@ -98,6 +98,8 @@
 #include "media/LensDatabase.h"
 #include "render/ReviewExport.h"
 #include "render/Versions.h"
+#include "render/RateConversion.h"
+#include "media/Pulldown.h"
 #include "render/ClipPlacement.h"
 #include "media/ImageSequence.h"
 #include "media/Interpret.h"
@@ -24932,6 +24934,344 @@ private slots:
         // Still frame.
         QVERIFY2(exportStill(p, s, 5, path("still.png"), &err), err.c_str());
         QVERIFY(QFileInfo(QString::fromStdString(path("still.png"))).size() > 100);
+    }
+    void pulldownAndFrameRates() {
+        std::string err;
+        // The cadence as it is kept: stretch by stretch from the file's first frame, "v" for video with none.
+        std::vector<PulldownStretch> st;
+        QVERIFY(parsePulldown("0:0:t,1873:2:b,2000:v:t", st));
+        QCOMPARE(st.size(), size_t(3));
+        QCOMPARE(st[1], (PulldownStretch{1873, 2, false}));
+        QCOMPARE(st[2].position, -1);
+        QCOMPARE(pulldownValue(st), std::string("0:0:t,1873:2:b,2000:v:t"));
+        for (const char* bad : {"5:0:t", "0:5:t", "0:0:x", "0:0:t,0:1:t", "0:0", "x"}) QVERIFY2(!parsePulldown(bad, st), bad);
+        QVERIFY(parsePulldown("", st) && st.empty());
+        Interpretation withPulldown;
+        withPulldown.pulldown = pulldownStartingAt(1, true);
+        QCOMPARE(withPulldown.pulldown, std::string("0:1:t"));
+        Interpretation back;
+        QVERIFY(parseInterpretation(interpretedPath("clip.mov", withPulldown), back));
+        QCOMPARE(back.pulldown, withPulldown.pulldown);
+        QCOMPARE(pulldownRate(Rational{30000, 1001}), (Rational{24000, 1001}));
+        QCOMPARE(pulldownRate(Rational{30, 1}), (Rational{24, 1}));
+        QVERIFY(pulldownRateValid(Rational{30000, 1001}) && !pulldownRateValid(Rational{25, 1}));
+
+        // The frames a cadence gives: A A, B B, B C, C D, D D are A, B, C (the fourth frame's first field and the third's
+        // second), D; cut two frames into the cadence, the B left with one field is made from it.
+        auto frames = pulldownFrames({{0, 0, true}, {10, 2, true}}, 15);
+        const std::vector<PulldownFrame> want = {{0, 0}, {1, 1}, {3, 2}, {4, 4}, {5, 5}, {6, 6}, {8, 7}, {9, 9},
+                                                 {10, -1}, {11, 10}, {12, 12}, {13, 13}, {14, 14}};
+        QCOMPARE(frames.size(), want.size());
+        for (size_t i = 0; i < want.size(); ++i) QVERIFY2(frames[i] == want[i], std::to_string(i).c_str());
+        // Video with no pulldown keeps time by leaving out one frame in five.
+        QCOMPARE(pulldownFrames({{0, -1, true}}, 10).size(), size_t(8));
+
+        // Weaving: the first frame's first field (its even lines, top field first) with the second's other lines; a field
+        // alone has its missing lines made from the lines either side.
+        {
+            auto gray = [](int base) {
+                AVFrame* f = av_frame_alloc();
+                f->format = AV_PIX_FMT_GRAY8, f->width = 4, f->height = 6;
+                av_frame_get_buffer(f, 0);
+                for (int y = 0; y < 6; ++y) std::fill_n(f->data[0] + y * f->linesize[0], 4, uint8_t(base + y * 10));
+                return f;
+            };
+            AVFrame* a = gray(0);
+            AVFrame* b = gray(100);
+            AVFrame* w = weaveFields(a, b, true);
+            QVERIFY(w);
+            for (int y = 0; y < 6; ++y) QCOMPARE(int(w->data[0][y * w->linesize[0] + 2]), (y % 2 ? 100 : 0) + y * 10);
+            av_frame_free(&w);
+            w = weaveFields(b, a, false);  // bottom field first: the first frame's odd lines
+            for (int y = 0; y < 6; ++y) QCOMPARE(int(w->data[0][y * w->linesize[0] + 2]), (y % 2 ? 100 : 0) + y * 10);
+            av_frame_free(&w);
+            w = weaveFields(a, nullptr, true);
+            QCOMPARE(int(w->data[0][1 * w->linesize[0]]), 10);
+            QCOMPARE(int(w->data[0][3 * w->linesize[0]]), 30);
+            av_frame_free(&w);
+            av_frame_free(&a);
+            av_frame_free(&b);
+        }
+
+        const QString ffmpeg = QStandardPaths::findExecutable("ffmpeg");
+        if (ffmpeg.isEmpty()) QSKIP("No ffmpeg command to make and undo pulldown with");
+        auto run = [&](const QStringList& args, QByteArray* out = nullptr) {
+            QProcess pr;
+            pr.start(ffmpeg, QStringList{"-hide_banner", "-loglevel", "error", "-y"} + args);
+            const bool done = pr.waitForFinished(300000) && pr.exitStatus() == QProcess::NormalExit && pr.exitCode() == 0;
+            if (out) *out = pr.readAllStandardOutput();
+            if (!done) qWarning() << pr.readAllStandardError();
+            return done;
+        };
+        // Each frame of a file, as FFmpeg decodes it (and filters it), in 8 bits (as FFmpeg's field matching reads them).
+        auto rawFrames = [&](const std::string& file, const QString& filter, std::vector<QByteArray>& out) {
+            QByteArray all;
+            QStringList args{"-i", QString::fromStdString(file)};
+            if (!filter.isEmpty()) args << "-vf" << filter;
+            args << "-f" << "rawvideo" << "-pix_fmt" << "yuv422p" << "-";
+            if (!run(args, &all)) return false;
+            const int size = 320 * 240 * 2;
+            out.clear();
+            for (int at = 0; at + size <= all.size(); at += size) out.push_back(all.mid(at, size));
+            return all.size() % size == 0;
+        };
+
+        // A moving test pattern, 80 frames at 23.976 (lossless), telecined by FFmpeg in two parts, as video edited after
+        // the pulldown: the first 40 frames' whole cadence, then the rest cut two frames into theirs.
+        const std::string film = path("pd-film.mkv"), tel = path("pd-telecined.mkv");
+        QVERIFY(run({"-f", "lavfi", "-i", "testsrc2=size=320x240:rate=24000/1001", "-frames:v", "80", "-pix_fmt", "yuv420p", "-c:v", "ffv1",
+                     QString::fromStdString(film)}));
+        QVERIFY(run({"-i", QString::fromStdString(film), "-filter_complex",
+                     "[0:v]split[a][b];[a]trim=end_frame=40,telecine=first_field=top:pattern=23[x];"
+                     "[b]trim=start_frame=40,setpts=PTS-STARTPTS,telecine=first_field=top:pattern=23,trim=start_frame=2,setpts=PTS-STARTPTS[y];"
+                     "[x][y]concat=n=2:v=1[out]",
+                     "-map", "[out]", "-c:v", "ffv1", "-pix_fmt", "yuv420p", QString::fromStdString(tel)}));
+        std::vector<PulldownStretch> found;
+        QVERIFY2(detectPulldown(tel, found, {}, nullptr, &err), err.c_str());
+        QVERIFY2(pulldownValue(found) == "0:0:t,50:2:t", pulldownValue(found).c_str());
+        // Interpret Footage: 23.976, as long as before; a 23.976 file has no pulldown to remove.
+        Project p = makeDefaultProject();
+        MediaItem telItem = probeOrFail(p, tel);
+        QCOMPARE(telItem.fps, (Rational{30000, 1001}));
+        p.media.push_back(telItem);
+        MediaItem filmItem = probeOrFail(p, film);
+        p.media.push_back(filmItem);
+        Interpretation removed;
+        removed.pulldown = pulldownValue(found);
+        QVERIFY(!edit::interpretFootage(p, filmItem.id, removed).ok);
+        QVERIFY(edit::interpretFootage(p, telItem.id, removed).ok);
+        const MediaItem* now = p.findMedia(telItem.id);
+        QCOMPARE(now->fps, (Rational{24000, 1001}));
+        QVERIFY2(std::fabs(now->duration - telItem.duration) < 0.01, qPrintable(QString::number(now->duration)));
+        // Every whole frame is the original, exactly; the B at the break left with one field is close to it.
+        VideoDecoder removedDec, filmDec;
+        QVERIFY(removedDec.open(now->path, &err) && filmDec.open(film, &err));
+        QVERIFY(std::fabs(removedDec.fps() - 24000.0 / 1001.0) < 1e-6);
+        const double fps = 24000.0 / 1001.0;
+        for (int n = 0; n < 79; ++n) {
+            Frame16Ptr got = removedDec.frameAt((n + 0.5) / fps);
+            Frame16Ptr orig = filmDec.frameAt(((n < 40 ? n : n + 1) + 0.5) / fps);
+            QVERIFY2(got && orig && got->width == 320 && got->px.size() == orig->px.size(), std::to_string(n).c_str());
+            if (n == 40) {
+                double diff = 0;
+                for (size_t i = 0; i < got->px.size(); ++i) diff += std::abs(int(got->px[i]) - int(orig->px[i]));
+                diff /= double(got->px.size()) * 65535.0;
+                QVERIFY2(diff < 0.02, qPrintable(QString::number(diff)));
+            } else {
+                QVERIFY2(std::equal(got->px.begin(), got->px.end(), orig->px.begin()), std::to_string(n).c_str());
+            }
+        }
+        QVERIFY(!removedDec.frameAt(80.5 / fps) || removedDec.frameAt(80.5 / fps)->pts <= 79.0 / fps);
+
+        // Pulldown added on export: a 23.976 sequence as 29.97 interlaced video (2:3), pulled up again by FFmpeg's field
+        // matching and decimation, gives back the frames the 23.976 export has, exactly.
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 240, s.fps = Rational{24000, 1001};
+        QVERIFY(edit::placeMedia(p, s, filmItem.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        ExportSettings base = findExportPreset("FFV1 (lossless archive)")->settings;
+        base.audioCodec = "none";
+        base.in = 0, base.out = 40;
+        ExportSettings asFilm = base;
+        asFilm.path = path("pd-out-film.mkv");
+        QVERIFY2(exportSequence(p, s, asFilm, nullptr, nullptr, &err), err.c_str());
+        ExportSettings asVideo = base;
+        asVideo.path = path("pd-out-2997i.mkv");
+        asVideo.rateChange = "pulldown";
+        QVERIFY2(exportSequence(p, s, asVideo, nullptr, nullptr, &err), err.c_str());
+        MediaItem video = probeOrFail(p, asVideo.path);
+        QCOMPARE(video.fps, (Rational{30000, 1001}));
+        std::vector<QByteArray> ref, pulledUp, fields;
+        QVERIFY(rawFrames(asFilm.path, "", ref));
+        QCOMPARE(ref.size(), size_t(40));
+        QVERIFY(rawFrames(asVideo.path, "", fields));
+        QCOMPARE(fields.size(), size_t(50));
+        QVERIFY(fields[2] != ref[1] && fields[2] != ref[2]);  // B C: a frame of two pictures' fields
+        QVERIFY(rawFrames(asVideo.path, "format=yuv422p,fieldmatch=order=tff:combmatch=none,decimate", pulledUp));
+        QCOMPARE(pulledUp.size(), ref.size());
+        for (size_t i = 0; i < ref.size(); ++i) QVERIFY2(pulledUp[i] == ref[i], std::to_string(i).c_str());
+        // 59.94 progressive with 2:2:2:4: each frame twice, the fourth four times.
+        ExportSettings at5994 = base;
+        at5994.path = path("pd-out-5994.mkv");
+        at5994.rateChange = "pulldown";
+        at5994.rate = Rational{60000, 1001};
+        at5994.cadence = "2:2:2:4";
+        QVERIFY2(exportSequence(p, s, at5994, nullptr, nullptr, &err), err.c_str());
+        std::vector<QByteArray> repeated;
+        QVERIFY(rawFrames(at5994.path, "", repeated));
+        QCOMPARE(repeated.size(), size_t(100));
+        static const int shown[10] = {0, 0, 1, 1, 2, 2, 3, 3, 3, 3};
+        for (size_t o = 0; o < repeated.size(); ++o) QVERIFY2(repeated[o] == ref[(o / 10) * 4 + size_t(shown[o % 10])], std::to_string(o).c_str());
+        // Not from a 25 frame sequence, nor at a rate pulldown does not make.
+        s.fps = Rational{25, 1};
+        QVERIFY(!exportSequence(p, s, asVideo, nullptr, nullptr, &err));
+        s.fps = Rational{24000, 1001};
+        ExportSettings wrong = asVideo;
+        wrong.rate = Rational{25, 1};
+        QVERIFY(!exportSequence(p, s, wrong, nullptr, nullptr, &err));
+
+        // Over MCP: removed with the cadence found, and delivered with pulldown; a rate pulldown does not make refused.
+        const QString project = QString::fromStdString(path("pulldown-mcp.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QString& tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_interpret_media", {{"project", project}, {"media", "pd-telecined.mkv"}, {"remove_pulldown", "off"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("media").toArray().at(0).toObject().value("frame_rate").toDouble(), 30000.0 / 1001.0);
+        r = call("montage_interpret_media", {{"project", project}, {"media", "pd-telecined.mkv"}, {"remove_pulldown", "auto"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject item = r.value("structuredContent").toObject().value("media").toArray().at(0).toObject();
+        QCOMPARE(item.value("frame_rate").toDouble(), 24000.0 / 1001.0);
+        QCOMPARE(item.value("interpretation").toObject().value("pulldown_removed").toArray().size(), 2);
+        QVERIFY(call("montage_interpret_media", {{"project", project}, {"media", "pd-film.mkv"}, {"remove_pulldown", "auto"}}).value("isError").toBool());
+        const QString mcpOut = QString::fromStdString(path("pd-mcp.mkv"));
+        r = call("montage_render", {{"project", project}, {"output", mcpOut}, {"preset", "FFV1 (lossless archive)"}, {"rate_change", "pulldown"},
+                                    {"frame_rate", 29.97}, {"start_timecode", "01:00:00:00"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(probeOrFail(p, mcpOut.toStdString()).fps, (Rational{30000, 1001}));
+        r = call("montage_render", {{"project", project}, {"output", mcpOut}, {"preset", "FFV1 (lossless archive)"}, {"rate_change", "pulldown"},
+                                    {"frame_rate", 25}});
+        QVERIFY(r.value("isError").toBool());
+
+        // Markers and captions land on the delivered frames.
+        {
+            Sequence m = s;
+            m.markers = {Marker{24, 0, "a", "", 0, false}, Marker{48, 0, "after", "", 0, false}};
+            RateConversion c;
+            ExportSettings plan = asVideo;
+            QVERIFY(planRateConversion(m, plan, c, &err) && c.fields);
+            Sequence d = deliveredSequence(m, c, 0, 40);
+            QCOMPARE(d.markers.size(), size_t(1));
+            QCOMPARE(d.markers[0].t, FrameTime(30));
+            QCOMPARE(deliveredFrames(c, 40), int64_t(50));
+        }
+    }
+
+    void speedChangeAndStandardsConversion() {
+        std::string err;
+        // Two seconds at 24 with a 1 kHz tone, sped up to PAL's 25: 4 % shorter, the tone still at 1 kHz (or, its pitch
+        // not kept, a semitone's two thirds higher with it, at 1041.7 Hz).
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160, s.height = 90, s.fps = Rational{24, 1};
+        std::vector<float> tone(96000);
+        for (size_t i = 0; i < tone.size(); ++i) tone[i] = float(0.5 * std::sin(2 * M_PI * 1000.0 * double(i) / 48000));
+        QVERIFY(writeMonoWav(path("pal-tone.wav"), tone, 48000));
+        MediaItem toneItem = probeOrFail(p, path("pal-tone.wav"));
+        p.media.push_back(toneItem);
+        QVERIFY(edit::placeMedia(p, s, toneItem.id, 0, 0, -1, {TrackKind::Video, 1}, {TrackKind::Audio, 0}, false).ok);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "bars", 48));
+        s.markers = {Marker{24, 12, "one second", "", 0, false}};
+        ExportSettings pal;
+        pal.path = path("pal.mov");
+        pal.videoCodec = "prores_ks";
+        pal.audioCodec = "pcm_s16le";
+        pal.rateChange = "speed";
+        pal.rate = Rational{25, 1};
+        for (bool keepPitch : {true, false}) {
+            pal.rateKeepPitch = keepPitch;
+            QVERIFY2(exportSequence(p, s, pal, nullptr, nullptr, &err), err.c_str());
+            Project q;
+            MediaItem out = probeOrFail(q, pal.path);
+            QCOMPARE(out.fps, (Rational{25, 1}));
+            QVERIFY2(std::fabs(out.duration - 1.92) < 0.02, qPrintable(QString::number(out.duration)));
+            AudioBufferPtr heard = decodeAudio(pal.path, 48000);
+            QVERIFY(heard);
+            QVERIFY2(std::abs(heard->frames() - 92160) < 960, qPrintable(QString::number(heard->frames())));
+            const double hz = keepPitch ? 1000.0 : 1000.0 * 25.0 / 24.0;
+            const double at = toneLevel(heard->samples, 0, hz, 12000, 84000), other = toneLevel(heard->samples, 0, keepPitch ? 1041.67 : 1000.0, 12000, 84000);
+            QVERIFY2(at > 0.3 && other < 0.1, qPrintable(QString("%1 %2 %3").arg(keepPitch).arg(at).arg(other)));
+        }
+        RateConversion sped;
+        QVERIFY(planRateConversion(s, pal, sped, &err));
+        QVERIFY(std::fabs(sped.speed() - 25.0 / 24.0) < 1e-12);
+        int64_t num = 0, den = 0;
+        sped.speedRatio(num, den);
+        QVERIFY(num == 25 && den == 24);
+        const Sequence d = deliveredSequence(s, sped, 0, 48);
+        QCOMPARE(d.fps, (Rational{25, 1}));
+        QVERIFY(d.markers.size() == 1 && d.markers[0].t == 24 && d.markers[0].duration == 12);  // the same frame, sooner
+        pal.rate = Rational{60, 1};
+        QVERIFY(!exportSequence(p, s, pal, nullptr, nullptr, &err));  // more than twice the speed
+
+        // 25 to 29.97: a red shot cut to a blue one, then the same as one file with the cut inside it; no delivered frame
+        // is a blend of the two. A slow ramp is converted with in-betweens.
+        Project c = makeDefaultProject();
+        Sequence& cs = *c.active();
+        cs.width = 160, cs.height = 90, cs.fps = Rational{25, 1};
+        auto colour = [&](float r, float g, float b, FrameTime start) {
+            Clip k = makeGeneratorClip(c, "color", 25);
+            k.start = start;
+            k.generator.params["color.r"] = r;
+            k.generator.params["color.g"] = g;
+            k.generator.params["color.b"] = b;
+            return k;
+        };
+        edit::overwrite(c, cs, {TrackKind::Video, 0}, colour(1, 0, 0, 0));
+        edit::overwrite(c, cs, {TrackKind::Video, 0}, colour(0, 0, 1, 25));
+        ExportSettings ntsc;
+        ntsc.videoCodec = "prores_ks";
+        ntsc.audioCodec = "none";
+        ntsc.rateChange = "convert";
+        ntsc.rate = Rational{30000, 1001};
+        auto noBlends = [&](const std::string& file) {
+            VideoDecoder dec;
+            if (!dec.open(file, &err)) return std::string("not opened: ") + err;
+            if (std::fabs(dec.fps() - 30000.0 / 1001.0) > 1e-6) return std::string("at ") + std::to_string(dec.fps());
+            int red = 0, blue = 0;
+            for (int o = 0; o < 60; ++o) {
+                Frame16Ptr f = dec.frameAt((o + 0.5) * 1001.0 / 30000.0);
+                if (!f) return "no frame " + std::to_string(o);
+                const uint16_t* px = f->px.data() + (size_t(45) * size_t(f->width) + 80) * 4;
+                const double r = px[0] / 65535.0, b = px[2] / 65535.0;
+                if (r > 0.9 && b < 0.1) ++red;
+                else if (b > 0.9 && r < 0.1) ++blue;
+                else return "frame " + std::to_string(o) + " is a blend: " + std::to_string(r) + " " + std::to_string(b);
+            }
+            return red == 30 && blue == 30 ? std::string() : "red " + std::to_string(red) + " blue " + std::to_string(blue);
+        };
+        ntsc.path = path("ntsc-cut.mov");
+        QVERIFY2(exportSequence(c, cs, ntsc, nullptr, nullptr, &err), err.c_str());
+        QCOMPARE(probeOrFail(c, ntsc.path).duration > 1.95, true);
+        QVERIFY2(noBlends(ntsc.path).empty(), noBlends(ntsc.path).c_str());
+        ExportSettings whole = ntsc;
+        whole.rateChange.clear();
+        whole.path = path("ntsc-source.mov");
+        QVERIFY2(exportSequence(c, cs, whole, nullptr, nullptr, &err), err.c_str());
+        Project w = makeDefaultProject();
+        Sequence& ws = *w.active();
+        ws.width = 160, ws.height = 90, ws.fps = Rational{25, 1};
+        MediaItem source = probeOrFail(w, whole.path);
+        w.media.push_back(source);
+        QVERIFY(edit::placeMedia(w, ws, source.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QCOMPARE(ws.videoTracks[0].clips.size(), size_t(1));
+        ntsc.path = path("ntsc-inside.mov");
+        QVERIFY2(exportSequence(w, ws, ntsc, nullptr, nullptr, &err), err.c_str());
+        QVERIFY2(noBlends(ntsc.path).empty(), noBlends(ntsc.path).c_str());
+        // The ramp: red from 0 at the first frame to 1 at the 25th; delivered frame 3 is 3 x 25/29.97 = 2.5 frames in,
+        // half way between the programme's frames 2 and 3 (0.083 and 0.125), made from both.
+        Project r = makeDefaultProject();
+        Sequence& rs = *r.active();
+        rs.width = 160, rs.height = 90, rs.fps = Rational{25, 1};
+        Clip ramp = makeGeneratorClip(r, "color", 25);
+        ramp.generator.params["color.r"].addKey(0, 0.0);
+        ramp.generator.params["color.r"].addKey(24, 1.0);
+        edit::overwrite(r, rs, {TrackKind::Video, 0}, ramp);
+        ntsc.path = path("ntsc-ramp.mov");
+        QVERIFY2(exportSequence(r, rs, ntsc, nullptr, nullptr, &err), err.c_str());
+        VideoDecoder rampDec;
+        QVERIFY(rampDec.open(ntsc.path, &err));
+        Frame16Ptr third = rampDec.frameAt(3.5 * 1001.0 / 30000.0);
+        QVERIFY(third);
+        const double red = third->px[(size_t(45) * size_t(third->width) + 80) * 4] / 65535.0;
+        const double expected = 3.0 * 25.0 * 1001.0 / 30000.0 / 24.0;
+        QVERIFY2(std::fabs(red - expected) < 0.008, qPrintable(QString("%1 %2").arg(red).arg(expected)));
     }
 };
 

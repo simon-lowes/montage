@@ -56,6 +56,8 @@
 #include "media/TextReader.h"
 #include "media/ImageSequence.h"
 #include "media/Interpret.h"
+#include "media/Pulldown.h"
+#include "render/RateConversion.h"
 #include "media/MediaPool.h"
 #include "render/Ofx.h"
 #include "media/Psd.h"
@@ -375,6 +377,18 @@ QJsonObject interpretationJson(const MediaItem& m) {
     if (i.par > 0) o["pixel_aspect"] = i.par;
     if (!i.alpha.empty()) o["alpha"] = QString::fromStdString(i.alpha);
     if (!i.fields.empty()) o["field_order"] = QString::fromStdString(i.fields);
+    if (std::vector<PulldownStretch> st; parsePulldown(i.pulldown, st) && !st.empty()) {
+        // Pulldown removed: the cadence's stretches (a break where an edit after the pulldown changed it).
+        QJsonArray stretches;
+        for (const PulldownStretch& x : st) {
+            static const char* letters[5] = {"A", "B", "C", "D", "D2"};
+            QJsonObject so{{"from_frame", double(x.start)}, {"field_order", x.topFirst ? "upper" : "lower"}};
+            if (x.position < 0) so["video"] = true;
+            else so["starts_on"] = letters[x.position];
+            stretches.append(so);
+        }
+        o["pulldown_removed"] = stretches;
+    }
     if (i.rawExposure != 0) o["raw_exposure"] = i.rawExposure;
     if (i.rawTemperature > 0) o["raw_temperature"] = i.rawTemperature;
     if (i.rawTint != 0) o["raw_tint"] = i.rawTint;
@@ -6655,7 +6669,7 @@ void McpServer::Impl::addTools() {
         "its sound with it, at the new speed or with keep_pitch time-stretched); pixel_aspect replaces the file's (2 for "
         "a 2x anamorphic lens, 1.33, 1.5, 1.8, 0.9 for DV NTSC, 1 for square); alpha reads its transparency as straight, "
         "premultiplied, ignore (opaque) or invert; field_order forces progressive, upper (top field first) or lower "
-        "(bottom field first) whatever the frames are flagged. Arguments left out keep their current setting; 0 or "
+        "(bottom field first) whatever the frames are flagged; remove_pulldown undoes 2:3 pulldown (29.97 to 23.976). Arguments left out keep their current setting; 0 or "
         "\"file\" goes back to the file's own; reset puts everything back. Clips keep starting on the same frame and keep "
         "their timeline length (shortened where the footage no longer reaches); subclips, clip markers and transcripts "
         "follow.",
@@ -6666,6 +6680,7 @@ void McpServer::Impl::addTools() {
             "alpha":{"type":"string","enum":["file","straight","premultiplied","ignore","invert"]},
             "field_order":{"type":"string","enum":["file","progressive","upper","lower"]},
             "keep_pitch":{"type":"boolean","description":"A conformed sound keeps its pitch"},
+            "remove_pulldown":{"type":"string","enum":["off","auto","A","B","C","D"],"description":"29.97 or 30 frame video carrying 23.976 or 24 frame pictures with 2:3 pulldown: woven back into those frames (it then plays at 23.976 or 24, with no combed or repeated frames). auto finds the cadence from the fields, stretch by stretch (an edit made after the pulldown breaks it); A to D say which frame of the cadence the file starts on (A A, B B, B C, C D), the fields in field_order (upper unless lower)"},
             "raw_exposure":{"type":"number","description":"Camera RAW, CinemaDNG, ProRes RAW and Magic Lantern Video: exposure in stops (-5 to 5)"},
             "raw_temperature":{"type":["number","string"],"description":"Camera RAW: the light's colour temperature in kelvin (2000 to 25000), or \"as_shot\""},
             "raw_tint":{"type":"number","description":"Camera RAW: tint, + magenta, - green (-150 to 150)"},
@@ -6702,6 +6717,22 @@ void McpServer::Impl::addTools() {
                 if (a.contains("alpha")) i.alpha = str(a, "alpha") == "file" ? "" : str(a, "alpha").toStdString();
                 if (a.contains("field_order")) i.fields = str(a, "field_order") == "file" ? "" : str(a, "field_order").toStdString();
                 if (a.contains("keep_pitch")) i.keepPitch = a.value("keep_pitch").toBool();
+                if (a.contains("remove_pulldown")) {
+                    const QString pd = str(a, "remove_pulldown");
+                    if (pd == "off") {
+                        i.pulldown.clear();
+                    } else if (pd == "auto") {
+                        std::vector<PulldownStretch> st;
+                        std::string why;
+                        if (!detectPulldown(uninterpretedPath(m->path), st, {}, nullptr, &why))
+                            throw ArgError{QStringLiteral("%1: %2").arg(QString::fromStdString(m->name), QString::fromStdString(why))};
+                        i.pulldown = pulldownValue(st);
+                    } else if (pd.size() == 1 && pd[0] >= 'A' && pd[0] <= 'D') {
+                        i.pulldown = pulldownStartingAt(pd[0].toLatin1() - 'A', i.fields != "lower");
+                    } else {
+                        throw ArgError{"\"remove_pulldown\" is off, auto or A to D"};
+                    }
+                }
                 if (a.contains("raw_exposure")) i.rawExposure = a.value("raw_exposure").toDouble();
                 if (a.contains("raw_temperature")) {
                     const QJsonValue t = a.value("raw_temperature");
@@ -7903,7 +7934,8 @@ void McpServer::Impl::addTools() {
     add("montage_render", "Render",
         "Render the active sequence (or its in-out range) to a file with an export preset (default \"H.264 - High Quality\"), "
         "optionally normalising the mix's loudness for where it is going. Broadcast deliveries: the XDCAM HD422, AVC-Intra 100 "
-        "and DNxHR MXF presets write MXF OP1a with each sound channel a mono track; start_timecode sets the file's timecode.",
+        "and DNxHR MXF presets write MXF OP1a with each sound channel a mono track; start_timecode sets the file's timecode. "
+        "rate_change delivers it at another frame rate: 2:3 pulldown, a PAL speed change or a standards conversion.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"output":{"type":"string"},
             "preset":{"type":"string"},"in":{"type":["number","string"]},"out":{"type":["number","string"]},
             "loudness_lufs":{"type":"number","description":"Normalise the mix to this loudness, e.g. -14 (streaming) or -23 (EBU R128)"},
@@ -7932,6 +7964,10 @@ void McpServer::Impl::addTools() {
             "start_timecode":{"type":"string","description":"The file's starting timecode (MXF and MOV), e.g. 10:00:00:00 as broadcasters ask"},
             "mono_tracks":{"type":"integer","description":"Write the mix (then each audio stream) as mono tracks, padded with silence to this many, as broadcast MXF takes it; the MXF presets set 8, 4 or 2"},
             "interlaced":{"type":"boolean","default":false,"description":"Code the video as interlaced fields, top first (each picture as both fields: PsF), as 1080i deliveries ask: MPEG-2, AVC-Intra, ProRes"},
+            "rate_change":{"type":"string","enum":["none","pulldown","speed","convert"],"default":"none","description":"Deliver at another frame rate: pulldown (a 23.976 or 24 sequence with 2:3 or 2:2:2:4 pulldown, into fields at 29.97 or 30, coded interlaced: MPEG-2, AVC-Intra or H.264, ProRes, FFV1; or as repeated frames at 59.94 or 60); speed (each frame shown once at frame_rate, the programme faster or slower, as PAL's 25 from 24 is 4 % shorter, its sound sped with it, captions and markers with it); convert (a standards conversion to frame_rate, keeping its length: each new frame made from the two nearest by optical flow, or RIFE where installed, never blended across a cut)"},
+            "frame_rate":{"type":["number","string"],"description":"With rate_change: the rate delivered (23.976, 24, 25, 29.97, 30, 50, 59.94, 60...); pulldown's default is 29.97 (30 from 24)"},
+            "pulldown_cadence":{"type":"string","enum":["2:3","2:2:2:4"],"default":"2:3","description":"With pulldown: 2:3 (A A, B B, B C, C D, D D) or 2:2:2:4 (no frame of mixed fields)"},
+            "keep_pitch":{"type":"boolean","default":true,"description":"With speed: the sound keeps its pitch (time-stretched); false plays it faster and higher (varispeed), as a telecine's PAL speed-up"},
             "mxf_delivery":{"type":"string","enum":["op1a","rdd9","as11-dpp","as11-x2","as11-x8"],"default":"op1a","description":"Broadcast MXF by the book (rewrapped with the EBU's bmx): rdd9 = RDD 9 (the MPEG-2 HD 4:2:2 MXF preset); AS-11 with its descriptive metadata and parts: as11-dpp (UK DPP HD: the AVC-Intra 100 preset at 25 fps, coded 1080i25), as11-x2 (AVC-Intra HD), as11-x8 (MPEG-2 HD 4:2:2 in RDD 9, the NABA's)"},
             "as11":{"type":"object","additionalProperties":{"type":["string","number","boolean"]},"description":"AS-11 metadata by the names AS-11 gives them: core (SeriesTitle, ProgrammeTitle, EpisodeTitleNumber, ShimName, ShimVersion, AudioTrackLayout, PrimaryAudioLanguage, ClosedCaptionsPresent/Type/Language) and UK DPP (ProductionNumber, Synopsis, Originator, CopyrightYear, Distributor, PSEPass, SecondaryAudioLanguage, LineUpStart, IdentClockStart, CompletionDate, ContactEmail, ContactTelephoneNumber...). Unset ones come from the sequence: its name, languages, captions; line-up and clock from markers named Line-up and Clock, parts from markers with a duration named Part ..."},
             "anc_captions":{"type":"string","enum":["none","cea708","teletext","both"],"default":"none","description":"In a broadcast MXF delivery: the caption track as ancillary data (ST 436): CEA-708 caption packets (with 608) and/or OP-47 teletext subtitles"},
@@ -7951,11 +7987,27 @@ void McpServer::Impl::addTools() {
             if (!pr) throw ArgError{"Unknown preset (see montage_list_presets)"};
             ExportSettings st = pr->settings;
             st.path = absolute(need(a, "output")).toStdString();
+            if (a.contains("rate_change") && str(a, "rate_change") != "none") {
+                st.rateChange = str(a, "rate_change").toStdString();
+                if (st.rateChange != "pulldown" && st.rateChange != "speed" && st.rateChange != "convert")
+                    throw ArgError{"\"rate_change\" is none, pulldown, speed or convert"};
+                const QJsonValue r = a.value("frame_rate");
+                const double fr = r.isString() ? r.toString().toDouble() : r.toDouble();
+                if (!r.isUndefined() && !(fr > 0)) throw ArgError{"\"frame_rate\" is frames a second, as 25 or 29.97"};
+                if (fr > 0) st.rate = rateFor(fr);
+                st.cadence = str(a, "pulldown_cadence", "2:3").toStdString();
+                st.rateKeepPitch = a.value("keep_pitch").toBool(true);
+            }
             if (a.contains("start_timecode")) {
+                // (in the delivered rate's frames)
+                RateConversion conv;
+                std::string why;
+                if (!planRateConversion(s, st, conv, &why)) throw ArgError{QString::fromStdString(why)};
+                const Rational rate = conv.active() ? conv.to : s.fps;
                 FrameTime t = 0;
                 const std::string tc = str(a, "start_timecode").toStdString();
-                if (!parseTimecode(tc, s.fps, t) || t < 0) throw ArgError{"\"start_timecode\" is a timecode like 10:00:00:00"};
-                st.startTimecode = formatTimecode(t, s.fps);
+                if (!parseTimecode(tc, rate, t) || t < 0) throw ArgError{"\"start_timecode\" is a timecode like 10:00:00:00"};
+                st.startTimecode = formatTimecode(t, rate);
             }
             if (a.contains("mono_tracks")) {
                 st.monoAudioTracks = a.value("mono_tracks").toInt();

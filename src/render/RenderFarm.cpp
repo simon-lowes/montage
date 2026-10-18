@@ -188,6 +188,11 @@ void visitSettings(S& s, V& v) {
     v("startTimecode", s.startTimecode);
     v("extraCaptions", s.extraCaptions);
     v("interlaced", s.interlaced);
+    v("rateChange", s.rateChange);
+    v("rateNum", s.rate.num);
+    v("rateDen", s.rate.den);
+    v("cadence", s.cadence);
+    v("rateKeepPitch", s.rateKeepPitch);
     v("mxfDelivery", s.mxfDelivery);
     v("as11Metadata", s.as11Metadata);
     v("ancCaptions", s.ancCaptions);

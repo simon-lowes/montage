@@ -10554,6 +10554,105 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(restored, QStringLiteral("DNxHR HQ (MXF)"));
     }
 
+    void frameRateDelivery() {
+        // 29.97 video made from a 23.976 cut with 2:3 pulldown, then removed in Interpret Footage, starting on A.
+        const QString telecined = dir_.filePath("telecined.mov");
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 64, gs.height = 36, gs.fps = Rational{24000, 1001};
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, makeGeneratorClip(gen, "bars", 48));
+            ExportSettings st;
+            st.path = telecined.toStdString();
+            st.videoCodec = "prores_ks";
+            st.audioCodec = "none";
+            st.rateChange = "pulldown";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        QVERIFY(state()->edit("Rate", [](Project&, Sequence& s) {
+            s.fps = Rational{24000, 1001};
+            return true;
+        }));
+        const auto ids = state()->importFiles({telecined});
+        QCOMPARE(ids.size(), size_t(1));
+        QCOMPARE(state()->project().findMedia(ids[0])->fps, (Rational{30000, 1001}));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        auto* bin = win_->findChild<MediaBinWidget*>();
+        bool shown = false;
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+            if (!dlg || dlg->objectName() != "interpretFootageDialog") return;
+            auto* pulldown = dlg->findChild<QComboBox*>("interpretPulldown");
+            if (!pulldown || !pulldown->isEnabled() || pulldown->currentData().toString() != "") return dlg->reject();
+            shown = true;
+            pulldown->setCurrentIndex(pulldown->findData("A"));
+            dlg->accept();
+        });
+        bin->interpretFootageDialog({ids[0]});
+        QVERIFY(shown);
+        const MediaItem* m = state()->project().findMedia(ids[0]);
+        QCOMPARE(m->fps, (Rational{24000, 1001}));
+        QCOMPARE(interpretationOf(*m).pulldown, std::string("0:0:t"));
+        // Opened again it says the pulldown is removed, and keeps it.
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+            if (!dlg) return;
+            shown = dlg->findChild<QComboBox*>("interpretPulldown")->currentData().toString() == "keep";
+            dlg->accept();
+        });
+        shown = false;
+        bin->interpretFootageDialog({ids[0]});
+        QVERIFY(shown);
+        QCOMPARE(interpretationOf(*state()->project().findMedia(ids[0])).pulldown, std::string("0:0:t"));
+        state()->undo();
+        QCOMPARE(state()->project().findMedia(ids[0])->fps, (Rational{30000, 1001}));
+        QCOMPARE(state()->sequence()->fps, (Rational{24000, 1001}));
+
+        // The export dialog offers the 23.976 sequence's deliveries: pulldown, PAL's speed-up, conversions.
+        RenderQueue* queue = win_->renderQueue();
+        const size_t jobs = queue->jobs().size();
+        const QVariant rememberedPreset = appSettings().value("export/preset");
+        ExportDialog ed(state(), win_.get());
+        ed.setQueue(queue);
+        auto* preset = ed.findChild<QComboBox*>("exportPreset");
+        auto* rate = ed.findChild<QComboBox*>("exportRate");
+        auto* pitch = ed.findChild<QCheckBox*>("exportRatePitch");
+        auto* interlaced = ed.findChild<QCheckBox*>("exportInterlaced");
+        QVERIFY(preset && rate && pitch && interlaced);
+        preset->setCurrentIndex(preset->findText("ProRes 422 HQ"));
+        QVERIFY(preset->currentIndex() >= 0);
+        const int fields = rate->findData("pulldown|30000/1001|2:3"), doubled = rate->findData("pulldown|60000/1001|2:2:2:4");
+        const int pal = rate->findData("speed|25/1|"), converted = rate->findData("convert|25/1|");
+        QVERIFY(fields > 0 && doubled > 0 && pal > 0 && converted > 0);
+        QVERIFY(rate->findData("convert|24000/1001|") < 0);  // (its own rate)
+        rate->setCurrentIndex(fields);
+        QVERIFY(rate->isEnabled() && !pitch->isEnabled() && !interlaced->isEnabled());  // fields are interlaced anyway
+        rate->setCurrentIndex(doubled);
+        QVERIFY(interlaced->isEnabled());
+        rate->setCurrentIndex(pal);
+        QVERIFY(pitch->isEnabled());
+        pitch->setChecked(false);
+        ed.findChild<QLineEdit*>("exportPath")->setText(dir_.path() + "/pal.mov");
+        ed.findChild<QPushButton*>("addToQueue")->click();
+        QCOMPARE(ed.result(), int(QDialog::Accepted));
+        QCOMPARE(queue->jobs().size(), jobs + 1);
+        const RenderQueue::Job& job = queue->jobs().back();
+        QCOMPARE(job.settings.rateChange, std::string("speed"));
+        QCOMPARE(job.settings.rate, (Rational{25, 1}));
+        QVERIFY(!job.settings.rateKeepPitch);
+        queue->remove(job.id);
+        // Remembered for the next export.
+        QCOMPARE(ExportDialog(state(), win_.get()).findChild<QComboBox*>("exportRate")->currentData().toString(), QStringLiteral("speed|25/1|"));
+        appSettings().remove("export/rate");
+        appSettings().remove("export/ratePitch");
+        appSettings().setValue("export/preset", rememberedPreset);
+        state()->newProject();
+    }
+
     void renderQueueInTheBackground() {
         loadDemo();
         RenderQueue* queue = win_->renderQueue();

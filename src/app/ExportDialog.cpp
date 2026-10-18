@@ -237,6 +237,53 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     startTc_->setToolTip(tr("The file's starting timecode, as broadcasters ask (often 10:00:00:00); MXF and MOV keep it"));
     startTc_->setText(appSettings().value("export/startTimecode").toString());
     form->addRow(tr("Start timecode:"), startTc_);
+    {
+        // Delivered at another frame rate (render/RateConversion.h): pulldown, a speed change or a standards conversion.
+        auto* row = new QWidget(form_);
+        auto* h = new QHBoxLayout(row);
+        h->setContentsMargins(0, 0, 0, 0);
+        rate_ = new QComboBox(row);
+        rate_->setObjectName(QStringLiteral("exportRate"));
+        rate_->setToolTip(tr("Pulldown for 29.97 interlaced or 59.94 deliveries of a 23.976 cut; a speed change (PAL's 25 from "
+                             "24, 4 % shorter, the sound sped with it); or a standards conversion, each new frame made from the "
+                             "two nearest by optical flow, never across a cut"));
+        ratePitch_ = new QCheckBox(tr("Keep pitch"), row);
+        ratePitch_->setObjectName(QStringLiteral("exportRatePitch"));
+        ratePitch_->setToolTip(tr("A speed change's sound keeps its pitch (time-stretched); off, it plays faster and higher (varispeed), "
+                                  "as a telecine's PAL speed-up does"));
+        ratePitch_->setChecked(appSettings().value("export/ratePitch", true).toBool());
+        h->addWidget(rate_, 1);
+        h->addWidget(ratePitch_);
+        form->addRow(tr("Frame rate:"), row);
+        const Rational own = seq ? seq->fps : Rational{25, 1};
+        auto name = [](Rational r) {
+            const double v = r.toDouble();
+            return std::fabs(v - std::round(v)) < 1e-6 ? QString::number(int(std::lround(v))) : QString::number(v, 'f', 3).remove(QRegularExpression(QStringLiteral("0+$")));
+        };
+        auto add = [&](const QString& label, const QString& mode, Rational r, const QString& cadence = {}) {
+            rate_->addItem(label, QStringLiteral("%1|%2/%3|%4").arg(mode).arg(r.num).arg(r.den).arg(cadence));
+        };
+        rate_->addItem(tr("As the sequence (%1)").arg(name(own)), QString());
+        const bool ntscFilm = std::fabs(own.toDouble() - 24000.0 / 1001.0) < 1e-3, film = ntscFilm || std::fabs(own.toDouble() - 24) < 1e-3;
+        if (film) {
+            const Rational i = ntscFilm ? Rational{30000, 1001} : Rational{30, 1}, pp = ntscFilm ? Rational{60000, 1001} : Rational{60, 1};
+            add(tr("%1 interlaced, 2:3 pulldown").arg(name(i)), QStringLiteral("pulldown"), i, QStringLiteral("2:3"));
+            add(tr("%1 interlaced, 2:2:2:4 pulldown").arg(name(i)), QStringLiteral("pulldown"), i, QStringLiteral("2:2:2:4"));
+            add(tr("%1, 2:3 pulldown").arg(name(pp)), QStringLiteral("pulldown"), pp, QStringLiteral("2:3"));
+            add(tr("%1, 2:2:2:4 pulldown").arg(name(pp)), QStringLiteral("pulldown"), pp, QStringLiteral("2:2:2:4"));
+            add(tr("25, sped up (PAL)"), QStringLiteral("speed"), Rational{25, 1});
+        }
+        if (std::fabs(own.toDouble() - 25) < 1e-3) {
+            add(tr("24, slowed down"), QStringLiteral("speed"), Rational{24, 1});
+            add(tr("23.976, slowed down"), QStringLiteral("speed"), Rational{24000, 1001});
+        }
+        for (Rational r : {Rational{24000, 1001}, Rational{24, 1}, Rational{25, 1}, Rational{30000, 1001}, Rational{30, 1}, Rational{50, 1},
+                           Rational{60000, 1001}, Rational{60, 1}})
+            if (std::fabs(r.toDouble() - own.toDouble()) > 1e-3) add(tr("%1, converted (motion compensated)").arg(name(r)), QStringLiteral("convert"), r);
+        const int at = rate_->findData(appSettings().value("export/rate").toString());
+        rate_->setCurrentIndex(std::max(0, at));
+        connect(rate_, &QComboBox::currentIndexChanged, this, [this] { updateControls(); });
+    }
     interlaced_ = new QCheckBox(tr("Interlaced, top field first"), form_);
     interlaced_->setObjectName(QStringLiteral("exportInterlaced"));
     interlaced_->setToolTip(tr("Coded as two fields, the top first (each picture as both fields: PsF), as 1080i deliveries ask"));
@@ -681,6 +728,10 @@ void ExportDialog::updateControls() {
     const ExportPreset* p = currentPreset();
     const bool video = p && hasVideo(p->settings);
     matchSize_->setEnabled(video);
+    if (rate_) {
+        rate_->setEnabled(video && p->settings.videoCodec != "gif");
+        ratePitch_->setEnabled(rate_->isEnabled() && rate_->currentData().toString().startsWith(QLatin1String("speed|")));
+    }
     width_->setEnabled(video && !matchSize_->isChecked());
     height_->setEnabled(video && !matchSize_->isChecked());
     color_->setEnabled(video);
@@ -749,7 +800,13 @@ void ExportDialog::updateControls() {
             mxfDelivery_->setToolTip(!broadcastMxfAvailable() ? tr("This build of Montage has no broadcast MXF writer (bmx)")
                                                                : tr("For the MPEG-2 HD and AVC-Intra 100 MXF presets"));
         // The DPP's HD is 1080i: coded interlaced whatever the box says.
-        interlaced_->setEnabled(video && (vc == "mpeg2video" || vc == "libx264" || vc == "prores_ks") && d != "as11-dpp");
+        // (pulldown into fields is interlaced anyway)
+        // (pulldown into fields: 29.97 or 30, not 59.94 or 60)
+        const QStringList r = rate_->currentData().toString().split(QLatin1Char('|'));
+        const QStringList nd = r.size() == 3 ? r[1].split(QLatin1Char('/')) : QStringList{};
+        const bool fields = r.size() == 3 && r[0] == QLatin1String("pulldown") && nd.size() == 2 && nd[1].toDouble() > 0 &&
+                            nd[0].toDouble() / nd[1].toDouble() < 40;
+        interlaced_->setEnabled(video && (vc == "mpeg2video" || vc == "libx264" || vc == "prores_ks" || vc == "ffv1") && d != "as11-dpp" && !fields);
     }
     if (credentials_) {
         ExportSettings would = p ? p->settings : ExportSettings{};
@@ -943,7 +1000,11 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     settings.setValue("export/chapters", chapters_->isChecked());
     if (startTc_->isEnabled() && !startTc_->text().trimmed().isEmpty() && state_->sequence()) {
         FrameTime t = 0;
-        const Rational fps = state_->sequence()->fps;
+        // (in the delivered rate's frames)
+        Rational fps = state_->sequence()->fps;
+        if (const QStringList r = rate_->currentData().toString().split(QLatin1Char('|')); rate_->isEnabled() && r.size() == 3)
+            if (const QStringList nd = r[1].split(QLatin1Char('/')); nd.size() == 2 && nd[0].toInt() > 0 && nd[1].toInt() > 0)
+                fps = Rational{nd[0].toInt(), nd[1].toInt()};
         if (!parseTimecode(startTc_->text().trimmed().toStdString(), fps, t) || t < 0) {
             QMessageBox::warning(this, tr("Export"), tr("The start timecode should look like 10:00:00:00."));
             return false;
@@ -953,6 +1014,15 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     settings.setValue("export/startTimecode", startTc_->text().trimmed());
     s.interlaced = interlaced_->isEnabled() && interlaced_->isChecked();
     settings.setValue("export/interlaced", interlaced_->isChecked());
+    if (const QStringList r = rate_->currentData().toString().split(QLatin1Char('|')); rate_->isEnabled() && r.size() == 3) {
+        s.rateChange = r[0].toStdString();
+        const QStringList nd = r[1].split(QLatin1Char('/'));
+        if (nd.size() == 2) s.rate = Rational{nd[0].toInt(), nd[1].toInt()};
+        if (!r[2].isEmpty()) s.cadence = r[2].toStdString();
+        s.rateKeepPitch = ratePitch_->isChecked();
+    }
+    settings.setValue("export/rate", rate_->currentData());
+    settings.setValue("export/ratePitch", ratePitch_->isChecked());
     if (mxfDelivery_->isEnabled()) {
         s.mxfDelivery = mxfDelivery_->currentData().toString().toStdString();
         settings.setValue("export/mxfDelivery", mxfDelivery_->currentData());
