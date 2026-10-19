@@ -55,7 +55,8 @@ struct GainMapPicture {
 std::shared_ptr<const GainMapPicture> decodeGainMapJpeg(const std::string& path, std::string* error = nullptr);
 
 // An AVIF with a gain map: a tone-mapped derived item ('tmap', ISO 21496-1's metadata) from its base (the primary item)
-// and its map. Its metadata (the meta box alone is read), and its HDR rendition as decodeGainMapJpeg gives it.
+// and its map. Its metadata (the meta box alone is read; false for a gain map Montage does not read: to SDR from an HDR
+// base, or in primaries or a curve it does not know), and its HDR rendition as decodeGainMapJpeg gives it.
 bool readGainMapAvif(const std::string& path, GainMapMetadata* metadata = nullptr);
 std::shared_ptr<const GainMapPicture> decodeGainMapAvif(const std::string& path, std::string* error = nullptr);
 // An AVIF still's primary picture as 8-bit RGB (null when it is not one); its primary item's coded data and property

@@ -108,12 +108,16 @@ bool isStillFormat(const AVFormatContext* fmt) {
 int bestVideoStream(AVFormatContext* fmt) {
     int best = -1;
     int64_t bestArea = -1;
+    bool bestDefault = false;
+    // The largest picture; of equal ones, the default (an AVIF's primary item, not a gain map the same size).
     for (unsigned i = 0; i < fmt->nb_streams; ++i) {
         AVStream* st = fmt->streams[i];
         if (st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) continue;
         if (st->disposition & AV_DISPOSITION_ATTACHED_PIC) continue;
         int64_t area = int64_t(st->codecpar->width) * st->codecpar->height;
-        if (area > bestArea) {
+        const bool isDefault = st->disposition & AV_DISPOSITION_DEFAULT;
+        if (area > bestArea || (area == bestArea && isDefault && !bestDefault)) {
+            bestDefault = isDefault;
             bestArea = area;
             best = int(i);
         }

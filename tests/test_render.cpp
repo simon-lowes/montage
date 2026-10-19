@@ -4359,6 +4359,21 @@ colorspaces:
                              std::abs(int(got[at + 2]) - trimmed[at + 2]) <= 3,
                          qPrintable(QString("AVIF SDR picture patch %1").arg(i)));
             }
+            // Gain maps it cannot read are refused rather than misread: item locations without lengths, a base in
+            // primaries Montage does not know (EBU Tech 3213).
+            QFile f(QString::fromStdString(gmAvif));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QByteArray bytes = f.readAll();
+            const qsizetype ilocAt = bytes.indexOf("iloc"), nclxAt = bytes.indexOf("nclx");
+            QVERIFY(ilocAt > 0 && nclxAt > 0);
+            auto refused = [&](const QString& name, qsizetype at, const QByteArray& with) {
+                QByteArray b = bytes;
+                b.replace(at, with.size(), with);
+                QFile o(dir.filePath(name));
+                return o.open(QIODevice::WriteOnly) && o.write(b) == b.size() && (o.close(), !readGainMapAvif(o.fileName().toStdString()));
+            };
+            QVERIFY(refused("no-lengths.avif", ilocAt + 8, QByteArray(1, char(0x40))));
+            QVERIFY(refused("ebu-primaries.avif", nclxAt + 4, QByteArray("\0\x16", 2)));
         }
 
         // For SDR screens (the default): the SDR trim's render, as an 8-bit PNG.

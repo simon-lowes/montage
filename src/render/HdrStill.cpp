@@ -828,7 +828,7 @@ bool writeGainMapAvif(const Image& sdr, const ColorSpace& sdrSpace, const Image&
     put16(cdsc, 1);
     put16(cdsc, 3);
     QByteArray altr;
-    put32(altr, 4);  // group id (unlike any item's)
+    put32(altr, 5);  // group id (unlike any item's)
     put32(altr, 2);
     put32(altr, 2);
     put32(altr, 1);
@@ -865,7 +865,8 @@ bool writeGainMapAvif(const Image& sdr, const ColorSpace& sdrSpace, const Image&
     if (uint64_t(head.size() + metaSize + 8 + payload.size()) > 0xffffffffu) return fail("Too large for this AVIF writer");
     const QByteArray file = head + metaBox(uint32_t(head.size() + metaSize + 8)) + box("mdat", payload);
     QSaveFile out(QString::fromStdString(path));
-    if (!out.open(QIODevice::WriteOnly) || out.write(file) != file.size() || !out.commit()) return fail("Cannot write " + path + ": " + out.errorString().toStdString());
+    if (!out.open(QIODevice::WriteOnly) || out.write(file) != file.size() || !out.commit())
+        return fail("Cannot write " + path + ": " + out.errorString().toStdString());
     return true;
 }
 

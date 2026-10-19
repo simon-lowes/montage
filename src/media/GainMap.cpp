@@ -15,6 +15,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <vector>
 
@@ -381,11 +382,28 @@ bool readGainMapJpeg(const std::string& path, GainMapJpeg& out) {
 
 namespace {
 
-// Each row of the HDR rendition of `base` (RGB32; sRGB's curve, else BT.709's) and `map` (Grayscale8 or RGB888): linear
-// light relative to SDR white, three values a pixel in the base's primaries, handed to `row(y, values)` (rows in
-// parallel).
+// A base's code value (0-1) as linear light, by its H.273 transfer: sRGB's curve (13, and unstated), BT.709's (1, 6, 14,
+// 15), gamma 2.2 (4) or 2.8 (5), or linear (8). False for others.
+bool baseTransferKnown(int transfer) {
+    return transfer == 2 || transfer == 13 || transfer == 1 || transfer == 6 || transfer == 14 || transfer == 15 || transfer == 4 ||
+           transfer == 5 || transfer == 8;
+}
+double baseToLinear(int transfer, double v) {
+    switch (transfer) {
+    case 1: case 6: case 14: case 15: return bt709ToLinear(v);
+    case 4: return std::pow(v, 2.2);
+    case 5: return std::pow(v, 2.8);
+    case 8: return v;
+    default: return srgbToLinear(v);
+    }
+}
+
+// Each row of the HDR rendition of `base` (RGB32, its code values by `transfer`) and `map` (Grayscale8 or RGB888): linear
+// light relative to SDR white, three values a pixel, handed to `row(y, values)` (rows in parallel). The map applies in
+// the base's primaries, else (`toMath`, a 3 x 3 matrix) in those the base is converted to first, which the values are in.
 template <typename Row>
-void gainedRows(const QImage& b, bool bt709Curve, const QImage& g, const GainMapMetadata& m, double headroom, const Row& row) {
+void gainedRows(const QImage& b, int transfer, const double* toMath, const QImage& g, const GainMapMetadata& m, double headroom,
+                const Row& row) {
     const int W = b.width(), H = b.height(), mw = g.width(), mh = g.height(), step = g.format() == QImage::Format_Grayscale8 ? 1 : 3;
     if (W <= 0 || H <= 0 || mw <= 0 || mh <= 0) return;
     // How much of the map applies: all of it from its capacity's maximum up.
@@ -401,7 +419,7 @@ void gainedRows(const QImage& b, bool bt709Curve, const QImage& g, const GainMap
             gain[c][v] = std::exp2((m.gainMapMin[c] + (m.gainMapMax[c] - m.gainMapMin[c]) * t) * weight);
         }
     double lin[256];
-    for (int v = 0; v < 256; ++v) lin[v] = bt709Curve ? bt709ToLinear(v / 255.0) : srgbToLinear(v / 255.0);
+    for (int v = 0; v < 256; ++v) lin[v] = baseToLinear(transfer, v / 255.0);
     parallelRows(H, [&](int y0, int y1) {
         std::vector<double> out(size_t(W) * 3);
         for (int y = y0; y < y1; ++y) {
@@ -416,12 +434,13 @@ void gainedRows(const QImage& b, bool bt709Curve, const QImage& g, const GainMap
                 const double mx = std::clamp((x + 0.5) * mw / W - 0.5, 0.0, double(mw - 1));
                 const int x0m = int(mx), x1m = std::min(x0m + 1, mw - 1);
                 const double fx = mx - x0m;
-                const int px[3] = {qRed(s[x]), qGreen(s[x]), qBlue(s[x])};
+                double sdr[3] = {lin[qRed(s[x])], lin[qGreen(s[x])], lin[qBlue(s[x])]};
+                if (toMath) multiply(toMath, sdr);
                 for (int c = 0; c < 3; ++c) {
                     const int k = step == 1 ? 0 : c;
                     const double a = gain[c][r0[x0m * step + k]] * (1 - fx) + gain[c][r0[x1m * step + k]] * fx;
                     const double bb = gain[c][r1[x0m * step + k]] * (1 - fx) + gain[c][r1[x1m * step + k]] * fx;
-                    d[c] = (lin[px[c]] + m.offsetSdr[c]) * (a * (1 - fy) + bb * fy) - m.offsetHdr[c];
+                    d[c] = (sdr[c] + m.offsetSdr[c]) * (a * (1 - fy) + bb * fy) - m.offsetHdr[c];
                 }
             }
             row(y, out.data());
@@ -436,17 +455,20 @@ QImage asMap(const QImage& q) {
     return q.format() == QImage::Format_Grayscale8 || q.format() == QImage::Format_RGB888 ? q : q.convertToFormat(QImage::Format_RGB888);
 }
 
-// The HDR rendition at full boost as 16-bit PQ (BT.2020) code values, from the base's primaries.
-std::shared_ptr<GainMapPicture> hdrRendition(const QImage& base, bool bt709Curve, Primaries from, const QImage& map, const GainMapMetadata& meta) {
-    double m[9];
-    primariesMatrix(from, Primaries::Bt2020, m);
+// The HDR rendition at full boost as 16-bit PQ (BT.2020) code values, from a base in `from` primaries (the map applied
+// in `math` ones).
+std::shared_ptr<GainMapPicture> hdrRendition(const QImage& base, int transfer, Primaries from, Primaries math, const QImage& map,
+                                             const GainMapMetadata& meta) {
+    double m[9], toMath[9];
+    primariesMatrix(math, Primaries::Bt2020, m);
+    primariesMatrix(from, math, toMath);
     const ColorSpace& space = *findColorSpace("rec2100pq");
     auto out = std::make_shared<GainMapPicture>();
     out->width = base.width();
     out->height = base.height();
     out->rgba.resize(size_t(out->width) * size_t(out->height) * 4);
     std::vector<double> peaks(size_t(out->height), 0.0);
-    gainedRows(base, bt709Curve, map, meta, 1e9, [&](int y, const double* s) {
+    gainedRows(base, transfer, from == math ? nullptr : toMath, map, meta, 1e9, [&](int y, const double* s) {
         uint16_t* d = out->rgba.data() + size_t(y) * size_t(out->width) * 4;
         for (int x = 0; x < out->width; ++x, s += 3, d += 4) {
             double v[3] = {s[0], s[1], s[2]};
@@ -479,6 +501,8 @@ std::shared_ptr<const GainMapPicture> cachedRendition(const std::string& path,
     std::shared_ptr<const GainMapPicture> out = decode();
     if (!out) return out;
     std::lock_guard<std::mutex> g(lock);
+    for (const auto& [k, picture] : known)
+        if (k == key) return picture;  // (decoded meanwhile on another thread)
     known.emplace_back(key, out);
     if (known.size() > 2) known.pop_front();
     return out;
@@ -489,7 +513,7 @@ std::shared_ptr<const GainMapPicture> cachedRendition(const std::string& path,
 void applyGainMap(const QImage& base, const QImage& map, const GainMapMetadata& m, Image& linear, double headroom) {
     const QImage b = asRgb32(base), g = asMap(map);
     linear = Image(b.width(), b.height(), Image::Uninitialized{});
-    gainedRows(b, false, g, m, headroom, [&](int y, const double* v) {
+    gainedRows(b, 13, nullptr, g, m, headroom, [&](int y, const double* v) {
         float* d = linear.row(y);
         for (int x = 0; x < b.width(); ++x, v += 3, d += 4) d[0] = float(v[0]), d[1] = float(v[1]), d[2] = float(v[2]), d[3] = 1;
     });
@@ -514,7 +538,7 @@ std::shared_ptr<const GainMapPicture> decodeGainMapJpeg(const std::string& path,
             base.convertToColorSpace(QColorSpace(QColorSpace::DisplayP3));
             from = Primaries::P3D65;
         }
-        return hdrRendition(base, false, from, map, info.metadata);
+        return hdrRendition(base, 13, from, from, map, info.metadata);
     });
     if (!out && error) *error = why;
     return out;
@@ -657,24 +681,26 @@ struct AvifItem {
     int method = 0;  // where its data is: 0 the file, 1 the meta box's idat
     uint64_t base = 0;
     std::vector<std::pair<uint64_t, uint64_t>> extents;  // offset, length
-    std::vector<QByteArray> properties;                  // its property boxes, whole, in order
+    std::vector<int> properties;                         // its property boxes (in the file's), in order
+    bool associated = false;                             // (listed in ipma, which lists an item once)
     std::vector<uint32_t> dimg;                          // the items it is derived from
 };
 struct AvifFile {
     uint32_t primary = 0;
-    std::vector<AvifItem> items;
+    std::map<uint32_t, AvifItem> items;
+    std::vector<QByteArray> properties;  // the property boxes, whole
     QByteArray idat;
     const AvifItem* item(uint32_t id) const {
-        for (const AvifItem& i : items)
-            if (i.id == id) return &i;
+        const auto it = items.find(id);
+        return it == items.end() ? nullptr : &it->second;
+    }
+    // An item's first property of a type.
+    const QByteArray* property(const AvifItem& item, const char* type) const {
+        for (int i : item.properties)
+            if (properties[size_t(i)].mid(4, 4) == type) return &properties[size_t(i)];
         return nullptr;
     }
 };
-const QByteArray* property(const AvifItem& item, const char* type) {
-    for (const QByteArray& p : item.properties)
-        if (p.size() >= 8 && p.mid(4, 4) == type) return &p;
-    return nullptr;
-}
 
 // An AVIF's items: its meta box read (the top-level boxes skipped by their sizes, so the pictures are not read).
 bool readAvifFile(QFile& f, AvifFile& out) {
@@ -700,12 +726,12 @@ bool readAvifFile(QFile& f, AvifFile& out) {
     if (meta.isEmpty() || !heifBoxes(meta, 0, meta.size(), top) || top.size() != 1 || top[0].body + 4 > top[0].end() ||
         !heifBoxes(meta, top[0].body + 4, top[0].end(), kids))  // (a full box)
         return false;
-    auto byId = [&](uint32_t id) -> AvifItem& {
-        for (AvifItem& i : out.items)
-            if (i.id == id) return i;
-        out.items.push_back({});
-        out.items.back().id = id;
-        return out.items.back();
+    // (An item by id, added when new; null past a few thousand, more than a still has.)
+    auto byId = [&](uint32_t id) -> AvifItem* {
+        if (out.items.size() >= 4096 && !out.items.count(id)) return nullptr;
+        AvifItem& i = out.items[id];
+        i.id = id;
+        return &i;
     };
     if (const HeifBox* p = heifFind(kids, "pitm"); p && p->body + 6 <= p->end())
         out.primary = uint8_t(meta[p->body]) == 0 ? uint32_t(beN(meta, p->body + 4, 2)) : (p->body + 8 <= p->end() ? be32(meta, p->body + 4) : 0);
@@ -722,7 +748,9 @@ bool readAvifFile(QFile& f, AvifFile& out) {
         if (v < 2) continue;
         const int idBytes = v == 2 ? 2 : 4;
         if (e.body + 4 + idBytes + 2 + 4 > e.end()) return false;
-        AvifItem& item = byId(uint32_t(beN(meta, e.body + 4, idBytes)));
+        AvifItem* found = byId(uint32_t(beN(meta, e.body + 4, idBytes)));
+        if (!found) return false;
+        AvifItem& item = *found;
         item.type = meta.mid(e.body + 4 + idBytes + 2, 4);
     }
     // Where their data is.
@@ -733,7 +761,9 @@ bool readAvifFile(QFile& f, AvifFile& out) {
         if (v > 2) return false;
         const int offsetSize = uint8_t(meta[at + 4]) >> 4, lengthSize = uint8_t(meta[at + 4]) & 15;
         const int baseSize = uint8_t(meta[at + 5]) >> 4, indexSize = v >= 1 ? uint8_t(meta[at + 5]) & 15 : 0;
-        if (offsetSize > 8 || lengthSize > 8 || baseSize > 8 || indexSize > 8) return false;
+        // (Sizes of 0, 4 or 8 bytes; a length is stated, so every extent takes bytes of the box.)
+        auto size = [](int n) { return n == 0 || n == 4 || n == 8; };
+        if (!size(offsetSize) || lengthSize == 0 || !size(lengthSize) || !size(baseSize) || !size(indexSize)) return false;
         at += 6;
         const int idBytes = v < 2 ? 2 : 4;
         if (at + idBytes > iloc->end()) return false;
@@ -741,7 +771,9 @@ bool readAvifFile(QFile& f, AvifFile& out) {
         at += idBytes;
         for (uint64_t i = 0; i < count; ++i) {
             if (at + idBytes + (v >= 1 ? 2 : 0) + 2 + baseSize + 2 > iloc->end()) return false;
-            AvifItem& item = byId(uint32_t(beN(meta, at, idBytes)));
+            AvifItem* found = byId(uint32_t(beN(meta, at, idBytes)));
+            if (!found) return false;
+            AvifItem& item = *found;
             at += idBytes;
             if (v >= 1) item.method = int(beN(meta, at, 2) & 15), at += 2;
             if (beN(meta, at, 2) != 0) item.method = -1;  // (in another file)
@@ -766,7 +798,9 @@ bool readAvifFile(QFile& f, AvifFile& out) {
         if (!heifBoxes(meta, iref->body + 4, iref->end(), refs)) return false;
         for (const HeifBox& r : refs) {
             if (r.type != "dimg" || r.body + idBytes + 2 > r.end()) continue;
-            AvifItem& item = byId(uint32_t(beN(meta, r.body, idBytes)));
+            AvifItem* found = byId(uint32_t(beN(meta, r.body, idBytes)));
+            if (!found) return false;
+            AvifItem& item = *found;
             const uint64_t n = beN(meta, r.body + idBytes, 2);
             if (r.body + idBytes + 2 + qint64(n) * idBytes > r.end()) return false;
             for (uint64_t k = 0; k < n; ++k) item.dimg.push_back(uint32_t(beN(meta, r.body + idBytes + 2 + qint64(k) * idBytes, idBytes)));
@@ -778,6 +812,7 @@ bool readAvifFile(QFile& f, AvifFile& out) {
     if (!iprpBox || !heifBoxes(meta, iprpBox->body, iprpBox->end(), iprp)) return false;
     const HeifBox *ipco = heifFind(iprp, "ipco"), *ipma = heifFind(iprp, "ipma");
     if (!ipco || !ipma || !heifBoxes(meta, ipco->body, ipco->end(), props)) return false;
+    for (const HeifBox& b : props) out.properties.push_back(meta.mid(b.at, b.size));
     qint64 at = ipma->body;
     if (at + 8 > ipma->end()) return false;
     const int v = uint8_t(meta[at]);
@@ -787,15 +822,18 @@ bool readAvifFile(QFile& f, AvifFile& out) {
     for (uint64_t e = 0; e < entries; ++e) {
         const int idBytes = v < 1 ? 2 : 4;
         if (at + idBytes + 1 > ipma->end()) return false;
-        AvifItem& item = byId(uint32_t(beN(meta, at, idBytes)));
+        AvifItem* found = byId(uint32_t(beN(meta, at, idBytes)));
+        if (!found) return false;
+        AvifItem& item = *found;
+        if (item.associated) return false;
+        item.associated = true;
         const int n = uint8_t(meta[at + idBytes]);
         at += idBytes + 1;
         if (at + qint64(n) * (wide ? 2 : 1) > ipma->end()) return false;
         for (int k = 0; k < n; ++k) {
             const unsigned index = wide ? unsigned(beN(meta, at, 2) & 0x7fff) : unsigned(uint8_t(meta[at]) & 0x7f);
             at += wide ? 2 : 1;
-            if (index >= 1 && index <= props.size())
-                item.properties.push_back(meta.mid(props[index - 1].at, props[index - 1].size));
+            if (index >= 1 && index <= props.size()) item.properties.push_back(int(index - 1));
         }
     }
     return true;
@@ -806,11 +844,13 @@ QByteArray itemData(QFile& f, const AvifFile& a, const AvifItem& item) {
     QByteArray out;
     for (const auto& [offset, length] : item.extents) {
         if (length > (1u << 30) || uint64_t(out.size()) + length > (1u << 30)) return {};
+        // (Within `limit`, without overflowing.)
+        auto within = [&](uint64_t limit) { return item.base <= limit && offset <= limit - item.base && length <= limit - item.base - offset; };
         if (item.method == 1) {
-            if (item.base + offset + length > uint64_t(a.idat.size())) return {};
+            if (!within(uint64_t(a.idat.size()))) return {};
             out += a.idat.mid(qsizetype(item.base + offset), qsizetype(length));
         } else if (item.method == 0) {
-            if (item.base + offset + length > uint64_t(f.size()) || !f.seek(qint64(item.base + offset))) return {};
+            if (!within(uint64_t(f.size())) || !f.seek(qint64(item.base + offset))) return {};
             const QByteArray part = f.read(qint64(length));
             if (part.size() != qint64(length)) return {};
             out += part;
@@ -821,20 +861,59 @@ QByteArray itemData(QFile& f, const AvifFile& a, const AvifItem& item) {
     return out;
 }
 
-// The colr (nclx) property's code points (primaries, transfer, matrix, full range); false without one.
-bool nclx(const AvifItem& item, int& primaries, int& transfer, int& matrix, bool& full) {
-    const QByteArray* c = property(item, "colr");
-    if (!c || c->size() < 8 + 4 + 7 || c->mid(8, 4) != "nclx") return false;
-    primaries = int(beN(*c, 12, 2)), transfer = int(beN(*c, 14, 2)), matrix = int(beN(*c, 16, 2));
-    full = uint8_t((*c)[18]) & 0x80;
+// An item's colour (H.273 code points; 0 where not known): its colr property's (nclx), else what its ICC profile's
+// primaries and curve are. False without either.
+struct ItemColour {
+    int primaries = 0, transfer = 0, matrix = 0;
+    bool full = true;
+    bool nclx = false;  // (an ICC profile states no matrix or range)
+};
+bool itemColour(const AvifFile& a, const AvifItem& item, ItemColour& out) {
+    const QByteArray* icc = nullptr;
+    for (int i : item.properties) {
+        const QByteArray& c = a.properties[size_t(i)];
+        if (c.mid(4, 4) != "colr" || c.size() < 12) continue;
+        if (c.mid(8, 4) == "nclx" && c.size() >= 8 + 4 + 7) {
+            out.primaries = int(beN(c, 12, 2)), out.transfer = int(beN(c, 14, 2)), out.matrix = int(beN(c, 16, 2));
+            out.full = uint8_t(c[18]) & 0x80;
+            out.nclx = true;
+            return true;
+        }
+        if ((c.mid(8, 4) == "prof" || c.mid(8, 4) == "rICC") && !icc) icc = &c;
+    }
+    if (!icc) return false;
+    const QColorSpace cs = QColorSpace::fromIccProfile(icc->mid(12));
+    if (!cs.isValid()) return false;
+    out = ItemColour();
+    out.primaries = cs.primaries() == QColorSpace::Primaries::SRgb        ? 1
+                    : cs.primaries() == QColorSpace::Primaries::DciP3D65 ? 12
+                                                                          : 0;
+    const double gamma = cs.gamma();
+    out.transfer = cs.transferFunction() == QColorSpace::TransferFunction::SRgb     ? 13
+                   : cs.transferFunction() == QColorSpace::TransferFunction::Linear ? 8
+                   : cs.transferFunction() != QColorSpace::TransferFunction::Gamma ? 0
+                   : std::fabs(gamma - 2.2) < 0.02                                 ? 4
+                   : std::fabs(gamma - 2.8) < 0.02                                 ? 5
+                                                                                   : 0;
     return true;
 }
 
+// Montage's primaries for H.273's (1 BT.709, 9 BT.2020, 12 Display P3; unstated as BT.709); false for others.
+bool knownPrimaries(int cicp, Primaries& out) {
+    if (cicp == 1 || cicp == 2) return out = Primaries::Bt709, true;
+    if (cicp == 9) return out = Primaries::Bt2020, true;
+    if (cicp == 12) return out = Primaries::P3D65, true;
+    return false;
+}
+
 // An AV1 picture (an item's data and its av1C property) as 8-bit RGB.
-QImage decodeAv1(const AvifItem& item, const QByteArray& data, std::string& why) {
-    const QByteArray* av1C = property(item, "av1C");
+QImage decodeAv1(const AvifFile& a, const AvifItem& item, const QByteArray& data, std::string& why) {
+    const QByteArray* av1C = a.property(item, "av1C");
     if (!av1C || av1C->size() < 12 || data.isEmpty()) return why = "Not an AV1 picture", QImage();
+    // (FFmpeg's own AV1 decoder needs hardware decoding: dav1d or libaom decode in software.)
     const AVCodec* codec = avcodec_find_decoder_by_name("libdav1d");
+    if (!codec) codec = avcodec_find_decoder_by_name("libaom-av1");
+    const bool software = codec;
     if (!codec) codec = avcodec_find_decoder(AV_CODEC_ID_AV1);
     if (!codec) return why = "No AV1 decoder in this build of FFmpeg", QImage();
     AVCodecContext* ctx = avcodec_alloc_context3(codec);
@@ -842,7 +921,7 @@ QImage decodeAv1(const AvifItem& item, const QByteArray& data, std::string& why)
     AVFrame* frame = av_frame_alloc();
     SwsContext* sws = nullptr;
     QImage out;
-    why = "Cannot decode the AV1 picture";
+    why = software ? "Cannot decode the AV1 picture" : "Cannot decode the AV1 picture (this build of FFmpeg has no software AV1 decoder: dav1d or libaom)";
     if (ctx && pkt && frame) {
         const int extra = int(av1C->size() - 8);
         ctx->extradata = static_cast<uint8_t*>(av_mallocz(size_t(extra) + AV_INPUT_BUFFER_PADDING_SIZE));
@@ -854,9 +933,9 @@ QImage decodeAv1(const AvifItem& item, const QByteArray& data, std::string& why)
             std::memcpy(pkt->data, data.constData(), size_t(data.size()));
             pkt->flags |= AV_PKT_FLAG_KEY;
             if (avcodec_send_packet(ctx, pkt) >= 0 && avcodec_send_packet(ctx, nullptr) >= 0 && avcodec_receive_frame(ctx, frame) >= 0) {
-                int primaries = 0, transfer = 0, matrix = int(frame->colorspace);
+                int matrix = int(frame->colorspace);
                 bool full = frame->color_range == AVCOL_RANGE_JPEG;
-                nclx(item, primaries, transfer, matrix, full);
+                if (ItemColour c; itemColour(a, item, c) && c.nclx) matrix = c.matrix, full = c.full;
                 sws = sws_getContext(frame->width, frame->height, AVPixelFormat(frame->format), frame->width, frame->height, AV_PIX_FMT_RGB24,
                                      SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT | SWS_FULL_CHR_H_INP, nullptr, nullptr, nullptr);
                 if (sws) {
@@ -879,18 +958,37 @@ QImage decodeAv1(const AvifItem& item, const QByteArray& data, std::string& why)
     return out;
 }
 
-struct GainMapItems {
+// A gain map Montage reads: the tone-mapped item, its base and map, its metadata, the base's primaries and transfer,
+// and the primaries the map applies in. False for a file without one, or with one to SDR from an HDR base, or in
+// colour Montage does not know.
+struct GainMapAvif {
     const AvifItem *tmap = nullptr, *base = nullptr, *map = nullptr;
+    GainMapMetadata meta;
+    Primaries basePrimaries = Primaries::Bt709, mathPrimaries = Primaries::Bt709;
+    int transfer = 13;
 };
-bool findGainMap(const AvifFile& a, GainMapItems& out) {
-    for (const AvifItem& i : a.items)
+bool findGainMap(QFile& f, const AvifFile& a, GainMapAvif& out) {
+    for (const auto& [id, i] : a.items)
         if (i.type == "tmap" && i.dimg.size() == 2) {
             out.tmap = &i;
             out.base = a.item(i.dimg[0]);
             out.map = a.item(i.dimg[1]);
-            return out.base && out.map && out.base->type == "av01" && out.map->type == "av01";
+            break;
         }
-    return false;
+    if (!out.tmap || !out.base || !out.map || out.base->type != "av01" || out.map->type != "av01") return false;
+    const QByteArray data = itemData(f, a, *out.tmap);
+    if (data.size() < 2 || data[0] != 0 || !readIsoMetadata(data, 1, data.size(), out.meta) || out.meta.baseIsHdr) return false;  // (version 0)
+    ItemColour base;
+    if (!itemColour(a, *out.base, base)) base.primaries = 1, base.transfer = 13;  // (unstated: sRGB)
+    if (!knownPrimaries(base.primaries, out.basePrimaries) || !baseTransferKnown(base.transfer)) return false;
+    out.transfer = base.transfer;
+    out.mathPrimaries = out.basePrimaries;
+    if (!out.meta.useBaseColorSpace) {
+        // (In the HDR rendition's primaries, as the tone-mapped item states them.)
+        ItemColour hdr;
+        if (!itemColour(a, *out.tmap, hdr) || !knownPrimaries(hdr.primaries, out.mathPrimaries)) return false;
+    }
+    return true;
 }
 
 }  // namespace
@@ -898,12 +996,9 @@ bool findGainMap(const AvifFile& a, GainMapItems& out) {
 bool readGainMapAvif(const std::string& path, GainMapMetadata* metadata) {
     QFile f(QString::fromStdString(path));
     AvifFile a;
-    GainMapItems g;
-    if (!f.open(QIODevice::ReadOnly) || !readAvifFile(f, a) || !findGainMap(a, g)) return false;
-    const QByteArray data = itemData(f, a, *g.tmap);
-    GainMapMetadata m;
-    if (data.size() < 2 || data[0] != 0 || !readIsoMetadata(data, 1, data.size(), m)) return false;  // (version 0)
-    if (metadata) *metadata = m;
+    GainMapAvif g;
+    if (!f.open(QIODevice::ReadOnly) || !readAvifFile(f, a) || !findGainMap(f, a, g)) return false;
+    if (metadata) *metadata = g.meta;
     return true;
 }
 
@@ -912,20 +1007,12 @@ std::shared_ptr<const GainMapPicture> decodeGainMapAvif(const std::string& path,
     auto out = cachedRendition(path, [&]() -> std::shared_ptr<const GainMapPicture> {
         QFile f(QString::fromStdString(path));
         AvifFile a;
-        GainMapItems g;
-        GainMapMetadata meta;
-        if (!f.open(QIODevice::ReadOnly) || !readAvifFile(f, a) || !findGainMap(a, g) || !readGainMapAvif(path, &meta))
-            return why = "No gain map in " + path, nullptr;
-        if (meta.baseIsHdr) return why = "A gain map to SDR from an HDR base is not read", nullptr;
-        int primaries = 1, transfer = 13, matrix = 0;
-        bool full = true;
-        nclx(*g.base, primaries, transfer, matrix, full);
-        if (transfer == 16 || transfer == 18) return why = "A gain map to SDR from an HDR base is not read", nullptr;
-        const QImage base = decodeAv1(*g.base, itemData(f, a, *g.base), why);
-        const QImage map = base.isNull() ? QImage() : decodeAv1(*g.map, itemData(f, a, *g.map), why);
+        GainMapAvif g;
+        if (!f.open(QIODevice::ReadOnly) || !readAvifFile(f, a) || !findGainMap(f, a, g)) return why = "No gain map Montage reads in " + path, nullptr;
+        const QImage base = decodeAv1(a, *g.base, itemData(f, a, *g.base), why);
+        const QImage map = base.isNull() ? QImage() : decodeAv1(a, *g.map, itemData(f, a, *g.map), why);
         if (base.isNull() || map.isNull()) return why = "Cannot decode " + path + ": " + why, nullptr;
-        const Primaries from = primaries == 12 ? Primaries::P3D65 : primaries == 9 ? Primaries::Bt2020 : Primaries::Bt709;
-        return hdrRendition(asRgb32(base), transfer != 13 && transfer != 2, from, map, meta);
+        return hdrRendition(asRgb32(base), g.transfer, g.basePrimaries, g.mathPrimaries, map, g.meta);
     });
     if (!out && error) *error = why;
     return out;
@@ -937,7 +1024,7 @@ QImage decodeAvifPicture(const std::string& path, std::string* error) {
     AvifFile a;
     QImage out;
     if (f.open(QIODevice::ReadOnly) && readAvifFile(f, a))
-        if (const AvifItem* item = a.item(a.primary); item && item->type == "av01") out = decodeAv1(*item, itemData(f, a, *item), why);
+        if (const AvifItem* item = a.item(a.primary); item && item->type == "av01") out = decodeAv1(a, *item, itemData(f, a, *item), why);
     if (out.isNull() && error) *error = why;
     return out;
 }
@@ -948,9 +1035,9 @@ bool readAvifCodedItem(const std::string& path, AvifCodedItem& out) {
     AvifFile a;
     if (!f.open(QIODevice::ReadOnly) || !readAvifFile(f, a)) return false;
     const AvifItem* item = a.item(a.primary);
-    if (!item || item->type != "av01" || !property(*item, "av1C")) return false;
+    if (!item || item->type != "av01" || !a.property(*item, "av1C")) return false;
     out.data = itemData(f, a, *item);
-    out.properties = item->properties;
+    for (int i : item->properties) out.properties.push_back(a.properties[size_t(i)]);
     return !out.data.isEmpty();
 }
 

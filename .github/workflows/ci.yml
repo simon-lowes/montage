@@ -134,7 +134,7 @@ jobs:
           key: libavif-${{ runner.os }}-${{ hashFiles('scripts/build-avifgainmaputil.sh') }}
       - name: The reference gain-map AVIF reader for the HDR stills test
         run: |
-          (sudo apt-get install -y --no-install-recommends libdav1d-dev > /dev/null && scripts/build-avifgainmaputil.sh ~/libavif) \
+          (sudo apt-get update > /dev/null && sudo apt-get install -y --no-install-recommends libdav1d-dev > /dev/null && scripts/build-avifgainmaputil.sh ~/libavif) \
             && echo "MONTAGE_TEST_AVIFGAINMAP=$HOME/libavif/bin/avifgainmaputil" >> "$GITHUB_ENV" \
             || echo "::warning::Could not build libavif's avifgainmaputil; its part of the HDR stills test will be skipped"
       - name: Test
