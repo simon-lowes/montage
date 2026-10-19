@@ -25680,10 +25680,16 @@ private slots:
         for (int i = 0; i < N; ++i) frames.push_back(skyFrame(W, H, i, pan, uint32_t(i + 3)));
         const std::string video = path("sky.mp4");
         writeFrames(video, frames, 25, 0);
+        // Its frames as they were drawn (the PNGs the video was made from, as a sequence), so the edge is the same on
+        // every system: a video's colours pass through each system's FFmpeg, and these hills are a hair from the sky.
+        ImageSequence run;
+        QVERIFY(detectImageSequence(path("sky.mp4.frame0.png"), run));
+        QCOMPARE(run.frames(), N);
+        run.fps = {25, 1};
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
         s.width = W, s.height = H, s.fps = Rational{25, 1};
-        MediaItem m = probeOrFail(p, video);
+        MediaItem m = probeOrFail(p, imageSequencePath(run));
         p.media.push_back(m);
         QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
         Clip& clip = s.videoTracks[0].clips.at(0);
@@ -25692,45 +25698,30 @@ private slots:
         sky.params["view"] = Param(1.0);    // the matte
         sky.params["use_depth"] = Param(0.0);
         clip.effects.push_back(sky);
-        // Each column's edge: where the matte falls through a half, below the top.
-        auto edges = [&](const Image& matte) {
-            std::vector<double> e(size_t(W), -1);
-            for (int x = 0; x < W; ++x)
-                for (int y = 1; y < H; ++y) {
-                    const float a = matte.at(x, y - 1)[1], b = matte.at(x, y)[1];
-                    if (a >= 0.5f && b < 0.5f) {
-                        e[size_t(x)] = y - 1 + (a - 0.5) / std::max(1e-6f, a - b);
-                        break;
-                    }
-                }
-            return e;
-        };
-        // How far the edge moves from frame to frame beyond the pan (the picture moving `pan` pixels left a frame).
+        // How far the sky's edge moves from frame to frame beyond the pan (the picture moving `pan` pixels left a frame):
+        // the matte that changed, against the last frame's moved with the picture, over the width (as many rows of change
+        // in each column as the edge moved there; a sliver that comes and goes counts for its own size).
         auto movement = [&](bool steady) {
             clip.effects.back().params["steady"] = Param(steady ? 1.0 : 0.0);
-            std::vector<std::vector<double>> e;
-            for (int i = 0; i < N; ++i) e.push_back(edges(renderSequenceFrame(p, s, i, {})));
+            std::vector<Image> m;
+            for (int i = 0; i < N; ++i) m.push_back(renderSequenceFrame(p, s, i, {}));
             double sum = 0;
-            int n = 0;
             for (int i = 1; i < N; ++i)
-                for (int x = 8; x < W - 8; ++x) {
-                    const double before = e[size_t(i - 1)][size_t(x)], now = e[size_t(i)][size_t(x)];
-                    if (before < 0 || now < 0) continue;
-                    // (the edge now at x was at x + pan a frame ago)
-                    const double xs = x + pan;
-                    const int x0 = int(xs);
-                    const double was = e[size_t(i - 1)][size_t(x0)] * (1 - (xs - x0)) + e[size_t(i - 1)][size_t(x0 + 1)] * (xs - x0);
-                    if (e[size_t(i - 1)][size_t(x0)] < 0 || e[size_t(i - 1)][size_t(x0 + 1)] < 0) continue;
-                    sum += std::fabs(now - was);
-                    ++n;
-                }
-            return n > W ? sum / n : 1e9;
+                for (int y = 0; y < H; ++y)
+                    for (int x = 8; x < W - 8; ++x) {
+                        // (what is at x now was at x + pan a frame ago)
+                        const double xs = x + pan;
+                        const int x0 = int(xs);
+                        const double was = m[size_t(i - 1)].at(x0, y)[1] * (1 - (xs - x0)) + m[size_t(i - 1)].at(x0 + 1, y)[1] * (xs - x0);
+                        sum += std::fabs(m[size_t(i)].at(x, y)[1] - was);
+                    }
+            return sum / ((N - 1) * (W - 16));
         };
         const double jumpy = movement(false), steady = movement(true);
         qInfo("sky edge movement beyond the pan: %.3f px frame by frame, %.3f px held steady", jumpy, steady);
-        // (the hazy hills drop in and out of the sky frame by frame, the edge jumping from them to the trees)
-        QVERIFY2(steady < 0.6, qPrintable(QString::number(steady)));
-        QVERIFY2(steady < 0.5 * jumpy, qPrintable(QString("%1 vs %2").arg(steady).arg(jumpy)));
+        // (the hazy hills' crest drops in and out of the sky frame by frame, and the grain moves the edge about)
+        QVERIFY2(steady < 0.75, qPrintable(QString::number(steady)));
+        QVERIFY2(steady < 0.7 * jumpy, qPrintable(QString("%1 vs %2").arg(steady).arg(jumpy)));
     }
 };
 

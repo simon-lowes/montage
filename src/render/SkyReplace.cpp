@@ -371,12 +371,33 @@ std::vector<float> skyMatte(const Image& img, const ValueMap* depth, double sens
 
 namespace {
 
-// What a frame's sky is carried from: its picture in grey (at most 320 wide) and its coarse sky, kept for the frames
-// around it, by what decides the frame.
+// What a frame's sky is carried from: its picture in grey (at most 320 wide), its coarse sky and its sky as refined on
+// its own edges, kept for the frames around it, by what decides the frame.
 struct SkyLook {
     GrayImage gray;
     CoarseSky sky;
+    int width = 0, height = 0;
+    std::vector<uint8_t> matte;  // (0..255)
+    float matteAt(double x, double y) const {  // bilinear, clamped to the edges
+        x = std::clamp(x, 0.0, double(width - 1)), y = std::clamp(y, 0.0, double(height - 1));
+        const int x0 = int(x), y0 = int(y), x1 = std::min(x0 + 1, width - 1), y1 = std::min(y0 + 1, height - 1);
+        const float fx = float(x - x0), fy = float(y - y0);
+        auto m = [&](int i, int j) { return float(matte[size_t(j) * size_t(width) + size_t(i)]); };
+        return ((m(x0, y0) * (1 - fx) + m(x1, y0) * fx) * (1 - fy) + (m(x0, y1) * (1 - fx) + m(x1, y1) * fx) * fy) / 255.f;
+    }
 };
+
+std::shared_ptr<const SkyLook> lookOf(const Image& picture, const ValueMap* depth, double sensitivity, double lowest, double refine) {
+    auto look = std::make_shared<SkyLook>();
+    look->gray = toGray(picture, 320);
+    look->sky = coarseSky(picture, depth, sensitivity, lowest);
+    std::vector<float> m = fullSize(look->sky, picture.width, picture.height);
+    finishSky(m, picture, 1.5 * look->sky.f + 2, refine);
+    look->width = picture.width, look->height = picture.height;
+    look->matte.resize(m.size());
+    for (size_t i = 0; i < m.size(); ++i) look->matte[i] = uint8_t(std::lround(std::clamp(m[i], 0.f, 1.f) * 255));
+    return look;
+}
 
 std::mutex gSkyMutex;
 std::deque<std::pair<std::string, std::shared_ptr<const SkyLook>>> gSkyLooks;
@@ -404,36 +425,44 @@ void keepLook(std::deque<std::pair<std::string, std::shared_ptr<const T>>>& kept
 std::vector<float> steadySkyMatte(const Image& img, const ValueMap* depth, const SkyShot& shot, double sensitivity, double lowest,
                                   double refine) {
     const int W = img.width, H = img.height;
-    auto look = std::make_shared<SkyLook>();
-    look->gray = toGray(img, 320);
-    look->sky = coarseSky(img, depth, sensitivity, lowest);
-    const CoarseSky& own = look->sky;
+    const GrayImage gray = toGray(img, 320);
+    const CoarseSky own = coarseSky(img, depth, sensitivity, lowest);
     std::string settings;
     {
-        char buf[96];
-        std::snprintf(buf, sizeof buf, "|%dx%d|%.4f|%.4f", W, H, sensitivity, lowest);
+        char buf[128];
+        std::snprintf(buf, sizeof buf, "|%dx%d|%.4f|%.4f|%.4f", W, H, sensitivity, lowest, refine);
         settings = buf;
     }
     // (This frame's own look is of the picture as it is here, with what is below and its matte, so it is not kept for
     // its neighbours, which see the clip's layer alone: the flows from it are its own.)
     const std::string ownKey = shot.key ? shot.key(0) : std::string();
-    std::vector<float> out = fullSize(own, W, H);
-    if (own.grid.empty() || !shot.frame) {
-        finishSky(out, img, 1.5 * own.f + 2, refine);
-        return out;
-    }
-    const double kg = double(look->gray.width) / W;  // full-size pixels to grey ones
-    // The grid cells' centres in grey pixels, followed frame by frame along the flow.
-    std::vector<float> sum = own.grid, weight(own.grid.size(), 1.0f);
+    auto finished = [&](const CoarseSky& c) {
+        std::vector<float> m = fullSize(c, W, H);
+        finishSky(m, img, 1.5 * c.f + 2, refine);
+        return m;
+    };
+    if (own.grid.empty() || !shot.frame) return finished(own);
+    const double kg = double(gray.width) / W;  // full-size pixels to grey ones
+    const size_t cells = own.grid.size();
+    auto centre = [&](size_t i) {
+        const int gx = int(i % size_t(own.w)), gy = int(i / size_t(own.w));
+        return Point2{((gx + 0.5) * own.f - 0.5) * kg, ((gy + 0.5) * own.f - 0.5) * kg};
+    };
+    // The frames around it: where each grid cell's centre is carried to in each, along the flow from frame to frame,
+    // and how far it counts there (only where the two pictures agree once carried).
+    struct Carried {
+        std::shared_ptr<const SkyLook> look;
+        std::vector<Point2> at;
+        std::vector<float> weight;
+    };
+    std::vector<Carried> around;
     for (int dir : {-1, 1}) {
-        std::shared_ptr<const SkyLook> from = look;
+        const GrayImage* fromGray = &gray;
         std::string fromKey = ownKey.empty() ? std::string() : ownKey + "|self";
-        std::vector<Point2> at(own.grid.size());
-        std::vector<uint8_t> alive(own.grid.size(), 1);
-        for (int gy = 0; gy < own.h; ++gy)
-            for (int gx = 0; gx < own.w; ++gx)
-                at[size_t(gy) * size_t(own.w) + size_t(gx)] = {((gx + 0.5) * own.f - 0.5) * kg, ((gy + 0.5) * own.f - 0.5) * kg};
-        for (int k = 1; k <= 3; ++k) {
+        std::vector<Point2> at(cells);
+        std::vector<uint8_t> alive(cells, 1);
+        for (size_t i = 0; i < cells; ++i) at[i] = centre(i);
+        for (int k = 1; k <= 4; ++k) {
             const int offset = dir * k;
             const std::string key = ownKey.empty() ? std::string() : shot.key(offset);
             std::shared_ptr<const SkyLook> next = key.empty() ? nullptr : keptLook(gSkyLooks, key + settings);
@@ -441,24 +470,20 @@ std::vector<float> steadySkyMatte(const Image& img, const ValueMap* depth, const
                 Image picture;
                 std::shared_ptr<const ValueMap> theirDepth;
                 if (!shot.frame(offset, picture, theirDepth) || picture.width != W || picture.height != H) break;
-                auto made = std::make_shared<SkyLook>();
-                made->gray = toGray(picture, 320);
-                made->sky = coarseSky(picture, theirDepth.get(), sensitivity, lowest);
-                next = made;
+                next = lookOf(picture, theirDepth.get(), sensitivity, lowest, refine);
                 if (!key.empty()) keepLook(gSkyLooks, key + settings, next, 24);
             }
-            if (next->sky.grid.size() != own.grid.size() || next->gray.width != look->gray.width) break;
+            if (next->sky.grid.size() != cells || next->gray.width != gray.width || next->width != W || next->height != H) break;
             // The flow from the last frame to this one (kept too).
             const std::string flowKey = fromKey.empty() || key.empty() ? std::string() : fromKey + ">" + key + settings;
             std::shared_ptr<const FlowField> flow = keptLook(gSkyFlows, flowKey);
             if (!flow) {
-                flow = std::make_shared<const FlowField>(denseFlow(from->gray, next->gray, 4));
+                flow = std::make_shared<const FlowField>(denseFlow(*fromGray, next->gray, 4));
                 keepLook(gSkyFlows, flowKey, flow, 24);
             }
-            const float wt = float(std::exp(-k * k / 8.0));  // (nearer frames count for more)
-            const GrayImage& g0 = look->gray;
             const GrayImage& gk = next->gray;
-            for (size_t i = 0; i < at.size(); ++i) {
+            Carried c{next, {}, std::vector<float>(cells, 0.f)};
+            for (size_t i = 0; i < cells; ++i) {
                 if (!alive[i]) continue;
                 const Point2 d = flow->at(at[i].x, at[i].y);
                 at[i].x += d.x, at[i].y += d.y;
@@ -466,29 +491,60 @@ std::vector<float> steadySkyMatte(const Image& img, const ValueMap* depth, const
                     alive[i] = 0;
                     continue;
                 }
-                // Only where the two pictures agree once carried (not something that moved in front).
-                const int gx = int(i % size_t(own.w)), gy = int(i / size_t(own.w));
-                const double hx = ((gx + 0.5) * own.f - 0.5) * kg, hy = ((gy + 0.5) * own.f - 0.5) * kg;
-                const float diff = std::fabs(g0.sample(hx, hy) - gk.sample(at[i].x, at[i].y));
-                const float agree = std::exp(-(diff / 0.06f) * (diff / 0.06f));
-                // Their sky there (on their grid).
-                const double cx = std::clamp((at[i].x / kg + 0.5) / own.f - 0.5, 0.0, double(own.w - 1));
-                const double cy = std::clamp((at[i].y / kg + 0.5) / own.f - 0.5, 0.0, double(own.h - 1));
-                const int x0 = int(cx), y0 = int(cy), x1 = std::min(x0 + 1, own.w - 1), y1 = std::min(y0 + 1, own.h - 1);
-                const float fx = float(cx - x0), fy = float(cy - y0);
-                auto g = [&](int x, int y) { return next->sky.grid[size_t(y) * size_t(own.w) + size_t(x)]; };
-                const float m = (g(x0, y0) * (1 - fx) + g(x1, y0) * fx) * (1 - fy) + (g(x0, y1) * (1 - fx) + g(x1, y1) * fx) * fy;
-                sum[i] += m * wt * agree;
-                weight[i] += wt * agree;
+                const Point2 h = centre(i);
+                const float diff = std::fabs(gray.sample(h.x, h.y) - gk.sample(at[i].x, at[i].y));
+                c.weight[i] = std::exp(-(diff / 0.06f) * (diff / 0.06f));
             }
-            from = next;
+            c.at = at;
+            around.push_back(std::move(c));
+            fromGray = &next->gray;
             fromKey = key;
         }
     }
+    if (around.empty()) return finished(own);
+    // Each cell decided by the frames around it together (sky in most, sky), as one frame's coarse sky is decided: what
+    // is a hair from the sky is then sky, or not, through the shot.
     CoarseSky held = own;
-    for (size_t i = 0; i < held.grid.size(); ++i) held.grid[i] = sum[i] / weight[i];
-    out = fullSize(held, W, H);
-    finishSky(out, img, 1.5 * own.f + 2, refine);
+    for (size_t i = 0; i < cells; ++i) {
+        float sum = own.grid[i], weight = 1;
+        for (const Carried& c : around) {
+            if (c.weight[i] <= 0) continue;
+            const Point2& p = c.at[i];
+            const double cx = std::clamp((p.x / kg + 0.5) / own.f - 0.5, 0.0, double(own.w - 1));
+            const double cy = std::clamp((p.y / kg + 0.5) / own.f - 0.5, 0.0, double(own.h - 1));
+            const int x0 = int(cx), y0 = int(cy), x1 = std::min(x0 + 1, own.w - 1), y1 = std::min(y0 + 1, own.h - 1);
+            const float fx = float(cx - x0), fy = float(cy - y0);
+            auto g = [&](int x, int y) { return c.look->sky.grid[size_t(y) * size_t(own.w) + size_t(x)]; };
+            sum += ((g(x0, y0) * (1 - fx) + g(x1, y0) * fx) * (1 - fy) + (g(x0, y1) * (1 - fx) + g(x1, y1) * fx) * fy) * c.weight[i];
+            weight += c.weight[i];
+        }
+        held.grid[i] = sum >= 0.5f * weight ? 1.f : 0.f;
+    }
+    std::vector<float> out = finished(held);
+    // Its edge put where the frames around put theirs, each carried here: each frame's edge on its own picture jitters
+    // with the grain, and together they hold still. (Only where they decided as this frame did.)
+    parallelRows(H, [&](int y0, int y1) {
+        for (int Y = y0; Y < y1; ++Y)
+            for (int X = 0; X < W; ++X) {
+                const size_t p = size_t(Y) * size_t(W) + size_t(X);
+                const float mine = out[p];
+                const int gx = std::clamp(X / own.f, 0, own.w - 1), gy = std::clamp(Y / own.f, 0, own.h - 1);
+                const size_t i = size_t(gy) * size_t(own.w) + size_t(gx);
+                const Point2 here{(X + 0.5) * kg - 0.5, (Y + 0.5) * kg - 0.5}, from = centre(i);
+                float sum = mine, weight = 1;
+                for (const Carried& c : around) {
+                    if (c.weight[i] <= 0) continue;
+                    const double px = (c.at[i].x + here.x - from.x + 0.5) / kg - 0.5, py = (c.at[i].y + here.y - from.y + 0.5) / kg - 0.5;
+                    const float theirs = c.look->matteAt(px, py);
+                    if (std::fabs(theirs - mine) >= 0.5f) continue;
+                    sum += theirs * c.weight[i];
+                    weight += c.weight[i];
+                }
+                out[p] = sum / weight;
+            }
+    });
+    for (size_t i = 0; i < out.size(); ++i)
+        if (img.px[i * 4 + 3] <= 1e-3f) out[i] = 0.f;
     return out;
 }
 
