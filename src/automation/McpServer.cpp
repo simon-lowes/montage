@@ -38,6 +38,7 @@
 #include "render/Versions.h"
 #include "render/Dcp.h"
 #include "render/Adm.h"
+#include "render/Iamf.h"
 #include "render/Imf.h"
 #include "render/BroadcastMxf.h"
 #include "render/LightLevel.h"
@@ -151,6 +152,7 @@
 #include "render/Letterbox.h"
 #include "render/Processing.h"
 #include "render/Restoration.h"
+#include "media/LensCalibration.h"
 #include "media/LensDatabase.h"
 #include "core/Production.h"
 #include "core/ProjectLock.h"
@@ -5237,6 +5239,46 @@ void McpServer::Impl::addTools() {
                                   {"seconds", double(r.samples) / 48000.0}, {"chna_tracks", int(info.chna.size())}});
         });
 
+    add("montage_export_iamf", "Export immersive audio as IAMF",
+        "Write the active sequence's sound as IAMF (the Alliance for Open Media's Immersive Audio Model and Formats), "
+        "which YouTube and players take immersive and ambisonic sound in: an .mp4 (or .m4a) whose track is IAMF, or the "
+        "bare stream (.iamf). A surround or immersive layout (5.1 to 7.1.4, montage_set_surround) is a bed in that layout "
+        "with any audio objects rendered into it; an ambisonic one (first to third order) a scene, a substream per "
+        "component. The mix presentation carries the loudness measured in the layout and in stereo (BS.1770 integrated, "
+        "sample and true peak) and plays binaurally on headphones unless `binaural` is false. FLAC (lossless) or 24-bit "
+        "PCM, 48 kHz. Returns what the file holds, read back.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"path":{"type":"string","description":"The .mp4, .m4a or .iamf to write"},
+            "codec":{"type":"string","enum":["flac","lpcm"],"default":"flac"},
+            "binaural":{"type":"boolean","default":true,"description":"On headphones: rendered binaurally (false: as stereo)"},
+            "title":{"type":"string"},"in_out":{"type":"boolean","default":false,"description":"Only In to Out"}},
+            "required":["project","path"]})json",
+        true, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Sequence& s = l.seq();
+            IamfSettings st;
+            st.codec = str(a, "codec", "flac").toStdString();
+            if (st.codec != "flac" && st.codec != "lpcm") throw ArgError{"\"codec\" must be \"flac\" or \"lpcm\""};
+            st.binaural = a.value("binaural").toBool(true);
+            st.title = str(a, "title", QString::fromStdString(s.name)).toStdString();
+            st.inOut = a.value("in_out").toBool();
+            const QString path = absolute(need(a, "path"));
+            IamfResult r;
+            std::string err;
+            if (!exportIamf(l.project, s, st, path.toStdString(), &r, [this](double f) { progress(f, "IAMF"); return true; }, &err))
+                return fail(QString::fromStdString(err));
+            IamfInfo info;
+            if (!readIamfInfo(r.path, info, &err)) return fail(QString::fromStdString(err));
+            QJsonArray loudness;
+            for (const IamfLoudness& m : info.loudness)
+                loudness.append(QJsonObject{{"layout", QString::fromStdString(m.layout)}, {"integrated_lufs", m.integrated},
+                                            {"sample_peak_dbfs", m.digitalPeak}, {"true_peak_dbtp", m.truePeak}});
+            return ok(QStringLiteral("Wrote %1 IAMF (%2, %3 substreams)").arg(QString::fromStdString(r.layout), QString::fromStdString(r.codec)).arg(r.substreams),
+                      QJsonObject{{"path", path}, {"layout", QString::fromStdString(r.layout)}, {"codec", QString::fromStdString(r.codec)},
+                                  {"scene_based", info.sceneBased}, {"channels", r.channels}, {"substreams", info.substreams},
+                                  {"coupled", info.coupled}, {"seconds", double(r.samples) / 48000.0}, {"frames", info.frames},
+                                  {"binaural", info.headphonesMode == 1}, {"loudness", loudness}});
+        });
+
     add("montage_super_scale", "Super Scale a file",
         "Write a copy of a video or still enlarged 2, 3 or 4 times with Real-ESRGAN, which redraws edges and texture "
         "instead of blurring them. A video keeps its sound (output .mov is ProRes 422 HQ, others H.264); a still is "
@@ -7399,6 +7441,151 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Corrected the %1 on %2 clip(s)").arg(QString::fromStdString(lens::lensName(*c.lens))).arg(n), out);
         });
 
+    add("montage_calibrate_lens", "Calibrate a lens",
+        "Lens calibration: makes a lens profile for the lens a video clip was shot with and puts it in a Lens Correction "
+        "first in the clip's effects. From a checkerboard: `board` is its inner corners across and down ([9, 6] for a "
+        "board of 10 x 7 squares); the whole board is looked for in up to 40 frames of the clip (`from` and `to`, "
+        "timeline times, narrow them), best seen at many angles and reaching the frame's corners, and the focal length, "
+        "the lens's centre, its distortion and (`anamorphic`) a squeeze are fitted so the corners land where they were "
+        "seen (`squeeze` holds one known, or starts the fit). Or from `lines` that should be straight (an edge of a building, a horizon: each three points or more "
+        "along it, fractions of the frame at `at`), snapped to the picture's edges there unless `snap` is false, and "
+        "straightened (the focal length is not known from lines; `focal` names it). `model` is lensfun's poly3, poly5 "
+        "(default) or ptlens. `maker`, `name` and `focal` (mm) name the lens; it is saved to the user's lens folder, so "
+        "Lens Correction offers it for clips from the same camera. `same_media` corrects every clip of the media; "
+        "`fit_only` changes nothing. Returns the fit: rms and worst (pixels: the corners' reprojection, or how far the "
+        "lines are from straight), the terms (in halves of the frame's shorter side), the centre (lensfun's units), the squeeze, the focal length found and the "
+        "profile's file (or why it was not saved: the clip is corrected anyway).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":["number","string"],"description":"A video clip's id or name"},
+            "board":{"type":"array","items":{"type":"integer"},"minItems":2,"maxItems":2},
+            "from":{"type":["number","string"]},"to":{"type":["number","string"]},
+            "lines":{"type":"array","items":{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2}}},
+            "at":{"type":["number","string"],"description":"Timeline time of the frame the lines are on"},"snap":{"type":"boolean","default":true},
+            "model":{"type":"string","enum":["poly3","poly5","ptlens"],"default":"poly5"},
+            "anamorphic":{"type":"boolean","default":false},"squeeze":{"type":"number","default":1},"fit_center":{"type":"boolean","description":"Default: true for a board, false for lines"},
+            "maker":{"type":"string"},"name":{"type":"string"},"focal":{"type":"number"},
+            "same_media":{"type":"boolean","default":false},"fit_only":{"type":"boolean","default":false}},
+            "required":["project","clip"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Clip clip = videoClipArg(l, a);
+            const MediaItem* media = clip.mediaId ? l.project.findMedia(clip.mediaId) : nullptr;
+            if (!media || !media->hasVideo) throw ArgError{"\"clip\" must show footage (not a generator or a nested sequence)"};
+            const bool board = a.contains("board"), lines = a.contains("lines");
+            if (board == lines) throw ArgError{"Give \"board\" (a checkerboard's inner corners) or \"lines\" (that should be straight)"};
+            LensFitOptions o;
+            const QString model = str(a, "model", "poly5");
+            if (model != "poly3" && model != "poly5" && model != "ptlens") throw ArgError{"\"model\" is poly3, poly5 or ptlens"};
+            o.model = model == "poly3" ? lens::Distortion::Poly3 : model == "ptlens" ? lens::Distortion::PtLens : lens::Distortion::Poly5;
+            o.fitSqueeze = a.value("anamorphic").toBool();
+            o.squeeze = a.value("squeeze").toDouble(1);
+            if (!(o.squeeze >= 0.25 && o.squeeze <= 4)) throw ArgError{"\"squeeze\" must be from 0.25 to 4"};
+            o.fitCenter = a.value("fit_center").toBool(board);
+            if (a.contains("focal") && !(a.value("focal").toDouble() > 0 && a.value("focal").toDouble() <= 2000))
+                throw ArgError{"\"focal\" must be from 0 to 2000 (mm)"};
+            const double seqFps = s.fpsValue();
+            auto mediaSeconds = [&](FrameTime t) { return clip.sourceAt(double(std::clamp<FrameTime>(t, clip.start, clip.start + clip.duration - 1) - clip.start)) / seqFps; };
+            LensFit fit;
+            int width = 0, height = 0;
+            std::string err;
+            QJsonObject out;
+            if (board) {
+                const QJsonArray b = a.value("board").toArray();
+                const int cols = b.size() == 2 ? b[0].toInt() : 0, rows = b.size() == 2 ? b[1].toInt() : 0;
+                if (cols < 2 || rows < 2 || cols > 60 || rows > 60) throw ArgError{"\"board\" is the inner corners across and down, 2 to 60 each"};
+                const FrameTime from = a.contains("from") ? timeArg(a.value("from"), s, "from") : clip.start;
+                const FrameTime to = a.contains("to") ? timeArg(a.value("to"), s, "to") : clip.start + clip.duration;
+                if (to <= from) throw ArgError{"\"to\" must be after \"from\""};
+                ClipCalibration cc;
+                const double t0 = mediaSeconds(from), t1 = mediaSeconds(to - 1) + 1 / seqFps;
+                if (!calibrateClip(media->path, std::min(t0, t1), std::max(t0, t1), cols, rows, o, cc, &err,
+                                   [this](double f) { progress(f, "Calibrating"); }))
+                    return fail(QString::fromStdString(err));
+                fit = cc.fit;
+                width = cc.width, height = cc.height;
+                out["frames_read"] = cc.framesRead;
+                out["boards_found"] = cc.boardsFound;
+            } else {
+                const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : clip.start + clip.duration / 2;
+                VideoDecoder dec;
+                if (!dec.open(media->path, &err)) return fail(QString::fromStdString(err));
+                width = dec.displayWidth(), height = dec.displayHeight();
+                const Frame16Ptr frame = dec.frameAt(mediaSeconds(at), width, height, true);
+                if (!frame) return fail("The clip's frame could not be read");
+                const GrayImage gray = toGray(*frame);
+                const bool snap = a.value("snap").toBool(true);
+                std::vector<std::vector<Point2>> drawn;
+                for (const QJsonValue& lv : a.value("lines").toArray()) {
+                    std::vector<Point2> pts;
+                    for (const QJsonValue& pv : lv.toArray()) {
+                        const QJsonArray q = pv.toArray();
+                        const double x = q.size() == 2 ? q[0].toDouble(-1) : -1, y = q.size() == 2 ? q[1].toDouble(-1) : -1;
+                        if (!(x >= 0 && x <= 1 && y >= 0 && y <= 1)) throw ArgError{"\"lines\" are points [x, y], fractions of the frame"};
+                        pts.push_back({x * width, y * height});
+                    }
+                    if (pts.size() < (snap ? 2u : 3u)) throw ArgError{snap ? "Each line needs two points or more" : "Each line needs three points or more"};
+                    drawn.push_back(snap ? snapLineToEdge(gray, pts) : pts);
+                }
+                if (!calibrateFromLines(drawn, width, height, o, fit, &err)) return fail(QString::fromStdString(err));
+            }
+            // Named, saved and put on the clip(s).
+            const std::shared_ptr<const lens::Database> db = lensDatabase();
+            const lens::Camera* camera = db ? suggestLens(*db, *media).camera : nullptr;
+            LensIdentity id;
+            const auto device = media->metadata.find("device");
+            id.maker = a.contains("maker") ? str(a, "maker").toStdString()
+                     : camera                ? camera->maker
+                                             : std::string("Calibrated");
+            id.focalMm = a.value("focal").toDouble(0);
+            const double real = fitFocalMm(fit, width, height, camera ? camera->cropFactor : 0);
+            const double named = id.focalMm > 0 ? id.focalMm : real;
+            id.model = a.contains("name") ? str(a, "name").toStdString()
+                                          : (device != media->metadata.end() ? device->second + " " : std::string()) +
+                                                (named > 0 ? QString::number(named, 'f', 0).toStdString() + "mm " : std::string()) + "(calibrated)";
+            if (id.model == "(calibrated)") id.model = "Lens (calibrated)";
+            id.cropFactor = camera ? camera->cropFactor : 0;
+            id.mount = camera ? camera->mount : std::string();
+            const lens::Lens made = calibratedLens(fit, width, height, id);
+            QJsonArray terms;
+            for (int k = 0; k < (fit.model == lens::Distortion::Poly3 ? 1 : fit.model == lens::Distortion::Poly5 ? 2 : 3); ++k) terms.append(fit.terms[k]);
+            out["lens"] = QString::fromStdString(lens::lensName(made));
+            out["model"] = model;
+            out["terms"] = terms;
+            out["center"] = QJsonArray{fit.centerX, fit.centerY};
+            out["squeeze"] = fit.squeeze;
+            out["rms"] = fit.rms;
+            out["worst"] = fit.worst;
+            out["views"] = fit.views;
+            out["points"] = fit.points;
+            out["width"] = width;
+            out["height"] = height;
+            if (real > 0) out["focal_found"] = std::round(real * 100) / 100;
+            const QString summary = board ? QStringLiteral("Fitted from %1 frames of the board: corners within %2 px (rms %3)")
+                                                .arg(fit.views).arg(fit.worst, 0, 'f', 3).arg(fit.rms, 0, 'f', 3)
+                                          : QStringLiteral("Fitted from %1 lines: straight within %2 px (rms %3)").arg(fit.views).arg(fit.worst, 0, 'f', 3).arg(fit.rms, 0, 'f', 3);
+            if (a.value("fit_only").toBool()) return ok(summary, out);
+            std::string file;
+            // (Put on the clip even when it cannot be kept: the effect holds the profile itself.)
+            const bool saved = saveUserLens(made, &file, &err);
+            if (saved) out["file"] = QString::fromStdString(file);
+            else out["not_saved"] = QString::fromStdString(err);
+            LensChoice c;
+            c.lens = &made;
+            c.camera = camera;
+            c.focal = made.minFocal;
+            c.aperture = 0;
+            const std::vector<Id> clips = a.value("same_media").toBool() ? clipsOfSameMedia(s, clip.id) : std::vector<Id>{clip.id};
+            const int n = applyLensCorrection(l.project, s, clips, c);
+            save(l);
+            out["clips"] = n;
+            if (const Clip* now = edit::clipById(s, clip.id))
+                for (const Effect& x : now->effects)
+                    if (x.type == "lens_correction") out["effect"] = double(x.id);
+            return ok(summary + (saved ? QStringLiteral("\nSaved %1 and corrected %2 clip(s)")
+                                       : QStringLiteral("\nCorrected %2 clip(s) with %1, not saved: ") + QString::fromStdString(err))
+                                      .arg(QString::fromStdString(lens::lensName(made))).arg(n), out);
+        });
+
     add("montage_object_mask", "Pick objects for a mask",
         "AI object masks (Premiere's Object Mask, Resolve's Magic Mask, Final Cut's Magnetic Mask), with several objects in "
         "one mask: limits a clip's video effect (`effect`, its id) to objects picked by clicks. `object` is the object's "
@@ -9335,11 +9522,15 @@ void McpServer::Impl::addTools() {
         "(default: every footage clip on the video tracks). OpenEXR pulls can carry more in each frame: `source_layers` "
         "copies a multi-layer OpenEXR source's other layers (AOVs) and Cryptomattes as they are, `mattes` adds each of the "
         "clip's masks as a one-channel layer matte_<effect>; `compression` is any of OpenEXR's (none, rle, zips, zip, "
-        "piz, pxr24, b44, b44a, dwaa, dwab, zstd, htj2k256, htj2k32; default zip).",
+        "piz, pxr24, b44, b44a, dwaa, dwab, zstd, htj2k256, htj2k32; default zip). `st_maps` writes, for a shot whose "
+        "clip has a Lens Correction, ST maps (32-bit OpenEXR, red the source's x over its width, green 1 minus its y over "
+        "its height) that undistort the plate as Lens Correction does with no fit (all of the picture, at the overscan size "
+        "returned), and redistort renders back.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string"},
             "clips":{"type":"array","items":{"type":"number"}},"format":{"type":"string","enum":["exr","dpx","tiff"],"default":"exr"},
             "handles":{"type":"integer","default":8},"cut_in":{"type":"integer","default":1001},"amf":{"type":"boolean","default":true},
-            "compression":{"type":"string"},"source_layers":{"type":"boolean","default":false},"mattes":{"type":"boolean","default":false}},
+            "compression":{"type":"string"},"source_layers":{"type":"boolean","default":false},"mattes":{"type":"boolean","default":false},
+            "st_maps":{"type":"boolean","default":false}},
             "required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -9352,6 +9543,7 @@ void McpServer::Impl::addTools() {
             o.compression = str(a, "compression").toStdString();
             o.sourceLayers = a.value("source_layers").toBool();
             o.mattes = a.value("mattes").toBool();
+            o.stMaps = a.value("st_maps").toBool();
             std::vector<Id> clips;
             for (const QJsonValue& v : a.value("clips").toArray()) clips.push_back(Id(v.toDouble()));
             if (clips.empty())
@@ -9364,16 +9556,20 @@ void McpServer::Impl::addTools() {
             QJsonArray list;
             QStringList lines;
             for (const VfxShot& s : shots) {
-                list.append(QJsonObject{{"name", QString::fromStdString(s.name)}, {"folder", QString::fromStdString(s.folder)},
-                                        {"first_frame", s.firstFrame}, {"cut_in", s.cutIn}, {"cut_out", s.cutOut}, {"last_frame", s.lastFrame},
-                                        {"head_handle", s.headHandle}, {"tail_handle", s.tailHandle}, {"amf", QString::fromStdString(s.amf)}});
+                QJsonObject sh{{"name", QString::fromStdString(s.name)}, {"folder", QString::fromStdString(s.folder)},
+                               {"first_frame", s.firstFrame}, {"cut_in", s.cutIn}, {"cut_out", s.cutOut}, {"last_frame", s.lastFrame},
+                               {"head_handle", s.headHandle}, {"tail_handle", s.tailHandle}, {"amf", QString::fromStdString(s.amf)}};
+                if (!s.undistortMap.empty()) {
+                    sh["undistort_map"] = QString::fromStdString(s.undistortMap);
+                    sh["redistort_map"] = QString::fromStdString(s.redistortMap);
+                    sh["overscan"] = QJsonArray{s.overscanWidth, s.overscanHeight};
+                }
                 if (!s.layers.empty()) {
                     QJsonArray layers;
                     for (const std::string& n : s.layers) layers.append(QString::fromStdString(n));
-                    QJsonObject sh = list.last().toObject();
                     sh["layers"] = layers;
-                    list.last() = sh;
                 }
+                list.append(sh);
                 lines << QStringLiteral("%1: frames %2-%3 (cut %4-%5)").arg(QString::fromStdString(s.name)).arg(s.firstFrame).arg(s.lastFrame).arg(s.cutIn).arg(s.cutOut);
             }
             const QString csv = QDir(QString::fromStdString(o.folder)).filePath("pull_list.csv");

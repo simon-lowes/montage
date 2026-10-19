@@ -28,6 +28,11 @@ struct VfxPullOptions {
     std::string compression;     // "" = ZIP (16 lines); or any of exrCompressions(), HTJ2K and zstd among them
     bool sourceLayers = false;   // a multi-layer OpenEXR source's other layers (AOVs) and Cryptomattes, copied as they are
     bool mattes = false;         // the clip's masks, each a one-channel layer "matte_<effect>" (A, 1 inside)
+    // A shot whose clip has a Lens Correction: ST maps for its lens (32-bit OpenEXR, media/LensCalibration.h) beside the
+    // plate, <shot>_undistort.exr (at the overscan size) and <shot>_redistort.exr, so the vendor's comp undistorts the
+    // plate as Lens Correction does with no fit (all of the picture, at the recording's scale) and redistorts its
+    // renders to match it.
+    bool stMaps = false;
 };
 
 struct VfxShot {
@@ -40,6 +45,8 @@ struct VfxShot {
     int headHandle = 0, tailHandle = 0;  // the handles there was footage for
     std::string amf;                    // its ACES Metadata File, when written
     std::vector<std::string> layers;    // OpenEXR: the layers and Cryptomattes written beside the plate (its own is the main picture)
+    std::string undistortMap, redistortMap;  // its ST maps, when written
+    int overscanWidth = 0, overscanHeight = 0;  // the undistorted plate's size (its undistort map's)
 };
 
 // Pulls the clips (video clips of footage; titles and other generated clips

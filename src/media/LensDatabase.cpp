@@ -1,6 +1,8 @@
 #include "LensDatabase.h"
 
 #include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QStandardPaths>
 #include <cstdlib>
 #include <algorithm>
@@ -91,6 +93,11 @@ std::shared_ptr<const lens::Database>& loaded() {
     return db;
 }
 
+bool& lensfunFound() {
+    static bool found = false;
+    return found;
+}
+
 }  // namespace
 
 const ModelPack& lensDatabasePack() {
@@ -131,16 +138,71 @@ std::shared_ptr<const lens::Database> lensDatabase() {
     // (Looked for again while there is none: it may have been fetched since.)
     if (loaded()) return loaded();
     const char* env = std::getenv("MONTAGE_LENS_DB");
+    std::shared_ptr<lens::Database> found;
     for (const std::string& dir : lensDatabaseFolders()) {
         // (Not a download cut short.)
         if (!(env && *env) && dir == lensDatabasePack().directory() && !lensDatabasePack().installed()) continue;
         auto db = std::make_shared<lens::Database>();
         if (db->addDirectory(dir) > 0 && !db->empty()) {
-            loaded() = db;
+            found = db;
             break;
         }
     }
+    lensfunFound() = found != nullptr;
+    // The user's own, with lensfun's or alone.
+    if (const std::string own = userLensFolder(); !own.empty() && QDir(QString::fromStdString(own)).exists()) {
+        if (!found) found = std::make_shared<lens::Database>();
+        found->addDirectory(own, true);
+        if (found->empty()) found.reset();
+    }
+    loaded() = found;
     return loaded();
+}
+
+bool lensfunDatabaseFound() {
+    lensDatabase();
+    std::lock_guard lock(dbMutex());
+    return lensfunFound();
+}
+
+std::string userLensFolder() {
+    if (const QString env = qEnvironmentVariable("MONTAGE_USER_LENSES"); !env.isEmpty()) return env.toStdString();
+    if (const char* env = std::getenv("MONTAGE_LENS_DB"); env && *env) return {};
+    const QString data = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    return data.isEmpty() ? std::string() : (data + "/lenses").toStdString();
+}
+
+bool saveUserLens(const lens::Lens& l, std::string* file, std::string* error) {
+    const QString dir = QString::fromStdString(userLensFolder());
+    if (dir.isEmpty() || !QDir().mkpath(dir)) {
+        if (error) *error = "There is no folder to keep lenses in";
+        return false;
+    }
+    // (Named after the lens, in letters, digits, dashes and underscores; a file of another lens of that name is kept,
+    // one of the same lens replaced.)
+    QString name = QString::fromStdString(l.maker + " " + l.model).trimmed();
+    for (QChar& ch : name)
+        if (!ch.isLetterOrNumber() && ch != '-' && ch != '_') ch = '_';
+    if (name.isEmpty()) name = "lens";
+    QString path = QDir(dir).filePath(name + ".xml");
+    for (int n = 2; QFileInfo::exists(path); ++n) {
+        QFile was(path);
+        if (was.open(QIODevice::ReadOnly)) {
+            const auto other = lens::parseLens(was.readAll().toStdString());
+            if (other && other->maker == l.maker && other->model == l.model) break;
+        }
+        path = QDir(dir).filePath(name + "_" + QString::number(n) + ".xml");
+    }
+    const std::string xml = lens::lensXml(l);
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(xml.data(), qint64(xml.size())) != qint64(xml.size())) {
+        if (error) *error = "Cannot write " + path.toStdString();
+        return false;
+    }
+    f.close();
+    if (file) *file = path.toStdString();
+    reloadLensDatabase();
+    return true;
 }
 
 void reloadLensDatabase() {

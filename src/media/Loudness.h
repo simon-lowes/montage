@@ -29,7 +29,7 @@ public:
     explicit LoudnessMeter(int sampleRate);
     ~LoudnessMeter();
     void add(const float* stereo, int64_t frames);
-    // Interleaved audio of `channels` (up to 8), each weighted as BS.1770 says
+    // Interleaved audio of `channels` (up to 24), each weighted as BS.1770 says
     // (1 front, 1.41 surround, 0 for the LFE).
     void addChannels(const float* data, int64_t frames, int channels, const double* weights);
     LoudnessResult result() const;

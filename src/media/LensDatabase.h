@@ -16,9 +16,18 @@ const ModelPack& lensDatabasePack();
 // Where a database is looked for, in order: MONTAGE_LENS_DB alone when set; else the downloaded pack's folder, then
 // lensfun's updates and installed folders.
 std::vector<std::string> lensDatabaseFolders();
-// The first of them holding one, read once (null when none does); read again after reloadLensDatabase.
+// The first of them holding one, with the user's own lenses (userLensFolder), read once (null when there are none);
+// read again after reloadLensDatabase.
 std::shared_ptr<const lens::Database> lensDatabase();
 void reloadLensDatabase();
+// Whether lensfun's database itself was found (not only the user's own lenses).
+bool lensfunDatabaseFound();
+// Where lenses the user calibrated are kept: MONTAGE_USER_LENSES when set; else none when MONTAGE_LENS_DB is (the
+// database is that folder alone); else "lenses" in Montage's data folder.
+std::string userLensFolder();
+// Saves a lens there (in a file named after it, replacing one of the same name) and reads the database again; the
+// file's path in `file`.
+bool saveUserLens(const lens::Lens& lens, std::string* file = nullptr, std::string* error = nullptr);
 
 // What a Lens Correction corrects for: the lens, the camera it was on (its sensor's size), the focal length and the
 // aperture (0: the lens's shortest and widest).

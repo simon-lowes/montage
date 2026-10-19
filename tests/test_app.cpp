@@ -125,6 +125,7 @@
 #include "MediaBinWidget.h"
 #include "ReviewOverlay.h"
 #include "ChartMatchDialog.h"
+#include "LensCalibrationDialog.h"
 #include "LensCorrectionDialog.h"
 #include "media/Proxy.h"
 #include "StoryboardView.h"
@@ -3640,6 +3641,16 @@ private slots:
         BwfInfo info;
         QVERIFY(readBwfInfo(path.toStdString(), info) && info.channels == 13 && info.chna.size() == 13);
         QVERIFY(info.axml.find("audioObjectName=\"A2\"") != std::string::npos);
+        // The same mix as IAMF: the object rendered into the 7.1.4 bed, with its loudness in 7.1.4 and stereo.
+        QVERIFY(win_->findChild<QAction*>("exportIamf"));
+        const QString iamf = dir_.filePath("immersive.mp4");
+        IamfSettings is;
+        is.title = "App mix";
+        IamfResult ir;
+        QVERIFY(win_->exportIamfTo(iamf, is, &ir));
+        QVERIFY(ir.layout == "7.1.4" && ir.channels == 12 && ir.substreams == 7 && ir.loudness.size() == 2);
+        IamfInfo ii;
+        QVERIFY(readIamfInfo(iamf.toStdString(), ii) && ii.loudspeakerLayout == 7 && ii.title == "App mix" && ii.frames == ir.frames);
         state()->newProject();
     }
 
@@ -7877,6 +7888,126 @@ private slots:
         // Played: filled to the frame's corners.
         const Image frame = renderProgramFrame(state()->project(), *state()->sequence(), 5, RenderOptions{});
         QVERIFY(frame.at(0, 0)[3] > 0.99f);
+    }
+
+    void calibrateLensInTheApp() {
+        // The user's lens folder in a temporary one; no lensfun database.
+        QTemporaryDir own;
+        qputenv("MONTAGE_USER_LENSES", own.path().toUtf8());
+        qputenv("MONTAGE_LENS_DB", QFile::encodeName(own.filePath("no-lensfun")));
+        reloadLensDatabase();
+        struct Restore {
+            ~Restore() {
+                qunsetenv("MONTAGE_USER_LENSES");
+                qunsetenv("MONTAGE_LENS_DB");
+                reloadLensDatabase();
+                lensCalibrationDialogHook() = nullptr;
+            }
+        } restore;
+        // A still through a lens with barrel distortion (poly3): a grid of lines straight before the lens bent them.
+        const int W = 640, H = 360;
+        lens::Lens truth;
+        truth.cropFactor = 1;
+        truth.aspectRatio = double(W - 1) / (H - 1);
+        truth.minFocal = truth.maxFocal = 24;
+        lens::Calibration cal;
+        cal.cropFactor = 1, cal.aspectRatio = truth.aspectRatio;
+        lens::Distortion d;
+        d.model = lens::Distortion::Poly3;
+        d.focal = 24;
+        d.terms[0] = -0.05;
+        cal.distortion.push_back(d);
+        truth.calibrations.push_back(cal);
+        lens::Settings plain;
+        plain.fit = lens::Settings::None;
+        plain.focal = 24;
+        const lens::Correction c(truth, plain, W, H);
+        QImage img(W, H, QImage::Format_RGB32);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                // (4 x 4 samples: how much of the pixel is on a line 3 px wide, every 60 px.)
+                int dark = 0;
+                for (int s = 0; s < 16; ++s) {
+                    double xc, yc;
+                    c.corrected(x + (s % 4 + 0.5) / 4, y + (s / 4 + 0.5) / 4, xc, yc);
+                    const double fx = std::fmod(xc + 6000, 60.0), fy = std::fmod(yc + 6000, 60.0);
+                    dark += fx < 3 || fy < 3;
+                }
+                const int v = 220 - dark * 180 / 16;
+                img.setPixel(x, y, qRgb(v, v, v));
+            }
+        const QString file = dir_.filePath("grid-lens.png");
+        QVERIFY(img.save(file));
+        state()->newProject();
+        const auto ids = state()->importFiles({file});
+        QCOMPARE(ids.size(), size_t(1));
+        Id clip = 0;
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = W, s.height = H;
+            if (!edit::placeMedia(p, s, ids[0], 0, 0, 30, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok) return false;
+            clip = s.videoTracks[0].clips[0].id;
+            return true;
+        }));
+        state()->setSelection({clip}, false);
+        // The board is not in the clip; lines drawn along four of the grid's lines (two each way, near the edges) are
+        // snapped and straighten it; saved and applied.
+        bool shown = false;
+        bool checked = false;
+        lensCalibrationDialogHook() = [&](LensCalibrationDialog* dlg) {
+            shown = true;
+            // (Closed once it runs, whatever the checks find: saved only when they all pass.)
+            struct Close {
+                LensCalibrationDialog* dlg;
+                bool& ok;
+                ~Close() {
+                    QTimer::singleShot(0, dlg, [d = dlg, &o = ok] { o ? d->accept() : d->reject(); });
+                }
+            } close{dlg, checked};
+            QVERIFY(!dlg->findChild<QPushButton*>("calibrateSave")->isEnabled());
+            dlg->setBoard(9, 6);
+            QVERIFY(!dlg->calibrate());
+            QVERIFY2(dlg->resultText().contains("found in 0 frames"), qPrintable(dlg->resultText()));
+            dlg->setLinesMode(true);
+            QVERIFY(!dlg->findChild<QCheckBox*>("calibrateCentre")->isChecked());
+            dlg->findChild<QComboBox*>("calibrateModel")->setCurrentIndex(1);  // (poly3)
+            const std::pair<double, int> lines[] = {{60, 1}, {540, 1}, {60, 0}, {300, 0}};  // (where, and whether up the frame)
+            for (const auto& [at, vertical] : lines) {
+                    // (Points on the bent line, a pixel off.)
+                    std::vector<QPointF> pts;
+                    for (int k = 0; k <= 5; ++k) {
+                        const double along = vertical ? 20 + k * (H - 40) / 5.0 : 20 + k * (W - 40) / 5.0;
+                        double rgb[6];
+                        c.source(vertical ? at + 1.5 : along, vertical ? along : at + 1.5, rgb);
+                        pts.push_back({(rgb[2] + (k % 2 ? 1 : -1)) / W, rgb[3] / H});
+                    }
+                    dlg->addLine(pts);
+                }
+            QVERIFY(dlg->lineCount() >= 4);
+            QVERIFY2(dlg->calibrate(), qPrintable(dlg->resultText()));
+            QVERIFY2(dlg->fit().rms < 0.2, qPrintable(dlg->resultText()));
+            QVERIFY2(std::fabs(dlg->fit().terms[0] / -0.05 - 1) < 0.05, qPrintable(QString::number(dlg->fit().terms[0])));
+            QVERIFY(dlg->resultText().contains("straight within"));
+            QVERIFY(dlg->findChild<QPushButton*>("calibrateSave")->isEnabled());
+            dlg->findChild<QLineEdit*>("calibrateName")->setText("Wide 24mm");
+            dlg->findChild<QDoubleSpinBox*>("calibrateFocal")->setValue(24);
+            checked = true;
+        };
+        QAction* action = win_->findChild<QAction*>("calibrateLens");
+        QVERIFY(action);
+        action->trigger();
+        QVERIFY(shown && checked);
+        const Clip* now = edit::clipById(*state()->sequence(), clip);
+        QVERIFY(now && !now->effects.empty() && now->effects[0].type == "lens_correction");
+        QCOMPARE(now->effects[0].s("lens"), std::string("Calibrated Wide 24mm"));
+        QCOMPARE(now->effects[0].p("focal", 0), 24.0);
+        // Kept in the user's lens folder, so Correct Lens offers it.
+        QCOMPARE(QDir(own.path()).entryList({"*.xml"}).size(), 1);
+        const auto db = lensDatabase();
+        QVERIFY(db && db->lens("Calibrated Wide 24mm"));
+        // One undo step takes the correction off (the profile stays saved).
+        state()->undo();
+        QVERIFY(edit::clipById(*state()->sequence(), clip)->effects.empty() ||
+                edit::clipById(*state()->sequence(), clip)->effects[0].type != "lens_correction");
     }
 
     void contentCredentialsInTheApp() {

@@ -8586,6 +8586,74 @@ private slots:
         QVERIFY(!parseLens("<lensdatabase/>"));
     }
 
+    void lensCentreSqueezeAndOwnLenses() {
+        // A lens's centre off the frame's middle and an anamorphic squeeze: kept through its database file, and the
+        // correction's inverse (where a recorded point lands in the corrected frame) undoes it.
+        lens::Lens l;
+        l.maker = "Own";
+        l.model = "Anamorphic 40mm";
+        l.mounts = {"goProHero11bl"};
+        l.cropFactor = 1;
+        l.aspectRatio = 1919.0 / 1079;
+        l.minFocal = l.maxFocal = 40;
+        l.centerX = 0.04, l.centerY = -0.03;
+        l.squeeze = 1.5;
+        lens::Calibration cal;
+        cal.cropFactor = 1, cal.aspectRatio = l.aspectRatio;
+        lens::Distortion d;
+        d.model = lens::Distortion::Poly5;
+        d.focal = 40;
+        d.terms[0] = -0.04, d.terms[1] = 0.006;
+        cal.distortion.push_back(d);
+        l.calibrations.push_back(cal);
+        const std::string xml = lens::lensXml(l);
+        QVERIFY(xml.find("<anamorphic squeeze=\"1.5\"/>") != std::string::npos);
+        const auto back = lens::parseLens(xml);
+        QVERIFY(back);
+        QCOMPARE(back->centerX, 0.04);
+        QCOMPARE(back->centerY, -0.03);
+        QCOMPARE(back->squeeze, 1.5);
+        lens::Settings plain;
+        plain.fit = lens::Settings::None;
+        plain.focal = 40;
+        const lens::Correction c(*back, plain, 1920, 1080);
+        QVERIFY(std::fabs(c.centerX() - (960 + 0.04 * 1079 / 2)) < 1e-9 && std::fabs(c.centerY() - (540 - 0.03 * 1079 / 2)) < 1e-9);
+        QCOMPARE(c.squeeze(), 1.5);
+        double worst = 0;
+        for (int y = 0; y <= 1080; y += 60)
+            for (int x = 0; x <= 1920; x += 80) {
+                double at[6], cx, cy;
+                c.source(x, y, at);
+                QVERIFY(c.corrected(at[2], at[3], cx, cy));
+                worst = std::max(worst, std::hypot(cx - x, cy - y));
+            }
+        QVERIFY2(worst < 1e-6, qPrintable(QString::number(worst)));
+        // The squeeze makes the distortion radial in the widened picture: a point as far across as another is down
+        // (once widened) moves as far.
+        double a[6], b[6];
+        c.source(c.centerX() + 300 / 1.5, c.centerY(), a);
+        c.source(c.centerX(), c.centerY() + 300, b);
+        QVERIFY(std::fabs((a[2] - c.centerX()) * 1.5 - (b[3] - c.centerY())) < 1e-9);
+
+        // The user's own lenses: a fixed-lens camera's own calibration is preferred to the database's.
+        QTemporaryDir own;
+        QFile f(own.filePath("own.xml"));
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write(QByteArray::fromStdString(xml));
+        f.close();
+        lens::Database db;
+        QFile shipped(QStringLiteral(MONTAGE_TEST_DATA_DIR "/lensfun/test-lenses.xml"));
+        QVERIFY(shipped.open(QIODevice::ReadOnly));
+        QVERIFY(db.addXml(shipped.readAll().toStdString()));
+        const lens::Camera* gopro = db.findCamera("GoPro HERO11 Black");
+        QVERIFY(gopro);
+        QCOMPARE(lens::lensName(*db.fixedLens(gopro)), std::string("GoPro HERO11 Black & compatibles"));
+        QCOMPARE(db.addDirectory(own.path().toStdString(), true), 1);
+        QVERIFY(db.lenses().back().own && !db.lenses().front().own);
+        QCOMPARE(db.fixedLens(gopro)->model, std::string("Anamorphic 40mm"));
+        QCOMPARE(db.lensesFor(gopro).size(), size_t(2));
+    }
+
     void provenanceForCredentials() {
         // A plain cut: its file, no AI.
         Fixture fx;

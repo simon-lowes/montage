@@ -95,6 +95,7 @@
 #include "media/Sofa.h"
 #include "render/ExtendClip.h"
 #include "render/ColorChart.h"
+#include "media/LensCalibration.h"
 #include "media/LensDatabase.h"
 #include "render/ReviewExport.h"
 #include "render/Versions.h"
@@ -111,6 +112,7 @@
 #include "render/AafExport.h"
 #include "core/Interpretation.h"
 #include "render/Adm.h"
+#include "render/Iamf.h"
 #include "core/Adr.h"
 #include "core/AudioDescription.h"
 #include "core/History.h"
@@ -153,6 +155,7 @@
 #include "media/FaceTracks.h"
 #include "media/DepthMap.h"
 #include "media/Exr.h"
+#include "render/VideoFx.h"
 #ifdef MONTAGE_WITH_OPENEXR
 #include <ImfChannelList.h>
 #include <ImfFrameBuffer.h>
@@ -211,6 +214,9 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
+#if __has_include(<libavutil/iamf.h>)
+#include <libavutil/iamf.h>
+#endif
 }
 
 using namespace montage;
@@ -814,6 +820,111 @@ double pitchOf(const std::vector<float>& b, size_t from, size_t to, int rate = 4
     return rate / (best + 0.5 * (a - d) / (a - 2 * c + d));
 }
 
+// A PCM WAV file's samples (16, 24 or 32-bit integers, or 32-bit floats), interleaved; its channel count in `channels`.
+std::vector<float> readPcmWav(const std::string& path, int& channels) {
+    std::vector<float> out;
+    channels = 0;
+    QFile f(QString::fromStdString(path));
+    if (!f.open(QIODevice::ReadOnly)) return out;
+    const QByteArray all = f.readAll();
+    const auto* d = reinterpret_cast<const uint8_t*>(all.constData());
+    auto u16 = [&](size_t at) { return int(d[at] | (d[at + 1] << 8)); };
+    auto u32 = [&](size_t at) { return uint32_t(d[at]) | (uint32_t(d[at + 1]) << 8) | (uint32_t(d[at + 2]) << 16) | (uint32_t(d[at + 3]) << 24); };
+    int bits = 0, tag = 0, ch = 0;
+    size_t dataAt = 0, dataLen = 0;
+    for (size_t at = 12; at + 8 <= size_t(all.size());) {
+        const std::string id(all.constData() + at, 4);
+        const size_t len = u32(at + 4);
+        if (id == "fmt " && at + 24 <= size_t(all.size())) {
+            tag = u16(at + 8), ch = u16(at + 10), bits = u16(at + 22);
+            if (tag == 0xFFFE && at + 34 <= size_t(all.size())) tag = u16(at + 8 + 24);
+        }
+        if (id == "data") dataAt = at + 8, dataLen = std::min(len, size_t(all.size()) - at - 8);
+        at += 8 + len + (len & 1);
+    }
+    if (!ch || !dataAt || (bits != 16 && bits != 24 && bits != 32)) return out;
+    const size_t bytes = size_t(bits / 8), n = dataLen / bytes;
+    out.resize(n - n % size_t(ch));
+    for (size_t i = 0; i < out.size(); ++i) {
+        const uint8_t* q = d + dataAt + i * bytes;
+        if (bits == 16) out[i] = float(int16_t(q[0] | (q[1] << 8))) / 32768.f;
+        else if (bits == 24) out[i] = float(int32_t(uint32_t(q[0]) << 8 | uint32_t(q[1]) << 16 | uint32_t(q[2]) << 24) >> 8) / 8388608.f;
+        else if (tag == 3) std::memcpy(&out[i], q, 4);
+        else out[i] = float(double(int32_t(u32(size_t(q - d)))) / 2147483648.0);
+    }
+    channels = ch;
+    return out;
+}
+
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(61, 7, 100)
+// An IAMF file as FFmpeg's demuxer reads it (an MP4's IAMF track, or the bare stream): its audio element, its mix
+// presentation's integrated loudness per layout (the layout's channel count, LUFS), and each substream decoded (its
+// channels as its frames have them).
+struct FfmpegIamf {
+    int elementChannels = 0;
+    bool sceneBased = false;
+    std::vector<std::pair<int, double>> loudness;
+    std::vector<int> substreamChannels;
+    std::vector<std::vector<float>> substreams;  // interleaved, each in its own channels
+};
+bool readIamfWithFfmpeg(const std::string& path, FfmpegIamf& out) {
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return false;
+    avformat_find_stream_info(fmt, nullptr);
+    for (unsigned g = 0; g < fmt->nb_stream_groups; ++g) {
+        const AVStreamGroup* sg = fmt->stream_groups[g];
+        if (sg->type == AV_STREAM_GROUP_PARAMS_IAMF_AUDIO_ELEMENT && sg->params.iamf_audio_element->nb_layers) {
+            out.sceneBased = sg->params.iamf_audio_element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE;
+            out.elementChannels = sg->params.iamf_audio_element->layers[0]->ch_layout.nb_channels;
+        } else if (sg->type == AV_STREAM_GROUP_PARAMS_IAMF_MIX_PRESENTATION && sg->params.iamf_mix_presentation->nb_submixes) {
+            const AVIAMFSubmix* sm = sg->params.iamf_mix_presentation->submixes[0];
+            for (unsigned k = 0; k < sm->nb_layouts; ++k)
+                out.loudness.emplace_back(sm->layouts[k]->sound_system.nb_channels, av_q2d(sm->layouts[k]->integrated_loudness));
+        }
+    }
+    std::vector<AVCodecContext*> ctx(fmt->nb_streams, nullptr);
+    std::vector<SwrContext*> swr(fmt->nb_streams, nullptr);
+    out.substreams.assign(fmt->nb_streams, {});
+    out.substreamChannels.assign(fmt->nb_streams, 0);
+    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+        const AVCodecParameters* par = fmt->streams[i]->codecpar;
+        const AVCodec* codec = avcodec_find_decoder(par->codec_id);
+        if (!codec || !(ctx[i] = avcodec_alloc_context3(codec)) || avcodec_parameters_to_context(ctx[i], par) < 0 ||
+            avcodec_open2(ctx[i], codec, nullptr) < 0)
+            continue;
+    }
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* fr = av_frame_alloc();
+    auto drain = [&](unsigned i) {
+        while (avcodec_receive_frame(ctx[i], fr) >= 0) {
+            if (!swr[i]) {
+                swr_alloc_set_opts2(&swr[i], &fr->ch_layout, AV_SAMPLE_FMT_FLT, fr->sample_rate, &fr->ch_layout,
+                                    AVSampleFormat(fr->format), fr->sample_rate, 0, nullptr);
+                swr_init(swr[i]);
+            }
+            out.substreamChannels[i] = fr->ch_layout.nb_channels;
+            std::vector<float> buf(size_t(fr->nb_samples) * size_t(fr->ch_layout.nb_channels));
+            uint8_t* o[1] = {reinterpret_cast<uint8_t*>(buf.data())};
+            const int got = swr_convert(swr[i], o, fr->nb_samples, const_cast<const uint8_t**>(fr->extended_data), fr->nb_samples);
+            if (got > 0) out.substreams[i].insert(out.substreams[i].end(), buf.begin(), buf.begin() + got * fr->ch_layout.nb_channels);
+        }
+    };
+    while (av_read_frame(fmt, pkt) >= 0) {
+        const unsigned i = unsigned(pkt->stream_index);
+        if (i < ctx.size() && ctx[i] && avcodec_send_packet(ctx[i], pkt) >= 0) drain(i);
+        av_packet_unref(pkt);
+    }
+    for (unsigned i = 0; i < ctx.size(); ++i)
+        if (ctx[i] && avcodec_send_packet(ctx[i], nullptr) >= 0) drain(i);
+    av_frame_free(&fr);
+    av_packet_free(&pkt);
+    for (SwrContext*& c : swr) swr_free(&c);
+    for (AVCodecContext*& c : ctx) avcodec_free_context(&c);
+    avformat_close_input(&fmt);
+    return out.elementChannels > 0;
+}
+#endif
+
 }  // namespace
 
 // Three talks (cooking, football, astronomy) of eight sentences, a word every 0.4 s and 0.6 s between sentences.
@@ -975,6 +1086,144 @@ QImage skyFrame(int w, int h, int t, double pan, uint32_t seed) {
         }
     return img;
 }
+
+// A lens to calibrate against: anamorphic (a 1.33 squeeze), barrel distortion (poly5), its centre off the frame's
+// middle, on a 720 x 540 recording; and pictures of planes (a checkerboard, a wall of bars) through it at known poses.
+struct LensRig {
+    static constexpr int W = 720, H = 540, cols = 9, rows = 6;
+    static constexpr double F = 1.5;  // (halves of the frame's height)
+    lens::Lens truth;
+    lens::Settings plain;  // (the distortion alone, nothing fitted to the frame)
+    std::unique_ptr<lens::Correction> c;
+    struct Pose {
+        double R[9], t[3];
+    };
+    LensRig() {
+        truth.maker = "Test";
+        truth.model = "Anamorphic 50mm";
+        truth.names = {truth.maker, truth.model};
+        truth.cropFactor = 1;
+        truth.aspectRatio = double(W - 1) / (H - 1);
+        truth.minFocal = truth.maxFocal = 50;
+        truth.centerX = 0.03, truth.centerY = -0.02;
+        truth.squeeze = 1.33;
+        lens::Calibration cal;
+        cal.cropFactor = 1, cal.aspectRatio = truth.aspectRatio;
+        lens::Distortion dist;
+        dist.model = lens::Distortion::Poly5;
+        dist.focal = 50;
+        dist.terms[0] = -0.06, dist.terms[1] = 0.012;
+        cal.distortion.push_back(dist);
+        truth.calibrations.push_back(cal);
+        plain.fit = lens::Settings::None;
+        plain.tca = plain.vignetting = false;
+        plain.focal = 50;
+        c = std::make_unique<lens::Correction>(truth, plain, W, H);
+    }
+    double k(int i) const { return truth.calibrations[0].distortion[0].terms[i]; }
+    // A rotation (Rodrigues) and where the board's middle is put.
+    static Pose pose(double wx, double wy, double wz, double X, double Y, double Z) {
+        Pose p;
+        const double th = std::sqrt(wx * wx + wy * wy + wz * wz);
+        const double kx = th > 0 ? wx / th : 0, ky = th > 0 ? wy / th : 0, kz = th > 0 ? wz / th : 0;
+        const double co = std::cos(th), si = std::sin(th), v = 1 - co;
+        const double R[9] = {co + kx * kx * v,      kx * ky * v - kz * si, kx * kz * v + ky * si,
+                             ky * kx * v + kz * si, co + ky * ky * v,      ky * kz * v - kx * si,
+                             kz * kx * v - ky * si, kz * ky * v + kx * si, co + kz * kz * v};
+        std::copy(R, R + 9, p.R);
+        const double mx = (cols - 1) / 2.0, my = (rows - 1) / 2.0;
+        p.t[0] = X - (R[0] * mx + R[1] * my), p.t[1] = Y - (R[3] * mx + R[4] * my), p.t[2] = Z - (R[6] * mx + R[7] * my);
+        return p;
+    }
+    // Eight poses, tilted each way and towards the frame's corners.
+    static std::vector<Pose> boardPoses() {
+        return {pose(0.45, 0, 0, 0, 0, 10),           pose(-0.45, 0, 0, 0, 0, 10),          pose(0, 0.55, 0, 0, 0, 10),
+                pose(0, -0.55, 0, 0, 0, 10),           pose(0.3, 0.35, 0.1, -3.2, -1.3, 11), pose(-0.3, 0.35, -0.1, 3.2, -1.3, 11),
+                pose(0.3, -0.35, 0.15, -3.2, 1.3, 11), pose(-0.25, -0.4, -0.1, 3.2, 1.3, 11)};
+    }
+    // Where a point (i, j) of the plane is recorded: the pinhole picture, then the lens's distortion.
+    Point2 recorded(const Pose& p, double i, double j) const {
+        const double X = p.R[0] * i + p.R[1] * j + p.t[0], Y = p.R[3] * i + p.R[4] * j + p.t[1], Z = p.R[6] * i + p.R[7] * j + p.t[2];
+        const double xc = c->centerX() + F * X / Z / (c->unit() * c->squeeze()), yc = c->centerY() + F * Y / Z / c->unit();
+        double at[6];
+        c->source(xc, yc, at);
+        return {at[2], at[3]};
+    }
+    // A board of 10 x 7 squares on a white card, over grey; a wall of dark bars 3 apart.
+    static double board(double i, double j) {
+        if (i < -1.6 || j < -1.6 || i > cols + 0.6 || j > rows + 0.6) return 0.5;
+        if (i < -1 || j < -1 || i > cols || j > rows) return 0.9;
+        return (int(std::floor(i)) + int(std::floor(j))) % 2 ? 0.1 : 0.9;
+    }
+    static double bars(double i, double j) {
+        const double fi = i / 3 - std::floor(i / 3), fj = j / 3 - std::floor(j / 3);
+        return fi < 0.25 || fj < 0.25 ? 0.15 : 0.85;
+    }
+    // The plane through the lens: 6 x 6 samples a pixel (each jittered within its cell, so an edge's position is not
+    // rounded to the samples' grid) traced back to it.
+    GrayImage render(const Pose& p, double (*pattern)(double, double)) const {
+        GrayImage g;
+        g.width = W, g.height = H;
+        g.px.assign(size_t(W) * H, 0.f);
+        std::vector<std::thread> workers;
+        const int n = std::max(1, int(std::thread::hardware_concurrency()));
+        for (int w = 0; w < n; ++w)
+            workers.emplace_back([&, w] {
+                for (int y = w; y < H; y += n)
+                    for (int x = 0; x < W; ++x) {
+                        double sum = 0;
+                        for (int sy = 0; sy < 6; ++sy)
+                            for (int sx = 0; sx < 6; ++sx) {
+                                uint32_t h = uint32_t(x) * 73856093u ^ uint32_t(y) * 19349663u ^ uint32_t(sy * 6 + sx) * 83492791u;
+                                h ^= h >> 13, h *= 0x5bd1e995u, h ^= h >> 15;
+                                const double jx = (h & 0xffff) / 65536.0, jy = (h >> 16) / 65536.0;
+                                double xc, yc;
+                                if (!c->corrected(x + (sx + jx) / 6, y + (sy + jy) / 6, xc, yc)) continue;
+                                const double a = (xc - c->centerX()) * c->unit() * c->squeeze() / F, b = (yc - c->centerY()) * c->unit() / F;
+                                const double nx = p.R[2], ny = p.R[5], nz = p.R[8];
+                                const double s = (nx * p.t[0] + ny * p.t[1] + nz * p.t[2]) / (nx * a + ny * b + nz);
+                                const double Px = s * a - p.t[0], Py = s * b - p.t[1], Pz = s - p.t[2];
+                                sum += pattern(p.R[0] * Px + p.R[3] * Py + p.R[6] * Pz, p.R[1] * Px + p.R[4] * Py + p.R[7] * Pz);
+                            }
+                        g.px[size_t(y) * W + x] = float(sum / 36);
+                    }
+            });
+        for (auto& t : workers) t.join();
+        return g;
+    }
+    static QImage toQImage(const GrayImage& g) {
+        QImage img(g.width, g.height, QImage::Format_RGB32);
+        for (int y = 0; y < g.height; ++y)
+            for (int x = 0; x < g.width; ++x) {
+                const int v = std::clamp(int(std::lround(g.at(x, y) * 255)), 0, 255);
+                img.setPixel(x, y, qRgb(v, v, v));
+            }
+        return img;
+    }
+    // The wall's edges (vertical and horizontal) where they are recorded inside the frame, finely; and each as a line
+    // drawn roughly along it (six points, a pixel and a half off either way).
+    const Pose wall = pose(0.04, -0.06, 0.02, 0, 0, 6.5);
+    void wallEdges(std::vector<std::vector<Point2>>& truths, std::vector<std::vector<Point2>>& drawn) const {
+        for (int vertical = 0; vertical < 2; ++vertical)
+            for (int m = -12; m <= 12; ++m)
+                for (double edge : {0.0, 0.75}) {
+                    std::vector<Point2> pts;
+                    for (double u = -40; u <= 40; u += 0.02) {
+                        const Point2 q = vertical ? recorded(wall, 3 * m + edge, u) : recorded(wall, u, 3 * m + edge);
+                        if (q.x > 12 && q.y > 12 && q.x < W - 12 && q.y < H - 12) pts.push_back(q);
+                    }
+                    if (pts.size() < 200) continue;
+                    std::vector<Point2> line;
+                    for (int k = 0; k < 6; ++k) {
+                        Point2 q = pts[std::min(pts.size() - 1, size_t(k * (pts.size() - 1) / 5))];
+                        (vertical ? q.x : q.y) += k % 2 ? 1.5 : -1.5;
+                        line.push_back(q);
+                    }
+                    truths.push_back(pts);
+                    drawn.push_back(line);
+                }
+    }
+};
 
 class TestMedia : public QObject {
     Q_OBJECT
@@ -9151,6 +9400,295 @@ private slots:
         QCOMPARE(out.value("objects").toArray().at(0).toString(), QString("A2"));
         res = call("montage_set_surround", {{"project", project}, {"layout", "9.1"}});
         QVERIFY(res.value("isError").toBool());
+    }
+
+    void immersiveAudioAsIamf() {
+        // A 7.1.4 sequence with a tone on each speaker, 100 Hz apart in Montage's channel order (200 Hz on L, 300 on R...),
+        // 60 Hz sent to the LFE, at 29.97 fps: its length is not a whole number of IAMF frames, so the last is trimmed.
+        const int rate = 48000;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{30000, 1001};
+        s.audioLayout = "7.1.4";
+        const std::vector<Speaker>& speakers = layoutSpeakers("7.1.4");
+        const int channels = int(speakers.size());
+        auto hzOf = [&](int c) { return speakers[size_t(c)].lfe ? 60.0 : 200.0 + 100.0 * c; };
+        for (int c = 0; c < channels; ++c) {
+            std::vector<float> x(size_t(rate) * 2);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.25 * std::sin(2 * M_PI * hzOf(c) * double(i) / rate));
+            const std::string f = path(("iamf-tone" + std::to_string(c) + ".wav").c_str());
+            QVERIFY(writeMonoWav(f, x, rate));
+            p.media.push_back(probeOrFail(p, f));
+            while (int(s.audioTracks.size()) <= c) edit::addTrack(p, s, TrackKind::Audio);
+            QVERIFY(edit::placeMedia(p, s, p.media.back().id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, c}, false).ok);
+            SurroundPan& pan = s.audioTracks[size_t(c)].surround;
+            const double a = speakers[size_t(c)].angle * M_PI / 180;
+            pan.x = std::sin(a), pan.y = std::cos(a), pan.z = speakers[size_t(c)].elevation > 0 ? 1 : 0, pan.width = 0;
+            if (speakers[size_t(c)].lfe) pan.lfeDb = 10;
+        }
+        const int64_t total = std::llround(double(s.duration()) * rate / s.fpsValue());
+        QVERIFY(total % 960 != 0);
+        std::vector<double> weights;
+        for (const Speaker& sp : speakers) weights.push_back(sp.loudnessWeight);
+        // The level of a tone in one channel of interleaved audio, away from the ends.
+        auto level = [&](const std::vector<float>& b, int chs, int ch, double hz) {
+            const size_t n = b.size() / size_t(chs), from = 4800, to = n > 9600 ? n - 4800 : n;
+            std::complex<double> acc = 0;
+            for (size_t i = from; i < to; ++i) acc += double(b[i * size_t(chs) + size_t(ch)]) * std::polar(1.0, -2 * M_PI * hz * double(i) / rate);
+            return 2 * std::abs(acc) / double(std::max<size_t>(1, to - from));
+        };
+        // Every speaker's tone on its channel and on no other (the LFE track is also heard where it is placed, in C).
+        auto tonesOnTheirChannels = [&](const std::vector<float>& b, const QString& what) {
+            for (int c = 0; c < channels; ++c)
+                for (int d = 0; d < channels; ++d) {
+                    const double l = level(b, channels, d, hzOf(c));
+                    if (c == d) {
+                        if (l < (speakers[size_t(c)].lfe ? 0.6 : 0.2)) return QString("%1: %2 Hz on channel %3 at %4").arg(what).arg(hzOf(c)).arg(d).arg(l);
+                    } else if (!(speakers[size_t(c)].lfe && d == 2) && l > 0.01) {
+                        return QString("%1: %2 Hz heard on channel %3 at %4").arg(what).arg(hzOf(c)).arg(d).arg(l);
+                    }
+                }
+            return QString();
+        };
+        auto integrated = [&](const std::vector<float>& b, int chs, const double* w) {
+            const LoudnessResult l = measureLoudness(b.data(), int64_t(b.size() / size_t(chs)), chs, w, rate);
+            return l.valid ? l.integrated : -200.0;
+        };
+        auto stereoOf = [&](const std::vector<float>& b) {
+            std::vector<float> two(b.size() / size_t(channels) * 2);
+            iamfDownmixToStereo("7.1.4", b.data(), int(b.size() / size_t(channels)), two.data());
+            return two;
+        };
+        const double stereoWeights[2] = {1, 1};
+
+        // Exported: FLAC in seven substreams (five pairs, C, LFE), with the loudness Montage's meter gives the mix.
+        IamfSettings st;
+        st.title = "Tones";
+        IamfResult r;
+        std::string err;
+        const std::string mp4 = path("tones714.mp4"), bare = path("tones714.iamf");
+        QVERIFY2(exportIamf(p, s, st, mp4, &r, {}, &err), err.c_str());
+        QVERIFY(r.layout == "7.1.4" && r.codec == "flac" && r.channels == 12 && r.substreams == 7 && r.coupled == 5);
+        QCOMPARE(r.samples, total);
+        QCOMPARE(r.frames, int((total + 959) / 960));
+        QCOMPARE(r.loudness.size(), size_t(2));
+        QVERIFY(r.loudness[0].layout == "7.1.4" && r.loudness[1].layout == "stereo");
+        std::vector<float> mix(size_t(total) * size_t(channels));
+        {
+            Sequence at48 = s;
+            at48.sampleRate = rate;
+            AudioMixer mixer;
+            mixer.mixLayout(p, at48, 0, int(total), mix.data());
+        }
+        QVERIFY(tonesOnTheirChannels(mix, "the mix").isEmpty());
+        const double mixLoudness = integrated(mix, channels, weights.data()), mixStereo = integrated(stereoOf(mix), 2, stereoWeights);
+        QVERIFY2(std::fabs(r.loudness[0].integrated - mixLoudness) < 0.1, qPrintable(QString("%1 vs %2").arg(r.loudness[0].integrated).arg(mixLoudness)));
+        QVERIFY2(std::fabs(r.loudness[1].integrated - mixStereo) < 0.1, qPrintable(QString("%1 vs %2").arg(r.loudness[1].integrated).arg(mixStereo)));
+        QVERIFY(r.loudness[0].truePeak >= r.loudness[0].digitalPeak - 0.01 && r.loudness[0].digitalPeak < 0);
+        QVERIFY2(exportIamf(p, s, st, bare, nullptr, {}, &err), err.c_str());
+
+        // Read back, the MP4's iacb box and the bare stream alike: the simple profile, the layout, binaural on headphones,
+        // the loudness (in IAMF's 1/256 dB), the frames and the last one's trimming.
+        for (const std::string& f : {mp4, bare}) {
+            IamfInfo info;
+            QVERIFY2(readIamfInfo(f, info, &err), err.c_str());
+            QVERIFY(info.primaryProfile == 0 && info.additionalProfile == 0 && info.codec == "fLaC");
+            QVERIFY(info.samplesPerFrame == 960 && info.sampleRate == rate && info.bitDepth == 24);
+            QVERIFY(!info.sceneBased && info.loudspeakerLayout == 7 && info.substreams == 7 && info.coupled == 5);
+            QVERIFY(info.headphonesMode == 1 && info.title == "Tones");
+            QCOMPARE(info.frames, r.frames);
+            QCOMPARE(info.trimmedAtEnd, int64_t(r.frames) * 960 - total);
+            QCOMPARE(info.loudnessSoundSystems, (std::vector<int>{9, 0}));
+            for (size_t k = 0; k < 2; ++k) {
+                QCOMPARE(info.loudness[k].layout, r.loudness[k].layout);
+                QVERIFY(std::fabs(info.loudness[k].integrated - r.loudness[k].integrated) < 0.002);
+                QVERIFY(std::fabs(info.loudness[k].truePeak - r.loudness[k].truePeak) < 0.002);
+            }
+        }
+
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(61, 7, 100)
+        // FFmpeg's demuxer reads both: the element's twelve channels, the loudness, and each substream decodes to its
+        // speakers' tones.
+        for (const std::string& f : {mp4, bare}) {
+            FfmpegIamf ff;
+            QVERIFY2(readIamfWithFfmpeg(f, ff), f.c_str());
+            QVERIFY(!ff.sceneBased && ff.elementChannels == 12);
+            const std::vector<std::vector<int>> subs = iamfSubstreams("7.1.4");
+            QCOMPARE(ff.substreams.size(), subs.size());
+            size_t n = size_t(total);
+            for (size_t k = 0; k < subs.size(); ++k) {
+                QCOMPARE(ff.substreamChannels[k], int(subs[k].size()));
+                n = std::min(n, ff.substreams[k].size() / subs[k].size());
+            }
+            QVERIFY(n + 960 > size_t(total));
+            std::vector<float> all(n * size_t(channels));
+            for (size_t k = 0; k < subs.size(); ++k)
+                for (size_t i = 0; i < n; ++i)
+                    for (size_t c = 0; c < subs[k].size(); ++c) all[i * size_t(channels) + size_t(subs[k][c])] = ff.substreams[k][i * subs[k].size() + c];
+            const QString wrong = tonesOnTheirChannels(all, "FFmpeg");
+            QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+            QCOMPARE(ff.loudness.size(), size_t(2));
+            QVERIFY(ff.loudness[0].first == 12 && ff.loudness[1].first == 2);
+            const double decoded = integrated(all, channels, weights.data()), decodedStereo = integrated(stereoOf(all), 2, stereoWeights);
+            QVERIFY2(std::fabs(ff.loudness[0].second - decoded) < 0.1, qPrintable(QString("%1 vs %2").arg(ff.loudness[0].second).arg(decoded)));
+            QVERIFY2(std::fabs(ff.loudness[1].second - decodedStereo) < 0.1, qPrintable(QString("%1 vs %2").arg(ff.loudness[1].second).arg(decodedStereo)));
+        }
+#endif
+
+        // The reference decoder (libiamf's iamfdec), when there is one, decodes both to 7.1.4 and to stereo: each tone on
+        // its speaker, as long as the sequence (the padding trimmed), and as loud as the file says by Montage's meter.
+        const QByteArray iamfdec = qgetenv("MONTAGE_TEST_IAMFDEC");
+        auto decodeWith = [&](const std::string& in, const char* system, const std::string& out) {
+            QProcess run;
+            const bool isMp4 = QString::fromStdString(in).endsWith(".mp4");
+            run.start(QString::fromLocal8Bit(iamfdec), {isMp4 ? "-i1" : "-i0", "-o3", QString::fromStdString(out), system, "-d", "24",
+                                                        "-disable_limiter", QString::fromStdString(in)});
+            if (!run.waitForFinished(120000) || run.exitCode() != 0) return QString::fromLocal8Bit(run.readAllStandardError() + run.readAllStandardOutput());
+            return QString();
+        };
+        if (!iamfdec.isEmpty()) {
+            for (const std::string& f : {mp4, bare}) {
+                const std::string out = path("iamfdec714.wav");
+                const QString failed = decodeWith(f, "-s9", out);
+                QVERIFY2(failed.isEmpty(), qPrintable(failed));
+                int chs = 0;
+                const std::vector<float> dec = readPcmWav(out, chs);
+                QCOMPARE(chs, 12);
+                // (libiamf's 7.1.4: L R C LFE, the sides, the backs, the four overhead; Montage's has the backs first.)
+                const int toMontage[12] = {0, 1, 2, 3, 6, 7, 4, 5, 8, 9, 10, 11};
+                std::vector<float> all(dec.size());
+                for (size_t i = 0; i < dec.size() / 12; ++i)
+                    for (int c = 0; c < 12; ++c) all[i * 12 + size_t(toMontage[c])] = dec[i * 12 + size_t(c)];
+                QCOMPARE(int64_t(all.size() / 12), total);
+                const QString wrong = tonesOnTheirChannels(all, "iamfdec");
+                QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+                const double decoded = integrated(all, channels, weights.data());
+                QVERIFY2(std::fabs(r.loudness[0].integrated - decoded) < 0.1, qPrintable(QString("%1 vs %2").arg(r.loudness[0].integrated).arg(decoded)));
+            }
+            const std::string out = path("iamfdec20.wav");
+            const QString failed = decodeWith(mp4, "-s0", out);
+            QVERIFY2(failed.isEmpty(), qPrintable(failed));
+            int chs = 0;
+            const std::vector<float> two = readPcmWav(out, chs);
+            QCOMPARE(chs, 2);
+            const double decodedStereo = integrated(two, 2, stereoWeights);
+            QVERIFY2(std::fabs(r.loudness[1].integrated - decodedStereo) < 0.1, qPrintable(QString("%1 vs %2").arg(r.loudness[1].integrated).arg(decodedStereo)));
+        }
+
+        // A third-order field with a 1 kHz tone from the left, as 24-bit PCM: sixteen substreams, a component each, the
+        // loudness given in stereo alone.
+        Project q = makeDefaultProject();
+        Sequence& field = *q.active();
+        field.audioLayout = "ambix3";
+        {
+            std::vector<float> x(size_t(rate) * 2);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.25 * std::sin(2 * M_PI * 1000 * double(i) / rate));
+            const std::string f = path("iamf-left.wav");
+            QVERIFY(writeMonoWav(f, x, rate));
+            q.media.push_back(probeOrFail(q, f));
+            QVERIFY(edit::placeMedia(q, field, q.media.back().id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            field.audioTracks[0].surround = SurroundPan{-1, 0, 0, -100, 0, false};
+        }
+        st.codec = "lpcm";
+        const std::string hoa = path("left3oa.mp4");
+        QVERIFY2(exportIamf(q, field, st, hoa, &r, {}, &err), err.c_str());
+        QVERIFY(r.layout == "ambix3" && r.channels == 16 && r.substreams == 16 && r.coupled == 0);
+        QVERIFY(r.loudness.size() == 1 && r.loudness[0].layout == "stereo" && r.loudness[0].integrated > -40);
+        IamfInfo info;
+        QVERIFY2(readIamfInfo(hoa, info, &err), err.c_str());
+        QVERIFY(info.codec == "ipcm" && info.bitDepth == 24 && info.sampleRate == rate);
+        QVERIFY(info.sceneBased && info.ambisonicChannels == 16 && info.substreams == 16 && info.coupled == 0);
+        QCOMPARE(info.loudnessSoundSystems, std::vector<int>{0});
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(61, 7, 100)
+        {
+            // The components as FFmpeg decodes them: from the left, Y (ACN 1) as strong as W, X and Z silent.
+            FfmpegIamf ff;
+            QVERIFY(readIamfWithFfmpeg(hoa, ff));
+            QVERIFY(ff.sceneBased && ff.elementChannels == 16 && ff.substreams.size() == 16);
+            const double w = level(ff.substreams[0], 1, 0, 1000), y = level(ff.substreams[1], 1, 0, 1000);
+            const double z = level(ff.substreams[2], 1, 0, 1000), x = level(ff.substreams[3], 1, 0, 1000);
+            QVERIFY2(w > 0.1 && std::fabs(y / w - 1) < 0.05 && x < 0.01 * w && z < 0.01 * w,
+                     qPrintable(QString("W %1 Y %2 Z %3 X %4").arg(w).arg(y).arg(z).arg(x)));
+        }
+#endif
+        if (!iamfdec.isEmpty()) {
+            // Rendered to speakers by the reference decoder: in stereo on the left, in 7.1.4 most on the left side.
+            QString failed = decodeWith(hoa, "-s0", path("hoa20.wav"));
+            QVERIFY2(failed.isEmpty(), qPrintable(failed));
+            int chs = 0;
+            std::vector<float> dec = readPcmWav(path("hoa20.wav"), chs);
+            QCOMPARE(chs, 2);
+            const double left = level(dec, 2, 0, 1000), right = level(dec, 2, 1, 1000);
+            QVERIFY2(left > 0.05 && right < 0.3 * left, qPrintable(QString("%1 %2").arg(left).arg(right)));
+            // As loud as the file says (the stereo loudness is measured through the reference renderer's decoder).
+            const double heard = integrated(dec, 2, stereoWeights);
+            QVERIFY2(std::fabs(r.loudness[0].integrated - heard) < 0.1, qPrintable(QString("%1 vs %2").arg(r.loudness[0].integrated).arg(heard)));
+            failed = decodeWith(hoa, "-s9", path("hoa714.wav"));
+            QVERIFY2(failed.isEmpty(), qPrintable(failed));
+            dec = readPcmWav(path("hoa714.wav"), chs);
+            QCOMPARE(chs, 12);
+            std::vector<double> at(12);
+            for (int c = 0; c < 12; ++c) at[size_t(c)] = level(dec, 12, c, 1000);
+            const double side = at[4];
+            for (int c = 0; c < 12; ++c)
+                if (c != 4) QVERIFY2(at[size_t(c)] < 0.5 * side, qPrintable(QString("%1: %2 vs %3").arg(c).arg(at[size_t(c)]).arg(side)));
+        }
+
+        // Over MCP: the bare stream as PCM, stereo on headphones, read back.
+        {
+            const QString project = QString::fromStdString(path("iamf.montage"));
+            QVERIFY(saveProject(p, project.toStdString()));
+            McpServer server;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_export_iamf"},
+                                                         {"arguments", QJsonObject{{"project", project}, {"path", QString::fromStdString(path("mcp.iamf"))},
+                                                                                   {"codec", "lpcm"}, {"binaural", false}, {"title", "Over MCP"}}},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+            const QJsonObject out = res.value("structuredContent").toObject();
+            QVERIFY(out.value("layout").toString() == "7.1.4" && out.value("codec").toString() == "lpcm" && out.value("substreams").toInt() == 7);
+            QVERIFY(!out.value("binaural").toBool() && !out.value("scene_based").toBool());
+            QCOMPARE(out.value("loudness").toArray().size(), 2);
+            QVERIFY(std::fabs(out.value("loudness").toArray().at(0).toObject().value("integrated_lufs").toDouble() - mixLoudness) < 0.1);
+        }
+
+        // Damaged files are refused, not read past their ends: the MP4 cut short, a box claiming 2^63 bytes, a mix
+        // presentation claiming 2^49 labels.
+        {
+            QFile in(QString::fromStdString(mp4));
+            QVERIFY(in.open(QIODevice::ReadOnly));
+            const QByteArray whole = in.readAll();
+            auto writeBytes = [&](const char* name, const QByteArray& b) {
+                QFile o(QString::fromStdString(path(name)));
+                return o.open(QIODevice::WriteOnly) && o.write(b) == b.size();
+            };
+            QVERIFY(writeBytes("cut.mp4", whole.left(whole.size() / 2)));
+            IamfInfo bad;
+            QVERIFY(!readIamfInfo(path("cut.mp4"), bad, &err));
+            QByteArray huge = whole.left(32);  // the ftyp box
+            huge += QByteArray::fromHex("00000001") + "moov" + QByteArray::fromHex("8000000000000000");
+            QVERIFY(writeBytes("huge.mp4", huge));
+            QVERIFY(!readIamfInfo(path("huge.mp4"), bad, &err));
+            // A sequence header, then a mix presentation: id 2, then a label count of 2^49 and nothing more.
+            QByteArray obus = QByteArray::fromHex("f806") + "iamf" + QByteArray::fromHex("0000");
+            const QByteArray mp = QByteArray::fromHex("02") + QByteArray::fromHex("8080808080808001");
+            obus += char(2 << 3);
+            obus += char(mp.size());
+            obus += mp;
+            QVERIFY(writeBytes("labels.iamf", obus));
+            QVERIFY(!readIamfInfo(path("labels.iamf"), bad, &err));
+        }
+
+        // Stopping leaves no file; a layout IAMF has none for, or another codec, is refused.
+        QVERIFY(!exportIamf(p, s, st, path("stopped.mp4"), nullptr, [](double) { return false; }, &err));
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(path("stopped.mp4"))));
+        st.codec = "aac";
+        QVERIFY(!exportIamf(p, s, st, path("aac.mp4"), nullptr, {}, &err));
+        QCOMPARE(iamfLoudspeakerLayout("9.1.6"), -1);
+        QCOMPARE(iamfSubstreams("5.1"), (std::vector<std::vector<int>>{{0, 1}, {4, 5}, {2}, {3}}));
     }
 
     void surroundMixExportAndStems() {
@@ -19098,6 +19636,407 @@ if ui["pressed"] == "add":
         r = call({{"clip", double(first)}});
         QVERIFY(r.value("isError").toBool());
         QVERIFY(QJsonDocument(r).toJson().contains("fetch-models"));
+    }
+
+    void calibrateLensFromBoards() {
+        const LensRig rig;
+        const int W = rig.W, H = rig.H, cols = rig.cols, rows = rig.rows;
+        // The board at eight poses through the lens: every corner found where the lens put it, to a small fraction of
+        // a pixel (the board may be read turned half way round).
+        const auto poses = LensRig::boardPoses();
+        std::vector<std::vector<Point2>> views;
+        for (size_t v = 0; v < poses.size(); ++v) {
+            const GrayImage img = rig.render(poses[v], LensRig::board);
+            std::vector<Point2> corners;
+            QVERIFY2(findCheckerboard(img, cols, rows, corners), qPrintable(QString("view %1").arg(v)));
+            QCOMPARE(corners.size(), size_t(cols * rows));
+            double worst[2] = {0, 0};
+            for (int k = 0; k < cols * rows; ++k)
+                for (int turned = 0; turned < 2; ++turned) {
+                    const int at = turned ? cols * rows - 1 - k : k;
+                    const Point2 want = rig.recorded(poses[v], at % cols, at / cols);
+                    worst[turned] = std::max(worst[turned], std::hypot(corners[size_t(k)].x - want.x, corners[size_t(k)].y - want.y));
+                }
+            QVERIFY2(std::min(worst[0], worst[1]) < 0.15, qPrintable(QString("view %1: %2 px").arg(v).arg(std::min(worst[0], worst[1]))));
+            views.push_back(corners);
+        }
+        // A board of another size is not this one.
+        std::vector<Point2> none;
+        QVERIFY(!findCheckerboard(rig.render(poses[0], LensRig::board), 8, 6, none));
+
+        // The fit: reprojected within a tenth of a pixel, the terms within 1 %, the focal length, squeeze and centre
+        // found.
+        LensFitOptions o;
+        o.model = lens::Distortion::Poly5;
+        o.fitCenter = true;
+        o.fitSqueeze = true;
+        LensFit fit;
+        std::string error;
+        QVERIFY2(calibrateFromBoards(views, cols, rows, W, H, o, fit, &error), error.c_str());
+        qInfo() << "rms" << fit.rms << "worst" << fit.worst << "F" << fit.focal << "k" << fit.terms[0] << fit.terms[1]
+                << "centre" << fit.centerX << fit.centerY << "squeeze" << fit.squeeze;
+        QCOMPARE(fit.views, 8);
+        QCOMPARE(fit.points, 8 * cols * rows);
+        QVERIFY(fit.rms < 0.1);
+        QVERIFY(std::fabs(fit.terms[0] / rig.k(0) - 1) < 0.01);
+        QVERIFY(std::fabs(fit.terms[1] / rig.k(1) - 1) < 0.01);
+        QVERIFY(std::fabs(fit.focal / rig.F - 1) < 0.01);
+        QVERIFY(std::fabs(fit.squeeze / rig.truth.squeeze - 1) < 0.002);
+        QVERIFY(std::fabs(fit.centerX - rig.truth.centerX) < 0.002 && std::fabs(fit.centerY - rig.truth.centerY) < 0.002);
+        // Too few views are refused.
+        QVERIFY(!calibrateFromBoards({views[0], views[1]}, cols, rows, W, H, o, fit, &error));
+        QVERIFY(calibrateFromBoards(views, cols, rows, W, H, o, fit, &error));
+
+        // As a lens profile: its correction is the lens's own, to a twentieth of a pixel where the boards were seen.
+        LensIdentity id;
+        id.maker = "Test";
+        id.model = "Calibrated 50mm";
+        id.focalMm = 50;
+        const lens::Lens made = calibratedLens(fit, W, H, id);
+        const auto back = lens::parseLens(lens::lensXml(made));
+        QVERIFY(back);
+        QCOMPARE(back->squeeze, fit.squeeze);
+        QCOMPARE(back->centerX, fit.centerX);
+        QCOMPARE(back->minFocal, 50.0);
+        QVERIFY(back->calibrations.size() == 1 && back->calibrations[0].distortion[0].realFocalMeasured);
+        QVERIFY(std::fabs(back->calibrations[0].distortion[0].realFocal - fitFocalMm(fit, W, H, 1)) < 1e-9);
+        // (1.5 halves of the frame's height, which is a full-frame sensor's 24 mm: 18 mm.)
+        QVERIFY(std::fabs(fitFocalMm(fit, W, H, 1) - 18) < 0.2);
+        // A 16:9 recording spans the sensor's width instead (36 mm, so its height is 20.25 mm), and a profile made on
+        // it corrects a 3:2 picture from the same camera as the lens does: the same distortion at the same place.
+        {
+            LensFit wide;
+            wide.model = lens::Distortion::Poly5;
+            wide.focal = 1.5;
+            wide.terms[0] = -0.06, wide.terms[1] = 0.012;
+            QVERIFY(std::fabs(fitFocalMm(wide, 1920, 1080, 1) - 1.5 * 20.25 / 2) < 0.05);
+            const lens::Lens onWide = calibratedLens(wide, 1920, 1080, id);
+            lens::Settings none;
+            none.fit = lens::Settings::None;
+            const lens::Correction w169(onWide, none, 1920, 1080), w32(onWide, none, 1620, 1080);
+            // (A point 400 px right of the middle in both, a 16:9 picture's 1919 px being the 3:2 one's 1619 px.)
+            double a[6], b[6];
+            w169.source(960 + 400, 540, a);
+            w32.source(810 + 400 * 1619.0 / 1919, 540, b);
+            QVERIFY(std::fabs((a[2] - 960) - (b[2] - 810) * 1919.0 / 1619) < 0.02);
+            // And through the fit's own model on the 16:9 frame (rd = ru (1 + k1 ru² + k2 ru⁴), units of 539.5 px).
+            const double ru = 400 / 539.5, rd = ru * (1 + wide.terms[0] * ru * ru + wide.terms[1] * ru * ru * ru * ru);
+            QVERIFY(std::fabs(a[2] - 960 - rd * 539.5) < 0.01);
+        }
+        const lens::Correction mc(*back, rig.plain, W, H);
+        double off = 0;
+        for (const auto& v : views)
+            for (const Point2& p : v) {
+                double xc, yc, a[6], b[6];
+                QVERIFY(rig.c->corrected(p.x, p.y, xc, yc));
+                rig.c->source(xc, yc, a);
+                mc.source(xc, yc, b);
+                off = std::max(off, std::hypot(a[2] - b[2], a[3] - b[3]));
+            }
+        qInfo() << "profile against the lens" << off << "px";
+        QVERIFY(off < 0.05);
+    }
+
+    void straightenLensLines() {
+        // Plumb lines: a wall of dark bars through the lens, lines drawn roughly along their edges and snapped to them;
+        // the distortion fitted from them alone (the centre and squeeze given) makes them straight to a fifth of a pixel.
+        const LensRig rig;
+        const GrayImage wall = rig.render(rig.wall, LensRig::bars);
+        std::vector<std::vector<Point2>> truths, drawn, snapped;
+        rig.wallEdges(truths, drawn);
+        QVERIFY(truths.size() >= 12);
+        for (const auto& d : drawn) snapped.push_back(snapLineToEdge(wall, d));
+        // Snapped onto the edges, nearly all to a fifth of a pixel.
+        std::vector<double> misses;
+        for (size_t l = 0; l < snapped.size(); ++l)
+            for (const Point2& q : snapped[l]) {
+                double nearest = 1e9;
+                const auto& t = truths[l];
+                for (size_t k = 0; k + 1 < t.size(); ++k) {
+                    const double dx = t[k + 1].x - t[k].x, dy = t[k + 1].y - t[k].y, l2 = dx * dx + dy * dy;
+                    const double f = l2 > 0 ? std::clamp(((q.x - t[k].x) * dx + (q.y - t[k].y) * dy) / l2, 0.0, 1.0) : 0;
+                    nearest = std::min(nearest, std::hypot(t[k].x + f * dx - q.x, t[k].y + f * dy - q.y));
+                }
+                misses.push_back(nearest);
+            }
+        QVERIFY(misses.size() > 20 * snapped.size());
+        std::sort(misses.begin(), misses.end());
+        qInfo() << "snapped" << misses.size() << "points; median" << misses[misses.size() / 2] << "95%" << misses[misses.size() * 95 / 100];
+        QVERIFY(misses[misses.size() * 95 / 100] < 0.2);
+        LensFitOptions o;
+        o.model = lens::Distortion::Poly5;
+        o.fitCenter = false;
+        o.centerX = rig.truth.centerX, o.centerY = rig.truth.centerY;
+        o.squeeze = rig.truth.squeeze;
+        LensFit lines;
+        std::string error;
+        QVERIFY2(calibrateFromLines(snapped, rig.W, rig.H, o, lines, &error), error.c_str());
+        qInfo() << "lines: rms" << lines.rms << "worst" << lines.worst << "k" << lines.terms[0] << lines.terms[1];
+        QVERIFY(lines.rms < 0.2);
+        QCOMPARE(lines.focal, 0.0);
+        QCOMPARE(lines.views, int(snapped.size()));
+        QVERIFY(std::fabs(lines.terms[0] / rig.k(0) - 1) < 0.02 && std::fabs(lines.terms[1] / rig.k(1) - 1) < 0.05);
+        // The edges themselves (exactly where the lens put them) straight through the fitted lens.
+        LensIdentity id;
+        id.focalMm = 50;
+        const lens::Lens straightened = calibratedLens(lines, rig.W, rig.H, id);
+        QVERIFY(!straightened.calibrations[0].distortion[0].realFocalMeasured);
+        const lens::Correction sc(straightened, rig.plain, rig.W, rig.H);
+        double bend = 0;
+        for (const auto& pts : truths) {
+            std::vector<Point2> u;
+            for (size_t k = 0; k < pts.size(); k += 10) {
+                double xc, yc;
+                QVERIFY(sc.corrected(pts[k].x, pts[k].y, xc, yc));
+                u.push_back({(xc - sc.centerX()) * sc.squeeze(), yc - sc.centerY()});
+            }
+            // (From the chord's line, in pixels down the frame.)
+            const Point2 a = u.front(), b = u.back();
+            const double len = std::hypot(b.x - a.x, b.y - a.y);
+            double lo = 1e9, hi = -1e9;
+            for (const Point2& q : u) {
+                const double d = ((q.x - a.x) * (b.y - a.y) - (q.y - a.y) * (b.x - a.x)) / len;
+                lo = std::min(lo, d), hi = std::max(hi, d);
+            }
+            bend = std::max(bend, (hi - lo) / 2);
+        }
+        qInfo() << "edges bent by" << bend << "px";
+        QVERIFY(bend < 0.2);
+        // Nothing to fit from.
+        QVERIFY(!calibrateFromLines({}, rig.W, rig.H, o, lines, &error));
+        QVERIFY(snapLineToEdge(wall, {{100, 100}}).empty());
+    }
+
+    void lensStMaps() {
+        // ST maps: the undistort map takes a grid exactly where Lens Correction (no fit) puts it, and the redistort
+        // map takes it back; the overscan holds all of the recorded frame.
+        const LensRig rig;
+        const int W = rig.W, H = rig.H;
+        StMaps maps;
+        std::string error;
+        QVERIFY2(makeStMaps(rig.truth, rig.plain, W, H, maps, &error), error.c_str());
+        QVERIFY(maps.overscanWidth > W && maps.overscanHeight > H);  // (barrel: the corrected picture is larger)
+        QVERIFY((maps.overscanWidth - W) % 2 == 0 && (maps.overscanHeight - H) % 2 == 0);
+        // (Every corner of the recorded frame lands inside it.)
+        const int ox = (maps.overscanWidth - W) / 2, oy = (maps.overscanHeight - H) / 2;
+        for (const Point2 corner : {Point2{0, 0}, Point2{double(W), 0}, Point2{0, double(H)}, Point2{double(W), double(H)}}) {
+            double xc, yc;
+            QVERIFY(rig.c->corrected(corner.x, corner.y, xc, yc));
+            QVERIFY(xc + ox >= 0 && xc + ox <= maps.overscanWidth && yc + oy >= 0 && yc + oy <= maps.overscanHeight);
+        }
+        Image grid(W, H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* q = grid.at(x, y);
+                const float v = (x % 24 < 2 || y % 24 < 2) ? 1.f : 0.2f;
+                q[0] = v, q[1] = v * 0.5f, q[2] = 1 - v, q[3] = 1;
+            }
+        LensChoice choice;
+        choice.lens = &rig.truth;
+        choice.focal = 50;
+        Effect e = lensCorrectionEffect(choice, 1);
+        e.params["fit"] = Param(2.0);
+        e.params["tca"] = Param(0.0);
+        e.params["vignetting"] = Param(0.0);
+        Image corrected = grid;
+        vfx::lensCorrection(e, 0, corrected);
+        // (Bilinear, as Lens Correction samples, the recorded frame's edge pixels reaching its edge.)
+        auto take = [&](const Image& img, double x, double y, float out[4]) {
+            if (!(x >= 0 && y >= 0 && x <= img.width && y <= img.height)) {
+                std::fill(out, out + 4, 0.f);
+                return;
+            }
+            x = std::clamp(x, 0.5, img.width - 0.5) - 0.5, y = std::clamp(y, 0.5, img.height - 0.5) - 0.5;
+            const int x0 = int(std::floor(x)), y0 = int(std::floor(y)), x1 = std::min(x0 + 1, img.width - 1), y1 = std::min(y0 + 1, img.height - 1);
+            const float fx = float(x - x0), fy = float(y - y0);
+            for (int k = 0; k < 4; ++k) {
+                const float top = img.at(x0, y0)[k] + (img.at(x1, y0)[k] - img.at(x0, y0)[k]) * fx;
+                const float bottom = img.at(x0, y1)[k] + (img.at(x1, y1)[k] - img.at(x0, y1)[k]) * fx;
+                out[k] = top + (bottom - top) * fy;
+            }
+        };
+        double worst = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const float* st = &maps.undistort[(size_t(y + oy) * maps.overscanWidth + size_t(x + ox)) * 3];
+                float q[4];
+                take(grid, double(st[0]) * W, (1 - double(st[1])) * H, q);
+                for (int k = 0; k < 4; ++k) worst = std::max(worst, double(std::fabs(q[k] - corrected.at(x, y)[k])));
+            }
+        qInfo() << "ST map against Lens Correction" << worst;
+        QVERIFY(worst < 1e-3);
+        // Undistorted then redistorted: back where it was, to a hundredth of a pixel.
+        double round = 0;
+        for (int y = 0; y < H; y += 7)
+            for (int x = 0; x < W; x += 7) {
+                const float* st = &maps.redistort[(size_t(y) * W + size_t(x)) * 3];
+                double sx, sy;
+                QVERIFY(stMapLookup(maps.undistort, maps.overscanWidth, maps.overscanHeight, double(st[0]) * maps.overscanWidth,
+                                    (1 - double(st[1])) * maps.overscanHeight, W, H, sx, sy));
+                round = std::max(round, std::hypot(sx - (x + 0.5), sy - (y + 0.5)));
+            }
+        qInfo() << "undistorted and redistorted" << round << "px";
+        QVERIFY(round < 0.01);
+        if (!exrAvailable()) QSKIP("Built without OpenEXR");
+        // As 32-bit EXRs.
+        const std::string u = path("st_undistort.exr"), r = path("st_redistort.exr");
+        QVERIFY2(writeStMaps(maps, u, r, &error), error.c_str());
+        ExrInfo info;
+        QVERIFY(readExrInfo(u, info));
+        QCOMPARE(info.width, maps.overscanWidth);
+        QCOMPARE(info.height, maps.overscanHeight);
+        int rw = 0, rh = 0;
+        std::vector<float> rgba;
+        QVERIFY(readExrLayer(r, "", rw, rh, rgba));
+        QVERIFY(rw == W && rh == H);
+        QCOMPARE(rgba[(size_t(100) * W + 200) * 4], maps.redistort[(size_t(100) * W + 200) * 3]);
+
+        // In a VFX pull, over MCP: a shot whose clip has a Lens Correction gets its maps (at the plate's size) and its
+        // overscan in the pull list; one without gets none.
+        writeFrames(path("st_plate.mp4"), {LensRig::toQImage(rig.render(rig.wall, LensRig::bars)), LensRig::toQImage(rig.render(rig.wall, LensRig::bars))}, 25);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H;
+        const MediaItem m = probeOrFail(p, path("st_plate.mp4"));
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 2, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, m.id, 10, 0, 2, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& corrected0 = s.videoTracks[0].clips[0];
+        corrected0.name = "Corrected";
+        s.videoTracks[0].clips[1].name = "Plain";
+        corrected0.effects.insert(corrected0.effects.begin(), e);
+        const QString project = QString::fromStdString(path("stmaps.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_vfx_pull"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"folder", QString::fromStdString(path("st-pulls"))},
+                                                                               {"handles", 0}, {"amf", false}, {"st_maps", true}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+        const QJsonArray shots = res.value("structuredContent").toObject().value("shots").toArray();
+        QCOMPARE(shots.size(), 2);
+        const QJsonObject withMaps = shots[0].toObject();
+        QCOMPARE(withMaps.value("name").toString(), QStringLiteral("Corrected"));
+        QCOMPARE(withMaps.value("overscan").toArray(), (QJsonArray{maps.overscanWidth, maps.overscanHeight}));
+        QVERIFY(QFileInfo::exists(withMaps.value("undistort_map").toString()) && QFileInfo::exists(withMaps.value("redistort_map").toString()));
+        QVERIFY(readExrLayer(withMaps.value("undistort_map").toString().toStdString(), "", rw, rh, rgba));
+        QVERIFY(rw == maps.overscanWidth && rh == maps.overscanHeight);
+        QCOMPARE(rgba[(size_t(50) * rw + 60) * 4], maps.undistort[(size_t(50) * rw + 60) * 3]);
+        QVERIFY(!shots[1].toObject().contains("undistort_map"));
+        QFile list(QString::fromStdString(path("st-pulls") + "/pull_list.csv"));
+        QVERIFY(list.open(QIODevice::ReadOnly));
+        const QStringList rowsCsv = QString::fromUtf8(list.readAll()).split('\n', Qt::SkipEmptyParts);
+        QVERIFY(rowsCsv[0].endsWith(",Overscan,Undistort Map,Redistort Map"));
+        QVERIFY2(rowsCsv[1].contains(QStringLiteral(",%1x%2,").arg(maps.overscanWidth).arg(maps.overscanHeight)), qPrintable(rowsCsv[1]));
+        QVERIFY(rowsCsv[2].endsWith(",,,"));
+    }
+
+    void calibrateLensOverMcp() {
+        // The user's lens folder in a temporary one; no lensfun database.
+        QTemporaryDir own;
+        const QByteArray before = qgetenv("MONTAGE_USER_LENSES"), beforeDb = qgetenv("MONTAGE_LENS_DB");
+        qputenv("MONTAGE_USER_LENSES", own.path().toUtf8());
+        qputenv("MONTAGE_LENS_DB", QFile::encodeName(own.filePath("no-lensfun")));
+        reloadLensDatabase();
+        struct Restore {
+            QByteArray v, db;
+            ~Restore() {
+                if (v.isEmpty()) qunsetenv("MONTAGE_USER_LENSES");
+                else qputenv("MONTAGE_USER_LENSES", v);
+                if (db.isEmpty()) qunsetenv("MONTAGE_LENS_DB");
+                else qputenv("MONTAGE_LENS_DB", db);
+                reloadLensDatabase();
+            }
+        } restore{before, beforeDb};
+        QVERIFY(!lensDatabase());
+        QCOMPARE(userLensFolder(), own.path().toStdString());
+        // A clip of the board at its eight poses (losslessly), and a still of the wall.
+        const LensRig rig;
+        std::vector<QImage> frames;
+        for (const auto& pose : LensRig::boardPoses()) frames.push_back(LensRig::toQImage(rig.render(pose, LensRig::board)));
+        writeFrames(path("board.mp4"), frames, 25, 0);
+        const std::string wall = path("wall.png");
+        QVERIFY(LensRig::toQImage(rig.render(rig.wall, LensRig::bars)).save(QString::fromStdString(wall)));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = rig.W, s.height = rig.H;
+        s.fps = {25, 1};
+        MediaItem board = probeOrFail(p, path("board.mp4"));
+        board.metadata["device"] = "Test Cam";
+        p.media.push_back(board);
+        const MediaItem wallMedia = probeOrFail(p, wall);
+        p.media.push_back(wallMedia);
+        QVERIFY(edit::placeMedia(p, s, board.id, 0, 0, 8, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, wallMedia.id, 20, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id boardClip = s.videoTracks[0].clips[0].id, wallClip = s.videoTracks[0].clips[1].id;
+        const QString project = QString::fromStdString(path("calibrate.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject full = args;
+            full["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_calibrate_lens"}, {"arguments", full},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject o = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object();
+            return o.contains("error") ? QJsonObject{{"isError", true}, {"error", o.value("error")}} : o.value("result").toObject();
+        };
+        // From the board: fitted, saved to the user's folder and put on the clip.
+        QJsonObject r = call({{"clip", double(boardClip)}, {"board", QJsonArray{9, 6}}, {"anamorphic", true}, {"focal", 50}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject out = r.value("structuredContent").toObject();
+        QCOMPARE(out.value("views").toInt(), 8);
+        QVERIFY(out.value("rms").toDouble() < 0.15);
+        const QJsonArray terms = out.value("terms").toArray();
+        QCOMPARE(terms.size(), 2);
+        QVERIFY(std::fabs(terms[0].toDouble() / rig.k(0) - 1) < 0.02 && std::fabs(terms[1].toDouble() / rig.k(1) - 1) < 0.05);
+        QVERIFY(std::fabs(out.value("squeeze").toDouble() - 1.33) < 0.005);
+        QCOMPARE(out.value("lens").toString(), QStringLiteral("Calibrated Test Cam 50mm (calibrated)"));
+        QVERIFY(QFileInfo(out.value("file").toString()).dir() == QDir(own.path()));
+        QCOMPARE(out.value("clips").toInt(), 1);
+        // Lens Correction offers it now (the user's own lenses, with no lensfun database), and the clip has it.
+        const auto db = lensDatabase();
+        QVERIFY(db && db->lenses().size() == 1 && db->lenses()[0].own);
+        QVERIFY(!lensfunDatabaseFound());
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Clip* clip = edit::clipById(*back.active(), boardClip);
+        QVERIFY(clip && !clip->effects.empty() && clip->effects[0].type == "lens_correction");
+        QCOMPARE(clip->effects[0].s("lens"), out.value("lens").toString().toStdString());
+        QCOMPARE(lens::parseLens(clip->effects[0].s("profile"))->squeeze, out.value("squeeze").toDouble());
+        // From lines drawn on the wall (fractions of the frame), snapped, the squeeze given and the centre fitted too;
+        // fit only.
+        std::vector<std::vector<Point2>> truths, drawn;
+        rig.wallEdges(truths, drawn);
+        QJsonArray lines;
+        for (const auto& d : drawn) {
+            QJsonArray line;
+            for (const Point2& q : d) line.append(QJsonArray{q.x / rig.W, q.y / rig.H});
+            lines.append(line);
+        }
+        r = call({{"clip", double(wallClip)}, {"lines", lines}, {"squeeze", 1.33}, {"fit_center", true}, {"fit_only", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        out = r.value("structuredContent").toObject();
+        QVERIFY(out.value("rms").toDouble() < 0.2);
+        QVERIFY(std::fabs(out.value("center").toArray()[0].toDouble() - rig.truth.centerX) < 0.003 &&
+                std::fabs(out.value("center").toArray()[1].toDouble() - rig.truth.centerY) < 0.003);
+        QCOMPARE(out.value("lens").toString(), QStringLiteral("Calibrated Lens (calibrated)"));
+        QCOMPARE(out.value("views").toInt(), lines.size());
+        QVERIFY(!out.contains("file") && !out.contains("focal_found"));
+        QVERIFY(!edit::clipById(*back.active(), wallClip)->effects.size() || edit::clipById(*back.active(), wallClip)->effects[0].type != "lens_correction");
+        // Refused: neither or both ways, a board not there, bad lines.
+        QVERIFY(call({{"clip", double(boardClip)}}).value("isError").toBool());
+        QVERIFY(call({{"clip", double(boardClip)}, {"board", QJsonArray{9, 6}}, {"lines", lines}}).value("isError").toBool());
+        r = call({{"clip", double(boardClip)}, {"board", QJsonArray{7, 5}}});
+        QVERIFY(r.value("isError").toBool());
+        QVERIFY2(QJsonDocument(r).toJson().contains("found in 0 frames"), QJsonDocument(r).toJson().constData());
+        QVERIFY(call({{"clip", double(wallClip)}, {"lines", QJsonArray{QJsonArray{QJsonArray{2, 0.5}, QJsonArray{0.5, 0.5}}}}}).value("isError").toBool());
     }
 
     void reviewPackages() {

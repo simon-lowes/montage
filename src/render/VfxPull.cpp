@@ -12,6 +12,7 @@
 #include "ColorSpace.h"
 #include "Compositor.h"
 #include "Processing.h"
+#include "VideoFx.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/Interpretation.h"
@@ -19,6 +20,7 @@
 #include "media/VideoDepth.h"
 #include "media/Exr.h"
 #include "media/Image.h"
+#include "media/LensCalibration.h"
 #include "media/Matting.h"
 #include "media/MediaPool.h"
 
@@ -172,6 +174,7 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
         return false;
     };
     if (o.format != "exr" && o.format != "dpx" && o.format != "tiff") return fail("Pulls are OpenEXR, DPX or TIFF");
+    if (o.stMaps && !exrAvailable()) return fail("ST maps need Montage built with the OpenEXR library");
     if (!QDir().mkpath(QString::fromStdString(o.folder))) return fail("Cannot make the folder " + o.folder);
     // The shots: footage clips on video tracks, in timeline order.
     std::vector<const Clip*> chosen;
@@ -303,10 +306,26 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
             if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(xml.data(), qint64(xml.size())) != qint64(xml.size()))
                 return fail("Cannot write " + shot.amf);
         }
+        if (o.stMaps) {
+            // (The clip's first Lens Correction that is on, as it is at the cut's first frame.)
+            const auto lc = std::find_if(c.effects.begin(), c.effects.end(), [](const Effect& e) { return e.type == "lens_correction" && e.enabled; });
+            const auto lensOf = lc != c.effects.end() ? lens::parseLens(lc->s("profile")) : nullptr;
+            if (lensOf) {
+                StMaps maps;
+                if (!makeStMaps(*lensOf, vfx::lensSettings(*lc, 0), alone.width, alone.height, maps, &why) ||
+                    !writeStMaps(maps,
+                                 shot.undistortMap = QDir(QString::fromStdString(shot.folder)).filePath(QString::fromStdString(name) + "_undistort.exr").toStdString(),
+                                 shot.redistortMap = QDir(QString::fromStdString(shot.folder)).filePath(QString::fromStdString(name) + "_redistort.exr").toStdString(),
+                                 &why))
+                    return fail(name + ": " + why);
+                shot.overscanWidth = maps.overscanWidth;
+                shot.overscanHeight = maps.overscanHeight;
+            }
+        }
         shots.push_back(shot);
     }
     // The pull list.
-    std::string csv = "Shot,Source File,Source In (s),Source Out (s),Head Handle,Tail Handle,First Frame,Cut In,Cut Out,Last Frame,Folder,Layers\n";
+    std::string csv = "Shot,Source File,Source In (s),Source Out (s),Head Handle,Tail Handle,First Frame,Cut In,Cut Out,Last Frame,Folder,Layers,Overscan,Undistort Map,Redistort Map\n";
     char num[64];
     for (const VfxShot& s : shots) {
         csv += csvField(s.name) + "," + csvField(s.media) + ",";
@@ -316,7 +335,9 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
                std::to_string(s.cutIn) + "," + std::to_string(s.cutOut) + "," + std::to_string(s.lastFrame) + "," + csvField(s.folder) + ",";
         std::string layers;
         for (const std::string& l : s.layers) layers += (layers.empty() ? "" : " ") + l;
-        csv += csvField(layers) + "\n";
+        csv += csvField(layers) + ",";
+        csv += s.overscanWidth > 0 ? std::to_string(s.overscanWidth) + "x" + std::to_string(s.overscanHeight) : std::string();
+        csv += "," + csvField(s.undistortMap) + "," + csvField(s.redistortMap) + "\n";
     }
     QFile list(QDir(QString::fromStdString(o.folder)).filePath(QStringLiteral("pull_list.csv")));
     if (!list.open(QIODevice::WriteOnly | QIODevice::Truncate) || list.write(csv.data(), qint64(csv.size())) != qint64(csv.size()))

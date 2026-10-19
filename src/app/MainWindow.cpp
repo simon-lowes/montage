@@ -158,6 +158,7 @@
 #include "TransformOverlay.h"
 #include "ReviewOverlay.h"
 #include "ChartMatchDialog.h"
+#include "LensCalibrationDialog.h"
 #include "LensCorrectionDialog.h"
 #include "LicencesDialog.h"
 #include "ReferenceOutputPanel.h"
@@ -1027,6 +1028,8 @@ void MainWindow::buildMenus() {
     add(file, tr("Export &IMF Master…"), QKeySequence(), [this] { exportImfDialog(); })->setObjectName(QStringLiteral("exportImf"));
     add(file, tr("Export Immersive Master (&ADM BWF)…"), QKeySequence(), [this] { exportAdmDialog(); })
         ->setObjectName(QStringLiteral("exportAdm"));
+    add(file, tr("Export Immersive Audio (&IAMF)…"), QKeySequence(), [this] { exportIamfDialog(); })
+        ->setObjectName(QStringLiteral("exportIamf"));
     add(file, tr("Watch Remote Review…"), QKeySequence(), [this] {
         auto* w = new ReviewViewerWindow(this);
         w->show();
@@ -1371,6 +1374,7 @@ void MainWindow::buildMenus() {
     add(clipM, tr("&Key Out Green / Blue Screen"), QKeySequence(), [this] { keyOutScreen(); })->setObjectName(QStringLiteral("keyScreen"));
     add(clipM, tr("Match Colour Chart…"), QKeySequence(), [this] { matchColourChart(); })->setObjectName(QStringLiteral("matchColourChart"));
     add(clipM, tr("Correct Lens…"), QKeySequence(), [this] { correctLens(); })->setObjectName(QStringLiteral("correctLens"));
+    add(clipM, tr("Calibrate Lens…"), QKeySequence(), [this] { calibrateLens(); })->setObjectName(QStringLiteral("calibrateLens"));
     add(clipM, tr("Match Colour to Reference"), QKeySequence("Ctrl+Alt+Shift+C"), [this] { matchColour(); })
         ->setObjectName(QStringLiteral("matchColour"));
     compareRef_ = add(clipM, tr("Compare with Reference"), QKeySequence(), [this] { setCompareWithReference(compareRef_->isChecked()); });
@@ -4578,28 +4582,37 @@ int MainWindow::matchColour() {
     return n;
 }
 
-bool MainWindow::correctLens() {
-    const Sequence* s = state_->sequence();
-    if (!s) return false;
-    // The selected picture clip, else the top one at the playhead.
-    const FrameTime at = state_->playhead();
-    Id clip = 0;
-    for (Id id : state_->selectedClips())
-        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Video && edit::clipById(*s, id)->mediaId) {
-            clip = id;
-            break;
-        }
-    for (auto t = s->videoTracks.rbegin(); !clip && t != s->videoTracks.rend(); ++t)
+namespace {
+// The selected picture clip, else the top one at the playhead; 0 when there is none.
+Id lensClip(EditorState* state) {
+    const Sequence* s = state->sequence();
+    if (!s) return 0;
+    const FrameTime at = state->playhead();
+    for (Id id : state->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Video && edit::clipById(*s, id)->mediaId) return id;
+    for (auto t = s->videoTracks.rbegin(); t != s->videoTracks.rend(); ++t)
         for (const Clip& c : t->clips)
-            if (c.mediaId && c.contains(at)) {
-                clip = c.id;
-                break;
-            }
+            if (c.mediaId && c.contains(at)) return c.id;
+    return 0;
+}
+}  // namespace
+
+bool MainWindow::correctLens() {
+    const Id clip = lensClip(state_);
     if (!clip) {
         state_->message(tr("Select the video clip to correct (or park on it)"));
         return false;
     }
     return montage::correctLens(this, state_, clip);
+}
+
+bool MainWindow::calibrateLens() {
+    const Id clip = lensClip(state_);
+    if (!clip) {
+        state_->message(tr("Select the video clip to calibrate from (or park on it)"));
+        return false;
+    }
+    return montage::calibrateLens(this, state_, clip);
 }
 
 int MainWindow::matchColourChart() {
@@ -6220,6 +6233,93 @@ void MainWindow::exportAdmDialog() {
     st.title = s->name;
     st.inOut = s->inPoint >= 0 && s->outPoint >= s->inPoint;
     exportAdmTo(QFileInfo(path).suffix().isEmpty() ? path + QStringLiteral(".wav") : path, st);
+}
+
+bool MainWindow::exportIamfTo(const QString& path, const IamfSettings& settings, IamfResult* resultOut) {
+    const Sequence* s = state_->sequence();
+    if (!s || s->duration() == 0) {
+        state_->message(tr("Nothing to export"));
+        return false;
+    }
+    // Mixed from a copy, off the UI thread.
+    const Project project = state_->project();
+    const Sequence seq = *s;
+    QProgressDialog progress(tr("Writing the immersive audio of %1...").arg(QString::fromStdString(seq.name)), tr("Cancel"), 0, 1000, this);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(400);
+    std::atomic<int> done{0};
+    std::atomic<bool> cancel{false};
+    connect(&progress, &QProgressDialog::canceled, this, [&cancel] { cancel = true; });
+    IamfResult result;
+    std::string err;
+    QFutureWatcher<bool> watcher;
+    QEventLoop loop;
+    connect(&watcher, &QFutureWatcher<bool>::finished, &loop, &QEventLoop::quit);
+    QTimer tick;
+    connect(&tick, &QTimer::timeout, this, [&] { progress.setValue(done.load()); });
+    tick.start(100);
+    watcher.setFuture(QtConcurrent::run([&] {
+        return exportIamf(project, seq, settings, path.toStdString(), &result, [&](double f) {
+            done = int(f * 1000);
+            return !cancel.load();
+        }, &err);
+    }));
+    if (!watcher.isFinished()) loop.exec();
+    tick.stop();
+    progress.close();
+    if (!watcher.result()) {
+        state_->message(cancel ? tr("IAMF export cancelled") : tr("No IAMF file: %1").arg(QString::fromStdString(err)), 8000);
+        return false;
+    }
+    if (resultOut) *resultOut = result;
+    const QString loud = result.loudness.empty() ? QString()
+                                                 : tr(", %1 LUFS").arg(result.loudness.front().integrated, 0, 'f', 1);
+    state_->message(tr("IAMF %1 written: %2 in %n substream(s)%3", "", result.substreams)
+                        .arg(QFileInfo(path).fileName(), QString::fromStdString(result.layout), loud),
+                    10000);
+    state_->noteMediaFileWritten(path);
+    return true;
+}
+
+void MainWindow::exportIamfDialog() {
+    const Sequence* s = state_->sequence();
+    if (!s || s->duration() == 0) {
+        state_->message(tr("Nothing to export"));
+        return;
+    }
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Export Immersive Audio (IAMF)"));
+    auto* form = new QFormLayout(&dlg);
+    auto* about = new QLabel(tr("%1 is mixed in %2: its sound is written in that layout (objects rendered into it), with its "
+                                "loudness measured, for YouTube and players that take IAMF.")
+                                 .arg(QString::fromStdString(s->name), QString::fromStdString(s->audioLayout)));
+    about->setWordWrap(true);
+    form->addRow(about);
+    auto* codec = new QComboBox;
+    codec->addItem(tr("FLAC (lossless)"), QStringLiteral("flac"));
+    codec->addItem(tr("PCM, 24-bit"), QStringLiteral("lpcm"));
+    form->addRow(tr("Codec:"), codec);
+    auto* binaural = new QCheckBox(tr("Binaural on headphones"));
+    binaural->setChecked(true);
+    form->addRow(binaural);
+    auto* inOut = new QCheckBox(tr("In to Out only"));
+    inOut->setChecked(s->inPoint >= 0 && s->outPoint >= s->inPoint);
+    inOut->setEnabled(inOut->isChecked());
+    form->addRow(inOut);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    form->addRow(buttons);
+    if (dlg.exec() != QDialog::Accepted) return;
+    const QString path = QFileDialog::getSaveFileName(this, tr("Export Immersive Audio (IAMF)"), QString::fromStdString(s->name) + QStringLiteral(".mp4"),
+                                                      tr("IAMF in MP4 (*.mp4 *.m4a);;IAMF stream (*.iamf)"));
+    if (path.isEmpty()) return;
+    IamfSettings st;
+    st.codec = codec->currentData().toString().toStdString();
+    st.binaural = binaural->isChecked();
+    st.inOut = inOut->isChecked();
+    st.title = s->name;
+    exportIamfTo(QFileInfo(path).suffix().isEmpty() ? path + QStringLiteral(".mp4") : path, st);
 }
 
 void MainWindow::exportImfDialog() {

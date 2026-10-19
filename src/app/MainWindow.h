@@ -21,6 +21,7 @@
 #include "render/ReviewExport.h"
 #include "render/Dcp.h"
 #include "render/Adm.h"
+#include "render/Iamf.h"
 #include "render/Imf.h"
 #include "render/Jpeg2000.h"
 #include "render/ExtendClip.h"
@@ -126,6 +127,9 @@ public:
     // Clip › Correct Lens…: the selected clip's (or the one at the playhead's) lens profile chosen and its Lens
     // Correction put on (app/LensCorrectionDialog.h; tests reach the dialog through lensDialogHook()).
     bool correctLens();
+    // Clip › Calibrate Lens…: a lens profile made from the clip (a checkerboard in it, or lines drawn on its frame),
+    // saved and applied (app/LensCalibrationDialog.h; tests reach the dialog through lensCalibrationDialogHook()).
+    bool calibrateLens();
     // Split-screen compare in the Program monitor: the reference beside the current frame.
     void setCompareWithReference(bool on);
     void scriptCutDialog();  // Sequence › Build Cut from Script…
@@ -263,6 +267,9 @@ public:
     // File › Export Immersive Master (ADM BWF)…: the bed and the audio objects (render/Adm.h), in the background.
     bool exportAdmTo(const QString& path, const AdmSettings& settings, AdmResult* result = nullptr);
     void exportAdmDialog();
+    // File › Export Immersive Audio (IAMF)…: the mix as IAMF in an MP4 or the bare stream (render/Iamf.h), in the background.
+    bool exportIamfTo(const QString& path, const IamfSettings& settings, IamfResult* result = nullptr);
+    void exportIamfDialog();
     bool addToColorGroup(Id group);
     bool removeFromColorGroup();
     // Suggest Chapters: chapter markers where the talk moves on, titled with what each part is about (replacing the
