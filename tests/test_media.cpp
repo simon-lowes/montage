@@ -7348,6 +7348,12 @@ private slots:
         probed = call("montage_probe_media", {{"path", sdrStill}}).value("structuredContent").toObject();
         QVERIFY(probed.value("color_space").toString() == "rec709" && !probed.contains("max_cll"));
         QVERIFY(call("montage_render_frame", {{"at", 0.5}, {"output", still}, {"rendition", "cinema"}}).value("isError").toBool());
+        // As a JPEG with a gain map, which probes as PQ.
+        const QString gainMapped = QString::fromStdString(path("trims/frame.jpg"));
+        r = call("montage_render_frame", {{"at", 0.5}, {"output", gainMapped}, {"rendition", "master"}});
+        QVERIFY2(!r.value("isError").toBool() && said(r).contains("gain map"), qPrintable(said(r)));
+        probed = call("montage_probe_media", {{"path", gainMapped}}).value("structuredContent").toObject();
+        QVERIFY(probed.value("color_space").toString() == "rec2100pq" && probed.value("gain_map").toBool());
     }
 
     void galleryOverMcp() {

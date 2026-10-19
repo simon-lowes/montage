@@ -536,6 +536,7 @@ QJsonObject mediaJson(const MediaItem& m) {
             o["max_cll"] = m.maxCll;
             o["max_fall"] = m.maxFall;
         }
+        if (m.gainMap) o["gain_map"] = true;
     }
     if (m.hasAudio) {
         o["sample_rate"] = m.sampleRate;
@@ -7748,7 +7749,7 @@ void McpServer::Impl::addTools() {
         R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
             "width":{"type":"integer","default":640,"description":"Width of the returned image"},
             "output":{"type":"string","description":"Also save the full-size frame here (PNG, JPEG, TIFF or AVIF by extension)"},
-            "rendition":{"type":"string","description":"An HDR sequence's frame: \"\" (default) as SDR screens show it (its SDR trim target, else tone mapped to Rec.709), \"master\" (saved as a 16-bit PNG with cICP, mDCV and cLLI or a 10-bit AVIF), or a trim target's id"},
+            "rendition":{"type":"string","description":"An HDR sequence's frame: \"\" (default) as SDR screens show it (its SDR trim target, else tone mapped to Rec.709), \"master\" (saved as a 16-bit PNG with cICP, mDCV and cLLI, a 10-bit AVIF, or a JPEG with a gain map over its SDR rendition), or a trim target's id"},
             "quality":{"type":"integer","minimum":0,"maximum":100,"default":90,"description":"JPEG and AVIF quality"},
             "stereo_view":{"type":"string","enum":["left","right","anaglyph","sbs","sbs_half","tb","tb_half","difference"],"default":"left","description":"A stereoscopic 3D sequence: which eye, both, or where they differ"}},"required":["project","at"]})json", true,
         [](const QJsonObject& a) {
@@ -7796,6 +7797,7 @@ void McpServer::Impl::addTools() {
                     if (!exportStill(l.project, s, at, absolute(str(a, "output")).toStdString(), &err, so, &res))
                         return fail(QString::fromStdString(err));
                     saved = QStringLiteral("; saved %1-bit %2").arg(res.bits).arg(QString::fromStdString(res.colorSpace));
+                    if (res.gainMap) saved += QStringLiteral(" (an SDR base with a gain map)");
                     if (res.maxCll > 0) saved += QStringLiteral(" (MaxCLL %1, MaxFALL %2 nits)").arg(res.maxCll).arg(res.maxFall);
                 }
             }

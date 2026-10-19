@@ -1433,6 +1433,8 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
                 for (Id id : pictures)
                     if (MediaItem* m = p.findMedia(id); m && m->colorOverride != space) {
                         m->colorOverride = space;
+                        // A gain-map JPEG: its HDR rendition as detected or as PQ, its SDR picture as anything else.
+                        if (m->gainMap) m->path = gainMapPath(m->path, space.empty() || space == "rec2100pq");
                         any = true;
                     }
                 return any;

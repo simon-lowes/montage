@@ -279,7 +279,7 @@ QString MediaBinModel::toolTip(const MediaItem& m) const {
         if (in.par > 0) how << tr("pixel aspect %1").arg(in.par, 0, 'g', 4);
         if (!in.alpha.empty()) how << tr("alpha %1").arg(QString::fromStdString(in.alpha));
         if (!in.fields.empty()) how << tr("fields %1").arg(QString::fromStdString(in.fields));
-        tip += "<br>" + tr("Interpreted: %1").arg(how.join(QStringLiteral(", ")));
+        if (!how.isEmpty()) tip += "<br>" + tr("Interpreted: %1").arg(how.join(QStringLiteral(", ")));
     }
     if (m.hasAudio && m.sampleRate > 0)
         tip += QString("<br>%1 Hz, %2 ch, %3").arg(m.sampleRate).arg(m.channels).arg(QString::fromStdString(m.audioCodec));

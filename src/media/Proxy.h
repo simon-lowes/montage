@@ -45,7 +45,7 @@ std::string pictureSource(const MediaItem& m, bool useProxies, bool offlineProxi
 // Its sound: the file, or (with `offlineProxies`) its proxy when the file is offline and the proxy carries sound.
 std::string soundSource(const MediaItem& m, bool offlineProxies);
 // The colour space a picture read from `path` is in: the media's own for its file, else what the proxy file says
-// (Rec.709 when it says nothing, as proxies made here from log footage are).
+// (Rec.709 when it says nothing, as proxies made here from log footage are); Rec.709 for a gain-map JPEG's SDR picture.
 const ColorSpace& pictureColorSpace(const MediaItem& m, const std::string& path);
 // The file shot analysis reads (visual search and auto-tags, scene cuts, slates; not faces, whose boxes are in the
 // file's pixels): the proxy when one is here at least 640 pixels wide (quicker to read than a camera file, and there

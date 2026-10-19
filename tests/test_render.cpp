@@ -5,6 +5,7 @@
 #include <QProcess>
 
 #include <algorithm>
+#include <QBuffer>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -46,9 +47,11 @@
 #include "render/DcpMxf.h"
 #include "render/DcpSecurity.h"
 #include "render/XmlCanonical.h"
+#include "core/Interpretation.h"
 #include "media/Decoder.h"
 #include "render/Exporter.h"
 #include "render/HdrStill.h"
+#include "media/GainMap.h"
 #include "render/Gallery.h"
 #include "render/LinedScript.h"
 #include "render/RemoteReview.h"
@@ -4105,6 +4108,196 @@ colorspaces:
         QCOMPARE(back.maxCll, res.maxCll);
         QCOMPARE(back.maxFall, res.maxFall);
 
+        // As a JPEG with a gain map: the base is the SDR trim's render, the map takes it to the master. At full boost every
+        // patch comes back within 2 % in nits (in the base's Rec.709 gamut: the master's green beyond it is clipped to it).
+        double toBase[9];
+        primariesMatrix(Primaries::Bt2020, Primaries::Bt709, toBase);
+        auto in709 = [&](const double* n, double out[3]) {
+            for (int r = 0; r < 3; ++r) out[r] = std::max(0.0, toBase[r * 3] * n[0] + toBase[r * 3 + 1] * n[1] + toBase[r * 3 + 2] * n[2]);
+        };
+        auto sameLight709 = [&](auto nitsAt, double tolerance) {
+            for (int i = 0; i < 8; ++i) {
+                double want[3], got[3];
+                in709(patches[i], want);
+                nitsAt(i * 32 + 16, H / 2, got);
+                for (int c = 0; c < 3; ++c)
+                    if (std::fabs(got[c] - want[c]) > tolerance * std::max(want[c], 5.0))
+                        return QString("patch %1 channel %2: %3 nits, not %4").arg(i).arg(c).arg(got[c]).arg(want[c]);
+            }
+            return QString();
+        };
+        StillOptions gainMap = master;
+        gainMap.quality = 95;
+        const std::string jpg = dir.filePath("frame.jpg").toStdString();
+        QVERIFY2(exportStill(p, s, 0, jpg, &err, gainMap, &res), err.c_str());
+        QVERIFY(res.gainMap && res.bits == 8 && res.colorSpace == "rec2100pq");
+        GainMapJpeg gm;
+        QVERIFY(readGainMapJpeg(jpg, gm));
+        QVERIFY(gm.iso && gm.xmp);  // (both kinds of metadata, as Adobe's licence asks)
+        QVERIFY2(gm.metadata.hdrCapacityMax > 2.2 && gm.metadata.hdrCapacityMin == 0, qPrintable(QString::number(gm.metadata.hdrCapacityMax)));
+        QCOMPARE(gm.metadata.offsetSdr[0], 1 / 64.0);
+        RenderOptions sdrTrim;
+        sdrTrim.trimTarget = "sdr";
+        sdrTrim.highQuality = true;
+        const std::vector<uint8_t> trimmed = toRgba8(renderProgramFrame(p, s, 0, sdrTrim));
+        const QImage primary(QString::fromStdString(jpg));
+        QCOMPARE(primary.size(), QSize(W, H));
+        for (int i = 0; i < 8; ++i) {
+            const QColor c = primary.pixelColor(i * 32 + 16, H / 2);
+            const size_t at = (size_t(H / 2) * W + i * 32 + 16) * 4;
+            QVERIFY2(std::abs(c.red() - trimmed[at]) <= 3 && std::abs(c.green() - trimmed[at + 1]) <= 3 && std::abs(c.blue() - trimmed[at + 2]) <= 3,
+                     qPrintable(QString("base patch %1").arg(i)));
+        }
+        // It imports as HDR (PQ, the map applied) into a PQ sequence.
+        img = readBack(jpg, "rec2100pq", back);
+        QCOMPARE(back.kind, MediaKind::Image);
+        QCOMPARE(back.colorSpace, std::string("rec2100pq"));
+        QVERIFY(back.gainMap);
+        why = sameLight709([&](int x, int y, double out[3]) {
+            const float* px = img.at(x, y);
+            double n[3] = {codeToNits(pq, px[0]), codeToNits(pq, px[1]), codeToNits(pq, px[2])};
+            in709(n, out);
+        }, 0.02);
+        QVERIFY2(why.isEmpty(), qPrintable(why));
+        // The Ultra HDR reference decoder (libultrahdr's ultrahdr_app, MONTAGE_TEST_UHDR) reads the same light.
+        if (const QByteArray app = qgetenv("MONTAGE_TEST_UHDR"); !app.isEmpty()) {
+            const QString raw = dir.filePath("uhdr.raw");
+            QProcess dec;
+            dec.start(QString::fromLocal8Bit(app), {"-m", "1", "-j", QString::fromStdString(jpg), "-o", "2", "-O", "5", "-z", raw});
+            QVERIFY(dec.waitForFinished(60000));
+            QVERIFY2(dec.exitCode() == 0, dec.readAllStandardError().constData());
+            QFile f(raw);
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            const QByteArray bytes = f.readAll();
+            QCOMPARE(bytes.size(), qsizetype(W) * H * 4);
+            why = sameLight709([&](int x, int y, double out[3]) {
+                uint32_t v;
+                std::memcpy(&v, bytes.constData() + (qsizetype(y) * W + x) * 4, 4);  // RGBA 10:10:10:2, PQ, the base's gamut
+                for (int c = 0; c < 3; ++c) out[c] = codeToNits(pq, ((v >> (10 * c)) & 1023) / 1023.0);
+            }, 0.02);
+            QVERIFY2(why.isEmpty(), qPrintable("ultrahdr_app: " + why));
+        } else {
+            qInfo("MONTAGE_TEST_UHDR not set: the gain-map JPEG is not checked with libultrahdr");
+        }
+        // In an SDR sequence it is its own SDR picture (the base), not its HDR rendition tone mapped.
+        img = readBack(jpg, "rec709", back);
+        QVERIFY(back.gainMap);
+        {
+            const std::vector<uint8_t> got = toRgba8(img);
+            for (int i = 0; i < 8; ++i) {
+                const QColor c = primary.pixelColor(i * 32 + 16, H / 2);
+                const size_t at = (size_t(H / 2) * W + i * 32 + 16) * 4;
+                QVERIFY2(std::abs(c.red() - got[at]) <= 2 && std::abs(c.green() - got[at + 1]) <= 2 && std::abs(c.blue() - got[at + 2]) <= 2,
+                         qPrintable(QString("SDR picture patch %1").arg(i)));
+            }
+        }
+        // Read as a project saved before gain maps were read keeps it: the SDR picture, in Rec.709, in an HDR sequence.
+        {
+            const std::string old = dir.filePath("old.jpg").toStdString();
+            QVERIFY(QFile::copy(QString::fromStdString(jpg), QString::fromStdString(old)));
+            Project r = makeDefaultProject();
+            Sequence& rs = *r.active();
+            rs.width = W, rs.height = H, rs.colorSpace = "rec2100pq";
+            MediaItem m;
+            QVERIFY(probeMedia(old, m));
+            QVERIFY(m.gainMap && m.path != old);  // (as imported)
+            m.path = old, m.colorSpace.clear(), m.gainMap = false;
+            m.id = r.newId();
+            r.media.push_back(m);
+            QVERIFY(edit::placeMedia(r, rs, m.id, 0, 0, 10, {TrackKind::Video, 0}, {}, false).ok);
+            const Image saved = renderProgramFrame(r, rs, 0, RenderOptions());
+            const float* px = saved.at(7 * 32 + 16, H / 2);  // (the brightest patch: SDR white at most)
+            QVERIFY2(codeToNits(pq, px[1]) < 260, qPrintable(QString::number(codeToNits(pq, px[1]))));
+        }
+        // Adobe's XMP alone, under another prefix and in single quotes, reads the same.
+        {
+            QFile f(QString::fromStdString(jpg));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            QByteArray bytes = f.readAll();
+            for (qsizetype at = bytes.indexOf("<x:xmpmeta"); at >= 0; at = bytes.indexOf("<x:xmpmeta", at + 1)) {
+                const qsizetype end = bytes.indexOf("</x:xmpmeta>", at);
+                QVERIFY(end > at);
+                for (qsizetype i = at; i < end; ++i) {
+                    if (bytes[i] == '"') bytes[i] = '\'';
+                    if (bytes.mid(i, 6) == "hdrgm:") bytes.replace(i, 6, "gmhdr:");
+                    if (bytes.mid(i, 12) == "xmlns:hdrgm=") bytes.replace(i, 12, "xmlns:gmhdr=");
+                }
+            }
+            for (qsizetype at = bytes.indexOf("urn:iso:std:iso:ts:21496"); at >= 0; at = bytes.indexOf("urn:iso:std:iso:ts:21496", at + 1))
+                bytes[at + 4] = 'X';  // (no ISO metadata)
+            const std::string xmpOnly = dir.filePath("xmp-only.jpg").toStdString();
+            QFile o(QString::fromStdString(xmpOnly));
+            QVERIFY(o.open(QIODevice::WriteOnly) && o.write(bytes) == bytes.size());
+            o.close();
+            GainMapJpeg x;
+            QVERIFY(readGainMapJpeg(xmpOnly, x));
+            QVERIFY(x.xmp && !x.iso);
+            QVERIFY(std::fabs(x.metadata.gainMapMax[0] - gm.metadata.gainMapMax[0]) < 1e-5);
+            QVERIFY(std::fabs(x.metadata.gainMapMin[2] - gm.metadata.gainMapMin[2]) < 1e-5);
+            QVERIFY(std::fabs(x.metadata.hdrCapacityMax - gm.metadata.hdrCapacityMax) < 1e-5);
+            // A map that does not decode (a lossless JPEG, which no reader here takes): no HDR rendition, and the
+            // picture does not open (rather than read its SDR codes as PQ).
+            const qsizetype sof = bytes.indexOf(QByteArray("\xff\xc0", 2), qsizetype(x.mapOffset));
+            QVERIFY(sof > 0);
+            bytes[sof + 1] = char(0xc3);
+            const std::string damaged = dir.filePath("damaged.jpg").toStdString();
+            QFile d(QString::fromStdString(damaged));
+            QVERIFY(d.open(QIODevice::WriteOnly) && d.write(bytes) == bytes.size());
+            d.close();
+            std::string why2;
+            QVERIFY(!decodeGainMapJpeg(damaged, &why2));
+            QVERIFY(!why2.empty());
+            VideoDecoder vd;
+            QVERIFY(!vd.open(gainMapPath(damaged, true)));
+        }
+        // A camera's JPEG with a second picture (an MPF preview) and XMP of its own has no gain map: Rec.709.
+        {
+            QImage photo(64, 48, QImage::Format_RGB888);
+            photo.fill(QColor(200, 120, 40));
+            QByteArray first, preview;
+            QBuffer b1(&first), b2(&preview);
+            QVERIFY(b1.open(QIODevice::WriteOnly) && photo.save(&b1, "JPEG"));
+            QVERIFY(b2.open(QIODevice::WriteOnly) && photo.scaled(16, 12).save(&b2, "JPEG"));
+            auto seg = [](int marker, const QByteArray& data) {
+                QByteArray s;
+                s.append(char(0xff)).append(char(marker)).append(char((data.size() + 2) >> 8)).append(char((data.size() + 2) & 0xff));
+                return s + data;
+            };
+            const QByteArray xmp = QByteArray("http://ns.adobe.com/xap/1.0/\0", 29) +
+                                   "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">"
+                                   "<rdf:Description xmlns:xmp=\"http://ns.adobe.com/xap/1.0/\" xmp:CreatorTool=\"Camera\"/></rdf:RDF></x:xmpmeta>";
+            auto mpf = [](uint32_t primary, uint32_t offset, uint32_t size) {
+                QByteArray m("MPF\0MM\0\x2a\0\0\0\x08\0\x03", 14);
+                auto u16 = [&](unsigned v) { m.append(char(v >> 8)).append(char(v)); };
+                auto u32 = [&](uint32_t v) { u16(v >> 16), u16(v & 0xffff); };
+                u16(0xb000), u16(7), u32(4), m.append("0100", 4);
+                u16(0xb001), u16(4), u32(1), u32(2);
+                u16(0xb002), u16(7), u32(32), u32(50);
+                u32(0);
+                u32(0x20030000), u32(primary), u32(0), u16(0), u16(0);
+                u32(0x00010001), u32(size), u32(offset), u16(0), u16(0);
+                return m;
+            };
+            const QByteArray head = seg(0xe1, xmp), mpfSeg = seg(0xe2, mpf(0, 0, 0));
+            const qsizetype primarySize = first.size() + head.size() + mpfSeg.size(), tiff = 2 + head.size() + 8;
+            const QByteArray file = first.left(2) + head + seg(0xe2, mpf(uint32_t(primarySize), uint32_t(primarySize - tiff), uint32_t(preview.size()))) +
+                                    first.mid(2) + preview;
+            const std::string camera = dir.filePath("camera.jpg").toStdString();
+            QFile c(QString::fromStdString(camera));
+            QVERIFY(c.open(QIODevice::WriteOnly) && c.write(file) == file.size());
+            c.close();
+            GainMapJpeg none;
+            QVERIFY(!readGainMapJpeg(camera, none));
+            MediaItem m;
+            QVERIFY(probeMedia(camera, m));
+            QVERIFY(!m.gainMap && m.colorSpace.empty() && m.path == camera);
+            // Nor does a file whose segments run past its end.
+            QFile t(QString::fromStdString(camera));
+            QVERIFY(t.open(QIODevice::WriteOnly) && t.write(file.left(head.size() / 2 + 2)) > 0);
+            t.close();
+            QVERIFY(!readGainMapJpeg(camera, none));
+        }
+
         // For SDR screens (the default): the SDR trim's render, as an 8-bit PNG.
         RenderOptions trim;
         trim.trimTarget = "sdr";
@@ -4151,9 +4344,9 @@ colorspaces:
         QVERIFY(probeMedia(avif, back) && back.colorSpace == "rec2100hlg" && back.kind == MediaKind::Image);
         s.colorSpace = "rec2100pq";
 
-        // HDR goes out only as PNG or AVIF; an unknown target is refused.
-        QVERIFY(!exportStill(p, s, 0, dir.filePath("frame.jpg").toStdString(), &err, master));
-        QVERIFY(err.find("PNG or AVIF") != std::string::npos);
+        // HDR goes out only as PNG, AVIF or JPEG; an unknown target is refused.
+        QVERIFY(!exportStill(p, s, 0, dir.filePath("frame.tif").toStdString(), &err, master));
+        QVERIFY(err.find("PNG, AVIF or JPEG") != std::string::npos);
         StillOptions unknown;
         unknown.rendition = "cinema";
         QVERIFY(!exportStill(p, s, 0, png, &err, unknown) && err.find("cinema") != std::string::npos);

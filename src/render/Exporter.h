@@ -243,8 +243,9 @@ bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::
 
 // Export Frame's choices. `rendition`: "" the frame as SDR screens show it (an HDR sequence through its first SDR trim
 // target, else mapped to Rec.709 as the viewer maps it; other sequences as they are), "master" the sequence's own
-// space, or a trim target's id. An HDR picture is written as a 16-bit PNG with cICP, mDCV and cLLI or a 10-bit AVIF
-// (other formats cannot carry it); `quality` (0-100) is JPEG's and AVIF's.
+// space, or a trim target's id. An HDR picture is written as a 16-bit PNG with cICP, mDCV and cLLI, a 10-bit AVIF, or a
+// JPEG whose base is the SDR rendition with a gain map to the HDR one (TIFF cannot carry it); `quality` (0-100) is
+// JPEG's and AVIF's.
 struct StillOptions {
     std::string rendition;
     int quality = 90;
@@ -254,6 +255,7 @@ struct StillOptions {
 struct StillResult {
     std::string colorSpace;
     int bits = 8;
+    bool gainMap = false;  // a JPEG with a gain map
     double maxCll = 0, maxFall = 0;
 };
 // How Export Frame renders a rendition (StillOptions::rendition): `ro` set for it, the space and peak its pictures are

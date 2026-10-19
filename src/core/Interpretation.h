@@ -52,10 +52,13 @@ struct Interpretation {
     // One layer (AOV) of a multi-layer OpenEXR, read with OpenEXR (media/Exr.h); "" the main picture. Set per clip by
     // the renderer, as the eye is.
     std::string layer;
+    // A JPEG with a gain map (media/GainMap.h) read as its HDR rendition (Rec.2100 PQ) rather than its SDR picture: set
+    // when it is imported, and dropped while its colour is interpreted as an SDR space or it is in an SDR sequence.
+    bool gainMap = false;
     bool hasRaw() const { return rawExposure != 0 || rawTemperature > 0 || rawTint != 0 || !rawHighlights.empty() || rawHalf; }
     bool empty() const {
         return !conformed() && par <= 0 && (alpha.empty() || alpha == "straight") && fields.empty() && pulldown.empty() && !hasRaw() && stereo.empty() && !swapEyes &&
-               eye == 0 && layer.empty();
+               eye == 0 && layer.empty() && !gainMap;
     }
     bool conformed() const { return fps.valid() && fileFps.valid() && !(fps == fileFps); }
     // Seconds of the file per second of media time (the new rate over the file's); 1 when not conformed.
@@ -95,5 +98,7 @@ std::string stereoLayout(const std::string& detected, const Interpretation& i);
 std::string eyePath(const std::string& path, int eye);
 // `path` with one layer of a multi-layer OpenEXR read from it ("" the main picture).
 std::string layerPath(const std::string& path, const std::string& layer);
+// `path` read as a gain-map JPEG's HDR rendition, or its SDR picture.
+std::string gainMapPath(const std::string& path, bool hdr);
 
 }  // namespace montage

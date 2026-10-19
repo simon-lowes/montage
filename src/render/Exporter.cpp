@@ -39,6 +39,7 @@
 #include "Compositor.h"
 #include "Hdr10Plus.h"
 #include "HdrStill.h"
+#include "media/GainMap.h"
 #include "LightLevel.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
@@ -2543,12 +2544,16 @@ bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::
     if (!stillRendition(seq, options.rendition, ro, space, peak, error)) return false;
     const std::string ext = lowered(std::filesystem::path(path).extension().string());
     const bool avif = ext == ".avif";
-    if (space->hdr() && ext != ".png" && !avif) return fail("An HDR still is written as PNG or AVIF");
+    const bool jpeg = ext == ".jpg" || ext == ".jpeg";
+    if (space->hdr() && ext != ".png" && !avif && !jpeg) return fail("An HDR still is written as PNG, AVIF or JPEG (with a gain map)");
     Image img = renderProgramFrame(p, seq, t, ro);
     if (img.empty()) return fail("Nothing to render at this frame");
     StillResult res;
     res.colorSpace = space->id;
-    if (space->hdr()) {
+    if (space->hdr() && jpeg) {
+        res.bits = 8;
+        res.gainMap = true;  // (a JPEG states no light levels)
+    } else if (space->hdr()) {
         res.bits = avif ? 10 : 16;
         LightLevels l;
         if (ro.trimTarget.empty() && seq.hdrMaxCll > 0) {
@@ -2565,6 +2570,21 @@ bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::
         bool stated = false;
         if (!writeAvifStill(img, *space, options.quality, peak, res.maxCll, res.maxFall, path, error, &stated)) return false;
         if (!stated) res.maxCll = res.maxFall = 0;
+    } else if (space->hdr() && jpeg) {
+        // The SDR rendition as the base (the SDR trim, else the viewer's tone mapping), the map to this one.
+        RenderOptions sro;
+        sro.highQuality = true;
+        const ColorSpace* sdrSpace = nullptr;
+        double sdrPeak = 0;
+        if (!stillRendition(seq, "", sro, sdrSpace, sdrPeak, error)) return false;
+        if (sdrSpace->hdr()) sro.displaySpace = rec709Space().id, sdrSpace = &rec709Space();
+        Image sdr = renderProgramFrame(p, seq, t, sro);
+        // A JPEG says Display P3 (its ICC profile) or nothing (sRGB): a trim to other primaries goes into Rec.709.
+        if (sdrSpace->primaries != Primaries::Bt709 && sdrSpace->primaries != Primaries::P3D65) {
+            convertColor(sdr, *sdrSpace, rec709Space(), sdrPeak);
+            sdrSpace = &rec709Space();
+        }
+        if (!writeGainMapJpeg(sdr, *sdrSpace, img, *space, options.quality, path, error)) return false;
     } else if (space->hdr()) {
         if (!writeHdrPng(img, *space, peak, res.maxCll, res.maxFall, path, error)) return false;
     } else {

@@ -9,6 +9,12 @@ files of every library the package bundles, an index of them (`BUNDLED.txt`, wit
 source comes from) and the exact FFmpeg configuration. In the app, Help › Licences… shows this file and opens that
 folder. The source code for each release, including every bundled library's, is attached to the release on GitHub.
 
+## Licensed technology
+
+This product includes Gain Map technology under license by Adobe. Montage reads and writes HDR stills with gain maps
+(`src/media/GainMap.cpp`: JPEG with a gain map, its metadata as Adobe's gain map XMP and as ISO 21496-1) under the
+licence Adobe offers with its Gain Map specification; its terms are Adobe's, as published with the specification.
+
 ## Code and data ported into Montage's source
 
 | Component | Where in Montage | Licence | Notice |

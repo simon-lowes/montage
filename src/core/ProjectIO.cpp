@@ -951,6 +951,7 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         if (!m.colorOverride.empty()) o["colorOverride"] = qs(m.colorOverride);
         if (m.maxCll > 0) o["maxCll"] = m.maxCll;
         if (m.maxFall > 0) o["maxFall"] = m.maxFall;
+        if (m.gainMap) o["gainMap"] = true;
         if (!m.projection.empty()) o["projection"] = qs(m.projection);
         if (m.ambisonic > 0) o["ambisonic"] = m.ambisonic;
         if (!m.stereo.empty()) o["stereo"] = qs(m.stereo);
@@ -1120,6 +1121,7 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         m.colorOverride = ss(o.value("colorOverride"));
         m.maxCll = std::max(0.0, o.value("maxCll").toDouble());
         m.maxFall = std::max(0.0, o.value("maxFall").toDouble());
+        m.gainMap = o.value("gainMap").toBool();
         m.projection = ss(o.value("projection"));
         m.ambisonic = std::clamp(o.value("ambisonic").toInt(0), 0, 7);
         m.stereo = ss(o.value("stereo"));

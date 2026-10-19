@@ -45,6 +45,7 @@ extern "C" {
 #include "HwAccel.h"
 #include "render/ColorSpace.h"
 #include "render/HdrStill.h"
+#include "media/GainMap.h"
 
 namespace montage {
 
@@ -72,6 +73,13 @@ std::string averr(int code) {
     char buf[AV_ERROR_MAX_STRING_SIZE] = {0};
     av_strerror(code, buf, sizeof buf);
     return buf;
+}
+
+// A .jpg that may hold a gain map (its metadata read to find out, so only JPEG names).
+bool isGainMapJpegPath(const std::string& path) {
+    std::string ext = path.substr(path.find_last_of('.') == std::string::npos ? path.size() : path.find_last_of('.'));
+    for (char& c : ext) c = char(std::tolower(static_cast<unsigned char>(c)));
+    return ext == ".jpg" || ext == ".jpeg" || ext == ".jpe";
 }
 
 bool isStillFormat(const AVFormatContext* fmt) {
@@ -607,6 +615,14 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         m.colorSpace = colorSpaceFromTags(pri ? pri : "", trc ? trc : "");
         if (const std::string proj = streamProjection(st); !proj.empty()) m.projection = proj;
         if (m.colorSpace == "rec709") m.colorSpace.clear();
+        // A JPEG with a gain map: imported as its HDR rendition (said on the path, so a project saved before this
+        // reads keep the SDR picture they were made with).
+        if (GainMapJpeg gm; st->codecpar->codec_id == AV_CODEC_ID_MJPEG && isGainMapJpegPath(file) && readGainMapJpeg(file, gm) &&
+                            !gm.metadata.baseIsHdr) {
+            m.gainMap = true;
+            if (in.empty()) m.path = gainMapPath(path, true), in.gainMap = true;
+            if (in.gainMap) m.colorSpace = "rec2100pq";
+        }
         // HDR light levels: MP4 and Matroska carry them as stream side data, PNG in its cLLI chunk, AVIF as a property.
         if (const AVPacketSideData* sd = av_packet_side_data_get(st->codecpar->coded_side_data, st->codecpar->nb_coded_side_data,
                                                                  AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
@@ -851,6 +867,39 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
             curPts_ = nextPts_ = -1;
             return true;
         }
+    }
+    // A JPEG with a gain map read as its HDR rendition (PQ), made from the base and the map.
+    if (const std::string file = uninterpretedPath(path); in.gainMap && isGainMapJpegPath(file)) {
+        std::string why;
+        const std::shared_ptr<const GainMapPicture> pic = decodeGainMapJpeg(file, &why);
+        if (!pic) {
+            if (error) *error = why;
+            close();
+            return false;
+        }
+        raw_ = av_frame_alloc();
+        if (!raw_) return false;
+        raw_->format = AV_PIX_FMT_RGBA64;  // host byte order
+        raw_->width = pic->width;
+        raw_->height = pic->height;
+        raw_->color_range = AVCOL_RANGE_JPEG;
+        if (av_frame_get_buffer(raw_, 0) < 0) {
+            if (error) *error = "Out of memory reading " + path;
+            close();
+            return false;
+        }
+        for (int y = 0; y < pic->height; ++y)
+            std::memcpy(raw_->data[0] + size_t(y) * size_t(raw_->linesize[0]), pic->rgba.data() + size_t(y) * size_t(pic->width) * 4,
+                        size_t(pic->width) * 4 * sizeof(uint16_t));
+        dispW_ = pic->width;
+        dispH_ = pic->height;
+        fps_ = 25.0;
+        duration_ = 0;
+        still_ = true;
+        rotation_ = 0;
+        origin_ = 0;
+        curPts_ = nextPts_ = -1;
+        return true;
     }
     // OpenEXR read with the OpenEXR library: a layer of a multi-layer file, or a compression FFmpeg doesn't read.
     if (ImageSequence seq; exrByLibrary(uninterpretedPath(path), in, &seq)) {

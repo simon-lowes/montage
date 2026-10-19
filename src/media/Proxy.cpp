@@ -14,6 +14,7 @@ extern "C" {
 #include <set>
 
 #include "core/EditOps.h"
+#include "core/Interpretation.h"
 #include "media/Decoder.h"
 #include "media/ImageSequence.h"
 #include "render/ColorSpace.h"
@@ -183,6 +184,8 @@ std::string soundSource(const MediaItem& m, bool offlineProxies) {
 }
 
 const ColorSpace& pictureColorSpace(const MediaItem& m, const std::string& path) {
+    // A gain-map JPEG's SDR picture (read in place of its HDR rendition: render/Compositor.cpp).
+    if (m.gainMap && m.colorOverride.empty() && path != m.path && path == gainMapPath(m.path, false)) return rec709Space();
     if (m.proxyPath.empty() || path != m.proxyPath) return mediaColorSpace(m);
     const ColorSpace* c = findColorSpace(probed(path).colorSpace);
     return c ? *c : rec709Space();
