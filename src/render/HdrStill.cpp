@@ -5,7 +5,6 @@
 #include <QFile>
 #include <QImage>
 #include <QImageWriter>
-#include <QSaveFile>
 #include <QTemporaryDir>
 #include <algorithm>
 #include <cmath>
@@ -683,8 +682,7 @@ bool writeAvifStill(const Image& img, const ColorSpace& space, int quality, doub
     std::string why;
     if (!hdr)
         return encodeAvif(ycbcr420(img, space, 8), quality, {"libsvtav1", "libaom-av1", "librav1e"}, path, why) || fail(why);
-    // Encoded into a temporary file, then written with its light levels and mastering display as properties of the image
-    // (rather than replacing the file just written, which Windows can refuse while something else has it open).
+    // Encoded into a temporary file, then written with its light levels and mastering display as properties of the image.
     QTemporaryDir dir;
     if (!dir.isValid()) return fail("Cannot make a temporary folder");
     const std::string encoded = dir.filePath("still.avif").toStdString();
@@ -695,8 +693,9 @@ bool writeAvifStill(const Image& img, const ColorSpace& space, int quality, doub
     QByteArray bytes = in.readAll();
     in.close();
     const bool added = addAvifLightLevels(bytes, peakNits, maxCll, maxFall);
-    QSaveFile out(QString::fromStdString(path));
-    if (!out.open(QIODevice::WriteOnly) || out.write(bytes) != bytes.size() || !out.commit())
+    // (Written in place, as the PNG is: Windows refused QSaveFile's rename into place.)
+    QFile out(QString::fromStdString(path));
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate) || out.write(bytes) != bytes.size())
         return fail("Cannot write " + path + ": " + out.errorString().toStdString());
     if (stated) *stated = added;
     return true;
@@ -864,8 +863,8 @@ bool writeGainMapAvif(const Image& sdr, const ColorSpace& sdrSpace, const Image&
     const QByteArray payload = base.data + tmap + map.data + xmp;
     if (uint64_t(head.size() + metaSize + 8 + payload.size()) > 0xffffffffu) return fail("Too large for this AVIF writer");
     const QByteArray file = head + metaBox(uint32_t(head.size() + metaSize + 8)) + box("mdat", payload);
-    QSaveFile out(QString::fromStdString(path));
-    if (!out.open(QIODevice::WriteOnly) || out.write(file) != file.size() || !out.commit())
+    QFile out(QString::fromStdString(path));
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate) || out.write(file) != file.size())
         return fail("Cannot write " + path + ": " + out.errorString().toStdString());
     return true;
 }
