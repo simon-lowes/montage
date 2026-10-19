@@ -38,6 +38,7 @@
 #include "render/Versions.h"
 #include "render/Dcp.h"
 #include "render/Adm.h"
+#include "render/Iamf.h"
 #include "render/Imf.h"
 #include "render/BroadcastMxf.h"
 #include "render/LightLevel.h"
@@ -5236,6 +5237,46 @@ void McpServer::Impl::addTools() {
                       QJsonObject{{"path", path}, {"layout", QString::fromStdString(s.audioLayout)}, {"bed_channels", r.bedChannels},
                                   {"bed_pack", QString::fromStdString(r.bedPack)}, {"objects", objects}, {"channels", info.channels},
                                   {"seconds", double(r.samples) / 48000.0}, {"chna_tracks", int(info.chna.size())}});
+        });
+
+    add("montage_export_iamf", "Export immersive audio as IAMF",
+        "Write the active sequence's sound as IAMF (the Alliance for Open Media's Immersive Audio Model and Formats), "
+        "which YouTube and players take immersive and ambisonic sound in: an .mp4 (or .m4a) whose track is IAMF, or the "
+        "bare stream (.iamf). A surround or immersive layout (5.1 to 7.1.4, montage_set_surround) is a bed in that layout "
+        "with any audio objects rendered into it; an ambisonic one (first to third order) a scene, a substream per "
+        "component. The mix presentation carries the loudness measured in the layout and in stereo (BS.1770 integrated, "
+        "sample and true peak) and plays binaurally on headphones unless `binaural` is false. FLAC (lossless) or 24-bit "
+        "PCM, 48 kHz. Returns what the file holds, read back.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"path":{"type":"string","description":"The .mp4, .m4a or .iamf to write"},
+            "codec":{"type":"string","enum":["flac","lpcm"],"default":"flac"},
+            "binaural":{"type":"boolean","default":true,"description":"On headphones: rendered binaurally (false: as stereo)"},
+            "title":{"type":"string"},"in_out":{"type":"boolean","default":false,"description":"Only In to Out"}},
+            "required":["project","path"]})json",
+        true, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            const Sequence& s = l.seq();
+            IamfSettings st;
+            st.codec = str(a, "codec", "flac").toStdString();
+            if (st.codec != "flac" && st.codec != "lpcm") throw ArgError{"\"codec\" must be \"flac\" or \"lpcm\""};
+            st.binaural = a.value("binaural").toBool(true);
+            st.title = str(a, "title", QString::fromStdString(s.name)).toStdString();
+            st.inOut = a.value("in_out").toBool();
+            const QString path = absolute(need(a, "path"));
+            IamfResult r;
+            std::string err;
+            if (!exportIamf(l.project, s, st, path.toStdString(), &r, [this](double f) { progress(f, "IAMF"); return true; }, &err))
+                return fail(QString::fromStdString(err));
+            IamfInfo info;
+            if (!readIamfInfo(r.path, info, &err)) return fail(QString::fromStdString(err));
+            QJsonArray loudness;
+            for (const IamfLoudness& m : info.loudness)
+                loudness.append(QJsonObject{{"layout", QString::fromStdString(m.layout)}, {"integrated_lufs", m.integrated},
+                                            {"sample_peak_dbfs", m.digitalPeak}, {"true_peak_dbtp", m.truePeak}});
+            return ok(QStringLiteral("Wrote %1 IAMF (%2, %3 substreams)").arg(QString::fromStdString(r.layout), QString::fromStdString(r.codec)).arg(r.substreams),
+                      QJsonObject{{"path", path}, {"layout", QString::fromStdString(r.layout)}, {"codec", QString::fromStdString(r.codec)},
+                                  {"scene_based", info.sceneBased}, {"channels", r.channels}, {"substreams", info.substreams},
+                                  {"coupled", info.coupled}, {"seconds", double(r.samples) / 48000.0}, {"frames", info.frames},
+                                  {"binaural", info.headphonesMode == 1}, {"loudness", loudness}});
         });
 
     add("montage_super_scale", "Super Scale a file",

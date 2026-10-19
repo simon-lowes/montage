@@ -9,11 +9,14 @@ namespace montage {
 
 namespace {
 
+// The most channels measured (a third-order ambisonic field, a 22.2 bed).
+constexpr int kMeterChannels = 24;
+
 // K-weighting: a high shelf (head effects) followed by a high-pass (RLB),
 // with coefficients derived for any sample rate (as in libebur128).
 struct KFilter {
     double b[2][3], a[2][3];
-    double z[2][8][2] = {};  // [stage][channel][state]
+    double z[2][kMeterChannels][2] = {};  // [stage][channel][state]
     explicit KFilter(double fs) {
         double f0 = 1681.974450955533, G = 3.999843853973347, Q = 0.7071752369554196;
         double K = std::tan(M_PI * f0 / fs), Vh = std::pow(10.0, G / 20.0), Vb = std::pow(Vh, 0.4996667741545416);
@@ -76,7 +79,7 @@ struct LoudnessMeter::Impl {
     double acc = 0;
     int64_t n = 0;
     double peak = 0;
-    std::array<std::array<double, kTaps>, 8> history{};  // recent samples per channel, for oversampling
+    std::array<std::array<double, kTaps>, kMeterChannels> history{};  // recent samples per channel, for oversampling
     size_t hpos = 0;
     double maxM = -200, maxS = -200;
     // The mean square of the last `count` steps (fewer at the start).
@@ -103,12 +106,14 @@ void LoudnessMeter::add(const float* stereo, int64_t frames) {
 
 void LoudnessMeter::addChannels(const float* data, int64_t frames, int channels, const double* weights) {
     Impl& d = *d_;
-    channels = std::clamp(channels, 1, 8);
+    // (Interleaved `channels` wide; the first kMeterChannels measured.)
+    const int stride = std::max(1, channels);
+    channels = std::clamp(channels, 1, kMeterChannels);
     const auto& h = truePeakFilter();
     for (int64_t i = 0; i < frames; ++i) {
         double sum = 0;
         for (int ch = 0; ch < channels; ++ch) {
-            const double x = data[i * channels + ch];
+            const double x = data[i * stride + ch];
             d.history[size_t(ch)][d.hpos] = x;
             d.peak = std::max(d.peak, std::fabs(x));
             const double k = d.k.process(ch, x);

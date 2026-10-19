@@ -109,5 +109,14 @@ jobs:
         with:
           path: ~/montage-models/stems/bandit-v2-eng
           key: bandit-eng-12701995
+      - name: Cache the reference IAMF decoder
+        uses: actions/cache@v4
+        with:
+          path: ~/iamfdec
+          key: iamfdec-${{ runner.os }}-${{ hashFiles('scripts/build-iamfdec.sh') }}
+      - name: The reference IAMF decoder for the immersive audio export test
+        run: |
+          scripts/build-iamfdec.sh ~/iamfdec && echo "MONTAGE_TEST_IAMFDEC=$HOME/iamfdec/bin/iamfdec" >> "$GITHUB_ENV" \
+            || echo "::warning::Could not build the reference IAMF decoder; its part of the IAMF test will be skipped"
       - name: Test
         run: ctest --test-dir build --output-on-failure

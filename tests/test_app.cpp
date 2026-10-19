@@ -3641,6 +3641,16 @@ private slots:
         BwfInfo info;
         QVERIFY(readBwfInfo(path.toStdString(), info) && info.channels == 13 && info.chna.size() == 13);
         QVERIFY(info.axml.find("audioObjectName=\"A2\"") != std::string::npos);
+        // The same mix as IAMF: the object rendered into the 7.1.4 bed, with its loudness in 7.1.4 and stereo.
+        QVERIFY(win_->findChild<QAction*>("exportIamf"));
+        const QString iamf = dir_.filePath("immersive.mp4");
+        IamfSettings is;
+        is.title = "App mix";
+        IamfResult ir;
+        QVERIFY(win_->exportIamfTo(iamf, is, &ir));
+        QVERIFY(ir.layout == "7.1.4" && ir.channels == 12 && ir.substreams == 7 && ir.loudness.size() == 2);
+        IamfInfo ii;
+        QVERIFY(readIamfInfo(iamf.toStdString(), ii) && ii.loudspeakerLayout == 7 && ii.title == "App mix" && ii.frames == ir.frames);
         state()->newProject();
     }
 

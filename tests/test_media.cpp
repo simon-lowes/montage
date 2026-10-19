@@ -112,6 +112,7 @@
 #include "render/AafExport.h"
 #include "core/Interpretation.h"
 #include "render/Adm.h"
+#include "render/Iamf.h"
 #include "core/Adr.h"
 #include "core/AudioDescription.h"
 #include "core/History.h"
@@ -213,6 +214,9 @@ extern "C" {
 #include <libavutil/pixdesc.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
+#if __has_include(<libavutil/iamf.h>)
+#include <libavutil/iamf.h>
+#endif
 }
 
 using namespace montage;
@@ -815,6 +819,111 @@ double pitchOf(const std::vector<float>& b, size_t from, size_t to, int rate = 4
     const double a = r[size_t(best - 1)], c = r[size_t(best)], d = r[size_t(best + 1)];
     return rate / (best + 0.5 * (a - d) / (a - 2 * c + d));
 }
+
+// A PCM WAV file's samples (16, 24 or 32-bit integers, or 32-bit floats), interleaved; its channel count in `channels`.
+std::vector<float> readPcmWav(const std::string& path, int& channels) {
+    std::vector<float> out;
+    channels = 0;
+    QFile f(QString::fromStdString(path));
+    if (!f.open(QIODevice::ReadOnly)) return out;
+    const QByteArray all = f.readAll();
+    const auto* d = reinterpret_cast<const uint8_t*>(all.constData());
+    auto u16 = [&](size_t at) { return int(d[at] | (d[at + 1] << 8)); };
+    auto u32 = [&](size_t at) { return uint32_t(d[at]) | (uint32_t(d[at + 1]) << 8) | (uint32_t(d[at + 2]) << 16) | (uint32_t(d[at + 3]) << 24); };
+    int bits = 0, tag = 0, ch = 0;
+    size_t dataAt = 0, dataLen = 0;
+    for (size_t at = 12; at + 8 <= size_t(all.size());) {
+        const std::string id(all.constData() + at, 4);
+        const size_t len = u32(at + 4);
+        if (id == "fmt " && at + 24 <= size_t(all.size())) {
+            tag = u16(at + 8), ch = u16(at + 10), bits = u16(at + 22);
+            if (tag == 0xFFFE && at + 34 <= size_t(all.size())) tag = u16(at + 8 + 24);
+        }
+        if (id == "data") dataAt = at + 8, dataLen = std::min(len, size_t(all.size()) - at - 8);
+        at += 8 + len + (len & 1);
+    }
+    if (!ch || !dataAt || (bits != 16 && bits != 24 && bits != 32)) return out;
+    const size_t bytes = size_t(bits / 8), n = dataLen / bytes;
+    out.resize(n - n % size_t(ch));
+    for (size_t i = 0; i < out.size(); ++i) {
+        const uint8_t* q = d + dataAt + i * bytes;
+        if (bits == 16) out[i] = float(int16_t(q[0] | (q[1] << 8))) / 32768.f;
+        else if (bits == 24) out[i] = float(int32_t(uint32_t(q[0]) << 8 | uint32_t(q[1]) << 16 | uint32_t(q[2]) << 24) >> 8) / 8388608.f;
+        else if (tag == 3) std::memcpy(&out[i], q, 4);
+        else out[i] = float(double(int32_t(u32(size_t(q - d)))) / 2147483648.0);
+    }
+    channels = ch;
+    return out;
+}
+
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(61, 7, 100)
+// An IAMF file as FFmpeg's demuxer reads it (an MP4's IAMF track, or the bare stream): its audio element, its mix
+// presentation's integrated loudness per layout (the layout's channel count, LUFS), and each substream decoded (its
+// channels as its frames have them).
+struct FfmpegIamf {
+    int elementChannels = 0;
+    bool sceneBased = false;
+    std::vector<std::pair<int, double>> loudness;
+    std::vector<int> substreamChannels;
+    std::vector<std::vector<float>> substreams;  // interleaved, each in its own channels
+};
+bool readIamfWithFfmpeg(const std::string& path, FfmpegIamf& out) {
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return false;
+    avformat_find_stream_info(fmt, nullptr);
+    for (unsigned g = 0; g < fmt->nb_stream_groups; ++g) {
+        const AVStreamGroup* sg = fmt->stream_groups[g];
+        if (sg->type == AV_STREAM_GROUP_PARAMS_IAMF_AUDIO_ELEMENT && sg->params.iamf_audio_element->nb_layers) {
+            out.sceneBased = sg->params.iamf_audio_element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE;
+            out.elementChannels = sg->params.iamf_audio_element->layers[0]->ch_layout.nb_channels;
+        } else if (sg->type == AV_STREAM_GROUP_PARAMS_IAMF_MIX_PRESENTATION && sg->params.iamf_mix_presentation->nb_submixes) {
+            const AVIAMFSubmix* sm = sg->params.iamf_mix_presentation->submixes[0];
+            for (unsigned k = 0; k < sm->nb_layouts; ++k)
+                out.loudness.emplace_back(sm->layouts[k]->sound_system.nb_channels, av_q2d(sm->layouts[k]->integrated_loudness));
+        }
+    }
+    std::vector<AVCodecContext*> ctx(fmt->nb_streams, nullptr);
+    std::vector<SwrContext*> swr(fmt->nb_streams, nullptr);
+    out.substreams.assign(fmt->nb_streams, {});
+    out.substreamChannels.assign(fmt->nb_streams, 0);
+    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+        const AVCodecParameters* par = fmt->streams[i]->codecpar;
+        const AVCodec* codec = avcodec_find_decoder(par->codec_id);
+        if (!codec || !(ctx[i] = avcodec_alloc_context3(codec)) || avcodec_parameters_to_context(ctx[i], par) < 0 ||
+            avcodec_open2(ctx[i], codec, nullptr) < 0)
+            continue;
+    }
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* fr = av_frame_alloc();
+    auto drain = [&](unsigned i) {
+        while (avcodec_receive_frame(ctx[i], fr) >= 0) {
+            if (!swr[i]) {
+                swr_alloc_set_opts2(&swr[i], &fr->ch_layout, AV_SAMPLE_FMT_FLT, fr->sample_rate, &fr->ch_layout,
+                                    AVSampleFormat(fr->format), fr->sample_rate, 0, nullptr);
+                swr_init(swr[i]);
+            }
+            out.substreamChannels[i] = fr->ch_layout.nb_channels;
+            std::vector<float> buf(size_t(fr->nb_samples) * size_t(fr->ch_layout.nb_channels));
+            uint8_t* o[1] = {reinterpret_cast<uint8_t*>(buf.data())};
+            const int got = swr_convert(swr[i], o, fr->nb_samples, const_cast<const uint8_t**>(fr->extended_data), fr->nb_samples);
+            if (got > 0) out.substreams[i].insert(out.substreams[i].end(), buf.begin(), buf.begin() + got * fr->ch_layout.nb_channels);
+        }
+    };
+    while (av_read_frame(fmt, pkt) >= 0) {
+        const unsigned i = unsigned(pkt->stream_index);
+        if (i < ctx.size() && ctx[i] && avcodec_send_packet(ctx[i], pkt) >= 0) drain(i);
+        av_packet_unref(pkt);
+    }
+    for (unsigned i = 0; i < ctx.size(); ++i)
+        if (ctx[i] && avcodec_send_packet(ctx[i], nullptr) >= 0) drain(i);
+    av_frame_free(&fr);
+    av_packet_free(&pkt);
+    for (SwrContext*& c : swr) swr_free(&c);
+    for (AVCodecContext*& c : ctx) avcodec_free_context(&c);
+    avformat_close_input(&fmt);
+    return out.elementChannels > 0;
+}
+#endif
 
 }  // namespace
 
@@ -9291,6 +9400,295 @@ private slots:
         QCOMPARE(out.value("objects").toArray().at(0).toString(), QString("A2"));
         res = call("montage_set_surround", {{"project", project}, {"layout", "9.1"}});
         QVERIFY(res.value("isError").toBool());
+    }
+
+    void immersiveAudioAsIamf() {
+        // A 7.1.4 sequence with a tone on each speaker, 100 Hz apart in Montage's channel order (200 Hz on L, 300 on R...),
+        // 60 Hz sent to the LFE, at 29.97 fps: its length is not a whole number of IAMF frames, so the last is trimmed.
+        const int rate = 48000;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{30000, 1001};
+        s.audioLayout = "7.1.4";
+        const std::vector<Speaker>& speakers = layoutSpeakers("7.1.4");
+        const int channels = int(speakers.size());
+        auto hzOf = [&](int c) { return speakers[size_t(c)].lfe ? 60.0 : 200.0 + 100.0 * c; };
+        for (int c = 0; c < channels; ++c) {
+            std::vector<float> x(size_t(rate) * 2);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.25 * std::sin(2 * M_PI * hzOf(c) * double(i) / rate));
+            const std::string f = path(("iamf-tone" + std::to_string(c) + ".wav").c_str());
+            QVERIFY(writeMonoWav(f, x, rate));
+            p.media.push_back(probeOrFail(p, f));
+            while (int(s.audioTracks.size()) <= c) edit::addTrack(p, s, TrackKind::Audio);
+            QVERIFY(edit::placeMedia(p, s, p.media.back().id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, c}, false).ok);
+            SurroundPan& pan = s.audioTracks[size_t(c)].surround;
+            const double a = speakers[size_t(c)].angle * M_PI / 180;
+            pan.x = std::sin(a), pan.y = std::cos(a), pan.z = speakers[size_t(c)].elevation > 0 ? 1 : 0, pan.width = 0;
+            if (speakers[size_t(c)].lfe) pan.lfeDb = 10;
+        }
+        const int64_t total = std::llround(double(s.duration()) * rate / s.fpsValue());
+        QVERIFY(total % 960 != 0);
+        std::vector<double> weights;
+        for (const Speaker& sp : speakers) weights.push_back(sp.loudnessWeight);
+        // The level of a tone in one channel of interleaved audio, away from the ends.
+        auto level = [&](const std::vector<float>& b, int chs, int ch, double hz) {
+            const size_t n = b.size() / size_t(chs), from = 4800, to = n > 9600 ? n - 4800 : n;
+            std::complex<double> acc = 0;
+            for (size_t i = from; i < to; ++i) acc += double(b[i * size_t(chs) + size_t(ch)]) * std::polar(1.0, -2 * M_PI * hz * double(i) / rate);
+            return 2 * std::abs(acc) / double(std::max<size_t>(1, to - from));
+        };
+        // Every speaker's tone on its channel and on no other (the LFE track is also heard where it is placed, in C).
+        auto tonesOnTheirChannels = [&](const std::vector<float>& b, const QString& what) {
+            for (int c = 0; c < channels; ++c)
+                for (int d = 0; d < channels; ++d) {
+                    const double l = level(b, channels, d, hzOf(c));
+                    if (c == d) {
+                        if (l < (speakers[size_t(c)].lfe ? 0.6 : 0.2)) return QString("%1: %2 Hz on channel %3 at %4").arg(what).arg(hzOf(c)).arg(d).arg(l);
+                    } else if (!(speakers[size_t(c)].lfe && d == 2) && l > 0.01) {
+                        return QString("%1: %2 Hz heard on channel %3 at %4").arg(what).arg(hzOf(c)).arg(d).arg(l);
+                    }
+                }
+            return QString();
+        };
+        auto integrated = [&](const std::vector<float>& b, int chs, const double* w) {
+            const LoudnessResult l = measureLoudness(b.data(), int64_t(b.size() / size_t(chs)), chs, w, rate);
+            return l.valid ? l.integrated : -200.0;
+        };
+        auto stereoOf = [&](const std::vector<float>& b) {
+            std::vector<float> two(b.size() / size_t(channels) * 2);
+            iamfDownmixToStereo("7.1.4", b.data(), int(b.size() / size_t(channels)), two.data());
+            return two;
+        };
+        const double stereoWeights[2] = {1, 1};
+
+        // Exported: FLAC in seven substreams (five pairs, C, LFE), with the loudness Montage's meter gives the mix.
+        IamfSettings st;
+        st.title = "Tones";
+        IamfResult r;
+        std::string err;
+        const std::string mp4 = path("tones714.mp4"), bare = path("tones714.iamf");
+        QVERIFY2(exportIamf(p, s, st, mp4, &r, {}, &err), err.c_str());
+        QVERIFY(r.layout == "7.1.4" && r.codec == "flac" && r.channels == 12 && r.substreams == 7 && r.coupled == 5);
+        QCOMPARE(r.samples, total);
+        QCOMPARE(r.frames, int((total + 959) / 960));
+        QCOMPARE(r.loudness.size(), size_t(2));
+        QVERIFY(r.loudness[0].layout == "7.1.4" && r.loudness[1].layout == "stereo");
+        std::vector<float> mix(size_t(total) * size_t(channels));
+        {
+            Sequence at48 = s;
+            at48.sampleRate = rate;
+            AudioMixer mixer;
+            mixer.mixLayout(p, at48, 0, int(total), mix.data());
+        }
+        QVERIFY(tonesOnTheirChannels(mix, "the mix").isEmpty());
+        const double mixLoudness = integrated(mix, channels, weights.data()), mixStereo = integrated(stereoOf(mix), 2, stereoWeights);
+        QVERIFY2(std::fabs(r.loudness[0].integrated - mixLoudness) < 0.1, qPrintable(QString("%1 vs %2").arg(r.loudness[0].integrated).arg(mixLoudness)));
+        QVERIFY2(std::fabs(r.loudness[1].integrated - mixStereo) < 0.1, qPrintable(QString("%1 vs %2").arg(r.loudness[1].integrated).arg(mixStereo)));
+        QVERIFY(r.loudness[0].truePeak >= r.loudness[0].digitalPeak - 0.01 && r.loudness[0].digitalPeak < 0);
+        QVERIFY2(exportIamf(p, s, st, bare, nullptr, {}, &err), err.c_str());
+
+        // Read back, the MP4's iacb box and the bare stream alike: the simple profile, the layout, binaural on headphones,
+        // the loudness (in IAMF's 1/256 dB), the frames and the last one's trimming.
+        for (const std::string& f : {mp4, bare}) {
+            IamfInfo info;
+            QVERIFY2(readIamfInfo(f, info, &err), err.c_str());
+            QVERIFY(info.primaryProfile == 0 && info.additionalProfile == 0 && info.codec == "fLaC");
+            QVERIFY(info.samplesPerFrame == 960 && info.sampleRate == rate && info.bitDepth == 24);
+            QVERIFY(!info.sceneBased && info.loudspeakerLayout == 7 && info.substreams == 7 && info.coupled == 5);
+            QVERIFY(info.headphonesMode == 1 && info.title == "Tones");
+            QCOMPARE(info.frames, r.frames);
+            QCOMPARE(info.trimmedAtEnd, int64_t(r.frames) * 960 - total);
+            QCOMPARE(info.loudnessSoundSystems, (std::vector<int>{9, 0}));
+            for (size_t k = 0; k < 2; ++k) {
+                QCOMPARE(info.loudness[k].layout, r.loudness[k].layout);
+                QVERIFY(std::fabs(info.loudness[k].integrated - r.loudness[k].integrated) < 0.002);
+                QVERIFY(std::fabs(info.loudness[k].truePeak - r.loudness[k].truePeak) < 0.002);
+            }
+        }
+
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(61, 7, 100)
+        // FFmpeg's demuxer reads both: the element's twelve channels, the loudness, and each substream decodes to its
+        // speakers' tones.
+        for (const std::string& f : {mp4, bare}) {
+            FfmpegIamf ff;
+            QVERIFY2(readIamfWithFfmpeg(f, ff), f.c_str());
+            QVERIFY(!ff.sceneBased && ff.elementChannels == 12);
+            const std::vector<std::vector<int>> subs = iamfSubstreams("7.1.4");
+            QCOMPARE(ff.substreams.size(), subs.size());
+            size_t n = size_t(total);
+            for (size_t k = 0; k < subs.size(); ++k) {
+                QCOMPARE(ff.substreamChannels[k], int(subs[k].size()));
+                n = std::min(n, ff.substreams[k].size() / subs[k].size());
+            }
+            QVERIFY(n + 960 > size_t(total));
+            std::vector<float> all(n * size_t(channels));
+            for (size_t k = 0; k < subs.size(); ++k)
+                for (size_t i = 0; i < n; ++i)
+                    for (size_t c = 0; c < subs[k].size(); ++c) all[i * size_t(channels) + size_t(subs[k][c])] = ff.substreams[k][i * subs[k].size() + c];
+            const QString wrong = tonesOnTheirChannels(all, "FFmpeg");
+            QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+            QCOMPARE(ff.loudness.size(), size_t(2));
+            QVERIFY(ff.loudness[0].first == 12 && ff.loudness[1].first == 2);
+            const double decoded = integrated(all, channels, weights.data()), decodedStereo = integrated(stereoOf(all), 2, stereoWeights);
+            QVERIFY2(std::fabs(ff.loudness[0].second - decoded) < 0.1, qPrintable(QString("%1 vs %2").arg(ff.loudness[0].second).arg(decoded)));
+            QVERIFY2(std::fabs(ff.loudness[1].second - decodedStereo) < 0.1, qPrintable(QString("%1 vs %2").arg(ff.loudness[1].second).arg(decodedStereo)));
+        }
+#endif
+
+        // The reference decoder (libiamf's iamfdec), when there is one, decodes both to 7.1.4 and to stereo: each tone on
+        // its speaker, as long as the sequence (the padding trimmed), and as loud as the file says by Montage's meter.
+        const QByteArray iamfdec = qgetenv("MONTAGE_TEST_IAMFDEC");
+        auto decodeWith = [&](const std::string& in, const char* system, const std::string& out) {
+            QProcess run;
+            const bool isMp4 = QString::fromStdString(in).endsWith(".mp4");
+            run.start(QString::fromLocal8Bit(iamfdec), {isMp4 ? "-i1" : "-i0", "-o3", QString::fromStdString(out), system, "-d", "24",
+                                                        "-disable_limiter", QString::fromStdString(in)});
+            if (!run.waitForFinished(120000) || run.exitCode() != 0) return QString::fromLocal8Bit(run.readAllStandardError() + run.readAllStandardOutput());
+            return QString();
+        };
+        if (!iamfdec.isEmpty()) {
+            for (const std::string& f : {mp4, bare}) {
+                const std::string out = path("iamfdec714.wav");
+                const QString failed = decodeWith(f, "-s9", out);
+                QVERIFY2(failed.isEmpty(), qPrintable(failed));
+                int chs = 0;
+                const std::vector<float> dec = readPcmWav(out, chs);
+                QCOMPARE(chs, 12);
+                // (libiamf's 7.1.4: L R C LFE, the sides, the backs, the four overhead; Montage's has the backs first.)
+                const int toMontage[12] = {0, 1, 2, 3, 6, 7, 4, 5, 8, 9, 10, 11};
+                std::vector<float> all(dec.size());
+                for (size_t i = 0; i < dec.size() / 12; ++i)
+                    for (int c = 0; c < 12; ++c) all[i * 12 + size_t(toMontage[c])] = dec[i * 12 + size_t(c)];
+                QCOMPARE(int64_t(all.size() / 12), total);
+                const QString wrong = tonesOnTheirChannels(all, "iamfdec");
+                QVERIFY2(wrong.isEmpty(), qPrintable(wrong));
+                const double decoded = integrated(all, channels, weights.data());
+                QVERIFY2(std::fabs(r.loudness[0].integrated - decoded) < 0.1, qPrintable(QString("%1 vs %2").arg(r.loudness[0].integrated).arg(decoded)));
+            }
+            const std::string out = path("iamfdec20.wav");
+            const QString failed = decodeWith(mp4, "-s0", out);
+            QVERIFY2(failed.isEmpty(), qPrintable(failed));
+            int chs = 0;
+            const std::vector<float> two = readPcmWav(out, chs);
+            QCOMPARE(chs, 2);
+            const double decodedStereo = integrated(two, 2, stereoWeights);
+            QVERIFY2(std::fabs(r.loudness[1].integrated - decodedStereo) < 0.1, qPrintable(QString("%1 vs %2").arg(r.loudness[1].integrated).arg(decodedStereo)));
+        }
+
+        // A third-order field with a 1 kHz tone from the left, as 24-bit PCM: sixteen substreams, a component each, the
+        // loudness given in stereo alone.
+        Project q = makeDefaultProject();
+        Sequence& field = *q.active();
+        field.audioLayout = "ambix3";
+        {
+            std::vector<float> x(size_t(rate) * 2);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.25 * std::sin(2 * M_PI * 1000 * double(i) / rate));
+            const std::string f = path("iamf-left.wav");
+            QVERIFY(writeMonoWav(f, x, rate));
+            q.media.push_back(probeOrFail(q, f));
+            QVERIFY(edit::placeMedia(q, field, q.media.back().id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+            field.audioTracks[0].surround = SurroundPan{-1, 0, 0, -100, 0, false};
+        }
+        st.codec = "lpcm";
+        const std::string hoa = path("left3oa.mp4");
+        QVERIFY2(exportIamf(q, field, st, hoa, &r, {}, &err), err.c_str());
+        QVERIFY(r.layout == "ambix3" && r.channels == 16 && r.substreams == 16 && r.coupled == 0);
+        QVERIFY(r.loudness.size() == 1 && r.loudness[0].layout == "stereo" && r.loudness[0].integrated > -40);
+        IamfInfo info;
+        QVERIFY2(readIamfInfo(hoa, info, &err), err.c_str());
+        QVERIFY(info.codec == "ipcm" && info.bitDepth == 24 && info.sampleRate == rate);
+        QVERIFY(info.sceneBased && info.ambisonicChannels == 16 && info.substreams == 16 && info.coupled == 0);
+        QCOMPARE(info.loudnessSoundSystems, std::vector<int>{0});
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(61, 7, 100)
+        {
+            // The components as FFmpeg decodes them: from the left, Y (ACN 1) as strong as W, X and Z silent.
+            FfmpegIamf ff;
+            QVERIFY(readIamfWithFfmpeg(hoa, ff));
+            QVERIFY(ff.sceneBased && ff.elementChannels == 16 && ff.substreams.size() == 16);
+            const double w = level(ff.substreams[0], 1, 0, 1000), y = level(ff.substreams[1], 1, 0, 1000);
+            const double z = level(ff.substreams[2], 1, 0, 1000), x = level(ff.substreams[3], 1, 0, 1000);
+            QVERIFY2(w > 0.1 && std::fabs(y / w - 1) < 0.05 && x < 0.01 * w && z < 0.01 * w,
+                     qPrintable(QString("W %1 Y %2 Z %3 X %4").arg(w).arg(y).arg(z).arg(x)));
+        }
+#endif
+        if (!iamfdec.isEmpty()) {
+            // Rendered to speakers by the reference decoder: in stereo on the left, in 7.1.4 most on the left side.
+            QString failed = decodeWith(hoa, "-s0", path("hoa20.wav"));
+            QVERIFY2(failed.isEmpty(), qPrintable(failed));
+            int chs = 0;
+            std::vector<float> dec = readPcmWav(path("hoa20.wav"), chs);
+            QCOMPARE(chs, 2);
+            const double left = level(dec, 2, 0, 1000), right = level(dec, 2, 1, 1000);
+            QVERIFY2(left > 0.05 && right < 0.3 * left, qPrintable(QString("%1 %2").arg(left).arg(right)));
+            // As loud as the file says (the stereo loudness is measured through the reference renderer's decoder).
+            const double heard = integrated(dec, 2, stereoWeights);
+            QVERIFY2(std::fabs(r.loudness[0].integrated - heard) < 0.1, qPrintable(QString("%1 vs %2").arg(r.loudness[0].integrated).arg(heard)));
+            failed = decodeWith(hoa, "-s9", path("hoa714.wav"));
+            QVERIFY2(failed.isEmpty(), qPrintable(failed));
+            dec = readPcmWav(path("hoa714.wav"), chs);
+            QCOMPARE(chs, 12);
+            std::vector<double> at(12);
+            for (int c = 0; c < 12; ++c) at[size_t(c)] = level(dec, 12, c, 1000);
+            const double side = at[4];
+            for (int c = 0; c < 12; ++c)
+                if (c != 4) QVERIFY2(at[size_t(c)] < 0.5 * side, qPrintable(QString("%1: %2 vs %3").arg(c).arg(at[size_t(c)]).arg(side)));
+        }
+
+        // Over MCP: the bare stream as PCM, stereo on headphones, read back.
+        {
+            const QString project = QString::fromStdString(path("iamf.montage"));
+            QVERIFY(saveProject(p, project.toStdString()));
+            McpServer server;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_export_iamf"},
+                                                         {"arguments", QJsonObject{{"project", project}, {"path", QString::fromStdString(path("mcp.iamf"))},
+                                                                                   {"codec", "lpcm"}, {"binaural", false}, {"title", "Over MCP"}}},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+            const QJsonObject out = res.value("structuredContent").toObject();
+            QVERIFY(out.value("layout").toString() == "7.1.4" && out.value("codec").toString() == "lpcm" && out.value("substreams").toInt() == 7);
+            QVERIFY(!out.value("binaural").toBool() && !out.value("scene_based").toBool());
+            QCOMPARE(out.value("loudness").toArray().size(), 2);
+            QVERIFY(std::fabs(out.value("loudness").toArray().at(0).toObject().value("integrated_lufs").toDouble() - mixLoudness) < 0.1);
+        }
+
+        // Damaged files are refused, not read past their ends: the MP4 cut short, a box claiming 2^63 bytes, a mix
+        // presentation claiming 2^49 labels.
+        {
+            QFile in(QString::fromStdString(mp4));
+            QVERIFY(in.open(QIODevice::ReadOnly));
+            const QByteArray whole = in.readAll();
+            auto writeBytes = [&](const char* name, const QByteArray& b) {
+                QFile o(QString::fromStdString(path(name)));
+                return o.open(QIODevice::WriteOnly) && o.write(b) == b.size();
+            };
+            QVERIFY(writeBytes("cut.mp4", whole.left(whole.size() / 2)));
+            IamfInfo bad;
+            QVERIFY(!readIamfInfo(path("cut.mp4"), bad, &err));
+            QByteArray huge = whole.left(32);  // the ftyp box
+            huge += QByteArray::fromHex("00000001") + "moov" + QByteArray::fromHex("8000000000000000");
+            QVERIFY(writeBytes("huge.mp4", huge));
+            QVERIFY(!readIamfInfo(path("huge.mp4"), bad, &err));
+            // A sequence header, then a mix presentation: id 2, then a label count of 2^49 and nothing more.
+            QByteArray obus = QByteArray::fromHex("f806") + "iamf" + QByteArray::fromHex("0000");
+            const QByteArray mp = QByteArray::fromHex("02") + QByteArray::fromHex("8080808080808001");
+            obus += char(2 << 3);
+            obus += char(mp.size());
+            obus += mp;
+            QVERIFY(writeBytes("labels.iamf", obus));
+            QVERIFY(!readIamfInfo(path("labels.iamf"), bad, &err));
+        }
+
+        // Stopping leaves no file; a layout IAMF has none for, or another codec, is refused.
+        QVERIFY(!exportIamf(p, s, st, path("stopped.mp4"), nullptr, [](double) { return false; }, &err));
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(path("stopped.mp4"))));
+        st.codec = "aac";
+        QVERIFY(!exportIamf(p, s, st, path("aac.mp4"), nullptr, {}, &err));
+        QCOMPARE(iamfLoudspeakerLayout("9.1.6"), -1);
+        QCOMPARE(iamfSubstreams("5.1"), (std::vector<std::vector<int>>{{0, 1}, {4, 5}, {2}, {3}}));
     }
 
     void surroundMixExportAndStems() {
