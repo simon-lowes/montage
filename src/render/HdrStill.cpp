@@ -530,6 +530,12 @@ Av1Picture rgbPicture(const QImage& rgb888, Av1Layout layout) {
     return pic;
 }
 
+std::string averr(int code) {
+    char buf[AV_ERROR_MAX_STRING_SIZE] = {};
+    av_strerror(code, buf, sizeof buf);
+    return buf;
+}
+
 // Encodes `pic` into an AVIF file at `path` (FFmpeg's muxer) with the first of `encoders` that takes it; with a
 // mastering display of `peakNits` and light levels when `peakNits` > 0.
 bool encodeAvif(const Av1Picture& pic, int quality, std::initializer_list<const char*> encoders, const std::string& path,
@@ -592,7 +598,7 @@ bool encodeAvif(const Av1Picture& pic, int quality, std::initializer_list<const 
     }
     if (!opened) return false;
     AVStream* st = avformat_new_stream(oc, nullptr);
-    if (!st || avcodec_parameters_from_context(st->codecpar, ctx) < 0) return why = "Cannot write " + path, false;
+    if (!st || avcodec_parameters_from_context(st->codecpar, ctx) < 0) return why = "Cannot add the picture to " + path, false;
     st->time_base = ctx->time_base;
     if (peakNits > 0) {
         AVMasteringDisplayMetadata md{};
@@ -614,8 +620,10 @@ bool encodeAvif(const Av1Picture& pic, int quality, std::initializer_list<const 
                                                            AV_PKT_DATA_CONTENT_LIGHT_LEVEL, sizeof cl, 0))
             std::memcpy(sd->data, &cl, sizeof cl);
     }
-    if (!(oc->oformat->flags & AVFMT_NOFILE) && avio_open(&oc->pb, path.c_str(), AVIO_FLAG_WRITE) < 0) return why = "Cannot write " + path, false;
-    if (avformat_write_header(oc, nullptr) < 0) return why = "Cannot write " + path, false;
+    int rc = 0;
+    if (!(oc->oformat->flags & AVFMT_NOFILE) && (rc = avio_open(&oc->pb, path.c_str(), AVIO_FLAG_WRITE)) < 0)
+        return why = "Cannot write " + path + ": " + averr(rc), false;
+    if ((rc = avformat_write_header(oc, nullptr)) < 0) return why = "Cannot write the AVIF header: " + averr(rc), false;
     frame = av_frame_alloc();
     if (!frame) return why = "Out of memory", false;
     frame->format = ctx->pix_fmt;
@@ -648,14 +656,15 @@ bool encodeAvif(const Av1Picture& pic, int quality, std::initializer_list<const 
         for (;;) {
             const int r = avcodec_receive_packet(ctx, pkt);
             if (r == AVERROR(EAGAIN) || r == AVERROR_EOF) return true;
-            if (r < 0) return false;
+            if (r < 0) return rc = r, false;
             av_packet_rescale_ts(pkt, ctx->time_base, st->time_base);
             pkt->stream_index = st->index;
-            if (av_interleaved_write_frame(oc, pkt) < 0) return false;
+            if ((rc = av_interleaved_write_frame(oc, pkt)) < 0) return false;
         }
     };
-    if (!(avcodec_send_frame(ctx, frame) >= 0 && drain() && avcodec_send_frame(ctx, nullptr) >= 0 && drain() && av_write_trailer(oc) >= 0))
-        return why = "Cannot encode the AVIF", false;
+    if (!((rc = avcodec_send_frame(ctx, frame)) >= 0 && drain() && (rc = avcodec_send_frame(ctx, nullptr)) >= 0 && drain() &&
+          (rc = av_write_trailer(oc)) >= 0))
+        return why = "Cannot encode the AVIF: " + averr(rc), false;
     why.clear();
     return true;
 }
@@ -672,19 +681,24 @@ bool writeAvifStill(const Image& img, const ColorSpace& space, int quality, doub
     if (img.empty()) return fail("Nothing to write");
     const bool hdr = space.hdr();
     std::string why;
-    if (!encodeAvif(ycbcr420(img, space, hdr ? 10 : 8), quality, {"libsvtav1", "libaom-av1", "librav1e"}, path, why, hdr ? peakNits : 0,
-                    maxCll, maxFall))
+    if (!hdr)
+        return encodeAvif(ycbcr420(img, space, 8), quality, {"libsvtav1", "libaom-av1", "librav1e"}, path, why) || fail(why);
+    // Encoded into a temporary file, then written with its light levels and mastering display as properties of the image
+    // (rather than replacing the file just written, which Windows can refuse while something else has it open).
+    QTemporaryDir dir;
+    if (!dir.isValid()) return fail("Cannot make a temporary folder");
+    const std::string encoded = dir.filePath("still.avif").toStdString();
+    if (!encodeAvif(ycbcr420(img, space, 10), quality, {"libsvtav1", "libaom-av1", "librav1e"}, encoded, why, peakNits, maxCll, maxFall))
         return fail(why);
-    if (!hdr) return true;
-    // Its light levels and mastering display, as properties of the image (the file replaced whole).
-    QFile in(QString::fromStdString(path));
-    if (!in.open(QIODevice::ReadOnly)) return fail("Cannot read back " + path);
+    QFile in(QString::fromStdString(encoded));
+    if (!in.open(QIODevice::ReadOnly)) return fail("Cannot read back " + encoded);
     QByteArray bytes = in.readAll();
     in.close();
-    if (!addAvifLightLevels(bytes, peakNits, maxCll, maxFall)) return true;
+    const bool added = addAvifLightLevels(bytes, peakNits, maxCll, maxFall);
     QSaveFile out(QString::fromStdString(path));
-    if (!out.open(QIODevice::WriteOnly) || out.write(bytes) != bytes.size() || !out.commit()) return fail("Cannot write " + path);
-    if (stated) *stated = true;
+    if (!out.open(QIODevice::WriteOnly) || out.write(bytes) != bytes.size() || !out.commit())
+        return fail("Cannot write " + path + ": " + out.errorString().toStdString());
+    if (stated) *stated = added;
     return true;
 }
 
@@ -851,7 +865,7 @@ bool writeGainMapAvif(const Image& sdr, const ColorSpace& sdrSpace, const Image&
     if (uint64_t(head.size() + metaSize + 8 + payload.size()) > 0xffffffffu) return fail("Too large for this AVIF writer");
     const QByteArray file = head + metaBox(uint32_t(head.size() + metaSize + 8)) + box("mdat", payload);
     QSaveFile out(QString::fromStdString(path));
-    if (!out.open(QIODevice::WriteOnly) || out.write(file) != file.size() || !out.commit()) return fail("Cannot write " + path);
+    if (!out.open(QIODevice::WriteOnly) || out.write(file) != file.size() || !out.commit()) return fail("Cannot write " + path + ": " + out.errorString().toStdString());
     return true;
 }
 
