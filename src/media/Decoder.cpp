@@ -32,6 +32,7 @@ extern "C" {
 #include <libavutil/channel_layout.h>
 #include <libavutil/display.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/spherical.h>
@@ -43,6 +44,7 @@ extern "C" {
 
 #include "HwAccel.h"
 #include "render/ColorSpace.h"
+#include "render/HdrStill.h"
 
 namespace montage {
 
@@ -77,6 +79,21 @@ bool isStillFormat(const AVFormatContext* fmt) {
     std::string n = fmt->iformat->name;
     if (n == "image2" && fmt->url && av_filename_number_test(fmt->url)) return false;  // a numbered sequence plays
     if (n == "image2" || n == "image2pipe") return true;
+    // AVIF (the MP4 demuxer's): an avif brand, major or compatible, and none for an image sequence (avis, msf1), which
+    // plays.
+    if (n.rfind("mov,", 0) == 0) {
+        const AVDictionaryEntry* major = av_dict_get(fmt->metadata, "major_brand", nullptr, 0);
+        const AVDictionaryEntry* compatible = av_dict_get(fmt->metadata, "compatible_brands", nullptr, 0);
+        std::string brands = compatible ? compatible->value : "";
+        if (major) brands += major->value;
+        bool avif = false, sequence = false;
+        for (size_t i = 0; i + 4 <= brands.size(); i += 4) {
+            const std::string b = brands.substr(i, 4);
+            avif = avif || b == "avif";
+            sequence = sequence || b == "avis" || b == "msf1";
+        }
+        return avif && !sequence;
+    }
     return n.size() > 5 && n.compare(n.size() - 5, 5, "_pipe") == 0;
 }
 
@@ -590,6 +607,19 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         m.colorSpace = colorSpaceFromTags(pri ? pri : "", trc ? trc : "");
         if (const std::string proj = streamProjection(st); !proj.empty()) m.projection = proj;
         if (m.colorSpace == "rec709") m.colorSpace.clear();
+        // HDR light levels: MP4 and Matroska carry them as stream side data, PNG in its cLLI chunk, AVIF as a property.
+        if (const AVPacketSideData* sd = av_packet_side_data_get(st->codecpar->coded_side_data, st->codecpar->nb_coded_side_data,
+                                                                 AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
+            sd && sd->size >= sizeof(AVContentLightMetadata)) {
+            const auto* cl = reinterpret_cast<const AVContentLightMetadata*>(sd->data);
+            m.maxCll = cl->MaxCLL;
+            m.maxFall = cl->MaxFALL;
+        }
+        if (StillHdrInfo still; (st->codecpar->codec_id == AV_CODEC_ID_PNG || st->codecpar->codec_id == AV_CODEC_ID_AV1) &&
+                                readStillHdrInfo(file, still) && still.maxCll > 0) {
+            m.maxCll = still.maxCll;
+            m.maxFall = still.maxFall;
+        }
         int w = st->codecpar->width, h = st->codecpar->height;
 #ifdef MONTAGE_PRORES_RAW
         // ProRes RAW is developed to ACEScct (the scene's whole range), at its size less the recommended crop.

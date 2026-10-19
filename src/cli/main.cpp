@@ -105,7 +105,7 @@ int usage() {
                  "  montage-cli node <folder> [--name NAME] [--map FROM=TO]... [--once] [--poll SECONDS]\n"
                  "                     (a render node: renders the farm's waiting jobs one at a time, FROM paths read as TO;\n"
                  "                      Ctrl+C gives its job back for another node)\n"
-                 "  montage-cli frame <project.montage> --at TC -o <image.png>\n"
+                 "  montage-cli frame <project.montage> --at TC -o <image.png|.jpg|.tif|.avif> [--rendition master|<trim target>]\n"
                  "  montage-cli presets\n"
                  "  montage-cli colorspaces\n"
                  "  montage-cli devices                                (where AI models can run: CPU, GPU, NPU)\n"
@@ -579,9 +579,11 @@ int cmdNode(const std::vector<std::string>& args) {
 int cmdFrame(const std::vector<std::string>& args) {
     if (args.empty()) return usage();
     std::string tc = "0", outPath;
+    StillOptions so;
     for (size_t i = 1; i < args.size(); ++i) {
         if (args[i] == "--at" && i + 1 < args.size()) tc = args[++i];
         else if (args[i] == "-o" && i + 1 < args.size()) outPath = args[++i];
+        else if (args[i] == "--rendition" && i + 1 < args.size()) so.rendition = args[++i];
         else return usage();
     }
     if (outPath.empty()) return usage();
@@ -590,7 +592,7 @@ int cmdFrame(const std::vector<std::string>& args) {
     FrameTime t = 0;
     if (!parseTimecode(tc, p.active()->fps, t)) return usage();
     std::string err;
-    if (!exportStill(p, *p.active(), t, outPath, &err)) {
+    if (!exportStill(p, *p.active(), t, outPath, &err, so)) {
         std::fprintf(stderr, "error: %s\n", err.c_str());
         return 1;
     }

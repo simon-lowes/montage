@@ -142,6 +142,7 @@ add_library(montage_engine STATIC
   render/BroadcastMxf.h render/BroadcastMxf.cpp
   render/Adm.h render/Adm.cpp
   render/Iamf.h render/Iamf.cpp
+  render/HdrStill.h render/HdrStill.cpp
   render/Relight.h render/Relight.cpp
   render/FilmLook.h render/FilmLook.cpp
   render/Retime.h render/Retime.cpp

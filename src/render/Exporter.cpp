@@ -38,6 +38,8 @@
 #include "ColorSpace.h"
 #include "Compositor.h"
 #include "Hdr10Plus.h"
+#include "HdrStill.h"
+#include "LightLevel.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "Processing.h"
@@ -2497,16 +2499,82 @@ bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::
     return exportSequence(p, alone, st, progress, cancel, error);
 }
 
-bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::string& path, std::string* error) {
+bool stillRendition(const Sequence& seq, const std::string& rendition, RenderOptions& ro, const ColorSpace*& space, double& peak,
+                    std::string* error) {
+    const ColorSpace& master = sequenceColorSpace(seq);
+    space = &master;
+    peak = seq.hdrPeakNits;
+    if (rendition == "master") return true;
+    if (!rendition.empty()) {
+        if (!findTrimTarget(seq, rendition)) {
+            if (error) *error = "The sequence has no trim target " + rendition;
+            return false;
+        }
+        ro.trimTarget = rendition;
+        space = &trimTargetSpace(seq, rendition);
+        peak = trimTargetPeak(seq, rendition);
+        return true;
+    }
+    if (!master.hdr()) return true;
+    // SDR screens: the grade's own SDR trim when it has one.
+    for (const TrimTarget& tt : seq.trimTargets)
+        if (const ColorSpace* c = findColorSpace(tt.colorSpace); c && !c->hdr() && !c->sceneReferred) {
+            ro.trimTarget = tt.id;
+            space = c;
+            peak = trimTargetPeak(seq, tt.id);
+            return true;
+        }
+    ro.displaySpace = rec709Space().id;
+    space = &rec709Space();
+    peak = 100;
+    return true;
+}
+
+bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::string& path, std::string* error,
+                 const StillOptions& options, StillResult* result) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
     RenderOptions ro;
     ro.highQuality = true;
+    const ColorSpace* space = nullptr;
+    double peak = 0;
+    if (!stillRendition(seq, options.rendition, ro, space, peak, error)) return false;
+    const std::string ext = lowered(std::filesystem::path(path).extension().string());
+    const bool avif = ext == ".avif";
+    if (space->hdr() && ext != ".png" && !avif) return fail("An HDR still is written as PNG or AVIF");
     Image img = renderProgramFrame(p, seq, t, ro);
-    std::vector<uint8_t> rgba = toRgba8(img);
-    QImage qi(rgba.data(), img.width, img.height, img.width * 4, QImage::Format_RGBA8888);
-    if (!qi.save(QString::fromStdString(path))) {
-        if (error) *error = "Cannot write " + path;
-        return false;
+    if (img.empty()) return fail("Nothing to render at this frame");
+    StillResult res;
+    res.colorSpace = space->id;
+    if (space->hdr()) {
+        res.bits = avif ? 10 : 16;
+        LightLevels l;
+        if (ro.trimTarget.empty() && seq.hdrMaxCll > 0) {
+            l.maxCll = seq.hdrMaxCll;
+            l.maxFall = seq.hdrMaxFall;
+        } else if (LightMeter meter(*space); meter.valid()) {
+            meter.measure(img, l.maxCll, l.maxFall);
+        }
+        unsigned cll = 0, fall = 0;
+        hdr10LightLevels(l, cll, fall);
+        res.maxCll = cll, res.maxFall = fall;
     }
+    if (avif) {
+        bool stated = false;
+        if (!writeAvifStill(img, *space, options.quality, peak, res.maxCll, res.maxFall, path, error, &stated)) return false;
+        if (!stated) res.maxCll = res.maxFall = 0;
+    } else if (space->hdr()) {
+        if (!writeHdrPng(img, *space, peak, res.maxCll, res.maxFall, path, error)) return false;
+    } else {
+        std::vector<uint8_t> rgba = toRgba8(img);
+        QImage qi(rgba.data(), img.width, img.height, img.width * 4, QImage::Format_RGBA8888);
+        const bool lossy = ext == ".jpg" || ext == ".jpeg" || ext == ".webp";
+        if (!qi.save(QString::fromStdString(path), nullptr, lossy ? std::clamp(options.quality, 0, 100) : -1))
+            return fail("Cannot write " + path);
+    }
+    if (result) *result = res;
     return true;
 }
 

@@ -146,7 +146,8 @@ QPixmap MediaBinModel::skimmedThumbnail(const MediaItem& m) const {
     // Up to about 48 distinct frames across a clip, and never finer than a frame.
     const double span = m.subclipOut > m.subclipIn ? m.subclipOut - m.subclipIn : m.duration;
     const double quantum = std::max(span / 48.0, m.fps.num > 0 && m.fps.den > 0 ? double(m.fps.den) / m.fps.num : 1.0 / 30);
-    const QImage img = ThumbnailCache::instance().get(QString::fromStdString(m.path), skimSeconds_, std::max(2, w), std::max(2, h), quantum);
+    const QImage img = ThumbnailCache::instance().get(QString::fromStdString(m.path), skimSeconds_, std::max(2, w), std::max(2, h), quantum,
+                                                      mediaColorSpace(m).id);
     skimShown_ = !img.isNull();
     if (!img.isNull()) skimFrame_ = img;
     if (skimFrame_.isNull()) return thumbnail(m);
@@ -192,7 +193,7 @@ QPixmap MediaBinModel::thumbnail(const MediaItem& m) const {
         w = int(kThumbH * aspect);
     }
     const double t = m.kind == MediaKind::Video ? m.subclipIn + std::min(1.0, m.duration * 0.1) : 0.0;
-    const QImage img = ThumbnailCache::instance().get(QString::fromStdString(m.path), t, std::max(2, w), std::max(2, h));
+    const QImage img = ThumbnailCache::instance().get(QString::fromStdString(m.path), t, std::max(2, w), std::max(2, h), 0.0, mediaColorSpace(m).id);
     if (img.isNull()) return tile(QString(), theme::kVideoClip);
     QPixmap pm(kThumbW, kThumbH);
     pm.fill(Qt::black);

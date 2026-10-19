@@ -13,6 +13,8 @@
 
 namespace montage {
 
+struct RenderOptions;
+
 // Review-copy overlays burned into the picture (after captions), as an
 // editor sends out for notes: timecode, the clip's name, any text, a logo.
 struct BurnIn {
@@ -239,7 +241,27 @@ bool renderClipVideo(const Project& p, const Sequence& seq, Id clip, const std::
 bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
                      const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr);
 
-// Writes a single frame as PNG/JPEG/TIFF (by extension).
-bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::string& path, std::string* error);
+// Export Frame's choices. `rendition`: "" the frame as SDR screens show it (an HDR sequence through its first SDR trim
+// target, else mapped to Rec.709 as the viewer maps it; other sequences as they are), "master" the sequence's own
+// space, or a trim target's id. An HDR picture is written as a 16-bit PNG with cICP, mDCV and cLLI or a 10-bit AVIF
+// (other formats cannot carry it); `quality` (0-100) is JPEG's and AVIF's.
+struct StillOptions {
+    std::string rendition;
+    int quality = 90;
+};
+// What was written: its space (ColorSpace.h id), bits per channel and, for HDR, the light levels it states (the
+// sequence's measured ones for its master, else the frame's own) in nits.
+struct StillResult {
+    std::string colorSpace;
+    int bits = 8;
+    double maxCll = 0, maxFall = 0;
+};
+// How Export Frame renders a rendition (StillOptions::rendition): `ro` set for it, the space and peak its pictures are
+// in. False with `error` for an unknown trim target.
+bool stillRendition(const Sequence& seq, const std::string& rendition, RenderOptions& ro, const ColorSpace*& space, double& peak,
+                    std::string* error = nullptr);
+// Writes a single frame as PNG, JPEG, TIFF or AVIF (by extension).
+bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::string& path, std::string* error,
+                 const StillOptions& options = {}, StillResult* result = nullptr);
 
 }  // namespace montage

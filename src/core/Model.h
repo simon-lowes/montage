@@ -138,6 +138,7 @@ struct MediaItem {
     std::string bin;         // bin path, "/" between nested bins ("Interviews/Day 1"), "" = the project root
     std::string colorSpace;     // detected from the file's colour tags (ColorSpace.h id), "" = Rec.709
     std::string colorOverride;  // Interpret Colour: the space to read it as, "" = as detected
+    double maxCll = 0, maxFall = 0;  // HDR light levels the file states (CTA-861.3), nits; 0 = none stated
     // 360° footage: "equirect" or "vr180" (the half in front; from the file's spherical metadata, or set by hand),
     // "" = a flat picture.
     std::string projection;
