@@ -1437,7 +1437,7 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
 // `below` is what the tracks under the clip have made so far, for adjustment layers.
 Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
                 const Image* below = nullptr) {
-    ExpressionScope expressions(&p, &seq, &c);  // (core/Expression.h)
+    ExpressionScope expressions(&p, &seq, &c, o.cancel);  // (core/Expression.h)
     ClipSource cs;
     if (!clipSource(p, seq, c, t, o, below, false, cs)) return {};
     return finishClipLayer(seq, c, o, cs);
@@ -1556,7 +1556,7 @@ const Transition* activeTransition(const Track& track, FrameTime t, FrameTime& f
 
 // What track `m` shows at t (a transition's mix while one runs), on the CPU.
 Image trackPicture(const Project& p, const Sequence& seq, size_t m, FrameTime t, const RenderOptions& o, int W, int H) {
-    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
+    ExpressionScope expressions(&p, &seq, nullptr, o.cancel);  // (core/Expression.h)
     const Track& track = seq.videoTracks[m];
     FrameTime from = 0, to = 0;
     if (const Transition* tr = activeTransition(track, t, from, to)) return transitionLayer(p, seq, track, *tr, from, to, t, o, nullptr, W, H);
@@ -1664,7 +1664,7 @@ void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c,
 }  // namespace
 
 Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& opts) {
-    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
+    ExpressionScope expressions(&p, &seq, nullptr, opts.cancel);  // (core/Expression.h)
     const WorkingSpaceScope working(&sequenceColorSpace(seq));  // effects that work in light know whose
     const int solo = opts.soloVideoTrack;
     RenderOptions o = opts;
@@ -1957,7 +1957,7 @@ bool runOnSource(const Effect& e) {
 }
 
 GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, gpu::Layer& out) {
-    ExpressionScope expressions(&p, &seq, &c);  // (core/Expression.h)
+    ExpressionScope expressions(&p, &seq, &c, o.cancel);  // (core/Expression.h)
     if (c.isGenerator() && c.generator.type == "adjustment") return GpuLayerResult::Unsupported;
     // Its colour steps, each one the GPU draws (the ones on the source, such as noise reduction, are not). Those the
     // GPU has no form for go to the CPU before anything is decoded, unless they may run on the camera's picture.
@@ -2036,7 +2036,7 @@ gpu::Layer cpuLayer(Image&& img) {
 // The program frame drawn on the GPU where it can be, its layers that it cannot draw made on the CPU: false (counted,
 // with why) when the frame as a whole is for the CPU.
 bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& opts, Image* out, QImage* out8) {
-    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
+    ExpressionScope expressions(&p, &seq, nullptr, opts.cancel);  // (core/Expression.h)
     std::string why;
     auto fallback = [](const std::string& reason) {
         gpu::countFallback(reason);
@@ -2133,7 +2133,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
 }  // namespace
 
 QImage renderProgramFrameRgba8(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
-    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
+    ExpressionScope expressions(&p, &seq, nullptr, o.cancel);  // (core/Expression.h)
     QImage q;
     if (o.gpu && o.depth == 0 && gpuProgramFrame(p, seq, t, o, nullptr, &q)) return q;
     RenderOptions cpu = o;
@@ -2145,7 +2145,7 @@ QImage renderProgramFrameRgba8(const Project& p, const Sequence& seq, FrameTime 
 }
 
 Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
-    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
+    ExpressionScope expressions(&p, &seq, nullptr, o.cancel);  // (core/Expression.h)
     if (o.gpu && o.depth == 0) {
         Image img;
         if (gpuProgramFrame(p, seq, t, o, &img, nullptr)) return img;
@@ -2491,7 +2491,7 @@ QPoint cornerPos(int c, int w, int h, int W, int H) {
 }  // namespace
 
 void drawBurnIns(Image& img, const Project& p, const Sequence& seq, FrameTime t, const BurnIn& b, const QImage* watermark,
-                 const ColorSpace* space) {
+                 const ColorSpace* space, FrameTime timecode, bool dropFrame) {
     if (img.width < 8 || img.height < 8) return;
     // The logo first, so the text stays readable over it.
     if (watermark && !watermark->isNull() && b.watermarkOpacity > 0) {
@@ -2501,7 +2501,7 @@ void drawBurnIns(Image& img, const Project& p, const Sequence& seq, FrameTime t,
         blendPatch(img, logo, at.x(), at.y(), space, float(std::clamp(b.watermarkOpacity, 0.0, 1.0)));
     }
     QStringList lines;
-    if (b.timecode) lines << QString::fromStdString(formatTimecode(t, seq.fps));
+    if (b.timecode) lines << QString::fromStdString(formatTimecode(timecode >= 0 ? timecode : t, seq.fps, dropFrame));
     if (b.clipName) {
         for (int i = int(seq.videoTracks.size()) - 1; i >= 0; --i) {
             if (seq.videoTracks[size_t(i)].muted) continue;

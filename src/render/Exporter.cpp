@@ -22,6 +22,8 @@
 #include <QImage>
 #include <QString>
 #include <algorithm>
+#include <functional>
+#include <optional>
 #include <array>
 #include <cctype>
 #include <filesystem>
@@ -1565,29 +1567,38 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     };
     const bool burns = (s.burnInCaptions && captions) || s.burnIn.any();
     const bool packedEyes = seq.stereo3d && stereoView != StereoView::Left && stereoView != StereoView::Right && stereoView != StereoView::Anaglyph;
-    // A frame of the programme: rendered, captions and burn-ins drawn, in the output space.
-    auto programmeFrame = [&](FrameTime f) {
+    // At another rate, captions and burn-ins go on the delivered frames (so an in-between does not ghost them, the
+    // timecode counts the delivered frames and a woven frame shows one); packed eyes are then converted each on its own.
+    const bool burnDelivered = burns && conv.active();
+    const bool eyesApart = burnDelivered && packedEyes;
+    auto renderEye = [&](FrameTime f, StereoView v) {
+        RenderOptions eye = ro;
+        eye.stereoView = v;
+        Image img = renderProgramFrame(p, seq, f, eye);
+        if (trim) applyTrimPass(img, seq, f, *trim);
+        return img;
+    };
+    // A frame of the programme, in the output space: rendered, with captions and burn-ins unless they go on the
+    // delivered frames; `eye` 1 or 2 is the left or right eye alone.
+    auto programmeFrame = [&](FrameTime f, int eye = 0) {
         auto burn = [&](Image& img) {
             if (burnCaptions) drawCaption(img, *burnCaptions, f, &seqSpace);
             if (s.burnIn.any()) drawBurnIns(img, p, seq, f, s.burnIn, watermark.isNull() ? nullptr : &watermark, &seqSpace);
         };
         Image img;
-        if (burns && packedEyes) {
+        if (eye) {
+            img = renderEye(f, eye == 1 ? StereoView::Left : StereoView::Right);
+        } else if (burns && packedEyes) {
             // Packed eyes: captions and burn-ins on each eye, so they sit on the screen in both rather than across
             // the join.
-            RenderOptions eye = ro;
-            eye.stereoView = StereoView::Left;
-            Image left = renderProgramFrame(p, seq, f, eye);
-            eye.stereoView = StereoView::Right;
-            Image right = renderProgramFrame(p, seq, f, eye);
-            if (trim) applyTrimPass(left, seq, f, *trim), applyTrimPass(right, seq, f, *trim);
+            Image left = renderEye(f, StereoView::Left), right = renderEye(f, StereoView::Right);
             burn(left);
             burn(right);
             img = combineStereo(left, right, stereoView);
         } else {
             img = s.alpha && !seq.stereo3d ? renderSequenceFrame(p, seq, f, ro) : renderProgramFrame(p, seq, f, ro);
             if (trim) applyTrimPass(img, seq, f, *trim);
-            burn(img);
+            if (!burnDelivered) burn(img);
         }
         convertColor(img, seqSpace, outSpace, peakNits);
         return img;
@@ -1596,46 +1607,75 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     // conversion's in-betweens and its cut test, pulldown's fields), each with its look.
     static std::atomic<uint64_t> exportRuns{0};
     const uint64_t exportRun = ++exportRuns;
-    std::map<FrameTime, std::shared_ptr<const Image>> held;
+    std::map<std::pair<FrameTime, int>, std::shared_ptr<const Image>> held;
     std::map<FrameTime, ShotLook> looks;
-    auto heldFrame = [&](FrameTime f) -> std::shared_ptr<const Image> {
+    auto heldFrame = [&](FrameTime f, int eye = 0) -> std::shared_ptr<const Image> {
         f = std::clamp<FrameTime>(f, in, out - 1);
-        if (auto it = held.find(f); it != held.end()) return it->second;
-        while (held.size() >= 5) held.erase(held.begin());
-        auto img = std::make_shared<const Image>(programmeFrame(f));
-        held[f] = img;
+        if (auto it = held.find({f, eye}); it != held.end()) return it->second;
+        while (held.size() >= (eyesApart ? 10u : 5u)) held.erase(held.begin());
+        auto img = std::make_shared<const Image>(programmeFrame(f, eye));
+        held[{f, eye}] = img;
         return img;
     };
     auto lookOf = [&](FrameTime f) -> const ShotLook& {
         if (auto it = looks.find(f); it != looks.end()) return it->second;
         while (looks.size() >= 8) looks.erase(looks.begin());
-        return looks[f] = shotLook(*heldFrame(f));
+        return looks[f] = shotLook(*heldFrame(f, eyesApart ? 1 : 0));
     };
     // Whether a cut falls between programme frames f and f + 1: an edit there, or two pictures that are plainly
     // different shots (a cut inside a clip, as a programme imported whole has).
     auto cutAfter = [&](FrameTime f) {
         if (editBetween(seq, f + 1)) return true;
-        const ShotLook& a = lookOf(f);
-        const ShotLook& b = lookOf(f + 1);
-        const ShotLook* before = f > in ? &lookOf(f - 1) : nullptr;
-        const ShotLook* after = f + 2 < out ? &lookOf(f + 2) : nullptr;
-        return looksLikeCut(a, b, before, after);
+        // (copies: each lookOf can drop the looks kept before it)
+        const ShotLook a = lookOf(f), b = lookOf(f + 1);
+        const std::optional<ShotLook> before = f > in ? std::optional<ShotLook>(lookOf(f - 1)) : std::nullopt;
+        const std::optional<ShotLook> after = f + 2 < out ? std::optional<ShotLook>(lookOf(f + 2)) : std::nullopt;
+        return looksLikeCut(a, b, before ? &*before : nullptr, after ? &*after : nullptr);
     };
-    // A frame as delivered: the programme's, or (at another rate) the frame its conversion makes. Pulldown's woven frames
-    // are their first field's frame here, the second field woven in after the conversion to the encoder's format.
-    auto deliveredFrame = [&](FrameTime o) -> Image {
-        if (!conv.active()) return programmeFrame(o);
+    // The frame a conversion makes for delivered frame o (of one eye, or both).
+    auto convertedFrame = [&](FrameTime o, int eye) -> Image {
         const DeliveredPicture pic = deliveredPicture(conv, o - din, out - in);
         const FrameTime a = in + pic.a, b = in + pic.b;
-        if (pic.t <= 0 || pic.woven || b == a) return *heldFrame(a);
-        if (cutAfter(a)) return *heldFrame(pic.t < 0.5 ? a : b);  // never a blend of two shots
-        const std::shared_ptr<const Image> A = heldFrame(a), B = heldFrame(b);
-        // (the flow and in-between caches outlive the export: keyed by this export, and the size)
-        const std::string key = "export#" + std::to_string(exportRun) + "#" + std::to_string(A->width) + "x" + std::to_string(A->height) + "#" +
-                                std::to_string(a);
+        if (pic.t <= 0 || pic.woven || b == a) return *heldFrame(a, eye);
+        if (cutAfter(a)) return *heldFrame(pic.t < 0.5 ? a : b, eye);  // never a blend of two shots
+        const std::shared_ptr<const Image> A = heldFrame(a, eye), B = heldFrame(b, eye);
+        // (the flow and in-between caches outlive the export: keyed by this export, the eye and the size)
+        const std::string key = "export#" + std::to_string(exportRun) + "#" + std::to_string(eye) + "#" + std::to_string(A->width) + "x" +
+                                std::to_string(A->height) + "#" + std::to_string(a);
         Image mid;
         if (rifeAvailable() && rifeModel().installed() && cachedRife(*A, *B, pic.t, key, mid)) return mid;
         return interpolateFrames(*A, *B, pic.t, key);
+    };
+    // Captions and burn-ins on delivered frame o, in the output space, with its timecode counted at the delivered rate
+    // from where the range starts in the programme (non-drop-frame for pulldown, as film transfers count, so each A
+    // frame falls on a frame number ending in 0 or 5).
+    const FrameTime deliveredTimecode = conv.active() ? deliveredFrameOf(conv, in) : 0;
+    const bool dropFrame = conv.mode != RateConversion::Mode::Pulldown;
+    auto burnOn = [&](Image& img, FrameTime o) {
+        if (s.burnInCaptions && captions) drawCaption(img, *captions, o, &outSpace);
+        if (s.burnIn.any()) drawBurnIns(img, p, dseq, o, s.burnIn, watermark.isNull() ? nullptr : &watermark, &outSpace, deliveredTimecode + o, dropFrame);
+    };
+    auto finished = [&](FrameTime o, const std::function<Image(int)>& eyeFrame) {
+        if (!burnDelivered) return eyeFrame(0);
+        if (!eyesApart) {
+            Image img = eyeFrame(0);
+            burnOn(img, o);
+            return img;
+        }
+        Image left = eyeFrame(1), right = eyeFrame(2);
+        burnOn(left, o);
+        burnOn(right, o);
+        return combineStereo(left, right, stereoView);
+    };
+    // A frame as delivered: the programme's, or (at another rate) the frame its conversion makes. Pulldown's woven frames
+    // are their first field's frame here, the second field woven in after (secondFieldOf).
+    auto deliveredFrame = [&](FrameTime o) -> Image {
+        if (!conv.active()) return programmeFrame(o);
+        return finished(o, [&](int eye) { return convertedFrame(o, eye); });
+    };
+    // The picture a woven frame's second field comes from, with the frame's own captions and burn-ins.
+    auto secondFieldOf = [&](FrameTime o, const DeliveredPicture& pic) {
+        return finished(o, [&](int eye) { return *heldFrame(in + pic.b, eye); });
     };
     // HDR10+: each scene's metadata for the frames exported. The sequence's analysis is used where it still matches
     // the cut (not when burn-ins or packed eyes change the picture from what was analysed); the rest is measured now on
@@ -1759,7 +1799,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                 // Pulldown's B C and C D frames: the second (bottom) field from the next picture, woven in the encoder's
                 // format, each plane's lines alternating (4:2:0 chroma too, as FFmpeg's telecine and field matching
                 // weave it).
-                Image second = *heldFrame(in + pic.b);
+                Image second = secondFieldOf(f, pic);
                 if (second.width != img.width || second.height != img.height) second = resizeImage(second, img.width, img.height);
                 toRgba16(second, rgba16);
                 const uint8_t* secondData[4] = {reinterpret_cast<const uint8_t*>(rgba16.data()), nullptr, nullptr, nullptr};

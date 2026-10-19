@@ -94,10 +94,11 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const Color
 
 // Burn-ins (timecode, clip name, text, watermark) drawn over frame t of `seq`
 // in `img` (the whole frame, in colour space `space`; null = Rec.709).
-// `watermark` is the loaded logo (or null).
+// `watermark` is the loaded logo (or null). The timecode shown is frame `timecode` at `seq`'s rate (t when negative),
+// drop-frame at 29.97 and 59.94 unless `dropFrame` is false.
 struct BurnIn;
 void drawBurnIns(Image& img, const Project& p, const Sequence& seq, FrameTime t, const BurnIn& b, const QImage* watermark,
-                 const ColorSpace* space = nullptr);
+                 const ColorSpace* space = nullptr, FrameTime timecode = -1, bool dropFrame = true);
 
 // Raw (unprocessed) frame of a media item at `seconds`, fitted into w x h; for the source monitor.
 Image renderMediaFrame(const Project& p, const MediaItem& m, double seconds, int w, int h);

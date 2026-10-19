@@ -4901,6 +4901,20 @@ private slots:
             QCOMPARE(at(follower, "rotation", 3), 12.0);
             QVERIFY2(!failure().empty(), bad.c_str());
         }
+        // A render's Cancel stops an expression part way (not after the time limit), and is not the expression's error.
+        {
+            follower.motion.params["rotation"].expr = "value * 2";
+            QCOMPARE(at(follower, "rotation", 3), 24.0);
+            std::atomic<bool> cancel{true};
+            ExpressionScope cancelled(&p, &s, nullptr, &cancel);
+            ExpressionScope inner(&p, &s);  // (scopes inside it keep its Cancel)
+            follower.motion.params["rotation"].expr = "while true do end";
+            QElapsedTimer clock;
+            clock.start();
+            QCOMPARE(at(follower, "rotation", 3), 12.0);
+            QVERIFY2(clock.elapsed() < 1000, qPrintable(QString::number(clock.elapsed())));
+            QVERIFY(failure().empty());
+        }
         follower.motion.params["rotation"].expr = "(type(1) == 'number' and math.pi == pi and string.upper('a') == 'A') and 5 or 0";
         QCOMPARE(at(follower, "rotation", 3), 5.0);
         QVERIFY(!checkExpression("value +"));
@@ -25410,6 +25424,102 @@ private slots:
         const double red = third->px[(size_t(45) * size_t(third->width) + 80) * 4] / 65535.0;
         const double expected = 3.0 * 25.0 * 1001.0 / 30000.0 / 24.0;
         QVERIFY2(std::fabs(red - expected) < 0.008, qPrintable(QString("%1 %2").arg(red).arg(expected)));
+    }
+
+    void burnInsAndFieldsAtTheDeliveredRate() {
+        std::string err;
+        // A still black programme at 25 with its timecode burnt in, delivered at 29.97 with in-betweens: every delivered
+        // frame shows its own timecode at the delivered rate, sharp (drawn on the frame as delivered, not blended from
+        // the programme's two).
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = Rational{25, 1};
+        Clip black = makeGeneratorClip(p, "color", 50);
+        for (const char* c : {"color.r", "color.g", "color.b"}) black.generator.params[c] = 0.0;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, black);
+        ExportSettings st;
+        st.videoCodec = "png";
+        st.audioCodec = "none";
+        st.rateChange = "convert";
+        st.rate = Rational{30000, 1001};
+        st.burnIn.timecode = true;
+        st.in = 0, st.out = 10;
+        st.path = path("tc2997_%04d.png");
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        RateConversion c;
+        QVERIFY(planRateConversion(s, st, c, &err));
+        const Sequence d = deliveredSequence(s, c, 0, 10);
+        for (int o = 0; o < 12; ++o) {
+            const QImage got = QImage(QString::fromStdString(path(qPrintable(QString::asprintf("tc2997_%04d.png", o)))))
+                                   .convertToFormat(QImage::Format_RGBA8888);
+            QVERIFY2(got.width() == 320 && got.height() == 180, std::to_string(o).c_str());
+            Image want(320, 180);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) want.at(x, y)[3] = 1.0f;
+            drawBurnIns(want, p, d, o, st.burnIn, nullptr, nullptr, o);
+            int worst = 0;
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x)
+                    worst = std::max(worst, std::abs(qGreen(got.pixel(x, y)) - int(std::lround(std::clamp(want.at(x, y)[1], 0.0f, 1.0f) * 255))));
+            QVERIFY2(worst <= 3, qPrintable(QString("frame %1: %2").arg(o).arg(worst)));
+        }
+        // From a second in: the timecode counts on from where the range starts (frame 25 at 25 is 30 at 29.97).
+        st.in = 25, st.out = 30;
+        st.path = path("tc2997b_%04d.png");
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        {
+            const QImage got = QImage(QString::fromStdString(path("tc2997b_0000.png"))).convertToFormat(QImage::Format_RGBA8888);
+            Image want(320, 180), wrong(320, 180);
+            for (Image* w : {&want, &wrong})
+                for (int y = 0; y < 180; ++y)
+                    for (int x = 0; x < 320; ++x) w->at(x, y)[3] = 1.0f;
+            drawBurnIns(want, p, d, 0, st.burnIn, nullptr, nullptr, 30);
+            drawBurnIns(wrong, p, d, 0, st.burnIn, nullptr, nullptr, 0);
+            int off = 0, offWrong = 0;
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) {
+                    off += std::abs(qGreen(got.pixel(x, y)) - int(std::lround(std::clamp(want.at(x, y)[1], 0.0f, 1.0f) * 255))) > 3;
+                    offWrong += std::abs(qGreen(got.pixel(x, y)) - int(std::lround(std::clamp(wrong.at(x, y)[1], 0.0f, 1.0f) * 255))) > 3;
+                }
+            QVERIFY2(off == 0 && offWrong > 0, qPrintable(QString("%1 %2").arg(off).arg(offWrong)));
+        }
+
+        // Pulldown into fields: B C's and C D's two fields show the one timecode, the delivered frame's (not B's and C's),
+        // so each delivered frame of the black programme is as it is with 2:2:2:4, where no frame mixes two.
+        ExportSettings woven = st;
+        woven.videoCodec = "ffv1";
+        woven.rateChange = "pulldown";
+        woven.in = 0, woven.out = 8;
+        s.fps = Rational{24000, 1001};
+        std::vector<Frame16Ptr> byCadence[2];
+        for (int k = 0; k < 2; ++k) {
+            woven.cadence = k ? "2:2:2:4" : "2:3";
+            woven.path = path(k ? "tc-2224.mkv" : "tc-23.mkv");
+            QVERIFY2(exportSequence(p, s, woven, nullptr, nullptr, &err), err.c_str());
+            VideoDecoder dec;
+            QVERIFY2(dec.open(woven.path, &err), err.c_str());
+            for (int o = 0; o < 10; ++o) {
+                Frame16Ptr f = dec.frameAt((o + 0.5) * 1001.0 / 30000.0, 0, 0);
+                QVERIFY(f);
+                byCadence[k].push_back(f);
+            }
+        }
+        for (int o = 0; o < 10; ++o) QVERIFY2(byCadence[0][size_t(o)]->px == byCadence[1][size_t(o)]->px, std::to_string(o).c_str());
+        QVERIFY(byCadence[0][2]->px != byCadence[0][3]->px);
+
+        // Pulldown into fields is for video: OpenEXR frames (through FFmpeg or the OpenEXR library) are refused.
+        ExportSettings exr;
+        exr.videoCodec = "exr";
+        exr.audioCodec = "none";
+        exr.rateChange = "pulldown";
+        exr.rate = Rational{30000, 1001};
+        exr.in = 0, exr.out = 8;
+        exr.path = path("pd_%04d.exr");
+        for (const char* way : {"", "zip"}) {
+            if (*way && !exrAvailable()) continue;  // (built without OpenEXR)
+            exr.exrCompression = way;
+            QVERIFY(!exportSequence(p, s, exr, nullptr, nullptr, &err) && err.find("Interlaced") != std::string::npos);
+        }
     }
 
     void steadyVideoDepth() {
