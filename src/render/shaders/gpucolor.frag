@@ -55,14 +55,21 @@ vec3 applyLut(vec3 c) {
     }
     const int x0 = min(n - 2, int(u.x)), y0 = min(n - 2, int(u.y)), z0 = min(n - 2, int(u.z));
     const float fx = u.x - float(x0), fy = u.y - float(y0), fz = u.z - float(z0);
-    const vec3 c000 = texelFetch(lut3, ivec3(x0, y0, z0), 0).rgb, c100 = texelFetch(lut3, ivec3(x0 + 1, y0, z0), 0).rgb;
-    const vec3 c010 = texelFetch(lut3, ivec3(x0, y0 + 1, z0), 0).rgb, c110 = texelFetch(lut3, ivec3(x0 + 1, y0 + 1, z0), 0).rgb;
-    const vec3 c001 = texelFetch(lut3, ivec3(x0, y0, z0 + 1), 0).rgb, c101 = texelFetch(lut3, ivec3(x0 + 1, y0, z0 + 1), 0).rgb;
-    const vec3 c011 = texelFetch(lut3, ivec3(x0, y0 + 1, z0 + 1), 0).rgb, c111 = texelFetch(lut3, ivec3(x0 + 1, y0 + 1, z0 + 1), 0).rgb;
-    const vec3 c00 = c000 * (1.0 - fx) + c100 * fx, c10 = c010 * (1.0 - fx) + c110 * fx;
-    const vec3 c01 = c001 * (1.0 - fx) + c101 * fx, c11 = c011 * (1.0 - fx) + c111 * fx;
-    const vec3 c0 = c00 * (1.0 - fy) + c10 * fy, c1 = c01 * (1.0 - fy) + c11 * fy;
-    return c0 * (1.0 - fz) + c1 * fz;
+    // Tetrahedral (as the CPU's Lut3D::apply): a grey from greys only.
+    const ivec3 o = ivec3(x0, y0, z0);
+    ivec3 da, db;
+    vec4 w;
+    if (fx > fy) {
+        if (fy > fz) { da = ivec3(1, 0, 0); db = ivec3(1, 1, 0); w = vec4(1.0 - fx, fx - fy, fy - fz, fz); }
+        else if (fx > fz) { da = ivec3(1, 0, 0); db = ivec3(1, 0, 1); w = vec4(1.0 - fx, fx - fz, fz - fy, fy); }
+        else { da = ivec3(0, 0, 1); db = ivec3(1, 0, 1); w = vec4(1.0 - fz, fz - fx, fx - fy, fy); }
+    } else {
+        if (fz > fy) { da = ivec3(0, 0, 1); db = ivec3(0, 1, 1); w = vec4(1.0 - fz, fz - fy, fy - fx, fx); }
+        else if (fz > fx) { da = ivec3(0, 1, 0); db = ivec3(0, 1, 1); w = vec4(1.0 - fy, fy - fz, fz - fx, fx); }
+        else { da = ivec3(0, 1, 0); db = ivec3(1, 1, 0); w = vec4(1.0 - fy, fy - fx, fx - fz, fz); }
+    }
+    return w.x * texelFetch(lut3, o, 0).rgb + w.y * texelFetch(lut3, o + da, 0).rgb + w.z * texelFetch(lut3, o + db, 0).rgb +
+           w.w * texelFetch(lut3, o + ivec3(1, 1, 1), 0).rgb;
 }
 
 // Color Correct. p[1] exposure, contrast, pivot, saturation; p[2] offset, vibrance, tone on; p[3..6] lift, gamma

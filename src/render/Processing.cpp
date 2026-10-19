@@ -2329,19 +2329,24 @@ void Lut3D::apply(float& r, float& g, float& b) const {
     }
     int x0 = std::min(size - 2, int(u[0])), y0 = std::min(size - 2, int(u[1])), z0 = std::min(size - 2, int(u[2]));
     float fx = u[0] - float(x0), fy = u[1] - float(y0), fz = u[2] - float(z0);
-    auto at = [&](int x, int y, int z, int c) {
-        return data[((size_t(z) * size_t(size) + size_t(y)) * size_t(size) + size_t(x)) * 3 + size_t(c)];
-    };
-    float out[3];
-    for (int c = 0; c < 3; ++c) {
-        float c00 = at(x0, y0, z0, c) * (1 - fx) + at(x0 + 1, y0, z0, c) * fx;
-        float c10 = at(x0, y0 + 1, z0, c) * (1 - fx) + at(x0 + 1, y0 + 1, z0, c) * fx;
-        float c01 = at(x0, y0, z0 + 1, c) * (1 - fx) + at(x0 + 1, y0, z0 + 1, c) * fx;
-        float c11 = at(x0, y0 + 1, z0 + 1, c) * (1 - fx) + at(x0 + 1, y0 + 1, z0 + 1, c) * fx;
-        float c0 = c00 * (1 - fy) + c10 * fy;
-        float c1 = c01 * (1 - fy) + c11 * fy;
-        out[c] = c0 * (1 - fz) + c1 * fz;
+    auto at = [&](int x, int y, int z) { return &data[((size_t(z) * size_t(size) + size_t(y)) * size_t(size) + size_t(x)) * 3]; };
+    // Tetrahedral: the cube cut into six tetrahedra along its grey diagonal, so a grey is interpolated from greys only
+    // (trilinear mixes in the corners off it, which a tone mapping's highlights pull down).
+    const float* c000 = at(x0, y0, z0);
+    const float* c111 = at(x0 + 1, y0 + 1, z0 + 1);
+    const float *a, *b2;
+    float w0, w1, w2, w3;
+    if (fx > fy) {
+        if (fy > fz) a = at(x0 + 1, y0, z0), b2 = at(x0 + 1, y0 + 1, z0), w0 = 1 - fx, w1 = fx - fy, w2 = fy - fz, w3 = fz;
+        else if (fx > fz) a = at(x0 + 1, y0, z0), b2 = at(x0 + 1, y0, z0 + 1), w0 = 1 - fx, w1 = fx - fz, w2 = fz - fy, w3 = fy;
+        else a = at(x0, y0, z0 + 1), b2 = at(x0 + 1, y0, z0 + 1), w0 = 1 - fz, w1 = fz - fx, w2 = fx - fy, w3 = fy;
+    } else {
+        if (fz > fy) a = at(x0, y0, z0 + 1), b2 = at(x0, y0 + 1, z0 + 1), w0 = 1 - fz, w1 = fz - fy, w2 = fy - fx, w3 = fx;
+        else if (fz > fx) a = at(x0, y0 + 1, z0), b2 = at(x0, y0 + 1, z0 + 1), w0 = 1 - fy, w1 = fy - fz, w2 = fz - fx, w3 = fx;
+        else a = at(x0, y0 + 1, z0), b2 = at(x0 + 1, y0 + 1, z0), w0 = 1 - fy, w1 = fy - fx, w2 = fx - fz, w3 = fz;
     }
+    float out[3];
+    for (int c = 0; c < 3; ++c) out[c] = w0 * c000[c] + w1 * a[c] + w2 * b2[c] + w3 * c111[c];
     r = out[0];
     g = out[1];
     b = out[2];

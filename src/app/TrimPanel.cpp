@@ -8,6 +8,7 @@
 #include <QMenu>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QSignalBlocker>
 #include <QToolButton>
 #include <QVBoxLayout>
 
@@ -81,6 +82,19 @@ TrimPanel::TrimPanel(EditorState* state, QWidget* parent) : QWidget(parent), sta
     buttons->addWidget(reset_);
     buttons->addWidget(copy_);
     v->addLayout(buttons);
+    auto* analysis = new QHBoxLayout;
+    analyse_ = new QPushButton(tr("Analyse Trims"), this);
+    analyse_->setObjectName(QStringLiteral("analyseTrims"));
+    analyse_->setToolTip(tr("Measure each shot's light in the HDR master and give every shot with no trim of its own a starting "
+                            "trim for each target (the In to Out marks, else the whole sequence)"));
+    beside_ = new QToolButton(this);
+    beside_->setObjectName(QStringLiteral("trimMasterBeside"));
+    beside_->setText(tr("Master Beside"));
+    beside_->setCheckable(true);
+    beside_->setToolTip(tr("Split the Program monitor: the master on the left of the divider, the target on the right"));
+    analysis->addWidget(analyse_, 1);
+    analysis->addWidget(beside_);
+    v->addLayout(analysis);
     queue_ = new QPushButton(tr("Queue Passes…"), this);
     queue_->setObjectName(QStringLiteral("queueTrimPasses"));
     queue_->setToolTip(tr("Render every target into a folder (the render queue): HDR ones as 10-bit HEVC with dynamic HDR metadata (ST 2094-40), SDR as H.264"));
@@ -100,9 +114,18 @@ TrimPanel::TrimPanel(EditorState* state, QWidget* parent) : QWidget(parent), sta
     connect(reset_, &QPushButton::clicked, this, [this] { resetShot(); });
     connect(copy_, &QPushButton::clicked, this, [this] { copyToSelection(); });
     connect(queue_, &QPushButton::clicked, this, &TrimPanel::queueRequested);
+    connect(analyse_, &QPushButton::clicked, this, &TrimPanel::analyseRequested);
+    connect(beside_, &QToolButton::toggled, this, &TrimPanel::masterBesideToggled);
     for (auto sig : {&EditorState::projectChanged, &EditorState::sequenceSwitched}) connect(state_, sig, this, &TrimPanel::refresh);
     connect(state_, &EditorState::playheadChanged, this, [this] { refreshShot(); });
     refresh();
+}
+
+bool TrimPanel::masterBeside() const { return beside_->isChecked(); }
+
+void TrimPanel::setMasterBeside(bool on) {
+    const QSignalBlocker b(beside_);
+    beside_->setChecked(on);
 }
 
 QString TrimPanel::shown() const { return targets_->currentData().toString(); }
@@ -156,6 +179,8 @@ void TrimPanel::refreshShot() {
     reset_->setEnabled(has);
     copy_->setEnabled(editing);
     queue_->setEnabled(s && !s->trimTargets.empty());
+    analyse_->setEnabled(s && !s->trimTargets.empty());
+    beside_->setEnabled(!target.empty() || beside_->isChecked());
     updating_ = false;
 }
 

@@ -1,7 +1,9 @@
 // Montage — the Trims panel (Resolve's MultiMaster Trim Manager): the sequence's trim targets (render/TrimPasses.h),
 // the one the Program monitor and reference output show, and the shot at the playhead's trim for it (lift, gamma,
-// gain, saturation, highlight roll-off, mid-tone detail; a control with keyframes is set at the playhead). Copy puts
-// the shot's trim on the selected clips; Queue Passes renders every target into a folder.
+// gain, saturation, highlight roll-off, mid-tone detail, the shot's peak; a control with keyframes is set at the
+// playhead). Copy puts the shot's trim on the selected clips; Analyse Trims works out a starting trim for every shot
+// that has none (render/AutoTrims.h); Master Beside splits the Program monitor between the master and the target;
+// Queue Passes renders every target into a folder.
 #pragma once
 
 #include <QWidget>
@@ -37,10 +39,14 @@ public:
     Id shot() const;
     void refresh();
     void refreshShot();  // the shot at the playhead and its controls
+    bool masterBeside() const;
+    void setMasterBeside(bool on);  // (without telling)
 
 signals:
     void shownChanged(const QString& target);
     void queueRequested();
+    void analyseRequested();
+    void masterBesideToggled(bool on);
 
 private:
     EditorState* state_;
@@ -52,6 +58,8 @@ private:
     QToolButton* key_;
     QPushButton* reset_;
     QPushButton* copy_;
+    QPushButton* analyse_;
+    QToolButton* beside_;
     QPushButton* queue_;
     bool updating_ = false;
 };

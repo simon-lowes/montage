@@ -136,6 +136,7 @@
 #include "GradeNodePanel.h"
 #include "GalleryPanel.h"
 #include "TrimPanel.h"
+#include "render/AutoTrims.h"
 #include "render/TrimPasses.h"
 #include "ClipStripPanel.h"
 #include "MediaBinWidget.h"
@@ -585,6 +586,10 @@ void MainWindow::buildPanels() {
     clipStrip_ = new ClipStripPanel(state_, this);
     clipsDock_ = makeDock(tr("Clips"), "clips", clipStrip_);
     connect(gallery_, &GalleryPanel::compareRequested, this, [this](const QImage& still, const QString& label) {
+        if (masterBeside_) {
+            masterBeside_ = false;
+            trims_->setMasterBeside(false);
+        }
         if (compareRef_ && compareRef_->isChecked()) {
             const QSignalBlocker b(compareRef_);
             compareRef_->setChecked(false);
@@ -602,10 +607,30 @@ void MainWindow::buildPanels() {
     trimsDock_ = makeDock(tr("Trims"), "trims", trims_);
     connect(trims_, &TrimPanel::shownChanged, this, [this](const QString& target) {
         program_->setTrimTarget(target.toStdString());
+        if (masterBeside_) setMasterBeside(!target.isEmpty());  // (the master beside itself is no comparison)
         if (referenceOutput_) referenceOutput_->sequenceChanged();
         // (rendered previews are the master's or another target's: what is cached changes)
         stopBackgroundRender();
         refreshRenderBar();
+    });
+    connect(trims_, &TrimPanel::analyseRequested, this, [this] { analyseTrims(); });
+    connect(trims_, &TrimPanel::masterBesideToggled, this, &MainWindow::setMasterBeside);
+    // (the master beside follows the playhead and the edits while paused)
+    // (rendered once things settle, not on every step of a scrub or a spin box)
+    masterTimer_ = new QTimer(this);
+    masterTimer_->setSingleShot(true);
+    masterTimer_->setInterval(150);
+    connect(masterTimer_, &QTimer::timeout, this, [this] {
+        if (masterBeside_ && !program_->isPlaying()) refreshMasterBeside();
+    });
+    auto followMaster = [this] {
+        if (masterBeside_) masterTimer_->start();
+    };
+    connect(state_, &EditorState::playheadChanged, this, followMaster);
+    connect(state_, &EditorState::projectChanged, this, followMaster);
+    connect(state_, &EditorState::sequenceSwitched, this, followMaster);
+    connect(program_, &PlaybackController::playingChanged, this, [this](bool playing) {
+        if (masterBeside_ && !playing) refreshMasterBeside();
     });
     connect(trims_, &TrimPanel::queueRequested, this, [this] {
         const QString folder = QFileDialog::getExistingDirectory(this, tr("Render the Trim Passes Into"), QFileInfo(state_->filePath()).absolutePath());
@@ -4442,6 +4467,10 @@ void MainWindow::setCompareWithReference(bool on) {
     }
     if (!programPanel_) return;
     if (on && gallery_) gallery_->wipeEnded();
+    if (on && masterBeside_) {
+        masterBeside_ = false;
+        if (trims_) trims_->setMasterBeside(false);
+    }
     if (on) programPanel_->viewer()->setCompare(colourRefView_, tr("Reference: %1").arg(colourRefName_));
     else programPanel_->viewer()->clearCompare();
 }
@@ -7085,6 +7114,76 @@ QDialog* MainWindow::speedEditorKeysDialog(QWidget* parent) {
     dlg->resize(720, 640);
     dlg->show();
     return dlg;
+}
+
+bool MainWindow::analyseTrims() {
+    const Sequence* cur = state_->sequence();
+    if (!cur) return false;
+    if (!sequenceColorSpace(*cur).hdr()) {
+        state_->message(tr("Trims are worked out from an HDR master (PQ or HLG); see Sequence Settings"), 6000);
+        return false;
+    }
+    if (cur->trimTargets.empty()) {
+        state_->message(tr("Add a trim target first (the Trims panel's +)"), 5000);
+        return false;
+    }
+    // A copy to measure while the dialog runs.
+    const Project p = state_->project();
+    const Sequence s = *cur;
+    const bool marked = s.inPoint >= 0 && s.outPoint >= s.inPoint;
+    std::vector<ShotLight> lights;
+    if (!runWithProgress(this, state_, tr("Measuring each shot's light..."), [&](const auto& progress, const auto* cancel, std::string* e) {
+            return measureShotLight(p, s, marked ? s.inPoint : 0, marked ? s.outPoint + 1 : 0, lights, e, [&](double f) { progress(f); }, cancel);
+        }))
+        return false;
+    std::vector<AutoTrim> trims;
+    for (const TrimTarget& t : s.trimTargets) {
+        const std::vector<AutoTrim> some = solveAutoTrims(s, t.id, lights);
+        trims.insert(trims.end(), some.begin(), some.end());
+    }
+    FrameTime filled = 0;
+    QString why;
+    if (!state_->edit(tr("Analyse Trims"), [&](Project&, Sequence& sq) {
+            const edit::Result r = edit::fillAutoTrims(sq, trims);
+            filled = r.applied;
+            why = QString::fromStdString(r.error);
+            return r.ok;
+        })) {
+        if (!why.isEmpty()) state_->message(why, 6000);
+        return false;
+    }
+    state_->message(tr("%n starting trim(s) from %1 shot(s) measured", "", int(filled)).arg(lights.size()), 6000);
+    return true;
+}
+
+void MainWindow::setMasterBeside(bool on) {
+    if (on && (!trims_ || trims_->shown().isEmpty())) {
+        state_->message(tr("Pick a trim target to see beside the master"), 4000);
+        on = false;
+    }
+    masterBeside_ = on;
+    if (trims_) trims_->setMasterBeside(on);
+    if (!programPanel_) return;
+    if (on) {
+        if (compareRef_ && compareRef_->isChecked()) {
+            const QSignalBlocker b(compareRef_);
+            compareRef_->setChecked(false);
+        }
+        if (gallery_) gallery_->wipeEnded();
+        refreshMasterBeside();
+    } else {
+        programPanel_->viewer()->clearCompare();
+    }
+}
+
+void MainWindow::refreshMasterBeside() {
+    const Sequence* s = state_->sequence();
+    if (!s || !programPanel_) return;
+    RenderOptions o;
+    o.scale = std::min(1.0, 1280.0 / std::max(1, s->width));
+    o.displaySpace = "rec709";  // (as the Program monitor shows a target)
+    const FrameTime t = std::clamp<FrameTime>(state_->playhead(), 0, std::max<FrameTime>(0, s->duration() - 1));
+    programPanel_->viewer()->setCompare(renderProgramFrameRgba8(state_->project(), *s, t, o), tr("Master"));
 }
 
 bool MainWindow::analyseHdrLightLevels(bool ask) {

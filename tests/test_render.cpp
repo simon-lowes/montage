@@ -61,6 +61,7 @@
 #include <QElapsedTimer>
 #include <QRandomGenerator>
 #include "core/ScriptCut.h"
+#include "render/AutoTrims.h"
 #include "render/TrimPasses.h"
 #include "render/RoomTone.h"
 #include "render/Ocio.h"
@@ -3988,6 +3989,158 @@ colorspaces:
         QVERIFY(edit::removeTrimTarget(s, "hdr10-600").ok);
         QVERIFY(!edit::clipById(s, a.id)->trims.count("hdr10-600"));
         QVERIFY(!edit::removeTrimTarget(s, "hdr10-600").ok);
+    }
+
+    void autoTrimsFromTheMaster() {
+        // A PQ master at 4000 nits, 240 x 136: shots built from pairs of pixels lit k times over and under a mid-grey
+        // G (same colour, luminance G k and G / k), so G is each shot's log-average, and a patch of G to read.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        constexpr int W = 240, H = 136;
+        s.width = W;
+        s.height = H;
+        s.colorSpace = "rec2100pq";
+        s.hdrPeakNits = 4000;
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        QTemporaryDir dir;
+        struct Light {
+            double r, g, b;  // its colour
+            double k;        // how many times over G
+            double share;    // of the frame, half over and half under
+        };
+        const auto lum = [](double r, double g, double b) { return 0.2627 * r + 0.6780 * g + 0.0593 * b; };
+        FrameTime at = 0;
+        auto shot = [&](const QString& name, double G, const std::vector<Light>& lights) {
+            QImage q(W, H, QImage::Format_RGBA64);
+            int i = 0;
+            auto put = [&](double r, double g, double b) {
+                q.setPixelColor(i % W, i / W, QColor::fromRgbF(float(nitsToCode(pq, r)), float(nitsToCode(pq, g)), float(nitsToCode(pq, b)), 1));
+                ++i;
+            };
+            for (const Light& l : lights) {
+                const int n = int(l.share * W * H / 2);
+                const double y = lum(l.r, l.g, l.b), hi = G * l.k / y, lo = G / l.k / y;
+                for (int j = 0; j < n; ++j) {
+                    put(l.r * hi, l.g * hi, l.b * hi);
+                    put(l.r * lo, l.g * lo, l.b * lo);
+                }
+            }
+            while (i < W * H) put(G, G, G);  // (the rest grey: the last rows are the patch)
+            const QString path = dir.filePath(name + ".png");
+            q.save(path);
+            MediaItem media;
+            probeMedia(path.toStdString(), media);
+            media.id = p.newId();
+            media.colorOverride = "rec2100pq";
+            p.media.push_back(media);
+            const auto placed = edit::placeMedia(p, s, media.id, at, 0, 10, {TrackKind::Video, 0}, {}, false);
+            at += 10;
+            return placed.ok ? placed.created[0] : Id(0);
+        };
+        const double g = 1;  // (neutral)
+        const Id night = shot("night", 1, {{g, g, g, 40, 0.06}, {g, g, g, 8, 0.3}, {1, 0.8, 0.5, 300, 0.004}});
+        const Id day = shot("day", 40, {{g, g, g, 6, 0.4}, {0.8, 0.95, 1.4, 12, 0.2}});
+        const Id sea = shot("sea", 60, {{g, g, g, 3, 0.4}, {g, g, g, 50, 0.06}});
+        const Id sunset = shot("sunset", 25, {{1, 0.45, 0.12, 30, 0.3}, {g, g, g, 150, 0.004}, {g, g, g, 4, 0.2}});
+        // A scene: two shots a stop apart in one colour group.
+        const Id near1 = shot("near1", 30, {{g, g, g, 4, 0.4}});
+        const Id near2 = shot("near2", 60, {{g, g, g, 4, 0.4}});
+        QVERIFY(night && day && sea && sunset && near1 && near2);
+        ColorGroup scene;
+        scene.id = p.newId(), scene.postId = p.newId(), scene.name = "Scene";
+        s.colorGroups.push_back(scene);
+        edit::clipById(s, near1)->colorGroup = edit::clipById(s, near2)->colorGroup = scene.id;
+        for (const char* id : {"sdr", "hdr10-600"})
+            QVERIFY(edit::addTrimTarget(s, *std::find_if(trimTargetPresets().begin(), trimTargetPresets().end(),
+                                                         [&](const TrimTarget& t) { return t.id == id; })).ok);
+
+        // Measured: each shot's log-average is its G; its brightest 0.1 % and peak.
+        std::vector<ShotLight> lights;
+        std::string err;
+        QVERIFY2(measureShotLight(p, s, 0, 0, lights, &err), err.c_str());
+        QCOMPARE(lights.size(), size_t(6));
+        const std::map<Id, double> G{{night, 1}, {day, 40}, {sea, 60}, {sunset, 25}, {near1, 30}, {near2, 60}};
+        for (const ShotLight& l : lights) {
+            QVERIFY2(std::fabs(l.logAverage / G.at(l.clip) - 1) < 0.02, qPrintable(QString::number(l.logAverage)));
+            QCOMPARE(l.frames, 9);
+        }
+        QVERIFY(std::fabs(lights[2].high / 3000 - 1) < 0.05 && lights[2].peak > 2900);  // the sea's glints
+        QVERIFY(lights[0].low < 0.03);  // the night's shadows
+
+        // Before: the master tone mapped as it is clips the sea's glints.
+        auto sdr = [&](Id clip, int& clipped) {
+            RenderOptions o;
+            o.trimTarget = "sdr";
+            const Clip* c = edit::clipById(s, clip);
+            const Image img = renderProgramFrame(p, s, c->start + 3, o);
+            clipped = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    if (std::max({img.at(x, y)[0], img.at(x, y)[1], img.at(x, y)[2]}) >= 0.995f) ++clipped;
+            return double(img.at(W - 1, H - 1)[1]);  // the grey patch
+        };
+        int clipped = 0;
+        sdr(sea, clipped);
+        QVERIFY2(clipped > 0.02 * W * H, qPrintable(QString::number(clipped)));
+
+        // Solved and filled: a shot with a trim of its own keeps it.
+        QVERIFY(edit::setTrim(s, day, "hdr10-600", {{"gain", 0.9}}, 20).ok);
+        std::vector<AutoTrim> trims = solveAutoTrims(s, "sdr", lights);
+        const std::vector<AutoTrim> hdr = solveAutoTrims(s, "hdr10-600", lights);
+        trims.insert(trims.end(), hdr.begin(), hdr.end());
+        QVERIFY(edit::fillAutoTrims(s, trims).ok);
+        QCOMPARE(edit::clipById(s, day)->trims.at("hdr10-600").p("gain", 0, 1), 0.9);
+        QCOMPARE(edit::clipById(s, day)->trims.at("hdr10-600").p("peak", 0, 0), 0.0);
+        QVERIFY(edit::clipById(s, sea)->trims.at("sdr").p("peak", 0, 0) > 2500);
+        QVERIFY(edit::clipById(s, sea)->trims.at("sdr").p("saturation", 0, 1) > 1);
+        QVERIFY(edit::clipById(s, night)->trims.at("sdr").p("lift", 0, 0) > 0);
+        QVERIFY(!edit::fillAutoTrims(s, trims).ok);  // (every shot has its own now)
+
+        // SDR: every shot's mid-grey within 2 % of where the mapping puts it, under 0.5 % of pixels clipped.
+        for (const Id shot : {night, day, sea, sunset}) {
+            const double grey = sdr(shot, clipped), aimed = trimmedGrey(s, *findTrimTarget(s, "sdr"), nullptr, G.at(shot));
+            QVERIFY2(std::fabs(grey / aimed - 1) < 0.02, qPrintable(QStringLiteral("%1: %2 / %3").arg(shot).arg(grey).arg(aimed)));
+            QVERIFY2(clipped < 0.005 * W * H, qPrintable(QStringLiteral("%1: %2 clipped").arg(shot).arg(clipped)));
+        }
+        // The scene's two shots within 0.3 stops of each other (a stop apart in the master).
+        const double a1 = std::pow(sdr(near1, clipped), 2.4), a2 = std::pow(sdr(near2, clipped), 2.4);
+        QVERIFY2(std::fabs(std::log2(a2 / a1)) < 0.3, qPrintable(QStringLiteral("%1 %2").arg(a1).arg(a2)));
+        QVERIFY(std::fabs(std::log2(a2 / a1)) > 0.1);  // (pulled together, not made the same)
+
+        // 600 nits: the sea rolled off from its own glints, its mid-grey kept, nothing over the peak.
+        {
+            RenderOptions o;
+            o.trimTarget = "hdr10-600";
+            const Image img = renderProgramFrame(p, s, edit::clipById(s, sea)->start + 3, o);
+            double most = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) most = std::max(most, codeToNits(pq, img.at(x, y)[0]));
+            QVERIFY2(most <= 601 && most > 450, qPrintable(QString::number(most)));
+            const double grey = codeToNits(pq, img.at(W - 1, H - 1)[1]);
+            QVERIFY2(std::fabs(grey / 60 - 1) < 0.02, qPrintable(QString::number(grey)));
+            // A shot whose peak is under the target's: held there, opaque and as it was.
+            const Image dim = renderProgramFrame(p, s, edit::clipById(s, near1)->start + 3, o);
+            QVERIFY(edit::clipById(s, near1)->trims.at("hdr10-600").p("peak", 0, 0) < 600);
+            QCOMPARE(dim.at(0, 0)[3], 1.0f);
+            const auto aimed = std::find_if(hdr.begin(), hdr.end(), [&](const AutoTrim& t) { return t.clip == near1; });
+            QVERIFY(aimed != hdr.end());
+            const double dimGrey = dim.at(W - 1, H - 1)[1];
+            QVERIFY2(std::fabs(dimGrey / aimed->greyCode - 1) < 0.02, qPrintable(QStringLiteral("%1 %2").arg(dimGrey).arg(aimed->greyCode)));
+        }
+        // A trim switched off is still the shot's own; one with only defaults is not.
+        {
+            Clip c = *edit::clipById(s, day);
+            QVERIFY(hasOwnTrim(c, "hdr10-600"));
+            c.trims["hdr10-600"].enabled = false;
+            QVERIFY(hasOwnTrim(c, "hdr10-600"));
+            c.trims["hdr10-600"] = makeTrim();
+            QVERIFY(!hasOwnTrim(c, "hdr10-600"));
+        }
+
+        // An SDR master has nothing to trim from.
+        Sequence sdrMaster = s;
+        sdrMaster.colorSpace = "rec709";
+        QVERIFY(!measureShotLight(p, sdrMaster, 0, 0, lights, &err) && err.find("HDR") != std::string::npos);
     }
 
     void clipAnimationsRendered() {

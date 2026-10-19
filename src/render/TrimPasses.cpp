@@ -126,6 +126,7 @@ const std::vector<TrimControl>& trimControls() {
         {"saturation", "Saturation", 1, 0, 2},
         {"highlights", "Highlight Roll-off", 0, 0, 1},
         {"mid_detail", "Mid-tone Contrast", 0, -1, 1},
+        {"peak", "Shot Peak (nits)", 0, 0, 10000},
     };
     return controls;
 }
@@ -184,28 +185,50 @@ void rollOffPq(Image& img, double fromNits, double toNits) {
 }
 
 void applyTrimPass(Image& img, const Sequence& s, FrameTime t, const TrimTarget& target) {
+    const Clip* shot = trimShot(s, t);
+    const auto it = shot ? shot->trims.find(target.id) : decltype(shot->trims)::const_iterator{};
+    applyTrim(img, s, target, shot && it != shot->trims.end() ? &it->second : nullptr, shot ? t - shot->start : 0);
+}
+
+void applyTrim(Image& img, const Sequence& s, const TrimTarget& target, const Effect* trimmed, FrameTime local) {
     const ColorSpace& from = sequenceColorSpace(s);
     const ColorSpace* to = findColorSpace(target.colorSpace);
     if (img.empty() || !to) return;
-    // 1. The master on the target's display: PQ above its peak rolled off first, then into its space.
-    const double peak = targetPeak(*to, target.peakNits);
-    if (to->transfer == Transfer::Pq && from.hdr() && sourcePeak(s) > peak) {
+    // 1. The master on the target's display: PQ above its peak rolled off first, then into its space. The rolled-off
+    // light runs from the shot's own peak where its trim gives one, else the master's.
+    const double peak = targetPeak(*to, target.peakNits), master = sourcePeak(s);
+    const double shotPeak = trimmed && trimmed->enabled ? trimmed->p("peak", local, 0) : 0;
+    const double fromPeak = shotPeak > 0 ? std::min(shotPeak, master) : master;
+    const ColorSpace& pq = *findColorSpace("rec2100pq");
+    // (light above `top`, the shot's own brightest, held at the target's peak: no roll-off under it)
+    auto rollOff = [&](double top, double toNits) {
+        if (top > toNits) {
+            rollOffPq(img, top, toNits);
+            return;
+        }
+        const float most = float(nitsToCode(pq, toNits));
+        for (size_t i = 0; i + 3 < img.px.size(); i += 4)  // (premultiplied: the colour under its alpha times the code)
+            for (size_t k = 0; k < 3; ++k) img.px[i + k] = std::min(img.px[i + k], most * img.px[i + 3]);
+    };
+    if (!to->hdr() && from.hdr() && shotPeak > 0) {
+        // SDR from the shot's peak: its light rolled off (in PQ) to what SDR shows just short of white, then tone mapped.
+        // The roll-off is in the target's primaries, so a colour its smaller gamut makes brighter is rolled off too.
+        const ColorSpace rolled{"trim-pq-" + to->id, "", to->primaries, Transfer::Pq, false};
+        convertColor(img, from, rolled, master);
+        if (fromPeak > kSdrHeadroomNits) rollOffPq(img, fromPeak, kSdrHeadroomNits);
+        convertColor(img, rolled, *to, master);
+    } else if (to->transfer == Transfer::Pq && from.hdr() && (fromPeak > peak || master > peak)) {
         // (into PQ at the master's peak, then rolled off there: HLG's highlights too)
-        convertColor(img, from, *to, sourcePeak(s));
-        rollOffPq(img, sourcePeak(s), peak);
+        convertColor(img, from, *to, master);
+        rollOff(fromPeak, peak);
     } else {
         // (a PQ master into HLG rolled off to its 1000 nits first, on PQ's own code values)
-        if (from.transfer == Transfer::Pq && to->hdr() && sourcePeak(s) > peak) rollOffPq(img, sourcePeak(s), peak);
-        convertColor(img, from, *to, to->transfer == Transfer::Pq ? peak : sourcePeak(s));
+        if (from.transfer == Transfer::Pq && to->hdr() && master > peak) rollOff(fromPeak, peak);
+        convertColor(img, from, *to, to->transfer == Transfer::Pq ? peak : master);
     }
     // 2. The shot's trim, on the display's code values.
-    const Clip* shot = trimShot(s, t);
-    if (!shot) return;
-    const auto it = shot->trims.find(target.id);
-    if (it == shot->trims.end()) return;
-    const Effect& trim = it->second;
-    const FrameTime local = t - shot->start;
-    if (isNeutralTrim(trim, local)) return;
+    if (!trimmed || isNeutralTrim(*trimmed, local)) return;
+    const Effect& trim = *trimmed;
     const double lift = trim.p("lift", local, 0), gamma = trim.p("gamma", local, 0), gain = trim.p("gain", local, 1);
     const double sat = trim.p("saturation", local, 1), roll = std::clamp(trim.p("highlights", local, 0), 0.0, 1.0);
     const double detail = trim.p("mid_detail", local, 0);
@@ -226,7 +249,19 @@ void applyTrimPass(Image& img, const Sequence& s, FrameTime t, const TrimTarget&
                     c[k] = std::pow(std::max(v, 0.0), expo);
                 }
                 const double luma = w[0] * c[0] + w[1] * c[1] + w[2] * c[2];
-                for (double& v : c) v = luma + sat * (v - luma);
+                double eased = sat;
+                if (sat > 1) {
+                    // More saturation eases into what is left under white (from 90 % code, or the brightest channel
+                    // where it is already higher) rather than clipping the brightest channel, which would turn its hue.
+                    const double mx = std::max({c[0], c[1], c[2]}), spread = mx - luma, raised = mx + (sat - 1) * spread;
+                    const double knee = std::max(mx, 0.9);
+                    if (spread > 1e-6 && raised > knee) {
+                        const double room = std::max(0.0, 0.99 - knee);
+                        const double top = room > 1e-9 ? knee + room * (1 - std::exp(-(raised - knee) / room)) : knee;
+                        eased = 1 + std::max(0.0, top - mx) / spread;
+                    }
+                }
+                for (double& v : c) v = luma + eased * (v - luma);
                 if (roll > 0) {
                     const double mx = std::max({c[0], c[1], c[2]});
                     if (mx > knee) {
@@ -277,7 +312,7 @@ Result setTrim(Sequence& s, Id clipId, const std::string& target, const std::map
     Clip& c = t->clips[loc->index];
     for (const auto& [name, v] : values)
         if (std::none_of(trimControls().begin(), trimControls().end(), [&](const TrimControl& k) { return name == k.name; }))
-            return Result::fail("No trim control " + name + " (lift, gamma, gain, saturation, highlights, mid_detail)");
+            return Result::fail("No trim control " + name + " (lift, gamma, gain, saturation, highlights, mid_detail, peak)");
     auto [it, added] = c.trims.try_emplace(target, makeTrim());
     for (const TrimControl& k : trimControls())
         if (const auto v = values.find(k.name); v != values.end()) {

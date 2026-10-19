@@ -7000,6 +7000,9 @@ private slots:
         Clip b = makeGeneratorClip(q, "color", 10);
         b.name = "Close";
         b.start = 10;
+        Effect brighter = makeEffect(q, "color_correct");  // (three stops over: highlights an SDR trim rolls off)
+        brighter.params["exposure"] = 3.0;
+        b.effects.push_back(brighter);
         edit::overwrite(q, seq, {TrackKind::Video, 0}, a);
         edit::overwrite(q, seq, {TrackKind::Video, 0}, b);
         const QString project = QString::fromStdString(path("trims/film.montage"));
@@ -7044,6 +7047,27 @@ private slots:
         QCOMPARE(back.active()->trimTargets.size(), size_t(1));
         QCOMPARE(back.active()->videoTracks[0].clips.at(0).trims.at("sdr").params.at("gain").value, 0.8);
         QVERIFY(back.active()->videoTracks[0].clips.at(1).trims.empty());
+
+        // Analyse: each shot's light; Close (no trim of its own) filled, Wide kept; measure_only changes nothing.
+        r = call("montage_trim", {{"action", "analyse"}, {"measure_only", true}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QJsonArray shots = r.value("structuredContent").toObject().value("shots").toArray();
+        QCOMPARE(shots.size(), 2);
+        QVERIFY(shots.at(0).toObject().value("log_average_nits").toDouble() > 0);
+        const QJsonArray closeTrims = shots.at(1).toObject().value("trims").toArray();
+        QVERIFY(!closeTrims.isEmpty() && !closeTrims.at(0).toObject().value("kept_own").toBool());
+        QVERIFY(closeTrims.at(0).toObject().value("values").toObject().value("peak").toDouble() > 280);
+        QVERIFY(!closeTrims.at(0).toObject().value("filled").toBool());  // (measure_only)
+        QVERIFY(call("montage_trim", {{"action", "analyse"}, {"from", 0.5}, {"to", 0.2}}).value("isError").toBool());
+        QVERIFY(loadProject(project.toStdString(), back) && back.active()->videoTracks[0].clips.at(1).trims.empty());
+        QVERIFY(call("montage_trim", {{"action", "analyse"}, {"target", "nope"}}).value("isError").toBool());
+        r = call("montage_trim", {{"action", "analyse"}, {"target", "sdr"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("filled").toDouble(), 1.0);
+        QVERIFY(r.value("structuredContent").toObject().value("shots").toArray().at(1).toObject().value("trims").toArray().at(0).toObject().value("filled").toBool());
+        QVERIFY(loadProject(project.toStdString(), back));
+        QVERIFY(back.active()->videoTracks[0].clips.at(1).trims.count("sdr"));
+        QCOMPARE(back.active()->videoTracks[0].clips.at(0).trims.at("sdr").params.at("gain").value, 0.8);
 
         // montage_render delivers a target (SDR: Rec.709 tags), and refuses one the sequence lacks.
         const QString out = QString::fromStdString(path("trims/sdr.mp4"));
