@@ -246,6 +246,17 @@ void parseLens(QXmlStreamReader& x, Lens& l) {
             x.skipCurrentElement();
             continue;
         }
+        if (n == QLatin1String("center")) {
+            l.centerX = attr(x.attributes(), "x");
+            l.centerY = attr(x.attributes(), "y");
+            x.skipCurrentElement();
+            continue;
+        }
+        if (n == QLatin1String("anamorphic")) {
+            l.squeeze = std::clamp(attr(x.attributes(), "squeeze", 1), 0.25, 4.0);
+            x.skipCurrentElement();
+            continue;
+        }
         const bool translated = !x.attributes().value(QLatin1String("lang")).isEmpty();
         const QString text = x.readElementText().trimmed();
         if (n == QLatin1String("maker")) {
@@ -407,13 +418,15 @@ bool Database::addXml(const std::string& xml, std::string* error) {
     return true;
 }
 
-int Database::addDirectory(const std::string& dir) {
+int Database::addDirectory(const std::string& dir, bool own) {
     int n = 0;
+    const size_t had = lenses_.size();
     const QDir d(QString::fromStdString(dir));
     for (const QString& name : d.entryList({"*.xml"}, QDir::Files, QDir::Name)) {
         QFile f(d.filePath(name));
         if (f.open(QIODevice::ReadOnly) && addXml(f.readAll().toStdString())) ++n;
     }
+    for (size_t i = had; i < lenses_.size(); ++i) lenses_[i].own = own;
     return n;
 }
 
@@ -489,13 +502,15 @@ std::vector<const Lens*> Database::lensesFor(const Camera* camera) const {
 const Lens* Database::fixedLens(const Camera* camera) const {
     if (!camera || std::any_of(mounts_.begin(), mounts_.end(), [&](const Mount& m) { return m.name == camera->mount; }))
         return nullptr;
-    const Lens* found = nullptr;
+    // (The user's own calibration of it first.)
+    const Lens *found = nullptr, *own = nullptr;
+    int count = 0, owned = 0;
     for (const Lens* l : lensesFor(camera))
         if (std::find(l->mounts.begin(), l->mounts.end(), camera->mount) != l->mounts.end()) {
-            if (found) return nullptr;
-            found = l;
+            if (l->own) own = l, ++owned;
+            else found = l, ++count;
         }
-    return found;
+    return owned == 1 ? own : owned == 0 && count == 1 ? found : nullptr;
 }
 
 const Camera* Database::camera(const std::string& name) const {
@@ -585,6 +600,15 @@ std::string lensXml(const Lens& l) {
     if (l.minAperture > 0) {
         w.writeEmptyElement("aperture");
         w.writeAttribute("min", num(l.minAperture));
+    }
+    if (l.centerX != 0 || l.centerY != 0) {
+        w.writeEmptyElement("center");
+        w.writeAttribute("x", num(l.centerX));
+        w.writeAttribute("y", num(l.centerY));
+    }
+    if (l.squeeze != 1) {
+        w.writeEmptyElement("anamorphic");  // (Montage's own: lensfun has no anamorphic lenses)
+        w.writeAttribute("squeeze", num(l.squeeze));
     }
     for (const Calibration& c : l.calibrations) {
         w.writeStartElement("calibration");
@@ -738,10 +762,12 @@ bool interpolateVignetting(const Lens& lens, double crop, double focal, double a
 Correction::Correction(const Lens& lens, const Settings& s, int width, int height) {
     width = std::max(width, 1);
     height = std::max(height, 1);
-    cx_ = width / 2.0;
-    cy_ = height / 2.0;
     // Sizes as lensfun measures them, between the outer pixels' centres.
     const double w = std::max(width - 1, 1), h = std::max(height - 1, 1);
+    // The lens's centre: lensfun's offset from the frame's middle, in halves of its shorter side.
+    cx_ = width / 2.0 + lens.centerX * std::min(w, h) / 2;
+    cy_ = height / 2.0 + lens.centerY * std::min(w, h) / 2;
+    squeeze_ = lens.squeeze > 0 ? lens.squeeze : 1;
     // The lens's own sensor (its first calibration's): what the units are measured on.
     const double calCrop = lens.cropFactor > 0 ? lens.cropFactor : 1;
     const double calAspect = lens.aspectRatio > 0 ? lens.aspectRatio : 1.5;
@@ -785,7 +811,8 @@ Correction::Correction(const Lens& lens, const Settings& s, int width, int heigh
     // a frame edge's point comes from inside the recorded frame (or the recorded frame's edge is reached first).
     scale_ = 1;
     if (s.fit != Settings::None && (distortion_ || tca_ || rectilinear_)) {
-        const double hx = cx_ * unit_, hy = cy_ * unit_;
+        // (from the lens's centre to the furthest edges, an anamorphic frame's width as the lens drew it)
+        const double hx = std::max(cx_, width - cx_) * unit_ * squeeze_, hy = std::max(cy_, height - cy_) * unit_;
         // How far past the recorded frame's edge (+) or inside it (-) the frame edge's points come from, at worst
         // (fill: the most outside; whole: the most inside).
         auto worst = [&](double scale) {
@@ -845,6 +872,22 @@ Correction::Correction(const Lens& lens, const Settings& s, int width, int heigh
         }
     }
     scale_ *= s.scale > 0 ? s.scale : 1;
+
+    // How far out (corrected, calibration units) the green's source radius still rises: `corrected` looks no further.
+    if (geometric()) {
+        const double far = 8 * std::hypot(std::max(cx_, width - cx_) * unit_ * squeeze_, std::max(cy_, height - cy_) * unit_);
+        const int steps = 8192;
+        double was = sourceRadius(0, 1);
+        rising_ = far;
+        for (int i = 1; i <= steps; ++i) {
+            const double r = far * i / steps, now = sourceRadius(r, 1);
+            if (!(now > was)) {
+                rising_ = far * (i - 1) / steps;
+                break;
+            }
+            was = now;
+        }
+    }
 }
 
 double Correction::fisheyeRadius(double r) const {
@@ -886,18 +929,62 @@ double Correction::radius(double r, int channel) const {
 double Correction::sourceRadius(double r, int channel) const { return radius(r / scale_, channel); }
 
 void Correction::source(double x, double y, double rgb[6]) const {
-    const double dx = (x - cx_) * unit_, dy = (y - cy_) * unit_;
+    const double dx = (x - cx_) * unit_ * squeeze_, dy = (y - cy_) * unit_;
     const double r = std::hypot(dx, dy);
     for (int ch = 0; ch < 3; ++ch) {
         const double f = r > 1e-12 ? sourceRadius(r, ch) / r : 1 / scale_;
-        rgb[ch * 2] = cx_ + dx * f / unit_;
+        rgb[ch * 2] = cx_ + dx * f / (unit_ * squeeze_);
         rgb[ch * 2 + 1] = cy_ + dy * f / unit_;
     }
 }
 
+bool Correction::corrected(double x, double y, double& cx, double& cy) const {
+    const double dx = (x - cx_) * unit_ * squeeze_, dy = (y - cy_) * unit_;
+    const double rd = std::hypot(dx, dy);
+    if (rd < 1e-12) {
+        cx = cx_, cy = cy_;
+        return true;
+    }
+    // The corrected radius whose green comes from rd: Newton's method from rd itself, then bisection if it strays
+    // (the correction rises with the radius over the part that means anything).
+    auto f = [&](double r) { return sourceRadius(r, 1) - rd; };
+    double r = rd * scale_;
+    bool ok = false;
+    for (int i = 0; i < 30; ++i) {
+        const double e = f(r), h = std::max(1e-9, r * 1e-6), d = (f(r + h) - e) / h;
+        if (std::fabs(e) < 1e-12) {
+            ok = true;
+            break;
+        }
+        if (!(d > 0)) break;
+        const double next = r - e / d;
+        if (!(next > 0)) break;
+        if (std::fabs(next - r) < 1e-13 * std::max(1.0, r)) {
+            r = next;
+            ok = true;
+            break;
+        }
+        r = next;
+    }
+    // (Past where the source radius turns back, a root means nothing: the picture there comes from nowhere.)
+    if (!ok || std::fabs(f(r)) > 1e-9 || r > rising_) {
+        double lo = 0, hi = std::max(rd, 1e-6);
+        for (int i = 0; i < 64 && f(hi) < 0 && hi < rising_; ++i) hi = std::min(hi * 2, rising_);
+        if (f(hi) < 0) return false;
+        for (int i = 0; i < 100; ++i) {
+            const double m = (lo + hi) / 2;
+            (f(m) < 0 ? lo : hi) = m;
+        }
+        r = (lo + hi) / 2;
+    }
+    cx = cx_ + dx * (r / rd) / (unit_ * squeeze_);
+    cy = cy_ + dy * (r / rd) / unit_;
+    return true;
+}
+
 double Correction::falloff(double x, double y) const {
     if (!vignetting_) return 1;
-    const double r = std::hypot(x - cx_, y - cy_) * unit_ / vigUnit_, r2 = r * r;
+    const double r = std::hypot((x - cx_) * squeeze_, y - cy_) * unit_ / vigUnit_, r2 = r * r;
     const double c = 1 + vig_.k[0] * r2 + vig_.k[1] * r2 * r2 + vig_.k[2] * r2 * r2 * r2;
     return std::max(c, 0.05);
 }

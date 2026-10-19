@@ -207,11 +207,12 @@ bool ensureLipSyncModels(QWidget* parent) {
 
 bool ensureEffectModel(QWidget* parent, const std::string& type) {
     if (type == "lens_correction") {
-        if (lensDatabase()) return true;
+        if (lensfunDatabaseFound()) return true;
         const bool ok = ensureModelPack(parent, lensDatabasePack(), QObject::tr("Lens Correction"),
                                         QObject::tr("Lens Correction uses lensfun's database of lens profiles (CC BY-SA 3.0)."));
         reloadLensDatabase();
-        return ok && lensDatabase();
+        // (Lenses the user calibrated serve without it.)
+        return (ok || lensDatabase()) && lensDatabase();
     }
     if (type == "super_scale") {
         if (!upscalerAvailable()) {

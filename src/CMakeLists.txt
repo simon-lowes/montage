@@ -6,6 +6,7 @@ add_library(montage_engine STATIC
   core/KeyframeEdit.h core/KeyframeEdit.cpp
   core/MaskPath.h core/MaskPath.cpp
   core/ColorWarp.h core/ColorWarp.cpp
+  core/LinearSolve.h core/LinearSolve.cpp
   core/ObjectMask.h core/ObjectMask.cpp
   core/VisualIndex.h core/VisualIndex.cpp
   core/AutoTag.h core/AutoTag.cpp
@@ -123,6 +124,7 @@ add_library(montage_engine STATIC
   media/ModelFiles.h media/ModelFiles.cpp
   media/Sofa.h media/Sofa.cpp
   media/LensDatabase.h media/LensDatabase.cpp
+  media/LensCalibration.h media/LensCalibration.cpp
   media/Segmenter.h media/Segmenter.cpp
   media/Diarizer.h media/Diarizer.cpp
   media/VisualSearch.h media/VisualSearch.cpp

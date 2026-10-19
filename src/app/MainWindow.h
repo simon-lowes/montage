@@ -126,6 +126,9 @@ public:
     // Clip › Correct Lens…: the selected clip's (or the one at the playhead's) lens profile chosen and its Lens
     // Correction put on (app/LensCorrectionDialog.h; tests reach the dialog through lensDialogHook()).
     bool correctLens();
+    // Clip › Calibrate Lens…: a lens profile made from the clip (a checkerboard in it, or lines drawn on its frame),
+    // saved and applied (app/LensCalibrationDialog.h; tests reach the dialog through lensCalibrationDialogHook()).
+    bool calibrateLens();
     // Split-screen compare in the Program monitor: the reference beside the current frame.
     void setCompareWithReference(bool on);
     void scriptCutDialog();  // Sequence › Build Cut from Script…

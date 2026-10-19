@@ -3,6 +3,7 @@
 // (distortion, transverse chromatic aberration, vignetting, a fisheye's projection) computed as lensfun computes it.
 #pragma once
 
+#include <cfloat>
 #include <memory>
 #include <string>
 #include <vector>
@@ -61,7 +62,13 @@ struct Lens {
     double cropFactor = 0, aspectRatio = 1.5;
     double minFocal = 0, maxFocal = 0;  // from <focal>, else the calibrations' range
     double minAperture = 0;             // widest f-number, when given
+    // The lens's centre against the frame's middle, in halves of the frame's shorter side (lensfun's <center>; down
+    // and right positive), and an anamorphic lens's squeeze (Montage's own <anamorphic>): the recorded picture is that
+    // much narrower than the lens drew it, so its distortion is radial only once widened again.
+    double centerX = 0, centerY = 0;
+    double squeeze = 1;
     std::vector<Calibration> calibrations;
+    bool own = false;  // one the user calibrated (read from their lens folder)
     bool calibrated() const;
 };
 
@@ -74,8 +81,8 @@ class Database {
 public:
     // One database file's contents (lensfun's <lensdatabase>, version 1 or 2); false and why when it is not one.
     bool addXml(const std::string& xml, std::string* error = nullptr);
-    // Every .xml file in `dir`; the number read.
-    int addDirectory(const std::string& dir);
+    // Every .xml file in `dir`; the number read. `own`: the user's own lenses (preferred for a fixed-lens camera).
+    int addDirectory(const std::string& dir, bool own = false);
 
     const std::vector<Camera>& cameras() const { return cameras_; }
     const std::vector<Lens>& lenses() const { return lenses_; }
@@ -88,7 +95,7 @@ public:
     // adapter; only calibrated lenses. Every calibrated lens when `camera` is null.
     std::vector<const Lens*> lensesFor(const Camera* camera) const;
     // A fixed-lens camera's lens (a compact's, an action camera's, a drone's, a phone's): its mount is its own (not one
-    // the database lists for interchangeable lenses) and one lens is on it; else null.
+    // the database lists for interchangeable lenses) and one lens is on it (or one of the user's own); else null.
     const Lens* fixedLens(const Camera* camera) const;
     // By name as cameraName and lensName give it (or the words of one).
     const Camera* camera(const std::string& name) const;
@@ -142,6 +149,15 @@ public:
     // For the corrected frame's position (x, y) (pixels, their centres at +0.5): where its red, green and blue come
     // from in the recorded frame, as x, y pairs.
     void source(double x, double y, double rgb[6]) const;
+    // The other way (green): the corrected frame's position whose picture comes from the recorded frame's (x, y);
+    // false where none does.
+    bool corrected(double x, double y, double& cx, double& cy) const;
+    // The lens's centre in the frame (pixels, as `source`), and calibration units per pixel (down the frame; across,
+    // times the squeeze).
+    double centerX() const { return cx_; }
+    double centerY() const { return cy_; }
+    double unit() const { return unit_; }
+    double squeeze() const { return squeeze_; }
     // The radius in the recorded frame (calibration units) a corrected radius comes from, for one channel (0..2).
     double sourceRadius(double r, int channel = 1) const;
     // How much darker the recorded frame is at (x, y) than in its middle (divide linear light by it).
@@ -149,6 +165,7 @@ public:
 
 private:
     double cx_ = 0, cy_ = 0, unit_ = 1;  // middle in pixels, calibration units per pixel
+    double squeeze_ = 1;
     double crop_ = 0;
     bool distortion_ = false, tca_ = false, vignetting_ = false, rectilinear_ = false;
     Distortion dist_;
@@ -158,6 +175,7 @@ private:
     double focal_ = 1;      // in calibration units, for the projection
     double vigUnit_ = 1;    // calibration units per vignetting unit
     double scale_ = 1;
+    double rising_ = DBL_MAX;  // the corrected radius the green's source radius rises to (`corrected` stays inside)
     double radius(double r, int channel) const;  // sourceRadius before the scale
     double distort(double ru) const;
     double fisheyeRadius(double rRect) const;
