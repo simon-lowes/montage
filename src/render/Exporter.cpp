@@ -2550,11 +2550,13 @@ bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::
     if (img.empty()) return fail("Nothing to render at this frame");
     StillResult res;
     res.colorSpace = space->id;
-    if (space->hdr() && jpeg) {
+    const bool gainMap = space->hdr() && (jpeg || (avif && options.gainMap));
+    if (gainMap) {
         res.bits = 8;
-        res.gainMap = true;  // (a JPEG states no light levels)
-    } else if (space->hdr()) {
-        res.bits = avif ? 10 : 16;
+        res.gainMap = true;
+    }
+    if (space->hdr() && !jpeg) {  // (a JPEG states no light levels)
+        if (!gainMap) res.bits = avif ? 10 : 16;
         LightLevels l;
         if (ro.trimTarget.empty() && seq.hdrMaxCll > 0) {
             l.maxCll = seq.hdrMaxCll;
@@ -2566,11 +2568,7 @@ bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::
         hdr10LightLevels(l, cll, fall);
         res.maxCll = cll, res.maxFall = fall;
     }
-    if (avif) {
-        bool stated = false;
-        if (!writeAvifStill(img, *space, options.quality, peak, res.maxCll, res.maxFall, path, error, &stated)) return false;
-        if (!stated) res.maxCll = res.maxFall = 0;
-    } else if (space->hdr() && jpeg) {
+    if (gainMap) {
         // The SDR rendition as the base (the SDR trim, else the viewer's tone mapping), the map to this one.
         RenderOptions sro;
         sro.highQuality = true;
@@ -2579,12 +2577,18 @@ bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::
         if (!stillRendition(seq, "", sro, sdrSpace, sdrPeak, error)) return false;
         if (sdrSpace->hdr()) sro.displaySpace = rec709Space().id, sdrSpace = &rec709Space();
         Image sdr = renderProgramFrame(p, seq, t, sro);
-        // A JPEG says Display P3 (its ICC profile) or nothing (sRGB): a trim to other primaries goes into Rec.709.
+        // A gain map's base says Rec.709 or Display P3: a trim to other primaries goes into Rec.709.
         if (sdrSpace->primaries != Primaries::Bt709 && sdrSpace->primaries != Primaries::P3D65) {
             convertColor(sdr, *sdrSpace, rec709Space(), sdrPeak);
             sdrSpace = &rec709Space();
         }
-        if (!writeGainMapJpeg(sdr, *sdrSpace, img, *space, options.quality, path, error)) return false;
+        if (jpeg ? !writeGainMapJpeg(sdr, *sdrSpace, img, *space, options.quality, path, error)
+                 : !writeGainMapAvif(sdr, *sdrSpace, img, *space, options.quality, res.maxCll, res.maxFall, path, error))
+            return false;
+    } else if (avif) {
+        bool stated = false;
+        if (!writeAvifStill(img, *space, options.quality, peak, res.maxCll, res.maxFall, path, error, &stated)) return false;
+        if (!stated) res.maxCll = res.maxFall = 0;
     } else if (space->hdr()) {
         if (!writeHdrPng(img, *space, peak, res.maxCll, res.maxFall, path, error)) return false;
     } else {

@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <mutex>
 #include <vector>
 
@@ -21,6 +22,7 @@
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
 }
 
 namespace montage {
@@ -35,6 +37,12 @@ const QByteArray kMpfSignature("MPF\0", 4);
 double srgbToLinear(double v) {
     v = std::clamp(v, 0.0, 1.0);
     return v <= 0.04045 ? v / 12.92 : std::pow((v + 0.055) / 1.055, 2.4);
+}
+
+// BT.709's inverse OETF (libavif's reading of a picture tagged with BT.709's transfer).
+double bt709ToLinear(double v) {
+    v = std::clamp(v, 0.0, 1.0);
+    return v < 4.5 * 0.018053968510807 ? v / 4.5 : std::pow((v + 0.09929682680944) / 1.09929682680944, 1 / 0.45);
 }
 
 uint32_t be32(const QByteArray& b, qsizetype at) {
@@ -373,10 +381,11 @@ bool readGainMapJpeg(const std::string& path, GainMapJpeg& out) {
 
 namespace {
 
-// Each row of the HDR rendition of `base` (RGB32) and `map` (Grayscale8 or RGB888): linear light relative to SDR white,
-// three values a pixel in the base's primaries, handed to `row(y, values)` (rows in parallel).
+// Each row of the HDR rendition of `base` (RGB32; sRGB's curve, else BT.709's) and `map` (Grayscale8 or RGB888): linear
+// light relative to SDR white, three values a pixel in the base's primaries, handed to `row(y, values)` (rows in
+// parallel).
 template <typename Row>
-void gainedRows(const QImage& b, const QImage& g, const GainMapMetadata& m, double headroom, const Row& row) {
+void gainedRows(const QImage& b, bool bt709Curve, const QImage& g, const GainMapMetadata& m, double headroom, const Row& row) {
     const int W = b.width(), H = b.height(), mw = g.width(), mh = g.height(), step = g.format() == QImage::Format_Grayscale8 ? 1 : 3;
     if (W <= 0 || H <= 0 || mw <= 0 || mh <= 0) return;
     // How much of the map applies: all of it from its capacity's maximum up.
@@ -392,7 +401,7 @@ void gainedRows(const QImage& b, const QImage& g, const GainMapMetadata& m, doub
             gain[c][v] = std::exp2((m.gainMapMin[c] + (m.gainMapMax[c] - m.gainMapMin[c]) * t) * weight);
         }
     double lin[256];
-    for (int v = 0; v < 256; ++v) lin[v] = srgbToLinear(v / 255.0);
+    for (int v = 0; v < 256; ++v) lin[v] = bt709Curve ? bt709ToLinear(v / 255.0) : srgbToLinear(v / 255.0);
     parallelRows(H, [&](int y0, int y1) {
         std::vector<double> out(size_t(W) * 3);
         for (int y = y0; y < y1; ++y) {
@@ -427,50 +436,8 @@ QImage asMap(const QImage& q) {
     return q.format() == QImage::Format_Grayscale8 || q.format() == QImage::Format_RGB888 ? q : q.convertToFormat(QImage::Format_RGB888);
 }
 
-}  // namespace
-
-void applyGainMap(const QImage& base, const QImage& map, const GainMapMetadata& m, Image& linear, double headroom) {
-    const QImage b = asRgb32(base), g = asMap(map);
-    linear = Image(b.width(), b.height(), Image::Uninitialized{});
-    gainedRows(b, g, m, headroom, [&](int y, const double* v) {
-        float* d = linear.row(y);
-        for (int x = 0; x < b.width(); ++x, v += 3, d += 4) d[0] = float(v[0]), d[1] = float(v[1]), d[2] = float(v[2]), d[3] = 1;
-    });
-}
-
-std::shared_ptr<const GainMapPicture> decodeGainMapJpeg(const std::string& path, std::string* error) {
-    auto fail = [&](const std::string& why) {
-        if (error) *error = why;
-        return std::shared_ptr<const GainMapPicture>();
-    };
-    // Decoded once per version of the file (decoders open it again and again: the media pool, thumbnails); the last
-    // two kept, as a picture is large.
-    static std::mutex lock;
-    static std::deque<std::pair<std::string, std::shared_ptr<const GainMapPicture>>> known;
-    const QFileInfo fi(QString::fromStdString(path));
-    const std::string key = path + '|' + std::to_string(fi.size()) + '|' + std::to_string(fi.lastModified().toMSecsSinceEpoch());
-    {
-        std::lock_guard<std::mutex> g(lock);
-        for (const auto& [k, picture] : known)
-            if (k == key) return picture;
-    }
-    GainMapJpeg info;
-    if (!readGainMapJpeg(path, info)) return fail("No gain map in " + path);
-    if (info.metadata.baseIsHdr) return fail("A gain map to SDR from an HDR base is not read");
-    QFile f(QString::fromStdString(path));
-    if (!f.open(QIODevice::ReadOnly)) return fail("Cannot read " + path);
-    QImage base = asRgb32(QImage::fromData(f.read(info.mapOffset), "JPEG"));
-    const QImage map = asMap(f.seek(info.mapOffset) ? QImage::fromData(f.read(info.mapLength), "JPEG") : QImage());
-    if (base.isNull() || map.isNull()) return fail("Cannot decode " + path + " (too large, or damaged)");
-    // Into BT.2020 (from the base's primaries: Display P3 or sRGB's; a picture in others is put into Display P3 first)
-    // and PQ.
-    Primaries from = Primaries::Bt709;
-    if (const QColorSpace cs = base.colorSpace(); cs.isValid() && cs.primaries() == QColorSpace::Primaries::DciP3D65) {
-        from = Primaries::P3D65;
-    } else if (cs.isValid() && cs.primaries() != QColorSpace::Primaries::SRgb) {
-        base.convertToColorSpace(QColorSpace(QColorSpace::DisplayP3));
-        from = Primaries::P3D65;
-    }
+// The HDR rendition at full boost as 16-bit PQ (BT.2020) code values, from the base's primaries.
+std::shared_ptr<GainMapPicture> hdrRendition(const QImage& base, bool bt709Curve, Primaries from, const QImage& map, const GainMapMetadata& meta) {
     double m[9];
     primariesMatrix(from, Primaries::Bt2020, m);
     const ColorSpace& space = *findColorSpace("rec2100pq");
@@ -479,7 +446,7 @@ std::shared_ptr<const GainMapPicture> decodeGainMapJpeg(const std::string& path,
     out->height = base.height();
     out->rgba.resize(size_t(out->width) * size_t(out->height) * 4);
     std::vector<double> peaks(size_t(out->height), 0.0);
-    gainedRows(base, map, info.metadata, 1e9, [&](int y, const double* s) {
+    gainedRows(base, bt709Curve, map, meta, 1e9, [&](int y, const double* s) {
         uint16_t* d = out->rgba.data() + size_t(y) * size_t(out->width) * 4;
         for (int x = 0; x < out->width; ++x, s += 3, d += 4) {
             double v[3] = {s[0], s[1], s[2]};
@@ -492,45 +459,82 @@ std::shared_ptr<const GainMapPicture> decodeGainMapJpeg(const std::string& path,
             d[3] = 65535;
         }
     });
-    out->maxNits = *std::max_element(peaks.begin(), peaks.end());
+    out->maxNits = out->height > 0 ? *std::max_element(peaks.begin(), peaks.end()) : 0;
+    return out;
+}
+
+// A file's HDR rendition decoded once per version of it (decoders open it again and again: the media pool,
+// thumbnails); the last two kept, as a picture is large.
+std::shared_ptr<const GainMapPicture> cachedRendition(const std::string& path,
+                                                      const std::function<std::shared_ptr<const GainMapPicture>()>& decode) {
+    static std::mutex lock;
+    static std::deque<std::pair<std::string, std::shared_ptr<const GainMapPicture>>> known;
+    const QFileInfo fi(QString::fromStdString(path));
+    const std::string key = path + '|' + std::to_string(fi.size()) + '|' + std::to_string(fi.lastModified().toMSecsSinceEpoch());
+    {
+        std::lock_guard<std::mutex> g(lock);
+        for (const auto& [k, picture] : known)
+            if (k == key) return picture;
+    }
+    std::shared_ptr<const GainMapPicture> out = decode();
+    if (!out) return out;
     std::lock_guard<std::mutex> g(lock);
     known.emplace_back(key, out);
     if (known.size() > 2) known.pop_front();
     return out;
 }
 
-bool writeGainMapJpeg(const Image& sdr, const ColorSpace& sdrSpace, const Image& hdr, const ColorSpace& hdrSpace, int quality,
-                      const std::string& path, std::string* error, GainMapMetadata* written) {
-    auto fail = [&](const std::string& why) {
-        if (error) *error = why;
-        return false;
-    };
-    if (sdr.empty() || sdr.width != hdr.width || sdr.height != hdr.height) return fail("Nothing to write");
-    if (!hdrSpace.hdr() || sdrSpace.hdr()) return fail("A gain map needs an SDR picture and an HDR one");
-    if (sdrSpace.primaries != Primaries::Bt709 && sdrSpace.primaries != Primaries::P3D65)
-        return fail("The SDR picture of a gain-map JPEG is in Rec.709 or Display P3 primaries");
-    const int W = sdr.width, H = sdr.height;
+}  // namespace
 
-    // The base, encoded first: the map is made against what decoders will see of it.
-    QImage base(W, H, QImage::Format_RGBA8888);
-    toRgba8(sdr, base.bits(), size_t(base.bytesPerLine()));
-    base = base.convertToFormat(QImage::Format_RGB888);
-    const bool p3 = sdrSpace.primaries == Primaries::P3D65;
-    if (p3) base.setColorSpace(QColorSpace(QColorSpace::DisplayP3));
-    const QByteArray baseJpeg = jpegBytes(base, quality);
-    const QImage seen = QImage::fromData(baseJpeg, "JPEG").convertToFormat(QImage::Format_RGB888);
-    if (baseJpeg.isEmpty() || seen.width() != W || seen.height() != H) return fail("Cannot encode the JPEG");
+void applyGainMap(const QImage& base, const QImage& map, const GainMapMetadata& m, Image& linear, double headroom) {
+    const QImage b = asRgb32(base), g = asMap(map);
+    linear = Image(b.width(), b.height(), Image::Uninitialized{});
+    gainedRows(b, false, g, m, headroom, [&](int y, const double* v) {
+        float* d = linear.row(y);
+        for (int x = 0; x < b.width(); ++x, v += 3, d += 4) d[0] = float(v[0]), d[1] = float(v[1]), d[2] = float(v[2]), d[3] = 1;
+    });
+}
 
+std::shared_ptr<const GainMapPicture> decodeGainMapJpeg(const std::string& path, std::string* error) {
+    std::string why;
+    auto out = cachedRendition(path, [&]() -> std::shared_ptr<const GainMapPicture> {
+        GainMapJpeg info;
+        if (!readGainMapJpeg(path, info)) return why = "No gain map in " + path, nullptr;
+        if (info.metadata.baseIsHdr) return why = "A gain map to SDR from an HDR base is not read", nullptr;
+        QFile f(QString::fromStdString(path));
+        if (!f.open(QIODevice::ReadOnly)) return why = "Cannot read " + path, nullptr;
+        QImage base = asRgb32(QImage::fromData(f.read(info.mapOffset), "JPEG"));
+        const QImage map = asMap(f.seek(info.mapOffset) ? QImage::fromData(f.read(info.mapLength), "JPEG") : QImage());
+        if (base.isNull() || map.isNull()) return why = "Cannot decode " + path + " (too large, or damaged)", nullptr;
+        // From the base's primaries: Display P3 or sRGB's; a picture in others is put into Display P3 first.
+        Primaries from = Primaries::Bt709;
+        if (const QColorSpace cs = base.colorSpace(); cs.isValid() && cs.primaries() == QColorSpace::Primaries::DciP3D65) {
+            from = Primaries::P3D65;
+        } else if (cs.isValid() && cs.primaries() != QColorSpace::Primaries::SRgb) {
+            base.convertToColorSpace(QColorSpace(QColorSpace::DisplayP3));
+            from = Primaries::P3D65;
+        }
+        return hdrRendition(base, false, from, map, info.metadata);
+    });
+    if (!out && error) *error = why;
+    return out;
+}
+
+bool planGainMap(const QImage& seen, Primaries basePrimaries, const Image& hdr, const ColorSpace& hdrSpace, GainMapMetadata& meta,
+                 std::vector<float>& target) {
+    const QImage base = seen.convertToFormat(QImage::Format_RGB888);
+    const int W = base.width(), H = base.height();
+    if (W != hdr.width || H != hdr.height || W <= 0 || H <= 0) return false;
     // Each pixel's gain (log2, per channel) from the base to the HDR rendition, in the base's primaries.
     double m[9];
-    primariesMatrix(hdrSpace.primaries, p3 ? Primaries::P3D65 : Primaries::Bt709, m);
-    GainMapMetadata meta;
+    primariesMatrix(hdrSpace.primaries, basePrimaries, m);
+    meta = GainMapMetadata();
     const double off = 1 / 64.0;
     std::vector<float> gains(size_t(W) * H * 3);
     std::vector<double> lo(size_t(H), 1e9), hi(size_t(H), -1e9);
     parallelRows(H, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
-            const uchar* s = seen.constScanLine(y);
+            const uchar* s = base.constScanLine(y);
             const float* h = hdr.row(y);
             float* g = gains.data() + size_t(y) * W * 3;
             for (int x = 0; x < W; ++x, s += 3, h += 4, g += 3) {
@@ -556,12 +560,17 @@ bool writeGainMapJpeg(const Image& sdr, const ColorSpace& sdrSpace, const Image&
     }
     meta.hdrCapacityMin = 0;
     meta.hdrCapacityMax = std::max(gmax, 1e-3);
+    target.resize(gains.size());
+    for (size_t i = 0; i < gains.size(); ++i) target[i] = float(std::clamp((gains[i] - gmin) / (gmax - gmin), 0.0, 1.0) * 255);
+    return true;
+}
 
-    // The map in 8 bits. JPEG's Y'CbCr rounds each channel by a code value or so, a percent of light at this range, so
+QByteArray encodeGainMap(const std::vector<float>& target, int W, int H, const std::function<QByteArray(const QImage&, QImage&)>& roundTrip) {
+    // An encoder's Y'CbCr and quantising move each channel by a code value or so, a percent of light at this range, so
     // what a decoder will read back is fed back into the codes asked for (twice), keeping the closest.
-    std::vector<float> target(gains.size()), ask(gains.size());
-    for (size_t i = 0; i < gains.size(); ++i) ask[i] = target[i] = float(std::clamp((gains[i] - gmin) / (gmax - gmin), 0.0, 1.0) * 255);
-    QByteArray mapJpeg;
+    if (target.size() != size_t(W) * size_t(H) * 3) return {};
+    std::vector<float> ask = target;
+    QByteArray out;
     double best = 1e300;
     for (int pass = 0; pass < 3; ++pass) {
         QImage map(W, H, QImage::Format_RGB888);
@@ -570,8 +579,9 @@ bool writeGainMapJpeg(const Image& sdr, const ColorSpace& sdrSpace, const Image&
             const float* a = ask.data() + size_t(y) * W * 3;
             for (int i = 0; i < W * 3; ++i) d[i] = uchar(std::clamp(std::lround(a[i]), 0L, 255L));
         }
-        const QByteArray bytes = jpeg444(map, quality >= 95 ? 1 : 2);
-        const QImage back = QImage::fromData(bytes, "JPEG").convertToFormat(QImage::Format_RGB888);
+        QImage back;
+        const QByteArray bytes = roundTrip(map, back);
+        back = back.convertToFormat(QImage::Format_RGB888);
         if (bytes.isEmpty() || back.size() != map.size()) break;
         double error = 0;
         for (int y = 0; y < H; ++y) {
@@ -583,19 +593,402 @@ bool writeGainMapJpeg(const Image& sdr, const ColorSpace& sdrSpace, const Image&
                 ask[row + size_t(i)] = std::clamp(ask[row + size_t(i)] + e, -8.0f, 263.0f);
             }
         }
-        if (error < best) best = error, mapJpeg = bytes;
+        if (error < best) best = error, out = bytes;
     }
+    return out;
+}
+
+QByteArray isoGainMapMetadata(const GainMapMetadata& m) { return isoMetadata(m); }
+
+QByteArray adobeGainMapXmp(const GainMapMetadata& m) {
+    QByteArray xmp = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Montage\">"
+                     "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">"
+                     "<rdf:Description xmlns:hdrgm=\"http://ns.adobe.com/hdr-gain-map/1.0/\" hdrgm:Version=\"1.0\"";
+    xmp += " hdrgm:GainMapMin=\"" + number(m.gainMapMin[0]) + "\" hdrgm:GainMapMax=\"" + number(m.gainMapMax[0]) + "\"";
+    xmp += " hdrgm:Gamma=\"" + number(m.gamma[0]) + "\"";
+    xmp += " hdrgm:OffsetSDR=\"" + number(m.offsetSdr[0]) + "\" hdrgm:OffsetHDR=\"" + number(m.offsetHdr[0]) + "\"";
+    xmp += " hdrgm:HDRCapacityMin=\"" + number(m.hdrCapacityMin) + "\" hdrgm:HDRCapacityMax=\"" + number(m.hdrCapacityMax) + "\"";
+    xmp += QByteArray(" hdrgm:BaseRenditionIsHDR=\"") + (m.baseIsHdr ? "True" : "False") + "\"/></rdf:RDF></x:xmpmeta>";
+    return xmp;
+}
+
+// AVIF (HEIF) with a gain map: a tone-mapped derived item ('tmap', whose data is ISO 21496-1's metadata after a version
+// byte) made from the base picture and the gain map ('dimg', in that order), the base the primary item.
+namespace {
+
+struct HeifBox {
+    qint64 at = 0, size = 0, body = 0;
+    QByteArray type;
+    qint64 end() const { return at + size; }
+};
+bool heifBoxes(const QByteArray& b, qint64 from, qint64 to, std::vector<HeifBox>& out) {
+    out.clear();
+    while (from < to && out.size() < 10000) {
+        if (to - from < 8) return false;
+        uint64_t size = be32(b, from);
+        qint64 head = 8;
+        if (size == 1) {
+            if (to - from < 16) return false;
+            size = uint64_t(be32(b, from + 8)) << 32 | be32(b, from + 12);
+            head = 16;
+        } else if (size == 0) {
+            size = uint64_t(to - from);
+        }
+        if (size < uint64_t(head) || size > uint64_t(to - from)) return false;
+        out.push_back({from, qint64(size), from + head, b.mid(from + 4, 4)});
+        from += qint64(size);
+    }
+    return from == to;
+}
+const HeifBox* heifFind(const std::vector<HeifBox>& list, const char* type) {
+    for (const HeifBox& x : list)
+        if (x.type == type) return &x;
+    return nullptr;
+}
+uint64_t beN(const QByteArray& b, qint64 at, int bytes) {
+    uint64_t v = 0;
+    for (int i = 0; i < bytes; ++i) v = v << 8 | uint8_t(b[at + i]);
+    return v;
+}
+
+struct AvifItem {
+    uint32_t id = 0;
+    QByteArray type;
+    int method = 0;  // where its data is: 0 the file, 1 the meta box's idat
+    uint64_t base = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> extents;  // offset, length
+    std::vector<QByteArray> properties;                  // its property boxes, whole, in order
+    std::vector<uint32_t> dimg;                          // the items it is derived from
+};
+struct AvifFile {
+    uint32_t primary = 0;
+    std::vector<AvifItem> items;
+    QByteArray idat;
+    const AvifItem* item(uint32_t id) const {
+        for (const AvifItem& i : items)
+            if (i.id == id) return &i;
+        return nullptr;
+    }
+};
+const QByteArray* property(const AvifItem& item, const char* type) {
+    for (const QByteArray& p : item.properties)
+        if (p.size() >= 8 && p.mid(4, 4) == type) return &p;
+    return nullptr;
+}
+
+// An AVIF's items: its meta box read (the top-level boxes skipped by their sizes, so the pictures are not read).
+bool readAvifFile(QFile& f, AvifFile& out) {
+    out = AvifFile();
+    QByteArray meta;
+    for (qint64 at = 0; at + 8 <= f.size() && meta.isEmpty();) {
+        if (!f.seek(at)) return false;
+        const QByteArray head = f.read(16);
+        if (head.size() < 8) return false;
+        uint64_t size = be32(head, 0);
+        if (size == 1 && head.size() == 16) size = uint64_t(be32(head, 8)) << 32 | be32(head, 12);
+        else if (size == 0) size = uint64_t(f.size() - at);
+        if (size < 8 || size > uint64_t(f.size() - at)) return false;
+        if (at == 0 && head.mid(4, 4) != "ftyp") return false;
+        if (head.mid(4, 4) == "meta") {
+            if (size > (16u << 20) || !f.seek(at)) return false;
+            meta = f.read(qint64(size));
+            if (meta.size() != qint64(size)) return false;
+        }
+        at += qint64(size);
+    }
+    std::vector<HeifBox> top, kids;
+    if (meta.isEmpty() || !heifBoxes(meta, 0, meta.size(), top) || top.size() != 1 || top[0].body + 4 > top[0].end() ||
+        !heifBoxes(meta, top[0].body + 4, top[0].end(), kids))  // (a full box)
+        return false;
+    auto byId = [&](uint32_t id) -> AvifItem& {
+        for (AvifItem& i : out.items)
+            if (i.id == id) return i;
+        out.items.push_back({});
+        out.items.back().id = id;
+        return out.items.back();
+    };
+    if (const HeifBox* p = heifFind(kids, "pitm"); p && p->body + 6 <= p->end())
+        out.primary = uint8_t(meta[p->body]) == 0 ? uint32_t(beN(meta, p->body + 4, 2)) : (p->body + 8 <= p->end() ? be32(meta, p->body + 4) : 0);
+    if (const HeifBox* idat = heifFind(kids, "idat")) out.idat = meta.mid(idat->body, idat->end() - idat->body);
+    // Items and their types.
+    const HeifBox* iinf = heifFind(kids, "iinf");
+    if (!iinf || iinf->body + 6 > iinf->end()) return false;
+    const qint64 entriesAt = iinf->body + 4 + (uint8_t(meta[iinf->body]) == 0 ? 2 : 4);
+    std::vector<HeifBox> infes;
+    if (entriesAt > iinf->end() || !heifBoxes(meta, entriesAt, iinf->end(), infes)) return false;
+    for (const HeifBox& e : infes) {
+        if (e.type != "infe" || e.body + 4 > e.end()) continue;
+        const int v = uint8_t(meta[e.body]);
+        if (v < 2) continue;
+        const int idBytes = v == 2 ? 2 : 4;
+        if (e.body + 4 + idBytes + 2 + 4 > e.end()) return false;
+        AvifItem& item = byId(uint32_t(beN(meta, e.body + 4, idBytes)));
+        item.type = meta.mid(e.body + 4 + idBytes + 2, 4);
+    }
+    // Where their data is.
+    if (const HeifBox* iloc = heifFind(kids, "iloc")) {
+        qint64 at = iloc->body;
+        if (at + 8 > iloc->end()) return false;
+        const int v = uint8_t(meta[at]);
+        if (v > 2) return false;
+        const int offsetSize = uint8_t(meta[at + 4]) >> 4, lengthSize = uint8_t(meta[at + 4]) & 15;
+        const int baseSize = uint8_t(meta[at + 5]) >> 4, indexSize = v >= 1 ? uint8_t(meta[at + 5]) & 15 : 0;
+        if (offsetSize > 8 || lengthSize > 8 || baseSize > 8 || indexSize > 8) return false;
+        at += 6;
+        const int idBytes = v < 2 ? 2 : 4;
+        if (at + idBytes > iloc->end()) return false;
+        const uint64_t count = beN(meta, at, idBytes);
+        at += idBytes;
+        for (uint64_t i = 0; i < count; ++i) {
+            if (at + idBytes + (v >= 1 ? 2 : 0) + 2 + baseSize + 2 > iloc->end()) return false;
+            AvifItem& item = byId(uint32_t(beN(meta, at, idBytes)));
+            at += idBytes;
+            if (v >= 1) item.method = int(beN(meta, at, 2) & 15), at += 2;
+            if (beN(meta, at, 2) != 0) item.method = -1;  // (in another file)
+            at += 2;
+            item.base = beN(meta, at, baseSize);
+            at += baseSize;
+            const uint64_t extents = beN(meta, at, 2);
+            at += 2;
+            for (uint64_t e = 0; e < extents; ++e) {
+                if (at + indexSize + offsetSize + lengthSize > iloc->end()) return false;
+                at += indexSize;
+                const uint64_t offset = beN(meta, at, offsetSize), length = beN(meta, at + offsetSize, lengthSize);
+                at += offsetSize + lengthSize;
+                item.extents.push_back({offset, length});
+            }
+        }
+    }
+    // What they are derived from.
+    if (const HeifBox* iref = heifFind(kids, "iref"); iref && iref->body + 4 <= iref->end()) {
+        const int idBytes = uint8_t(meta[iref->body]) == 0 ? 2 : 4;
+        std::vector<HeifBox> refs;
+        if (!heifBoxes(meta, iref->body + 4, iref->end(), refs)) return false;
+        for (const HeifBox& r : refs) {
+            if (r.type != "dimg" || r.body + idBytes + 2 > r.end()) continue;
+            AvifItem& item = byId(uint32_t(beN(meta, r.body, idBytes)));
+            const uint64_t n = beN(meta, r.body + idBytes, 2);
+            if (r.body + idBytes + 2 + qint64(n) * idBytes > r.end()) return false;
+            for (uint64_t k = 0; k < n; ++k) item.dimg.push_back(uint32_t(beN(meta, r.body + idBytes + 2 + qint64(k) * idBytes, idBytes)));
+        }
+    }
+    // Their properties.
+    std::vector<HeifBox> iprp, props;
+    const HeifBox* iprpBox = heifFind(kids, "iprp");
+    if (!iprpBox || !heifBoxes(meta, iprpBox->body, iprpBox->end(), iprp)) return false;
+    const HeifBox *ipco = heifFind(iprp, "ipco"), *ipma = heifFind(iprp, "ipma");
+    if (!ipco || !ipma || !heifBoxes(meta, ipco->body, ipco->end(), props)) return false;
+    qint64 at = ipma->body;
+    if (at + 8 > ipma->end()) return false;
+    const int v = uint8_t(meta[at]);
+    const bool wide = uint8_t(meta[at + 3]) & 1;
+    const uint64_t entries = be32(meta, at + 4);
+    at += 8;
+    for (uint64_t e = 0; e < entries; ++e) {
+        const int idBytes = v < 1 ? 2 : 4;
+        if (at + idBytes + 1 > ipma->end()) return false;
+        AvifItem& item = byId(uint32_t(beN(meta, at, idBytes)));
+        const int n = uint8_t(meta[at + idBytes]);
+        at += idBytes + 1;
+        if (at + qint64(n) * (wide ? 2 : 1) > ipma->end()) return false;
+        for (int k = 0; k < n; ++k) {
+            const unsigned index = wide ? unsigned(beN(meta, at, 2) & 0x7fff) : unsigned(uint8_t(meta[at]) & 0x7f);
+            at += wide ? 2 : 1;
+            if (index >= 1 && index <= props.size())
+                item.properties.push_back(meta.mid(props[index - 1].at, props[index - 1].size));
+        }
+    }
+    return true;
+}
+
+// An item's data, its extents joined (up to 1 GiB).
+QByteArray itemData(QFile& f, const AvifFile& a, const AvifItem& item) {
+    QByteArray out;
+    for (const auto& [offset, length] : item.extents) {
+        if (length > (1u << 30) || uint64_t(out.size()) + length > (1u << 30)) return {};
+        if (item.method == 1) {
+            if (item.base + offset + length > uint64_t(a.idat.size())) return {};
+            out += a.idat.mid(qsizetype(item.base + offset), qsizetype(length));
+        } else if (item.method == 0) {
+            if (item.base + offset + length > uint64_t(f.size()) || !f.seek(qint64(item.base + offset))) return {};
+            const QByteArray part = f.read(qint64(length));
+            if (part.size() != qint64(length)) return {};
+            out += part;
+        } else {
+            return {};
+        }
+    }
+    return out;
+}
+
+// The colr (nclx) property's code points (primaries, transfer, matrix, full range); false without one.
+bool nclx(const AvifItem& item, int& primaries, int& transfer, int& matrix, bool& full) {
+    const QByteArray* c = property(item, "colr");
+    if (!c || c->size() < 8 + 4 + 7 || c->mid(8, 4) != "nclx") return false;
+    primaries = int(beN(*c, 12, 2)), transfer = int(beN(*c, 14, 2)), matrix = int(beN(*c, 16, 2));
+    full = uint8_t((*c)[18]) & 0x80;
+    return true;
+}
+
+// An AV1 picture (an item's data and its av1C property) as 8-bit RGB.
+QImage decodeAv1(const AvifItem& item, const QByteArray& data, std::string& why) {
+    const QByteArray* av1C = property(item, "av1C");
+    if (!av1C || av1C->size() < 12 || data.isEmpty()) return why = "Not an AV1 picture", QImage();
+    const AVCodec* codec = avcodec_find_decoder_by_name("libdav1d");
+    if (!codec) codec = avcodec_find_decoder(AV_CODEC_ID_AV1);
+    if (!codec) return why = "No AV1 decoder in this build of FFmpeg", QImage();
+    AVCodecContext* ctx = avcodec_alloc_context3(codec);
+    AVPacket* pkt = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+    SwsContext* sws = nullptr;
+    QImage out;
+    why = "Cannot decode the AV1 picture";
+    if (ctx && pkt && frame) {
+        const int extra = int(av1C->size() - 8);
+        ctx->extradata = static_cast<uint8_t*>(av_mallocz(size_t(extra) + AV_INPUT_BUFFER_PADDING_SIZE));
+        if (ctx->extradata) {
+            std::memcpy(ctx->extradata, av1C->constData() + 8, size_t(extra));
+            ctx->extradata_size = extra;
+        }
+        if (ctx->extradata && avcodec_open2(ctx, codec, nullptr) >= 0 && av_new_packet(pkt, int(data.size())) >= 0) {
+            std::memcpy(pkt->data, data.constData(), size_t(data.size()));
+            pkt->flags |= AV_PKT_FLAG_KEY;
+            if (avcodec_send_packet(ctx, pkt) >= 0 && avcodec_send_packet(ctx, nullptr) >= 0 && avcodec_receive_frame(ctx, frame) >= 0) {
+                int primaries = 0, transfer = 0, matrix = int(frame->colorspace);
+                bool full = frame->color_range == AVCOL_RANGE_JPEG;
+                nclx(item, primaries, transfer, matrix, full);
+                sws = sws_getContext(frame->width, frame->height, AVPixelFormat(frame->format), frame->width, frame->height, AV_PIX_FMT_RGB24,
+                                     SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT | SWS_FULL_CHR_H_INP, nullptr, nullptr, nullptr);
+                if (sws) {
+                    const int coefficients = matrix >= 1 && matrix <= 10 && matrix != 2 && matrix != 3 ? matrix : SWS_CS_DEFAULT;
+                    sws_setColorspaceDetails(sws, sws_getCoefficients(coefficients), full ? 1 : 0, sws_getCoefficients(SWS_CS_DEFAULT), 1, 0,
+                                             1 << 16, 1 << 16);
+                    out = QImage(frame->width, frame->height, QImage::Format_RGB888);
+                    uint8_t* dst[4] = {out.bits(), nullptr, nullptr, nullptr};
+                    const int stride[4] = {int(out.bytesPerLine()), 0, 0, 0};
+                    if (out.isNull() || sws_scale(sws, frame->data, frame->linesize, 0, frame->height, dst, stride) != frame->height) out = QImage();
+                    else why.clear();
+                }
+            }
+        }
+    }
+    sws_freeContext(sws);
+    av_frame_free(&frame);
+    av_packet_free(&pkt);
+    avcodec_free_context(&ctx);
+    return out;
+}
+
+struct GainMapItems {
+    const AvifItem *tmap = nullptr, *base = nullptr, *map = nullptr;
+};
+bool findGainMap(const AvifFile& a, GainMapItems& out) {
+    for (const AvifItem& i : a.items)
+        if (i.type == "tmap" && i.dimg.size() == 2) {
+            out.tmap = &i;
+            out.base = a.item(i.dimg[0]);
+            out.map = a.item(i.dimg[1]);
+            return out.base && out.map && out.base->type == "av01" && out.map->type == "av01";
+        }
+    return false;
+}
+
+}  // namespace
+
+bool readGainMapAvif(const std::string& path, GainMapMetadata* metadata) {
+    QFile f(QString::fromStdString(path));
+    AvifFile a;
+    GainMapItems g;
+    if (!f.open(QIODevice::ReadOnly) || !readAvifFile(f, a) || !findGainMap(a, g)) return false;
+    const QByteArray data = itemData(f, a, *g.tmap);
+    GainMapMetadata m;
+    if (data.size() < 2 || data[0] != 0 || !readIsoMetadata(data, 1, data.size(), m)) return false;  // (version 0)
+    if (metadata) *metadata = m;
+    return true;
+}
+
+std::shared_ptr<const GainMapPicture> decodeGainMapAvif(const std::string& path, std::string* error) {
+    std::string why;
+    auto out = cachedRendition(path, [&]() -> std::shared_ptr<const GainMapPicture> {
+        QFile f(QString::fromStdString(path));
+        AvifFile a;
+        GainMapItems g;
+        GainMapMetadata meta;
+        if (!f.open(QIODevice::ReadOnly) || !readAvifFile(f, a) || !findGainMap(a, g) || !readGainMapAvif(path, &meta))
+            return why = "No gain map in " + path, nullptr;
+        if (meta.baseIsHdr) return why = "A gain map to SDR from an HDR base is not read", nullptr;
+        int primaries = 1, transfer = 13, matrix = 0;
+        bool full = true;
+        nclx(*g.base, primaries, transfer, matrix, full);
+        if (transfer == 16 || transfer == 18) return why = "A gain map to SDR from an HDR base is not read", nullptr;
+        const QImage base = decodeAv1(*g.base, itemData(f, a, *g.base), why);
+        const QImage map = base.isNull() ? QImage() : decodeAv1(*g.map, itemData(f, a, *g.map), why);
+        if (base.isNull() || map.isNull()) return why = "Cannot decode " + path + ": " + why, nullptr;
+        const Primaries from = primaries == 12 ? Primaries::P3D65 : primaries == 9 ? Primaries::Bt2020 : Primaries::Bt709;
+        return hdrRendition(asRgb32(base), transfer != 13 && transfer != 2, from, map, meta);
+    });
+    if (!out && error) *error = why;
+    return out;
+}
+
+QImage decodeAvifPicture(const std::string& path, std::string* error) {
+    std::string why = "Not an AVIF still";
+    QFile f(QString::fromStdString(path));
+    AvifFile a;
+    QImage out;
+    if (f.open(QIODevice::ReadOnly) && readAvifFile(f, a))
+        if (const AvifItem* item = a.item(a.primary); item && item->type == "av01") out = decodeAv1(*item, itemData(f, a, *item), why);
+    if (out.isNull() && error) *error = why;
+    return out;
+}
+
+bool readAvifCodedItem(const std::string& path, AvifCodedItem& out) {
+    out = AvifCodedItem();
+    QFile f(QString::fromStdString(path));
+    AvifFile a;
+    if (!f.open(QIODevice::ReadOnly) || !readAvifFile(f, a)) return false;
+    const AvifItem* item = a.item(a.primary);
+    if (!item || item->type != "av01" || !property(*item, "av1C")) return false;
+    out.data = itemData(f, a, *item);
+    out.properties = item->properties;
+    return !out.data.isEmpty();
+}
+
+bool writeGainMapJpeg(const Image& sdr, const ColorSpace& sdrSpace, const Image& hdr, const ColorSpace& hdrSpace, int quality,
+                      const std::string& path, std::string* error, GainMapMetadata* written) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    if (sdr.empty() || sdr.width != hdr.width || sdr.height != hdr.height) return fail("Nothing to write");
+    if (!hdrSpace.hdr() || sdrSpace.hdr()) return fail("A gain map needs an SDR picture and an HDR one");
+    if (sdrSpace.primaries != Primaries::Bt709 && sdrSpace.primaries != Primaries::P3D65)
+        return fail("The SDR picture of a gain-map JPEG is in Rec.709 or Display P3 primaries");
+    const int W = sdr.width, H = sdr.height;
+
+    // The base, encoded first: the map is made against what decoders will see of it.
+    QImage base(W, H, QImage::Format_RGBA8888);
+    toRgba8(sdr, base.bits(), size_t(base.bytesPerLine()));
+    base = base.convertToFormat(QImage::Format_RGB888);
+    const bool p3 = sdrSpace.primaries == Primaries::P3D65;
+    if (p3) base.setColorSpace(QColorSpace(QColorSpace::DisplayP3));
+    const QByteArray baseJpeg = jpegBytes(base, quality);
+    const QImage seen = QImage::fromData(baseJpeg, "JPEG").convertToFormat(QImage::Format_RGB888);
+    if (baseJpeg.isEmpty() || seen.width() != W || seen.height() != H) return fail("Cannot encode the JPEG");
+    GainMapMetadata meta;
+    std::vector<float> target;
+    if (!planGainMap(seen, p3 ? Primaries::P3D65 : Primaries::Bt709, hdr, hdrSpace, meta, target)) return fail("Nothing to write");
+    // The map in 8 bits, at full chroma resolution.
+    const QByteArray mapJpeg = encodeGainMap(target, W, H, [&](const QImage& map, QImage& back) {
+        const QByteArray bytes = jpeg444(map, quality >= 95 ? 1 : 2);
+        back = QImage::fromData(bytes, "JPEG");
+        return bytes;
+    });
     if (mapJpeg.isEmpty()) return fail("Cannot encode the gain map");
 
     // The map's picture: its XMP (Adobe's gain map properties) and the ISO 21496-1 metadata.
-    QByteArray xmp2 = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Montage\">"
-                      "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">"
-                      "<rdf:Description xmlns:hdrgm=\"http://ns.adobe.com/hdr-gain-map/1.0/\" hdrgm:Version=\"1.0\"";
-    xmp2 += " hdrgm:GainMapMin=\"" + number(gmin) + "\" hdrgm:GainMapMax=\"" + number(gmax) + "\" hdrgm:Gamma=\"1\"";
-    xmp2 += " hdrgm:OffsetSDR=\"" + number(off) + "\" hdrgm:OffsetHDR=\"" + number(off) + "\"";
-    xmp2 += " hdrgm:HDRCapacityMin=\"0\" hdrgm:HDRCapacityMax=\"" + number(meta.hdrCapacityMax) + "\"";
-    xmp2 += " hdrgm:BaseRenditionIsHDR=\"False\"/></rdf:RDF></x:xmpmeta>";
-    const QByteArray second = withSegments(mapJpeg, segment(0xe1, kXmpNamespace + xmp2) + segment(0xe2, kIsoNamespace + isoMetadata(meta)));
+    const QByteArray second =
+        withSegments(mapJpeg, segment(0xe1, kXmpNamespace + adobeGainMapXmp(meta)) + segment(0xe2, kIsoNamespace + isoMetadata(meta)));
 
     // The primary picture: XMP naming the map and its length, ISO 21496-1's version (the file has a map), and MPF.
     QByteArray xmp1 = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Montage\">"

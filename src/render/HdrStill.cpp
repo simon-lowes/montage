@@ -6,6 +6,7 @@
 #include <QImage>
 #include <QImageWriter>
 #include <QSaveFile>
+#include <QTemporaryDir>
 #include <algorithm>
 #include <cmath>
 #include <climits>
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include "ColorSpace.h"
+#include "media/GainMap.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -418,22 +420,35 @@ bool writeHdrPng(const Image& img, const ColorSpace& space, double peakNits, dou
     return true;
 }
 
-bool writeAvifStill(const Image& img, const ColorSpace& space, int quality, double peakNits, double maxCll, double maxFall,
-                    const std::string& path, std::string* error, bool* stated) {
-    if (stated) *stated = false;
-    auto fail = [&](const std::string& why) {
-        if (error) *error = why;
-        return false;
-    };
-    if (img.empty()) return fail("Nothing to write");
-    const bool hdr = space.hdr();
-    const int bits = hdr ? 10 : 8;
+namespace {
+
+// A picture for the AV1 encoder: Y'CbCr at 4:2:0 or 4:4:4 (Cb and Cr at half size for 4:2:0), or R, G and B
+// (identity matrix), full range, with the colour it is tagged with.
+enum class Av1Layout { Yuv420, Yuv444, Gbr };
+struct Av1Picture {
+    int width = 0, height = 0, bits = 8;
+    Av1Layout layout = Av1Layout::Yuv420;
+    std::vector<uint16_t> planes[3];
+    AVColorPrimaries primaries = AVCOL_PRI_BT709;
+    AVColorTransferCharacteristic transfer = AVCOL_TRC_BT709;
+    AVColorSpace matrix = AVCOL_SPC_BT709;
+};
+
+AVColorPrimaries avPrimaries(Primaries p) {
+    return p == Primaries::Bt2020 ? AVCOL_PRI_BT2020 : p == Primaries::P3D65 ? AVCOL_PRI_SMPTE432 : AVCOL_PRI_BT709;
+}
+
+// `img` (code values, over black) as Y'CbCr 4:2:0 by the BT.2020 non-constant luminance matrix for its primaries, else
+// BT.709's; tagged with `space` (its transfer replaced by `transfer` when given).
+Av1Picture ycbcr420(const Image& img, const ColorSpace& space, int bits, AVColorTransferCharacteristic transfer = AVCOL_TRC_UNSPECIFIED) {
+    Av1Picture pic;
     const int maxCode = (1 << bits) - 1;
     const int W = img.width, H = img.height, CW = (W + 1) / 2, CH = (H + 1) / 2;
-    // Y'CbCr, full range, by the space's matrix (BT.2020 non-constant luminance for its primaries, else BT.709).
     const bool wide = space.primaries == Primaries::Bt2020;
     const double kr = wide ? 0.2627 : 0.2126, kb = wide ? 0.0593 : 0.0722, kg = 1 - kr - kb;
-    std::vector<uint16_t> Y(size_t(W) * H), U(size_t(CW) * CH), V(size_t(CW) * CH);
+    pic.width = W, pic.height = H, pic.bits = bits;
+    std::vector<uint16_t>&Y = pic.planes[0], &U = pic.planes[1], &V = pic.planes[2];
+    Y.resize(size_t(W) * H), U.resize(size_t(CW) * CH), V.resize(size_t(CW) * CH);
     std::vector<double> cb(size_t(W) * H), cr(size_t(W) * H);
     for (int y = 0; y < H; ++y) {
         const float* p = img.row(y);
@@ -458,18 +473,72 @@ bool writeAvifStill(const Image& img, const ColorSpace& space, int quality, doub
             U[size_t(y) * CW + x] = uint16_t(std::clamp(std::lround(sb / n * maxCode + mid), 0L, long(maxCode)));
             V[size_t(y) * CW + x] = uint16_t(std::clamp(std::lround(sr / n * maxCode + mid), 0L, long(maxCode)));
         }
+    pic.primaries = avPrimaries(space.primaries);
+    pic.transfer = transfer != AVCOL_TRC_UNSPECIFIED ? transfer
+                   : space.transfer == Transfer::Pq    ? AVCOL_TRC_SMPTE2084
+                   : space.transfer == Transfer::Hlg   ? AVCOL_TRC_ARIB_STD_B67
+                   : space.transfer == Transfer::Srgb  ? AVCOL_TRC_IEC61966_2_1
+                                                       : AVCOL_TRC_BT709;
+    pic.matrix = wide ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT709;
+    return pic;
+}
 
+// An 8-bit RGB picture (a gain map) as R, G and B, or as Y'CbCr 4:4:4 or 4:2:0 by BT.601's matrix.
+Av1Picture rgbPicture(const QImage& rgb888, Av1Layout layout) {
+    Av1Picture pic;
+    const int W = rgb888.width(), H = rgb888.height(), CW = layout == Av1Layout::Yuv420 ? (W + 1) / 2 : W,
+              CH = layout == Av1Layout::Yuv420 ? (H + 1) / 2 : H;
+    pic.width = W, pic.height = H, pic.layout = layout;
+    pic.planes[0].resize(size_t(W) * H);
+    for (int i = 1; i < 3; ++i) pic.planes[i].resize(layout == Av1Layout::Gbr ? size_t(W) * H : size_t(CW) * CH);
+    std::vector<double> cb, cr;
+    if (layout == Av1Layout::Yuv420) cb.resize(size_t(W) * H), cr.resize(size_t(W) * H);
+    for (int y = 0; y < H; ++y) {
+        const uchar* s = rgb888.constScanLine(y);
+        for (int x = 0; x < W; ++x, s += 3) {
+            const size_t i = size_t(y) * W + x;
+            if (layout == Av1Layout::Gbr) {
+                for (int c = 0; c < 3; ++c) pic.planes[c][i] = s[c];
+                continue;
+            }
+            const double r = s[0], g = s[1], b = s[2], luma = 0.299 * r + 0.587 * g + 0.114 * b;
+            pic.planes[0][i] = uint16_t(std::clamp(std::lround(luma), 0L, 255L));
+            const double u = 128 + (b - luma) / 1.772, v = 128 + (r - luma) / 1.402;
+            if (layout == Av1Layout::Yuv444) {
+                pic.planes[1][i] = uint16_t(std::clamp(std::lround(u), 0L, 255L));
+                pic.planes[2][i] = uint16_t(std::clamp(std::lround(v), 0L, 255L));
+            } else {
+                cb[i] = u, cr[i] = v;
+            }
+        }
+    }
+    if (layout == Av1Layout::Yuv420)
+        for (int y = 0; y < CH; ++y)
+            for (int x = 0; x < CW; ++x) {
+                double sb = 0, sr = 0;
+                for (int dy = 0; dy < 2; ++dy)
+                    for (int dx = 0; dx < 2; ++dx) {
+                        const size_t i = size_t(std::min(H - 1, 2 * y + dy)) * W + size_t(std::min(W - 1, 2 * x + dx));
+                        sb += cb[i], sr += cr[i];
+                    }
+                pic.planes[1][size_t(y) * CW + x] = uint16_t(std::clamp(std::lround(sb / 4), 0L, 255L));
+                pic.planes[2][size_t(y) * CW + x] = uint16_t(std::clamp(std::lround(sr / 4), 0L, 255L));
+            }
+    pic.primaries = AVCOL_PRI_BT709;
+    pic.transfer = AVCOL_TRC_IEC61966_2_1;
+    pic.matrix = layout == Av1Layout::Gbr ? AVCOL_SPC_RGB : AVCOL_SPC_SMPTE170M;
+    return pic;
+}
+
+// Encodes `pic` into an AVIF file at `path` (FFmpeg's muxer) with the first of `encoders` that takes it; with a
+// mastering display of `peakNits` and light levels when `peakNits` > 0.
+bool encodeAvif(const Av1Picture& pic, int quality, std::initializer_list<const char*> encoders, const std::string& path,
+                std::string& why, double peakNits = 0, double maxCll = 0, double maxFall = 0) {
     AVFormatContext* oc = nullptr;
-    if (avformat_alloc_output_context2(&oc, nullptr, "avif", path.c_str()) < 0 || !oc) return fail("This build of FFmpeg cannot write AVIF");
+    if (avformat_alloc_output_context2(&oc, nullptr, "avif", path.c_str()) < 0 || !oc) return why = "This build of FFmpeg cannot write AVIF", false;
     AVCodecContext* ctx = nullptr;
     AVFrame* frame = nullptr;
     AVPacket* pkt = av_packet_alloc();
-    bool ok = false;
-    if (!pkt) {
-        avformat_free_context(oc);
-        return fail("Out of memory");
-    }
-    std::string why = "No AV1 encoder in this build of FFmpeg";
     struct Cleanup {
         AVFormatContext*& oc;
         AVCodecContext*& ctx;
@@ -483,28 +552,29 @@ bool writeAvifStill(const Image& img, const ColorSpace& space, int quality, doub
             avformat_free_context(oc);
         }
     } cleanup{oc, ctx, frame, pkt};
+    if (!pkt) return why = "Out of memory", false;
+    const AVPixelFormat format = pic.layout == Av1Layout::Gbr      ? (pic.bits > 8 ? AV_PIX_FMT_GBRP10LE : AV_PIX_FMT_GBRP)
+                                 : pic.layout == Av1Layout::Yuv444 ? (pic.bits > 8 ? AV_PIX_FMT_YUV444P10LE : AV_PIX_FMT_YUV444P)
+                                                                   : (pic.bits > 8 ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P);
+    why = "No AV1 encoder in this build of FFmpeg";
     // (A small still is quick at the slower presets.)
     const int crf = std::clamp(int(std::lround((100 - std::clamp(quality, 0, 100)) * 0.63)), 0, 63);
-    for (const char* name : {"libsvtav1", "libaom-av1", "librav1e"}) {
+    bool opened = false;
+    for (const char* name : encoders) {
         const AVCodec* codec = avcodec_find_encoder_by_name(name);
         if (!codec) continue;
         avcodec_free_context(&ctx);
         ctx = avcodec_alloc_context3(codec);
-        if (!ctx) return fail("Out of memory");
-        ctx->width = W;
-        ctx->height = H;
-        ctx->pix_fmt = hdr ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
+        if (!ctx) return why = "Out of memory", false;
+        ctx->width = pic.width;
+        ctx->height = pic.height;
+        ctx->pix_fmt = format;
         ctx->time_base = {1, 1};
         ctx->framerate = {1, 1};
         ctx->color_range = AVCOL_RANGE_JPEG;
-        ctx->color_primaries = space.primaries == Primaries::Bt2020 ? AVCOL_PRI_BT2020
-                               : space.primaries == Primaries::P3D65 ? AVCOL_PRI_SMPTE432
-                                                                     : AVCOL_PRI_BT709;
-        ctx->color_trc = space.transfer == Transfer::Pq    ? AVCOL_TRC_SMPTE2084
-                         : space.transfer == Transfer::Hlg ? AVCOL_TRC_ARIB_STD_B67
-                         : space.transfer == Transfer::Srgb ? AVCOL_TRC_IEC61966_2_1
-                                                            : AVCOL_TRC_BT709;
-        ctx->colorspace = wide ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT709;
+        ctx->color_primaries = pic.primaries;
+        ctx->color_trc = pic.transfer;
+        ctx->colorspace = pic.matrix;
         ctx->gop_size = 1;
         if (oc->oformat->flags & AVFMT_GLOBALHEADER) ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
         AVDictionary* opts = nullptr;
@@ -514,16 +584,17 @@ bool writeAvifStill(const Image& img, const ColorSpace& space, int quality, doub
         const int rc = avcodec_open2(ctx, codec, &opts);
         av_dict_free(&opts);
         if (rc >= 0) {
-            why.clear();
+            opened = true;
             break;
         }
-        why = std::string("The AV1 encoder (") + name + ") would not take a " + std::to_string(W) + " x " + std::to_string(H) + " picture";
+        why = std::string("The AV1 encoder (") + name + ") would not take a " + std::to_string(pic.width) + " x " + std::to_string(pic.height) +
+              " picture";
     }
-    if (!why.empty()) return fail(why);
+    if (!opened) return false;
     AVStream* st = avformat_new_stream(oc, nullptr);
-    if (!st || avcodec_parameters_from_context(st->codecpar, ctx) < 0) return fail("Cannot write " + path);
+    if (!st || avcodec_parameters_from_context(st->codecpar, ctx) < 0) return why = "Cannot write " + path, false;
     st->time_base = ctx->time_base;
-    if (hdr) {
+    if (peakNits > 0) {
         AVMasteringDisplayMetadata md{};
         const Mastering m;
         for (int i = 0; i < 3; ++i)
@@ -543,22 +614,28 @@ bool writeAvifStill(const Image& img, const ColorSpace& space, int quality, doub
                                                            AV_PKT_DATA_CONTENT_LIGHT_LEVEL, sizeof cl, 0))
             std::memcpy(sd->data, &cl, sizeof cl);
     }
-    if (!(oc->oformat->flags & AVFMT_NOFILE) && avio_open(&oc->pb, path.c_str(), AVIO_FLAG_WRITE) < 0) return fail("Cannot write " + path);
-    if (avformat_write_header(oc, nullptr) < 0) return fail("Cannot write " + path);
+    if (!(oc->oformat->flags & AVFMT_NOFILE) && avio_open(&oc->pb, path.c_str(), AVIO_FLAG_WRITE) < 0) return why = "Cannot write " + path, false;
+    if (avformat_write_header(oc, nullptr) < 0) return why = "Cannot write " + path, false;
     frame = av_frame_alloc();
-    if (!frame) return fail("Out of memory");
+    if (!frame) return why = "Out of memory", false;
     frame->format = ctx->pix_fmt;
-    frame->width = W;
-    frame->height = H;
+    frame->width = pic.width;
+    frame->height = pic.height;
     frame->color_range = ctx->color_range;
     frame->color_primaries = ctx->color_primaries;
     frame->color_trc = ctx->color_trc;
     frame->colorspace = ctx->colorspace;
     frame->pts = 0;
-    if (av_frame_get_buffer(frame, 0) < 0) return fail("Out of memory");
-    auto plane = [&](int i, const std::vector<uint16_t>& src, int w, int h) {
+    if (av_frame_get_buffer(frame, 0) < 0) return why = "Out of memory", false;
+    // (FFmpeg's planar RGB is G, B, R.)
+    const int order[3] = {pic.layout == Av1Layout::Gbr ? 1 : 0, pic.layout == Av1Layout::Gbr ? 2 : 1, pic.layout == Av1Layout::Gbr ? 0 : 2};
+    for (int i = 0; i < 3; ++i) {
+        const std::vector<uint16_t>& src = pic.planes[order[i]];
+        const int w = pic.layout == Av1Layout::Yuv420 && i > 0 ? (pic.width + 1) / 2 : pic.width;
+        const int h = pic.layout == Av1Layout::Yuv420 && i > 0 ? (pic.height + 1) / 2 : pic.height;
+        if (src.size() != size_t(w) * h) return why = "Cannot encode the AVIF", false;
         for (int y = 0; y < h; ++y) {
-            if (hdr) {
+            if (pic.bits > 8) {
                 auto* d = reinterpret_cast<uint16_t*>(frame->data[i] + size_t(y) * size_t(frame->linesize[i]));
                 std::memcpy(d, src.data() + size_t(y) * w, size_t(w) * 2);
             } else {
@@ -566,10 +643,7 @@ bool writeAvifStill(const Image& img, const ColorSpace& space, int quality, doub
                 for (int x = 0; x < w; ++x) d[x] = uint8_t(src[size_t(y) * w + x]);
             }
         }
-    };
-    plane(0, Y, W, H);
-    plane(1, U, CW, CH);
-    plane(2, V, CW, CH);
+    }
     auto drain = [&]() -> bool {
         for (;;) {
             const int r = avcodec_receive_packet(ctx, pkt);
@@ -580,11 +654,29 @@ bool writeAvifStill(const Image& img, const ColorSpace& space, int quality, doub
             if (av_interleaved_write_frame(oc, pkt) < 0) return false;
         }
     };
-    ok = avcodec_send_frame(ctx, frame) >= 0 && drain() && avcodec_send_frame(ctx, nullptr) >= 0 && drain() && av_write_trailer(oc) >= 0;
-    if (!ok) return fail("Cannot encode the AVIF");
+    if (!(avcodec_send_frame(ctx, frame) >= 0 && drain() && avcodec_send_frame(ctx, nullptr) >= 0 && drain() && av_write_trailer(oc) >= 0))
+        return why = "Cannot encode the AVIF", false;
+    why.clear();
+    return true;
+}
+
+}  // namespace
+
+bool writeAvifStill(const Image& img, const ColorSpace& space, int quality, double peakNits, double maxCll, double maxFall,
+                    const std::string& path, std::string* error, bool* stated) {
+    if (stated) *stated = false;
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    if (img.empty()) return fail("Nothing to write");
+    const bool hdr = space.hdr();
+    std::string why;
+    if (!encodeAvif(ycbcr420(img, space, hdr ? 10 : 8), quality, {"libsvtav1", "libaom-av1", "librav1e"}, path, why, hdr ? peakNits : 0,
+                    maxCll, maxFall))
+        return fail(why);
     if (!hdr) return true;
     // Its light levels and mastering display, as properties of the image (the file replaced whole).
-    if (!(oc->oformat->flags & AVFMT_NOFILE)) avio_closep(&oc->pb);
     QFile in(QString::fromStdString(path));
     if (!in.open(QIODevice::ReadOnly)) return fail("Cannot read back " + path);
     QByteArray bytes = in.readAll();
@@ -593,6 +685,173 @@ bool writeAvifStill(const Image& img, const ColorSpace& space, int quality, doub
     QSaveFile out(QString::fromStdString(path));
     if (!out.open(QIODevice::WriteOnly) || out.write(bytes) != bytes.size() || !out.commit()) return fail("Cannot write " + path);
     if (stated) *stated = true;
+    return true;
+}
+
+bool writeGainMapAvif(const Image& sdr, const ColorSpace& sdrSpace, const Image& hdr, const ColorSpace& hdrSpace, int quality,
+                      double maxCll, double maxFall, const std::string& path, std::string* error) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    if (sdr.empty() || sdr.width != hdr.width || sdr.height != hdr.height) return fail("Nothing to write");
+    if (!hdrSpace.hdr() || sdrSpace.hdr()) return fail("A gain map needs an SDR picture and an HDR one");
+    if (sdrSpace.primaries != Primaries::Bt709 && sdrSpace.primaries != Primaries::P3D65)
+        return fail("The SDR picture of a gain-map AVIF is in Rec.709 or Display P3 primaries");
+    const int W = sdr.width, H = sdr.height;
+    QTemporaryDir dir;
+    if (!dir.isValid()) return fail("Cannot make a temporary folder");
+    const std::string basePath = dir.filePath("base.avif").toStdString();
+    std::string why;
+    // The base (8-bit, tagged with sRGB's curve, which is how gain map readers linearise it), encoded first: the map is
+    // made against what decoders will see of it.
+    if (!encodeAvif(ycbcr420(sdr, sdrSpace, 8, AVCOL_TRC_IEC61966_2_1), quality, {"libsvtav1", "libaom-av1", "librav1e"}, basePath, why))
+        return fail(why);
+    const QImage seen = decodeAvifPicture(basePath, &why);
+    AvifCodedItem base, map;
+    if (seen.isNull() || seen.width() != W || seen.height() != H || !readAvifCodedItem(basePath, base))
+        return fail("Cannot read back the AVIF's picture: " + why);
+    GainMapMetadata meta;
+    std::vector<float> target;
+    if (!planGainMap(seen, sdrSpace.primaries, hdr, hdrSpace, meta, target)) return fail("Nothing to write");
+    // The map in 8 bits: R, G and B as they are (identity matrix) where the encoder takes them, else Y'CbCr 4:4:4, else
+    // 4:2:0 (SVT-AV1's only one).
+    int attempt = 0;
+    const QByteArray mapFile = encodeGainMap(target, W, H, [&](const QImage& m, QImage& back) -> QByteArray {
+        const std::string mapPath = dir.filePath(QStringLiteral("map%1.avif").arg(attempt++)).toStdString();
+        if (!encodeAvif(rgbPicture(m, Av1Layout::Gbr), std::max(quality, 90), {"libaom-av1"}, mapPath, why) &&
+            !encodeAvif(rgbPicture(m, Av1Layout::Yuv444), std::max(quality, 90), {"librav1e", "libaom-av1"}, mapPath, why) &&
+            !encodeAvif(rgbPicture(m, Av1Layout::Yuv420), std::max(quality, 90), {"libsvtav1", "libaom-av1", "librav1e"}, mapPath, why))
+            return {};
+        back = decodeAvifPicture(mapPath, &why);
+        return QByteArray::fromStdString(mapPath);
+    });
+    if (mapFile.isEmpty() || !readAvifCodedItem(mapFile.toStdString(), map)) return fail("Cannot encode the gain map: " + why);
+
+    // The file (as libavif writes one): the base (item 1, primary), the 'tmap' item (2) derived from it and the map,
+    // and the map (3, hidden), the tone-mapped item preferred over the base in an 'altr' group; and Adobe's gain map
+    // properties as XMP (4) describing the map, beside ISO 21496-1's.
+    auto full = [](const char* type, int version, uint32_t flags, const QByteArray& body) {
+        QByteArray b;
+        put32(b, uint32_t(version) << 24 | flags);
+        return box(type, b + body);
+    };
+    QByteArray tmap(1, '\0');  // (version 0)
+    tmap += isoGainMapMetadata(meta);
+    const QByteArray xmp = adobeGainMapXmp(meta);
+    // Properties: the base's and the map's as FFmpeg wrote them, and the tone-mapped image's own (its size, and the
+    // HDR rendition's colour and light levels).
+    std::vector<QByteArray> props;
+    auto index = [&](const QByteArray& p) {
+        for (size_t i = 0; i < props.size(); ++i)
+            if (props[i] == p) return int(i + 1);
+        props.push_back(p);
+        return int(props.size());
+    };
+    struct Assoc {
+        int index;
+        bool essential;
+    };
+    std::vector<Assoc> assoc[3];
+    auto take = [&](const std::vector<QByteArray>& from, std::vector<Assoc>& to) {
+        for (const QByteArray& p : from) {
+            const QByteArray type = p.mid(4, 4);
+            if (type == "clli" || type == "mdcv") continue;
+            to.push_back({index(p), type == "av1C"});
+        }
+    };
+    take(base.properties, assoc[0]);
+    take(map.properties, assoc[2]);
+    QByteArray ispe;
+    put32(ispe, uint32_t(W));
+    put32(ispe, uint32_t(H));
+    QByteArray colr("nclx", 4);
+    put16(colr, unsigned(cicpPrimaries(hdrSpace)));
+    put16(colr, unsigned(cicpTransfer(hdrSpace)));
+    put16(colr, 6);  // (BT.601: not coded, libavif's default)
+    colr.append(char(0x80));  // full range
+    QByteArray clli;
+    put16(clli, unsigned(std::clamp(std::lround(maxCll), 0L, 65535L)));
+    put16(clli, unsigned(std::clamp(std::lround(maxFall), 0L, 65535L)));
+    assoc[1].push_back({index(full("ispe", 0, 0, ispe)), false});
+    assoc[1].push_back({index(box("colr", colr)), false});
+    if (maxCll > 0) assoc[1].push_back({index(box("clli", clli)), false});
+    if (props.size() > 127) return fail("Too many properties");
+    QByteArray ipco;
+    for (const QByteArray& p : props) ipco += p;
+    QByteArray ipma;
+    put32(ipma, 3);
+    for (int i = 0; i < 3; ++i) {
+        put16(ipma, unsigned(i + 1));
+        ipma.append(char(assoc[i].size()));
+        for (const Assoc& a : assoc[i]) ipma.append(char((a.essential ? 0x80 : 0) | a.index));
+    }
+    QByteArray hdlr;
+    put32(hdlr, 0);
+    hdlr.append("pict", 4);
+    hdlr.append(QByteArray(12, '\0'));
+    hdlr.append('\0');
+    QByteArray pitm;
+    put16(pitm, 1);
+    QByteArray iinf;
+    put16(iinf, 4);
+    auto infe = [&](unsigned id, const char* type, bool hidden, const QByteArray& contentType = {}) {
+        QByteArray b;
+        put16(b, id);
+        put16(b, 0);
+        b.append(type, 4);
+        b.append('\0');
+        if (!contentType.isEmpty()) b += contentType + '\0';
+        return full("infe", 2, hidden ? 1 : 0, b);
+    };
+    iinf += infe(1, "av01", false) + infe(2, "tmap", false) + infe(3, "av01", true) + infe(4, "mime", false, "application/rdf+xml");
+    QByteArray dimg, cdsc;
+    put16(dimg, 2);
+    put16(dimg, 2);
+    put16(dimg, 1);
+    put16(dimg, 3);
+    put16(cdsc, 4);
+    put16(cdsc, 1);
+    put16(cdsc, 3);
+    QByteArray altr;
+    put32(altr, 4);  // group id (unlike any item's)
+    put32(altr, 2);
+    put32(altr, 2);
+    put32(altr, 1);
+    // Item locations: offsets into the file, known once the boxes before mdat are (their sizes do not depend on them).
+    auto iloc = [&](uint32_t mdatData) {
+        QByteArray b;
+        b.append(char(0x44));  // offsets and lengths of four bytes
+        b.append(char(0x00));  // no base offset
+        put16(b, 4);
+        uint32_t at = mdatData;
+        for (const auto& [id, size] :
+             {std::pair<unsigned, qsizetype>{1, base.data.size()}, {2, tmap.size()}, {3, map.data.size()}, {4, xmp.size()}}) {
+            put16(b, id);
+            put16(b, 0);  // data reference: this file
+            put16(b, 1);  // one extent
+            put32(b, at);
+            put32(b, uint32_t(size));
+            at += uint32_t(size);
+        }
+        return full("iloc", 0, 0, b);
+    };
+    QByteArray ftyp("avif", 4);
+    put32(ftyp, 0);
+    ftyp.append("avifmif1miaftmap", 16);
+    auto metaBox = [&](uint32_t mdatData) {
+        return full("meta", 0, 0,
+                    full("hdlr", 0, 0, hdlr) + full("pitm", 0, 0, pitm) + iloc(mdatData) + full("iinf", 0, 0, iinf) +
+                        full("iref", 0, 0, box("dimg", dimg) + box("cdsc", cdsc)) + box("iprp", box("ipco", ipco) + full("ipma", 0, 0, ipma)) +
+                        box("grpl", full("altr", 0, 0, altr)));
+    };
+    const QByteArray head = box("ftyp", ftyp);
+    const qsizetype metaSize = metaBox(0).size();
+    const QByteArray payload = base.data + tmap + map.data + xmp;
+    if (uint64_t(head.size() + metaSize + 8 + payload.size()) > 0xffffffffu) return fail("Too large for this AVIF writer");
+    const QByteArray file = head + metaBox(uint32_t(head.size() + metaSize + 8)) + box("mdat", payload);
+    QSaveFile out(QString::fromStdString(path));
+    if (!out.open(QIODevice::WriteOnly) || out.write(file) != file.size() || !out.commit()) return fail("Cannot write " + path);
     return true;
 }
 

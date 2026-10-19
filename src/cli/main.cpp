@@ -105,7 +105,7 @@ int usage() {
                  "  montage-cli node <folder> [--name NAME] [--map FROM=TO]... [--once] [--poll SECONDS]\n"
                  "                     (a render node: renders the farm's waiting jobs one at a time, FROM paths read as TO;\n"
                  "                      Ctrl+C gives its job back for another node)\n"
-                 "  montage-cli frame <project.montage> --at TC -o <image.png|.jpg|.tif|.avif> [--rendition master|<trim target>]\n"
+                 "  montage-cli frame <project.montage> --at TC -o <image.png|.jpg|.tif|.avif> [--rendition master|<trim target>] [--gain-map]\n"
                  "  montage-cli presets\n"
                  "  montage-cli colorspaces\n"
                  "  montage-cli devices                                (where AI models can run: CPU, GPU, NPU)\n"
@@ -584,6 +584,7 @@ int cmdFrame(const std::vector<std::string>& args) {
         if (args[i] == "--at" && i + 1 < args.size()) tc = args[++i];
         else if (args[i] == "-o" && i + 1 < args.size()) outPath = args[++i];
         else if (args[i] == "--rendition" && i + 1 < args.size()) so.rendition = args[++i];
+        else if (args[i] == "--gain-map") so.gainMap = true;
         else return usage();
     }
     if (outPath.empty()) return usage();

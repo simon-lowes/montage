@@ -2935,13 +2935,13 @@ void MainWindow::exportFrame() {
     const Sequence* s = state_->sequence();
     if (!s) return;
     QSettings st = appSettings();
-    // An HDR sequence's frame goes out for SDR screens (its SDR trim) or as its HDR master (PNG, AVIF, or JPEG with a gain
-    // map over the SDR rendition).
+    // An HDR sequence's frame goes out for SDR screens (its SDR trim) or as its HDR master (PNG, AVIF, or JPEG or AVIF with
+    // a gain map over the SDR rendition).
     const bool hdr = sequenceColorSpace(*s).hdr();
     const QString sdrPng = tr("PNG for SDR screens (*.png)"), hdrPng = tr("HDR PNG, 16-bit (*.png)"),
                   sdrAvif = tr("AVIF for SDR screens (*.avif)"), hdrAvif = tr("HDR AVIF, 10-bit (*.avif)"),
-                  hdrJpeg = tr("HDR JPEG with gain map (*.jpg)");
-    const QString filters = hdr ? QStringList{sdrPng, hdrPng, sdrAvif, hdrAvif, hdrJpeg, tr("JPEG for SDR screens (*.jpg)"),
+                  hdrJpeg = tr("HDR JPEG with gain map (*.jpg)"), gainMapAvif = tr("HDR AVIF with gain map (*.avif)");
+    const QString filters = hdr ? QStringList{sdrPng, hdrPng, sdrAvif, hdrAvif, gainMapAvif, hdrJpeg, tr("JPEG for SDR screens (*.jpg)"),
                                               tr("TIFF for SDR screens (*.tif)")}.join(";;")
                                 : tr("Images (*.png *.jpg *.tif *.avif)");
     QString chosen;
@@ -2954,7 +2954,8 @@ void MainWindow::exportFrame() {
         if (!path.endsWith(ext, Qt::CaseInsensitive)) path = QFileInfo(path).dir().filePath(QFileInfo(path).completeBaseName() + ext);
     }
     StillOptions o;
-    if (hdr && (chosen == hdrPng || chosen == hdrAvif || chosen == hdrJpeg)) o.rendition = "master";
+    if (hdr && (chosen == hdrPng || chosen == hdrAvif || chosen == hdrJpeg || chosen == gainMapAvif)) o.rendition = "master";
+    o.gainMap = hdr && chosen == gainMapAvif;
     std::string err;
     if (exportStill(state_->project(), *s, state_->playhead(), path.toStdString(), &err, o))
         statusBar()->showMessage(tr("Saved frame to %1").arg(path), 4000);

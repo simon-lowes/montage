@@ -33,5 +33,11 @@ bool writeHdrPng(const Image& img, const ColorSpace& space, double peakNits, dou
 // levels (mdcv and clli properties; `stated` says whether they could be added), else 8. `quality` 0-100.
 bool writeAvifStill(const Image& img, const ColorSpace& space, int quality, double peakNits, double maxCll, double maxFall,
                     const std::string& path, std::string* error = nullptr, bool* stated = nullptr);
+// An AVIF with a gain map (ISO 21496-1, as libavif writes one): `sdr` (code values in `sdrSpace`, Rec.709 or Display P3
+// primaries) as the 8-bit base, which every reader shows, and a map to `hdr` (in `hdrSpace`, PQ or HLG) in a tone-mapped
+// derived item that HDR readers prefer, stating the HDR rendition's colour and light levels. Pictures premultiplied
+// over black, the same size.
+bool writeGainMapAvif(const Image& sdr, const ColorSpace& sdrSpace, const Image& hdr, const ColorSpace& hdrSpace, int quality,
+                      double maxCll, double maxFall, const std::string& path, std::string* error = nullptr);
 
 }  // namespace montage

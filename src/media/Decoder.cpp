@@ -75,11 +75,11 @@ std::string averr(int code) {
     return buf;
 }
 
-// A .jpg that may hold a gain map (its metadata read to find out, so only JPEG names).
-bool isGainMapJpegPath(const std::string& path) {
+// A still that may hold a gain map (its metadata read to find out, so only JPEG and AVIF names): 1 JPEG, 2 AVIF, else 0.
+int gainMapKind(const std::string& path) {
     std::string ext = path.substr(path.find_last_of('.') == std::string::npos ? path.size() : path.find_last_of('.'));
     for (char& c : ext) c = char(std::tolower(static_cast<unsigned char>(c)));
-    return ext == ".jpg" || ext == ".jpeg" || ext == ".jpe";
+    return ext == ".jpg" || ext == ".jpeg" || ext == ".jpe" ? 1 : ext == ".avif" ? 2 : 0;
 }
 
 bool isStillFormat(const AVFormatContext* fmt) {
@@ -615,10 +615,12 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         m.colorSpace = colorSpaceFromTags(pri ? pri : "", trc ? trc : "");
         if (const std::string proj = streamProjection(st); !proj.empty()) m.projection = proj;
         if (m.colorSpace == "rec709") m.colorSpace.clear();
-        // A JPEG with a gain map: imported as its HDR rendition (said on the path, so a project saved before this
+        // A JPEG or AVIF with a gain map: imported as its HDR rendition (said on the path, so a project saved before this
         // reads keep the SDR picture they were made with).
-        if (GainMapJpeg gm; st->codecpar->codec_id == AV_CODEC_ID_MJPEG && isGainMapJpegPath(file) && readGainMapJpeg(file, gm) &&
-                            !gm.metadata.baseIsHdr) {
+        GainMapJpeg jpeg;
+        GainMapMetadata avif;
+        if ((st->codecpar->codec_id == AV_CODEC_ID_MJPEG && gainMapKind(file) == 1 && readGainMapJpeg(file, jpeg) && !jpeg.metadata.baseIsHdr) ||
+            (st->codecpar->codec_id == AV_CODEC_ID_AV1 && gainMapKind(file) == 2 && readGainMapAvif(file, &avif) && !avif.baseIsHdr)) {
             m.gainMap = true;
             if (in.empty()) m.path = gainMapPath(path, true), in.gainMap = true;
             if (in.gainMap) m.colorSpace = "rec2100pq";
@@ -868,10 +870,10 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
             return true;
         }
     }
-    // A JPEG with a gain map read as its HDR rendition (PQ), made from the base and the map.
-    if (const std::string file = uninterpretedPath(path); in.gainMap && isGainMapJpegPath(file)) {
+    // A JPEG or AVIF with a gain map read as its HDR rendition (PQ), made from the base and the map.
+    if (const std::string file = uninterpretedPath(path); in.gainMap && gainMapKind(file)) {
         std::string why;
-        const std::shared_ptr<const GainMapPicture> pic = decodeGainMapJpeg(file, &why);
+        const std::shared_ptr<const GainMapPicture> pic = gainMapKind(file) == 1 ? decodeGainMapJpeg(file, &why) : decodeGainMapAvif(file, &why);
         if (!pic) {
             if (error) *error = why;
             close();

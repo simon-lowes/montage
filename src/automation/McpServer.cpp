@@ -7750,6 +7750,7 @@ void McpServer::Impl::addTools() {
             "width":{"type":"integer","default":640,"description":"Width of the returned image"},
             "output":{"type":"string","description":"Also save the full-size frame here (PNG, JPEG, TIFF or AVIF by extension)"},
             "rendition":{"type":"string","description":"An HDR sequence's frame: \"\" (default) as SDR screens show it (its SDR trim target, else tone mapped to Rec.709), \"master\" (saved as a 16-bit PNG with cICP, mDCV and cLLI, a 10-bit AVIF, or a JPEG with a gain map over its SDR rendition), or a trim target's id"},
+            "gain_map":{"type":"boolean","default":false,"description":"An HDR AVIF as an 8-bit SDR base with a gain map to the HDR rendition (ISO 21496-1), rather than 10-bit PQ or HLG"},
             "quality":{"type":"integer","minimum":0,"maximum":100,"default":90,"description":"JPEG and AVIF quality"},
             "stereo_view":{"type":"string","enum":["left","right","anaglyph","sbs","sbs_half","tb","tb_half","difference"],"default":"left","description":"A stereoscopic 3D sequence: which eye, both, or where they differ"}},"required":["project","at"]})json", true,
         [](const QJsonObject& a) {
@@ -7793,6 +7794,7 @@ void McpServer::Impl::addTools() {
                     StillOptions so;
                     so.rendition = rendition;
                     so.quality = std::clamp(a.value("quality").toInt(90), 0, 100);
+                    so.gainMap = a.value("gain_map").toBool();
                     StillResult res;
                     if (!exportStill(l.project, s, at, absolute(str(a, "output")).toStdString(), &err, so, &res))
                         return fail(QString::fromStdString(err));

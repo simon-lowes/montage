@@ -5,18 +5,19 @@
 // This product includes Gain Map technology under license by Adobe.
 #pragma once
 
+#include <QByteArray>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "media/Image.h"
+#include "render/ColorSpace.h"
 
 class QImage;
 
 namespace montage {
-
-struct ColorSpace;
 
 // The map's metadata (one set for all three channels, as Montage writes it): log2 of the content boost the map's 0
 // and 1 stand for, the map's gamma, the offsets added to the SDR and HDR linear light before the ratio is taken, and
@@ -52,6 +53,31 @@ struct GainMapPicture {
     double maxNits = 0;
 };
 std::shared_ptr<const GainMapPicture> decodeGainMapJpeg(const std::string& path, std::string* error = nullptr);
+
+// An AVIF with a gain map: a tone-mapped derived item ('tmap', ISO 21496-1's metadata) from its base (the primary item)
+// and its map. Its metadata (the meta box alone is read), and its HDR rendition as decodeGainMapJpeg gives it.
+bool readGainMapAvif(const std::string& path, GainMapMetadata* metadata = nullptr);
+std::shared_ptr<const GainMapPicture> decodeGainMapAvif(const std::string& path, std::string* error = nullptr);
+// An AVIF still's primary picture as 8-bit RGB (null when it is not one); its primary item's coded data and property
+// boxes (whole, in order), for writing it into another file.
+QImage decodeAvifPicture(const std::string& path, std::string* error = nullptr);
+struct AvifCodedItem {
+    QByteArray data;
+    std::vector<QByteArray> properties;
+};
+bool readAvifCodedItem(const std::string& path, AvifCodedItem& out);
+
+// For the writers: the map's metadata and target codes (0-255, three a pixel) for an HDR picture over a base as decoders
+// see it (`seen`, 8-bit sRGB-curve code values in `basePrimaries`); the map encoded with what a decoder reads back of
+// each attempt (`roundTrip` encodes `map` and decodes it into `back`) fed back into the codes, the closest kept; and
+// ISO 21496-1's metadata block.
+bool planGainMap(const QImage& seen, Primaries basePrimaries, const Image& hdr, const ColorSpace& hdrSpace, GainMapMetadata& meta,
+                 std::vector<float>& target);
+QByteArray encodeGainMap(const std::vector<float>& target, int width, int height,
+                         const std::function<QByteArray(const QImage& map, QImage& back)>& roundTrip);
+QByteArray isoGainMapMetadata(const GainMapMetadata& m);
+// Adobe's gain map properties (hdrgm) as an XMP packet, for one set of channels.
+QByteArray adobeGainMapXmp(const GainMapMetadata& m);
 
 // Writes `sdr` (code values in `sdrSpace`, an SDR display space) as the base and the map to `hdr` (code values in
 // `hdrSpace`, PQ or HLG), as a JPEG with both kinds of metadata. Pictures premultiplied over black, the same size; the

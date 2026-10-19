@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <QBuffer>
+#include <QColorSpace>
+#include <QImageReader>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -4296,6 +4298,67 @@ colorspaces:
             QVERIFY(t.open(QIODevice::WriteOnly) && t.write(file.left(head.size() / 2 + 2)) > 0);
             t.close();
             QVERIFY(!readGainMapJpeg(camera, none));
+        }
+
+        // As an AVIF with a gain map: the same, an 8-bit base with ISO 21496-1's tone-mapped item.
+        {
+            StillOptions o = gainMap;
+            o.gainMap = true;
+            const std::string gmAvif = dir.filePath("gain-map.avif").toStdString();
+            QVERIFY2(exportStill(p, s, 0, gmAvif, &err, o, &res), err.c_str());
+            QVERIFY(res.gainMap && res.bits == 8 && res.colorSpace == "rec2100pq" && res.maxCll > 900);
+            GainMapMetadata meta;
+            QVERIFY(readGainMapAvif(gmAvif, &meta));
+            QVERIFY2(meta.hdrCapacityMax > 2.2 && meta.hdrCapacityMin == 0, qPrintable(QString::number(meta.hdrCapacityMax)));
+            // Readers without gain maps show the base: the SDR trim's render.
+            const QImage base = decodeAvifPicture(gmAvif);
+            QCOMPARE(base.size(), QSize(W, H));
+            for (int i = 0; i < 8; ++i) {
+                const QColor c = base.pixelColor(i * 32 + 16, H / 2);
+                const size_t at = (size_t(H / 2) * W + i * 32 + 16) * 4;
+                QVERIFY2(std::abs(c.red() - trimmed[at]) <= 3 && std::abs(c.green() - trimmed[at + 1]) <= 3 && std::abs(c.blue() - trimmed[at + 2]) <= 3,
+                         qPrintable(QString("AVIF base patch %1").arg(i)));
+            }
+            // It imports as HDR into a PQ sequence, every patch within 2 % in nits.
+            img = readBack(gmAvif, "rec2100pq", back);
+            QVERIFY(back.gainMap && back.colorSpace == "rec2100pq");
+            why = sameLight709([&](int x, int y, double out[3]) {
+                const float* px = img.at(x, y);
+                double n[3] = {codeToNits(pq, px[0]), codeToNits(pq, px[1]), codeToNits(pq, px[2])};
+                in709(n, out);
+            }, 0.02);
+            QVERIFY2(why.isEmpty(), qPrintable("AVIF: " + why));
+            // libavif's own tone mapping (MONTAGE_TEST_AVIFGAINMAP, its avifgainmaputil) reads the same light.
+            if (const QByteArray app = qgetenv("MONTAGE_TEST_AVIFGAINMAP"); !app.isEmpty()) {
+                const QString out = dir.filePath("libavif.png");
+                QProcess t;
+                t.start(QString::fromLocal8Bit(app), {"tonemap", QString::fromStdString(gmAvif), out, "--headroom", "6", "-d", "12", "-y", "444", "--cicp-output", "9/16/6"});
+                QVERIFY(t.waitForFinished(60000));
+                QVERIFY2(t.exitCode() == 0, t.readAllStandardError().constData());
+                QImageReader reader(out);
+                reader.setAutoTransform(false);
+                QImage tm = reader.read();  // 16-bit PQ, BT.2020 (its cICP)
+                tm.setColorSpace(QColorSpace());
+                tm = tm.convertToFormat(QImage::Format_RGBA64);
+                QCOMPARE(tm.size(), QSize(W, H));
+                why = sameLight709([&](int x, int y, double out3[3]) {
+                    const QRgba64 v = reinterpret_cast<const QRgba64*>(tm.constScanLine(y))[x];
+                    double n[3] = {codeToNits(pq, v.red() / 65535.0), codeToNits(pq, v.green() / 65535.0), codeToNits(pq, v.blue() / 65535.0)};
+                    in709(n, out3);
+                }, 0.02);
+                QVERIFY2(why.isEmpty(), qPrintable("avifgainmaputil: " + why));
+            } else {
+                qInfo("MONTAGE_TEST_AVIFGAINMAP not set: the gain-map AVIF is not checked with libavif");
+            }
+            // In a Rec.709 sequence: its SDR picture.
+            img = readBack(gmAvif, "rec709", back);
+            const std::vector<uint8_t> got = toRgba8(img);
+            for (int i = 0; i < 8; ++i) {
+                const size_t at = (size_t(H / 2) * W + i * 32 + 16) * 4;
+                QVERIFY2(std::abs(int(got[at]) - trimmed[at]) <= 3 && std::abs(int(got[at + 1]) - trimmed[at + 1]) <= 3 &&
+                             std::abs(int(got[at + 2]) - trimmed[at + 2]) <= 3,
+                         qPrintable(QString("AVIF SDR picture patch %1").arg(i)));
+            }
         }
 
         // For SDR screens (the default): the SDR trim's render, as an 8-bit PNG.
