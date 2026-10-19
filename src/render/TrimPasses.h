@@ -26,7 +26,8 @@ const TrimTarget* findTrimTarget(const Sequence& s, const std::string& id);
 const ColorSpace& trimTargetSpace(const Sequence& s, const std::string& id);
 double trimTargetPeak(const Sequence& s, const std::string& id);
 
-// A trim's controls: lift, gamma, gain, saturation, highlights, mid_detail, each with its default (no change).
+// A trim's controls: lift, gamma, gain, saturation, highlights, mid_detail, each with its default (no change), and
+// peak: the shot's brightest light in nits (0 = the master's peak), which the target's roll-off starts from.
 struct TrimControl {
     const char* name;
     const char* label;
@@ -40,6 +41,11 @@ bool isNeutralTrim(const Effect& trim, FrameTime t);
 const Clip* trimShot(const Sequence& s, FrameTime t);
 // The program frame at t, in the sequence's space (premultiplied), as `target` shows it: in its space and trimmed.
 void applyTrimPass(Image& img, const Sequence& s, FrameTime t, const TrimTarget& target);
+// The same with a given trim (null: none) at `local` frames into its shot.
+void applyTrim(Image& img, const Sequence& s, const TrimTarget& target, const Effect* trim, FrameTime local);
+// The master light an SDR target shows just short of white (Montage's HDR-to-SDR mapping puts it at 98 %): a shot's
+// peak is rolled off to it.
+constexpr double kSdrHeadroomNits = 280;
 // BT.2390's EETF on PQ code values: the brightest channel rolled off from `fromNits` to `toNits`, hue kept.
 void rollOffPq(Image& img, double fromNits, double toNits);
 

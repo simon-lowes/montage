@@ -193,6 +193,13 @@ public:
     // and saved with it (render/LightLevel.h), one undo step, for exports that state them up front; `ask` shows the
     // result with a way to the brightest frame. False (with a message) for SDR sequences or when cancelled.
     bool analyseHdrLightLevels(bool ask = true);
+    // Trims › Analyse Trims: every shot's light measured from the HDR master over In to Out (or all of it) and a starting
+    // trim for each target put on the shots that have none of their own (render/AutoTrims.h), one undo step. False
+    // (with a message) for SDR masters, when there are no targets or nothing to fill, or when cancelled.
+    bool analyseTrims();
+    // Trims › Master Beside: the Program monitor split between the master (left) and the target shown (right).
+    void setMasterBeside(bool on);
+    bool masterBeside() const { return masterBeside_; }
     // Edit > Control Surface: the Mackie Control surface's MIDI ports (one dialog, shown and returned).
     QDialog* controlSurfaceDialog();
     ControlSurface* controlSurface() const { return surface_; }
@@ -612,6 +619,9 @@ private:
     Id voiceRefClip_ = 0;  // and its clip, for Dialogue Match (in the project of that generation)
     uint64_t voiceRefGeneration_ = 0;
     QAction* compareRef_ = nullptr;
+    bool masterBeside_ = false;
+    QTimer* masterTimer_ = nullptr;
+    void refreshMasterBeside();
     QAction* trimView_ = nullptr;  // Playback › Two-Up Trim View
     class ReviewOverlay* reviewOverlay_ = nullptr;  // reviewers' drawings over the Program monitor
     QAction* hdrViewer_ = nullptr;  // Playback › HDR Viewer

@@ -11841,6 +11841,13 @@ const auto seq = [this] { return state()->sequence(); };
         const QString path = dir_.path() + "/trims-demo.montage";
         Project demo = demoProject();
         demo.active()->colorSpace = "rec2100pq";
+        {
+            // (Blue three stops brighter: highlights an SDR trim has to roll off)
+            Effect brighter = makeEffect(demo, "color_correct");
+            brighter.params["exposure"] = 3.0;
+            for (Clip& c : demo.active()->videoTracks[0].clips)
+                if (c.name == "Blue") c.effects.push_back(brighter);
+        }
         QVERIFY(saveProject(demo, path.toStdString()));
         QVERIFY(win_->openProject(path));
         auto* trims = win_->findChild<TrimPanel*>();
@@ -11882,6 +11889,38 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(trims->shot(), blue);
         QVERIFY(trims->resetShot());
         QVERIFY(edit::clipById(*state()->sequence(), blue)->trims.empty());
+
+        // Analyse Trims: a starting trim for Blue (it has none) in one undo step; Red keeps its own.
+        auto* analyse = win_->findChild<QPushButton*>("analyseTrims");
+        QVERIFY(analyse && analyse->isEnabled());
+        const auto redTrims = edit::clipById(*state()->sequence(), red)->trims;
+        QVERIFY2(win_->analyseTrims(), qPrintable(win_->statusBar()->currentMessage()));
+        QVERIFY(edit::clipById(*state()->sequence(), red)->trims == redTrims);
+        QVERIFY(edit::clipById(*state()->sequence(), blue)->trims.at("sdr").p("peak", 0, 0) > 0);
+        QCOMPARE(win_->findChild<QDoubleSpinBox*>("trim_peak")->value(), edit::clipById(*state()->sequence(), blue)->trims.at("sdr").p("peak", 0, 0));
+        state()->undo();
+        QVERIFY(edit::clipById(*state()->sequence(), blue)->trims.empty());
+        QVERIFY(edit::clipById(*state()->sequence(), red)->trims == redTrims);
+        state()->redo();
+        QVERIFY(!win_->analyseTrims());
+        QVERIFY(win_->statusBar()->currentMessage().contains("already has a trim of its own"));
+
+        // Master Beside: the Program monitor split, the master on the left, until the master itself is shown.
+        MonitorPanel* programPanel = nullptr;
+        for (auto* mp : win_->findChildren<MonitorPanel*>())
+            if (mp->mode() == MonitorPanel::Mode::Program) programPanel = mp;
+        auto* beside = win_->findChild<QToolButton*>("trimMasterBeside");
+        QVERIFY(beside && beside->isEnabled());
+        beside->click();
+        QVERIFY(win_->masterBeside() && programPanel->viewer()->comparing());
+        state()->setPlayhead(20);
+        QVERIFY(programPanel->viewer()->comparing());
+        trims->showTarget(QString());
+        QVERIFY(!win_->masterBeside() && !beside->isChecked() && !programPanel->viewer()->comparing());
+        trims->showTarget("sdr");
+        win_->setMasterBeside(true);
+        win_->setMasterBeside(false);
+        QVERIFY(!programPanel->viewer()->comparing());
 
         // Queue Passes: a render of each target, delivering it.
         RenderQueue* queue = win_->renderQueue();

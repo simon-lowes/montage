@@ -141,6 +141,7 @@
 #include "render/OGraf.h"
 #include "render/Gallery.h"
 #include "render/DialogueLoudness.h"
+#include "render/AutoTrims.h"
 #include "render/TrimPasses.h"
 #include "media/Segmenter.h"
 #include "render/Compositor.h"
@@ -7076,16 +7077,24 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_trim", "HDR and SDR trim passes",
-        "Trim passes (Resolve's MultiMaster Trim): the sequence graded once (its master, usually HDR) delivered to other "
+        "Trim passes: the sequence graded once (its master, usually HDR) delivered to other "
         "displays, each a trim target: a preset (sdr: Rec.709 100 nits; hdr10-1000, hdr10-600, hdr10-300: PQ rolled off "
         "to that peak; hlg) or a space and peak of its own. Each shot (the top picture clip on screen) can be trimmed for "
         "a target on its code values: lift (-0.5..0.5), gamma (-1..1), gain (0..2), saturation (0..2), highlights (a "
-        "roll-off, 0..1) and mid_detail (-1..1), keyframed with `keyframe` (or where a control has keys). list gives the targets and the "
-        "clips' trims; add_target, remove_target; set a clip's controls (at a timeline time, default the playhead); "
-        "reset clips' trims; copy one clip's trim to others. montage_render's trim_target delivers a target.",
+        "roll-off, 0..1) and mid_detail (-1..1), keyframed with `keyframe` (or where a control has keys), and peak (the "
+        "shot's brightest light in nits, which the target's roll-off starts from; 0 the master's peak). list gives the "
+        "targets and the clips' trims; add_target, remove_target; set a clip's controls (at a timeline time, default the "
+        "playhead); reset clips' trims; copy one clip's trim to others; analyse measures each shot's light in an HDR "
+        "master (between `from` and `to`, default all) and gives every shot with no trim of its own a starting trim for "
+        "`target` (default every target), shots of one colour group pulled towards their median, returning each shot's "
+        "light and trims (whether each was filled, kept the shot's own or is on a locked track; `measure_only` changes "
+        "nothing). montage_render's trim_target delivers a target.",
         R"json({"type":"object","properties":{"project":{"type":"string"},
-            "action":{"type":"string","enum":["list","add_target","remove_target","set","reset","copy"],"default":"list"},
+            "action":{"type":"string","enum":["list","add_target","remove_target","set","reset","copy","analyse"],"default":"list"},
             "target":{"type":"string","description":"A target's id; add_target: a preset (sdr, hdr10-1000, hdr10-600, hdr10-300, hlg) or omitted with color_space"},
+            "from":{"type":["number","string"],"description":"analyse: timeline time to start at (default the start)"},
+            "to":{"type":["number","string"],"description":"analyse: timeline time to end at (exclusive; default the end)"},
+            "measure_only":{"type":"boolean","default":false,"description":"analyse: return the light and trims without filling them"},
             "color_space":{"type":"string","description":"add_target: a display space (rec709, rec2100pq, rec2100hlg...)"},
             "peak_nits":{"type":"number","description":"add_target: the display's peak (PQ)"},
             "name":{"type":"string","description":"add_target: its name"},
@@ -7174,7 +7183,62 @@ void McpServer::Impl::addTools() {
                 const Clip& c = videoClipArg(l, a);
                 return done(edit::copyTrim(s, c.id, clipsArg(), need(a, "target").toStdString()), QStringLiteral("Copied"));
             }
-            throw ArgError{"\"action\" is list, add_target, remove_target, set, reset or copy"};
+            if (action == "analyse") {
+                std::vector<std::string> targets;
+                if (a.contains("target")) {
+                    if (!findTrimTarget(s, need(a, "target").toStdString())) return fail("No trim target " + str(a, "target"));
+                    targets.push_back(str(a, "target").toStdString());
+                }
+                for (const TrimTarget& tt : s.trimTargets)
+                    if (!a.contains("target")) targets.push_back(tt.id);
+                if (targets.empty()) return fail("Add a trim target first (add_target)");
+                const FrameTime from = a.contains("from") ? timeArg(a.value("from"), s, "from") : 0;
+                const FrameTime to = a.contains("to") ? timeArg(a.value("to"), s, "to") : 0;
+                if (a.contains("to") && to <= from) throw ArgError{"\"to\" must be after \"from\""};
+                std::vector<ShotLight> lights;
+                std::string err;
+                if (!measureShotLight(l.project, s, from, to, lights, &err)) return fail(QString::fromStdString(err));
+                std::vector<AutoTrim> trims;
+                for (const std::string& t : targets) {
+                    const std::vector<AutoTrim> some = solveAutoTrims(s, t, lights);
+                    trims.insert(trims.end(), some.begin(), some.end());
+                }
+                // (which shots have their own, and which are on locked tracks, before filling)
+                std::map<std::pair<Id, std::string>, bool> own, locked;
+                for (const AutoTrim& t : trims)
+                    if (const Clip* c = edit::clipById(s, t.clip)) {
+                        own[{t.clip, t.target}] = hasOwnTrim(*c, t.target);
+                        const auto loc = edit::locate(s, t.clip);
+                        const Track* tr = loc ? trackAt(s, loc->track) : nullptr;
+                        locked[{t.clip, t.target}] = !tr || tr->locked;
+                    }
+                const bool measureOnly = a.value("measure_only").toBool();
+                FrameTime filled = 0;
+                if (!measureOnly) {
+                    const auto r = edit::fillAutoTrims(s, trims);
+                    if (r.ok) save(l), filled = r.applied;
+                }
+                QJsonArray shots;
+                for (const ShotLight& sl : lights) {
+                    const Clip* c = edit::clipById(s, sl.clip);
+                    QJsonArray its;
+                    for (const AutoTrim& t : trims) {
+                        if (t.clip != sl.clip) continue;
+                        QJsonObject values;
+                        for (const auto& [k, v] : t.values) values[QString::fromStdString(k)] = v;
+                        its.append(QJsonObject{{"target", QString::fromStdString(t.target)}, {"values", values},
+                                               {"aimed_grey_nits", t.aimedGrey}, {"kept_own", own[{t.clip, t.target}]},
+                                               {"locked", locked[{t.clip, t.target}]},
+                                               {"filled", !measureOnly && !own[{t.clip, t.target}] && !locked[{t.clip, t.target}]}});
+                    }
+                    shots.append(QJsonObject{{"clip", double(sl.clip)}, {"name", c ? QString::fromStdString(c->name) : QString()},
+                                             {"from", double(sl.from)}, {"to", double(sl.to)}, {"log_average_nits", sl.logAverage},
+                                             {"low_nits", sl.low}, {"high_nits", sl.high}, {"peak_nits", sl.peak}, {"trims", its}});
+                }
+                return ok(QStringLiteral("%1 shot(s) measured, %2 trim(s) filled").arg(lights.size()).arg(filled),
+                          QJsonObject{{"shots", shots}, {"filled", double(filled)}});
+            }
+            throw ArgError{"\"action\" is list, add_target, remove_target, set, reset, copy or analyse"};
         });
 
     add("montage_match_chart", "Match a colour chart",
