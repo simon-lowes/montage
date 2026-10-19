@@ -42,12 +42,9 @@ std::function<bool(const std::string&)>& analysedDepthCheck() {
     return check;
 }
 
-// Whether the effect works from the picture's depth.
+// Whether the effect takes the clip's analysed depth (Sky Replacement does with Use Depth on, model or not).
 bool usesDepth(const Effect& e) {
-    if (!e.enabled) return false;
-    const std::string& t = e.type;
-    return t == "depth_blur" || t == "depth_fog" || t == "depth_map" || t == "relight" || e.p("mask.depth", 0) > 0.5 ||
-           (t == "sky_replace" && e.p("use_depth", 0, 1) > 0.5 && optionalModelThere("depth"));
+    return needsDepth(e, 0) || (e.enabled && e.type == "sky_replace" && e.p("use_depth", 0, 1) > 0.5);
 }
 
 }  // namespace
@@ -116,8 +113,10 @@ void walk(Provenance& out, const Project& p, const Sequence& s, std::set<Id>& se
                 }
                 mediaUses(out, *m);
                 if (m->kind == MediaKind::Video && analysedDepthCheck()) {
+                    // (not a view reframed from 360°, which takes its depth from the view)
                     const auto chain = gradeChain(s, c);
-                    if (std::any_of(chain.begin(), chain.end(), [](const Effect* e) { return usesDepth(*e); }) && analysedDepthCheck()(m->path))
+                    const bool reframed = std::any_of(c.effects.begin(), c.effects.end(), [](const Effect& e) { return e.enabled && e.type == "reframe_360"; });
+                    if (!reframed && std::any_of(chain.begin(), chain.end(), [](const Effect* e) { return usesDepth(*e); }) && analysedDepthCheck()(m->path))
                         add(out, {"Steady Depth", "Video Depth Anything Small", AiRole::Assisted});
                 }
                 if (!m->path.empty() && std::find(out.sources.begin(), out.sources.end(), m->path) == out.sources.end())

@@ -8348,7 +8348,7 @@ void McpServer::Impl::addTools() {
         "The clip's depth effects (depth_blur, depth_fog, depth_map, relight, depth masks, sky_replace's depth) then use "
         "it. Analysing again replaces it. Returns whether it covers the clip.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
-            "size":{"type":"integer","default":518,"description":"The analysis's short side in pixels (a multiple of 14; less is faster)"},
+            "size":{"type":"integer","default":518,"description":"The analysis's short side in pixels (a multiple of 14, 140 to 770; less is faster)"},
             "check":{"type":"boolean","default":false,"description":"Only report whether the clip is analysed"}},
             "required":["project","clip"]})json",
         false, [this](const QJsonObject& a) {
@@ -8357,8 +8357,9 @@ void McpServer::Impl::addTools() {
             const Clip& c = clipArg(l, a);
             const bool covered = clipDepthAnalysed(l.project, s, c);
             if (a.value("check").toBool()) return ok(covered ? QStringLiteral("Analysed") : QStringLiteral("Not analysed"), QJsonObject{{"analysed", covered}});
-            const int size = a.value("size").toInt(518);
-            if (size < 140 || size > 1036 || size % 14) throw ArgError{"\"size\" is a multiple of 14 from 140 to 1036"};
+            const double sizeArg = a.contains("size") ? a.value("size").toDouble(-1) : 518;
+            const int size = int(sizeArg);
+            if (sizeArg != size || size < 140 || size > 770 || size % 14) throw ArgError{"\"size\" is a multiple of 14 from 140 to 770"};
             if (!videoDepthAvailable() || !videoDepthModel().installed())
                 return fail("Steady depth needs the video depth model: run `scripts/fetch-models.sh` or analyse once in the app");
             std::string err;
@@ -8399,7 +8400,7 @@ void McpServer::Impl::addTools() {
             fs.x = a.contains("x") ? a.value("x").toDouble(-1) : e->p("point_x", fs.at, 0.5);
             fs.y = a.contains("y") ? a.value("y").toDouble(-1) : e->p("point_y", fs.at, 0.5);
             if (!(fs.x >= 0 && fs.x <= 1 && fs.y >= 0 && fs.y <= 1)) throw ArgError{"\"x\" and \"y\" are fractions of the frame, 0 to 1"};
-            fs.ease = a.value("ease").toDouble(0.3);
+            fs.ease = a.contains("ease") ? a.value("ease").toDouble(-1) : 0.3;
             if (!(fs.ease >= 0 && fs.ease <= 10)) throw ArgError{"\"ease\" is seconds, 0 to 10"};
             if (fs.target == FocusTarget::Face && (!faceSearchAvailable() || !faceModel().installed()))
                 return fail("Following a face needs the face model: run `scripts/fetch-models.sh`");

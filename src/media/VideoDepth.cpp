@@ -5,6 +5,7 @@
 #include "VideoDepth.h"
 
 #include <QByteArray>
+#include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
@@ -13,14 +14,19 @@
 #include <QStandardPaths>
 #include <QString>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <deque>
 #include <map>
 #include <mutex>
+#include <new>
+#include <thread>
 #include <vector>
 
 #include "Decoder.h"
+#include "ImageSequence.h"
 #include "SuperScale.h"
 #include "core/Zip.h"
 
@@ -275,18 +281,25 @@ bool estimateVideoDepth(int count, const std::function<bool(int, Image&)>& frame
     };
     const int step = kWindow - kOverlap;
     const int windows = (count + step - 1) / step;
-    std::vector<Features> previous;  // the last window's frames
+    std::vector<Features> previous;  // the last window's key frames (kKeyframes), which start the next
     std::deque<std::pair<int, DepthMap>> tail;  // aligned frames not yet given out: the last eight are blended again
     std::vector<float> ref[kAlign];  // what each window is aligned to: the first frame's depth, and the last window's twelfth
-    std::vector<float> samples;      // of every frame given out, for the run's percentiles
+    std::vector<float> samples;      // of every frame given out, for the run's percentiles (thinned to stay small)
+    size_t thin = 1;                 // (every thin-th sample of a frame's 4096 kept)
+    constexpr size_t kMostSamples = size_t(1) << 21;
     int given = 0;
     auto giveOut = [&](int upTo) {
         while (!tail.empty() && tail.front().first < upTo) {
             const auto& [index, map] = tail.front();
             if (index < count) {
                 if (!sink(index, map)) return cancelled();
-                const size_t stride = std::max<size_t>(1, map.values.size() / 4096);
+                const size_t stride = std::max<size_t>(1, map.values.size() / 4096) * thin;
                 for (size_t i = 0; i < map.values.size(); i += stride) samples.push_back(map.values[i]);
+                if (samples.size() > kMostSamples) {  // (a long clip: every other kept, and half as many from now on)
+                    for (size_t i = 0; 2 * i < samples.size(); ++i) samples[i] = samples[2 * i];
+                    samples.resize((samples.size() + 1) / 2);
+                    thin *= 2;
+                }
                 given = index + 1;
             }
             tail.pop_front();
@@ -299,7 +312,7 @@ bool estimateVideoDepth(int count, const std::function<bool(int, Image&)>& frame
             const int start = w * step;
             std::vector<Features> inputs(kWindow);
             for (int i = 0; i < kWindow; ++i) {
-                if (w > 0 && i < kOverlap) inputs[size_t(i)] = previous[size_t(kKeyframes[i])];
+                if (w > 0 && i < kOverlap) inputs[size_t(i)] = std::move(previous[size_t(i)]);
                 else if (!encode(start + i, inputs[size_t(i)])) return false;
             }
             // The window's temporal pass.
@@ -360,13 +373,17 @@ bool estimateVideoDepth(int count, const std::function<bool(int, Image&)>& frame
                 }
                 ref[1] = depth[size_t(kKeyframes[1])].values;
             }
-            previous = std::move(inputs);
+            previous.assign(size_t(kOverlap), Features{});
+            for (int i = 0; i < kOverlap; ++i) previous[size_t(i)] = std::move(inputs[size_t(kKeyframes[i])]);
             // Every frame but the last eight is final.
             if (!giveOut(start + kWindow - kInterp)) return false;
         }
         if (!giveOut(count)) return false;
     } catch (const Ort::Exception& e) {
         if (error) *error = std::string("Video depth estimation failed: ") + e.what();
+        return false;
+    } catch (const std::bad_alloc&) {
+        if (error) *error = "Not enough memory for the video depth analysis: try a smaller size";
         return false;
     }
     if (given < count) {
@@ -388,9 +405,12 @@ bool estimateVideoDepth(int count, const std::function<bool(int, Image&)>& frame
 
 // ---- Kept analyses ------------------------------------------------------------------------------------------------
 // A file per analysed media file, named by a hash of its path:
-//   "MDEP" version(u32=1) mediaSize(i64) mediaModified(i64 ms) start(f64) step(f64) count(i32) width(i32) height(i32)
+//   "MDEP" version(u32=2) mediaSize(i64) mediaModified(i64 ms) start(f64) step(f64) frame(f64: the media's frame, s)
+//   count(i32) width(i32) height(i32)
 //   lo(f32) hi(f32) pathLength(u32) path offsets[count + 1](u64), then each frame: its least and greatest disparity
-//   (f32, f32) and its values as 16 bits between them, each row's differences from the left, deflated (qCompress).
+//   (f32, f32) and its values as 12 bits between them (in 16), each row's differences from the left, deflated
+//   (qCompress). (Twelve bits are 4096 steps across the frame's depth, finer than its effects tell; 16 kept the model's
+//   noise and took over twice the room.) The folder is kept under a size: the analyses longest unchanged go first.
 
 std::string videoDepthCacheDirectory() {
     const QByteArray env = qgetenv("MONTAGE_DEPTH_CACHE");
@@ -400,7 +420,7 @@ std::string videoDepthCacheDirectory() {
 
 namespace {
 
-constexpr uint32_t kKeptVersion = 1;
+constexpr uint32_t kKeptVersion = 2;
 
 QString keptPath(const std::string& media) {
     const QString abs = QFileInfo(QString::fromStdString(media)).absoluteFilePath();
@@ -410,7 +430,7 @@ QString keptPath(const std::string& media) {
 
 struct Kept {
     int64_t mediaSize = 0, mediaModified = 0;
-    double start = 0, step = 0;
+    double start = 0, step = 0, frame = 0;
     int count = 0, width = 0, height = 0;
     float lo = 0, hi = 1;
     std::string path;
@@ -426,8 +446,9 @@ void writeValue(QByteArray& out, const T& v) {
     out.append(reinterpret_cast<const char*>(&v), qsizetype(sizeof v));
 }
 
+// The file's size and modification time (of the file on disk: a path read with Interpret Footage settings is its file's).
 bool mediaStamp(const std::string& media, int64_t& size, int64_t& modified) {
-    const QFileInfo fi(QString::fromStdString(media));
+    const QFileInfo fi(QString::fromStdString(mediaFileOnDisk(media)));
     if (!fi.exists()) return false;
     size = fi.size();
     modified = fi.lastModified().toMSecsSinceEpoch();
@@ -441,8 +462,8 @@ bool readKept(const QString& file, Kept& k) {
     uint32_t version = 0, length = 0;
     if (f.read(magic, 4) != 4 || std::memcmp(magic, "MDEP", 4) != 0 || !readValue(f, version) || version != kKeptVersion) return false;
     if (!readValue(f, k.mediaSize) || !readValue(f, k.mediaModified) || !readValue(f, k.start) || !readValue(f, k.step) ||
-        !readValue(f, k.count) || !readValue(f, k.width) || !readValue(f, k.height) || !readValue(f, k.lo) || !readValue(f, k.hi) ||
-        !readValue(f, length) || length > 65536 || k.count <= 0 || k.width <= 0 || k.height <= 0)
+        !readValue(f, k.frame) || !readValue(f, k.count) || !readValue(f, k.width) || !readValue(f, k.height) || !readValue(f, k.lo) || !readValue(f, k.hi) ||
+        !readValue(f, length) || length > 65536 || k.count <= 0 || k.width <= 0 || k.height <= 0 || !(k.frame > 0) || !(k.step > 0))
         return false;
     const QByteArray path = f.read(length);
     if (path.size() != qsizetype(length)) return false;
@@ -462,7 +483,7 @@ QByteArray packFrame(const DepthMap& m) {
         uint16_t left = 0;
         for (int x = 0; x < m.width; ++x) {
             const size_t i = size_t(y) * size_t(m.width) + size_t(x);
-            const auto v = uint16_t(std::lround(std::clamp((m.values[i] - a) / span, 0.0f, 1.0f) * 65535));
+            const auto v = uint16_t(std::lround(std::clamp((m.values[i] - a) / span, 0.0f, 1.0f) * 4095));
             q[i] = uint16_t(v - left);
             left = v;
         }
@@ -492,7 +513,7 @@ bool unpackFrame(const QByteArray& blob, const Kept& k, DepthMap& out) {
         for (int x = 0; x < k.width; ++x) {
             const size_t i = size_t(y) * size_t(k.width) + size_t(x);
             v = uint16_t(v + q[i]);
-            const float d = a + (z - a) * (v / 65535.0f);
+            const float d = a + (z - a) * (v / 4095.0f);
             out.values[i] = std::clamp((d - k.lo) / span, 0.0f, 1.0f);
         }
     }
@@ -500,28 +521,42 @@ bool unpackFrame(const QByteArray& blob, const Kept& k, DepthMap& out) {
 }
 
 std::mutex gKeptMutex;
-std::map<std::string, std::pair<QString, std::shared_ptr<const Kept>>> gKept;  // by media path: its file and header (null: none)
-std::deque<std::pair<std::string, std::shared_ptr<const DepthMap>>> gFrames;  // recently read frames, by "<file>|<index>"
+struct KeptEntry {
+    QString file;
+    int64_t stamp = 0;  // the kept file's modification time and size, as read (0: none there)
+    std::shared_ptr<const Kept> kept;  // (null: none for the file as it is)
+};
+std::map<std::string, KeptEntry> gKept;  // by media path
+std::deque<std::pair<std::string, std::shared_ptr<const DepthMap>>> gFrames;  // recently read frames, by "<file>|<stamp>|<index>"
 
-// The kept analysis of `media` as the file is now, or null.
-std::shared_ptr<const Kept> keptFor(const std::string& media, QString& file) {
-    int64_t size, modified;
-    if (!mediaStamp(media, size, modified)) return nullptr;
-    std::lock_guard lock(gKeptMutex);
-    auto it = gKept.find(media);
-    if (it == gKept.end() || (it->second.second && (it->second.second->mediaSize != size || it->second.second->mediaModified != modified))) {
-        auto k = std::make_shared<Kept>();
-        const QString path = keptPath(media);
-        if (!readKept(path, *k) || k->mediaSize != size || k->mediaModified != modified) k.reset();
-        if (gKept.size() > 64) gKept.clear();
-        it = gKept.insert_or_assign(media, std::make_pair(path, std::shared_ptr<const Kept>(k))).first;
-    }
-    file = it->second.first;
-    return it->second.second;
+int64_t keptStamp(const QString& file) {
+    const QFileInfo fi(file);
+    return fi.exists() ? fi.lastModified().toMSecsSinceEpoch() * 4096 + (fi.size() & 4095) : 0;
 }
 
-std::shared_ptr<const DepthMap> keptFrame(const QString& file, const Kept& k, int index) {
-    const std::string key = file.toStdString() + "|" + std::to_string(k.mediaModified) + "|" + std::to_string(index);
+// The kept analysis of `media` as the file is now, or null; read again when it or the kept file changes (another
+// process may analyse it).
+std::shared_ptr<const Kept> keptFor(const std::string& media, QString& file, int64_t& stamp) {
+    int64_t size, modified;
+    if (!mediaStamp(media, size, modified)) return nullptr;
+    const QString path = keptPath(media);
+    const int64_t now = keptStamp(path);
+    std::lock_guard lock(gKeptMutex);
+    auto it = gKept.find(media);
+    if (it == gKept.end() || it->second.stamp != now ||
+        (it->second.kept && (it->second.kept->mediaSize != size || it->second.kept->mediaModified != modified))) {
+        auto k = std::make_shared<Kept>();
+        if (!now || !readKept(path, *k) || k->mediaSize != size || k->mediaModified != modified) k.reset();
+        if (gKept.size() > 64) gKept.clear();
+        it = gKept.insert_or_assign(media, KeptEntry{path, now, std::shared_ptr<const Kept>(k)}).first;
+    }
+    file = it->second.file;
+    stamp = it->second.stamp;
+    return it->second.kept;
+}
+
+std::shared_ptr<const DepthMap> keptFrame(const QString& file, int64_t stamp, const Kept& k, int index) {
+    const std::string key = file.toStdString() + "|" + std::to_string(stamp) + "|" + std::to_string(index);
     {
         std::lock_guard lock(gKeptMutex);
         for (const auto& [name, map] : gFrames)
@@ -530,6 +565,8 @@ std::shared_ptr<const DepthMap> keptFrame(const QString& file, const Kept& k, in
     QFile f(file);
     if (!f.open(QIODevice::ReadOnly) || !f.seek(qint64(k.offsets[size_t(index)]))) return nullptr;
     const QByteArray blob = f.read(qint64(k.offsets[size_t(index) + 1] - k.offsets[size_t(index)]));
+    f.close();
+    if (keptStamp(file) != stamp) return nullptr;  // (analysed again meanwhile: not this header's frame)
     auto map = std::make_shared<DepthMap>();
     if (!unpackFrame(blob, k, *map)) return nullptr;
     std::lock_guard lock(gKeptMutex);
@@ -540,28 +577,39 @@ std::shared_ptr<const DepthMap> keptFrame(const QString& file, const Kept& k, in
 
 }  // namespace
 
-bool analysedDepthRange(const std::string& path, double& start, double& end) {
+bool analysedDepthRange(const std::string& path, double& start, double& end, double* step) {
     QString file;
-    auto k = keptFor(path, file);
+    int64_t stamp;
+    auto k = keptFor(path, file, stamp);
     if (!k) return false;
     start = k->start;
     end = k->start + k->step * (k->count - 1);
+    if (step) *step = k->step;
     return true;
+}
+
+std::string analysedDepthStamp(const std::string& path) {
+    QString file;
+    int64_t stamp;
+    return keptFor(path, file, stamp) ? std::to_string(stamp) : std::string();
 }
 
 std::shared_ptr<const DepthMap> analysedDepth(const std::string& path, double seconds) {
     QString file;
-    auto k = keptFor(path, file);
+    int64_t stamp;
+    auto k = keptFor(path, file, stamp);
     if (!k) return nullptr;
-    const double pos = k->step > 0 ? (seconds - k->start) / k->step : 0;
+    // The frame shown at that time (the one starting at or before it), not a mix of it and the next.
+    const double shown = std::floor(seconds / k->frame + 1e-4) * k->frame;
+    const double pos = (shown - k->start) / k->step;
     if (pos < -1 || pos > k->count) return nullptr;
     const double at = std::clamp(pos, 0.0, double(k->count - 1));
-    const int i0 = int(std::floor(at));
-    const double frac = at - i0;
-    if (frac < 1e-3 || i0 + 1 >= k->count) return keptFrame(file, *k, i0);
-    if (frac > 1 - 1e-3) return keptFrame(file, *k, i0 + 1);
-    // Between two analysed frames (footage above 30 frames a second): the two mixed.
-    auto a = keptFrame(file, *k, i0), b = keptFrame(file, *k, i0 + 1);
+    const int i0 = int(std::floor(at + 1e-3));
+    const double frac = std::max(0.0, at - i0);
+    if (frac < 1e-3 || i0 + 1 >= k->count) return keptFrame(file, stamp, *k, std::min(i0, k->count - 1));
+    if (frac > 1 - 1e-3) return keptFrame(file, stamp, *k, i0 + 1);
+    // Between two analysed frames (footage above 30 frames a second, analysed every few): the two mixed.
+    auto a = keptFrame(file, stamp, *k, i0), b = keptFrame(file, stamp, *k, i0 + 1);
     if (!a || !b) return a ? a : b;
     auto mixed = std::make_shared<DepthMap>(*a);
     const float t = float(frac);
@@ -592,7 +640,16 @@ bool analyzeVideoDepth(const std::string& path, double start, double end, int si
     const double fps = dec.fps() > 0 ? dec.fps() : 25;
     const int stride = std::max(1, int(std::lround(fps / 30)));
     const double last = std::max(0.0, dec.duration() - 0.5 / fps);
-    const double a = std::clamp(std::min(start, end), 0.0, last), z = std::clamp(std::max(start, end), a, last);
+    double a = std::clamp(std::min(start, end), 0.0, last), z = std::clamp(std::max(start, end), a, last);
+    // What was analysed before stays analysed: the file's analysis covers both (one stretch of depth for both).
+    {
+        QString was;
+        int64_t stamp;
+        if (auto old = keptFor(path, was, stamp); old && std::fabs(old->frame - 1 / fps) < 1e-9) {
+            a = std::clamp(std::min(a, old->start), 0.0, last);
+            z = std::clamp(std::max(z, old->start + old->step * (old->count - 1)), a, last);
+        }
+    }
     const long first = long(std::floor(a * fps + 1e-6)), lastFrame = long(std::floor(z * fps + 1e-6));
     const int count = int(std::max(1L, (lastFrame - first) / stride + 1));
     // Decoded straight to the size the model runs at.
@@ -608,7 +665,8 @@ bool analyzeVideoDepth(const std::string& path, double start, double end, int si
     };
     QDir().mkpath(QString::fromStdString(videoDepthCacheDirectory()));
     const QString file = keptPath(path);
-    QFile out(file + ".part");
+    static std::atomic<int> runs{0};  // (analyses of one file at once each write their own)
+    QFile out(file + QStringLiteral(".%1-%2.part").arg(QCoreApplication::applicationPid()).arg(++runs));
     if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
         if (error) *error = "Cannot write " + out.fileName().toStdString();
         return false;
@@ -616,7 +674,7 @@ bool analyzeVideoDepth(const std::string& path, double start, double end, int si
     const QByteArray absolute = QFileInfo(QString::fromStdString(path)).absoluteFilePath().toUtf8();
     Kept k;
     k.mediaSize = mediaSize, k.mediaModified = modified;
-    k.start = double(first) / fps, k.step = stride / fps, k.count = count;
+    k.start = double(first) / fps, k.step = stride / fps, k.frame = 1 / fps, k.count = count;
     k.offsets.assign(size_t(count) + 1, 0);
     auto header = [&] {
         QByteArray h("MDEP", 4);
@@ -625,6 +683,7 @@ bool analyzeVideoDepth(const std::string& path, double start, double end, int si
         writeValue(h, k.mediaModified);
         writeValue(h, k.start);
         writeValue(h, k.step);
+        writeValue(h, k.frame);
         writeValue(h, k.count);
         writeValue(h, k.width);
         writeValue(h, k.height);
@@ -661,10 +720,28 @@ bool analyzeVideoDepth(const std::string& path, double start, double end, int si
         return false;
     }
     out.close();
-    QFile::remove(file);
-    if (!QFile::rename(out.fileName(), file)) {
+    // (Windows will not replace a file another thread is reading from: it reads a frame at a time, so try again.)
+    bool moved = false;
+    for (int tries = 0; tries < 40 && !moved; ++tries) {
+        if (tries) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        QFile::remove(file);
+        moved = QFile::rename(out.fileName(), file);
+    }
+    if (!moved) {
+        out.remove();
         if (error) *error = "Cannot write " + file.toStdString();
         return false;
+    }
+    // The folder kept under its size ($MONTAGE_DEPTH_CACHE_GB, 20 by default): the others longest unchanged removed.
+    {
+        bool given = false;
+        const double gb = qEnvironmentVariableIntValue("MONTAGE_DEPTH_CACHE_GB", &given);
+        const qint64 most = qint64((given && gb > 0 ? gb : 20) * 1024 * 1024 * 1024);
+        QFileInfoList kept = QDir(QString::fromStdString(videoDepthCacheDirectory())).entryInfoList({"*.mdepth"}, QDir::Files, QDir::Time);
+        qint64 total = 0;
+        for (const QFileInfo& fi : kept) total += fi.size();
+        for (qsizetype i = kept.size(); i-- > 0 && total > most;)
+            if (kept[i].absoluteFilePath() != QFileInfo(file).absoluteFilePath() && QFile::remove(kept[i].absoluteFilePath())) total -= kept[i].size();
     }
     std::lock_guard lock(gKeptMutex);
     gKept.erase(path);

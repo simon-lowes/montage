@@ -414,8 +414,9 @@ std::vector<float> steadySkyMatte(const Image& img, const ValueMap* depth, const
         std::snprintf(buf, sizeof buf, "|%dx%d|%.4f|%.4f", W, H, sensitivity, lowest);
         settings = buf;
     }
+    // (This frame's own look is of the picture as it is here, with what is below and its matte, so it is not kept for
+    // its neighbours, which see the clip's layer alone: the flows from it are its own.)
     const std::string ownKey = shot.key ? shot.key(0) : std::string();
-    if (!ownKey.empty()) keepLook(gSkyLooks, ownKey + settings, std::shared_ptr<const SkyLook>(look), 24);
     std::vector<float> out = fullSize(own, W, H);
     if (own.grid.empty() || !shot.frame) {
         finishSky(out, img, 1.5 * own.f + 2, refine);
@@ -426,7 +427,7 @@ std::vector<float> steadySkyMatte(const Image& img, const ValueMap* depth, const
     std::vector<float> sum = own.grid, weight(own.grid.size(), 1.0f);
     for (int dir : {-1, 1}) {
         std::shared_ptr<const SkyLook> from = look;
-        std::string fromKey = ownKey;
+        std::string fromKey = ownKey.empty() ? std::string() : ownKey + "|self";
         std::vector<Point2> at(own.grid.size());
         std::vector<uint8_t> alive(own.grid.size(), 1);
         for (int gy = 0; gy < own.h; ++gy)

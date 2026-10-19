@@ -33,16 +33,20 @@ bool estimateVideoDepth(int count, const std::function<bool(int, Image&)>& frame
 
 // ---- A clip's depth, analysed and kept --------------------------------------------------------------------------
 // Analyses media seconds `start`..`end` of the video at `path` (every frame, up to 30 a second) and keeps the result
-// in the cache folder (beside the render cache), where analysedDepth finds it. A file analysed again replaces what
-// was kept for it. False if cancelled (`progress` returning false) or on failure.
+// in the cache folder (beside the render cache), where analysedDepth finds it. A file has one analysis: analysed
+// again, the new one covers what the old did too (so other clips of it keep theirs), stretched over the whole of it.
+// False if cancelled (`progress` returning false) or on failure.
 bool analyzeVideoDepth(const std::string& path, double start, double end, int size = 518,
                        const std::function<bool(double)>& progress = {}, std::string* error = nullptr);
 
-// What was analysed for the file as it is now (the same size and modification time): its media range, or false.
-bool analysedDepthRange(const std::string& path, double& start, double& end);
+// What was analysed for the file as it is now (the same size and modification time): its media range (the first and
+// last frames analysed, `step` seconds apart; the depth reaches a step beyond either end), or false.
+bool analysedDepthRange(const std::string& path, double& start, double& end, double* step = nullptr);
+// What tells this analysis of the file from another ("" none), for keys of what was made from it.
+std::string analysedDepthStamp(const std::string& path);
 
-// The analysed depth at media time `seconds` (0 far, 1 near, stretched over the whole analysis), between the two
-// analysed frames either side; null where the analysis does not reach (more than a frame beyond either end) or there
+// The analysed depth of the frame shown at media time `seconds` (0 far, 1 near, stretched over the whole analysis),
+// between the two analysed frames either side where not every frame was analysed; null where the analysis does not reach (more than a frame beyond either end) or there
 // is none. The last few are kept in memory.
 std::shared_ptr<const DepthMap> analysedDepth(const std::string& path, double seconds);
 

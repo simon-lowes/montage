@@ -1633,9 +1633,11 @@ void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c,
         auto out = std::make_shared<ValueMap>();
         out->width = w, out->height = h;
         out->values.assign(size_t(w) * size_t(h), 0.0f);
-        for (int Y = 0; Y < h; ++Y)
-            for (int X = 0; X < w; ++X)
-                if (double u, v; canvasToFrame(seq, ag, o.scale, X, Y, u, v)) out->values[size_t(Y) * size_t(w) + size_t(X)] = d->at(u, v);
+        parallelRows(h, [&](int y0, int y1) {
+            for (int Y = y0; Y < y1; ++Y)
+                for (int X = 0; X < w; ++X)
+                    if (double u, v; canvasToFrame(seq, ag, o.scale, X, Y, u, v)) out->values[size_t(Y) * size_t(w) + size_t(X)] = d->at(u, v);
+        });
         return out;
     };
     const std::shared_ptr<const ValueMap> depth = sr->p("use_depth", lt, 1) > 0.5 ? analysedOnLayer(t, layer.width, layer.height) : nullptr;
@@ -1649,17 +1651,10 @@ void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c,
             if (sr->p("use_depth", lt, 1) > 0.5) otherDepth = analysedOnLayer(t + offset, other.width, other.height);
             return true;
         };
-        // (what decides the frame: everything on screen then, render/RenderCache.h)
+        // (what decides the clip's layer then, its depth analysis included: render/RenderCache.h)
         shot.key = [&, inClip](int offset) {
             if (!inClip(offset)) return std::string();
-            const QByteArray k = frameKey(p, seq, t + offset, o);
-            if (k.isEmpty()) return std::string();
-            // (and whether the clip's depth was analysed, which the sky found in it can take)
-            std::string analysed;
-            double from, to;
-            if (const MediaItem* m = c.isGenerator() ? nullptr : p.findMedia(c.mediaId); m && analysedDepthRange(m->path, from, to))
-                analysed = "|" + std::to_string(from) + "-" + std::to_string(to);
-            return std::to_string(c.id) + "|" + k.toStdString() + analysed;
+            return std::to_string(c.id) + "|" + clipLayerKey(p, seq, c, t + offset, o).toStdString();
         };
     }
     applySkyReplacement(seq, c, *sr, lt, layer, &sky, o.scale, c.sourceFrameAt(t) / seq.fpsValue(), mask.empty() ? nullptr : &mask, depth.get(),

@@ -25500,6 +25500,54 @@ private slots:
         QVERIFY(!analysedDepthRange(video, a, b));
     }
 
+    void steadyDepthCoverage() {
+        // Footage at 120 frames a second, read with Interpret Footage settings: analysed every fourth frame, the clip's
+        // depth is steady to its last frame, a frame's depth is the one shown, and a second analysis keeps the first's.
+        if (!videoDepthAvailable() || !videoDepthModel().installed()) QSKIP("Set MONTAGE_VIDEO_DEPTH_MODEL to Video Depth Anything Small");
+        qputenv("MONTAGE_DEPTH_CACHE", path("depth-cache-120").c_str());
+        const int W = 196, H = 112, N = 60;
+        std::vector<QImage> frames;
+        for (int i = 0; i < N; ++i) frames.push_back(dollyFrame(W, H, -0.5 + i / double(N - 1), nullptr, uint32_t(i + 1)));
+        const std::string file = path("dolly120.mp4");
+        writeFrames(file, frames, 120);
+        Interpretation how;
+        how.par = 1.0;
+        const std::string video = interpretedPath(file, how);
+        QVERIFY(video != file);
+        std::string err;
+        double a = -1, b = -1, step = 0;
+        QVERIFY2(analyzeVideoDepth(video, 0, 0.2, 140, {}, &err), err.c_str());
+        QVERIFY(analysedDepthRange(video, a, b, &step));
+        QCOMPARE(a, 0.0);
+        QVERIFY2(std::fabs(step - 4 / 120.0) < 1e-9, qPrintable(QString::number(step)));
+        QVERIFY2(b <= 0.2 + 1e-9, qPrintable(QString::number(b)));
+        // Analysed again further on: the first stretch is still analysed.
+        QVERIFY2(analyzeVideoDepth(video, 0.3, 1, 140, {}, &err), err.c_str());
+        QVERIFY(analysedDepthRange(video, a, b, &step));
+        QCOMPARE(a, 0.0);
+        QVERIFY2(b >= 56 / 120.0 - 1e-9, qPrintable(QString::number(b)));
+        // Shown frame 4 (an analysed one) until frame 5 starts: its own depth, not mixed with the next analysed frame's.
+        auto at4 = analysedDepth(video, 4 / 120.0), late = analysedDepth(video, 4.9 / 120.0), at6 = analysedDepth(video, 6 / 120.0);
+        QVERIFY(at4 && late && at6);
+        QVERIFY(at4->values == late->values);
+        QVERIFY(at4->values != at6->values);  // (half way to the next analysed frame)
+        // A 120 fps clip of all of it reads as analysed, though the last analysed frame is three before its last.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = Rational{120, 1};
+        MediaItem m = probeOrFail(p, file);
+        m.path = video;
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Clip& clip = s.videoTracks[0].clips.at(0);
+        QCOMPARE(clip.duration, FrameTime(N));
+        QVERIFY(clipDepthAnalysed(p, s, clip));
+        // Reframed from 360°, it is not (its depth is the view's).
+        Clip reframed = clip;
+        reframed.effects.push_back(makeEffect(p, "reframe_360"));
+        QVERIFY(!clipDepthAnalysed(p, s, reframed));
+    }
+
     void followFocusOnABall() {
         if (!videoDepthAvailable() || !videoDepthModel().installed()) QSKIP("Set MONTAGE_VIDEO_DEPTH_MODEL to Video Depth Anything Small");
         qputenv("MONTAGE_DEPTH_CACHE", path("depth-cache").c_str());

@@ -5,6 +5,7 @@
 #include "media/MotionDeblur.h"
 #include "media/Proxy.h"
 #include "media/SuperScale.h"
+#include "media/VideoDepth.h"
 
 #include <QCryptographicHash>
 #include <QDateTime>
@@ -12,10 +13,12 @@
 #include <QDirIterator>
 #include <QFileInfo>
 #include <QStandardPaths>
+#include <algorithm>
 #include <map>
 #include <memory>
 
 #include "core/Captions.h"
+#include "core/Effects.h"
 #include "core/ColorGroups.h"
 #include "core/EditOps.h"
 #include "core/Expression.h"
@@ -156,6 +159,12 @@ void addClipAt(QCryptographicHash& h, const Project& p, const Sequence& seq, con
             }
         } else {
             addMedia(h, *m, o);
+            // Depth effects take the file's depth analysis where there is one: analysed (again), the frame changes.
+            const auto chain = liveEffects(seq, c);
+            if (m->kind == MediaKind::Video && std::any_of(chain.begin(), chain.end(), [&](const Effect* e) {
+                    return needsDepth(*e, t - c.start) || (e->enabled && e->type == "sky_replace" && e->p("use_depth", t - c.start, 1) > 0.5);
+                }))
+                h.addData(QByteArray("|depth") + QByteArray::fromStdString(analysedDepthStamp(m->path)));
         }
     }
 }
@@ -197,6 +206,17 @@ bool addFrame(QCryptographicHash& h, const Project& p, const Sequence& seq, Fram
 }
 
 }  // namespace
+
+QByteArray clipLayerKey(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o) {
+    QCryptographicHash h(QCryptographicHash::Sha1);
+    h.addData(QByteArray("montage-layer-") + QByteArray::number(kCacheVersion));
+    h.addData(QByteArray::number(o.scale, 'g', 10) + (o.useProxies ? "P" : "") + (o.highQuality ? "H" : "") + '#' +
+              QByteArray::fromStdString(o.displaySpace) + (seq.stereo3d ? QByteArray("#3D") + QByteArray::number(int(o.stereoView)) : QByteArray()));
+    h.addData(QByteArray::number(seq.width) + 'x' + QByteArray::number(seq.height) + '@' + QByteArray::number(seq.fpsValue(), 'g', 10));
+    h.addData(QByteArray::fromStdString(seq.colorSpace) + QByteArray::number(seq.hdrPeakNits));
+    addClipAt(h, p, seq, c, t, o, 0);
+    return h.result().toHex();
+}
 
 QByteArray frameKey(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
     if (usesExpressions(p)) return {};  // (not cached: what they give can depend on what the key does not cover)

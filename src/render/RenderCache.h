@@ -25,6 +25,9 @@ namespace montage {
 // transitions there, the media files (path, size, date), nested sequences and
 // the visible caption. Empty when nothing is on screen.
 QByteArray frameKey(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o);
+// What decides one clip's own layer at t (its settings, how far into it t is, what it shows), for what is kept of it
+// between frames. Unlike frameKey, made even with expressions in the project (what they read elsewhere is not in it).
+QByteArray clipLayerKey(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o);
 
 class RenderCache {
 public:

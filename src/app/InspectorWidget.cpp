@@ -3125,7 +3125,7 @@ void InspectorWidget::followFocusOn(Id clip, Id effect, FocusTarget target) {
     const Sequence* s = state_->sequence();
     const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
     const Effect* e = c ? edit::ownedEffect(const_cast<Sequence&>(*s), clip, effect) : nullptr;
-    if (!c || !e) return;
+    if (!c || !e || c->duration <= 0) return;
     if (target == FocusTarget::Face && !ensureEffectModel(window(), "focus.face")) return;
     if (!clipDepthAnalysed(state_->project(), *s, *c) && !ensureEffectModel(window(), "video_depth")) return;
     FollowFocusSettings fs;

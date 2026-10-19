@@ -1,6 +1,7 @@
 #include "FollowFocus.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <vector>
 
@@ -82,6 +83,9 @@ void keepKeys(const std::vector<double>& v, size_t a, size_t b, double tolerance
 bool clipMediaRange(const Project& p, const Sequence& seq, const Clip& c, std::string& path, double& from, double& to) {
     const MediaItem* m = c.isGenerator() ? nullptr : p.findMedia(c.mediaId);
     if (!m || m->kind != MediaKind::Video || !m->hasVideo || c.duration <= 0) return false;
+    // (A view reframed from 360° takes its depth from the view, not the analysis of the whole sphere.)
+    for (const Effect& e : c.effects)
+        if (e.enabled && e.type == "reframe_360") return false;
     const double frameSeconds = m->fps.valid() ? 1.0 / m->fps.toDouble() : 1.0 / 30;
     from = 1e300, to = -1e300;
     for (FrameTime i = 0; i < c.duration; ++i) {
@@ -105,11 +109,12 @@ bool analyzeClipDepth(const Project& p, const Sequence& seq, const Clip& c, int 
 
 bool clipDepthAnalysed(const Project& p, const Sequence& seq, const Clip& c) {
     std::string path;
-    double from, to, a, b;
-    if (!clipMediaRange(p, seq, c, path, from, to) || !analysedDepthRange(path, a, b)) return false;
+    double from, to, a, b, step;
+    if (!clipMediaRange(p, seq, c, path, from, to) || !analysedDepthRange(path, a, b, &step)) return false;
     const MediaItem* m = p.findMedia(c.mediaId);
     const double frameSeconds = m && m->fps.valid() ? 1.0 / m->fps.toDouble() : 1.0 / 30;
-    return a <= from + frameSeconds && b >= to - frameSeconds;
+    // (analysed every few frames above 30 a second: the last analysed frame can be up to a step before the clip's last)
+    return a <= from + frameSeconds * 0.5 && b >= to - std::max(step, frameSeconds) + 1e-6;
 }
 
 bool followFocus(const Project& p, const Sequence& seq, const Clip& c, const Effect& e, const FollowFocusSettings& s, Param& focus,
@@ -118,9 +123,12 @@ bool followFocus(const Project& p, const Sequence& seq, const Clip& c, const Eff
         if (error && error->empty()) *error = why;
         return false;
     };
-    const MediaItem* m = c.isGenerator() ? nullptr : p.findMedia(c.mediaId);
-    if (!m || m->kind != MediaKind::Video || !m->hasVideo) return fail("Follow Focus is for video clips");
     if (c.duration <= 0) return fail("The clip is empty");
+    const MediaItem* m = c.isGenerator() ? nullptr : p.findMedia(c.mediaId);
+    std::string mediaPath;
+    double mediaFrom, mediaTo;
+    if (!m || !clipMediaRange(p, seq, c, mediaPath, mediaFrom, mediaTo))
+        return fail("Follow Focus is for video clips (not views reframed from 360°)");
     if (s.target == FocusTarget::Object && (!e.object || e.object->frames.empty()))
         return fail("Pick the object first: set the effect's mask to Object and click it on the monitor, then track it");
     const double fps = seq.fpsValue();
@@ -133,8 +141,12 @@ bool followFocus(const Project& p, const Sequence& seq, const Clip& c, const Eff
     for (FrameTime i = 0; i < c.duration; ++i) times[size_t(i)] = mediaTime(i);
     const double first = *std::min_element(times.begin(), times.end()), last = *std::max_element(times.begin(), times.end());
     // Depth across the clip: its analysis, made now where it does not reach.
+    std::atomic<bool> cancelled{false};
     auto stage = [&](double from, double to) {
-        return [&progress, from, to](double f) { return !progress || progress(from + (to - from) * f); };
+        return [&progress, &cancelled, from, to](double f) {
+            if (progress && !progress(from + (to - from) * f)) cancelled = true;
+            return !cancelled;
+        };
     };
     if (!clipDepthAnalysed(p, seq, c)) {
         if (!videoDepthAvailable() || !videoDepthModel().installed()) return fail("Follow Focus needs the video depth model");
@@ -147,9 +159,10 @@ bool followFocus(const Project& p, const Sequence& seq, const Clip& c, const Eff
         const double aspect = m->height > 0 ? double(m->width) / m->height : 16.0 / 9;
         TrackRegion start;
         start.x = s.x, start.y = s.y, start.w = 0.06, start.h = 0.06 * aspect;
-        const std::vector<TrackRegion> ahead = trackRegion(m->path, at, last, start, MotionModel::TranslationScale, stage(0.6, 0.75), nullptr, error);
-        const std::vector<TrackRegion> behind = at > first ? trackRegion(m->path, at, first, start, MotionModel::TranslationScale, stage(0.75, 0.9), nullptr, error)
+        const std::vector<TrackRegion> ahead = trackRegion(m->path, at, last, start, MotionModel::TranslationScale, stage(0.6, 0.75), &cancelled, error);
+        const std::vector<TrackRegion> behind = at > first ? trackRegion(m->path, at, first, start, MotionModel::TranslationScale, stage(0.75, 0.9), &cancelled, error)
                                                            : std::vector<TrackRegion>{start};
+        if (cancelled) return fail("Cancelled");
         if (ahead.empty() && behind.empty()) return fail("The point could not be tracked");
         const double mfps = 1 / frameSeconds;
         for (size_t i = 0; i < times.size(); ++i) {
