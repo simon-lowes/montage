@@ -39,6 +39,9 @@ Provenance sequenceProvenance(const Project& p, const Sequence& s, FrameTime fro
 // Whether a model an effect only uses when it is there (Sky Replacement's "depth") is: set by the engine
 // (render/SkyReplace.cpp); unset, it is taken to be there.
 void setOptionalModelCheck(std::function<bool(const std::string& model)> check);
+// Whether the video at a path has its depth analysed (media/VideoDepth.h), so its depth effects use the video depth
+// model rather than the still one: set by the engine (render/SkyReplace.cpp); unset, none is.
+void setAnalysedDepthCheck(std::function<bool(const std::string& path)> check);
 
 // The IPTC digital source type for a role ("" for Assisted).
 std::string iptcSourceType(AiRole role);

@@ -18,6 +18,7 @@
 //                                         by name (sin, abs, pi...) as well as in math
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -38,9 +39,10 @@ double evaluateExpression(const Param& p, FrameTime t, double keyed, std::string
 // What expressions evaluated on this thread belong to, while it lives: the project and sequence, and the clip when it
 // is known (else the clip whose setting it is is looked up). Scopes nest. Renders set one; without any, the thread's
 // fallback (setExpressionFallback) is asked, and failing that `param` and `audio` give 0 and the frame rate is 25.
+// `cancel` (else the scope around it's) stops an expression running in it part way, as a render's Cancel does.
 class ExpressionScope {
 public:
-    ExpressionScope(const Project* p, const Sequence* s, const Clip* c = nullptr);
+    ExpressionScope(const Project* p, const Sequence* s, const Clip* c = nullptr, const std::atomic<bool>* cancel = nullptr);
     ~ExpressionScope();
     ExpressionScope(const ExpressionScope&) = delete;
     ExpressionScope& operator=(const ExpressionScope&) = delete;
@@ -48,6 +50,7 @@ public:
     const Project* project;
     const Sequence* sequence;
     const Clip* clip;
+    const std::atomic<bool>* cancel;
     ExpressionScope* previous;
     // Where the settings evaluated in it are (found once a scope: the project does not change while it lives).
     struct Owners;
@@ -58,6 +61,7 @@ struct ExpressionContext {
     const Project* project = nullptr;
     const Sequence* sequence = nullptr;
     const Clip* clip = nullptr;
+    const std::atomic<bool>* cancel = nullptr;
 };
 // Where this thread's expressions belong now (its scope, else its fallback), for work it hands to other threads.
 ExpressionContext currentExpressionContext();

@@ -839,7 +839,7 @@ OfxStatus multiThread(OfxThreadFunctionV1 func, unsigned int n, void* arg) {
     const ExpressionContext where = currentExpressionContext();  // (settings the plug-in reads on its threads)
     for (unsigned i = 1; i < n; ++i)
         threads.emplace_back([=] {
-            ExpressionScope scope(where.project, where.sequence, where.clip);
+            ExpressionScope scope(where.project, where.sequence, where.clip, where.cancel);
             tThreadIndex = i;
             tSpawned = true;
             func(i, n, arg);

@@ -177,7 +177,7 @@ void parallelRows(int height, const std::function<void(int, int)>& fn) {
         int y1 = int(int64_t(height) * (b + 1) / bands);
         p.submit([&, y0, y1] {
             {
-                ExpressionScope scope(where.project, where.sequence, where.clip);
+                ExpressionScope scope(where.project, where.sequence, where.clip, where.cancel);
                 fn(y0, y1);
             }
             std::lock_guard lock(m);

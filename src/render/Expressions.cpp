@@ -85,7 +85,8 @@ struct ExpressionScope::Owners {
     std::unordered_map<const Param*, Owner> found;
 };
 
-ExpressionScope::ExpressionScope(const Project* p, const Sequence* s, const Clip* c) : project(p), sequence(s), clip(c), previous(tScope) {
+ExpressionScope::ExpressionScope(const Project* p, const Sequence* s, const Clip* c, const std::atomic<bool>* cancel)
+    : project(p), sequence(s), clip(c), cancel(cancel ? cancel : tScope ? tScope->cancel : nullptr), previous(tScope) {
     tScope = this;
 }
 ExpressionScope::~ExpressionScope() { tScope = previous; }
@@ -93,7 +94,7 @@ ExpressionScope::~ExpressionScope() { tScope = previous; }
 void setExpressionFallback(std::function<ExpressionContext()> fallback) { tFallback = std::move(fallback); }
 
 ExpressionContext currentExpressionContext() {
-    if (tScope) return {tScope->project, tScope->sequence, tScope->clip};
+    if (tScope) return {tScope->project, tScope->sequence, tScope->clip, tScope->cancel};
     return tFallback ? tFallback() : ExpressionContext{};
 }
 
@@ -269,6 +270,7 @@ struct Eval {
 };
 thread_local std::vector<Eval> tEval;
 thread_local bool tLooped = false;  // an expression this one reads went round in a loop
+thread_local bool tCancelled = false;  // the render it runs for was cancelled
 
 struct Evaluating {
     explicit Evaluating(const Eval& e) { tEval.push_back(e); }
@@ -325,6 +327,10 @@ void* allocate(void* ud, void* ptr, size_t osize, size_t nsize) {
 }
 
 void budget(lua_State* L, lua_Debug*) {
+    if (tScope && tScope->cancel && tScope->cancel->load(std::memory_order_relaxed)) {
+        tCancelled = true;
+        luaL_error(L, "cancelled");
+    }
     if (++tState->ticks > kBudget ||
         std::chrono::duration<double>(std::chrono::steady_clock::now() - tState->started).count() > kSeconds)
         luaL_error(L, "the expression took too long");
@@ -660,13 +666,17 @@ bool checkExpression(const std::string& expr, std::string* error) {
 
 double evaluateExpression(const Param& p, FrameTime t, double keyed, std::string* errorOut) {
     const bool outermost = tEval.empty();
-    if (outermost) tLooped = false;
+    if (outermost) tLooped = false, tCancelled = false;
     const ExpressionContext where = currentExpressionContext();
     Owner scratch;
     Owner& owner = ownerOf(where, p, scratch);
     std::string error;
     double out = keyed;
     auto finish = [&]() {
+        if (tCancelled) {  // (not an error of the expression's: nothing noted)
+            if (errorOut) *errorOut = "cancelled";
+            return keyed;
+        }
         noteError(owner, error);
         if (errorOut) *errorOut = error;
         if (!error.empty()) return keyed;

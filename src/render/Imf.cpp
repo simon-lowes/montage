@@ -11,6 +11,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <deque>
+#include <future>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -28,6 +29,7 @@ extern "C" {
 #include "DcpMxf.h"
 #include "Jpeg2000.h"
 #include "PackageFiles.h"
+#include "RateConversion.h"
 #include "core/AudioDescription.h"
 #include "core/Captions.h"
 #include "core/EditOps.h"
@@ -506,16 +508,6 @@ private:
     std::vector<int32_t> part_;
 };
 
-// The earlier composition's picture `m`, decoded.
-bool oldFrame(const ImfVirtualTrack& picture, TrackFiles& files, int64_t m, std::vector<uint16_t>& rgb, int& w, int& h) {
-    const std::vector<ImfResource> r = slice(picture, m, 1);
-    if (r.size() != 1) return false;
-    const dcp::ImfTrackReader* f = files.get(r[0].trackFile);
-    std::vector<uint8_t> cs;
-    int components = 0, bits = 0;
-    return f && f->frame(r[0].entry, cs) && decodeJpeg2000(cs.data(), cs.size(), rgb, w, h, components, bits) && components == 3;
-}
-
 // The sequence a sound version is mixed from: the roles it hears.
 Sequence soundVersion(const Sequence& s, const ImfSound& v) {
     Sequence out = s;
@@ -730,57 +722,92 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         // The black after the programme (at 29.97 and 59.94): the earlier package's own, where it has as much.
         for (int64_t k = programme; k < frames; ++k)
             if (oldEnd - oldFirst + (k - programme) < oldFrames) same[size_t(k)] = oldEnd - oldFirst + (k - programme);
-        // The checks: each stretch's first and last frame, and one every second.
-        std::vector<std::pair<int64_t, int64_t>> stretches;
+        // Every frame taken from the earlier package is checked against it: what the sequence says is the same can still
+        // differ (a relinked or re-rendered shot, Interpret Footage, a colour override, a file changed on disk). A stretch
+        // taken in one piece, up to an edit, is kept or made again whole (frame by frame, a lossy check could keep the
+        // faint start of a change and make its end again). Rendered here, the earlier frames decoded and compared on other threads.
+        std::vector<int64_t> stretchOf(size_t(frames), -1);
+        int64_t stretches = 0, toCheck = 0, checked = 0;
         for (int64_t k = 0; k < frames; ++k) {
             if (same[size_t(k)] < 0) continue;
-            if (!stretches.empty() && stretches.back().second == k && same[size_t(k)] == same[size_t(k - 1)] + 1) ++stretches.back().second;
-            else stretches.push_back({k, k + 1});
+            ++toCheck;
+            const bool runsOn = k > 0 && same[size_t(k - 1)] >= 0 && same[size_t(k)] == same[size_t(k - 1)] + 1 &&
+                                (k >= programme || !editBetween(s, first + k));
+            stretchOf[size_t(k)] = runsOn ? stretchOf[size_t(k - 1)] : stretches++;
         }
-        const int64_t every = std::max<int64_t>(1, std::llround(fps));
-        int64_t checked = 0, toCheck = 0;
-        for (const auto& [a, b] : stretches) toCheck += 2 + (b - a) / every;
-        for (const auto& [a, b] : stretches) {
-            std::vector<int64_t> at = {a};
-            for (int64_t k = a + every; k < b - 1; k += every) at.push_back(k);
-            if (b - 1 > a) at.push_back(b - 1);
-            bool alike = true;
-            for (int64_t k : at) {
-                const std::vector<uint16_t> mine = pictureAt(k);
-                std::vector<uint16_t> theirs;
-                int w = 0, h = 0;
-                alike = oldFrame(*oldPicture, oldFiles, same[size_t(k)], theirs, w, h) && w == W && h == H && theirs.size() == mine.size();
-                if (alike && lossless) {
-                    for (size_t i = 0; i < mine.size() && alike; ++i) alike = std::abs(int(mine[i]) - int(theirs[i])) <= 1;
-                } else if (alike) {
-                    // Lossy: coding noise is small everywhere and averages out; a change (a grade, a word of a title)
-                    // moves the average or stands out in a block of the picture.
-                    double mean[3] = {0, 0, 0}, worst = 0;
-                    const int B = 32;
-                    for (int by = 0; by < H; by += B)
-                        for (int bx = 0; bx < W; bx += B) {
-                            double sum = 0;
-                            size_t n = 0;
-                            for (int y = by; y < std::min(H, by + B); ++y)
-                                for (int x = bx; x < std::min(W, bx + B); ++x)
-                                    for (int c = 0; c < 3; ++c, ++n) {
-                                        const size_t i = (size_t(y) * size_t(W) + size_t(x)) * 3 + size_t(c);
-                                        const double d = double(int(mine[i]) - int(theirs[i]));
-                                        sum += d * d;
-                                        mean[c] += d;
-                                    }
-                            worst = std::max(worst, sum / double(std::max<size_t>(1, n)));
-                        }
-                    const double pixels = double(W) * double(H);
-                    for (double m : mean) alike = alike && std::fabs(m / pixels) <= maxCode / 1000;
-                    alike = alike && (worst <= 0 || 10 * std::log10(maxCode * maxCode / worst) >= 30);
-                }
-                if (progress && !progress(0.05 * double(++checked) / double(std::max<int64_t>(1, toCheck)))) return fail("Stopped");
-                if (!alike) break;
+        std::vector<char> differs(size_t(stretches), 0);
+        // Whether two pictures are the same, within the coding's noise.
+        auto alikeTo = [W, H, lossless, maxCode](const std::vector<uint16_t>& mine, const std::vector<uint16_t>& theirs) {
+            if (theirs.size() != mine.size()) return false;
+            if (lossless) {
+                for (size_t i = 0; i < mine.size(); ++i)
+                    if (std::abs(int(mine[i]) - int(theirs[i])) > 1) return false;
+                return true;
             }
-            if (!alike)
-                for (int64_t k = a; k < b; ++k) same[size_t(k)] = -1;
+            // Lossy: coding noise is small everywhere and averages out; a change (a grade, a word of a title) moves the
+            // average or stands out in a block of the picture.
+            double mean[3] = {0, 0, 0}, worst = 0;
+            const int B = 32;
+            for (int by = 0; by < H; by += B)
+                for (int bx = 0; bx < W; bx += B) {
+                    double sum = 0;
+                    size_t n = 0;
+                    for (int y = by; y < std::min(H, by + B); ++y)
+                        for (int x = bx; x < std::min(W, bx + B); ++x)
+                            for (int c = 0; c < 3; ++c, ++n) {
+                                const size_t i = (size_t(y) * size_t(W) + size_t(x)) * 3 + size_t(c);
+                                const double d = double(int(mine[i]) - int(theirs[i]));
+                                sum += d * d;
+                                mean[c] += d;
+                            }
+                    worst = std::max(worst, sum / double(std::max<size_t>(1, n)));
+                }
+            const double pixels = double(W) * double(H);
+            for (double m : mean)
+                if (std::fabs(m / pixels) > maxCode / 1000) return false;
+            return worst <= 0 || 10 * std::log10(maxCode * maxCode / worst) >= 30;
+        };
+        // (each check holds a rendered and a decoded frame, 12 bytes a pixel, and the decoder's own: within about 2 GiB)
+        const int memoryCap = std::max(1, int(2147483648.0 / (double(W) * double(H) * 40.0)));
+        const size_t inHand = size_t(std::min(memoryCap, settings.threads > 0 ? settings.threads : std::max(1, int(std::thread::hardware_concurrency()))));
+        std::deque<std::pair<int64_t, std::future<bool>>> checks;
+        bool stopped = false;
+        auto collect = [&](size_t keep) {
+            while (checks.size() > keep) {
+                const int64_t k = checks.front().first;
+                if (!checks.front().second.get()) differs[size_t(stretchOf[size_t(k)])] = 1;
+                checks.pop_front();
+                stopped = stopped || (progress && !progress(0.05 * double(++checked) / double(std::max<int64_t>(1, toCheck))));
+            }
+        };
+        for (int64_t k = 0; k < frames && !stopped; ++k) {
+            if (same[size_t(k)] < 0) continue;
+            if (differs[size_t(stretchOf[size_t(k)])]) {  // (already to be made again)
+                stopped = progress && !progress(0.05 * double(++checked) / double(std::max<int64_t>(1, toCheck)));
+                continue;
+            }
+            std::vector<uint16_t> mine = pictureAt(k);
+            // (the earlier frame's codestream read here: the files are not shared between threads)
+            std::vector<uint8_t> cs;
+            const std::vector<ImfResource> r = slice(*oldPicture, same[size_t(k)], 1);
+            const dcp::ImfTrackReader* f = r.size() == 1 ? oldFiles.get(r[0].trackFile) : nullptr;
+            if (!f || !f->frame(r[0].entry, cs)) cs.clear();
+            checks.emplace_back(k, std::async(std::launch::async, [&alikeTo, W, H, mine = std::move(mine), cs = std::move(cs)] {
+                try {
+                    std::vector<uint16_t> theirs;
+                    int w = 0, h = 0, components = 0, bits = 0;
+                    return !cs.empty() && decodeJpeg2000(cs.data(), cs.size(), theirs, w, h, components, bits) && components == 3 && w == W &&
+                           h == H && alikeTo(mine, theirs);
+                } catch (...) {
+                    return false;  // (out of memory: made again)
+                }
+            }));
+            collect(inHand);
         }
+        collect(0);
+        if (stopped) return fail("Stopped");
+        for (int64_t k = 0; k < frames; ++k)
+            if (same[size_t(k)] >= 0 && differs[size_t(stretchOf[size_t(k)])]) same[size_t(k)] = -1;
     }
 
     // The folder.
@@ -1723,14 +1750,22 @@ bool readImfComposition(const std::string& cplPath, ImfComposition& out, std::st
     if (r.hasError()) return fail(cplPath + " does not read: " + r.errorString().toStdString());
     if (!out.rateNum || !out.rateDen) return fail(cplPath + " has no edit rate");
     // (a package from anywhere: numbers that would play for ever, backwards or past what a track can hold refused)
+    // Edit rates: whole numbers to a million, at least one unit a second, at most 1000 pictures or 384 kHz of sound.
+    auto rateOk = [](uint32_t num, uint32_t den, uint32_t most) {
+        return num >= 1 && den >= 1 && num <= 1000000 && den <= 1000000 && num >= den && uint64_t(num) <= uint64_t(most) * den;
+    };
+    if (!rateOk(out.rateNum, out.rateDen, 1000)) return fail(cplPath + " has an edit rate that does not make sense");
     constexpr int64_t kMaxUnits = int64_t(1) << 40;  // edit units in a virtual track: years of 96 kHz sound
     int64_t plays = 0;                               // resources played, repeats counted (each opens as a clip)
     for (ImfVirtualTrack& t : out.tracks) {
         int64_t length = 0;
         for (ImfResource& res : t.resources) {
             if (!res.rateNum || !res.rateDen) res.rateNum = out.rateNum, res.rateDen = out.rateDen;
-            if (res.duration < 0) res.duration = std::max<int64_t>(0, res.intrinsic - res.entry);
-            if (res.entry < 0 || res.entry > kMaxUnits || res.duration > kMaxUnits || res.intrinsic > kMaxUnits || res.repeat < 1 ||
+            if (!rateOk(res.rateNum, res.rateDen, 384000)) return fail(cplPath + " has a resource with an edit rate that does not make sense");
+            // (an intrinsic duration of -1 is none given)
+            const bool bad = res.entry < 0 || res.entry > kMaxUnits || res.intrinsic < -1 || res.intrinsic > kMaxUnits;
+            if (!bad && res.duration < 0) res.duration = std::max<int64_t>(0, res.intrinsic - res.entry);
+            if (bad || res.duration > kMaxUnits || (res.intrinsic >= 0 && res.entry + res.duration > res.intrinsic) || res.repeat < 1 ||
                 res.repeat > 100000 || res.duration * res.repeat > kMaxUnits - length || (plays += res.repeat) > 1000000)
                 return fail(cplPath + " has a resource that does not make sense (its entry point, duration or repeat count)");
             length += res.duration * res.repeat;

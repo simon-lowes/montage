@@ -5726,6 +5726,18 @@ colorspaces:
         QVERIFY(r3.codedFrames == 0 && r3.newSamples == 0 && r3.trackFiles.empty());
         issues = verifyImf(r3.folder);
         QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        // A change the cut does not show (frames 3 to 5 of the first shot less red, as a re-rendered or relinked shot
+        // would be): every frame taken from the earlier package is checked, so the stretch they are in is made again.
+        const Clip firstShot = now.videoTracks[0].clips[0];
+        Param& red = now.videoTracks[0].clips[0].generator.params["color.r"];
+        red.addKey(2, 0.8), red.addKey(3, 0.1), red.addKey(5, 0.1), red.addKey(6, 0.8);
+        again.title = "Versions changed";
+        ImfResult r4;
+        QVERIFY2(exportImf(p, now, again, dir.path().toStdString(), &r4, {}, &err), err.c_str());
+        QCOMPARE(r4.codedFrames, int64_t(8));  // (the first shot, made again whole)
+        issues = verifyImf(r4.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        now.videoTracks[0].clips[0] = firstShot;
 
         // Opened as a sequence, the supplemental plays as the new cut does: the same pictures, the subtitles, English
         // heard and German muted.
@@ -5820,6 +5832,33 @@ colorspaces:
             g.close();
             ImfComposition c;
             QVERIFY(!readImfComposition(g.fileName().toStdString(), c, &err) && err.find("does not make sense") != std::string::npos);
+            // So are edit rates that would run backwards or overflow, a negative intrinsic duration and a resource that
+            // plays past its file's end; the package as written still opens.
+            f.seek(0);
+            const QByteArray good = f.readAll();
+            QVERIFY(readImfComposition(r1.cpl, c, &err));
+            const qsizetype res = good.indexOf("<Resource");
+            QVERIFY(res > 0);
+            auto edited = [&](const QByteArray& from, const QByteArray& to, bool inResource) {
+                QByteArray x = good;
+                const qsizetype i = x.indexOf(from, inResource ? res : 0);
+                if (i < 0) return false;
+                x.replace(i, from.size(), to);
+                QFile h(dir.filePath("hostile.xml"));
+                if (!h.open(QIODevice::WriteOnly) || h.write(x) != x.size()) return false;
+                h.close();
+                ImfComposition d;
+                return !readImfComposition(h.fileName().toStdString(), d, &err) && err.find("does not make sense") != std::string::npos;
+            };
+            const QByteArray rate = "<EditRate>" + QByteArray::number(c.rateNum) + " " + QByteArray::number(c.rateDen) + "</EditRate>";
+            QVERIFY(edited(rate, "<EditRate>4294967295 1</EditRate>", false));
+            QVERIFY(edited(rate, "<EditRate>1 4000000000</EditRate>", false));
+            QVERIFY(edited(rate, "<EditRate>1 4000000000</EditRate>", true));
+            const qsizetype id = good.indexOf("<IntrinsicDuration>"), idEnd = good.indexOf("</IntrinsicDuration>", id);
+            QVERIFY(id > 0 && idEnd > id);
+            const QByteArray intrinsic = good.mid(id, idEnd - id + 20);
+            QVERIFY(edited(intrinsic, "<IntrinsicDuration>-9223372036854775807</IntrinsicDuration>", true));
+            QVERIFY(edited(intrinsic, "<IntrinsicDuration>1</IntrinsicDuration>", true));  // shorter than it plays
         }
         // A role no clip has is refused (it would leave the version silent).
         sup.sounds = {{"de", "PRM", {"Dialog"}}};

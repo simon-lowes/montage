@@ -60,6 +60,8 @@
 #include "media/Proxy.h"
 #include "media/Relink.h"
 #include "media/DepthMap.h"
+#include "media/VideoDepth.h"
+#include "RenderCache.h"
 #include "SkyReplace.h"
 #include "media/Matting.h"
 #include "media/Faces.h"
@@ -927,6 +929,7 @@ struct ClipSource {
     double sourceSeconds = -1;  // media time of the frame, for effects that follow the footage
     uint64_t sourceMedia = 0;   // and its media, and whether it was reframed from 360° (or is a right eye), for analyses made from it
     bool reframed = false;
+    std::string sourcePath;     // the video file, for its analysed depth (media/VideoDepth.h); "" for any other picture
     std::string exrFile;        // the OpenEXR file the frame was read from (its Cryptomattes), "" for any other
     ofx::FrameFetch ofxFetch;   // the clip's source at other clip frames, for OpenFX plugins that ask (render/Ofx.h)
 };
@@ -1078,6 +1081,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (!f && original && isOffline(*m)) f = offlineSlate(w, h);
             if (!f) return false;
             if (m->kind == MediaKind::Video) sourceSeconds = sec;
+            if (m->kind == MediaKind::Video && c.layer.empty()) out.sourcePath = m->path;
             sourceMedia = m->id;
             exrFile = exrFrameFile(m->path, sec);
             if (m->kind == MediaKind::Video && std::any_of(c.effects.begin(), c.effects.end(), [](const Effect& e) { return e.type == "ofx" && e.enabled; })) {
@@ -1356,9 +1360,9 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
     const std::vector<const Effect*> chain = gradeChain(seq, c);
     // The picture's depth, once, for the effects that work by distance.
     std::shared_ptr<const DepthMap> depth;
-    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsDepth(*e, lt); }) && depthAvailable() &&
-        depthModel().installed())
-        depth = cachedDepth(src);
+    // (The clip's analysed depth where it has one, steady through the shot: not of a reframed view or the other eye.)
+    if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsDepth(*e, lt); }))
+        depth = frameDepth(src, reframed ? std::string() : cs.sourcePath, sourceSeconds);
     DepthScope depthScope(depth);
     // And the people in it, for Remove Background and People masks.
     std::shared_ptr<const ValueMap> people;
@@ -1433,7 +1437,7 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
 // `below` is what the tracks under the clip have made so far, for adjustment layers.
 Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
                 const Image* below = nullptr) {
-    ExpressionScope expressions(&p, &seq, &c);  // (core/Expression.h)
+    ExpressionScope expressions(&p, &seq, &c, o.cancel);  // (core/Expression.h)
     ClipSource cs;
     if (!clipSource(p, seq, c, t, o, below, false, cs)) return {};
     return finishClipLayer(seq, c, o, cs);
@@ -1552,7 +1556,7 @@ const Transition* activeTransition(const Track& track, FrameTime t, FrameTime& f
 
 // What track `m` shows at t (a transition's mix while one runs), on the CPU.
 Image trackPicture(const Project& p, const Sequence& seq, size_t m, FrameTime t, const RenderOptions& o, int W, int H) {
-    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
+    ExpressionScope expressions(&p, &seq, nullptr, o.cancel);  // (core/Expression.h)
     const Track& track = seq.videoTracks[m];
     FrameTime from = 0, to = 0;
     if (const Transition* tr = activeTransition(track, t, from, to)) return transitionLayer(p, seq, track, *tr, from, to, t, o, nullptr, W, H);
@@ -1561,6 +1565,16 @@ Image trackPicture(const Project& p, const Sequence& seq, size_t m, FrameTime t,
 }
 
 bool clipGeometry(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, Geometry& g);  // (below)
+
+// Where canvas pixel (X, Y) of a layer at `scale` falls in the clip's own frame (fractions of it), through its
+// transform; false beyond the frame.
+bool canvasToFrame(const Sequence& seq, const Geometry& g, double scale, int X, int Y, double& u, double& v) {
+    const double cr = std::cos(g.rot), sn = std::sin(g.rot);
+    const double xs = (X + 0.5) / scale - seq.width / 2.0 - g.px, ys = (Y + 0.5) / scale - seq.height / 2.0 - g.py;
+    const double rx = xs * cr + ys * sn, ry = -xs * sn + ys * cr;
+    u = (rx / g.sx + g.mw / 2 + g.ax) / g.mw, v = (ry / g.sy + g.mh / 2 + g.ay) / g.mh;
+    return u >= 0 && v >= 0 && u <= 1 && v <= 1;
+}
 
 // Sky Replacement on clip `c` (on track `ti`) at t: the sky found in its layer and another put in its place
 // (render/SkyReplace.h).
@@ -1594,10 +1608,9 @@ void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c,
             mask.assign(size_t(layer.width) * size_t(layer.height), 0.0f);
             for (int Y = 0; Y < layer.height; ++Y)
                 for (int X = 0; X < layer.width; ++X) {
-                    const double xs = (X + 0.5) / o.scale - seq.width / 2.0 - g.px, ys = (Y + 0.5) / o.scale - seq.height / 2.0 - g.py;
-                    const double rx = xs * cr + ys * sn, ry = -xs * sn + ys * cr;
-                    const double u = (rx / g.sx + g.mw / 2 + g.ax) / g.mw * pw - 0.5, v = (ry / g.sy + g.mh / 2 + g.ay) / g.mh * ph - 0.5;
-                    if (u < -0.5 || v < -0.5 || u > pw - 0.5 || v > ph - 0.5) continue;
+                    double u, v;
+                    if (!canvasToFrame(seq, g, o.scale, X, Y, u, v)) continue;
+                    u = u * pw - 0.5, v = v * ph - 0.5;
                     const int i0 = std::clamp(int(std::floor(u)), 0, pw - 1), j0 = std::clamp(int(std::floor(v)), 0, ph - 1);
                     const int i1 = std::min(i0 + 1, pw - 1), j1 = std::min(j0 + 1, ph - 1);
                     const float fu = float(std::clamp(u - i0, 0.0, 1.0)), fv = float(std::clamp(v - j0, 0.0, 1.0));
@@ -1607,13 +1620,51 @@ void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c,
                 }
         }
     }
-    applySkyReplacement(seq, c, *sr, lt, layer, &sky, o.scale, c.sourceFrameAt(t) / seq.fpsValue(), mask.empty() ? nullptr : &mask);
+    // The clip's analysed depth carried onto the layer (null: found in the layer, if at all), and the frames either side
+    // for a steady sky.
+    auto analysedOnLayer = [&](FrameTime at, int w, int h) -> std::shared_ptr<const ValueMap> {
+        const MediaItem* m = c.isGenerator() ? nullptr : p.findMedia(c.mediaId);
+        if (!m || m->kind != MediaKind::Video || !c.layer.empty() || !m->stereo.empty() || enabledEffect(seq, c, "reframe_360")) return nullptr;
+        const double fd = m->fps.valid() ? 1.0 / m->fps.toDouble() : 1.0 / 30;
+        const double sec = std::clamp(c.sourceFrameAt(at) / seq.fpsValue(), 0.0, std::max(0.0, m->duration - fd * 0.5));
+        std::shared_ptr<const DepthMap> d = analysedDepth(m->path, sec);
+        Geometry ag;
+        if (!d || !clipGeometry(p, seq, c, at, ag)) return nullptr;
+        auto out = std::make_shared<ValueMap>();
+        out->width = w, out->height = h;
+        out->values.assign(size_t(w) * size_t(h), 0.0f);
+        parallelRows(h, [&](int y0, int y1) {
+            for (int Y = y0; Y < y1; ++Y)
+                for (int X = 0; X < w; ++X)
+                    if (double u, v; canvasToFrame(seq, ag, o.scale, X, Y, u, v)) out->values[size_t(Y) * size_t(w) + size_t(X)] = d->at(u, v);
+        });
+        return out;
+    };
+    const std::shared_ptr<const ValueMap> depth = sr->p("use_depth", lt, 1) > 0.5 ? analysedOnLayer(t, layer.width, layer.height) : nullptr;
+    SkyShot shot;
+    if (!(c.isGenerator() && c.generator.type == "adjustment")) {
+        auto inClip = [&](int offset) { return t + offset >= c.start && t + offset < c.start + c.duration; };
+        shot.frame = [&, inClip](int offset, Image& other, std::shared_ptr<const ValueMap>& otherDepth) {
+            if (!inClip(offset)) return false;
+            other = clipLayer(p, seq, c, t + offset, o);
+            if (other.width != layer.width || other.height != layer.height) return false;
+            if (sr->p("use_depth", lt, 1) > 0.5) otherDepth = analysedOnLayer(t + offset, other.width, other.height);
+            return true;
+        };
+        // (what decides the clip's layer then, its depth analysis included: render/RenderCache.h)
+        shot.key = [&, inClip](int offset) {
+            if (!inClip(offset)) return std::string();
+            return std::to_string(c.id) + "|" + clipLayerKey(p, seq, c, t + offset, o).toStdString();
+        };
+    }
+    applySkyReplacement(seq, c, *sr, lt, layer, &sky, o.scale, c.sourceFrameAt(t) / seq.fpsValue(), mask.empty() ? nullptr : &mask, depth.get(),
+                        shot);
 }
 
 }  // namespace
 
 Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& opts) {
-    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
+    ExpressionScope expressions(&p, &seq, nullptr, opts.cancel);  // (core/Expression.h)
     const WorkingSpaceScope working(&sequenceColorSpace(seq));  // effects that work in light know whose
     const int solo = opts.soloVideoTrack;
     RenderOptions o = opts;
@@ -1906,7 +1957,7 @@ bool runOnSource(const Effect& e) {
 }
 
 GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, gpu::Layer& out) {
-    ExpressionScope expressions(&p, &seq, &c);  // (core/Expression.h)
+    ExpressionScope expressions(&p, &seq, &c, o.cancel);  // (core/Expression.h)
     if (c.isGenerator() && c.generator.type == "adjustment") return GpuLayerResult::Unsupported;
     // Its colour steps, each one the GPU draws (the ones on the source, such as noise reduction, are not). Those the
     // GPU has no form for go to the CPU before anything is decoded, unless they may run on the camera's picture.
@@ -1985,7 +2036,7 @@ gpu::Layer cpuLayer(Image&& img) {
 // The program frame drawn on the GPU where it can be, its layers that it cannot draw made on the CPU: false (counted,
 // with why) when the frame as a whole is for the CPU.
 bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& opts, Image* out, QImage* out8) {
-    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
+    ExpressionScope expressions(&p, &seq, nullptr, opts.cancel);  // (core/Expression.h)
     std::string why;
     auto fallback = [](const std::string& reason) {
         gpu::countFallback(reason);
@@ -2082,7 +2133,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
 }  // namespace
 
 QImage renderProgramFrameRgba8(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
-    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
+    ExpressionScope expressions(&p, &seq, nullptr, o.cancel);  // (core/Expression.h)
     QImage q;
     if (o.gpu && o.depth == 0 && gpuProgramFrame(p, seq, t, o, nullptr, &q)) return q;
     RenderOptions cpu = o;
@@ -2094,7 +2145,7 @@ QImage renderProgramFrameRgba8(const Project& p, const Sequence& seq, FrameTime 
 }
 
 Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
-    ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
+    ExpressionScope expressions(&p, &seq, nullptr, o.cancel);  // (core/Expression.h)
     if (o.gpu && o.depth == 0) {
         Image img;
         if (gpuProgramFrame(p, seq, t, o, &img, nullptr)) return img;
@@ -2440,7 +2491,7 @@ QPoint cornerPos(int c, int w, int h, int W, int H) {
 }  // namespace
 
 void drawBurnIns(Image& img, const Project& p, const Sequence& seq, FrameTime t, const BurnIn& b, const QImage* watermark,
-                 const ColorSpace* space) {
+                 const ColorSpace* space, FrameTime timecode, bool dropFrame) {
     if (img.width < 8 || img.height < 8) return;
     // The logo first, so the text stays readable over it.
     if (watermark && !watermark->isNull() && b.watermarkOpacity > 0) {
@@ -2450,7 +2501,7 @@ void drawBurnIns(Image& img, const Project& p, const Sequence& seq, FrameTime t,
         blendPatch(img, logo, at.x(), at.y(), space, float(std::clamp(b.watermarkOpacity, 0.0, 1.0)));
     }
     QStringList lines;
-    if (b.timecode) lines << QString::fromStdString(formatTimecode(t, seq.fps));
+    if (b.timecode) lines << QString::fromStdString(formatTimecode(timecode >= 0 ? timecode : t, seq.fps, dropFrame));
     if (b.clipName) {
         for (int i = int(seq.videoTracks.size()) - 1; i >= 0; --i) {
             if (seq.videoTracks[size_t(i)].muted) continue;

@@ -125,6 +125,8 @@
 #include "media/FaceMesh.h"
 #include "media/FaceTracks.h"
 #include "media/DepthMap.h"
+#include "media/VideoDepth.h"
+#include "render/FollowFocus.h"
 #include "media/Matting.h"
 #include "media/Inpaint.h"
 #include "media/Rife.h"
@@ -2180,8 +2182,8 @@ void McpServer::Impl::addTools() {
         "`mask_smooth` gives points without handles smooth automatic ones); "
         "or to a range of distances: mask.depth 1, with mask.depth_low and mask.depth_high from 0 (farthest) to 100 (nearest). "
         "depth_blur (lens blur keeping one distance sharp), depth_fog, depth_map and relight (a virtual light) work from "
-        "the picture's depth. depth_blur focuses on its focus depth (follow 0), the depth at point_x / point_y (follow 1; "
-        "keys on the point rack between the keyed points' depths) or the nearest face (follow 2); fstop scales its blur, "
+        "the picture's depth (on video clips analysed with montage_steady_depth, depth that holds steady through the shot). depth_blur focuses on its focus depth (follow 0), the depth at point_x / point_y (follow 1; "
+        "keys on the point rack between the keyed points' depths) or the nearest face (follow 2); montage_follow_focus keys its focus to follow a point, object or face through a clip; fstop scales its blur, "
         "blades / blade_rotation / squeeze / cat_eye shape the aperture, highlights lifts bokeh highlights and breathing "
         "scales the picture with the focus. "
         "remove_background cuts people out (keep 1 keeps the background instead), and mask.shape 4 limits any effect to "
@@ -2195,7 +2197,7 @@ void McpServer::Impl::addTools() {
         "sky_replace finds the sky (bright, smooth, open to the top of the frame, far away when the depth model is "
         "installed) and puts the picture on another track (source 0; track 0 is the one above, hidden unless hide 0) or a "
         "gradient (source 1, colours zenith and horizon) in its place; sensitivity, lowest (the lowest the sky reaches, % "
-        "of the height), refine, shift and soften shape its key, view 1 shows it; the sky follows the camera (follow 1, "
+        "of the height), refine, shift and soften shape its key, view 1 shows it; steady (on by default) carries the sky from the frames around each so its edge holds through the shot; the sky follows the camera (follow 1, "
         "measured when added; follow 2 uses the clip's camera_track solve) by follow_amount; sky_exposure, sky_blur, "
         "match (the foreground's colour moved toward the new sky's) and wrap / wrap_width (its light round the "
         "foreground's edges) tie it in; a mask limits where the sky may be. "
@@ -8338,6 +8340,79 @@ void McpServer::Impl::addTools() {
             save(l);
             const Clip* made = edit::clipById(s, title);
             return ok(QStringLiteral("Placed a title in the scene"), made ? clipJson(l.project, s, *made) : QJsonObject{});
+        });
+
+    add("montage_steady_depth", "Steady depth for a video clip",
+        "Analyses the depth of what a video clip shows with the video depth model (32 frames at a time, so a surface "
+        "keeps its depth as the camera moves rather than shimmering frame to frame) and keeps it with the file's cache. "
+        "The clip's depth effects (depth_blur, depth_fog, depth_map, relight, depth masks, sky_replace's depth) then use "
+        "it. Analysing again replaces it. Returns whether it covers the clip.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "size":{"type":"integer","default":518,"description":"The analysis's short side in pixels (a multiple of 14, 140 to 770; less is faster)"},
+            "check":{"type":"boolean","default":false,"description":"Only report whether the clip is analysed"}},
+            "required":["project","clip"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Clip& c = clipArg(l, a);
+            const bool covered = clipDepthAnalysed(l.project, s, c);
+            if (a.value("check").toBool()) return ok(covered ? QStringLiteral("Analysed") : QStringLiteral("Not analysed"), QJsonObject{{"analysed", covered}});
+            const double sizeArg = a.contains("size") ? a.value("size").toDouble(-1) : 518;
+            const int size = int(sizeArg);
+            if (sizeArg != size || size < 140 || size > 770 || size % 14) throw ArgError{"\"size\" is a multiple of 14 from 140 to 770"};
+            if (!videoDepthAvailable() || !videoDepthModel().installed())
+                return fail("Steady depth needs the video depth model: run `scripts/fetch-models.sh` or analyse once in the app");
+            std::string err;
+            if (!analyzeClipDepth(l.project, s, c, size, {}, &err)) return fail(QStringLiteral("Could not analyse the depth: %1").arg(QString::fromStdString(err)));
+            return ok(QStringLiteral("Analysed the clip's depth"), QJsonObject{{"analysed", clipDepthAnalysed(l.project, s, c)}});
+        });
+
+    add("montage_follow_focus", "Follow Focus",
+        "Keys a video clip's depth_blur (`effect`, its id) Focus Depth so the focus stays on what it follows, as a focus "
+        "puller keeps it: a point (x, y on the frame at `at`, tracked to both ends of the clip), the effect's object "
+        "mask (montage_object_mask, tracked), or the face nearest the point. Each frame's focus is the median steady "
+        "depth inside the target (the clip is analysed first where montage_steady_depth has not), eased over `ease` "
+        "seconds; where the target is lost the focus holds. Sets follow 0 and replaces the focus keys.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "effect":{"type":"number","description":"The depth_blur effect's id on the clip"},
+            "target":{"type":"string","enum":["point","object","face"],"default":"point"},
+            "at":{"type":["number","string"],"description":"Timeline time of the frame the point is on (the clip's start by default)"},
+            "x":{"type":"number","description":"Across the frame, 0 to 1 (default the effect's point_x)"},
+            "y":{"type":"number","description":"Down the frame, 0 to 1 (default the effect's point_y)"},
+            "ease":{"type":"number","default":0.3,"description":"Seconds a change of distance is eased over (0: none)"}},
+            "required":["project","clip","effect"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id clipId = clipArg(l, a).id;
+            const Id effectId = Id(a.value("effect").toDouble());
+            Effect* e = edit::ownedEffect(s, clipId, effectId);
+            if (!e || e->type != "depth_blur") throw ArgError{QStringLiteral("No depth_blur effect %1 on that clip (see montage_project_info)").arg(qint64(effectId))};
+            const Clip& c = *edit::clipById(s, clipId);
+            FollowFocusSettings fs;
+            const QString target = str(a, "target", "point");
+            if (target == "object") fs.target = FocusTarget::Object;
+            else if (target == "face") fs.target = FocusTarget::Face;
+            else if (target != "point") throw ArgError{"\"target\" is point, object or face"};
+            const FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : c.start;
+            if (!c.contains(at)) throw ArgError{"\"at\" must be inside the clip"};
+            fs.at = at - c.start;
+            fs.x = a.contains("x") ? a.value("x").toDouble(-1) : e->p("point_x", fs.at, 0.5);
+            fs.y = a.contains("y") ? a.value("y").toDouble(-1) : e->p("point_y", fs.at, 0.5);
+            if (!(fs.x >= 0 && fs.x <= 1 && fs.y >= 0 && fs.y <= 1)) throw ArgError{"\"x\" and \"y\" are fractions of the frame, 0 to 1"};
+            fs.ease = a.contains("ease") ? a.value("ease").toDouble(-1) : 0.3;
+            if (!(fs.ease >= 0 && fs.ease <= 10)) throw ArgError{"\"ease\" is seconds, 0 to 10"};
+            if (fs.target == FocusTarget::Face && (!faceSearchAvailable() || !faceModel().installed()))
+                return fail("Following a face needs the face model: run `scripts/fetch-models.sh`");
+            Param focus;
+            std::string err;
+            if (!followFocus(l.project, s, c, *e, fs, focus, {}, &err)) return fail(QStringLiteral("Could not follow focus: %1").arg(QString::fromStdString(err)));
+            e->params["focus"] = focus;
+            e->params["follow"] = Param(0.0);
+            save(l);
+            QJsonArray keys;
+            for (const auto& k : focus.keys) keys.append(QJsonObject{{"frame", double(c.start + k.t)}, {"focus", k.v}});
+            return ok(QStringLiteral("Keyed Focus Depth at %1 frame(s)").arg(focus.keys.size()), QJsonObject{{"keys", keys}});
         });
 
     add("montage_ograf", "OGraf graphics",

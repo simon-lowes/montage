@@ -100,6 +100,8 @@
 #include "render/Versions.h"
 #include "render/RateConversion.h"
 #include "media/Pulldown.h"
+#include "media/VideoDepth.h"
+#include "render/FollowFocus.h"
 #include "render/ClipPlacement.h"
 #include "media/ImageSequence.h"
 #include "media/Interpret.h"
@@ -862,6 +864,115 @@ static QImage castChartImage() {
         p.fillRect(QRectF(120 + (i % 6) * cw + 4, 80 + (i / 6) * ch + 4, cw - 8, ch - 8),
                    QColor::fromRgbF(float(std::min(1.0, rgb[0])), float(std::min(1.0, rgb[1])), float(std::min(1.0, rgb[2]))));
     }
+    return img;
+}
+
+// A sideways dolly past boards at known distances: a brick wall 12 m away, a board 6 m away and another 3 m away, both
+// standing on a tiled floor, the camera (at 1 m) moving along `camX` metres; the picture has a little grain. `labels`
+// gets each pixel's surface: 0 floor, 1 wall, 2 the far board, 3 the near board.
+QImage dollyFrame(int w, int h, double camX, std::vector<uint8_t>* labels, uint32_t seed) {
+    QImage img(w, h, QImage::Format_RGB32);
+    if (labels) labels->assign(size_t(w) * size_t(h), 0);
+    const double f = w * 0.8;
+    auto hash = [](uint32_t v) {
+        v ^= v >> 16, v *= 0x7feb352dU, v ^= v >> 15, v *= 0x846ca68bU, v ^= v >> 16;
+        return double(v & 0xffffff) / double(0xffffff);
+    };
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const double dx = (x + 0.5 - w / 2.0) / f, dy = (y + 0.5 - h / 2.0) / f;
+            double z = 12, r, g, b;
+            int label = 1;
+            // The boards (x from..to, top y, standing on the floor at y = 1).
+            const struct { double z, x0, x1, top; int label; } boards[2] = {{6, -2.4, -0.3, -1.4, 2}, {3, 0.25, 1.15, -0.1, 3}};
+            const bool floorHit = dy > 1e-6 && 1.0 / dy < z;
+            if (floorHit) z = 1.0 / dy, label = 0;
+            for (const auto& bd : boards) {
+                const double X = camX + dx * bd.z, Y = dy * bd.z;
+                if (bd.z < z && X >= bd.x0 && X <= bd.x1 && Y >= bd.top && Y <= 1.0) z = bd.z, label = bd.label;
+            }
+            const double X = camX + dx * z, Y = dy * z;
+            if (label == 1) {  // bricks a quarter of a metre high and half a metre long, the rows offset
+                const int row = int(std::floor(Y / 0.25));
+                const double bx = X / 0.5 + (row % 2 ? 0.5 : 0);
+                const bool mortar = std::fmod(Y + 100, 0.25) < 0.025 || std::fmod(bx + 100, 1.0) < 0.05;
+                const double v = hash(uint32_t(row * 7919 + int(std::floor(bx)) * 104729 + 50000)) * 0.25;
+                r = mortar ? 0.72 : 0.55 + v, g = mortar ? 0.7 : 0.28 + v * 0.5, b = mortar ? 0.66 : 0.2 + v * 0.3;
+            } else if (label == 0) {  // half-metre tiles
+                const bool dark = (int(std::floor(X / 0.5 + 1000)) + int(std::floor(z / 0.5))) % 2;
+                r = g = b = dark ? 0.32 : 0.62;
+                g += 0.03;
+            } else if (label == 2) {  // a board with stripes
+                const double s = 0.5 + 0.5 * std::sin(X * 18 + std::sin(Y * 5) * 2);
+                r = 0.15 + 0.2 * s, g = 0.45 + 0.25 * s, b = 0.5 + 0.2 * s;
+            } else {  // a chequered board
+                const bool dark = (int(std::floor(X / 0.12 + 1000)) + int(std::floor(Y / 0.12 + 1000))) % 2;
+                r = dark ? 0.85 : 0.98, g = dark ? 0.45 : 0.8, b = dark ? 0.1 : 0.35;
+            }
+            // A little haze with distance, and grain.
+            const double haze = 1 - std::exp(-z / 40);
+            const double n = (hash(seed * 2654435761U + uint32_t(y * w + x)) - 0.5) * 0.06;
+            auto c = [&](double v) { return std::clamp(int(std::lround((v * (1 - haze) + 0.8 * haze + n) * 255)), 0, 255); };
+            img.setPixel(x, y, qRgb(c(r), c(g), c(b)));
+            if (labels) (*labels)[size_t(y) * size_t(w) + size_t(x)] = uint8_t(label);
+        }
+    return img;
+}
+
+// A ball 0.35 m across rolling towards the camera from 6 m to 3.5 m as it crosses the frame, in front of the brick
+// wall 12 m away, over the tiled floor (the camera still, at 1 m). `ball` gets its centre and radius in pixels.
+QImage ballFrame(int w, int h, double t, QPointF* ballCentre, double* ballRadius, uint32_t seed) {
+    QImage img = dollyFrame(w, h, 0, nullptr, seed);
+    const double f = w * 0.8, r = 0.35;
+    const double bx = -1.6 + 3.2 * t, bz = 6 - 2.5 * t, by = 1 - r;
+    if (ballCentre) *ballCentre = QPointF(w / 2.0 + f * bx / bz, h / 2.0 + f * by / bz);
+    if (ballRadius) *ballRadius = f * r / bz;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const double dx = (x + 0.5 - w / 2.0) / f, dy = (y + 0.5 - h / 2.0) / f, dz = 1;
+            // Ray from the camera (0, 0, 0) along (dx, dy, 1) against the ball.
+            const double A = dx * dx + dy * dy + dz * dz, B = -2 * (dx * bx + dy * by + dz * bz), C = bx * bx + by * by + bz * bz - r * r;
+            const double disc = B * B - 4 * A * C;
+            if (disc < 0) continue;
+            const double k = (-B - std::sqrt(disc)) / (2 * A);
+            const double nx = (dx * k - bx) / r, ny = (dy * k - by) / r, nz = (dz * k - bz) / r;
+            // Chequered in latitude and longitude, lit from the upper left.
+            const bool dark = (int(std::floor((std::atan2(nx, -nz) + M_PI) / (M_PI / 6))) + int(std::floor((std::asin(std::clamp(ny, -1.0, 1.0)) + M_PI / 2) / (M_PI / 6)))) % 2;
+            const double light = std::clamp(0.35 + 0.65 * (-0.5 * nx - 0.6 * ny - 0.62 * nz), 0.15, 1.0);
+            const double base = dark ? 0.15 : 0.95;
+            const int v = std::clamp(int(std::lround(base * light * 255)), 0, 255);
+            img.setPixel(x, y, qRgb(v, int(v * 0.9), int(v * 0.4)));
+        }
+    return img;
+}
+
+// A still camera panning `pan` pixels a frame across a sky over hazy hills and a line of trees, with grain: `t` is
+// the frame. The trees' top edge is at row treeLine(x + t * pan).
+double treeLine(double wx, int h) { return h * 0.48 + 7 * std::sin(wx * 0.07) + 4 * std::sin(wx * 0.23 + 1) + 2 * std::sin(wx * 0.9); }
+QImage skyFrame(int w, int h, int t, double pan, uint32_t seed) {
+    QImage img(w, h, QImage::Format_RGB32);
+    auto hash = [](uint32_t v) {
+        v ^= v >> 16, v *= 0x7feb352dU, v ^= v >> 15, v *= 0x846ca68bU, v ^= v >> 16;
+        return double(v & 0xffffff) / double(0xffffff);
+    };
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const double wx = x + t * pan;
+            double r, g, b;
+            const double hills = h * 0.40 + 6 * std::sin(wx * 0.021 + 2);
+            if (y < hills) {  // the sky, paler towards the horizon
+                const double k = double(y) / (h * 0.4);
+                r = 0.35 + 0.4 * k, g = 0.55 + 0.3 * k, b = 0.9 - 0.05 * k;
+            } else if (y < treeLine(wx, h)) {  // far hills in haze, a little darker than the sky above them
+                r = 0.62, g = 0.72, b = 0.8;
+            } else {  // trees, then grass
+                const double leaf = 0.5 + 0.5 * std::sin(wx * 0.8) * std::sin(y * 0.9);
+                r = 0.1 + 0.08 * leaf, g = 0.25 + 0.12 * leaf, b = 0.1;
+            }
+            const double n = (hash(seed * 2654435761U + uint32_t(y * w + x)) - 0.5) * 0.06;
+            auto c = [&](double v) { return std::clamp(int(std::lround((v + n) * 255)), 0, 255); };
+            img.setPixel(x, y, qRgb(c(r), c(g), c(b)));
+        }
     return img;
 }
 
@@ -4789,6 +4900,20 @@ private slots:
             follower.motion.params["rotation"].expr = bad;
             QCOMPARE(at(follower, "rotation", 3), 12.0);
             QVERIFY2(!failure().empty(), bad.c_str());
+        }
+        // A render's Cancel stops an expression part way (not after the time limit), and is not the expression's error.
+        {
+            follower.motion.params["rotation"].expr = "value * 2";
+            QCOMPARE(at(follower, "rotation", 3), 24.0);
+            std::atomic<bool> cancel{true};
+            ExpressionScope cancelled(&p, &s, nullptr, &cancel);
+            ExpressionScope inner(&p, &s);  // (scopes inside it keep its Cancel)
+            follower.motion.params["rotation"].expr = "while true do end";
+            QElapsedTimer clock;
+            clock.start();
+            QCOMPARE(at(follower, "rotation", 3), 12.0);
+            QVERIFY2(clock.elapsed() < 1000, qPrintable(QString::number(clock.elapsed())));
+            QVERIFY(failure().empty());
         }
         follower.motion.params["rotation"].expr = "(type(1) == 'number' and math.pi == pi and string.upper('a') == 'A') and 5 or 0";
         QCOMPARE(at(follower, "rotation", 3), 5.0);
@@ -25299,6 +25424,414 @@ private slots:
         const double red = third->px[(size_t(45) * size_t(third->width) + 80) * 4] / 65535.0;
         const double expected = 3.0 * 25.0 * 1001.0 / 30000.0 / 24.0;
         QVERIFY2(std::fabs(red - expected) < 0.008, qPrintable(QString("%1 %2").arg(red).arg(expected)));
+    }
+
+    void burnInsAndFieldsAtTheDeliveredRate() {
+        std::string err;
+        // A still black programme at 25 with its timecode burnt in, delivered at 29.97 with in-betweens: every delivered
+        // frame shows its own timecode at the delivered rate, sharp (drawn on the frame as delivered, not blended from
+        // the programme's two).
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = Rational{25, 1};
+        Clip black = makeGeneratorClip(p, "color", 50);
+        for (const char* c : {"color.r", "color.g", "color.b"}) black.generator.params[c] = 0.0;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, black);
+        ExportSettings st;
+        st.videoCodec = "png";
+        st.audioCodec = "none";
+        st.rateChange = "convert";
+        st.rate = Rational{30000, 1001};
+        st.burnIn.timecode = true;
+        st.in = 0, st.out = 10;
+        st.path = path("tc2997_%04d.png");
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        RateConversion c;
+        QVERIFY(planRateConversion(s, st, c, &err));
+        const Sequence d = deliveredSequence(s, c, 0, 10);
+        for (int o = 0; o < 12; ++o) {
+            const QImage got = QImage(QString::fromStdString(path(qPrintable(QString::asprintf("tc2997_%04d.png", o)))))
+                                   .convertToFormat(QImage::Format_RGBA8888);
+            QVERIFY2(got.width() == 320 && got.height() == 180, std::to_string(o).c_str());
+            Image want(320, 180);
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) want.at(x, y)[3] = 1.0f;
+            drawBurnIns(want, p, d, o, st.burnIn, nullptr, nullptr, o);
+            int worst = 0;
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x)
+                    worst = std::max(worst, std::abs(qGreen(got.pixel(x, y)) - int(std::lround(std::clamp(want.at(x, y)[1], 0.0f, 1.0f) * 255))));
+            QVERIFY2(worst <= 3, qPrintable(QString("frame %1: %2").arg(o).arg(worst)));
+        }
+        // From a second in: the timecode counts on from where the range starts (frame 25 at 25 is 30 at 29.97).
+        st.in = 25, st.out = 30;
+        st.path = path("tc2997b_%04d.png");
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        {
+            const QImage got = QImage(QString::fromStdString(path("tc2997b_0000.png"))).convertToFormat(QImage::Format_RGBA8888);
+            Image want(320, 180), wrong(320, 180);
+            for (Image* w : {&want, &wrong})
+                for (int y = 0; y < 180; ++y)
+                    for (int x = 0; x < 320; ++x) w->at(x, y)[3] = 1.0f;
+            drawBurnIns(want, p, d, 0, st.burnIn, nullptr, nullptr, 30);
+            drawBurnIns(wrong, p, d, 0, st.burnIn, nullptr, nullptr, 0);
+            int off = 0, offWrong = 0;
+            for (int y = 0; y < 180; ++y)
+                for (int x = 0; x < 320; ++x) {
+                    off += std::abs(qGreen(got.pixel(x, y)) - int(std::lround(std::clamp(want.at(x, y)[1], 0.0f, 1.0f) * 255))) > 3;
+                    offWrong += std::abs(qGreen(got.pixel(x, y)) - int(std::lround(std::clamp(wrong.at(x, y)[1], 0.0f, 1.0f) * 255))) > 3;
+                }
+            QVERIFY2(off == 0 && offWrong > 0, qPrintable(QString("%1 %2").arg(off).arg(offWrong)));
+        }
+
+        // Pulldown into fields: B C's and C D's two fields show the one timecode, the delivered frame's (not B's and C's),
+        // so each delivered frame of the black programme is as it is with 2:2:2:4, where no frame mixes two.
+        ExportSettings woven = st;
+        woven.videoCodec = "ffv1";
+        woven.rateChange = "pulldown";
+        woven.in = 0, woven.out = 8;
+        s.fps = Rational{24000, 1001};
+        std::vector<Frame16Ptr> byCadence[2];
+        for (int k = 0; k < 2; ++k) {
+            woven.cadence = k ? "2:2:2:4" : "2:3";
+            woven.path = path(k ? "tc-2224.mkv" : "tc-23.mkv");
+            QVERIFY2(exportSequence(p, s, woven, nullptr, nullptr, &err), err.c_str());
+            VideoDecoder dec;
+            QVERIFY2(dec.open(woven.path, &err), err.c_str());
+            for (int o = 0; o < 10; ++o) {
+                Frame16Ptr f = dec.frameAt((o + 0.5) * 1001.0 / 30000.0, 0, 0);
+                QVERIFY(f);
+                byCadence[k].push_back(f);
+            }
+        }
+        for (int o = 0; o < 10; ++o) QVERIFY2(byCadence[0][size_t(o)]->px == byCadence[1][size_t(o)]->px, std::to_string(o).c_str());
+        QVERIFY(byCadence[0][2]->px != byCadence[0][3]->px);
+
+        // Pulldown into fields is for video: OpenEXR frames (through FFmpeg or the OpenEXR library) are refused.
+        ExportSettings exr;
+        exr.videoCodec = "exr";
+        exr.audioCodec = "none";
+        exr.rateChange = "pulldown";
+        exr.rate = Rational{30000, 1001};
+        exr.in = 0, exr.out = 8;
+        exr.path = path("pd_%04d.exr");
+        for (const char* way : {"", "zip"}) {
+            if (*way && !exrAvailable()) continue;  // (built without OpenEXR)
+            exr.exrCompression = way;
+            QVERIFY(!exportSequence(p, s, exr, nullptr, nullptr, &err) && err.find("Interlaced") != std::string::npos);
+        }
+    }
+
+    void steadyVideoDepth() {
+        if (!videoDepthAvailable() || !videoDepthModel().installed()) QSKIP("Set MONTAGE_VIDEO_DEPTH_MODEL to Video Depth Anything Small");
+        if (!depthModel().installed()) QSKIP("Set MONTAGE_DEPTH_MODEL to Depth Anything V2 Small");
+        qputenv("MONTAGE_DEPTH_CACHE", path("depth-cache").c_str());
+        // A dolly past the boards, 48 frames.
+        const int W = 336, H = 196, N = 48;
+        std::vector<QImage> frames;
+        std::vector<std::vector<uint8_t>> labels(N);
+        for (int i = 0; i < N; ++i) frames.push_back(dollyFrame(W, H, -0.5 + i / double(N - 1), &labels[size_t(i)], uint32_t(i + 1)));
+        const std::string video = path("dolly.mp4");
+        writeFrames(video, frames, 25);
+        std::string err;
+        double a = -1, b = -1;
+        QVERIFY(!analysedDepthRange(video, a, b));
+        QVERIFY(!analysedDepth(video, 0.5));
+        int calls = 0;
+        QVERIFY2(analyzeVideoDepth(video, 0, 10, 196, [&](double) { return ++calls > 0; }, &err), err.c_str());
+        QVERIFY(calls >= 3);  // (each 32-frame window)
+        QVERIFY(analysedDepthRange(video, a, b));
+        QCOMPARE(a, 0.0);
+        QVERIFY2(std::fabs(b - 47 / 25.0) < 1e-6, qPrintable(QString::number(b)));
+        // Each surface's depth on each frame (its median, a few pixels in from its edges), from the analysis and from the
+        // still model frame by frame.
+        VideoDecoder dec;
+        QVERIFY(dec.open(video, &err));
+        auto medians = [&](const DepthMap& d, int frame) {
+            std::array<std::vector<float>, 4> v;
+            const std::vector<uint8_t>& l = labels[size_t(frame)];
+            for (int y = 4; y < H - 4; y += 2)
+                for (int x = 4; x < W - 4; x += 2) {
+                    const uint8_t k = l[size_t(y) * W + size_t(x)];
+                    bool inside = true;
+                    for (int j = -4; j <= 4 && inside; j += 2)
+                        for (int i = -4; i <= 4 && inside; i += 2) inside = l[size_t(y + j) * W + size_t(x + i)] == k;
+                    if (inside) v[k].push_back(d.at((x + 0.5) / W, (y + 0.5) / H));
+                }
+            std::array<double, 4> m{};
+            for (int k = 0; k < 4; ++k) {
+                if (v[size_t(k)].empty()) return std::array<double, 4>{-1, -1, -1, -1};
+                std::nth_element(v[size_t(k)].begin(), v[size_t(k)].begin() + std::ptrdiff_t(v[size_t(k)].size() / 2), v[size_t(k)].end());
+                m[size_t(k)] = v[size_t(k)][v[size_t(k)].size() / 2];
+            }
+            return m;
+        };
+        std::vector<std::array<double, 4>> steady, still;
+        for (int i = 0; i < N; ++i) {
+            auto d = analysedDepth(video, i / 25.0);
+            QVERIFY(d);
+            QCOMPARE(d->width, 336);
+            QCOMPARE(d->height, 196);
+            steady.push_back(medians(*d, i));
+            Frame16Ptr f = dec.frameAt((i + 0.25) / 25);
+            QVERIFY(f);
+            DepthMap s;
+            QVERIFY2(estimateDepth(toImage(*f), s, 196, &err), err.c_str());
+            still.push_back(medians(s, i));
+        }
+        // The boards and the wall keep their distances (the camera moves across, not towards them): the depth of each
+        // changes at least 3 times less from frame to frame than the still model's does.
+        auto change = [&](const std::vector<std::array<double, 4>>& m) {
+            double sum = 0;
+            int n = 0;
+            for (int i = 1; i < N; ++i)
+                for (int k = 1; k < 4; ++k)
+                    if (m[size_t(i)][size_t(k)] >= 0 && m[size_t(i - 1)][size_t(k)] >= 0) sum += std::fabs(m[size_t(i)][size_t(k)] - m[size_t(i - 1)][size_t(k)]), ++n;
+            return n ? sum / n : 1.0;
+        };
+        const double cs = change(steady), cv = change(still);
+        qInfo("frame-to-frame change: %.4f steady, %.4f frame by frame", cs, cv);
+        QVERIFY2(cs * 3 <= cv, qPrintable(QString("%1 vs %2").arg(cs).arg(cv)));
+        // In order on every frame: the near board, the far board, the wall.
+        for (int i = 0; i < N; ++i) {
+            const auto& m = steady[size_t(i)];
+            QVERIFY2(m[3] > m[2] && m[2] > m[1], qPrintable(QString("frame %1: %2 %3 %4").arg(i).arg(m[3]).arg(m[2]).arg(m[1])));
+        }
+        // Beyond the analysis by more than a frame: nothing (the still model is used there).
+        QVERIFY(analysedDepth(video, 47 / 25.0 + 0.03));
+        QVERIFY(!analysedDepth(video, 47 / 25.0 + 0.09));
+        QVERIFY(!analysedDepth(video, -0.09));
+        // A changed file is not taken for the one analysed.
+        QFile touch(QString::fromStdString(video));
+        QVERIFY(touch.open(QIODevice::Append));
+        touch.write("x");
+        touch.close();
+        QVERIFY(!analysedDepth(video, 0.5));
+        QVERIFY(!analysedDepthRange(video, a, b));
+    }
+
+    void steadyDepthCoverage() {
+        // Footage at 120 frames a second, read with Interpret Footage settings: analysed every fourth frame, the clip's
+        // depth is steady to its last frame, a frame's depth is the one shown, and a second analysis keeps the first's.
+        if (!videoDepthAvailable() || !videoDepthModel().installed()) QSKIP("Set MONTAGE_VIDEO_DEPTH_MODEL to Video Depth Anything Small");
+        qputenv("MONTAGE_DEPTH_CACHE", path("depth-cache-120").c_str());
+        const int W = 196, H = 112, N = 60;
+        std::vector<QImage> frames;
+        for (int i = 0; i < N; ++i) frames.push_back(dollyFrame(W, H, -0.5 + i / double(N - 1), nullptr, uint32_t(i + 1)));
+        const std::string file = path("dolly120.mp4");
+        writeFrames(file, frames, 120);
+        Interpretation how;
+        how.par = 1.0;
+        const std::string video = interpretedPath(file, how);
+        QVERIFY(video != file);
+        std::string err;
+        double a = -1, b = -1, step = 0;
+        QVERIFY2(analyzeVideoDepth(video, 0, 0.2, 140, {}, &err), err.c_str());
+        QVERIFY(analysedDepthRange(video, a, b, &step));
+        QCOMPARE(a, 0.0);
+        QVERIFY2(std::fabs(step - 4 / 120.0) < 1e-9, qPrintable(QString::number(step)));
+        QVERIFY2(b <= 0.2 + 1e-9, qPrintable(QString::number(b)));
+        // Analysed again further on: the first stretch is still analysed.
+        QVERIFY2(analyzeVideoDepth(video, 0.3, 1, 140, {}, &err), err.c_str());
+        QVERIFY(analysedDepthRange(video, a, b, &step));
+        QCOMPARE(a, 0.0);
+        QVERIFY2(b >= 56 / 120.0 - 1e-9, qPrintable(QString::number(b)));
+        // Shown frame 4 (an analysed one) until frame 5 starts: its own depth, not mixed with the next analysed frame's.
+        auto at4 = analysedDepth(video, 4 / 120.0), late = analysedDepth(video, 4.9 / 120.0), at6 = analysedDepth(video, 6 / 120.0);
+        QVERIFY(at4 && late && at6);
+        QVERIFY(at4->values == late->values);
+        QVERIFY(at4->values != at6->values);  // (half way to the next analysed frame)
+        // A 120 fps clip of all of it reads as analysed, though the last analysed frame is three before its last.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = Rational{120, 1};
+        MediaItem m = probeOrFail(p, file);
+        m.path = video;
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Clip& clip = s.videoTracks[0].clips.at(0);
+        QCOMPARE(clip.duration, FrameTime(N));
+        QVERIFY(clipDepthAnalysed(p, s, clip));
+        // Reframed from 360°, it is not (its depth is the view's).
+        Clip reframed = clip;
+        reframed.effects.push_back(makeEffect(p, "reframe_360"));
+        QVERIFY(!clipDepthAnalysed(p, s, reframed));
+    }
+
+    void followFocusOnABall() {
+        if (!videoDepthAvailable() || !videoDepthModel().installed()) QSKIP("Set MONTAGE_VIDEO_DEPTH_MODEL to Video Depth Anything Small");
+        qputenv("MONTAGE_DEPTH_CACHE", path("depth-cache").c_str());
+        const int W = 336, H = 196, N = 40;
+        std::vector<QImage> frames;
+        std::vector<QPointF> centre(N);
+        std::vector<double> radius(N);
+        for (int i = 0; i < N; ++i) frames.push_back(ballFrame(W, H, i / double(N - 1), &centre[size_t(i)], &radius[size_t(i)], uint32_t(i + 7)));
+        const std::string video = path("ball.mp4");
+        writeFrames(video, frames, 25);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, video);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& clip = s.videoTracks[0].clips.at(0);
+        QCOMPARE(clip.duration, FrameTime(N));
+        Effect lens = makeEffect(p, "depth_blur");
+        lens.params["radius"] = Param(6.0);
+        // Follow Focus on the ball, picked on its first frame.
+        FollowFocusSettings fs;
+        fs.target = FocusTarget::Point;
+        fs.x = centre[0].x() / W, fs.y = centre[0].y() / H;
+        fs.size = 196;
+        Param focus;
+        std::string err;
+        double reached = 0;
+        QVERIFY2(followFocus(p, s, clip, lens, fs, focus, [&](double f) { reached = f; return true; }, &err), err.c_str());
+        QCOMPARE(reached, 1.0);
+        // Fewer keys than frames where the distance changes evenly, nearer at the end than the start.
+        QVERIFY2(focus.keys.size() >= 2 && focus.keys.size() < size_t(N), qPrintable(QString::number(focus.keys.size())));
+        QVERIFY2(focus.at(N - 1) > focus.at(0) + 5, qPrintable(QString("%1 %2").arg(focus.at(0)).arg(focus.at(N - 1))));
+        lens.params["focus"] = focus;
+        clip.effects.push_back(lens);
+        auto detail = [](const Image& im, double cx, double cy, double half) {
+            double sum = 0;
+            int n = 0;
+            auto l = [&](int x, int y) {
+                const float* q = im.at(x, y);
+                return 0.2126 * q[0] + 0.7152 * q[1] + 0.0722 * q[2];
+            };
+            for (int y = int(cy - half); y <= int(cy + half); ++y)
+                for (int x = int(cx - half); x <= int(cx + half); ++x, ++n)
+                    sum += std::abs(4 * l(x, y) - l(x - 1, y) - l(x + 1, y) - l(x, y - 1) - l(x, y + 1));
+            return sum / std::max(1, n);
+        };
+        // On frames across the shot the ball stays sharp while the wall behind it blurs.
+        clip.effects.back().enabled = true;
+        for (int i : {0, 13, 26, 39}) {
+            clip.effects.back().enabled = false;
+            const Image plain = renderSequenceFrame(p, s, i, {});
+            clip.effects.back().enabled = true;
+            const Image shown = renderSequenceFrame(p, s, i, {});
+            const double half = radius[size_t(i)] * 0.55;
+            const double ball = detail(shown, centre[size_t(i)].x(), centre[size_t(i)].y(), half) / detail(plain, centre[size_t(i)].x(), centre[size_t(i)].y(), half);
+            // (a patch of wall well away from the ball)
+            const double wx = centre[size_t(i)].x() < W / 2.0 ? W * 0.8 : W * 0.2;
+            const double wall = detail(shown, wx, H * 0.2, 12) / detail(plain, wx, H * 0.2, 12);
+            qInfo("frame %d: ball keeps %.2f of its detail, the wall %.2f", i, ball, wall);
+            QVERIFY2(ball > 0.8, qPrintable(QString("frame %1: %2").arg(i).arg(ball)));
+            QVERIFY2(wall < 0.5, qPrintable(QString("frame %1: %2").arg(i).arg(wall)));
+        }
+        // Focused where the ball starts and left there, it goes soft as it nears.
+        clip.effects.back().params["focus"] = Param(focus.at(0));
+        const Image fixedFocus = renderSequenceFrame(p, s, N - 1, {});
+        clip.effects.back().enabled = false;
+        const Image plainEnd = renderSequenceFrame(p, s, N - 1, {});
+        const double half = radius[size_t(N - 1)] * 0.55;
+        QVERIFY(detail(fixedFocus, centre[size_t(N - 1)].x(), centre[size_t(N - 1)].y(), half) <
+                0.6 * detail(plainEnd, centre[size_t(N - 1)].x(), centre[size_t(N - 1)].y(), half));
+        // A step in distance is eased into and out of over the ease (0.2 s, 5 frames), centred on the step; lost frames
+        // hold the distance.
+        std::vector<double> step(50, 0.2);
+        std::fill(step.begin() + 25, step.end(), 0.8);
+        step[40] = -1;
+        const std::vector<double> pulled = pullFocus(step, 25, 0.2);
+        QVERIFY(std::fabs(pulled[0] - 0.2) < 1e-9 && std::fabs(pulled[49] - 0.8) < 1e-9 && std::fabs(pulled[40] - 0.8) < 1e-9);
+        QVERIFY(std::fabs(pulled[24] + pulled[25] - 1.0) < 1e-9);  // (half way across the step)
+        QVERIFY(pulled[22] > 0.2 && pulled[22] < 0.3 && pulled[28] < 0.8 && pulled[28] > 0.7);
+        for (size_t i = 1; i < pulled.size(); ++i) QVERIFY(pulled[i] >= pulled[i - 1] - 1e-12);
+
+        // ---- Over MCP: the clip is already analysed, and the focus is keyed onto the effect as in the app.
+        clip.effects.back().enabled = true;
+        clip.effects.back().params["focus"] = Param(50.0);
+        clip.effects.back().params["follow"] = Param(1.0);
+        const Id lensId = clip.effects.back().id;
+        const QString project = QString::fromStdString(path("follow.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const QJsonObject clipArgs{{"project", project}, {"clip", double(clip.id)}};
+        QJsonObject r = call("montage_steady_depth", QJsonObject{{"project", project}, {"clip", double(clip.id)}, {"check", true}});
+        QVERIFY(!r.value("isError").toBool());
+        QVERIFY(r.value("structuredContent").toObject().value("analysed").toBool());
+        r = call("montage_follow_focus", QJsonObject{{"project", project}, {"clip", double(clip.id)}, {"effect", double(lensId + 1000)}});
+        QVERIFY(r.value("isError").toBool());
+        r = call("montage_follow_focus", QJsonObject{{"project", project}, {"clip", double(clip.id)}, {"effect", double(lensId)},
+                                                      {"x", centre[0].x() / W}, {"y", centre[0].y() / H}, {"at", 0}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(r.value("content").toArray().at(0).toObject().value("text").toString()));
+        const QJsonArray keys = r.value("structuredContent").toObject().value("keys").toArray();
+        QCOMPARE(keys.size(), qsizetype(focus.keys.size()));
+        Project after;
+        QVERIFY(loadProject(project.toStdString(), after));
+        const Effect* kept = nullptr;
+        for (const Effect& e : after.active()->videoTracks[0].clips.at(0).effects)
+            if (e.id == lensId) kept = &e;
+        QVERIFY(kept);
+        QCOMPARE(kept->p("follow", 0, 1), 0.0);
+        QCOMPARE(kept->params.at("focus").keys.size(), focus.keys.size());
+        QVERIFY(std::fabs(kept->p("focus", N - 1, 0) - focus.at(N - 1)) < 1e-6);
+        // Content credentials name the video depth model for the analysed clip's depth effect.
+        const Provenance said = sequenceProvenance(after, *after.active());
+        QVERIFY(std::find(said.ai.begin(), said.ai.end(), AiUse{"Steady Depth", "Video Depth Anything Small", AiRole::Assisted}) != said.ai.end());
+    }
+
+    void steadySkyMatte() {
+        // A slow pan across a sky over hazy hills and trees, with grain: the sky's edge found frame by frame jumps
+        // about; held steady through the shot it moves with the picture, by less than a set limit.
+        const int W = 320, H = 180, N = 8;
+        const double pan = 1.5;
+        std::vector<QImage> frames;
+        for (int i = 0; i < N; ++i) frames.push_back(skyFrame(W, H, i, pan, uint32_t(i + 3)));
+        const std::string video = path("sky.mp4");
+        writeFrames(video, frames, 25, 0);
+        // Its frames as they were drawn (the PNGs the video was made from, as a sequence), so the edge is the same on
+        // every system: a video's colours pass through each system's FFmpeg, and these hills are a hair from the sky.
+        ImageSequence run;
+        QVERIFY(detectImageSequence(path("sky.mp4.frame0.png"), run));
+        QCOMPARE(run.frames(), N);
+        run.fps = {25, 1};
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, imageSequencePath(run));
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& clip = s.videoTracks[0].clips.at(0);
+        Effect sky = makeEffect(p, "sky_replace");
+        sky.params["source"] = Param(1.0);  // (a gradient)
+        sky.params["view"] = Param(1.0);    // the matte
+        sky.params["use_depth"] = Param(0.0);
+        clip.effects.push_back(sky);
+        // How far the sky's edge moves from frame to frame beyond the pan (the picture moving `pan` pixels left a frame):
+        // the matte that changed, against the last frame's moved with the picture, over the width (as many rows of change
+        // in each column as the edge moved there; a sliver that comes and goes counts for its own size).
+        auto movement = [&](bool steady) {
+            clip.effects.back().params["steady"] = Param(steady ? 1.0 : 0.0);
+            std::vector<Image> m;
+            for (int i = 0; i < N; ++i) m.push_back(renderSequenceFrame(p, s, i, {}));
+            double sum = 0;
+            for (int i = 1; i < N; ++i)
+                for (int y = 0; y < H; ++y)
+                    for (int x = 8; x < W - 8; ++x) {
+                        // (what is at x now was at x + pan a frame ago)
+                        const double xs = x + pan;
+                        const int x0 = int(xs);
+                        const double was = m[size_t(i - 1)].at(x0, y)[1] * (1 - (xs - x0)) + m[size_t(i - 1)].at(x0 + 1, y)[1] * (xs - x0);
+                        sum += std::fabs(m[size_t(i)].at(x, y)[1] - was);
+                    }
+            return sum / ((N - 1) * (W - 16));
+        };
+        const double jumpy = movement(false), steady = movement(true);
+        qInfo("sky edge movement beyond the pan: %.3f px frame by frame, %.3f px held steady", jumpy, steady);
+        // (the hazy hills' crest drops in and out of the sky frame by frame, and the grain moves the edge about)
+        QVERIFY2(steady < 0.75, qPrintable(QString::number(steady)));
+        QVERIFY2(steady < 0.7 * jumpy, qPrintable(QString("%1 vs %2").arg(steady).arg(jumpy)));
     }
 };
 
