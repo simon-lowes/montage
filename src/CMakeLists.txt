@@ -88,6 +88,8 @@ add_library(montage_engine STATIC
   media/VoiceClone.h media/VoiceClone.cpp
   media/ContentCredentials.h media/ContentCredentials.cpp
   media/SoundSearch.h media/SoundSearch.cpp
+  media/DescribePicture.h media/DescribePicture.cpp
+  media/LanguageModel.h media/LanguageModel.cpp
   media/StemSeparation.h media/StemSeparation.cpp
   media/BanditSeparation.h media/BanditSeparation.cpp
   media/LipSync.h media/LipSync.cpp
@@ -158,6 +160,7 @@ add_library(montage_engine STATIC
   render/Title3D.h render/Title3D.cpp
   render/AafExport.h render/AafExport.cpp
   render/ClipAnalysis.h render/ClipAnalysis.cpp
+  render/FootageWords.h render/FootageWords.cpp
   render/MusicEdit.h render/MusicEdit.cpp
   render/Highlights.h render/Highlights.cpp
   render/Shorts.h render/Shorts.cpp
@@ -602,6 +605,10 @@ target_sources(montage_engine PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/LipSyncGraphs.
 if(MONTAGE_WITH_WHISPER)
   target_link_libraries(montage_engine PRIVATE whisper)
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_WHISPER)
+endif()
+if(MONTAGE_WITH_LLAMA)
+  target_link_libraries(montage_engine PRIVATE llama)
+  target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_LLAMA)
 endif()
 
 add_executable(montage-cli cli/main.cpp)

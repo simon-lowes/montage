@@ -169,7 +169,10 @@ bool ClapTokenizer::load(const std::string& vocabJson, const std::string& merges
     QFile vf(QString::fromStdString(vocabJson)), mf(QString::fromStdString(mergesTxt));
     if (!vf.open(QIODevice::ReadOnly) || !mf.open(QIODevice::ReadOnly)) return false;
     const QJsonObject v = QJsonDocument::fromJson(vf.readAll()).object();
-    for (auto it = v.begin(); it != v.end(); ++it) vocab_[it.key().toStdString()] = it.value().toInteger();
+    for (auto it = v.begin(); it != v.end(); ++it) {
+        vocab_[it.key().toStdString()] = it.value().toInteger();
+        pieces_[it.value().toInteger()] = it.key().toStdString();
+    }
     int rank = 0;
     for (const QByteArray& line : mf.readAll().split('\n')) {
         if (line.isEmpty() || line.startsWith("#version")) continue;
@@ -183,6 +186,7 @@ bool ClapTokenizer::load(const std::string& vocabJson, const std::string& merges
         const bool printable = (b >= '!' && b <= '~') || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF);
         const char32_t c = printable ? char32_t(b) : char32_t(256 + extra++);
         byteChar_[b] = QString::fromUcs4(&c, 1).toStdString();
+        charByte_[c] = static_cast<unsigned char>(b);
     }
     return !vocab_.empty() && !ranks_.empty();
 }
@@ -228,6 +232,16 @@ std::vector<int64_t> ClapTokenizer::encode(const std::string& text) const {
         }
     ids.push_back(kEos);
     return ids;
+}
+
+std::string ClapTokenizer::decode(const std::vector<int64_t>& ids) const {
+    std::string mapped;
+    for (const int64_t id : ids)
+        if (const auto it = pieces_.find(id); id > 3 && it != pieces_.end()) mapped += it->second;
+    std::string out;
+    for (const char32_t c : QString::fromStdString(mapped).toStdU32String())
+        if (const auto it = charByte_.find(c); it != charByte_.end()) out += char(it->second);
+    return out;
 }
 
 // ---- The model ---------------------------------------------------------------------------

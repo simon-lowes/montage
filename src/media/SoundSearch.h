@@ -32,18 +32,23 @@ constexpr int kClapFrames = 1001, kClapMels = 64;
 // samples, centred, power in dB), kClapFrames x kClapMels, row-major.
 std::vector<float> clapFeatures(const std::vector<float>& mono);
 
-// RoBERTa's byte-level BPE (vocab.json, merges.txt), as CLAP's text side reads a query: <s> ... </s>.
+// RoBERTa's byte-level BPE (vocab.json, merges.txt), as CLAP's text side reads a query: <s> ... </s>. Florence-2
+// (media/DescribePicture.h) reads and writes the same vocabulary.
 class ClapTokenizer {
 public:
     bool load(const std::string& vocabJson, const std::string& mergesTxt);
     bool loaded() const { return !vocab_.empty(); }
     std::vector<int64_t> encode(const std::string& text) const;
+    // The text of tokens, leaving out the special ones (<s>, <pad>, </s>, <unk>: ids 0-3).
+    std::string decode(const std::vector<int64_t>& ids) const;
 
 private:
     std::vector<int64_t> word(const std::string& piece) const;
     std::map<std::string, int64_t> vocab_;
+    std::map<int64_t, std::string> pieces_;
     std::map<std::pair<std::string, std::string>, int> ranks_;
     std::string byteChar_[256];
+    std::map<char32_t, unsigned char> charByte_;
 };
 
 // The model, loaded once per process and shared (its sessions are thread safe).

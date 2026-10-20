@@ -65,6 +65,8 @@
 #include "media/DualSystem.h"
 #include "media/FieldRecorder.h"
 #include "media/Analysis.h"
+#include "media/DescribePicture.h"
+#include "media/LanguageModel.h"
 #include "media/Inference.h"
 #include "media/Proxy.h"
 #include "media/AudioSync.h"
@@ -5518,6 +5520,23 @@ private slots:
         QVERIFY(searchSpoken(p, "  ", {}, &err).empty() && !err.empty());
         Project silent = makeDefaultProject();
         QVERIFY(searchSpoken(silent, "money", {}, &err).empty() && QString::fromStdString(err).startsWith("Transcribe"));
+        // Shots put into words (Describe Shots) are found with what is said: the shot's own times.
+        MediaItem c;
+        c.id = p.newId();
+        c.name = "harbour.mov";
+        c.kind = MediaKind::Video;
+        c.hasVideo = true;
+        c.shots = {{0, 4, "A fishing boat comes into a harbour at dawn, gulls overhead."},
+                   {4, 9, "A woman in a red coat reads a newspaper on a park bench."}};
+        o.minScore = 0.12f;
+        Project described = p;
+        described.media.push_back(c);
+        const auto boats = searchSpoken(described, "boats at sea", o, &err);
+        QVERIFY2(!boats.empty() && boats[0].media == c.id && boats[0].start == 0 && boats[0].end == 4,
+                 boats.empty() ? err.c_str() : boats[0].text.c_str());
+        silent.media.push_back(c);
+        const auto reading = searchSpoken(silent, "someone reading the news outdoors", {}, &err);
+        QVERIFY2(!reading.empty() && reading[0].start == 4, err.c_str());
         // Over MCP.
         const QString project = QString::fromStdString(path("speech-search.montage"));
         QVERIFY(saveProject(p, project.toStdString()));
@@ -27060,6 +27079,71 @@ private slots:
         // (the hazy hills' crest drops in and out of the sky frame by frame, and the grain moves the edge about)
         QVERIFY2(steady < 0.75, qPrintable(QString::number(steady)));
         QVERIFY2(steady < 0.7 * jumpy, qPrintable(QString("%1 vs %2").arg(steady).arg(jumpy)));
+    }
+
+    void languageModelKeepsToItsGrammar() {
+        // The tiny story model llama.cpp's own tests use (llama2.c's stories260K, MIT): it has no chat template, so the
+        // question goes in as plain text, and what it writes is nonsense held to the grammar.
+        if (!languageModelAvailable()) QSKIP("Built without llama.cpp");
+        std::string err;
+        auto lm = LanguageModel::load(MONTAGE_TEST_DATA_DIR "/llm/stories260K.gguf", &err);
+        QVERIFY2(lm, err.c_str());
+        QVERIFY(lm->tokenCount("Once upon a time there was a cat.") > 4);
+        WriteRequest r;
+        r.system = "You write lists.";
+        r.prompt = "Once upon a time";
+        r.grammar = "root ::= line line line\nline ::= [1-9] \" | \" [a-z]{1,8} (\" \" [a-z]{1,8})? \"\\n\"";
+        r.maxTokens = 120;
+        double progress = 0;
+        const std::string a = lm->write(r, &err, [&](double f) { progress = f; });
+        QVERIFY2(!a.empty(), err.c_str());
+        qInfo("%s", a.c_str());
+        static const QRegularExpression form("^([1-9] \\| [a-z]{1,8}( [a-z]{1,8})?\n){3}$");
+        QVERIFY2(form.match(QString::fromStdString(a)).hasMatch(), a.c_str());
+        QCOMPARE(progress, 1.0);
+        // The same question, the same answer.
+        QCOMPARE(lm->write(r, &err), a);
+        // Too long a question is refused; a cancelled one stops.
+        r.maxTokens = lm->contextTokens();
+        QVERIFY(lm->write(r, &err).empty());
+        QVERIFY(QString::fromStdString(err).contains("too long"));
+        r.maxTokens = 50;
+        std::atomic<bool> cancel{true};
+        QVERIFY(lm->write(r, &err, {}, &cancel).empty());
+        QCOMPARE(err, std::string("Cancelled"));
+        // A grammar that does not parse.
+        r.grammar = "root ::= (";
+        QVERIFY(lm->write(r, &err).empty());
+    }
+
+    void describesPictures() {
+        if (!describeAvailable()) QSKIP("Built without ONNX Runtime");
+        if (!describeModel().installed()) QSKIP("Picture description model not installed (set MONTAGE_DESCRIBE_MODEL)");
+        std::string err;
+        auto model = PictureDescriber::load(&err);
+        QVERIFY2(model, err.c_str());
+        const std::string jfk = MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg", armstrong = MONTAGE_TEST_DATA_DIR "/faces/armstrong.jpg";
+        const std::string brief = describeFrame(jfk, 0, PictureDetail::Brief, &err);
+        qInfo("%s", brief.c_str());
+        QVERIFY2(QString::fromStdString(brief).contains("man") && QString::fromStdString(brief).contains("suit"), (brief + err).c_str());
+        const std::string detailed = describeFrame(jfk, 0, PictureDetail::Detailed, &err);
+        qInfo("%s", detailed.c_str());
+        QVERIFY2(QString::fromStdString(detailed).contains("tie"), (detailed + err).c_str());
+        QVERIFY(detailed.size() > brief.size());
+        const std::string astronaut = describeFrame(armstrong, 0, PictureDetail::Brief, &err);
+        qInfo("%s", astronaut.c_str());
+        QVERIFY2(QString::fromStdString(astronaut).contains("man"), (astronaut + err).c_str());
+        // The same picture at another size reads the same way.
+        VideoDecoder dec;
+        QVERIFY(dec.open(jfk, &err));
+        Frame16Ptr small = dec.frameAt(0, 300, 380, true);
+        QVERIFY(small);
+        const std::string again = model->describe(toImage(*small), PictureDetail::Brief, &err);
+        QVERIFY2(QString::fromStdString(again).contains("suit"), again.c_str());
+        // Cancelled, and nothing to describe.
+        std::atomic<bool> cancel{true};
+        QVERIFY(model->describe(toImage(*small), PictureDetail::Brief, &err, &cancel).empty());
+        QVERIFY(model->describe(Image(), PictureDetail::Brief, &err).empty());
     }
 };
 

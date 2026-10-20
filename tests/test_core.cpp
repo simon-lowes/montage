@@ -5686,6 +5686,7 @@ private slots:
         t.segments.push_back({1, 6, "hello world", {{1, 2, "hello", 1, {}}, {5, 6, "world", 1, {}}}, -1});
         m.transcript = std::make_shared<const Transcript>(t);
         m.timecode = 3600;
+        m.shots = {{0, 5, "A kettle on a stove."}, {5, 10, "Steam rises from a cup."}};
 
         // A range of the media, in its bin, with its keywords; nothing for an empty range or a still.
         auto sub = makeSubclip(p, fx.media, 4, 7);
@@ -5699,6 +5700,7 @@ private slots:
         QCOMPARE(sub->keywords, std::vector<std::string>{"interview"});
         QCOMPARE(sub->timecode, 3604.0);
         QVERIFY(!sub->transcript && sub->id == 0);
+        QVERIFY(sub->shots.empty());  // (its media's, as the transcript is)
         sub->id = p.newId();
         p.media.push_back(*sub);
         const Id subId = sub->id;
@@ -5726,6 +5728,10 @@ private slots:
         QCOMPARE(spokenText(&p, *p.findMedia(fx.media)), std::string("hello world"));
         QVERIFY(mediaMatchesSearch(s, "world", &p));
         QVERIFY(!mediaMatchesSearch(s, "hello", &p));
+        // and what its shots show: its media's shots in its range (4-7 s: both).
+        QVERIFY(mediaMatchesSearch(*p.findMedia(fx.media), "kettle", &p));
+        QVERIFY(mediaMatchesSearch(s, "steam", &p));
+        QVERIFY(!mediaMatchesSearch(*p.findMedia(fx.media), "teapot", &p));
         using Ids = std::vector<Id>;
         auto matches = [&](std::vector<SmartRule> rules) {
             std::vector<Id> ids = smartBinMedia(p, SmartBin{1, "t", true, std::move(rules)});
@@ -5754,6 +5760,7 @@ private slots:
         QCOMPARE(back.findMedia(subId)->subclipOf, fx.media);
         QCOMPARE(back.findMedia(subId)->subclipIn, 4.0);
         QCOMPARE(back.findMedia(subId)->subclipOut, 7.0);
+        QCOMPARE(back.findMedia(fx.media)->shots, p.findMedia(fx.media)->shots);
     }
 
     void mediaLogging() {

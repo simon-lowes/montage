@@ -283,18 +283,20 @@ std::vector<SpokenHit> searchSpoken(const Project& p, const std::string& query, 
         return std::vector<SpokenHit>{};
     };
     if (QString::fromStdString(query).trimmed().isEmpty()) return fail("Say what to look for");
-    // The passages of every transcribed media item asked about.
+    // The passages of every transcribed media item asked about, and its shots' descriptions.
     struct Item {
         Id media;
         SpokenPassage passage;
     };
     std::vector<Item> items;
     for (const MediaItem& m : p.media) {
-        if (!m.transcript || m.subclipOf) continue;
+        if (m.subclipOf) continue;
         if (!o.media.empty() && std::find(o.media.begin(), o.media.end(), m.id) == o.media.end()) continue;
-        for (SpokenPassage& sp : spokenPassages(*m.transcript)) items.push_back({m.id, std::move(sp)});
+        if (m.transcript)
+            for (SpokenPassage& sp : spokenPassages(*m.transcript)) items.push_back({m.id, std::move(sp)});
+        for (const ShotDescription& d : m.shots) items.push_back({m.id, SpokenPassage{d.start, d.end, d.text, 0, 0}});
     }
-    if (items.empty()) return fail("Transcribe the footage first: speech is searched by its transcript");
+    if (items.empty()) return fail("Transcribe the footage first: speech is searched by its transcript (and shots by their descriptions)");
     std::string err;
     auto model = SentenceModel::load(&err);
     if (!model) return fail(err);

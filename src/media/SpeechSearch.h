@@ -43,8 +43,9 @@ struct SpokenSearchOptions {
     std::vector<Id> media;  // only these (empty: every transcribed media item)
 };
 
-// The moments of the project's transcripts that say what `query` asks about, best first. Empty with `error` when
-// the model is missing or nothing is transcribed.
+// The moments of the project's transcripts that say what `query` asks about, and the shots whose descriptions
+// (Describe Shots) do, best first. Empty with `error` when the model is missing or nothing is transcribed or
+// described.
 std::vector<SpokenHit> searchSpoken(const Project& p, const std::string& query, const SpokenSearchOptions& o = {},
                                     std::string* error = nullptr, const std::function<void(double)>& progress = {},
                                     const std::atomic<bool>* cancel = nullptr);

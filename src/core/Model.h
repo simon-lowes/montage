@@ -112,6 +112,13 @@ struct Effect {
 
 enum class MediaKind { Video, Audio, Image, Sequence };
 
+// What a shot of the media shows, in words (render/FootageWords.h), for logging and search.
+struct ShotDescription {
+    double start = 0, end = 0;  // media seconds
+    std::string text;
+    bool operator==(const ShotDescription&) const = default;
+};
+
 struct MediaItem {
     Id id = 0;
     MediaKind kind = MediaKind::Video;
@@ -169,6 +176,7 @@ struct MediaItem {
     int label = 0;                                 // colour label (core/MediaLog.h labelName), 0 = none
     std::vector<std::string> keywords;
     std::map<std::string, std::string> metadata;  // scene, shot, take, camera, description, comment, ...
+    std::vector<ShotDescription> shots;            // each shot described (Describe Shots), in order
     std::string created;                           // when it was recorded (ISO 8601, from the file), "" = unknown
     // A subclip: a saved range of another media item. Clips made from it use
     // that item (with this range), so only bins, logging and search see it.

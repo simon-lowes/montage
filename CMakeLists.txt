@@ -20,6 +20,7 @@ option(MONTAGE_BUILD_APP "Build the Montage GUI application" ON)
 option(MONTAGE_BUILD_TESTS "Build the Montage test suite" ON)
 option(MONTAGE_WITH_VST3 "Host VST3 audio plugins (VST 3 SDK, MIT, vendored)" ON)
 option(MONTAGE_WITH_WHISPER "Speech-to-text with whisper.cpp (MIT, fetched at configure time)" ON)
+option(MONTAGE_WITH_LLAMA "Words from the footage with a small language model on this computer (llama.cpp, MIT, fetched at configure time)" ON)
 option(MONTAGE_WITH_RNNOISE "Voice isolation with RNNoise (BSD, fetched with its model at configure time)" ON)
 option(MONTAGE_WITH_THORVG "Lottie animations and SVG graphics with ThorVG (MIT, fetched at configure time)" ON)
 option(MONTAGE_WITH_LUA "Lua scripting (Lua 5.4, MIT, fetched at configure time)" ON)
@@ -76,6 +77,34 @@ if(MONTAGE_WITH_WHISPER)
     GIT_TAG v1.9.5
     GIT_SHALLOW TRUE)
   FetchContent_MakeAvailable(whisper)
+  set(BUILD_SHARED_LIBS ${MONTAGE_SAVED_BUILD_SHARED_LIBS})
+endif()
+
+if(MONTAGE_WITH_LLAMA)
+  # llama.cpp's library alone (no common, tools or server), static. It uses whisper.cpp's ggml when that is built
+  # (b11430 has the same ggml as whisper.cpp 1.9.5), its own otherwise.
+  include(FetchContent)
+  set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+  set(LLAMA_BUILD_APP OFF CACHE BOOL "" FORCE)
+  set(LLAMA_OPENSSL OFF CACHE BOOL "" FORCE)
+  set(LLAMA_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
+  set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+  set(MONTAGE_SAVED_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+  set(BUILD_SHARED_LIBS OFF)
+  FetchContent_Declare(llama
+    GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
+    GIT_TAG b11430
+    GIT_SHALLOW TRUE)
+  FetchContent_MakeAvailable(llama)
+  # b11430's models/clef.cpp calls std::find without <algorithm>, which newer libstdc++ (GCC 16, as on MSYS2) no
+  # longer brings in through <memory>.
+  if(NOT MSVC)
+    target_compile_options(llama PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-include algorithm>)
+  endif()
   set(BUILD_SHARED_LIBS ${MONTAGE_SAVED_BUILD_SHARED_LIBS})
 endif()
 

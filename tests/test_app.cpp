@@ -176,6 +176,9 @@
 #include "Voiceover.h"
 #include "AdrPanel.h"
 #include "AudioDescriptionDialog.h"
+#include "FootageNotesDialog.h"
+#include "media/DescribePicture.h"
+#include "media/LanguageModel.h"
 #include "core/AudioDescription.h"
 #include "core/Adr.h"
 #include "MaskOverlay.h"
@@ -9610,6 +9613,57 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(state()->project().media.empty());
         QVERIFY(!QFileInfo::exists(partial + "/M101 take 7.wav"));
         state()->newProject();
+    }
+
+    void wordsFromTheFootage() {
+        state()->newProject();
+        // The controls: drafting in Audio Description, Summary and Notes in the Sequence menu.
+        win_->findChild<QAction*>("audioDescription")->trigger();
+        auto* ad = win_->findChild<AudioDescriptionDialog*>("audioDescriptionDialog");
+        QVERIFY(ad && ad->findChild<QPushButton*>("adDraft") && ad->findChild<QCheckBox*>("adUseModel"));
+        QString err;
+        QCOMPARE(ad->draft(&err), -1);  // nothing in the sequence
+        ad->hide();
+        QVERIFY(win_->findChild<QAction*>("footageNotes"));
+        {
+            FootageNotesDialog dlg(state(), win_.get());
+            auto* kind = dlg.findChild<QComboBox*>("footageNotesKind");
+            QVERIFY(kind && dlg.findChild<QPushButton*>("footageNotesWrite") && dlg.findChild<QPlainTextEdit*>("footageNotesText"));
+            QCOMPARE(kind->count(), 3);
+            QCOMPARE(kind->itemText(1), QString("Show Notes"));
+        }
+        // Describe Shots on a still, when the model is here: the shot kept with the item and its Description filled,
+        // in one undo step.
+        if (describeAvailable() && describeModel().installed()) {
+            const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg")});
+            QCOMPARE(ids.size(), size_t(1));
+            auto* bin = win_->findChild<MediaBinWidget*>();
+            QVERIFY(bin);
+            QCOMPARE(bin->describeShots(ids), 1);
+            const MediaItem* m = state()->project().findMedia(ids[0]);
+            QCOMPARE(m->shots.size(), size_t(1));
+            qInfo("%s", m->shots[0].text.c_str());
+            QVERIFY(QString::fromStdString(m->metadata.at("description")).contains("tie"));
+            state()->undo();
+            QVERIFY(state()->project().findMedia(ids[0])->shots.empty());
+        }
+        // Show notes, when the language model is here.
+        if (languageModelAvailable() && languageModel().installed()) {
+            const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+            const Id media = ids[0];
+            double end = 0;
+            auto t = threeTalks(end);
+            QVERIFY(state()->edit("Transcript", [media, t, end](Project& p, Sequence& s) {
+                MediaItem* m = p.findMedia(media);
+                m->transcript = t;
+                m->duration = end + 1;
+                return edit::placeMedia(p, s, media, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+            }));
+            FootageNotesDialog dlg(state(), win_.get());
+            QVERIFY2(dlg.write(FootageWriting::ShowNotes, &err), qPrintable(err));
+            qInfo("%s", qPrintable(dlg.text()));
+            QVERIFY(dlg.text().contains("\n\nTopics:\n- "));
+        }
     }
 
     void audioDescriptionDialog() {

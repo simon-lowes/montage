@@ -358,6 +358,7 @@ std::optional<MediaItem> makeSubclip(const Project& p, Id media, double in, doub
     m.transcript.reset();
     m.visual.reset();
     m.sounds.reset();
+    m.shots.clear();  // (the media holds them, as it does its indexes)
     m.subclipOf = base->id;
     m.subclipIn = in;
     m.subclipOut = out;
@@ -524,6 +525,11 @@ bool mediaMatchesSearch(const MediaItem& m, const std::string& query, const Proj
     for (const std::string& k : m.keywords) text += "\n" + qs(k);
     for (const auto& [key, v] : m.metadata) text += "\n" + qs(v);
     for (const std::string& name : peopleSeen(p, m)) text += "\n" + qs(name);
+    // What its shots show (a subclip: its media's shots in its range).
+    const MediaItem* shotsOf = m.subclipOf && p ? p->findMedia(m.subclipOf) : &m;
+    if (shotsOf)
+        for (const ShotDescription& d : shotsOf->shots)
+            if (!m.subclipOf || (d.end > m.subclipIn && d.start < m.subclipOut)) text += "\n" + qs(d.text);
     const QString spoken = qs(spokenText(p, m));
     for (const QString& t : terms)
         if (!text.contains(t, Qt::CaseInsensitive) && !spoken.contains(t, Qt::CaseInsensitive)) return false;

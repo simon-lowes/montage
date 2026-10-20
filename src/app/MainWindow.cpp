@@ -152,6 +152,9 @@
 #include "AdrPanel.h"
 #include "LinedScriptPanel.h"
 #include "AudioDescriptionDialog.h"
+#include "FootageNotesDialog.h"
+#include "render/FootageWords.h"
+#include "media/LanguageModel.h"
 #include "CaptionsPanel.h"
 #include "MaskOverlay.h"
 #include "PaintOverlay.h"
@@ -170,6 +173,7 @@
 #include "SpectralRepairDialog.h"
 #include "ShotSearchPanel.h"
 #include "ModelPacks.h"
+#include "WorkProgress.h"
 #include "media/VisualSearch.h"
 #include "PeoplePanel.h"
 #include "SpeechDialog.h"
@@ -1870,6 +1874,13 @@ void MainWindow::buildMenus() {
     add(seqM, tr("Add C&lip Marker"), QKeySequence("Shift+Alt+M"), [this] { addClipMarker(); })->setObjectName(QStringLiteral("addClipMarker"));
     add(seqM, tr("Copy Chapters for YouTube"), QKeySequence(), [this] { copyYoutubeChapters(); })->setObjectName(QStringLiteral("copyChapters"));
     add(seqM, tr("Suggest Chapters…"), QKeySequence(), [this] { suggestChapterMarkers(); })->setObjectName(QStringLiteral("suggestChapters"));
+    QAction* notes = add(seqM, tr("Summary and Notes…"), QKeySequence(), [this] {
+        if (!state_->sequence()) return;
+        FootageNotesDialog dlg(state_, this);
+        dlg.exec();
+    });
+    notes->setObjectName(QStringLiteral("footageNotes"));
+    notes->setEnabled(languageModelAvailable());  // (written by the language model, which this build may not have)
     add(seqM, tr("Compare with Sequence…"), QKeySequence(), [this] {
         // Another version of the cut, compared with this one (the older one picked from the project's sequences).
         const Sequence* now = state_->sequence();
@@ -4210,7 +4221,8 @@ int MainWindow::suggestChapterMarkers(double minSeconds, bool ask) {
         return montage::suggestChapters(state_->project(), *s, o, &err);
     };
     std::vector<SuggestedChapter> chapters = find(minSeconds);
-    if (chapters.empty()) {
+    // (With the dialog, the language model can still be asked when the wording alone finds no chapters.)
+    if (chapters.empty() && (!ask || !languageModelAvailable())) {
         state_->message(QString::fromStdString(err), 6000);
         return 0;
     }
@@ -4228,6 +4240,17 @@ int MainWindow::suggestChapterMarkers(double minSeconds, bool ask) {
         shortest->setValue(int(minSeconds));
         form->addRow(tr("Shortest chapter:"), shortest);
         lay->addLayout(form);
+        // The language model reads the whole talk: chapters where it moves on, titled as a person would.
+        auto* askModel = new QPushButton(tr("Ask the Language Model"), &dlg);
+        askModel->setObjectName(QStringLiteral("chapterAskModel"));
+        askModel->setToolTip(tr("Find the chapters and title them with a language model on this computer (Granite 4.0 Micro)"));
+        askModel->setEnabled(languageModelAvailable());
+        auto* note = new QLabel(chapters.empty() ? QString::fromStdString(err) : QString(), &dlg);
+        note->setWordWrap(true);
+        auto* askRow = new QHBoxLayout;
+        askRow->addWidget(askModel);
+        askRow->addWidget(note, 1);
+        lay->addLayout(askRow);
         auto* table = new QTableWidget(0, 2, &dlg);
         table->setObjectName(QStringLiteral("chapterTable"));
         table->setHorizontalHeaderLabels({tr("Starts"), tr("Title (double-click to rename)")});
@@ -4238,7 +4261,10 @@ int MainWindow::suggestChapterMarkers(double minSeconds, bool ask) {
         auto* keep = new QCheckBox(tr("Keep the chapter markers already there"), &dlg);
         keep->setObjectName(QStringLiteral("keepChapters"));
         lay->addWidget(keep);
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+        buttons->button(QDialogButtonBox::Ok)->setText(tr("Add Chapters"));
         auto fill = [&] {
+            buttons->button(QDialogButtonBox::Ok)->setEnabled(!chapters.empty());
             table->setRowCount(int(chapters.size()));
             for (int r = 0; r < int(chapters.size()); ++r) {
                 auto* when = new QTableWidgetItem(QString::fromStdString(formatTimecode(chapters[size_t(r)].start, s->fps)));
@@ -4253,10 +4279,33 @@ int MainWindow::suggestChapterMarkers(double minSeconds, bool ask) {
             if (auto again = find(v); !again.empty()) {
                 chapters = std::move(again);
                 fill();
+                note->clear();  // (the chapters are the wording's again, not the language model's)
             }
         });
-        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
-        buttons->button(QDialogButtonBox::Ok)->setText(tr("Add Chapters"));
+        connect(askModel, &QPushButton::clicked, &dlg, [&] {
+            if (!ensureModelPack(&dlg, languageModel(), tr("Suggest Chapters"),
+                                 tr("The chapters are found by Granite 4.0 Micro (IBM, Apache-2.0 licence), which runs on this computer.")))
+                return;
+            ChapterOptions o;
+            o.minSeconds = shortest->value();
+            const Project project = state_->project();
+            const Sequence seq = *s;
+            using Out = std::pair<std::vector<SuggestedChapter>, std::string>;
+            const Out r = withProgress<Out>(&dlg, tr("Reading the talk…"), [&](const auto& progress) {
+                Out out;
+                std::atomic<bool> stop{false};
+                if (auto lm = LanguageModel::load({}, &out.second))
+                    out.first = writeChapters(project, seq, o, *lm, &out.second, [&](double f) { stop = !progress(f, QString()); }, &stop);
+                return out;
+            });
+            if (r.first.empty()) {
+                note->setText(r.second == "Cancelled" ? QString() : QString::fromStdString(r.second));
+                return;
+            }
+            chapters = r.first;
+            fill();
+            note->setText(tr("Chapters from the language model: check the titles"));
+        });
         connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
         connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
         lay->addWidget(buttons);
