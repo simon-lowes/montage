@@ -715,6 +715,25 @@ void MainWindow::buildPanels() {
         auto* cut = new QShortcut(QKeySequence(Qt::SHIFT | (Qt::Key_1 + i)), this);
         connect(cut, &QShortcut::activated, this, [this, i] { multicam_->switchTo(i, true); });
     }
+    // In the Colour workspace the numeric keypad sets printer lights, as on a timer's console: 7, 8, 9 add a point of
+    // red, green or blue, 4, 5, 6 take one away, + and - move all three. Elsewhere its keys do what they did: digits cut
+    // to an angle, - zooms out.
+    {
+        const std::pair<int, std::pair<int, int>> keys[] = {{Qt::Key_7, {0, 1}},  {Qt::Key_8, {1, 1}},  {Qt::Key_9, {2, 1}},
+                                                            {Qt::Key_4, {0, -1}}, {Qt::Key_5, {1, -1}}, {Qt::Key_6, {2, -1}},
+                                                            {Qt::Key_Plus, {-1, 1}}, {Qt::Key_Minus, {-1, -1}}};
+        for (const auto& entry : keys) {
+            const int key = entry.first;
+            const std::pair<int, int> move = entry.second;
+            auto* sc = new QShortcut(QKeySequence(Qt::KeypadModifier | key), this);
+            sc->setObjectName(QStringLiteral("printerLight%1").arg(QChar(char(key))));
+            connect(sc, &QShortcut::activated, this, [this, key, move] {
+                if (workspace_ == QLatin1String("Colour")) printerLight(move.first, move.second);
+                else if (key == Qt::Key_Minus) timeline_->zoomOut();
+                else if (key != Qt::Key_Plus) multicam_->switchTo(key - Qt::Key_1, false);
+            });
+        }
+    }
     connect(timeline_, &TimelineWidget::captionActivated, this, [this](Id track, int index) {
         captionsDock_->show();
         captionsDock_->raise();
@@ -4434,6 +4453,18 @@ void MainWindow::autoColor() {
         return true;
     });
     inspectorDock_->raise();
+}
+
+void MainWindow::printerLight(int channel, int points) {
+    static const char* names[3] = {"printer_r", "printer_g", "printer_b"};
+    const QString label = tr("Printer Lights");
+    for (int i = 0; i < 3; ++i)
+        if ((channel < 0 || channel == i) && !tangent_->set(names[i], tangent_->value(names[i]) + points, label)) return;
+    auto shown = [&](int i) {
+        const int v = int(std::lround(tangent_->value(names[i])));
+        return QStringLiteral("%1%2").arg(v > 0 ? "+" : "").arg(v);
+    };
+    state_->message(tr("Printer lights: R %1  G %2  B %3").arg(shown(0), shown(1), shown(2)), 3000);
 }
 
 void MainWindow::scriptCutDialog() {

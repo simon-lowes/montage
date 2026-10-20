@@ -27,6 +27,12 @@ struct DirtSettings {
 // `count` receives the number of specks.
 std::vector<float> detectDirt(const Image& current, const Image& prev, const Image& next, const MotionFn& toPrev,
                               const MotionFn& toNext, const DirtSettings& s, int* count = nullptr);
+// Dirt that lasts two frames (on `current` and one neighbour): specks standing out from the frames two away (`prev2`,
+// `next2`, followed along `toPrev2`, `toNext2`), as detectDirt finds them, that one neighbour (`prev` or `next`) has too
+// and the other has not.
+std::vector<float> detectLastingDirt(const Image& current, const Image& prev, const Image& next, const Image& prev2, const Image& next2,
+                                     const MotionFn& toPrev, const MotionFn& toNext, const MotionFn& toPrev2, const MotionFn& toNext2,
+                                     const DirtSettings& s, int* count = nullptr);
 // The matte's pixels from the neighbours: their mean along the motion (or the one that reaches there). The motion
 // at each pixel is taken from four points `reach` pixels around it (their mean), outside the defect, whose own pull
 // on the measured motion would otherwise move the fill.
@@ -66,9 +72,12 @@ struct ScratchSettings {
     double sensitivity = 50;  // 0..100
     double maxWidth = 4;      // pixels
     int polarity = 0;         // 0 either, 1 dark, 2 light
+    bool follow = false;      // slanting and wandering scratches too
 };
 // Thin vertical lines lighter or darker than both sides, the same way down most of a band of rows (each eighth of the
-// frame on its own, so a scratch may come and go). A matte; `count` receives the number of scratch pieces.
+// frame on its own, so a scratch may come and go); with `follow`, also lines that slant or wander, followed row by row (a
+// pixel either way a row at most) over a quarter of the frame or more. A matte; `count` receives the number of scratch
+// pieces.
 std::vector<float> detectScratches(const Image& img, const ScratchSettings& s, int* count = nullptr);
 // Each row's runs of the matte filled across, from the pixels either side.
 void fillAcross(Image& img, const std::vector<float>& matte);

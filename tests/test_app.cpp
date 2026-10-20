@@ -181,6 +181,7 @@
 #include "MaskOverlay.h"
 #include "PaintOverlay.h"
 #include "render/Restoration.h"
+#include "render/FilmScan.h"
 #include "TransformOverlay.h"
 #include "render/ClipPlacement.h"
 #include "media/ImageSequence.h"
@@ -12664,6 +12665,111 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
         win_->activateWindow();
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+    }
+
+    // Film scans from the Inspector and the keypad: Steady on Perforations' reference and Film Negative's base taken
+    // from the frame under the playhead, and printer lights set a point at a time (a run of them one undo step).
+    void filmScanControls() {
+        // A scan: the orange film base down the left with six clear perforations in it, a darker picture beside it.
+        QImage scan(320, 240, QImage::Format_RGB32);
+        scan.fill(QColor(120, 70, 50));
+        {
+            QPainter pa(&scan);
+            pa.fillRect(0, 0, 36, 240, QColor(230, 140, 90));
+            pa.setRenderHint(QPainter::Antialiasing);
+            pa.setPen(Qt::NoPen);
+            pa.setBrush(Qt::white);
+            for (int k = 0; k < 6; ++k) pa.drawRoundedRect(QRectF(8, 14 + 40 * k, 16, 12), 2, 2);
+            for (int i = 0; i < 40; ++i) pa.fillRect(60 + (i * 37) % 240, (i * 53) % 220, 12, 12, QColor(60 + i, 40, 30));
+        }
+        const QString png = dir_.path() + "/scan.png";
+        QVERIFY(scan.save(png));
+        state()->newProject();
+        auto ids = state()->importFiles({png});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->apply("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+        }));
+        const Id clip = state()->sequence()->videoTracks[0].clips.at(0).id;
+        QVERIFY(state()->edit("Film", [clip](Project& p, Sequence& s) {
+            edit::clipById(s, clip)->effects.push_back(makeEffect(p, "perf_lock"));
+            edit::clipById(s, clip)->effects.push_back(makeEffect(p, "film_negative"));
+            return true;
+        }));
+        state()->setPlayhead(2);
+        state()->setSelection({clip}, false);
+        win_->findChild<QDockWidget*>("inspector")->show();
+        win_->findChild<QDockWidget*>("inspector")->raise();
+        QApplication::processEvents();
+        auto effectOf = [&](const char* type) -> const Effect* {
+            for (const Effect& e : edit::clipById(*state()->sequence(), clip)->effects)
+                if (e.type == type) return &e;
+            return nullptr;
+        };
+        auto visible = [&](const char* name) -> QPushButton* {
+            for (auto* b : win_->findChildren<QPushButton*>(name))
+                if (b->isVisibleTo(win_.get())) return b;
+            return nullptr;
+        };
+        auto said = [&](const QString& text) {
+            for (auto* l : win_->findChildren<QLabel*>("filmScanStatus"))
+                if (l->isVisibleTo(win_.get()) && l->text().startsWith(text)) return true;
+            return false;
+        };
+        QVERIFY(said("No reference yet"));
+        QVERIFY(said("Film base found in each frame"));
+
+        // The reference: the six perforations, one undo step.
+        QPushButton* perfs = visible("perfReference");
+        QVERIFY(perfs);
+        perfs->click();
+        QTRY_VERIFY(!effectOf("perf_lock")->s("reference").empty());
+        QCOMPARE(perforationsFromString(effectOf("perf_lock")->s("reference"), 320, 240).size(), size_t(6));
+        QCOMPARE(state()->undoText(), QString("Set Perforation Reference"));
+        QTRY_VERIFY(said("Holding the 6"));
+
+        // The base: the rebate's orange, set for every frame.
+        QPushButton* base = visible("filmBaseFromFrame");
+        QVERIFY(base);
+        base->click();
+        QTRY_VERIFY(effectOf("film_negative")->p("base_from", 0) > 0.5);
+        const Effect* neg = effectOf("film_negative");
+        QVERIFY2(std::fabs(neg->p("base_r", 0) - 230 / 255.0) < 0.02 && std::fabs(neg->p("base_g", 0) - 140 / 255.0) < 0.02 &&
+                     std::fabs(neg->p("base_b", 0) - 90 / 255.0) < 0.02,
+                 qPrintable(QString("%1 %2 %3").arg(neg->p("base_r", 0)).arg(neg->p("base_g", 0)).arg(neg->p("base_b", 0))));
+        QCOMPARE(state()->undoText(), QString("Take Film Base"));
+        QTRY_VERIFY(said("Film base set below"));
+
+        // Printer lights, in the Colour workspace: keypad 7 twice, + once and 5 once make R +3, G 0, B +1 on a Color
+        // Correct made for them, and the status bar shows the three. (Elsewhere the keypad does what it did.)
+        win_->activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+        win_->timeline()->setFocus();
+        QSignalSpy messages(state(), &EditorState::statusMessage);
+        QCOMPARE(win_->currentWorkspace(), QString("Editing"));
+        QTest::keyClick(win_.get(), Qt::Key_7, Qt::KeypadModifier);
+        QVERIFY(!effectOf("color_correct"));
+        QVERIFY(win_->applyWorkspace("Colour"));
+        win_->activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+        win_->timeline()->setFocus();
+        QTest::keyClick(win_.get(), Qt::Key_7, Qt::KeypadModifier);
+        QTest::keyClick(win_.get(), Qt::Key_7, Qt::KeypadModifier);
+        QTest::keyClick(win_.get(), Qt::Key_Plus, Qt::KeypadModifier);
+        QTest::keyClick(win_.get(), Qt::Key_5, Qt::KeypadModifier);
+        const Effect* cc = effectOf("color_correct");
+        QVERIFY(cc);
+        QCOMPARE(cc->p("printer_r", 0), 3.0);
+        QCOMPARE(cc->p("printer_g", 0), 0.0);
+        QCOMPARE(cc->p("printer_b", 0), 1.0);
+        QVERIFY(!messages.isEmpty());
+        QCOMPARE(messages.last().at(0).toString(), QString("Printer lights: R +3  G 0  B +1"));
+        QCOMPARE(state()->undoText(), QString("Printer Lights"));
+        state()->undo();
+        QVERIFY(!effectOf("color_correct"));
+        QCOMPARE(state()->undoText(), QString("Take Film Base"));
+        QVERIFY(win_->applyWorkspace("Editing"));
+        state()->newProject();
     }
 
     void ocioEffectInInspector() {

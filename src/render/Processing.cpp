@@ -27,6 +27,7 @@
 #include "GpuCompositor.h"
 #include "QualityCheck.h"
 #include "Restoration.h"
+#include "FilmScan.h"
 #include "LensBlur.h"
 #include "media/MotionData.h"
 #include "media/Tracking.h"
@@ -98,6 +99,8 @@ float toneShift(float l, float highlights, float shadows, float whites, float bl
 struct ColorCorrectSetup {
     float exposure, contrast, pivot, sat, offset, vibrance;
     float lift[3], gam[3], gain[3], wb[3];
+    float printer[3] = {1, 1, 1};  // printer lights as multipliers of each channel's light
+    bool printing = false;
     bool tone;
     static constexpr int kTone = 1024;
     std::array<float, kTone + 1> toneLut{};  // luma after the tone controls, as a table over 0..2, kept rising
@@ -118,6 +121,9 @@ ColorCorrectSetup colorCorrectSetup(const Effect& e, FrameTime t) {
         s.lift[i] = liftM + float(e.p(std::string("lift") + channel[i], t));
         s.gam[i] = std::pow(2.0f, gammaM + float(e.p(std::string("gamma") + channel[i], t)));
         s.gain[i] = gainM * float(e.p(std::string("gain") + channel[i], t, 1));
+        const double points = e.p(std::string("printer") + channel[i], t);
+        s.printer[i] = float(std::pow(10.0, points * e.p("printer_point", t, 0.025)));
+        s.printing = s.printing || points != 0;
     }
     // White balance as channel multipliers (normalised to keep luma roughly constant).
     s.wb[0] = 1 + 0.3f * temp + 0.1f * tint, s.wb[1] = 1 - 0.25f * tint, s.wb[2] = 1 - 0.3f * temp + 0.1f * tint;
@@ -154,8 +160,13 @@ void colorCorrect(const Effect& e, FrameTime t, Image& img) {
         const int i = std::min(kTone - 1, int(x));
         return toneLut[size_t(i)] + (toneLut[size_t(i + 1)] - toneLut[size_t(i)]) * (x - float(i));
     };
+    const Transfer transfer = currentWorkingSpace().transfer;
     perPixel(img, [&](float& r, float& g, float& b, float&) {
         float c[3] = {r, g, b};
+        // (Printer lights first, on the light itself: each a step of log exposure.)
+        if (cs.printing)
+            for (int i = 0; i < 3; ++i)
+                if (cs.printer[i] != 1 && c[i] > 0) c[i] = float(fromLinear(transfer, toLinear(transfer, c[i]) * cs.printer[i]));
         for (int i = 0; i < 3; ++i) {
             float v = c[i] * exposure * wb[i];
             v = v * gain[i] + offset;
@@ -2093,16 +2104,26 @@ std::vector<PaintStrokeAt> paintStrokesAt(const Effect& e, FrameTime t, int W, i
 }
 
 void applyDirtRemoval(const Effect& e, FrameTime lt, Image& src, const Image* prev, const Image* next, const MotionFn& toPrev,
-                      const MotionFn& toNext, double pixelScale, double sourceSeconds) {
+                      const MotionFn& toNext, double pixelScale, double sourceSeconds, const Image* prev2, const Image* next2,
+                      const MotionFn& toPrev2, const MotionFn& toNext2) {
     if (!e.enabled || !prev || !next) return;
     throughMask(e, lt, src, pixelScale, sourceSeconds, [&](Image& img) {
         DirtSettings s;
         s.sensitivity = e.p("sensitivity", lt, 50);
         s.maxSize = std::max(1.0, e.p("size", lt, 12) * pixelScale);
-        const std::vector<float> m = detectDirt(img, *prev, *next, toPrev, toNext, s);
+        std::vector<float> m = detectDirt(img, *prev, *next, toPrev, toNext, s);
         if (m.empty()) return;
-        if (e.p("show", lt) > 0.5) showFound(img, m);
-        else fillFromNeighbours(img, m, *prev, *next, toPrev, toNext, s.maxSize / 2 + 4);
+        // Then what lasts two frames, against the frames two away (once the rest is out).
+        const bool show = e.p("show", lt) > 0.5;
+        if (!show) fillFromNeighbours(img, m, *prev, *next, toPrev, toNext, s.maxSize / 2 + 4);
+        std::vector<float> lasting;
+        if (prev2 && next2) lasting = detectLastingDirt(img, *prev, *next, *prev2, *next2, toPrev, toNext, toPrev2, toNext2, s);
+        if (show) {
+            for (size_t i = 0; i < lasting.size(); ++i) m[i] = std::max(m[i], lasting[i]);
+            showFound(img, m);
+        } else if (!lasting.empty()) {
+            fillFromNeighbours(img, lasting, *prev2, *next2, toPrev2, toNext2, s.maxSize / 2 + 4);
+        }
     });
 }
 
@@ -2125,6 +2146,32 @@ void applyDustSpots(const Effect& e, FrameTime lt, Image& src, const Image* prev
     });
 }
 
+void applyFilmNegative(const Effect& e, FrameTime t, Image& img, Transfer transfer) {
+    NegativeSettings s;
+    s.encoding = ScanEncoding(std::clamp(int(std::lround(e.p("scan", t))), 0, 2));
+    if (e.p("base_from", t) > 0.5 || !filmBase(img, s.encoding, transfer, s.base)) {
+        s.base[0] = e.p("base_r", t, 0.9), s.base[1] = e.p("base_g", t, 0.55), s.base[2] = e.p("base_b", t, 0.35);
+    }
+    s.gamma = e.p("gamma", t, 0.6);
+    s.exposure = e.p("exposure", t);
+    invertNegative(img, s, transfer);
+}
+
+void applyPerfLock(const Effect& e, FrameTime t, Image& img) {
+    PerfSettings s;
+    s.side = e.p("side", t) > 0.5 ? 1 : 0;
+    s.rebate = e.p("rebate", t, 12) / 100;
+    const bool show = e.p("show", t) > 0.5;
+    std::vector<float> holes;
+    const std::vector<Point2> now = findPerforations(img, s, show ? &holes : nullptr);
+    if (show) {
+        showFound(img, holes);
+        return;
+    }
+    double dx = 0, dy = 0;
+    if (perforationOffset(now, perforationsFromString(e.s("reference"), img.width, img.height), dx, dy)) img = shiftedImage(img, dx, dy);
+}
+
 namespace {
 
 void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelScale) {
@@ -2134,6 +2181,7 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
         s.sensitivity = e.p("sensitivity", t, 50);
         s.maxWidth = std::max(1.0, e.p("width", t, 4) * pixelScale);
         s.polarity = int(std::lround(e.p("polarity", t, 0)));
+        s.follow = e.p("follow", t, 0) > 0.5;  // (on in new effects; projects from before it keep their look)
         const std::vector<float> m = detectScratches(img, s);
         if (e.p("show", t) > 0.5) showFound(img, m);
         else fillAcross(img, m);
@@ -3185,6 +3233,7 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
     if (hasMask(e, t) && !gpuMask(e, t, op, 0, 0, pixelScale)) return false;
     if (e.type == "color_correct") {
         const ColorCorrectSetup s = colorCorrectSetup(e, t);
+        if (s.printing) return false;  // (printer lights on the light, which the shader does not decode)
         op.kind = gpu::ColorOp::ColorCorrect;
         // In gpucolor.frag's order: p[1] exposure, contrast, pivot, saturation; p[2] offset, vibrance, tone; p[3..6]
         // lift, gamma, gain, white balance.

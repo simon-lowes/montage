@@ -68,6 +68,7 @@
 #include "render/Compositor.h"
 #include "render/OGraf.h"
 #include "render/Restoration.h"
+#include "render/FilmScan.h"
 #include "render/Ocio.h"
 
 namespace montage {
@@ -169,6 +170,9 @@ QString InspectorWidget::signature() const {
     for (const auto& e : c->effects) {
         const long shape = std::lround(e.p("mask.shape", 0));
         sig += QString(":%1%2%3n%4").arg(e.id).arg(e.enabled ? "+" : "-").arg(shape == 3 ? "o" : shape == 5 ? "p" : shape == 7 ? "c" : "").arg(e.node);
+        // A film scan's status line: rebuild when its reference or base is taken.
+        if (e.type == "perf_lock") sig += QString("r%1").arg(perforationsFromString(e.s("reference"), 1, 1).size());
+        if (e.type == "film_negative") sig += QString("b%1").arg(std::lround(e.p("base_from", 0)));
     }
     // Its colour nodes: rebuild when one is added, picked, renamed or shared, or a shared one's effects change.
     if (!c->grade.empty()) {
@@ -858,6 +862,33 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
         else if (e.type == "color_slice") addColorSlice(f, *info, target(eid));
         else addParamRows(f, *info, target(eid));
         const bool onClip = state_->sequence() && edit::clipById(*state_->sequence(), owner);
+        if ((e.type == "perf_lock" || e.type == "film_negative") && onClip) {
+            // What the effect holds to (the perforations' places, the film base), taken from a frame on demand.
+            auto* row = new QWidget(content_);
+            auto* rh = new QHBoxLayout(row);
+            rh->setContentsMargins(0, 0, 0, 0);
+            auto* status = new QLabel(row);
+            status->setObjectName(QStringLiteral("filmScanStatus"));
+            status->setWordWrap(true);
+            QPushButton* take = nullptr;
+            if (e.type == "perf_lock") {
+                const int held = int(perforationsFromString(e.s("reference"), 1, 1).size());
+                status->setText(held ? tr("Holding the %n perforation(s) of the reference frame", "", held)
+                                     : tr("No reference yet: the frame is left as it is"));
+                take = new QPushButton(tr("Set Reference From This Frame"), row);
+                take->setObjectName(QStringLiteral("perfReference"));
+                take->setToolTip(tr("Hold every frame's perforations where they are on the frame under the playhead"));
+            } else {
+                status->setText(e.p("base_from", 0) > 0.5 ? tr("Film base set below") : tr("Film base found in each frame's rebate"));
+                take = new QPushButton(tr("Take the Base From This Frame"), row);
+                take->setObjectName(QStringLiteral("filmBaseFromFrame"));
+                take->setToolTip(tr("Set the film base from the rebate of the frame under the playhead, for every frame"));
+            }
+            rh->addWidget(status, 1);
+            rh->addWidget(take);
+            f->addRow(QString(), row);
+            connect(take, &QPushButton::clicked, this, [this, owner, eid] { QTimer::singleShot(0, this, [this, owner, eid] { takeFromFrame(owner, eid); }); });
+        }
         if ((e.type == "stabilize" || e.type == "rolling_shutter" || e.type == "sky_replace") && onClip) {
             // The analysis lives in the effect; it is redone on demand.
             auto* row = new QWidget(content_);
@@ -2896,6 +2927,30 @@ bool InspectorWidget::runAnalysis(
     const Out r = watcher.result();
     if (!r.first && !*cancel && !r.second.empty()) state_->message(QString::fromStdString(r.second), 6000);
     return r.first && !*cancel;
+}
+
+void InspectorWidget::takeFromFrame(Id clip, Id effect) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
+    const Effect* e = nullptr;
+    if (c)
+        for (const Effect& x : c->effects)
+            if (x.id == effect) e = &x;
+    if (!e) return;
+    Effect taken = *e;
+    std::string err;
+    const bool perfs = e->type == "perf_lock";
+    if (!(perfs ? takePerforationReference : takeFilmBase)(state_->project(), *s, *c, taken, state_->playhead(), &err)) {
+        state_->message(QString::fromStdString(err), 6000);
+        return;
+    }
+    state_->edit(perfs ? tr("Set Perforation Reference") : tr("Take Film Base"), [clip, effect, taken](Project&, Sequence& sq) {
+        Effect* x = edit::ownedEffect(sq, clip, effect);
+        if (!x) return false;
+        x->strings = taken.strings;
+        x->params = taken.params;
+        return true;
+    });
 }
 
 void InspectorWidget::analyzeStabilize(Id clip, Id effect) {

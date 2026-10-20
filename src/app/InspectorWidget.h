@@ -91,6 +91,8 @@ public:
     QString publishField(Id clip, Id effect, const std::string& param, const QString& label);
     // Analyses clip `clip`'s footage for its Stabilize effect `effect`.
     void analyzeStabilize(Id clip, Id effect);
+    // Steady on Perforations' reference, or Film Negative's base, taken from the clip's frame under the playhead.
+    void takeFromFrame(Id clip, Id effect);
     // Solves the camera of clip `clip`'s footage into its 3D Camera Tracker `effect`.
     void solveCameraTrack(Id clip, Id effect);
     // A title saying `text` placed in the scene of `clip`'s solve, where its 3D Camera Tracker `effect`'s settings say

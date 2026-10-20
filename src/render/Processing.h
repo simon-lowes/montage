@@ -9,6 +9,7 @@
 
 #include "core/Model.h"
 #include "media/Image.h"
+#include "render/ColorSpace.h"
 #include "render/VideoDenoise.h"
 
 namespace montage {
@@ -20,10 +21,17 @@ namespace montage {
 // the footage, such as Stabilize); -1 when there is none.
 void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds = -1);
 
+// Film Negative (render/FilmScan.h): the base found in the frame's rebate (or as set), the negative inverted in the
+// picture's own curve `transfer`. Steady on Perforations: the frame moved so its perforations sit where they were on the
+// reference frame. Both run where the clip's source frame is read, the lock first.
+void applyFilmNegative(const Effect& e, FrameTime t, Image& img, Transfer transfer);
+void applyPerfLock(const Effect& e, FrameTime t, Image& img);
 // Dirt Removal and Dust Spot Removal (render/Restoration.h), which need the source frames either side, followed along the
-// motion (either may be missing): run where the clip's source frame is read, through the effect's mask if it has one.
+// motion (either may be missing): run where the clip's source frame is read, through the effect's mask if it has one. Dirt
+// Removal also takes the frames two away when it has them, for dirt that lasts two frames.
 void applyDirtRemoval(const Effect& e, FrameTime lt, Image& src, const Image* prev, const Image* next, const MotionFn& toPrev,
-                      const MotionFn& toNext, double pixelScale, double sourceSeconds = -1);
+                      const MotionFn& toNext, double pixelScale, double sourceSeconds = -1, const Image* prev2 = nullptr,
+                      const Image* next2 = nullptr, const MotionFn& toPrev2 = {}, const MotionFn& toNext2 = {});
 void applyDustSpots(const Effect& e, FrameTime lt, Image& src, const Image* prev, const Image* next, const MotionFn& toPrev,
                      const MotionFn& toNext, double pixelScale, double sourceSeconds = -1);
 // A Paint effect's strokes at clip frame t, in the frame's pixels (each tracked one moved with the mask box).
