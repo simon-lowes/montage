@@ -1,5 +1,5 @@
-// Montage — HDR stills: PNG with its HDR chunks (PNG Third Edition's cICP, mDCV and cLLI) and AVIF at 10 bits in PQ or
-// HLG with its light levels, written from a rendered frame; and both read back.
+// Montage — HDR stills: PNG with its HDR chunks (PNG Third Edition's cICP, mDCV and cLLI), and AVIF and HEIF at 10 bits
+// in PQ or HLG with their light levels, written from a rendered frame; and read back.
 #pragma once
 
 #include <string>
@@ -33,11 +33,19 @@ bool writeHdrPng(const Image& img, const ColorSpace& space, double peakNits, dou
 // levels (mdcv and clli properties; `stated` says whether they could be added), else 8. `quality` 0-100.
 bool writeAvifStill(const Image& img, const ColorSpace& space, int quality, double peakNits, double maxCll, double maxFall,
                     const std::string& path, std::string* error = nullptr, bool* stated = nullptr);
+// A HEIF still (HEVC, 4:2:0, full range, over black): 10 bits in an HDR space with its mastering display and light
+// levels (mdcv and clli), else 8. Pictures larger than HEVC's levels take (or than `tile`, when given) go in a grid of
+// tiles.
+bool writeHeifStill(const Image& img, const ColorSpace& space, int quality, double peakNits, double maxCll, double maxFall,
+                    const std::string& path, std::string* error = nullptr, int tile = 0);
 // An AVIF with a gain map (ISO 21496-1, as libavif writes one): `sdr` (code values in `sdrSpace`, Rec.709 or Display P3
 // primaries) as the 8-bit base, which every reader shows, and a map to `hdr` (in `hdrSpace`, PQ or HLG) in a tone-mapped
 // derived item that HDR readers prefer, stating the HDR rendition's colour and light levels. Pictures premultiplied
 // over black, the same size.
 bool writeGainMapAvif(const Image& sdr, const ColorSpace& sdrSpace, const Image& hdr, const ColorSpace& hdrSpace, int quality,
+                      double maxCll, double maxFall, const std::string& path, std::string* error = nullptr);
+// The same as a HEIF, in HEVC (the map 4:4:4).
+bool writeGainMapHeif(const Image& sdr, const ColorSpace& sdrSpace, const Image& hdr, const ColorSpace& hdrSpace, int quality,
                       double maxCll, double maxFall, const std::string& path, std::string* error = nullptr);
 
 }  // namespace montage

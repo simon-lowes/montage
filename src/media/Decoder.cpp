@@ -75,11 +75,27 @@ std::string averr(int code) {
     return buf;
 }
 
-// A still that may hold a gain map (its metadata read to find out, so only JPEG and AVIF names): 1 JPEG, 2 AVIF, else 0.
-int gainMapKind(const std::string& path) {
+std::string lowerExtension(const std::string& path) {
     std::string ext = path.substr(path.find_last_of('.') == std::string::npos ? path.size() : path.find_last_of('.'));
     for (char& c : ext) c = char(std::tolower(static_cast<unsigned char>(c)));
-    return ext == ".jpg" || ext == ".jpeg" || ext == ".jpe" ? 1 : ext == ".avif" ? 2 : 0;
+    return ext;
+}
+
+// A still that may hold a gain map (its metadata read to find out, so only JPEG and HEIF names): 1 JPEG, 2 HEIF (AVIF,
+// HEIC), else 0.
+int gainMapKind(const std::string& path) {
+    const std::string ext = lowerExtension(path);
+    return ext == ".jpg" || ext == ".jpeg" || ext == ".jpe"                       ? 1
+           : ext == ".avif" || ext == ".heic" || ext == ".heif" || ext == ".hif" ? 2
+                                                                                  : 0;
+}
+
+// A HEIF still that Montage reads itself (FFmpeg reads AVIF, but not HEIC or pictures in tiles): HEIC and HEIF by name,
+// and AVIF whose picture is a grid.
+bool heifByMontage(const std::string& file, HeifStillInfo& info) {
+    const std::string ext = lowerExtension(file);
+    if (ext != ".heic" && ext != ".heif" && ext != ".hif" && ext != ".avif") return false;
+    return readHeifStill(file, info) && (ext != ".avif" || info.grid);
 }
 
 bool isStillFormat(const AVFormatContext* fmt) {
@@ -565,6 +581,33 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         out = m;
         return true;
     }
+    // A HEIF still FFmpeg does not read: its size, colour and light levels from its meta box, and its gain map as for
+    // AVIF.
+    if (HeifStillInfo hi; heifByMontage(file, hi)) {
+        MediaItem m = out;
+        m.path = path;
+        if (m.name.empty()) m.name = file.substr(file.find_last_of("/\\") + 1);
+        m.kind = MediaKind::Image;
+        m.hasVideo = true;
+        m.hasAudio = false;
+        m.width = hi.width;
+        m.height = hi.height;
+        m.duration = 0;
+        m.videoCodec = hi.codec;
+        const char* pri = av_color_primaries_name(AVColorPrimaries(hi.primaries));
+        const char* trc = av_color_transfer_name(AVColorTransferCharacteristic(hi.transfer));
+        m.colorSpace = colorSpaceFromTags(pri ? pri : "", trc ? trc : "");
+        if (m.colorSpace == "rec709") m.colorSpace.clear();
+        m.maxCll = hi.maxCll;
+        m.maxFall = hi.maxFall;
+        if (hi.gainMap) {
+            m.gainMap = true;
+            if (in.empty()) m.path = gainMapPath(path, true), in.gainMap = true;
+            if (in.gainMap) m.colorSpace = "rec2100pq", m.maxCll = hi.hdrMaxCll, m.maxFall = hi.hdrMaxFall;
+        }
+        out = m;
+        return true;
+    }
     AVFormatContext* fmt = nullptr;
     int rc = openMediaInput(&fmt, path);
     if (rc < 0) {
@@ -624,12 +667,13 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         GainMapJpeg jpeg;
         GainMapMetadata avif;
         if ((st->codecpar->codec_id == AV_CODEC_ID_MJPEG && gainMapKind(file) == 1 && readGainMapJpeg(file, jpeg) && !jpeg.metadata.baseIsHdr) ||
-            (st->codecpar->codec_id == AV_CODEC_ID_AV1 && gainMapKind(file) == 2 && readGainMapAvif(file, &avif) && !avif.baseIsHdr)) {
+            (st->codecpar->codec_id == AV_CODEC_ID_AV1 && gainMapKind(file) == 2 && readGainMapHeif(file, &avif) && !avif.baseIsHdr)) {
             m.gainMap = true;
             if (in.empty()) m.path = gainMapPath(path, true), in.gainMap = true;
             if (in.gainMap) m.colorSpace = "rec2100pq";
         }
-        // HDR light levels: MP4 and Matroska carry them as stream side data, PNG in its cLLI chunk, AVIF as a property.
+        // HDR light levels: MP4 and Matroska carry them as stream side data, PNG in its cLLI chunk, an AVIF still as a
+        // property of its picture (or, imported as its gain map's HDR rendition, of its tone-mapped item).
         if (const AVPacketSideData* sd = av_packet_side_data_get(st->codecpar->coded_side_data, st->codecpar->nb_coded_side_data,
                                                                  AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
             sd && sd->size >= sizeof(AVContentLightMetadata)) {
@@ -637,10 +681,12 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
             m.maxCll = cl->MaxCLL;
             m.maxFall = cl->MaxFALL;
         }
-        if (StillHdrInfo still; (st->codecpar->codec_id == AV_CODEC_ID_PNG || st->codecpar->codec_id == AV_CODEC_ID_AV1) &&
-                                readStillHdrInfo(file, still) && still.maxCll > 0) {
+        if (StillHdrInfo still; st->codecpar->codec_id == AV_CODEC_ID_PNG && readStillHdrInfo(file, still) && still.maxCll > 0) {
             m.maxCll = still.maxCll;
             m.maxFall = still.maxFall;
+        } else if (HeifStillInfo hi; st->codecpar->codec_id == AV_CODEC_ID_AV1 && lowerExtension(file) == ".avif" && readHeifStill(file, hi)) {
+            const double cll = in.gainMap ? hi.hdrMaxCll : hi.maxCll, fall = in.gainMap ? hi.hdrMaxFall : hi.maxFall;
+            if (cll > 0) m.maxCll = cll, m.maxFall = fall;
         }
         int w = st->codecpar->width, h = st->codecpar->height;
 #ifdef MONTAGE_PRORES_RAW
@@ -874,10 +920,14 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
             return true;
         }
     }
-    // A JPEG or AVIF with a gain map read as its HDR rendition (PQ), made from the base and the map.
-    if (const std::string file = uninterpretedPath(path); in.gainMap && gainMapKind(file)) {
+    // A JPEG or HEIF with a gain map read as its HDR rendition (PQ), made from the base and the map; a HEIF still FFmpeg
+    // does not read, as its code values.
+    HeifStillInfo heif;
+    if (const std::string file = uninterpretedPath(path); (in.gainMap && gainMapKind(file)) || heifByMontage(file, heif)) {
         std::string why;
-        const std::shared_ptr<const GainMapPicture> pic = gainMapKind(file) == 1 ? decodeGainMapJpeg(file, &why) : decodeGainMapAvif(file, &why);
+        const std::shared_ptr<const GainMapPicture> pic = !(in.gainMap && gainMapKind(file)) ? decodeHeifStill(file, &why)
+                                                          : gainMapKind(file) == 1           ? decodeGainMapJpeg(file, &why)
+                                                                                             : decodeGainMapHeif(file, &why);
         if (!pic) {
             if (error) *error = why;
             close();
