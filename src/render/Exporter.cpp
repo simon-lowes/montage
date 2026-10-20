@@ -2545,18 +2545,20 @@ bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::
     const std::string ext = lowered(std::filesystem::path(path).extension().string());
     const bool avif = ext == ".avif";
     const bool jpeg = ext == ".jpg" || ext == ".jpeg";
-    if (space->hdr() && ext != ".png" && !avif && !jpeg) return fail("An HDR still is written as PNG, AVIF or JPEG (with a gain map)");
+    const bool heif = ext == ".heic" || ext == ".heif" || ext == ".hif";
+    if (space->hdr() && ext != ".png" && !avif && !heif && !jpeg)
+        return fail("An HDR still is written as PNG, AVIF, HEIF or JPEG (with a gain map)");
     Image img = renderProgramFrame(p, seq, t, ro);
     if (img.empty()) return fail("Nothing to render at this frame");
     StillResult res;
     res.colorSpace = space->id;
-    const bool gainMap = space->hdr() && (jpeg || (avif && options.gainMap));
+    const bool gainMap = space->hdr() && (jpeg || ((avif || heif) && options.gainMap));
     if (gainMap) {
         res.bits = 8;
         res.gainMap = true;
     }
     if (space->hdr() && !jpeg) {  // (a JPEG states no light levels)
-        if (!gainMap) res.bits = avif ? 10 : 16;
+        if (!gainMap) res.bits = avif || heif ? 10 : 16;
         LightLevels l;
         if (ro.trimTarget.empty() && seq.hdrMaxCll > 0) {
             l.maxCll = seq.hdrMaxCll;
@@ -2582,13 +2584,16 @@ bool exportStill(const Project& p, const Sequence& seq, FrameTime t, const std::
             convertColor(sdr, *sdrSpace, rec709Space(), sdrPeak);
             sdrSpace = &rec709Space();
         }
-        if (jpeg ? !writeGainMapJpeg(sdr, *sdrSpace, img, *space, options.quality, path, error)
-                 : !writeGainMapAvif(sdr, *sdrSpace, img, *space, options.quality, res.maxCll, res.maxFall, path, error))
+        if (jpeg   ? !writeGainMapJpeg(sdr, *sdrSpace, img, *space, options.quality, path, error)
+            : avif ? !writeGainMapAvif(sdr, *sdrSpace, img, *space, options.quality, res.maxCll, res.maxFall, path, error)
+                   : !writeGainMapHeif(sdr, *sdrSpace, img, *space, options.quality, res.maxCll, res.maxFall, path, error))
             return false;
     } else if (avif) {
         bool stated = false;
         if (!writeAvifStill(img, *space, options.quality, peak, res.maxCll, res.maxFall, path, error, &stated)) return false;
         if (!stated) res.maxCll = res.maxFall = 0;
+    } else if (heif) {
+        if (!writeHeifStill(img, *space, options.quality, peak, res.maxCll, res.maxFall, path, error)) return false;
     } else if (space->hdr()) {
         if (!writeHdrPng(img, *space, peak, res.maxCll, res.maxFall, path, error)) return false;
     } else {

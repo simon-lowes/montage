@@ -45,8 +45,8 @@ bool readGainMapJpeg(const std::string& path, GainMapJpeg& out);
 // The HDR rendition of a base picture and its map at full boost (`headroom` log2, below the metadata's maximum: less):
 // linear light relative to SDR white (1.0 = 203 nits in HDR), in the base's primaries.
 void applyGainMap(const QImage& base, const QImage& map, const GainMapMetadata& m, Image& linear, double headroom = 1e9);
-// A file's HDR rendition: 16-bit code values of Rec.2100 PQ (BT.2020), RGBA (opaque) in host byte order, and its
-// brightest pixel in nits. Decoded once per version of the file; nullptr with `error` when it cannot be.
+// A picture as 16-bit code values, RGBA (opaque) in host byte order: a file's HDR rendition in Rec.2100 PQ (BT.2020),
+// with its brightest pixel in nits. Decoded once per version of the file; nullptr with `error` when it cannot be.
 struct GainMapPicture {
     int width = 0, height = 0;
     std::vector<uint16_t> rgba;
@@ -54,19 +54,37 @@ struct GainMapPicture {
 };
 std::shared_ptr<const GainMapPicture> decodeGainMapJpeg(const std::string& path, std::string* error = nullptr);
 
-// An AVIF with a gain map: a tone-mapped derived item ('tmap', ISO 21496-1's metadata) from its base (the primary item)
-// and its map. Its metadata (the meta box alone is read; false for a gain map Montage does not read: to SDR from an HDR
-// base, or in primaries or a curve it does not know), and its HDR rendition as decodeGainMapJpeg gives it.
-bool readGainMapAvif(const std::string& path, GainMapMetadata* metadata = nullptr);
-std::shared_ptr<const GainMapPicture> decodeGainMapAvif(const std::string& path, std::string* error = nullptr);
-// An AVIF still's primary picture as 8-bit RGB (null when it is not one); its primary item's coded data and property
-// boxes (whole, in order), for writing it into another file.
-QImage decodeAvifPicture(const std::string& path, std::string* error = nullptr);
+// HEIF stills (HEIC, and AVIF, which is HEIF with AV1): their primary picture, AV1 or HEVC or a grid of tiles of
+// either, turned and mirrored as the file says. What it is (size as shown, codec, H.273 colour code points from its
+// nclx or what its ICC profile is closest to, 0 where not known; light levels; whether it has a gain map Montage
+// reads), the meta box alone read; and its picture as 16-bit full-range code values in its own colour (decoded once
+// per version of the file).
+struct HeifStillInfo {
+    int width = 0, height = 0;
+    std::string codec;  // "hevc", "av1"
+    bool grid = false;
+    int primaries = 0, transfer = 0;
+    double maxCll = 0, maxFall = 0;
+    bool gainMap = false;
+};
+bool readHeifStill(const std::string& path, HeifStillInfo& out);
+std::shared_ptr<const GainMapPicture> decodeHeifStill(const std::string& path, std::string* error = nullptr);
+
+// A HEIF (AVIF or HEIC) with a gain map: a tone-mapped derived item ('tmap', ISO 21496-1's metadata) from its base (the
+// primary item) and its map. Its metadata (the meta box alone is read; false for a gain map Montage does not read: to
+// SDR from an HDR base, or in primaries or a curve it does not know), and its HDR rendition as decodeGainMapJpeg gives
+// it.
+bool readGainMapHeif(const std::string& path, GainMapMetadata* metadata = nullptr);
+std::shared_ptr<const GainMapPicture> decodeGainMapHeif(const std::string& path, std::string* error = nullptr);
+// A HEIF still's primary picture as 8-bit RGB (null when it is not one); its primary item's type ("av01", "hvc1"), coded
+// data and property boxes (whole, in order), for writing it into another file.
+QImage decodeHeifPicture(const std::string& path, std::string* error = nullptr);
 struct AvifCodedItem {
+    QByteArray type;
     QByteArray data;
     std::vector<QByteArray> properties;
 };
-bool readAvifCodedItem(const std::string& path, AvifCodedItem& out);
+bool readHeifCodedItem(const std::string& path, AvifCodedItem& out);
 
 // For the writers: the map's metadata and target codes (0-255, three a pixel) for an HDR picture over a base as decoders
 // see it (`seen`, 8-bit sRGB-curve code values in `basePrimaries`); the map encoded with what a decoder reads back of

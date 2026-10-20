@@ -137,5 +137,10 @@ jobs:
           (sudo apt-get update > /dev/null && sudo apt-get install -y --no-install-recommends libdav1d-dev > /dev/null && scripts/build-avifgainmaputil.sh ~/libavif) \
             && echo "MONTAGE_TEST_AVIFGAINMAP=$HOME/libavif/bin/avifgainmaputil" >> "$GITHUB_ENV" \
             || echo "::warning::Could not build libavif's avifgainmaputil; its part of the HDR stills test will be skipped"
+      - name: libheif's decoder for the HDR stills test
+        run: |
+          sudo apt-get install -y --no-install-recommends libheif-examples libheif-plugin-libde265 > /dev/null \
+            && echo "MONTAGE_TEST_HEIFDEC=$(command -v heif-dec || command -v heif-convert)" >> "$GITHUB_ENV" \
+            || echo "::warning::Could not install libheif's decoder; its part of the HDR stills test will be skipped"
       - name: Test
         run: ctest --test-dir build --output-on-failure

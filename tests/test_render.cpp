@@ -4110,6 +4110,71 @@ colorspaces:
         QCOMPARE(back.maxCll, res.maxCll);
         QCOMPARE(back.maxFall, res.maxFall);
 
+        // libheif's decoder (MONTAGE_TEST_HEIFDEC, heif-dec or heif-convert) reads a HEIF as Montage does: within 1 % of
+        // full scale in each patch.
+        const QByteArray heifDec = qgetenv("MONTAGE_TEST_HEIFDEC");
+        auto libheifReads = [&](const std::string& heifPath, const Image& as) {
+            const QString out = dir.filePath("libheif.png");
+            QFile::remove(out);
+            QProcess t;
+            t.start(QString::fromLocal8Bit(heifDec), {QString::fromStdString(heifPath), out});
+            if (!t.waitForFinished(60000) || t.exitCode() != 0) return QString("libheif: ") + t.readAllStandardError();
+            QImageReader reader(out);
+            reader.setAutoTransform(false);
+            QImage q = reader.read();
+            q.setColorSpace(QColorSpace());
+            q = q.convertToFormat(QImage::Format_RGBA64);
+            if (q.size() != QSize(as.width, as.height)) return QString("libheif: size %1 x %2").arg(q.width()).arg(q.height());
+            for (int i = 0; i < 8; ++i) {
+                const QRgba64 v = reinterpret_cast<const QRgba64*>(q.constScanLine(H / 2))[i * 32 + 16];
+                const float* m = as.row(H / 2) + (i * 32 + 16) * 4;
+                const double got[3] = {v.red() / 65535.0, v.green() / 65535.0, v.blue() / 65535.0};
+                for (int c = 0; c < 3; ++c)
+                    if (std::fabs(got[c] - m[c]) > 0.01) return QString("libheif: patch %1 channel %2: %3, not %4").arg(i).arg(c).arg(got[c]).arg(m[c]);
+            }
+            return QString();
+        };
+        if (heifDec.isEmpty()) qInfo("MONTAGE_TEST_HEIFDEC not set: HEIF stills are not checked with libheif");
+
+        // As a 10-bit HEIF (HEVC): the same light within 2 %, an image, PQ, with its colr, clli and mdcv.
+        const std::string heic = dir.filePath("frame.heic").toStdString();
+        QVERIFY2(exportStill(p, s, 0, heic, &err, master, &res), err.c_str());
+        QCOMPARE(res.bits, 10);
+        img = readBack(heic, "rec2100pq", back);
+        QCOMPARE(back.kind, MediaKind::Image);
+        QCOMPARE(back.colorSpace, std::string("rec2100pq"));
+        QCOMPARE(back.videoCodec, std::string("hevc"));
+        why = sameLight(img, pq, 0.02);
+        QVERIFY2(why.isEmpty(), qPrintable("HEIF: " + why));
+        QVERIFY(readStillHdrInfo(heic, info));
+        QVERIFY(info.primaries == 9 && info.transfer == 16 && info.fullRange);
+        QCOMPARE(info.maxCll, res.maxCll);
+        QCOMPARE(info.masteringMaxNits, 1000.0);
+        QCOMPARE(back.maxCll, res.maxCll);
+        QCOMPARE(back.maxFall, res.maxFall);
+        if (!heifDec.isEmpty()) {
+            why = libheifReads(heic, img);
+            QVERIFY2(why.isEmpty(), qPrintable(why));
+        }
+        // In tiles (a grid, as phones and large pictures are written): the same picture.
+        {
+            const std::string tiled = dir.filePath("tiled.heic").toStdString();
+            QVERIFY2(writeHeifStill(img, pq, 90, 1000, res.maxCll, res.maxFall, tiled, &err, 96), err.c_str());
+            HeifStillInfo hi;
+            QVERIFY(readHeifStill(tiled, hi) && hi.grid && hi.width == W && hi.height == H && hi.transfer == 16 && hi.maxCll == res.maxCll);
+            MediaItem tiledBack;
+            const Image t = readBack(tiled, "rec2100pq", tiledBack);
+            QCOMPARE(t.width, W);
+            for (int i = 0; i < 8; ++i)  // (each patch's middle, against the picture written, within 1 % of full scale)
+                for (int c = 0; c < 3; ++c)
+                    QVERIFY2(std::fabs(t.row(H / 2)[(i * 32 + 16) * 4 + c] - img.row(H / 2)[(i * 32 + 16) * 4 + c]) <= 0.01,
+                             qPrintable(QString("HEIF grid patch %1").arg(i)));
+            if (!heifDec.isEmpty()) {
+                why = libheifReads(tiled, t);
+                QVERIFY2(why.isEmpty(), qPrintable(why));
+            }
+        }
+
         // As a JPEG with a gain map: the base is the SDR trim's render, the map takes it to the master. At full boost every
         // patch comes back within 2 % in nits (in the base's Rec.709 gamut: the master's green beyond it is clipped to it).
         double toBase[9];
@@ -4308,10 +4373,10 @@ colorspaces:
             QVERIFY2(exportStill(p, s, 0, gmAvif, &err, o, &res), err.c_str());
             QVERIFY(res.gainMap && res.bits == 8 && res.colorSpace == "rec2100pq" && res.maxCll > 900);
             GainMapMetadata meta;
-            QVERIFY(readGainMapAvif(gmAvif, &meta));
+            QVERIFY(readGainMapHeif(gmAvif, &meta));
             QVERIFY2(meta.hdrCapacityMax > 2.2 && meta.hdrCapacityMin == 0, qPrintable(QString::number(meta.hdrCapacityMax)));
             // Readers without gain maps show the base: the SDR trim's render.
-            const QImage base = decodeAvifPicture(gmAvif);
+            const QImage base = decodeHeifPicture(gmAvif);
             QCOMPARE(base.size(), QSize(W, H));
             for (int i = 0; i < 8; ++i) {
                 const QColor c = base.pixelColor(i * 32 + 16, H / 2);
@@ -4370,10 +4435,50 @@ colorspaces:
                 QByteArray b = bytes;
                 b.replace(at, with.size(), with);
                 QFile o(dir.filePath(name));
-                return o.open(QIODevice::WriteOnly) && o.write(b) == b.size() && (o.close(), !readGainMapAvif(o.fileName().toStdString()));
+                return o.open(QIODevice::WriteOnly) && o.write(b) == b.size() && (o.close(), !readGainMapHeif(o.fileName().toStdString()));
             };
             QVERIFY(refused("no-lengths.avif", ilocAt + 8, QByteArray(1, char(0x40))));
             QVERIFY(refused("ebu-primaries.avif", nclxAt + 4, QByteArray("\0\x16", 2)));
+        }
+
+        // As a HEIF (HEVC) with a gain map: the same.
+        {
+            StillOptions o = gainMap;
+            o.gainMap = true;
+            const std::string gmHeif = dir.filePath("gain-map.heic").toStdString();
+            QVERIFY2(exportStill(p, s, 0, gmHeif, &err, o, &res), err.c_str());
+            QVERIFY(res.gainMap && res.bits == 8 && res.colorSpace == "rec2100pq");
+            GainMapMetadata meta;
+            QVERIFY(readGainMapHeif(gmHeif, &meta) && meta.hdrCapacityMax > 2.2);
+            const QImage base = decodeHeifPicture(gmHeif);
+            QCOMPARE(base.size(), QSize(W, H));
+            for (int i = 0; i < 8; ++i) {
+                const QColor c = base.pixelColor(i * 32 + 16, H / 2);
+                const size_t at = (size_t(H / 2) * W + i * 32 + 16) * 4;
+                QVERIFY2(std::abs(c.red() - trimmed[at]) <= 3 && std::abs(c.green() - trimmed[at + 1]) <= 3 && std::abs(c.blue() - trimmed[at + 2]) <= 3,
+                         qPrintable(QString("HEIF base patch %1").arg(i)));
+            }
+            img = readBack(gmHeif, "rec2100pq", back);
+            QVERIFY(back.gainMap && back.colorSpace == "rec2100pq");
+            why = sameLight709([&](int x, int y, double out[3]) {
+                const float* px = img.at(x, y);
+                double n[3] = {codeToNits(pq, px[0]), codeToNits(pq, px[1]), codeToNits(pq, px[2])};
+                in709(n, out);
+            }, 0.02);
+            QVERIFY2(why.isEmpty(), qPrintable("HEIF: " + why));
+            // Readers without gain maps (libheif here) show the base; a Rec.709 sequence shows it too.
+            img = readBack(gmHeif, "rec709", back);
+            const std::vector<uint8_t> got = toRgba8(img);
+            for (int i = 0; i < 8; ++i) {
+                const size_t at = (size_t(H / 2) * W + i * 32 + 16) * 4;
+                QVERIFY2(std::abs(int(got[at]) - trimmed[at]) <= 3 && std::abs(int(got[at + 1]) - trimmed[at + 1]) <= 3 &&
+                             std::abs(int(got[at + 2]) - trimmed[at + 2]) <= 3,
+                         qPrintable(QString("HEIF SDR picture patch %1").arg(i)));
+            }
+            if (!heifDec.isEmpty()) {
+                why = libheifReads(gmHeif, img);
+                QVERIFY2(why.isEmpty(), qPrintable(why));
+            }
         }
 
         // For SDR screens (the default): the SDR trim's render, as an 8-bit PNG.
@@ -4402,6 +4507,21 @@ colorspaces:
                 const size_t at = (size_t(H / 2) * W + i * 32 + 16) * 4 + c;
                 QVERIFY2(std::abs(int(got[at]) - int(want[at])) <= 3, qPrintable(QString("patch %1: %2, not %3").arg(i).arg(got[at]).arg(want[at])));
             }
+        // And as an 8-bit HEIF.
+        {
+            const std::string sdrHeif = dir.filePath("sdr.heic").toStdString();
+            QVERIFY2(exportStill(p, s, 0, sdrHeif, &err, {}, &res), err.c_str());
+            QCOMPARE(res.bits, 8);
+            img = readBack(sdrHeif, "rec709", back);
+            QVERIFY(back.colorSpace.empty() && back.maxCll == 0 && back.kind == MediaKind::Image);
+            const std::vector<uint8_t> heifGot = toRgba8(img);
+            for (int i = 0; i < 8; ++i)
+                for (int c = 0; c < 3; ++c) {
+                    const size_t at = (size_t(H / 2) * W + i * 32 + 16) * 4 + c;
+                    QVERIFY2(std::abs(int(heifGot[at]) - int(want[at])) <= 3,
+                             qPrintable(QString("HEIF patch %1: %2, not %3").arg(i).arg(heifGot[at]).arg(want[at])));
+                }
+        }
         // Without an SDR trim target: the master tone mapped as the viewer shows it.
         Sequence plain = s;
         plain.trimTargets.clear();
@@ -4424,7 +4544,7 @@ colorspaces:
 
         // HDR goes out only as PNG, AVIF or JPEG; an unknown target is refused.
         QVERIFY(!exportStill(p, s, 0, dir.filePath("frame.tif").toStdString(), &err, master));
-        QVERIFY(err.find("PNG, AVIF or JPEG") != std::string::npos);
+        QVERIFY(err.find("PNG, AVIF, HEIF or JPEG") != std::string::npos);
         StillOptions unknown;
         unknown.rendition = "cinema";
         QVERIFY(!exportStill(p, s, 0, png, &err, unknown) && err.find("cinema") != std::string::npos);
