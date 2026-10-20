@@ -148,6 +148,12 @@ std::vector<EffectInfo> buildCatalog() {
                      num("whites", "Whites", -100, 100, 0, 0.5),
                      num("blacks", "Blacks", -100, 100, 0, 0.5),
                      num("vibrance", "Vibrance", -100, 100, 0, 0.5),
+                     // Printer lights, as a timer sets them on a film printer: each channel's exposure in points of
+                     // `printer_point` log exposure (0.025 by default, about a twelfth of a stop), more light more colour.
+                     num("printer_r", "Printer Light R (points)", -100, 100, 0, 1),
+                     num("printer_g", "Printer Light G (points)", -100, 100, 0, 1),
+                     num("printer_b", "Printer Light B (points)", -100, 100, 0, 1),
+                     num("printer_point", "Printer Point (log E)", 0.005, 0.1, 0.025, 0.001),
                  },
                  {}});
     c.push_back({"curves", "Curves", EffectCategory::VideoFilter, "Color",
@@ -819,7 +825,8 @@ std::vector<EffectInfo> buildCatalog() {
                      {}});
         c.push_back({"scratch_removal", "Scratch Removal", EffectCategory::VideoFilter, "Repair",
                      {pct("sensitivity", "Sensitivity", 0, 100, 50), num("width", "Widest Scratch (px)", 1, 32, 4, 1),
-                      choice("polarity", "Scratches", {"Dark and Light", "Dark", "Light"}, 0), boolean("show", "Show Detected")},
+                      choice("polarity", "Scratches", {"Dark and Light", "Dark", "Light"}, 0),
+                      boolean("follow", "Follow Slanting Scratches", true), boolean("show", "Show Detected")},
                      {}});
         c.push_back({"patch_fill", "Patch Fill", EffectCategory::VideoFilter, "Repair",
                      {num("source_x", "Source X (of the width)", -1, 1, 0.15, 0.001), num("source_y", "Source Y (of the height)", -1, 1, 0, 0.001),
@@ -835,6 +842,25 @@ std::vector<EffectInfo> buildCatalog() {
             for (auto& pi : c[i].params)
                 if (pi.name != "sensitivity")
                     pi.keyframeable = c[i].type == "patch_fill" && (pi.name == "source_x" || pi.name == "source_y");
+        // Film scans (render/FilmScan.h), run where the source frame is read: Steady on Perforations first (holding the
+        // holes where they were on the frame its reference was taken from, "reference" as text), then Film Negative (its
+        // base found in each frame's rebate unless set), then Faded Colour Restore (from the frames either side).
+        c.push_back({"film_negative", "Film Negative", EffectCategory::VideoFilter, "Film",
+                     {choice("scan", "Scan Encoding", {"The Picture's Own Curve", "Linear", "Printing Density (10-bit Log)"}, 0),
+                      choice("base_from", "Film Base", {"Found in the Rebate", "As Set Below"}, 0),
+                      num("base_r", "Film Base R", 0, 1, 0.9, 0.001), num("base_g", "Film Base G", 0, 1, 0.55, 0.001),
+                      num("base_b", "Film Base B", 0, 1, 0.35, 0.001), num("gamma", "Negative Gamma", 0.3, 1.2, 0.6, 0.01),
+                      num("exposure", "Print Exposure (stops)", -4, 4, 0, 0.05)},
+                     {}});
+        c.push_back({"fade_restore", "Faded Colour Restore", EffectCategory::VideoFilter, "Film",
+                     {pct("strength", "Strength", 0, 100, 100), num("frames", "Frames Either Side", 0, 24, 12, 1)},
+                     {}});
+        c.push_back({"perf_lock", "Steady on Perforations", EffectCategory::VideoFilter, "Film",
+                     {choice("side", "Perforations", {"Left", "Right"}, 0), pct("rebate", "Rebate Width", 2, 30, 12),
+                      boolean("show", "Show Detected")},
+                     {}});
+        for (size_t i = c.size() - 3; i < c.size(); ++i)
+            for (auto& pi : c[i].params) pi.keyframeable = pi.name == "exposure" || pi.name == "strength";
         c.push_back({"tilt_shift", "Tilt-Shift Blur", EffectCategory::VideoFilter, "Blur & Sharpen",
                      {pct("focus", "Focus Position", 0, 100, 50), pct("width", "Focus Width", 0, 100, 20), num("blur", "Blur (px)", 0, 200, 12, 0.5),
                       angle("angle", "Angle", 0), pct("saturation", "Saturation", 0, 200, 120)},

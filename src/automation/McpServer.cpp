@@ -2215,14 +2215,21 @@ void McpServer::Impl::addTools() {
         "nose_length, eye_size, eye_distance, mouth_width, mouth_height; show draws the mesh. look_at_lens turns each open "
         "eye's iris to the lens (amount; limit, the largest gaze off the lens in degrees it corrects, fading over the next "
         "10; show marks the irises). "
-        "Restoration: dirt_removal takes out specks that are on one frame only (compared with the frames either side, "
-        "following the motion); dust_spots replaces hand-marked spots (strings.spots, lines of \"frame x y radius\": the "
+        "Restoration: dirt_removal takes out specks that are on one frame (compared with the frames either side, "
+        "following the motion) or two (against the frames two away); dust_spots replaces hand-marked spots (strings.spots, lines of \"frame x y radius\": the "
         "frame counted from the clip's start in sequence frames, the centre as fractions of the frame's width and height, "
-        "the radius as a fraction of its width); scratch_removal fills thin vertical scratches; patch_fill covers its mask "
+        "the radius as a fraction of its width); scratch_removal fills thin vertical scratches (follow 1, the default, also slanting and "
+        "wandering ones); patch_fill covers its mask "
         "with the picture source_x / source_y away (fractions of the frame), blended seamlessly; paint draws clone or heal "
         "strokes (strings.strokes, lines of \"clone|heal frame hold track dx dy radius softness x y x y ...\": frame as for "
         "spots, hold 1 for every frame, track 1 to follow the mask's track, dx dy to where it copies from and the points "
         "as fractions of the frame's width and height, radius a fraction of its width, softness 0-1). "
+        "Film scans: film_negative inverts a negative from its film base (scan 0 the picture's own curve, 1 linear, 2 "
+        "printing density, 10-bit log; base_from 0 finds the base in each frame's rebate, 1 uses base_r/g/b; gamma, exposure in stops); "
+        "color_correct's printer_r/g/b are printer lights in points of printer_point log exposure (0.025); fade_restore "
+        "brings faded dyes back to neutral (strength, frames either side); perf_lock holds the frame on its perforations "
+        "(side 0 left, 1 right; rebate in % of the width), the reference (strings.reference, lines of \"x y\" as fractions "
+        "of the frame) taken from the clip's first frame when none is given. "
         "lip_sync redraws the largest face's mouth and jaw to speak an audio track's sound (strings.track, e.g. \"A2\"; "
         "every track when empty), as a dub needs (MuseTalk; amount mixes it); it needs consent: true (the person shown has "
         "agreed) and its models (scripts/fetch-models.sh --lipsync), and runs in exports and renders (about 4 s a frame on four cores).",
@@ -2374,8 +2381,8 @@ void McpServer::Impl::addTools() {
                 ColorGroup* g = findColorGroup(l.seq(), c.colorGroup);
                 if (!g) throw ArgError{"That clip is in no colour group (see montage_color_group)"};
                 if (stage != "pre" && stage != "post") throw ArgError{"\"group_stage\" is pre or post"};
-                if (audioClip || type == "stabilize" || type == "rolling_shutter")
-                    throw ArgError{"A colour group takes picture effects that work the same on each clip"};
+                if (audioClip || runsBeforeGrade(type))
+                    throw ArgError{"A colour group takes picture effects that work the same on each clip (that one works on each clip's picture as it comes: add it to the clips)"};
                 (stage == "pre" ? g->pre : g->post).push_back(e);
                 save(l);
                 return ok(QStringLiteral("Added %1 to the %2-clip grade of %3").arg(QString::fromStdString(displayName), stage, QString::fromStdString(g->name)),
@@ -2434,6 +2441,12 @@ void McpServer::Impl::addTools() {
                           QJsonObject{{"effect_id", double(e.id)}, {"camera_gyro", usingGyro}});
             }
             QString note;
+            if (type == "perf_lock" && e.s("reference").empty()) {
+                // Held to the perforations of the clip's first frame (unless a reference was given).
+                std::string err;
+                if (!takePerforationReference(l.project, l.seq(), c, e, c.start, &err))
+                    note = QStringLiteral(" (no reference yet: %1)").arg(QString::fromStdString(err));
+            }
             if (type == "sky_replace" && std::lround(e.p("follow", 0, 1)) == 1) {
                 // The new sky moves with the camera, measured now (a still, or a clip it fails on, keeps the sky still).
                 std::string motion, err;

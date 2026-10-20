@@ -357,6 +357,57 @@ std::vector<float> detectDirt(const Image& cur, const Image& prev, const Image& 
     return matte;
 }
 
+std::vector<float> detectLastingDirt(const Image& cur, const Image& prev, const Image& next, const Image& prev2, const Image& next2,
+                                     const MotionFn& toPrev, const MotionFn& toNext, const MotionFn& toPrev2, const MotionFn& toNext2,
+                                     const DirtSettings& s, int* count) {
+    if (count) *count = 0;
+    std::vector<float> m = detectDirt(cur, prev2, next2, toPrev2, toNext2, s);
+    if (m.empty() || prev.empty() || next.empty()) return {};
+    const int W = cur.width, H = cur.height;
+    const double sigma = s.noise >= 0 ? s.noise : estimateNoise(cur);
+    const float T = float(std::max(0.03, 5 * sigma) * sensitivityFactor(s.sensitivity));
+    const double reach = std::max(1.0, s.maxSize) / 2 + 4;
+    const Followed f = followBoth(cur, prev, next, around(toPrev, reach), around(toNext, reach));
+    const Followed f2 = followBoth(cur, prev2, next2, around(toPrev2, reach), around(toNext2, reach));
+    // Each speck kept when one neighbour has it and the other does not: most of its core (what stands out from the frames
+    // two away) matches the previous frame and not the next, or the next and not the previous. (What stands out from both
+    // neighbours is dirt detectDirt finds; what both have lasts three frames and is taken for the picture.)
+    std::vector<char> seen(m.size(), 0);
+    std::vector<size_t> stack, piece;
+    int kept = 0;
+    for (size_t i = 0; i < m.size(); ++i) {
+        if (m[i] <= 0 || seen[i]) continue;
+        seen[i] = 1;
+        stack.assign(1, i);
+        piece.clear();
+        int core = 0, one = 0;
+        while (!stack.empty()) {
+            const size_t j = stack.back();
+            stack.pop_back();
+            piece.push_back(j);
+            const int x = int(j % size_t(W)), y = int(j / size_t(W));
+            const float c = luma(cur.at(x, y));
+            if (f2.okP[j] && f2.okN[j] && std::fabs(c - (f2.p[j] + f2.n[j]) / 2) > T) {
+                ++core;
+                const bool inP = f.okP[j] && std::fabs(c - f.p[j]) < T, inN = f.okN[j] && std::fabs(c - f.n[j]) < T;
+                const bool outP = f.okP[j] && std::fabs(c - f.p[j]) > T, outN = f.okN[j] && std::fabs(c - f.n[j]) > T;
+                one += (inP && outN) || (inN && outP);
+            }
+            const int nx[4] = {x - 1, x + 1, x, x}, ny[4] = {y, y, y - 1, y + 1};
+            for (int k = 0; k < 4; ++k)
+                if (nx[k] >= 0 && ny[k] >= 0 && nx[k] < W && ny[k] < H) {
+                    const size_t n = size_t(ny[k]) * W + nx[k];
+                    if (m[n] > 0 && !seen[n]) seen[n] = 1, stack.push_back(n);
+                }
+        }
+        if (core > 0 && 2 * one >= core) ++kept;
+        else
+            for (size_t j : piece) m[j] = 0;
+    }
+    if (count) *count = kept;
+    return m;
+}
+
 void fillFromNeighbours(Image& cur, const std::vector<float>& matte, const Image& prev, const Image& next,
                         const MotionFn& toPrev, const MotionFn& toNext, double reach) {
     const int W = cur.width, H = cur.height;
@@ -496,6 +547,84 @@ void fillFromSurround(Image& img, const LocalMatte& matte) {
 
 // ---- Scratches -----------------------------------------------------------------------------------------------------------
 
+namespace {
+
+// Slanting and wandering scratches in the thin-line response `line` (W x H, `o` the distance to each side): each followed
+// down row by row from where it stands out most (seeds every eighth row), a pixel either way a row at most, kept when it
+// runs over a quarter of the frame within about 22 degrees of upright, standing out the same way well above the row's own texture most of the way and thin
+// (no wider than `width`) nearly all of it. Added to `matte` (where it is not there already); the number found.
+int followScratches(const std::vector<float>& line, int W, int H, int o, int width, double sigma, double factor, int polarity,
+                    std::vector<float>& matte) {
+    const int minRows = std::max(24, H / 4);
+    if (H < minRows || W <= 2 * o + 2) return 0;
+    // What each row's texture gives the response (its 90th percentile across the row: scratches are few).
+    std::vector<float> bar(static_cast<size_t>(H));
+    parallelRows(H, [&](int y0, int y1) {
+        std::vector<float> a;
+        for (int y = y0; y < y1; ++y) {
+            a.assign(line.begin() + long(size_t(y) * W + o), line.begin() + long(size_t(y) * W + W - o));
+            for (float& v : a) v = std::fabs(v);
+            std::nth_element(a.begin(), a.begin() + long(a.size() * 9 / 10), a.end());
+            bar[size_t(y)] = float(std::max({3.0 * a[a.size() * 9 / 10], 3 * sigma, 0.02}) * factor);
+        }
+    });
+    auto at = [&](int x, int y) { return line[size_t(y) * W + x]; };
+    // The run of pixels standing out with the line on row y about x (half as much as it does there), as [l, r].
+    auto run = [&](int x, int y, float sign, int& l, int& r) {
+        const float v = sign * at(x, y);
+        l = r = x;
+        while (l - 1 >= o && sign * at(l - 1, y) > 0.3f * v) --l;
+        while (r + 1 < W - o && sign * at(r + 1, y) > 0.3f * v) ++r;
+    };
+    int found = 0;
+    for (int sy = 0; sy + minRows <= H; sy += 8)
+        for (int x = o + 1; x < W - o - 1; ++x) {
+            const float v = at(x, sy);
+            const float sign = v > 0 ? 1.0f : -1.0f;
+            if (std::fabs(v) <= bar[size_t(sy)] || std::fabs(v) < std::fabs(at(x - 1, sy)) || std::fabs(v) < std::fabs(at(x + 1, sy)) ||
+                matte[size_t(sy) * W + x] > 0)
+                continue;
+            if ((polarity == 1 && sign > 0) || (polarity == 2 && sign < 0)) continue;
+            std::vector<int> xs{x};
+            int cx = x, misses = 0, agree = 1, thin = 0;
+            double sum = std::fabs(v), level = bar[size_t(sy)];
+            for (int y = sy + 1; y < H && misses <= 6; ++y) {
+                int bx = cx;
+                float bv = -1e30f;
+                for (int dx = -1; dx <= 1; ++dx)
+                    if (const int nx = cx + dx; nx >= o && nx < W - o && sign * at(nx, y) > bv) bv = sign * at(nx, y), bx = nx;
+                if (bv > 0.4f * bar[size_t(y)]) ++agree, misses = 0;
+                else ++misses;
+                cx = bx;
+                xs.push_back(cx);
+                sum += bv, level += bar[size_t(y)];
+            }
+            xs.resize(xs.size() - size_t(misses));
+            const int rows = int(xs.size());
+            if (rows < minRows || agree < 0.6 * rows || sum / rows < 0.5 * level / rows) continue;
+            // (A scratch runs down the film: within about 22 degrees of upright, so a wire or a mast is left alone.)
+            if (std::abs(xs.back() - xs.front()) > 0.4 * rows) continue;
+            std::vector<std::pair<int, int>> runs(static_cast<size_t>(rows));
+            for (int k = 0; k < rows; ++k) {
+                run(xs[size_t(k)], sy + k, sign, runs[size_t(k)].first, runs[size_t(k)].second);
+                thin += runs[size_t(k)].second - runs[size_t(k)].first + 1 <= width;
+            }
+            if (thin < 0.8 * rows) continue;
+            ++found;
+            for (int k = 0; k < rows; ++k) {
+                const int y = sy + k;
+                int l = runs[size_t(k)].first, r = runs[size_t(k)].second;
+                if (r - l + 1 > width) l = r = xs[size_t(k)];
+                for (int c = l; c <= r; ++c) matte[size_t(y) * W + c] = 1;
+                if (l > 0) matte[size_t(y) * W + l - 1] = std::max(matte[size_t(y) * W + l - 1], 0.5f);
+                if (r + 1 < W) matte[size_t(y) * W + r + 1] = std::max(matte[size_t(y) * W + r + 1], 0.5f);
+            }
+        }
+    return found;
+}
+
+}  // namespace
+
 std::vector<float> detectScratches(const Image& img, const ScratchSettings& s, int* count) {
     if (count) *count = 0;
     const int W = img.width, H = img.height;
@@ -562,6 +691,7 @@ std::vector<float> detectScratches(const Image& img, const ScratchSettings& s, i
             x = e + 1;
         }
     }
+    if (s.follow) found += followScratches(line, W, H, o, width, sigma, factor, s.polarity, matte);
     if (count) *count = found;
     return matte;
 }

@@ -305,7 +305,7 @@ double TangentControl::value(const std::string& name, const Target& t) const {
     return e ? e->p(name, t.at, def) : def;
 }
 
-bool TangentControl::change(const std::string& name, double to, bool reset) {
+bool TangentControl::change(const std::string& name, double to, bool reset, const QString& named) {
     const ParamInfo* info = paramInfo(name);
     if (!info) return false;
     const Target t = target();
@@ -315,7 +315,7 @@ bool TangentControl::change(const std::string& name, double to, bool reset) {
     }
     if (!reset && !std::isfinite(to)) return false;
     const double v = reset ? info->def : std::clamp(to, info->min, info->max);
-    const QString label = tr("%1 (Tangent)").arg(QString::fromStdString(info->label));
+    const QString label = named.isEmpty() ? tr("%1 (Tangent)").arg(QString::fromStdString(info->label)) : named;
     // (a run of turns on the node, a trackball's three colours interleaved, is one undo step)
     const QString key = QStringLiteral("tangent:%1:%2").arg(t.clip).arg(t.node);
     return state_->edit(label, [t, name, v](Project& p, Sequence& s) {

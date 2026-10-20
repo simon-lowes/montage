@@ -72,6 +72,9 @@ public:
     Target target() const;
     // A Color Correct control's value there (its default with none).
     double value(const std::string& name) const;
+    // Sets a Color Correct control on the graded clip (one made when it has none), as a turn of the panel does, the
+    // undo step named `label` (a run of changes on the node is one step).
+    bool set(const std::string& name, double to, const QString& label) { return change(name, to, false, label); }
 
     // A message from the Hub, as if it came over the connection (they are handled so; public for tests).
     void handle(const tangent::HubMessage& m);
@@ -85,7 +88,7 @@ private:
     void lost();
     void send(const std::string& bytes);
     void introduce();  // controls.xml written, Montage named
-    bool change(const std::string& name, double to, bool reset);
+    bool change(const std::string& name, double to, bool reset, const QString& label = QString());
     void sendValue(uint32_t id);
     void sendMenu();
     void sendDisplay(const Target& t);

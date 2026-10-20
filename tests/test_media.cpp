@@ -86,6 +86,7 @@
 #include "render/BroadcastMxf.h"
 #include "render/OGraf.h"
 #include "render/Restoration.h"
+#include "render/FilmScan.h"
 #include "render/ConformCheck.h"
 #include "media/Vector.h"
 #include "media/Beats.h"
@@ -24807,6 +24808,244 @@ private slots:
         const Image frame7 = renderSequenceFrame(pd, *pd.active(), 7, {});
         clip.effects.back().enabled = true;
         QVERIFY(renderSequenceFrame(pd, *pd.active(), 7, {}).px == frame7.px);
+    }
+
+    void filmScansOnFootage() {
+        auto open = [&](Project& p, const std::string& file, int W, int H) -> Clip& {
+            Sequence& s = *p.active();
+            s.width = W, s.height = H, s.fps = {25, 1};
+            MediaItem m = probeOrFail(p, file);
+            p.media.push_back(m);
+            edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            return s.videoTracks[0].clips.at(0);
+        };
+
+        // Dirt that lasts two frames on a still shot (frames 4 and 5): Dirt Removal takes it out against the frames two
+        // away, and leaves everything else as it was.
+        {
+            const int W = 320, H = 180;
+            auto tex = [](double x, double y) {
+                return 0.45 + 0.15 * std::sin(x * 0.21) * std::cos(y * 0.17) + 0.1 * std::sin((x + 2 * y) * 0.07);
+            };
+            const std::vector<std::array<int, 4>> specks = {{80, 60, 2, 20}, {220, 120, 3, 235}};  // x, y, radius, grey
+            std::vector<QImage> clean, dirty;
+            for (int f = 0; f < 10; ++f) {
+                QImage img(W, H, QImage::Format_RGB32);
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        const int v = std::clamp(int(std::lround(255 * tex(x, y))), 0, 255);
+                        img.setPixel(x, y, qRgb(v, v * 9 / 10, v * 8 / 10));
+                    }
+                clean.push_back(img);
+                if (f == 4 || f == 5)
+                    for (const auto& sp : specks)
+                        for (int y = -sp[2]; y <= sp[2]; ++y)
+                            for (int x = -sp[2]; x <= sp[2]; ++x)
+                                if (x * x + y * y <= sp[2] * sp[2]) img.setPixel(sp[0] + x, sp[1] + y, qRgb(sp[3], sp[3], sp[3]));
+                dirty.push_back(img);
+            }
+            const std::string cleanFile = path("lasting-clean.mp4"), dirtyFile = path("lasting-dirty.mp4");
+            writeFrames(cleanFile, clean, 25, 0);
+            writeFrames(dirtyFile, dirty, 25, 0);
+            Project pc = makeDefaultProject(), pd = makeDefaultProject();
+            open(pc, cleanFile, W, H);
+            Clip& clip = open(pd, dirtyFile, W, H);
+            const Image truth = renderSequenceFrame(pc, *pc.active(), 4, {}), before = renderSequenceFrame(pd, *pd.active(), 4, {});
+            auto near = [&](int x, int y) {
+                for (const auto& sp : specks)
+                    if (std::hypot(x - sp[0], y - sp[1]) <= sp[2] + 6) return true;
+                return false;
+            };
+            clip.effects.push_back(makeEffect(pd, "dirt_removal"));
+            for (int frame : {4, 5}) {
+                const Image dirtyFrame = renderSequenceFrame(pd, *pd.active(), frame, {});
+                clip.effects.back().enabled = false;
+                const Image was = renderSequenceFrame(pd, *pd.active(), frame, {});
+                clip.effects.back().enabled = true;
+                float worst = 0, elsewhere = 0;
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x)
+                        for (int k = 0; k < 3; ++k) {
+                            if (near(x, y)) worst = std::max(worst, std::fabs(dirtyFrame.at(x, y)[k] - truth.at(x, y)[k]));
+                            else elsewhere = std::max(elsewhere, std::fabs(dirtyFrame.at(x, y)[k] - was.at(x, y)[k]));
+                        }
+                QVERIFY2(worst < 0.06f, qPrintable(QString("frame %1: %2").arg(frame).arg(worst)));
+                QVERIFY2(elsewhere == 0, qPrintable(QString("frame %1: %2").arg(frame).arg(elsewhere)));
+            }
+            QVERIFY(std::fabs(before.at(220, 120)[0] - truth.at(220, 120)[0]) > 0.3f);
+        }
+
+        // Gate weave: footage moved up to 3 px either way a frame. Steady on Perforations, its reference taken from the
+        // first frame as the MCP tool takes it, holds every frame's perforations where the first frame's are.
+        {
+            const int W = 320, H = 240;
+            auto scene = [](double x, double y) {
+                if (x >= 40) return 0.3 + 0.2 * std::sin(x * 0.13) * std::cos(y * 0.09);
+                const double cy = 30 + 60 * std::floor(y / 60), qx = std::fabs(x - 16) - 4, qy = std::fabs(y - cy) - 7;
+                const double out = std::hypot(std::max(qx, 0.0), std::max(qy, 0.0)) + std::min(std::max(qx, qy), 0.0) - 3;
+                return out < 0 ? 1.0 : 0.45;
+            };
+            std::mt19937 rng(3);
+            std::uniform_real_distribution<double> weave(-3, 3);
+            std::vector<QImage> frames;
+            for (int f = 0; f < 8; ++f) {
+                const double dx = weave(rng), dy = weave(rng);
+                QImage img(W, H, QImage::Format_RGB32);
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        const int n = x < 44 ? 16 : 1;
+                        double v = 0;
+                        for (int sy = 0; sy < n; ++sy)
+                            for (int sx = 0; sx < n; ++sx) v += scene(x + (sx + 0.5) / n - dx, y + (sy + 0.5) / n - dy);
+                        const int g = std::clamp(int(std::lround(255 * v / (n * n))), 0, 255);
+                        img.setPixel(x, y, qRgb(g, g, g));
+                    }
+                frames.push_back(img);
+            }
+            const std::string file = path("weave.mp4");
+            writeFrames(file, frames, 25, 0);
+            Project p = makeDefaultProject();
+            Clip& clip = open(p, file, W, H);
+            Effect lock = makeEffect(p, "perf_lock");
+            std::string err;
+            QVERIFY2(takePerforationReference(p, *p.active(), clip, lock, 0, &err), err.c_str());
+            const std::vector<Point2> reference = perforationsFromString(lock.s("reference"), W, H);
+            QCOMPARE(int(reference.size()), 4);
+            clip.effects.push_back(lock);
+            double worst = 0;
+            for (int f = 0; f < 8; ++f) {
+                double ox = 0, oy = 0;
+                QVERIFY(perforationOffset(findPerforations(renderSequenceFrame(p, *p.active(), f, {}), PerfSettings()), reference, ox, oy));
+                worst = std::max({worst, std::fabs(ox), std::fabs(oy)});
+            }
+            QVERIFY2(worst < 0.15, qPrintable(QString::number(worst)));
+        }
+
+        // A colour negative scan that weaves: Steady on Perforations holds it even listed after Film Negative (both run on
+        // the source frame, the lock first), the base taken from a frame as the Inspector takes it, and the picture comes
+        // back positive and neutral with its dots in place on every frame.
+        {
+            const int W = 320, H = 240;
+            const Transfer curve = rec709Space().transfer;
+            NegativeSettings ns;
+            ns.base[0] = 0.85, ns.base[1] = 0.5, ns.base[2] = 0.3;
+            const std::vector<std::array<double, 2>> dots = {{100, 60}, {200, 150}, {260, 90}};
+            // The positive picture (0.7 with dark dots), the holes' cover of the rebate.
+            auto picture = [&](double x, double y) {
+                for (const auto& d : dots)
+                    if (std::hypot(x - d[0], y - d[1]) < 5) return 0.1;
+                return 0.7;
+            };
+            auto hole = [](double x, double y) {
+                const double cy = 30 + 60 * std::floor(y / 60), qx = std::fabs(x - 16) - 4, qy = std::fabs(y - cy) - 7;
+                return std::hypot(std::max(qx, 0.0), std::max(qy, 0.0)) + std::min(std::max(qx, qy), 0.0) - 3 < 0 ? 1.0 : 0.0;
+            };
+            std::mt19937 rng(5);
+            std::uniform_real_distribution<double> weave(-3, 3);
+            std::vector<QImage> frames;
+            for (int f = 0; f < 6; ++f) {
+                const double dx = f ? weave(rng) : 0, dy = f ? weave(rng) : 0;
+                Image positive(W, H), cover(W, H);
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        const int n = x < 44 ? 16 : 8;
+                        double v = 0, a = 0;
+                        for (int sy = 0; sy < n; ++sy)
+                            for (int sx = 0; sx < n; ++sx) {
+                                const double u = x + (sx + 0.5) / n - dx, w = y + (sy + 0.5) / n - dy;
+                                if (u >= 40) v += picture(u, w);
+                                else a += hole(u, w);
+                            }
+                        positive.at(x, y)[0] = positive.at(x, y)[1] = positive.at(x, y)[2] = float(v / (n * n));
+                        positive.at(x, y)[3] = 1;
+                        cover.at(x, y)[0] = float(a / (n * n));
+                    }
+                // (The rebate is unexposed film: its base, with the clear holes in it.)
+                Image scan = positive;
+                makeNegative(scan, ns, curve);
+                QImage img(W, H, QImage::Format_RGB32);
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        const float a = cover.at(x, y)[0];
+                        int c[3];
+                        for (int k = 0; k < 3; ++k) {
+                            const double film = x + 0.5 - dx < 40 ? ns.base[k] : scan.at(x, y)[k];
+                            c[k] = std::clamp(int(std::lround(255 * (a + (1 - a) * film))), 0, 255);
+                        }
+                        img.setPixel(x, y, qRgb(c[0], c[1], c[2]));
+                    }
+                frames.push_back(img);
+            }
+            const std::string file = path("negative-weave.mp4");
+            writeFrames(file, frames, 25, 0);
+            Project p = makeDefaultProject();
+            Clip& clip = open(p, file, W, H);
+            Effect negative = makeEffect(p, "film_negative"), lock = makeEffect(p, "perf_lock");
+            std::string err;
+            QVERIFY2(takeFilmBase(p, *p.active(), clip, negative, 0, &err), err.c_str());
+            for (int k = 0; k < 3; ++k)
+                QVERIFY2(std::fabs(negative.p(std::string("base_") + "rgb"[k], 0) - ns.base[k]) < 0.03,
+                         qPrintable(QString("%1 %2 %3").arg(negative.p("base_r", 0)).arg(negative.p("base_g", 0)).arg(negative.p("base_b", 0))));
+            QVERIFY2(takePerforationReference(p, *p.active(), clip, lock, 0, &err), err.c_str());
+            clip.effects.push_back(negative);
+            clip.effects.push_back(lock);
+            // Each dot's centre (the centroid of how much darker than the picture it is) on each frame.
+            double worst = 0;
+            std::vector<Point2> first;
+            for (int f = 0; f < 6; ++f) {
+                const Image img = renderSequenceFrame(p, *p.active(), f, {});
+                // (Within 0.05: a step of an 8-bit negative's dense blue is several of the print's.)
+                double grey[3] = {0, 0, 0};
+                for (int y = 190; y < 230; ++y)
+                    for (int x = 130; x < 170; ++x)
+                        for (int k = 0; k < 3; ++k) grey[k] += img.at(x, y)[k] / 1600.0;
+                QVERIFY2(std::fabs(grey[0] - 0.7) < 0.05 && std::fabs(grey[1] - grey[0]) < 0.05 && std::fabs(grey[2] - grey[0]) < 0.05,
+                         qPrintable(QString("%1 %2 %3").arg(grey[0]).arg(grey[1]).arg(grey[2])));
+                for (size_t d = 0; d < dots.size(); ++d) {
+                    double sw = 0, sx = 0, sy = 0;
+                    for (int y = int(dots[d][1]) - 9; y <= int(dots[d][1]) + 9; ++y)
+                        for (int x = int(dots[d][0]) - 9; x <= int(dots[d][0]) + 9; ++x) {
+                            const double w = std::max(0.0, 0.65 - double(img.at(x, y)[1]));
+                            sw += w, sx += w * x, sy += w * y;
+                        }
+                    QVERIFY(sw > 0);
+                    const Point2 c{sx / sw, sy / sw};
+                    if (f == 0) first.push_back(c);
+                    else worst = std::max({worst, std::fabs(c.x - first[d].x), std::fabs(c.y - first[d].y)});
+                }
+            }
+            QVERIFY2(worst < 0.25, qPrintable(QString::number(worst)));
+        }
+
+        // Faded footage (its green and blue faded, as dyes fade): Faded Colour Restore brings every channel back to
+        // within 3 % (a little more for 8-bit footage).
+        {
+            const int W = 256, H = 144;
+            std::vector<QImage> frames;
+            for (int f = 0; f < 6; ++f) {
+                QImage img(W, H, QImage::Format_RGB32);
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        const double r = double(x) / (W - 1), g = double(y) / (H - 1), b = 1 - r;
+                        img.setPixel(x, y, qRgb(int(std::lround(255 * r)), int(std::lround(255 * (0.12 + 0.7 * std::pow(g, 1.25)))),
+                                                int(std::lround(255 * (0.2 + 0.55 * std::pow(b, 0.8))))));
+                    }
+                frames.push_back(img);
+            }
+            const std::string file = path("faded.mp4");
+            writeFrames(file, frames, 25, 0);
+            Project p = makeDefaultProject();
+            Clip& clip = open(p, file, W, H);
+            clip.effects.push_back(makeEffect(p, "fade_restore"));
+            const Image img = renderSequenceFrame(p, *p.active(), 3, {});
+            float worst = 0;
+            for (int y = 2; y < H - 2; ++y)
+                for (int x = 2; x < W - 2; ++x) {
+                    const float want[3] = {float(x) / (W - 1), float(y) / (H - 1), 1 - float(x) / (W - 1)};
+                    for (int k = 0; k < 3; ++k) worst = std::max(worst, std::fabs(img.at(x, y)[k] - want[k]));
+                }
+            QVERIFY2(worst < 0.04f, qPrintable(QString::number(worst)));
+        }
     }
 
     void ltcTimecode() {

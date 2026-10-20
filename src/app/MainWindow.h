@@ -467,6 +467,8 @@ private:
     void detectScenes();
     void normalizeLoudness();
     void autoColor();
+    // Printer lights on the graded clip's Color Correct: `channel` (0 R, 1 G, 2 B, -1 all three) moved by `points`.
+    void printerLight(int channel, int points);
     // Asks which attributes (Paste Attributes / Remove Attributes); 0 if cancelled.
     unsigned askAttributes(const QString& title, bool removing);
     // The video clip a clip command acts on: the selected one under the playhead, else the

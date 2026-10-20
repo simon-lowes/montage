@@ -97,6 +97,7 @@
 #include "audio/DynLib.h"
 #include <random>
 #include "render/Restoration.h"
+#include "render/FilmScan.h"
 #include "render/LensBlur.h"
 #include "render/TransferTables.h"
 #include "media/DepthMap.h"
@@ -2561,6 +2562,304 @@ colorspaces:
         ScratchSettings wide;
         wide.maxWidth = 32;
         QVERIFY(detectScratches(Image(64, 64), wide) == std::vector<float>(64 * 64, 0.0f));
+    }
+
+    void filmScans() {
+        const ColorSpace& rec709 = rec709Space();
+        Project p = makeDefaultProject();
+
+        // A picture (a grey ramp and colours) as a colour negative's scan: an orange base, the rebate on the left
+        // unexposed with four clear perforations. Inverted from the base found in the rebate, it comes back within
+        // delta E 2 everywhere.
+        {
+            const int W = 240, H = 140, R = 20;
+            Image picture(W, H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const float u = x < R ? 0 : float(x - R) / float(W - R - 1);
+                    const int band = y * 4 / H;
+                    const float c[4][3] = {{u, u, u}, {u, 0.5f, 1 - u}, {0.8f, 0.2f + 0.6f * u, 0.3f}, {0.2f + 0.5f * u, 0.3f, 0.6f}};
+                    float* q = picture.at(x, y);
+                    for (int k = 0; k < 3; ++k) q[k] = x < R ? 0 : c[band][k];
+                    q[3] = 1;
+                }
+            NegativeSettings ns;
+            ns.base[0] = 0.85, ns.base[1] = 0.5, ns.base[2] = 0.3;
+            Image scan = picture;
+            makeNegative(scan, ns, rec709.transfer);
+            for (int k = 0; k < 4; ++k)
+                for (int y = 10 + 35 * k; y < 24 + 35 * k; ++y)
+                    for (int x = 5; x < 15; ++x) std::fill_n(scan.at(x, y), 4, 1.0f);
+            double base[3];
+            QVERIFY(filmBase(scan, ScanEncoding::Curve, rec709.transfer, base));
+            for (int k = 0; k < 3; ++k) QVERIFY2(std::fabs(base[k] - ns.base[k]) < 0.005, qPrintable(QString::number(base[k])));
+            auto worstDeltaE = [&](const Image& got) {
+                double worst = 0;
+                for (int y = 0; y < H; ++y)
+                    for (int x = R; x < W; ++x) {
+                        const float *a = got.at(x, y), *b = picture.at(x, y);
+                        worst = std::max(worst, deltaE76({a[0], a[1], a[2]}, {b[0], b[1], b[2]}));
+                    }
+                return worst;
+            };
+            Effect e = makeEffect(p, "film_negative");
+            Image back = scan;
+            applyFilmNegative(e, 0, back, rec709.transfer);
+            QVERIFY2(worstDeltaE(back) < 2, qPrintable(QString::number(worstDeltaE(back))));
+            // The base as set by hand is the one used: another base gives another picture, the right one this one.
+            e.params["base_from"].set(0, 1);
+            e.params["base_r"].set(0, 0.75), e.params["base_g"].set(0, 0.45), e.params["base_b"].set(0, 0.25);
+            back = scan;
+            applyFilmNegative(e, 0, back, rec709.transfer);
+            QVERIFY(worstDeltaE(back) > 5);
+            e.params["base_r"].set(0, 0.85), e.params["base_g"].set(0, 0.5), e.params["base_b"].set(0, 0.3);
+            back = scan;
+            applyFilmNegative(e, 0, back, rec709.transfer);
+            QVERIFY(worstDeltaE(back) < 2);
+            // Film more opaque than a scan holds (a speck, the scanner's black) stays a bright white, not a vast number
+            // that blurs would spread.
+            Image opaque(2, 2);
+            opaque.fill(0, 0, 0, 1);
+            applyFilmNegative(e, 0, opaque, rec709.transfer);
+            for (int k = 0; k < 3; ++k) QVERIFY2(std::isfinite(opaque.at(0, 0)[k]) && toLinear(rec709.transfer, opaque.at(0, 0)[k]) < 30, qPrintable(QString::number(opaque.at(0, 0)[k])));
+            // A clear-base black-and-white negative with no perforations in the frame: its base is its clearest film,
+            // neutral as it is.
+            NegativeSettings bw;
+            bw.base[0] = bw.base[1] = bw.base[2] = 0.8;
+            Image bwScan = picture;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    float* q = bwScan.at(x, y);
+                    q[0] = q[1] = q[2] = (q[0] + q[1] + q[2]) / 3;
+                }
+            makeNegative(bwScan, bw, rec709.transfer);
+            QVERIFY(filmBase(bwScan, ScanEncoding::Curve, rec709.transfer, base));
+            for (int k = 0; k < 3; ++k) QVERIFY2(std::fabs(base[k] - 0.8) < 0.005, qPrintable(QString::number(base[k])));
+            NegativeSettings cineon;
+            cineon.encoding = ScanEncoding::PrintingDensity;
+            cineon.base[0] = 0.1, cineon.base[1] = 0.25, cineon.base[2] = 0.4;  // (density codes: orange is least red density)
+            Image dpx = picture;
+            makeNegative(dpx, cineon, rec709.transfer);
+            QVERIFY(filmBase(dpx, ScanEncoding::PrintingDensity, rec709.transfer, base));
+            for (int k = 0; k < 3; ++k) QVERIFY2(std::fabs(base[k] - cineon.base[k]) < 0.005, qPrintable(QString::number(base[k])));
+            invertNegative(dpx, cineon, rec709.transfer);
+            QVERIFY(worstDeltaE(dpx) < 2);
+        }
+
+        // Printer lights: four points of red at the default step (0.025 log exposure) is a tenth of a decade more red
+        // light, the other channels as they were; the step is a setting.
+        {
+            Effect cc = makeEffect(p, "color_correct");
+            cc.params["printer_r"].set(0, 4);
+            Image img(4, 4);
+            img.fill(0.5f, 0.5f, 0.5f, 1);
+            {
+                const WorkingSpaceScope working(&rec709);
+                applyVideoEffect(cc, 0, img, 1.0);
+            }
+            const double want = fromLinear(rec709.transfer, toLinear(rec709.transfer, 0.5) * std::pow(10.0, 0.1));
+            QVERIFY2(std::fabs(img.at(1, 1)[0] - want) < 1e-4, qPrintable(QString::number(img.at(1, 1)[0])));
+            QVERIFY(std::fabs(img.at(1, 1)[1] - 0.5f) < 1e-5 && std::fabs(img.at(1, 1)[2] - 0.5f) < 1e-5);
+            cc.params["printer_point"].set(0, 0.05);
+            cc.params["printer_r"].set(0, -2);
+            img.fill(0.5f, 0.5f, 0.5f, 1);
+            applyVideoEffect(cc, 0, img, 1.0);
+            QVERIFY(std::fabs(img.at(1, 1)[0] - fromLinear(rec709.transfer, toLinear(rec709.transfer, 0.5) / std::pow(10.0, 0.1))) < 1e-4);
+            std::vector<gpu::ColorOp> ops;
+            QVERIFY(!gpuColorOps(cc, 0, ops, 4, 4, 1.0));  // (on the CPU, which decodes the light)
+        }
+
+        // Fading: a picture whose channels share their levels, its green and blue faded (raised, flattened and bent);
+        // restored to within 3 % in every channel.
+        {
+            const int W = 200, H = 120;
+            Image original(W, H), faded(W, H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const float r = float(x) / (W - 1), g = float(y) / (H - 1), b = 1 - r;
+                    float* o = original.at(x, y);
+                    o[0] = r, o[1] = g, o[2] = b, o[3] = 1;
+                    float* f = faded.at(x, y);
+                    f[0] = r, f[1] = float(0.12 + 0.7 * std::pow(g, 1.25)), f[2] = float(0.2 + 0.55 * std::pow(b, 0.8)), f[3] = 1;
+                }
+            restoreFade(faded, fadeLevels(faded), 1.0);
+            float worst = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    for (int k = 0; k < 3; ++k) worst = std::max(worst, std::fabs(faded.at(x, y)[k] - original.at(x, y)[k]));
+            QVERIFY2(worst < 0.03f, qPrintable(QString::number(worst)));
+            // A shot's levels are its frames' mean.
+            FadeLevels a, b;
+            a.lo[1] = 0.1f, b.lo[1] = 0.3f;
+            QCOMPARE(meanFadeLevels({a, b}).lo[1], 0.2f);
+        }
+
+        // Gate weave: frames moved up to 3 px either way, the perforations (rounded holes in the rebate) found in each
+        // to a tenth of a pixel; held still on them, every frame's holes are where the first frame's are.
+        {
+            const int W = 320, H = 240;
+            auto scene = [](double x, double y) {
+                if (x >= 40) return 0.3 + 0.2 * std::sin(x * 0.13) * std::cos(y * 0.09);
+                // (Holes 14 x 20 with rounded corners every 60 rows, centred 16 across.)
+                const double cy = 30 + 60 * std::floor((y + 0.0) / 60), qx = std::fabs(x - 16) - 4, qy = std::fabs(y - cy) - 7;
+                const double out = std::hypot(std::max(qx, 0.0), std::max(qy, 0.0)) + std::min(std::max(qx, qy), 0.0) - 3;
+                return out < 0 ? 1.0 : 0.45;
+            };
+            std::mt19937 rng(5);
+            std::uniform_real_distribution<double> weave(-3, 3);
+            auto frame = [&](double dx, double dy) {
+                Image f(W, H);
+                std::normal_distribution<float> noise(0, 0.003f);
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        // (Each pixel's cover of the holes, 32 x 32 samples: fewer would move the edges.)
+                        const int n = x < 44 ? 32 : 1;
+                        double v = 0;
+                        for (int sy = 0; sy < n; ++sy)
+                            for (int sx = 0; sx < n; ++sx) v += scene(x + (sx + 0.5) / n - dx, y + (sy + 0.5) / n - dy);
+                        float* q = f.at(x, y);
+                        q[0] = q[1] = q[2] = float(v / (n * n)) + noise(rng), q[3] = 1;
+                    }
+                return f;
+            };
+            const double d0x = weave(rng), d0y = weave(rng);
+            const Image first = frame(d0x, d0y);
+            PerfSettings ps;
+            const std::vector<Point2> reference = findPerforations(first, ps);
+            QCOMPARE(int(reference.size()), 4);
+            Effect lock = makeEffect(p, "perf_lock");
+            lock.strings["reference"] = perforationsToString(reference, W, H);
+            QCOMPARE(int(perforationsFromString(lock.strings["reference"], W, H).size()), 4);
+            double worstFound = 0, worstHeld = 0;
+            for (int n = 0; n < 6; ++n) {
+                const double dx = weave(rng), dy = weave(rng);
+                Image f = frame(dx, dy);
+                double ox = 0, oy = 0;
+                QVERIFY(perforationOffset(findPerforations(f, ps), reference, ox, oy));
+                worstFound = std::max({worstFound, std::fabs(ox - (dx - d0x)), std::fabs(oy - (dy - d0y))});
+                applyPerfLock(lock, 0, f);
+                QVERIFY(perforationOffset(findPerforations(f, ps), reference, ox, oy));
+                worstHeld = std::max({worstHeld, std::fabs(ox), std::fabs(oy)});
+            }
+            QVERIFY2(worstFound < 0.1, qPrintable(QString::number(worstFound)));
+            QVERIFY2(worstHeld < 0.1, qPrintable(QString::number(worstHeld)));
+            // No reference: the frame as it was; nothing in a plain rebate.
+            Image f = frame(1, 1), same = f;
+            applyPerfLock(makeEffect(p, "perf_lock"), 0, same);
+            QVERIFY(same.px == f.px);
+            Image flat(W, H);
+            flat.fill(0.4f, 0.4f, 0.4f, 1);
+            QVERIFY(findPerforations(flat, ps).empty());
+        }
+
+        // Scratches that slant (a third of a pixel a row) and wander (a sine either way), dark and light, found row by
+        // row and filled, everything away from them unchanged; a bar, an edge and a thin line at 31 degrees (a wire) are
+        // not scratches.
+        {
+            const int W = 220, H = 160;
+            auto tex = [](int x, int y) { return float(0.4 + 0.06 * std::sin(x * 0.21) * std::cos(y * 0.17)); };
+            Image clean(W, H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const float v = tex(x, y) + (x >= 200 ? 0.2f : 0) - (x >= 180 && x < 192 ? 0.3f : 0) - (std::fabs(x - 142 - 0.6 * y) <= 1 && y < 60 ? 0.25f : 0);
+                    float* q = clean.at(x, y);
+                    q[0] = q[1] = q[2] = v, q[3] = 1;
+                }
+            Image dirty = clean;
+            auto slant = [](int y) { return 40 + y / 3; };
+            auto wander = [](int y) { return int(std::lround(130 + 8 * std::sin(y / 25.0))); };
+            for (int y = 0; y < H; ++y)
+                for (int k = 0; k < 2; ++k) {
+                    for (int c = 0; c < 3; ++c) dirty.at(slant(y) + k, y)[c] -= 0.25f;
+                    for (int c = 0; c < 3; ++c) dirty.at(wander(y) + k, y)[c] += 0.25f;
+                }
+            ScratchSettings ss;
+            ss.follow = true;
+            int count = 0;
+            QVERIFY(detectScratches(clean, ss, &count) == std::vector<float>(size_t(W) * H, 0.0f));
+            QCOMPARE(count, 0);
+            const std::vector<float> m = detectScratches(dirty, ss, &count);
+            QVERIFY2(count >= 2, qPrintable(QString::number(count)));
+            Image fixed = dirty;
+            fillAcross(fixed, m);
+            float worst = 0, elsewhere = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const bool near = std::abs(x - slant(y)) <= 4 || std::abs(x - wander(y)) <= 4;
+                    const float e = std::fabs(fixed.at(x, y)[0] - clean.at(x, y)[0]);
+                    if (near) worst = std::max(worst, e);
+                    else elsewhere = std::max(elsewhere, std::fabs(fixed.at(x, y)[0] - dirty.at(x, y)[0]));
+                }
+            QVERIFY2(worst < 0.03f, qPrintable(QString::number(worst)));
+            QVERIFY2(elsewhere == 0, qPrintable(QString::number(elsewhere)));
+            // Without following, the slanting ones are left (they stand out from no column for long).
+            ss.follow = false;
+            const std::vector<float> straight = detectScratches(dirty, ss);
+            QVERIFY(straight[size_t(80) * W + slant(80)] == 0);
+        }
+
+        // Dirt that lasts two frames on a still shot: the neighbouring frame has it too, so it does not stand out from
+        // both neighbours; against the frames two away it does, and is filled from them. Dirt on one frame alone is not
+        // taken for it, nor is something on three frames (this one and both neighbours).
+        {
+            auto tex = [](double x, double y) {
+                return 0.45 + 0.15 * std::sin(x * 0.21) * std::cos(y * 0.17) + 0.1 * std::sin((x + 2 * y) * 0.07);
+            };
+            const int W = 160, H = 96;
+            auto frame = [&](int k) {
+                Image f(W, H);
+                std::mt19937 rng(unsigned(k + 11));
+                std::normal_distribution<float> noise(0, 0.004f);
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        const float v = float(tex(x, y));
+                        float* q = f.at(x, y);
+                        q[0] = v + noise(rng), q[1] = v * 0.9f + noise(rng), q[2] = v * 0.8f + noise(rng), q[3] = 1;
+                    }
+                return f;
+            };
+            const Image prev2 = frame(-2), prev = frame(-1), clean = frame(0), next2 = frame(2);
+            Image next = frame(1), dirty = clean;
+            const std::vector<std::array<int, 2>> specks = {{30, 30}, {90, 60}, {130, 20}};
+            for (const auto& sp : specks)
+                for (int y = sp[1] - 2; y <= sp[1] + 2; ++y)
+                    for (int x = sp[0] - 2; x <= sp[0] + 2; ++x)
+                        for (int k = 0; k < 3; ++k) dirty.at(x, y)[k] -= 0.3f, next.at(x, y)[k] -= 0.3f;
+            const MotionFn still = [](double, double) { return Point2{0, 0}; };
+            const MotionFn &toPrev = still, &toNext = still, &toPrev2 = still, &toNext2 = still;
+            DirtSettings ds;
+            int count = -1;
+            detectDirt(dirty, prev, next, toPrev, toNext, ds, &count);
+            QCOMPARE(count, 0);  // (not standing out from both neighbours)
+            const std::vector<float> lasting = detectLastingDirt(dirty, prev, next, prev2, next2, toPrev, toNext, toPrev2, toNext2, ds, &count);
+            QCOMPARE(count, int(specks.size()));
+            Image fixed = dirty;
+            fillFromNeighbours(fixed, lasting, prev2, next2, toPrev2, toNext2);
+            float worst = 0, elsewhere = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    bool near = false;
+                    for (const auto& sp : specks) near = near || (std::abs(x - sp[0]) <= 6 && std::abs(y - sp[1]) <= 6);
+                    for (int k = 0; k < 3; ++k) {
+                        if (near) worst = std::max(worst, std::fabs(fixed.at(x, y)[k] - clean.at(x, y)[k]));
+                        else elsewhere = std::max(elsewhere, std::fabs(fixed.at(x, y)[k] - dirty.at(x, y)[k]));
+                    }
+                }
+            QVERIFY2(worst < 0.03f, qPrintable(QString::number(worst)));
+            QVERIFY2(elsewhere == 0, qPrintable(QString::number(elsewhere)));
+            // A speck on this frame alone (its neighbours clean) is not lasting dirt.
+            Image once = clean;
+            for (int y = 48; y <= 52; ++y)
+                for (int x = 60; x <= 64; ++x) once.at(x, y)[0] -= 0.3f, once.at(x, y)[1] -= 0.3f, once.at(x, y)[2] -= 0.3f;
+            detectLastingDirt(once, prev, frame(1), prev2, next2, toPrev, toNext, toPrev2, toNext2, ds, &count);
+            QCOMPARE(count, 0);
+            Image before = prev, after = frame(1);
+            for (Image* f : {&before, &after})
+                for (int y = 48; y <= 52; ++y)
+                    for (int x = 60; x <= 64; ++x) f->at(x, y)[0] -= 0.3f, f->at(x, y)[1] -= 0.3f, f->at(x, y)[2] -= 0.3f;
+            detectLastingDirt(once, before, after, prev2, next2, toPrev, toNext, toPrev2, toNext2, ds, &count);
+            QCOMPARE(count, 0);
+        }
     }
 
     void effectMasks() {

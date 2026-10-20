@@ -111,6 +111,11 @@ Image colourReferenceFrame(const Project& p, const Sequence& s, FrameTime t);
 // Color Correct put first in its effects, replacing an earlier match. Returns
 // how many clips were matched.
 int matchClipColour(Project& p, Sequence& s, const std::vector<Id>& clips, const Image& reference, FrameTime at);
+// Film scans, read from the clip's own picture at `at` (or its first frame): Steady on Perforations' reference (where
+// the perforations are), and Film Negative's base (set by hand from the frame's rebate). False with `error` when the
+// frame has none.
+bool takePerforationReference(const Project& p, const Sequence& s, const Clip& c, Effect& e, FrameTime at, std::string* error = nullptr);
+bool takeFilmBase(const Project& p, const Sequence& s, const Clip& c, Effect& e, FrameTime at, std::string* error = nullptr);
 // Keys a green or blue screen out of a clip: its Keyer (added first if it has none) set to the screen's colour, read
 // from the clip's picture at `at` (or its middle). False with `error` if no screen colour stands out.
 bool keyScreen(Project& p, Sequence& s, Id clip, FrameTime at, std::string* error = nullptr);

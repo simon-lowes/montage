@@ -25,6 +25,8 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <locale>
+#include <sstream>
 #include <thread>
 #include <tuple>
 
@@ -34,6 +36,7 @@
 #include "GpuCompositor.h"
 #include "Processing.h"
 #include "Restoration.h"
+#include "FilmScan.h"
 #include "Retime.h"
 #include "Shapes.h"
 #include "Title3D.h"
@@ -934,14 +937,19 @@ struct ClipSource {
     ofx::FrameFetch ofxFetch;   // the clip's source at other clip frames, for OpenFX plugins that ask (render/Ofx.h)
 };
 
+// Effects clipSource runs on the source frame before a camera look made on it can run.
+bool ranOnSourceFirst(const std::string& type) {
+    static const std::set<std::string> types = {"video_denoise", "super_scale", "motion_deblur", "reframe_360", "redact_faces",
+                                                "stereo_3d",     "dirt_removal", "dust_spots",   "lip_sync",    "motion_blur",
+                                                "deflicker",     "fade_restore", "film_negative", "perf_lock"};
+    return types.count(type) > 0;
+}
+
 // Whether any of the clip's looks run on the camera's picture before the input transform (as clipSource runs them).
 bool sourceStageLooks(const Clip& c, FrameTime lt, const ColorSpace& from, const MediaItem& m) {
     if (from.sceneReferred)
         for (const Effect& e : c.effects) {
-            if (!e.enabled || e.type == "video_denoise" || e.type == "super_scale" || e.type == "motion_deblur" ||
-                e.type == "reframe_360" || e.type == "redact_faces" || e.type == "stereo_3d" || e.type == "dirt_removal" ||
-                e.type == "dust_spots" || e.type == "lip_sync")
-                continue;
+            if (!e.enabled || ranOnSourceFirst(e.type)) continue;
             if (e.node != 0 || hasMask(e, lt)) break;
             if (e.type == "aces_gamut_compress" || sourceLookSpace(e)) return true;
             break;
@@ -1112,6 +1120,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 const ColorSpace& from = pictureColorSpace(*m, path);
                 if (!ofxFetch && !(sampling > 0 && m->kind == MediaKind::Video) && !denoiseEffect(seq, c) &&
                     !enabledEffect(seq, c, "motion_deblur") && !enabledEffect(seq, c, "motion_blur") && !enabledEffect(seq, c, "deflicker") &&
+                    !enabledEffect(seq, c, "fade_restore") && !enabledEffect(seq, c, "film_negative") && !enabledEffect(seq, c, "perf_lock") &&
                     !enabledEffect(seq, c, "dirt_removal") && !enabledEffect(seq, c, "dust_spots") && !enabledEffect(seq, c, "lip_sync") &&
                     !upscale && !vr && !sourceStageLooks(c, lt, from, *m)) {
                     out.frame = f;
@@ -1143,6 +1152,8 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     }
                 }
             }
+            // Steady on Perforations (render/FilmScan.h) first, so the frame is held still before anything else sees it.
+            if (const Effect* pl = enabledEffect(seq, c, "perf_lock")) applyPerfLock(*pl, lt, src);
             // Dirt Removal and Dust Spot Removal (render/Restoration.h), each one on the clip in its order, from the source
             // frames either side followed along the motion; before noise reduction, which would spread a speck into its
             // neighbours. Whole source frames only: an in-between of slow motion is left as it is made.
@@ -1159,9 +1170,9 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             std::erase_if(restore, [lt](const Effect* e) { return e->type == "dust_spots" && !hasDustSpotAt(e->s("spots"), lt); });
             if (!restore.empty()) {
                 const double ps = effectPixelScale(c, lt, g.sx, mw, src.width);
-                Image prev, next;
-                bool hp = false, hn = false;
-                std::vector<MotionFn> motion(2);
+                Image prev, next, prev2, next2;
+                bool hp = false, hn = false, hp2 = false, hn2 = false;
+                std::vector<MotionFn> motion(4);
                 if (m->kind == MediaKind::Video && m->fps.valid()) {
                     const double mf = m->fps.toDouble();
                     const int64_t base = int64_t(std::floor(sec * mf + 1e-6));
@@ -1174,21 +1185,32 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     };
                     hp = fetch(base - 1, prev);
                     hn = fetch(base + 1, next);
+                    // (Dirt Removal looks two frames away too, for dirt that lasts two frames.)
+                    const bool two = std::any_of(restore.begin(), restore.end(), [](const Effect* e) { return e->type == "dirt_removal"; });
+                    if (two && hp && hn) hp2 = fetch(base - 2, prev2), hn2 = fetch(base + 2, next2);
                     const Image& self = src;
-                    motion = chainedMotion(path + '@' + std::to_string(w) + 'x' + std::to_string(h), base, {-1, 1},
+                    motion = chainedMotion(path + '@' + std::to_string(w) + 'x' + std::to_string(h), base,
+                                           hp2 && hn2 ? std::vector<int>{-1, 1, -2, 2} : std::vector<int>{-1, 1},
                                            [&](int64_t i) -> const Image* {
                                                if (i == base) return &self;
                                                if (i == base - 1) return hp ? &prev : nullptr;
                                                if (i == base + 1) return hn ? &next : nullptr;
+                                               if (i == base - 2) return hp2 ? &prev2 : nullptr;
+                                               if (i == base + 2) return hn2 ? &next2 : nullptr;
                                                return nullptr;
                                            });
+                    motion.resize(4);
                     if (!hp) motion[0] = nullptr;
                     if (!hn) motion[1] = nullptr;
                 }
                 const double at = m->kind == MediaKind::Video ? sec : -1;
+                const bool two = hp2 && hn2 && motion[2] && motion[3];
                 for (const Effect* e : restore)
-                    (e->type == "dirt_removal" ? applyDirtRemoval : applyDustSpots)(*e, lt, src, hp ? &prev : nullptr, hn ? &next : nullptr,
-                                                                                    motion[0], motion[1], ps, at);
+                    if (e->type == "dirt_removal")
+                        applyDirtRemoval(*e, lt, src, hp ? &prev : nullptr, hn ? &next : nullptr, motion[0], motion[1], ps, at,
+                                         two ? &prev2 : nullptr, two ? &next2 : nullptr, motion[2], motion[3]);
+                    else
+                        applyDustSpots(*e, lt, src, hp ? &prev : nullptr, hn ? &next : nullptr, motion[0], motion[1], ps, at);
             }
             // Noise reduction, on the source frames with the frames either side (Resolve's temporal NR).
             if (const Effect* nr = denoiseEffect(seq, c)) {
@@ -1281,6 +1303,53 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     deflicker(src, tileStats(src, gw, gh), 1.0, around, weights, flicker->p("strength", lt, 100) / 100);
                 }
             }
+            // Film Negative (render/FilmScan.h), in the picture's own curve, then Faded Colour Restore, which measures the
+            // print: each channel's levels over the shot's frames either side (each kept as nine numbers), so the
+            // restoration holds steady through the shot.
+            const Effect* negative = enabledEffect(seq, c, "film_negative");
+            const Transfer ownCurve = pictureColorSpace(*m, path).transfer;
+            if (negative) applyFilmNegative(*negative, lt, src, ownCurve);
+            if (const Effect* fade = enabledEffect(seq, c, "fade_restore")) {
+                std::vector<FadeLevels> levels = {fadeLevels(src)};
+                const int r = std::clamp(int(std::lround(fade->p("frames", lt, 12))), 0, 24);
+                if (m->kind == MediaKind::Video && m->fps.valid() && r > 0) {
+                    const double mf = m->fps.toDouble(), sf = seq.fpsValue();
+                    const int64_t base = int64_t(std::floor(sec * mf + 1e-6));
+                    // (Within the clip: a reel scanned as one file and cut into shots keeps each shot's own levels.)
+                    const double a0 = c.sourceFrameAt(c.start) / sf * mf, a1 = c.sourceFrameAt(c.start + std::max<FrameTime>(0, c.duration - 1)) / sf * mf;
+                    const int64_t first = int64_t(std::floor(std::min(a0, a1) + 1e-6)), last = int64_t(std::floor(std::max(a0, a1) + 1e-6));
+                    // Measured small (the levels need no more), as the frame is made: through the negative, if any.
+                    const int sw = std::min(w, 480), sh = std::max(1, int(std::lround(double(h) * sw / std::max(1, w))));
+                    std::ostringstream id;
+                    id.imbue(std::locale::classic());
+                    id << path << '@' << sw << 'x' << sh << "#fade";
+                    if (negative)
+                        for (const char* k : {"scan", "base_from", "base_r", "base_g", "base_b", "gamma", "exposure"}) id << ':' << negative->p(k, lt);
+                    const std::string key = id.str();
+                    for (int k = -r; k <= r; ++k) {
+                        const int64_t i = base + k;
+                        if (k == 0 || i < first || i > last) continue;
+                        TileStats st;
+                        if (!cachedTileStats(key + '#' + std::to_string(i), st, [&](TileStats& made) {
+                                const double at = (double(i) + 0.25) / mf;
+                                if (at < 0 || at >= m->duration) return false;
+                                Frame16Ptr nf = MediaPool::instance().videoFrame(path, at, sw, sh, false);
+                                if (!nf) return false;
+                                Image f = toImage(*nf);
+                                if (negative) applyFilmNegative(*negative, lt, f, ownCurve);
+                                const FadeLevels l = fadeLevels(f);
+                                for (int c3 = 0; c3 < 3; ++c3) made.mean.insert(made.mean.end(), {l.lo[c3], l.mid[c3], l.hi[c3]});
+                                return true;
+                            }) ||
+                            st.mean.size() != 9)
+                            continue;
+                        FadeLevels f;
+                        for (int c3 = 0; c3 < 3; ++c3) f.lo[c3] = st.mean[size_t(c3) * 3], f.mid[c3] = st.mean[size_t(c3) * 3 + 1], f.hi[c3] = st.mean[size_t(c3) * 3 + 2];
+                        levels.push_back(f);
+                    }
+                }
+                restoreFade(src, meanFadeLevels(levels), fade->p("strength", lt, 100) / 100);
+            }
             if (upscale) {
                 Image big;
                 src = cachedSuperScale(src, outW, outH, ss->p("strength", lt, 100) / 100, big) ? std::move(big)
@@ -1296,10 +1365,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             // the input transform's display rendering, as an AMF's pipeline runs them.
             if (from.sceneReferred)
                 for (const Effect& e : c.effects) {
-                    if (!e.enabled || e.type == "video_denoise" || e.type == "super_scale" || e.type == "motion_deblur" ||
-                        e.type == "reframe_360" || e.type == "redact_faces" || e.type == "stereo_3d" || e.type == "dirt_removal" ||
-                        e.type == "dust_spots" || e.type == "lip_sync")
-                        continue;  // (off, or run at the source already)
+                    if (!e.enabled || ranOnSourceFirst(e.type)) continue;  // (off, or run at the source already)
                     if (e.node != 0 || hasMask(e, lt)) break;
                     if (e.type == "aces_gamut_compress" && !sourceRgc) {
                         applyAcesGamutCompress(e, lt, from, src);
@@ -2408,6 +2474,59 @@ Image colourReferenceFrame(const Project& p, const Sequence& s, FrameTime t) {
     o.scale = std::min(1.0, 480.0 / std::max(1, s.width));
     o.displaySpace = "rec709";  // as renderMediaFrame gives the clips' own frames
     return renderProgramFrame(p, s, std::clamp<FrameTime>(t, 0, std::max<FrameTime>(0, s.duration() - 1)), o);
+}
+
+namespace {
+
+// A clip's source frame at `at` (its first frame when `at` is outside it) as the film-scan effects get it: decoded, in
+// the picture's own curve (`transfer`), its own size up to 2048 on the longer side; empty for a clip with none.
+Image clipPictureAt(const Project& p, const Sequence& s, const Clip& c, FrameTime at, Transfer* transfer = nullptr) {
+    const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
+    if (!m || (m->kind != MediaKind::Video && m->kind != MediaKind::Image) || (!m->hasVideo && m->kind != MediaKind::Image)) return {};
+    // (The file clipSource reads when not viewing proxies: its layer, an SDR sequence's gain-map JPEG as SDR.)
+    std::string path = pictureSource(*m, false, true);
+    if (!c.layer.empty() && (path != m->proxyPath || fileOnline(m->path))) path = layerPath(m->path, c.layer);
+    if (m->gainMap && path == m->path && m->colorOverride.empty() && !sequenceColorSpace(s).hdr()) path = gainMapPath(path, false);
+    const FrameTime t = c.contains(at) ? at : c.start;
+    const double sec = m->kind == MediaKind::Video ? std::max(0.0, c.sourceFrameAt(t) / s.fpsValue()) : 0.0;
+    const double mw = m->width > 0 ? m->width : s.width, mh = m->height > 0 ? m->height : s.height;
+    const double k = std::min(1.0, 2048 / std::max(mw, mh));
+    Frame16Ptr f = MediaPool::instance().videoFrame(path, sec, std::max(1, int(std::lround(mw * k))), std::max(1, int(std::lround(mh * k))), true);
+    if (!f) return {};
+    if (transfer) *transfer = pictureColorSpace(*m, path).transfer;
+    return toImage(*f);
+}
+
+}  // namespace
+
+bool takePerforationReference(const Project& p, const Sequence& s, const Clip& c, Effect& e, FrameTime at, std::string* error) {
+    const Image img = clipPictureAt(p, s, c, at);
+    PerfSettings ps;
+    ps.side = e.p("side", 0) > 0.5 ? 1 : 0;
+    ps.rebate = e.p("rebate", 0, 12) / 100;
+    const std::vector<Point2> perfs = findPerforations(img, ps);
+    if (perfs.empty()) {
+        if (error) *error = img.empty() ? "The clip has no picture" : "No perforations found in the rebate (check its side and width)";
+        return false;
+    }
+    e.strings["reference"] = perforationsToString(perfs, img.width, img.height);
+    return true;
+}
+
+bool takeFilmBase(const Project& p, const Sequence& s, const Clip& c, Effect& e, FrameTime at, std::string* error) {
+    Transfer transfer = Transfer::Srgb;
+    const Image img = clipPictureAt(p, s, c, at, &transfer);
+    double base[3];
+    const ScanEncoding encoding = ScanEncoding(std::clamp(int(std::lround(e.p("scan", 0))), 0, 2));
+    if (!filmBase(img, encoding, transfer, base)) {
+        if (error) *error = img.empty() ? "The clip has no picture" : "No film base found in the frame";
+        return false;
+    }
+    e.params["base_from"] = Param(1);
+    e.params["base_r"] = Param(base[0]);
+    e.params["base_g"] = Param(base[1]);
+    e.params["base_b"] = Param(base[2]);
+    return true;
 }
 
 bool keyScreen(Project& p, Sequence& s, Id clip, FrameTime at, std::string* error) {
