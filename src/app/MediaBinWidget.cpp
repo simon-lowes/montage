@@ -79,6 +79,8 @@
 #include "core/AutoTag.h"
 #include "media/Analysis.h"
 #include "media/VisualSearch.h"
+#include "render/FootageWords.h"
+#include "WorkProgress.h"
 #include "render/ColorSpace.h"
 
 namespace montage {
@@ -903,6 +905,44 @@ bool MediaBinWidget::editSmartBinDialog(Id id) {
     return updateSmartBin(dlg.bin());
 }
 
+int MediaBinWidget::describeShots(const std::vector<Id>& ids) {
+    if (!describeAvailable() || ids.empty()) return 0;
+    if (!ensureModelPack(window(), describeModel(), tr("Describe Shots"),
+                         tr("Describing shots puts what each one shows into words with Florence-2 (Microsoft, MIT licence), "
+                            "which runs on this computer.")))
+        return 0;
+    std::vector<MediaItem> items;
+    for (Id id : ids)
+        if (const MediaItem* m = state_->project().findMedia(id)) items.push_back(*m);
+    struct Outcome {
+        std::vector<std::pair<Id, std::vector<ShotDescription>>> shots;
+        std::string error;
+    };
+    const Outcome o = withProgress<Outcome>(window(), tr("Describing shots…"), [items](const auto& progress) {
+        Outcome out;
+        std::atomic<bool> stop{false};
+        for (size_t i = 0; i < items.size() && !stop; ++i) {
+            const double n = double(items.size());
+            std::string err;
+            auto shots = montage::describeShots(items[i], {}, [&](double f) {
+                stop = !progress((double(i) + f) / n, QString::fromStdString(items[i].name)); }, &stop, &err);
+            if (!shots.empty()) out.shots.emplace_back(items[i].id, std::move(shots));
+            else if (!stop && out.error.empty()) out.error = items[i].name + ": " + err;
+        }
+        return out;
+    });
+    if (!o.shots.empty())
+        state_->edit(tr("Describe Shots"), [&](Project& p, Sequence&) {
+            for (const auto& [id, shots] : o.shots)
+                if (MediaItem* m = p.findMedia(id)) setShotDescriptions(*m, shots);
+            return true;
+        });
+    if (!o.error.empty()) state_->message(QString::fromStdString(o.error), 8000);
+    else if (!o.shots.empty())
+        state_->message(tr("Described the shots of %n item(s): Find What's Said searches them", "", int(o.shots.size())), 6000);
+    return int(o.shots.size());
+}
+
 int MediaBinWidget::autoTag(const std::vector<Id>& ids) {
     if (!visualSearchAvailable()) return 0;
     if (!ensureModelPack(window(), visualModel(), tr("Auto-Tag"),
@@ -1337,6 +1377,16 @@ void MediaBinWidget::showContextMenu(QAbstractItemView* view, const QPoint& pos)
         if (!taggable.empty() && visualSearchAvailable())
             menu.addAction(tr("Auto-Tag Shots"), this, [this, taggable] { autoTag(taggable); })
                 ->setToolTip(tr("Add keywords for what each shot shows: close-up, medium or wide, interior or exterior, day or night, people"));
+        std::vector<Id> describable;
+        for (Id id : ids)
+            if (const MediaItem* m = state_->project().findMedia(id);
+                m && !m->subclipOf && m->hasVideo && (m->kind == MediaKind::Video || m->kind == MediaKind::Image))
+                describable.push_back(id);
+        if (!describable.empty() && describeAvailable()) {
+            QAction* a = menu.addAction(tr("Describe Shots"), this, [this, describable] { describeShots(describable); });
+            a->setObjectName(QStringLiteral("describeShots"));
+            a->setToolTip(tr("Put what each shot shows into words, on this computer: for logging, and for Find What's Said"));
+        }
         std::vector<std::string> present;
         for (Id id : ids)
             if (const MediaItem* m = state_->project().findMedia(id)) montage::addKeywords(present, m->keywords);

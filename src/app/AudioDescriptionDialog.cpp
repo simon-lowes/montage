@@ -16,11 +16,15 @@
 #include <map>
 
 #include "EditorState.h"
+#include "ModelPacks.h"
 #include "Settings.h"
+#include "WorkProgress.h"
 #include "SpeechDialog.h"
 #include "core/EditOps.h"
 #include "core/History.h"
+#include "render/FootageWords.h"
 #include "media/AutoDuck.h"
+#include "media/LanguageModel.h"
 #include "media/TextToSpeech.h"
 
 namespace montage {
@@ -62,6 +66,15 @@ AudioDescriptionDialog::AudioDescriptionDialog(EditorState* state, QWidget* pare
     findButton->setObjectName(QStringLiteral("adFindGaps"));
     auto* addButton = new QPushButton(tr("Add at Playhead"), this);
     addButton->setObjectName(QStringLiteral("adAdd"));
+    auto* draftButton = new QPushButton(tr("Draft From the Pictures"), this);
+    draftButton->setObjectName(QStringLiteral("adDraft"));
+    draftButton->setToolTip(tr("Write a first draft in each empty gap from what the picture shows, on this computer"));
+    useModel_ = new QCheckBox(tr("Write with the language model"), this);
+    useModel_->setObjectName(QStringLiteral("adUseModel"));
+    useModel_->setToolTip(tr("Have the language model word each draft as a describer would; otherwise a brief caption of the picture"));
+    useModel_->setChecked(languageModelAvailable() && saved.value(QStringLiteral("ad/useModel"), true).toBool());
+    useModel_->setEnabled(languageModelAvailable());
+    draftButton->setEnabled(describeAvailable());
     find->addWidget(new QLabel(tr("Gaps of at least"), this));
     find->addWidget(minGap_);
     find->addSpacing(12);
@@ -71,6 +84,11 @@ AudioDescriptionDialog::AudioDescriptionDialog(EditorState* state, QWidget* pare
     find->addWidget(findButton);
     find->addWidget(addButton);
     root->addLayout(find);
+    auto* drafting = new QHBoxLayout;
+    drafting->addWidget(draftButton);
+    drafting->addWidget(useModel_);
+    drafting->addStretch(1);
+    root->addLayout(drafting);
 
     table_ = new QTableWidget(0, ColCount, this);
     table_->setObjectName(QStringLiteral("adTable"));
@@ -116,6 +134,11 @@ AudioDescriptionDialog::AudioDescriptionDialog(EditorState* state, QWidget* pare
         if (findGaps(&err) < 0) status_->setText(err);
     });
     connect(addButton, &QPushButton::clicked, this, &AudioDescriptionDialog::addAtPlayhead);
+    connect(draftButton, &QPushButton::clicked, this, [this] {
+        QString err;
+        if (draft(&err) < 0 && !err.isEmpty()) status_->setText(err);
+    });
+    connect(useModel_, &QCheckBox::toggled, this, [](bool on) { appSettings().setValue(QStringLiteral("ad/useModel"), on); });
     connect(voiceButton, &QPushButton::clicked, this, [this] {
         QString err;
         if (voice(&err) <= 0 && !err.isEmpty()) status_->setText(err);
@@ -254,6 +277,66 @@ void AudioDescriptionDialog::addAtPlayhead() {
             table_->setCurrentCell(r, ColText);
             table_->editItem(table_->item(r, ColText));
         }
+}
+
+int AudioDescriptionDialog::draft(QString* error) {
+    const Sequence* s = state_->sequence();
+    if (!s) return -1;
+    if (gaps_.empty() && findGaps(error) < 0) return -1;
+    // The gaps with no description yet.
+    std::vector<DescriptionGap> empty;
+    const int t = findDescriptionTrack(*s);
+    for (const DescriptionGap& g : gaps_)
+        if (t < 0 || std::none_of(s->captionTracks[size_t(t)].captions.begin(), s->captionTracks[size_t(t)].captions.end(),
+                                  [&](const Caption& c) { return c.start < g.end && c.end > g.start; }))
+            empty.push_back(g);
+    if (empty.empty()) {
+        if (error) *error = gaps_.empty() ? tr("No gaps between the dialogue to describe") : tr("Every gap has a description");
+        return -1;
+    }
+    if (!describeAvailable()) {
+        if (error) *error = tr("This build of Montage cannot describe pictures: it was built without ONNX Runtime.");
+        return -1;
+    }
+    const bool withModel = useModel_->isChecked() && languageModelAvailable();
+    if (!ensureModelPack(this, describeModel(), tr("Draft Audio Description"),
+                         tr("Drafting descriptions puts each picture into words on this computer.")))
+        return -1;
+    if (withModel && !ensureModelPack(this, languageModel(), tr("Draft Audio Description"),
+                                      tr("The language model words each draft as a describer would, on this computer.")))
+        return -1;
+    struct Outcome {
+        std::vector<DescriptionDraft> drafts;
+        std::string error;
+    };
+    const Project project = state_->project();
+    const Sequence seq = *s;
+    const double pace = pace_->value();
+    const Outcome o = withProgress<Outcome>(this, tr("Drafting descriptions…"), [&](const auto& progress) {
+        Outcome out;
+        std::atomic<bool> stop{false};
+        auto describer = PictureDescriber::load(&out.error);
+        if (!describer) return out;
+        std::shared_ptr<LanguageModel> lm;
+        if (withModel && !(lm = LanguageModel::load({}, &out.error))) return out;
+        DraftOptions opts;
+        opts.wordsPerMinute = pace;
+        out.drafts = draftDescriptions(project, seq, empty, *describer, lm.get(), opts, [&](double f) { stop = !progress(f, QString()); },
+                                       &stop, &out.error);
+        return out;
+    });
+    if (o.drafts.empty()) {
+        if (error) *error = o.error == "Cancelled" ? QString() : qs(o.error);
+        return -1;
+    }
+    state_->edit(tr("Draft Descriptions"), [&](Project& p, Sequence& sq) {
+        bool any = false;
+        for (const DescriptionDraft& d : o.drafts) any = setDescription(p, sq, d.start, d.end, d.text) || any;
+        return any;
+    });
+    refresh();
+    status_->setText(tr("Drafted %n description(s) from the pictures: read each one through and correct it", "", int(o.drafts.size())));
+    return int(o.drafts.size());
 }
 
 int AudioDescriptionDialog::voice(QString* error) {

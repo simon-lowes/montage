@@ -73,6 +73,7 @@ void takeDetails(MediaItem& m, const MediaItem& n, bool replace) {
         m.visual.reset();
         m.sounds.reset();
         m.faces.reset();
+        m.shots.clear();
         if (!m.subclipOf) m.name = n.name;
     }
 }

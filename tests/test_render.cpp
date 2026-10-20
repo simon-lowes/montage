@@ -51,6 +51,10 @@
 #include "render/XmlCanonical.h"
 #include "core/Interpretation.h"
 #include "media/Decoder.h"
+#include "media/DescribePicture.h"
+#include "media/LanguageModel.h"
+#include "render/FootageWords.h"
+#include "core/TranscriptEdit.h"
 #include "render/Exporter.h"
 #include "render/HdrStill.h"
 #include "media/GainMap.h"
@@ -151,6 +155,49 @@ Clip colorClip(Project& p, float r, float g, float b, FrameTime start, FrameTime
     c.generator.params["color.b"] = b;
     return c;
 }
+
+// Talks of ten sentences each, a word every 0.4 s and 0.6 s between sentences, as one transcribed clip in the
+// sequence; `joins` are where each talk after the first begins (timeline seconds).
+void placeTalks(Project& p, const std::vector<std::vector<std::string>>& talks, std::vector<double>& joins) {
+    Sequence& s = *p.active();
+    s.fps = {25, 1};
+    MediaItem m;
+    m.id = p.newId();
+    m.kind = MediaKind::Video;
+    m.hasVideo = m.hasAudio = true;
+    auto t = std::make_shared<Transcript>();
+    double at = 0.5;
+    for (const auto& talk : talks) {
+        if (at > 1) joins.push_back(at);
+        for (const std::string& sentence : talk) {
+            TranscriptSegment seg;
+            for (const QString& w : QString::fromStdString(sentence).split(' ')) {
+                seg.words.push_back({at, at + 0.3, w.toStdString(), 1});
+                at += 0.4;
+            }
+            at += 0.6;
+            t->segments.push_back(seg);
+        }
+    }
+    m.duration = at + 1;
+    m.transcript = t;
+    p.media.push_back(m);
+    QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+}
+
+std::vector<std::vector<std::string>> cookingAndFootball() {
+    return {{"Today we start in the kitchen with a simple pasta dish.", "Boil the pasta in plenty of salted water for ten minutes.",
+             "Meanwhile chop the garlic and warm the olive oil in a pan.", "Add the tomatoes to the garlic and let the sauce simmer.",
+             "A tomato sauce needs patience and fresh garlic.", "Stir the sauce now and then so the tomatoes break down.",
+             "Drain the pasta but keep a cup of the cooking water.", "Toss the pasta through the sauce with a splash of that water.",
+             "Finish the pasta with basil, olive oil and grated cheese.", "That is the whole recipe for a quick tomato pasta sauce."},
+            {"Now to the football match on Saturday afternoon.", "The team started slowly and the coach looked worried.",
+             "Their striker missed two chances in the opening half.", "Our defence held firm until the goalkeeper made a mistake.",
+             "The goal came from a corner just before half time.", "In the second half the coach changed the formation.",
+             "The new striker scored a brilliant goal from outside the box.", "The team pressed high and the defence stayed compact.",
+             "A late goal from the captain won the match for us.", "The coach praised the whole team after the match."}};
+}
+
 
 }  // namespace
 
@@ -10653,6 +10700,202 @@ colorspaces:
         QVERIFY(same(5) <= 1e-6);
         QCOMPARE(gpu::stats().cpuFrames, 1L);
         QVERIFY(!gpu::stats().lastFallback.empty());
+    }
+    void footageWordsReadAnswers() {
+        // The sentences numbered, shortened when asked, several to a line when asked.
+        QCOMPARE(numberedSentences({"First thing said here today.", "Second one."}, 3), std::string("[1] First thing said\n[2] Second one.\n"));
+        QCOMPARE(numberedSentences({"A b.", "C d.", "E f."}, 0, 2), std::string("[1] A b. C d.\n[2] E f.\n"));
+        QVERIFY(subjectsQuestion("[1] Hi.\n").find("[1] Hi.") != std::string::npos);
+        QVERIFY(subjectsGrammar(4).find("{1,4}") != std::string::npos);
+        // Subjects are read tidied, each once.
+        const std::vector<std::string> subjects = readSubjects("- Cooking\n- football.\n- cooking\n-  Night sky \nnoise\n- \n");
+        QCOMPARE(subjects, (std::vector<std::string>{"Cooking", "Football", "Night sky", "Noise"}));
+        QVERIFY(labelQuestion("[1] Hi.\n", {"Cooking", "Football"}).find("Cooking, Football") != std::string::npos);
+        // The label grammar spells out every line's number and allows only the subjects.
+        const std::string lg = labelGrammar(2, {"Cooking", "Football"});
+        QVERIFY2(lg.find("\"1 | \" subject \"\\n\" \"2 | \" subject") != std::string::npos, lg.c_str());
+        QVERIFY2(lg.find("subject ::= \"Cooking\" | \"Football\"") != std::string::npos, lg.c_str());
+        // Labels are read by line number; a line missing, out of range or on no listed subject is -1.
+        QCOMPARE(readLabels("1 | Cooking\n2 | football\n4 | Cooking\n9 | Football\n", 4, {"Cooking", "Football"}),
+                 (std::vector<int>{0, 1, -1, 0}));
+        QCOMPARE(readLabels("1 | Gardening\n", 2, {"Cooking"}), (std::vector<int>{-1, -1}));
+        // Chapters are the runs of one subject; a sentence with none stays with the run before it.
+        const std::vector<double> starts{0, 10, 20, 30, 40, 50, 60, 70};
+        using Chapters = std::vector<std::pair<size_t, int>>;
+        QCOMPARE(chaptersFromLabels({0, 0, -1, 0, 1, 1, 1, 1}, starts, 80, 20), (Chapters{{0, 0}, {4, 1}}));
+        // A stray sentence on another subject is taken back into the run around it.
+        QCOMPARE(chaptersFromLabels({0, 0, 0, 1, 0, 0, 1, 1}, starts, 80, 20), (Chapters{{0, 0}, {6, 1}}));
+        // A short first run joins the next; a short run elsewhere joins the one before.
+        QCOMPARE(chaptersFromLabels({1, 0, 0, 0, 0, 0, 0, 2}, starts, 80, 20), (Chapters{{0, 0}}));
+        // At most the chapters asked for, the shortest taken in first.
+        QCOMPARE(chaptersFromLabels({0, 0, 0, 1, 2, 2, 2, 2}, starts, 80, 5, 2), (Chapters{{0, 0}, {4, 2}}));
+        QVERIFY(chaptersFromLabels({}, {}, 0, 10).empty());
+        // Description lines: the words a gap has room for, the grammar holding a line to them, and a line cut to fit.
+        QCOMPARE(descriptionWordBudget(3.0), 8);
+        QCOMPARE(descriptionWordBudget(1.0), 2);
+        QCOMPARE(descriptionWordBudget(0.2), 2);
+        QCOMPARE(descriptionWordBudget(3.0, 120), 6);
+        QVERIFY(descriptionGrammar(8).find("{0,7}") != std::string::npos);
+        QCOMPARE(fitDescription("a man in a suit and tie, sitting at a desk", 7), std::string("A man in a suit and tie."));
+        QCOMPARE(fitDescription("She runs!", 5), std::string("She runs!"));
+        QCOMPARE(fitDescription("  rain   falls ", 5), std::string("Rain falls."));
+        QCOMPARE(fitDescription("a man in a suit", 3), std::string("A man."));
+        QCOMPARE(fitDescription("A man in.", 5), std::string("A man."));
+        QVERIFY(descriptionFit(fitDescription("one two three four five six seven eight nine ten", 8), 3.0).fits);
+        // Shots kept with the item; its Description, when empty, is the longest shot's.
+        MediaItem m;
+        setShotDescriptions(m, {{0, 2, "A short shot."}, {2, 9, "The long shot."}, {9, 10, "Another."}});
+        QCOMPARE(m.shots.size(), size_t(3));
+        QCOMPARE(m.metadata["description"], std::string("The long shot."));
+        m.metadata["description"] = "Mine";
+        setShotDescriptions(m, {{0, 1, "New."}});
+        QCOMPARE(m.metadata["description"], std::string("Mine"));
+        QCOMPARE(m.shots.size(), size_t(1));
+        // A shot put into no words does not empty the Description.
+        MediaItem n;
+        setShotDescriptions(n, {{0, 2, "A short shot."}, {2, 9, ""}});
+        QCOMPARE(n.metadata["description"], std::string("A short shot."));
+    }
+
+    void footageWordsWithATinyModel() {
+        // The plumbing, with the tiny story model llama.cpp tests with (it writes nonsense, held to the grammars).
+        if (!languageModelAvailable()) QSKIP("Built without llama.cpp");
+        std::string err;
+        auto lm = LanguageModel::load(MONTAGE_TEST_DATA_DIR "/llm/stories260K.gguf", &err);
+        QVERIFY2(lm, err.c_str());
+        Project p = makeDefaultProject();
+        std::vector<double> joins;
+        placeTalks(p, cookingAndFootball(), joins);
+        Sequence& s = *p.active();
+        // The answers parse: a subject list, and a subject for every line.
+        std::vector<std::string> sentences;
+        for (const auto& talk : cookingAndFootball()) sentences.insert(sentences.end(), talk.begin(), talk.end());
+        const std::string numbered = numberedSentences(sentences, 8);
+        WriteRequest r;
+        r.prompt = subjectsQuestion(numbered);
+        r.grammar = subjectsGrammar(3);
+        r.maxTokens = 60;
+        const std::string listed = lm->write(r, &err);
+        QVERIFY2(!readSubjects(listed).empty(), (listed + err).c_str());
+        r.prompt = labelQuestion(numbered, {"Cooking", "Football"});
+        r.grammar = labelGrammar(int(sentences.size()), {"Cooking", "Football"});
+        r.maxTokens = 12 * int(sentences.size()) + 16;
+        const std::string labelled = lm->write(r, &err);
+        const std::vector<int> labels = readLabels(labelled, int(sentences.size()), {"Cooking", "Football"});
+        QVERIFY2(std::none_of(labels.begin(), labels.end(), [](int l) { return l < 0; }), (labelled + err).c_str());
+        // Chapters from it start at 0, in order, at least the shortest apart (or there are none to suggest).
+        ChapterOptions o;
+        o.minSeconds = 10;
+        const std::vector<SuggestedChapter> ch = writeChapters(p, s, o, *lm, &err);
+        if (ch.empty()) {
+            QVERIFY2(QString::fromStdString(err).contains("one subject"), err.c_str());
+        } else {
+            QCOMPARE(ch[0].start, FrameTime(0));
+            for (size_t i = 1; i < ch.size(); ++i) QVERIFY(ch[i].start - ch[i - 1].start >= FrameTime(10 * 25));
+            QVERIFY(std::all_of(ch.begin(), ch.end(), [](const SuggestedChapter& c) { return !c.title.empty(); }));
+        }
+        // Notes in their form, as far as they are written.
+        const std::string story = writeAboutSequence(p, s, FootageWriting::StoryNotes, *lm, &err);
+        QVERIFY2(QString::fromStdString(story).startsWith("Logline: "), (story + err).c_str());
+        const std::string summary = writeAboutSequence(p, s, FootageWriting::Summary, *lm, &err);
+        QVERIFY2(!summary.empty() && QString::fromStdString(summary).front().isUpper(), (summary + err).c_str());
+        // A description line keeps to its words.
+        r.prompt = "Once upon a time";
+        r.grammar = descriptionGrammar(5);
+        r.maxTokens = 80;
+        const std::string line = lm->write(r, &err);
+        QVERIFY2(!line.empty() && QString::fromStdString(line).split(' ').size() <= 5, line.c_str());
+        // Nothing transcribed: nothing to write about.
+        Project empty = makeDefaultProject();
+        QVERIFY(writeAboutSequence(empty, *empty.active(), FootageWriting::Summary, *lm, &err).empty());
+        QVERIFY(QString::fromStdString(err).contains("transcribed"));
+        QVERIFY(writeChapters(empty, *empty.active(), o, *lm, &err).empty());
+    }
+
+    void footageWordsWithTheRealModels() {
+        if (!languageModelAvailable()) QSKIP("Built without llama.cpp");
+        if (!languageModel().installed()) QSKIP("Language model not installed (set MONTAGE_LANGUAGE_MODEL)");
+        std::string err;
+        auto lm = LanguageModel::load({}, &err);
+        QVERIFY2(lm, err.c_str());
+        Project p = makeDefaultProject();
+        std::vector<double> joins;
+        placeTalks(p, cookingAndFootball(), joins);
+        Sequence& s = *p.active();
+        // Two talks: split where the talk turns from cooking to football, each titled with its subject.
+        ChapterOptions o;
+        o.minSeconds = 20;
+        const std::vector<SuggestedChapter> ch = writeChapters(p, s, o, *lm, &err);
+        for (const SuggestedChapter& c : ch) qInfo("chapter at %.1f s: %s", c.start / 25.0, c.title.c_str());
+        QVERIFY2(ch.size() >= 2, err.c_str());
+        const auto at = std::find_if(ch.begin(), ch.end(), [&](const SuggestedChapter& c) { return std::fabs(c.start / 25.0 - joins[0]) < 4.6; });
+        QVERIFY2(at != ch.end(), "no chapter where the talk turns to football");
+        auto about = [](const std::string& text, const QStringList& topic) {
+            const QString t = QString::fromStdString(text).toLower();
+            return std::any_of(topic.begin(), topic.end(), [&](const QString& w) { return t.contains(w); });
+        };
+        const QStringList cooking{"pasta", "sauce", "tomato", "garlic", "cook", "kitchen", "recipe"},
+            football{"match", "goal", "team", "coach", "striker", "defence", "football"};
+        QVERIFY2(about(ch[0].title, cooking), ch[0].title.c_str());
+        QVERIFY2(about(at->title, football), at->title.c_str());
+        // The same question, the same chapters.
+        const std::vector<SuggestedChapter> again = writeChapters(p, s, o, *lm, &err);
+        QCOMPARE(again.size(), ch.size());
+        for (size_t i = 0; i < ch.size(); ++i) QCOMPARE(again[i].title, ch[i].title);
+        // A summary, show notes and story notes, in their forms and on the subject.
+        const std::string summary = writeAboutSequence(p, s, FootageWriting::Summary, *lm, &err);
+        qInfo("%s", summary.c_str());
+        QVERIFY2(about(summary, cooking) && about(summary, football), (summary + err).c_str());
+        QVERIFY(summary.find('\n') == std::string::npos);
+        QVERIFY2(std::count_if(summary.begin(), summary.end(), [](char c) { return c == '.' || c == '!' || c == '?'; }) <= 5, summary.c_str());
+        QVERIFY(edit::addSuggestedChapters(s, ch).ok);
+        const std::string show = writeAboutSequence(p, s, FootageWriting::ShowNotes, *lm, &err);
+        qInfo("%s", show.c_str());
+        static const QRegularExpression showForm("^[A-Z][^\\n]+\\n\\nTopics:\\n(- [^\\n]+\\n){3,8}\\nChapters:\\n0:00 ");
+        QVERIFY2(showForm.match(QString::fromStdString(show)).hasMatch(), show.c_str());
+        const std::string story = writeAboutSequence(p, s, FootageWriting::StoryNotes, *lm, &err);
+        qInfo("%s", story.c_str());
+        static const QRegularExpression storyForm("^Logline: [A-Z][^\\n]+\\n\\nBeats:\\n(- [^\\n]+\\n){3,12}\\nOpen questions:\\n(- [^\\n]+\\n?){1,5}$");
+        QVERIFY2(storyForm.match(QString::fromStdString(story)).hasMatch(), story.c_str());
+    }
+
+    void draftingAudioDescription() {
+        if (!describeAvailable()) QSKIP("Built without ONNX Runtime");
+        if (!describeModel().installed()) QSKIP("Picture description model not installed (set MONTAGE_DESCRIBE_MODEL)");
+        std::string err;
+        auto describer = PictureDescriber::load(&err);
+        QVERIFY2(describer, err.c_str());
+        // A portrait held for ten seconds, with gaps of 2.5 s and 1.2 s between the lines.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {25, 1};
+        MediaItem m;
+        QVERIFY(probeMedia(MONTAGE_TEST_DATA_DIR "/faces/jfk-color.jpg", m));
+        m.id = p.newId();
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 250, {TrackKind::Video, 0}, {}, false).ok);
+        const std::vector<DescriptionGap> gaps{{0, 63}, {150, 180}};
+        std::vector<std::shared_ptr<LanguageModel>> writers{nullptr};
+        if (languageModelAvailable() && languageModel().installed()) writers.push_back(LanguageModel::load({}, &err));
+        for (const auto& lm : writers) {
+            const std::vector<DescriptionDraft> drafts = draftDescriptions(p, s, gaps, *describer, lm.get(), {}, {}, nullptr, &err);
+            QVERIFY2(drafts.size() == gaps.size(), err.c_str());
+            for (size_t i = 0; i < drafts.size(); ++i) {
+                qInfo("%s: \"%s\" (seen: %s)", lm ? "written" : "caption", drafts[i].text.c_str(), drafts[i].seen.c_str());
+                QCOMPARE(drafts[i].start, gaps[i].start);
+                QCOMPARE(drafts[i].end, gaps[i].end);
+                // Every draft fits its gap at a describer's pace, and is a sentence.
+                const DescriptionFit f = descriptionFit(drafts[i].text, double(gaps[i].length()) / 25.0);
+                QVERIFY2(f.fits && f.speed <= 1.0, drafts[i].text.c_str());
+                QVERIFY(QString::fromStdString(drafts[i].text).front().isUpper());
+                QVERIFY(QStringLiteral(".!?").contains(QString::fromStdString(drafts[i].text).back()));
+            }
+            // The longer gap says who is there.
+            static const QRegularExpression someone(QStringLiteral("\\b(man|person|kennedy)\\b"));
+            QVERIFY2(someone.match(QString::fromStdString(drafts[0].text).toLower()).hasMatch(), drafts[0].text.c_str());
+        }
+        std::atomic<bool> cancel{true};
+        QVERIFY(draftDescriptions(p, s, gaps, *describer, nullptr, {}, {}, &cancel, &err).empty());
     }
 };
 

@@ -32,6 +32,8 @@
 #include "core/GraphicsTemplate.h"
 #include "core/Storyboard.h"
 #include "render/ExtendClip.h"
+#include "render/FootageWords.h"
+#include "media/LanguageModel.h"
 #include "render/ColorChart.h"
 #include "render/ReviewExport.h"
 #include "render/RoomTone.h"
@@ -615,6 +617,19 @@ struct McpServer::Impl {
 };
 
 namespace {
+// The language model, when this build has one and it is downloaded.
+std::shared_ptr<LanguageModel> loadLanguageModel(std::string& error) {
+    if (!languageModelAvailable()) {
+        error = "This build of Montage has no language model (built without llama.cpp)";
+        return nullptr;
+    }
+    if (!languageModel().installed()) {
+        error = "The language model is not downloaded: use Summary and Notes or Suggest Chapters' language model in the app once";
+        return nullptr;
+    }
+    return LanguageModel::load({}, &error);
+}
+
 // A person by id or (case-insensitively) by name.
 int personId(const Project& p, const QJsonValue& v) {
     for (const PersonSummary& s : peopleIn(p))
@@ -2584,11 +2599,15 @@ void McpServer::Impl::addTools() {
     add("montage_suggest_chapters", "Suggest chapters from what is said",
         "Find where the talk in the sequence moves on to something new (TextTiling over the transcribed words of the "
         "cut: the sentences either side of each break compared, the breaks where they share least taken, none closer than "
-        "`min_seconds`) and title each chapter with the phrase it says more than the others do. With `apply` (the "
+        "`min_seconds`) and title each chapter with the phrase it says more than the others do. With `language_model`, "
+        "a language model on this computer (Granite 4.0 Micro through llama.cpp, its answer held to a grammar) reads the "
+        "numbered sentences instead and says where each chapter starts and what to call it; chapters still start just "
+        "before a sentence and are at least `min_seconds` long. With `apply` (the "
         "default) they become chapter markers, replacing the chapter markers there were unless `replace` is false. "
         "Returns the chapters and YouTube's chapter list.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"min_seconds":{"type":"number","default":30},
             "max_chapters":{"type":"number","default":0,"description":"0 = as many as the talk has"},
+            "language_model":{"type":"boolean","default":false},
             "apply":{"type":"boolean","default":true},"replace":{"type":"boolean","default":true}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -2597,7 +2616,14 @@ void McpServer::Impl::addTools() {
             o.minSeconds = std::max(10.0, a.value("min_seconds").toDouble(30));
             o.maxChapters = std::max(0, a.value("max_chapters").toInt(0));
             std::string err;
-            const std::vector<SuggestedChapter> chapters = suggestChapters(l.project, s, o, &err);
+            std::vector<SuggestedChapter> chapters;
+            if (a.value("language_model").toBool(false)) {
+                const auto lm = loadLanguageModel(err);
+                if (!lm) return fail(QString::fromStdString(err));
+                chapters = writeChapters(l.project, s, o, *lm, &err);
+            } else {
+                chapters = suggestChapters(l.project, s, o, &err);
+            }
             if (chapters.empty()) return fail(QString::fromStdString(err));
             QJsonArray list;
             for (const SuggestedChapter& c : chapters)
@@ -6275,10 +6301,14 @@ void McpServer::Impl::addTools() {
         "seconds; empty text removes one) on the hidden \"Audio Description\" caption track; list shows them with how they "
         "fit at pace words a minute; voice speaks them with an AI voice (Kokoro) onto the AD track as clips of the role "
         "Description, replacing what was voiced before; duck lowers every other clip under them by duck_db; hear sets "
-        "whether they play while working. montage_render's described option (or the export dialog's) writes the mix "
-        "without them and a stream of the programme with them.",
+        "whether they play while working. draft writes a first draft in each gap of at least min_gap seconds that has "
+        "none, from the picture in its middle, on this computer: Florence-2 describes it and, with language_model (the "
+        "default), Granite 4.0 Micro words it as a describer would, held to the words the gap has room for at pace "
+        "(without, the picture's brief caption); read them through before voicing. montage_render's described option "
+        "(or the export dialog's) writes the mix without them and a stream of the programme with them.",
         R"json({"type":"object","properties":{"project":{"type":"string"},
-            "action":{"type":"string","enum":["gaps","write","list","voice","duck","hear"],"default":"list"},
+            "action":{"type":"string","enum":["gaps","write","draft","list","voice","duck","hear"],"default":"list"},
+            "language_model":{"type":"boolean","default":true},
             "min_gap":{"type":"number","default":2},"pace":{"type":"number","default":160},
             "descriptions":{"type":"array","items":{"type":"object","properties":{"start":{"type":["number","string"]},
                 "end":{"type":["number","string"]},"text":{"type":"string"}},"required":["start","text"]}},
@@ -6323,6 +6353,36 @@ void McpServer::Impl::addTools() {
                     out.append(QJsonObject{{"start", tc(g.start, s)}, {"end", tc(g.end, s)}, {"seconds", double(g.length()) / s.fpsValue()},
                                            {"words", int(std::floor(double(g.length()) / s.fpsValue() * pace / 60))}});
                 return ok(QStringLiteral("%1 gap(s) between the dialogue").arg(gaps.size()), QJsonObject{{"gaps", out}});
+            }
+            if (action == "draft") {
+                std::vector<DescriptionGap> gaps, empty;
+                if (const QString err = findGaps(gaps, std::max(0.5, a.value("min_gap").toDouble(2))); !err.isEmpty()) return fail(err);
+                const int t = findDescriptionTrack(s);
+                for (const DescriptionGap& g : gaps)
+                    if (t < 0 || std::none_of(s.captionTracks[size_t(t)].captions.begin(), s.captionTracks[size_t(t)].captions.end(),
+                                              [&](const Caption& c) { return c.start < g.end && c.end > g.start; }))
+                        empty.push_back(g);
+                if (empty.empty()) return fail(gaps.empty() ? "No gaps between the dialogue to describe" : "Every gap has a description");
+                std::string err;
+                if (!describeAvailable()) return fail("This build of Montage cannot describe pictures (no ONNX Runtime)");
+                if (!describeModel().installed())
+                    return fail("The picture description model is not downloaded: draft descriptions once in the app (Sequence > Audio Description)");
+                const auto describer = PictureDescriber::load(&err);
+                if (!describer) return fail(QString::fromStdString(err));
+                std::shared_ptr<LanguageModel> lm;
+                if (a.value("language_model").toBool(true) && !(lm = loadLanguageModel(err))) return fail(QString::fromStdString(err));
+                DraftOptions o;
+                o.wordsPerMinute = pace;
+                const std::vector<DescriptionDraft> drafts = draftDescriptions(l.project, s, empty, *describer, lm.get(), o, {}, nullptr, &err);
+                if (drafts.empty()) return fail(QString::fromStdString(err));
+                for (const DescriptionDraft& d : drafts) setDescription(l.project, s, d.start, d.end, d.text);
+                save(l);
+                QJsonObject out = listing();
+                QJsonArray seen;
+                for (const DescriptionDraft& d : drafts)
+                    seen.append(QJsonObject{{"start", tc(d.start, s)}, {"text", QString::fromStdString(d.text)}, {"seen", QString::fromStdString(d.seen)}});
+                out["drafted"] = seen;
+                return ok(QStringLiteral("Drafted %1 description(s); read them through before voicing").arg(drafts.size()), out);
             }
             if (action == "write") {
                 const QJsonArray items = a.value("descriptions").toArray();
@@ -6927,6 +6987,79 @@ void McpServer::Impl::addTools() {
             }
             if (changed) save(l);
             return ok(text.isEmpty() ? QStringLiteral("No videos") : text, QJsonObject{{"media", list}});
+        });
+
+    add("montage_describe_shots", "Describe shots",
+        "Put what each shot shows into words, on this computer (Florence-2, Microsoft, MIT licence): videos are cut into "
+        "shots at their scene cuts (`sensitivity` 0-1; none shorter than `shortest` seconds) and each is described from its "
+        "middle frame; a still is one shot. The descriptions are kept with the media, montage_search_speech searches them "
+        "with the transcripts, and an item with no Description gets its longest shot's. `detail` \"brief\" gives a line "
+        "a shot. Returns each item's shots, and any that could not be described with why.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "media":{"type":"array","items":{"type":"string"},"description":"Media files or names; default: every video and still"},
+            "sensitivity":{"type":"number","default":0.5},"shortest":{"type":"number","default":1},
+            "detail":{"type":"string","enum":["brief","detailed"],"default":"detailed"}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            if (!describeAvailable()) return fail("This build of Montage cannot describe pictures (no ONNX Runtime)");
+            if (!describeModel().installed())
+                return fail("The picture description model is not downloaded: run Describe Shots in the app once");
+            std::vector<Id> ids;
+            for (const QJsonValue& v : a.value("media").toArray()) ids.push_back(projectMedia(l.project, v.toString()).id);
+            if (ids.empty())
+                for (const MediaItem& m : l.project.media)
+                    if (!m.subclipOf && m.hasVideo && (m.kind == MediaKind::Video || m.kind == MediaKind::Image)) ids.push_back(m.id);
+            DescribeShotsOptions o;
+            o.sensitivity = std::clamp(a.value("sensitivity").toDouble(0.5), 0.0, 1.0);
+            o.shortestShot = std::max(0.1, a.value("shortest").toDouble(1));
+            o.detail = str(a, "detail", "detailed") == "brief" ? PictureDetail::Brief : PictureDetail::Detailed;
+            QJsonArray list, failed;
+            QString text;
+            for (Id id : ids) {
+                MediaItem* m = l.project.findMedia(id);
+                if (!m) continue;
+                std::string err;
+                std::vector<ShotDescription> shots = describeShots(*m, o, {}, nullptr, &err);
+                if (shots.empty()) {  // (the others are still described and kept)
+                    failed.append(QJsonObject{{"name", QString::fromStdString(m->name)}, {"error", QString::fromStdString(err)}});
+                    continue;
+                }
+                QJsonArray js;
+                text += QString::fromStdString(m->name) + ":\n";
+                for (const ShotDescription& d : shots) {
+                    js.append(QJsonObject{{"start_seconds", d.start}, {"end_seconds", d.end}, {"text", QString::fromStdString(d.text)}});
+                    text += QStringLiteral("  %1-%2 s: %3\n").arg(d.start, 0, 'f', 1).arg(d.end, 0, 'f', 1).arg(QString::fromStdString(d.text));
+                }
+                setShotDescriptions(*m, std::move(shots));
+                list.append(QJsonObject{{"name", QString::fromStdString(m->name)}, {"shots", js}});
+            }
+            for (const QJsonValue& f : failed)
+                text += QStringLiteral("Not described: %1 (%2)\n").arg(f["name"].toString(), f["error"].toString());
+            if (list.isEmpty())
+                return fail(failed.isEmpty() ? QStringLiteral("No videos or stills to describe") : text.trimmed());
+            save(l);
+            return ok(text, QJsonObject{{"media", list}, {"failed", failed}});
+        });
+
+    add("montage_write_notes", "Write a summary or notes",
+        "Write about the sequence from what is said in it, with a language model on this computer (Granite 4.0 Micro, IBM, "
+        "Apache-2.0, through llama.cpp; its answer held to a form): `kind` summary (a paragraph), show_notes (a paragraph, "
+        "the topics as a list, and the chapter markers with their times when there are any) or story_notes (for the editor: "
+        "a logline, the story's beats and the questions it leaves open). Needs the footage transcribed. Read it through "
+        "before using it.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "kind":{"type":"string","enum":["summary","show_notes","story_notes"],"default":"summary"}},"required":["project"]})json",
+        true, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            const QString kind = str(a, "kind", "summary");
+            const FootageWriting what = kind == "show_notes" ? FootageWriting::ShowNotes
+                                        : kind == "story_notes" ? FootageWriting::StoryNotes : FootageWriting::Summary;
+            std::string err;
+            const auto lm = loadLanguageModel(err);
+            if (!lm) return fail(QString::fromStdString(err));
+            const std::string text = writeAboutSequence(l.project, l.seq(), what, *lm, &err);
+            if (text.empty()) return fail(QString::fromStdString(err));
+            return ok(QString::fromStdString(text), QJsonObject{{"kind", kind}, {"text", QString::fromStdString(text)}});
         });
 
     add("montage_auto_duck", "Duck music under dialogue",

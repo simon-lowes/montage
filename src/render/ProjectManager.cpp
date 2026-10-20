@@ -227,6 +227,9 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
                 }
                 m.transcript = shifted;
             }
+            // and what the shots show.
+            std::erase_if(m.shots, [&](const ShotDescription& d) { return d.end <= from || d.start >= to; });
+            for (ShotDescription& d : m.shots) d.start = std::max(0.0, d.start - from), d.end = std::min(to, d.end) - from;
             // Clips and subclips now count from the span's start.
             for (Sequence& s : q.sequences)
                 for (TrackRef r : allTracks(s))

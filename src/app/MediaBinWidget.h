@@ -121,6 +121,10 @@ public:
     // interior or exterior, day or night, people), indexing them first if
     // needed; one undo step. Returns how many items got new keywords.
     int autoTag(const std::vector<Id>& ids);
+    // Describe Shots: each shot of the videos and stills put into words (render/FootageWords.h), kept with the item
+    // and searched by Find What's Said; an item with no Description gets its longest shot's. One undo step. Returns
+    // how many items were described.
+    int describeShots(const std::vector<Id>& ids);
     // Hover scrub (Premiere's, Final Cut's skimming): moving the pointer across a video's thumbnail in the icon view
     // shows its frames, left to right. On unless turned off (the bin's context menu); remembered.
     void setHoverScrub(bool on);

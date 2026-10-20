@@ -55,6 +55,8 @@
 #include "media/Translator.h"
 #include "media/VisualSearch.h"
 #include "media/SoundSearch.h"
+#include "media/DescribePicture.h"
+#include "media/LanguageModel.h"
 #include "media/StemSeparation.h"
 #include "media/FaceMesh.h"
 #include "media/Faces.h"
@@ -918,6 +920,15 @@ int cmdModels() {
     if (!soundSearchAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
     else
         std::printf("  %-22s %6.0f MB  %s\n", soundModel().id.c_str(), double(soundModel().bytes()) / 1e6, soundModel().installed() ? "downloaded" : "");
+    std::printf("\nPicture description model (Florence-2 large, for Describe Shots and audio description drafts; folder: %s)\n",
+                describeModel().directory().c_str());
+    if (!describeAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        std::printf("  %-22s %6.0f MB  %s\n", describeModel().id.c_str(), double(describeModel().bytes()) / 1e6, describeModel().installed() ? "downloaded" : "");
+    std::printf("\nLanguage model (Granite 4.0 Micro, for chapters, summaries and notes; folder: %s)\n", languageModel().directory().c_str());
+    if (!languageModelAvailable()) std::printf("  unavailable: this build has no llama.cpp\n");
+    else
+        std::printf("  %-22s %6.0f MB  %s\n", languageModel().id.c_str(), double(languageModel().bytes()) / 1e6, languageModel().installed() ? "downloaded" : "");
     std::printf("\nVisual search model (CLIP ViT-B/32, for Find Shots; folder: %s)\n", visualModel().directory().c_str());
     std::printf("  %-22s %6.0f MB  %s\n", visualModel().id.c_str(), double(visualModel().bytes()) / 1e6,
                 visualModel().installed() ? "downloaded" : "");

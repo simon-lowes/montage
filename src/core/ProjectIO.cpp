@@ -977,6 +977,11 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
             for (const auto& [key, v] : m.metadata) md[qs(key)] = qs(v);
             o["metadata"] = md;
         }
+        if (!m.shots.empty()) {
+            QJsonArray sh;
+            for (const ShotDescription& d : m.shots) sh.append(QJsonObject{{"start", d.start}, {"end", d.end}, {"text", qs(d.text)}});
+            o["shots"] = sh;
+        }
         if (!m.created.empty()) o["created"] = qs(m.created);
         if (m.subclipOf) {
             o["subclipOf"] = double(m.subclipOf);
@@ -1136,6 +1141,10 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         for (const auto& k : o.value("keywords").toArray()) m.keywords.push_back(ss(k));
         const QJsonObject md = o.value("metadata").toObject();
         for (auto it = md.begin(); it != md.end(); ++it) m.metadata[it.key().toStdString()] = ss(it.value());
+        for (const auto& v : o.value("shots").toArray()) {
+            const QJsonObject d = v.toObject();
+            m.shots.push_back({d.value("start").toDouble(), d.value("end").toDouble(), ss(d.value("text"))});
+        }
         m.created = ss(o.value("created"));
         m.subclipOf = Id(i64(o.value("subclipOf")));
         m.subclipIn = o.value("subclipIn").toDouble();

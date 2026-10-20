@@ -21,6 +21,7 @@ licence Adobe offers with its Gain Map specification; its terms are Adobe's, as 
 |---|---|---|---|
 | [lensfun](https://github.com/lensfun/lensfun) library: guessing a lens's focal lengths and aperture from its name, and its Hermite interpolation | `src/core/LensProfile.cpp` | LGPL-3.0 | Copyright (C) 2007 Andrew Zabolotny and the lensfun contributors. [LICENSES/LGPL-3.0.txt](LICENSES/LGPL-3.0.txt) |
 | [lensfun](https://github.com/lensfun/lensfun) database: lens profiles used in a test fixture | `tests/data/lensfun/test-lenses.xml` | CC BY-SA 3.0 | The lensfun database contributors. Not part of the packages |
+| [llama2.c](https://github.com/karpathy/llama2.c) stories260K: a tiny language model used to test the language model plumbing (as llama.cpp's own tests do) | `tests/data/llm/stories260K.gguf` | MIT | Copyright (c) 2023 Andrej. [tests/data/llm/LICENSE](tests/data/llm/LICENSE). Not part of the packages |
 | [blackmagic-misc](https://github.com/smunaut/blackmagic-misc): the Speed Editor's HID protocol and authentication | `src/control/SpeedEditor.cpp`, `.h` | Apache-2.0 | Copyright (C) 2021 Sylvain Munaut. Translated to C++. [LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt) |
 | [CommandPost](https://github.com/CommandPost/CommandPost) `hs.blackmagic`: the Speed Editor's key and light codes | `src/control/SpeedEditor.cpp`, `.h` | MIT | [LICENSES/MIT-CommandPost.txt](LICENSES/MIT-CommandPost.txt) |
 | [Hammerspoon](https://github.com/Hammerspoon/hammerspoon) `hs.tangent` and [CommandPost](https://github.com/CommandPost/CommandPost): the Tangent Hub (TUBE) message ids and fields | `src/control/Tangent.cpp`, `.h` | MIT | [LICENSES/MIT-Hammerspoon.txt](LICENSES/MIT-Hammerspoon.txt), [LICENSES/MIT-CommandPost.txt](LICENSES/MIT-CommandPost.txt) |
@@ -41,6 +42,7 @@ licence Adobe offers with its Gain Map specification; its terms are Adobe's, as 
 | Component | Licence | Licence file |
 |---|---|---|
 | [whisper.cpp and ggml](https://github.com/ggml-org/whisper.cpp) | MIT | the source's `LICENSE` (copied into the packages) |
+| [llama.cpp](https://github.com/ggml-org/llama.cpp) (on whisper.cpp's ggml) | MIT | the source's `LICENSE` (copied into the packages) |
 | [RNNoise](https://github.com/xiph/rnnoise) and its model | BSD-3-Clause | the source's `COPYING` (copied into the packages) |
 | [Lua](https://www.lua.org) 5.4 | MIT | [LICENSES/MIT-Lua.txt](LICENSES/MIT-Lua.txt) |
 | [ThorVG](https://github.com/thorvg/thorvg), with RapidJSON (MIT) and JerryScript (Apache-2.0) | MIT, MIT, Apache-2.0 | the source's licence files (copied into the packages) |
