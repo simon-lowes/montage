@@ -10,7 +10,10 @@
 #include <map>
 #include <numeric>
 
+#include "AvidMedia.h"
 #include "core/Aaf.h"
+#include "core/Effects.h"
+#include "core/History.h"
 #include "core/Interpretation.h"
 #include "core/EditOps.h"
 #include "media/Decoder.h"
@@ -46,6 +49,8 @@ const char* const kWaveDescriptor = "0d010101-0101-2c00-060e-2b3402060101";
 const char* const kCdciDescriptor = "0d010101-0101-2800-060e-2b3402060101";
 const char* const kImportDescriptor = "0d010101-0101-4a00-060e-2b3402060101";
 const char* const kNetworkLocator = "0d010101-0101-3200-060e-2b3402060101";
+const char* const kPcmDescriptor = "0d010101-0101-4800-060e-2b3402060101";
+const char* const kTapeDescriptor = "0d010101-0101-2e00-060e-2b3402060101";
 const char* const kDataDefinition = "0d010101-0101-1b00-060e-2b3402060101";
 const char* const kContainerDefinition = "0d010101-0101-2000-060e-2b3402060101";
 const char* const kOperationDefinition = "0d010101-0101-1c00-060e-2b3402060101";
@@ -58,6 +63,11 @@ const char* const kPicture = "01030202-0100-0000-060e-2b3404010101";
 const char* const kTimecodeData = "01030201-0100-0000-060e-2b3404010101";
 const char* const kContainerAAF = "4313b571-d8ba-11d2-809b-006008143e6f";
 const char* const kContainerExternal = "4313b572-d8ba-11d2-809b-006008143e6f";
+// MXF generic container ULs, as the OP-Atom files FFmpeg writes name them: VC-3 frame wrapped, and Broadcast Wave
+// sound frame wrapped. And the VC-3 picture coding.
+const char* const kContainerVc3 = "0d010301-0211-0100-060e-2b340401010a";
+const char* const kContainerWav = "0d010301-0206-0100-060e-2b3404010101";
+const char* const kVc3Coding = "04010202-7100-0000-060e-2b340401010a";
 const char* const kVideoDissolve = "0c3bea40-fc05-11d2-8a29-0050040ef7d2";  // OperationDef_VideoDissolve
 const char* const kSpeedControl = "9d2ea890-0968-11d3-8a38-0050040ef7d2";   // OperationDef_VideoSpeedControl
 const char* const kSpeedRatio = "72559a80-24d7-11d3-8a50-0050040ef7d2";     // ParameterDef_SpeedRatio
@@ -176,6 +186,10 @@ struct Source {
     std::string masterMob;
     int64_t samples = 0;
     double frames = 0;  // length in sequence frames
+    // As OP-Atom files: each its own master clip and tape, as in the file; and the source's timecode (seconds) and tape.
+    std::vector<std::string> masterMobs, tapeMobs;
+    double timecode = -1;
+    std::string reel;
 };
 
 // A picture file the composition links to: the camera original where it is, not copied.
@@ -188,6 +202,17 @@ struct Picture {
     double par = 1;           // pixel aspect Interpret Footage gives it (the width above is as shown, par included)
     double timecode = -1;     // its start timecode in seconds, -1 = none
     std::string tapeMob;      // the source it was recorded as, carrying that timecode
+    // With Avid media: what is rendered to make it (its media, at `scale` seconds of the file per second of media
+    // time; or one clip, baked), and the OP-Atom file it became (VC-3 at `depth` bits, 4:2:2 or 4:4:4).
+    const MediaItem* media = nullptr;
+    double scale = 1;
+    const Clip* baked = nullptr;
+    double head = 0, tail = 0;  // a baked clip's media beyond its ends (timeline frames)
+    std::string layer;  // a multi-layer EXR's layer it shows
+    bool vc3 = false;
+    int depth = 8, subsampling = 2;
+    std::string reel;      // the tape its timecode is from ("" = the file's name)
+    int64_t tcStart = 0;   // an OP-Atom file's timecode in frames
 };
 
 // A video clip as placed: its extent with the handles a dissolve reaches into, and where in the file it starts.
@@ -242,11 +267,36 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
                const ExportProgress& progress, const std::atomic<bool>* cancel, std::string* error, const AafExportOptions& options) {
     AafExportResult res;
     const double fps = seq.fpsValue();
+    const Rational seqRate = seq.fps.valid() ? seq.fps : Rational{30, 1};
     const QFileInfo out(QString::fromStdString(path));
-    const QString mediaDir = out.absolutePath() + "/" + out.completeBaseName() + " Media";
-    if (!QDir().mkpath(mediaDir)) {
-        if (error) *error = "Cannot make " + mediaDir.toStdString();
-        return false;
+    const AafAvidMedia& avid = options.avid;
+    // A new numbered folder for Avid media, gone again if the export fails.
+    struct Cleanup {
+        QString dir;
+        std::vector<std::string> made;  // the folders above it made for it
+        bool keep = false;
+        ~Cleanup() {
+            if (keep || dir.isEmpty()) return;
+            QDir(dir).removeRecursively();
+            for (auto it = made.rbegin(); it != made.rend(); ++it) QDir().rmdir(QString::fromStdString(*it));
+        }
+    } cleanup;
+    QString mediaDir;
+    if (avid.enabled) {
+        if (const std::string why = avidCodecProblem(avid.codec, seq.width, seq.height, fps); !why.empty()) {
+            if (error) *error = why;
+            return false;
+        }
+        const std::string folder = avidMediaFolder(avid.drive.empty() ? out.absolutePath().toStdString() : avid.drive, error, &cleanup.made);
+        if (folder.empty()) return false;
+        mediaDir = cleanup.dir = QString::fromStdString(folder);
+        res.mediaFolder = folder;
+    } else {
+        mediaDir = out.absolutePath() + "/" + out.completeBaseName() + " Media";
+        if (!QDir().mkpath(mediaDir)) {
+            if (error) *error = "Cannot make " + mediaDir.toStdString();
+            return false;
+        }
     }
     auto cancelled = [&] {
         if (cancel && cancel->load()) {
@@ -270,6 +320,10 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
             const std::string key = render ? "clip:" + std::to_string(c.id) : audioKey(m->path, c.channels);
             sourceOf[c.id] = key;
             Source& s = sources[key];
+            if (s.name.empty() && !render && m->timecode >= 0) {
+                s.timecode = m->timecode;
+                s.reel = QFileInfo(QString::fromStdString(uninterpretedPath(m->path))).completeBaseName().toStdString();
+            }
             if (s.name.empty()) {
                 s.name = render ? (c.name.empty() ? "Clip" : c.name) + " (rendered)" : QFileInfo(QString::fromStdString(uninterpretedPath(m->path))).completeBaseName().toStdString();
                 if (!render && !c.channels.empty()) {
@@ -290,7 +344,7 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
     };
     std::vector<PictureTrack> pictureTracks;
     if (options.picture) {
-        int skipped = 0, motion = 0, notDissolve = 0, fades = 0, shortened = 0;
+        int skipped = 0, motion = 0, notDissolve = 0, fades = 0, shortened = 0, overBlack = 0;
         for (const Track& t : seq.videoTracks) {
             if (t.muted) continue;
             PictureTrack pt;
@@ -302,14 +356,53 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
                 const std::string file = m ? uninterpretedPath(m->path) : std::string();
                 std::string psd;
                 int layer = 0;
-                if (!m || (m->kind != MediaKind::Video && m->kind != MediaKind::Image) || file.empty() || isImageSequencePath(file) ||
-                    parsePsdLayerPath(file, psd, layer)) {
+                if (avid.enabled && avid.bake) {
+                    // Baked: the clip rendered as it plays, so anything with a picture.
+                    if (c.duration <= 0 || (!c.isGenerator() && (!m || m->kind == MediaKind::Audio))) {
+                        ++skipped;
+                        continue;
+                    }
+                    Picture& pic = pictures["clip:" + std::to_string(c.id)];
+                    pic.baked = &c;
+                    pic.media = m;
+                    pic.name = !c.name.empty() ? c.name : m ? m->name : std::string("Clip");
+                    pic.rate = seq.fps.valid() ? seq.fps : Rational{30, 1};
+                    // The media beyond the clip's ends, for handles and dissolves: none for a ramped or reversed clip,
+                    // as much as wanted of a still or a generated picture; none at an end it animates in or out at
+                    // (the animation is timed from the clip's ends).
+                    if (!c.reverse && !c.ramped()) {
+                        const double speed = std::max(1e-6, std::fabs(c.speed));
+                        if (!m || m->kind == MediaKind::Image || m->duration <= 0) {
+                            pic.head = pic.tail = 1e6;
+                        } else {
+                            pic.head = std::floor(std::max(0.0, c.sourceIn) / speed + 1e-6);
+                            pic.tail = std::max(0.0, std::floor((m->duration * fps - c.sourceIn - double(c.duration) * speed) / speed + 1e-6));
+                        }
+                    }
+                    if (!c.animIn.type.empty()) pic.head = 0;
+                    if (!c.animOut.type.empty()) pic.tail = 0;
+                    if (&t != &seq.videoTracks.front()) ++overBlack;
+                    pic.seconds = (pic.head + double(c.duration) + pic.tail) / fps;
+                    PlacedPicture pc;
+                    pc.clip = &c;
+                    pc.picture = &pic;
+                    pc.start = c.start;
+                    pc.end = c.end();
+                    pc.sourceStart = pic.head;
+                    pc.own = pc.end - pc.start;
+                    at[c.id] = pt.clips.size();
+                    pt.clips.push_back(pc);
+                    continue;
+                }
+                // Linked, the files themselves; with Avid media left off, rendered from any picture media.
+                if (!m || (m->kind != MediaKind::Video && m->kind != MediaKind::Image) || file.empty() ||
+                    (!avid.enabled && (isImageSequencePath(file) || parsePsdLayerPath(file, psd, layer)))) {
                     ++skipped;
                     continue;
                 }
                 const Interpretation in = interpretationOf(*m);
                 const double ts = in.timeScale();  // seconds of the file per second of media time
-                Picture& pic = pictures[file];
+                Picture& pic = pictures[avid.enabled ? "media:" + std::to_string(m->id) + ":" + c.layer : file];
                 if (pic.file.empty()) {
                     pic.file = file;
                     pic.name = m->name.empty() ? QFileInfo(QString::fromStdString(file)).completeBaseName().toStdString() : m->name;
@@ -321,9 +414,15 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
                     pic.height = m->height > 0 ? m->height : seq.height;
                     pic.par = in.par > 0 ? in.par : 1;
                     pic.timecode = still ? -1 : m->timecode;
-                    pic.masterMob = aafNewMobId();
-                    pic.fileMob = aafNewMobId();
-                    if (pic.timecode >= 0) pic.tapeMob = aafNewMobId();
+                    if (avid.enabled) {  // its mobs come with the files rendered from it
+                        pic.media = m;
+                        pic.scale = ts;
+                        pic.layer = c.layer;
+                    } else {
+                        pic.masterMob = aafNewMobId();
+                        pic.fileMob = aafNewMobId();
+                        if (pic.timecode >= 0) pic.tapeMob = aafNewMobId();
+                    }
                 }
                 PlacedPicture pc;
                 pc.clip = &c;
@@ -392,7 +491,14 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
             std::sort(pt.clips.begin(), pt.clips.end(), [](const PlacedPicture& x, const PlacedPicture& y) { return x.start < y.start; });
             if (!pt.clips.empty()) pictureTracks.push_back(std::move(pt));
         }
-        if (skipped) res.warnings.push_back(std::to_string(skipped) + " video clip(s) are not linked: titles, generated clips, nested sequences, image sequences and Photoshop layers leave gaps in the picture");
+        if (skipped)
+            res.warnings.push_back(std::to_string(skipped) +
+                                   (!avid.enabled ? " video clip(s) are not linked: titles, generated clips, nested sequences, image sequences and Photoshop layers leave gaps in the picture"
+                                    : !avid.bake  ? " video clip(s) are not carried: titles, generated clips and nested sequences leave gaps in the picture (bake effects in to bring them)"
+                                                  : " video clip(s) without a picture are not carried"));
+        if (overBlack)
+            res.warnings.push_back(std::to_string(overBlack) + " clip(s) above V1 were baked over black (the media has no transparency): titles and "
+                                   "pictures in pictures there cover the tracks below");
         if (motion) res.warnings.push_back(std::to_string(motion) + " video clip(s) with speed ramps or reversed play at a constant speed forwards in the AAF");
         if (notDissolve) res.warnings.push_back(std::to_string(notDissolve) + " video transition(s) became dissolves");
         if (fades) res.warnings.push_back(std::to_string(fades) + " fade(s) to or from black are not carried");
@@ -404,9 +510,10 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
         return false;
     }
 
-    // Each source as mono 24-bit WAVs.
+    // Each source as mono 24-bit WAVs (OP-Atom files for Media Composer, their package IDs the mobs').
     std::map<std::string, int> usedNames;
     size_t done = 0;
+    const double soundShare = avid.enabled && !pictureTracks.empty() ? 0.2 : 0.9;
     for (auto& [key, s] : sources) {
         if (cancelled()) return false;
         std::vector<int> picked;  // the channels a clip plays, if it chose some
@@ -429,14 +536,194 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
         std::string base = safeName(s.name);
         if (usedNames[base]++) base += " " + std::to_string(usedNames[base]);
         for (int ch = 0; ch < channels; ++ch) {
-            const std::string file =
-                (mediaDir + "/" + QString::fromStdString(base) + (channels == 1 ? "" : ch == 0 ? " L" : " R") + ".wav").toStdString();
-            if (!writeMono24(file, *buf, ch, error)) return false;
+            const std::string file = (mediaDir + "/" + QString::fromStdString(base) + (channels == 1 ? "" : ch == 0 ? " L" : " R") +
+                                      (avid.enabled ? ".mxf" : ".wav"))
+                                         .toStdString();
+            if (avid.enabled) {
+                OpAtomFile made;
+                const std::string tc = formatTimecode(FrameTime(std::llround(std::max(0.0, s.timecode) * fps)), seqRate, false);
+                if (!writeOpAtomSound(file, *buf, ch, seqRate, tc, s.name, s.reel, error) || !readOpAtom(file, made, error)) return false;
+                if (made.materialPackage.empty() || made.filePackage.empty()) {
+                    if (error) *error = file + " has no package IDs";
+                    return false;
+                }
+                s.masterMobs.push_back(made.materialPackage);
+                s.fileMobs.push_back(made.filePackage);
+                s.tapeMobs.push_back(made.tapePackage);
+            } else if (!writeMono24(file, *buf, ch, error)) {
+                return false;
+            }
             s.files.push_back(file);
             res.mediaFiles.push_back(file);
         }
         ++done;
-        if (progress) progress(0.9 * double(done) / double(sources.size()), 0);
+        if (progress) progress(soundShare * double(done) / double(sources.size()), 0);
+    }
+
+    // With Avid media, the picture as OP-Atom files: each source's used stretches with their handles, or each clip
+    // rendered through its effects (baked), the clips pointed into them.
+    if (avid.enabled && !pictureTracks.empty()) {
+        std::string profile, pixFmt;
+        int64_t bitrate = 0;
+        avidCodecSettings(avid.codec, fps, profile, pixFmt, bitrate);
+        const int handles = std::max(0, avid.handles);
+        const Rational rate = seq.fps.valid() ? seq.fps : Rational{30, 1};
+        struct Job {
+            Picture* from = nullptr;
+            Clip clip;              // what is rendered, from frame 0
+            double first = 0;       // left off: the media time (sequence frames) at its first frame
+            FrameTime head = 0;     // baked: the frames before the clip's own first
+            double timecode = -1;   // seconds
+            std::vector<PlacedPicture*> uses;
+        };
+        std::vector<Job> jobs;
+        std::vector<std::pair<Picture*, std::vector<PlacedPicture*>>> uses;  // in the order the cut first uses them
+        for (PictureTrack& pt : pictureTracks)
+            for (PlacedPicture& pc : pt.clips) {
+                auto it = std::find_if(uses.begin(), uses.end(), [&](const auto& u) { return u.first == pc.picture; });
+                if (it == uses.end()) it = uses.insert(uses.end(), {pc.picture, {}});
+                it->second.push_back(&pc);
+            }
+        for (auto& [pic, placed] : uses) {
+            if (pic->baked) {
+                PlacedPicture& pc = *placed.front();
+                const Clip& c = *pic->baked;
+                Job job;
+                job.from = pic;
+                const FrameTime head = FrameTime(std::min(pic->head, double(std::max<FrameTime>(handles, c.start - pc.start))));
+                const FrameTime tail = FrameTime(std::min(pic->tail, double(std::max<FrameTime>(handles, pc.end - c.end()))));
+                job.clip = c;
+                job.clip.start = 0;
+                job.clip.linkGroup = 0;
+                job.clip.blendMode = "normal";
+                const bool timed = pic->media && pic->media->kind != MediaKind::Image && pic->media->duration > 0;
+                if (timed) job.clip.sourceIn -= double(head) * job.clip.speed;
+                job.clip.duration += head + tail;
+                edit::shiftKeyframes(job.clip, head);
+                job.head = head;
+                if (timed && pic->media->kind == MediaKind::Video && pic->media->timecode >= 0 && !c.reverse && !c.ramped())
+                    job.timecode = pic->media->timecode + job.clip.sourceIn / fps * interpretationOf(*pic->media).timeScale();
+                job.uses = placed;
+                jobs.push_back(std::move(job));
+                continue;
+            }
+            // Left off: the stretches of the media its clips reach, with handles, merged where they meet.
+            const bool still = pic->seconds <= 0;
+            const double frames = still ? 1e12 : std::floor(pic->media->duration * fps + 1e-6);
+            struct Stretch {
+                double lo, hi;
+                std::vector<PlacedPicture*> uses;
+            };
+            std::vector<Stretch> stretches;
+            for (PlacedPicture* pc : placed) {
+                const double m0 = pc->sourceStart / pic->scale, m1 = m0 + double(pc->end - pc->start) * pc->ratio / pic->scale;
+                const double lo = std::max(0.0, std::floor(m0 + 1e-6) - handles);
+                const double hi = std::max(lo + 1, std::min(frames, std::ceil(m1 - 1e-6) + handles));
+                stretches.push_back({lo, std::max(hi, std::ceil(m1 - 1e-6)), {pc}});
+            }
+            std::sort(stretches.begin(), stretches.end(), [](const Stretch& a, const Stretch& b) { return a.lo < b.lo; });
+            std::vector<Stretch> merged;
+            for (Stretch& st : stretches) {
+                if (!merged.empty() && st.lo <= merged.back().hi) {
+                    merged.back().hi = std::max(merged.back().hi, st.hi);
+                    merged.back().uses.insert(merged.back().uses.end(), st.uses.begin(), st.uses.end());
+                } else {
+                    merged.push_back(std::move(st));
+                }
+            }
+            for (Stretch& st : merged) {
+                Job job;
+                job.from = pic;
+                const Id id = Id(0x7f000000) + Id(4 * jobs.size());  // its own, apart from the project's, for the renderer's caches
+                job.clip.id = id;
+                job.clip.mediaId = pic->media->id;
+                job.clip.name = pic->name;
+                job.clip.duration = FrameTime(st.hi - st.lo);
+                job.clip.sourceIn = still ? 0 : st.lo;
+                job.clip.motion = makeEffect("transform", id + 1);
+                job.clip.audio = makeEffect("volume", id + 2);
+                job.clip.timing = makeEffect("time", id + 3);
+                job.clip.layer = pic->layer;
+                job.first = st.lo;
+                if (!still && pic->timecode >= 0) job.timecode = pic->timecode + st.lo / fps * pic->scale;
+                job.uses = std::move(st.uses);
+                jobs.push_back(std::move(job));
+            }
+        }
+        for (size_t j = 0; j < jobs.size(); ++j) {
+            if (cancelled()) return false;
+            Job& job = jobs[j];
+            Picture& from = *job.from;
+            std::string base = safeName(from.name);
+            if (usedNames[base]++) base += " " + std::to_string(usedNames[base]);
+            const std::string file = (mediaDir + "/" + QString::fromStdString(base) + " V.mxf").toStdString();
+            const std::string source = !from.file.empty()                                   ? from.file
+                                       : from.media && from.media->kind != MediaKind::Sequence ? uninterpretedPath(from.media->path)
+                                                                                               : std::string();
+            const std::string reel = source.empty() ? std::string() : QFileInfo(QString::fromStdString(source)).completeBaseName().toStdString();
+            Sequence alone = seq;
+            alone.videoTracks.assign(1, Track{});
+            alone.videoTracks[0].kind = TrackKind::Video;
+            alone.videoTracks[0].clips.push_back(job.clip);
+            alone.audioTracks.clear();
+            alone.buses.clear();
+            alone.captionTracks.clear();
+            alone.markers.clear();
+            ExportSettings st;
+            st.path = file;
+            st.format = "mxf_opatom";
+            st.videoCodec = "dnxhd";
+            st.profile = profile;
+            st.pixFmt = pixFmt;
+            st.videoBitrate = bitrate;
+            st.audioCodec = "none";
+            st.smartRender = false;
+            st.chapters = false;
+            st.in = 0;
+            st.out = job.clip.duration;
+            const FrameTime tcStart = FrameTime(std::llround(std::max(0.0, job.timecode) * fps));
+            st.startTimecode = formatTimecode(tcStart, rate, false);
+            st.formatMetadata["material_package_name"] = from.name;
+            if (!reel.empty()) st.formatMetadata["reel_name"] = reel;
+            const double share = (0.95 - soundShare) / double(jobs.size());
+            const ExportProgress step = [&](double f, double eta) {
+                if (progress) progress(soundShare + share * (double(j) + f), eta);
+            };
+            if (!exportSequence(p, alone, st, step, cancel, error)) return false;
+            OpAtomFile made;
+            if (!readOpAtom(file, made, error)) return false;
+            if (made.materialPackage.empty() || made.filePackage.empty()) {
+                if (error) *error = file + " has no package IDs";
+                return false;
+            }
+            Picture& pic = pictures[file];
+            pic.file = file;
+            pic.name = from.name;
+            pic.masterMob = made.materialPackage;
+            pic.fileMob = made.filePackage;
+            pic.rate = rate;
+            pic.seconds = double(made.length) / rate.toDouble();
+            pic.width = seq.width;
+            pic.height = seq.height;
+            pic.timecode = job.timecode;
+            pic.tapeMob = made.tapePackage;
+            pic.reel = reel;
+            pic.tcStart = tcStart;
+            pic.vc3 = true;
+            pic.depth = pixFmt.find("10") != std::string::npos ? 10 : 8;
+            pic.subsampling = pixFmt.rfind("yuv444", 0) == 0 ? 1 : 2;
+            res.mediaFiles.push_back(file);
+            for (PlacedPicture* pc : job.uses) {
+                pc->picture = &pic;
+                if (from.baked) {
+                    pc->sourceStart = double(pc->start - (from.baked->start - job.head));
+                    pc->ratio = 1;
+                } else {
+                    pc->sourceStart = pc->sourceStart / from.scale - job.first;
+                    pc->ratio /= from.scale;
+                }
+            }
+        }
     }
 
     // Dictionary.
@@ -445,6 +732,12 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
     dict->addToSet(0x2605, "DataDefinitions", 0x1b01, aafAuid(kTimecodeData),
                    definition(kDataDefinition, kTimecodeData, "DataDef_Timecode", "Timecode data"));
     dict->addToSet(0x2608, "ContainerDefinitions", 0x1b01, aafAuid(kContainerAAF), definition(kContainerDefinition, kContainerAAF, "ContainerDef_AAF", ""));
+    if (avid.enabled) {
+        dict->addToSet(0x2608, "ContainerDefinitions", 0x1b01, aafAuid(kContainerVc3),
+                       definition(kContainerDefinition, kContainerVc3, "MXF-GC Frame-wrapped VC-3 Pictures", ""));
+        dict->addToSet(0x2608, "ContainerDefinitions", 0x1b01, aafAuid(kContainerWav),
+                       definition(kContainerDefinition, kContainerWav, "MXF-GC Frame-wrapped Broadcast Wave audio data", ""));
+    }
     if (!pictureTracks.empty()) {
         dict->addToSet(0x2605, "DataDefinitions", 0x1b01, aafAuid(kPicture), definition(kDataDefinition, kPicture, "DataDef_Picture", "Picture data"));
         dict->addToSet(0x2608, "ContainerDefinitions", 0x1b01, aafAuid(kContainerExternal),
@@ -477,7 +770,57 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
 
     // Mobs: for each source a master mob, and a file source mob per channel.
     Obj content = make(kContentStorage);
+    // An OP-Atom file's packages as AAF mobs, slot for slot as the file has them (its timecode track 1, the essence 2):
+    // its master clip, the file and the tape it is from, so Media Composer's index of the file and the AAF agree.
+    const auto mirror = [&](const std::string& name, const std::string& masterId, const std::string& fileId, const std::string& tapeId,
+                            const std::string& reel, const char* dataDef, Rational rate, int64_t length, int64_t tcStart, Obj desc) {
+        const int64_t tcLength = std::max<int64_t>(1, int64_t(std::ceil(double(length) * seqRate.toDouble() / rate.toDouble() - 1e-9)));
+        const auto timecode = [&] {
+            Obj tc = make(kTimecode);
+            tc->weak(0x0201, AafRefTable::DataDefinitions, 0x1b01, aafAuid(kTimecodeData))
+                .i64(0x0202, tcLength)
+                .i64(0x1501, tcStart)
+                .u16(0x1502, uint16_t(std::max<long>(1, std::lround(fps))))
+                .u8(0x1503, 0);
+            return timelineSlot(1, "", 0, seqRate.num, seqRate.den, std::move(tc));
+        };
+        const auto essence = [&](const std::string& from) {
+            return timelineSlot(2, "", 1, rate.num, rate.den, sourceClip(length, 0, from.empty() ? std::string(32, '\0') : from, from.empty() ? 0 : 2, dataDef));
+        };
+        if (!tapeId.empty()) {
+            Obj tape = mob(kSourceMob, reel, tapeId);
+            tape->add(0x4403, "Slots", timecode()).add(0x4403, "Slots", essence({}));
+            tape->strong(0x4701, "EssenceDescription", make(kTapeDescriptor));
+            content->addToSet(0x1901, "Mobs", 0x4401, tapeId, std::move(tape));
+        }
+        Obj file = mob(kSourceMob, name, fileId);
+        file->add(0x4403, "Slots", timecode()).add(0x4403, "Slots", essence(tapeId));
+        file->strong(0x4701, "EssenceDescription", std::move(desc));
+        content->addToSet(0x1901, "Mobs", 0x4401, fileId, std::move(file));
+        Obj master = mob(kMasterMob, name, masterId);
+        master->add(0x4403, "Slots", timecode()).add(0x4403, "Slots", essence(fileId));
+        content->addToSet(0x1901, "Mobs", 0x4401, masterId, std::move(master));
+    };
     for (auto& [key, s] : sources) {
+        if (avid.enabled) {
+            for (size_t ch = 0; ch < s.files.size(); ++ch) {
+                Obj locator = make(kNetworkLocator);
+                locator->text(0x4001, QUrl::fromLocalFile(QString::fromStdString(s.files[ch])).toString(QUrl::FullyEncoded).toStdString());
+                Obj desc = make(kPcmDescriptor);
+                desc->rational(0x3001, kRate, 1)
+                    .i64(0x3002, s.samples)
+                    .weak(0x3004, AafRefTable::ContainerDefinitions, 0x1b01, aafAuid(kContainerWav))
+                    .rational(0x3d03, kRate, 1)
+                    .u32(0x3d07, 1)
+                    .u32(0x3d01, 24)
+                    .u16(0x3d0a, 3)
+                    .u32(0x3d09, kRate * 3)
+                    .add(0x2f01, "Locator", std::move(locator));
+                mirror(QFileInfo(QString::fromStdString(s.files[ch])).completeBaseName().toStdString(), s.masterMobs[ch], s.fileMobs[ch],
+                       s.tapeMobs[ch], s.reel, kSound, {kRate, 1}, s.samples, std::llround(std::max(0.0, s.timecode) * fps), std::move(desc));
+            }
+            continue;
+        }
         s.masterMob = aafNewMobId();
         Obj master = mob(kMasterMob, s.name, s.masterMob);
         for (size_t ch = 0; ch < s.files.size(); ++ch) {
@@ -549,14 +892,14 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
                 const double needed = sourceStart + double(length) * pc.ratio;  // sequence frames into the file
                 pc.picture->used = std::max(pc.picture->used, needed / fps);
                 if (std::fabs(pc.ratio - 1) < 1e-9) {
-                    sequence->add(0x1001, "Components", sourceClip(length, in, pc.picture->masterMob, 1, kPicture));
+                    sequence->add(0x1001, "Components", sourceClip(length, in, pc.picture->masterMob, pc.picture->vc3 ? 2 : 1, kPicture));
                 } else {
                     const int64_t used = std::max<int64_t>(1, int64_t(std::ceil(double(length) * pc.ratio - 1e-9)));  // every frame it shows
                     Obj op = component(kOperationGroup, length, kPicture);
                     Obj ratio = make(kConstantValue);
                     ratio->bytes(0x4c01, aafAuid(kSpeedRatio)).indirectRational(0x4d01, int32_t(std::llround(pc.ratio * 100000)), 100000);
                     op->weak(0x0b01, AafRefTable::OperationDefinitions, 0x1b01, aafAuid(kSpeedControl))
-                        .add(0x0b02, "InputSegments", sourceClip(used, in, pc.picture->masterMob, 1, kPicture))
+                        .add(0x0b02, "InputSegments", sourceClip(used, in, pc.picture->masterMob, pc.picture->vc3 ? 2 : 1, kPicture))
                         .addToSet(0x0b03, "Parameters", 0x1b01, aafAuid(kSpeedRatio), std::move(ratio));
                     sequence->add(0x1001, "Components", std::move(op));
                 }
@@ -643,7 +986,7 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
                 for (const Placed& n : placed)
                     if (n.crossfadeCut >= 0 && n.crossfadeCut == pc.clip->end()) next = &n;
                 const uint32_t slot = uint32_t(std::min<size_t>(size_t(ch), pc.source->files.size() - 1) + 1);
-                Obj clip = sourceClip(length, sourceStart, pc.source->masterMob, slot);
+                Obj clip = avid.enabled ? sourceClip(length, sourceStart, pc.source->masterMobs[slot - 1], 2) : sourceClip(length, sourceStart, pc.source->masterMob, slot);
                 if (fadeIn > 0) clip->i64(0x1202, fadeIn).u8(0x1203, pc.powerIn ? 2 : 1);
                 if (pc.fadeOut > 0 && !next) clip->i64(0x1204, pc.fadeOut).u8(0x1205, pc.powerOut ? 2 : 1);
                 Obj gain = gainParameter(*pc.clip, pc.clip->start - start, length);
@@ -674,6 +1017,32 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
         if (pic.masterMob.empty()) continue;
         const double rate = pic.rate.toDouble();
         const int64_t frames = std::max<int64_t>(1, std::llround((pic.seconds > 0 ? pic.seconds : pic.used) * rate));
+        Obj desc = make(kCdciDescriptor);
+        Obj locator = make(kNetworkLocator);
+        locator->text(0x4001, QUrl::fromLocalFile(QString::fromStdString(file)).toString(QUrl::FullyEncoded).toStdString());
+        // The picture's shape as shown (anamorphic footage stretched out) and its stored size.
+        const int w = std::max(1, pic.width), h = std::max(1, pic.height);
+        const int stored = std::max(1, int(std::lround(double(w) / pic.par)));
+        const int64_t aw = w, ah = h;
+        const int64_t g = std::gcd(aw, ah);
+        std::string lineMap(8, '\0');
+        if (pic.vc3) desc->bytes(0x3201, aafAuid(kVc3Coding));
+        desc->rational(0x3001, pic.rate.num, pic.rate.den)
+            .i64(0x3002, frames)
+            .weak(0x3004, AafRefTable::ContainerDefinitions, 0x1b01, aafAuid(pic.vc3 ? kContainerVc3 : kContainerExternal))
+            .u32(0x3202, uint32_t(h))
+            .u32(0x3203, uint32_t(stored))
+            .u8(0x320c, 0)  // full frame
+            .bytes(0x320d, lineMap)
+            .rational(0x320e, int32_t(aw / g), int32_t(ah / g))
+            .u32(0x3301, uint32_t(pic.depth))
+            .u32(0x3302, uint32_t(pic.subsampling))
+            .u32(0x3308, 1)
+            .add(0x2f01, "Locator", std::move(locator));
+        if (pic.vc3) {
+            mirror(pic.name, pic.masterMob, pic.fileMob, pic.tapeMob, pic.reel, kPicture, pic.rate, frames, pic.tcStart, std::move(desc));
+            continue;
+        }
         // A file with a start timecode was recorded as a source carrying it (pyaaf2's and Media Composer's "tape" mob):
         // the file's first frame sits at that timecode in it, which is how other editors match the file to the camera
         // original.
@@ -696,27 +1065,6 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
         fileMob->add(0x4403, "Slots", timelineSlot(1, "", 1, pic.rate.num, pic.rate.den,
                                                    pic.tapeMob.empty() ? sourceClip(frames, 0, std::string(32, '\0'), 0, kPicture)
                                                                        : sourceClip(frames, tcFrames, pic.tapeMob, 1, kPicture)));
-        Obj desc = make(kCdciDescriptor);
-        Obj locator = make(kNetworkLocator);
-        locator->text(0x4001, QUrl::fromLocalFile(QString::fromStdString(file)).toString(QUrl::FullyEncoded).toStdString());
-        // The picture's shape as shown (anamorphic footage stretched out) and its stored size.
-        const int w = std::max(1, pic.width), h = std::max(1, pic.height);
-        const int stored = std::max(1, int(std::lround(double(w) / pic.par)));
-        const int64_t aw = w, ah = h;
-        const int64_t g = std::gcd(aw, ah);
-        std::string lineMap(8, '\0');
-        desc->rational(0x3001, pic.rate.num, pic.rate.den)
-            .i64(0x3002, frames)
-            .weak(0x3004, AafRefTable::ContainerDefinitions, 0x1b01, aafAuid(kContainerExternal))
-            .u32(0x3202, uint32_t(h))
-            .u32(0x3203, uint32_t(stored))
-            .u8(0x320c, 0)  // full frame
-            .bytes(0x320d, lineMap)
-            .rational(0x320e, int32_t(aw / g), int32_t(ah / g))
-            .u32(0x3301, 8)
-            .u32(0x3302, 2)
-            .u32(0x3308, 1)
-            .add(0x2f01, "Locator", std::move(locator));
         fileMob->strong(0x4701, "EssenceDescription", std::move(desc));
         content->addToSet(0x1901, "Mobs", 0x4401, pic.fileMob, std::move(fileMob));
         Obj master = mob(kMasterMob, pic.name, pic.masterMob);
@@ -738,6 +1086,7 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
     if (cancelled()) return false;
     if (!writeAafFile(path, header, error)) return false;
     if (tracks.empty()) QDir().rmdir(mediaDir);  // no sound files: no folder for them
+    cleanup.keep = true;
     if (progress) progress(1.0, 0);
     if (result) *result = res;
     return true;

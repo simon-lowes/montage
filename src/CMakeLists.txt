@@ -159,6 +159,7 @@ add_library(montage_engine STATIC
   render/Shapes.h render/Shapes.cpp
   render/Title3D.h render/Title3D.cpp
   render/AafExport.h render/AafExport.cpp
+  render/AvidMedia.h render/AvidMedia.cpp
   render/ClipAnalysis.h render/ClipAnalysis.cpp
   render/FootageWords.h render/FootageWords.cpp
   render/MusicEdit.h render/MusicEdit.cpp

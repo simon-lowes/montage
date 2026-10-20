@@ -197,6 +197,7 @@
 #include "media/Loudness.h"
 #include "media/MediaPool.h"
 #include "render/AafExport.h"
+#include "render/AvidMedia.h"
 #include "render/ClipAnalysis.h"
 #include "render/RenderCache.h"
 #include "render/Compositor.h"
@@ -1138,6 +1139,8 @@ void MainWindow::buildMenus() {
         ->setObjectName(QStringLiteral("exportAaf"));
     add(file, tr("Export AAF, Sound Only (Pro Tools, Fairlight)…"), QKeySequence(), [this] { exportAafDialog(false); })
         ->setObjectName(QStringLiteral("exportAafSound"));
+    add(file, tr("Export AAF with Media (Media Composer)…"), QKeySequence(), [this] { exportAafWithMediaDialog(); })
+        ->setObjectName(QStringLiteral("exportAafAvid"));
     file->addSeparator();
     add(file, tr("&Quit"), QKeySequence::Quit, [this] { close(); });
 
@@ -8374,7 +8377,7 @@ void MainWindow::findSimilarShots() {
     statusBar()->showMessage(tr("%n moment(s) like this one", "", n), 5000);
 }
 
-bool MainWindow::exportAafTo(const QString& path, QString* summary, bool picture) {
+bool MainWindow::exportAafTo(const QString& path, QString* summary, bool picture, const AafAvidMedia& avid) {
     const Sequence* s = state_->sequence();
     if (!s) return false;
     // In the background on a copy of the project: decoding and writing the WAVs takes a while.
@@ -8382,7 +8385,7 @@ bool MainWindow::exportAafTo(const QString& path, QString* summary, bool picture
     const Id seqId = s->id;
     auto cancel = std::make_shared<std::atomic<bool>>(false);
     auto progress = std::make_shared<std::atomic<double>>(0.0);
-    QProgressDialog dlg(tr("Exporting AAF and its audio files..."), tr("Cancel"), 0, 1000, this);
+    QProgressDialog dlg(avid.enabled ? tr("Exporting AAF and its media...") : tr("Exporting AAF and its audio files..."), tr("Cancel"), 0, 1000, this);
     dlg.setWindowModality(Qt::WindowModal);
     dlg.setMinimumDuration(300);
     connect(&dlg, &QProgressDialog::canceled, this, [cancel] { *cancel = true; });
@@ -8397,12 +8400,13 @@ bool MainWindow::exportAafTo(const QString& path, QString* summary, bool picture
     QTimer poll;
     connect(&poll, &QTimer::timeout, this, [&] { dlg.setValue(int(progress->load() * 1000)); });
     poll.start(100);
-    watcher.setFuture(QtConcurrent::run([snap, seqId, path, cancel, progress, picture]() {
+    watcher.setFuture(QtConcurrent::run([snap, seqId, path, cancel, progress, picture, avid]() {
         Outcome o;
         const Sequence* sq = snap->findSequence(seqId);
         if (!sq) return o;
         AafExportOptions options;
         options.picture = picture;
+        options.avid = avid;
         o.ok = exportAaf(*snap, *sq, path.toStdString(), &o.result, [progress](double f, FrameTime) { *progress = f; }, cancel.get(),
                          &o.error, options);
         return o;
@@ -8414,6 +8418,20 @@ bool MainWindow::exportAafTo(const QString& path, QString* summary, bool picture
     if (!o.ok) {
         if (!*cancel) QMessageBox::warning(this, tr("Export AAF"), QString::fromStdString(o.error));
         return false;
+    }
+    if (avid.enabled) {
+        QString text = tr("%1: %2 video tracks, %3 clips, %4 dissolves; %5 audio tracks, %6 clips; %7 media files in \"%8\"")
+                           .arg(QFileInfo(path).fileName())
+                           .arg(o.result.videoTracks)
+                           .arg(o.result.videoClips)
+                           .arg(o.result.videoTransitions)
+                           .arg(o.result.audioTracks)
+                           .arg(o.result.clips)
+                           .arg(o.result.mediaFiles.size())
+                           .arg(QDir::toNativeSeparators(QString::fromStdString(o.result.mediaFolder)));
+        for (const std::string& w : o.result.warnings) text += "\n" + QString::fromStdString(w);
+        if (summary) *summary = text;
+        return true;
     }
     QString text = o.result.mediaFiles.empty() ? QFileInfo(path).fileName() + tr(": no sound")
                                                : tr("%1: %2 audio tracks, %3 clips, %4 crossfades; %5 WAV files in \"%6\"")
@@ -8444,6 +8462,84 @@ void MainWindow::exportAafDialog(bool picture) {
     st.setValue("lastExportDir", QFileInfo(path).absolutePath());
     QString summary;
     if (exportAafTo(path, &summary, picture)) statusBar()->showMessage(tr("Exported %1").arg(summary), 10000);
+}
+
+void MainWindow::exportAafWithMediaDialog() {
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    QSettings st = appSettings();
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Export AAF with Media"));
+    auto* v = new QVBoxLayout(&dlg);
+    auto* about = new QLabel(tr("The cut's media is written as Media Composer keeps its own, MXF OP-Atom files in a new numbered "
+                                "folder of \"Avid MediaFiles/MXF\" on the drive, with an AAF linked to them: the sequence opens "
+                                "with its media, nothing to link or import. The picture is at the sequence's size and rate."),
+                             &dlg);
+    about->setWordWrap(true);
+    v->addWidget(about);
+    auto* form = new QFormLayout;
+    auto* codec = new QComboBox(&dlg);
+    codec->setObjectName(QStringLiteral("avidCodec"));
+    for (const AvidCodec& c : avidCodecs()) codec->addItem(QString::fromUtf8(c.name), QString::fromUtf8(c.id));
+    codec->setCurrentIndex(std::max(0, codec->findData(st.value("avidCodec", "dnxhr_sq").toString())));
+    form->addRow(tr("Picture:"), codec);
+    auto* handles = new QSpinBox(&dlg);
+    handles->setObjectName(QStringLiteral("avidHandles"));
+    handles->setRange(0, 1000);
+    handles->setSuffix(tr(" frames"));
+    handles->setValue(st.value("avidHandles", 30).toInt());
+    form->addRow(tr("Handles:"), handles);
+    auto* bake = new QCheckBox(tr("Bake grades, effects and titles in (each clip a file of its own)"), &dlg);
+    bake->setObjectName(QStringLiteral("avidBake"));
+    bake->setChecked(st.value("avidBake", false).toBool());
+    form->addRow(QString(), bake);
+    auto* drive = new QLineEdit(st.value("avidDrive").toString(), &dlg);
+    drive->setObjectName(QStringLiteral("avidDrive"));
+    drive->setPlaceholderText(tr("Beside the AAF"));
+    auto* browse = new QPushButton(tr("Choose…"), &dlg);
+    connect(browse, &QPushButton::clicked, &dlg, [&] {
+        const QString d = QFileDialog::getExistingDirectory(&dlg, tr("Media Drive"), drive->text());
+        if (!d.isEmpty()) drive->setText(d);
+    });
+    auto* row = new QHBoxLayout;
+    row->addWidget(drive, 1);
+    row->addWidget(browse);
+    form->addRow(tr("Media drive:"), row);
+    v->addLayout(form);
+    auto* problem = new QLabel(&dlg);
+    problem->setObjectName(QStringLiteral("avidProblem"));
+    problem->setWordWrap(true);
+    v->addWidget(problem);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    v->addWidget(buttons);
+    // A coding the sequence cannot take (DNxHD is 1080-only, at broadcast rates) says why and cannot be chosen.
+    auto check = [&, s] {
+        const std::string why = avidCodecProblem(codec->currentData().toString().toStdString(), s->width, s->height, s->fpsValue());
+        problem->setText(QString::fromStdString(why));
+        buttons->button(QDialogButtonBox::Ok)->setEnabled(why.empty());
+    };
+    connect(codec, &QComboBox::currentIndexChanged, &dlg, check);
+    check();
+    if (dlg.exec() != QDialog::Accepted) return;
+    AafAvidMedia avid;
+    avid.enabled = true;
+    avid.codec = codec->currentData().toString().toStdString();
+    avid.handles = handles->value();
+    avid.bake = bake->isChecked();
+    avid.drive = drive->text().trimmed().toStdString();
+    st.setValue("avidCodec", codec->currentData().toString());
+    st.setValue("avidHandles", handles->value());
+    st.setValue("avidBake", bake->isChecked());
+    st.setValue("avidDrive", drive->text().trimmed());
+    const QString path = QFileDialog::getSaveFileName(
+        this, tr("Export AAF with Media"), st.value("lastExportDir").toString() + "/" + QString::fromStdString(s->name) + ".aaf",
+        tr("AAF (*.aaf)"));
+    if (path.isEmpty()) return;
+    st.setValue("lastExportDir", QFileInfo(path).absolutePath());
+    QString summary;
+    if (exportAafTo(path, &summary, true, avid)) statusBar()->showMessage(tr("Exported %1").arg(summary), 10000);
 }
 
 void MainWindow::importTimeline() {

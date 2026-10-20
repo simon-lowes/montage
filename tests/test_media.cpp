@@ -89,6 +89,7 @@
 #include "render/OGraf.h"
 #include "render/Restoration.h"
 #include "render/FilmScan.h"
+#include "render/AvidMedia.h"
 #include "render/ConformCheck.h"
 #include "media/Vector.h"
 #include "media/Beats.h"
@@ -10866,6 +10867,279 @@ private slots:
             const QJsonArray v2 = qt[1].toObject().value("components").toArray();
             QCOMPARE(v2[0].toObject().value("inputs").toArray()[0].toObject().value("length").toInt(), 41);  // 40.4 frames, all shown
         }
+    }
+
+    void aafExportWithAvidMedia() {
+        // MXF UMIDs as AAF mob IDs, as pyaaf2 reads them: FFmpeg's, and Media Composer's with the material number half
+        // swapped.
+        auto hex = [](const std::string& b) { return QByteArray::fromStdString(b).toHex().toStdString(); };
+        QCOMPARE(hex(aafMobIdFromUmid("0x060A2B340101010501010D0013533660529471345B53366000529471345B5301")),
+                 std::string("060a2b340101010501010d001353366034719452535b603600529471345b5301"));
+        QCOMPARE(hex(aafMobIdFromUmid("060a2b340101010101010f0013000000060e2b347f7f2a80a1b2c3d4e5f60718")),
+                 std::string("060a2b340101010101010f0013000000d4c3b2a1f6e51807060e2b347f7f2a80"));
+        QVERIFY(aafMobIdFromUmid("0x1234").empty());
+
+        // A 40-frame movie (320 x 240 at 25 fps) whose frames are told apart by their grey, from black to white, with a
+        // 1 kHz tone.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 320, gs.height = 240, gs.fps = {25, 1};
+        Clip ramp = makeGeneratorClip(gen, "color", 40);
+        for (const char* ch : {"color.r", "color.g", "color.b"}) {
+            ramp.generator.params[ch].addKey(0, 0.0);
+            ramp.generator.params[ch].addKey(39, 1.0);
+        }
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, ramp);
+        std::vector<float> tone(2 * 48000);
+        for (size_t i = 0; i < tone.size(); ++i) tone[i] = float(0.5 * std::sin(2 * M_PI * 1000.0 * double(i) / 48000));
+        QVERIFY(writeMonoWav(path("avid-tone.wav"), tone, 48000));
+        MediaItem toneItem = probeOrFail(gen, path("avid-tone.wav"));
+        gen.media.push_back(toneItem);
+        QVERIFY(edit::placeMedia(gen, gs, toneItem.id, 0, 0, 40, {TrackKind::Video, 1}, {TrackKind::Audio, 0}, false).ok);
+        ExportSettings st;
+        st.path = path("avid-ramp.mov");
+        st.videoCodec = "prores_ks";
+        st.audioCodec = "pcm_s16le";
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        const std::string still = path("avid-still.png");
+        {
+            QImage img(64, 48, QImage::Format_RGB32);
+            img.fill(QColor(200, 40, 40));
+            QVERIFY(img.save(QString::fromStdString(still)));
+        }
+
+        // V1: frames 5-9 and 28-33 of the movie with a 4-frame dissolve between them, sound and all; V2: the still, then
+        // frames 0-9 at double speed.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 240, s.fps = {25, 1};
+        s.name = "Avid Cut";
+        MediaItem movie = probeOrFail(p, st.path);
+        movie.timecode = 3600;  // recorded from 01:00:00:00
+        p.media.push_back(movie);
+        const MediaItem pic = probeOrFail(p, still);
+        p.media.push_back(pic);
+        QVERIFY(edit::placeMedia(p, s, movie.id, 0, 5, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, movie.id, 5, 28, 34, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id first = edit::clipAt(s, {TrackKind::Video, 0}, 0)->id;
+        QVERIFY(edit::addTransition(p, s, edit::clipAt(s, {TrackKind::Video, 0}, 6)->id, edit::Edge::In, "cross_dissolve", 4).ok);
+        while (s.videoTracks.size() < 2) edit::addTrack(p, s, TrackKind::Video);
+        QVERIFY(edit::placeMedia(p, s, pic.id, 12, 0, 4, {TrackKind::Video, 1}, {TrackKind::Audio, -1}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, movie.id, 16, 0, 10, {TrackKind::Video, 1}, {TrackKind::Audio, -1}, false).ok);
+        Clip* fast = edit::clipById(s, edit::clipAt(s, {TrackKind::Video, 1}, 16)->id);
+        fast->speed = 2;
+        fast->duration = 5;
+        const FrameTime end = s.duration();
+        QCOMPARE(end, FrameTime(21));
+
+        RenderOptions o;
+        auto grey = [&](const Project& pp, const Sequence& ss, FrameTime t) {  // the middle of the picture (an AAF has no frame size)
+            const Image img = renderSequenceFrame(pp, ss, t, o);
+            const float* px = img.at(img.width / 2, img.height / 2);
+            return std::array<float, 3>{px[0], px[1], px[2]};
+        };
+        // Each frame of the cut as Montage shows it and as the AAF's media shows it: the same frame of the movie (to a
+        // third of the step between frames), and the still where it is.
+        auto sameCut = [&](const Project& a, const Sequence& as, const Project& b, const Sequence& bs) -> QString {
+            for (FrameTime t = 0; t < end; ++t) {
+                const auto x = grey(a, as, t), y = grey(b, bs, t);
+                for (int c = 0; c < 3; ++c)
+                    if (std::fabs(x[c] - y[c]) * 39 > 0.3) return QString("frame %1: %2 against %3").arg(t).arg(x[c]).arg(y[c]);
+            }
+            return {};
+        };
+        auto importBack = [&](Project& in, const std::string& aafPath) {
+            const ImportResult ir = importAaf(in, aafPath, [](const std::string& f, MediaItem& m) { return probeMedia(f, m); });
+            if (!ir.ok || !ir.offline.empty()) qWarning("%s %zu offline", ir.error.c_str(), ir.offline.size());
+            return ir.ok && ir.offline.empty() ? in.findSequence(ir.sequence) : nullptr;
+        };
+
+        // To a drive (here a folder) for Media Composer, effects left off.
+        const QString drive = QString::fromStdString(path("avid-drive"));
+        QVERIFY(QDir().mkpath(drive));
+        const std::string aaf = (drive + "/Avid Cut.aaf").toStdString();
+        AafExportOptions opt;
+        opt.avid.enabled = true;
+        opt.avid.handles = 3;
+        AafExportResult r;
+        QVERIFY2(exportAaf(p, s, aaf, &r, {}, nullptr, &err, opt), err.c_str());
+        QCOMPARE(QString::fromStdString(r.mediaFolder), drive + "/Avid MediaFiles/MXF/1");
+        QCOMPARE(r.videoClips, 4);
+        QCOMPARE(r.videoTransitions, 1);
+        QVERIFY(!QFileInfo::exists(drive + "/Avid Cut Media"));
+        // Two stretches of the movie (frames 0-14 and 23-36: what the cut uses, the dissolve and three frames either side),
+        // the still, and the sound a mono file a channel: each OP-Atom, the picture VC-3 (DNxHR SQ), the sound PCM.
+        int pictures = 0, sounds = 0;
+        for (const std::string& f : r.mediaFiles) {
+            QVERIFY2(QFileInfo(QString::fromStdString(f)).absolutePath() == drive + "/Avid MediaFiles/MXF/1", f.c_str());
+            OpAtomFile a;
+            QVERIFY2(readOpAtom(f, a, &err), err.c_str());
+            QVERIFY2(a.opAtom, f.c_str());
+            QCOMPARE(a.materialPackage.size(), size_t(32));
+            QCOMPARE(a.filePackage.size(), size_t(32));
+            if (a.picture) {
+                ++pictures;
+                QCOMPARE(a.codec, std::string("dnxhd"));
+                QCOMPARE(a.profile, std::string("DNXHR SQ"));
+                QVERIFY(a.width == 320 && a.height == 240 && a.editRate == (Rational{25, 1}));
+                if (a.name == "avid-ramp.mov")
+                    QVERIFY2((a.length == 15 && a.timecode == "01:00:00:00") || (a.length == 14 && a.timecode == "01:00:00:23"),
+                             qPrintable(QString("%1 %2").arg(a.length).arg(QString::fromStdString(a.timecode))));
+            } else {
+                ++sounds;
+                QCOMPARE(a.codec, std::string("pcm_s24le"));
+                QVERIFY(a.timecode == "01:00:00:00" && a.reel == "avid-ramp");  // the source's
+                QVERIFY2(std::abs(a.length - 76800) < 2000, qPrintable(QString::number(a.length)));  // the movie's 1.6 s
+            }
+        }
+        QCOMPARE(pictures, 3);
+        QVERIFY(sounds >= 1);
+
+        // Montage's import rebuilds the cut frame for frame from those files.
+        {
+            Project in = makeDefaultProject();
+            const Sequence* rs = importBack(in, aaf);
+            QVERIFY(rs);
+            for (const Track& t : rs->videoTracks)
+                for (const Clip& c : t.clips) QVERIFY(in.findMedia(c.mediaId)->path.find("/Avid MediaFiles/MXF/1/") != std::string::npos);
+            QVERIFY(!rs->audioTracks.empty() && !rs->audioTracks[0].clips.empty());
+            QVERIFY(QString::fromStdString(in.findMedia(rs->audioTracks[0].clips[0].mediaId)->path).endsWith(".mxf"));
+            const QString diff = sameCut(p, s, in, *rs);
+            QVERIFY2(diff.isEmpty(), qPrintable(diff));
+        }
+        // Moved somewhere else, so no file is where the AAF's locators say: found as Media Composer finds them, by the
+        // file mob's ID among the drive's media.
+        const QString moved = QString::fromStdString(path("avid-moved"));
+        QVERIFY(QDir().rename(drive, moved));
+        {
+            Project in = makeDefaultProject();
+            const Sequence* rs = importBack(in, (moved + "/Avid Cut.aaf").toStdString());
+            QVERIFY(rs);
+            for (const Track& t : rs->videoTracks)
+                for (const Clip& c : t.clips) QVERIFY(QString::fromStdString(in.findMedia(c.mediaId)->path).startsWith(moved + "/Avid MediaFiles/MXF/1/"));
+            const QString diff = sameCut(p, s, in, *rs);
+            QVERIFY2(diff.isEmpty(), qPrintable(diff));
+        }
+
+        // An independent reader (pyaaf2) of both: each clip's master mob is its file's material package and its file mob the
+        // file's source package, at the files' own track numbers; the descriptors say VC-3 and PCM in their MXF
+        // containers.
+        if (const QByteArray python = qgetenv("MONTAGE_TEST_PYAAF2"); !python.isEmpty()) {
+            QStringList args{"-I", QStringLiteral(MONTAGE_TEST_TOOLS_DIR "/aaf_check.py"), moved + "/Avid Cut.aaf", "--mxf"};
+            for (const QFileInfo& f : QDir(moved + "/Avid MediaFiles/MXF/1").entryInfoList({"*.mxf"}, QDir::Files)) args << f.absoluteFilePath();
+            QProcess py;
+            py.start(QString::fromLocal8Bit(python), args);
+            QVERIFY(py.waitForFinished(60000));
+            QVERIFY2(py.exitCode() == 0, py.readAllStandardError().constData());
+            const QJsonObject j = QJsonDocument::fromJson(py.readAllStandardOutput()).object();
+            const QJsonObject mxf = j.value("mxf").toObject();
+            int checked = 0;
+            std::function<void(const QJsonArray&)> check = [&](const QJsonArray& parts) {
+                for (const QJsonValue& v : parts) {
+                    const QJsonObject c = v.toObject();
+                    check(c.value("inputs").toArray());
+                    if (c.value("type").toString() != "clip") continue;
+                    const QString file = QUrl(c.value("file").toString()).toLocalFile();
+                    const QJsonObject ids = mxf.value(moved + "/Avid MediaFiles/MXF/1/" + QFileInfo(file).fileName()).toObject();
+                    const bool picture = c.value("descriptor").toString() == "CDCIDescriptor";
+                    QVERIFY2(ids.value("material").toArray().contains(c.value("master_id")), qPrintable(file));
+                    QVERIFY2(ids.value("source").toArray().contains(c.value("file_id")), qPrintable(file));
+                    // The slots used are the files' essence tracks (2; 1 is the timecode track).
+                    const QString kind = picture ? "DataDef_Picture" : "DataDef_Sound";
+                    const QJsonObject tracks = ids.value("slots").toObject();
+                    QCOMPARE(tracks.value(c.value("master_id").toString()).toObject().value(QString::number(c.value("slot").toInt())).toString(), kind);
+                    QCOMPARE(tracks.value(c.value("file_id").toString()).toObject().value(QString::number(c.value("file_slot").toInt())).toString(), kind);
+                    QVERIFY(picture || c.value("descriptor").toString() == "PCMDescriptor");
+                    QCOMPARE(c.value("container").toString(), picture ? QString("0d010301-0211-0100-060e-2b340401010a") : QString("0d010301-0206-0100-060e-2b3404010101"));
+                    if (picture) QCOMPARE(c.value("compression").toString(), QString("04010202-7100-0000-060e-2b340401010a"));
+                    ++checked;
+                }
+            };
+            for (const QJsonValue& t : j.value("tracks").toArray()) check(t.toObject().value("components").toArray());
+            QVERIFY2(checked >= 6, qPrintable(QString::number(checked)));
+        }
+
+        // With a grade on the first shot (inverted): left off, the media is the shot as shot (here into the moved drive,
+        // named by its MXF folder: the next folder there); baked, as graded, each clip its own file with its handles.
+        edit::clipById(s, first)->effects.push_back(makeEffect(p, "invert"));
+        {
+            const std::string offAaf = path("avid-off.aaf");
+            opt.avid.drive = (moved + "/Avid MediaFiles/MXF").toStdString();
+            QVERIFY2(exportAaf(p, s, offAaf, &r, {}, nullptr, &err, opt), err.c_str());
+            QCOMPARE(QString::fromStdString(r.mediaFolder), moved + "/Avid MediaFiles/MXF/2");
+            Project in = makeDefaultProject();
+            const Sequence* rs = importBack(in, offAaf);
+            QVERIFY(rs);
+            QVERIFY2(std::fabs(grey(in, *rs, 0)[0] - 5.0 / 39) < 0.3 / 39, qPrintable(QString::number(grey(in, *rs, 0)[0])));  // not inverted
+        }
+        {
+            const std::string bakedAaf = path("avid-baked.aaf");
+            opt.avid.drive = path("avid-baked");
+            QVERIFY(QDir().mkpath(QString::fromStdString(opt.avid.drive)));
+            opt.avid.bake = true;
+            QVERIFY2(exportAaf(p, s, bakedAaf, &r, {}, nullptr, &err, opt), err.c_str());
+            QCOMPARE(r.videoClips, 4);
+            QCOMPARE(r.videoTransitions, 1);
+            int files = 0;
+            for (const std::string& f : r.mediaFiles) {
+                OpAtomFile a;
+                QVERIFY(readOpAtom(f, a));
+                files += a.picture;
+                if (a.picture && a.name == "avid-ramp.mov" && a.length == 11)  // the first shot's 5 frames and 3 either side (2 into the dissolve)
+                    QVERIFY(a.timecode == "01:00:00:02" && a.reel == "avid-ramp");
+            }
+            QCOMPARE(files, 4);  // a file a clip
+            Project in = makeDefaultProject();
+            const Sequence* rs = importBack(in, bakedAaf);
+            QVERIFY(rs);
+            for (const Track& t : rs->videoTracks)
+                for (const Clip& c : t.clips) QVERIFY(c.effects.empty());
+            const QString diff = sameCut(p, s, in, *rs);
+            QVERIFY2(diff.isEmpty(), qPrintable(diff));
+        }
+
+        // Through MCP.
+        {
+            const QString project = QString::fromStdString(path("avid.montage"));
+            QVERIFY(saveProject(p, project.toStdString()));
+            QVERIFY(QDir().mkpath(QString::fromStdString(path("avid-mcp"))));
+            McpServer server;
+            const QJsonObject args{{"project", project}, {"format", "aaf"}, {"output", QString::fromStdString(path("avid-mcp.aaf"))},
+                                   {"avid_media", QJsonObject{{"drive", QString::fromStdString(path("avid-mcp"))}, {"codec", "dnxhr_lb"}, {"handles", 0}}}};
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_export_timeline"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+            const QJsonObject sc = res.value("structuredContent").toObject();
+            QCOMPARE(sc.value("media_folder").toString(), QString::fromStdString(path("avid-mcp")) + "/Avid MediaFiles/MXF/1");
+            OpAtomFile a;
+            QVERIFY(readOpAtom(sc.value("media").toArray().last().toString().toStdString(), a));
+            QVERIFY(a.picture && a.profile == "DNXHR LB");
+        }
+
+        // Cancelled: nothing is left, not even the folders made for it.
+        const QString cancelled = QString::fromStdString(path("avid-cancelled"));
+        QVERIFY(QDir().mkpath(cancelled));
+        opt.avid.drive = cancelled.toStdString();
+        const std::atomic<bool> stop{true};
+        QVERIFY(!exportAaf(p, s, path("avid-cancelled.aaf"), &r, {}, &stop, &err, opt));
+        QVERIFY(QDir(cancelled).isEmpty());
+        // A drive that is not there is refused, not made.
+        opt.avid.drive = path("avid-nowhere");
+        QVERIFY(!exportAaf(p, s, path("avid-nowhere.aaf"), &r, {}, nullptr, &err, opt));
+        QVERIFY2(err.find("No such drive") != std::string::npos, err.c_str());
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(opt.avid.drive)));
+        // A coding the sequence cannot take is refused before anything is written.
+        opt.avid.codec = "dnxhd_sq";
+        opt.avid.drive = cancelled.toStdString();
+        QVERIFY(!exportAaf(p, s, path("avid-refused.aaf"), &r, {}, nullptr, &err, opt));
+        QVERIFY2(err.find("1920 x 1080") != std::string::npos, err.c_str());
+        QVERIFY(QDir(cancelled).isEmpty());
+        QVERIFY(!QFileInfo::exists(QString::fromStdString(path("avid-refused.aaf"))));
     }
 
     void motionDeblurring() {

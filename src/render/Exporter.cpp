@@ -797,7 +797,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         }
     }
     Output o;
-    int rc = avformat_alloc_output_context2(&o.oc, nullptr, imageSequence ? "image2" : nullptr, outPath.c_str());
+    int rc = avformat_alloc_output_context2(&o.oc, nullptr, imageSequence ? "image2" : s.format.empty() ? nullptr : s.format.c_str(),
+                                            outPath.c_str());
     if (rc < 0 || !o.oc) return fail("Unknown output format for " + s.path);
     if (imageSequence) av_opt_set_int(o.oc->priv_data, "start_number", s.startNumber, 0);
     o.pkt = av_packet_alloc();
@@ -1285,6 +1286,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     }
     av_dict_set(&o.oc->metadata, "encoder", "Montage", 0);
     if (!s.startTimecode.empty()) av_dict_set(&o.oc->metadata, "timecode", s.startTimecode.c_str(), 0);
+    for (const auto& [key, value] : s.formatMetadata) av_dict_set(&o.oc->metadata, key.c_str(), value.c_str(), 0);
     if (s.chapters) addChapters(o.oc, dseq, din, dout);
     if ((rc = avformat_write_header(o.oc, nullptr)) < 0) return fail("Cannot write header: " + averr(rc));
     o.headerWritten = true;

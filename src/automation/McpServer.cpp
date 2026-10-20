@@ -9753,9 +9753,16 @@ void McpServer::Impl::addTools() {
         "Write the active sequence as an EDL, OpenTimelineIO, Final Cut Pro 7 XML (Premiere, Resolve), FCPXML (Final Cut "
         "Pro) or AAF (Pro Tools, Fairlight, Media Composer: the audio tracks linked to mono WAVs written to a \"<name> "
         "Media\" folder beside it, with crossfades, fades and clip gain; the video tracks linked to the original files, "
-        "with dissolves and constant speed, unless picture is false).",
+        "with dissolves and constant speed, unless picture is false). With avid_media, an AAF for Media Composer with the "
+        "cut's media written as it keeps its own: MXF OP-Atom (DNxHD or DNxHR picture at the sequence's size and rate, mono "
+        "PCM sound) in a new numbered folder of \"Avid MediaFiles/MXF\" on the drive, so the sequence opens linked.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"format":{"type":"string","enum":["edl","otio","xml","fcpxml","aaf"]},
-            "output":{"type":"string"},"picture":{"type":"boolean","description":"AAF: include the video tracks (default true)"}},
+            "output":{"type":"string"},"picture":{"type":"boolean","description":"AAF: include the video tracks (default true)"},
+            "avid_media":{"type":"object","description":"AAF: write the media for Media Composer","properties":{
+                "drive":{"type":"string","description":"Where \"Avid MediaFiles\" goes (default: the AAF's folder)"},
+                "codec":{"type":"string","enum":["dnxhr_lb","dnxhr_sq","dnxhr_hq","dnxhr_hqx","dnxhr_444","dnxhd_lb","dnxhd_sq","dnxhd_hq"],"description":"Default dnxhr_sq; DNxHD is 1920 x 1080 only"},
+                "handles":{"type":"integer","description":"Frames of media kept either side of each use (default 30)"},
+                "bake":{"type":"boolean","description":"Render each clip through its grades and effects (titles too); default false: the source media, effects left off"}}}},
             "required":["project","format","output"]})json",
         true, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -9767,17 +9774,40 @@ void McpServer::Impl::addTools() {
                 AafExportOptions o;
                 const QJsonValue pv = a.value("picture");
                 o.picture = pv.isString() ? pv.toString().compare("false", Qt::CaseInsensitive) != 0 && pv.toString() != "0" : pv.toBool(true);
+                if (a.contains("avid_media")) {
+                    if (!a.value("avid_media").isObject()) throw ArgError{"avid_media must be an object"};
+                    const QJsonObject av = a.value("avid_media").toObject();
+                    o.avid.enabled = true;
+                    if (av.contains("drive")) o.avid.drive = absolute(av.value("drive").toString()).toStdString();
+                    if (av.contains("codec")) {
+                        if (!av.value("codec").isString()) throw ArgError{"avid_media.codec must be a string"};
+                        o.avid.codec = av.value("codec").toString().toStdString();
+                    }
+                    if (av.contains("handles")) {
+                        bool number = false;
+                        const QJsonValue h = av.value("handles");
+                        const int n = h.isString() ? h.toString().toInt(&number) : h.isDouble() ? (number = true, h.toInt()) : 0;
+                        if (!number || n < 0) throw ArgError{"avid_media.handles must be a number of frames"};
+                        o.avid.handles = n;
+                    }
+                    const QJsonValue bake = av.value("bake");
+                    o.avid.bake = bake.isString() ? bake.toString().compare("true", Qt::CaseInsensitive) == 0 || bake.toString() == "1" : bake.toBool(false);
+                }
                 if (!exportAaf(l.project, l.seq(), out.toStdString(), &r, [this](double x, FrameTime) { progress(x, "AAF"); }, nullptr, &err, o))
                     return fail(QString::fromStdString(err));
                 QJsonArray files, warnings;
                 for (const std::string& m : r.mediaFiles) files.append(QString::fromStdString(m));
                 for (const std::string& w : r.warnings) warnings.append(QString::fromStdString(w));
-                return ok(QStringLiteral("Wrote %1: %2 audio tracks, %3 clips, %4 crossfades, %5 WAV files; %6 video tracks, %7 clips, %8 dissolves")
+                QJsonObject res{{"output", out}, {"audio_tracks", r.audioTracks}, {"clips", r.clips},
+                                {"crossfades", r.transitions}, {"video_tracks", r.videoTracks}, {"video_clips", r.videoClips},
+                                {"dissolves", r.videoTransitions}, {"media", files}, {"warnings", warnings}};
+                if (o.avid.enabled) res["media_folder"] = QString::fromStdString(r.mediaFolder);
+                return ok(QStringLiteral("Wrote %1: %2 audio tracks, %3 clips, %4 crossfades, %5 %6 files; %7 video tracks, %8 clips, %9 dissolves")
                               .arg(out).arg(r.audioTracks).arg(r.clips).arg(r.transitions).arg(files.size())
-                              .arg(r.videoTracks).arg(r.videoClips).arg(r.videoTransitions),
-                          QJsonObject{{"output", out}, {"audio_tracks", r.audioTracks}, {"clips", r.clips},
-                                      {"crossfades", r.transitions}, {"video_tracks", r.videoTracks}, {"video_clips", r.videoClips},
-                                      {"dissolves", r.videoTransitions}, {"media", files}, {"warnings", warnings}});
+                              .arg(o.avid.enabled ? "MXF" : "WAV")
+                              .arg(r.videoTracks).arg(r.videoClips).arg(r.videoTransitions)
+                              + (o.avid.enabled ? QStringLiteral(" (media in %1)").arg(QString::fromStdString(r.mediaFolder)) : QString()),
+                          res);
             }
             const std::string text = f == "otio" ? exportOtio(l.project, l.seq())
                                      : f == "xml" ? exportFcp7Xml(l.project, l.seq())

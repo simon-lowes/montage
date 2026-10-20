@@ -142,5 +142,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends libheif-examples libheif-plugin-libde265 > /dev/null \
             && echo "MONTAGE_TEST_HEIFDEC=$(command -v heif-dec || command -v heif-convert)" >> "$GITHUB_ENV" \
             || echo "::warning::Could not install libheif's decoder; its part of the HDR stills test will be skipped"
+      - name: pyaaf2, an independent AAF and MXF reader for the AAF tests
+        run: |
+          (python3 -m venv ~/pyaaf2 && ~/pyaaf2/bin/pip install -q pyaaf2==1.7.1) && echo "MONTAGE_TEST_PYAAF2=$HOME/pyaaf2/bin/python" >> "$GITHUB_ENV" \
+            || echo "::warning::Could not install pyaaf2; the AAF tests' independent read-back will be skipped"
       - name: Test
         run: ctest --test-dir build --output-on-failure

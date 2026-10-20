@@ -3,8 +3,9 @@
 // through the AAF object model (strong references as storages, vectors and sets through their index streams, weak
 // references by key) and each top-level composition becomes a sequence: its picture and sound slots become tracks,
 // source clips are followed through master mobs to the file mobs and the files their network locators name (looked
-// for where the AAF says, then beside it and in its "<name> Media" folder; missing files come in offline with their
-// names and lengths), a sound slot plays its file's channel, fillers become gaps, transitions dissolves or crossfades
+// for where the AAF says, then beside it and in its "<name> Media" folder, then as Media Composer finds its own
+// media: by the file mob's ID among the MXF files of an "Avid MediaFiles/MXF" folder above it or on a drive; missing
+// files come in offline with their names and lengths), a sound slot plays its file's channel, fillers become gaps, transitions dissolves or crossfades
 // at their cut points, audio gain becomes clip gain, a constant speed ratio clip speed, and locators markers. Effects it
 // cannot carry keep their clip and are listed as warnings.
 #pragma once

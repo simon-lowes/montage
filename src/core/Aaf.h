@@ -22,6 +22,10 @@ namespace montage {
 std::string aafAuid(const std::string& text);
 // A new SMPTE UMID for a mob (32 bytes; the material number random).
 std::string aafNewMobId();
+// A mob ID from an MXF UMID, as FFmpeg reports it ("0x060A2B34...") or as its 32 bytes: the material number's UUID
+// fields little-endian, as AAF keeps them (pyaaf2 links MXF files to AAF mobs this way). "" if it is not one.
+std::string aafMobIdFromUmid(const std::string& umid);
+std::string aafMobIdFromUmidBytes(const std::string& umid);
 
 // The well-known places weak references point into (indices of the file's referenced-property table).
 enum class AafRefTable : uint16_t {

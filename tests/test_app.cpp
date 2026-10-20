@@ -3780,6 +3780,14 @@ private slots:
         QVERIFY(win_->findChild<QAction*>("exportAafSound"));
         QVERIFY(win_->exportAafTo(dir_.path() + "/sound.aaf", &summary, false));
         QVERIFY2(summary.contains("1 audio tracks") && !summary.contains("video"), qPrintable(summary));
+        // With media for Media Composer, from its own menu item: OP-Atom files in a numbered "Avid MediaFiles/MXF" folder.
+        QVERIFY(win_->findChild<QAction*>("exportAafAvid"));
+        AafAvidMedia avid;
+        avid.enabled = true;
+        avid.codec = "dnxhr_lb";
+        QVERIFY(win_->exportAafTo(dir_.path() + "/avid.aaf", &summary, true, avid));
+        QVERIFY2(summary.contains("1 audio tracks") && summary.contains("Avid MediaFiles"), qPrintable(summary));
+        QVERIFY(!QDir(dir_.path() + "/Avid MediaFiles/MXF/1").entryList({"*.mxf"}, QDir::Files).isEmpty());
         state()->newProject();
     }
 
