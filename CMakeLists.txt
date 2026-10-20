@@ -100,6 +100,11 @@ if(MONTAGE_WITH_LLAMA)
     GIT_TAG b11430
     GIT_SHALLOW TRUE)
   FetchContent_MakeAvailable(llama)
+  # b11430's models/clef.cpp calls std::find without <algorithm>, which newer libstdc++ (GCC 16, as on MSYS2) no
+  # longer brings in through <memory>.
+  if(NOT MSVC)
+    target_compile_options(llama PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-include algorithm>)
+  endif()
   set(BUILD_SHARED_LIBS ${MONTAGE_SAVED_BUILD_SHARED_LIBS})
 endif()
 
