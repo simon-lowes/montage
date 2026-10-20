@@ -8,7 +8,9 @@
 #include <QFileInfo>
 #include <QImage>
 #include <QImageWriter>
+#include <QRect>
 #include <QRegularExpression>
+#include <QSaveFile>
 #include <QTransform>
 #include <algorithm>
 #include <cmath>
@@ -909,7 +911,10 @@ bool knownPrimaries(int cicp, Primaries& out) {
 
 // A coded picture (an item's data, av01 with its av1C property or hvc1 with its hvcC) as 8-bit RGB, or as 16-bit RGBA
 // (`deep`, for pictures of more than 8 bits): full-range code values in the picture's own colour.
-QImage decodeCoded(const AvifFile& a, const AvifItem& item, const QByteArray& data, bool deep, std::string& why) {
+// (Its colour from its own colr, else `inherited` (a grid's), else what the coded picture says; its size as its ispe
+// says.)
+QImage decodeCoded(const AvifFile& a, const AvifItem& item, const QByteArray& data, bool deep, std::string& why,
+                   const ItemColour* inherited = nullptr) {
     const bool hevc = item.type == "hvc1";
     const QByteArray* config = a.property(item, hevc ? "hvcC" : "av1C");
     if ((item.type != "av01" && !hevc) || !config || config->size() < 12 || data.isEmpty()) return why = "Not a picture Montage reads", QImage();
@@ -939,10 +944,14 @@ QImage decodeCoded(const AvifFile& a, const AvifItem& item, const QByteArray& da
                 int matrix = int(frame->colorspace);
                 bool full = frame->color_range == AVCOL_RANGE_JPEG;
                 if (ItemColour c; itemColour(a, item, c) && c.nclx) matrix = c.matrix, full = c.full;
+                else if (inherited && inherited->nclx) matrix = inherited->matrix, full = inherited->full;
+                const QByteArray* ispe = a.property(item, "ispe");
+                if (ispe && ispe->size() >= 20 && (int64_t(beN(*ispe, 12, 4)) != frame->width || int64_t(beN(*ispe, 16, 4)) != frame->height))
+                    frame->width = 0;  // (refused below)
                 const AVPixelFormat to = deep ? AV_PIX_FMT_RGBA64 : AV_PIX_FMT_RGB24;
                 sws = sws_getContext(frame->width, frame->height, AVPixelFormat(frame->format), frame->width, frame->height, to,
                                      SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT | SWS_FULL_CHR_H_INP, nullptr, nullptr, nullptr);
-                if (sws) {
+                if (sws && frame->width > 0) {
                     const int coefficients = matrix >= 1 && matrix <= 10 && matrix != 2 && matrix != 3 ? matrix : SWS_CS_DEFAULT;
                     sws_setColorspaceDetails(sws, sws_getCoefficients(coefficients), full ? 1 : 0, sws_getCoefficients(SWS_CS_DEFAULT), 1, 0,
                                              1 << 16, 1 << 16);
@@ -962,17 +971,67 @@ QImage decodeCoded(const AvifFile& a, const AvifItem& item, const QByteArray& da
     return out;
 }
 
-// A grid item's output size and its rows and columns of tiles; false when it is not one Montage reads.
-bool gridLayout(QFile& f, const AvifFile& a, const AvifItem& item, int& width, int& height, int& rows, int& columns) {
+// A grid item's output size, its rows and columns of tiles and their size; false when it is not one Montage reads: its
+// tiles AV1 or HEVC, all of one size (their ispe) and just covering the output.
+bool gridLayout(QFile& f, const AvifFile& a, const AvifItem& item, int& width, int& height, int& rows, int& columns, QSize* tile = nullptr) {
     const QByteArray g = itemData(f, a, item);
     if (g.size() < 8 || g[0] != 0) return false;  // (version 0)
     const bool wide = uint8_t(g[1]) & 1;
     if (g.size() < (wide ? 12 : 8)) return false;
     rows = uint8_t(g[2]) + 1, columns = uint8_t(g[3]) + 1;
     const uint64_t w = beN(g, 4, wide ? 4 : 2), h = beN(g, wide ? 8 : 6, wide ? 4 : 2);
-    if (w == 0 || h == 0 || w > 65535 || h > 65535 || w * h > (1u << 28) || item.dimg.size() != size_t(rows) * size_t(columns)) return false;
+    if (w == 0 || h == 0 || w > 65535 || h > 65535 || w * h > (1u << 27) || item.dimg.size() != size_t(rows) * size_t(columns)) return false;
+    int64_t tw = -1, th = -1;
+    for (uint32_t id : item.dimg) {
+        const AvifItem* t = a.item(id);
+        const QByteArray* ispe = t ? a.property(*t, "ispe") : nullptr;
+        if (!t || (t->type != "av01" && t->type != "hvc1") || !ispe || ispe->size() < 20) return false;
+        const int64_t iw = int64_t(beN(*ispe, 12, 4)), ih = int64_t(beN(*ispe, 16, 4));
+        if (tw < 0) tw = iw, th = ih;
+        if (iw != tw || ih != th) return false;
+    }
+    if (tw <= 0 || th <= 0 || columns * tw < int64_t(w) || (columns - 1) * tw >= int64_t(w) || rows * th < int64_t(h) || (rows - 1) * th >= int64_t(h))
+        return false;
     width = int(w), height = int(h);
+    if (tile) *tile = QSize(int(tw), int(th));
     return true;
+}
+
+// A clean aperture (clap) in a picture `W` x `H`: the part it keeps; false when it is not one inside the picture.
+bool cleanAperture(const QByteArray& p, int W, int H, QRect& out) {
+    if (p.size() < 8 + 32) return false;
+    const auto n = [&](int i) { return double(int32_t(beN(p, 8 + i * 4, 4))); };
+    const auto u = [&](int i) { return double(beN(p, 8 + i * 4, 4)); };
+    if (u(1) == 0 || u(3) == 0 || u(5) == 0 || u(7) == 0) return false;
+    const double cw = u(0) / u(1), ch = u(2) / u(3), cx = n(4) / u(5) + (W - 1) / 2.0, cy = n(6) / u(7) + (H - 1) / 2.0;
+    const long long left = std::llround(cx - (cw - 1) / 2), top = std::llround(cy - (ch - 1) / 2), w = std::llround(cw), h = std::llround(ch);
+    if (w <= 0 || h <= 0 || left < 0 || top < 0 || left + w > W || top + h > H) return false;
+    out = QRect(int(left), int(top), int(w), int(h));
+    return true;
+}
+
+// An item's size as shown: its own (a grid's output, else its ispe), cropped to its clean aperture and turned as its
+// properties say.
+bool shownSize(QFile& f, const AvifFile& a, const AvifItem& item, int& width, int& height) {
+    if (item.type == "grid") {
+        int rows = 0, columns = 0;
+        if (!gridLayout(f, a, item, width, height, rows, columns)) return false;
+    } else if (const QByteArray* ispe = a.property(item, "ispe"); ispe && ispe->size() >= 20) {
+        width = int(std::min<uint64_t>(beN(*ispe, 12, 4), 1u << 30)), height = int(std::min<uint64_t>(beN(*ispe, 16, 4), 1u << 30));
+    } else {
+        return false;
+    }
+    for (int i : item.properties) {
+        const QByteArray& p = a.properties[size_t(i)];
+        if (p.mid(4, 4) == "clap") {
+            QRect r;
+            if (!cleanAperture(p, width, height, r)) return false;
+            width = r.width(), height = r.height();
+        } else if (p.mid(4, 4) == "irot" && p.size() >= 9 && (p[8] & 1)) {
+            std::swap(width, height);
+        }
+    }
+    return width > 0 && height > 0;
 }
 
 // An item's picture (decodeCoded's, a grid's tiles put together), turned and mirrored as its properties say.
@@ -980,16 +1039,17 @@ QImage decodeItem(QFile& f, const AvifFile& a, const AvifItem& item, bool deep, 
     QImage out;
     if (item.type == "grid") {
         int W = 0, H = 0, rows = 0, columns = 0;
-        if (!gridLayout(f, a, item, W, H, rows, columns)) return why = "Not a picture grid Montage reads", QImage();
         QSize tileSize;
+        if (!gridLayout(f, a, item, W, H, rows, columns, &tileSize)) return why = "Not a picture grid Montage reads", QImage();
+        ItemColour colour;
+        const bool coloured = itemColour(a, item, colour);
         for (int r = 0; r < rows; ++r)
             for (int c = 0; c < columns; ++c) {
                 const AvifItem* tile = a.item(item.dimg[size_t(r) * size_t(columns) + size_t(c)]);
                 if (!tile) return why = "A tile of the picture is missing", QImage();
-                const QImage t = decodeCoded(a, *tile, itemData(f, a, *tile), deep, why);
+                const QImage t = decodeCoded(a, *tile, itemData(f, a, *tile), deep, why, coloured ? &colour : nullptr);
                 if (t.isNull()) return QImage();
                 if (out.isNull()) {
-                    tileSize = t.size();
                     out = QImage(W, H, t.format());
                     if (out.isNull()) return why = "The picture is too large", QImage();
                     out.fill(Qt::black);
@@ -1003,12 +1063,27 @@ QImage decodeItem(QFile& f, const AvifFile& a, const AvifItem& item, bool deep, 
     } else {
         out = decodeCoded(a, item, itemData(f, a, item), deep, why);
     }
-    // (Its transformations in the order listed: a turn anticlockwise, a mirror about a vertical or horizontal axis.)
+    // (Its transformations in the order listed: a crop to its clean aperture, a turn anticlockwise, a mirror about a
+    // vertical or horizontal axis.)
     for (int i : item.properties) {
         const QByteArray& p = a.properties[size_t(i)];
+        const QByteArray type = p.mid(4, 4);
         if (out.isNull() || p.size() < 9) continue;
-        if (p.mid(4, 4) == "irot" && (p[8] & 3)) out = out.transformed(QTransform().rotate(-90.0 * (p[8] & 3)));
-        else if (p.mid(4, 4) == "imir") out = (p[8] & 1) ? out.mirrored(false, true) : out.mirrored(true, false);
+        if (type == "clap") {
+            QRect r;
+            if (!cleanAperture(p, out.width(), out.height(), r)) return why = "The picture's clean aperture is outside it", QImage();
+            out = out.copy(r);
+        } else if (type == "irot") {
+            const int turns = p[8] & 3;  // (exact turns: QTransform's -180 is not)
+            if (turns == 2) out = out.transformed(QTransform().rotate(180));
+            else if (turns) out = out.transformed(QTransform().rotate(turns == 1 ? 270 : 90));
+        } else if (type == "imir") {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)
+            out = out.flipped((p[8] & 1) ? Qt::Vertical : Qt::Horizontal);
+#else
+            out = (p[8] & 1) ? out.mirrored(false, true) : out.mirrored(true, false);
+#endif
+        }
     }
     return out;
 }
@@ -1070,15 +1145,7 @@ bool readHeifStill(const std::string& path, HeifStillInfo& out) {
     const AvifItem* coded = item->type == "grid" ? a.item(item->dimg[0]) : item;
     out.grid = item->type == "grid";
     out.codec = coded->type == "hvc1" ? "hevc" : "av1";
-    if (out.grid) {
-        int rows = 0, columns = 0;
-        if (!gridLayout(f, a, *item, out.width, out.height, rows, columns)) return false;
-    } else if (const QByteArray* ispe = a.property(*item, "ispe"); ispe && ispe->size() >= 20) {
-        out.width = int(beN(*ispe, 12, 4)), out.height = int(beN(*ispe, 16, 4));
-    } else {
-        return false;
-    }
-    if (const QByteArray* irot = a.property(*item, "irot"); irot && irot->size() >= 9 && (irot->at(8) & 1)) std::swap(out.width, out.height);
+    if (!shownSize(f, a, *item, out.width, out.height)) return false;
     ItemColour c;
     if (itemColour(a, *item, c) || itemColour(a, *coded, c)) out.primaries = c.primaries, out.transfer = c.transfer;
     const QByteArray* clli = a.property(*item, "clli");
@@ -1086,7 +1153,31 @@ bool readHeifStill(const std::string& path, HeifStillInfo& out) {
     if (clli && clli->size() >= 12) out.maxCll = double(beN(*clli, 8, 2)), out.maxFall = double(beN(*clli, 10, 2));
     GainMapAvif g;
     out.gainMap = findGainMap(f, a, g);
+    if (const QByteArray* hdr = out.gainMap ? a.property(*g.tmap, "clli") : nullptr; hdr && hdr->size() >= 12)
+        out.hdrMaxCll = double(beN(*hdr, 8, 2)), out.hdrMaxFall = double(beN(*hdr, 10, 2));
     return out.width > 0 && out.height > 0;
+}
+
+bool writeStillFile(const std::string& path, const QByteArray& bytes, std::string& why) {
+    const QString name = QString::fromStdString(path);
+    {
+        // (In place only where the file beside it could not be made or put in its place: on any other failure, such
+        // as a full disk, the file at `path` is left as it was.)
+        QSaveFile f(name);
+        const bool made = f.open(QIODevice::WriteOnly);
+        if (made && f.write(bytes) == bytes.size() && f.commit()) return true;
+        if (made && f.error() != QFileDevice::RenameError) return why = "Cannot write " + path + ": " + f.errorString().toStdString(), false;
+    }
+    QFile f(name);
+    const bool opened = f.open(QIODevice::WriteOnly | QIODevice::Truncate);
+    if (opened && f.write(bytes) == bytes.size() && f.flush()) {
+        f.close();
+        if (f.error() == QFileDevice::NoError) return true;
+    }
+    why = "Cannot write " + path + ": " + f.errorString().toStdString();
+    f.close();
+    if (opened) QFile::remove(name);
+    return false;
 }
 
 std::shared_ptr<const GainMapPicture> decodeHeifStill(const std::string& path, std::string* error) {
@@ -1096,8 +1187,9 @@ std::shared_ptr<const GainMapPicture> decodeHeifStill(const std::string& path, s
         AvifFile a;
         const AvifItem* item = nullptr;
         if (!f.open(QIODevice::ReadOnly) || !readAvifFile(f, a) || !(item = primaryPicture(a))) return why = "Not a HEIF still Montage reads: " + path, nullptr;
-        const QImage q = decodeItem(f, a, *item, true, why);
+        QImage q = decodeItem(f, a, *item, true, why);
         if (q.isNull()) return why = "Cannot decode " + path + ": " + why, nullptr;
+        if (q.format() != QImage::Format_RGBA64) q = q.convertToFormat(QImage::Format_RGBA64);
         auto pic = std::make_shared<GainMapPicture>();
         pic->width = q.width();
         pic->height = q.height();
@@ -1229,8 +1321,8 @@ bool writeGainMapJpeg(const Image& sdr, const ColorSpace& sdrSpace, const Image&
     const QByteArray primary =
         withSegments(baseJpeg, before + mpf(uint32_t(primarySize), uint32_t(primarySize - tiff), uint32_t(second.size())));
     const QByteArray file = primary + second;
-    QFile out(QString::fromStdString(path));
-    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate) || out.write(file) != file.size()) return fail("Cannot write " + path);
+    std::string why;
+    if (!writeStillFile(path, file, why)) return fail(why);
     if (written) *written = meta;
     return true;
 }

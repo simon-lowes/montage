@@ -603,7 +603,7 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         if (hi.gainMap) {
             m.gainMap = true;
             if (in.empty()) m.path = gainMapPath(path, true), in.gainMap = true;
-            if (in.gainMap) m.colorSpace = "rec2100pq";
+            if (in.gainMap) m.colorSpace = "rec2100pq", m.maxCll = hi.hdrMaxCll, m.maxFall = hi.hdrMaxFall;
         }
         out = m;
         return true;
@@ -672,7 +672,8 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
             if (in.empty()) m.path = gainMapPath(path, true), in.gainMap = true;
             if (in.gainMap) m.colorSpace = "rec2100pq";
         }
-        // HDR light levels: MP4 and Matroska carry them as stream side data, PNG in its cLLI chunk, AVIF as a property.
+        // HDR light levels: MP4 and Matroska carry them as stream side data, PNG in its cLLI chunk, an AVIF still as a
+        // property of its picture (or, imported as its gain map's HDR rendition, of its tone-mapped item).
         if (const AVPacketSideData* sd = av_packet_side_data_get(st->codecpar->coded_side_data, st->codecpar->nb_coded_side_data,
                                                                  AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
             sd && sd->size >= sizeof(AVContentLightMetadata)) {
@@ -680,10 +681,12 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
             m.maxCll = cl->MaxCLL;
             m.maxFall = cl->MaxFALL;
         }
-        if (StillHdrInfo still; (st->codecpar->codec_id == AV_CODEC_ID_PNG || st->codecpar->codec_id == AV_CODEC_ID_AV1) &&
-                                readStillHdrInfo(file, still) && still.maxCll > 0) {
+        if (StillHdrInfo still; st->codecpar->codec_id == AV_CODEC_ID_PNG && readStillHdrInfo(file, still) && still.maxCll > 0) {
             m.maxCll = still.maxCll;
             m.maxFall = still.maxFall;
+        } else if (HeifStillInfo hi; st->codecpar->codec_id == AV_CODEC_ID_AV1 && lowerExtension(file) == ".avif" && readHeifStill(file, hi)) {
+            const double cll = in.gainMap ? hi.hdrMaxCll : hi.maxCll, fall = in.gainMap ? hi.hdrMaxFall : hi.maxFall;
+            if (cll > 0) m.maxCll = cll, m.maxFall = fall;
         }
         int w = st->codecpar->width, h = st->codecpar->height;
 #ifdef MONTAGE_PRORES_RAW

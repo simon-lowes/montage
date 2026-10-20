@@ -66,8 +66,13 @@ struct HeifStillInfo {
     int primaries = 0, transfer = 0;
     double maxCll = 0, maxFall = 0;
     bool gainMap = false;
+    double hdrMaxCll = 0, hdrMaxFall = 0;  // (the gain map's HDR rendition's, from its tone-mapped item)
 };
 bool readHeifStill(const std::string& path, HeifStillInfo& out);
+
+// A still's file written whole: into a file beside it that then replaces it, else (where the system refuses that, as
+// Windows has) over it in place; every byte checked as written, and a part-written file removed.
+bool writeStillFile(const std::string& path, const QByteArray& bytes, std::string& why);
 std::shared_ptr<const GainMapPicture> decodeHeifStill(const std::string& path, std::string* error = nullptr);
 
 // A HEIF (AVIF or HEIC) with a gain map: a tone-mapped derived item ('tmap', ISO 21496-1's metadata) from its base (the

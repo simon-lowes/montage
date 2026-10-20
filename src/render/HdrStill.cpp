@@ -319,7 +319,33 @@ bool readPngHdrInfo(QFile& f, StillHdrInfo& out) {
     return true;
 }
 
-// An AVIF's (or other HEIF's) properties: the first colr of type nclx, clli and mdcv.
+// The ipco indexes (from 1) of the properties of a HEIF's primary item (pitm), from its meta box's contents.
+bool primaryProperties(const QByteArray& b, const Box& meta, std::vector<unsigned>& out) {
+    std::vector<Box> kids, iprp;
+    if (meta.body + 4 > meta.end() || !boxes(b, meta.body + 4, meta.end(), kids)) return false;
+    const Box *pitm = find(kids, "pitm"), *p = find(kids, "iprp");
+    if (!pitm || pitm->body + 6 > pitm->end() || !p || !boxes(b, p->body, p->end(), iprp)) return false;
+    const bool longIds = b[pitm->body] != 0;
+    if (longIds && pitm->body + 8 > pitm->end()) return false;
+    const uint32_t primary = longIds ? get32(b, pitm->body + 4) : get16(b, pitm->body + 4);
+    const Box* ipma = find(iprp, "ipma");
+    if (!ipma || ipma->body + 8 > ipma->end()) return false;
+    const int version = uint8_t(b[ipma->body]);
+    const bool wide = get32(b, ipma->body) & 1;
+    qsizetype at = ipma->body + 8;
+    for (uint32_t n = get32(b, ipma->body + 4); n > 0; --n) {
+        if (at + (version < 1 ? 3 : 5) > ipma->end()) return false;
+        const uint32_t id = version < 1 ? get16(b, at) : get32(b, at);
+        at += version < 1 ? 2 : 4;
+        const int count = uint8_t(b[at++]);
+        if (at + count * (wide ? 2 : 1) > ipma->end()) return false;
+        for (int i = 0; i < count; ++i, at += wide ? 2 : 1)
+            if (id == primary) out.push_back(wide ? get16(b, at) & 0x7fff : uint8_t(b[at]) & 0x7f);
+    }
+    return true;
+}
+
+// An AVIF's (or other HEIF's) primary item's properties: its colr of type nclx, clli and mdcv. (Not another item's: a gain-map still's tone-mapped item has the HDR rendition's.)
 bool readAvifHdrInfo(QFile& f, StillHdrInfo& out) {
     QByteArray meta;
     for (qint64 at = 0, n = 0; at + 8 <= f.size() && n < 64; ++n) {  // (meta comes first in a still)
@@ -339,10 +365,15 @@ bool readAvifHdrInfo(QFile& f, StillHdrInfo& out) {
         at += qint64(size);
     }
     std::vector<Box> top, props;
-    if (meta.isEmpty() || !boxes(meta, 0, meta.size(), top) || top.size() != 1 || !avifProperties(meta, top[0], props)) return false;
+    std::vector<unsigned> primary;
+    if (meta.isEmpty() || !boxes(meta, 0, meta.size(), top) || top.size() != 1 || !avifProperties(meta, top[0], props) ||
+        !primaryProperties(meta, top[0], primary))
+        return false;
     bool colour = false;
-    for (const Box& p : props) {
+    for (size_t i = 0; i < props.size(); ++i) {
+        const Box& p = props[i];
         const qsizetype n = p.end() - p.body;
+        if (std::find(primary.begin(), primary.end(), unsigned(i + 1)) == primary.end()) continue;
         if (p.type == "colr" && !colour && n >= 11 && meta.mid(p.body, 4) == "nclx") {
             out.primaries = int(get16(meta, p.body + 4));
             out.transfer = int(get16(meta, p.body + 6));
@@ -423,9 +454,8 @@ bool writeHdrPng(const Image& img, const ColorSpace& space, double peakNits, dou
         }
         at = next;
     }
-    QFile f(QString::fromStdString(path));
-    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(out) != out.size()) return fail("Cannot write " + path);
-    return true;
+    std::string why;
+    return writeStillFile(path, out, why) || fail(why);
 }
 
 namespace {
@@ -571,6 +601,7 @@ bool encodeStill(const Av1Picture& pic, int quality, std::initializer_list<const
     const AVPixelFormat format = pic.layout == Av1Layout::Gbr      ? (pic.bits > 8 ? AV_PIX_FMT_GBRP10LE : AV_PIX_FMT_GBRP)
                                  : pic.layout == Av1Layout::Yuv444 ? (pic.bits > 8 ? AV_PIX_FMT_YUV444P10LE : AV_PIX_FMT_YUV444P)
                                                                    : (pic.bits > 8 ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P);
+    const std::string kind = std::string(muxer) == "avif" ? "AVIF" : "HEVC picture";
     why = std::string("No ") + (std::string(muxer) == "avif" ? "AV1" : "HEVC") + " encoder in this build of FFmpeg";
     // (A small still is quick at the slower presets.)
     const int crf = std::clamp(int(std::lround((100 - std::clamp(quality, 0, 100)) * 0.63)), 0, 63);
@@ -605,7 +636,8 @@ bool encodeStill(const Av1Picture& pic, int quality, std::initializer_list<const
             break;
         }
         why = std::string("The encoder (") + name + ") would not take a " + std::to_string(pic.width) + " x " + std::to_string(pic.height) +
-              " picture";
+              (pic.bits > 8 ? " 10-bit" : "") + " picture" +
+              (pic.bits > 8 && std::string(name) == "libx265" ? " (this build of x265 may have no 10-bit support)" : "");
     }
     if (!opened) return false;
     AVStream* st = avformat_new_stream(oc, nullptr);
@@ -635,7 +667,7 @@ bool encodeStill(const Av1Picture& pic, int quality, std::initializer_list<const
     int rc = 0;
     if (!(oc->oformat->flags & AVFMT_NOFILE) && (rc = avio_open(&oc->pb, path.c_str(), AVIO_FLAG_WRITE)) < 0)
         return why = "Cannot write " + path + ": " + averr(rc), false;
-    if ((rc = avformat_write_header(oc, nullptr)) < 0) return why = "Cannot write the AVIF header: " + averr(rc), false;
+    if ((rc = avformat_write_header(oc, nullptr)) < 0) return why = "Cannot write the " + kind + "'s header: " + averr(rc), false;
     frame = av_frame_alloc();
     if (!frame) return why = "Out of memory", false;
     frame->format = ctx->pix_fmt;
@@ -653,7 +685,7 @@ bool encodeStill(const Av1Picture& pic, int quality, std::initializer_list<const
         const std::vector<uint16_t>& src = pic.planes[order[i]];
         const int w = pic.layout == Av1Layout::Yuv420 && i > 0 ? (pic.width + 1) / 2 : pic.width;
         const int h = pic.layout == Av1Layout::Yuv420 && i > 0 ? (pic.height + 1) / 2 : pic.height;
-        if (src.size() != size_t(w) * h) return why = "Cannot encode the AVIF", false;
+        if (src.size() != size_t(w) * h) return why = "Cannot encode the " + kind, false;
         for (int y = 0; y < h; ++y) {
             if (pic.bits > 8) {
                 auto* d = reinterpret_cast<uint16_t*>(frame->data[i] + size_t(y) * size_t(frame->linesize[i]));
@@ -676,7 +708,7 @@ bool encodeStill(const Av1Picture& pic, int quality, std::initializer_list<const
     };
     if (!((rc = avcodec_send_frame(ctx, frame)) >= 0 && drain() && (rc = avcodec_send_frame(ctx, nullptr)) >= 0 && drain() &&
           (rc = av_write_trailer(oc)) >= 0))
-        return why = "Cannot encode the AVIF: " + averr(rc), false;
+        return why = "Cannot encode the " + kind + ": " + averr(rc), false;
     why.clear();
     return true;
 }
@@ -693,23 +725,20 @@ bool writeAvifStill(const Image& img, const ColorSpace& space, int quality, doub
     if (img.empty()) return fail("Nothing to write");
     const bool hdr = space.hdr();
     std::string why;
-    if (!hdr)
-        return encodeStill(ycbcr420(img, space, 8), quality, {"libsvtav1", "libaom-av1", "librav1e"}, "avif", path, why) || fail(why);
-    // Encoded into a temporary file, then written with its light levels and mastering display as properties of the image.
+    // Encoded into a temporary file (so a failed encode leaves any file at `path` as it was), then written whole, an HDR
+    // one with its light levels and mastering display as properties of the image.
     QTemporaryDir dir;
     if (!dir.isValid()) return fail("Cannot make a temporary folder");
     const std::string encoded = dir.filePath("still.avif").toStdString();
-    if (!encodeStill(ycbcr420(img, space, 10), quality, {"libsvtav1", "libaom-av1", "librav1e"}, "avif", encoded, why, peakNits, maxCll, maxFall))
+    if (!encodeStill(ycbcr420(img, space, hdr ? 10 : 8), quality, {"libsvtav1", "libaom-av1", "librav1e"}, "avif", encoded, why,
+                     hdr ? peakNits : 0, maxCll, maxFall))
         return fail(why);
     QFile in(QString::fromStdString(encoded));
     if (!in.open(QIODevice::ReadOnly)) return fail("Cannot read back " + encoded);
     QByteArray bytes = in.readAll();
     in.close();
-    const bool added = addAvifLightLevels(bytes, peakNits, maxCll, maxFall);
-    // (Written in place, as the PNG is: Windows refused QSaveFile's rename into place.)
-    QFile out(QString::fromStdString(path));
-    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate) || out.write(bytes) != bytes.size())
-        return fail("Cannot write " + path + ": " + out.errorString().toStdString());
+    const bool added = hdr && addAvifLightLevels(bytes, peakNits, maxCll, maxFall);
+    if (!writeStillFile(path, bytes, why)) return fail(why);
     if (stated) *stated = added;
     return true;
 }
@@ -786,6 +815,7 @@ struct HeifRef {
 // item 1 the primary.
 bool heifFile(const std::vector<QByteArray>& brands, const std::vector<HeifItem>& items, const std::vector<HeifRef>& refs,
               const std::vector<unsigned>& altr, QByteArray& file, std::string& why) {
+    if (items.size() >= 65535) return why = "Too many pictures for this HEIF writer", false;
     std::vector<QByteArray> props;
     auto index = [&](const QByteArray& p) {
         for (size_t i = 0; i < props.size(); ++i)
@@ -870,25 +900,59 @@ bool heifFile(const std::vector<QByteArray>& brands, const std::vector<HeifItem>
     return true;
 }
 
-// A coded picture's properties as a HEIF item takes them: av1C and hvcC essential, any light levels left out (the
+// A coded picture's properties as a HEIF item takes them: av1C, hvcC and clap essential, any light levels left out (the
 // item's own are added).
 std::vector<std::pair<QByteArray, bool>> itemProperties(const std::vector<QByteArray>& from) {
     std::vector<std::pair<QByteArray, bool>> out;
     for (const QByteArray& p : from) {
         const QByteArray type = p.mid(4, 4);
-        if (type != "clli" && type != "mdcv") out.push_back({p, type == "av1C" || type == "hvcC"});
+        if (type != "clli" && type != "mdcv") out.push_back({p, type == "av1C" || type == "hvcC" || type == "clap"});
     }
     return out;
 }
 
+// `pic` at 4:2:0 filled out to an even width and height with its last column and row (its Cb and Cr planes already
+// cover them).
+Av1Picture evenPicture(Av1Picture pic) {
+    const int W = pic.width, H = pic.height, EW = W + (W & 1), EH = H + (H & 1);
+    if (pic.layout != Av1Layout::Yuv420 || (EW == W && EH == H)) return pic;
+    std::vector<uint16_t> y(size_t(EW) * EH);
+    for (int r = 0; r < EH; ++r)
+        for (int c = 0; c < EW; ++c) y[size_t(r) * EW + c] = pic.planes[0][size_t(std::min(r, H - 1)) * W + size_t(std::min(c, W - 1))];
+    pic.planes[0] = std::move(y);
+    pic.width = EW, pic.height = EH;
+    return pic;
+}
+
+// A clean aperture (clap) keeping the top left `width` x `height` of a picture `codedWidth` x `codedHeight`.
+QByteArray clapBox(int width, int height, int codedWidth, int codedHeight) {
+    QByteArray b;
+    put32(b, uint32_t(width)), put32(b, 1), put32(b, uint32_t(height)), put32(b, 1);
+    // (Its centre's offset from the picture's, in halves.)
+    put32(b, uint32_t(int32_t(width - codedWidth))), put32(b, 2), put32(b, uint32_t(int32_t(height - codedHeight))), put32(b, 2);
+    return box("clap", b);
+}
+
+// A descriptive property added to an item's: before any transformative one (clap, irot, imir), which come last.
+void addDescriptive(std::vector<std::pair<QByteArray, bool>>& properties, const std::pair<QByteArray, bool>& p) {
+    auto at = std::find_if(properties.begin(), properties.end(), [](const std::pair<QByteArray, bool>& q) {
+        const QByteArray type = q.first.mid(4, 4);
+        return type == "clap" || type == "irot" || type == "imir";
+    });
+    properties.insert(at, p);
+}
+
 // HEVC into a HEIF item: encoded into an MP4 in `dir`, whose picture and hvcC are taken, with the picture's own
-// properties.
-bool hevcItem(const Av1Picture& pic, int quality, const QTemporaryDir& dir, const QString& name, AvifCodedItem& item, std::string& why) {
+// properties. (At 4:2:0 an odd width or height is filled out to an even one, which x265 needs, and cropped back by a
+// clean aperture.)
+bool hevcItem(const Av1Picture& source, int quality, const QTemporaryDir& dir, const QString& name, AvifCodedItem& item, std::string& why) {
+    const Av1Picture pic = evenPicture(source);
     const std::string mp4 = dir.filePath(name + ".mp4").toStdString();
     if (!encodeStill(pic, quality, {"libx265"}, "mp4", mp4, why)) return false;
     if (!readMp4Hevc(mp4, item)) return why = "Cannot read back the HEVC picture", false;
     for (QByteArray& p : pictureProperties(pic.width, pic.height, pic.bits, int(pic.primaries), int(pic.transfer), int(pic.matrix)))
         item.properties.push_back(p);
+    if (pic.width != source.width || pic.height != source.height) item.properties.push_back(clapBox(source.width, source.height, pic.width, pic.height));
     return true;
 }
 
@@ -941,13 +1005,14 @@ bool writeGainMapStill(bool hevc, const Image& sdr, const ColorSpace& sdrSpace, 
     std::vector<float> target;
     if (!planGainMap(seen, sdrSpace.primaries, hdr, hdrSpace, meta, target)) return fail("Nothing to write");
     // The map in 8 bits: in AV1, R, G and B as they are (identity matrix) where the encoder takes them, else Y'CbCr
-    // 4:4:4, else 4:2:0 (SVT-AV1's only one); in HEVC, Y'CbCr 4:4:4. (Each attempt kept; the closest is used.)
+    // 4:4:4, else 4:2:0 (SVT-AV1's only one); in HEVC, Y'CbCr 4:2:0 (Main profile, which every HEVC decoder takes). (Each
+    // attempt kept; the closest is used.)
     std::vector<AvifCodedItem> attempts;
     const QByteArray chosen = encodeGainMap(target, W, H, [&](const QImage& m, QImage& back) -> QByteArray {
         AvifCodedItem item;
         const QString name = QStringLiteral("map%1").arg(attempts.size());
         if (hevc) {
-            if (!hevcItem(rgbPicture(m, Av1Layout::Yuv444), std::max(quality, 90), dir, name, item, why) || !readBack(item, back)) return {};
+            if (!hevcItem(rgbPicture(m, Av1Layout::Yuv420), std::max(quality, 90), dir, name, item, why) || !readBack(item, back)) return {};
         } else {
             const std::string mapPath = dir.filePath(name + ".avif").toStdString();
             if (!encodeStill(rgbPicture(m, Av1Layout::Gbr), std::max(quality, 90), {"libaom-av1"}, "avif", mapPath, why) &&
@@ -981,10 +1046,7 @@ bool writeGainMapStill(bool hevc, const Image& sdr, const ColorSpace& sdrSpace, 
                                                 : std::vector<QByteArray>{"avif", "avif", "mif1", "miaf", "tmap"};
     QByteArray file;
     if (!heifFile(brands, items, {{"dimg", 2, {1, 3}}, {"cdsc", 4, {3}}}, {2, 1}, file, why)) return fail(why);
-    QFile out(QString::fromStdString(path));
-    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate) || out.write(file) != file.size())
-        return fail("Cannot write " + path + ": " + out.errorString().toStdString());
-    return true;
+    return writeStillFile(path, file, why) || fail(why);
 }
 
 }  // namespace
@@ -998,8 +1060,10 @@ bool writeHeifStill(const Image& img, const ColorSpace& space, int quality, doub
     if (img.empty()) return fail("Nothing to write");
     const bool hdr = space.hdr();
     const int W = img.width, H = img.height, bits = hdr ? 10 : 8;
-    // (Larger pictures than HEVC's levels take go in tiles.)
-    if (tile <= 0 && std::max(W, H) > 8192) tile = 4096;
+    if (W > 65535 || H > 65535 || int64_t(W) * H > (1 << 27)) return fail("Too large for this HEIF writer");  // (as Montage reads them)
+    // (A picture larger than HEVC level 5.1 takes, which phones and graphics cards decode, goes in tiles of 2048.)
+    if (tile <= 0 && (int64_t(W) * H > 8912896 || std::max(W, H) > 8192)) tile = 2048;
+    tile += tile & 1;  // (tiles at 4:2:0 even)
     QTemporaryDir dir;
     if (!dir.isValid()) return fail("Cannot make a temporary folder");
     std::string why;
@@ -1011,7 +1075,7 @@ bool writeHeifStill(const Image& img, const ColorSpace& space, int quality, doub
         AvifCodedItem item;
         if (!hevcItem(ycbcr420(img, space, bits), quality, dir, "still", item, why)) return fail(why);
         items.push_back({item.type, item.data, itemProperties(item.properties)});
-        for (const auto& p : light) items[0].properties.push_back(p);
+        for (const auto& p : light) addDescriptive(items[0].properties, p);
     } else {
         // A grid (item 1) of tiles the same size, those at the right and bottom edges filled out with their last
         // column and row.
@@ -1040,17 +1104,14 @@ bool writeHeifStill(const Image& img, const ColorSpace& space, int quality, doub
             }
         // (The grid's colour, as its tiles'.)
         for (const auto& [p, essential] : items[1].properties)
-            if (p.mid(4, 4) == "colr") items[0].properties.push_back({p, false});
+            if (p.mid(4, 4) == "colr") addDescriptive(items[0].properties, {p, false});
         for (const auto& p : light) items[0].properties.push_back(p);
     }
     QByteArray file;
     if (!heifFile(hdr ? std::vector<QByteArray>{"heix", "mif1", "heix"} : std::vector<QByteArray>{"heic", "mif1", "heic"}, items, refs, {},
                   file, why))
         return fail(why);
-    QFile out(QString::fromStdString(path));
-    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate) || out.write(file) != file.size())
-        return fail("Cannot write " + path + ": " + out.errorString().toStdString());
-    return true;
+    return writeStillFile(path, file, why) || fail(why);
 }
 
 bool writeGainMapAvif(const Image& sdr, const ColorSpace& sdrSpace, const Image& hdr, const ColorSpace& hdrSpace, int quality,

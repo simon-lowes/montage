@@ -4174,6 +4174,34 @@ colorspaces:
                 QVERIFY2(why.isEmpty(), qPrintable(why));
             }
         }
+        // An odd size (which HEVC at 4:2:0 cannot code): filled out to an even one and cropped back by a clean aperture.
+        auto crop = [](const Image& from, int w, int h) {
+            Image out(w, h, Image::Uninitialized{});
+            for (int y = 0; y < h; ++y) std::memcpy(out.row(y), from.row(y), size_t(w) * 4 * sizeof(float));
+            return out;
+        };
+        auto libheifSize = [&](const std::string& heifPath) {
+            const QString out = dir.filePath("libheif-size.png");
+            QFile::remove(out);
+            QProcess t;
+            t.start(QString::fromLocal8Bit(heifDec), {QString::fromStdString(heifPath), out});
+            if (!t.waitForFinished(60000) || t.exitCode() != 0) return QSize();
+            return QImageReader(out).size();
+        };
+        {
+            const Image odd = crop(img, 61, 37);
+            const std::string oddHeic = dir.filePath("odd.heic").toStdString();
+            QVERIFY2(writeHeifStill(odd, pq, 90, 1000, res.maxCll, res.maxFall, oddHeic, &err), err.c_str());
+            HeifStillInfo hi;
+            QVERIFY(readHeifStill(oddHeic, hi) && hi.width == 61 && hi.height == 37);
+            const auto pic = decodeHeifStill(oddHeic, &err);
+            QVERIFY2(pic && pic->width == 61 && pic->height == 37, err.c_str());
+            for (int x : {16, 48})  // (the first two patches' middles, against the picture written, within 1 % of full scale)
+                for (int c = 0; c < 3; ++c)
+                    QVERIFY2(std::fabs(pic->rgba[(size_t(18) * 61 + x) * 4 + c] / 65535.0 - odd.row(18)[x * 4 + c]) <= 0.01,
+                             qPrintable(QString("odd HEIF at %1").arg(x)));
+            if (!heifDec.isEmpty()) QCOMPARE(libheifSize(oddHeic), QSize(61, 37));
+        }
 
         // As a JPEG with a gain map: the base is the SDR trim's render, the map takes it to the master. At full boost every
         // patch comes back within 2 % in nits (in the base's Rec.709 gamut: the master's green beyond it is clipped to it).
@@ -4387,6 +4415,10 @@ colorspaces:
             // It imports as HDR into a PQ sequence, every patch within 2 % in nits.
             img = readBack(gmAvif, "rec2100pq", back);
             QVERIFY(back.gainMap && back.colorSpace == "rec2100pq");
+            // With the HDR rendition's light levels (its tone-mapped item's), where its SDR base states none.
+            QVERIFY2(std::fabs(back.maxCll - res.maxCll) <= 1, qPrintable(QString::number(back.maxCll)));
+            StillHdrInfo baseInfo;
+            QVERIFY(readStillHdrInfo(gmAvif, baseInfo) && baseInfo.transfer == 13 && baseInfo.maxCll == 0);
             why = sameLight709([&](int x, int y, double out[3]) {
                 const float* px = img.at(x, y);
                 double n[3] = {codeToNits(pq, px[0]), codeToNits(pq, px[1]), codeToNits(pq, px[2])};
@@ -4460,6 +4492,7 @@ colorspaces:
             }
             img = readBack(gmHeif, "rec2100pq", back);
             QVERIFY(back.gainMap && back.colorSpace == "rec2100pq");
+            QVERIFY2(std::fabs(back.maxCll - res.maxCll) <= 1, qPrintable(QString::number(back.maxCll)));
             why = sameLight709([&](int x, int y, double out[3]) {
                 const float* px = img.at(x, y);
                 double n[3] = {codeToNits(pq, px[0]), codeToNits(pq, px[1]), codeToNits(pq, px[2])};
@@ -4479,6 +4512,14 @@ colorspaces:
                 why = libheifReads(gmHeif, img);
                 QVERIFY2(why.isEmpty(), qPrintable(why));
             }
+            // At an odd size: the base and the map cropped back by their clean apertures.
+            const Image oddSdr = crop(renderProgramFrame(p, s, 0, sdrTrim), 61, 37), oddHdr = crop(renderProgramFrame(p, s, 0, RenderOptions()), 61, 37);
+            const std::string oddGm = dir.filePath("odd-gain-map.heic").toStdString();
+            QVERIFY2(writeGainMapHeif(oddSdr, *findColorSpace("rec709"), oddHdr, pq, 95, res.maxCll, res.maxFall, oddGm, &err), err.c_str());
+            QCOMPARE(decodeHeifPicture(oddGm).size(), QSize(61, 37));
+            const auto hdrPic = decodeGainMapHeif(oddGm, &err);
+            QVERIFY2(hdrPic && hdrPic->width == 61 && hdrPic->height == 37, err.c_str());
+            if (!heifDec.isEmpty()) QCOMPARE(libheifSize(oddGm), QSize(61, 37));
         }
 
         // For SDR screens (the default): the SDR trim's render, as an 8-bit PNG.
