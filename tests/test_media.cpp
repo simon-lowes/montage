@@ -11011,6 +11011,7 @@ private slots:
         // Moved somewhere else, so no file is where the AAF's locators say: found as Media Composer finds them, by the
         // file mob's ID among the drive's media.
         const QString moved = QString::fromStdString(path("avid-moved"));
+        MediaPool::instance().clear();  // its idle decoders hold the files open, and Windows moves no folder with a file open
         QVERIFY(QDir().rename(drive, moved));
         {
             Project in = makeDefaultProject();
