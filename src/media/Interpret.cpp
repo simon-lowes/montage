@@ -65,6 +65,7 @@ Result interpretFootage(Project& p, Id media, Interpretation i) {
     if (i.rawTint < -150 || i.rawTint > 150) return Result::fail("The tint must be -150 to 150");
     if (!validStereoLayout(i.stereo)) return Result::fail("Stereo 3D is none, sbs, sbs_half, tb, tb_half or mv");
     i.eye = 0;  // which eye is read is the renderer's choice, never the media's
+    i.gainMap = interpretationOf(*m).gainMap;  // (its colour's interpretation, not the footage's)
     const bool still = m->kind == MediaKind::Image;
     if (still) i.fps = Rational{0, 1}, i.fields.clear(), i.keepPitch = false, i.stereo.clear(), i.swapEyes = false;
     // An image sequence's rate is part of its own path.

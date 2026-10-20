@@ -37,6 +37,7 @@
 #include "core/KeyframeEdit.h"
 #include "core/Multicam.h"
 #include "media/MediaPool.h"
+#include "render/ColorSpace.h"
 
 namespace montage {
 
@@ -1318,7 +1319,7 @@ void TimelineWidget::paintThumbnails(QPainter& p, const Clip& c, const QRect& bo
         FrameTime tl = c.start + FrameTime(double(i * tw) / ppf_);
         double sec = m->kind == MediaKind::Image ? 0.0 : std::clamp(c.sourceFrameAt(tl) / fps, 0.0, std::max(0.0, m->duration - 0.05));
         double quantum = std::max(1.0 / fps, double(tw) / ppf_ / fps);
-        QImage img = ThumbnailCache::instance().get(path, sec, tw, th, quantum);
+        QImage img = ThumbnailCache::instance().get(path, sec, tw, th, quantum, mediaColorSpace(*m).id);
         if (!img.isNull()) p.drawImage(QRect(x, body.top() + 1, tw, th), img);
         else p.fillRect(QRect(x, body.top() + 1, tw - 1, th), QColor(0, 0, 0, 40));
         if (m->kind == MediaKind::Image) break;

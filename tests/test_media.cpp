@@ -7328,6 +7328,32 @@ private slots:
         std::string err;
         QVERIFY2(probeMedia(out.toStdString(), m, &err), err.c_str());
         QCOMPARE(m.colorSpace.empty() ? std::string("rec709") : m.colorSpace, std::string("rec709"));
+
+        // A frame of the HDR master as a 16-bit PNG, which probes as PQ with its light levels; and for SDR screens.
+        const QString still = QString::fromStdString(path("trims/frame.png"));
+        auto said = [](const QJsonObject& r) {  // (the text after the image)
+            QString t;
+            for (const QJsonValue& c : r.value("content").toArray()) t += c.toObject().value("text").toString();
+            return t;
+        };
+        r = call("montage_render_frame", {{"at", 0.5}, {"output", still}, {"rendition", "master"}});
+        QVERIFY2(!r.value("isError").toBool() && said(r).contains("16-bit rec2100pq") && said(r).contains("MaxCLL"), qPrintable(said(r)));
+        r = call("montage_probe_media", {{"path", still}});
+        QJsonObject probed = r.value("structuredContent").toObject();
+        QCOMPARE(probed.value("color_space").toString(), QString("rec2100pq"));
+        QVERIFY(probed.value("max_cll").toDouble() >= 1 && probed.value("max_fall").toDouble() >= 1);
+        const QString sdrStill = QString::fromStdString(path("trims/frame-sdr.png"));
+        r = call("montage_render_frame", {{"at", 0.5}, {"output", sdrStill}});
+        QVERIFY2(!r.value("isError").toBool() && said(r).contains("8-bit rec709"), qPrintable(said(r)));
+        probed = call("montage_probe_media", {{"path", sdrStill}}).value("structuredContent").toObject();
+        QVERIFY(probed.value("color_space").toString() == "rec709" && !probed.contains("max_cll"));
+        QVERIFY(call("montage_render_frame", {{"at", 0.5}, {"output", still}, {"rendition", "cinema"}}).value("isError").toBool());
+        // As a JPEG with a gain map, which probes as PQ.
+        const QString gainMapped = QString::fromStdString(path("trims/frame.jpg"));
+        r = call("montage_render_frame", {{"at", 0.5}, {"output", gainMapped}, {"rendition", "master"}});
+        QVERIFY2(!r.value("isError").toBool() && said(r).contains("gain map"), qPrintable(said(r)));
+        probed = call("montage_probe_media", {{"path", gainMapped}}).value("structuredContent").toObject();
+        QVERIFY(probed.value("color_space").toString() == "rec2100pq" && probed.value("gain_map").toBool());
     }
 
     void galleryOverMcp() {

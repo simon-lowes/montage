@@ -7,6 +7,7 @@
 #include <QObject>
 #include <QSet>
 #include <QThreadPool>
+#include <string>
 
 namespace montage {
 
@@ -17,8 +18,9 @@ public:
 
     // Returns the thumbnail if cached, otherwise a null image and schedules
     // decoding; ready() fires when new thumbnails arrive. `seconds` is
-    // quantised to `quantum` to keep the cache small.
-    QImage get(const QString& path, double seconds, int width, int height, double quantum = 0.0);
+    // quantised to `quantum` to keep the cache small. `colorSpace`: the media's (ColorSpace.h id); HDR pictures are
+    // tone mapped to SDR as the viewer shows them.
+    QImage get(const QString& path, double seconds, int width, int height, double quantum = 0.0, const std::string& colorSpace = {});
 
     // Drops the file's thumbnails (it changed on disk).
     void forget(const QString& path);

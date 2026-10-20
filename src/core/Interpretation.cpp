@@ -105,6 +105,13 @@ std::string layerPath(const std::string& path, const std::string& layer) {
     return interpretedPath(path, i);
 }
 
+std::string gainMapPath(const std::string& path, bool hdr) {
+    Interpretation i;
+    parseInterpretation(path, i);
+    i.gainMap = hdr;
+    return interpretedPath(path, i);
+}
+
 std::string eyePath(const std::string& path, int eye) {
     Interpretation i;
     parseInterpretation(path, i);
@@ -139,6 +146,7 @@ bool parseInterpretation(const std::string& path, Interpretation& out) {
         else if (key == "swap") out.swapEyes = value == "1";
         else if (key == "eye") out.eye = value == "1" ? 1 : 0;
         else if (key == "layer") out.layer = unescapeValue(value);
+        else if (key == "gainmap") out.gainMap = value == "1";
     }
     if (!out.conformed()) out.fps = out.fileFps = Rational{0, 1};
     return !out.empty();
@@ -173,6 +181,7 @@ std::string interpretedPath(const std::string& path, const Interpretation& i) {
     if (i.swapEyes) add("swap=1");
     if (i.eye) add("eye=1");
     if (!i.layer.empty()) add("layer=" + escapeValue(i.layer));
+    if (i.gainMap) add("gainmap=1");
     return items.empty() ? out : out + kMark + items;
 }
 

@@ -73,7 +73,8 @@ LicencesDialog::LicencesDialog(QWidget* parent) : QDialog(parent) {
            "<p>Its source code is at <a href=\"https://github.com/simon-lowes/montage\">github.com/simon-lowes/montage</a>, "
            "and the source for each release, including every library its packages bundle, is attached to the "
            "release.</p>"
-           "<p>This copy runs with FFmpeg %2 (%3) and Qt %4 (LGPL-3.0).</p>")
+           "<p>This copy runs with FFmpeg %2 (%3) and Qt %4 (LGPL-3.0).</p>"
+           "<p>This product includes Gain Map technology under license by Adobe.</p>")
                 .arg(QStringLiteral(MONTAGE_VERSION), ffmpegVersion().toHtmlEscaped(), ffmpegLicence().toHtmlEscaped(),
                      QString::fromLatin1(qVersion())) +
         "<pre>" + readText(":/montage/licences/LICENSE-EXCEPTION").toHtmlEscaped() + "</pre>");

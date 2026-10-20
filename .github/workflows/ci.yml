@@ -118,5 +118,24 @@ jobs:
         run: |
           scripts/build-iamfdec.sh ~/iamfdec && echo "MONTAGE_TEST_IAMFDEC=$HOME/iamfdec/bin/iamfdec" >> "$GITHUB_ENV" \
             || echo "::warning::Could not build the reference IAMF decoder; its part of the IAMF test will be skipped"
+      - name: Cache the reference gain-map decoder
+        uses: actions/cache@v4
+        with:
+          path: ~/ultrahdr
+          key: ultrahdr-${{ runner.os }}-${{ hashFiles('scripts/build-ultrahdr.sh') }}
+      - name: The reference gain-map decoder for the HDR stills test
+        run: |
+          scripts/build-ultrahdr.sh ~/ultrahdr && echo "MONTAGE_TEST_UHDR=$HOME/ultrahdr/bin/ultrahdr_app" >> "$GITHUB_ENV" \
+            || echo "::warning::Could not build the reference gain-map decoder; its part of the HDR stills test will be skipped"
+      - name: Cache the reference gain-map AVIF reader
+        uses: actions/cache@v4
+        with:
+          path: ~/libavif
+          key: libavif-${{ runner.os }}-${{ hashFiles('scripts/build-avifgainmaputil.sh') }}
+      - name: The reference gain-map AVIF reader for the HDR stills test
+        run: |
+          (sudo apt-get update > /dev/null && sudo apt-get install -y --no-install-recommends libdav1d-dev > /dev/null && scripts/build-avifgainmaputil.sh ~/libavif) \
+            && echo "MONTAGE_TEST_AVIFGAINMAP=$HOME/libavif/bin/avifgainmaputil" >> "$GITHUB_ENV" \
+            || echo "::warning::Could not build libavif's avifgainmaputil; its part of the HDR stills test will be skipped"
       - name: Test
         run: ctest --test-dir build --output-on-failure

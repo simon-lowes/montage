@@ -5,6 +5,8 @@
 #include <cmath>
 
 #include "media/MediaPool.h"
+#include "media/Image.h"
+#include "render/ColorSpace.h"
 
 namespace montage {
 
@@ -22,19 +24,27 @@ void ThumbnailCache::forget(const QString& path) {
     order_.removeIf([&](const QString& k) { return k.startsWith(prefix); });
 }
 
-QImage ThumbnailCache::get(const QString& path, double seconds, int width, int height, double quantum) {
+QImage ThumbnailCache::get(const QString& path, double seconds, int width, int height, double quantum, const std::string& colorSpace) {
     if (path.isEmpty() || width <= 0 || height <= 0) return {};
     if (quantum > 0) seconds = std::floor(seconds / quantum) * quantum;
+    const ColorSpace* hdr = findColorSpace(colorSpace);
+    if (hdr && !hdr->hdr()) hdr = nullptr;
     QString key = QStringLiteral("%1|%2|%3x%4").arg(path).arg(qint64(std::llround(seconds * 1000))).arg(width).arg(height);
+    if (hdr) key += '|' + QString::fromStdString(hdr->id);
     QMutexLocker lock(&m_);
     auto it = cache_.find(key);
     if (it != cache_.end()) return it.value();
     if (pending_.contains(key)) return {};
     pending_.insert(key);
-    pool_.start([this, key, path, seconds, width, height] {
+    pool_.start([this, key, path, seconds, width, height, hdr] {
         Frame16Ptr f = MediaPool::instance().videoFrame(path.toStdString(), seconds, width, height);
         QImage img;
-        if (f) {
+        if (f && hdr) {
+            Image im = toImage(*f);
+            convertColor(im, *hdr, rec709Space());
+            img = QImage(im.width, im.height, QImage::Format_RGBA8888);
+            toRgba8(im, img.bits(), size_t(img.bytesPerLine()));
+        } else if (f) {
             img = QImage(f->width, f->height, QImage::Format_RGBA8888);
             for (int y = 0; y < f->height; ++y) {
                 uchar* d = img.scanLine(y);

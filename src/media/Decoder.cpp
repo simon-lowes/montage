@@ -32,6 +32,7 @@ extern "C" {
 #include <libavutil/channel_layout.h>
 #include <libavutil/display.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/mastering_display_metadata.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/spherical.h>
@@ -43,6 +44,8 @@ extern "C" {
 
 #include "HwAccel.h"
 #include "render/ColorSpace.h"
+#include "render/HdrStill.h"
+#include "media/GainMap.h"
 
 namespace montage {
 
@@ -72,23 +75,49 @@ std::string averr(int code) {
     return buf;
 }
 
+// A still that may hold a gain map (its metadata read to find out, so only JPEG and AVIF names): 1 JPEG, 2 AVIF, else 0.
+int gainMapKind(const std::string& path) {
+    std::string ext = path.substr(path.find_last_of('.') == std::string::npos ? path.size() : path.find_last_of('.'));
+    for (char& c : ext) c = char(std::tolower(static_cast<unsigned char>(c)));
+    return ext == ".jpg" || ext == ".jpeg" || ext == ".jpe" ? 1 : ext == ".avif" ? 2 : 0;
+}
+
 bool isStillFormat(const AVFormatContext* fmt) {
     if (!fmt || !fmt->iformat || !fmt->iformat->name) return false;
     std::string n = fmt->iformat->name;
     if (n == "image2" && fmt->url && av_filename_number_test(fmt->url)) return false;  // a numbered sequence plays
     if (n == "image2" || n == "image2pipe") return true;
+    // AVIF (the MP4 demuxer's): an avif brand, major or compatible, and none for an image sequence (avis, msf1), which
+    // plays.
+    if (n.rfind("mov,", 0) == 0) {
+        const AVDictionaryEntry* major = av_dict_get(fmt->metadata, "major_brand", nullptr, 0);
+        const AVDictionaryEntry* compatible = av_dict_get(fmt->metadata, "compatible_brands", nullptr, 0);
+        std::string brands = compatible ? compatible->value : "";
+        if (major) brands += major->value;
+        bool avif = false, sequence = false;
+        for (size_t i = 0; i + 4 <= brands.size(); i += 4) {
+            const std::string b = brands.substr(i, 4);
+            avif = avif || b == "avif";
+            sequence = sequence || b == "avis" || b == "msf1";
+        }
+        return avif && !sequence;
+    }
     return n.size() > 5 && n.compare(n.size() - 5, 5, "_pipe") == 0;
 }
 
 int bestVideoStream(AVFormatContext* fmt) {
     int best = -1;
     int64_t bestArea = -1;
+    bool bestDefault = false;
+    // The largest picture; of equal ones, the default (an AVIF's primary item, not a gain map the same size).
     for (unsigned i = 0; i < fmt->nb_streams; ++i) {
         AVStream* st = fmt->streams[i];
         if (st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) continue;
         if (st->disposition & AV_DISPOSITION_ATTACHED_PIC) continue;
         int64_t area = int64_t(st->codecpar->width) * st->codecpar->height;
-        if (area > bestArea) {
+        const bool isDefault = st->disposition & AV_DISPOSITION_DEFAULT;
+        if (area > bestArea || (area == bestArea && isDefault && !bestDefault)) {
+            bestDefault = isDefault;
             bestArea = area;
             best = int(i);
         }
@@ -590,6 +619,29 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         m.colorSpace = colorSpaceFromTags(pri ? pri : "", trc ? trc : "");
         if (const std::string proj = streamProjection(st); !proj.empty()) m.projection = proj;
         if (m.colorSpace == "rec709") m.colorSpace.clear();
+        // A JPEG or AVIF with a gain map: imported as its HDR rendition (said on the path, so a project saved before this
+        // reads keep the SDR picture they were made with).
+        GainMapJpeg jpeg;
+        GainMapMetadata avif;
+        if ((st->codecpar->codec_id == AV_CODEC_ID_MJPEG && gainMapKind(file) == 1 && readGainMapJpeg(file, jpeg) && !jpeg.metadata.baseIsHdr) ||
+            (st->codecpar->codec_id == AV_CODEC_ID_AV1 && gainMapKind(file) == 2 && readGainMapAvif(file, &avif) && !avif.baseIsHdr)) {
+            m.gainMap = true;
+            if (in.empty()) m.path = gainMapPath(path, true), in.gainMap = true;
+            if (in.gainMap) m.colorSpace = "rec2100pq";
+        }
+        // HDR light levels: MP4 and Matroska carry them as stream side data, PNG in its cLLI chunk, AVIF as a property.
+        if (const AVPacketSideData* sd = av_packet_side_data_get(st->codecpar->coded_side_data, st->codecpar->nb_coded_side_data,
+                                                                 AV_PKT_DATA_CONTENT_LIGHT_LEVEL);
+            sd && sd->size >= sizeof(AVContentLightMetadata)) {
+            const auto* cl = reinterpret_cast<const AVContentLightMetadata*>(sd->data);
+            m.maxCll = cl->MaxCLL;
+            m.maxFall = cl->MaxFALL;
+        }
+        if (StillHdrInfo still; (st->codecpar->codec_id == AV_CODEC_ID_PNG || st->codecpar->codec_id == AV_CODEC_ID_AV1) &&
+                                readStillHdrInfo(file, still) && still.maxCll > 0) {
+            m.maxCll = still.maxCll;
+            m.maxFall = still.maxFall;
+        }
         int w = st->codecpar->width, h = st->codecpar->height;
 #ifdef MONTAGE_PRORES_RAW
         // ProRes RAW is developed to ACEScct (the scene's whole range), at its size less the recommended crop.
@@ -821,6 +873,39 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
             curPts_ = nextPts_ = -1;
             return true;
         }
+    }
+    // A JPEG or AVIF with a gain map read as its HDR rendition (PQ), made from the base and the map.
+    if (const std::string file = uninterpretedPath(path); in.gainMap && gainMapKind(file)) {
+        std::string why;
+        const std::shared_ptr<const GainMapPicture> pic = gainMapKind(file) == 1 ? decodeGainMapJpeg(file, &why) : decodeGainMapAvif(file, &why);
+        if (!pic) {
+            if (error) *error = why;
+            close();
+            return false;
+        }
+        raw_ = av_frame_alloc();
+        if (!raw_) return false;
+        raw_->format = AV_PIX_FMT_RGBA64;  // host byte order
+        raw_->width = pic->width;
+        raw_->height = pic->height;
+        raw_->color_range = AVCOL_RANGE_JPEG;
+        if (av_frame_get_buffer(raw_, 0) < 0) {
+            if (error) *error = "Out of memory reading " + path;
+            close();
+            return false;
+        }
+        for (int y = 0; y < pic->height; ++y)
+            std::memcpy(raw_->data[0] + size_t(y) * size_t(raw_->linesize[0]), pic->rgba.data() + size_t(y) * size_t(pic->width) * 4,
+                        size_t(pic->width) * 4 * sizeof(uint16_t));
+        dispW_ = pic->width;
+        dispH_ = pic->height;
+        fps_ = 25.0;
+        duration_ = 0;
+        still_ = true;
+        rotation_ = 0;
+        origin_ = 0;
+        curPts_ = nextPts_ = -1;
+        return true;
     }
     // OpenEXR read with the OpenEXR library: a layer of a multi-layer file, or a compression FFmpeg doesn't read.
     if (ImageSequence seq; exrByLibrary(uninterpretedPath(path), in, &seq)) {

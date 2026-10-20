@@ -1039,6 +1039,8 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 const bool proxy = !m->proxyPath.empty() && path == m->proxyPath;
                 if (!proxy || fileOnline(m->path)) path = layerPath(proxy ? m->path : path, c.layer);
             }
+            // A gain-map JPEG in an SDR sequence: its own SDR picture, rather than its HDR rendition tone mapped.
+            if (m->gainMap && path == m->path && m->colorOverride.empty() && !sequenceColorSpace(seq).hdr()) path = gainMapPath(path, false);
             const bool original = m->proxyPath.empty() || path != m->proxyPath;  // the file itself, not its proxy
             mw = m->width > 0 ? m->width : SW;
             mh = m->height > 0 ? m->height : SH;
@@ -1107,7 +1109,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             // transform.
             if (deferFrame) {
                 const int sampling = c.timing.empty() ? 0 : int(c.timing.p("sampling", lt, 0));
-                const ColorSpace& from = original ? mediaColorSpace(*m) : pictureColorSpace(*m, path);
+                const ColorSpace& from = pictureColorSpace(*m, path);
                 if (!ofxFetch && !(sampling > 0 && m->kind == MediaKind::Video) && !denoiseEffect(seq, c) &&
                     !enabledEffect(seq, c, "motion_deblur") && !enabledEffect(seq, c, "motion_blur") && !enabledEffect(seq, c, "deflicker") &&
                     !enabledEffect(seq, c, "dirt_removal") && !enabledEffect(seq, c, "dust_spots") && !enabledEffect(seq, c, "lip_sync") &&
@@ -1288,7 +1290,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (vr)
                 src = reframeEquirect(src, vr->p("yaw", lt, 0), vr->p("pitch", lt, 0), vr->p("roll", lt, 0), vrFov, vrView, viewW, viewH,
                                       projectionSpan(m->projection));
-            const ColorSpace& from = original ? mediaColorSpace(*m) : pictureColorSpace(*m, path);
+            const ColorSpace& from = pictureColorSpace(*m, path);
             // Camera footage: the looks first in its chain made on the camera's picture (CDLs and LUTs applied in a
             // scene-referred space, the ACES gamut compression), in their order, on the picture as it comes and before
             // the input transform's display rendering, as an AMF's pipeline runs them.

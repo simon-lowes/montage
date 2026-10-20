@@ -531,6 +531,12 @@ QJsonObject mediaJson(const MediaItem& m) {
         o["height"] = m.height;
         o["fps"] = m.fps.toDouble();
         o["video_codec"] = QString::fromStdString(m.videoCodec);
+        o["color_space"] = QString::fromStdString(m.colorSpace.empty() ? std::string("rec709") : m.colorSpace);
+        if (m.maxCll > 0) {
+            o["max_cll"] = m.maxCll;
+            o["max_fall"] = m.maxFall;
+        }
+        if (m.gainMap) o["gain_map"] = true;
     }
     if (m.hasAudio) {
         o["sample_rate"] = m.sampleRate;
@@ -754,7 +760,8 @@ McpServer::Impl::CloneVoice McpServer::Impl::cloneVoiceArg(const QJsonObject& a,
 
 void McpServer::Impl::addTools() {
     add("montage_probe_media", "Probe media",
-        "Describe a video, audio or image file: duration, size, frame rate and codecs; for an OpenEXR render its layers "
+        "Describe a video, audio or image file: duration, size, frame rate, codecs, colour space and any HDR light levels "
+        "(max_cll, max_fall in nits); for an OpenEXR render its layers "
         "(AOVs, \"\" the main picture) and Cryptomattes with their object names.",
         R"json({"type":"object","properties":{"path":{"type":"string","description":"Media file"}},"required":["path"]})json", true,
         [](const QJsonObject& a) {
@@ -7741,7 +7748,10 @@ void McpServer::Impl::addTools() {
         "Render the program at a timeline time and return it as an image (to check an edit), optionally saving a PNG.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
             "width":{"type":"integer","default":640,"description":"Width of the returned image"},
-            "output":{"type":"string","description":"Also save the full-size frame here (PNG)"},
+            "output":{"type":"string","description":"Also save the full-size frame here (PNG, JPEG, TIFF or AVIF by extension)"},
+            "rendition":{"type":"string","description":"An HDR sequence's frame: \"\" (default) as SDR screens show it (its SDR trim target, else tone mapped to Rec.709), \"master\" (saved as a 16-bit PNG with cICP, mDCV and cLLI, a 10-bit AVIF, or a JPEG with a gain map over its SDR rendition), or a trim target's id"},
+            "gain_map":{"type":"boolean","default":false,"description":"An HDR AVIF as an 8-bit SDR base with a gain map to the HDR rendition (ISO 21496-1), rather than 10-bit PQ or HLG"},
+            "quality":{"type":"integer","minimum":0,"maximum":100,"default":90,"description":"JPEG and AVIF quality"},
             "stereo_view":{"type":"string","enum":["left","right","anaglyph","sbs","sbs_half","tb","tb_half","difference"],"default":"left","description":"A stereoscopic 3D sequence: which eye, both, or where they differ"}},"required":["project","at"]})json", true,
         [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -7749,6 +7759,13 @@ void McpServer::Impl::addTools() {
             const FrameTime at = timeArg(a.value("at"), s, "at");
             const int w = std::clamp(a.value("width").toInt(640), 64, 1920);
             RenderOptions ro;
+            const ColorSpace* space = nullptr;
+            double peak = 0;
+            std::string err;
+            // The image returned is for looking at: as SDR screens show it, unless a target is asked for.
+            const std::string rendition = str(a, "rendition").toStdString();
+            if (!stillRendition(s, rendition == "master" ? "" : rendition, ro, space, peak, &err)) throw ArgError{QString::fromStdString(err)};
+            if (space->hdr()) ro.displaySpace = "rec709";  // (an HDR target, as the viewer shows it)
             ro.scale = std::min(1.0, double(w) / std::max(1, s.width));
             ro.captions = true;
             if (a.contains("stereo_view") && !stereoViewFromName(str(a, "stereo_view").toStdString(), ro.stereoView))
@@ -7761,8 +7778,8 @@ void McpServer::Impl::addTools() {
             QBuffer buf(&png);
             buf.open(QIODevice::WriteOnly);
             q.save(&buf, "PNG");
+            QString saved;
             if (a.contains("output")) {
-                std::string err;
                 if (s.stereo3d && ro.stereoView != StereoView::Left) {
                     // The view asked for, at full size.
                     RenderOptions full;
@@ -7773,11 +7790,20 @@ void McpServer::Impl::addTools() {
                     QImage q8(big.width, big.height, QImage::Format_RGBA8888);
                     toRgba8(big, q8.bits(), size_t(q8.bytesPerLine()));
                     if (!q8.save(absolute(str(a, "output")), "PNG")) return fail(QStringLiteral("Cannot write %1").arg(str(a, "output")));
-                } else if (!exportStill(l.project, s, at, absolute(str(a, "output")).toStdString(), &err)) {
-                    return fail(QString::fromStdString(err));
+                } else {
+                    StillOptions so;
+                    so.rendition = rendition;
+                    so.quality = std::clamp(a.value("quality").toInt(90), 0, 100);
+                    so.gainMap = a.value("gain_map").toBool();
+                    StillResult res;
+                    if (!exportStill(l.project, s, at, absolute(str(a, "output")).toStdString(), &err, so, &res))
+                        return fail(QString::fromStdString(err));
+                    saved = QStringLiteral("; saved %1-bit %2").arg(res.bits).arg(QString::fromStdString(res.colorSpace));
+                    if (res.gainMap) saved += QStringLiteral(" (an SDR base with a gain map)");
+                    if (res.maxCll > 0) saved += QStringLiteral(" (MaxCLL %1, MaxFALL %2 nits)").arg(res.maxCll).arg(res.maxFall);
                 }
             }
-            ToolResult r = ok(QStringLiteral("Frame at %1 (%2x%3)").arg(tc(at, s)).arg(img.width).arg(img.height));
+            ToolResult r = ok(QStringLiteral("Frame at %1 (%2x%3)%4").arg(tc(at, s)).arg(img.width).arg(img.height).arg(saved));
             r.png = png;
             return r;
         });
