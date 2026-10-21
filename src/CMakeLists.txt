@@ -187,6 +187,7 @@ add_library(montage_engine STATIC
   render/VfxPull.h render/VfxPull.cpp
   render/Spherical.h render/Spherical.cpp
   render/Stereo.h render/Stereo.cpp
+  render/SpatialVideo.h render/SpatialVideo.cpp
   render/ClipPlacement.h render/ClipPlacement.cpp
   render/AudioReactive.h render/AudioReactive.cpp
   core/Expression.h render/Expressions.cpp
@@ -516,6 +517,10 @@ if(MONTAGE_WITH_BMX)
   target_sources(montage_engine PRIVATE render/MxfFiles.h render/MxfFiles.cpp)
   target_link_libraries(montage_engine PRIVATE bmx)
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_BMX)
+endif()
+if(MONTAGE_WITH_SPATIAL_VIDEO)
+  target_link_libraries(montage_engine PRIVATE montage_x265)
+  target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_SPATIAL_VIDEO)
 endif()
 if(MONTAGE_WITH_THORVG)
   target_link_libraries(montage_engine PRIVATE montage_thorvg)

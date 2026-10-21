@@ -8401,7 +8401,9 @@ void McpServer::Impl::addTools() {
                 "properties":{"certificate":{"type":"string","description":"The signing certificate chain (PEM, the signing certificate first; issued by a certificate authority, for digital signatures with e-mail protection or document signing use)"},
                     "key":{"type":"string","description":"Its private key (PEM)"},
                     "allow_ai_training":{"type":"boolean","default":false,"description":"false: the credentials ask that it not be used to train AI models"}},"required":["certificate","key"]},
-            "stereo_view":{"type":"string","enum":["sbs","sbs_half","tb","tb_half","left","right","anaglyph"],"default":"sbs","description":"A stereoscopic 3D sequence: the eyes side by side or top and bottom (full size, or squeezed into one frame), or one picture"},
+            "stereo_view":{"type":"string","enum":["sbs","sbs_half","tb","tb_half","left","right","anaglyph","mv"],"default":"sbs","description":"A stereoscopic 3D sequence: the eyes side by side or top and bottom (full size, or squeezed into one frame), one picture, or mv: spatial video (both eyes coded as MV-HEVC in a MOV or MP4, for Vision Pro; needs the libx265 codec, 8-bit SDR)"},
+            "spatial_baseline_mm":{"type":"number","default":64,"description":"Spatial video: the distance between the cameras' lenses (mm)"},
+            "spatial_fov":{"type":"number","default":60,"description":"Spatial video: the cameras' horizontal field of view (degrees)"},
             "exr_compression":{"type":"string","enum":["none","rle","zips","zip","piz","pxr24","b44","b44a","dwaa","dwab","zstd","htj2k256","htj2k32"],"description":"OpenEXR presets: the frames' compression (default zip); HTJ2K is High-Throughput JPEG 2000, lossless"},
             "farm":{"type":"string","description":"A render farm folder: send the render there for its render nodes (montage-cli node) instead of rendering now; returns the job's id. The output is where the nodes write (each maps paths to its own)"}},
             "required":["project","output"]})json",
@@ -8480,8 +8482,16 @@ void McpServer::Impl::addTools() {
             if (a.contains("stereo_view")) {
                 StereoView v;
                 st.stereo = str(a, "stereo_view").toStdString();
-                if (!stereoViewFromName(st.stereo, v) || v == StereoView::Difference)
-                    throw ArgError{"\"stereo_view\" is sbs, sbs_half, tb, tb_half, left, right or anaglyph"};
+                if (st.stereo != "mv" && (!stereoViewFromName(st.stereo, v) || v == StereoView::Difference))
+                    throw ArgError{"\"stereo_view\" is sbs, sbs_half, tb, tb_half, left, right, anaglyph or mv"};
+            }
+            if (a.contains("spatial_baseline_mm")) {
+                st.spatialBaseline = a.value("spatial_baseline_mm").toDouble(-1);
+                if (!(st.spatialBaseline > 0 && st.spatialBaseline <= 1000)) throw ArgError{"\"spatial_baseline_mm\" must be between 0 and 1000"};
+            }
+            if (a.contains("spatial_fov")) {
+                st.spatialFieldOfView = a.value("spatial_fov").toDouble(-1);
+                if (!(st.spatialFieldOfView > 0 && st.spatialFieldOfView <= 180)) throw ArgError{"\"spatial_fov\" must be between 0 and 180 degrees"};
             }
             if (a.value("loudness_lufs").isDouble()) {
                 st.loudnessTarget = a.value("loudness_lufs").toDouble();

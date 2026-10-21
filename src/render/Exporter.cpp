@@ -1,6 +1,7 @@
 #include "Exporter.h"
 #include "TrimPasses.h"
 #include "media/SpatialAudio.h"
+#include "render/SpatialVideo.h"
 #include "core/AudioDescription.h"
 #include "core/Provenance.h"
 #include "media/ContentCredentials.h"
@@ -207,6 +208,9 @@ struct Output {
     AVPacket* pkt = nullptr;
     // Called with each video packet before it is written (pts in the encoder's time base); false fails the export.
     std::function<bool(AVPacket*)> videoPacket;
+    // Spatial video: the video "encoder" gives raw pictures (the eyes side by side), which this codes as MV-HEVC.
+    std::unique_ptr<SpatialVideoEncoder> spatial;
+    std::string spatialError;  // (what x265 said, when it failed)
     bool headerWritten = false;
     ~Output() {
         sws_freeContext(sws);
@@ -223,11 +227,49 @@ struct Output {
     }
 };
 
+// MV-HEVC coded pictures written as the video stream's packets.
+int writeSpatial(Output& o, std::vector<SpatialVideoEncoder::Packet>& coded) {
+    for (SpatialVideoEncoder::Packet& c : coded) {
+        AVPacket* p = av_packet_alloc();
+        if (!p || av_new_packet(p, int(c.data.size())) < 0) {
+            av_packet_free(&p);
+            return AVERROR(ENOMEM);
+        }
+        std::memcpy(p->data, c.data.data(), c.data.size());
+        p->pts = c.pts;
+        p->dts = c.dts;
+        if (c.key) p->flags |= AV_PKT_FLAG_KEY;
+        p->stream_index = o.vst->index;
+        av_packet_rescale_ts(p, o.vctx->time_base, o.vst->time_base);
+        const int rc = av_interleaved_write_frame(o.oc, p);
+        av_packet_free(&p);
+        if (rc < 0) return rc;
+    }
+    coded.clear();
+    return 0;
+}
+
+// Why writing video failed: x265's own words for spatial video.
+std::string videoError(const Output& o, int rc) { return o.spatialError.empty() ? averr(rc) : o.spatialError; }
+
 int drain(Output& o, AVCodecContext* ctx, AVStream* st) {
     for (;;) {
         int rc = avcodec_receive_packet(ctx, o.pkt);
+        if (rc == AVERROR_EOF && o.spatial && st == o.vst) {
+            std::vector<SpatialVideoEncoder::Packet> coded;
+            return o.spatial->flush(coded, &o.spatialError) ? writeSpatial(o, coded) : AVERROR_EXTERNAL;
+        }
         if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) return 0;
         if (rc < 0) return rc;
+        if (o.spatial && st == o.vst) {
+            // (The eyes side by side, raw: coded as the two views.)
+            std::vector<SpatialVideoEncoder::Packet> coded;
+            const bool ok = o.spatial->encode(o.pkt->data, size_t(o.pkt->size), o.pkt->pts, coded, &o.spatialError);
+            av_packet_unref(o.pkt);
+            if (!ok) return AVERROR_EXTERNAL;
+            if ((rc = writeSpatial(o, coded)) < 0) return rc;
+            continue;
+        }
         if (st == o.vst && o.videoPacket && !o.videoPacket(o.pkt)) return AVERROR(EINVAL);
         av_packet_rescale_ts(o.pkt, ctx->time_base, st->time_base);
         o.pkt->stream_index = st->index;
@@ -805,8 +847,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     const AVRational fps{dseq.fps.num, dseq.fps.den};
     // A stereoscopic sequence: its eyes packed as asked (two eyes across or down make the frame twice the size).
     StereoView stereoView = StereoView::Left;
-    if (seq.stereo3d && !stereoViewFromName(s.stereo.empty() ? "sbs" : s.stereo, stereoView))
-        return fail("Unknown stereo output " + s.stereo + " (sbs, sbs_half, tb, tb_half, left, right or anaglyph)");
+    // Spatial video renders the eyes side by side, each then coded as a view of its own.
+    const bool spatial = seq.stereo3d && s.stereo == "mv" && wantVideo;
+    if (seq.stereo3d && !stereoViewFromName(s.stereo.empty() || s.stereo == "mv" ? "sbs" : s.stereo, stereoView))
+        return fail("Unknown stereo output " + s.stereo + " (sbs, sbs_half, tb, tb_half, left, right, anaglyph or mv)");
     if (stereoView == StereoView::Difference) return fail("The eyes' difference is for checking, not delivering");
     int across = 1, down = 1;
     stereoPacking(stereoView, across, down);
@@ -851,7 +895,17 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             c = pickHwEncoder(family, W, H, fps.num, fps.den);
             if (c.empty()) c = family == "hevc" ? "libx265" : "libx264";  // no hardware encoder here
         }
-        if (encoderUsed) *encoderUsed = c;
+        if (spatial) {
+            // MV-HEVC: FFmpeg's raw "encoder" hands over each picture with both eyes, coded by x265's multiview
+            // encoder (render/SpatialVideo.h).
+            if (s.videoCodec != "libx265" && s.videoCodec != "hw_hevc") return fail("Spatial video is MV-HEVC: choose H.265 (HEVC)");
+            const std::string fmt = o.oc->oformat->name;
+            if (fmt.find("mov") == std::string::npos && fmt.find("mp4") == std::string::npos) return fail("Spatial video goes in MOV or MP4");
+            if (outSpace.hdr()) return fail("Spatial video is written in 8-bit SDR: export in Rec.709 or Display P3");
+            if (s.alpha || interlacedOut || s.cea608) return fail("Spatial video has no alpha, fields or CEA-608 captions");
+            c = "rawvideo";
+        }
+        if (encoderUsed) *encoderUsed = spatial ? std::string("x265 (MV-HEVC)") : c;
         // FFmpeg's CineForm encoder reads memory it never wrote below a picture whose height is not a multiple of 8
         // (Valgrind shows it at 320 x 180, not at 184 or 1080), so the same export came out different each time.
         if (c == "cfhd" && H % 8 != 0)
@@ -874,7 +928,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         o.vctx->color_trc = tags.trc;
         o.vctx->colorspace = tags.matrix;
         o.vctx->color_range = c == "mjpeg" ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
-        o.vctx->thread_count = 0;
+        // (Raw pictures for spatial video are only copied: frames in flight on many threads would just hold memory.)
+        o.vctx->thread_count = spatial ? 1 : 0;
         // Smart rendering interleaves copied packets with encoded ones, so the encoder must not hold frames back.
         if (s.smartRender && isIntraCodec(c)) o.vctx->thread_type = FF_THREAD_SLICE;
         if (s.videoBitrate > 0) o.vctx->bit_rate = s.videoBitrate;
@@ -969,15 +1024,45 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             o.vctx->flags |= AV_CODEC_FLAG_QSCALE;
             o.vctx->global_quality = FF_QP2LAMBDA * 3;
         }
+        if (spatial) o.vctx->pix_fmt = AV_PIX_FMT_YUV420P;  // (x265's multiview encoder is 8-bit 4:2:0)
         rc = avcodec_open2(o.vctx, codec, &opts);
         av_dict_free(&opts);
         if (rc < 0) return fail("Cannot open video encoder: " + averr(rc));
         avcodec_parameters_from_context(o.vst->codecpar, o.vctx);
         o.vst->time_base = o.vctx->time_base;
         o.vst->avg_frame_rate = fps;
+        if (spatial) {
+            SpatialVideoSettings sv;
+            sv.width = W / 2;
+            sv.height = H;
+            sv.fpsNum = fps.num;
+            sv.fpsDen = fps.den;
+            sv.crf = s.crf;
+            sv.bitrate = s.videoBitrate;
+            sv.preset = s.preset;
+            sv.keyint = s.gop;
+            sv.primaries = o.vctx->color_primaries;
+            sv.transfer = o.vctx->color_trc;
+            sv.matrix = o.vctx->colorspace;
+            std::string e;
+            if (!(o.spatial = SpatialVideoEncoder::open(sv, &e))) return fail(e);
+            // The stream as the muxer sees it: HEVC, one eye's size, the base view's parameter sets (for the hvcC).
+            AVCodecParameters* par = o.vst->codecpar;
+            par->codec_id = AV_CODEC_ID_HEVC;
+            par->codec_tag = MKTAG('h', 'v', 'c', '1');
+            par->width = W / 2;
+            par->bit_rate = s.videoBitrate;
+            par->bits_per_coded_sample = 0;
+            const std::vector<uint8_t>& headers = o.spatial->baseHeaders();
+            av_freep(&par->extradata);
+            par->extradata = static_cast<uint8_t*>(av_mallocz(headers.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+            if (!par->extradata) return fail("Out of memory");
+            std::memcpy(par->extradata, headers.data(), headers.size());
+            par->extradata_size = int(headers.size());
+        }
         // Packed stereoscopic 3D: stereo metadata, so players and headsets show the eyes apart (MP4 st3d, written
         // only when asked to go beyond the standard, as sv3d is; Matroska StereoMode).
-        const bool packed = seq.stereo3d && stereoView != StereoView::Left && stereoView != StereoView::Right && stereoView != StereoView::Anaglyph;
+        const bool packed = seq.stereo3d && !spatial && stereoView != StereoView::Left && stereoView != StereoView::Right && stereoView != StereoView::Anaglyph;
         if (packed) {
             if (AVStereo3D* s3d = av_stereo3d_alloc()) {
                 s3d->type = stereoView == StereoView::SideBySide || stereoView == StereoView::SideBySideHalf ? AV_STEREO3D_SIDEBYSIDE
@@ -1784,7 +1869,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                 if (interlacedOut) o.vframe->flags |= AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST;
                 if (!attach608(f - din)) return fail("Out of memory");
                 if ((rc = avcodec_send_frame(o.vctx, o.vframe)) < 0) return fail("Video encoding failed: " + averr(rc));
-                if ((rc = drain(o, o.vctx, o.vst)) < 0) return fail("Writing video failed: " + averr(rc));
+                if ((rc = drain(o, o.vctx, o.vst)) < 0) return fail("Writing video failed: " + videoError(o, rc));
             } else {
             toRgba16(img, rgba16);
             AVPixelFormat srcFmt = AV_PIX_FMT_RGBA64LE;
@@ -1830,7 +1915,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             if (interlacedOut) o.vframe->flags |= AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST;
             if (!attach608(f - din)) return fail("Out of memory");
             if ((rc = avcodec_send_frame(o.vctx, o.vframe)) < 0) return fail("Video encoding failed: " + averr(rc));
-            if ((rc = drain(o, o.vctx, o.vst)) < 0) return fail("Writing video failed: " + averr(rc));
+            if ((rc = drain(o, o.vctx, o.vst)) < 0) return fail("Writing video failed: " + videoError(o, rc));
             }
         }
         if (wantAudio) {
@@ -1908,7 +1993,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     }
     if (wantVideo) {
         if ((rc = avcodec_send_frame(o.vctx, nullptr)) < 0 || (rc = drain(o, o.vctx, o.vst)) < 0)
-            return fail("Finishing video failed: " + averr(rc));
+            return fail("Finishing video failed: " + videoError(o, rc));
     }
     // HDR10 light levels as measured (MP4 and MOV write their clli box with the index, at the end).
     if (pq && measured.frames > 0 && o.vst && !(smart && smart->copied() > 0))  // copied frames go unmeasured
@@ -1919,6 +2004,12 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         }
     if ((rc = av_write_trailer(o.oc)) < 0) return fail("Cannot finalise file: " + averr(rc));
     if (o.oc->pb && o.oc->pb->error < 0) return fail("Writing the file failed: " + averr(o.oc->pb->error));
+    if (o.spatial) {
+        // The second view's configuration and Apple's stereo boxes, which FFmpeg does not write.
+        if ((rc = avio_closep(&o.oc->pb)) < 0) return fail("Writing the file failed: " + averr(rc));
+        std::string e;
+        if (!writeSpatialVideoBoxes(s.path, o.spatial->lhvcRecord(), s.spatialBaseline, s.spatialFieldOfView, &e)) return fail(e);
+    }
     // The HDR10+ metadata beside the file too (named after it, an image sequence's frame number left out). The video
     // is done by now: a JSON that cannot be written is warned about, never a reason to lose the export.
     if (!hdr10.empty()) {

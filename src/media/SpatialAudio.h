@@ -1,10 +1,13 @@
 // Montage — spatial audio metadata: Google's Spatial Audio box (SA3D) in an MP4 or MOV file's audio sample entry,
 // which tells YouTube and 360° players that the track's channels are an ambisonic field (AmbiX: ACN channel order,
 // SN3D normalisation) rather than speakers. FFmpeg reads it (the stream's layout becomes ambisonic) but does not
-// write it, so Montage adds it to the files it exports.
+// write it, so Montage adds it to the files it exports. (Spatial video's boxes go into the video sample entry the
+// same way: render/SpatialVideo.h.)
 #pragma once
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace montage {
 
@@ -18,5 +21,9 @@ bool writeSpatialAudioBox(const std::string& path, int order, std::string* error
 // The ambisonic order the first audio track with an SA3D box declares, or 0 when none has one (or the file is not
 // MP4/MOV).
 int readSpatialAudioBox(const std::string& path);
+
+// Adds `boxes` (whole boxes, one after another) at the end of the first video track's sample entry, as
+// writeSpatialAudioBox adds its box.
+bool addVideoEntryBoxes(const std::string& path, const std::vector<uint8_t>& boxes, std::string* error = nullptr);
 
 }  // namespace montage

@@ -39,6 +39,12 @@ for dep in whisper llama rnnoise thorvg openexr imath bmx liburiparser bmx_git_v
     done
 done
 
+# x265, built by CMakeLists.txt with its multiview encoder for spatial video.
+if [ -f "$BUILD/montage_x265_build-prefix/src/montage_x265_build/COPYING" ]; then
+  mkdir -p "$OUT/compiled/x265"
+  cp "$BUILD/montage_x265_build-prefix/src/montage_x265_build/COPYING" "$OUT/compiled/x265/"
+fi
+
 if [ -n "$C2PA" ] && [ -d "$C2PA/licenses" ]; then cp -R "$C2PA/licenses" "$OUT/c2pa"; fi
 
 if [ -n "$FFSHARE" ] && [ -d "$FFSHARE" ]; then

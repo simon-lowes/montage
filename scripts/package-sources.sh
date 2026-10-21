@@ -11,6 +11,10 @@ SOURCES=${MONTAGE_SOURCES_DIR:?MONTAGE_SOURCES_DIR is not set}
 VERSION=$(sed -n 's/^project(Montage VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
 [ -d "$SOURCES" ] || { echo "$SOURCES does not exist: package first" >&2; exit 1; }
 
+# x265, compiled into Montage for spatial video, as the build downloaded it (CMakeLists.txt checks its hash).
+for f in "${MONTAGE_BUILD_DIR:-build}"/montage_x265_build-prefix/src/x265_*.tar.gz; do
+  [ -f "$f" ] && cp "$f" "$SOURCES/"
+done
 git archive --format=tar.gz --prefix="montage-$VERSION/" -o "$SOURCES/montage-$VERSION.tar.gz" HEAD
 cat > "$SOURCES/README.txt" << EOF
 The source code of Montage $VERSION ($PLATFORM package) and of the libraries the package bundles.
@@ -18,6 +22,7 @@ The source code of Montage $VERSION ($PLATFORM package) and of the libraries the
 montage-$VERSION.tar.gz   Montage itself (GPL-3.0-or-later), with the scripts that build the packages
                           (scripts/build-ffmpeg.sh builds FFmpeg; scripts/package-*.sh bundle the libraries).
 ffmpeg-*.tar.xz           FFmpeg, as released; licenses/ffmpeg/configure.txt in the package has its configuration.
+x265_*.tar.gz             x265, as released, which Montage compiles in (with its multiview encoder) for spatial video.
 everything else           each bundled library's source as its package manager builds it: an MSYS2 source
                           archive (Windows), or a Homebrew formula and its source (macOS).
 

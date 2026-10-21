@@ -164,6 +164,8 @@ void visitSettings(S& s, V& v) {
     v("useProxies", s.useProxies);
     v("alpha", s.alpha);
     v("stereo", s.stereo);
+    v("spatialBaseline", s.spatialBaseline);
+    v("spatialFieldOfView", s.spatialFieldOfView);
     v("burnInCaptions", s.burnInCaptions);
     v("embedCaptions", s.embedCaptions);
     v("captionTrack", s.captionTrack);

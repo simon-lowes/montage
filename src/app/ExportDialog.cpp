@@ -6,6 +6,7 @@
 #include <QComboBox>
 #include <QDateTime>
 #include <QDialogButtonBox>
+#include <QDoubleSpinBox>
 #include <QDir>
 #include <QFile>
 #include <QFileDialog>
@@ -38,6 +39,7 @@
 #include "core/History.h"
 #include "render/BroadcastMxf.h"
 #include "render/ColorSpace.h"
+#include "render/SpatialVideo.h"
 #include "render/Stereo.h"
 
 namespace montage {
@@ -368,12 +370,38 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     stereo_->addItem(tr("Left eye only (2D)"), QStringLiteral("left"));
     stereo_->addItem(tr("Right eye only (2D)"), QStringLiteral("right"));
     stereo_->addItem(tr("Anaglyph (red-cyan)"), QStringLiteral("anaglyph"));
+    if (spatialVideoAvailable()) stereo_->addItem(tr("Spatial video (MV-HEVC, for Vision Pro)"), QStringLiteral("mv"));
     stereo_->setCurrentIndex(std::max(0, stereo_->findData(appSettings().value("export/stereo", "sbs").toString())));
     stereo_->setToolTip(tr("Packed exports say how their eyes are packed (MP4 st3d, Matroska StereoMode; MOV keeps none), so 3D "
                            "players, headsets and YouTube show them in depth"));
     if (seq && seq->stereo3d) form->addRow(tr("Stereo 3D:"), stereo_);
     else stereo_->hide();
     connect(stereo_, &QComboBox::currentIndexChanged, this, &ExportDialog::updateSummary);
+    // Spatial video states the cameras that shot it: how far apart and how wide they see (Vision Pro sizes the
+    // picture by them).
+    spatialBaseline_ = new QDoubleSpinBox(form_);
+    spatialBaseline_->setObjectName(QStringLiteral("exportSpatialBaseline"));
+    spatialBaseline_->setRange(1, 1000);
+    spatialBaseline_->setDecimals(1);
+    spatialBaseline_->setSuffix(tr(" mm"));
+    spatialBaseline_->setValue(appSettings().value("export/spatialBaseline", 64.0).toDouble());
+    spatialBaseline_->setToolTip(tr("The distance between the two cameras' lenses (64 mm is about the distance between a person's eyes)"));
+    spatialFov_ = new QDoubleSpinBox(form_);
+    spatialFov_->setObjectName(QStringLiteral("exportSpatialFov"));
+    spatialFov_->setRange(1, 180);
+    spatialFov_->setDecimals(1);
+    spatialFov_->setSuffix(tr("°"));
+    spatialFov_->setValue(appSettings().value("export/spatialFov", 60.0).toDouble());
+    spatialFov_->setToolTip(tr("How wide the cameras see, across the picture"));
+    form->addRow(tr("Camera baseline:"), spatialBaseline_);
+    form->addRow(tr("Field of view:"), spatialFov_);
+    auto showSpatial = [this, form, seq] {
+        const bool on = seq && seq->stereo3d && stereo_->currentData().toString() == QLatin1String("mv");
+        form->setRowVisible(spatialBaseline_, on);
+        form->setRowVisible(spatialFov_, on);
+    };
+    showSpatial();
+    connect(stereo_, &QComboBox::currentIndexChanged, this, showSpatial);
     // Loudness for where it is going: (target LUFS, true peak ceiling dBTP).
     loudness_ = new QComboBox(form_);
     loudness_->setObjectName(QStringLiteral("exportLoudness"));
@@ -872,6 +900,8 @@ void ExportDialog::updateSummary() {
         if (usesCrf(s.videoCodec)) line += tr(", CRF %1").arg(quality_->value());
         if (s.alpha && !seq->stereo3d) line += tr(", with alpha");
         if (seq->stereo3d) line += ", " + stereo_->currentText();
+        if (seq->stereo3d && stereo_->currentData().toString() == QLatin1String("mv") && s.videoCodec != "libx265" && s.videoCodec != "hw_hevc")
+            line += tr(" (choose H.265: spatial video is MV-HEVC)");
         const ColorSpace* out = findColorSpace(color_->currentData().toString().toStdString());
         const ColorSpace& space = out ? *out : sequenceColorSpace(*seq);
         line += ", " + QString::fromStdString(space.label);
@@ -1041,6 +1071,10 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     if (hasVideo(s) && state_->sequence() && state_->sequence()->stereo3d) {
         s.stereo = stereo_->currentData().toString().toStdString();
         settings.setValue("export/stereo", stereo_->currentData().toString());
+        s.spatialBaseline = spatialBaseline_->value();
+        s.spatialFieldOfView = spatialFov_->value();
+        settings.setValue("export/spatialBaseline", spatialBaseline_->value());
+        settings.setValue("export/spatialFov", spatialFov_->value());
     }
     if (hasAudio(s) && loudness_->currentIndex() > 0) {
         const QPointF target = loudness_->currentData().toPointF();

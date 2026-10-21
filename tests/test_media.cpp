@@ -81,6 +81,7 @@
 #include "core/AafImport.h"
 #include "core/ProjectLock.h"
 #include "media/MediaPool.h"
+#include "render/SpatialVideo.h"
 #include "media/Relink.h"
 #include "media/SpeakerSwitch.h"
 #include "media/Tracking.h"
@@ -6472,6 +6473,21 @@ private slots:
         }
         QVERIFY(call("montage_render", {{"project", project}, {"output", QString::fromStdString(path("x.mp4"))}, {"stereo_view", "difference"}})
                     .value("isError").toBool());
+        // Spatial video: H.265 only, and a field of view a camera can have.
+        r = call("montage_render", {{"project", project}, {"output", QString::fromStdString(path("mcp-mv-h264.mov"))},
+                                    {"preset", "H.264 - Fast Draft"}, {"stereo_view", "mv"}});
+        QVERIFY(r.value("isError").toBool());
+        QVERIFY(call("montage_render", {{"project", project}, {"output", QString::fromStdString(path("x.mov"))}, {"preset", "H.265 / HEVC"},
+                                        {"stereo_view", "mv"}, {"spatial_fov", 200}})
+                    .value("isError").toBool());
+        if (spatialVideoAvailable()) {
+            r = call("montage_render", {{"project", project}, {"output", QString::fromStdString(path("mcp-mv.mov"))}, {"preset", "H.265 / HEVC"},
+                                        {"stereo_view", "mv"}, {"spatial_baseline_mm", 20}, {"spatial_fov", 90}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            MediaItem back;
+            QVERIFY(probeMedia(path("mcp-mv.mov"), back));
+            if (multiviewDecoding()) QCOMPARE(back.stereo, std::string("mv"));
+        }
         Project after;
         QVERIFY(loadProject(project.toStdString(), after));
         QVERIFY(after.active()->stereo3d);
@@ -6584,6 +6600,176 @@ private slots:
             QCOMPARE(loaded.findMedia(item.id)->stereo, std::string("mv"));
             QCOMPARE(loaded.findMedia(item.id)->width, 128);
         }
+    }
+
+    void spatialVideoOut() {
+        if (!spatialVideoAvailable()) QSKIP("This build has no MV-HEVC encoder (x265's multiview)");
+        // A stereoscopic sequence, 160 x 96 an eye: the left eye red, the right blue (a side-by-side file).
+        auto solid = [](Project& pr, double r, double g, double b, FrameTime len) {
+            Clip c = makeGeneratorClip(pr, "color", len);
+            c.generator.params["color.r"] = r;
+            c.generator.params["color.g"] = g;
+            c.generator.params["color.b"] = b;
+            return c;
+        };
+        std::string err;
+        Project q = makeDefaultProject();
+        q.sequences.clear();
+        {
+            Project src = makeDefaultProject();
+            src.sequences.clear();
+            Sequence& ss = src.sequences.emplace_back(makeSequence(src, "SBS", 320, 96, Rational{25, 1}, 2, 1));
+            src.activeSequence = ss.id;
+            QVERIFY(edit::overwrite(src, ss, {TrackKind::Video, 0}, solid(src, 0, 0, 1, 12)).ok);
+            Clip red = solid(src, 1, 0, 0, 12);
+            red.motion.params["crop_right"] = 50.0;
+            QVERIFY(edit::overwrite(src, ss, {TrackKind::Video, 1}, red).ok);
+            ExportSettings st;
+            st.path = path("mvout-sbs.mp4");
+            st.preset = "ultrafast";
+            st.crf = 12;
+            QVERIFY2(exportSequence(src, ss, st, nullptr, nullptr, &err), err.c_str());
+            MediaItem flat = probeOrFail(q, st.path);
+            q.media.push_back(flat);
+            Interpretation how;
+            how.stereo = "sbs";
+            QVERIFY(edit::interpretFootage(q, flat.id, how).ok);
+        }
+        Sequence& s3 = q.sequences.emplace_back(makeSequence(q, "Spatial out", 160, 96, Rational{25, 1}, 2, 1));
+        q.activeSequence = s3.id;
+        s3.stereo3d = true;
+        QVERIFY(edit::placeMedia(q, s3, q.media[0].id, 0, 0, 12, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+
+        // As spatial video: MV-HEVC in a MOV, a baseline of 63.5 mm and a field of view of 71.5 degrees.
+        ExportSettings st;
+        st.path = path("spatial-out.mov");
+        st.videoCodec = "libx265";
+        st.stereo = "mv";
+        st.preset = "ultrafast";
+        st.crf = 12;
+        st.spatialBaseline = 63.5;
+        st.spatialFieldOfView = 71.5;
+        std::string used;
+        QVERIFY2(exportSequence(q, s3, st, nullptr, nullptr, &err, &used), err.c_str());
+        QCOMPARE(used, std::string("x265 (MV-HEVC)"));
+
+        // The sample entry, as Apple's documents describe it: hvc1 with the base view's hvcC (its parameter sets and
+        // the 3D reference displays message naming the eyes' views), the second view's lhvC, and vexu (both eyes, the
+        // left the hero, the baseline in micrometres, no disparity adjustment) with hfov (thousandths of a degree).
+        QFile f(QString::fromStdString(st.path));
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        const QByteArray file = f.readAll();
+        auto be = [&](const QByteArray& b, qsizetype at, int n) {
+            uint32_t v = 0;
+            for (int i = 0; i < n; ++i) v = v << 8 | uint8_t(b[at + i]);
+            return v;
+        };
+        // (The movie header now: the boxes go in a new one at the end, the one FFmpeg wrote left as free space.)
+        const qsizetype stsd = file.indexOf("stsd", file.lastIndexOf("moov"));
+        QVERIFY(stsd > 0 && file.mid(stsd + 16, 4) == "hvc1");
+        const qsizetype entry = stsd + 12, entryEnd = entry + qsizetype(be(file, entry, 4));
+        QMap<QByteArray, QByteArray> boxes;
+        for (qsizetype at = entry + 86; at + 8 <= entryEnd;) {
+            const uint32_t size = be(file, at, 4);
+            QVERIFY(size >= 8 && at + size <= entryEnd);
+            boxes[file.mid(at + 4, 4)] = file.mid(at + 8, size - 8);
+            at += size;
+        }
+        QVERIFY2(boxes.contains("hvcC") && boxes.contains("lhvC") && boxes.contains("vexu") && boxes.contains("hfov"),
+                 boxes.keys().join(' ').constData());
+        auto children = [&](const QByteArray& b) {
+            QMap<QByteArray, QByteArray> out;
+            for (qsizetype at = 0; at + 8 <= b.size();) {
+                const uint32_t size = be(b, at, 4);
+                if (size < 8 || at + size > b.size()) break;
+                out[b.mid(at + 4, 4)] = b.mid(at + 8, size - 8);
+                at += size;
+            }
+            return out;
+        };
+        const auto vexu = children(boxes["vexu"]);
+        QVERIFY(vexu.contains("eyes"));
+        const auto eyes = children(vexu["eyes"]);
+        QCOMPARE(eyes["stri"], QByteArray::fromHex("0000000003"));  // (version and flags, then left and right present)
+        QCOMPARE(eyes["hero"], QByteArray::fromHex("0000000001"));
+        QCOMPARE(be(children(eyes["cams"])["blin"], 4, 4), 63500u);
+        QCOMPARE(children(eyes["cmfy"])["dadj"], QByteArray::fromHex("0000000000000000"));
+        QCOMPARE(be(boxes["hfov"], 0, 4), 71500u);
+        // NAL units in a configuration record's arrays: (type, layer, the unit).
+        struct Nal {
+            int type, layer;
+            QByteArray data;
+        };
+        auto arrays = [&](const QByteArray& b, qsizetype at) {
+            std::vector<Nal> out;
+            const int count = uint8_t(b[at++]);
+            for (int i = 0; i < count && at + 3 <= b.size(); ++i) {
+                const int n = int(be(b, at + 1, 2));
+                at += 3;
+                for (int k = 0; k < n && at + 2 <= b.size(); ++k) {
+                    const int len = int(be(b, at, 2));
+                    const QByteArray nal = b.mid(at + 2, len);
+                    out.push_back({(uint8_t(nal[0]) >> 1) & 0x3f, ((uint8_t(nal[0]) & 1) << 5) | (uint8_t(nal[1]) >> 3), nal});
+                    at += 2 + len;
+                }
+            }
+            return out;
+        };
+        const QByteArray lhvc = boxes["lhvC"];
+        QCOMPARE(int(uint8_t(lhvc[0])), 1);
+        QCOMPARE(uint8_t(lhvc[4]) & 3, 3);  // 4-byte lengths, as the hvcC's
+        std::set<int> secondTypes;
+        for (const Nal& n : arrays(lhvc, 5)) {
+            QCOMPARE(n.layer, 1);
+            secondTypes.insert(n.type);
+        }
+        QCOMPARE(secondTypes, (std::set<int>{33, 34}));  // SPS and PPS
+        bool vps = false, reference = false;
+        for (const Nal& n : arrays(boxes["hvcC"], 22)) {
+            QCOMPARE(n.layer, 0);
+            vps |= n.type == 32;
+            reference |= n.type == 39 && uint8_t(n.data[2]) == 176;  // three-dimensional reference displays information
+        }
+        QVERIFY(vps && reference);
+
+        // Read back: FFmpeg's decoder (7.1 and later) gives each view, the left eye red and the right blue; older ones
+        // the base view, the left eye.
+        Project r = makeDefaultProject();
+        r.sequences.clear();
+        MediaItem m = probeOrFail(r, st.path);
+        QCOMPARE(m.width, 160);
+        QCOMPARE(m.height, 96);
+        QVERIFY2(std::abs(m.duration - 12.0 / 25) < 0.02, qPrintable(QString::number(m.duration)));
+        r.media.push_back(m);
+        Sequence& back = r.sequences.emplace_back(makeSequence(r, "Back", 160, 96, Rational{25, 1}, 2, 1));
+        r.activeSequence = back.id;
+        back.stereo3d = multiviewDecoding();
+        QVERIFY(edit::placeMedia(r, back, m.id, 0, 0, 12, {TrackKind::Video, 0}, {TrackKind::Audio, -1}, false).ok);
+        auto isRed = [](const Image& img) { return img.at(80, 48)[0] > 0.7f && img.at(80, 48)[2] < 0.25f; };
+        auto isBlue = [](const Image& img) { return img.at(80, 48)[2] > 0.7f && img.at(80, 48)[0] < 0.25f; };
+        RenderOptions o;
+        for (FrameTime t : {0, 5, 11}) {
+            o.eye = 0;
+            const Image left = renderSequenceFrame(r, back, t, o);
+            QVERIFY2(isRed(left), qPrintable(QString("left eye at %1").arg(t)));
+            if (multiviewDecoding()) {
+                QCOMPARE(m.stereo, std::string("mv"));
+                o.eye = 1;
+                QVERIFY2(isBlue(renderSequenceFrame(r, back, t, o)), qPrintable(QString("right eye at %1").arg(t)));
+            }
+        }
+        if (!multiviewDecoding()) qInfo("This FFmpeg reads only the base view of MV-HEVC: the right eye is not checked");
+
+        // Refused: another codec, another container, HDR.
+        ExportSettings bad = st;
+        bad.videoCodec = "prores_ks";
+        QVERIFY(!exportSequence(q, s3, bad, nullptr, nullptr, &err) && err.find("H.265") != std::string::npos);
+        bad = st;
+        bad.path = path("spatial-out.mkv");
+        QVERIFY(!exportSequence(q, s3, bad, nullptr, nullptr, &err) && err.find("MOV or MP4") != std::string::npos);
+        bad = st;
+        bad.colorSpace = "rec2100pq";
+        QVERIFY(!exportSequence(q, s3, bad, nullptr, nullptr, &err) && err.find("SDR") != std::string::npos);
     }
 
     void stereoscopicEdgeCases() {
