@@ -487,25 +487,30 @@ Av1Picture ycbcr420(const Image& img, const ColorSpace& space, int bits, AVColor
     pic.width = W, pic.height = H, pic.bits = bits;
     std::vector<uint16_t>&Y = pic.planes[0], &U = pic.planes[1], &V = pic.planes[2];
     Y.resize(size_t(W) * H), U.resize(size_t(CW) * CH), V.resize(size_t(CW) * CH);
-    std::vector<double> cb(size_t(W) * H), cr(size_t(W) * H);
-    for (int y = 0; y < H; ++y) {
-        const float* p = img.row(y);
-        for (int x = 0; x < W; ++x, p += 4) {
-            const double r = std::clamp(p[0], 0.f, 1.f), g = std::clamp(p[1], 0.f, 1.f), b = std::clamp(p[2], 0.f, 1.f);
-            const double luma = kr * r + kg * g + kb * b;
+    // (Each pixel's luma and colour differences worked out where they are needed, not kept: a large still's would take
+    // gigabytes.)
+    auto at = [&](int x, int y, double& luma, double& cb, double& cr) {
+        const float* p = img.at(x, y);
+        const double r = std::clamp(p[0], 0.f, 1.f), g = std::clamp(p[1], 0.f, 1.f), b = std::clamp(p[2], 0.f, 1.f);
+        luma = kr * r + kg * g + kb * b;
+        cb = (b - luma) / (2 * (1 - kb));
+        cr = (r - luma) / (2 * (1 - kr));
+    };
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            double luma, cb, cr;
+            at(x, y, luma, cb, cr);
             Y[size_t(y) * W + x] = uint16_t(std::lround(luma * maxCode));
-            cb[size_t(y) * W + x] = (b - luma) / (2 * (1 - kb));
-            cr[size_t(y) * W + x] = (r - luma) / (2 * (1 - kr));
         }
-    }
     for (int y = 0; y < CH; ++y)
         for (int x = 0; x < CW; ++x) {
             double sb = 0, sr = 0;
             int n = 0;
             for (int dy = 0; dy < 2; ++dy)
                 for (int dx = 0; dx < 2; ++dx) {
-                    const int xx = std::min(W - 1, 2 * x + dx), yy = std::min(H - 1, 2 * y + dy);
-                    sb += cb[size_t(yy) * W + xx], sr += cr[size_t(yy) * W + xx], ++n;
+                    double luma, cb, cr;
+                    at(std::min(W - 1, 2 * x + dx), std::min(H - 1, 2 * y + dy), luma, cb, cr);
+                    sb += cb, sr += cr, ++n;
                 }
             const double mid = (maxCode + 1) / 2.0;
             U[size_t(y) * CW + x] = uint16_t(std::clamp(std::lround(sb / n * maxCode + mid), 0L, long(maxCode)));
@@ -956,12 +961,76 @@ bool hevcItem(const Av1Picture& source, int quality, const QTemporaryDir& dir, c
     return true;
 }
 
+// The tile size for a W x H picture in HEVC: 2048 when it is larger than HEVC level 5.1 takes (which phones and graphics
+// cards decode), else 0 (whole).
+int heifTile(int W, int H) { return int64_t(W) * H > 8912896 || std::max(W, H) > 8192 ? 2048 : 0; }
+
+// `pic` (4:2:0) as HEIF items in HEVC: one coded picture, or, larger than `tile` (> 0), a grid (the first item) of tiles
+// that size after it, hidden, those at the right and bottom edges filled out with their last column and row.
+bool hevcPicture(const Av1Picture& pic, int quality, int tile, const QTemporaryDir& dir, const QString& name, std::vector<HeifItem>& out,
+                 std::string& why) {
+    out.clear();
+    const int W = pic.width, H = pic.height;
+    tile += tile & 1;  // (tiles at 4:2:0 even)
+    if (tile <= 0 || (tile >= W && tile >= H)) {
+        AvifCodedItem item;
+        if (!hevcItem(pic, quality, dir, name, item, why)) return false;
+        out.push_back({item.type, item.data, itemProperties(item.properties)});
+        return true;
+    }
+    const int columns = (W + tile - 1) / tile, rows = (H + tile - 1) / tile;
+    if (columns > 256 || rows > 256) return why = "Too large for this HEIF writer", false;
+    QByteArray grid;
+    grid.append(char(0)).append(char(0)).append(char(rows - 1)).append(char(columns - 1));
+    put16(grid, unsigned(W));
+    put16(grid, unsigned(H));
+    out.push_back({"grid", grid, {}});
+    for (const QByteArray& p : pictureProperties(W, H, pic.bits, 0, 0, 0))
+        if (p.mid(4, 4) != "colr") out[0].properties.push_back({p, false});
+    const int CW = (W + 1) / 2, CH = (H + 1) / 2, half = tile / 2;
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < columns; ++c) {
+            Av1Picture part;  // (its planes cut from the picture's below)
+            part.width = part.height = tile, part.bits = pic.bits, part.layout = pic.layout;
+            part.primaries = pic.primaries, part.transfer = pic.transfer, part.matrix = pic.matrix;
+            part.planes[0].assign(size_t(tile) * tile, 0);
+            for (int y = 0; y < tile; ++y)
+                for (int x = 0; x < tile; ++x)
+                    part.planes[0][size_t(y) * tile + x] = pic.planes[0][size_t(std::min(H - 1, r * tile + y)) * W + size_t(std::min(W - 1, c * tile + x))];
+            for (int i = 1; i < 3; ++i) {
+                part.planes[i].assign(size_t(half) * half, 0);
+                for (int y = 0; y < half; ++y)
+                    for (int x = 0; x < half; ++x)
+                        part.planes[i][size_t(y) * half + x] = pic.planes[i][size_t(std::min(CH - 1, r * half + y)) * CW + size_t(std::min(CW - 1, c * half + x))];
+            }
+            AvifCodedItem item;
+            if (!hevcItem(part, quality, dir, name + QStringLiteral("-tile%1").arg(out.size()), item, why)) return false;
+            out.push_back({item.type, item.data, itemProperties(item.properties), true});
+        }
+    // (The grid's colour, as its tiles'.)
+    for (const auto& [p, essential] : out[1].properties)
+        if (p.mid(4, 4) == "colr") addDescriptive(out[0].properties, {p, false});
+    return true;
+}
+
+// `picture` (hevcPicture's or a coded item) added to `items`, the grid's references to its tiles to `refs`; its item's ID.
+unsigned addPicture(std::vector<HeifItem>& items, std::vector<HeifRef>& refs, const std::vector<HeifItem>& picture, bool hidden) {
+    const unsigned id = unsigned(items.size() + 1);
+    items.insert(items.end(), picture.begin(), picture.end());
+    items[id - 1].hidden = hidden;
+    if (picture.size() > 1) {
+        refs.push_back({"dimg", id, {}});
+        for (unsigned i = 1; i < picture.size(); ++i) refs.back().to.push_back(id + i);
+    }
+    return id;
+}
+
 // The SDR base and its gain map to `hdr` as AV1 or HEVC pictures, and the HEIF file around them (as libavif writes one):
 // the base (item 1, primary), the 'tmap' item (2) derived from it and the map, and the map (3, hidden), the tone-mapped
 // item preferred over the base in an 'altr' group; and Adobe's gain map properties as XMP (4) describing the map,
 // beside ISO 21496-1's.
 bool writeGainMapStill(bool hevc, const Image& sdr, const ColorSpace& sdrSpace, const Image& hdr, const ColorSpace& hdrSpace, int quality,
-                       double maxCll, double maxFall, const std::string& path, std::string* error) {
+                       double maxCll, double maxFall, const std::string& path, std::string* error, int tile = 0) {
     auto fail = [&](const std::string& why) {
         if (error) *error = why;
         return false;
@@ -977,28 +1046,36 @@ bool writeGainMapStill(bool hevc, const Image& sdr, const ColorSpace& sdrSpace, 
     std::string why;
     // The base (8-bit, tagged with sRGB's curve, which is how gain map readers linearise it), encoded first: the map is
     // made against what decoders will see of it.
-    AvifCodedItem base, map;
+    if (hevc && (W > 65535 || H > 65535 || int64_t(W) * H > (1 << 27))) return fail("Too large for this HEIF writer");  // (as Montage reads them)
+    // (In HEVC, larger than its levels take, the base and the map each a grid of tiles.)
+    if (hevc && tile <= 0) tile = heifTile(W, H);
+    std::vector<HeifItem> base, map;
     QImage seen;
     const Av1Picture basePicture = ycbcr420(sdr, sdrSpace, 8, AVCOL_TRC_IEC61966_2_1);
-    auto readBack = [&](const AvifCodedItem& item, QImage& back) {
+    auto readBack = [&](const std::vector<HeifItem>& picture, const QString& name, QImage& back) {
         // (Through a file of its own, as a reader sees it.)
         QByteArray file;
-        const std::string at = dir.filePath(QStringLiteral("back%1.heif").arg(qHash(item.data))).toStdString();
+        std::vector<HeifItem> items;
+        std::vector<HeifRef> refs;
+        addPicture(items, refs, picture, false);
+        const std::string at = dir.filePath(name + "-back.heif").toStdString();
         QFile f(QString::fromStdString(at));
-        if (!heifFile({"mif1", "mif1"}, {{item.type, item.data, itemProperties(item.properties)}}, {}, {}, file, why) ||
-            !f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(file) != file.size())
+        if (!heifFile({"mif1", "mif1"}, items, refs, {}, file, why) || !f.open(QIODevice::WriteOnly | QIODevice::Truncate) ||
+            f.write(file) != file.size())
             return false;
         f.close();
         back = decodeHeifPicture(at, &why);
         return !back.isNull();
     };
     if (hevc) {
-        if (!hevcItem(basePicture, quality, dir, "base", base, why) || !readBack(base, seen)) return fail(why);
+        if (!hevcPicture(basePicture, quality, tile, dir, "base", base, why) || !readBack(base, "base", seen)) return fail(why);
     } else {
         const std::string basePath = dir.filePath("base.avif").toStdString();
         if (!encodeStill(basePicture, quality, {"libsvtav1", "libaom-av1", "librav1e"}, "avif", basePath, why)) return fail(why);
         seen = decodeHeifPicture(basePath, &why);
-        if (!seen.isNull() && !readHeifCodedItem(basePath, base)) seen = QImage();
+        AvifCodedItem item;
+        if (!seen.isNull() && !readHeifCodedItem(basePath, item)) seen = QImage();
+        base = {{item.type, item.data, itemProperties(item.properties)}};
     }
     if (seen.isNull() || seen.width() != W || seen.height() != H) return fail("Cannot read back the picture: " + why);
     GainMapMetadata meta;
@@ -1007,13 +1084,16 @@ bool writeGainMapStill(bool hevc, const Image& sdr, const ColorSpace& sdrSpace, 
     // The map in 8 bits: in AV1, R, G and B as they are (identity matrix) where the encoder takes them, else Y'CbCr
     // 4:4:4, else 4:2:0 (SVT-AV1's only one); in HEVC, Y'CbCr 4:2:0 (Main profile, which every HEVC decoder takes). (Each
     // attempt kept; the closest is used.)
-    std::vector<AvifCodedItem> attempts;
+    std::vector<std::vector<HeifItem>> attempts;
     const QByteArray chosen = encodeGainMap(target, W, H, [&](const QImage& m, QImage& back) -> QByteArray {
-        AvifCodedItem item;
+        std::vector<HeifItem> picture;
         const QString name = QStringLiteral("map%1").arg(attempts.size());
         if (hevc) {
-            if (!hevcItem(rgbPicture(m, Av1Layout::Yuv420), std::max(quality, 90), dir, name, item, why) || !readBack(item, back)) return {};
+            if (!hevcPicture(rgbPicture(m, Av1Layout::Yuv420), std::max(quality, 90), tile, dir, name, picture, why) ||
+                !readBack(picture, name, back))
+                return {};
         } else {
+            AvifCodedItem item;
             const std::string mapPath = dir.filePath(name + ".avif").toStdString();
             if (!encodeStill(rgbPicture(m, Av1Layout::Gbr), std::max(quality, 90), {"libaom-av1"}, "avif", mapPath, why) &&
                 !encodeStill(rgbPicture(m, Av1Layout::Yuv444), std::max(quality, 90), {"librav1e", "libaom-av1"}, "avif", mapPath, why) &&
@@ -1021,8 +1101,9 @@ bool writeGainMapStill(bool hevc, const Image& sdr, const ColorSpace& sdrSpace, 
                 return {};
             back = decodeHeifPicture(mapPath, &why);
             if (!readHeifCodedItem(mapPath, item)) return {};
+            picture = {{item.type, item.data, itemProperties(item.properties)}};
         }
-        attempts.push_back(item);
+        attempts.push_back(picture);
         return QByteArray::number(qulonglong(attempts.size() - 1));
     });
     bool ok = false;
@@ -1038,14 +1119,18 @@ bool writeGainMapStill(bool hevc, const Image& sdr, const ColorSpace& sdrSpace, 
     for (const QByteArray& p : pictureProperties(W, H, 10, cicpPrimaries(hdrSpace), cicpTransfer(hdrSpace), 6))
         if (p.mid(4, 4) != "pixi") tmapProperties.push_back({p, false});
     if (maxCll > 0) tmapProperties.push_back({clliBox(maxCll, maxFall), false});
-    std::vector<HeifItem> items = {{base.type, base.data, itemProperties(base.properties)},
-                                   {"tmap", tmap, tmapProperties},
-                                   {map.type, map.data, itemProperties(map.properties), true},
-                                   {"mime", adobeGainMapXmp(meta), {}, false, "application/rdf+xml"}};
+    std::vector<HeifItem> items;
+    std::vector<HeifRef> refs;
+    const unsigned baseId = addPicture(items, refs, base, false), tmapId = unsigned(items.size() + 1);
+    items.push_back({"tmap", tmap, tmapProperties});
+    const unsigned mapId = addPicture(items, refs, map, true), xmpId = unsigned(items.size() + 1);
+    items.push_back({"mime", adobeGainMapXmp(meta), {}, false, "application/rdf+xml"});
+    refs.push_back({"dimg", tmapId, {baseId, mapId}});
+    refs.push_back({"cdsc", xmpId, {mapId}});
     const std::vector<QByteArray> brands = hevc ? std::vector<QByteArray>{"heic", "mif1", "heic", "heix", "tmap"}
                                                 : std::vector<QByteArray>{"avif", "avif", "mif1", "miaf", "tmap"};
     QByteArray file;
-    if (!heifFile(brands, items, {{"dimg", 2, {1, 3}}, {"cdsc", 4, {3}}}, {2, 1}, file, why)) return fail(why);
+    if (!heifFile(brands, items, refs, {tmapId, baseId}, file, why)) return fail(why);
     return writeStillFile(path, file, why) || fail(why);
 }
 
@@ -1061,52 +1146,17 @@ bool writeHeifStill(const Image& img, const ColorSpace& space, int quality, doub
     const bool hdr = space.hdr();
     const int W = img.width, H = img.height, bits = hdr ? 10 : 8;
     if (W > 65535 || H > 65535 || int64_t(W) * H > (1 << 27)) return fail("Too large for this HEIF writer");  // (as Montage reads them)
-    // (A picture larger than HEVC level 5.1 takes, which phones and graphics cards decode, goes in tiles of 2048.)
-    if (tile <= 0 && (int64_t(W) * H > 8912896 || std::max(W, H) > 8192)) tile = 2048;
-    tile += tile & 1;  // (tiles at 4:2:0 even)
+    if (tile <= 0) tile = heifTile(W, H);
     QTemporaryDir dir;
     if (!dir.isValid()) return fail("Cannot make a temporary folder");
     std::string why;
-    std::vector<std::pair<QByteArray, bool>> light;
-    if (hdr) light = {{mdcvBox(peakNits), false}, {clliBox(maxCll, maxFall), false}};
-    std::vector<HeifItem> items;
+    std::vector<HeifItem> items, picture;
     std::vector<HeifRef> refs;
-    if (tile <= 0 || (tile >= W && tile >= H)) {
-        AvifCodedItem item;
-        if (!hevcItem(ycbcr420(img, space, bits), quality, dir, "still", item, why)) return fail(why);
-        items.push_back({item.type, item.data, itemProperties(item.properties)});
-        for (const auto& p : light) addDescriptive(items[0].properties, p);
-    } else {
-        // A grid (item 1) of tiles the same size, those at the right and bottom edges filled out with their last
-        // column and row.
-        const int columns = (W + tile - 1) / tile, rows = (H + tile - 1) / tile;
-        if (columns > 256 || rows > 256) return fail("Too large for this HEIF writer");
-        QByteArray grid;
-        grid.append(char(0)).append(char(0)).append(char(rows - 1)).append(char(columns - 1));
-        put16(grid, unsigned(W));
-        put16(grid, unsigned(H));
-        items.push_back({"grid", grid, {}});
-        for (const QByteArray& p : pictureProperties(W, H, bits, 0, 0, 0))
-            if (p.mid(4, 4) != "colr") items[0].properties.push_back({p, false});
-        refs.push_back({"dimg", 1, {}});
-        for (int r = 0; r < rows; ++r)
-            for (int c = 0; c < columns; ++c) {
-                Image part(tile, tile, Image::Uninitialized{});
-                for (int y = 0; y < tile; ++y) {
-                    const float* s = img.row(std::min(H - 1, r * tile + y));
-                    float* d = part.row(y);
-                    for (int x = 0; x < tile; ++x) std::memcpy(d + x * 4, s + std::min(W - 1, c * tile + x) * 4, 4 * sizeof(float));
-                }
-                AvifCodedItem item;
-                if (!hevcItem(ycbcr420(part, space, bits), quality, dir, QStringLiteral("tile%1").arg(items.size()), item, why)) return fail(why);
-                items.push_back({item.type, item.data, itemProperties(item.properties), true});
-                refs[0].to.push_back(unsigned(items.size()));
-            }
-        // (The grid's colour, as its tiles'.)
-        for (const auto& [p, essential] : items[1].properties)
-            if (p.mid(4, 4) == "colr") addDescriptive(items[0].properties, {p, false});
-        for (const auto& p : light) items[0].properties.push_back(p);
-    }
+    if (!hevcPicture(ycbcr420(img, space, bits), quality, tile, dir, "still", picture, why)) return fail(why);
+    addPicture(items, refs, picture, false);
+    if (hdr)
+        for (const auto& p : {std::pair<QByteArray, bool>{mdcvBox(peakNits), false}, {clliBox(maxCll, maxFall), false}})
+            addDescriptive(items[0].properties, p);
     QByteArray file;
     if (!heifFile(hdr ? std::vector<QByteArray>{"heix", "mif1", "heix"} : std::vector<QByteArray>{"heic", "mif1", "heic"}, items, refs, {},
                   file, why))
@@ -1120,8 +1170,8 @@ bool writeGainMapAvif(const Image& sdr, const ColorSpace& sdrSpace, const Image&
 }
 
 bool writeGainMapHeif(const Image& sdr, const ColorSpace& sdrSpace, const Image& hdr, const ColorSpace& hdrSpace, int quality,
-                      double maxCll, double maxFall, const std::string& path, std::string* error) {
-    return writeGainMapStill(true, sdr, sdrSpace, hdr, hdrSpace, quality, maxCll, maxFall, path, error);
+                      double maxCll, double maxFall, const std::string& path, std::string* error, int tile) {
+    return writeGainMapStill(true, sdr, sdrSpace, hdr, hdrSpace, quality, maxCll, maxFall, path, error, tile);
 }
 
 }  // namespace montage

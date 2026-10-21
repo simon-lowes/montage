@@ -9723,6 +9723,15 @@ const auto seq = [this] { return state()->sequence(); };
         // Undo puts the first back.
         state()->undo();
         QTRY_COMPARE(table->item(0, 3)->text(), QString("Rain falls."));
+        // Drafting looks for the gaps again: a line put in the gap since leaves none to draft into.
+        QVERIFY(state()->apply("Line in the gap", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, media, 45, 0, -1, {TrackKind::Video, -1}, {TrackKind::Audio, 0}, false);
+        }));
+        QCOMPARE(dlg->draft(&err), -1);
+        QCOMPARE(err, QString("No gaps between the dialogue to describe"));
+        state()->undo();
+        QVERIFY2(dlg->findGaps(&err) >= 1, qPrintable(err));
+        QTRY_COMPARE(table->item(0, 3)->text(), QString("Rain falls."));
         // Muting them while working; nothing to duck before they are voiced.
         dlg->setHear(false);
         QVERIFY(edit::roleMuted(*state()->sequence(), kDescriptionRole));

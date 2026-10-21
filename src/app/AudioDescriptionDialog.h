@@ -57,6 +57,7 @@ private:
     QCheckBox* useModel_;
     QLabel* status_;
     std::vector<DescriptionGap> gaps_;
+    std::vector<DescriptionGap> added_;  // the gaps added at the playhead, kept when the gaps are found again
     bool refreshing_ = false;
 };
 

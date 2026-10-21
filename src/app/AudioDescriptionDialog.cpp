@@ -157,6 +157,7 @@ AudioDescriptionDialog::AudioDescriptionDialog(EditorState* state, QWidget* pare
     connect(state_, &EditorState::projectChanged, this, &AudioDescriptionDialog::refresh);
     connect(state_, &EditorState::sequenceSwitched, this, [this] {
         gaps_.clear();
+        added_.clear();
         refresh();
     });
     refresh();
@@ -185,6 +186,10 @@ int AudioDescriptionDialog::findGaps(QString* error) {
     }
     const FrameTime end = std::max<FrameTime>(s->duration(), 1);
     gaps_ = descriptionGaps(speech, s->fpsValue(), 0, end, minGap_->value());
+    gaps_.insert(gaps_.end(), added_.begin(), added_.end());
+    std::sort(gaps_.begin(), gaps_.end(), [](const DescriptionGap& a, const DescriptionGap& b) { return a.start < b.start || (a.start == b.start && a.end < b.end); });
+    gaps_.erase(std::unique(gaps_.begin(), gaps_.end(), [](const DescriptionGap& a, const DescriptionGap& b) { return a.start == b.start && a.end == b.end; }),
+                gaps_.end());
     refresh();
     status_->setText(tr("%n gap(s) of %1 s or more between the dialogue", "", int(gaps_.size())).arg(minGap_->value()));
     return int(gaps_.size());
@@ -270,6 +275,7 @@ void AudioDescriptionDialog::addAtPlayhead() {
     for (const DescriptionGap& g : gaps_)
         if (at >= g.start && at < g.end) end = std::min(end, g.end);  // within the gap it is in
     gaps_.push_back({at, end});
+    added_.push_back({at, end});
     std::sort(gaps_.begin(), gaps_.end(), [](const DescriptionGap& a, const DescriptionGap& b) { return a.start < b.start; });
     refresh();
     for (int r = 0; r < table_->rowCount(); ++r)
@@ -282,7 +288,13 @@ void AudioDescriptionDialog::addAtPlayhead() {
 int AudioDescriptionDialog::draft(QString* error) {
     const Sequence* s = state_->sequence();
     if (!s) return -1;
-    if (gaps_.empty() && findGaps(error) < 0) return -1;
+    // (Found again: the dialogue may have been cut since they were last found. Those found before, when the dialogue
+    // cannot be heard now.)
+    QString why;
+    if (findGaps(&why) < 0 && gaps_.empty()) {
+        if (error) *error = why;
+        return -1;
+    }
     // The gaps with no description yet.
     std::vector<DescriptionGap> empty;
     const int t = findDescriptionTrack(*s);
