@@ -19,6 +19,7 @@
 #include "media/Image.h"
 #include "render/Shorts.h"
 #include "render/ReviewExport.h"
+#include "render/AafExport.h"
 #include "render/Dcp.h"
 #include "render/Adm.h"
 #include "render/Iamf.h"
@@ -481,10 +482,12 @@ private:
     void exportInterchange(Interchange format);
     // The audio tracks as AAF with mono WAVs beside it (for Pro Tools, Fairlight), in the background with progress.
     void exportAafDialog(bool picture = true);
+    // The cut's media as Media Composer keeps its own (OP-Atom in "Avid MediaFiles/MXF") with an AAF linked to it.
+    void exportAafWithMediaDialog();
     // Find Shots for moments that look like the selected clip (or the one under the playhead) at the playhead.
     void findSimilarShots();
 public:
-    bool exportAafTo(const QString& path, QString* summary = nullptr, bool picture = true);
+    bool exportAafTo(const QString& path, QString* summary = nullptr, bool picture = true, const AafAvidMedia& avid = {});
 private:
     // Imports an OTIO, EDL or FCP XML timeline as a new sequence (one undo step).
     void importTimeline();

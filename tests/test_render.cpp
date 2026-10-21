@@ -2790,6 +2790,13 @@ colorspaces:
             }
             QVERIFY2(worstFound < 0.1, qPrintable(QString::number(worstFound)));
             QVERIFY2(worstHeld < 0.1, qPrintable(QString::number(worstHeld)));
+            // A reference of one hole (a format with a hole a frame): the frame's hole nearest it is that hole, not the
+            // mean of all the frame's holes.
+            {
+                double ox = 0, oy = 0;
+                QVERIFY(perforationOffset(findPerforations(frame(d0x + 2, d0y - 1), ps), {reference[1]}, ox, oy));
+                QVERIFY2(std::fabs(ox - 2) < 0.1 && std::fabs(oy + 1) < 0.1, qPrintable(QString("%1 %2").arg(ox).arg(oy)));
+            }
             // No reference: the frame as it was; nothing in a plain rebate.
             Image f = frame(1, 1), same = f;
             applyPerfLock(makeEffect(p, "perf_lock"), 0, same);
@@ -4866,6 +4873,31 @@ colorspaces:
             const auto hdrPic = decodeGainMapHeif(oddGm, &err);
             QVERIFY2(hdrPic && hdrPic->width == 61 && hdrPic->height == 37, err.c_str());
             if (!heifDec.isEmpty()) QCOMPARE(libheifSize(oddGm), QSize(61, 37));
+            // In tiles (as a picture larger than HEVC's levels is written): the base and the map each a grid, read as the
+            // same picture.
+            const std::string tiledGm = dir.filePath("tiled-gain-map.heic").toStdString();
+            QVERIFY2(writeGainMapHeif(renderProgramFrame(p, s, 0, sdrTrim), *findColorSpace("rec709"), renderProgramFrame(p, s, 0, RenderOptions()), pq, 95,
+                                      res.maxCll, res.maxFall, tiledGm, &err, 96),
+                     err.c_str());
+            HeifStillInfo hi;
+            QVERIFY(readHeifStill(tiledGm, hi) && hi.grid && hi.width == W && hi.height == H);
+            const QImage tiledBase = decodeHeifPicture(tiledGm).convertToFormat(QImage::Format_RGB888);
+            QCOMPARE(tiledBase.size(), QSize(W, H));
+            for (int i = 0; i < 8; ++i) {
+                const QColor c = tiledBase.pixelColor(i * 32 + 16, H / 2);
+                const size_t at = (size_t(H / 2) * W + i * 32 + 16) * 4;
+                QVERIFY2(std::abs(c.red() - trimmed[at]) <= 3 && std::abs(c.green() - trimmed[at + 1]) <= 3 && std::abs(c.blue() - trimmed[at + 2]) <= 3,
+                         qPrintable(QString("tiled HEIF base patch %1").arg(i)));
+            }
+            img = readBack(tiledGm, "rec2100pq", back);
+            QVERIFY(back.gainMap);
+            why = sameLight709([&](int x, int y, double out[3]) {
+                const float* px = img.at(x, y);
+                double n[3] = {codeToNits(pq, px[0]), codeToNits(pq, px[1]), codeToNits(pq, px[2])};
+                in709(n, out);
+            }, 0.02);
+            QVERIFY2(why.isEmpty(), qPrintable("tiled HEIF: " + why));
+            if (!heifDec.isEmpty()) QCOMPARE(libheifSize(tiledGm), QSize(W, H));
         }
 
         // For SDR screens (the default): the SDR trim's render, as an 8-bit PNG.
@@ -4908,6 +4940,19 @@ colorspaces:
                     QVERIFY2(std::abs(int(heifGot[at]) - int(want[at])) <= 3,
                              qPrintable(QString("HEIF patch %1: %2, not %3").arg(i).arg(heifGot[at]).arg(want[at])));
                 }
+            // Its colour property's matrix made 2 (unspecified): the coded picture's own (BT.709) is used, not BT.601.
+            QFile in(QString::fromStdString(sdrHeif));
+            QVERIFY(in.open(QIODevice::ReadOnly));
+            QByteArray bytes = in.readAll();
+            const qsizetype colr = bytes.indexOf("colrnclx");
+            QVERIFY(colr > 0 && bytes.indexOf("colrnclx", colr + 1) < 0);
+            QCOMPARE(int(bytes[colr + 12]) * 256 + int(bytes[colr + 13]), 1);
+            bytes[colr + 13] = 2;
+            const QString unstated = dir.filePath("sdr-matrix-unstated.heic");
+            QFile out(unstated);
+            QVERIFY(out.open(QIODevice::WriteOnly) && out.write(bytes) == bytes.size());
+            out.close();
+            QVERIFY(decodeHeifPicture(unstated.toStdString()) == decodeHeifPicture(sdrHeif));
         }
         // Without an SDR trim target: the master tone mapped as the viewer shows it.
         Sequence plain = s;

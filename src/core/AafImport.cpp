@@ -1,7 +1,9 @@
 #include "AafImport.h"
 
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
+#include <QStorageInfo>
 #include <QString>
 #include <QUrl>
 #include <algorithm>
@@ -229,6 +231,7 @@ struct Source {
     double length = 0;    // the file's length, when known
     int channel = -1;     // the file's sound slot (channel) played
     bool found = false;
+    std::string fileMob;  // the file mob's ID: Media Composer's media are found by it
 };
 
 class Reader {
@@ -289,6 +292,7 @@ public:
         // A file mob: its descriptor's locator names the file.
         if (m.obj.is(kSourceMob)) {
             const Obj desc = strong(m.obj, 0x4701);
+            if (desc && desc.has(0x3001)) out.fileMob = m.id;  // a file's descriptor (a tape's has no sample rate)
             std::string url = locator(desc);
             if (url.empty() && desc.is(kMultipleDescriptor))
                 for (const Obj& d : strongList(desc, 0x3f01))
@@ -324,9 +328,11 @@ public:
                 if (deeper.found || !deeper.url.empty()) {
                     if (!m.obj.is(kSourceMob) && !m.name.empty()) deeper.name = m.name;  // the master mob's name is the clip's
                     if (out.channel >= 0 && deeper.channel < 0) deeper.channel = out.channel;
+                    if (!out.fileMob.empty()) deeper.fileMob = out.fileMob;
                     return deeper;
                 }
                 if (out.length <= 0) out.length = deeper.length;
+                if (out.fileMob.empty()) out.fileMob = deeper.fileMob;
             }
         }
         return out;
@@ -494,6 +500,84 @@ std::string findFile(const std::string& url, const std::string& aafDir) {
     return path.toStdString();
 }
 
+// The package IDs an MXF file's header names (each package's PackageUID, local tag 4401h), as mob IDs: read from the
+// start of the file, not decoded.
+std::vector<std::string> mxfPackageIds(const QString& path) {
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) return {};
+    const QByteArray head = f.read(128 * 1024);
+    static const QByteArray tag("\x44\x01\x00\x20\x06\x0a\x2b\x34", 8);
+    std::vector<std::string> ids;
+    for (qsizetype at = head.indexOf(tag); at >= 0 && at + 36 <= head.size(); at = head.indexOf(tag, at + 1))
+        if (const std::string id = aafMobIdFromUmidBytes(head.mid(at + 4, 32).toStdString()); !id.empty()) ids.push_back(id);
+    return ids;
+}
+
+// Media Composer's own media: MXF files in the numbered folders of a drive's "Avid MediaFiles/MXF", found by their
+// package IDs (a file mob's ID is its file's), as Media Composer finds them. Looked for, when a file is not where its
+// locator says, first at the same place under each "Avid MediaFiles" (a drive moved or mounted elsewhere), then among
+// all the files of those beside and above the AAF and at the top of each local drive.
+class AvidMediaIndex {
+public:
+    explicit AvidMediaIndex(const std::string& aafDir) : dir_(aafDir) {}
+    std::string find(const std::string& mobId, const std::string& url) {
+        if (roots_.isEmpty()) findRoots();
+        // "Avid MediaFiles/MXF/<n>/<file>" from the locator, under each.
+        QString path = QUrl(QString::fromStdString(url)).isLocalFile() ? QUrl(QString::fromStdString(url)).toLocalFile() : QString::fromStdString(url);
+        path.replace('\\', '/');
+        const qsizetype at = path.lastIndexOf(QLatin1String("/Avid MediaFiles/"), -1, Qt::CaseInsensitive);
+        if (at >= 0)
+            for (const QString& root : roots_) {
+                if (root.isEmpty()) continue;
+                const QString there = root + path.mid(at);
+                if (QFileInfo(there).isFile()) {
+                    const std::vector<std::string> ids = mxfPackageIds(there);
+                    if (std::find(ids.begin(), ids.end(), mobId) != ids.end()) return there.toStdString();
+                }
+            }
+        if (!scanned_) scan();
+        const auto it = files_.find(mobId);
+        return it == files_.end() ? std::string() : it->second;
+    }
+
+private:
+    void findRoots() {
+        QStringList roots;
+        for (QDir d(QString::fromStdString(dir_));;) {
+            roots << d.absolutePath();
+            if (!d.cdUp()) break;
+        }
+        // Not network shares: reading every file's header there could take very long.
+        static const char* const remote[] = {"nfs", "cifs", "smb", "afp", "webdav", "fuse.sshfs", "9p"};
+        for (const QStorageInfo& v : QStorageInfo::mountedVolumes()) {
+            const QByteArray type = v.fileSystemType().toLower();
+            if (v.isValid() && v.isReady() &&
+                std::none_of(std::begin(remote), std::end(remote), [&](const char* r) { return type.startsWith(r); }))
+                roots << v.rootPath();
+        }
+        for (QString& r : roots)
+            if (r.endsWith('/')) r.chop(1);
+        roots.removeDuplicates();
+        for (const QString& r : roots)
+            if (QFileInfo(r + "/Avid MediaFiles/MXF").isDir()) roots_ << r;
+        if (roots_.isEmpty()) roots_ << QString();  // looked: none
+    }
+    void scan() {
+        scanned_ = true;
+        for (const QString& root : roots_) {
+            if (root.isEmpty()) continue;
+            const QDir mxf(root + "/Avid MediaFiles/MXF");
+            for (const QFileInfo& folder : mxf.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot))
+                for (const QFileInfo& f : QDir(folder.filePath()).entryInfoList({"*.mxf"}, QDir::Files))
+                    for (const std::string& id : mxfPackageIds(f.absoluteFilePath())) files_.emplace(id, f.absoluteFilePath().toStdString());
+        }
+    }
+    std::string dir_;
+    QStringList roots_;
+    bool scanned_ = false;
+    std::map<std::string, std::string> files_;
+};
+
 }  // namespace
 
 ImportResult importAaf(Project& p, const std::string& path, const MediaProber& probe) {
@@ -512,6 +596,7 @@ ImportResult importAaf(Project& p, const std::string& path, const MediaProber& p
         return res;
     }
     const std::string aafDir = QFileInfo(QString::fromStdString(path)).absolutePath().toStdString();
+    AvidMediaIndex avidMedia(aafDir);
     // Each composition becomes a sequence; one that another plays (a nested sequence) is made once, when first met,
     // and played there as a nested sequence clip.
     std::map<std::string, Id> built;    // composition mob -> sequence
@@ -608,7 +693,9 @@ ImportResult importAaf(Project& p, const std::string& path, const MediaProber& p
                     if (already) continue;  // its other sound (or picture) slots: the nested mix already plays them
                 } else {
                     const Source src = reader.resolve(pc.mob, pc.slot, pc.start, s.rate);
-                    const std::string file = src.url.empty() ? std::string() : findFile(src.url, aafDir);
+                    std::string file = src.url.empty() ? std::string() : findFile(src.url, aafDir);
+                    if ((file.empty() || !QFileInfo(QString::fromStdString(file)).isFile()) && !src.fileMob.empty())
+                        if (const std::string found = avidMedia.find(src.fileMob, src.url); !found.empty()) file = found;
                     const double seconds = std::max(src.length, src.seconds + pc.len * pc.speed / rateOf(s.rate));
                     media = b.media(file, src.name, pic, snd, seconds);
                     sourceIn = src.seconds * f;

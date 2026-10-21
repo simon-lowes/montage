@@ -3780,6 +3780,14 @@ private slots:
         QVERIFY(win_->findChild<QAction*>("exportAafSound"));
         QVERIFY(win_->exportAafTo(dir_.path() + "/sound.aaf", &summary, false));
         QVERIFY2(summary.contains("1 audio tracks") && !summary.contains("video"), qPrintable(summary));
+        // With media for Media Composer, from its own menu item: OP-Atom files in a numbered "Avid MediaFiles/MXF" folder.
+        QVERIFY(win_->findChild<QAction*>("exportAafAvid"));
+        AafAvidMedia avid;
+        avid.enabled = true;
+        avid.codec = "dnxhr_lb";
+        QVERIFY(win_->exportAafTo(dir_.path() + "/avid.aaf", &summary, true, avid));
+        QVERIFY2(summary.contains("1 audio tracks") && summary.contains("Avid MediaFiles"), qPrintable(summary));
+        QVERIFY(!QDir(dir_.path() + "/Avid MediaFiles/MXF/1").entryList({"*.mxf"}, QDir::Files).isEmpty());
         state()->newProject();
     }
 
@@ -9714,6 +9722,15 @@ const auto seq = [this] { return state()->sequence(); };
         QTRY_VERIFY(table->item(0, 4)->text().startsWith("Too long"));
         // Undo puts the first back.
         state()->undo();
+        QTRY_COMPARE(table->item(0, 3)->text(), QString("Rain falls."));
+        // Drafting looks for the gaps again: a line put in the gap since leaves none to draft into.
+        QVERIFY(state()->apply("Line in the gap", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, media, 45, 0, -1, {TrackKind::Video, -1}, {TrackKind::Audio, 0}, false);
+        }));
+        QCOMPARE(dlg->draft(&err), -1);
+        QCOMPARE(err, QString("No gaps between the dialogue to describe"));
+        state()->undo();
+        QVERIFY2(dlg->findGaps(&err) >= 1, qPrintable(err));
         QTRY_COMPARE(table->item(0, 3)->text(), QString("Rain falls."));
         // Muting them while working; nothing to duck before they are voiced.
         dlg->setHear(false);

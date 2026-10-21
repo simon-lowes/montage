@@ -10,7 +10,8 @@
 // clip and file mob each, with a CDCI descriptor and the file's URL): source
 // offsets exact, dissolves as transitions at their edit points (reaching into
 // the handles the media has), constant speed (and a conformed frame rate) as
-// Motion Control; titles, generated clips and nested sequences leave gaps.
+// Motion Control; titles, generated clips and nested sequences leave gaps. Or everything with media Media Composer
+// keeps as its own (AafAvidMedia).
 #pragma once
 
 #include <atomic>
@@ -22,8 +23,24 @@
 
 namespace montage {
 
+// Media for Media Composer (render/AvidMedia.h): the cut's media written as MXF OP-Atom into a numbered folder of
+// "Avid MediaFiles/MXF" and the AAF linked to it, so the sequence opens with its media and nothing to link or import.
+// The picture at the sequence's size and rate in a DNxHD or DNxHR flavour, the sound as mono 24-bit PCM (each source
+// whole, a file per channel). Left off (the default), each used stretch of a picture source (and `handles` frames
+// either side, where the source has them) becomes one file, cut as it is in Montage, its grades and effects left
+// behind; baked, each clip is rendered through its effects and transform to a file of its own, with its handles.
+// Image sequences and Photoshop layers come too, and, baked, titles, generated clips and nested sequences.
+struct AafAvidMedia {
+    bool enabled = false;
+    std::string drive;  // where "Avid MediaFiles" is ("" = the AAF's folder), or that folder, or its MXF folder
+    std::string codec = "dnxhr_sq";
+    int handles = 30;  // frames
+    bool bake = false;
+};
+
 struct AafExportOptions {
     bool picture = true;  // the video tracks too, linked to the original files
+    AafAvidMedia avid;
 };
 
 struct AafExportResult {
@@ -34,6 +51,7 @@ struct AafExportResult {
     int videoClips = 0;
     int videoTransitions = 0;  // dissolves
     std::vector<std::string> mediaFiles;
+    std::string mediaFolder;  // with Avid media: the numbered folder it went to
     std::vector<std::string> warnings;
 };
 

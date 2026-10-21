@@ -2,6 +2,7 @@
 
 #include <QString>
 #include <algorithm>
+#include <exception>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -130,48 +131,54 @@ std::string LanguageModel::write(const WriteRequest& r, std::string* error, cons
     const int maxTokens = std::max(1, r.maxTokens);
     if (count + maxTokens > contextTokens()) return fail("The question is too long for the language model");
 
-    llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = uint32_t((count + maxTokens + 255) / 256 * 256);
-    cp.n_batch = 512;
-    cp.n_ubatch = 512;
-    cp.n_threads = cp.n_threads_batch = int32_t(std::max(1u, std::thread::hardware_concurrency()));
-    cp.no_perf = true;
-    cp.op_offload = false;
-    cp.abort_callback = [](void* c) { return c && static_cast<const std::atomic<bool>*>(c)->load(); };
-    cp.abort_callback_data = const_cast<std::atomic<bool>*>(cancel);
-    std::unique_ptr<llama_context, void (*)(llama_context*)> ctx(llama_init_from_model(d_->model, cp), llama_free);
-    if (!ctx) return fail("The language model has no room to work (not enough memory)");
-    std::unique_ptr<llama_sampler, void (*)(llama_sampler*)> sampler(llama_sampler_chain_init(llama_sampler_chain_default_params()),
-                                                                    llama_sampler_free);
-    if (!r.grammar.empty()) {
-        llama_sampler* g = llama_sampler_init_grammar(vocab, r.grammar.c_str(), "root");
-        if (!g) return fail("The answer's grammar could not be read");
-        llama_sampler_chain_add(sampler.get(), g);
-    }
-    llama_sampler_chain_add(sampler.get(), llama_sampler_init_greedy());
+    // (llama.cpp throws in places, its grammar sampler among them, on a state it did not foresee: an answer that
+    // fails, not a crash.)
+    try {
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = uint32_t((count + maxTokens + 255) / 256 * 256);
+        cp.n_batch = 512;
+        cp.n_ubatch = 512;
+        cp.n_threads = cp.n_threads_batch = int32_t(std::max(1u, std::thread::hardware_concurrency()));
+        cp.no_perf = true;
+        cp.op_offload = false;
+        cp.abort_callback = [](void* c) { return c && static_cast<const std::atomic<bool>*>(c)->load(); };
+        cp.abort_callback_data = const_cast<std::atomic<bool>*>(cancel);
+        std::unique_ptr<llama_context, void (*)(llama_context*)> ctx(llama_init_from_model(d_->model, cp), llama_free);
+        if (!ctx) return fail("The language model has no room to work (not enough memory)");
+        std::unique_ptr<llama_sampler, void (*)(llama_sampler*)> sampler(llama_sampler_chain_init(llama_sampler_chain_default_params()),
+                                                                        llama_sampler_free);
+        if (!r.grammar.empty()) {
+            llama_sampler* g = llama_sampler_init_grammar(vocab, r.grammar.c_str(), "root");
+            if (!g) return fail("The answer's grammar could not be read");
+            llama_sampler_chain_add(sampler.get(), g);
+        }
+        llama_sampler_chain_add(sampler.get(), llama_sampler_init_greedy());
 
-    auto cancelled = [&] { return cancel && cancel->load(); };
-    for (int at = 0; at < count; at += int(cp.n_batch)) {
-        if (cancelled()) return fail("Cancelled");
-        const int n = std::min(int(cp.n_batch), count - at);
-        if (llama_decode(ctx.get(), llama_batch_get_one(tokens.data() + at, n)) != 0)
-            return fail(cancelled() ? "Cancelled" : "The language model could not read the question");
-        if (progress) progress(0.5 * double(at + n) / count);
+        auto cancelled = [&] { return cancel && cancel->load(); };
+        for (int at = 0; at < count; at += int(cp.n_batch)) {
+            if (cancelled()) return fail("Cancelled");
+            const int n = std::min(int(cp.n_batch), count - at);
+            if (llama_decode(ctx.get(), llama_batch_get_one(tokens.data() + at, n)) != 0)
+                return fail(cancelled() ? "Cancelled" : "The language model could not read the question");
+            if (progress) progress(0.5 * double(at + n) / count);
+        }
+        std::string answer;
+        char piece[256];
+        for (int i = 0; i < maxTokens; ++i) {
+            if (cancelled()) return fail("Cancelled");
+            llama_token t = llama_sampler_sample(sampler.get(), ctx.get(), -1);
+            if (llama_vocab_is_eog(vocab, t)) break;
+            const int n = llama_token_to_piece(vocab, t, piece, int32_t(sizeof piece), 0, false);
+            if (n > 0) answer.append(piece, size_t(n));
+            if (progress) progress(0.5 + 0.5 * double(i + 1) / maxTokens);
+            if (llama_decode(ctx.get(), llama_batch_get_one(&t, 1)) != 0)
+                return fail(cancelled() ? "Cancelled" : "The language model stopped part way");
+        }
+        if (progress) progress(1.0);
+        return answer;
+    } catch (const std::exception& e) {
+        return fail(std::string("The language model failed: ") + e.what());
     }
-    std::string answer;
-    char piece[256];
-    for (int i = 0; i < maxTokens; ++i) {
-        if (cancelled()) return fail("Cancelled");
-        llama_token t = llama_sampler_sample(sampler.get(), ctx.get(), -1);
-        if (llama_vocab_is_eog(vocab, t)) break;
-        const int n = llama_token_to_piece(vocab, t, piece, int32_t(sizeof piece), 0, false);
-        if (n > 0) answer.append(piece, size_t(n));
-        if (progress) progress(0.5 + 0.5 * double(i + 1) / maxTokens);
-        if (llama_decode(ctx.get(), llama_batch_get_one(&t, 1)) != 0)
-            return fail(cancelled() ? "Cancelled" : "The language model stopped part way");
-    }
-    if (progress) progress(1.0);
-    return answer;
 }
 
 #else

@@ -3,6 +3,7 @@
 #include <QByteArray>
 #include <QDateTime>
 #include <QString>
+#include <algorithm>
 #include <cstdio>
 #include <random>
 
@@ -137,6 +138,36 @@ std::string aafNewMobId() {
     static std::mt19937_64 rng(std::random_device{}());
     for (int i = 0; i < 2; ++i) append64(id, rng());
     return id;
+}
+
+std::string aafMobIdFromUmidBytes(const std::string& umid) {
+    if (umid.size() != 32) return {};
+    std::string b = umid;
+    // The material number's UUID fields, little-endian as AAF keeps them. Media Composer's own UMIDs carry it half
+    // swapped (its last eight bytes first, marked by 06 0E 2B 34 7F 7F), which pyaaf2 reads the same way.
+    const unsigned char* m = reinterpret_cast<const unsigned char*>(umid.data()) + 16;
+    const bool halfSwapped = umid[11] == 0 && m[0] == 0x06 && m[1] == 0x0e && m[2] == 0x2b && m[3] == 0x34 && m[4] == 0x7f && m[5] == 0x7f;
+    const size_t fields = halfSwapped ? 24 : 16, rest = halfSwapped ? 16 : 24;
+    b.replace(16, 8, umid, fields, 8);
+    b.replace(24, 8, umid, rest, 8);
+    std::reverse(b.begin() + 16, b.begin() + 20);
+    std::reverse(b.begin() + 20, b.begin() + 22);
+    std::reverse(b.begin() + 22, b.begin() + 24);
+    return b;
+}
+
+std::string aafMobIdFromUmid(const std::string& umid) {
+    std::string hex = umid.rfind("0x", 0) == 0 || umid.rfind("0X", 0) == 0 ? umid.substr(2) : umid;
+    hex.erase(std::remove_if(hex.begin(), hex.end(), [](char c) { return c == '.' || c == '-'; }), hex.end());
+    if (hex.size() != 64) return {};
+    const auto nibble = [](char c) { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; };
+    std::string b(32, '\0');
+    for (size_t i = 0; i < 32; ++i) {
+        const int hi = nibble(hex[2 * i]), lo = nibble(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return {};
+        b[i] = char(hi * 16 + lo);
+    }
+    return aafMobIdFromUmidBytes(b);
 }
 
 AafObject::AafObject(const std::string& classAuidText) : classId_(aafAuid(classAuidText)) {}

@@ -132,6 +132,10 @@ struct ExportSettings {
     int monoAudioTracks = 0;
     // The file's starting timecode ("10:00:00:00"; "" = none), where the container keeps one (MXF, MOV).
     std::string startTimecode;
+    // The FFmpeg muxer by name ("mxf_opatom": one picture track in Avid's OP-Atom, render/AvidMedia.h); "" = by the
+    // path's extension. And container metadata for it (MXF: material_package_name, reel_name).
+    std::string format;
+    std::map<std::string, std::string> formatMetadata;
     // Delivered at another frame rate (render/RateConversion.h): "" at the sequence's own; "pulldown" (a 23.976 or 24
     // sequence with 2:3 or 2:2:2:4 pulldown: into fields at 29.97 or 30, coded interlaced, or repeated frames at 59.94
     // or 60); "speed" (each frame shown once at `rate`, the programme faster or slower, as PAL's 25 from 24, its sound

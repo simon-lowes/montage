@@ -44,8 +44,9 @@ bool writeHeifStill(const Image& img, const ColorSpace& space, int quality, doub
 // over black, the same size.
 bool writeGainMapAvif(const Image& sdr, const ColorSpace& sdrSpace, const Image& hdr, const ColorSpace& hdrSpace, int quality,
                       double maxCll, double maxFall, const std::string& path, std::string* error = nullptr);
-// The same as a HEIF, in HEVC (the map 4:4:4).
+// The same as a HEIF, in HEVC (the map 4:2:0), the base and the map each in a grid of tiles when larger than HEVC's
+// levels take (or than `tile`, when given).
 bool writeGainMapHeif(const Image& sdr, const ColorSpace& sdrSpace, const Image& hdr, const ColorSpace& hdrSpace, int quality,
-                      double maxCll, double maxFall, const std::string& path, std::string* error = nullptr);
+                      double maxCll, double maxFall, const std::string& path, std::string* error = nullptr, int tile = 0);
 
 }  // namespace montage

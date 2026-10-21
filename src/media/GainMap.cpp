@@ -943,8 +943,9 @@ QImage decodeCoded(const AvifFile& a, const AvifItem& item, const QByteArray& da
             if (avcodec_send_packet(ctx, pkt) >= 0 && avcodec_send_packet(ctx, nullptr) >= 0 && avcodec_receive_frame(ctx, frame) >= 0) {
                 int matrix = int(frame->colorspace);
                 bool full = frame->color_range == AVCOL_RANGE_JPEG;
-                if (ItemColour c; itemColour(a, item, c) && c.nclx) matrix = c.matrix, full = c.full;
-                else if (inherited && inherited->nclx) matrix = inherited->matrix, full = inherited->full;
+                // (An nclx's matrix 2, unspecified, leaves the coded picture's.)
+                if (ItemColour c; itemColour(a, item, c) && c.nclx) matrix = c.matrix != 2 ? c.matrix : matrix, full = c.full;
+                else if (inherited && inherited->nclx) matrix = inherited->matrix != 2 ? inherited->matrix : matrix, full = inherited->full;
                 const QByteArray* ispe = a.property(item, "ispe");
                 if (ispe && ispe->size() >= 20 && (int64_t(beN(*ispe, 12, 4)) != frame->width || int64_t(beN(*ispe, 16, 4)) != frame->height))
                     frame->width = 0;  // (refused below)
@@ -1017,7 +1018,9 @@ bool shownSize(QFile& f, const AvifFile& a, const AvifItem& item, int& width, in
         int rows = 0, columns = 0;
         if (!gridLayout(f, a, item, width, height, rows, columns)) return false;
     } else if (const QByteArray* ispe = a.property(item, "ispe"); ispe && ispe->size() >= 20) {
-        width = int(std::min<uint64_t>(beN(*ispe, 12, 4), 1u << 30)), height = int(std::min<uint64_t>(beN(*ispe, 16, 4), 1u << 30));
+        const uint64_t w = beN(*ispe, 12, 4), h = beN(*ispe, 16, 4);
+        if (w > 65535 || h > 65535 || w * h > (1u << 27)) return false;  // (as large as a grid Montage reads)
+        width = int(w), height = int(h);
     } else {
         return false;
     }

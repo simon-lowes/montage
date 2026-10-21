@@ -120,6 +120,8 @@ int usage() {
                  "  montage-cli otio <project.montage> [-o out.otio]\n"
                  "  montage-cli aaf <project.montage> -o <out.aaf> [--no-picture]   (Pro Tools, Fairlight, Media Composer: audio as\n"
                  "      WAVs in \"<out> Media\", video tracks linked to the original files)\n"
+                 "      [--avid-media [--drive DIR] [--codec dnxhr_sq] [--handles 30] [--bake]]   (for Media Composer: the media as\n"
+                 "      MXF OP-Atom in DIR's \"Avid MediaFiles/MXF/<n>\", the AAF linked to it)\n"
                  "  montage-cli xml <project.montage> [-o out.xml]       (Final Cut Pro 7 XML)\n"
                  "  montage-cli fcpxml <project.montage> [-o out.fcpxml]\n"
                  "  montage-cli import <timeline.xml|.fcpxml|.otio|.edl> -o <project.montage> [--fps N]\n"
@@ -835,12 +837,22 @@ int cmdAaf(const std::vector<std::string>& args) {
     if (args.empty()) return usage();
     std::string out;
     AafExportOptions options;
+    bool mediaOption = false;  // --drive, --codec, --handles, --bake: only with --avid-media
     for (size_t i = 1; i < args.size(); ++i) {
         if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
         else if (args[i] == "--no-picture") options.picture = false;
+        else if (args[i] == "--avid-media") options.avid.enabled = true;
+        else if (args[i] == "--drive" && i + 1 < args.size()) options.avid.drive = args[++i], mediaOption = true;
+        else if (args[i] == "--codec" && i + 1 < args.size()) options.avid.codec = args[++i], mediaOption = true;
+        else if (args[i] == "--handles" && i + 1 < args.size()) {
+            const std::string& n = args[++i];
+            if (n.empty() || n.find_first_not_of("0123456789") != std::string::npos) return usage();
+            options.avid.handles = std::atoi(n.c_str());
+            mediaOption = true;
+        } else if (args[i] == "--bake") options.avid.bake = mediaOption = true;
         else return usage();
     }
-    if (out.empty()) return usage();
+    if (out.empty() || (mediaOption && !options.avid.enabled)) return usage();
     Project p;
     if (!load(args[0], p)) return 1;
     std::signal(SIGINT, [](int) { gCancel = true; });
@@ -859,6 +871,7 @@ int cmdAaf(const std::vector<std::string>& args) {
         return 1;
     }
     for (const std::string& w : r.warnings) std::fprintf(stderr, "warning: %s\n", w.c_str());
+    if (!r.mediaFolder.empty()) std::printf("Media in %s\n", r.mediaFolder.c_str());
     std::printf("Wrote %s: %d audio tracks, %d clips, %d crossfades, %zu media files; %d video tracks, %d clips, %d dissolves\n",
                 out.c_str(), r.audioTracks, r.clips, r.transitions, r.mediaFiles.size(), r.videoTracks, r.videoClips, r.videoTransitions);
     return 0;
