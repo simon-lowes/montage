@@ -3,6 +3,7 @@ add_library(montage_engine STATIC
   core/MediaLog.h core/MediaLog.cpp
   core/Cdl.h core/Cdl.cpp
   core/Ale.h core/Ale.cpp
+  core/Ucs.h core/Ucs.cpp
   core/KeyframeEdit.h core/KeyframeEdit.cpp
   core/MaskPath.h core/MaskPath.cpp
   core/ColorWarp.h core/ColorWarp.cpp
@@ -92,6 +93,7 @@ add_library(montage_engine STATIC
   media/VoiceClone.h media/VoiceClone.cpp
   media/ContentCredentials.h media/ContentCredentials.cpp
   media/SoundSearch.h media/SoundSearch.cpp
+  media/SoundLibrary.h media/SoundLibrary.cpp
   media/DescribePicture.h media/DescribePicture.cpp
   media/LanguageModel.h media/LanguageModel.cpp
   media/StemSeparation.h media/StemSeparation.cpp
@@ -283,6 +285,7 @@ endif()
 target_compile_definitions(montage_engine PUBLIC MONTAGE_VERSION="${PROJECT_VERSION}")
 target_link_libraries(montage_engine PUBLIC Qt6::Core Qt6::Gui Qt6::Xml PkgConfig::FFMPEG Threads::Threads ${CMAKE_DL_LIBS})
 target_link_libraries(montage_engine PRIVATE Qt6::Network)  # (OGraf graphics: the browser's DevTools socket)
+target_link_libraries(montage_engine PRIVATE montage_sqlite)
 # The GPU compositor (render/GpuCompositor.h): Qt's RHI, public from Qt 6.6 (in the private GUI module, which Qt 6.9 and
 # later only load when asked for by name). Older Qt builds render on the CPU, as before.
 if(MONTAGE_GPU AND Qt6_VERSION VERSION_GREATER_EQUAL 6.6)

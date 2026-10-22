@@ -26,6 +26,7 @@
 #include "EditorState.h"
 #include "LensCorrectionDialog.h"
 #include "ModelPacks.h"
+#include "SoundLibraryPanel.h"
 #include "StackedTimelineWidget.h"
 #include "render/Exporter.h"
 #include "Theme.h"
@@ -2385,7 +2386,8 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* e) {
 
 void TimelineWidget::dragEnterEvent(QDragEnterEvent* e) {
     const QMimeData* m = e->mimeData();
-    if (m->hasFormat("application/x-montage-media") || m->hasFormat("application/x-montage-effect") || m->hasUrls() || hasSequencePart(m))
+    if (m->hasFormat("application/x-montage-media") || m->hasFormat("application/x-montage-effect") || m->hasFormat(kSoundRangeMime) ||
+        m->hasUrls() || hasSequencePart(m))
         e->acceptProposedAction();
 }
 
@@ -2416,6 +2418,15 @@ std::vector<TimelineWidget::Ghost> TimelineWidget::ghostsFor(const QMimeData* mi
         std::stable_sort(out.begin(), out.end(), [](const Ghost& a, const Ghost& b) { return a.start < b.start; });
         return out;
     }
+    if (SoundRange sound; soundRangeFromMime(mime, sound)) {
+        // A stretch from the sound library: on the audio track under the pointer (or the target).
+        if (s->audioTracks.empty()) return out;
+        auto row = rowAt(pos.y());
+        const int at = row && row->ref.kind == TrackKind::Audio ? row->ref.index : state_->targetAudioTrack();
+        const FrameTime len = std::max<FrameTime>(1, FrameTime(std::ceil(double(sound.count) * s->fpsValue() / sound.rate - 1e-9)));
+        out.push_back({{TrackKind::Audio, std::clamp(at, 0, int(s->audioTracks.size()) - 1)}, frameRound(pos.x()), len});
+        return out;
+    }
     auto refs = parseMediaMime(mime);
     if (refs.empty()) return out;
     auto row = rowAt(pos.y());
@@ -2442,7 +2453,7 @@ std::vector<TimelineWidget::Ghost> TimelineWidget::ghostsFor(const QMimeData* mi
 void TimelineWidget::dragMoveEvent(QDragMoveEvent* e) {
     const QMimeData* m = e->mimeData();
     hoverPos_ = e->position().toPoint();
-    if (m->hasFormat("application/x-montage-media") || hasSequencePart(m)) {
+    if (m->hasFormat("application/x-montage-media") || m->hasFormat(kSoundRangeMime) || hasSequencePart(m)) {
         ghosts_ = ghostsFor(m, hoverPos_);
         // Snap the drop point (a range from a stacked timeline by its start, which may be a gap before its first clip).
         if (!ghosts_.empty()) {
@@ -2643,8 +2654,18 @@ void TimelineWidget::dropEvent(QDropEvent* e) {
     QPoint pos = e->position().toPoint();
     bool insertMode = e->modifiers() & Qt::ControlModifier;
     ghosts_.clear();
+    SoundRange sound;
     if (m->hasFormat("application/x-montage-media")) {
         dropMedia(m, pos, insertMode);
+    } else if (soundRangeFromMime(m, sound)) {
+        // Just the stretch, to the sample, where its ghost was.
+        const auto ghosts = ghostsFor(m, pos);
+        if (!ghosts.empty()) {
+            QString error;
+            if (state_->placeSound(sound.path, sound.first, sound.count, sound.rate, snapFrame(ghosts.front().start, {}), ghosts.front().track.index,
+                                   insertMode, &error).empty())
+                state_->message(error, 6000);
+        }
     } else if (hasSequencePart(m)) {
         dropSequencePart(m, pos, insertMode);
     } else if (m->hasFormat("application/x-montage-effect")) {

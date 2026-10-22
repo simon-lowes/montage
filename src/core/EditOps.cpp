@@ -2864,6 +2864,33 @@ Result finalizeAudition(Project&, Sequence& s, Id clipId) {
     return {};
 }
 
+Result placeSoundRange(Project& p, Sequence& s, Id mediaId, FrameTime at, int64_t first, int64_t count, int rate, TrackRef audioTrack,
+                       bool insertMode) {
+    if (count <= 0 || rate <= 0 || first < 0) return Result::fail("Nothing to place");
+    const MediaItem* m = p.findMedia(mediaId);
+    if (!m || !m->hasAudio || m->kind == MediaKind::Image) return Result::fail("The media has no sound");
+    if (!editable(trackAt(s, audioTrack))) return Result::fail("No unlocked target track for this media");
+    // Built here rather than by placeMedia, which ends a clip at the media's last whole frame: a stretch running to
+    // the end of its file takes the frame its last samples fall in, the rest of that frame silent.
+    const double fps = s.fpsValue();
+    const double in = double(first) * fps / rate, length = double(count) * fps / rate;
+    const FrameTime frames = std::max<FrameTime>(1, FrameTime(std::ceil(length - 1e-9)));
+    Clip c = makeClip(p, *m, TrackKind::Audio, s);
+    c.id = p.newId();
+    c.start = std::max<FrameTime>(0, at);
+    c.sourceIn = in;
+    c.duration = frames;
+    c.tail = std::clamp(double(frames) - length, 0.0, 1.0 - 1e-9);
+    c.channels = newClipChannels(*m);
+    if (insertMode) rippleOpen(p, s, c.start, frames, rippleTracks(s, {audioTrack}));
+    Result r = overwrite(p, s, audioTrack, c);
+    if (r.ok && (m->audioChannelMode == kChannelsMono || m->audioChannelMode == kChannelsPairs) && sourceChannelCount(*m) > 1) {
+        const Result split = splitAudioChannels(p, s, c.id, m->audioChannelMode == kChannelsPairs);
+        r.created.insert(r.created.end(), split.created.begin(), split.created.end());
+    }
+    return r;
+}
+
 Result editSoundSamples(const Project& p, Sequence& s, Id clip, SampleEdit what, int64_t samples, int rate) {
     const auto loc = locate(s, clip);
     if (!loc || loc->track.kind != TrackKind::Audio) return Result::fail("Only sound clips can be edited by samples");

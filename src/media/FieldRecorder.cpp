@@ -68,6 +68,8 @@ void readIxml(const QByteArray& xml, FieldRecording& f, double& stampSamples, in
                 else if (tag == QStringLiteral("TIMESTAMP_SAMPLES_SINCE_MIDNIGHT_HI")) hi = v.toULongLong(), haveHi = true;
                 else if (tag == QStringLiteral("TIMESTAMP_SAMPLES_SINCE_MIDNIGHT_LO")) lo = v.toULongLong(), haveLo = true;
                 else if (tag == QStringLiteral("TIMESTAMP_SAMPLE_RATE")) stampRate = v.toInt();
+            } else if (parent == QStringLiteral("USER") || parent == QStringLiteral("ASWG")) {
+                f.user[tag.toStdString()] = v.toStdString();
             } else if (parent == QStringLiteral("TRACK")) {
                 if (tag == QStringLiteral("CHANNEL_INDEX")) trackIndex = v.toInt();
                 else if (tag == QStringLiteral("NAME")) trackName = v;
@@ -134,7 +136,12 @@ bool readFieldRecording(const std::string& path, FieldRecording& out) {
         if (!file.seek(body + qint64(size + (size & 1)))) break;  // chunks are padded to even sizes
     }
     if (bext.size() >= 346) {
-        readDescription(QString::fromLatin1(bext.constData(), qsizetype(strnlen(bext.constData(), 256))), f);
+        // ASCII by the standard; libraries write UTF-8, read as such where it is.
+        const QByteArray raw(bext.constData(), qsizetype(strnlen(bext.constData(), 256)));
+        QString description = QString::fromUtf8(raw);
+        if (description.contains(QChar::ReplacementCharacter)) description = QString::fromLatin1(raw);
+        readDescription(description, f);
+        f.description = description.trimmed().toStdString();
         bextSamples = double(le64(bext.constData() + 338));
     }
     if (!ixml.isEmpty()) readIxml(ixml, f, ixmlSamples, ixmlRate);

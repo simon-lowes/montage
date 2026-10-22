@@ -188,6 +188,8 @@
 #include "media/Inpaint.h"
 #include "media/VisualSearch.h"
 #include "automation/McpServer.h"
+#include "media/SoundLibrary.h"
+#include "core/Ucs.h"
 #include "automation/PythonHost.h"
 #include "automation/ScriptHost.h"
 #include "automation/ScriptPanel.h"
@@ -2675,6 +2677,254 @@ private slots:
         }
     }
 
+    void soundLibrary() {
+        // UCS: its list, and file names taken apart (a dot in the FX name, the user category, letter case).
+        QCOMPARE(ucsCategories().size(), size_t(753));
+        QVERIFY(ucsCategory("doorwood") && std::string(ucsCategory("doorwood")->subCategory) == "WOOD");
+        UcsName ucs;
+        QVERIFY(parseUcsFileName("GUNPis-Glock_9mm Shot 1.5m_JD_Lib_Take 2.wav", ucs));
+        QVERIFY(ucs.catId == "GUNPis" && ucs.userCategory == "Glock" && ucs.fxName == "9mm Shot 1.5m" && ucs.creatorId == "JD" &&
+                ucs.sourceId == "Lib" && ucs.userData == "Take 2");
+        QVERIFY(!parseUcsFileName("Door creak.wav", ucs));
+        QVERIFY(!parseUcsFileName("NOTACatID_Thing_JD_Lib.wav", ucs));
+
+        // A library of 500 short sounds in UCS names across subfolders, each with a bext description; three of the
+        // DOORWood ones creak, one has iXML keywords.
+        const QString root = QString::fromStdString(path("sfx-library"));
+        const char* cats[] = {"DOORWood", "AMBForst", "FOLYClth", "WATRSurf", "VEHCar"};
+        const std::set<int> creaks = {5, 250, 495};
+        std::map<int, std::string> files;
+        auto sound = [](int i, double seconds) {
+            AudioBuffer b;
+            b.samples.resize(size_t(seconds * 48000) * 2);
+            for (size_t k = 0; k < b.samples.size() / 2; ++k)
+                b.samples[k * 2] = b.samples[k * 2 + 1] = float(0.3 * std::sin(2 * M_PI * (200.0 + i) * double(k) / 48000));
+            return b;
+        };
+        for (int i = 0; i < 500; ++i) {
+            const QString dir = root + QStringLiteral("/%1/%2").arg(QString::fromLatin1(cats[i % 5]).left(4)).arg(i / 100);
+            QDir().mkpath(dir);
+            const std::string name = QStringLiteral("%1_Take %2_TS_TestLib.wav").arg(cats[i % 5]).arg(i).toStdString();
+            const std::string desc = creaks.count(i) ? "Heavy door creak, slow" : QStringLiteral("Test sound %1").arg(i).toStdString();
+            const std::string ixml = i == 42 ? "<BWFXML><USER><KEYWORDS>squeak; rubber</KEYWORDS></USER></BWFXML>" : "<BWFXML></BWFXML>";
+            files[i] = (dir + "/").toStdString() + name;
+            writeBwf(files[i], sound(i, 0.1), 0, desc, ixml);
+        }
+        const std::string db = path("sfx.sqlite");
+        std::string err;
+        SoundLibrary lib;
+        QVERIFY2(lib.open(db, &err), err.c_str());
+        QVERIFY(lib.addFolder(root.toStdString()));
+        QVERIFY(!lib.addFolder(path("no-such-folder")));
+        SoundLibraryScan scan = lib.scan();
+        QCOMPARE(scan.files, 500);
+        QCOMPARE(scan.added, 500);
+        QVERIFY2(scan.seconds < 10, qPrintable(QString::number(scan.seconds)));
+        qInfo("500 sounds indexed in %.2f s", scan.seconds);
+        QCOMPARE(lib.count(), 500);
+        // Found by CatID (exactly its files), by a word of the description, by the start of a word, by iXML keywords.
+        std::vector<SoundLibraryEntry> found = lib.search("DOORWood");
+        QCOMPARE(found.size(), size_t(100));
+        QVERIFY(std::all_of(found.begin(), found.end(), [](const SoundLibraryEntry& e) { return e.catId == "DOORWood"; }));
+        auto paths = [](const std::vector<SoundLibraryEntry>& v) {
+            std::set<std::string> s;
+            for (const SoundLibraryEntry& e : v) s.insert(e.path);
+            return s;
+        };
+        const std::set<std::string> creaking = {files[5], files[250], files[495]};
+        QCOMPARE(paths(lib.search("creak")), creaking);
+        QCOMPARE(paths(lib.search("cre")), creaking);
+        QCOMPARE(paths(lib.search("doorwood heavy")), creaking);
+        QCOMPARE(lib.search("doors wood take 371").size(), size_t(0));  // (take 371 is an AMBForst)
+        QCOMPARE(paths(lib.search("Doors Wood Take 490")), std::set<std::string>{files[490]});
+        QCOMPARE(paths(lib.search("squeak")), std::set<std::string>{files[42]});
+        QCOMPARE(lib.search("").size(), size_t(500));
+        QCOMPARE(lib.search("", 10).size(), size_t(10));
+        const auto e = lib.entryForPath(files[250]);
+        QVERIFY(e);
+        QCOMPARE(e->catId, std::string("DOORWood"));
+        QCOMPARE(e->category, std::string("DOORS"));
+        QCOMPARE(e->subCategory, std::string("WOOD"));
+        QCOMPARE(e->fxName, std::string("Take 250"));
+        QCOMPARE(e->creatorId, std::string("TS"));
+        QCOMPARE(e->sourceId, std::string("TestLib"));
+        QCOMPARE(e->description, std::string("Heavy door creak, slow"));
+        QCOMPARE(e->channels, 2);
+        QCOMPARE(e->sampleRate, 48000);
+        QVERIFY(std::abs(e->duration - 0.1) < 1e-9);
+        QVERIFY(!e->heard);
+
+        // Nothing changed: nothing to do. Renamed into another folder: the same entry, found again; one gone, one
+        // rewritten, one new (not a UCS name: its category from iXML's ASWG fields).
+        scan = lib.scan();
+        QVERIFY(scan.added == 0 && scan.updated == 0 && scan.moved == 0 && scan.removed == 0);
+        const std::string renamed = (root + "/Elsewhere/DOORWood_Barn Door_TS_TestLib.wav").toStdString();
+        QDir().mkpath(root + "/Elsewhere");
+        QVERIFY(QFile::rename(QString::fromStdString(files[250]), QString::fromStdString(renamed)));
+        QVERIFY(QFile::remove(QString::fromStdString(files[1])));
+        writeBwf(files[2], sound(1000, 0.2), 0, "Rewritten", "<BWFXML></BWFXML>");
+        const std::string other = (root + "/forest morning.wav").toStdString();
+        writeBwf(other, sound(7, 0.1), 0, "Birds at dawn",
+                 "<BWFXML><ASWG><catId>AMBForst</catId><fxName>Forest Morning</fxName><library>Field Trips</library></ASWG></BWFXML>");
+        scan = lib.scan();
+        QCOMPARE(scan.files, 500);
+        QCOMPARE(scan.moved, 1);
+        QCOMPARE(scan.removed, 1);
+        QCOMPARE(scan.updated, 1);
+        QCOMPARE(scan.added, 1);
+        const auto moved = lib.entryForPath(renamed);
+        QVERIFY(moved && moved->id == e->id);
+        QCOMPARE(moved->fxName, std::string("Barn Door"));
+        QVERIFY(!lib.entryForPath(files[250]));
+        QCOMPARE(paths(lib.search("creak")), (std::set<std::string>{files[5], renamed, files[495]}));
+        QCOMPARE(lib.entryForPath(files[2])->description, std::string("Rewritten"));
+        QVERIFY(std::abs(lib.entryForPath(files[2])->duration - 0.2) < 1e-9);
+        const auto forest = lib.entryForPath(other);
+        QVERIFY(forest && forest->catId == "AMBForst" && forest->category == "AMBIENCE" && forest->fxName == "Forest Morning");
+        QCOMPARE(paths(lib.search("field trips")), std::set<std::string>{other});
+        QCOMPARE(lib.search("AMBForst").size(), size_t(100));  // (one gone, one come)
+
+        // Kept in its file; a folder that is not there (a drive not mounted) keeps its sounds; one removed loses them.
+        {
+            SoundLibrary again;
+            QVERIFY(again.open(db));
+            QCOMPARE(again.count(), 500);
+            QCOMPARE(again.folders(), std::vector<std::string>{QDir::cleanPath(root).toStdString()});
+        }
+        QVERIFY(QDir(root).rename(root, root + "-offline"));
+        scan = lib.scan();
+        QCOMPARE(scan.removed, 0);
+        QCOMPARE(lib.count(), 500);
+        QVERIFY(QDir().mkpath(root));  // (an empty mount point)
+        scan = lib.scan();
+        QCOMPARE(scan.removed, 0);
+        QCOMPARE(lib.count(), 500);
+        QVERIFY(QDir().rmdir(root));
+        QVERIFY(QDir(root).rename(root + "-offline", root));
+        QVERIFY(lib.removeFolder(root.toStdString()));
+        QCOMPARE(lib.count(), 0);
+        QCOMPARE(lib.search("creak").size(), size_t(0));
+        QVERIFY(lib.addFolder(root.toStdString()));
+        QCOMPARE(lib.scan().added, 500);
+
+        // A 2 s stretch from 0.5 s (and 7 samples) of a sound, dropped at frame 10 of a 29.97 fps sequence: its first
+        // sample heard at the start of frame 10, its last 2 s later, to the sample.
+        {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.fps = {30000, 1001};
+            const int rate = 48000;
+            AudioBuffer src;
+            src.samples.resize(size_t(3 * rate) * 2);
+            for (size_t k = 0; k < src.samples.size() / 2; ++k)
+                src.samples[k * 2] = src.samples[k * 2 + 1] = float(0.3 + 0.2 * std::sin(2 * M_PI * double(k) / 997));
+            const std::string file = path("library-stretch.wav");
+            writeBwf(file, src, 0, "", "<BWFXML></BWFXML>");
+            MediaItem m = probeOrFail(p, file);
+            p.media.push_back(m);
+            const int64_t first = rate / 2 + 7, count = 2 * rate;
+            const auto r = edit::placeSoundRange(p, s, m.id, 10, first, count, rate, {TrackKind::Audio, 0}, false);
+            QVERIFY2(r.ok, r.error.c_str());
+            QCOMPARE(s.videoTracks[0].clips.size(), size_t(0));
+            const Clip& c = s.audioTracks[0].clips.front();
+            QCOMPARE(c.start, FrameTime(10));
+            QCOMPARE(c.duration, FrameTime(60));  // 59.94 frames, the rest of the last silent
+            QVERIFY(std::abs(c.tail - (60 - 2 * 30000.0 / 1001)) < 1e-9);
+            const int64_t start = int64_t(std::llround(10 * 1001.0 / 30000 * rate));  // 16016
+            AudioMixer mixer;
+            std::vector<float> out(size_t(4 * rate) * 2);
+            mixer.mix(p, s, 0, 4 * rate, out.data());
+            int64_t firstHeard = -1, lastHeard = -1;
+            for (int64_t i = 0; i < 4 * rate; ++i)
+                if (std::fabs(out[size_t(i) * 2]) > 1e-4f) {
+                    if (firstHeard < 0) firstHeard = i;
+                    lastHeard = i;
+                }
+            QVERIFY2(firstHeard == start && lastHeard == start + count - 1,
+                     qPrintable(QString("first %1 last %2, wanted %3 and %4").arg(firstHeard).arg(lastHeard).arg(start).arg(start + count - 1)));
+            // The stretch's own samples (16-bit in the file), in step.
+            const float gain = out[size_t(start) * 2] / src.samples[size_t(first) * 2];
+            float worst = 0;
+            for (int64_t k = 0; k < count; k += 101)
+                worst = std::max(worst, std::fabs(out[size_t(start + k) * 2] - gain * src.samples[size_t(first + k) * 2]));
+            QVERIFY2(worst < 2e-4f && gain > 0.5f, qPrintable(QString("gain %1 worst %2").arg(gain).arg(worst)));
+            // The whole 3 s file (89.91 frames) at frame 200: 90 frames, its very last sample heard.
+            const auto whole = edit::placeSoundRange(p, s, m.id, 200, 0, 3 * rate, rate, {TrackKind::Audio, 0}, false);
+            QVERIFY2(whole.ok, whole.error.c_str());
+            const Clip* w = edit::clipById(s, whole.created.front());
+            QCOMPARE(w->duration, FrameTime(90));
+            const int64_t wholeStart = int64_t(std::llround(200 * 1001.0 / 30000 * rate));
+            std::vector<float> tailOut(size_t(4 * rate) * 2);
+            mixer.mix(p, s, wholeStart, 4 * rate, tailOut.data());
+            int64_t wholeLast = -1;
+            for (int64_t i = 0; i < 4 * rate; ++i)
+                if (std::fabs(tailOut[size_t(i) * 2]) > 1e-4f) wholeLast = i;
+            QVERIFY2(wholeLast == 3 * rate - 1, qPrintable(QString::number(wholeLast)));
+            QVERIFY(std::fabs(tailOut[0]) > 0.05f);
+        }
+
+        // Over MCP (the library in $MONTAGE_SOUND_LIBRARY).
+        {
+            const QByteArray before = qgetenv("MONTAGE_SOUND_LIBRARY");
+            qputenv("MONTAGE_SOUND_LIBRARY", QByteArray::fromStdString(path("sfx-mcp.sqlite")));
+            McpServer server;
+            auto call = [&](const QString& tool, const QJsonObject& args) {
+                const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                      {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                             {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                                   {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+                const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+                return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            };
+            QJsonObject res = call("montage_search_sound_library", {{"add_folder", root}, {"words", "creak"}});
+            QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+            QJsonObject sc = res.value("structuredContent").toObject();
+            QCOMPARE(sc.value("scan").toObject().value("added").toInt(), 500);
+            QCOMPARE(sc.value("sounds").toArray().size(), 3);
+            QCOMPARE(sc.value("sounds").toArray().at(0).toObject().value("cat_id").toString(), QString("DOORWood"));
+            res = call("montage_search_sound_library", {{"words", "DOORWood"}, {"max", 1000}});
+            QCOMPARE(res.value("structuredContent").toObject().value("sounds").toArray().size(), 100);
+            res = call("montage_search_sound_library", {{"more_like", "/no/such.wav"}});
+            QVERIFY(res.value("isError").toBool());
+            if (before.isNull()) qunsetenv("MONTAGE_SOUND_LIBRARY");
+            else qputenv("MONTAGE_SOUND_LIBRARY", before);
+        }
+
+        // What it sounds like (with the CLAP model): JFK's speech and a song in the library, each found by its
+        // description, and the song's half most like the song.
+        if (!soundSearchAvailable() || !soundModel().installed()) QSKIP("Set MONTAGE_SOUND_MODEL to the CLAP model to run the rest");
+        const QString heardRoot = QString::fromStdString(path("sfx-heard"));
+        QDir().mkpath(heardRoot);
+        QVERIFY(QFile::copy(MONTAGE_TEST_DATA_DIR "/jfk.wav", heardRoot + "/VOXMale_Speech_TS_TestLib.wav"));
+        const std::vector<int> chords = {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
+        const std::vector<float> song = testSong(48000, 0.5, chords);
+        QVERIFY(writeMonoWav((heardRoot + "/MUSCSong_Piano Song_TS_TestLib.wav").toStdString(), song, 48000));
+        QVERIFY(writeMonoWav((heardRoot + "/MUSCSong_Piano Song Half_TS_TestLib.wav").toStdString(),
+                             std::vector<float>(song.begin(), song.begin() + std::ptrdiff_t(song.size() / 2)), 48000));
+        SoundLibrary heard;
+        QVERIFY(heard.open(path("sfx-heard.sqlite")));
+        QVERIFY(heard.addFolder(heardRoot.toStdString()));
+        QCOMPARE(heard.scan().added, 3);
+        QCOMPARE(heard.unheard(), 3);
+        int last = -1;
+        QCOMPARE(heard.listen([&](int done, int) { last = done; }, nullptr, &err), 3);
+        QCOMPARE(last, 3);
+        QCOMPARE(heard.unheard(), 0);
+        QVERIFY(heard.search("").front().heard);
+        auto model = SoundModel::load(&err);
+        QVERIFY2(model, err.c_str());
+        auto best = heard.searchByMeaning(model->text("a man giving a speech"), 3);
+        QVERIFY(best.size() == 3 && QString::fromStdString(best[0].entry.name).startsWith("VOXMale"));
+        best = heard.searchByMeaning(model->text("music with piano chords"), 3);
+        QVERIFY(!best.empty() && QString::fromStdString(best[0].entry.name).startsWith("MUSCSong"));
+        const auto whole = heard.entryForPath((heardRoot + "/MUSCSong_Piano Song_TS_TestLib.wav").toStdString());
+        QVERIFY(whole);
+        const auto like = heard.moreLike(whole->id, 5);
+        QCOMPARE(like.size(), size_t(2));  // (itself left out)
+        QVERIFY2(QString::fromStdString(like[0].entry.name).contains("Half"), like[0].entry.name.c_str());
+        QVERIFY(like[0].score > like[1].score);
+    }
+
     void soundToTheSample() {
         // Two seconds of a steady level with a click at 0.1 s, on the timeline from frame 10 (30 fps, 48 kHz: 1600
         // samples a frame): moved, trimmed and slipped by samples, the click and the sound's ends land on the sample.
@@ -2745,7 +2995,7 @@ private slots:
         QVERIFY(edit::editSoundSamples(p, s, id, edit::SampleEdit::TrimStart, 100, rate).ok);
         QVERIFY(edit::editSoundSamples(p, s, id, edit::SampleEdit::TrimEnd, 50, rate).ok);
         h = listen();
-        // (Untrimmed, the file's very last sample is not heard; trimmed, the sound ends 63 samples sooner than it did.)
+        // (Its last sample: 13 earlier for the move, 50 for the trim.)
         const int64_t trimmedEnd = start + 2 * rate - 13 - 50;
         QVERIFY2(h.first == start + 87 && h.click == start + 4787 && h.last == trimmedEnd - 1, qPrintable(describe(h)));
         QVERIFY(edit::editSoundSamples(p, s, id, edit::SampleEdit::Slip, 10, rate).ok);

@@ -140,6 +140,7 @@
 #include "media/Rife.h"
 #include "media/TextToSpeech.h"
 #include "media/VoiceClone.h"
+#include "media/SoundLibrary.h"
 #include "media/SoundSearch.h"
 #include "media/LtcTimecode.h"
 #include "media/StemSeparation.h"
@@ -6041,6 +6042,95 @@ void McpServer::Impl::addTools() {
             for (const QJsonValue& v : skipped)
                 text += QStringLiteral("(not searched: %1: %2)\n").arg(v.toObject().value("media").toString(), v.toObject().value("error").toString());
             return ok(text.isEmpty() ? QStringLiteral("No recording with sound") : text, QJsonObject{{"moments", list}, {"skipped", skipped}});
+        });
+
+    add("montage_search_sound_library", "Search the sound effects library",
+        "Search the sound effects library on this computer (folders of sound files indexed outside any project, kept in "
+        "Montage's data folder or $MONTAGE_SOUND_LIBRARY): `words` finds sounds with every word's start in their name, UCS "
+        "category, subcategory or CatID (\"DOORWood\"), description (Broadcast Wave bext, iXML) or tags, by name; no words "
+        "lists them all. `sounds_like` finds them by what they sound like (\"a heavy door creaking\"), `more_like` (a sound's "
+        "path or id) the sounds most like one, both with CLAP on this computer (sounds not listened to yet are first). "
+        "`add_folder` adds a folder; `remove_folder` drops one; `rescan` (or adding a folder) brings the index up to date "
+        "(new, changed, renamed and moved files; gone ones dropped). Returns each sound's path, length, channels, rate, "
+        "UCS category and description.",
+        R"json({"type":"object","properties":{"words":{"type":"string"},"sounds_like":{"type":"string"},
+            "more_like":{"type":"string","description":"A sound's path or id"},
+            "add_folder":{"type":"string"},"remove_folder":{"type":"string"},"rescan":{"type":"boolean"},
+            "max":{"type":"integer","default":50}}})json",
+        false, [this](const QJsonObject& a) {
+            auto lib = SoundLibrary::shared();
+            if (!lib) return fail(QStringLiteral("The sound library cannot be opened: %1").arg(QString::fromStdString(SoundLibrary::defaultPath())));
+            std::string err;
+            bool scan = a.value("rescan").toBool();
+            if (a.contains("remove_folder") && !lib->removeFolder(str(a, "remove_folder").toStdString()))
+                return fail(QStringLiteral("\"%1\" is not a library folder").arg(str(a, "remove_folder")));
+            if (a.contains("add_folder")) {
+                if (!lib->addFolder(str(a, "add_folder").toStdString(), &err)) return fail(QString::fromStdString(err));
+                scan = true;
+            }
+            QJsonObject out;
+            QString text;
+            if (scan) {
+                const SoundLibraryScan s = lib->scan([&](double f) { progress(f, QStringLiteral("Reading the library's folders")); });
+                out["scan"] = QJsonObject{{"files", s.files}, {"added", s.added}, {"updated", s.updated}, {"moved", s.moved},
+                                          {"removed", s.removed}, {"seconds", s.seconds}};
+                text += QStringLiteral("%1 sound files: %2 added, %3 updated, %4 renamed or moved, %5 removed\n")
+                            .arg(s.files).arg(s.added).arg(s.updated).arg(s.moved).arg(s.removed);
+            }
+            const size_t max = size_t(std::clamp(a.value("max").toInt(50), 1, 1000));
+            std::vector<SoundLibraryEntry> found;
+            std::vector<double> scores;
+            if (a.contains("sounds_like") || a.contains("more_like")) {
+                if (!soundSearchAvailable()) return fail("This build of Montage cannot search sound by what it sounds like (no ONNX Runtime)");
+                if (!soundModel().installed())
+                    return fail("The sound search model is not downloaded: run `scripts/fetch-models.sh` or search Sounds Like in the app once");
+                if (lib->unheard() > 0 &&
+                    lib->listen([&](int done, int total) { progress(total > 0 ? double(done) / total : 1.0, QStringLiteral("Listening to the library")); },
+                                nullptr, &err) < 0)
+                    return fail(QString::fromStdString(err));
+                std::vector<SoundLibrary::Match> hits;
+                if (a.contains("more_like")) {
+                    const QString which = str(a, "more_like");
+                    bool isId = false;
+                    const qint64 id = which.toLongLong(&isId);
+                    const auto e = isId ? lib->entry(id) : lib->entryForPath(which.toStdString());
+                    if (!e) return fail(QStringLiteral("No sound \"%1\" in the library").arg(which));
+                    hits = lib->moreLike(e->id, max);
+                } else {
+                    auto model = SoundModel::load(&err);
+                    const std::vector<float> q = model ? model->text(str(a, "sounds_like").toStdString(), &err) : std::vector<float>{};
+                    if (q.empty()) return fail(QString::fromStdString(err));
+                    hits = lib->searchByMeaning(q, max);
+                }
+                for (const SoundLibrary::Match& m : hits) found.push_back(m.entry), scores.push_back(m.score);
+            } else if (!scan || a.contains("words")) {
+                found = lib->search(str(a, "words").toStdString(), max);
+            }
+            QJsonArray list;
+            for (size_t i = 0; i < found.size(); ++i) {
+                const SoundLibraryEntry& e = found[i];
+                QJsonObject o{{"id", double(e.id)},
+                              {"path", QString::fromStdString(e.path)},
+                              {"seconds", e.duration},
+                              {"channels", e.channels},
+                              {"sample_rate", e.sampleRate},
+                              {"description", QString::fromStdString(e.description)}};
+                if (!e.catId.empty()) o["cat_id"] = QString::fromStdString(e.catId);
+                if (!e.category.empty()) o["category"] = QString::fromStdString(e.category);
+                if (!e.subCategory.empty()) o["subcategory"] = QString::fromStdString(e.subCategory);
+                if (!e.fxName.empty()) o["fx_name"] = QString::fromStdString(e.fxName);
+                if (!e.keywords.empty()) o["keywords"] = QString::fromStdString(e.keywords);
+                if (i < scores.size()) o["score"] = scores[i];
+                list.append(o);
+                text += QStringLiteral("%1  %2 s%3%4\n")
+                            .arg(QString::fromStdString(e.path))
+                            .arg(e.duration, 0, 'f', 2)
+                            .arg(e.catId.empty() ? QString() : QStringLiteral("  ") + QString::fromStdString(e.catId))
+                            .arg(e.description.empty() ? QString() : QStringLiteral("  ") + QString::fromStdString(e.description));
+            }
+            out["sounds"] = list;
+            out["count"] = lib->count();
+            return ok(text.isEmpty() ? QStringLiteral("No sounds found (%1 in the library)").arg(lib->count()) : text, out);
         });
 
     add("montage_find_people", "Find people",

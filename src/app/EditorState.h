@@ -187,6 +187,12 @@ public:
     // Saves a range of a media item (frames of the active sequence, Out
     // inclusive) as a subclip in the bin; returns its id, or 0.
     Id makeSubclip(Id media, FrameTime in, FrameTime out, const QString& name = QString());
+    // A stretch of a sound library file ([first, first + count) samples at `rate`) on audio track `track` (-1: the
+    // target) from frame `at`, to the sample (edit::placeSoundRange). The file comes into the "Sound Effects" bin
+    // first (once); with the "soundLibrary/copyToProject" preference and a saved project, a copy of it in the "Sound
+    // Effects" folder beside the project does. Returns the clips made (none on failure, with `error`).
+    std::vector<Id> placeSound(const QString& path, int64_t first, int64_t count, int rate, FrameTime at, int track = -1,
+                               bool insertMode = false, QString* error = nullptr);
 
     // ---- Sequences ----------------------------------------------------------
     void setActiveSequence(Id id);

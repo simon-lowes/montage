@@ -3484,10 +3484,10 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                         for (int k = 0; k < nch; ++k) d[k] = stretched->samples[size_t(j) * stride + size_t(k)];
                     } else {
                         const double rel = pos - double(origin);
-                        if (rel < 0 || rel >= double(n - 1)) continue;
+                        if (rel < 0 || rel > double(n - 1)) continue;  // (the last sample itself included)
                         const size_t i = size_t(rel);
                         const float f = float(rel - double(i));
-                        const float *x0 = src + i * stride, *x1 = x0 + stride;
+                        const float *x0 = src + i * stride, *x1 = int64_t(i) + 1 < n ? x0 + stride : x0;
                         for (int k = 0; k < nch; ++k) d[k] = x0[k] + (x1[k] - x0[k]) * f;
                     }
                     ambisonicRotate(rot, d);
@@ -3591,7 +3591,7 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             }
             for (int64_t s = s0; s < s1; ++s) {
                 const double pos = srcPos(s);
-                if (pos < 0 || pos >= double(n - 1)) continue;
+                if (pos < 0 || pos > double(n - 1)) continue;  // (the last sample itself included)
                 float* d = &clipBuf[size_t(s - rs) * 2];
                 if (stretched) {
                     const int64_t j = s - cs;
@@ -3601,8 +3601,9 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                 } else {
                     int64_t i = int64_t(pos);
                     float f = float(pos - double(i));
-                    d[0] = src[i * 2] + (src[i * 2 + 2] - src[i * 2]) * f;
-                    d[1] = src[i * 2 + 1] + (src[i * 2 + 3] - src[i * 2 + 1]) * f;
+                    const int64_t k = std::min(i + 1, n - 1);
+                    d[0] = src[i * 2] + (src[k * 2] - src[i * 2]) * f;
+                    d[1] = src[i * 2 + 1] + (src[k * 2 + 1] - src[i * 2 + 1]) * f;
                 }
                 if (!bleeps.empty()) {
                     float tone = 0;

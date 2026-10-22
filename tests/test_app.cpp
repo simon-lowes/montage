@@ -117,6 +117,8 @@
 #include "media/TextReader.h"
 #include "core/OnScreenText.h"
 #include "ProjectManagerDialog.h"
+#include "SoundLibraryPanel.h"
+#include "media/SoundLibrary.h"
 #include "MediaBinModel.h"
 #include "ScopesWidget.h"
 #include "render/Gamut.h"
@@ -443,6 +445,8 @@ private slots:
         // DCP signing certificates and DKDMs of their own too.
         qputenv("MONTAGE_DCP_CERTIFICATES", dir_.filePath(QStringLiteral("dcp-certificates")).toUtf8());
         qputenv("MONTAGE_DCP_DKDMS", dir_.filePath(QStringLiteral("dkdm")).toUtf8());
+        // And a sound library (not the one on this computer, with its folders).
+        qputenv("MONTAGE_SOUND_LIBRARY", dir_.filePath(QStringLiteral("sound-library.sqlite")).toUtf8());
         win_ = std::make_unique<MainWindow>();
         win_->resize(1600, 1000);
         win_->show();
@@ -820,6 +824,93 @@ private slots:
         QCOMPARE(dlg.addMarkers(), 0);
         QVERIFY(!dlg.findChild<QPushButton*>("conformMarkers")->isEnabled());
         QCOMPARE(dlg.shots().size(), size_t(1));  // (its own markers do not make the results stale)
+    }
+
+    void soundLibraryPanel() {
+        // A library of three sounds: found as you type, a stretch chosen on the waveform and auditioned at a pitch
+        // (by semitones or varispeed), then dragged onto the timeline (copied into the project's folder first).
+        const QString dir = dir_.path() + "/sfx";
+        QDir().mkpath(dir + "/doors");
+        auto writeWav = [](const QString& file, double hz, double seconds) {
+            std::vector<float> x(size_t(seconds * 48000));
+            for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.3 * std::sin(2 * M_PI * hz * double(i) / 48000));
+            WavWriter w;
+            if (!w.open(file, 48000, 1)) return false;
+            w.write(x.data(), int64_t(x.size()));
+            return w.close();
+        };
+        QVERIFY(writeWav(dir + "/doors/DOORCreak_Old Gate_TS_Lib.wav", 300, 1));
+        QVERIFY(writeWav(dir + "/doors/DOORWood_Slam_TS_Lib.wav", 400, 1));
+        QVERIFY(writeWav(dir + "/WATRSurf_Waves_TS_Lib.wav", 500, 2));
+        auto library = std::make_shared<SoundLibrary>();
+        QVERIFY(library->open((dir_.path() + "/library.sqlite").toStdString()));
+        auto panel = std::make_unique<SoundLibraryPanel>(state(), library);
+        QVERIFY(panel->addFolder(dir));
+        panel->rescan(true);
+        QVERIFY(!panel->busy());
+        QCOMPARE(library->count(), 3);
+        QCOMPARE(panel->search("gate"), 1);
+        QCOMPARE(panel->search("doors"), 2);
+        QCOMPARE(panel->search(""), 3);
+        QCOMPARE(panel->search("waves"), 1);
+        QCOMPARE(panel->search("gate"), 1);
+        panel->select(0);
+        QVERIFY(panel->current());
+        SoundRange r = panel->range();
+        QCOMPARE(r.first, int64_t(0));
+        QCOMPARE(r.count, int64_t(48000));  // the whole sound until a stretch is chosen
+        QCOMPARE(r.rate, 48000);
+        panel->setRange(4800, 9600);
+        r = panel->range();
+        QVERIFY(r.first == 4800 && r.count == 9600);
+        // Up an octave: half as long by varispeed, as long by semitones; down an octave by varispeed, twice as long.
+        panel->setPitch(12, true);
+        QCOMPARE(panel->auditionSound().size(), size_t(4800 * 2));
+        panel->setPitch(12, false);
+        QCOMPARE(panel->auditionSound().size(), size_t(9600 * 2));
+        panel->setPitch(-12, true);
+        QCOMPARE(panel->auditionSound().size(), size_t(19200 * 2));
+        panel->setPitch(0, false);
+        // The stretch as a drag carries the file too, for other applications.
+        std::unique_ptr<QMimeData> mime(soundRangeMime(r));
+        QCOMPARE(mime->urls().value(0).toLocalFile(), r.path);
+        SoundRange back;
+        QVERIFY(soundRangeFromMime(mime.get(), back));
+        QVERIFY(back.path == r.path && back.first == 4800 && back.count == 9600 && back.rate == 48000);
+
+        // Dropped on A1 at frame 10 of a saved project, with copying on: the file copied into "Sound Effects" beside
+        // the project, imported into a bin of that name, and just the stretch placed (0.2 s: 6 frames at 30 fps).
+        state()->newProject();
+        state()->setSnapping(false);
+        QVERIFY(state()->save(dir_.path() + "/library-drop.montage"));
+        QSettings settings = appSettings();
+        settings.setValue("soundLibrary/copyToProject", true);
+        ppf_ = measurePpf();
+        const QPoint pos = pointFor(10, {TrackKind::Audio, 0}) + QPoint(2, 0);
+        QDragEnterEvent enter(pos, Qt::CopyAction, mime.get(), Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(viewport(), &enter);
+        QDropEvent drop(pos, Qt::CopyAction, mime.get(), Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(viewport(), &drop);
+        settings.setValue("soundLibrary/copyToProject", false);
+        const Sequence* s = state()->sequence();
+        QCOMPARE(s->audioTracks[0].clips.size(), size_t(1));
+        QVERIFY(s->videoTracks[0].clips.empty());
+        const Clip& c = s->audioTracks[0].clips.front();
+        QVERIFY2(std::abs(c.start - 10) <= 1, qPrintable(QString::number(c.start)));
+        QCOMPARE(c.duration, FrameTime(6));
+        QVERIFY(std::abs(c.sourceIn - 3.0) < 1e-9);  // 0.1 s in
+        QCOMPARE(c.tail, 0.0);
+        const MediaItem* m = state()->project().findMedia(c.mediaId);
+        QVERIFY(m);
+        QCOMPARE(QString::fromStdString(m->path), dir_.path() + "/Sound Effects/DOORCreak_Old Gate_TS_Lib.wav");
+        QVERIFY(QFileInfo::exists(QString::fromStdString(m->path)));
+        // Placed again (no copy this time): the library's own file, imported once.
+        const size_t media = state()->project().media.size();
+        QVERIFY(!state()->placeSound(r.path, 0, 4800, 48000, 40).empty());
+        QVERIFY(!state()->placeSound(r.path, 0, 4800, 48000, 60).empty());
+        QCOMPARE(state()->project().media.size(), media + 1);
+        state()->newProject();
+        panel.reset();
     }
 
     void filmCounterAndLists() {

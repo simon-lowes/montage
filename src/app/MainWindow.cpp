@@ -176,6 +176,7 @@
 #include "RedactFacesDialog.h"
 #include "SpectralRepairDialog.h"
 #include "ShotSearchPanel.h"
+#include "SoundLibraryPanel.h"
 #include "ModelPacks.h"
 #include "WorkProgress.h"
 #include "media/Breaths.h"
@@ -548,6 +549,8 @@ void MainWindow::buildPanels() {
     captionsDock_ = makeDock(tr("Captions"), "captions", captions_);
     transcriptDock_ = makeDock(tr("Transcript"), "transcript", transcript_);
     shotsDock_ = makeDock(tr("Find Shots"), "shots", shots_);
+    soundLibrary_ = new SoundLibraryPanel(state_, nullptr, this);
+    soundLibraryDock_ = makeDock(tr("Sound Library"), "soundLibrary", soundLibrary_);
     peopleDock_ = makeDock(tr("People"), "people", people_);
     assistant_ = new AssistantPanel(liveLink_, this);
     assistantDock_ = makeDock(tr("Assistant"), "assistant", assistant_);
@@ -861,7 +864,7 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         resizeDocks({clipsDock_}, {150}, Qt::Vertical);
     } else if (name == "Audio") {
         // The mixer where the Source monitor was, wide meters (Premiere's Audio workspace, Resolve's Fairlight page).
-        arrangeDocks({{mixerDock_, adrDock_, sourceDock_}, {programDock_}}, {{binDock_, effectsDock_}}, {{meterDock_}});
+        arrangeDocks({{mixerDock_, adrDock_, sourceDock_}, {programDock_}}, {{binDock_, soundLibraryDock_, effectsDock_}}, {{meterDock_}});
         resizeDocks({mixerDock_, programDock_}, {900, 640}, Qt::Horizontal);
         resizeDocks({mixerDock_}, {h / 2 + 40}, Qt::Vertical);
         resizeDocks({meterDock_}, {110}, Qt::Horizontal);
@@ -886,7 +889,7 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         resizeDocks({sourceDock_}, {h / 2 + 40}, Qt::Vertical);
     } else {  // Editing
         arrangeDocks({{sourceDock_, inspectorDock_, scopesDock_, mixerDock_, captionsDock_, multicamDock_, keyframesDock_}, {programDock_}},
-                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, peopleDock_, indexDock_, stackedDock_, queueDock_, assistantDock_, nodesDock_, galleryDock_, clipsDock_, trimsDock_, linedScriptDock_}},
+                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, soundLibraryDock_, peopleDock_, indexDock_, stackedDock_, queueDock_, assistantDock_, nodesDock_, galleryDock_, clipsDock_, trimsDock_, linedScriptDock_}},
                      {{meterDock_}});
         resizeDocks({binDock_}, {380}, Qt::Horizontal);
         resizeDocks({meterDock_}, {70}, Qt::Horizontal);

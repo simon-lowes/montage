@@ -1014,6 +1014,61 @@ Id EditorState::makeSubclip(Id media, FrameTime in, FrameTime out, const QString
     return id;
 }
 
+std::vector<Id> EditorState::placeSound(const QString& path, int64_t first, int64_t count, int rate, FrameTime at, int track,
+                                        bool insertMode, QString* error) {
+    if (!sequence()) {
+        if (error) *error = tr("No sequence is open");
+        return {};
+    }
+    QString file = QFileInfo(path).absoluteFilePath();
+    if (appSettings().value(QStringLiteral("soundLibrary/copyToProject"), false).toBool() && !path_.isEmpty()) {
+        // Into the project's folder, once: a file of that name there with the same bytes is this one.
+        const QDir dir(QFileInfo(path_).absolutePath() + QStringLiteral("/Sound Effects"));
+        dir.mkpath(QStringLiteral("."));
+        const QFileInfo from(file);
+        const auto same = [&](const QString& other) {
+            if (QFileInfo(other).size() != from.size()) return false;
+            QFile a(file), b(other);
+            if (!a.open(QIODevice::ReadOnly) || !b.open(QIODevice::ReadOnly)) return false;
+            while (!a.atEnd())
+                if (a.read(1 << 20) != b.read(1 << 20)) return false;
+            return true;
+        };
+        QString to = dir.filePath(from.fileName());
+        for (int n = 2; QFileInfo::exists(to) && !same(to); ++n)
+            to = dir.filePath(QStringLiteral("%1 %2.%3").arg(from.completeBaseName()).arg(n).arg(from.suffix()));
+        if (!QFileInfo::exists(to) && !QFile::copy(file, to)) {
+            if (error) *error = tr("Could not copy %1 into the project's folder").arg(from.fileName());
+            return {};
+        }
+        file = QFileInfo(to).absoluteFilePath();
+    }
+    Id media = 0;
+    for (const MediaItem& m : project_.media)
+        if (!m.subclipOf && QString::fromStdString(m.path) == file) media = m.id;
+    if (!media) {
+        QStringList errors;
+        const std::vector<Id> ids = importFiles({file}, &errors, tr("Sound Effects"));
+        if (ids.empty()) {
+            if (error) *error = errors.isEmpty() ? tr("Could not import %1").arg(file) : errors.join('\n');
+            return {};
+        }
+        media = ids.front();
+    }
+    std::vector<Id> created;
+    const int audioTrack = track >= 0 ? track : targetAudio_;
+    apply(tr("Place Sound"), [&](Project& p, Sequence& s) {
+        if (s.audioTracks.empty()) return edit::Result::fail("The sequence has no audio track");
+        const edit::Result r = edit::placeSoundRange(p, s, media, at, first, count, rate,
+                                                     {TrackKind::Audio, std::min(audioTrack, int(s.audioTracks.size()) - 1)}, insertMode);
+        created = r.created;
+        return r;
+    });
+    if (created.empty() && error) *error = tr("The sound could not be placed");
+    if (!created.empty()) setSelection(created);
+    return created;
+}
+
 void EditorState::setSourceIn(FrameTime t) {
     sourceIn_ = t;
     if (t >= 0 && sourceOut_ >= 0 && sourceOut_ <= t) sourceOut_ = -1;
