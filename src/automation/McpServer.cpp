@@ -2529,7 +2529,10 @@ void McpServer::Impl::addTools() {
         "Add an audio effect to an audio track's inserts (after its clips are mixed, before its fader), or with `remove` "
         "take one off by its id. A compressor or noise gate can listen to another track instead of its own signal: "
         "strings {\"sidechain\": \"A1\"} (a track's reference or name) ducks music under dialogue or opens a gate on a "
-        "kick; key_hpf_hz high-passes what it listens to.",
+        "kick; key_hpf_hz high-passes what it listens to. In a surround or ambisonic sequence, upmix spreads the track's "
+        "stereo (after its other inserts) over the speakers so that the stereo fold-down gives it back: centred sound "
+        "to the centre, what differs between the sides behind and above (params centre_width, surround_depth and height "
+        "0-100, delay_ms, lfe 1 for the lows in the LFE, dialogue_centre 0 to upmix Dialogue-role clips too).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"string","description":"A1, A2..."},
             "effect":{"type":"string"},"params":{"type":"object","additionalProperties":{"type":"number"}},
             "strings":{"type":"object","additionalProperties":{"type":"string"}},

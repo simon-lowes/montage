@@ -55,6 +55,7 @@
 #include "core/TranscriptEdit.h"
 #include "audio/DialogueAlign.h"
 #include "audio/RoomResponse.h"
+#include "audio/Upmix.h"
 #include "audio/SpeechCleanup.h"
 #include "audio/TimeStretch.h"
 #include "core/ClipAnimation.h"
@@ -2976,6 +2977,319 @@ private slots:
         const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
         const QString text = res.value("content").toArray().at(0).toObject().value("text").toString();
         QVERIFY2(!res.value("isError").toBool() && text.contains("Channel inverted") && text.contains("Out of phase"), qPrintable(text));
+    }
+
+    void upmixStereoToSurround() {
+        const int rate = 48000, lat = Upmixer::kLatency;
+        std::mt19937 rng(11);
+        std::normal_distribution<float> white(0, 0.1f);
+        // Interleaved stereo from a function of the sample.
+        auto make = [&](double seconds, const std::function<std::pair<float, float>(int)>& f) {
+            std::vector<float> out(size_t(seconds * rate) * 2);
+            for (size_t i = 0; i < out.size() / 2; ++i) {
+                const auto [l, r] = f(int(i));
+                out[2 * i] = l, out[2 * i + 1] = r;
+            }
+            return out;
+        };
+        auto tone = [&](double hz, int i) { return float(0.3 * std::sin(2 * M_PI * hz * i / rate)); };
+        auto upmix = [&](const std::string& layout, const std::vector<float>& in, UpmixSettings us = {}, const std::vector<float>* dialogue = nullptr) {
+            Upmixer u(layout, rate);
+            std::vector<float> out(in.size() / 2 * size_t(u.channels()));
+            // In uneven blocks, as the mixer gives them.
+            for (size_t at = 0, block = 300; at < in.size() / 2; at += block, block = block == 300 ? 1024 : 300) {
+                const size_t n = std::min(block, in.size() / 2 - at);
+                u.process(&in[2 * at], dialogue ? &(*dialogue)[2 * at] : nullptr, int(n), us, &out[at * size_t(u.channels())]);
+            }
+            return out;
+        };
+        // RMS of a channel from `from` seconds on.
+        auto rms = [&](const std::vector<float>& v, int ch, int channels, double from = 0.5) {
+            double acc = 0;
+            size_t count = 0;
+            for (size_t i = size_t(from * rate) + lat; i < v.size() / size_t(channels); ++i, ++count) acc += double(v[i * size_t(channels) + size_t(ch)]) * v[i * size_t(channels) + size_t(ch)];
+            return std::sqrt(acc / std::max<size_t>(1, count));
+        };
+        auto db = [](double a, double b) { return 20 * std::log10(std::max(a, 1e-12) / std::max(b, 1e-12)); };
+        enum { L, R, C, LFE, Ls, Rs };
+
+        // A tone in both channels goes to the centre at the level the fold-down needs; in the left alone, it stays there.
+        const auto centred = make(3, [&](int i) { return std::make_pair(tone(1000, i), tone(1000, i)); });
+        auto six = upmix("5.1", centred);
+        QVERIFY2(std::fabs(rms(six, C, 6) - 0.3) < 0.01, qPrintable(QString::number(rms(six, C, 6))));
+        QVERIFY(db(rms(six, C, 6), rms(six, L, 6)) > 20 && db(rms(six, C, 6), rms(six, R, 6)) > 20);
+        QVERIFY(db(rms(six, C, 6), rms(six, Ls, 6)) > 20 && rms(six, LFE, 6) < 1e-6);
+        six = upmix("5.1", make(3, [&](int i) { return std::make_pair(tone(1000, i), 0.0f); }));
+        QVERIFY(std::fabs(rms(six, L, 6) - 0.3 / std::sqrt(2.0)) < 0.01);
+        for (int ch : {R, C, Ls, Rs}) QVERIFY2(db(rms(six, L, 6), rms(six, ch, 6)) > 30, qPrintable(QString::number(ch)));
+
+        // Independent noise either side: mostly behind, the two surrounds unrelated (coherence under 0.2).
+        const auto noise = make(5, [&](int) { return std::make_pair(white(rng), white(rng)); });
+        six = upmix("5.1", noise);
+        const double front = std::pow(rms(six, L, 6), 2) + std::pow(rms(six, R, 6), 2) + std::pow(rms(six, C, 6), 2);
+        const double behind = std::pow(rms(six, Ls, 6), 2) + std::pow(rms(six, Rs, 6), 2);
+        QVERIFY2(behind > 1.5 * front, qPrintable(QStringLiteral("%1 %2").arg(behind).arg(front)));
+        qInfo("noise: %.2f times the power behind as in front", behind / front);
+        // Magnitude-squared coherence, averaged over 1024-point segments and over the bins from 100 Hz to 16 kHz.
+        auto coherence = [&](const std::vector<float>& v, int a, int b, int channels) {
+            const int n = 1024, bins = n / 2;
+            std::vector<double> paa(bins), pbb(bins);
+            std::vector<std::complex<double>> pab(bins);
+            for (size_t at = size_t(rate) / 2 + lat; at + n <= v.size() / size_t(channels); at += n) {
+                std::vector<std::complex<float>> fa(n), fb(n);
+                for (int i = 0; i < n; ++i) {
+                    const float w = float(0.5 - 0.5 * std::cos(2 * M_PI * i / n));
+                    fa[size_t(i)] = v[(at + size_t(i)) * size_t(channels) + size_t(a)] * w;
+                    fb[size_t(i)] = v[(at + size_t(i)) * size_t(channels) + size_t(b)] * w;
+                }
+                fftInPlace(fa, false);
+                fftInPlace(fb, false);
+                for (int k = 0; k < bins; ++k) {
+                    paa[size_t(k)] += std::norm(fa[size_t(k)]);
+                    pbb[size_t(k)] += std::norm(fb[size_t(k)]);
+                    pab[size_t(k)] += std::complex<double>(fa[size_t(k)]) * std::conj(std::complex<double>(fb[size_t(k)]));
+                }
+            }
+            double sum = 0;
+            int count = 0;
+            for (int k = 100 * n / rate + 1; k < 16000 * n / rate; ++k, ++count)
+                sum += std::norm(pab[size_t(k)]) / std::max(1e-30, paa[size_t(k)] * pbb[size_t(k)]);
+            return sum / count;
+        };
+        QVERIFY2(coherence(six, Ls, Rs, 6) < 0.2, qPrintable(QString::number(coherence(six, Ls, Rs, 6))));
+        qInfo("surrounds' coherence %.3f", coherence(six, Ls, Rs, 6));
+
+        // 7.1.4 (L R C LFE Lb Rb Ls Rs Ltf Rtf Ltr Rtr): the heights carry the ambient sound only.
+        auto twelve = upmix("7.1.4", centred);
+        for (int ch = 8; ch < 12; ++ch) QVERIFY2(db(rms(twelve, 2, 12), rms(twelve, ch, 12)) > 40, qPrintable(QString::number(ch)));
+        twelve = upmix("7.1.4", noise);
+        for (int ch = 8; ch < 12; ++ch) QVERIFY(rms(twelve, ch, 12) > 0.01);
+        // Two speakers on one side, fed the same ambient sound through all-passes of their own: unalike at any lag up to 10 ms.
+        auto alike = [&](const std::vector<float>& v, int a, int b, int channels) {
+            double worst = 0;
+            const size_t from = size_t(rate) / 2 + lat, to = v.size() / size_t(channels) - 600;
+            for (int lag = -480; lag <= 480; lag += 1) {
+                double ab = 0, aa = 0, bb = 0;
+                for (size_t i = from; i < to; i += 3) {
+                    const double x = v[i * size_t(channels) + size_t(a)], y = v[size_t(int64_t(i) + lag) * size_t(channels) + size_t(b)];
+                    ab += x * y, aa += x * x, bb += y * y;
+                }
+                worst = std::max(worst, std::fabs(ab) / std::sqrt(aa * bb + 1e-30));
+            }
+            return worst;
+        };
+        QVERIFY2(alike(twelve, 8, 10, 12) < 0.5, qPrintable(QString::number(alike(twelve, 8, 10, 12))));
+        QVERIFY2(alike(twelve, 4, 6, 12) < 0.5, qPrintable(QString::number(alike(twelve, 4, 6, 12))));
+        qInfo("same side alike at most %.2f (above), %.2f (behind)", alike(twelve, 8, 10, 12), alike(twelve, 4, 6, 12));
+
+        // A mix folds back to its stereo: a centred tone, a tone hard left, a voice-like band of noise panned right of
+        // centre and some independent noise. Within 1 LU, and above 0.9 correlated on both sides.
+        std::vector<float> band(size_t(6 * rate));
+        {
+            fx::Biquad lp, hp;
+            lp.lowPass(rate, 3000);
+            hp.highPass(rate, 300);
+            for (float& x : band) x = hp.process(0, lp.process(0, white(rng) * 2));
+        }
+        const auto mix = make(6, [&](int i) {
+            const float b = band[size_t(i)];
+            return std::make_pair(0.5f * tone(220, i) + 0.4f * tone(660, i) + 0.45f * b + 0.2f * white(rng),
+                                  0.5f * tone(220, i) + 0.85f * b + 0.2f * white(rng));
+        });
+        for (const std::string layout : {"5.1", "7.1", "7.1.4"}) {
+            const int n = layoutChannels(layout);
+            const auto up = upmix(layout, mix);
+            std::vector<float> fold(mix.size());
+            downmixToStereo(layout, up.data(), int(mix.size() / 2), fold.data());
+            // Lined up with the input (the upmix is kLatency late).
+            const size_t frames = mix.size() / 2 - lat - size_t(rate);
+            std::vector<float> a(mix.begin() + std::ptrdiff_t(rate) * 2, mix.begin() + std::ptrdiff_t(rate + frames) * 2);
+            std::vector<float> b(fold.begin() + std::ptrdiff_t(rate + lat) * 2, fold.begin() + std::ptrdiff_t(rate + lat + frames) * 2);
+            const double w[2] = {1, 1};
+            const double la = measureLoudness(a.data(), int64_t(frames), 2, w, rate).integrated;
+            const double lb = measureLoudness(b.data(), int64_t(frames), 2, w, rate).integrated;
+            QVERIFY2(std::fabs(la - lb) < 1, qPrintable(QStringLiteral("%1: %2 %3").arg(QString::fromStdString(layout)).arg(la).arg(lb)));
+            qInfo("%s fold-down: %.2f LU from the stereo", layout.c_str(), lb - la);
+            for (int ch = 0; ch < 2; ++ch) {
+                double ab = 0, aa = 0, bb = 0;
+                for (size_t i = 0; i < frames; ++i) {
+                    ab += double(a[2 * i + size_t(ch)]) * b[2 * i + size_t(ch)];
+                    aa += double(a[2 * i + size_t(ch)]) * a[2 * i + size_t(ch)];
+                    bb += double(b[2 * i + size_t(ch)]) * b[2 * i + size_t(ch)];
+                }
+                qInfo("  side %d correlation %.3f", ch, ab / std::sqrt(aa * bb));
+                QVERIFY2(ab / std::sqrt(aa * bb) > 0.9, qPrintable(QStringLiteral("%1 %2: %3").arg(QString::fromStdString(layout)).arg(ch).arg(ab / std::sqrt(aa * bb))));
+            }
+            QVERIFY(n == 6 || rms(up, 4, n) > 0.005);
+        }
+
+        // Whatever the phase or time between the sides, the fold-down keeps it: one side inverted, or 0.5 ms later.
+        auto foldCorrelation = [&](const std::vector<float>& in) {
+            const auto up = upmix("5.1", in);
+            std::vector<float> fold(in.size());
+            downmixToStereo("5.1", up.data(), int(in.size() / 2), fold.data());
+            double worst = 1;
+            for (int ch = 0; ch < 2; ++ch) {
+                double ab = 0, aa = 0, bb = 0;
+                for (size_t i = size_t(rate); i + lat < in.size() / 2; ++i) {
+                    const double x = in[2 * i + size_t(ch)], y = fold[2 * (i + lat) + size_t(ch)];
+                    ab += x * y, aa += x * x, bb += y * y;
+                }
+                worst = std::min(worst, ab / std::sqrt(aa * bb));
+            }
+            return worst;
+        };
+        std::vector<float> voice(size_t(4 * rate));
+        {
+            fx::Biquad lp, hp;
+            lp.lowPass(rate, 3000);
+            hp.highPass(rate, 300);
+            for (float& x : voice) x = hp.process(0, lp.process(0, white(rng) * 2));
+        }
+        const double inverted = foldCorrelation(make(4, [&](int i) { return std::make_pair(voice[size_t(i)], -voice[size_t(i)]); }));
+        const double later = foldCorrelation(make(4, [&](int i) { return std::make_pair(voice[size_t(i)], i >= 24 ? voice[size_t(i - 24)] : 0.0f); }));
+        qInfo("fold-down with one side inverted correlated %.3f, with one side 0.5 ms later %.3f", inverted, later);
+        QVERIFY(inverted > 0.99 && later > 0.99);
+        // The stereo comes back too, exactly as late as the upmix.
+        {
+            Upmixer u("5.1", rate);
+            std::vector<float> out(mix.size() / 2 * 6), back(mix.size());
+            u.process(mix.data(), nullptr, int(mix.size() / 2), {}, out.data(), back.data());
+            for (size_t i = lat * 2; i < mix.size(); i += 101) QCOMPARE(back[i], mix[i - lat * 2]);
+        }
+
+        // Settings: no surround depth leaves the ambient sound in front; full centre width puts nothing in the centre.
+        UpmixSettings us;
+        us.surroundDepth = 0;
+        six = upmix("5.1", noise, us);
+        QVERIFY(rms(six, Ls, 6) < 1e-6 && rms(six, Rs, 6) < 1e-6);
+        us = {};
+        us.centreWidth = 1;
+        six = upmix("5.1", centred, us);
+        QVERIFY(rms(six, C, 6) < 1e-4 && std::fabs(rms(six, L, 6) - 0.3 / std::sqrt(2.0)) < 0.01);
+        // The LFE takes the lows only when asked.
+        const auto lowAndHigh = make(3, [&](int i) { const float v = 0.5f * (tone(50, i) + tone(1000, i)); return std::make_pair(v, v); });
+        us = {};
+        us.lfe = true;
+        six = upmix("5.1", lowAndHigh, us);
+        {
+            std::vector<float> lfe(six.size() / 6 * 2);
+            for (size_t i = 0; i < lfe.size() / 2; ++i) lfe[2 * i] = lfe[2 * i + 1] = six[i * 6 + LFE];
+            QVERIFY2(std::fabs(toneLevel(lfe, 0, 50, size_t(lat + rate / 2)) - 0.15 * std::sqrt(2.0)) < 0.02,
+                     qPrintable(QString::number(toneLevel(lfe, 0, 50, size_t(lat + rate / 2)))));
+            QVERIFY(toneLevel(lfe, 0, 1000, size_t(lat + rate / 2)) < 0.002);
+        }
+        // Dialogue given apart goes to the centre alone, however it was panned.
+        const auto silence = make(3, [](int) { return std::make_pair(0.0f, 0.0f); });
+        const auto leftVoice = make(3, [&](int i) { return std::make_pair(tone(500, i), 0.0f); });
+        six = upmix("5.1", silence, {}, &leftVoice);
+        QVERIFY(std::fabs(rms(six, C, 6) - 0.3 / 2) < 0.005 && rms(six, L, 6) < 1e-6 && rms(six, Ls, 6) < 1e-6);
+        // First-order ambisonics: centred sound straight ahead (no Y, the left-right component).
+        const auto field = upmix("ambix", centred);
+        QVERIFY(rms(field, 0, 4) > 0.2 && db(rms(field, 0, 4), rms(field, 1, 4)) > 30 && rms(field, 3, 4) > 0.2);
+
+        // In a sequence: an upmixed track in 5.1, its sound on time (the upmix's latency made up), its Dialogue clip in
+        // the centre.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        auto file = [&](const char* name, const std::vector<float>& v) {
+            std::string err;
+            if (!writeStereoWav(path(name), v, rate, &err)) qWarning() << err.c_str();
+            MediaItem m = probeOrFail(p, path(name));
+            p.media.push_back(m);
+            return p.media.back().id;
+        };
+        // A click 1.5 s in, in both channels, over a quiet centred hum.
+        const auto click = make(3, [&](int i) {
+            const float v = (i == rate * 3 / 2 ? 0.8f : 0.0f) + 0.01f * tone(100, i);
+            return std::make_pair(v, v);
+        });
+        const Id clickMedia = file("upmix-click.wav", click), voiceMedia = file("upmix-voice.wav", leftVoice);
+        QVERIFY(edit::placeMedia(p, s, clickMedia, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const FrameTime voiceAt = s.duration() + 10;
+        QVERIFY(edit::placeMedia(p, s, voiceMedia, voiceAt, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Track& a1 = s.audioTracks[0];
+        for (Clip& c : a1.clips)
+            if (c.mediaId == voiceMedia) c.role = "Dialogue";
+        Effect up = makeEffect(p, "upmix");
+        a1.effects.push_back(up);
+        s.audioLayout = "5.1";
+        const double fps = s.fpsValue();
+        {
+            AudioMixer mixer;
+            const int n = rate;
+            std::vector<float> out(size_t(n) * 6);
+            mixer.mixLayout(p, s, rate, n, out.data());
+            int peak = 0;
+            for (int i = 0; i < n; ++i)
+                if (std::fabs(out[size_t(i) * 6 + C]) > std::fabs(out[size_t(peak) * 6 + C])) peak = i;
+            QVERIFY2(std::abs(peak - rate / 2) <= 2, qPrintable(QString::number(peak)));
+            QVERIFY(std::fabs(out[size_t(peak) * 6 + C]) > 0.5);
+            // Still on its sample routed to a bus with an Upmix of its own (a delay there), and with one on the master
+            // (left out of a surround mix, with its latency).
+            Sequence routed = s;
+            Bus b;
+            b.id = p.newId();
+            b.name = "Music";
+            b.effects.push_back(makeEffect(p, "upmix"));
+            routed.buses.push_back(b);
+            routed.audioTracks[0].output = b.id;
+            routed.masterEffects.push_back(makeEffect(p, "upmix"));
+            AudioMixer viaBus;
+            viaBus.mixLayout(p, routed, rate, n, out.data());
+            peak = 0;
+            for (int i = 0; i < n; ++i)
+                if (std::fabs(out[size_t(i) * 6 + C]) > std::fabs(out[size_t(peak) * 6 + C])) peak = i;
+            QVERIFY2(std::abs(peak - rate / 2) <= 2 && std::fabs(out[size_t(peak) * 6 + C]) > 0.5, qPrintable(QString::number(peak)));
+            // The voice, hard left but Dialogue, only in the centre; off, it stays left.
+            const int64_t voiceStart = int64_t(std::llround(double(voiceAt) * rate / fps)) + rate / 2;
+            mixer.mixLayout(p, s, voiceStart, n, out.data());
+            QVERIFY2(std::fabs(rms(out, C, 6, -double(lat) / rate) - 0.15) < 0.01 && rms(out, L, 6, -double(lat) / rate) < 1e-4,
+                     qPrintable(QStringLiteral("%1 %2").arg(rms(out, C, 6, -double(lat) / rate)).arg(rms(out, L, 6, -double(lat) / rate))));
+            a1.effects.back().params["dialogue_centre"].value = 0;
+            AudioMixer again;
+            again.mixLayout(p, s, voiceStart, n, out.data());
+            QVERIFY(rms(out, L, 6, -double(lat) / rate) > 0.15 && rms(out, C, 6, -double(lat) / rate) < 0.01);
+            a1.effects.back().params["dialogue_centre"].value = 1;
+        }
+        // In a stereo sequence it only delays, made up, so the mix is as it was without it.
+        {
+            s.audioLayout = "stereo";
+            AudioMixer with, without;
+            std::vector<float> a(size_t(rate) * 2), b(size_t(rate) * 2);
+            with.mix(p, s, rate, rate, a.data());
+            Sequence plain = s;
+            plain.audioTracks[0].effects.clear();
+            without.mix(p, plain, rate, rate, b.data());
+            double worst = 0;
+            for (size_t i = 0; i < a.size(); ++i) worst = std::max(worst, double(std::fabs(a[i] - b[i])));
+            QVERIFY2(worst < 1e-6, qPrintable(QString::number(worst)));
+            s.audioLayout = "5.1";
+        }
+
+        // Over MCP, on a track, then off again.
+        a1.effects.clear();
+        const QString project = QString::fromStdString(path("upmix.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_track_effect", {{"project", project}, {"track", "A1"}, {"effect", "upmix"},
+                                                      {"params", QJsonObject{{"surround_depth", 80}, {"lfe", 1}}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(QJsonDocument(r).toJson()));
+        Project loaded;
+        QVERIFY(loadProject(project.toStdString(), loaded));
+        const Track& t = loaded.active()->audioTracks[0];
+        QVERIFY(t.effects.size() == 1 && t.effects[0].type == "upmix");
+        QCOMPARE(t.effects[0].p("surround_depth", 0, 0), 80.0);
+        QCOMPARE(t.effects[0].p("lfe", 0, 0), 1.0);
+        QCOMPARE(t.effects[0].p("dialogue_centre", 0, 0), 1.0);
     }
 
     void dialogueGatedLoudness() {
