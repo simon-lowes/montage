@@ -28249,15 +28249,16 @@ private slots:
         }
 
         // A frame missing from the file's times (shown as the one before again) and a packet the transfer broke, which
-        // the decoder reports, in a file of keyframes.
+        // the decoder reports or drops, in a file of keyframes.
         const std::string intra = path("repair-intra.mp4"), broken = path("repair-broken.mp4");
         writeFrames(intra, clean, 25, 0, 1);
         remuxDamaged(intra, broken, 12, 20);
         std::map<int64_t, FrameDamage> gaps;
         for (const DamagedFrame& d : findDamagedFrames(broken, 0, -1, {}, nullptr, &err)) gaps[d.frame] = d.kind;
         QVERIFY2(err.empty(), err.c_str());
-        const std::map<int64_t, FrameDamage> wantGaps = {{12, FrameDamage::Missing}, {21, FrameDamage::Decode}};
-        QVERIFY2(gaps == wantGaps, damagedFramesToString(gaps).c_str());
+        // (The broken frame is reported by the decoder, or dropped by it and so shown as a repeat, by FFmpeg's version.)
+        const bool broken21 = gaps.count(21) && (gaps.at(21) == FrameDamage::Decode || gaps.at(21) == FrameDamage::Missing);
+        QVERIFY2(gaps.size() == 2 && gaps.count(12) && gaps.at(12) == FrameDamage::Missing && broken21, damagedFramesToString(gaps).c_str());
     }
 };
 
