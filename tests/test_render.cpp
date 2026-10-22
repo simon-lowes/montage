@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <QBuffer>
+#include <QScopeGuard>
 #include <QColorSpace>
 #include <QImageReader>
 #include <QDir>
@@ -69,6 +70,9 @@
 #include <QTcpSocket>
 #include <QNetworkProxy>
 #include <thread>
+#include <atomic>
+#include <functional>
+#include <mutex>
 #include <QPainter>
 #include <QElapsedTimer>
 #include <QRandomGenerator>
@@ -96,6 +100,10 @@
 #include "render/VideoFx.h"
 #include "render/VideoPacking.h"
 #include "render/ReferenceOutput.h"
+#ifdef MONTAGE_WITH_OMT
+#include "media/Omt.h"
+#include "media/OmtNet.h"
+#endif
 #include "render/MonitorCalibration.h"
 #include "render/SkyReplace.h"
 #include "render/FaceShape.h"
@@ -8702,6 +8710,451 @@ colorspaces:
         s.colorSpace = "rec2100pq";  // (HDR is not sent in 8 bits)
         cfg.depth = 8;
         QVERIFY(!sched.start(d, d.modes[0], s, cfg, &why));
+    }
+
+    void openMediaTransport() {
+#ifndef MONTAGE_WITH_OMT
+        QSKIP("Built without Open Media Transport");
+#else
+        using namespace montage::output;
+        namespace omt = montage::omt;
+        // The wire: little-endian headers, byte for byte as OMT lays them out.
+        uint8_t head[omt::kHeaderBytes];
+        omt::Header h;
+        h.type = omt::Video;
+        h.timestamp = 0x0102030405060708;
+        h.metadataLength = 5;
+        h.dataLength = 100;
+        omt::writeHeader(h, head);
+        const uint8_t expected[] = {1, 2, 8, 7, 6, 5, 4, 3, 2, 1, 5, 0, 100, 0, 0, 0};
+        QVERIFY(std::equal(head, head + 16, expected));
+        omt::Header back;
+        QVERIFY(omt::readHeader(head, back) && back.timestamp == h.timestamp && back.metadataLength == 5 && back.dataLength == 100);
+        head[0] = 2;
+        QVERIFY(!omt::readHeader(head, back));  // (version 1 only)
+        uint8_t ext[omt::kVideoHeaderBytes];
+        omt::VideoHeader vh;
+        vh.width = 1920, vh.height = 1080, vh.rateN = 50, vh.rateD = 1, vh.flags = omt::HighBitDepth, vh.colorSpace = 709;
+        omt::writeVideoHeader(vh, ext);
+        QVERIFY(std::equal(ext, ext + 4, reinterpret_cast<const uint8_t*>("VMX1")));
+        QCOMPARE(int(ext[4] | ext[5] << 8), 1920);
+        QCOMPARE(int(ext[24]), 16);
+        QCOMPARE(int(ext[28] | ext[29] << 8), 709);
+        QCOMPARE(omt::readVideoHeader(ext).aspect, 1920.0f / 1080.0f);
+        // Commands are exact strings (the tally's "==" is the protocol's own).
+        QCOMPARE(QString::fromStdString(omt::tallyCommand(true, false)), QStringLiteral("<OMTTally Preview=\"true\" Program==\"false\" />"));
+        QCOMPARE(QString::fromStdString(omt::subscribeCommand(omt::Audio)), QStringLiteral("<OMTSubscribe Audio=\"true\" />"));
+        QCOMPARE(QString::fromStdString(omt::qualityCommand(omt::Quality::High)), QStringLiteral("<OMTSettings Quality=\"High\" />"));
+        // FPA1: silent channels left out and marked so.
+        std::vector<float> three(3 * 4, 0.0f);
+        for (int i = 0; i < 4; ++i) three[size_t(i)] = float(i + 1), three[size_t(8 + i)] = -float(i + 1);
+        uint32_t active = 0;
+        const std::vector<uint8_t> fpa = omt::encodeFpa1(three.data(), 3, 4, &active);
+        QCOMPARE(active, 5u);
+        QCOMPARE(int(fpa.size()), 2 * 4 * 4);
+        std::vector<float> decoded(12, 9.0f);
+        QVERIFY(omt::decodeFpa1(fpa.data(), fpa.size(), 3, 4, active, decoded.data()));
+        QVERIFY(decoded == three);
+        QVERIFY(!omt::decodeFpa1(fpa.data(), fpa.size() - 1, 3, 4, active, decoded.data()));
+        // Names: "HOST (Name)", 63 characters at most.
+        const std::string host = omt::machineName();
+        QCOMPARE(QString::fromStdString(omt::fullName("Montage")), QString::fromStdString(host + " (Montage)"));
+        if (host.size() < 40) QCOMPARE(int(omt::fullName(std::string(80, 'x')).size()), 63);
+        // Addresses, and the discovery server's XML (libomtnet's: IPv4 as IPv6, Removed before Addresses).
+        std::string where;
+        int port = 0;
+        QVERIFY(omt::resolve("omt://127.0.0.1:6401", where, port, nullptr) && where == "127.0.0.1" && port == 6401);
+        QVERIFY(omt::resolve("OMT://[::1]:6400/", where, port, nullptr) && where == "::1" && port == 6400);
+        QVERIFY(omt::resolve("studio-pc:6402", where, port, nullptr) && where == "studio-pc" && port == 6402);
+        std::string why;
+        QVERIFY(!omt::resolve("omt://studio-pc", where, port, &why) && !why.empty());
+        omt::Source src;
+        bool removed = true;
+        QVERIFY(omt::parseAddressXml(omt::addressXml("STUDIO (Cam 1)", 6400, {"::ffff:192.168.1.5"}, false), src, removed));
+        QVERIFY(!removed && src.name == "STUDIO (Cam 1)" && src.port == 6400 && src.host == "192.168.1.5");
+        QVERIFY(omt::parseAddressXml(omt::addressXml("STUDIO (Cam 1)", 6400, {}, true), src, removed) && removed);
+        QVERIFY(QString::fromStdString(omt::addressXml("A (B)", 1, {}, true)).indexOf("<Removed>") <
+                QString::fromStdString(omt::addressXml("A (B)", 1, {}, true)).indexOf("<Addresses>"));
+        QCOMPARE(QString::fromStdString(omt::xmlAttribute("<a b=\"1 &amp; 2\" c=\"x\"/>", "b")), QStringLiteral("1 & 2"));
+        if (!omt::vmxAvailable(&why)) QSKIP(why.c_str());
+
+        // A 1080p50 picture: moving gradients with fine detail and grain, as Montage packs it for the wire.
+        const int W = 1920, H = 1080;
+        auto picture = [&](int t) {
+            Image img(W, H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    float* p = img.at(x, y);
+                    uint32_t n = uint32_t(x) * 73856093u ^ uint32_t(y) * 19349663u ^ uint32_t(t) * 83492791u;
+                    n = (n ^ (n >> 13)) * 1274126177u;
+                    const float grain = 0.008f * (float(n & 1023) / 1023.0f - 0.5f);
+                    const float detail = 0.05f * std::sin(float(x) * 0.25f) * std::sin(float(y) * 0.2f);
+                    p[0] = 0.1f + 0.7f * float(x) / W + detail + grain, p[1] = 0.1f + 0.7f * float(y) / H + grain;
+                    p[2] = 0.5f + 0.4f * std::sin(float(x + y) * 0.01f + float(t) * 0.3f) - detail;
+                    p[3] = 1;
+                }
+            const video::Ycbcr422 yc = video::toYcbcr422(img, video::YcbcrMatrix::Bt709);
+            std::vector<uint8_t> out(frameBytes(PixelFormat::P216, W, H));
+            video::packP216(yc, out.data(), size_t(W) * 2);
+            return out;
+        };
+        // PSNR at 10 bits, over both planes of two P216 pictures.
+        auto psnr = [&](const std::vector<uint8_t>& a, const uint8_t* b) {
+            double err = 0;
+            const size_t n = a.size() / 2;
+            for (size_t i = 0; i < n; ++i) {
+                const double d = double((a[2 * i] | a[2 * i + 1] << 8) >> 6) - double((b[2 * i] | b[2 * i + 1] << 8) >> 6);
+                err += d * d;
+            }
+            return err == 0 ? 99.0 : 10 * std::log10(1023.0 * 1023.0 / (err / double(n)));
+        };
+        // VMX: encoded and decoded again, at OMT's three qualities.
+        const std::vector<uint8_t> still = picture(0);
+        omt::VmxDecoder dec;
+        std::vector<uint8_t> round(still.size());
+        size_t mediumBytes = 0;
+        for (const omt::Quality q : {omt::Quality::Low, omt::Quality::Medium, omt::Quality::High}) {
+            omt::VmxEncoder enc;
+            QVERIFY(enc.open(W, H, omt::vmxProfile(q), 709, 50));
+            std::vector<uint8_t> coded;
+            QVERIFY(enc.encode(omt::PictureFormat::P216, still.data(), W * 2, false, coded));
+            QVERIFY(enc.previewLength() > 0 && enc.previewLength() < int(coded.size()));
+            QVERIFY(dec.decode(coded.data(), coded.size(), W, H, 709, omt::PictureFormat::P216, round.data(), W * 2));
+            qInfo("VMX %s: %.0f kB a picture, %.1f dB", q == omt::Quality::Low ? "low" : q == omt::Quality::Medium ? "medium" : "high",
+                  double(coded.size()) / 1e3, psnr(still, round.data()));
+            QVERIFY(psnr(still, round.data()) > 40);
+            if (q == omt::Quality::Medium) mediumBytes = coded.size();
+        }
+        // Checked against FFmpeg's own VMX decoder (vMix's codec, OMT's 8-bit pictures): the same picture to within a
+        // code or two.
+        if (const AVCodec* vmix = avcodec_find_decoder_by_name("vmix")) {
+            std::vector<uint8_t> uyvy(size_t(W) * H * 2);
+            {
+                const video::Ycbcr422 yc = video::toYcbcr422([&] {
+                    Image img(W, H);
+                    for (int y = 0; y < H; ++y)
+                        for (int x = 0; x < W; ++x) {
+                            float* p = img.at(x, y);
+                            p[0] = float(x) / W, p[1] = float(y) / H, p[2] = 0.3f, p[3] = 1;
+                        }
+                    return img;
+                }(), video::YcbcrMatrix::Bt709);
+                video::packUyvy(yc, uyvy.data(), size_t(W) * 2);
+            }
+            omt::VmxEncoder enc;
+            QVERIFY(enc.open(W, H, omt::vmxProfile(omt::Quality::Medium), 709, 50));
+            std::vector<uint8_t> coded;
+            QVERIFY(enc.encode(omt::PictureFormat::Uyvy, uyvy.data(), W * 2, false, coded));
+            std::vector<uint8_t> ours(uyvy.size());
+            QVERIFY(dec.decode(coded.data(), coded.size(), W, H, 709, omt::PictureFormat::Uyvy, ours.data(), W * 2));
+            AVCodecContext* c = avcodec_alloc_context3(vmix);
+            c->width = W, c->height = H;
+            QVERIFY(avcodec_open2(c, vmix, nullptr) >= 0);
+            AVPacket* pkt = av_packet_alloc();
+            av_new_packet(pkt, int(coded.size()));
+            std::memcpy(pkt->data, coded.data(), coded.size());
+            pkt->flags |= AV_PKT_FLAG_KEY;
+            AVFrame* fr = av_frame_alloc();
+            const bool decodedByFfmpeg = avcodec_send_packet(c, pkt) >= 0 && avcodec_receive_frame(c, fr) >= 0;
+            if (decodedByFfmpeg) {
+                QCOMPARE(fr->format, int(AV_PIX_FMT_YUV422P));
+                int worst = 0;
+                for (int y = 0; y < H; y += 7)
+                    for (int x = 0; x < W; x += 5) {
+                        worst = std::max(worst, std::abs(int(fr->data[0][y * fr->linesize[0] + x]) - int(ours[size_t(y) * W * 2 + size_t(x) * 2 + 1])));
+                        if (x % 2 == 0)
+                            worst = std::max(worst, std::abs(int(fr->data[1][y * fr->linesize[1] + x / 2]) - int(ours[size_t(y) * W * 2 + size_t(x) * 2])));
+                    }
+                qInfo("FFmpeg's VMX decoder: within %d code(s) of libvmx's", worst);
+                QVERIFY(worst <= 2);
+            } else {
+                qInfo("FFmpeg's VMX decoder does not take OMT's profiles");
+            }
+            av_frame_free(&fr);
+            av_packet_free(&pkt);
+            avcodec_free_context(&c);
+        }
+
+        // Montage to Montage over loopback: a second of 1080p50 sent by the OMT reference output, every frame received
+        // in order above 40 dB, the sound sample for sample and the timecode with each picture.
+        const auto backend = findBackend("OMT");
+        QVERIFY(backend && backend->available());
+        const std::vector<Device> devs = backend->devices();
+        QCOMPARE(int(devs.size()), 1);
+        QCOMPARE(QString::fromStdString(devs[0].id), QStringLiteral("Montage"));
+        Signal sig;
+        sig.format = PixelFormat::P216;
+        QVERIFY(backend->open(devs[0], Mode{"1080p50", W, H, {50, 1}, false, 0}, sig, 2, 48000, &why));
+        const QString address = QString::fromStdString(backend->address());
+        QVERIFY2(address.startsWith(QStringLiteral("omt://") + QString::fromStdString(host) + ":"), qPrintable(address));
+        omt::Receiver rx;
+        omt::Receiver::Options ro;
+        ro.queue = 1000;
+        QVERIFY2(rx.open("omt://127.0.0.1:" + address.section(':', -1).toStdString(), ro, &why), why.c_str());
+        for (int i = 0; i < 200 && backend->receivers() < 2; ++i) QThread::msleep(10);
+        QCOMPARE(backend->receivers(), 2);  // (its picture's connection and its sound's)
+        QVERIFY(QString::fromStdString(rx.senderInfo()).contains("ProductName=\"Montage\""));
+        const int frames = 50, spf = 960;
+        const FrameTime tc0 = 3600 * 50;  // 01:00:00:00 at 50p
+        std::vector<std::vector<uint8_t>> sentPictures;
+        std::vector<float> sentSound;
+        for (int t = 0; t < frames; ++t) {
+            sentPictures.push_back(picture(t));
+            VideoFrame vf;
+            vf.width = W, vf.height = H, vf.stride = size_t(W) * 2, vf.format = PixelFormat::P216;
+            vf.data = sentPictures.back().data();
+            vf.fps = {50, 1};
+            vf.timecodeFrame = tc0 + t;
+            vf.timecode = timecodeOf(tc0 + t, {50, 1});
+            std::vector<float> sound(size_t(spf) * 2);
+            for (int i = 0; i < spf; ++i) {
+                const int n = t * spf + i;
+                sound[size_t(i) * 2] = std::sin(float(n) * 0.0573f) * 0.5f;
+                sound[size_t(i) * 2 + 1] = t < 10 ? 0.0f : float(n % 1000) / 1000.0f;  // (silent at first: left out)
+            }
+            sentSound.insert(sentSound.end(), sound.begin(), sound.end());
+            Audio a{sound.data(), spf, 2, 48000};
+            QVERIFY(backend->send(vf, a));
+            // (the pictures checked later: only the last few kept)
+            if (t >= 3) sentPictures[size_t(t) - 3].clear();
+        }
+        // Received: pictures in order, a frame period apart, each with its timecode.
+        std::vector<float> heard;
+        int pictures = 0, sounds = 0;
+        int64_t lastPicture = -1, nextSoundAt = -1;
+        std::vector<uint8_t> got(still.size());
+        QElapsedTimer clock;
+        clock.start();
+        while ((pictures < frames || sounds < frames) && clock.elapsed() < 10000) {
+            omt::Frame f;
+            if (!rx.next(f, 200)) continue;
+            if (f.header.type == omt::Video) {
+                QCOMPARE(f.header.timestamp, (tc0 + pictures) * 200000);
+                if (lastPicture >= 0) QCOMPARE(f.header.timestamp - lastPicture, int64_t(200000));
+                lastPicture = f.header.timestamp;
+                QVERIFY(f.video.width == W && f.video.height == H && f.video.rateN == 50 && f.video.rateD == 1);
+                QVERIFY(f.video.flags & omt::HighBitDepth);
+                QCOMPARE(f.video.colorSpace, 709);
+                QCOMPARE(QString::fromStdString(omt::xmlAttribute(f.metadata, "transfer")), QStringLiteral("bt_709"));
+                const QString tc = QString::fromStdString(omt::xmlAttribute(f.metadata.substr(f.metadata.find("<montage_timecode")), "value"));
+                QCOMPARE(tc, QStringLiteral("01:00:00:%1").arg(pictures, 2, 10, QLatin1Char('0')));
+                if (pictures >= frames - 3 || pictures % 10 == 0) {
+                    const std::vector<uint8_t> expect = pictures >= frames - 3 ? sentPictures[size_t(pictures)] : picture(pictures);
+                    QVERIFY(dec.decode(f.data.data(), f.data.size(), W, H, 709, omt::PictureFormat::P216, got.data(), W * 2));
+                    const double db = psnr(expect, got.data());
+                    if (pictures == 0) qInfo("Received at %.1f dB", db);
+                    QVERIFY2(db > 40, qPrintable(QString::number(db)));
+                }
+                ++pictures;
+            } else if (f.header.type == omt::Audio) {
+                QVERIFY(f.audio.channels == 2 && f.audio.sampleRate == 48000 && f.audio.samplesPerChannel == spf);
+                QCOMPARE(f.audio.activeChannels, sounds < 10 ? 1u : 3u);
+                if (nextSoundAt >= 0) QCOMPARE(f.header.timestamp, nextSoundAt);
+                nextSoundAt = f.header.timestamp + int64_t(spf) * 10000000 / 48000;
+                std::vector<float> planar(size_t(spf) * 2);
+                QVERIFY(omt::decodeFpa1(f.data.data(), f.data.size(), 2, spf, f.audio.activeChannels, planar.data()));
+                for (int i = 0; i < spf; ++i) heard.push_back(planar[size_t(i)]), heard.push_back(planar[size_t(spf + i)]);
+                ++sounds;
+            }
+        }
+        QCOMPARE(pictures, frames);
+        QCOMPARE(sounds, frames);
+        QVERIFY(heard == sentSound);
+        QCOMPARE(rx.framesDropped(), int64_t(0));
+        backend->close();
+        rx.close();
+        QCOMPARE(backend->receivers(), -1);
+        QVERIFY(backend->address().empty());
+
+        // A sender of its own: the receivers' tally taken together, and a preview (the start of each picture) for a
+        // receiver that asks for one.
+        omt::Sender tx;
+        omt::Sender::Options so;
+        so.name = "Tally test";
+        so.announce = false;
+        QVERIFY2(tx.start(so, &why), why.c_str());
+        QVERIFY(tx.port() >= omt::kPortStart && tx.port() <= omt::kPortEnd);
+        QCOMPARE(QString::fromStdString(tx.fullName()), QString::fromStdString(host + " (Tally test)"));
+        omt::Receiver a, b;
+        omt::Receiver::Options va;
+        va.audio = false;
+        const std::string url = "omt://127.0.0.1:" + std::to_string(tx.port());
+        QVERIFY2(a.open(url, va, &why), why.c_str());
+        va.preview = true;
+        QVERIFY2(b.open(url, va, &why), why.c_str());
+        auto waitFor = [](const std::function<bool()>& f) {
+            for (int i = 0; i < 300 && !f(); ++i) QThread::msleep(10);
+            return f();
+        };
+        QVERIFY(waitFor([&] { return tx.connections() == 2; }));
+        QVERIFY(!tx.tallyProgram() && !tx.tallyPreview());
+        a.setTally(false, true);
+        QVERIFY(waitFor([&] { return tx.tallyProgram(); }));
+        QVERIFY(!tx.tallyPreview());
+        b.setTally(true, false);
+        QVERIFY(waitFor([&] { return tx.tallyPreview() && tx.tallyProgram(); }));
+        a.close();  // (its tally goes with it)
+        QVERIFY(waitFor([&] { return !tx.tallyProgram() && tx.connections() == 1; }));
+        QVERIFY(tx.tallyPreview());
+        omt::VideoOut vo;
+        vo.width = W, vo.height = H, vo.stride = W * 2, vo.data = still.data(), vo.rateN = 50, vo.timestamp = 7;
+        vo.metadata = "<x/>";
+        QVERIFY(tx.sendVideo(vo));
+        omt::Frame pf;
+        QVERIFY(b.next(pf, 3000) && pf.header.type == omt::Video);
+        QVERIFY(pf.video.flags & omt::Preview);
+        QVERIFY(pf.data.size() > 1000 && pf.data.size() < mediumBytes);
+        QCOMPARE(QString::fromStdString(pf.metadata), QStringLiteral("<x/>"));
+        QCOMPARE(pf.header.timestamp, int64_t(7));
+        b.close();
+        tx.stop();
+#endif
+    }
+
+    void omtDiscovery() {
+#ifndef MONTAGE_WITH_OMT
+        QSKIP("Built without Open Media Transport");
+#else
+        namespace omt = montage::omt;
+        namespace net = montage::omt::net;
+        std::string why;
+        if (!omt::vmxAvailable(&why)) QSKIP(why.c_str());
+        // A discovery server of the test's own, as OMT's works: it keeps what sources register (with the address it
+        // sees them at), tells every client of each change, and tells a client that subscribes all it has.
+        int serverPort = 0;
+        const net::Socket listener = net::listenOnFirstFree(16399, 16499, &serverPort, &why);
+        QVERIFY2(listener != net::kInvalid, why.c_str());
+        const QByteArray serverUrl = "omt://127.0.0.1:" + QByteArray::number(serverPort);
+        qputenv("MONTAGE_OMT_DISCOVERY_SERVER", serverUrl);
+        QCOMPARE(QString::fromStdString(omt::discoveryServer()), QString::fromLatin1(serverUrl));
+        std::mutex m;
+        std::vector<std::string> registrations;  // as sent to the server
+        std::map<std::string, std::string> known;
+        std::vector<net::Socket> clients, allSockets;
+        std::vector<std::thread> threads;
+        std::atomic<bool> stop{false};
+        auto frameOf = [](const std::string& xml) {
+            std::vector<uint8_t> f(omt::kHeaderBytes + xml.size());
+            omt::Header h;
+            h.dataLength = int32_t(xml.size());
+            omt::writeHeader(h, f.data());
+            std::memcpy(f.data() + omt::kHeaderBytes, xml.data(), xml.size());
+            return f;
+        };
+        auto serve = [&](net::Socket c) {
+            uint8_t head[omt::kHeaderBytes];
+            omt::Header h;
+            std::vector<uint8_t> body;
+            while (net::recvAll(c, head, omt::kHeaderBytes) && omt::readHeader(head, h)) {
+                body.resize(size_t(h.dataLength));
+                if (h.dataLength && !net::recvAll(c, body.data(), body.size())) break;
+                const std::string text(body.begin(), body.end());
+                std::lock_guard lock(m);
+                if (text == omt::subscribeCommand(omt::Metadata)) {
+                    clients.push_back(c);
+                    for (const auto& [n, x] : known) {
+                        const auto f = frameOf(x);
+                        net::sendAll(c, f.data(), f.size());
+                    }
+                } else if (text.rfind("<OMTAddress", 0) == 0) {
+                    registrations.push_back(text);
+                    omt::Source src;
+                    bool removed = false;
+                    if (!omt::parseAddressXml(text, src, removed)) continue;
+                    const std::string x = omt::addressXml(src.name, src.port, removed ? std::vector<std::string>{} : std::vector<std::string>{"::ffff:127.0.0.1"}, removed);
+                    if (removed) known.erase(src.name);
+                    else known[src.name] = x;
+                    const auto f = frameOf(x);
+                    for (net::Socket o : clients) net::sendAll(o, f.data(), f.size());
+                }
+            }
+            std::lock_guard lock(m);
+            clients.erase(std::remove(clients.begin(), clients.end(), c), clients.end());
+        };
+        std::thread server([&] {
+            while (!stop) {
+                const net::Socket c = net::acceptWithin(listener, 50);
+                if (c == net::kInvalid) continue;
+                std::lock_guard lock(m);
+                allSockets.push_back(c);
+                threads.emplace_back([&, c] { serve(c); });
+            }
+        });
+        // The server stopped once, here or when a check fails (its threads joined, so a failure fails only this test).
+        bool serverDown = false;
+        auto stopServer = [&] {
+            if (serverDown) return;
+            serverDown = true;
+            stop = true;
+            server.join();
+            {
+                std::lock_guard lock(m);
+                for (net::Socket c : allSockets) net::shutdownSocket(c);
+            }
+            for (std::thread& t : threads) t.join();
+            for (net::Socket c : allSockets) net::closeSocket(c);
+            net::closeSocket(listener);
+            qunsetenv("MONTAGE_OMT_DISCOVERY_SERVER");
+        };
+        const auto serverGuard = qScopeGuard(stopServer);
+        auto waitFor = [](const std::function<bool()>& f) {
+            for (int i = 0; i < 300 && !f(); ++i) QThread::msleep(10);
+            return f();
+        };
+        // A source registers with the server (not by DNS-SD) and is found through it, at the address the server saw.
+        omt::Sender tx;
+        omt::Sender::Options so;
+        so.name = "Discovery test";
+        QVERIFY2(tx.start(so, &why), why.c_str());
+        QCOMPARE(QString::fromStdString(tx.announcement()), QStringLiteral("discovery server ") + QString::fromLatin1(serverUrl));
+        QVERIFY(waitFor([&] { std::lock_guard lock(m); return registrations.size() == 1; }));
+        omt::Source reg;
+        bool removed = true;
+        {
+            std::lock_guard lock(m);
+            QVERIFY(omt::parseAddressXml(registrations[0], reg, removed));
+        }
+        QVERIFY(!removed && reg.name == tx.fullName() && reg.port == tx.port());
+        std::vector<omt::Source> found = omt::discover(1.0, &why);
+        const auto it = std::find_if(found.begin(), found.end(), [&](const omt::Source& s) { return s.name == tx.fullName(); });
+        QVERIFY(it != found.end());
+        QVERIFY(it->host == "127.0.0.1" && it->port == tx.port() && it->via == "discovery server");
+        // A receiver finds it by name.
+        omt::Receiver rx;
+        omt::Receiver::Options ro;
+        ro.audio = false;
+        QVERIFY2(rx.open(tx.fullName(), ro, &why), why.c_str());
+        QVERIFY(rx.connected());
+        QCOMPARE(QString::fromStdString(rx.address()), QStringLiteral("127.0.0.1:%1").arg(tx.port()));
+        rx.close();
+        // Gone, it is taken off the server's list.
+        tx.stop();
+        QVERIFY(waitFor([&] { std::lock_guard lock(m); return registrations.size() == 2; }));
+        {
+            std::lock_guard lock(m);
+            QVERIFY(omt::parseAddressXml(registrations[1], reg, removed) && removed);
+        }
+        found = omt::discover(0.5, &why);
+        QVERIFY(std::none_of(found.begin(), found.end(), [&](const omt::Source& s) { return s.name == reg.name; }));
+        stopServer();
+
+        // DNS-SD, where it runs here (Avahi's daemon on Linux).
+        if (!omt::dnsSdAvailable(&why)) {
+            qInfo("DNS-SD not checked: %s", why.c_str());
+            return;
+        }
+        so.name = "DNS-SD test";
+        QVERIFY2(tx.start(so, &why), why.c_str());
+        QVERIFY2(QString::fromStdString(tx.announcement()).startsWith("DNS-SD"), tx.announcement().c_str());
+        bool seen = false;
+        for (int i = 0; i < 5 && !seen; ++i)
+            for (const omt::Source& s : omt::discover(2.0, &why))
+                if (s.name == tx.fullName() && s.port == tx.port()) seen = true;
+        QVERIFY2(seen, why.c_str());
+        QVERIFY2(rx.open(tx.fullName(), ro, &why), why.c_str());
+        rx.close();
+        tx.stop();
+#endif
     }
 
     void deckLinkWithoutDriver() {

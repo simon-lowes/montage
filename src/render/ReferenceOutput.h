@@ -1,8 +1,9 @@
 // Montage — reference output: the program sent to a broadcast monitor through a video interface (SDI or HDMI on a
-// Blackmagic DeckLink card, or NDI over the network), as Resolve's video monitoring, Premiere's Mercury Transmit and
-// Media Composer's do: 10-bit 4:2:2, HDR signalled (PQ, HLG and their static metadata), embedded audio, timecode, and
-// offsets for a monitor's latency. Each interface is a Backend, its library loaded when it is used (none is linked);
-// a Scheduler feeds one at the device's own pace with the frames playback renders.
+// Blackmagic DeckLink card, or NDI or Open Media Transport over the network), as Resolve's video monitoring, Premiere's
+// Mercury Transmit and Media Composer's do: 10-bit 4:2:2, HDR signalled (PQ, HLG and their static metadata), embedded
+// audio, timecode, and offsets for a monitor's latency. Each interface is a Backend, its library loaded when it is
+// used (DeckLink's and NDI's; OMT's is built in); a Scheduler feeds one at the device's own pace with the frames
+// playback renders.
 #pragma once
 
 #include <atomic>
@@ -108,8 +109,10 @@ public:
     virtual void close() = 0;
     // Makes a `send` waiting for the device return (stopping).
     virtual void wake() {}
-    // Receivers connected (NDI); -1 when it does not know.
+    // Receivers connected (NDI, OMT); -1 when it does not know.
     virtual int receivers() { return -1; }
+    // Where receivers find it while open, when it is on the network by an address (OMT's omt://HOST:port); "" else.
+    virtual std::string address() { return {}; }
 };
 
 // What the user chose.
@@ -226,8 +229,9 @@ private:
 
 std::shared_ptr<Backend> makeNdiBackend();
 std::shared_ptr<Backend> makeDeckLinkBackend();
+std::shared_ptr<Backend> makeOmtBackend();  // (null in a build without Open Media Transport)
 
-// The interfaces Montage knows (NDI and DeckLink; and Virtual, a test device, with MONTAGE_VIRTUAL_OUTPUT set).
+// The interfaces Montage knows (DeckLink, NDI and OMT; and Virtual, a test device, with MONTAGE_VIRTUAL_OUTPUT set).
 std::vector<std::shared_ptr<Backend>> backends();
 std::shared_ptr<Backend> findBackend(const std::string& name);
 

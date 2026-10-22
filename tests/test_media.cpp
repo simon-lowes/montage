@@ -78,6 +78,10 @@
 #include "media/AutoDuck.h"
 #include "media/Breaths.h"
 #include "media/Capture.h"
+#ifdef MONTAGE_WITH_OMT
+#include "media/Omt.h"
+#include "render/VideoPacking.h"
+#endif
 #include "media/Mlv.h"
 #include "media/Decoder.h"
 #include "media/HwAccel.h"
@@ -1380,6 +1384,116 @@ private slots:
             QCOMPARE(m.width, 320);
             QVERIFY2(std::fabs(m.duration - 2.0) < 0.05, std::to_string(m.duration).c_str());
         }
+    }
+
+    void captureFromOmt() {
+#ifndef MONTAGE_WITH_OMT
+        QSKIP("Built without Open Media Transport");
+#else
+        std::string err;
+        if (!omt::vmxAvailable(&err)) QSKIP(err.c_str());
+        const std::vector<std::string> kinds = captureDeviceKinds();
+        QVERIFY(std::find(kinds.begin(), kinds.end(), "omt") != kinds.end());
+        // An OMT source sending 640x360 at 25p from 10:00:00:00, 16-bit, as Montage's reference output sends: each
+        // picture's blue its frame number (mod 25), a 1 kHz tone on the left channel and silence on the right.
+        omt::Sender tx;
+        omt::Sender::Options so;
+        so.name = "Capture test";
+        so.announce = false;
+        QVERIFY2(tx.start(so, &err), err.c_str());
+        const int W = 640, H = 360, spf = 1920;
+        auto picture = [&](int t) {
+            Image img(W, H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    float* p = img.at(x, y);
+                    p[0] = 0.1f + 0.8f * float(x) / W, p[1] = 0.1f + 0.8f * float(y) / H, p[2] = 0.2f + 0.6f * float(t % 25) / 24.0f, p[3] = 1;
+                }
+            std::vector<uint8_t> out(size_t(W) * H * 4);
+            video::packP216(video::toYcbcr422(img, video::YcbcrMatrix::Bt709), out.data(), size_t(W) * 2);
+            return out;
+        };
+        std::vector<std::vector<uint8_t>> pictures;
+        for (int t = 0; t < 25; ++t) pictures.push_back(picture(t));
+        auto tone = [](int64_t n) { return 0.5f * std::sin(float(2 * M_PI * 1000.0 * double(n % 48) / 48000.0)); };
+        std::atomic<bool> stop{false};
+        std::thread sending([&] {
+            auto next = std::chrono::steady_clock::now();
+            for (int t = 0; !stop && t < 25 * 20; ++t) {
+                const int64_t ts = (int64_t(36000) * 25 + t) * 400000;  // (100 ns, from the timecode)
+                std::vector<float> planar(size_t(spf) * 2, 0.0f);
+                for (int i = 0; i < spf; ++i) planar[size_t(i)] = tone(int64_t(t) * spf + i);
+                tx.sendAudio(planar.data(), 2, spf, spf, 48000, ts);
+                omt::VideoOut v;
+                v.width = W, v.height = H, v.stride = W * 2, v.data = pictures[size_t(t % 25)].data(), v.rateN = 25, v.rateD = 1;
+                v.timestamp = ts;
+                char tc[32];
+                std::snprintf(tc, sizeof tc, "10:00:%02d:%02d", t / 25, t % 25);
+                v.metadata = std::string("<ndi_color_info transfer=\"bt_709\" matrix=\"bt_709\" primaries=\"bt_709\"/><montage_timecode value=\"") + tc + "\"/>";
+                tx.sendVideo(v);
+                next += std::chrono::milliseconds(40);
+                std::this_thread::sleep_until(next);
+            }
+        });
+        // Recorded for two seconds by its address, with the source's timecode.
+        CaptureSettings cs;
+        cs.video.device = "omt";
+        cs.video.url = "omt://127.0.0.1:" + std::to_string(tx.port());
+        cs.path = path("capture-omt.mov");
+        cs.seconds = 2;
+        Recorder rec;
+        QVERIFY2(rec.start(cs, &err), err.c_str());
+        const bool ended = rec.wait(20);
+        stop = true;
+        sending.join();
+        tx.stop();
+        QVERIFY(ended);
+        const CaptureStatus st = rec.status();
+        QVERIFY2(st.error.empty(), st.error.c_str());
+        QCOMPARE(st.frames, int64_t(50));
+        QVERIFY(st.width == W && st.height == H && st.fps == 25 && st.channels == 2);
+        QVERIFY2(QString::fromStdString(st.timecode).startsWith("10:00:"), st.timecode.c_str());
+        const int first = std::stoi(st.timecode.substr(6, 2)) * 25 + std::stoi(st.timecode.substr(9, 2));  // (the source's frame)
+        MediaItem m;
+        QVERIFY(probeMedia(cs.path, m, &err));
+        QCOMPARE(m.videoCodec, std::string("prores"));
+        QVERIFY(std::fabs(m.duration - 2.0) < 0.05);
+        QVERIFY(std::fabs(m.timecode - (36000.0 + first / 25.0)) < 1e-6);
+        QVERIFY(m.hasAudio && m.channels == 2 && m.sampleRate == 48000);
+        // Every picture, in order: the right one at each frame (its blue), and the picture itself close to what was sent.
+        VideoDecoder dec;
+        QVERIFY(dec.open(cs.path));
+        for (int k : {0, 1, 2, 3, 24, 25, 48, 49}) {
+            const Frame16Ptr f = dec.frameAt((k + 0.5) / 25.0);
+            QVERIFY(f && f->width == W);
+            const Image img = toImage(*f);
+            const float blue = img.at(W / 2, H / 2)[2];
+            QVERIFY2(std::fabs(blue - (0.2f + 0.6f * float((first + k) % 25) / 24.0f)) < 0.006, qPrintable(QStringLiteral("frame %1: %2").arg(k).arg(blue)));
+            QVERIFY(std::fabs(img.at(W / 4, H / 4)[0] - (0.1f + 0.8f * 0.25f)) < 0.01);
+        }
+        // The sound placed to the sample: the recording's sample s is the source's sample (first frame's) + s.
+        AudioBufferPtr heard = decodeAudio(cs.path, 48000, &err);
+        QVERIFY2(heard, err.c_str());
+        QCOMPARE(heard->frames(), int64_t(96000));
+        double worst = 0, right = 0;
+        for (int64_t s = 2 * spf; s < 96000; ++s) {
+            worst = std::max(worst, double(std::fabs(heard->samples[size_t(s) * 2] - tone(int64_t(first) * spf + s))));
+            right = std::max(right, double(std::fabs(heard->samples[size_t(s) * 2 + 1])));
+        }
+        QVERIFY2(worst < 1e-4, qPrintable(QString::number(worst)));
+        QVERIFY(right < 1e-6);
+
+        // A source that is not there: given up, nothing written.
+        CaptureSettings none = cs;
+        none.video.url = "omt://127.0.0.1:" + std::to_string(tx.port() == 6600 ? 6599 : 6600);
+        none.path = path("capture-omt-none.mov");
+        none.openTimeout = 2;
+        Recorder never;
+        QVERIFY(never.start(none, &err));
+        QVERIFY(never.wait(15));
+        QVERIFY(!never.status().error.empty());
+        QVERIFY(!QFile::exists(QString::fromStdString(none.path)));
+#endif
     }
 
     void magicLanternVideo() {
