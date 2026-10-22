@@ -182,9 +182,11 @@ private:
     // surround mix, `fieldChannels` wide), ambisonic clips (and nested ambisonic sequences) add their turned field
     // there (an ambisonic mix's channels, or decoded to a speaker layout's) over [fieldStart, fieldStart + frames)
     // instead of being heard as stereo: the field passes no stereo inserts, so it is read where the mix after them is
-    // (the master's latency ahead) rather than as far ahead as the track's sound.
+    // (the master's latency ahead) rather than as far ahead as the track's sound. With `dialogueBuf`, Dialogue-role
+    // clips go there rather than into trackBuf (an upmixed track keeps them in the centre).
     bool mixTrackClips(const Project& p, const Sequence& seq, const Track& track, int64_t start, int frames, double sr,
-                       int depth, float* trackBuf, float* trackField = nullptr, int64_t fieldStart = 0, int fieldChannels = 0);
+                       int depth, float* trackBuf, float* trackField = nullptr, int64_t fieldStart = 0, int fieldChannels = 0,
+                       float* dialogueBuf = nullptr);
     // Latency (samples) of a chain's plugins, loading them if needed; and the largest in a sequence.
     int chainLatency(const std::vector<Effect>& chain, Id owner, double sr);
     int maxLatency(const Sequence& seq, double sr);
@@ -215,6 +217,7 @@ private:
     std::map<std::pair<Id, Id>, std::unique_ptr<State>> states_;
     std::mutex m_;
     bool nonBlocking_ = false;
+    Id skipUpmix_ = 0;  // the Upmix processChain leaves out (mixInto runs it, into the speakers)
     bool offlineProxies_ = false;
     std::vector<bool> mask_, lfeOnly_;
     bool ambisonicBinaural_ = false;

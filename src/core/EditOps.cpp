@@ -31,9 +31,10 @@ void shiftParamKeys(Effect& e, FrameTime delta) {
 
 bool editable(const Track* t) { return t && !t->locked; }
 
-// Source-bound helpers for a clip (in source frames).
-double srcLow(const Clip& c) { return c.sourceIn; }
-double srcHigh(const Clip& c) { return c.sourceIn + c.sourceExtent(); }
+// Source-bound helpers for a clip (in source frames): what it plays, less the silent part of its first and last frame
+// when its sound sits between frames.
+double srcLow(const Clip& c) { return c.sourceIn + (c.reverse ? c.tail : c.head) * c.speed; }
+double srcHigh(const Clip& c) { return c.sourceIn + c.sourceExtent() - (c.reverse ? c.head : c.tail) * c.speed; }
 
 }  // namespace
 
@@ -162,8 +163,8 @@ Clip subClip(const Clip& c, FrameTime from, FrameTime to) {
         out.sourceIn = c.sourceIn + c.sourceOffset(double(from - c.start));  // follows a speed ramp
     shiftKeyframes(out, -(from - c.start));
     // A part that no longer starts (ends) where the clip did loses its entrance (exit) animation.
-    if (from > c.start) out.animIn = {};
-    if (to < c.end()) out.animOut = {};
+    if (from > c.start) out.animIn = {}, out.head = 0;
+    if (to < c.end()) out.animOut = {}, out.tail = 0;
     return out;
 }
 
@@ -936,8 +937,9 @@ Result slip(Project& p, Sequence& s, Id clipId, FrameTime delta) {
         FrameTime limit = sourceLimit(p, s, *c);
         const double sp = c->speedAt(0) > 1e-9 ? c->speedAt(0) : 1.0;  // a held frame slips frame by frame
         double shift = double(delta) * sp;
-        if (limit < kInfiniteFrames) shift = std::clamp(shift, -c->sourceIn, double(limit) - srcHigh(*c));
-        else shift = std::max(shift, -c->sourceIn);
+        const double lo = -srcLow(*c), hi = double(limit) - srcHigh(*c);
+        if (limit < kInfiniteFrames) shift = lo <= hi ? std::clamp(shift, lo, hi) : 0.0;
+        else shift = std::max(shift, lo);
         c->sourceIn += shift;
         if (id == clipId) res.applied = FrameTime(std::llround(shift / sp));
     }
@@ -2708,7 +2710,7 @@ bool isThrough(const Track& t, size_t i) {
     if (a.effects.size() != b.effects.size()) return false;
     for (size_t k = 0; k < a.effects.size(); ++k)
         if (a.effects[k].type != b.effects[k].type) return false;
-    if (std::fabs(b.sourceIn - (a.sourceIn + a.sourceExtent())) > 1e-3) return false;
+    if (std::fabs(b.sourceIn - (a.sourceIn + a.sourceExtent())) > 1e-6 || a.tail != 0 || b.head != 0) return false;
     for (const Transition& tr : t.transitions)
         if (tr.clipA == a.id && tr.clipB == b.id) return false;
     return true;
@@ -2719,6 +2721,7 @@ void mergeWithNext(Track& t, size_t i) {
     Clip& a = t.clips[i];
     const Clip b = t.clips[i + 1];
     a.duration += b.duration;
+    a.tail = b.tail;
     for (const Marker& m : b.markers)
         if (std::find(a.markers.begin(), a.markers.end(), m) == a.markers.end()) a.markers.push_back(m);
     t.clips.erase(t.clips.begin() + long(i) + 1);
@@ -2858,6 +2861,99 @@ Result finalizeAudition(Project&, Sequence& s, Id clipId) {
     if (!c || c->takes.empty()) return Result::fail("That clip is not an audition");
     c->takes.clear();
     c->take = 0;
+    return {};
+}
+
+Result placeSoundRange(Project& p, Sequence& s, Id mediaId, FrameTime at, int64_t first, int64_t count, int rate, TrackRef audioTrack,
+                       bool insertMode) {
+    if (count <= 0 || rate <= 0 || first < 0) return Result::fail("Nothing to place");
+    const MediaItem* m = p.findMedia(mediaId);
+    if (!m || !m->hasAudio || m->kind == MediaKind::Image) return Result::fail("The media has no sound");
+    if (!editable(trackAt(s, audioTrack))) return Result::fail("No unlocked target track for this media");
+    // Built here rather than by placeMedia, which ends a clip at the media's last whole frame: a stretch running to
+    // the end of its file takes the frame its last samples fall in, the rest of that frame silent.
+    const double fps = s.fpsValue();
+    const double in = double(first) * fps / rate, length = double(count) * fps / rate;
+    const FrameTime frames = std::max<FrameTime>(1, FrameTime(std::ceil(length - 1e-9)));
+    Clip c = makeClip(p, *m, TrackKind::Audio, s);
+    c.id = p.newId();
+    c.start = std::max<FrameTime>(0, at);
+    c.sourceIn = in;
+    c.duration = frames;
+    c.tail = std::clamp(double(frames) - length, 0.0, 1.0 - 1e-9);
+    c.channels = newClipChannels(*m);
+    if (insertMode) rippleOpen(p, s, c.start, frames, rippleTracks(s, {audioTrack}));
+    Result r = overwrite(p, s, audioTrack, c);
+    if (r.ok && (m->audioChannelMode == kChannelsMono || m->audioChannelMode == kChannelsPairs) && sourceChannelCount(*m) > 1) {
+        const Result split = splitAudioChannels(p, s, c.id, m->audioChannelMode == kChannelsPairs);
+        r.created.insert(r.created.end(), split.created.begin(), split.created.end());
+    }
+    return r;
+}
+
+Result editSoundSamples(const Project& p, Sequence& s, Id clip, SampleEdit what, int64_t samples, int rate) {
+    const auto loc = locate(s, clip);
+    if (!loc || loc->track.kind != TrackKind::Audio) return Result::fail("Only sound clips can be edited by samples");
+    Track* t = trackAt(s, loc->track);
+    if (!editable(t)) return Result::fail("The track is locked");
+    const Clip c = t->clips[loc->index];
+    if (c.ramped()) return Result::fail("A clip with a speed ramp cannot be edited by samples");
+    if (rate <= 0) return Result::fail("No sample rate");
+    const double fps = s.fpsValue(), d = double(samples) * fps / rate, one = fps / rate;
+    double from = soundStart(c), to = soundEnd(c), slip = 0, keyShift = 0;
+    switch (what) {
+        case SampleEdit::Move: from += d, to += d, keyShift = d; break;
+        case SampleEdit::TrimStart: from += d; break;
+        case SampleEdit::TrimEnd: to -= d; break;
+        case SampleEdit::Slip: slip = d; break;
+    }
+    if (to - from < one * 0.5) return Result::fail("That leaves no sound");
+    if (from < -1e-9) return Result::fail("That would start before the sequence does");
+    for (const Transition& tr : t->transitions)
+        if (tr.clipA == c.id || tr.clipB == c.id) return Result::fail("Remove its transitions first");
+    // What plays at a timeline time, before and after (the content moves with a move, else stays).
+    const auto sourceAt = [](const Clip& cl, double time) { return cl.sourceAt(time - double(cl.start)); };
+    Clip out = c;
+    constexpr double eps = 1e-7;
+    out.start = FrameTime(std::floor(from + eps));
+    const FrameTime endCell = FrameTime(std::ceil(to - eps));
+    out.duration = std::max<FrameTime>(1, endCell - out.start);
+    out.head = std::clamp(from - double(out.start), 0.0, 0.999999);
+    out.tail = std::clamp(double(out.end()) - to, 0.0, 0.999999);
+    out.sourceIn = 0;
+    out.sourceIn = sourceAt(c, from - keyShift) + slip - sourceAt(out, from);
+    if (const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr; m && m->duration > 0) {
+        const double a = std::min(sourceAt(out, from), sourceAt(out, to)), b = std::max(sourceAt(out, from), sourceAt(out, to));
+        if (a < -one * 0.5 || b > m->duration * fps + one * 0.5) return Result::fail("That runs past the end of its media");
+    }
+    if (out.start != c.start || out.end() != c.end()) {
+        for (size_t i = 0; i < t->clips.size(); ++i)
+            if (i != loc->index && t->clips[i].start < out.end() && out.start < t->clips[i].end())
+                return Result::fail("There is another clip in the way");
+    }
+    // Keys stay where they are on the timeline, or move with the sound (to a fraction of a frame); an expression's
+    // time keeps counting from where it did. Two keys may not come to share a frame.
+    const double shift = keyShift - double(out.start - c.start);
+    bool collide = false;
+    auto shiftKeys = [&](Effect& e) {
+        for (auto& [name, param] : e.params) {
+            for (Keyframe& k : param.keys) {
+                const double time = k.time() + shift;
+                k.t = FrameTime(std::floor(time + eps));
+                k.sub = std::clamp(time - double(k.t), 0.0, 0.999999);
+                if (k.sub < eps) k.sub = 0;
+            }
+            for (size_t i = 1; i < param.keys.size(); ++i) collide = collide || param.keys[i].t == param.keys[i - 1].t;
+            if (!param.expr.empty()) param.exprFrom -= out.start - c.start;
+        }
+    };
+    if (shift != 0) {
+        shiftKeys(out.audio);
+        for (Effect& e : out.effects) shiftKeys(e);
+        if (collide) return Result::fail("Two of its keys would fall on one frame");
+    }
+    t->clips[loc->index] = out;
+    normalize(*t);
     return {};
 }
 

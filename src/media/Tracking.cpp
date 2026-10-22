@@ -171,8 +171,7 @@ GrayImage toGray(const Frame16& f) {
     g.px.resize(size_t(f.width) * size_t(f.height));
     const float k = 1.0f / 65535.0f;
     for (size_t i = 0; i < g.px.size(); ++i) {
-        const uint16_t* p = &f.px[i * 4];
-        g.px[i] = (0.2126f * p[0] + 0.7152f * p[1] + 0.0722f * p[2]) * k;
+        g.px[i] = (0.2126f * f.code(i * 4) + 0.7152f * f.code(i * 4 + 1) + 0.0722f * f.code(i * 4 + 2)) * k;
     }
     return g;
 }

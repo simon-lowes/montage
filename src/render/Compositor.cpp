@@ -4,6 +4,7 @@
 #include "Ofx.h"
 
 #include "core/ColorGroups.h"
+#include "core/FilmCount.h"
 #include "core/Expression.h"
 #include "core/GradeGraph.h"
 #include "GradeGraph.h"
@@ -31,12 +32,14 @@
 #include <tuple>
 
 #include "AudioFx.h"
+#include "audio/Upmix.h"
 #include "ColorSpace.h"
 #include "Exporter.h"
 #include "GpuCompositor.h"
 #include "Processing.h"
 #include "Restoration.h"
 #include "FilmScan.h"
+#include "FrameRepair.h"
 #include "Retime.h"
 #include "Shapes.h"
 #include "Title3D.h"
@@ -941,7 +944,7 @@ struct ClipSource {
 bool ranOnSourceFirst(const std::string& type) {
     static const std::set<std::string> types = {"video_denoise", "super_scale", "motion_deblur", "reframe_360", "redact_faces",
                                                 "stereo_3d",     "dirt_removal", "dust_spots",   "lip_sync",    "motion_blur",
-                                                "deflicker",     "fade_restore", "film_negative", "perf_lock"};
+                                                "deflicker",     "fade_restore", "film_negative", "perf_lock",  "frame_repair"};
     return types.count(type) > 0;
 }
 
@@ -1121,8 +1124,9 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 if (!ofxFetch && !(sampling > 0 && m->kind == MediaKind::Video) && !denoiseEffect(seq, c) &&
                     !enabledEffect(seq, c, "motion_deblur") && !enabledEffect(seq, c, "motion_blur") && !enabledEffect(seq, c, "deflicker") &&
                     !enabledEffect(seq, c, "fade_restore") && !enabledEffect(seq, c, "film_negative") && !enabledEffect(seq, c, "perf_lock") &&
+                    !enabledEffect(seq, c, "frame_repair") &&
                     !enabledEffect(seq, c, "dirt_removal") && !enabledEffect(seq, c, "dust_spots") && !enabledEffect(seq, c, "lip_sync") &&
-                    !upscale && !vr && !sourceStageLooks(c, lt, from, *m)) {
+                    !upscale && !vr && !sourceStageLooks(c, lt, from, *m) && !f->half) {  // (half floats: the CPU keeps them)
                     out.frame = f;
                     out.frameSpace = &from;
                     return true;
@@ -1131,6 +1135,22 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             src = toImage(*f);
             Image decoded;  // the source frame itself, when src is an in-between (and noise reduction needs it)
             bool between = false;  // src is an in-between
+            // Frame Repair (render/FrameRepair.h) before anything: a broken source frame rebuilt from the good ones either side
+            // (the frame itself, or both an in-between of slow motion is made from).
+            const Effect* fr = m->kind == MediaKind::Video && m->fps.valid() ? enabledEffect(seq, c, "frame_repair") : nullptr;
+            const std::map<int64_t, FrameDamage> damaged = fr ? damagedFramesFromString(fr->s("frames")) : std::map<int64_t, FrameDamage>();
+            auto repair = [&](int64_t n, Image& img) {
+                if (!damaged.count(n)) return false;
+                const double mf = m->fps.toDouble();
+                auto fetch = [&](int64_t i, Image& into) {
+                    const double at = (double(i) + 0.25) / mf;
+                    if (at < 0 || at >= m->duration) return false;
+                    Frame16Ptr nf = MediaPool::instance().videoFrame(path, at, w, h, o.highQuality);
+                    if (nf) into = toImage(*nf);
+                    return bool(nf);
+                };
+                return repairFrame(damaged, n, img, fetch, path + '@' + std::to_string(w) + 'x' + std::to_string(h), fr->p("show", lt, 0) > 0.5);
+            };
             // Slow motion between two source frames: blend them or follow the motion.
             const int sampling = c.timing.empty() ? 0 : int(c.timing.p("sampling", lt, 0));
             if (sampling > 0 && m->kind == MediaKind::Video && m->fps.valid()) {
@@ -1142,8 +1162,10 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     if (fa && fb) {
                         between = true;
                         if (denoiseEffect(seq, c)) decoded = src;
-                        const Image a = toImage(*fa), b = toImage(*fb);
-                        const std::string pair = path + '#' + std::to_string(int64_t(base)) + '@' + std::to_string(w) + 'x' + std::to_string(h);
+                        Image a = toImage(*fa), b = toImage(*fb);
+                        const bool repairedA = repair(int64_t(base), a), repairedB = repair(int64_t(base) + 1, b);
+                        const std::string pair = path + '#' + std::to_string(int64_t(base)) + '@' + std::to_string(w) + 'x' + std::to_string(h) +
+                                                 (repairedA || repairedB ? "+repaired" : "");
                         // AI frames when RIFE is here, else optical flow.
                         Image ai;
                         if (sampling == 1) src = blendFrames(a, b, frac);
@@ -1152,6 +1174,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     }
                 }
             }
+            if (fr && !between) repair(int64_t(std::floor(sec * m->fps.toDouble() + 1e-6)), src);
             // Steady on Perforations (render/FilmScan.h) first, so the frame is held still before anything else sees it.
             if (const Effect* pl = enabledEffect(seq, c, "perf_lock")) applyPerfLock(*pl, lt, src);
             // Dirt Removal and Dust Spot Removal (render/Restoration.h), each one on the clip in its order, from the source
@@ -2623,17 +2646,31 @@ void drawBurnIns(Image& img, const Project& p, const Sequence& seq, FrameTime t,
     }
     QStringList lines;
     if (b.timecode) lines << QString::fromStdString(formatTimecode(timecode >= 0 ? timecode : t, seq.fps, dropFrame));
-    if (b.clipName) {
-        for (int i = int(seq.videoTracks.size()) - 1; i >= 0; --i) {
-            if (seq.videoTracks[size_t(i)].muted) continue;
-            if (const Clip* c = edit::clipAt(seq, TrackRef{TrackKind::Video, i}, t); c && c->enabled) {
-                std::string name = c->name;
-                if (name.empty())
-                    if (const MediaItem* m = c->mediaId ? p.findMedia(c->mediaId) : nullptr) name = m->name;
-                lines << QString::fromStdString(name);
-                break;
-            }
+    const FilmGauge& gauge = filmGauge(seq.filmGauge);
+    if (b.footage) lines << QString::fromStdString(formatFeetFrames(t, gauge));
+    // The top clip (its name), and the top one with footage (its film numbers: a title over the picture has none).
+    const Clip* top = nullptr;
+    const Clip* film = nullptr;
+    const MediaItem* filmMedia = nullptr;
+    for (int i = int(seq.videoTracks.size()) - 1; i >= 0 && !film; --i) {
+        if (seq.videoTracks[size_t(i)].muted) continue;
+        const Clip* c = edit::clipAt(seq, TrackRef{TrackKind::Video, i}, t);
+        if (!c || !c->enabled) continue;
+        if (!top) top = c;
+        if (const MediaItem* m = c->mediaId && !c->isGenerator() ? p.findMedia(c->mediaId) : nullptr; m && m->kind != MediaKind::Sequence) {
+            film = c;
+            filmMedia = m;
         }
+    }
+    if (b.clipName && top) {
+        std::string name = top->name;
+        if (const MediaItem* m = top->mediaId ? p.findMedia(top->mediaId) : nullptr; name.empty() && m) name = m->name;
+        lines << QString::fromStdString(name);
+    }
+    for (const bool ink : {false, true}) {
+        if (!(ink ? b.inkNumber : b.keyNumber) || !filmMedia) continue;
+        const std::string n = mediaFilmNumberText(*filmMedia, ink, clipMediaFrame(*film, t, seq, *filmMedia), gauge);
+        if (!n.empty()) lines << QString::fromStdString(n);
     }
     if (!b.text.empty()) lines << QString::fromStdString(b.text);
     if (lines.isEmpty()) return;
@@ -2851,6 +2888,8 @@ struct AudioMixer::State {
     Convolver roomL, roomR;
     RoomKey roomKey;
     std::vector<float> roomOut;
+    // Upmix: the upmixer (where the sound stays stereo, `delay` holds its latency instead).
+    std::unique_ptr<Upmixer> upmix;
 };
 
 namespace {
@@ -3044,7 +3083,18 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
         for (const auto& [k, v] : e.params) params.push_back(v.at(lt));
         bool changed = params != st->lastParams;
         st->lastParams = params;
-        if (e.type == "eq3") {
+        if (e.type == "upmix") {
+            // Here the sound stays stereo (a clip, a bus, a stereo mix): only the upmix's latency, so it stays in line.
+            if (e.id == skipUpmix_) continue;
+            if (st->delay.size() != size_t(Upmixer::kLatency) * 2) {
+                st->delay.assign(size_t(Upmixer::kLatency) * 2, 0.0f);
+                st->pos = 0;
+            }
+            for (int i = 0; i < frames * 2; ++i) {
+                std::swap(buf[i], st->delay[st->pos]);
+                if (++st->pos == st->delay.size()) st->pos = 0;
+            }
+        } else if (e.type == "eq3") {
             if (changed) {
                 st->bq[0].lowShelf(sr, e.p("low_hz", lt, 200), e.p("low_db", lt));
                 st->bq[1].peaking(sr, e.p("mid_hz", lt, 1000), std::max(0.1, e.p("mid_q", lt, 0.9)), e.p("mid_db", lt));
@@ -3256,7 +3306,8 @@ void AudioMixer::mixLayout(const Project& p, const Sequence& seq, int64_t start,
 }
 
 bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Track& track, int64_t start, int frames,
-                               double sr, int depth, float* trackBuf, float* trackField, int64_t fieldStart, int fieldChannels) {
+                               double sr, int depth, float* trackBuf, float* trackField, int64_t fieldStart, int fieldChannels,
+                               float* dialogueBuf) {
     const double fps = seq.fpsValue();
     const int64_t end = start + frames;
     std::vector<float> clipBuf(size_t(frames) * 2);
@@ -3265,8 +3316,9 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
     for (const Clip& c : track.clips) {
         if (!c.enabled || edit::roleMuted(seq, c.role)) continue;
         int64_t cs = int64_t(std::llround(c.start * sr / fps)), ce = int64_t(std::llround(c.end() * sr / fps));
-        // Transitions extend the playable range and add fades.
-        int64_t ps = cs, pe = ce;
+        // Transitions extend the playable range and add fades; sound placed between frames starts and ends inside its
+        // first and last frame.
+        int64_t ps = int64_t(std::llround((double(c.start) + c.head) * sr / fps)), pe = int64_t(std::llround((double(c.end()) - c.tail) * sr / fps));
         int64_t fiS = 0, fiE = 0, foS = 0, foE = 0;
         bool equalPowerIn = true, equalPowerOut = true;
         for (const auto& tr : track.transitions) {
@@ -3306,10 +3358,16 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
         const double srcBase = c.sourceIn * sr / fps;
         const bool ramped = c.ramped();  // Time Remapping: the source position follows the speed curve
         // Where the clip's sound comes from at a timeline sample (in the source's samples), for its speed and direction.
+        // (A position within a millionth of a sample of a whole one is that sample: sound placed between frames carries
+        // rounding from frames to samples and back.)
         auto srcPos = [&](int64_t smp) {
-            if (c.reverse) return srcBase + double(ce - 1 - smp) * c.speed;
+            const auto whole = [](double v) {
+                const double r = std::round(v);
+                return std::fabs(v - r) < 1e-6 ? r : v;
+            };
+            if (c.reverse) return whole(srcBase + double(ce - 1 - smp) * c.speed);
             if (ramped) return (c.sourceIn + c.sourceOffset(double(smp - cs) * fps / sr)) * sr / fps;  // speed ramp
-            return srcBase + double(smp - cs) * c.speed;
+            return whole(srcBase + double(smp - cs) * c.speed);
         };
         // Bleeps: stretches of source (as samples) covered by a tone or silence, with 5 ms ramps.
         std::vector<std::pair<double, double>> bleeps;
@@ -3426,10 +3484,10 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                         for (int k = 0; k < nch; ++k) d[k] = stretched->samples[size_t(j) * stride + size_t(k)];
                     } else {
                         const double rel = pos - double(origin);
-                        if (rel < 0 || rel >= double(n - 1)) continue;
+                        if (rel < 0 || rel > double(n - 1)) continue;  // (the last sample itself included)
                         const size_t i = size_t(rel);
                         const float f = float(rel - double(i));
-                        const float *x0 = src + i * stride, *x1 = x0 + stride;
+                        const float *x0 = src + i * stride, *x1 = int64_t(i) + 1 < n ? x0 + stride : x0;
                         for (int k = 0; k < nch; ++k) d[k] = x0[k] + (x1[k] - x0[k]) * f;
                     }
                     ambisonicRotate(rot, d);
@@ -3533,7 +3591,7 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             }
             for (int64_t s = s0; s < s1; ++s) {
                 const double pos = srcPos(s);
-                if (pos < 0 || pos >= double(n - 1)) continue;
+                if (pos < 0 || pos > double(n - 1)) continue;  // (the last sample itself included)
                 float* d = &clipBuf[size_t(s - rs) * 2];
                 if (stretched) {
                     const int64_t j = s - cs;
@@ -3543,8 +3601,9 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                 } else {
                     int64_t i = int64_t(pos);
                     float f = float(pos - double(i));
-                    d[0] = src[i * 2] + (src[i * 2 + 2] - src[i * 2]) * f;
-                    d[1] = src[i * 2 + 1] + (src[i * 2 + 3] - src[i * 2 + 1]) * f;
+                    const int64_t k = std::min(i + 1, n - 1);
+                    d[0] = src[i * 2] + (src[k * 2] - src[i * 2]) * f;
+                    d[1] = src[i * 2 + 1] + (src[k * 2 + 1] - src[i * 2 + 1]) * f;
                 }
                 if (!bleeps.empty()) {
                     float tone = 0;
@@ -3576,21 +3635,35 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             }
             return fade;
         };
+        // Volume at each sample when it is keyed (keys can sit between frames), and pan every 64 samples, at the clip's
+        // time.
+        const auto gainParam = c.audio.params.find("gain_db");
+        const Param* gainKeys = gainParam != c.audio.params.end() ? &gainParam->second : nullptr;
         auto gainAt = [&](int64_t s) {
-            const FrameTime lt = FrameTime(std::floor(double(s) * fps / sr)) - c.start;
-            return dbToLin(c.audio.p("gain_db", lt, 0) + (adDuck ? adDuck->at(lt) : 0.0));
+            const double lt = double(s) * fps / sr - double(c.start);
+            return dbToLin((gainKeys ? gainKeys->atTime(lt) : 0.0) + (adDuck ? adDuck->atTime(lt) : 0.0));
         };
+        // Where keys change the volume, it glides between 64-sample steps, and is worked out at each sample in a step
+        // a key falls in (so a step or a key between frames lands on its sample).
+        std::vector<int64_t> keySamples;
+        for (const Param* k : {gainKeys, adDuck})
+            if (k && k->keys.size() >= 2)
+                for (const Keyframe& key : k->keys) keySamples.push_back(int64_t(std::ceil((double(c.start) + key.time()) * sr / fps - 1e-6)));
+        std::sort(keySamples.begin(), keySamples.end());
+        const bool keyedGain = !keySamples.empty() && (!gainKeys || gainKeys->expr.empty()) && (!adDuck || adDuck->expr.empty());
         const int64_t o0 = std::max(start, ps), o1 = std::min(end, pe);
         for (int64_t s = o0; s < o1; s += 64) {
             int64_t e2 = std::min(o1, s + 64);
-            FrameTime lt = FrameTime(std::floor(double(s) * fps / sr)) - c.start;
-            const float g = gainAt(s);
+            const float g0 = gainAt(s), g1 = keyedGain ? gainAt(e2) : g0;
+            const auto key = std::upper_bound(keySamples.begin(), keySamples.end(), s);
+            const bool exact = keyedGain && key != keySamples.end() && *key <= e2;
             float pl, pr;
-            panGains(c.audio.p("pan", lt, 0), pl, pr);
+            panGains(c.audio.pAt("pan", double(s) * fps / sr - double(c.start), 0), pl, pr);
             for (int64_t k = s; k < e2; ++k) {
+                const float g = exact ? (k > s ? gainAt(k) : g0) : g0 + (g1 - g0) * float(k - s) / float(e2 - s);
                 const float fade = fadeAt(k);
                 float* d = &clipBuf[size_t(k - start) * 2];
-                float* tb = &trackBuf[size_t(k - start) * 2];
+                float* tb = &(dialogueBuf && c.role == "Dialogue" ? dialogueBuf : trackBuf)[size_t(k - start) * 2];
                 tb[0] += d[0] * g * pl * fade;
                 tb[1] += d[1] * g * pr * fade;
             }
@@ -3616,6 +3689,7 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
 int AudioMixer::chainLatency(const std::vector<Effect>& chain, Id owner, double sr) {
     int total = 0;
     for (const Effect& e : chain) {
+        if (e.enabled && e.type == "upmix") total += Upmixer::kLatency;
         if (!e.enabled || e.type != "plugin") continue;
         auto& st = states_[{owner, e.id}];
         if (!st) st = std::make_unique<State>();
@@ -3693,7 +3767,8 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
     // after it, so everything lines up at the output. The master chain gets the
     // mix of [start + Lm, ...), a bus that of [start + Lm + Lb, ...), and a track
     // its clips at [start + Lm + Lb + Lt, ...).
-    const int64_t masterLat = chainLatency(seq.masterEffects, seq.id, sr);
+    // (Master inserts are stereo: a surround mix leaves them out, and their latency with them.)
+    const int64_t masterLat = surround ? 0 : chainLatency(seq.masterEffects, seq.id, sr);
     std::vector<float> master(size_t(frames) * size_t(nch), 0.0f);
     std::map<Id, std::vector<float>> busBufs;
     std::map<Id, int64_t> busLat;
@@ -3701,7 +3776,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         busBufs[b.id].assign(size_t(frames) * 2, 0.0f);
         busLat[b.id] = chainLatency(b.effects, b.id, sr);
     }
-    std::vector<float> trackBuf(size_t(frames) * 2), postBuf;
+    std::vector<float> trackBuf(size_t(frames) * 2), postBuf, dialogueBuf, upmixOut;
     // A surround mix: ambisonic clips add their field straight to it, beside the tracks' panned sound, as a field in
     // an ambisonic mix (W, Y, Z, X, ...) and decoded to the speakers (AllRAD) in the others. It passes no stereo
     // inserts (clip, track or bus), so it is read where the master is fed from; a track routed to a bus sends it
@@ -3719,19 +3794,54 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         const bool lfeSend = lfeOnly && surround && lfeCh >= 0 && track.surround.lfeDb > -99;
         if (lfeOnly && (track.output || (!lfeSend && track.sends.empty()))) continue;
         auto bus = track.output ? busBufs.find(track.output) : busBufs.end();
-        const int64_t downstream = masterLat + (bus != busBufs.end() ? busLat[bus->first] : 0);
+        // (An ADM object's clips stay sound of its own, as the object is rendered from its track: no field kept.)
+        const bool keepsField = fieldMix && !(lfeOnly && !ambisonicLayout(seq.audioLayout));
+        // Upmix (audio/Upmix.h): in a surround or ambisonic mix the track's stereo, after its other inserts, is spread
+        // over the speakers (into its field), its Dialogue clips kept apart for the centre; it is not panned. As a field
+        // it passes no bus inserts (only the bus's fader and mute), so it is not fed ahead by their latency. (The first
+        // Upmix does it; any other is a delay.)
+        const Effect* upmix = nullptr;
+        if (keepsField && !lfeOnly)
+            for (const Effect& e : track.effects)
+                if (e.enabled && e.type == "upmix" && !upmix) upmix = &e;
+        const int64_t downstream = masterLat + (bus != busBufs.end() && !upmix ? busLat[bus->first] : 0);
         const int64_t trackLat = chainLatency(track.effects, track.id, sr);
         std::fill(trackBuf.begin(), trackBuf.end(), 0.0f);
         std::fill(trackField.begin(), trackField.end(), 0.0f);
         key_ = {&p, &seq, start + downstream + trackLat, sr, depth};
-        // (An ADM object's clips stay sound of its own, as the object is rendered from its track: no field kept.)
-        const bool keepsField = fieldMix && !(lfeOnly && !ambisonicLayout(seq.audioLayout));
+        const bool dialogueApart = upmix && upmix->p("dialogue_centre", 0, 1) > 0.5 &&
+                                   std::any_of(track.clips.begin(), track.clips.end(), [](const Clip& c) { return c.role == "Dialogue"; });
+        if (dialogueApart) dialogueBuf.assign(trackBuf.size(), 0.0f);
         const bool any = mixTrackClips(p, seq, track, start + downstream + trackLat, frames, sr, depth, trackBuf.data(),
-                                       keepsField ? trackField.data() : nullptr, fieldStart, nch);
+                                       keepsField ? trackField.data() : nullptr, fieldStart, nch,
+                                       dialogueApart ? dialogueBuf.data() : nullptr);
         // Track inserts keep running without clips, so reverb and delay tails ring out.
         if (!any && track.effects.empty()) continue;
-        if (!track.effects.empty())
-            processChain(track.effects, track.id, frameAt(start + downstream + trackLat), sr, trackBuf.data(), frames);
+        if (!track.effects.empty()) {
+            const FrameTime at = frameAt(start + downstream + trackLat);
+            skipUpmix_ = upmix ? upmix->id : 0;
+            processChain(track.effects, track.id, at, sr, trackBuf.data(), frames);
+            // The dialogue through the same inserts, each its own instance of them.
+            if (dialogueApart) processChain(track.effects, -track.id, at, sr, dialogueBuf.data(), frames);
+            skipUpmix_ = 0;
+        }
+        if (upmix) {
+            auto& st = states_[{track.id, upmix->id}];
+            if (!st) st = std::make_unique<State>();
+            if (!st->upmix || st->upmix->layout() != seq.audioLayout || st->upmix->rate() != int(sr))
+                st->upmix = std::make_unique<Upmixer>(seq.audioLayout, int(sr));
+            const FrameTime lt = frameAt(start + downstream);
+            UpmixSettings us;
+            us.centreWidth = upmix->p("centre_width", lt, 0) / 100;
+            us.surroundDepth = upmix->p("surround_depth", lt, 50) / 100;
+            us.height = upmix->p("height", lt, 30) / 100;
+            us.delayMs = upmix->p("delay_ms", lt, 10);
+            us.lfe = upmix->p("lfe", lt, 0) > 0.5;
+            upmixOut.resize(size_t(frames) * size_t(nch));
+            // (The stereo, with the dialogue, comes back as late, for the meters and sends.)
+            st->upmix->process(trackBuf.data(), dialogueApart ? dialogueBuf.data() : nullptr, frames, us, upmixOut.data(), trackBuf.data());
+            for (size_t i = 0; i < upmixOut.size(); ++i) trackField[i] += upmixOut[i];
+        }
         float tg = dbToLin(track.volumeDb), tl, tr;
         // Fader automation (core/Automation.h): the gain ramps smoothly between frames; pan steps every 64 samples.
         const bool readsLanes = trackAutomation(track) != AutomationMode::Off && trackAutomation(track) != AutomationMode::Write;
@@ -3833,6 +3943,14 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
                         master[size_t(i) * size_t(nch) + size_t(lfeCh)] +=
                             0.70710678f * (trackBuf[size_t(i) * 2] + trackBuf[size_t(i) * 2 + 1]) * tg * lfe;
                 }
+            } else if (upmix) {
+                // (Already in its field, spread over the speakers; the panner's LFE send still applies.)
+                if (lfeCh >= 0 && track.surround.lfeDb > -99) {
+                    const float lfe = float(std::pow(10.0, track.surround.lfeDb / 20));
+                    for (int i = 0; i < frames; ++i)
+                        master[size_t(i) * size_t(nch) + size_t(lfeCh)] +=
+                            0.70710678f * (trackBuf[size_t(i) * 2] + trackBuf[size_t(i) * 2 + 1]) * tg * lfe;
+                }
             } else if (readsLanes && surroundAnimated(track)) {
                 // A moving position (its x, y, z lanes): the speakers' gains glide from one 64-sample step to the next.
                 SurroundGains g0 = surroundGains(seq.audioLayout, trackSurroundAt(track, double(heard) * fps / sr));
@@ -3859,7 +3977,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
             for (int i = 0; i < frames; ++i) {
                 if (panAuto && i % 64 == 0) panGains(trackPanAt(track, double(heard + i) * fps / sr), tl, tr);
                 float l = trackBuf[size_t(i) * 2] * tg * tl, r = trackBuf[size_t(i) * 2 + 1] * tg * tr;
-                if (!lfeOnly) {  // (an object in a bed without speakers to pan to: only its sends)
+                if (!lfeOnly && !upmix) {  // (an object in a bed without speakers to pan to: only its sends; upmixed, its field)
                     dest[i * 2] += l;
                     dest[i * 2 + 1] += r;
                 }

@@ -21,6 +21,10 @@
 #include "core/Model.h"
 #include "media/Image.h"
 
+namespace montage {
+struct ColorSpace;
+}
+
 namespace montage::ofx {
 
 struct ParamDesc {
@@ -46,6 +50,7 @@ struct PluginDesc {
     int index = 0;        // in the binary
     bool temporal = false;  // asks for frames other than the one rendered
     bool floatImages = true;  // takes 32-bit float images (else 8-bit)
+    std::string colour;       // the colour management it takes (OpenFX 1.5: Basic, Core; empty for none)
     std::vector<ParamDesc> params;
     bool operator==(const PluginDesc&) const = default;
 };
@@ -96,8 +101,11 @@ std::string effectName(const Effect& e);
 // `fetch` gives the source at another clip frame for plugins that ask (false: none; the current frame is given).
 // Runs only plug-ins the registry found and did not block (never a binary named in the project file). False (with
 // `error`) when the plugin is missing, blocked or fails; `img` is then left as it was.
+// A plugin that takes OpenFX 1.5 colour management is told the colourspace of its pictures (the `working` space, or
+// one of the colourspaces it prefers, converted into and out of), and Montage takes its output's colourspace into account.
 using FrameFetch = std::function<bool(double t, Image& out)>;
-bool applyEffect(const Effect& e, double t, Image& img, double scale, const FrameFetch& fetch = {}, std::string* error = nullptr);
+bool applyEffect(const Effect& e, double t, Image& img, double scale, const FrameFetch& fetch = {}, std::string* error = nullptr,
+                 const ColorSpace* working = nullptr);
 
 // The frames of the clip being rendered on this thread, for plugins that ask for other times: set by the compositor
 // around a clip's effects.

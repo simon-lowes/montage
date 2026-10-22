@@ -681,6 +681,14 @@ std::vector<EffectInfo> buildCatalog() {
                   num("attack_ms", "Attack (ms)", 0.1, 50, 1, 0.1), num("hold_ms", "Hold (ms)", 0, 500, 50, 1),
                   num("release_ms", "Release (ms)", 5, 2000, 150, 1), num("key_hpf_hz", "Key High-Pass (Hz)", 0, 500, 0, 1)},
                  {str("sidechain", "Sidechain", StringKind::Track)}});
+    // Stereo spread over a surround or ambisonic sequence's speakers (audio/Upmix.h), on a track; elsewhere (a clip, a
+    // bus, a stereo sequence) the sound stays stereo, delayed as much as the upmix would have and made up for.
+    c.push_back({"upmix", "Upmix", EffectCategory::AudioFilter, "Surround",
+                 {pct("centre_width", "Centre Width", 0, 100, 0), pct("surround_depth", "Surround Depth", 0, 100, 50),
+                  pct("height", "Height", 0, 100, 30), num("delay_ms", "Surround Delay (ms)", 0, 30, 10, 0.1),
+                  boolean("lfe", "Copy Lows to LFE", false), boolean("dialogue_centre", "Dialogue in Centre", true)},
+                 {}});
+    c.back().params[3].keyframeable = false;
     c.push_back({"reverb", "Reverb", EffectCategory::AudioFilter, "Time",
                  {pct("size", "Room Size", 0, 100, 50), pct("damping", "Damping", 0, 100, 50), pct("width", "Width", 0, 100, 100),
                   pct("mix", "Mix", 0, 100, 25)},
@@ -852,6 +860,10 @@ std::vector<EffectInfo> buildCatalog() {
             for (auto& pi : c[i].params)
                 if (pi.name != "sensitivity")
                     pi.keyframeable = c[i].type == "patch_fill" && (pi.name == "source_x" || pi.name == "source_y");
+        // Frame Repair (render/FrameRepair.h): the source frames listed as damaged ("frames" as text, from Clip › Repair
+        // Damaged Frames… or MCP) rebuilt where the source frame is read, before anything else runs on it.
+        c.push_back({"frame_repair", "Frame Repair", EffectCategory::VideoFilter, "Repair", {boolean("show", "Show Repaired")}, {}});
+        c.back().params.back().keyframeable = false;
         // Film scans (render/FilmScan.h), run where the source frame is read: Steady on Perforations first (holding the
         // holes where they were on the frame its reference was taken from, "reference" as text), then Film Negative (its
         // base found in each frame's rebate unless set), then Faded Colour Restore (from the frames either side).

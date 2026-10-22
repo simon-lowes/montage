@@ -317,6 +317,8 @@ public:
             meterSeq_ = seq;
             meterRate_ = rate;
         }
+        stereo_ = std::make_unique<StereoAnalyser>(rate);
+        spectrum_ = std::make_unique<SpectrumAnalyser>(rate);
         speech_ = std::move(speech);
     }
     void resetLoudness() {
@@ -335,6 +337,7 @@ public:
         QMutexLocker meterLock(&meterM_);
         speech_ = std::move(speech);
     }
+    void setSpectrumKWeighting(bool on) { kWeighted_ = on; }
     // Global Mute: the meters still move, the speakers get silence.
     void setMuted(bool on) { muted_ = on; }
     void setAmbisonicBinaural(bool on) {
@@ -353,6 +356,7 @@ signals:
     void levels(float l, float r, const QVector<float>& tracks);
     void loudness(double momentary, double shortTerm, double integrated, double range, double truePeak);
     void dialogueLoudness(double integrated, double speechShare);
+    void analysis(montage::AudioAnalysisPtr a);
 
 protected:
     qint64 readData(char* data, qint64 maxlen) override {
@@ -383,9 +387,9 @@ protected:
             pl = std::max(pl, std::fabs(buf_[size_t(i) * 2]));
             pr = std::max(pr, std::fabs(buf_[size_t(i) * 2 + 1]));
         }
-        if (muted_) std::fill(buf_.begin(), buf_.end(), 0.0f);
-        std::vector<float> heard;
-        if (cycle && !muted_) {  // (Global Mute silences the beeps too)
+        std::vector<float> heard;  // what the speakers get, when it is not buf_ (which the meters still read)
+        if (muted_) heard.assign(buf_.size(), 0.0f);  // (Global Mute silences the beeps too)
+        else if (cycle) {
             heard = buf_;
             addAdrBeeps(*cycle, fps, rate, first, heard.data(), frames, 2);
         }
@@ -411,6 +415,11 @@ protected:
                 const auto at = std::upper_bound(speech_.begin(), speech_.end(), std::make_pair(mid, 1e300));
                 meter_->setSpeech(at != speech_.begin() && std::prev(at)->second > mid);
                 meter_->add(buf_.data(), frames);
+                if (stereo_) {
+                    stereo_->add(buf_.data(), frames);
+                    spectrum_->setKWeighting(kWeighted_);
+                    spectrum_->add(buf_.data(), frames);
+                }
                 sinceReport_ += frames;
                 if (sinceReport_ >= meterRate_ / 10) {
                     sinceReport_ = 0;
@@ -419,6 +428,7 @@ protected:
                                   r.truePeakDb);
                     const LoudnessResult d = meter_->speechResult();
                     emit dialogueLoudness(d.valid ? d.integrated : -200.0, speech_.empty() ? -1.0 : meter_->speechShare());
+                    if (stereo_) emit analysis(takeAudioAnalysis(*stereo_, *spectrum_));
                 }
             }
         }
@@ -444,6 +454,9 @@ private:
     std::vector<float> buf_;
     QMutex meterM_;
     std::unique_ptr<LoudnessMeter> meter_;
+    std::unique_ptr<StereoAnalyser> stereo_;  // (afresh each play)
+    std::unique_ptr<SpectrumAnalyser> spectrum_;
+    std::atomic<bool> kWeighted_{false};
     Id meterSeq_ = 0;
     int meterRate_ = 48000;
     int64_t sinceReport_ = 0;
@@ -500,6 +513,8 @@ PlaybackController::PlaybackController(QObject* parent) : QObject(parent) {
     connect(device_, &MixerDevice::levels, this, &PlaybackController::audioLevels);
     connect(device_, &MixerDevice::loudness, this, &PlaybackController::loudness);
     connect(device_, &MixerDevice::dialogueLoudness, this, &PlaybackController::dialogueLoudness);
+    qRegisterMetaType<AudioAnalysisPtr>("montage::AudioAnalysisPtr");
+    connect(device_, &MixerDevice::analysis, this, &PlaybackController::audioAnalysis);
     timer_.setTimerType(Qt::PreciseTimer);
     timer_.setInterval(8);
     connect(&timer_, &QTimer::timeout, this, &PlaybackController::tick);
@@ -915,6 +930,8 @@ RenderOptions PlaybackController::renderOptions() const {
 }
 
 void PlaybackController::resetLoudness() { device_->resetLoudness(); }
+
+void PlaybackController::setSpectrumKWeighting(bool on) { device_->setSpectrumKWeighting(on); }
 
 }  // namespace montage
 

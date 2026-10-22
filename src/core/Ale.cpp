@@ -56,6 +56,8 @@ const ColumnField kColumns[] = {
     {"Comments", "comment"}, {"Comment", "comment"},
     // ACES Metadata Files' clip names and ids (render/Amf.h), as ACES dailies tools write them.
     {"AMF_NAME", "amf_name"}, {"AMF_UUID", "amf_uuid"},
+    // Film: the key number and ink number of the clip's first frame (core/FilmCount.h).
+    {"KN Start", "key_number"}, {"Ink Number", "ink_number"},
 };
 
 }  // namespace
@@ -305,6 +307,15 @@ AleTable aleFromMedia(const Project& p, const std::vector<Id>& ids, Rational fps
         t.columns.push_back("AMF_NAME");
         t.columns.push_back("AMF_UUID");
     }
+    // And the film numbers when any media has them.
+    bool anyFilm = false;
+    for (Id id : ids)
+        if (const MediaItem* m = p.findMedia(id); m && m->kind != MediaKind::Sequence && m->kind != MediaKind::Image)
+            anyFilm |= m->metadata.count("key_number") || m->metadata.count("ink_number");
+    if (anyFilm) {
+        t.columns.push_back("KN Start");
+        t.columns.push_back("Ink Number");
+    }
     size_t row = 0;
     for (Id id : ids) {
         const MediaItem* m = p.findMedia(id);
@@ -316,6 +327,12 @@ AleTable aleFromMedia(const Project& p, const std::vector<Id>& ids, Rational fps
         }
         if (anyAmf) {
             for (const char* key : {"amf_name", "amf_uuid"}) {
+                const auto it = m->metadata.find(key);
+                cells.push_back(it == m->metadata.end() ? std::string() : it->second);
+            }
+        }
+        if (anyFilm) {
+            for (const char* key : {"key_number", "ink_number"}) {
                 const auto it = m->metadata.find(key);
                 cells.push_back(it == m->metadata.end() ? std::string() : it->second);
             }

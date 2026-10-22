@@ -187,6 +187,12 @@ public:
     // Saves a range of a media item (frames of the active sequence, Out
     // inclusive) as a subclip in the bin; returns its id, or 0.
     Id makeSubclip(Id media, FrameTime in, FrameTime out, const QString& name = QString());
+    // A stretch of a sound library file ([first, first + count) samples at `rate`) on audio track `track` (-1: the
+    // target) from frame `at`, to the sample (edit::placeSoundRange). The file comes into the "Sound Effects" bin
+    // first (once); with the "soundLibrary/copyToProject" preference and a saved project, a copy of it in the "Sound
+    // Effects" folder beside the project does. Returns the clips made (none on failure, with `error`).
+    std::vector<Id> placeSound(const QString& path, int64_t first, int64_t count, int rate, FrameTime at, int track = -1,
+                               bool insertMode = false, QString* error = nullptr);
 
     // ---- Sequences ----------------------------------------------------------
     void setActiveSequence(Id id);
@@ -348,7 +354,18 @@ private:
     std::optional<Gesture> gesture_;
 };
 
-// Formats a frame count using the active sequence's timecode.
+// What the timecode readouts show: timecode, or feet and frames (core/FilmCount.h; in the sequence's film gauge, 35 mm
+// 4-perf where it has none) with 0+00 at the timeline's first frame or at its first picture (the earliest video clip,
+// so a leader before it counts back from zero). Kept in the app's settings.
+enum class Counter { Timecode, Feet, FeetFromPicture };
+Counter counterDisplay();
+void setCounterDisplay(Counter c);
+// A frame of sequence `s` as the readouts show it.
 QString timecodeString(const Sequence* s, FrameTime t);
+// A length of time (feet and frames from zero whichever the counter).
+QString durationString(const Sequence* s, FrameTime d);
+// What a readout shows (feet and frames while the counter shows them; else timecode, frames or seconds as
+// parseTimecode reads them), as a frame of the sequence, or a length where `duration`.
+bool parseCounterString(const Sequence* s, const QString& text, FrameTime& t, bool duration = false);
 
 }  // namespace montage

@@ -21,33 +21,33 @@ void keyHandles(const std::vector<Keyframe>& keys, size_t i, double& inDt, doubl
     if (i > 0 && i + 1 < keys.size()) {
         const Keyframe& a = keys[i - 1];
         const Keyframe& b = keys[i + 1];
-        if ((k.v - a.v) * (b.v - k.v) > 0 && b.t > a.t) slope = (b.v - a.v) / double(b.t - a.t);
+        if ((k.v - a.v) * (b.v - k.v) > 0 && b.time() > a.time()) slope = (b.v - a.v) / (b.time() - a.time());
     }
     if (k.inDt != 0 || k.inDv != 0) {
         inDt = k.inDt, inDv = k.inDv;
     } else if (i > 0) {
-        inDt = -double(k.t - keys[i - 1].t) / 3;
+        inDt = -(k.time() - keys[i - 1].time()) / 3;
         inDv = slope * inDt;
     }
     if (k.outDt != 0 || k.outDv != 0) {
         outDt = k.outDt, outDv = k.outDv;
     } else if (i + 1 < keys.size()) {
-        outDt = double(keys[i + 1].t - k.t) / 3;
+        outDt = (keys[i + 1].time() - k.time()) / 3;
         outDv = slope * outDt;
     }
 }
 
 namespace {
 // The value of keys at t, holding the first and last values outside them.
-double evalKeys(const std::vector<Keyframe>& keys, FrameTime t) {
-    if (t <= keys.front().t) return keys.front().v;
-    if (t >= keys.back().t) return keys.back().v;
+double evalKeys(const std::vector<Keyframe>& keys, double t) {
+    if (t <= keys.front().time()) return keys.front().v;
+    if (t >= keys.back().time()) return keys.back().v;
     auto it = std::upper_bound(keys.begin(), keys.end(), t,
-                               [](FrameTime tt, const Keyframe& k) { return tt < k.t; });
+                               [](double tt, const Keyframe& k) { return tt < k.time(); });
     const Keyframe& b = *it;
     const Keyframe& a = *(it - 1);
-    if (a.interp == Interp::Hold || b.t == a.t) return a.v;
-    double u = double(t - a.t) / double(b.t - a.t);
+    if (a.interp == Interp::Hold || b.time() == a.time()) return a.v;
+    double u = (t - a.time()) / (b.time() - a.time());
     if (a.interp == Interp::Bezier) {
         // A cubic from a to b through a's out handle and b's in handle, their times kept
         // inside the segment so the curve is a function of time; solved for t by bisection.
@@ -55,7 +55,7 @@ double evalKeys(const std::vector<Keyframe>& keys, FrameTime t) {
         double ai, av, aOutDt, aOutDv, bInDt, bInDv, bo1, bo2;
         keyHandles(keys, ia, ai, av, aOutDt, aOutDv);
         keyHandles(keys, ia + 1, bInDt, bInDv, bo1, bo2);
-        const double seg = double(b.t - a.t);
+        const double seg = b.time() - a.time();
         const double x1 = std::clamp(aOutDt, 0.0, seg) / seg, x2 = 1 + std::clamp(bInDt, -seg, 0.0) / seg;
         const double y0 = a.v, y1 = a.v + aOutDv, y2 = b.v + bInDv, y3 = b.v;
         auto bez = [](double p0, double p1, double p2, double p3, double s) {
@@ -80,15 +80,22 @@ double Param::at(FrameTime t) const {
     return expr.empty() ? keyed : evaluateExpression(*this, t, keyed);
 }
 
-double Param::keyedAt(FrameTime t) const {
+double Param::atTime(double t) const {
+    const double keyed = keyedAtTime(t);
+    return expr.empty() ? keyed : evaluateExpression(*this, FrameTime(std::floor(t)), keyed);
+}
+
+double Param::keyedAt(FrameTime t) const { return keyedAtTime(double(t)); }
+
+double Param::keyedAtTime(double t) const {
     if (keys.empty()) return value;
-    if (repeat != Repeat::Hold && keys.size() >= 2 && t > keys.back().t && keys.back().t > keys.front().t) {
-        const FrameTime first = keys.front().t, span = keys.back().t - first;
-        const FrameTime cycle = (t - first) / span, into = (t - first) % span;
+    if (repeat != Repeat::Hold && keys.size() >= 2 && t > keys.back().time() && keys.back().time() > keys.front().time()) {
+        const double first = keys.front().time(), span = keys.back().time() - first;
+        const double cycle = std::floor((t - first) / span), into = (t - first) - cycle * span;
         switch (repeat) {
             case Repeat::Loop: return evalKeys(keys, first + into);
-            case Repeat::PingPong: return evalKeys(keys, cycle % 2 ? keys.back().t - into : first + into);
-            case Repeat::Offset: return evalKeys(keys, first + into) + double(cycle) * (keys.back().v - keys.front().v);
+            case Repeat::PingPong: return evalKeys(keys, std::fmod(cycle, 2.0) != 0 ? keys.back().time() - into : first + into);
+            case Repeat::Offset: return evalKeys(keys, first + into) + cycle * (keys.back().v - keys.front().v);
             default: break;
         }
     }
@@ -104,6 +111,13 @@ void Param::addKey(FrameTime t, double v, Interp interp) {
     } else {
         keys.insert(it, Keyframe{t, v, interp});
     }
+}
+
+void Param::addKeyAt(double time, double v, Interp interp) {
+    const FrameTime t = FrameTime(std::floor(time));
+    addKey(t, v, interp);
+    for (Keyframe& k : keys)
+        if (k.t == t) k.sub = std::clamp(time - double(t), 0.0, 0.999999);
 }
 
 void Param::set(FrameTime t, double v) {
@@ -143,6 +157,12 @@ double Effect::p(const std::string& name, FrameTime t, double def) const {
     auto it = params.find(name);
     if (it == params.end()) return def;
     return it->second.at(t);
+}
+
+double Effect::pAt(const std::string& name, double t, double def) const {
+    auto it = params.find(name);
+    if (it == params.end()) return def;
+    return it->second.atTime(t);
 }
 
 std::string Effect::s(const std::string& name, const std::string& def) const {

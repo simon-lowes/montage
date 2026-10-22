@@ -84,6 +84,7 @@
 #include "media/ContentCredentials.h"
 #include "ExposureView.h"
 #include "QualityCheckDialog.h"
+#include "SoundSamplesDialog.h"
 #include "ConformCheckDialog.h"
 #include "OffloadDialog.h"
 #include "RepairMediaDialog.h"
@@ -116,6 +117,8 @@
 #include "media/TextReader.h"
 #include "core/OnScreenText.h"
 #include "ProjectManagerDialog.h"
+#include "SoundLibraryPanel.h"
+#include "media/SoundLibrary.h"
 #include "MediaBinModel.h"
 #include "ScopesWidget.h"
 #include "render/Gamut.h"
@@ -173,6 +176,7 @@
 #include "CompareDialog.h"
 #include "Keymap.h"
 #include "LoudnessReadout.h"
+#include "AudioAnalysisWidget.h"
 #include "Voiceover.h"
 #include "AdrPanel.h"
 #include "AudioDescriptionDialog.h"
@@ -441,6 +445,8 @@ private slots:
         // DCP signing certificates and DKDMs of their own too.
         qputenv("MONTAGE_DCP_CERTIFICATES", dir_.filePath(QStringLiteral("dcp-certificates")).toUtf8());
         qputenv("MONTAGE_DCP_DKDMS", dir_.filePath(QStringLiteral("dkdm")).toUtf8());
+        // And a sound library (not the one on this computer, with its folders).
+        qputenv("MONTAGE_SOUND_LIBRARY", dir_.filePath(QStringLiteral("sound-library.sqlite")).toUtf8());
         win_ = std::make_unique<MainWindow>();
         win_->resize(1600, 1000);
         win_->show();
@@ -818,6 +824,157 @@ private slots:
         QCOMPARE(dlg.addMarkers(), 0);
         QVERIFY(!dlg.findChild<QPushButton*>("conformMarkers")->isEnabled());
         QCOMPARE(dlg.shots().size(), size_t(1));  // (its own markers do not make the results stale)
+    }
+
+    void soundLibraryPanel() {
+        // A library of three sounds: found as you type, a stretch chosen on the waveform and auditioned at a pitch
+        // (by semitones or varispeed), then dragged onto the timeline (copied into the project's folder first).
+        const QString dir = dir_.path() + "/sfx";
+        QDir().mkpath(dir + "/doors");
+        auto writeWav = [](const QString& file, double hz, double seconds) {
+            std::vector<float> x(size_t(seconds * 48000));
+            for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.3 * std::sin(2 * M_PI * hz * double(i) / 48000));
+            WavWriter w;
+            if (!w.open(file, 48000, 1)) return false;
+            w.write(x.data(), int64_t(x.size()));
+            return w.close();
+        };
+        QVERIFY(writeWav(dir + "/doors/DOORCreak_Old Gate_TS_Lib.wav", 300, 1));
+        QVERIFY(writeWav(dir + "/doors/DOORWood_Slam_TS_Lib.wav", 400, 1));
+        QVERIFY(writeWav(dir + "/WATRSurf_Waves_TS_Lib.wav", 500, 2));
+        auto library = std::make_shared<SoundLibrary>();
+        QVERIFY(library->open((dir_.path() + "/library.sqlite").toStdString()));
+        auto panel = std::make_unique<SoundLibraryPanel>(state(), library);
+        QVERIFY(panel->addFolder(dir));
+        panel->rescan(true);
+        QVERIFY(!panel->busy());
+        QCOMPARE(library->count(), 3);
+        QCOMPARE(panel->search("gate"), 1);
+        QCOMPARE(panel->search("doors"), 2);
+        QCOMPARE(panel->search(""), 3);
+        QCOMPARE(panel->search("waves"), 1);
+        QCOMPARE(panel->search("gate"), 1);
+        panel->select(0);
+        QVERIFY(panel->current());
+        SoundRange r = panel->range();
+        QCOMPARE(r.first, int64_t(0));
+        QCOMPARE(r.count, int64_t(48000));  // the whole sound until a stretch is chosen
+        QCOMPARE(r.rate, 48000);
+        panel->setRange(4800, 9600);
+        r = panel->range();
+        QVERIFY(r.first == 4800 && r.count == 9600);
+        // Up an octave: half as long by varispeed, as long by semitones; down an octave by varispeed, twice as long.
+        panel->setPitch(12, true);
+        QCOMPARE(panel->auditionSound().size(), size_t(4800 * 2));
+        panel->setPitch(12, false);
+        QCOMPARE(panel->auditionSound().size(), size_t(9600 * 2));
+        panel->setPitch(-12, true);
+        QCOMPARE(panel->auditionSound().size(), size_t(19200 * 2));
+        panel->setPitch(0, false);
+        // The stretch as a drag carries the file too, for other applications.
+        std::unique_ptr<QMimeData> mime(soundRangeMime(r));
+        QCOMPARE(mime->urls().value(0).toLocalFile(), r.path);
+        SoundRange back;
+        QVERIFY(soundRangeFromMime(mime.get(), back));
+        QVERIFY(back.path == r.path && back.first == 4800 && back.count == 9600 && back.rate == 48000);
+
+        // Dropped on A1 at frame 10 of a saved project, with copying on: the file copied into "Sound Effects" beside
+        // the project, imported into a bin of that name, and just the stretch placed (0.2 s: 6 frames at 30 fps).
+        state()->newProject();
+        state()->setSnapping(false);
+        QVERIFY(state()->save(dir_.path() + "/library-drop.montage"));
+        QSettings settings = appSettings();
+        settings.setValue("soundLibrary/copyToProject", true);
+        ppf_ = measurePpf();
+        const QPoint pos = pointFor(10, {TrackKind::Audio, 0}) + QPoint(2, 0);
+        QDragEnterEvent enter(pos, Qt::CopyAction, mime.get(), Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(viewport(), &enter);
+        QDropEvent drop(pos, Qt::CopyAction, mime.get(), Qt::LeftButton, Qt::NoModifier);
+        QApplication::sendEvent(viewport(), &drop);
+        settings.setValue("soundLibrary/copyToProject", false);
+        const Sequence* s = state()->sequence();
+        QCOMPARE(s->audioTracks[0].clips.size(), size_t(1));
+        QVERIFY(s->videoTracks[0].clips.empty());
+        const Clip& c = s->audioTracks[0].clips.front();
+        QVERIFY2(std::abs(c.start - 10) <= 1, qPrintable(QString::number(c.start)));
+        QCOMPARE(c.duration, FrameTime(6));
+        QVERIFY(std::abs(c.sourceIn - 3.0) < 1e-9);  // 0.1 s in
+        QCOMPARE(c.tail, 0.0);
+        const MediaItem* m = state()->project().findMedia(c.mediaId);
+        QVERIFY(m);
+        QCOMPARE(QString::fromStdString(m->path), dir_.path() + "/Sound Effects/DOORCreak_Old Gate_TS_Lib.wav");
+        QVERIFY(QFileInfo::exists(QString::fromStdString(m->path)));
+        // Placed again (no copy this time): the library's own file, imported once.
+        const size_t media = state()->project().media.size();
+        QVERIFY(!state()->placeSound(r.path, 0, 4800, 48000, 40).empty());
+        QVERIFY(!state()->placeSound(r.path, 0, 4800, 48000, 60).empty());
+        QCOMPARE(state()->project().media.size(), media + 1);
+        state()->newProject();
+        panel.reset();
+    }
+
+    void filmCounterAndLists() {
+        // A sequence cut on film: its gauge in Sequence Settings, the readouts in feet and frames, and its film lists.
+        state()->newProject();
+        QVERIFY(state()->edit("Film", [&](Project& p, Sequence& s) {
+            s.fps = {24, 1};
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Video;
+            m.name = "Roll 12";
+            m.path = "/scans/roll12.mov";
+            m.duration = 10;
+            m.width = 1920;
+            m.height = 1080;
+            m.fps = {24, 1};
+            m.hasVideo = true;
+            m.metadata["key_number"] = "KJ 23 1234 5678+00";
+            p.media.push_back(m);
+            return edit::placeMedia(p, s, m.id, 8, 16, 56, {TrackKind::Video, 0}, {}, false).ok;
+        }));
+        {
+            SequenceSettingsDialog dlg;
+            auto* gauge = dlg.findChild<QComboBox*>("filmGauge");
+            QVERIFY(gauge);
+            gauge->setCurrentIndex(gauge->findData(QStringLiteral("35mm-3perf")));
+            QCOMPARE(dlg.spec().filmGauge, std::string("35mm-3perf"));
+            NewSequenceSpec spec = dlg.spec();
+            spec.filmGauge = "16mm";
+            dlg.setSpec(spec);
+            QCOMPARE(gauge->currentData().toString(), QStringLiteral("16mm"));
+        }
+        const Sequence* s = state()->sequence();
+        QCOMPARE(timecodeString(s, 24), QStringLiteral("00:00:01:00"));
+        // Feet and frames: 35 mm 4-perf where the sequence has no gauge.
+        win_->findChild<QAction*>("counterFeet")->trigger();
+        QCOMPARE(counterDisplay(), Counter::Feet);
+        QCOMPARE(timecodeString(s, 20), QStringLiteral("1+04"));
+        FrameTime t = 0;
+        QVERIFY(parseCounterString(s, QStringLiteral("2+00"), t) && t == 32);
+        QVERIFY(parseCounterString(s, QStringLiteral("00:00:01:00"), t) && t == 24);  // timecode still read
+        // From the first picture (the clip at frame 8): what comes before it counts back from 0+00.
+        win_->findChild<QAction*>("counterFeetFromPicture")->trigger();
+        QCOMPARE(timecodeString(s, 8), QStringLiteral("0+00"));
+        QCOMPARE(timecodeString(s, 0), QStringLiteral("-0+08"));
+        QCOMPARE(durationString(s, 16), QStringLiteral("1+00"));
+        QVERIFY(parseCounterString(s, QStringLiteral("1+00"), t) && t == 24);
+        QVERIFY(parseCounterString(s, QStringLiteral("1+00"), t, true) && t == 16);
+        QVERIFY(state()->edit("Gauge", [](Project&, Sequence& sq) {
+            sq.filmGauge = "16mm";
+            return true;
+        }));
+        QCOMPARE(timecodeString(state()->sequence(), 48), QStringLiteral("1+00"));
+        win_->findChild<QAction*>("counterTimecode")->trigger();
+        QCOMPARE(counterDisplay(), Counter::Timecode);
+        // The lists, with the media's key numbers.
+        QVERIFY(win_->findChild<QAction*>("exportFilmLists"));
+        const QString lists = dir_.path() + "/reel.txt";
+        QVERIFY(win_->exportFilmLists(lists));
+        QFile f(lists);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        const QString text = QString::fromUtf8(f.readAll());
+        QVERIFY2(text.contains(QStringLiteral("KJ 23 1234 5678+16")) && text.contains(QStringLiteral("KJ 23 1234 5680+15")), qPrintable(text));
+        QVERIFY2(text.contains(QStringLiteral("16 mm")), qPrintable(text));
     }
 
     void aleAndCdlFromTheMenus() {
@@ -6616,8 +6773,8 @@ private slots:
         // Quality Check reports it.
         state()->undo();
         QcSettings q;
-        q.flashing = q.levels = q.clipping = q.spelling = false;
-        q.blackSeconds = q.freezeSeconds = q.silenceSeconds = 0;
+        q.flashing = q.levels = q.clipping = q.spelling = q.phase = false;
+        q.blackSeconds = q.freezeSeconds = q.silenceSeconds = q.dcOffsetDb = 0;
         const auto issues = qualityCheck(state()->project(), *state()->sequence(), 0, -1, q);
         QCOMPARE(issues.size(), size_t(1));
         QCOMPARE(issues[0].kind, QcKind::OutOfSync);
@@ -7093,6 +7250,93 @@ private slots:
         QVERIFY(std::fabs(gain(0, 1.5)) < 0.5 && std::fabs(gain(1, 4.0)) < 0.5);
         state()->undo();
         QVERIFY(state()->sequence()->audioTracks[0].clips.at(0).audio.params.at("gain_db").keys.empty());
+        state()->newProject();
+    }
+
+    void dialogueIntelligibilityFromTheMenu() {
+        // JFK (Dialogue) for 11 s over a steady hiss (Effects) 20 dB down, which swells to 10 dB over him from 4 to 7 s.
+        const int rate = 48000;
+        std::vector<float> bed(size_t(rate) * 11 * 2);
+        std::mt19937 rng(9);
+        std::normal_distribution<float> white(0, 0.01f);
+        for (size_t i = 0; i < bed.size(); ++i) {
+            const double t = double(i / 2) / rate;
+            bed[i] = white(rng) * (t >= 4 && t < 7 ? 30.0f : 1.0f);
+        }
+        WavWriter w;
+        QVERIFY(w.open(dir_.path() + "/hiss.wav", rate, 2));
+        w.write(bed.data(), int64_t(bed.size() / 2));
+        QVERIFY(w.close());
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("analyseIntelligibility"));
+        QCOMPARE(win_->analyseIntelligibility("Standard"), -1.0);  // nothing to measure
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav"), dir_.path() + "/hiss.wav"});
+        QCOMPARE(ids.size(), size_t(2));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            const bool a = edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+            const bool b = edit::placeMedia(p, s, ids[1], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok;
+            s.audioTracks[0].clips.at(0).role = "Dialogue";
+            s.audioTracks[1].clips.at(0).role = "Effects";
+            return a && b;
+        }));
+        const double average = win_->analyseIntelligibility("Standard");
+        QVERIFY2(average > 0 && average < 1, qPrintable(QString::number(average)));
+        // The lane: red over the swell, green elsewhere.
+        const auto& lane = win_->timeline()->intelligibilityLane();
+        QVERIFY(!lane.empty());
+        const double fps = state()->sequence()->fpsValue();
+        auto statusAt = [&](double seconds) {
+            const FrameTime f = FrameTime(seconds * fps);
+            for (const auto& sp : lane)
+                if (f >= sp.first && f < sp.end) return sp.status;
+            return -1;
+        };
+        QCOMPARE(statusAt(5.5), 2);
+        QVERIFY(std::any_of(lane.begin(), lane.end(), [&](const auto& sp) { return sp.status == 0 && sp.end <= FrameTime(4 * fps); }));
+        // The readout follows the playhead.
+        auto* readout = win_->findChild<LoudnessReadout*>("loudness");
+        QVERIFY(readout);
+        state()->setPlayhead(FrameTime(5.5 * fps));
+        QVERIFY2(readout->text("INT").toDouble() < 0.45 && readout->text("INT") != QStringLiteral("—"), qPrintable(readout->text("INT")));
+        state()->newProject();
+        QVERIFY(win_->timeline()->intelligibilityLane().empty());
+        QCOMPARE(readout->text("INT"), QStringLiteral("—"));
+    }
+
+    void repairDamagedFramesFromTheMenu() {
+        // A grey shot with one white frame (frame 10) in it.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 160;
+        gs.height = 90;
+        for (const auto& [start, length, v] : std::vector<std::tuple<FrameTime, FrameTime, double>>{{0, 10, 0.4}, {10, 1, 1.0}, {11, 14, 0.4}}) {
+            Clip c = makeGeneratorClip(gen, "color", length);
+            c.start = start;
+            for (const char* k : {"color.r", "color.g", "color.b"}) c.generator.params[k] = v;
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+        }
+        ExportSettings st;
+        st.path = (dir_.path() + "/flashed.mp4").toStdString();
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("repairDamagedFrames"));
+        QCOMPARE(win_->repairDamagedFrames(), 0);  // nothing selected or under the playhead
+        const auto ids = state()->importFiles({dir_.path() + "/flashed.mp4"});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        state()->setSelection({state()->sequence()->videoTracks.at(0).clips.at(0).id});
+        QCOMPARE(win_->repairDamagedFrames(), 1);
+        const Sequence* s = state()->sequence();
+        QCOMPARE(s->videoTracks[0].clips.at(0).effects.at(0).s("frames"), std::string("10 flash\n"));
+        QCOMPARE(int(s->markers.size()), 1);
+        QCOMPARE(s->markers[0].t, FrameTime(10));
+        state()->undo();
+        QVERIFY(state()->sequence()->videoTracks[0].clips.at(0).effects.empty() && state()->sequence()->markers.empty());
         state()->newProject();
     }
 
@@ -9312,6 +9556,92 @@ const auto seq = [this] { return state()->sequence(); };
         keymap::resetAll(w);
     }
 
+    void soundBySamplesDialog() {
+        // JFK from frame 10: moved 7 samples later and its end trimmed by 100 in one undo step; a move into the frames
+        // of the clip after it is refused and changes nothing.
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            const bool a = edit::placeMedia(p, s, ids[0], 10, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+            const FrameTime after = s.audioTracks[0].clips.at(0).end();
+            return a && edit::placeMedia(p, s, ids[0], after, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const Id id = state()->sequence()->audioTracks[0].clips.at(0).id;
+        const Clip before = *edit::clipById(*state()->sequence(), id);
+        // Nothing selected: the menu says what to do.
+        state()->clearSelection();
+        auto* action = win_->findChild<QAction*>("editSoundBySamples");
+        QVERIFY(action);
+        action->trigger();  // (no dialog: it says to select the clip)
+        state()->setSelection({id}, false);
+        SoundSamplesDialog dlg(state(), id, win_.get());
+        QCOMPARE(dlg.span().left(16), QString("00:00:00:10+0000"));
+        dlg.findChild<QSpinBox*>("soundMove")->setValue(7);
+        dlg.findChild<QSpinBox*>("soundTrimEnd")->setValue(100);
+        QVERIFY(dlg.apply());
+        const Clip* c = edit::clipById(*state()->sequence(), id);
+        QVERIFY(std::fabs(c->head - 7.0 / 1600) < 1e-9);
+        QVERIFY(std::fabs(c->tail - 93.0 / 1600) < 1e-9);
+        QCOMPARE(dlg.span().left(16), QString("00:00:00:10+0007"));
+        QCOMPARE(dlg.findChild<QSpinBox*>("soundMove")->value(), 0);
+        dlg.findChild<QSpinBox*>("soundMove")->setValue(4000);
+        QVERIFY(!dlg.apply());
+        QVERIFY(dlg.error().contains("another clip"));
+        QCOMPARE(edit::clipById(*state()->sequence(), id)->head, c->head);
+        state()->undo();
+        QVERIFY(*edit::clipById(*state()->sequence(), id) == before);
+    }
+
+    void audioAnalysisMeters() {
+        // In the Meters dock beneath the loudness: a channel inverted reads -1 and loses everything in mono; a -6 dBFS
+        // tone shows at -6 dB in its third-octave band and its FFT bin.
+        auto* meters = win_->findChild<QDockWidget*>("meters");
+        auto* w = win_->findChild<AudioAnalysisWidget*>("audioAnalysis");
+        QVERIFY(meters && w && meters->isAncestorOf(w));
+        const int rate = 48000;
+        const double hz = 171.0 * rate / SpectrumAnalyser::kFft;
+        std::vector<float> tone(size_t(rate / 2) * 2);
+        for (size_t i = 0; i < tone.size() / 2; ++i) {
+            const float v = float(0.5 * std::sin(2 * M_PI * hz * double(i) / rate));
+            tone[2 * i] = v, tone[2 * i + 1] = -v;
+        }
+        StereoAnalyser stereo(rate);
+        SpectrumAnalyser spectrum(rate);
+        stereo.add(tone.data(), rate / 2);
+        spectrum.add(tone.data(), rate / 2);
+        w->resize(320, 220);
+        w->layout()->activate();
+        w->setMode(AudioAnalysisWidget::SpectrumMode::Bands);
+        w->setAnalysis(takeAudioAnalysis(stereo, spectrum));
+        QCOMPARE(w->text("CORR"), QString("-1.00"));
+        QCOMPARE(w->text("MONO"), QString("-60.0"));
+        QVERIFY2(std::fabs(w->levelAt(1000) + 6.02) < 0.5, qPrintable(QString::number(w->levelAt(1000))));
+        QVERIFY(w->levelAt(250) < -60);
+        QImage bands(w->size(), QImage::Format_ARGB32);
+        bands.fill(Qt::black);
+        w->render(&bands);
+        w->setMode(AudioAnalysisWidget::SpectrumMode::Bins);
+        QVERIFY2(std::fabs(w->levelAt(hz) + 6.02) < 0.1, qPrintable(QString::number(w->levelAt(hz))));
+        QImage bins(w->size(), QImage::Format_ARGB32);
+        bins.fill(Qt::black);
+        w->render(&bins);
+        QVERIFY(bins != bands);
+        // K-weighting is asked of the players; Peaks off draws no held peaks.
+        QSignalSpy weighting(w, &AudioAnalysisWidget::kWeightingChanged);
+        w->findChild<QCheckBox*>("spectrumKWeighting")->click();
+        QCOMPARE(weighting.count(), 1);
+        QVERIFY(w->kWeighting());
+        w->setKWeighting(false);
+        w->setPeakHold(false);
+        QVERIFY(!w->peakHold());
+        w->setPeakHold(true);
+        w->setMode(AudioAnalysisWidget::SpectrumMode::Bands);
+        w->clear();
+        QCOMPARE(w->text("CORR"), QString("—"));
+        QCOMPARE(w->levelAt(1000), -120.0);
+    }
+
     void loudnessReadout() {
         auto* readout = win_->findChild<LoudnessReadout*>("loudness");
         QVERIFY(readout);
@@ -10594,7 +10924,7 @@ const auto seq = [this] { return state()->sequence(); };
         reg.setCachePath(dir_.filePath("ofx-cache.json").toStdString());
         reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
         reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
-        QCOMPARE(reg.scan(), 3);
+        QCOMPARE(reg.scan(), 4);
         auto* browser = win_->findChild<EffectsBrowser*>();
         QVERIFY(browser);
         browser->reload();

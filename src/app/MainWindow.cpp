@@ -3,6 +3,7 @@
 #include "PatchGenerator.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
+#include "render/FilmLists.h"
 #include "render/DcpSecurity.h"
 #include "render/OGraf.h"
 #include "render/Ofx.h"
@@ -17,6 +18,7 @@
 
 #include "Keymap.h"
 #include "LoudnessReadout.h"
+#include "AudioAnalysisWidget.h"
 #include "Voiceover.h"
 
 #include <QJsonDocument>
@@ -118,11 +120,13 @@
 #include "AutoMixDialog.h"
 #include "ScriptCutDialog.h"
 #include "QualityCheckDialog.h"
+#include "SoundSamplesDialog.h"
 #include "ConformCheckDialog.h"
 #include "OffloadDialog.h"
 #include "CaptureDialog.h"
 #include "ProductionPanel.h"
 #include "core/AafImport.h"
+#include "core/AvidBinImport.h"
 #include "core/Production.h"
 #include "core/ProjectLock.h"
 #include "core/ProjectIO.h"
@@ -172,6 +176,7 @@
 #include "RedactFacesDialog.h"
 #include "SpectralRepairDialog.h"
 #include "ShotSearchPanel.h"
+#include "SoundLibraryPanel.h"
 #include "ModelPacks.h"
 #include "WorkProgress.h"
 #include "media/Breaths.h"
@@ -216,6 +221,7 @@
 #include "render/VoiceMatch.h"
 #include "render/Exporter.h"
 #include "render/Processing.h"
+#include "render/FrameRepair.h"
 
 namespace montage {
 
@@ -264,6 +270,12 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     });
     connect(state_, &EditorState::playheadChanged, this, [this](FrameTime t) {
         if (t != program_->position()) program_->seek(t);
+    });
+    // The intelligibility lane and readout follow the playhead, the active sequence and its edits.
+    connect(state_, &EditorState::playheadChanged, this, [this] { showIntelligibility(); });
+    connect(state_, &EditorState::sequenceSwitched, this, [this] { showIntelligibility(); });
+    connect(state_, &EditorState::projectChanged, this, [this] {
+        if (const Sequence* s = state_->sequence(); s && intelligibility_.count(s->id)) showIntelligibility();
     });
     connect(program_, &PlaybackController::positionChanged, this, [this](FrameTime t) {
         state_->setPlayhead(t);
@@ -537,6 +549,8 @@ void MainWindow::buildPanels() {
     captionsDock_ = makeDock(tr("Captions"), "captions", captions_);
     transcriptDock_ = makeDock(tr("Transcript"), "transcript", transcript_);
     shotsDock_ = makeDock(tr("Find Shots"), "shots", shots_);
+    soundLibrary_ = new SoundLibraryPanel(state_, nullptr, this);
+    soundLibraryDock_ = makeDock(tr("Sound Library"), "soundLibrary", soundLibrary_);
     peopleDock_ = makeDock(tr("People"), "people", people_);
     assistant_ = new AssistantPanel(liveLink_, this);
     assistantDock_ = makeDock(tr("Assistant"), "assistant", assistant_);
@@ -754,9 +768,16 @@ void MainWindow::buildPanels() {
     ml->setSpacing(2);
     ml->addWidget(meter_, 1);
     ml->addWidget(loudness_);
+    // Phase correlation, goniometer and spectrum beneath.
+    auto* analysis = new AudioAnalysisWidget(meters);
+    analysis->setObjectName(QStringLiteral("audioAnalysis"));
+    ml->addWidget(analysis, 1);
     for (PlaybackController* pc : {program_, source_}) {
         connect(pc, &PlaybackController::loudness, loudness_, &LoudnessReadout::setReading);
         connect(pc, &PlaybackController::dialogueLoudness, loudness_, &LoudnessReadout::setDialogue);
+        connect(pc, &PlaybackController::audioAnalysis, analysis, &AudioAnalysisWidget::setAnalysis);
+        pc->setSpectrumKWeighting(analysis->kWeighting());
+        connect(analysis, &AudioAnalysisWidget::kWeightingChanged, pc, &PlaybackController::setSpectrumKWeighting);
     }
     connect(loudness_, &LoudnessReadout::resetRequested, this, [this] {
         program_->resetLoudness();
@@ -843,7 +864,7 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         resizeDocks({clipsDock_}, {150}, Qt::Vertical);
     } else if (name == "Audio") {
         // The mixer where the Source monitor was, wide meters (Premiere's Audio workspace, Resolve's Fairlight page).
-        arrangeDocks({{mixerDock_, adrDock_, sourceDock_}, {programDock_}}, {{binDock_, effectsDock_}}, {{meterDock_}});
+        arrangeDocks({{mixerDock_, adrDock_, sourceDock_}, {programDock_}}, {{binDock_, soundLibraryDock_, effectsDock_}}, {{meterDock_}});
         resizeDocks({mixerDock_, programDock_}, {900, 640}, Qt::Horizontal);
         resizeDocks({mixerDock_}, {h / 2 + 40}, Qt::Vertical);
         resizeDocks({meterDock_}, {110}, Qt::Horizontal);
@@ -868,7 +889,7 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         resizeDocks({sourceDock_}, {h / 2 + 40}, Qt::Vertical);
     } else {  // Editing
         arrangeDocks({{sourceDock_, inspectorDock_, scopesDock_, mixerDock_, captionsDock_, multicamDock_, keyframesDock_}, {programDock_}},
-                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, peopleDock_, indexDock_, stackedDock_, queueDock_, assistantDock_, nodesDock_, galleryDock_, clipsDock_, trimsDock_, linedScriptDock_}},
+                     {{binDock_, effectsDock_, transcriptDock_, shotsDock_, soundLibraryDock_, peopleDock_, indexDock_, stackedDock_, queueDock_, assistantDock_, nodesDock_, galleryDock_, clipsDock_, trimsDock_, linedScriptDock_}},
                      {{meterDock_}});
         resizeDocks({binDock_}, {380}, Qt::Horizontal);
         resizeDocks({meterDock_}, {70}, Qt::Horizontal);
@@ -1122,8 +1143,14 @@ void MainWindow::buildMenus() {
     add(file, tr("&Link Media…"), QKeySequence(), [this] { showLinkMedia(); })->setObjectName(QStringLiteral("linkMediaAction"));
     add(file, tr("Export &Frame…"), QKeySequence("Ctrl+Shift+E"), [this] { exportFrame(); });
     add(file, tr("Export &VFX Pulls…"), QKeySequence(), [this] { vfxPullDialog(); })->setObjectName(QStringLiteral("vfxPulls"));
-    add(file, tr("&Import Timeline (FCP XML, FCPXML, OTIO, EDL, AAF)…"), QKeySequence(), [this] { importTimeline(); });
+    add(file, tr("&Import Timeline (FCP XML, FCPXML, OTIO, EDL, AAF, bin)…"), QKeySequence(), [this] { importTimeline(); });
     add(file, tr("Import IMF &Package…"), QKeySequence(), [this] { importImfPackage(); })->setObjectName(QStringLiteral("importImf"));
+    add(file, tr("Import Media Composer &Bin…"), QKeySequence(), [this] {
+        QSettings st = appSettings();
+        const QString path = QFileDialog::getOpenFileName(this, tr("Import Media Composer Bin"), st.value("lastImportTimelineDir").toString(),
+                                                          tr("Media Composer bins (*.avb)"));
+        if (!path.isEmpty()) importTimelineFrom(path);
+    })->setObjectName(QStringLiteral("importAvidBin"));
     add(file, tr("Import A&LE (Avid Log Exchange)…"), QKeySequence(), [this] {
         const QString path = QFileDialog::getOpenFileName(this, tr("Import ALE"), QString(), tr("Avid Log Exchange (*.ale *.ALE);;All files (*)"));
         if (!path.isEmpty()) importAle(path);
@@ -1142,6 +1169,34 @@ void MainWindow::buildMenus() {
         ->setObjectName(QStringLiteral("exportAafSound"));
     add(file, tr("Export AAF with Media (Media Composer)…"), QKeySequence(), [this] { exportAafWithMediaDialog(); })
         ->setObjectName(QStringLiteral("exportAafAvid"));
+    add(file, tr("Export Film &Lists…"), QKeySequence(), [this] {
+        // Cut, optical, dupe and pull lists, and (from an earlier version picked here) the change list.
+        const Sequence* now = state_->sequence();
+        if (!now) return;
+        QStringList names{tr("(no change list)")};
+        std::vector<Id> ids{0};
+        for (const Sequence& sq : state_->project().sequences)
+            if (sq.id != now->id && !sq.multicam) {
+                QString name = QString::fromStdString(sq.name);
+                for (int n = 2; names.contains(name); ++n) name = QStringLiteral("%1 (%2)").arg(QString::fromStdString(sq.name)).arg(n);
+                names << name;
+                ids.push_back(sq.id);
+            }
+        bool ok = true;
+        const QString pick = ids.size() < 2 ? names[0]
+                                            : QInputDialog::getItem(this, tr("Export Film Lists"),
+                                                                    tr("Change list from an earlier version of %1:").arg(QString::fromStdString(now->name)),
+                                                                    names, 0, false, &ok);
+        if (!ok) return;
+        QString filter;
+        QString path = QFileDialog::getSaveFileName(this, tr("Export Film Lists"), QString::fromStdString(now->name),
+                                                    tr("Text (*.txt);;CSV (*.csv);;PDF (*.pdf)"), &filter);
+        if (path.isEmpty()) return;
+        const QString ext = filter.contains(QLatin1String("csv")) ? QStringLiteral("csv") : filter.contains(QLatin1String("pdf")) ? QStringLiteral("pdf") : QStringLiteral("txt");
+        const QString suffix = QFileInfo(path).suffix().toLower();
+        if (suffix != QLatin1String("txt") && suffix != QLatin1String("csv") && suffix != QLatin1String("pdf")) path += QLatin1Char('.') + ext;
+        exportFilmLists(path, ids[size_t(std::max<qsizetype>(0, names.indexOf(pick)))]);
+    })->setObjectName(QStringLiteral("exportFilmLists"));
     file->addSeparator();
     add(file, tr("&Quit"), QKeySequence::Quit, [this] { close(); });
 
@@ -1341,6 +1396,21 @@ void MainWindow::buildMenus() {
             appSettings().setValue("breathControl/amount", amount);
             breathControl(amount);
         }))->setObjectName(QStringLiteral("breathControl"));
+    add(clipM, tr("Repair Damaged Frames…"), QKeySequence(), withSeq([this] { repairDamagedFrames(); }))
+        ->setObjectName(QStringLiteral("repairDamagedFrames"));
+    add(clipM, tr("Edit Sound by Samples…"), QKeySequence(), withSeq([this] {
+        // The selected sound clip.
+        const Sequence* s = state_->sequence();
+        Id clip = 0;
+        for (Id id : state_->selectedClips())
+            if (const auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Audio) clip = id;
+        if (!clip) {
+            state_->message(tr("Select the sound clip to edit by samples"));
+            return;
+        }
+        SoundSamplesDialog dlg(state_, clip, this);
+        dlg.exec();
+    }))->setObjectName(QStringLiteral("editSoundBySamples"));
     add(clipM, tr("Remove Mic &Bleed…"), QKeySequence(), withSeq([this] { micBleedDialog(); }))->setObjectName(QStringLiteral("removeMicBleed"));
     add(clipM, tr("Separate Stems…"), QKeySequence(), withSeq([this] {
             std::vector<Id> clips;
@@ -1938,6 +2008,18 @@ void MainWindow::buildMenus() {
         QualityCheckDialog dlg(state_, this);
         dlg.exec();
     })->setObjectName(QStringLiteral("qualityCheck"));
+    add(seqM, tr("Dialogue &Intelligibility…"), QKeySequence(), [this] {
+            QStringList presets;
+            for (const std::string& n : intelligibilityPresetNames()) presets << QString::fromStdString(n);
+            bool ok = false;
+            const QString preset = QInputDialog::getItem(this, tr("Dialogue Intelligibility"),
+                                                         tr("How well the dialogue can be followed over the music and effects, judged as:"),
+                                                         presets, std::max<qsizetype>(0, presets.indexOf(appSettings().value("intelligibility/preset", "Standard").toString())),
+                                                         false, &ok);
+            if (!ok) return;
+            appSettings().setValue("intelligibility/preset", preset);
+            analyseIntelligibility(preset);
+        })->setObjectName(QStringLiteral("analyseIntelligibility"));
     add(seqM, tr("Analyse HDR &Light Levels…"), QKeySequence(), [this] { analyseHdrLightLevels(); })->setObjectName(QStringLiteral("analyseHdrLightLevels"));
     add(seqM, tr("Next Marker"), QKeySequence("Shift+M"), [this] { jumpMarker(true); });
     add(seqM, tr("Previous Marker"), QKeySequence("Ctrl+Shift+M"), [this] { jumpMarker(false); });
@@ -2267,6 +2349,29 @@ void MainWindow::buildMenus() {
             a->setObjectName(QStringLiteral("stereoView_") + QString::fromStdString(stereoViewName(view)));
             a->setCheckable(true);
             a->setChecked(view == initial);
+            group->addAction(a);
+        }
+    }
+    // What the timecode readouts count in (EditorState.h counterDisplay).
+    QMenu* counterM = play->addMenu(tr("Counter"));
+    counterM->setObjectName(QStringLiteral("counterMenu"));
+    counterM->setToolTip(tr("Timecode, or feet and frames in the sequence's film gauge (Sequence Settings)"));
+    {
+        auto* group = new QActionGroup(counterM);
+        const std::pair<Counter, QString> counters[] = {
+            {Counter::Timecode, tr("Timecode")},
+            {Counter::Feet, tr("Feet and Frames")},
+            {Counter::FeetFromPicture, tr("Feet and Frames from the First Picture")},
+        };
+        const char* names[] = {"counterTimecode", "counterFeet", "counterFeetFromPicture"};
+        for (const auto& [counter, label] : counters) {
+            QAction* a = counterM->addAction(label, this, [this, counter = counter] {
+                setCounterDisplay(counter);
+                emit state_->projectChanged();
+            });
+            a->setObjectName(QLatin1String(names[int(counter)]));
+            a->setCheckable(true);
+            a->setChecked(counter == counterDisplay());
             group->addAction(a);
         }
     }
@@ -2637,6 +2742,7 @@ void MainWindow::rebuildSourceProject() {
     int h = m->hasVideo && m->height > 0 ? m->height : main->height;
     Sequence ss = makeSequence(tmp, "Source", w, h, main->fps, 1, 1);
     ss.sampleRate = main->sampleRate;
+    ss.filmGauge = main->filmGauge;  // (its readouts count as the sequence's)
     edit::placeMedia(tmp, ss, m->id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
     sourceSequence_ = ss.id;
     tmp.sequences.push_back(ss);
@@ -4015,6 +4121,29 @@ int MainWindow::importAle(const QString& path, bool cdlToClips) {
     if (!result.unmatched.empty()) msg += tr("; not found: %1").arg(QString::fromStdString(result.unmatched.front())) + (result.unmatched.size() > 1 ? tr(" and %n more", nullptr, int(result.unmatched.size() - 1)) : QString());
     state_->message(msg, 8000);
     return int(result.matched.size());
+}
+
+bool MainWindow::exportFilmLists(const QString& path, Id earlier) {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    const Project& p = state_->project();
+    const FilmLists lists = filmLists(p, *s);
+    std::optional<CutChanges> changes;
+    if (const Sequence* old = earlier ? p.findSequence(earlier) : nullptr) {
+        std::string err;
+        changes = cutChanges(p, *old, *s, &err);
+        if (!err.empty()) {
+            state_->message(QString::fromStdString(err), 6000);
+            return false;
+        }
+    }
+    QString err;
+    if (!writeFilmLists(lists, changes ? &*changes : nullptr, path, &err)) {
+        state_->message(err, 6000);
+        return false;
+    }
+    state_->message(tr("Wrote film lists of %n event(s) to %1", nullptr, int(lists.events.size())).arg(QFileInfo(path).fileName()), 6000);
+    return true;
 }
 
 bool MainWindow::exportAle(const QString& path) {
@@ -5511,6 +5640,103 @@ Id MainWindow::makeHighlights(double seconds, const QString& lookFor) {
         state_->message(tr("%n moment(s) in a new Highlights sequence", "", int(moments.size())), 6000);
     }
     return seq;
+}
+
+double MainWindow::analyseIntelligibility(const QString& preset) {
+    const Sequence* s = state_->sequence();
+    if (!s) return -1;
+    IntelligibilityLimits limits;
+    if (!intelligibilityPreset(preset.toStdString(), limits)) return -1;
+    const Project project = state_->project();
+    const Sequence seq = *s;
+    const uint64_t revision = state_->history().revision(), generation = state_->projectGeneration();
+    Intelligibility r;
+    if (!runWithProgress(this, state_, tr("Measuring dialogue intelligibility…"), [&](const auto& progress, const auto* cancel, std::string* e) {
+            r = measureIntelligibility(project, seq, {}, progress, cancel, e);
+            return r.valid;
+        }))
+        return -1;
+    // (Edits made while it measured leave it stale; another project opened meanwhile, unused.)
+    if (generation != state_->projectGeneration()) return -1;
+    intelligibility_[seq.id] = {r, limits, revision, generation};
+    showIntelligibility();
+    const auto hard = r.under(limits.poor, 2.0);
+    state_->message(tr("Dialogue intelligibility %1 on average; %n stretch(es) hard to follow (red in the ruler)", "", int(hard.size()))
+                        .arg(r.average, 0, 'f', 2),
+                    8000);
+    return r.average;
+}
+
+void MainWindow::showIntelligibility() {
+    std::erase_if(intelligibility_, [this](const auto& run) { return run.second.generation != state_->projectGeneration(); });
+    const Sequence* s = state_->sequence();
+    const auto it = s ? intelligibility_.find(s->id) : intelligibility_.end();
+    if (it == intelligibility_.end()) {
+        timeline_->setIntelligibilityLane({}, false);
+        if (loudness_) loudness_->setIntelligibility(-1, 0);
+        return;
+    }
+    const IntelligibilityRun& run = it->second;
+    auto status = [&](double v) { return v < run.limits.poor ? 2 : v < run.limits.fair ? 1 : 0; };
+    const double fps = s->fpsValue();
+    std::vector<TimelineWidget::IntelligibilitySpan> spans;
+    for (const IntelligibilityBlock& b : run.result.blocks) {
+        if (!b.speech) continue;
+        const FrameTime a = FrameTime(std::floor(b.start * fps + 1e-6)), e = std::max(a + 1, FrameTime(std::ceil(b.end * fps - 1e-6)));
+        const int st = status(b.index);
+        if (!spans.empty() && spans.back().status == st && spans.back().end >= a) spans.back().end = e;
+        else spans.push_back({a, e, st});
+    }
+    timeline_->setIntelligibilityLane(std::move(spans), run.revision != state_->history().revision());
+    const double v = run.result.at(double(state_->playhead()) / fps);
+    if (loudness_) loudness_->setIntelligibility(v, v >= 0 ? status(v) : 0);
+}
+
+int MainWindow::repairDamagedFrames() {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    // The selected video clips, else the one under the playhead on the target video track.
+    std::vector<Id> clips;
+    for (Id id : state_->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Video) clips.push_back(id);
+    if (clips.empty())
+        if (const Track* t = trackAt(*s, {TrackKind::Video, state_->targetVideoTrack()}))
+            for (const Clip& c : t->clips)
+                if (c.start <= state_->playhead() && state_->playhead() < c.end()) clips.push_back(c.id);
+    std::erase_if(clips, [&](Id id) {
+        const MediaItem* m = state_->project().findMedia(edit::clipById(*s, id)->mediaId);
+        return !m || m->kind != MediaKind::Video;
+    });
+    if (clips.empty()) {
+        state_->message(tr("Select the video clips whose damaged frames to repair"));
+        return 0;
+    }
+    // Found off the interface thread, then listed on each clip's Frame Repair effect in one undo step.
+    const Project project = state_->project();
+    const Sequence seq = *s;
+    std::vector<std::pair<Id, std::vector<DamagedFrame>>> found;
+    if (!runWithProgress(this, state_, tr("Finding damaged frames…"), [&](const auto& progress, const auto* cancel, std::string* e) {
+            for (size_t i = 0; i < clips.size(); ++i) {
+                std::vector<DamagedFrame> frames;
+                const auto part = [&](double f) { progress((double(i) + f) / double(clips.size())); };
+                if (!damagedFramesInClip(project, seq, *edit::clipById(seq, clips[i]), frames, part, cancel, e)) return false;
+                found.push_back({clips[i], std::move(frames)});
+            }
+            return true;
+        }))
+        return 0;
+    size_t total = 0;
+    for (const auto& [id, frames] : found) total += frames.size();
+    if (total)
+        state_->edit(tr("Repair Damaged Frames"), [&](Project& p, Sequence& sq) {
+            for (const auto& [id, frames] : found)
+                if (Clip* c = edit::clipById(sq, id)) listDamagedFrames(p, sq, *c, frames);
+            return true;
+        });
+    state_->message(total ? tr("%n damaged frame(s) found and repaired (marked on the timeline)", "", int(total))
+                          : tr("No damaged frames found"),
+                    6000);
+    return int(total);
 }
 
 int MainWindow::importEmbeddedCaptions() {
@@ -8610,9 +8836,10 @@ void MainWindow::exportAafWithMediaDialog() {
 void MainWindow::importTimeline() {
     QSettings st = appSettings();
     QString path = QFileDialog::getOpenFileName(this, tr("Import Timeline"), st.value("lastImportTimelineDir").toString(),
-                                                tr("Timelines (*.xml *.fcpxml *.otio *.edl *.aaf);;Final Cut Pro 7 XML (*.xml);;"
+                                                tr("Timelines (*.xml *.fcpxml *.otio *.edl *.aaf *.avb);;Final Cut Pro 7 XML (*.xml);;"
                                                    "FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl);;"
-                                                   "AAF (Media Composer, Pro Tools) (*.aaf);;IMF composition (CPL*.xml ASSETMAP.xml)"));
+                                                   "AAF (Media Composer, Pro Tools) (*.aaf);;Media Composer bin (*.avb);;"
+                                                   "IMF composition (CPL*.xml ASSETMAP.xml)"));
     if (path.isEmpty()) return;
     importTimelineFrom(path);
 }
@@ -8640,17 +8867,28 @@ void MainWindow::importTimelineFrom(QString path) {
     }
     st.setValue("lastImportTimelineDir", QFileInfo(path).absolutePath());
     const QString suffix = QFileInfo(path).suffix().toLower();
-    const std::string text = suffix == QLatin1String("aaf") || imf ? std::string() : f.readAll().toStdString();
+    const std::string text = suffix == QLatin1String("aaf") || suffix == QLatin1String("avb") || imf ? std::string() : f.readAll().toStdString();
     const MediaProber prober = [](const std::string& file, MediaItem& m) { return probeMedia(file, m, nullptr); };
     const QString ext = QFileInfo(path).suffix().toLower();
     // EDLs do not say their rate: take the open sequence's.
     const Rational fps = state_->sequence() ? state_->sequence()->fps : Rational{30, 1};
     const std::string dir = QFileInfo(path).absolutePath().toStdString();
     ImportResult r;
+    // A bin: its clips as media, its sequences as sequences (the first opened).
+    size_t binMedia = 0;
+    const auto importBin = [&](Project& p) {
+        const AvidBinImport b = importAvidBin(p, path.toStdString(), prober);
+        binMedia = b.media.size() + b.sequences.size();
+        ImportResult out;
+        out.ok = b.ok, out.error = b.error, out.clips = b.clips, out.offline = b.offline, out.warnings = b.warnings;
+        out.sequence = b.sequences.empty() ? 0 : b.sequences.front();
+        return out;
+    };
     QApplication::setOverrideCursor(Qt::WaitCursor);
     state_->edit(tr("Import Timeline"), [&](Project& p, Sequence&) {
         r = imf                               ? importImf(p, path.toStdString(), prober)
             : ext == "aaf"                    ? importAaf(p, path.toStdString(), prober)
+            : ext == "avb"                    ? importBin(p)
             : ext == "edl"                    ? importEdl(p, text, fps, prober, dir)
             : ext == "xml" || ext == "fcpxml" ? importXmlTimeline(p, text, prober)
                                               : importOtio(p, text, prober);
@@ -8661,13 +8899,16 @@ void MainWindow::importTimelineFrom(QString path) {
         QMessageBox::warning(this, tr("Import Timeline"), QString::fromStdString(r.error));
         return;
     }
-    state_->setActiveSequence(r.sequence);
+    if (r.sequence) state_->setActiveSequence(r.sequence);
     QStringList notes;
     if (!r.offline.empty()) notes << tr("%n file(s) not found; their clips are offline:", "", int(r.offline.size()));
     for (size_t i = 0; i < r.offline.size() && i < 10; ++i) notes << QStringLiteral("  ") + QString::fromStdString(r.offline[i]);
     for (const auto& w : r.warnings) notes << QString::fromStdString(w);
     if (!notes.isEmpty()) QMessageBox::information(this, tr("Import Timeline"), notes.join('\n'));
-    statusBar()->showMessage(tr("Imported %n clip(s) from %1", "", r.clips).arg(QFileInfo(path).fileName()), 5000);
+    if (ext == "avb")
+        statusBar()->showMessage(tr("Imported %n bin item(s) from %1", "", int(binMedia)).arg(QFileInfo(path).fileName()), 5000);
+    else
+        statusBar()->showMessage(tr("Imported %n clip(s) from %1", "", r.clips).arg(QFileInfo(path).fileName()), 5000);
 }
 
 void MainWindow::addTitle() {
@@ -8751,6 +8992,7 @@ void MainWindow::newSequence() {
             s.spherical = spec.spherical;
             s.vr180 = spec.vr180;
             s.stereo3d = spec.stereo3d;
+            s.filmGauge = spec.filmGauge;
             return true;
         });
 }

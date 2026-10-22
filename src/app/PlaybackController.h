@@ -15,6 +15,7 @@
 
 #include "core/Adr.h"
 #include "core/Model.h"
+#include "media/StereoAnalysis.h"
 #include "render/Compositor.h"
 #include "render/HdrView.h"
 
@@ -95,6 +96,8 @@ public:
     // An ADR cycle (core/Adr.h): its beeps are heard while it is set; the Program monitor draws its streamer.
     void setAdrCycle(const std::optional<AdrCycle>& cycle);
     const std::optional<AdrCycle>& adrCycle() const { return cycle_; }
+    // Whether the spectrum in audioAnalysis is K-weighted (BS.1770's curve, as loudness hears it).
+    void setSpectrumKWeighting(bool on);
     // What the speakers get for `frames` samples of the sequence from sample `start` (silence under Global Mute).
     std::vector<float> heard(int64_t start, int frames);
     double speed() const { return speed_; }
@@ -135,6 +138,8 @@ signals:
     // pauses and all, else transcribed words; -200 for none yet) and the share of the sound that is speech (-1: the
     // sequence marks none). An approximation: exports and Quality Check narrow Dialogue clips to where they sound.
     void dialogueLoudness(double integrated, double speechShare);
+    // Phase correlation, goniometer and spectrum of what is heard (media/StereoAnalysis.h), ten times a second.
+    void audioAnalysis(montage::AudioAnalysisPtr analysis);
     void playingChanged(bool playing);
 
 private slots:

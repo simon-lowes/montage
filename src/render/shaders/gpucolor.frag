@@ -115,9 +115,21 @@ float curveAt(int ch, int row, float v, int n) {
     const float f = x - float(i);
     return texelFetch(table, ivec2(i, row), 0)[ch] * (1.0 - f) + texelFetch(table, ivec2(i + 1, row), 0)[ch] * f;
 }
+// The same, carried on past either end at the end's slope (a floating-point picture's highlights).
+float curveOn(int ch, float v) {
+    const int n = 1024;
+    if (v > 1.0) {
+        const float e = texelFetch(table, ivec2(n, 0), 0)[ch];
+        return e + (v - 1.0) * (e - texelFetch(table, ivec2(n - 1, 0), 0)[ch]) * float(n);
+    }
+    if (v < 0.0) {
+        const float e = texelFetch(table, ivec2(0, 0), 0)[ch];
+        return e + v * (texelFetch(table, ivec2(1, 0), 0)[ch] - e) * float(n);
+    }
+    return curveAt(ch, 0, v, n);
+}
 vec3 curves(vec3 c) {
-    const vec3 n = vec3(curveAt(1, 0, curveAt(0, 0, c.r, 1024), 1024), curveAt(2, 0, curveAt(0, 0, c.g, 1024), 1024),
-                        curveAt(3, 0, curveAt(0, 0, c.b, 1024), 1024));
+    const vec3 n = vec3(curveOn(1, curveOn(0, c.r)), curveOn(2, curveOn(0, c.g)), curveOn(3, curveOn(0, c.b)));
     return c + (n - c) * p[1].x;
 }
 

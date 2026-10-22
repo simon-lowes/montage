@@ -9,6 +9,9 @@
 #include <QJsonObject>
 
 #include "core/Ale.h"
+#include "core/FilmCount.h"
+#include <QtEndian>
+#include <cstring>
 #include "core/Cdl.h"
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
@@ -9652,6 +9655,165 @@ private slots:
         QCOMPARE(c0.effects.size(), size_t(3));
         QCOMPARE(c0.effects[0].type, std::string("cdl"));
         QVERIFY(clipCdl(c0, 0, cc0) && cc0.sameGrade(h));
+    }
+
+    void filmCounts() {
+        // Feet and frames: 16 frames a foot of 35 mm 4-perf, 64 frames in 3 feet of 3-perf, 40 a foot of 16 mm.
+        const FilmGauge& four = filmGauge("35mm-4perf");
+        const FilmGauge& three = filmGauge("35mm-3perf");
+        const FilmGauge& sixteen = filmGauge("16mm");
+        QCOMPARE(formatFeetFrames(0, four), std::string("0+00"));
+        QCOMPARE(formatFeetFrames(16, four), std::string("1+00"));
+        QCOMPARE(formatFeetFrames(1447, four), std::string("90+07"));
+        QCOMPARE(formatFeetFrames(-3, four), std::string("-0+03"));
+        QCOMPARE(formatFeetFrames(40, sixteen), std::string("1+00"));
+        QCOMPARE(formatFeetFrames(65, filmGauge("65mm-5perf")), std::string("5+01.0"));
+        // 3-perf frames start on another perforation of each foot, the pattern coming round every 64 frames.
+        QCOMPARE(formatFeetFrames(21, three), std::string("0+21.0"));
+        QCOMPARE(formatFeetFrames(22, three), std::string("1+00.2"));
+        QCOMPARE(formatFeetFrames(43, three), std::string("2+00.1"));
+        QCOMPARE(formatFeetFrames(64, three), std::string("3+00.0"));
+        QCOMPARE(formatFeetFrames(64 * 7 + 22, three), std::string("22+00.2"));
+        for (const FilmGauge& g : filmGauges())
+            for (int64_t f = -70; f < 400; ++f) {
+                int64_t back = 0;
+                QVERIFY2(parseFeetFrames(formatFeetFrames(f, g), g, back) && back == f, g.id);
+            }
+        int64_t f = 0;
+        QVERIFY(parseFeetFrames("12", four, f) && f == 192);
+        QVERIFY(!parseFeetFrames("1+16", four, f));    // past the foot
+        QVERIFY(!parseFeetFrames("1+00.1", three, f));  // between frames
+        QVERIFY(!parseFeetFrames("1+05x", four, f) && !parseFeetFrames("", four, f) && !parseFeetFrames("+3", four, f));
+
+        // Key numbers: a count every foot of 35 mm (64 perforations), every half foot of 16 mm (20 frames).
+        FilmNumber k;
+        QVERIFY(parseFilmNumber("KJ 23 1234 5678+05", four, k));
+        QCOMPARE(k.prefix, std::string("KJ 23 1234"));
+        QCOMPARE(k.count, int64_t(5678));
+        QCOMPARE(k.perfs, 20);
+        QCOMPARE(formatFilmNumber(advanceFilmNumber(k, 11, four), four), std::string("KJ 23 1234 5679+00"));
+        QCOMPARE(formatFilmNumber(advanceFilmNumber(k, -6, four), four), std::string("KJ 23 1234 5677+15"));
+        QCOMPARE(filmNumberFrames(k, advanceFilmNumber(k, 1000, four), four), std::optional<int64_t>(1000));
+        FilmNumber written;
+        QVERIFY(parseFilmNumber("KJ231234 5678+05", four, written) && written.count == 5678 && written.perfs == 20);
+        QVERIFY(!filmNumberFrames(k, written, four));  // another roll (as written)
+        // 3-perf: each count is 21 frames and a perforation on.
+        FilmNumber k3;
+        QVERIFY(parseFilmNumber("0223 12 3456 0100+00.0", three, k3));
+        QCOMPARE(formatFilmNumber(advanceFilmNumber(k3, 22, three), three), std::string("0223 12 3456 0101+00.2"));
+        QCOMPARE(formatFilmNumber(advanceFilmNumber(k3, 64, three), three), std::string("0223 12 3456 0103+00.0"));
+        QVERIFY(!parseFilmNumber("0223 12 3456 0100+21.2", three, k3));  // the next count's
+        FilmNumber k16;
+        QVERIFY(parseFilmNumber("EK 12 3456 0010+19", sixteen, k16));
+        QCOMPARE(formatFilmNumber(advanceFilmNumber(k16, 1, sixteen), sixteen), std::string("EK 12 3456 0011+00"));
+        // Ink numbers: a count a foot whatever the gauge.
+        FilmNumber ink;
+        QVERIFY(parseFilmNumber("123A 4567+39", sixteen, ink, true));
+        QCOMPARE(formatFilmNumber(advanceFilmNumber(ink, 1, sixteen), sixteen), std::string("123A 4568+00"));
+
+        // A DPX film header (big-endian) and a Cineon one.
+        QTemporaryDir dir;
+        {
+            QByteArray d(2048, '\0');
+            std::memcpy(d.data(), "SDPX", 4);
+            std::memset(d.data() + 1664, 0xff, 384);
+            auto put = [&](int at, const char* text) { std::memcpy(d.data() + at, text, std::strlen(text)); };
+            put(1664, "02");
+            put(1666, "23");
+            put(1668, "07");  // 7 perforations past the count: a 3-perf frame
+            put(1670, "123456");
+            put(1676, "0042");
+            put(1680, "Super 35");
+            d[1680 + 8] = 0;
+            const float rate = 24;
+            quint32 bits;
+            std::memcpy(&bits, &rate, 4);
+            qToBigEndian<quint32>(bits, d.data() + 1724);
+            qToBigEndian<quint32>(1001, d.data() + 1712);
+            QFile f(dir.path() + "/a.dpx");
+            QVERIFY(f.open(QIODevice::WriteOnly) && f.write(d) == d.size());
+        }
+        FilmScanHeader h;
+        QVERIFY(readFilmScanHeader((dir.path() + "/a.dpx").toStdString(), h));
+        QVERIFY(h.hasKeyKode);
+        QCOMPARE(h.key.prefix, std::string("0223 12 3456"));
+        QCOMPARE(h.key.count, int64_t(42));
+        QCOMPARE(h.key.perfs, 7);
+        QCOMPARE(h.format, std::string("Super 35"));
+        QCOMPARE(h.frameRate, 24.0);
+        QCOMPARE(h.framePosition, int64_t(1001));
+        QCOMPARE(std::string(filmScanGauge(h).id), std::string("35mm-3perf"));
+        QCOMPARE(filmScanKeyNumber(h, three), std::string("0223 12 3456 0042+02.1"));
+        QCOMPARE(filmScanKeyNumber(h, four), std::string("0223 12 3456 0042+01.3"));  // (frames starting off the mark)
+        // The gauge from the next frame's key number: 4 perforations on is 4-perf whatever the offset, 1 is 16 mm
+        // (counts 20 apart), 5 is 65 mm (120 apart).
+        FilmScanHeader next = h;
+        next.key.perfs = 11;
+        QCOMPARE(std::string(filmScanGauge(h, &next).id), std::string("35mm-4perf"));
+        next.key.perfs = 8;
+        QCOMPARE(std::string(filmScanGauge(h, &next).id), std::string("16mm"));
+        FilmScanHeader at119 = h, at4 = h;
+        at119.key.perfs = 119;
+        at4.key.count = 43, at4.key.perfs = 4;
+        QCOMPARE(std::string(filmScanGauge(at119, &at4).id), std::string("65mm-5perf"));
+        FilmScanHeader wide = h;
+        wide.format = "Super 35 16:9";
+        QCOMPARE(std::string(filmScanGauge(wide).id), std::string("35mm-3perf"));  // not 16 mm
+        wide.format = "Super 16";
+        QCOMPARE(std::string(filmScanGauge(wide).id), std::string("16mm"));
+        {
+            QByteArray d(2048, '\xff');
+            qToBigEndian<quint32>(0x802a5fd7, d.data());
+            d[1024] = 2, d[1025] = 23, d[1026] = 8;
+            qToBigEndian<quint32>(123456, d.data() + 1028);
+            qToBigEndian<quint32>(42, d.data() + 1032);
+            QFile f(dir.path() + "/a.cin");
+            QVERIFY(f.open(QIODevice::WriteOnly) && f.write(d) == d.size());
+        }
+        QVERIFY(readFilmScanHeader((dir.path() + "/a.cin").toStdString(), h));
+        QVERIFY(h.hasKeyKode && h.key.prefix == "0223 12 3456" && h.key.count == 42 && h.key.perfs == 8);
+        QCOMPARE(filmScanKeyNumber(h, filmScanGauge(h)), std::string("0223 12 3456 0042+02"));
+        QVERIFY(h.format.empty() && h.framePosition == -1);
+        {
+            QFile f(dir.path() + "/no.dpx");
+            QVERIFY(f.open(QIODevice::WriteOnly) && f.write(QByteArray(2048, 'x')) == 2048);
+        }
+        QVERIFY(!readFilmScanHeader((dir.path() + "/no.dpx").toStdString(), h));
+
+        // A log's KN Start and Ink Number columns onto media, and out again only when some media has them.
+        Project p = makeDefaultProject();
+        for (const char* name : {"A001", "A002"}) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Video;
+            m.name = name;
+            m.path = std::string("/scans/") + name + ".mov";
+            m.duration = 4;
+            m.fps = {24, 1};
+            m.hasVideo = true;
+            p.media.push_back(m);
+        }
+        AleTable t;
+        QVERIFY(parseAle("Heading\nFIELD_DELIM\tTABS\nFPS\t24\n\nColumn\nName\tKN Start\tInk Number\n\nData\n"
+                         "A001\tKJ 23 1234 5678+05\t123A 4567+00\n", t));
+        QCOMPARE(applyAle(p, t, false).matched.size(), size_t(1));
+        QCOMPARE(p.media[0].metadata.at("key_number"), std::string("KJ 23 1234 5678+05"));
+        QCOMPARE(formatFilmNumber(*mediaFilmNumber(p.media[0], false, 11, four), four), std::string("KJ 23 1234 5679+00"));
+        QCOMPARE(formatFilmNumber(*mediaFilmNumber(p.media[0], true, 16, four), four), std::string("123A 4568+00"));
+        QVERIFY(!mediaFilmNumber(p.media[1], false, 0, four));
+        const AleTable out = aleFromMedia(p, {p.media[0].id, p.media[1].id}, {24, 1});
+        QCOMPARE(out.value(0, "KN Start"), std::string("KJ 23 1234 5678+05"));
+        QCOMPARE(out.value(0, "Ink Number"), std::string("123A 4567+00"));
+        const AleTable plain = aleFromMedia(p, {p.media[1].id}, {24, 1});
+        QVERIFY(std::find(plain.columns.begin(), plain.columns.end(), "KN Start") == plain.columns.end());
+
+        // The sequence's gauge is saved with it.
+        p.active()->filmGauge = "16mm";
+        const std::string file = (dir.path() + "/film.montage").toStdString();
+        QVERIFY(saveProject(p, file));
+        Project back;
+        QVERIFY(loadProject(file, back));
+        QCOMPARE(back.active()->filmGauge, std::string("16mm"));
     }
 
     void aleAmfColumns() {

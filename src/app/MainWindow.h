@@ -30,6 +30,7 @@
 #include "render/RoomTone.h"
 #include "render/Versions.h"
 #include "render/RemoteReview.h"
+#include "render/Intelligibility.h"
 
 class QAction;
 class QActionGroup;
@@ -69,6 +70,7 @@ class ControlSurface;
 class CaptionsPanel;
 class TranscriptPanel;
 class ShotSearchPanel;
+class SoundLibraryPanel;
 class PeoplePanel;
 class MulticamPanel;
 class AdrPanel;
@@ -177,6 +179,13 @@ public:
     // Clip › Breath Control: the breaths in the selected audio clips turned down by `amountDb` with volume keys (one
     // undo step). How many breaths.
     int breathControl(double amountDb);
+    // Clip › Repair Damaged Frames: the selected video clips' broken frames (else the clip under the playhead's) found
+    // and listed on their Frame Repair effect, which rebuilds them, each marked on the timeline (one undo step). How many.
+    int repairDamagedFrames();
+    // Sequence › Dialogue Intelligibility: the active sequence's dialogue measured against `preset`'s limits (render/
+    // Intelligibility.h), shown in the timeline's intelligibility lane and, at the playhead, the meters' INT readout.
+    // The average, or -1 when it could not be measured.
+    double analyseIntelligibility(const QString& preset);
     // Clip › Import Embedded Captions: the CEA-608 captions inside the selected video clip's file (else the clip under
     // the playhead on the target video track) as a new caption track where the clip plays them. How many captions.
     int importEmbeddedCaptions();
@@ -291,6 +300,9 @@ public:
     // the selected media (else all) as an ALE.
     int importAle(const QString& path, bool cdlToClips = true);
     bool exportAle(const QString& path);
+    // Film lists of the active sequence (render/FilmLists.h): .txt, .csv or .pdf; with `earlier` (another sequence),
+    // the change list from it too.
+    bool exportFilmLists(const QString& path, Id earlier = 0);
     // ASC CDL files (core/Cdl.h): a .cc, .ccc or .cdl onto the selected video clips (one correction onto all of them,
     // a collection matched by id to each clip's name, file or tape), returning how many clips were graded; the selected
     // clips' CDLs (else every clip with one) as a .cc (one) or a .ccc or .cdl.
@@ -570,6 +582,7 @@ private:
     CaptionsPanel* captions_ = nullptr;
     TranscriptPanel* transcript_ = nullptr;
     ShotSearchPanel* shots_ = nullptr;
+    SoundLibraryPanel* soundLibrary_ = nullptr;
     PeoplePanel* people_ = nullptr;
     AudioMeterWidget* meter_ = nullptr;
     LoudnessReadout* loudness_ = nullptr;
@@ -582,6 +595,15 @@ private:
     void startBackgroundRender();
     void stopBackgroundRender();  // cancels a running job and waits for the next quiet spell
     int renderBarGeneration_ = 0;
+    // Each sequence's last intelligibility analysis, stale once the project is edited after it.
+    struct IntelligibilityRun {
+        Intelligibility result;
+        IntelligibilityLimits limits;
+        uint64_t revision = 0;    // the edit history's when the sequence was copied to be measured
+        uint64_t generation = 0;  // the project's (EditorState::projectGeneration): another project's runs are dropped
+    };
+    std::map<Id, IntelligibilityRun> intelligibility_;
+    void showIntelligibility();
     std::vector<QDockWidget*> docks_;
     QDockWidget* sourceDock_ = nullptr;
     QDockWidget* programDock_ = nullptr;
@@ -593,6 +615,7 @@ private:
     QDockWidget* captionsDock_ = nullptr;
     QDockWidget* transcriptDock_ = nullptr;
     QDockWidget* shotsDock_ = nullptr;
+    QDockWidget* soundLibraryDock_ = nullptr;
     QDockWidget* peopleDock_ = nullptr;
     QDockWidget* assistantDock_ = nullptr;
     AssistantPanel* assistant_ = nullptr;

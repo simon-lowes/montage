@@ -26,6 +26,7 @@
 #include "EditorState.h"
 #include "LensCorrectionDialog.h"
 #include "ModelPacks.h"
+#include "SoundLibraryPanel.h"
 #include "StackedTimelineWidget.h"
 #include "render/Exporter.h"
 #include "Theme.h"
@@ -735,6 +736,12 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
         p.setPen(QPen(QColor(0, 0, 0, 60), 1));
         for (int x = r.left() - r.height(); x < r.right(); x += 8) p.drawLine(x, r.bottom(), x + r.height(), r.top());
     }
+    if (row.ref.kind == TrackKind::Audio && (c.head > 0 || c.tail > 0)) {
+        // Sound placed between frames: the silent part of its first and last frame shaded.
+        const int head = int(std::lround(c.head * ppf_)), tail = int(std::lround(c.tail * ppf_));
+        if (head > 0) p.fillRect(QRect(r.left(), r.top(), head, r.height()), QColor(0, 0, 0, 110));
+        if (tail > 0) p.fillRect(QRect(r.right() + 1 - tail, r.top(), tail, r.height()), QColor(0, 0, 0, 110));
+    }
     paintLane(p, c, row.ref.kind, r);
     if (isThroughEdit(c.id)) {
         // A through edit (the picture or sound runs straight on): a small arrowhead into the cut, as Premiere marks it.
@@ -768,7 +775,7 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
         badges.prepend(QStringLiteral(" ") + QString::fromStdString(c.role) +
                        (edit::roleMuted(*state_->sequence(), c.role) ? tr(" (muted)") : QString()));
     if (showDurations_ && state_->sequence())  // Resolve 21.1's clip durations view option
-        badges += QStringLiteral("  ") + QString::fromStdString(formatTimecode(c.duration, state_->sequence()->fps));
+        badges += QStringLiteral("  ") + durationString(state_->sequence(), c.duration);
     QFont f = p.font();
     f.setPointSize(8);
     p.setFont(f);
@@ -1364,6 +1371,12 @@ void TimelineWidget::paintWaveform(QPainter& p, const Clip& c, const QRect& r, c
     }
 }
 
+void TimelineWidget::setIntelligibilityLane(std::vector<IntelligibilitySpan> spans, bool stale) {
+    intelligibility_ = std::move(spans);
+    intelligibilityStale_ = stale;
+    viewport()->update();
+}
+
 void TimelineWidget::setRenderedRanges(std::vector<std::pair<FrameTime, FrameTime>> ranges) {
     rendered_ = std::move(ranges);
     viewport()->update();
@@ -1413,6 +1426,14 @@ void TimelineWidget::paintRuler(QPainter& p) {
         if (xb < kHeaderW || xa > W) continue;
         p.fillRect(QRect(xa, kRulerH - 3, std::max(1, xb - xa), 2), QColor(63, 185, 80));
     }
+    // Intelligibility lane: green, amber and red where the dialogue was measured.
+    for (const IntelligibilitySpan& sp : intelligibility_) {
+        const int xa = xForFrame(sp.first), xb = xForFrame(sp.end);
+        if (xb < kHeaderW || xa > W) continue;
+        QColor c = sp.status == 0 ? QColor(63, 185, 80) : sp.status == 1 ? QColor(210, 153, 34) : QColor(248, 81, 73);
+        if (intelligibilityStale_) c.setAlpha(90);
+        p.fillRect(QRect(xa, kRulerH - 10, std::max(1, xb - xa), 3), c);
+    }
     // In/out band.
     if (s->inPoint >= 0 || s->outPoint >= 0) {
         int a = xForFrame(std::max<FrameTime>(0, s->inPoint));
@@ -1421,7 +1442,7 @@ void TimelineWidget::paintRuler(QPainter& p) {
     }
     // Markers.
     for (const auto& m : s->markers) {
-        int x = xForFrame(m.t);
+        int x = xForFrame(m.t) + int(std::floor(m.sub * ppf_));  // (between frames: a sync point in the sound)
         QColor col = theme::labelColor(m.color);
         if (!col.isValid()) col = m.chapter ? QColor(255, 149, 0) : theme::kSnap;
         QPolygon poly;
@@ -1833,7 +1854,7 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
     }
     const Sequence* s = state_->gestureBase();  // fetched after beginGesture() above
     const FrameTime raw = frameRound(pos.x()) - drag_.pressFrame;
-    auto signedTc = [s](FrameTime d) { return (d < 0 ? "-" : "+") + timecodeString(s, std::llabs(d)); };
+    auto signedTc = [s](FrameTime d) { return (d < 0 ? "-" : "+") + durationString(s, std::llabs(d)); };
     switch (drag_.kind) {
         case DragKind::Scrub: {
             FrameTime f = frameRound(pos.x());
@@ -1916,7 +1937,7 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             const Id id = drag_.transition;
             FrameTime applied = 0;
             state_->updateGesture([&](Project&, Sequence& sq) { applied = edit::setTransitionDuration(sq, id, want).applied; });
-            drag_.label = tr("Transition %1").arg(QString::fromStdString(formatTimecode(applied, live->fps)));
+            drag_.label = tr("Transition %1").arg(durationString(live, applied));
             break;
         }
         case DragKind::Slip: {
@@ -2365,7 +2386,8 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* e) {
 
 void TimelineWidget::dragEnterEvent(QDragEnterEvent* e) {
     const QMimeData* m = e->mimeData();
-    if (m->hasFormat("application/x-montage-media") || m->hasFormat("application/x-montage-effect") || m->hasUrls() || hasSequencePart(m))
+    if (m->hasFormat("application/x-montage-media") || m->hasFormat("application/x-montage-effect") || m->hasFormat(kSoundRangeMime) ||
+        m->hasUrls() || hasSequencePart(m))
         e->acceptProposedAction();
 }
 
@@ -2396,6 +2418,15 @@ std::vector<TimelineWidget::Ghost> TimelineWidget::ghostsFor(const QMimeData* mi
         std::stable_sort(out.begin(), out.end(), [](const Ghost& a, const Ghost& b) { return a.start < b.start; });
         return out;
     }
+    if (SoundRange sound; soundRangeFromMime(mime, sound)) {
+        // A stretch from the sound library: on the audio track under the pointer (or the target).
+        if (s->audioTracks.empty()) return out;
+        auto row = rowAt(pos.y());
+        const int at = row && row->ref.kind == TrackKind::Audio ? row->ref.index : state_->targetAudioTrack();
+        const FrameTime len = std::max<FrameTime>(1, FrameTime(std::ceil(double(sound.count) * s->fpsValue() / sound.rate - 1e-9)));
+        out.push_back({{TrackKind::Audio, std::clamp(at, 0, int(s->audioTracks.size()) - 1)}, frameRound(pos.x()), len});
+        return out;
+    }
     auto refs = parseMediaMime(mime);
     if (refs.empty()) return out;
     auto row = rowAt(pos.y());
@@ -2422,7 +2453,7 @@ std::vector<TimelineWidget::Ghost> TimelineWidget::ghostsFor(const QMimeData* mi
 void TimelineWidget::dragMoveEvent(QDragMoveEvent* e) {
     const QMimeData* m = e->mimeData();
     hoverPos_ = e->position().toPoint();
-    if (m->hasFormat("application/x-montage-media") || hasSequencePart(m)) {
+    if (m->hasFormat("application/x-montage-media") || m->hasFormat(kSoundRangeMime) || hasSequencePart(m)) {
         ghosts_ = ghostsFor(m, hoverPos_);
         // Snap the drop point (a range from a stacked timeline by its start, which may be a gap before its first clip).
         if (!ghosts_.empty()) {
@@ -2623,8 +2654,18 @@ void TimelineWidget::dropEvent(QDropEvent* e) {
     QPoint pos = e->position().toPoint();
     bool insertMode = e->modifiers() & Qt::ControlModifier;
     ghosts_.clear();
+    SoundRange sound;
     if (m->hasFormat("application/x-montage-media")) {
         dropMedia(m, pos, insertMode);
+    } else if (soundRangeFromMime(m, sound)) {
+        // Just the stretch, to the sample, where its ghost was.
+        const auto ghosts = ghostsFor(m, pos);
+        if (!ghosts.empty()) {
+            QString error;
+            if (state_->placeSound(sound.path, sound.first, sound.count, sound.rate, snapFrame(ghosts.front().start, {}), ghosts.front().track.index,
+                                   insertMode, &error).empty())
+                state_->message(error, 6000);
+        }
     } else if (hasSequencePart(m)) {
         dropSequencePart(m, pos, insertMode);
     } else if (m->hasFormat("application/x-montage-effect")) {

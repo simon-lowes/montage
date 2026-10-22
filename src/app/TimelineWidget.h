@@ -105,6 +105,14 @@ public:
     // rendered previews are cached show green.
     void setRenderedRanges(std::vector<std::pair<FrameTime, FrameTime>> ranges);
     const std::vector<std::pair<FrameTime, FrameTime>>& renderedRanges() const { return rendered_; }
+    // The intelligibility lane in the ruler: how well the dialogue can be followed over each stretch ([first, end),
+    // status 0 green, 1 amber, 2 red), faded when the sequence has changed since it was measured.
+    struct IntelligibilitySpan {
+        FrameTime first = 0, end = 0;
+        int status = 0;
+    };
+    void setIntelligibilityLane(std::vector<IntelligibilitySpan> spans, bool stale);
+    const std::vector<IntelligibilitySpan>& intelligibilityLane() const { return intelligibility_; }
     // Where a clip's line is drawn (widget coordinates), for tests; empty if it is not shown.
     QRect lineBand(montage::Id clip) const;
     int lineY(montage::Id clip, montage::FrameTime local) const;
@@ -297,6 +305,8 @@ private:
     int trimSide_ = -1;
     bool showOpacity_ = false;
     std::vector<std::pair<FrameTime, FrameTime>> rendered_;
+    std::vector<IntelligibilitySpan> intelligibility_;
+    bool intelligibilityStale_ = false;
 };
 
 }  // namespace montage

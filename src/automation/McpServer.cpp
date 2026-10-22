@@ -50,6 +50,7 @@
 #include "audio/DialogueAlign.h"
 #include "audio/SpeechCleanup.h"
 #include "core/AafImport.h"
+#include "core/AvidBinImport.h"
 #include "core/Provenance.h"
 #include "media/ContentCredentials.h"
 #include "media/Offload.h"
@@ -92,6 +93,7 @@
 #include "core/ProjectIO.h"
 #include "core/ScriptCut.h"
 #include "render/LinedScript.h"
+#include "render/FilmLists.h"
 #include "core/Ambisonics.h"
 #include "media/Sofa.h"
 #include "core/Surround.h"
@@ -123,6 +125,8 @@
 #include "render/LutExport.h"
 #include "render/ProjectManager.h"
 #include "render/QualityCheck.h"
+#include "render/FrameRepair.h"
+#include "render/Intelligibility.h"
 #include "render/ConformCheck.h"
 #include "media/Decoder.h"
 #include "media/Faces.h"
@@ -136,6 +140,7 @@
 #include "media/Rife.h"
 #include "media/TextToSpeech.h"
 #include "media/VoiceClone.h"
+#include "media/SoundLibrary.h"
 #include "media/SoundSearch.h"
 #include "media/LtcTimecode.h"
 #include "media/StemSeparation.h"
@@ -1098,7 +1103,8 @@ void McpServer::Impl::addTools() {
             "project":{"type":"string","description":"Path of the .montage file to write"},
             "media":{"type":"array","items":{"type":"string"},"description":"Media files, in order"},
             "width":{"type":"integer"},"height":{"type":"integer"},"fps":{"type":"number"},
-            "audio_layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4","ambix","ambix2","ambix3"],"default":"stereo"}},
+            "audio_layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4","ambix","ambix2","ambix3"],"default":"stereo"},
+            "film_gauge":{"type":"string","enum":["35mm-4perf","35mm-3perf","35mm-2perf","16mm","65mm-5perf"],"description":"For a cut going back to film: the gauge its feet and frames, burn-ins and film lists count in"}},
             "required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l;
@@ -1128,6 +1134,12 @@ void McpServer::Impl::addTools() {
                 if (std::find(audioLayouts().begin(), audioLayouts().end(), layout) == audioLayouts().end())
                     throw ArgError{"\"audio_layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2, 7.1.4, ambix, ambix2 or ambix3"};
                 s.audioLayout = layout;
+            }
+            if (a.contains("film_gauge")) {
+                const std::string gauge = str(a, "film_gauge").toStdString();
+                if (std::string(filmGauge(gauge).id) != gauge)
+                    throw ArgError{"\"film_gauge\" must be 35mm-4perf, 35mm-3perf, 35mm-2perf, 16mm or 65mm-5perf"};
+                s.filmGauge = gauge;
             }
             FrameTime at = 0;
             for (Id id : ids) {
@@ -1694,6 +1706,54 @@ void McpServer::Impl::addTools() {
             save(l);
             const Clip* c = edit::clipById(s, id);
             return ok(QStringLiteral("Trimmed by %1 frame(s)").arg(r.applied), c ? clipJson(l.project, s, *c) : QJsonObject{});
+        });
+
+    add("montage_sound_samples", "Edit sound to the sample",
+        "Move an audio clip's sound (`move`), trim its start or end (`trim_start`, `trim_end`: positive shortens) or slip "
+        "what it plays (`slip`) by a number of samples at the sequence's rate, between frames where need be; the picture "
+        "and linked clips stay put. `volume_keys` adds volume keys (dB) at timeline samples, between frames (one key a frame: "
+        "another on the same frame replaces it). Returns "
+        "where the sound starts and ends, as timecode and samples.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "move":{"type":"integer"},"trim_start":{"type":"integer"},"trim_end":{"type":"integer"},"slip":{"type":"integer"},
+            "volume_keys":{"type":"array","items":{"type":"object","properties":{"sample":{"type":"integer","description":"Timeline sample"},
+                "db":{"type":"number"}},"required":["sample","db"]}}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id id = clipArg(l, a).id;
+            const int rate = s.sampleRate > 0 ? s.sampleRate : 48000;
+            static const std::pair<const char*, edit::SampleEdit> ops[] = {{"trim_start", edit::SampleEdit::TrimStart},
+                                                                           {"trim_end", edit::SampleEdit::TrimEnd},
+                                                                           {"slip", edit::SampleEdit::Slip},
+                                                                           {"move", edit::SampleEdit::Move}};
+            int changed = 0;
+            for (const auto& [arg, op] : ops) {
+                if (!a.contains(arg) || a.value(arg).toInteger() == 0) continue;
+                const auto r = edit::editSoundSamples(l.project, s, id, op, a.value(arg).toInteger(), rate);
+                if (!r.ok) return fail(QString::fromStdString(r.error));
+                ++changed;
+            }
+            const double fps = s.fpsValue();
+            for (const QJsonValue& v : a.value("volume_keys").toArray()) {
+                Clip* c = edit::clipById(s, id);
+                const auto loc = edit::locate(s, id);
+                if (!c || !loc || loc->track.kind != TrackKind::Audio) throw ArgError{"Volume keys go on a sound clip"};
+                const double at = double(v.toObject().value("sample").toInteger()) * fps / rate;
+                if (at < edit::soundStart(*c) - 1e-9 || at > edit::soundEnd(*c) + 1e-9) throw ArgError{"A volume key's sample is outside the clip's sound"};
+                c->audio.params["gain_db"].addKeyAt(at - double(c->start), std::clamp(v.toObject().value("db").toDouble(), -96.0, 24.0));
+                ++changed;
+            }
+            if (changed == 0) throw ArgError{"Give move, trim_start, trim_end, slip or volume_keys"};
+            save(l);
+            const Clip* c = edit::clipById(s, id);
+            const double from = edit::soundStart(*c), to = edit::soundEnd(*c);
+            const QString start = QString::fromStdString(formatTimecodeSamples(from, s.fps, rate)),
+                          end = QString::fromStdString(formatTimecodeSamples(to, s.fps, rate));
+            QJsonObject out = clipJson(l.project, s, *c);
+            out["sound_start"] = start, out["sound_end"] = end;
+            out["sound_start_sample"] = double(std::llround(from * rate / fps)), out["sound_end_sample"] = double(std::llround(to * rate / fps));
+            return ok(QStringLiteral("The sound runs %1 to %2").arg(start, end), out);
         });
 
     add("montage_grade_version", "Grade versions",
@@ -2479,7 +2539,10 @@ void McpServer::Impl::addTools() {
         "Add an audio effect to an audio track's inserts (after its clips are mixed, before its fader), or with `remove` "
         "take one off by its id. A compressor or noise gate can listen to another track instead of its own signal: "
         "strings {\"sidechain\": \"A1\"} (a track's reference or name) ducks music under dialogue or opens a gate on a "
-        "kick; key_hpf_hz high-passes what it listens to.",
+        "kick; key_hpf_hz high-passes what it listens to. In a surround or ambisonic sequence, upmix spreads the track's "
+        "stereo (after its other inserts) over the speakers so that the stereo fold-down gives it back: centred sound "
+        "to the centre, what differs between the sides behind and above (params centre_width, surround_depth and height "
+        "0-100, delay_ms, lfe 1 for the lows in the LFE, dialogue_centre 0 to upmix Dialogue-role clips too).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"string","description":"A1, A2..."},
             "effect":{"type":"string"},"params":{"type":"object","additionalProperties":{"type":"number"}},
             "strings":{"type":"object","additionalProperties":{"type":"string"}},
@@ -2563,13 +2626,19 @@ void McpServer::Impl::addTools() {
         "at `at`, and travels with the clip.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
             "name":{"type":"string"},"comment":{"type":"string"},"chapter":{"type":"boolean","default":false},
-            "clip":{"type":"number","description":"A clip id (montage_project_info) for a clip marker"}},"required":["project","at"]})json",
+            "at_samples":{"type":"integer","description":"Instead of at: a timeline sample, so the marker can sit between frames"},
+            "clip":{"type":"number","description":"A clip id (montage_project_info) for a clip marker"}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
-            const FrameTime at = timeArg(a.value("at"), s, "at");
+            // `at_samples`: a timeline sample, between frames (a sync point in the sound).
+            if (a.contains("at_samples") && a.contains("clip")) throw ArgError{"at_samples is for timeline markers; give a clip marker `at`"};
+            const bool bySample = a.contains("at_samples");
+            const double atSample = bySample ? double(a.value("at_samples").toInteger()) * s.fpsValue() / (s.sampleRate > 0 ? s.sampleRate : 48000) : 0;
+            const FrameTime at = bySample ? FrameTime(std::floor(atSample + 1e-9)) : timeArg(a.value("at"), s, "at");
             const bool chapter = a.value("chapter").toBool();
-            const Marker m{at, 0, str(a, "name").toStdString(), str(a, "comment").toStdString(), 0, chapter};
+            Marker m{at, 0, str(a, "name").toStdString(), str(a, "comment").toStdString(), 0, chapter};
+            if (bySample) m.sub = std::clamp(atSample - double(at), 0.0, 0.999999);
             if (a.contains("clip")) {
                 const Clip& c = clipArg(l, a);
                 if (!edit::addClipMarker(s, c.id, at, m)) throw ArgError{QStringLiteral("The clip is not at %1").arg(tc(at, s))};
@@ -2578,7 +2647,8 @@ void McpServer::Impl::addTools() {
             }
             edit::addMarker(s, m);
             save(l);
-            return ok(QStringLiteral("%1 at %2").arg(chapter ? QStringLiteral("Chapter marker") : QStringLiteral("Marker"), tc(at, s)));
+            const QString where = bySample ? QString::fromStdString(formatTimecodeSamples(atSample, s.fps, s.sampleRate > 0 ? s.sampleRate : 48000)) : tc(at, s);
+            return ok(QStringLiteral("%1 at %2").arg(chapter ? QStringLiteral("Chapter marker") : QStringLiteral("Marker"), where));
         });
 
     add("montage_chapters", "List chapters",
@@ -3133,7 +3203,9 @@ void McpServer::Impl::addTools() {
         "(ITU-R BT.1702 / Ofcom / WCAG: more than three flashes a second over a quarter of the screen, or saturated red), "
         "levels outside EBU R103, black or frozen picture, silence, clipping, loudness against a target, and spelling in "
         "captions (each track's language) and titles (`title_language`, default en-US), the project's vocabulary allowed, "
-        "and linked clips out of sync with their picture (`sync`). Lists each problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones).",
+        "linked clips out of sync with their picture (`sync`), dialogue hard to follow under the music and effects "
+        "(`intelligibility`, as montage_intelligibility measures it), left and right out of phase or one inverted, so a mono "
+        "fold-down loses them (`phase`), and DC offset (`dc_offset_db`). Lists each problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"flashing":{"type":"boolean","default":true},"levels":{"type":"boolean","default":true},
             "black_seconds":{"type":"number","default":1,"description":"0 = not checked"},
@@ -3145,7 +3217,13 @@ void McpServer::Impl::addTools() {
             "loudness_dialogue":{"type":"boolean","default":false,"description":"Check the dialogue's loudness (montage_dialogue_loudness), as Netflix does: -27 with peak_ceiling -2"},
             "loudness_tolerance":{"type":"number","description":"LU either side of the target (default 1, 2 with loudness_dialogue)"},
             "spelling":{"type":"boolean","default":true},"title_language":{"type":"string","default":"en-US"},
-            "sync":{"type":"boolean","default":true},"markers":{"type":"boolean","default":false}},"required":["project"]})json",
+            "sync":{"type":"boolean","default":true},
+            "intelligibility":{"type":"number","description":"Dialogue intelligibility limit, 0..1 (e.g. 0.45); omitted = not checked"},
+            "intelligibility_seconds":{"type":"number","default":2,"description":"How long it must stay under the limit"},
+            "phase":{"type":"boolean","default":true,"description":"Left and right out of phase (correlation under -0.5) or one the other inverted"},
+            "phase_seconds":{"type":"number","default":1,"description":"How long it must last"},
+            "dc_offset_db":{"type":"number","default":-40,"description":"A channel's mean over a second above this, dBFS; 0 = not checked"},
+            "markers":{"type":"boolean","default":false}},"required":["project"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
@@ -3165,6 +3243,11 @@ void McpServer::Impl::addTools() {
             q.spelling = a.value("spelling").toBool(true);
             q.titleLanguage = str(a, "title_language", "en-US").toStdString();
             q.sync = a.value("sync").toBool(true);
+            q.intelligibility = std::clamp(a.value("intelligibility").toDouble(0), 0.0, 1.0);
+            q.intelligibilitySeconds = std::max(0.0, a.value("intelligibility_seconds").toDouble(2));
+            q.phase = a.value("phase").toBool(true);
+            q.phaseSeconds = std::max(0.05, a.value("phase_seconds").toDouble(1));
+            q.dcOffsetDb = std::min(0.0, a.value("dc_offset_db").toDouble(-40));
             const std::vector<QcIssue> issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(f, "Checking"); });
             QString text;
             for (const QcIssue& i : issues)
@@ -3175,6 +3258,74 @@ void McpServer::Impl::addTools() {
                 save(l);
             }
             return ok(issues.empty() ? QStringLiteral("No problems found.") : QStringLiteral("%1 problem(s):\n").arg(issues.size()) + text);
+        });
+
+    add("montage_intelligibility", "Measure dialogue intelligibility",
+        "How well the sequence's (or from..to's) dialogue can be made out over its music and effects: the Speech "
+        "Intelligibility Index (ANSI S3.5, 0 to 1; under about 0.45 hard to follow, over 0.75 easy) every 400 ms where "
+        "someone speaks, from each third-octave band's speech-to-masker ratio at the level it plays (`listening_level`, "
+        "dB SPL of a -20 dBFS sound). The dialogue is the Dialogue clips' sound and the masker the rest (`source` roles), "
+        "or the dialogue separated from the mix by the dialogue, music and effects model (separated); auto takes roles "
+        "when there are Dialogue clips. Returns the average, the stretches under the limit (`preset` Standard 0.45, "
+        "Accessible 0.6 or Lenient 0.35, or `limit`) for at least `min_seconds`, and the bands worst masked there; with "
+        "markers, a red \"QC: Dialogue intelligibility\" marker on each.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
+            "to":{"type":["number","string"]},"source":{"type":"string","enum":["auto","roles","separated"],"default":"auto"},
+            "listening_level":{"type":"number","default":79},"preset":{"type":"string","enum":["Standard","Accessible","Lenient"],"default":"Standard"},
+            "limit":{"type":"number","description":"0..1, in place of the preset's"},"min_seconds":{"type":"number","default":2},
+            "markers":{"type":"boolean","default":false}},"required":["project"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            IntelligibilityOptions o;
+            o.in = a.contains("from") ? timeArg(a.value("from"), s, "from") : 0;
+            o.out = a.contains("to") ? timeArg(a.value("to"), s, "to") : -1;
+            const QString source = str(a, "source", "auto");
+            if (source == "roles") o.source = DialogueSource::Roles;
+            else if (source == "separated") o.source = DialogueSource::Separated;
+            else if (source != "auto") throw ArgError{"\"source\" is auto, roles or separated"};
+            o.listeningLevel = std::clamp(a.value("listening_level").toDouble(79), 40.0, 110.0);
+            IntelligibilityLimits limits;
+            if (!intelligibilityPreset(str(a, "preset", "Standard").toStdString(), limits)) throw ArgError{"\"preset\" is Standard, Accessible or Lenient"};
+            const double limit = a.value("limit").isDouble() ? std::clamp(a.value("limit").toDouble(), 0.0, 1.0) : limits.poor;
+            const double minSeconds = std::max(0.0, a.value("min_seconds").toDouble(2));
+            std::string err;
+            const Intelligibility r = measureIntelligibility(l.project, s, o, [this](double f) { progress(f, "Measuring"); }, nullptr, &err);
+            if (!r.valid) return fail(QString::fromStdString(err));
+            const double fps = s.fpsValue();
+            QJsonArray hard;
+            std::vector<QcIssue> issues;
+            for (const auto& [from, to] : r.under(limit, minSeconds)) {
+                // The bands most masked over the stretch.
+                std::array<double, kSiiBands> ratio{};
+                double sum = 0;
+                int n = 0;
+                for (const IntelligibilityBlock& b : r.blocks)
+                    if (b.speech && b.start >= from - 1e-9 && b.end <= to + 1e-9) {
+                        sum += b.index, ++n;
+                        for (int k = 0; k < kSiiBands; ++k) ratio[size_t(k)] += b.ratioDb[size_t(k)];
+                    }
+                std::vector<int> order(kSiiBands);
+                std::iota(order.begin(), order.end(), 0);
+                // (the most understanding lost: importance times how far under audible the speech is)
+                auto lost = [&](int k) { return siiBandImportance()[size_t(k)] * (1 - std::clamp((ratio[size_t(k)] / std::max(1, n) + 15) / 30, 0.0, 1.0)); };
+                std::sort(order.begin(), order.end(), [&](int x, int y) { return lost(x) > lost(y); });
+                QJsonArray bands;
+                for (int k = 0; k < 3 && n; ++k)
+                    bands.append(QJsonObject{{"hz", siiBandCentres()[size_t(order[size_t(k)])]}, {"ratio_db", ratio[size_t(order[size_t(k)])] / n}});
+                hard.append(QJsonObject{{"start_seconds", from}, {"end_seconds", to}, {"index", n ? sum / n : 0.0}, {"worst_bands", bands}});
+                const FrameTime fa = FrameTime(std::floor(from * fps + 1e-6));
+                issues.push_back({QcKind::Intelligibility, fa, std::max(fa + 1, FrameTime(std::ceil(to * fps - 1e-6))),
+                                  QStringLiteral("Dialogue hard to follow: intelligibility %1; the limit is %2").arg(n ? sum / n : 0.0, 0, 'f', 2).arg(limit, 0, 'f', 2).toStdString()});
+            }
+            if (a.value("markers").toBool() && !issues.empty()) {
+                addQcMarkers(s, issues);
+                save(l);
+            }
+            return ok(QStringLiteral("Dialogue intelligibility %1 on average (%2); %3 stretch(es) under %4")
+                          .arg(r.average, 0, 'f', 2).arg(r.source == DialogueSource::Roles ? "Dialogue clips" : "separated from the mix")
+                          .arg(hard.size()).arg(limit, 0, 'f', 2),
+                      QJsonObject{{"average", r.average}, {"source", r.source == DialogueSource::Roles ? "roles" : "separated"}, {"hard", hard}});
         });
 
     add("montage_dialogue_loudness", "Measure dialogue loudness",
@@ -4507,6 +4658,97 @@ void McpServer::Impl::addTools() {
             return ok(message, result);
         });
 
+    add("montage_film_lists", "Film lists: cut, optical, dupe, pull and change lists",
+        "For a cut that goes back to film: the sequence's lists in feet and frames of its film gauge (Sequence Settings; "
+        "or `gauge`), naming the negative by its media's key numbers (read from DPX and Cineon film headers and ALE logs) "
+        "and ink numbers. The cut list: each shot's footage in and out, roll, key and ink numbers in and out. The optical "
+        "list: dissolves, fades and wipes (each side's negative, handles included), speed changes, reverse motion and "
+        "ramps, repositions, superimpositions and titles. The dupe list: negative used twice. The pull list: shots by "
+        "roll in negative order. With `before` (an earlier version of the cut), the change list in feet and frames. "
+        "`path` writes them as text (.txt), CSV (.csv) or PDF (.pdf).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "sequence":{"type":"string","description":"The sequence's name (default: the active one)"},
+            "gauge":{"type":"string","enum":["35mm-4perf","35mm-3perf","35mm-2perf","16mm","65mm-5perf"],"description":"Default: the sequence's (35mm-4perf where it has none)"},
+            "before":{"type":"string","description":"An earlier version's sequence name, for the change list"},
+            "path":{"type":"string","description":"Write the lists here (.txt, .csv or .pdf)"}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            auto byName = [&](const QString& name) -> const Sequence* {
+                for (const Sequence& sq : l.project.sequences)
+                    if (QString::fromStdString(sq.name) == name) return &sq;
+                throw ArgError{QStringLiteral("No sequence named \"%1\"").arg(name)};
+            };
+            const Sequence* s = a.contains("sequence") ? byName(str(a, "sequence")) : &l.seq();
+            FilmListOptions o;
+            o.gauge = str(a, "gauge").toStdString();
+            const FilmLists lists = filmLists(l.project, *s, o);
+            std::optional<CutChanges> changes;
+            if (a.contains("before")) {
+                const Sequence* before = byName(need(a, "before"));
+                if (before == s) throw ArgError{"\"before\" must be another sequence"};
+                std::string err;
+                changes = cutChanges(l.project, *before, *s, &err);
+                if (!err.empty()) return fail(QString::fromStdString(err));
+            }
+            const FilmGauge& g = lists.gauge;
+            auto key = [](const std::string& n) { return n.empty() ? QJsonValue() : QJsonValue(QString::fromStdString(n)); };
+            auto ff = [&](FrameTime f) { return QString::fromStdString(formatFeetFrames(f, g)); };
+            QJsonArray events, opticals, dupes, pulls;
+            for (const FilmEvent& e : lists.events)
+                events.append(QJsonObject{{"event", e.number}, {"clip", QString::fromStdString(e.name)}, {"roll", QString::fromStdString(e.roll)},
+                                          {"track", e.track + 1}, {"footage_in", ff(e.recIn)}, {"footage_out", ff(e.recOut - 1)},
+                                          {"length", ff(e.recOut - e.recIn)}, {"key_in", key(e.keyIn)}, {"key_out", key(e.keyOut)},
+                                          {"ink_in", key(e.inkIn)}, {"ink_out", key(e.inkOut)}});
+            for (const FilmOptical& op : lists.opticals) {
+                QJsonObject j{{"kind", QString::fromStdString(op.kind)}, {"event", op.event}, {"footage_in", ff(op.recIn)},
+                              {"footage_out", ff(op.recOut - 1)}, {"length", ff(op.recOut - op.recIn)},
+                              {"detail", QString::fromStdString(op.detail)}, {"key_in", key(op.keyIn)}, {"key_out", key(op.keyOut)}};
+                if (op.outgoing) {
+                    j["outgoing"] = op.outgoing;
+                    j["outgoing_key_in"] = key(op.outKeyIn);
+                    j["outgoing_key_out"] = key(op.outKeyOut);
+                }
+                opticals.append(j);
+            }
+            for (const FilmDupe& d : lists.dupes)
+                dupes.append(QJsonObject{{"event", d.second}, {"dupe_of", d.first}, {"roll", QString::fromStdString(d.roll)},
+                                         {"key_in", key(d.keyIn)}, {"key_out", key(d.keyOut)}, {"length", ff(d.frames())}});
+            for (const auto& [roll, list] : lists.pulls) {
+                QJsonArray ev;
+                for (int n : list) ev.append(n);
+                pulls.append(QJsonObject{{"roll", QString::fromStdString(roll)}, {"events", ev}});
+            }
+            QJsonObject result{{"gauge", QString::fromLatin1(g.id)}, {"length", ff(lists.length)}, {"events", events},
+                               {"opticals", opticals}, {"dupes", dupes}, {"pulls", pulls}};
+            if (changes) {
+                QJsonArray list;
+                for (const CutEvent& e : changes->events) {
+                    if (e.kind == CutEventKind::Same) continue;
+                    QJsonObject j{{"change", QString::fromLatin1(cutEventName(e.kind)).toLower()}, {"shot", QString::fromStdString(e.shot)},
+                                  {"new_in", ff(e.newIn)}, {"length", ff(e.length())}};
+                    if (e.black) j["black"] = true;
+                    if (e.kind == CutEventKind::Moved) j["shift"] = (e.shift() < 0 ? QStringLiteral("-") : QStringLiteral("+")) + ff(std::llabs(e.shift()));
+                    if (e.newOut > e.newIn) j["new_out"] = ff(e.newOut - 1);
+                    if (e.oldOut > e.oldIn) {
+                        j["old_in"] = ff(e.oldIn);
+                        j["old_out"] = ff(e.oldOut - 1);
+                    }
+                    list.append(j);
+                }
+                result["changes"] = list;
+            }
+            if (a.contains("path")) {
+                const QString file = absolute(need(a, "path"));
+                QString err;
+                if (!writeFilmLists(lists, changes ? &*changes : nullptr, file, &err)) return fail(err);
+                result["path"] = file;
+            }
+            return ok(QStringLiteral("%1 event(s), %2 optical(s), %3 dupe(s) in %4").arg(lists.events.size()).arg(lists.opticals.size())
+                          .arg(lists.dupes.size()).arg(QString::fromLatin1(g.name)),
+                      result);
+        });
+
     add("montage_adr", "ADR cue list and takes",
         "The lines to re-record to picture (ADR, looping): the sequence's cue list (cue number, character, the line, a "
         "note on why, start and end, status: to_record, recorded, approved or omitted) and each cue's takes. list shows "
@@ -5800,6 +6042,95 @@ void McpServer::Impl::addTools() {
             for (const QJsonValue& v : skipped)
                 text += QStringLiteral("(not searched: %1: %2)\n").arg(v.toObject().value("media").toString(), v.toObject().value("error").toString());
             return ok(text.isEmpty() ? QStringLiteral("No recording with sound") : text, QJsonObject{{"moments", list}, {"skipped", skipped}});
+        });
+
+    add("montage_search_sound_library", "Search the sound effects library",
+        "Search the sound effects library on this computer (folders of sound files indexed outside any project, kept in "
+        "Montage's data folder or $MONTAGE_SOUND_LIBRARY): `words` finds sounds with every word's start in their name, UCS "
+        "category, subcategory or CatID (\"DOORWood\"), description (Broadcast Wave bext, iXML) or tags, by name; no words "
+        "lists them all. `sounds_like` finds them by what they sound like (\"a heavy door creaking\"), `more_like` (a sound's "
+        "path or id) the sounds most like one, both with CLAP on this computer (sounds not listened to yet are first). "
+        "`add_folder` adds a folder; `remove_folder` drops one; `rescan` (or adding a folder) brings the index up to date "
+        "(new, changed, renamed and moved files; gone ones dropped). Returns each sound's path, length, channels, rate, "
+        "UCS category and description.",
+        R"json({"type":"object","properties":{"words":{"type":"string"},"sounds_like":{"type":"string"},
+            "more_like":{"type":"string","description":"A sound's path or id"},
+            "add_folder":{"type":"string"},"remove_folder":{"type":"string"},"rescan":{"type":"boolean"},
+            "max":{"type":"integer","default":50}}})json",
+        false, [this](const QJsonObject& a) {
+            auto lib = SoundLibrary::shared();
+            if (!lib) return fail(QStringLiteral("The sound library cannot be opened: %1").arg(QString::fromStdString(SoundLibrary::defaultPath())));
+            std::string err;
+            bool scan = a.value("rescan").toBool();
+            if (a.contains("remove_folder") && !lib->removeFolder(str(a, "remove_folder").toStdString()))
+                return fail(QStringLiteral("\"%1\" is not a library folder").arg(str(a, "remove_folder")));
+            if (a.contains("add_folder")) {
+                if (!lib->addFolder(str(a, "add_folder").toStdString(), &err)) return fail(QString::fromStdString(err));
+                scan = true;
+            }
+            QJsonObject out;
+            QString text;
+            if (scan) {
+                const SoundLibraryScan s = lib->scan([&](double f) { progress(f, QStringLiteral("Reading the library's folders")); });
+                out["scan"] = QJsonObject{{"files", s.files}, {"added", s.added}, {"updated", s.updated}, {"moved", s.moved},
+                                          {"removed", s.removed}, {"seconds", s.seconds}};
+                text += QStringLiteral("%1 sound files: %2 added, %3 updated, %4 renamed or moved, %5 removed\n")
+                            .arg(s.files).arg(s.added).arg(s.updated).arg(s.moved).arg(s.removed);
+            }
+            const size_t max = size_t(std::clamp(a.value("max").toInt(50), 1, 1000));
+            std::vector<SoundLibraryEntry> found;
+            std::vector<double> scores;
+            if (a.contains("sounds_like") || a.contains("more_like")) {
+                if (!soundSearchAvailable()) return fail("This build of Montage cannot search sound by what it sounds like (no ONNX Runtime)");
+                if (!soundModel().installed())
+                    return fail("The sound search model is not downloaded: run `scripts/fetch-models.sh` or search Sounds Like in the app once");
+                if (lib->unheard() > 0 &&
+                    lib->listen([&](int done, int total) { progress(total > 0 ? double(done) / total : 1.0, QStringLiteral("Listening to the library")); },
+                                nullptr, &err) < 0)
+                    return fail(QString::fromStdString(err));
+                std::vector<SoundLibrary::Match> hits;
+                if (a.contains("more_like")) {
+                    const QString which = str(a, "more_like");
+                    bool isId = false;
+                    const qint64 id = which.toLongLong(&isId);
+                    const auto e = isId ? lib->entry(id) : lib->entryForPath(which.toStdString());
+                    if (!e) return fail(QStringLiteral("No sound \"%1\" in the library").arg(which));
+                    hits = lib->moreLike(e->id, max);
+                } else {
+                    auto model = SoundModel::load(&err);
+                    const std::vector<float> q = model ? model->text(str(a, "sounds_like").toStdString(), &err) : std::vector<float>{};
+                    if (q.empty()) return fail(QString::fromStdString(err));
+                    hits = lib->searchByMeaning(q, max);
+                }
+                for (const SoundLibrary::Match& m : hits) found.push_back(m.entry), scores.push_back(m.score);
+            } else if (!scan || a.contains("words")) {
+                found = lib->search(str(a, "words").toStdString(), max);
+            }
+            QJsonArray list;
+            for (size_t i = 0; i < found.size(); ++i) {
+                const SoundLibraryEntry& e = found[i];
+                QJsonObject o{{"id", double(e.id)},
+                              {"path", QString::fromStdString(e.path)},
+                              {"seconds", e.duration},
+                              {"channels", e.channels},
+                              {"sample_rate", e.sampleRate},
+                              {"description", QString::fromStdString(e.description)}};
+                if (!e.catId.empty()) o["cat_id"] = QString::fromStdString(e.catId);
+                if (!e.category.empty()) o["category"] = QString::fromStdString(e.category);
+                if (!e.subCategory.empty()) o["subcategory"] = QString::fromStdString(e.subCategory);
+                if (!e.fxName.empty()) o["fx_name"] = QString::fromStdString(e.fxName);
+                if (!e.keywords.empty()) o["keywords"] = QString::fromStdString(e.keywords);
+                if (i < scores.size()) o["score"] = scores[i];
+                list.append(o);
+                text += QStringLiteral("%1  %2 s%3%4\n")
+                            .arg(QString::fromStdString(e.path))
+                            .arg(e.duration, 0, 'f', 2)
+                            .arg(e.catId.empty() ? QString() : QStringLiteral("  ") + QString::fromStdString(e.catId))
+                            .arg(e.description.empty() ? QString() : QStringLiteral("  ") + QString::fromStdString(e.description));
+            }
+            out["sounds"] = list;
+            out["count"] = lib->count();
+            return ok(text.isEmpty() ? QStringLiteral("No sounds found (%1 in the library)").arg(lib->count()) : text, out);
         });
 
     add("montage_find_people", "Find people",
@@ -7162,6 +7493,41 @@ void McpServer::Impl::addTools() {
                       QJsonObject{{"breaths", found}, {"keyed", keyed}, {"clips_left", left}});
         });
 
+    add("montage_find_damaged_frames", "Find and repair damaged frames",
+        "Finds the frames a recording or transfer broke in a video clip's file (over the stretch the clip plays): ones the "
+        "decoder reports damaged, blocky digital hits, tape drop-out lines, a lone black or flash frame, and frames missing "
+        "from the file's timestamps (shown as a repeat). Each is compared with the picture its neighbours make between them, "
+        "so motion, cuts and a real camera flash are left alone. With repair (the default) the frames are listed on the "
+        "clip's Frame Repair effect (added when it has none), which rebuilds each from the good frames either side (only "
+        "the broken lines or patches for a drop-out or hit), and a red \"Damaged:\" marker goes where the clip shows each.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number","description":"Video clip id"},
+            "repair":{"type":"boolean","default":true}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            Clip& c = clipArg(l, a);
+            if (edit::locate(s, c.id)->track.kind != TrackKind::Video) throw ArgError{"\"clip\" must be a video clip"};
+            std::vector<DamagedFrame> found;
+            std::string err;
+            if (!damagedFramesInClip(l.project, s, c, found, {}, nullptr, &err)) return fail(QString::fromStdString(err));
+            int added = 0;
+            if (a.value("repair").toBool(true)) {
+                added = listDamagedFrames(l.project, s, c, found);
+                save(l);
+            }
+            const MediaItem* m = l.project.findMedia(c.mediaId);
+            const double mf = m->fps.toDouble();
+            QJsonArray list;
+            for (const DamagedFrame& d : found) {
+                const auto [from, to] = timelineSpan(c, s, double(d.frame) / mf, double(d.frame + 1) / mf);
+                QJsonObject o{{"frame", double(d.frame)}, {"kind", QString::fromStdString(frameDamageName(d.kind))}, {"extent", d.extent}};
+                if (from >= 0) o.insert("timeline_seconds", from);
+                list.append(o);
+            }
+            return ok(QStringLiteral("%1 damaged frame(s) found, %2 newly listed for repair").arg(found.size()).arg(added),
+                      QJsonObject{{"frames", list}, {"listed", added}});
+        });
+
     add("montage_remove_bleed", "Remove mic bleed from multitrack talk",
         "For talk recorded with a mic on each speaker (podcasts, interviews): each of the audio `tracks` dips by "
         "`reduction_db` wherever it is not its speaker's turn (more than `margin_db` below the loudest mic at that moment, "
@@ -8421,6 +8787,9 @@ void McpServer::Impl::addTools() {
             "loudness_dialogue":{"type":"boolean","default":false,"description":"loudness_lufs is the dialogue's (Netflix: -27, peak_ceiling -2), measured as montage_dialogue_loudness does"},
             "burn_in":{"type":"object","description":"Overlays for a review copy","properties":{
                 "timecode":{"type":"boolean"},"clip_name":{"type":"boolean"},"text":{"type":"string"},
+                "footage":{"type":"boolean","description":"Feet and frames in the sequence's film gauge"},
+                "key_number":{"type":"boolean","description":"The key number of the frame on screen (its media's key_number)"},
+                "ink_number":{"type":"boolean","description":"Its ink number"},
                 "corner":{"type":"string","enum":["top_left","top_centre","top_right","bottom_left","bottom_centre","bottom_right"],"default":"top_left"},
                 "watermark":{"type":"string","description":"Image file, e.g. a logo"},
                 "watermark_corner":{"type":"string","enum":["top_left","top_centre","top_right","bottom_left","bottom_centre","bottom_right"],"default":"bottom_right"},
@@ -8563,6 +8932,9 @@ void McpServer::Impl::addTools() {
                 };
                 st.burnIn.timecode = b.value("timecode").toBool();
                 st.burnIn.clipName = b.value("clip_name").toBool();
+                st.burnIn.footage = b.value("footage").toBool();
+                st.burnIn.keyNumber = b.value("key_number").toBool();
+                st.burnIn.inkNumber = b.value("ink_number").toBool();
                 st.burnIn.text = b.value("text").toString().toStdString();
                 st.burnIn.corner = corner("corner", 0);
                 if (b.contains("watermark")) st.burnIn.watermark = absolute(b.value("watermark").toString()).toStdString();
@@ -9887,7 +10259,9 @@ void McpServer::Impl::addTools() {
     add("montage_import_timeline", "Import a timeline",
         "Make a project from an EDL, OpenTimelineIO, Final Cut Pro 7 XML, FCPXML or AAF file (Media Composer and Pro "
         "Tools sequences: picture and sound tracks, clips followed to their files, dissolves, audio gain, markers; media "
-        "found by path, else beside the file), or an IMF package (its folder, asset map or a composition playlist: the "
+        "found by path, else beside the file), a Media Composer bin (.avb: its master clips and subclips as media with "
+        "their custom columns as metadata, its sequences as an AAF of them would come in, the first opened; Media "
+        "Composer's MXF media found by mob ID under any \"Avid MediaFiles\" folder), or an IMF package (its folder, asset map or a composition playlist: the "
         "pictures, each sound track by language and kind with the first programme heard, the timed text as caption "
         "tracks; a supplemental's track files found in the packages beside it).",
         R"json({"type":"object","properties":{"input":{"type":"string"},"project":{"type":"string","description":"The .montage file to write"},
@@ -9912,10 +10286,30 @@ void McpServer::Impl::addTools() {
             std::string ext = std::filesystem::path(in).extension().string();
             for (char& ch : ext) ch = char(std::tolower(static_cast<unsigned char>(ch)));
             // An AAF is a binary compound file, read by its own importer.
-            const std::string text = ext == ".aaf" ? std::string() : std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            const std::string text = ext == ".aaf" || ext == ".avb" ? std::string() : std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
             Loaded l;
             l.path = absolute(need(a, "project"));
             l.project.name = std::filesystem::path(in).stem().string();
+            if (ext == ".avb") {
+                const AvidBinImport b = importAvidBin(l.project, in, prober);
+                if (!b.ok) return fail(QString::fromStdString(b.error));
+                if (b.sequences.empty()) {  // only clips: an empty sequence to cut them into
+                    Rational fps{25, 1};
+                    for (const MediaItem& m : l.project.media)
+                        if (m.hasVideo && m.fps.num > 0) {
+                            fps = m.fps;
+                            break;
+                        }
+                    l.project.sequences.push_back(makeSequence(l.project, "Sequence 1", 1920, 1080, fps));
+                    l.project.activeSequence = l.project.sequences.back().id;
+                }
+                save(l);
+                QString note = QStringLiteral("Imported %1 media item(s) and %2 sequence(s) from the bin into %3")
+                                   .arg(b.media.size()).arg(b.sequences.size()).arg(l.path);
+                for (const auto& o : b.offline) note += "\nOffline: " + QString::fromStdString(o);
+                for (const auto& w : b.warnings) note += "\nWarning: " + QString::fromStdString(w);
+                return ok(note, projectJson(l.project));
+            }
             const double fps = a.value("fps").toDouble(30);
             const Rational rate = std::fabs(fps - std::round(fps)) < 1e-6 ? Rational{int(std::lround(fps)), 1} : Rational{int(std::lround(fps * 1001)), 1001};
             const ImportResult r = ext == ".aaf" ? importAaf(l.project, in, prober)

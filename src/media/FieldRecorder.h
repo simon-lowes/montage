@@ -6,6 +6,7 @@
 // are read here, before and after the sound (RIFF, RF64 and BW64).
 #pragma once
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,10 @@ struct FieldRecording {
     std::string project, scene, take, tape, note;
     bool circled = false;
     std::vector<std::string> trackNames;  // in channel order
+    std::string description;              // bext's description as written (a recorder's lines, a library's words)
+    // iXML's USER and ASWG fields (what sound libraries write: DESCRIPTION, CATEGORY, KEYWORDS, LIBRARY...), by
+    // upper-case name.
+    std::map<std::string, std::string> user;
     bool any() const { return startSeconds >= 0 || !scene.empty() || !take.empty() || !tape.empty() || !trackNames.empty(); }
 };
 

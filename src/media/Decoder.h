@@ -88,6 +88,7 @@ private:
     bool decodeNext(AVFrame* into);  // false at EOF / error
     bool seek(double t);
     Frame16Ptr convert(const AVFrame* f, double pts, int w, int h, bool hq);
+    std::shared_ptr<Frame16> convertFixed(const AVFrame* f, double pts, int sw, int sh, bool hq);
     // The file's frame shown at `t` (its own time), decoded (cur_ or next_), with its time in `pts`; null at the end.
     const AVFrame* decodedAt(double t, double* pts);
 
@@ -138,6 +139,8 @@ private:
     std::shared_ptr<const dcp::ImfTrackReader> imf_;  // an IMF picture track file: each frame decoded with OpenJPEG, its codes kept
     std::unique_ptr<ImageSequence> exr_;      // OpenEXR read with OpenEXR (a layer, or a compression FFmpeg lacks): its frames
     std::string exrFile_;                     // (a single file: first = last = 0)
+    std::vector<float> exrRgba_;              // its frame rawFrame_, straight float RGBA
+    int exrW_ = 0, exrH_ = 0;
     // Pulldown removed (media/Pulldown.h): the frames the cadence gives, their rate, and the last one woven.
     std::shared_ptr<const PulldownMap> pulldown_;
     double pulldownFps_ = 0;

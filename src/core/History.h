@@ -51,6 +51,8 @@ private:
 
 // Timecode helpers (SMPTE, with drop-frame for 29.97 / 59.94).
 std::string formatTimecode(FrameTime frame, Rational fps, bool dropFrame = true);
+// A time between frames as timecode and the samples past that frame at `rate`: "00:00:01:12+0801".
+std::string formatTimecodeSamples(double frames, Rational fps, int rate, bool dropFrame = true);
 // Parses "HH:MM:SS:FF", "HH:MM:SS;FF", "+FF", plain frame counts, or "N s".
 bool parseTimecode(const std::string& text, Rational fps, FrameTime& out);
 bool isDropFrameRate(Rational fps);

@@ -3,6 +3,7 @@ add_library(montage_engine STATIC
   core/MediaLog.h core/MediaLog.cpp
   core/Cdl.h core/Cdl.cpp
   core/Ale.h core/Ale.cpp
+  core/Ucs.h core/Ucs.cpp
   core/KeyframeEdit.h core/KeyframeEdit.cpp
   core/MaskPath.h core/MaskPath.cpp
   core/ColorWarp.h core/ColorWarp.cpp
@@ -34,6 +35,10 @@ add_library(montage_engine STATIC
   core/FaceIndex.h core/FaceIndex.cpp
   core/Aaf.h core/Aaf.cpp core/AafMetaDictionary.inc
   core/AafImport.h core/AafImport.cpp
+  core/AvidBin.h core/AvidBin.cpp
+  core/AvidMediaIndex.h core/AvidMediaIndex.cpp
+  core/AvidBinImport.h core/AvidBinImport.cpp
+  core/FilmCount.h core/FilmCount.cpp
   core/Surround.h core/Surround.cpp
   core/Ambisonics.h core/Ambisonics.cpp
   media/SpatialAudio.h media/SpatialAudio.cpp
@@ -88,6 +93,7 @@ add_library(montage_engine STATIC
   media/VoiceClone.h media/VoiceClone.cpp
   media/ContentCredentials.h media/ContentCredentials.cpp
   media/SoundSearch.h media/SoundSearch.cpp
+  media/SoundLibrary.h media/SoundLibrary.cpp
   media/DescribePicture.h media/DescribePicture.cpp
   media/LanguageModel.h media/LanguageModel.cpp
   media/StemSeparation.h media/StemSeparation.cpp
@@ -107,6 +113,7 @@ add_library(montage_engine STATIC
   media/Inference.h media/Inference.cpp
   render/ColorChart.h render/ColorChart.cpp
   media/Loudness.h media/Loudness.cpp
+  media/StereoAnalysis.h media/StereoAnalysis.cpp
   media/AudioSync.h media/AudioSync.cpp
   media/FieldRecorder.h media/FieldRecorder.cpp
   media/ImageSequence.h media/ImageSequence.cpp
@@ -154,6 +161,7 @@ add_library(montage_engine STATIC
   render/VideoDenoise.h render/VideoDenoise.cpp
   render/Restoration.h render/Restoration.cpp
   render/FilmScan.h render/FilmScan.cpp
+  render/FrameRepair.h render/FrameRepair.cpp render/Intelligibility.h render/Intelligibility.cpp
   render/LensBlur.h render/LensBlur.cpp
   render/FollowFocus.h render/FollowFocus.cpp
   render/ConformCheck.h render/ConformCheck.cpp
@@ -211,6 +219,7 @@ add_library(montage_engine STATIC
   render/OGraf.h render/OGraf.cpp
   render/Gallery.h render/Gallery.cpp
   render/LinedScript.h render/LinedScript.cpp
+  render/FilmLists.h render/FilmLists.cpp
   render/TrimPasses.h render/TrimPasses.cpp
   render/AutoTrims.h render/AutoTrims.cpp
   render/DialogueLoudness.h render/DialogueLoudness.cpp
@@ -239,6 +248,7 @@ add_library(montage_engine STATIC
   audio/AudioRepair.h audio/AudioRepair.cpp
   audio/SpectralRepair.h audio/SpectralRepair.cpp
   audio/TimeStretch.h audio/TimeStretch.cpp
+  audio/Upmix.h audio/Upmix.cpp
 )
 target_include_directories(montage_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/clap/include)
@@ -275,6 +285,7 @@ endif()
 target_compile_definitions(montage_engine PUBLIC MONTAGE_VERSION="${PROJECT_VERSION}")
 target_link_libraries(montage_engine PUBLIC Qt6::Core Qt6::Gui Qt6::Xml PkgConfig::FFMPEG Threads::Threads ${CMAKE_DL_LIBS})
 target_link_libraries(montage_engine PRIVATE Qt6::Network)  # (OGraf graphics: the browser's DevTools socket)
+target_link_libraries(montage_engine PRIVATE montage_sqlite)
 # The GPU compositor (render/GpuCompositor.h): Qt's RHI, public from Qt 6.6 (in the private GUI module, which Qt 6.9 and
 # later only load when asked for by name). Older Qt builds render on the CPU, as before.
 if(MONTAGE_GPU AND Qt6_VERSION VERSION_GREATER_EQUAL 6.6)

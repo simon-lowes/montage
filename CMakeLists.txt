@@ -294,6 +294,29 @@ if(MONTAGE_WITH_THORVG)
   target_link_libraries(montage_thorvg PRIVATE Threads::Threads)
 endif()
 
+# SQLite (public domain) for the sound library's index (media/SoundLibrary.h), from its amalgamation, with full-text
+# search (FTS5).
+include(FetchContent)
+enable_language(C)
+set(MONTAGE_SQLITE_TIMESTAMP "")
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+  set(MONTAGE_SQLITE_TIMESTAMP DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+endif()
+FetchContent_Declare(sqlite
+  URL https://www.sqlite.org/2025/sqlite-amalgamation-3500400.zip
+  URL_HASH SHA256=1d3049dd0f830a025a53105fc79fd2ab9431aea99e137809d064d8ee8356b032
+  ${MONTAGE_SQLITE_TIMESTAMP})
+FetchContent_MakeAvailable(sqlite)
+add_library(montage_sqlite STATIC ${sqlite_SOURCE_DIR}/sqlite3.c)
+target_include_directories(montage_sqlite PUBLIC ${sqlite_SOURCE_DIR})
+target_compile_definitions(montage_sqlite PRIVATE SQLITE_ENABLE_FTS5 SQLITE_THREADSAFE=1 SQLITE_OMIT_LOAD_EXTENSION
+                           SQLITE_DQS=0 SQLITE_DEFAULT_FOREIGN_KEYS=1)
+set_target_properties(montage_sqlite PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden
+                      AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+target_compile_options(montage_sqlite PRIVATE $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w -O2> $<$<C_COMPILER_ID:MSVC>:/w /O2>)
+find_package(Threads REQUIRED)
+target_link_libraries(montage_sqlite PRIVATE Threads::Threads)
+
 list(LENGTH CMAKE_OSX_ARCHITECTURES MONTAGE_OSX_ARCH_COUNT)
 if(MONTAGE_WITH_SPATIAL_VIDEO AND MONTAGE_OSX_ARCH_COUNT GREATER 1)
   message(WARNING "Spatial video is left out of a universal build (x265 builds for one architecture at a time)")

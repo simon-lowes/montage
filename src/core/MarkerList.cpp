@@ -79,6 +79,8 @@ int labelFor(const std::string& colour) {
 
 }  // namespace
 
+int labelForColourName(const std::string& colour) { return labelFor(trim(colour)); }
+
 std::string markersToCsv(const Sequence& s) {
     auto tc = [&](FrameTime f) { return formatTimecode(f, s.fps); };
     std::string out = "Marker Name,Description,In,Out,Duration,Marker Type,Color\n";

@@ -205,7 +205,10 @@ void curves(const Effect& e, FrameTime t, Image& img) {
     float mix = float(e.p("mix", t, 100)) / 100.0f;
     const int n = int(m.size()) - 1;
     auto look = [n](const std::vector<float>& lut, float v) {
-        float x = clamp01(v) * float(n);
+        // Past either end (a floating-point picture's highlights), the curve carries on at its end's slope.
+        if (v > 1) return lut[size_t(n)] + (v - 1) * (lut[size_t(n)] - lut[size_t(n) - 1]) * float(n);
+        if (v < 0) return lut[0] + v * (lut[1] - lut[0]) * float(n);
+        float x = v * float(n);
         int i = std::min(n - 1, int(x));
         float f = x - float(i);
         return lut[size_t(i)] * (1 - f) + lut[size_t(i) + 1] * f;
@@ -2214,7 +2217,7 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     } else if (ty == "ocio")
         applyOcio(e, img);
     else if (ty == "ofx")
-        ofx::applyEffect(e, double(t), img, pixelScale, ofx::currentFetch());
+        ofx::applyEffect(e, double(t), img, pixelScale, ofx::currentFetch(), nullptr, &currentWorkingSpace());
     else if (ty == "chroma_key") chromaKey(e, t, img);
     else if (ty == "screen_key") screenKey(e, t, img, pixelScale);
     else if (ty == "luma_key") lumaKey(e, t, img);
@@ -3312,9 +3315,7 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
             if (cs.label == e.s("to")) to = &cs;
         }
         if (!from || !to || from->id == to->id) return true;
-        op.kind = gpu::ColorOp::Lut;  // (convertColor's LUT, clamped first as it clamps)
-        op.lut = conversionLut(*from, *to, 1000);
-        op.clampFirst = true;
+        return false;  // (convertColor works out colours past 0..1 exactly, which a table cannot)
     } else if (e.type == "invert") {
         op.kind = gpu::ColorOp::Invert;
         op.params[0] = float(e.p("amount", t, 100)) / 100.0f;

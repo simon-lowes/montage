@@ -180,8 +180,8 @@ void clipPixels(const Frame16& f, float* out) {
     for (int y = 0; y < S; ++y)
         for (int x = 0; x < S; ++x) {
             const int sx = std::min(f.width - 1, x0 + x), sy = std::min(f.height - 1, y0 + y);
-            const uint16_t* p = &f.px[(size_t(sy) * size_t(f.width) + size_t(sx)) * 4];
-            for (int c = 0; c < 3; ++c) out[size_t(c) * S * S + size_t(y) * S + size_t(x)] = (p[c] / 65535.f - mean[c]) / stdev[c];
+            const size_t i = (size_t(sy) * size_t(f.width) + size_t(sx)) * 4;
+            for (int c = 0; c < 3; ++c) out[size_t(c) * S * S + size_t(y) * S + size_t(x)] = (f.unit(i + size_t(c)) - mean[c]) / stdev[c];
         }
 }
 

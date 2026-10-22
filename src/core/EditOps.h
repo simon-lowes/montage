@@ -67,6 +67,11 @@ Result insert(Project& p, Sequence& s, TrackRef t, Clip clip);
 // srcIn / srcOut are in sequence frames; srcOut < 0 means "to the end".
 Result placeMedia(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcIn, double srcOut,
                   TrackRef videoTrack, TrackRef audioTrack, bool insertMode, bool useVideo = true, bool useAudio = true);
+// A stretch of a sound file's samples, [first, first + count) at `rate`, on the audio track from frame `at`, to the
+// sample: its first sample heard at the start of that frame, the rest of its last frame silent (Clip::tail), the file's
+// last samples included. For the sound library (media/SoundLibrary.h).
+Result placeSoundRange(Project& p, Sequence& s, Id mediaId, FrameTime at, int64_t first, int64_t count, int rate, TrackRef audioTrack,
+                       bool insertMode);
 // Place on Top: the media on the first tracks above the video target (the audio target or after it) with nothing
 // over its length, new tracks when none have room. Nothing already in the sequence moves.
 Result placeOnTop(Project& p, Sequence& s, Id mediaId, FrameTime at, double srcIn, double srcOut, TrackRef videoTrack,
@@ -388,5 +393,17 @@ Result replaceWithRender(Sequence& s, Id clip, Id media);
 Result restoreUnrendered(Sequence& s, Id clip);
 
 Result makeCompound(Project& p, Sequence& s, const std::vector<Id>& ids, const std::string& name);
+
+// ---- Sound to the sample ------------------------------------------------------------------
+// An audio clip's sound moved (picture and linked clips left where they are), its start or end trimmed (positive
+// shortens), or what it plays slipped, by `samples` at `rate`: within its first and last frames (Clip::head and
+// tail) where it can, else into the frames beside, which must be free on its track. Its keys go with its sound when
+// it moves. Fails for a clip not on an audio track, one with a speed ramp, one in a transition whose frames would
+// change, a move or trim into another clip, a trim to nothing, or past either end of its media.
+enum class SampleEdit { Move, TrimStart, TrimEnd, Slip };
+Result editSoundSamples(const Project& p, Sequence& s, Id clip, SampleEdit what, int64_t samples, int rate);
+// Where the clip's sound starts and ends, in timeline frames (fractional).
+inline double soundStart(const Clip& c) { return double(c.start) + c.head; }
+inline double soundEnd(const Clip& c) { return double(c.end()) - c.tail; }
 
 }  // namespace montage::edit

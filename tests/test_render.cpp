@@ -6418,7 +6418,8 @@ colorspaces:
         edit::overwrite(p, s, {TrackKind::Video, 0}, matte(285, 30, 1.3, 0.2, 0.2));
         QcSettings q;
         q.silenceSeconds = 0;
-        q.clipping = false;
+        q.clipping = q.phase = false;
+        q.dcOffsetDb = 0;
         int ticks = 0;
         std::vector<QcIssue> issues = qualityCheck(p, s, 0, -1, q, [&](double) { ++ticks; });
         QVERIFY(ticks >= 315);
@@ -6448,11 +6449,13 @@ colorspaces:
         trackAt(s, {TrackKind::Video, 0})->clips.back().effects.push_back(makeEffect(p, "broadcast_safe"));
         QcSettings levelsOnly;
         levelsOnly.flashing = false, levelsOnly.blackSeconds = 0, levelsOnly.freezeSeconds = 0, levelsOnly.silenceSeconds = 0,
-        levelsOnly.clipping = false;
+        levelsOnly.clipping = false, levelsOnly.phase = false, levelsOnly.dcOffsetDb = 0;
         QVERIFY(qualityCheck(p, s, 0, -1, levelsOnly).empty());
         // Markers: red, spanning each problem, replacing the last check's.
         s.markers.push_back(Marker{10, 0, "Mine", "", 0});
-        issues = qualityCheck(p, s, 0, -1, QcSettings{true, true, 1, 5, 0, false});
+        QcSettings pictureOnly{true, true, 1, 5, 0, false};
+        pictureOnly.phase = false, pictureOnly.dcOffsetDb = 0;
+        issues = qualityCheck(p, s, 0, -1, pictureOnly);
         QCOMPARE(addQcMarkers(s, issues), int(issues.size()));
         QCOMPARE(addQcMarkers(s, issues), int(issues.size()));
         QCOMPARE(s.markers.size(), issues.size() + 1);
@@ -8246,7 +8249,8 @@ colorspaces:
     void qualityCheckSpelling() {
         // Only text: no picture or sound checks.
         QcSettings q;
-        q.flashing = q.levels = q.clipping = false;
+        q.flashing = q.levels = q.clipping = q.phase = false;
+        q.dcOffsetDb = 0;
         q.blackSeconds = q.freezeSeconds = q.silenceSeconds = 0;
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
@@ -10380,10 +10384,16 @@ colorspaces:
         lv.params["in_black"] = 0.05;
         lv.params["gamma"] = 1.3;
         lv.params["out_white"] = 0.9;
-        for (const Effect& e : {cdl, cst, inv, bw, hs, lv}) graded->effects.push_back(e);
+        for (const Effect& e : {cdl, inv, bw, hs, lv}) graded->effects.push_back(e);
         gpu::resetStats();
         compare(20, o, "more effects");
         QCOMPARE(gpu::stats().cpuLayers, 0L);
+        // Color Space Transform is worked out on the CPU (exactly, past 0..1 too), so its layer is drawn there.
+        graded->effects.insert(graded->effects.begin() + 1, cst);
+        gpu::resetStats();
+        compare(20, o, "color space transform");
+        QVERIFY(gpu::stats().cpuLayers > 0);
+        graded->effects.erase(graded->effects.begin() + 1);
         // As grade nodes in series, one with a window and a qualifier at 60 %, one faded to 50 %; then beside another
         // through a parallel mixer, which the GPU leaves to the CPU.
         const Id topId = r2.created[0];

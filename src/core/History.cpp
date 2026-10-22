@@ -85,6 +85,19 @@ std::string formatTimecode(FrameTime frame, Rational fps, bool dropFrame) {
     return buf;
 }
 
+std::string formatTimecodeSamples(double frames, Rational fps, int rate, bool dropFrame) {
+    const double perFrame = double(rate) / fps.toDouble();
+    // Rounded to the sample, which may carry it into the next frame.
+    const double samples = std::round(frames * perFrame);
+    FrameTime f = FrameTime(std::floor(samples / perFrame + 1e-9));
+    long long into = std::llround(samples - std::round(double(f) * perFrame));
+    if (into < 0) into += std::llround(perFrame), --f;
+    const int width = perFrame >= 10000 ? 5 : 4;
+    char buf[24];
+    std::snprintf(buf, sizeof buf, "+%0*lld", width, into);
+    return formatTimecode(f, fps, dropFrame) + buf;
+}
+
 bool parseTimecode(const std::string& textIn, Rational fps, FrameTime& out) {
     std::string text;
     for (char c : textIn)

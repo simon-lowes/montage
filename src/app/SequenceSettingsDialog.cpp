@@ -19,6 +19,7 @@
 
 #include "EditorState.h"
 #include "Theme.h"
+#include "core/FilmCount.h"
 #include "core/History.h"
 #include "render/ColorSpace.h"
 
@@ -197,6 +198,13 @@ SequenceSettingsDialog::SequenceSettingsDialog(QWidget* parent) : QDialog(parent
     stereo3d_->setToolTip(tr("Stereo footage gives each eye its own picture and the Stereo 3D effect sets a clip's depth.\n"
                              "View › Stereo 3D chooses what the viewer shows; exports are side by side unless chosen otherwise."));
     form->addRow(tr("Stereo:"), stereo3d_);
+    filmGauge_ = new QComboBox(this);
+    filmGauge_->setObjectName(QStringLiteral("filmGauge"));
+    filmGauge_->addItem(tr("None"), QString());
+    for (const FilmGauge& g : filmGauges()) filmGauge_->addItem(tr(g.name), QString::fromLatin1(g.id));
+    filmGauge_->setToolTip(tr("For a cut that goes back to film: the gauge its feet and frames, key numbers and film lists\n"
+                              "(File › Export Film Lists) are counted in."));
+    form->addRow(tr("Film:"), filmGauge_);
     form->addRow(QString(), summary_);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
@@ -237,6 +245,8 @@ void SequenceSettingsDialog::setSpec(const NewSequenceSpec& spec) {
     spherical_->setChecked(spec.spherical);
     vr180_->setChecked(spec.spherical && spec.vr180);
     stereo3d_->setChecked(spec.stereo3d);
+    const int fg = filmGauge_->findData(QString::fromStdString(spec.filmGauge));
+    filmGauge_->setCurrentIndex(fg >= 0 ? fg : 0);
     updateSummary();
 }
 
@@ -254,6 +264,7 @@ NewSequenceSpec SequenceSettingsDialog::spec() const {
     s.spherical = spherical_->isChecked();
     s.vr180 = s.spherical && vr180_->isChecked();
     s.stereo3d = stereo3d_->isChecked();
+    s.filmGauge = filmGauge_->currentData().toString().toStdString();
     return s;
 }
 
@@ -326,7 +337,8 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
     if (!state || !state->sequence()) return false;
     const Sequence& seq = *state->sequence();
     const NewSequenceSpec before{QString::fromStdString(seq.name), seq.width, seq.height, seq.fps, seq.sampleRate,
-                                 seq.colorSpace, seq.hdrPeakNits, seq.audioLayout, seq.spherical, seq.vr180, seq.stereo3d};
+                                 seq.colorSpace, seq.hdrPeakNits, seq.audioLayout, seq.spherical, seq.vr180, seq.stereo3d,
+                                 seq.filmGauge};
 
     SequenceSettingsDialog dlg(parent);
     dlg.setWindowTitle(tr("Sequence Settings"));
@@ -342,7 +354,7 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
     if (after.name == before.name && after.width == before.width && after.height == before.height &&
         after.fps == before.fps && after.sampleRate == before.sampleRate && after.colorSpace == before.colorSpace &&
         after.hdrPeakNits == before.hdrPeakNits && after.audioLayout == before.audioLayout && after.spherical == before.spherical &&
-        after.vr180 == before.vr180 && after.stereo3d == before.stereo3d)
+        after.vr180 == before.vr180 && after.stereo3d == before.stereo3d && after.filmGauge == before.filmGauge)
         return false;
 
     const std::string name = after.name.toStdString();
@@ -358,6 +370,7 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
         s.spherical = after.spherical;
         s.vr180 = after.vr180;
         s.stereo3d = after.stereo3d;
+        s.filmGauge = after.filmGauge;
         // Keep the media item that represents this sequence (for nesting) in sync.
         for (MediaItem& m : p.media) {
             if (m.kind != MediaKind::Sequence || m.sequenceId != s.id) continue;

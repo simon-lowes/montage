@@ -31,6 +31,7 @@ struct NewSequenceSpec {
     bool spherical = false;              // a 360° sequence (Sequence::spherical)
     bool vr180 = false;                  // with spherical: the front half of the sphere (Sequence::vr180)
     bool stereo3d = false;               // a stereoscopic 3D sequence (Sequence::stereo3d)
+    std::string filmGauge;               // cut on film: the gauge it is counted in (Sequence::filmGauge)
 };
 
 // Spin box that only accepts even values (most encoders need even frame sizes).
@@ -76,6 +77,7 @@ private:
     QComboBox* colorSpace_ = nullptr;
     QSpinBox* hdrPeak_ = nullptr;
     QComboBox* audioLayout_ = nullptr;
+    QComboBox* filmGauge_ = nullptr;
     QCheckBox* spherical_ = nullptr;
     QCheckBox* vr180_ = nullptr;
     QCheckBox* stereo3d_ = nullptr;

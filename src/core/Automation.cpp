@@ -9,6 +9,8 @@ namespace {
 
 // A lane's value at a fractional frame: whole frames as the lane gives them, linear between.
 double laneAt(const Param& p, double frame) {
+    // Keys between frames are met where they sit; otherwise a straight line between the frames' values, as always.
+    if (p.expr.empty() && std::any_of(p.keys.begin(), p.keys.end(), [](const Keyframe& k) { return k.sub != 0; })) return p.atTime(frame);
     const FrameTime f0 = FrameTime(std::floor(frame));
     const double u = frame - double(f0), a = p.at(f0);
     return u > 1e-9 ? a + (p.at(f0 + 1) - a) * u : a;
@@ -42,7 +44,7 @@ double trackPanAt(const Track& t, double frame) {
 
 bool laneMuted(const Param& lane, bool still, double frame) {
     if (lane.keys.empty()) return still;
-    const auto after = std::upper_bound(lane.keys.begin(), lane.keys.end(), frame, [](double f, const Keyframe& k) { return f < double(k.t); });
+    const auto after = std::upper_bound(lane.keys.begin(), lane.keys.end(), frame, [](double f, const Keyframe& k) { return f < k.time(); });
     const Keyframe& k = after == lane.keys.begin() ? lane.keys.front() : *std::prev(after);
     return k.v >= 0.5;
 }
