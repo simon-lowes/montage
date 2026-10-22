@@ -13,6 +13,7 @@
 
 class QCheckBox;
 class QComboBox;
+class QDoubleSpinBox;
 class QLabel;
 class QLineEdit;
 class QProgressBar;
@@ -104,6 +105,8 @@ private:
     bool initialisedMxf_ = false;
     QComboBox* color_ = nullptr;
     QComboBox* stereo_ = nullptr;  // a stereoscopic sequence: how its eyes are delivered
+    QDoubleSpinBox* spatialBaseline_ = nullptr;  // spatial video: the cameras' baseline (mm)
+    QDoubleSpinBox* spatialFov_ = nullptr;       // and horizontal field of view (degrees)
     QComboBox* loudness_ = nullptr;
     QCheckBox* described_ = nullptr;  // an audio description stream after the mix
     QComboBox* audioOut_ = nullptr;  // a surround sequence: all its channels, or folded to stereo

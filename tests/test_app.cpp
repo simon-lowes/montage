@@ -240,6 +240,7 @@
 #include "render/RenderCache.h"
 #include "render/BroadcastMxf.h"
 #include "render/Exporter.h"
+#include "render/SpatialVideo.h"
 #include "render/Ocio.h"
 
 using namespace montage;
@@ -10155,6 +10156,15 @@ const auto seq = [this] { return state()->sequence(); };
             QVERIFY(stereo && !stereo->isHidden());
             stereo->setCurrentIndex(stereo->findData(QStringLiteral("tb")));
             QVERIFY(stereo->currentText().contains("Top and bottom"));
+            // Spatial video asks for the cameras' baseline and field of view; the other choices do not.
+            auto* baseline = ed.findChild<QDoubleSpinBox*>("exportSpatialBaseline");
+            QVERIFY(baseline && baseline->isHidden());
+            if (spatialVideoAvailable()) {
+                stereo->setCurrentIndex(stereo->findData(QStringLiteral("mv")));
+                QVERIFY(!baseline->isHidden() && !ed.findChild<QDoubleSpinBox*>("exportSpatialFov")->isHidden());
+                stereo->setCurrentIndex(stereo->findData(QStringLiteral("tb")));
+                QVERIFY(baseline->isHidden());
+            }
         }
         QVERIFY(state()->edit("2D", [](Project&, Sequence& s) {
             s.stereo3d = false;

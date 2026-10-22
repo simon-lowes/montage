@@ -57,7 +57,11 @@ struct ExportSettings {
     // A stereoscopic sequence's eyes as delivered (render/Stereo.h names): "sbs" side by side at full size (the
     // default), "sbs_half", "tb", "tb_half", or one picture ("left", "right", "anaglyph"). Packed exports carry stereo
     // metadata (MP4 st3d, Matroska StereoMode; FFmpeg writes none into MOV). The width and height asked for are each eye's.
+    // "mv": spatial video, the eyes as MV-HEVC's two views in MOV or MP4 (H.265, 8-bit SDR; render/SpatialVideo.h),
+    // stating the cameras' baseline and horizontal field of view.
     std::string stereo;
+    double spatialBaseline = 64;      // mm
+    double spatialFieldOfView = 60;   // degrees
     // Captions from the sequence's visible caption track (or captionTrack):
     bool burnInCaptions = false;         // drawn into the picture
     bool embedCaptions = false;          // as a subtitle stream (MP4/MOV mov_text, MKV SubRip, WebM WebVTT)

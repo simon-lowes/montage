@@ -30,6 +30,7 @@ option(MONTAGE_WITH_MYSOFA "Measured HRTFs (SOFA files) for binaural ambisonics,
 option(MONTAGE_WITH_OPENJPEG "IMF masters in the JPEG 2000 IMF profiles, when OpenJPEG 2.5+ is installed" ON)
 option(MONTAGE_WITH_OPENSSL "Encrypted DCPs, signed compositions and KDMs, when OpenSSL 3 is installed" ON)
 option(MONTAGE_WITH_OPENEXR "Multi-layer OpenEXR, Cryptomatte and HTJ2K (OpenEXR with Imath and OpenJPH, BSD, fetched at configure time)" ON)
+option(MONTAGE_WITH_SPATIAL_VIDEO "Spatial video out: MV-HEVC through x265's multiview encoder (x265 4.2, GPL-2.0-or-later, downloaded and built with Montage)" ON)
 option(MONTAGE_WITH_BMX "Broadcast MXF by the book: AS-11, RDD 9 and ST 436 ancillary data (the EBU's bmx with libMXF, BSD, fetched at configure time)" ON)
 option(MONTAGE_GPU "The GPU compositor through Qt's RHI, where Qt is 6.6 or later" ON)
 option(MONTAGE_WITH_OCIO "OpenColorIO configs and ACES transforms, when OpenColorIO 2.1+ is installed" ON)
@@ -291,6 +292,47 @@ if(MONTAGE_WITH_THORVG)
   target_compile_options(montage_thorvg PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-w -O2> $<$<CXX_COMPILER_ID:MSVC>:/w /O2>)
   find_package(Threads REQUIRED)
   target_link_libraries(montage_thorvg PRIVATE Threads::Threads)
+endif()
+
+list(LENGTH CMAKE_OSX_ARCHITECTURES MONTAGE_OSX_ARCH_COUNT)
+if(MONTAGE_WITH_SPATIAL_VIDEO AND MONTAGE_OSX_ARCH_COUNT GREATER 1)
+  message(WARNING "Spatial video is left out of a universal build (x265 builds for one architecture at a time)")
+  set(MONTAGE_WITH_SPATIAL_VIDEO OFF)
+endif()
+if(MONTAGE_WITH_SPATIAL_VIDEO)
+  # x265 4.2 built with its multiview (MV-HEVC) encoder, which distribution builds leave out, as an 8-bit static
+  # library. Its symbols are hidden, so they never stand in for those of the x265 FFmpeg itself may load.
+  include(ExternalProject)
+  enable_language(C)
+  set(MONTAGE_X265_TIMESTAMP "")
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+    set(MONTAGE_X265_TIMESTAMP DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  endif()
+  set(MONTAGE_X265_PREFIX ${CMAKE_BINARY_DIR}/x265-mv)
+  set(MONTAGE_X265_LIB ${MONTAGE_X265_PREFIX}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}x265${CMAKE_STATIC_LIBRARY_SUFFIX})
+  set(MONTAGE_X265_FLAGS "")
+  if(NOT WIN32)
+    set(MONTAGE_X265_FLAGS "-fvisibility=hidden")
+  endif()
+  ExternalProject_Add(montage_x265_build
+    URL https://download.videolan.org/pub/videolan/x265/x265_4.2.tar.gz
+    URL_HASH SHA256=40b1ea0453e0309f0eba934e0ddf533f8f6295966679e8894e8f1c1c8d5e1210
+    ${MONTAGE_X265_TIMESTAMP}
+    SOURCE_SUBDIR source
+    CMAKE_ARGS -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=${MONTAGE_X265_PREFIX} -DCMAKE_INSTALL_LIBDIR=lib
+               -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER} -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+               -DCMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES} -DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
+               "-DCMAKE_C_FLAGS=${MONTAGE_X265_FLAGS}" "-DCMAKE_CXX_FLAGS=${MONTAGE_X265_FLAGS}"
+               -DENABLE_MULTIVIEW=ON -DENABLE_SHARED=OFF -DENABLE_CLI=OFF -DENABLE_LIBNUMA=OFF -DENABLE_PIC=ON
+               -DENABLE_HDR10_PLUS=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+    BUILD_BYPRODUCTS ${MONTAGE_X265_LIB})
+  add_library(montage_x265 STATIC IMPORTED GLOBAL)
+  set_target_properties(montage_x265 PROPERTIES IMPORTED_LOCATION ${MONTAGE_X265_LIB}
+    # (Its header by its full path: another x265's, as Homebrew's, may be on the include path first.)
+    INTERFACE_COMPILE_DEFINITIONS "MONTAGE_X265_HEADER=\"${MONTAGE_X265_PREFIX}/include/x265.h\"")
+  find_package(Threads REQUIRED)
+  target_link_libraries(montage_x265 INTERFACE Threads::Threads ${CMAKE_DL_LIBS})
+  add_dependencies(montage_x265 montage_x265_build)
 endif()
 
 add_subdirectory(src)

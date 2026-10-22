@@ -15,8 +15,9 @@ target_link_libraries(test_media PRIVATE Qt6::Network)  # (a free port for the c
 if(TARGET OpenEXR::OpenEXR)
   target_link_libraries(test_media PRIVATE OpenEXR::OpenEXR)  # (writing multi-part files)
 endif()
-# Several minutes of real encoding, decoding and model runs: slow CI runners need more than the default.
-set_tests_properties(test_media PROPERTIES TIMEOUT 900)
+# Several minutes of real encoding, decoding and model runs: slow CI runners need more than the default (macOS
+# runners took 846 s on main in October 2026, and over 900 s on a slower one).
+set_tests_properties(test_media PROPERTIES TIMEOUT 1500)
 target_compile_definitions(test_media PRIVATE MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
                            MONTAGE_TEST_TOOLS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tools")
 target_compile_definitions(test_core PRIVATE MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
