@@ -112,7 +112,7 @@ int usage() {
                  "  montage-cli colorspaces\n"
                  "  montage-cli devices                                (where AI models can run: CPU, GPU, NPU)\n"
                  "  montage-cli scenes <video> [--sensitivity 0..1]\n"
-                 "  montage-cli proxy <video> -o <proxy.mp4|.mov> [--format h264|prores_proxy|dnxhr_lb|hevc10]\n"
+                 "  montage-cli proxy <video> -o <proxy.mp4|.mov> [--format h264|prores_proxy|dnxhr_lb|hevc10|apv]\n"
                  "                    [--width 960|half|quarter] [--sound]   (an editing proxy; ProRes and HEVC keep HDR)\n"
                  "  montage-cli upscale <video|image> -o <output> [--factor 2|3|4] [--strength 0..1]  (Super Scale)\n"
                  "  montage-cli loudness <media>\n"
@@ -638,7 +638,7 @@ int cmdProxy(const std::vector<std::string>& args) {
             o.maxWidth = w == "half" ? 0 : w == "quarter" ? -1 : std::max(16, std::atoi(w.c_str()));
         } else if (args[i] == "--format" && i + 1 < args.size()) {
             if (!parseProxyFormat(args[++i], o.format)) {
-                std::fprintf(stderr, "error: --format is h264, prores_proxy, dnxhr_lb or hevc10\n");
+                std::fprintf(stderr, "error: --format is h264, prores_proxy, dnxhr_lb, hevc10 or apv\n");
                 return 2;
             }
         } else if (args[i] == "--sound") o.sound = true;

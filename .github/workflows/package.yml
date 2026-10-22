@@ -61,6 +61,7 @@ jobs:
           mkdir -p "$HOME/ffmpeg" && cp -R "$RUNNER_TEMP/ffmpeg-stage$HOME/ffmpeg/." "$HOME/ffmpeg/"
           echo "PKG_CONFIG_PATH=$HOME/ffmpeg/lib/pkgconfig" >> "$GITHUB_ENV"
           echo "$HOME/ffmpeg/bin" >> "$GITHUB_PATH"
+          echo "MONTAGE_TEST_OAPV=$RUNNER_TEMP/ffmpeg-stage/oapv-apps" >> "$GITHUB_ENV"  # OpenAPV's apps, for the APV test
       - name: Rust version (part of the C2PA library's cache key)
         id: rust
         run: echo "version=$(rustc --version | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"
@@ -173,6 +174,7 @@ jobs:
           esac
           pacman -Rdd --noconfirm mingw-w64-ucrt-x86_64-ffmpeg
           cp -R "$stage/ucrt64/." /ucrt64/
+          echo "MONTAGE_TEST_OAPV=$(cygpath -m "$stage/oapv-apps")" >> "$GITHUB_ENV"  # OpenAPV's apps, for the APV test
       - name: Rust version (part of the C2PA library's cache key)
         id: rust
         run: echo "version=$(rustc --version | tr -c 'A-Za-z0-9.\n' '-')" >> "$GITHUB_OUTPUT"

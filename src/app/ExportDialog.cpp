@@ -54,10 +54,10 @@ bool hasVideo(const ExportSettings& s) { return !s.videoCodec.empty() && s.video
 bool hasAudio(const ExportSettings& s) { return !s.audioCodec.empty() && s.audioCodec != "none"; }
 
 bool usesCrf(const std::string& codec) {
-    return codec == "libx264" || codec == "libx265" || codec == "libvpx-vp9" || codec == "libsvtav1";
+    return codec == "libx264" || codec == "libx265" || codec == "libvpx-vp9" || codec == "libsvtav1" || codec == "liboapv";
 }
-// VP9 and SVT-AV1 use a 0-63 quantiser scale, x264 / x265 0-51.
-int maxCrf(const std::string& codec) { return (codec == "libvpx-vp9" || codec == "libsvtav1") ? 63 : 51; }
+// VP9, SVT-AV1 and APV (whose number is its QP) use a 0-63 quantiser scale, x264 / x265 0-51.
+int maxCrf(const std::string& codec) { return (codec == "libvpx-vp9" || codec == "libsvtav1" || codec == "liboapv") ? 63 : 51; }
 
 QString videoCodecName(const ExportSettings& s) {
     const std::string& c = s.videoCodec;
@@ -82,6 +82,9 @@ QString videoCodecName(const ExportSettings& s) {
     if (c == "cfhd") return s.alpha ? QStringLiteral("CineForm RGBA") : QStringLiteral("CineForm");
     if (c == "ffv1") return QStringLiteral("FFV1 (lossless)");
     if (c == "v210") return QStringLiteral("Uncompressed 10-bit");
+    if (c == "liboapv") return s.alpha ? QStringLiteral("APV 4:4:4:4 12-bit") : s.profile == "4444" ? QStringLiteral("APV 4:4:4 12-bit")
+                               : s.pixFmt.find("12") != std::string::npos ? QStringLiteral("APV 4:2:2 12-bit")
+                                                                         : QStringLiteral("APV 4:2:2 10-bit");
     return QString::fromStdString(c);
 }
 
@@ -617,6 +620,8 @@ void ExportDialog::presetChanged() {
     if (usesCrf(p->settings.videoCodec)) {
         quality_->setMaximum(maxCrf(p->settings.videoCodec));
         quality_->setValue(p->settings.crf);
+        quality_->setToolTip(p->settings.videoCodec == "liboapv" ? tr("APV's quantiser (QP): lower values give higher quality and larger files")
+                                                                 : tr("Constant rate factor: lower values give higher quality and larger files"));
     }
     updateControls();
     updateSummary();
@@ -912,7 +917,7 @@ void ExportDialog::updateSummary() {
                            .arg(w)
                            .arg(h)
                            .arg(fpsLabel(seq->fps));
-        if (usesCrf(s.videoCodec)) line += tr(", CRF %1").arg(quality_->value());
+        if (usesCrf(s.videoCodec)) line += (s.videoCodec == "liboapv" ? tr(", QP %1") : tr(", CRF %1")).arg(quality_->value());
         if (s.alpha && !seq->stereo3d) line += tr(", with alpha");
         if (seq->stereo3d) line += ", " + stereo_->currentText();
         if (seq->stereo3d && stereo_->currentData().toString() == QLatin1String("mv") && s.videoCodec != "libx265" && s.videoCodec != "hw_hevc")

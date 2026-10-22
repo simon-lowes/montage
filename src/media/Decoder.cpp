@@ -18,6 +18,8 @@
 #include "SpatialAudio.h"
 #include "core/Interpretation.h"
 
+#include <QFile>
+#include <QFileInfo>
 #include <QString>
 #include <QtCore/qfloat16.h>
 #include <algorithm>
@@ -746,6 +748,46 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
             if (fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
                 m.audioStreams.push_back(std::max(1, fmt->streams[i]->codecpar->ch_layout.nb_channels));
         if (m.audioStreams.size() < 2) m.audioStreams.clear();
+    }
+    // A raw stream with no length in it (an .apv from OpenAPV's encoder, a raw DNxHD or AV1 stream): its pictures are
+    // counted at the rate FFmpeg gives it (an .apv's is not in the stream: 30 a second unless Interpret Footage says).
+    // An .apv's access units are stepped over by their sizes; others are read, the first 64 MB of them, and the rest
+    // reckoned from the file's size. (Not where FFmpeg gives its pictures no times, as in an elementary H.264 or HEVC
+    // stream, which could not be sought in.)
+    if (m.hasVideo && dur <= 0 && !isStillFormat(fmt) && (fmt->iformat->flags & AVFMT_NOTIMESTAMPS) && QFileInfo(QString::fromStdString(file)).isFile()) {
+        const AVRational rate = av_guess_frame_rate(fmt, fmt->streams[v], nullptr);
+        double pictures = 0;
+        bool timed = true;
+        if (std::strcmp(fmt->iformat->name, "apv") == 0) {
+            // Each access unit: its size (32 bits, big-endian) then that many bytes.
+            QFile f(QString::fromStdString(file));
+            const qint64 size = f.size();
+            uchar be[4];
+            if (f.open(QIODevice::ReadOnly))
+                for (qint64 at = 0; at + 4 <= size && f.seek(at) && f.read(reinterpret_cast<char*>(be), 4) == 4;) {
+                    const qint64 au = qint64(be[0]) << 24 | qint64(be[1]) << 16 | qint64(be[2]) << 8 | be[3];
+                    if (au < 24 || at + 4 + au > size) break;
+                    ++pictures;
+                    at += 4 + au;
+                }
+        } else {
+            constexpr int64_t kRead = int64_t(64) << 20;
+            const int64_t size = avio_size(fmt->pb);
+            AVPacket* pkt = av_packet_alloc();
+            bool whole = true;
+            while (pkt && timed && av_read_frame(fmt, pkt) >= 0) {
+                if (pkt->stream_index == v) timed = pkt->dts != AV_NOPTS_VALUE, ++pictures;
+                av_packet_unref(pkt);
+                if (avio_tell(fmt->pb) > kRead) {
+                    whole = false;
+                    break;
+                }
+            }
+            av_packet_free(&pkt);
+            const int64_t read = avio_tell(fmt->pb);
+            if (!whole && size > read && read > 0) pictures = std::round(pictures * double(size) / double(read));
+        }
+        if (timed && rate.num > 0 && rate.den > 0) dur = pictures * rate.den / rate.num;
     }
     if (m.hasVideo && isStillFormat(fmt)) {
         m.kind = MediaKind::Image;

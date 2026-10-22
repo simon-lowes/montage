@@ -68,7 +68,10 @@ one with its exact version, licence and source.
 - [FFmpeg](https://ffmpeg.org), built by `scripts/build-ffmpeg.sh` with `--enable-gpl` (and never `--enable-nonfree`),
   which makes this build GPL-2.0-or-later; with [x264](https://www.videolan.org/developers/x264.html) (GPL-2.0-or-later),
   [x265](https://www.x265.org) (GPL-2.0-or-later), libvpx (BSD-3-Clause), SVT-AV1 (BSD-3-Clause-Clear), dav1d
-  (BSD-2-Clause), Opus (BSD-3-Clause), OpenJPEG (BSD-2-Clause), SRT (MPL-2.0) and librist (BSD-2-Clause).
+  (BSD-2-Clause), Opus (BSD-3-Clause), OpenJPEG (BSD-2-Clause), SRT (MPL-2.0), librist (BSD-2-Clause) and
+  [OpenAPV](https://github.com/AcademySoftwareFoundation/openapv) 0.2.1.3 (BSD-3-Clause, Copyright (c) 2022 Samsung
+  Electronics Co., Ltd.; linked into libavcodec for APV encoding, its `LICENSE` copied into the packages' `ffmpeg`
+  licences folder).
 - [Qt](https://www.qt.io) 6 (LGPL-3.0): Core, Gui, Widgets, Network, Concurrent, Xml and Multimedia. You may replace
   the bundled Qt libraries with your own build of the same version.
 - [OpenColorIO](https://opencolorio.org) (BSD-3-Clause), [ONNX Runtime](https://onnxruntime.ai) (MIT, with its own

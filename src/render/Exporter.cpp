@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <functional>
 #include <optional>
+#include <thread>
 #include <array>
 #include <cctype>
 #include <filesystem>
@@ -107,6 +108,7 @@ AVPixelFormat defaultPixFmt(const ExportSettings& s, const std::string& c) {
     if (c == "cfhd") return s.alpha ? AV_PIX_FMT_GBRAP12LE : AV_PIX_FMT_YUV422P10LE;
     if (c == "v210") return AV_PIX_FMT_YUV422P10LE;
     if (c == "ffv1") return s.alpha ? AV_PIX_FMT_YUVA444P10LE : AV_PIX_FMT_YUV422P10LE;
+    if (c == "liboapv") return s.alpha ? AV_PIX_FMT_YUVA444P12LE : s.profile == "4444" ? AV_PIX_FMT_YUV444P12LE : AV_PIX_FMT_YUV422P10LE;
     if (c == "mjpeg") return AV_PIX_FMT_YUVJ420P;
     if (c == "libvpx-vp9" && s.alpha) return AV_PIX_FMT_YUVA420P;
     if (c == "png") return s.alpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
@@ -321,6 +323,16 @@ const std::vector<ExportPreset>& exportPresets() {
         }
         v.push_back(preset("FFV1 (lossless archive)", "mkv", "Mathematically lossless 10-bit 4:2:2 with FLAC sound, for archiving", "ffv1", "flac", 0,
                            "", "", "yuv422p10le"));
+        if (avcodec_find_encoder_by_name("liboapv")) {
+            // APV (Advanced Professional Video, an open intra-frame codec; OpenAPV's encoder): listed where FFmpeg has
+            // the encoder. Quality is a QP from 0 (best) to 63, or a bitrate.
+            v.push_back(preset("APV 422 10-bit", "mov", "Open intra-frame intermediate, 10-bit 4:2:2", "liboapv", "pcm_s24le", 20, "", "", "yuv422p10le"));
+            v.push_back(preset("APV 422 10-bit (MP4)", "mp4", "APV 10-bit 4:2:2 in MP4, AAC sound", "liboapv", "aac", 20, "", "", "yuv422p10le"));
+            ExportPreset a = preset("APV 4444 12-bit (alpha)", "mov", "APV 12-bit 4:4:4 with transparency, for graphics and finishing", "liboapv",
+                                    "pcm_s24le", 16, "", "4444");
+            a.settings.alpha = true;
+            v.push_back(a);
+        }
         v.push_back(preset("Uncompressed 10-bit (v210)", "mov", "Uncompressed 10-bit 4:2:2, for broadcast ingest", "v210", "pcm_s24le", 0, ""));
         {
             // Broadcast delivery in MXF OP1a: 1080 lines, 48 kHz 24-bit sound with each channel its own mono track.
@@ -1012,6 +1024,22 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         } else if (c == "libsvtav1") {
             if (s.videoBitrate <= 0) av_dict_set_int(&opts, "crf", s.crf, 0);
             av_dict_set(&opts, "preset", s.preset.empty() ? "8" : s.preset.c_str(), 0);
+        } else if (c == "liboapv") {
+            // A QP (s.crf, 0-63) unless a bitrate is set; OpenAPV's threads, one a core up to its 32.
+            const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(o.vctx->pix_fmt);
+            if (!d || d->log2_chroma_h) {
+                av_dict_free(&opts);
+                return fail("APV takes 4:2:2 or 4:4:4 pictures");
+            }
+            if (s.videoBitrate <= 0) av_dict_set_int(&opts, "qp", std::clamp(s.crf, 0, 63), 0);
+            if (!s.preset.empty()) av_dict_set(&opts, "preset", s.preset.c_str(), 0);
+            // The profile from the pictures: FFmpeg 8.0's wrapper leaves OpenAPV at 4:2:2 10-bit unless told (later
+            // ones choose it themselves, the same).
+            const std::string profile = std::string(d->nb_components == 1 ? "400" : d->log2_chroma_w ? "422" : (d->flags & AV_PIX_FMT_FLAG_ALPHA) ? "4444" : "444") +
+                                        (d->comp[0].depth > 10 ? "-12" : "-10");
+            av_dict_set(&opts, "oapv-params", ("profile=" + profile).c_str(), 0);
+            o.vctx->thread_count = std::clamp(int(std::thread::hardware_concurrency()), 1, 32);
+            o.vctx->gop_size = 1;
         } else if (c == "ffv1") {
             // The archival settings (as the Library of Congress recommends): version 3, intra-only, per-slice CRCs.
             av_dict_set(&opts, "level", "3", 0);
@@ -2516,8 +2544,12 @@ bool exportStems(const Project& p, const Sequence& seq, const ExportSettings& s,
     return true;
 }
 
+bool apvEncoderAvailable() { return avcodec_find_encoder_by_name("liboapv") != nullptr; }
+
+bool apvDecoderAvailable() { return avcodec_find_decoder_by_name("apv") != nullptr; }
+
 bool renderClipVideo(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
-                     const ExportProgress& progress, const std::atomic<bool>* cancel) {
+                     const ExportProgress& progress, const std::atomic<bool>* cancel, bool apv) {
     const Clip* c = edit::clipById(seq, clip);
     if (!c) {
         if (error) *error = "No such clip";
@@ -2541,9 +2573,10 @@ bool renderClipVideo(const Project& p, const Sequence& seq, Id clip, const std::
     alone.videoTracks[0].clips.push_back(copy);
     ExportSettings st;
     st.path = path;
-    st.videoCodec = "prores_ks";
+    st.videoCodec = apv ? "liboapv" : "prores_ks";
     st.profile = "4444";  // with its transparency
     st.alpha = true;
+    st.crf = 12;  // (APV's QP: near lossless, as ProRes 4444 is)
     st.audioCodec = "none";
     st.smartRender = false;
     st.in = 0;

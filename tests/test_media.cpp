@@ -14864,6 +14864,301 @@ if __name__ == '__main__':
         }
     }
 
+    void rawStreamLength() {
+        // A raw stream says nothing of its length (a raw DNxHR stream here; an .apv from OpenAPV's encoder the same):
+        // its pictures are counted, so it imports as two seconds, not as nothing, and plays to its end.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 256, gs.height = 128, gs.fps = {25, 1};
+        Clip ramp = makeGeneratorClip(gen, "color", 50);
+        ramp.generator.params["color.r"].addKey(0, 0.0);
+        ramp.generator.params["color.r"].addKey(49, 1.0);
+        QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 0}, ramp).ok);
+        ExportSettings st;
+        st.videoCodec = "dnxhd";
+        st.profile = "dnxhr_lb";
+        st.audioCodec = "none";
+        st.path = path("raw-stream.dnxhd");
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        Project p = makeDefaultProject();
+        const MediaItem m = probeOrFail(p, st.path);
+        QCOMPARE(int(m.kind), int(MediaKind::Video));
+        QCOMPARE(m.fps, (Rational{25, 1}));
+        QVERIFY2(std::fabs(m.duration - 2.0) < 1e-6, qPrintable(QString::number(m.duration)));
+        VideoDecoder dec;
+        QVERIFY(dec.open(st.path));
+        const Frame16Ptr last = dec.frameAt(49 / 25.0 + 0.001);
+        QVERIFY(last);
+        QVERIFY2(toImage(*last).at(128, 64)[0] > 0.9f, qPrintable(QString::number(toImage(*last).at(128, 64)[0])));
+    }
+
+    void apvInAndOut() {
+        // APV (Advanced Professional Video): FFmpeg 8's own decoder and OpenAPV's encoder (liboapv), which the packages'
+        // FFmpeg has. An FFmpeg without the encoder (Linux CI's 6.1) is offered no APV presets or proxies.
+        if (!apvEncoderAvailable() || !apvDecoderAvailable()) {
+            QVERIFY(!findExportPreset("APV 422 10-bit"));
+            QSKIP("This FFmpeg has no APV encoder (liboapv) or decoder");
+        }
+        std::string err;
+        // Colour bars with a title over them (edges for the codec to keep), 320 x 176 at 25 frames a second, with sound.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 176, s.fps = {25, 1};
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "bars", 10)).ok);
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 1}, makeGeneratorClip(p, "title", 10)).ok);
+        MediaItem speech = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/jfk.wav");
+        p.media.push_back(speech);
+        QVERIFY(edit::placeMedia(p, s, speech.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        auto frame = [](const std::string& file, int index) {
+            VideoDecoder dec;
+            if (!dec.open(file)) return Image();
+            const Frame16Ptr f = dec.frameAt(index / 25.0 + 0.001);
+            return f ? toImage(*f) : Image();
+        };
+        auto psnr = [](const Image& a, const Image& b) {
+            double se = 0;
+            for (int y = 0; y < a.height; ++y)
+                for (int x = 0; x < a.width; ++x)
+                    for (int c = 0; c < 3; ++c) se += std::pow(double(a.at(x, y)[c]) - b.at(x, y)[c], 2);
+            return 10 * std::log10(double(a.width) * a.height * 3 / std::max(se, 1e-12));
+        };
+        // What a file holds: video codec, pixel format, audio codec.
+        auto codecs = [](const std::string& file) {
+            std::array<std::string, 3> r;
+            AVFormatContext* fmt = nullptr;
+            if (avformat_open_input(&fmt, file.c_str(), nullptr, nullptr) < 0) return r;
+            avformat_find_stream_info(fmt, nullptr);
+            for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+                const AVCodecParameters* cp = fmt->streams[i]->codecpar;
+                if (cp->codec_type == AVMEDIA_TYPE_VIDEO) {
+                    r[0] = avcodec_get_name(cp->codec_id);
+                    if (const char* pf = av_get_pix_fmt_name(AVPixelFormat(cp->format))) r[1] = pf;
+                } else if (cp->codec_type == AVMEDIA_TYPE_AUDIO) {
+                    r[2] = avcodec_get_name(cp->codec_id);
+                }
+            }
+            avformat_close_input(&fmt);
+            return r;
+        };
+        // The file's APV sample entry ('apv1') and its decoder configuration ('apvC', the first frame header's facts).
+        struct ApvC {
+            bool found = false, colour = false;
+            int profile = 0, width = 0, height = 0, chroma = 0, depth = 0, primaries = 0, transfer = 0, matrix = 0;
+        };
+        auto apvC = [](const std::string& file) {
+            ApvC r;
+            QFile f(QString::fromStdString(file));
+            if (!f.open(QIODevice::ReadOnly)) return r;
+            const QByteArray b = f.readAll();
+            const qsizetype entry = b.indexOf("apv1"), at = b.indexOf("apvC");
+            if (entry < 4 || at <= entry || at + 30 > b.size()) return r;
+            auto u8 = [&](qsizetype i) { return int(uint8_t(b[at + i])); };
+            auto u32 = [&](qsizetype i) { return u8(i) << 24 | u8(i + 1) << 16 | u8(i + 2) << 8 | u8(i + 3); };
+            // After the type: version and flags (4), configurationVersion, entries, pbu_type, frame infos, then the first.
+            if (u8(8) != 1 || u8(9) < 1 || u8(10) != 1 || u8(11) < 1) return r;
+            r.found = true;
+            r.colour = u8(12) & 2;
+            r.profile = u8(13);
+            r.width = u32(16);
+            r.height = u32(20);
+            r.chroma = u8(24) >> 4;
+            r.depth = (u8(24) & 15) + 8;
+            if (r.colour) r.primaries = u8(26), r.transfer = u8(27), r.matrix = u8(28);
+            return r;
+        };
+
+        // The lossless reference: FFV1 in the same 4:2:2 10-bit, so what is measured is APV's own loss.
+        ExportSettings ref = findExportPreset("FFV1 (lossless archive)")->settings;
+        ref.path = path("apv-reference.mkv");
+        QVERIFY2(exportSequence(p, s, ref, nullptr, nullptr, &err), err.c_str());
+        const Image truth = frame(ref.path, 4);
+        QVERIFY(!truth.empty());
+
+        // 4:2:2 10-bit in MOV (PCM) and MP4 (AAC): 'apv1' with its 'apvC', tagged Rec.709, above 45 dB.
+        for (const char* name : {"APV 422 10-bit", "APV 422 10-bit (MP4)"}) {
+            const ExportPreset* pr = findExportPreset(name);
+            QVERIFY2(pr, name);
+            ExportSettings st = pr->settings;
+            st.path = path((std::string("apv-422.") + pr->extension).c_str());
+            std::string used;
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err, &used), qPrintable(QString("%1: %2").arg(name, err.c_str())));
+            QCOMPARE(QString::fromStdString(used), QString("liboapv"));
+            const auto [video, pix, audio] = codecs(st.path);
+            QCOMPARE(QString::fromStdString(video), QString("apv"));
+            QCOMPARE(QString::fromStdString(pix), QString("yuv422p10le"));
+            QCOMPARE(QString::fromStdString(audio), QString(pr->extension == "mp4" ? "aac" : "pcm_s24le"));
+            const ApvC c = apvC(st.path);
+            QVERIFY2(c.found, name);
+            QCOMPARE(c.profile, 33);  // 422-10
+            QCOMPARE(c.width, 320);
+            QCOMPARE(c.height, 176);
+            QCOMPARE(c.chroma, 2);
+            QCOMPARE(c.depth, 10);
+            QVERIFY(c.colour);
+            QCOMPARE(c.primaries, 1);
+            QCOMPARE(c.transfer, 1);
+            QCOMPARE(c.matrix, 1);
+            const Image got = frame(st.path, 4);
+            QVERIFY2(!got.empty(), name);
+            const double db = psnr(got, truth);
+            QVERIFY2(db > 45, qPrintable(QString("%1: %2 dB").arg(name).arg(db)));
+        }
+        // Quality by bitrate instead of QP: a 1 Mb/s file is smaller than the QP 20 one.
+        {
+            ExportSettings st = findExportPreset("APV 422 10-bit")->settings;
+            st.audioCodec = "none";
+            st.path = path("apv-qp.mov");
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+            ExportSettings rate = st;
+            rate.videoBitrate = 1000000;
+            rate.path = path("apv-1mbps.mov");
+            QVERIFY2(exportSequence(p, s, rate, nullptr, nullptr, &err), err.c_str());
+            const qint64 qp = QFileInfo(QString::fromStdString(st.path)).size(), mbps = QFileInfo(QString::fromStdString(rate.path)).size();
+            QVERIFY2(mbps < qp, qPrintable(QString("1 Mb/s: %1 bytes, QP 20: %2").arg(mbps).arg(qp)));
+        }
+
+        // 4:4:4:4 12-bit keeps a title's transparency: clear round it, solid on it.
+        {
+            Project overlay = p;
+            Sequence& os = *overlay.active();
+            os.videoTracks[0].clips.clear();
+            ExportSettings st = findExportPreset("APV 4444 12-bit (alpha)")->settings;
+            st.audioCodec = "none";
+            st.path = path("apv-4444.mov");
+            QVERIFY2(exportSequence(overlay, os, st, nullptr, nullptr, &err), err.c_str());
+            QCOMPARE(QString::fromStdString(codecs(st.path)[1]), QString("yuva444p12le"));
+            const ApvC c = apvC(st.path);
+            QVERIFY(c.found);
+            QCOMPARE(c.profile, 88);  // 4444-12
+            QCOMPARE(c.chroma, 4);
+            QCOMPARE(c.depth, 12);
+            const Image got = frame(st.path, 4);
+            QVERIFY(!got.empty());
+            QVERIFY2(got.at(5, 5)[3] < 0.02f, "corner");
+            int solid = 0;
+            for (int y = 0; y < got.height; ++y)
+                for (int x = 0; x < got.width; ++x) solid += got.at(x, y)[3] > 0.98f;
+            QVERIFY2(solid > 50, qPrintable(QString::number(solid)));
+        }
+
+        // Proxies in APV (.mov only), and Render and Replace to APV with transparency.
+        {
+            ProxyOptions o;
+            o.format = ProxyFormat::Apv;
+            o.maxWidth = 160;
+            QVERIFY(!createProxy(ref.path, path("apv-proxy.mp4"), o, {}, nullptr, &err));
+            QVERIFY2(QString::fromStdString(err).contains(".mov"), err.c_str());
+            QVERIFY2(createProxy(ref.path, path("apv-proxy.mov"), o, {}, nullptr, &err), err.c_str());
+            QCOMPARE(QString::fromStdString(codecs(path("apv-proxy.mov"))[0]), QString("apv"));
+            QCOMPARE(proxyExtension(ProxyFormat::Apv), std::string(".mov"));
+            ProxyFormat back = ProxyFormat::H264;
+            QVERIFY(parseProxyFormat("apv", back) && back == ProxyFormat::Apv);
+            const Id title = s.videoTracks[1].clips[0].id;
+            QVERIFY2(renderClipVideo(p, s, title, path("apv-render.mov"), &err, {}, nullptr, true), err.c_str());
+            const auto [video, pix, audio] = codecs(path("apv-render.mov"));
+            QCOMPARE(QString::fromStdString(video), QString("apv"));
+            QCOMPARE(QString::fromStdString(pix), QString("yuva444p12le"));
+        }
+
+        // A raw APV stream from OpenAPV's own encoder (MONTAGE_TEST_OAPV: the folder with oapv_app_enc and oapv_app_dec):
+        // FFmpeg decodes it to the same samples as OpenAPV's decoder, and Montage imports it and shows its picture.
+        const QString tools = qEnvironmentVariable("MONTAGE_TEST_OAPV");
+        if (tools.isEmpty()) QSKIP("Set MONTAGE_TEST_OAPV to a folder with OpenAPV's oapv_app_enc and oapv_app_dec for the rest");
+        const int w = 320, h = 176, frames = 3;
+        const size_t planeY = size_t(w) * h, planeC = planeY / 2, frameSamples = planeY + 2 * planeC;
+        std::vector<uint16_t> source(frameSamples * frames);
+        for (int f = 0; f < frames; ++f) {
+            uint16_t* yp = source.data() + frameSamples * size_t(f);
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x)  // a diagonal ramp with a ripple, moving a little each frame; neutral chroma
+                    yp[size_t(y) * w + size_t(x)] = uint16_t(std::lround(100 + 700.0 * (x + y + 6 * f) / (w + h + 12) +
+                                                                         60 * std::sin(x * 0.21) * std::cos(y * 0.17)));
+            std::fill(yp + planeY, yp + frameSamples, uint16_t(512));
+        }
+        auto write = [](const std::string& file, const std::vector<uint16_t>& samples) {
+            QFile out(QString::fromStdString(file));
+            if (!out.open(QIODevice::WriteOnly)) return false;
+            QByteArray bytes(qsizetype(samples.size() * 2), Qt::Uninitialized);
+            for (size_t i = 0; i < samples.size(); ++i) bytes[qsizetype(2 * i)] = char(samples[i] & 255), bytes[qsizetype(2 * i + 1)] = char(samples[i] >> 8);
+            return out.write(bytes) == bytes.size();
+        };
+        QVERIFY(write(path("apv-source.yuv"), source));
+        auto run = [&](const QString& program, const QStringList& args) {
+            QProcess pr;
+            pr.start(tools + '/' + program, args);
+            const bool done = pr.waitForFinished(120000);
+            return done && pr.exitStatus() == QProcess::NormalExit && pr.exitCode() == 0 ? QString()
+                                                                                       : QString::fromLocal8Bit(pr.readAllStandardOutput() + pr.readAllStandardError());
+        };
+        const std::string apv = path("oapv.apv");
+        QString out = run("oapv_app_enc", {"-i", QString::fromStdString(path("apv-source.yuv")), "-w", QString::number(w), "-h", QString::number(h),
+                                           "-z", "25", "-d", "10", "--input-csp", "2", "-q", "8", "-o", QString::fromStdString(apv)});
+        QVERIFY2(out.isEmpty(), qPrintable(out));
+        out = run("oapv_app_dec", {"-i", QString::fromStdString(apv), "-o", QString::fromStdString(path("oapv-decoded.yuv"))});
+        QVERIFY2(out.isEmpty(), qPrintable(out));
+        QFile decodedFile(QString::fromStdString(path("oapv-decoded.yuv")));
+        QVERIFY(decodedFile.open(QIODevice::ReadOnly));
+        const QByteArray byOapv = decodedFile.readAll();
+        QCOMPARE(byOapv.size(), qsizetype(frameSamples * frames * 2));
+        // FFmpeg's decoder, every sample of every frame.
+        {
+            AVFormatContext* fmt = nullptr;
+            QVERIFY(avformat_open_input(&fmt, apv.c_str(), nullptr, nullptr) == 0);
+            QVERIFY(avformat_find_stream_info(fmt, nullptr) >= 0);
+            const int stream = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+            QVERIFY(stream >= 0);
+            const AVCodec* codec = avcodec_find_decoder(fmt->streams[stream]->codecpar->codec_id);
+            QVERIFY(codec);
+            AVCodecContext* ctx = avcodec_alloc_context3(codec);
+            avcodec_parameters_to_context(ctx, fmt->streams[stream]->codecpar);
+            QVERIFY(avcodec_open2(ctx, codec, nullptr) == 0);
+            AVPacket* pkt = av_packet_alloc();
+            AVFrame* fr = av_frame_alloc();
+            QByteArray byFfmpeg;
+            auto take = [&] {
+                while (avcodec_receive_frame(ctx, fr) == 0) {
+                    QCOMPARE(fr->format, int(AV_PIX_FMT_YUV422P10LE));
+                    for (int plane = 0; plane < 3; ++plane) {
+                        const int pw = plane ? w / 2 : w;
+                        for (int y = 0; y < h; ++y) byFfmpeg.append(reinterpret_cast<const char*>(fr->data[plane] + y * fr->linesize[plane]), pw * 2);
+                    }
+                }
+            };
+            while (av_read_frame(fmt, pkt) >= 0) {
+                if (pkt->stream_index == stream) avcodec_send_packet(ctx, pkt);
+                av_packet_unref(pkt);
+                take();
+            }
+            avcodec_send_packet(ctx, nullptr);
+            take();
+            av_frame_free(&fr);
+            av_packet_free(&pkt);
+            avcodec_free_context(&ctx);
+            avformat_close_input(&fmt);
+            QCOMPARE(byFfmpeg.size(), byOapv.size());
+            QVERIFY2(byFfmpeg == byOapv, "FFmpeg's APV decoder differs from OpenAPV's");
+        }
+        // Montage: the file imports as 320 x 176 video, and its first picture is the source's ramp (grey: Rec.709 video
+        // levels, 64 black to 940 white).
+        Project q = makeDefaultProject();
+        const MediaItem m = probeOrFail(q, apv);
+        QVERIFY(m.hasVideo);
+        QCOMPARE(m.width, w);
+        QCOMPARE(m.height, h);
+        // (A raw APV stream carries no rate: FFmpeg's 30 a second, its three access units counted.)
+        QCOMPARE(m.fps, (Rational{30, 1}));
+        QVERIFY2(std::fabs(m.duration - 0.1) < 1e-9, qPrintable(QString::number(m.duration)));
+        const Image first = frame(apv, 0);
+        QVERIFY(!first.empty());
+        double diff = 0;
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+                for (int c = 0; c < 3; ++c) diff += std::abs(first.at(x, y)[c] - (source[size_t(y) * w + size_t(x)] - 64) / 876.0);
+        diff /= double(w) * h * 3;
+        QVERIFY2(diff < 0.01, qPrintable(QString("mean difference %1").arg(diff)));
+    }
+
     void motionBlurAndDeflicker() {
         std::string err;
         auto footage = [&](const std::string& file, const std::function<void(Project&, Sequence&)>& build) {

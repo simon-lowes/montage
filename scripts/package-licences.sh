@@ -51,5 +51,7 @@ if [ -n "$FFSHARE" ] && [ -d "$FFSHARE" ]; then
   mkdir -p "$OUT/ffmpeg"
   cp "$FFSHARE"/LICENSE.md "$FFSHARE"/COPYING.* "$FFSHARE"/configure.txt "$OUT/ffmpeg/"
   [ -s "$FFSHARE/buildconf.txt" ] && cp "$FFSHARE/buildconf.txt" "$OUT/ffmpeg/"
+  # OpenAPV (BSD-3-Clause), linked into FFmpeg's libavcodec.
+  [ -s "$FFSHARE/OpenAPV-LICENSE.txt" ] && cp "$FFSHARE/OpenAPV-LICENSE.txt" "$OUT/ffmpeg/"
 fi
 echo "Licences for Montage, its vendored headers and compiled-in libraries are in $OUT"
