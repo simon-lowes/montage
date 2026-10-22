@@ -10380,10 +10380,16 @@ colorspaces:
         lv.params["in_black"] = 0.05;
         lv.params["gamma"] = 1.3;
         lv.params["out_white"] = 0.9;
-        for (const Effect& e : {cdl, cst, inv, bw, hs, lv}) graded->effects.push_back(e);
+        for (const Effect& e : {cdl, inv, bw, hs, lv}) graded->effects.push_back(e);
         gpu::resetStats();
         compare(20, o, "more effects");
         QCOMPARE(gpu::stats().cpuLayers, 0L);
+        // Color Space Transform is worked out on the CPU (exactly, past 0..1 too), so its layer is drawn there.
+        graded->effects.insert(graded->effects.begin() + 1, cst);
+        gpu::resetStats();
+        compare(20, o, "color space transform");
+        QVERIFY(gpu::stats().cpuLayers > 0);
+        graded->effects.erase(graded->effects.begin() + 1);
         // As grade nodes in series, one with a window and a qualifier at 60 %, one faded to 50 %; then beside another
         // through a parallel mixer, which the GPU leaves to the CPU.
         const Id topId = r2.created[0];
