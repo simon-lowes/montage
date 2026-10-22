@@ -216,6 +216,7 @@
 #include "render/VoiceMatch.h"
 #include "render/Exporter.h"
 #include "render/Processing.h"
+#include "render/FrameRepair.h"
 
 namespace montage {
 
@@ -1341,6 +1342,8 @@ void MainWindow::buildMenus() {
             appSettings().setValue("breathControl/amount", amount);
             breathControl(amount);
         }))->setObjectName(QStringLiteral("breathControl"));
+    add(clipM, tr("Repair Damaged Frames…"), QKeySequence(), withSeq([this] { repairDamagedFrames(); }))
+        ->setObjectName(QStringLiteral("repairDamagedFrames"));
     add(clipM, tr("Remove Mic &Bleed…"), QKeySequence(), withSeq([this] { micBleedDialog(); }))->setObjectName(QStringLiteral("removeMicBleed"));
     add(clipM, tr("Separate Stems…"), QKeySequence(), withSeq([this] {
             std::vector<Id> clips;
@@ -5511,6 +5514,53 @@ Id MainWindow::makeHighlights(double seconds, const QString& lookFor) {
         state_->message(tr("%n moment(s) in a new Highlights sequence", "", int(moments.size())), 6000);
     }
     return seq;
+}
+
+int MainWindow::repairDamagedFrames() {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    // The selected video clips, else the one under the playhead on the target video track.
+    std::vector<Id> clips;
+    for (Id id : state_->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Video) clips.push_back(id);
+    if (clips.empty())
+        if (const Track* t = trackAt(*s, {TrackKind::Video, state_->targetVideoTrack()}))
+            for (const Clip& c : t->clips)
+                if (c.start <= state_->playhead() && state_->playhead() < c.end()) clips.push_back(c.id);
+    std::erase_if(clips, [&](Id id) {
+        const MediaItem* m = state_->project().findMedia(edit::clipById(*s, id)->mediaId);
+        return !m || m->kind != MediaKind::Video;
+    });
+    if (clips.empty()) {
+        state_->message(tr("Select the video clips whose damaged frames to repair"));
+        return 0;
+    }
+    // Found off the interface thread, then listed on each clip's Frame Repair effect in one undo step.
+    const Project project = state_->project();
+    const Sequence seq = *s;
+    std::vector<std::pair<Id, std::vector<DamagedFrame>>> found;
+    if (!runWithProgress(this, state_, tr("Finding damaged frames…"), [&](const auto& progress, const auto* cancel, std::string* e) {
+            for (size_t i = 0; i < clips.size(); ++i) {
+                std::vector<DamagedFrame> frames;
+                const auto part = [&](double f) { progress((double(i) + f) / double(clips.size())); };
+                if (!damagedFramesInClip(project, seq, *edit::clipById(seq, clips[i]), frames, part, cancel, e)) return false;
+                found.push_back({clips[i], std::move(frames)});
+            }
+            return true;
+        }))
+        return 0;
+    size_t total = 0;
+    for (const auto& [id, frames] : found) total += frames.size();
+    if (total)
+        state_->edit(tr("Repair Damaged Frames"), [&](Project& p, Sequence& sq) {
+            for (const auto& [id, frames] : found)
+                if (Clip* c = edit::clipById(sq, id)) listDamagedFrames(p, sq, *c, frames);
+            return true;
+        });
+    state_->message(total ? tr("%n damaged frame(s) found and repaired (marked on the timeline)", "", int(total))
+                          : tr("No damaged frames found"),
+                    6000);
+    return int(total);
 }
 
 int MainWindow::importEmbeddedCaptions() {

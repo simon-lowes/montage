@@ -3,6 +3,7 @@
 #include "core/GradeGraph.h"
 #include "media/LipSync.h"
 #include "media/MotionDeblur.h"
+#include "media/Rife.h"
 #include "media/Proxy.h"
 #include "media/SuperScale.h"
 #include "media/VideoDepth.h"
@@ -76,6 +77,7 @@ void addClip(QCryptographicHash& h, const Sequence& seq, const Clip& c) {
     for (const Effect* e : liveEffects(seq, c))
         if (e->type == "motion_deblur") h.addData(deblurModel().installed() ? "deblur:1" : "deblur:0");
         else if (e->type == "super_scale") h.addData(upscaleModel().installed() ? "upscale:1" : "upscale:0");
+        else if (e->type == "frame_repair") h.addData(rifeAvailable() && rifeModel().installed() ? "rife:1" : "rife:0");
 }
 
 void addMedia(QCryptographicHash& h, const MediaItem& m, const RenderOptions& o) {

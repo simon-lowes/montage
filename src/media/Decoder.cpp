@@ -1454,6 +1454,11 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
     if (!out) return nullptr;
     if (!alpha_.empty()) interpretAlpha(*out, alpha_);
     out->pts = pts / timeScale_;
+#ifdef AV_FRAME_FLAG_CORRUPT
+    out->damaged = in->decode_error_flags != 0 || (in->flags & AV_FRAME_FLAG_CORRUPT);
+#else
+    out->damaged = in->decode_error_flags != 0;
+#endif
     if (rotation_) {
         auto rotated = std::make_shared<Frame16>(rotateFrame(*out, rotation_));
         rotated->pts = out->pts;
@@ -1848,6 +1853,7 @@ Frame16 rotateFrame(const Frame16& f, int degrees) {
     out.height = swap ? f.width : f.height;
     out.pts = f.pts;
     out.half = f.half;
+    out.damaged = f.damaged;
     out.px.resize(f.px.size());
     for (int y = 0; y < f.height; ++y)
         for (int x = 0; x < f.width; ++x) {

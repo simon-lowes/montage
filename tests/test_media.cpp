@@ -210,6 +210,7 @@
 #include "render/DialogueLoudness.h"
 #include "render/ProjectManager.h"
 #include "render/LutExport.h"
+#include "render/FrameRepair.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -24451,7 +24452,7 @@ private:
     };
 
     // Writes the frames as a video, each a still one frame long.
-    void writeFrames(const std::string& file, const std::vector<QImage>& frames, double fps, int crf = 8) {
+    void writeFrames(const std::string& file, const std::vector<QImage>& frames, double fps, int crf = 8, int gop = 0) {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
         s.width = frames[0].width();
@@ -24472,9 +24473,47 @@ private:
         st.path = file;
         st.audioCodec = "none";
         st.crf = crf;
+        st.gop = gop;
         st.preset = "ultrafast";
         std::string err;
         QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+    }
+
+    // Copies a video into a new file whose packets from `gapAt` on come a frame later (a frame missing from its times)
+    // and whose packet `corruptAt` has the middle of its bytes overwritten, as a broken transfer leaves them.
+    void remuxDamaged(const std::string& in, const std::string& out, int gapAt, int corruptAt) {
+        AVFormatContext* src = nullptr;
+        QVERIFY(avformat_open_input(&src, in.c_str(), nullptr, nullptr) >= 0);
+        QVERIFY(avformat_find_stream_info(src, nullptr) >= 0);
+        AVFormatContext* dst = nullptr;
+        QVERIFY(avformat_alloc_output_context2(&dst, nullptr, "mp4", out.c_str()) >= 0);
+        AVStream* v = avformat_new_stream(dst, nullptr);
+        avcodec_parameters_copy(v->codecpar, src->streams[0]->codecpar);
+        v->codecpar->codec_tag = 0;
+        v->time_base = src->streams[0]->time_base;
+        QVERIFY(avio_open(&dst->pb, out.c_str(), AVIO_FLAG_WRITE) >= 0);
+        QVERIFY(avformat_write_header(dst, nullptr) >= 0);
+        AVPacket* pkt = av_packet_alloc();
+        std::mt19937 rng(11);
+        for (int i = 0; av_read_frame(src, pkt) >= 0; av_packet_unref(pkt)) {
+            if (pkt->stream_index != 0) continue;
+            av_packet_rescale_ts(pkt, src->streams[0]->time_base, v->time_base);
+            if (i >= gapAt) {
+                const int64_t step = av_rescale_q(1, av_inv_q(src->streams[0]->avg_frame_rate), v->time_base);
+                pkt->pts += step, pkt->dts += step;
+            }
+            if (i == corruptAt) {
+                QVERIFY(av_packet_make_writable(pkt) >= 0);
+                for (int b = pkt->size * 2 / 5; b < pkt->size * 7 / 10; ++b) pkt->data[b] = uint8_t(rng());
+            }
+            ++i;
+            av_interleaved_write_frame(dst, pkt);
+        }
+        av_packet_free(&pkt);
+        av_write_trailer(dst);
+        avio_closep(&dst->pb);
+        avformat_free_context(dst);
+        avformat_close_input(&src);
     }
 
     // Copies a video's picture into a new file with a data track of the given packets (seconds, bytes), tagged gpmd;
@@ -28050,6 +28089,175 @@ private slots:
         std::atomic<bool> cancel{true};
         QVERIFY(model->describe(toImage(*small), PictureDetail::Brief, &err, &cancel).empty());
         QVERIFY(model->describe(Image(), PictureDetail::Brief, &err).empty());
+    }
+
+    void damagedFramesFoundAndRepaired() {
+        // Three shots of texture moving 3 px a frame (cuts at frames 30 and 35), as the camera saw them, and the same with
+        // a digital hit (frame 5), tape drop-out lines (10), a black frame (15), a white flash frame (19), a real camera
+        // flash (24, the picture lit up) and a black frame cut in between the second and third shots (35).
+        const int W = 320, H = 180, N = 40;
+        auto scene = [](int f, double x, double y) {
+            const double u = x + 3 * f;
+            if (f < 30) return 0.5 + 0.2 * std::sin(u * 0.11) * std::cos(y * 0.13) + 0.1 * std::sin((u + 2 * y) * 0.05);
+            if (f < 35) return 0.2 + 0.1 * std::sin(u * 0.07 + y * 0.09);
+            return 0.78 + 0.12 * std::cos(u * 0.09) * std::sin(y * 0.06);
+        };
+        auto grey = [](double v) {
+            const int g = std::clamp(int(std::lround(255 * v)), 0, 255);
+            return qRgb(g, g * 9 / 10, g * 8 / 10);
+        };
+        std::mt19937 rng(5);
+        std::vector<QImage> clean, damaged;
+        for (int f = 0; f < N; ++f) {
+            QImage img(W, H, QImage::Format_RGB32);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) img.setPixel(x, y, grey(scene(f, x, y)));
+            clean.push_back(img);
+            if (f == 5)
+                for (int b = 0; b < 10; ++b) {  // (8-pixel blocks of wrong colour, two by two)
+                    const int bx = int(rng() % uint32_t(W / 16 - 1)) * 16, by = int(rng() % uint32_t(H / 16 - 1)) * 16;
+                    for (int k = 0; k < 4; ++k) {
+                        const QRgb c = qRgb(int(rng() % 256), int(rng() % 256), int(rng() % 256));
+                        for (int y = 0; y < 8; ++y)
+                            for (int x = 0; x < 8; ++x) img.setPixel(bx + (k % 2) * 8 + x, by + (k / 2) * 8 + y, c);
+                    }
+                }
+            if (f == 10)
+                for (int y : {50, 51, 52, 53, 54, 55, 120, 121, 122, 123, 124, 125})
+                    for (int x = 0; x < W; ++x) img.setPixel(x, y, grey(0.95 + 0.05 * double(rng() % 100) / 100));
+            if (f == 15 || f == 35) img.fill(qRgb(2, 2, 2));
+            if (f == 19)
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) img.setPixel(x, y, grey(0.95 + 0.02 * double(rng() % 100) / 100));
+            if (f == 24)
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) img.setPixel(x, y, grey(0.45 + 0.6 * scene(f, x, y)));
+            damaged.push_back(img);
+        }
+        const std::string cleanFile = path("repair-clean.mp4"), damagedFile = path("repair-damaged.mp4");
+        writeFrames(cleanFile, clean, 25, 0);
+        writeFrames(damagedFile, damaged, 25, 0);
+
+        // Each broken frame is found, as its kind, and nothing else: not the cuts, the camera flash or the black between shots.
+        std::string err;
+        const std::vector<DamagedFrame> found = findDamagedFrames(damagedFile, 0, -1, {}, nullptr, &err);
+        QVERIFY2(err.empty(), err.c_str());
+        std::map<int64_t, FrameDamage> got;
+        for (const DamagedFrame& d : found) got[d.frame] = d.kind;
+        const std::map<int64_t, FrameDamage> want = {{5, FrameDamage::Hit}, {10, FrameDamage::Dropout}, {15, FrameDamage::Black}, {19, FrameDamage::Flash}};
+        QVERIFY2(got == want, damagedFramesToString(got).c_str());
+        QVERIFY(findDamagedFrames(cleanFile, 0, -1, {}, nullptr, &err).empty());
+
+        // Repaired through the clip's Frame Repair effect: each frame close to what the camera saw, marked on the
+        // timeline, and the frames that were not broken left exactly as they were.
+        auto open = [&](Project& p, const std::string& file) -> Clip& {
+            Sequence& s = *p.active();
+            s.width = W, s.height = H, s.fps = {25, 1};
+            MediaItem m = probeOrFail(p, file);
+            p.media.push_back(m);
+            edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            return s.videoTracks[0].clips.at(0);
+        };
+        Project pc = makeDefaultProject(), pd = makeDefaultProject();
+        open(pc, cleanFile);
+        Clip& clip = open(pd, damagedFile);
+        Sequence& sd = *pd.active();
+        std::vector<Image> before;
+        for (int f = 0; f < N; ++f) before.push_back(renderSequenceFrame(pd, sd, f, {}));
+        std::vector<DamagedFrame> listed;
+        QCOMPARE(repairClip(pd, sd, clip, &listed), 4);
+        QCOMPARE(listed.size(), size_t(4));
+        QCOMPARE(clip.effects.at(0).type, std::string("frame_repair"));
+        QCOMPARE(int(std::count_if(sd.markers.begin(), sd.markers.end(), [](const Marker& m) { return m.name.rfind("Damaged: ", 0) == 0; })), 4);
+        QVERIFY(std::any_of(sd.markers.begin(), sd.markers.end(), [](const Marker& m) { return m.t == 10 && m.name == "Damaged: dropout"; }));
+        auto psnr = [&](const Image& a, const Image& b) {
+            double se = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    for (int k = 0; k < 3; ++k) se += std::pow(double(a.at(x, y)[k] - b.at(x, y)[k]), 2);
+            return 10 * std::log10(1.0 / std::max(1e-12, se / (3.0 * W * H)));
+        };
+        for (int f = 0; f < N; ++f) {
+            const Image truth = renderSequenceFrame(pc, *pc.active(), f, {}), now = renderSequenceFrame(pd, sd, f, {});
+            if (want.count(f)) {
+                qInfo("frame %d: %.1f dB repaired, %.1f dB broken", f, psnr(now, truth), psnr(before[size_t(f)], truth));
+                QVERIFY2(psnr(now, truth) > 30 && psnr(now, truth) > psnr(before[size_t(f)], truth) + 10,
+                         qPrintable(QString("frame %1: %2 dB repaired, %3 dB broken").arg(f).arg(psnr(now, truth)).arg(psnr(before[size_t(f)], truth))));
+            } else {
+                QVERIFY2(psnr(now, before[size_t(f)]) > 99, qPrintable(QString("frame %1 changed").arg(f)));
+            }
+        }
+        // Scanning again lists nothing new; Show Repaired tints what was replaced.
+        QCOMPARE(repairClip(pd, sd, clip), 0);
+        clip.effects.at(0).params["show"] = 1.0;
+        const Image shown = renderSequenceFrame(pd, sd, 15, {});
+        QVERIFY(shown.at(W / 2, H / 2)[0] > shown.at(W / 2, H / 2)[2] + 0.2f);
+        // At half speed with the in-betweens following the motion, the one between frames 15 (black) and 16 is made from
+        // the repaired frame.
+        clip.effects.at(0).params["show"] = 0.0;
+        for (Project* p : {&pc, &pd}) {
+            Sequence& s = *p->active();
+            QVERIFY(edit::setSpeed(*p, s, s.videoTracks[0].clips.at(0).id, 0.5, true, false).ok);
+            Clip& slow = s.videoTracks[0].clips.at(0);
+            if (slow.timing.empty()) slow.timing = makeEffect(*p, "time");
+            slow.timing.params["sampling"] = 2.0;
+        }
+        {
+            const Image truth = renderSequenceFrame(pc, *pc.active(), 31, {}), now = renderSequenceFrame(pd, sd, 31, {});
+            QVERIFY2(psnr(now, truth) > 30, qPrintable(QString("%1 dB").arg(psnr(now, truth))));
+        }
+
+        // The same through MCP: listed only, then repaired.
+        {
+            Project p = makeDefaultProject();
+            const Id id = open(p, damagedFile).id;
+            const QString project = QString::fromStdString(path("repair.montage"));
+            QVERIFY(saveProject(p, project.toStdString()));
+            McpServer server;
+            auto call = [&](bool repair) {
+                const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                      {"params", QJsonObject{{"name", "montage_find_damaged_frames"},
+                                                             {"arguments", QJsonObject{{"project", project}, {"clip", double(id)}, {"repair", repair}}},
+                                                             {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                                   {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+                const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+                return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            };
+            QJsonObject r = call(false);
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            QJsonArray list = r.value("structuredContent").toObject().value("frames").toArray();
+            QCOMPARE(list.size(), qsizetype(4));
+            QCOMPARE(list.at(1).toObject().value("kind").toString(), QStringLiteral("dropout"));
+            QVERIFY(std::fabs(list.at(1).toObject().value("timeline_seconds").toDouble() - 0.4) < 1e-6);
+            Project after;
+            QVERIFY(loadProject(project.toStdString(), after));
+            QVERIFY(after.active()->videoTracks[0].clips[0].effects.empty());
+            r = call(true);
+            QCOMPARE(r.value("structuredContent").toObject().value("listed").toInt(), 4);
+            QVERIFY(loadProject(project.toStdString(), after));
+            QCOMPARE(after.active()->videoTracks[0].clips[0].effects.at(0).s("frames"), std::string("5 hit\n10 dropout\n15 black\n19 flash\n"));
+        }
+
+        // A cut between two shots lit alike (the second the first upside down): nothing found either side of it.
+        {
+            std::vector<QImage> alike;
+            for (int f = 0; f < 20; ++f) alike.push_back(f < 10 ? clean[size_t(f)] : clean[size_t(f)].mirrored(false, true));
+            const std::string file = path("repair-alike.mp4");
+            writeFrames(file, alike, 25, 0);
+            const std::vector<DamagedFrame> none = findDamagedFrames(file, 0, -1, {}, nullptr, &err);
+            QVERIFY2(none.empty(), qPrintable(QString("frame %1").arg(none.empty() ? -1 : none[0].frame)));
+        }
+
+        // A frame missing from the file's times (shown as the one before again) and a packet the transfer broke, which
+        // the decoder reports, in a file of keyframes.
+        const std::string intra = path("repair-intra.mp4"), broken = path("repair-broken.mp4");
+        writeFrames(intra, clean, 25, 0, 1);
+        remuxDamaged(intra, broken, 12, 20);
+        std::map<int64_t, FrameDamage> gaps;
+        for (const DamagedFrame& d : findDamagedFrames(broken, 0, -1, {}, nullptr, &err)) gaps[d.frame] = d.kind;
+        QVERIFY2(err.empty(), err.c_str());
+        const std::map<int64_t, FrameDamage> wantGaps = {{12, FrameDamage::Missing}, {21, FrameDamage::Decode}};
+        QVERIFY2(gaps == wantGaps, damagedFramesToString(gaps).c_str());
     }
 };
 

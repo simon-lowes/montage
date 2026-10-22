@@ -852,6 +852,10 @@ std::vector<EffectInfo> buildCatalog() {
             for (auto& pi : c[i].params)
                 if (pi.name != "sensitivity")
                     pi.keyframeable = c[i].type == "patch_fill" && (pi.name == "source_x" || pi.name == "source_y");
+        // Frame Repair (render/FrameRepair.h): the source frames listed as damaged ("frames" as text, from Clip › Repair
+        // Damaged Frames… or MCP) rebuilt where the source frame is read, before anything else runs on it.
+        c.push_back({"frame_repair", "Frame Repair", EffectCategory::VideoFilter, "Repair", {boolean("show", "Show Repaired")}, {}});
+        c.back().params.back().keyframeable = false;
         // Film scans (render/FilmScan.h), run where the source frame is read: Steady on Perforations first (holding the
         // holes where they were on the frame its reference was taken from, "reference" as text), then Film Negative (its
         // base found in each frame's rebate unless set), then Faded Colour Restore (from the frames either side).

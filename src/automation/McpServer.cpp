@@ -123,6 +123,7 @@
 #include "render/LutExport.h"
 #include "render/ProjectManager.h"
 #include "render/QualityCheck.h"
+#include "render/FrameRepair.h"
 #include "render/ConformCheck.h"
 #include "media/Decoder.h"
 #include "media/Faces.h"
@@ -7160,6 +7161,41 @@ void McpServer::Impl::addTools() {
             if (keyed) save(l);
             return ok(QStringLiteral("Turned down %1 breath(s) by %2 dB").arg(keyed).arg(amount),
                       QJsonObject{{"breaths", found}, {"keyed", keyed}, {"clips_left", left}});
+        });
+
+    add("montage_find_damaged_frames", "Find and repair damaged frames",
+        "Finds the frames a recording or transfer broke in a video clip's file (over the stretch the clip plays): ones the "
+        "decoder reports damaged, blocky digital hits, tape drop-out lines, a lone black or flash frame, and frames missing "
+        "from the file's timestamps (shown as a repeat). Each is compared with the picture its neighbours make between them, "
+        "so motion, cuts and a real camera flash are left alone. With repair (the default) the frames are listed on the "
+        "clip's Frame Repair effect (added when it has none), which rebuilds each from the good frames either side (only "
+        "the broken lines or patches for a drop-out or hit), and a red \"Damaged:\" marker goes where the clip shows each.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number","description":"Video clip id"},
+            "repair":{"type":"boolean","default":true}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            Clip& c = clipArg(l, a);
+            if (edit::locate(s, c.id)->track.kind != TrackKind::Video) throw ArgError{"\"clip\" must be a video clip"};
+            std::vector<DamagedFrame> found;
+            std::string err;
+            if (!damagedFramesInClip(l.project, s, c, found, {}, nullptr, &err)) return fail(QString::fromStdString(err));
+            int added = 0;
+            if (a.value("repair").toBool(true)) {
+                added = listDamagedFrames(l.project, s, c, found);
+                save(l);
+            }
+            const MediaItem* m = l.project.findMedia(c.mediaId);
+            const double mf = m->fps.toDouble();
+            QJsonArray list;
+            for (const DamagedFrame& d : found) {
+                const auto [from, to] = timelineSpan(c, s, double(d.frame) / mf, double(d.frame + 1) / mf);
+                QJsonObject o{{"frame", double(d.frame)}, {"kind", QString::fromStdString(frameDamageName(d.kind))}, {"extent", d.extent}};
+                if (from >= 0) o.insert("timeline_seconds", from);
+                list.append(o);
+            }
+            return ok(QStringLiteral("%1 damaged frame(s) found, %2 newly listed for repair").arg(found.size()).arg(added),
+                      QJsonObject{{"frames", list}, {"listed", added}});
         });
 
     add("montage_remove_bleed", "Remove mic bleed from multitrack talk",

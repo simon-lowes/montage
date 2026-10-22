@@ -177,6 +177,9 @@ public:
     // Clip › Breath Control: the breaths in the selected audio clips turned down by `amountDb` with volume keys (one
     // undo step). How many breaths.
     int breathControl(double amountDb);
+    // Clip › Repair Damaged Frames: the selected video clips' broken frames (else the clip under the playhead's) found
+    // and listed on their Frame Repair effect, which rebuilds them, each marked on the timeline (one undo step). How many.
+    int repairDamagedFrames();
     // Clip › Import Embedded Captions: the CEA-608 captions inside the selected video clip's file (else the clip under
     // the playhead on the target video track) as a new caption track where the clip plays them. How many captions.
     int importEmbeddedCaptions();

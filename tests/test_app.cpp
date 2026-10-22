@@ -7096,6 +7096,43 @@ private slots:
         state()->newProject();
     }
 
+    void repairDamagedFramesFromTheMenu() {
+        // A grey shot with one white frame (frame 10) in it.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 160;
+        gs.height = 90;
+        for (const auto& [start, length, v] : std::vector<std::tuple<FrameTime, FrameTime, double>>{{0, 10, 0.4}, {10, 1, 1.0}, {11, 14, 0.4}}) {
+            Clip c = makeGeneratorClip(gen, "color", length);
+            c.start = start;
+            for (const char* k : {"color.r", "color.g", "color.b"}) c.generator.params[k] = v;
+            edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+        }
+        ExportSettings st;
+        st.path = (dir_.path() + "/flashed.mp4").toStdString();
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("repairDamagedFrames"));
+        QCOMPARE(win_->repairDamagedFrames(), 0);  // nothing selected or under the playhead
+        const auto ids = state()->importFiles({dir_.path() + "/flashed.mp4"});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        state()->setSelection({state()->sequence()->videoTracks.at(0).clips.at(0).id});
+        QCOMPARE(win_->repairDamagedFrames(), 1);
+        const Sequence* s = state()->sequence();
+        QCOMPARE(s->videoTracks[0].clips.at(0).effects.at(0).s("frames"), std::string("10 flash\n"));
+        QCOMPARE(int(s->markers.size()), 1);
+        QCOMPARE(s->markers[0].t, FrameTime(10));
+        state()->undo();
+        QVERIFY(state()->sequence()->videoTracks[0].clips.at(0).effects.empty() && state()->sequence()->markers.empty());
+        state()->newProject();
+    }
+
     void breathControlFromTheMenu() {
         // Three voiced lines with a quiet, breathy noise between them (sines at random pitches from 500 to 2000 Hz).
         const int rate = 48000;

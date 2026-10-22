@@ -82,6 +82,7 @@ struct Frame16 {
     int height = 0;
     double pts = 0;  // seconds
     bool half = false;         // px holds IEEE half floats rather than 0..65535
+    bool damaged = false;      // the decoder reported errors in it (render/FrameRepair.h)
     PixelVector<uint16_t> px;  // written in full by the decoder
     size_t bytes() const { return px.size() * sizeof(uint16_t); }
     // Sample i as 0..1 (a half float's value clamped there): for analysis that works on the visible range.

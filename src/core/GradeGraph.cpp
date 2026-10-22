@@ -13,7 +13,7 @@ bool runsBeforeGrade(const std::string& type) {
     static const std::set<std::string> types = {"video_denoise", "super_scale", "motion_deblur", "reframe_360", "redact_faces",
                                                 "stereo_3d",     "motion_blur", "deflicker",     "stabilize",   "rolling_shutter",
                                                 "lens_correction", "camera_track", "dirt_removal", "dust_spots", "lip_sync", "fade_restore",
-                                                "film_negative", "perf_lock"};
+                                                "film_negative", "perf_lock", "frame_repair"};
     return types.count(type) > 0;
 }
 

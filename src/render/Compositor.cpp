@@ -37,6 +37,7 @@
 #include "Processing.h"
 #include "Restoration.h"
 #include "FilmScan.h"
+#include "FrameRepair.h"
 #include "Retime.h"
 #include "Shapes.h"
 #include "Title3D.h"
@@ -941,7 +942,7 @@ struct ClipSource {
 bool ranOnSourceFirst(const std::string& type) {
     static const std::set<std::string> types = {"video_denoise", "super_scale", "motion_deblur", "reframe_360", "redact_faces",
                                                 "stereo_3d",     "dirt_removal", "dust_spots",   "lip_sync",    "motion_blur",
-                                                "deflicker",     "fade_restore", "film_negative", "perf_lock"};
+                                                "deflicker",     "fade_restore", "film_negative", "perf_lock",  "frame_repair"};
     return types.count(type) > 0;
 }
 
@@ -1121,6 +1122,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 if (!ofxFetch && !(sampling > 0 && m->kind == MediaKind::Video) && !denoiseEffect(seq, c) &&
                     !enabledEffect(seq, c, "motion_deblur") && !enabledEffect(seq, c, "motion_blur") && !enabledEffect(seq, c, "deflicker") &&
                     !enabledEffect(seq, c, "fade_restore") && !enabledEffect(seq, c, "film_negative") && !enabledEffect(seq, c, "perf_lock") &&
+                    !enabledEffect(seq, c, "frame_repair") &&
                     !enabledEffect(seq, c, "dirt_removal") && !enabledEffect(seq, c, "dust_spots") && !enabledEffect(seq, c, "lip_sync") &&
                     !upscale && !vr && !sourceStageLooks(c, lt, from, *m) && !f->half) {  // (half floats: the CPU keeps them)
                     out.frame = f;
@@ -1131,6 +1133,22 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             src = toImage(*f);
             Image decoded;  // the source frame itself, when src is an in-between (and noise reduction needs it)
             bool between = false;  // src is an in-between
+            // Frame Repair (render/FrameRepair.h) before anything: a broken source frame rebuilt from the good ones either side
+            // (the frame itself, or both an in-between of slow motion is made from).
+            const Effect* fr = m->kind == MediaKind::Video && m->fps.valid() ? enabledEffect(seq, c, "frame_repair") : nullptr;
+            const std::map<int64_t, FrameDamage> damaged = fr ? damagedFramesFromString(fr->s("frames")) : std::map<int64_t, FrameDamage>();
+            auto repair = [&](int64_t n, Image& img) {
+                if (!damaged.count(n)) return false;
+                const double mf = m->fps.toDouble();
+                auto fetch = [&](int64_t i, Image& into) {
+                    const double at = (double(i) + 0.25) / mf;
+                    if (at < 0 || at >= m->duration) return false;
+                    Frame16Ptr nf = MediaPool::instance().videoFrame(path, at, w, h, o.highQuality);
+                    if (nf) into = toImage(*nf);
+                    return bool(nf);
+                };
+                return repairFrame(damaged, n, img, fetch, path + '@' + std::to_string(w) + 'x' + std::to_string(h), fr->p("show", lt, 0) > 0.5);
+            };
             // Slow motion between two source frames: blend them or follow the motion.
             const int sampling = c.timing.empty() ? 0 : int(c.timing.p("sampling", lt, 0));
             if (sampling > 0 && m->kind == MediaKind::Video && m->fps.valid()) {
@@ -1142,8 +1160,10 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     if (fa && fb) {
                         between = true;
                         if (denoiseEffect(seq, c)) decoded = src;
-                        const Image a = toImage(*fa), b = toImage(*fb);
-                        const std::string pair = path + '#' + std::to_string(int64_t(base)) + '@' + std::to_string(w) + 'x' + std::to_string(h);
+                        Image a = toImage(*fa), b = toImage(*fb);
+                        const bool repairedA = repair(int64_t(base), a), repairedB = repair(int64_t(base) + 1, b);
+                        const std::string pair = path + '#' + std::to_string(int64_t(base)) + '@' + std::to_string(w) + 'x' + std::to_string(h) +
+                                                 (repairedA || repairedB ? "+repaired" : "");
                         // AI frames when RIFE is here, else optical flow.
                         Image ai;
                         if (sampling == 1) src = blendFrames(a, b, frac);
@@ -1152,6 +1172,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     }
                 }
             }
+            if (fr && !between) repair(int64_t(std::floor(sec * m->fps.toDouble() + 1e-6)), src);
             // Steady on Perforations (render/FilmScan.h) first, so the frame is held still before anything else sees it.
             if (const Effect* pl = enabledEffect(seq, c, "perf_lock")) applyPerfLock(*pl, lt, src);
             // Dirt Removal and Dust Spot Removal (render/Restoration.h), each one on the clip in its order, from the source
