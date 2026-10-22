@@ -211,6 +211,7 @@
 #include "render/ProjectManager.h"
 #include "render/LutExport.h"
 #include "render/FrameRepair.h"
+#include "render/Intelligibility.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -2486,6 +2487,184 @@ private slots:
         QVERIFY(!has(QcKind::Silence));
         q.clipping = false, q.loudnessTarget = 0;
         QVERIFY2(qualityCheck(p, s, 0, speechEnd, q).empty(), qPrintable(describe(qualityCheck(p, s, 0, speechEnd, q))));
+    }
+
+    void dialogueIntelligibility() {
+        // The index itself: the standard's speech spectrum alone is understood, under masking as loud as itself about
+        // half, under masking 15 dB louder hardly at all.
+        std::array<double, kSiiBands> speechDb{}, quiet{}, equal{}, loud{};
+        const std::array<double, kSiiBands> standard = {32.41, 34.48, 34.75, 33.98, 34.59, 34.27, 32.06, 28.30, 25.01,
+                                                        23.00, 20.15, 17.32, 13.18, 11.55, 9.33,  5.31,  2.59,  1.13};
+        for (int i = 0; i < kSiiBands; ++i) {
+            speechDb[size_t(i)] = standard[size_t(i)] + 10 * std::log10(0.2316 * siiBandCentres()[size_t(i)]);
+            quiet[size_t(i)] = -100, equal[size_t(i)] = speechDb[size_t(i)], loud[size_t(i)] = speechDb[size_t(i)] + 15;
+        }
+        double importance = 0;
+        for (double v : siiBandImportance()) importance += v;
+        QVERIFY(std::fabs(importance - 1) < 1e-3);
+        QVERIFY2(speechIntelligibilityIndex(speechDb, quiet) > 0.95, qPrintable(QString::number(speechIntelligibilityIndex(speechDb, quiet))));
+        const double half = speechIntelligibilityIndex(speechDb, equal);
+        QVERIFY2(half > 0.35 && half < 0.6, qPrintable(QString::number(half)));
+        QVERIFY2(speechIntelligibilityIndex(speechDb, loud) < 0.05, qPrintable(QString::number(speechIntelligibilityIndex(speechDb, loud))));
+
+        // JFK (Dialogue) over pink noise (Effects) at -10, 0, +10 and +20 dB: the figure rises with the ratio, red at
+        // -10 and green at +20.
+        const int rate = 48000;
+        std::string err;
+        AudioBufferPtr jfk = decodeAudio(MONTAGE_TEST_DATA_DIR "/jfk.wav", rate, &err);
+        QVERIFY2(jfk, err.c_str());
+        double ss = 0;
+        for (float v : jfk->samples) ss += double(v) * v;
+        const double speechRms = std::sqrt(ss / double(jfk->samples.size()));
+        auto writeFloatWav = [&](const std::string& file, const std::vector<float>& stereo) {
+            QFile f(QString::fromStdString(file));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            auto u32 = [&](uint32_t v) { f.write(reinterpret_cast<const char*>(&v), 4); };
+            auto u16 = [&](uint16_t v) { f.write(reinterpret_cast<const char*>(&v), 2); };
+            const uint32_t bytes = uint32_t(stereo.size() * 4);
+            f.write("RIFF", 4), u32(36 + bytes), f.write("WAVEfmt ", 8), u32(16), u16(3), u16(2), u32(rate), u32(rate * 8), u16(8), u16(32);
+            f.write("data", 4), u32(bytes), f.write(reinterpret_cast<const char*>(stereo.data()), qint64(bytes));
+        };
+        // Pink noise (Paul Kellet's filter) and music with nothing over 500 Hz, each `seconds` long at an RMS of `rms`.
+        auto pink = [&](double seconds, double rms, uint32_t seed) {
+            std::mt19937 rng(seed);
+            std::normal_distribution<double> white(0, 1);
+            std::vector<float> out(size_t(seconds * rate) * 2);
+            for (int ch = 0; ch < 2; ++ch) {
+                double b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
+                for (size_t i = 0; i < out.size() / 2; ++i) {
+                    const double w = white(rng);
+                    b0 = 0.99886 * b0 + w * 0.0555179, b1 = 0.99332 * b1 + w * 0.0750759, b2 = 0.96900 * b2 + w * 0.1538520;
+                    b3 = 0.86650 * b3 + w * 0.3104856, b4 = 0.55000 * b4 + w * 0.5329522, b5 = -0.7616 * b5 - w * 0.0168980;
+                    out[2 * i + size_t(ch)] = float(b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362);
+                    b6 = w * 0.115926;
+                }
+            }
+            double e = 0;
+            for (float v : out) e += double(v) * v;
+            const double k = rms / std::sqrt(e / double(out.size()));
+            for (float& v : out) v = float(v * k);
+            return out;
+        };
+        auto lowMusic = [&](double seconds, double rms) {
+            std::vector<float> out(size_t(seconds * rate) * 2);
+            const double notes[] = {82.4, 110, 146.8, 196, 261.6, 329.6};
+            for (size_t i = 0; i < out.size() / 2; ++i) {
+                const double t = double(i) / rate;
+                double v = 0;
+                for (int k = 0; k < 6; ++k) v += std::sin(2 * M_PI * notes[k] * t + k) * (0.6 + 0.4 * std::sin(2 * M_PI * 0.5 * t + k));
+                out[2 * i] = out[2 * i + 1] = float(v);
+            }
+            double e = 0;
+            for (float v : out) e += double(v) * v;
+            const double k = rms / std::sqrt(e / double(out.size()));
+            for (float& v : out) v = float(v * k);
+            return out;
+        };
+        const double speechSeconds = double(jfk->frames()) / rate;
+        std::string setup;  // (what went wrong making a sequence)
+        auto measure = [&](const std::string& under, double seconds, std::vector<double> starts = {0}) -> std::pair<Intelligibility, Project> {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            MediaItem speech = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/jfk.wav"), bed = probeOrFail(p, under);
+            p.media.push_back(speech);
+            p.media.push_back(bed);
+            const double fps = s.fpsValue();
+            for (double at : starts)
+                if (!edit::placeMedia(p, s, speech.id, FrameTime(std::llround(at * fps)), 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok)
+                    setup += "speech not placed; ";
+            if (!edit::placeMedia(p, s, bed.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok) setup += "bed not placed; ";
+            if (s.audioTracks.size() < 2 || s.audioTracks[0].clips.empty() || s.audioTracks[1].clips.empty()) return {};
+            for (Clip& c : s.audioTracks[0].clips) c.role = "Dialogue";
+            s.audioTracks[1].clips.front().role = "Effects";
+            IntelligibilityOptions o;
+            o.out = FrameTime(std::llround(seconds * fps));
+            const Intelligibility r = measureIntelligibility(p, s, o, {}, nullptr, &err);
+            if (!r.valid || r.source != DialogueSource::Roles) setup += "not measured: " + err;
+            return {r, p};
+        };
+        double previous = -1;
+        for (int snr : {-10, 0, 10, 20}) {
+            const std::string file = path(("pink" + std::to_string(snr + 20) + ".wav").c_str());
+            writeFloatWav(file, pink(speechSeconds, speechRms * std::pow(10.0, -snr / 20.0), 3));
+            const auto [r, p] = measure(file, speechSeconds);
+            QVERIFY2(setup.empty(), setup.c_str());
+            qInfo("%+d dB: intelligibility %.2f", snr, r.average);
+            QVERIFY2(r.average > previous + 0.05, qPrintable(QString("%1 dB: %2 after %3").arg(snr).arg(r.average).arg(previous)));
+            previous = r.average;
+            if (snr == -10) QVERIFY(r.average < IntelligibilityLimits{}.poor);
+            if (snr == 20) QVERIFY(r.average >= IntelligibilityLimits{}.fair);
+        }
+        // Music with nothing over 500 Hz leaves more of the speech to be heard than broadband noise as loud.
+        {
+            const std::string noise = path("pink-level.wav"), music = path("low-music.wav");
+            writeFloatWav(noise, pink(speechSeconds, speechRms, 4));
+            writeFloatWav(music, lowMusic(speechSeconds, speechRms));
+            const double withNoise = measure(noise, speechSeconds).first.average, withMusic = measure(music, speechSeconds).first.average;
+            QVERIFY2(setup.empty(), setup.c_str());
+            QVERIFY2(withMusic > withNoise + 0.15, qPrintable(QString("music %1, noise %2").arg(withMusic).arg(withNoise)));
+        }
+
+        // A 33 s mix (the speech three times) over noise 15 dB down, which swells to 10 dB over the speech from 12 to 15 s:
+        // Quality Check marks that stretch alone, from within half a second of where it starts.
+        {
+            std::vector<float> bed = pink(33, speechRms * std::pow(10.0, -15 / 20.0), 5);
+            for (size_t i = size_t(12 * rate); i < size_t(15 * rate); ++i) bed[2 * i] *= 31.6f, bed[2 * i + 1] *= 31.6f;
+            const std::string file = path("swell.wav");
+            writeFloatWav(file, bed);
+            auto [r, p] = measure(file, 33, {0, 11, 22});
+            QVERIFY2(setup.empty(), setup.c_str());
+            const auto hard = r.under(IntelligibilityLimits{}.poor, 1.0);
+            QVERIFY2(hard.size() == 1 && std::fabs(hard[0].first - 12) < 0.5 && hard[0].second < 15.6,
+                     qPrintable(QString("%1 stretches, first %2..%3").arg(hard.size()).arg(hard.empty() ? -1 : hard[0].first).arg(hard.empty() ? -1 : hard[0].second)));
+            // Under the swell the speech is lost; before it, it is clear.
+            double swell = 1, before = 0;
+            int heard = 0;
+            for (double t = 12.25; t < 15; t += 0.4) swell = r.at(t) >= 0 ? std::min(swell, r.at(t)) : swell;
+            for (double t = 1; t < 10; t += 0.4)
+                if (r.at(t) >= 0) before += r.at(t), ++heard;
+            QVERIFY2(swell < 0.2 && heard > 5 && before / heard > 0.6, qPrintable(QString("%1 %2").arg(swell).arg(before / std::max(1, heard))));
+            QcSettings q;
+            q.flashing = q.levels = q.clipping = q.spelling = q.sync = false;
+            q.blackSeconds = q.freezeSeconds = q.silenceSeconds = 0;
+            q.intelligibility = IntelligibilityLimits{}.poor;
+            q.intelligibilitySeconds = 1;
+            const std::vector<QcIssue> issues = qualityCheck(p, *p.active(), 0, -1, q);
+            QCOMPARE(issues.size(), size_t(1));
+            QCOMPARE(issues[0].kind, QcKind::Intelligibility);
+            QVERIFY(std::fabs(double(issues[0].start) / p.active()->fpsValue() - 12) < 0.5);
+            // Over MCP: the one stretch, the bands most masked in it, and a QC marker.
+            {
+                const QString project = QString::fromStdString(path("intelligibility.montage"));
+                QVERIFY(saveProject(p, project.toStdString()));
+                McpServer server;
+                const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                      {"params", QJsonObject{{"name", "montage_intelligibility"},
+                                                             {"arguments", QJsonObject{{"project", project}, {"min_seconds", 1}, {"markers", true}}},
+                                                             {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                                   {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+                const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+                const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+                QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+                const QJsonObject sc = res.value("structuredContent").toObject();
+                QVERIFY(std::fabs(sc.value("average").toDouble() - r.average) < 1e-6);
+                QCOMPARE(sc.value("source").toString(), QStringLiteral("roles"));
+                const QJsonArray list = sc.value("hard").toArray();
+                QCOMPARE(list.size(), qsizetype(1));
+                QCOMPARE(list.at(0).toObject().value("worst_bands").toArray().size(), qsizetype(3));
+                Project after;
+                QVERIFY(loadProject(project.toStdString(), after));
+                QCOMPARE(int(std::count_if(after.active()->markers.begin(), after.active()->markers.end(),
+                                           [](const Marker& m) { return m.name == "QC: Dialogue intelligibility"; })),
+                         1);
+            }
+            // Without a Dialogue clip and without the separation model, it says what to do.
+            for (Clip& c : p.active()->audioTracks[0].clips) c.role.clear();
+            IntelligibilityOptions roles;
+            roles.source = DialogueSource::Roles;
+            QVERIFY(!measureIntelligibility(p, *p.active(), roles, {}, nullptr, &err).valid);
+            QVERIFY(QString::fromStdString(err).contains("Dialogue role"));
+        }
     }
 
     void dialogueGatedLoudness() {

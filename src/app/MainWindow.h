@@ -30,6 +30,7 @@
 #include "render/RoomTone.h"
 #include "render/Versions.h"
 #include "render/RemoteReview.h"
+#include "render/Intelligibility.h"
 
 class QAction;
 class QActionGroup;
@@ -180,6 +181,10 @@ public:
     // Clip › Repair Damaged Frames: the selected video clips' broken frames (else the clip under the playhead's) found
     // and listed on their Frame Repair effect, which rebuilds them, each marked on the timeline (one undo step). How many.
     int repairDamagedFrames();
+    // Sequence › Dialogue Intelligibility: the active sequence's dialogue measured against `preset`'s limits (render/
+    // Intelligibility.h), shown in the timeline's intelligibility lane and, at the playhead, the meters' INT readout.
+    // The average, or -1 when it could not be measured.
+    double analyseIntelligibility(const QString& preset);
     // Clip › Import Embedded Captions: the CEA-608 captions inside the selected video clip's file (else the clip under
     // the playhead on the target video track) as a new caption track where the clip plays them. How many captions.
     int importEmbeddedCaptions();
@@ -585,6 +590,15 @@ private:
     void startBackgroundRender();
     void stopBackgroundRender();  // cancels a running job and waits for the next quiet spell
     int renderBarGeneration_ = 0;
+    // Each sequence's last intelligibility analysis, stale once the project is edited after it.
+    struct IntelligibilityRun {
+        Intelligibility result;
+        IntelligibilityLimits limits;
+        uint64_t revision = 0;    // the edit history's when the sequence was copied to be measured
+        uint64_t generation = 0;  // the project's (EditorState::projectGeneration): another project's runs are dropped
+    };
+    std::map<Id, IntelligibilityRun> intelligibility_;
+    void showIntelligibility();
     std::vector<QDockWidget*> docks_;
     QDockWidget* sourceDock_ = nullptr;
     QDockWidget* programDock_ = nullptr;

@@ -124,6 +124,7 @@
 #include "render/ProjectManager.h"
 #include "render/QualityCheck.h"
 #include "render/FrameRepair.h"
+#include "render/Intelligibility.h"
 #include "render/ConformCheck.h"
 #include "media/Decoder.h"
 #include "media/Faces.h"
@@ -3134,7 +3135,8 @@ void McpServer::Impl::addTools() {
         "(ITU-R BT.1702 / Ofcom / WCAG: more than three flashes a second over a quarter of the screen, or saturated red), "
         "levels outside EBU R103, black or frozen picture, silence, clipping, loudness against a target, and spelling in "
         "captions (each track's language) and titles (`title_language`, default en-US), the project's vocabulary allowed, "
-        "and linked clips out of sync with their picture (`sync`). Lists each problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones).",
+        "linked clips out of sync with their picture (`sync`), and dialogue hard to follow under the music and effects "
+        "(`intelligibility`, as montage_intelligibility measures it). Lists each problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"flashing":{"type":"boolean","default":true},"levels":{"type":"boolean","default":true},
             "black_seconds":{"type":"number","default":1,"description":"0 = not checked"},
@@ -3146,7 +3148,10 @@ void McpServer::Impl::addTools() {
             "loudness_dialogue":{"type":"boolean","default":false,"description":"Check the dialogue's loudness (montage_dialogue_loudness), as Netflix does: -27 with peak_ceiling -2"},
             "loudness_tolerance":{"type":"number","description":"LU either side of the target (default 1, 2 with loudness_dialogue)"},
             "spelling":{"type":"boolean","default":true},"title_language":{"type":"string","default":"en-US"},
-            "sync":{"type":"boolean","default":true},"markers":{"type":"boolean","default":false}},"required":["project"]})json",
+            "sync":{"type":"boolean","default":true},
+            "intelligibility":{"type":"number","description":"Dialogue intelligibility limit, 0..1 (e.g. 0.45); omitted = not checked"},
+            "intelligibility_seconds":{"type":"number","default":2,"description":"How long it must stay under the limit"},
+            "markers":{"type":"boolean","default":false}},"required":["project"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
@@ -3166,6 +3171,8 @@ void McpServer::Impl::addTools() {
             q.spelling = a.value("spelling").toBool(true);
             q.titleLanguage = str(a, "title_language", "en-US").toStdString();
             q.sync = a.value("sync").toBool(true);
+            q.intelligibility = std::clamp(a.value("intelligibility").toDouble(0), 0.0, 1.0);
+            q.intelligibilitySeconds = std::max(0.0, a.value("intelligibility_seconds").toDouble(2));
             const std::vector<QcIssue> issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(f, "Checking"); });
             QString text;
             for (const QcIssue& i : issues)
@@ -3176,6 +3183,74 @@ void McpServer::Impl::addTools() {
                 save(l);
             }
             return ok(issues.empty() ? QStringLiteral("No problems found.") : QStringLiteral("%1 problem(s):\n").arg(issues.size()) + text);
+        });
+
+    add("montage_intelligibility", "Measure dialogue intelligibility",
+        "How well the sequence's (or from..to's) dialogue can be made out over its music and effects: the Speech "
+        "Intelligibility Index (ANSI S3.5, 0 to 1; under about 0.45 hard to follow, over 0.75 easy) every 400 ms where "
+        "someone speaks, from each third-octave band's speech-to-masker ratio at the level it plays (`listening_level`, "
+        "dB SPL of a -20 dBFS sound). The dialogue is the Dialogue clips' sound and the masker the rest (`source` roles), "
+        "or the dialogue separated from the mix by the dialogue, music and effects model (separated); auto takes roles "
+        "when there are Dialogue clips. Returns the average, the stretches under the limit (`preset` Standard 0.45, "
+        "Accessible 0.6 or Lenient 0.35, or `limit`) for at least `min_seconds`, and the bands worst masked there; with "
+        "markers, a red \"QC: Dialogue intelligibility\" marker on each.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
+            "to":{"type":["number","string"]},"source":{"type":"string","enum":["auto","roles","separated"],"default":"auto"},
+            "listening_level":{"type":"number","default":79},"preset":{"type":"string","enum":["Standard","Accessible","Lenient"],"default":"Standard"},
+            "limit":{"type":"number","description":"0..1, in place of the preset's"},"min_seconds":{"type":"number","default":2},
+            "markers":{"type":"boolean","default":false}},"required":["project"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            IntelligibilityOptions o;
+            o.in = a.contains("from") ? timeArg(a.value("from"), s, "from") : 0;
+            o.out = a.contains("to") ? timeArg(a.value("to"), s, "to") : -1;
+            const QString source = str(a, "source", "auto");
+            if (source == "roles") o.source = DialogueSource::Roles;
+            else if (source == "separated") o.source = DialogueSource::Separated;
+            else if (source != "auto") throw ArgError{"\"source\" is auto, roles or separated"};
+            o.listeningLevel = std::clamp(a.value("listening_level").toDouble(79), 40.0, 110.0);
+            IntelligibilityLimits limits;
+            if (!intelligibilityPreset(str(a, "preset", "Standard").toStdString(), limits)) throw ArgError{"\"preset\" is Standard, Accessible or Lenient"};
+            const double limit = a.value("limit").isDouble() ? std::clamp(a.value("limit").toDouble(), 0.0, 1.0) : limits.poor;
+            const double minSeconds = std::max(0.0, a.value("min_seconds").toDouble(2));
+            std::string err;
+            const Intelligibility r = measureIntelligibility(l.project, s, o, [this](double f) { progress(f, "Measuring"); }, nullptr, &err);
+            if (!r.valid) return fail(QString::fromStdString(err));
+            const double fps = s.fpsValue();
+            QJsonArray hard;
+            std::vector<QcIssue> issues;
+            for (const auto& [from, to] : r.under(limit, minSeconds)) {
+                // The bands most masked over the stretch.
+                std::array<double, kSiiBands> ratio{};
+                double sum = 0;
+                int n = 0;
+                for (const IntelligibilityBlock& b : r.blocks)
+                    if (b.speech && b.start >= from - 1e-9 && b.end <= to + 1e-9) {
+                        sum += b.index, ++n;
+                        for (int k = 0; k < kSiiBands; ++k) ratio[size_t(k)] += b.ratioDb[size_t(k)];
+                    }
+                std::vector<int> order(kSiiBands);
+                std::iota(order.begin(), order.end(), 0);
+                // (the most understanding lost: importance times how far under audible the speech is)
+                auto lost = [&](int k) { return siiBandImportance()[size_t(k)] * (1 - std::clamp((ratio[size_t(k)] / std::max(1, n) + 15) / 30, 0.0, 1.0)); };
+                std::sort(order.begin(), order.end(), [&](int x, int y) { return lost(x) > lost(y); });
+                QJsonArray bands;
+                for (int k = 0; k < 3 && n; ++k)
+                    bands.append(QJsonObject{{"hz", siiBandCentres()[size_t(order[size_t(k)])]}, {"ratio_db", ratio[size_t(order[size_t(k)])] / n}});
+                hard.append(QJsonObject{{"start_seconds", from}, {"end_seconds", to}, {"index", n ? sum / n : 0.0}, {"worst_bands", bands}});
+                const FrameTime fa = FrameTime(std::floor(from * fps + 1e-6));
+                issues.push_back({QcKind::Intelligibility, fa, std::max(fa + 1, FrameTime(std::ceil(to * fps - 1e-6))),
+                                  QStringLiteral("Dialogue hard to follow: intelligibility %1; the limit is %2").arg(n ? sum / n : 0.0, 0, 'f', 2).arg(limit, 0, 'f', 2).toStdString()});
+            }
+            if (a.value("markers").toBool() && !issues.empty()) {
+                addQcMarkers(s, issues);
+                save(l);
+            }
+            return ok(QStringLiteral("Dialogue intelligibility %1 on average (%2); %3 stretch(es) under %4")
+                          .arg(r.average, 0, 'f', 2).arg(r.source == DialogueSource::Roles ? "Dialogue clips" : "separated from the mix")
+                          .arg(hard.size()).arg(limit, 0, 'f', 2),
+                      QJsonObject{{"average", r.average}, {"source", r.source == DialogueSource::Roles ? "roles" : "separated"}, {"hard", hard}});
         });
 
     add("montage_dialogue_loudness", "Measure dialogue loudness",

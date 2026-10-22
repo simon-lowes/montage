@@ -46,6 +46,9 @@ private:
     QCheckBox* clipping_;
     QCheckBox* spelling_ = nullptr;
     QCheckBox* sync_ = nullptr;
+    QCheckBox* intelligibility_ = nullptr;
+    QDoubleSpinBox* intelligibilitySeconds_ = nullptr;
+    QComboBox* intelligibilityPreset_ = nullptr;
     QComboBox* loudness_;
     QTableWidget* table_;
     QLabel* summary_;

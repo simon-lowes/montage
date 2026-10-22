@@ -7096,6 +7096,56 @@ private slots:
         state()->newProject();
     }
 
+    void dialogueIntelligibilityFromTheMenu() {
+        // JFK (Dialogue) for 11 s over a steady hiss (Effects) 20 dB down, which swells to 10 dB over him from 4 to 7 s.
+        const int rate = 48000;
+        std::vector<float> bed(size_t(rate) * 11 * 2);
+        std::mt19937 rng(9);
+        std::normal_distribution<float> white(0, 0.01f);
+        for (size_t i = 0; i < bed.size(); ++i) {
+            const double t = double(i / 2) / rate;
+            bed[i] = white(rng) * (t >= 4 && t < 7 ? 30.0f : 1.0f);
+        }
+        WavWriter w;
+        QVERIFY(w.open(dir_.path() + "/hiss.wav", rate, 2));
+        w.write(bed.data(), int64_t(bed.size() / 2));
+        QVERIFY(w.close());
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("analyseIntelligibility"));
+        QCOMPARE(win_->analyseIntelligibility("Standard"), -1.0);  // nothing to measure
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav"), dir_.path() + "/hiss.wav"});
+        QCOMPARE(ids.size(), size_t(2));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            const bool a = edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+            const bool b = edit::placeMedia(p, s, ids[1], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok;
+            s.audioTracks[0].clips.at(0).role = "Dialogue";
+            s.audioTracks[1].clips.at(0).role = "Effects";
+            return a && b;
+        }));
+        const double average = win_->analyseIntelligibility("Standard");
+        QVERIFY2(average > 0 && average < 1, qPrintable(QString::number(average)));
+        // The lane: red over the swell, green elsewhere.
+        const auto& lane = win_->timeline()->intelligibilityLane();
+        QVERIFY(!lane.empty());
+        const double fps = state()->sequence()->fpsValue();
+        auto statusAt = [&](double seconds) {
+            const FrameTime f = FrameTime(seconds * fps);
+            for (const auto& sp : lane)
+                if (f >= sp.first && f < sp.end) return sp.status;
+            return -1;
+        };
+        QCOMPARE(statusAt(5.5), 2);
+        QVERIFY(std::any_of(lane.begin(), lane.end(), [&](const auto& sp) { return sp.status == 0 && sp.end <= FrameTime(4 * fps); }));
+        // The readout follows the playhead.
+        auto* readout = win_->findChild<LoudnessReadout*>("loudness");
+        QVERIFY(readout);
+        state()->setPlayhead(FrameTime(5.5 * fps));
+        QVERIFY2(readout->text("INT").toDouble() < 0.45 && readout->text("INT") != QStringLiteral("—"), qPrintable(readout->text("INT")));
+        state()->newProject();
+        QVERIFY(win_->timeline()->intelligibilityLane().empty());
+        QCOMPARE(readout->text("INT"), QStringLiteral("—"));
+    }
+
     void repairDamagedFramesFromTheMenu() {
         // A grey shot with one white frame (frame 10) in it.
         Project gen = makeDefaultProject();

@@ -44,6 +44,9 @@ LoudnessReadout::LoudnessReadout(QWidget* parent) : QWidget(parent) {
                                    "Dialogue clips count, pauses too; Quality Check and exports measure only where they sound");
     row(5, tr("D"), dialogueTip, d_);
     row(6, tr("SP"), tr("How much of the sound is speech; under 15 % the integrated loudness counts instead"), sp_);
+    row(7, tr("INT"), tr("Dialogue intelligibility at the playhead (0 to 1; under about 0.45 hard to follow), from the last "
+                         "Sequence › Dialogue Intelligibility… analysis"), int_);
+    int_->setObjectName(QStringLiteral("intelligibility"));
     target_ = new QComboBox(this);
     target_->setObjectName(QStringLiteral("loudnessTarget"));
     target_->addItems({tr("-23 (EBU R128)"), tr("-24 (ATSC A/85)"), tr("-14 (Streaming)"), tr("-16 (Apple, podcasts)"),
@@ -54,9 +57,9 @@ LoudnessReadout::LoudnessReadout(QWidget* parent) : QWidget(parent) {
     reset_->setObjectName(QStringLiteral("loudnessReset"));
     reset_->setText(tr("Reset"));
     reset_->setToolTip(tr("Measure again from now"));
-    grid->addWidget(target_, 7, 0, 1, 2);
-    grid->addWidget(reset_, 8, 0, 1, 2);
-    grid->setRowStretch(9, 1);
+    grid->addWidget(target_, 8, 0, 1, 2);
+    grid->addWidget(reset_, 9, 0, 1, 2);
+    grid->setRowStretch(10, 1);
     connect(target_, &QComboBox::currentIndexChanged, this, [this](int i) {
         appSettings().setValue(QStringLiteral("loudness/target"), i);
         colour();
@@ -75,7 +78,7 @@ void LoudnessReadout::setTargetIndex(int index) { target_->setCurrentIndex(std::
 
 QString LoudnessReadout::text(const char* field) const {
     const QString f = QString::fromLatin1(field);
-    const QLabel* l = f == "M" ? m_ : f == "S" ? s_ : f == "I" ? i_ : f == "LRA" ? lra_ : f == "D" ? d_ : f == "SP" ? sp_ : tp_;
+    const QLabel* l = f == "M" ? m_ : f == "S" ? s_ : f == "I" ? i_ : f == "LRA" ? lra_ : f == "D" ? d_ : f == "SP" ? sp_ : f == "INT" ? int_ : tp_;
     return l->text();
 }
 
@@ -100,6 +103,12 @@ void LoudnessReadout::setDialogue(double integrated, double speechShare) {
     d_->setText(speechShare >= 0 && integrated > -70 ? QString::number(integrated, 'f', 1) : QStringLiteral("—"));
     sp_->setText(speechShare >= 0 ? QStringLiteral("%1 %").arg(std::lround(speechShare * 100)) : QStringLiteral("—"));
     colour();
+}
+
+void LoudnessReadout::setIntelligibility(double index, int status) {
+    static const char* const colours[] = {"#3fb950", "#d29922", "#f85149"};
+    int_->setText(index >= 0 ? QString::number(index, 'f', 2) : QStringLiteral("—"));
+    int_->setStyleSheet(index >= 0 ? QStringLiteral("color: %1;").arg(QLatin1String(colours[std::clamp(status, 0, 2)])) : QString());
 }
 
 // The loudness that counts against the target, green on it, amber near, red off; true peaks over the ceiling red.

@@ -10,6 +10,7 @@
 #include "core/SpellCheck.h"
 #include "media/Loudness.h"
 #include "render/DialogueLoudness.h"
+#include "render/Intelligibility.h"
 
 namespace montage {
 
@@ -61,6 +62,7 @@ const char* qcKindName(QcKind k) {
         case QcKind::TruePeak: return "True peak";
         case QcKind::Spelling: return "Spelling";
         case QcKind::OutOfSync: return "Out of sync";
+        case QcKind::Intelligibility: return "Dialogue intelligibility";
     }
     return "";
 }
@@ -151,7 +153,7 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
     const double fps = s.fpsValue();
     const FrameTime frames = out - in;
     const bool picture = q.flashing || q.levels || q.blackSeconds > 0 || q.freezeSeconds > 0;
-    const bool sound = q.silenceSeconds > 0 || q.clipping || q.loudnessTarget != 0;
+    const bool sound = q.silenceSeconds > 0 || q.clipping || q.loudnessTarget != 0 || q.intelligibility > 0;
     const double pictureShare = picture ? (sound ? 0.8 : 1.0) : 0.0;
 
     if (picture) {
@@ -322,6 +324,26 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
                 issues.push_back({QcKind::Loudness, in, out, (r.valid ? measured : std::string("Too quiet to measure")) + "; " + target});
             if (r.valid && r.truePeakDb > q.peakCeiling + 0.05)
                 issues.push_back({QcKind::TruePeak, in, out, fmt("True peak %.1f dBTP; the ceiling is %.1f dBTP", r.truePeakDb, q.peakCeiling)});
+        }
+        // Dialogue the music and effects make hard to follow (render/Intelligibility.h); nothing when there is no
+        // dialogue to measure.
+        if (q.intelligibility > 0) {
+            IntelligibilityOptions o;
+            o.in = in;
+            o.out = out;
+            o.source = DialogueSource::Roles;  // (not the slow separation: Quality Check measures Dialogue clips only)
+            const Intelligibility r = measureIntelligibility(p, s, o, {}, cancel);
+            if (cancel && cancel->load()) return {};
+            for (const auto& [a, b] : r.under(q.intelligibility, q.intelligibilitySeconds)) {
+                double sum = 0;
+                int n = 0;
+                for (const IntelligibilityBlock& blk : r.blocks)
+                    if (blk.speech && blk.start >= a - 1e-9 && blk.end <= b + 1e-9) sum += blk.index, ++n;
+                const FrameTime fa = std::max(in, FrameTime(std::floor(a * fps + 1e-6))), fb = std::min(out, FrameTime(std::ceil(b * fps - 1e-6)));
+                issues.push_back({QcKind::Intelligibility, fa, std::max(fa + 1, fb),
+                                  fmt("Dialogue hard to follow under the rest of the mix: intelligibility %.2f; the limit is %.2f",
+                                      n ? sum / n : 0.0, q.intelligibility)});
+            }
         }
     }
     if (q.spelling) {

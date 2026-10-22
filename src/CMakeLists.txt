@@ -154,7 +154,7 @@ add_library(montage_engine STATIC
   render/VideoDenoise.h render/VideoDenoise.cpp
   render/Restoration.h render/Restoration.cpp
   render/FilmScan.h render/FilmScan.cpp
-  render/FrameRepair.h render/FrameRepair.cpp
+  render/FrameRepair.h render/FrameRepair.cpp render/Intelligibility.h render/Intelligibility.cpp
   render/LensBlur.h render/LensBlur.cpp
   render/FollowFocus.h render/FollowFocus.cpp
   render/ConformCheck.h render/ConformCheck.cpp

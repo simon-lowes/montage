@@ -1364,6 +1364,12 @@ void TimelineWidget::paintWaveform(QPainter& p, const Clip& c, const QRect& r, c
     }
 }
 
+void TimelineWidget::setIntelligibilityLane(std::vector<IntelligibilitySpan> spans, bool stale) {
+    intelligibility_ = std::move(spans);
+    intelligibilityStale_ = stale;
+    viewport()->update();
+}
+
 void TimelineWidget::setRenderedRanges(std::vector<std::pair<FrameTime, FrameTime>> ranges) {
     rendered_ = std::move(ranges);
     viewport()->update();
@@ -1412,6 +1418,14 @@ void TimelineWidget::paintRuler(QPainter& p) {
         const int xa = xForFrame(a), xb = xForFrame(b);
         if (xb < kHeaderW || xa > W) continue;
         p.fillRect(QRect(xa, kRulerH - 3, std::max(1, xb - xa), 2), QColor(63, 185, 80));
+    }
+    // Intelligibility lane: green, amber and red where the dialogue was measured.
+    for (const IntelligibilitySpan& sp : intelligibility_) {
+        const int xa = xForFrame(sp.first), xb = xForFrame(sp.end);
+        if (xb < kHeaderW || xa > W) continue;
+        QColor c = sp.status == 0 ? QColor(63, 185, 80) : sp.status == 1 ? QColor(210, 153, 34) : QColor(248, 81, 73);
+        if (intelligibilityStale_) c.setAlpha(90);
+        p.fillRect(QRect(xa, kRulerH - 10, std::max(1, xb - xa), 3), c);
     }
     // In/out band.
     if (s->inPoint >= 0 || s->outPoint >= 0) {

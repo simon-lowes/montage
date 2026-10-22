@@ -1,5 +1,6 @@
 #include "QualityCheckDialog.h"
 #include "SpellUi.h"
+#include "render/Intelligibility.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -92,6 +93,24 @@ QualityCheckDialog::QualityCheckDialog(EditorState* state, QWidget* parent) : QD
     loudness_->addItem(tr("Netflix: -27 ±2 LKFS dialogue, -2 dBTP"), QPointF(-27, -2));
     loudness_->setItemData(loudness_->count() - 1, true, Qt::UserRole + 1);  // (measured on the dialogue, within 2 LU)
     form->addRow(tr("Loudness:"), loudness_);
+    {
+        // Dialogue intelligibility (render/Intelligibility.h): under the chosen preset's red line for at least a time.
+        QWidget* w = row(intelligibility_, intelligibilitySeconds_, tr("Dialogue hard to follow for at least"), "qcIntelligibility", 2.0, false);
+        intelligibilityPreset_ = new QComboBox(w);
+        intelligibilityPreset_->setObjectName(QStringLiteral("qcIntelligibilityPreset"));
+        for (const std::string& name : intelligibilityPresetNames()) {
+            IntelligibilityLimits l;
+            intelligibilityPreset(name, l);
+            intelligibilityPreset_->addItem(tr("%1 (under %2)").arg(QString::fromStdString(name)).arg(l.poor, 0, 'f', 2), l.poor);
+        }
+        intelligibilityPreset_->setEnabled(false);
+        intelligibilitySeconds_->setEnabled(false);
+        connect(intelligibility_, &QCheckBox::toggled, intelligibilityPreset_, &QWidget::setEnabled);
+        static_cast<QHBoxLayout*>(w->layout())->insertWidget(2, intelligibilityPreset_);
+        intelligibility_->setToolTip(tr("Where the music and effects make the dialogue hard to follow (the Speech Intelligibility Index). "
+                                        "The dialogue is what the Dialogue clips play"));
+        form->addRow(tr("Dialogue:"), w);
+    }
     spelling_ = new QCheckBox(tr("Spelling in captions and titles"), this);
     spelling_->setObjectName(QStringLiteral("qcSpelling"));
     spelling_->setChecked(true);
@@ -147,6 +166,8 @@ QcSettings QualityCheckDialog::settings() const {
     if (q.dialogueGated) q.loudnessTolerance = 2;
     q.spelling = spelling_->isChecked();
     q.sync = sync_->isChecked();
+    q.intelligibility = intelligibility_->isChecked() ? intelligibilityPreset_->currentData().toDouble() : 0;
+    q.intelligibilitySeconds = intelligibilitySeconds_->value();
     q.titleLanguage = titleSpellingLanguage().toStdString();
     return q;
 }

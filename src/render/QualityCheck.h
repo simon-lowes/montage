@@ -7,7 +7,8 @@
 //  - black and frozen picture, silence and clipped sound held too long;
 //  - integrated loudness (or the dialogue's) away from the target and true peaks over the ceiling;
 //  - spelling in captions (in each track's language) and titles (core/SpellCheck.h), the project's vocabulary allowed;
-//  - linked clips out of sync with their picture (core/EditOps.h syncOffsets).
+//  - linked clips out of sync with their picture (core/EditOps.h syncOffsets);
+//  - dialogue the music and effects make hard to follow (render/Intelligibility.h).
 #pragma once
 
 #include <atomic>
@@ -37,9 +38,13 @@ struct QcSettings {
     bool spelling = true;           // captions and titles
     std::string titleLanguage = "en-US";  // the dictionary titles are checked with
     bool sync = true;               // linked sound or picture out of sync
+    // Dialogue intelligibility (render/Intelligibility.h) of the Dialogue clips: stretches whose index stays under this
+    // for intelligibilitySeconds; 0 = not checked.
+    double intelligibility = 0;
+    double intelligibilitySeconds = 2;
 };
 
-enum class QcKind { Flashing, RedFlashing, Levels, Black, Freeze, Silence, Clipping, Loudness, TruePeak, Spelling, OutOfSync };
+enum class QcKind { Flashing, RedFlashing, Levels, Black, Freeze, Silence, Clipping, Loudness, TruePeak, Spelling, OutOfSync, Intelligibility };
 
 struct QcIssue {
     QcKind kind = QcKind::Flashing;

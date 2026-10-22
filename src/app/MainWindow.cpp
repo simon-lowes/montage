@@ -266,6 +266,12 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(state_, &EditorState::playheadChanged, this, [this](FrameTime t) {
         if (t != program_->position()) program_->seek(t);
     });
+    // The intelligibility lane and readout follow the playhead, the active sequence and its edits.
+    connect(state_, &EditorState::playheadChanged, this, [this] { showIntelligibility(); });
+    connect(state_, &EditorState::sequenceSwitched, this, [this] { showIntelligibility(); });
+    connect(state_, &EditorState::projectChanged, this, [this] {
+        if (const Sequence* s = state_->sequence(); s && intelligibility_.count(s->id)) showIntelligibility();
+    });
     connect(program_, &PlaybackController::positionChanged, this, [this](FrameTime t) {
         state_->setPlayhead(t);
         if (program_->isPlaying()) {
@@ -1941,6 +1947,18 @@ void MainWindow::buildMenus() {
         QualityCheckDialog dlg(state_, this);
         dlg.exec();
     })->setObjectName(QStringLiteral("qualityCheck"));
+    add(seqM, tr("Dialogue &Intelligibility…"), QKeySequence(), [this] {
+            QStringList presets;
+            for (const std::string& n : intelligibilityPresetNames()) presets << QString::fromStdString(n);
+            bool ok = false;
+            const QString preset = QInputDialog::getItem(this, tr("Dialogue Intelligibility"),
+                                                         tr("How well the dialogue can be followed over the music and effects, judged as:"),
+                                                         presets, std::max<qsizetype>(0, presets.indexOf(appSettings().value("intelligibility/preset", "Standard").toString())),
+                                                         false, &ok);
+            if (!ok) return;
+            appSettings().setValue("intelligibility/preset", preset);
+            analyseIntelligibility(preset);
+        })->setObjectName(QStringLiteral("analyseIntelligibility"));
     add(seqM, tr("Analyse HDR &Light Levels…"), QKeySequence(), [this] { analyseHdrLightLevels(); })->setObjectName(QStringLiteral("analyseHdrLightLevels"));
     add(seqM, tr("Next Marker"), QKeySequence("Shift+M"), [this] { jumpMarker(true); });
     add(seqM, tr("Previous Marker"), QKeySequence("Ctrl+Shift+M"), [this] { jumpMarker(false); });
@@ -5514,6 +5532,56 @@ Id MainWindow::makeHighlights(double seconds, const QString& lookFor) {
         state_->message(tr("%n moment(s) in a new Highlights sequence", "", int(moments.size())), 6000);
     }
     return seq;
+}
+
+double MainWindow::analyseIntelligibility(const QString& preset) {
+    const Sequence* s = state_->sequence();
+    if (!s) return -1;
+    IntelligibilityLimits limits;
+    if (!intelligibilityPreset(preset.toStdString(), limits)) return -1;
+    const Project project = state_->project();
+    const Sequence seq = *s;
+    const uint64_t revision = state_->history().revision(), generation = state_->projectGeneration();
+    Intelligibility r;
+    if (!runWithProgress(this, state_, tr("Measuring dialogue intelligibility…"), [&](const auto& progress, const auto* cancel, std::string* e) {
+            r = measureIntelligibility(project, seq, {}, progress, cancel, e);
+            return r.valid;
+        }))
+        return -1;
+    // (Edits made while it measured leave it stale; another project opened meanwhile, unused.)
+    if (generation != state_->projectGeneration()) return -1;
+    intelligibility_[seq.id] = {r, limits, revision, generation};
+    showIntelligibility();
+    const auto hard = r.under(limits.poor, 2.0);
+    state_->message(tr("Dialogue intelligibility %1 on average; %n stretch(es) hard to follow (red in the ruler)", "", int(hard.size()))
+                        .arg(r.average, 0, 'f', 2),
+                    8000);
+    return r.average;
+}
+
+void MainWindow::showIntelligibility() {
+    std::erase_if(intelligibility_, [this](const auto& run) { return run.second.generation != state_->projectGeneration(); });
+    const Sequence* s = state_->sequence();
+    const auto it = s ? intelligibility_.find(s->id) : intelligibility_.end();
+    if (it == intelligibility_.end()) {
+        timeline_->setIntelligibilityLane({}, false);
+        if (loudness_) loudness_->setIntelligibility(-1, 0);
+        return;
+    }
+    const IntelligibilityRun& run = it->second;
+    auto status = [&](double v) { return v < run.limits.poor ? 2 : v < run.limits.fair ? 1 : 0; };
+    const double fps = s->fpsValue();
+    std::vector<TimelineWidget::IntelligibilitySpan> spans;
+    for (const IntelligibilityBlock& b : run.result.blocks) {
+        if (!b.speech) continue;
+        const FrameTime a = FrameTime(std::floor(b.start * fps + 1e-6)), e = std::max(a + 1, FrameTime(std::ceil(b.end * fps - 1e-6)));
+        const int st = status(b.index);
+        if (!spans.empty() && spans.back().status == st && spans.back().end >= a) spans.back().end = e;
+        else spans.push_back({a, e, st});
+    }
+    timeline_->setIntelligibilityLane(std::move(spans), run.revision != state_->history().revision());
+    const double v = run.result.at(double(state_->playhead()) / fps);
+    if (loudness_) loudness_->setIntelligibility(v, v >= 0 ? status(v) : 0);
 }
 
 int MainWindow::repairDamagedFrames() {
