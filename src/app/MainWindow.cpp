@@ -17,6 +17,7 @@
 
 #include "Keymap.h"
 #include "LoudnessReadout.h"
+#include "AudioAnalysisWidget.h"
 #include "Voiceover.h"
 
 #include <QJsonDocument>
@@ -761,9 +762,16 @@ void MainWindow::buildPanels() {
     ml->setSpacing(2);
     ml->addWidget(meter_, 1);
     ml->addWidget(loudness_);
+    // Phase correlation, goniometer and spectrum beneath.
+    auto* analysis = new AudioAnalysisWidget(meters);
+    analysis->setObjectName(QStringLiteral("audioAnalysis"));
+    ml->addWidget(analysis, 1);
     for (PlaybackController* pc : {program_, source_}) {
         connect(pc, &PlaybackController::loudness, loudness_, &LoudnessReadout::setReading);
         connect(pc, &PlaybackController::dialogueLoudness, loudness_, &LoudnessReadout::setDialogue);
+        connect(pc, &PlaybackController::audioAnalysis, analysis, &AudioAnalysisWidget::setAnalysis);
+        pc->setSpectrumKWeighting(analysis->kWeighting());
+        connect(analysis, &AudioAnalysisWidget::kWeightingChanged, pc, &PlaybackController::setSpectrumKWeighting);
     }
     connect(loudness_, &LoudnessReadout::resetRequested, this, [this] {
         program_->resetLoudness();

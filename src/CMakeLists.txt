@@ -107,6 +107,7 @@ add_library(montage_engine STATIC
   media/Inference.h media/Inference.cpp
   render/ColorChart.h render/ColorChart.cpp
   media/Loudness.h media/Loudness.cpp
+  media/StereoAnalysis.h media/StereoAnalysis.cpp
   media/AudioSync.h media/AudioSync.cpp
   media/FieldRecorder.h media/FieldRecorder.cpp
   media/ImageSequence.h media/ImageSequence.cpp

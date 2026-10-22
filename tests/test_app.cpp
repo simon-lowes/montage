@@ -173,6 +173,7 @@
 #include "CompareDialog.h"
 #include "Keymap.h"
 #include "LoudnessReadout.h"
+#include "AudioAnalysisWidget.h"
 #include "Voiceover.h"
 #include "AdrPanel.h"
 #include "AudioDescriptionDialog.h"
@@ -6616,8 +6617,8 @@ private slots:
         // Quality Check reports it.
         state()->undo();
         QcSettings q;
-        q.flashing = q.levels = q.clipping = q.spelling = false;
-        q.blackSeconds = q.freezeSeconds = q.silenceSeconds = 0;
+        q.flashing = q.levels = q.clipping = q.spelling = q.phase = false;
+        q.blackSeconds = q.freezeSeconds = q.silenceSeconds = q.dcOffsetDb = 0;
         const auto issues = qualityCheck(state()->project(), *state()->sequence(), 0, -1, q);
         QCOMPARE(issues.size(), size_t(1));
         QCOMPARE(issues[0].kind, QcKind::OutOfSync);
@@ -9397,6 +9398,55 @@ const auto seq = [this] { return state()->sequence(); };
         QTest::keyClick(win_.get(), Qt::Key_Q);
         QCOMPARE(state()->sequence()->markers.size(), markers + 1);
         keymap::resetAll(w);
+    }
+
+    void audioAnalysisMeters() {
+        // In the Meters dock beneath the loudness: a channel inverted reads -1 and loses everything in mono; a -6 dBFS
+        // tone shows at -6 dB in its third-octave band and its FFT bin.
+        auto* meters = win_->findChild<QDockWidget*>("meters");
+        auto* w = win_->findChild<AudioAnalysisWidget*>("audioAnalysis");
+        QVERIFY(meters && w && meters->isAncestorOf(w));
+        const int rate = 48000;
+        const double hz = 171.0 * rate / SpectrumAnalyser::kFft;
+        std::vector<float> tone(size_t(rate / 2) * 2);
+        for (size_t i = 0; i < tone.size() / 2; ++i) {
+            const float v = float(0.5 * std::sin(2 * M_PI * hz * double(i) / rate));
+            tone[2 * i] = v, tone[2 * i + 1] = -v;
+        }
+        StereoAnalyser stereo(rate);
+        SpectrumAnalyser spectrum(rate);
+        stereo.add(tone.data(), rate / 2);
+        spectrum.add(tone.data(), rate / 2);
+        w->resize(320, 220);
+        w->layout()->activate();
+        w->setMode(AudioAnalysisWidget::SpectrumMode::Bands);
+        w->setAnalysis(takeAudioAnalysis(stereo, spectrum));
+        QCOMPARE(w->text("CORR"), QString("-1.00"));
+        QCOMPARE(w->text("MONO"), QString("-60.0"));
+        QVERIFY2(std::fabs(w->levelAt(1000) + 6.02) < 0.5, qPrintable(QString::number(w->levelAt(1000))));
+        QVERIFY(w->levelAt(250) < -60);
+        QImage bands(w->size(), QImage::Format_ARGB32);
+        bands.fill(Qt::black);
+        w->render(&bands);
+        w->setMode(AudioAnalysisWidget::SpectrumMode::Bins);
+        QVERIFY2(std::fabs(w->levelAt(hz) + 6.02) < 0.1, qPrintable(QString::number(w->levelAt(hz))));
+        QImage bins(w->size(), QImage::Format_ARGB32);
+        bins.fill(Qt::black);
+        w->render(&bins);
+        QVERIFY(bins != bands);
+        // K-weighting is asked of the players; Peaks off draws no held peaks.
+        QSignalSpy weighting(w, &AudioAnalysisWidget::kWeightingChanged);
+        w->findChild<QCheckBox*>("spectrumKWeighting")->click();
+        QCOMPARE(weighting.count(), 1);
+        QVERIFY(w->kWeighting());
+        w->setKWeighting(false);
+        w->setPeakHold(false);
+        QVERIFY(!w->peakHold());
+        w->setPeakHold(true);
+        w->setMode(AudioAnalysisWidget::SpectrumMode::Bands);
+        w->clear();
+        QCOMPARE(w->text("CORR"), QString("—"));
+        QCOMPARE(w->levelAt(1000), -120.0);
     }
 
     void loudnessReadout() {

@@ -3135,8 +3135,9 @@ void McpServer::Impl::addTools() {
         "(ITU-R BT.1702 / Ofcom / WCAG: more than three flashes a second over a quarter of the screen, or saturated red), "
         "levels outside EBU R103, black or frozen picture, silence, clipping, loudness against a target, and spelling in "
         "captions (each track's language) and titles (`title_language`, default en-US), the project's vocabulary allowed, "
-        "linked clips out of sync with their picture (`sync`), and dialogue hard to follow under the music and effects "
-        "(`intelligibility`, as montage_intelligibility measures it). Lists each problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones).",
+        "linked clips out of sync with their picture (`sync`), dialogue hard to follow under the music and effects "
+        "(`intelligibility`, as montage_intelligibility measures it), left and right out of phase or one inverted, so a mono "
+        "fold-down loses them (`phase`), and DC offset (`dc_offset_db`). Lists each problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"flashing":{"type":"boolean","default":true},"levels":{"type":"boolean","default":true},
             "black_seconds":{"type":"number","default":1,"description":"0 = not checked"},
@@ -3151,6 +3152,9 @@ void McpServer::Impl::addTools() {
             "sync":{"type":"boolean","default":true},
             "intelligibility":{"type":"number","description":"Dialogue intelligibility limit, 0..1 (e.g. 0.45); omitted = not checked"},
             "intelligibility_seconds":{"type":"number","default":2,"description":"How long it must stay under the limit"},
+            "phase":{"type":"boolean","default":true,"description":"Left and right out of phase (correlation under -0.5) or one the other inverted"},
+            "phase_seconds":{"type":"number","default":1,"description":"How long it must last"},
+            "dc_offset_db":{"type":"number","default":-40,"description":"A channel's mean over a second above this, dBFS; 0 = not checked"},
             "markers":{"type":"boolean","default":false}},"required":["project"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -3173,6 +3177,9 @@ void McpServer::Impl::addTools() {
             q.sync = a.value("sync").toBool(true);
             q.intelligibility = std::clamp(a.value("intelligibility").toDouble(0), 0.0, 1.0);
             q.intelligibilitySeconds = std::max(0.0, a.value("intelligibility_seconds").toDouble(2));
+            q.phase = a.value("phase").toBool(true);
+            q.phaseSeconds = std::max(0.05, a.value("phase_seconds").toDouble(1));
+            q.dcOffsetDb = std::min(0.0, a.value("dc_offset_db").toDouble(-40));
             const std::vector<QcIssue> issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(f, "Checking"); });
             QString text;
             for (const QcIssue& i : issues)

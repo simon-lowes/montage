@@ -1,6 +1,7 @@
 #include "QualityCheck.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 
@@ -9,6 +10,7 @@
 #include "core/EditOps.h"
 #include "core/SpellCheck.h"
 #include "media/Loudness.h"
+#include "media/StereoAnalysis.h"
 #include "render/DialogueLoudness.h"
 #include "render/Intelligibility.h"
 
@@ -63,6 +65,9 @@ const char* qcKindName(QcKind k) {
         case QcKind::Spelling: return "Spelling";
         case QcKind::OutOfSync: return "Out of sync";
         case QcKind::Intelligibility: return "Dialogue intelligibility";
+        case QcKind::Phase: return "Out of phase";
+        case QcKind::Inverted: return "Channel inverted";
+        case QcKind::DcOffset: return "DC offset";
     }
     return "";
 }
@@ -153,7 +158,7 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
     const double fps = s.fpsValue();
     const FrameTime frames = out - in;
     const bool picture = q.flashing || q.levels || q.blackSeconds > 0 || q.freezeSeconds > 0;
-    const bool sound = q.silenceSeconds > 0 || q.clipping || q.loudnessTarget != 0 || q.intelligibility > 0;
+    const bool sound = q.silenceSeconds > 0 || q.clipping || q.loudnessTarget != 0 || q.intelligibility > 0 || q.phase || q.dcOffsetDb != 0;
     const double pictureShare = picture ? (sound ? 0.8 : 1.0) : 0.0;
 
     if (picture) {
@@ -261,7 +266,9 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
         LoudnessMeter meter(sr);
         const int win = std::max(1, sr / 20);  // 50 ms
         std::vector<char> silentWin, clipWin;  // per 50 ms window
+        std::vector<std::array<double, 5>> stereoWin;  // per 50 ms window: sums of left², right², left×right, left, right
         silentWin.reserve(size_t(total / win + 1));
+        std::array<double, 5> winStereo{};
         int64_t clipped = 0;
         std::vector<float> buf;
         const int chunk = win * 20;  // a second
@@ -277,11 +284,14 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
             for (int k = 0; k < count; ++k) {
                 const float l = buf[size_t(k) * 2], r = buf[size_t(k) * 2 + 1];
                 winEnergy += double(l) * l + double(r) * r;
+                winStereo[0] += double(l) * l, winStereo[1] += double(r) * r, winStereo[2] += double(l) * r;
+                winStereo[3] += l, winStereo[4] += r;
                 if (std::fabs(l) >= 0.9999f || std::fabs(r) >= 0.9999f) ++clipped, winClip = true;
                 if (++winFill == win) {
                     silentWin.push_back(std::sqrt(winEnergy / (2.0 * win)) < 0.001);  // -60 dBFS
                     clipWin.push_back(winClip);
-                    winEnergy = 0, winFill = 0, winClip = false;
+                    stereoWin.push_back(winStereo);
+                    winEnergy = 0, winFill = 0, winClip = false, winStereo = {};
                 }
             }
             if (progress) progress(pictureShare + (1 - pictureShare) * double(pos + count) / double(total));
@@ -289,6 +299,7 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
         if (winFill > 0) {
             silentWin.push_back(std::sqrt(winEnergy / (2.0 * winFill)) < 0.001);
             clipWin.push_back(winClip);
+            stereoWin.push_back(winStereo);
         }
         // Window spans back to sequence frames.
         auto toFrame = [&](FrameTime w) { return in + FrameTime(std::floor(double(w) * win / sr * fps + 1e-9)); };
@@ -305,6 +316,69 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
         if (q.clipping && clipped > 0)
             for (const auto& [a, b] : fromWindows(clipWin, 0, 0.25))
                 issues.push_back({QcKind::Clipping, a, b, fmt("Sound at full scale (it will clip): %.0f samples in all", double(clipped))});
+        // The windows a span of sequence frames covers.
+        auto windowsIn = [&](FrameTime a, FrameTime b) {
+            const auto at = [&](FrameTime f) {
+                return std::min(stereoWin.size(), size_t(std::max(0.0, std::ceil(double(f - in) / fps * sr / win - 1e-6))));
+            };
+            return std::pair<size_t, size_t>(at(a), at(b));
+        };
+        if (q.phase) {
+            // Each window judged over the 350 ms around it, where both sides are above -60 dBFS.
+            const int nw = int(stereoWin.size()), half = 3;
+            std::vector<char> inverted(size_t(nw), 0), outOfPhase(size_t(nw), 0);
+            std::vector<double> loss(size_t(nw), 0);
+            for (int w = 0; w < nw; ++w) {
+                double ll = 0, rr = 0, lr = 0;
+                int64_t n = 0;
+                for (int k = std::max(0, w - half); k < std::min(nw, w + half + 1); ++k) {
+                    ll += stereoWin[size_t(k)][0], rr += stereoWin[size_t(k)][1], lr += stereoWin[size_t(k)][2];
+                    n += win;
+                }
+                if (ll < 1e-6 * double(n) || rr < 1e-6 * double(n)) continue;
+                const double c = stereoCorrelation(ll, rr, lr);
+                loss[size_t(w)] = foldDownLossDb(ll, rr, lr);
+                if (c < -0.9 && ll < 4 * rr && rr < 4 * ll) inverted[size_t(w)] = 1;
+                else if (c < -0.5) outOfPhase[size_t(w)] = 1;
+            }
+            // The fold-down's loss over a span, the median window's (a window at a span's edge straddles it).
+            auto lossOver = [&](FrameTime a, FrameTime b) {
+                std::vector<double> v;
+                const auto [w0, w1] = windowsIn(a, b);
+                for (size_t w = w0; w < w1; ++w) v.push_back(loss[w]);
+                if (v.empty()) return 0.0;
+                std::nth_element(v.begin(), v.begin() + std::ptrdiff_t(v.size() / 2), v.end());
+                return v[v.size() / 2];
+            };
+            for (const auto& [a, b] : fromWindows(inverted, q.phaseSeconds, 0.25))
+                issues.push_back({QcKind::Inverted, a, b,
+                                  fmt("One channel is the other inverted (opposite polarity): a mono fold-down loses %.0f dB", lossOver(a, b))});
+            for (const auto& [a, b] : fromWindows(outOfPhase, q.phaseSeconds, 0.25))
+                issues.push_back({QcKind::Phase, a, b, fmt("Left and right out of phase: a mono fold-down loses %.1f dB", lossOver(a, b))});
+        }
+        if (q.dcOffsetDb != 0) {
+            // Each second's mean, each side (a last part under a second joins the second before it; a range under half
+            // a second is not judged, as a low note's own swing would read as an offset over so short a time).
+            const int per = 20;
+            const double limit = std::pow(10.0, q.dcOffsetDb / 20);
+            std::vector<char> offset(stereoWin.size(), 0);
+            std::vector<double> mean(stereoWin.size(), 0);
+            for (size_t w0 = 0, w1 = 0; w0 < stereoWin.size() && stereoWin.size() >= size_t(per / 2); w0 = w1) {
+                w1 = std::min(stereoWin.size(), w0 + per);
+                if (stereoWin.size() - w1 < size_t(per)) w1 = stereoWin.size();
+                double sl = 0, sr_ = 0;
+                for (size_t k = w0; k < w1; ++k) sl += stereoWin[k][3], sr_ += stereoWin[k][4];
+                const double n = double(w1 - w0) * win, m = std::max(std::fabs(sl), std::fabs(sr_)) / n;
+                std::fill(mean.begin() + std::ptrdiff_t(w0), mean.begin() + std::ptrdiff_t(w1), m);
+                if (m > limit) std::fill(offset.begin() + std::ptrdiff_t(w0), offset.begin() + std::ptrdiff_t(w1), 1);
+            }
+            for (const auto& [a, b] : fromWindows(offset, 0, 0)) {
+                const auto [w0, w1] = windowsIn(a, b);
+                double worst = limit;
+                for (size_t w = w0; w < w1; ++w) worst = std::max(worst, mean[w]);
+                issues.push_back({QcKind::DcOffset, a, b, fmt("DC offset: the sound's mean is %.1f dBFS (the limit is %.0f dBFS)", 20 * std::log10(worst), q.dcOffsetDb)});
+            }
+        }
         if (q.loudnessTarget != 0) {
             LoudnessResult r = meter.result();
             std::string measured = fmt("Integrated loudness %.1f LUFS", r.integrated);

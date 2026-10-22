@@ -83,6 +83,14 @@ QualityCheckDialog::QualityCheckDialog(EditorState* state, QWidget* parent) : QD
     clipping_->setObjectName(QStringLiteral("qcClipping"));
     clipping_->setChecked(true);
     form->addRow(QString(), clipping_);
+    phase_ = new QCheckBox(tr("Out of phase or a channel inverted (lost in a mono fold-down)"), this);
+    phase_->setObjectName(QStringLiteral("qcPhase"));
+    phase_->setChecked(true);
+    form->addRow(QString(), phase_);
+    dcOffset_ = new QCheckBox(tr("DC offset (above -40 dBFS)"), this);
+    dcOffset_->setObjectName(QStringLiteral("qcDcOffset"));
+    dcOffset_->setChecked(true);
+    form->addRow(QString(), dcOffset_);
     loudness_ = new QComboBox(this);
     loudness_->setObjectName(QStringLiteral("qcLoudness"));
     loudness_->addItem(tr("Not checked"), QPointF(0, 0));
@@ -159,6 +167,8 @@ QcSettings QualityCheckDialog::settings() const {
     q.freezeSeconds = freeze_->isChecked() ? freezeSeconds_->value() : 0;
     q.silenceSeconds = silence_->isChecked() ? silenceSeconds_->value() : 0;
     q.clipping = clipping_->isChecked();
+    q.phase = phase_->isChecked();
+    q.dcOffsetDb = dcOffset_->isChecked() ? -40 : 0;
     const QPointF target = loudness_->currentData().toPointF();
     q.loudnessTarget = target.x();
     q.peakCeiling = target.y();

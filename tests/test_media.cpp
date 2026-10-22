@@ -77,6 +77,7 @@
 #include "media/Decoder.h"
 #include "media/HwAccel.h"
 #include "media/Loudness.h"
+#include "media/StereoAnalysis.h"
 #include "media/Offload.h"
 #include "media/Recover.h"
 #include "core/AafImport.h"
@@ -2629,6 +2630,7 @@ private slots:
             q.blackSeconds = q.freezeSeconds = q.silenceSeconds = 0;
             q.intelligibility = IntelligibilityLimits{}.poor;
             q.intelligibilitySeconds = 1;
+            q.phase = false, q.dcOffsetDb = 0;  // (the noise here is flat down to 0 Hz, unlike anything recorded)
             const std::vector<QcIssue> issues = qualityCheck(p, *p.active(), 0, -1, q);
             QCOMPARE(issues.size(), size_t(1));
             QCOMPARE(issues[0].kind, QcKind::Intelligibility);
@@ -2665,6 +2667,153 @@ private slots:
             QVERIFY(!measureIntelligibility(p, *p.active(), roles, {}, nullptr, &err).valid);
             QVERIFY(QString::fromStdString(err).contains("Dialogue role"));
         }
+    }
+
+    void stereoPhaseAndSpectrum() {
+        const int rate = 48000;
+        std::mt19937 rng(7);
+        std::normal_distribution<float> white(0, 0.2f);
+        // Interleaved stereo from a function of the sample and two noises.
+        auto make = [&](double seconds, const std::function<std::pair<float, float>(int, float, float)>& f) {
+            std::vector<float> out(size_t(seconds * rate) * 2);
+            for (size_t i = 0; i < out.size() / 2; ++i) {
+                const auto [l, r] = f(int(i), white(rng), white(rng));
+                out[2 * i] = l, out[2 * i + 1] = r;
+            }
+            return out;
+        };
+        auto analyse = [&](const std::vector<float>& v) {
+            StereoAnalyser a(rate);
+            a.add(v.data(), int(v.size() / 2));
+            return std::make_pair(a.correlation(), a.foldDownLossDb());
+        };
+        // The same both sides: +1 and nothing lost in mono; one inverted: -1 and all of it lost; unrelated: about 0 and 3 dB.
+        const auto same = analyse(make(0.5, [](int, float a, float) { return std::make_pair(a, a); }));
+        QVERIFY2(same.first > 0.999 && same.second < 0.01, qPrintable(QString("%1 %2").arg(same.first).arg(same.second)));
+        const auto inverted = analyse(make(0.5, [](int, float a, float) { return std::make_pair(a, -a); }));
+        QVERIFY2(inverted.first < -0.999 && inverted.second >= 59, qPrintable(QString("%1 %2").arg(inverted.first).arg(inverted.second)));
+        const auto unrelated = analyse(make(0.5, [](int, float a, float b) { return std::make_pair(a, b); }));
+        QVERIFY2(std::fabs(unrelated.first) < 0.05 && std::fabs(unrelated.second - 3) < 0.3,
+                 qPrintable(QString("%1 %2").arg(unrelated.first).arg(unrelated.second)));
+        QCOMPARE(stereoCorrelation(0, 1, 0), 0.0);  // one side silent
+        // Only the last 300 ms count; the goniometer leans to the side that plays.
+        {
+            StereoAnalyser a(rate);
+            const auto before = make(1, [](int, float x, float) { return std::make_pair(x, -x); });
+            const auto after = make(0.4, [](int, float x, float) { return std::make_pair(x, 0.0f); });
+            a.add(before.data(), int(before.size() / 2));
+            a.add(after.data(), int(after.size() / 2));
+            QCOMPARE(a.correlation(), 0.0);
+            const auto pts = a.points(100);
+            QCOMPARE(pts.size(), size_t(100));
+            for (const auto& [side, mid] : pts) QVERIFY(std::fabs(side + mid) < 1e-6);  // up and to the left, or down and right
+        }
+
+        // A sine at -6 dBFS on an FFT bin (1001.95 Hz) reads -6 dB in its bin and its third-octave band, and next to
+        // nothing two bands away; the held peak falls 20 dB a second after it stops.
+        SpectrumAnalyser sp(rate);
+        const double hz = 171.0 * rate / SpectrumAnalyser::kFft;
+        const auto tone = make(0.5, [&](int i, float, float) {
+            const float v = float(0.5 * std::sin(2 * M_PI * hz * i / rate));
+            return std::make_pair(v, v);
+        });
+        sp.add(tone.data(), int(tone.size() / 2));
+        const auto& centres = SpectrumAnalyser::bandCentres();
+        QCOMPARE(centres.size(), size_t(31));
+        const size_t band = size_t(std::find(centres.begin(), centres.end(), 1000.0) - centres.begin());
+        QVERIFY2(std::fabs(sp.bands()[band] + 6.02) < 0.5, qPrintable(QString::number(sp.bands()[band])));
+        QVERIFY2(std::fabs(sp.bins()[171] + 6.02) < 0.1, qPrintable(QString::number(sp.bins()[171])));
+        QVERIFY2(sp.bands()[band - 2] < -60 && sp.bands()[band + 2] < -60, qPrintable(QString("%1 %2").arg(sp.bands()[band - 2]).arg(sp.bands()[band + 2])));
+        const std::vector<float> silence(size_t(rate), 0.0f);  // 0.5 s
+        sp.add(silence.data(), rate / 2);
+        QVERIFY(sp.bands()[band] < -100);
+        QVERIFY2(std::fabs(sp.bandPeaks()[band] - (-6.02 - 10)) < 1.5, qPrintable(QString::number(sp.bandPeaks()[band])));
+        // K-weighting: about +0.7 dB at 1 kHz, +4 dB in the presence range, less in the bass.
+        QVERIFY2(std::fabs(SpectrumAnalyser::kWeightDb(1000) - 0.7) < 0.3, qPrintable(QString::number(SpectrumAnalyser::kWeightDb(1000))));
+        QVERIFY2(std::fabs(SpectrumAnalyser::kWeightDb(4000) - 4) < 0.6, qPrintable(QString::number(SpectrumAnalyser::kWeightDb(4000))));
+        QVERIFY(SpectrumAnalyser::kWeightDb(30) < SpectrumAnalyser::kWeightDb(100) && SpectrumAnalyser::kWeightDb(100) < SpectrumAnalyser::kWeightDb(1000));
+        sp.reset();
+        sp.setKWeighting(true);
+        sp.add(tone.data(), int(tone.size() / 2));
+        QVERIFY(std::fabs(sp.bins()[171] - (-6.02 + SpectrumAnalyser::kWeightDb(hz))) < 0.1);
+
+        // Quality Check over 10 s of a mono-compatible mix with the right channel inverted from 3 to 6 s, left and
+        // right partly cancelling from 7.5 to 9 s: one stretch each, the first losing everything in mono.
+        Project p = makeDefaultProject();
+        const auto mix = make(10, [&](int i, float a, float b) {
+            const double t = double(i) / rate;
+            if (t >= 3 && t < 6) return std::make_pair(a, -a);
+            if (t >= 7.5 && t < 9) return std::make_pair(a, -0.6f * a + 0.8f * b);
+            return std::make_pair(a, a);
+        });
+        auto writeFloatWav = [&](const std::string& file, const std::vector<float>& stereo) {
+            QFile f(QString::fromStdString(file));
+            if (!f.open(QIODevice::WriteOnly)) return false;
+            auto u32 = [&](uint32_t v) { f.write(reinterpret_cast<const char*>(&v), 4); };
+            auto u16 = [&](uint16_t v) { f.write(reinterpret_cast<const char*>(&v), 2); };
+            const uint32_t bytes = uint32_t(stereo.size() * 4);
+            f.write("RIFF", 4), u32(36 + bytes), f.write("WAVEfmt ", 8), u32(16), u16(3), u16(2), u32(rate), u32(rate * 8), u16(8), u16(32);
+            f.write("data", 4), u32(bytes), f.write(reinterpret_cast<const char*>(stereo.data()), qint64(bytes));
+            return true;
+        };
+        const std::string file = path("phase-mix.wav");
+        QVERIFY(writeFloatWav(file, mix));
+        MediaItem m = probeOrFail(p, file);
+        p.media.push_back(m);
+        Sequence& s = *p.active();
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const double fps = s.fpsValue();
+        QcSettings q;
+        q.flashing = q.levels = q.clipping = q.spelling = q.sync = false;
+        q.blackSeconds = q.freezeSeconds = q.silenceSeconds = 0;
+        auto describe = [](const std::vector<QcIssue>& v) {
+            QString t;
+            for (const QcIssue& i : v) t += QStringLiteral("%1 %2-%3 %4; ").arg(qcKindName(i.kind)).arg(i.start).arg(i.end).arg(QString::fromStdString(i.text));
+            return t;
+        };
+        std::vector<QcIssue> issues = qualityCheck(p, s, 0, -1, q);
+        QVERIFY2(issues.size() == 2, qPrintable(describe(issues)));
+        QCOMPARE(issues[0].kind, QcKind::Inverted);
+        QVERIFY2(std::fabs(issues[0].start / fps - 3) < 0.3 && std::fabs(issues[0].end / fps - 6) < 0.3, qPrintable(describe(issues)));
+        QVERIFY2(QString::fromStdString(issues[0].text).contains("loses 60 dB"), issues[0].text.c_str());
+        QCOMPARE(issues[1].kind, QcKind::Phase);
+        QVERIFY2(std::fabs(issues[1].start / fps - 7.5) < 0.3 && std::fabs(issues[1].end / fps - 9) < 0.3, qPrintable(describe(issues)));
+        // Shorter than the time asked for: nothing.
+        q.phaseSeconds = 4;
+        QVERIFY2(qualityCheck(p, s, 0, -1, q).empty(), qPrintable(describe(qualityCheck(p, s, 0, -1, q))));
+        q.phaseSeconds = 1;
+
+        // DC offset (-26 dBFS) through the second half; the mono part elsewhere is clean.
+        std::vector<float> offset = make(4, [](int i, float a, float) { return std::make_pair(a, i >= 2 * 48000 ? a + 0.05f : a); });
+        const std::string dcFile = path("dc-offset.wav");
+        QVERIFY(writeFloatWav(dcFile, offset));
+        MediaItem dc = probeOrFail(p, dcFile);
+        p.media.push_back(dc);
+        const FrameTime dcAt = s.duration();
+        QVERIFY(edit::placeMedia(p, s, dc.id, dcAt, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        q.phase = false;
+        issues = qualityCheck(p, s, dcAt, -1, q);
+        QVERIFY2(issues.size() == 1 && issues[0].kind == QcKind::DcOffset, qPrintable(describe(issues)));
+        QVERIFY2(std::fabs((issues[0].start - dcAt) / fps - 2) < 0.6 && issues[0].end >= s.duration() - 1, qPrintable(describe(issues)));
+        const double dcDb = QString::fromStdString(issues[0].text).section("is ", 1).section(" dBFS", 0, 0).toDouble();
+        QVERIFY2(std::fabs(dcDb + 26) < 0.3, issues[0].text.c_str());
+        q.dcOffsetDb = 0;
+        QVERIFY(qualityCheck(p, s, dcAt, -1, q).empty());
+
+        // Over MCP: phase on by default.
+        const QString project = QString::fromStdString(path("phase.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject args{{"project", project}, {"flashing", false}, {"levels", false}, {"black_seconds", 0}, {"freeze_seconds", 0},
+                               {"silence_seconds", 0}, {"clipping", false}, {"spelling", false}, {"sync", false}, {"to", double(dcAt)}};
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_quality_check"}, {"arguments", args},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        const QString text = res.value("content").toArray().at(0).toObject().value("text").toString();
+        QVERIFY2(!res.value("isError").toBool() && text.contains("Channel inverted") && text.contains("Out of phase"), qPrintable(text));
     }
 
     void dialogueGatedLoudness() {
