@@ -7096,6 +7096,48 @@ private slots:
         state()->newProject();
     }
 
+    void breathControlFromTheMenu() {
+        // Three voiced lines with a quiet, breathy noise between them (sines at random pitches from 500 to 2000 Hz).
+        const int rate = 48000;
+        std::vector<float> x(size_t(rate) * 66 / 10);  // (ending before a third breath would)
+        std::mt19937 rng(7);
+        std::uniform_real_distribution<double> freq(500, 2000), phase(0, 2 * M_PI);
+        std::vector<std::pair<double, double>> partials(40);
+        for (auto& [f, ph] : partials) f = freq(rng), ph = phase(rng);
+        for (size_t i = 0; i < x.size(); ++i) {
+            const double t = double(i) / rate;
+            double v = 0;
+            if (std::fmod(t, 2.5) < 1.5)
+                for (int h = 1; h <= 12; ++h) v += 0.25 * std::sin(2 * M_PI * 140 * h * t) / h;
+            else if (const double u = std::fmod(t, 2.5) - 1.75; u >= 0 && u < 0.5)
+                for (const auto& [f, ph] : partials) v += 0.003 * std::sin(M_PI * u / 0.5) * std::sin(2 * M_PI * f * t + ph);
+            x[i] = float(v);
+        }
+        WavWriter w;
+        QVERIFY(w.open(dir_.path() + "/breathing.wav", rate, 1));
+        w.write(x.data(), int64_t(x.size()));
+        QVERIFY(w.close());
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("breathControl"));
+        QCOMPARE(win_->breathControl(-12), 0);  // nothing selected
+        const auto ids = state()->importFiles({dir_.path() + "/breathing.wav"});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        state()->setSelection({state()->sequence()->audioTracks.at(0).clips.at(0).id});
+        QCOMPARE(win_->breathControl(-12), 2);
+        const Sequence* s = state()->sequence();
+        const double fps = s->fpsValue();
+        auto gain = [&](double t) { return s->audioTracks[0].clips.at(0).audio.p("gain_db", FrameTime(std::llround(t * fps))); };
+        QVERIFY(std::fabs(gain(2.0) + 12) < 1e-9 && std::fabs(gain(4.5) + 12) < 1e-9);  // each breath down
+        QVERIFY(std::fabs(gain(0.75)) < 1e-9 && std::fabs(gain(3.25)) < 1e-9 && std::fabs(gain(5.75)) < 1e-9);
+        state()->undo();
+        const auto& params = state()->sequence()->audioTracks[0].clips.at(0).audio.params;
+        QVERIFY(!params.count("gain_db") || params.at("gain_db").keys.empty());
+        state()->newProject();
+    }
+
     void importEmbeddedClosedCaptions() {
         // A clip whose file carries CEA-608 captions.
         Project gen = makeDefaultProject();

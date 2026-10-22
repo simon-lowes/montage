@@ -174,6 +174,7 @@
 #include "ShotSearchPanel.h"
 #include "ModelPacks.h"
 #include "WorkProgress.h"
+#include "media/Breaths.h"
 #include "media/VisualSearch.h"
 #include "PeoplePanel.h"
 #include "SpeechDialog.h"
@@ -1332,6 +1333,14 @@ void MainWindow::buildMenus() {
             AutoDuckDialog dlg(state_, music, this);
             if (dlg.exec() == QDialog::Accepted) AutoDuckDialog::apply(state_, music, dlg.dialogueTracks(), dlg.options(), this);
         }))->setObjectName(QStringLiteral("autoDuck"));
+    add(clipM, tr("Breath Control…"), QKeySequence(), withSeq([this] {
+            bool ok = false;
+            const double amount = QInputDialog::getDouble(this, tr("Breath Control"), tr("Turn each breath down by (dB):"),
+                                                          appSettings().value("breathControl/amount", -12.0).toDouble(), -60, -1, 1, &ok);
+            if (!ok) return;
+            appSettings().setValue("breathControl/amount", amount);
+            breathControl(amount);
+        }))->setObjectName(QStringLiteral("breathControl"));
     add(clipM, tr("Remove Mic &Bleed…"), QKeySequence(), withSeq([this] { micBleedDialog(); }))->setObjectName(QStringLiteral("removeMicBleed"));
     add(clipM, tr("Separate Stems…"), QKeySequence(), withSeq([this] {
             std::vector<Id> clips;
@@ -4321,6 +4330,62 @@ int MainWindow::suggestChapterMarkers(double minSeconds, bool ask) {
         return 0;
     state_->message(tr("%n chapter marker(s) added; Copy Chapters for YouTube lists them", "", int(chapters.size())), 6000);
     return int(chapters.size());
+}
+
+int MainWindow::breathControl(double amountDb) {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    std::vector<Id> clips;
+    for (Id id : state_->selectedClips())
+        if (auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Audio) clips.push_back(id);
+    if (clips.empty()) {
+        statusBar()->showMessage(tr("Select the dialogue clips whose breaths to turn down"), 5000);
+        return 0;
+    }
+    // A volume line driven by an expression, or whose keys repeat, is left (keys added there would change the rest).
+    const size_t asked = clips.size();
+    std::erase_if(clips, [&](Id id) { return !volumeTakesBreathKeys(*edit::clipById(*s, id)); });
+    if (clips.empty()) {
+        statusBar()->showMessage(tr("Breath Control leaves a clip whose volume has an expression or repeating keys"), 6000);
+        return 0;
+    }
+    // Found off the interface thread (each file's sound is read once), then keyed in one undo step; Cancel keys none.
+    const Project project = state_->project();
+    const Sequence seq = *s;
+    struct Out {
+        std::vector<std::pair<Id, TimeSpans>> found;
+        std::string error;
+        bool cancelled = false;
+    };
+    const Out r = withProgress<Out>(this, tr("Finding breaths…"), [&](const auto& progress) {
+        Out out;
+        std::atomic<bool> stop{false};
+        std::map<std::string, AudioBufferPtr> decoded;
+        for (size_t i = 0; i < clips.size() && !stop; ++i) {
+            const Clip* c = edit::clipById(seq, clips[i]);
+            if (!c) continue;
+            std::string err;
+            TimeSpans b = breathsInClip(project, seq, *c, &err, &stop, &decoded);
+            if (!err.empty()) out.error = err;
+            out.found.push_back({clips[i], std::move(b)});
+            stop = !progress(double(i + 1) / double(clips.size()), QString());
+        }
+        out.cancelled = stop;
+        return out;
+    });
+    if (r.cancelled) return 0;
+    int keyed = 0;
+    state_->edit(tr("Breath Control"), [&](Project&, Sequence& sq) {
+        for (const auto& [id, breaths] : r.found)
+            if (Clip* c = edit::clipById(sq, id)) keyed += lowerBreaths(*c, sq, breaths, amountDb);
+        return keyed > 0;
+    });
+    statusBar()->showMessage(keyed ? tr("%n breath(s) turned down by %1 dB", "", keyed).arg(amountDb)
+                                   : !r.error.empty()       ? QString::fromStdString(r.error)
+                                   : clips.size() < asked   ? tr("No breaths found (clips whose volume has an expression or repeating keys are left)")
+                                                            : tr("No breaths found"),
+                             6000);
+    return keyed;
 }
 
 QString MainWindow::copyYoutubeChapters() {

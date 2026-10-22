@@ -71,6 +71,7 @@
 #include "media/Proxy.h"
 #include "media/AudioSync.h"
 #include "media/AutoDuck.h"
+#include "media/Breaths.h"
 #include "media/Capture.h"
 #include "media/Mlv.h"
 #include "media/Decoder.h"
@@ -2719,6 +2720,377 @@ private slots:
         QVERIFY(cleaned && cleaned != wetPtr);
         target = room(0.8, 0, false, true);
         QVERIFY2(srr(*cleaned) > before + 2, qPrintable(QString::number(srr(*cleaned))));
+    }
+
+    void dialogueRepair() {
+        constexpr int sr = 48000;
+        std::string err;
+        AudioBufferPtr speech = decodeAudio(MONTAGE_TEST_DATA_DIR "/jfk.wav", sr, &err);
+        QVERIFY2(speech && speech->frames() > sr, err.c_str());
+        const int64_t n = speech->frames();
+        // The voice at a peak of 0.8 (its left channel; both channels the same).
+        std::vector<double> voice(static_cast<size_t>(n));
+        double peak = 0;
+        for (int64_t i = 0; i < n; ++i) peak = std::max(peak, double(std::fabs(speech->samples[size_t(i) * 2])));
+        for (int64_t i = 0; i < n; ++i) voice[size_t(i)] = speech->samples[size_t(i) * 2] * 0.8 / peak;
+        auto stereo = [&](const std::vector<double>& l, const std::vector<double>& r) {
+            AudioBuffer b;
+            b.sampleRate = sr;
+            b.samples.resize(l.size() * 2);
+            for (size_t i = 0; i < l.size(); ++i) b.samples[i * 2] = float(l[i]), b.samples[i * 2 + 1] = float(r[i]);
+            return b;
+        };
+        auto db = [](double a, double b) { return 10 * std::log10((a + 1e-30) / (b + 1e-30)); };
+
+        // De-Clip: the voice, and a sweep from 100 Hz to 4 kHz, clipped 6 dB under their peaks.
+        std::vector<double> sweep(static_cast<size_t>(sr) * 3);
+        for (size_t i = 0; i < sweep.size(); ++i) {
+            const double t = double(i) / sr, T = 3, f0 = 100, f1 = 4000;
+            sweep[i] = 0.8 * std::sin(2 * M_PI * f0 * T / std::log(f1 / f0) * (std::exp(t / T * std::log(f1 / f0)) - 1));
+        }
+        // (And the voice clipped sooner below than above, as a recording with an offset is: each side found by itself.)
+        struct DeclipCase {
+            const char* name;
+            const std::vector<double>& original;
+            double up, down;
+        };
+        for (const DeclipCase& k : {DeclipCase{"voice", voice, 0.4, 0.4}, DeclipCase{"sweep", sweep, 0.4, 0.4},
+                                    DeclipCase{"voice, offset", voice, 0.6, 0.4}}) {
+            const auto& original = k.original;
+            auto level = [&](double v) { return v > 0 ? k.up : k.down; };
+            std::vector<double> clipped(original.size());
+            for (size_t i = 0; i < original.size(); ++i) clipped[i] = std::clamp(original[i], -k.down, k.up);
+            const AudioBuffer in = stereo(clipped, clipped);
+            AudioBuffer out;
+            int found = 0;
+            QVERIFY(declip(in, out, 0, &found));
+            QVERIFY2(found > 0, k.name);
+            double before = 0, after = 0, signal = 0, changed = 0, beforeUp = 0, afterUp = 0;
+            for (size_t i = 0; i < original.size(); ++i) {
+                const double y = out.samples[i * 2];
+                if (std::fabs(original[i]) >= level(original[i])) {
+                    signal += original[i] * original[i];
+                    before += std::pow(clipped[i] - original[i], 2);
+                    after += std::pow(y - original[i], 2);
+                    if (original[i] > 0) beforeUp += std::pow(clipped[i] - original[i], 2), afterUp += std::pow(y - original[i], 2);
+                    QVERIFY(std::fabs(y) >= level(original[i]) * 0.99 && (y > 0) == (original[i] > 0));  // beyond the clip level
+                } else if (std::fabs(original[i]) < 0.95 * level(original[i])) {
+                    changed = std::max(changed, std::fabs(y - double(float(clipped[i]))));
+                }
+                QVERIFY(std::fabs(y) < 1);
+            }
+            qInfo("de-clip %s: %d runs; where clipped, error %.1f dB under the signal before, %.1f after (the top side %.1f dB "
+                  "better); unclipped changed %.2g",
+                  k.name, found, -db(before, signal), -db(after, signal), -db(afterUp, beforeUp), changed);
+            QVERIFY2(db(after, before) < -6, qPrintable(QString::number(db(after, before))));
+            QVERIFY2(db(afterUp, beforeUp) < -6, qPrintable(QString::number(db(afterUp, beforeUp))));  // both sides
+            QCOMPARE(changed, 0.0);
+        }
+        {
+            // Clipped at full scale (the commonest case): the rebuilt peaks rise past it, and the whole is lowered to
+            // bring them back under -0.1 dBFS, keeping their shape (measured after matching the level).
+            std::vector<double> loud(voice.size()), clipped(voice.size());
+            for (size_t i = 0; i < voice.size(); ++i) loud[i] = voice[i] * 1.6, clipped[i] = std::clamp(loud[i], -1.0, 1.0);
+            const AudioBuffer in = stereo(clipped, clipped);
+            AudioBuffer out;
+            int found = 0;
+            QVERIFY(declip(in, out, 0, &found));
+            QVERIFY(found > 0);
+            auto fitError = [&](auto get) {  // the error where it was clipped, after the best gain
+                double xy = 0, xx = 0, e = 0, sig = 0;
+                for (size_t i = 0; i < loud.size(); ++i)
+                    if (std::fabs(loud[i]) >= 1) xy += get(i) * loud[i], xx += loud[i] * loud[i];
+                const double g = xy / xx;
+                for (size_t i = 0; i < loud.size(); ++i)
+                    if (std::fabs(loud[i]) >= 1) e += std::pow(get(i) - g * loud[i], 2), sig += std::pow(g * loud[i], 2);
+                return db(e, sig);
+            };
+            double top = 0;
+            for (float v : out.samples) top = std::max(top, double(std::fabs(v)));
+            const double was = fitError([&](size_t i) { return clipped[i]; }), now = fitError([&](size_t i) { return double(out.samples[i * 2]); });
+            qInfo("de-clip at full scale: %d runs, peak %.4f, error where clipped %.1f dB under the signal before, %.1f after", found, top,
+                  -was, -now);
+            QVERIFY(top <= 0.9891);
+            QVERIFY2(now < was - 6, qPrintable(QString("%1 %2").arg(was).arg(now)));
+        }
+        {
+            // A level typed in to the setting's step (-6.0 for a clip at half scale, -6.02 dBFS) still finds it.
+            std::vector<double> half(voice.size());
+            for (size_t i = 0; i < voice.size(); ++i) half[i] = std::clamp(voice[i], -0.5, 0.5);
+            AudioBuffer out;
+            int found = 0;
+            QVERIFY(declip(stereo(half, half), out, -6.0, &found));
+            QVERIFY(found > 0);
+        }
+        {
+            // Nothing clipped: nothing changed.
+            const AudioBuffer in = stereo(voice, voice);
+            AudioBuffer out;
+            int found = -1;
+            QVERIFY(declip(in, out, 0, &found));
+            QCOMPARE(found, 0);
+            QVERIFY(out.samples == in.samples);
+        }
+
+        // De-Plosive: 40 ms bursts at 80 Hz dropped into the voice.
+        {
+            std::vector<double> popped = voice, burst(voice.size(), 0.0);
+            std::vector<std::pair<int64_t, int64_t>> pops;
+            for (double at : {1.3, 2.9, 4.6, 6.2, 8.1, 9.4}) {
+                const int64_t s0 = int64_t(at * sr), len = int64_t(0.04 * sr);
+                if (s0 + len >= n) continue;
+                pops.push_back({s0, s0 + len});
+                for (int64_t j = 0; j < len; ++j) {
+                    const double env = std::sin(M_PI * double(j) / double(len));
+                    burst[size_t(s0 + j)] = 0.5 * env * std::sin(2 * M_PI * 80 * double(j) / sr);
+                    popped[size_t(s0 + j)] += burst[size_t(s0 + j)];
+                }
+            }
+            const AudioBuffer in = stereo(popped, popped);
+            AudioBuffer out;
+            int found = 0;
+            deplosive(in, out, 50, 24, &found);
+            double before = 0, after = 0;
+            for (const auto& [a, b] : pops)
+                for (int64_t i = a; i < b; ++i) {
+                    before += burst[size_t(i)] * burst[size_t(i)];
+                    after += std::pow(out.samples[size_t(i) * 2] - voice[size_t(i)], 2);
+                }
+            // The voice above 200 Hz, before and after (a high-pass in the test).
+            auto above200 = [&](auto get) {
+                const double w = 2 * M_PI * 200 / sr, alpha = std::sin(w) / (2 * 0.7071), cw = std::cos(w), a0 = 1 + alpha;
+                const double b0 = (1 + cw) / 2 / a0, b1 = -(1 + cw) / a0, a1 = -2 * cw / a0, a2 = (1 - alpha) / a0;
+                double x1 = 0, x2 = 0, y1 = 0, y2 = 0, e = 0;
+                for (int64_t i = 0; i < n; ++i) {
+                    const double v = get(i), y = b0 * v + b1 * x1 + b0 * x2 - a1 * y1 - a2 * y2;
+                    x2 = x1, x1 = v, y2 = y1, y1 = y;
+                    e += y * y;
+                }
+                return e;
+            };
+            const double kept = db(above200([&](int64_t i) { return double(out.samples[size_t(i) * 2]); }),
+                                   above200([&](int64_t i) { return popped[size_t(i)]; }));
+            qInfo("de-plosive: %d of %d found, bursts %.1f dB down, above 200 Hz %.2f dB", found, int(pops.size()), db(after, before), kept);
+            QCOMPARE(found, int(pops.size()));
+            QVERIFY2(db(after, before) < -15, qPrintable(QString::number(db(after, before))));
+            QVERIFY2(std::fabs(kept) < 0.5, qPrintable(QString::number(kept)));
+            // The voice alone has no plosives to find.
+            AudioBuffer plain;
+            deplosive(stereo(voice, voice), plain, 50, 24, &found);
+            QCOMPARE(found, 0);
+        }
+
+        // De-Wind: gusty low noise on the left microphone only.
+        {
+            std::mt19937 rng(11);
+            std::normal_distribution<double> white(0, 1);
+            std::vector<double> wind(voice.size());
+            double lp1 = 0, lp2 = 0;
+            for (size_t i = 0; i < wind.size(); ++i) {
+                const double a = 2 * M_PI * 250 / sr;  // two one-pole low-passes at 250 Hz
+                lp1 += a * (white(rng) - lp1);
+                lp2 += a * (lp1 - lp2);
+                const double gust = std::pow(0.55 + 0.45 * std::sin(2 * M_PI * 0.6 * double(i) / sr), 2);
+                wind[i] = 6.0 * lp2 * gust;
+            }
+            std::vector<double> left(voice.size());
+            for (size_t i = 0; i < left.size(); ++i) left[i] = voice[i] + wind[i];
+            const AudioBuffer in = stereo(left, voice);
+            AudioBuffer out;
+            dewind(in, out, 100, 24);
+            double before = 0, after = 0, rightError = 0, energy = 0;
+            for (int64_t i = 0; i < n; ++i) {
+                before += wind[size_t(i)] * wind[size_t(i)];
+                after += std::pow(out.samples[size_t(i) * 2] - voice[size_t(i)], 2);
+                rightError += std::pow(out.samples[size_t(i) * 2 + 1] - voice[size_t(i)], 2);
+                energy += voice[size_t(i)] * voice[size_t(i)];
+            }
+            qInfo("de-wind: wind %.1f dB over the voice, %.1f dB down; the clean mic changed %.1f dB under the voice", db(before, energy),
+                  db(after, before), -db(rightError, energy));
+            QVERIFY2(db(after, before) < -12, qPrintable(QString::number(db(after, before))));
+            QVERIFY2(db(rightError, energy) < -30, qPrintable(QString::number(db(rightError, energy))));
+            // One microphone (both channels the same) with no wind: the voice is left nearly as it was.
+            AudioBuffer mono;
+            dewind(stereo(voice, voice), mono, 100, 24);
+            double change = 0;
+            for (int64_t i = 0; i < n; ++i) change += std::pow(mono.samples[size_t(i) * 2] - voice[size_t(i)], 2);
+            QVERIFY2(db(change, energy) < -25, qPrintable(QString::number(db(change, energy))));
+            // The voice 6 dB quieter on the second mic, no wind: still counted as shared, so left on both.
+            std::vector<double> half(voice.size());
+            for (size_t i = 0; i < voice.size(); ++i) half[i] = voice[i] / 2;
+            AudioBuffer uneven;
+            dewind(stereo(voice, half), uneven, 100, 24);
+            double changeL = 0, changeR = 0;
+            for (int64_t i = 0; i < n; ++i)
+                changeL += std::pow(uneven.samples[size_t(i) * 2] - voice[size_t(i)], 2),
+                    changeR += std::pow(uneven.samples[size_t(i) * 2 + 1] - half[size_t(i)], 2);
+            qInfo("de-wind, voice 6 dB down on one mic: changed %.1f and %.1f dB under it", -db(changeL, energy), -db(changeR, energy / 4));
+            QVERIFY2(db(changeL, energy) < -25 && db(changeR, energy / 4) < -25, qPrintable(QString("%1 %2").arg(db(changeL, energy)).arg(db(changeR, energy / 4))));
+            // A stereo file whose second channel is dead: the live one is judged as one mic, so its voice is left.
+            AudioBuffer dead;
+            dewind(stereo(voice, std::vector<double>(voice.size(), 0.0)), dead, 100, 24);
+            double deadChange = 0;
+            for (int64_t i = 0; i < n; ++i) deadChange += std::pow(dead.samples[size_t(i) * 2] - voice[size_t(i)], 2);
+            QVERIFY2(db(deadChange, energy) < -25, qPrintable(QString::number(db(deadChange, energy))));
+            // One mic starting with a second of silence, then the voice over a steady 70 Hz rumble: the silence does not
+            // leave everything after it cut.
+            std::vector<double> late(voice.size() + size_t(sr), 0.0);
+            double lateEnergy = 0;
+            for (size_t i = 0; i < voice.size(); ++i) {
+                late[i + size_t(sr)] = voice[i] + 0.05 * std::sin(2 * M_PI * 70 * double(i) / sr);
+                lateEnergy += late[i + size_t(sr)] * late[i + size_t(sr)];
+            }
+            AudioBuffer fromSilence;
+            dewind(stereo(late, late), fromSilence, 100, 24);
+            double lateChange = 0;
+            for (size_t i = 0; i < late.size(); ++i) lateChange += std::pow(fromSilence.samples[i * 2] - late[i], 2);
+            qInfo("de-wind, one mic after silence: changed %.1f dB under the sound", -db(lateChange, lateEnergy));
+            QVERIFY2(db(lateChange, lateEnergy) < -25, qPrintable(QString::number(db(lateChange, lateEnergy))));
+        }
+
+        // Breath Control: four lines of voice (a buzz at a speaker's pitch, in syllables), each after a gap; three gaps
+        // with a breath, one without, and an "s" just before two of the lines; a quiet room under it all.
+        {
+            std::mt19937 rng(5);
+            std::normal_distribution<double> white(0, 1);
+            const double line = 1.5, gap = 0.9;
+            std::vector<double> mix(size_t((line + gap) * 4 * sr) + size_t(sr / 2), 0.0);
+            for (double& v : mix) v = 0.0005 * white(rng);
+            auto band = [&](std::vector<double> v, double lo, double hi) {  // two biquads: a high-pass and a low-pass
+                for (int pass = 0; pass < 2; ++pass) {
+                    const bool high = pass == 0;
+                    const double w = 2 * M_PI * (high ? lo : hi) / sr, alpha = std::sin(w) / (2 * 0.7071), cw = std::cos(w), a0 = 1 + alpha;
+                    const double b0 = (high ? (1 + cw) : (1 - cw)) / 2 / a0, b1 = (high ? -(1 + cw) : (1 - cw)) / a0;
+                    const double a1 = -2 * cw / a0, a2 = (1 - alpha) / a0;
+                    double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+                    for (double& u : v) {
+                        const double y = b0 * u + b1 * x1 + b0 * x2 - a1 * y1 - a2 * y2;
+                        x2 = x1, x1 = u, y2 = y1, y1 = y;
+                        u = y;
+                    }
+                }
+                return v;
+            };
+            Transcript words;
+            TimeSpans placed;
+            for (int k = 0; k < 4; ++k) {
+                const double gapStart = 0.25 + k * (line + gap), lineStart = gapStart + gap;
+                if (k != 2) {  // a breath in the middle of the gap
+                    const double bs = gapStart + 0.25, len = 0.4;
+                    std::vector<double> noise(size_t(len * sr));
+                    for (double& v : noise) v = white(rng);
+                    noise = band(noise, 500, 2500);
+                    for (size_t j = 0; j < noise.size(); ++j)
+                        mix[size_t(bs * sr) + j] += 0.03 * noise[j] * std::sin(M_PI * double(j) / double(noise.size()));
+                    placed.push_back({bs, bs + len});
+                }
+                if (k % 2) {  // an "s" leading into the line
+                    std::vector<double> noise(size_t(0.09 * sr));
+                    for (double& v : noise) v = white(rng);
+                    noise = band(noise, 4500, 12000);
+                    for (size_t j = 0; j < noise.size(); ++j) mix[size_t((lineStart - 0.09) * sr) + j] += 0.05 * noise[j];
+                }
+                TranscriptSegment seg;
+                seg.start = lineStart - (k % 2 ? 0.09 : 0), seg.end = lineStart + line;
+                for (int i = 0; i < int(line * sr); ++i) {
+                    const double t = double(i) / sr, f0 = 110 + 15 * std::sin(2 * M_PI * 0.7 * t);
+                    const double env = 0.3 + 0.7 * std::pow(std::sin(M_PI * 4 * t / line * 2), 2);
+                    double v = 0;
+                    for (int h = 1; h <= 20; ++h) v += std::sin(2 * M_PI * f0 * h * t) / h;
+                    mix[size_t(lineStart * sr) + size_t(i)] += 0.25 * env * v;
+                }
+                for (int w = 0; w < 3; ++w) {  // three words a line
+                    TranscriptWord tw;
+                    tw.start = seg.start + w * (seg.end - seg.start) / 3, tw.end = seg.start + (w + 1) * (seg.end - seg.start) / 3;
+                    tw.text = "word";
+                    seg.words.push_back(tw);
+                }
+                words.segments.push_back(seg);
+            }
+            const AudioBuffer in = stereo(mix, mix);
+            for (const Transcript* t : std::initializer_list<const Transcript*>{nullptr, &words}) {
+                const TimeSpans found = findBreaths(in, t);
+                QString list;
+                for (const auto& [a, b] : found) list += QString(" %1-%2").arg(a, 0, 'f', 3).arg(b, 0, 'f', 3);
+                qInfo("breaths%s:%s", t ? " (with words)" : "", qPrintable(list));
+                QCOMPARE(found.size(), placed.size());
+                for (size_t i = 0; i < placed.size(); ++i) {
+                    // (The envelope's quiet ends are under the room's level plus 6 dB, so only the middle is found.)
+                    QVERIFY2(found[i].first >= placed[i].first - 0.05 && found[i].second <= placed[i].second + 0.05 &&
+                                 found[i].second - found[i].first > 0.2,
+                             qPrintable(list));
+                }
+            }
+            // Keyed on a clip: each breath 12 dB down, the lines as they were.
+            Sequence seq;
+            seq.fps = {25, 1};
+            Clip c;
+            c.start = 50;
+            c.duration = FrameTime(double(mix.size()) / sr * 25);
+            c.audio.params["gain_db"] = Param(-2.0);
+            const Clip unkeyed = c;
+            const TimeSpans breaths = findBreaths(in, &words);
+            QCOMPARE(lowerBreaths(c, seq, breaths, -12), int(placed.size()));
+            const Param& g = c.audio.params["gain_db"];
+            for (const auto& [a, b] : placed) QCOMPARE(g.at(FrameTime(std::llround((a + b) / 2 * 25))), -14.0);
+            for (int k = 0; k < 4; ++k) QCOMPARE(g.at(FrameTime(std::llround((0.25 + k * (line + gap) + gap + line / 2) * 25))), -2.0);
+            QCOMPARE(g.keys.size(), size_t(1 + 4 * placed.size()));
+            QCOMPARE(lowerBreaths(c, seq, breaths, -12), 0);  // already down
+            // Played backwards: each breath keyed where the clip now plays it.
+            Clip back = unkeyed;
+            back.reverse = true;
+            QCOMPARE(lowerBreaths(back, seq, breaths, -12), int(placed.size()));
+            for (const auto& [a, b] : placed)
+                QCOMPARE(back.audio.params["gain_db"].at(FrameTime(std::floor(back.localForSource((a + b) / 2 * 25) + 1))), -14.0);
+            // A volume an expression drives is left (keys added would not leave the rest of its line as it was).
+            Clip driven = unkeyed;
+            driven.audio.params["gain_db"].expr = "value + 1";
+            QVERIFY(!volumeTakesBreathKeys(driven));
+            QCOMPARE(lowerBreaths(driven, seq, breaths, -12), 0);
+
+            // Over MCP, on a clip 0.3 s into the timeline playing from 0.2 s into the recording (so its first breath is
+            // keyed where it plays).
+            const std::string wav = path("breaths.wav");
+            writeBwf(wav, in, 0, "", "");
+            Project p = makeDefaultProject();
+            Sequence& ps = *p.active();
+            MediaItem m = probeOrFail(p, wav);
+            p.media.push_back(m);
+            const double fps = ps.fpsValue();
+            QVERIFY(edit::placeMedia(p, ps, m.id, FrameTime(std::llround(0.3 * fps)), 0.2 * fps, FrameTime(std::floor(8.5 * fps)),
+                                     {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false)
+                        .ok);
+            const Id clip = ps.audioTracks.at(0).clips.at(0).id;
+            const QString project = QString::fromStdString(path("breaths.montage"));
+            QVERIFY(saveProject(p, project.toStdString()));
+            McpServer server;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_breath_control"},
+                                                         {"arguments", QJsonObject{{"project", project}, {"track", "A1"}, {"amount_db", -9}}},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            const QJsonObject sc = r.value("structuredContent").toObject();
+            QCOMPARE(sc.value("keyed").toInt(), int(placed.size()));
+            const QJsonArray list = sc.value("breaths").toArray();
+            QCOMPARE(list.size(), qsizetype(placed.size()));
+            QVERIFY(std::fabs(list.at(0).toObject().value("start_seconds").toDouble() - (breaths[0].first - 0.2 + 0.3)) < 1e-6);
+            Project after;
+            QVERIFY(loadProject(project.toStdString(), after));
+            const Clip* keyedClip = edit::clipById(*after.active(), clip);
+            QVERIFY(keyedClip);
+            const Param& kg = keyedClip->audio.params.at("gain_db");
+            QCOMPARE(kg.at(FrameTime(std::llround(((placed[0].first + placed[0].second) / 2 - 0.2) * fps))), -9.0);
+        }
+
+        // As clip effects, on the clip's whole source audio.
+        for (const char* type : {"declip", "deplosive", "dewind"}) {
+            QVERIFY(isSourceAudioEffect(type));
+            const EffectInfo* def = findEffectInfo(type);
+            QVERIFY(def && !def->hidden);
+        }
     }
 
     void audioRepair() {

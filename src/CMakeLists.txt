@@ -117,6 +117,7 @@ add_library(montage_engine STATIC
   media/DualSystem.h media/DualSystem.cpp
   media/SpeakerSwitch.h media/SpeakerSwitch.cpp
   media/AutoDuck.h media/AutoDuck.cpp
+  media/Breaths.h media/Breaths.cpp
   media/Offload.h media/Offload.cpp
   media/Recover.h media/Recover.cpp
   media/MicBleed.h media/MicBleed.cpp
