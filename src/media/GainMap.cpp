@@ -1242,12 +1242,14 @@ std::shared_ptr<const GainMapPicture> decodeGainMapHeif(const std::string& path,
             QImage t = QImage(reinterpret_cast<const uchar*>(pic->rgba.data()), pic->width, pic->height, pic->width * 8,
                               QImage::Format_RGBA64)
                            .copy();
-            if (!applyItemTransforms(a, *g.tmap, t, why)) return nullptr;
-            t = t.convertToFormat(QImage::Format_RGBA64);
-            pic->width = t.width(), pic->height = t.height();
-            pic->rgba.resize(size_t(t.width()) * size_t(t.height()) * 4);
-            for (int y = 0; y < t.height(); ++y)
-                std::memcpy(pic->rgba.data() + size_t(y) * size_t(t.width()) * 4, t.constScanLine(y), size_t(t.width()) * 8);
+            // (Only when they keep the picture's size, as a half turn or a mirror does: the still's size is the base's,
+            // and a bad crop leaves the picture as it is rather than failing it.)
+            std::string ignored;
+            if (applyItemTransforms(a, *g.tmap, t, ignored) && t.width() == pic->width && t.height() == pic->height) {
+                t = t.convertToFormat(QImage::Format_RGBA64);
+                for (int y = 0; y < t.height(); ++y)
+                    std::memcpy(pic->rgba.data() + size_t(y) * size_t(t.width()) * 4, t.constScanLine(y), size_t(t.width()) * 8);
+            }
         }
         return pic;
     });

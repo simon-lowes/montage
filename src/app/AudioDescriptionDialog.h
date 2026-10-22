@@ -17,6 +17,7 @@ class QDoubleSpinBox;
 class QLabel;
 class QSpinBox;
 class QTableWidget;
+class QTimer;
 
 namespace montage {
 
@@ -62,7 +63,7 @@ private:
     std::vector<DescriptionGap> added_;  // the gaps added at the playhead, kept when the gaps are found again
     std::string foundFor_;               // the dialogue's layout when the gaps were found
     bool refreshing_ = false;
-    bool refinding_ = false;
+    QTimer* refind_;  // finds the gaps again after the dialogue is cut (restarted by each edit)
 };
 
 }  // namespace montage
