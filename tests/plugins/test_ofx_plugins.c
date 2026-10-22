@@ -4,6 +4,9 @@
  *  - Test Probe: shows what the host gave it. Mode "Centre" writes its Centre parameter (defined in normalised
  *    coordinates, read in canonical pixels) as red = x / 1000, green = y / 1000; mode "Changes" writes red = the
  *    times this instance was told Amount changed / 10.
+ *  - Test Colour: takes OpenFX 1.5 colour management, asking for ACEScg. Mode "Report" writes the red it was given,
+ *    green = 1 when the host agreed the core style, blue = 1 when its source is ACEScg, and says its output
+ *    is raw; mode "Pass" gives its source back, in its source's colourspace.
  * With MONTAGE_TEST_OFX_CRASH defined it instead crashes while describing itself, for the scanner's blocklist. */
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +16,7 @@
 #include <signal.h>
 #endif
 
+#include "ofxColour.h"
 #include "ofxCore.h"
 #include "ofxImageEffect.h"
 #include "ofxParam.h"
@@ -292,14 +296,102 @@ static OfxStatus mainTemporal(const char* action, const void* handle, OfxPropert
     return kOfxStatReplyDefault;
 }
 
+static OfxStatus describeColour(OfxImageEffectHandle effect) {
+    OfxPropertySetHandle props;
+    gEffect->getPropertySet(effect, &props);
+    gProp->propSetString(props, kOfxImageEffectPropColourManagementStyle, 0, kOfxImageEffectColourManagementCore);
+    gProp->propSetString(props, kOfxImageEffectPropColourManagementAvailableConfigs, 0, "ofx-native-v1.5_aces-v1.3_ocio-v2.3");
+    return describe(effect, "Test Colour", 0);
+}
+
+static OfxStatus describeColourInContext(OfxImageEffectHandle effect) {
+    describeInContext(effect, 0);
+    OfxParamSetHandle params;
+    gEffect->getParamSet(effect, &params);
+    OfxPropertySetHandle p;
+    gParam->paramDefine(params, kOfxParamTypeChoice, "mode", &p);
+    gProp->propSetString(p, kOfxPropLabel, 0, "Mode");
+    gProp->propSetString(p, kOfxParamPropChoiceOption, 0, "Report");
+    gProp->propSetString(p, kOfxParamPropChoiceOption, 1, "Pass");
+    return kOfxStatOK;
+}
+
+static int colourMode(OfxImageEffectHandle effect, OfxTime time) {
+    OfxParamSetHandle params;
+    OfxParamHandle h;
+    int mode = 0;
+    gEffect->getParamSet(effect, &params);
+    gParam->paramGetHandle(params, "mode", &h, NULL);
+    gParam->paramGetValueAtTime(h, time, &mode);
+    return mode;
+}
+
+static int propIs(OfxPropertySetHandle props, const char* name, const char* value) {
+    char* v = NULL;
+    return gProp->propGetString(props, name, 0, &v) == kOfxStatOK && v && !strcmp(v, value);
+}
+
+static OfxStatus renderColour(OfxImageEffectHandle effect, OfxPropertySetHandle in) {
+    OfxTime time;
+    int window[4];
+    gProp->propGetDouble(in, kOfxPropTime, 0, &time);
+    gProp->propGetIntN(in, kOfxImageEffectPropRenderWindow, 4, window);
+    OfxImageClipHandle source, output;
+    gEffect->clipGetHandle(effect, kOfxImageEffectSimpleSourceClipName, &source, NULL);
+    gEffect->clipGetHandle(effect, kOfxImageEffectOutputClipName, &output, NULL);
+    OfxPropertySetHandle outImg = NULL, srcImg = NULL, props, clipProps;
+    if (gEffect->clipGetImage(output, time, NULL, &outImg) != kOfxStatOK) return kOfxStatFailed;
+    if (gEffect->clipGetImage(source, time, NULL, &srcImg) != kOfxStatOK) {
+        gEffect->clipReleaseImage(outImg);
+        return kOfxStatFailed;
+    }
+    gEffect->getPropertySet(effect, &props);
+    gEffect->clipGetPropertySet(source, &clipProps);
+    const int core = propIs(props, kOfxImageEffectPropColourManagementStyle, kOfxImageEffectColourManagementCore);
+    const int linear = propIs(clipProps, kOfxImageClipPropColourspace, kOfxColourspaceACEScg);
+    const int report = colourMode(effect, time) == 0;
+    View o, s;
+    viewOf(outImg, &o);
+    viewOf(srcImg, &s);
+    for (int y = window[1]; y < window[3]; ++y)
+        for (int x = window[0]; x < window[2]; ++x) {
+            const float* sp = pixel(&s, x, y);
+            float* op = pixel(&o, x, y);
+            if (report) op[0] = sp[0], op[1] = (float)core, op[2] = (float)linear, op[3] = 1;
+            else op[0] = sp[0], op[1] = sp[1], op[2] = sp[2], op[3] = sp[3];
+        }
+    gEffect->clipReleaseImage(srcImg);
+    gEffect->clipReleaseImage(outImg);
+    return kOfxStatOK;
+}
+
+static OfxStatus mainColour(const char* action, const void* handle, OfxPropertySetHandle in, OfxPropertySetHandle out) {
+    OfxImageEffectHandle effect = (OfxImageEffectHandle)handle;
+    if (!strcmp(action, kOfxActionLoad)) return load();
+    if (!strcmp(action, kOfxActionDescribe)) return describeColour(effect);
+    if (!strcmp(action, kOfxImageEffectActionDescribeInContext)) return describeColourInContext(effect);
+    if (!strcmp(action, kOfxImageEffectActionGetClipPreferences)) {
+        gProp->propSetString(out, "OfxImageClipPropPreferredColourspaces_Source", 0, kOfxColourspaceACEScg);
+        gProp->propSetString(out, "OfxImageClipPropPreferredColourspaces_Source", 1, kOfxColourspaceOfxSceneLinear);
+        return kOfxStatOK;
+    }
+    if (!strcmp(action, kOfxImageEffectActionGetOutputColourspace)) {
+        gProp->propSetString(out, kOfxImageClipPropColourspace, 0, colourMode(effect, 0) == 0 ? kOfxColourspaceOfxRaw : "OfxColourspace_Source");
+        return kOfxStatOK;
+    }
+    if (!strcmp(action, kOfxImageEffectActionRender)) return renderColour(effect, in);
+    return kOfxStatReplyDefault;
+}
+
 static OfxPlugin gInvert = {kOfxImageEffectPluginApi, 1, "org.montage.test.invert", 1, 0, setHost, mainInvert};
 static OfxPlugin gTemporal = {kOfxImageEffectPluginApi, 1, "org.montage.test.temporal", 1, 0, setHost, mainTemporal};
 static OfxPlugin gProbe = {kOfxImageEffectPluginApi, 1, "org.montage.test.probe", 1, 0, setHost, mainProbe};
+static OfxPlugin gColour = {kOfxImageEffectPluginApi, 1, "org.montage.test.colour", 1, 0, setHost, mainColour};
 
 EXPORT int OfxGetNumberOfPlugins(void) {
-    return 3;
+    return 4;
 }
 
 EXPORT OfxPlugin* OfxGetPlugin(int nth) {
-    return nth == 0 ? &gInvert : nth == 1 ? &gTemporal : nth == 2 ? &gProbe : NULL;
+    return nth == 0 ? &gInvert : nth == 1 ? &gTemporal : nth == 2 ? &gProbe : nth == 3 ? &gColour : NULL;
 }

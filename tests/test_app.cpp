@@ -10594,7 +10594,7 @@ const auto seq = [this] { return state()->sequence(); };
         reg.setCachePath(dir_.filePath("ofx-cache.json").toStdString());
         reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
         reg.setSearchPaths({MONTAGE_TEST_OFX_DIR "/good"});
-        QCOMPARE(reg.scan(), 3);
+        QCOMPARE(reg.scan(), 4);
         auto* browser = win_->findChild<EffectsBrowser*>();
         QVERIFY(browser);
         browser->reload();

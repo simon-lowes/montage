@@ -1122,7 +1122,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     !enabledEffect(seq, c, "motion_deblur") && !enabledEffect(seq, c, "motion_blur") && !enabledEffect(seq, c, "deflicker") &&
                     !enabledEffect(seq, c, "fade_restore") && !enabledEffect(seq, c, "film_negative") && !enabledEffect(seq, c, "perf_lock") &&
                     !enabledEffect(seq, c, "dirt_removal") && !enabledEffect(seq, c, "dust_spots") && !enabledEffect(seq, c, "lip_sync") &&
-                    !upscale && !vr && !sourceStageLooks(c, lt, from, *m)) {
+                    !upscale && !vr && !sourceStageLooks(c, lt, from, *m) && !f->half) {  // (half floats: the CPU keeps them)
                     out.frame = f;
                     out.frameSpace = &from;
                     return true;

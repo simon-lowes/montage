@@ -26,6 +26,8 @@
 #include "core/Effects.h"
 #include "core/Expression.h"
 #include "media/SuperScale.h"
+#include "render/ColorSpace.h"
+#include "ofxColour.h"
 #include "ofxCore.h"
 #include "ofxImageEffect.h"
 #include "ofxMemory.h"
@@ -322,6 +324,7 @@ struct Instance {
     Image* output = nullptr;
     std::string error;
     bool floatImages = true;
+    std::string colourStyle;  // the colour management agreed (OpenFX 1.5), empty for none
     bool wrote = false;  // the plugin gave its output image back
     double projectW = 1920, projectH = 1080;  // full-size frame, for parameters given as a fraction of it
     Effect last;  // the effect's values at its last render here, for kOfxActionInstanceChanged
@@ -960,6 +963,106 @@ OfxStatus getTimeBounds(void* h, double* first, double* last) {
 }
 OfxTimeLineSuiteV1 gTimeLineSuite = {getTime, gotoTime, getTimeBounds};
 
+// ---- Colour management (OpenFX 1.5) --------------------------------------------------------------------------------
+
+constexpr const char* kNativeConfig = "ofx-native-v1.5_aces-v1.3_ocio-v2.3";
+
+// The style agreed with a plugin that describes itself with `p`: the highest both take (Montage gives the core
+// colourspaces), empty when it takes none or not the native config.
+std::string colourStyleWith(const PropertySet& p) {
+    const std::string style = p.getString(kOfxImageEffectPropColourManagementStyle);
+    const std::vector<std::string> configs = p.strings(kOfxImageEffectPropColourManagementAvailableConfigs);
+    if (!configs.empty() && std::find(configs.begin(), configs.end(), kNativeConfig) == configs.end()) return {};
+    if (style == kOfxImageEffectColourManagementBasic) return kOfxImageEffectColourManagementBasic;
+    if (style == kOfxImageEffectColourManagementCore || style == kOfxImageEffectColourManagementFull || style == kOfxImageEffectColourManagementOCIO)
+        return kOfxImageEffectColourManagementCore;
+    return {};
+}
+
+// The native config's colourspaces Montage can make, by their encoding (primaries and curve).
+struct NativeSpace {
+    const char* name;
+    Primaries primaries;
+    Transfer transfer;
+    bool display;
+    bool basic;
+};
+constexpr NativeSpace kNativeSpaces[] = {
+    {kOfxColourspaceRec1886Rec709Display, Primaries::Bt709, Transfer::Bt1886, true, false},
+    {kOfxColourspaceSrgbDisplay, Primaries::Bt709, Transfer::Srgb, true, false},
+    {kOfxColourspaceRec1886Rec2020Display, Primaries::Bt2020, Transfer::Bt1886, true, false},
+    {kOfxColourspaceDisplayp3Display, Primaries::P3D65, Transfer::Srgb, true, false},
+    {kOfxColourspaceRec2100PqDisplay, Primaries::Bt2020, Transfer::Pq, true, false},
+    {kOfxColourspaceRec2100HlgDisplay, Primaries::Bt2020, Transfer::Hlg, true, false},
+    {kOfxColourspaceSt2084P3d65Display, Primaries::P3D65, Transfer::Pq, true, false},
+    {kOfxColourspaceG24Rec709Tx, Primaries::Bt709, Transfer::Bt1886, false, false},
+    {kOfxColourspaceSrgbTx, Primaries::Bt709, Transfer::Srgb, false, false},
+    {kOfxColourspaceSrgbEncodedP3d65Tx, Primaries::P3D65, Transfer::Srgb, false, false},
+    {kOfxColourspaceSrgbEncodedAp1Tx, Primaries::Ap1, Transfer::Srgb, false, false},
+    {kOfxColourspaceLinRec709Srgb, Primaries::Bt709, Transfer::Linear, false, false},
+    {kOfxColourspaceLinRec2020, Primaries::Bt2020, Transfer::Linear, false, false},
+    {kOfxColourspaceLinP3d65, Primaries::P3D65, Transfer::Linear, false, false},
+    {kOfxColourspaceACEScg, Primaries::Ap1, Transfer::Linear, false, false},
+    {kOfxColourspaceACES20651, Primaries::Ap0, Transfer::Linear, false, false},
+    {kOfxColourspaceACEScct, Primaries::Ap1, Transfer::AcesCct, false, false},
+    {"scene_linear", Primaries::Ap1, Transfer::Linear, false, false},  // (the config's roles)
+    {"aces_interchange", Primaries::Ap0, Transfer::Linear, false, false},
+    {"color_timing", Primaries::Ap1, Transfer::AcesCct, false, false},
+    {"compositing_log", Primaries::Ap1, Transfer::AcesCct, false, false},
+    // The basic colourspaces: a linear and a log one Montage picks.
+    {kOfxColourspaceOfxSceneLinear, Primaries::Bt709, Transfer::Linear, false, true},
+    {kOfxColourspaceOfxSceneLog, Primaries::Ap1, Transfer::AcesCct, false, true},
+};
+
+const NativeSpace* nativeSpace(const std::string& name) {
+    for (const NativeSpace& n : kNativeSpaces)
+        if (name == n.name) return &n;
+    return nullptr;
+}
+
+bool rawSpace(const std::string& name) {
+    return name == kOfxColourspaceOfxRaw || name == kOfxColourspaceRaw || name == "data";
+}
+
+// Montage's working space by the config's name (the basic display one in the basic style).
+std::string workingSpaceName(const ColorSpace& working, const std::string& style) {
+    if (style == kOfxImageEffectColourManagementBasic) return working.hdr() ? kOfxColourspaceOfxDisplayHdr : kOfxColourspaceOfxDisplaySdr;
+    for (const NativeSpace& n : kNativeSpaces)
+        if (n.display && n.primaries == working.primaries && n.transfer == working.transfer) return n.name;
+    return kOfxColourspaceRec1886Rec709Display;
+}
+
+// A premultiplied picture from one encoding to another: its curve undone, its primaries changed, the other curve
+// applied, with nothing clipped or tone mapped, so a picture taken there and back is as it was.
+void reencode(Image& img, Primaries fromP, Transfer fromT, Primaries toP, Transfer toT) {
+    if (fromP == toP && fromT == toT) return;
+    double m[9];
+    primariesMatrix(fromP, toP, m);
+    parallelRows(img.height, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            float* p = img.row(y);
+            for (int x = 0; x < img.width; ++x, p += 4) {
+                const float a = p[3];
+                if (a <= 0) continue;
+                double c[3];
+                for (int k = 0; k < 3; ++k) c[k] = toLinear(fromT, double(p[k] / a));
+                for (int k = 0; k < 3; ++k) {
+                    const double l = m[k * 3] * c[0] + m[k * 3 + 1] * c[1] + m[k * 3 + 2] * c[2];
+                    p[k] = float(fromLinear(toT, l)) * a;
+                }
+            }
+        }
+    });
+}
+
+// What a render's colour management came to: the colourspace the plugin's pictures are given in and the one its
+// output is in (null: the working space; raw: left as it is).
+struct ColourPlan {
+    const NativeSpace* source = nullptr;
+    const NativeSpace* output = nullptr;
+    bool rawOutput = false;
+};
+
 // ---- The host -------------------------------------------------------------------------------------------------------
 
 PropertySet& hostProps() {
@@ -993,6 +1096,9 @@ PropertySet& hostProps() {
         h->setInt(kOfxParamHostPropMaxPages, {0});
         h->setInt(kOfxParamHostPropPageRowColumnCount, {0, 0});
         h->setPointer(kOfxPropHostOSHandle, nullptr);
+        // Colour management (OpenFX 1.5): the core colourspaces of the native config.
+        h->setString(kOfxImageEffectPropColourManagementStyle, {kOfxImageEffectColourManagementCore});
+        h->setString(kOfxImageEffectPropColourManagementAvailableConfigs, {kNativeConfig});
         return h;
     }();
     return *p;
@@ -1141,6 +1247,7 @@ std::unique_ptr<Loaded> describe(Binary* bin, int index, std::string* error) {
     d.temporal = fp.getInt(kOfxImageEffectPropTemporalClipAccess) != 0;
     const std::vector<std::string> depths = fp.strings(kOfxImageEffectPropSupportedPixelDepths);
     d.floatImages = depths.empty() || std::find(depths.begin(), depths.end(), kOfxBitDepthFloat) != depths.end();
+    d.colour = colourStyleWith(fp);
     l->unsafe = fp.getString(kOfxImageEffectPluginRenderThreadSafety) == kOfxImageEffectRenderUnsafe;
     describeParams(*l->filter, d);
     return l;
@@ -1162,7 +1269,7 @@ QJsonObject toJson(const PluginDesc& d) {
                        {"versionMajor", d.versionMajor}, {"versionMinor", d.versionMinor}, {"label", QString::fromStdString(d.label)},
                        {"group", QString::fromStdString(d.group)}, {"description", QString::fromStdString(d.description)},
                        {"binary", QString::fromStdString(d.binary)}, {"bundle", QString::fromStdString(d.bundle)}, {"index", d.index},
-                       {"temporal", d.temporal}, {"float", d.floatImages}, {"params", params}};
+                       {"temporal", d.temporal}, {"float", d.floatImages}, {"colour", QString::fromStdString(d.colour)}, {"params", params}};
 }
 
 PluginDesc fromJson(const QJsonObject& o) {
@@ -1179,6 +1286,7 @@ PluginDesc fromJson(const QJsonObject& o) {
     d.index = o.value("index").toInt();
     d.temporal = o.value("temporal").toBool();
     d.floatImages = o.value("float").toBool(true);
+    d.colour = o.value("colour").toString().toStdString();
     for (const QJsonValue& v : o.value("params").toArray()) {
         const QJsonObject po = v.toObject();
         ParamDesc p;
@@ -1242,6 +1350,7 @@ std::unique_ptr<Instance> createInstance(Loaded* l, std::string* error) {
     auto inst = std::make_unique<Instance>();
     inst->plugin = l;
     inst->floatImages = l->desc.floatImages;
+    inst->colourStyle = l->desc.colour;
     EffectObj& o = inst->obj;
     o.instance = inst.get();
     o.props = l->filter->props;
@@ -1256,6 +1365,10 @@ std::unique_ptr<Instance> createInstance(Loaded* l, std::string* error) {
     o.props.setDouble(kOfxImageEffectPropFrameRate, {25.0});
     o.props.setInt(kOfxPropIsInteractive, {0});
     o.props.setInt(kOfxImageEffectInstancePropSequentialRender, {0});
+    if (!inst->colourStyle.empty()) {
+        o.props.setString(kOfxImageEffectPropColourManagementStyle, {inst->colourStyle});
+        o.props.setString(kOfxImageEffectPropColourManagementConfig, {kNativeConfig});
+    }
     o.params.props = l->filter->params.props;
     o.params.owner = inst.get();
     for (const auto& p : l->filter->params.params) {
@@ -1538,7 +1651,8 @@ int Registry::scan(std::vector<std::string>* log) {
     std::vector<std::pair<std::string, std::string>> blocked;
     for (const std::string& bin : findBinaries(dirs)) {
         const QFileInfo fi(QString::fromStdString(bin));
-        const QString stamp = QString::number(fi.size()) + ":" + QString::number(fi.lastModified().toMSecsSinceEpoch());
+        // (The last number is the description's version: a description from before colour management is made again.)
+        const QString stamp = QString::number(fi.size()) + ":" + QString::number(fi.lastModified().toMSecsSinceEpoch()) + ":2";
         QJsonObject entry = cache.value(QString::fromStdString(bin)).toObject();
         if (entry.value("stamp").toString() != stamp) {
             // New or changed: described in the probe, out of this process.
@@ -1604,6 +1718,79 @@ bool Registry::find(const std::string& id, PluginDesc& out) const {
 
 bool isOfxType(const std::string& type) { return type.rfind(kTypePrefix, 0) == 0; }
 
+namespace {
+
+// Asks the plugin which colourspace it would like its pictures in (the first it lists that Montage can make) and which
+// its output will be in, and tells it on its clips.
+ColourPlan planColour(Instance& inst, const ColorSpace& working) {
+    ColourPlan plan;
+    const std::string& style = inst.colourStyle;
+    const bool basic = style == kOfxImageEffectColourManagementBasic;
+    const std::string workName = workingSpaceName(working, style);
+    auto basicName = [](const std::string& name) {
+        const NativeSpace* n = nativeSpace(name);
+        return (n && n->basic) || name == kOfxColourspaceOfxDisplaySdr || name == kOfxColourspaceOfxDisplayHdr || name == kOfxColourspaceOfxRaw;
+    };
+    auto isWorking = [&](const std::string& name) {
+        if (basic && !basicName(name)) return false;
+        if (name == workName) return true;
+        if (name == kOfxColourspaceOfxDisplaySdr) return !working.hdr();
+        if (name == kOfxColourspaceOfxDisplayHdr) return working.hdr();
+        const NativeSpace* n = nativeSpace(name);
+        return n && n->primaries == working.primaries && n->transfer == working.transfer;
+    };
+    auto entry = inst.plugin->plugin->mainEntry;
+    const OfxImageEffectHandle h = reinterpret_cast<OfxImageEffectHandle>(&inst.obj);
+    ClipObj* source = inst.obj.clip(kOfxImageEffectSimpleSourceClipName);
+    for (auto& c : inst.obj.clips)
+        if (!source && c->name != kOfxImageEffectOutputClipName) source = c.get();
+    std::string chosen = workName;
+    // (GetClipPreferences's outArgs hold what the host would do anyway.)
+    PropertySet prefs;
+    const char* depth = inst.floatImages ? kOfxBitDepthFloat : kOfxBitDepthByte;
+    for (auto& c : inst.obj.clips) {
+        prefs.setString(("OfxImageClipPropComponents_" + c->name).c_str(), {kOfxImageComponentRGBA});
+        prefs.setString(("OfxImageClipPropDepth_" + c->name).c_str(), {depth});
+        prefs.setDouble(("OfxImageClipPropPAR_" + c->name).c_str(), {1.0});
+    }
+    prefs.setDouble(kOfxImageEffectPropFrameRate, {25.0});
+    prefs.setString(kOfxImageClipPropFieldOrder, {kOfxImageFieldNone});
+    prefs.setString(kOfxImageEffectPropPreMultiplication, {kOfxImagePreMultiplied});
+    prefs.setInt(kOfxImageClipPropContinuousSamples, {0});
+    prefs.setInt(kOfxImageEffectFrameVarying, {0});
+    if (source && ok(entry(kOfxImageEffectActionGetClipPreferences, h, nullptr, handle(&prefs))))
+        for (const std::string& name : prefs.strings(("OfxImageClipPropPreferredColourspaces_" + source->name).c_str())) {
+            if (isWorking(name) || (rawSpace(name) && (!basic || basicName(name)))) {
+                chosen = name;
+                break;
+            }
+            if (const NativeSpace* n = nativeSpace(name); n && (!basic || n->basic)) {
+                chosen = name;
+                plan.source = n;
+                break;
+            }
+        }
+    for (auto& c : inst.obj.clips)  // (not a mask: colour management is off for those)
+        if (c->name != kOfxImageEffectOutputClipName && !c->props.getInt(kOfxImageClipPropIsMask))
+            c->props.setString(kOfxImageClipPropColourspace, {chosen});
+    // Its output: what it says, a clip's colourspace it names, or (by default) its source's.
+    PropertySet in, out;
+    in.setString(kOfxImageClipPropPreferredColourspaces, {workName});
+    std::string made = chosen;
+    if (entry(kOfxImageEffectActionGetOutputColourspace, h, handle(&in), handle(&out)) == kOfxStatOK)
+        made = out.getString(kOfxImageClipPropColourspace, chosen);
+    if (const std::string prefix = "OfxColourspace_"; made.rfind(prefix, 0) == 0) {
+        const ClipObj* named = inst.obj.clip(made.substr(prefix.size()));
+        made = named && named->name != kOfxImageEffectOutputClipName ? chosen : workName;
+    }
+    if (rawSpace(made)) plan.rawOutput = true;
+    else if (!isWorking(made)) plan.output = nativeSpace(made);  // (one Montage cannot read is taken as the working space)
+    if (ClipObj* o = inst.obj.clip(kOfxImageEffectOutputClipName)) o->props.setString(kOfxImageClipPropColourspace, {made});
+    return plan;
+}
+
+}  // namespace
+
 Effect makeEffect(Project& p, const PluginDesc& d) {
     Effect e = montage::makeEffect(p, "ofx");
     e.strings["ofx_id"] = d.id;
@@ -1662,7 +1849,7 @@ std::string effectName(const Effect& e) {
     return it != e.strings.end() && !it->second.empty() ? it->second : "OpenFX Plugin";
 }
 
-bool applyEffect(const Effect& e, double t, Image& img, double scale, const FrameFetch& fetch, std::string* error) {
+bool applyEffect(const Effect& e, double t, Image& img, double scale, const FrameFetch& fetch, std::string* error, const ColorSpace* working) {
     auto fail = [&](const std::string& why) {
         if (error) *error = why;
         return false;
@@ -1705,6 +1892,22 @@ bool applyEffect(const Effect& e, double t, Image& img, double scale, const Fram
     inst->obj.props.setDouble(kOfxImageEffectPropProjectSize, {fullW, fullH});
     inst->obj.props.setDouble(kOfxImageEffectPropProjectExtent, {fullW, fullH});
     announceChanges(*inst, e, t);
+    // Colour management: the pictures in the colourspace the plugin asked for, its output back into the working space.
+    const ColorSpace& space = working ? *working : rec709Space();
+    const ColourPlan plan = inst->colourStyle.empty() ? ColourPlan{} : planColour(*inst, space);
+    Image converted;
+    FrameFetch convertedFetch;
+    if (const NativeSpace* to = plan.source) {
+        converted = img;
+        reencode(converted, space.primaries, space.transfer, to->primaries, to->transfer);
+        inst->source = &converted;
+        convertedFetch = [&fetch, &space, to](double at, Image& other) {
+            if (!fetch || !fetch(at, other)) return false;
+            reencode(other, space.primaries, space.transfer, to->primaries, to->transfer);
+            return true;
+        };
+        inst->fetch = &convertedFetch;
+    }
     auto entry = l->plugin->mainEntry;
     const OfxImageEffectHandle h = reinterpret_cast<OfxImageEffectHandle>(&inst->obj);
     PropertySet seq;
@@ -1731,6 +1934,7 @@ bool applyEffect(const Effect& e, double t, Image& img, double scale, const Fram
     inst->output = nullptr;
     if (!ok(st)) return fail(inst->error.empty() ? d.label + " failed to render" : d.label + ": " + inst->error);
     if (!inst->wrote || out.px.size() != img.px.size()) return fail(d.label + " gave no picture back");
+    if (const NativeSpace* from = plan.output) reencode(out, from->primaries, from->transfer, space.primaries, space.transfer);
     img = std::move(out);
     return true;
 }

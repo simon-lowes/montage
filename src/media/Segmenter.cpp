@@ -164,14 +164,13 @@ std::vector<float> encoderInput(const Frame16& f) {
             for (int x = 0; x < S; ++x) {
                 float rgb[3];
                 if (same) {
-                    const uint16_t* p = &f.px[(size_t(y) * S + size_t(x)) * 4];
-                    for (int c = 0; c < 3; ++c) rgb[c] = p[c] / 65535.f;
+                    for (int c = 0; c < 3; ++c) rgb[c] = f.unit((size_t(y) * S + size_t(x)) * 4 + size_t(c));
                 } else {
                     const double sx = std::clamp((x + 0.5) * f.width / S - 0.5, 0.0, f.width - 1.0);
                     const double sy = std::clamp((y + 0.5) * f.height / S - 0.5, 0.0, f.height - 1.0);
                     const int x0 = int(sx), y0i = int(sy), x1 = std::min(x0 + 1, f.width - 1), y1i = std::min(y0i + 1, f.height - 1);
                     const float fx = float(sx - x0), fy = float(sy - y0i);
-                    auto px = [&](int xx, int yy, int c) { return f.px[(size_t(yy) * size_t(f.width) + size_t(xx)) * 4 + size_t(c)] / 65535.f; };
+                    auto px = [&](int xx, int yy, int c) { return f.unit((size_t(yy) * size_t(f.width) + size_t(xx)) * 4 + size_t(c)); };
                     for (int c = 0; c < 3; ++c) {
                         const float a = px(x0, y0i, c) + (px(x1, y0i, c) - px(x0, y0i, c)) * fx;
                         const float b = px(x0, y1i, c) + (px(x1, y1i, c) - px(x0, y1i, c)) * fx;

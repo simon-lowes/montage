@@ -385,7 +385,7 @@ bool calibrateLens(QWidget* parent, EditorState* state, Id clipId) {
         state->message(QObject::tr("The clip's frame could not be read"));
         return false;
     }
-    src.frame = QImage(reinterpret_cast<const uchar*>(f->px.data()), f->width, f->height, f->width * 8, QImage::Format_RGBA64)
+    src.frame = QImage(reinterpret_cast<const uchar*>(f->px.data()), f->width, f->height, f->width * 8, f->half ? QImage::Format_RGBA16FPx4 : QImage::Format_RGBA64)
                     .convertToFormat(QImage::Format_RGB32);
     src.gray = toGray(*f);
     // Named after the camera when it is known.

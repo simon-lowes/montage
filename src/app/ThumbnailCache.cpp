@@ -48,8 +48,8 @@ QImage ThumbnailCache::get(const QString& path, double seconds, int width, int h
             img = QImage(f->width, f->height, QImage::Format_RGBA8888);
             for (int y = 0; y < f->height; ++y) {
                 uchar* d = img.scanLine(y);
-                const uint16_t* s = f->px.data() + size_t(y) * size_t(f->width) * 4;
-                for (int x = 0; x < f->width * 4; ++x) d[x] = uchar(s[x] >> 8);
+                const size_t row = size_t(y) * size_t(f->width) * 4;
+                for (int x = 0; x < f->width * 4; ++x) d[x] = uchar(f->code(row + size_t(x)) >> 8);
             }
         }
         QMutexLocker l(&m_);

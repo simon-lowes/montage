@@ -60,8 +60,14 @@ bool latinLanguage(const std::string& lang) {
 
 QImage frameImage(const Frame16& f) {
     QImage img(f.width, f.height, QImage::Format_RGBA64);
-    for (int y = 0; y < f.height; ++y)
-        std::memcpy(img.scanLine(y), f.px.data() + size_t(y) * size_t(f.width) * 4, size_t(f.width) * 8);
+    for (int y = 0; y < f.height; ++y) {
+        auto* d = reinterpret_cast<uint16_t*>(img.scanLine(y));
+        const size_t row = size_t(y) * size_t(f.width) * 4;
+        if (f.half)
+            for (size_t i = 0; i < size_t(f.width) * 4; ++i) d[i] = f.code(row + i);
+        else
+            std::memcpy(d, f.px.data() + row, size_t(f.width) * 8);
+    }
     return img;
 }
 

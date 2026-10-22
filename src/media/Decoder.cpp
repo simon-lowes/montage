@@ -17,6 +17,7 @@
 #include "SpatialAudio.h"
 #include "core/Interpretation.h"
 
+#include <QtCore/qfloat16.h>
 #include <algorithm>
 #include <numeric>
 #include <cmath>
@@ -51,16 +52,16 @@ namespace montage {
 
 namespace {
 
-// OpenEXR read with the OpenEXR library rather than FFmpeg: a layer asked for, or a compression FFmpeg's reader lacks.
-bool exrByLibrary(const std::string& file, const Interpretation& in, ImageSequence* seq) {
+// OpenEXR read with the OpenEXR library rather than FFmpeg whenever it is built in: its values are kept as they are
+// (FFmpeg's scaler clips them to 0..1), any layer can be shown, and every compression is read.
+bool exrByLibrary(const std::string& file, const Interpretation&, ImageSequence* seq) {
     if (!exrAvailable()) return false;
     ImageSequence s;
     const bool sequence = parseImageSequencePath(file, s);
     if (!isExrPath(sequence ? s.pattern : file)) return false;
     if (seq) *seq = s;
-    if (!in.layer.empty()) return true;
     ExrInfo info;
-    return readExrInfo(sequence ? imageSequenceFrame(s, s.first) : file, info) && exrNeedsLibrary(info.compression);
+    return readExrInfo(sequence ? imageSequenceFrame(s, s.first) : file, info);
 }
 
 // Keep FFmpeg quiet unless something is actually wrong.
@@ -811,6 +812,7 @@ void VideoDecoder::close() {
     av_frame_free(&woven_);
     wovenIndex_ = -1;
     exrFile_.clear();
+    exrRgba_.clear();
     rawFrame_ = -1;
     proResRaw_ = false;
     viewId_ = -1;
@@ -1260,6 +1262,25 @@ void setFieldDominance(AVFrame* f, int dominance) {
 void interpretAlpha(Frame16& f, const std::string& mode) {
     const bool ignore = mode == "ignore", invert = mode == "invert", premultiplied = mode == "premultiplied";
     if (!ignore && !invert && !premultiplied) return;
+    if (f.half) {  // (half floats: one is 0x3c00)
+        parallelRows(f.height, [&](int y0, int y1) {
+            std::vector<float> row(size_t(f.width) * 4);
+            for (int y = y0; y < y1; ++y) {
+                auto* p = reinterpret_cast<qfloat16*>(f.px.data() + size_t(y) * size_t(f.width) * 4);
+                qFloatFromFloat16(row.data(), p, qsizetype(row.size()));
+                for (float* q = row.data(); q < row.data() + row.size(); q += 4) {
+                    const float a = std::clamp(q[3] == q[3] ? q[3] : 0.0f, 0.0f, 1.0f);
+                    if (ignore) q[3] = 1;
+                    else if (invert) q[3] = 1 - a;
+                    else if (a == 0) q[0] = q[1] = q[2] = 0;
+                    else if (a < 1)
+                        for (int c = 0; c < 3; ++c) q[c] = std::clamp(q[c] / a, -65504.0f, 65504.0f);  // (half's range)
+                }
+                qFloatToFloat16(p, row.data(), qsizetype(row.size()));
+            }
+        });
+        return;
+    }
     parallelRows(f.height, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
             uint16_t* p = f.px.data() + size_t(y) * size_t(f.width) * 4;
@@ -1329,6 +1350,39 @@ bool bilinearRgba64Sound() {
     return sound;
 }
 
+// A floating-point picture (FFmpeg's OpenEXR, PFM or float TIFF reader) as straight float RGBA, its values as they are:
+// FFmpeg's scaler would clip them to 0..1. False for any other format.
+bool floatRgba(const AVFrame* f, std::vector<float>& rgba) {
+    const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(AVPixelFormat(f->format));
+    if (!d || !(d->flags & AV_PIX_FMT_FLAG_FLOAT) || (d->flags & AV_PIX_FMT_FLAG_HWACCEL) || f->width <= 0 || f->height <= 0) return false;
+    const bool rgb = d->flags & AV_PIX_FMT_FLAG_RGB;
+    const int n = d->nb_components;
+    if (rgb ? n < 3 : n > 2) return false;  // (no float YUV)
+    for (int c = 0; c < n; ++c)
+        if (d->comp[c].depth != 16 && d->comp[c].depth != 32) return false;
+    const int w = f->width;
+    rgba.assign(size_t(w) * size_t(f->height) * 4, 1.0f);
+    parallelRows(f->height, [&](int y0, int y1) {
+        std::vector<uint32_t> line(static_cast<size_t>(w));
+        for (int y = y0; y < y1; ++y) {
+            float* o = &rgba[size_t(y) * size_t(w) * 4];
+            for (int c = 0; c < n; ++c) {
+                av_read_image_line2(line.data(), const_cast<const uint8_t**>(f->data), f->linesize, d, 0, y, c, w, 0, 4);
+                // Grey fills red, green and blue; its second component is alpha.
+                const int to = rgb ? c : c == 0 ? 0 : 3;
+                for (int x = 0; x < w; ++x) {
+                    float v;
+                    if (d->comp[c].depth == 32) std::memcpy(&v, &line[size_t(x)], 4);
+                    else v = halfToFloat(uint16_t(line[size_t(x)]));
+                    o[size_t(x) * 4 + size_t(to)] = v;
+                    if (!rgb && c == 0) o[size_t(x) * 4 + 1] = o[size_t(x) * 4 + 2] = v;
+                }
+            }
+        }
+    });
+    return true;
+}
+
 }  // namespace
 
 bool deinterlaceFrame(AVFrame* f) {
@@ -1395,6 +1449,21 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
     if (h <= 0) h = dispH_;
     int sw = (rotation_ % 180) ? h : w;
     int sh = (rotation_ % 180) ? w : h;
+    std::vector<float> rgba;
+    std::shared_ptr<Frame16> out = floatRgba(f, rgba) ? halfFrame(rgba.data(), f->width, f->height, sw, sh, pts) : convertFixed(f, pts, sw, sh, hq);
+    if (!out) return nullptr;
+    if (!alpha_.empty()) interpretAlpha(*out, alpha_);
+    out->pts = pts / timeScale_;
+    if (rotation_) {
+        auto rotated = std::make_shared<Frame16>(rotateFrame(*out, rotation_));
+        rotated->pts = out->pts;
+        return rotated;
+    }
+    return out;
+}
+
+// The picture `f` scaled to `sw` x `sh` 16-bit RGBA by FFmpeg's scaler.
+std::shared_ptr<Frame16> VideoDecoder::convertFixed(const AVFrame* f, double pts, int sw, int sh, bool hq) {
     bool fullRange = f->color_range == AVCOL_RANGE_JPEG;
     AVPixelFormat srcFmt = dejpeg(AVPixelFormat(f->format), fullRange);
     const int flags = hq ? (SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT) : bilinearRgba64Sound() ? SWS_BILINEAR : SWS_BICUBIC;
@@ -1464,13 +1533,6 @@ Frame16Ptr VideoDecoder::convert(const AVFrame* in, double pts, int w, int h, bo
         av_frame_free(&dstFrame);
     }
     if (!converted) sws_scale(sws_, f->data, f->linesize, 0, f->height, dst, dstStride);
-    if (!alpha_.empty()) interpretAlpha(*out, alpha_);
-    out->pts = pts / timeScale_;
-    if (rotation_) {
-        auto rotated = std::make_shared<Frame16>(rotateFrame(*out, rotation_));
-        rotated->pts = out->pts;
-        return rotated;
-    }
     return out;
 }
 
@@ -1569,34 +1631,37 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
         return stillFrame_;
     }
     if (exr_) {
-        // The frame shown at `t`, read once and kept while it is asked for again; as FFmpeg's reader gives it (the values
-        // as stored, alpha premultiplied as OpenEXR keeps it), clamped to the 16 bits frames are kept in.
+        // The frame shown at `t`, read once and kept while it is asked for again. Its values are kept as they are, past
+        // 0..1 too, as half floats (straight alpha: OpenEXR keeps colour premultiplied).
         const ImageSequence& seq = *exr_;
         const int n = seq.first + std::clamp(int(std::floor(std::max(0.0, t) * fps_ + 1e-6)), 0, seq.frames() - 1);
         if (targetW <= 0) targetW = dispW_;
         if (targetH <= 0) targetH = dispH_;
-        if (n != rawFrame_ || !raw_) {
-            int w = 0, h = 0;
-            std::vector<float> rgba;
+        if (n != rawFrame_ || exrRgba_.empty()) {
             std::string err;
-            if (!readExrLayer(exrFile_.empty() ? imageSequenceFrame(seq, n) : exrFile_, exrLayer_, w, h, rgba, &err) ||
-                !rawFrame(w, h, &err, AV_PIX_FMT_RGBA64))
+            exrRgba_.clear();
+            if (!readExrLayer(exrFile_.empty() ? imageSequenceFrame(seq, n) : exrFile_, exrLayer_, exrW_, exrH_, exrRgba_, &err) ||
+                exrRgba_.size() != size_t(exrW_) * size_t(exrH_) * 4) {
+                exrRgba_.clear();
                 return nullptr;
-            parallelRows(h, [&](int y0, int y1) {
-                for (int y = y0; y < y1; ++y) {
-                    auto* o = reinterpret_cast<uint16_t*>(raw_->data[0] + size_t(y) * size_t(raw_->linesize[0]));
-                    const float* q = &rgba[size_t(y) * size_t(w) * 4];
-                    for (int i = 0; i < w * 4; ++i) {
-                        const float v = q[i];
-                        o[i] = uint16_t(std::lround(std::clamp(v == v ? v : 0.0f, 0.0f, 1.0f) * 65535.0f));
+            }
+            // (Unless Interpret Footage says its colour is straight already, or its alpha is to be ignored.)
+            if (alpha_.empty() || alpha_ == "premultiplied")
+                parallelRows(exrH_, [&](int y0, int y1) {
+                    for (int y = y0; y < y1; ++y) {
+                        float* q = &exrRgba_[size_t(y) * size_t(exrW_) * 4];
+                        for (int x = 0; x < exrW_; ++x, q += 4)
+                            if (q[3] > 0 && q[3] != 1) q[0] /= q[3], q[1] /= q[3], q[2] /= q[3];
                     }
-                }
-            });
+                });
             rawFrame_ = n;
             stillFrame_.reset();
         }
-        if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH)
-            stillFrame_ = convert(raw_, double(n - seq.first) / fps_, targetW, targetH, true);
+        if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH) {
+            auto made = halfFrame(exrRgba_.data(), exrW_, exrH_, targetW, targetH, double(n - seq.first) / fps_ / timeScale_);
+            if (alpha_ == "ignore" || alpha_ == "invert") interpretAlpha(*made, alpha_);
+            stillFrame_ = made;
+        }
         curPts_ = double(n - seq.first) / fps_;
         return stillFrame_;
     }
@@ -1782,6 +1847,7 @@ Frame16 rotateFrame(const Frame16& f, int degrees) {
     out.width = swap ? f.height : f.width;
     out.height = swap ? f.width : f.height;
     out.pts = f.pts;
+    out.half = f.half;
     out.px.resize(f.px.size());
     for (int y = 0; y < f.height; ++y)
         for (int x = 0; x < f.width; ++x) {

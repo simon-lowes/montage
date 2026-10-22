@@ -54,7 +54,7 @@ void sample(const Frame16& f, double x, double y, float rgb[3]) {
     y = std::clamp(y, 0.0, double(f.height - 1));
     const int x0 = int(x), y0 = int(y), x1 = std::min(x0 + 1, f.width - 1), y1 = std::min(y0 + 1, f.height - 1);
     const double fx = x - x0, fy = y - y0;
-    auto at = [&](int xx, int yy, int c) { return double(f.px[(size_t(yy) * size_t(f.width) + size_t(xx)) * 4 + size_t(c)]); };
+    auto at = [&](int xx, int yy, int c) { return double(f.code((size_t(yy) * size_t(f.width) + size_t(xx)) * 4 + size_t(c))); };
     for (int c = 0; c < 3; ++c) {
         const double top = at(x0, y0, c) + (at(x1, y0, c) - at(x0, y0, c)) * fx;
         const double bottom = at(x0, y1, c) + (at(x1, y1, c) - at(x0, y1, c)) * fx;

@@ -24783,6 +24783,79 @@ private slots:
         QVERIFY(!syncMotionData(d, cm, wrong, &err));
     }
 
+    void floatPicturesKeepTheirRange() {
+        if (!exrAvailable()) QSKIP("Built without OpenEXR");
+        // A half-float OpenEXR frame: 16.0 (four stops over white) on the left, 0.25 on the right.
+        const int W = 16, H = 8;
+        std::vector<ExrOutLayer> layers(1);
+        layers[0].channels = {"R", "G", "B", "A"};
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                for (float v : {x < W / 2 ? 16.0f : 0.25f, x < W / 2 ? 16.0f : 0.25f, x < W / 2 ? 16.0f : 0.25f, 1.0f}) layers[0].data.push_back(v);
+        std::string err;
+        QVERIFY2(writeExr(path("bright.exr"), W, H, layers, "zip", {}, &err), err.c_str());
+        // Decoded as it is: half floats, nothing clipped.
+        {
+            VideoDecoder dec;
+            QVERIFY2(dec.open(path("bright.exr"), &err), err.c_str());
+            const Frame16Ptr fr = dec.frameAt(0);
+            QVERIFY(fr && fr->half);
+            const Image img = toImage(*fr);
+            QCOMPARE(img.at(2, 2)[0], 16.0f);
+            QCOMPARE(img.at(W - 2, 2)[1], 0.25f);
+            QCOMPARE(fr->unit(0), 1.0f);  // (as analysis sees it)
+        }
+        // In a sequence: four stops down, the highlight reads white rather than a sixteenth of it; Curves left as they
+        // are leave it at 16.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = Rational{25, 1};
+        MediaItem m = probeOrFail(p, path("bright.exr"));
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& c = s.videoTracks[0].clips.at(0);
+        RenderOptions o;
+        c.effects.push_back(makeEffect(p, "curves"));
+        QVERIFY2(std::fabs(renderSequenceFrame(p, s, 0, o).at(2, 2)[0] - 16.0f) < 0.01f, qPrintable(QString::number(renderSequenceFrame(p, s, 0, o).at(2, 2)[0])));
+        Effect down = makeEffect(p, "color_correct");
+        down.params["exposure"] = Param(-4.0);
+        c.effects.push_back(down);
+        const Image shown = renderSequenceFrame(p, s, 0, o);
+        QVERIFY2(std::fabs(shown.at(2, 2)[0] - 1.0f) < 0.01f && std::fabs(shown.at(W - 2, 2)[0] - 0.25f / 16) < 0.002f,
+                 qPrintable(QString("%1 %2").arg(shown.at(2, 2)[0]).arg(shown.at(W - 2, 2)[0])));
+        // Exported to OpenEXR one stop down, in the sequence's own space: 8.0 kept.
+        c.effects.back().params["exposure"] = Param(-1.0);
+        ExportSettings st;
+        st.path = path("bright-out.%04d.exr");
+        st.videoCodec = "exr";
+        st.audioCodec = "none";
+        st.exrCompression = "zip";
+        st.colorSpace = "rec709";
+        st.in = 0, st.out = 1;
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        int w = 0, h = 0;
+        std::vector<float> rgba;
+        QVERIFY2(readExrLayer(path("bright-out.0000.exr"), "", w, h, rgba, &err), err.c_str());
+        QVERIFY2(w == W && std::fabs(rgba[(2 * size_t(W) + 2) * 4] - 8.0f) < 0.01f, qPrintable(QString::number(rgba[(2 * size_t(W) + 2) * 4])));
+        // A floating-point picture FFmpeg reads (a PFM, its rows bottom first): kept as it is too.
+        {
+            QFile pfm(QString::fromStdString(path("bright.pfm")));
+            QVERIFY(pfm.open(QIODevice::WriteOnly));
+            pfm.write("PF\n4 2\n-1.0\n");
+            for (int y = 0; y < 2; ++y)
+                for (int x = 0; x < 4; ++x)
+                    for (float v : {6.0f, 0.5f, -0.25f}) pfm.write(reinterpret_cast<const char*>(&v), 4);
+            pfm.close();
+            VideoDecoder dec;
+            QVERIFY2(dec.open(path("bright.pfm"), &err), err.c_str());
+            const Frame16Ptr fr = dec.frameAt(0);
+            QVERIFY(fr && fr->half);
+            const Image img = toImage(*fr);
+            QVERIFY2(img.at(1, 1)[0] == 6.0f && img.at(1, 1)[1] == 0.5f && img.at(1, 1)[2] == -0.25f,
+                     qPrintable(QString("%1 %2 %3").arg(img.at(1, 1)[0]).arg(img.at(1, 1)[1]).arg(img.at(1, 1)[2])));
+        }
+    }
+
     void multiLayerOpenExr() {
         if (!exrAvailable()) QSKIP("Built without OpenEXR");
         // A render of 12 frames in HTJ2K: the beauty, a diffuse layer (red on the left, green on the right), depth (a

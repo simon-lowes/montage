@@ -2,7 +2,11 @@
 
 #include "core/Expression.h"
 
+#include <QtCore/qfloat16.h>
+
 #include <algorithm>
+#include <cmath>
+#include <tuple>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -38,6 +42,21 @@ void Image::fill(float r, float g, float b, float a) {
 
 Image toImage(const Frame16& f) {
     Image img(f.width, f.height, Image::Uninitialized{});
+    if (f.half) {
+        // Half floats as they are (values past 0..1 kept); alpha clamped to 0..1 before premultiplying.
+        parallelRows(f.height, [&](int y0, int y1) {
+            for (int y = y0; y < y1; ++y) {
+                float* d = img.row(y);
+                qFloatFromFloat16(d, reinterpret_cast<const qfloat16*>(f.px.data() + size_t(y) * size_t(f.width) * 4), qsizetype(f.width) * 4);
+                for (int x = 0; x < f.width; ++x, d += 4) {
+                    float a = d[3] == d[3] ? std::clamp(d[3], 0.0f, 1.0f) : 0.0f;
+                    for (int c = 0; c < 3; ++c) d[c] = std::isfinite(d[c]) ? d[c] * a : 0.0f;
+                    d[3] = a;
+                }
+            }
+        });
+        return img;
+    }
     const float k = 1.0f / 65535.0f;
     parallelRows(f.height, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
@@ -53,6 +72,58 @@ Image toImage(const Frame16& f) {
         }
     });
     return img;
+}
+
+std::shared_ptr<Frame16> halfFrame(const float* rgba, int srcW, int srcH, int w, int h, double pts) {
+    auto out = std::make_shared<Frame16>();
+    if (w <= 0) w = srcW;
+    if (h <= 0) h = srcH;
+    out->width = w, out->height = h, out->pts = pts, out->half = true;
+    out->px.resize(size_t(w) * size_t(h) * 4);
+    if (srcW <= 0 || srcH <= 0) return out;
+    // Each output pixel from the source: the average of the source pixels it covers when smaller (weighted by
+    // coverage, colour weighted by alpha so edges keep their colour), bilinear when larger.
+    const double sx = double(srcW) / w, sy = double(srcH) / h;
+    parallelRows(h, [&](int y0, int y1) {
+        std::vector<float> row(size_t(w) * 4);
+        for (int y = y0; y < y1; ++y) {
+            for (int x = 0; x < w; ++x) {
+                float* d = &row[size_t(x) * 4];
+                double acc[4] = {0, 0, 0, 0}, wsum = 0;
+                if (sx > 1 || sy > 1) {
+                    const double fx0 = x * sx, fx1 = (x + 1) * sx, fy0 = y * sy, fy1 = (y + 1) * sy;
+                    for (int j = int(fy0); j < std::min(srcH, int(std::ceil(fy1))); ++j) {
+                        const double wy = std::min(fy1, j + 1.0) - std::max(fy0, double(j));
+                        for (int i = int(fx0); i < std::min(srcW, int(std::ceil(fx1))); ++i) {
+                            const double wt = wy * (std::min(fx1, i + 1.0) - std::max(fx0, double(i)));
+                            const float* p = rgba + (size_t(j) * size_t(srcW) + size_t(i)) * 4;
+                            const double a = std::isfinite(p[3]) ? std::clamp(double(p[3]), 0.0, 1.0) : 0.0;
+                            for (int c = 0; c < 3; ++c) acc[c] += std::isfinite(p[c]) ? wt * a * p[c] : 0.0;
+                            acc[3] += wt * a;
+                            wsum += wt;
+                        }
+                    }
+                } else {
+                    const double fx = std::clamp((x + 0.5) * sx - 0.5, 0.0, srcW - 1.0), fy = std::clamp((y + 0.5) * sy - 0.5, 0.0, srcH - 1.0);
+                    const int x0 = int(fx), y0i = int(fy), x1 = std::min(srcW - 1, x0 + 1), y1i = std::min(srcH - 1, y0i + 1);
+                    const double tx = fx - x0, ty = fy - y0i;
+                    for (const auto& [i, j, wt] : {std::tuple{x0, y0i, (1 - tx) * (1 - ty)}, std::tuple{x1, y0i, tx * (1 - ty)},
+                                                   std::tuple{x0, y1i, (1 - tx) * ty}, std::tuple{x1, y1i, tx * ty}}) {
+                        const float* p = rgba + (size_t(j) * size_t(srcW) + size_t(i)) * 4;
+                        const double a = std::isfinite(p[3]) ? std::clamp(double(p[3]), 0.0, 1.0) : 0.0;
+                        for (int c = 0; c < 3; ++c) acc[c] += std::isfinite(p[c]) ? wt * a * p[c] : 0.0;
+                        acc[3] += wt * a;
+                        wsum += wt;
+                    }
+                }
+                const double a = wsum > 0 ? acc[3] / wsum : 0;
+                for (int c = 0; c < 3; ++c) d[c] = acc[3] > 0 ? float(std::clamp(acc[c] / acc[3], -65504.0, 65504.0)) : 0.0f;  // (half's range)
+                d[3] = float(a);
+            }
+            qFloatToFloat16(reinterpret_cast<qfloat16*>(out->px.data() + size_t(y) * size_t(w) * 4), row.data(), qsizetype(w) * 4);
+        }
+    });
+    return out;
 }
 
 void toRgba8(const Image& img, uint8_t* dst, size_t stride) {

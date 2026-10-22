@@ -19,6 +19,7 @@
 #include "core/Effects.h"
 #include "core/ProjectIO.h"
 #include "media/Decoder.h"
+#include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/Ofx.h"
 #include "media/ImageSequence.h"
@@ -289,13 +290,13 @@ private slots:
     void hostsOpenFxVideoPlugins() {
         const std::string good = MONTAGE_TEST_OFX_DIR "/good", crash = MONTAGE_TEST_OFX_DIR "/crash";
         QCOMPARE(ofx::findBinaries({good, crash}).size(), size_t(2));
-        // Scanned in the probe: the good bundle's three filters described, the one that crashes blocklisted.
+        // Scanned in the probe: the good bundle's four filters described, the one that crashes blocklisted.
         ofx::Registry& reg = ofx::Registry::instance();
         reg.setCachePath(path("ofx-cache.json").toStdString());
         reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
         reg.setSearchPaths({good, crash});
         std::vector<std::string> log;
-        QCOMPARE(reg.scan(&log), 3);
+        QCOMPARE(reg.scan(&log), 4);
         QCOMPARE(reg.blocked().size(), size_t(1));
         // (A crash on Linux and macOS; on Windows the test plugin ends its process without the crash dialog.)
         QVERIFY2(reg.blocked()[0].first.find("MontageTestOfxCrash") != std::string::npos &&
@@ -304,7 +305,7 @@ private slots:
         QCOMPARE(log.size(), size_t(2));
         // Unchanged files come from the cache, without the probe.
         log.clear();
-        QCOMPARE(reg.scan(&log), 3);
+        QCOMPARE(reg.scan(&log), 4);
         QVERIFY(std::all_of(log.begin(), log.end(), [](const std::string& l) { return l.rfind("cached", 0) == 0; }));
         QCOMPARE(ofx::instancesCreated(), 0);  // nothing loaded in this process yet
         ofx::PluginDesc invert, temporal;
@@ -496,6 +497,27 @@ private slots:
             }
             QVERIFY(ofx::instancesCreated() >= made + 20);
             QVERIFY2(ofx::instancesAlive() <= 16, qPrintable(QString::number(ofx::instancesAlive())));
+        }
+        // OpenFX 1.5 colour management: a plugin asking for ACEScg is given its picture there (the working space's
+        // curve undone and its primaries changed, nothing clipped: a grey of 4.0 in Rec.709 is 4^2.4 in linear light),
+        // told so, and its output, in its source's colourspace, comes back into the working space as it was.
+        {
+            ofx::PluginDesc colour;
+            QVERIFY(reg.find("org.montage.test.colour/1", colour));
+            QCOMPARE(colour.colour, std::string("OfxImageEffectColourManagementCore"));
+            QVERIFY(invert.colour.empty());
+            Effect fx = ofx::makeEffect(p, colour);
+            Image bright(4, 4);
+            bright.fill(4.0f, 4.0f, 4.0f, 1.0f);
+            QVERIFY2(ofx::applyEffect(fx, 0, bright, 1.0, {}, &err, findColorSpace("rec709")), err.c_str());
+            QVERIFY2(std::fabs(bright.at(1, 1)[0] - std::pow(4.0f, 2.4f)) < 0.02f && bright.at(1, 1)[1] == 1.0f && bright.at(1, 1)[2] == 1.0f,
+                     qPrintable(QString("%1 %2 %3").arg(bright.at(1, 1)[0]).arg(bright.at(1, 1)[1]).arg(bright.at(1, 1)[2])));
+            fx.params["param.mode"] = Param(1.0);
+            bright.fill(4.0f, 0.5f, 0.25f, 1.0f);
+            QVERIFY2(ofx::applyEffect(fx, 0, bright, 1.0, {}, &err, findColorSpace("rec709")), err.c_str());
+            QVERIFY2(std::fabs(bright.at(1, 1)[0] - 4.0f) < 1e-3f && std::fabs(bright.at(1, 1)[1] - 0.5f) < 1e-4f &&
+                         std::fabs(bright.at(1, 1)[2] - 0.25f) < 1e-4f,
+                     qPrintable(QString("%1 %2 %3").arg(bright.at(1, 1)[0]).arg(bright.at(1, 1)[1]).arg(bright.at(1, 1)[2])));
         }
         // A missing plugin leaves the picture as it was and says why.
         Effect gone = e;

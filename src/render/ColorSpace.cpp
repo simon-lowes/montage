@@ -485,15 +485,24 @@ std::shared_ptr<const Lut3D> conversionLut(const ColorSpace& from, const ColorSp
 void convertColor(Image& img, const ColorSpace& from, const ColorSpace& to, double hdrPeakNits) {
     if (img.empty() || from.id == to.id) return;
     const std::shared_ptr<const Lut3D> lut = conversionLut(from, to, hdrPeakNits);
+    double mat[9];
+    primariesMatrix(from.primaries, to.primaries, mat);
     parallelRows(img.height, [&](int y0, int y1) {
         for (int y = y0; y < y1; ++y) {
             float* p = img.row(y);
             for (int x = 0; x < img.width; ++x, p += 4) {
                 const float a = p[3];
                 if (a <= 0) continue;
-                float r = std::clamp(p[0] / a, 0.0f, 1.0f), g = std::clamp(p[1] / a, 0.0f, 1.0f), b = std::clamp(p[2] / a, 0.0f, 1.0f);
-                lut->apply(r, g, b);
-                p[0] = r * a, p[1] = g * a, p[2] = b * a;
+                float c[3] = {p[0] / a, p[1] / a, p[2] / a};
+                if (c[0] >= 0 && c[0] <= 1 && c[1] >= 0 && c[1] <= 1 && c[2] >= 0 && c[2] <= 1) {
+                    lut->apply(c[0], c[1], c[2]);
+                } else {
+                    // Past the table (a floating-point source's highlights, or colours outside its gamut): worked out
+                    // exactly rather than clipped to it.
+                    for (float& v : c) v = std::isfinite(v) ? v : 0.0f;
+                    convertPixelWith(c, from, to, hdrPeakNits, mat);
+                }
+                p[0] = c[0] * a, p[1] = c[1] * a, p[2] = c[2] * a;
             }
         }
     });

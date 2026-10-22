@@ -32,7 +32,7 @@ Signature signatureOf(const Frame16& f) {
     s.luma.resize(size_t(f.width) * size_t(f.height));
     const float k = 1.0f / 65535.0f;
     for (int i = 0; i < f.width * f.height; ++i) {
-        float r = f.px[size_t(i) * 4] * k, g = f.px[size_t(i) * 4 + 1] * k, b = f.px[size_t(i) * 4 + 2] * k;
+        float r = f.code(size_t(i) * 4) * k, g = f.code(size_t(i) * 4 + 1) * k, b = f.code(size_t(i) * 4 + 2) * k;
         float y = 0.2126f * r + 0.7152f * g + 0.0722f * b;
         float cb = (b - y) / 1.8556f + 0.5f, cr = (r - y) / 1.5748f + 0.5f;
         s.luma[size_t(i)] = y;

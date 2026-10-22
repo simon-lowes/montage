@@ -1,7 +1,9 @@
 // Montage — image buffers used by the renderer.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <utility>
@@ -51,17 +53,48 @@ struct Image {
     void fill(float r, float g, float b, float a);
 };
 
-// 16-bit RGBA straight alpha, as produced by the decoder (cache-friendly).
+// An IEEE half float's value (one that is not a number reads 0).
+inline float halfToFloat(uint16_t h) {
+    const uint32_t sign = uint32_t(h & 0x8000) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ff;
+    uint32_t bits;
+    if (e == 0) {
+        if (m == 0) {
+            bits = sign;
+        } else {  // subnormal: 2^-14 * m/1024
+            const float v = float(m) * (1.0f / 16777216.0f);
+            return sign ? -v : v;
+        }
+    } else if (e == 31) {
+        if (m) return 0.0f;
+        bits = sign | 0x7f800000u;
+    } else {
+        bits = sign | ((e + 112) << 23) | (m << 13);
+    }
+    float f;
+    std::memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
+// 16-bit RGBA straight alpha, as produced by the decoder (cache-friendly): code values 0..65535 for 0..1, or, for a
+// floating-point source (OpenEXR, float DPX/TIFF), half floats kept as they are, values past 0..1 included.
 struct Frame16 {
     int width = 0;
     int height = 0;
     double pts = 0;  // seconds
+    bool half = false;         // px holds IEEE half floats rather than 0..65535
     PixelVector<uint16_t> px;  // written in full by the decoder
     size_t bytes() const { return px.size() * sizeof(uint16_t); }
+    // Sample i as 0..1 (a half float's value clamped there): for analysis that works on the visible range.
+    float unit(size_t i) const { return half ? std::min(1.0f, std::max(0.0f, halfToFloat(px[i]))) : float(px[i]) * (1.0f / 65535.0f); }
+    // The same as a 16-bit code value.
+    uint16_t code(size_t i) const { return half ? uint16_t(unit(i) * 65535.0f + 0.5f) : px[i]; }
 };
 using Frame16Ptr = std::shared_ptr<const Frame16>;
 
 Image toImage(const Frame16& f);
+// Float RGBA (straight alpha, values unclamped) into a half-float Frame16, scaled to `w` x `h` (an area average when
+// smaller, bilinear when larger) when that differs.
+std::shared_ptr<Frame16> halfFrame(const float* rgba, int srcW, int srcH, int w, int h, double pts);
 // Converts to 8-bit RGBA (straight alpha) e.g. for display / PNG export.
 std::vector<uint8_t> toRgba8(const Image& img);
 // The same into caller memory (e.g. a QImage's bits), `stride` bytes per row.
