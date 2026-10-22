@@ -3,6 +3,7 @@
 #include "PatchGenerator.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
+#include "render/FilmLists.h"
 #include "render/DcpSecurity.h"
 #include "render/OGraf.h"
 #include "render/Ofx.h"
@@ -1165,6 +1166,34 @@ void MainWindow::buildMenus() {
         ->setObjectName(QStringLiteral("exportAafSound"));
     add(file, tr("Export AAF with Media (Media Composer)…"), QKeySequence(), [this] { exportAafWithMediaDialog(); })
         ->setObjectName(QStringLiteral("exportAafAvid"));
+    add(file, tr("Export Film &Lists…"), QKeySequence(), [this] {
+        // Cut, optical, dupe and pull lists, and (from an earlier version picked here) the change list.
+        const Sequence* now = state_->sequence();
+        if (!now) return;
+        QStringList names{tr("(no change list)")};
+        std::vector<Id> ids{0};
+        for (const Sequence& sq : state_->project().sequences)
+            if (sq.id != now->id && !sq.multicam) {
+                QString name = QString::fromStdString(sq.name);
+                for (int n = 2; names.contains(name); ++n) name = QStringLiteral("%1 (%2)").arg(QString::fromStdString(sq.name)).arg(n);
+                names << name;
+                ids.push_back(sq.id);
+            }
+        bool ok = true;
+        const QString pick = ids.size() < 2 ? names[0]
+                                            : QInputDialog::getItem(this, tr("Export Film Lists"),
+                                                                    tr("Change list from an earlier version of %1:").arg(QString::fromStdString(now->name)),
+                                                                    names, 0, false, &ok);
+        if (!ok) return;
+        QString filter;
+        QString path = QFileDialog::getSaveFileName(this, tr("Export Film Lists"), QString::fromStdString(now->name),
+                                                    tr("Text (*.txt);;CSV (*.csv);;PDF (*.pdf)"), &filter);
+        if (path.isEmpty()) return;
+        const QString ext = filter.contains(QLatin1String("csv")) ? QStringLiteral("csv") : filter.contains(QLatin1String("pdf")) ? QStringLiteral("pdf") : QStringLiteral("txt");
+        const QString suffix = QFileInfo(path).suffix().toLower();
+        if (suffix != QLatin1String("txt") && suffix != QLatin1String("csv") && suffix != QLatin1String("pdf")) path += QLatin1Char('.') + ext;
+        exportFilmLists(path, ids[size_t(std::max<qsizetype>(0, names.indexOf(pick)))]);
+    })->setObjectName(QStringLiteral("exportFilmLists"));
     file->addSeparator();
     add(file, tr("&Quit"), QKeySequence::Quit, [this] { close(); });
 
@@ -2320,6 +2349,29 @@ void MainWindow::buildMenus() {
             group->addAction(a);
         }
     }
+    // What the timecode readouts count in (EditorState.h counterDisplay).
+    QMenu* counterM = play->addMenu(tr("Counter"));
+    counterM->setObjectName(QStringLiteral("counterMenu"));
+    counterM->setToolTip(tr("Timecode, or feet and frames in the sequence's film gauge (Sequence Settings)"));
+    {
+        auto* group = new QActionGroup(counterM);
+        const std::pair<Counter, QString> counters[] = {
+            {Counter::Timecode, tr("Timecode")},
+            {Counter::Feet, tr("Feet and Frames")},
+            {Counter::FeetFromPicture, tr("Feet and Frames from the First Picture")},
+        };
+        const char* names[] = {"counterTimecode", "counterFeet", "counterFeetFromPicture"};
+        for (const auto& [counter, label] : counters) {
+            QAction* a = counterM->addAction(label, this, [this, counter = counter] {
+                setCounterDisplay(counter);
+                emit state_->projectChanged();
+            });
+            a->setObjectName(QLatin1String(names[int(counter)]));
+            a->setCheckable(true);
+            a->setChecked(counter == counterDisplay());
+            group->addAction(a);
+        }
+    }
     play->addSeparator();
     add(play, tr("&Play / Pause"), QKeySequence(Qt::Key_Space), [this] { activeController()->togglePlay(); });
     // In Trim mode J, K and L trim the selected edit as it plays (dynamic trimming).
@@ -2687,6 +2739,7 @@ void MainWindow::rebuildSourceProject() {
     int h = m->hasVideo && m->height > 0 ? m->height : main->height;
     Sequence ss = makeSequence(tmp, "Source", w, h, main->fps, 1, 1);
     ss.sampleRate = main->sampleRate;
+    ss.filmGauge = main->filmGauge;  // (its readouts count as the sequence's)
     edit::placeMedia(tmp, ss, m->id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
     sourceSequence_ = ss.id;
     tmp.sequences.push_back(ss);
@@ -4065,6 +4118,29 @@ int MainWindow::importAle(const QString& path, bool cdlToClips) {
     if (!result.unmatched.empty()) msg += tr("; not found: %1").arg(QString::fromStdString(result.unmatched.front())) + (result.unmatched.size() > 1 ? tr(" and %n more", nullptr, int(result.unmatched.size() - 1)) : QString());
     state_->message(msg, 8000);
     return int(result.matched.size());
+}
+
+bool MainWindow::exportFilmLists(const QString& path, Id earlier) {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    const Project& p = state_->project();
+    const FilmLists lists = filmLists(p, *s);
+    std::optional<CutChanges> changes;
+    if (const Sequence* old = earlier ? p.findSequence(earlier) : nullptr) {
+        std::string err;
+        changes = cutChanges(p, *old, *s, &err);
+        if (!err.empty()) {
+            state_->message(QString::fromStdString(err), 6000);
+            return false;
+        }
+    }
+    QString err;
+    if (!writeFilmLists(lists, changes ? &*changes : nullptr, path, &err)) {
+        state_->message(err, 6000);
+        return false;
+    }
+    state_->message(tr("Wrote film lists of %n event(s) to %1", nullptr, int(lists.events.size())).arg(QFileInfo(path).fileName()), 6000);
+    return true;
 }
 
 bool MainWindow::exportAle(const QString& path) {
@@ -8913,6 +8989,7 @@ void MainWindow::newSequence() {
             s.spherical = spec.spherical;
             s.vr180 = spec.vr180;
             s.stereo3d = spec.stereo3d;
+            s.filmGauge = spec.filmGauge;
             return true;
         });
 }

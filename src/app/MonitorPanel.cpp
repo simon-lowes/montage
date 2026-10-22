@@ -724,8 +724,11 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
         const Sequence* s = controller_->sequence();
         FrameTime t = 0;
         QString text = timecode_->text().trimmed();
-        bool relative = text.startsWith('+') || text.startsWith('-');
-        if (s && parseTimecode(text.toStdString(), s->fps, t)) controller_->seek(relative ? controller_->position() + t : t);
+        // (a leader's "-0+03" in feet and frames is a place, not a step back)
+        const bool feet = counterDisplay() != Counter::Timecode && text.mid(1).contains('+');
+        bool relative = text.startsWith('+') || (text.startsWith('-') && !feet);
+        if (relative && parseCounterString(s, text.mid(1), t, true)) controller_->seek(controller_->position() + (text.startsWith('-') ? -t : t));
+        else if (!relative && parseCounterString(s, text, t)) controller_->seek(t);
         refresh();
         viewer_->setFocus();
     });
@@ -882,10 +885,10 @@ void MonitorPanel::refresh() {
     if (mode_ == Mode::Source) updateWaveform();
     if (!timecode_->hasFocus()) timecode_->setText(timecodeString(s, controller_->position()));
     FrameTime in = inPoint(), out = outPoint();
-    QString dur = timecodeString(s, d);
+    QString dur = durationString(s, d);
     if (in >= 0 || out >= 0) {
         FrameTime a = std::max<FrameTime>(0, in), b = out >= 0 ? out + 1 : d;
-        dur = tr("In–Out %1").arg(timecodeString(s, std::max<FrameTime>(0, b - a)));
+        dur = tr("In–Out %1").arg(durationString(s, std::max<FrameTime>(0, b - a)));
     }
     durationLabel_->setText(dur);
 }

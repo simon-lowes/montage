@@ -532,6 +532,7 @@ struct Sequence {
     Rational fps{30, 1};
     int sampleRate = 48000;
     std::string audioLayout = "stereo";  // "stereo", "5.1" or "7.1" (core/Surround.h)
+    std::string filmGauge;  // "" (none: timecode), or a gauge cut on film is counted in (core/FilmCount.h)
     std::vector<Track> videoTracks;   // [0] = V1 (bottom-most)
     std::vector<Track> audioTracks;   // [0] = A1
     std::vector<Marker> markers;

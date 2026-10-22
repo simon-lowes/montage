@@ -37,6 +37,7 @@ add_library(montage_engine STATIC
   core/AvidBin.h core/AvidBin.cpp
   core/AvidMediaIndex.h core/AvidMediaIndex.cpp
   core/AvidBinImport.h core/AvidBinImport.cpp
+  core/FilmCount.h core/FilmCount.cpp
   core/Surround.h core/Surround.cpp
   core/Ambisonics.h core/Ambisonics.cpp
   media/SpatialAudio.h media/SpatialAudio.cpp
@@ -216,6 +217,7 @@ add_library(montage_engine STATIC
   render/OGraf.h render/OGraf.cpp
   render/Gallery.h render/Gallery.cpp
   render/LinedScript.h render/LinedScript.cpp
+  render/FilmLists.h render/FilmLists.cpp
   render/TrimPasses.h render/TrimPasses.cpp
   render/AutoTrims.h render/AutoTrims.cpp
   render/DialogueLoudness.h render/DialogueLoudness.cpp

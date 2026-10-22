@@ -93,6 +93,7 @@
 #include "core/ProjectIO.h"
 #include "core/ScriptCut.h"
 #include "render/LinedScript.h"
+#include "render/FilmLists.h"
 #include "core/Ambisonics.h"
 #include "media/Sofa.h"
 #include "core/Surround.h"
@@ -1101,7 +1102,8 @@ void McpServer::Impl::addTools() {
             "project":{"type":"string","description":"Path of the .montage file to write"},
             "media":{"type":"array","items":{"type":"string"},"description":"Media files, in order"},
             "width":{"type":"integer"},"height":{"type":"integer"},"fps":{"type":"number"},
-            "audio_layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4","ambix","ambix2","ambix3"],"default":"stereo"}},
+            "audio_layout":{"type":"string","enum":["stereo","5.1","7.1","5.1.2","5.1.4","7.1.2","7.1.4","ambix","ambix2","ambix3"],"default":"stereo"},
+            "film_gauge":{"type":"string","enum":["35mm-4perf","35mm-3perf","35mm-2perf","16mm","65mm-5perf"],"description":"For a cut going back to film: the gauge its feet and frames, burn-ins and film lists count in"}},
             "required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l;
@@ -1131,6 +1133,12 @@ void McpServer::Impl::addTools() {
                 if (std::find(audioLayouts().begin(), audioLayouts().end(), layout) == audioLayouts().end())
                     throw ArgError{"\"audio_layout\" must be stereo, 5.1, 7.1, 5.1.2, 5.1.4, 7.1.2, 7.1.4, ambix, ambix2 or ambix3"};
                 s.audioLayout = layout;
+            }
+            if (a.contains("film_gauge")) {
+                const std::string gauge = str(a, "film_gauge").toStdString();
+                if (std::string(filmGauge(gauge).id) != gauge)
+                    throw ArgError{"\"film_gauge\" must be 35mm-4perf, 35mm-3perf, 35mm-2perf, 16mm or 65mm-5perf"};
+                s.filmGauge = gauge;
             }
             FrameTime at = 0;
             for (Id id : ids) {
@@ -4647,6 +4655,97 @@ void McpServer::Impl::addTools() {
                 message += QStringLiteral("; made %1").arg(QString::fromStdString(made->name));
             }
             return ok(message, result);
+        });
+
+    add("montage_film_lists", "Film lists: cut, optical, dupe, pull and change lists",
+        "For a cut that goes back to film: the sequence's lists in feet and frames of its film gauge (Sequence Settings; "
+        "or `gauge`), naming the negative by its media's key numbers (read from DPX and Cineon film headers and ALE logs) "
+        "and ink numbers. The cut list: each shot's footage in and out, roll, key and ink numbers in and out. The optical "
+        "list: dissolves, fades and wipes (each side's negative, handles included), speed changes, reverse motion and "
+        "ramps, repositions, superimpositions and titles. The dupe list: negative used twice. The pull list: shots by "
+        "roll in negative order. With `before` (an earlier version of the cut), the change list in feet and frames. "
+        "`path` writes them as text (.txt), CSV (.csv) or PDF (.pdf).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "sequence":{"type":"string","description":"The sequence's name (default: the active one)"},
+            "gauge":{"type":"string","enum":["35mm-4perf","35mm-3perf","35mm-2perf","16mm","65mm-5perf"],"description":"Default: the sequence's (35mm-4perf where it has none)"},
+            "before":{"type":"string","description":"An earlier version's sequence name, for the change list"},
+            "path":{"type":"string","description":"Write the lists here (.txt, .csv or .pdf)"}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            auto byName = [&](const QString& name) -> const Sequence* {
+                for (const Sequence& sq : l.project.sequences)
+                    if (QString::fromStdString(sq.name) == name) return &sq;
+                throw ArgError{QStringLiteral("No sequence named \"%1\"").arg(name)};
+            };
+            const Sequence* s = a.contains("sequence") ? byName(str(a, "sequence")) : &l.seq();
+            FilmListOptions o;
+            o.gauge = str(a, "gauge").toStdString();
+            const FilmLists lists = filmLists(l.project, *s, o);
+            std::optional<CutChanges> changes;
+            if (a.contains("before")) {
+                const Sequence* before = byName(need(a, "before"));
+                if (before == s) throw ArgError{"\"before\" must be another sequence"};
+                std::string err;
+                changes = cutChanges(l.project, *before, *s, &err);
+                if (!err.empty()) return fail(QString::fromStdString(err));
+            }
+            const FilmGauge& g = lists.gauge;
+            auto key = [](const std::string& n) { return n.empty() ? QJsonValue() : QJsonValue(QString::fromStdString(n)); };
+            auto ff = [&](FrameTime f) { return QString::fromStdString(formatFeetFrames(f, g)); };
+            QJsonArray events, opticals, dupes, pulls;
+            for (const FilmEvent& e : lists.events)
+                events.append(QJsonObject{{"event", e.number}, {"clip", QString::fromStdString(e.name)}, {"roll", QString::fromStdString(e.roll)},
+                                          {"track", e.track + 1}, {"footage_in", ff(e.recIn)}, {"footage_out", ff(e.recOut - 1)},
+                                          {"length", ff(e.recOut - e.recIn)}, {"key_in", key(e.keyIn)}, {"key_out", key(e.keyOut)},
+                                          {"ink_in", key(e.inkIn)}, {"ink_out", key(e.inkOut)}});
+            for (const FilmOptical& op : lists.opticals) {
+                QJsonObject j{{"kind", QString::fromStdString(op.kind)}, {"event", op.event}, {"footage_in", ff(op.recIn)},
+                              {"footage_out", ff(op.recOut - 1)}, {"length", ff(op.recOut - op.recIn)},
+                              {"detail", QString::fromStdString(op.detail)}, {"key_in", key(op.keyIn)}, {"key_out", key(op.keyOut)}};
+                if (op.outgoing) {
+                    j["outgoing"] = op.outgoing;
+                    j["outgoing_key_in"] = key(op.outKeyIn);
+                    j["outgoing_key_out"] = key(op.outKeyOut);
+                }
+                opticals.append(j);
+            }
+            for (const FilmDupe& d : lists.dupes)
+                dupes.append(QJsonObject{{"event", d.second}, {"dupe_of", d.first}, {"roll", QString::fromStdString(d.roll)},
+                                         {"key_in", key(d.keyIn)}, {"key_out", key(d.keyOut)}, {"length", ff(d.frames())}});
+            for (const auto& [roll, list] : lists.pulls) {
+                QJsonArray ev;
+                for (int n : list) ev.append(n);
+                pulls.append(QJsonObject{{"roll", QString::fromStdString(roll)}, {"events", ev}});
+            }
+            QJsonObject result{{"gauge", QString::fromLatin1(g.id)}, {"length", ff(lists.length)}, {"events", events},
+                               {"opticals", opticals}, {"dupes", dupes}, {"pulls", pulls}};
+            if (changes) {
+                QJsonArray list;
+                for (const CutEvent& e : changes->events) {
+                    if (e.kind == CutEventKind::Same) continue;
+                    QJsonObject j{{"change", QString::fromLatin1(cutEventName(e.kind)).toLower()}, {"shot", QString::fromStdString(e.shot)},
+                                  {"new_in", ff(e.newIn)}, {"length", ff(e.length())}};
+                    if (e.black) j["black"] = true;
+                    if (e.kind == CutEventKind::Moved) j["shift"] = (e.shift() < 0 ? QStringLiteral("-") : QStringLiteral("+")) + ff(std::llabs(e.shift()));
+                    if (e.newOut > e.newIn) j["new_out"] = ff(e.newOut - 1);
+                    if (e.oldOut > e.oldIn) {
+                        j["old_in"] = ff(e.oldIn);
+                        j["old_out"] = ff(e.oldOut - 1);
+                    }
+                    list.append(j);
+                }
+                result["changes"] = list;
+            }
+            if (a.contains("path")) {
+                const QString file = absolute(need(a, "path"));
+                QString err;
+                if (!writeFilmLists(lists, changes ? &*changes : nullptr, file, &err)) return fail(err);
+                result["path"] = file;
+            }
+            return ok(QStringLiteral("%1 event(s), %2 optical(s), %3 dupe(s) in %4").arg(lists.events.size()).arg(lists.opticals.size())
+                          .arg(lists.dupes.size()).arg(QString::fromLatin1(g.name)),
+                      result);
         });
 
     add("montage_adr", "ADR cue list and takes",
@@ -8598,6 +8697,9 @@ void McpServer::Impl::addTools() {
             "loudness_dialogue":{"type":"boolean","default":false,"description":"loudness_lufs is the dialogue's (Netflix: -27, peak_ceiling -2), measured as montage_dialogue_loudness does"},
             "burn_in":{"type":"object","description":"Overlays for a review copy","properties":{
                 "timecode":{"type":"boolean"},"clip_name":{"type":"boolean"},"text":{"type":"string"},
+                "footage":{"type":"boolean","description":"Feet and frames in the sequence's film gauge"},
+                "key_number":{"type":"boolean","description":"The key number of the frame on screen (its media's key_number)"},
+                "ink_number":{"type":"boolean","description":"Its ink number"},
                 "corner":{"type":"string","enum":["top_left","top_centre","top_right","bottom_left","bottom_centre","bottom_right"],"default":"top_left"},
                 "watermark":{"type":"string","description":"Image file, e.g. a logo"},
                 "watermark_corner":{"type":"string","enum":["top_left","top_centre","top_right","bottom_left","bottom_centre","bottom_right"],"default":"bottom_right"},
@@ -8740,6 +8842,9 @@ void McpServer::Impl::addTools() {
                 };
                 st.burnIn.timecode = b.value("timecode").toBool();
                 st.burnIn.clipName = b.value("clip_name").toBool();
+                st.burnIn.footage = b.value("footage").toBool();
+                st.burnIn.keyNumber = b.value("key_number").toBool();
+                st.burnIn.inkNumber = b.value("ink_number").toBool();
                 st.burnIn.text = b.value("text").toString().toStdString();
                 st.burnIn.corner = corner("corner", 0);
                 if (b.contains("watermark")) st.burnIn.watermark = absolute(b.value("watermark").toString()).toStdString();

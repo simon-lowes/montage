@@ -121,6 +121,9 @@ template <class S, class V>
 void visitBurnIn(S& b, V& v) {
     v("timecode", b.timecode);
     v("clipName", b.clipName);
+    v("footage", b.footage);
+    v("keyNumber", b.keyNumber);
+    v("inkNumber", b.inkNumber);
     v("text", b.text);
     v("corner", b.corner);
     v("size", b.size);

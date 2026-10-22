@@ -774,7 +774,7 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
         badges.prepend(QStringLiteral(" ") + QString::fromStdString(c.role) +
                        (edit::roleMuted(*state_->sequence(), c.role) ? tr(" (muted)") : QString()));
     if (showDurations_ && state_->sequence())  // Resolve 21.1's clip durations view option
-        badges += QStringLiteral("  ") + QString::fromStdString(formatTimecode(c.duration, state_->sequence()->fps));
+        badges += QStringLiteral("  ") + durationString(state_->sequence(), c.duration);
     QFont f = p.font();
     f.setPointSize(8);
     p.setFont(f);
@@ -1853,7 +1853,7 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
     }
     const Sequence* s = state_->gestureBase();  // fetched after beginGesture() above
     const FrameTime raw = frameRound(pos.x()) - drag_.pressFrame;
-    auto signedTc = [s](FrameTime d) { return (d < 0 ? "-" : "+") + timecodeString(s, std::llabs(d)); };
+    auto signedTc = [s](FrameTime d) { return (d < 0 ? "-" : "+") + durationString(s, std::llabs(d)); };
     switch (drag_.kind) {
         case DragKind::Scrub: {
             FrameTime f = frameRound(pos.x());
@@ -1936,7 +1936,7 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             const Id id = drag_.transition;
             FrameTime applied = 0;
             state_->updateGesture([&](Project&, Sequence& sq) { applied = edit::setTransitionDuration(sq, id, want).applied; });
-            drag_.label = tr("Transition %1").arg(QString::fromStdString(formatTimecode(applied, live->fps)));
+            drag_.label = tr("Transition %1").arg(durationString(live, applied));
             break;
         }
         case DragKind::Slip: {

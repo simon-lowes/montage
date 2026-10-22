@@ -21,6 +21,7 @@
 #include <utility>
 
 #include "core/Ambisonics.h"
+#include "core/FilmCount.h"
 #include "core/MediaLog.h"
 #include "core/ProjectIO.h"
 #include "core/ProjectLock.h"
@@ -98,8 +99,58 @@ EditorState::~EditorState() {
     releaseLock();
 }
 
+namespace {
+Counter& counterSetting() {
+    static Counter c = [] {
+        const QString v = appSettings().value(QStringLiteral("view/counter")).toString();
+        return v == QLatin1String("feet") ? Counter::Feet : v == QLatin1String("feetFromPicture") ? Counter::FeetFromPicture : Counter::Timecode;
+    }();
+    return c;
+}
+
+const FilmGauge& counterGauge(const Sequence& s) { return filmGauge(s.filmGauge); }
+
+// Where 0+00 is: the first picture, or the timeline's first frame.
+FrameTime counterZero(const Sequence& s) {
+    if (counterSetting() != Counter::FeetFromPicture) return 0;
+    FrameTime first = -1;
+    for (const Track& t : s.videoTracks)
+        for (const Clip& c : t.clips)
+            if (first < 0 || c.start < first) first = c.start;
+    return std::max<FrameTime>(0, first);
+}
+}  // namespace
+
+Counter counterDisplay() { return counterSetting(); }
+
+void setCounterDisplay(Counter c) {
+    counterSetting() = c;
+    appSettings().setValue(QStringLiteral("view/counter"), c == Counter::Feet ? QStringLiteral("feet")
+                                                           : c == Counter::FeetFromPicture ? QStringLiteral("feetFromPicture")
+                                                                                           : QStringLiteral("timecode"));
+}
+
 QString timecodeString(const Sequence* s, FrameTime t) {
+    if (s && counterSetting() != Counter::Timecode)
+        return QString::fromStdString(formatFeetFrames(t - counterZero(*s), counterGauge(*s)));
     return QString::fromStdString(formatTimecode(t, s ? s->fps : Rational{30, 1}));
+}
+
+QString durationString(const Sequence* s, FrameTime d) {
+    if (s && counterSetting() != Counter::Timecode) return QString::fromStdString(formatFeetFrames(d, counterGauge(*s)));
+    return QString::fromStdString(formatTimecode(d, s ? s->fps : Rational{30, 1}));
+}
+
+bool parseCounterString(const Sequence* s, const QString& text, FrameTime& t, bool duration) {
+    if (!s) return false;
+    const QString v = text.trimmed();
+    if (counterSetting() != Counter::Timecode && v.mid(1).contains('+')) {
+        int64_t f = 0;
+        if (!parseFeetFrames(v.toStdString(), counterGauge(*s), f)) return false;
+        t = duration ? f : f + counterZero(*s);
+        return true;
+    }
+    return parseTimecode(v.toStdString(), s->fps, t);
 }
 
 // ---------------------------------------------------------------------------

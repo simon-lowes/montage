@@ -199,6 +199,8 @@
 #include "render/ColorSpace.h"
 #include "render/Clf.h"
 #include "render/AudioFx.h"
+#include "render/FilmLists.h"
+#include "core/FilmCount.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
 #include "render/RenderFarm.h"
@@ -13391,6 +13393,247 @@ if __name__ == '__main__':
         const AvidBinImport bi = importAvidBin(bombed, bombPath);
         QVERIFY(std::find(bi.warnings.begin(), bi.warnings.end(), "A sequence too large to bring in whole was cut short") != bi.warnings.end());
         QVERIFY2(quick.elapsed() < 20000, qPrintable(QString::number(quick.elapsed())));
+    }
+
+    // A DPX frame (8-bit RGB, big-endian, 2048 bytes of headers) of w x h in one colour, its film header saying the
+    // key number a scanner reads: manufacturer and film type codes, prefix, count and perforation offset; 24 fps.
+    static bool writeFilmScanFrame(const QString& file, int w, int h, QRgb colour, const char* mfr, const char* type,
+                                   const char* prefix, int count, int perfs) {
+        QByteArray d(2048 + w * h * 3, '\0');
+        char* p = d.data();
+        auto put = [&](int at, const QByteArray& text) { std::memcpy(p + at, text.constData(), size_t(text.size())); };
+        put(0, "SDPX");
+        qToBigEndian<quint32>(2048, p + 4);
+        put(8, "V2.0");
+        qToBigEndian<quint32>(quint32(d.size()), p + 16);
+        qToBigEndian<quint32>(1664, p + 24);
+        qToBigEndian<quint32>(384, p + 28);
+        qToBigEndian<quint16>(1, p + 770);  // one element: RGB, 8 bits, unpacked
+        qToBigEndian<quint32>(quint32(w), p + 772);
+        qToBigEndian<quint32>(quint32(h), p + 776);
+        qToBigEndian<quint32>(255, p + 792);
+        p[800] = 50;
+        p[801] = p[802] = 2;
+        p[803] = 8;
+        qToBigEndian<quint32>(2048, p + 808);
+        std::memset(p + 1664, 0xff, 384);  // the film and television headers: unset but for the key number
+        put(1664, mfr);
+        put(1666, type);
+        put(1668, QByteArray::number(perfs).rightJustified(2, '0'));
+        put(1670, prefix);
+        put(1676, QByteArray::number(count).rightJustified(4, '0'));
+        const float rate = 24;
+        quint32 bits;
+        std::memcpy(&bits, &rate, 4);
+        qToBigEndian<quint32>(bits, p + 1724);
+        for (int i = 0; i < w * h; ++i) {
+            p[2048 + i * 3] = char(qRed(colour));
+            p[2048 + i * 3 + 1] = char(qGreen(colour));
+            p[2048 + i * 3 + 2] = char(qBlue(colour));
+        }
+        QFile f(file);
+        return f.open(QIODevice::WriteOnly) && f.write(d) == d.size();
+    }
+
+    void filmListsFromScans() {
+        // Three scanned rolls with KeyKode in each frame's header: A and B 4-perf, C 3-perf (its frames starting on
+        // every perforation of a foot in turn).
+        struct Roll {
+            const char* name;
+            const char* prefix;
+            int count, offset, perfsPerFrame, frames;
+        };
+        const Roll rolls[] = {{"A", "123456", 100, 0, 4, 100}, {"B", "654321", 7000, 7, 4, 100}, {"C", "111111", 50, 5, 3, 140}};
+        std::map<std::string, ImageSequence> seqs;
+        for (const Roll& r : rolls) {
+            const QString dir = QString::fromStdString(path((std::string("scan_") + r.name).c_str()));
+            QDir().mkpath(dir);
+            for (int f = 0; f < r.frames; ++f) {
+                const int perfs = r.offset + f * r.perfsPerFrame;
+                QVERIFY(writeFilmScanFrame(dir + QStringLiteral("/%1_%2.dpx").arg(r.name).arg(f, 4, 10, QLatin1Char('0')), 32, 18,
+                                           qRgb(f * 2, 100, r.name[0] == 'A' ? 200 : 40), "02", "23", r.prefix, r.count + perfs / 64, perfs % 64));
+            }
+            ImageSequence seq;
+            QVERIFY(detectImageSequence((dir + QStringLiteral("/%1_0000.dpx").arg(r.name)).toStdString(), seq));
+            seqs[r.name] = seq;
+        }
+        // What the scanner wrote on frame f of a roll, as a key number of `g`.
+        auto header = [&](const char* roll, int f, const FilmGauge& g) {
+            FilmScanHeader h;
+            if (!readFilmScanHeader(imageSequenceFrame(seqs[roll], f), h)) return std::string("(unread)");
+            return filmScanKeyNumber(h, g);
+        };
+        const FilmGauge& four = filmGauge("35mm-4perf");
+        const FilmGauge& three = filmGauge("35mm-3perf");
+
+        Project p = makeDefaultProject();
+        std::map<std::string, Id> media;
+        for (const Roll& r : rolls) {
+            MediaItem m = probeOrFail(p, imageSequencePath(seqs[r.name]));
+            QCOMPARE(m.fps, (Rational{24, 1}));
+            p.media.push_back(m);
+            media[r.name] = m.id;
+        }
+        // Each roll's first key number from its first frame's header, in the gauge the header suggests.
+        QCOMPARE(p.findMedia(media["A"])->metadata.at("key_number"), std::string("0223 12 3456 0100+00"));
+        QCOMPARE(p.findMedia(media["B"])->metadata.at("key_number"), std::string("0223 65 4321 7000+01.3"));
+        QCOMPARE(p.findMedia(media["C"])->metadata.at("key_number"), std::string("0223 11 1111 0050+01.2"));
+        // Each roll's gauge from how far its second frame's key number is past its first's: B's frames start 3
+        // perforations past a 4-perf frame's, and it is still 4-perf, its key numbers read by it in any sequence.
+        QCOMPARE(p.findMedia(media["A"])->metadata.at("film_gauge"), std::string("35mm-4perf"));
+        QCOMPARE(p.findMedia(media["B"])->metadata.at("film_gauge"), std::string("35mm-4perf"));
+        QCOMPARE(p.findMedia(media["C"])->metadata.at("film_gauge"), std::string("35mm-3perf"));
+        QCOMPARE(mediaFilmNumberText(*p.findMedia(media["B"]), false, 14, filmGauge("16mm")), header("B", 14, filmGauge("35mm-4perf")));
+        // Every frame's key number worked out from the first is the one the scanner wrote on it, across 64-frame cycles.
+        for (int f = 0; f < 140; ++f)
+            QCOMPARE(formatFilmNumber(*mediaFilmNumber(*p.findMedia(media["C"]), false, f, three), three), header("C", f, three));
+        for (int f = 0; f < 100; f += 7)
+            QCOMPARE(formatFilmNumber(*mediaFilmNumber(*p.findMedia(media["B"]), false, f, four), four), header("B", f, four));
+
+        // A cut: A 10-49, then B 20-59 dissolving in over 12 frames, then A 30-59 again (the negative used twice).
+        Sequence& s = *p.active();
+        s.name = "Reel 1";
+        s.width = 640, s.height = 360, s.fps = {24, 1};
+        s.filmGauge = "35mm-4perf";
+        auto place = [&](const char* roll, FrameTime at, int from, int to) {
+            const edit::Result r = edit::placeMedia(p, s, media[roll], at, from, to, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false);
+            return r.ok && !r.created.empty() ? r.created[0] : Id(0);
+        };
+        const Id first = place("A", 0, 10, 50);
+        QVERIFY(first && place("B", 40, 20, 60) && place("A", 80, 30, 60));
+        QVERIFY(edit::addTransition(p, s, first, edit::Edge::Out, "cross_dissolve", 12).ok);
+
+        const FilmLists l = filmLists(p, s);
+        QCOMPARE(l.events.size(), size_t(3));
+        const FilmEvent &e1 = l.events[0], &e2 = l.events[1], &e3 = l.events[2];
+        QCOMPARE(e1.keyIn, header("A", 10, four));
+        QCOMPARE(e1.keyOut, header("A", 49, four));
+        QCOMPARE(e2.keyIn, header("B", 20, four));
+        QCOMPARE(e2.keyOut, header("B", 59, four));
+        QCOMPARE(e3.keyIn, header("A", 30, four));
+        QCOMPARE(e3.keyOut, header("A", 59, four));
+        QCOMPARE(e2.roll, std::string("0223 65 4321"));
+        // The dissolve, centred on the cut at 2+08, with each side's negative (its handles included).
+        QCOMPARE(l.opticals.size(), size_t(1));
+        const FilmOptical& d = l.opticals[0];
+        QCOMPARE(d.kind, std::string("Dissolve"));
+        QVERIFY(d.event == 2 && d.outgoing == 1);
+        QCOMPARE(formatFeetFrames(d.recIn, four), std::string("2+02"));
+        QCOMPARE(d.recOut - d.recIn, FrameTime(12));
+        QCOMPARE(d.keyIn, header("B", 14, four));
+        QCOMPARE(d.keyOut, header("B", 25, four));
+        QCOMPARE(d.outKeyIn, header("A", 44, four));
+        QCOMPARE(d.outKeyOut, header("A", 55, four));
+        // The repeat: A 30-55 (the first shot's dissolve handle included) needs a dupe for the third shot.
+        QCOMPARE(l.dupes.size(), size_t(1));
+        QVERIFY(l.dupes[0].first == 1 && l.dupes[0].second == 3);
+        QCOMPARE(l.dupes[0].keyIn, header("A", 30, four));
+        QCOMPARE(l.dupes[0].keyOut, header("A", 55, four));
+        // The pull list: roll A's two shots in negative order, then B.
+        QCOMPARE(l.pulls.size(), size_t(2));
+        QCOMPARE(l.pulls[0].first, std::string("0223 12 3456"));
+        QCOMPARE(l.pulls[0].second, (std::vector<int>{1, 3}));
+        QCOMPARE(l.pulls[1].second, (std::vector<int>{2}));
+
+        // A recut taking a foot off the end: the change list in feet and frames.
+        const Id reelId = s.id;
+        auto reel = [&]() -> const Sequence& { return *p.findSequence(reelId); };
+        Sequence recut = s;
+        recut.id = p.newId();
+        recut.name = "Reel 1 v2";
+        recut.videoTracks[0].clips.back().duration -= 16;
+        for (Track& t : recut.audioTracks) t.clips.clear();
+        for (Track& t : s.audioTracks) t.clips.clear();
+        p.sequences.push_back(recut);
+        std::string err;
+        const CutChanges changes = cutChanges(p, reel(), p.sequences.back(), &err);
+        QVERIFY2(err.empty(), err.c_str());
+        const FilmLists l2 = filmLists(p, p.sequences.back());
+        const std::string text = filmListsText(l2, &changes);
+        const std::string tail = text.substr(text.size() > 900 ? text.size() - 900 : 0);
+        QVERIFY2(text.find("Change list  Reel 1 to Reel 1 v2") != std::string::npos, tail.c_str());
+        bool trimmed = false;
+        for (const QString& line : QString::fromStdString(text).split('\n'))
+            if (line.contains("Trimmed")) trimmed = line.contains(" 5+14 ") && line.contains(" 6+13 ") && line.contains(" 1+00");
+        QVERIFY2(trimmed, tail.c_str());
+        QVERIFY(text.find("Dupe list") != std::string::npos && text.find("Pull list") != std::string::npos);
+        // CSV and PDF too.
+        QString werr;
+        QVERIFY2(writeFilmLists(l, nullptr, QString::fromStdString(path("reel1.csv")), &werr), qPrintable(werr));
+        QFile csv(QString::fromStdString(path("reel1.csv")));
+        QVERIFY(csv.open(QIODevice::ReadOnly));
+        const QString csvText = QString::fromUtf8(csv.readAll());
+        QVERIFY2(csvText.contains(QStringLiteral("Dupe list,3,1,0223 12 3456,%1,%2,1+10")
+                                      .arg(QString::fromStdString(header("A", 30, four)), QString::fromStdString(header("A", 55, four)))),
+                 qPrintable(csvText));
+        QVERIFY2(writeFilmLists(l, &changes, QString::fromStdString(path("reel1.pdf")), &werr), qPrintable(werr));
+        QFile pdf(QString::fromStdString(path("reel1.pdf")));
+        QVERIFY(pdf.open(QIODevice::ReadOnly) && pdf.read(5) == "%PDF-" && pdf.size() > 1000);
+        // Its lines laid out as the text's: the second shot's row whole on one line.
+        if (const QString tool = QStandardPaths::findExecutable(QStringLiteral("pdftotext")); !tool.isEmpty()) {
+            QProcess pt;
+            pt.start(tool, {QStringLiteral("-layout"), pdf.fileName(), QStringLiteral("-")});
+            QVERIFY(pt.waitForFinished(60000));
+            const QString laid = QString::fromUtf8(pt.readAllStandardOutput());
+            const QRegularExpression row(QStringLiteral("\\b2 +2\\+08 +4\\+15 +2\\+08 +B_\\S+ +0223 65 4321 +") +
+                                         QRegularExpression::escape(QString::fromStdString(header("B", 20, four))));
+            QVERIFY2(laid.contains(row), qPrintable(laid.left(1500)));
+        }
+
+        // 3-perf: a shot of C's frames 3-135 counted in 3-perf feet and frames.
+        Sequence& s3 = p.sequences.emplace_back(makeSequence(p, "Three perf", 640, 360, Rational{24, 1}, 1, 1));
+        s3.filmGauge = "35mm-3perf";
+        QVERIFY(edit::placeMedia(p, s3, media["C"], 0, 3, 136, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const FilmLists l3 = filmLists(p, s3);
+        QCOMPARE(l3.events.size(), size_t(1));
+        QCOMPARE(l3.events[0].keyIn, header("C", 3, three));
+        QCOMPARE(l3.events[0].keyOut, header("C", 135, three));
+        QCOMPARE(formatFeetFrames(l3.length, three), std::string("6+05.0"));
+
+        // Through MCP.
+        {
+            const QString project = QString::fromStdString(path("film.montage"));
+            p.activeSequence = reelId;
+            QVERIFY(saveProject(p, project.toStdString()));
+            McpServer server;
+            const QJsonObject args{{"project", project}, {"before", "Reel 1"}, {"sequence", "Reel 1 v2"}, {"path", QString::fromStdString(path("mcp.txt"))}};
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_film_lists"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+            const QJsonObject out = res.value("structuredContent").toObject();
+            QCOMPARE(out.value("events").toArray().size(), 3);
+            QCOMPARE(out.value("events").toArray()[1].toObject().value("key_in").toString(), QString::fromStdString(header("B", 20, four)));
+            QCOMPARE(out.value("dupes").toArray().size(), 1);
+            QCOMPARE(out.value("changes").toArray()[0].toObject().value("length").toString(), QStringLiteral("1+00"));
+            QVERIFY(QFileInfo(QString::fromStdString(path("mcp.txt"))).size() > 200);
+        }
+
+        // The key number burnt in reads back: frame 2+02 (34) shows B's frame 30.
+        if (!ocrAvailable()) QSKIP("Built without ONNX Runtime");
+        if (!ocrModel().installed()) QSKIP("Text reading model not installed (set MONTAGE_OCR_MODEL)");
+        BurnIn b;
+        b.footage = b.keyNumber = true;
+        b.size = 0.06;
+        Image img(640, 360);
+        img.fill(0.1f, 0.12f, 0.15f, 1);
+        drawBurnIns(img, p, reel(), 50, b, nullptr, nullptr);
+        QImage q(img.width, img.height, QImage::Format_RGB32);
+        for (int y = 0; y < img.height; ++y)
+            for (int x = 0; x < img.width; ++x) {
+                const float* v = img.at(x, y);
+                auto c = [](float f) { return int(std::lround(std::clamp(f, 0.0f, 1.0f) * 255)); };
+                q.setPixel(x, y, qRgb(c(v[0]), c(v[1]), c(v[2])));
+            }
+        auto reader = TextReader::load("en", &err);
+        QVERIFY2(reader, err.c_str());
+        const std::vector<TextLine> read = reader->read(q, {}, &err);
+        QVERIFY2(read.size() == 2, textOf(read, 0).c_str());
+        QVERIFY2(readingSimilarity(read[0].text, "3+02") >= 0.75, read[0].text.c_str());
+        QVERIFY2(readingSimilarity(read[1].text, header("B", 30, four)) >= 0.9, read[1].text.c_str());
     }
 
     void avidBinImport() {

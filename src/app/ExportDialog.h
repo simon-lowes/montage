@@ -115,6 +115,9 @@ private:
     // Burn-ins for review copies.
     QCheckBox* burnTimecode_ = nullptr;
     QCheckBox* burnClipName_ = nullptr;
+    QCheckBox* burnFootage_ = nullptr;
+    QCheckBox* burnKeyNumber_ = nullptr;
+    QCheckBox* burnInkNumber_ = nullptr;
     QLineEdit* burnText_ = nullptr;
     QComboBox* burnCorner_ = nullptr;
     QLineEdit* watermark_ = nullptr;

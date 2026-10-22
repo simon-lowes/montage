@@ -14,9 +14,11 @@
 #include "audio/TimeStretch.h"
 #include "core/Ambisonics.h"
 #include "core/Cea708.h"
+#include "core/FilmCount.h"
 #include "SpatialAudio.h"
 #include "core/Interpretation.h"
 
+#include <QString>
 #include <QtCore/qfloat16.h>
 #include <algorithm>
 #include <numeric>
@@ -762,6 +764,24 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         m.fps = seq.fps;
         m.duration = seq.frames() / seq.fps.toDouble();
         if (out.name.empty()) m.name = imageSequenceName(seq);
+    }
+    // A film scan's DPX or Cineon header: the first frame's key number, and what the scanner says of the film.
+    if (ImageSequence seq; m.hasVideo) {
+        const bool sequence = parseImageSequencePath(path, seq);
+        const std::string first = sequence ? imageSequenceFrame(seq, seq.first) : uninterpretedPath(path);
+        const QString ext = QString::fromStdString(first).section('.', -1).toLower();
+        if (FilmScanHeader h; (ext == "dpx" || ext == "cin") && readFilmScanHeader(first, h)) {
+            // The gauge from how far the second frame's key number is past the first's (else what the header suggests).
+            FilmScanHeader next;
+            const bool hasNext = sequence && seq.last > seq.first && readFilmScanHeader(imageSequenceFrame(seq, seq.first + 1), next);
+            const FilmGauge& g = filmScanGauge(h, hasNext ? &next : nullptr);
+            if (h.hasKeyKode && !m.metadata.count("key_number")) {
+                m.metadata["key_number"] = filmScanKeyNumber(h, g);
+                m.metadata["film_gauge"] = g.id;
+            }
+            if (!h.format.empty() && !m.metadata.count("film_format")) m.metadata["film_format"] = h.format;
+            if (!h.slate.empty() && !m.metadata.count("slate")) m.metadata["slate"] = h.slate;
+        }
     }
     // A field recorder's WAV: its timecode stamp, scene, take, notes and channel names.
     if (fmt->iformat && std::strstr(fmt->iformat->name, "wav")) {

@@ -348,7 +348,18 @@ private:
     std::optional<Gesture> gesture_;
 };
 
-// Formats a frame count using the active sequence's timecode.
+// What the timecode readouts show: timecode, or feet and frames (core/FilmCount.h; in the sequence's film gauge, 35 mm
+// 4-perf where it has none) with 0+00 at the timeline's first frame or at its first picture (the earliest video clip,
+// so a leader before it counts back from zero). Kept in the app's settings.
+enum class Counter { Timecode, Feet, FeetFromPicture };
+Counter counterDisplay();
+void setCounterDisplay(Counter c);
+// A frame of sequence `s` as the readouts show it.
 QString timecodeString(const Sequence* s, FrameTime t);
+// A length of time (feet and frames from zero whichever the counter).
+QString durationString(const Sequence* s, FrameTime d);
+// What a readout shows (feet and frames while the counter shows them; else timecode, frames or seconds as
+// parseTimecode reads them), as a frame of the sequence, or a length where `duration`.
+bool parseCounterString(const Sequence* s, const QString& text, FrameTime& t, bool duration = false);
 
 }  // namespace montage

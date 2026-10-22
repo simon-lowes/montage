@@ -486,7 +486,7 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
         if (!c) return;
         const Sequence* s = state_->sequence();
         if (!name->hasFocus()) name->setText(QString::fromStdString(c->name));
-        timing->setText(tr("%1 → %2  (%3)").arg(timecodeString(s, c->start), timecodeString(s, c->end()), timecodeString(s, c->duration)));
+        timing->setText(tr("%1 → %2  (%3)").arg(timecodeString(s, c->start), timecodeString(s, c->end()), durationString(s, c->duration)));
         QSignalBlocker b1(speed), b2(reverse), b3(enabled), b4(labelBox);
         speed->setValue(c->speed * 100);
         reverse->setChecked(c->reverse);

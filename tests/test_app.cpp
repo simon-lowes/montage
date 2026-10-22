@@ -822,6 +822,70 @@ private slots:
         QCOMPARE(dlg.shots().size(), size_t(1));  // (its own markers do not make the results stale)
     }
 
+    void filmCounterAndLists() {
+        // A sequence cut on film: its gauge in Sequence Settings, the readouts in feet and frames, and its film lists.
+        state()->newProject();
+        QVERIFY(state()->edit("Film", [&](Project& p, Sequence& s) {
+            s.fps = {24, 1};
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Video;
+            m.name = "Roll 12";
+            m.path = "/scans/roll12.mov";
+            m.duration = 10;
+            m.width = 1920;
+            m.height = 1080;
+            m.fps = {24, 1};
+            m.hasVideo = true;
+            m.metadata["key_number"] = "KJ 23 1234 5678+00";
+            p.media.push_back(m);
+            return edit::placeMedia(p, s, m.id, 8, 16, 56, {TrackKind::Video, 0}, {}, false).ok;
+        }));
+        {
+            SequenceSettingsDialog dlg;
+            auto* gauge = dlg.findChild<QComboBox*>("filmGauge");
+            QVERIFY(gauge);
+            gauge->setCurrentIndex(gauge->findData(QStringLiteral("35mm-3perf")));
+            QCOMPARE(dlg.spec().filmGauge, std::string("35mm-3perf"));
+            NewSequenceSpec spec = dlg.spec();
+            spec.filmGauge = "16mm";
+            dlg.setSpec(spec);
+            QCOMPARE(gauge->currentData().toString(), QStringLiteral("16mm"));
+        }
+        const Sequence* s = state()->sequence();
+        QCOMPARE(timecodeString(s, 24), QStringLiteral("00:00:01:00"));
+        // Feet and frames: 35 mm 4-perf where the sequence has no gauge.
+        win_->findChild<QAction*>("counterFeet")->trigger();
+        QCOMPARE(counterDisplay(), Counter::Feet);
+        QCOMPARE(timecodeString(s, 20), QStringLiteral("1+04"));
+        FrameTime t = 0;
+        QVERIFY(parseCounterString(s, QStringLiteral("2+00"), t) && t == 32);
+        QVERIFY(parseCounterString(s, QStringLiteral("00:00:01:00"), t) && t == 24);  // timecode still read
+        // From the first picture (the clip at frame 8): what comes before it counts back from 0+00.
+        win_->findChild<QAction*>("counterFeetFromPicture")->trigger();
+        QCOMPARE(timecodeString(s, 8), QStringLiteral("0+00"));
+        QCOMPARE(timecodeString(s, 0), QStringLiteral("-0+08"));
+        QCOMPARE(durationString(s, 16), QStringLiteral("1+00"));
+        QVERIFY(parseCounterString(s, QStringLiteral("1+00"), t) && t == 24);
+        QVERIFY(parseCounterString(s, QStringLiteral("1+00"), t, true) && t == 16);
+        QVERIFY(state()->edit("Gauge", [](Project&, Sequence& sq) {
+            sq.filmGauge = "16mm";
+            return true;
+        }));
+        QCOMPARE(timecodeString(state()->sequence(), 48), QStringLiteral("1+00"));
+        win_->findChild<QAction*>("counterTimecode")->trigger();
+        QCOMPARE(counterDisplay(), Counter::Timecode);
+        // The lists, with the media's key numbers.
+        QVERIFY(win_->findChild<QAction*>("exportFilmLists"));
+        const QString lists = dir_.path() + "/reel.txt";
+        QVERIFY(win_->exportFilmLists(lists));
+        QFile f(lists);
+        QVERIFY(f.open(QIODevice::ReadOnly));
+        const QString text = QString::fromUtf8(f.readAll());
+        QVERIFY2(text.contains(QStringLiteral("KJ 23 1234 5678+16")) && text.contains(QStringLiteral("KJ 23 1234 5680+15")), qPrintable(text));
+        QVERIFY2(text.contains(QStringLiteral("16 mm")), qPrintable(text));
+    }
+
     void aleAndCdlFromTheMenus() {
         state()->newProject();
         Id media = 0;

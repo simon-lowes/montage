@@ -4,6 +4,7 @@
 #include "Ofx.h"
 
 #include "core/ColorGroups.h"
+#include "core/FilmCount.h"
 #include "core/Expression.h"
 #include "core/GradeGraph.h"
 #include "GradeGraph.h"
@@ -2645,17 +2646,31 @@ void drawBurnIns(Image& img, const Project& p, const Sequence& seq, FrameTime t,
     }
     QStringList lines;
     if (b.timecode) lines << QString::fromStdString(formatTimecode(timecode >= 0 ? timecode : t, seq.fps, dropFrame));
-    if (b.clipName) {
-        for (int i = int(seq.videoTracks.size()) - 1; i >= 0; --i) {
-            if (seq.videoTracks[size_t(i)].muted) continue;
-            if (const Clip* c = edit::clipAt(seq, TrackRef{TrackKind::Video, i}, t); c && c->enabled) {
-                std::string name = c->name;
-                if (name.empty())
-                    if (const MediaItem* m = c->mediaId ? p.findMedia(c->mediaId) : nullptr) name = m->name;
-                lines << QString::fromStdString(name);
-                break;
-            }
+    const FilmGauge& gauge = filmGauge(seq.filmGauge);
+    if (b.footage) lines << QString::fromStdString(formatFeetFrames(t, gauge));
+    // The top clip (its name), and the top one with footage (its film numbers: a title over the picture has none).
+    const Clip* top = nullptr;
+    const Clip* film = nullptr;
+    const MediaItem* filmMedia = nullptr;
+    for (int i = int(seq.videoTracks.size()) - 1; i >= 0 && !film; --i) {
+        if (seq.videoTracks[size_t(i)].muted) continue;
+        const Clip* c = edit::clipAt(seq, TrackRef{TrackKind::Video, i}, t);
+        if (!c || !c->enabled) continue;
+        if (!top) top = c;
+        if (const MediaItem* m = c->mediaId && !c->isGenerator() ? p.findMedia(c->mediaId) : nullptr; m && m->kind != MediaKind::Sequence) {
+            film = c;
+            filmMedia = m;
         }
+    }
+    if (b.clipName && top) {
+        std::string name = top->name;
+        if (const MediaItem* m = top->mediaId ? p.findMedia(top->mediaId) : nullptr; name.empty() && m) name = m->name;
+        lines << QString::fromStdString(name);
+    }
+    for (const bool ink : {false, true}) {
+        if (!(ink ? b.inkNumber : b.keyNumber) || !filmMedia) continue;
+        const std::string n = mediaFilmNumberText(*filmMedia, ink, clipMediaFrame(*film, t, seq, *filmMedia), gauge);
+        if (!n.empty()) lines << QString::fromStdString(n);
     }
     if (!b.text.empty()) lines << QString::fromStdString(b.text);
     if (lines.isEmpty()) return;

@@ -455,12 +455,27 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
         burnClipName_ = new QCheckBox(tr("Clip name"), row);
         burnClipName_->setObjectName(QStringLiteral("burnClipName"));
         burnClipName_->setChecked(st.value("export/burnClipName", false).toBool());
+        // Film: feet and frames, and the key and ink numbers of the frame on screen.
+        burnFootage_ = new QCheckBox(tr("Feet+frames"), row);
+        burnFootage_->setObjectName(QStringLiteral("burnFootage"));
+        burnFootage_->setChecked(st.value("export/burnFootage", false).toBool());
+        burnFootage_->setToolTip(tr("In the sequence's film gauge (Sequence Settings)"));
+        burnKeyNumber_ = new QCheckBox(tr("Key number"), row);
+        burnKeyNumber_->setObjectName(QStringLiteral("burnKeyNumber"));
+        burnKeyNumber_->setChecked(st.value("export/burnKeyNumber", false).toBool());
+        burnKeyNumber_->setToolTip(tr("The negative's key number of the frame on screen (from film scans' headers and logs)"));
+        burnInkNumber_ = new QCheckBox(tr("Ink number"), row);
+        burnInkNumber_->setObjectName(QStringLiteral("burnInkNumber"));
+        burnInkNumber_->setChecked(st.value("export/burnInkNumber", false).toBool());
         burnCorner_ = new QComboBox(row);
         burnCorner_->setObjectName(QStringLiteral("burnCorner"));
         burnCorner_->addItems(corners);
         burnCorner_->setCurrentIndex(std::clamp(st.value("export/burnCorner", 0).toInt(), 0, 5));
         rl->addWidget(burnTimecode_);
         rl->addWidget(burnClipName_);
+        rl->addWidget(burnFootage_);
+        rl->addWidget(burnKeyNumber_);
+        rl->addWidget(burnInkNumber_);
         rl->addWidget(burnCorner_, 1);
         form->addRow(tr("Burn in:"), row);
         burnText_ = new QLineEdit(form_);
@@ -1088,6 +1103,9 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     if (hasVideo(s)) {
         s.burnIn.timecode = burnTimecode_->isChecked();
         s.burnIn.clipName = burnClipName_->isChecked();
+        s.burnIn.footage = burnFootage_->isChecked();
+        s.burnIn.keyNumber = burnKeyNumber_->isChecked();
+        s.burnIn.inkNumber = burnInkNumber_->isChecked();
         s.burnIn.text = burnText_->text().trimmed().toStdString();
         s.burnIn.corner = burnCorner_->currentIndex();
         s.burnIn.watermark = watermark_->text().trimmed().toStdString();
@@ -1099,6 +1117,9 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     }
     settings.setValue("export/burnTimecode", burnTimecode_->isChecked());
     settings.setValue("export/burnClipName", burnClipName_->isChecked());
+    settings.setValue("export/burnFootage", burnFootage_->isChecked());
+    settings.setValue("export/burnKeyNumber", burnKeyNumber_->isChecked());
+    settings.setValue("export/burnInkNumber", burnInkNumber_->isChecked());
     settings.setValue("export/burnText", burnText_->text());
     settings.setValue("export/burnCorner", burnCorner_->currentIndex());
     settings.setValue("export/watermark", watermark_->text());

@@ -1,5 +1,6 @@
 #include "ProjectIO.h"
 #include "Surround.h"
+#include "FilmCount.h"
 #include "Interpretation.h"
 #include "GradeGraph.h"
 
@@ -720,6 +721,7 @@ QJsonObject sequenceToJson(const Sequence& s) {
     if (s.vr180) o["vr180"] = true;
     if (s.stereo3d) o["stereo3d"] = true;
     if (s.audioLayout != "stereo") o["audioLayout"] = qs(s.audioLayout);
+    if (!s.filmGauge.empty()) o["filmGauge"] = qs(s.filmGauge);
     return o;
 }
 
@@ -782,6 +784,8 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     s.stereo3d = o.value("stereo3d").toBool(false);
     s.audioLayout = o.contains("audioLayout") ? ss(o.value("audioLayout")) : "stereo";
     if (std::find(audioLayouts().begin(), audioLayouts().end(), s.audioLayout) == audioLayouts().end()) s.audioLayout = "stereo";
+    s.filmGauge = ss(o.value("filmGauge"));
+    if (!s.filmGauge.empty()) s.filmGauge = filmGauge(s.filmGauge).id;
     for (const auto& t : o.value("video").toArray()) s.videoTracks.push_back(trackFromJson(t.toObject(), TrackKind::Video));
     for (const auto& t : o.value("audio").toArray()) s.audioTracks.push_back(trackFromJson(t.toObject(), TrackKind::Audio));
     s.markers = markersFromJson(o.value("markers"));

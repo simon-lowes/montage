@@ -299,6 +299,9 @@ public:
     // the selected media (else all) as an ALE.
     int importAle(const QString& path, bool cdlToClips = true);
     bool exportAle(const QString& path);
+    // Film lists of the active sequence (render/FilmLists.h): .txt, .csv or .pdf; with `earlier` (another sequence),
+    // the change list from it too.
+    bool exportFilmLists(const QString& path, Id earlier = 0);
     // ASC CDL files (core/Cdl.h): a .cc, .ccc or .cdl onto the selected video clips (one correction onto all of them,
     // a collection matched by id to each clip's name, file or tape), returning how many clips were graded; the selected
     // clips' CDLs (else every clip with one) as a .cc (one) or a .ccc or .cdl.
