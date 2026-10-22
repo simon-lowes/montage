@@ -38,6 +38,9 @@
 #include "core/GradeGraph.h"
 #include "core/AudioChannels.h"
 #include "core/Aaf.h"
+#include "core/AvidBin.h"
+#include "core/AvidBinImport.h"
+#include "core/MarkerList.h"
 #include "core/Bleep.h"
 #include "core/AutoTag.h"
 #include "core/Cfb.h"
@@ -3007,7 +3010,9 @@ private slots:
         auto rms = [&](const std::vector<float>& v, int ch, int channels, double from = 0.5) {
             double acc = 0;
             size_t count = 0;
-            for (size_t i = size_t(from * rate) + lat; i < v.size() / size_t(channels); ++i, ++count) acc += double(v[i * size_t(channels) + size_t(ch)]) * v[i * size_t(channels) + size_t(ch)];
+            // (A negative `from` reaches back into the latency; never before the start.)
+            for (size_t i = size_t(std::max<int64_t>(0, std::llround(from * rate) + lat)); i < v.size() / size_t(channels); ++i, ++count)
+                acc += double(v[i * size_t(channels) + size_t(ch)]) * v[i * size_t(channels) + size_t(ch)];
             return std::sqrt(acc / std::max<size_t>(1, count));
         };
         auto db = [](double a, double b) { return 20 * std::log10(std::max(a, 1e-12) / std::max(b, 1e-12)); };
@@ -12504,6 +12509,1111 @@ private slots:
         QVERIFY2(err.find("1920 x 1080") != std::string::npos, err.c_str());
         QVERIFY(QDir(cancelled).isEmpty());
         QVERIFY(!QFileInfo::exists(QString::fromStdString(path("avid-refused.aaf"))));
+    }
+
+    void avidBinReader() {
+        // pyavb's own sample bin (a Media Composer bin of 160 items: 52 master clips, their 107 source mobs and one
+        // sequence) read into the model, against facts pyavb reports for it.
+        const std::string sample = MONTAGE_TEST_DATA_DIR "/avb/test_file_01.avb";
+        AvidBin bin;
+        std::string err;
+        QVERIFY2(readAvidBin(sample, bin, &err), err.c_str());
+        QVERIFY2(bin.issues.empty(), bin.issues.empty() ? "" : bin.issues[0].c_str());
+        QVERIFY(!bin.bigEndian);
+        QCOMPARE(bin.items.size(), size_t(160));
+        QCOMPARE(bin.mobs.size(), size_t(160));
+        std::map<std::string, int> types;
+        for (const AvidMob& m : bin.mobs) ++types[m.mobType];
+        QCOMPARE(types["SourceMob"], 107);
+        QCOMPARE(types["MasterMob"], 52);
+        QCOMPARE(types["CompositionMob"], 1);
+        QCOMPARE(bin.items[0].x, int16_t(-30000));
+        QVERIFY(bin.items[0].userPlaced);
+        QCOMPARE(bin.mobs[size_t(bin.items[1].mob)].name, std::string("96_116_20_03_01.mov"));
+        // The view: its name and 186 columns, the first few as Media Composer lists them; the bin's own attributes.
+        QCOMPARE(bin.viewName, std::string("Untitled"));
+        QCOMPARE(bin.viewKind, std::string("Bin View"));
+        QCOMPARE(bin.columns.size(), size_t(186));
+        QCOMPARE(bin.columns[0].title, std::string("Color"));
+        QCOMPARE(bin.columns[0].format, int16_t(105));
+        QCOMPARE(bin.columns[0].type, int16_t(51));
+        QCOMPARE(bin.columns[2].title, std::string("Name"));
+        QCOMPARE(bin.columns[3].title, std::string("Auxiliary TC3"));
+        QVERIFY(bin.columns[3].hidden);
+        QCOMPARE(bin.columns[9].title, std::string("Duration"));
+        QVERIFY(!bin.columns[9].hidden);
+        QCOMPARE(bin.displayMode, int16_t(0));
+        QCOMPARE(bin.displayMask, 98999);
+        QCOMPARE(bin.uid, uint64_t(242134121498348758ull));
+        const AvidAttribute* font = findAvidAttribute(bin.attributes, "ATTR__BIN_FONT_NAME");
+        QVERIFY(font);
+        QCOMPARE(font->text, std::string("Geneva"));
+        const AvidAttribute* arrived = findAvidAttribute(bin.attributes, "NewlyArrivedMobList");
+        QVERIFY(arrived && arrived->kind == AvidAttribute::Kind::Object && arrived->objectClass == "ATTR");
+        QCOMPARE(arrived->children.size(), size_t(52));
+
+        // The sequence: its ID (as pyavb writes it, and as the 32 bytes AAF keeps), length, rate and track layout.
+        const AvidMob* seq = nullptr;
+        for (const AvidMob& m : bin.mobs)
+            if (m.mobType == "CompositionMob") seq = &m;
+        QVERIFY(seq);
+        QCOMPARE(seq->name, std::string("Demo_2012_v0002.Exported.01"));
+        QCOMPARE(seq->urn, std::string("urn:smpte:umid:060a2b34.01010101.01010f00.13000000.060e2b34.7f7f2a80.5be90cf4.b17e035c"));
+        QCOMPARE(std::string(seq->mobId.begin(), seq->mobId.end()), aafMobIdFromUmid(seq->urn.substr(15)));
+        QCOMPARE(bin.findMob(seq->mobId), seq);
+        QCOMPARE(seq->length, int64_t(4794));
+        QCOMPARE(QString::asprintf("%.3f", seq->editRate), QString("23.976"));
+        QCOMPARE(seq->usageCode, 0);
+        QCOMPARE(seq->lastModified, int64_t(1541999860));
+        QCOMPARE(seq->creationTime.value_or(0), int64_t(1379890496));
+        QVERIFY(!seq->descriptor);
+        QStringList layout;
+        for (const AvidTrack& t : seq->tracks)
+            layout << QString("%1 %2 %3").arg(t.index.value_or(-1)).arg(QString::fromStdString(t.component->mediaKind),
+                                                                         QString::fromStdString(t.component->classId));
+        QCOMPARE(layout.join(", "), QString("1 timecode TCCP, 3 timecode MASK, 2 timecode TCCP, 4 timecode TCCP, 5 timecode MASK, "
+                                            "6 timecode MASK, 7 timecode MASK, 1 edgecode ECCP, 8 timecode MASK, 1 picture SEQU, "
+                                            "2 picture SEQU, 3 picture SEQU, 4 picture SEQU, 1 sound SEQU, 2 sound SEQU"));
+        const AvidComponent& tc = *seq->tracks[0].component;
+        QCOMPARE(tc.fps, uint16_t(24));
+        QCOMPARE(tc.timecodeStart, uint32_t(86400));
+        QCOMPARE(tc.length, int64_t(4794));
+        // A capture mask over 30 fps drop-frame timecode.
+        const AvidComponent& mask = *seq->tracks[4].component;
+        QCOMPARE(mask.effectId, std::string("EFF_TIMEWARP.CAPTURE_MASK"));
+        QCOMPARE(mask.maskBits, uint32_t(3623878656u));
+        QCOMPARE(mask.tracks.size(), size_t(1));
+        QCOMPARE(mask.tracks[0].component->fps, uint16_t(30));
+        QCOMPARE(mask.tracks[0].component->timecodeFlags & 1, 1u);
+        QCOMPARE(QByteArray::fromStdString(seq->tracks[7].component->edgeHeader), QByteArray("001\0    ", 8));
+        // V1: 58 components, starting with two fillers, a dissolve and source clips; motion effects and resizes with
+        // their inputs.
+        const AvidComponent& v1 = *seq->tracks[9].component;
+        QCOMPARE(v1.components.size(), size_t(58));
+        QCOMPARE(v1.length, int64_t(4794));
+        QStringList head;
+        for (size_t i = 0; i < 6; ++i)
+            head << QString("%1 %2").arg(QString::fromStdString(v1.components[i]->classId)).arg(v1.components[i]->length);
+        QCOMPARE(head.join(", "), QString("FILL 0, FILL 167, TNFX 33, SCLP 219, SCLP 295, SCLP 142"));
+        const AvidComponent& dissolve = *v1.components[2];
+        QCOMPARE(dissolve.effectId, std::string("EFF2_BLEND_DISSOLVE"));
+        QCOMPARE(dissolve.cutPoint, 0);
+        QCOMPARE(dissolve.tracks.size(), size_t(2));
+        QVERIFY(!dissolve.tracks[0].component);
+        const AvidComponent& clip = *v1.components[3];
+        QCOMPARE(avidMobIdUrn(clip.mobId), std::string("urn:smpte:umid:060a2b34.01010101.01010f00.13000000.060e2b34.7f7f2a80.4e87d127.f00104ce"));
+        QCOMPARE(clip.trackId, int16_t(1));
+        QCOMPARE(clip.startTime, 136);
+        QVERIFY(findAvidAttribute(clip.attributes, "_BOUNDS_REFORMATTING_OPTION")->kind == AvidAttribute::Kind::Int);
+        const AvidComponent& motion = *v1.components[27];
+        QCOMPARE(motion.classId, std::string("SPED"));
+        QCOMPARE(motion.effectId, std::string("EFF_TIMEWARP.MOTION_CTL"));
+        QCOMPARE(motion.length, int64_t(56));
+        QCOMPARE(motion.speedNum, 1000);
+        QCOMPARE(motion.speedDen, 1001);
+        QCOMPARE(motion.parameters.size(), size_t(2));
+        QCOMPARE(motion.parameters[1].name, std::string("SpeedRatio"));
+        QCOMPARE(motion.parameters[1].doubleValue, 1000.0 / 1001.0);
+        const AvidComponent& slowed = *motion.tracks[0].component;
+        QCOMPARE(slowed.classId, std::string("SEQU"));
+        QCOMPARE(slowed.components[1]->classId, std::string("SCLP"));
+        QCOMPARE(slowed.components[1]->length, int64_t(57));
+        const AvidComponent& resize = *v1.components[33];
+        QCOMPARE(resize.classId, std::string("TKFX"));
+        QCOMPARE(resize.effectId, std::string("EFF2_BLEND_RESIZE"));
+        QCOMPARE(resize.tracks[0].component->components[1]->classId, std::string("SPED"));
+        QVERIFY(resize.tracks[0].fillerProxy);
+        QCOMPARE(v1.components[56]->effectId, std::string("EFF2_BLEND_GRAPHIC"));
+        const AvidAttribute* title = findAvidAttribute(v1.components[56]->attributes, "AGraphicFXAttr");
+        QVERIFY(title && title->objectClass == "GRFX");
+        // A1: pan and volume over its clip, with a volume curve, then an audio dissolve with its level curve.
+        const AvidComponent& a1 = *seq->tracks[13].component;
+        const AvidComponent& panVol = *a1.components[1];
+        QCOMPARE(panVol.classId, std::string("PVOL"));
+        QCOMPARE(panVol.effectId, std::string("Audio Pan Volume"));
+        QCOMPARE(panVol.level, 536870912);
+        QCOMPARE(panVol.pan, 16384);
+        QCOMPARE(panVol.tracks[0].component->classId, std::string("SCLP"));
+        const AvidComponent& volume = *panVol.tracks[1].component;
+        QCOMPARE(volume.classId, std::string("CTRL"));
+        QCOMPARE(volume.points.size(), size_t(1));
+        QCOMPARE(volume.points[0].offsetNum, 3488);
+        QCOMPARE(volume.points[0].valueNum, 40323990);
+        const AvidComponent& fade = *a1.components[2];
+        QCOMPARE(fade.effectId, std::string("BLEND_AUDIO_DISSOLVE"));
+        QCOMPARE(fade.cutPoint, 152);
+        QCOMPARE(fade.parameters[2].name, std::string("Level"));
+        QCOMPARE(fade.parameters[2].interpKind, 3);
+        QCOMPARE(fade.parameters[2].points.size(), size_t(2));
+        QCOMPARE(fade.parameters[2].points[1].offsetNum, 151);
+        QCOMPARE(fade.parameters[2].points[1].value, 1.0);
+
+        // A master clip to its media: the master mob's clip names the file mob (a DV picture descriptor, with the MXF
+        // file's path on its physical media), whose clip names the source mob of the QuickTime it was made from.
+        const AvidMob* master = bin.mobs.data() + bin.items[1].mob;
+        QCOMPARE(master->mobType, std::string("MasterMob"));
+        QCOMPARE(master->length, int64_t(57));
+        QCOMPARE(master->editRate, 24.0);
+        QCOMPARE(master->urn, std::string("urn:smpte:umid:060a2b34.01010101.01010f00.13000000.060e2b34.7f7f2a80.48c9f1f4.2aba0184"));
+        const AvidAttribute* user = findAvidAttribute(master->attributes, "_USER");
+        QVERIFY(user && user->objectClass == "ATTR");
+        QCOMPARE(findAvidAttribute(user->children, "UNC Path")->text, std::string("X:\\demo\\film\\luna\\quicktimes\\96_116_20_03_01.mov"));
+        QCOMPARE(findAvidAttribute(master->attributes, "_ORG_BIN")->objectClass, std::string("MCBR"));
+        const AvidMob* file = bin.findMob(master->tracks[0].component->mobId);
+        QVERIFY(file);
+        QCOMPARE(file->name, std::string("96_116_20_03_01.mov.PHYS"));
+        QCOMPARE(file->mobType, std::string("SourceMob"));
+        QVERIFY(file->descriptor);
+        const AvidDescriptor& cdci = *file->descriptor;
+        QCOMPARE(cdci.classId, std::string("CDCI"));
+        QCOMPARE(cdci.mobKind, uint8_t(1));
+        QCOMPARE(cdci.length, 57);
+        QCOMPARE(cdci.editRate, 24.0);
+        QCOMPARE(cdci.storedWidth, 720);
+        QCOMPARE(cdci.storedHeight, 480);
+        QCOMPARE(cdci.aspectNum, 4);
+        QCOMPARE(cdci.aspectDen, 3);
+        QCOMPARE(cdci.compression, std::string("DV/C"));
+        QCOMPARE(cdci.locator->classId, std::string("MSML"));
+        QCOMPARE(avidMobIdUrn(*cdci.locator->mobId), file->urn);
+        QCOMPARE(cdci.physicalMedia->classId, std::string("MDES"));
+        QCOMPARE(cdci.physicalMedia->locator->classId, std::string("FILE"));
+        QCOMPARE(cdci.physicalMedia->locator->pathPosix, std::string("/Giraffe/Marty/Avid MediaFiles/MXF/1/96_116_20_03_01.mov48C9F1F4.mxf"));
+        QCOMPARE(cdci.physicalMedia->locator->path, std::string("Macintosh HD/Giraffe/Marty/Avid MediaFiles/MXF/1/96_116_20_03_01.mov48C9F1F4.mxf"));
+        const AvidMob* original = bin.findMob(file->tracks[0].component->mobId);
+        QVERIFY(original);
+        QCOMPARE(original->descriptor->classId, std::string("MDES"));
+        QCOMPARE(original->descriptor->mobKind, uint8_t(5));
+        QCOMPARE(original->descriptor->locator->pathPosix, std::string("/Giraffe/Bunny/X/demo/film/luna/quicktimes/96_116_20_03_01.mov"));
+        // Sound file mobs: PCM, one channel, 48 kHz.
+        int pcm = 0;
+        for (const AvidMob& m : bin.mobs)
+            if (m.descriptor && m.descriptor->classId == "PCMA") {
+                QCOMPARE(m.descriptor->channels, uint16_t(1));
+                QCOMPARE(m.descriptor->bitsPerSample, uint16_t(16));
+                QCOMPARE(m.descriptor->sampleRate, 48000.0);
+                ++pcm;
+            }
+        QCOMPARE(pcm, 2);
+
+        // Damaged copies: cut short anywhere, the read fails with a reason; bytes changed inside objects never crash it
+        // (an object it cannot make sense of is listed, or the read fails); a sequence made to contain itself is cut.
+        QFile in(QString::fromStdString(sample));
+        QVERIFY(in.open(QIODevice::ReadOnly));
+        const QByteArray bytes = in.readAll();
+        for (const qsizetype cut : {qsizetype(0), qsizetype(1), qsizetype(8), qsizetype(40), qsizetype(100), bytes.size() / 3,
+                                    bytes.size() / 2, bytes.size() - 1}) {
+            AvidBin damaged;
+            err.clear();
+            QVERIFY(!readAvidBinData(bytes.left(cut).toStdString(), damaged, &err));
+            QVERIFY(!err.empty());
+            QVERIFY(damaged.mobs.empty());
+        }
+        QVERIFY(!readAvidBinData(std::string("\x07\x00" "Domain", 8) + bytes.mid(8).toStdString(), bin, &err));
+        QCOMPARE(err, std::string("not a Media Composer bin"));
+        std::mt19937 rng(9);
+        int readAnyway = 0;
+        for (int i = 0; i < 150; ++i) {
+            std::string d = bytes.toStdString();
+            for (int k = 0, n = 1 + int(rng() % 6); k < n; ++k) d[2048 + rng() % (d.size() - 2048)] = char(rng());
+            AvidBin damaged;
+            if (readAvidBinData(d, damaged, &err)) ++readAnyway;
+        }
+        QVERIFY(readAnyway > 0);
+        {
+            // Walk the object table to the first sequence that holds a component, and point that at the sequence.
+            const auto u16 = [&](qsizetype at) { return qFromLittleEndian<quint16>(bytes.constData() + at); };
+            const auto u32 = [&](qsizetype at) { return qFromLittleEndian<quint32>(bytes.constData() + at); };
+            const auto text = [&](qsizetype at) { return u16(at) == 0xffff ? 2 : 2 + u16(at); };
+            qsizetype at = 12;
+            at += text(at) + 1;
+            at += text(at);
+            const quint32 count = u32(at);
+            at += 28;
+            at += text(at) + 16;
+            QByteArray looped = bytes;
+            bool patched = false;
+            for (quint32 i = 1; i <= count && !patched; ++i) {
+                const quint32 size = u32(at + 4);
+                if (bytes.mid(at, 4) == "UQES") {
+                    qsizetype p = at + 8 + 18;
+                    p += text(p);
+                    p += text(p);
+                    p += 12;
+                    if (bytes[p] == 0x01) p += 7;
+                    if (u32(p + 2) > 0) {
+                        qToLittleEndian<quint32>(i, looped.data() + p + 6);
+                        patched = true;
+                    }
+                }
+                at += 8 + size;
+            }
+            QVERIFY(patched);
+            AvidBin loop;
+            QVERIFY2(readAvidBinData(looped.toStdString(), loop, &err), err.c_str());
+            QVERIFY(std::any_of(loop.issues.begin(), loop.issues.end(),
+                                [](const std::string& i) { return i.find("SEQU: it refers back to itself") != std::string::npos; }));
+            QCOMPARE(loop.mobs.size(), size_t(160));
+        }
+
+        // pyavb itself: its reading of the sample, the sample rewritten big-endian, and a bin it writes with a master
+        // clip, its file and tape mobs and a sequence of a filler, a clip with a locator, a dissolve and a clip.
+        const QByteArray python = qgetenv("MONTAGE_TEST_PYAVB");
+        if (python.isEmpty()) {
+            qInfo("The comparison with pyavb is skipped: MONTAGE_TEST_PYAVB names no Python with pyavb");
+            return;
+        }
+        const QString script = QString::fromStdString(path("avb_reference.py"));
+        {
+            QFile f(script);
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(R"py(import binascii, datetime, json, sys
+import avb
+
+def rate(r):
+    return '%.6f' % r
+
+def stamp(d):
+    return int(d.timestamp()) if isinstance(d, datetime.datetime) else d
+
+def attrs(a, depth=0):
+    out = {}
+    if a is None or depth > 8:
+        return out
+    for k, v in a.items():
+        if isinstance(v, bool):
+            v = int(v)
+        if isinstance(v, int):
+            out[k] = v
+        elif isinstance(v, str):
+            out[k] = v
+        elif isinstance(v, (bytes, bytearray)):
+            out[k] = 'bytes:' + binascii.hexlify(bytes(v)).decode()
+        elif v is None:
+            out[k] = 'obj:'
+        elif v.class_id == b'ATTR':
+            out[k] = attrs(v, depth + 1)
+        else:
+            out[k] = 'obj:' + v.class_id.decode()
+    return out
+
+def locators(c):
+    a = c.property_data.get('attributes')
+    if a is None:
+        return []
+    crumbs = a.get('_TMP_CRM')
+    if crumbs is None or getattr(crumbs, 'class_id', None) != b'TMCS':
+        return []
+    out = []
+    for m in crumbs:
+        out.append({'offset': m.comp_offset, 'position': m.position, 'color': list(m.color),
+                    'mob': str(m.mob_id) if 'mob_id' in m.property_data else '',
+                    'attrs': attrs(m.attributes)})
+    return out
+
+def params(c):
+    pl = c.property_data.get('param_list')
+    if pl is None:
+        return None
+    out = []
+    for p in pl:
+        e = {'uuid': str(p.uuid), 'type': p.value_type, 'enabled': bool(p.enable)}
+        if p.value_type == 1:
+            e['value'] = p.value
+        elif p.value_type == 2:
+            e['value'] = '%.9g' % p.value
+        ct = p.control_track
+        if ct is not None and ct.class_id == b'PRCL' and ct.control_points:
+            e['interp'] = ct.interp_kind
+            e['points'] = [[cp.offset[0], cp.offset[1], cp.timescale, '%.9g' % (cp.value if ct.value_type != 4 else 0)]
+                           for cp in ct.control_points]
+        out.append(e)
+    return out
+
+def component(c, depth=0):
+    if c is None:
+        return None
+    pd = c.property_data
+    d = {'class': c.class_id.decode(), 'kind': c.media_kind, 'rate': rate(c.edit_rate),
+         'name': pd.get('name') or '', 'effect': pd.get('effect_id') or ''}
+    if c.class_id == b'SEQU':
+        d['length'] = c.length
+        d['items'] = [component(x, depth + 1) for x in c.components]
+    elif 'length' in pd:
+        d['length'] = c.length
+    if 'attributes' in pd and c.attributes:
+        d['attrs'] = attrs(c.attributes)
+    locs = locators(c)
+    if locs:
+        d['locators'] = locs
+    ps = params(c)
+    if ps:
+        d['params'] = ps
+    cid = c.class_id
+    if cid == b'SCLP':
+        d.update({'mob': str(c.mob_id), 'track': c.track_id, 'start': c.start_time})
+    elif cid == b'TCCP':
+        d.update({'fps': c.fps, 'start': c.start, 'flags': c.flags})
+    elif cid == b'ECCP':
+        d.update({'start': c.start_ec, 'film': c.film_kind, 'format': c.code_format, 'perf': c.base_perf,
+                  'header': binascii.hexlify(bytes(c.header)).decode()})
+    elif cid == b'TRKR':
+        d.update({'scope': c.relative_scope, 'rel': c.relative_track})
+    elif cid == b'CTRL':
+        d['points'] = [[cp.offset[0], cp.offset[1], cp.time_scale, cp.value[0], cp.value[1]] for cp in c.control_points]
+    if 'tracks' in pd:
+        d['tracks'] = [track(t, depth + 1) for t in c.tracks]
+        if cid == b'TNFX':
+            d['cut'] = c.cutpoint
+        elif cid == b'SPED':
+            d.update({'speed': list(c.speed_ratio), 'phase': c.phase_offset})
+        elif cid == b'MASK':
+            d.update({'bits': c.mask_bits, 'double': bool(c.is_double), 'phase': c.phase_offset})
+        elif cid == b'SLCT':
+            d.update({'selected': c.selected, 'ganged': bool(c.is_ganged)})
+        elif cid == b'PVOL':
+            d.update({'level': c.level, 'pan': c.pan})
+    return d
+
+def track(t, depth=0):
+    pd = t.property_data
+    return {'index': pd.get('index'), 'component': component(pd.get('component'), depth),
+            'filler_proxy': component(pd.get('filler_proxy'), depth)}
+
+def locator(l):
+    if l is None:
+        return None
+    pd = l.property_data
+    d = {'class': l.class_id.decode()}
+    for k in ('path', 'path_posix', 'path_utf8', 'path2_utf8', 'last_known_volume', 'last_known_volume_utf8', 'domain_type'):
+        if pd.get(k):
+            d[k] = pd[k]
+    if 'mob_id' in pd:
+        d['mob'] = str(pd['mob_id'])
+    return d
+
+def descriptor(x):
+    if x is None:
+        return None
+    pd = x.property_data
+    d = {'class': x.class_id.decode(), 'mob_kind': x.mob_kind, 'locator': locator(pd.get('locator')),
+         'physical': descriptor(pd.get('physical_media'))}
+    if 'attributes' in pd and x.attributes:
+        d['attrs'] = attrs(x.attributes)
+    if 'length' in pd:
+        d.update({'rate': rate(x.edit_rate), 'length': x.length})
+    if 'descriptors' in pd:
+        d['children'] = [descriptor(y) for y in x.descriptors]
+    if 'stored_width' in pd:
+        d.update({'width': x.stored_width, 'height': x.stored_height, 'display': [x.display_width, x.display_height],
+                  'aspect': list(x.aspect_ratio), 'compression': x.compress_method.decode('latin-1')})
+    if 'channels' in pd:
+        d.update({'channels': x.channels, 'bits': x.quantization_bits, 'sample_rate': rate(x.sample_rate)})
+    return d
+
+def mob(m):
+    pd = m.property_data
+    return {'name': m.name or '', 'id': str(m.mob_id), 'type': m.mob_type, 'usage': m.usage_code,
+            'length': m.length, 'rate': rate(m.edit_rate), 'modified': stamp(m.last_modified),
+            'created': stamp(pd.get('creation_time', 0)), 'attrs': attrs(m.attributes),
+            'descriptor': descriptor(pd.get('descriptor')), 'tracks': [track(t) for t in m.tracks]}
+
+def dump(path):
+    with avb.open(path) as f:
+        b = f.content
+        v = b.view_setting
+        mobs, seen, items = [], set(), []
+        for it in b.items:
+            m = it.mob
+            urn = str(m.mob_id)
+            items.append([urn, it.x, it.y, it.keyframe, bool(it.user_placed)])
+            if urn not in seen:
+                seen.add(urn)
+                mobs.append(mob(m))
+        out = {'items': items, 'mobs': mobs, 'display_mode': b.display_mode, 'display_mask': b.display_mask,
+               'sort': [[s[0], s[1]] for s in b.sort_columns], 'attrs': attrs(b.attributes),
+               'view': {'name': v.name, 'kind': v.kind,
+                        'columns': [[c['title'], c['format'], c['type'], bool(c['hidden'])] for c in v.columns]}}
+    json.dump(out, sys.stdout, sort_keys=True)
+
+def rewrite(src, dst, order):
+    with avb.open(src) as f:
+        for m in f.content.mobs:
+            pass
+        f.write(dst, byte_order=order)
+
+def make(path):
+    with avb.open() as f:
+        rate = 25
+        tape = f.create.Composition(mob_type='SourceMob')
+        tape.name = 'Tape 7'
+        tape.descriptor = f.create.TapeDescriptor()
+        tape.descriptor.mob_kind = 2
+        tape.length = 2160000
+        t = f.create.Track()
+        t.index = 1
+        t.component = f.create.Timecode(edit_rate=rate, media_kind='timecode')
+        t.component.length = 2160000
+        t.component.start = 90000
+        tape.tracks.append(t)
+        t = f.create.Track()
+        t.index = 1
+        t.component = f.create.SourceClip(edit_rate=rate, media_kind='picture')
+        t.component.length = 2160000
+        tape.tracks.append(t)
+
+        src = f.create.Composition(mob_type='SourceMob')
+        src.name = 'A001C003.PHYS'
+        src.descriptor = f.create.CDCIDescriptor()
+        src.descriptor.mob_kind = 1
+        src.descriptor.length = 250
+        src.descriptor.edit_rate = rate
+        loc = f.create.MacFileLocator()
+        loc.path = 'Media/Avid MediaFiles/MXF/1/A001C003.mxf'
+        loc.path_posix = '/Volumes/Media/Avid MediaFiles/MXF/1/A001C003.mxf'
+        loc.path_utf8 = '/Volumes/Media/Avid MediaFiles/MXF/1/A001C003.mxf'
+        src.descriptor.locator = loc
+        src.length = 250
+        t = f.create.Track()
+        t.index = 1
+        t.component = f.create.SourceClip(edit_rate=rate, media_kind='picture')
+        t.component.length = 250
+        t.component.track_id = 1
+        t.component.start_time = 90000 + 100
+        t.component.mob_id = tape.mob_id
+        src.tracks.append(t)
+
+        master = f.create.Composition(mob_type='MasterMob')
+        master.name = 'A001C003'
+        master.length = 250
+        t = f.create.Track()
+        t.index = 1
+        t.component = f.create.SourceClip(edit_rate=rate, media_kind='picture')
+        t.component.length = 250
+        t.component.track_id = 1
+        t.component.mob_id = src.mob_id
+        master.tracks.append(t)
+        user = f.create.Attributes()
+        user['Scene'] = '12A'
+        user['Take'] = '3'
+        master.attributes['_USER'] = user
+
+        comp = f.create.Composition(mob_type='CompositionMob')
+        comp.name = 'Scene 12 Cut'
+        seq = f.create.Sequence(edit_rate=rate, media_kind='picture')
+        fill = f.create.Filler(edit_rate=rate, media_kind='picture')
+        fill.length = 10
+        seq.components.append(fill)
+        clip = f.create.SourceClip(edit_rate=rate, media_kind='picture')
+        clip.track_id = 1
+        clip.start_time = 20
+        clip.length = 100
+        clip.mob_id = master.mob_id
+        crumbs = f.create.TimeCrumbList()
+        marker = f.create.Marker()
+        marker.mob_id = comp.mob_id
+        marker.position = 0
+        marker.comp_offset = 40
+        marker.color = [65535, 0, 0]
+        marker.attributes = f.create.Attributes()
+        marker.attributes['_ATN_CRM_COM'] = 'Fix the boom'
+        marker.attributes['_ATN_CRM_COLOR'] = 'Red'
+        marker.attributes['_ATN_CRM_USER'] = 'editor'
+        crumbs.append(marker)
+        clip.attributes['_TMP_CRM'] = crumbs
+        seq.components.append(clip)
+        tran = f.create.TransitionEffect(edit_rate=rate, media_kind='picture')
+        tran.effect_id = 'EFF2_BLEND_DISSOLVE'
+        tran.length = 12
+        tran.cutpoint = 6
+        for k in ('left_length', 'right_length', 'info_current', 'info_smooth', 'info_version', 'info_color_item',
+                  'info_quality', 'info_is_reversed'):
+            setattr(tran, k, 0)
+        for k in ('info_aspect_on', 'info_force_software', 'info_never_hardware'):
+            setattr(tran, k, False)
+        tran.keyframes = None
+        tran.tracks.append(f.create.Track())
+        tran.tracks.append(f.create.Track())
+        seq.components.append(tran)
+        clip = f.create.SourceClip(edit_rate=rate, media_kind='picture')
+        clip.track_id = 1
+        clip.start_time = 150
+        clip.length = 50
+        clip.mob_id = master.mob_id
+        seq.components.append(clip)
+        t = f.create.Track()
+        t.index = 1
+        t.component = seq
+        comp.tracks.append(t)
+        comp.length = seq.length
+
+        for m in (comp, master, src, tape):
+            f.content.add_mob(m)
+        f.write(path)
+
+def bomb(path):
+    # A sequence naming the next twice, 48 deep, and attributes the same: tiny on disk, 2^48 parts unfolded.
+    def walk_once(obj, seen=None):  # pyavb's walk_references, each object once
+        seen = set() if seen is None else seen
+        if hasattr(obj, 'class_id') and obj.class_id:
+            if id(obj) in seen:
+                return
+            seen.add(id(obj))
+        if isinstance(obj, list):
+            values = obj
+        elif isinstance(obj, dict):
+            values = obj.values()
+        else:
+            values = obj.property_data.values() if hasattr(obj, 'property_data') else []
+        for v in values:
+            if isinstance(v, avb.utils.AVBObjectRef):
+                v = v.value
+            if v is None:
+                continue
+            if isinstance(v, list):
+                for item in v:
+                    yield from walk_once(item, seen)
+            if hasattr(v, 'class_id') and v.class_id:
+                yield from walk_once(v, seen)
+        if hasattr(obj, 'class_id') and obj.class_id:
+            yield obj
+    avb.file.walk_references = walk_once
+    with avb.open() as f:
+        comp = f.create.Composition(mob_type='CompositionMob')
+        comp.name = 'Bomb'
+        inner = f.create.SourceClip(edit_rate=25, media_kind='picture')
+        inner.length = 1000
+        inner.track_id = 1
+        inner.start_time = 0
+        inner.mob_id = avb.mobid.MobID()
+        attrs = f.create.Attributes()
+        attrs['leaf'] = 1
+        for i in range(48):
+            seq = f.create.Sequence(edit_rate=25, media_kind='picture')
+            seq.components.append(inner)
+            seq.components.append(inner)
+            inner = seq
+            a = f.create.Attributes()
+            a['left'] = attrs
+            a['right'] = attrs
+            attrs = a
+        t = f.create.Track()
+        t.index = 1
+        t.component = inner
+        comp.tracks.append(t)
+        comp.attributes['_USER'] = attrs
+        comp.length = 1000
+        f.content.add_mob(comp)
+        f.write(path)
+
+if __name__ == '__main__':
+    if sys.argv[1] == 'bomb':
+        bomb(sys.argv[2])
+    elif sys.argv[1] == 'dump':
+        dump(sys.argv[2])
+    elif sys.argv[1] == 'rewrite':
+        rewrite(sys.argv[2], sys.argv[3], sys.argv[4])
+    elif sys.argv[1] == 'make':
+        make(sys.argv[2])
+)py");
+        }
+        const auto pyavb = [&](const QStringList& args) {
+            QProcess py;
+            py.start(QString::fromLocal8Bit(python), QStringList{"-I", script} + args);
+            py.waitForFinished(120000);
+            const QByteArray out = py.readAllStandardOutput();
+            return py.exitCode() == 0 && py.exitStatus() == QProcess::NormalExit ? out : QByteArray("error: ") + py.readAllStandardError();
+        };
+        // The model as JSON, in the form the pyavb script below writes.
+        const auto rate = [](double r) { return QString::asprintf("%.6f", r); };
+        const auto str = [](const std::string& s) { return QString::fromStdString(s); };
+        std::function<QJsonObject(const AvidAttributes&)> attrsJson = [&](const AvidAttributes& list) {
+            QJsonObject o;
+            for (const AvidAttribute& a : list) {
+                const QString k = str(a.name);
+                if (a.kind == AvidAttribute::Kind::Int) o[k] = a.intValue;
+                else if (a.kind == AvidAttribute::Kind::String) o[k] = str(a.text);
+                else if (a.kind == AvidAttribute::Kind::Bytes) o[k] = "bytes:" + QString::fromLatin1(QByteArray::fromStdString(a.text).toHex());
+                else if (a.objectClass == "ATTR") o[k] = attrsJson(a.children);
+                else o[k] = "obj:" + str(a.objectClass);
+            }
+            return o;
+        };
+        std::function<QJsonValue(const std::shared_ptr<const AvidComponent>&)> compJson;
+        const auto trackJson = [&](const AvidTrack& t) {
+            return QJsonObject{{"index", t.index ? QJsonValue(*t.index) : QJsonValue()},
+                               {"component", compJson(t.component)},
+                               {"filler_proxy", compJson(t.fillerProxy)}};
+        };
+        compJson = [&](const std::shared_ptr<const AvidComponent>& c) -> QJsonValue {
+            if (!c) return QJsonValue();
+            QJsonObject o{{"class", str(c->classId)},
+                          {"kind", c->mediaKind.empty() ? QJsonValue() : QJsonValue(str(c->mediaKind))},
+                          {"rate", rate(c->editRate)},
+                          {"name", str(c->name)},
+                          {"effect", str(c->effectId)},
+                          {"length", qint64(c->length)}};
+            if (!c->readable) o["error"] = str(c->error);
+            if (!c->attributes.empty()) o["attrs"] = attrsJson(c->attributes);
+            QJsonArray locs;
+            for (const AvidLocator& l : c->locators)
+                locs.append(QJsonObject{{"offset", l.offset},
+                                        {"position", l.position},
+                                        {"color", QJsonArray{l.rgb[0], l.rgb[1], l.rgb[2]}},
+                                        {"mob", l.mobId ? str(avidMobIdUrn(*l.mobId)) : QString()},
+                                        {"attrs", attrsJson(l.attributes)}});
+            if (!locs.isEmpty()) o["locators"] = locs;
+            QJsonArray params;
+            for (const AvidParameter& p : c->parameters) {
+                QJsonObject e{{"uuid", str(p.uuid)}, {"type", p.valueType}, {"enabled", p.enabled}};
+                if (p.valueType == 1) e["value"] = p.intValue;
+                else if (p.valueType == 2) e["value"] = QString::asprintf("%.9g", p.doubleValue);
+                if (!p.points.empty()) {
+                    e["interp"] = p.interpKind;
+                    QJsonArray pts;
+                    for (const AvidControlPoint& cp : p.points)
+                        pts.append(QJsonArray{cp.offsetNum, cp.offsetDen, cp.timeScale, QString::asprintf("%.9g", cp.value)});
+                    e["points"] = pts;
+                }
+                params.append(e);
+            }
+            if (!params.isEmpty()) o["params"] = params;
+            const std::string& k = c->classId;
+            if (k == "SEQU") {
+                QJsonArray items;
+                for (const auto& item : c->components) items.append(compJson(item));
+                o["items"] = items;
+            } else if (k == "SCLP") {
+                o["mob"] = str(avidMobIdUrn(c->mobId));
+                o["track"] = c->trackId;
+                o["start"] = c->startTime;
+            } else if (k == "TCCP") {
+                o["fps"] = c->fps;
+                o["start"] = qint64(c->timecodeStart);
+                o["flags"] = qint64(c->timecodeFlags);
+            } else if (k == "ECCP") {
+                o["start"] = c->edgeStart;
+                o["film"] = c->filmKind;
+                o["format"] = c->codeFormat;
+                o["perf"] = c->basePerf;
+                o["header"] = QString::fromLatin1(QByteArray::fromStdString(c->edgeHeader).toHex());
+            } else if (k == "TRKR") {
+                o["scope"] = c->relativeScope;
+                o["rel"] = c->relativeTrack;
+            } else if (k == "CTRL") {
+                QJsonArray pts;
+                for (const AvidControlPoint& cp : c->points) pts.append(QJsonArray{cp.offsetNum, cp.offsetDen, cp.timeScale, cp.valueNum, cp.valueDen});
+                o["points"] = pts;
+            }
+            if (c->isTrackGroup) {
+                QJsonArray tracks;
+                for (const AvidTrack& t : c->tracks) tracks.append(trackJson(t));
+                o["tracks"] = tracks;
+                if (k == "TNFX") {
+                    o["cut"] = c->cutPoint;
+                } else if (k == "SPED") {
+                    o["speed"] = QJsonArray{c->speedNum, c->speedDen};
+                    o["phase"] = c->phaseOffset;
+                } else if (k == "MASK") {
+                    o["bits"] = qint64(c->maskBits);
+                    o["double"] = c->isDouble;
+                    o["phase"] = c->phaseOffset;
+                } else if (k == "SLCT") {
+                    o["selected"] = c->selected;
+                    o["ganged"] = c->isGanged;
+                } else if (k == "PVOL") {
+                    o["level"] = c->level;
+                    o["pan"] = c->pan;
+                }
+            }
+            return o;
+        };
+        const auto locatorJson = [&](const std::optional<AvidMediaLocator>& l) -> QJsonValue {
+            if (!l) return QJsonValue();
+            QJsonObject o{{"class", str(l->classId)}};
+            const std::pair<const char*, const std::string*> texts[] = {{"path", &l->path},
+                                                                       {"path_posix", &l->pathPosix},
+                                                                       {"path_utf8", &l->pathUtf8},
+                                                                       {"path2_utf8", &l->path2Utf8},
+                                                                       {"last_known_volume", &l->lastKnownVolume},
+                                                                       {"last_known_volume_utf8", &l->lastKnownVolumeUtf8}};
+            for (const auto& [key, value] : texts)
+                if (!value->empty()) o[key] = str(*value);
+            if (l->domainType) o["domain_type"] = l->domainType;
+            if (l->mobId) o["mob"] = str(avidMobIdUrn(*l->mobId));
+            return o;
+        };
+        std::function<QJsonValue(const std::shared_ptr<const AvidDescriptor>&)> descJson = [&](const std::shared_ptr<const AvidDescriptor>& d) -> QJsonValue {
+            if (!d) return QJsonValue();
+            QJsonObject o{{"class", str(d->classId)}, {"mob_kind", d->mobKind}, {"locator", locatorJson(d->locator)}, {"physical", descJson(d->physicalMedia)}};
+            if (!d->readable) o["error"] = str(d->error);
+            if (!d->attributes.empty()) o["attrs"] = attrsJson(d->attributes);
+            if (d->isFile) {
+                o["rate"] = rate(d->editRate);
+                o["length"] = d->length;
+            }
+            if (d->classId == "MULD") {
+                QJsonArray children;
+                for (const auto& child : d->children) children.append(descJson(child));
+                o["children"] = children;
+            }
+            if (d->classId == "DIDD" || d->classId == "CDCI" || d->classId == "MPGI" || d->classId == "JPED" || d->classId == "RGBA") {
+                o["width"] = d->storedWidth;
+                o["height"] = d->storedHeight;
+                o["display"] = QJsonArray{d->displayWidth, d->displayHeight};
+                o["aspect"] = QJsonArray{d->aspectNum, d->aspectDen};
+                o["compression"] = str(d->compression);
+            }
+            if (d->classId == "PCMA" || d->classId == "MPGA") {
+                o["channels"] = d->channels;
+                o["bits"] = d->bitsPerSample;
+                o["sample_rate"] = rate(d->sampleRate);
+            }
+            return o;
+        };
+        const auto binJson = [&](const AvidBin& b) {
+            QJsonArray items, mobs, sort, columns;
+            for (const AvidBinItem& it : b.items)
+                items.append(QJsonArray{it.mob >= 0 ? str(b.mobs[size_t(it.mob)].urn) : QString(), it.x, it.y, it.keyframe, it.userPlaced});
+            std::set<std::string> seen;
+            for (const AvidMob& m : b.mobs) {
+                if (!seen.insert(m.urn).second) continue;
+                QJsonArray tracks;
+                for (const AvidTrack& t : m.tracks) tracks.append(trackJson(t));
+                mobs.append(QJsonObject{{"name", str(m.name)},
+                                        {"id", str(m.urn)},
+                                        {"type", str(m.mobType)},
+                                        {"usage", m.usageCode},
+                                        {"length", qint64(m.length)},
+                                        {"rate", rate(m.editRate)},
+                                        {"modified", qint64(m.lastModified)},
+                                        {"created", qint64(m.creationTime.value_or(0))},
+                                        {"attrs", attrsJson(m.attributes)},
+                                        {"descriptor", descJson(m.descriptor)},
+                                        {"tracks", tracks}});
+            }
+            for (const auto& [direction, column] : b.sortColumns) sort.append(QJsonArray{direction, str(column)});
+            for (const AvidBinColumn& c : b.columns) columns.append(QJsonArray{str(c.title), c.format, c.type, c.hidden});
+            return QJsonObject{{"items", items},
+                               {"mobs", mobs},
+                               {"display_mode", b.displayMode},
+                               {"display_mask", b.displayMask},
+                               {"sort", sort},
+                               {"attrs", attrsJson(b.attributes)},
+                               {"view", QJsonObject{{"name", str(b.viewName)}, {"kind", str(b.viewKind)}, {"columns", columns}}}};
+        };
+        const auto same = [&](const QJsonObject& got, const QByteArray& want, const char* name) {
+            if (got == QJsonDocument::fromJson(want).object()) return true;
+            QFile a(QString::fromStdString(path(name)) + "-montage.json"), b(QString::fromStdString(path(name)) + "-pyavb.json");
+            if (a.open(QIODevice::WriteOnly)) a.write(QJsonDocument(got).toJson());
+            if (b.open(QIODevice::WriteOnly)) b.write(QJsonDocument::fromJson(want).toJson());
+            qWarning() << "The readings differ; compare" << a.fileName() << "and" << b.fileName() << want.left(200);
+            return false;
+        };
+        QVERIFY(readAvidBin(sample, bin, &err));
+        const QJsonObject sampleJson = binJson(bin);
+        QVERIFY(same(sampleJson, pyavb({"dump", QString::fromStdString(sample)}), "sample"));
+
+        const std::string swapped = path("big-endian.avb");
+        const QByteArray rewritten = pyavb({"rewrite", QString::fromStdString(sample), QString::fromStdString(swapped), "big"});
+        QVERIFY2(rewritten.isEmpty(), rewritten.constData());
+        AvidBin big;
+        QVERIFY2(readAvidBin(swapped, big, &err), err.c_str());
+        QVERIFY(big.bigEndian);
+        QVERIFY(big.issues.empty());
+        QVERIFY(binJson(big) == sampleJson);
+
+        const std::string made = path("made.avb");
+        const QByteArray written = pyavb({"make", QString::fromStdString(made)});
+        QVERIFY2(written.isEmpty(), written.constData());
+        AvidBin mine;
+        QVERIFY2(readAvidBin(made, mine, &err), err.c_str());
+        QVERIFY(mine.issues.empty());
+        QVERIFY(same(binJson(mine), pyavb({"dump", QString::fromStdString(made)}), "made"));
+        QCOMPARE(mine.mobs.size(), size_t(4));
+        const AvidMob& cut = mine.mobs[0];
+        QCOMPARE(cut.name, std::string("Scene 12 Cut"));
+        QCOMPARE(cut.mobType, std::string("CompositionMob"));
+        QCOMPARE(cut.length, int64_t(148));
+        // A pyavb mob ID is a plain UUID material number, which keeps its order.
+        QCOMPARE(std::string(cut.mobId.begin(), cut.mobId.end()), aafMobIdFromUmid(cut.urn.substr(15)));
+        const AvidComponent& track = *cut.tracks[0].component;
+        QStringList items;
+        for (const auto& c : track.components) items << QString("%1 %2").arg(QString::fromStdString(c->classId)).arg(c->length);
+        QCOMPARE(items.join(", "), QString("FILL 10, SCLP 100, TNFX 12, SCLP 50"));
+        QCOMPARE(track.length, int64_t(148));
+        const AvidComponent& first = *track.components[1];
+        QCOMPARE(first.startTime, 20);
+        QCOMPARE(first.locators.size(), size_t(1));
+        const AvidLocator& loc = first.locators[0];
+        QCOMPARE(loc.offset, 40);
+        QCOMPARE(loc.comment, std::string("Fix the boom"));
+        QCOMPARE(loc.colorName, std::string("Red"));
+        QCOMPARE(loc.user, std::string("editor"));
+        QCOMPARE(loc.rgb[0], uint16_t(65535));
+        QVERIFY(loc.mobId && *loc.mobId == cut.mobId);
+        QCOMPARE(track.components[2]->effectId, std::string("EFF2_BLEND_DISSOLVE"));
+        QCOMPARE(track.components[2]->cutPoint, 6);
+        const AvidMob* clipMaster = mine.findMob(first.mobId);
+        QVERIFY(clipMaster);
+        QCOMPARE(clipMaster->name, std::string("A001C003"));
+        QCOMPARE(clipMaster->mobType, std::string("MasterMob"));
+        const AvidAttribute* columns = findAvidAttribute(clipMaster->attributes, "_USER");
+        QVERIFY(columns);
+        QCOMPARE(findAvidAttribute(columns->children, "Scene")->text, std::string("12A"));
+        QCOMPARE(findAvidAttribute(columns->children, "Take")->text, std::string("3"));
+        const AvidMob* clipFile = mine.findMob(clipMaster->tracks[0].component->mobId);
+        QVERIFY(clipFile && clipFile->descriptor);
+        QCOMPARE(clipFile->descriptor->classId, std::string("CDCI"));
+        QCOMPARE(clipFile->descriptor->length, 250);
+        QCOMPARE(clipFile->descriptor->locator->pathPosix, std::string("/Volumes/Media/Avid MediaFiles/MXF/1/A001C003.mxf"));
+        const AvidMob* tape = mine.findMob(clipFile->tracks[0].component->mobId);
+        QVERIFY(tape);
+        QCOMPARE(tape->name, std::string("Tape 7"));
+        QCOMPARE(tape->descriptor->classId, std::string("MDTP"));
+        QCOMPARE(clipFile->tracks[0].component->startTime, 90100);
+        QCOMPARE(tape->tracks[0].component->timecodeStart, uint32_t(90000));
+
+        // A hostile bin: a sequence naming the next twice and attributes doing the same, 48 deep (2^48 parts unfolded,
+        // a few kilobytes on disk), read and imported quickly with what was cut short said.
+        const std::string bombPath = path("bomb.avb");
+        const QByteArray bombWritten = pyavb({"bomb", QString::fromStdString(bombPath)});
+        QVERIFY2(bombWritten.isEmpty(), bombWritten.constData());
+        QVERIFY(QFileInfo(QString::fromStdString(bombPath)).size() < 20000);
+        QElapsedTimer quick;
+        quick.start();
+        AvidBin bomb;
+        QVERIFY2(readAvidBin(bombPath, bomb, &err), err.c_str());
+        QVERIFY(std::any_of(bomb.issues.begin(), bomb.issues.end(), [](const std::string& i) { return i.find("too many attributes") != std::string::npos; }));
+        QCOMPARE(bomb.mobs.size(), size_t(1));
+        QVERIFY(bomb.mobs[0].tracks[0].component->length > 0);  // (saturated, not overflowed)
+        Project bombed = makeDefaultProject();
+        const AvidBinImport bi = importAvidBin(bombed, bombPath);
+        QVERIFY(std::find(bi.warnings.begin(), bi.warnings.end(), "A sequence too large to bring in whole was cut short") != bi.warnings.end());
+        QVERIFY2(quick.elapsed() < 20000, qPrintable(QString::number(quick.elapsed())));
+    }
+
+    void avidBinImport() {
+        // pyavb's sample bin: its 52 master clips as offline media in a bin named after it (their files are on a Mac
+        // drive this machine does not have), its sequence as the active sequence.
+        {
+            Project p = makeDefaultProject();
+            const size_t before = p.media.size();
+            const AvidBinImport r = importAvidBin(p, MONTAGE_TEST_DATA_DIR "/avb/test_file_01.avb");
+            QVERIFY2(r.ok, r.error.c_str());
+            QCOMPARE(r.bin, std::string("test_file_01"));
+            // 51 master clips as media (the 52nd is a title's rendering, not a clip).
+            QCOMPARE(p.media.size() - before, size_t(51));
+            QCOMPARE(r.offline.size(), size_t(51));
+            QCOMPARE(r.sequences.size(), size_t(1));
+            const Sequence* seq = p.findSequence(r.sequences[0]);
+            QVERIFY(seq && p.active() == seq);
+            QCOMPARE(seq->name, std::string("Demo_2012_v0002.Exported.01"));
+            QCOMPARE(r.clips, 52);
+            for (const MediaItem& m : p.media)
+                if (m.kind != MediaKind::Sequence) QCOMPARE(m.bin, std::string("test_file_01"));
+            // Its effects that Montage has no counterpart for are left off and named, what they were applied to kept.
+            QCOMPARE(QString::fromStdString(std::accumulate(r.warnings.begin(), r.warnings.end(), std::string(), [](std::string a, const std::string& w) { return a + w + "; "; })),
+                     QString("Effect EFF2_BLEND_GRAPHIC was left off (what it was applied to is kept); "
+                             "Effect EFF2_BLEND_RESIZE was left off (what it was applied to is kept); "
+                             "Effect EFF2_RGB_COLOR_CORRECTION was left off (what it was applied to is kept); "));
+        }
+
+        // A movie, a still and a cut of them handed to Media Composer as an AAF with its own media (as
+        // aafExportWithAvidMedia), and a bin of the same.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 320, gs.height = 240, gs.fps = {25, 1};
+        Clip ramp = makeGeneratorClip(gen, "color", 40);
+        for (const char* ch : {"color.r", "color.g", "color.b"}) {
+            ramp.generator.params[ch].addKey(0, 0.0);
+            ramp.generator.params[ch].addKey(39, 1.0);
+        }
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, ramp);
+        std::vector<float> tone(2 * 48000);
+        for (size_t i = 0; i < tone.size(); ++i) tone[i] = float(0.5 * std::sin(2 * M_PI * 1000.0 * double(i) / 48000));
+        QVERIFY(writeMonoWav(path("bin-tone.wav"), tone, 48000));
+        MediaItem toneItem = probeOrFail(gen, path("bin-tone.wav"));
+        gen.media.push_back(toneItem);
+        QVERIFY(edit::placeMedia(gen, gs, toneItem.id, 0, 0, 40, {TrackKind::Video, 1}, {TrackKind::Audio, 0}, false).ok);
+        ExportSettings st;
+        st.path = path("bin-ramp.mov");
+        st.videoCodec = "prores_ks";
+        st.audioCodec = "pcm_s16le";
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        const std::string still = path("bin-still.png");
+        {
+            QImage img(64, 48, QImage::Format_RGB32);
+            img.fill(QColor(200, 40, 40));
+            QVERIFY(img.save(QString::fromStdString(still)));
+        }
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 240, s.fps = {25, 1};
+        s.name = "Bin Cut";
+        MediaItem movie = probeOrFail(p, st.path);
+        movie.timecode = 3600;
+        p.media.push_back(movie);
+        const MediaItem pic = probeOrFail(p, still);
+        p.media.push_back(pic);
+        QVERIFY(edit::placeMedia(p, s, movie.id, 0, 5, 10, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, movie.id, 5, 28, 34, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::addTransition(p, s, edit::clipAt(s, {TrackKind::Video, 0}, 6)->id, edit::Edge::In, "cross_dissolve", 4).ok);
+        while (s.videoTracks.size() < 2) edit::addTrack(p, s, TrackKind::Video);
+        QVERIFY(edit::placeMedia(p, s, pic.id, 12, 0, 4, {TrackKind::Video, 1}, {TrackKind::Audio, -1}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, movie.id, 16, 0, 10, {TrackKind::Video, 1}, {TrackKind::Audio, -1}, false).ok);
+        Clip* fast = edit::clipById(s, edit::clipAt(s, {TrackKind::Video, 1}, 16)->id);
+        fast->speed = 2;
+        fast->duration = 5;
+        const FrameTime end = s.duration();
+        QCOMPARE(end, FrameTime(21));
+        const QString drive = QString::fromStdString(path("bin-drive"));
+        QVERIFY(QDir().mkpath(drive));
+        const std::string aaf = (drive + "/Bin Cut.aaf").toStdString();
+        AafExportOptions opt;
+        opt.avid.enabled = true;
+        opt.avid.handles = 3;
+        AafExportResult ar;
+        QVERIFY2(exportAaf(p, s, aaf, &ar, {}, nullptr, &err, opt), err.c_str());
+
+        // The bin, written by pyavb from what pyaaf2 reads of the AAF: its master clips, their files' mobs (the
+        // pictures' found as Media Composer finds them, by mob ID; the sound's by path) and the cut, with a subclip,
+        // custom columns on a master clip and a locator added.
+        const QByteArray python = qgetenv("MONTAGE_TEST_PYAVB");
+        if (python.isEmpty()) {
+            qInfo("Opening a bin over Montage's Avid media is skipped: MONTAGE_TEST_PYAVB names no Python with pyavb and pyaaf2");
+            return;
+        }
+        const std::string binPath = (drive + "/Bin Cut.avb").toStdString();
+        {
+            QProcess py;
+            py.start(QString::fromLocal8Bit(python), {"-I", QStringLiteral(MONTAGE_TEST_TOOLS_DIR "/aaf_to_avb.py"), QString::fromStdString(aaf),
+                                                      QString::fromStdString(binPath), "--extras"});
+            QVERIFY(py.waitForFinished(120000));
+            QVERIFY2(py.exitCode() == 0, py.readAllStandardError().constData());
+        }
+        RenderOptions o;
+        auto grey = [&](const Project& pp, const Sequence& ss, FrameTime t) {
+            const Image img = renderSequenceFrame(pp, ss, t, o);
+            const float* px = img.at(img.width / 2, img.height / 2);
+            return std::array<float, 3>{px[0], px[1], px[2]};
+        };
+        // Each frame the same frame of the movie (to a third of the step between frames), or the still.
+        auto sameCut = [&](const Project& a, const Sequence& as, const Project& b, const Sequence& bs) -> QString {
+            for (FrameTime t = 0; t < end; ++t) {
+                const auto x = grey(a, as, t), y = grey(b, bs, t);
+                for (int c = 0; c < 3; ++c)
+                    if (std::fabs(x[c] - y[c]) * 39 > 0.3) return QString("frame %1: %2 against %3").arg(t).arg(x[c]).arg(y[c]);
+            }
+            return {};
+        };
+        const auto probe = [](const std::string& f, MediaItem& m) { return probeMedia(f, m); };
+        // What each track holds: each clip's start, length, speed, source in-point and channels, and each transition's
+        // length.
+        auto layout = [](const Sequence& seq) {
+            QStringList out;
+            for (const auto* tracks : {&seq.videoTracks, &seq.audioTracks})
+                for (const Track& t : *tracks) {
+                    QStringList clips;
+                    for (const Clip& c : t.clips)
+                        clips << QString("%1+%2x%3@%4/%5").arg(c.start).arg(c.duration).arg(c.speed).arg(c.sourceIn, 0, 'f', 3).arg(c.channels.size());
+                    for (const Transition& x : t.transitions) clips << QString("transition %1").arg(x.duration);
+                    out << clips.join(" ");
+                }
+            return out.join(" | ");
+        };
+        Project viaAaf = makeDefaultProject();
+        const ImportResult air = importAaf(viaAaf, aaf, probe);
+        QVERIFY2(air.ok && air.offline.empty(), air.error.c_str());
+        const Sequence& aafCut = *viaAaf.findSequence(air.sequence);
+        {
+            Project in = makeDefaultProject();
+            const AvidBinImport r = importAvidBin(in, binPath, probe);
+            QVERIFY2(r.ok, r.error.c_str());
+            QVERIFY2(r.offline.empty(), r.offline.empty() ? "" : r.offline[0].c_str());
+            QVERIFY2(r.warnings.empty(), r.warnings.empty() ? "" : r.warnings[0].c_str());
+            QCOMPARE(r.bin, std::string("Bin Cut"));
+            QCOMPARE(r.sequences.size(), size_t(1));
+            const Sequence* rs = in.findSequence(r.sequences[0]);
+            QVERIFY(rs && in.active() == rs);
+            QCOMPARE(rs->name, std::string("Bin Cut"));
+            // Opened linked to the drive's MXF files, the cut as Montage made it and as its AAF imports, frame for frame
+            // and clip for clip.
+            for (const auto* tracks : {&rs->videoTracks, &rs->audioTracks})
+                for (const Track& t : *tracks)
+                    for (const Clip& c : t.clips)
+                        QVERIFY(QString::fromStdString(in.findMedia(c.mediaId)->path).startsWith(drive + "/Avid MediaFiles/MXF/1/"));
+            QCOMPARE(layout(*rs), layout(aafCut));
+            QString diff = sameCut(p, s, in, *rs);
+            QVERIFY2(diff.isEmpty(), qPrintable(diff));
+            diff = sameCut(viaAaf, aafCut, in, *rs);
+            QVERIFY2(diff.isEmpty(), qPrintable(diff));
+            // The master clips as media in the bin, the custom columns as metadata, the subclip a stretch of its master,
+            // the locator a marker.
+            const MediaItem* master = nullptr;
+            const MediaItem* sub = nullptr;
+            for (const MediaItem& m : in.media) {
+                QVERIFY(m.bin == "Bin Cut" || m.kind == MediaKind::Sequence);
+                if (m.name == "bin-ramp.mov" && m.metadata.count("scene")) master = &m;
+                if (m.name == "bin-ramp.mov.Sub.01") sub = &m;
+            }
+            QVERIFY(master);
+            QCOMPARE(master->metadata.at("scene"), std::string("12A"));
+            QCOMPARE(master->metadata.at("take"), std::string("3"));
+            QCOMPARE(master->metadata.at("comment"), std::string("Best take"));
+            QCOMPARE(master->metadata.at("tape"), std::string("bin-ramp"));
+            QVERIFY(sub);
+            QCOMPARE(sub->subclipOf, master->id);
+            QCOMPARE(sub->subclipIn, 2.0 / 25);
+            QCOMPARE(sub->subclipOut, 6.0 / 25);
+            QCOMPARE(rs->markers.size(), size_t(1));
+            QCOMPARE(rs->markers[0].t, FrameTime(3));
+            QCOMPARE(rs->markers[0].name, std::string("Check focus"));
+            QCOMPARE(rs->markers[0].color, labelForColourName("Blue"));
+        }
+        // The drive moved, so no file is where the sound's locators say: all found by their mob IDs among the drive's
+        // media.
+        const QString moved = QString::fromStdString(path("bin-moved"));
+        MediaPool::instance().clear();
+        QVERIFY(QDir().rename(drive, moved));
+        {
+            Project in = makeDefaultProject();
+            const AvidBinImport r = importAvidBin(in, (moved + "/Bin Cut.avb").toStdString(), probe);
+            QVERIFY2(r.ok && r.offline.empty(), r.error.c_str());
+            const Sequence* rs = in.findSequence(r.sequences[0]);
+            for (const auto* tracks : {&rs->videoTracks, &rs->audioTracks})
+                for (const Track& t : *tracks)
+                    for (const Clip& c : t.clips)
+                        QVERIFY(QString::fromStdString(in.findMedia(c.mediaId)->path).startsWith(moved + "/Avid MediaFiles/MXF/1/"));
+            const QString diff = sameCut(p, s, in, *rs);
+            QVERIFY2(diff.isEmpty(), qPrintable(diff));
+            QVERIFY(std::find(in.bins.begin(), in.bins.end(), std::string("Bin Cut")) != in.bins.end());
+        }
+        // Through MCP: a project of the bin, its sequence open.
+        {
+            const QString project = QString::fromStdString(path("bin.montage"));
+            McpServer server;
+            const QJsonObject args{{"input", moved + "/Bin Cut.avb"}, {"project", project}};
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_import_timeline"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            QVERIFY2(!res.value("isError").toBool(), QJsonDocument(res).toJson().constData());
+            Project in;
+            QVERIFY(loadProject(project.toStdString(), in));
+            QVERIFY(in.active() && in.active()->name == "Bin Cut");
+            QCOMPARE(layout(*in.active()), layout(aafCut));
+        }
+        // Not a bin.
+        {
+            Project in = makeDefaultProject();
+            const AvidBinImport r = importAvidBin(in, (moved + "/Bin Cut.aaf").toStdString());
+            QVERIFY(!r.ok && !r.error.empty());
+            QVERIFY(in.media.empty());
+        }
     }
 
     void motionDeblurring() {

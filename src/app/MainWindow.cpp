@@ -125,6 +125,7 @@
 #include "CaptureDialog.h"
 #include "ProductionPanel.h"
 #include "core/AafImport.h"
+#include "core/AvidBinImport.h"
 #include "core/Production.h"
 #include "core/ProjectLock.h"
 #include "core/ProjectIO.h"
@@ -1138,8 +1139,14 @@ void MainWindow::buildMenus() {
     add(file, tr("&Link Media…"), QKeySequence(), [this] { showLinkMedia(); })->setObjectName(QStringLiteral("linkMediaAction"));
     add(file, tr("Export &Frame…"), QKeySequence("Ctrl+Shift+E"), [this] { exportFrame(); });
     add(file, tr("Export &VFX Pulls…"), QKeySequence(), [this] { vfxPullDialog(); })->setObjectName(QStringLiteral("vfxPulls"));
-    add(file, tr("&Import Timeline (FCP XML, FCPXML, OTIO, EDL, AAF)…"), QKeySequence(), [this] { importTimeline(); });
+    add(file, tr("&Import Timeline (FCP XML, FCPXML, OTIO, EDL, AAF, bin)…"), QKeySequence(), [this] { importTimeline(); });
     add(file, tr("Import IMF &Package…"), QKeySequence(), [this] { importImfPackage(); })->setObjectName(QStringLiteral("importImf"));
+    add(file, tr("Import Media Composer &Bin…"), QKeySequence(), [this] {
+        QSettings st = appSettings();
+        const QString path = QFileDialog::getOpenFileName(this, tr("Import Media Composer Bin"), st.value("lastImportTimelineDir").toString(),
+                                                          tr("Media Composer bins (*.avb)"));
+        if (!path.isEmpty()) importTimelineFrom(path);
+    })->setObjectName(QStringLiteral("importAvidBin"));
     add(file, tr("Import A&LE (Avid Log Exchange)…"), QKeySequence(), [this] {
         const QString path = QFileDialog::getOpenFileName(this, tr("Import ALE"), QString(), tr("Avid Log Exchange (*.ale *.ALE);;All files (*)"));
         if (!path.isEmpty()) importAle(path);
@@ -8750,9 +8757,10 @@ void MainWindow::exportAafWithMediaDialog() {
 void MainWindow::importTimeline() {
     QSettings st = appSettings();
     QString path = QFileDialog::getOpenFileName(this, tr("Import Timeline"), st.value("lastImportTimelineDir").toString(),
-                                                tr("Timelines (*.xml *.fcpxml *.otio *.edl *.aaf);;Final Cut Pro 7 XML (*.xml);;"
+                                                tr("Timelines (*.xml *.fcpxml *.otio *.edl *.aaf *.avb);;Final Cut Pro 7 XML (*.xml);;"
                                                    "FCPXML (*.fcpxml);;OpenTimelineIO (*.otio);;CMX 3600 EDL (*.edl);;"
-                                                   "AAF (Media Composer, Pro Tools) (*.aaf);;IMF composition (CPL*.xml ASSETMAP.xml)"));
+                                                   "AAF (Media Composer, Pro Tools) (*.aaf);;Media Composer bin (*.avb);;"
+                                                   "IMF composition (CPL*.xml ASSETMAP.xml)"));
     if (path.isEmpty()) return;
     importTimelineFrom(path);
 }
@@ -8780,17 +8788,28 @@ void MainWindow::importTimelineFrom(QString path) {
     }
     st.setValue("lastImportTimelineDir", QFileInfo(path).absolutePath());
     const QString suffix = QFileInfo(path).suffix().toLower();
-    const std::string text = suffix == QLatin1String("aaf") || imf ? std::string() : f.readAll().toStdString();
+    const std::string text = suffix == QLatin1String("aaf") || suffix == QLatin1String("avb") || imf ? std::string() : f.readAll().toStdString();
     const MediaProber prober = [](const std::string& file, MediaItem& m) { return probeMedia(file, m, nullptr); };
     const QString ext = QFileInfo(path).suffix().toLower();
     // EDLs do not say their rate: take the open sequence's.
     const Rational fps = state_->sequence() ? state_->sequence()->fps : Rational{30, 1};
     const std::string dir = QFileInfo(path).absolutePath().toStdString();
     ImportResult r;
+    // A bin: its clips as media, its sequences as sequences (the first opened).
+    size_t binMedia = 0;
+    const auto importBin = [&](Project& p) {
+        const AvidBinImport b = importAvidBin(p, path.toStdString(), prober);
+        binMedia = b.media.size() + b.sequences.size();
+        ImportResult out;
+        out.ok = b.ok, out.error = b.error, out.clips = b.clips, out.offline = b.offline, out.warnings = b.warnings;
+        out.sequence = b.sequences.empty() ? 0 : b.sequences.front();
+        return out;
+    };
     QApplication::setOverrideCursor(Qt::WaitCursor);
     state_->edit(tr("Import Timeline"), [&](Project& p, Sequence&) {
         r = imf                               ? importImf(p, path.toStdString(), prober)
             : ext == "aaf"                    ? importAaf(p, path.toStdString(), prober)
+            : ext == "avb"                    ? importBin(p)
             : ext == "edl"                    ? importEdl(p, text, fps, prober, dir)
             : ext == "xml" || ext == "fcpxml" ? importXmlTimeline(p, text, prober)
                                               : importOtio(p, text, prober);
@@ -8801,13 +8820,16 @@ void MainWindow::importTimelineFrom(QString path) {
         QMessageBox::warning(this, tr("Import Timeline"), QString::fromStdString(r.error));
         return;
     }
-    state_->setActiveSequence(r.sequence);
+    if (r.sequence) state_->setActiveSequence(r.sequence);
     QStringList notes;
     if (!r.offline.empty()) notes << tr("%n file(s) not found; their clips are offline:", "", int(r.offline.size()));
     for (size_t i = 0; i < r.offline.size() && i < 10; ++i) notes << QStringLiteral("  ") + QString::fromStdString(r.offline[i]);
     for (const auto& w : r.warnings) notes << QString::fromStdString(w);
     if (!notes.isEmpty()) QMessageBox::information(this, tr("Import Timeline"), notes.join('\n'));
-    statusBar()->showMessage(tr("Imported %n clip(s) from %1", "", r.clips).arg(QFileInfo(path).fileName()), 5000);
+    if (ext == "avb")
+        statusBar()->showMessage(tr("Imported %n bin item(s) from %1", "", int(binMedia)).arg(QFileInfo(path).fileName()), 5000);
+    else
+        statusBar()->showMessage(tr("Imported %n clip(s) from %1", "", r.clips).arg(QFileInfo(path).fileName()), 5000);
 }
 
 void MainWindow::addTitle() {

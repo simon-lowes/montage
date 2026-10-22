@@ -50,6 +50,7 @@
 #include "audio/DialogueAlign.h"
 #include "audio/SpeechCleanup.h"
 #include "core/AafImport.h"
+#include "core/AvidBinImport.h"
 #include "core/Provenance.h"
 #include "media/ContentCredentials.h"
 #include "media/Offload.h"
@@ -10063,7 +10064,9 @@ void McpServer::Impl::addTools() {
     add("montage_import_timeline", "Import a timeline",
         "Make a project from an EDL, OpenTimelineIO, Final Cut Pro 7 XML, FCPXML or AAF file (Media Composer and Pro "
         "Tools sequences: picture and sound tracks, clips followed to their files, dissolves, audio gain, markers; media "
-        "found by path, else beside the file), or an IMF package (its folder, asset map or a composition playlist: the "
+        "found by path, else beside the file), a Media Composer bin (.avb: its master clips and subclips as media with "
+        "their custom columns as metadata, its sequences as an AAF of them would come in, the first opened; Media "
+        "Composer's MXF media found by mob ID under any \"Avid MediaFiles\" folder), or an IMF package (its folder, asset map or a composition playlist: the "
         "pictures, each sound track by language and kind with the first programme heard, the timed text as caption "
         "tracks; a supplemental's track files found in the packages beside it).",
         R"json({"type":"object","properties":{"input":{"type":"string"},"project":{"type":"string","description":"The .montage file to write"},
@@ -10088,10 +10091,30 @@ void McpServer::Impl::addTools() {
             std::string ext = std::filesystem::path(in).extension().string();
             for (char& ch : ext) ch = char(std::tolower(static_cast<unsigned char>(ch)));
             // An AAF is a binary compound file, read by its own importer.
-            const std::string text = ext == ".aaf" ? std::string() : std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            const std::string text = ext == ".aaf" || ext == ".avb" ? std::string() : std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
             Loaded l;
             l.path = absolute(need(a, "project"));
             l.project.name = std::filesystem::path(in).stem().string();
+            if (ext == ".avb") {
+                const AvidBinImport b = importAvidBin(l.project, in, prober);
+                if (!b.ok) return fail(QString::fromStdString(b.error));
+                if (b.sequences.empty()) {  // only clips: an empty sequence to cut them into
+                    Rational fps{25, 1};
+                    for (const MediaItem& m : l.project.media)
+                        if (m.hasVideo && m.fps.num > 0) {
+                            fps = m.fps;
+                            break;
+                        }
+                    l.project.sequences.push_back(makeSequence(l.project, "Sequence 1", 1920, 1080, fps));
+                    l.project.activeSequence = l.project.sequences.back().id;
+                }
+                save(l);
+                QString note = QStringLiteral("Imported %1 media item(s) and %2 sequence(s) from the bin into %3")
+                                   .arg(b.media.size()).arg(b.sequences.size()).arg(l.path);
+                for (const auto& o : b.offline) note += "\nOffline: " + QString::fromStdString(o);
+                for (const auto& w : b.warnings) note += "\nWarning: " + QString::fromStdString(w);
+                return ok(note, projectJson(l.project));
+            }
             const double fps = a.value("fps").toDouble(30);
             const Rational rate = std::fabs(fps - std::round(fps)) < 1e-6 ? Rational{int(std::lround(fps)), 1} : Rational{int(std::lround(fps * 1001)), 1001};
             const ImportResult r = ext == ".aaf" ? importAaf(l.project, in, prober)

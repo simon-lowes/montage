@@ -146,5 +146,9 @@ jobs:
         run: |
           (python3 -m venv ~/pyaaf2 && ~/pyaaf2/bin/pip install -q pyaaf2==1.7.1) && echo "MONTAGE_TEST_PYAAF2=$HOME/pyaaf2/bin/python" >> "$GITHUB_ENV" \
             || echo "::warning::Could not install pyaaf2; the AAF tests' independent read-back will be skipped"
+      - name: pyavb and pyaaf2, for the Avid bin tests (an independent bin reader, and bins written from AAFs)
+        run: |
+          (python3 -m venv ~/pyavb && ~/pyavb/bin/pip install -q pyavb==1.4.0 pyaaf2==1.7.1) && echo "MONTAGE_TEST_PYAVB=$HOME/pyavb/bin/python" >> "$GITHUB_ENV" \
+            || echo "::warning::Could not install pyavb; the Avid bin tests' comparisons with pyavb will be skipped"
       - name: Test
         run: ctest --test-dir build --output-on-failure

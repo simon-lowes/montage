@@ -34,6 +34,9 @@ add_library(montage_engine STATIC
   core/FaceIndex.h core/FaceIndex.cpp
   core/Aaf.h core/Aaf.cpp core/AafMetaDictionary.inc
   core/AafImport.h core/AafImport.cpp
+  core/AvidBin.h core/AvidBin.cpp
+  core/AvidMediaIndex.h core/AvidMediaIndex.cpp
+  core/AvidBinImport.h core/AvidBinImport.cpp
   core/Surround.h core/Surround.cpp
   core/Ambisonics.h core/Ambisonics.cpp
   media/SpatialAudio.h media/SpatialAudio.cpp
