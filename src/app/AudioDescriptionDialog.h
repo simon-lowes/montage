@@ -6,6 +6,7 @@
 #pragma once
 
 #include <QDialog>
+#include <string>
 #include <vector>
 
 #include "core/AudioDescription.h"
@@ -46,6 +47,7 @@ private:
     void refresh();
     void cellEdited(int row, int column);
     int adTrack() const;  // the audio track named "AD", -1 if none
+    std::string dialogueLayout() const;  // where the dialogue's clips are (the AD track aside), to tell when it is cut
 
     EditorState* state_;
     QTableWidget* table_;
@@ -58,7 +60,9 @@ private:
     QLabel* status_;
     std::vector<DescriptionGap> gaps_;
     std::vector<DescriptionGap> added_;  // the gaps added at the playhead, kept when the gaps are found again
+    std::string foundFor_;               // the dialogue's layout when the gaps were found
     bool refreshing_ = false;
+    bool refinding_ = false;
 };
 
 }  // namespace montage

@@ -58,8 +58,10 @@ struct PerfSettings {
 // whole ones only, each to a fraction of a pixel. `found` (when given) receives a matte of the holes.
 std::vector<Point2> findPerforations(const Image& img, const PerfSettings& s, std::vector<float>* found = nullptr);
 // How far the perforations `now` are from where they were (`reference`): the mean offset of each from the nearest of the
-// reference's, those further than half their spacing left out. False when none match.
-bool perforationOffset(const std::vector<Point2>& now, const std::vector<Point2>& reference, double& dx, double& dy);
+// reference's, those further than half their spacing left out. False when none match. With one reference hole (no
+// spacing to go by), the nearest is taken only within a quarter of `frameHeight` when that is given.
+bool perforationOffset(const std::vector<Point2>& now, const std::vector<Point2>& reference, double& dx, double& dy,
+                       double frameHeight = 0);
 // Perforations as text (a line each: x and y as fractions of the frame's width and height) and back, in pixels of a W x H
 // frame.
 std::string perforationsToString(const std::vector<Point2>& perfs, int W, int H);

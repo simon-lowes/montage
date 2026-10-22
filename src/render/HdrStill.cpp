@@ -534,8 +534,10 @@ Av1Picture rgbPicture(const QImage& rgb888, Av1Layout layout) {
     pic.width = W, pic.height = H, pic.layout = layout;
     pic.planes[0].resize(size_t(W) * H);
     for (int i = 1; i < 3; ++i) pic.planes[i].resize(layout == Av1Layout::Gbr ? size_t(W) * H : size_t(CW) * CH);
-    std::vector<double> cb, cr;
-    if (layout == Av1Layout::Yuv420) cb.resize(size_t(W) * H), cr.resize(size_t(W) * H);
+    auto chroma = [](const uchar* s, double& u, double& v) {
+        const double r = s[0], g = s[1], b = s[2], luma = 0.299 * r + 0.587 * g + 0.114 * b;
+        u = 128 + (b - luma) / 1.772, v = 128 + (r - luma) / 1.402;
+    };
     for (int y = 0; y < H; ++y) {
         const uchar* s = rgb888.constScanLine(y);
         for (int x = 0; x < W; ++x, s += 3) {
@@ -544,25 +546,26 @@ Av1Picture rgbPicture(const QImage& rgb888, Av1Layout layout) {
                 for (int c = 0; c < 3; ++c) pic.planes[c][i] = s[c];
                 continue;
             }
-            const double r = s[0], g = s[1], b = s[2], luma = 0.299 * r + 0.587 * g + 0.114 * b;
+            const double luma = 0.299 * s[0] + 0.587 * s[1] + 0.114 * s[2];
             pic.planes[0][i] = uint16_t(std::clamp(std::lround(luma), 0L, 255L));
-            const double u = 128 + (b - luma) / 1.772, v = 128 + (r - luma) / 1.402;
             if (layout == Av1Layout::Yuv444) {
+                double u, v;
+                chroma(s, u, v);
                 pic.planes[1][i] = uint16_t(std::clamp(std::lround(u), 0L, 255L));
                 pic.planes[2][i] = uint16_t(std::clamp(std::lround(v), 0L, 255L));
-            } else {
-                cb[i] = u, cr[i] = v;
             }
         }
     }
+    // 4:2:0: each 2x2 block's chroma averaged, straight from the picture (no full-size planes held for it).
     if (layout == Av1Layout::Yuv420)
         for (int y = 0; y < CH; ++y)
             for (int x = 0; x < CW; ++x) {
                 double sb = 0, sr = 0;
                 for (int dy = 0; dy < 2; ++dy)
                     for (int dx = 0; dx < 2; ++dx) {
-                        const size_t i = size_t(std::min(H - 1, 2 * y + dy)) * W + size_t(std::min(W - 1, 2 * x + dx));
-                        sb += cb[i], sr += cr[i];
+                        double u, v;
+                        chroma(rgb888.constScanLine(std::min(H - 1, 2 * y + dy)) + size_t(std::min(W - 1, 2 * x + dx)) * 3, u, v);
+                        sb += u, sr += v;
                     }
                 pic.planes[1][size_t(y) * CW + x] = uint16_t(std::clamp(std::lround(sb / 4), 0L, 255L));
                 pic.planes[2][size_t(y) * CW + x] = uint16_t(std::clamp(std::lround(sr / 4), 0L, 255L));

@@ -9,6 +9,7 @@
 #include <QLabel>
 #include <QPushButton>
 #include <QSpinBox>
+#include <QTimer>
 #include <QTableWidget>
 #include <QVBoxLayout>
 #include <algorithm>
@@ -154,7 +155,18 @@ AudioDescriptionDialog::AudioDescriptionDialog(EditorState* state, QWidget* pare
     connect(duckDb_, &QDoubleSpinBox::valueChanged, this, [](double v) { appSettings().setValue(QStringLiteral("ad/duck"), v); });
     connect(voice_, &QComboBox::currentIndexChanged, this,
             [this] { appSettings().setValue(QStringLiteral("ad/voice"), voice_->currentData().toString()); });
-    connect(state_, &EditorState::projectChanged, this, &AudioDescriptionDialog::refresh);
+    connect(state_, &EditorState::projectChanged, this, [this] {
+        // When the dialogue has been cut since the gaps were found, they are found again (once the edits settle), so
+        // the table never offers a gap that is now under a line.
+        if (!gaps_.empty() && !refinding_ && dialogueLayout() != foundFor_) {
+            refinding_ = true;
+            QTimer::singleShot(300, this, [this] {
+                refinding_ = false;
+                if (!gaps_.empty() && dialogueLayout() != foundFor_) findGaps();
+            });
+        }
+        refresh();
+    });
     connect(state_, &EditorState::sequenceSwitched, this, [this] {
         gaps_.clear();
         added_.clear();
@@ -173,6 +185,22 @@ int AudioDescriptionDialog::adTrack() const {
 
 int AudioDescriptionDialog::rows() const { return table_->rowCount(); }
 
+std::string AudioDescriptionDialog::dialogueLayout() const {
+    const Sequence* s = state_->sequence();
+    if (!s) return {};
+    std::string out;
+    const int ad = adTrack();
+    for (size_t i = 0; i < s->audioTracks.size(); ++i) {
+        if (int(i) == ad) continue;
+        const Track& t = s->audioTracks[i];
+        out += t.muted ? "M|" : "|";
+        for (const Clip& c : t.clips)
+            out += std::to_string(c.mediaId) + ":" + std::to_string(c.start) + ":" + std::to_string(c.duration) + ":" +
+                   std::to_string(c.sourceIn) + ":" + std::to_string(c.speed) + (c.reverse ? "r" : "") + (c.enabled ? "," : "x,");
+    }
+    return out;
+}
+
 int AudioDescriptionDialog::findGaps(QString* error) {
     const Sequence* s = state_->sequence();
     if (!s) return -1;
@@ -185,7 +213,18 @@ int AudioDescriptionDialog::findGaps(QString* error) {
         return -1;
     }
     const FrameTime end = std::max<FrameTime>(s->duration(), 1);
-    gaps_ = descriptionGaps(speech, s->fpsValue(), 0, end, minGap_->value());
+    const double fps = s->fpsValue();
+    gaps_ = descriptionGaps(speech, fps, 0, end, minGap_->value());
+    foundFor_ = dialogueLayout();
+    // A gap added at the playhead stays while it is still clear of the dialogue and not inside a gap found anyway
+    // (the found one is drafted and voiced instead).
+    std::erase_if(added_, [&](const DescriptionGap& a) {
+        for (const DescriptionGap& g : gaps_)
+            if (a.start >= g.start && a.start < g.end) return true;
+        for (const auto& [t0, t1] : speech)
+            if (t0 < double(a.end) / fps && t1 > double(a.start) / fps) return true;
+        return false;
+    });
     gaps_.insert(gaps_.end(), added_.begin(), added_.end());
     std::sort(gaps_.begin(), gaps_.end(), [](const DescriptionGap& a, const DescriptionGap& b) { return a.start < b.start || (a.start == b.start && a.end < b.end); });
     gaps_.erase(std::unique(gaps_.begin(), gaps_.end(), [](const DescriptionGap& a, const DescriptionGap& b) { return a.start == b.start && a.end == b.end; }),
@@ -271,17 +310,24 @@ void AudioDescriptionDialog::addAtPlayhead() {
     const Sequence* s = state_->sequence();
     if (!s) return;
     const FrameTime at = state_->playhead();
-    FrameTime end = at + FrameTime(std::llround(3 * s->fpsValue()));
+    const FrameTime end = at + FrameTime(std::llround(3 * s->fpsValue()));
+    // Inside a gap already listed: that gap's row is the one to write in (two descriptions in one gap would talk over
+    // each other).
+    bool inside = false;
     for (const DescriptionGap& g : gaps_)
-        if (at >= g.start && at < g.end) end = std::min(end, g.end);  // within the gap it is in
-    gaps_.push_back({at, end});
-    added_.push_back({at, end});
-    std::sort(gaps_.begin(), gaps_.end(), [](const DescriptionGap& a, const DescriptionGap& b) { return a.start < b.start; });
+        if (at >= g.start && at < g.end) inside = true;
+    if (!inside) {
+        gaps_.push_back({at, end});
+        added_.push_back({at, end});
+        std::sort(gaps_.begin(), gaps_.end(), [](const DescriptionGap& a, const DescriptionGap& b) { return a.start < b.start; });
+    }
     refresh();
     for (int r = 0; r < table_->rowCount(); ++r)
-        if (table_->item(r, ColText) && FrameTime(table_->item(r, ColText)->data(Qt::UserRole).toLongLong()) == at) {
+        if (const QTableWidgetItem* it = table_->item(r, ColText);
+            it && FrameTime(it->data(Qt::UserRole).toLongLong()) <= at && at < FrameTime(it->data(Qt::UserRole + 1).toLongLong())) {
             table_->setCurrentCell(r, ColText);
             table_->editItem(table_->item(r, ColText));
+            break;
         }
 }
 

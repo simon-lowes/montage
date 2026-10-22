@@ -9775,6 +9775,14 @@ const auto seq = [this] { return state()->sequence(); };
         state()->undo();
         QVERIFY2(dlg->findGaps(&err) >= 1, qPrintable(err));
         QTRY_COMPARE(table->item(0, 3)->text(), QString("Rain falls."));
+        // A description added at a playhead inside that gap opens the gap's own row rather than a second one in it.
+        const int rowsBefore = table->rowCount();
+        state()->setPlayhead(60);
+        dlg->addAtPlayhead();
+        QCOMPARE(table->rowCount(), rowsBefore);
+        QCOMPARE(table->currentRow(), 0);
+        QVERIFY2(dlg->findGaps(&err) >= 1, qPrintable(err));
+        QCOMPARE(table->rowCount(), rowsBefore);
         // Muting them while working; nothing to duck before they are voiced.
         dlg->setHear(false);
         QVERIFY(edit::roleMuted(*state()->sequence(), kDescriptionRole));

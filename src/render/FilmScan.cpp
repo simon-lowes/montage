@@ -285,19 +285,21 @@ std::vector<Point2> findPerforations(const Image& img, const PerfSettings& s, st
     return out;
 }
 
-bool perforationOffset(const std::vector<Point2>& now, const std::vector<Point2>& reference, double& dx, double& dy) {
+bool perforationOffset(const std::vector<Point2>& now, const std::vector<Point2>& reference, double& dx, double& dy, double frameHeight) {
     dx = dy = 0;
     if (now.empty() || reference.empty()) return false;
     // (Half the spacing of the reference's holes: a hole moved further than that is taken for its neighbour.)
     double reach = 1e9;
     for (size_t i = 1; i < reference.size(); ++i) reach = std::min(reach, std::hypot(reference[i].x - reference[i - 1].x, reference[i].y - reference[i - 1].y) / 2);
     // One hole to go by (a format with a hole a frame) gives no spacing: only the hole nearest it is taken for it, not
-    // every hole in the frame.
+    // every hole in the frame, and only within a quarter of the frame's height (further is dust or half a hole at the
+    // edge, not weave).
     if (reference.size() == 1) {
         const Point2& r = reference[0];
         const auto nearest = std::min_element(now.begin(), now.end(), [&](const Point2& a, const Point2& b) {
             return std::hypot(a.x - r.x, a.y - r.y) < std::hypot(b.x - r.x, b.y - r.y);
         });
+        if (frameHeight > 0 && std::hypot(nearest->x - r.x, nearest->y - r.y) > frameHeight / 4) return false;
         dx = nearest->x - r.x, dy = nearest->y - r.y;
         return true;
     }

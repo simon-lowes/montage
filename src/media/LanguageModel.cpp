@@ -105,35 +105,35 @@ std::string LanguageModel::write(const WriteRequest& r, std::string* error, cons
         return std::string();
     };
     std::lock_guard lock(d_->busy);
-    const llama_vocab* vocab = llama_model_get_vocab(d_->model);
-    // The question as the model was trained to read it: its chat template when it has one (the template's own
-    // markers are special tokens), else the system words and the question as plain text.
-    std::string text;
-    bool special = false;
-    if (const char* tmpl = llama_model_chat_template(d_->model, nullptr)) {
-        std::vector<llama_chat_message> chat;
-        if (!r.system.empty()) chat.push_back({"system", r.system.c_str()});
-        chat.push_back({"user", r.prompt.c_str()});
-        std::vector<char> buf(2 * (r.system.size() + r.prompt.size()) + 1024);
-        int n = llama_chat_apply_template(tmpl, chat.data(), chat.size(), true, buf.data(), int32_t(buf.size()));
-        if (n > int(buf.size())) {
-            buf.resize(size_t(n));
-            n = llama_chat_apply_template(tmpl, chat.data(), chat.size(), true, buf.data(), int32_t(buf.size()));
-        }
-        if (n > 0) text.assign(buf.data(), size_t(n)), special = true;
-    }
-    if (!special) text = (r.system.empty() ? "" : r.system + "\n\n") + r.prompt + "\n\n";
-    const bool bos = !special || llama_vocab_get_add_bos(vocab);
-    const int count = -llama_tokenize(vocab, text.c_str(), int32_t(text.size()), nullptr, 0, bos, special);
-    std::vector<llama_token> tokens(size_t(std::max(1, count)));
-    if (count <= 0 || llama_tokenize(vocab, text.c_str(), int32_t(text.size()), tokens.data(), count, bos, special) != count)
-        return fail("The question could not be read");
-    const int maxTokens = std::max(1, r.maxTokens);
-    if (count + maxTokens > contextTokens()) return fail("The question is too long for the language model");
-
-    // (llama.cpp throws in places, its grammar sampler among them, on a state it did not foresee: an answer that
-    // fails, not a crash.)
+    // (llama.cpp throws in places, its chat templates and grammar sampler among them, on a state it did not foresee:
+    // an answer that fails, not a crash.)
     try {
+        const llama_vocab* vocab = llama_model_get_vocab(d_->model);
+        // The question as the model was trained to read it: its chat template when it has one (the template's own
+        // markers are special tokens), else the system words and the question as plain text.
+        std::string text;
+        bool special = false;
+        if (const char* tmpl = llama_model_chat_template(d_->model, nullptr)) {
+            std::vector<llama_chat_message> chat;
+            if (!r.system.empty()) chat.push_back({"system", r.system.c_str()});
+            chat.push_back({"user", r.prompt.c_str()});
+            std::vector<char> buf(2 * (r.system.size() + r.prompt.size()) + 1024);
+            int n = llama_chat_apply_template(tmpl, chat.data(), chat.size(), true, buf.data(), int32_t(buf.size()));
+            if (n > int(buf.size())) {
+                buf.resize(size_t(n));
+                n = llama_chat_apply_template(tmpl, chat.data(), chat.size(), true, buf.data(), int32_t(buf.size()));
+            }
+            if (n > 0) text.assign(buf.data(), size_t(n)), special = true;
+        }
+        if (!special) text = (r.system.empty() ? "" : r.system + "\n\n") + r.prompt + "\n\n";
+        const bool bos = !special || llama_vocab_get_add_bos(vocab);
+        const int count = -llama_tokenize(vocab, text.c_str(), int32_t(text.size()), nullptr, 0, bos, special);
+        std::vector<llama_token> tokens(size_t(std::max(1, count)));
+        if (count <= 0 || llama_tokenize(vocab, text.c_str(), int32_t(text.size()), tokens.data(), count, bos, special) != count)
+            return fail("The question could not be read");
+        const int maxTokens = std::max(1, r.maxTokens);
+        if (count + maxTokens > contextTokens()) return fail("The question is too long for the language model");
+
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = uint32_t((count + maxTokens + 255) / 256 * 256);
         cp.n_batch = 512;
@@ -178,6 +178,8 @@ std::string LanguageModel::write(const WriteRequest& r, std::string* error, cons
         return answer;
     } catch (const std::exception& e) {
         return fail(std::string("The language model failed: ") + e.what());
+    } catch (...) {
+        return fail("The language model failed");
     }
 }
 

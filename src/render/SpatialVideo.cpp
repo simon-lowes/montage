@@ -64,7 +64,9 @@ void collect(const x265_nal* nals, uint32_t count, const x265_picture& pic, std:
     for (uint32_t i = 0; i < count; ++i) p.data.insert(p.data.end(), nals[i].payload, nals[i].payload + nals[i].sizeBytes);
     p.pts = pic.pts;
     p.dts = pic.dts;
-    p.key = IS_X265_TYPE_I(pic.sliceType);
+    // (A sync sample only where decoding can start: an IDR picture, not any intra one; an I picture that is not IDR
+    // can have leading pictures that reach back past it.)
+    p.key = pic.sliceType == X265_TYPE_IDR;
     out.push_back(std::move(p));
 }
 
