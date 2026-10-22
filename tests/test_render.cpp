@@ -2796,6 +2796,10 @@ colorspaces:
                 double ox = 0, oy = 0;
                 QVERIFY(perforationOffset(findPerforations(frame(d0x + 2, d0y - 1), ps), {reference[1]}, ox, oy));
                 QVERIFY2(std::fabs(ox - 2) < 0.1 && std::fabs(oy + 1) < 0.1, qPrintable(QString("%1 %2").arg(ox).arg(oy)));
+                // Given the frame's height, a lone hole further than a quarter of it away is not taken for weave.
+                const Point2 far{reference[1].x, reference[1].y + 1000};
+                QVERIFY(!perforationOffset(findPerforations(frame(d0x, d0y), ps), {far}, ox, oy, 400));
+                QVERIFY(perforationOffset(findPerforations(frame(d0x + 2, d0y - 1), ps), {reference[1]}, ox, oy, 400));
             }
             // No reference: the frame as it was; nothing in a plain rebate.
             Image f = frame(1, 1), same = f;

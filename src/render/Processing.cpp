@@ -2169,7 +2169,7 @@ void applyPerfLock(const Effect& e, FrameTime t, Image& img) {
         return;
     }
     double dx = 0, dy = 0;
-    if (perforationOffset(now, perforationsFromString(e.s("reference"), img.width, img.height), dx, dy)) img = shiftedImage(img, dx, dy);
+    if (perforationOffset(now, perforationsFromString(e.s("reference"), img.width, img.height), dx, dy, img.height)) img = shiftedImage(img, dx, dy);
 }
 
 namespace {

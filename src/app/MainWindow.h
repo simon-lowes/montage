@@ -174,6 +174,9 @@ public:
     bool addFrameHold();                              // the clip under the playhead
     // Copies the chapter markers (within In to Out when set) as YouTube's chapter list; returns the text.
     QString copyYoutubeChapters();
+    // Clip › Breath Control: the breaths in the selected audio clips turned down by `amountDb` with volume keys (one
+    // undo step). How many breaths.
+    int breathControl(double amountDb);
     // Clip › Import Embedded Captions: the CEA-608 captions inside the selected video clip's file (else the clip under
     // the playhead on the target video track) as a new caption track where the clip plays them. How many captions.
     int importEmbeddedCaptions();

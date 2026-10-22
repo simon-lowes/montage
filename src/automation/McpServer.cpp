@@ -116,6 +116,7 @@
 #include "render/VoiceMatch.h"
 #include "media/Analysis.h"
 #include "media/AutoDuck.h"
+#include "media/Breaths.h"
 #include "media/MicBleed.h"
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
@@ -7107,6 +7108,58 @@ void McpServer::Impl::addTools() {
             for (const auto& [from, to] : spans) list.append(QJsonObject{{"start_seconds", from}, {"end_seconds", to}});
             return ok(QStringLiteral("Ducked %1 clip(s) under %2 stretch(es) of dialogue").arg(changed).arg(spans.size()),
                       QJsonObject{{"dialogue", list}, {"clips_changed", changed}});
+        });
+
+    add("montage_breath_control", "Turn down breaths in dialogue",
+        "Breath Control: finds the breaths between a speaker's lines in each audio clip (in the gaps between its "
+        "transcript's words when its media is transcribed, else by sound: unvoiced, quieter than the speech, not an \"s\") "
+        "and turns each down by amount_db with volume keyframes, a dip per breath that can be dragged back by hand. The "
+        "rest of the volume line is kept; a clip whose volume has an expression or repeating keys is left (counted in "
+        "clips_left). Returns the breaths found, in timeline seconds.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "clips":{"type":"array","items":{"type":"number"},"description":"Audio clip ids (or give track)"},
+            "track":{"type":"string","description":"Every clip on this audio track, e.g. A1"},
+            "amount_db":{"type":"number","default":-12,"description":"How far each breath goes down (-60 to -1)"}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            std::vector<Id> clips;
+            for (const QJsonValue& v : a.value("clips").toArray()) {
+                const Id id = clipArg(l, QJsonObject{{"clip", v}}).id;
+                if (edit::locate(s, id)->track.kind != TrackKind::Audio) throw ArgError{"\"clips\" must be audio clips"};
+                clips.push_back(id);
+            }
+            if (a.contains("track")) {
+                const TrackRef t = trackArg(str(a, "track"), s, false);
+                if (t.kind != TrackKind::Audio) throw ArgError{"\"track\" must be an audio track"};
+                for (const Clip& c : trackAt(s, t)->clips) clips.push_back(c.id);
+            }
+            if (clips.empty()) throw ArgError{"Give the dialogue as \"clips\" or \"track\""};
+            for (size_t i = 1; i < clips.size(); ++i)  // (each once, in the order given)
+                if (std::find(clips.begin(), clips.begin() + long(i), clips[i]) != clips.begin() + long(i)) clips.erase(clips.begin() + long(i--));
+            const double amount = std::clamp(a.value("amount_db").toDouble(-12), -60.0, -1.0);
+            int keyed = 0, left = 0;
+            QJsonArray found;
+            std::map<std::string, AudioBufferPtr> decoded;
+            for (Id id : clips) {
+                Clip* c = edit::clipById(s, id);
+                if (!c || c->mediaId == 0) continue;
+                if (!volumeTakesBreathKeys(*c)) {
+                    ++left;
+                    continue;
+                }
+                std::string err;
+                const TimeSpans breaths = breathsInClip(l.project, s, *c, &err, nullptr, &decoded);
+                if (!err.empty()) return fail(QString::fromStdString(err));
+                keyed += lowerBreaths(*c, s, breaths, amount);
+                for (const auto& [from, to] : breaths)
+                    if (const auto [start, end] = timelineSpan(*c, s, from, to); start >= 0)
+                        found.append(QJsonObject{{"clip", double(id)}, {"start_seconds", start}, {"end_seconds", end}});
+            }
+            if (keyed) save(l);
+            return ok(QStringLiteral("Turned down %1 breath(s) by %2 dB").arg(keyed).arg(amount),
+                      QJsonObject{{"breaths", found}, {"keyed", keyed}, {"clips_left", left}});
         });
 
     add("montage_remove_bleed", "Remove mic bleed from multitrack talk",

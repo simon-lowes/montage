@@ -587,8 +587,9 @@ bool planGainMap(const QImage& seen, Primaries basePrimaries, const Image& hdr, 
     }
     meta.hdrCapacityMin = 0;
     meta.hdrCapacityMax = std::max(gmax, 1e-3);
-    target.resize(gains.size());
-    for (size_t i = 0; i < gains.size(); ++i) target[i] = float(std::clamp((gains[i] - gmin) / (gmax - gmin), 0.0, 1.0) * 255);
+    // (In place: at the largest sizes a second full-size copy is gigabytes.)
+    target = std::move(gains);
+    for (float& t : target) t = float(std::clamp((t - gmin) / (gmax - gmin), 0.0, 1.0) * 255);
     return true;
 }
 
@@ -1038,6 +1039,32 @@ bool shownSize(QFile& f, const AvifFile& a, const AvifItem& item, int& width, in
 }
 
 // An item's picture (decodeCoded's, a grid's tiles put together), turned and mirrored as its properties say.
+// An item's transformations applied to its picture: in the order listed, a crop to its clean aperture, a turn
+// anticlockwise, a mirror about a vertical or horizontal axis. False (with `why`) when they cannot be.
+bool applyItemTransforms(const AvifFile& a, const AvifItem& item, QImage& out, std::string& why) {
+    for (int i : item.properties) {
+        const QByteArray& p = a.properties[size_t(i)];
+        const QByteArray type = p.mid(4, 4);
+        if (out.isNull() || p.size() < 9) continue;
+        if (type == "clap") {
+            QRect r;
+            if (!cleanAperture(p, out.width(), out.height(), r)) return why = "The picture's clean aperture is outside it", false;
+            out = out.copy(r);
+        } else if (type == "irot") {
+            const int turns = p[8] & 3;  // (exact turns: QTransform's -180 is not)
+            if (turns == 2) out = out.transformed(QTransform().rotate(180));
+            else if (turns) out = out.transformed(QTransform().rotate(turns == 1 ? 270 : 90));
+        } else if (type == "imir") {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)
+            out = out.flipped((p[8] & 1) ? Qt::Vertical : Qt::Horizontal);
+#else
+            out = (p[8] & 1) ? out.mirrored(false, true) : out.mirrored(true, false);
+#endif
+        }
+    }
+    return true;
+}
+
 QImage decodeItem(QFile& f, const AvifFile& a, const AvifItem& item, bool deep, std::string& why) {
     QImage out;
     if (item.type == "grid") {
@@ -1066,28 +1093,7 @@ QImage decodeItem(QFile& f, const AvifFile& a, const AvifItem& item, bool deep, 
     } else {
         out = decodeCoded(a, item, itemData(f, a, item), deep, why);
     }
-    // (Its transformations in the order listed: a crop to its clean aperture, a turn anticlockwise, a mirror about a
-    // vertical or horizontal axis.)
-    for (int i : item.properties) {
-        const QByteArray& p = a.properties[size_t(i)];
-        const QByteArray type = p.mid(4, 4);
-        if (out.isNull() || p.size() < 9) continue;
-        if (type == "clap") {
-            QRect r;
-            if (!cleanAperture(p, out.width(), out.height(), r)) return why = "The picture's clean aperture is outside it", QImage();
-            out = out.copy(r);
-        } else if (type == "irot") {
-            const int turns = p[8] & 3;  // (exact turns: QTransform's -180 is not)
-            if (turns == 2) out = out.transformed(QTransform().rotate(180));
-            else if (turns) out = out.transformed(QTransform().rotate(turns == 1 ? 270 : 90));
-        } else if (type == "imir") {
-#if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)
-            out = out.flipped((p[8] & 1) ? Qt::Vertical : Qt::Horizontal);
-#else
-            out = (p[8] & 1) ? out.mirrored(false, true) : out.mirrored(true, false);
-#endif
-        }
-    }
+    if (!out.isNull() && !applyItemTransforms(a, item, out, why)) return QImage();
     return out;
 }
 
@@ -1224,7 +1230,28 @@ std::shared_ptr<const GainMapPicture> decodeGainMapHeif(const std::string& path,
         const QImage base = decodeItem(f, a, *g.base, false, why);
         const QImage map = base.isNull() ? QImage() : decodeItem(f, a, *g.map, false, why);
         if (base.isNull() || map.isNull()) return why = "Cannot decode " + path + ": " + why, nullptr;
-        return hdrRendition(asRgb32(base), g.transfer, g.basePrimaries, g.mathPrimaries, map, g.meta);
+        auto pic = hdrRendition(asRgb32(base), g.transfer, g.basePrimaries, g.mathPrimaries, map, g.meta);
+        // The tone-mapped item's own crop, turn and mirror. (Writers give the base the same ones, so the picture
+        // shown without the map matches; when the base has its own they have been applied already.)
+        auto transforms = [&](const AvifItem& item) {
+            for (int i : item.properties)
+                if (const QByteArray t = a.properties[size_t(i)].mid(4, 4); t == "clap" || t == "irot" || t == "imir") return true;
+            return false;
+        };
+        if (pic && g.tmap && transforms(*g.tmap) && !transforms(*g.base)) {
+            QImage t = QImage(reinterpret_cast<const uchar*>(pic->rgba.data()), pic->width, pic->height, pic->width * 8,
+                              QImage::Format_RGBA64)
+                           .copy();
+            // (Only when they keep the picture's size, as a half turn or a mirror does: the still's size is the base's,
+            // and a bad crop leaves the picture as it is rather than failing it.)
+            std::string ignored;
+            if (applyItemTransforms(a, *g.tmap, t, ignored) && t.width() == pic->width && t.height() == pic->height) {
+                t = t.convertToFormat(QImage::Format_RGBA64);
+                for (int y = 0; y < t.height(); ++y)
+                    std::memcpy(pic->rgba.data() + size_t(y) * size_t(t.width()) * 4, t.constScanLine(y), size_t(t.width()) * 8);
+            }
+        }
+        return pic;
     });
     if (!out && error) *error = why;
     return out;

@@ -30,7 +30,8 @@ namespace montage {
 
 bool isSourceAudioEffect(const std::string& type) {
     return type == "denoise" || type == "voice_isolate" || type == "enhance_speech" || type == "declick" || type == "pitch_shift" ||
-           type == "dereverb" || type == "spectral_repair" || type == "dialogue_align";
+           type == "dereverb" || type == "spectral_repair" || type == "dialogue_align" || type == "declip" || type == "deplosive" ||
+           type == "dewind";
 }
 
 
@@ -506,6 +507,14 @@ AudioBufferPtr process(const AudioBufferPtr& source, const std::vector<Effect>& 
             ok = enhanceSpeech(*cur, *out, e.p("amount", 0, 100), e.p("max_reduction_db", 0, 100), e.p("keep", 0) > 0.5, cancel);
         } else if (e.type == "declick") {
             declick(*cur, *out, e.p("sensitivity", 0, 50), e.p("max_ms", 0, 2), nullptr, cancel);
+            ok = true;
+        } else if (e.type == "declip") {
+            ok = declip(*cur, *out, e.p("clip_level_db", 0, 0), nullptr, cancel);
+        } else if (e.type == "deplosive") {
+            deplosive(*cur, *out, e.p("sensitivity", 0, 50), e.p("reduction_db", 0, 24), nullptr, cancel);
+            ok = true;
+        } else if (e.type == "dewind") {
+            dewind(*cur, *out, e.p("amount", 0, 100), e.p("max_reduction_db", 0, 24), cancel);
             ok = true;
         } else if (e.type == "dereverb") {
             dereverb(*cur, *out, e.p("amount", 0, 80), e.p("reverb_time", 0, 0), e.p("max_reduction_db", 0, 18), cancel);

@@ -617,6 +617,16 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"declick", "De-Click", EffectCategory::AudioFilter, "Restoration",
                  {pct("sensitivity", "Sensitivity", 0, 100, 50), num("max_ms", "Longest Click (ms)", 0.1, 10, 2, 0.1)},
                  {}});
+    // Dialogue repair on the clip's whole source audio (audio/AudioRepair.h).
+    c.push_back({"declip", "De-Clip", EffectCategory::AudioFilter, "Restoration",
+                 {num("clip_level_db", "Clip Level (dBFS, 0 = auto)", -30, 0, 0, 0.1)},
+                 {}});
+    c.push_back({"deplosive", "De-Plosive", EffectCategory::AudioFilter, "Restoration",
+                 {pct("sensitivity", "Sensitivity", 0, 100, 50), num("reduction_db", "Max Reduction (dB)", 0, 60, 24, 0.5)},
+                 {}});
+    c.push_back({"dewind", "De-Wind", EffectCategory::AudioFilter, "Restoration",
+                 {pct("amount", "Amount", 0, 100, 100), num("max_reduction_db", "Max Reduction (dB)", 0, 60, 24, 0.5)},
+                 {}});
     // On the clip's whole source audio (audio/SpeechCleanup.h dereverb).
     c.push_back({"dereverb", "De-Reverb", EffectCategory::AudioFilter, "Restoration",
                  {pct("amount", "Amount", 0, 100, 80), num("reverb_time", "Room Reverb Time (s, 0 = auto)", 0, 5, 0, 0.05),
