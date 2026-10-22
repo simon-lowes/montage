@@ -42,6 +42,8 @@
 #include "render/Gamut.h"
 #include "render/HdrView.h"
 #include "render/Compositor.h"
+#include "render/Particles.h"
+#include "core/Expression.h"
 #include "render/GpuCompositor.h"
 #include "render/Dcp.h"
 #include "render/Imf.h"
@@ -10020,6 +10022,239 @@ colorspaces:
         QVERIFY(across == 1 && down == 2);
         stereoPacking(StereoView::SideBySideHalf, across, down);
         QVERIFY(across == 1 && down == 1);
+    }
+
+    // Particles: a frame is the same rendered alone, after the frames before it, and on one thread or eight; one particle
+    // falls ½gt² under gravity; a second at a birth rate makes that many; a bounce keeps the set share of the speed; the
+    // turbulence has no divergence; in 3D the nearer of two particles is larger and drawn over the farther; title text and
+    // pictures emit only where they are; a sprite is drawn; an expression drives the rate; every look and preset draws.
+    void particles() {
+        const double fps = 30;
+        auto make = [](const char* type = "particles") { return makeEffect(type, 1); };
+        auto set = [](Effect& g, std::initializer_list<std::pair<const char*, double>> values) {
+            for (const auto& [name, v] : values) g.params[name] = Param(v);
+        };
+        auto inked = [](const Image& img) {
+            double a = 0;
+            for (size_t i = 3; i < img.px.size(); i += 4) a += img.px[i];
+            return a;
+        };
+
+        // The same picture alone, in sequence, on one thread, on eight and on the pool's (a 1920 x 1080 sequence at a
+        // quarter size).
+        Effect confetti = make("particles_confetti");
+        set(confetti, {{"floor", 1}, {"edges", 1}, {"mode", 1}});
+        clearParticleCache();
+        const Image alone = renderParticles(confetti, 40, 480, 270, 1920, 1080, fps, 1);
+        QVERIFY(inked(alone) > 20);
+        clearParticleCache();
+        Image played;
+        for (FrameTime t = 0; t <= 40; ++t) played = renderParticles(confetti, t, 480, 270, 1920, 1080, fps, 8);
+        QVERIFY(played.px == alone.px);
+        QVERIFY(renderParticles(confetti, 40, 480, 270, 1920, 1080, fps, 8).px == alone.px);
+        QVERIFY(renderParticles(confetti, 40, 480, 270, 1920, 1080, fps).px == alone.px);
+        // (Kept states every 16 frames: frame 40 again carries on from frame 32's.)
+        clearParticleCache();
+        const ParticleState fromStart = particleState(confetti, 40, 1920, 1080, fps);
+        const ParticleState fromKept = particleState(confetti, 40, 1920, 1080, fps);
+        QCOMPARE(fromKept.live.size(), fromStart.live.size());
+        QVERIFY(std::memcmp(fromKept.live.data(), fromStart.live.data(), fromStart.live.size() * sizeof(Particle)) == 0);
+
+        // A moving emitter: frame 60 the same reached from frame 48's state as worked out straight through.
+        Effect moving = make();
+        moving.params["emit_x"].addKey(0, -600);
+        moving.params["emit_x"].addKey(60, 600);
+        clearParticleCache();
+        particleState(moving, 48, 1920, 1080, 25);
+        const ParticleState via48 = particleState(moving, 60, 1920, 1080, 25);
+        clearParticleCache();
+        const ParticleState straight = particleState(moving, 60, 1920, 1080, 25);
+        QCOMPARE(via48.live.size(), straight.live.size());
+        QVERIFY(std::memcmp(via48.live.data(), straight.live.data(), straight.live.size() * sizeof(Particle)) == 0);
+        // Sequence size, not the size drawn at: the same particles however large the picture is.
+        clearParticleCache();
+        QVERIFY(inked(renderParticles(moving, 30, 634, 357, 1920, 1080, 30)) > 1);
+        const ParticleState drawnSmall = particleState(moving, 30, 1920, 1080, 30);
+        clearParticleCache();
+        renderParticles(moving, 30, 1920, 1080, 1920, 1080, 30);
+        QVERIFY(std::memcmp(particleState(moving, 30, 1920, 1080, 30).live.data(), drawnSmall.live.data(), drawnSmall.live.size() * sizeof(Particle)) == 0);
+
+        // One particle, still at the start, under 100 px/s² for 2 s: 200 px down.
+        Effect one = make();
+        set(one, {{"rate", 0}, {"burst", 1}, {"speed", 0}, {"gravity", 100}, {"emit_x", 0}, {"emit_y", 0}, {"life", 10}});
+        ParticleState s = particleState(one, 60, 1920, 1080, fps);
+        QCOMPARE(int(s.live.size()), 1);
+        QVERIFY2(std::fabs(s.live[0].y - 0.5 * 100 * 2 * 2) < 1e-3, qPrintable(QString::number(s.live[0].y, 'g', 12)));
+        QVERIFY(std::fabs(s.live[0].x) < 1e-9 && std::fabs(s.live[0].vy - 200) < 1e-6);
+
+        // The birth rate's count after a second, at 30, 25 and 29.97 frames a second.
+        Effect rate = make();
+        set(rate, {{"rate", 100}, {"life", 10}, {"life_random", 0}});
+        QCOMPARE(int(particleState(rate, 30, 1920, 1080, 30).live.size()), 100);
+        QCOMPARE(int(particleState(rate, 25, 1920, 1080, 25).live.size()), 100);
+        QCOMPARE(int(particleState(rate, 30, 1920, 1080, 30000.0 / 1001).live.size()), 100);
+
+        // Dropped 100 px onto a floor with a bounce of 50 %: it leaves at half the speed it arrived at.
+        Effect drop = make();
+        set(drop, {{"rate", 0}, {"burst", 1}, {"speed", 0}, {"gravity", 1000}, {"emit_y", 0}, {"life", 10}, {"floor", 1},
+                   {"floor_y", 60}, {"bounce", 50}, {"friction", 0}});
+        s = particleState(drop, 18, 1000, 1000, fps);  // 0.6 s: after the bounce at 0.447 s
+        QCOMPARE(int(s.live.size()), 1);
+        const double hit = std::sqrt(2 * 100 / 1000.0), after = 0.6 - hit, leave = -0.5 * 1000 * hit;
+        QVERIFY2(std::fabs(s.live[0].y - (100 + leave * after + 500 * after * after)) < 1e-3, qPrintable(QString::number(s.live[0].y, 'g', 12)));
+        QVERIFY2(std::fabs(s.live[0].vy - (leave + 1000 * after)) < 1e-6, qPrintable(QString::number(s.live[0].vy, 'g', 12)));
+        // And then it comes to rest on the floor.
+        s = particleState(drop, 240, 1000, 1000, fps);
+        QVERIFY(std::fabs(s.live[0].y - 100) < 1e-6 && std::fabs(s.live[0].vy) < 1e-6);
+
+        // A floor that rises carries what lies on it; friction slows a sliding particle the same at any number of steps;
+        // strong air resistance at one step a frame stops particles rather than flinging them.
+        Effect rising = make();
+        set(rising, {{"rate", 0}, {"burst", 30}, {"speed", 100}, {"spread", 180}, {"gravity", 1000}, {"emit_y", 0}, {"life", 10},
+                     {"floor", 1}, {"bounce", 20}});
+        rising.params["floor_y"].addKey(0, 80);
+        rising.params["floor_y"].addKey(60, 80);
+        rising.params["floor_y"].addKey(90, 60);
+        s = particleState(rising, 120, 1080, 1080, fps);
+        QCOMPARE(int(s.live.size()), 30);
+        for (const Particle& q : s.live) QVERIFY2(q.y <= 0.1 * 1080 + 1e-6, qPrintable(QString::number(q.y)));
+        auto slid = [&](int steps) {
+            Effect g = make();
+            set(g, {{"rate", 0}, {"burst", 1}, {"speed", 300}, {"direction", 90}, {"spread", 0}, {"speed_random", 0}, {"gravity", 1000},
+                    {"emit_y", 0}, {"life", 10}, {"floor", 1}, {"floor_y", 50}, {"friction", 30}, {"steps", double(steps)}});
+            return particleState(g, 60, 1920, 1080, fps).live.at(0).x;
+        };
+        const double slid1 = slid(1), slid4 = slid(4);
+        QVERIFY2(slid4 > 20 && slid4 < 600 && std::fabs(slid1 - slid4) < 0.02 * slid4, qPrintable(QStringLiteral("%1 %2").arg(slid1).arg(slid4)));
+        Effect thick = make();
+        set(thick, {{"rate", 0}, {"burst", 10}, {"speed", 1000}, {"gravity", 0}, {"drag", 50}, {"steps", 1}, {"emit_y", 0}, {"life", 10}});
+        s = particleState(thick, 24, 1920, 1080, 24);
+        for (const Particle& q : s.live) QVERIFY(std::hypot(q.vx, q.vy) < 1 && std::hypot(q.x, q.y) < 25);
+
+        // The turbulence fields' divergence, by central differences, at points all over, while they do move things.
+        QRandomGenerator rng(7);
+        double most = 0, worst = 0;
+        for (int i = 0; i < 400; ++i) {
+            const double x = rng.bounded(4000.0) - 2000, y = rng.bounded(4000.0) - 2000, z = rng.bounded(2000.0) - 1000, t = rng.bounded(30.0);
+            const double d = 1e-3, scale = 250, evolve = 0.3;
+            double a[3], b[3], v[3];
+            double div = 0;
+            curlNoise2(x + d, y, t, scale, evolve, 5, a), curlNoise2(x - d, y, t, scale, evolve, 5, b), div += (a[0] - b[0]) / (2 * d);
+            curlNoise2(x, y + d, t, scale, evolve, 5, a), curlNoise2(x, y - d, t, scale, evolve, 5, b), div += (a[1] - b[1]) / (2 * d);
+            curlNoise2(x, y, t, scale, evolve, 5, v);
+            most = std::max(most, std::hypot(v[0], v[1]));
+            worst = std::max(worst, std::fabs(div));
+            div = 0;
+            curlNoise3(x + d, y, z, t, scale, evolve, 5, a), curlNoise3(x - d, y, z, t, scale, evolve, 5, b), div += (a[0] - b[0]) / (2 * d);
+            curlNoise3(x, y + d, z, t, scale, evolve, 5, a), curlNoise3(x, y - d, z, t, scale, evolve, 5, b), div += (a[1] - b[1]) / (2 * d);
+            curlNoise3(x, y, z + d, t, scale, evolve, 5, a), curlNoise3(x, y, z - d, t, scale, evolve, 5, b), div += (a[2] - b[2]) / (2 * d);
+            worst = std::max(worst, std::fabs(div));
+        }
+        QVERIFY2(worst < 1e-4, qPrintable(QString::number(worst)));
+        QVERIFY(most > 0.5);
+
+        // 3D: two particles on the line through the frame's centre, one nearer. The centre shows the nearer one's colour
+        // (as its rim, beyond the farther one, does); turned round, the other's.
+        Effect pair = make();
+        set(pair, {{"mode", 1}, {"emitter", 2}, {"emit_w", 0}, {"emit_h", 0}, {"emit_d", 1600}, {"emit_y", 0}, {"rate", 0},
+                   {"burst", 2}, {"speed", 0}, {"gravity", 0}, {"life", 10}, {"size", 200}, {"size_random", 0},
+                   {"hue_random", 180}, {"fade_in", 0}, {"fade_out", 0}, {"color.r", 1}, {"color.g", 0}, {"color.b", 0},
+                   {"color_end.r", 1}, {"color_end.g", 0}, {"color_end.b", 0}, {"seed", 2}});
+        s = particleState(pair, 1, 1920, 1080, fps);
+        QCOMPARE(int(s.live.size()), 2);
+        QVERIFY2(std::fabs(s.live[0].z - s.live[1].z) > 300, qPrintable(QStringLiteral("%1 %2").arg(s.live[0].z).arg(s.live[1].z)));
+        const double focal = 540 / std::tan(35 * M_PI / 360);
+        auto colourAt = [](const Image& img, double x, double y, float out[3]) {
+            const float* p = img.at(int(x), int(y));
+            for (int c = 0; c < 3; ++c) out[c] = p[3] > 0 ? p[c] / p[3] : 0;
+        };
+        float centreNear[3], centreFar[3], rim[3];
+        for (int turned = 0; turned < 2; ++turned) {
+            pair.params["cam_turn"] = Param(turned ? 180.0 : 0.0);
+            const Image img = renderParticles(pair, 1, 480, 270, 1920, 1080, fps);
+            const double z0 = turned ? -s.live[0].z : s.live[0].z, z1 = turned ? -s.live[1].z : s.live[1].z;
+            const double rNear = 100 * focal / (focal - std::max(z0, z1)) * 0.25, rFar = 100 * focal / (focal - std::min(z0, z1)) * 0.25;
+            QVERIFY(rNear > rFar + 2);
+            colourAt(img, 240, 135, turned ? centreFar : centreNear);
+            if (!turned) colourAt(img, 240 + (rNear + rFar) / 2, 135, rim);
+        }
+        for (int c = 0; c < 3; ++c) QVERIFY(std::fabs(centreNear[c] - rim[c]) < 0.02);  // (the farther one shows through a little)
+        QVERIFY2(std::fabs(centreNear[0] - centreFar[0]) + std::fabs(centreNear[1] - centreFar[1]) + std::fabs(centreNear[2] - centreFar[2]) > 0.3,
+                 qPrintable(QStringLiteral("%1 %2 %3 / %4 %5 %6").arg(centreNear[0]).arg(centreNear[1]).arg(centreNear[2]).arg(centreFar[0]).arg(centreFar[1]).arg(centreFar[2])));
+
+        // Title text emits from its letters only: "I", a bar some 60 px wide and 290 high.
+        Effect text = make();
+        set(text, {{"emitter", 4}, {"emit_y", 0}, {"text_size", 400}, {"rate", 2000}, {"speed", 0}, {"gravity", 0}, {"life", 10}});
+        text.strings["text"] = "I";
+        s = particleState(text, 15, 1920, 1080, fps);
+        QVERIFY(s.live.size() > 900);
+        double xs = 0;
+        for (const Particle& q : s.live) {
+            QVERIFY2(std::fabs(q.x) < 80 && std::fabs(q.y) < 250, qPrintable(QStringLiteral("%1 %2").arg(q.x).arg(q.y)));
+            xs = std::max(xs, std::fabs(q.x));
+        }
+        QVERIFY(xs > 15);
+
+        // A picture opaque only on its left half emits only there; drawn as a sprite, a picture shows its colour.
+        QTemporaryDir dir;
+        QImage half(100, 100, QImage::Format_RGBA8888);
+        half.fill(Qt::transparent);
+        for (int y = 0; y < 100; ++y)
+            for (int x = 0; x < 50; ++x) half.setPixelColor(x, y, QColor(0, 200, 0));
+        const QString halfPath = dir.filePath("half.png");
+        QVERIFY(half.save(halfPath));
+        Effect pic = make();
+        set(pic, {{"emitter", 5}, {"emit_y", 0}, {"emit_w", 100}, {"emit_h", 100}, {"rate", 2000}, {"speed", 0}, {"gravity", 0}, {"life", 10}});
+        pic.strings["picture"] = halfPath.toStdString();
+        s = particleState(pic, 15, 1920, 1080, fps);
+        QVERIFY(s.live.size() > 900);
+        for (const Particle& q : s.live) QVERIFY2(q.x <= 0.5 && q.x >= -50.5 && std::fabs(q.y) <= 50.5, qPrintable(QString::number(q.x)));
+        Effect sprite = make();
+        set(sprite, {{"look", 4}, {"rate", 0}, {"burst", 1}, {"speed", 0}, {"gravity", 0}, {"emit_y", 0}, {"life", 10}, {"size", 400},
+                     {"size_random", 0}, {"fade_in", 0}, {"fade_out", 0}, {"color.r", 1}, {"color.g", 1}, {"color.b", 1}});
+        sprite.strings["sprite"] = halfPath.toStdString();
+        const Image sp = renderParticles(sprite, 1, 480, 270, 1920, 1080, fps);
+        const float* left = sp.at(240 - 25, 135);
+        const float* right = sp.at(240 + 25, 135);
+        QVERIFY2(left[3] > 0.95f && left[1] > 0.7f && left[0] < 0.05f, qPrintable(QString::number(left[3])));
+        QVERIFY(right[3] < 0.05f);
+
+        // An expression for the rate: none for the first second, 100 a second after.
+        if (expressionsAvailable()) {
+            Effect driven = make();
+            set(driven, {{"life", 10}});
+            driven.params["rate"].expr = "frame < 30 and 0 or 100";  // (frames: with no sequence in scope, time counts at 25 a second)
+            const size_t n = particleState(driven, 60, 1920, 1080, fps).live.size();
+            QVERIFY2(n >= 100 && n <= 102, qPrintable(QString::number(n)));
+            QCOMPARE(int(particleState(driven, 29, 1920, 1080, fps).live.size()), 0);
+            // A rate far past any sense is held to the catalogue's most, and the count to Most Particles.
+            Effect flood = make();
+            set(flood, {{"life", 10}, {"max_particles", 5000}});
+            flood.params["rate"].expr = "1e12";
+            QCOMPARE(int(particleState(flood, 30, 1920, 1080, fps).live.size()), 5000);
+        }
+
+        // Every look and every preset draws something.
+        for (int look = 0; look <= 4; ++look) {
+            Effect g = make();
+            g.params["look"] = Param(double(look));
+            QVERIFY2(inked(renderParticles(g, 30, 480, 270, 1920, 1080, fps)) > 1, qPrintable(QString::number(look)));
+        }
+        for (const GeneratorPreset& pre : generatorPresets()) {
+            const Effect g = make(pre.id);
+            QCOMPARE(g.type, std::string("particles"));
+            QVERIFY2(inked(renderParticles(g, 45, 480, 270, 1920, 1080, fps)) > 1, pre.id);
+            if (const QByteArray dir = qgetenv("MONTAGE_TEST_DUMP"); !dir.isEmpty())
+                for (FrameTime t : {20, 75}) {
+                    Image img = renderParticles(g, t, 960, 540, 1920, 1080, fps);
+                    for (size_t i = 0; i < img.px.size(); i += 4)  // (over dark grey)
+                        for (int c = 0; c < 3; ++c) img.px[i + size_t(c)] += 0.12f * (1 - img.px[i + 3]);
+                    for (size_t i = 3; i < img.px.size(); i += 4) img.px[i] = 1;
+                    QImage q(img.width, img.height, QImage::Format_RGBA8888);
+                    toRgba8(img, q.bits(), size_t(q.bytesPerLine()));
+                    q.save(QString::fromLocal8Bit(dir) + "/" + pre.id + "_" + QString::number(t) + ".png");
+                }
+        }
     }
 
     void titles3D() {

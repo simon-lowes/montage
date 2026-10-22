@@ -167,6 +167,7 @@ add_library(montage_engine STATIC
   render/ConformCheck.h render/ConformCheck.cpp
   render/Shapes.h render/Shapes.cpp
   render/Title3D.h render/Title3D.cpp
+  render/Particles.h render/Particles.cpp
   render/AafExport.h render/AafExport.cpp
   render/AvidMedia.h render/AvidMedia.cpp
   render/ClipAnalysis.h render/ClipAnalysis.cpp

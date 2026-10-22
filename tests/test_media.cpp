@@ -53,6 +53,7 @@
 #include "core/Expression.h"
 #include "core/ProjectIO.h"
 #include "render/Expressions.h"
+#include "render/Particles.h"
 #include "core/Surround.h"
 #include "core/Transcript.h"
 #include "core/TranscriptEdit.h"
@@ -6572,6 +6573,20 @@ private slots:
         const double loud = at(follower, "anchor_x", 10 + 75 - 30), band = at(follower, "anchor_y", 10 + 75 - 30);
         QVERIFY2(std::fabs(loud - 25) < 1, qPrintable(QString::number(loud)));
         QVERIFY2(std::fabs(band - 25) < 3, qPrintable(QString::number(band)));
+        // The sound driving particles: none born in the silent second, about 100 in the loud one.
+        {
+            Clip sparks = makeGeneratorClip(p, "particles", 100);
+            sparks.start = 10;
+            edit::overwrite(p, s, {TrackKind::Video, 2}, sparks);
+            Clip& placed = *edit::clipById(s, sparks.id);
+            placed.generator.params["life"] = Param(10.0);
+            const edit::Result r = edit::setExpression(p, s, placed.id, placed.generator.id, "rate", "audio(1) * 400");
+            QVERIFY2(r.ok, r.error.c_str());
+            ExpressionScope inClip(&p, &s, &placed);
+            QVERIFY(particleState(placed.generator, 45, s.width, s.height, 50).live.empty());
+            const size_t loud = particleState(placed.generator, 100, s.width, s.height, 50).live.size();
+            QVERIFY2(loud >= 90 && loud <= 110, qPrintable(QString::number(loud)));
+        }
         // Errors: the keyed value instead, and why.
         // (Nothing that could catch the time limit, run long in C, or change what other evaluations share.)
         follower.motion.params["rotation"] = Param(12);
@@ -11732,6 +11747,25 @@ private slots:
         QCOMPARE(shape.generator.p("trim_end", 0), 0.0);
         QCOMPARE(shape.generator.p("trim_end", FrameTime(std::llround(bs.fpsValue()))), 100.0);
         QVERIFY(std::fabs(shape.generator.p("stroke_color.g", 0) - 0x88 / 255.0) < 1e-6);
+
+        // Particles: snow with two settings changed; an unknown setting or preset is refused; generators are listed.
+        r = call("montage_add_particles", {{"project", project}, {"preset", "snow"}, {"at", 0}, {"duration", 2},
+                                           {"settings", QJsonObject{{"rate", 300}, {"color.b", 0.5}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(call("montage_add_particles", {{"project", project}, {"at", 0}, {"settings", QJsonObject{{"nonsense", 1}}}}).value("isError").toBool());
+        QVERIFY(call("montage_add_particles", {{"project", project}, {"at", 0}, {"preset", "fog"}}).value("isError").toBool());
+        QVERIFY(QJsonDocument(call("montage_list_effects", {{"kind", "generator"}})).toJson().contains("particles_snow"));
+        Project withSnow;
+        QVERIFY(loadProject(project.toStdString(), withSnow));
+        const Clip* snow = nullptr;
+        for (const Track& tr : withSnow.active()->videoTracks)
+            for (const Clip& c : tr.clips)
+                if (c.generator.type == "particles") snow = &c;
+        QVERIFY(snow);
+        QCOMPARE(snow->name, std::string("Snow"));
+        QCOMPARE(snow->generator.p("rate", 0), 300.0);
+        QCOMPARE(snow->generator.p("color.b", 0), 0.5);
+        QCOMPARE(snow->generator.p("emitter", 0), 1.0);  // (the preset's line)
     }
 
     void bleepInTheMix() {

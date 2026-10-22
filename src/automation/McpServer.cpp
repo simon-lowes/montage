@@ -2136,6 +2136,68 @@ void McpServer::Impl::addTools() {
                       made ? clipJson(l.project, s, *made) : QJsonObject{});
         });
 
+    add("montage_add_particles", "Add particles",
+        "Add a particle emitter over the picture at a time, for a duration (default 5 s), on a video track (default: the "
+        "track above the top one in use): sparks, snow, rain, floating dust, smoke puffs, confetti, a firework burst, or "
+        "sparkles round title text (preset), or plain particles to set up. settings sets any of its settings by name "
+        "(montage_list_effects with kind generator lists them; colours as name.r / .g / .b in 0..1), e.g. "
+        "{\"rate\": 200, \"gravity\": 0, \"look\": 2}. text is what a title-text emitter spells, picture the image or clip "
+        "a picture emitter (emitter 5 alpha, 6 brightness) emits from, sprite the image or clip each particle shows (look 4). "
+        "The simulation is the same however the frame is reached; montage_expression can drive any setting (rate from "
+        "audio(1), say).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
+            "duration":{"type":["number","string"],"default":5},"track":{"type":"string"},
+            "preset":{"type":"string","enum":["plain","sparks","snow","rain","dust","smoke","confetti","burst","title_sparkle"],"default":"plain"},
+            "settings":{"type":"object","additionalProperties":{"type":"number"}},
+            "text":{"type":"string"},"picture":{"type":"string"},"sprite":{"type":"string"}},
+            "required":["project","at"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            TrackRef t{TrackKind::Video, 0};
+            if (a.contains("track")) t = trackArg(str(a, "track"), s, true, &l.project, &s);
+            else {
+                int top = -1;
+                for (int i = 0; i < int(s.videoTracks.size()); ++i)
+                    if (!s.videoTracks[size_t(i)].clips.empty()) top = i;
+                t = top + 1 < int(s.videoTracks.size()) ? TrackRef{TrackKind::Video, top + 1} : edit::addTrack(l.project, s, TrackKind::Video);
+            }
+            const FrameTime len = a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(5 * s.fpsValue()));
+            const QString preset = str(a, "preset", "plain");
+            const std::string type = preset == "plain" ? std::string("particles") : "particles_" + preset.toStdString();
+            if (type != "particles" && !findGeneratorPreset(type)) throw ArgError{QStringLiteral("Unknown preset \"%1\"").arg(preset)};
+            Clip c = makeGeneratorClip(l.project, type, std::max<FrameTime>(1, len));
+            const EffectInfo* info = findEffectInfo("particles");
+            const QJsonObject settings = a.value("settings").toObject();
+            for (auto it = settings.begin(); it != settings.end(); ++it) {
+                const std::string name = it.key().toStdString();
+                const ParamInfo* pi = nullptr;
+                for (const ParamInfo& p : info->params)
+                    if (p.kind == ParamKind::Color ? name == p.name + ".r" || name == p.name + ".g" || name == p.name + ".b" : p.name == name) pi = &p;
+                if (!pi) throw ArgError{QStringLiteral("\"%1\" is not a setting of Particles").arg(it.key())};
+                if (!it.value().isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(it.key())};
+                c.generator.params[name] = Param(std::clamp(it.value().toDouble(), pi->min, pi->max));
+            }
+            for (const char* key : {"text", "picture", "sprite"})
+                if (a.contains(key)) {
+                    if (!a.value(key).isString()) throw ArgError{QStringLiteral("\"%1\" is text").arg(key)};
+                    c.generator.strings[key] = a.value(key).toString().toStdString();
+                }
+            for (const char* key : {"picture", "sprite"})
+                if (a.contains(key)) {
+                    const QFileInfo fi(a.value(key).toString());
+                    if (!fi.exists()) throw ArgError{QStringLiteral("No file at \"%1\"").arg(a.value(key).toString())};
+                    c.generator.strings[key] = fi.absoluteFilePath().toStdString();
+                }
+            c.start = timeArg(a.value("at"), s, "at");
+            const auto r = edit::overwrite(l.project, s, t, c);
+            check(r);
+            save(l);
+            const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
+            return ok(QStringLiteral("Added %1 on %2").arg(QString::fromStdString(c.name), QString::fromStdString(trackAt(s, t)->name)),
+                      made ? clipJson(l.project, s, *made) : QJsonObject{});
+        });
+
     add("montage_add_shape", "Add a shape",
         "Add a shape layer over the picture: a rectangle, ellipse, polygon, star, line or arrow, filled (a colour, or a "
         "gradient to a second colour) and/or outlined. Sizes and positions are in sequence pixels, from the centre. "
@@ -2209,14 +2271,15 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_list_effects", "List effects",
-        "The effects and transitions Montage has, with their parameters (name, range, default).",
-        R"json({"type":"object","properties":{"kind":{"type":"string","enum":["video","audio","transition"],"default":"video"}}})json", true,
+        "The effects, transitions and generators (titles, shapes, particles...) Montage has, with their parameters (name, range, default).",
+        R"json({"type":"object","properties":{"kind":{"type":"string","enum":["video","audio","transition","generator"],"default":"video"}}})json", true,
         [](const QJsonObject& a) {
             const QString kind = str(a, "kind", "video");
             QJsonArray list;
             for (const EffectInfo& e : effectCatalog()) {
                 const bool want = kind == "audio"        ? e.category == EffectCategory::AudioFilter
                                   : kind == "transition" ? e.category == EffectCategory::VideoTransition || e.category == EffectCategory::AudioTransition
+                                  : kind == "generator"  ? e.category == EffectCategory::Generator
                                                          : e.category == EffectCategory::VideoFilter;
                 if (!want || e.hidden) continue;
                 QJsonArray params;

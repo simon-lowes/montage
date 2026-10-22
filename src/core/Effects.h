@@ -89,6 +89,17 @@ struct TitleTemplate {
 };
 const std::vector<TitleTemplate>& titleTemplates();
 const TitleTemplate* findTitleTemplate(const std::string& id);
+// Ready-made looks for other generators (Particles' sparks, snow, rain...): listed as generators of their own, they
+// make a `base` generator with these settings.
+struct GeneratorPreset {
+    const char* id;
+    const char* name;
+    const char* base;
+    std::vector<std::pair<const char*, double>> params;
+    std::vector<std::pair<const char*, const char*>> strings;
+};
+const std::vector<GeneratorPreset>& generatorPresets();
+const GeneratorPreset* findGeneratorPreset(const std::string& id);
 std::vector<const EffectInfo*> effectsInCategory(EffectCategory c);
 
 // The parameters the inspector shows for an effect: the catalogue entry's,
