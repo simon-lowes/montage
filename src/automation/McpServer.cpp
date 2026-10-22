@@ -1698,6 +1698,54 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Trimmed by %1 frame(s)").arg(r.applied), c ? clipJson(l.project, s, *c) : QJsonObject{});
         });
 
+    add("montage_sound_samples", "Edit sound to the sample",
+        "Move an audio clip's sound (`move`), trim its start or end (`trim_start`, `trim_end`: positive shortens) or slip "
+        "what it plays (`slip`) by a number of samples at the sequence's rate, between frames where need be; the picture "
+        "and linked clips stay put. `volume_keys` adds volume keys (dB) at timeline samples, between frames (one key a frame: "
+        "another on the same frame replaces it). Returns "
+        "where the sound starts and ends, as timecode and samples.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "move":{"type":"integer"},"trim_start":{"type":"integer"},"trim_end":{"type":"integer"},"slip":{"type":"integer"},
+            "volume_keys":{"type":"array","items":{"type":"object","properties":{"sample":{"type":"integer","description":"Timeline sample"},
+                "db":{"type":"number"}},"required":["sample","db"]}}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id id = clipArg(l, a).id;
+            const int rate = s.sampleRate > 0 ? s.sampleRate : 48000;
+            static const std::pair<const char*, edit::SampleEdit> ops[] = {{"trim_start", edit::SampleEdit::TrimStart},
+                                                                           {"trim_end", edit::SampleEdit::TrimEnd},
+                                                                           {"slip", edit::SampleEdit::Slip},
+                                                                           {"move", edit::SampleEdit::Move}};
+            int changed = 0;
+            for (const auto& [arg, op] : ops) {
+                if (!a.contains(arg) || a.value(arg).toInteger() == 0) continue;
+                const auto r = edit::editSoundSamples(l.project, s, id, op, a.value(arg).toInteger(), rate);
+                if (!r.ok) return fail(QString::fromStdString(r.error));
+                ++changed;
+            }
+            const double fps = s.fpsValue();
+            for (const QJsonValue& v : a.value("volume_keys").toArray()) {
+                Clip* c = edit::clipById(s, id);
+                const auto loc = edit::locate(s, id);
+                if (!c || !loc || loc->track.kind != TrackKind::Audio) throw ArgError{"Volume keys go on a sound clip"};
+                const double at = double(v.toObject().value("sample").toInteger()) * fps / rate;
+                if (at < edit::soundStart(*c) - 1e-9 || at > edit::soundEnd(*c) + 1e-9) throw ArgError{"A volume key's sample is outside the clip's sound"};
+                c->audio.params["gain_db"].addKeyAt(at - double(c->start), std::clamp(v.toObject().value("db").toDouble(), -96.0, 24.0));
+                ++changed;
+            }
+            if (changed == 0) throw ArgError{"Give move, trim_start, trim_end, slip or volume_keys"};
+            save(l);
+            const Clip* c = edit::clipById(s, id);
+            const double from = edit::soundStart(*c), to = edit::soundEnd(*c);
+            const QString start = QString::fromStdString(formatTimecodeSamples(from, s.fps, rate)),
+                          end = QString::fromStdString(formatTimecodeSamples(to, s.fps, rate));
+            QJsonObject out = clipJson(l.project, s, *c);
+            out["sound_start"] = start, out["sound_end"] = end;
+            out["sound_start_sample"] = double(std::llround(from * rate / fps)), out["sound_end_sample"] = double(std::llround(to * rate / fps));
+            return ok(QStringLiteral("The sound runs %1 to %2").arg(start, end), out);
+        });
+
     add("montage_grade_version", "Grade versions",
         "Several named grades on one picture clip (Resolve's local versions): `action` list, add (a copy of the current "
         "grade, or none with `empty`; named `name`), switch (to `index`, from 0), remove (`index`) or rename (`index`, "
@@ -2565,13 +2613,19 @@ void McpServer::Impl::addTools() {
         "at `at`, and travels with the clip.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"at":{"type":["number","string"]},
             "name":{"type":"string"},"comment":{"type":"string"},"chapter":{"type":"boolean","default":false},
-            "clip":{"type":"number","description":"A clip id (montage_project_info) for a clip marker"}},"required":["project","at"]})json",
+            "at_samples":{"type":"integer","description":"Instead of at: a timeline sample, so the marker can sit between frames"},
+            "clip":{"type":"number","description":"A clip id (montage_project_info) for a clip marker"}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
-            const FrameTime at = timeArg(a.value("at"), s, "at");
+            // `at_samples`: a timeline sample, between frames (a sync point in the sound).
+            if (a.contains("at_samples") && a.contains("clip")) throw ArgError{"at_samples is for timeline markers; give a clip marker `at`"};
+            const bool bySample = a.contains("at_samples");
+            const double atSample = bySample ? double(a.value("at_samples").toInteger()) * s.fpsValue() / (s.sampleRate > 0 ? s.sampleRate : 48000) : 0;
+            const FrameTime at = bySample ? FrameTime(std::floor(atSample + 1e-9)) : timeArg(a.value("at"), s, "at");
             const bool chapter = a.value("chapter").toBool();
-            const Marker m{at, 0, str(a, "name").toStdString(), str(a, "comment").toStdString(), 0, chapter};
+            Marker m{at, 0, str(a, "name").toStdString(), str(a, "comment").toStdString(), 0, chapter};
+            if (bySample) m.sub = std::clamp(atSample - double(at), 0.0, 0.999999);
             if (a.contains("clip")) {
                 const Clip& c = clipArg(l, a);
                 if (!edit::addClipMarker(s, c.id, at, m)) throw ArgError{QStringLiteral("The clip is not at %1").arg(tc(at, s))};
@@ -2580,7 +2634,8 @@ void McpServer::Impl::addTools() {
             }
             edit::addMarker(s, m);
             save(l);
-            return ok(QStringLiteral("%1 at %2").arg(chapter ? QStringLiteral("Chapter marker") : QStringLiteral("Marker"), tc(at, s)));
+            const QString where = bySample ? QString::fromStdString(formatTimecodeSamples(atSample, s.fps, s.sampleRate > 0 ? s.sampleRate : 48000)) : tc(at, s);
+            return ok(QStringLiteral("%1 at %2").arg(chapter ? QStringLiteral("Chapter marker") : QStringLiteral("Marker"), where));
         });
 
     add("montage_chapters", "List chapters",

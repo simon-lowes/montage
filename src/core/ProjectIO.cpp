@@ -82,7 +82,8 @@ QJsonValue paramToJson(const Param& p) {
     QJsonArray keys;
     for (const auto& k : p.keys) {
         QJsonArray a{double(k.t), k.v, interpName(k.interp)};
-        if (k.inDt != 0 || k.inDv != 0 || k.outDt != 0 || k.outDv != 0) a << k.inDt << k.inDv << k.outDt << k.outDv;  // Bezier handles
+        if (k.inDt != 0 || k.inDv != 0 || k.outDt != 0 || k.outDv != 0 || k.sub != 0) a << k.inDt << k.inDv << k.outDt << k.outDv;  // Bezier handles
+        if (k.sub != 0) a << k.sub;  // between frames
         keys.append(a);
     }
     QJsonObject o{{"value", p.value}, {"keys", keys}};
@@ -113,9 +114,10 @@ Param paramFromJson(const QJsonValue& v) {
         if (a.size() < 2) continue;
         Keyframe k{FrameTime(a.at(0).toDouble()), a.at(1).toDouble(), a.size() > 2 ? interpFrom(a.at(2).toString()) : Interp::Linear};
         if (a.size() >= 7) k.inDt = a.at(3).toDouble(), k.inDv = a.at(4).toDouble(), k.outDt = a.at(5).toDouble(), k.outDv = a.at(6).toDouble();
+        if (a.size() >= 8) k.sub = std::clamp(a.at(7).toDouble(), 0.0, 0.999999);
         p.keys.push_back(k);
     }
-    std::sort(p.keys.begin(), p.keys.end(), [](const Keyframe& a, const Keyframe& b) { return a.t < b.t; });
+    std::stable_sort(p.keys.begin(), p.keys.end(), [](const Keyframe& a, const Keyframe& b) { return a.time() < b.time(); });
     return p;
 }
 
@@ -244,6 +246,7 @@ QJsonArray markersToJson(const std::vector<Marker>& markers) {
     for (const auto& mk : markers) {
         QJsonObject mo{{"t", double(mk.t)}, {"duration", double(mk.duration)}, {"name", qs(mk.name)}, {"comment", qs(mk.comment)}, {"color", mk.color}};
         if (mk.chapter) mo["chapter"] = true;
+        if (mk.sub != 0) mo["sub"] = mk.sub;
         if (!mk.drawing.empty()) mo["drawing"] = qs(mk.drawing);
         if (mk.drawnAt >= 0) mo["drawn_at"] = double(mk.drawnAt);
         if (!mk.reviewId.empty()) mo["review_id"] = qs(mk.reviewId);
@@ -259,6 +262,7 @@ std::vector<Marker> markersFromJson(const QJsonValue& v) {
         QJsonObject mo = mv.toObject();
         Marker mk;
         mk.t = i64(mo.value("t"));
+        mk.sub = std::clamp(mo.value("sub").toDouble(0), 0.0, 0.999999);
         mk.duration = i64(mo.value("duration"));
         mk.name = ss(mo.value("name"));
         mk.comment = ss(mo.value("comment"));
@@ -281,6 +285,8 @@ QJsonObject clipToJson(const Clip& c) {
                   {"duration", double(c.duration)},
                   {"sourceIn", c.sourceIn},
                   {"speed", c.speed}};
+    if (c.head != 0) o["head"] = c.head;
+    if (c.tail != 0) o["tail"] = c.tail;
     if (c.reverse) o["reverse"] = true;
     if (!c.enabled) o["enabled"] = false;
     if (c.linkGroup) o["link"] = double(c.linkGroup);
@@ -357,6 +363,8 @@ Clip clipFromJson(const QJsonObject& o) {
     c.start = i64(o.value("start"));
     c.duration = std::max<qint64>(1, i64(o.value("duration"), 1));
     c.sourceIn = o.value("sourceIn").toDouble();
+    c.head = std::clamp(o.value("head").toDouble(0), 0.0, 0.999999);
+    c.tail = std::clamp(o.value("tail").toDouble(0), 0.0, 0.999999);
     c.speed = o.value("speed").toDouble(1.0);
     if (!(c.speed > 0)) c.speed = 1.0;
     c.reverse = o.value("reverse").toBool(false);

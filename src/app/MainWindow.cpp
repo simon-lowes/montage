@@ -119,6 +119,7 @@
 #include "AutoMixDialog.h"
 #include "ScriptCutDialog.h"
 #include "QualityCheckDialog.h"
+#include "SoundSamplesDialog.h"
 #include "ConformCheckDialog.h"
 #include "OffloadDialog.h"
 #include "CaptureDialog.h"
@@ -1358,6 +1359,19 @@ void MainWindow::buildMenus() {
         }))->setObjectName(QStringLiteral("breathControl"));
     add(clipM, tr("Repair Damaged Frames…"), QKeySequence(), withSeq([this] { repairDamagedFrames(); }))
         ->setObjectName(QStringLiteral("repairDamagedFrames"));
+    add(clipM, tr("Edit Sound by Samples…"), QKeySequence(), withSeq([this] {
+        // The selected sound clip.
+        const Sequence* s = state_->sequence();
+        Id clip = 0;
+        for (Id id : state_->selectedClips())
+            if (const auto loc = edit::locate(*s, id); loc && loc->track.kind == TrackKind::Audio) clip = id;
+        if (!clip) {
+            state_->message(tr("Select the sound clip to edit by samples"));
+            return;
+        }
+        SoundSamplesDialog dlg(state_, clip, this);
+        dlg.exec();
+    }))->setObjectName(QStringLiteral("editSoundBySamples"));
     add(clipM, tr("Remove Mic &Bleed…"), QKeySequence(), withSeq([this] { micBleedDialog(); }))->setObjectName(QStringLiteral("removeMicBleed"));
     add(clipM, tr("Separate Stems…"), QKeySequence(), withSeq([this] {
             std::vector<Id> clips;

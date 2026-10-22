@@ -84,6 +84,7 @@
 #include "media/ContentCredentials.h"
 #include "ExposureView.h"
 #include "QualityCheckDialog.h"
+#include "SoundSamplesDialog.h"
 #include "ConformCheckDialog.h"
 #include "OffloadDialog.h"
 #include "RepairMediaDialog.h"
@@ -9398,6 +9399,43 @@ const auto seq = [this] { return state()->sequence(); };
         QTest::keyClick(win_.get(), Qt::Key_Q);
         QCOMPARE(state()->sequence()->markers.size(), markers + 1);
         keymap::resetAll(w);
+    }
+
+    void soundBySamplesDialog() {
+        // JFK from frame 10: moved 7 samples later and its end trimmed by 100 in one undo step; a move into the frames
+        // of the clip after it is refused and changes nothing.
+        state()->newProject();
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            const bool a = edit::placeMedia(p, s, ids[0], 10, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+            const FrameTime after = s.audioTracks[0].clips.at(0).end();
+            return a && edit::placeMedia(p, s, ids[0], after, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        const Id id = state()->sequence()->audioTracks[0].clips.at(0).id;
+        const Clip before = *edit::clipById(*state()->sequence(), id);
+        // Nothing selected: the menu says what to do.
+        state()->clearSelection();
+        auto* action = win_->findChild<QAction*>("editSoundBySamples");
+        QVERIFY(action);
+        action->trigger();  // (no dialog: it says to select the clip)
+        state()->setSelection({id}, false);
+        SoundSamplesDialog dlg(state(), id, win_.get());
+        QCOMPARE(dlg.span().left(16), QString("00:00:00:10+0000"));
+        dlg.findChild<QSpinBox*>("soundMove")->setValue(7);
+        dlg.findChild<QSpinBox*>("soundTrimEnd")->setValue(100);
+        QVERIFY(dlg.apply());
+        const Clip* c = edit::clipById(*state()->sequence(), id);
+        QVERIFY(std::fabs(c->head - 7.0 / 1600) < 1e-9);
+        QVERIFY(std::fabs(c->tail - 93.0 / 1600) < 1e-9);
+        QCOMPARE(dlg.span().left(16), QString("00:00:00:10+0007"));
+        QCOMPARE(dlg.findChild<QSpinBox*>("soundMove")->value(), 0);
+        dlg.findChild<QSpinBox*>("soundMove")->setValue(4000);
+        QVERIFY(!dlg.apply());
+        QVERIFY(dlg.error().contains("another clip"));
+        QCOMPARE(edit::clipById(*state()->sequence(), id)->head, c->head);
+        state()->undo();
+        QVERIFY(*edit::clipById(*state()->sequence(), id) == before);
     }
 
     void audioAnalysisMeters() {

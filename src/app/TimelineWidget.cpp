@@ -735,6 +735,12 @@ void TimelineWidget::paintClip(QPainter& p, const Row& row, const Clip& c, const
         p.setPen(QPen(QColor(0, 0, 0, 60), 1));
         for (int x = r.left() - r.height(); x < r.right(); x += 8) p.drawLine(x, r.bottom(), x + r.height(), r.top());
     }
+    if (row.ref.kind == TrackKind::Audio && (c.head > 0 || c.tail > 0)) {
+        // Sound placed between frames: the silent part of its first and last frame shaded.
+        const int head = int(std::lround(c.head * ppf_)), tail = int(std::lround(c.tail * ppf_));
+        if (head > 0) p.fillRect(QRect(r.left(), r.top(), head, r.height()), QColor(0, 0, 0, 110));
+        if (tail > 0) p.fillRect(QRect(r.right() + 1 - tail, r.top(), tail, r.height()), QColor(0, 0, 0, 110));
+    }
     paintLane(p, c, row.ref.kind, r);
     if (isThroughEdit(c.id)) {
         // A through edit (the picture or sound runs straight on): a small arrowhead into the cut, as Premiere marks it.
@@ -1435,7 +1441,7 @@ void TimelineWidget::paintRuler(QPainter& p) {
     }
     // Markers.
     for (const auto& m : s->markers) {
-        int x = xForFrame(m.t);
+        int x = xForFrame(m.t) + int(std::floor(m.sub * ppf_));  // (between frames: a sync point in the sound)
         QColor col = theme::labelColor(m.color);
         if (!col.isValid()) col = m.chapter ? QColor(255, 149, 0) : theme::kSnap;
         QPolygon poly;

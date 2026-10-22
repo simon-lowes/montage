@@ -2669,6 +2669,168 @@ private slots:
         }
     }
 
+    void soundToTheSample() {
+        // Two seconds of a steady level with a click at 0.1 s, on the timeline from frame 10 (30 fps, 48 kHz: 1600
+        // samples a frame): moved, trimmed and slipped by samples, the click and the sound's ends land on the sample.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        const int rate = 48000, spf = 1600;
+        QCOMPARE(s.sampleRate, rate);
+        QCOMPARE(s.fpsValue(), 30.0);
+        std::vector<float> sound(size_t(2 * rate) * 2, 0.25f);
+        sound[2 * 4800] = sound[2 * 4800 + 1] = 1.0f;
+        const std::string file = path("click.wav");
+        {
+            QFile f(QString::fromStdString(file));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            auto u32 = [&](uint32_t v) { f.write(reinterpret_cast<const char*>(&v), 4); };
+            auto u16 = [&](uint16_t v) { f.write(reinterpret_cast<const char*>(&v), 2); };
+            const uint32_t bytes = uint32_t(sound.size() * 4);
+            f.write("RIFF", 4), u32(36 + bytes), f.write("WAVEfmt ", 8), u32(16), u16(3), u16(2), u32(rate), u32(rate * 8), u16(8), u16(32);
+            f.write("data", 4), u32(bytes), f.write(reinterpret_cast<const char*>(sound.data()), qint64(bytes));
+        }
+        MediaItem m = probeOrFail(p, file);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 10, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id id = s.audioTracks[0].clips.front().id;
+        // The first and last sample heard, and the click, over the first three seconds.
+        struct Heard {
+            int64_t first = -1, last = -1, click = -1;
+            std::vector<float> left;
+        };
+        auto listen = [&] {
+            AudioMixer mixer;
+            std::vector<float> out(size_t(3 * rate) * 2);
+            mixer.mix(p, s, 0, 3 * rate, out.data());
+            Heard h;
+            float loudest = 0;
+            for (int64_t i = 0; i < 3 * rate; ++i) {
+                const float v = std::fabs(out[size_t(i) * 2]);
+                h.left.push_back(out[size_t(i) * 2]);
+                if (v > 1e-4f) {
+                    if (h.first < 0) h.first = i;
+                    h.last = i;
+                }
+                if (v > loudest) loudest = v, h.click = i;
+            }
+            return h;
+        };
+        auto describe = [](const Heard& h) { return QString("first %1 last %2 click %3").arg(h.first).arg(h.last).arg(h.click); };
+        const int64_t start = 10 * spf;
+        Heard h = listen();
+        QVERIFY2(h.first == start && h.click == start + 4800, qPrintable(describe(h)));
+        const int64_t end = h.last;
+        const Clip before = s.audioTracks[0].clips.front();
+
+        // Moved 7 samples later: within its first frame (its frames stay), the click too.
+        QVERIFY(edit::editSoundSamples(p, s, id, edit::SampleEdit::Move, 7, rate).ok);
+        h = listen();
+        QVERIFY2(h.first == start + 7 && h.click == start + 4807 && h.last == end + 7, qPrintable(describe(h)));
+        const Clip* c = edit::clipById(s, id);
+        QCOMPARE(c->start, before.start);
+        QCOMPARE(c->duration, before.duration + 1);  // (its last 7 samples spill into one more frame)
+        QVERIFY(std::fabs(c->head - 7.0 / spf) < 1e-9);
+        // 20 back: into the frame before.
+        QVERIFY(edit::editSoundSamples(p, s, id, edit::SampleEdit::Move, -20, rate).ok);
+        h = listen();
+        QVERIFY2(h.first == start - 13 && h.click == start + 4787 && h.last == end - 13, qPrintable(describe(h)));
+        QCOMPARE(edit::clipById(s, id)->start, FrameTime(9));
+        // Trimmed by samples at both ends; slipped: the click comes 10 samples sooner, the ends stay.
+        QVERIFY(edit::editSoundSamples(p, s, id, edit::SampleEdit::TrimStart, 100, rate).ok);
+        QVERIFY(edit::editSoundSamples(p, s, id, edit::SampleEdit::TrimEnd, 50, rate).ok);
+        h = listen();
+        // (Untrimmed, the file's very last sample is not heard; trimmed, the sound ends 63 samples sooner than it did.)
+        const int64_t trimmedEnd = start + 2 * rate - 13 - 50;
+        QVERIFY2(h.first == start + 87 && h.click == start + 4787 && h.last == trimmedEnd - 1, qPrintable(describe(h)));
+        QVERIFY(edit::editSoundSamples(p, s, id, edit::SampleEdit::Slip, 10, rate).ok);
+        h = listen();
+        QVERIFY2(h.first == start + 87 && h.click == start + 4777 && h.last == trimmedEnd - 1, qPrintable(describe(h)));
+        QCOMPARE(QString::fromStdString(formatTimecodeSamples(edit::soundStart(*edit::clipById(s, id)), s.fps, rate)),
+                 QString("00:00:00:10+0087"));
+
+        // A volume key between frames: held loud, then silent from frame 20.5 of the clip, to the sample.
+        {
+            Clip* k = edit::clipById(s, id);
+            Param& gain = k->audio.params["gain_db"];
+            gain.addKey(0, 0.0, Interp::Hold);
+            gain.addKeyAt(20.5, -96.0, Interp::Hold);
+            QVERIFY(std::fabs(gain.keys[1].sub - 0.5) < 1e-12);
+            const int64_t at = int64_t(k->start) * spf + 20 * spf + spf / 2;
+            h = listen();
+            QVERIFY2(std::fabs(h.left[size_t(at - 1)]) > 0.1f && std::fabs(h.left[size_t(at)]) < 1e-4f,
+                     qPrintable(QString("%1 %2").arg(h.left[size_t(at - 1)]).arg(h.left[size_t(at)])));
+            // Moving the sound takes its keys with it, between frames.
+            QVERIFY(edit::editSoundSamples(p, s, id, edit::SampleEdit::Move, 3, rate).ok);
+            h = listen();
+            QVERIFY(std::fabs(h.left[size_t(at + 2)]) > 0.1f && std::fabs(h.left[size_t(at + 3)]) < 1e-4f);
+            QVERIFY(edit::editSoundSamples(p, s, id, edit::SampleEdit::Move, -3, rate).ok);
+            edit::clipById(s, id)->audio.params.erase("gain_db");
+        }
+
+        // Saved and opened again; split, each part keeps only its own end's offset.
+        const std::string saved = path("samples.montage");
+        QVERIFY(saveProject(p, saved));
+        Project again;
+        QVERIFY(loadProject(saved, again));
+        const Clip* r = edit::clipById(*again.active(), id);
+        QVERIFY(r && std::fabs(r->head - edit::clipById(s, id)->head) < 1e-9 && std::fabs(r->tail - edit::clipById(s, id)->tail) < 1e-9);
+        {
+            Project cut = again;
+            Track& t = cut.active()->audioTracks[0];
+            const Id right = edit::splitClip(cut, t, 0, 30);
+            QVERIFY(right);
+            QVERIFY(t.clips[0].head > 0 && t.clips[0].tail == 0 && edit::clipById(*cut.active(), right)->head == 0 &&
+                    edit::clipById(*cut.active(), right)->tail > 0);
+        }
+
+        // What cannot be done: into the clip after it, to nothing, past the media's start, a picture clip.
+        {
+            Project q = p;
+            Sequence& qs = *q.active();
+            const Clip* cl = edit::clipById(qs, id);
+            QVERIFY(edit::placeMedia(q, qs, m.id, cl->end(), 0, -1, {TrackKind::Video, 1}, {TrackKind::Audio, 0}, false).ok);
+            const auto r1 = edit::editSoundSamples(q, qs, id, edit::SampleEdit::Move, 2000, rate);
+            QVERIFY2(!r1.ok && r1.error.find("another clip") != std::string::npos, r1.error.c_str());
+            QVERIFY(!edit::editSoundSamples(q, qs, id, edit::SampleEdit::TrimEnd, 10 * rate, rate).ok);
+            const auto r2 = edit::editSoundSamples(q, qs, id, edit::SampleEdit::TrimStart, -2000, rate);
+            QVERIFY2(!r2.ok && r2.error.find("media") != std::string::npos, r2.error.c_str());
+            QVERIFY(edit::overwrite(q, qs, {TrackKind::Video, 0}, makeGeneratorClip(q, "color", 30)).ok);
+            QVERIFY(!edit::editSoundSamples(q, qs, qs.videoTracks[0].clips.front().id, edit::SampleEdit::Move, 1, rate).ok);
+        }
+
+        // Over MCP: moved 5 samples, a volume key between frames, and a marker on a sample.
+        const QString project = QString::fromStdString(path("samples-mcp.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QString& tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const QJsonObject moved = call("montage_sound_samples",
+                                       {{"project", project}, {"clip", double(id)}, {"move", 5},
+                                        {"volume_keys", QJsonArray{QJsonObject{{"sample", double(start + 20000 + 400)}, {"db", -6}}}}});
+        QVERIFY2(!moved.value("isError").toBool(), QJsonDocument(moved).toJson().constData());
+        const QJsonObject sc = moved.value("structuredContent").toObject();
+        QCOMPARE(qint64(sc.value("sound_start_sample").toDouble()), start + 92);
+        QCOMPARE(sc.value("sound_start").toString(), QString("00:00:00:10+0092"));
+        const QJsonObject marked = call("montage_add_marker", {{"project", project}, {"at_samples", double(start + 800)}, {"name", "Sync"}});
+        QVERIFY2(!marked.value("isError").toBool() && marked.value("content").toArray().at(0).toObject().value("text").toString().contains("+0800"),
+                 QJsonDocument(marked).toJson().constData());
+        Project after;
+        QVERIFY(loadProject(project.toStdString(), after));
+        const Clip* ac = edit::clipById(*after.active(), id);
+        QCOMPARE(ac->audio.params.at("gain_db").keys.size(), size_t(1));
+        const double keyAt = ac->audio.params.at("gain_db").keys[0].time() + double(ac->start);
+        QVERIFY2(std::fabs(keyAt - double(start + 20400) / spf) < 1e-6, qPrintable(QString::number(keyAt)));
+        const auto mk = std::find_if(after.active()->markers.begin(), after.active()->markers.end(), [](const Marker& x) { return x.name == "Sync"; });
+        QVERIFY(mk != after.active()->markers.end() && mk->t == 10 && std::fabs(mk->sub - 0.5) < 1e-9);
+        QVERIFY(call("montage_sound_samples", {{"project", project}, {"clip", double(id)}}).value("isError").toBool());
+    }
+
     void stereoPhaseAndSpectrum() {
         const int rate = 48000;
         std::mt19937 rng(7);

@@ -47,6 +47,10 @@ struct Keyframe {
     // used when this key is). Both zero means automatic: smooth through the key,
     // flat where it turns and at the ends.
     double inDt = 0, inDv = 0, outDt = 0, outDv = 0;
+    // A sound key's place between frames (0..1): it sits at t + sub, sample-accurate for volume and pan. Pictures are
+    // made a frame at a time and see it at t + sub too.
+    double sub = 0;
+    double time() const { return double(t) + sub; }
     bool operator==(const Keyframe&) const = default;
 };
 
@@ -76,10 +80,15 @@ struct Param {
     // Whether the value can change over time: keys or an expression.
     bool varies() const { return !keys.empty() || !expr.empty(); }
     double at(FrameTime t) const;
+    // At a fractional frame (sound is mixed between frames); an expression is worked out at the frame it falls in.
+    double atTime(double t) const;
     double keyedAt(FrameTime t) const;  // the keys' (or the still) value, without the expression
+    double keyedAtTime(double t) const;
     // Sets the value at t: adds/replaces a keyframe if animated, else the static value.
     void set(FrameTime t, double v);
     void addKey(FrameTime t, double v, Interp interp = Interp::Linear);
+    // A key at a fractional frame (replacing one on the same frame); a sound key placed between frames.
+    void addKeyAt(double time, double v, Interp interp = Interp::Linear);
     bool removeKey(FrameTime t);
     const Keyframe* keyAt(FrameTime t) const;
     bool operator==(const Param&) const = default;
@@ -102,6 +111,7 @@ struct Effect {
     int node = 0;
 
     double p(const std::string& name, FrameTime t, double def = 0) const;
+    double pAt(const std::string& name, double t, double def = 0) const;  // at a fractional frame (Param::atTime)
     std::string s(const std::string& name, const std::string& def = {}) const;
     bool empty() const { return type.empty(); }
     bool operator==(const Effect&) const;  // compares the object mask by value
@@ -225,6 +235,7 @@ struct Marker {
     std::string reviewId;  // the review note it came from (the notes imported again bring it up to date)
     std::string reviewStatusAt;  // when the note's status was last set (the later status wins on import)
     FrameTime drawingFrame() const { return drawnAt >= 0 ? drawnAt : t; }
+    double sub = 0;  // between frames (0..1): it sits at t + sub (a sync point in the sound)
     bool operator==(const Marker&) const = default;
 };
 
@@ -321,6 +332,9 @@ struct Clip {
     std::string name;
     FrameTime start = 0;         // timeline position
     FrameTime duration = 1;      // timeline length
+    // Sound placed between frames: how much of the clip's first and last frame is silent (each 0..1, in frames), so
+    // its sound starts at start + head and ends at end() - tail, to the sample (edit::editSoundSamples).
+    double head = 0, tail = 0;
     double sourceIn = 0;         // in-point into the media, in sequence frames
     double speed = 1.0;          // > 0
     bool reverse = false;

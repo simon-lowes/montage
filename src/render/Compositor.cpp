@@ -3286,8 +3286,9 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
     for (const Clip& c : track.clips) {
         if (!c.enabled || edit::roleMuted(seq, c.role)) continue;
         int64_t cs = int64_t(std::llround(c.start * sr / fps)), ce = int64_t(std::llround(c.end() * sr / fps));
-        // Transitions extend the playable range and add fades.
-        int64_t ps = cs, pe = ce;
+        // Transitions extend the playable range and add fades; sound placed between frames starts and ends inside its
+        // first and last frame.
+        int64_t ps = int64_t(std::llround((double(c.start) + c.head) * sr / fps)), pe = int64_t(std::llround((double(c.end()) - c.tail) * sr / fps));
         int64_t fiS = 0, fiE = 0, foS = 0, foE = 0;
         bool equalPowerIn = true, equalPowerOut = true;
         for (const auto& tr : track.transitions) {
@@ -3327,10 +3328,16 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
         const double srcBase = c.sourceIn * sr / fps;
         const bool ramped = c.ramped();  // Time Remapping: the source position follows the speed curve
         // Where the clip's sound comes from at a timeline sample (in the source's samples), for its speed and direction.
+        // (A position within a millionth of a sample of a whole one is that sample: sound placed between frames carries
+        // rounding from frames to samples and back.)
         auto srcPos = [&](int64_t smp) {
-            if (c.reverse) return srcBase + double(ce - 1 - smp) * c.speed;
+            const auto whole = [](double v) {
+                const double r = std::round(v);
+                return std::fabs(v - r) < 1e-6 ? r : v;
+            };
+            if (c.reverse) return whole(srcBase + double(ce - 1 - smp) * c.speed);
             if (ramped) return (c.sourceIn + c.sourceOffset(double(smp - cs) * fps / sr)) * sr / fps;  // speed ramp
-            return srcBase + double(smp - cs) * c.speed;
+            return whole(srcBase + double(smp - cs) * c.speed);
         };
         // Bleeps: stretches of source (as samples) covered by a tone or silence, with 5 ms ramps.
         std::vector<std::pair<double, double>> bleeps;
@@ -3597,18 +3604,32 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             }
             return fade;
         };
+        // Volume at each sample when it is keyed (keys can sit between frames), and pan every 64 samples, at the clip's
+        // time.
+        const auto gainParam = c.audio.params.find("gain_db");
+        const Param* gainKeys = gainParam != c.audio.params.end() ? &gainParam->second : nullptr;
         auto gainAt = [&](int64_t s) {
-            const FrameTime lt = FrameTime(std::floor(double(s) * fps / sr)) - c.start;
-            return dbToLin(c.audio.p("gain_db", lt, 0) + (adDuck ? adDuck->at(lt) : 0.0));
+            const double lt = double(s) * fps / sr - double(c.start);
+            return dbToLin((gainKeys ? gainKeys->atTime(lt) : 0.0) + (adDuck ? adDuck->atTime(lt) : 0.0));
         };
+        // Where keys change the volume, it glides between 64-sample steps, and is worked out at each sample in a step
+        // a key falls in (so a step or a key between frames lands on its sample).
+        std::vector<int64_t> keySamples;
+        for (const Param* k : {gainKeys, adDuck})
+            if (k && k->keys.size() >= 2)
+                for (const Keyframe& key : k->keys) keySamples.push_back(int64_t(std::ceil((double(c.start) + key.time()) * sr / fps - 1e-6)));
+        std::sort(keySamples.begin(), keySamples.end());
+        const bool keyedGain = !keySamples.empty() && (!gainKeys || gainKeys->expr.empty()) && (!adDuck || adDuck->expr.empty());
         const int64_t o0 = std::max(start, ps), o1 = std::min(end, pe);
         for (int64_t s = o0; s < o1; s += 64) {
             int64_t e2 = std::min(o1, s + 64);
-            FrameTime lt = FrameTime(std::floor(double(s) * fps / sr)) - c.start;
-            const float g = gainAt(s);
+            const float g0 = gainAt(s), g1 = keyedGain ? gainAt(e2) : g0;
+            const auto key = std::upper_bound(keySamples.begin(), keySamples.end(), s);
+            const bool exact = keyedGain && key != keySamples.end() && *key <= e2;
             float pl, pr;
-            panGains(c.audio.p("pan", lt, 0), pl, pr);
+            panGains(c.audio.pAt("pan", double(s) * fps / sr - double(c.start), 0), pl, pr);
             for (int64_t k = s; k < e2; ++k) {
+                const float g = exact ? (k > s ? gainAt(k) : g0) : g0 + (g1 - g0) * float(k - s) / float(e2 - s);
                 const float fade = fadeAt(k);
                 float* d = &clipBuf[size_t(k - start) * 2];
                 float* tb = &trackBuf[size_t(k - start) * 2];
