@@ -788,6 +788,7 @@ struct FcpxWriter {
         const Clip* clip;
         double offset;
         int lane;
+        double scale = 1;  // the element's time a timeline frame (its speed)
     };
 
     // Multicam angles: each video track is an angle (with its own sound when an audio track carries the same media), and
@@ -806,7 +807,7 @@ struct FcpxWriter {
     // One clip element. `lane` 0 is the primary storyline; `offset` is in the parent's time. `audio` is the linked sound
     // carried with it (a multicam clip's audio angle comes from it).
     void clip(const Clip& c, int lane, double offset, bool withAudio, const std::vector<Connected>& connected = {},
-              const Clip* audio = nullptr, bool soundOnly = false) {
+              const Clip* audio = nullptr, bool soundOnly = false, double scale = 1) {
         const Sequence* inner = nestedOf(c);
         const bool audioOnly = lane < 0 || soundOnly;
         if (c.isGenerator()) {
@@ -826,10 +827,20 @@ struct FcpxWriter {
             w.writeAttribute("ref", assets[c.mediaId]);
         }
         if (lane != 0) w.writeAttribute("lane", QString::number(lane));
-        w.writeAttribute("offset", t(offset));
+        // Sound placed to the sample (its head and tail, parts of its first and last frames left silent), connected at
+        // its own speed: its times in samples, as Final Cut Pro edits sound on its own. (In a storyline, or retimed, it
+        // keeps whole frames, its neighbours and time map in frames too.)
+        const bool sampled = lane < 0 && !c.isGenerator() && !inner && c.speed == 1.0 && !c.reverse && !c.ramped();
+        const double head = sampled ? c.head : 0, tail = sampled ? c.tail : 0;
+        auto ts = [&](double frames) {
+            if (head == 0 && tail == 0) return t(frames);
+            const int rate = cur->sampleRate > 0 ? cur->sampleRate : 48000;
+            return fcpTime(frames * double(rate) * cur->fps.den / cur->fps.num, Rational{rate, 1});
+        };
+        w.writeAttribute("offset", ts(offset + head * scale));
         w.writeAttribute("name", q(c.name));
-        w.writeAttribute("start", c.isGenerator() ? "0s" : t(c.sourceIn));
-        w.writeAttribute("duration", t(double(c.duration)));
+        w.writeAttribute("start", c.isGenerator() ? "0s" : ts(c.sourceIn + head));
+        w.writeAttribute("duration", ts(double(c.duration) - head - tail));
         if (!c.enabled) w.writeAttribute("enabled", "0");
         if (!c.isGenerator()) timeMap(c);  // (before mc-source, as the DTD orders them)
         if (inner && inner->multicam && nested.count(inner->id)) {
@@ -877,7 +888,7 @@ struct FcpxWriter {
             w.writeAttribute("fontColor", "1 1 1 1");
             w.writeEndElement();
         }
-        for (const Connected& k : connected) clip(*k.clip, k.lane, k.offset, false);
+        for (const Connected& k : connected) clip(*k.clip, k.lane, k.offset, false, {}, nullptr, false, k.scale);
         for (const Marker& m : markersIn(c.start, c.end()))
             marker(m, (c.isGenerator() ? 0 : c.sourceIn) + double(m.t - c.start) * c.speed);
         // Clip markers are already in the clip's own (source) time.
@@ -995,7 +1006,8 @@ struct FcpxWriter {
                 for (Id other : edit::linkedClips(seq, c.id))
                     if (auto loc = edit::locate(seq, other); loc && loc->track.kind == TrackKind::Audio && loc->track.index == 0) {
                         const Clip& a = seq.audioTracks[0].clips[loc->index];
-                        if (a.mediaId == c.mediaId && a.start == c.start && a.duration == c.duration) {
+                        // (Not sound placed to the sample: it is connected, with its times in samples.)
+                        if (a.mediaId == c.mediaId && a.start == c.start && a.duration == c.duration && a.head == 0 && a.tail == 0) {
                             e.withAudio = true;
                             e.audio = &a;
                             carried.insert(a.id);
@@ -1012,7 +1024,7 @@ struct FcpxWriter {
                 if (c.start >= e.offset && c.start < e.offset + e.duration) {
                     const double local = e.clip && !e.clip->isGenerator() ? e.clip->sourceIn + double(c.start - e.offset) * e.clip->speed
                                                                           : double(c.start - e.offset);
-                    e.connected.push_back({&c, local, lane});
+                    e.connected.push_back({&c, local, lane, e.clip && !e.clip->isGenerator() ? e.clip->speed : 1.0});
                     return;
                 }
         };
@@ -1044,7 +1056,7 @@ struct FcpxWriter {
                 w.writeAttribute("offset", t(double(e.offset)));
                 w.writeAttribute("start", "0s");
                 w.writeAttribute("duration", t(double(e.duration)));
-                for (const Connected& k : e.connected) clip(*k.clip, k.lane, k.offset, false);
+                for (const Connected& k : e.connected) clip(*k.clip, k.lane, k.offset, false, {}, nullptr, false, k.scale);
                 for (const Marker& m : markersIn(e.offset, e.offset + e.duration)) marker(m, double(m.t - e.offset));
                 w.writeEndElement();
             }
@@ -1298,11 +1310,21 @@ struct FcpxReader {
         bool reverse = false;
         const double speed = speedOf(e, reverse);
         auto place = [&](Id mid, double origin, TrackKind kind, int track) -> Clip* {
-            Clip* c = b->addClip(kind, track, mid, s0, len, (start - origin) * fps, name);
+            // Sound edited to the sample (times between frames): whole frames round it, the silent parts of its first
+            // and last frames its head and tail.
+            // (Within half a sample of a frame, on it.)
+            const double near = 0.5 * fps / 48000;
+            const double from = at * fps, to = (at + dur) * fps, first = std::floor(from + near), last = std::ceil(to - near);
+            const bool sampled = kind == TrackKind::Audio && dur > 0 && (from - first > near || last - to > near);
+            const double head = sampled ? from - first : 0, tail = sampled ? last - to : 0;
+            const double in = (start - origin) * fps - (reverse ? tail : head) * speed;
+            Clip* c = sampled ? b->addClip(kind, track, mid, FrameTime(first), FrameTime(last - first), in, name)
+                              : b->addClip(kind, track, mid, s0, len, (start - origin) * fps, name);
             if (c) {
                 c->speed = speed;
                 c->reverse = reverse;
                 c->enabled = e.attribute("enabled", "1") != "0";
+                c->head = std::clamp(head, 0.0, 1.0), c->tail = std::clamp(tail, 0.0, 1.0);
             }
             return c;
         };

@@ -1,6 +1,7 @@
 // Montage — recording a live feed (Resolve's Media page capture, Media Composer's Capture tool), through FFmpeg:
-// a network stream (SRT, RIST, UDP or RTP MPEG-TS, RTMP, HLS or any URL FFmpeg opens) or a capture device FFmpeg
-// reaches (V4L2 and ALSA or PulseAudio on Linux, AVFoundation on macOS, DirectShow on Windows; built with
+// a network stream (SRT, RIST, UDP or RTP MPEG-TS, RTMP, HLS or any URL FFmpeg opens), an Open Media Transport source
+// (media/Omt.h: omt://host:port or its announced name, with its timecode and colour when Montage sent it) or a capture
+// device FFmpeg reaches (V4L2 and ALSA or PulseAudio on Linux, AVFoundation on macOS, DirectShow on Windows; built with
 // libavdevice), recorded to ProRes or DNxHR with its sound (up to 16 channels, 24-bit) and timecode (the
 // feed's own SMPTE 12-M timecode, one given, or the time of day). QuickTime files are written in fragments half a
 // second long, so the file can be imported and cut while it records (EditorState's growing media) and survives a crash;
@@ -25,8 +26,9 @@
 namespace montage {
 
 struct CaptureSource {
-    std::string url;     // a stream's URL, or the device's name (e.g. "/dev/video0", "0:0", "video=My Camera")
-    std::string device;  // FFmpeg's input device ("v4l2", "alsa", "pulse", "avfoundation", "dshow", "lavfi"); "" for a URL
+    std::string url;     // a stream's URL, or the device's name (e.g. "/dev/video0", "0:0", "video=My Camera"); an OMT source's
+                         // omt://host:port or "HOST (Name)"
+    std::string device;  // FFmpeg's input device ("v4l2", "alsa", "pulse", "avfoundation", "dshow", "lavfi"), or "omt"; "" for a URL
     std::map<std::string, std::string> options;  // FFmpeg input options ("video_size", "framerate", "latency"...)
 };
 
@@ -42,7 +44,7 @@ struct CaptureSettings {
 
 // The codecs offered: id and name.
 std::vector<std::pair<std::string, std::string>> captureCodecs();
-// The capture devices this build can open (empty without libavdevice).
+// The capture devices this build can open: "omt" (Open Media Transport) and FFmpeg's (none without libavdevice).
 std::vector<std::string> captureDeviceKinds();
 
 struct CaptureStatus {

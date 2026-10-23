@@ -205,9 +205,17 @@ void curves(const Effect& e, FrameTime t, Image& img) {
     float mix = float(e.p("mix", t, 100)) / 100.0f;
     const int n = int(m.size()) - 1;
     auto look = [n](const std::vector<float>& lut, float v) {
-        // Past either end (a floating-point picture's highlights), the curve carries on at its end's slope.
-        if (v > 1) return lut[size_t(n)] + (v - 1) * (lut[size_t(n)] - lut[size_t(n) - 1]) * float(n);
-        if (v < 0) return lut[0] + v * (lut[1] - lut[0]) * float(n);
+        // Past either end (a floating-point picture's highlights), the curve carries on at its end's slope (flat ends
+        // stay flat, even for an infinite value); a NaN becomes 0, as the clamped path made it.
+        if (std::isnan(v)) return 0.0f;
+        if (v > 1) {
+            const float slope = (lut[size_t(n)] - lut[size_t(n) - 1]) * float(n);
+            return slope == 0 ? lut[size_t(n)] : lut[size_t(n)] + (v - 1) * slope;
+        }
+        if (v < 0) {
+            const float slope = (lut[1] - lut[0]) * float(n);
+            return slope == 0 ? lut[0] : lut[0] + v * slope;
+        }
         float x = v * float(n);
         int i = std::min(n - 1, int(x));
         float f = x - float(i);
@@ -215,6 +223,10 @@ void curves(const Effect& e, FrameTime t, Image& img) {
     };
     perPixel(img, [&](float& r, float& g, float& b, float&) {
         float nr = look(cr, look(m, r)), ng = look(cg, look(m, g)), nb = look(cb, look(m, b));
+        if (mix >= 1) {
+            r = nr, g = ng, b = nb;  // (so a NaN or infinite pixel takes the curve's value, not NaN from the mix)
+            return;
+        }
         r += (nr - r) * mix;
         g += (ng - g) * mix;
         b += (nb - b) * mix;

@@ -10,6 +10,7 @@
 #include "media/Pulldown.h"
 #include <QCoreApplication>
 #include "media/TextReader.h"
+#include "render/Exporter.h"
 #include "Settings.h"
 
 #include <QApplication>
@@ -491,7 +492,7 @@ void MediaBinWidget::importDialog() {
     QString dir = settings.value("lastImportDir").toString();
     QStringList files = QFileDialog::getOpenFileNames(
         this, tr("Import Media"), dir,
-        tr("Media (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mxf *.mts *.m2ts *.ts *.mpg *.mpeg *.wmv *.flv *.gif "
+        tr("Media (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mxf *.apv *.mts *.m2ts *.ts *.mpg *.mpeg *.wmv *.flv *.gif "
            "*.wav *.mp3 *.aac *.m4a *.flac *.ogg *.opus *.aif *.aiff *.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp *.exr *.svg *.json "
            "*.mlv *.psd *.psb *.dng *.cr2 *.cr3 *.nef *.arw *.raf *.rw2 *.orf *.pef *.srw *.3fr *.iiq);;All files (*)"));
     if (files.isEmpty()) return;
@@ -1732,6 +1733,7 @@ std::optional<ProxyOptions> MediaBinWidget::proxyOptionsDialog() {
     format->addItem(tr("ProRes 422 Proxy (keeps HDR)"), QStringLiteral("prores_proxy"));
     format->addItem(tr("DNxHR LB"), QStringLiteral("dnxhr_lb"));
     format->addItem(tr("HEVC 10-bit (smallest, keeps HDR)"), QStringLiteral("hevc10"));
+    if (apvEncoderAvailable()) format->addItem(tr("APV 10-bit (intra-frame, keeps HDR)"), QStringLiteral("apv"));
     format->setCurrentIndex(std::max(0, format->findData(appSettings().value(QStringLiteral("proxy/format"), "h264"))));
     auto* size = new QComboBox(&dlg);
     size->setObjectName(QStringLiteral("proxySize"));

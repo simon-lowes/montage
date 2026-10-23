@@ -7,11 +7,16 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <deque>
 #include <vector>
 
 #include <QFile>
+
+#ifdef MONTAGE_WITH_OMT
+#include "Omt.h"
+#endif
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -71,12 +76,35 @@ bool endsWith(const std::string& s, const char* tail) {
     return true;
 }
 
-// A packet read from one of the inputs (null: that input ended, with `error` when it failed).
+// A packet read from one of the inputs (null: that input ended, with `error` when it failed); an Open Media Transport
+// feed's frames come as they are, with an empty packet for their size.
 struct Item {
     int input = 0;
     AVPacket* packet = nullptr;
     std::string error;
+#ifdef MONTAGE_WITH_OMT
+    std::shared_ptr<omt::Frame> omt;
+#endif
 };
+
+// An Open Media Transport source: "omt" as the device, or an omt:// URL.
+int64_t itemBytes(const Item& i) {
+#ifdef MONTAGE_WITH_OMT
+    if (i.omt) return int64_t(i.omt->data.size());
+#endif
+    return i.packet ? i.packet->size : 0;
+}
+bool hasData(const Item& i) {
+#ifdef MONTAGE_WITH_OMT
+    if (i.omt) return true;
+#endif
+    return i.packet != nullptr;
+}
+
+bool isOmt(const CaptureSource& src) {
+    return src.device == "omt" || (src.device.empty() && src.url.size() > 6 &&
+                                   std::equal(src.url.begin(), src.url.begin() + 6, "omt://", [](char a, char b) { return std::tolower(static_cast<unsigned char>(a)) == b; }));
+}
 
 }  // namespace
 
@@ -123,6 +151,19 @@ struct Input {
     int videoStream = -1, audioStream = -1;
     Interrupt irq{};
     AVRational videoTb{1, 1}, audioTb{1, 1}, rate{0, 1};
+#ifdef MONTAGE_WITH_OMT
+    // An Open Media Transport feed: its receiver, the frames read while it was opened, its sound's channels.
+    std::unique_ptr<omt::Receiver> omt;
+    std::deque<std::shared_ptr<omt::Frame>> early;
+    omt::VmxDecoder vmx;
+    int omtChannels = 0;
+#endif
+    bool live() const {
+#ifdef MONTAGE_WITH_OMT
+        if (omt) return true;
+#endif
+        return fmt != nullptr;
+    }
     ~Input() {
         avcodec_free_context(&video);
         avcodec_free_context(&audio);
@@ -148,7 +189,59 @@ AVCodecContext* openDecoder(AVStream* st, std::string* error) {
     return c;
 }
 
+#ifdef MONTAGE_WITH_OMT
+// Connects to an Open Media Transport source and waits for its first picture (and, a moment longer, its sound).
+bool openOmt(Recorder::State* s, const CaptureSource& src, bool wantVideo, bool wantAudio, Input& in, std::string* error) {
+    omt::Receiver::Options o;
+    o.video = wantVideo;
+    o.audio = wantAudio;
+    o.metadata = false;
+    o.quality = omt::Quality::High;  // (the best the sender will give)
+    o.queue = 64;
+    o.connectTimeout = std::min(s->settings.openTimeout, 10.0);
+    in.omt = std::make_unique<omt::Receiver>();
+    if (!in.omt->open(src.url, o, error)) {
+        in.omt.reset();
+        return false;
+    }
+    using namespace std::chrono;
+    const auto until = Clock::now() + milliseconds(int64_t(s->settings.openTimeout * 1000));
+    auto deadline = until;
+    bool picture = !wantVideo;
+    while (!s->stopping && Clock::now() < deadline) {
+        auto f = std::make_shared<omt::Frame>();
+        if (!in.omt->next(*f, 50)) continue;
+        if (f->header.type == omt::Video && f->video.codec == omt::kVmx1 && !picture) {
+            picture = true;
+            if (f->video.rateN > 0 && f->video.rateD > 0) in.rate = {f->video.rateN, f->video.rateD};
+            deadline = std::min(until, Clock::now() + milliseconds(500));  // (its sound, a moment longer)
+        } else if (f->header.type == omt::Audio && f->audio.codec == omt::kFpa1 && f->audio.channels > 0) {
+            in.omtChannels = std::max(in.omtChannels, f->audio.channels);
+        }
+        in.early.push_back(f);
+        if (picture && (!wantAudio || in.omtChannels > 0)) break;
+    }
+    if (!picture) {
+        if (error) *error = s->stopping ? "Stopped" : src.url + " sent no picture";
+        in.omt.reset();
+        return false;
+    }
+    in.videoStream = wantVideo ? 0 : -1;
+    in.audioStream = wantAudio && in.omtChannels > 0 ? 1 : -1;
+    in.videoTb = in.audioTb = {1, 10000000};
+    return true;
+}
+#endif
+
 bool openInput(Recorder::State* s, int index, const CaptureSource& src, bool wantVideo, bool wantAudio, Input& in, std::string* error) {
+#ifdef MONTAGE_WITH_OMT
+    if (isOmt(src)) return openOmt(s, src, wantVideo, wantAudio, in, error);
+#else
+    if (isOmt(src)) {
+        if (error) *error = "This build has no Open Media Transport";
+        return false;
+    }
+#endif
     const AVInputFormat* ifmt = nullptr;
     if (!src.device.empty()) {
 #ifdef MONTAGE_WITH_AVDEVICE
@@ -249,6 +342,9 @@ std::vector<std::pair<std::string, std::string>> captureCodecs() {
 
 std::vector<std::string> captureDeviceKinds() {
     std::vector<std::string> out;
+#ifdef MONTAGE_WITH_OMT
+    if (omt::vmxAvailable()) out.push_back("omt");
+#endif
 #ifdef MONTAGE_WITH_AVDEVICE
     avdevice_register_all();
     for (const char* name : {"v4l2", "alsa", "pulse", "avfoundation", "dshow", "lavfi"})
@@ -467,14 +563,18 @@ void Recorder::run() {
         vst->avg_frame_rate = fps;
         av_dict_set(&vst->metadata, "timecode", tc.c_str(), 0);
         // Its sound: the video source's, else a sound device of its own (its format known from the first sound).
-        const Input& ain = inputs[1].fmt ? inputs[1] : inputs[0];
-        if (ain.audioStream >= 0 && ain.audio) {
+        const Input& ain = inputs[1].live() ? inputs[1] : inputs[0];
+        int sourceChannels = ain.audio ? ain.audio->ch_layout.nb_channels : 0;
+#ifdef MONTAGE_WITH_OMT
+        if (ain.omt) sourceChannels = ain.omtChannels;
+#endif
+        if (ain.audioStream >= 0 && sourceChannels > 0) {
             const AVCodec* pcm = avcodec_find_encoder(AV_CODEC_ID_PCM_S24LE);
             aenc = avcodec_alloc_context3(pcm);
             aenc->sample_fmt = AV_SAMPLE_FMT_S32;
             aenc->sample_rate = 48000;
-            const int channels = std::min(16, std::max(1, ain.audio->ch_layout.nb_channels));
-            if (ain.audio->ch_layout.nb_channels == channels && ain.audio->ch_layout.order != AV_CHANNEL_ORDER_UNSPEC)
+            const int channels = std::min(16, std::max(1, sourceChannels));
+            if (ain.audio && ain.audio->ch_layout.nb_channels == channels && ain.audio->ch_layout.order != AV_CHANNEL_ORDER_UNSPEC)
                 av_channel_layout_copy(&aenc->ch_layout, &ain.audio->ch_layout);
             else
                 av_channel_layout_default(&aenc->ch_layout, channels);
@@ -707,8 +807,95 @@ void Recorder::run() {
         return ok;
     };
 
+#ifdef MONTAGE_WITH_OMT
+    // An Open Media Transport frame: its picture decoded from VMX (16-bit when it was sent so, else 8-bit), with the
+    // timecode and colour Montage's senders put in its metadata; its sound from FPA1.
+    auto decodeOmt = [&](Item& item, bool soundOnly) -> bool {
+        Input& in = inputs[item.input];
+        const omt::Frame& f = *item.omt;
+        if (f.header.type == omt::Video && !soundOnly && in.videoStream >= 0) {
+            const omt::VideoHeader& v = f.video;
+            if (v.codec != omt::kVmx1 || !omt::plausible(v) || (v.flags & omt::Preview)) return true;
+            const bool deep = (v.flags & omt::HighBitDepth) != 0;
+            const int stride = v.width * 2;
+            AVBufferRef* buf = av_buffer_alloc(size_t(stride) * size_t(v.height) * (deep ? 2 : 1));
+            if (!buf) return true;
+            if (!in.vmx.decode(f.data.data(), f.data.size(), v.width, v.height, v.colorSpace, deep ? omt::PictureFormat::P216 : omt::PictureFormat::Uyvy,
+                               buf->data, stride)) {
+                av_buffer_unref(&buf);
+                std::lock_guard lock(s->m);
+                ++s->st.dropped;
+                return true;
+            }
+            AVFrame* pic = av_frame_alloc();
+            pic->buf[0] = buf;
+            pic->format = deep ? AV_PIX_FMT_P216LE : AV_PIX_FMT_UYVY422;
+            pic->width = v.width;
+            pic->height = v.height;
+            pic->data[0] = buf->data;
+            pic->linesize[0] = stride;
+            if (deep) pic->data[1] = buf->data + size_t(stride) * size_t(v.height), pic->linesize[1] = stride;
+            pic->pts = pic->best_effort_timestamp = f.header.timestamp;
+            pic->color_range = AVCOL_RANGE_MPEG;
+            pic->colorspace = v.colorSpace == 601 ? AVCOL_SPC_SMPTE170M : v.colorSpace == 709 ? AVCOL_SPC_BT709 : AVCOL_SPC_UNSPECIFIED;
+            const std::string transfer = omt::xmlAttribute(f.metadata, "transfer"), matrix = omt::xmlAttribute(f.metadata, "matrix");
+            if (matrix == "bt_2020") pic->colorspace = AVCOL_SPC_BT2020_NCL;
+            else if (matrix == "bt_709") pic->colorspace = AVCOL_SPC_BT709;
+            const std::string primaries = omt::xmlAttribute(f.metadata, "primaries");
+            pic->color_primaries = primaries == "bt_2020" ? AVCOL_PRI_BT2020 : primaries == "bt_709" ? AVCOL_PRI_BT709 : AVCOL_PRI_UNSPECIFIED;
+            pic->color_trc = transfer == "bt_2100_pq" ? AVCOL_TRC_SMPTE2084 : transfer == "bt_2100_hlg" ? AVCOL_TRC_ARIB_STD_B67
+                           : transfer == "bt_2020"    ? AVCOL_TRC_BT2020_10
+                           : transfer == "bt_709"     ? AVCOL_TRC_BT709
+                                                      : AVCOL_TRC_UNSPECIFIED;
+            if (v.flags & omt::Interlaced) pic->flags |= AV_FRAME_FLAG_INTERLACED | AV_FRAME_FLAG_TOP_FIELD_FIRST;
+            if (v.rateN > 0 && v.rateD > 0) in.rate = {v.rateN, v.rateD};
+            // (its timecode, as the feed's own: SMPTE 12-M side data, as FFmpeg gives it)
+            const std::string tc = omt::xmlAttribute(f.metadata.substr(std::min(f.metadata.size(), f.metadata.find("<montage_timecode"))), "value");
+            AVTimecode t;
+            if (!tc.empty() && in.rate.num > 0 && av_timecode_init_from_string(&t, in.rate, tc.c_str(), nullptr) >= 0)
+                if (AVFrameSideData* sd = av_frame_new_side_data(pic, AV_FRAME_DATA_S12M_TIMECODE, sizeof(uint32_t) * 4)) {
+                    auto* w = reinterpret_cast<uint32_t*>(sd->data);
+                    w[0] = 1;
+                    w[1] = av_timecode_get_smpte_from_framenum(&t, 0);
+                    w[2] = w[3] = 0;
+                }
+            const bool ok = putPicture(pic, in);
+            av_frame_free(&pic);
+            return ok;
+        }
+        if (f.header.type == omt::Audio && in.audioStream >= 0) {
+            const omt::AudioHeader& a = f.audio;
+            if (a.codec != omt::kFpa1 || !omt::plausible(a, f.data.size())) return true;
+            std::vector<float> planar(size_t(a.channels) * size_t(a.samplesPerChannel));
+            if (!omt::decodeFpa1(f.data.data(), f.data.size(), a.channels, a.samplesPerChannel, a.activeChannels, planar.data())) {
+                std::lock_guard lock(s->m);
+                ++s->st.dropped;
+                return true;
+            }
+            AVFrame* sound = av_frame_alloc();
+            sound->format = AV_SAMPLE_FMT_FLTP;
+            sound->sample_rate = a.sampleRate;
+            sound->nb_samples = a.samplesPerChannel;
+            av_channel_layout_default(&sound->ch_layout, a.channels);
+            bool ok = av_frame_get_buffer(sound, 0) >= 0;
+            if (ok) {
+                for (int c = 0; c < a.channels; ++c)
+                    std::memcpy(sound->extended_data[c], planar.data() + size_t(c) * size_t(a.samplesPerChannel), size_t(a.samplesPerChannel) * 4);
+                sound->pts = sound->best_effort_timestamp = f.header.timestamp;
+                ok = putSound(sound, item.input == 0, in.audioTb);
+            }
+            av_frame_free(&sound);
+            return ok;
+        }
+        return true;
+    };
+#endif
+
     // One packet decoded: pictures (unless only sound is wanted now) and sound.
     auto decode = [&](Item& item, bool soundOnly) -> bool {
+#ifdef MONTAGE_WITH_OMT
+        if (item.omt) return decodeOmt(item, soundOnly);
+#endif
         Input& in = inputs[item.input];
         const bool isVideo = item.packet->stream_index == in.videoStream;
         if (isVideo && soundOnly) return true;
@@ -735,6 +922,43 @@ void Recorder::run() {
     if (opened && cs.audio) opened = openInput(s, 1, *cs.audio, false, true, inputs[1], &fatal);
     if (opened) {
         for (int i = 0; i < 2; ++i) {
+#ifdef MONTAGE_WITH_OMT
+            if (inputs[i].omt) {
+                // An Open Media Transport feed: its frames as they come (pictures dropped when falling behind).
+                readers.emplace_back([s, i, &inputs] {
+                    Input& in = inputs[i];
+                    const double patience = std::max(5.0, s->settings.openTimeout);
+                    int64_t heard = nowMs();
+                    while (!s->stopping) {
+                        auto f = std::make_shared<omt::Frame>();
+                        if (!in.early.empty()) {
+                            f = in.early.front();
+                            in.early.pop_front();
+                        } else if (!in.omt->next(*f, 100)) {
+                            if (nowMs() - heard < int64_t(patience * 1000)) continue;
+                            Item item;
+                            item.input = i;
+                            item.error = "The feed stopped sending";
+                            std::lock_guard lock(s->qm);
+                            s->queue.push_back(item);
+                            s->qc.notify_all();
+                            return;
+                        }
+                        heard = nowMs();
+                        if (f->header.type != omt::Video && f->header.type != omt::Audio) continue;
+                        Item item;
+                        item.input = i;
+                        item.omt = f;
+                        std::lock_guard lock(s->qm);
+                        if (f->header.type == omt::Video && s->queuedBytes > kQueueBytes) continue;
+                        s->queuedBytes += itemBytes(item);
+                        s->queue.push_back(item);
+                        s->qc.notify_all();
+                    }
+                });
+                continue;
+            }
+#endif
             if (!inputs[i].fmt) continue;
             readers.emplace_back([s, i, &inputs] {
                 Input& in = inputs[i];
@@ -788,7 +1012,7 @@ void Recorder::run() {
         }
         bool ok = true;
         int ended = 0;
-        const int live = inputs[1].fmt ? 2 : 1;
+        const int live = inputs[1].live() ? 2 : 1;
         while (ok && !timedOut) {
             Item item;
             {
@@ -798,9 +1022,9 @@ void Recorder::run() {
                 if (s->queue.empty()) continue;
                 item = s->queue.front();
                 s->queue.pop_front();
-                if (item.packet) s->queuedBytes -= item.packet->size;
+                s->queuedBytes -= itemBytes(item);
             }
-            if (!item.packet) {
+            if (!hasData(item)) {
                 if (!item.error.empty()) {
                     // (a sound device lost: the picture goes on without it)
                     if (item.input == 1) warning = "The sound device stopped:" + item.error.substr(item.error.find(':') + 1);
@@ -827,7 +1051,7 @@ void Recorder::run() {
                 item = s->queue.front();
                 s->queue.pop_front();
             }
-            if (item.packet) ok = decode(item, true);
+            if (hasData(item)) ok = decode(item, true);
             av_packet_free(&item.packet);
         }
         // Pictures and sound end together.

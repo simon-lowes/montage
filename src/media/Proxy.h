@@ -22,13 +22,14 @@ enum class ProxyFormat {
     ProResProxy,  // ProRes 422 Proxy, 10-bit (.mov)
     DnxhrLb,      // DNxHR LB, 8-bit (.mov)
     Hevc10,       // 10-bit HEVC (.mp4): small, keeps HDR
+    Apv,          // APV 4:2:2 10-bit (.mov), intra-frame, keeps HDR; where FFmpeg has the OpenAPV encoder
 };
 struct ProxyOptions {
     ProxyFormat format = ProxyFormat::H264;
     int maxWidth = 960;  // at most this wide; 0 = half the source's width, -1 = a quarter
     bool sound = false;  // with the file's sound (AAC in .mp4, PCM in .mov)
 };
-const char* proxyFormatName(ProxyFormat f);  // "h264", "prores_proxy", "dnxhr_lb", "hevc10"
+const char* proxyFormatName(ProxyFormat f);  // "h264", "prores_proxy", "dnxhr_lb", "hevc10", "apv"
 bool parseProxyFormat(const std::string& name, ProxyFormat& out);
 std::string proxyExtension(ProxyFormat f);  // ".mp4" or ".mov"
 // Whether the format keeps an HDR source's HDR (10-bit and tagged); the rest are tone mapped to Rec.709.

@@ -167,6 +167,7 @@ add_library(montage_engine STATIC
   render/ConformCheck.h render/ConformCheck.cpp
   render/Shapes.h render/Shapes.cpp
   render/Title3D.h render/Title3D.cpp
+  render/Particles.h render/Particles.cpp
   render/AafExport.h render/AafExport.cpp
   render/AvidMedia.h render/AvidMedia.cpp
   render/ClipAnalysis.h render/ClipAnalysis.cpp
@@ -524,6 +525,16 @@ if(MONTAGE_WITH_OPENEXR)
   target_include_directories(montage_engine PRIVATE ${openexr_SOURCE_DIR}/external/OpenJPH/src/core/common
                                                     ${openexr_SOURCE_DIR}/external/OpenJPH/src/core/openjph)
   target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_OPENEXR)
+endif()
+if(MONTAGE_WITH_OMT)
+  # Open Media Transport: the protocol (media/Omt), a reference output (render/OmtOutput) and a Capture source.
+  target_sources(montage_engine PRIVATE media/Omt.h media/Omt.cpp media/OmtNet.h media/OmtNet.cpp media/OmtDiscovery.cpp
+                                        render/OmtOutput.cpp)
+  target_link_libraries(montage_engine PRIVATE montage_vmx)
+  target_compile_definitions(montage_engine PUBLIC MONTAGE_WITH_OMT)
+  if(WIN32)
+    target_link_libraries(montage_engine PRIVATE ws2_32 iphlpapi)
+  endif()
 endif()
 if(MONTAGE_WITH_BMX)
   target_sources(montage_engine PRIVATE render/MxfFiles.h render/MxfFiles.cpp)

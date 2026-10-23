@@ -5,6 +5,7 @@
 #include <deque>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <sstream>
 
 #include "core/Effects.h"
@@ -259,8 +260,14 @@ std::vector<DamagedFrame> findDamagedFrames(const std::string& path, int64_t fir
         }
         ahead.pop_front();
     }
-    // Repeats all through the file are its own timing (a variable frame rate, or a rate given per field), not frames lost.
-    if (missing > std::max<int64_t>(2, judged / 50)) std::erase_if(found, [](const DamagedFrame& d) { return d.kind == FrameDamage::Missing; });
+    // Repeats all through the file are its own timing (a variable frame rate, or a rate given per field), not frames lost:
+    // many of them, in most eighths of it. A few, or many in one stretch (a short damaged clip), are frames lost.
+    if (missing >= 8 && missing > judged / 50) {
+        std::set<int64_t> parts;
+        for (const DamagedFrame& d : found)
+            if (d.kind == FrameDamage::Missing) parts.insert((d.frame - first) * 8 / std::max<int64_t>(1, judged));
+        if (parts.size() >= 5) std::erase_if(found, [](const DamagedFrame& d) { return d.kind == FrameDamage::Missing; });
+    }
     if (progress) progress(1.0);
     return found;
 }

@@ -284,13 +284,18 @@ const std::set<std::string> kFileDescriptors = {"MDFL", "MULD", "WAVE", "AIFC", 
 const std::set<std::string> kPictureDescriptors = {"DIDD", "CDCI", "MPGI", "JPED", "RGBA"};
 
 constexpr int kMaxDepth = 128;
-constexpr size_t kMaxCopies = 4'000'000;           // attributes and locators copied in all
-constexpr int64_t kMaxLength = int64_t(1) << 40;  // edit units
+constexpr size_t kMaxCopyBytes = size_t(512) << 20;  // attributes and locators copied in all, in bytes
+constexpr int64_t kMaxLength = int64_t(1) << 40;    // edit units
 
-size_t countAvidAttributes(const AvidAttributes& list) {
-    size_t n = list.size();
-    for (const AvidAttribute& a : list) n += countAvidAttributes(a.children);
+// What a copy of attributes (or a locator) costs: the objects and their text.
+size_t bytesOf(const AvidAttributes& list) {
+    size_t n = 0;
+    for (const AvidAttribute& a : list)
+        n += sizeof(AvidAttribute) + a.name.size() + a.text.size() + a.objectClass.size() + a.binName.size() + bytesOf(a.children);
     return n;
+}
+size_t bytesOf(const AvidLocator& l) {
+    return sizeof(AvidLocator) + l.comment.size() + l.colorName.size() + l.user.size() + bytesOf(l.attributes);
 }
 
 class BinReader {
@@ -318,18 +323,19 @@ private:
     struct AttributeList {
         AvidAttributes attributes;
         std::vector<AvidLocator> locators;
-        size_t nodes = 0;  // attributes and locators in it, nested ones too
+        size_t bytes = 0;  // its attributes and locators, nested ones too
     };
     std::map<uint32_t, AttributeList> attributes_;
-    // Attribute lists are copied where they are used, so the copies are counted: a small file naming one large list
-    // many times (or a list naming the next twice, and so on) cannot grow without bound.
+    // Attribute lists are copied where they are used (and locator lists made from references), so what they hold is
+    // counted, in bytes: a small file naming one large list many times (or a list naming the next twice, and so on, or
+    // one long text) cannot grow without bound.
     size_t copied_ = 0;
-    bool spend(uint32_t index, size_t nodes) {
-        if (nodes > kMaxCopies - copied_) {
+    bool spend(uint32_t index, size_t bytes) {
+        if (bytes > kMaxCopyBytes - copied_) {
             issue(index, "too many attributes to copy");
             return false;
         }
-        copied_ += nodes;
+        copied_ += bytes;
         return true;
     }
 
@@ -399,9 +405,9 @@ const BinReader::AttributeList& BinReader::attributes(uint32_t index, int depth)
                 a.objectClass = chunk(r).classId;
                 if (a.objectClass == "ATTR") {
                     const AttributeList& sub = attributes(r, depth + 1);
-                    if (spend(r, sub.nodes)) {
+                    if (spend(r, sub.bytes)) {
                         a.children = sub.attributes;
-                        list.nodes += sub.nodes;
+                        list.bytes += sub.bytes;
                     }
                 } else if (a.objectClass == "MCBR") {
                     // A bin reference (pyavb's BinRef): its UID, then its name, also as UTF-8 in an extension field.
@@ -440,7 +446,9 @@ const BinReader::AttributeList& BinReader::attributes(uint32_t index, int depth)
                             for (const uint32_t mr : refs)
                                 if (mr)
                                     if (auto loc = marker(mr, depth + 2)) {
-                                        list.nodes += 1 + countAvidAttributes(loc->attributes);
+                                        const size_t bytes = bytesOf(*loc);
+                                        if (!spend(r, bytes)) break;
+                                        list.bytes += bytes;
                                         list.locators.push_back(std::move(*loc));
                                     }
                             active_.erase(r);
@@ -455,8 +463,8 @@ const BinReader::AttributeList& BinReader::attributes(uint32_t index, int depth)
             c.fail("an attribute of unknown type " + std::to_string(type));
         }
         if (c.ok()) {
+            list.bytes += sizeof(AvidAttribute) + a.name.size() + a.text.size() + a.objectClass.size() + a.binName.size();
             list.attributes.push_back(std::move(a));
-            ++list.nodes;
         }
     }
     c.tag(0x03);
@@ -510,7 +518,7 @@ std::optional<AvidLocator> BinReader::marker(uint32_t index, int depth) {
         return std::nullopt;
     }
     active_.insert(index);
-    if (const AttributeList& list = attributes(attrs, depth + 1); spend(attrs ? attrs : index, list.nodes)) loc.attributes = list.attributes;
+    if (const AttributeList& list = attributes(attrs, depth + 1); spend(attrs ? attrs : index, list.bytes)) loc.attributes = list.attributes;
     active_.erase(index);
     const auto text = [&](const char* name) {
         const AvidAttribute* a = findAvidAttribute(loc.attributes, name);
@@ -678,7 +686,7 @@ void BinReader::readTrackGroup(Cursor& c, AvidComponent& out, int depth) {
     if (!c.ok()) return;
     for (size_t i = 0; i < n; ++i) {
         AvidTrack& t = out.tracks[i];
-        if (const AttributeList& list = attributes(refs[i].attributes, depth + 1); spend(refs[i].attributes, list.nodes)) t.attributes = list.attributes;
+        if (const AttributeList& list = attributes(refs[i].attributes, depth + 1); spend(refs[i].attributes, list.bytes)) t.attributes = list.attributes;
         t.component = component(refs[i].component, depth + 1);
         t.fillerProxy = component(refs[i].fillerProxy, depth + 1);
     }
@@ -981,7 +989,7 @@ void BinReader::readComponent(Cursor& c, AvidComponent& out, int depth, AvidMob*
         }
     }
     if (!c.ok()) return;
-    if (const AttributeList& list = attributes(attrs, depth + 1); spend(attrs, list.nodes)) {
+    if (const AttributeList& list = attributes(attrs, depth + 1); spend(attrs, list.bytes)) {
         out.attributes = list.attributes;
         out.locators = list.locators;
     }
@@ -1115,7 +1123,7 @@ void BinReader::readDescriptor(Cursor& c, AvidDescriptor& out, int depth) {
     if (!c.ok()) return;
     out.locator = mediaLocator(locator);
     out.physicalMedia = descriptor(physical, depth + 1);
-    out.attributes = attributes(attrs, depth + 1).attributes;
+    if (const AttributeList& list = attributes(attrs, depth + 1); spend(attrs, list.bytes)) out.attributes = list.attributes;
 }
 
 std::shared_ptr<const AvidDescriptor> BinReader::descriptor(uint32_t index, int depth) {
@@ -1298,11 +1306,13 @@ bool BinReader::readBin(uint32_t root, std::string* error) {
         if (auto m = mob(r)) {
             mobIndex[r] = int(bin_.mobs.size());
             bin_.items[i].mob = int(bin_.mobs.size());
+            bin_.mobIndex.try_emplace(m->mobId, bin_.mobs.size());
             bin_.mobs.push_back(std::move(*m));
         } else {
             mobIndex[r] = -1;
         }
     }
+    bin_.indexedMobs = bin_.mobs.size();
     return true;
 }
 
@@ -1337,8 +1347,12 @@ const AvidAttribute* findAvidAttribute(const AvidAttributes& list, const std::st
 }
 
 const AvidMob* AvidBin::findMob(const AvidMobId& id) const {
-    for (const AvidMob& m : mobs)
-        if (m.mobId == id) return &m;
+    if (const auto it = mobIndex.find(id); it != mobIndex.end() && it->second < mobs.size() && mobs[it->second].mobId == id)
+        return &mobs[it->second];
+    // (mobs added or changed since they were read)
+    const bool changed = indexedMobs > mobs.size() || (mobIndex.count(id) != 0);
+    for (size_t i = changed ? 0 : indexedMobs; i < mobs.size(); ++i)
+        if (mobs[i].mobId == id) return &mobs[i];
     return nullptr;
 }
 

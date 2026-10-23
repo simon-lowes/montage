@@ -59,6 +59,7 @@ private:
     EditorState* state_;
     QComboBox* kind_;
     QLineEdit* url_;
+    QPushButton* find_;
     QLineEdit* sound_;
     QLineEdit* options_;
     QComboBox* codec_;

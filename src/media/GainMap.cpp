@@ -548,7 +548,7 @@ std::shared_ptr<const GainMapPicture> decodeGainMapJpeg(const std::string& path,
 }
 
 bool planGainMap(const QImage& seen, Primaries basePrimaries, const Image& hdr, const ColorSpace& hdrSpace, GainMapMetadata& meta,
-                 std::vector<float>& target) {
+                 std::vector<uint16_t>& target) {
     const QImage base = seen.convertToFormat(QImage::Format_RGB888);
     const int W = base.width(), H = base.height();
     if (W != hdr.width || H != hdr.height || W <= 0 || H <= 0) return false;
@@ -557,25 +557,25 @@ bool planGainMap(const QImage& seen, Primaries basePrimaries, const Image& hdr, 
     primariesMatrix(hdrSpace.primaries, basePrimaries, m);
     meta = GainMapMetadata();
     const double off = 1 / 64.0;
-    std::vector<float> gains(size_t(W) * H * 3);
+    // (Worked out twice, for their range and then their codes, rather than kept: at the largest sizes a full-size copy
+    // is gigabytes.)
+    auto gainsOf = [&](int y, auto&& use) {
+        const uchar* s = base.constScanLine(y);
+        const float* h = hdr.row(y);
+        for (int x = 0; x < W; ++x, s += 3, h += 4) {
+            double v[3];
+            hdrLinear(hdrSpace, h, v);
+            multiply(m, v);
+            for (int c = 0; c < 3; ++c) use(size_t(x) * 3 + size_t(c), std::log2((std::max(v[c], 0.0) + off) / (srgbToLinear(s[c] / 255.0) + off)));
+        }
+    };
     std::vector<double> lo(size_t(H), 1e9), hi(size_t(H), -1e9);
     parallelRows(H, [&](int y0, int y1) {
-        for (int y = y0; y < y1; ++y) {
-            const uchar* s = base.constScanLine(y);
-            const float* h = hdr.row(y);
-            float* g = gains.data() + size_t(y) * W * 3;
-            for (int x = 0; x < W; ++x, s += 3, h += 4, g += 3) {
-                double v[3];
-                hdrLinear(hdrSpace, h, v);
-                multiply(m, v);
-                for (int c = 0; c < 3; ++c) {
-                    const double gain = std::log2((std::max(v[c], 0.0) + off) / (srgbToLinear(s[c] / 255.0) + off));
-                    g[c] = float(gain);
-                    lo[size_t(y)] = std::min(lo[size_t(y)], gain);
-                    hi[size_t(y)] = std::max(hi[size_t(y)], gain);
-                }
-            }
-        }
+        for (int y = y0; y < y1; ++y)
+            gainsOf(y, [&](size_t, double gain) {
+                lo[size_t(y)] = std::min(lo[size_t(y)], gain);
+                hi[size_t(y)] = std::max(hi[size_t(y)], gain);
+            });
     });
     double gmin = *std::min_element(lo.begin(), lo.end()), gmax = *std::max_element(hi.begin(), hi.end());
     if (gmax - gmin < 1e-3) gmax = gmin + 1e-3;
@@ -587,25 +587,31 @@ bool planGainMap(const QImage& seen, Primaries basePrimaries, const Image& hdr, 
     }
     meta.hdrCapacityMin = 0;
     meta.hdrCapacityMax = std::max(gmax, 1e-3);
-    // (In place: at the largest sizes a second full-size copy is gigabytes.)
-    target = std::move(gains);
-    for (float& t : target) t = float(std::clamp((t - gmin) / (gmax - gmin), 0.0, 1.0) * 255);
+    target.assign(size_t(W) * H * 3, 0);
+    parallelRows(H, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            uint16_t* t = target.data() + size_t(y) * W * 3;
+            gainsOf(y, [&](size_t i, double gain) { t[i] = uint16_t(std::lround(std::clamp((gain - gmin) / (gmax - gmin), 0.0, 1.0) * 255 * 256)); });
+        }
+    });
     return true;
 }
 
-QByteArray encodeGainMap(const std::vector<float>& target, int W, int H, const std::function<QByteArray(const QImage&, QImage&)>& roundTrip) {
+QByteArray encodeGainMap(const std::vector<uint16_t>& target, int W, int H, const std::function<QByteArray(const QImage&, QImage&)>& roundTrip) {
     // An encoder's Y'CbCr and quantising move each channel by a code value or so, a percent of light at this range, so
-    // what a decoder will read back is fed back into the codes asked for (twice), keeping the closest.
+    // what a decoder will read back is fed back into the codes asked for (twice), keeping the closest. (The codes asked
+    // for in 32nds, two bytes each, as the target is in 256ths: at the largest sizes each copy is a gigabyte.)
     if (target.size() != size_t(W) * size_t(H) * 3) return {};
-    std::vector<float> ask = target;
+    std::vector<int16_t> ask(target.size());
+    for (size_t i = 0; i < ask.size(); ++i) ask[i] = int16_t((target[i] + 4) / 8);
     QByteArray out;
     double best = 1e300;
     for (int pass = 0; pass < 3; ++pass) {
         QImage map(W, H, QImage::Format_RGB888);
         for (int y = 0; y < H; ++y) {
             uchar* d = map.scanLine(y);
-            const float* a = ask.data() + size_t(y) * W * 3;
-            for (int i = 0; i < W * 3; ++i) d[i] = uchar(std::clamp(std::lround(a[i]), 0L, 255L));
+            const int16_t* a = ask.data() + size_t(y) * W * 3;
+            for (int i = 0; i < W * 3; ++i) d[i] = uchar(std::clamp(std::lround(a[i] / 32.0), 0L, 255L));
         }
         QImage back;
         const QByteArray bytes = roundTrip(map, back);
@@ -616,9 +622,9 @@ QByteArray encodeGainMap(const std::vector<float>& target, int W, int H, const s
             const uchar* r = back.constScanLine(y);
             const size_t row = size_t(y) * W * 3;
             for (int i = 0; i < W * 3; ++i) {
-                const float e = target[row + size_t(i)] - r[i];
-                error += double(e) * e;
-                ask[row + size_t(i)] = std::clamp(ask[row + size_t(i)] + e, -8.0f, 263.0f);
+                const double e = target[row + size_t(i)] / 256.0 - r[i];
+                error += e * e;
+                ask[row + size_t(i)] = int16_t(std::clamp(std::lround(ask[row + size_t(i)] + e * 32), -8L * 32, 263L * 32));
             }
         }
         if (error < best) best = error, out = bytes;
@@ -1038,6 +1044,13 @@ bool shownSize(QFile& f, const AvifFile& a, const AvifItem& item, int& width, in
     return width > 0 && height > 0;
 }
 
+// Whether an item is cropped, turned or mirrored.
+bool transformed(const AvifFile& a, const AvifItem& item) {
+    for (int i : item.properties)
+        if (const QByteArray t = a.properties[size_t(i)].mid(4, 4); t == "clap" || t == "irot" || t == "imir") return true;
+    return false;
+}
+
 // An item's picture (decodeCoded's, a grid's tiles put together), turned and mirrored as its properties say.
 // An item's transformations applied to its picture: in the order listed, a crop to its clean aperture, a turn
 // anticlockwise, a mirror about a vertical or horizontal axis. False (with `why`) when they cannot be.
@@ -1164,6 +1177,10 @@ bool readHeifStill(const std::string& path, HeifStillInfo& out) {
     out.gainMap = findGainMap(f, a, g);
     if (const QByteArray* hdr = out.gainMap ? a.property(*g.tmap, "clli") : nullptr; hdr && hdr->size() >= 12)
         out.hdrMaxCll = double(beN(*hdr, 8, 2)), out.hdrMaxFall = double(beN(*hdr, 10, 2));
+    // (The HDR rendition takes the tone-mapped item's crop and turn, as decodeGainMapHeif does, when the base has none.)
+    out.hdrWidth = out.width, out.hdrHeight = out.height;
+    if (int w = 0, h = 0; out.gainMap && g.tmap && transformed(a, *g.tmap) && !transformed(a, *g.base) && shownSize(f, a, *g.tmap, w, h))
+        out.hdrWidth = w, out.hdrHeight = h;
     return out.width > 0 && out.height > 0;
 }
 
@@ -1232,21 +1249,17 @@ std::shared_ptr<const GainMapPicture> decodeGainMapHeif(const std::string& path,
         if (base.isNull() || map.isNull()) return why = "Cannot decode " + path + ": " + why, nullptr;
         auto pic = hdrRendition(asRgb32(base), g.transfer, g.basePrimaries, g.mathPrimaries, map, g.meta);
         // The tone-mapped item's own crop, turn and mirror. (Writers give the base the same ones, so the picture
-        // shown without the map matches; when the base has its own they have been applied already.)
-        auto transforms = [&](const AvifItem& item) {
-            for (int i : item.properties)
-                if (const QByteArray t = a.properties[size_t(i)].mid(4, 4); t == "clap" || t == "irot" || t == "imir") return true;
-            return false;
-        };
-        if (pic && g.tmap && transforms(*g.tmap) && !transforms(*g.base)) {
+        // shown without the map matches; when the base has its own they have been applied already.) The still is
+        // probed at the size they give (readHeifStill's HDR size); a bad crop leaves the picture as it is rather than
+        // failing it.
+        if (pic && g.tmap && transformed(a, *g.tmap) && !transformed(a, *g.base)) {
             QImage t = QImage(reinterpret_cast<const uchar*>(pic->rgba.data()), pic->width, pic->height, pic->width * 8,
                               QImage::Format_RGBA64)
                            .copy();
-            // (Only when they keep the picture's size, as a half turn or a mirror does: the still's size is the base's,
-            // and a bad crop leaves the picture as it is rather than failing it.)
-            std::string ignored;
-            if (applyItemTransforms(a, *g.tmap, t, ignored) && t.width() == pic->width && t.height() == pic->height) {
+            if (std::string ignored; applyItemTransforms(a, *g.tmap, t, ignored) && !t.isNull()) {
                 t = t.convertToFormat(QImage::Format_RGBA64);
+                pic->width = t.width(), pic->height = t.height();
+                pic->rgba.resize(size_t(t.width()) * size_t(t.height()) * 4);
                 for (int y = 0; y < t.height(); ++y)
                     std::memcpy(pic->rgba.data() + size_t(y) * size_t(t.width()) * 4, t.constScanLine(y), size_t(t.width()) * 8);
             }
@@ -1303,7 +1316,7 @@ bool writeGainMapJpeg(const Image& sdr, const ColorSpace& sdrSpace, const Image&
     const QImage seen = QImage::fromData(baseJpeg, "JPEG").convertToFormat(QImage::Format_RGB888);
     if (baseJpeg.isEmpty() || seen.width() != W || seen.height() != H) return fail("Cannot encode the JPEG");
     GainMapMetadata meta;
-    std::vector<float> target;
+    std::vector<uint16_t> target;
     if (!planGainMap(seen, p3 ? Primaries::P3D65 : Primaries::Bt709, hdr, hdrSpace, meta, target)) return fail("Nothing to write");
     // The map in 8 bits, at full chroma resolution.
     const QByteArray mapJpeg = encodeGainMap(target, W, H, [&](const QImage& map, QImage& back) {

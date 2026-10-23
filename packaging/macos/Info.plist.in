@@ -30,6 +30,13 @@
   <string>Montage records from cameras and capture devices you choose in File › Capture.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>Montage records sound from the devices you choose (File › Capture, voice-over and ADR).</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Montage finds and connects to video sources and monitors on your network (Open Media Transport and NDI).</string>
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_omt._tcp</string>
+    <string>_ndi._tcp</string>
+  </array>
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSPrincipalClass</key>

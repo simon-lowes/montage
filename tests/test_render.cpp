@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <QBuffer>
+#include <QScopeGuard>
 #include <QColorSpace>
 #include <QImageReader>
 #include <QDir>
@@ -42,6 +43,8 @@
 #include "render/Gamut.h"
 #include "render/HdrView.h"
 #include "render/Compositor.h"
+#include "render/Particles.h"
+#include "core/Expression.h"
 #include "render/GpuCompositor.h"
 #include "render/Dcp.h"
 #include "render/Imf.h"
@@ -67,6 +70,9 @@
 #include <QTcpSocket>
 #include <QNetworkProxy>
 #include <thread>
+#include <atomic>
+#include <functional>
+#include <mutex>
 #include <QPainter>
 #include <QElapsedTimer>
 #include <QRandomGenerator>
@@ -94,6 +100,10 @@
 #include "render/VideoFx.h"
 #include "render/VideoPacking.h"
 #include "render/ReferenceOutput.h"
+#ifdef MONTAGE_WITH_OMT
+#include "media/Omt.h"
+#include "media/OmtNet.h"
+#endif
 #include "render/MonitorCalibration.h"
 #include "render/SkyReplace.h"
 #include "render/FaceShape.h"
@@ -3666,6 +3676,27 @@ colorspaces:
         QVERIFY(near(inv[64], 1 - 64.0f / 256, 0.002f));
         auto sCurve = buildCurve("0,0 0.25,0.15 0.75,0.85 1,1", 1000);
         for (size_t i = 1; i < sCurve.size(); ++i) QVERIFY(sCurve[i] >= sCurve[i - 1] - 1e-6f);  // monotone
+        {
+            // A floating-point picture's NaN and infinite pixels through Curves: NaN becomes 0 (as the clamped path made
+            // it), an infinite value past a flat end stays at that end, and one past a sloping end stays infinite.
+            Project cp;
+            Effect flat = makeEffect(cp, "curves");
+            flat.strings["master"] = "0,0.1 0.2,0.1 0.8,0.9 1,0.9";
+            Image img(4, 1);
+            const float inf = std::numeric_limits<float>::infinity();
+            const float in[4] = {std::numeric_limits<float>::quiet_NaN(), inf, -inf, 2.0f};
+            for (int x = 0; x < 4; ++x) img.at(x, 0)[0] = img.at(x, 0)[1] = img.at(x, 0)[2] = in[x], img.at(x, 0)[3] = 1;
+            applyVideoEffect(flat, 0, img, 1);
+            QCOMPARE(img.at(0, 0)[0], 0.0f);
+            QVERIFY(near(img.at(1, 0)[0], 0.9f, 1e-4f) && near(img.at(2, 0)[0], 0.1f, 1e-4f) && near(img.at(3, 0)[0], 0.9f, 1e-4f));
+            Effect sloped = makeEffect(cp, "curves");
+            Image img2(2, 1);
+            img2.at(0, 0)[0] = std::numeric_limits<float>::quiet_NaN(), img2.at(1, 0)[0] = inf;
+            img2.at(0, 0)[3] = img2.at(1, 0)[3] = 1;
+            applyVideoEffect(sloped, 0, img2, 1);
+            QCOMPARE(img2.at(0, 0)[0], 0.0f);
+            QVERIFY(std::isinf(img2.at(1, 0)[0]) && img2.at(1, 0)[0] > 0);
+        }
 
         QTemporaryDir dir;
         std::string path = (dir.path() + "/invert.cube").toStdString();
@@ -8702,6 +8733,462 @@ colorspaces:
         QVERIFY(!sched.start(d, d.modes[0], s, cfg, &why));
     }
 
+    void openMediaTransport() {
+#ifndef MONTAGE_WITH_OMT
+        QSKIP("Built without Open Media Transport");
+#else
+        using namespace montage::output;
+        namespace omt = montage::omt;
+        // The wire: little-endian headers, byte for byte as OMT lays them out.
+        uint8_t head[omt::kHeaderBytes];
+        omt::Header h;
+        h.type = omt::Video;
+        h.timestamp = 0x0102030405060708;
+        h.metadataLength = 5;
+        h.dataLength = 100;
+        omt::writeHeader(h, head);
+        const uint8_t expected[] = {1, 2, 8, 7, 6, 5, 4, 3, 2, 1, 5, 0, 100, 0, 0, 0};
+        QVERIFY(std::equal(head, head + 16, expected));
+        omt::Header back;
+        QVERIFY(omt::readHeader(head, back) && back.timestamp == h.timestamp && back.metadataLength == 5 && back.dataLength == 100);
+        head[0] = 2;
+        QVERIFY(!omt::readHeader(head, back));  // (version 1 only)
+        uint8_t ext[omt::kVideoHeaderBytes];
+        omt::VideoHeader vh;
+        vh.width = 1920, vh.height = 1080, vh.rateN = 50, vh.rateD = 1, vh.flags = omt::HighBitDepth, vh.colorSpace = 709;
+        omt::writeVideoHeader(vh, ext);
+        QVERIFY(std::equal(ext, ext + 4, reinterpret_cast<const uint8_t*>("VMX1")));
+        QCOMPARE(int(ext[4] | ext[5] << 8), 1920);
+        QCOMPARE(int(ext[24]), 16);
+        QCOMPARE(int(ext[28] | ext[29] << 8), 709);
+        QCOMPARE(omt::readVideoHeader(ext).aspect, 1920.0f / 1080.0f);
+        // Commands are exact strings (the tally's "==" is the protocol's own).
+        QCOMPARE(QString::fromStdString(omt::tallyCommand(true, false)), QStringLiteral("<OMTTally Preview=\"true\" Program==\"false\" />"));
+        QCOMPARE(QString::fromStdString(omt::subscribeCommand(omt::Audio)), QStringLiteral("<OMTSubscribe Audio=\"true\" />"));
+        QCOMPARE(QString::fromStdString(omt::qualityCommand(omt::Quality::High)), QStringLiteral("<OMTSettings Quality=\"High\" />"));
+        // FPA1: silent channels left out and marked so.
+        std::vector<float> three(3 * 4, 0.0f);
+        for (int i = 0; i < 4; ++i) three[size_t(i)] = float(i + 1), three[size_t(8 + i)] = -float(i + 1);
+        uint32_t active = 0;
+        const std::vector<uint8_t> fpa = omt::encodeFpa1(three.data(), 3, 4, &active);
+        QCOMPARE(active, 5u);
+        QCOMPARE(int(fpa.size()), 2 * 4 * 4);
+        std::vector<float> decoded(12, 9.0f);
+        QVERIFY(omt::decodeFpa1(fpa.data(), fpa.size(), 3, 4, active, decoded.data()));
+        QVERIFY(decoded == three);
+        QVERIFY(!omt::decodeFpa1(fpa.data(), fpa.size() - 1, 3, 4, active, decoded.data()));
+        // Names: "HOST (Name)", 63 characters at most.
+        const std::string host = omt::machineName();
+        if (host.size() < 40) QCOMPARE(QString::fromStdString(omt::fullName("Montage")), QString::fromStdString(host + " (Montage)"));
+        if (host.size() < 40) QCOMPARE(int(omt::fullName(std::string(80, 'x')).size()), 63);
+        // (63 bytes at most however long the computer's name: DNS-SD takes no longer an instance name)
+        QVERIFY(omt::fullName("Montage").size() <= 63 && omt::fullName(std::string(80, 'x')).size() <= 63);
+        // Addresses, and the discovery server's XML (libomtnet's: IPv4 as IPv6, Removed before Addresses).
+        std::string where;
+        int port = 0;
+        QVERIFY(omt::resolve("omt://127.0.0.1:6401", where, port, nullptr) && where == "127.0.0.1" && port == 6401);
+        QVERIFY(omt::resolve("OMT://[::1]:6400/", where, port, nullptr) && where == "::1" && port == 6400);
+        QVERIFY(omt::resolve("studio-pc:6402", where, port, nullptr) && where == "studio-pc" && port == 6402);
+        std::string why;
+        QVERIFY(!omt::resolve("omt://studio-pc", where, port, &why) && !why.empty());
+        omt::Source src;
+        bool removed = true;
+        QVERIFY(omt::parseAddressXml(omt::addressXml("STUDIO (Cam 1)", 6400, {"::ffff:192.168.1.5"}, false), src, removed));
+        QVERIFY(!removed && src.name == "STUDIO (Cam 1)" && src.port == 6400 && src.host == "192.168.1.5");
+        QVERIFY(omt::parseAddressXml(omt::addressXml("STUDIO (Cam 1)", 6400, {}, true), src, removed) && removed);
+        QVERIFY(QString::fromStdString(omt::addressXml("A (B)", 1, {}, true)).indexOf("<Removed>") <
+                QString::fromStdString(omt::addressXml("A (B)", 1, {}, true)).indexOf("<Addresses>"));
+        QCOMPARE(QString::fromStdString(omt::xmlAttribute("<a b=\"1 &amp; 2\" c=\"x\"/>", "b")), QStringLiteral("1 & 2"));
+        if (!omt::vmxAvailable(&why)) QSKIP(why.c_str());
+
+        // A 1080p50 picture: moving gradients with fine detail and grain, as Montage packs it for the wire.
+        const int W = 1920, H = 1080;
+        auto picture = [&](int t) {
+            Image img(W, H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    float* p = img.at(x, y);
+                    uint32_t n = uint32_t(x) * 73856093u ^ uint32_t(y) * 19349663u ^ uint32_t(t) * 83492791u;
+                    n = (n ^ (n >> 13)) * 1274126177u;
+                    const float grain = 0.008f * (float(n & 1023) / 1023.0f - 0.5f);
+                    const float detail = 0.05f * std::sin(float(x) * 0.25f) * std::sin(float(y) * 0.2f);
+                    p[0] = 0.1f + 0.7f * float(x) / W + detail + grain, p[1] = 0.1f + 0.7f * float(y) / H + grain;
+                    p[2] = 0.5f + 0.4f * std::sin(float(x + y) * 0.01f + float(t) * 0.3f) - detail;
+                    p[3] = 1;
+                }
+            const video::Ycbcr422 yc = video::toYcbcr422(img, video::YcbcrMatrix::Bt709);
+            std::vector<uint8_t> out(frameBytes(PixelFormat::P216, W, H));
+            video::packP216(yc, out.data(), size_t(W) * 2);
+            return out;
+        };
+        // PSNR at 10 bits, over both planes of two P216 pictures.
+        auto psnr = [&](const std::vector<uint8_t>& a, const uint8_t* b) {
+            double err = 0;
+            const size_t n = a.size() / 2;
+            for (size_t i = 0; i < n; ++i) {
+                const double d = double((a[2 * i] | a[2 * i + 1] << 8) >> 6) - double((b[2 * i] | b[2 * i + 1] << 8) >> 6);
+                err += d * d;
+            }
+            return err == 0 ? 99.0 : 10 * std::log10(1023.0 * 1023.0 / (err / double(n)));
+        };
+        // VMX: encoded and decoded again, at OMT's three qualities.
+        const std::vector<uint8_t> still = picture(0);
+        omt::VmxDecoder dec;
+        std::vector<uint8_t> round(still.size());
+        size_t mediumBytes = 0;
+        for (const omt::Quality q : {omt::Quality::Low, omt::Quality::Medium, omt::Quality::High}) {
+            omt::VmxEncoder enc;
+            QVERIFY(enc.open(W, H, omt::vmxProfile(q), 709, 50));
+            std::vector<uint8_t> coded;
+            QVERIFY(enc.encode(omt::PictureFormat::P216, still.data(), W * 2, false, coded));
+            QVERIFY(enc.previewLength() > 0 && enc.previewLength() < int(coded.size()));
+            QVERIFY(dec.decode(coded.data(), coded.size(), W, H, 709, omt::PictureFormat::P216, round.data(), W * 2));
+            qInfo("VMX %s: %.0f kB a picture, %.1f dB", q == omt::Quality::Low ? "low" : q == omt::Quality::Medium ? "medium" : "high",
+                  double(coded.size()) / 1e3, psnr(still, round.data()));
+            QVERIFY(psnr(still, round.data()) > 40);
+            if (q == omt::Quality::Medium) mediumBytes = coded.size();
+        }
+        // Checked against FFmpeg's own VMX decoder (vMix's codec, OMT's 8-bit pictures): the same picture to within a
+        // code or two.
+        if (const AVCodec* vmix = avcodec_find_decoder_by_name("vmix")) {
+            std::vector<uint8_t> uyvy(size_t(W) * H * 2);
+            {
+                const video::Ycbcr422 yc = video::toYcbcr422([&] {
+                    Image img(W, H);
+                    for (int y = 0; y < H; ++y)
+                        for (int x = 0; x < W; ++x) {
+                            float* p = img.at(x, y);
+                            p[0] = float(x) / W, p[1] = float(y) / H, p[2] = 0.3f, p[3] = 1;
+                        }
+                    return img;
+                }(), video::YcbcrMatrix::Bt709);
+                video::packUyvy(yc, uyvy.data(), size_t(W) * 2);
+            }
+            omt::VmxEncoder enc;
+            QVERIFY(enc.open(W, H, omt::vmxProfile(omt::Quality::Medium), 709, 50));
+            std::vector<uint8_t> coded;
+            QVERIFY(enc.encode(omt::PictureFormat::Uyvy, uyvy.data(), W * 2, false, coded));
+            std::vector<uint8_t> ours(uyvy.size());
+            QVERIFY(dec.decode(coded.data(), coded.size(), W, H, 709, omt::PictureFormat::Uyvy, ours.data(), W * 2));
+            AVCodecContext* c = avcodec_alloc_context3(vmix);
+            c->width = W, c->height = H;
+            QVERIFY(avcodec_open2(c, vmix, nullptr) >= 0);
+            AVPacket* pkt = av_packet_alloc();
+            av_new_packet(pkt, int(coded.size()));
+            std::memcpy(pkt->data, coded.data(), coded.size());
+            pkt->flags |= AV_PKT_FLAG_KEY;
+            AVFrame* fr = av_frame_alloc();
+            const bool decodedByFfmpeg = avcodec_send_packet(c, pkt) >= 0 && avcodec_receive_frame(c, fr) >= 0;
+            if (decodedByFfmpeg) {
+                QCOMPARE(fr->format, int(AV_PIX_FMT_YUV422P));
+                int worst = 0;
+                for (int y = 0; y < H; y += 7)
+                    for (int x = 0; x < W; x += 5) {
+                        worst = std::max(worst, std::abs(int(fr->data[0][y * fr->linesize[0] + x]) - int(ours[size_t(y) * W * 2 + size_t(x) * 2 + 1])));
+                        if (x % 2 == 0)
+                            worst = std::max(worst, std::abs(int(fr->data[1][y * fr->linesize[1] + x / 2]) - int(ours[size_t(y) * W * 2 + size_t(x) * 2])));
+                    }
+                qInfo("FFmpeg's VMX decoder: within %d code(s) of libvmx's", worst);
+                QVERIFY(worst <= 2);
+            } else {
+                qInfo("FFmpeg's VMX decoder does not take OMT's profiles");
+            }
+            av_frame_free(&fr);
+            av_packet_free(&pkt);
+            avcodec_free_context(&c);
+        }
+
+        // Montage to Montage over loopback: a second of 1080p50 sent by the OMT reference output, every frame received
+        // in order above 40 dB, the sound sample for sample and the timecode with each picture.
+        const auto backend = findBackend("OMT");
+        QVERIFY(backend && backend->available());
+        const std::vector<Device> devs = backend->devices();
+        QCOMPARE(int(devs.size()), 1);
+        QCOMPARE(QString::fromStdString(devs[0].id), QStringLiteral("Montage"));
+        Signal sig;
+        sig.format = PixelFormat::P216;
+        QVERIFY(backend->open(devs[0], Mode{"1080p50", W, H, {50, 1}, false, 0}, sig, 2, 48000, &why));
+        const QString address = QString::fromStdString(backend->address());
+        QVERIFY2(address.startsWith(QStringLiteral("omt://") + QString::fromStdString(host) + ":"), qPrintable(address));
+        omt::Receiver rx;
+        omt::Receiver::Options ro;
+        ro.queue = 1000;
+        QVERIFY2(rx.open("omt://127.0.0.1:" + address.section(':', -1).toStdString(), ro, &why), why.c_str());
+        for (int i = 0; i < 200 && backend->receivers() < 2; ++i) QThread::msleep(10);
+        QCOMPARE(backend->receivers(), 2);  // (its picture's connection and its sound's)
+        QVERIFY(QString::fromStdString(rx.senderInfo()).contains("ProductName=\"Montage\""));
+        const int frames = 50, spf = 960;
+        const FrameTime tc0 = 3600 * 50;  // 01:00:00:00 at 50p
+        std::vector<std::vector<uint8_t>> sentPictures;
+        std::vector<float> sentSound;
+        for (int t = 0; t < frames; ++t) {
+            sentPictures.push_back(picture(t));
+            VideoFrame vf;
+            vf.width = W, vf.height = H, vf.stride = size_t(W) * 2, vf.format = PixelFormat::P216;
+            vf.data = sentPictures.back().data();
+            vf.fps = {50, 1};
+            vf.timecodeFrame = tc0 + t;
+            vf.timecode = timecodeOf(tc0 + t, {50, 1});
+            std::vector<float> sound(size_t(spf) * 2);
+            for (int i = 0; i < spf; ++i) {
+                const int n = t * spf + i;
+                sound[size_t(i) * 2] = std::sin(float(n) * 0.0573f) * 0.5f;
+                sound[size_t(i) * 2 + 1] = t < 10 ? 0.0f : float(n % 1000) / 1000.0f;  // (silent at first: left out)
+            }
+            sentSound.insert(sentSound.end(), sound.begin(), sound.end());
+            Audio a{sound.data(), spf, 2, 48000};
+            QVERIFY(backend->send(vf, a));
+            // (the pictures checked later: only the last few kept)
+            if (t >= 3) sentPictures[size_t(t) - 3].clear();
+        }
+        // Received: pictures in order, a frame period apart, each with its timecode.
+        std::vector<float> heard;
+        int pictures = 0, sounds = 0;
+        int64_t lastPicture = -1, nextSoundAt = -1;
+        std::vector<uint8_t> got(still.size());
+        QElapsedTimer clock;
+        clock.start();
+        while ((pictures < frames || sounds < frames) && clock.elapsed() < 10000) {
+            omt::Frame f;
+            if (!rx.next(f, 200)) continue;
+            if (f.header.type == omt::Video) {
+                QCOMPARE(f.header.timestamp, (tc0 + pictures) * 200000);
+                if (lastPicture >= 0) QCOMPARE(f.header.timestamp - lastPicture, int64_t(200000));
+                lastPicture = f.header.timestamp;
+                QVERIFY(f.video.width == W && f.video.height == H && f.video.rateN == 50 && f.video.rateD == 1);
+                QVERIFY(f.video.flags & omt::HighBitDepth);
+                QCOMPARE(f.video.colorSpace, 709);
+                QCOMPARE(QString::fromStdString(omt::xmlAttribute(f.metadata, "transfer")), QStringLiteral("bt_709"));
+                const QString tc = QString::fromStdString(omt::xmlAttribute(f.metadata.substr(f.metadata.find("<montage_timecode")), "value"));
+                QCOMPARE(tc, QStringLiteral("01:00:00:%1").arg(pictures, 2, 10, QLatin1Char('0')));
+                if (pictures >= frames - 3 || pictures % 10 == 0) {
+                    const std::vector<uint8_t> expect = pictures >= frames - 3 ? sentPictures[size_t(pictures)] : picture(pictures);
+                    QVERIFY(dec.decode(f.data.data(), f.data.size(), W, H, 709, omt::PictureFormat::P216, got.data(), W * 2));
+                    const double db = psnr(expect, got.data());
+                    if (pictures == 0) qInfo("Received at %.1f dB", db);
+                    QVERIFY2(db > 40, qPrintable(QString::number(db)));
+                }
+                ++pictures;
+            } else if (f.header.type == omt::Audio) {
+                QVERIFY(f.audio.channels == 2 && f.audio.sampleRate == 48000 && f.audio.samplesPerChannel == spf);
+                QCOMPARE(f.audio.activeChannels, sounds < 10 ? 1u : 3u);
+                if (nextSoundAt >= 0) QCOMPARE(f.header.timestamp, nextSoundAt);
+                nextSoundAt = f.header.timestamp + int64_t(spf) * 10000000 / 48000;
+                std::vector<float> planar(size_t(spf) * 2);
+                QVERIFY(omt::decodeFpa1(f.data.data(), f.data.size(), 2, spf, f.audio.activeChannels, planar.data()));
+                for (int i = 0; i < spf; ++i) heard.push_back(planar[size_t(i)]), heard.push_back(planar[size_t(spf + i)]);
+                ++sounds;
+            }
+        }
+        QCOMPARE(pictures, frames);
+        QCOMPARE(sounds, frames);
+        QVERIFY(heard == sentSound);
+        QCOMPARE(rx.framesDropped(), int64_t(0));
+        backend->close();
+        rx.close();
+        QCOMPARE(backend->receivers(), -1);
+        QVERIFY(backend->address().empty());
+
+        // A sender of its own: the receivers' tally taken together, and a preview (the start of each picture) for a
+        // receiver that asks for one.
+        omt::Sender tx;
+        omt::Sender::Options so;
+        so.name = "Tally test";
+        so.announce = false;
+        QVERIFY2(tx.start(so, &why), why.c_str());
+        QVERIFY(tx.port() >= omt::kPortStart && tx.port() <= omt::kPortEnd);
+        QCOMPARE(QString::fromStdString(tx.fullName()), QString::fromStdString(omt::fullName("Tally test")));
+        omt::Receiver a, b;
+        omt::Receiver::Options va;
+        va.audio = false;
+        const std::string url = "omt://127.0.0.1:" + std::to_string(tx.port());
+        QVERIFY2(a.open(url, va, &why), why.c_str());
+        va.preview = true;
+        QVERIFY2(b.open(url, va, &why), why.c_str());
+        auto waitFor = [](const std::function<bool()>& f) {
+            for (int i = 0; i < 300 && !f(); ++i) QThread::msleep(10);
+            return f();
+        };
+        QVERIFY(waitFor([&] { return tx.connections() == 2; }));
+        QVERIFY(!tx.tallyProgram() && !tx.tallyPreview());
+        a.setTally(false, true);
+        QVERIFY(waitFor([&] { return tx.tallyProgram(); }));
+        QVERIFY(!tx.tallyPreview());
+        b.setTally(true, false);
+        QVERIFY(waitFor([&] { return tx.tallyPreview() && tx.tallyProgram(); }));
+        a.close();  // (its tally goes with it)
+        QVERIFY(waitFor([&] { return !tx.tallyProgram() && tx.connections() == 1; }));
+        QVERIFY(tx.tallyPreview());
+        omt::VideoOut vo;
+        vo.width = W, vo.height = H, vo.stride = W * 2, vo.data = still.data(), vo.rateN = 50, vo.timestamp = 7;
+        vo.metadata = "<x/>";
+        QVERIFY(tx.sendVideo(vo));
+        omt::Frame pf;
+        QVERIFY(b.next(pf, 3000) && pf.header.type == omt::Video);
+        QVERIFY(pf.video.flags & omt::Preview);
+        QVERIFY(pf.data.size() > 1000 && pf.data.size() < mediumBytes);
+        QCOMPARE(QString::fromStdString(pf.metadata), QStringLiteral("<x/>"));
+        QCOMPARE(pf.header.timestamp, int64_t(7));
+        b.close();
+        tx.stop();
+#endif
+    }
+
+    void omtDiscovery() {
+#ifndef MONTAGE_WITH_OMT
+        QSKIP("Built without Open Media Transport");
+#else
+        namespace omt = montage::omt;
+        namespace net = montage::omt::net;
+        std::string why;
+        if (!omt::vmxAvailable(&why)) QSKIP(why.c_str());
+        // A discovery server of the test's own, as OMT's works: it keeps what sources register (with the address it
+        // sees them at), tells every client of each change, and tells a client that subscribes all it has.
+        int serverPort = 0;
+        const net::Socket listener = net::listenOnFirstFree(16399, 16499, &serverPort, &why);
+        QVERIFY2(listener != net::kInvalid, why.c_str());
+        const QByteArray serverUrl = "omt://127.0.0.1:" + QByteArray::number(serverPort);
+        qputenv("MONTAGE_OMT_DISCOVERY_SERVER", serverUrl);
+        QCOMPARE(QString::fromStdString(omt::discoveryServer()), QString::fromLatin1(serverUrl));
+        std::mutex m;
+        std::vector<std::string> registrations;  // as sent to the server
+        std::map<std::string, std::string> known;
+        std::vector<net::Socket> clients, allSockets;
+        std::vector<std::thread> threads;
+        std::atomic<bool> stop{false};
+        auto frameOf = [](const std::string& xml) {
+            std::vector<uint8_t> f(omt::kHeaderBytes + xml.size());
+            omt::Header h;
+            h.dataLength = int32_t(xml.size());
+            omt::writeHeader(h, f.data());
+            std::memcpy(f.data() + omt::kHeaderBytes, xml.data(), xml.size());
+            return f;
+        };
+        auto serve = [&](net::Socket c) {
+            uint8_t head[omt::kHeaderBytes];
+            omt::Header h;
+            std::vector<uint8_t> body;
+            while (net::recvAll(c, head, omt::kHeaderBytes, &stop) && omt::readHeader(head, h)) {
+                body.resize(size_t(h.dataLength));
+                if (h.dataLength && !net::recvAll(c, body.data(), body.size(), &stop)) break;
+                const std::string text(body.begin(), body.end());
+                std::lock_guard lock(m);
+                if (text == omt::subscribeCommand(omt::Metadata)) {
+                    clients.push_back(c);
+                    for (const auto& [n, x] : known) {
+                        const auto f = frameOf(x);
+                        net::sendAll(c, f.data(), f.size());
+                    }
+                } else if (text.rfind("<OMTAddress", 0) == 0) {
+                    registrations.push_back(text);
+                    omt::Source src;
+                    bool removed = false;
+                    if (!omt::parseAddressXml(text, src, removed)) continue;
+                    const std::string x = omt::addressXml(src.name, src.port, removed ? std::vector<std::string>{} : std::vector<std::string>{"::ffff:127.0.0.1"}, removed);
+                    if (removed) known.erase(src.name);
+                    else known[src.name] = x;
+                    const auto f = frameOf(x);
+                    for (net::Socket o : clients) net::sendAll(o, f.data(), f.size());
+                }
+            }
+            std::lock_guard lock(m);
+            clients.erase(std::remove(clients.begin(), clients.end(), c), clients.end());
+        };
+        std::thread server([&] {
+            while (!stop) {
+                const net::Socket c = net::acceptWithin(listener, 50);
+                if (c == net::kInvalid) continue;
+                std::lock_guard lock(m);
+                allSockets.push_back(c);
+                threads.emplace_back([&, c] { serve(c); });
+            }
+        });
+        // The server stopped once, here or when a check fails (its threads joined, so a failure fails only this test).
+        bool serverDown = false;
+        auto stopServer = [&] {
+            if (serverDown) return;
+            serverDown = true;
+            stop = true;
+            server.join();
+            {
+                std::lock_guard lock(m);
+                for (net::Socket c : allSockets) net::shutdownSocket(c);
+            }
+            for (std::thread& t : threads) t.join();
+            for (net::Socket c : allSockets) net::closeSocket(c);
+            net::closeSocket(listener);
+            qunsetenv("MONTAGE_OMT_DISCOVERY_SERVER");
+        };
+        const auto serverGuard = qScopeGuard(stopServer);
+        auto waitFor = [](const std::function<bool()>& f) {
+            for (int i = 0; i < 300 && !f(); ++i) QThread::msleep(10);
+            return f();
+        };
+        // A source registers with the server (not by DNS-SD) and is found through it, at the address the server saw.
+        omt::Sender tx;
+        omt::Sender::Options so;
+        so.name = "Discovery test";
+        QVERIFY2(tx.start(so, &why), why.c_str());
+        QCOMPARE(QString::fromStdString(tx.announcement()), QStringLiteral("discovery server ") + QString::fromLatin1(serverUrl));
+        QVERIFY(waitFor([&] { std::lock_guard lock(m); return registrations.size() == 1; }));
+        omt::Source reg;
+        bool removed = true;
+        {
+            std::lock_guard lock(m);
+            QVERIFY(omt::parseAddressXml(registrations[0], reg, removed));
+        }
+        QVERIFY(!removed && reg.name == tx.fullName() && reg.port == tx.port());
+        std::vector<omt::Source> found = omt::discover(1.0, &why);
+        const auto it = std::find_if(found.begin(), found.end(), [&](const omt::Source& s) { return s.name == tx.fullName(); });
+        QVERIFY(it != found.end());
+        QVERIFY(it->host == "127.0.0.1" && it->port == tx.port() && it->via == "discovery server");
+        // A receiver finds it by name.
+        omt::Receiver rx;
+        omt::Receiver::Options ro;
+        ro.audio = false;
+        QVERIFY2(rx.open(tx.fullName(), ro, &why), why.c_str());
+        QVERIFY(rx.connected());
+        QCOMPARE(QString::fromStdString(rx.address()), QStringLiteral("127.0.0.1:%1").arg(tx.port()));
+        rx.close();
+        // Gone, it is taken off the server's list.
+        tx.stop();
+        QVERIFY(waitFor([&] { std::lock_guard lock(m); return registrations.size() == 2; }));
+        {
+            std::lock_guard lock(m);
+            QVERIFY(omt::parseAddressXml(registrations[1], reg, removed) && removed);
+        }
+        found = omt::discover(0.5, &why);
+        QVERIFY(std::none_of(found.begin(), found.end(), [&](const omt::Source& s) { return s.name == reg.name; }));
+        stopServer();
+
+        // DNS-SD, where it runs here (Avahi's daemon on Linux).
+        if (!omt::dnsSdAvailable(&why)) {
+            qInfo("DNS-SD not checked: %s", why.c_str());
+            return;
+        }
+        so.name = "DNS-SD test";
+        QVERIFY2(tx.start(so, &why), why.c_str());
+        QVERIFY2(QString::fromStdString(tx.announcement()).startsWith("DNS-SD"), tx.announcement().c_str());
+        bool seen = false;
+        std::string heard;  // (what was found instead, for the failure's message)
+        for (int i = 0; i < 5 && !seen; ++i)
+            for (const omt::Source& s : omt::discover(2.0, &why)) {
+                if (s.name == tx.fullName() && s.port == tx.port()) seen = true;
+                heard += " \"" + s.name + "\" at " + s.host + ":" + std::to_string(s.port) + " (" + s.via + ");";
+            }
+        if (!seen && why.find("Local Network") != std::string::npos) {
+            // (a CI machine's local network privacy setting, which only a person can change, refuses browsing)
+            qInfo("DNS-SD browsing not checked: %s", why.c_str());
+            tx.stop();
+            return;
+        }
+        QVERIFY2(seen, ("looking for \"" + tx.fullName() + "\" at port " + std::to_string(tx.port()) + "; found" + heard + " " + why).c_str());
+        QVERIFY2(rx.open(tx.fullName(), ro, &why), why.c_str());
+        rx.close();
+        tx.stop();
+#endif
+    }
+
     void deckLinkWithoutDriver() {
         using namespace montage::output;
         // No Desktop Video here: listed, not available, with the reason, and no devices or opening.
@@ -10020,6 +10507,239 @@ colorspaces:
         QVERIFY(across == 1 && down == 2);
         stereoPacking(StereoView::SideBySideHalf, across, down);
         QVERIFY(across == 1 && down == 1);
+    }
+
+    // Particles: a frame is the same rendered alone, after the frames before it, and on one thread or eight; one particle
+    // falls ½gt² under gravity; a second at a birth rate makes that many; a bounce keeps the set share of the speed; the
+    // turbulence has no divergence; in 3D the nearer of two particles is larger and drawn over the farther; title text and
+    // pictures emit only where they are; a sprite is drawn; an expression drives the rate; every look and preset draws.
+    void particles() {
+        const double fps = 30;
+        auto make = [](const char* type = "particles") { return makeEffect(type, 1); };
+        auto set = [](Effect& g, std::initializer_list<std::pair<const char*, double>> values) {
+            for (const auto& [name, v] : values) g.params[name] = Param(v);
+        };
+        auto inked = [](const Image& img) {
+            double a = 0;
+            for (size_t i = 3; i < img.px.size(); i += 4) a += img.px[i];
+            return a;
+        };
+
+        // The same picture alone, in sequence, on one thread, on eight and on the pool's (a 1920 x 1080 sequence at a
+        // quarter size).
+        Effect confetti = make("particles_confetti");
+        set(confetti, {{"floor", 1}, {"edges", 1}, {"mode", 1}});
+        clearParticleCache();
+        const Image alone = renderParticles(confetti, 40, 480, 270, 1920, 1080, fps, 1);
+        QVERIFY(inked(alone) > 20);
+        clearParticleCache();
+        Image played;
+        for (FrameTime t = 0; t <= 40; ++t) played = renderParticles(confetti, t, 480, 270, 1920, 1080, fps, 8);
+        QVERIFY(played.px == alone.px);
+        QVERIFY(renderParticles(confetti, 40, 480, 270, 1920, 1080, fps, 8).px == alone.px);
+        QVERIFY(renderParticles(confetti, 40, 480, 270, 1920, 1080, fps).px == alone.px);
+        // (Kept states every 16 frames: frame 40 again carries on from frame 32's.)
+        clearParticleCache();
+        const ParticleState fromStart = particleState(confetti, 40, 1920, 1080, fps);
+        const ParticleState fromKept = particleState(confetti, 40, 1920, 1080, fps);
+        QCOMPARE(fromKept.live.size(), fromStart.live.size());
+        QVERIFY(std::memcmp(fromKept.live.data(), fromStart.live.data(), fromStart.live.size() * sizeof(Particle)) == 0);
+
+        // A moving emitter: frame 60 the same reached from frame 48's state as worked out straight through.
+        Effect moving = make();
+        moving.params["emit_x"].addKey(0, -600);
+        moving.params["emit_x"].addKey(60, 600);
+        clearParticleCache();
+        particleState(moving, 48, 1920, 1080, 25);
+        const ParticleState via48 = particleState(moving, 60, 1920, 1080, 25);
+        clearParticleCache();
+        const ParticleState straight = particleState(moving, 60, 1920, 1080, 25);
+        QCOMPARE(via48.live.size(), straight.live.size());
+        QVERIFY(std::memcmp(via48.live.data(), straight.live.data(), straight.live.size() * sizeof(Particle)) == 0);
+        // Sequence size, not the size drawn at: the same particles however large the picture is.
+        clearParticleCache();
+        QVERIFY(inked(renderParticles(moving, 30, 634, 357, 1920, 1080, 30)) > 1);
+        const ParticleState drawnSmall = particleState(moving, 30, 1920, 1080, 30);
+        clearParticleCache();
+        renderParticles(moving, 30, 1920, 1080, 1920, 1080, 30);
+        QVERIFY(std::memcmp(particleState(moving, 30, 1920, 1080, 30).live.data(), drawnSmall.live.data(), drawnSmall.live.size() * sizeof(Particle)) == 0);
+
+        // One particle, still at the start, under 100 px/s² for 2 s: 200 px down.
+        Effect one = make();
+        set(one, {{"rate", 0}, {"burst", 1}, {"speed", 0}, {"gravity", 100}, {"emit_x", 0}, {"emit_y", 0}, {"life", 10}});
+        ParticleState s = particleState(one, 60, 1920, 1080, fps);
+        QCOMPARE(int(s.live.size()), 1);
+        QVERIFY2(std::fabs(s.live[0].y - 0.5 * 100 * 2 * 2) < 1e-3, qPrintable(QString::number(s.live[0].y, 'g', 12)));
+        QVERIFY(std::fabs(s.live[0].x) < 1e-9 && std::fabs(s.live[0].vy - 200) < 1e-6);
+
+        // The birth rate's count after a second, at 30, 25 and 29.97 frames a second.
+        Effect rate = make();
+        set(rate, {{"rate", 100}, {"life", 10}, {"life_random", 0}});
+        QCOMPARE(int(particleState(rate, 30, 1920, 1080, 30).live.size()), 100);
+        QCOMPARE(int(particleState(rate, 25, 1920, 1080, 25).live.size()), 100);
+        QCOMPARE(int(particleState(rate, 30, 1920, 1080, 30000.0 / 1001).live.size()), 100);
+
+        // Dropped 100 px onto a floor with a bounce of 50 %: it leaves at half the speed it arrived at.
+        Effect drop = make();
+        set(drop, {{"rate", 0}, {"burst", 1}, {"speed", 0}, {"gravity", 1000}, {"emit_y", 0}, {"life", 10}, {"floor", 1},
+                   {"floor_y", 60}, {"bounce", 50}, {"friction", 0}});
+        s = particleState(drop, 18, 1000, 1000, fps);  // 0.6 s: after the bounce at 0.447 s
+        QCOMPARE(int(s.live.size()), 1);
+        const double hit = std::sqrt(2 * 100 / 1000.0), after = 0.6 - hit, leave = -0.5 * 1000 * hit;
+        QVERIFY2(std::fabs(s.live[0].y - (100 + leave * after + 500 * after * after)) < 1e-3, qPrintable(QString::number(s.live[0].y, 'g', 12)));
+        QVERIFY2(std::fabs(s.live[0].vy - (leave + 1000 * after)) < 1e-6, qPrintable(QString::number(s.live[0].vy, 'g', 12)));
+        // And then it comes to rest on the floor.
+        s = particleState(drop, 240, 1000, 1000, fps);
+        QVERIFY(std::fabs(s.live[0].y - 100) < 1e-6 && std::fabs(s.live[0].vy) < 1e-6);
+
+        // A floor that rises carries what lies on it; friction slows a sliding particle the same at any number of steps;
+        // strong air resistance at one step a frame stops particles rather than flinging them.
+        Effect rising = make();
+        set(rising, {{"rate", 0}, {"burst", 30}, {"speed", 100}, {"spread", 180}, {"gravity", 1000}, {"emit_y", 0}, {"life", 10},
+                     {"floor", 1}, {"bounce", 20}});
+        rising.params["floor_y"].addKey(0, 80);
+        rising.params["floor_y"].addKey(60, 80);
+        rising.params["floor_y"].addKey(90, 60);
+        s = particleState(rising, 120, 1080, 1080, fps);
+        QCOMPARE(int(s.live.size()), 30);
+        for (const Particle& q : s.live) QVERIFY2(q.y <= 0.1 * 1080 + 1e-6, qPrintable(QString::number(q.y)));
+        auto slid = [&](int steps) {
+            Effect g = make();
+            set(g, {{"rate", 0}, {"burst", 1}, {"speed", 300}, {"direction", 90}, {"spread", 0}, {"speed_random", 0}, {"gravity", 1000},
+                    {"emit_y", 0}, {"life", 10}, {"floor", 1}, {"floor_y", 50}, {"friction", 30}, {"steps", double(steps)}});
+            return particleState(g, 60, 1920, 1080, fps).live.at(0).x;
+        };
+        const double slid1 = slid(1), slid4 = slid(4);
+        QVERIFY2(slid4 > 20 && slid4 < 600 && std::fabs(slid1 - slid4) < 0.02 * slid4, qPrintable(QStringLiteral("%1 %2").arg(slid1).arg(slid4)));
+        Effect thick = make();
+        set(thick, {{"rate", 0}, {"burst", 10}, {"speed", 1000}, {"gravity", 0}, {"drag", 50}, {"steps", 1}, {"emit_y", 0}, {"life", 10}});
+        s = particleState(thick, 24, 1920, 1080, 24);
+        for (const Particle& q : s.live) QVERIFY(std::hypot(q.vx, q.vy) < 1 && std::hypot(q.x, q.y) < 25);
+
+        // The turbulence fields' divergence, by central differences, at points all over, while they do move things.
+        QRandomGenerator rng(7);
+        double most = 0, worst = 0;
+        for (int i = 0; i < 400; ++i) {
+            const double x = rng.bounded(4000.0) - 2000, y = rng.bounded(4000.0) - 2000, z = rng.bounded(2000.0) - 1000, t = rng.bounded(30.0);
+            const double d = 1e-3, scale = 250, evolve = 0.3;
+            double a[3], b[3], v[3];
+            double div = 0;
+            curlNoise2(x + d, y, t, scale, evolve, 5, a), curlNoise2(x - d, y, t, scale, evolve, 5, b), div += (a[0] - b[0]) / (2 * d);
+            curlNoise2(x, y + d, t, scale, evolve, 5, a), curlNoise2(x, y - d, t, scale, evolve, 5, b), div += (a[1] - b[1]) / (2 * d);
+            curlNoise2(x, y, t, scale, evolve, 5, v);
+            most = std::max(most, std::hypot(v[0], v[1]));
+            worst = std::max(worst, std::fabs(div));
+            div = 0;
+            curlNoise3(x + d, y, z, t, scale, evolve, 5, a), curlNoise3(x - d, y, z, t, scale, evolve, 5, b), div += (a[0] - b[0]) / (2 * d);
+            curlNoise3(x, y + d, z, t, scale, evolve, 5, a), curlNoise3(x, y - d, z, t, scale, evolve, 5, b), div += (a[1] - b[1]) / (2 * d);
+            curlNoise3(x, y, z + d, t, scale, evolve, 5, a), curlNoise3(x, y, z - d, t, scale, evolve, 5, b), div += (a[2] - b[2]) / (2 * d);
+            worst = std::max(worst, std::fabs(div));
+        }
+        QVERIFY2(worst < 1e-4, qPrintable(QString::number(worst)));
+        QVERIFY(most > 0.5);
+
+        // 3D: two particles on the line through the frame's centre, one nearer. The centre shows the nearer one's colour
+        // (as its rim, beyond the farther one, does); turned round, the other's.
+        Effect pair = make();
+        set(pair, {{"mode", 1}, {"emitter", 2}, {"emit_w", 0}, {"emit_h", 0}, {"emit_d", 1600}, {"emit_y", 0}, {"rate", 0},
+                   {"burst", 2}, {"speed", 0}, {"gravity", 0}, {"life", 10}, {"size", 200}, {"size_random", 0},
+                   {"hue_random", 180}, {"fade_in", 0}, {"fade_out", 0}, {"color.r", 1}, {"color.g", 0}, {"color.b", 0},
+                   {"color_end.r", 1}, {"color_end.g", 0}, {"color_end.b", 0}, {"seed", 2}});
+        s = particleState(pair, 1, 1920, 1080, fps);
+        QCOMPARE(int(s.live.size()), 2);
+        QVERIFY2(std::fabs(s.live[0].z - s.live[1].z) > 300, qPrintable(QStringLiteral("%1 %2").arg(s.live[0].z).arg(s.live[1].z)));
+        const double focal = 540 / std::tan(35 * M_PI / 360);
+        auto colourAt = [](const Image& img, double x, double y, float out[3]) {
+            const float* p = img.at(int(x), int(y));
+            for (int c = 0; c < 3; ++c) out[c] = p[3] > 0 ? p[c] / p[3] : 0;
+        };
+        float centreNear[3], centreFar[3], rim[3];
+        for (int turned = 0; turned < 2; ++turned) {
+            pair.params["cam_turn"] = Param(turned ? 180.0 : 0.0);
+            const Image img = renderParticles(pair, 1, 480, 270, 1920, 1080, fps);
+            const double z0 = turned ? -s.live[0].z : s.live[0].z, z1 = turned ? -s.live[1].z : s.live[1].z;
+            const double rNear = 100 * focal / (focal - std::max(z0, z1)) * 0.25, rFar = 100 * focal / (focal - std::min(z0, z1)) * 0.25;
+            QVERIFY(rNear > rFar + 2);
+            colourAt(img, 240, 135, turned ? centreFar : centreNear);
+            if (!turned) colourAt(img, 240 + (rNear + rFar) / 2, 135, rim);
+        }
+        for (int c = 0; c < 3; ++c) QVERIFY(std::fabs(centreNear[c] - rim[c]) < 0.02);  // (the farther one shows through a little)
+        QVERIFY2(std::fabs(centreNear[0] - centreFar[0]) + std::fabs(centreNear[1] - centreFar[1]) + std::fabs(centreNear[2] - centreFar[2]) > 0.3,
+                 qPrintable(QStringLiteral("%1 %2 %3 / %4 %5 %6").arg(centreNear[0]).arg(centreNear[1]).arg(centreNear[2]).arg(centreFar[0]).arg(centreFar[1]).arg(centreFar[2])));
+
+        // Title text emits from its letters only: "I", a bar some 60 px wide and 290 high.
+        Effect text = make();
+        set(text, {{"emitter", 4}, {"emit_y", 0}, {"text_size", 400}, {"rate", 2000}, {"speed", 0}, {"gravity", 0}, {"life", 10}});
+        text.strings["text"] = "I";
+        s = particleState(text, 15, 1920, 1080, fps);
+        QVERIFY(s.live.size() > 900);
+        double xs = 0;
+        for (const Particle& q : s.live) {
+            QVERIFY2(std::fabs(q.x) < 80 && std::fabs(q.y) < 250, qPrintable(QStringLiteral("%1 %2").arg(q.x).arg(q.y)));
+            xs = std::max(xs, std::fabs(q.x));
+        }
+        QVERIFY(xs > 15);
+
+        // A picture opaque only on its left half emits only there; drawn as a sprite, a picture shows its colour.
+        QTemporaryDir dir;
+        QImage half(100, 100, QImage::Format_RGBA8888);
+        half.fill(Qt::transparent);
+        for (int y = 0; y < 100; ++y)
+            for (int x = 0; x < 50; ++x) half.setPixelColor(x, y, QColor(0, 200, 0));
+        const QString halfPath = dir.filePath("half.png");
+        QVERIFY(half.save(halfPath));
+        Effect pic = make();
+        set(pic, {{"emitter", 5}, {"emit_y", 0}, {"emit_w", 100}, {"emit_h", 100}, {"rate", 2000}, {"speed", 0}, {"gravity", 0}, {"life", 10}});
+        pic.strings["picture"] = halfPath.toStdString();
+        s = particleState(pic, 15, 1920, 1080, fps);
+        QVERIFY(s.live.size() > 900);
+        for (const Particle& q : s.live) QVERIFY2(q.x <= 0.5 && q.x >= -50.5 && std::fabs(q.y) <= 50.5, qPrintable(QString::number(q.x)));
+        Effect sprite = make();
+        set(sprite, {{"look", 4}, {"rate", 0}, {"burst", 1}, {"speed", 0}, {"gravity", 0}, {"emit_y", 0}, {"life", 10}, {"size", 400},
+                     {"size_random", 0}, {"fade_in", 0}, {"fade_out", 0}, {"color.r", 1}, {"color.g", 1}, {"color.b", 1}});
+        sprite.strings["sprite"] = halfPath.toStdString();
+        const Image sp = renderParticles(sprite, 1, 480, 270, 1920, 1080, fps);
+        const float* left = sp.at(240 - 25, 135);
+        const float* right = sp.at(240 + 25, 135);
+        QVERIFY2(left[3] > 0.95f && left[1] > 0.7f && left[0] < 0.05f, qPrintable(QString::number(left[3])));
+        QVERIFY(right[3] < 0.05f);
+
+        // An expression for the rate: none for the first second, 100 a second after.
+        if (expressionsAvailable()) {
+            Effect driven = make();
+            set(driven, {{"life", 10}});
+            driven.params["rate"].expr = "frame < 30 and 0 or 100";  // (frames: with no sequence in scope, time counts at 25 a second)
+            const size_t n = particleState(driven, 60, 1920, 1080, fps).live.size();
+            QVERIFY2(n >= 100 && n <= 102, qPrintable(QString::number(n)));
+            QCOMPARE(int(particleState(driven, 29, 1920, 1080, fps).live.size()), 0);
+            // A rate far past any sense is held to the catalogue's most, and the count to Most Particles.
+            Effect flood = make();
+            set(flood, {{"life", 10}, {"max_particles", 5000}});
+            flood.params["rate"].expr = "1e12";
+            QCOMPARE(int(particleState(flood, 30, 1920, 1080, fps).live.size()), 5000);
+        }
+
+        // Every look and every preset draws something.
+        for (int look = 0; look <= 4; ++look) {
+            Effect g = make();
+            g.params["look"] = Param(double(look));
+            QVERIFY2(inked(renderParticles(g, 30, 480, 270, 1920, 1080, fps)) > 1, qPrintable(QString::number(look)));
+        }
+        for (const GeneratorPreset& pre : generatorPresets()) {
+            const Effect g = make(pre.id);
+            QCOMPARE(g.type, std::string("particles"));
+            QVERIFY2(inked(renderParticles(g, 45, 480, 270, 1920, 1080, fps)) > 1, pre.id);
+            if (const QByteArray dir = qgetenv("MONTAGE_TEST_DUMP"); !dir.isEmpty())
+                for (FrameTime t : {20, 75}) {
+                    Image img = renderParticles(g, t, 960, 540, 1920, 1080, fps);
+                    for (size_t i = 0; i < img.px.size(); i += 4)  // (over dark grey)
+                        for (int c = 0; c < 3; ++c) img.px[i + size_t(c)] += 0.12f * (1 - img.px[i + 3]);
+                    for (size_t i = 3; i < img.px.size(); i += 4) img.px[i] = 1;
+                    QImage q(img.width, img.height, QImage::Format_RGBA8888);
+                    toRgba8(img, q.bits(), size_t(q.bytesPerLine()));
+                    q.save(QString::fromLocal8Bit(dir) + "/" + pre.id + "_" + QString::number(t) + ".png");
+                }
+        }
     }
 
     void titles3D() {

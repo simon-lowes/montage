@@ -45,7 +45,8 @@ public:
     QSize sizeHint() const override { return {900, 320}; }
 
     // Bakes an audio clip's effects into a new audio file and points the clip at it (undoable).
-    bool renderAndReplace(montage::Id clip, QString* error = nullptr);
+    // To ProRes 4444, or with `apv` to APV 4:4:4:4 12-bit (where FFmpeg has its encoder).
+    bool renderAndReplace(montage::Id clip, QString* error = nullptr, bool apv = false);
 
     // Lines over clips for their volume (audio clips) and opacity (video clips),
     // with their keyframes: drag the line to change it, Ctrl/Cmd-click it to add

@@ -2200,7 +2200,7 @@ void TimelineWidget::leaveEvent(QEvent* e) {
     QAbstractScrollArea::leaveEvent(e);
 }
 
-bool TimelineWidget::renderAndReplace(Id clip, QString* error) {
+bool TimelineWidget::renderAndReplace(Id clip, QString* error, bool apv) {
     const Sequence* s = state_->sequence();
     const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
     if (!c) return false;
@@ -2219,7 +2219,7 @@ bool TimelineWidget::renderAndReplace(Id clip, QString* error) {
                                                            QDateTime::currentDateTime().toString("yyyyMMdd-hhmmss-zzz"), video ? "mov" : "wav");
     QApplication::setOverrideCursor(Qt::WaitCursor);
     std::string err;
-    const bool ok = video ? renderClipVideo(state_->project(), *s, clip, path.toStdString(), &err)
+    const bool ok = video ? renderClipVideo(state_->project(), *s, clip, path.toStdString(), &err, {}, nullptr, apv)
                           : renderClipAudio(state_->project(), *s, clip, path.toStdString(), &err);
     QApplication::restoreOverrideCursor();
     if (!ok) {
@@ -2306,6 +2306,8 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* e) {
                 if (!c->effects.empty() || (h.track->kind == TrackKind::Video && (c->speed != 1 || c->reverse || c->ramped()))) {
                     menu.addSeparator();
                     menu.addAction(tr("Render and Replace"), this, [this, id] { renderAndReplace(id); });
+                    if (h.track->kind == TrackKind::Video && apvEncoderAvailable())
+                        menu.addAction(tr("Render and Replace as APV"), this, [this, id] { renderAndReplace(id, nullptr, true); });
                 }
                 if (!c->unrendered.empty())
                     menu.addAction(tr("Restore Unrendered"), this, [this, id] {

@@ -11,6 +11,7 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
 #include <QPointer>
 #include <QPushButton>
 #include <QRegularExpression>
@@ -22,6 +23,9 @@
 #include "EditorState.h"
 #include "Settings.h"
 #include "media/ImageSequence.h"
+#ifdef MONTAGE_WITH_OMT
+#include "media/Omt.h"
+#endif
 
 namespace montage {
 
@@ -34,6 +38,7 @@ QString deviceLabel(const QString& kind) {
     if (kind == QLatin1String("avfoundation")) return QObject::tr("AVFoundation camera or capture card");
     if (kind == QLatin1String("dshow")) return QObject::tr("DirectShow camera or capture card");
     if (kind == QLatin1String("lavfi")) return QObject::tr("Test pattern (FFmpeg filter)");
+    if (kind == QLatin1String("omt")) return QObject::tr("Open Media Transport source (on the network)");
     return kind;
 }
 
@@ -64,7 +69,28 @@ CaptureDialog::CaptureDialog(EditorState* state, QWidget* parent) : QDialog(pare
     form->addRow(tr("Feed:"), kind_);
     url_ = new QLineEdit(settings.value(QStringLiteral("capture/url")).toString(), this);
     url_->setObjectName(QStringLiteral("captureUrl"));
-    form->addRow(tr("Address or device:"), url_);
+    auto* urlRow = new QHBoxLayout;
+    urlRow->addWidget(url_, 1);
+    // Open Media Transport sources announced on the network, to choose from.
+    find_ = new QPushButton(tr("Find…"), this);
+    find_->setObjectName(QStringLiteral("captureFindSources"));
+    urlRow->addWidget(find_);
+#ifdef MONTAGE_WITH_OMT
+    connect(find_, &QPushButton::clicked, this, [this] {
+        setCursor(Qt::WaitCursor);
+        std::string why;
+        const std::vector<omt::Source> sources = omt::discover(1.5, &why);
+        unsetCursor();
+        QMenu menu(this);
+        for (const omt::Source& s : sources) {
+            const QString url = QStringLiteral("omt://%1:%2").arg(QString::fromStdString(s.host.find(':') != std::string::npos ? "[" + s.host + "]" : s.host)).arg(s.port);
+            menu.addAction(QString::fromStdString(s.name), this, [this, url] { url_->setText(url); });
+        }
+        if (sources.empty()) menu.addAction(why.empty() ? tr("No sources found") : tr("No sources found (%1)").arg(QString::fromStdString(why)))->setEnabled(false);
+        menu.exec(find_->mapToGlobal(QPoint(0, find_->height())));
+    });
+#endif
+    form->addRow(tr("Address or device:"), urlRow);
     sound_ = new QLineEdit(this);
     sound_->setObjectName(QStringLiteral("captureSound"));
     sound_->setPlaceholderText(tr("The feed's own sound"));
@@ -78,8 +104,12 @@ CaptureDialog::CaptureDialog(EditorState* state, QWidget* parent) : QDialog(pare
         url_->setPlaceholderText(k.isEmpty() ? tr("srt://0.0.0.0:9000?mode=listener") : k == QLatin1String("v4l2") ? QStringLiteral("/dev/video0")
                                                : k == QLatin1String("avfoundation")                                 ? QStringLiteral("0:0")
                                                : k == QLatin1String("dshow")                                        ? tr("video=Camera name")
+                                               : k == QLatin1String("omt")                                          ? tr("omt://host:6400, or HOST (Name)")
                                                                                                                     : QString());
-        sound_->setEnabled(!k.isEmpty());
+        const bool omt = k == QLatin1String("omt");
+        sound_->setEnabled(!k.isEmpty() && !omt);
+        options_->setEnabled(!omt);
+        find_->setVisible(omt);
     };
     connect(kind_, &QComboBox::currentIndexChanged, this, placeholders);
     if (const int i = kind_->findData(settings.value(QStringLiteral("capture/kind")).toString()); i >= 0) kind_->setCurrentIndex(i);
@@ -212,7 +242,7 @@ bool CaptureDialog::record() {
         }
         cs.video.options[o.left(eq).toStdString()] = o.mid(eq + 1).toStdString();
     }
-    if (!kind.isEmpty() && !sound_->text().trimmed().isEmpty()) cs.audio = CaptureSource{sound_->text().trimmed().toStdString(), kind.toStdString(), {}};
+    if (!kind.isEmpty() && kind != QLatin1String("omt") && !sound_->text().trimmed().isEmpty()) cs.audio = CaptureSource{sound_->text().trimmed().toStdString(), kind.toStdString(), {}};
     cs.codec = codec_->currentData().toString().toStdString();
     cs.path = path_.toStdString();
     cs.timecode = tc.toStdString();

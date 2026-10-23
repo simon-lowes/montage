@@ -200,17 +200,18 @@ QString ReferenceOutputController::status() const {
                        .arg(st.sent)
                        .arg(st.late);
     if (st.receivers >= 0) text += tr(", %n receiver(s)", "", st.receivers);
+    if (backend_ && !backend_->address().empty()) text += QStringLiteral(" (%1)").arg(qs(backend_->address()));
     if (scheduler_->calibration()) text += tr(", calibrated");
     return text;
 }
 
 QByteArray ReferenceOutputController::toolJson() {
     return QByteArrayLiteral(R"json({"name":"montage_reference_output","title":"Reference monitor output",
-"description":"The Program monitor sent to a broadcast monitor: SDI or HDMI through a Blackmagic DeckLink card, or over the network as an NDI source (10-bit 4:2:2, HDR signalled, timecode, embedded sound); it follows the playhead, playing or parked. \"list\": the interfaces, whether each can be used (and why not), their devices and modes. \"status\": what is going out (mode, frames sent, late frames, NDI receivers). \"start\": opens it (settings left out are the last used: the first interface and device found, the sequence's own mode). \"stop\".",
+"description":"The Program monitor sent to a broadcast monitor: SDI or HDMI through a Blackmagic DeckLink card, or over the network as an NDI or Open Media Transport (OMT) source (10-bit 4:2:2, HDR signalled, timecode, embedded sound); it follows the playhead, playing or parked. \"list\": the interfaces, whether each can be used (and why not), their devices and modes. \"status\": what is going out (mode, frames sent, late frames, NDI or OMT receivers). \"start\": opens it (settings left out are the last used: the first interface and device found, the sequence's own mode). \"stop\".",
 "inputSchema":{"type":"object","properties":{
 "action":{"type":"string","enum":["list","status","start","stop"]},
-"interface":{"type":"string","description":"\"DeckLink\" or \"NDI\""},
-"device":{"type":"string","description":"A device's id or name from \"list\" (on NDI, the source's name)"},
+"interface":{"type":"string","description":"\"DeckLink\", \"NDI\" or \"OMT\""},
+"device":{"type":"string","description":"A device's id or name from \"list\" (on NDI and OMT, the source's name)"},
 "mode":{"type":"string","description":"A mode from \"list\", such as \"1080p25\" or \"2160p23.98\"; \"\" for the sequence's"},
 "depth":{"type":"number","enum":[8,10],"description":"Bits (10 for HDR)"},
 "rec709":{"type":"boolean","description":"Send the picture as the viewer shows it (HDR tone mapped to Rec. 709) instead of the sequence's own colour"},
@@ -296,7 +297,7 @@ QString ReferenceOutputController::runTool(const QJsonObject& args, QJsonObject&
         if (has("audio_offset_ms")) c.audioOffsetMs = std::clamp(args.value("audio_offset_ms").toInt(), -500, 500);
         if (!c.backend.empty() && !output::findBackend(c.backend)) {
             isError = true;
-            return tr("No interface \"%1\" (DeckLink or NDI)").arg(qs(c.backend));
+            return tr("No interface \"%1\" (DeckLink, NDI or OMT)").arg(qs(c.backend));
         }
         QString why;
         if (!start(c, &why)) {
@@ -316,6 +317,7 @@ QString ReferenceOutputController::runTool(const QJsonObject& args, QJsonObject&
         structured["sent"] = double(st.sent);
         structured["late"] = double(st.late);
         if (st.receivers >= 0) structured["receivers"] = st.receivers;
+        if (!backend_->address().empty()) structured["address"] = qs(backend_->address());
     }
     return status();
 }
@@ -329,7 +331,8 @@ ReferenceOutputPanel::ReferenceOutputPanel(ReferenceOutputController* controller
     setAttribute(Qt::WA_DeleteOnClose);
     auto* v = new QVBoxLayout(this);
     auto* intro = new QLabel(tr("The Program sent to a broadcast monitor: SDI or HDMI through a Blackmagic DeckLink or UltraStudio, "
-                                "or over the network as an NDI® source. 10-bit 4:2:2, HDR signalled, timecode and embedded sound."),
+                                "or over the network as an NDI® or Open Media Transport source. 10-bit 4:2:2, HDR signalled, timecode and "
+                                "embedded sound."),
                              this);
     intro->setWordWrap(true);
     v->addWidget(intro);
@@ -439,9 +442,9 @@ void ReferenceOutputPanel::fillDevices() {
     device_->blockSignals(false);
     why_->setText(!b ? QString() : !why.empty() ? qs(why) : devices_.empty() ? tr("No %1 device found").arg(qs(b->name())) : QString());
     why_->setVisible(!why_->text().isEmpty());
-    const bool ndi = b && b->name() == "NDI";
-    hdr_->setEnabled(!ndi);  // (NDI carries the colour, not HDR10's mastering metadata)
-    device_->setToolTip(ndi ? tr("The NDI source's name (other computers see \"<this computer> (Montage)\")") : QString());
+    const bool network = b && (b->name() == "NDI" || b->name() == "OMT");
+    hdr_->setEnabled(!network);  // (NDI and OMT carry the colour, not HDR10's mastering metadata)
+    device_->setToolTip(network ? tr("The %1 source's name (other computers see \"<this computer> (Montage)\")").arg(qs(b->name())) : QString());
     fillModes();    refresh();  // (Start, as there is a device now or not)
 }
 

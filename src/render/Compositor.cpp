@@ -40,6 +40,7 @@
 #include "Restoration.h"
 #include "FilmScan.h"
 #include "FrameRepair.h"
+#include "Particles.h"
 #include "Retime.h"
 #include "Shapes.h"
 #include "Title3D.h"
@@ -410,6 +411,9 @@ Image renderGenerator(const Effect& g, FrameTime t, int w, int h, double scale, 
         return renderShape(g, t, w, h, scale);
     } else if (g.type == "title3d") {
         return renderTitle3D(g, t, w, h, scale, duration, fps);
+    } else if (g.type == "particles") {
+        // (Clips draw it through clipSource, which knows the sequence's size.)
+        return renderParticles(g, t, w, h, std::max(1, int(std::lround(w / scale))), std::max(1, int(std::lround(h / scale))), fps);
     }
     // (OGraf graphics are drawn by clipLayer: they need the sequence's size.)
     return img;
@@ -1000,6 +1004,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         sourceSize(g, o.scale, int(SW * 4), int(SH * 4), w, h);
         src = c.generator.type == "audio_viz" ? renderAudioVisualiser(p, seq, c, t, w, h)
               : c.generator.type == "ograf"   ? ografFrame(c.generator, lt, w, h, SW, SH, c.duration, seq.fpsValue())
+              : c.generator.type == "particles" ? renderParticles(c.generator, lt, w, h, SW, SH, seq.fpsValue())
                                               : renderGenerator(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue());
         // Titles and mattes are authored in SDR: graphics white sits at HDR reference white.
         convertColor(src, rec709Space(), sequenceColorSpace(seq), seq.hdrPeakNits);

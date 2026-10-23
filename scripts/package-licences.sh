@@ -28,7 +28,7 @@ done
 # JerryScript's; OpenEXR's its bundled OpenJPH, libdeflate and zstd; bmx's its libMXF and libMXF++, and the
 # cmake-git-version-tracking each of the three compiles in). Lua's tarball has none; its licence is
 # LICENSES/MIT-Lua.txt.
-for dep in whisper llama rnnoise thorvg openexr imath bmx liburiparser bmx_git_version libmxf_git_version libmxfpp_git_version; do
+for dep in whisper llama rnnoise thorvg openexr imath libvmx bmx liburiparser bmx_git_version libmxf_git_version libmxfpp_git_version; do
   src="$BUILD/_deps/$dep-src"
   [ -d "$src" ] || continue
   (cd "$src" && find . -type f \( -iname 'LICENSE' -o -iname 'LICENSE.*' -o -iname 'LICENCE*' -o -iname 'COPYING' -o -iname 'COPYING.*' \) \
@@ -51,5 +51,7 @@ if [ -n "$FFSHARE" ] && [ -d "$FFSHARE" ]; then
   mkdir -p "$OUT/ffmpeg"
   cp "$FFSHARE"/LICENSE.md "$FFSHARE"/COPYING.* "$FFSHARE"/configure.txt "$OUT/ffmpeg/"
   [ -s "$FFSHARE/buildconf.txt" ] && cp "$FFSHARE/buildconf.txt" "$OUT/ffmpeg/"
+  # OpenAPV (BSD-3-Clause), linked into FFmpeg's libavcodec.
+  [ -s "$FFSHARE/OpenAPV-LICENSE.txt" ] && cp "$FFSHARE/OpenAPV-LICENSE.txt" "$OUT/ffmpeg/"
 fi
 echo "Licences for Montage, its vendored headers and compiled-in libraries are in $OUT"

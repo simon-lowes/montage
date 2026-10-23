@@ -28,12 +28,13 @@ const char* proxyFormatName(ProxyFormat f) {
         case ProxyFormat::ProResProxy: return "prores_proxy";
         case ProxyFormat::DnxhrLb: return "dnxhr_lb";
         case ProxyFormat::Hevc10: return "hevc10";
+        case ProxyFormat::Apv: return "apv";
     }
     return "h264";
 }
 
 bool parseProxyFormat(const std::string& name, ProxyFormat& out) {
-    for (ProxyFormat f : {ProxyFormat::H264, ProxyFormat::ProResProxy, ProxyFormat::DnxhrLb, ProxyFormat::Hevc10})
+    for (ProxyFormat f : {ProxyFormat::H264, ProxyFormat::ProResProxy, ProxyFormat::DnxhrLb, ProxyFormat::Hevc10, ProxyFormat::Apv})
         if (name == proxyFormatName(f)) {
             out = f;
             return true;
@@ -41,9 +42,11 @@ bool parseProxyFormat(const std::string& name, ProxyFormat& out) {
     return false;
 }
 
-std::string proxyExtension(ProxyFormat f) { return f == ProxyFormat::ProResProxy || f == ProxyFormat::DnxhrLb ? ".mov" : ".mp4"; }
+std::string proxyExtension(ProxyFormat f) {
+    return f == ProxyFormat::ProResProxy || f == ProxyFormat::DnxhrLb || f == ProxyFormat::Apv ? ".mov" : ".mp4";
+}
 
-bool proxyKeepsHdr(ProxyFormat f) { return f == ProxyFormat::ProResProxy || f == ProxyFormat::Hevc10; }
+bool proxyKeepsHdr(ProxyFormat f) { return f == ProxyFormat::ProResProxy || f == ProxyFormat::Hevc10 || f == ProxyFormat::Apv; }
 
 bool createProxy(const std::string& source, const std::string& dest, const ProxyOptions& o, const ProxyProgress& progress,
                  const std::atomic<bool>* cancel, std::string* error) {
@@ -52,6 +55,16 @@ bool createProxy(const std::string& source, const std::string& dest, const Proxy
     if ((o.format == ProxyFormat::ProResProxy || o.format == ProxyFormat::DnxhrLb) && ext != QLatin1String("mov") && ext != QLatin1String("mxf")) {
         if (error) *error = "ProRes and DNxHR proxies are .mov files";
         return false;
+    }
+    if (o.format == ProxyFormat::Apv) {
+        if (ext != QLatin1String("mov")) {
+            if (error) *error = "APV proxies are .mov files";
+            return false;
+        }
+        if (!avcodec_find_encoder_by_name("liboapv")) {
+            if (error) *error = "APV needs FFmpeg 8 or later with the OpenAPV encoder (liboapv)";
+            return false;
+        }
     }
     MediaItem m;
     if (!probeMedia(source, m, error)) return false;
@@ -103,6 +116,13 @@ bool createProxy(const std::string& source, const std::string& dest, const Proxy
             st.pixFmt = st.videoCodec == "libx265" ? "yuv420p10le" : "";
             st.audioCodec = "aac";
             st.audioBitrate = 160000;
+            break;
+        case ProxyFormat::Apv:
+            st.videoCodec = "liboapv";
+            st.crf = 36;  // its QP: about ProRes Proxy's size
+            st.preset = "fastest";
+            st.pixFmt = "yuv422p10le";
+            st.audioCodec = "pcm_s16le";
             break;
     }
     if (!sound) st.audioCodec = "none";

@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -266,6 +267,9 @@ struct AvidBin {
     std::vector<std::string> issues;
 
     const AvidMob* findMob(const AvidMobId& id) const;
+    // Where each mob read is in `mobs` (the first of an ID), for findMob; mobs added later are searched one by one.
+    std::map<AvidMobId, size_t> mobIndex;
+    size_t indexedMobs = 0;
 };
 
 bool readAvidBin(const std::string& path, AvidBin& out, std::string* error = nullptr);

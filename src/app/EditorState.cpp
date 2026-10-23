@@ -770,7 +770,7 @@ Id EditorState::importImageSequence(const QString& frame, Rational fps, QString*
 namespace {
 
 bool importableMedia(const QString& file) {
-    static const QStringList exts = {"mp4", "mov", "mkv",  "avi",  "webm", "m4v", "mxf", "mts", "m2ts", "ts",  "mpg", "mpeg", "wmv",
+    static const QStringList exts = {"mp4", "mov", "mkv",  "avi",  "webm", "m4v", "mxf", "apv", "mts", "m2ts", "ts",  "mpg", "mpeg", "wmv",
                                      "flv", "gif", "wav",  "mp3",  "aac",  "m4a", "flac", "ogg", "opus", "aif", "aiff", "png", "jpg",
                                      "jpeg", "tif", "tiff", "bmp", "webp", "exr", "dpx", "svg", "psd",  "psb", "heic", "heif", "hif", "avif", "dng", "cr2",
                                      "cr3", "nef", "arw",  "raf",  "rw2",  "orf",  "mlv"};

@@ -10077,6 +10077,28 @@ const auto seq = [this] { return state()->sequence(); };
         auto* dlg = win_->findChild<AudioDescriptionDialog*>("audioDescriptionDialog");
         QVERIFY(dlg && dlg->isVisible());
         dlg->findChild<QDoubleSpinBox*>("adMinGap")->setValue(1.0);
+        // Added at the playhead before any gaps are found: checked against the dialogue at once (none in a line, ended
+        // where the next line begins), and again when the dialogue is cut while the dialog is hidden.
+        {
+            auto* rows = dlg->findChild<QTableWidget*>("adTable");
+            state()->setPlayhead(10);
+            dlg->addAtPlayhead();
+            QCOMPARE(rows->rowCount(), 0);
+            state()->setPlayhead(50);
+            dlg->addAtPlayhead();
+            QCOMPARE(rows->rowCount(), 1);
+            const qlonglong end = rows->item(0, 3)->data(Qt::UserRole + 1).toLongLong();
+            QVERIFY2(end > 50 && end <= 92, qPrintable(QString::number(end)));
+            rows->setCurrentItem(nullptr);  // (the row opened for typing closed, left empty)
+            QVERIFY(!QApplication::focusWidget() || !rows->isAncestorOf(QApplication::focusWidget()));
+            dlg->hide();
+            QVERIFY(state()->apply("Line over it", [&](Project& p, Sequence& s) {
+                return edit::placeMedia(p, s, media, 45, 0, -1, {TrackKind::Video, -1}, {TrackKind::Audio, 0}, false);
+            }));
+            dlg->show();
+            QTRY_COMPARE(rows->rowCount(), 0);
+            state()->undo();
+        }
         QString err;
         QVERIFY2(dlg->findGaps(&err) >= 1, qPrintable(err));
         auto* table = dlg->findChild<QTableWidget*>("adTable");

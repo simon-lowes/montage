@@ -36,7 +36,7 @@ struct BurnIn {
 struct ExportSettings {
     std::string path;
     // libx264, libx265, hw_h264, hw_hevc, prores_ks, dnxhd, cfhd, ffv1, v210, mpeg2video (XDCAM HD422), libvpx-vp9,
-    // libsvtav1, mjpeg, none; also
+    // libsvtav1, liboapv (APV), mjpeg, none; also
     // gif (an animated GIF: its own palette, dithered) and png or tiff (an image sequence: the
     // path gets a frame number, name_000000.png, unless it already has a printf pattern).
     std::string videoCodec = "libx264";  // also exr (half float, scene-linear) and dpx (10-bit) image sequences
@@ -246,9 +246,12 @@ bool exportSequence(const Project& p, const Sequence& seq, const ExportSettings&
 // Renders an audio clip's sound with its effects (not its volume, pan or
 // fades) to a 24-bit WAV, from its first frame to its last.
 // Render and Replace for video: the clip alone through its effects (and speed), at its media's size, to ProRes 4444
-// with its transparency; its transform is not baked in.
+// (or, with `apv`, APV 4:4:4:4 12-bit) with its transparency; its transform is not baked in.
 bool renderClipVideo(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error = nullptr,
-                     const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr);
+                     const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr, bool apv = false);
+// Whether FFmpeg here has APV's encoder (OpenAPV's liboapv, FFmpeg 8 and later) and decoder.
+bool apvEncoderAvailable();
+bool apvDecoderAvailable();
 bool renderClipAudio(const Project& p, const Sequence& seq, Id clip, const std::string& path, std::string* error,
                      const ExportProgress& progress = {}, const std::atomic<bool>* cancel = nullptr);
 

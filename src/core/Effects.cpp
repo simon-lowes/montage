@@ -945,6 +945,71 @@ std::vector<EffectInfo> buildCatalog() {
                   num("window", "Response (ms)", 20, 250, 60, 1),
                   pct("opacity", "Opacity", 0, 100, 100)},
                  {}});
+    // Particles (render/Particles.h): positions in pixels from the frame's centre (y down, z towards the viewer).
+    {
+        EffectInfo particles{
+            "particles", "Particles", EffectCategory::Generator, "Generators",
+            {
+                // Where they are born.
+                choice("emitter", "Emitter", {"Point", "Line", "Box", "Sphere", "Title Text", "Picture (Alpha)", "Picture (Brightness)"}, 0),
+                boolean("edge_only", "Only From the Edge"),
+                num("emit_x", "Emitter X", -8000, 8000, 0, 1), num("emit_y", "Emitter Y", -8000, 8000, 200, 1),
+                num("emit_z", "Emitter Z (3D)", -8000, 8000, 0, 1),
+                num("emit_w", "Emitter Width (px)", 0, 16000, 400, 1), num("emit_h", "Emitter Height (px)", 0, 16000, 200, 1),
+                num("emit_d", "Emitter Depth (px, 3D)", 0, 16000, 0, 1), angle("emit_angle", "Emitter Angle", 0),
+                num("text_size", "Title Text Size (px)", 4, 2000, 160, 1), boolean("text_bold", "Title Text Bold", true),
+                // How many, for how long, which way.
+                num("rate", "Birth Rate (per second)", 0, 100000, 60, 1), num("burst", "Burst at the Start", 0, 200000, 0, 1),
+                num("life", "Life (s)", 0.01, 120, 2, 0.01), pct("life_random", "Life Variation", 0, 100, 25),
+                num("speed", "Speed (px/s)", 0, 20000, 250, 1), pct("speed_random", "Speed Variation", 0, 100, 25),
+                angle("direction", "Direction (0 up, 90 right)", 0), angle("elevation", "Elevation (3D, towards the viewer)", 0),
+                num("spread", "Spread (°)", 0, 180, 25, 0.5), boolean("outward", "Away From the Emitter's Centre"),
+                // What moves them.
+                num("gravity", "Gravity (px/s²)", -20000, 20000, 300, 1), num("wind_x", "Wind X (px/s²)", -20000, 20000, 0, 1),
+                num("wind_y", "Wind Y (px/s²)", -20000, 20000, 0, 1), num("wind_z", "Wind Z (px/s², 3D)", -20000, 20000, 0, 1),
+                num("drag", "Air Resistance (per s)", 0, 50, 0, 0.01),
+                num("attract", "Attractor Strength (px/s², negative repels)", -100000, 100000, 0, 1),
+                num("attract_x", "Attractor X", -8000, 8000, 0, 1), num("attract_y", "Attractor Y", -8000, 8000, 0, 1),
+                num("attract_z", "Attractor Z (3D)", -8000, 8000, 0, 1), num("attract_radius", "Attractor Reach (px)", 1, 8000, 200, 1),
+                num("turbulence", "Turbulence (px/s)", 0, 10000, 0, 1), num("turbulence_scale", "Turbulence Size (px)", 1, 8000, 250, 1),
+                num("turbulence_evolve", "Turbulence Change (per s)", 0, 20, 0.3, 0.01),
+                // What they hit.
+                boolean("floor", "Floor"), pct("floor_y", "Floor Height (from the top)", -100, 300, 100),
+                boolean("edges", "Bounce Off the Frame's Sides and Top"), pct("bounce", "Bounce", 0, 100, 50), pct("friction", "Friction", 0, 100, 20),
+                // How they look.
+                choice("look", "Look", {"Dots", "Soft Discs", "Streaks", "Squares", "Sprites"}, 1),
+                num("size", "Size (px)", 0, 2000, 12, 0.1), pct("size_random", "Size Variation", 0, 100, 30),
+                pct("size_end", "Size at Death", 0, 2000, 100),
+                color("color", "Colour at Birth", 1, 0.9, 0.6), color("color_end", "Colour at Death", 1, 0.35, 0.1),
+                num("hue_random", "Hue Variation (°)", 0, 180, 0, 0.5), pct("opacity", "Opacity", 0, 100, 100),
+                pct("fade_in", "Fade In (of life)", 0, 100, 10), pct("fade_out", "Fade Out (of life)", 0, 100, 30),
+                angle("rotation", "Rotation", 0), num("rotation_random", "Rotation Variation (°)", 0, 180, 0, 0.5),
+                num("spin", "Spin (°/s)", -7200, 7200, 0, 1), pct("spin_random", "Spin Variation", 0, 200, 0),
+                num("streak", "Streak Length (frames of motion)", 0, 10, 0.5, 0.05),
+                choice("blend", "Blend", {"Normal", "Add (glow where they overlap)"}, 0),
+                // 3D, through the 3D titles' lens.
+                choice("mode", "Space", {"Flat (2D)", "3D"}, 0), num("fov", "Lens (field of view °, 3D)", 5, 120, 35, 0.5),
+                num("cam_tilt", "Camera Tilt (°, 3D)", -90, 90, 0, 0.5), num("cam_turn", "Camera Turn (°, 3D)", -180, 180, 0, 0.5),
+                // The simulation.
+                num("preroll", "Already Running For (s)", 0, 120, 0, 0.1), num("seed", "Seed", 0, 1000000, 1, 1),
+                num("steps", "Steps per Frame", 1, 32, 4, 1), num("max_particles", "Most Particles", 1, 200000, 20000, 1),
+            },
+            {str("text", "Title Text", StringKind::MultilineText, "Montage"), str("font", "Title Font", StringKind::Font, "Sans Serif"),
+             str("picture", "Emitter Picture", StringKind::File), str("sprite", "Sprite (Picture or Clip)", StringKind::File)}};
+        for (const char* fixed : {"text_size", "text_bold", "burst", "preroll", "seed", "steps", "max_particles"})
+            for (ParamInfo& pi : particles.params)
+                if (pi.name == fixed) pi.keyframeable = false;
+        particles.strings[2].fileFilter = particles.strings[3].fileFilter =
+            "Pictures and clips (*.png *.jpg *.jpeg *.tif *.tiff *.webp *.exr *.gif *.mov *.mp4 *.mkv *.webm);;All files (*)";
+        c.push_back(particles);
+        // Ready-made looks: Particles with these settings (makeEffect gives type "particles").
+        for (const GeneratorPreset& pre : generatorPresets()) {
+            EffectInfo e = particles;
+            e.type = pre.id;
+            e.displayName = pre.name;
+            c.push_back(e);
+        }
+    }
     {
         EffectInfo title{"title", "Title", EffectCategory::Generator, "Titles",
                          {
@@ -1301,6 +1366,71 @@ const std::vector<TitleTemplate>& titleTemplates() {
     return list;
 }
 
+const std::vector<GeneratorPreset>& generatorPresets() {
+    // Choices: emitter 0 Point, 1 Line, 2 Box, 3 Sphere, 4 Title Text, 5 Picture (Alpha), 6 Picture (Brightness);
+    // look 0 Dots, 1 Soft Discs, 2 Streaks, 3 Squares, 4 Sprites; blend 0 Normal, 1 Add; mode 0 Flat, 1 3D.
+    static const std::vector<GeneratorPreset> list = {
+        {"particles_sparks", "Sparks", "particles",
+         {{"emit_y", 250}, {"rate", 300}, {"life", 1.2}, {"life_random", 50}, {"speed", 750}, {"speed_random", 40}, {"spread", 35},
+          {"gravity", 1400}, {"drag", 0.4}, {"floor", 1}, {"floor_y", 95}, {"bounce", 35}, {"friction", 30}, {"look", 2},
+          {"size", 2.5}, {"size_random", 40}, {"streak", 1}, {"color.r", 1}, {"color.g", 0.85}, {"color.b", 0.45},
+          {"color_end.r", 1}, {"color_end.g", 0.25}, {"color_end.b", 0.05}, {"fade_in", 0}, {"fade_out", 40}, {"blend", 1}},
+         {}},
+        {"particles_snow", "Snow", "particles",
+         {{"emitter", 1}, {"emit_y", -620}, {"emit_w", 2400}, {"rate", 70}, {"life", 14}, {"speed", 40}, {"speed_random", 50},
+          {"direction", 180}, {"spread", 25}, {"gravity", 40}, {"drag", 0.35}, {"turbulence", 22}, {"turbulence_scale", 400},
+          {"turbulence_evolve", 0.15}, {"size", 7}, {"size_random", 60}, {"color.r", 1}, {"color.g", 1}, {"color.b", 1},
+          {"color_end.r", 0.92}, {"color_end.g", 0.95}, {"color_end.b", 1}, {"opacity", 90}, {"fade_in", 3}, {"fade_out", 8},
+          {"preroll", 12}},
+         {}},
+        {"particles_rain", "Rain", "particles",
+         {{"emitter", 1}, {"emit_y", -640}, {"emit_w", 2600}, {"rate", 900}, {"life", 1.1}, {"life_random", 10}, {"speed", 1500},
+          {"speed_random", 15}, {"direction", 188}, {"spread", 2}, {"gravity", 2000}, {"look", 2}, {"size", 1.2},
+          {"size_random", 30}, {"streak", 1.5}, {"color.r", 0.75}, {"color.g", 0.8}, {"color.b", 0.9}, {"color_end.r", 0.75},
+          {"color_end.g", 0.8}, {"color_end.b", 0.9}, {"opacity", 45}, {"fade_in", 0}, {"fade_out", 0}, {"preroll", 2}},
+         {}},
+        {"particles_dust", "Floating Dust", "particles",
+         {{"emitter", 2}, {"emit_y", 0}, {"emit_w", 2200}, {"emit_h", 1300}, {"emit_d", 900}, {"mode", 1}, {"rate", 70},
+          {"life", 8}, {"life_random", 40}, {"speed", 6}, {"spread", 180}, {"gravity", 0}, {"turbulence", 22},
+          {"turbulence_scale", 260}, {"turbulence_evolve", 0.08}, {"size", 6}, {"size_random", 70}, {"color.r", 1},
+          {"color.g", 0.95}, {"color.b", 0.85}, {"color_end.r", 1}, {"color_end.g", 0.95}, {"color_end.b", 0.85},
+          {"opacity", 75}, {"fade_in", 30}, {"fade_out", 30}, {"preroll", 8}},
+         {}},
+        {"particles_smoke", "Smoke Puffs", "particles",
+         {{"emit_y", 320}, {"emit_w", 40}, {"emit_h", 40}, {"emitter", 3}, {"rate", 14}, {"life", 4}, {"life_random", 30}, {"speed", 90},
+          {"spread", 18}, {"gravity", -35}, {"drag", 0.45}, {"turbulence", 60}, {"turbulence_scale", 220}, {"size", 70},
+          {"size_random", 30}, {"size_end", 420}, {"color.r", 0.8}, {"color.g", 0.8}, {"color.b", 0.8}, {"color_end.r", 0.55},
+          {"color_end.g", 0.55}, {"color_end.b", 0.55}, {"opacity", 28}, {"fade_in", 15}, {"fade_out", 60}},
+         {}},
+        {"particles_confetti", "Confetti", "particles",
+         {{"emitter", 1}, {"emit_y", -600}, {"emit_w", 2000}, {"burst", 250}, {"rate", 60}, {"life", 7}, {"speed", 160},
+          {"direction", 180}, {"spread", 45}, {"gravity", 260}, {"drag", 1.1}, {"turbulence", 90}, {"turbulence_scale", 200},
+          {"look", 3}, {"size", 10}, {"size_random", 35}, {"color.r", 1}, {"color.g", 0.3}, {"color.b", 0.35},
+          {"color_end.r", 1}, {"color_end.g", 0.3}, {"color_end.b", 0.35}, {"hue_random", 180}, {"fade_in", 0}, {"fade_out", 10},
+          {"rotation_random", 180}, {"spin", 300}, {"spin_random", 150}},
+         {}},
+        {"particles_burst", "Firework Burst", "particles",
+         {{"emit_y", -150}, {"burst", 400}, {"rate", 0}, {"outward", 1}, {"life", 2.4}, {"life_random", 30}, {"speed", 420},
+          {"speed_random", 25}, {"spread", 0}, {"gravity", 160}, {"drag", 1}, {"look", 2}, {"size", 2.5}, {"streak", 1.2},
+          {"color.r", 1}, {"color.g", 0.9}, {"color.b", 0.6}, {"color_end.r", 0.9}, {"color_end.g", 0.2}, {"color_end.b", 0.5},
+          {"fade_in", 0}, {"fade_out", 60}, {"blend", 1}},
+         {}},
+        {"particles_title_sparkle", "Title Sparkle", "particles",
+         {{"emitter", 4}, {"edge_only", 1}, {"emit_y", 0}, {"rate", 900}, {"life", 0.9}, {"life_random", 40}, {"speed", 12},
+          {"spread", 180}, {"gravity", -20}, {"size", 4}, {"size_random", 60}, {"color.r", 1}, {"color.g", 0.92},
+          {"color.b", 0.6}, {"color_end.r", 1}, {"color_end.g", 0.7}, {"color_end.b", 0.3}, {"fade_in", 20}, {"fade_out", 50},
+          {"blend", 1}},
+         {{"text", "Montage"}}},
+    };
+    return list;
+}
+
+const GeneratorPreset* findGeneratorPreset(const std::string& id) {
+    for (const GeneratorPreset& p : generatorPresets())
+        if (id == p.id) return &p;
+    return nullptr;
+}
+
 const TitleTemplate* findTitleTemplate(const std::string& id) {
     for (const TitleTemplate& t : titleTemplates())
         if (id == t.id) return &t;
@@ -1308,6 +1438,12 @@ const TitleTemplate* findTitleTemplate(const std::string& id) {
 }
 
 Effect makeEffect(const std::string& type, Id id) {
+    if (const GeneratorPreset* pre = findGeneratorPreset(type)) {
+        Effect e = makeEffect(pre->base, id);
+        for (const auto& [name, value] : pre->params) e.params[name] = Param(value);
+        for (const auto& [name, value] : pre->strings) e.strings[name] = value;
+        return e;
+    }
     if (const TitleTemplate* tpl = findTitleTemplate(type)) {
         Effect e = makeEffect("title", id);
         for (const auto& [name, value] : tpl->params) e.params[name] = Param(value);
