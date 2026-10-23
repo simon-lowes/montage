@@ -23,7 +23,7 @@ void shutdownSocket(Socket s);  // a blocked read or write on it returns
 // No delay, kept alive, and the send and receive buffers OMT uses (8 MB to receive).
 void configure(Socket s, bool receiver);
 bool sendAll(Socket s, const uint8_t* data, size_t size);
-// False when it ended (or `stop` was set and the socket shut down).
+// False when it ended, or within a tenth of a second of `stop` being set.
 bool recvAll(Socket s, uint8_t* data, size_t size, const std::atomic<bool>* stop = nullptr);
 // Listens on every address (IPv6 and IPv4) at the first free port from `first` to `last`.
 Socket listenOnFirstFree(int first, int last, int* port, std::string* why);

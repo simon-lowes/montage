@@ -170,17 +170,17 @@ bool sendXml(net::Socket s, const std::string& xml) {
 
 // Reads the server's metadata into `sources` until `until` (or the connection ends).
 void readServer(net::Socket s, std::chrono::steady_clock::time_point until, std::map<std::string, Source>& sources) {
-    std::atomic<bool> stop{false};
+    std::atomic<bool> expired{false}, finished{false};
     std::thread timer([&] {
-        while (!stop && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(20));
-        net::shutdownSocket(s);
+        while (!finished && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        expired = true;
     });
     uint8_t head[kHeaderBytes];
     std::vector<uint8_t> body;
     Header h;
-    while (net::recvAll(s, head, kHeaderBytes) && readHeader(head, h) && h.dataLength <= (4 << 20)) {
+    while (net::recvAll(s, head, kHeaderBytes, &expired) && readHeader(head, h) && h.dataLength <= (4 << 20)) {
         body.resize(size_t(h.dataLength));
-        if (h.dataLength && !net::recvAll(s, body.data(), body.size())) break;
+        if (h.dataLength && !net::recvAll(s, body.data(), body.size(), &expired)) break;
         if (h.type != Metadata) continue;
         Source src;
         bool removed = false;
@@ -188,7 +188,7 @@ void readServer(net::Socket s, std::chrono::steady_clock::time_point until, std:
         if (removed) sources.erase(src.name);
         else sources[src.name] = src;
     }
-    stop = true;
+    finished = true;
     timer.join();
 }
 
@@ -198,13 +198,14 @@ public:
     ServerAnnouncement(net::Socket s, std::string name, int port) : s_(s), name_(std::move(name)), port_(port) {
         // (the server's broadcasts read and let go, so the connection stays open)
         reader_ = std::thread([this] {
-            uint8_t buf[4096];
-            while (net::recvAll(s_, buf, 1)) {
+            uint8_t buf[1];
+            while (net::recvAll(s_, buf, 1, &stop_)) {
             }
         });
     }
     ~ServerAnnouncement() override {
         sendXml(s_, addressXml(name_, port_, {}, true));
+        stop_ = true;
         net::shutdownSocket(s_);
         reader_.join();
         net::closeSocket(s_);
@@ -215,6 +216,7 @@ private:
     net::Socket s_;
     std::string name_;
     int port_;
+    std::atomic<bool> stop_{false};
     std::thread reader_;
 };
 

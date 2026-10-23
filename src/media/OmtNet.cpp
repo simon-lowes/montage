@@ -144,6 +144,9 @@ bool sendAll(Socket s, const uint8_t* data, size_t size) {
 bool recvAll(Socket s, uint8_t* data, size_t size, const std::atomic<bool>* stop) {
     while (size > 0) {
         if (stop && *stop) return false;
+        // (with a stop flag, waited for in short steps: Windows does not wake a blocked recv when its socket is shut
+        // down from another thread, only when the other end answers)
+        if (stop && !pollOne(raw(s), POLLIN, 100)) continue;
         const int chunk = int(std::min<size_t>(size, size_t(1) << 30));
         const auto n = ::recv(raw(s), reinterpret_cast<char*>(data), chunk, 0);
         if (n <= 0) {

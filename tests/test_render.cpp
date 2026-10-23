@@ -9045,9 +9045,9 @@ colorspaces:
             uint8_t head[omt::kHeaderBytes];
             omt::Header h;
             std::vector<uint8_t> body;
-            while (net::recvAll(c, head, omt::kHeaderBytes) && omt::readHeader(head, h)) {
+            while (net::recvAll(c, head, omt::kHeaderBytes, &stop) && omt::readHeader(head, h)) {
                 body.resize(size_t(h.dataLength));
-                if (h.dataLength && !net::recvAll(c, body.data(), body.size())) break;
+                if (h.dataLength && !net::recvAll(c, body.data(), body.size(), &stop)) break;
                 const std::string text(body.begin(), body.end());
                 std::lock_guard lock(m);
                 if (text == omt::subscribeCommand(omt::Metadata)) {
