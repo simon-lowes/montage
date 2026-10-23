@@ -181,12 +181,19 @@ std::string machineName() {
 std::string fullName(const std::string& name) {
     const std::string host = machineName();
     std::string n = name;
-    const int over = int(host.size() + n.size() + 3) - 63;
+    std::string h = host;
+    const int over = int(h.size() + n.size() + 3) - 63;
     if (over > 0 && over < int(n.size())) {
         n = n.substr(0, n.size() - size_t(over));
         while (!n.empty() && n.back() == ' ') n.pop_back();
+    } else if (over > 0) {
+        // (a computer name too long even for a one-letter source, as cloud machines have: it is shortened instead,
+        // since DNS-SD cuts an instance name at 63 bytes and the source could no longer be found by its name)
+        n = n.substr(0, std::min<size_t>(n.size(), 16));
+        h = h.substr(0, size_t(std::max(1, 63 - int(n.size()) - 3)));
+        while (h.size() > 1 && (h.back() == '.' || h.back() == '-')) h.pop_back();
     }
-    return host + " (" + n + ")";
+    return h + " (" + n + ")";
 }
 
 std::string xmlAttribute(const std::string& xml, const std::string& name) {

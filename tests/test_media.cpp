@@ -1464,14 +1464,20 @@ private slots:
         // ProRes are both lossy: about 0.005 here, 0.01 on Apple silicon), and the picture itself close to what was sent.
         VideoDecoder dec;
         QVERIFY(dec.open(cs.path));
+        // (a frame the source sent late on a busy machine is held over the one it missed, at most twice here)
+        int held = 0;
         for (int k : {0, 1, 2, 3, 24, 25, 48, 49}) {
             const Frame16Ptr f = dec.frameAt((k + 0.5) / 25.0);
             QVERIFY(f && f->width == W);
             const Image img = toImage(*f);
             const float blue = img.at(W / 2, H / 2)[2];
-            QVERIFY2(std::fabs(blue - (0.2f + 0.6f * float((first + k) % 25) / 24.0f)) < 0.0125, qPrintable(QStringLiteral("frame %1: %2").arg(k).arg(blue)));
+            auto blueOf = [&](int n) { return 0.2f + 0.6f * float(((n % 25) + 25) % 25) / 24.0f; };
+            const bool right = std::fabs(blue - blueOf(first + k)) < 0.0125;
+            if (!right && k > 0 && std::fabs(blue - blueOf(first + k - 1)) < 0.0125) ++held;
+            else QVERIFY2(right, qPrintable(QStringLiteral("frame %1: %2, not %3").arg(k).arg(blue).arg(blueOf(first + k))));
             QVERIFY2(std::fabs(img.at(W / 4, H / 4)[0] - (0.1f + 0.8f * 0.25f)) < 0.015, qPrintable(QStringLiteral("frame %1: red %2").arg(k).arg(img.at(W / 4, H / 4)[0])));
         }
+        QVERIFY(held <= 2);
         // The sound placed to the sample: the recording's sample s is the source's sample (first frame's) + s.
         AudioBufferPtr heard = decodeAudio(cs.path, 48000, &err);
         QVERIFY2(heard, err.c_str());

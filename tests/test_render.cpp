@@ -8758,8 +8758,10 @@ colorspaces:
         QVERIFY(!omt::decodeFpa1(fpa.data(), fpa.size() - 1, 3, 4, active, decoded.data()));
         // Names: "HOST (Name)", 63 characters at most.
         const std::string host = omt::machineName();
-        QCOMPARE(QString::fromStdString(omt::fullName("Montage")), QString::fromStdString(host + " (Montage)"));
+        if (host.size() < 40) QCOMPARE(QString::fromStdString(omt::fullName("Montage")), QString::fromStdString(host + " (Montage)"));
         if (host.size() < 40) QCOMPARE(int(omt::fullName(std::string(80, 'x')).size()), 63);
+        // (63 bytes at most however long the computer's name: DNS-SD takes no longer an instance name)
+        QVERIFY(omt::fullName("Montage").size() <= 63 && omt::fullName(std::string(80, 'x')).size() <= 63);
         // Addresses, and the discovery server's XML (libomtnet's: IPv4 as IPv6, Removed before Addresses).
         std::string where;
         int port = 0;
@@ -8974,7 +8976,7 @@ colorspaces:
         so.announce = false;
         QVERIFY2(tx.start(so, &why), why.c_str());
         QVERIFY(tx.port() >= omt::kPortStart && tx.port() <= omt::kPortEnd);
-        QCOMPARE(QString::fromStdString(tx.fullName()), QString::fromStdString(host + " (Tally test)"));
+        QCOMPARE(QString::fromStdString(tx.fullName()), QString::fromStdString(omt::fullName("Tally test")));
         omt::Receiver a, b;
         omt::Receiver::Options va;
         va.audio = false;
@@ -9151,7 +9153,7 @@ colorspaces:
         for (int i = 0; i < 5 && !seen; ++i)
             for (const omt::Source& s : omt::discover(2.0, &why)) {
                 if (s.name == tx.fullName() && s.port == tx.port()) seen = true;
-                heard += " "" + s.name + "" at " + s.host + ":" + std::to_string(s.port) + " (" + s.via + ");";
+                heard += " \"" + s.name + "\" at " + s.host + ":" + std::to_string(s.port) + " (" + s.via + ");";
             }
         if (!seen && why.find("Local Network") != std::string::npos) {
             // (a CI machine's local network privacy setting, which only a person can change, refuses browsing)
@@ -9159,7 +9161,7 @@ colorspaces:
             tx.stop();
             return;
         }
-        QVERIFY2(seen, ("looking for "" + tx.fullName() + "" at port " + std::to_string(tx.port()) + "; found" + heard + " " + why).c_str());
+        QVERIFY2(seen, ("looking for \"" + tx.fullName() + "\" at port " + std::to_string(tx.port()) + "; found" + heard + " " + why).c_str());
         QVERIFY2(rx.open(tx.fullName(), ro, &why), why.c_str());
         rx.close();
         tx.stop();
