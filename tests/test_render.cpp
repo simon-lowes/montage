@@ -3676,6 +3676,27 @@ colorspaces:
         QVERIFY(near(inv[64], 1 - 64.0f / 256, 0.002f));
         auto sCurve = buildCurve("0,0 0.25,0.15 0.75,0.85 1,1", 1000);
         for (size_t i = 1; i < sCurve.size(); ++i) QVERIFY(sCurve[i] >= sCurve[i - 1] - 1e-6f);  // monotone
+        {
+            // A floating-point picture's NaN and infinite pixels through Curves: NaN becomes 0 (as the clamped path made
+            // it), an infinite value past a flat end stays at that end, and one past a sloping end stays infinite.
+            Project cp;
+            Effect flat = makeEffect(cp, "curves");
+            flat.strings["master"] = "0,0.1 0.2,0.1 0.8,0.9 1,0.9";
+            Image img(4, 1);
+            const float inf = std::numeric_limits<float>::infinity();
+            const float in[4] = {std::numeric_limits<float>::quiet_NaN(), inf, -inf, 2.0f};
+            for (int x = 0; x < 4; ++x) img.at(x, 0)[0] = img.at(x, 0)[1] = img.at(x, 0)[2] = in[x], img.at(x, 0)[3] = 1;
+            applyVideoEffect(flat, 0, img, 1);
+            QCOMPARE(img.at(0, 0)[0], 0.0f);
+            QVERIFY(near(img.at(1, 0)[0], 0.9f, 1e-4f) && near(img.at(2, 0)[0], 0.1f, 1e-4f) && near(img.at(3, 0)[0], 0.9f, 1e-4f));
+            Effect sloped = makeEffect(cp, "curves");
+            Image img2(2, 1);
+            img2.at(0, 0)[0] = std::numeric_limits<float>::quiet_NaN(), img2.at(1, 0)[0] = inf;
+            img2.at(0, 0)[3] = img2.at(1, 0)[3] = 1;
+            applyVideoEffect(sloped, 0, img2, 1);
+            QCOMPARE(img2.at(0, 0)[0], 0.0f);
+            QVERIFY(std::isinf(img2.at(1, 0)[0]) && img2.at(1, 0)[0] > 0);
+        }
 
         QTemporaryDir dir;
         std::string path = (dir.path() + "/invert.cube").toStdString();

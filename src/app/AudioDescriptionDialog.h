@@ -44,8 +44,18 @@ public:
     void setHear(bool on);
     int rows() const;
 
+protected:
+    void showEvent(QShowEvent* e) override;
+
 private:
     void refresh();
+    // Whether the gaps (or those added at the playhead, when none were found) were looked for before the dialogue was
+    // last cut.
+    bool stale() const;
+    // Drops (or shortens) the gaps added at the playhead that the dialogue now covers; with `alone`, when no gaps were
+    // found, they are all there is. Returns false (with `error`) when the dialogue cannot be heard.
+    bool checkAdded(QString* error = nullptr);
+    void keepAdded(const std::vector<std::pair<double, double>>& speech, double fps);
     void cellEdited(int row, int column);
     int adTrack() const;  // the audio track named "AD", -1 if none
     std::string dialogueLayout() const;  // where the dialogue's clips are (the AD track aside), to tell when it is cut
@@ -62,6 +72,7 @@ private:
     std::vector<DescriptionGap> gaps_;
     std::vector<DescriptionGap> added_;  // the gaps added at the playhead, kept when the gaps are found again
     std::string foundFor_;               // the dialogue's layout when the gaps were found
+    std::string addedFor_;               // and when the gaps added were checked, when none were found
     bool refreshing_ = false;
     QTimer* refind_;  // finds the gaps again after the dialogue is cut (restarted by each edit)
 };

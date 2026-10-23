@@ -296,27 +296,109 @@ if(MONTAGE_WITH_THORVG)
 endif()
 
 # SQLite (public domain) for the sound library's index (media/SoundLibrary.h), from its amalgamation, with full-text
-# search (FTS5).
+# search (FTS5). The system's SQLite is used instead with MONTAGE_SYSTEM_SQLITE (as a distribution's build would), or
+# when the amalgamation cannot be downloaded (offline, or a network that refuses it) and the system's has FTS5.
 include(FetchContent)
 enable_language(C)
-set(MONTAGE_SQLITE_TIMESTAMP "")
-if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
-  set(MONTAGE_SQLITE_TIMESTAMP DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+option(MONTAGE_SYSTEM_SQLITE "Use the system's SQLite (built with FTS5) instead of the amalgamation" OFF)
+set(MONTAGE_SQLITE_URL https://www.sqlite.org/2025/sqlite-amalgamation-3500400.zip)
+set(MONTAGE_SQLITE_SHA256 1d3049dd0f830a025a53105fc79fd2ab9431aea99e137809d064d8ee8356b032)
+# Whether the system has an SQLite with FTS5 (found, and a full-text table made in it).
+function(montage_system_sqlite_usable out)
+  set(${out} OFF PARENT_SCOPE)
+  if(CMAKE_CROSSCOMPILING)
+    return()
+  endif()
+  find_package(SQLite3 3.9 QUIET)
+  if(NOT SQLite3_FOUND)
+    return()
+  endif()
+  include(CheckCSourceRuns)
+  include(CMakePushCheckState)
+  cmake_push_check_state(RESET)
+  set(CMAKE_REQUIRED_INCLUDES ${SQLite3_INCLUDE_DIRS})
+  set(CMAKE_REQUIRED_LIBRARIES ${SQLite3_LIBRARIES})
+  set(CMAKE_REQUIRED_QUIET ON)
+  unset(MONTAGE_SYSTEM_SQLITE_FTS5 CACHE)  # (looked for again each time: one may have been installed since)
+  check_c_source_runs([[
+#include <sqlite3.h>
+int main(void) {
+    sqlite3* db = 0;
+    if (sqlite3_open(":memory:", &db) != SQLITE_OK) return 1;
+    const int r = sqlite3_exec(db, "CREATE VIRTUAL TABLE t USING fts5(a)", 0, 0, 0);
+    sqlite3_close(db);
+    return r != SQLITE_OK;
+}]] MONTAGE_SYSTEM_SQLITE_FTS5)
+  cmake_pop_check_state()
+  if(MONTAGE_SYSTEM_SQLITE_FTS5)
+    set(${out} ON PARENT_SCOPE)
+    set(MONTAGE_SYSTEM_SQLITE_VERSION ${SQLite3_VERSION} PARENT_SCOPE)
+  endif()
+endfunction()
+set(MONTAGE_SQLITE_FROM_SYSTEM OFF)
+set(MONTAGE_SQLITE_ZIP ${CMAKE_BINARY_DIR}/sqlite-amalgamation-3500400.zip)
+if(MONTAGE_SYSTEM_SQLITE)
+  montage_system_sqlite_usable(MONTAGE_SQLITE_FROM_SYSTEM)
+  if(NOT MONTAGE_SQLITE_FROM_SYSTEM)
+    message(FATAL_ERROR "MONTAGE_SYSTEM_SQLITE is on, but no SQLite with FTS5 was found")
+  endif()
+elseif(NOT FETCHCONTENT_SOURCE_DIR_SQLITE AND NOT EXISTS ${FETCHCONTENT_BASE_DIR}/sqlite-src/sqlite3.c
+       AND NOT EXISTS ${MONTAGE_SQLITE_ZIP})
+  # (Three tries; a file that is not the amalgamation, as a proxy's page, is not kept.)
+  foreach(MONTAGE_SQLITE_TRY RANGE 1 3)
+    file(DOWNLOAD ${MONTAGE_SQLITE_URL} ${MONTAGE_SQLITE_ZIP}.part STATUS MONTAGE_SQLITE_STATUS INACTIVITY_TIMEOUT 30 TIMEOUT 300)
+    list(GET MONTAGE_SQLITE_STATUS 0 MONTAGE_SQLITE_CODE)
+    list(GET MONTAGE_SQLITE_STATUS 1 MONTAGE_SQLITE_WHY)
+    if(MONTAGE_SQLITE_CODE EQUAL 0)
+      file(SHA256 ${MONTAGE_SQLITE_ZIP}.part MONTAGE_SQLITE_GOT)
+      if(MONTAGE_SQLITE_GOT STREQUAL MONTAGE_SQLITE_SHA256)
+        file(RENAME ${MONTAGE_SQLITE_ZIP}.part ${MONTAGE_SQLITE_ZIP})
+        break()
+      endif()
+      set(MONTAGE_SQLITE_WHY "what came was not the amalgamation")
+    endif()
+    file(REMOVE ${MONTAGE_SQLITE_ZIP}.part)
+  endforeach()
+  if(NOT EXISTS ${MONTAGE_SQLITE_ZIP})
+    montage_system_sqlite_usable(MONTAGE_SQLITE_FROM_SYSTEM)
+    if(NOT MONTAGE_SQLITE_FROM_SYSTEM)
+      message(FATAL_ERROR "The SQLite amalgamation could not be downloaded (${MONTAGE_SQLITE_WHY}) and the system has no "
+                          "SQLite with FTS5: install one (libsqlite3-dev), or point FETCHCONTENT_SOURCE_DIR_SQLITE at an "
+                          "unpacked ${MONTAGE_SQLITE_URL}")
+    endif()
+    message(WARNING "The SQLite amalgamation could not be downloaded (${MONTAGE_SQLITE_WHY}): using the system's")
+  endif()
 endif()
-FetchContent_Declare(sqlite
-  URL https://www.sqlite.org/2025/sqlite-amalgamation-3500400.zip
-  URL_HASH SHA256=1d3049dd0f830a025a53105fc79fd2ab9431aea99e137809d064d8ee8356b032
-  ${MONTAGE_SQLITE_TIMESTAMP})
-FetchContent_MakeAvailable(sqlite)
-add_library(montage_sqlite STATIC ${sqlite_SOURCE_DIR}/sqlite3.c)
-target_include_directories(montage_sqlite PUBLIC ${sqlite_SOURCE_DIR})
-target_compile_definitions(montage_sqlite PRIVATE SQLITE_ENABLE_FTS5 SQLITE_THREADSAFE=1 SQLITE_OMIT_LOAD_EXTENSION
-                           SQLITE_DQS=0 SQLITE_DEFAULT_FOREIGN_KEYS=1)
-set_target_properties(montage_sqlite PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden
-                      AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
-target_compile_options(montage_sqlite PRIVATE $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w -O2> $<$<C_COMPILER_ID:MSVC>:/w /O2>)
-find_package(Threads REQUIRED)
-target_link_libraries(montage_sqlite PRIVATE Threads::Threads)
+if(MONTAGE_SQLITE_FROM_SYSTEM)
+  message(STATUS "SQLite: the system's, ${MONTAGE_SYSTEM_SQLITE_VERSION}")
+  add_library(montage_sqlite INTERFACE)
+  target_link_libraries(montage_sqlite INTERFACE SQLite::SQLite3)
+else()
+  set(MONTAGE_SQLITE_TIMESTAMP "")
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+    set(MONTAGE_SQLITE_TIMESTAMP DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  endif()
+  if(EXISTS ${MONTAGE_SQLITE_ZIP})
+    set(MONTAGE_SQLITE_URL ${MONTAGE_SQLITE_ZIP})
+  endif()
+  FetchContent_Declare(sqlite
+    URL ${MONTAGE_SQLITE_URL}
+    URL_HASH SHA256=${MONTAGE_SQLITE_SHA256}
+    ${MONTAGE_SQLITE_TIMESTAMP})
+  FetchContent_MakeAvailable(sqlite)
+  add_library(montage_sqlite STATIC ${sqlite_SOURCE_DIR}/sqlite3.c)
+  target_include_directories(montage_sqlite PUBLIC ${sqlite_SOURCE_DIR})
+  target_compile_definitions(montage_sqlite PRIVATE SQLITE_ENABLE_FTS5 SQLITE_THREADSAFE=1 SQLITE_OMIT_LOAD_EXTENSION
+                             SQLITE_DQS=0 SQLITE_DEFAULT_FOREIGN_KEYS=1)
+  set_target_properties(montage_sqlite PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden
+                        AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
+  target_compile_options(montage_sqlite PRIVATE $<$<C_COMPILER_ID:GNU,Clang,AppleClang>:-w -O2> $<$<C_COMPILER_ID:MSVC>:/w /O2>)
+  find_package(Threads REQUIRED)
+  target_link_libraries(montage_sqlite PRIVATE Threads::Threads)
+  if(UNIX AND NOT APPLE)
+    target_link_libraries(montage_sqlite PRIVATE m)  # (its maths functions)
+  endif()
+endif()
 
 if(MONTAGE_WITH_OMT)
   # libvmx (MIT), the VMX codec Open Media Transport sends pictures in (media/Omt.h), at a fixed commit. Its x86 code

@@ -38,6 +38,7 @@
 #include "core/GradeGraph.h"
 #include "core/AudioChannels.h"
 #include "core/Aaf.h"
+#include "core/Interchange.h"
 #include "core/AvidBin.h"
 #include "core/AvidBinImport.h"
 #include "core/MarkerList.h"
@@ -2694,7 +2695,8 @@ private slots:
         };
         const double speechSeconds = double(jfk->frames()) / rate;
         std::string setup;  // (what went wrong making a sequence)
-        auto measure = [&](const std::string& under, double seconds, std::vector<double> starts = {0}) -> std::pair<Intelligibility, Project> {
+        auto measure = [&](const std::string& under, double seconds, std::vector<double> starts = {0},
+                           bool compressed = false) -> std::pair<Intelligibility, Project> {
             Project p = makeDefaultProject();
             Sequence& s = *p.active();
             MediaItem speech = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/jfk.wav"), bed = probeOrFail(p, under);
@@ -2708,6 +2710,13 @@ private slots:
             if (s.audioTracks.size() < 2 || s.audioTracks[0].clips.empty() || s.audioTracks[1].clips.empty()) return {};
             for (Clip& c : s.audioTracks[0].clips) c.role = "Dialogue";
             s.audioTracks[1].clips.front().role = "Effects";
+            if (compressed) {
+                Effect comp = makeEffect(p, "compressor");
+                comp.params["threshold_db"] = Param(-45.0);
+                comp.params["ratio"] = Param(10.0);
+                comp.params["makeup_db"] = Param(30.0);  // (about what it takes away: the mix as loud as before)
+                s.masterEffects.push_back(comp);
+            }
             IntelligibilityOptions o;
             o.out = FrameTime(std::llround(seconds * fps));
             const Intelligibility r = measureIntelligibility(p, s, o, {}, nullptr, &err);
@@ -2734,6 +2743,17 @@ private slots:
             const double withNoise = measure(noise, speechSeconds).first.average, withMusic = measure(music, speechSeconds).first.average;
             QVERIFY2(setup.empty(), setup.c_str());
             QVERIFY2(withMusic > withNoise + 0.15, qPrintable(QString("music %1, noise %2").arg(withMusic).arg(withNoise)));
+        }
+        // A compressor on the master working hard on the whole mix, driven by music 10 dB over the speech (with nothing
+        // over 500 Hz, so masking little of it): the dialogue is taken at the level it has in the mix, so the figure
+        // stays near what it was (none of the dialogue is left in what masks it).
+        {
+            const std::string file = path("music-compressed.wav");
+            writeFloatWav(file, lowMusic(speechSeconds, speechRms * std::pow(10.0, 10 / 20.0)));
+            const double plain = measure(file, speechSeconds).first.average, squeezed = measure(file, speechSeconds, {0}, true).first.average;
+            QVERIFY2(setup.empty(), setup.c_str());
+            qInfo("compressed %.3f, plain %.3f", squeezed, plain);
+            QVERIFY2(std::fabs(squeezed - plain) < 0.1, qPrintable(QString("compressed %1, plain %2").arg(squeezed).arg(plain)));
         }
 
         // A 33 s mix (the speech three times) over noise 15 dB down, which swells to 10 dB over the speech from 12 to 15 s:
@@ -3159,6 +3179,42 @@ private slots:
             QVERIFY(right);
             QVERIFY(t.clips[0].head > 0 && t.clips[0].tail == 0 && edit::clipById(*cut.active(), right)->head == 0 &&
                     edit::clipById(*cut.active(), right)->tail > 0);
+        }
+
+        // An ordinary trim of either edge lands it on a frame: the samples' head (tail) goes with the old edge, so the
+        // new first frame plays whole.
+        {
+            Project q = p;
+            Sequence& qs = *q.active();
+            QVERIFY(edit::clipById(qs, id)->head > 0 && edit::clipById(qs, id)->tail > 0);
+            QVERIFY(edit::trim(q, qs, id, edit::Edge::In, 2, edit::TrimMode::Normal, false).ok);
+            QVERIFY(edit::trim(q, qs, id, edit::Edge::Out, -2, edit::TrimMode::Normal, false).ok);
+            QCOMPARE(edit::clipById(qs, id)->head, 0.0);
+            QCOMPARE(edit::clipById(qs, id)->tail, 0.0);
+        }
+
+        // OpenTimelineIO and Final Cut Pro XML carry the sound to the sample (between frames), and read it back.
+        {
+            const Clip& was = *edit::clipById(s, id);
+            QVERIFY(was.head > 0 && was.tail > 0);
+            for (const bool otio : {true, false}) {
+                Project q = p;
+                const ImportResult r = otio ? importOtio(q, exportOtio(p, s)) : importXmlTimeline(q, exportFcpXml(p, s));
+                QVERIFY2(r.ok, r.error.c_str());
+                const Sequence* imported = q.findSequence(r.sequence);
+                QVERIFY(imported && imported->id != s.id);
+                const Sequence& qs = *imported;
+                const Clip* sound = nullptr;
+                for (const Track& t : qs.audioTracks)
+                    if (!t.clips.empty() && !sound) sound = &t.clips.front();
+                QVERIFY(sound);
+                const Clip& got = *sound;
+                const QString what = QString("%1: start %2 duration %3 in %4 head %5 tail %6").arg(otio ? "OTIO" : "FCPXML")
+                                         .arg(got.start).arg(got.duration).arg(got.sourceIn).arg(got.head).arg(got.tail);
+                QVERIFY2(got.start == was.start && got.duration == was.duration && std::fabs(got.sourceIn - was.sourceIn) < 1e-3 &&
+                             std::fabs(got.head - was.head) < 1e-3 && std::fabs(got.tail - was.tail) < 1e-3,
+                         qPrintable(what));
+            }
         }
 
         // What cannot be done: into the clip after it, to nothing, past the media's start, a picture clip.
@@ -13458,32 +13514,33 @@ def make(path):
             f.content.add_mob(m)
         f.write(path)
 
+def walk_once(obj, seen=None):  # pyavb's walk_references, each object once
+    seen = set() if seen is None else seen
+    if hasattr(obj, 'class_id') and obj.class_id:
+        if id(obj) in seen:
+            return
+        seen.add(id(obj))
+    if isinstance(obj, list):
+        values = obj
+    elif isinstance(obj, dict):
+        values = obj.values()
+    else:
+        values = obj.property_data.values() if hasattr(obj, 'property_data') else []
+    for v in values:
+        if isinstance(v, avb.utils.AVBObjectRef):
+            v = v.value
+        if v is None:
+            continue
+        if hasattr(v, 'class_id') and v.class_id:
+            yield from walk_once(v, seen)  # (a list of references among them: its items once too)
+        elif isinstance(v, list):
+            for item in v:
+                yield from walk_once(item, seen)
+    if hasattr(obj, 'class_id') and obj.class_id:
+        yield obj
+
 def bomb(path):
     # A sequence naming the next twice, 48 deep, and attributes the same: tiny on disk, 2^48 parts unfolded.
-    def walk_once(obj, seen=None):  # pyavb's walk_references, each object once
-        seen = set() if seen is None else seen
-        if hasattr(obj, 'class_id') and obj.class_id:
-            if id(obj) in seen:
-                return
-            seen.add(id(obj))
-        if isinstance(obj, list):
-            values = obj
-        elif isinstance(obj, dict):
-            values = obj.values()
-        else:
-            values = obj.property_data.values() if hasattr(obj, 'property_data') else []
-        for v in values:
-            if isinstance(v, avb.utils.AVBObjectRef):
-                v = v.value
-            if v is None:
-                continue
-            if isinstance(v, list):
-                for item in v:
-                    yield from walk_once(item, seen)
-            if hasattr(v, 'class_id') and v.class_id:
-                yield from walk_once(v, seen)
-        if hasattr(obj, 'class_id') and obj.class_id:
-            yield obj
     avb.file.walk_references = walk_once
     with avb.open() as f:
         comp = f.create.Composition(mob_type='CompositionMob')
@@ -13513,9 +13570,47 @@ def bomb(path):
         f.content.add_mob(comp)
         f.write(path)
 
+def flood(path):
+    # Copies that are few but large: a locator list of 30000 (one marker named again and again) in each of 2000
+    # attribute lists, and a megabyte of bytes named 1000 times in a list named 300 times.
+    avb.file.walk_references = walk_once
+    with avb.open() as f:
+        comp = f.create.Composition(mob_type='CompositionMob')
+        comp.name = 'Flood'
+        marker = f.create.Marker()
+        marker.mob_id = comp.mob_id
+        marker.position = 0
+        marker.comp_offset = 1
+        marker.color = [65535, 0, 0]
+        marker.attributes = f.create.Attributes()
+        marker.attributes['_ATN_CRM_COM'] = 'again'
+        crumbs = f.create.TimeCrumbList()
+        for i in range(30000):
+            crumbs.append(marker)
+        lists = f.create.Attributes()
+        for i in range(2000):
+            a = f.create.Attributes()
+            a['_TMP_CRM'] = crumbs
+            lists['l%d' % i] = a
+        text = f.create.Attributes()
+        text['blob'] = bytearray(1000000)
+        once = f.create.Attributes()
+        for i in range(1000):
+            once['t%d' % i] = text
+        many = f.create.Attributes()
+        for i in range(300):
+            many['o%d' % i] = once
+        comp.attributes['_USER'] = lists
+        comp.attributes['many'] = many
+        comp.length = 1
+        f.content.add_mob(comp)
+        f.write(path)
+
 if __name__ == '__main__':
     if sys.argv[1] == 'bomb':
         bomb(sys.argv[2])
+    elif sys.argv[1] == 'flood':
+        flood(sys.argv[2])
     elif sys.argv[1] == 'dump':
         dump(sys.argv[2])
     elif sys.argv[1] == 'rewrite':
@@ -13797,6 +13892,17 @@ if __name__ == '__main__':
         Project bombed = makeDefaultProject();
         const AvidBinImport bi = importAvidBin(bombed, bombPath);
         QVERIFY(std::find(bi.warnings.begin(), bi.warnings.end(), "A sequence too large to bring in whole was cut short") != bi.warnings.end());
+        QVERIFY2(quick.elapsed() < 20000, qPrintable(QString::number(quick.elapsed())));
+
+        // Few copies but large ones (60 million locators, 300 GB of text unfolded): cut short too, quickly.
+        const std::string floodPath = path("flood.avb");
+        const QByteArray floodWritten = pyavb({"flood", QString::fromStdString(floodPath)});
+        QVERIFY2(floodWritten.isEmpty(), floodWritten.constData());
+        quick.restart();
+        AvidBin flood;
+        QVERIFY2(readAvidBin(floodPath, flood, &err), err.c_str());
+        QVERIFY(std::any_of(flood.issues.begin(), flood.issues.end(), [](const std::string& i) { return i.find("too many attributes") != std::string::npos; }));
+        QCOMPARE(flood.mobs.size(), size_t(1));
         QVERIFY2(quick.elapsed() < 20000, qPrintable(QString::number(quick.elapsed())));
     }
 
@@ -27338,7 +27444,7 @@ private:
 
     // Copies a video into a new file whose packets from `gapAt` on come a frame later (a frame missing from its times)
     // and whose packet `corruptAt` has the middle of its bytes overwritten, as a broken transfer leaves them.
-    void remuxDamaged(const std::string& in, const std::string& out, int gapAt, int corruptAt) {
+    void remuxDamaged(const std::string& in, const std::string& out, std::vector<int> gapsAt, int corruptAt) {
         AVFormatContext* src = nullptr;
         QVERIFY(avformat_open_input(&src, in.c_str(), nullptr, nullptr) >= 0);
         QVERIFY(avformat_find_stream_info(src, nullptr) >= 0);
@@ -27355,8 +27461,8 @@ private:
         for (int i = 0; av_read_frame(src, pkt) >= 0; av_packet_unref(pkt)) {
             if (pkt->stream_index != 0) continue;
             av_packet_rescale_ts(pkt, src->streams[0]->time_base, v->time_base);
-            if (i >= gapAt) {
-                const int64_t step = av_rescale_q(1, av_inv_q(src->streams[0]->avg_frame_rate), v->time_base);
+            if (const int64_t gaps = std::count_if(gapsAt.begin(), gapsAt.end(), [&](int g) { return i >= g; })) {
+                const int64_t step = av_rescale_q(gaps, av_inv_q(src->streams[0]->avg_frame_rate), v->time_base);
                 pkt->pts += step, pkt->dts += step;
             }
             if (i == corruptAt) {
@@ -31109,13 +31215,21 @@ private slots:
         // the decoder reports or drops, in a file of keyframes.
         const std::string intra = path("repair-intra.mp4"), broken = path("repair-broken.mp4");
         writeFrames(intra, clean, 25, 0, 1);
-        remuxDamaged(intra, broken, 12, 20);
+        remuxDamaged(intra, broken, {12}, 20);
         std::map<int64_t, FrameDamage> gaps;
         for (const DamagedFrame& d : findDamagedFrames(broken, 0, -1, {}, nullptr, &err)) gaps[d.frame] = d.kind;
         QVERIFY2(err.empty(), err.c_str());
         // (The broken frame is reported by the decoder, or dropped by it and so shown as a repeat, by FFmpeg's version.)
         const bool broken21 = gaps.count(21) && (gaps.at(21) == FrameDamage::Decode || gaps.at(21) == FrameDamage::Missing);
         QVERIFY2(gaps.size() == 2 && gaps.count(12) && gaps.at(12) == FrameDamage::Missing && broken21, damagedFramesToString(gaps).c_str());
+
+        // Three frames lost in a short clip: all three found (not taken for the file's own timing).
+        const std::string lost = path("repair-lost.mp4");
+        remuxDamaged(intra, lost, {6, 12, 18}, -1);
+        std::map<int64_t, FrameDamage> three;
+        for (const DamagedFrame& d : findDamagedFrames(lost, 0, -1, {}, nullptr, &err)) three[d.frame] = d.kind;
+        const std::map<int64_t, FrameDamage> wantThree = {{6, FrameDamage::Missing}, {13, FrameDamage::Missing}, {20, FrameDamage::Missing}};
+        QVERIFY2(three == wantThree, damagedFramesToString(three).c_str());
     }
 };
 

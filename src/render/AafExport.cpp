@@ -316,7 +316,9 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
         for (const Clip& c : t.clips) {
             const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
             if (!c.enabled || !m || (!m->hasAudio && m->kind != MediaKind::Sequence)) continue;
-            const bool render = m->kind == MediaKind::Sequence || std::fabs(c.speed - 1) > 1e-9 || c.reverse || c.ramped();
+            // (rendered too: a sound placed to the sample, whose partial first and last frames the AAF's frame-rate
+            // timeline cannot say are silent)
+            const bool render = m->kind == MediaKind::Sequence || std::fabs(c.speed - 1) > 1e-9 || c.reverse || c.ramped() || c.head > 0 || c.tail > 0;
             const std::string key = render ? "clip:" + std::to_string(c.id) : audioKey(m->path, c.channels);
             sourceOf[c.id] = key;
             Source& s = sources[key];

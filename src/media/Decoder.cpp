@@ -608,7 +608,7 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         if (hi.gainMap) {
             m.gainMap = true;
             if (in.empty()) m.path = gainMapPath(path, true), in.gainMap = true;
-            if (in.gainMap) m.colorSpace = "rec2100pq", m.maxCll = hi.hdrMaxCll, m.maxFall = hi.hdrMaxFall;
+            if (in.gainMap) m.colorSpace = "rec2100pq", m.maxCll = hi.hdrMaxCll, m.maxFall = hi.hdrMaxFall, m.width = hi.hdrWidth, m.height = hi.hdrHeight;
         }
         out = m;
         return true;
@@ -710,6 +710,9 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         if (streamRotation(st) % 180 != 0) std::swap(w, h);
         m.width = std::max(1, w);
         m.height = h;
+        // (A gain map's HDR rendition is shown at its tone-mapped item's size: readHeifStill.)
+        if (HeifStillInfo hi; in.gainMap && m.gainMap && st->codecpar->codec_id == AV_CODEC_ID_AV1 && readHeifStill(file, hi) && hi.hdrWidth > 0)
+            m.width = hi.hdrWidth, m.height = hi.hdrHeight;
         AVRational fr = av_guess_frame_rate(fmt, st, nullptr);
         if (fr.num > 0 && fr.den > 0) m.fps = Rational{fr.num, fr.den};
         // Conformed: each frame shown for 1 / the new rate, and the start timecode still names the same frame.

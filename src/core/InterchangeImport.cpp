@@ -388,10 +388,24 @@ struct OtioReader {
                         const double avail = rtValue(ref.value("available_range").toObject().value("duration"), rate);
                         const Id mid = b.media(path.toStdString(), ref.value("name").toString().toStdString(), video, !video,
                                                avail > 0 ? avail / rate : (srcStart + dur * std::fabs(scalar)) / rate);
-                        clip = b.addClip(kind, index, mid, start, len, sourceIn, name);
+                        // Sound placed to the sample (times in fractions of a frame): whole frames round it, the silent
+                        // parts of its first and last frames its head and tail.
+                        FrameTime at = start, frames = len;
+                        double head = 0, tail = 0, in = sourceIn;
+                        // (Within half a sample of a frame, on it: times written at a sample rate and rounded.)
+                        if (const double near = 0.5 * rate / 48000; !video && dur > 0) {
+                            const double first = std::floor(cursor + near), last = std::ceil(cursor + dur - near);
+                            if (cursor - first > near || last - (cursor + dur) > near) {
+                                head = cursor - first, tail = last - (cursor + dur);
+                                at = FrameTime(first), frames = FrameTime(last - first);
+                                in -= (scalar < 0 ? tail : head) * std::fabs(scalar);
+                            }
+                        }
+                        clip = b.addClip(kind, index, mid, at, frames, in, name);
                         if (clip) {
                             clip->speed = std::max(0.01, std::fabs(scalar));
                             clip->reverse = scalar < 0;
+                            clip->head = std::clamp(head, 0.0, 1.0), clip->tail = std::clamp(tail, 0.0, 1.0);
                             // Our sequence rate may differ from the media's rate in source_range units: both are `rate` here.
                         }
                     }

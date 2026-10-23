@@ -1082,7 +1082,7 @@ bool writeGainMapStill(bool hevc, const Image& sdr, const ColorSpace& sdrSpace, 
     }
     if (seen.isNull() || seen.width() != W || seen.height() != H) return fail("Cannot read back the picture: " + why);
     GainMapMetadata meta;
-    std::vector<float> target;
+    std::vector<uint16_t> target;
     if (!planGainMap(seen, sdrSpace.primaries, hdr, hdrSpace, meta, target)) return fail("Nothing to write");
     // The map in 8 bits: in AV1, R, G and B as they are (identity matrix) where the encoder takes them, else Y'CbCr
     // 4:4:4, else 4:2:0 (SVT-AV1's only one); in HEVC, Y'CbCr 4:2:0 (Main profile, which every HEVC decoder takes). (Each

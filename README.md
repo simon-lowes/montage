@@ -439,6 +439,7 @@ CMake options:
 - `-DMONTAGE_REQUIRE_ONNXRUNTIME=ON` stops the configure step if ONNX Runtime is missing (release builds use it).
 - `-DMONTAGE_WITH_LIBRAW=OFF` leaves out camera RAW stills (LibRaw 0.20+, LGPL-2.1 or CDDL-1.0, linked as a shared library when installed).
 - `-DMONTAGE_WITH_THORVG=OFF` leaves out Lottie and SVG import (ThorVG 1.1.2, MIT, is fetched and compiled at configure time).
+- `-DMONTAGE_SYSTEM_SQLITE=ON` uses the system's SQLite (built with FTS5, as distributions' are) for the sound library instead of downloading the amalgamation; the system's is also used when the download fails.
 
 The object mask, speaker and visual search tests need their models: `scripts/fetch-models.sh ~/montage-models`, then set `MONTAGE_OBJECT_MODEL=~/montage-models/edgetam-video`, `MONTAGE_SPEAKER_MODEL=~/montage-models/speakers` and `MONTAGE_VISUAL_MODEL=~/montage-models/clip-vit-b32`; the people tests `MONTAGE_FACE_MODEL=~/montage-models/faces`, the depth tests `MONTAGE_DEPTH_MODEL=~/montage-models/depth`, the slow-motion tests `MONTAGE_RIFE_MODEL=~/montage-models/rife`, the background removal tests `MONTAGE_MATTE_MODEL=~/montage-models/matte`, the speech tests `MONTAGE_TTS_MODEL=~/montage-models/tts`, the object removal tests `MONTAGE_INPAINT_MODEL=~/montage-models/inpaint` (the app reads the same variables). The speech tests read `MONTAGE_TEST_WHISPER_MODEL`.
 

@@ -67,6 +67,7 @@ struct HeifStillInfo {
     double maxCll = 0, maxFall = 0;
     bool gainMap = false;
     double hdrMaxCll = 0, hdrMaxFall = 0;  // (the gain map's HDR rendition's, from its tone-mapped item)
+    int hdrWidth = 0, hdrHeight = 0;       // its size as shown (its tone-mapped item cropped and turned)
 };
 bool readHeifStill(const std::string& path, HeifStillInfo& out);
 
@@ -91,13 +92,13 @@ struct AvifCodedItem {
 };
 bool readHeifCodedItem(const std::string& path, AvifCodedItem& out);
 
-// For the writers: the map's metadata and target codes (0-255, three a pixel) for an HDR picture over a base as decoders
+// For the writers: the map's metadata and target codes (0-255 in 256ths, three a pixel) for an HDR picture over a base as decoders
 // see it (`seen`, 8-bit sRGB-curve code values in `basePrimaries`); the map encoded with what a decoder reads back of
 // each attempt (`roundTrip` encodes `map` and decodes it into `back`) fed back into the codes, the closest kept; and
 // ISO 21496-1's metadata block.
 bool planGainMap(const QImage& seen, Primaries basePrimaries, const Image& hdr, const ColorSpace& hdrSpace, GainMapMetadata& meta,
-                 std::vector<float>& target);
-QByteArray encodeGainMap(const std::vector<float>& target, int width, int height,
+                 std::vector<uint16_t>& target);
+QByteArray encodeGainMap(const std::vector<uint16_t>& target, int width, int height,
                          const std::function<QByteArray(const QImage& map, QImage& back)>& roundTrip);
 QByteArray isoGainMapMetadata(const GainMapMetadata& m);
 // Adobe's gain map properties (hdrgm) as an XMP packet, for one set of channels.

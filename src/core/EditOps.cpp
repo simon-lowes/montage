@@ -810,6 +810,9 @@ FrameTime clampTrim(const Project& p, const Sequence& s, const Track& t, size_t 
 }
 
 void applyTrim(Clip& c, Edge edge, FrameTime delta, TrimMode mode) {
+    // A trimmed edge lands on a frame: the sound placed to the sample there (head or tail) no longer applies, as when
+    // a clip is split.
+    if (delta != 0) (edge == Edge::Out ? c.tail : c.head) = 0;
     if (edge == Edge::Out) {
         if (c.reverse) c.sourceIn -= double(delta) * c.speed;
         c.duration += delta;

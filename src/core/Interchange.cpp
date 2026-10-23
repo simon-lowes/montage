@@ -272,11 +272,16 @@ QJsonObject trackJson(const Project& p, const Sequence& s, const Track& t, int d
     o["kind"] = t.kind == TrackKind::Video ? "Video" : "Audio";
     o["source_range"] = QJsonValue();
     QJsonArray children;
-    FrameTime cursor = 0;
+    double cursor = 0;
     for (const Clip& c : t.clips) {
-        if (c.start > cursor) {
+        // Sound placed to the sample: the silent parts of its first and last frames (head, tail) left to the gaps
+        // round it, in fractions of a frame (OTIO's times need not be whole). (A nested sequence keeps whole frames.)
+        QJsonObject clip = clipJson(p, s, c, t.kind, depth);
+        const bool placed = t.kind == TrackKind::Audio && !c.isGenerator() && (c.head > 0 || c.tail > 0) && clip.contains("media_references");
+        const double head = placed ? c.head : 0, tail = placed ? c.tail : 0;
+        if (double(c.start) + head > cursor + 1e-9) {
             QJsonObject gap = item("Gap.1", "");
-            gap["source_range"] = range(0, double(c.start - cursor), rate);
+            gap["source_range"] = range(0, double(c.start) + head - cursor, rate);
             children.append(gap);
         }
         // A transition into this clip sits between it and the previous item.
@@ -289,8 +294,12 @@ QJsonObject trackJson(const Project& p, const Sequence& s, const Track& t, int d
                                         {"transition_type", type}, {"in_offset", rt(double(c.start - from), rate)},
                                         {"out_offset", rt(double(to - c.start), rate)}, {"metadata", QJsonObject()}});
         }
-        children.append(clipJson(p, s, c, t.kind, depth));
-        cursor = c.end();
+        if (placed) {
+            const double from = c.reverse ? c.sourceIn + c.sourceExtent() - head * c.speed : c.sourceIn + head * c.speed;
+            clip["source_range"] = range(from, double(c.duration) - head - tail, rate);
+        }
+        children.append(clip);
+        cursor = double(c.end()) - tail;
     }
     o["children"] = children;
     return o;

@@ -557,12 +557,19 @@ void lowpassZeroPhase(std::vector<double>& x, double fc, double q, int rate) {
     run(x.rbegin(), x.rend());
 }
 
-// The low band of a signal: 4th-order Butterworth at `fc`, forwards and backwards.
-std::vector<double> lowBand(const std::vector<double>& x, double fc, int rate) {
-    std::vector<double> lo = x;
-    lowpassZeroPhase(lo, fc, 0.5412, rate);
-    lowpassZeroPhase(lo, fc, 1.3066, rate);
-    return lo;
+// The low band of samples [from, to) of a signal of n samples (sample i: at(i)): 4th-order Butterworth at `fc`,
+// forwards and backwards, worked out over a stretch either side too. The filters' response dies away well within it
+// (their slowest pole's time constant is about 0.42 / fc seconds; the stretch is 40 / fc, about a hundred of them), so
+// parts worked out apart join as the whole would, and a long recording needs only a part's memory at a time.
+template <class At>
+std::vector<double> lowBand(At at, int64_t n, int64_t from, int64_t to, double fc, int rate) {
+    const int64_t margin = int64_t(std::ceil(40.0 / fc * rate));
+    const int64_t a = std::max<int64_t>(0, from - margin), b = std::min(n, to + margin);
+    std::vector<double> x(static_cast<size_t>(b - a));
+    for (int64_t i = a; i < b; ++i) x[size_t(i - a)] = at(i);
+    lowpassZeroPhase(x, fc, 0.5412, rate);
+    lowpassZeroPhase(x, fc, 1.3066, rate);
+    return std::vector<double>(x.begin() + (from - a), x.begin() + (to - a));
 }
 
 }  // namespace
@@ -580,16 +587,21 @@ void deplosive(const AudioBuffer& in, AudioBuffer& out, double sensitivity, doub
     // Levels every 5 ms (dB) of the channels' mix: its low band (the plosive's, split off without phase shift), the
     // rest, and the low band's usual level around (median over a second).
     const int64_t frames = n / hop;
+    const int64_t chunk = hop * std::max<int64_t>(1, 10 * rate / hop);  // ten seconds at a time
     std::vector<double> eLo(static_cast<size_t>(frames)), eHi(static_cast<size_t>(frames));
-    {
-        std::vector<double> mono(static_cast<size_t>(n), 0.0);
-        for (int64_t i = 0; i < n; ++i)
-            for (int c = 0; c < nch; ++c) mono[size_t(i)] += in.samples[size_t(i) * size_t(nch) + size_t(c)] / double(nch);
-        const std::vector<double> monoLo = lowBand(mono, kSplit, rate);
-        for (int64_t f = 0; f < frames; ++f) {
+    auto mono = [&](int64_t i) {
+        double v = 0;
+        for (int c = 0; c < nch; ++c) v += in.samples[size_t(i) * size_t(nch) + size_t(c)] / double(nch);
+        return v;
+    };
+    for (int64_t s = 0; s < frames * hop; s += chunk) {
+        if (cancelled(cancel)) return;
+        const int64_t e = std::min(frames * hop, s + chunk);
+        const std::vector<double> monoLo = lowBand(mono, n, s, e, kSplit, rate);
+        for (int64_t f = s / hop; f < e / hop; ++f) {
             double a = 0, b = 0;
             for (int64_t i = f * hop; i < (f + 1) * hop; ++i) {
-                const double l = monoLo[size_t(i)], h = mono[size_t(i)] - l;
+                const double l = monoLo[size_t(i - s)], h = mono(i) - l;
                 a += l * l, b += h * h;
             }
             eLo[size_t(f)] = 10 * std::log10(a / double(hop) + 1e-12);
@@ -635,16 +647,22 @@ void deplosive(const AudioBuffer& in, AudioBuffer& out, double sensitivity, doub
         const double db = cutDb[size_t(f0)] * (1 - t) + cutDb[size_t(f1)] * t;
         return db > 0 ? std::pow(10.0, -db / 20) : 1.0;
     };
-    for (int c = 0; c < nch; ++c) {
-        if (cancelled(cancel)) {
-            out = in;
-            return;
+    // (Only the parts with a cut in them: most of a recording has none.)
+    for (int64_t s = 0; s < n; s += chunk) {
+        const int64_t e = std::min(n, s + chunk);
+        bool any = false;
+        for (int64_t f = std::max<int64_t>(0, s / hop - 1); f <= std::min(frames - 1, e / hop + 1) && !any; ++f) any = cutDb[size_t(f)] > 0;
+        if (!any) continue;
+        for (int c = 0; c < nch; ++c) {
+            if (cancelled(cancel)) {
+                out = in;
+                return;
+            }
+            const std::vector<double> lo =
+                lowBand([&](int64_t i) { return double(in.samples[size_t(i) * size_t(nch) + size_t(c)]); }, n, s, e, kSplit, rate);
+            for (int64_t i = s; i < e; ++i)
+                if (const double k = keep(i); k < 1) out.samples[size_t(i) * size_t(nch) + size_t(c)] -= float((1 - k) * lo[size_t(i - s)]);
         }
-        std::vector<double> x(static_cast<size_t>(n));
-        for (int64_t i = 0; i < n; ++i) x[size_t(i)] = in.samples[size_t(i) * size_t(nch) + size_t(c)];
-        const std::vector<double> lo = lowBand(x, kSplit, rate);
-        for (int64_t i = 0; i < n; ++i)
-            if (const double k = keep(i); k < 1) out.samples[size_t(i) * size_t(nch) + size_t(c)] -= float((1 - k) * lo[size_t(i)]);
     }
     if (found) *found = count;
 }
@@ -690,8 +708,19 @@ void dewind(const AudioBuffer& in, AudioBuffer& out, double amount, double maxRe
     std::vector<std::vector<std::complex<double>>> spec(static_cast<size_t>(used), std::vector<std::complex<double>>(size_t(N)));
     std::vector<double> sLL(size_t(top) + 1, 0.0), sRR(size_t(top) + 1, 0.0), ref(size_t(top) + 1, 0.0);
     std::vector<std::complex<double>> sLR(size_t(top) + 1);
-    // What is taken away from each channel, overlap-added: the rest of the sound stays exactly as it was.
-    std::vector<std::vector<double>> removed(static_cast<size_t>(std::min(nch, 2)), std::vector<double>(static_cast<size_t>(n) + size_t(N), 0.0));
+    // What is taken away from each channel, overlap-added: the rest of the sound stays exactly as it was. Only the
+    // frame's span is still being added to (the samples before it are done, and taken from the output as it moves on),
+    // so it is kept in a ring that long.
+    std::vector<std::vector<double>> removed(static_cast<size_t>(std::min(nch, 2)), std::vector<double>(size_t(N), 0.0));
+    int64_t done = 0;  // samples taken from the output so far
+    auto finish = [&](int64_t upTo) {
+        for (; done < std::min(n, upTo); ++done)
+            for (int c : outs) {
+                double& r = removed[size_t(c)][size_t(done % N)];
+                out.samples[size_t(done) * size_t(nch) + size_t(c)] -= float(r);
+                r = 0;
+            }
+    };
     const double smooth = 0.75;
     std::vector<std::complex<double>> buf(static_cast<size_t>(N));
     const int64_t frames = (n + N / 2) / hop + 1;
@@ -787,12 +816,12 @@ void dewind(const AudioBuffer& in, AudioBuffer& out, double amount, double maxRe
             auto& rem = removed[size_t(c)];
             for (int i = 0; i < N; ++i) {
                 const int64_t t = centre - N / 2 + i;
-                if (t >= 0 && t < n) rem[size_t(t)] += buf[size_t(i)].real() * win[size_t(i)] * scale;
+                if (t >= 0 && t < n) rem[size_t(t % N)] += buf[size_t(i)].real() * win[size_t(i)] * scale;
             }
         }
+        finish(centre + hop - N / 2);  // (the next frame starts there)
     }
-    for (int c : outs)
-        for (int64_t i = 0; i < n; ++i) out.samples[size_t(i) * size_t(nch) + size_t(c)] -= float(removed[size_t(c)][size_t(i)]);
+    finish(n);
 }
 
 }  // namespace montage
