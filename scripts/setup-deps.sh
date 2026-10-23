@@ -18,16 +18,18 @@ install_packages() {
   echo "$(date -u +%T) apt-get install"
   # (each download listed, so a log shows which one stalls; a mirror that trickles rather than stalls passes apt's own
   # timeouts, so the whole install is given a limit)
-  $SUDO env DEBIAN_FRONTEND=noninteractive timeout 360 apt-get "${APT_OPTS[@]}" install -y -q -o Dpkg::Use-Pty=0 "${PACKAGES[@]}" |
+  $SUDO env DEBIAN_FRONTEND=noninteractive timeout "$1" apt-get "${APT_OPTS[@]}" install -y -q -o Dpkg::Use-Pty=0 "${PACKAGES[@]}" |
     { grep --line-buffered -E '^(Get:|Fetched|Err:|E:|W:)' || true; }
   return "${PIPESTATUS[0]}"
 }
-if ! install_packages; then
-  # A slow mirror: a cloud runner's own is swapped for Ubuntu's main archive, and the install tried again.
-  echo "$(date -u +%T) apt-get install did not finish; trying again"
-  $SUDO sed -i 's#://azure\.archive\.ubuntu\.com/#://archive.ubuntu.com/#g' /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
+if ! install_packages 240; then
+  # A slow mirror: a cloud runner's own (named directly, or through its mirror list) is swapped for Ubuntu's main
+  # archive, and the install tried again, keeping what was already downloaded.
+  echo "$(date -u +%T) apt-get install did not finish; trying again from archive.ubuntu.com"
+  $SUDO sed -i -e 's#mirror+file:/etc/apt/apt-mirrors\.txt#http://archive.ubuntu.com/ubuntu/#g' \
+    -e 's#://azure\.archive\.ubuntu\.com/#://archive.ubuntu.com/#g' /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null || true
   $SUDO dpkg --configure -a || true
-  install_packages
+  install_packages 480
 fi
 # ONNX Runtime (object masks): Ubuntu does not package it, so Microsoft's
 # release archive goes to /opt/onnxruntime, where CMake looks for it.

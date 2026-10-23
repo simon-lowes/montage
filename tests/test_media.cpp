@@ -1460,7 +1460,8 @@ private slots:
         QVERIFY(std::fabs(m.duration - 2.0) < 0.05);
         QVERIFY(std::fabs(m.timecode - (36000.0 + first / 25.0)) < 1e-6);
         QVERIFY(m.hasAudio && m.channels == 2 && m.sampleRate == 48000);
-        // Every picture, in order: the right one at each frame (its blue), and the picture itself close to what was sent.
+        // Every picture, in order: the right one at each frame (its blue, nearer it than the next frame's: VMX and
+        // ProRes are both lossy: about 0.005 here, 0.01 on Apple silicon), and the picture itself close to what was sent.
         VideoDecoder dec;
         QVERIFY(dec.open(cs.path));
         for (int k : {0, 1, 2, 3, 24, 25, 48, 49}) {
@@ -1468,8 +1469,8 @@ private slots:
             QVERIFY(f && f->width == W);
             const Image img = toImage(*f);
             const float blue = img.at(W / 2, H / 2)[2];
-            QVERIFY2(std::fabs(blue - (0.2f + 0.6f * float((first + k) % 25) / 24.0f)) < 0.006, qPrintable(QStringLiteral("frame %1: %2").arg(k).arg(blue)));
-            QVERIFY(std::fabs(img.at(W / 4, H / 4)[0] - (0.1f + 0.8f * 0.25f)) < 0.01);
+            QVERIFY2(std::fabs(blue - (0.2f + 0.6f * float((first + k) % 25) / 24.0f)) < 0.0125, qPrintable(QStringLiteral("frame %1: %2").arg(k).arg(blue)));
+            QVERIFY2(std::fabs(img.at(W / 4, H / 4)[0] - (0.1f + 0.8f * 0.25f)) < 0.015, qPrintable(QStringLiteral("frame %1: red %2").arg(k).arg(img.at(W / 4, H / 4)[0])));
         }
         // The sound placed to the sample: the recording's sample s is the source's sample (first frame's) + s.
         AudioBufferPtr heard = decodeAudio(cs.path, 48000, &err);

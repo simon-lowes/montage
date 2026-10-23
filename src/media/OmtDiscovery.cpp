@@ -482,14 +482,14 @@ bool browseDnsSd(double seconds, std::vector<Source>& out, std::string* why) {
     };
     struct Browse {
         std::vector<Found> found;
-        bool more = true;
+        DNSServiceErrorType err = kDNSServiceErr_NoError;
     } browse;
     DNSServiceRef ref = nullptr;
     DNSServiceErrorType e = DNSServiceBrowse(&ref, 0, 0, kServiceType, nullptr,
         [](DNSServiceRef, DNSServiceFlags flags, uint32_t iface, DNSServiceErrorType err, const char* name, const char* type, const char* domain, void* ctx) {
             auto* b = static_cast<Browse*>(ctx);
-            if (err == kDNSServiceErr_NoError && (flags & kDNSServiceFlagsAdd)) b->found.push_back({name, type, domain, iface});
-            b->more = (flags & kDNSServiceFlagsMoreComing) != 0;
+            if (err != kDNSServiceErr_NoError) b->err = err;
+            else if (flags & kDNSServiceFlagsAdd) b->found.push_back({name, type, domain, iface});
         },
         &browse);
     if (e != kDNSServiceErr_NoError) {
@@ -499,7 +499,15 @@ bool browseDnsSd(double seconds, std::vector<Source>& out, std::string* why) {
     // (results for a little while; the rest of the time to resolve them)
     processFor(ref, int(seconds * 500), [] { return false; });
     DNSServiceRefDeallocate(ref);
+    if (browse.err != kDNSServiceErr_NoError && browse.found.empty()) {
+        // (-65570: the system's local network privacy setting refuses this program)
+        if (why)
+            *why = browse.err == -65570 ? "DNS-SD browsing is not allowed (System Settings › Privacy & Security › Local Network)"
+                                        : "DNS-SD browsing failed (" + std::to_string(browse.err) + ")";
+        return false;
+    }
     std::map<std::string, Source> sources;
+    int unresolved = 0;
     for (const Found& f : browse.found) {
         if (sources.count(f.name)) continue;
         struct Resolved {
@@ -520,8 +528,10 @@ bool browseDnsSd(double seconds, std::vector<Source>& out, std::string* why) {
         processFor(rr, std::max(200, int(seconds * 500 / std::max<size_t>(1, browse.found.size()))), [&] { return r.done; });
         DNSServiceRefDeallocate(rr);
         if (r.port > 0 && !r.host.empty()) sources[f.name] = Source{f.name, r.host, r.port, "DNS-SD"};
+        else ++unresolved;
     }
     for (const auto& [n, s] : sources) out.push_back(s);
+    if (unresolved && why) *why = std::to_string(unresolved) + " source(s) found by DNS-SD could not be resolved";
     return true;
 }
 
@@ -844,7 +854,11 @@ std::vector<Source> discover(double seconds, std::string* why) {
     if (server.joinable()) server.join();
     for (const Source& s : dns) all[s.name] = s;
     for (const auto& [n, s] : fromServer) all[n] = s;
-    if (why) *why = dnsOk ? serverWhy : discoveryServer().empty() ? dnsWhy : serverWhy.empty() ? std::string() : dnsWhy + "; " + serverWhy;
+    // (what went wrong, when something did: DNS-SD's trouble matters less when a server answered)
+    if (why) {
+        const bool serverOk = !discoveryServer().empty() && serverWhy.empty();
+        *why = serverOk && !dnsOk ? std::string() : !dnsWhy.empty() && !serverWhy.empty() ? dnsWhy + "; " + serverWhy : dnsWhy + serverWhy;
+    }
     std::vector<Source> out;
     for (const auto& [n, s] : all) out.push_back(s);
     return out;
