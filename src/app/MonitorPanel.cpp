@@ -711,6 +711,7 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
     connect(viewer_, &ViewerWidget::displayMoved, this, hdrCalibration);
     connect(viewer_, &ViewerWidget::hdrChanged, this, [this, hdrCalibration] {
         hdrCalibration();
+        controller_->setHdrHeadroom(viewer_->hdrHeadroom());
         // HDR light is only rendered while it can be shown.
         controller_->setHdrOutput(viewer_->hdrViewer() && viewer_->hdrStatus().isEmpty());
         hdrBadge_->setVisible(viewer_->hdrShowing());

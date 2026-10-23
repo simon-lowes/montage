@@ -67,6 +67,9 @@ public:
     bool hdrOutput() const { return hdrOutput_; }
     // The calibration LUT of the display the HDR viewer is on (made for PQ BT.2020), applied to its pictures; null: none.
     void setHdrCalibration(std::shared_ptr<const Lut3D> lut, double sdrWhiteNits = 203);
+    // The HDR viewer's display's headroom (its peak over SDR white): pictures with adaptive HDR metadata are tone mapped
+    // to it as they are rendered.
+    void setHdrHeadroom(double headroom);
     // Draw the program frames on the GPU where it can (render/GpuCompositor.h; the rest on the CPU as before).
     void setGpuRendering(bool on);
     bool gpuRendering() const { return gpu_; }
@@ -169,6 +172,7 @@ private:
     bool hdrOutput_ = false;
     std::shared_ptr<const Lut3D> hdrCalibration_;
     double hdrWhite_ = 203;
+    double hdrHeadroom_ = 1;
     bool gpu_ = false;
     double speed_ = 0;
     bool loop_ = false;

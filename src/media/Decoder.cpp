@@ -48,6 +48,7 @@ extern "C" {
 }
 
 #include "HwAccel.h"
+#include "render/AdaptiveHdr.h"
 #include "render/ColorSpace.h"
 #include "render/HdrStill.h"
 #include "media/GainMap.h"
@@ -692,6 +693,11 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         } else if (HeifStillInfo hi; st->codecpar->codec_id == AV_CODEC_ID_AV1 && lowerExtension(file) == ".avif" && readHeifStill(file, hi)) {
             const double cll = in.gainMap ? hi.hdrMaxCll : hi.maxCll, fall = in.gainMap ? hi.hdrMaxFall : hi.maxFall;
             if (cll > 0) m.maxCll = cll, m.maxFall = fall;
+        }
+        // Adaptive HDR metadata (ST 2094-50) in HEVC SEI or AV1 metadata OBUs, scene by scene.
+        if (st->codecpar->codec_id == AV_CODEC_ID_HEVC || st->codecpar->codec_id == AV_CODEC_ID_AV1) {
+            std::vector<AdaptiveHdrScene> scenes;
+            if (readAdaptiveHdr(file, scenes)) m.adaptiveHdr = std::make_shared<const std::vector<AdaptiveHdrScene>>(std::move(scenes));
         }
         int w = st->codecpar->width, h = st->codecpar->height;
 #ifdef MONTAGE_PRORES_RAW

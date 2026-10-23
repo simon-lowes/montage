@@ -2,6 +2,7 @@ add_library(montage_engine STATIC
   core/Model.h core/Model.cpp
   core/MediaLog.h core/MediaLog.cpp
   core/Cdl.h core/Cdl.cpp
+  core/AdaptiveHdrMetadata.h core/AdaptiveHdrMetadata.cpp
   core/Ale.h core/Ale.cpp
   core/Ucs.h core/Ucs.cpp
   core/KeyframeEdit.h core/KeyframeEdit.cpp
@@ -178,6 +179,7 @@ add_library(montage_engine STATIC
   render/Letterbox.h render/Letterbox.cpp
   render/LightLevel.h render/LightLevel.cpp
   render/Hdr10Plus.h render/Hdr10Plus.cpp
+  render/AdaptiveHdr.h render/AdaptiveHdr.cpp
   control/Midi.h control/Midi.cpp
   control/MackieControl.h control/MackieControl.cpp
   control/Hui.h control/Hui.cpp

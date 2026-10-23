@@ -23,6 +23,7 @@
 #include <mutex>
 
 #include "core/Surround.h"
+#include "render/AdaptiveHdr.h"
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/HdrView.h"
@@ -54,6 +55,7 @@ public:
         bool gpu = false;  // drawn on the GPU where it can be (render/GpuCompositor.h)
         std::shared_ptr<const Lut3D> hdrCalibration;  // the HDR viewer's display's calibration (render/MonitorCalibration.h)
         double hdrWhite = 203;                         // the nits that display shows SDR white at
+        double hdrHeadroom = 1;                        // and its headroom (its peak over SDR white), for adaptive HDR metadata
     };
     void request(const Request& r) {
         {
@@ -142,7 +144,8 @@ private:
     bool sameContext(const Request& r) const {
         return r.project == ctx_.project && r.sequence == ctx_.sequence && r.scale == ctx_.scale && r.proxies == ctx_.proxies &&
                r.captions == ctx_.captions && r.stereoView == ctx_.stereoView && r.hdr == ctx_.hdr &&
-               r.trim == ctx_.trim && r.gpu == ctx_.gpu && r.hdrCalibration == ctx_.hdrCalibration && r.hdrWhite == ctx_.hdrWhite;
+               r.trim == ctx_.trim && r.gpu == ctx_.gpu && r.hdrCalibration == ctx_.hdrCalibration && r.hdrWhite == ctx_.hdrWhite &&
+               r.hdrHeadroom == ctx_.hdrHeadroom;
     }
 
     Rendered render(const Request& r, FrameTime t) {
@@ -194,10 +197,20 @@ private:
                 pic->height = img.height;
                 pic->contentPeak = hdrContentPeak(trimTargetSpace(*s, r.trim), trimTargetPeak(*s, r.trim));
                 hdrViewImage(img, trimTargetSpace(*s, r.trim), trimTargetPeak(*s, r.trim), pic->contentPeak, pic->rgba);  // (rolled off as drawn)
+                // The master's adaptive HDR metadata (render/AdaptiveHdr.h), while it matches the cut: tone mapped by its
+                // own curves to the display's headroom here, so the viewer has nothing left to roll off.
+                if (const AdaptiveHdr* md = r.trim.empty() ? storedAdaptiveHdrAt(r.project, *s, t) : nullptr;
+                    md && r.hdrHeadroom < pic->contentPeak) {
+                    adaptiveViewImage(pic->rgba, *md, r.hdrHeadroom);
+                    pic->contentPeak = std::max(1.0, r.hdrHeadroom);
+                }
                 if (r.hdrCalibration) calibrateHdrPicture(pic->rgba, pic->width, pic->height, *r.hdrCalibration, r.hdrWhite);
                 out.hdr = std::move(pic);
             }
-            convertColor(img, trimTargetSpace(*s, r.trim), rec709Space(), trimTargetPeak(*s, r.trim));
+            if (const AdaptiveHdr* md = r.trim.empty() ? storedAdaptiveHdrAt(r.project, *s, t) : nullptr)
+                convertColorAdaptive(img, trimTargetSpace(*s, r.trim), *md, rec709Space(), trimTargetPeak(*s, r.trim));  // (at no headroom)
+            else
+                convertColor(img, trimTargetSpace(*s, r.trim), rec709Space(), trimTargetPeak(*s, r.trim));
         }
         out.view = QImage(shown.width, shown.height, QImage::Format_RGBA8888);
         toRgba8(shown, out.view.bits(), size_t(out.view.bytesPerLine()));
@@ -664,6 +677,12 @@ void PlaybackController::setHdrCalibration(std::shared_ptr<const Lut3D> lut, dou
     if (hdrOutput_) requestFrame();
 }
 
+void PlaybackController::setHdrHeadroom(double headroom) {
+    if (hdrHeadroom_ == headroom) return;
+    hdrHeadroom_ = headroom;
+    if (hdrOutput_) requestFrame();
+}
+
 void PlaybackController::setGpuRendering(bool on) {
     if (gpu_ == on) return;
     gpu_ = on;
@@ -693,7 +712,7 @@ FrameTime PlaybackController::clampToSequence(FrameTime t) const { return std::m
 void PlaybackController::requestFrame() {
     if (!sequence()) return;
     // Paused frames render at full quality; playback uses the preview scale (a reference output its own).
-    worker_->request({project_, sequenceId_, position_, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_});
+    worker_->request({project_, sequenceId_, position_, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_, hdrHeadroom_});
 }
 
 void PlaybackController::seek(FrameTime t) {
@@ -880,7 +899,7 @@ void PlaybackController::tick() {
     }
     if (t != position_) {
         position_ = t;
-        worker_->request({project_, sequenceId_, t, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_});
+        worker_->request({project_, sequenceId_, t, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_, hdrHeadroom_});
         syncOutput();
         emit positionChanged(t);
     }

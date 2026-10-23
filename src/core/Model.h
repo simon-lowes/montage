@@ -122,6 +122,36 @@ struct Effect {
 
 enum class MediaKind { Video, Audio, Image, Sequence };
 
+// Adaptive HDR metadata (SMPTE ST 2094-50, core/AdaptiveHdrMetadata.h): the picture's HDR reference white and, when
+// given, how to tone map it to any display's headroom: gain curves for alternate renditions (an SDR one, a less bright
+// HDR one) that a display blends between by its own headroom. Headrooms are log2 of light over reference white.
+struct AdaptiveGainCurve {
+    // How a colour's components are mixed before the curve: red, green, blue, the brightest, the dimmest and each
+    // component itself, summing to 1 (the brightest alone by default: one gain for the whole colour, keeping its hue).
+    double mix[6] = {0, 0, 0, 1, 0, 0};
+    std::vector<double> x, y, m;  // control points: light (relative to reference white), log2 gain, slope
+    bool pchip = true;            // slopes worked out from the points (monotone cubic), not given
+    bool operator==(const AdaptiveGainCurve&) const = default;
+};
+struct AdaptiveHdr {
+    double referenceWhite = 203;  // cd/m² (BT.2408's by default)
+    bool toneMap = false;         // the gain curves below are given (else the display tone maps as it likes)
+    bool computed = false;        // with toneMap: the standard's own curves for `baseline`, worked out rather than sent
+    double baseline = 0;          // the picture's own headroom
+    int chromaMode = 2;           // gain application primaries: 0 Rec.709, 1 P3-D65, 2 Rec.2020, 3 `chroma`
+    double chroma[8] = {0.708, 0.292, 0.17, 0.797, 0.131, 0.046, 0.3127, 0.329};  // red, green, blue, white xy
+    std::vector<double> alternate;          // each alternate rendition's headroom, ascending (at most four)
+    std::vector<AdaptiveGainCurve> gains;   // its gain curve
+    bool operator==(const AdaptiveHdr&) const = default;
+};
+// The metadata over frames [start, end): a sequence's (measured for its exports) or a media file's (its own frames).
+struct AdaptiveHdrScene {
+    FrameTime start = 0, end = 0;
+    AdaptiveHdr md;
+    std::string key;  // (a sequence's) a fingerprint of the frames measured, as Hdr10PlusScene's
+    bool operator==(const AdaptiveHdrScene&) const = default;
+};
+
 // What a shot of the media shows, in words (render/FootageWords.h), for logging and search.
 struct ShotDescription {
     double start = 0, end = 0;  // media seconds
@@ -156,6 +186,9 @@ struct MediaItem {
     std::string colorSpace;     // detected from the file's colour tags (ColorSpace.h id), "" = Rec.709
     std::string colorOverride;  // Interpret Colour: the space to read it as, "" = as detected
     double maxCll = 0, maxFall = 0;  // HDR light levels the file states (CTA-861.3), nits; 0 = none stated
+    // Adaptive HDR metadata the video carries (ST 2094-50, render/AdaptiveHdr.h), scene by scene in its own frames;
+    // null = none. Shared: undo snapshots copy the pointer.
+    std::shared_ptr<const std::vector<AdaptiveHdrScene>> adaptiveHdr;
     bool gainMap = false;  // an SDR picture with a gain map (media/GainMap.h), read as its HDR rendition
     // 360° footage: "equirect" or "vr180" (the half in front; from the file's spherical metadata, or set by hand),
     // "" = a flat picture.
@@ -552,6 +585,7 @@ struct Sequence {
     double hdrPeakNits = 1000;          // mastering peak for HDR spaces
     double hdrMaxCll = 0, hdrMaxFall = 0;  // measured light levels (Analyse HDR Light Levels), nits; 0 = not measured
     std::vector<Hdr10PlusScene> hdr10Plus;  // HDR10+ metadata from the same analysis (PQ only), in time order
+    std::vector<AdaptiveHdrScene> adaptiveHdr;  // adaptive HDR metadata measured for exports (PQ, HLG), in time order
     std::vector<TemplateField> fields;      // published for the clips that play it: a graphics template's settings
     bool spherical = false;             // a 360° sequence (equirectangular): exports say so to players and YouTube
     bool vr180 = false;                 // with spherical: half the sphere in front (VR180), as stereo VR180 cameras shoot

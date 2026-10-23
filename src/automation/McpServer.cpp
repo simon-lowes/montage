@@ -45,6 +45,7 @@
 #include "render/BroadcastMxf.h"
 #include "render/LightLevel.h"
 #include "render/Hdr10Plus.h"
+#include "render/AdaptiveHdr.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
 #include "audio/DialogueAlign.h"
@@ -2781,7 +2782,9 @@ void McpServer::Impl::addTools() {
         "sequence so exports that state them before the first frame (x265, Matroska) use them; MP4 and MOV exports "
         "measure what they render anyway. Warns when MaxCLL is above the sequence's mastering peak. A PQ sequence's "
         "scenes for dynamic HDR metadata are measured in the same pass (each scene's brightest red, green and blue, average and spread, "
-        "as ST 2094-40 sends them) and kept too, for exports with `hdr10plus`.",
+        "as ST 2094-40 sends them) and kept too, for exports with `hdr10plus`. Any HDR sequence's scenes are also fitted for "
+        "adaptive HDR metadata (ST 2094-50: each scene's headroom and the gain curve to its SDR rendition, from its SDR "
+        "trim or Montage's own mapping), kept for exports with `adaptive_hdr` and shown by the HDR viewer.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"save":{"type":"boolean","default":true}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
@@ -2816,6 +2819,15 @@ void McpServer::Impl::addTools() {
                                               &err, {}, nullptr, nullptr, frame);
             }
             if (!measuredOk) return fail(QString::fromStdString(err));
+            // Adaptive HDR metadata over whole scenes too.
+            std::vector<AdaptiveHdrScene> adaptive;
+            {
+                FrameTime a0 = std::max<FrameTime>(0, from), b0 = to > a0 ? to : s.duration();
+                for (const AdaptiveHdrScene& sc : s.adaptiveHdr)
+                    if (sc.end > a0 && sc.start < b0) a0 = std::min(a0, sc.start), b0 = std::max(b0, sc.end);
+                if (!analyseAdaptiveHdr(l.project, s, a0, b0, sequenceColorSpace(s), std::clamp(s.hdrPeakNits, 100.0, 10000.0), adaptive, &err))
+                    return fail(QString::fromStdString(err));
+            }
             unsigned cll = 0, fall = 0;
             hdr10LightLevels(light, cll, fall);
             QJsonObject out{{"max_cll", int(cll)}, {"max_fall", int(fall)}, {"max_cll_at", tc(light.maxCllFrame, s)},
@@ -2835,9 +2847,16 @@ void McpServer::Impl::addTools() {
                 out["hdr10plus_scenes"] = list;
                 text += QStringLiteral("; dynamic HDR metadata: %1 scene(s)").arg(scenes.size());
             }
+            QJsonArray adaptiveList;
+            for (const AdaptiveHdrScene& sc : adaptive)
+                adaptiveList.append(QJsonObject{{"start", tc(sc.start, s)}, {"end", tc(sc.end, s)}, {"headroom", sc.md.baseline},
+                                                {"curve_points", sc.md.gains.empty() ? 0 : int(sc.md.gains[0].x.size())}});
+            out["adaptive_hdr_scenes"] = adaptiveList;
+            text += QStringLiteral("; adaptive HDR metadata: %1 scene(s)").arg(adaptive.size());
             if (a.value("save").toBool(true)) {
                 s.hdrMaxCll = cll, s.hdrMaxFall = fall;
                 if (pq) mergeHdr10PlusScenes(s.hdr10Plus, scenes);  // replacing those they overlap; others stay
+                mergeAdaptiveHdrScenes(s.adaptiveHdr, adaptive);
                 save(l);
             }
             return ok(text, out);
@@ -8864,6 +8883,7 @@ void McpServer::Impl::addTools() {
             "captions":{"type":"string","enum":["none","burn","embed","both"],"default":"none","description":"The visible caption track, burned into the picture and/or embedded as a subtitle stream"},
             "trim_target":{"type":"string","description":"A trim pass (montage_trim): deliver that target of the sequence (its space and peak, each shot's trim) instead of the master"},
             "hdr10plus":{"type":"boolean","default":false,"description":"PQ exports: dynamic HDR metadata (SMPTE ST 2094-40), scene by scene, in HEVC and AV1 video and as name.hdr10plus.json beside the file (measured first unless montage_measure_hdr's analysis still matches the cut)"},
+            "adaptive_hdr":{"type":"boolean","default":false,"description":"PQ and HLG exports: adaptive HDR metadata (SMPTE ST 2094-50) in HEVC and AV1 video, scene by scene: the reference white, the scene's headroom and the gain curve to its SDR rendition (the sequence's SDR trim, else Montage's own mapping), so any display tones it down as the grade did (fitted first unless montage_measure_hdr's analysis still matches)"},
             "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask): CEA-608 and CTA-708 service 1"},
             "cea708":{"type":"boolean","default":true,"description":"With cea608: the CTA-708 service beside the 608 bytes"},
             "all_captions":{"type":"boolean","default":false,"description":"With embed: every caption track as its own subtitle stream, language tagged"},
@@ -9014,6 +9034,7 @@ void McpServer::Impl::addTools() {
             st.cea608 = a.value("cea608").toBool();
             st.cea708 = a.value("cea708").toBool(true);
             st.hdr10Plus = a.value("hdr10plus").toBool();
+            st.adaptiveHdr = a.value("adaptive_hdr").toBool();
             st.trimTarget = str(a, "trim_target").toStdString();
             if (!st.trimTarget.empty() && !findTrimTarget(s, st.trimTarget))
                 throw ArgError{QStringLiteral("The sequence has no trim target \"%1\" (montage_trim lists them)").arg(str(a, "trim_target"))};
@@ -9087,6 +9108,12 @@ void McpServer::Impl::addTools() {
                 text += carriage == "video" ? QStringLiteral("\nDynamic HDR metadata (ST 2094-40) in the video, and beside it as .hdr10plus.json")
                         : carriage == "json" ? QStringLiteral("\nDynamic HDR metadata (ST 2094-40) beside it as .hdr10plus.json (this codec cannot carry it)")
                                              : QStringLiteral("\nNo dynamic HDR metadata: it is for PQ (HDR10) video");
+            }
+            if (st.adaptiveHdr) {
+                const bool carried = adaptiveHdrCarried(s, st);
+                o["adaptive_hdr"] = carried ? QStringLiteral("video") : QStringLiteral("none");
+                text += carried ? QStringLiteral("\nAdaptive HDR metadata (ST 2094-50) in the video")
+                                : QStringLiteral("\nNo adaptive HDR metadata: it is for PQ and HLG video in HEVC or AV1");
             }
             if (!st.credentialCertificate.empty()) {
                 // What the credentials say it was made with (core/Provenance.h).

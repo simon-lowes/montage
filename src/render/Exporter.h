@@ -96,6 +96,10 @@ struct ExportSettings {
     // while it still matches the cut, else before the render) and carried in HEVC and AV1 video on every frame; the
     // same goes beside the file as name.hdr10plus.json, for other codecs and for encoders and checks that read it.
     bool hdr10Plus = false;
+    // Adaptive HDR metadata (PQ and HLG exports, render/AdaptiveHdr.h): each scene's reference white, headroom and the
+    // gain curve to its SDR rendition (its SDR trim, else Montage's own mapping), carried in HEVC and AV1 video on every
+    // frame so displays of any headroom tone map it as the grade did.
+    bool adaptiveHdr = false;
     // Loudness normalisation: the mix is measured first (ITU-R BS.1770) and
     // brought to this integrated loudness, with a limiter holding peaks under
     // the ceiling. 0 = off; e.g. -14 LUFS for streaming, -23 for EBU R128.
@@ -232,6 +236,8 @@ bool containerCarriesStreams(const std::string& path);
 // Where an export's HDR10+ metadata goes: "video" (HEVC and AV1, with the JSON beside it), "json" (other codecs: the
 // JSON beside the file only), or "" when it has none (not PQ, EXR or GIF, no video).
 std::string hdr10PlusCarriage(const Sequence& seq, const ExportSettings& s);
+// Whether an export with these settings carries adaptive HDR metadata (PQ or HLG out, HEVC or AV1 video).
+bool adaptiveHdrCarried(const Sequence& seq, const ExportSettings& s);
 
 // HDR exports measure their light levels as they render (`light`, when given); PQ files to MP4 and MOV carry the
 // measured MaxCLL and MaxFALL. Encoders that state them before the first frame (x265) use the sequence's analysed

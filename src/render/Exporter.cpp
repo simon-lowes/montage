@@ -40,6 +40,7 @@
 #include "ColorSpace.h"
 #include "Compositor.h"
 #include "Hdr10Plus.h"
+#include "AdaptiveHdr.h"
 #include "HdrStill.h"
 #include "media/GainMap.h"
 #include "LightLevel.h"
@@ -898,6 +899,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     // HDR10+ (measured once everything is open, just before the frames, so a missing encoder fails first).
     const bool wantHdr10 = s.hdr10Plus && wantVideo && pq && !floatFrames;
     std::vector<Hdr10PlusScene> hdr10;
+    // Adaptive HDR metadata (ST 2094-50) likewise, for PQ and HLG.
+    const bool wantAdaptive = s.adaptiveHdr && wantVideo && outSpace.hdr() && !floatFrames;
+    std::vector<AdaptiveHdrScene> adaptive;
     double renderFrom = 0;  // where the render's share of the progress starts
     if (wantVideo) {
         std::string c = s.videoCodec;
@@ -1831,6 +1835,50 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             };
         }
     }
+    // Adaptive HDR metadata: each scene fitted from a few of its frames and their SDR renditions (the sequence's analysis
+    // where it still matches), as part of the progress; then a message on every frame of HEVC and AV1 video.
+    if (wantAdaptive) {
+        const double share = 0.1;
+        const double before = renderFrom;
+        renderFrom += share;
+        std::string e;
+        FrameTime toMeasure = 0;
+        const auto part = [&](double f) {
+            if (progress) progress(before + share * f, in);
+        };
+        // (Delivered at another rate: the programme is measured and its scenes put on the delivered frames.)
+        // (The pictures as graded, without burn-ins: the sequence's own analysis serves unless a trim pass is delivered.)
+        if (!adaptiveHdrForRange(p, seq, in, out, outSpace, peakNits, true, adaptive, &e, part, cancel,
+                                 trim && trimTargetSpace(seq, trim->id).hdr() ? trim : nullptr, &toMeasure))
+            return fail(cancel && cancel->load() ? std::string("Export cancelled") : "Adaptive HDR metadata analysis failed: " + e);
+        if (toMeasure == 0) renderFrom = before;
+        if (conv.active())
+            for (AdaptiveHdrScene& sc : adaptive) {
+                const double k = dseq.fpsValue() / seq.fpsValue();
+                sc.start = sc.start == in ? din : din + FrameTime(std::llround(double(sc.start - in) * k));
+                sc.end = sc.end == out ? dout : din + FrameTime(std::llround(double(sc.end - in) * k));
+            }
+        std::erase_if(adaptive, [](const AdaptiveHdrScene& sc) { return sc.end <= sc.start; });
+        if (!adaptive.empty() && o.vctx && (o.vctx->codec_id == AV_CODEC_ID_HEVC || o.vctx->codec_id == AV_CODEC_ID_AV1)) {
+            const bool av1 = o.vctx->codec_id == AV_CODEC_ID_AV1;
+            const int lengthSize = !av1 && o.vctx->extradata_size > 22 && o.vctx->extradata[0] == 1 ? (o.vctx->extradata[21] & 3) + 1 : 0;
+            auto messages = std::make_shared<std::vector<std::vector<uint8_t>>>();
+            for (const AdaptiveHdrScene& sc : adaptive) messages->push_back(adaptiveHdrT35(sc.md));
+            const auto scenes = std::make_shared<std::vector<AdaptiveHdrScene>>(adaptive);
+            const FrameTime first = din;
+            std::function<bool(AVPacket*)> before10 = o.videoPacket;  // (HDR10+'s, when both are carried)
+            o.videoPacket = [before10, scenes, messages, av1, lengthSize, first](AVPacket* pkt) {
+                if (before10 && !before10(pkt)) return false;
+                if (pkt->pts == AV_NOPTS_VALUE) return true;
+                const FrameTime f = first + pkt->pts;
+                const auto it = std::upper_bound(scenes->begin(), scenes->end(), f,
+                                                 [](FrameTime t, const AdaptiveHdrScene& sc) { return t < sc.end; });
+                if (it == scenes->end() || f < it->start) return true;
+                const auto& msg = (*messages)[size_t(it - scenes->begin())];
+                return av1 ? addHdr10PlusObu(pkt, msg) : addHdr10PlusSei(pkt, msg, lengthSize);
+            };
+        }
+    }
     // Pulldown's second fields: the frame they come from, in the encoder's format.
     AVFrame* secondField = nullptr;
     struct FreeFrame {
@@ -2067,6 +2115,15 @@ std::string hdr10PlusCarriage(const Sequence& seq, const ExportSettings& s) {
     const bool video = c == "libx265" || c == "hw_hevc" || c.rfind("hevc_", 0) == 0 || c == "libsvtav1" || c == "libaom-av1" ||
                        c == "librav1e" || c.rfind("av1_", 0) == 0;
     return video ? "video" : "json";
+}
+
+bool adaptiveHdrCarried(const Sequence& seq, const ExportSettings& s) {
+    const std::string& c = s.videoCodec;
+    if (c.empty() || c == "none" || c == "gif" || c == "exr") return false;
+    const ColorSpace* chosen = findTrimTarget(seq, s.trimTarget) ? &trimTargetSpace(seq, s.trimTarget) : findColorSpace(s.colorSpace);
+    const ColorSpace& out = chosen && !chosen->sceneReferred ? *chosen : sequenceColorSpace(seq);
+    return out.hdr() && (c == "libx265" || c == "hw_hevc" || c.rfind("hevc_", 0) == 0 || c == "libsvtav1" || c == "libaom-av1" ||
+                         c == "librav1e" || c.rfind("av1_", 0) == 0);
 }
 
 bool exportCodecCarries(const std::string& codecName, const std::string& layout) {

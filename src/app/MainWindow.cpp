@@ -214,6 +214,7 @@
 #include "render/Letterbox.h"
 #include "render/LightLevel.h"
 #include "render/Hdr10Plus.h"
+#include "render/AdaptiveHdr.h"
 #include "render/Versions.h"
 #include "media/MicBleed.h"
 #include "media/Sofa.h"
@@ -6041,13 +6042,14 @@ int MainWindow::queueTrimPasses(const QString& folder) {
     QDir().mkpath(folder);
     int queued = 0;
     for (const TrimTarget& t : s->trimTargets) {
-        // HDR as 10-bit HEVC with HDR10+ (PQ), SDR as H.264.
+        // HDR as 10-bit HEVC with HDR10+ (PQ) and adaptive HDR metadata, SDR as H.264.
         const bool hdr = trimTargetSpace(*s, t.id).hdr();
         const ExportPreset* preset = findExportPreset(hdr ? "H.265 / HEVC 10-bit" : "H.264 - High Quality");
         if (!preset) continue;
         ExportSettings st = preset->settings;
         st.trimTarget = t.id;
         st.hdr10Plus = trimTargetSpace(*s, t.id).transfer == Transfer::Pq;
+        st.adaptiveHdr = hdr;
         // (two targets of one name take their ids)
         const bool named = std::count_if(s->trimTargets.begin(), s->trimTargets.end(), [&](const TrimTarget& o) { return o.name == t.name; }) == 1;
         QString name = QString::fromStdString(s->name + " - " + (named ? t.name : t.id));
@@ -7697,9 +7699,18 @@ bool MainWindow::analyseHdrLightLevels(bool ask) {
     // PQ: HDR10+'s scenes measured in the same pass.
     const bool pq = sequenceColorSpace(s).transfer == Transfer::Pq;
     std::vector<Hdr10PlusScene> scenes;
+    std::vector<AdaptiveHdrScene> adaptive;  // and adaptive HDR metadata's, over whole scenes, after
     const FrameTime from = marked ? s.inPoint : 0, to = marked ? s.outPoint + 1 : 0;
+    const auto fitAdaptive = [&](const auto& progress, const auto* cancel, std::string* e) {
+        FrameTime a = std::max<FrameTime>(0, from), b = to > from ? to : s.duration();
+        for (const AdaptiveHdrScene& sc : s.adaptiveHdr)
+            if (sc.end > a && sc.start < b) a = std::min(a, sc.start), b = std::max(b, sc.end);
+        return analyseAdaptiveHdr(p, s, a, b, sequenceColorSpace(s), std::clamp(s.hdrPeakNits, 100.0, 10000.0), adaptive, e,
+                                  [&](double f) { progress(0.8 + 0.2 * f); }, cancel);
+    };
     if (!runWithProgress(this, state_, tr("Measuring light levels..."), [&](const auto& progress, const auto* cancel, std::string* e) {
-            if (!pq) return measureLightLevels(p, s, from, to, l, e, 1.0, [&](double f) { progress(f); }, cancel);
+            if (!pq)
+                return measureLightLevels(p, s, from, to, l, e, 1.0, [&](double f) { progress(0.8 * f); }, cancel) && fitAdaptive(progress, cancel, e);
             // HDR10+ over whole scenes (a stretch analysed again grows to the stored scenes it cuts into), the light
             // levels over what was asked.
             const FrameTime lo = from, hi = to > from ? to : s.duration();
@@ -7715,7 +7726,8 @@ bool MainWindow::analyseHdrLightLevels(bool ask) {
                 return img;
             };
             return analyseHdr10Plus(p, s, a, b, sequenceColorSpace(s), std::clamp(s.hdrPeakNits, 100.0, 10000.0), scenes, e,
-                                    [&](double f) { progress(f); }, cancel, nullptr, frame);
+                                    [&](double f) { progress(0.8 * f); }, cancel, nullptr, frame) &&
+                   fitAdaptive(progress, cancel, e);
         }))
         return false;
     unsigned cll = 0, fall = 0;
@@ -7723,6 +7735,7 @@ bool MainWindow::analyseHdrLightLevels(bool ask) {
     state_->apply(tr("Analyse HDR Light Levels"), [&](Project&, Sequence& sq) {
         sq.hdrMaxCll = cll, sq.hdrMaxFall = fall;
         if (pq) mergeHdr10PlusScenes(sq.hdr10Plus, scenes);  // replacing those they overlap; others stay
+        mergeAdaptiveHdrScenes(sq.adaptiveHdr, adaptive);
         return edit::Result{};
     });
     const QLocale loc;
@@ -7739,6 +7752,8 @@ bool MainWindow::analyseHdrLightLevels(bool ask) {
     QString more = tr("Saved with the sequence: HDR10 exports state them (MP4 and MOV also measure what they render).");
     if (pq)
         more += tr("\n\nDynamic HDR metadata (ST 2094-40): %n scene(s) measured, used by exports with it while the cut still matches them.", "", int(scenes.size()));
+    more += tr("\n\nAdaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, used by exports with it and by the HDR "
+               "viewer at the display's headroom while the cut still matches them.", "", int(adaptive.size()));
     if (sequenceColorSpace(s).transfer == Transfer::Pq && cll > s.hdrPeakNits + 0.5)
         more = tr("Brighter than the %1-nit mastering peak: highlights above it will be clipped or tone mapped by displays.\n\n")
                    .arg(loc.toString(qRound(s.hdrPeakNits))) + more;

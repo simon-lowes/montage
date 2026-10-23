@@ -338,13 +338,7 @@ namespace {
 void convertPixelWith(float rgb[3], const ColorSpace& from, const ColorSpace& to, double hdrPeakNits, const double m[9]) {
     // 1. Code values to linear light in the source primaries.
     double c[3];
-    for (int i = 0; i < 3; ++i) c[i] = toLinear(from.transfer, rgb[i]);
-    if (from.transfer == Transfer::Hlg) {
-        // HLG OOTF (1000-nit display, system gamma 1.2): scene light to display light.
-        const double ys = std::max(0.0, luminance2020(c[0], c[1], c[2]));
-        const double k = kHlgPeak * std::pow(ys, kHlgGamma - 1) / kSdrWhiteNits;
-        for (double& v : c) v *= k;
-    }
+    displayLight(from, rgb, c);
     // 2. Into the target primaries.
     double l[3];
     for (int r = 0; r < 3; ++r) l[r] = m[r * 3] * c[0] + m[r * 3 + 1] * c[1] + m[r * 3 + 2] * c[2];
@@ -376,18 +370,95 @@ void convertPixelWith(float rgb[3], const ColorSpace& from, const ColorSpace& to
         }
         for (double& v : l) v = std::min(v, peakRel);
     }
-    if (to.transfer == Transfer::Hlg) {
+    if (targetDisplay) {
+        encodeDisplayLight(to, l, rgb);
+        return;
+    }
+    for (int i = 0; i < 3; ++i) rgb[i] = float(fromLinear(to.transfer, l[i]));
+}
+}  // namespace
+
+void displayLight(const ColorSpace& space, const float rgb[3], double c[3]) {
+    for (int i = 0; i < 3; ++i) c[i] = toLinear(space.transfer, rgb[i]);
+    if (space.transfer == Transfer::Hlg) {
+        // HLG OOTF (1000-nit display, system gamma 1.2): scene light to display light.
+        const double ys = std::max(0.0, luminance2020(c[0], c[1], c[2]));
+        const double k = kHlgPeak * std::pow(ys, kHlgGamma - 1) / kSdrWhiteNits;
+        for (int i = 0; i < 3; ++i) c[i] *= k;
+    }
+}
+
+void encodeDisplayLight(const ColorSpace& space, const double light[3], float rgb[3]) {
+    double l[3] = {light[0], light[1], light[2]};
+    if (space.transfer == Transfer::Hlg) {
         // Inverse OOTF: display light back to scene light.
         const double yd = std::max(1e-12, luminance2020(l[0], l[1], l[2]) * kSdrWhiteNits / kHlgPeak);
         const double k = std::pow(yd, (1 - kHlgGamma) / kHlgGamma) * kSdrWhiteNits / kHlgPeak;
         for (double& v : l) v *= k;
     }
-    for (int i = 0; i < 3; ++i) {
-        const double e = fromLinear(to.transfer, l[i]);
-        rgb[i] = float(targetDisplay ? std::clamp(e, 0.0, 1.0) : e);
-    }
+    for (int i = 0; i < 3; ++i) rgb[i] = float(std::clamp(fromLinear(space.transfer, l[i]), 0.0, 1.0));
 }
-}  // namespace
+
+void chromaticitiesToXyz(const double xy[8], double m[9]) {
+    const Chroma c{xy[0], xy[1], xy[2], xy[3], xy[4], xy[5], xy[6], xy[7]};
+    double toXyz[9];
+    rgbToXyz(c, toXyz);
+    double adapt[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    if (std::fabs(c.wx - 0.3127) > 1e-6 || std::fabs(c.wy - 0.3290) > 1e-6) bradford(c.wx, c.wy, 0.3127, 0.3290, adapt);
+    mul3(adapt, toXyz, m);
+}
+
+void linearToLab(Primaries p, const double rgb[3], double lab[3]) {
+    double m[9];
+    primariesToXyz(p, m);
+    double xyz[3];
+    for (int r = 0; r < 3; ++r) xyz[r] = m[r * 3] * rgb[0] + m[r * 3 + 1] * rgb[1] + m[r * 3 + 2] * rgb[2];
+    const double white[3] = {m[0] + m[1] + m[2], m[3] + m[4] + m[5], m[6] + m[7] + m[8]};
+    auto f = [](double t) { return t > 216.0 / 24389 ? std::cbrt(t) : (24389.0 / 27 * t + 16) / 116; };
+    const double fx = f(xyz[0] / white[0]), fy = f(xyz[1] / white[1]), fz = f(xyz[2] / white[2]);
+    lab[0] = 116 * fy - 16;
+    lab[1] = 500 * (fx - fy);
+    lab[2] = 200 * (fy - fz);
+}
+
+double deltaE2000(const double a[3], const double b[3]) {
+    constexpr double kPi = 3.14159265358979323846, deg = kPi / 180;
+    const double c1 = std::hypot(a[1], a[2]), c2 = std::hypot(b[1], b[2]), cm = (c1 + c2) / 2;
+    const double g = 0.5 * (1 - std::sqrt(std::pow(cm, 7) / (std::pow(cm, 7) + std::pow(25.0, 7))));
+    const double a1 = a[1] * (1 + g), a2 = b[1] * (1 + g);
+    const double cp1 = std::hypot(a1, a[2]), cp2 = std::hypot(a2, b[2]);
+    auto hue = [&](double x, double y) {
+        if (x == 0 && y == 0) return 0.0;
+        const double h = std::atan2(y, x) / deg;
+        return h < 0 ? h + 360 : h;
+    };
+    const double h1 = hue(a1, a[2]), h2 = hue(a2, b[2]);
+    const double dL = b[0] - a[0], dC = cp2 - cp1;
+    double dh = 0;
+    if (cp1 * cp2 != 0) {
+        dh = h2 - h1;
+        if (dh > 180) dh -= 360;
+        else if (dh < -180) dh += 360;
+    }
+    const double dH = 2 * std::sqrt(cp1 * cp2) * std::sin(dh / 2 * deg);
+    const double lm = (a[0] + b[0]) / 2, cpm = (cp1 + cp2) / 2;
+    double hm = h1 + h2;
+    if (cp1 * cp2 != 0) {
+        if (std::fabs(h1 - h2) <= 180) hm = (h1 + h2) / 2;
+        else hm = (h1 + h2 < 360) ? (h1 + h2 + 360) / 2 : (h1 + h2 - 360) / 2;
+    }
+    const double t = 1 - 0.17 * std::cos((hm - 30) * deg) + 0.24 * std::cos(2 * hm * deg) + 0.32 * std::cos((3 * hm + 6) * deg) -
+                     0.20 * std::cos((4 * hm - 63) * deg);
+    const double dTheta = 30 * std::exp(-std::pow((hm - 275) / 25, 2));
+    const double rc = 2 * std::sqrt(std::pow(cpm, 7) / (std::pow(cpm, 7) + std::pow(25.0, 7)));
+    const double sl = 1 + 0.015 * std::pow(lm - 50, 2) / std::sqrt(20 + std::pow(lm - 50, 2));
+    const double sc = 1 + 0.045 * cpm, sh = 1 + 0.015 * cpm * t;
+    const double rt = -std::sin(2 * dTheta * deg) * rc;
+    return std::sqrt(std::pow(dL / sl, 2) + std::pow(dC / sc, 2) + std::pow(dH / sh, 2) + rt * (dC / sc) * (dH / sh));
+}
+
+void invertMatrix3(const double m[9], double out[9]) { invert3(m, out); }
+void multiplyMatrix3(const double a[9], const double b[9], double out[9]) { mul3(a, b, out); }
 
 void primariesToXyz(Primaries p, double m[9]) {
     // The makers' published matrices to ACES AP0 (the ACES IDTs).

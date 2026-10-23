@@ -1,4 +1,5 @@
 #include "ProjectIO.h"
+#include "AdaptiveHdrMetadata.h"
 #include "Surround.h"
 #include "FilmCount.h"
 #include "Interpretation.h"
@@ -23,6 +24,36 @@ QString qs(const std::string& s) { return QString::fromStdString(s); }
 std::string ss(const QJsonValue& v) { return v.toString().toStdString(); }
 // 64-bit ids/frames are stored as doubles (exact up to 2^53).
 qint64 i64(const QJsonValue& v, qint64 def = 0) { return v.isDouble() ? qint64(v.toDouble()) : def; }
+
+// Adaptive HDR scenes as [start, end, the message's payload in hex, key] (the message carries every value).
+QJsonArray adaptiveHdrToJson(const std::vector<AdaptiveHdrScene>& scenes) {
+    QJsonArray out;
+    for (const AdaptiveHdrScene& sc : scenes) {
+        const std::vector<uint8_t> payload = adaptiveHdrPayload(sc.md);
+        QJsonArray a{double(sc.start), double(sc.end),
+                     QString::fromLatin1(QByteArray(reinterpret_cast<const char*>(payload.data()), qsizetype(payload.size())).toHex())};
+        if (!sc.key.empty()) a.append(qs(sc.key));
+        out.append(a);
+    }
+    return out;
+}
+std::vector<AdaptiveHdrScene> adaptiveHdrFromJson(const QJsonArray& in) {
+    std::vector<AdaptiveHdrScene> out;
+    for (const auto& v : in) {
+        const QJsonArray a = v.toArray();
+        if (a.size() < 3) continue;
+        AdaptiveHdrScene sc;
+        sc.start = FrameTime(a.at(0).toDouble());
+        sc.end = FrameTime(a.at(1).toDouble());
+        const QByteArray payload = QByteArray::fromHex(a.at(2).toString().toLatin1());
+        if (sc.end <= sc.start || (!out.empty() && sc.start < out.back().end) ||
+            !parseAdaptiveHdrPayload(reinterpret_cast<const uint8_t*>(payload.constData()), size_t(payload.size()), sc.md))
+            continue;
+        if (a.size() > 3) sc.key = ss(a.at(3));
+        out.push_back(std::move(sc));
+    }
+    return out;
+}
 
 const char* kindName(MediaKind k) {
     switch (k) {
@@ -710,6 +741,7 @@ QJsonObject sequenceToJson(const Sequence& s) {
         }
         o["hdr10Plus"] = scenes;
     }
+    if (!s.adaptiveHdr.empty()) o["adaptiveHdr"] = adaptiveHdrToJson(s.adaptiveHdr);
     if (!s.fields.empty()) {
         QJsonArray fields;
         for (const TemplateField& f : s.fields)
@@ -767,6 +799,7 @@ Sequence sequenceFromJson(const QJsonObject& o) {
         sc.key = ss(a.at(13));
         s.hdr10Plus.push_back(sc);
     }
+    s.adaptiveHdr = adaptiveHdrFromJson(o.value("adaptiveHdr").toArray());
     for (const auto& v : o.value("fields").toArray()) {
         const QJsonObject f = v.toObject();
         TemplateField t;
@@ -964,6 +997,7 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         if (m.maxCll > 0) o["maxCll"] = m.maxCll;
         if (m.maxFall > 0) o["maxFall"] = m.maxFall;
         if (m.gainMap) o["gainMap"] = true;
+        if (m.adaptiveHdr && !m.adaptiveHdr->empty()) o["adaptiveHdr"] = adaptiveHdrToJson(*m.adaptiveHdr);
         if (!m.projection.empty()) o["projection"] = qs(m.projection);
         if (m.ambisonic > 0) o["ambisonic"] = m.ambisonic;
         if (!m.stereo.empty()) o["stereo"] = qs(m.stereo);
@@ -1139,6 +1173,8 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         m.maxCll = std::max(0.0, o.value("maxCll").toDouble());
         m.maxFall = std::max(0.0, o.value("maxFall").toDouble());
         m.gainMap = o.value("gainMap").toBool();
+        if (auto scenes = adaptiveHdrFromJson(o.value("adaptiveHdr").toArray()); !scenes.empty())
+            m.adaptiveHdr = std::make_shared<const std::vector<AdaptiveHdrScene>>(std::move(scenes));
         m.projection = ss(o.value("projection"));
         m.ambisonic = std::clamp(o.value("ambisonic").toInt(0), 0, 7);
         m.stereo = ss(o.value("stereo"));

@@ -1,4 +1,5 @@
 #include "Compositor.h"
+#include "AdaptiveHdr.h"
 #include "TrimPasses.h"
 #include "OGraf.h"
 #include "Ofx.h"
@@ -931,6 +932,8 @@ struct ClipSource {
     // Or, when asked to leave it (`deferFrame`), the decoded frame and the space it is in: nothing ran on it yet.
     Frame16Ptr frame;
     const ColorSpace* frameSpace = nullptr;
+    // The frame's adaptive HDR metadata (render/AdaptiveHdr.h) when it changes how the frame enters the sequence.
+    const AdaptiveHdr* adaptive = nullptr;
     const Effect* sourceCdl = nullptr;  // a CDL applied in the media's own space, before the input transform
     const Effect* sourceRgc = nullptr;  // the ACES gamut compression, likewise
     std::vector<const Effect*> sourceLooks;  // CDLs and LUTs made on the camera's picture (an AMF's looks), likewise
@@ -943,6 +946,21 @@ struct ClipSource {
     std::string exrFile;        // the OpenEXR file the frame was read from (its Cryptomattes), "" for any other
     ofx::FrameFetch ofxFetch;   // the clip's source at other clip frames, for OpenFX plugins that ask (render/Ofx.h)
 };
+
+// The input transform: a picture in its media's space into the sequence's working space, by its adaptive HDR metadata
+// when it has some that matters there.
+void inputTransform(Image& img, const ColorSpace& from, const AdaptiveHdr* adaptive, const Sequence& seq) {
+    if (adaptive) convertColorAdaptive(img, from, *adaptive, sequenceColorSpace(seq), seq.hdrPeakNits);
+    else convertColor(img, from, sequenceColorSpace(seq), seq.hdrPeakNits);
+}
+
+// The metadata of a media file's frame at `seconds` that changes how it enters `seq` (not its proxy's, nor when its
+// colour is interpreted by hand).
+const AdaptiveHdr* clipAdaptiveHdr(const MediaItem& m, const std::string& path, double seconds, const Sequence& seq) {
+    if (m.kind != MediaKind::Video || path != m.path || !m.colorOverride.empty()) return nullptr;
+    const AdaptiveHdr* md = adaptiveHdrAt(m, seconds);
+    return md && adaptiveConverts(*md, mediaColorSpace(m), sequenceColorSpace(seq), seq.hdrPeakNits) ? md : nullptr;
+}
 
 // Effects clipSource runs on the source frame before a camera look made on it can run.
 bool ranOnSourceFirst(const std::string& type) {
@@ -1099,6 +1117,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (!f && original && isOffline(*m)) f = offlineSlate(w, h);
             if (!f) return false;
             if (m->kind == MediaKind::Video) sourceSeconds = sec;
+            out.adaptive = clipAdaptiveHdr(*m, path, sec, seq);
             if (m->kind == MediaKind::Video && c.layer.empty()) out.sourcePath = m->path;
             sourceMedia = m->id;
             exrFile = exrFrameFile(m->path, sec);
@@ -1110,14 +1129,19 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 const ColorSpace* from = &pictureColorSpace(*m, path);
                 const ColorSpace* to = &sequenceColorSpace(seq);
                 const double peak = seq.hdrPeakNits;
-                ofxFetch = [path, w, h, hq, clipCopy, duration, frameSeconds, seqFps, from, to, peak](double at, Image& out) {
+                MediaItem media;  // (what the neighbours' adaptive HDR metadata needs)
+                media.kind = m->kind, media.path = m->path, media.colorSpace = m->colorSpace, media.colorOverride = m->colorOverride;
+                media.fps = m->fps, media.adaptiveHdr = m->adaptiveHdr;
+                ofxFetch = [path, w, h, hq, clipCopy, duration, frameSeconds, seqFps, from, to, peak, media](double at, Image& out) {
                     const FrameTime local = FrameTime(std::floor(at + 1e-6));
                     if (local < 0 || local >= clipCopy.duration) return false;
                     const double s = std::clamp(clipCopy.sourceFrameAt(clipCopy.start + local) / seqFps, 0.0, std::max(0.0, duration - frameSeconds * 0.5));
                     Frame16Ptr frame = MediaPool::instance().videoFrame(path, s, w, h, hq);
                     if (!frame) return false;
                     out = toImage(*frame);
-                    convertColor(out, *from, *to, peak);
+                    const AdaptiveHdr* md = path == media.path && media.colorOverride.empty() ? adaptiveHdrAt(media, s) : nullptr;
+                    if (md && adaptiveConverts(*md, *from, *to, peak)) convertColorAdaptive(out, *from, *md, *to, peak);
+                    else convertColor(out, *from, *to, peak);
                     return true;
                 };
             }
@@ -1422,7 +1446,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     applyAcesGamutCompress(e, lt, from, src);
                 }
             // Input transform: the media's space (or its proxy's) into the sequence's working space.
-            convertColor(src, from, sequenceColorSpace(seq), seq.hdrPeakNits);
+            inputTransform(src, from, out.adaptive, seq);
         } else {
             return false;
         }
@@ -1437,7 +1461,7 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
     Image& src = cs.src;
     if (cs.frame) {  // (left as decoded)
         src = toImage(*cs.frame);
-        convertColor(src, *cs.frameSpace, sequenceColorSpace(seq), seq.hdrPeakNits);
+        inputTransform(src, *cs.frameSpace, cs.adaptive, seq);
         cs.frame.reset();
     }
     const Effect* sourceCdl = cs.sourceCdl;
@@ -2068,7 +2092,8 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     int w = 0, h = 0;
     if (cs.frame) {
         out.frame = cs.frame;
-        out.input = conversionLut(*cs.frameSpace, sequenceColorSpace(seq), seq.hdrPeakNits);
+        out.input = cs.adaptive ? adaptiveConversionLut(*cs.frameSpace, *cs.adaptive, sequenceColorSpace(seq), seq.hdrPeakNits)
+                                : conversionLut(*cs.frameSpace, sequenceColorSpace(seq), seq.hdrPeakNits);
         w = cs.frame->width, h = cs.frame->height;
     } else {
         out.image = std::move(cs.src);
@@ -2732,7 +2757,10 @@ Image renderMediaFrame(const Project& p, const MediaItem& m, double seconds, int
     Frame16Ptr f = MediaPool::instance().videoFrame(m.path, std::max(0.0, seconds), dw, dh);
     if (!f) return out;
     Image img = toImage(*f);
-    convertColor(img, mediaColorSpace(m), rec709Space());  // the source monitor shows SDR
+    // The source monitor shows SDR (by the frame's own adaptive HDR curves when it has them).
+    const AdaptiveHdr* md = m.colorOverride.empty() ? adaptiveHdrAt(m, seconds) : nullptr;
+    if (md && adaptiveConverts(*md, mediaColorSpace(m), rec709Space(), 100)) convertColorAdaptive(img, mediaColorSpace(m), *md, rec709Space(), 100);
+    else convertColor(img, mediaColorSpace(m), rec709Space());
     Geometry g;
     g.mw = mw;
     g.mh = mh;

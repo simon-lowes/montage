@@ -96,4 +96,19 @@ double pixelMaxNits(const ColorSpace& space, const float rgb[3]);
 // For tests and scopes: one pixel through the same conversion.
 void convertPixel(float rgb[3], const ColorSpace& from, const ColorSpace& to, double hdrPeakNits = 1000);
 
+// The steps either side of a display-referred conversion: a pixel's code values to the light it shows (relative to SDR
+// white, which is 203 nits for PQ and HLG; HLG through its OOTF on a 1000-nit display), and such light back to code
+// values (clamped to 0..1).
+void displayLight(const ColorSpace& space, const float rgb[3], double light[3]);
+void encodeDisplayLight(const ColorSpace& space, const double light[3], float rgb[3]);
+// Linear RGB with these CIE 1931 xy chromaticities (red, green, blue, white) to XYZ relative to D65 (Bradford adapted
+// from another white).
+void chromaticitiesToXyz(const double xy[8], double m[9]);
+// CIE L*a*b* (D65) of linear light in primaries `p`, white (1, 1, 1) at L* 100; and the CIEDE2000 colour difference.
+void linearToLab(Primaries p, const double rgb[3], double lab[3]);
+double deltaE2000(const double lab1[3], const double lab2[3]);
+// 3x3 matrix helpers.
+void invertMatrix3(const double m[9], double out[9]);
+void multiplyMatrix3(const double a[9], const double b[9], double out[9]);
+
 }  // namespace montage
