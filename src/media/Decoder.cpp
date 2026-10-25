@@ -694,11 +694,6 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
             const double cll = in.gainMap ? hi.hdrMaxCll : hi.maxCll, fall = in.gainMap ? hi.hdrMaxFall : hi.maxFall;
             if (cll > 0) m.maxCll = cll, m.maxFall = fall;
         }
-        // Adaptive HDR metadata (ST 2094-50) in HEVC SEI or AV1 metadata OBUs, scene by scene.
-        if (st->codecpar->codec_id == AV_CODEC_ID_HEVC || st->codecpar->codec_id == AV_CODEC_ID_AV1) {
-            std::vector<AdaptiveHdrScene> scenes;
-            if (readAdaptiveHdr(file, scenes)) m.adaptiveHdr = std::make_shared<const std::vector<AdaptiveHdrScene>>(std::move(scenes));
-        }
         int w = st->codecpar->width, h = st->codecpar->height;
 #ifdef MONTAGE_PRORES_RAW
         // ProRes RAW is developed to ACEScct (the scene's whole range), at its size less the recommended crop.
@@ -728,6 +723,12 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         }
         // Pulldown removed: four frames for each five of the file's, over the same time (its timecode read at the file's rate).
         if (!in.pulldown.empty() && !in.conformed()) m.fps = pulldownRate(m.fps);
+        // Adaptive HDR metadata (ST 2094-50) in HEVC SEI or AV1 metadata OBUs, scene by scene in the file's frames (so not
+        // once pulldown is removed, which takes frames apart).
+        if ((st->codecpar->codec_id == AV_CODEC_ID_HEVC || st->codecpar->codec_id == AV_CODEC_ID_AV1) && (in.pulldown.empty() || in.conformed())) {
+            std::vector<AdaptiveHdrScene> scenes;
+            if (readAdaptiveHdr(file, scenes)) m.adaptiveHdr = std::make_shared<const std::vector<AdaptiveHdrScene>>(std::move(scenes));
+        }
         // Start timecode (camera files carry it in the stream, the container or a tmcd track).
         const AVDictionaryEntry* tc = av_dict_get(st->metadata, "timecode", nullptr, 0);
         if (!tc) tc = av_dict_get(fmt->metadata, "timecode", nullptr, 0);

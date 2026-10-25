@@ -27,6 +27,7 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QFile>
+#include <QFloat16>
 #include <random>
 #include <complex>
 #include <tuple>
@@ -165,6 +166,8 @@
 #include "media/Reframe.h"
 #include "media/Diarizer.h"
 #include "render/Hdr10Plus.h"
+#include "render/AdaptiveHdr.h"
+#include "render/TrimPasses.h"
 #include "media/Faces.h"
 #include "media/FaceMesh.h"
 #include "media/LipSync.h"
@@ -25396,6 +25399,497 @@ if ui["pressed"] == "add":
             QVERIFY(std::fabs(maxRed[25] - std::floor(av1Json[2].maxScl[0] * 10 + 0.5) / 10) < 0.051);
         }
 #endif
+    }
+
+    void adaptiveHdrMetadata() {
+        // ---- The message: ST 2094-50's T.35 user data, read back as written (to the encoding's steps).
+        AdaptiveHdr md;
+        md.referenceWhite = 100;
+        md.toneMap = true;
+        md.baseline = 2.5;
+        md.chromaMode = 3;
+        const double p3[8] = {0.68, 0.32, 0.265, 0.69, 0.15, 0.06, 0.3127, 0.329};
+        std::copy(p3, p3 + 8, md.chroma);
+        md.alternate = {0, 1.2};
+        AdaptiveGainCurve g0;
+        g0.pchip = false;
+        g0.x = {0.5, 1, 4, std::exp2(2.5)};
+        g0.y = {0, -0.5, -1.5, -2.5};
+        g0.m = {0, -0.3, -0.4, -0.5};
+        AdaptiveGainCurve g1;
+        const double mix[6] = {0.2, 0.3, 0.1, 0.4, 0, 0};
+        std::copy(mix, mix + 6, g1.mix);
+        g1.x = {1, 3, std::exp2(2.5)};
+        g1.y = {0, -0.6, -1.3};
+        pchipSlopes(g1);
+        md.gains = {g0, g1};
+        const std::vector<uint8_t> t35 = adaptiveHdrT35(md);
+        QCOMPARE(std::vector<uint8_t>(t35.begin(), t35.begin() + 5), (std::vector<uint8_t>{0xB5, 0x00, 0x90, 0x00, 0x01}));
+        QVERIFY(isAdaptiveHdrT35(t35.data(), t35.size()));
+        AdaptiveHdr back;
+        QVERIFY(parseAdaptiveHdrT35(t35.data(), t35.size(), back));
+        QVERIFY(back.toneMap && !back.computed);
+        QCOMPARE(back.referenceWhite, 100.0);
+        QCOMPARE(back.baseline, 2.5);
+        QCOMPARE(back.chromaMode, 3);
+        for (int i = 0; i < 8; ++i) QVERIFY(std::fabs(back.chroma[i] - p3[i]) < 1e-5);
+        QCOMPARE(back.alternate, (std::vector<double>{0, 1.2}));
+        QCOMPARE(back.gains.size(), size_t(2));
+        QVERIFY(!back.gains[0].pchip && back.gains[1].pchip);
+        for (size_t c = 0; c < 4; ++c) {
+            QVERIFY(std::fabs(back.gains[0].x[c] - g0.x[c]) < 5e-4 && std::fabs(back.gains[0].y[c] - g0.y[c]) < 5e-5);
+            QVERIFY2(std::fabs(back.gains[0].m[c] - g0.m[c]) < 1e-4, qPrintable(QString::number(back.gains[0].m[c])));
+        }
+        for (int k = 0; k < 6; ++k) QVERIFY(std::fabs(back.gains[1].mix[k] - mix[k]) < 1e-9);
+        QVERIFY(std::fabs(back.gains[1].y[1] + 0.6) < 5e-5);
+        // Read back and written again, it is the same message.
+        QCOMPARE(adaptiveHdrT35(back), t35);
+        // Two renditions with the same mix and points send them once.
+        {
+            AdaptiveHdr same = md;
+            same.gains[1] = same.gains[0];
+            for (double& y : same.gains[1].y) y /= 2;
+            AdaptiveHdr differ = same;
+            differ.gains[1].x[1] = 1.1;
+            QVERIFY(adaptiveHdrPayload(same).size() + 8 < adaptiveHdrPayload(differ).size());
+            AdaptiveHdr s2;
+            QVERIFY(parseAdaptiveHdrPayload(adaptiveHdrPayload(same).data(), adaptiveHdrPayload(same).size(), s2));
+            QVERIFY(s2.gains.size() == 2 && s2.gains[1].x == s2.gains[0].x && std::fabs(s2.gains[1].y[3] + 1.25) < 1e-9);
+        }
+        // Reference white alone: two bytes after the codes; 203 nits (the default) is not sent.
+        QCOMPARE(adaptiveHdrPayload(AdaptiveHdr{}).size(), size_t(2));
+        {
+            AdaptiveHdr white;
+            white.referenceWhite = 100;
+            QCOMPARE(adaptiveHdrPayload(white).size(), size_t(4));
+        }
+        // Refused: one only a later parser may read, another provider's, one cut short.
+        {
+            std::vector<uint8_t> later = t35;
+            later[5] |= 0x04;  // minimum_application_version 1
+            QVERIFY(!parseAdaptiveHdrT35(later.data(), later.size(), back));
+            std::vector<uint8_t> other = t35;
+            other[2] = 0x3C;
+            QVERIFY(!isAdaptiveHdrT35(other.data(), other.size()) && !parseAdaptiveHdrT35(other.data(), other.size(), back));
+            QVERIFY(!parseAdaptiveHdrT35(t35.data(), t35.size() - 3, back));
+        }
+
+        // ---- Curves "worked out" (C.3.8): one byte more than the headroom; an SDR rendition a stop down at reference
+        // white with the picture's peak at SDR white, and one at a third of the way.
+        AdaptiveHdr computed;
+        computed.toneMap = true;
+        computed.computed = true;
+        computed.baseline = 3;
+        const std::vector<uint8_t> small = adaptiveHdrT35(computed);
+        QCOMPARE(small.size(), size_t(5 + 5));
+        AdaptiveHdr worked;
+        QVERIFY(parseAdaptiveHdrT35(small.data(), small.size(), worked));
+        QVERIFY(worked.computed && worked.gains.size() == 2 && worked.chromaMode == 2);
+        QCOMPARE(worked.alternate[0], 0.0);
+        QVERIFY(std::fabs(worked.alternate[1] - std::log2(8.0 / 3)) < 1e-9);
+        QVERIFY(std::fabs(adaptiveGainCurve(worked.gains[0], 1) + 1) < 1e-9);
+        QVERIFY(std::fabs(adaptiveGainCurve(worked.gains[0], 8) + 3) < 1e-9);
+        QVERIFY(std::fabs(adaptiveGainCurve(worked.gains[1], 1)) < 1e-9);
+        // At its own headroom (or above) the picture is as it is; below, highlights come down to the display's peak.
+        QVERIFY(!adaptiveToneMaps(worked, 3) && !adaptiveToneMaps(worked, 5) && adaptiveToneMaps(worked, 0));
+        {
+            double c[3] = {8, 8, 8};
+            adaptiveToneMap(worked, c, 0);
+            QVERIFY(std::fabs(c[0] - 1) < 1e-9 && c[1] == c[0]);
+            double w[3] = {1, 1, 1};
+            adaptiveToneMap(worked, w, 0);
+            QVERIFY(std::fabs(w[0] - 0.5) < 1e-9);
+            double same[3] = {2, 1, 0.5};
+            adaptiveToneMap(worked, same, 3);
+            QVERIFY(same[0] == 2 && same[1] == 1 && same[2] == 0.5);
+        }
+
+        // ---- A curve: flat below its first point, falling with the light above its last, PCHIP flat at a turn.
+        {
+            AdaptiveGainCurve g;
+            g.x = {1, 2, 4};
+            g.y = {0, -1, 0};
+            pchipSlopes(g);
+            QCOMPARE(g.m[1], 0.0);
+            QCOMPARE(adaptiveGainCurve(g, 0.25), 0.0);
+            QCOMPARE(adaptiveGainCurve(g, 2), -1.0);
+            QVERIFY(std::fabs(adaptiveGainCurve(g, 8) + 1) < 1e-12);
+            QVERIFY(adaptiveGainCurve(g, 1.5) < 0 && adaptiveGainCurve(g, 1.5) > -1);
+        }
+        // Headrooms between renditions blend their gains by distance; the baseline's gain is none.
+        {
+            AdaptiveHdr two;
+            two.toneMap = true;
+            two.baseline = 2;
+            two.alternate = {0, 1};
+            AdaptiveGainCurve a, b;
+            a.x = b.x = {1};
+            a.y = {-2};
+            b.y = {-1};
+            pchipSlopes(a);
+            pchipSlopes(b);
+            two.gains = {a, b};
+            const double c[3] = {0.5, 0.25, 0.1};
+            double g[3];
+            auto at = [&](double h) {
+                adaptiveGain(two, c, h, g);
+                return g[0];
+            };
+            QCOMPARE(at(0), -2.0);
+            QCOMPARE(at(-1), -2.0);
+            QCOMPARE(at(0.5), -1.5);
+            QCOMPARE(at(1), -1.0);
+            QCOMPARE(at(1.5), -0.5);
+            QCOMPARE(at(3), 0.0);
+            QVERIFY(g[1] == g[0] && g[2] == g[0]);  // (the brightest component's gain for all three)
+        }
+
+        // ---- In packets: HEVC SEI (start codes and lengths) and AV1 metadata OBUs, beside an HDR10+ message.
+        auto packet = [](const std::vector<uint8_t>& bytes) {
+            AVPacket* pkt = av_packet_alloc();
+            av_new_packet(pkt, int(bytes.size()));
+            std::copy(bytes.begin(), bytes.end(), pkt->data);
+            return pkt;
+        };
+        Hdr10PlusScene plus;
+        plus.maxScl[0] = 500;
+        const std::vector<uint8_t> plusT35 = hdr10PlusT35(plus);
+        auto found = [&](AVPacket* pkt, bool av1, int lengthSize) {
+            std::vector<std::vector<uint8_t>> all;
+            forEachT35(pkt->data, size_t(pkt->size), av1, lengthSize, [&](const uint8_t* d, size_t n) { all.emplace_back(d, d + n); });
+            return all;
+        };
+        for (int lengthSize : {0, 4}) {
+            AVPacket* pkt = lengthSize ? packet({0, 0, 0, 3, 0x02, 0x01, 0xD0}) : packet({0, 0, 0, 1, 0x26, 0x01, 0xAF, 0x09});
+            QVERIFY(addHdr10PlusSei(pkt, plusT35, lengthSize));
+            QVERIFY(addHdr10PlusSei(pkt, t35, lengthSize));
+            const auto all = found(pkt, false, lengthSize);
+            QCOMPARE(all.size(), size_t(2));
+            QVERIFY(std::count(all.begin(), all.end(), t35) == 1 && std::count(all.begin(), all.end(), plusT35) == 1);
+            av_packet_free(&pkt);
+        }
+        {
+            AVPacket* pkt = packet({0x12, 0x00, 0x0A, 0x02, 0xAA, 0xBB, 0x32, 0x02, 0xDD, 0xEE});
+            QVERIFY(addHdr10PlusObu(pkt, plusT35));
+            QVERIFY(addHdr10PlusObu(pkt, t35));
+            const auto all = found(pkt, true, 0);
+            QVERIFY(all.size() == 2 && std::count(all.begin(), all.end(), t35) == 1);
+            av_packet_free(&pkt);
+        }
+
+        // ---- Colour differences: CIEDE2000 as Sharma, Wu and Dalal's test data has it.
+        {
+            const double a[3] = {50, 2.6772, -79.7751}, b[3] = {50, 0, -82.7485};
+            QVERIFY2(std::fabs(deltaE2000(a, b) - 2.0425) < 5e-5, qPrintable(QString::number(deltaE2000(a, b), 'f', 5)));
+            const double c[3] = {50, 2.5, 0}, d[3] = {73, 25, -18};
+            QVERIFY(std::fabs(deltaE2000(c, d) - 27.1492) < 5e-5);
+            const double c2[3] = {2.0776, 0.0795, -1.135}, d2[3] = {0.9033, -0.0636, -0.5514};
+            QVERIFY(std::fabs(deltaE2000(c2, d2) - 0.9082) < 5e-5);
+            const double white[3] = {1, 1, 1};
+            double lab[3];
+            linearToLab(Primaries::Bt2020, white, lab);
+            QVERIFY(std::fabs(lab[0] - 100) < 1e-6 && std::fabs(lab[1]) < 1e-4 && std::fabs(lab[2]) < 1e-4);
+        }
+
+        // ---- Into a sequence: a picture whose reference white is 100 nits sits at the sequence's 203.
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        const ColorSpace& sdr = rec709Space();
+        {
+            AdaptiveHdr white;
+            white.referenceWhite = 100;
+            QVERIFY(adaptiveConverts(white, pq, pq, 1000) && !adaptiveConverts(AdaptiveHdr{}, pq, pq, 1000));
+            float px[3] = {float(nitsToCode(pq, 100)), float(nitsToCode(pq, 100)), float(nitsToCode(pq, 100))};
+            convertPixelAdaptive(px, pq, white, pq, 1000);
+            QVERIFY2(std::fabs(codeToNits(pq, px[0]) - 203) < 0.5, qPrintable(QString::number(codeToNits(pq, px[0]))));
+        }
+
+        // ---- Fitted to a chart and Montage's own SDR mapping of it: a grey ramp to 1000 nits and colours inside Rec.709.
+        const int W = 128, H = 64;
+        Image chart(W, H);
+        const double toBt2020[9] = {0.6274, 0.3293, 0.0433, 0.0691, 0.9195, 0.0114, 0.0164, 0.0880, 0.8956};
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const double nits = 0.2 * std::pow(5000.0, double(x) / (W - 1));  // 0.2 to 1000
+                double c709[3] = {1, 1, 1};
+                if (y >= H / 2) {
+                    const int hue = (y - H / 2) / 4;  // eight colours
+                    const double colours[8][3] = {{1, 0.2, 0.2}, {0.2, 1, 0.2}, {0.2, 0.2, 1}, {1, 1, 0.2},
+                                                  {0.2, 1, 1}, {1, 0.2, 1}, {1, 0.6, 0.3}, {0.4, 0.5, 0.9}};
+                    std::copy(colours[hue], colours[hue] + 3, c709);
+                }
+                float* px = chart.at(x, y);
+                for (int k = 0; k < 3; ++k) {
+                    const double l = toBt2020[k * 3] * c709[0] + toBt2020[k * 3 + 1] * c709[1] + toBt2020[k * 3 + 2] * c709[2];
+                    px[k] = float(nitsToCode(pq, nits * l));
+                }
+                px[3] = 1;
+            }
+        Image mapped = chart;
+        convertColor(mapped, pq, sdr, 1000);
+        AdaptiveHdrFitter fitter(pq, sdr);
+        fitter.add(chart, mapped);
+        QVERIFY(fitter.samples() > size_t(W * H / 2));
+        const AdaptiveHdr fit = fitter.result();
+        QVERIFY(fit.toneMap && fit.chromaMode == 0 && fit.alternate == std::vector<double>{0} && fit.gains.size() == 1);
+        QVERIFY2(std::fabs(fit.baseline - std::log2(1000 / 203.0)) < 0.05, qPrintable(QString::number(fit.baseline)));
+        QVERIFY(fit.gains[0].x.size() >= 2 && fit.gains[0].x.size() <= 32);
+        // Tone mapped to SDR by its curve it looks as Montage maps it; at its own headroom it is untouched.
+        {
+            double worst = 0, sum = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    float a[3] = {chart.at(x, y)[0], chart.at(x, y)[1], chart.at(x, y)[2]};
+                    float same[3] = {a[0], a[1], a[2]};
+                    convertPixelAdaptive(a, pq, fit, sdr, 1000);
+                    convertPixelAdaptive(same, pq, fit, pq, 1000);
+                    for (int k = 0; k < 3; ++k) QVERIFY(std::fabs(same[k] - chart.at(x, y)[k]) < 1e-4);
+                    double la[3], lb[3], laba[3], labb[3];
+                    displayLight(sdr, a, la);
+                    displayLight(sdr, mapped.at(x, y), lb);
+                    linearToLab(Primaries::Bt709, la, laba);
+                    linearToLab(Primaries::Bt709, lb, labb);
+                    const double e = deltaE2000(laba, labb);
+                    worst = std::max(worst, e), sum += e;
+                }
+            QVERIFY2(sum / (W * H) < 0.5 && worst < 2, qPrintable(QString("%1 %2").arg(sum / (W * H)).arg(worst)));
+        }
+
+        // ---- Exported: a scene per shot, the second with an SDR trim that holds it down, on every frame.
+        if (!avcodec_find_encoder_by_name("libx265")) QSKIP("This FFmpeg has no libx265");
+        {
+            QImage png(W, H, QImage::Format_RGBA64);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const float* c = chart.at(x, y);
+                    png.setPixelColor(x, y, QColor::fromRgba64(quint16(std::lround(c[0] * 65535)), quint16(std::lround(c[1] * 65535)),
+                                                               quint16(std::lround(c[2] * 65535)), 65535));
+                }
+            QVERIFY(png.save(QString::fromStdString(path("adaptive-chart.png"))));
+        }
+        Project p = makeDefaultProject();
+        MediaItem still = probeOrFail(p, path("adaptive-chart.png"));
+        still.colorOverride = "rec2100pq";
+        p.media.push_back(still);
+        Sequence& s = *p.active();
+        s.width = W;
+        s.height = H;
+        s.fps = {25, 1};
+        s.colorSpace = "rec2100pq";
+        s.hdrPeakNits = 1000;
+        QVERIFY(edit::placeMedia(p, s, still.id, 0, 0, 15, {TrackKind::Video, 0}, {}, false, true, false).ok);
+        QVERIFY(edit::placeMedia(p, s, still.id, 15, 0, 15, {TrackKind::Video, 0}, {}, false, true, false).ok);
+        QCOMPARE(s.videoTracks[0].clips.size(), size_t(2));
+        const auto& presets = trimTargetPresets();
+        QVERIFY(edit::addTrimTarget(s, *std::find_if(presets.begin(), presets.end(), [](const TrimTarget& t) { return t.id == "sdr"; })).ok);
+        QVERIFY(edit::setTrim(s, s.videoTracks[0].clips[1].id, "sdr", {{"gain", 0.7}}, 15).ok);
+        std::vector<AdaptiveHdrScene> fitted;
+        std::string err;
+        QVERIFY2(analyseAdaptiveHdr(p, s, 0, 30, pq, 1000, fitted, &err), err.c_str());
+        QCOMPARE(fitted.size(), size_t(2));
+        QVERIFY(fitted[0].start == 0 && fitted[0].end == 15 && fitted[1].start == 15 && fitted[1].end == 30);
+        // The trimmed shot's SDR rendition is darker: its curve lower at reference white.
+        const double lift0 = adaptiveGainCurve(fitted[0].md.gains[0], 1), lift1 = adaptiveGainCurve(fitted[1].md.gains[0], 1);
+        QVERIFY2(lift1 < lift0 - 0.5, qPrintable(QString("%1 %2").arg(lift0).arg(lift1)));
+        QVERIFY(std::fabs(fitted[0].md.baseline - fitted[1].md.baseline) < 1e-9);  // (the same HDR picture)
+        // A file's messages that tone map alike make one scene; these two do not.
+        QVERIFY(adaptiveHdrAlike(fitted[0].md, fitted[0].md) && !adaptiveHdrAlike(fitted[0].md, fitted[1].md));
+        {
+            AdaptiveHdr nudged = fitted[0].md;
+            for (double& y : nudged.gains[0].y) y -= 0.002;
+            pchipSlopes(nudged.gains[0]);
+            QVERIFY(adaptiveHdrAlike(fitted[0].md, nudged));
+        }
+        QVERIFY(!analyseAdaptiveHdr(p, s, 0, 30, sdr, 100, fitted, &err) && !err.empty());
+        QVERIFY(analyseAdaptiveHdr(p, s, 0, 30, pq, 1000, fitted, &err));
+
+        ExportSettings st;
+        st.path = path("adaptive.mp4");
+        st.videoCodec = "libx265";
+        st.audioCodec = "none";
+        st.preset = "ultrafast";
+        st.crf = 12;
+        st.adaptiveHdr = true;
+        QVERIFY(adaptiveHdrCarried(s, st));
+        QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+        std::vector<AdaptiveHdrScene> read;
+        QVERIFY2(readAdaptiveHdr(st.path, read, &err), err.c_str());
+        QCOMPARE(read.size(), size_t(2));
+        QVERIFY2(read[0].start == 0 && read[0].end == 15 && read[1].start == 15 && read[1].end == 30,
+                 qPrintable(QString("%1-%2 %3-%4").arg(read[0].start).arg(read[0].end).arg(read[1].start).arg(read[1].end)));
+        for (size_t i = 0; i < 2; ++i) QCOMPARE(adaptiveHdrPayload(read[i].md), adaptiveHdrPayload(fitted[i].md));
+        // Every access unit has one, in an SEI before its first slice.
+        {
+            AVFormatContext* fmt = nullptr;
+            QCOMPARE(avformat_open_input(&fmt, st.path.c_str(), nullptr, nullptr), 0);
+            QVERIFY(avformat_find_stream_info(fmt, nullptr) >= 0);
+            const AVCodecParameters* cp = fmt->streams[0]->codecpar;
+            const int lengthSize = cp->extradata_size > 22 && cp->extradata[0] == 1 ? (cp->extradata[21] & 3) + 1 : 4;
+            AVPacket* pkt = av_packet_alloc();
+            int units = 0, before = 0;
+            while (av_read_frame(fmt, pkt) >= 0) {
+                ++units;
+                bool sliceSeen = false;
+                for (size_t i = 0; i + size_t(lengthSize) < size_t(pkt->size);) {
+                    size_t len = 0;
+                    for (int k = 0; k < lengthSize; ++k) len = (len << 8) | pkt->data[i + size_t(k)];
+                    const uint8_t* nal = pkt->data + i + lengthSize;
+                    const int type = (nal[0] >> 1) & 0x3f;
+                    if (type < 32) sliceSeen = true;
+                    int here = 0;
+                    if (type == 39)
+                        forEachT35(pkt->data + i, size_t(lengthSize) + len, false, lengthSize, [&](const uint8_t* d, size_t n) { here += isAdaptiveHdrT35(d, n); });
+                    if (here && !sliceSeen) before += here;
+                    i += size_t(lengthSize) + len;
+                }
+                av_packet_unref(pkt);
+            }
+            av_packet_free(&pkt);
+            avformat_close_input(&fmt);
+            QCOMPARE(units, 30);
+            QCOMPARE(before, 30);
+        }
+        // AV1 carries it in metadata OBUs.
+        if (!avcodec_find_encoder_by_name("libsvtav1")) {
+            qWarning("AV1 adaptive HDR metadata not checked: this FFmpeg lacks libsvtav1");
+        } else {
+            ExportSettings av1 = st;
+            av1.path = path("adaptive-av1.mp4");
+            av1.videoCodec = "libsvtav1";
+            av1.preset = "12";
+            av1.crf = 40;
+            QVERIFY(adaptiveHdrCarried(s, av1));
+            QVERIFY2(exportSequence(p, s, av1, nullptr, nullptr, &err), err.c_str());
+            std::vector<AdaptiveHdrScene> fromAv1;
+            QVERIFY2(readAdaptiveHdr(av1.path, fromAv1, &err), err.c_str());
+            QVERIFY(fromAv1.size() == 2 && fromAv1[1].start == 15 && fromAv1[1].end == 30);
+            QCOMPARE(adaptiveHdrPayload(fromAv1[1].md), adaptiveHdrPayload(fitted[1].md));
+        }
+        // Not without the option, nor for SDR or EXR deliveries.
+        {
+            ExportSettings off = st;
+            off.adaptiveHdr = false;
+            QVERIFY(!adaptiveHdrCarried(s, off));
+            Sequence sdrSeq = s;
+            sdrSeq.colorSpace = "rec709";
+            QVERIFY(!adaptiveHdrCarried(sdrSeq, st));
+            ExportSettings exr = st;
+            exr.videoCodec = "exr";
+            exr.path = path("adaptive_%04d.exr");
+            QVERIFY(!adaptiveHdrCarried(s, exr));
+        }
+
+        // ---- Imported: the file's scenes on its media, honoured as it enters a sequence.
+        MediaItem file = probeOrFail(p, st.path);
+        QVERIFY(file.adaptiveHdr && file.adaptiveHdr->size() == 2);
+        QCOMPARE(adaptiveHdrAt(file, 0.2), &(*file.adaptiveHdr)[0].md);
+        QCOMPARE(adaptiveHdrAt(file, 0.8), &(*file.adaptiveHdr)[1].md);
+        QVERIFY(!adaptiveHdrAt(file, 1.3));
+        Project q = makeDefaultProject();
+        q.media.push_back(file);
+        MediaItem bare = file;
+        bare.id = q.newId();
+        bare.adaptiveHdr.reset();
+        q.media.push_back(bare);
+        Sequence& sq = *q.active();
+        sq.width = W;
+        sq.height = H;
+        sq.fps = {25, 1};
+        sq.colorSpace = "rec709";
+        QVERIFY(edit::placeMedia(q, sq, file.id, 0, 0, 30, {TrackKind::Video, 0}, {}, false, true, false).ok);
+        Sequence plain = sq;
+        plain.videoTracks[0].clips[0].mediaId = bare.id;
+        // (CIEDE2000 between two SDR pictures, over their first `rows`)
+        auto meanDifference = [&](const Image& a, const Image& b, int rows) {
+            double sum = 0;
+            for (int y = 0; y < rows; ++y)
+                for (int x = 0; x < W; ++x) {
+                    double la[3], lb[3], laba[3], labb[3];
+                    displayLight(sdr, a.at(x, y), la);
+                    displayLight(sdr, b.at(x, y), lb);
+                    linearToLab(Primaries::Bt709, la, laba);
+                    linearToLab(Primaries::Bt709, lb, labb);
+                    sum += deltaE2000(laba, labb);
+                }
+            return sum / (W * rows);
+        };
+        // The trimmed shot: as the file's picture tone mapped by its own curves, and so (on the grey ramp, which the
+        // encoding keeps best) as its SDR trim; without them, Montage's own mapping, far brighter.
+        RenderOptions trimmed;
+        trimmed.trimTarget = "sdr";
+        const Image wanted = renderProgramFrame(p, s, 22, trimmed);
+        const Image honoured = renderProgramFrame(q, sq, 22, RenderOptions{});
+        const Image unaware = renderProgramFrame(q, plain, 22, RenderOptions{});
+        Sequence filePq = plain;
+        filePq.colorSpace = "rec2100pq";
+        filePq.hdrPeakNits = 1000;
+        Image mappedFile = renderProgramFrame(q, filePq, 22, RenderOptions{});
+        convertColorAdaptive(mappedFile, pq, read[1].md, sdr, 1000);
+        const double toOwn = meanDifference(honoured, mappedFile, H), toTrim = meanDifference(honoured, wanted, H / 2),
+                     plainToTrim = meanDifference(unaware, wanted, H / 2);
+        QVERIFY2(toOwn < 0.3 && toTrim < 1 && plainToTrim > 5, qPrintable(QString("%1 %2 %3").arg(toOwn).arg(toTrim).arg(plainToTrim)));
+        // In a sequence with the picture's own headroom it is as the plain picture.
+        {
+            Sequence hdrSeq = sq, hdrPlain = plain;
+            hdrSeq.colorSpace = hdrPlain.colorSpace = "rec2100pq";
+            hdrSeq.hdrPeakNits = hdrPlain.hdrPeakNits = 1000;
+            const Image a = renderProgramFrame(q, hdrSeq, 22, RenderOptions{}), b = renderProgramFrame(q, hdrPlain, 22, RenderOptions{});
+            double most = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    for (int k = 0; k < 3; ++k) most = std::max(most, double(std::fabs(a.at(x, y)[k] - b.at(x, y)[k])));
+            QVERIFY2(most < 0.01, qPrintable(QString::number(most)));
+        }
+
+        // ---- The HDR viewer: light over SDR white tone mapped to the display's headroom, clipped to it.
+        {
+            std::vector<uint16_t> view(8);
+            const float in[8] = {4, 4, 4, 1, 0.5f, 0.5f, 0.5f, 1};
+            qFloatToFloat16(reinterpret_cast<qfloat16*>(view.data()), in, 8);
+            std::vector<uint16_t> wide = view;
+            adaptiveViewImage(wide, worked, 8);  // (its own headroom: untouched)
+            QCOMPARE(wide, view);
+            adaptiveViewImage(view, worked, 2);
+            float out[8];
+            qFloatFromFloat16(out, reinterpret_cast<const qfloat16*>(view.data()), 8);
+            QVERIFY2(out[0] < 2.0f + 1e-3f && out[0] > 1.0f && out[1] == out[0], qPrintable(QString::number(out[0])));
+            QVERIFY(out[4] < 0.5f && out[4] > 0.3f && out[3] == 1.0f);
+        }
+
+        // ---- Kept with the sequence while the cut is as measured; an edit to a shot drops its scene.
+        s.adaptiveHdr = fitted;
+        {
+            auto snap = std::make_shared<const Project>(p);
+            QCOMPARE(storedAdaptiveHdrAt(snap, *snap->active(), 5), &snap->active()->adaptiveHdr[0].md);
+            QCOMPARE(storedAdaptiveHdrAt(snap, *snap->active(), 20), &snap->active()->adaptiveHdr[1].md);
+            QVERIFY(!storedAdaptiveHdrAt(snap, *snap->active(), 30));
+            Project edited = p;
+            QVERIFY(edit::setTrim(*edited.active(), edited.active()->videoTracks[0].clips[1].id, "sdr", {{"gain", 0.8}}, 15).ok);
+            auto snap2 = std::make_shared<const Project>(edited);
+            QVERIFY(storedAdaptiveHdrAt(snap2, *snap2->active(), 5));
+            QVERIFY(!storedAdaptiveHdrAt(snap2, *snap2->active(), 20));
+            std::vector<AdaptiveHdrScene> again;
+            FrameTime measured = 0;
+            QVERIFY(adaptiveHdrForRange(edited, *edited.active(), 0, 30, pq, 1000, true, again, &err, {}, nullptr, nullptr, &measured));
+            QCOMPARE(measured, FrameTime(15));
+            QVERIFY(again.size() == 2 && again[0] == fitted[0] && again[1].key != fitted[1].key);
+            std::vector<AdaptiveHdrScene> stored = fitted;
+            mergeAdaptiveHdrScenes(stored, {again[1]});
+            QVERIFY(stored.size() == 2 && stored[0] == fitted[0] && stored[1] == again[1]);
+        }
+        const std::string proj = path("adaptive.montage");
+        p.media.push_back(file);
+        QVERIFY(saveProject(p, proj));
+        Project reopened;
+        QVERIFY(loadProject(proj, reopened));
+        const auto& kept = reopened.active()->adaptiveHdr;
+        QCOMPARE(kept.size(), size_t(2));
+        for (size_t i = 0; i < 2; ++i) {
+            QVERIFY(kept[i].start == fitted[i].start && kept[i].end == fitted[i].end && kept[i].key == fitted[i].key);
+            QCOMPARE(adaptiveHdrPayload(kept[i].md), adaptiveHdrPayload(fitted[i].md));
+        }
+        const MediaItem* keptFile = reopened.findMedia(file.id);
+        QVERIFY(keptFile && keptFile->adaptiveHdr && keptFile->adaptiveHdr->size() == 2);
+        QCOMPARE(adaptiveHdrPayload((*keptFile->adaptiveHdr)[1].md), adaptiveHdrPayload((*file.adaptiveHdr)[1].md));
     }
 
     void hdrExportRoundTrip() {

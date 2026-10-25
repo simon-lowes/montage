@@ -29,7 +29,7 @@ struct Lut3D;
 void forEachT35(const uint8_t* data, size_t size, bool av1, int lengthSize, const std::function<void(const uint8_t*, size_t)>& fn);
 // A video file's adaptive HDR metadata, scene by scene in its frames (a message lasts until the next one). False with
 // nothing when it has none: only HEVC and AV1 carry it, and a file without it in its first frames is taken to have
-// none.
+// none. Only its first ten minutes are read.
 bool readAdaptiveHdr(const std::string& path, std::vector<AdaptiveHdrScene>& scenes, std::string* error = nullptr);
 // The metadata of a media item's frame at `seconds` (null: none).
 const AdaptiveHdr* adaptiveHdrAt(const MediaItem& m, double seconds);

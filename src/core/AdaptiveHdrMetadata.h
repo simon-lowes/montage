@@ -41,6 +41,9 @@ void adaptiveGain(const AdaptiveHdr& md, const double c[3], double headroom, dou
 // `c` tone mapped in place: c × 2^gain. Unchanged without curves, or at the picture's own headroom or above it when
 // every rendition is below it.
 void adaptiveToneMap(const AdaptiveHdr& md, double c[3], double headroom);
+// Whether two messages tone map alike: within 1/100 stop wherever they act (a file's metadata changing a little each
+// frame is one scene).
+bool adaptiveHdrAlike(const AdaptiveHdr& a, const AdaptiveHdr& b);
 // Whether tone mapping to `headroom` changes anything.
 bool adaptiveToneMaps(const AdaptiveHdr& md, double headroom);
 // Brings values into the standard's ranges: headrooms 0..6 with no alternate at the baseline, ascending and at most

@@ -1,6 +1,7 @@
 // Montage — adaptive HDR metadata (SMPTE ST 2094-50) in pictures and files. See AdaptiveHdr.h.
 #include "AdaptiveHdr.h"
 
+#include <QCryptographicHash>
 #include <QFloat16>
 #include <algorithm>
 #include <cmath>
@@ -93,8 +94,12 @@ void forEachT35(const uint8_t* d, size_t n, bool av1, int lengthSize, const std:
             if (!ok || p > end || size > uint64_t(end - p)) return;
             if (type == 5) {  // OBU_METADATA
                 const uint8_t* q = p;
-                const uint64_t metadataType = leb128(q, p + size, ok);
-                if (ok && metadataType == 4 && q < p + size) fn(q, size_t(p + size - q));  // ITU-T T.35
+                const uint8_t* e = p + size;
+                const uint64_t metadataType = leb128(q, e, ok);
+                // (less the OBU's trailing bits: a one bit, then zeros to the end)
+                while (e > q && e[-1] == 0) --e;
+                if (e > q && e[-1] == 0x80) --e;
+                if (ok && metadataType == 4 && q < e) fn(q, size_t(e - q));  // ITU-T T.35
             }
             p += size;
         }
@@ -157,7 +162,8 @@ bool readAdaptiveHdr(const std::string& path, std::vector<AdaptiveHdrScene>& sce
     AVRational fr = av_guess_frame_rate(fmt, st, nullptr);
     if (fr.num <= 0 || fr.den <= 0) fr = AVRational{30, 1};
     const double fps = av_q2d(fr), tb = av_q2d(st->time_base);
-    const int64_t origin = st->start_time != AV_NOPTS_VALUE ? st->start_time : 0;
+    // (frames counted from the file's start, as the decoder's media time is)
+    const double origin = fmt->start_time != AV_NOPTS_VALUE ? double(fmt->start_time) / AV_TIME_BASE : 0.0;
     for (unsigned i = 0; i < fmt->nb_streams; ++i)
         if (int(i) != v) fmt->streams[i]->discard = AVDISCARD_ALL;
     // Each frame's message, in display order (packets come in decode order).
@@ -165,10 +171,18 @@ bool readAdaptiveHdr(const std::string& path, std::vector<AdaptiveHdrScene>& sce
     int64_t frames = 0, last = -1;
     AVPacket* pkt = av_packet_alloc();
     constexpr int64_t kFirstFrames = 120;  // a file without any in these is taken to have none
+    // Read on import, so only the first ten minutes (the rest of a longer file has none).
+    const int64_t kMaxFrames = std::llround(600 * fps);
+    bool cut = false;
     while (av_read_frame(fmt, pkt) >= 0) {
         if (pkt->stream_index == v) {
             const int64_t ts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
-            const int64_t index = ts != AV_NOPTS_VALUE ? std::llround(double(ts - origin) * tb * fps) : frames;
+            const int64_t index = ts != AV_NOPTS_VALUE ? std::llround((double(ts) * tb - origin) * fps) : frames;
+            if (index >= kMaxFrames) {
+                av_packet_unref(pkt);
+                cut = true;
+                break;
+            }
             last = std::max(last, index);
             ++frames;
             forEachT35(pkt->data, size_t(pkt->size), av1, lengthSize, [&](const uint8_t* t35, size_t size) {
@@ -180,14 +194,18 @@ bool readAdaptiveHdr(const std::string& path, std::vector<AdaptiveHdrScene>& sce
     }
     av_packet_free(&pkt);
     if (messages.empty()) return false;
-    const int64_t end = std::max(last + 1, frames);
-    // A message lasts until the next one; the same message over and over is one scene.
+    const int64_t end = cut ? std::min(kMaxFrames, last + 1) : std::max(last + 1, frames);
+    // A message lasts until the next one; the same message over and over (or one that tone maps alike) is one scene.
     const std::vector<uint8_t>* current = nullptr;
     for (auto it = messages.begin(); it != messages.end(); ++it) {
         if (current && *current == it->second) continue;
         AdaptiveHdr md;
         if (!parseAdaptiveHdrT35(it->second.data(), it->second.size(), md)) {
             current = nullptr;
+            continue;
+        }
+        if (current && !scenes.empty() && adaptiveHdrAlike(scenes.back().md, md)) {
+            current = &it->second;
             continue;
         }
         if (!scenes.empty() && scenes.back().end > it->first) scenes.back().end = it->first;
@@ -247,7 +265,7 @@ struct AdaptivePixel {
         headroom = spaceHeadroom(to, peakNits);
         scale = from.hdr() ? kReferenceWhite / md.referenceWhite : 1;
         toneMaps = adaptiveToneMaps(md, headroom);
-        rollOff = !md.toneMap && from.hdr() && !to.hdr();
+        rollOff = !toneMaps && from.hdr() && !to.hdr();
     }
     void operator()(float rgb[3]) const {
         double l[3], c[3];
@@ -347,6 +365,22 @@ void adaptiveViewImage(std::vector<uint16_t>& rgba, const AdaptiveHdr& md, doubl
     if (!adaptiveToneMaps(md, h) || rgba.empty()) return;
     double toGain[9], fromGain[9];
     adaptiveGainMatrices(md, Primaries::Bt709, toGain, fromGain);
+    // Curves on the brightest component alone (as Montage makes them) give one gain for the whole colour, the same in
+    // any primaries: a table of it by that component's stops, 1/64 stop apart, from -12 to +8.
+    const bool brightest = std::all_of(md.gains.begin(), md.gains.end(), [](const AdaptiveGainCurve& g) {
+        return g.mix[0] == 0 && g.mix[1] == 0 && g.mix[2] == 0 && g.mix[3] == 1 && g.mix[4] == 0 && g.mix[5] == 0;
+    });
+    constexpr int kSteps = 64, kLow = -12, kHigh = 8;
+    std::vector<float> table;
+    if (brightest) {
+        table.resize(size_t((kHigh - kLow) * kSteps + 1));
+        for (size_t i = 0; i < table.size(); ++i) {
+            const double v = std::exp2(double(i) / kSteps + kLow), c[3] = {v, v, v};
+            double g[3];
+            adaptiveGain(md, c, h, g);
+            table[i] = float(std::exp2(g[0]));
+        }
+    }
     const size_t pixels = rgba.size() / 4;
     const size_t chunk = 4096;
     parallelRows(int((pixels + chunk - 1) / chunk), [&](int c0, int c1) {
@@ -359,8 +393,19 @@ void adaptiveViewImage(std::vector<uint16_t>& rgba, const AdaptiveHdr& md, doubl
                 const double l[3] = {p[0], p[1], p[2]};
                 double g[3], o[3];
                 apply3(toGain, l, g);
-                adaptiveToneMap(md, g, h);
-                apply3(fromGain, g, o);
+                if (brightest) {
+                    const double mx = std::max({g[0], g[1], g[2]});
+                    double k = 1;
+                    if (mx > 0) {
+                        const double at = std::clamp((std::log2(mx) - kLow) * kSteps, 0.0, double(table.size() - 1));
+                        const size_t j = std::min(size_t(at), table.size() - 2);
+                        k = table[j] + (table[j + 1] - table[j]) * (at - double(j));
+                    }
+                    for (int q = 0; q < 3; ++q) o[q] = l[q] * k;
+                } else {
+                    adaptiveToneMap(md, g, h);
+                    apply3(fromGain, g, o);
+                }
                 for (int k = 0; k < 3; ++k) p[k] = float(std::min(o[k], headroom));
             }
             qFloatToFloat16(reinterpret_cast<qfloat16*>(&rgba[first * 4]), f.data(), qsizetype(count * 4));
@@ -440,11 +485,12 @@ AdaptiveHdr AdaptiveHdrFitter::result() const {
     uint64_t total = 0;
     for (uint32_t c : peak_) total += c;
     if (total == 0) return md;
-    // The picture's headroom: its brightest component, but for the brightest one pixel in ten thousand.
+    // The picture's headroom: its brightest component, but for the brightest one pixel in ten thousand (the foot of
+    // its bin, so a display with the picture's own peak is never tone mapped).
     uint64_t above = 0;
     int top = int(peak_.size()) - 1;
     while (top > 0 && (above += peak_[size_t(top)]) <= total / 10000) --top;
-    const double peak = double(top + 1) / kPeakBinsPerStop + kPeakLow;
+    const double peak = double(top) / kPeakBinsPerStop + kPeakLow;
     md.baseline = std::clamp(std::round(peak * 10000) / 10000, 0.0, 6.0);
     if (md.baseline < 1.0 / 64) {
         md.baseline = 0;
@@ -523,7 +569,9 @@ std::string adaptiveHdrFramesKey(const Project& p, const Sequence& s, FrameTime 
             for (const TrimControl& c : trimControls()) trims += "," + std::to_string(e.p(c.name, f - shot->start, c.def));
         }
     }
-    return hdr10PlusFramesKey(p, s, from, to, out, peakNits) + ":" + std::to_string(std::hash<std::string>{}(trims));
+    // (a hash that is the same on every platform, so a project's analysis is reused wherever it is opened)
+    return hdr10PlusFramesKey(p, s, from, to, out, peakNits) + ":" +
+           QCryptographicHash::hash(QByteArray::fromStdString(trims), QCryptographicHash::Sha1).toHex().toStdString();
 }
 
 bool analyseAdaptiveHdr(const Project& p, const Sequence& s, FrameTime from, FrameTime to, const ColorSpace& out, double peakNits,
@@ -649,7 +697,7 @@ const AdaptiveHdr* storedAdaptiveHdrAt(const std::shared_ptr<const Project>& p, 
         if (checkedFor.lock() != p) checked.clear(), checkedFor = p;
         if (auto c = checked.find(key); c != checked.end()) return c->second ? &it->md : nullptr;
     }
-    const bool ok = adaptiveHdrFramesKey(*p, s, it->start, it->end, sequenceColorSpace(s), s.hdrPeakNits) == it->key;
+    const bool ok = adaptiveHdrFramesKey(*p, s, it->start, it->end, sequenceColorSpace(s), std::clamp(s.hdrPeakNits, 100.0, 10000.0)) == it->key;
     std::lock_guard lock(m);
     if (checkedFor.lock() == p) checked[key] = ok;
     return ok ? &it->md : nullptr;

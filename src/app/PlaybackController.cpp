@@ -207,10 +207,7 @@ private:
                 if (r.hdrCalibration) calibrateHdrPicture(pic->rgba, pic->width, pic->height, *r.hdrCalibration, r.hdrWhite);
                 out.hdr = std::move(pic);
             }
-            if (const AdaptiveHdr* md = r.trim.empty() ? storedAdaptiveHdrAt(r.project, *s, t) : nullptr)
-                convertColorAdaptive(img, trimTargetSpace(*s, r.trim), *md, rec709Space(), trimTargetPeak(*s, r.trim));  // (at no headroom)
-            else
-                convertColor(img, trimTargetSpace(*s, r.trim), rec709Space(), trimTargetPeak(*s, r.trim));
+            convertColor(img, trimTargetSpace(*s, r.trim), rec709Space(), trimTargetPeak(*s, r.trim));
         }
         out.view = QImage(shown.width, shown.height, QImage::Format_RGBA8888);
         toRgba8(shown, out.view.bits(), size_t(out.view.bytesPerLine()));

@@ -1837,7 +1837,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     }
     // Adaptive HDR metadata: each scene fitted from a few of its frames and their SDR renditions (the sequence's analysis
     // where it still matches), as part of the progress; then a message on every frame of HEVC and AV1 video.
-    if (wantAdaptive) {
+    if (wantAdaptive && o.vctx && (o.vctx->codec_id == AV_CODEC_ID_HEVC || o.vctx->codec_id == AV_CODEC_ID_AV1)) {
         const double share = 0.1;
         const double before = renderFrom;
         renderFrom += share;
@@ -1854,12 +1854,11 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         if (toMeasure == 0) renderFrom = before;
         if (conv.active())
             for (AdaptiveHdrScene& sc : adaptive) {
-                const double k = dseq.fpsValue() / seq.fpsValue();
-                sc.start = sc.start == in ? din : din + FrameTime(std::llround(double(sc.start - in) * k));
-                sc.end = sc.end == out ? dout : din + FrameTime(std::llround(double(sc.end - in) * k));
+                sc.start = din + deliveredFrameOf(conv, sc.start - in);
+                sc.end = sc.end >= out ? dout : din + deliveredFrameOf(conv, sc.end - in);
             }
         std::erase_if(adaptive, [](const AdaptiveHdrScene& sc) { return sc.end <= sc.start; });
-        if (!adaptive.empty() && o.vctx && (o.vctx->codec_id == AV_CODEC_ID_HEVC || o.vctx->codec_id == AV_CODEC_ID_AV1)) {
+        if (!adaptive.empty()) {
             const bool av1 = o.vctx->codec_id == AV_CODEC_ID_AV1;
             const int lengthSize = !av1 && o.vctx->extradata_size > 22 && o.vctx->extradata[0] == 1 ? (o.vctx->extradata[21] & 3) + 1 : 0;
             auto messages = std::make_shared<std::vector<std::vector<uint8_t>>>();
@@ -2119,7 +2118,7 @@ std::string hdr10PlusCarriage(const Sequence& seq, const ExportSettings& s) {
 
 bool adaptiveHdrCarried(const Sequence& seq, const ExportSettings& s) {
     const std::string& c = s.videoCodec;
-    if (c.empty() || c == "none" || c == "gif" || c == "exr") return false;
+    if (!s.adaptiveHdr || c.empty() || c == "none" || c == "gif" || c == "exr") return false;
     const ColorSpace* chosen = findTrimTarget(seq, s.trimTarget) ? &trimTargetSpace(seq, s.trimTarget) : findColorSpace(s.colorSpace);
     const ColorSpace& out = chosen && !chosen->sceneReferred ? *chosen : sequenceColorSpace(seq);
     return out.hdr() && (c == "libx265" || c == "hw_hevc" || c.rfind("hevc_", 0) == 0 || c == "libsvtav1" || c == "libaom-av1" ||

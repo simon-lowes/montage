@@ -271,7 +271,9 @@ bool parseAdaptiveHdrPayload(const uint8_t* data, size_t size, AdaptiveHdr& out)
         }
         md.gains.push_back(std::move(g));
     }
-    // (Anything after is padding or a later version's, which parsers skip.)
+    // (Anything after is padding or a later version's, which parsers skip.) Renditions out of order, or at the
+    // baseline's headroom, are put right as the maths needs them.
+    sanitizeAdaptiveHdr(md);
     out = md;
     return true;
 }
@@ -348,19 +350,20 @@ double adaptiveGainCurve(const AdaptiveGainCurve& g, double x) {
 void adaptiveGain(const AdaptiveHdr& md, const double c[3], double headroom, double gain[3]) {
     gain[0] = gain[1] = gain[2] = 0;
     if (!md.toneMap) return;
-    const size_t n = std::min(md.alternate.size(), md.gains.size());
+    const size_t n = std::min<size_t>({md.alternate.size(), md.gains.size(), 4});
     // The headrooms with the baseline's among them (its gain zero), and the two the display's lies between.
-    std::vector<double> hs;
-    std::vector<int> which;  // the curve each is (-1: the baseline)
+    double hs[5];
+    int which[5];  // the curve each is (-1: the baseline)
+    size_t count = 0;
     bool placed = false;
     for (size_t a = 0; a < n; ++a) {
-        if (!placed && md.baseline < md.alternate[a]) hs.push_back(md.baseline), which.push_back(-1), placed = true;
-        hs.push_back(md.alternate[a]), which.push_back(int(a));
+        if (!placed && md.baseline < md.alternate[a]) hs[count] = md.baseline, which[count++] = -1, placed = true;
+        hs[count] = md.alternate[a], which[count++] = int(a);
     }
-    if (!placed) hs.push_back(md.baseline), which.push_back(-1);
-    const double h = std::clamp(headroom, hs.front(), hs.back());
+    if (!placed) hs[count] = md.baseline, which[count++] = -1;
+    const double h = std::clamp(headroom, std::min(hs[0], hs[count - 1]), std::max(hs[0], hs[count - 1]));
     size_t i = 0;
-    while (i + 1 < hs.size() && hs[i + 1] <= h) ++i;
+    while (i + 1 < count && hs[i + 1] <= h) ++i;
     auto addCurve = [&](int a, double weight) {
         if (a < 0 || weight == 0) return;
         const AdaptiveGainCurve& g = md.gains[size_t(a)];
@@ -373,7 +376,7 @@ void adaptiveGain(const AdaptiveHdr& md, const double c[3], double headroom, dou
             for (int k = 0; k < 3; ++k) gain[k] += weight * adaptiveGainCurve(g, c[k] * g.mix[5] + common);
         }
     };
-    if (hs[i] == h || i + 1 >= hs.size()) {
+    if (hs[i] == h || i + 1 >= count) {
         addCurve(which[i], 1);
         return;
     }
@@ -382,9 +385,33 @@ void adaptiveGain(const AdaptiveHdr& md, const double c[3], double headroom, dou
     addCurve(which[i + 1], w1);
 }
 
+bool adaptiveHdrAlike(const AdaptiveHdr& a, const AdaptiveHdr& b) {
+    auto near = [](double x, double y, double tol) { return std::fabs(x - y) <= tol; };
+    if (a.toneMap != b.toneMap || a.computed != b.computed || !near(a.referenceWhite, b.referenceWhite, 0.5) || !near(a.baseline, b.baseline, 0.01) ||
+        a.chromaMode != b.chromaMode || a.alternate.size() != b.alternate.size() || a.gains.size() != b.gains.size())
+        return false;
+    for (int i = 0; i < 8; ++i)
+        if (!near(a.chroma[i], b.chroma[i], 1e-4)) return false;
+    for (size_t k = 0; k < a.alternate.size(); ++k) {
+        if (!near(a.alternate[k], b.alternate[k], 0.01)) return false;
+        const AdaptiveGainCurve &ga = a.gains[k], &gb = b.gains[k];
+        for (int i = 0; i < 6; ++i)
+            if (!near(ga.mix[i], gb.mix[i], 1e-3)) return false;
+        // Compared where they act: their gains from a sixteenth of reference white to past the higher headroom.
+        const double top = std::exp2(std::max({a.baseline, a.alternate[k], 0.0}) + 0.5);
+        for (int i = 0; i <= 16; ++i) {
+            const double x = std::exp2(-4 + (std::log2(top) + 4) * i / 16.0);
+            if (!near(adaptiveGainCurve(ga, x), adaptiveGainCurve(gb, x), 0.01)) return false;
+        }
+    }
+    return true;
+}
+
 bool adaptiveToneMaps(const AdaptiveHdr& md, double headroom) {
     if (!md.toneMap || md.gains.empty()) return false;
-    const double lo = std::min(md.baseline, md.alternate.front()), hi = std::max(md.baseline, md.alternate.back());
+    if (md.alternate.empty()) return false;
+    const auto [first, last] = std::minmax_element(md.alternate.begin(), md.alternate.end());
+    const double lo = std::min(md.baseline, *first), hi = std::max(md.baseline, *last);
     return std::fabs(std::clamp(headroom, lo, hi) - md.baseline) > 1e-9;
 }
 
@@ -420,6 +447,7 @@ void sanitizeAdaptiveHdr(AdaptiveHdr& md) {
         if (sum <= 0) std::fill(g.mix, g.mix + 6, 0.0), g.mix[3] = 1, sum = 1;
         for (double& k : g.mix) k /= sum;
         const size_t n = std::min<size_t>({g.x.size(), g.y.size(), 32});
+        if (n == 0) continue;
         g.x.resize(n);
         g.y.resize(n);
         double last = 0;
