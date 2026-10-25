@@ -231,6 +231,7 @@
 #include "render/LutExport.h"
 #include "render/FrameRepair.h"
 #include "render/Intelligibility.h"
+#include "render/MonitorSection.h"
 #include "media/TakeChoice.h"
 
 extern "C" {
@@ -499,8 +500,10 @@ std::vector<SubEvent> readSubtitles(const std::string& path, const char* format,
     return out;
 }
 
-// The n-th audio stream of a file as interleaved stereo float at 48 kHz, with its title and language tags.
-std::vector<float> decodeAudioStream(const std::string& path, int n, std::string* title = nullptr, std::string* language = nullptr) {
+// The n-th audio stream of a file as interleaved stereo float at 48 kHz, with its title and language tags (`native`:
+// in its own channels).
+std::vector<float> decodeAudioStream(const std::string& path, int n, std::string* title = nullptr, std::string* language = nullptr,
+                                     bool native = false) {
     std::vector<float> out;
     AVFormatContext* fmt = nullptr;
     if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return out;
@@ -526,16 +529,18 @@ std::vector<float> decodeAudioStream(const std::string& path, int n, std::string
     avcodec_open2(ctx, codec, nullptr);
     SwrContext* swr = nullptr;
     AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
-    swr_alloc_set_opts2(&swr, &stereo, AV_SAMPLE_FMT_FLT, 48000, &ctx->ch_layout, ctx->sample_fmt, ctx->sample_rate, 0, nullptr);
+    const AVChannelLayout* to = native ? &ctx->ch_layout : &stereo;
+    const size_t chs = size_t(to->nb_channels);
+    swr_alloc_set_opts2(&swr, to, AV_SAMPLE_FMT_FLT, 48000, &ctx->ch_layout, ctx->sample_fmt, ctx->sample_rate, 0, nullptr);
     swr_init(swr);
     AVPacket* pkt = av_packet_alloc();
     AVFrame* fr = av_frame_alloc();
     auto drainFrames = [&] {
         while (avcodec_receive_frame(ctx, fr) >= 0) {
-            std::vector<float> buf(size_t(fr->nb_samples + 256) * 2);
+            std::vector<float> buf(size_t(fr->nb_samples + 256) * chs);
             uint8_t* o[1] = {reinterpret_cast<uint8_t*>(buf.data())};
             const int got = swr_convert(swr, o, fr->nb_samples + 256, const_cast<const uint8_t**>(fr->extended_data), fr->nb_samples);
-            if (got > 0) out.insert(out.end(), buf.begin(), buf.begin() + got * 2);
+            if (got > 0) out.insert(out.end(), buf.begin(), buf.begin() + size_t(got) * chs);
         }
     };
     while (av_read_frame(fmt, pkt) >= 0) {
@@ -11636,6 +11641,87 @@ private slots:
         QCOMPARE(out.value("objects").toArray().at(0).toString(), QString("A2"));
         res = call("montage_set_surround", {{"project", project}, {"layout", "9.1"}});
         QVERIFY(res.value("isError").toBool());
+    }
+
+    void monitorListenAs() {
+        // A 5.1.4 sequence with a tone on each speaker (200 Hz on L, 300 on R...; 60 Hz to the LFE), heard on 5.1.4
+        // speakers as 5.1: the programme is what a 5.1 export carries, sample for sample, and only on the 5.1 speakers.
+        const int rate = 48000;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.audioLayout = "5.1.4";
+        const std::vector<Speaker>& speakers = layoutSpeakers("5.1.4");
+        const int channels = int(speakers.size());
+        for (int c = 0; c < channels; ++c) {
+            const double hz = speakers[size_t(c)].lfe ? 60.0 : 200.0 + 100.0 * c;
+            std::vector<float> x(static_cast<size_t>(rate));
+            for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.2 * std::sin(2 * M_PI * hz * double(i) / rate));
+            const std::string f = path(("listen-tone" + std::to_string(c) + ".wav").c_str());
+            QVERIFY(writeMonoWav(f, x, rate));
+            p.media.push_back(probeOrFail(p, f));
+            while (int(s.audioTracks.size()) <= c) edit::addTrack(p, s, TrackKind::Audio);
+            QVERIFY(edit::placeMedia(p, s, p.media.back().id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, c}, false).ok);
+            SurroundPan& pan = s.audioTracks[size_t(c)].surround;
+            const double a = speakers[size_t(c)].angle * M_PI / 180;
+            pan.x = std::sin(a), pan.y = std::cos(a), pan.z = speakers[size_t(c)].elevation > 0 ? 1 : 0, pan.width = 0;
+            if (speakers[size_t(c)].lfe) pan.lfeDb = 10;
+        }
+        const int64_t total = std::llround(double(s.duration()) * rate / s.fpsValue());
+        QVERIFY(total > rate / 2);
+
+        // FLAC carries no more than 5.1 of it.
+        QCOMPARE(exportAudioLayout("5.1.4", "flac"), std::string("5.1"));
+        ExportSettings flac;
+        flac.path = path("listen51.mkv");
+        flac.videoCodec = "none";
+        flac.audioCodec = "flac";
+        std::string err;
+        QVERIFY2(exportSequence(p, s, flac, nullptr, nullptr, &err), err.c_str());
+        const std::vector<float> file = decodeAudioStream(flac.path, 0, nullptr, nullptr, true);
+        QCOMPARE(int64_t(file.size()), total * 6);
+        Sequence five = s;
+        five.audioLayout = "5.1";
+        std::vector<float> mix(size_t(total) * 6);
+        {
+            AudioMixer mixer;
+            mixer.mixLayout(p, five, 0, int(total), mix.data());
+        }
+
+        MonitorSettings m;
+        m.on = true;
+        m.speakers = "5.1.4";
+        m.listenAs = "5.1";
+        QCOMPARE(listenLayout(m, s), std::string("5.1"));
+        Monitor monitor;
+        monitor.setSettings(m, rate);
+        monitor.prepare(std::make_shared<const Project>(p), s.id);
+        QCOMPARE(monitor.outputs(), channels);
+        std::vector<float> out(size_t(total) * size_t(channels));
+        for (int64_t at = 0; at < total; at += 1000) {
+            const int n = int(std::min<int64_t>(1000, total - at));
+            monitor.render(at, n, out.data() + size_t(at) * size_t(channels));
+        }
+        const std::vector<Speaker>& fiveOne = layoutSpeakers("5.1");
+        auto speakerIndex = [](const std::vector<Speaker>& set, const char* name) {
+            for (size_t k = 0; k < set.size(); ++k)
+                if (std::string(set[k].name) == name) return int(k);
+            return -1;
+        };
+        double vsMix = 0, vsFile = 0, elsewhere = 0;
+        for (int64_t i = 0; i < total; ++i) {
+            for (int c = 0; c < 6; ++c) {
+                const int k = speakerIndex(speakers, fiveOne[size_t(c)].name);
+                QVERIFY(k >= 0);
+                const float heard = out[size_t(i) * size_t(channels) + size_t(k)];
+                vsMix = std::max(vsMix, double(std::fabs(heard - mix[size_t(i) * 6 + size_t(c)])));
+                vsFile = std::max(vsFile, double(std::fabs(heard - file[size_t(i) * 6 + size_t(c)])));
+            }
+            for (int k = 0; k < channels; ++k)
+                if (speakerIndex(fiveOne, speakers[size_t(k)].name) < 0) elsewhere = std::max(elsewhere, double(std::fabs(out[size_t(i) * size_t(channels) + size_t(k)])));
+        }
+        QCOMPARE(vsMix, 0.0);
+        QVERIFY2(vsFile < 1.5 / 32768, qPrintable(QString::number(vsFile)));  // (within the file's 16-bit steps)
+        QCOMPARE(elsewhere, 0.0);
     }
 
     void immersiveAudioAsIamf() {

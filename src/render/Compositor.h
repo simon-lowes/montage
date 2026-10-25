@@ -145,7 +145,8 @@ public:
     // The same in the sequence's own layout (core/Surround.h): `out` gets
     // layoutChannels(seq.audioLayout) interleaved channels. mix() gives the
     // stereo fold-down of a surround mix, for listening.
-    void mixLayout(const Project& p, const Sequence& seq, int64_t start, int frames, float* out);
+    void mixLayout(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
+                   std::vector<MeterLevels>* trackLevels = nullptr);
     // Mixes only the audio tracks whose entry is true (stems); empty = all.
     void setTrackMask(std::vector<bool> mask) { mask_ = std::move(mask); }
     // Audio tracks heard only through their LFE send (ADM objects: their position is the object's, their LFE send

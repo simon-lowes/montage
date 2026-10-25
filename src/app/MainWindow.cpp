@@ -156,6 +156,7 @@
 #include "control/Midi.h"
 #include "MulticamPanel.h"
 #include "AdrPanel.h"
+#include "MonitoringPanel.h"
 #include "LinedScriptPanel.h"
 #include "AudioDescriptionDialog.h"
 #include "FootageNotesDialog.h"
@@ -463,6 +464,10 @@ void MainWindow::buildPanels() {
         inspectorDock_->show();
         inspectorDock_->raise();
     });
+    // The monitoring section (speakers, Listen As, Dim, calibration, the cue mix), kept in the app's settings.
+    MonitoringPanel::restore(program_);
+    monitoring_ = new MonitoringPanel(state_, program_, this);
+    mixer_->setMonitor(program_);
     // A hardware control surface (Mackie Control) works the mixer and transport.
     surface_ = new ControlSurface(state_, mixer_, program_, this);
     connect(program_, &PlaybackController::audioLevels, surface_, &ControlSurface::setLevels);
@@ -495,6 +500,12 @@ void MainWindow::buildPanels() {
         surface_->setCommand(QString::fromLatin1(name), fn);
         osc_->setCommand(QString::fromLatin1(name), fn);
     }
+    // The monitor keys (F1 to F4 on a Mackie Control or HUI).
+    surface_->setCommand(QStringLiteral("dim"), [this] { monitoring_->toggleDim(); });
+    surface_->setCommand(QStringLiteral("mono"), [this] { monitoring_->toggleMono(); });
+    surface_->setCommand(QStringLiteral("monitorMute"), [this] { monitoring_->toggleMute(); });
+    surface_->setCommand(QStringLiteral("talkbackOn"), [this] { program_->setTalkback(program_->monitoring().cue.on); });
+    surface_->setCommand(QStringLiteral("talkbackOff"), [this] { program_->setTalkback(false); });
     osc_->setFeedbackPort(quint16(appSettings().value(QStringLiteral("osc/feedbackPort"), 0).toInt()));
     osc_->setToolsAllowed(appSettings().value(QStringLiteral("osc/tools"), false).toBool());
     if (appSettings().value(QStringLiteral("osc/enabled"), false).toBool()) {
@@ -591,6 +602,7 @@ void MainWindow::buildPanels() {
     multicamDock_ = makeDock(tr("Multicam"), "multicam", multicam_);
     adr_ = new AdrPanel(state_, program_, programPanel_->viewer(), this);
     adrDock_ = makeDock(tr("ADR"), "adr", adr_);
+    monitoringDock_ = makeDock(tr("Monitoring"), "monitoring", monitoring_);
     keyframesDock_ = makeDock(tr("Keyframes"), "keyframes", new KeyframePanel(state_, this));
     gradeNodes_ = new GradeNodePanel(state_, this);
     nodesDock_ = makeDock(tr("Nodes"), "nodes", gradeNodes_);
@@ -867,7 +879,7 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         resizeDocks({clipsDock_}, {150}, Qt::Vertical);
     } else if (name == "Audio") {
         // The mixer where the Source monitor was, wide meters (Premiere's Audio workspace, Resolve's Fairlight page).
-        arrangeDocks({{mixerDock_, adrDock_, sourceDock_}, {programDock_}}, {{binDock_, soundLibraryDock_, effectsDock_}}, {{meterDock_}});
+        arrangeDocks({{mixerDock_, adrDock_, monitoringDock_, sourceDock_}, {programDock_}}, {{binDock_, soundLibraryDock_, effectsDock_}}, {{meterDock_}});
         resizeDocks({mixerDock_, programDock_}, {900, 640}, Qt::Horizontal);
         resizeDocks({mixerDock_}, {h / 2 + 40}, Qt::Vertical);
         resizeDocks({meterDock_}, {110}, Qt::Horizontal);
@@ -2275,6 +2287,10 @@ void MainWindow::buildMenus() {
     monitorCalibrationAction_->setToolTip(tr("A calibration LUT for each display and the reference output, and a patch generator for calibration software"));
     connect(monitorCalibrationAction_, &QAction::triggered, this, [this] { showMonitorCalibration(); });
     addAction(monitorCalibrationAction_);
+    if (liveLink_)
+        liveLink_->addAppTool(MonitoringPanel::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
+            return monitoring_->runTool(args, structured, isError);
+        });
     if (liveLink_)
         liveLink_->addAppTool(RemoteReviewController::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
             return remoteReview_->runTool(args, structured, isError);

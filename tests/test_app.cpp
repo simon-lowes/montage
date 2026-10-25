@@ -1,6 +1,7 @@
 // Application integration tests: drive the real main window offscreen —
 // timeline mouse gestures, tools, undo, inspector, monitors and playback.
 #include <QtTest>
+#include <complex>
 #include <limits>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -157,6 +158,7 @@
 #include "media/Translator.h"
 #include "ModelPacks.h"
 #include "MixerPanel.h"
+#include "MonitoringPanel.h"
 #include "ControlSurface.h"
 #include "OscControl.h"
 #include "SpeedEditorControl.h"
@@ -9894,6 +9896,221 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(dlg->findChild<QPushButton*>("voiceoverRecord"));
         dlg->close();
         state()->newProject();
+    }
+
+    void monitoringSection() {
+        // A 440 Hz tone on A1 panned left and a 1 kHz tone on A2 panned right.
+        const int rate = 48000;
+        std::vector<float> a(size_t(rate) * 2), b(a.size());
+        for (size_t i = 0; i < a.size(); ++i) {
+            a[i] = float(0.3 * std::sin(2 * M_PI * 440 * double(i) / rate));
+            b[i] = float(0.3 * std::sin(2 * M_PI * 1000 * double(i) / rate));
+        }
+        auto writeWav = [](const QString& file, const std::vector<float>& x) {
+            WavWriter w;
+            if (!w.open(file, 48000, 1)) return false;
+            w.write(x.data(), int64_t(x.size()));
+            return w.close();
+        };
+        QVERIFY(writeWav(dir_.path() + "/mon440.wav", a));
+        QVERIFY(writeWav(dir_.path() + "/mon1k.wav", b));
+        state()->newProject();
+        const auto ids = state()->importFiles({dir_.path() + "/mon440.wav", dir_.path() + "/mon1k.wav"});
+        QCOMPARE(ids.size(), size_t(2));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            while (s.audioTracks.size() < 2) edit::addTrack(p, s, TrackKind::Audio);
+            s.audioTracks[0].pan = -1;
+            s.audioTracks[1].pan = 1;
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok &&
+                   edit::placeMedia(p, s, ids[1], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok;
+        }));
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        auto* panel = win_->findChild<MonitoringPanel*>("monitoringPanel");
+        QVERIFY(program && panel);
+        auto tone = [&](const std::vector<float>& x, int chs, int ch, double hz) {
+            const size_t n = x.size() / size_t(chs);
+            std::complex<double> acc = 0;
+            for (size_t i = 0; i < n; ++i) acc += double(x[i * size_t(chs) + size_t(ch)]) * std::polar(1.0, -2 * M_PI * hz * double(i) / rate);
+            return 2 * std::abs(acc) / double(n);
+        };
+        const int n = 9600;
+        QTRY_VERIFY(tone(program->heard(0, n), 2, 0, 440) > 0.1);
+        const std::vector<float> heard = program->heard(0, n);
+        QVERIFY(tone(heard, 2, 1, 1000) > 0.1 && tone(heard, 2, 1, 440) < 0.01);
+
+        // On, with the speakers as they are: what is heard is the mix.
+        auto* on = panel->findChild<QCheckBox*>("monitorOn");
+        QVERIFY(!program->monitoring().on && !panel->findChild<QToolButton*>("monitorDim")->isEnabled());
+        on->click();
+        QVERIFY(program->monitoring().on);
+        QCOMPARE(program->monitored(0, n), heard);
+        // The right speaker 37 samples late and 3.2 dB down, typed in its row.
+        auto* table = panel->findChild<QTableWidget*>("monitorSpeakerTable");
+        QCOMPARE(table->rowCount(), 2);
+        QCOMPARE(table->item(1, 0)->text(), QString("R"));
+        table->item(1, 2)->setText("-3.2");
+        table->item(1, 3)->setText("37");
+        QCOMPARE(monitorSpeaker(program->monitoring(), 1), (MonitorSpeaker{1, -3.2, 37}));
+        {
+            const std::vector<float> out = program->monitored(0, n);
+            const float g = float(std::pow(10.0, -3.2 / 20));
+            double worst = 0;
+            for (int i = 0; i < n; ++i) {
+                worst = std::max(worst, double(std::fabs(out[size_t(i) * 2] - heard[size_t(i) * 2])));
+                const float want = i < 37 ? 0.0f : g * heard[size_t(i - 37) * 2 + 1];
+                worst = std::max(worst, double(std::fabs(out[size_t(i) * 2 + 1] - want)));
+            }
+            QVERIFY2(worst < 1e-6, qPrintable(QString::number(worst)));
+        }
+        table->item(1, 2)->setText("0");
+        table->item(1, 3)->setText("0");
+        // Dim (from F1 on a Mackie Control) is 20 dB down; Mono puts (L + R) / 2 on both.
+        struct Quiet : MidiConnection {
+            bool send(const MidiMessage&) override { return true; }
+            std::string inputName() const override { return "X-Touch"; }
+            std::string outputName() const override { return "X-Touch"; }
+        };
+        ControlSurface* surface = win_->controlSurface();
+        surface->setConnection(std::make_unique<Quiet>());
+        surface->handle({0x90, uint8_t(mcu::F1), 0x7F});
+        surface->handle({0x90, uint8_t(mcu::F1), 0x00});
+        QVERIFY(program->monitoring().dim && panel->findChild<QToolButton*>("monitorDim")->isChecked());
+        {
+            const std::vector<float> out = program->monitored(0, n);
+            double worst = 0;
+            for (size_t i = 0; i < out.size(); ++i) worst = std::max(worst, double(std::fabs(out[i] - 0.1f * heard[i])));
+            QVERIFY2(worst < 1e-6, qPrintable(QString::number(worst)));
+        }
+        surface->handle({0x90, uint8_t(mcu::F1), 0x7F});
+        QVERIFY(!program->monitoring().dim);
+        panel->findChild<QToolButton*>("monitorMono")->click();
+        QVERIFY(program->monitoring().mono);
+        {
+            const std::vector<float> out = program->monitored(0, n);
+            double worst = 0;
+            for (int i = 0; i < n; ++i) {
+                const float m = (heard[size_t(i) * 2] + heard[size_t(i) * 2 + 1]) / 2;
+                worst = std::max({worst, double(std::fabs(out[size_t(i) * 2] - m)), double(std::fabs(out[size_t(i) * 2 + 1] - m))});
+            }
+            QVERIFY2(worst < 1e-6, qPrintable(QString::number(worst)));
+        }
+        panel->findChild<QToolButton*>("monitorMono")->click();
+        // F3 mutes the speakers.
+        surface->handle({0x90, uint8_t(mcu::F1 + 2), 0x7F});
+        QVERIFY(program->monitoring().mute);
+        {
+            const std::vector<float> out = program->monitored(0, n);
+            QVERIFY(std::all_of(out.begin(), out.end(), [](float v) { return v == 0.0f; }));
+        }
+        surface->handle({0x90, uint8_t(mcu::F1 + 2), 0x7F});
+        QVERIFY(!program->monitoring().mute);
+
+        // The mixer's solo after the fader: A2 alone is heard, the project's solos untouched (and nothing to undo).
+        auto* soloMode = panel->findChild<QComboBox*>("monitorSoloMode");
+        soloMode->setCurrentIndex(soloMode->findData(int(MonitorSolo::AfterFader)));
+        QCOMPARE(program->monitoring().soloMode, MonitorSolo::AfterFader);
+        auto* mixer = win_->findChild<MixerPanel*>();
+        const bool couldUndo = state()->canUndo();
+        mixer->trackSolo(1)->click();
+        QCOMPARE(program->monitoring().soloTracks, std::vector<int>{1});
+        QVERIFY(mixer->trackSolo(1)->isChecked() && !mixer->trackSolo(0)->isChecked());
+        QVERIFY(!state()->sequence()->audioTracks[0].solo && !state()->sequence()->audioTracks[1].solo);
+        QCOMPARE(state()->canUndo(), couldUndo);
+        {
+            const std::vector<float> out = program->monitored(0, n);
+            QVERIFY(tone(out, 2, 0, 440) < 1e-4 && tone(out, 2, 1, 1000) > 0.1);
+        }
+
+        // The cue mix on channels 3 and 4: A1 alone (the speakers still hear the solo).
+        panel->findChild<QCheckBox*>("monitorCueOn")->click();
+        panel->findChild<QSpinBox*>("monitorCueOutput")->setValue(3);
+        panel->findChild<QCheckBox*>("monitorCueBeeps")->setChecked(false);
+        panel->findChild<QListWidget*>("monitorCueTracks")->item(0)->setCheckState(Qt::Checked);
+        QCOMPARE(program->monitoring().cue.tracks, std::vector<int>{0});
+        QCOMPARE(monitorOutputs(program->monitoring()), 4);
+        {
+            const std::vector<float> out = program->monitored(0, n);
+            QCOMPARE(out.size(), size_t(n) * 4);
+            QVERIFY(tone(out, 4, 2, 440) > 0.05 && tone(out, 4, 2, 1000) < 1e-4 && tone(out, 4, 3, 1000) < 1e-4);
+            QVERIFY(tone(out, 4, 0, 440) < 1e-4 && tone(out, 4, 1, 1000) > 0.1);
+        }
+        // F4 talks back while it is held.
+        surface->handle({0x90, uint8_t(mcu::F1 + 3), 0x7F});
+        QVERIFY(program->talkback() && panel->findChild<QToolButton*>("monitorTalkback")->isEnabled());
+        surface->handle({0x90, uint8_t(mcu::F1 + 3), 0x00});
+        QVERIFY(!program->talkback());
+
+        // With all of it on, an export is bit for bit the one made with it off.
+        surface->handle({0x90, uint8_t(mcu::F1), 0x7F});
+        panel->findChild<QToolButton*>("monitorMono")->click();
+        table->item(0, 2)->setText("-6");
+        table->item(0, 3)->setText("100");
+        QVERIFY(program->monitoring().dim && program->monitoring().mono);
+        auto exported = [&](const QString& name) {
+            ExportSettings wav;
+            wav.path = (dir_.path() + "/" + name).toStdString();
+            wav.videoCodec = "none";
+            wav.audioCodec = "pcm_s24le";
+            std::string err;
+            if (!exportSequence(state()->project(), *state()->sequence(), wav, nullptr, nullptr, &err)) return QByteArray();
+            QFile f(QString::fromStdString(wav.path));
+            if (!f.open(QIODevice::ReadOnly)) return QByteArray();
+            const QByteArray all = f.readAll();
+            return all.mid(all.indexOf("data"));  // (the sound, whatever the header's dates)
+        };
+        const QByteArray withMonitoring = exported("mon-on.wav");
+        QVERIFY(withMonitoring.size() > rate * 6);
+
+        // MCP: read and change it, calibrate a speaker and set the level from the meter's reading.
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 3}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_monitoring"}, {"arguments", args}}}};
+            win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+            return answer;
+        };
+        QJsonObject r = call({{"action", "get"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject got = r.value("structuredContent").toObject();
+        QVERIFY(got.value("on").toBool() && got.value("dim").toBool() && got.value("solo_mode").toString() == "afl");
+        QCOMPARE(got.value("outputs").toInt(), 4);
+        r = call({{"action", "set"}, {"settings", QJsonObject{{"dim", false}, {"mono", false}, {"solo_mode", "project"}, {"cue", QJsonObject{{"on", false}}},
+                                                              {"map", QJsonArray{}}, {"level_db", 0}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(!program->monitoring().dim && !program->monitoring().cue.on && program->monitoring().soloTracks.empty());
+        QVERIFY(!panel->findChild<QToolButton*>("monitorDim")->isChecked());
+        QVERIFY(!mixer->trackSolo(1)->isChecked());
+        r = call({{"action", "calibrate"}, {"speaker", 1}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(program->monitorCalibration(), 1);
+        {
+            // Pink noise at -20 dBFS RMS on the right speaker alone, even while stopped.
+            const std::vector<float> out = program->monitored(0, rate * 10, true);
+            double left = 0, right = 0;
+            for (int i = 0; i < rate * 10; ++i) left += double(out[size_t(i) * 2]) * out[size_t(i) * 2], right += double(out[size_t(i) * 2 + 1]) * out[size_t(i) * 2 + 1];
+            QCOMPARE(left, 0.0);
+            const double rms = 10 * std::log10(right / (rate * 10));
+            QVERIFY2(std::fabs(rms + 20) < 0.1, qPrintable(QString::number(rms)));
+        }
+        r = call({{"action", "reading"}, {"spl", 88.0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(program->monitoring().levelDb, -3.0);  // 85 dB SPL wanted
+        QCOMPARE(panel->findChild<QDoubleSpinBox*>("monitorLevel")->value(), -3.0);
+        QVERIFY(call({{"action", "reading"}}).value("isError").toBool());
+        call({{"action", "calibrate"}, {"speaker", -1}});
+        QCOMPARE(program->monitorCalibration(), -1);
+        // Kept in the app's settings (but not its solos), for the next start.
+        QVERIFY(appSettings().value("monitoring/settings").toString().contains("\"level_db\":-3"));
+
+        // Off: the same export.
+        on->click();
+        QVERIFY(!program->monitoring().on);
+        QCOMPARE(program->monitored(0, n), heard);
+        QCOMPARE(exported("mon-off.wav"), withMonitoring);
+        appSettings().remove("monitoring/settings");
+        program->setMonitoring(MonitorSettings{});
+        surface->disconnectSurface();
     }
 
     void loopRecordingTakeLanes() {

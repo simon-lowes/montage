@@ -21,6 +21,7 @@
 
 #include "AudioMeterWidget.h"
 #include "EditorState.h"
+#include "PlaybackController.h"
 #include "SurroundPanner.h"
 #include "core/Automation.h"
 #include "core/Surround.h"
@@ -941,7 +942,14 @@ void MixerPanel::refresh() {
         }
         {
             const QSignalBlocker block(s.solo);
-            s.solo->setChecked(t.solo);
+            const MonitorSettings* m = monitor_ && monitor_->monitoring().on && monitor_->monitoring().soloMode != MonitorSolo::Project
+                                           ? &monitor_->monitoring()
+                                           : nullptr;
+            s.solo->setChecked(m ? std::find(m->soloTracks.begin(), m->soloTracks.end(), int(i)) != m->soloTracks.end() : t.solo);
+            s.solo->setToolTip(!m                                         ? tr("Solo")
+                               : m->soloMode == MonitorSolo::InPlace     ? tr("Solo in place (heard only, not exported)")
+                               : m->soloMode == MonitorSolo::AfterFader  ? tr("After-fader listen (heard only)")
+                                                                          : tr("Pre-fader listen (heard only)"));
         }
         s.fx->setText(t.effects.empty() ? tr("FX") : tr("FX %1").arg(t.effects.size()));
         {
@@ -1652,7 +1660,21 @@ void MixerPanel::setMute(int index, bool on) {
         refresh();
 }
 
+void MixerPanel::setMonitor(PlaybackController* monitor) {
+    monitor_ = monitor;
+    connect(monitor_, &PlaybackController::monitoringChanged, this, &MixerPanel::refresh);
+    refresh();
+}
+
 void MixerPanel::setSolo(int index, bool on) {
+    if (monitor_ && monitor_->monitoring().on && monitor_->monitoring().soloMode != MonitorSolo::Project) {
+        MonitorSettings m = monitor_->monitoring();
+        auto it = std::find(m.soloTracks.begin(), m.soloTracks.end(), index);
+        if (on && it == m.soloTracks.end()) m.soloTracks.push_back(index);
+        else if (!on && it != m.soloTracks.end()) m.soloTracks.erase(it);
+        monitor_->setMonitoring(m);
+        return;
+    }
     const bool ok = state_->edit(on ? tr("Solo Track") : tr("Unsolo Track"), [index, on](Project&, Sequence& s) {
         if (index >= int(s.audioTracks.size()) || s.audioTracks[index].solo == on)
             return false;

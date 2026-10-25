@@ -3429,7 +3429,8 @@ void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int f
     downmixToStereo(seq.audioLayout, full.data(), frames, out);
 }
 
-void AudioMixer::mixLayout(const Project& p, const Sequence& seq, int64_t start, int frames, float* out) {
+void AudioMixer::mixLayout(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
+                           std::vector<MeterLevels>* trackLevels) {
     ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
     const int n = layoutChannels(seq.audioLayout);
     std::lock_guard lock(m_);
@@ -3443,7 +3444,7 @@ void AudioMixer::mixLayout(const Project& p, const Sequence& seq, int64_t start,
     }
     nextStart_ = start + frames;
     startTape();
-    mixInto(p, seq, start, frames, out, nullptr, 0, 0, -1, n);
+    mixInto(p, seq, start, frames, out, trackLevels, 0, 0, -1, n);
 }
 
 bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Track& track, int64_t start, int frames,

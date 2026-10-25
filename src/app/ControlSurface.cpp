@@ -435,7 +435,16 @@ void ControlSurface::command(const QString& name) {
 }
 
 void ControlSurface::button(int note, bool down) {
+    // The monitor keys (F1 Dim, F2 Mono, F3 Mute; F4 talks back while it is held).
+    if (note == mcu::F1 + 3) {
+        command(down ? QStringLiteral("talkbackOn") : QStringLiteral("talkbackOff"));
+        return;
+    }
     if (!down) return;
+    if (note >= mcu::F1 && note < mcu::F1 + 3) {
+        command(note == mcu::F1 ? QStringLiteral("dim") : note == mcu::F1 + 1 ? QStringLiteral("mono") : QStringLiteral("monitorMute"));
+        return;
+    }
     const int n = tracks();
     auto strip = [&](int base) { return note >= base && note < base + mcu::kStrips ? bank_ + note - base : -1; };
     if (const int t = strip(mcu::Mute); t >= 0) {

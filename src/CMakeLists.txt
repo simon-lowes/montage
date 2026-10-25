@@ -245,6 +245,7 @@ add_library(montage_engine STATIC
   render/SkyReplace.h render/SkyReplace.cpp
   render/FaceShape.h render/FaceShape.cpp
   render/MonitorCalibration.h render/MonitorCalibration.cpp
+  render/MonitorSection.h render/MonitorSection.cpp
   audio/Plugins.h audio/PluginScan.cpp audio/ClapHost.cpp
   audio/DynLib.h audio/DynLib.cpp
   audio/PluginEffect.h audio/PluginEffect.cpp

@@ -18,8 +18,10 @@
 #include "media/StereoAnalysis.h"
 #include "render/Compositor.h"
 #include "render/HdrView.h"
+#include "render/MonitorSection.h"
 
 class QAudioSink;
+class QAudioSource;
 class QIODevice;
 class QThread;
 
@@ -103,6 +105,30 @@ public:
     void setSpectrumKWeighting(bool on);
     // What the speakers get for `frames` samples of the sequence from sample `start` (silence under Global Mute).
     std::vector<float> heard(int64_t start, int frames);
+
+    // The monitoring section (render/MonitorSection.h): speaker sets, Listen As, Dim, Mono, Mute, monitor solos, the
+    // reference level and the cue mix, after the mix in playback alone (never in an export). The output device is the
+    // system's default unless named (QAudioDevice description); it is opened with the channels the setting needs, or
+    // two when it cannot take them (then only the first two channels are heard).
+    void setMonitoring(const MonitorSettings& s);
+    const MonitorSettings& monitoring() const { return monitoring_; }
+    void setAudioOutput(const QString& description);
+    QString audioOutput() const { return audioOutput_; }
+    int outputChannels() const { return outputChannels_; }  // as the device was last opened
+    // Calibration noise on one speaker of the set (-1 off): heard while stopped too.
+    void setMonitorCalibration(int speaker);
+    int monitorCalibration() const { return calibration_; }
+    // Talkback into the cue mix while held, from the talkback microphone (QAudioDevice description; "" the
+    // default input), heard while stopped too.
+    void setTalkback(bool on);
+    bool talkback() const { return talkback_; }
+    void setTalkbackInput(const QString& description) { talkbackInput_ = description; }
+    QString talkbackInput() const { return talkbackInput_; }
+    // The talkback microphone's sound, as it arrives (mono at the sequence's rate).
+    void feedTalkback(const float* mono, int frames);
+    // What the device gets through the monitoring section for `frames` samples from sample `start` (outputs channels,
+    // interleaved), from a monitor of its own; `idle` as while stopped (no programme).
+    std::vector<float> monitored(int64_t start, int frames, bool idle = false);
     double speed() const { return speed_; }
     FrameTime position() const { return position_; }
 
@@ -144,13 +170,16 @@ signals:
     // Phase correlation, goniometer and spectrum of what is heard (media/StereoAnalysis.h), ten times a second.
     void audioAnalysis(montage::AudioAnalysisPtr analysis);
     void playingChanged(bool playing);
+    void monitoringChanged();
 
 private slots:
     void tick();
 
 private:
-    void startAudio(FrameTime from);
+    void startAudio(FrameTime from, bool idle = false);
     void stopAudio();
+    bool monitorKeepsAudio() const { return monitoring_.on && (calibration_ >= 0 || talkback_); }
+    void startTalkbackInput();
     FrameTime clampToSequence(FrameTime t) const;
     int playStep() const;
     void scrubAudio(FrameTime t);  // frames per tick direction for render-ahead (0 = paused)
@@ -192,6 +221,14 @@ private:
     AudioMixer scrubMixer_;
     bool globalMute_ = false;
     bool ambisonicBinaural_ = true;
+    MonitorSettings monitoring_;
+    QString audioOutput_, talkbackInput_;
+    int outputChannels_ = 2;
+    int calibration_ = -1;
+    bool talkback_ = false;
+    QAudioSource* talkSource_ = nullptr;
+    QIODevice* talkIo_ = nullptr;
+    std::unique_ptr<Monitor> testMonitor_;
     std::shared_ptr<output::Scheduler> output_;
     std::shared_ptr<OutputAudio> outputAudio_;
     std::shared_ptr<output::Scheduler> review_;

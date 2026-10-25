@@ -87,6 +87,7 @@
 #include "render/LutExport.h"
 #include "render/GrainMatch.h"
 #include "render/LutToGrade.h"
+#include "render/MonitorSection.h"
 #include "render/LightLevel.h"
 #include "render/Relight.h"
 #include "render/Deconvolve.h"
@@ -8013,6 +8014,190 @@ colorspaces:
         // (Rec.709 pictures fill under half of ACEScct's range, so the 17-point residual is coarser there than the
         // 33-point LUT, and coming back out of the log curve magnifies what it misses.)
         QVERIFY2(worst < 0.15f && mean < 0.005, qPrintable(QString("%1 %2").arg(worst).arg(mean)));
+    }
+
+    void monitorSection() {
+        const int rate = 48000;
+        auto db = [](double x) { return 20 * std::log10(x); };
+        // A 1 kHz tone on the right speaker, 37 samples late and 3.2 dB down, whatever the blocks.
+        MonitorSettings s;
+        s.on = true;
+        s.map = {{0, 0, 0}, {1, -3.2, 37}};
+        MonitorSection m;
+        m.configure(s, rate);
+        QCOMPARE(m.outputs(), 2);
+        const int n = 4800;
+        std::vector<float> in(size_t(n) * 2, 0.0f), out(size_t(n) * 2);
+        for (int i = 0; i < n; ++i) in[size_t(i) * 2 + 1] = float(0.5 * std::sin(2 * M_PI * 1000 * i / rate));
+        m.process("stereo", in.data(), nullptr, 1000, out.data());
+        m.process("stereo", in.data() + 2000, nullptr, n - 1000, out.data() + 2000);
+        const float g = float(std::pow(10.0, -3.2 / 20));
+        double worst = 0;
+        for (int i = 0; i < n; ++i) {
+            const float want = i < 37 ? 0.0f : g * in[size_t(i - 37) * 2 + 1];
+            worst = std::max(worst, double(std::fabs(out[size_t(i) * 2 + 1] - want)));
+            QCOMPARE(out[size_t(i) * 2], 0.0f);
+        }
+        QVERIFY2(worst < 1e-7, qPrintable(QString::number(worst)));
+        // Dim, Mono, Mute and one speaker alone.
+        std::vector<float> lr(size_t(n) * 2);
+        for (int i = 0; i < n; ++i) lr[size_t(i) * 2] = 0.4f, lr[size_t(i) * 2 + 1] = 0.2f;
+        auto run = [&](const MonitorSettings& x) {
+            MonitorSection t;
+            t.configure(x, rate);
+            std::vector<float> o(size_t(n) * size_t(t.outputs()));
+            t.process("stereo", lr.data(), nullptr, n, o.data());
+            return std::pair{o[size_t(n - 1) * size_t(t.outputs())], o[size_t(n - 1) * size_t(t.outputs()) + 1]};
+        };
+        MonitorSettings plain;
+        QVERIFY(run(plain) == std::pair(0.4f, 0.2f));
+        MonitorSettings x = plain;
+        x.dim = true;
+        QVERIFY(std::fabs(run(x).first - 0.04f) < 1e-7 && std::fabs(run(x).second - 0.02f) < 1e-7);
+        x = plain, x.mono = true;
+        QVERIFY(std::fabs(run(x).first - 0.3f) < 1e-7 && std::fabs(run(x).second - 0.3f) < 1e-7);
+        x = plain, x.mute = true;
+        QVERIFY(run(x) == std::pair(0.0f, 0.0f));
+        x = plain, x.soloSpeaker = 1;
+        QVERIFY(run(x) == std::pair(0.0f, 0.2f));
+        x = plain, x.levelDb = calibratedLevel(0, 88, 85);
+        QVERIFY(std::fabs(run(x).first - 0.4f * float(std::pow(10.0, -3.0 / 20))) < 1e-7);
+
+        // Bass management on 5.1: a main and the subwoofer together are flat through the crossover (within 0.5 dB from
+        // 20 Hz to 20 kHz), the main alone is quiet below it, and the LFE reaches the subwoofer 10 dB up.
+        MonitorSettings bm;
+        bm.on = true;
+        bm.speakers = "5.1";
+        bm.bassManagement = true;
+        MonitorSection b;
+        b.configure(bm, rate);
+        QCOMPARE(b.outputs(), 6);
+        const int len = 1 << 15;
+        std::vector<float> imp(size_t(len) * 6, 0.0f), resp(size_t(len) * 6);
+        imp[0] = 1;            // L
+        imp[3 * 6 + 3] = 1;    // and the LFE three samples later
+        b.process("5.1", imp.data(), nullptr, len, resp.data());
+        auto gainAt = [&](const std::vector<float>& h, double hz) {
+            std::complex<double> acc = 0;
+            for (size_t i = 0; i < h.size(); ++i) acc += double(h[i]) * std::polar(1.0, -2 * M_PI * hz * double(i) / rate);
+            return db(std::abs(acc));
+        };
+        std::vector<float> sum(static_cast<size_t>(len)), mainOnly(static_cast<size_t>(len)), lfe(static_cast<size_t>(len));
+        // (the LFE's impulse is three samples later, so the subwoofer's response is split from it by time: the
+        // mains' lows are taken from a run without the LFE)
+        {
+            std::vector<float> noLfe = imp;
+            noLfe[3 * 6 + 3] = 0;
+            MonitorSection c;
+            c.configure(bm, rate);
+            std::vector<float> r(size_t(len) * 6);
+            c.process("5.1", noLfe.data(), nullptr, len, r.data());
+            for (int i = 0; i < len; ++i) sum[size_t(i)] = r[size_t(i) * 6] + r[size_t(i) * 6 + 3], mainOnly[size_t(i)] = r[size_t(i) * 6];
+            for (int i = 0; i < len; ++i) lfe[size_t(i)] = resp[size_t(i) * 6 + 3] - r[size_t(i) * 6 + 3];
+        }
+        double flat = 0;
+        for (double hz = 20; hz <= 20000; hz *= 1.25) flat = std::max(flat, std::fabs(gainAt(sum, hz)));
+        QVERIFY2(flat < 0.5, qPrintable(QString::number(flat)));
+        QVERIFY(gainAt(mainOnly, 80) < -5.5 && gainAt(mainOnly, 80) > -6.5);  // (Linkwitz-Riley: -6 dB at the crossover)
+        QVERIFY(gainAt(mainOnly, 20) < -40);
+        QVERIFY2(std::fabs(gainAt(lfe, 40) - 10) < 0.01, qPrintable(QString::number(gainAt(lfe, 40))));
+
+        // Calibration: pink noise at -20 dBFS RMS in its band, on one speaker at a time, the others silent; the
+        // subwoofer's in its own band.
+        MonitorSection cal;
+        cal.configure(bm, rate);
+        cal.setCalibration(1);
+        const int ten = rate * 10;
+        std::vector<float> silence(size_t(ten) * 6, 0.0f), noise(size_t(ten) * 6);
+        cal.process("5.1", silence.data(), nullptr, ten, noise.data());
+        std::vector<float> r1(static_cast<size_t>(ten));
+        double acc = 0, others = 0;
+        for (int i = 0; i < ten; ++i) {
+            r1[size_t(i)] = noise[size_t(i) * 6 + 1];
+            acc += double(r1[size_t(i)]) * r1[size_t(i)];
+            for (int c : {0, 2, 3, 4, 5}) others = std::max(others, double(std::fabs(noise[size_t(i) * 6 + size_t(c)])));
+        }
+        QVERIFY2(std::fabs(db(std::sqrt(acc / ten)) + 20) < 0.1, qPrintable(QString::number(db(std::sqrt(acc / ten)))));
+        QCOMPARE(others, 0.0);
+        auto band = [&](const std::vector<float>& v, double hz) {  // mean power within 10 % of `hz`, over the first second
+            const std::vector<float> second(v.begin(), v.begin() + rate);
+            double power = 0;
+            for (int k = -10; k <= 10; ++k) power += std::pow(10.0, gainAt(second, hz * (1 + k / 100.0)) / 10);
+            return 10 * std::log10(power / 21);
+        };
+        QVERIFY(band(r1, 1000) - band(r1, 100) > 20 && band(r1, 1000) - band(r1, 8000) > 20);
+        cal.setCalibration(3);
+        cal.process("5.1", silence.data(), nullptr, rate, noise.data());
+        std::vector<float> subNoise(static_cast<size_t>(rate));
+        for (int i = 0; i < rate; ++i) subNoise[size_t(i)] = noise[size_t(i) * 6 + 3];
+        QVERIFY(band(subNoise, 40) - band(subNoise, 1000) > 30);
+
+        // The cue mix on channels 3 and 4: its tracks, the beeps and talkback, nothing of the programme unless asked;
+        // the speakers keep the programme with the beeps.
+        MonitorSettings cs = plain;
+        cs.cue.on = true;
+        cs.cue.output = 2;
+        MonitorSection cue;
+        cue.configure(cs, rate);
+        QCOMPARE(cue.outputs(), 4);
+        std::vector<float> guide(size_t(n) * 2, 0.1f), beeps(size_t(n) * 2, 0.0f), talk(size_t(n), 0.05f), co(size_t(n) * 4);
+        beeps[10] = beeps[11] = 0.25f;
+        cue.process("stereo", lr.data(), beeps.data(), n, co.data());
+        cue.feedTalkback(talk.data(), n);
+        cue.addCue(guide.data(), beeps.data(), lr.data(), n, co.data());
+        QVERIFY(co[5 * 4 + 0] == 0.4f + 0.25f && co[5 * 4 + 1] == 0.2f + 0.25f);  // the speakers: programme and beeps
+        QVERIFY(co[5 * 4 + 2] == 0.1f + 0.25f && co[5 * 4 + 3] == 0.1f + 0.25f);  // the cue: guide and beeps alone
+        QVERIFY(co[100 * 4 + 2] == 0.1f);
+        cue.setTalkback(true);
+        cue.feedTalkback(talk.data(), n);
+        cue.addCue(guide.data(), nullptr, lr.data(), n, co.data());
+        QVERIFY(std::fabs(co[100 * 4 + 2] - 0.15f) < 1e-7);
+
+        // The settings as text and back; what is mixed for a set.
+        MonitorSettings full = bm;
+        full.map = {{1, -1.5, 12}, {0, 0.3, 0}};
+        full.listenAs = "stereo";
+        full.soloMode = MonitorSolo::AfterFader;
+        full.soloTracks = {1};
+        full.cue = cs.cue;
+        full.cue.tracks = {2};
+        QVERIFY(MonitorSettings::fromJson(full.toJson()) == full);
+        Sequence seq;
+        seq.audioLayout = "7.1.4";
+        MonitorSettings room;
+        room.speakers = "7.1.4";
+        QCOMPARE(listenLayout(room, seq), std::string("7.1.4"));
+        room.listenAs = "5.1";
+        QCOMPARE(listenLayout(room, seq), std::string("5.1"));
+        room.speakers = "5.1", room.listenAs = "";
+        QCOMPARE(listenLayout(room, seq), std::string("5.1"));
+        seq.audioLayout = "stereo";
+        QCOMPARE(listenLayout(room, seq), std::string("stereo"));  // never mixed up
+        room.speakers = "headphones", room.listenAs = "binaural";
+        QCOMPARE(listenLayout(room, seq), std::string("binaural"));
+        QCOMPARE(monitorSequence(seq, room).audioLayout, std::string("ambix3"));
+        QVERIFY((listenChoices("7.1.4") == std::vector<std::string>{"7.1", "5.1", "stereo"}));
+        // The monitor's solos leave the project's alone: after the fader, the track straight to the master without
+        // its processing; before it, at unity and in the middle.
+        seq.audioTracks.resize(2);
+        seq.audioTracks[1].volumeDb = -6;
+        seq.audioTracks[1].pan = 0.5;
+        seq.audioTracks[1].output = 42;
+        seq.masterVolumeDb = -3;
+        seq.masterEffects.push_back(Effect{});
+        MonitorSettings solo;
+        solo.soloMode = MonitorSolo::AfterFader;
+        solo.soloTracks = {1};
+        Sequence afl = monitorSequence(seq, solo);
+        QVERIFY(afl.audioTracks[1].solo && !afl.audioTracks[0].solo && afl.audioTracks[1].output == 0 && afl.masterEffects.empty());
+        QCOMPARE(afl.audioTracks[1].volumeDb, -6.0);
+        solo.soloMode = MonitorSolo::PreFader;
+        Sequence pfl = monitorSequence(seq, solo);
+        QVERIFY(pfl.audioTracks[1].volumeDb == 0 && pfl.audioTracks[1].pan == 0 && pfl.masterVolumeDb == 0);
+        solo.soloMode = MonitorSolo::InPlace;
+        Sequence sip = monitorSequence(seq, solo);
+        QVERIFY(sip.audioTracks[1].solo && sip.audioTracks[1].output == 42 && sip.masterVolumeDb == -3);
+        QVERIFY(!seq.audioTracks[1].solo);
     }
 
     void grainMatching() {
