@@ -660,14 +660,14 @@ IndexedPicture reduceColours(const QImage& source, int colours, int alphaSteps) 
         b.end = cut;
         boxes.push_back(second);
     }
+    // Each box stands for its commonest colour, not its mean: a caption's text and box keep their exact colours
+    // however many edge blends fall in with them (fonts are smoothed differently on each system).
     for (const Box& b : boxes) {
-        double sum[4] = {0, 0, 0, 0}, n = 0;
-        for (size_t i = b.begin; i < b.end; ++i) {
-            for (int ch = 0; ch < 4; ++ch) sum[ch] += double(entries[i].v[size_t(ch)]) * entries[i].n;
-            n += entries[i].n;
-        }
+        size_t most = b.begin;
+        for (size_t i = b.begin; i < b.end; ++i)
+            if (entries[i].n > entries[most].n) most = i;
         uint32_t c = 0;
-        for (int ch = 0; ch < 4; ++ch) c = (c << 8) | uint32_t(std::clamp(std::lround(sum[ch] / n), 0L, 255L));
+        for (int ch = 0; ch < 4; ++ch) c = (c << 8) | uint32_t(entries[most].v[size_t(ch)]);
         c = snap(c);
         if (!(c >> 24)) c |= 0x01000000;  // (still not the transparent entry)
         out.palette.push_back(c);
