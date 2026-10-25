@@ -416,6 +416,12 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"object_removal", "Object Removal", EffectCategory::VideoFilter, "Refine",
                  {num("grow", "Grow Mask (px)", 0, 50, 4, 0.5)},
                  {}});
+    // A network trained on frames worked on by hand (media/LearnedEffect.h; Clip › Learn Effect from Examples), run on
+    // the picture: what was done to those frames, done to these.
+    c.push_back({"learned_effect", "Learned Effect", EffectCategory::VideoFilter, "Refine",
+                 {pct("amount", "Amount", 0, 100, 100)},
+                 {str("network", "Network File", StringKind::File)}});
+    c.back().strings[0].fileFilter = "Learned effects (*.mlnet)";
     // The faces in the frame (YuNet, found again each frame) touched up within a soft mask.
     c.push_back({"face_refine", "Face Refinement", EffectCategory::VideoFilter, "Refine",
                  {pct("smooth", "Smooth Skin", 0, 100, 40), pct("lighten", "Lighten Face", 0, 100, 0),

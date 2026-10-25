@@ -182,6 +182,7 @@
 #include "StackedTimelineWidget.h"
 #include "PanFollowDialog.h"
 #include "RedactFacesDialog.h"
+#include "LearnEffectDialog.h"
 #include "SpectralRepairDialog.h"
 #include "ShotSearchPanel.h"
 #include "SoundLibraryPanel.h"
@@ -1483,6 +1484,7 @@ void MainWindow::buildMenus() {
     add(clipM, tr("S&pectral Repair…"), QKeySequence(), withSeq([this] { spectralRepairDialog(); }))->setObjectName(QStringLiteral("spectralRepair"));
     add(clipM, tr("Pan to &Follow…"), QKeySequence(), withSeq([this] { panFollowDialog(); }))->setObjectName(QStringLiteral("panFollow"));
     add(clipM, tr("Redact &Faces…"), QKeySequence(), withSeq([this] { redactFacesDialog(); }))->setObjectName(QStringLiteral("redactFaces"));
+    add(clipM, tr("Learn Effect from E&xamples…"), QKeySequence(), withSeq([this] { learnEffectDialog(); }))->setObjectName(QStringLiteral("learnEffect"));
     add(clipM, tr("Remove Letterbo&x"), QKeySequence(), withSeq([this] { removeLetterbox(); }))->setObjectName(QStringLiteral("removeLetterbox"));
     // Colour groups: grade shots together, before and after each clip's own grade (core/ColorGroups.h).
     QMenu* groupM = clipM->addMenu(tr("Colour &Group"));
@@ -6142,6 +6144,26 @@ RedactFacesDialog* MainWindow::redactFacesDialog() {
         return nullptr;
     }
     auto* dlg = new RedactFacesDialog(state_, c->id, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->show();
+    return dlg;
+}
+
+LearnEffectDialog* MainWindow::learnEffectDialog() {
+    const Clip* c = state_->primaryClip();
+    const auto loc = c && state_->sequence() ? edit::locate(*state_->sequence(), c->id) : std::nullopt;
+    if (!c || !loc || loc->track.kind != TrackKind::Video) {
+        state_->message(tr("Select the video clip you worked on by hand: its effects are what is learned"));
+        return nullptr;
+    }
+    // (One a clip: two would train into the same file.)
+    for (LearnEffectDialog* open : findChildren<LearnEffectDialog*>())
+        if (open->clip() == c->id && open->isVisible()) {
+            open->raise();
+            open->activateWindow();
+            return open;
+        }
+    auto* dlg = new LearnEffectDialog(state_, c->id, this);
     dlg->setAttribute(Qt::WA_DeleteOnClose);
     dlg->show();
     return dlg;

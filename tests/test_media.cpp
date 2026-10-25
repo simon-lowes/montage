@@ -165,6 +165,8 @@
 #include "media/Translator.h"
 #include "media/SpeechEnhance.h"
 #include "media/BandwidthExtension.h"
+#include "media/LearnedEffect.h"
+#include "render/LearnFromClip.h"
 #include "media/MotionDeblur.h"
 #include "media/SuperScale.h"
 #include "media/Reframe.h"
@@ -5382,6 +5384,88 @@ private slots:
         QCOMPARE(title, std::string("Musik"));
         QVERIFY2(lang == "ger" || lang == "deu", lang.c_str());
         QVERIFY(level(musik, 880) > 20 * level(musik, 440));
+    }
+
+    void learnedEffectFromAClip() {
+        // Colour bars graded by hand (Color Correct): two frames of them learned through MCP from the clip itself, given to
+        // it in the grade's place, and the frames it did not see come out graded too.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 48, s.fps = {25, 1};
+        Clip bars = makeGeneratorClip(p, "bars", 50);
+        Effect grade = makeEffect(p, "color_correct");
+        grade.params["saturation"] = 0.4, grade.params["contrast"] = 1.3, grade.params["temperature"] = 40.0;
+        bars.effects.push_back(grade);
+        s.videoTracks[0].clips.push_back(bars);
+        const Id clip = bars.id;
+        // The examples: the clip without its effects, and with them.
+        learn::Pair pair;
+        std::string err;
+        QVERIFY2(learningPair(p, s, bars, 10, pair, &err), err.c_str());
+        QCOMPARE(pair.before.width, 64);
+        QCOMPARE(pair.before.height, 48);
+        const RenderOptions ro;
+        QVERIFY(learn::psnr(pair.after, renderSequenceFrame(p, s, 10, ro)) > 50);
+        QVERIFY(learn::psnr(pair.before, pair.after) < 25);
+        s.markers.push_back({10, 0, "worked on"});
+        s.markers.push_back({30, 0, "worked on"});
+        s.markers.push_back({80, 0, "after the clip"});
+        QVERIFY(exampleFrames(s, bars, 0) == std::vector<FrameTime>({10, 30}));
+        const Image truth = renderSequenceFrame(p, s, 40, ro);
+        const QString project = QString::fromStdString(path("learn.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_train_effect"}, {"arguments", QJsonObject{{"project", project}, {"clip", double(clip)}, {"steps", 150}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonObject out = r.value("structuredContent").toObject();
+        QCOMPARE(out.value("examples").toInt(), 2);
+        QCOMPARE(out.value("steps").toInt(), 150);
+        QVERIFY2(out.value("psnr_after").toDouble() > out.value("psnr_before").toDouble() + 10, QJsonDocument(out).toJson().constData());
+        const QString network = out.value("network").toString();
+        QVERIFY(QFileInfo::exists(network) && network.endsWith(".mlnet"));
+        QVERIFY(network.contains("learn Learned Effects"));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Clip& c = back.active()->videoTracks[0].clips.at(0);
+        QCOMPARE(c.effects.size(), size_t(2));
+        QCOMPARE(c.effects[0].type, std::string("learned_effect"));
+        QVERIFY(c.effects[0].enabled && !c.effects[1].enabled);
+        QCOMPARE(c.effects[0].s("network"), network.toStdString());
+        // A frame it did not learn from, rendered with the network in the grade's place (as delivered: views that cannot
+        // wait go without it until it is rendered).
+        RenderOptions delivery;
+        delivery.highQuality = true;
+        RenderIssues issues;
+        RenderOptions view;
+        view.issues = &issues;
+        QVERIFY(learn::psnr(renderSequenceFrame(back, *back.active(), 41, view), truth) < 25);
+        QVERIFY(issues.incomplete && QString::fromStdString(issues.reason()).contains("Learned Effect"));
+        const Image learned = renderSequenceFrame(back, *back.active(), 40, delivery);
+        const double q = learn::psnr(learned, truth);
+        QVERIFY2(q > 30, qPrintable(QString::number(q)));
+        // Going on from there adds to the steps, from the clip as it was graded (not as the network now does it), into a
+        // new file the clip is given: the old one is left for the undo.
+        const QJsonObject more{{"jsonrpc", "2.0"}, {"id", 2}, {"method", "tools/call"},
+                               {"params", QJsonObject{{"name", "montage_train_effect"},
+                                                      {"arguments", QJsonObject{{"project", project}, {"clip", double(clip)}, {"steps", 20}, {"continue", true}, {"replace", false}}},
+                                                      {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                            {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto again = server.handle(QJsonDocument(more).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r2 = QJsonDocument::fromJson(QByteArray::fromStdString(again.back())).object().value("result").toObject();
+        QVERIFY2(!r2.value("isError").toBool(), QJsonDocument(r2).toJson().constData());
+        const QJsonObject out2 = r2.value("structuredContent").toObject();
+        QCOMPARE(out2.value("steps").toInt(), 170);
+        QVERIFY2(out2.value("psnr_before").toDouble() < 20, QJsonDocument(out2).toJson().constData());
+        const QString network2 = out2.value("network").toString();
+        QVERIFY(network2 != network && QFileInfo::exists(network2) && QFileInfo::exists(network));
+        Project reloaded;
+        QVERIFY(loadProject(project.toStdString(), reloaded));
+        QCOMPARE(reloaded.active()->videoTracks[0].clips.at(0).effects[0].s("network"), network2.toStdString());
     }
 
     void mcpKeyScreen() {
@@ -34102,6 +34186,234 @@ private slots:
         for (const DamagedFrame& d : findDamagedFrames(lost, 0, -1, {}, nullptr, &err)) three[d.frame] = d.kind;
         const std::map<int64_t, FrameDamage> wantThree = {{6, FrameDamage::Missing}, {13, FrameDamage::Missing}, {20, FrameDamage::Missing}};
         QVERIFY2(three == wantThree, damagedFramesToString(three).c_str());
+    }
+
+    void learnedEffectGradients() {
+        // Back-propagation agrees with finite differences, through every kind of layer (a small network, with the last
+        // layer given weights so the gradient reaches the rest).
+        using namespace learn;
+        Net net;
+        net.init({3, 4, 4}, 7);
+        uint64_t r = 99;
+        auto rnd = [&r] {
+            r = r * 6364136223846793005ULL + 1442695040888963407ULL;
+            return double(r >> 11) / 9007199254740992.0;
+        };
+        for (float& w : net.weights) w += float((rnd() - 0.5) * 0.2);
+        const int w = 16, h = 12;
+        std::vector<float> in(size_t(4 * w * h)), target(in.size());
+        for (size_t i = 0; i < in.size(); ++i) in[i] = float(rnd()), target[i] = float(rnd());
+        std::vector<float> grad;
+        lossAndGradient(net, in.data(), target.data(), w, h, grad, 1);
+        QCOMPARE(grad.size(), net.weights.size());
+        auto loss = [&](const Net& n) {
+            std::vector<float> out(in.size());
+            forward(n, in.data(), w, h, out.data(), 1);
+            double sum = 0;
+            for (size_t i = 0; i < out.size(); ++i) sum += (double(out[i]) - target[i]) * (double(out[i]) - target[i]);
+            return sum / double(out.size());
+        };
+        int checked = 0;
+        double worst = 0;
+        for (size_t i = 0; i < net.weights.size(); i += std::max<size_t>(1, net.weights.size() / 150)) {
+            const double eps = 1e-3;
+            Net plus = net, minus = net;
+            plus.weights[i] += float(eps);
+            minus.weights[i] -= float(eps);
+            const double numeric = (loss(plus) - loss(minus)) / (double(plus.weights[i]) - double(minus.weights[i]));
+            const double error = std::abs(numeric - grad[i]) / std::max(1.0, std::abs(numeric));
+            worst = std::max(worst, error);
+            ++checked;
+            QVERIFY2(error < 1e-3, qPrintable(QStringLiteral("weight %1: %2 against %3").arg(i).arg(grad[i]).arg(numeric)));
+        }
+        QVERIFY(checked > 100);
+        qInfo("learned effect gradients: %d checked, worst %.2g", checked, worst);
+    }
+
+    void learnedEffectNetwork() {
+        using namespace learn;
+        // About half a million parameters, and untrained the picture comes back as it was.
+        const NetShape full;
+        QVERIFY2(parameterCount(full) > 400000 && parameterCount(full) < 600000, qPrintable(QString::number(parameterCount(full))));
+        Net net;
+        net.init(full, 3);
+        Image picture(40, 30);
+        for (int y = 0; y < 30; ++y)
+            for (int x = 0; x < 40; ++x) {
+                float* p = picture.at(x, y);
+                p[0] = float(x) / 40, p[1] = float(y) / 30, p[2] = 0.5f, p[3] = 1;
+            }
+        const Image same = applyNet(net, picture, 2);
+        QCOMPARE(same.width, 40);
+        QVERIFY(same.px == picture.px);
+
+        // Trained a few steps on a small grade: the same seed gives the same weights on one thread and eight, and
+        // stopping and going on (from its saved state) matches not stopping.
+        std::vector<Pair> pairs;
+        for (int f = 0; f < 3; ++f) {
+            Pair p;
+            p.before = Image(48, 40);
+            for (int y = 0; y < 40; ++y)
+                for (int x = 0; x < 48; ++x) {
+                    float* q = p.before.at(x, y);
+                    q[0] = float(0.5 + 0.4 * std::sin(0.2 * x + f)), q[1] = float(0.5 + 0.4 * std::cos(0.15 * y - f)), q[2] = 0.3f, q[3] = 1;
+                }
+            p.after = p.before;
+            for (size_t i = 0; i < p.after.px.size(); i += 4) p.after.px[i] *= 0.7f;
+            p.frame = f;
+            pairs.push_back(std::move(p));
+        }
+        const NetShape small{3, 8, 4};
+        TrainOptions o;
+        o.crop = 32, o.batch = 2, o.rate = 2e-3, o.seed = 11;
+        o.threads = 1;
+        Trainer one(small, pairs, o);
+        QVERIFY(one.run(12));
+        o.threads = 8;
+        Trainer eight(small, pairs, o);
+        QVERIFY(eight.run(12));
+        QVERIFY(one.net().weights == eight.net().weights);
+        QCOMPARE(one.loss(), eight.loss());
+        Trainer first(small, pairs, o);
+        QVERIFY(first.run(5));
+        const std::vector<unsigned char> state = first.state();
+        Trainer again(small, pairs, o);
+        QVERIFY(again.restore(state));
+        QCOMPARE(again.steps(), 5);
+        QVERIFY(again.run(7));
+        QVERIFY(again.net().weights == one.net().weights);
+        // A step cancelled leaves the steps already done.
+        std::atomic<bool> stop{true};
+        QVERIFY(!again.run(3, &stop));
+        QCOMPARE(again.steps(), 12);
+
+        // Saved and read back.
+        QTemporaryDir dir;
+        Saved saved;
+        saved.net = one.net();
+        saved.frames = {3, 9};
+        saved.options = o;
+        saved.state = one.state();
+        saved.source = "A001_C003";
+        const std::string file = dir.filePath("learned.mlnet").toStdString();
+        std::string err;
+        QVERIFY2(save(file, saved, &err), err.c_str());
+        Saved back;
+        QVERIFY2(load(file, back, &err), err.c_str());
+        QVERIFY(back.net.weights == saved.net.weights && back.net.shape == small);
+        QVERIFY(back.frames == saved.frames && back.source == "A001_C003" && back.state == saved.state);
+        QVERIFY(cachedNet(file) && cachedNet(file)->net.weights == saved.net.weights);
+
+        // A picture of two tiles each way.
+        Image big(700, 420);
+        for (int y = 0; y < big.height; ++y)
+            for (int x = 0; x < big.width; ++x) {
+                float* p = big.at(x, y);
+                p[0] = float(0.5 + 0.3 * std::sin(x * 0.05)), p[1] = float(0.5 + 0.3 * std::cos(y * 0.07)), p[2] = 0.4f, p[3] = 1;
+            }
+        // The tiles join as one pass over the whole picture (made up to the levels' grid past the right and bottom), for a
+        // network of the full size, whose reach is the widest.
+        Net deep;
+        deep.init(full, 3);
+        for (size_t i = 0; i < deep.weights.size(); ++i) deep.weights[i] += float(0.01 * std::sin(double(i)));
+        const Image tiledDeep = applyNet(deep, big);
+        const int m = 1 << (deep.shape.levels - 1), W = (big.width + m - 1) / m * m, H = (big.height + m - 1) / m * m;
+        std::vector<float> whole(size_t(4) * size_t(W) * size_t(H)), onePass(whole.size());
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                for (int c = 0; c < 4; ++c)
+                    whole[size_t(c) * size_t(W) * size_t(H) + size_t(y) * size_t(W) + size_t(x)] =
+                        big.at(x < big.width ? x : 2 * (big.width - 1) - x, y < big.height ? y : 2 * (big.height - 1) - y)[c];
+        forward(deep, whole.data(), W, H, onePass.data());
+        double worst = 0;
+        for (int y = 0; y < big.height; ++y)
+            for (int x = 0; x < big.width; ++x)
+                for (int c = 0; c < 4; ++c)
+                    worst = std::max(worst, double(std::abs(tiledDeep.at(x, y)[c] -
+                                                            onePass[size_t(c) * size_t(W) * size_t(H) + size_t(y) * size_t(W) + size_t(x)])));
+        QVERIFY2(worst < 1e-5, qPrintable(QString::number(worst)));
+        // The ONNX graph gives what the trainer's own code does, on a frame and through the tiles.
+        if (!onnxRuntimeAvailable()) QSKIP("Built without ONNX Runtime");
+        Net trained = one.net();
+        for (float& w : trained.weights) w *= 1.5f;  // (the last layer away from zero)
+        const int w = 64, h = 48;
+        std::vector<float> in(size_t(4 * w * h));
+        for (size_t i = 0; i < in.size(); ++i) in[i] = float(0.5 + 0.5 * std::sin(double(i) * 0.37));
+        std::vector<float> mine(in.size()), theirs;
+        forward(trained, in.data(), w, h, mine.data());
+        QVERIFY2(runOnnx(onnxModel(trained), in.data(), 4, w, h, theirs, &err), err.c_str());
+        QCOMPARE(theirs.size(), mine.size());
+        worst = 0;
+        for (size_t i = 0; i < mine.size(); ++i) worst = std::max(worst, double(std::abs(mine[i] - theirs[i])));
+        QVERIFY2(worst < 1e-4, qPrintable(QString::number(worst)));
+        Image viaOrt;
+        QVERIFY2(applyNetOrt(trained, big, viaOrt, &err), err.c_str());
+        const Image viaMine = applyNet(trained, big);
+        worst = 0;
+        for (size_t i = 0; i < viaMine.px.size(); ++i) worst = std::max(worst, double(std::abs(viaMine.px[i] - viaOrt.px[i])));
+        QVERIFY2(worst < 1e-4, qPrintable(QString::number(worst)));
+    }
+
+    void learnedEffectTraining() {
+        // A shot graded and with a logo taken out on eight frames: trained on those for 2,000 steps, the four frames it
+        // did not see come out at 32 dB or more against the truth, where they went in at under 20.
+        using namespace learn;
+        auto clean = [](int f, int x, int y, int c) {
+            const double t = f * 0.45;
+            return 0.5 + 0.22 * std::sin(0.09 * x + 0.06 * y + t + c) + 0.14 * std::sin(0.045 * x - 0.11 * y - 0.7 * t + 2 * c) +
+                   0.06 * std::sin(0.23 * x + 0.19 * y + 1.3 * t);
+        };
+        auto grade = [](double r, double g, double b, double out[3]) {
+            out[0] = 0.95 * std::pow(std::clamp(r, 0.0, 1.0), 1.5) + 0.04;
+            out[1] = 0.5 + (g - 0.5) * 1.35;
+            out[2] = 0.7 * b + 0.12 * r + 0.02;
+        };
+        // The logo: a ring and a bar, white at 60 %.
+        auto logo = [](int x, int y) {
+            const double d = std::hypot(x - 104.0, y - 24.0);
+            return (d > 9 && d < 14) || (x >= 96 && x <= 112 && y >= 22 && y <= 26) ? 0.6 : 0.0;
+        };
+        auto frame = [&](int f, Pair& p) {
+            p.before = Image(128, 128);
+            p.after = Image(128, 128);
+            p.frame = f;
+            for (int y = 0; y < 128; ++y)
+                for (int x = 0; x < 128; ++x) {
+                    const double r = clean(f, x, y, 0), g = clean(f, x, y, 1), b = clean(f, x, y, 2), a = logo(x, y);
+                    float* in = p.before.at(x, y);
+                    in[0] = float(r + (1 - r) * a), in[1] = float(g + (1 - g) * a), in[2] = float(b + (1 - b) * a), in[3] = 1;
+                    double o[3];
+                    grade(r, g, b, o);
+                    float* out = p.after.at(x, y);
+                    out[0] = float(o[0]), out[1] = float(o[1]), out[2] = float(o[2]), out[3] = 1;
+                }
+        };
+        std::vector<Pair> train, unseen;
+        for (int f = 0; f < 12; ++f) {
+            Pair p;
+            frame(f, p);
+            (f % 3 == 1 ? unseen : train).push_back(std::move(p));
+        }
+        QCOMPARE(train.size(), size_t(8));
+        double before = 0;
+        for (const Pair& p : unseen) before += psnr(p.before, p.after) / double(unseen.size());
+        TrainOptions o;
+        o.crop = 64, o.batch = 2, o.seed = 5;
+        Trainer trainer(NetShape{}, train, o);
+        QElapsedTimer timer;
+        timer.start();
+        QVERIFY(trainer.run(2000));
+        double after = 0, worst = 1e9;
+        for (const Pair& p : unseen) {
+            const Image got = applyNet(trainer.net(), p.before);
+            const double q = psnr(got, p.after);
+            after += q / double(unseen.size());
+            worst = std::min(worst, q);
+        }
+        qInfo("learned effect: unseen frames %.1f dB going in, %.1f dB out (worst %.1f), loss %.2g, %lld ms", before, after, worst,
+              trainer.loss(), qint64(timer.elapsed()));
+        QVERIFY2(before < 20, qPrintable(QString::number(before)));
+        QVERIFY2(after >= 32, qPrintable(QString::number(after)));
     }
 };
 

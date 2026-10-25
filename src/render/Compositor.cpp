@@ -1572,6 +1572,7 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
         faceModel().installed())
         faces = cachedFaces(src);
     FaceScope faceScope(faces);
+    SlowEffectsScope slowScope({o.highQuality || o.slowEffects, o.cancel, o.issues});
     ofx::FetchScope fetchScope(ofxFetch);
     // Faces are covered first, where they are in the source, whatever moves the picture after (Stabilize, transforms).
     // (Its colour group's, and its own and its shared nodes' that take part.)

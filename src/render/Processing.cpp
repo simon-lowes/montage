@@ -17,6 +17,8 @@
 #include "media/Exr.h"
 #include "media/Matting.h"
 #include "media/Inpaint.h"
+#include "media/LearnedEffect.h"
+#include "render/Compositor.h"
 #include "FaceRefine.h"
 #include "FaceShape.h"
 #include "media/FaceMesh.h"
@@ -1160,6 +1162,10 @@ DepthScope::~DepthScope() { tDepth = std::move(previous_); }
 const ValueMap* currentPersonMatte() { return tPerson.get(); }
 PersonScope::PersonScope(std::shared_ptr<const ValueMap> matte) : previous_(std::move(tPerson)) { tPerson = std::move(matte); }
 PersonScope::~PersonScope() { tPerson = std::move(previous_); }
+thread_local SlowEffects tSlow;
+const SlowEffects& currentSlowEffects() { return tSlow; }
+SlowEffectsScope::SlowEffectsScope(SlowEffects slow) : previous_(tSlow) { tSlow = slow; }
+SlowEffectsScope::~SlowEffectsScope() { tSlow = previous_; }
 thread_local std::string tCryptoFile;
 const std::string& currentCryptomatteFile() { return tCryptoFile; }
 CryptomatteScope::CryptomatteScope(std::string file) : previous_(std::move(tCryptoFile)) { tCryptoFile = std::move(file); }
@@ -2224,6 +2230,22 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     }
     if (ty == "paint") {
         paintStrokes(e, t, img);
+        return;
+    }
+    if (ty == "learned_effect") {
+        // (Without its network file, or when it fails, the picture is left as it is.)
+        const float amount = float(std::clamp(e.p("amount", t, 100) / 100, 0.0, 1.0));
+        if (amount <= 0) return;
+        const SlowEffects& slow = currentSlowEffects();
+        Image learned;
+        std::string why;
+        if (!learn::applySaved(e.s("network"), img, learned, &why, slow.cancel, slow.run)) {
+            if (slow.issues)
+                slow.issues->note(why.empty() ? "The Learned Effect is shown once the frames are rendered (Render In to Out)"
+                                              : "Learned Effect: " + why);
+            return;
+        }
+        for (size_t i = 0; i < img.px.size(); ++i) img.px[i] += (learned.px[i] - img.px[i]) * amount;
         return;
     }
     if (ty == "color_correct") colorCorrect(e, t, img);

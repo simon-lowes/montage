@@ -91,6 +91,7 @@ add_library(montage_engine STATIC
   media/Mlv.h media/Mlv.cpp
   media/SuperScale.h media/SuperScale.cpp
   media/MotionDeblur.h media/MotionDeblur.cpp
+  media/LearnedEffect.h media/LearnedEffect.cpp
   media/Faces.h media/Faces.cpp
   media/FaceMesh.h media/FaceMesh.cpp
   media/FaceTracks.h media/FaceTracks.cpp
@@ -232,6 +233,7 @@ add_library(montage_engine STATIC
   render/HdrView.h render/HdrView.cpp
   render/Ocio.h render/Ocio.cpp
   render/Compositor.h render/Compositor.cpp
+  render/LearnFromClip.h render/LearnFromClip.cpp
   render/GpuCompositor.h render/GpuCompositor.cpp
   render/OGraf.h render/OGraf.cpp
   render/Gallery.h render/Gallery.cpp
@@ -271,6 +273,8 @@ add_library(montage_engine STATIC
   audio/TimeStretch.h audio/TimeStretch.cpp
   audio/Upmix.h audio/Upmix.cpp
 )
+# The learned effect's trainer is its convolutions' inner loops, written to be vectorised (media/LearnedEffect.h).
+set_source_files_properties(media/LearnedEffect.cpp PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O3>")
 target_include_directories(montage_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/clap/include)
 # ARA 2 interfaces and host dispatch library (Apache-2.0, Celemony's SDK), for hosting ARA plug-ins (audio/AraHost).

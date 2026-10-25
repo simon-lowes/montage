@@ -179,6 +179,7 @@
 #include "audio/PluginEffect.h"
 #include "KeyframePanel.h"
 #include "Accessibility.h"
+#include "LearnEffectDialog.h"
 #include "Theme.h"
 #include <QAccessible>
 #include <QFileDialog>
@@ -388,6 +389,16 @@ private:
     std::shared_ptr<std::vector<std::vector<uint8_t>>> written_;
     int state_ = 0;
 };
+
+// Runs `act` on the modal dialog of type D once it is open: tried every 100 ms for 20 s, as a dialog can take a moment
+// to open and one timer may fire before it does (and leave it open, waiting).
+template <class D, class Fn>
+static void whenModal(QObject* context, Fn act, int tries = 200) {
+    QTimer::singleShot(100, context, [context, act, tries] {
+        if (auto* dialog = qobject_cast<D*>(QApplication::activeModalWidget())) act(dialog);
+        else if (tries > 1) whenModal<D>(context, act, tries - 1);
+    });
+}
 
 class TestApp : public QObject {
     Q_OBJECT
@@ -17335,6 +17346,8 @@ print("added " + ui["name"])
         QStringList missing;
         for (const QString& workspace : MainWindow::builtInWorkspaces()) {
             QVERIFY(win_->applyWorkspace(workspace));
+            // (The tab bars of panels no longer stacked go when the event loop next runs, as it would between workspaces.)
+            QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
             QApplication::processEvents();
             for (QWidget* w : win_->findChildren<QWidget*>()) {
                 if (!w->isVisible() || !w->isEnabled() || w->focusPolicy() == Qt::NoFocus || w->window() != win_.get()) continue;
@@ -17604,6 +17617,54 @@ print("added " + ui["name"])
         qApp->setFont(font);
     }
 
+    void learnEffectFromExamples() {
+        // Clip > Learn Effect from Examples: the clip's own work (an Invert) learned from a frame, then given to the clip
+        // in the Invert's place, and Undo takes that back.
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        QVERIFY(state()->edit("Invert", [&](Project& p, Sequence& s) {
+            edit::clipById(s, red)->effects.push_back(makeEffect(p, "invert"));
+            return true;
+        }));
+        state()->setSelection({red});
+        const FrameTime at = edit::clipById(*state()->sequence(), red)->start + 5;
+        state()->setPlayhead(at);
+        LearnEffectDialog* dlg = win_->learnEffectDialog();
+        QVERIFY(dlg);
+        QFile::remove(dlg->networkFile());
+        dlg->setFrames({at});
+        QVERIFY(dlg->frames() == std::vector<FrameTime>{at});
+        learn::TrainOptions o;
+        o.crop = 64, o.batch = 1;
+        dlg->setOptions(o);
+        dlg->setSteps(60);
+        QVERIFY(dlg->train(true));
+        QVERIFY(!dlg->busy());
+        QCOMPARE(dlg->stepsTrained(), 60);
+        QVERIFY2(QFileInfo::exists(dlg->networkFile()), qPrintable(dlg->status()));
+        QVERIFY(dlg->findChild<QLabel*>("learnPreview")->pixmap().width() > 0);
+        // Trained again, it goes on from there.
+        QVERIFY(dlg->train(true));
+        QCOMPARE(dlg->stepsTrained(), 120);
+        QVERIFY(dlg->apply(false, true));
+        const Clip* c = edit::clipById(*state()->sequence(), red);
+        QCOMPARE(c->effects.front().type, std::string("learned_effect"));
+        QCOMPARE(QString::fromStdString(c->effects.front().s("network")), dlg->networkFile());
+        QVERIFY(!c->effects.back().enabled);
+        // Trained again, into a new file: the clip keeps the network it was given.
+        const QString given = dlg->networkFile();
+        dlg->setSteps(50);
+        QVERIFY(dlg->train(true));
+        QCOMPARE(dlg->stepsTrained(), 170);
+        QVERIFY(dlg->networkFile() != given && QFileInfo::exists(dlg->networkFile()));
+        QCOMPARE(QString::fromStdString(edit::clipById(*state()->sequence(), red)->effects.front().s("network")), given);
+        QFile::remove(given);
+        state()->undo();
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->effects.size(), size_t(1));
+        dlg->close();
+        QFile::remove(dlg->networkFile());
+    }
+
     void editingByKeyboardAlone() {
         // Import, insert, trim, a title and an export with the keys alone give the same sequence as the commands run
         // directly.
@@ -17639,9 +17700,7 @@ print("added " + ui["name"])
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));
         // (Held apart from the test's frame: the timer may fire after it, when no dialog opened.)
         auto typed = std::make_shared<bool>(false);
-        QTimer::singleShot(200, this, [typed, wav] {
-            auto* dialog = qobject_cast<QFileDialog*>(QApplication::activeModalWidget());
-            if (!dialog) return;
+        whenModal<QFileDialog>(this, [typed, wav](QFileDialog* dialog) {
             // (The file name field has the focus; offscreen, a dialog opened in a test may not be given it.)
             QWidget* field = QApplication::focusWidget();
             if (!field || !dialog->isAncestorOf(field)) field = dialog->findChild<QLineEdit*>(QStringLiteral("fileNameEdit"));
@@ -17689,9 +17748,7 @@ print("added " + ui["name"])
         const QString out = dir_.filePath(QStringLiteral("keyboard-export.mp4"));
         QFile::remove(out);
         auto exported = std::make_shared<bool>(false);
-        QTimer::singleShot(300, this, [exported, out] {
-            auto* dialog = qobject_cast<ExportDialog*>(QApplication::activeModalWidget());
-            if (!dialog) return;
+        whenModal<ExportDialog>(this, [exported, out](ExportDialog* dialog) {
             auto* path = dialog->findChild<QLineEdit*>(QStringLiteral("exportPath"));
             for (int i = 0; i < 80 && QApplication::focusWidget() != path; ++i) QTest::keyClick(QApplication::focusWidget(), Qt::Key_Tab);
             if (QApplication::focusWidget() != path) {

@@ -2,6 +2,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
@@ -99,6 +100,25 @@ public:
 
 private:
     std::string previous_;
+};
+// How a frame being drawn takes effects that run for seconds a frame (a Learned Effect): `run` (deliveries, previews
+// rendered ahead) runs them, else a result already made is used or the frame goes without, told to `issues`.
+struct RenderIssues;
+struct SlowEffects {
+    bool run = true;
+    const std::atomic<bool>* cancel = nullptr;
+    RenderIssues* issues = nullptr;
+};
+const SlowEffects& currentSlowEffects();
+class SlowEffectsScope {
+public:
+    explicit SlowEffectsScope(SlowEffects slow);
+    ~SlowEffectsScope();
+    SlowEffectsScope(const SlowEffectsScope&) = delete;
+    SlowEffectsScope& operator=(const SlowEffectsScope&) = delete;
+
+private:
+    SlowEffects previous_;
 };
 // And the faces in the frame (media/Faces.h), for Face Refinement.
 struct FaceBox;

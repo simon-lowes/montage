@@ -32,6 +32,7 @@
 #include "core/ColorGroups.h"
 #include "core/GraphicsTemplate.h"
 #include "core/Storyboard.h"
+#include "render/LearnFromClip.h"
 #include "render/ExtendClip.h"
 #include "render/FootageWords.h"
 #include "media/LanguageModel.h"
@@ -1586,6 +1587,79 @@ void McpServer::Impl::addTools() {
             if (keyed.isEmpty()) return fail(err.empty() ? QStringLiteral("No clips keyed") : QString::fromStdString(err));
             save(l);
             return ok(QStringLiteral("Keyed %1 clip(s)").arg(keyed.size()), QJsonObject{{"keyed", keyed}});
+        });
+
+    add("montage_train_effect", "Learn an effect from examples",
+        "Train a small network on frames of a clip worked on by hand (painted, graded, cleaned up, a matte drawn: its "
+        "effects) against the same frames without its effects, on this computer, and give it to clips as a Learned "
+        "Effect (learned_effect), so what was done to those frames is done to the rest of the shot or to similar shots. "
+        "`frames` are the examples (default: the sequence's markers on the clip, else where its effects have keys); "
+        "`steps` how long to train (default 1000, up to 100000; more is better, each step a 128-pixel crop, about a "
+        "tenth of a second on four cores; progress is reported); `continue` goes on from the network the clip's "
+        "Learned Effect runs, into a new file (clips running the old one keep it). `apply_to` lists the clips to get it (default the clip itself); "
+        "`replace` (default true) turns off the clip's own effects, which the network now stands in for. Gives the "
+        "network file, the steps trained, the last loss and the examples' PSNR before and after.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "frames":{"type":"array","items":{"type":["number","string"]}},"steps":{"type":"number","default":1000},
+            "continue":{"type":"boolean","default":false},"apply_to":{"type":"array","items":{"type":"number"}},
+            "replace":{"type":"boolean","default":true},"seed":{"type":"number","default":1}},"required":["project","clip"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Clip examples = clipArg(l, a);
+            std::vector<FrameTime> frames;
+            for (const QJsonValue& v : a.value("frames").toArray()) frames.push_back(timeArg(v, s, "frames"));
+            if (frames.empty()) frames = exampleFrames(s, examples, s.playhead);
+            if (frames.empty()) return fail("No frames to learn from: give `frames`, or put markers on the clip");
+            std::vector<learn::Pair> pairs;
+            std::string err;
+            for (FrameTime f : frames) {
+                if (!examples.contains(f)) throw ArgError{QStringLiteral("Frame %1 is not on the clip").arg(tc(f, s))};
+                learn::Pair p;
+                if (!learningPair(l.project, s, examples, f, p, &err)) return fail(QString::fromStdString(err));
+                pairs.push_back(std::move(p));
+            }
+            learn::TrainOptions o;
+            o.seed = uint64_t(std::clamp(a.value("seed").toDouble(1), 0.0, 9007199254740992.0));
+            learn::Trainer trainer(learn::NetShape{}, pairs, o);
+            if (a.value("continue").toBool()) {
+                const std::string from = learnedNetworkOf(examples);
+                learn::Saved before;
+                if (from.empty() || !learn::load(from, before, &err) || before.state.empty() || !trainer.restore(before.state))
+                    return fail("The clip has no network trained before to go on from");
+            }
+            const std::string file = newLearnedNetworkPath(l.path.toStdString(), l.project, examples);
+            const int steps = int(std::clamp(a.value("steps").toDouble(1000), 1.0, 100000.0));
+            const int start = trainer.steps();
+            trainer.run(steps, nullptr, [&](int step, double) {
+                if ((step - start) % 50 == 0) progress(double(step - start) / steps, QStringLiteral("Training"));
+            });
+            learn::Saved saved;
+            saved.net = trainer.net();
+            saved.frames = frames;
+            saved.options = o;
+            saved.state = trainer.state();
+            saved.source = examples.name;
+            if (!learn::save(file, saved, &err)) return fail(QString::fromStdString(err));
+            double before = 0, after = 0;
+            for (const learn::Pair& p : pairs) {
+                before += learn::psnr(p.before, p.after) / double(pairs.size());
+                after += learn::psnr(learn::applyNet(trainer.net(), p.before), p.after) / double(pairs.size());
+            }
+            std::vector<Id> targets;
+            for (const QJsonValue& v : a.value("apply_to").toArray()) targets.push_back(Id(v.toDouble()));
+            if (!a.contains("apply_to")) targets = {examples.id};
+            const int given = applyLearnedNetwork(l.project, s, targets, file, examples.id, a.value("replace").toBool(true));
+            save(l);
+            const QJsonObject o2{{"network", QString::fromStdString(file)}, {"steps", trainer.steps()}, {"loss", trainer.loss()},
+                                 {"examples", int(pairs.size())}, {"psnr_before", before}, {"psnr_after", after}, {"clips", given}};
+            return ok(QStringLiteral("Trained %1 steps on %2 frame(s): the examples %3 dB, from %4; given to %5 clip(s)")
+                          .arg(trainer.steps())
+                          .arg(pairs.size())
+                          .arg(after, 0, 'f', 1)
+                          .arg(before, 0, 'f', 1)
+                          .arg(given),
+                      o2);
         });
 
     add("montage_move_clip", "Move a clip",
