@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <array>
 #include <set>
 #include <QImage>
@@ -175,6 +176,7 @@
 #include "render/FaceShape.h"
 #include "media/FaceTracks.h"
 #include "media/DepthMap.h"
+#include "media/DeepImage.h"
 #include "media/Exr.h"
 #include "render/VideoFx.h"
 #ifdef MONTAGE_WITH_OPENEXR
@@ -27831,6 +27833,313 @@ if ui["pressed"] == "add":
             QCOMPARE(tracks[2].captions[i].start, t.captions[i].start + 90);  // the file's frame 10 is at 100
             QCOMPARE(tracks[2].captions[i].end, t.captions[i].end + 90);
         }
+    }
+
+    void deepImages() {
+        if (!exrAvailable()) QSKIP("Built without OpenEXR");
+        // A red volume from Z 1 to 3 and a blue one from 2 to 4 (values halves keep exactly), written as deep OpenEXR,
+        // scanlines and tiles, and read back.
+        auto volume = [](int w, int h, float z, float zBack, float r, float b, float a) {
+            return buildDeep(w, h, [=](int, int, std::vector<DeepSample>& out) { out.push_back({z, zBack, r * a, 0, b * a, a}); });
+        };
+        const DeepFrame red = volume(8, 6, 1, 3, 1, 0, 0.625f), blue = volume(8, 6, 2, 4, 0, 1, 0.5f);
+        std::string err;
+        QVERIFY2(writeDeepExr(path("red.exr"), red, "zips", false, false, &err), err.c_str());
+        QVERIFY2(writeDeepExr(path("blue.exr"), blue, "zstd", true, false, &err), err.c_str());
+        QVERIFY(!writeDeepExr(path("zip.exr"), blue, "zip", false, false, &err));  // (not for deep data)
+        ExrInfo info;
+        QVERIFY2(readExrInfo(path("blue.exr"), info, &err), err.c_str());
+        QVERIFY(info.deep && info.width == 8 && info.height == 6 && info.hasLayer(""));
+        DeepFrame r2, b2;
+        QVERIFY2(readDeepExr(path("red.exr"), r2, &err), err.c_str());
+        QVERIFY2(readDeepExr(path("blue.exr"), b2, &err), err.c_str());  // (tiled)
+        QCOMPARE(r2.samples.size(), size_t(48));
+        QCOMPARE(b2.count(7, 5), size_t(1));
+        QCOMPARE(b2.at(7, 5)->zBack, 4.0f);
+        QCOMPARE(r2.at(3, 2)->r, 0.625f);
+        DeepFrame none;
+        QVERIFY(!readDeepExr(path("missing.exr"), none, &err));
+        // A frame taller than one band of rows read, with 0 to 3 samples a pixel, comes back whole from scanlines and
+        // tiles; a sample with no depth goes, and one reaching to no end becomes a point.
+        const float inf = std::numeric_limits<float>::infinity();
+        const DeepFrame many = buildDeep(130, 150, [=](int x, int y, std::vector<DeepSample>& out) {
+            for (int k = 0; k < (x + y) % 4; ++k) out.push_back({float(k + 1), float(k + 1) + 0.5f, 0.25f, 0.5f, 0.125f, 0.5f});
+            if (x == 1 && y == 140) out.push_back({std::nanf(""), 1, 0, 0, 0, 1}), out.push_back({7, inf, 0, 0, 0, 1});
+        });
+        for (const bool tiled : {false, true}) {
+            QVERIFY2(writeDeepExr(path("many.exr"), many, "zips", tiled, true, &err), err.c_str());
+            DeepFrame back;
+            bool full = false;
+            QVERIFY2(readDeepExr(path("many.exr"), back, &err, &full), err.c_str());
+            QVERIFY(full && back.width == 130 && back.height == 150 && back.samples.size() == many.samples.size() - 1);
+            for (int y = 0; y < 150; ++y)
+                for (int x = 0; x < 130; ++x) {
+                    const bool odd = x == 1 && y == 140;
+                    QCOMPARE(back.count(x, y), many.count(x, y) - (odd ? 1 : 0));
+                    for (size_t k = 0; k < size_t((x + y) % 4); ++k)
+                        QVERIFY(back.at(x, y)[k].z == many.at(x, y)[k].z && back.at(x, y)[k].zBack == many.at(x, y)[k].zBack &&
+                                back.at(x, y)[k].g == 0.5f);
+                    if (odd) QVERIFY(back.at(x, y)[back.count(x, y) - 1].z == 7 && back.at(x, y)[back.count(x, y) - 1].zBack == 7);
+                }
+        }
+        // Merged the same in either order, as "Interpreting OpenEXR Deep Pixels" works it out: red alone from 1 to 2,
+        // both mixed by their absorption from 2 to 3, blue alone from 3 to 4.
+        const DeepFrame ab = mergeDeep({&r2, &b2}), ba = mergeDeep({&b2, &r2});
+        QCOMPARE(ab.samples.size(), size_t(48 * 3));
+        const std::vector<float> fa = flattenDeep(ab), fb = flattenDeep(ba);
+        for (size_t i = 0; i < fa.size(); ++i) QCOMPARE(fa[i], fb[i]);
+        const double ar = 1 - std::sqrt(0.375), abl = 1 - std::sqrt(0.5);           // each half of a volume
+        const double ur = -std::log(1 - ar), ub = -std::log(1 - abl), am = 1 - std::exp(-(ur + ub));
+        const double mr = ur * am / (ur + ub), mb = ub * am / (ur + ub);               // the mix's colour
+        const double R = ar + (1 - ar) * mr, B = (1 - ar) * mb + (1 - ar) * (1 - am) * abl;
+        const double A = 1 - (1 - ar) * (1 - am) * (1 - abl);
+        QVERIFY2(std::fabs(fa[0] - R) < 1e-5 && std::fabs(fa[2] - B) < 1e-5 && std::fabs(fa[3] - A) < 1e-5,
+                 qPrintable(QString("%1 %2 %3, not %4 %5 %6").arg(fa[0]).arg(fa[2]).arg(fa[3]).arg(R).arg(B).arg(A)));
+        QVERIFY(std::fabs(A - (1 - 0.375 * 0.5)) < 1e-9);  // (the same light gets through either way)
+        // OpenEXR's own CompositeDeepScanLine (which sorts but does not split) agrees on the tidied samples, and on
+        // samples that do not overlap: random points in two files.
+        QVERIFY2(writeDeepExr(path("merged.exr"), ab, "zips", false, true, &err), err.c_str());
+        int w = 0, h = 0;
+        std::vector<float> theirs;
+        QVERIFY2(compositeDeepWithOpenExr({path("merged.exr")}, w, h, theirs, &err), err.c_str());
+        QCOMPARE(w, 8);
+        for (size_t i = 0; i < fa.size(); ++i) QVERIFY2(std::fabs(theirs[i] - fa[i]) < 1e-5, qPrintable(QString::number(i)));
+        uint32_t lcg = 7;
+        auto rnd = [&] {
+            lcg = lcg * 1664525u + 1013904223u;
+            return float(lcg >> 8) / float(1 << 24);
+        };
+        DeepFrame points[2];
+        for (DeepFrame& f : points) {
+            std::vector<std::vector<DeepSample>> px(16 * 9);
+            for (auto& v : px)
+                for (int k = int(rnd() * 5); k > 0; --k) {
+                    const float a = 0.1f + 0.8f * rnd(), z = 1 + 10 * rnd();
+                    v.push_back({z, z, a * rnd(), a * rnd(), a * rnd(), a});
+                }
+            for (auto& v : px)  // (each file tidy, as OpenEXR expects of one source)
+                std::sort(v.begin(), v.end(), [](const DeepSample& a, const DeepSample& b) { return a.z < b.z; });
+            f = buildDeep(16, 9, [&](int x, int y, std::vector<DeepSample>& out) {
+                const auto& v = px[size_t(y) * 16 + size_t(x)];
+                out.insert(out.end(), v.begin(), v.end());
+            });
+        }
+        QVERIFY(writeDeepExr(path("points1.exr"), points[0], "none", false, true, &err));
+        QVERIFY(writeDeepExr(path("points2.exr"), points[1], "rle", false, true, &err));
+        QVERIFY2(compositeDeepWithOpenExr({path("points1.exr"), path("points2.exr")}, w, h, theirs, &err), err.c_str());
+        const std::vector<float> ours = flattenDeep(mergeDeep({&points[1], &points[0]}));
+        for (size_t i = 0; i < ours.size(); ++i) QVERIFY2(std::fabs(theirs[i] - ours[i]) < 1e-5, qPrintable(QString("%1: %2 %3").arg(i).arg(theirs[i]).arg(ours[i])));
+        // Red held out by blue: its front half whole, then its share of the mix; nothing where blue is in front.
+        DeepFrame held = r2;
+        holdOutDeep(held, b2);
+        const std::vector<float> fh = flattenDeep(held);
+        const double heldA = ar + (1 - ar) * am * ur / (ur + ub);
+        QVERIFY2(std::fabs(fh[3] - heldA) < 1e-5, qPrintable(QString("%1, not %2").arg(fh[3]).arg(heldA)));
+        QVERIFY(std::fabs(fh[0] - (ar + (1 - ar) * mr)) < 1e-5 && fh[2] == 0);
+        {
+            const DeepFrame front = buildDeep(1, 1, [](int, int, std::vector<DeepSample>& out) { out.push_back({1, 1, 0, 0, 0.5f, 0.5f}); });
+            DeepFrame back = buildDeep(1, 1, [](int, int, std::vector<DeepSample>& out) { out.push_back({2, 2, 1, 0, 0, 1}); });
+            holdOutDeep(back, front);
+            QCOMPARE(flattenDeep(back)[3], 0.5f);  // an opaque sample behind half of the holdout: half left
+        }
+        // A slice at Z 2.5: red's front half and the first half of the mix.
+        DeepFrame sliced = ab;
+        sliceDeep(sliced, 0, 2.5f);
+        const std::vector<float> fs = flattenDeep(sliced);
+        const double ap = 1 - std::sqrt(1 - am);
+        QVERIFY2(std::fabs(fs[3] - (ar + (1 - ar) * ap)) < 1e-5, qPrintable(QString::number(fs[3])));
+        QVERIFY(std::fabs(fs[0] - (ar + (1 - ar) * mr * ap / am)) < 1e-5);
+        // Graded by depth: blue's back half (3.5 to 4) twice as bright, the rest as it was.
+        DeepFrame graded = b2;
+        gradeDeep(graded, 3.5f, 100, 0, [](float* rgb, float wt) {
+            for (int k = 0; k < 3; ++k) rgb[k] *= 1 + wt;
+        });
+        QCOMPARE(graded.count(0, 0), size_t(2));
+        QCOMPARE(graded.at(0, 0)[0].b, float(0.5 * (1 - std::pow(0.5, 0.75)) / 0.5));
+        QCOMPARE(graded.at(0, 0)[1].b, float(2 * (1 - std::pow(0.5, 0.25))));
+        // A flat picture made deep: a sample a pixel with any alpha, at its depth.
+        const std::vector<float> flat = {1, 0, 0, 1, 0, 0, 0, 0};
+        const std::vector<float> depth = {3, 4};
+        const DeepFrame made = deepFromFlat(flat.data(), 2, 1, depth.data(), 0.5f);
+        QVERIFY(made.count(0, 0) == 1 && made.count(1, 0) == 0 && made.at(0, 0)->z == 3 && made.at(0, 0)->zBack == 3.5f);
+        // A deep file shown on its own: the samples flattened.
+        int lw = 0, lh = 0;
+        std::vector<float> shown;
+        QVERIFY(readExrLayer(path("merged.exr"), "", lw, lh, shown, &err));
+        QCOMPARE(shown[3], fa[3]);
+    }
+
+    void deepCompositing() {
+        if (!exrAvailable()) QSKIP("Built without OpenEXR");
+        // In a sequence: the red and blue volumes on two tracks merge the same in either order, under a flat clip above.
+        auto volume = [](float z, float zBack, float r, float b, float a) {
+            return buildDeep(32, 18, [=](int, int, std::vector<DeepSample>& out) { out.push_back({z, zBack, r * a, 0, b * a, a}); });
+        };
+        std::string err;
+        QVERIFY(writeDeepExr(path("seq-red.exr"), volume(1, 3, 1, 0, 0.625f), "zips", false, false, &err));
+        QVERIFY(writeDeepExr(path("seq-blue.exr"), volume(2, 4, 0, 1, 0.5f), "zips", false, false, &err));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 32, s.height = 18, s.fps = {25, 1};
+        while (s.videoTracks.size() < 4) s.videoTracks.push_back(Track{});
+        auto place = [&](const std::string& file, size_t track) {
+            MediaItem m = probeOrFail(p, file);
+            m.colorOverride = s.colorSpace;  // (compared in the sequence's own space)
+            p.media.push_back(m);
+            Clip c;
+            c.id = p.newId();
+            c.mediaId = m.id;
+            c.start = 0;
+            c.duration = 25;
+            s.videoTracks[track].clips = {c};
+            return c.id;
+        };
+        place(path("seq-red.exr"), 0);
+        place(path("seq-blue.exr"), 1);
+        RenderOptions o;
+        const Image one = renderSequenceFrame(p, s, 5, o);
+        std::swap(s.videoTracks[0].clips, s.videoTracks[1].clips);
+        const Image two = renderSequenceFrame(p, s, 5, o);
+        DeepFrame red, blue;
+        QVERIFY(readDeepExr(path("seq-red.exr"), red) && readDeepExr(path("seq-blue.exr"), blue));
+        const std::vector<float> want = flattenDeep(mergeDeep({&red, &blue}));
+        for (int k = 0; k < 4; ++k) {
+            QVERIFY2(std::fabs(one.at(10, 9)[k] - want[size_t(k)]) < 1e-5, qPrintable(QString("%1: %2 %3").arg(k).arg(one.at(10, 9)[k]).arg(want[size_t(k)])));
+            QCOMPARE(two.at(10, 9)[k], one.at(10, 9)[k]);
+        }
+        // Held out by the other track's picture, hidden: red with the holdout's alpha.
+        Clip& top = s.videoTracks[1].clips[0];  // (red, now on V2)
+        Effect ho = makeEffect(p, "deep_holdout");
+        ho.params["track"] = 1.0;
+        ho.params["hide"] = 1.0;
+        top.effects.push_back(ho);
+        const Image heldImg = renderSequenceFrame(p, s, 5, o);
+        DeepFrame held = red;
+        holdOutDeep(held, blue);
+        QVERIFY(std::fabs(heldImg.at(3, 3)[3] - flattenDeep(held)[3]) < 1e-5 && heldImg.at(3, 3)[2] == 0);
+        // Shown, the holdout changes nothing: the merge already hides red where blue is in front.
+        top.effects[0].params["hide"] = 0.0;
+        const Image shownImg = renderSequenceFrame(p, s, 5, o);
+        for (int k = 0; k < 4; ++k) QVERIFY(std::fabs(shownImg.at(10, 9)[k] - one.at(10, 9)[k]) < 1e-5);
+        top.effects.clear();
+        // Both volumes in one file: shown on its own they are mixed where they overlap, as the merge mixes them.
+        QVERIFY(writeDeepExr(path("seq-both.exr"), buildDeep(32, 18, [&](int x, int y, std::vector<DeepSample>& out) {
+            out.push_back(*red.at(x, y));
+            out.push_back(*blue.at(x, y));
+        }), "zips", false, true, &err));
+        int bw = 0, bh = 0;
+        std::vector<float> both;
+        QVERIFY(readExrLayer(path("seq-both.exr"), "", bw, bh, both, &err));
+        for (int k = 0; k < 4; ++k) QVERIFY(std::fabs(both[size_t(k)] - want[size_t(k)]) < 1e-5);
+        // A depth slice, and Flatten Deep taking a layer out of the merge (blue on V1 under red on V2: red over it).
+        Effect slice = makeEffect(p, "deep_slice");
+        slice.params["near"] = 0.0;
+        slice.params["far"] = 2.0;
+        top.effects.push_back(slice);
+        const Image slicedImg = renderSequenceFrame(p, s, 5, o);
+        QVERIFY(std::fabs(slicedImg.at(0, 0)[3] - float(1 - std::sqrt(0.375) * 0.5)) < 1e-5);  // red's front half over blue
+        top.effects = {makeEffect(p, "flatten_deep")};
+        s.videoTracks[0].clips[0].effects = {makeEffect(p, "flatten_deep")};
+        const Image flatImg = renderSequenceFrame(p, s, 5, o);
+        QVERIFY(std::fabs(flatImg.at(0, 0)[0] - 0.625f) < 1e-5);  // red over blue, whole
+        for (Track& t : s.videoTracks)
+            for (Clip& c : t.clips) c.effects.clear();
+
+        // Make Deep from Depth Map: a graphic between a person and the wall behind them, from the frame's depth map
+        // (white near), whatever the tracks' order; the map itself hidden.
+        QImage frame(64, 48, QImage::Format_ARGB32), map(64, 48, QImage::Format_ARGB32), box(64, 48, QImage::Format_ARGB32);
+        frame.fill(QColor(128, 128, 128));
+        map.fill(Qt::black);
+        box.fill(Qt::transparent);
+        for (int y = 0; y < 48; ++y)
+            for (int x = 0; x < 64; ++x) {
+                if (x >= 20 && x < 40 && y >= 8) frame.setPixel(x, y, qRgb(230, 180, 150)), map.setPixel(x, y, qRgb(255, 255, 255));
+                if (x >= 10 && x < 54 && y >= 16 && y < 32) box.setPixel(x, y, qRgb(0, 200, 0));
+            }
+        QVERIFY(frame.save(QString::fromStdString(path("deep-frame.png"))) && map.save(QString::fromStdString(path("deep-map.png"))) &&
+                box.save(QString::fromStdString(path("deep-box.png"))));
+        Project q = makeDefaultProject();
+        Sequence& qs = *q.active();
+        qs.width = 64, qs.height = 48, qs.fps = {25, 1};
+        while (qs.videoTracks.size() < 3) qs.videoTracks.push_back(Track{});
+        auto put = [&](const char* file, size_t track) -> Clip& {
+            MediaItem m = probeOrFail(q, path(file));
+            q.media.push_back(m);
+            Clip c;
+            c.id = q.newId();
+            c.mediaId = m.id;
+            c.duration = 25;
+            qs.videoTracks[track].clips = {c};
+            return qs.videoTracks[track].clips[0];
+        };
+        Effect fromMap = makeEffect(q, "make_deep");
+        fromMap.params["track"] = 3.0;  // V3
+        put("deep-frame.png", 0).effects.push_back(fromMap);
+        Effect constant = makeEffect(q, "make_deep");
+        constant.params["source"] = 2.0;
+        constant.params["depth"] = 5.0;
+        put("deep-box.png", 1).effects.push_back(constant);
+        put("deep-map.png", 2);
+        for (int order = 0; order < 2; ++order) {
+            if (order) std::swap(qs.videoTracks[0].clips, qs.videoTracks[1].clips);
+            const Image img = renderSequenceFrame(q, qs, 3, o);
+            auto near = [&](int x, int y, int r, int g, int b) {
+                const float* px = img.at(x, y);
+                return std::fabs(px[0] - r / 255.0f) < 0.01f && std::fabs(px[1] - g / 255.0f) < 0.01f && std::fabs(px[2] - b / 255.0f) < 0.01f;
+            };
+            QVERIFY2(near(30, 24, 230, 180, 150), "the person in front of the graphic");
+            QVERIFY2(near(14, 24, 0, 200, 0), "the graphic in front of the wall");
+            QVERIFY2(near(30, 40, 230, 180, 150), "the person");
+            QVERIFY2(near(5, 5, 128, 128, 128), "the wall (the map not seen)");
+        }
+        // Over MCP: a deep OpenEXR placed like any picture.
+        const QString project = QString::fromStdString(path("deep.montage"));
+        QVERIFY(saveProject(makeDefaultProject(), project.toStdString()));
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_place_media"},
+                                                     {"arguments", QJsonObject{{"project", project}, {"media", QString::fromStdString(path("seq-red.exr"))}, {"at", 0}}},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        // A deep render pulled for VFX: its frames' samples copied, deep, numbered from the cut's 1001.
+        for (int k = 1; k <= 3; ++k)
+            QVERIFY(writeDeepExr(path(qPrintable(QString("deepseq.%1.exr").arg(k, 4, 10, QChar('0')))), volume(float(k), float(k) + 1, 1, 0, 0.25f * float(k)),
+                                 "zips", false, false, &err));
+        ImageSequence dseq;
+        QVERIFY(detectImageSequence(path("deepseq.0001.exr"), dseq));
+        dseq.fps = {25, 1};
+        Project pp = makeDefaultProject();
+        Sequence& ps = *pp.active();
+        ps.width = 32, ps.height = 18, ps.fps = {25, 1};
+        MediaItem dm = probeOrFail(pp, imageSequencePath(dseq));
+        QCOMPARE(dm.kind, MediaKind::Video);
+        pp.media.push_back(dm);
+        Clip dc = makeClip(pp, dm, TrackKind::Video, ps);
+        dc.sourceIn = 1;
+        dc.duration = 1;
+        edit::overwrite(pp, ps, {TrackKind::Video, 0}, dc);
+        VfxPullOptions po;
+        po.folder = path("deep-pulls");
+        po.handles = 1;
+        po.compression = "zip";  // (not for deep data: ZIP one line at a time instead)
+        std::vector<VfxShot> shots;
+        QVERIFY2(exportVfxPulls(pp, ps, {ps.videoTracks[0].clips.at(0).id}, po, &shots, nullptr, nullptr, &err), err.c_str());
+        QVERIFY(shots.size() == 1 && shots[0].deep && shots[0].firstFrame == 1000 && shots[0].lastFrame == 1002);
+        for (int k = 0; k < 3; ++k) {
+            DeepFrame pulled;
+            const std::string file = shots[0].folder + "/" + shots[0].name + "." + std::to_string(1000 + k) + ".exr";
+            QVERIFY2(readDeepExr(file, pulled, &err), err.c_str());
+            QCOMPARE(pulled.at(4, 4)->z, float(k + 1));
+            QCOMPARE(pulled.at(4, 4)->a, 0.25f * float(k + 1));
+        }
+        // The deep cache keeps within its budget (the newest frame always).
+        const size_t was = deepCacheBudget();
+        setDeepCacheBudget(1);
+        QVERIFY(deepCacheBytes() <= std::max(red.bytes(), blue.bytes()) + 64);
+        setDeepCacheBudget(was);
     }
 
     void dialogueMusicEffectsChunks() {

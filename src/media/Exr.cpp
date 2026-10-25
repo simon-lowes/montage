@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -20,7 +21,14 @@
 #ifdef MONTAGE_WITH_OPENEXR
 #include <ImathBox.h>
 #include <ImfChannelList.h>
+#include <ImfCompositeDeepScanLine.h>
 #include <ImfCompression.h>
+#include <ImfDeepFrameBuffer.h>
+#include <ImfDeepScanLineInputFile.h>
+#include <ImfDeepScanLineInputPart.h>
+#include <ImfDeepScanLineOutputFile.h>
+#include <ImfDeepTiledInputPart.h>
+#include <ImfDeepTiledOutputFile.h>
 #include <ImfFrameBuffer.h>
 #include <ImfHeader.h>
 #include <ImfInputPart.h>
@@ -31,6 +39,7 @@
 #include <half.h>
 #endif
 
+#include "DeepImage.h"
 #include "Image.h"
 #include "ImageSequence.h"
 #include "core/Interpretation.h"
@@ -205,6 +214,13 @@ bool locate(const Imf::MultiPartInputFile& in, const std::string& layer, Located
     }
     return false;
 }
+
+// The first deep part of a file, or -1.
+int isDeep(const Imf::MultiPartInputFile& in) {
+    for (int p = 0; p < in.parts(); ++p)
+        if (in.header(p).hasType() && in.header(p).type().find("deep") != std::string::npos) return p;
+    return -1;
+}
 #endif
 
 }  // namespace
@@ -265,7 +281,17 @@ bool readExrInfo(const std::string& file, ExrInfo& out, std::string* error) {
         out.compression = compressionName(first.compression());
         for (int p = 0; p < in.parts(); ++p) {
             const Imf::Header& h = in.header(p);
-            if (h.hasType() && h.type().find("deep") != std::string::npos) continue;  // deep data: not a picture
+            if (h.hasType() && h.type().find("deep") != std::string::npos) {
+                // Deep data: its samples (readDeepExr), shown flattened as the main picture.
+                if (!out.deep) {
+                    out.deep = true;
+                    ExrLayer l;
+                    for (const char* c : {"R", "G", "B", "A"})
+                        if (h.channels().findChannel(c)) l.channels.push_back(c);
+                    out.layers.insert(out.layers.begin(), std::move(l));
+                }
+                continue;
+            }
             const std::string part = partPrefix(h, in.parts());
             // Cryptomattes first, so their channels aren't listed as layers.
             std::set<std::string> cryptoPrefixes;
@@ -335,6 +361,14 @@ bool readExrLayer(const std::string& file, const std::string& layer, int& width,
     try {
         useThreads();
         Imf::MultiPartInputFile in(file.c_str());
+        if (layer.empty() && isDeep(in) >= 0) {
+            // A deep file's picture: its samples flattened.
+            const std::shared_ptr<const DeepFrame> deep = cachedDeepExr(file, error);
+            if (!deep) return false;
+            width = deep->width, height = deep->height;
+            rgba = flattenDeep(*deep);
+            return true;
+        }
         Located l;
         if (!locate(in, layer, l)) {
             if (error) *error = file + " has no layer \"" + layer + "\"";
@@ -766,6 +800,294 @@ bool writeExr(const std::string& file, int width, int height, const std::vector<
     if (error) *error = "This build of Montage writes OpenEXR layers only with the OpenEXR library";
     return false;
 #endif
+}
+
+// ---- Deep data -----------------------------------------------------------------------------------------------------
+
+bool readDeepExr(const std::string& file, DeepFrame& out, std::string* error, bool* floatColour) {
+    out = {};
+    if (floatColour) *floatColour = false;
+#ifdef MONTAGE_WITH_OPENEXR
+    try {
+        useThreads();
+        Imf::MultiPartInputFile in(file.c_str());
+        const int p = isDeep(in);
+        if (p < 0) {
+            if (error) *error = file + " holds no deep data";
+            return false;
+        }
+        const Imf::Header& h = in.header(p);
+        const Imath::Box2i disp = in.header(0).displayWindow(), dw = h.dataWindow();
+        const int dwW = dw.max.x - dw.min.x + 1, dwH = dw.max.y - dw.min.y + 1;
+        const size_t n = size_t(dwW) * size_t(dwH);
+        static const char* names[] = {"Z", "ZBack", "R", "G", "B", "A"};
+        bool has[6] = {};
+        for (int c = 0; c < 6; ++c) has[c] = h.channels().findChannel(names[c]) != nullptr;
+        if (!has[0]) {
+            if (error) *error = file + " has no Z channel";
+            return false;
+        }
+        if (floatColour)
+            if (const Imf::Channel* r = h.channels().findChannel("R")) *floatColour = r->type == Imf::FLOAT;
+        // Each pixel's count, then its samples read a band of rows at a time straight into the frame: a pointer a
+        // pixel of the band for each channel, into the samples' fields.
+        std::vector<uint32_t> counts(n, 0);
+        const ptrdiff_t origin = ptrdiff_t(dw.min.y) * dwW + dw.min.x;
+        const Imf::Slice countSlice(Imf::UINT, reinterpret_cast<char*>(counts.data() - origin), sizeof(uint32_t), sizeof(uint32_t) * size_t(dwW));
+        const bool tiled = h.type().find("tile") != std::string::npos;
+        std::unique_ptr<Imf::DeepTiledInputPart> tiles;
+        std::unique_ptr<Imf::DeepScanLineInputPart> lines;
+        {
+            Imf::DeepFrameBuffer fb;
+            fb.insertSampleCountSlice(countSlice);
+            if (tiled) {
+                tiles = std::make_unique<Imf::DeepTiledInputPart>(in, p);
+                tiles->setFrameBuffer(fb);
+                tiles->readPixelSampleCounts(0, tiles->numXTiles(0) - 1, 0, tiles->numYTiles(0) - 1, 0, 0);
+            } else {
+                lines = std::make_unique<Imf::DeepScanLineInputPart>(in, p);
+                lines->setFrameBuffer(fb);
+                lines->readPixelSampleCounts(dw.min.y, dw.max.y);
+            }
+        }
+        size_t total = 0;
+        for (uint32_t c : counts) total += c;
+        std::vector<DeepSample>& samples = out.samples;
+        samples.assign(total, DeepSample{});
+        const int band = tiled ? tiles->tileYSize() : 64;
+        std::vector<std::vector<char*>> pointers(6, std::vector<char*>(size_t(band) * size_t(dwW), nullptr));
+        size_t at = 0;
+        for (int y0 = dw.min.y, b = 0; y0 <= dw.max.y; y0 += band, ++b) {
+            const int y1 = std::min(dw.max.y, y0 + band - 1);
+            const size_t first = size_t(y0 - dw.min.y) * size_t(dwW), last = size_t(y1 - dw.min.y + 1) * size_t(dwW);
+            for (size_t i = first; i < last; ++i) {
+                DeepSample* s = samples.data() + at;
+                pointers[0][i - first] = reinterpret_cast<char*>(&s->z);
+                pointers[1][i - first] = reinterpret_cast<char*>(&s->zBack);
+                pointers[2][i - first] = reinterpret_cast<char*>(&s->r);
+                pointers[3][i - first] = reinterpret_cast<char*>(&s->g);
+                pointers[4][i - first] = reinterpret_cast<char*>(&s->b);
+                pointers[5][i - first] = reinterpret_cast<char*>(&s->a);
+                at += counts[i];
+            }
+            Imf::DeepFrameBuffer fb;
+            fb.insertSampleCountSlice(countSlice);
+            const ptrdiff_t bandOrigin = ptrdiff_t(y0) * dwW + dw.min.x;
+            for (int c = 0; c < 6; ++c)
+                if (has[c])
+                    fb.insert(names[c], Imf::DeepSlice(Imf::FLOAT, reinterpret_cast<char*>(pointers[size_t(c)].data() - bandOrigin), sizeof(char*),
+                                                       sizeof(char*) * size_t(dwW), sizeof(DeepSample)));
+            if (tiled) {
+                tiles->setFrameBuffer(fb);
+                tiles->readTiles(0, tiles->numXTiles(0) - 1, b, b, 0, 0);
+            } else {
+                lines->setFrameBuffer(fb);
+                lines->readPixels(y0, y1);
+            }
+        }
+        // The samples laid out on the display window (in place: both run row by row), their depths made sound: a
+        // sample with no depth goes, one with no (or an endless or inverted) ZBack becomes a point.
+        out.width = disp.max.x - disp.min.x + 1;
+        out.height = disp.max.y - disp.min.y + 1;
+        out.offsets.assign(size_t(out.width) * size_t(out.height) + 1, 0);
+        size_t read = 0, kept = 0;
+        for (int sy = 0; sy < dwH; ++sy)
+            for (int sx = 0; sx < dwW; ++sx) {
+                const size_t count = counts[size_t(sy) * size_t(dwW) + size_t(sx)];
+                const int x = sx + dw.min.x - disp.min.x, y = sy + dw.min.y - disp.min.y;
+                if (x < 0 || y < 0 || x >= out.width || y >= out.height) {
+                    read += count;
+                    continue;
+                }
+                const size_t before = kept;
+                for (size_t k = 0; k < count; ++k) {
+                    DeepSample s = samples[read++];
+                    if (!std::isfinite(s.z)) continue;
+                    if (!has[1] || !std::isfinite(s.zBack) || !(s.zBack >= s.z)) s.zBack = s.z;
+                    if (!has[5]) s.a = 1;  // (no alpha: opaque)
+                    samples[kept++] = s;
+                }
+                out.offsets[size_t(y) * size_t(out.width) + size_t(x) + 1] = uint32_t(kept - before);
+            }
+        for (size_t i = 1; i < out.offsets.size(); ++i) out.offsets[i] += out.offsets[i - 1];
+        samples.resize(kept);
+        if (kept < total / 2) samples.shrink_to_fit();
+        return true;
+    } catch (const std::exception& e) {
+        out = {};
+        if (error) *error = "Cannot read " + file + ": " + e.what();
+        return false;
+    }
+#else
+    (void)file;
+    if (error) *error = "This build of Montage reads deep OpenEXR only with the OpenEXR library";
+    return false;
+#endif
+}
+
+bool writeDeepExr(const std::string& file, const DeepFrame& f, const std::string& compression, bool tiled, bool fullFloat, std::string* error) {
+#ifdef MONTAGE_WITH_OPENEXR
+    try {
+        useThreads();
+        if (f.empty() || f.offsets.size() != size_t(f.width) * size_t(f.height) + 1) {
+            if (error) *error = "No deep frame to write";
+            return false;
+        }
+        Imf::Compression c = Imf::NUM_COMPRESSION_METHODS;
+        Imf::getCompressionIdFromName(compression.empty() ? "zips" : compression, c);
+        // (What OpenEXR reads deep data in.)
+        if (c != Imf::NO_COMPRESSION && c != Imf::RLE_COMPRESSION && c != Imf::ZIPS_COMPRESSION && c != Imf::ZSTD_COMPRESSION) {
+            if (error) *error = "Deep OpenEXR is compressed with none, rle, zips or zstd, not \"" + compression + "\"";
+            return false;
+        }
+        Imf::Header header(f.width, f.height);
+        header.compression() = c;
+        static const char* names[] = {"Z", "ZBack", "R", "G", "B", "A"};
+        const Imf::PixelType colourType = fullFloat ? Imf::FLOAT : Imf::HALF;
+        for (int k = 0; k < 6; ++k) header.channels().insert(names[k], Imf::Channel(k < 2 ? Imf::FLOAT : colourType));
+        const size_t n = size_t(f.width) * size_t(f.height);
+        std::vector<uint32_t> counts(n);
+        for (size_t i = 0; i < n; ++i) counts[i] = f.offsets[i + 1] - f.offsets[i];
+        // Halves for the colour, the depths as they are.
+        std::vector<half> colour(fullFloat ? 0 : f.samples.size() * 4);
+        for (size_t i = 0; i < f.samples.size() && !fullFloat; ++i) {
+            const DeepSample& s = f.samples[i];
+            colour[i * 4] = half(s.r), colour[i * 4 + 1] = half(s.g), colour[i * 4 + 2] = half(s.b), colour[i * 4 + 3] = half(s.a);
+        }
+        std::vector<std::vector<char*>> pointers(6, std::vector<char*>(n));
+        for (size_t i = 0; i < n; ++i) {
+            DeepSample* s = const_cast<DeepSample*>(f.samples.data()) + f.offsets[i];
+            pointers[0][i] = reinterpret_cast<char*>(&s->z);
+            pointers[1][i] = reinterpret_cast<char*>(&s->zBack);
+            if (fullFloat) {
+                pointers[2][i] = reinterpret_cast<char*>(&s->r), pointers[3][i] = reinterpret_cast<char*>(&s->g);
+                pointers[4][i] = reinterpret_cast<char*>(&s->b), pointers[5][i] = reinterpret_cast<char*>(&s->a);
+            } else {
+                half* q = colour.data() + size_t(f.offsets[i]) * 4;
+                for (int k = 0; k < 4; ++k) pointers[size_t(2 + k)][i] = reinterpret_cast<char*>(q + k);
+            }
+        }
+        Imf::DeepFrameBuffer fb;
+        fb.insertSampleCountSlice(Imf::Slice(Imf::UINT, reinterpret_cast<char*>(counts.data()), sizeof(uint32_t), sizeof(uint32_t) * size_t(f.width)));
+        for (int k = 0; k < 6; ++k)
+            fb.insert(names[k], Imf::DeepSlice(k < 2 ? Imf::FLOAT : colourType, reinterpret_cast<char*>(pointers[size_t(k)].data()), sizeof(char*),
+                                               sizeof(char*) * size_t(f.width), k < 2 || fullFloat ? sizeof(DeepSample) : 4 * sizeof(half)));
+        if (tiled) {
+            header.setTileDescription(Imf::TileDescription(64, 64, Imf::ONE_LEVEL));
+            Imf::DeepTiledOutputFile out(file.c_str(), header);
+            out.setFrameBuffer(fb);
+            out.writeTiles(0, out.numXTiles(0) - 1, 0, out.numYTiles(0) - 1, 0, 0);
+        } else {
+            Imf::DeepScanLineOutputFile out(file.c_str(), header);
+            out.setFrameBuffer(fb);
+            out.writePixels(f.height);
+        }
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = "Cannot write " + file + ": " + e.what();
+        return false;
+    }
+#else
+    (void)file, (void)f, (void)compression, (void)tiled, (void)fullFloat;
+    if (error) *error = "This build of Montage writes deep OpenEXR only with the OpenEXR library";
+    return false;
+#endif
+}
+
+bool compositeDeepWithOpenExr(const std::vector<std::string>& files, int& width, int& height, std::vector<float>& rgba, std::string* error) {
+#ifdef MONTAGE_WITH_OPENEXR
+    try {
+        useThreads();
+        std::vector<std::unique_ptr<Imf::DeepScanLineInputFile>> in;
+        Imf::CompositeDeepScanLine comp;
+        for (const std::string& f : files) {
+            in.push_back(std::make_unique<Imf::DeepScanLineInputFile>(f.c_str()));
+            comp.addSource(in.back().get());
+        }
+        const Imath::Box2i dw = comp.dataWindow();
+        width = dw.max.x - dw.min.x + 1, height = dw.max.y - dw.min.y + 1;
+        rgba.assign(size_t(width) * size_t(height) * 4, 0.0f);
+        Imf::FrameBuffer fb;
+        const ptrdiff_t origin = (ptrdiff_t(dw.min.y) * width + dw.min.x) * 4;
+        const char* names[] = {"R", "G", "B", "A"};
+        for (int k = 0; k < 4; ++k)
+            fb.insert(names[k], Imf::Slice(Imf::FLOAT, reinterpret_cast<char*>(rgba.data() - origin + k), 4 * sizeof(float), size_t(width) * 4 * sizeof(float)));
+        comp.setFrameBuffer(fb);
+        comp.readPixels(dw.min.y, dw.max.y);
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = std::string("Cannot composite: ") + e.what();
+        return false;
+    }
+#else
+    (void)files, (void)width, (void)height, (void)rgba;
+    if (error) *error = "This build of Montage has no OpenEXR library";
+    return false;
+#endif
+}
+
+namespace {
+std::mutex deepMutex;
+// 1 GB, or $MONTAGE_DEEP_CACHE_MB.
+size_t deepBudget = [] {
+    const char* mb = std::getenv("MONTAGE_DEEP_CACHE_MB");
+    const long long v = mb ? std::atoll(mb) : 0;
+    return v > 0 ? size_t(v) << 20 : size_t(1) << 30;
+}();
+std::list<std::pair<std::string, std::shared_ptr<const DeepFrame>>> deepRecent;  // newest first
+
+void trimDeep() {
+    size_t bytes = 0, kept = 0;
+    for (auto it = deepRecent.begin(); it != deepRecent.end(); ++it, ++kept) {
+        bytes += it->second->bytes();
+        if (kept >= 1 && bytes > deepBudget) {
+            deepRecent.erase(it, deepRecent.end());
+            break;
+        }
+    }
+}
+}  // namespace
+
+std::shared_ptr<const DeepFrame> cachedDeepExr(const std::string& file, std::string* error) {
+    const std::string key = fileKey(file);
+    {
+        std::lock_guard<std::mutex> lock(deepMutex);
+        for (auto it = deepRecent.begin(); it != deepRecent.end(); ++it)
+            if (it->first == key) {
+                deepRecent.splice(deepRecent.begin(), deepRecent, it);
+                return it->second;
+            }
+    }
+    auto f = std::make_shared<DeepFrame>();
+    if (!readDeepExr(file, *f, error)) return nullptr;
+    tidyDeep(*f);
+    std::lock_guard<std::mutex> lock(deepMutex);
+    for (auto it = deepRecent.begin(); it != deepRecent.end(); ++it)
+        if (it->first == key) {  // (read meanwhile by another thread)
+            deepRecent.splice(deepRecent.begin(), deepRecent, it);
+            return it->second;
+        }
+    deepRecent.emplace_front(key, f);
+    trimDeep();
+    return f;
+}
+
+void setDeepCacheBudget(size_t bytes) {
+    std::lock_guard<std::mutex> lock(deepMutex);
+    deepBudget = bytes;
+    trimDeep();
+}
+
+size_t deepCacheBudget() {
+    std::lock_guard<std::mutex> lock(deepMutex);
+    return deepBudget;
+}
+
+size_t deepCacheBytes() {
+    std::lock_guard<std::mutex> lock(deepMutex);
+    size_t bytes = 0;
+    for (const auto& [k, f] : deepRecent) bytes += f->bytes();
+    return bytes;
 }
 
 }  // namespace montage

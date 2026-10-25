@@ -373,6 +373,26 @@ std::vector<EffectInfo> buildCatalog() {
                   choice("composite", "Composite Using", {"Matte Alpha", "Matte Luma"}, 0), boolean("reverse", "Reverse"),
                   boolean("hide", "Hide the Matte", true)},
                  {}});
+    // Deep compositing (media/DeepImage.h; handled when tracks are composited): deep OpenEXR clips, and pictures made
+    // deep, are merged by depth whatever their tracks' order and flattened in where the lowest of them is.
+    c.push_back({"make_deep", "Make Deep from Depth Map", EffectCategory::VideoFilter, "Deep",
+                 {choice("source", "Depth", {"Depth Map Track", "Estimated from the Picture", "Constant"}, 0),
+                  num("track", "Depth Map Track (V number, 0: the one above)", 0, 99, 0, 1), boolean("hide", "Hide the Depth Map", true),
+                  choice("map", "Depth Map", {"White Is Near", "White Is Far", "Values Are Depth"}, 0),
+                  num("near", "Nearest Depth", 0, 100000, 1), num("far", "Farthest Depth", 0, 100000, 10),
+                  num("depth", "Constant Depth", 0, 100000, 5), num("thickness", "Thickness", 0, 100000, 0)},
+                 {}});
+    c.push_back({"deep_holdout", "Hold Out by Depth", EffectCategory::VideoFilter, "Deep",
+                 {num("track", "Holdout Track (V number, 0: the one above)", 0, 99, 0, 1), boolean("hide", "Hide the Holdout")},
+                 {}});
+    c.push_back({"deep_grade", "Colour Correct by Depth", EffectCategory::VideoFilter, "Deep",
+                 {num("near", "From Depth", 0, 100000, 0), num("far", "To Depth", 0, 100000, 10), num("soft", "Softness", 0, 100000, 0),
+                  num("exposure", "Exposure (stops)", -8, 8, 0), color("gain", "Gain", 1, 1, 1), pct("saturation", "Saturation", 0, 200, 100)},
+                 {}});
+    c.push_back({"deep_slice", "Depth Slice", EffectCategory::VideoFilter, "Deep",
+                 {num("near", "From Depth", 0, 100000, 0), num("far", "To Depth", 0, 100000, 10)},
+                 {}});
+    c.push_back({"flatten_deep", "Flatten Deep", EffectCategory::VideoFilter, "Deep", {}, {}});
     // The sky found, keyed and replaced by another track's picture or a gradient (handled when tracks are composited,
     // render/SkyReplace.h). Its strings["motion"] holds the camera motion an analysis measured, to move the sky with.
     c.push_back({"sky_replace", "Sky Replacement", EffectCategory::VideoFilter, "Keying",

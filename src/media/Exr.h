@@ -35,6 +35,7 @@ struct Cryptomatte {
 
 struct ExrInfo {
     int width = 0, height = 0;  // the display window
+    bool deep = false;          // a deep file (its picture: the samples flattened, layer "")
     double pixelAspect = 1;
     std::string compression;    // the first part's ("zip", "piz", "htj2k256"...)
     std::vector<ExrLayer> layers;
@@ -100,5 +101,27 @@ std::vector<std::string> exrCompressions();  // the names writeExr takes
 std::string exrCompressionLabel(const std::string& name);
 bool writeExr(const std::string& file, int width, int height, const std::vector<ExrOutLayer>& layers, const std::string& compression,
               const std::map<std::string, std::string>& attributes = {}, std::string* error = nullptr);
+
+// ---- Deep data (media/DeepImage.h) ----------------------------------------------------------------------------------
+
+struct DeepFrame;
+// A deep file's samples (its first deep part, scanline or tiled): Z, ZBack (Z when it has none), R, G, B and A
+// (opaque when it has none), on the display window; samples with no finite depth are left out. False with `error`
+// when the file is not deep. `floatColour`: whether its colour is stored as full floats.
+bool readDeepExr(const std::string& file, DeepFrame& out, std::string* error = nullptr, bool* floatColour = nullptr);
+// The same tidied (media/DeepImage.h tidyDeep), kept while the deep frames last asked for fit the deep cache's budget (the newest always kept).
+std::shared_ptr<const DeepFrame> cachedDeepExr(const std::string& file, std::string* error = nullptr);
+// 1 GB at first ($MONTAGE_DEEP_CACHE_MB to change it): a 4K frame of 8 samples a pixel is about 0.85 GB in half floats.
+void setDeepCacheBudget(size_t bytes);
+size_t deepCacheBudget();
+size_t deepCacheBytes();
+// A deep frame written as deep OpenEXR (Z and ZBack as floats, RGBA as halves or with `fullFloat` floats), scanlines
+// or 64-pixel tiles; compressed with none, rle, zips or zstd.
+bool writeDeepExr(const std::string& file, const DeepFrame& f, const std::string& compression = "zips", bool tiled = false,
+                  bool fullFloat = false, std::string* error = nullptr);
+// Deep scanline files composited by OpenEXR's own CompositeDeepScanLine (which sorts the samples by depth but does not
+// split overlapping volumes), as RGBA floats of their data window: a reference for Montage's own.
+bool compositeDeepWithOpenExr(const std::vector<std::string>& files, int& width, int& height, std::vector<float>& rgba,
+                              std::string* error = nullptr);
 
 }  // namespace montage

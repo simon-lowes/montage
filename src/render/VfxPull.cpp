@@ -18,6 +18,7 @@
 #include "core/Interpretation.h"
 #include "media/DepthMap.h"
 #include "media/VideoDepth.h"
+#include "media/DeepImage.h"
 #include "media/Exr.h"
 #include "media/Image.h"
 #include "media/LensCalibration.h"
@@ -283,7 +284,27 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
             }
         }
         std::string why;
-        if (!exportSequence(p, alone, st, prog, cancel, &why)) return fail(name + ": " + why);
+        // A deep render's frames: their samples copied as they are, as deep OpenEXR (compressed as deep data can be).
+        const std::string firstFile = o.format == "exr" && c.layer.empty() ? exrFrameFile(m.path, double(first) / mf) : std::string();
+        const std::shared_ptr<const ExrInfo> firstInfo = firstFile.empty() ? nullptr : cachedExrInfo(firstFile);
+        if (firstInfo && firstInfo->deep) {
+            const std::string& cmp = o.compression;
+            const std::string compression = cmp == "none" || cmp == "rle" || cmp == "zips" || cmp == "zstd" ? cmp : std::string("zips");
+            for (int64_t k = 0; k < frames; ++k) {
+                if (cancel && cancel->load()) return fail("Cancelled");
+                DeepFrame f;
+                const QString file = QDir(QString::fromStdString(shot.folder))
+                                         .filePath(QStringLiteral("%1.%2.exr").arg(QString::fromStdString(name)).arg(shot.firstFrame + int(k), 4, 10, QChar('0')));
+                bool full = false;
+                if (!readDeepExr(exrFrameFile(m.path, double(first + k) / mf), f, &why, &full) ||
+                    !writeDeepExr(file.toStdString(), f, compression, false, full, &why))
+                    return fail(name + ": " + why);
+                prog(double(k + 1) / double(frames), FrameTime(k));
+            }
+            shot.deep = true;
+        } else if (!exportSequence(p, alone, st, prog, cancel, &why)) {
+            return fail(name + ": " + why);
+        }
         if (o.amf) {
             // The frames' space as the input transform and the cut's grade as looks, for the frames by their numbers.
             // (as the exporter chooses it: EXR any space asked for, else linear Rec.709; DPX the space asked for or the

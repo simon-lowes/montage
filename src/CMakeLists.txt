@@ -81,6 +81,7 @@ add_library(montage_engine STATIC
   automation/McpServer.h automation/McpServer.cpp
   media/Image.h media/Image.cpp
   media/Decoder.h media/Decoder.cpp
+  media/DeepImage.h media/DeepImage.cpp
   media/Exr.h media/Exr.cpp
   media/Vector.h media/Vector.cpp
   media/CameraRaw.h media/CameraRaw.cpp

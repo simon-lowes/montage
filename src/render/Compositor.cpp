@@ -80,6 +80,7 @@
 #include "media/Rife.h"
 #include "media/SuperScale.h"
 #include "core/Interpretation.h"
+#include "media/DeepImage.h"
 #include "media/Exr.h"
 
 namespace montage {
@@ -1680,6 +1681,12 @@ std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t) {
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
             if (const Effect* e = skyTrackEffect(seq, *c, t); e && e->p("hide", t - c->start, 1) > 0.5)
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
+            // A depth map made into depth, and a deep holdout, when they are to be hidden.
+            if (const Effect* e = enabledEffect(seq, *c, "make_deep"); e && std::lround(e->p("source", t - c->start, 0)) == 0 &&
+                                                                     e->p("hide", t - c->start, 1) > 0.5)
+                if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
+            if (const Effect* e = enabledEffect(seq, *c, "deep_holdout"); e && e->p("hide", t - c->start, 0) > 0.5)
+                if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
         }
     return hidden;
 }
@@ -1835,6 +1842,207 @@ void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c,
 
 }  // namespace
 
+namespace {
+
+// ---- Deep layers (media/DeepImage.h) -------------------------------------------------------------------------------
+
+// The deep OpenEXR file a clip shows at t ("" when its picture is not deep), and its media. Whether a sequence is
+// deep is told by its first frame, so flat EXR sequences are not opened again frame by frame.
+std::string clipDeepFile(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const MediaItem** media = nullptr) {
+    if (c.isGenerator() || !c.layer.empty() || !exrAvailable()) return {};
+    const MediaItem* m = p.findMedia(c.mediaId);
+    if (!m || (m->kind != MediaKind::Video && m->kind != MediaKind::Image)) return {};
+    const std::string first = exrFrameFile(m->path, 0);
+    if (first.empty()) return {};
+    const std::shared_ptr<const ExrInfo> info = cachedExrInfo(first);
+    if (!info || !info->deep) return {};
+    double sec = 0;
+    if (m->kind == MediaKind::Video) {
+        const double fd = m->fps.valid() ? 1.0 / m->fps.toDouble() : 1.0 / 30;
+        sec = std::clamp(c.sourceFrameAt(t) / seq.fpsValue(), 0.0, std::max(0.0, m->duration - fd * 0.5));
+    }
+    if (media) *media = m;
+    return exrFrameFile(m->path, sec);
+}
+
+// Whether a clip's picture takes part in the depth merge (or is flattened on its own, `flattened`).
+bool isDeepClip(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, bool* flattened = nullptr) {
+    const bool deep = enabledEffect(seq, c, "make_deep") || !clipDeepFile(p, seq, c, t).empty();
+    if (flattened) *flattened = deep && enabledEffect(seq, c, "flatten_deep");
+    return deep;
+}
+
+// Samples' colours from a picture's space into the sequence's working space (straight, a million at a time).
+void deepIntoWorkingSpace(DeepFrame& f, const ColorSpace& from, const Sequence& seq) {
+    const ColorSpace& to = sequenceColorSpace(seq);
+    if (&from == &to) return;
+    constexpr size_t chunk = size_t(1) << 20;
+    for (size_t at = 0; at < f.samples.size(); at += chunk) {
+        const size_t n = std::min(chunk, f.samples.size() - at);
+        Image img(1024, int((n + 1023) / 1024));  // (rows, so the conversion runs on every core)
+        for (size_t i = 0; i < n; ++i) {
+            const DeepSample& s = f.samples[at + i];
+            const float k = s.a > 1e-6f ? 1 / s.a : 1;
+            float* q = img.px.data() + i * 4;
+            q[0] = s.r * k, q[1] = s.g * k, q[2] = s.b * k, q[3] = 1;
+        }
+        convertColor(img, from, to, seq.hdrPeakNits);
+        for (size_t i = 0; i < n; ++i) {
+            DeepSample& s = f.samples[at + i];
+            const float k = s.a > 1e-6f ? s.a : 1;
+            const float* q = img.px.data() + i * 4;
+            s.r = q[0] * k, s.g = q[1] * k, s.b = q[2] * k;
+        }
+    }
+}
+
+float lumaOf(const float* q) {
+    const float y = 0.2126f * q[0] + 0.7152f * q[1] + 0.0722f * q[2];
+    return q[3] > 1e-6f ? y / q[3] : y;
+}
+
+// A clip's picture at t as deep samples on the W x H frame: a deep OpenEXR frame through the clip's transform (nearest
+// pixels) and opacity, or its flat picture made deep (Make Deep from Depth Map); then its depth slices and grades.
+DeepFrame clipDeepFrame(const Project& p, const Sequence& seq, size_t ti, const Clip& c, FrameTime t, const RenderOptions& o, int W, int H) {
+    ExpressionScope expressions(&p, &seq, &c, o.cancel);  // (core/Expression.h)
+    const FrameTime lt = t - c.start;
+    DeepFrame f;
+    if (const Effect* md = enabledEffect(seq, c, "make_deep")) {
+        Image layer = clipLayer(p, seq, c, t, o, nullptr);
+        if (layer.empty() || layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
+        const int source = int(std::lround(md->p("source", lt, 0)));
+        const int map = int(std::lround(md->p("map", lt, 0)));
+        const float near = float(md->p("near", lt, 1)), far = float(md->p("far", lt, 10));
+        std::vector<float> depth(size_t(W) * size_t(H), float(md->p("depth", lt, 5)));
+        auto toDepth = [&](float v) {
+            return map == 2 ? v : map == 1 ? near + (far - near) * std::clamp(v, 0.0f, 1.0f) : far + (near - far) * std::clamp(v, 0.0f, 1.0f);
+        };
+        if (source == 0) {
+            const int m = matteTrack(seq, ti, c, *md, t);
+            const Clip* mc = m >= 0 ? clipAt(seq.videoTracks[size_t(m)], t) : nullptr;
+            const Image dm = mc ? clipLayer(p, seq, *mc, t, o, nullptr) : Image();
+            if (dm.width != W || dm.height != H) return DeepFrame::blank(W, H);  // no depth map now: nothing
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) depth[size_t(y) * size_t(W) + size_t(x)] = toDepth(lumaOf(dm.at(x, y)));
+        } else if (source == 1) {
+            const std::shared_ptr<const DepthMap> d = depthAvailable() && depthModel().installed() ? cachedDepth(layer) : nullptr;
+            if (!d) {
+                if (o.issues) o.issues->note("Make Deep from Depth Map needs the depth model");
+                return DeepFrame::blank(W, H);
+            }
+            const std::vector<float> v = d->resized(W, H);
+            for (size_t i = 0; i < depth.size(); ++i) depth[i] = toDepth(v[i]);
+        }
+        f = deepFromFlat(layer.px.data(), W, H, depth.data(), float(md->p("thickness", lt, 0)));
+    } else {
+        const MediaItem* m = nullptr;
+        const std::string file = clipDeepFile(p, seq, c, t, &m);
+        const std::shared_ptr<const DeepFrame> src = file.empty() ? nullptr : cachedDeepExr(file);
+        Geometry g;
+        if (!src || !clipGeometry(p, seq, c, t, g)) return DeepFrame::blank(W, H);
+        // The clip's transform, as sequence pixels to the deep frame's.
+        double u0, v0, u1, v1, u2, v2;
+        sequenceToClipFrame(p, seq, c, t, 0, 0, u0, v0);
+        sequenceToClipFrame(p, seq, c, t, 1, 0, u1, v1);
+        sequenceToClipFrame(p, seq, c, t, 0, 1, u2, v2);
+        const double s = o.scale > 0 ? o.scale : 1;
+        const int sw = src->width, sh = src->height;
+        f = resampleDeep(*src, W, H, [&](double x, double y, double& u, double& v) {
+            const double X = x / s, Y = y / s;
+            u = (u0 + (u1 - u0) * X + (u2 - u0) * Y) * sw;
+            v = (v0 + (v1 - v0) * X + (v2 - v0) * Y) * sh;
+        }, float(g.opacity));
+        deepIntoWorkingSpace(f, pictureColorSpace(*m, m->path), seq);
+    }
+    for (const Effect* e : liveEffects(seq, c)) {
+        if (e->type == "deep_slice") {
+            sliceDeep(f, float(e->p("near", lt, 0)), float(e->p("far", lt, 10)));
+        } else if (e->type == "deep_grade") {
+            const float gain = float(std::exp2(e->p("exposure", lt, 0)));
+            const float gr = float(e->p("gain.r", lt, 1)) * gain, gg = float(e->p("gain.g", lt, 1)) * gain, gb = float(e->p("gain.b", lt, 1)) * gain;
+            const float sat = float(e->p("saturation", lt, 100) / 100);
+            gradeDeep(f, float(e->p("near", lt, 0)), float(e->p("far", lt, 10)), float(e->p("soft", lt, 0)), [&](float* rgb, float w) {
+                float q[3] = {rgb[0] * gr, rgb[1] * gg, rgb[2] * gb};
+                const float y = 0.2126f * q[0] + 0.7152f * q[1] + 0.0722f * q[2];
+                for (int k = 0; k < 3; ++k) rgb[k] += (y + (q[k] - y) * sat - rgb[k]) * w;
+            });
+        }
+    }
+    return f;
+}
+
+// A flattened deep frame as a layer (premultiplied).
+Image deepLayer(const DeepFrame& f) {
+    Image img(f.width, f.height, Image::Uninitialized{});
+    const std::vector<float> rgba = flattenDeep(f);
+    std::copy(rgba.begin(), rgba.end(), img.px.begin());
+    return img;
+}
+
+// The deep layers on screen at t: every deep clip's frame (held out where asked), the merge of those not flattened on
+// their own, and the lowest track among them.
+struct DeepLayers {
+    std::map<size_t, DeepFrame> frames;  // by track
+    std::map<size_t, bool> flattened;
+    Image merged;
+    int lowest = -1;
+};
+DeepLayers deepLayers(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o, int W, int H, int solo,
+                      const std::vector<bool>& hidden) {
+    DeepLayers out;
+    auto on = [&](size_t ti) {
+        const Track& track = seq.videoTracks[ti];
+        return !(solo >= 0 ? int(ti) != solo : track.muted);
+    };
+    for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
+        if (!on(ti) || (solo < 0 && hidden[ti])) continue;
+        const Track& track = seq.videoTracks[ti];
+        FrameTime a, b;
+        if (std::any_of(track.transitions.begin(), track.transitions.end(),
+                        [&](const Transition& tr) { return edit::transitionRange(track, tr, a, b) && t >= a && t < b; }))
+            continue;  // (a transition shows its clips flat)
+        const Clip* c = clipAt(track, t);
+        bool flat = false;
+        if (!c || !isDeepClip(p, seq, *c, t, &flat)) continue;
+        out.frames[ti] = clipDeepFrame(p, seq, ti, *c, t, o, W, H);
+        out.flattened[ti] = flat;
+    }
+    if (out.frames.empty()) return out;
+    // Holdouts: by another track's deep picture (made even when that track is hidden or off), each by the pictures as
+    // they were before any was held out. One merged with the clip already hides it where it is in front, so it is
+    // held out only when either of them is flattened on its own or the holdout is not shown.
+    std::vector<std::pair<size_t, DeepFrame>> held;
+    for (const auto& [ti, f] : out.frames) {
+        const Clip* c = clipAt(seq.videoTracks[ti], t);
+        const Effect* e = c ? enabledEffect(seq, *c, "deep_holdout") : nullptr;
+        if (!e) continue;
+        const int m = matteTrack(seq, ti, *c, *e, t);
+        if (m < 0) continue;
+        const auto it = out.frames.find(size_t(m));
+        if (it != out.frames.end() && !out.flattened[ti] && !out.flattened[size_t(m)]) continue;
+        DeepFrame other;
+        if (it == out.frames.end())
+            if (const Clip* hc = clipAt(seq.videoTracks[size_t(m)], t); hc && isDeepClip(p, seq, *hc, t))
+                other = clipDeepFrame(p, seq, size_t(m), *hc, t, o, W, H);
+        const DeepFrame& by = it != out.frames.end() ? it->second : other;
+        if (by.empty()) continue;
+        DeepFrame g = f;
+        holdOutDeep(g, by);
+        held.emplace_back(ti, std::move(g));
+    }
+    for (auto& [ti, g] : held) out.frames[ti] = std::move(g);
+    std::vector<const DeepFrame*> merge;
+    for (const auto& [ti, f] : out.frames)
+        if (!out.flattened[ti]) {
+            merge.push_back(&f);
+            if (out.lowest < 0) out.lowest = int(ti);
+        }
+    if (!merge.empty()) out.merged = deepLayer(mergeDeep(merge));
+    return out;
+}
+
+}  // namespace
+
 Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& opts) {
     ExpressionScope expressions(&p, &seq, nullptr, opts.cancel);  // (core/Expression.h)
     const WorkingSpaceScope working(&sequenceColorSpace(seq));  // effects that work in light know whose
@@ -1851,10 +2059,21 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
         else blendOnto(canvas, layer, mode, 1.0f);
         canvasEmpty = false;
     };
+    // Deep layers: merged by depth, whatever their tracks' order, and flattened in where the lowest of them is.
+    DeepLayers deep = deepLayers(p, seq, t, o, W, H, solo, hiddenMatte);
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
         const Track& track = seq.videoTracks[ti];
         if (solo >= 0 ? int(ti) != solo : track.muted) continue;  // an angle shows even if its track is hidden
         if (solo < 0 && hiddenMatte[ti]) continue;
+        if (auto it = deep.frames.find(ti); it != deep.frames.end()) {
+            if (deep.flattened[ti]) {
+                const Clip* c = clipAt(track, t);
+                composite(deepLayer(it->second), c ? c->blendMode : "normal");
+            } else if (int(ti) == deep.lowest) {
+                composite(std::move(deep.merged), "normal");
+            }
+            continue;
+        }
         const Transition* active = nullptr;
         FrameTime from = 0, to = 0;
         for (const auto& tr : track.transitions) {
@@ -2243,6 +2462,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
                 if (trackMatteOf(*c)) return fallback("a track matte");
                 if (enabledEffect(seq, *c, "behind_people")) return fallback("Behind People");
                 if (enabledEffect(seq, *c, "sky_replace")) return fallback("Sky Replacement");
+                if (isDeepClip(p, seq, *c, t)) return fallback("deep compositing");
             }
     }
     auto layerOf = [&](const Clip& c, gpu::Layer& l) {
