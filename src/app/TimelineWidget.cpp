@@ -55,6 +55,7 @@ constexpr int kSnapPx = 9;
 constexpr int kNameStrip = 16;
 constexpr int kBtn = 20;
 constexpr int kFolderH = 24;  // a track folder's header row
+constexpr int kTakeLaneH = 22;  // a take lane under an audio track
 
 // A clip's line parameter (generic over the timeline's private Lane type).
 template <class L>
@@ -189,7 +190,7 @@ void TimelineWidget::layoutRows(std::vector<Row>* rowsOut, std::vector<FolderRow
             const Track& t = tracks[size_t(at(k))];
             if (t.folder.empty()) {
                 if (rowsOut) rowsOut->push_back({{kind, at(k)}, y, trackHeight(t)});
-                y += trackHeight(t);
+                y += trackHeight(t) + takeLanesHeight({kind, at(k)}, t);
                 ++k;
                 continue;
             }
@@ -199,7 +200,7 @@ void TimelineWidget::layoutRows(std::vector<Row>* rowsOut, std::vector<FolderRow
             if (!f.collapsed)
                 for (int i : f.tracks) {
                     if (rowsOut) rowsOut->push_back({{kind, i}, y, trackHeight(tracks[size_t(i)])});
-                    y += trackHeight(tracks[size_t(i)]);
+                    y += trackHeight(tracks[size_t(i)]) + takeLanesHeight({kind, i}, tracks[size_t(i)]);
                 }
             if (foldersOut) foldersOut->push_back(std::move(f));
         }
@@ -209,6 +210,172 @@ void TimelineWidget::layoutRows(std::vector<Row>* rowsOut, std::vector<FolderRow
     y += kDividerH;
     lay(TrackKind::Audio, s->audioTracks, false);
     if (bottom) *bottom = y;
+}
+
+int TimelineWidget::takeLanesHeight(TrackRef ref, const Track& t) const {
+    if (ref.kind != TrackKind::Audio || !t.lanesShown) return 0;
+    const Sequence* s = state_->sequence();
+    return s ? int(laneViews(state_->project(), *s, ref).size()) * kTakeLaneH : 0;
+}
+
+std::vector<TimelineWidget::TakeLaneRow> TimelineWidget::takeLaneRows() const {
+    std::vector<TakeLaneRow> out;
+    const Sequence* s = state_->sequence();
+    if (!s) return out;
+    for (const Row& r : rows()) {
+        if (r.ref.kind != TrackKind::Audio || !trackAt(*s, r.ref)->lanesShown) continue;
+        int y = r.y + r.h;
+        for (LaneView& v : laneViews(state_->project(), *s, r.ref)) {
+            out.push_back({r.ref, std::move(v), y});
+            y += kTakeLaneH;
+        }
+    }
+    return out;
+}
+
+QRect TimelineWidget::takeLaneBounds(TrackRef track, Id lane, FrameTime from, FrameTime to, Id clip, int take) const {
+    for (const TakeLaneRow& l : takeLaneRows())
+        if (l.ref == track && l.view.lane == lane && l.view.clip == clip && l.view.take == take)
+            return QRect(QPoint(xForFrame(from), l.y), QPoint(xForFrame(to) - 1, l.y + kTakeLaneH - 1));
+    return {};
+}
+
+std::optional<TimelineWidget::TakeLaneRow> TimelineWidget::takeLaneAt(const QPoint& pos) const {
+    if (pos.y() < kRulerH) return std::nullopt;
+    for (TakeLaneRow& l : takeLaneRows())
+        if (pos.y() >= l.y && pos.y() < l.y + kTakeLaneH) return std::move(l);
+    return std::nullopt;
+}
+
+// The lanes under audio tracks: each take where it plays, the parts the comp uses bright, a sweep being made outlined;
+// in the header column, each lane's name and rating.
+void TimelineWidget::paintTakeLanes(QPainter& p, bool header) {
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    const int W = viewport()->width();
+    for (const TakeLaneRow& l : takeLaneRows()) {
+        if (l.y + kTakeLaneH < kRulerH || l.y > viewport()->height()) continue;
+        const Track* t = trackAt(*s, l.ref);
+        if (header) {
+            const QRect hr(0, l.y, kHeaderW, kTakeLaneH);
+            p.fillRect(hr, theme::kPanel.darker(125));
+            p.setPen(l.view.lane ? theme::kText : theme::kTextDim);
+            QString label = QString::fromStdString(l.view.name);
+            if (l.view.rating > 0) label += QStringLiteral("  ") + QString(l.view.rating, QChar(0x2605));
+            p.drawText(hr.adjusted(18, 0, -6, 0), Qt::AlignVCenter | Qt::AlignLeft, p.fontMetrics().elidedText(label, Qt::ElideRight, kHeaderW - 24));
+            p.setPen(QColor(0, 0, 0, 90));
+            p.drawLine(0, l.y + kTakeLaneH - 1, kHeaderW, l.y + kTakeLaneH - 1);
+            continue;
+        }
+        p.fillRect(QRect(kHeaderW, l.y, W - kHeaderW, kTakeLaneH), theme::kPanel.darker(125));
+        const int xs = xForFrame(l.view.start), xe = xForFrame(l.view.end);
+        const QRect band(xs, l.y + 2, std::max(2, xe - xs), kTakeLaneH - 5);
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(0x3d, 0x6b, 0x66, 150));
+        p.drawRoundedRect(band, 3, 3);
+        // What the comp takes from it.
+        for (const Clip& c : t->clips) {
+            const bool used = l.view.lane ? compLaneOf(*t, c) == l.view.lane : false;
+            if (!used) continue;
+            p.setBrush(QColor(0x5f, 0xc9, 0xb8, 220));
+            p.drawRect(QRect(xForFrame(c.start), l.y + 2, std::max(1, xForFrame(c.end()) - xForFrame(c.start)), kTakeLaneH - 5));
+        }
+        p.setPen(theme::kText);
+        p.drawText(band.adjusted(4, 0, -4, 0), Qt::AlignVCenter | Qt::AlignLeft,
+                   p.fontMetrics().elidedText(QString::fromStdString(l.view.name), Qt::ElideRight, std::max(0, band.width() - 8)));
+        if (drag_.kind == DragKind::TakeComp && drag_.started && drag_.clip == l.view.lane && drag_.pressTrack && *drag_.pressTrack == l.ref) {
+            const FrameTime a = std::min(drag_.pressFrame, drag_.compTo), b = std::max(drag_.pressFrame, drag_.compTo);
+            p.setPen(QPen(theme::kAccent, 2));
+            p.setBrush(QColor(61, 139, 255, 60));
+            p.drawRect(QRect(xForFrame(a), l.y + 1, std::max(2, xForFrame(b) - xForFrame(a)), kTakeLaneH - 3));
+        }
+        p.setPen(QColor(0, 0, 0, 90));
+        p.drawLine(kHeaderW, l.y + kTakeLaneH - 1, W, l.y + kTakeLaneH - 1);
+    }
+}
+
+void TimelineWidget::takeLaneMenu(QMenu& menu, const TakeLaneRow& lane) {
+    const TrackRef ref = lane.ref;
+    if (!lane.view.lane) {  // an audition's take: play it
+        const Id clip = lane.view.clip;
+        const int take = lane.view.take;
+        menu.addAction(tr("Use This Take"), this, [this, clip, take] {
+            state_->apply(tr("Pick Take"), [clip, take](Project& p, Sequence& s) { return edit::pickTake(p, s, clip, take); });
+        });
+        return;
+    }
+    const Id id = lane.view.lane;
+    const FrameTime from = lane.view.start, to = lane.view.end;
+    menu.addAction(tr("Comp Whole Take"), this, [this, ref, id, from, to] {
+        state_->apply(tr("Comp Take"), [=](Project& p, Sequence& s) { return edit::compTake(p, s, ref, id, from, to); });
+    });
+    menu.addAction(tr("Rename Take..."), this, [this, ref, id, name = lane.view.name] {
+        bool ok = false;
+        const QString n = QInputDialog::getText(this, tr("Rename Take"), tr("Name:"), QLineEdit::Normal, QString::fromStdString(name), &ok);
+        if (ok && !n.trimmed().isEmpty())
+            state_->apply(tr("Rename Take"), [=](Project&, Sequence& s) { return edit::renameTakeLane(s, ref, id, n.trimmed().toStdString()); });
+    });
+    QMenu* rate = menu.addMenu(tr("Rate"));
+    for (int k = 0; k <= 5; ++k)
+        rate->addAction(k ? QString(k, QChar(0x2605)) : tr("None"), this, [this, ref, id, k] {
+            state_->apply(tr("Rate Take"), [=](Project&, Sequence& s) { return edit::rateTakeLane(s, ref, id, k); });
+        });
+    menu.addAction(tr("Remove Take Lane"), this, [this, ref, id] {
+        state_->apply(tr("Remove Take Lane"), [=](Project&, Sequence& s) { return edit::removeTakeLane(s, ref, id); });
+    });
+    menu.addSeparator();
+    menu.addAction(tr("Hide Take Lanes"), this, [this, ref] {
+        state_->apply(tr("Hide Take Lanes"), [=](Project&, Sequence& s) { return edit::showLanes(s, ref, false); });
+    });
+}
+
+void TimelineWidget::trackVersionMenu(QMenu& menu, TrackRef ref) {
+    const Sequence* s = state_->sequence();
+    const Track* t = s ? trackAt(*s, ref) : nullptr;
+    if (!t) return;
+    if (ref.kind == TrackKind::Audio && (!t->lanes.empty() || std::any_of(t->clips.begin(), t->clips.end(), [](const Clip& c) { return c.takes.size() > 1; }))) {
+        QAction* lanes = menu.addAction(tr("Show Take Lanes"));
+        lanes->setCheckable(true);
+        lanes->setChecked(t->lanesShown);
+        connect(lanes, &QAction::toggled, this, [this, ref](bool on) {
+            state_->apply(on ? tr("Show Take Lanes") : tr("Hide Take Lanes"), [=](Project&, Sequence& sq) { return edit::showLanes(sq, ref, on); });
+        });
+    }
+    QMenu* versions = menu.addMenu(tr("Track Versions"));
+    versions->setObjectName(QStringLiteral("trackVersionMenu"));
+    for (size_t k = 0; k < t->versions.size(); ++k) {
+        QAction* a = versions->addAction(QString::fromStdString(t->versions[k].name));
+        a->setCheckable(true);
+        a->setChecked(int(k) == t->version);
+        const int index = int(k);
+        connect(a, &QAction::triggered, this, [this, ref, index] {
+            state_->apply(tr("Switch Track Version"), [=](Project&, Sequence& sq) { return edit::switchTrackVersion(sq, ref, index); });
+        });
+    }
+    if (!t->versions.empty()) versions->addSeparator();
+    versions->addAction(tr("Duplicate as New Version"), this, [this, ref] {
+        state_->apply(tr("New Track Version"), [=](Project& p, Sequence& sq) { return edit::newTrackVersion(p, sq, ref, {}, true); });
+    });
+    versions->addAction(tr("New Empty Version"), this, [this, ref] {
+        state_->apply(tr("New Track Version"), [=](Project& p, Sequence& sq) { return edit::newTrackVersion(p, sq, ref, {}, false); });
+    });
+    if (t->versions.size() > 1) {
+        const int shown = t->version;
+        versions->addAction(tr("Rename Version..."), this, [this, ref, shown, name = t->versions[size_t(shown)].name] {
+            bool ok = false;
+            const QString n = QInputDialog::getText(this, tr("Rename Version"), tr("Name:"), QLineEdit::Normal, QString::fromStdString(name), &ok);
+            if (ok && !n.trimmed().isEmpty())
+                state_->apply(tr("Rename Track Version"), [=](Project&, Sequence& sq) { return edit::renameTrackVersion(sq, ref, shown, n.trimmed().toStdString()); });
+        });
+        QMenu* del = versions->addMenu(tr("Delete Version"));
+        for (size_t k = 0; k < t->versions.size(); ++k) {
+            if (int(k) == shown) continue;
+            const int index = int(k);
+            del->addAction(QString::fromStdString(t->versions[k].name), this, [this, ref, index] {
+                state_->apply(tr("Delete Track Version"), [=](Project&, Sequence& sq) { return edit::deleteTrackVersion(sq, ref, index); });
+            });
+        }
+    }
 }
 
 std::vector<TimelineWidget::Row> TimelineWidget::rows() const {
@@ -594,6 +761,7 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
             }
         }
     }
+    paintTakeLanes(p, false);
     for (const FolderRow& f : folderRows()) paintFolderRow(p, f, false);
     if (gap_)
         for (const Row& r : rs)
@@ -650,6 +818,7 @@ void TimelineWidget::paintEvent(QPaintEvent*) {
     p.restore();
 
     paintHeaders(p, rs);
+    paintTakeLanes(p, true);
     paintRuler(p);
     // Live readout during drags.
     if (drag_.started && !drag_.label.isEmpty()) {
@@ -1674,6 +1843,24 @@ void TimelineWidget::mousePressEvent(QMouseEvent* e) {
         return;
     }
     if (e->button() != Qt::LeftButton) return;
+    // A sweep across a take lane gives that stretch of it to the comp (on release); a click on an audition's take
+    // plays that take.
+    if (const auto lane = takeLaneAt(e->pos())) {
+        if (e->pos().x() < kHeaderW) return;
+        if (!lane->view.lane) {
+            const Id clip = lane->view.clip;
+            const int take = lane->view.take;
+            state_->apply(tr("Pick Take"), [clip, take](Project& p, Sequence& sq) { return edit::pickTake(p, sq, clip, take); });
+            return;
+        }
+        drag_.kind = DragKind::TakeComp;
+        drag_.clip = lane->view.lane;
+        drag_.pressTrack = lane->ref;
+        drag_.compFrom = lane->view.start, drag_.compEnd = lane->view.end;
+        drag_.pressFrame = std::clamp(frameRound(e->pos().x()), lane->view.start, lane->view.end);
+        drag_.compTo = drag_.pressFrame;
+        return;
+    }
     if (hit.kind == HitKind::Header) {
         handleHeaderClick(hit);
         return;
@@ -1851,6 +2038,12 @@ void TimelineWidget::updateDrag(QMouseEvent* e) {
             case DragKind::TransitionEdge: state_->beginGesture(tr("Transition Duration")); break;
             default: break;
         }
+    }
+    if (drag_.kind == DragKind::TakeComp) {
+        drag_.compTo = std::clamp(frameRound(pos.x()), drag_.compFrom, drag_.compEnd);
+        drag_.label = durationString(state_->sequence(), std::llabs(drag_.compTo - drag_.pressFrame));
+        viewport()->update();
+        return;
     }
     const Sequence* s = state_->gestureBase();  // fetched after beginGesture() above
     const FrameTime raw = frameRound(pos.x()) - drag_.pressFrame;
@@ -2145,6 +2338,12 @@ void TimelineWidget::mouseReleaseEvent(QMouseEvent* e) {
                                      drag_.kind == DragKind::LineKey || drag_.kind == DragKind::TrackLine ||
                                      drag_.kind == DragKind::TrackKey || drag_.kind == DragKind::TransitionEdge);
     if (gesture) state_->endGesture(true);
+    if (drag_.kind == DragKind::TakeComp && drag_.started && drag_.pressTrack && drag_.compTo != drag_.pressFrame) {
+        const TrackRef ref = *drag_.pressTrack;
+        const Id lane = drag_.clip;
+        const FrameTime a = std::min(drag_.pressFrame, drag_.compTo), b = std::max(drag_.pressFrame, drag_.compTo);
+        state_->apply(tr("Comp Take"), [=](Project& p, Sequence& sq) { return edit::compTake(p, sq, ref, lane, a, b); });
+    }
     if (drag_.started && (drag_.kind == DragKind::Trim || drag_.kind == DragKind::Roll || drag_.kind == DragKind::Slip || drag_.kind == DragKind::Slide))
         emit trimViewEnded();
     // A click (not a drag) on empty track space selects the gap there.
@@ -2243,6 +2442,13 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* e) {
         QMenu menu(this);
         menu.setObjectName(QStringLiteral("keyframeMenu"));
         laneMenu(menu, *lh);
+        if (!menu.isEmpty()) menu.exec(e->globalPos());
+        return;
+    }
+    if (const auto lane = takeLaneAt(e->pos())) {
+        QMenu menu(this);
+        menu.setObjectName(QStringLiteral("takeLaneMenu"));
+        takeLaneMenu(menu, *lane);
         if (!menu.isEmpty()) menu.exec(e->globalPos());
         return;
     }
@@ -2367,6 +2573,7 @@ void TimelineWidget::contextMenuEvent(QContextMenuEvent* e) {
                 return true;
             });
         });
+        trackVersionMenu(menu, ref);
         QMenu* height = menu.addMenu(tr("Track Height"));
         for (auto [label, px] : {std::pair{tr("Small"), 36}, {tr("Medium"), 0}, {tr("Large"), 96}, {tr("Extra Large"), 140}}) {
             int hpx = px;

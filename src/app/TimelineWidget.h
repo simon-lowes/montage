@@ -10,6 +10,7 @@
 
 #include "core/EditOps.h"
 #include "core/Model.h"
+#include "core/TakeLanes.h"
 
 class QAction;
 class QMimeData;
@@ -92,6 +93,9 @@ public:
         QRect r;
         return clipRect(clip, r) ? r : QRect();
     }
+    // Where a take lane (or an audition take's lane: `lane` 0 and its clip and take) is drawn from frame `from` to
+    // `to`, in viewport pixels (empty when its track's lanes are not shown).
+    QRect takeLaneBounds(TrackRef track, Id lane, FrameTime from, FrameTime to, Id clip = 0, int take = -1) const;
     // Whether a through edit follows this clip (edit::throughEdits), as marked on the timeline.
     bool isThroughEdit(Id clip) const;
     // How many frames a linked clip is out of sync with its picture (edit::syncOffset), as its red badge shows; 0 in sync.
@@ -179,7 +183,7 @@ private:
         std::string folder;  // a track folder's header (with folderKind)
         TrackKind folderKind = TrackKind::Audio;
     };
-    enum class DragKind { None, Scrub, Move, Trim, Roll, Slip, Slide, Rubber, Pan, CaptionMove, CaptionIn, CaptionOut, Line, LineKey, TrackLine, TrackKey, TransitionEdge };
+    enum class DragKind { None, Scrub, Move, Trim, Roll, Slip, Slide, Rubber, Pan, CaptionMove, CaptionIn, CaptionOut, Line, LineKey, TrackLine, TrackKey, TransitionEdge, TakeComp };
     struct DragState {
         DragKind kind = DragKind::None;
         QPoint pressPos;
@@ -203,7 +207,21 @@ private:
         double lineAtPress = 0;  // the line's value under the press
         int track = -1;          // the audio track whose automation is dragged
         Id transition = 0;       // TransitionEdge: the transition resized (edge: In its start, Out its end)
+        FrameTime compTo = 0;    // TakeComp: where the sweep across a take lane has reached
+        FrameTime compFrom = 0, compEnd = 0;  // and the lane's span
     };
+    // A take lane under an audio track (core/TakeLanes.h), shown while the track's lanes are.
+    struct TakeLaneRow {
+        TrackRef ref;
+        LaneView view;
+        int y = 0;
+    };
+    std::vector<TakeLaneRow> takeLaneRows() const;
+    std::optional<TakeLaneRow> takeLaneAt(const QPoint& pos) const;
+    int takeLanesHeight(TrackRef ref, const Track& t) const;
+    void paintTakeLanes(QPainter& p, bool header);
+    void takeLaneMenu(QMenu& menu, const TakeLaneRow& lane);
+    void trackVersionMenu(QMenu& menu, TrackRef ref);
     struct TrackLaneHit {
         int track = -1;       // audio track index
         FrameTime frame = 0;  // timeline frame under the pointer

@@ -5,7 +5,7 @@
 // 16-bit TIFF), numbered so the first frame of the cut is 1001, plus a pull
 // list (CSV) saying what came from where. An OpenEXR pull can carry more:
 // the source render's other layers and Cryptomattes, and the clip's masks as
-// mattes, in any of OpenEXR's compressions (HTJ2K and zstd too).
+// mattes, in any of OpenEXR's compressions (HTJ2K and zstd too). A deep render is pulled deep: its samples copied.
 #pragma once
 
 #include <atomic>
@@ -47,6 +47,7 @@ struct VfxShot {
     std::vector<std::string> layers;    // OpenEXR: the layers and Cryptomattes written beside the plate (its own is the main picture)
     std::string undistortMap, redistortMap;  // its ST maps, when written
     int overscanWidth = 0, overscanHeight = 0;  // the undistorted plate's size (its undistort map's)
+    bool deep = false;                  // a deep render's samples, copied as they are (deep OpenEXR)
 };
 
 // Pulls the clips (video clips of footage; titles and other generated clips

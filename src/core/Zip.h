@@ -1,6 +1,7 @@
 // Montage — reading zip archives (stored and deflated entries, Zip64 sizes),
 // and gzipped tar archives, for model downloads that come packed: the
 // inflater follows RFC 1951 and every entry is checked against its CRC-32.
+// And writing small zip archives of stored entries (an XLSX workbook's parts).
 #pragma once
 
 #include <cstddef>
@@ -48,6 +49,21 @@ public:
 private:
     std::string bytes_;
     std::vector<Entry> entries_;
+};
+
+// A zip archive of stored (uncompressed) entries, names in UTF-8, built in memory.
+class ZipWriter {
+public:
+    void add(const std::string& name, const std::string& data);
+    std::string finish();  // the archive's bytes (the writer is empty again)
+
+private:
+    struct Item {
+        std::string name;
+        uint32_t crc = 0, size = 0, offset = 0;
+    };
+    std::string out_;
+    std::vector<Item> items_;
 };
 
 }  // namespace montage

@@ -26,6 +26,7 @@
 #include "core/GradeVersions.h"
 #include "core/GradeGraph.h"
 #include "core/AudioChannels.h"
+#include "core/TakeLanes.h"
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
 #include "core/ColorGroups.h"
@@ -45,6 +46,7 @@
 #include "render/BroadcastMxf.h"
 #include "render/LightLevel.h"
 #include "render/Hdr10Plus.h"
+#include "render/AdaptiveHdr.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
 #include "audio/DialogueAlign.h"
@@ -57,6 +59,7 @@
 #include "media/Recover.h"
 #include "media/Proxy.h"
 #include "media/SpeechSearch.h"
+#include "media/TakeChoice.h"
 #include "media/TextReader.h"
 #include "media/ImageSequence.h"
 #include "media/Interpret.h"
@@ -94,6 +97,8 @@
 #include "core/ScriptCut.h"
 #include "render/LinedScript.h"
 #include "render/FilmLists.h"
+#include "render/PaperworkOutput.h"
+#include "render/ImageSubtitles.h"
 #include "core/Ambisonics.h"
 #include "media/Sofa.h"
 #include "core/Surround.h"
@@ -123,6 +128,8 @@
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
 #include "render/LutExport.h"
+#include "render/GrainMatch.h"
+#include "render/LutToGrade.h"
 #include "render/ProjectManager.h"
 #include "render/QualityCheck.h"
 #include "render/FrameRepair.h"
@@ -2781,7 +2788,9 @@ void McpServer::Impl::addTools() {
         "sequence so exports that state them before the first frame (x265, Matroska) use them; MP4 and MOV exports "
         "measure what they render anyway. Warns when MaxCLL is above the sequence's mastering peak. A PQ sequence's "
         "scenes for dynamic HDR metadata are measured in the same pass (each scene's brightest red, green and blue, average and spread, "
-        "as ST 2094-40 sends them) and kept too, for exports with `hdr10plus`.",
+        "as ST 2094-40 sends them) and kept too, for exports with `hdr10plus`. Any HDR sequence's scenes are also fitted for "
+        "adaptive HDR metadata (ST 2094-50: each scene's headroom and the gain curve to its SDR rendition, from its SDR "
+        "trim or Montage's own mapping), kept for exports with `adaptive_hdr` and shown by the HDR viewer.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"save":{"type":"boolean","default":true}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
@@ -2816,6 +2825,15 @@ void McpServer::Impl::addTools() {
                                               &err, {}, nullptr, nullptr, frame);
             }
             if (!measuredOk) return fail(QString::fromStdString(err));
+            // Adaptive HDR metadata over whole scenes too.
+            std::vector<AdaptiveHdrScene> adaptive;
+            {
+                FrameTime a0 = std::max<FrameTime>(0, from), b0 = to > a0 ? to : s.duration();
+                for (const AdaptiveHdrScene& sc : s.adaptiveHdr)
+                    if (sc.end > a0 && sc.start < b0) a0 = std::min(a0, sc.start), b0 = std::max(b0, sc.end);
+                if (!analyseAdaptiveHdr(l.project, s, a0, b0, sequenceColorSpace(s), std::clamp(s.hdrPeakNits, 100.0, 10000.0), adaptive, &err))
+                    return fail(QString::fromStdString(err));
+            }
             unsigned cll = 0, fall = 0;
             hdr10LightLevels(light, cll, fall);
             QJsonObject out{{"max_cll", int(cll)}, {"max_fall", int(fall)}, {"max_cll_at", tc(light.maxCllFrame, s)},
@@ -2835,9 +2853,16 @@ void McpServer::Impl::addTools() {
                 out["hdr10plus_scenes"] = list;
                 text += QStringLiteral("; dynamic HDR metadata: %1 scene(s)").arg(scenes.size());
             }
+            QJsonArray adaptiveList;
+            for (const AdaptiveHdrScene& sc : adaptive)
+                adaptiveList.append(QJsonObject{{"start", tc(sc.start, s)}, {"end", tc(sc.end, s)}, {"headroom", sc.md.baseline},
+                                                {"curve_points", sc.md.gains.empty() ? 0 : int(sc.md.gains[0].x.size())}});
+            out["adaptive_hdr_scenes"] = adaptiveList;
+            text += QStringLiteral("; adaptive HDR metadata: %1 scene(s)").arg(adaptive.size());
             if (a.value("save").toBool(true)) {
                 s.hdrMaxCll = cll, s.hdrMaxFall = fall;
                 if (pq) mergeHdr10PlusScenes(s.hdr10Plus, scenes);  // replacing those they overlap; others stay
+                mergeAdaptiveHdrScenes(s.adaptiveHdr, adaptive);
                 save(l);
             }
             return ok(text, out);
@@ -3171,6 +3196,246 @@ void McpServer::Impl::addTools() {
             for (const std::string& n : skipped) left << QString::fromStdString(n);
             return ok(QStringLiteral("Wrote %1 (%2-point cube)%3").arg(path).arg(lut.size)
                           .arg(left.isEmpty() ? QString() : QStringLiteral("; left out: ") + left.join(QStringLiteral(", "))));
+        });
+
+    add("montage_lut_to_grade", "Rebuild a clip's LUT as an editable grade",
+        "Turns a clip's LUT effect (a show LUT or a look from elsewhere) into Montage's own controls fitted to it: Color "
+        "Correct (CDL), RGB Mixer, Curves and Hue Curves, each kept only when it brings the fit closer, then a small "
+        "residual LUT for what they miss (written to residual; none when residual is left out). A LUT applied in another "
+        "space is rebuilt there, between Colour Space Transforms. The grade as it was is kept as a grade version. Reports "
+        "how close the controls come (mean and largest CIEDE2000) and where the LUT clips.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "effect":{"type":"number","description":"The LUT effect's id (default: the clip's first LUT)"},
+            "residual":{"type":"string","description":"A .cube file for the residual LUT"}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id clip = clipArg(l, a).id;
+            const QString residual = a.contains("residual") ? absolute(a.value("residual").toString()) : QString();
+            LutGrade fit;
+            const edit::Result r = edit::lutToGrade(l.project, s, clip, Id(a.value("effect").toDouble()), residual.toStdString(), &fit);
+            if (!r.ok) return fail(QString::fromStdString(r.error));
+            save(l);
+            QStringList stages;
+            for (const Effect& e : fit.effects) stages << QString::fromStdString(findEffectInfo(e.type) ? findEffectInfo(e.type)->displayName : e.type);
+            QString text = QStringLiteral("Rebuilt as %1: mean delta E %2, largest %3")
+                               .arg(stages.isEmpty() ? QStringLiteral("no controls") : stages.join(QStringLiteral(", ")))
+                               .arg(fit.meanDeltaE, 0, 'f', 2).arg(fit.maxDeltaE, 0, 'f', 2);
+            const Clip* after = edit::clipById(s, clip);
+            if (!residual.isEmpty() && after && std::any_of(after->effects.begin(), after->effects.end(), [&](const Effect& e) {
+                    return e.type == "lut" && e.s("path") == residual.toStdString();
+                }))
+                text += QStringLiteral("; with the residual LUT: mean %1, largest %2").arg(fit.residualMeanDeltaE, 0, 'f', 2).arg(fit.residualMaxDeltaE, 0, 'f', 2);
+            if (fit.clips) text += QStringLiteral("\nThe LUT clips: ") + QString::fromStdString(fit.clipNote);
+            return ok(text + QStringLiteral("\nThe grade with the LUT is kept as a grade version."));
+        });
+
+    add("montage_grain", "Measure a clip's grain, or put matching grain on clips",
+        "Grain matching: measure takes the grain of a clip's footage (its strength in each channel through eight stops of "
+        "light, its size and softness, how its colours go together and from frame to frame) from the flat areas of a few "
+        "runs of frames, or of a region, and returns it as a profile; apply puts a Grain Match effect on clips (apply_to), "
+        "from that profile, a measured profile given, or a film gauge (65mm, 35mm, 16mm, super8). With measure, apply_to "
+        "puts the measured grain on those clips at once. mode replace takes each clip's own grain out first.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"action":{"type":"string","enum":["measure","apply"]},
+            "clip":{"type":"number","description":"measure: the clip whose grain to measure"},
+            "region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}},
+                      "description":"In pixels of the footage (default: the whole frame)"},
+            "apply_to":{"type":"array","items":{"type":"number"},"description":"Clips to put the grain on"},
+            "profile":{"type":"string","description":"apply: a profile measure returned"},
+            "gauge":{"type":"string","enum":["65mm","35mm","16mm","super8"]},
+            "mode":{"type":"string","enum":["add","replace"],"default":"add"},
+            "amount":{"type":"number","default":100,"description":"Percent of the measured strength"}},"required":["project","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const QString action = need(a, "action");
+            GrainProfile profile;
+            int gauge = -1;
+            QString text;
+            if (action == "measure") {
+                const Clip& c = clipArg(l, a);
+                GrainRegion region;
+                const QJsonObject r = a.value("region").toObject();
+                region.x = r.value("x").toInt(), region.y = r.value("y").toInt(), region.w = r.value("w").toInt(), region.h = r.value("h").toInt();
+                std::string err;
+                const WorkingSpaceScope working(&sequenceColorSpace(s));
+                if (!measureClipGrain(l.project, s, c, region, profile, &err)) return fail(QString::fromStdString(err));
+                const int mid = GrainProfile::kBands - 3;  // (about 18 % grey)
+                auto fixed = [](double v, char f, int digits) { return QString::number(v, f, digits); };
+                text = QStringLiteral("Grain of %1: about %2 px across; strength at 18% grey %3 / %4 / %5 (linear light, red / green / blue); "
+                                      "colours alike by %6 / %7 / %8; %9 carried to the next frame.\nProfile: ")
+                           .arg(QString::fromStdString(c.name), fixed(grainSize(profile), 'f', 1), fixed(profile.amplitude[0][mid], 'g', 3),
+                                fixed(profile.amplitude[1][mid], 'g', 3), fixed(profile.amplitude[2][mid], 'g', 3),
+                                fixed(profile.correlation[0], 'f', 2), fixed(profile.correlation[1], 'f', 2), fixed(profile.correlation[2], 'f', 2),
+                                fixed(profile.temporal, 'f', 2)) +
+                       QString::fromStdString(grainProfileText(profile));
+            } else if (action == "apply") {
+                if (a.contains("profile")) {
+                    if (!parseGrainProfile(a.value("profile").toString().toStdString(), profile)) return fail(QStringLiteral("That is not a grain profile"));
+                } else {
+                    const QString g = a.value("gauge").toString(QStringLiteral("35mm"));
+                    const QStringList names{QStringLiteral("65mm"), QStringLiteral("35mm"), QStringLiteral("16mm"), QStringLiteral("super8")};
+                    gauge = int(names.indexOf(g));
+                    if (gauge < 0) return fail(QStringLiteral("Unknown gauge %1").arg(g));
+                }
+            } else {
+                return fail(QStringLiteral("action is measure or apply"));
+            }
+            const QJsonArray targets = a.value("apply_to").toArray();
+            if (action == "apply" && targets.isEmpty()) return fail(QStringLiteral("apply needs apply_to: the clips to put the grain on"));
+            const QString mode = a.value("mode").toString(QStringLiteral("add"));
+            if (mode != "add" && mode != "replace") return fail(QStringLiteral("mode is add or replace"));
+            int put = 0;
+            for (const QJsonValue& v : targets) {
+                Clip* c = edit::clipById(s, Id(v.toDouble()));
+                if (!c) return fail(QStringLiteral("No clip %1 in the active sequence").arg(qulonglong(v.toDouble())));
+                Effect e = makeEffect(l.project, "grain_match");
+                if (gauge >= 0) e.params["source"] = double(gauge + 1);
+                else e.strings["profile"] = grainProfileText(profile);
+                e.params["mode"] = mode == "replace" ? 1.0 : 0.0;
+                e.params["amount"] = a.value("amount").toDouble(100);
+                c->effects.push_back(e);
+                ++put;
+            }
+            if (put) {
+                save(l);
+                text += QStringLiteral("%1Grain Match put on %2 clip(s).").arg(text.isEmpty() ? QString() : QStringLiteral("\n")).arg(put);
+            }
+            return ok(text);
+        });
+
+    add("montage_takes", "Take lanes, comps and track versions on an audio track",
+        "Takes on lanes (Pro Tools' loop record, playlists and comping): an audio track keeps takes as lanes under it and "
+        "plays a comp of them, its own clips cut from the lanes with short equal-power crossfades at the joins. list gives "
+        "the lanes (and the track's audition takes), the comp's clips with the lane each comes from, and the versions. "
+        "record takes a loop recording from a file (from preroll seconds on, a pass for each In to Out) as lanes at In, the "
+        "last whole pass the comp. comp gives from..to of a lane to the comp; join moves the join at `at` by `move` "
+        "seconds, or sets its crossfade (`crossfade` seconds, 0 none); rate (0-5), rename and show (lanes shown or folded) "
+        "act on a lane; version makes a new version (a copy, or empty with empty true), switches to one (index, 1 = first), "
+        "renames or deletes one; suggest names the take that best says `line` (from transcripts) without clipping.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"string","default":"A1"},
+            "action":{"type":"string","enum":["list","record","comp","join","rate","rename","show","version","suggest"]},
+            "file":{"type":"string","description":"record: the loop recording"},
+            "in":{"type":["number","string"],"description":"record: where the loop starts (default the sequence In)"},
+            "out":{"type":["number","string"],"description":"record: where it ends, exclusive (default after the sequence Out)"},
+            "preroll":{"type":"number","default":0,"description":"record: seconds recorded before the first pass"},
+            "lane":{"type":["number","string"],"description":"A lane's id or name"},
+            "from":{"type":["number","string"]},"to":{"type":["number","string"]},
+            "at":{"type":["number","string"],"description":"join: the join's time"},"move":{"type":"number","description":"join: seconds"},
+            "crossfade":{"type":"number","description":"Seconds (comp, join; default 0.01)"},
+            "rating":{"type":"integer"},"name":{"type":"string"},"shown":{"type":"boolean"},
+            "version":{"type":"string","enum":["new","switch","rename","delete"]},"index":{"type":"integer"},"empty":{"type":"boolean"},
+            "line":{"type":"string","description":"suggest: the words the take should say"}},"required":["project","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const TrackRef track = trackArg(str(a, "track", "A1"), s, false);
+            if (track.kind != TrackKind::Audio) return fail(QStringLiteral("Take lanes are on audio tracks"));
+            const QString action = need(a, "action");
+            const double fps = s.fpsValue();
+            auto laneArg = [&]() -> Id {
+                const Track& t = *trackAt(s, track);
+                const QJsonValue v = a.value("lane");
+                for (const TakeLane& ln : t.lanes)
+                    if ((v.isDouble() && ln.id == Id(v.toDouble())) || (v.isString() && QString::fromStdString(ln.name).compare(v.toString(), Qt::CaseInsensitive) == 0))
+                        return ln.id;
+                throw ArgError{QStringLiteral("No such lane on that track (see action list)")};
+            };
+            auto listing = [&]() {
+                const Track& t = *trackAt(s, track);
+                QJsonArray lanes, comp, versions;
+                QString text;
+                for (const LaneView& v : laneViews(l.project, s, track)) {
+                    QJsonObject o{{"name", QString::fromStdString(v.name)}, {"start", secs(v.start, s)}, {"end", secs(v.end, s)}, {"rating", v.rating}};
+                    if (v.lane) o["lane"] = double(v.lane);
+                    else o["clip"] = double(v.clip), o["take"] = v.take + 1;
+                    lanes.append(o);
+                    text += QStringLiteral("%1%2 (%3 to %4)%5\n").arg(v.lane ? QStringLiteral("Lane ") : QStringLiteral("Audition take: "),
+                                                                    QString::fromStdString(v.name), tc(v.start, s), tc(v.end, s),
+                                                                    v.rating ? QStringLiteral(", rated %1").arg(v.rating) : QString());
+                }
+                for (const Clip& c : t.clips) {
+                    const Id from = compLaneOf(t, c);
+                    QJsonObject o{{"clip", double(c.id)}, {"start", secs(c.start, s)}, {"end", secs(c.end(), s)}};
+                    if (from) o["lane"] = double(from), o["lane_name"] = QString::fromStdString(edit::findTakeLane(t, from)->name);
+                    comp.append(o);
+                }
+                for (size_t k = 0; k < t.versions.size(); ++k)
+                    versions.append(QJsonObject{{"index", int(k) + 1}, {"name", QString::fromStdString(t.versions[k].name)}, {"shown", int(k) == t.version}});
+                text += QStringLiteral("%1 comp clip(s); %2 version(s)").arg(comp.size()).arg(std::max<qsizetype>(1, versions.size()));
+                return ok(text, {{"lanes", lanes}, {"comp", comp}, {"versions", versions}, {"lanes_shown", t.lanesShown}});
+            };
+            if (action == "list") return listing();
+            if (action == "suggest") {
+                // Over from..to, else In to Out, else the first take lane's span.
+                FrameTime from = s.inPoint >= 0 && s.outPoint > s.inPoint ? s.inPoint : -1, to = from >= 0 ? s.outPoint + 1 : -1;
+                if (from < 0)
+                    for (const LaneView& v : laneViews(l.project, s, track))
+                        if (v.lane) {
+                            from = v.start, to = v.end;
+                            break;
+                        }
+                if (a.contains("from")) from = timeArg(a.value("from"), s, "from");
+                if (a.contains("to")) to = timeArg(a.value("to"), s, "to");
+                if (from < 0 || to <= from) return fail(QStringLiteral("suggest needs from and to"));
+                const TakeChoice choice = chooseTake(l.project, s, track, from, to, a.value("line").toString().toStdString());
+                if (choice.best < 0) return fail(QStringLiteral("No takes cover that range"));
+                const TakeCandidate& b = choice.takes[size_t(choice.best)];
+                QJsonArray all;
+                for (const TakeCandidate& t : choice.takes)
+                    all.append(QJsonObject{{"name", QString::fromStdString(t.name)}, {"said", QString::fromStdString(t.said)},
+                                           {"word_errors", t.transcribed ? lineWordErrors(t.said, a.value("line").toString().toStdString()) : -1},
+                                           {"rms_db", t.rmsDb}, {"peak_db", t.peakDb}, {"clipped_seconds", t.clippedSeconds}});
+                QJsonObject sc{{"name", QString::fromStdString(b.name)}, {"takes", all}};
+                if (b.lane) sc["lane"] = double(b.lane);
+                else sc["clip"] = double(b.clip), sc["take"] = b.take + 1;
+                return ok(QString::fromStdString(choice.why), sc);
+            }
+            edit::Result r;
+            if (action == "record") {
+                const QString file = absolute(need(a, "file"));
+                const FrameTime in = a.contains("in") ? timeArg(a.value("in"), s, "in") : s.inPoint;
+                const FrameTime out = a.contains("out") ? timeArg(a.value("out"), s, "out") : s.outPoint >= 0 ? s.outPoint + 1 : -1;
+                if (in < 0 || out <= in) return fail(QStringLiteral("record needs in and out (or the sequence's In and Out)"));
+                std::vector<bool> complete;
+                std::string err;
+                const std::vector<std::string> passes = splitLoopRecording(
+                    file.toStdString(), a.value("preroll").toDouble(0), double(out - in) / fps, s.sampleRate > 0 ? s.sampleRate : 48000,
+                    (QFileInfo(l.path).absolutePath() + QStringLiteral("/Takes")).toStdString(), QFileInfo(file).completeBaseName().toStdString() + " pass ",
+                    &complete, &err);
+                if (passes.empty()) return fail(QString::fromStdString(err));
+                std::vector<Id> media;
+                for (const std::string& f : passes) media.push_back(mediaFor(l.project, QString::fromStdString(f)));
+                r = edit::addLoopTakes(l.project, s, track, media, complete, in, out);
+            } else if (action == "comp") {
+                r = edit::compTake(l.project, s, track, laneArg(), timeArg(a.value("from"), s, "from"), timeArg(a.value("to"), s, "to"),
+                                   a.value("crossfade").toDouble(kCompCrossfadeSeconds));
+            } else if (action == "join") {
+                const FrameTime at = timeArg(a.value("at"), s, "at");
+                if (a.contains("move")) r = edit::moveCompJoin(l.project, s, track, at, FrameTime(std::llround(a.value("move").toDouble() * fps)));
+                else if (a.contains("crossfade")) r = edit::setCompCrossfade(l.project, s, track, at, a.value("crossfade").toDouble());
+                else return fail(QStringLiteral("join needs move or crossfade"));
+            } else if (action == "rate") {
+                if (!a.value("rating").isDouble()) return fail(QStringLiteral("rate needs rating (0 to 5)"));
+                r = edit::rateTakeLane(s, track, laneArg(), a.value("rating").toInt());
+            } else if (action == "rename") {
+                r = edit::renameTakeLane(s, track, laneArg(), need(a, "name").toStdString());
+            } else if (action == "show") {
+                r = edit::showLanes(s, track, a.value("shown").toBool(true));
+            } else if (action == "version") {
+                const QString v = need(a, "version");
+                const int index = a.value("index").toInt(0) - 1;
+                if (v == "new") r = edit::newTrackVersion(l.project, s, track, str(a, "name").toStdString(), !a.value("empty").toBool(false));
+                else if (v == "switch") r = edit::switchTrackVersion(s, track, index);
+                else if (v == "rename") r = edit::renameTrackVersion(s, track, index, need(a, "name").toStdString());
+                else if (v == "delete") r = edit::deleteTrackVersion(s, track, index);
+                else return fail(QStringLiteral("version is new, switch, rename or delete"));
+            } else {
+                return fail(QStringLiteral("Unknown action %1").arg(action));
+            }
+            check(r);
+            save(l);
+            return listing();
         });
 
     add("montage_audition", "Audition takes on a clip",
@@ -4812,6 +5077,109 @@ void McpServer::Impl::addTools() {
                       result);
         });
 
+    add("montage_paperwork", "Delivery paperwork: cue sheet, dialogue list, as-broadcast script, CCSL",
+        "The paperwork a delivery asks for, from the cut. cue_sheet: the music heard (clips with the Music role, or whose "
+        "media is marked or tagged as music), a cue per piece played on (gaps under a second bridged), each timed in, out "
+        "and by duration, with its title, composer, publisher, society, library, catalogue number, ISRC and ISWC (the "
+        "media's own cue fields over its file's tags and the sound library's index) and its use; `suggest_vocal` tells "
+        "unmarked cues vocal or instrumental from the vocal stem. dialogue_list and as_broadcast: the transcript by "
+        "speaker a line at a time, each timed to the dialogue heard (`refine`), with a heading where the logged scene "
+        "changes and, with `on_screen_text`, the text read from each shot. ccsl: shot by shot, footage in feet and frames "
+        "(`gauge`), shot size from the largest face (CU, MS, WS; faces must have been found), description, dialogue and "
+        "the first caption track's subtitles. `path` writes it as .xlsx, .csv, .pdf or (the dialogue lists) .txt. "
+        "action set_cue sets a media item's cue fields (`fields`: title, composer, publisher, society, library, "
+        "catalogue, isrc, iswc, use background|visual, vocal vocal|instrumental, theme \"main title\"|\"end title\", "
+        "music yes|no; \"\" clears one).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "sequence":{"type":"string","description":"The sequence's name (default: the active one)"},
+            "list":{"type":"string","enum":["cue_sheet","dialogue_list","as_broadcast","ccsl"]},
+            "action":{"type":"string","enum":["list","set_cue"],"description":"Default list"},
+            "media":{"type":"string","description":"set_cue: the media's name or path"},
+            "fields":{"type":"object","description":"set_cue: field to value"},
+            "gauge":{"type":"string","enum":["35mm-4perf","35mm-3perf","35mm-2perf","16mm","65mm-5perf"]},
+            "refine":{"type":"boolean","description":"Time lines to the dialogue heard (default true)"},
+            "on_screen_text":{"type":"boolean","description":"Read on-screen text into the dialogue list (needs the OCR model)"},
+            "suggest_vocal":{"type":"boolean","description":"Tell unmarked cues vocal or instrumental (needs the stems model)"},
+            "path":{"type":"string","description":"Write it here (.xlsx, .csv, .pdf; .txt for the dialogue lists)"}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            if (str(a, "action") == QLatin1String("set_cue")) {
+                MediaItem& m = projectMedia(l.project, need(a, "media"));
+                const QJsonObject fields = a.value("fields").toObject();
+                if (fields.isEmpty()) throw ArgError{"set_cue needs \"fields\""};
+                const std::map<std::string, std::vector<std::string>> choices{
+                    {"use", {"background", "visual"}}, {"vocal", {"vocal", "instrumental"}},
+                    {"theme", {"main title", "end title"}}, {"music", {"yes", "no"}}};
+                for (auto it = fields.begin(); it != fields.end(); ++it) {
+                    if (!it.value().isString() && !it.value().isNull())
+                        throw ArgError{QStringLiteral("Cue field \"%1\" takes text (\"\" or null clears it)").arg(it.key())};
+                    const std::string key = it.key().toStdString(), value = it.value().toString().trimmed().toStdString();
+                    const bool known = std::find(std::begin(kCueFields), std::end(kCueFields), key) != std::end(kCueFields);
+                    auto choice = choices.find(key);
+                    if (!known && choice == choices.end()) throw ArgError{QStringLiteral("No cue field \"%1\"").arg(it.key())};
+                    if (choice != choices.end() && !value.empty() &&
+                        std::find(choice->second.begin(), choice->second.end(), value) == choice->second.end())
+                        throw ArgError{QStringLiteral("\"%1\" is not a %2").arg(QString::fromStdString(value), it.key())};
+                    if (value.empty())
+                        m.metadata.erase(cueMetadataKey(key));
+                    else
+                        m.metadata[cueMetadataKey(key)] = value;
+                }
+                save(l);
+                QJsonObject now;
+                for (const auto& [k, v] : m.metadata)
+                    if (k.rfind("cue.", 0) == 0) now[QString::fromStdString(k.substr(4))] = QString::fromStdString(v);
+                return ok(QStringLiteral("Cue fields of %1 set").arg(QString::fromStdString(m.name)), QJsonObject{{"fields", now}});
+            }
+            const Sequence* s = &l.seq();
+            if (a.contains("sequence")) {
+                s = nullptr;
+                for (const Sequence& sq : l.project.sequences)
+                    if (QString::fromStdString(sq.name) == str(a, "sequence")) s = &sq;
+                if (!s) throw ArgError{QStringLiteral("No sequence named \"%1\"").arg(str(a, "sequence"))};
+            }
+            PaperworkList list;
+            if (!paperworkListFromId(need(a, "list").toStdString(), list)) throw ArgError{QStringLiteral("No list \"%1\"").arg(str(a, "list"))};
+            PaperworkOptions o;
+            o.gauge = str(a, "gauge").toStdString();
+            o.refineTimes = a.value("refine").toBool(true);
+            o.onScreenText = a.value("on_screen_text").toBool();
+            o.suggestVocal = a.value("suggest_vocal").toBool();
+            XlsxSheet table;
+            std::string script, err;
+            QJsonObject result{{"list", QString::fromLatin1(paperworkListId(list))}};
+            if (a.contains("path")) {
+                const QString file = absolute(need(a, "path"));
+                if (!writePaperwork(l.project, *s, list, file.toStdString(), o, &err, &table, &script)) return fail(QString::fromStdString(err));
+                result["path"] = file;
+            } else if (!buildPaperwork(l.project, *s, list, o, table, &script, &err)) {
+                return fail(QString::fromStdString(err));
+            }
+            // The rows as objects, keyed by their column (lower case, words joined by _).
+            QJsonArray rows;
+            if (!table.rows.empty()) {
+                std::vector<QString> keys;
+                for (const XlsxCell& c : table.rows.front()) {
+                    QString k = QString::fromStdString(c.text).toLower();
+                    k.replace(QLatin1Char(' '), QLatin1Char('_'));
+                    keys.push_back(k == QLatin1String("#") ? QStringLiteral("number") : k);
+                }
+                for (size_t r = 1; r < table.rows.size(); ++r) {
+                    QJsonObject row;
+                    for (size_t c = 0; c < table.rows[r].size() && c < keys.size(); ++c) {
+                        const XlsxCell& cell = table.rows[r][c];
+                        if (cell.number) row[keys[c]] = cell.value;
+                        else if (!cell.text.empty()) row[keys[c]] = QString::fromStdString(cell.text);
+                    }
+                    rows.append(row);
+                }
+            }
+            result["rows"] = rows;
+            if (list == PaperworkList::AsBroadcast && !script.empty()) result["script"] = QString::fromStdString(script);
+            return ok(QStringLiteral("%1: %2 row(s)").arg(QString::fromLatin1(paperworkListName(list))).arg(rows.size()), result);
+        });
+
     add("montage_adr", "ADR cue list and takes",
         "The lines to re-record to picture (ADR, looping): the sequence's cue list (cue number, character, the line, a "
         "note on why, start and end, status: to_record, recorded, approved or omitted) and each cue's takes. list shows "
@@ -5658,16 +6026,39 @@ void McpServer::Impl::addTools() {
     add("montage_captions", "Import or export captions",
         "Write a caption track to a file in the format its extension names: .srt (SubRip), .vtt (WebVTT), .scc "
         "(Scenarist, CEA-608), .mcc (MCC captions: CEA-608 and CTA-708, with the track's places and colours), .ttml / .xml / .dfxp (TTML, IMSC 1.1 Text profile, with the track's colours), .stl "
-        "(EBU Tech 3264, 25 or 30 fps) or .ass / .ssa (SubStation Alpha, with the track's style); or read any of them "
-        "as a new caption track (`import`), or the closed captions inside a video clip's file (`import_embedded`: CTA-708 service 1, else CEA-608 channel 1). "
+        "(EBU Tech 3264, 25 or 30 fps) or .ass / .ssa (SubStation Alpha, with the track's style); or as pictures drawn in "
+        "the track's style (`format`): pgs (Blu-ray: .sup, or Matroska .mks/.mkv), dvb (MPEG-TS .ts, or Matroska), "
+        "vobsub (DVD: .idx with its .sub, or Matroska) or imsc_image (IMSC 1.1 Image: a .ttml document with a PNG a "
+        "caption beside it); .sup, .idx and .ts need no `format`. Or read any of them as a new caption track (`import`: "
+        "picture subtitles, and IMSC Image documents, are read by OCR, the words it is unsure of listed in `review`), "
+        "or the captions inside a video clip's file (`import_embedded`: CTA-708 service 1, else CEA-608 channel 1, else "
+        "its PGS, DVB or DVD subtitles by OCR; `stream` picks a subtitle stream). "
         "`track` is a caption track index (default: the visible one).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"export":{"type":"string","description":"A file to write"},
+            "format":{"type":"string","enum":["pgs","dvb","vobsub","imsc_image"],"description":"Export as subtitle pictures"},
+            "width":{"type":"integer","description":"The pictures' frame (default: the sequence's)"},"height":{"type":"integer"},
             "import":{"type":"string","description":"A file to read as a new track"},"track":{"type":"integer"},
-            "import_embedded":{"type":"number","description":"A video clip (id): the CEA-608 closed captions inside its file as a new track, where the clip plays them"},
+            "import_embedded":{"type":"number","description":"A video clip (id): the captions inside its file as a new track, where the clip plays them"},
+            "stream":{"type":"integer","description":"The file's subtitle stream to read (its index in the file)"},
             "language":{"type":"string","description":"ISO 639-1 code for an imported track"}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
+            // Subtitles read off their pictures: the track and what to check.
+            auto reviewed = [&](const ImageSubtitleImport& in, QJsonObject extra) {
+                QJsonArray review;
+                for (const OcrReview& r : in.review) {
+                    QJsonArray sugg;
+                    for (const std::string& w : r.suggestions) sugg.append(QString::fromStdString(w));
+                    review.append(QJsonObject{{"caption", int(r.caption)}, {"word", QString::fromStdString(r.word)}, {"suggestions", sugg},
+                                              {"confidence", double(r.confidence)}});
+                }
+                extra.insert("review", review);
+                extra.insert("codec", QString::fromStdString(in.codec));
+                extra.insert("pictures", in.pictures);
+                extra.insert("unread", in.unread);
+                return extra;
+            };
             if (a.contains("import_embedded")) {
                 const Id id = Id(a.value("import_embedded").toDouble());
                 const Clip* c = edit::clipById(s, id);
@@ -5675,7 +6066,28 @@ void McpServer::Impl::addTools() {
                 if (!m || m->kind != MediaKind::Video) return fail("import_embedded names a video clip (see montage_project_info)");
                 std::vector<Caption> found;
                 std::string err;
-                if (!readEmbeddedCaptions(m->path, s.fps, found, {}, nullptr, &err)) return fail(QString::fromStdString(err));
+                const bool pictures = a.contains("stream") || (!readEmbeddedCaptions(m->path, s.fps, found, {}, nullptr, &err) &&
+                                                               !imageSubtitleStreams(m->path).empty());
+                if (pictures) {
+                    ImageSubtitleImport in;
+                    if (!readImageSubtitles(m->path, s.fps, in, a.value("stream").toInt(-1), a.value("language").toString().toStdString(), {},
+                                            nullptr, &err))
+                        return fail(QString::fromStdString(err));
+                    CaptionTrack t = in.track;
+                    t.id = l.project.newId();
+                    t.name = "Subtitles - " + c->name;
+                    t.captions = captionsThroughClip(*c, in.track.captions);
+                    if (t.captions.empty()) return fail("None of the clip's subtitles fall within it");
+                    // (Review indices follow the clip's captions only when none were cut away.)
+                    if (t.captions.size() != in.track.captions.size()) in.review.clear();
+                    const int n = int(t.captions.size());
+                    const QString name = QString::fromStdString(t.name), language = QString::fromStdString(t.language);
+                    s.captionTracks.push_back(std::move(t));
+                    save(l);
+                    return ok(QStringLiteral("Read %1 subtitles into \"%2\"").arg(n).arg(name),
+                              reviewed(in, QJsonObject{{"track", int(s.captionTracks.size()) - 1}, {"name", name}, {"captions", n}, {"language", language}}));
+                }
+                if (found.empty()) return fail(QString::fromStdString(err));
                 CaptionTrack t;
                 t.id = l.project.newId();
                 t.name = "CC1 - " + c->name;
@@ -5695,7 +6107,25 @@ void McpServer::Impl::addTools() {
                 const QString path = need(a, "import");
                 QFile in(path);
                 if (!in.open(QIODevice::ReadOnly)) return fail(QStringLiteral("Cannot read %1").arg(path));
-                const std::string data = in.readAll().toStdString();
+                const QString suffix = QFileInfo(path).suffix().toLower();
+                ImageSubtitleFormat pictureFormat;
+                // (Containers of pictures are not read into memory.)
+                const bool container = imageSubtitleFormatFor("." + suffix.toStdString(), pictureFormat) || suffix == "mks" || suffix == "mkv";
+                const std::string data = container ? std::string() : in.readAll().toStdString();
+                if (container || isImscImage(data)) {
+                    ImageSubtitleImport got;
+                    std::string err;
+                    if (!readImageSubtitles(path.toStdString(), s.fps, got, a.value("stream").toInt(-1), a.value("language").toString().toStdString(),
+                                            {}, nullptr, &err))
+                        return fail(QString::fromStdString(err));
+                    got.track.id = l.project.newId();
+                    const int n = int(got.track.captions.size());
+                    const QString name = QString::fromStdString(got.track.name), language = QString::fromStdString(got.track.language);
+                    s.captionTracks.push_back(got.track);
+                    save(l);
+                    return ok(QStringLiteral("Read %1 subtitles into \"%2\"").arg(n).arg(name),
+                              reviewed(got, QJsonObject{{"track", int(s.captionTracks.size()) - 1}, {"name", name}, {"captions", n}, {"language", language}}));
+                }
                 std::vector<Caption> caps;
                 std::string err;
                 if (!parseSubtitles(data, s.fps, caps, &err)) return fail(QString::fromStdString(err));
@@ -5725,7 +6155,22 @@ void McpServer::Impl::addTools() {
                 if (!t && !s.captionTracks.empty()) t = &s.captionTracks.front();
             }
             if (!t) return fail("The sequence has no captions");
-            const std::string ext = "." + QFileInfo(path).suffix().toStdString();
+            const std::string ext = "." + QFileInfo(path).suffix().toLower().toStdString();
+            ImageSubtitleFormat pictureFormat = ImageSubtitleFormat::Pgs;
+            const bool pictures = a.contains("format") ? true : imageSubtitleFormatFor(ext, pictureFormat) || ext == ".mks";
+            if (a.contains("format") && !imageSubtitleFormatFromId(a.value("format").toString().toStdString(), pictureFormat))
+                throw ArgError{"\"format\" is pgs, dvb, vobsub or imsc_image"};
+            if (pictures) {
+                std::string err;
+                ImageSubtitleResult r;
+                if (!writeImageSubtitles(*t, s, path.toStdString(), pictureFormat, &err, a.value("width").toInt(0), a.value("height").toInt(0), &r))
+                    return fail(QString::fromStdString(err));
+                QJsonArray files;
+                for (const std::string& f : r.files) files.append(QString::fromStdString(f));
+                return ok(QStringLiteral("Wrote %1 subtitles as %2 to %3").arg(r.subtitles).arg(imageSubtitleFormatId(pictureFormat)).arg(path),
+                          QJsonObject{{"path", path}, {"format", imageSubtitleFormatId(pictureFormat)}, {"captions", r.subtitles},
+                                      {"colours", r.colours}, {"files", files}});
+            }
             if (!captionFormatKnown(ext))
                 throw ArgError{QStringLiteral("Unknown caption format \"%1\": use .srt, .vtt, .scc, .mcc, .ttml, .stl or .ass")
                                    .arg(QString::fromStdString(ext))};
@@ -8706,7 +9151,8 @@ void McpServer::Impl::addTools() {
                 "roles":{"type":"array","items":{"type":"string"},"description":"The roles heard (default: the mix as it plays)"}},"required":["language"]}},
             "captions":{"type":"boolean","default":true,"description":"Caption tracks as IMSC 1.1 timed text"},
             "texts":{"type":"array","description":"Which caption tracks, and as what (default: all as subtitles)","items":{"type":"object","properties":{
-                "track":{"type":"string","description":"The caption track's name"},"kind":{"type":"string","enum":["subtitles","captions","forced"],"default":"subtitles"}},"required":["track"]}},
+                "track":{"type":"string","description":"The caption track's name"},"kind":{"type":"string","enum":["subtitles","captions","forced"],"default":"subtitles"},
+                "image":{"type":"boolean","default":false,"description":"As pictures in the track's style (IMSC 1.1 Image profile), not text"}},"required":["track"]}},
             "supplement_of":{"type":"string","description":"An earlier IMF package's folder: make a supplemental package of it (beside it: `folder` must be the folder holding it)"},
             "original_sequence":{"type":"string","description":"Supplemental: the sequence the earlier package was mastered from (default: the picture has not changed)"}},
             "required":["project","folder"]})json",
@@ -8744,6 +9190,7 @@ void McpServer::Impl::addTools() {
                     if (QString::fromStdString(c.name) == name) t.track = c.id;
                 if (!t.track) throw ArgError{QStringLiteral("No caption track named \"%1\"").arg(name)};
                 t.kind = str(o, "kind", "subtitles").toStdString();
+                t.image = o.value("image").toBool();
                 st.texts.push_back(t);
             }
             if (a.contains("supplement_of")) st.supplementOf = absolute(need(a, "supplement_of")).toStdString();
@@ -8862,8 +9309,10 @@ void McpServer::Impl::addTools() {
             "stems":{"type":"string","enum":["none","tracks","buses","roles"],"default":"none",
                 "description":"Also write 24-bit WAV stems beside the output, one per audio track, per bus (plus Main) or per audio role"},
             "captions":{"type":"string","enum":["none","burn","embed","both"],"default":"none","description":"The visible caption track, burned into the picture and/or embedded as a subtitle stream"},
+            "caption_images":{"type":"string","enum":["pgs","dvb","dvd"],"description":"Embedded captions as pictures in the track's style: PGS or DVD in Matroska, DVB in Matroska or MPEG-TS (MPEG-TS takes DVB anyway)"},
             "trim_target":{"type":"string","description":"A trim pass (montage_trim): deliver that target of the sequence (its space and peak, each shot's trim) instead of the master"},
             "hdr10plus":{"type":"boolean","default":false,"description":"PQ exports: dynamic HDR metadata (SMPTE ST 2094-40), scene by scene, in HEVC and AV1 video and as name.hdr10plus.json beside the file (measured first unless montage_measure_hdr's analysis still matches the cut)"},
+            "adaptive_hdr":{"type":"boolean","default":false,"description":"PQ and HLG exports: adaptive HDR metadata (SMPTE ST 2094-50) in HEVC and AV1 video, scene by scene: the reference white, the scene's headroom and the gain curve to its SDR rendition (the sequence's SDR trim, else Montage's own mapping), so any display tones it down as the grade did (fitted first unless montage_measure_hdr's analysis still matches)"},
             "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask): CEA-608 and CTA-708 service 1"},
             "cea708":{"type":"boolean","default":true,"description":"With cea608: the CTA-708 service beside the 608 bytes"},
             "all_captions":{"type":"boolean","default":false,"description":"With embed: every caption track as its own subtitle stream, language tagged"},
@@ -9014,10 +9463,16 @@ void McpServer::Impl::addTools() {
             st.cea608 = a.value("cea608").toBool();
             st.cea708 = a.value("cea708").toBool(true);
             st.hdr10Plus = a.value("hdr10plus").toBool();
+            st.adaptiveHdr = a.value("adaptive_hdr").toBool();
             st.trimTarget = str(a, "trim_target").toStdString();
             if (!st.trimTarget.empty() && !findTrimTarget(s, st.trimTarget))
                 throw ArgError{QStringLiteral("The sequence has no trim target \"%1\" (montage_trim lists them)").arg(str(a, "trim_target"))};
             st.embedCaptions = cap == "embed" || cap == "both";
+            if (a.contains("caption_images")) {
+                st.captionImages = a.value("caption_images").toString().toStdString();
+                if (st.captionImages != "pgs" && st.captionImages != "dvb" && st.captionImages != "dvd")
+                    throw ArgError{"\"caption_images\" must be pgs, dvb or dvd"};
+            }
             if (st.embedCaptions && a.value("all_captions").toBool())
                 for (const CaptionTrack& t : s.captionTracks)
                     if (t.name != kDescriptionTrackName) st.extraCaptions.push_back(t.id);  // descriptions are spoken, not subtitles
@@ -9087,6 +9542,12 @@ void McpServer::Impl::addTools() {
                 text += carriage == "video" ? QStringLiteral("\nDynamic HDR metadata (ST 2094-40) in the video, and beside it as .hdr10plus.json")
                         : carriage == "json" ? QStringLiteral("\nDynamic HDR metadata (ST 2094-40) beside it as .hdr10plus.json (this codec cannot carry it)")
                                              : QStringLiteral("\nNo dynamic HDR metadata: it is for PQ (HDR10) video");
+            }
+            if (st.adaptiveHdr) {
+                const bool carried = adaptiveHdrCarried(s, st);
+                o["adaptive_hdr"] = carried ? QStringLiteral("video") : QStringLiteral("none");
+                text += carried ? QStringLiteral("\nAdaptive HDR metadata (ST 2094-50) in the video")
+                                : QStringLiteral("\nNo adaptive HDR metadata: it is for PQ and HLG video in HEVC or AV1");
             }
             if (!st.credentialCertificate.empty()) {
                 // What the credentials say it was made with (core/Provenance.h).

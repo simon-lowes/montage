@@ -37,6 +37,8 @@
 #include "audio/DialogueAlign.h"
 #include "Voiceover.h"
 #include "core/History.h"
+#include "core/TakeLanes.h"
+#include "media/TakeChoice.h"
 
 namespace montage {
 
@@ -136,6 +138,11 @@ AdrPanel::AdrPanel(EditorState* state, PlaybackController* program, ViewerWidget
     cueRow->addSpacing(12);
     cueRow->addWidget(new QLabel(tr("Take:"), this));
     cueRow->addWidget(takes_, 1);
+    best_ = new QPushButton(tr("Best Take"), this);
+    best_->setObjectName(QStringLiteral("adrBestTake"));
+    best_->setToolTip(tr("Choose the take that says the line most nearly word for word (from the takes' transcripts), "
+                         "and does not clip or fall too quiet"));
+    cueRow->addWidget(best_);
     convert_ = new QPushButton(tr("Convert Voice…"), this);
     convert_->setObjectName(QStringLiteral("adrConvertVoice"));
     convert_->setToolTip(tr("Say the chosen take again in the guide's voice (with the speaker's consent), as a new take"));
@@ -147,6 +154,7 @@ AdrPanel::AdrPanel(EditorState* state, PlaybackController* program, ViewerWidget
     root->addLayout(cueRow);
     connect(status_, &QComboBox::activated, this, [this](int k) { setCueStatus(k); });
     connect(takes_, &QComboBox::activated, this, [this](int k) { pickTake(k); });
+    connect(best_, &QPushButton::clicked, this, &AdrPanel::pickBestTake);
 
     // How a cycle goes.
     QSettings saved = appSettings();
@@ -387,6 +395,7 @@ void AdrPanel::refreshTakes() {
         takes_->setCurrentIndex(c->take);
     }
     takes_->setEnabled(c && c->takes.size() > 1 && !cycle_);
+    best_->setEnabled(c && c->takes.size() > 1 && !cycle_);
     takes_->blockSignals(false);
     status_->blockSignals(true);
     status_->setCurrentIndex(q ? q->status : 0);
@@ -786,6 +795,23 @@ void AdrPanel::pickTake(int index) {
     const Id clip = q->clip;
     state_->apply(tr("Pick Take"), [&](Project& p, Sequence& sq) { return edit::pickTake(p, sq, clip, index); });
     refresh();
+}
+
+void AdrPanel::pickBestTake() {
+    const Sequence* s = state_->sequence();
+    const AdrCue* q = s ? findAdrCue(*s, currentCue()) : nullptr;
+    if (!q || !q->clip || cycle_) return;
+    const auto at = edit::locate(*s, q->clip);
+    if (!at) return;
+    TakeChoice choice = chooseTake(state_->project(), *s, {TrackKind::Audio, at->track.index}, q->start, q->end, q->line);
+    // (The cue's own takes only.)
+    std::erase_if(choice.takes, [&](const TakeCandidate& t) { return t.clip != q->clip; });
+    std::string why;
+    const int best = suggestTake(choice.takes, q->line, &why);
+    if (best < 0) return;
+    const int take = choice.takes[size_t(best)].take;
+    state_->message(qs(why), 6000);
+    if (take >= 0) pickTake(take);
 }
 
 void AdrPanel::paintOverlay(QPainter& p, const QRectF& r) {

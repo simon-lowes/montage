@@ -303,20 +303,27 @@ private:
     std::vector<uint8_t> buf_;
 };
 
-// SMPTE ST 2067-2 timed text: one IMSC 1.1 Text document (the whole composition's, times from its start) clip-wrapped
-// as ST 429-5 has it, in the AS-02 layout, its descriptor naming the IMSC 1.1 Text profile and the RFC 5646 language.
+// SMPTE ST 2067-2 timed text: one IMSC 1.1 document (the whole composition's, times from its start) clip-wrapped as
+// ST 429-5 has it, in the AS-02 layout, its descriptor naming the IMSC 1.1 Text or Image profile and the RFC 5646
+// language; an Image document's PNGs follow in generic stream partitions, each named by its resource id.
 class ImfTimedTextWriter : public TrackFileWriter {
 public:
     bool open(const std::string& path, const Uuid& asset, EditRate rate, std::string* error = nullptr) {
         return openImfFile(path, asset, rate, error);
     }
-    // The document, `duration` edit units long.
-    bool write(const std::string& xml, int64_t duration, const std::string& language, std::string* error = nullptr);
+    // The document, `duration` edit units long, and the images it refers to as "urn:uuid:<id>".
+    bool write(const std::string& xml, int64_t duration, const std::string& language, std::string* error = nullptr,
+               const std::vector<TimedTextResource>& resources = {});
     int64_t duration() const override { return duration_; }
     EditRate rate() const { return rate_; }
     const Uuid& resourceId() const { return resourceId_; }
     const std::string& language() const { return language_; }
+    const char* profile() const { return image_ ? kImageProfile : kProfile; }
+    // The resources written: each one's id and type, and its sub-descriptor's instance id.
+    const std::vector<std::pair<Uuid, std::string>>& resources() const { return resources_; }
+    const std::vector<Uuid>& resourceSets() const { return resourceSets_; }
     static constexpr const char* kProfile = "http://www.w3.org/ns/ttml/profile/imsc1.1/text";
+    static constexpr const char* kImageProfile = "http://www.w3.org/ns/ttml/profile/imsc1.1/image";
 
 protected:
     std::vector<uint8_t> headerMetadata(int64_t duration) const override;
@@ -327,6 +334,9 @@ private:
     Uuid resourceId_{};
     std::string language_ = "en";
     int64_t duration_ = 0;
+    bool image_ = false;
+    std::vector<std::pair<Uuid, std::string>> resources_;  // id and type, in stream order
+    std::vector<Uuid> resourceSets_;
 };
 
 // Reads an IMF (AS-02) track file back: what it carries, its track file id (the file package's), each picture
@@ -353,9 +363,18 @@ public:
     // `count` sample frames from `first`, interleaved, as 24-bit integers (past the end: false).
     bool pcm(int64_t first, int64_t count, std::vector<int32_t>& out, std::string* error = nullptr) const;
     bool text(std::string& out, std::string* error = nullptr) const;
+    // Timed text: the resources the descriptor lists (an Image document's PNGs), each found in its generic stream or not.
+    struct Resource {
+        Uuid id{};
+        uint64_t at = 0, size = 0;
+        bool present = false;
+    };
+    const std::vector<Resource>& resources() const { return resources_; }
+    bool resource(const Uuid& id, std::vector<uint8_t>& out, std::string* error = nullptr) const;
 
 private:
     std::string path_;
+    std::vector<Resource> resources_;
     Kind kind_ = Kind::Unknown;
     Uuid asset_{};
     int channels_ = 0, width_ = 0, height_ = 0;

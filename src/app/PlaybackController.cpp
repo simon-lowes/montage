@@ -11,6 +11,7 @@
 #include <QAudioDevice>
 #include <QAudioFormat>
 #include <QAudioSink>
+#include <QAudioSource>
 #include <QIODevice>
 #include <QMediaDevices>
 #include <QMutex>
@@ -23,6 +24,7 @@
 #include <mutex>
 
 #include "core/Surround.h"
+#include "render/AdaptiveHdr.h"
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/HdrView.h"
@@ -54,6 +56,7 @@ public:
         bool gpu = false;  // drawn on the GPU where it can be (render/GpuCompositor.h)
         std::shared_ptr<const Lut3D> hdrCalibration;  // the HDR viewer's display's calibration (render/MonitorCalibration.h)
         double hdrWhite = 203;                         // the nits that display shows SDR white at
+        double hdrHeadroom = 1;                        // and its headroom (its peak over SDR white), for adaptive HDR metadata
     };
     void request(const Request& r) {
         {
@@ -142,7 +145,8 @@ private:
     bool sameContext(const Request& r) const {
         return r.project == ctx_.project && r.sequence == ctx_.sequence && r.scale == ctx_.scale && r.proxies == ctx_.proxies &&
                r.captions == ctx_.captions && r.stereoView == ctx_.stereoView && r.hdr == ctx_.hdr &&
-               r.trim == ctx_.trim && r.gpu == ctx_.gpu && r.hdrCalibration == ctx_.hdrCalibration && r.hdrWhite == ctx_.hdrWhite;
+               r.trim == ctx_.trim && r.gpu == ctx_.gpu && r.hdrCalibration == ctx_.hdrCalibration && r.hdrWhite == ctx_.hdrWhite &&
+               r.hdrHeadroom == ctx_.hdrHeadroom;
     }
 
     Rendered render(const Request& r, FrameTime t) {
@@ -194,6 +198,13 @@ private:
                 pic->height = img.height;
                 pic->contentPeak = hdrContentPeak(trimTargetSpace(*s, r.trim), trimTargetPeak(*s, r.trim));
                 hdrViewImage(img, trimTargetSpace(*s, r.trim), trimTargetPeak(*s, r.trim), pic->contentPeak, pic->rgba);  // (rolled off as drawn)
+                // The master's adaptive HDR metadata (render/AdaptiveHdr.h), while it matches the cut: tone mapped by its
+                // own curves to the display's headroom here, so the viewer has nothing left to roll off.
+                if (const AdaptiveHdr* md = r.trim.empty() ? storedAdaptiveHdrAt(r.project, *s, t) : nullptr;
+                    md && r.hdrHeadroom < pic->contentPeak) {
+                    adaptiveViewImage(pic->rgba, *md, r.hdrHeadroom);
+                    pic->contentPeak = std::max(1.0, r.hdrHeadroom);
+                }
                 if (r.hdrCalibration) calibrateHdrPicture(pic->rgba, pic->width, pic->height, *r.hdrCalibration, r.hdrWhite);
                 out.hdr = std::move(pic);
             }
@@ -300,7 +311,7 @@ public:
         mixer_.setOfflineProxies(true);  // (an offline file's proxy is heard while editing)
     }
 
-    void configure(std::shared_ptr<const Project> p, Id seq, int64_t startSample, bool int16) {
+    void configure(std::shared_ptr<const Project> p, Id seq, int64_t startSample, bool int16, int channels = 2, bool idle = false) {
         auto speech = speechIn(p, seq);  // (worked out before the audio thread is held up)
         QMutexLocker lock(&m_);
         const Sequence* s = p ? p->findSequence(seq) : nullptr;
@@ -308,7 +319,13 @@ public:
         seq_ = seq;
         sample_ = startSample;
         int16_ = int16;
+        channels_ = std::max(1, channels);
+        idle_ = idle;
         mixer_.reset();
+        if (monitor_) {
+            monitor_->prepare(project_, seq_);
+            monitor_->reset();
+        }
         // Loudness keeps integrating across plays of the same sequence until reset.
         QMutexLocker meterLock(&meterM_);
         const int rate = s ? s->sampleRate : 48000;
@@ -334,6 +351,7 @@ public:
         auto speech = speechIn(p, seq);  // (outside the locks the audio thread takes)
         QMutexLocker lock(&m_);
         project_ = std::move(p);
+        if (monitor_) monitor_->prepare(project_, seq_);
         QMutexLocker meterLock(&meterM_);
         speech_ = std::move(speech);
     }
@@ -343,7 +361,44 @@ public:
     void setAmbisonicBinaural(bool on) {
         QMutexLocker lock(&m_);
         mixer_.setAmbisonicBinaural(on);
+        binaural_ = on;
+        if (monitor_) monitor_->setAmbisonicBinaural(on);
     }
+    // The monitoring section (off: the stereo mix as before).
+    void setMonitoring(const MonitorSettings& m, int rate) {
+        QMutexLocker lock(&m_);
+        if (!m.on) {
+            monitor_.reset();
+            return;
+        }
+        if (!monitor_) {
+            monitor_ = std::make_unique<Monitor>();
+            monitor_->setNonBlocking(true);
+            monitor_->setOfflineProxies(true);
+            monitor_->setAmbisonicBinaural(binaural_);
+        }
+        monitor_->setSettings(m, rate);
+        monitor_->prepare(project_, seq_);
+    }
+    void setCalibration(int speaker, const MonitorSettings& s, int rate) {
+        {
+            QMutexLocker lock(&m_);
+            if (!monitor_ || monitor_->section().calibration() == speaker) return;
+        }
+        auto noise = calibrationNoiseFor(s, rate, speaker);  // (made while the audio thread plays on)
+        QMutexLocker lock(&m_);
+        if (monitor_) monitor_->section().setCalibration(speaker, std::move(noise));
+    }
+    void setTalkback(bool on) {
+        QMutexLocker lock(&m_);
+        if (monitor_) monitor_->section().setTalkback(on);
+    }
+    void feedTalkback(const float* mono, int frames) {
+        QMutexLocker lock(&m_);
+        if (monitor_) monitor_->section().feedTalkback(mono, frames);
+    }
+    // Stopped, with the sink kept running for calibration or talkback: no programme.
+    void setIdle(bool on) { idle_ = on; }
     // An ADR cycle's beeps, in what is heard (never in the meters).
     void setCycle(const std::optional<AdrCycle>& c) {
         QMutexLocker lock(&m_);
@@ -360,7 +415,8 @@ signals:
 
 protected:
     qint64 readData(char* data, qint64 maxlen) override {
-        const int bytesPerFrame = int16_ ? 4 : 8;
+        const int channels = channels_;
+        const int bytesPerFrame = (int16_ ? 2 : 4) * channels;
         int frames = int(maxlen / bytesPerFrame);
         if (frames <= 0) return 0;
         buf_.resize(size_t(frames) * 2);
@@ -369,36 +425,65 @@ protected:
         int64_t first = 0;
         double fps = 30;
         int rate = 48000;
+        int monitored = 0;  // the monitoring section's channels, when it is on
+        const bool idle = idle_;
         {
             QMutexLocker lock(&m_);
             const Sequence* s = project_ ? project_->findSequence(seq_) : nullptr;
-            if (s) mixer_.mix(*project_, *s, sample_, frames, buf_.data(), &tl);
-            else std::fill(buf_.begin(), buf_.end(), 0.0f);
-            if (s && cycle_) {
+            if (monitor_) {
+                monitored = monitor_->outputs();
+                mon_.resize(size_t(frames) * size_t(monitored));
+                monitor_->render(sample_, frames, mon_.data(), buf_.data(), &tl, s && cycle_ && !idle ? &*cycle_ : nullptr, s && !idle);
+            } else if (s && !idle) {
+                mixer_.mix(*project_, *s, sample_, frames, buf_.data(), &tl);
+            } else {
+                std::fill(buf_.begin(), buf_.end(), 0.0f);
+            }
+            if (s && cycle_ && !monitored) {
                 cycle = cycle_;
                 fps = s->fpsValue();
                 rate = s->sampleRate;
             }
             first = sample_;
-            sample_ += frames;
+            if (!idle) sample_ += frames;
         }
+        if (monitored) {
+            // Through the monitoring section: its channels onto the device's (Global Mute silences them all).
+            if (int16_) {
+                auto* d = reinterpret_cast<int16_t*>(data);
+                for (int i = 0; i < frames; ++i)
+                    for (int c = 0; c < channels; ++c) {
+                        const float v = muted_ || c >= monitored ? 0.0f : mon_[size_t(i) * size_t(monitored) + size_t(c)];
+                        d[size_t(i) * size_t(channels) + size_t(c)] = int16_t(std::lround(std::clamp(v, -1.0f, 1.0f) * 32767.0f));
+                    }
+            } else {
+                auto* d = reinterpret_cast<float*>(data);
+                for (int i = 0; i < frames; ++i)
+                    for (int c = 0; c < channels; ++c)
+                        d[size_t(i) * size_t(channels) + size_t(c)] = muted_ || c >= monitored ? 0.0f : mon_[size_t(i) * size_t(monitored) + size_t(c)];
+            }
+        } else if (idle) {
+            std::memset(data, 0, size_t(frames) * size_t(bytesPerFrame));
+        } else {
+            std::vector<float> heard;  // what the speakers get, when it is not buf_ (which the meters still read)
+            if (muted_) heard.assign(buf_.size(), 0.0f);  // (Global Mute silences the beeps too)
+            else if (cycle) {
+                heard = buf_;
+                addAdrBeeps(*cycle, fps, rate, first, heard.data(), frames, 2);
+            }
+            const std::vector<float>& out = heard.empty() ? buf_ : heard;
+            if (int16_) {
+                auto* d = reinterpret_cast<int16_t*>(data);
+                for (size_t i = 0; i < out.size(); ++i) d[i] = int16_t(std::lround(std::clamp(out[i], -1.0f, 1.0f) * 32767.0f));
+            } else {
+                std::memcpy(data, out.data(), size_t(frames) * 8);
+            }
+        }
+        if (idle) return qint64(frames) * bytesPerFrame;  // (the meters rest)
         float pl = 0, pr = 0;
         for (int i = 0; i < frames; ++i) {
             pl = std::max(pl, std::fabs(buf_[size_t(i) * 2]));
             pr = std::max(pr, std::fabs(buf_[size_t(i) * 2 + 1]));
-        }
-        std::vector<float> heard;  // what the speakers get, when it is not buf_ (which the meters still read)
-        if (muted_) heard.assign(buf_.size(), 0.0f);  // (Global Mute silences the beeps too)
-        else if (cycle) {
-            heard = buf_;
-            addAdrBeeps(*cycle, fps, rate, first, heard.data(), frames, 2);
-        }
-        const std::vector<float>& out = heard.empty() ? buf_ : heard;
-        if (int16_) {
-            auto* d = reinterpret_cast<int16_t*>(data);
-            for (size_t i = 0; i < out.size(); ++i) d[i] = int16_t(std::lround(std::clamp(out[i], -1.0f, 1.0f) * 32767.0f));
-        } else {
-            std::memcpy(data, out.data(), size_t(frames) * 8);
         }
         QVector<float> tracks;
         tracks.reserve(int(tl.size()) * 2);
@@ -448,10 +533,14 @@ private:
     Id seq_ = 0;
     int64_t sample_ = 0;
     bool int16_ = false;
+    std::atomic<int> channels_{2};
+    std::atomic<bool> idle_{false};
     std::atomic<bool> muted_{false};
     std::optional<AdrCycle> cycle_;
     AudioMixer mixer_;
-    std::vector<float> buf_;
+    std::unique_ptr<Monitor> monitor_;  // the monitoring section, while it is on
+    bool binaural_ = false;
+    std::vector<float> buf_, mon_;
     QMutex meterM_;
     std::unique_ptr<LoudnessMeter> meter_;
     std::unique_ptr<StereoAnalyser> stereo_;  // (afresh each play)
@@ -522,7 +611,8 @@ PlaybackController::PlaybackController(QObject* parent) : QObject(parent) {
 
 PlaybackController::~PlaybackController() {
     worker_->setSinks({});
-    stopAudio();
+    stopAudio(true);
+    if (talkSource_) talkSource_->stop();
     renderThread_->quit();
     renderThread_->wait();
 }
@@ -644,6 +734,7 @@ void PlaybackController::setAmbisonicBinaural(bool on) {
     ambisonicBinaural_ = on;
     device_->setAmbisonicBinaural(on);
     scrubMixer_.setAmbisonicBinaural(on);  // scrubbing sounds as playback does
+    testMonitor_.reset();
 }
 
 void PlaybackController::setShowCaptions(bool on) {
@@ -661,6 +752,12 @@ void PlaybackController::setHdrCalibration(std::shared_ptr<const Lut3D> lut, dou
     if (hdrCalibration_ == lut && hdrWhite_ == sdrWhiteNits) return;
     hdrCalibration_ = std::move(lut);
     hdrWhite_ = sdrWhiteNits;
+    if (hdrOutput_) requestFrame();
+}
+
+void PlaybackController::setHdrHeadroom(double headroom) {
+    if (hdrHeadroom_ == headroom) return;
+    hdrHeadroom_ = headroom;
     if (hdrOutput_) requestFrame();
 }
 
@@ -693,7 +790,7 @@ FrameTime PlaybackController::clampToSequence(FrameTime t) const { return std::m
 void PlaybackController::requestFrame() {
     if (!sequence()) return;
     // Paused frames render at full quality; playback uses the preview scale (a reference output its own).
-    worker_->request({project_, sequenceId_, position_, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_});
+    worker_->request({project_, sequenceId_, position_, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_, hdrHeadroom_});
 }
 
 void PlaybackController::seek(FrameTime t) {
@@ -730,7 +827,7 @@ std::vector<float> PlaybackController::heard(int64_t start, int frames) {
 
 void PlaybackController::scrubAudio(FrameTime t) {
     const Sequence* s = sequence();
-    if (!scrubbing_ || !s || s->audioTracks.empty() || globalMute_) return;
+    if (!scrubbing_ || !s || s->audioTracks.empty() || globalMute_ || (monitoring_.on && monitoring_.mute)) return;
     if (!scrubSink_) {
         QAudioDevice dev = QMediaDevices::defaultAudioOutput();
         if (dev.isNull()) {
@@ -762,10 +859,12 @@ void PlaybackController::scrubAudio(FrameTime t) {
     scrubMixer_.mix(*heard_, *heard_->findSequence(sequenceId_), start, frames, mix.data());  // its tracks as heard
     std::vector<int16_t> pcm(mix.size());
     const int fade = std::min(frames / 4, 240);
+    // (The monitoring section's level and Dim, though not its speakers: scrubbing is heard in stereo.)
+    const float level = monitoring_.on ? float(std::pow(10.0, (monitoring_.levelDb + (monitoring_.dim ? monitoring_.dimDb : 0.0)) / 20)) : 1.0f;
     for (int i = 0; i < frames; ++i) {
-        float g = 1.0f;
-        if (i < fade) g = float(i) / fade;
-        if (i >= frames - fade) g = float(frames - 1 - i) / fade;
+        float g = level;
+        if (i < fade) g *= float(i) / fade;
+        if (i >= frames - fade) g *= float(frames - 1 - i) / fade;
         for (int c = 0; c < 2; ++c)
             pcm[size_t(i) * 2 + size_t(c)] = int16_t(std::lround(std::clamp(mix[size_t(i) * 2 + size_t(c)] * g, -1.0f, 1.0f) * 32767));
     }
@@ -880,38 +979,66 @@ void PlaybackController::tick() {
     }
     if (t != position_) {
         position_ = t;
-        worker_->request({project_, sequenceId_, t, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_});
+        worker_->request({project_, sequenceId_, t, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_, hdrHeadroom_});
         syncOutput();
         emit positionChanged(t);
     }
 }
 
-void PlaybackController::startAudio(FrameTime from) {
-    stopAudio();
+void PlaybackController::startAudio(FrameTime from, bool idle) {
+    if (sink_) {
+        sink_->stop();
+        sink_->deleteLater();
+        sink_ = nullptr;
+    }
     const Sequence* s = sequence();
     if (!s) return;
     QAudioDevice dev = QMediaDevices::defaultAudioOutput();
+    if (monitoring_.on && !audioOutput_.isEmpty())  // (the section's device; without it, the system's as before)
+        for (const QAudioDevice& d : QMediaDevices::audioOutputs())
+            if (d.description() == audioOutput_) dev = d;
     if (dev.isNull()) return;
+    // The channels the monitoring section needs, or two when the device cannot take them.
+    const int wanted = monitoring_.on ? monitorOutputs(monitoring_) : 2;
     QAudioFormat fmt;
     fmt.setSampleRate(s->sampleRate);
-    fmt.setChannelCount(2);
+    fmt.setChannelCount(wanted);
     fmt.setSampleFormat(QAudioFormat::Float);
     bool int16 = false;
-    if (!dev.isFormatSupported(fmt)) {
+    auto supported = [&] {
+        fmt.setSampleFormat(QAudioFormat::Float);
+        int16 = false;
+        if (dev.isFormatSupported(fmt)) return true;
         fmt.setSampleFormat(QAudioFormat::Int16);
         int16 = true;
-        if (!dev.isFormatSupported(fmt)) return;
+        return dev.isFormatSupported(fmt);
+    };
+    if (!supported()) {
+        if (wanted == 2) return;
+        fmt.setChannelCount(2);
+        if (!supported()) return;
+        qWarning("The audio output takes %d channels, not the %d the monitoring section needs: only the first two are heard", 2,
+                 wanted);
     }
+    outputChannels_ = fmt.channelCount();
+    device_->setMonitoring(monitoring_, s->sampleRate);
     int64_t startSample = int64_t(std::llround(double(from) * s->sampleRate / s->fpsValue()));
-    device_->configure(heard_, sequenceId_, startSample, int16);
+    device_->configure(heard_, sequenceId_, startSample, int16, outputChannels_, idle);
+    device_->setCalibration(calibration_, monitoring_, s->sampleRate);
+    device_->setTalkback(talkback_);
     if (!device_->isOpen()) device_->open(QIODevice::ReadOnly);
     sink_ = new QAudioSink(dev, fmt, this);
     sink_->setBufferSize(fmt.bytesForDuration(80000));  // ~80 ms
     sink_->start(device_);
 }
 
-void PlaybackController::stopAudio() {
+void PlaybackController::stopAudio(bool force) {
     if (!sink_) return;
+    // Calibration noise and talkback go on while stopped.
+    if (!force && monitorKeepsAudio()) {
+        device_->setIdle(true);
+        return;
+    }
     sink_->stop();
     sink_->deleteLater();
     sink_ = nullptr;
@@ -927,6 +1054,130 @@ RenderOptions PlaybackController::renderOptions() const {
     o.trimTarget = trimTarget_;
     o.displaySpace = "rec709";
     return o;
+}
+
+void PlaybackController::setMonitoring(const MonitorSettings& settings) {
+    MonitorSettings m = settings;
+    if (m.soloMode == MonitorSolo::Project) m.soloTracks.clear();  // (the mixer's solos are the project's again)
+    if (m == monitoring_) return;
+    const bool reopen = m.on != monitoring_.on || (m.on && monitorOutputs(m) != monitorOutputs(monitoring_));
+    // Calibration stops when the speakers change (the same number may be another speaker now).
+    if (!m.on || m.speakers != monitoring_.speakers) calibration_ = -1;
+    if (!m.on) talkback_ = false;
+    monitoring_ = m;
+    const Sequence* s = sequence();
+    const int rate = s ? s->sampleRate : 48000;
+    device_->setMonitoring(m, rate);
+    device_->setCalibration(calibration_, m, rate);
+    device_->setTalkback(talkback_);
+    testMonitor_.reset();
+    refreshAudio(reopen);
+    if (!talkback_ && talkSource_) {
+        talkSource_->stop();
+        talkSource_->deleteLater();
+        talkSource_ = nullptr;
+        talkIo_ = nullptr;
+    }
+    emit monitoringChanged();
+}
+
+void PlaybackController::refreshAudio(bool reopen) {
+    if (speed_ == 1) {
+        if (!sink_ || reopen) {
+            // (the picture's clock afresh with the sound, as after a seek)
+            startFrame_ = position_;
+            clock_.restart();
+            startAudio(position_);
+        }
+    } else if (monitorKeepsAudio()) {
+        if (!sink_ || reopen) startAudio(position_, true);
+        else device_->setIdle(true);
+    } else {
+        stopAudio(true);
+    }
+}
+
+void PlaybackController::setAudioOutput(const QString& description) {
+    if (description == audioOutput_) return;
+    audioOutput_ = description;
+    if (sink_ && monitoring_.on) refreshAudio(true);
+    emit monitoringChanged();
+}
+
+void PlaybackController::setMonitorCalibration(int speaker) {
+    const int n = int(monitorSpeakers(monitoring_.speakers).size());
+    const int k = monitoring_.on && speaker >= 0 && speaker < n ? speaker : -1;
+    if (k == calibration_) return;
+    calibration_ = k;
+    const Sequence* s = sequence();
+    device_->setCalibration(k, monitoring_, s ? s->sampleRate : 48000);
+    if (testMonitor_) testMonitor_->section().setCalibration(k);
+    refreshAudio(false);
+    emit monitoringChanged();
+}
+
+void PlaybackController::setTalkback(bool on) {
+    on = on && monitoring_.on;
+    if (on == talkback_) return;
+    talkback_ = on;
+    device_->setTalkback(on);
+    if (testMonitor_) testMonitor_->section().setTalkback(on);
+    if (on) startTalkbackInput();
+    else if (talkSource_) {
+        talkSource_->stop();
+        talkSource_->deleteLater();
+        talkSource_ = nullptr;
+        talkIo_ = nullptr;
+    }
+    refreshAudio(false);
+    emit monitoringChanged();
+}
+
+void PlaybackController::startTalkbackInput() {
+    if (talkSource_) return;
+    QAudioDevice dev = QMediaDevices::defaultAudioInput();
+    if (!talkbackInput_.isEmpty())
+        for (const QAudioDevice& d : QMediaDevices::audioInputs())
+            if (d.description() == talkbackInput_) dev = d;
+    if (dev.isNull()) return;
+    const Sequence* s = sequence();
+    QAudioFormat fmt;
+    fmt.setSampleRate(s ? s->sampleRate : 48000);
+    fmt.setChannelCount(1);
+    fmt.setSampleFormat(QAudioFormat::Float);
+    if (!dev.isFormatSupported(fmt)) return;  // (talkback needs the microphone at the sequence's rate)
+    talkSource_ = new QAudioSource(dev, fmt, this);
+    talkIo_ = talkSource_->start();
+    if (!talkIo_) return;
+    connect(talkIo_, &QIODevice::readyRead, this, [this] {
+        if (!talkIo_) return;
+        const QByteArray data = talkIo_->readAll();
+        feedTalkback(reinterpret_cast<const float*>(data.constData()), int(data.size() / 4));
+    });
+}
+
+void PlaybackController::feedTalkback(const float* mono, int frames) {
+    if (frames <= 0) return;
+    device_->feedTalkback(mono, frames);
+    if (testMonitor_) testMonitor_->section().feedTalkback(mono, frames);
+}
+
+std::vector<float> PlaybackController::monitored(int64_t start, int frames, bool idle) {
+    const Sequence* s = sequence();
+    if (!monitoring_.on || !s || frames <= 0) return heard(start, std::max(0, frames));
+    if (!testMonitor_) {
+        testMonitor_ = std::make_unique<Monitor>();
+        testMonitor_->setAmbisonicBinaural(ambisonicBinaural_);
+        testMonitor_->setSettings(monitoring_, s->sampleRate);
+        testMonitor_->section().setCalibration(calibration_);
+        testMonitor_->section().setTalkback(talkback_);
+    }
+    testMonitor_->prepare(heard_, sequenceId_);
+    testMonitor_->reset();  // (each call from silence: the delays and noise from their starts)
+    std::vector<float> out(size_t(frames) * size_t(testMonitor_->outputs()));
+    testMonitor_->render(start, frames, out.data(), nullptr, nullptr, cycle_ ? &*cycle_ : nullptr, !idle);
+    if (globalMute_) std::fill(out.begin(), out.end(), 0.0f);
+    return out;
 }
 
 void PlaybackController::resetLoudness() { device_->resetLoudness(); }

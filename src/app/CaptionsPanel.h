@@ -10,6 +10,7 @@
 #include "core/CaptionTools.h"
 #include "core/Captions.h"
 #include "core/Model.h"
+#include "render/ImageSubtitles.h"
 
 class QCheckBox;
 class QLabel;
@@ -36,8 +37,12 @@ public:
     // Replaces the current track's captions with ones built from transcripts
     // (or adds a track when there is none). Returns the number of captions.
     int generateFromTranscripts(const CaptionRules& rules = {});
+    // Subtitle pictures (.sup, .idx, Matroska, MPEG-TS, IMSC Image) are read by OCR (render/ImageSubtitles.h), and
+    // written as pictures by extension, or as `pictures` says ("pgs", "dvb", "vobsub", "imsc_image").
     bool importFile(const QString& path, QString* error = nullptr);
-    bool exportFile(const QString& path, QString* error = nullptr) const;
+    bool exportFile(const QString& path, QString* error = nullptr, const QString& pictures = {}) const;
+    // The words the last subtitles read from pictures were unsure of.
+    const std::vector<OcrReview>& lastReview() const { return lastReview_; }
     // Shows the caption and starts editing its text.
     void editCaption(Id track, int index);
     // The spelling menu for caption `row` (a submenu per misspelt word: suggestions, Add to Dictionary), or null.
@@ -114,6 +119,7 @@ private:
     void deleteSelected();
     void mergeWithNext();
     void splitAtPlayhead();
+    bool importPictures(const QString& path, QString* error);
 
     EditorState* state_;
     Id track_ = 0;
@@ -122,6 +128,7 @@ private:
     QTableWidget* table_;
     QLabel* summary_ = nullptr;  // how many captions break the reading limits
     bool rebuilding_ = false;
+    std::vector<OcrReview> lastReview_;
 };
 
 }  // namespace montage

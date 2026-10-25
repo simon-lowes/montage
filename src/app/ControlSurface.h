@@ -54,7 +54,7 @@ public:
     SurfaceProtocol protocol() const { return protocol_; }
     QString surfaceName() const;
     // What the transport keys do that lives in the main window: "record", "marker", "save", "previousEdit",
-    // "nextEdit", "loop".
+    // "nextEdit", "loop"; and the monitor keys: "dim", "mono", "monitorMute", "talkbackOn", "talkbackOff".
     void setCommand(const QString& name, std::function<void()> fn) { commands_[name] = std::move(fn); }
 
     // A message from the surface (on the GUI thread; the connection's are queued here).

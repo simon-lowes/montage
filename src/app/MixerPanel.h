@@ -27,6 +27,7 @@ class QVBoxLayout;
 namespace montage {
 
 class AudioMeterWidget;
+class PlaybackController;
 class SurroundPanner;
 
 class MixerPanel : public QWidget {
@@ -77,6 +78,9 @@ public:
     // step, not one per message); empty, each track's control merges its own moves.
     void setEditMergeKey(const QString& key) { mergeKey_ = key; }
     int trackStrips() const { return int(strips_.size()); }
+    // The monitoring section whose solo mode the solo buttons follow: in place, after or before the fader, they solo
+    // in what is heard (PlaybackController::monitoring) and leave the project's solos alone.
+    void setMonitor(PlaybackController* monitor);
 
 signals:
     // The user asked to see a track's, bus's or the master's effects (now in the Inspector).
@@ -183,6 +187,7 @@ private:
     void followAutomation();
 
     EditorState* state_;
+    PlaybackController* monitor_ = nullptr;
     QScrollArea* scroll_ = nullptr;
     QWidget* stripHost_ = nullptr;
     QHBoxLayout* stripLayout_ = nullptr;

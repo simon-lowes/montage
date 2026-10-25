@@ -1,6 +1,7 @@
 // Application integration tests: drive the real main window offscreen —
 // timeline mouse gestures, tools, undo, inspector, monitors and playback.
 #include <QtTest>
+#include <complex>
 #include <limits>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -157,6 +158,9 @@
 #include "media/Translator.h"
 #include "ModelPacks.h"
 #include "MixerPanel.h"
+#include "MonitoringPanel.h"
+#include "CueSheetPanel.h"
+#include "core/Xlsx.h"
 #include "ControlSurface.h"
 #include "OscControl.h"
 #include "SpeedEditorControl.h"
@@ -212,6 +216,8 @@
 #include "SequenceIndexPanel.h"
 #include "core/Automation.h"
 #include "core/History.h"
+#include "render/GrainMatch.h"
+#include "render/LutExport.h"
 #include "render/Processing.h"
 #include "media/Segmenter.h"
 #include "HdrSurface.h"
@@ -234,6 +240,7 @@
 #include "core/Expression.h"
 #include "core/Multicam.h"
 #include "core/ProjectIO.h"
+#include "core/TakeLanes.h"
 #include "media/Decoder.h"
 #include "media/LtcTimecode.h"
 #include "audio/Ltc.h"
@@ -1873,14 +1880,17 @@ private slots:
         QCOMPARE(m->timecode, 3600.0);
         QVERIFY(m->duration < 5.9);
         QVERIFY(dlg->statusText().startsWith("Recording 00:00:0"));
+        // Growing from when it is imported (under load the rest of the recording can pass before the loop below looks),
+        // and its length seen rising while it records.
+        bool grew = state()->isMediaGrowing(id);
+        const double firstSeen = m->duration;
         // Cut in while it records.
         QVERIFY(state()->edit("Place", [id](Project& p, Sequence& s) { return edit::placeMedia(p, s, id, 0, 0, 25, {TrackKind::Video, 0}, {}, false).ok; }));
-        bool grew = false;
         QElapsedTimer t;
         t.start();
         while (dlg->isRecording() && t.elapsed() < 20000) {
             QTest::qWait(50);
-            grew = grew || state()->isMediaGrowing(id);
+            grew = grew || state()->isMediaGrowing(id) || state()->project().findMedia(id)->duration > firstSeen + 0.5;
         }
         QVERIFY(!dlg->isRecording());
         QVERIFY(grew);
@@ -3028,6 +3038,96 @@ private slots:
         state()->setPlayhead(5000);
         QVERIFY(!win_->exportClipLut(dir_.path() + "/none.cube"));
         QVERIFY(!QFileInfo::exists(dir_.path() + "/none.cube"));
+    }
+
+    void rebuildLutAsGrade() {
+        loadDemo();
+        QVERIFY(win_->findChild<QAction*>("lutToGrade"));
+        // A LUT made from a CDL on the red clip.
+        Project scratch = makeDefaultProject();
+        Effect cdl = makeEffect(scratch, "cdl");
+        cdl.params["slope.r"] = 0.8;
+        cdl.params["offset.b"] = 0.05;
+        const QString cube = dir_.path() + "/look.cube";
+        QVERIFY(writeCubeLut(bakeLut({cdl}, 0, 33), cube.toStdString()));
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        state()->edit("LUT", [red, cube](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "lut");
+            e.strings["path"] = cube.toStdString();
+            edit::clipById(s, red)->effects.push_back(e);
+            return true;
+        });
+        state()->setSelection({red});
+        state()->setPlayhead(30);
+        QVERIFY(win_->rebuildLutAsGrade(dir_.path() + "/residual.cube"));
+        const Clip* c = clipNamed(*state()->sequence(), "Red");
+        QVERIFY(std::none_of(c->effects.begin(), c->effects.end(), [&](const Effect& e) { return e.s("path") == cube.toStdString(); }));
+        QVERIFY(!c->effects.empty() && c->effects.front().type == "cdl");
+        QVERIFY(std::fabs(c->effects.front().p("slope.r", 0, 1) - 0.8) < 0.02);
+        QCOMPARE(c->gradeVersions.size(), size_t(2));
+        QVERIFY2(win_->statusBar()->currentMessage().contains("Rebuilt the LUT"), qPrintable(win_->statusBar()->currentMessage()));
+        // Undo puts the LUT back.
+        state()->undo();
+        c = clipNamed(*state()->sequence(), "Red");
+        QCOMPARE(c->effects.back().s("path"), cube.toStdString());
+        // A clip without a LUT: refused.
+        state()->undo();
+        QVERIFY(!win_->rebuildLutAsGrade(dir_.path() + "/residual.cube"));
+    }
+
+    void measureGrainAsPreset() {
+        loadDemo();
+        QVERIFY(win_->findChild<QAction*>("measureGrain"));
+        // A generator has no grain to measure: refused.
+        state()->setSelection({clipNamed(*state()->sequence(), "Red")->id});
+        state()->setPlayhead(30);
+        QVERIFY(win_->measureGrainAsPreset().isEmpty());
+        // Grainy footage: a flat colour with fresh grain on every frame, kept by ProRes 422 HQ.
+        const QString shot = dir_.path() + "/grainy-plate.mov";
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 320, gs.height = 180, gs.fps = {25, 1};
+            Clip c = makeGeneratorClip(gen, "color", 20);
+            c.generator.params["color.r"] = Param(0.45);
+            c.generator.params["color.g"] = Param(0.5);
+            c.generator.params["color.b"] = Param(0.4);
+            Effect grain = makeEffect(gen, "film_grain");
+            grain.params["amount"] = Param(0.3);
+            grain.params["color"] = Param(1.0);
+            c.effects.push_back(grain);
+            QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 0}, c).ok);
+            ExportSettings st = findExportPreset("ProRes 422 HQ")->settings;
+            st.path = shot.toStdString();
+            st.audioCodec = "none";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({shot});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = 320, s.height = 180, s.fps = {25, 1};
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        state()->setSelection({state()->sequence()->videoTracks[0].clips.at(0).id});
+        state()->setPlayhead(5);
+        // Saved as a preset holding a Grain Match with the measured profile, listed in the Effects panel.
+        const QString file = win_->measureGrainAsPreset();
+        QVERIFY2(QFileInfo::exists(file), qPrintable(win_->statusBar()->currentMessage()));
+        EffectPreset preset;
+        QVERIFY(presets::load(file, preset));
+        QCOMPARE(preset.name, std::string("Grain of grainy-plate.mov"));
+        QCOMPARE(preset.effects.size(), size_t(1));
+        QCOMPARE(preset.effects[0].type, std::string("grain_match"));
+        GrainProfile g;
+        QVERIFY(parseGrainProfile(preset.effects[0].s("profile"), g));
+        QCOMPARE(g.width, 320);
+        QVERIFY(g.amplitude[1][GrainProfile::kBands - 3] > 0.005);  // (the plate's green, about 0.21 in linear light)
+        QVERIFY2(win_->statusBar()->currentMessage().contains("Measured the grain"), qPrintable(win_->statusBar()->currentMessage()));
+        QVERIFY(presets::remove(file));
+        win_->findChild<EffectsBrowser*>()->reload();
+        state()->newProject();
     }
 
     void clipMarkersFromTheMenu() {
@@ -9797,6 +9897,406 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(dlg && dlg->isVisible());
         QVERIFY(dlg->findChild<QPushButton*>("voiceoverRecord"));
         dlg->close();
+        state()->newProject();
+    }
+
+    void cueSheetPanel() {
+        const int rate = 48000;
+        std::vector<float> x(size_t(rate) * 3);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.2 * std::sin(2 * M_PI * 330 * double(i) / rate));
+        for (const char* name : {"/cueA.wav", "/cueB.wav"}) {
+            WavWriter w;
+            QVERIFY(w.open(dir_.path() + name, rate, 1));
+            w.write(x.data(), int64_t(x.size()));
+            QVERIFY(w.close());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({dir_.path() + "/cueA.wav", dir_.path() + "/cueB.wav"});
+        QCOMPARE(ids.size(), size_t(2));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            const FrameTime second = FrameTime(std::llround(s.fpsValue() * 3)) + FrameTime(std::llround(s.fpsValue() * 2));
+            if (!edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok ||
+                !edit::placeMedia(p, s, ids[1], second, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok)
+                return false;
+            for (Clip& c : s.audioTracks[0].clips) c.role = "Music";
+            return true;
+        }));
+        auto* panel = win_->findChild<CueSheetPanel*>("cueSheetPanel");
+        QVERIFY(panel);
+        panel->refresh();
+        auto* table = panel->findChild<QTableWidget*>("cueSheetTable");
+        QCOMPARE(table->rowCount(), 2);
+        QCOMPARE(table->item(0, 1)->text(), QString("cueA"));  // the title from the file's name, untagged
+        // Typed fields are kept with the media.
+        table->item(0, 2)->setText("A. Writer");
+        QCOMPARE(QString::fromStdString(state()->project().findMedia(ids[0])->metadata.at("cue.composer")), QString("A. Writer"));
+        panel->refresh();
+        QCOMPARE(QString::fromStdString(panel->cues()[0].fields.at("composer")), QString("A. Writer"));
+        auto* use = qobject_cast<QComboBox*>(table->cellWidget(1, 9));
+        QVERIFY(use);
+        use->setCurrentIndex(1);
+        emit use->activated(1);
+        QCOMPARE(QString::fromStdString(state()->project().findMedia(ids[1])->metadata.at("cue.use")), QString("visual"));
+        state()->undo();
+        QVERIFY(!state()->project().findMedia(ids[1])->metadata.count("cue.use"));
+        // Clearing a field takes the media's word away.
+        panel->refresh();
+        table->item(0, 2)->setText("");
+        QVERIFY(!state()->project().findMedia(ids[0])->metadata.count("cue.composer"));
+        state()->undo();
+        // File › Export Paperwork: the sheet as a workbook.
+        QVERIFY(win_->findChild<QAction*>("exportPaperwork_ccsl"));
+        const QString xlsx = dir_.path() + "/cues.xlsx";
+        QVERIFY(win_->exportPaperwork("cue_sheet", xlsx));
+        std::vector<XlsxSheet> book;
+        std::string err;
+        QVERIFY2(readXlsxFile(xlsx.toStdString(), book, &err), err.c_str());
+        QCOMPARE(book[0].rows.size(), size_t(3));
+        QCOMPARE(QString::fromStdString(book[0].rows[1][2].text), QString("A. Writer"));
+        QVERIFY(win_->exportPaperwork("ccsl", dir_.path() + "/ccsl.pdf"));
+        QVERIFY(QFileInfo(dir_.path() + "/ccsl.pdf").size() > 0);
+        QVERIFY(!win_->exportPaperwork("cue_sheet", dir_.path() + "/cues.txt"));
+    }
+
+    void monitoringSection() {
+        // A 440 Hz tone on A1 panned left and a 1 kHz tone on A2 panned right.
+        const int rate = 48000;
+        std::vector<float> a(size_t(rate) * 2), b(a.size());
+        for (size_t i = 0; i < a.size(); ++i) {
+            a[i] = float(0.3 * std::sin(2 * M_PI * 440 * double(i) / rate));
+            b[i] = float(0.3 * std::sin(2 * M_PI * 1000 * double(i) / rate));
+        }
+        auto writeWav = [](const QString& file, const std::vector<float>& x) {
+            WavWriter w;
+            if (!w.open(file, 48000, 1)) return false;
+            w.write(x.data(), int64_t(x.size()));
+            return w.close();
+        };
+        QVERIFY(writeWav(dir_.path() + "/mon440.wav", a));
+        QVERIFY(writeWav(dir_.path() + "/mon1k.wav", b));
+        state()->newProject();
+        const auto ids = state()->importFiles({dir_.path() + "/mon440.wav", dir_.path() + "/mon1k.wav"});
+        QCOMPARE(ids.size(), size_t(2));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            while (s.audioTracks.size() < 2) edit::addTrack(p, s, TrackKind::Audio);
+            s.audioTracks[0].pan = -1;
+            s.audioTracks[1].pan = 1;
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok &&
+                   edit::placeMedia(p, s, ids[1], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok;
+        }));
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        auto* panel = win_->findChild<MonitoringPanel*>("monitoringPanel");
+        QVERIFY(program && panel);
+        auto tone = [&](const std::vector<float>& x, int chs, int ch, double hz) {
+            const size_t n = x.size() / size_t(chs);
+            std::complex<double> acc = 0;
+            for (size_t i = 0; i < n; ++i) acc += double(x[i * size_t(chs) + size_t(ch)]) * std::polar(1.0, -2 * M_PI * hz * double(i) / rate);
+            return 2 * std::abs(acc) / double(n);
+        };
+        const int n = 9600;
+        QTRY_VERIFY(tone(program->heard(0, n), 2, 0, 440) > 0.1);
+        const std::vector<float> heard = program->heard(0, n);
+        QVERIFY(tone(heard, 2, 1, 1000) > 0.1 && tone(heard, 2, 1, 440) < 0.01);
+
+        // On, with the speakers as they are: what is heard is the mix.
+        auto* on = panel->findChild<QCheckBox*>("monitorOn");
+        QVERIFY(!program->monitoring().on && !panel->findChild<QToolButton*>("monitorDim")->isEnabled());
+        on->click();
+        QVERIFY(program->monitoring().on);
+        QCOMPARE(program->monitored(0, n), heard);
+        // The right speaker 37 samples late and 3.2 dB down, typed in its row.
+        auto* table = panel->findChild<QTableWidget*>("monitorSpeakerTable");
+        QCOMPARE(table->rowCount(), 2);
+        QCOMPARE(table->item(1, 0)->text(), QString("R"));
+        table->item(1, 2)->setText("-3.2");
+        table->item(1, 3)->setText("37");
+        QCOMPARE(monitorSpeaker(program->monitoring(), 1), (MonitorSpeaker{1, -3.2, 37}));
+        {
+            const std::vector<float> out = program->monitored(0, n);
+            const float g = float(std::pow(10.0, -3.2 / 20));
+            double worst = 0;
+            for (int i = 0; i < n; ++i) {
+                worst = std::max(worst, double(std::fabs(out[size_t(i) * 2] - heard[size_t(i) * 2])));
+                const float want = i < 37 ? 0.0f : g * heard[size_t(i - 37) * 2 + 1];
+                worst = std::max(worst, double(std::fabs(out[size_t(i) * 2 + 1] - want)));
+            }
+            QVERIFY2(worst < 1e-6, qPrintable(QString::number(worst)));
+        }
+        table->item(1, 2)->setText("0");
+        table->item(1, 3)->setText("0");
+        // Dim (from F1 on a Mackie Control) is 20 dB down; Mono puts (L + R) / 2 on both.
+        struct Quiet : MidiConnection {
+            bool send(const MidiMessage&) override { return true; }
+            std::string inputName() const override { return "Surface"; }
+            std::string outputName() const override { return "Surface"; }
+        };
+        ControlSurface* surface = win_->controlSurface();
+        surface->setConnection(std::make_unique<Quiet>());
+        surface->handle({0x90, uint8_t(mcu::F1), 0x7F});
+        surface->handle({0x90, uint8_t(mcu::F1), 0x00});
+        QVERIFY(program->monitoring().dim && panel->findChild<QToolButton*>("monitorDim")->isChecked());
+        {
+            const std::vector<float> out = program->monitored(0, n);
+            double worst = 0;
+            for (size_t i = 0; i < out.size(); ++i) worst = std::max(worst, double(std::fabs(out[i] - 0.1f * heard[i])));
+            QVERIFY2(worst < 1e-6, qPrintable(QString::number(worst)));
+        }
+        surface->handle({0x90, uint8_t(mcu::F1), 0x7F});
+        QVERIFY(!program->monitoring().dim);
+        panel->findChild<QToolButton*>("monitorMono")->click();
+        QVERIFY(program->monitoring().mono);
+        {
+            const std::vector<float> out = program->monitored(0, n);
+            double worst = 0;
+            for (int i = 0; i < n; ++i) {
+                const float m = (heard[size_t(i) * 2] + heard[size_t(i) * 2 + 1]) / 2;
+                worst = std::max({worst, double(std::fabs(out[size_t(i) * 2] - m)), double(std::fabs(out[size_t(i) * 2 + 1] - m))});
+            }
+            QVERIFY2(worst < 1e-6, qPrintable(QString::number(worst)));
+        }
+        panel->findChild<QToolButton*>("monitorMono")->click();
+        // F3 mutes the speakers.
+        surface->handle({0x90, uint8_t(mcu::F1 + 2), 0x7F});
+        QVERIFY(program->monitoring().mute);
+        {
+            const std::vector<float> out = program->monitored(0, n);
+            QVERIFY(std::all_of(out.begin(), out.end(), [](float v) { return v == 0.0f; }));
+        }
+        surface->handle({0x90, uint8_t(mcu::F1 + 2), 0x7F});
+        QVERIFY(!program->monitoring().mute);
+
+        // The mixer's solo after the fader: A2 alone is heard, the project's solos untouched (and nothing to undo).
+        auto* soloMode = panel->findChild<QComboBox*>("monitorSoloMode");
+        soloMode->setCurrentIndex(soloMode->findData(int(MonitorSolo::AfterFader)));
+        QCOMPARE(program->monitoring().soloMode, MonitorSolo::AfterFader);
+        auto* mixer = win_->findChild<MixerPanel*>();
+        const bool couldUndo = state()->canUndo();
+        mixer->trackSolo(1)->click();
+        QCOMPARE(program->monitoring().soloTracks, std::vector<int>{1});
+        QVERIFY(mixer->trackSolo(1)->isChecked() && !mixer->trackSolo(0)->isChecked());
+        QVERIFY(!state()->sequence()->audioTracks[0].solo && !state()->sequence()->audioTracks[1].solo);
+        QCOMPARE(state()->canUndo(), couldUndo);
+        {
+            const std::vector<float> out = program->monitored(0, n);
+            QVERIFY(tone(out, 2, 0, 440) < 1e-4 && tone(out, 2, 1, 1000) > 0.1);
+        }
+
+        // The cue mix on channels 3 and 4: A1 alone (the speakers still hear the solo).
+        panel->findChild<QCheckBox*>("monitorCueOn")->click();
+        QCOMPARE(program->monitoring().cue.output, 2);  // (after the speakers)
+        panel->findChild<QSpinBox*>("monitorCueOutput")->setValue(3);
+        panel->findChild<QCheckBox*>("monitorCueBeeps")->setChecked(false);
+        panel->findChild<QListWidget*>("monitorCueTracks")->item(0)->setCheckState(Qt::Checked);
+        QCOMPARE(program->monitoring().cue.tracks, std::vector<int>{0});
+        QCOMPARE(monitorOutputs(program->monitoring()), 4);
+        {
+            const std::vector<float> out = program->monitored(0, n);
+            QCOMPARE(out.size(), size_t(n) * 4);
+            QVERIFY(tone(out, 4, 2, 440) > 0.05 && tone(out, 4, 2, 1000) < 1e-4 && tone(out, 4, 3, 1000) < 1e-4);
+            QVERIFY(tone(out, 4, 0, 440) < 1e-4 && tone(out, 4, 1, 1000) > 0.1);
+        }
+        // F4 talks back while it is held.
+        surface->handle({0x90, uint8_t(mcu::F1 + 3), 0x7F});
+        QVERIFY(program->talkback() && panel->findChild<QToolButton*>("monitorTalkback")->isEnabled());
+        surface->handle({0x90, uint8_t(mcu::F1 + 3), 0x00});
+        QVERIFY(!program->talkback());
+
+        // With all of it on, an export is bit for bit the one made with it off.
+        surface->handle({0x90, uint8_t(mcu::F1), 0x7F});
+        panel->findChild<QToolButton*>("monitorMono")->click();
+        table->item(0, 2)->setText("-6");
+        table->item(0, 3)->setText("100");
+        QVERIFY(program->monitoring().dim && program->monitoring().mono);
+        auto exported = [&](const QString& name) {
+            ExportSettings wav;
+            wav.path = (dir_.path() + "/" + name).toStdString();
+            wav.videoCodec = "none";
+            wav.audioCodec = "pcm_s24le";
+            std::string err;
+            if (!exportSequence(state()->project(), *state()->sequence(), wav, nullptr, nullptr, &err)) return QByteArray();
+            QFile f(QString::fromStdString(wav.path));
+            if (!f.open(QIODevice::ReadOnly)) return QByteArray();
+            const QByteArray all = f.readAll();
+            return all.mid(all.indexOf("data"));  // (the sound, whatever the header's dates)
+        };
+        const QByteArray withMonitoring = exported("mon-on.wav");
+        QVERIFY(withMonitoring.size() > rate * 6);
+
+        // MCP: read and change it, calibrate a speaker and set the level from the meter's reading.
+        auto call = [&](const QJsonObject& args) {
+            QJsonObject answer;
+            const QJsonObject m{{"jsonrpc", "2.0"}, {"id", 3}, {"method", "tools/call"},
+                                {"params", QJsonObject{{"name", "montage_monitoring"}, {"arguments", args}}}};
+            win_->liveLink()->handle(QJsonDocument(m).toJson(QJsonDocument::Compact),
+                                     [&](QByteArray a) { answer = QJsonDocument::fromJson(a).object().value("result").toObject(); });
+            return answer;
+        };
+        QJsonObject r = call({{"action", "get"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject got = r.value("structuredContent").toObject();
+        QVERIFY(got.value("on").toBool() && got.value("dim").toBool() && got.value("solo_mode").toString() == "afl");
+        QCOMPARE(got.value("outputs").toInt(), 4);
+        r = call({{"action", "set"}, {"settings", QJsonObject{{"dim", false}, {"mono", false}, {"solo_mode", "project"}, {"cue", QJsonObject{{"on", false}}},
+                                                              {"map", QJsonArray{}}, {"level_db", 0}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(!program->monitoring().dim && !program->monitoring().cue.on && program->monitoring().soloTracks.empty());
+        QVERIFY(!panel->findChild<QToolButton*>("monitorDim")->isChecked());
+        QVERIFY(!mixer->trackSolo(1)->isChecked());
+        r = call({{"action", "calibrate"}, {"speaker", 1}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(program->monitorCalibration(), 1);
+        {
+            // Pink noise at -20 dBFS RMS on the right speaker alone, even while stopped.
+            const std::vector<float> out = program->monitored(0, rate * 10, true);
+            double left = 0, right = 0;
+            for (int i = 0; i < rate * 10; ++i) left += double(out[size_t(i) * 2]) * out[size_t(i) * 2], right += double(out[size_t(i) * 2 + 1]) * out[size_t(i) * 2 + 1];
+            QCOMPARE(left, 0.0);
+            const double rms = 10 * std::log10(right / (rate * 10));
+            QVERIFY2(std::fabs(rms + 20) < 0.1, qPrintable(QString::number(rms)));
+        }
+        // The right speaker's reading trims it; the left's sets the monitor level.
+        r = call({{"action", "reading"}, {"spl", 84.0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(monitorSpeaker(program->monitoring(), 1).trimDb, 1.0);
+        QCOMPARE(program->monitoring().levelDb, 0.0);
+        QCOMPARE(table->item(1, 2)->text(), QString("1.0"));
+        call({{"action", "calibrate"}, {"speaker", 0}});
+        QCOMPARE(program->monitorCalibration(), 0);
+        r = call({{"action", "reading"}, {"spl", 88.0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(program->monitoring().levelDb, -3.0);  // 85 dB SPL wanted
+        QCOMPARE(panel->findChild<QDoubleSpinBox*>("monitorLevel")->value(), -3.0);
+        QCOMPARE(monitorSpeaker(program->monitoring(), 1).trimDb, 1.0);
+        QVERIFY(call({{"action", "reading"}}).value("isError").toBool());
+        call({{"action", "calibrate"}, {"speaker", -1}});
+        QCOMPARE(program->monitorCalibration(), -1);
+        // Kept in the app's settings (but not its solos), for the next start.
+        QVERIFY(appSettings().value("monitoring/settings").toString().contains("\"level_db\":-3"));
+
+        // Off: the same export.
+        on->click();
+        QVERIFY(!program->monitoring().on);
+        QCOMPARE(program->monitored(0, n), heard);
+        QCOMPARE(exported("mon-off.wav"), withMonitoring);
+        appSettings().remove("monitoring/settings");
+        program->setMonitoring(MonitorSettings{});
+        surface->disconnectSurface();
+    }
+
+    void loopRecordingTakeLanes() {
+        state()->newProject();
+        QVERIFY(state()->save(dir_.path() + "/loop.montage"));
+        const double fps = state()->sequence()->fpsValue();
+        const FrameTime in = 48, out = in + FrameTime(std::llround(6 * fps)), pre = FrameTime(std::llround(fps));
+        const TrackRef a2{TrackKind::Audio, 1};
+        // Loop recording from In to Out with a second's pre-roll: three passes and half a second more (too short to
+        // keep), each sample saying where it is in the recording.
+        VoiceoverRecorder rec(state());
+        QVERIFY(rec.startLoop(in, out, pre, 1, {}, false, 48000, 1));
+        QVERIFY(rec.isLooping());
+        const double length = double(out - in) / fps * 48000;
+        const qint64 preroll = std::llround(double(pre) / fps * 48000);
+        auto passStart = [&](int k) { return preroll + qint64(std::llround(k * length)); };
+        auto value = [](qint64 i) { return float(i % 9973) / 9973.0f * 0.5f; };
+        const qint64 total = passStart(3) + 24000;
+        std::vector<float> block(4800);
+        for (qint64 at = 0; at < total; at += 4800) {
+            const qint64 n = std::min<qint64>(4800, total - at);
+            for (qint64 i = 0; i < n; ++i) block[size_t(i)] = value(at + i);
+            rec.feed(block.data(), n);
+        }
+        QCOMPARE(rec.passes(), 3);
+        const Id comp = rec.stop();
+        QVERIFY(comp);
+        QVERIFY(!rec.isLooping());
+        // Three lanes at In, each pass sample-exact; the last half second is dropped and the whole recording removed.
+        auto track = [&]() -> const Track& { return state()->sequence()->audioTracks[1]; };
+        QCOMPARE(track().lanes.size(), size_t(3));
+        for (int k = 0; k < 3; ++k) {
+            const TakeLane& l = track().lanes[size_t(k)];
+            QCOMPARE(l.start, in);
+            QCOMPARE(l.name, "Take " + std::to_string(k + 1));
+            QFile f(QString::fromStdString(state()->project().findMedia(l.mediaId)->path));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            f.seek(44);
+            const QByteArray data = f.readAll();
+            const auto* s = reinterpret_cast<const float*>(data.constData());
+            const qint64 count = data.size() / 4;
+            QCOMPARE(count, passStart(k + 1) - passStart(k));
+            QCOMPARE(s[0], value(passStart(k)));
+            QCOMPARE(s[count - 1], value(passStart(k + 1) - 1));
+        }
+        QVERIFY(rec.lastTake().endsWith(" pass 3.wav"));
+        const QString whole = rec.lastTake().chopped(11);  // ".../Sequence 1 VO n"
+        QVERIFY(!QFileInfo::exists(whole + ".wav"));
+        QVERIFY(!QFileInfo::exists(whole + " pass 4.wav"));
+        // The last pass is the comp, In to Out; one undo takes lanes and comp away.
+        const Clip* c = edit::clipById(*state()->sequence(), comp);
+        QVERIFY(c && c->start == in && c->duration == out - in);
+        QCOMPARE(c->mediaId, track().lanes[2].mediaId);
+        QCOMPARE(compLaneOf(track(), *c), track().lanes[2].id);
+        state()->undo();
+        QVERIFY(track().lanes.empty() && track().clips.empty());
+        state()->redo();
+        QCOMPARE(track().lanes.size(), size_t(3));
+
+        // A sweep across Take 1's lane gives that stretch to the comp, with crossfades at its joins.
+        TimelineWidget* tl = timeline();
+        tl->zoomToFit();
+        const Id take1 = track().lanes[0].id;
+        const QRect sweep = tl->takeLaneBounds(a2, take1, in + 24, in + 72);
+        QVERIFY(!sweep.isEmpty() && tl->viewport()->rect().contains(sweep.center()));
+        drag({sweep.left(), sweep.center().y()}, {sweep.right() + 1, sweep.center().y()});
+        QCOMPARE(track().clips.size(), size_t(3));
+        const Clip& mid = track().clips[1];
+        QCOMPARE(compLaneOf(track(), mid), take1);
+        QVERIFY(std::abs(mid.start - (in + 24)) <= 1 && std::abs(mid.end() - (in + 72)) <= 1);
+        QCOMPARE(track().transitions.size(), size_t(2));
+        state()->undo();
+        QCOMPARE(track().clips.size(), size_t(1));
+        state()->redo();
+
+        // Track Versions from the header's menu: a new empty version, then back to the first with its comp.
+        auto viaMenu = [&](const QString& text) {
+            bool triggered = false;
+            QTimer::singleShot(0, this, [&] {
+                auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
+                if (!menu) return;
+                if (auto* sub = menu->findChild<QMenu*>("trackVersionMenu"))
+                    for (QAction* act : sub->actions())
+                        if (act->text() == text) {
+                            act->trigger();
+                            triggered = true;
+                        }
+                menu->close();
+            });
+            const QPoint at(40, tl->takeLaneBounds(a2, take1, in, in + 1).top() - 10);
+            QContextMenuEvent ev(QContextMenuEvent::Mouse, at, tl->viewport()->mapToGlobal(at));
+            QApplication::sendEvent(tl->viewport(), &ev);
+            return triggered;
+        };
+        const std::vector<Clip> comped = track().clips;
+        QVERIFY(viaMenu("New Empty Version"));
+        QCOMPARE(track().versions.size(), size_t(2));
+        QVERIFY(track().clips.empty());
+        QCOMPARE(track().lanes.size(), size_t(3));  // the takes stay with the track
+        QVERIFY(viaMenu("Version 1"));
+        QCOMPARE(track().version, 0);
+        QVERIFY(track().clips == comped);
+
+        // Another loop recording leaves the first one's passes as they were.
+        const QByteArray firstPass = [&] {
+            QFile f(whole + " pass 1.wav");
+            return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+        }();
+        QVERIFY(rec.startLoop(in, out, pre, 1, {}, false, 48000, 1));
+        std::fill(block.begin(), block.end(), 0.125f);
+        for (qint64 at = 0; at < passStart(1); at += 4800) rec.feed(block.data(), std::min<qint64>(4800, passStart(1) - at));
+        QVERIFY(rec.stop());
+        QVERIFY(!rec.lastTake().startsWith(whole + " "));
+        QCOMPARE(track().lanes.size(), size_t(4));
+        QFile again(whole + " pass 1.wav");
+        QVERIFY(again.open(QIODevice::ReadOnly) && again.readAll() == firstPass);
         state()->newProject();
     }
 

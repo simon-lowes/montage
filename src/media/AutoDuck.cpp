@@ -101,7 +101,7 @@ Spans dialogueSpans(const Project& p, const Sequence& s, const std::vector<int>&
     return merge(speech, std::max(o.minPause, o.fadeDown + o.fadeUp));
 }
 
-Spans descriptionSpeech(const Project& p, const Sequence& s, int skipTrack, std::string* error) {
+Spans descriptionSpeech(const Project& p, const Sequence& s, int skipTrack, std::string* error, const std::atomic<bool>* cancel) {
     std::vector<int> tracks;
     for (int i = 0; i < int(s.audioTracks.size()); ++i)
         if (i != skipTrack) tracks.push_back(i);
@@ -116,7 +116,7 @@ Spans descriptionSpeech(const Project& p, const Sequence& s, int skipTrack, std:
     } else {
         o.skipRoles = {"Music", "Effects", kDescriptionRole};
     }
-    return dialogueSpans(p, s, tracks, o, error);
+    return dialogueSpans(p, s, tracks, o, error, cancel);
 }
 
 Spans clipSpans(const Sequence& s, int track, double minPause) {

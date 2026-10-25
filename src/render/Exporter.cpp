@@ -39,7 +39,9 @@
 
 #include "ColorSpace.h"
 #include "Compositor.h"
+#include "ImageSubtitles.h"
 #include "Hdr10Plus.h"
+#include "AdaptiveHdr.h"
 #include "HdrStill.h"
 #include "media/GainMap.h"
 #include "LightLevel.h"
@@ -898,6 +900,9 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     // HDR10+ (measured once everything is open, just before the frames, so a missing encoder fails first).
     const bool wantHdr10 = s.hdr10Plus && wantVideo && pq && !floatFrames;
     std::vector<Hdr10PlusScene> hdr10;
+    // Adaptive HDR metadata (ST 2094-50) likewise, for PQ and HLG.
+    const bool wantAdaptive = s.adaptiveHdr && wantVideo && outSpace.hdr() && !floatFrames;
+    std::vector<AdaptiveHdrScene> adaptive;
     double renderFrom = 0;  // where the render's share of the progress starts
     if (wantVideo) {
         std::string c = s.videoCodec;
@@ -1354,6 +1359,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         AVCodecContext* ctx = nullptr;
         AVStream* st = nullptr;
         size_t next = 0;
+        std::vector<SubtitlePacket> pictures;  // image subtitles, coded ahead (times from the export's start)
+        bool image = false;
         ~CaptionOut() { avcodec_free_context(&ctx); }
     };
     std::vector<std::unique_ptr<CaptionOut>> captionOuts;
@@ -1367,11 +1374,44 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         auto out = std::make_unique<CaptionOut>();
         out->track = track;
         AVCodecID id = AV_CODEC_ID_NONE;
-        for (AVCodecID c : {AV_CODEC_ID_MOV_TEXT, AV_CODEC_ID_SUBRIP, AV_CODEC_ID_WEBVTT})
-            if (avformat_query_codec(o.oc->oformat, c, FF_COMPLIANCE_NORMAL) == 1) {
-                id = c;
-                break;
+        const bool ts = std::string(o.oc->oformat->name) == "mpegts";
+        auto holds = [&](AVCodecID c) { return avformat_query_codec(o.oc->oformat, c, FF_COMPLIANCE_NORMAL) == 1 || (ts && c == AV_CODEC_ID_DVB_SUBTITLE); };
+        if (s.captionImages.empty())
+            for (AVCodecID c : {AV_CODEC_ID_MOV_TEXT, AV_CODEC_ID_SUBRIP, AV_CODEC_ID_WEBVTT})
+                if (holds(c)) {
+                    id = c;
+                    break;
+                }
+        // As pictures (render/ImageSubtitles.h) when asked, or where only pictures go (MPEG-TS: DVB subtitles).
+        std::string images = s.captionImages;
+        if (images.empty() && id == AV_CODEC_ID_NONE && ts) images = "dvb";
+        if (!images.empty()) {
+            ImageSubtitleFormat f;
+            if (!imageSubtitleFormatFromId(images, f) || f == ImageSubtitleFormat::ImscImage)
+                return fail("Caption pictures are pgs, dvb or dvd, not " + images);
+            id = f == ImageSubtitleFormat::Pgs ? AV_CODEC_ID_HDMV_PGS_SUBTITLE : f == ImageSubtitleFormat::Dvb ? AV_CODEC_ID_DVB_SUBTITLE : AV_CODEC_ID_DVD_SUBTITLE;
+            if (!holds(id)) return fail(std::string("This file type cannot hold ") + (f == ImageSubtitleFormat::Pgs ? "PGS" : f == ImageSubtitleFormat::Dvb ? "DVB" : "DVD") +
+                                        " subtitles (Matroska holds all three, MPEG-TS DVB)");
+            std::vector<uint8_t> extra;
+            std::string err;
+            if (!encodeImageSubtitles(*track, dseq.fps, f, W / across, H / down, out->pictures, &extra, &err, din, dout)) return fail(err);
+            out->image = true;
+            out->st = avformat_new_stream(o.oc, nullptr);
+            out->st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+            out->st->codecpar->codec_id = id;
+            out->st->codecpar->width = W / across;
+            out->st->codecpar->height = H / down;
+            if (!extra.empty()) {
+                out->st->codecpar->extradata = static_cast<uint8_t*>(av_mallocz(extra.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+                std::copy(extra.begin(), extra.end(), out->st->codecpar->extradata);
+                out->st->codecpar->extradata_size = int(extra.size());
             }
+            out->st->time_base = AVRational{1, 90000};
+            tagStream(out->st, track->name, track->language);
+            if (captionOuts.empty() && embedded.size() > 1) out->st->disposition |= AV_DISPOSITION_DEFAULT;
+            captionOuts.push_back(std::move(out));
+            continue;
+        }
         if (id == AV_CODEC_ID_NONE) return fail("This file type cannot hold captions; export them as a sidecar file instead");
         const AVCodec* codec = avcodec_find_encoder(id);
         if (!codec) return fail("Caption encoder not available");
@@ -1599,9 +1639,26 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
 
     // Writes the captions that start before frame `until` (export range only), on every caption stream.
     std::vector<uint8_t> subBuf(1 << 16);
-    auto writeCaptions = [&](FrameTime until) -> bool {
+    auto writeCaptions = [&](FrameTime until, bool last = false) -> bool {
         const double msPerFrame = 1000.0 / dseq.fpsValue();
+        for (auto& co : captionOuts) {
+            if (!co->image) continue;
+            // Pictures: each packet whose time has come (at the end, the one clearing the last caption too).
+            const int64_t limit = int64_t(std::llround(double(until - din) * 90000.0 / dseq.fpsValue()));
+            for (; co->next < co->pictures.size() && (co->pictures[co->next].pts < limit || (last && co->pictures[co->next].pts <= limit)); ++co->next) {
+                const SubtitlePacket& sp = co->pictures[co->next];
+                av_packet_unref(o.pkt);
+                if (av_new_packet(o.pkt, int(sp.data.size())) < 0) return false;
+                std::copy(sp.data.begin(), sp.data.end(), o.pkt->data);
+                o.pkt->pts = o.pkt->dts = av_rescale_q(sp.pts, AVRational{1, 90000}, co->st->time_base);
+                o.pkt->duration = av_rescale_q(sp.duration, AVRational{1, 90000}, co->st->time_base);
+                o.pkt->flags |= AV_PKT_FLAG_KEY;
+                o.pkt->stream_index = co->st->index;
+                if (av_interleaved_write_frame(o.oc, o.pkt) < 0) return false;
+            }
+        }
         for (auto& co : captionOuts)
+        if (!co->image)
         for (; co->next < co->track->captions.size() && co->track->captions[co->next].start < until; ++co->next) {
             const Caption& c = co->track->captions[co->next];
             const FrameTime a = std::max(c.start, din), b = std::min(c.end, dout);
@@ -1831,6 +1888,49 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             };
         }
     }
+    // Adaptive HDR metadata: each scene fitted from a few of its frames and their SDR renditions (the sequence's analysis
+    // where it still matches), as part of the progress; then a message on every frame of HEVC and AV1 video.
+    if (wantAdaptive && o.vctx && (o.vctx->codec_id == AV_CODEC_ID_HEVC || o.vctx->codec_id == AV_CODEC_ID_AV1)) {
+        const double share = 0.1;
+        const double before = renderFrom;
+        renderFrom += share;
+        std::string e;
+        FrameTime toMeasure = 0;
+        const auto part = [&](double f) {
+            if (progress) progress(before + share * f, in);
+        };
+        // (Delivered at another rate: the programme is measured and its scenes put on the delivered frames.)
+        // (The pictures as graded, without burn-ins: the sequence's own analysis serves unless a trim pass is delivered.)
+        if (!adaptiveHdrForRange(p, seq, in, out, outSpace, peakNits, true, adaptive, &e, part, cancel,
+                                 trim && trimTargetSpace(seq, trim->id).hdr() ? trim : nullptr, &toMeasure))
+            return fail(cancel && cancel->load() ? std::string("Export cancelled") : "Adaptive HDR metadata analysis failed: " + e);
+        if (toMeasure == 0) renderFrom = before;
+        if (conv.active())
+            for (AdaptiveHdrScene& sc : adaptive) {
+                sc.start = din + deliveredFrameOf(conv, sc.start - in);
+                sc.end = sc.end >= out ? dout : din + deliveredFrameOf(conv, sc.end - in);
+            }
+        std::erase_if(adaptive, [](const AdaptiveHdrScene& sc) { return sc.end <= sc.start; });
+        if (!adaptive.empty()) {
+            const bool av1 = o.vctx->codec_id == AV_CODEC_ID_AV1;
+            const int lengthSize = !av1 && o.vctx->extradata_size > 22 && o.vctx->extradata[0] == 1 ? (o.vctx->extradata[21] & 3) + 1 : 0;
+            auto messages = std::make_shared<std::vector<std::vector<uint8_t>>>();
+            for (const AdaptiveHdrScene& sc : adaptive) messages->push_back(adaptiveHdrT35(sc.md));
+            const auto scenes = std::make_shared<std::vector<AdaptiveHdrScene>>(adaptive);
+            const FrameTime first = din;
+            std::function<bool(AVPacket*)> before10 = o.videoPacket;  // (HDR10+'s, when both are carried)
+            o.videoPacket = [before10, scenes, messages, av1, lengthSize, first](AVPacket* pkt) {
+                if (before10 && !before10(pkt)) return false;
+                if (pkt->pts == AV_NOPTS_VALUE) return true;
+                const FrameTime f = first + pkt->pts;
+                const auto it = std::upper_bound(scenes->begin(), scenes->end(), f,
+                                                 [](FrameTime t, const AdaptiveHdrScene& sc) { return t < sc.end; });
+                if (it == scenes->end() || f < it->start) return true;
+                const auto& msg = (*messages)[size_t(it - scenes->begin())];
+                return av1 ? addHdr10PlusObu(pkt, msg) : addHdr10PlusSei(pkt, msg, lengthSize);
+            };
+        }
+    }
     // Pulldown's second fields: the frame they come from, in the encoder's format.
     AVFrame* secondField = nullptr;
     struct FreeFrame {
@@ -2000,6 +2100,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             progress(renderFrom + (1 - renderFrom) * double(f - din + 1) / double(total),
                      conv.active() ? in + FrameTime(double(f - din) * double(out - in) / double(total)) : f);
     }
+    if (!writeCaptions(dout, true)) return fail("Writing captions failed");
     // Flush the encoders; errors here (e.g. a full disk) must fail the export.
     if (wantAudio) {
         if (o.actx) {
@@ -2067,6 +2168,15 @@ std::string hdr10PlusCarriage(const Sequence& seq, const ExportSettings& s) {
     const bool video = c == "libx265" || c == "hw_hevc" || c.rfind("hevc_", 0) == 0 || c == "libsvtav1" || c == "libaom-av1" ||
                        c == "librav1e" || c.rfind("av1_", 0) == 0;
     return video ? "video" : "json";
+}
+
+bool adaptiveHdrCarried(const Sequence& seq, const ExportSettings& s) {
+    const std::string& c = s.videoCodec;
+    if (!s.adaptiveHdr || c.empty() || c == "none" || c == "gif" || c == "exr") return false;
+    const ColorSpace* chosen = findTrimTarget(seq, s.trimTarget) ? &trimTargetSpace(seq, s.trimTarget) : findColorSpace(s.colorSpace);
+    const ColorSpace& out = chosen && !chosen->sceneReferred ? *chosen : sequenceColorSpace(seq);
+    return out.hdr() && (c == "libx265" || c == "hw_hevc" || c.rfind("hevc_", 0) == 0 || c == "libsvtav1" || c == "libaom-av1" ||
+                         c == "librav1e" || c.rfind("av1_", 0) == 0);
 }
 
 bool exportCodecCarries(const std::string& codecName, const std::string& layout) {

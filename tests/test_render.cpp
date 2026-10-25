@@ -1,6 +1,7 @@
 // Renderer tests: blending, transforms, effects, transitions, generators.
 #include <QtTest>
 #include <map>
+#include <QJsonArray>
 #include <QTemporaryDir>
 #include <QProcess>
 
@@ -50,6 +51,8 @@
 #include "render/Imf.h"
 #include "render/Jpeg2000.h"
 #include "render/DcpMxf.h"
+#include "render/ImageSubtitles.h"
+#include "media/TextReader.h"
 #include "render/DcpSecurity.h"
 #include "render/XmlCanonical.h"
 #include "core/Interpretation.h"
@@ -85,6 +88,9 @@
 #include "render/Processing.h"
 #include "render/QualityCheck.h"
 #include "render/LutExport.h"
+#include "render/GrainMatch.h"
+#include "render/LutToGrade.h"
+#include "render/MonitorSection.h"
 #include "render/LightLevel.h"
 #include "render/Relight.h"
 #include "render/Deconvolve.h"
@@ -6954,6 +6960,111 @@ colorspaces:
         QVERIFY(!exportImf(p, now, sup, dir.path().toStdString(), nullptr, {}, &err) && err.find("mastered from") != std::string::npos);
     }
 
+    void exportsImfImageSubtitles() {
+        if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
+        QTemporaryDir dir;
+        // Three subtitles over a two-second matte, sent as pictures (the IMSC 1.1 Image profile), the third the first again.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 960, s.height = 540, s.fps = Rational{24, 1};
+        s.videoTracks[0].clips = {colorClip(p, 0.2f, 0.3f, 0.4f, 0, 48)};
+        CaptionTrack t;
+        t.id = p.newId();
+        t.name = "English";
+        t.language = "en";
+        Caption a{4, 20, "Pictures, not text"};
+        Caption b{26, 44, "The second subtitle"};
+        b.vertical = kCaptionTop;
+        Caption c{44, 48, "Pictures, not text"};
+        t.captions = {a, b, c};
+        s.captionTracks.push_back(t);
+        ImfSettings st;
+        st.title = "Pictures";
+        st.threads = 2;
+        st.texts = {{t.id, "subtitles", true}};
+        ImfResult r;
+        std::string err;
+        QVERIFY2(exportImf(p, s, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+        QCOMPARE(r.texts, 1);
+        std::vector<std::string> issues = verifyImf(r.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        const QStringList photon = photonErrors(QString::fromStdString(r.folder));
+        QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+        // The timed text track file: an Image profile document, and its two PNGs (the repeated one once) in the file under
+        // their ids.
+        std::string xml;
+        dcp::ImfTrackReader text;
+        for (const std::string& f : r.trackFiles) {
+            dcp::ImfTrackReader reader;
+            if (reader.open(f, &err) && reader.kind() == dcp::ImfTrackReader::Kind::TimedText) text = reader;
+        }
+        QVERIFY(text.kind() == dcp::ImfTrackReader::Kind::TimedText && text.text(xml, &err));
+        QVERIFY(isImscImage(xml));
+        QVERIFY(xml.find("ttp:contentProfiles=\"http://www.w3.org/ns/ttml/profile/imsc1.1/image\"") != std::string::npos);
+        QVERIFY(xml.find("tts:extent=\"960px 540px\"") != std::string::npos);
+        QCOMPARE(text.resources().size(), size_t(2));
+        auto png = [&](const std::string& name) {
+            dcp::Uuid id;
+            std::vector<uint8_t> d;
+            if (name.rfind("urn:uuid:", 0) != 0 || !dcp::parseUuid(name.substr(9), id) || !text.resource(id, d)) return QByteArray();
+            return QByteArray(reinterpret_cast<const char*>(d.data()), qsizetype(d.size()));
+        };
+        const std::vector<std::string> problems = checkImscImage(xml, png, 960, 540);
+        QVERIFY2(problems.empty(), problems.empty() ? "" : problems.front().c_str());
+        DecodedSubtitles pictures;
+        QVERIFY2(decodeImscImage(xml, png, pictures, &err), err.c_str());
+        QCOMPARE(pictures.pictures.size(), size_t(3));
+        for (size_t i = 0; i < 3; ++i) {
+            QCOMPARE(FrameTime(std::llround(pictures.pictures[i].start * 24)), t.captions[i].start);
+            QCOMPARE(FrameTime(std::llround(pictures.pictures[i].end * 24)), t.captions[i].end);
+        }
+        QVERIFY(pictures.pictures[1].y < 540 / 3);  // the second at the top
+        // The composition's descriptor names the profile and the pictures.
+        QFile cpl(QString::fromStdString(r.cpl));
+        QVERIFY(cpl.open(QIODevice::ReadOnly));
+        const QString cplText = QString::fromUtf8(cpl.readAll());
+        QVERIFY(cplText.contains("imsc1.1/image") && cplText.count("<r0:DCTimedTextResourceSubDescriptor>") == 2);
+        // TTML2's schema (W3C) passes the document, where MONTAGE_TEST_TTML_SCHEMA names it (and xmllint is at hand).
+        const QString schema = qEnvironmentVariable("MONTAGE_TEST_TTML_SCHEMA");
+        if (schema.isEmpty()) {
+            qInfo("MONTAGE_TEST_TTML_SCHEMA not set: the document is not checked against TTML2's schema");
+        } else {
+            QFile doc(dir.filePath("image.ttml"));
+            QVERIFY(doc.open(QIODevice::WriteOnly));
+            doc.write(QByteArray::fromStdString(xml));
+            doc.close();
+            QProcess lint;
+            lint.setProcessChannelMode(QProcess::MergedChannels);
+            lint.start("xmllint", {"--noout", "--nonet", "--schema", schema, doc.fileName()});
+            QVERIFY2(lint.waitForFinished(120000), "xmllint did not finish");
+            QVERIFY2(lint.exitCode() == 0, lint.readAll().constData());
+        }
+        // Montage's check finds what is wrong with a broken one.
+        std::string broken = xml;
+        broken.replace(broken.find("urn:uuid:"), 9, "urn:uuid:0");
+        QVERIFY(!checkImscImage(broken, png, 960, 540).empty());
+        QVERIFY(!checkImscImage(xml, png, 1920, 1080).empty());
+        QVERIFY(!checkImscImage(captionsToTtml(t.captions, s.fps), png).empty());
+        // Opened again as a sequence: the subtitles read back off their pictures (with the text reading model).
+        if (!ocrAvailable() || !ocrModel().installed()) {
+            qInfo("Text reading model not installed (set MONTAGE_OCR_MODEL): the package's subtitles are not read back");
+            return;
+        }
+        Project q = makeDefaultProject();
+        const ImportResult in = importImf(q, r.folder, [](const std::string& f, MediaItem& m) { return probeMedia(f, m, nullptr); });
+        QVERIFY2(in.ok, in.error.c_str());
+        const Sequence* opened = q.findSequence(in.sequence);
+        QVERIFY(opened && opened->captionTracks.size() == 1);
+        const CaptionTrack& back = opened->captionTracks[0];
+        QCOMPARE(back.captions.size(), size_t(3));
+        for (size_t i = 0; i < 3; ++i) {
+            QCOMPARE(QString::fromStdString(back.captions[i].text), QString::fromStdString(t.captions[i].text));
+            QCOMPARE(back.captions[i].start, t.captions[i].start);
+            QCOMPARE(back.captions[i].end, t.captions[i].end);
+            QCOMPARE(back.captions[i].vertical, t.captions[i].vertical);
+        }
+    }
+
     void exportsImfSupplementalAt2997() {
         if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
         // A lossy 29.97 master of 7 frames (padded to 10, so the sound fills whole frames), then a supplemental with
@@ -7831,6 +7942,652 @@ colorspaces:
         for (size_t i = 0; i < same.px.size(); ++i) moved = std::max(moved, std::fabs(same.px[i] - before.px[i]));
         QVERIFY2(moved < 1e-4f, qPrintable(QString::number(moved)));
         QVERIFY(!writeCubeLut(Lut3D{}, path));
+    }
+
+    void lutToGrade() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        QTemporaryDir dir;
+        const ColorSpace& space = sequenceColorSpace(s);
+        const WorkingSpaceScope working(&space);
+        std::string err;
+        // RGB Mixer: each output a mix of the inputs.
+        Effect mixer = makeEffect(p, "rgb_mixer");
+        mixer.params["r.g"] = 0.2;
+        mixer.params["g.g"] = 0.5;
+        mixer.params["b.r"] = -0.1;
+        Image one(1, 1);
+        one.px = {0.2f, 0.5f, 0.8f, 1};
+        applyVideoEffect(mixer, 0, one, 1);
+        QVERIFY(std::fabs(one.px[0] - 0.3f) < 1e-6f && std::fabs(one.px[1] - 0.25f) < 1e-6f && std::fabs(one.px[2] - 0.78f) < 1e-6f);
+        // A LUT file from a transform on 0..1, 33 points.
+        auto write = [&](const QString& name, const std::function<void(float[3])>& f) {
+            Lut3D l;
+            l.size = 33;
+            for (int b = 0; b < 33; ++b)
+                for (int g = 0; g < 33; ++g)
+                    for (int r = 0; r < 33; ++r) {
+                        float v[3] = {r / 32.0f, g / 32.0f, b / 32.0f};
+                        f(v);
+                        l.data.insert(l.data.end(), v, v + 3);
+                    }
+            const std::string path = (dir.path() + "/" + name).toStdString();
+            [&] { QVERIFY2(writeCubeLut(l, path, name.toStdString(), &err), err.c_str()); }();
+            return path;
+        };
+        auto fitted = [&](const std::string& path) {
+            LutGrade fit;
+            const auto fn = lutTransform(path, &err);
+            [&] { QVERIFY2(fn && fitLutGrade(fn, space, fit, &err), err.c_str()); }();
+            return fit;
+        };
+        auto label = [](const LutGrade& g) {
+            QString t = QString("mean %1 max %2, with the residual %3 %4:").arg(g.meanDeltaE).arg(g.maxDeltaE).arg(g.residualMeanDeltaE).arg(g.residualMaxDeltaE);
+            for (const std::string& st : g.stages) t += " " + QString::fromStdString(st);
+            return t;
+        };
+        // A LUT baked from an ASC CDL comes back as that CDL.
+        Effect cdl = makeEffect(p, "cdl");
+        const double slope[3] = {1.12, 0.94, 1.0}, offset[3] = {0.02, 0.0, -0.015}, power[3] = {0.9, 1.06, 1.0};
+        for (int i = 0; i < 3; ++i) {
+            const std::string c(1, "rgb"[i]);
+            cdl.params["slope." + c] = slope[i];
+            cdl.params["offset." + c] = offset[i];
+            cdl.params["power." + c] = power[i];
+        }
+        cdl.params["saturation"] = 1.1;
+        const std::string cdlPath = (dir.path() + "/cdl.cube").toStdString();
+        QVERIFY(writeCubeLut(bakeLut({cdl}, 0, 33), cdlPath));
+        const LutGrade fromCdl = fitted(cdlPath);
+        QVERIFY2(!fromCdl.stages.empty() && fromCdl.stages[0] == "cdl" && fromCdl.meanDeltaE < 0.2, qPrintable(label(fromCdl)));
+        for (int i = 0; i < 3; ++i) {
+            const std::string c(1, "rgb"[i]);
+            const Effect& got = fromCdl.effects[0];
+            QVERIFY2(std::fabs(got.p("slope." + c, 0, 1) - slope[i]) < 0.02 * slope[i] && std::fabs(got.p("offset." + c, 0, 0) - offset[i]) < 0.004 &&
+                         std::fabs(got.p("power." + c, 0, 1) - power[i]) < 0.02 * power[i],
+                     qPrintable(QString("%1: %2 %3 %4").arg(i).arg(got.p("slope." + c, 0, 1)).arg(got.p("offset." + c, 0, 0)).arg(got.p("power." + c, 0, 1))));
+        }
+        QVERIFY(std::fabs(fromCdl.effects[0].p("saturation", 0, 1) - 1.1) < 0.022);
+        // Curves on their own come back close.
+        Effect curves = makeEffect(p, "curves");
+        curves.strings["red"] = "0,0 0.25,0.2 0.6,0.68 1,1";
+        curves.strings["blue"] = "0,0.03 0.5,0.45 1,0.97";
+        const std::string curvesPath = (dir.path() + "/curves.cube").toStdString();
+        QVERIFY(writeCubeLut(bakeLut({curves}, 0, 33), curvesPath));
+        const LutGrade fromCurves = fitted(curvesPath);
+        QVERIFY2(fromCurves.meanDeltaE < 0.3 && fromCurves.maxDeltaE < 1.5, qPrintable(label(fromCurves)));
+        // A print-like look (channel crosstalk, an S-curve, a hue twist): the controls come close, the residual closer.
+        auto print = [](float v[3]) {
+            const float m[9] = {0.9f, 0.08f, 0.02f, 0.05f, 0.88f, 0.07f, 0.02f, 0.1f, 0.88f};
+            float x[3];
+            for (int o = 0; o < 3; ++o) x[o] = m[o * 3] * v[0] + m[o * 3 + 1] * v[1] + m[o * 3 + 2] * v[2];
+            auto sCurve = [](float t) {
+                auto f = [](float u) { return 1.0f / (1.0f + std::exp(-5.0f * (std::pow(std::clamp(u, 0.0f, 1.0f), 1.1f) - 0.5f))); };
+                return (f(t) - f(0)) / (f(1) - f(0));
+            };
+            for (float& c : x) c = sCurve(c);
+            // Hue turned a little towards orange and teal.
+            QColor col = QColor::fromRgbF(x[0], x[1], x[2]);
+            float h, sat, val, a;
+            col.getHsvF(&h, &sat, &val, &a);
+            if (h >= 0) {
+                h = std::fmod(h + 0.03f * std::sin(float(2 * M_PI) * h * 2) + 1.0f, 1.0f);
+                col = QColor::fromHsvF(h, sat, val);
+                x[0] = float(col.redF()), x[1] = float(col.greenF()), x[2] = float(col.blueF());
+            }
+            std::copy(x, x + 3, v);
+        };
+        const std::string printPath = write("print.cube", print);
+        const LutGrade fromPrint = fitted(printPath);
+        qInfo("print look: %s", qPrintable(label(fromPrint)));
+        QVERIFY2(fromPrint.meanDeltaE < 1.5 && fromPrint.residualMeanDeltaE < 0.3 && fromPrint.residualMeanDeltaE < fromPrint.meanDeltaE / 3,
+                 qPrintable(label(fromPrint)));
+        QVERIFY(!fromPrint.clips);
+        // A LUT that clips is said to.
+        const LutGrade fromClip = fitted(write("clip.cube", [](float v[3]) {
+            for (int c = 0; c < 3; ++c) v[c] = std::min(1.0f, 1.5f * v[c]);
+        }));
+        QVERIFY2(fromClip.clips && fromClip.clipNote == "every channel clips from 69% grey", fromClip.clipNote.c_str());  // (1/1.5 on the lattice)
+
+        // On a clip: the LUT effect becomes the grade (and the residual), the grade with the LUT a version.
+        Clip clip = colorClip(p, 0.5f, 0.4f, 0.3f, 0, 30);
+        Effect lut = makeEffect(p, "lut");
+        lut.strings["path"] = printPath;
+        Effect blur = makeEffect(p, "gaussian_blur");
+        clip.effects = {lut, blur};
+        edit::overwrite(p, s, {TrackKind::Video, 0}, clip);
+        const std::string residual = (dir.path() + "/residual.cube").toStdString();
+        Effect half = lut;
+        half.params["strength"] = 50.0;
+        edit::clipById(s, clip.id)->effects[0] = half;
+        QVERIFY(!edit::lutToGrade(p, s, clip.id, 0, residual).ok);  // part strength: a mix, refused
+        Effect off = lut;
+        off.enabled = false;
+        edit::clipById(s, clip.id)->effects[0] = off;
+        QVERIFY(!edit::lutToGrade(p, s, clip.id, 0, residual).ok);  // switched off
+        edit::clipById(s, clip.id)->effects[0] = lut;
+        QVERIFY(!edit::lutToGrade(p, s, clip.id, 0, printPath).ok);  // the residual over the LUT itself
+        QCOMPARE(edit::clipById(s, clip.id)->effects[0].s("path"), printPath);
+        LutGrade fit;
+        const edit::Result r = edit::lutToGrade(p, s, clip.id, 0, residual, &fit);
+        QVERIFY2(r.ok, r.error.c_str());
+        const Clip* c = edit::clipById(s, clip.id);
+        QCOMPARE(c->gradeVersions.size(), size_t(2));
+        QCOMPARE(c->gradeVersion, 1);
+        QCOMPARE(QString::fromStdString(c->gradeVersions[0].name), QString("With LUT"));
+        QCOMPARE(QString::fromStdString(c->gradeVersions[1].name), QString("Rebuilt from LUT"));
+        QVERIFY(QFileInfo::exists(QString::fromStdString(residual)));
+        QCOMPARE(c->effects.size(), fit.effects.size() + 2);  // the stages, the residual, the blur
+        QCOMPARE(c->effects.back().type, std::string("gaussian_blur"));
+        QCOMPARE(c->effects[c->effects.size() - 2].s("path"), residual);
+        for (size_t i = 0; i < fit.effects.size(); ++i) QCOMPARE(c->effects[i].type, fit.effects[i].type);
+        // It looks like the LUT did.
+        std::mt19937 rng(5);
+        std::uniform_real_distribution<float> u(0, 1);
+        Image viaLut(48, 32);
+        for (size_t i = 0; i < viaLut.px.size(); i += 4) viaLut.px[i] = u(rng), viaLut.px[i + 1] = u(rng), viaLut.px[i + 2] = u(rng), viaLut.px[i + 3] = 1;
+        Image viaGrade = viaLut;
+        applyVideoEffect(lut, 0, viaLut, 1);
+        for (size_t i = 0; i + 1 < c->effects.size(); ++i) applyVideoEffect(c->effects[i], 0, viaGrade, 1);
+        float worst = 0;
+        for (size_t i = 0; i < viaLut.px.size(); ++i) worst = std::max(worst, std::fabs(viaLut.px[i] - viaGrade.px[i]));
+        QVERIFY2(worst < 0.03f, qPrintable(QString::number(worst)));
+        // Switching back shows the LUT again.
+        QVERIFY(edit::switchGradeVersion(s, clip.id, 0).ok);
+        c = edit::clipById(s, clip.id);
+        QCOMPARE(c->effects.size(), size_t(2));
+        QCOMPARE(c->effects[0].s("path"), printPath);
+        // A LUT applied in another space is rebuilt there, between Colour Space Transforms.
+        Clip logClip = colorClip(p, 0.5f, 0.4f, 0.3f, 30, 30);
+        Effect logLut = makeEffect(p, "lut");
+        logLut.strings["path"] = printPath;
+        logLut.strings["space"] = findColorSpace("acescct")->label;
+        logClip.effects = {logLut};
+        edit::overwrite(p, s, {TrackKind::Video, 0}, logClip);
+        QVERIFY(effectApplySpace(logLut));
+        const edit::Result lr = edit::lutToGrade(p, s, logClip.id, 0, (dir.path() + "/log-residual.cube").toStdString());
+        QVERIFY2(lr.ok, lr.error.c_str());
+        c = edit::clipById(s, logClip.id);
+        QCOMPARE(c->effects.front().type, std::string("color_space_transform"));
+        QCOMPARE(c->effects.back().type, std::string("color_space_transform"));
+        Image a(32, 16);
+        for (size_t i = 0; i < a.px.size(); i += 4) a.px[i] = u(rng), a.px[i + 1] = u(rng), a.px[i + 2] = u(rng), a.px[i + 3] = 1;
+        Image b = a;
+        applyVideoEffect(logLut, 0, a, 1);
+        for (const Effect& e : c->effects) applyVideoEffect(e, 0, b, 1);
+        worst = 0;
+        double mean = 0;
+        for (size_t i = 0; i < a.px.size(); ++i) worst = std::max(worst, std::fabs(a.px[i] - b.px[i])), mean += std::fabs(a.px[i] - b.px[i]);
+        mean /= double(a.px.size());
+        // (Rec.709 pictures fill under half of ACEScct's range, so the 17-point residual is coarser there than the
+        // 33-point LUT, and coming back out of the log curve magnifies what it misses.)
+        QVERIFY2(worst < 0.15f && mean < 0.005, qPrintable(QString("%1 %2").arg(worst).arg(mean)));
+    }
+
+    void monitorSection() {
+        const int rate = 48000;
+        auto db = [](double x) { return 20 * std::log10(x); };
+        // A 1 kHz tone on the right speaker, 37 samples late and 3.2 dB down, whatever the blocks.
+        MonitorSettings s;
+        s.on = true;
+        s.map = {{0, 0, 0}, {1, -3.2, 37}};
+        MonitorSection m;
+        m.configure(s, rate);
+        QCOMPARE(m.outputs(), 2);
+        const int n = 4800;
+        std::vector<float> in(size_t(n) * 2, 0.0f), out(size_t(n) * 2);
+        for (int i = 0; i < n; ++i) in[size_t(i) * 2 + 1] = float(0.5 * std::sin(2 * M_PI * 1000 * i / rate));
+        m.process("stereo", in.data(), nullptr, 1000, out.data());
+        m.process("stereo", in.data() + 2000, nullptr, n - 1000, out.data() + 2000);
+        const float g = float(std::pow(10.0, -3.2 / 20));
+        double worst = 0;
+        for (int i = 0; i < n; ++i) {
+            const float want = i < 37 ? 0.0f : g * in[size_t(i - 37) * 2 + 1];
+            worst = std::max(worst, double(std::fabs(out[size_t(i) * 2 + 1] - want)));
+            QCOMPARE(out[size_t(i) * 2], 0.0f);
+        }
+        QVERIFY2(worst < 1e-7, qPrintable(QString::number(worst)));
+        // Dim, Mono, Mute and one speaker alone.
+        std::vector<float> lr(size_t(n) * 2);
+        for (int i = 0; i < n; ++i) lr[size_t(i) * 2] = 0.4f, lr[size_t(i) * 2 + 1] = 0.2f;
+        auto run = [&](const MonitorSettings& x) {
+            MonitorSection t;
+            t.configure(x, rate);
+            std::vector<float> o(size_t(n) * size_t(t.outputs()));
+            t.process("stereo", lr.data(), nullptr, n, o.data());
+            return std::pair{o[size_t(n - 1) * size_t(t.outputs())], o[size_t(n - 1) * size_t(t.outputs()) + 1]};
+        };
+        MonitorSettings plain;
+        QVERIFY(run(plain) == std::pair(0.4f, 0.2f));
+        MonitorSettings x = plain;
+        x.dim = true;
+        QVERIFY(std::fabs(run(x).first - 0.04f) < 1e-7 && std::fabs(run(x).second - 0.02f) < 1e-7);
+        x = plain, x.mono = true;
+        QVERIFY(std::fabs(run(x).first - 0.3f) < 1e-7 && std::fabs(run(x).second - 0.3f) < 1e-7);
+        x = plain, x.mute = true;
+        QVERIFY(run(x) == std::pair(0.0f, 0.0f));
+        x = plain, x.soloSpeaker = 1;
+        QVERIFY(run(x) == std::pair(0.0f, 0.2f));
+        x = plain, x.levelDb = calibratedLevel(0, 88, 85);
+        QVERIFY(std::fabs(run(x).first - 0.4f * float(std::pow(10.0, -3.0 / 20))) < 1e-7);
+
+        // Bass management on 5.1: a main and the subwoofer together are flat through the crossover (within 0.5 dB from
+        // 20 Hz to 20 kHz), the main alone is quiet below it, and the LFE reaches the subwoofer 10 dB up.
+        MonitorSettings bm;
+        bm.on = true;
+        bm.speakers = "5.1";
+        bm.bassManagement = true;
+        MonitorSection b;
+        b.configure(bm, rate);
+        QCOMPARE(b.outputs(), 6);
+        const int len = 1 << 15;
+        std::vector<float> imp(size_t(len) * 6, 0.0f), resp(size_t(len) * 6);
+        imp[0] = 1;            // L
+        imp[3 * 6 + 3] = 1;    // and the LFE three samples later
+        b.process("5.1", imp.data(), nullptr, len, resp.data());
+        auto gainAt = [&](const std::vector<float>& h, double hz) {
+            std::complex<double> acc = 0;
+            for (size_t i = 0; i < h.size(); ++i) acc += double(h[i]) * std::polar(1.0, -2 * M_PI * hz * double(i) / rate);
+            return db(std::abs(acc));
+        };
+        std::vector<float> sum(static_cast<size_t>(len)), mainOnly(static_cast<size_t>(len)), lfe(static_cast<size_t>(len));
+        // (the LFE's impulse is three samples later, so the subwoofer's response is split from it by time: the
+        // mains' lows are taken from a run without the LFE)
+        {
+            std::vector<float> noLfe = imp;
+            noLfe[3 * 6 + 3] = 0;
+            MonitorSection c;
+            c.configure(bm, rate);
+            std::vector<float> r(size_t(len) * 6);
+            c.process("5.1", noLfe.data(), nullptr, len, r.data());
+            for (int i = 0; i < len; ++i) sum[size_t(i)] = r[size_t(i) * 6] + r[size_t(i) * 6 + 3], mainOnly[size_t(i)] = r[size_t(i) * 6];
+            for (int i = 0; i < len; ++i) lfe[size_t(i)] = resp[size_t(i) * 6 + 3] - r[size_t(i) * 6 + 3];
+        }
+        double flat = 0;
+        for (double hz = 20; hz <= 20000; hz *= 1.25) flat = std::max(flat, std::fabs(gainAt(sum, hz)));
+        QVERIFY2(flat < 0.5, qPrintable(QString::number(flat)));
+        QVERIFY(gainAt(mainOnly, 80) < -5.5 && gainAt(mainOnly, 80) > -6.5);  // (Linkwitz-Riley: -6 dB at the crossover)
+        QVERIFY(gainAt(mainOnly, 20) < -40);
+        QVERIFY2(std::fabs(gainAt(lfe, 40) - 10) < 0.01, qPrintable(QString::number(gainAt(lfe, 40))));
+
+        // Calibration: pink noise at -20 dBFS RMS in its band, on one speaker at a time, the others silent; the
+        // subwoofer's in its own band.
+        MonitorSection cal;
+        cal.configure(bm, rate);
+        cal.setCalibration(1);
+        const int ten = rate * 10;
+        std::vector<float> silence(size_t(ten) * 6, 0.0f), noise(size_t(ten) * 6);
+        cal.process("5.1", silence.data(), nullptr, ten, noise.data());
+        std::vector<float> r1(static_cast<size_t>(ten));
+        double acc = 0, others = 0;
+        for (int i = 0; i < ten; ++i) {
+            r1[size_t(i)] = noise[size_t(i) * 6 + 1];
+            acc += double(r1[size_t(i)]) * r1[size_t(i)];
+            for (int c : {0, 2, 3, 4, 5}) others = std::max(others, double(std::fabs(noise[size_t(i) * 6 + size_t(c)])));
+        }
+        QVERIFY2(std::fabs(db(std::sqrt(acc / ten)) + 20) < 0.1, qPrintable(QString::number(db(std::sqrt(acc / ten)))));
+        QCOMPARE(others, 0.0);
+        auto band = [&](const std::vector<float>& v, double hz) {  // mean power within 10 % of `hz`, over the first second
+            const std::vector<float> second(v.begin(), v.begin() + rate);
+            double power = 0;
+            for (int k = -10; k <= 10; ++k) power += std::pow(10.0, gainAt(second, hz * (1 + k / 100.0)) / 10);
+            return 10 * std::log10(power / 21);
+        };
+        QVERIFY(band(r1, 1000) - band(r1, 100) > 20 && band(r1, 1000) - band(r1, 8000) > 20);
+        cal.setCalibration(3);
+        cal.process("5.1", silence.data(), nullptr, rate, noise.data());
+        std::vector<float> subNoise(static_cast<size_t>(rate));
+        for (int i = 0; i < rate; ++i) subNoise[size_t(i)] = noise[size_t(i) * 6 + 3];
+        QVERIFY(band(subNoise, 40) - band(subNoise, 1000) > 30);
+
+        // The cue mix on channels 3 and 4: its tracks, the beeps and talkback, nothing of the programme unless asked;
+        // the speakers keep the programme with the beeps.
+        MonitorSettings cs = plain;
+        cs.cue.on = true;
+        cs.cue.output = 2;
+        MonitorSection cue;
+        cue.configure(cs, rate);
+        QCOMPARE(cue.outputs(), 4);
+        std::vector<float> guide(size_t(n) * 2, 0.1f), beeps(size_t(n) * 2, 0.0f), talk(size_t(n), 0.05f), co(size_t(n) * 4);
+        beeps[10] = beeps[11] = 0.25f;
+        cue.process("stereo", lr.data(), beeps.data(), n, co.data());
+        cue.feedTalkback(talk.data(), n);
+        cue.addCue(guide.data(), beeps.data(), lr.data(), n, co.data());
+        QVERIFY(co[5 * 4 + 0] == 0.4f + 0.25f && co[5 * 4 + 1] == 0.2f + 0.25f);  // the speakers: programme and beeps
+        QVERIFY(co[5 * 4 + 2] == 0.1f + 0.25f && co[5 * 4 + 3] == 0.1f + 0.25f);  // the cue: guide and beeps alone
+        QVERIFY(co[100 * 4 + 2] == 0.1f);
+        cue.setTalkback(true);
+        cue.feedTalkback(talk.data(), n);
+        cue.process("stereo", lr.data(), nullptr, n, co.data());
+        cue.addCue(guide.data(), nullptr, lr.data(), n, co.data());
+        QVERIFY(std::fabs(co[100 * 4 + 2] - 0.15f) < 1e-7);
+
+        // The settings as text and back; what is mixed for a set.
+        MonitorSettings full = bm;
+        full.map = {{1, -1.5, 12}, {0, 0.3, 0}};
+        full.listenAs = "stereo";
+        full.soloMode = MonitorSolo::AfterFader;
+        full.soloTracks = {1};
+        full.cue = cs.cue;
+        full.cue.tracks = {2};
+        QVERIFY(MonitorSettings::fromJson(full.toJson()) == full);
+        Sequence seq;
+        seq.audioLayout = "7.1.4";
+        MonitorSettings room;
+        room.speakers = "7.1.4";
+        QCOMPARE(listenLayout(room, seq), std::string("7.1.4"));
+        room.listenAs = "5.1";
+        QCOMPARE(listenLayout(room, seq), std::string("5.1"));
+        room.speakers = "5.1", room.listenAs = "";
+        QCOMPARE(listenLayout(room, seq), std::string("5.1"));
+        seq.audioLayout = "stereo";
+        QCOMPARE(listenLayout(room, seq), std::string("stereo"));  // never mixed up
+        room.speakers = "headphones", room.listenAs = "binaural";
+        QCOMPARE(listenLayout(room, seq), std::string("binaural"));
+        QCOMPARE(monitorSequence(seq, room).audioLayout, std::string("ambix3"));
+        QVERIFY((listenChoices("7.1.4") == std::vector<std::string>{"7.1", "5.1", "stereo"}));
+        // Only layouts whose every speaker the set has: 5.1.4 has no back pair for 7.1, and 7.1 no heights for 5.1.2.
+        QVERIFY((listenChoices("5.1.4") == std::vector<std::string>{"5.1", "stereo"}));
+        room.speakers = "7.1", room.listenAs = "5.1.2";
+        seq.audioLayout = "7.1.4";
+        QCOMPARE(listenLayout(room, seq), std::string("7.1"));
+        seq.audioLayout = "stereo";
+        // A cue on speakers' channels is added to them; turned on, it goes after them. Channels stay on the device's.
+        {
+            MonitorSettings ov;
+            ov.on = true;
+            ov.speakers = "5.1";
+            ov.cue.on = true;
+            QCOMPARE(ov.cue.output, 2);
+            QCOMPARE(monitorFreeOutput(ov), 6);
+            MonitorSection sec;
+            sec.configure(ov, rate);
+            QCOMPARE(sec.outputs(), 6);
+            std::vector<float> six(600, 0.0f), guide(200, 0.25f), o(600);
+            for (int i = 0; i < 100; ++i) six[size_t(i) * 6 + 2] = 0.5f;
+            sec.process("5.1", six.data(), nullptr, 100, o.data());
+            sec.addCue(guide.data(), nullptr, nullptr, 100, o.data());
+            QCOMPARE(o[size_t(50) * 6 + 2], 0.75f);
+            QCOMPARE(o[size_t(50) * 6 + 3], 0.25f);
+            QJsonObject wild = ov.toJson();
+            wild["map"] = QJsonArray{QJsonObject{{"output", 100000000}}};
+            QJsonObject cue = wild["cue"].toObject();
+            cue["output"] = 2147483647;
+            wild["cue"] = cue;
+            const MonitorSettings tame = MonitorSettings::fromJson(wild);
+            QCOMPARE(monitorSpeaker(tame, 0).output, kMaxMonitorChannels - 1);
+            QCOMPARE(monitorOutputs(tame), kMaxMonitorChannels);
+        }
+        // The monitor's solos leave the project's alone: after the fader, the track straight to the master without
+        // its processing; before it, at unity and in the middle.
+        seq.audioTracks.resize(2);
+        seq.audioTracks[1].volumeDb = -6;
+        seq.audioTracks[1].pan = 0.5;
+        seq.audioTracks[1].output = 42;
+        seq.masterVolumeDb = -3;
+        seq.masterEffects.push_back(Effect{});
+        MonitorSettings solo;
+        solo.soloMode = MonitorSolo::AfterFader;
+        solo.soloTracks = {1};
+        Sequence afl = monitorSequence(seq, solo);
+        QVERIFY(afl.audioTracks[1].solo && !afl.audioTracks[0].solo && afl.audioTracks[1].output == 0 && afl.masterEffects.empty());
+        QCOMPARE(afl.audioTracks[1].volumeDb, -6.0);
+        solo.soloMode = MonitorSolo::PreFader;
+        Sequence pfl = monitorSequence(seq, solo);
+        QVERIFY(pfl.audioTracks[1].volumeDb == 0 && pfl.audioTracks[1].pan == 0 && pfl.masterVolumeDb == 0);
+        solo.soloMode = MonitorSolo::InPlace;
+        Sequence sip = monitorSequence(seq, solo);
+        QVERIFY(sip.audioTracks[1].solo && sip.audioTracks[1].output == 42 && sip.masterVolumeDb == -3);
+        QVERIFY(!seq.audioTracks[1].solo);
+    }
+
+    void grainMatching() {
+        const ColorSpace& space = rec709Space();
+        const WorkingSpaceScope working(&space);
+        // Eight stripes of grey, a stop apart, 64 pixels wide; nine frames of grain made here: white noise blurred by
+        // [1 4 6 4 1] / 16 each way, red, green and blue correlated 0.6, its strength 0.004 + 0.05 √light in linear light.
+        const int W = 512, H = 192, kFrames = 9;
+        double stripe[8];
+        for (int k = 0; k < 8; ++k) stripe[k] = std::exp2(k - 7.5);
+        auto amplitudeAt = [](double light) { return 0.004 + 0.05 * std::sqrt(light); };
+        auto clean = [&] {
+            Image img(W, H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    float* p = img.at(x, y);
+                    for (int c = 0; c < 3; ++c) p[c] = float(fromLinear(space.transfer, stripe[x / 64]));
+                    p[3] = 1;
+                }
+            return img;
+        };
+        std::mt19937 rng(11);
+        std::normal_distribution<double> normal;
+        const double kernel[5] = {1 / 16.0, 4 / 16.0, 6 / 16.0, 4 / 16.0, 1 / 16.0};
+        const double gain = 1 / std::pow(35.0 / 128.0, 2.0);  // (the kernel's sum of squares is 70/256 each way)
+        auto blurred = [&] {
+            std::vector<double> n(size_t(W) * H), a(n.size()), b(n.size());
+            for (double& v : n) v = normal(rng);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    double s = 0;
+                    for (int k = -2; k <= 2; ++k) s += kernel[k + 2] * n[size_t(y) * W + size_t((x + k + W) % W)];
+                    a[size_t(y) * W + size_t(x)] = s;
+                }
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    double s = 0;
+                    for (int k = -2; k <= 2; ++k) s += kernel[k + 2] * a[size_t((y + k + H) % H) * W + size_t(x)];
+                    b[size_t(y) * W + size_t(x)] = s * std::sqrt(gain);
+                }
+            return b;
+        };
+        const double r = 0.6, l10 = 1, l20 = r, l21 = std::sqrt(1 - r * r), l30 = r, l31 = (r - r * r) / l21,
+                     l32 = std::sqrt(1 - l30 * l30 - l31 * l31);
+        std::vector<Image> plate;
+        for (int f = 0; f < kFrames; ++f) {
+            Image img = clean();
+            const auto z0 = blurred(), z1 = blurred(), z2 = blurred();
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const size_t i = size_t(y) * W + size_t(x);
+                    const double g[3] = {l10 * z0[i], l20 * z0[i] + l21 * z1[i], l30 * z0[i] + l31 * z1[i] + l32 * z2[i]};
+                    float* p = img.at(x, y);
+                    for (int c = 0; c < 3; ++c) {
+                        const double l = stripe[x / 64] + amplitudeAt(stripe[x / 64]) * g[c];
+                        p[c] = float(l < 0 ? -fromLinear(space.transfer, -l) : fromLinear(space.transfer, l));
+                    }
+                }
+            plate.push_back(std::move(img));
+        }
+        GrainProfile measured;
+        std::string err;
+        QVERIFY2(measureGrain(plate, space, {}, measured, &err), err.c_str());
+        qInfo("measured: %s", grainProfileText(measured).c_str());
+        // Its strength in every band within 10 %, its colour correlation and its spectrum (the kernel's, cos⁸ each way,
+        // averaged round each ring) too.
+        for (int b = 0; b < GrainProfile::kBands; ++b)
+            for (int c = 0; c < 3; ++c)
+                QVERIFY2(std::fabs(measured.amplitude[c][b] / amplitudeAt(stripe[b]) - 1) < 0.1,
+                         qPrintable(QString("band %1 channel %2: %3 for %4").arg(b).arg(c).arg(measured.amplitude[c][b]).arg(amplitudeAt(stripe[b]))));
+        for (double v : measured.correlation) QVERIFY2(std::fabs(v - r) < 0.06, qPrintable(QString::number(v)));
+        QVERIFY2(measured.temporal < 0.05, qPrintable(QString::number(measured.temporal)));
+        double expect[GrainProfile::kBins] = {}, rings[GrainProfile::kBins] = {};
+        for (int v = -32; v < 32; ++v)
+            for (int u = -32; u < 32; ++u) {
+                const int bin = int(std::hypot(u, v));
+                if (bin >= GrainProfile::kBins || (u == 0 && v == 0)) continue;
+                expect[bin] += std::pow(std::cos(M_PI * u / 64.0), 8) * std::pow(std::cos(M_PI * v / 64.0), 8);
+                rings[bin] += 1;
+            }
+        double top = 0;
+        for (int b = 1; b < GrainProfile::kBins; ++b) top = std::max(top, expect[b] /= rings[b]);
+        for (int b = 1; b < GrainProfile::kBins; ++b)
+            if (expect[b] / top > 0.1)
+                QVERIFY2(std::fabs(measured.spectrum[b] - expect[b] / top) < 0.1 * expect[b] / top + 0.02,
+                         qPrintable(QString("bin %1: %2 for %3").arg(b).arg(measured.spectrum[b]).arg(expect[b] / top)));
+        // The profile as text and back.
+        GrainProfile back;
+        QVERIFY(parseGrainProfile(grainProfileText(measured), back));
+        QCOMPARE(grainProfileText(back), grainProfileText(measured));
+        QVERIFY(!parseGrainProfile("grain1 width=10", back) && !parseGrainProfile("nothing", back));
+        // Not numbers, or a negative spectrum: refused.
+        auto with = [&](const std::string& from, const std::string& to) {
+            std::string t = grainProfileText(measured);
+            return t.replace(t.find(from), from.size(), to);
+        };
+        QVERIFY(!parseGrainProfile(with("temporal=", "temporal=nan "), back));
+        QVERIFY(!parseGrainProfile(with("spectrum=", "spectrum=-"), back));
+        QVERIFY(!parseGrainProfile(with("width=512", "width=inf"), back));
+
+        // Grain made from it on the clean stripes measures as the plate did, within 1 dB in every band.
+        Project p = makeDefaultProject();
+        Effect match = makeEffect(p, "grain_match");
+        match.strings["profile"] = grainProfileText(measured);
+        std::vector<Image> made;
+        for (int f = 0; f < kFrames; ++f) {
+            Image img = clean();
+            applyVideoEffect(match, f, img, 1);
+            made.push_back(std::move(img));
+        }
+        GrainProfile again;
+        QVERIFY2(measureGrain(made, space, {}, again, &err), err.c_str());
+        auto dB = [](double a, double b) { return 20 * std::log10(a / b); };
+        for (int b = 0; b < GrainProfile::kBands; ++b)
+            for (int c = 0; c < 3; ++c)
+                QVERIFY2(std::fabs(dB(again.amplitude[c][b], measured.amplitude[c][b])) < 1,
+                         qPrintable(QString("band %1 channel %2: %3 dB").arg(b).arg(c).arg(dB(again.amplitude[c][b], measured.amplitude[c][b]))));
+        for (int k = 0; k < 3; ++k) QVERIFY(std::fabs(again.correlation[k] - measured.correlation[k]) < 0.06);
+        QVERIFY2(std::fabs(grainSize(again) / grainSize(measured) - 1) < 0.1, qPrintable(QString("%1 for %2").arg(grainSize(again)).arg(grainSize(measured))));
+        // Twice the size: grain twice as large.
+        {
+            Effect big = match;
+            big.params["size"] = 200.0;
+            std::vector<Image> bigger;
+            for (int f = 0; f < kFrames; ++f) {
+                Image img = clean();
+                applyVideoEffect(big, f, img, 1);
+                bigger.push_back(std::move(img));
+            }
+            GrainProfile twice;
+            QVERIFY2(measureGrain(bigger, space, {}, twice, &err), err.c_str());
+            QVERIFY2(std::fabs(grainSize(twice) / grainSize(measured) - 2) < 0.3,
+                     qPrintable(QString("%1 for %2").arg(grainSize(twice)).arg(grainSize(measured))));
+        }
+        // On a picture twice the size, the grain is twice as large and as strong.
+        {
+            auto stripes = [&](int w, int h) {
+                Image img(w, h);
+                for (int y = 0; y < h; ++y)
+                    for (int x = 0; x < w; ++x) {
+                        float* p = img.at(x, y);
+                        for (int c = 0; c < 3; ++c) p[c] = float(fromLinear(space.transfer, stripe[x * 8 / w]));
+                        p[3] = 1;
+                    }
+                return img;
+            };
+            std::vector<Image> large;
+            for (int f = 0; f < kFrames; ++f) {
+                Image img = stripes(2 * W, 2 * H);
+                applyVideoEffect(match, f, img, 1);
+                large.push_back(std::move(img));
+            }
+            GrainProfile doubled;
+            QVERIFY2(measureGrain(large, space, {}, doubled, &err), err.c_str());
+            QVERIFY2(std::fabs(grainSize(doubled) / grainSize(measured) - 2) < 0.3,
+                     qPrintable(QString("%1 for %2").arg(grainSize(doubled)).arg(grainSize(measured))));
+            for (int b = 1; b < GrainProfile::kBands; ++b)
+                QVERIFY2(std::fabs(dB(doubled.amplitude[1][b], measured.amplitude[1][b])) < 1,
+                         qPrintable(QString("band %1: %2 dB").arg(b).arg(dB(doubled.amplitude[1][b], measured.amplitude[1][b]))));
+            // At half the size, as weak as the plate's grain is with 2 x 2 pixels averaged (in each stripe, away from
+            // its edges).
+            auto half = [](const Image& img) {
+                Image out(img.width / 2, img.height / 2);
+                for (int y = 0; y < out.height; ++y)
+                    for (int x = 0; x < out.width; ++x)
+                        for (int k = 0; k < 4; ++k)
+                            out.at(x, y)[k] = (img.at(2 * x, 2 * y)[k] + img.at(2 * x + 1, 2 * y)[k] + img.at(2 * x, 2 * y + 1)[k] +
+                                               img.at(2 * x + 1, 2 * y + 1)[k]) / 4;
+                return out;
+            };
+            auto spreadIn = [&](const std::vector<Image>& frames, int k) {
+                double sum = 0, sq = 0, n = 0;
+                for (const Image& img : frames)
+                    for (int y = 0; y < img.height; ++y)
+                        for (int x = k * img.width / 8 + 3; x < (k + 1) * img.width / 8 - 3; ++x) {
+                            const double v = toLinear(space.transfer, img.at(x, y)[1]) - stripe[k];
+                            sum += v, sq += v * v, n += 1;
+                        }
+                return std::sqrt(std::max(0.0, sq / n - sum * sum / n / n));
+            };
+            std::vector<Image> smallPlate, smallMade;
+            for (int f = 0; f < kFrames; ++f) {
+                smallPlate.push_back(half(plate[size_t(f)]));
+                Image img = stripes(W / 2, H / 2);
+                applyVideoEffect(match, f, img, 1);
+                smallMade.push_back(std::move(img));
+            }
+            for (int k = 2; k < 8; ++k)
+                QVERIFY2(std::fabs(dB(spreadIn(smallMade, k), spreadIn(smallPlate, k))) < 1,
+                         qPrintable(QString("stripe %1: %2 dB").arg(k).arg(dB(spreadIn(smallMade, k), spreadIn(smallPlate, k)))));
+        }
+        // The mean picture (in linear light) moves by under 0.1 %.
+        {
+            Image grey(1024, 512);
+            grey.fill(0.5f, 0.5f, 0.5f, 1);
+            const Image flat = grey;
+            applyVideoEffect(match, 3, grey, 1);
+            double was = 0, now = 0;
+            for (size_t i = 0; i < grey.px.size(); i += 4) was += toLinear(space.transfer, flat.px[i + 1]), now += toLinear(space.transfer, grey.px[i + 1]);
+            QVERIFY2(std::fabs(now / was - 1) < 0.001, qPrintable(QString::number(now / was - 1)));
+            float moved = 0;
+            for (size_t i = 0; i < grey.px.size(); ++i) moved = std::max(moved, std::fabs(grey.px[i] - flat.px[i]));
+            QVERIFY(moved > 0.01f);  // (there is grain)
+        }
+        // Frame 100 alone and after 99 is the same, bit for bit; another frame or seed differs.
+        auto frame = [&](int t, double seed = 0) {
+            Effect e = match;
+            e.params["seed"] = seed;
+            Image img(320, 180);
+            img.fill(0.4f, 0.45f, 0.5f, 1);
+            applyVideoEffect(e, t, img, 1);
+            return img;
+        };
+        const Image alone = frame(100);
+        for (int t = 1; t <= 99; t += 7) frame(t);  // (more than the frames kept made since: frame 100 is made afresh)
+        frame(98);
+        frame(99);
+        QVERIFY(frame(100).px == alone.px);
+        QVERIFY(frame(101).px != alone.px && frame(100, 7).px != alone.px);
+        // A stock gauge: larger grain in Super 8 than 35 mm; 35 mm when nothing was measured.
+        QVERIFY(grainSize(stockGrain(3)) > 1.8 * grainSize(stockGrain(1)));
+        Effect stock = makeEffect(p, "grain_match");
+        QCOMPARE(grainProfileText(effectGrainProfile(stock)), grainProfileText(stockGrain(1)));
+        stock.params["source"] = 4.0;
+        QCOMPARE(grainProfileText(effectGrainProfile(stock)), grainProfileText(stockGrain(3)));
+
+        // A plate with its grain taken out and put back (Replace Grain): the grain matches the plate's within 0.75 dB.
+        std::vector<Image> regrained;
+        for (int f = 0; f < kFrames; ++f) {
+            std::vector<const Image*> around;
+            for (int k = std::max(0, f - kReplaceGrainFrames); k <= std::min(kFrames - 1, f + kReplaceGrainFrames); ++k)
+                if (k != f) around.push_back(&plate[size_t(k)]);
+            Image img = removeGrain(plate[size_t(f)], around, {}, space, measured);
+            Effect replace = match;
+            replace.params["mode"] = 1.0;
+            applyVideoEffect(replace, f, img, 1);
+            regrained.push_back(std::move(img));
+        }
+        GrainProfile replaced;
+        QVERIFY2(measureGrain(regrained, space, {}, replaced, &err), err.c_str());
+        for (int b = 0; b < GrainProfile::kBands; ++b)
+            qInfo("replaced band %d: %.2f dB", b, dB(replaced.amplitude[1][b], measured.amplitude[1][b]));
+        for (int b = 0; b < GrainProfile::kBands; ++b)
+            for (int c = 0; c < 3; ++c)
+                QVERIFY2(std::fabs(dB(replaced.amplitude[c][b], measured.amplitude[c][b])) < 0.75,
+                         qPrintable(QString("band %1 channel %2: %3 dB").arg(b).arg(c).arg(dB(replaced.amplitude[c][b], measured.amplitude[c][b]))));
+        // Too few frames, or nothing flat enough: refused.
+        QVERIFY(!measureGrain(std::vector<Image>(plate.begin(), plate.begin() + 6), space, {}, back, &err));
+        QVERIFY(!measureGrain(plate, space, {0, 0, 32, 32}, back, &err));
     }
 
     void magnifyChannelBlurNoise() {

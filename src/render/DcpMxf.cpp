@@ -1016,11 +1016,17 @@ bool TrackFileWriter::close(std::string* error) {
         const uint64_t indexAt = bodyStart + 140 + essenceBytes_;
         const Bytes index = indexSegments();
         const uint64_t footerAt = indexAt + 140 + index.size();
-        Bytes tail = partitionPack(ul("060e2b34020501010d01020101030400").data(), indexAt, bodyStart, footerAt, 0, index.size(), kIndexSid, 0);
+        // (After any generic stream partitions: a timed text document's resources.)
+        const uint64_t previous = streams_.empty() ? bodyStart : streams_.back().second;
+        Bytes tail = partitionPack(ul("060e2b34020501010d01020101030400").data(), indexAt, previous, footerAt, 0, index.size(), kIndexSid, 0);
         putBytes(tail, index);
         putBytes(tail, partitionPack(ul("060e2b34020501010d01020101040400").data(), footerAt, indexAt, footerAt, 0, 0, 0, 0));
+        std::vector<std::pair<uint32_t, uint64_t>> partitions = {{0, 0}, {kBodySid, bodyStart}};
+        partitions.insert(partitions.end(), streams_.begin(), streams_.end());
+        partitions.emplace_back(0, indexAt);
+        partitions.emplace_back(0, footerAt);
         Bytes rip;
-        for (auto [sid, at] : {std::pair<uint32_t, uint64_t>{0, 0}, {kBodySid, bodyStart}, {0, indexAt}, {0, footerAt}}) {
+        for (auto [sid, at] : partitions) {
             put32(rip, sid);
             put64(rip, at);
         }
@@ -1987,11 +1993,21 @@ std::vector<uint8_t> ImfSoundWriter::indexSegments() const {
 
 // ---- IMF timed text -----------------------------------------------------------------------------------------------
 
-bool ImfTimedTextWriter::write(const std::string& xml, int64_t duration, const std::string& language, std::string* error) {
+bool ImfTimedTextWriter::write(const std::string& xml, int64_t duration, const std::string& language, std::string* error,
+                               const std::vector<TimedTextResource>& resources) {
     resourceId_ = newUuid();
     duration_ = duration;
     language_ = language.empty() ? "en" : language;
-    return writeElement(ul(kTimedTextElement).data(), reinterpret_cast<const uint8_t*>(xml.data()), xml.size(), error);
+    image_ = xml.find(kImageProfile) != std::string::npos;
+    if (!writeElement(ul(kTimedTextElement).data(), reinterpret_cast<const uint8_t*>(xml.data()), xml.size(), error)) return false;
+    // Each resource in a generic stream partition of its own, streams 10, 11, ... in the descriptor's order.
+    uint32_t sid = 10;
+    for (const TimedTextResource& r : resources) {
+        resources_.emplace_back(r.id, r.mime);
+        resourceSets_.push_back(newUuid());
+        if (!startStream(sid++, error) || !writeElement(ul(kStreamElement).data(), r.data.data(), r.data.size(), error, false)) return false;
+    }
+    return true;
 }
 
 std::array<uint8_t, 16> ImfTimedTextWriter::essenceContainer() const { return ul(kTimedTextContainer); }
@@ -2004,6 +2020,7 @@ std::vector<uint8_t> ImfTimedTextWriter::headerMetadata(int64_t duration) const 
                               "File Package: SMPTE 429-5 clip wrapping of IMF Timed Text data"));
     Set s;
     s.uuid(0x3c0a, ids_[kDescriptor]);
+    if (!resourceSets_.empty()) s.refs(0xffff, resourceSets_);
     s.u32(0x3006, 1);
     s.rational(0x3001, rate_.num, rate_.den);
     s.i64(0x3002, duration);
@@ -2011,9 +2028,17 @@ std::vector<uint8_t> ImfTimedTextWriter::headerMetadata(int64_t duration) const 
     s.item(0x3e01, Bytes(16, 0));
     s.uuid(0xfffe, resourceId_);
     s.text(0xfffd, "UTF-8");
-    s.text(0xfffc, kProfile);
+    s.text(0xfffc, profile());
     s.text(0xfffb, language_);
     putBytes(out, setKlv(0x64, s));
+    for (size_t i = 0; i < resources_.size(); ++i) {
+        Set r;
+        r.uuid(0x3c0a, resourceSets_[i]);
+        r.uuid(0xfffa, resources_[i].first);
+        r.text(0xfff9, resources_[i].second);
+        r.u32(0x3f07, uint32_t(10 + i));
+        putBytes(out, setKlv(0x65, r));
+    }
     return out;
 }
 
@@ -2034,8 +2059,12 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
     op1a_ = rgba_ = j2k_ = false;
     elements_.clear();
     clipAt_ = clipSize_ = 0;
+    resources_.clear();
     File file;
     if (!openRead(file, path)) return fail("Cannot open " + path);
+    std::map<uint32_t, std::pair<uint64_t, uint64_t>> streamData;  // generic streams' elements, by body stream
+    std::vector<std::pair<Uuid, uint32_t>> streamOf;                // timed text resources' ids and streams
+    uint32_t stream = 0;                                            // the generic stream partition read last
     // Every KLV in turn: the header's sets (the file package's id, the sound's channels) and the essence elements
     // (06.0e.2b.34.01.02.01.01.0d.01.03.01, byte 12 the item: 15 picture, 16 sound, 17 data).
     bool sound = false, text = false;
@@ -2046,7 +2075,25 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
         const uint64_t value = at + head;
         static const uint8_t essence[12] = {0x06, 0x0e, 0x2b, 0x34, 0x01, 0x02, 0x01, 0x01, 0x0d, 0x01, 0x03, 0x01};
         static const uint8_t set[6] = {0x06, 0x0e, 0x2b, 0x34, 0x02, 0x53};
-        if (std::memcmp(key, essence, 12) == 0) {
+        if (std::memcmp(key, ul(kStreamPartition).data(), 16) == 0 && length >= 64) {
+            // (a generic stream partition: its BodySID, 60 bytes into the pack)
+            Bytes v(64);
+            if (!file.read(v.data(), v.size())) return fail(path + " is damaged");
+            stream = uint32_t(beOf(Bytes(v.begin() + 60, v.begin() + 64)));
+        } else if (std::memcmp(key, ul(kStreamElement).data(), 13) == 0) {
+            if (stream) streamData[stream] = {value, length};
+        } else if (std::memcmp(key, set, 6) == 0 && length < (1u << 20) && key[14] == 0x65) {
+            // A timed text resource: its id and stream.
+            Bytes v(static_cast<size_t>(length));
+            if (!file.read(v.data(), v.size())) return fail(path + " is damaged");
+            const auto it = items(v);
+            const auto id = it.find(0xfffa), sid = it.find(0x3f07);
+            if (id != it.end() && id->second.size() == 16 && sid != it.end() && sid->second.size() == 4) {
+                Uuid u;
+                std::copy(id->second.begin(), id->second.end(), u.begin());
+                streamOf.emplace_back(u, uint32_t(beOf(sid->second)));
+            }
+        } else if (std::memcmp(key, essence, 12) == 0) {
             // (past the header: what it said is all there is)
             if (imfPictureOnly && !(op1a_ && rgba_ && j2k_)) return fail(path + " is not an IMF picture track file");
             if (key[12] == 0x15) {
@@ -2104,7 +2151,24 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
     else if (sound && elements_.empty() && channels_ > 0 && channels_ <= 64) kind_ = Kind::Sound;
     else if (text && elements_.empty()) kind_ = Kind::TimedText;
     else return fail(path + " is not an IMF track file Montage reads");
+    for (const auto& [id, sid] : streamOf) {
+        const auto d = streamData.find(sid);
+        resources_.push_back({id, d == streamData.end() ? 0 : d->second.first, d == streamData.end() ? 0 : d->second.second, d != streamData.end()});
+    }
     return true;
+}
+
+bool ImfTrackReader::resource(const Uuid& id, std::vector<uint8_t>& out, std::string* error) const {
+    for (const Resource& r : resources_) {
+        if (r.id != id) continue;
+        File file;
+        if (!r.present || r.size > (uint64_t(64) << 20) || !openRead(file, path_) || !file.seek(r.at) || !file.fits(r.size)) break;
+        out.resize(size_t(r.size));
+        if (!file.read(out.data(), out.size())) break;
+        return true;
+    }
+    if (error) *error = "No resource " + uuidString(id) + " in " + path_;
+    return false;
 }
 
 uint64_t ImfTrackReader::largestFrame() const {

@@ -270,6 +270,7 @@ struct AvidBin {
     // Where each mob read is in `mobs` (the first of an ID), for findMob; mobs added later are searched one by one.
     std::map<AvidMobId, size_t> mobIndex;
     size_t indexedMobs = 0;
+    AvidMobId lastIndexed{};  // the last mob indexed: still in its place unless mobs were taken away since
 };
 
 bool readAvidBin(const std::string& path, AvidBin& out, std::string* error = nullptr);

@@ -65,6 +65,7 @@ public:
     bool isRecording() const;
     // The current cue's takes: pick one.
     void pickTake(int index);
+    void pickBestTake();  // the take core/TakeLanes.h suggestTake suggests for the cue's line
     // The guide's clip under the current cue (the voice Convert Voice… offers first); 0 for none.
     Id guideClip() const;
     // Align to Guide: the current cue's chosen take fitted to the guide's timing over the line (audio/DialogueAlign.h),
@@ -105,6 +106,7 @@ private:
     QPushButton* rehearse_;
     QPushButton* record_;
     QPushButton* stop_;
+    QPushButton* best_;
     QPushButton* convert_;
     QPushButton* align_;
     QProgressBar* meter_;

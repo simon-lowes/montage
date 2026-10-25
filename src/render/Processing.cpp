@@ -28,6 +28,7 @@
 #include "QualityCheck.h"
 #include "Restoration.h"
 #include "FilmScan.h"
+#include "GrainMatch.h"
 #include "LensBlur.h"
 #include "media/MotionData.h"
 #include "media/Tracking.h"
@@ -234,6 +235,22 @@ void curves(const Effect& e, FrameTime t, Image& img) {
 }
 
 void hueCurves(const Effect& e, FrameTime t, Image& img);  // below, beside the curve building
+
+void rgbMixer(const Effect& e, FrameTime t, Image& img) {
+    float m[9];
+    bool identity = true;
+    for (int o = 0; o < 3; ++o)
+        for (int i = 0; i < 3; ++i) {
+            const std::string name = std::string(1, "rgb"[o]) + "." + "rgb"[i];
+            m[o * 3 + i] = float(e.p(name, t, o == i ? 1 : 0));
+            identity = identity && m[o * 3 + i] == (o == i ? 1.0f : 0.0f);
+        }
+    if (identity) return;
+    perPixel(img, [&](float& r, float& g, float& b, float&) {
+        const float nr = m[0] * r + m[1] * g + m[2] * b, ng = m[3] * r + m[4] * g + m[5] * b, nb = m[6] * r + m[7] * g + m[8] * b;
+        r = nr, g = ng, b = nb;
+    });
+}
 void colorWarper(const Effect& e, FrameTime t, Image& img);  // below, as hue curves
 
 // HDR Palette: each pixel's brightness in stops from mid grey (0.18 of reference white, in the light the working space
@@ -361,6 +378,15 @@ const ColorSpace* applyInSpace(const Effect& e) {
 
 // `fn` run in `space`: the working space's code values into it and back exactly (linear light through its primaries and
 // curve, no display rendering), so only `fn` changes the picture; the round trip baked into a 65^3 LUT, kept for `key`.
+// A colour from one space's code values to another's exactly: linear light through the first's curve, its primaries
+// into the second's, out through the second's curve (no display rendering).
+void through(const double mat[9], Transfer a, Transfer b, float v[3]) {
+    double l[3], o[3];
+    for (int i = 0; i < 3; ++i) l[i] = toLinear(a, v[i]);
+    for (int i = 0; i < 3; ++i) o[i] = mat[i * 3] * l[0] + mat[i * 3 + 1] * l[1] + mat[i * 3 + 2] * l[2];
+    for (int i = 0; i < 3; ++i) v[i] = float(fromLinear(b, o[i]));
+}
+
 std::shared_ptr<const Lut3D> bakedInSpace(const ColorSpace& space, const std::string& key, const std::function<void(float[3])>& fn) {
     const ColorSpace& working = currentWorkingSpace();
     static std::mutex m;
@@ -373,12 +399,6 @@ std::shared_ptr<const Lut3D> bakedInSpace(const ColorSpace& space, const std::st
     double to[9], from[9];
     primariesMatrix(working.primaries, space.primaries, to);
     primariesMatrix(space.primaries, working.primaries, from);
-    auto through = [](const double mat[9], Transfer a, Transfer b, float v[3]) {
-        double l[3], o[3];
-        for (int i = 0; i < 3; ++i) l[i] = toLinear(a, v[i]);
-        for (int i = 0; i < 3; ++i) o[i] = mat[i * 3] * l[0] + mat[i * 3 + 1] * l[1] + mat[i * 3 + 2] * l[2];
-        for (int i = 0; i < 3; ++i) v[i] = float(fromLinear(b, o[i]));
-    };
     auto made = std::make_shared<Lut3D>();
     const int n = 65;
     made->size = n;
@@ -2210,6 +2230,7 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "chart_match") applyChartMatch(e, t, img);
     else if (ty == "curves") curves(e, t, img);
     else if (ty == "hue_curves") hueCurves(e, t, img);
+    else if (ty == "rgb_mixer") rgbMixer(e, t, img);
     else if (ty == "color_warper") colorWarper(e, t, img);
     else if (ty == "hdr_palette") hdrPalette(e, t, img);
     else if (ty == "hue_sat") hueSat(e, t, img);
@@ -2225,7 +2246,18 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
             if (cs.label == e.s("from")) from = &cs;
             if (cs.label == e.s("to")) to = &cs;
         }
-        if (from && to) convertColor(img, *from, *to);
+        if (from && to && e.s("rendering") == "None") {
+            // Exactly, as a LUT's "Apply In" goes into its space and back.
+            double mat[9];
+            primariesMatrix(from->primaries, to->primaries, mat);
+            if (from->id != to->id)
+                perPixel(img, [&](float& r, float& g, float& b, float&) {
+                    float v[3] = {r, g, b};
+                    through(mat, from->transfer, to->transfer, v);
+                    r = v[0], g = v[1], b = v[2];
+                });
+        } else if (from && to)
+            convertColor(img, *from, *to);
     } else if (ty == "ocio")
         applyOcio(e, img);
     else if (ty == "ofx")
@@ -2244,6 +2276,7 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
         broadcastSafe(img.px.data(), img.width, img.height, e.p("limits", t, 0) >= 0.5, e.p("knee", t, 5) / 100.0, e.p("highlight", t, 0) >= 0.5);
     else if (ty == "glow") vfx::glow(e, t, img, pixelScale);
     else if (ty == "film_grain") vfx::filmGrain(e, t, img, pixelScale);
+    else if (ty == "grain_match") grainMatch(e, t, img);
     else if (ty == "film_look") filmLook(img, filmLookSettings(e, t), t);
     else if (ty == "directional_blur") vfx::directionalBlur(e, t, img, pixelScale);
     else if (ty == "chromatic_aberration") vfx::chromaticAberration(e, t, img, pixelScale);
@@ -3385,5 +3418,9 @@ bool gpuColorOps(const Effect& e, FrameTime t, std::vector<gpu::ColorOp>& out, i
     out.push_back(std::move(op));
     return true;
 }
+
+std::function<void(float[3])> lutTransform(const std::string& path, std::string* error) { return lutFileTransform(path, error); }
+
+const ColorSpace* effectApplySpace(const Effect& e) { return applyInSpace(e); }
 
 }  // namespace montage

@@ -10,6 +10,8 @@
 
 #include "core/Ale.h"
 #include "core/FilmCount.h"
+#include "core/Paperwork.h"
+#include "core/Xlsx.h"
 #include <QtEndian>
 #include <cstring>
 #include "core/Cdl.h"
@@ -55,6 +57,7 @@
 #include "core/Provenance.h"
 #include "core/LensProfile.h"
 #include "core/AudioDescription.h"
+#include "core/TakeLanes.h"
 #include <QProcess>
 #include <QSysInfo>
 #include <QCoreApplication>
@@ -127,6 +130,271 @@ struct Fixture {
 class TestCore : public QObject {
     Q_OBJECT
 private slots:
+    void xlsxRoundTrip() {
+        XlsxSheet a;
+        a.name = "Music Cue Sheet";
+        a.rows = {{"Cue", "Title", "Seconds"},
+                  {XlsxCell::num(1), "Café, \"live\"", XlsxCell::num(12.5)},
+                  {XlsxCell::num(2), "Line one\nline two", ""},
+                  {XlsxCell::num(3), "<b>&amp;</b>", XlsxCell::num(-0.04)}};
+        a.widths = {6, 30, 9};
+        XlsxSheet b;
+        b.name = "Second";
+        b.header = false;
+        b.rows = {{"x"}, {"", "", "far right"}};
+        const std::string bytes = writeXlsx({a, b});
+        std::vector<XlsxSheet> back;
+        std::string err;
+        QVERIFY2(readXlsx(bytes, back, &err), err.c_str());
+        QCOMPARE(back.size(), size_t(2));
+        QCOMPARE(QString::fromStdString(back[0].name), QString("Music Cue Sheet"));
+        QCOMPARE(back[0].rows.size(), a.rows.size());
+        for (size_t r = 0; r < a.rows.size(); ++r)
+            for (size_t c = 0; c < a.rows[r].size(); ++c) {
+                // An empty cell reads back as none (or an empty one).
+                const XlsxCell got = c < back[0].rows[r].size() ? back[0].rows[r][c] : XlsxCell();
+                QVERIFY2(got == a.rows[r][c], qPrintable(QStringLiteral("row %1 column %2: %3").arg(r).arg(c).arg(QString::fromStdString(got.text))));
+            }
+        QCOMPARE(back[0].rows[1][2].value, 12.5);
+        QCOMPARE(back[1].rows.size(), size_t(2));
+        QCOMPARE(QString::fromStdString(back[1].rows[1].back().text), QString("far right"));
+        QCOMPARE(back[1].rows[1].size(), size_t(3));  // the cell in column C stays in column C
+        QCOMPARE(xlsxColumn(0), std::string("A"));
+        QCOMPARE(xlsxColumn(27), std::string("AB"));
+        // Not a workbook.
+        QVERIFY(!readXlsx("PK not really", back, &err));
+        // What XML cannot carry is left out (a malformed byte read as a replacement character); long names are cut
+        // on a character, and names differing only in case are told apart.
+        XlsxSheet odd;
+        odd.name = "Ünïcödé names that run on far too long for a sheet";
+        odd.rows = {{std::string("a\xEF\xBF\xBF" "b\x01" "c\xC3"), "\xF0\x9F\x8E\xB5 music"}};
+        XlsxSheet lower = a;
+        lower.name = "music cue sheet";
+        QVERIFY2(readXlsx(writeXlsx({a, lower, odd}), back, &err), err.c_str());
+        QCOMPARE(back.size(), size_t(3));
+        QVERIFY(back[1].name != back[0].name);
+        QCOMPARE(QString::fromStdString(back[2].name).size(), qsizetype(31));
+        QCOMPARE(QString::fromStdString(back[2].rows[0][0].text), QString::fromUtf8("abc\xEF\xBF\xBD"));
+        QCOMPARE(QString::fromStdString(back[2].rows[0][1].text), QString::fromUtf8("\xF0\x9F\x8E\xB5 music"));
+        // A row past a workbook's last is refused, not allocated.
+        {
+            ZipReader in;
+            QVERIFY(in.open(writeXlsx({b})));
+            ZipWriter out;
+            for (const char* name : {"[Content_Types].xml", "_rels/.rels", "xl/workbook.xml", "xl/_rels/workbook.xml.rels", "xl/styles.xml"}) {
+                std::string part;
+                QVERIFY(in.read(name, part));
+                out.add(name, part);
+            }
+            out.add("xl/worksheets/sheet1.xml", "<?xml version=\"1.0\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+                                                 "<sheetData><row r=\"2000000000\"><c r=\"A2000000000\" t=\"inlineStr\"><is><t>x</t></is></c></row>"
+                                                 "</sheetData></worksheet>");
+            QVERIFY(!readXlsx(out.finish(), back, &err));
+            QVERIFY2(QString::fromStdString(err).contains("rows past"), err.c_str());
+        }
+    }
+
+    void musicCueSheet() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {24, 1};
+        s.audioTracks.resize(3);
+        auto music = [&](const char* name) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Audio;
+            m.hasAudio = true;
+            m.duration = 120;
+            m.name = name;
+            m.path = std::string("/music/") + name + ".flac";
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id a = music("Opening"), b = music("Chase"), c = music("Sting"), speech = music("Interview");
+        auto place = [&](int track, Id media, FrameTime at, FrameTime length, double sourceIn, const char* role) {
+            Clip clip;
+            clip.id = p.newId();
+            clip.mediaId = media;
+            clip.start = at;
+            clip.duration = length;
+            clip.sourceIn = sourceIn;
+            clip.role = role;
+            s.audioTracks[size_t(track)].clips.push_back(clip);
+        };
+        // The opening cut into twice (a jump in the music, then a half-second gap): one cue of 300 frames.
+        place(0, a, 0, 100, 0, "Music");
+        place(0, a, 100, 100, 480, "Music");
+        place(0, a, 212, 88, 600, "Music");
+        // The chase runs on under a picture cut: one cue.
+        place(0, b, 300, 240, 0, "Music");
+        Clip shot1, shot2;
+        shot1.id = p.newId(), shot1.start = 250, shot1.duration = 150;
+        shot2.id = p.newId(), shot2.start = 400, shot2.duration = 200;
+        s.videoTracks[0].clips = {shot1, shot2};
+        // The sting has no role, but its tags say it is music.
+        place(1, c, 700, 120, 0, "");
+        // Dialogue is not music; a muted track is not heard.
+        place(1, speech, 0, 600, 0, "Dialogue");
+        place(2, b, 900, 100, 0, "Music");
+        s.audioTracks[2].muted = true;
+        for (MediaItem& m : p.media)
+            if (m.id == b) m.metadata[cueMetadataKey("publisher")] = "Own Publishing";  // the panel's word over the tag
+        const MusicTagReader tags = [&](const MediaItem& m) -> std::map<std::string, std::string> {
+            if (m.id == a) return {{"composer", "A. Writer"}, {"publisher", "Alpha Music"}, {"isrc", "GBAAA2600001"}};
+            if (m.id == b) return {{"title", "The Chase"}, {"composer", "B. Writer"}, {"publisher", "Beta Music"}};
+            if (m.id == c) return {{"composer", "C. Writer"}, {"publisher", "Gamma Music"}};
+            return {};
+        };
+        const std::vector<MusicCue> cues = musicCues(p, s, tags);
+        QCOMPARE(cues.size(), size_t(3));
+        QCOMPARE(cues[0].mediaId, a);
+        QCOMPARE(cues[0].in, FrameTime(0));
+        QCOMPARE(cues[0].duration(), FrameTime(300));
+        QCOMPARE(cues[0].clips, 3);
+        QCOMPARE(QString::fromStdString(cues[0].fields.at("title")), QString("Opening"));  // its file's name
+        QCOMPARE(QString::fromStdString(cues[0].fields.at("composer")), QString("A. Writer"));
+        QCOMPARE(QString::fromStdString(cues[0].fields.at("isrc")), QString("GBAAA2600001"));
+        QCOMPARE(cues[1].mediaId, b);
+        QCOMPARE(cues[1].in, FrameTime(300));
+        QCOMPARE(cues[1].duration(), FrameTime(240));
+        QCOMPARE(QString::fromStdString(cues[1].fields.at("title")), QString("The Chase"));
+        QCOMPARE(QString::fromStdString(cues[1].fields.at("publisher")), QString("Own Publishing"));
+        QCOMPARE(cues[2].mediaId, c);
+        QCOMPARE(cues[2].duration(), FrameTime(120));
+        QCOMPARE(QString::fromStdString(cues[2].fields.at("publisher")), QString("Gamma Music"));
+        QCOMPARE(QString::fromStdString(cues[2].use), QString("background"));
+        // As a table: the duration as timecode and in seconds.
+        const XlsxSheet t = cueSheetTable(cues, s);
+        QCOMPARE(t.rows.size(), size_t(4));
+        QCOMPARE(QString::fromStdString(t.rows[2][14].text), QString("00:00:10:00"));
+        QCOMPARE(t.rows[2][15].value, 10.0);
+        // A wrong tag blanked by the panel stays blank.
+        for (MediaItem& m : p.media)
+            if (m.id == c) m.metadata[cueMetadataKey("publisher")] = "";
+        QCOMPARE(QString::fromStdString(musicCues(p, s, tags)[2].fields.at("publisher")), QString());
+        // Marked not music, the sting is gone; a muted role takes the rest.
+        for (MediaItem& m : p.media)
+            if (m.id == c) m.metadata[kCueMusic] = "no";
+        QCOMPARE(musicCues(p, s, tags).size(), size_t(2));
+        edit::setRoleMuted(s, "Music", true);
+        QVERIFY(musicCues(p, s, tags).empty());
+        // CSV quotes what needs it.
+        XlsxSheet q;
+        q.rows = {{"a,b", "say \"hi\"", "plain"}};
+        QCOMPARE(tableCsv(q), std::string("\"a,b\",\"say \"\"hi\"\"\",plain\r\n"));
+    }
+
+    void dialogueListAndCcsl() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {24, 1};
+        s.filmGauge = "35mm-4perf";
+        auto footage = [&](const char* name, const char* scene, float faceHeight, bool looked) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Video;
+            m.hasVideo = true;
+            m.duration = 60;
+            m.name = name;
+            m.path = std::string("/shoot/") + name + ".mov";
+            if (scene) m.metadata["scene"] = scene;
+            if (looked) {
+                auto faces = std::make_shared<FaceIndex>();
+                faces->step = 1;
+                if (faceHeight > 0)
+                    for (int i = 0; i < 60; ++i) {
+                        FaceIndex::Face f;
+                        f.time = i;
+                        f.h = faceHeight;
+                        faces->faces.push_back(f);
+                    }
+                m.faces = faces;
+            }
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id close = footage("close", "12", 0.42f, true), mid = footage("mid", "12", 0.18f, true),
+                 wide = footage("wide", "13", 0, true), unknown = footage("unknown", "13", 0, false);
+        for (MediaItem& m : p.media)
+            if (m.id == wide) m.shots.push_back({0, 60, "A street at night"});
+        // Dialogue in the close-up's transcript, two speakers.
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment one, two;
+        one.speaker = 0;
+        one.words = {{0.5, 0.9, "Where", 1}, {1.0, 1.3, "were", 1}, {1.4, 1.8, "you?", 1}};
+        two.speaker = 1;
+        two.words = {{2.5, 2.8, "Out.", 1}};
+        t->segments = {one, two};
+        t->speakerNames = {"Anna", "Ben"};
+        for (MediaItem& m : p.media)
+            if (m.id == close) m.transcript = t;
+        auto shot = [&](Id media, FrameTime at, FrameTime length) {
+            Clip c;
+            c.id = p.newId();
+            c.mediaId = media;
+            c.start = at;
+            c.duration = length;
+            c.name = p.findMedia(media)->name;
+            s.videoTracks[0].clips.push_back(c);
+        };
+        shot(close, 0, 96);     // 4 s
+        shot(mid, 96, 48);
+        shot(wide, 144, 72);
+        shot(unknown, 216, 40);
+        CaptionTrack subs;
+        Caption cap;
+        cap.start = 12, cap.end = 44, cap.text = "Where were you?";
+        subs.captions.push_back(cap);
+        s.captionTracks.push_back(subs);
+
+        const std::vector<DialogueEntry> list = dialogueList(p, s);
+        // Scene 12, two lines, scene 13 (with the shot's description).
+        QCOMPARE(list.size(), size_t(4));
+        QCOMPARE(int(list[0].kind), int(DialogueEntry::Kind::Scene));
+        QCOMPARE(QString::fromStdString(list[0].text), QString("SCENE 12"));
+        QCOMPARE(list[0].out, FrameTime(144));
+        QCOMPARE(QString::fromStdString(list[1].speaker), QString("Anna"));
+        QCOMPARE(QString::fromStdString(list[1].text), QString("Where were you?"));
+        QCOMPARE(list[1].in, FrameTime(12));
+        QCOMPARE(list[1].out, FrameTime(44));  // 1.8 s, rounded up
+        QCOMPARE(QString::fromStdString(list[2].speaker), QString("Ben"));
+        QCOMPARE(list[2].in, FrameTime(60));
+        QCOMPARE(QString::fromStdString(list[3].text), QString("SCENE 13"));
+        QCOMPARE(QString::fromStdString(list[3].description), QString("A street at night"));
+        const std::string script = asBroadcastScript(list, s);
+        QVERIFY(script.find("00:00:00:12  ANNA\n") != std::string::npos);
+        QVERIFY(script.find("SCENE 13 - A street at night") != std::string::npos);
+
+        const std::vector<CcslShot> shots = ccsl(p, s);
+        QCOMPARE(shots.size(), size_t(4));
+        QCOMPARE(QString::fromStdString(shots[0].shotSize), QString("CU"));
+        QCOMPARE(QString::fromStdString(shots[1].shotSize), QString("MS"));
+        QCOMPARE(QString::fromStdString(shots[2].shotSize), QString("WS"));
+        QCOMPARE(QString::fromStdString(shots[3].shotSize), QString());  // faces never looked for
+        // 16 frames to the foot: the second shot from 6+00 to its last frame 8+15, 3 feet long.
+        QCOMPARE(QString::fromStdString(shots[1].footageIn), QString("6+00"));
+        QCOMPARE(QString::fromStdString(shots[1].footageOut), QString("8+15"));
+        QCOMPARE(QString::fromStdString(shots[1].length), QString("3+00"));
+        QCOMPARE(shots[0].dialogue.size(), size_t(2));
+        QCOMPARE(shots[0].subtitles.size(), size_t(1));
+        QCOMPARE(QString::fromStdString(shots[2].description), QString("A street at night"));
+        // 16 mm counts 40 frames to the foot.
+        QCOMPARE(QString::fromStdString(ccsl(p, s, "16mm")[1].footageIn), QString("2+16"));
+        const XlsxSheet table = ccslTable(shots, s);
+        QCOMPARE(table.rows.size(), size_t(5));
+        QCOMPARE(QString::fromStdString(table.rows[1][8].text), QString("Anna: Where were you?\nBen: Out."));
+        // A shot played on across a cut in the clip is one shot.
+        Sequence& seq = *p.active();
+        Clip second = seq.videoTracks[0].clips[1];
+        seq.videoTracks[0].clips[1].duration = 20;
+        second.id = p.newId();
+        second.start = 116;
+        second.duration = 28;
+        second.sourceIn = 20;
+        seq.videoTracks[0].clips.push_back(second);
+        QCOMPARE(ccsl(p, seq).size(), size_t(4));
+    }
+
     void numbersAndStressForSpeech() {
         QCOMPARE(numberWords(0), std::string("zero"));
         QCOMPARE(numberWords(42), std::string("forty-two"));
@@ -9939,6 +10207,181 @@ private slots:
         QVERIFY(err.find("ColorCorrectionRef") != std::string::npos);
     }
 
+    void takesOnLanes() {
+        // Three takes of a 6 s line recorded in a loop from 1 s (30 fps), as lanes on A1.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        std::vector<Id> media;
+        for (int k = 1; k <= 3; ++k) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Audio;
+            m.name = "Take " + std::to_string(k) + ".wav";
+            m.path = "/nonexistent/take" + std::to_string(k) + ".wav";
+            m.duration = 6.0;
+            m.hasAudio = true;
+            p.media.push_back(m);
+            media.push_back(m.id);
+        }
+        // The passes of a loop recording: whole ones, a short last one kept only from a second, none drifting at 29.97.
+        {
+            const auto passes = loopPasses(48000 + 3 * 288000 + 30000, 48000, 288000.0, 48000);
+            QCOMPARE(passes.size(), size_t(3));
+            QCOMPARE(passes[2].first, int64_t(48000 + 2 * 288000));
+            QVERIFY(passes[2].complete);
+            QCOMPARE(loopPasses(48000 + 3 * 288000 + 50000, 48000, 288000.0, 48000).back().complete, false);
+            const double ntsc = 180 * 48000 * 1001.0 / 30000;  // 180 frames at 29.97
+            const auto drift = loopPasses(int64_t(10 * ntsc) + 10, 0, ntsc);
+            QCOMPARE(drift.size(), size_t(10));
+            QCOMPARE(drift[9].first, std::llround(9 * ntsc));
+        }
+        const TrackRef a1{TrackKind::Audio, 0};
+        const edit::Result added = edit::addLoopTakes(p, s, a1, media, {true, true, true}, 30, 210);
+        QVERIFY2(added.ok, added.error.c_str());
+        QCOMPARE(added.created.size(), size_t(4));  // three lanes and the comp of the last
+        const Track& t = s.audioTracks[0];
+        QCOMPARE(t.lanes.size(), size_t(3));
+        QCOMPARE(t.lanes[1].name, std::string("Take 2"));
+        QCOMPARE(t.lanes[2].start, FrameTime(30));
+        QCOMPARE(t.clips.size(), size_t(1));
+        QCOMPARE(compLaneOf(t, t.clips[0]), t.lanes[2].id);
+        const Id take1 = t.lanes[0].id, take2 = t.lanes[1].id, take3 = t.lanes[2].id;
+        // The comp: take 1 for 0-2 s of the line, take 3 for 2-4 s, take 2 for 4-6 s; a crossfade at each join.
+        QVERIFY(edit::compTake(p, s, a1, take1, 30, 90).ok);
+        QVERIFY(edit::compTake(p, s, a1, take2, 150, 210).ok);
+        auto comp = [&] {
+            std::vector<std::tuple<FrameTime, FrameTime, Id, double>> out;
+            const Track& at = p.active()->audioTracks[0];  // (undo replaces the sequence)
+            for (const Clip& c : at.clips) out.push_back({c.start, c.end(), compLaneOf(at, c), c.sourceIn});
+            return out;
+        };
+        using Seg = std::tuple<FrameTime, FrameTime, Id, double>;
+        QCOMPARE(comp(), (std::vector<Seg>{{30, 90, take1, 0.0}, {90, 150, take3, 60.0}, {150, 210, take2, 120.0}}));
+        QCOMPARE(s.audioTracks[0].transitions.size(), size_t(2));
+        for (const Transition& tr : s.audioTracks[0].transitions) {
+            QCOMPARE(tr.type, std::string("crossfade"));
+            QCOMPARE(tr.params.p("seconds", 0, 0), kCompCrossfadeSeconds);
+            QVERIFY(tr.clipA && tr.clipB);
+        }
+        QVERIFY(!edit::compTake(p, s, a1, take1, 10, 40).ok);   // before the take
+        QVERIFY(!edit::compTake(p, s, a1, take1, 200, 220).ok);  // past it
+        // The join at 2 s moved half a second later: both sides go, take 3 starting further in; the crossfade stays.
+        QVERIFY(edit::moveCompJoin(p, s, a1, 90, 15).ok);
+        QCOMPARE(comp(), (std::vector<Seg>{{30, 105, take1, 0.0}, {105, 150, take3, 75.0}, {150, 210, take2, 120.0}}));
+        QCOMPARE(s.audioTracks[0].transitions.size(), size_t(2));
+        QVERIFY(!edit::moveCompJoin(p, s, a1, 100, 5).ok);  // no join there
+        QVERIFY(edit::setCompCrossfade(p, s, a1, 150, 0.05).ok);
+        const auto joinAt150 = std::find_if(s.audioTracks[0].transitions.begin(), s.audioTracks[0].transitions.end(),
+                                            [&](const Transition& tr) { return edit::clipById(s, tr.clipB)->start == 150; });
+        QVERIFY(joinAt150 != s.audioTracks[0].transitions.end() && std::fabs(joinAt150->params.p("seconds", 0, 0) - 0.05) < 1e-12);
+        {
+            // Centred on the cut, a crossfade is at most twice the shorter clip (45 frames here); comping a stretch of
+            // the take already there puts none inside it; dragged on the timeline it is as long as drawn.
+            Project q = p;
+            Sequence& qs = *q.active();
+            auto fadeAt = [&](FrameTime at) -> const Transition* {
+                for (const Transition& tr : qs.audioTracks[0].transitions)
+                    if (edit::clipById(qs, tr.clipB)->start == at) return &tr;
+                return nullptr;
+            };
+            QVERIFY(edit::setCompCrossfade(q, qs, a1, 150, 9.0).ok);
+            QCOMPARE(fadeAt(150)->params.p("seconds", 0, 0), 3.0);
+            QVERIFY(edit::compTake(q, qs, a1, take1, 60, 90).ok);
+            QCOMPARE(qs.audioTracks[0].clips.size(), size_t(5));
+            QCOMPARE(qs.audioTracks[0].transitions.size(), size_t(2));
+            QVERIFY(!edit::compTake(q, qs, a1, take1, 60, 90, -1).ok);
+            QVERIFY(edit::setTransitionDuration(qs, fadeAt(150)->id, 6).ok);
+            QVERIFY(!fadeAt(150)->params.params.count("seconds"));
+        }
+        // Named and rated; the lanes and the comp saved and read back, and undone.
+        QVERIFY(edit::renameTakeLane(s, a1, take3, "Best").ok);
+        QVERIFY(edit::rateTakeLane(s, a1, take3, 4).ok);
+        History h;
+        h.push("Comp", p);
+        QVERIFY(edit::compTake(p, s, a1, take1, 150, 210).ok);
+        QVERIFY(h.undo(p));
+        QCOMPARE(comp(), (std::vector<Seg>{{30, 105, take1, 0.0}, {105, 150, take3, 75.0}, {150, 210, take2, 120.0}}));
+        QTemporaryDir dir;
+        const std::string file = (dir.path() + "/takes.montage").toStdString();
+        QVERIFY(saveProject(p, file));
+        Project back;
+        QVERIFY(loadProject(file, back));
+        QCOMPARE(back.active()->audioTracks[0].lanes, p.active()->audioTracks[0].lanes);
+        QCOMPARE(back.active()->audioTracks[0].clips, p.active()->audioTracks[0].clips);
+        QCOMPARE(back.active()->audioTracks[0].transitions, p.active()->audioTracks[0].transitions);
+        QCOMPARE(back.active()->audioTracks[0].lanes[2].rating, 4);
+        // Versions: the comp kept as version 1, a copy changed as version 2; switching back restores it exactly.
+        Sequence& sv = *p.active();
+        const Track before = sv.audioTracks[0];
+        QVERIFY(edit::newTrackVersion(p, sv, a1, "Alt").ok);
+        QCOMPARE(sv.audioTracks[0].versions.size(), size_t(2));
+        QCOMPARE(sv.audioTracks[0].version, 1);
+        QCOMPARE(sv.audioTracks[0].clips.size(), size_t(3));
+        QVERIFY(sv.audioTracks[0].clips[0].id != before.clips[0].id);
+        QVERIFY(edit::compTake(p, sv, a1, take1, 30, 210).ok);
+        QCOMPARE(sv.audioTracks[0].clips.size(), size_t(1));
+        QVERIFY(edit::switchTrackVersion(sv, a1, 0).ok);
+        QCOMPARE(sv.audioTracks[0].clips, before.clips);
+        QCOMPARE(sv.audioTracks[0].transitions, before.transitions);
+        QVERIFY(!edit::deleteTrackVersion(sv, a1, 0).ok);  // the one shown
+        {
+            // Saved with both versions; a copy of the sequence renews every id, the other version's too.
+            QVERIFY(saveProject(p, file));
+            Project again;
+            QVERIFY(loadProject(file, again));
+            QCOMPARE(again.active()->audioTracks[0].versions, sv.audioTracks[0].versions);
+            const Id copy = edit::duplicateSequence(again, again.activeSequence, "Copy");
+            const Track& ct = again.findSequence(copy)->audioTracks[0];
+            QCOMPARE(ct.versions.size(), size_t(2));
+            QVERIFY(ct.versions[1].clips.size() == 1 && ct.versions[1].clips[0].id != sv.audioTracks[0].versions[1].clips[0].id);
+            QVERIFY(ct.lanes[0].id != take1);
+            QCOMPARE(compLaneOf(ct, ct.clips[0]), ct.lanes[0].id);
+        }
+        QVERIFY(edit::switchTrackVersion(sv, a1, 1).ok);
+        QCOMPARE(sv.audioTracks[0].clips.size(), size_t(1));
+        QVERIFY(edit::switchTrackVersion(sv, a1, 0).ok);
+        QVERIFY(edit::deleteTrackVersion(sv, a1, 1).ok);
+        QVERIFY(sv.audioTracks[0].versions.empty());
+        QCOMPARE(sv.audioTracks[0].clips, before.clips);
+        // The lanes as shown: the three takes, then an audition's other takes at its place.
+        {
+            Project q = p;
+            Sequence& qs = *q.active();
+            Clip v = makeClip(q, *q.findMedia(media[0]), TrackKind::Audio, qs);
+            v.start = 300;
+            v.duration = 30;
+            QVERIFY(edit::overwrite(q, qs, a1, v).ok);
+            QVERIFY(edit::addTakes(q, qs, v.id, {{media[1], 0.0}}).ok);
+            const std::vector<LaneView> views = laneViews(q, qs, a1);
+            QCOMPARE(views.size(), size_t(4));
+            QCOMPARE(views[3].clip, v.id);
+            QCOMPARE(views[3].start, FrameTime(300));
+        }
+        // The take that says the line, and among those that do equally, one that does not clip.
+        {
+            std::vector<TakeCandidate> c(3);
+            for (auto& x : c) x.transcribed = true, x.rmsDb = -20;
+            c[0].name = "Take 1", c[0].said = "Ask not what your country can do";
+            c[1].name = "Take 2", c[1].said = "Ask not what your country can do for you.";
+            c[2].name = "Take 3", c[2].said = "ask not what you're country can do for you";
+            const std::string line = "Ask not what your country can do for you";
+            QCOMPARE(lineWordErrors(c[1].said, line), 0);
+            QCOMPARE(lineWordErrors(c[0].said, line), 2);
+            QCOMPARE(lineWordErrors(c[2].said, line), 1);
+            std::string why;
+            QCOMPARE(suggestTake(c, line, &why), 1);
+            QVERIFY2(why.find("Take 2") != std::string::npos, why.c_str());
+            c[2].said = c[1].said;
+            c[1].clippedSeconds = 0.2;
+            QCOMPARE(suggestTake(c, line), 2);
+            QCOMPARE(suggestTake({}, line), -1);
+        }
+        // A lane's media must have sound; a locked track takes no lanes.
+        QVERIFY(!edit::addTakeLane(p, sv, {TrackKind::Video, 0}, media[0], 0).ok);
+        sv.audioTracks[0].locked = true;
+        QVERIFY(!edit::compTake(p, sv, a1, take1, 30, 60).ok);
+    }
+
     void interchangeCompoundAndMulticam() {
         Project p = makeDefaultProject();
         auto addMedia = [&](const char* name, bool video, bool audio) {
@@ -10058,6 +10501,24 @@ private slots:
         QCOMPARE(files, 4);
         // The project's sequence is found even with compound sequences written before it.
         QCOMPARE(back.duration(), FrameTime(130));
+        // The lav's angle placed to the sample (a head and a tail): its times in samples, read back the same.
+        {
+            Project ps = p;
+            Sequence& msq = *ps.findSequence(ps.findMedia(mcMedia)->sequenceId);
+            Clip& lavClip = msq.audioTracks.at(2).clips.at(0);
+            lavClip.start = 3;
+            lavClip.head = 0.25;
+            lavClip.tail = 0.5;
+            const std::string sx = exportFcpXml(ps, *ps.active());
+            Project qs = makeDefaultProject();
+            ImportResult rs = importXmlTimeline(qs, sx);
+            QVERIFY2(rs.ok, rs.error.c_str());
+            const Sequence* mcs = qs.findSequence(qs.findMedia(trackAt(*qs.findSequence(rs.sequence), V1)->clips.at(0).mediaId)->sequenceId);
+            const Clip& got = mcs->audioTracks.at(2).clips.at(0);
+            QVERIFY2(got.start == 3 && got.duration == lavClip.duration && std::fabs(got.head - 0.25) < 1e-3 &&
+                         std::fabs(got.tail - 0.5) < 1e-3 && std::fabs(got.sourceIn - lavClip.sourceIn) < 1e-3,
+                     qPrintable(QString("start %1 duration %2 head %3 tail %4 in %5").arg(got.start).arg(got.duration).arg(got.head).arg(got.tail).arg(got.sourceIn)));
+        }
 
         // As Final Cut writes them: random angle ids, an hour's timecode start, picture from one angle and sound from
         // another, a compound clip of sound alone.

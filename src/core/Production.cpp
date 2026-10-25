@@ -135,38 +135,45 @@ std::vector<Id> importFromProject(Project& into, const Project& from, const std:
     for (Id id : order) {
         Sequence s = *from.findSequence(id);
         for (auto* list : {&s.videoTracks, &s.audioTracks})
-            for (Track& t : *list)
-                for (Clip& c : t.clips) {
-                    // The clip's media and its other takes (auditions).
-                    auto remap = [&](Id& mediaId) {
-                        if (!mediaId) return;
-                        const MediaItem* m = from.findMedia(mediaId);
-                        if (m && m->kind == MediaKind::Sequence) {
-                            const auto it = sequenceMedia.find(m->sequenceId);
-                            mediaId = it == sequenceMedia.end() ? 0 : it->second;
-                        } else {
-                            mediaId = bring(mediaId);
-                        }
-                    };
-                    // A graphic's media fields name the other project's media: brought along too.
-                    if (const MediaItem* gm = c.mediaId ? from.findMedia(c.mediaId) : nullptr; gm && gm->kind == MediaKind::Sequence)
-                        if (const Sequence* g = from.findSequence(gm->sequenceId))
-                            for (const TemplateField& f : g->fields)
-                                if (const auto it = c.fields.find(f.id); f.kind == "media" && it != c.fields.end()) {
-                                    if (const Id brought = bring(Id(std::strtoull(it->second.c_str(), nullptr, 10)))) it->second = std::to_string(brought);
-                                    else c.fields.erase(it);
-                                }
-                    remap(c.mediaId);
-                    for (Take& tk : c.takes) remap(tk.mediaId);
-                    // A Dialogue Alignment names the take it was made for (audio/DialogueAlign.h): its media's new id.
-                    std::erase_if(c.effects, [&](Effect& e) {
-                        if (e.type != "dialogue_align" || e.s("media").empty()) return false;
-                        Id made = Id(std::strtoull(e.s("media").c_str(), nullptr, 10));
-                        remap(made);
-                        e.strings["media"] = std::to_string(made);
-                        return made == 0;
-                    });
-                }
+            for (Track& t : *list) {
+                std::vector<std::vector<Clip>*> clipLists{&t.clips};  // the track's, and its other versions'
+                for (TrackVersion& v : t.versions) clipLists.push_back(&v.clips);
+                // Take lanes bring their media; one whose media did not come is dropped.
+                for (TakeLane& l : t.lanes) l.mediaId = bring(l.mediaId);
+                std::erase_if(t.lanes, [](const TakeLane& l) { return !l.mediaId; });
+                for (std::vector<Clip>* clips : clipLists)
+                    for (Clip& c : *clips) {
+                        // The clip's media and its other takes (auditions).
+                        auto remap = [&](Id& mediaId) {
+                            if (!mediaId) return;
+                            const MediaItem* m = from.findMedia(mediaId);
+                            if (m && m->kind == MediaKind::Sequence) {
+                                const auto it = sequenceMedia.find(m->sequenceId);
+                                mediaId = it == sequenceMedia.end() ? 0 : it->second;
+                            } else {
+                                mediaId = bring(mediaId);
+                            }
+                        };
+                        // A graphic's media fields name the other project's media: brought along too.
+                        if (const MediaItem* gm = c.mediaId ? from.findMedia(c.mediaId) : nullptr; gm && gm->kind == MediaKind::Sequence)
+                            if (const Sequence* g = from.findSequence(gm->sequenceId))
+                                for (const TemplateField& f : g->fields)
+                                    if (const auto it = c.fields.find(f.id); f.kind == "media" && it != c.fields.end()) {
+                                        if (const Id brought = bring(Id(std::strtoull(it->second.c_str(), nullptr, 10)))) it->second = std::to_string(brought);
+                                        else c.fields.erase(it);
+                                    }
+                        remap(c.mediaId);
+                        for (Take& tk : c.takes) remap(tk.mediaId);
+                        // A Dialogue Alignment names the take it was made for (audio/DialogueAlign.h): its media's new id.
+                        std::erase_if(c.effects, [&](Effect& e) {
+                            if (e.type != "dialogue_align" || e.s("media").empty()) return false;
+                            Id made = Id(std::strtoull(e.s("media").c_str(), nullptr, 10));
+                            remap(made);
+                            e.strings["media"] = std::to_string(made);
+                            return made == 0;
+                        });
+                    }
+            }
         // In under a temporary id, then copied with new ids for everything in it (tracks, clips, links, effects).
         s.id = into.newId();
         const Id temp = s.id;

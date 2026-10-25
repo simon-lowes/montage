@@ -4,6 +4,8 @@
 #include "LiveBridge.h"
 #include "LiveLink.h"
 #include "render/FilmLists.h"
+#include "render/PaperworkOutput.h"
+#include "render/ImageSubtitles.h"
 #include "render/DcpSecurity.h"
 #include "render/OGraf.h"
 #include "render/Ofx.h"
@@ -105,6 +107,8 @@
 #include "media/Exr.h"
 #include "render/Amf.h"
 #include "render/LutExport.h"
+#include "render/GrainMatch.h"
+#include "render/LutToGrade.h"
 #include "media/LtcTimecode.h"
 #include "media/TextReader.h"
 #include "media/Decoder.h"
@@ -154,6 +158,8 @@
 #include "control/Midi.h"
 #include "MulticamPanel.h"
 #include "AdrPanel.h"
+#include "MonitoringPanel.h"
+#include "CueSheetPanel.h"
 #include "LinedScriptPanel.h"
 #include "AudioDescriptionDialog.h"
 #include "FootageNotesDialog.h"
@@ -214,6 +220,7 @@
 #include "render/Letterbox.h"
 #include "render/LightLevel.h"
 #include "render/Hdr10Plus.h"
+#include "render/AdaptiveHdr.h"
 #include "render/Versions.h"
 #include "media/MicBleed.h"
 #include "media/Sofa.h"
@@ -460,6 +467,10 @@ void MainWindow::buildPanels() {
         inspectorDock_->show();
         inspectorDock_->raise();
     });
+    // The monitoring section (speakers, Listen As, Dim, calibration, the cue mix), kept in the app's settings.
+    MonitoringPanel::restore(program_);
+    monitoring_ = new MonitoringPanel(state_, program_, this);
+    mixer_->setMonitor(program_);
     // A hardware control surface (Mackie Control) works the mixer and transport.
     surface_ = new ControlSurface(state_, mixer_, program_, this);
     connect(program_, &PlaybackController::audioLevels, surface_, &ControlSurface::setLevels);
@@ -492,6 +503,12 @@ void MainWindow::buildPanels() {
         surface_->setCommand(QString::fromLatin1(name), fn);
         osc_->setCommand(QString::fromLatin1(name), fn);
     }
+    // The monitor keys (F1 to F4 on a Mackie Control or HUI).
+    surface_->setCommand(QStringLiteral("dim"), [this] { monitoring_->toggleDim(); });
+    surface_->setCommand(QStringLiteral("mono"), [this] { monitoring_->toggleMono(); });
+    surface_->setCommand(QStringLiteral("monitorMute"), [this] { monitoring_->toggleMute(); });
+    surface_->setCommand(QStringLiteral("talkbackOn"), [this] { program_->setTalkback(program_->monitoring().cue.on); });
+    surface_->setCommand(QStringLiteral("talkbackOff"), [this] { program_->setTalkback(false); });
     osc_->setFeedbackPort(quint16(appSettings().value(QStringLiteral("osc/feedbackPort"), 0).toInt()));
     osc_->setToolsAllowed(appSettings().value(QStringLiteral("osc/tools"), false).toBool());
     if (appSettings().value(QStringLiteral("osc/enabled"), false).toBool()) {
@@ -588,6 +605,10 @@ void MainWindow::buildPanels() {
     multicamDock_ = makeDock(tr("Multicam"), "multicam", multicam_);
     adr_ = new AdrPanel(state_, program_, programPanel_->viewer(), this);
     adrDock_ = makeDock(tr("ADR"), "adr", adr_);
+    monitoringDock_ = makeDock(tr("Monitoring"), "monitoring", monitoring_);
+    cueSheet_ = new CueSheetPanel(state_, this);
+    cueSheetDock_ = makeDock(tr("Cue Sheet"), "cueSheet", cueSheet_);
+    connect(cueSheet_, &CueSheetPanel::exportRequested, this, [this] { exportPaperworkDialog(QStringLiteral("cue_sheet")); });
     keyframesDock_ = makeDock(tr("Keyframes"), "keyframes", new KeyframePanel(state_, this));
     gradeNodes_ = new GradeNodePanel(state_, this);
     nodesDock_ = makeDock(tr("Nodes"), "nodes", gradeNodes_);
@@ -864,7 +885,7 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         resizeDocks({clipsDock_}, {150}, Qt::Vertical);
     } else if (name == "Audio") {
         // The mixer where the Source monitor was, wide meters (Premiere's Audio workspace, Resolve's Fairlight page).
-        arrangeDocks({{mixerDock_, adrDock_, sourceDock_}, {programDock_}}, {{binDock_, soundLibraryDock_, effectsDock_}}, {{meterDock_}});
+        arrangeDocks({{mixerDock_, adrDock_, monitoringDock_, sourceDock_}, {programDock_}}, {{binDock_, soundLibraryDock_, effectsDock_, cueSheetDock_}}, {{meterDock_}});
         resizeDocks({mixerDock_, programDock_}, {900, 640}, Qt::Horizontal);
         resizeDocks({mixerDock_}, {h / 2 + 40}, Qt::Vertical);
         resizeDocks({meterDock_}, {110}, Qt::Horizontal);
@@ -1197,6 +1218,17 @@ void MainWindow::buildMenus() {
         if (suffix != QLatin1String("txt") && suffix != QLatin1String("csv") && suffix != QLatin1String("pdf")) path += QLatin1Char('.') + ext;
         exportFilmLists(path, ids[size_t(std::max<qsizetype>(0, names.indexOf(pick)))]);
     })->setObjectName(QStringLiteral("exportFilmLists"));
+    {
+        QMenu* paperwork = file->addMenu(tr("Export Pape&rwork"));
+        paperwork->setObjectName(QStringLiteral("exportPaperworkMenu"));
+        const std::vector<std::pair<QString, QString>> lists{{QStringLiteral("cue_sheet"), tr("&Music Cue Sheet…")},
+                                                             {QStringLiteral("dialogue_list"), tr("&Dialogue List…")},
+                                                             {QStringLiteral("as_broadcast"), tr("&As-Broadcast Script…")},
+                                                             {QStringLiteral("ccsl"), tr("&CCSL (Continuity and Spotting List)…")}};
+        for (const auto& [id, label] : lists)
+            add(paperwork, label, QKeySequence(), [this, id] { exportPaperworkDialog(id); })
+                ->setObjectName(QStringLiteral("exportPaperwork_") + id);
+    }
     file->addSeparator();
     add(file, tr("&Quit"), QKeySequence::Quit, [this] { close(); });
 
@@ -1311,6 +1343,17 @@ void MainWindow::buildMenus() {
         const QString path = QFileDialog::getSaveFileName(this, tr("Export LUT"), QString(), tr("LUT files (*.cube)"));
         if (!path.isEmpty()) exportClipLut(path.endsWith(QLatin1String(".cube"), Qt::CaseInsensitive) ? path : path + QStringLiteral(".cube"));
     })->setObjectName(QStringLiteral("exportLut"));
+    add(clipM, tr("Rebuild LUT as &Grade…"), QKeySequence(), [this] {
+        const Clip* c = clipForCommand();
+        if (!c || std::none_of(c->effects.begin(), c->effects.end(), [](const Effect& e) { return e.type == "lut"; })) {
+            statusBar()->showMessage(tr("Select a clip with a LUT effect under the playhead to rebuild it as a grade"), 5000);
+            return;
+        }
+        const QString path = QFileDialog::getSaveFileName(this, tr("Save the Residual LUT"), QString(), tr("LUT files (*.cube)"));
+        if (path.isEmpty()) return;
+        rebuildLutAsGrade(path.endsWith(QLatin1String(".cube"), Qt::CaseInsensitive) ? path : path + QStringLiteral(".cube"));
+    })->setObjectName(QStringLiteral("lutToGrade"));
+    add(clipM, tr("Measure &Grain"), QKeySequence(), [this] { measureGrainAsPreset(); })->setObjectName(QStringLiteral("measureGrain"));
     add(clipM, tr("Import CDL…"), QKeySequence(), [this] {
         const QString path = QFileDialog::getOpenFileName(this, tr("Import CDL"), QString(), tr("ASC CDL (*.cdl *.cc *.ccc);;All files (*)"));
         if (!path.isEmpty()) importCdl(path);
@@ -2261,6 +2304,10 @@ void MainWindow::buildMenus() {
     monitorCalibrationAction_->setToolTip(tr("A calibration LUT for each display and the reference output, and a patch generator for calibration software"));
     connect(monitorCalibrationAction_, &QAction::triggered, this, [this] { showMonitorCalibration(); });
     addAction(monitorCalibrationAction_);
+    if (liveLink_)
+        liveLink_->addAppTool(MonitoringPanel::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
+            return monitoring_->runTool(args, structured, isError);
+        });
     if (liveLink_)
         liveLink_->addAppTool(RemoteReviewController::toolJson(), [this](const QJsonObject& args, QJsonObject& structured, bool& isError) {
             return remoteReview_->runTool(args, structured, isError);
@@ -4992,6 +5039,47 @@ bool runWithProgress(QWidget* parent, EditorState* state, const QString& title,
 
 }  // namespace
 
+bool MainWindow::exportPaperwork(const QString& list, const QString& path) {
+    const Sequence* s = state_->sequence();
+    PaperworkList which;
+    if (!s || !paperworkListFromId(list.toStdString(), which)) return false;
+    PaperworkOptions o;
+    // The on-screen text where the model to read it is at hand.
+    o.onScreenText = (which == PaperworkList::DialogueList || which == PaperworkList::AsBroadcast) && ocrAvailable() && ocrModel().installed();
+    const Project p = state_->project();
+    const Sequence seq = *s;
+    const std::string file = path.toStdString();
+    const bool ok = runWithProgress(this, state_, tr("Writing the %1…").arg(tr(paperworkListName(which))),
+                                    [&](const auto&, const std::atomic<bool>* cancel, std::string* err) {
+                                        o.cancel = cancel;
+                                        return writePaperwork(p, seq, which, file, o, err);
+                                    });
+    if (ok) state_->message(tr("Wrote %1").arg(QDir::toNativeSeparators(path)), 5000);
+    return ok;
+}
+
+void MainWindow::exportPaperworkDialog(const QString& list) {
+    const Sequence* s = state_->sequence();
+    PaperworkList which;
+    if (!s || !paperworkListFromId(list.toStdString(), which)) return;
+    const bool text = which == PaperworkList::DialogueList || which == PaperworkList::AsBroadcast;
+    QString filter;
+    const QString name = QStringLiteral("%1 %2").arg(QString::fromStdString(s->name), tr(paperworkListName(which)));
+    QString path = QFileDialog::getSaveFileName(
+        this, tr("Export %1").arg(tr(paperworkListName(which))),
+        QDir(appSettings().value(QStringLiteral("export/lastDirectory")).toString()).filePath(name),
+        tr("Excel workbook (*.xlsx);;CSV (*.csv);;PDF (*.pdf)") + (text ? tr(";;Text (*.txt)") : QString()), &filter);
+    if (path.isEmpty()) return;
+    const QString suffix = QFileInfo(path).suffix().toLower();
+    if (suffix != QLatin1String("xlsx") && suffix != QLatin1String("csv") && suffix != QLatin1String("pdf") && !(text && suffix == QLatin1String("txt")))
+        path += filter.contains(QLatin1String("*.csv"))   ? QStringLiteral(".csv")
+                : filter.contains(QLatin1String("*.pdf")) ? QStringLiteral(".pdf")
+                : filter.contains(QLatin1String("*.txt")) ? QStringLiteral(".txt")
+                                                          : QStringLiteral(".xlsx");
+    appSettings().setValue(QStringLiteral("export/lastDirectory"), QFileInfo(path).absolutePath());
+    exportPaperwork(list, path);
+}
+
 int MainWindow::arrangeLayout(edit::Layout layout, double gap) {
     // The selected video clips; with fewer than two, every video clip under the playhead.
     const Sequence* s = state_->sequence();
@@ -5173,6 +5261,88 @@ bool MainWindow::exportClipLut(const QString& path, int size) {
                                                   .arg(QFileInfo(path).fileName(), left.join(QStringLiteral(", "))),
                              8000);
     return true;
+}
+
+bool MainWindow::rebuildLutAsGrade(const QString& residualPath, Id lutEffect) {
+    const Clip* c = clipForCommand();
+    const Sequence* seq = state_->sequence();
+    if (!c || !seq) return false;
+    const Id clip = c->id;
+    std::function<void(float[3])> lut;
+    const ColorSpace* space = nullptr;
+    std::string err;
+    Id resolved = 0;
+    if (!edit::lutGradeSource(*seq, clip, lutEffect, lut, space, &err, &resolved)) {
+        state_->message(QString::fromStdString(err), 6000);
+        return false;
+    }
+    const ColorSpace* working = &sequenceColorSpace(*seq);
+    const Clip* before = edit::clipById(*seq, clip);
+    const auto at = std::find_if(before->effects.begin(), before->effects.end(), [&](const Effect& e) { return e.id == resolved; });
+    const std::string lutPath = at != before->effects.end() ? at->s("path") : std::string();
+    LutGrade fit;
+    if (!runWithProgress(this, state_, tr("Rebuilding the LUT as a grade…"), [&](const auto& progress, const std::atomic<bool>* cancel, std::string* error) {
+            const WorkingSpaceScope scope(working);
+            return fitLutGrade(lut, *space, fit, error, progress, cancel);
+        }))
+        return false;
+    if (!state_->apply(tr("Rebuild LUT as Grade"), [&](Project& p, Sequence& s) {
+            // (the clip may have been changed while the fit ran)
+            const Clip* now = edit::clipById(s, clip);
+            const bool same = now && std::any_of(now->effects.begin(), now->effects.end(), [&](const Effect& e) {
+                return e.id == resolved && e.s("path") == lutPath;
+            });
+            if (!same) return edit::Result::fail("The clip's LUT changed while it was being rebuilt");
+            return edit::applyLutGrade(p, s, clip, resolved, residualPath.toStdString(), fit);
+        }))
+        return false;
+    const Clip* after = edit::clipById(*state_->sequence(), clip);
+    const bool residual = after && std::any_of(after->effects.begin(), after->effects.end(), [&](const Effect& e) {
+        return e.type == "lut" && e.s("path") == residualPath.toStdString();
+    });
+    QString msg = tr("Rebuilt the LUT as a grade: delta E %1 (largest %2)").arg(fit.meanDeltaE, 0, 'f', 2).arg(fit.maxDeltaE, 0, 'f', 2);
+    if (residual) msg += tr(", %1 with the residual LUT").arg(fit.residualMeanDeltaE, 0, 'f', 2);
+    if (fit.clips) msg += tr("; the LUT clips (%1)").arg(QString::fromStdString(fit.clipNote));
+    state_->message(msg, 10000);
+    return true;
+}
+
+QString MainWindow::measureGrainAsPreset() {
+    const Clip* c = clipForCommand();
+    const Sequence* seq = state_->sequence();
+    if (!c || !seq || c->isGenerator()) {
+        state_->message(tr("Select a clip of footage under the playhead to measure its grain"), 5000);
+        return {};
+    }
+    const Project project = state_->project();
+    const Sequence copy = *seq;
+    const Clip clip = *c;
+    GrainProfile profile;
+    if (!runWithProgress(this, state_, tr("Measuring the grain of %1…").arg(QString::fromStdString(clip.name)),
+                         [&](const auto& progress, const std::atomic<bool>* cancel, std::string* error) {
+                             const WorkingSpaceScope scope(&sequenceColorSpace(copy));
+                             return measureClipGrain(project, copy, clip, {}, profile, error, progress, cancel);
+                         }))
+        return {};
+    EffectPreset preset;
+    preset.name = tr("Grain of %1").arg(QString::fromStdString(clip.name)).toStdString();
+    preset.video = true;
+    Effect e = makeEffect("grain_match", 0);
+    e.strings["profile"] = grainProfileText(profile);
+    preset.effects.push_back(e);
+    QString error;
+    const QString file = presets::save(preset, &error);
+    if (file.isEmpty()) {
+        state_->message(tr("Could not save the preset: %1").arg(error));
+        return {};
+    }
+    effects_->reload();
+    state_->message(tr("Measured the grain of %1 (about %2 px, colours alike by %3): saved as the preset %4 in the Effects panel's Presets")
+                        .arg(QString::fromStdString(clip.name), QString::number(grainSize(profile), 'f', 1),
+                             QString::number((profile.correlation[0] + profile.correlation[1] + profile.correlation[2]) / 3, 'f', 2),
+                             QString::fromStdString(preset.name)),
+                    10000);
+    return file;
 }
 
 void MainWindow::syncSequenceTabs() {
@@ -5754,17 +5924,48 @@ int MainWindow::importEmbeddedCaptions() {
                 if (c.mediaId && c.start <= state_->playhead() && state_->playhead() < c.end()) clip = &c;
     const MediaItem* m = clip ? state_->project().findMedia(clip->mediaId) : nullptr;
     if (!m || m->kind != MediaKind::Video) {
-        state_->message(tr("Select a video clip whose file carries closed captions"));
+        state_->message(tr("Select a video clip whose file carries closed captions or subtitles"));
         return 0;
     }
     const std::string path = m->path;
     const Rational fps = s->fps;
     const Clip target = *clip;
+    // Closed captions first (exact); else subtitle pictures (a disc's or a broadcast's PGS, DVB or DVD subtitles),
+    // read off them by OCR.
+    const bool pictures = !imageSubtitleStreams(path).empty();
     std::vector<Caption> found;
     if (!runWithProgress(this, state_, tr("Reading closed captions..."), [&](const auto& progress, const auto* cancel, std::string* e) {
-            return readEmbeddedCaptions(path, fps, found, progress, cancel, e);
+            return readEmbeddedCaptions(path, fps, found, progress, cancel, e) || (pictures && !(cancel && *cancel));
         }))
         return 0;
+    if (found.empty() && pictures) {
+        if (!ensureModelPack(this, ocrModel(), tr("Import Embedded Captions"),
+                             tr("Subtitles that are pictures are read with PP-OCR (PaddlePaddle, Apache-2.0), which runs on this computer.")))
+            return 0;
+        ImageSubtitleImport in;
+        if (!runWithProgress(this, state_, tr("Reading the subtitles..."), [&](const auto& progress, const auto* cancel, std::string* e) {
+                return readImageSubtitles(path, fps, in, -1, {}, [&](double f) { progress(f); }, cancel, e);
+            }))
+            return 0;
+        const std::vector<Caption> placed = captionsThroughClip(target, in.track.captions);
+        if (placed.empty()) {
+            state_->message(tr("None of the clip's subtitles fall within it"));
+            return 0;
+        }
+        state_->edit(tr("Import Embedded Captions"), [&](Project& p, Sequence& sq) {
+            CaptionTrack t = in.track;
+            t.id = p.newId();
+            t.name = "Subtitles - " + target.name;
+            t.captions = placed;
+            sq.captionTracks.push_back(std::move(t));
+            return true;
+        });
+        state_->message(in.review.empty() ? tr("%n subtitle(s) read from their pictures", "", int(placed.size()))
+                                          : tr("%n subtitle(s) read from their pictures; %1 word(s) to check (underlined)", "", int(placed.size()))
+                                                .arg(in.review.size()),
+                        6000);
+        return int(placed.size());
+    }
     const std::vector<Caption> placed = captionsThroughClip(target, found);
     if (placed.empty()) {
         state_->message(tr("None of the clip's closed captions fall within it"));
@@ -6041,13 +6242,14 @@ int MainWindow::queueTrimPasses(const QString& folder) {
     QDir().mkpath(folder);
     int queued = 0;
     for (const TrimTarget& t : s->trimTargets) {
-        // HDR as 10-bit HEVC with HDR10+ (PQ), SDR as H.264.
+        // HDR as 10-bit HEVC with HDR10+ (PQ) and adaptive HDR metadata, SDR as H.264.
         const bool hdr = trimTargetSpace(*s, t.id).hdr();
         const ExportPreset* preset = findExportPreset(hdr ? "H.265 / HEVC 10-bit" : "H.264 - High Quality");
         if (!preset) continue;
         ExportSettings st = preset->settings;
         st.trimTarget = t.id;
         st.hdr10Plus = trimTargetSpace(*s, t.id).transfer == Transfer::Pq;
+        st.adaptiveHdr = hdr;
         // (two targets of one name take their ids)
         const bool named = std::count_if(s->trimTargets.begin(), s->trimTargets.end(), [&](const TrimTarget& o) { return o.name == t.name; }) == 1;
         QString name = QString::fromStdString(s->name + " - " + (named ? t.name : t.id));
@@ -6813,9 +7015,10 @@ void MainWindow::exportImfDialog() {
     soundBox->addLayout(soundButtons);
     form->addRow(tr("Sound:"), soundBox);
     // Each caption track as timed text: subtitles, captions for the deaf and hard of hearing, forced narrative, or left out.
-    auto* texts = new QTableWidget(0, 2, &dlg);
+    auto* texts = new QTableWidget(0, 3, &dlg);
     texts->setObjectName(QStringLiteral("imfTexts"));
-    texts->setHorizontalHeaderLabels({tr("Caption track"), tr("As")});
+    texts->setHorizontalHeaderLabels({tr("Caption track"), tr("As"), tr("Pictures")});
+    texts->horizontalHeaderItem(2)->setToolTip(tr("As pictures drawn in the track's style (IMSC 1.1 Image profile), not text"));
     texts->horizontalHeader()->setStretchLastSection(true);
     texts->verticalHeader()->hide();
     for (const CaptionTrack& t : s->captionTracks) {
@@ -6833,6 +7036,10 @@ void MainWindow::exportImfDialog() {
         k->addItem(tr("Left out"), QString());
         if (t.captions.empty()) k->setCurrentIndex(k->count() - 1);  // (nothing to send)
         texts->setCellWidget(row, 1, k);
+        auto* pictures = new QTableWidgetItem;
+        pictures->setFlags(Qt::ItemIsEnabled | Qt::ItemIsUserCheckable);
+        pictures->setCheckState(Qt::Unchecked);
+        texts->setItem(row, 2, pictures);
     }
     if (texts->rowCount()) {
         texts->setMinimumHeight(std::min(160, 40 + 28 * texts->rowCount()));
@@ -6925,7 +7132,9 @@ void MainWindow::exportImfDialog() {
     if (!st.sounds.empty()) st.language = st.sounds.front().language;
     for (int row = 0; row < texts->rowCount(); ++row) {
         const QString kind = static_cast<QComboBox*>(texts->cellWidget(row, 1))->currentData().toString();
-        if (!kind.isEmpty()) st.texts.push_back({Id(texts->item(row, 0)->data(Qt::UserRole).toULongLong()), kind.toStdString()});
+        if (!kind.isEmpty())
+            st.texts.push_back({Id(texts->item(row, 0)->data(Qt::UserRole).toULongLong()), kind.toStdString(),
+                                texts->item(row, 2) && texts->item(row, 2)->checkState() == Qt::Checked});
     }
     st.captions = !st.texts.empty();
     if (supplemental->isChecked()) {
@@ -7697,9 +7906,18 @@ bool MainWindow::analyseHdrLightLevels(bool ask) {
     // PQ: HDR10+'s scenes measured in the same pass.
     const bool pq = sequenceColorSpace(s).transfer == Transfer::Pq;
     std::vector<Hdr10PlusScene> scenes;
+    std::vector<AdaptiveHdrScene> adaptive;  // and adaptive HDR metadata's, over whole scenes, after
     const FrameTime from = marked ? s.inPoint : 0, to = marked ? s.outPoint + 1 : 0;
+    const auto fitAdaptive = [&](const auto& progress, const auto* cancel, std::string* e) {
+        FrameTime a = std::max<FrameTime>(0, from), b = to > from ? to : s.duration();
+        for (const AdaptiveHdrScene& sc : s.adaptiveHdr)
+            if (sc.end > a && sc.start < b) a = std::min(a, sc.start), b = std::max(b, sc.end);
+        return analyseAdaptiveHdr(p, s, a, b, sequenceColorSpace(s), std::clamp(s.hdrPeakNits, 100.0, 10000.0), adaptive, e,
+                                  [&](double f) { progress(0.8 + 0.2 * f); }, cancel);
+    };
     if (!runWithProgress(this, state_, tr("Measuring light levels..."), [&](const auto& progress, const auto* cancel, std::string* e) {
-            if (!pq) return measureLightLevels(p, s, from, to, l, e, 1.0, [&](double f) { progress(f); }, cancel);
+            if (!pq)
+                return measureLightLevels(p, s, from, to, l, e, 1.0, [&](double f) { progress(0.8 * f); }, cancel) && fitAdaptive(progress, cancel, e);
             // HDR10+ over whole scenes (a stretch analysed again grows to the stored scenes it cuts into), the light
             // levels over what was asked.
             const FrameTime lo = from, hi = to > from ? to : s.duration();
@@ -7715,7 +7933,8 @@ bool MainWindow::analyseHdrLightLevels(bool ask) {
                 return img;
             };
             return analyseHdr10Plus(p, s, a, b, sequenceColorSpace(s), std::clamp(s.hdrPeakNits, 100.0, 10000.0), scenes, e,
-                                    [&](double f) { progress(f); }, cancel, nullptr, frame);
+                                    [&](double f) { progress(0.8 * f); }, cancel, nullptr, frame) &&
+                   fitAdaptive(progress, cancel, e);
         }))
         return false;
     unsigned cll = 0, fall = 0;
@@ -7723,6 +7942,7 @@ bool MainWindow::analyseHdrLightLevels(bool ask) {
     state_->apply(tr("Analyse HDR Light Levels"), [&](Project&, Sequence& sq) {
         sq.hdrMaxCll = cll, sq.hdrMaxFall = fall;
         if (pq) mergeHdr10PlusScenes(sq.hdr10Plus, scenes);  // replacing those they overlap; others stay
+        mergeAdaptiveHdrScenes(sq.adaptiveHdr, adaptive);
         return edit::Result{};
     });
     const QLocale loc;
@@ -7739,6 +7959,8 @@ bool MainWindow::analyseHdrLightLevels(bool ask) {
     QString more = tr("Saved with the sequence: HDR10 exports state them (MP4 and MOV also measure what they render).");
     if (pq)
         more += tr("\n\nDynamic HDR metadata (ST 2094-40): %n scene(s) measured, used by exports with it while the cut still matches them.", "", int(scenes.size()));
+    more += tr("\n\nAdaptive HDR metadata (ST 2094-50): %n scene(s) fitted to their SDR renditions, used by exports with it and by the HDR "
+               "viewer at the display's headroom while the cut still matches them.", "", int(adaptive.size()));
     if (sequenceColorSpace(s).transfer == Transfer::Pq && cll > s.hdrPeakNits + 0.5)
         more = tr("Brighter than the %1-nit mastering peak: highlights above it will be clipped or tone mapped by displays.\n\n")
                    .arg(loc.toString(qRound(s.hdrPeakNits))) + more;

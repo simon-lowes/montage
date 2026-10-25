@@ -6,6 +6,8 @@
 #pragma once
 
 #include <QDialog>
+#include <atomic>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -27,6 +29,7 @@ class AudioDescriptionDialog : public QDialog {
     Q_OBJECT
 public:
     AudioDescriptionDialog(EditorState* state, QWidget* parent = nullptr);
+    ~AudioDescriptionDialog() override;
 
     // Finds the gaps in the dialogue (the audio tracks other than the AD track) and lists them with the descriptions.
     int findGaps(QString* error = nullptr);
@@ -46,6 +49,7 @@ public:
 
 protected:
     void showEvent(QShowEvent* e) override;
+    void hideEvent(QHideEvent* e) override;
 
 private:
     void refresh();
@@ -56,6 +60,12 @@ private:
     // found, they are all there is. Returns false (with `error`) when the dialogue cannot be heard.
     bool checkAdded(QString* error = nullptr);
     void keepAdded(const std::vector<std::pair<double, double>>& speech, double fps);
+    // checkAdded's and findGaps's second halves: the dialogue's speech (or why it could not be heard) used, as it was
+    // with the dialogue's clips at `layout`.
+    bool useAdded(const std::vector<std::pair<double, double>>& speech, const std::string& err, const std::string& layout,
+                  QString* error);
+    int useFound(const std::vector<std::pair<double, double>>& speech, const std::string& err, const std::string& layout,
+                 QString* error);
     void cellEdited(int row, int column);
     int adTrack() const;  // the audio track named "AD", -1 if none
     std::string dialogueLayout() const;  // where the dialogue's clips are (the AD track aside), to tell when it is cut
@@ -75,6 +85,9 @@ private:
     std::string addedFor_;               // and when the gaps added were checked, when none were found
     bool refreshing_ = false;
     QTimer* refind_;  // finds the gaps again after the dialogue is cut (restarted by each edit)
+    bool listening_ = false, listenAgain_ = false;  // the dialogue being listened to off the UI thread, and again after
+    // Stops that listening when the dialog is hidden or goes (it is started again on show).
+    std::shared_ptr<std::atomic<bool>> cancel_ = std::make_shared<std::atomic<bool>>(false);
 };
 
 }  // namespace montage

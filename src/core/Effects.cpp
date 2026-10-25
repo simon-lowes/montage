@@ -204,6 +204,17 @@ std::vector<EffectInfo> buildCatalog() {
                   num("lightness", "Lightness", -1, 1, 0), num("vibrance", "Vibrance", -1, 1, 0)},
                  {}});
     {
+        // RGB Mixer: each output channel a mix of the three input channels (a 3x3 matrix on the values as they are),
+        // for crosstalk between channels as film and some looks have it.
+        EffectInfo mixer{"rgb_mixer", "RGB Mixer", EffectCategory::VideoFilter, "Color", {}, {}};
+        const char* names[3] = {"Red", "Green", "Blue"};
+        for (int o = 0; o < 3; ++o)
+            for (int i = 0; i < 3; ++i)
+                mixer.params.push_back(num(std::string(1, "rgb"[o]) + "." + "rgb"[i], std::string(names[o]) + " Output: " + names[i], -2, 3,
+                                           o == i ? 1 : 0, 0.001));
+        c.push_back(mixer);
+    }
+    {
         // A .cube LUT or a Common LUT Format file (render/Clf.h, as ACES looks come), applied in the working space or
         // in the space it was made for (a camera log, ACEScct, ACES2065-1).
         std::vector<std::string> spaces{"Working space"};
@@ -268,8 +279,12 @@ std::vector<EffectInfo> buildCatalog() {
         for (const auto& cs : colorSpaces()) spaces.push_back(cs.label);
         EffectInfo cst{"color_space_transform", "Colour Space Transform", EffectCategory::VideoFilter, "Color", {},
                        {str("from", "From", StringKind::Choice, colorSpaces().front().label),
-                        str("to", "To", StringKind::Choice, colorSpaces().front().label)}};
+                        str("to", "To", StringKind::Choice, colorSpaces().front().label),
+                        str("rendering", "Rendering", StringKind::Choice, "Display Rendering")}};
         cst.strings[0].choices = cst.strings[1].choices = spaces;
+        // Display Rendering: camera footage into a display space looks as it would on screen (convertColor). None: the
+        // code values converted exactly and nothing more, as a LUT's "Apply In" goes into its space and back.
+        cst.strings[2].choices = {"Display Rendering", "None"};
         c.push_back(cst);
     }
     // Stabilize: the analysed camera path (strings["motion"], written by the
@@ -358,6 +373,26 @@ std::vector<EffectInfo> buildCatalog() {
                   choice("composite", "Composite Using", {"Matte Alpha", "Matte Luma"}, 0), boolean("reverse", "Reverse"),
                   boolean("hide", "Hide the Matte", true)},
                  {}});
+    // Deep compositing (media/DeepImage.h; handled when tracks are composited): deep OpenEXR clips, and pictures made
+    // deep, are merged by depth whatever their tracks' order and flattened in where the lowest of them is.
+    c.push_back({"make_deep", "Make Deep from Depth Map", EffectCategory::VideoFilter, "Deep",
+                 {choice("source", "Depth", {"Depth Map Track", "Estimated from the Picture", "Constant"}, 0),
+                  num("track", "Depth Map Track (V number, 0: the one above)", 0, 99, 0, 1), boolean("hide", "Hide the Depth Map", true),
+                  choice("map", "Depth Map", {"White Is Near", "White Is Far", "Values Are Depth"}, 0),
+                  num("near", "Nearest Depth", 0, 100000, 1), num("far", "Farthest Depth", 0, 100000, 10),
+                  num("depth", "Constant Depth", 0, 100000, 5), num("thickness", "Thickness", 0, 100000, 0)},
+                 {}});
+    c.push_back({"deep_holdout", "Hold Out by Depth", EffectCategory::VideoFilter, "Deep",
+                 {num("track", "Holdout Track (V number, 0: the one above)", 0, 99, 0, 1), boolean("hide", "Hide the Holdout")},
+                 {}});
+    c.push_back({"deep_grade", "Colour Correct by Depth", EffectCategory::VideoFilter, "Deep",
+                 {num("near", "From Depth", 0, 100000, 0), num("far", "To Depth", 0, 100000, 10), num("soft", "Softness", 0, 100000, 0),
+                  num("exposure", "Exposure (stops)", -8, 8, 0), color("gain", "Gain", 1, 1, 1), pct("saturation", "Saturation", 0, 200, 100)},
+                 {}});
+    c.push_back({"deep_slice", "Depth Slice", EffectCategory::VideoFilter, "Deep",
+                 {num("near", "From Depth", 0, 100000, 0), num("far", "To Depth", 0, 100000, 10)},
+                 {}});
+    c.push_back({"flatten_deep", "Flatten Deep", EffectCategory::VideoFilter, "Deep", {}, {}});
     // The sky found, keyed and replaced by another track's picture or a gradient (handled when tracks are composited,
     // render/SkyReplace.h). Its strings["motion"] holds the camera motion an analysis measured, to move the sky with.
     c.push_back({"sky_replace", "Sky Replacement", EffectCategory::VideoFilter, "Keying",
@@ -522,6 +557,14 @@ std::vector<EffectInfo> buildCatalog() {
                  {num("amount", "Amount", 0, 1, 0.15, 0.005), num("size", "Grain Size (px)", 0.5, 8, 1.5, 0.1),
                   boolean("color", "Colour Grain")},
                  {}});
+    // Grain Match (render/GrainMatch.h): grain made to a measured profile (Clip > Measure Grain, MCP montage_grain) or
+    // one of Film Look's gauges, by the picture's own light; Replace Grain takes the plate's own out first (with Video
+    // Noise Reduction's defaults on the source frames, unless the clip has that effect itself).
+    c.push_back({"grain_match", "Grain Match", EffectCategory::VideoFilter, "Stylize",
+                 {choice("source", "Grain", {"Measured", "65mm", "35mm", "16mm", "Super 8"}, 0),
+                  choice("mode", "Mode", {"Add Grain", "Replace Grain"}, 0), pct("amount", "Amount", 0, 200, 100),
+                  pct("size", "Size", 25, 400, 100), pct("saturation", "Colour", 0, 200, 100), num("seed", "Seed", 0, 9999, 0, 1)},
+                 {str("profile", "Measured Profile", StringKind::Text)}});
     c.push_back({"directional_blur", "Directional Blur", EffectCategory::VideoFilter, "Blur & Sharpen",
                  {num("length", "Length (px)", 0, 300, 20, 0.5), angle("angle", "Direction", 0)},
                  {}});

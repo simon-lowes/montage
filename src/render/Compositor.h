@@ -5,7 +5,9 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "Stereo.h"
@@ -14,6 +16,7 @@
 #include "media/Image.h"
 
 class QImage;
+class QPoint;
 
 namespace montage {
 
@@ -91,6 +94,9 @@ bool clipFrameSize(const Project& p, const Sequence& seq, const Clip& c, double&
 // Captions are styled in SDR; `space` converts them into the picture's colour space.
 struct ColorSpace;
 void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const ColorSpace* space = nullptr);
+// The caption on screen at frame t as drawCaption draws it on a `width` x `height` frame: just its area (premultiplied
+// RGBA, null when none is on screen), placed at `origin`.
+QImage captionImage(const CaptionTrack& track, FrameTime t, int width, int height, QPoint* origin = nullptr);
 
 // Burn-ins (timecode, clip name, text, watermark) drawn over frame t of `seq`
 // in `img` (the whole frame, in colour space `space`; null = Rec.709).
@@ -143,7 +149,8 @@ public:
     // The same in the sequence's own layout (core/Surround.h): `out` gets
     // layoutChannels(seq.audioLayout) interleaved channels. mix() gives the
     // stereo fold-down of a surround mix, for listening.
-    void mixLayout(const Project& p, const Sequence& seq, int64_t start, int frames, float* out);
+    void mixLayout(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
+                   std::vector<MeterLevels>* trackLevels = nullptr);
     // Mixes only the audio tracks whose entry is true (stems); empty = all.
     void setTrackMask(std::vector<bool> mask) { mask_ = std::move(mask); }
     // Audio tracks heard only through their LFE send (ADM objects: their position is the object's, their LFE send
@@ -165,6 +172,23 @@ public:
     // How mix() lets an ambisonic sequence be heard: binaurally for headphones, or through two virtual cardioids for
     // speakers (the default, as downmixToStereo folds it: exports, stems; playback sets the monitoring choice).
     void setAmbisonicBinaural(bool on) { ambisonicBinaural_ = on; }
+
+    // Dynamics held to another mix's. Recording, the built-in compressors, limiters, gates, de-essers and multiband
+    // compressors note how far they turn the sound down (or up) at each sample of a mix; replaying, over the same
+    // samples, they turn it by just that much rather than by what they hear. Everything else being linear, a part of
+    // the first mix (its dialogue, say) mixed alone while replaying is exactly that part as it is heard in the mix.
+    // Each mix() starts the tape afresh (recording) or from its start (replaying); a latency pre-roll leaves it alone.
+    struct GainTape {
+        using Key = std::tuple<Id, Id, Id>;  // the nested clips it is heard through, the owner, the effect
+        std::map<Key, std::vector<float>> gains;
+        std::map<Key, size_t> read;
+    };
+    void setGainTape(GainTape* tape, bool replay) {
+        tape_ = tape;
+        replayTape_ = replay;
+    }
+    // These plugin effects only delay the sound by their latency (so everything else stays where it is heard).
+    void setDelayOnly(std::set<Id> effects) { delayOnly_ = std::move(effects); }
 
     struct State;  // per clip/effect DSP state
     static bool ensurePlugin(State& st, const Effect& e, double sr);
@@ -217,6 +241,27 @@ private:
     std::map<std::pair<Id, Id>, std::unique_ptr<State>> states_;
     std::mutex m_;
     bool nonBlocking_ = false;
+    GainTape* tape_ = nullptr;
+    std::set<Id> delayOnly_;
+    bool replayTape_ = false;
+    void startTape() {
+        if (!tape_) return;
+        if (!replayTape_) tape_->gains.clear();
+        tape_->read.clear();
+    }
+    Id tapeScope_ = 0;  // the nested clips being mixed through (a nested sequence placed twice: two sets of gains)
+    struct TapeScope {
+        Id& scope;
+        Id was;
+        TapeScope(Id& s, Id clip) : scope(s), was(s) { scope = Id(uint64_t(s) * 1000003u + uint64_t(clip)); }
+        ~TapeScope() { scope = was; }
+    };
+    struct TapeOff {
+        GainTape*& tape;
+        GainTape* was;
+        explicit TapeOff(GainTape*& t) : tape(t), was(t) { tape = nullptr; }
+        ~TapeOff() { tape = was; }
+    };
     Id skipUpmix_ = 0;  // the Upmix processChain leaves out (mixInto runs it, into the speakers)
     bool offlineProxies_ = false;
     std::vector<bool> mask_, lfeOnly_;

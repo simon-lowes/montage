@@ -371,4 +371,78 @@ std::vector<TarEntry> tarEntries(const std::string& tar) {
     return entries;
 }
 
+namespace {
+
+void put16(std::string& o, uint32_t v) {
+    o.push_back(char(v & 0xFF));
+    o.push_back(char((v >> 8) & 0xFF));
+}
+void put32(std::string& o, uint32_t v) {
+    put16(o, v & 0xFFFF);
+    put16(o, v >> 16);
+}
+
+constexpr uint32_t kDosTime = 0, kDosDate = (1u << 5) | 1u;  // 1980-01-01 00:00 (the same bytes every time)
+
+}  // namespace
+
+void ZipWriter::add(const std::string& name, const std::string& data) {
+    Item it;
+    it.name = name;
+    it.crc = crc32(data.data(), data.size());
+    it.size = uint32_t(data.size());
+    it.offset = uint32_t(out_.size());
+    put32(out_, 0x04034b50);
+    put16(out_, 20);      // version needed
+    put16(out_, 0x0800);  // UTF-8 names
+    put16(out_, 0);       // stored
+    put16(out_, kDosTime);
+    put16(out_, kDosDate);
+    put32(out_, it.crc);
+    put32(out_, it.size);
+    put32(out_, it.size);
+    put16(out_, uint32_t(name.size()));
+    put16(out_, 0);
+    out_ += name;
+    out_ += data;
+    items_.push_back(std::move(it));
+}
+
+std::string ZipWriter::finish() {
+    const uint32_t start = uint32_t(out_.size());
+    for (const Item& it : items_) {
+        put32(out_, 0x02014b50);
+        put16(out_, 20);  // made by
+        put16(out_, 20);  // needed
+        put16(out_, 0x0800);
+        put16(out_, 0);
+        put16(out_, kDosTime);
+        put16(out_, kDosDate);
+        put32(out_, it.crc);
+        put32(out_, it.size);
+        put32(out_, it.size);
+        put16(out_, uint32_t(it.name.size()));
+        put16(out_, 0);  // extra
+        put16(out_, 0);  // comment
+        put16(out_, 0);  // disk
+        put16(out_, 0);  // internal attributes
+        put32(out_, 0);  // external attributes
+        put32(out_, it.offset);
+        out_ += it.name;
+    }
+    const uint32_t size = uint32_t(out_.size()) - start;
+    put32(out_, 0x06054b50);
+    put16(out_, 0);
+    put16(out_, 0);
+    put16(out_, uint32_t(items_.size()));
+    put16(out_, uint32_t(items_.size()));
+    put32(out_, size);
+    put32(out_, start);
+    put16(out_, 0);
+    std::string done;
+    done.swap(out_);
+    items_.clear();
+    return done;
+}
+
 }  // namespace montage

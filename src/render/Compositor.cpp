@@ -1,4 +1,6 @@
 #include "Compositor.h"
+#include "AdaptiveHdr.h"
+#include "GrainMatch.h"
 #include "TrimPasses.h"
 #include "OGraf.h"
 #include "Ofx.h"
@@ -78,6 +80,7 @@
 #include "media/Rife.h"
 #include "media/SuperScale.h"
 #include "core/Interpretation.h"
+#include "media/DeepImage.h"
 #include "media/Exr.h"
 
 namespace montage {
@@ -606,8 +609,37 @@ void applyMotionDeblur(const Effect& e, FrameTime lt, const RenderOptions& o, Im
     src = std::move(sharp);
 }
 
+// A Grain Match on the clip set to Replace Grain (any of them, the first such).
+const Effect* replacingGrain(const Sequence& seq, const Clip& c) {
+    auto replaces = [](const Effect& e) { return e.type == "grain_match" && std::lround(e.p("mode", 0, 0)) == 1; };
+    if (c.grade.empty()) {
+        for (const Effect& e : c.effects)
+            if (e.enabled && replaces(e)) return &e;
+        return nullptr;
+    }
+    for (const Effect* e : liveEffects(seq, c))
+        if (replaces(*e)) return e;
+    return nullptr;
+}
+
 const Effect* denoiseEffect(const Sequence& seq, const Clip& c) {
-    return enabledEffect(seq, c, "video_denoise");
+    if (const Effect* e = enabledEffect(seq, c, "video_denoise")) return e;
+    // Grain Match's Replace Grain: the plate's own grain taken out first, as Video Noise Reduction does by default.
+    if (replacingGrain(seq, c)) {
+        static const Effect standard = [] {
+            Effect e = makeEffect("video_denoise", 0);
+            e.params["frames"] = double(kReplaceGrainFrames);
+            return e;
+        }();
+        return &standard;
+    }
+    return nullptr;
+}
+
+// Grain Match's Replace Grain, when it takes the plate's grain out (the clip has no Video Noise Reduction of its own).
+const Effect* replaceGrainEffect(const Sequence& seq, const Clip& c) {
+    if (enabledEffect(seq, c, "video_denoise")) return nullptr;
+    return replacingGrain(seq, c);
 }
 
 // Lip Sync's sound: what its track (every track not muted, when none is named) plays over 30 s stretch `segment` from the
@@ -783,6 +815,19 @@ void applyDenoise(const Effect& e, FrameTime lt, Image& src, const std::vector<I
         for (int k = 0; k < 4; ++k) src.px[i * 4 + size_t(k)] += (clean.px[i * 4 + size_t(k)] - src.px[i * 4 + size_t(k)]) * matte[i];
 }
 
+// Replace Grain's taking the plate's grain out (render/GrainMatch removeGrain), within the Grain Match's mask when it has one.
+void applyRemoveGrain(const Effect& e, FrameTime lt, Image& src, const std::vector<const Image*>& around, const std::vector<MotionFn>& motion,
+                      const ColorSpace& space, double pixelScale, double sourceSeconds) {
+    const Image clean = removeGrain(src, around, motion, space, effectGrainProfile(e));
+    if (!hasMask(e, lt)) {
+        src = clean;
+        return;
+    }
+    const std::vector<float> matte = effectMatte(e, lt, src, pixelScale, sourceSeconds);
+    for (size_t i = 0; i < matte.size() && i * 4 < src.px.size(); ++i)
+        for (int k = 0; k < 4; ++k) src.px[i * 4 + size_t(k)] += (clean.px[i * 4 + size_t(k)] - src.px[i * 4 + size_t(k)]) * matte[i];
+}
+
 Geometry geometryFor(const Effect& motion, FrameTime lt, double mw, double mh, int SW, int SH) {
     Geometry g;
     g.mw = std::max(1.0, mw);
@@ -931,6 +976,8 @@ struct ClipSource {
     // Or, when asked to leave it (`deferFrame`), the decoded frame and the space it is in: nothing ran on it yet.
     Frame16Ptr frame;
     const ColorSpace* frameSpace = nullptr;
+    // The frame's adaptive HDR metadata (render/AdaptiveHdr.h) when it changes how the frame enters the sequence.
+    const AdaptiveHdr* adaptive = nullptr;
     const Effect* sourceCdl = nullptr;  // a CDL applied in the media's own space, before the input transform
     const Effect* sourceRgc = nullptr;  // the ACES gamut compression, likewise
     std::vector<const Effect*> sourceLooks;  // CDLs and LUTs made on the camera's picture (an AMF's looks), likewise
@@ -943,6 +990,21 @@ struct ClipSource {
     std::string exrFile;        // the OpenEXR file the frame was read from (its Cryptomattes), "" for any other
     ofx::FrameFetch ofxFetch;   // the clip's source at other clip frames, for OpenFX plugins that ask (render/Ofx.h)
 };
+
+// The input transform: a picture in its media's space into the sequence's working space, by its adaptive HDR metadata
+// when it has some that matters there.
+void inputTransform(Image& img, const ColorSpace& from, const AdaptiveHdr* adaptive, const Sequence& seq) {
+    if (adaptive) convertColorAdaptive(img, from, *adaptive, sequenceColorSpace(seq), seq.hdrPeakNits);
+    else convertColor(img, from, sequenceColorSpace(seq), seq.hdrPeakNits);
+}
+
+// The metadata of a media file's frame at `seconds` that changes how it enters `seq` (not its proxy's, nor when its
+// colour is interpreted by hand).
+const AdaptiveHdr* clipAdaptiveHdr(const MediaItem& m, const std::string& path, double seconds, const Sequence& seq) {
+    if (m.kind != MediaKind::Video || path != m.path || !m.colorOverride.empty()) return nullptr;
+    const AdaptiveHdr* md = adaptiveHdrAt(m, seconds);
+    return md && adaptiveConverts(*md, mediaColorSpace(m), sequenceColorSpace(seq), seq.hdrPeakNits) ? md : nullptr;
+}
 
 // Effects clipSource runs on the source frame before a camera look made on it can run.
 bool ranOnSourceFirst(const std::string& type) {
@@ -1031,7 +1093,9 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (nested->multicam) no.soloVideoTrack = std::clamp(c.angle, 0, std::max(0, int(nested->videoTracks.size()) - 1));
             FrameTime nf = FrameTime(std::floor(c.sourceFrameAt(t) * nested->fpsValue() / seq.fpsValue() + 1e-6));
             src = renderSequenceFrame(p, *nested, nf, no);
-            if (const Effect* nr = denoiseEffect(seq, c); nr && !src.empty())
+            if (const Effect* rg = replaceGrainEffect(seq, c); rg && !src.empty())
+                applyRemoveGrain(*rg, lt, src, {}, {}, sequenceColorSpace(*nested), effectPixelScale(c, lt, g.sx, mw, src.width), -1);
+            else if (const Effect* nr = denoiseEffect(seq, c); nr && !src.empty())
                 applyDenoise(*nr, lt, src, {}, {}, effectPixelScale(c, lt, g.sx, mw, src.width), -1);
             if (const Effect* db = enabledEffect(seq, c, "motion_deblur")) applyMotionDeblur(*db, lt, o, src);
             if (const Effect* ls = enabledEffect(seq, c, "lip_sync")) applyLipSync(p, seq, c, *ls, lt, o, src);
@@ -1099,6 +1163,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (!f && original && isOffline(*m)) f = offlineSlate(w, h);
             if (!f) return false;
             if (m->kind == MediaKind::Video) sourceSeconds = sec;
+            out.adaptive = clipAdaptiveHdr(*m, path, sec, seq);
             if (m->kind == MediaKind::Video && c.layer.empty()) out.sourcePath = m->path;
             sourceMedia = m->id;
             exrFile = exrFrameFile(m->path, sec);
@@ -1110,14 +1175,19 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 const ColorSpace* from = &pictureColorSpace(*m, path);
                 const ColorSpace* to = &sequenceColorSpace(seq);
                 const double peak = seq.hdrPeakNits;
-                ofxFetch = [path, w, h, hq, clipCopy, duration, frameSeconds, seqFps, from, to, peak](double at, Image& out) {
+                MediaItem media;  // (what the neighbours' adaptive HDR metadata needs)
+                media.kind = m->kind, media.path = m->path, media.colorSpace = m->colorSpace, media.colorOverride = m->colorOverride;
+                media.fps = m->fps, media.adaptiveHdr = m->adaptiveHdr;
+                ofxFetch = [path, w, h, hq, clipCopy, duration, frameSeconds, seqFps, from, to, peak, media](double at, Image& out) {
                     const FrameTime local = FrameTime(std::floor(at + 1e-6));
                     if (local < 0 || local >= clipCopy.duration) return false;
                     const double s = std::clamp(clipCopy.sourceFrameAt(clipCopy.start + local) / seqFps, 0.0, std::max(0.0, duration - frameSeconds * 0.5));
                     Frame16Ptr frame = MediaPool::instance().videoFrame(path, s, w, h, hq);
                     if (!frame) return false;
                     out = toImage(*frame);
-                    convertColor(out, *from, *to, peak);
+                    const AdaptiveHdr* md = path == media.path && media.colorOverride.empty() ? adaptiveHdrAt(media, s) : nullptr;
+                    if (md && adaptiveConverts(*md, *from, *to, peak)) convertColorAdaptive(out, *from, *md, *to, peak);
+                    else convertColor(out, *from, *to, peak);
                     return true;
                 };
             }
@@ -1268,8 +1338,15 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                                                });
                     }
                 }
-                applyDenoise(*nr, lt, src, around, motion, effectPixelScale(c, lt, g.sx, mw, src.width),
-                             m->kind == MediaKind::Video ? sec : -1);
+                if (const Effect* rg = replaceGrainEffect(seq, c)) {
+                    std::vector<const Image*> nb;
+                    for (const Image& im : around) nb.push_back(&im);
+                    applyRemoveGrain(*rg, lt, src, nb, motion, mediaColorSpace(*m), effectPixelScale(c, lt, g.sx, mw, src.width),
+                                     m->kind == MediaKind::Video ? sec : -1);
+                } else {
+                    applyDenoise(*nr, lt, src, around, motion, effectPixelScale(c, lt, g.sx, mw, src.width),
+                                 m->kind == MediaKind::Video ? sec : -1);
+                }
             }
             // Motion Deblur, on the source frame as decoded (the size it is shown at); not on proxies, which are for speed.
             if (const Effect* db = enabledEffect(seq, c, "motion_deblur"); db && original) applyMotionDeblur(*db, lt, o, src);
@@ -1422,7 +1499,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     applyAcesGamutCompress(e, lt, from, src);
                 }
             // Input transform: the media's space (or its proxy's) into the sequence's working space.
-            convertColor(src, from, sequenceColorSpace(seq), seq.hdrPeakNits);
+            inputTransform(src, from, out.adaptive, seq);
         } else {
             return false;
         }
@@ -1437,7 +1514,7 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
     Image& src = cs.src;
     if (cs.frame) {  // (left as decoded)
         src = toImage(*cs.frame);
-        convertColor(src, *cs.frameSpace, sequenceColorSpace(seq), seq.hdrPeakNits);
+        inputTransform(src, *cs.frameSpace, cs.adaptive, seq);
         cs.frame.reset();
     }
     const Effect* sourceCdl = cs.sourceCdl;
@@ -1604,6 +1681,12 @@ std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t) {
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
             if (const Effect* e = skyTrackEffect(seq, *c, t); e && e->p("hide", t - c->start, 1) > 0.5)
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
+            // A depth map made into depth, and a deep holdout, when they are to be hidden.
+            if (const Effect* e = enabledEffect(seq, *c, "make_deep"); e && std::lround(e->p("source", t - c->start, 0)) == 0 &&
+                                                                     e->p("hide", t - c->start, 1) > 0.5)
+                if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
+            if (const Effect* e = enabledEffect(seq, *c, "deep_holdout"); e && e->p("hide", t - c->start, 0) > 0.5)
+                if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
         }
     return hidden;
 }
@@ -1759,6 +1842,207 @@ void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c,
 
 }  // namespace
 
+namespace {
+
+// ---- Deep layers (media/DeepImage.h) -------------------------------------------------------------------------------
+
+// The deep OpenEXR file a clip shows at t ("" when its picture is not deep), and its media. Whether a sequence is
+// deep is told by its first frame, so flat EXR sequences are not opened again frame by frame.
+std::string clipDeepFile(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const MediaItem** media = nullptr) {
+    if (c.isGenerator() || !c.layer.empty() || !exrAvailable()) return {};
+    const MediaItem* m = p.findMedia(c.mediaId);
+    if (!m || (m->kind != MediaKind::Video && m->kind != MediaKind::Image)) return {};
+    const std::string first = exrFrameFile(m->path, 0);
+    if (first.empty()) return {};
+    const std::shared_ptr<const ExrInfo> info = cachedExrInfo(first);
+    if (!info || !info->deep) return {};
+    double sec = 0;
+    if (m->kind == MediaKind::Video) {
+        const double fd = m->fps.valid() ? 1.0 / m->fps.toDouble() : 1.0 / 30;
+        sec = std::clamp(c.sourceFrameAt(t) / seq.fpsValue(), 0.0, std::max(0.0, m->duration - fd * 0.5));
+    }
+    if (media) *media = m;
+    return exrFrameFile(m->path, sec);
+}
+
+// Whether a clip's picture takes part in the depth merge (or is flattened on its own, `flattened`).
+bool isDeepClip(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, bool* flattened = nullptr) {
+    const bool deep = enabledEffect(seq, c, "make_deep") || !clipDeepFile(p, seq, c, t).empty();
+    if (flattened) *flattened = deep && enabledEffect(seq, c, "flatten_deep");
+    return deep;
+}
+
+// Samples' colours from a picture's space into the sequence's working space (straight, a million at a time).
+void deepIntoWorkingSpace(DeepFrame& f, const ColorSpace& from, const Sequence& seq) {
+    const ColorSpace& to = sequenceColorSpace(seq);
+    if (&from == &to) return;
+    constexpr size_t chunk = size_t(1) << 20;
+    for (size_t at = 0; at < f.samples.size(); at += chunk) {
+        const size_t n = std::min(chunk, f.samples.size() - at);
+        Image img(1024, int((n + 1023) / 1024));  // (rows, so the conversion runs on every core)
+        for (size_t i = 0; i < n; ++i) {
+            const DeepSample& s = f.samples[at + i];
+            const float k = s.a > 1e-6f ? 1 / s.a : 1;
+            float* q = img.px.data() + i * 4;
+            q[0] = s.r * k, q[1] = s.g * k, q[2] = s.b * k, q[3] = 1;
+        }
+        convertColor(img, from, to, seq.hdrPeakNits);
+        for (size_t i = 0; i < n; ++i) {
+            DeepSample& s = f.samples[at + i];
+            const float k = s.a > 1e-6f ? s.a : 1;
+            const float* q = img.px.data() + i * 4;
+            s.r = q[0] * k, s.g = q[1] * k, s.b = q[2] * k;
+        }
+    }
+}
+
+float lumaOf(const float* q) {
+    const float y = 0.2126f * q[0] + 0.7152f * q[1] + 0.0722f * q[2];
+    return q[3] > 1e-6f ? y / q[3] : y;
+}
+
+// A clip's picture at t as deep samples on the W x H frame: a deep OpenEXR frame through the clip's transform (nearest
+// pixels) and opacity, or its flat picture made deep (Make Deep from Depth Map); then its depth slices and grades.
+DeepFrame clipDeepFrame(const Project& p, const Sequence& seq, size_t ti, const Clip& c, FrameTime t, const RenderOptions& o, int W, int H) {
+    ExpressionScope expressions(&p, &seq, &c, o.cancel);  // (core/Expression.h)
+    const FrameTime lt = t - c.start;
+    DeepFrame f;
+    if (const Effect* md = enabledEffect(seq, c, "make_deep")) {
+        Image layer = clipLayer(p, seq, c, t, o, nullptr);
+        if (layer.empty() || layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
+        const int source = int(std::lround(md->p("source", lt, 0)));
+        const int map = int(std::lround(md->p("map", lt, 0)));
+        const float near = float(md->p("near", lt, 1)), far = float(md->p("far", lt, 10));
+        std::vector<float> depth(size_t(W) * size_t(H), float(md->p("depth", lt, 5)));
+        auto toDepth = [&](float v) {
+            return map == 2 ? v : map == 1 ? near + (far - near) * std::clamp(v, 0.0f, 1.0f) : far + (near - far) * std::clamp(v, 0.0f, 1.0f);
+        };
+        if (source == 0) {
+            const int m = matteTrack(seq, ti, c, *md, t);
+            const Clip* mc = m >= 0 ? clipAt(seq.videoTracks[size_t(m)], t) : nullptr;
+            const Image dm = mc ? clipLayer(p, seq, *mc, t, o, nullptr) : Image();
+            if (dm.width != W || dm.height != H) return DeepFrame::blank(W, H);  // no depth map now: nothing
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) depth[size_t(y) * size_t(W) + size_t(x)] = toDepth(lumaOf(dm.at(x, y)));
+        } else if (source == 1) {
+            const std::shared_ptr<const DepthMap> d = depthAvailable() && depthModel().installed() ? cachedDepth(layer) : nullptr;
+            if (!d) {
+                if (o.issues) o.issues->note("Make Deep from Depth Map needs the depth model");
+                return DeepFrame::blank(W, H);
+            }
+            const std::vector<float> v = d->resized(W, H);
+            for (size_t i = 0; i < depth.size(); ++i) depth[i] = toDepth(v[i]);
+        }
+        f = deepFromFlat(layer.px.data(), W, H, depth.data(), float(md->p("thickness", lt, 0)));
+    } else {
+        const MediaItem* m = nullptr;
+        const std::string file = clipDeepFile(p, seq, c, t, &m);
+        const std::shared_ptr<const DeepFrame> src = file.empty() ? nullptr : cachedDeepExr(file);
+        Geometry g;
+        if (!src || !clipGeometry(p, seq, c, t, g)) return DeepFrame::blank(W, H);
+        // The clip's transform, as sequence pixels to the deep frame's.
+        double u0, v0, u1, v1, u2, v2;
+        sequenceToClipFrame(p, seq, c, t, 0, 0, u0, v0);
+        sequenceToClipFrame(p, seq, c, t, 1, 0, u1, v1);
+        sequenceToClipFrame(p, seq, c, t, 0, 1, u2, v2);
+        const double s = o.scale > 0 ? o.scale : 1;
+        const int sw = src->width, sh = src->height;
+        f = resampleDeep(*src, W, H, [&](double x, double y, double& u, double& v) {
+            const double X = x / s, Y = y / s;
+            u = (u0 + (u1 - u0) * X + (u2 - u0) * Y) * sw;
+            v = (v0 + (v1 - v0) * X + (v2 - v0) * Y) * sh;
+        }, float(g.opacity));
+        deepIntoWorkingSpace(f, pictureColorSpace(*m, m->path), seq);
+    }
+    for (const Effect* e : liveEffects(seq, c)) {
+        if (e->type == "deep_slice") {
+            sliceDeep(f, float(e->p("near", lt, 0)), float(e->p("far", lt, 10)));
+        } else if (e->type == "deep_grade") {
+            const float gain = float(std::exp2(e->p("exposure", lt, 0)));
+            const float gr = float(e->p("gain.r", lt, 1)) * gain, gg = float(e->p("gain.g", lt, 1)) * gain, gb = float(e->p("gain.b", lt, 1)) * gain;
+            const float sat = float(e->p("saturation", lt, 100) / 100);
+            gradeDeep(f, float(e->p("near", lt, 0)), float(e->p("far", lt, 10)), float(e->p("soft", lt, 0)), [&](float* rgb, float w) {
+                float q[3] = {rgb[0] * gr, rgb[1] * gg, rgb[2] * gb};
+                const float y = 0.2126f * q[0] + 0.7152f * q[1] + 0.0722f * q[2];
+                for (int k = 0; k < 3; ++k) rgb[k] += (y + (q[k] - y) * sat - rgb[k]) * w;
+            });
+        }
+    }
+    return f;
+}
+
+// A flattened deep frame as a layer (premultiplied).
+Image deepLayer(const DeepFrame& f) {
+    Image img(f.width, f.height, Image::Uninitialized{});
+    const std::vector<float> rgba = flattenDeep(f);
+    std::copy(rgba.begin(), rgba.end(), img.px.begin());
+    return img;
+}
+
+// The deep layers on screen at t: every deep clip's frame (held out where asked), the merge of those not flattened on
+// their own, and the lowest track among them.
+struct DeepLayers {
+    std::map<size_t, DeepFrame> frames;  // by track
+    std::map<size_t, bool> flattened;
+    Image merged;
+    int lowest = -1;
+};
+DeepLayers deepLayers(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o, int W, int H, int solo,
+                      const std::vector<bool>& hidden) {
+    DeepLayers out;
+    auto on = [&](size_t ti) {
+        const Track& track = seq.videoTracks[ti];
+        return !(solo >= 0 ? int(ti) != solo : track.muted);
+    };
+    for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
+        if (!on(ti) || (solo < 0 && hidden[ti])) continue;
+        const Track& track = seq.videoTracks[ti];
+        FrameTime a, b;
+        if (std::any_of(track.transitions.begin(), track.transitions.end(),
+                        [&](const Transition& tr) { return edit::transitionRange(track, tr, a, b) && t >= a && t < b; }))
+            continue;  // (a transition shows its clips flat)
+        const Clip* c = clipAt(track, t);
+        bool flat = false;
+        if (!c || !isDeepClip(p, seq, *c, t, &flat)) continue;
+        out.frames[ti] = clipDeepFrame(p, seq, ti, *c, t, o, W, H);
+        out.flattened[ti] = flat;
+    }
+    if (out.frames.empty()) return out;
+    // Holdouts: by another track's deep picture (made even when that track is hidden or off), each by the pictures as
+    // they were before any was held out. One merged with the clip already hides it where it is in front, so it is
+    // held out only when either of them is flattened on its own or the holdout is not shown.
+    std::vector<std::pair<size_t, DeepFrame>> held;
+    for (const auto& [ti, f] : out.frames) {
+        const Clip* c = clipAt(seq.videoTracks[ti], t);
+        const Effect* e = c ? enabledEffect(seq, *c, "deep_holdout") : nullptr;
+        if (!e) continue;
+        const int m = matteTrack(seq, ti, *c, *e, t);
+        if (m < 0) continue;
+        const auto it = out.frames.find(size_t(m));
+        if (it != out.frames.end() && !out.flattened[ti] && !out.flattened[size_t(m)]) continue;
+        DeepFrame other;
+        if (it == out.frames.end())
+            if (const Clip* hc = clipAt(seq.videoTracks[size_t(m)], t); hc && isDeepClip(p, seq, *hc, t))
+                other = clipDeepFrame(p, seq, size_t(m), *hc, t, o, W, H);
+        const DeepFrame& by = it != out.frames.end() ? it->second : other;
+        if (by.empty()) continue;
+        DeepFrame g = f;
+        holdOutDeep(g, by);
+        held.emplace_back(ti, std::move(g));
+    }
+    for (auto& [ti, g] : held) out.frames[ti] = std::move(g);
+    std::vector<const DeepFrame*> merge;
+    for (const auto& [ti, f] : out.frames)
+        if (!out.flattened[ti]) {
+            merge.push_back(&f);
+            if (out.lowest < 0) out.lowest = int(ti);
+        }
+    if (!merge.empty()) out.merged = deepLayer(mergeDeep(merge));
+    return out;
+}
+
+}  // namespace
+
 Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& opts) {
     ExpressionScope expressions(&p, &seq, nullptr, opts.cancel);  // (core/Expression.h)
     const WorkingSpaceScope working(&sequenceColorSpace(seq));  // effects that work in light know whose
@@ -1775,10 +2059,21 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
         else blendOnto(canvas, layer, mode, 1.0f);
         canvasEmpty = false;
     };
+    // Deep layers: merged by depth, whatever their tracks' order, and flattened in where the lowest of them is.
+    DeepLayers deep = deepLayers(p, seq, t, o, W, H, solo, hiddenMatte);
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
         const Track& track = seq.videoTracks[ti];
         if (solo >= 0 ? int(ti) != solo : track.muted) continue;  // an angle shows even if its track is hidden
         if (solo < 0 && hiddenMatte[ti]) continue;
+        if (auto it = deep.frames.find(ti); it != deep.frames.end()) {
+            if (deep.flattened[ti]) {
+                const Clip* c = clipAt(track, t);
+                composite(deepLayer(it->second), c ? c->blendMode : "normal");
+            } else if (int(ti) == deep.lowest) {
+                composite(std::move(deep.merged), "normal");
+            }
+            continue;
+        }
         const Transition* active = nullptr;
         FrameTime from = 0, to = 0;
         for (const auto& tr : track.transitions) {
@@ -2068,7 +2363,8 @@ GpuLayerResult gpuClipLayer(const Project& p, const Sequence& seq, const Clip& c
     int w = 0, h = 0;
     if (cs.frame) {
         out.frame = cs.frame;
-        out.input = conversionLut(*cs.frameSpace, sequenceColorSpace(seq), seq.hdrPeakNits);
+        out.input = cs.adaptive ? adaptiveConversionLut(*cs.frameSpace, *cs.adaptive, sequenceColorSpace(seq), seq.hdrPeakNits)
+                                : conversionLut(*cs.frameSpace, sequenceColorSpace(seq), seq.hdrPeakNits);
         w = cs.frame->width, h = cs.frame->height;
     } else {
         out.image = std::move(cs.src);
@@ -2166,6 +2462,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
                 if (trackMatteOf(*c)) return fallback("a track matte");
                 if (enabledEffect(seq, *c, "behind_people")) return fallback("Behind People");
                 if (enabledEffect(seq, *c, "sky_replace")) return fallback("Sky Replacement");
+                if (isDeepClip(p, seq, *c, t)) return fallback("deep compositing");
             }
     }
     auto layerOf = [&](const Clip& c, gpu::Layer& l) {
@@ -2328,15 +2625,15 @@ bool sequenceToClipFrame(const Project& p, const Sequence& seq, const Clip& c, F
     return true;
 }
 
-void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const ColorSpace* space) {
+QImage captionImage(const CaptionTrack& track, FrameTime t, int width, int height, QPoint* origin) {
     const Caption* cap = captionAt(track, t);
-    if (!cap || img.width < 8 || img.height < 8) return;
+    if (!cap || width < 8 || height < 8) return QImage();
     const CaptionStyle& st = track.style;
     const int anim = std::clamp(st.animation, 0, 4);
     const int spoken = anim ? captionWordAt(*cap, t) : -1;  // the word being said
     QFont f(QString::fromStdString(st.font));
     // One word at a time is shown large.
-    const double px = std::max(4.0, st.size * img.height * (anim == 4 ? 1.8 : 1.0));
+    const double px = std::max(4.0, st.size * height * (anim == 4 ? 1.8 : 1.0));
     f.setPixelSize(int(std::lround(px)));
     f.setBold(st.bold || anim == 4);
     f.setItalic(cap->italic);
@@ -2371,7 +2668,7 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const Color
         const Word* w = nullptr;
         for (const Word& x : words)
             if (x.index == spoken) w = &x;
-        if (!w) return;
+        if (!w) return QImage();
         lines = QStringList{w->text};
         words = {{w->text, 0, w->index, 0, w->w}};
     }
@@ -2381,21 +2678,21 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const Color
     const double blockH = lineH * double(lines.size());
     // Where the style puts captions, or at the top (as far from it as the style is from the bottom),
     // or in the middle; centred, or lined up inside the graphics-safe margins (EBU R95: 5 %).
-    const double fromBottom = std::clamp(st.position, 0.05, 1.0) * img.height;
-    const double bottom = cap->vertical == kCaptionTop      ? std::min(img.height - fromBottom, img.height / 2.0 - blockH / 2) + blockH
-                          : cap->vertical == kCaptionMiddle ? (img.height + blockH) / 2
+    const double fromBottom = std::clamp(st.position, 0.05, 1.0) * height;
+    const double bottom = cap->vertical == kCaptionTop      ? std::min(height - fromBottom, height / 2.0 - blockH / 2) + blockH
+                          : cap->vertical == kCaptionMiddle ? (height + blockH) / 2
                                                             : fromBottom;
-    const double margin = img.width * 0.05;
+    const double margin = width * 0.05;
     auto leftOf = [&](double w) {
-        return cap->align == kCaptionLeft ? margin : cap->align == kCaptionRight ? img.width - margin - w : img.width / 2.0 - w / 2;
+        return cap->align == kCaptionLeft ? margin : cap->align == kCaptionRight ? width - margin - w : width / 2.0 - w / 2;
     };
     const double grow = (anim == 3 ? 0.25 : 0.0) + std::max(0.0, st.shadow) + std::max(0.0, st.outline);  // room for a popped word, shadow, outline
     // Render only the caption's area, then blend it over the frame.
     const int x0 = std::max(0, int(std::floor(leftOf(blockW) - padX - 2 - grow * px)));
-    const int x1 = std::min(img.width, int(std::ceil(leftOf(blockW) + blockW + padX + 2 + grow * px)));
+    const int x1 = std::min(width, int(std::ceil(leftOf(blockW) + blockW + padX + 2 + grow * px)));
     const int y0 = std::max(0, int(std::floor(bottom - blockH - padY - 2 - grow * px)));
-    const int y1 = std::min(img.height, int(std::ceil(bottom + padY + 2 + grow * px)));
-    if (x1 <= x0 || y1 <= y0) return;
+    const int y1 = std::min(height, int(std::ceil(bottom + padY + 2 + grow * px)));
+    if (x1 <= x0 || y1 <= y0) return QImage();
     QImage qi(x1 - x0, y1 - y0, QImage::Format_RGBA8888_Premultiplied);
     qi.fill(Qt::transparent);
     {
@@ -2467,6 +2764,15 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const Color
         pa.fillPath(text, col(st.textR, st.textG, st.textB, 1));
         pa.fillPath(said, col(st.hiR, st.hiG, st.hiB, 1));
     }
+    if (origin) *origin = QPoint(x0, y0);
+    return qi;
+}
+
+void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const ColorSpace* space) {
+    QPoint at;
+    const QImage qi = captionImage(track, t, img.width, img.height, &at);
+    if (qi.isNull()) return;
+    const int x0 = at.x(), y0 = at.y(), x1 = x0 + qi.width(), y1 = y0 + qi.height();
     if (space && space->id != rec709Space().id) {
         // Caption colours are SDR: convert the rendered patch into the picture's space.
         Image patch(qi.width(), qi.height());
@@ -2732,7 +3038,10 @@ Image renderMediaFrame(const Project& p, const MediaItem& m, double seconds, int
     Frame16Ptr f = MediaPool::instance().videoFrame(m.path, std::max(0.0, seconds), dw, dh);
     if (!f) return out;
     Image img = toImage(*f);
-    convertColor(img, mediaColorSpace(m), rec709Space());  // the source monitor shows SDR
+    // The source monitor shows SDR (by the frame's own adaptive HDR curves when it has them).
+    const AdaptiveHdr* md = m.colorOverride.empty() ? adaptiveHdrAt(m, seconds) : nullptr;
+    if (md && adaptiveConverts(*md, mediaColorSpace(m), rec709Space(), 100)) convertColorAdaptive(img, mediaColorSpace(m), *md, rec709Space(), 100);
+    else convertColor(img, mediaColorSpace(m), rec709Space());
     Geometry g;
     g.mw = mw;
     g.mh = mh;
@@ -3080,6 +3389,22 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
             for (int ch = 0; ch < 2; ++ch) st.keyBuf[size_t(i) * 2 + ch] = st.keyHp.process(ch, st.keyBuf[size_t(i) * 2 + ch]);
         return st.keyBuf.data();
     };
+    // This block's gains for a dynamics effect (`per` a sample): where to note them (recording), or the ones to use
+    // (replaying; null when the recording has none, so it listens for itself).
+    auto tapeFor = [&](const Effect& e, int per) -> float* {
+        if (!tape_) return nullptr;
+        const GainTape::Key key{tapeScope_, owner, e.id};
+        std::vector<float>& g = tape_->gains[key];
+        const size_t want = size_t(frames) * size_t(per);
+        if (!replayTape_) {
+            g.resize(g.size() + want);
+            return g.data() + g.size() - want;
+        }
+        size_t& at = tape_->read[key];
+        if (at + want > g.size()) return nullptr;
+        at += want;
+        return g.data() + at - want;
+    };
     for (const Effect& e : chain) {
         if (!e.enabled || isSourceAudioEffect(e.type)) continue;
         auto& st = states_[{owner, e.id}];
@@ -3124,6 +3449,11 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
             double att = std::exp(-1.0 / (std::max(0.1, e.p("attack_ms", lt, 10)) * sr / 1000));
             double rel = std::exp(-1.0 / (std::max(1.0, e.p("release_ms", lt, 120)) * sr / 1000));
             double makeup = e.p("makeup_db", lt);
+            float* tape = tapeFor(e, 1);
+            if (tape && replayTape_) {
+                for (int i = 0; i < frames; ++i) buf[size_t(i) * 2] *= tape[i], buf[size_t(i) * 2 + 1] *= tape[i];
+                continue;
+            }
             const float* key = detector(e, *st);
             for (int i = 0; i < frames; ++i) {
                 float* d = &buf[size_t(i) * 2];
@@ -3136,17 +3466,27 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
                 float g = dbToLin(makeup - gr);
                 d[0] *= g;
                 d[1] *= g;
+                if (tape) tape[i] = g;
             }
         } else if (e.type == "limiter") {
             float ceil = dbToLin(e.p("ceiling_db", lt, -1));
             double rel = std::exp(-1.0 / (std::max(1.0, e.p("release_ms", lt, 60)) * sr / 1000));
+            // (Each channel's own gain on the tape, the clipping at the ceiling included.)
+            float* tape = tapeFor(e, 2);
+            if (tape && replayTape_) {
+                for (size_t i = 0; i < size_t(frames) * 2; ++i) buf[i] *= tape[i];
+                continue;
+            }
             for (int i = 0; i < frames; ++i) {
                 float* d = &buf[size_t(i) * 2];
                 double pk = std::max(std::fabs(d[0]), std::fabs(d[1]));
                 double target = pk > ceil ? ceil / pk : 1.0;
                 st->gain = target < st->gain ? target : rel * st->gain + (1 - rel) * target;
-                d[0] = std::clamp(float(d[0] * st->gain), -ceil, ceil);
-                d[1] = std::clamp(float(d[1] * st->gain), -ceil, ceil);
+                for (int ch = 0; ch < 2; ++ch) {
+                    const float in = d[ch];
+                    d[ch] = std::clamp(float(in * st->gain), -ceil, ceil);
+                    if (tape) tape[size_t(i) * 2 + ch] = in != 0 ? d[ch] / in : float(st->gain);
+                }
             }
         } else if (e.type == "parametric_eq") {
             if (changed) {
@@ -3159,10 +3499,14 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
             }
             st->eq.process(buf, frames);
         } else if (e.type == "deesser") {
-            st->deesser.process(buf, frames, sr, e.p("hz", lt, 6000), e.p("threshold_db", lt, -30), e.p("reduction_db", lt, 10));
+            float* tape = tapeFor(e, 1);
+            st->deesser.process(buf, frames, sr, e.p("hz", lt, 6000), e.p("threshold_db", lt, -30), e.p("reduction_db", lt, 10), tape,
+                                replayTape_);
         } else if (e.type == "gate") {
+            float* tape = tapeFor(e, 1);
             st->gate.process(buf, frames, sr, e.p("threshold_db", lt, -45), e.p("range_db", lt, -40), e.p("attack_ms", lt, 1),
-                             e.p("hold_ms", lt, 50), e.p("release_ms", lt, 150), detector(e, *st));
+                             e.p("hold_ms", lt, 50), e.p("release_ms", lt, 150), tape && replayTape_ ? nullptr : detector(e, *st), tape,
+                             replayTape_);
         } else if (e.type == "reverb") {
             st->reverb.process(buf, frames, sr, e.p("size", lt, 50) / 100, e.p("damping", lt, 50) / 100, e.p("width", lt, 100) / 100,
                                e.p("mix", lt, 25) / 100);
@@ -3200,8 +3544,9 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
                 const std::string n(names[k]);
                 b[k] = {e.p(n + "_threshold_db", lt, -24), e.p(n + "_ratio", lt, ratios[k]), e.p(n + "_gain_db", lt, 0)};
             }
+            float* tape = tapeFor(e, 3);
             st->multiband.process(buf, frames, sr, e.p("low_hz", lt, 200), e.p("high_hz", lt, 2500), b, e.p("attack_ms", lt, 10),
-                                  e.p("release_ms", lt, 150), e.p("output_db", lt, 0));
+                                  e.p("release_ms", lt, 150), e.p("output_db", lt, 0), tape, replayTape_);
         } else if (e.type == "dehum") {
             st->dehum.process(buf, frames, sr, e.p("mains", lt, 0) > 0.5 ? 60 : 50, int(std::lround(e.p("harmonics", lt, 6))),
                               e.p("reduction_db", lt, 30), e.p("width_hz", lt, 2));
@@ -3225,6 +3570,20 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
             st->width.process(buf, frames, sr, e.p("width", lt, 100) / 100, e.p("bass_mono_hz", lt, 0));
         } else if (e.type == "channels") {
             fx::channelTools(buf, frames, int(e.p("mode", lt, 0)), e.p("invert_l", lt) > 0.5, e.p("invert_r", lt) > 0.5);
+        } else if (e.type == "plugin" && delayOnly_.count(e.id)) {
+            ensurePlugin(*st, e, sr);
+            const int lat = st->plugin ? std::max(0, st->plugin->latencySamples()) : 0;
+            if (lat > 0) {
+                if (st->delay.size() != size_t(lat) * 2) {
+                    st->delay.assign(size_t(lat) * 2, 0.0f);
+                    st->pos = 0;
+                }
+                for (int i = 0; i < frames * 2; ++i) {
+                    std::swap(buf[i], st->delay[st->pos]);
+                    if (++st->pos == st->delay.size()) st->pos = 0;
+                }
+            }
+            keyAt -= lat;
         } else if (e.type == "plugin") {
             // Its key input hears its sidechain track (not its own), as the compressor's detector does.
             const float* key = nullptr;
@@ -3266,10 +3625,12 @@ void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int f
             resetLocked();
             if (const int pre = maxLatency(seq, seq.sampleRate); pre > 0) {
                 std::vector<float> scratch(size_t(pre) * 2);
+                TapeOff off(tape_);
                 mixInto(p, seq, start - pre, pre, scratch.data(), nullptr, 0);
             }
         }
         nextStart_ = start + frames;
+        startTape();
         mixInto(p, seq, start, frames, out, trackLevels, 0);
         return;
     }
@@ -3281,10 +3642,12 @@ void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int f
             resetLocked();
             if (const int pre = maxLatency(seq, seq.sampleRate); pre > 0) {
                 std::vector<float> scratch(size_t(pre) * size_t(n));
+                TapeOff off(tape_);
                 mixInto(p, seq, start - pre, pre, scratch.data(), nullptr, 0, 0, -1, n);
             }
         }
         nextStart_ = start + frames;
+        startTape();
         mixInto(p, seq, start, frames, full.data(), trackLevels, 0, 0, -1, n);
         // An ambisonic mix heard binaurally (the decoder keeps its state from block to block).
         if (ambisonicLayout(seq.audioLayout) && ambisonicBinaural_) {
@@ -3295,7 +3658,8 @@ void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int f
     downmixToStereo(seq.audioLayout, full.data(), frames, out);
 }
 
-void AudioMixer::mixLayout(const Project& p, const Sequence& seq, int64_t start, int frames, float* out) {
+void AudioMixer::mixLayout(const Project& p, const Sequence& seq, int64_t start, int frames, float* out,
+                           std::vector<MeterLevels>* trackLevels) {
     ExpressionScope expressions(&p, &seq);  // (core/Expression.h)
     const int n = layoutChannels(seq.audioLayout);
     std::lock_guard lock(m_);
@@ -3303,11 +3667,13 @@ void AudioMixer::mixLayout(const Project& p, const Sequence& seq, int64_t start,
         resetLocked();
         if (const int pre = maxLatency(seq, seq.sampleRate); pre > 0) {
             std::vector<float> scratch(size_t(pre) * size_t(n));
+            TapeOff off(tape_);
             mixInto(p, seq, start - pre, pre, scratch.data(), nullptr, 0, 0, -1, n);
         }
     }
     nextStart_ = start + frames;
-    mixInto(p, seq, start, frames, out, nullptr, 0, 0, -1, n);
+    startTape();
+    mixInto(p, seq, start, frames, out, trackLevels, 0, 0, -1, n);
 }
 
 bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Track& track, int64_t start, int frames,
@@ -3330,6 +3696,11 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             FrameTime a, b;
             if (!edit::transitionRange(track, tr, a, b)) continue;
             int64_t as = int64_t(std::llround(a * sr / fps)), bs = int64_t(std::llround(b * sr / fps));
+            // A comp's join (core/TakeLanes.h): a crossfade of so many seconds, centred on the edit point, to the sample.
+            if (const double secs = tr.params.p("seconds", 0, 0); secs > 0 && tr.clipA && tr.clipB) {
+                as = int64_t(std::llround(double(a + tr.duration / 2) * sr / fps - secs * sr / 2));
+                bs = as + std::max<int64_t>(1, int64_t(std::llround(secs * sr)));
+            }
             if (tr.clipB == c.id) {
                 ps = std::min(ps, as);
                 fiS = as;
@@ -3424,6 +3795,7 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                     origin = int64_t(std::floor(lo));
                     n = int64_t(std::floor(hi)) - origin + 2;
                     nf.assign(size_t(n) * size_t(nch), 0.0f);
+                    TapeScope scope(tapeScope_, c.id);
                     mixInto(p, *nested, origin, int(n), nf.data(), nullptr, depth + 1, int(sr), nested->multicam ? c.audioAngle : -1, nch);
                     src = nf.data();
                 }
@@ -3546,7 +3918,10 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             int64_t nLen = s1 > s0 ? int64_t(std::floor(hi)) - nStart + 2 : 0;
             std::vector<float> nb(size_t(std::max<int64_t>(0, nLen)) * 2, 0.0f);
             const int only = nested->multicam ? c.audioAngle : -1;
-            if (nLen > 0) mixInto(p, *nested, nStart, int(nLen), nb.data(), nullptr, depth + 1, int(sr), only);
+            if (nLen > 0) {
+                TapeScope scope(tapeScope_, c.id);
+                mixInto(p, *nested, nStart, int(nLen), nb.data(), nullptr, depth + 1, int(sr), only);
+            }
             for (int64_t smp = s0; smp < s1; ++smp) {
                 double rel = srcPos(smp) - double(nStart);
                 int64_t i = std::clamp<int64_t>(int64_t(rel), 0, nLen - 2);

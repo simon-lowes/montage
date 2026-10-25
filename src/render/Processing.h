@@ -2,6 +2,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -191,6 +192,11 @@ struct Lut3D {
     void apply(float& r, float& g, float& b) const;
 };
 std::shared_ptr<const Lut3D> loadCubeLut(const std::string& path, std::string* error = nullptr);
+// A .cube or CLF file's transform on one colour, as the LUT effect applies it; null (with the reason) when it cannot be
+// read.
+std::function<void(float[3])> lutTransform(const std::string& path, std::string* error = nullptr);
+// The space a CDL or LUT effect's "Apply In" names (null: the working space).
+const ColorSpace* effectApplySpace(const Effect& e);
 // Drops a cached .cube so the next load reads the file again (after it was rewritten).
 void forgetCubeLut(const std::string& path);
 

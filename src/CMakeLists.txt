@@ -2,6 +2,7 @@ add_library(montage_engine STATIC
   core/Model.h core/Model.cpp
   core/MediaLog.h core/MediaLog.cpp
   core/Cdl.h core/Cdl.cpp
+  core/AdaptiveHdrMetadata.h core/AdaptiveHdrMetadata.cpp
   core/Ale.h core/Ale.cpp
   core/Ucs.h core/Ucs.cpp
   core/KeyframeEdit.h core/KeyframeEdit.cpp
@@ -29,6 +30,8 @@ add_library(montage_engine STATIC
   core/ScriptCut.h core/ScriptCut.cpp
   core/Cfb.h core/Cfb.cpp
   core/Zip.h core/Zip.cpp
+  core/Xlsx.h core/Xlsx.cpp
+  core/Paperwork.h core/Paperwork.cpp
   core/G2p.h core/G2p.cpp
   core/Checkerboard.h core/Checkerboard.cpp
   core/Bleep.h core/Bleep.cpp
@@ -47,6 +50,7 @@ add_library(montage_engine STATIC
   core/TimelineCompare.h core/TimelineCompare.cpp
   core/Reconform.h core/Reconform.cpp
   core/Adr.h core/Adr.cpp
+  core/TakeLanes.h core/TakeLanes.cpp
   core/Provenance.h core/Provenance.cpp
   core/LensProfile.h core/LensProfile.cpp
   core/AudioDescription.h core/AudioDescription.cpp
@@ -77,6 +81,7 @@ add_library(montage_engine STATIC
   automation/McpServer.h automation/McpServer.cpp
   media/Image.h media/Image.cpp
   media/Decoder.h media/Decoder.cpp
+  media/DeepImage.h media/DeepImage.cpp
   media/Exr.h media/Exr.cpp
   media/Vector.h media/Vector.cpp
   media/CameraRaw.h media/CameraRaw.cpp
@@ -97,6 +102,7 @@ add_library(montage_engine STATIC
   media/DescribePicture.h media/DescribePicture.cpp
   media/LanguageModel.h media/LanguageModel.cpp
   media/StemSeparation.h media/StemSeparation.cpp
+  media/MusicTags.h media/MusicTags.cpp
   media/BanditSeparation.h media/BanditSeparation.cpp
   media/LipSync.h media/LipSync.cpp
   media/LtcTimecode.h media/LtcTimecode.cpp
@@ -114,6 +120,7 @@ add_library(montage_engine STATIC
   render/ColorChart.h render/ColorChart.cpp
   media/Loudness.h media/Loudness.cpp
   media/StereoAnalysis.h media/StereoAnalysis.cpp
+  media/TakeChoice.h media/TakeChoice.cpp
   media/AudioSync.h media/AudioSync.cpp
   media/FieldRecorder.h media/FieldRecorder.cpp
   media/ImageSequence.h media/ImageSequence.cpp
@@ -178,6 +185,7 @@ add_library(montage_engine STATIC
   render/Letterbox.h render/Letterbox.cpp
   render/LightLevel.h render/LightLevel.cpp
   render/Hdr10Plus.h render/Hdr10Plus.cpp
+  render/AdaptiveHdr.h render/AdaptiveHdr.cpp
   control/Midi.h control/Midi.cpp
   control/MackieControl.h control/MackieControl.cpp
   control/Hui.h control/Hui.cpp
@@ -203,6 +211,8 @@ add_library(montage_engine STATIC
   core/Expression.h render/Expressions.cpp
   render/QualityCheck.h render/QualityCheck.cpp
   render/LutExport.h render/LutExport.cpp
+  render/LutToGrade.h render/LutToGrade.cpp
+  render/GrainMatch.h render/GrainMatch.cpp
   render/ProjectManager.h render/ProjectManager.cpp
   render/AutoBroll.h render/AutoBroll.cpp
   render/AutoMix.h render/AutoMix.cpp
@@ -221,6 +231,8 @@ add_library(montage_engine STATIC
   render/Gallery.h render/Gallery.cpp
   render/LinedScript.h render/LinedScript.cpp
   render/FilmLists.h render/FilmLists.cpp
+  render/PaperworkOutput.h render/PaperworkOutput.cpp
+  render/ImageSubtitles.h render/ImageSubtitles.cpp
   render/TrimPasses.h render/TrimPasses.cpp
   render/AutoTrims.h render/AutoTrims.cpp
   render/DialogueLoudness.h render/DialogueLoudness.cpp
@@ -239,6 +251,7 @@ add_library(montage_engine STATIC
   render/SkyReplace.h render/SkyReplace.cpp
   render/FaceShape.h render/FaceShape.cpp
   render/MonitorCalibration.h render/MonitorCalibration.cpp
+  render/MonitorSection.h render/MonitorSection.cpp
   audio/Plugins.h audio/PluginScan.cpp audio/ClapHost.cpp
   audio/DynLib.h audio/DynLib.cpp
   audio/PluginEffect.h audio/PluginEffect.cpp

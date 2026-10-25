@@ -202,7 +202,10 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     captions_->addItem(tr("Burn into the picture"), 1);
     captions_->addItem(tr("Embed as a subtitle track"), 2);
     captions_->addItem(tr("Burn in and embed"), 3);
-    captions_->setCurrentIndex(std::clamp(appSettings().value("export/captions", 0).toInt(), 0, 3));
+    // Pictures drawn in the track's style, as Blu-ray and broadcast deliveries take them (Matroska; DVB in MPEG-TS too).
+    captions_->addItem(tr("Embed as subtitle pictures (PGS)"), 2 | 4);
+    captions_->addItem(tr("Embed as DVB subtitle pictures"), 2 | 8);
+    captions_->setCurrentIndex(std::clamp(appSettings().value("export/captions", 0).toInt(), 0, captions_->count() - 1));
     form->addRow(tr("Captions:"), captions_);
     allCaptions_ = new QCheckBox(tr("Every caption track (a stream each)"), form_);
     allCaptions_->setObjectName(QStringLiteral("exportAllCaptions"));
@@ -355,6 +358,13 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
                               "Uses Analyse HDR Light Levels' measurements while the cut still matches them, else measures first."));
     hdr10Plus_->setChecked(appSettings().value("export/hdr10Plus", false).toBool());
     form->addRow(QString(), hdr10Plus_);
+    adaptiveHdr_ = new QCheckBox(tr("Adaptive HDR metadata (ST 2094-50, any display's headroom)"), form_);
+    adaptiveHdr_->setObjectName(QStringLiteral("exportAdaptiveHdr"));
+    adaptiveHdr_->setToolTip(tr("Each scene's reference white, headroom and the gain curve to its SDR rendition (the sequence's SDR trim, "
+                                "else Montage's own mapping), so phones, browsers and displays of any brightness tone it down as the "
+                                "grade did: carried in HEVC and AV1 video. Uses Analyse HDR Light Levels' fit while the cut still matches it."));
+    adaptiveHdr_->setChecked(appSettings().value("export/adaptiveHdr", false).toBool());
+    form->addRow(QString(), adaptiveHdr_);
     // OpenEXR frames: any of OpenEXR's compressions (HTJ2K and zstd through the OpenEXR library).
     exrCompression_ = new QComboBox(form_);
     exrCompression_->setObjectName(QStringLiteral("exportExrCompression"));
@@ -790,6 +800,7 @@ void ExportDialog::updateControls() {
         const ColorSpace* out = chosen ? chosen : sq ? &sequenceColorSpace(*sq) : nullptr;
         const std::string vc = p ? p->settings.videoCodec : std::string();
         hdr10Plus_->setEnabled(video && out && out->transfer == Transfer::Pq && vc != "exr" && vc != "gif");
+        adaptiveHdr_->setEnabled(video && out && out->hdr() && vc != "exr" && vc != "gif");
         exrCompression_->setEnabled(video && vc == "exr" && exrAvailable());
     }
     loudness_->setEnabled(p && hasAudio(p->settings));
@@ -1022,6 +1033,7 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         const int mode = captions_->currentData().toInt();
         s.burnInCaptions = mode & 1;
         s.embedCaptions = mode & 2;
+        s.captionImages = mode & 4 ? "pgs" : mode & 8 ? "dvb" : "";
     }
     settings.setValue("export/captions", captions_->currentIndex());
     if (allCaptions_->isEnabled() && allCaptions_->isChecked() && state_->sequence())
@@ -1032,6 +1044,8 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     settings.setValue("export/cea608", cea608_->isChecked());
     s.hdr10Plus = hdr10Plus_->isEnabled() && hdr10Plus_->isChecked();
     settings.setValue("export/hdr10Plus", hdr10Plus_->isChecked());
+    s.adaptiveHdr = adaptiveHdr_->isEnabled() && adaptiveHdr_->isChecked();
+    settings.setValue("export/adaptiveHdr", adaptiveHdr_->isChecked());
     if (exrCompression_->isEnabled()) {
         const std::string c = exrCompression_->currentData().toString().toStdString();
         s.exrCompression = c == "zip" ? std::string() : c;  // (ZIP: FFmpeg's writer, as before)

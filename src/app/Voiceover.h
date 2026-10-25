@@ -11,12 +11,14 @@
 #include <QString>
 #include <QStringList>
 #include <QTimer>
+#include <optional>
 
 #include "core/Model.h"
 
 class QAudioSource;
 class QCheckBox;
 class QComboBox;
+class QDoubleSpinBox;
 class QIODevice;
 class QLabel;
 class QProgressBar;
@@ -65,6 +67,14 @@ public:
     // (punch-in to Out). `openDevice` false takes sound only through feed().
     bool start(FrameTime at, int track, FrameTime stopAt = -1, const QString& input = {}, bool openDevice = true,
                int sampleRate = 48000, int channels = 1);
+    // Loop recording (core/TakeLanes.h): the take starts `preroll` frames before `in` and runs on while the picture
+    // loops from `in` to `out` (exclusive). On stop each pass from In to Out (and a last one of at least a second)
+    // becomes a WAV of its own and a take lane on the track starting at In, and the last whole pass is given to the
+    // comp there (one undo step); stop() returns that comp clip.
+    bool startLoop(FrameTime in, FrameTime out, FrameTime preroll, int track, const QString& input = {}, bool openDevice = true,
+                   int sampleRate = 48000, int channels = 1);
+    bool isLooping() const { return loopOut_ > loopIn_; }
+    int passes() const;  // whole passes recorded so far
     // Sound for the take (float, interleaved); the device's sound arrives here too.
     void feed(const float* interleaved, qint64 frames);
     // Ends the take: the file is finished, imported and placed. Returns the new
@@ -85,6 +95,7 @@ signals:
 
 private:
     void readDevice();
+    Id stopLoop();
 
     EditorState* state_;
     WavWriter writer_;
@@ -98,6 +109,7 @@ private:
     QString folder_ = QStringLiteral("Voiceover"), stem_;
     bool stopping_ = false;
     bool placing_ = true;
+    FrameTime loopIn_ = 0, loopOut_ = 0, preroll_ = 0;
 };
 
 // Sequence › Record Voiceover: input, level, countdown and punch-in.
@@ -119,6 +131,9 @@ private:
     QComboBox* track_;
     QCheckBox* countdown_;
     QCheckBox* punch_;
+    QCheckBox* loop_;
+    QDoubleSpinBox* preroll_;
+    std::optional<bool> wasLooping_;  // the player's own loop setting, while a loop recording loops it
     QProgressBar* meter_;
     QLabel* status_;
     QPushButton* record_;

@@ -435,7 +435,16 @@ void ControlSurface::command(const QString& name) {
 }
 
 void ControlSurface::button(int note, bool down) {
+    // The monitor keys (F1 Dim, F2 Mono, F3 Mute; F4 talks back while it is held).
+    if (note == mcu::F1 + 3) {
+        command(down ? QStringLiteral("talkbackOn") : QStringLiteral("talkbackOff"));
+        return;
+    }
     if (!down) return;
+    if (note >= mcu::F1 && note < mcu::F1 + 3) {
+        command(note == mcu::F1 ? QStringLiteral("dim") : note == mcu::F1 + 1 ? QStringLiteral("mono") : QStringLiteral("monitorMute"));
+        return;
+    }
     const int n = tracks();
     auto strip = [&](int base) { return note >= base && note < base + mcu::kStrips ? bank_ + note - base : -1; };
     if (const int t = strip(mcu::Mute); t >= 0) {
@@ -568,7 +577,9 @@ void ControlSurface::refresh() {
             sendFader(i, fv);
             was.fader = fv;
         }
-        const int mute = tr && tr->muted ? 2 : 0, solo = tr && tr->solo ? 2 : 0, select = has && t == selected ? 2 : 0;
+        QToolButton* soloButton = has ? mixer_->trackSolo(t) : nullptr;  // (the monitor's solos, when the mixer's are)
+        const int mute = tr && tr->muted ? 2 : 0, solo = soloButton ? (soloButton->isChecked() ? 2 : 0) : tr && tr->solo ? 2 : 0;
+        const int select = has && t == selected ? 2 : 0;
         if (mute != was.mute) sendLed(mcu::Mute + i, was.mute = mute);
         if (solo != was.solo) sendLed(mcu::Solo + i, was.solo = solo);
         if (select != was.select) sendLed(mcu::Select + i, was.select = select);
