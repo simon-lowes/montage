@@ -256,6 +256,7 @@ add_library(montage_engine STATIC
   render/MonitorCalibration.h render/MonitorCalibration.cpp
   render/MonitorSection.h render/MonitorSection.cpp
   audio/Plugins.h audio/PluginScan.cpp audio/ClapHost.cpp
+  audio/AraHost.h audio/AraHost.cpp ${PROJECT_SOURCE_DIR}/third_party/ara/ARA_Library/Dispatch/ARAHostDispatch.cpp
   audio/DynLib.h audio/DynLib.cpp
   audio/PluginEffect.h audio/PluginEffect.cpp
   audio/SpeechCleanup.h audio/SpeechCleanup.cpp
@@ -269,6 +270,8 @@ add_library(montage_engine STATIC
 )
 target_include_directories(montage_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/clap/include)
+# ARA 2 interfaces and host dispatch library (Apache-2.0, Celemony's SDK), for hosting ARA plug-ins (audio/AraHost).
+target_include_directories(montage_engine SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/third_party/ara)
 # glTF and OBJ readers (media/Model3D.cpp), as system headers so their own warnings stay theirs.
 target_include_directories(montage_engine SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/third_party/cgltf ${PROJECT_SOURCE_DIR}/third_party/tinyobjloader)
 # OpenFX 1.5 headers (BSD-3-Clause, the ASWF's), for hosting video plugins (render/Ofx).

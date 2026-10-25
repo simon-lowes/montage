@@ -41,6 +41,7 @@ struct Descriptor {
     std::string category;  // e.g. "EQ", "Dynamics", "Reverb"
     std::string path;      // plugin file or bundle
     bool instrument = false;
+    bool ara = false;  // it offers ARA (audio random access: audio/AraHost.h)
     bool operator==(const Descriptor&) const = default;
 };
 
@@ -89,6 +90,24 @@ public:
     virtual void enableSidechain(bool on) {}
     // Clears internal audio state (delay lines, envelopes) after a seek.
     virtual void reset() {}
+
+    // ARA (audio/AraHost.h). The plugin's ARA factory (a const ARA::ARAFactory*), null when it has none.
+    virtual const void* araFactory() { return nullptr; }
+    // Binds the instance to an ARA document controller (an ARA::ARADocumentControllerRef) with the roles it is to
+    // play (ARA::ARAPlugInInstanceRoleFlags), before activate(); its ARA::ARAPlugInExtensionInstance, or null.
+    virtual const void* bindToAra(void* documentController, uint32_t knownRoles, uint32_t assignedRoles) { return nullptr; }
+    // Where the following process() calls are on the timeline (samples at the activated rate), whether it is playing,
+    // and its steady tempo and bar (x/4), which ARA renderers follow; process() moves the position on by the frames
+    // processed.
+    virtual void setTransport(int64_t samplePosition, bool playing, double bpm = 120, int beatsPerBar = 4) {}
+    // Rendering faster or slower than real time, not for live playback (VST3's offline process mode, CLAP's render
+    // extension); before activate().
+    virtual void setOffline(bool offline) {}
+    // Asks for main input and output ports of `channels` channels (before activate()); false if the plugin keeps its
+    // own (the audio is then folded to them and spread back).
+    virtual bool setMainChannels(int channels) { return false; }
+    // Keeps the plugin's file loaded while held (ARA objects outlive the instances bound to them).
+    virtual std::shared_ptr<const void> library() { return nullptr; }
 
     // The plugin's own editor window, embedded in a native window of this
     // platform: an NSView* on macOS, an HWND on Windows, an X11 window id on

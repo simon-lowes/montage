@@ -803,6 +803,13 @@ std::vector<EffectInfo> buildCatalog() {
         EffectInfo plugin{"plugin", "Audio Plugin", EffectCategory::AudioFilter, "Plugins", {}, {}};
         plugin.hidden = true;
         c.push_back(plugin);
+        // An ARA plug-in on the clip's whole sound (audio/AraHost.h): the musical context it is given.
+        EffectInfo ara{"ara", "ARA Plug-in", EffectCategory::AudioFilter, "Plugins",
+                       {num("tempo_bpm", "Tempo (BPM)", 10, 1000, 120, 0.01), num("beats_per_bar", "Beats per Bar", 1, 32, 4, 1)},
+                       {}};
+        ara.hidden = true;
+        for (ParamInfo& pi : ara.params) pi.keyframeable = false;
+        c.push_back(ara);
     }
     {
         // An OpenFX video plugin; see render/Ofx.h.

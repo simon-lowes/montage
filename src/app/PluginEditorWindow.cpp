@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "EditorState.h"
+#include "audio/AraHost.h"
 #include "audio/PluginEffect.h"
 #include "core/EditOps.h"
 
@@ -61,8 +62,10 @@ PluginEditorWindow::PluginEditorWindow(EditorState* state, Id clip, Id effect, Q
 PluginEditorWindow::~PluginEditorWindow() {
     auto& v = openWindows();
     v.erase(std::remove(v.begin(), v.end(), this), v.end());
-    if (inst_ && editorOpen_) inst_->closeEditor();
+    if (instance() && editorOpen_) instance()->closeEditor();
 }
+
+plugins::Instance* PluginEditorWindow::instance() const { return ara_ ? ara_->instance() : inst_.get(); }
 
 const Effect* PluginEditorWindow::effect() const {
     const Sequence* s = state_->sequence();
@@ -83,35 +86,50 @@ bool PluginEditorWindow::start(QString* error) {
         return false;
     };
     const Effect* e = effect();
-    if (!e || e->type != "plugin") return fail(tr("This effect is not a plugin"));
+    if (!e || (e->type != "plugin" && e->type != "ara")) return fail(tr("This effect is not a plugin"));
     const auto d = plugins::Registry::instance().find(e->s("plugin_id"));
     if (!d) return fail(tr("The plugin is not installed or has not been scanned"));
     std::string err;
-    inst_ = plugins::instantiate(*d, &err);
-    if (!inst_) return fail(tr("The plugin could not be loaded: %1").arg(QString::fromStdString(err)));
-    const std::string saved = plugins::decodeState(e->s("state"));
-    if (!saved.empty()) inst_->loadState(saved);
-    for (const plugins::ParamInfo& p : inst_->parameters()) params_[p.id] = p;
+    if (e->type == "ara") {
+        // An ARA plug-in edits the clip's document: its editor view and renderer bound to the clip's sound.
+        const Sequence* s = state_->sequence();
+        const Clip* c = s ? edit::clipById(*s, clip_) : nullptr;
+        std::string key;
+        AudioBufferPtr sound;
+        if (!c || !ara::clipSource(state_->project(), *s, *c, key, sound, &err) || !(ara_ = ara::liveSession(*e, key, sound, &err)))
+            return fail(tr("The ARA plug-in could not open the clip: %1").arg(QString::fromStdString(err)));
+        araArchive_ = e->s("archive");
+    } else {
+        inst_ = plugins::instantiate(*d, &err);
+        if (!inst_) return fail(tr("The plugin could not be loaded: %1").arg(QString::fromStdString(err)));
+        const std::string saved = plugins::decodeState(e->s("state"));
+        if (!saved.empty()) inst_->loadState(saved);
+    }
+    plugins::Instance* inst = instance();
+    for (const plugins::ParamInfo& p : inst->parameters()) params_[p.id] = p;
     syncFromProject();
-    if (!inst_->hasEditor()) return fail(tr("%1 has no editor of its own; use its controls in the Inspector")
-                                             .arg(QString::fromStdString(d->name)));
+    if (!inst->hasEditor()) return fail(tr("%1 has no editor of its own; use its controls in the Inspector")
+                                            .arg(QString::fromStdString(d->name)));
     int w = 400, h = 300;
     void* parent = reinterpret_cast<void*>(host_->winId());
-    if (!inst_->openEditor(parent, this, w, h)) return fail(tr("The plugin's editor could not be opened"));
+    if (!inst->openEditor(parent, this, w, h)) return fail(tr("The plugin's editor could not be opened"));
     editorOpen_ = true;
     if (requestedW_ > 0 && requestedH_ > 0) {
         w = requestedW_;
         h = requestedH_;
     }
     setWindowTitle(QStringLiteral("%1 — %2").arg(QString::fromStdString(d->name), QString::fromStdString(plugins::effectName(*e))));
-    if (!inst_->editorResizable()) {
+    if (!inst->editorResizable()) {
         host_->setFixedSize(std::max(1, w), std::max(1, h));
         adjustSize();
     } else {
         resize(std::max(1, w), std::max(1, h));  // the layout has no margins: the editor fills the window
     }
     idle_ = new QTimer(this);
-    connect(idle_, &QTimer::timeout, this, [this] { inst_->idle(); });
+    connect(idle_, &QTimer::timeout, this, [this] {
+        if (ara_) ara_->idle();
+        else inst_->idle();
+    });
     idle_->start(30);
     // Settings are saved into the project every few seconds and on close.
     auto* saver = new QTimer(this);
@@ -124,6 +142,11 @@ bool PluginEditorWindow::start(QString* error) {
             close();  // the effect or its clip is gone (deleted, or undone)
             return;
         }
+        if (ara_ && effect()->s("archive") != araArchive_) {
+            discard_ = true;  // an undo or a reset replaced the document: this one is out of date
+            close();
+            return;
+        }
         syncFromProject();
     });
     connect(state_, &EditorState::playheadChanged, this, [this] { syncFromProject(); });
@@ -132,7 +155,8 @@ bool PluginEditorWindow::start(QString* error) {
 
 void PluginEditorWindow::syncFromProject() {
     const Effect* e = effect();
-    if (!e || !inst_) return;
+    plugins::Instance* inst = instance();
+    if (!e || !inst) return;
     // Show the parameter values the project has at the playhead (automation, Inspector edits, undo).
     const FrameTime lt = localTime();
     for (const auto& [key, param] : e->params) {
@@ -141,7 +165,7 @@ void PluginEditorWindow::syncFromProject() {
         if (gesture_.count(id)) continue;  // the user is dragging it right now
         const auto live = state_->liveParameter(clip_, effect_, key);  // a mixer pass writing it
         const double v = live ? *live : param.at(lt);
-        if (std::fabs(inst_->parameter(id) - v) > 1e-9) inst_->setParameter(id, v);
+        if (std::fabs(inst->parameter(id) - v) > 1e-9) inst->setParameter(id, v);
     }
 }
 
@@ -196,20 +220,31 @@ void PluginEditorWindow::editorResize(int width, int height) {
 
 void PluginEditorWindow::resizeEvent(QResizeEvent* e) {
     QWidget::resizeEvent(e);
-    if (!resizing_ && editorOpen_ && inst_ && inst_->editorResizable()) inst_->setEditorSize(host_->width(), host_->height());
+    if (!resizing_ && editorOpen_ && instance() && instance()->editorResizable()) instance()->setEditorSize(host_->width(), host_->height());
 }
 
 void PluginEditorWindow::saveSettings() {
     const Effect* e = effect();
-    if (!e || !inst_) return;
-    inst_->idle();
-    const std::string state = plugins::encodeState(inst_->saveState());
-    if (state.empty() || state == e->s("state")) return;
+    plugins::Instance* inst = instance();
+    if (!e || !inst || discard_) return;
+    if (ara_) ara_->idle();
+    else inst->idle();
+    const std::string state = plugins::encodeState(inst->saveState());
+    // An ARA plug-in's edits live in its document, kept with the project as an archive when it reports a change.
+    const std::string archive = ara_ && ara_->changed() ? plugins::encodeState(ara_->archive()) : std::string();
+    const bool newState = !state.empty() && state != e->s("state");
+    const bool newArchive = ara_ && !archive.empty() && archive != e->s("archive");
+    if (!newState && !newArchive) return;
     const Id clip = clip_, eff = effect_;
-    state_->edit(tr("Plugin Settings"), [clip, eff, state](Project&, Sequence& s) {
+    if (newArchive) {
+        araArchive_ = archive;  // (before the edit: its projectChanged must find the document current)
+        ara::noteArchiveSaved(eff, archive);
+    }
+    state_->edit(tr("Plugin Settings"), [clip, eff, state, archive, newState, newArchive](Project&, Sequence& s) {
         Effect* fx = edit::ownedEffect(s, clip, eff);
         if (!fx) return false;
-        fx->strings["state"] = state;
+        if (newState) fx->strings["state"] = state;
+        if (newArchive) fx->strings["archive"] = archive;
         return true;
     }, QStringLiteral("plugin-state-%1").arg(eff));
 }
@@ -217,7 +252,7 @@ void PluginEditorWindow::saveSettings() {
 void PluginEditorWindow::closeEvent(QCloseEvent* e) {
     if (editorOpen_) {
         saveSettings();
-        inst_->closeEditor();
+        instance()->closeEditor();
         editorOpen_ = false;
     }
     QWidget::closeEvent(e);

@@ -17,8 +17,8 @@
 namespace montage {
 
 // Effect types processed this way ("denoise", "voice_isolate", "enhance_speech",
-// "declick", "declip", "deplosive", "dewind" and "pitch_shift" from AudioRepair.h, and "dialogue_align" from
-// DialogueAlign.h).
+// "declick", "declip", "deplosive", "dewind" and "pitch_shift" from AudioRepair.h, "dialogue_align" from
+// DialogueAlign.h, and "ara", an ARA plug-in, from AraHost.h).
 bool isSourceAudioEffect(const std::string& type);
 // (A Dialogue Alignment is for one take of an audition: DialogueAlign.h dialogueAlignmentApplies.)
 // True if this build includes the RNNoise voice model.

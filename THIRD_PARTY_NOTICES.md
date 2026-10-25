@@ -60,6 +60,7 @@ licence Adobe offers with its Gain Map specification; its terms are Adobe's, as 
 | [cgltf](https://github.com/jkuhlmann/cgltf) 1.14, which reads glTF 2.0 models | MIT | [third_party/cgltf/LICENSE](third_party/cgltf/LICENSE) |
 | [tinyobjloader](https://github.com/tinyobjloader/tinyobjloader) 2.0.0rc13, which reads OBJ models | MIT (its optional earcut triangulator, ISC, is not compiled in) | [third_party/tinyobjloader/LICENSE](third_party/tinyobjloader/LICENSE) |
 | [CLAP](https://github.com/free-audio/clap) headers | MIT | [third_party/clap/LICENSE](third_party/clap/LICENSE) |
+| Celemony's [ARA Audio Random Access SDK](https://github.com/Celemony/ARA_SDK) 2.3.0: the API headers (with the VST3 and CLAP companion headers) and the ARA Library's host dispatch, for hosting ARA plug-ins. ARA Audio Random Access is a trademark of Celemony Software GmbH | Apache-2.0 | [third_party/ara/LICENSE.txt](third_party/ara/LICENSE.txt) |
 | [OpenFX](https://github.com/AcademySoftwareFoundation/openfx) headers | BSD-3-Clause | [third_party/openfx/LICENSE](third_party/openfx/LICENSE) |
 | Blackmagic DeckLink SDK 12.0 headers | Blackmagic Design's header licence | [third_party/decklink/LICENSE](third_party/decklink/LICENSE) |
 | NDI SDK 6 headers | MIT (these files only) | [third_party/ndi/LICENSE](third_party/ndi/LICENSE) |

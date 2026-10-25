@@ -844,7 +844,7 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
         auto* reset = smallButton(tools, QStringLiteral("↺"), tr("Reset"));
         auto* del = smallButton(tools, QStringLiteral("✕"), tr("Remove Effect"));
         QToolButton* editor = nullptr;
-        if (e.type == "plugin") {
+        if (e.type == "plugin" || e.type == "ara") {
             editor = smallButton(tools, tr("Editor"), tr("Open the plugin's own editor"));
             editor->setObjectName("pluginEditor");
             th->addWidget(editor);
@@ -1626,6 +1626,12 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                 if (v[k].type == "plugin") {
                     // Keep the plugin; put its parameters back to their defaults.
                     for (const ParamInfo& pi : effectParams(v[k])) v[k].params[pi.name] = Param(pi.def);
+                } else if (v[k].type == "ara") {
+                    // Keep the ARA plug-in; its document (analysis and edits) starts afresh.
+                    Effect e = makeEffect(v[k].type, v[k].id);
+                    e.strings = v[k].strings;
+                    e.strings.erase("archive");
+                    v[k] = e;
                 } else if (v[k].type == "lens_correction") {
                     // Keep the lens and what it was chosen with; put the rest back.
                     Effect e = makeEffect(v[k].type, v[k].id);

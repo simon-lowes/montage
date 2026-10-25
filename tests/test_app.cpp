@@ -148,6 +148,7 @@
 #include "SequenceSettingsDialog.h"
 #include "media/Vector.h"
 #include "SurroundPanner.h"
+#include "audio/AraHost.h"
 #include "audio/DialogueAlign.h"
 #include "audio/Plugins.h"
 #include "MainWindow.h"
@@ -3678,6 +3679,62 @@ private slots:
         QVERIFY(state()->apply("Delete", [clip](Project& p, Sequence& s) { return edit::removeClips(p, s, {clip}, true); }));
         QApplication::processEvents();
         QVERIFY(!PluginEditorWindow::find(clip, eid));
+        state()->newProject();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+    }
+
+    void araPlugInDocument() {
+        // An ARA plug-in's Editor button opens the clip's ARA document (audio/AraHost.h), which stays with the effect
+        // and closes, ending its playback region, when the clip is deleted. The ARA SDK's test plug-in
+        // (scripts/build-ara-test-plugin.sh) has no editor window of its own, so the window itself does not open.
+        const QByteArray dir = qgetenv("MONTAGE_TEST_ARA_PLUGINS");
+        if (dir.isEmpty()) QSKIP("MONTAGE_TEST_ARA_PLUGINS is not set (scripts/build-ara-test-plugin.sh builds the test plug-in)");
+        plugins::Registry& reg = plugins::Registry::instance();
+        reg.setCachePath((dir_.path() + "/plugin-cache-ara.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        for (plugins::Format f : plugins::kAllFormats) reg.setSearchPaths(f, {"/nonexistent-montage-test-dir"});
+        reg.setSearchPaths(plugins::Format::Clap, {dir.toStdString()});
+        reg.scan();
+        std::optional<plugins::Descriptor> d;
+        for (const plugins::Descriptor& x : reg.plugins())
+            if (x.ara) d = x;
+        QVERIFY(d.has_value());
+        state()->newProject();
+        auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false);
+        }));
+        const Id clip = trackAt(*state()->sequence(), A1)->clips.at(0).id;
+        Id eid = 0;
+        QVERIFY(state()->edit("Add ARA Plug-in", [&](Project& p, Sequence& s) {
+            auto e = plugins::makePluginEffect(p, *d);
+            if (!e || e->type != "ara") return false;
+            eid = e->id;
+            edit::clipById(s, clip)->effects.push_back(*e);
+            return true;
+        }));
+        state()->setSelection({clip}, false);
+        QApplication::processEvents();
+        const int regions = ara::liveRegions();
+        QToolButton* button = nullptr;
+        for (auto* b : win_->findChildren<QToolButton*>("pluginEditor"))
+            if (b->isVisibleTo(win_.get())) button = b;
+        QVERIFY(button);
+        button->click();
+        QVERIFY(!PluginEditorWindow::find(clip, eid));
+        QVERIFY(ara::findLiveSession(eid));
+        QCOMPARE(ara::liveRegions(), regions + 1);
+        // An edit elsewhere keeps it; deleting the clip closes it.
+        QVERIFY(state()->edit("Rename", [clip](Project&, Sequence& s) {
+            edit::clipById(s, clip)->name = "renamed";
+            return true;
+        }));
+        QCOMPARE(ara::liveRegions(), regions + 1);
+        QVERIFY(state()->apply("Delete", [clip](Project& p, Sequence& s) { return edit::removeClips(p, s, {clip}, true); }));
+        QCOMPARE(ara::liveRegions(), regions);
+        QVERIFY(!ara::findLiveSession(eid));
         state()->newProject();
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));
     }

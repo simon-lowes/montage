@@ -9,7 +9,7 @@
 
 namespace montage::plugins {
 
-// Builds a "plugin" clip effect for `d`: the plugin's identity, its initial
+// Builds a "plugin" clip effect for `d` (an "ara" one for an ARA plug-in: audio/AraHost.h): the plugin's identity, its initial
 // state, and one keyframeable parameter per automatable plugin parameter.
 // Loads the plugin briefly to read its parameters. A plugin with a key input
 // is marked ("key_input"); its "sidechain" string names the key track's id.

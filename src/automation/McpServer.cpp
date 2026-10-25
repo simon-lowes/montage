@@ -49,7 +49,10 @@
 #include "render/AdaptiveHdr.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
+#include "audio/AraHost.h"
 #include "audio/DialogueAlign.h"
+#include "audio/PluginEffect.h"
+#include "audio/Plugins.h"
 #include "audio/SpeechCleanup.h"
 #include "core/AafImport.h"
 #include "core/AvidBinImport.h"
@@ -2422,12 +2425,29 @@ void McpServer::Impl::addTools() {
                                             {"params", params}});
                 }
             }
+            // Audio plugins installed here (CLAP, VST3, LV2, AU), as the scanner found them; "ara": an ARA plug-in, which
+            // works on the clip's whole sound (audio/AraHost.h).
+            if (kind == "audio") {
+                plugins::Registry& reg = plugins::Registry::instance();
+                if (reg.plugins().empty()) reg.scan();
+                for (const plugins::Descriptor& d : reg.plugins()) {
+                    if (d.instrument || reg.isPluginDisabled(d.id) || !plugins::canHost(d.format)) continue;
+                    QJsonObject o{{"type", QString::fromStdString(plugins::pluginType(d))}, {"name", QString::fromStdString(d.name)},
+                                  {"group", QStringLiteral("Plugins/%1").arg(plugins::formatName(d.format))},
+                                  {"vendor", QString::fromStdString(d.vendor)}};
+                    if (d.ara) o["ara"] = true;
+                    list.append(o);
+                }
+            }
             const QJsonObject o{{"effects", list}};
             return ok(json(o), o);
         });
 
     add("montage_add_effect", "Add an effect",
-        "Add an effect to a clip (see montage_list_effects), with parameter values. Video effects can be limited to a "
+        "Add an effect to a clip (see montage_list_effects), with parameter values. Audio plugins are \"plugin:<id>\" "
+        "(montage_list_effects kind audio), their parameters param.<id>; an ARA plug-in (marked \"ara\" there) works on "
+        "the clip's whole sound, given a steady tempo_bpm and beats_per_bar (montage_ara_content reads what it finds). "
+        "Video effects can be limited to a "
         "mask: mask.shape 1 ellipse or 2 rectangle, mask.x / mask.y centre and mask.w / mask.h size as fractions of the frame; "
         "6 a gradient across that box (full effect above it, none below, mask.rotation turning it); or a drawn Bézier "
         "path through `mask_path` (points as frame fractions, [x, y] or {x, y, in: [dx, dy], out: [dx, dy]} with handles; "
@@ -2497,11 +2517,21 @@ void McpServer::Impl::addTools() {
                     throw ArgError{QStringLiteral("No OpenFX plugin \"%1\" is installed (see montage_list_effects)").arg(QString::fromStdString(type))};
                 plugin = ofx::makeEffect(l.project, d);
                 type = "ofx";
+            } else if (plugins::isPluginType(type)) {
+                // An audio plugin ("plugin:<id>"): its parameters as "param.<id>"; an ARA plug-in becomes an "ara" effect.
+                std::string err;
+                if (plugins::Registry::instance().plugins().empty()) plugins::Registry::instance().scan();
+                plugin = plugins::makeEffectOfType(l.project, type, &err);
+                if (!plugin)
+                    throw ArgError{QStringLiteral("The plugin \"%1\" cannot be used: %2 (see montage_list_effects kind audio)")
+                                       .arg(QString::fromStdString(type), QString::fromStdString(err))};
+                type = plugin->type;
             }
             const EffectInfo* info = findEffectInfo(type);
             if (!info || (info->hidden && !plugin) || (info->category != EffectCategory::VideoFilter && info->category != EffectCategory::AudioFilter))
                 throw ArgError{QStringLiteral("Unknown effect \"%1\" (see montage_list_effects)").arg(QString::fromStdString(type))};
-            const std::string displayName = plugin ? ofx::effectName(*plugin) : info->displayName;
+            const std::string displayName = !plugin ? info->displayName : type == "ofx" ? ofx::effectName(*plugin) : plugins::effectName(*plugin);
+            const bool pluginParams = plugin && type != "ara";  // an ARA effect's own settings are Montage's (tempo, bar)
             if (type == "enhance_speech" && (!speechEnhancerAvailable() || !speechModel().installed()))
                 return fail("Enhance Speech needs its model: run `scripts/fetch-models.sh` or add the effect once in the app");
             if (type == "super_scale" && (!upscalerAvailable() || !upscaleModel().installed()))
@@ -2518,8 +2548,8 @@ void McpServer::Impl::addTools() {
             const QJsonObject params = a.value("params").toObject();
             for (auto it = params.begin(); it != params.end(); ++it) {
                 std::string name = it.key().toStdString();
-                if (plugin && name.rfind("param.", 0) != 0 && name.rfind("mask.", 0) != 0) name = "param." + name;  // "amount" for "param.amount"
-                const bool known = (plugin ? e.params.count(name) > 0
+                if (pluginParams && name.rfind("param.", 0) != 0 && name.rfind("mask.", 0) != 0) name = "param." + name;  // "amount" for "param.amount"
+                const bool known = (pluginParams ? e.params.count(name) > 0
                                            : std::any_of(info->params.begin(), info->params.end(), [&](const ParamInfo& p) { return p.name == name; })) ||
                                    (name.rfind("mask.", 0) == 0 && supportsMask(type));
                 if (!known) throw ArgError{QStringLiteral("\"%1\" has no parameter \"%2\"").arg(QString::fromStdString(type), it.key())};
@@ -2528,7 +2558,7 @@ void McpServer::Impl::addTools() {
             const QJsonObject strings = a.value("strings").toObject();
             for (auto it = strings.begin(); it != strings.end(); ++it) {
                 const std::string name = it.key().toStdString();
-                if (plugin) {
+                if (plugin && type == "ofx") {
                     const std::string key = name.rfind("str.", 0) == 0 ? name : "str." + name;
                     if (!e.strings.count(key))
                         throw ArgError{QStringLiteral("\"%1\" has no text setting \"%2\"").arg(QString::fromStdString(displayName), it.key())};
@@ -2699,6 +2729,65 @@ void McpServer::Impl::addTools() {
             save(l);
             return ok(QStringLiteral("Added %1 to %2%3").arg(QString::fromStdString(displayName), QString::fromStdString(c.name), note),
                       QJsonObject{{"effect_id", double(e.id)}});
+        });
+
+    add("montage_ara_content", "Read what an ARA plug-in found",
+        "Open a clip's ARA plug-in effect (added with montage_add_effect from a \"plugin:<id>\" type montage_list_effects "
+        "kind audio marks \"ara\") on the clip's sound, have the plug-in analyse it (unless analyse is false) and read "
+        "back what it found: notes (start and duration in seconds of the source, pitch as a MIDI note, frequency in Hz, "
+        "volume 0-1), tempo entries (seconds against quarter notes), bar signatures and chords (positions in quarter "
+        "notes). The plug-in's document, with its analysis, is stored in the effect, so it is kept with the project.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "effect":{"type":"number","description":"The ARA effect's id (default: the clip's first)"},
+            "analyse":{"type":"boolean","default":true},
+            "timeout_seconds":{"type":"number","default":600}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Clip& c = clipArg(l, a);
+            Effect* e = nullptr;
+            for (Effect& x : c.effects)
+                if (x.type == "ara" && (!a.contains("effect") || x.id == Id(a.value("effect").toDouble()))) {
+                    e = &x;
+                    break;
+                }
+            if (!e) return fail(QStringLiteral("%1 has no ARA plug-in effect%2").arg(QString::fromStdString(c.name), a.contains("effect") ? QStringLiteral(" with that id") : QString()));
+            if (plugins::Registry::instance().plugins().empty()) plugins::Registry::instance().scan();
+            const auto d = plugins::Registry::instance().find(e->s("plugin_id"));
+            if (!d) return fail(QStringLiteral("%1 is not installed here").arg(QString::fromStdString(e->s("plugin_name", "The plug-in"))));
+            std::string key, err;
+            AudioBufferPtr sound;
+            if (!ara::clipSource(l.project, l.seq(), c, key, sound, &err)) return fail(QString::fromStdString(err));
+            auto session = ara::Session::open(*d, plugins::decodeState(e->s("archive")), sound, ara::sourceIdFor(*e, *sound),
+                                              ara::modificationIdFor(*e), ara::timelineOf(*e), ara::kEditorRenderer, &err);
+            if (!session) return fail(QString::fromStdString(err));
+            if (const std::string state = plugins::decodeState(e->s("state")); !state.empty()) session->instance()->loadState(state);
+            ara::Content content;
+            bool complete = true;
+            if (a.value("analyse").toBool(true)) complete = session->analyse(content, int(std::clamp(a.value("timeout_seconds").toDouble(600), 1.0, 86400.0) * 1000));
+            else content = session->content();
+            const std::string archive = plugins::encodeState(session->archive());
+            if (!archive.empty() && archive != e->s("archive")) {
+                e->strings["archive"] = archive;
+                save(l);
+            }
+            QJsonArray notes, tempo, bars, chords;
+            for (const ara::Note& n : content.notes) {
+                QJsonObject o{{"start", n.start}, {"duration", n.duration}, {"volume", double(n.volume)}};
+                if (n.pitch >= 0) o["pitch"] = n.pitch;
+                if (n.frequency > 0) o["frequency"] = n.frequency;
+                notes.append(o);
+            }
+            for (const ara::TempoEntry& t : content.tempo) tempo.append(QJsonObject{{"seconds", t.time}, {"quarter", t.quarter}});
+            for (const ara::BarSignature& b : content.bars)
+                bars.append(QJsonObject{{"numerator", b.numerator}, {"denominator", b.denominator}, {"quarter", b.position}});
+            for (const ara::Chord& ch : content.chords)
+                chords.append(QJsonObject{{"quarter", ch.position}, {"quarters", ch.duration}, {"root", ch.root}, {"bass", ch.bass},
+                                          {"name", QString::fromStdString(ch.name)}});
+            const QJsonObject o{{"effect_id", double(e->id)}, {"analysed", content.analysed}, {"notes", notes}, {"tempo", tempo},
+                                {"bars", bars}, {"chords", chords}};
+            if (!complete) return ok(QStringLiteral("The analysis did not finish in time; this is what %1 has so far: %2")
+                                         .arg(QString::fromStdString(d->name), json(o)), o);
+            return ok(json(o), o);
         });
 
     add("montage_track_effect", "Add an effect to an audio track",

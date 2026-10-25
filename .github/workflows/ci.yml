@@ -134,6 +134,15 @@ jobs:
         run: |
           scripts/build-iamfdec.sh ~/iamfdec && echo "MONTAGE_TEST_IAMFDEC=$HOME/iamfdec/bin/iamfdec" >> "$GITHUB_ENV" \
             || echo "::warning::Could not build the reference IAMF decoder; its part of the IAMF test will be skipped"
+      - name: Cache the ARA test plug-in
+        uses: actions/cache@v4
+        with:
+          path: ~/ara-test-plugin
+          key: ara-test-plugin-${{ runner.os }}-${{ hashFiles('scripts/build-ara-test-plugin.sh') }}
+      - name: The ARA SDK's test plug-in (VST3 and CLAP) for the ARA hosting test
+        run: |
+          scripts/build-ara-test-plugin.sh ~/ara-test-plugin && echo "MONTAGE_TEST_ARA_PLUGINS=$HOME/ara-test-plugin" >> "$GITHUB_ENV" \
+            || echo "::warning::Could not build the ARA test plug-in; the ARA hosting tests will be skipped"
       - name: Cache the reference gain-map decoder
         uses: actions/cache@v4
         with:

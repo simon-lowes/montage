@@ -21,6 +21,7 @@ extern "C" {
 #include <rnnoise.h>
 #endif
 
+#include "AraHost.h"
 #include "AudioRepair.h"
 #include "DialogueAlign.h"
 #include "SpectralRepair.h"
@@ -31,7 +32,7 @@ namespace montage {
 bool isSourceAudioEffect(const std::string& type) {
     return type == "denoise" || type == "voice_isolate" || type == "enhance_speech" || type == "declick" || type == "pitch_shift" ||
            type == "dereverb" || type == "spectral_repair" || type == "dialogue_align" || type == "declip" || type == "deplosive" ||
-           type == "dewind";
+           type == "dewind" || type == "ara";
 }
 
 
@@ -484,10 +485,21 @@ std::string keyFor(const std::string& path, int rate, const std::vector<const Ef
     for (const Effect* e : effects) {
         key += "|" + e->type;
         for (const auto& [name, param] : e->params) {
-            std::snprintf(buf, sizeof buf, ":%s=%.4g", name.c_str(), param.at(0));
+            std::snprintf(buf, sizeof buf, ":%s=%.9g", name.c_str(), param.at(0));
             key += buf;
         }
-        for (const auto& [name, text] : e->strings) key += ":" + name + "=" + text;  // Spectral Repair's regions
+        // Spectral Repair's regions; an ARA plug-in's state and archive (long ones by their length and hash, so the
+        // key stays short: it is looked up every block).
+        for (const auto& [name, text] : e->strings) {
+            if (text.size() <= 256) {
+                key += ":" + name + "=" + text;
+                continue;
+            }
+            uint64_t h = 1469598103934665603ull;  // FNV-1a
+            for (unsigned char ch : text) h = (h ^ ch) * 1099511628211ull;
+            std::snprintf(buf, sizeof buf, "#%zu.%016llx", text.size(), static_cast<unsigned long long>(h));
+            key += ":" + name + buf;
+        }
     }
     return key;
 }
@@ -674,12 +686,20 @@ AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& sourc
             chain.clear();
         };
         for (const Effect& e : copies) {
-            if (e.type != "dialogue_align") {
+            if (e.type != "dialogue_align" && e.type != "ara") {
                 chain.push_back(e);
                 continue;
             }
             flush();
             if (job->cancel.load()) break;
+            if (e.type == "ara") {
+                // An ARA plug-in renders the whole source itself (audio/AraHost.h); one that fails leaves it as it was.
+                auto out = std::make_shared<AudioBuffer>();
+                std::string err;
+                if (ara::renderEffect(e, r, *out, &job->cancel, &err)) r = out;
+                else if (!err.empty()) std::fprintf(stderr, "ARA plug-in effect left out: %s\n", err.c_str());
+                continue;
+            }
             try {
                 auto out = std::make_shared<AudioBuffer>();
                 applyDialogueWarp(*r, dialogueWarpFromString(e.s("warp")), e.p("invert", 0) > 0.5, *out, &job->cancel);

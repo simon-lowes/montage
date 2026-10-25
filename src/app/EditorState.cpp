@@ -20,6 +20,7 @@
 #include <set>
 #include <utility>
 
+#include "audio/AraHost.h"
 #include "core/Ambisonics.h"
 #include "core/FilmCount.h"
 #include "core/MediaLog.h"
@@ -39,6 +40,8 @@ namespace montage {
 EditorState::EditorState(QObject* parent) : QObject(parent), project_(makeDefaultProject()) {
     // Clips playing chosen channels of a file need those decoded too (the whole file is decoded on import).
     connect(this, &EditorState::projectChanged, this, &EditorState::startClipAudioDecodes);
+    // ARA documents of effects no longer in the project (a clip deleted, an undo) close (audio/AraHost.h).
+    connect(this, &EditorState::projectChanged, this, [this] { ara::dropSessionsNotIn(project_); });
     // Decodes finish on worker threads, possibly after this object is gone:
     // hop to the application object and re-check before emitting.
     QPointer<EditorState> self(this);
@@ -96,6 +99,7 @@ EditorState::EditorState(QObject* parent) : QObject(parent), project_(makeDefaul
 
 EditorState::~EditorState() {
     MediaPool::instance().setReadyCallback(nullptr);
+    ara::dropAllSessions();  // plug-ins closed while the application is still there
     releaseLock();
 }
 

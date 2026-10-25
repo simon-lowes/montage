@@ -136,6 +136,10 @@ std::optional<std::vector<Descriptor>> readVst3ModuleInfo(const std::string& pat
     const QJsonObject root = doc.object();
     const QString factoryVendor = root.value("Factory Info").toObject().value("Vendor").toString();
     std::vector<Descriptor> out;
+    // An ARA plugin lists an ARA main factory class by the same name as its audio class.
+    QStringList araNames;
+    for (const QJsonValue& v : root.value("Classes").toArray())
+        if (v.toObject().value("Category").toString() == "ARA Main Factory Class") araNames << v.toObject().value("Name").toString();
     for (const QJsonValue& v : root.value("Classes").toArray()) {
         const QJsonObject c = v.toObject();
         if (c.value("Category").toString() != "Audio Module Class") continue;
@@ -150,6 +154,7 @@ std::optional<std::vector<Descriptor>> readVst3ModuleInfo(const std::string& pat
         for (const QJsonValue& s : c.value("Sub Categories").toArray()) subs << s.toString();
         d.instrument = subs.contains("Instrument");
         d.category = categoryFromWords(subs.join(' '));
+        d.ara = araNames.contains(c.value("Name").toString());
         d.path = path;
         out.push_back(d);
     }
@@ -424,7 +429,8 @@ QJsonObject toJson(const Descriptor& d) {
                        {"version", q(d.version)},
                        {"category", q(d.category)},
                        {"path", q(d.path)},
-                       {"instrument", d.instrument}};
+                       {"instrument", d.instrument},
+                       {"ara", d.ara}};
 }
 
 std::optional<Descriptor> fromJson(const QJsonObject& o) {
@@ -440,6 +446,7 @@ std::optional<Descriptor> fromJson(const QJsonObject& o) {
     d.category = o.value("category").toString().toStdString();
     d.path = o.value("path").toString().toStdString();
     d.instrument = o.value("instrument").toBool();
+    d.ara = o.value("ara").toBool();
     if (d.id.empty()) return std::nullopt;
     return d;
 }
@@ -568,7 +575,9 @@ void Registry::loadCacheLocked() const {
     QFile f(q(path));
     if (!f.open(QIODevice::ReadOnly)) return;
     const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
-    if (root.value("version").toInt() != 1) return;
+    // (Version 1 did not record which plugins offer ARA: those files are read again.)
+    const int version = root.value("version").toInt();
+    if (version != 1 && version != 2) return;
     for (const QJsonValue& v : root.value("disabled").toArray()) disabled_.insert(v.toString().toStdString());
     for (const QJsonValue& v : root.value("entries").toArray()) {
         const QJsonObject o = v.toObject();
@@ -581,6 +590,7 @@ void Registry::loadCacheLocked() const {
         e.blocked = o.value("blocked").toBool();
         e.reason = o.value("reason").toString().toStdString();
         e.plugins = fromJsonArray(o.value("plugins").toArray());
+        if (version == 1 && !e.blocked) e.signature.clear();
         entries_.push_back(std::move(e));
     }
 }
@@ -600,7 +610,7 @@ void Registry::saveCacheLocked() const {
     if (!f.open(QIODevice::WriteOnly)) return;
     QJsonArray disabled;
     for (const std::string& id : disabled_) disabled.append(q(id));
-    f.write(QJsonDocument(QJsonObject{{"version", 1}, {"entries", entries}, {"disabled", disabled}}).toJson());
+    f.write(QJsonDocument(QJsonObject{{"version", 2}, {"entries", entries}, {"disabled", disabled}}).toJson());
     f.commit();
 }
 

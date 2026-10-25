@@ -1,15 +1,18 @@
-// CLAP plugin probing and hosting (https://github.com/free-audio/clap, MIT).
+// CLAP plugin probing and hosting (https://github.com/free-audio/clap, MIT), with ARA through its CLAP extension
+// (Celemony's ARA SDK, Apache-2.0; third_party/ara).
 #include <clap/clap.h>
 
 #include <QFileInfo>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <utility>
 
+#include "ARA_API/ARACLAP.h"
 #include "DynLib.h"
 #include "Plugins.h"
 
@@ -203,6 +206,18 @@ public:
         state_ = static_cast<const clap_plugin_state_t*>(plugin_->get_extension(plugin_, CLAP_EXT_STATE));
         latency_ = static_cast<const clap_plugin_latency_t*>(plugin_->get_extension(plugin_, CLAP_EXT_LATENCY));
         gui_ = static_cast<const clap_plugin_gui_t*>(plugin_->get_extension(plugin_, CLAP_EXT_GUI));
+        ara_ = static_cast<const clap_ara_plugin_extension_t*>(plugin_->get_extension(plugin_, CLAP_EXT_ARA_PLUGINEXTENSION));
+        if (!ara_) ara_ = static_cast<const clap_ara_plugin_extension_t*>(plugin_->get_extension(plugin_, CLAP_EXT_ARA_PLUGINEXTENSION_COMPAT));
+        readPorts();
+        if (outChannels_ <= 0) {
+            if (error) *error = "the plugin has no audio output";
+            return false;
+        }
+        return true;
+    }
+
+    // The plugin's audio ports as it declares them now.
+    void readPorts() {
         if (auto* ports = static_cast<const clap_plugin_audio_ports_t*>(
                 plugin_->get_extension(plugin_, CLAP_EXT_AUDIO_PORTS))) {
             // Every port gets buffers (CLAP wants as many as it declares): the main ones carry the sound, a second input
@@ -220,11 +235,52 @@ public:
             keyChannels_ = inPorts_.size() > 1 ? inPorts_[1] : 0;
             outChannels_ = outPorts_.empty() ? 0 : outPorts_[0];
         }
-        if (outChannels_ <= 0) {
-            if (error) *error = "the plugin has no audio output";
-            return false;
+    }
+
+    const void* araFactory() override { return ara_ ? ara_->get_factory(plugin_) : nullptr; }
+    std::shared_ptr<const void> library() override { return lib_; }
+
+    const void* bindToAra(void* documentController, uint32_t knownRoles, uint32_t assignedRoles) override {
+        if (!ara_ || active_) return nullptr;
+        return ara_->bind_to_document_controller(plugin_, static_cast<ARA::ARADocumentControllerRef>(documentController), knownRoles,
+                                                 assignedRoles);
+    }
+
+    void setTransport(int64_t samplePosition, bool playing, double bpm, int beatsPerBar) override {
+        transportPos_ = samplePosition;
+        playing_ = playing;
+        bpm_ = bpm > 0 ? bpm : 120;
+        beatsPerBar_ = std::max(1, beatsPerBar);
+        transport_ = true;
+    }
+
+    void setOffline(bool offline) override {
+        auto* render = static_cast<const clap_plugin_render_t*>(plugin_->get_extension(plugin_, CLAP_EXT_RENDER));
+        if (render && !(offline && render->has_hard_realtime_requirement(plugin_)))
+            render->set(plugin_, offline ? CLAP_RENDER_OFFLINE : CLAP_RENDER_REALTIME);
+    }
+
+    bool setMainChannels(int channels) override {
+        if (active_ || channels < 1 || channels > 2) return false;
+        if (outChannels_ == channels && (inPorts_.empty() || inChannels_ == channels)) return true;
+        auto* conf = static_cast<const clap_plugin_configurable_audio_ports_t*>(plugin_->get_extension(plugin_, CLAP_EXT_CONFIGURABLE_AUDIO_PORTS));
+        if (!conf) conf = static_cast<const clap_plugin_configurable_audio_ports_t*>(plugin_->get_extension(plugin_, CLAP_EXT_CONFIGURABLE_AUDIO_PORTS_COMPAT));
+        if (!conf) return false;
+        std::vector<clap_audio_port_configuration_request_t> requests;
+        for (const bool input : {true, false}) {
+            if ((input ? inPorts_ : outPorts_).empty()) continue;
+            clap_audio_port_configuration_request_t r{};
+            r.is_input = input;
+            r.port_index = 0;
+            r.channel_count = uint32_t(channels);
+            r.port_type = channels == 1 ? CLAP_PORT_MONO : CLAP_PORT_STEREO;
+            requests.push_back(r);
         }
-        return true;
+        if (!conf->can_apply_configuration(plugin_, requests.data(), uint32_t(requests.size())) ||
+            !conf->apply_configuration(plugin_, requests.data(), uint32_t(requests.size())))
+            return false;
+        readPorts();
+        return outChannels_ == channels;
     }
 
     bool activate(double sampleRate, int maxFrames) override {
@@ -234,6 +290,7 @@ public:
             active_ = processing_ = false;
         }
         maxFrames_ = std::max(1, maxFrames);
+        sampleRate_ = sampleRate;
         if (!plugin_->activate(plugin_, sampleRate, 1, uint32_t(maxFrames_))) return false;
         active_ = true;
         processing_ = plugin_->start_processing(plugin_);
@@ -466,6 +523,23 @@ private:
         proc.steady_time = steadyTime_;
         proc.frames_count = uint32_t(n);
         proc.transport = nullptr;
+        clap_event_transport_t transport{};
+        if (transport_) {
+            // Where the block starts on the timeline, in seconds (as ARA renderers read it), at the steady tempo and bar.
+            transport.header.size = sizeof transport;
+            transport.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+            transport.header.type = CLAP_EVENT_TRANSPORT;
+            transport.flags = CLAP_TRANSPORT_HAS_SECONDS_TIMELINE | CLAP_TRANSPORT_HAS_BEATS_TIMELINE | CLAP_TRANSPORT_HAS_TEMPO |
+                              CLAP_TRANSPORT_HAS_TIME_SIGNATURE | (playing_ ? CLAP_TRANSPORT_IS_PLAYING : 0);
+            const double seconds = double(transportPos_) / sampleRate_;
+            transport.song_pos_seconds = clap_sectime(std::llround(seconds * double(CLAP_SECTIME_FACTOR)));
+            transport.song_pos_beats = clap_beattime(std::llround(seconds * bpm_ / 60 * double(CLAP_BEATTIME_FACTOR)));
+            transport.tempo = bpm_;
+            transport.tsig_num = uint16_t(beatsPerBar_);
+            transport.tsig_denom = 4;
+            proc.transport = &transport;
+            transportPos_ += n;
+        }
         proc.audio_inputs = inPorts_.empty() ? nullptr : inBufs.data();
         proc.audio_inputs_count = uint32_t(inPorts_.size());
         proc.audio_outputs = outBufs.data();
@@ -487,6 +561,12 @@ private:
     const clap_plugin_state_t* state_ = nullptr;
     const clap_plugin_latency_t* latency_ = nullptr;
     const clap_plugin_gui_t* gui_ = nullptr;
+    const clap_ara_plugin_extension_t* ara_ = nullptr;
+    bool transport_ = false, playing_ = false;  // (setTransport)
+    int64_t transportPos_ = 0;
+    double bpm_ = 120;
+    int beatsPerBar_ = 4;
+    double sampleRate_ = 48000;
     HostSide side_;
     bool editorOpen_ = false;
     int inChannels_ = 2, outChannels_ = 2;
@@ -521,6 +601,8 @@ std::vector<Descriptor> probeClap(const std::string& path, std::string* error) {
         d.vendor = desc->vendor ? desc->vendor : "";
         d.version = desc->version ? desc->version : "";
         d.category = categoryFromFeatures(desc->features, &d.instrument);
+        for (const char* const* f = desc->features; f && *f; ++f)
+            if (std::strcmp(*f, CLAP_PLUGIN_FEATURE_ARA_SUPPORTED) == 0 || std::strcmp(*f, CLAP_PLUGIN_FEATURE_ARA_REQUIRED) == 0) d.ara = true;
         d.path = path;
         out.push_back(d);
     }
