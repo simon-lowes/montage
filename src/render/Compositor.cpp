@@ -1,5 +1,6 @@
 #include "Compositor.h"
 #include "AdaptiveHdr.h"
+#include "GrainMatch.h"
 #include "TrimPasses.h"
 #include "OGraf.h"
 #include "Ofx.h"
@@ -607,8 +608,37 @@ void applyMotionDeblur(const Effect& e, FrameTime lt, const RenderOptions& o, Im
     src = std::move(sharp);
 }
 
+// A Grain Match on the clip set to Replace Grain (any of them, the first such).
+const Effect* replacingGrain(const Sequence& seq, const Clip& c) {
+    auto replaces = [](const Effect& e) { return e.type == "grain_match" && std::lround(e.p("mode", 0, 0)) == 1; };
+    if (c.grade.empty()) {
+        for (const Effect& e : c.effects)
+            if (e.enabled && replaces(e)) return &e;
+        return nullptr;
+    }
+    for (const Effect* e : liveEffects(seq, c))
+        if (replaces(*e)) return e;
+    return nullptr;
+}
+
 const Effect* denoiseEffect(const Sequence& seq, const Clip& c) {
-    return enabledEffect(seq, c, "video_denoise");
+    if (const Effect* e = enabledEffect(seq, c, "video_denoise")) return e;
+    // Grain Match's Replace Grain: the plate's own grain taken out first, as Video Noise Reduction does by default.
+    if (replacingGrain(seq, c)) {
+        static const Effect standard = [] {
+            Effect e = makeEffect("video_denoise", 0);
+            e.params["frames"] = double(kReplaceGrainFrames);
+            return e;
+        }();
+        return &standard;
+    }
+    return nullptr;
+}
+
+// Grain Match's Replace Grain, when it takes the plate's grain out (the clip has no Video Noise Reduction of its own).
+const Effect* replaceGrainEffect(const Sequence& seq, const Clip& c) {
+    if (enabledEffect(seq, c, "video_denoise")) return nullptr;
+    return replacingGrain(seq, c);
 }
 
 // Lip Sync's sound: what its track (every track not muted, when none is named) plays over 30 s stretch `segment` from the
@@ -780,6 +810,19 @@ void applyDenoise(const Effect& e, FrameTime lt, Image& src, const std::vector<I
         return;
     }
     const Image clean = denoiseFrame(src, nb, ds, motion);
+    for (size_t i = 0; i < matte.size() && i * 4 < src.px.size(); ++i)
+        for (int k = 0; k < 4; ++k) src.px[i * 4 + size_t(k)] += (clean.px[i * 4 + size_t(k)] - src.px[i * 4 + size_t(k)]) * matte[i];
+}
+
+// Replace Grain's taking the plate's grain out (render/GrainMatch removeGrain), within the Grain Match's mask when it has one.
+void applyRemoveGrain(const Effect& e, FrameTime lt, Image& src, const std::vector<const Image*>& around, const std::vector<MotionFn>& motion,
+                      const ColorSpace& space, double pixelScale, double sourceSeconds) {
+    const Image clean = removeGrain(src, around, motion, space, effectGrainProfile(e));
+    if (!hasMask(e, lt)) {
+        src = clean;
+        return;
+    }
+    const std::vector<float> matte = effectMatte(e, lt, src, pixelScale, sourceSeconds);
     for (size_t i = 0; i < matte.size() && i * 4 < src.px.size(); ++i)
         for (int k = 0; k < 4; ++k) src.px[i * 4 + size_t(k)] += (clean.px[i * 4 + size_t(k)] - src.px[i * 4 + size_t(k)]) * matte[i];
 }
@@ -1049,7 +1092,9 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (nested->multicam) no.soloVideoTrack = std::clamp(c.angle, 0, std::max(0, int(nested->videoTracks.size()) - 1));
             FrameTime nf = FrameTime(std::floor(c.sourceFrameAt(t) * nested->fpsValue() / seq.fpsValue() + 1e-6));
             src = renderSequenceFrame(p, *nested, nf, no);
-            if (const Effect* nr = denoiseEffect(seq, c); nr && !src.empty())
+            if (const Effect* rg = replaceGrainEffect(seq, c); rg && !src.empty())
+                applyRemoveGrain(*rg, lt, src, {}, {}, sequenceColorSpace(*nested), effectPixelScale(c, lt, g.sx, mw, src.width), -1);
+            else if (const Effect* nr = denoiseEffect(seq, c); nr && !src.empty())
                 applyDenoise(*nr, lt, src, {}, {}, effectPixelScale(c, lt, g.sx, mw, src.width), -1);
             if (const Effect* db = enabledEffect(seq, c, "motion_deblur")) applyMotionDeblur(*db, lt, o, src);
             if (const Effect* ls = enabledEffect(seq, c, "lip_sync")) applyLipSync(p, seq, c, *ls, lt, o, src);
@@ -1292,8 +1337,15 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                                                });
                     }
                 }
-                applyDenoise(*nr, lt, src, around, motion, effectPixelScale(c, lt, g.sx, mw, src.width),
-                             m->kind == MediaKind::Video ? sec : -1);
+                if (const Effect* rg = replaceGrainEffect(seq, c)) {
+                    std::vector<const Image*> nb;
+                    for (const Image& im : around) nb.push_back(&im);
+                    applyRemoveGrain(*rg, lt, src, nb, motion, mediaColorSpace(*m), effectPixelScale(c, lt, g.sx, mw, src.width),
+                                     m->kind == MediaKind::Video ? sec : -1);
+                } else {
+                    applyDenoise(*nr, lt, src, around, motion, effectPixelScale(c, lt, g.sx, mw, src.width),
+                                 m->kind == MediaKind::Video ? sec : -1);
+                }
             }
             // Motion Deblur, on the source frame as decoded (the size it is shown at); not on proxies, which are for speed.
             if (const Effect* db = enabledEffect(seq, c, "motion_deblur"); db && original) applyMotionDeblur(*db, lt, o, src);

@@ -124,6 +124,7 @@
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
 #include "render/LutExport.h"
+#include "render/GrainMatch.h"
 #include "render/LutToGrade.h"
 #include "render/ProjectManager.h"
 #include "render/QualityCheck.h"
@@ -3223,6 +3224,80 @@ void McpServer::Impl::addTools() {
                 text += QStringLiteral("; with the residual LUT: mean %1, largest %2").arg(fit.residualMeanDeltaE, 0, 'f', 2).arg(fit.residualMaxDeltaE, 0, 'f', 2);
             if (fit.clips) text += QStringLiteral("\nThe LUT clips: ") + QString::fromStdString(fit.clipNote);
             return ok(text + QStringLiteral("\nThe grade with the LUT is kept as a grade version."));
+        });
+
+    add("montage_grain", "Measure a clip's grain, or put matching grain on clips",
+        "Grain matching: measure takes the grain of a clip's footage (its strength in each channel through eight stops of "
+        "light, its size and softness, how its colours go together and from frame to frame) from the flat areas of a few "
+        "runs of frames, or of a region, and returns it as a profile; apply puts a Grain Match effect on clips (apply_to), "
+        "from that profile, a measured profile given, or a film gauge (65mm, 35mm, 16mm, super8). With measure, apply_to "
+        "puts the measured grain on those clips at once. mode replace takes each clip's own grain out first.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"action":{"type":"string","enum":["measure","apply"]},
+            "clip":{"type":"number","description":"measure: the clip whose grain to measure"},
+            "region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}},
+                      "description":"In pixels of the footage (default: the whole frame)"},
+            "apply_to":{"type":"array","items":{"type":"number"},"description":"Clips to put the grain on"},
+            "profile":{"type":"string","description":"apply: a profile measure returned"},
+            "gauge":{"type":"string","enum":["65mm","35mm","16mm","super8"]},
+            "mode":{"type":"string","enum":["add","replace"],"default":"add"},
+            "amount":{"type":"number","default":100,"description":"Percent of the measured strength"}},"required":["project","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const QString action = need(a, "action");
+            GrainProfile profile;
+            int gauge = -1;
+            QString text;
+            if (action == "measure") {
+                const Clip& c = clipArg(l, a);
+                GrainRegion region;
+                const QJsonObject r = a.value("region").toObject();
+                region.x = r.value("x").toInt(), region.y = r.value("y").toInt(), region.w = r.value("w").toInt(), region.h = r.value("h").toInt();
+                std::string err;
+                const WorkingSpaceScope working(&sequenceColorSpace(s));
+                if (!measureClipGrain(l.project, s, c, region, profile, &err)) return fail(QString::fromStdString(err));
+                const int mid = GrainProfile::kBands - 3;  // (about 18 % grey)
+                auto fixed = [](double v, char f, int digits) { return QString::number(v, f, digits); };
+                text = QStringLiteral("Grain of %1: about %2 px across; strength at 18% grey %3 / %4 / %5 (linear light, red / green / blue); "
+                                      "colours alike by %6 / %7 / %8; %9 carried to the next frame.\nProfile: ")
+                           .arg(QString::fromStdString(c.name), fixed(grainSize(profile), 'f', 1), fixed(profile.amplitude[0][mid], 'g', 3),
+                                fixed(profile.amplitude[1][mid], 'g', 3), fixed(profile.amplitude[2][mid], 'g', 3),
+                                fixed(profile.correlation[0], 'f', 2), fixed(profile.correlation[1], 'f', 2), fixed(profile.correlation[2], 'f', 2),
+                                fixed(profile.temporal, 'f', 2)) +
+                       QString::fromStdString(grainProfileText(profile));
+            } else if (action == "apply") {
+                if (a.contains("profile")) {
+                    if (!parseGrainProfile(a.value("profile").toString().toStdString(), profile)) return fail(QStringLiteral("That is not a grain profile"));
+                } else {
+                    const QString g = a.value("gauge").toString(QStringLiteral("35mm"));
+                    const QStringList names{QStringLiteral("65mm"), QStringLiteral("35mm"), QStringLiteral("16mm"), QStringLiteral("super8")};
+                    gauge = int(names.indexOf(g));
+                    if (gauge < 0) return fail(QStringLiteral("Unknown gauge %1").arg(g));
+                }
+            } else {
+                return fail(QStringLiteral("action is measure or apply"));
+            }
+            const QJsonArray targets = a.value("apply_to").toArray();
+            if (action == "apply" && targets.isEmpty()) return fail(QStringLiteral("apply needs apply_to: the clips to put the grain on"));
+            const QString mode = a.value("mode").toString(QStringLiteral("add"));
+            if (mode != "add" && mode != "replace") return fail(QStringLiteral("mode is add or replace"));
+            int put = 0;
+            for (const QJsonValue& v : targets) {
+                Clip* c = edit::clipById(s, Id(v.toDouble()));
+                if (!c) return fail(QStringLiteral("No clip %1 in the active sequence").arg(qulonglong(v.toDouble())));
+                Effect e = makeEffect(l.project, "grain_match");
+                if (gauge >= 0) e.params["source"] = double(gauge + 1);
+                else e.strings["profile"] = grainProfileText(profile);
+                e.params["mode"] = mode == "replace" ? 1.0 : 0.0;
+                e.params["amount"] = a.value("amount").toDouble(100);
+                c->effects.push_back(e);
+                ++put;
+            }
+            if (put) {
+                save(l);
+                text += QStringLiteral("%1Grain Match put on %2 clip(s).").arg(text.isEmpty() ? QString() : QStringLiteral("\n")).arg(put);
+            }
+            return ok(text);
         });
 
     add("montage_audition", "Audition takes on a clip",

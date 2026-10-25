@@ -28,6 +28,7 @@
 #include "QualityCheck.h"
 #include "Restoration.h"
 #include "FilmScan.h"
+#include "GrainMatch.h"
 #include "LensBlur.h"
 #include "media/MotionData.h"
 #include "media/Tracking.h"
@@ -2275,6 +2276,7 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
         broadcastSafe(img.px.data(), img.width, img.height, e.p("limits", t, 0) >= 0.5, e.p("knee", t, 5) / 100.0, e.p("highlight", t, 0) >= 0.5);
     else if (ty == "glow") vfx::glow(e, t, img, pixelScale);
     else if (ty == "film_grain") vfx::filmGrain(e, t, img, pixelScale);
+    else if (ty == "grain_match") grainMatch(e, t, img);
     else if (ty == "film_look") filmLook(img, filmLookSettings(e, t), t);
     else if (ty == "directional_blur") vfx::directionalBlur(e, t, img, pixelScale);
     else if (ty == "chromatic_aberration") vfx::chromaticAberration(e, t, img, pixelScale);

@@ -105,6 +105,7 @@
 #include "media/Exr.h"
 #include "render/Amf.h"
 #include "render/LutExport.h"
+#include "render/GrainMatch.h"
 #include "render/LutToGrade.h"
 #include "media/LtcTimecode.h"
 #include "media/TextReader.h"
@@ -1323,6 +1324,7 @@ void MainWindow::buildMenus() {
         if (path.isEmpty()) return;
         rebuildLutAsGrade(path.endsWith(QLatin1String(".cube"), Qt::CaseInsensitive) ? path : path + QStringLiteral(".cube"));
     })->setObjectName(QStringLiteral("lutToGrade"));
+    add(clipM, tr("Measure &Grain"), QKeySequence(), [this] { measureGrainAsPreset(); })->setObjectName(QStringLiteral("measureGrain"));
     add(clipM, tr("Import CDL…"), QKeySequence(), [this] {
         const QString path = QFileDialog::getOpenFileName(this, tr("Import CDL"), QString(), tr("ASC CDL (*.cdl *.cc *.ccc);;All files (*)"));
         if (!path.isEmpty()) importCdl(path);
@@ -5229,6 +5231,44 @@ bool MainWindow::rebuildLutAsGrade(const QString& residualPath, Id lutEffect) {
     if (fit.clips) msg += tr("; the LUT clips (%1)").arg(QString::fromStdString(fit.clipNote));
     state_->message(msg, 10000);
     return true;
+}
+
+QString MainWindow::measureGrainAsPreset() {
+    const Clip* c = clipForCommand();
+    const Sequence* seq = state_->sequence();
+    if (!c || !seq || c->isGenerator()) {
+        state_->message(tr("Select a clip of footage under the playhead to measure its grain"), 5000);
+        return {};
+    }
+    const Project project = state_->project();
+    const Sequence copy = *seq;
+    const Clip clip = *c;
+    GrainProfile profile;
+    if (!runWithProgress(this, state_, tr("Measuring the grain of %1…").arg(QString::fromStdString(clip.name)),
+                         [&](const auto& progress, const std::atomic<bool>* cancel, std::string* error) {
+                             const WorkingSpaceScope scope(&sequenceColorSpace(copy));
+                             return measureClipGrain(project, copy, clip, {}, profile, error, progress, cancel);
+                         }))
+        return {};
+    EffectPreset preset;
+    preset.name = tr("Grain of %1").arg(QString::fromStdString(clip.name)).toStdString();
+    preset.video = true;
+    Effect e = makeEffect("grain_match", 0);
+    e.strings["profile"] = grainProfileText(profile);
+    preset.effects.push_back(e);
+    QString error;
+    const QString file = presets::save(preset, &error);
+    if (file.isEmpty()) {
+        state_->message(tr("Could not save the preset: %1").arg(error));
+        return {};
+    }
+    effects_->reload();
+    state_->message(tr("Measured the grain of %1 (about %2 px, colours alike by %3): saved as the preset %4 in the Effects panel's Presets")
+                        .arg(QString::fromStdString(clip.name), QString::number(grainSize(profile), 'f', 1),
+                             QString::number((profile.correlation[0] + profile.correlation[1] + profile.correlation[2]) / 3, 'f', 2),
+                             QString::fromStdString(preset.name)),
+                    10000);
+    return file;
 }
 
 void MainWindow::syncSequenceTabs() {

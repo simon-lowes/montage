@@ -85,6 +85,7 @@
 #include "render/Processing.h"
 #include "render/QualityCheck.h"
 #include "render/LutExport.h"
+#include "render/GrainMatch.h"
 #include "render/LutToGrade.h"
 #include "render/LightLevel.h"
 #include "render/Relight.h"
@@ -8012,6 +8013,255 @@ colorspaces:
         // (Rec.709 pictures fill under half of ACEScct's range, so the 17-point residual is coarser there than the
         // 33-point LUT, and coming back out of the log curve magnifies what it misses.)
         QVERIFY2(worst < 0.15f && mean < 0.005, qPrintable(QString("%1 %2").arg(worst).arg(mean)));
+    }
+
+    void grainMatching() {
+        const ColorSpace& space = rec709Space();
+        const WorkingSpaceScope working(&space);
+        // Eight stripes of grey, a stop apart, 64 pixels wide; nine frames of grain made here: white noise blurred by
+        // [1 4 6 4 1] / 16 each way, red, green and blue correlated 0.6, its strength 0.004 + 0.05 √light in linear light.
+        const int W = 512, H = 192, kFrames = 9;
+        double stripe[8];
+        for (int k = 0; k < 8; ++k) stripe[k] = std::exp2(k - 7.5);
+        auto amplitudeAt = [](double light) { return 0.004 + 0.05 * std::sqrt(light); };
+        auto clean = [&] {
+            Image img(W, H);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    float* p = img.at(x, y);
+                    for (int c = 0; c < 3; ++c) p[c] = float(fromLinear(space.transfer, stripe[x / 64]));
+                    p[3] = 1;
+                }
+            return img;
+        };
+        std::mt19937 rng(11);
+        std::normal_distribution<double> normal;
+        const double kernel[5] = {1 / 16.0, 4 / 16.0, 6 / 16.0, 4 / 16.0, 1 / 16.0};
+        const double gain = 1 / std::pow(35.0 / 128.0, 2.0);  // (the kernel's sum of squares is 70/256 each way)
+        auto blurred = [&] {
+            std::vector<double> n(size_t(W) * H), a(n.size()), b(n.size());
+            for (double& v : n) v = normal(rng);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    double s = 0;
+                    for (int k = -2; k <= 2; ++k) s += kernel[k + 2] * n[size_t(y) * W + size_t((x + k + W) % W)];
+                    a[size_t(y) * W + size_t(x)] = s;
+                }
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    double s = 0;
+                    for (int k = -2; k <= 2; ++k) s += kernel[k + 2] * a[size_t((y + k + H) % H) * W + size_t(x)];
+                    b[size_t(y) * W + size_t(x)] = s * std::sqrt(gain);
+                }
+            return b;
+        };
+        const double r = 0.6, l10 = 1, l20 = r, l21 = std::sqrt(1 - r * r), l30 = r, l31 = (r - r * r) / l21,
+                     l32 = std::sqrt(1 - l30 * l30 - l31 * l31);
+        std::vector<Image> plate;
+        for (int f = 0; f < kFrames; ++f) {
+            Image img = clean();
+            const auto z0 = blurred(), z1 = blurred(), z2 = blurred();
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const size_t i = size_t(y) * W + size_t(x);
+                    const double g[3] = {l10 * z0[i], l20 * z0[i] + l21 * z1[i], l30 * z0[i] + l31 * z1[i] + l32 * z2[i]};
+                    float* p = img.at(x, y);
+                    for (int c = 0; c < 3; ++c) {
+                        const double l = stripe[x / 64] + amplitudeAt(stripe[x / 64]) * g[c];
+                        p[c] = float(l < 0 ? -fromLinear(space.transfer, -l) : fromLinear(space.transfer, l));
+                    }
+                }
+            plate.push_back(std::move(img));
+        }
+        GrainProfile measured;
+        std::string err;
+        QVERIFY2(measureGrain(plate, space, {}, measured, &err), err.c_str());
+        qInfo("measured: %s", grainProfileText(measured).c_str());
+        // Its strength in every band within 10 %, its colour correlation and its spectrum (the kernel's, cos⁸ each way,
+        // averaged round each ring) too.
+        for (int b = 0; b < GrainProfile::kBands; ++b)
+            for (int c = 0; c < 3; ++c)
+                QVERIFY2(std::fabs(measured.amplitude[c][b] / amplitudeAt(stripe[b]) - 1) < 0.1,
+                         qPrintable(QString("band %1 channel %2: %3 for %4").arg(b).arg(c).arg(measured.amplitude[c][b]).arg(amplitudeAt(stripe[b]))));
+        for (double v : measured.correlation) QVERIFY2(std::fabs(v - r) < 0.06, qPrintable(QString::number(v)));
+        QVERIFY2(measured.temporal < 0.05, qPrintable(QString::number(measured.temporal)));
+        double expect[GrainProfile::kBins] = {}, rings[GrainProfile::kBins] = {};
+        for (int v = -32; v < 32; ++v)
+            for (int u = -32; u < 32; ++u) {
+                const int bin = int(std::hypot(u, v));
+                if (bin >= GrainProfile::kBins || (u == 0 && v == 0)) continue;
+                expect[bin] += std::pow(std::cos(M_PI * u / 64.0), 8) * std::pow(std::cos(M_PI * v / 64.0), 8);
+                rings[bin] += 1;
+            }
+        double top = 0;
+        for (int b = 1; b < GrainProfile::kBins; ++b) top = std::max(top, expect[b] /= rings[b]);
+        for (int b = 1; b < GrainProfile::kBins; ++b)
+            if (expect[b] / top > 0.1)
+                QVERIFY2(std::fabs(measured.spectrum[b] - expect[b] / top) < 0.1 * expect[b] / top + 0.02,
+                         qPrintable(QString("bin %1: %2 for %3").arg(b).arg(measured.spectrum[b]).arg(expect[b] / top)));
+        // The profile as text and back.
+        GrainProfile back;
+        QVERIFY(parseGrainProfile(grainProfileText(measured), back));
+        QCOMPARE(grainProfileText(back), grainProfileText(measured));
+        QVERIFY(!parseGrainProfile("grain1 width=10", back) && !parseGrainProfile("nothing", back));
+        // Not numbers, or a negative spectrum: refused.
+        auto with = [&](const std::string& from, const std::string& to) {
+            std::string t = grainProfileText(measured);
+            return t.replace(t.find(from), from.size(), to);
+        };
+        QVERIFY(!parseGrainProfile(with("temporal=", "temporal=nan "), back));
+        QVERIFY(!parseGrainProfile(with("spectrum=", "spectrum=-"), back));
+        QVERIFY(!parseGrainProfile(with("width=512", "width=inf"), back));
+
+        // Grain made from it on the clean stripes measures as the plate did, within 1 dB in every band.
+        Project p = makeDefaultProject();
+        Effect match = makeEffect(p, "grain_match");
+        match.strings["profile"] = grainProfileText(measured);
+        std::vector<Image> made;
+        for (int f = 0; f < kFrames; ++f) {
+            Image img = clean();
+            applyVideoEffect(match, f, img, 1);
+            made.push_back(std::move(img));
+        }
+        GrainProfile again;
+        QVERIFY2(measureGrain(made, space, {}, again, &err), err.c_str());
+        auto dB = [](double a, double b) { return 20 * std::log10(a / b); };
+        for (int b = 0; b < GrainProfile::kBands; ++b)
+            for (int c = 0; c < 3; ++c)
+                QVERIFY2(std::fabs(dB(again.amplitude[c][b], measured.amplitude[c][b])) < 1,
+                         qPrintable(QString("band %1 channel %2: %3 dB").arg(b).arg(c).arg(dB(again.amplitude[c][b], measured.amplitude[c][b]))));
+        for (int k = 0; k < 3; ++k) QVERIFY(std::fabs(again.correlation[k] - measured.correlation[k]) < 0.06);
+        QVERIFY2(std::fabs(grainSize(again) / grainSize(measured) - 1) < 0.1, qPrintable(QString("%1 for %2").arg(grainSize(again)).arg(grainSize(measured))));
+        // Twice the size: grain twice as large.
+        {
+            Effect big = match;
+            big.params["size"] = 200.0;
+            std::vector<Image> bigger;
+            for (int f = 0; f < kFrames; ++f) {
+                Image img = clean();
+                applyVideoEffect(big, f, img, 1);
+                bigger.push_back(std::move(img));
+            }
+            GrainProfile twice;
+            QVERIFY2(measureGrain(bigger, space, {}, twice, &err), err.c_str());
+            QVERIFY2(std::fabs(grainSize(twice) / grainSize(measured) - 2) < 0.3,
+                     qPrintable(QString("%1 for %2").arg(grainSize(twice)).arg(grainSize(measured))));
+        }
+        // On a picture twice the size, the grain is twice as large and as strong.
+        {
+            auto stripes = [&](int w, int h) {
+                Image img(w, h);
+                for (int y = 0; y < h; ++y)
+                    for (int x = 0; x < w; ++x) {
+                        float* p = img.at(x, y);
+                        for (int c = 0; c < 3; ++c) p[c] = float(fromLinear(space.transfer, stripe[x * 8 / w]));
+                        p[3] = 1;
+                    }
+                return img;
+            };
+            std::vector<Image> large;
+            for (int f = 0; f < kFrames; ++f) {
+                Image img = stripes(2 * W, 2 * H);
+                applyVideoEffect(match, f, img, 1);
+                large.push_back(std::move(img));
+            }
+            GrainProfile doubled;
+            QVERIFY2(measureGrain(large, space, {}, doubled, &err), err.c_str());
+            QVERIFY2(std::fabs(grainSize(doubled) / grainSize(measured) - 2) < 0.3,
+                     qPrintable(QString("%1 for %2").arg(grainSize(doubled)).arg(grainSize(measured))));
+            for (int b = 1; b < GrainProfile::kBands; ++b)
+                QVERIFY2(std::fabs(dB(doubled.amplitude[1][b], measured.amplitude[1][b])) < 1,
+                         qPrintable(QString("band %1: %2 dB").arg(b).arg(dB(doubled.amplitude[1][b], measured.amplitude[1][b]))));
+            // At half the size, as weak as the plate's grain is with 2 x 2 pixels averaged (in each stripe, away from
+            // its edges).
+            auto half = [](const Image& img) {
+                Image out(img.width / 2, img.height / 2);
+                for (int y = 0; y < out.height; ++y)
+                    for (int x = 0; x < out.width; ++x)
+                        for (int k = 0; k < 4; ++k)
+                            out.at(x, y)[k] = (img.at(2 * x, 2 * y)[k] + img.at(2 * x + 1, 2 * y)[k] + img.at(2 * x, 2 * y + 1)[k] +
+                                               img.at(2 * x + 1, 2 * y + 1)[k]) / 4;
+                return out;
+            };
+            auto spreadIn = [&](const std::vector<Image>& frames, int k) {
+                double sum = 0, sq = 0, n = 0;
+                for (const Image& img : frames)
+                    for (int y = 0; y < img.height; ++y)
+                        for (int x = k * img.width / 8 + 3; x < (k + 1) * img.width / 8 - 3; ++x) {
+                            const double v = toLinear(space.transfer, img.at(x, y)[1]) - stripe[k];
+                            sum += v, sq += v * v, n += 1;
+                        }
+                return std::sqrt(std::max(0.0, sq / n - sum * sum / n / n));
+            };
+            std::vector<Image> smallPlate, smallMade;
+            for (int f = 0; f < kFrames; ++f) {
+                smallPlate.push_back(half(plate[size_t(f)]));
+                Image img = stripes(W / 2, H / 2);
+                applyVideoEffect(match, f, img, 1);
+                smallMade.push_back(std::move(img));
+            }
+            for (int k = 2; k < 8; ++k)
+                QVERIFY2(std::fabs(dB(spreadIn(smallMade, k), spreadIn(smallPlate, k))) < 1,
+                         qPrintable(QString("stripe %1: %2 dB").arg(k).arg(dB(spreadIn(smallMade, k), spreadIn(smallPlate, k)))));
+        }
+        // The mean picture (in linear light) moves by under 0.1 %.
+        {
+            Image grey(1024, 512);
+            grey.fill(0.5f, 0.5f, 0.5f, 1);
+            const Image flat = grey;
+            applyVideoEffect(match, 3, grey, 1);
+            double was = 0, now = 0;
+            for (size_t i = 0; i < grey.px.size(); i += 4) was += toLinear(space.transfer, flat.px[i + 1]), now += toLinear(space.transfer, grey.px[i + 1]);
+            QVERIFY2(std::fabs(now / was - 1) < 0.001, qPrintable(QString::number(now / was - 1)));
+            float moved = 0;
+            for (size_t i = 0; i < grey.px.size(); ++i) moved = std::max(moved, std::fabs(grey.px[i] - flat.px[i]));
+            QVERIFY(moved > 0.01f);  // (there is grain)
+        }
+        // Frame 100 alone and after 99 is the same, bit for bit; another frame or seed differs.
+        auto frame = [&](int t, double seed = 0) {
+            Effect e = match;
+            e.params["seed"] = seed;
+            Image img(320, 180);
+            img.fill(0.4f, 0.45f, 0.5f, 1);
+            applyVideoEffect(e, t, img, 1);
+            return img;
+        };
+        const Image alone = frame(100);
+        for (int t = 1; t <= 99; t += 7) frame(t);  // (more than the frames kept made since: frame 100 is made afresh)
+        frame(98);
+        frame(99);
+        QVERIFY(frame(100).px == alone.px);
+        QVERIFY(frame(101).px != alone.px && frame(100, 7).px != alone.px);
+        // A stock gauge: larger grain in Super 8 than 35 mm; 35 mm when nothing was measured.
+        QVERIFY(grainSize(stockGrain(3)) > 1.8 * grainSize(stockGrain(1)));
+        Effect stock = makeEffect(p, "grain_match");
+        QCOMPARE(grainProfileText(effectGrainProfile(stock)), grainProfileText(stockGrain(1)));
+        stock.params["source"] = 4.0;
+        QCOMPARE(grainProfileText(effectGrainProfile(stock)), grainProfileText(stockGrain(3)));
+
+        // A plate with its grain taken out and put back (Replace Grain): the grain matches the plate's within 0.75 dB.
+        std::vector<Image> regrained;
+        for (int f = 0; f < kFrames; ++f) {
+            std::vector<const Image*> around;
+            for (int k = std::max(0, f - kReplaceGrainFrames); k <= std::min(kFrames - 1, f + kReplaceGrainFrames); ++k)
+                if (k != f) around.push_back(&plate[size_t(k)]);
+            Image img = removeGrain(plate[size_t(f)], around, {}, space, measured);
+            Effect replace = match;
+            replace.params["mode"] = 1.0;
+            applyVideoEffect(replace, f, img, 1);
+            regrained.push_back(std::move(img));
+        }
+        GrainProfile replaced;
+        QVERIFY2(measureGrain(regrained, space, {}, replaced, &err), err.c_str());
+        for (int b = 0; b < GrainProfile::kBands; ++b)
+            qInfo("replaced band %d: %.2f dB", b, dB(replaced.amplitude[1][b], measured.amplitude[1][b]));
+        for (int b = 0; b < GrainProfile::kBands; ++b)
+            for (int c = 0; c < 3; ++c)
+                QVERIFY2(std::fabs(dB(replaced.amplitude[c][b], measured.amplitude[c][b])) < 0.75,
+                         qPrintable(QString("band %1 channel %2: %3 dB").arg(b).arg(c).arg(dB(replaced.amplitude[c][b], measured.amplitude[c][b]))));
+        // Too few frames, or nothing flat enough: refused.
+        QVERIFY(!measureGrain(std::vector<Image>(plate.begin(), plate.begin() + 6), space, {}, back, &err));
+        QVERIFY(!measureGrain(plate, space, {0, 0, 32, 32}, back, &err));
     }
 
     void magnifyChannelBlurNoise() {

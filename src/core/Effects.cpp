@@ -537,6 +537,14 @@ std::vector<EffectInfo> buildCatalog() {
                  {num("amount", "Amount", 0, 1, 0.15, 0.005), num("size", "Grain Size (px)", 0.5, 8, 1.5, 0.1),
                   boolean("color", "Colour Grain")},
                  {}});
+    // Grain Match (render/GrainMatch.h): grain made to a measured profile (Clip > Measure Grain, MCP montage_grain) or
+    // one of Film Look's gauges, by the picture's own light; Replace Grain takes the plate's own out first (with Video
+    // Noise Reduction's defaults on the source frames, unless the clip has that effect itself).
+    c.push_back({"grain_match", "Grain Match", EffectCategory::VideoFilter, "Stylize",
+                 {choice("source", "Grain", {"Measured", "65mm", "35mm", "16mm", "Super 8"}, 0),
+                  choice("mode", "Mode", {"Add Grain", "Replace Grain"}, 0), pct("amount", "Amount", 0, 200, 100),
+                  pct("size", "Size", 25, 400, 100), pct("saturation", "Colour", 0, 200, 100), num("seed", "Seed", 0, 9999, 0, 1)},
+                 {str("profile", "Measured Profile", StringKind::Text)}});
     c.push_back({"directional_blur", "Directional Blur", EffectCategory::VideoFilter, "Blur & Sharpen",
                  {num("length", "Length (px)", 0, 300, 20, 0.5), angle("angle", "Direction", 0)},
                  {}});

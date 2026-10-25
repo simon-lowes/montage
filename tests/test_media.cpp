@@ -54,6 +54,7 @@
 #include "core/Effects.h"
 #include "core/Expression.h"
 #include "core/ProjectIO.h"
+#include "render/GrainMatch.h"
 #include "render/Expressions.h"
 #include "render/Particles.h"
 #include "core/Surround.h"
@@ -2628,6 +2629,107 @@ private slots:
         QVERIFY(std::none_of(got.effects.begin(), got.effects.end(), [](const Effect& e) { return e.type == "lut"; }));  // no residual asked for
         // Nothing left to rebuild now.
         QVERIFY(call({{"project", project}, {"clip", double(id)}}).value("isError").toBool());
+    }
+
+    void grainOverMcp() {
+        // Grainy footage (a flat colour with fresh grain on every frame, kept by ProRes 422 HQ), then a clean matte of
+        // the same colour after it.
+        Project gen = makeDefaultProject();
+        Sequence& gs = *gen.active();
+        gs.width = 320, gs.height = 180, gs.fps = {25, 1};
+        Clip c = makeGeneratorClip(gen, "color", 20);
+        c.generator.params["color.r"] = Param(0.45);
+        c.generator.params["color.g"] = Param(0.5);
+        c.generator.params["color.b"] = Param(0.4);
+        Effect grain = makeEffect(gen, "film_grain");
+        grain.params["amount"] = Param(0.3);
+        grain.params["color"] = Param(1.0);
+        c.effects.push_back(grain);
+        edit::overwrite(gen, gs, {TrackKind::Video, 0}, c);
+        ExportSettings st = findExportPreset("ProRes 422 HQ")->settings;
+        st.path = path("grain-for-mcp.mov");
+        st.audioCodec = "none";
+        std::string err;
+        QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = {25, 1};
+        MediaItem m = probeOrFail(p, st.path);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip matte = makeGeneratorClip(p, "color", 20);
+        matte.start = 20;
+        matte.generator.params = c.generator.params;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, matte).ok);
+        const Id plate = s.videoTracks[0].clips.at(0).id, clean = s.videoTracks[0].clips.at(1).id;
+        const QString project = QString::fromStdString(path("grain.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        // (Flat: the green's spread is the grain's.)
+        auto spread = [](const Image& img) {
+            double sum = 0, sq = 0;
+            for (size_t i = 1; i < img.px.size(); i += 4) sum += img.px[i], sq += double(img.px[i]) * img.px[i];
+            const double n = double(img.px.size() / 4);
+            return std::sqrt(std::max(0.0, sq / n - sum * sum / n / n));
+        };
+        const Image raw = renderSequenceFrame(p, s, 10, {});
+        const double plateNoise = spread(raw);
+        QVERIFY2(plateNoise > 0.01, qPrintable(QString::number(plateNoise)));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_grain"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        // Measured: a profile; put on the matte, the matte's grain is about as strong as the plate's.
+        QJsonObject r = call({{"project", project}, {"action", "measure"}, {"clip", double(plate)}, {"apply_to", QJsonArray{double(clean)}}});
+        QVERIFY2(!r.value("isError").toBool() && text(r).contains("Profile: grain1") && text(r).contains("put on 1 clip"), qPrintable(text(r)));
+        GrainProfile g;
+        QVERIFY(parseGrainProfile(text(r).section("Profile: ", 1).section('\n', 0, 0).toStdString(), g));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const double made = spread(renderSequenceFrame(back, *back.active(), 30, {}));
+        QVERIFY2(std::fabs(made / plateNoise - 1) < 0.15, qPrintable(QString("%1 for %2").arg(made).arg(plateNoise)));
+        // Replace Grain on the plate: its own grain taken out and the measured grain put back, about as strong; the
+        // picture otherwise as it was.
+        r = call({{"project", project}, {"action", "apply"}, {"profile", QString::fromStdString(grainProfileText(g))}, {"mode", "replace"},
+                  {"apply_to", QJsonArray{double(plate)}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->videoTracks[0].clips.at(0).effects.back().p("mode", 0, 0), 1.0);
+        const Image replaced = renderSequenceFrame(back, *back.active(), 10, {});
+        const double again = spread(replaced);
+        QVERIFY2(std::fabs(again / plateNoise - 1) < 0.15, qPrintable(QString("%1 for %2").arg(again).arg(plateNoise)));
+        double was = 0, now = 0, moved = 0;
+        for (size_t i = 1; i < raw.px.size(); i += 4) was += raw.px[i], now += replaced.px[i], moved = std::max(moved, double(std::fabs(raw.px[i] - replaced.px[i])));
+        QVERIFY(std::fabs(now - was) / was < 0.01);
+        QVERIFY(moved > 0.02);  // (other grain)
+        // Under a mask (the left half), the right half is the plate as it was.
+        {
+            Effect& rg = back.active()->videoTracks[0].clips.at(0).effects.back();
+            rg.params["mask.shape"] = Param(2.0);
+            rg.params["mask.x"] = Param(0.25);
+            rg.params["mask.w"] = Param(0.5);
+            rg.params["mask.h"] = Param(2.0);
+            rg.params["mask.feather"] = Param(0.0);
+            const Image half = renderSequenceFrame(back, *back.active(), 10, {});
+            float right = 0, left = 0;
+            for (int y = 0; y < half.height; ++y)
+                for (int x = 0; x < half.width; ++x)
+                    (x >= 170 ? right : left) = std::max(x >= 170 ? right : left, std::fabs(half.at(x, y)[1] - raw.at(x, y)[1]));
+            QVERIFY2(right < 1e-4f && left > 0.02f, qPrintable(QString("%1 %2").arg(right).arg(left)));
+        }
+        // A gauge; and refusals: no clips to put it on, not a profile, an unknown gauge.
+        r = call({{"project", project}, {"action", "apply"}, {"gauge", "super8"}, {"apply_to", QJsonArray{double(clean)}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->videoTracks[0].clips.at(1).effects.back().p("source", 0, 0), 4.0);
+        QVERIFY(call({{"project", project}, {"action", "apply"}, {"gauge", "35mm"}}).value("isError").toBool());
+        QVERIFY(call({{"project", project}, {"action", "apply"}, {"profile", "grain"}, {"apply_to", QJsonArray{double(clean)}}}).value("isError").toBool());
+        QVERIFY(call({{"project", project}, {"action", "apply"}, {"gauge", "8mm"}, {"apply_to", QJsonArray{double(clean)}}}).value("isError").toBool());
     }
 
     void qualityCheckSound() {

@@ -212,6 +212,7 @@
 #include "SequenceIndexPanel.h"
 #include "core/Automation.h"
 #include "core/History.h"
+#include "render/GrainMatch.h"
 #include "render/LutExport.h"
 #include "render/Processing.h"
 #include "media/Segmenter.h"
@@ -3064,6 +3065,61 @@ private slots:
         // A clip without a LUT: refused.
         state()->undo();
         QVERIFY(!win_->rebuildLutAsGrade(dir_.path() + "/residual.cube"));
+    }
+
+    void measureGrainAsPreset() {
+        loadDemo();
+        QVERIFY(win_->findChild<QAction*>("measureGrain"));
+        // A generator has no grain to measure: refused.
+        state()->setSelection({clipNamed(*state()->sequence(), "Red")->id});
+        state()->setPlayhead(30);
+        QVERIFY(win_->measureGrainAsPreset().isEmpty());
+        // Grainy footage: a flat colour with fresh grain on every frame, kept by ProRes 422 HQ.
+        const QString shot = dir_.path() + "/grainy-plate.mov";
+        {
+            Project gen = makeDefaultProject();
+            Sequence& gs = *gen.active();
+            gs.width = 320, gs.height = 180, gs.fps = {25, 1};
+            Clip c = makeGeneratorClip(gen, "color", 20);
+            c.generator.params["color.r"] = Param(0.45);
+            c.generator.params["color.g"] = Param(0.5);
+            c.generator.params["color.b"] = Param(0.4);
+            Effect grain = makeEffect(gen, "film_grain");
+            grain.params["amount"] = Param(0.3);
+            grain.params["color"] = Param(1.0);
+            c.effects.push_back(grain);
+            QVERIFY(edit::overwrite(gen, gs, {TrackKind::Video, 0}, c).ok);
+            ExportSettings st = findExportPreset("ProRes 422 HQ")->settings;
+            st.path = shot.toStdString();
+            st.audioCodec = "none";
+            std::string err;
+            QVERIFY2(exportSequence(gen, gs, st, nullptr, nullptr, &err), err.c_str());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({shot});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            s.width = 320, s.height = 180, s.fps = {25, 1};
+            return edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+        }));
+        state()->setSelection({state()->sequence()->videoTracks[0].clips.at(0).id});
+        state()->setPlayhead(5);
+        // Saved as a preset holding a Grain Match with the measured profile, listed in the Effects panel.
+        const QString file = win_->measureGrainAsPreset();
+        QVERIFY2(QFileInfo::exists(file), qPrintable(win_->statusBar()->currentMessage()));
+        EffectPreset preset;
+        QVERIFY(presets::load(file, preset));
+        QCOMPARE(preset.name, std::string("Grain of grainy-plate.mov"));
+        QCOMPARE(preset.effects.size(), size_t(1));
+        QCOMPARE(preset.effects[0].type, std::string("grain_match"));
+        GrainProfile g;
+        QVERIFY(parseGrainProfile(preset.effects[0].s("profile"), g));
+        QCOMPARE(g.width, 320);
+        QVERIFY(g.amplitude[1][GrainProfile::kBands - 3] > 0.005);  // (the plate's green, about 0.21 in linear light)
+        QVERIFY2(win_->statusBar()->currentMessage().contains("Measured the grain"), qPrintable(win_->statusBar()->currentMessage()));
+        QVERIFY(presets::remove(file));
+        win_->findChild<EffectsBrowser*>()->reload();
+        state()->newProject();
     }
 
     void clipMarkersFromTheMenu() {
