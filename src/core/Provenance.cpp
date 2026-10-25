@@ -70,6 +70,7 @@ void effectUses(Provenance& out, const Effect& e) {
     else if (t == "lip_sync") add(out, {"Lip Sync", "MuseTalk 1.5, whisper-tiny, sd-vae-ft-mse, YuNet, MediaPipe Face Mesh V2", AiRole::Generated});
     else if (t == "relight") add(out, {"Relight", "Depth Anything V2", AiRole::Enhanced});
     else if (t == "enhance_speech") add(out, {"Enhance Speech", "DeepFilterNet3", AiRole::Enhanced});
+    else if (t == "bandwidth_extension") add(out, {"Bandwidth Extension", "AP-BWE", AiRole::Enhanced});
     else if (t == "voice_isolate") add(out, {"Voice Isolation", "RNNoise", AiRole::Enhanced});
     else if (t == "redact_faces") add(out, {"Redact Faces", "YuNet", AiRole::Assisted});
     else if (t == "remove_background" || t == "behind_people") add(out, {"People Matte", "MODNet", AiRole::Assisted});

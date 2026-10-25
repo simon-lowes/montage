@@ -657,6 +657,13 @@ std::vector<EffectInfo> buildCatalog() {
 #ifndef MONTAGE_WITH_ONNXRUNTIME
     c.back().hidden = true;  // needs ONNX Runtime
 #endif
+    // The missing top of band-limited speech rebuilt (media/BandwidthExtension.h); the cut-off 0 is found.
+    c.push_back({"bandwidth_extension", "Bandwidth Extension", EffectCategory::AudioFilter, "Restoration",
+                 {pct("amount", "Amount", 0, 100, 100), num("cutoff_hz", "Cut-off (Hz, 0 = auto)", 0, 24000, 0, 50)},
+                 {}});
+#ifndef MONTAGE_WITH_ONNXRUNTIME
+    c.back().hidden = true;  // needs ONNX Runtime
+#endif
     c.push_back({"declick", "De-Click", EffectCategory::AudioFilter, "Restoration",
                  {pct("sensitivity", "Sensitivity", 0, 100, 50), num("max_ms", "Longest Click (ms)", 0.1, 10, 2, 0.1)},
                  {}});

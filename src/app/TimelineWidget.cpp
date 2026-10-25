@@ -2811,6 +2811,10 @@ void TimelineWidget::dropEffect(const QString& typeQ, const QPoint& pos) {
                 return;
             }
             Id id = h.clip;
+            // Bandwidth Extension: the models the clip's cut-off needs.
+            if (type == "bandwidth_extension")
+                if (const Clip* c = edit::clipById(*s, id); c && !ensureBandwidthModels(window(), state_->project(), *s, *c)) return;
+            if (!(s = state_->sequence())) return;  // (a download waits in an event loop)
             QString error;
             state_->edit(tr("Add %1").arg(name), [id, type, &error](Project& p, Sequence& sq) {
                 Clip* c = edit::clipById(sq, id);

@@ -125,6 +125,31 @@ jobs:
         with:
           path: ~/montage-models/stems/bandit-v2-eng
           key: bandit-eng-12701995
+      # Saved only once both checkpoints are here, as the dialogue, music and effects model is.
+      - name: Restore the speech bandwidth models
+        id: bwe-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/montage-models/bwe
+          key: apbwe-fa3f46d-8k16k-8k48k
+      - name: The speech bandwidth models (two AP-BWE checkpoints, 238 MB)
+        id: bwe
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          if [ "${{ steps.bwe-cache.outputs.cache-hit }}" != "true" ]; then
+            scripts/fetch-models.sh ~/montage-models --bwe-test \
+              || echo "::warning::Could not download the speech bandwidth models; their test will be skipped"
+            rm -f ~/montage-models/bwe/*/*.part
+            if [ -s ~/montage-models/bwe/apbwe-8k-16k/generator.ckpt ] && [ -s ~/montage-models/bwe/apbwe-8k-48k/generator.ckpt ]; then echo "fetched=1" >> "$GITHUB_OUTPUT"; fi
+          fi
+          echo "MONTAGE_BWE_MODELS=$HOME/montage-models/bwe" >> "$GITHUB_ENV"
+      - name: Keep the speech bandwidth models
+        if: steps.bwe.outputs.fetched == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/montage-models/bwe
+          key: apbwe-fa3f46d-8k16k-8k48k
       - name: Cache the reference IAMF decoder
         uses: actions/cache@v4
         with:

@@ -164,6 +164,7 @@
 #include "media/Segmenter.h"
 #include "media/Translator.h"
 #include "media/SpeechEnhance.h"
+#include "media/BandwidthExtension.h"
 #include "media/MotionDeblur.h"
 #include "media/SuperScale.h"
 #include "media/Reframe.h"
@@ -889,6 +890,106 @@ bool writeMonoWav(const std::string& path, const std::vector<float>& x, int rate
         std::fwrite(&s, 2, 1, f);
     }
     return std::fclose(f) == 0;
+}
+
+// The sound with everything above (or below, `high`) `hz` taken out: one FFT of the whole, zero-padded.
+std::vector<float> bweFilter(const std::vector<float>& x, int rate, double hz, bool high) {
+    size_t n = 1;
+    while (n < x.size() * 2) n <<= 1;
+    std::vector<std::complex<float>> a(n);
+    for (size_t i = 0; i < x.size(); ++i) a[i] = x[i];
+    fftInPlace(a, false);
+    for (size_t k = 0; k < n; ++k) {
+        const double f = double(std::min(k, n - k)) * rate / double(n);
+        if (high ? f < hz : f > hz) a[k] = 0;
+    }
+    fftInPlace(a, true);
+    std::vector<float> out(x.size());
+    for (size_t i = 0; i < x.size(); ++i) out[i] = a[i].real() / float(n);
+    return out;
+}
+std::vector<float> bweLowPass(const std::vector<float>& x, int rate, double hz) { return bweFilter(x, rate, hz, false); }
+std::vector<float> bweHighPass(const std::vector<float>& x, int rate, double hz) { return bweFilter(x, rate, hz, true); }
+
+// White noise, uniform in [-amp, amp].
+std::vector<float> bweNoise(size_t n, float amp, uint32_t seed) {
+    std::vector<float> x(n);
+    for (float& v : x) {
+        seed = seed * 1664525u + 1013904223u;
+        v = amp * float(double(seed >> 8) / double(1u << 24) * 2 - 1);
+    }
+    return x;
+}
+
+// The energy between lo and hi Hz (Hann frames of 2048, half overlapping).
+double bweBandEnergy(const std::vector<float>& x, int rate, double lo, double hi) {
+    constexpr int N = 2048;
+    std::vector<std::complex<float>> a(N);
+    double e = 0;
+    for (size_t start = 0; start + N <= x.size(); start += N / 2) {
+        for (int i = 0; i < N; ++i) a[size_t(i)] = x[start + size_t(i)] * float(0.5 - 0.5 * std::cos(2 * M_PI * i / N));
+        fftInPlace(a, false);
+        for (int k = 0; k <= N / 2; ++k)
+            if (const double f = double(k) * rate / N; f >= lo && f < hi) e += std::norm(a[size_t(k)]);
+    }
+    return e;
+}
+
+// The STFT the bandwidth network takes (media/BandwidthExtension.h): frames [first, first + frames), 513 bins each,
+// log magnitude (without the floor) and phase, bin major.
+void bweStft(const std::vector<float>& x, int64_t first, int frames, std::vector<float>& logAmp, std::vector<float>& phase) {
+    const int64_t len = int64_t(x.size());
+    logAmp.assign(size_t(513) * size_t(frames), 0.0f);
+    phase.assign(logAmp.size(), 0.0f);
+    std::vector<std::complex<float>> a(1024);
+    for (int j = 0; j < frames; ++j) {
+        for (int i = 0; i < 1024; ++i) {
+            const int w = i - 352;
+            int64_t s = (first + j) * 80 + i - 512;
+            while (s < 0 || s >= len) s = s < 0 ? -s : 2 * (len - 1) - s;
+            a[size_t(i)] = w >= 0 && w < 320 ? x[size_t(s)] * float(0.5 - 0.5 * std::cos(2 * M_PI * w / 320)) : 0.0f;
+        }
+        fftInPlace(a, false);
+        for (int k = 0; k < 513; ++k) {
+            logAmp[size_t(k) * size_t(frames) + size_t(j)] = std::log(std::max(std::abs(a[size_t(k)]), 1e-30f));
+            phase[size_t(k) * size_t(frames) + size_t(j)] = std::arg(a[size_t(k)]);
+        }
+    }
+}
+
+// The log-spectral distance (dB) of `test` from `ref` between lo and hi Hz, over the frames where `ref` is within 30 dB
+// of its loudest (frames of about 32 ms, half overlapping).
+double bweLsd(const std::vector<float>& ref, const std::vector<float>& test, int rate, double lo, double hi) {
+    const int N = rate >= 32000 ? 2048 : 512;
+    std::vector<std::complex<float>> a(static_cast<size_t>(N)), b(static_cast<size_t>(N));
+    std::vector<double> energy, dist;
+    for (size_t start = 0; start + size_t(N) <= std::min(ref.size(), test.size()); start += size_t(N) / 2) {
+        for (int i = 0; i < N; ++i) {
+            const float w = float(0.5 - 0.5 * std::cos(2 * M_PI * i / N));
+            a[size_t(i)] = ref[start + size_t(i)] * w;
+            b[size_t(i)] = test[start + size_t(i)] * w;
+        }
+        fftInPlace(a, false);
+        fftInPlace(b, false);
+        double e = 0, d = 0;
+        int n = 0;
+        for (int k = 0; k <= N / 2; ++k) {
+            e += std::norm(a[size_t(k)]);
+            if (const double f = double(k) * rate / N; f >= lo && f < hi) {
+                const double diff = 10 * std::log10(std::norm(a[size_t(k)]) + 1e-8) - 10 * std::log10(std::norm(b[size_t(k)]) + 1e-8);
+                d += diff * diff;
+                ++n;
+            }
+        }
+        energy.push_back(e);
+        dist.push_back(std::sqrt(d / std::max(1, n)));
+    }
+    const double loud = *std::max_element(energy.begin(), energy.end());
+    double sum = 0;
+    int used = 0;
+    for (size_t t = 0; t < energy.size(); ++t)
+        if (energy[t] >= loud * 1e-3) sum += dist[t], ++used;
+    return used ? sum / used : 0;
 }
 
 // Amplitude of `hz` in channel `ch` of interleaved stereo, over samples [from, to).
@@ -33590,6 +33691,174 @@ private slots:
         // (the hazy hills' crest drops in and out of the sky frame by frame, and the grain moves the edge about)
         QVERIFY2(steady < 0.75, qPrintable(QString::number(steady)));
         QVERIFY2(steady < 0.7 * jumpy, qPrintable(QString("%1 vs %2").arg(steady).arg(jumpy)));
+    }
+
+    void bandwidthExtension() {
+        // JFK's speech at 48 kHz (the 16 kHz recording's own top is 8 kHz).
+        std::string err;
+        AudioBufferPtr jfk = decodeAudio(MONTAGE_TEST_DATA_DIR "/jfk.wav", 48000, &err);
+        QVERIFY2(jfk, err.c_str());
+        std::vector<float> speech(size_t(jfk->frames()));
+        for (int64_t i = 0; i < jfk->frames(); ++i) speech[size_t(i)] = jfk->samples[size_t(i) * 2];
+        // The cut-off of the speech low-passed at 4, 6 and 8 kHz is found within 200 Hz.
+        for (double fc : {4000.0, 6000.0, 8000.0}) {
+            const double found = speechCutoff(bweLowPass(speech, 48000, fc), 48000);
+            qInfo("speech low-passed at %.0f Hz: cut-off found at %.0f Hz", fc, found);
+            QVERIFY2(std::abs(found - fc) < 200, qPrintable(QString::number(found)));
+        }
+        // Noise over the whole band is missing nothing.
+        const std::vector<float> noise = bweNoise(4 * 48000, 0.1f, 7);
+        QCOMPARE(speechCutoff(noise, 48000), 24000.0);
+        QVERIFY(bwePlan(speechCutoff(noise, 48000), 48000).empty());
+
+        // The checkpoints the cut-off picks: the one whose band reaches it, narrower than 4 kHz to 16 kHz first.
+        using Plan = std::vector<BweCheckpoint>;
+        QVERIFY(bwePlan(4000, 48000) == (Plan{{8000, 48000}}));
+        QVERIFY(bwePlan(5000, 48000) == (Plan{{8000, 48000}}));
+        QVERIFY(bwePlan(6000, 48000) == (Plan{{12000, 48000}}));
+        QVERIFY(bwePlan(11000, 48000) == (Plan{{16000, 48000}}));
+        QVERIFY(bwePlan(16000, 48000) == (Plan{{24000, 48000}}));
+        QVERIFY(bwePlan(3400, 48000) == (Plan{{4000, 16000}, {16000, 48000}}));
+        QVERIFY(bwePlan(1500, 48000) == (Plan{{2000, 16000}, {16000, 48000}}));
+        QVERIFY(bwePlan(4000, 16000) == (Plan{{8000, 16000}}));
+        QVERIFY(bwePlan(3900, 44100) == (Plan{{8000, 48000}}));
+        QVERIFY(bwePlan(22000, 48000).empty());
+        QVERIFY(bwePlan(600, 48000).empty());
+
+        // A stand-in network that returns the original: below the cut-off nothing changes (what is added holds less than
+        // a millionth of the speech's energy there), and Amount 0 changes nothing at all.
+        const BweNetwork same = [](const BweCheckpoint&, int64_t, int, const std::vector<float>& logAmp, const std::vector<float>& phase,
+                                   std::vector<float>& logAmpOut, std::vector<float>& phaseOut, std::string*) {
+            logAmpOut = logAmp;
+            phaseOut = phase;
+            return true;
+        };
+        const std::vector<float> narrow = bweLowPass(speech, 48000, 6000);
+        std::vector<float> out;
+        BweResult r;
+        QVERIFY2(extendBandwidth(narrow, 48000, out, 100, 0, same, nullptr, &err, &r), err.c_str());
+        QVERIFY2(std::abs(r.cutoff - 6000) < 200, qPrintable(QString::number(r.cutoff)));
+        QVERIFY(r.plan == (Plan{{12000, 48000}}));
+        QCOMPARE(out.size(), narrow.size());
+        std::vector<float> added(out.size());
+        for (size_t i = 0; i < out.size(); ++i) added[i] = out[i] - narrow[i];
+        const double kept = bweBandEnergy(narrow, 48000, 50, r.cutoff - 200), change = bweBandEnergy(added, 48000, 50, r.cutoff - 200);
+        qInfo("below the cut-off: %.1f dB under the speech", 10 * std::log10(change / kept));
+        QVERIFY(change < kept * 1e-6);
+        QVERIFY(extendBandwidth(narrow, 48000, out, 0, 0, same));
+        QVERIFY(out == narrow);
+        // No sound, with or without a cut-off given, is nothing to do.
+        QVERIFY(extendBandwidth({}, 48000, out, 100, 4000, same));
+        QVERIFY(out.empty());
+
+        // The crossfade is equal-power: full-band noise with the cut-off given at 4 kHz and a stand-in returning another
+        // noise of the same level keeps the noise's level below the cut-off, through the 500 Hz crossfade and above it
+        // within 0.6 dB (a linear crossfade would dip 3 dB halfway).
+        const std::vector<float> other = bweNoise(noise.size(), 0.1f, 11);
+        const BweNetwork replace = [&other](const BweCheckpoint& c, int64_t first, int frames, const std::vector<float>&, const std::vector<float>&,
+                                            std::vector<float>& logAmpOut, std::vector<float>& phaseOut, std::string*) {
+            if (c.high != 48000) return false;
+            bweStft(other, first, frames, logAmpOut, phaseOut);
+            return true;
+        };
+        QVERIFY2(extendBandwidth(noise, 48000, out, 100, 4000, replace, nullptr, &err, &r), err.c_str());
+        QVERIFY(r.plan == (Plan{{8000, 48000}}));
+        for (auto [lo, hi] : {std::pair{3000.0, 3500.0}, {4150.0, 4350.0}, {4350.0, 4500.0}, {6000.0, 20000.0}}) {
+            const double db = 10 * std::log10(bweBandEnergy(out, 48000, lo, hi) / bweBandEnergy(noise, 48000, lo, hi));
+            qInfo("%.0f-%.0f Hz: %+.2f dB", lo, hi, db);
+            QVERIFY2(std::abs(db) < 0.6, qPrintable(QStringLiteral("%1-%2 Hz: %3 dB").arg(lo).arg(hi).arg(db)));
+        }
+        // Above the crossfade it is the other noise.
+        double corr = 0, e1 = 0, e2 = 0;
+        const std::vector<float> highOut = bweHighPass(out, 48000, 6000), highOther = bweHighPass(other, 48000, 6000);
+        for (size_t i = 4800; i + 4800 < out.size(); ++i) corr += double(highOut[i]) * highOther[i], e1 += double(highOut[i]) * highOut[i], e2 += double(highOther[i]) * highOther[i];
+        QVERIFY2(corr / std::sqrt(e1 * e2) > 0.99, qPrintable(QString::number(corr / std::sqrt(e1 * e2))));
+
+        // Through the effect: both sides of a mono recording restored alike, and a clip whose role is Music or Effects left
+        // alone.
+        AudioBuffer stereo;
+        stereo.sampleRate = 48000;
+        stereo.samples.resize(narrow.size() * 2);
+        for (size_t i = 0; i < narrow.size(); ++i) stereo.samples[i * 2] = stereo.samples[i * 2 + 1] = narrow[i];
+        AudioBuffer restored;
+        QVERIFY(restoreBandwidth(stereo, restored, 100, 0, nullptr, &err, same, &r));
+        QVERIFY(r.plan == (Plan{{12000, 48000}}));
+        QCOMPARE(restored.frames(), stereo.frames());
+        for (size_t i = 0; i < narrow.size(); i += 997) QCOMPARE(restored.samples[i * 2], restored.samples[i * 2 + 1]);
+        Effect bwe;
+        bwe.type = "bandwidth_extension";
+        Clip clip;
+        clip.role = "Dialogue";
+        QVERIFY(bandwidthExtensionApplies(bwe, clip));
+        clip.role = "Music";
+        QVERIFY(!bandwidthExtensionApplies(bwe, clip));
+        clip.role = "Effects";
+        QVERIFY(!bandwidthExtensionApplies(bwe, clip));
+        Effect denoise;
+        denoise.type = "denoise";
+        QVERIFY(bandwidthExtensionApplies(denoise, clip));
+        QVERIFY(isSourceAudioEffect("bandwidth_extension"));
+
+        // MCP: the effect added to a clip of the narrow speech names the models its cut-off needs when they are missing.
+        if (bandwidthExtensionAvailable()) {
+            const QByteArray had = qgetenv("MONTAGE_BWE_MODELS");
+            qputenv("MONTAGE_BWE_MODELS", QByteArray::fromStdString(path("no-bwe-models")));
+            Project p = makeDefaultProject();
+            QVERIFY(writeMonoWav(path("bwe-narrow.wav"), narrow, 48000));
+            MediaItem m = probeOrFail(p, path("bwe-narrow.wav"));
+            p.media.push_back(m);
+            Clip c;
+            c.id = p.newId();
+            c.mediaId = m.id;
+            c.duration = 60;
+            p.active()->audioTracks.at(0).clips.push_back(c);
+            const QString project = QString::fromStdString(path("bwe.montage"));
+            QVERIFY(saveProject(p, project.toStdString()));
+            McpServer server;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_add_effect"},
+                                                         {"arguments", QJsonObject{{"project", project}, {"clip", double(c.id)}, {"effect", "bandwidth_extension"}}},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject res = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            const QString text = QJsonDocument(res).toJson();
+            if (had.isEmpty()) qunsetenv("MONTAGE_BWE_MODELS");
+            else qputenv("MONTAGE_BWE_MODELS", had);
+            QVERIFY2(res.value("isError").toBool(), qPrintable(text));
+            QVERIFY2(text.contains("apbwe-12k-48k"), qPrintable(text));
+        }
+
+        // With the models: JFK at 16 kHz brought down to 8 kHz and back comes out of the 8-to-16 kHz checkpoint with its
+        // log-spectral distance above 4 kHz at least 3 dB lower than the input's; and at 48 kHz, cut at 4 kHz, out of the
+        // 8-to-48 kHz checkpoint likewise up to 8 kHz (where the recording itself ends).
+        if (!bandwidthExtensionAvailable() || !bweModel({8000, 16000}).installed())
+            QSKIP("Set MONTAGE_BWE_MODELS to the folder of the AP-BWE checkpoints to run the rest");
+        AudioBufferPtr j16 = decodeAudio(MONTAGE_TEST_DATA_DIR "/jfk.wav", 16000, &err);
+        QVERIFY2(j16, err.c_str());
+        std::vector<float> x16(size_t(j16->frames()));
+        for (int64_t i = 0; i < j16->frames(); ++i) x16[size_t(i)] = j16->samples[size_t(i) * 2];
+        const std::vector<float> narrow16 = resampleSinc(resampleSinc(x16, 16000, 8000), 8000, 16000);
+        std::vector<float> wide16;
+        QElapsedTimer timer;
+        timer.start();
+        QVERIFY2(extendBandwidth(narrow16, 16000, wide16, 100, 0, {}, nullptr, &err, &r), err.c_str());
+        QVERIFY(r.plan == (Plan{{8000, 16000}}));
+        const double lsdIn = bweLsd(x16, narrow16, 16000, 4000, 8000), lsdOut = bweLsd(x16, wide16, 16000, 4000, 8000);
+        qInfo("8 to 16 kHz (cut-off %.0f Hz, %.1f s): log-spectral distance above 4 kHz %.1f dB -> %.1f dB", r.cutoff,
+              timer.elapsed() / 1000.0, lsdIn, lsdOut);
+        QVERIFY(lsdOut <= lsdIn - 3);
+        if (bweModel({8000, 48000}).installed()) {
+            const std::vector<float> narrow48 = bweLowPass(speech, 48000, 4000);
+            std::vector<float> wide48;
+            timer.restart();
+            QVERIFY2(extendBandwidth(narrow48, 48000, wide48, 100, 0, {}, nullptr, &err, &r), err.c_str());
+            QVERIFY(r.plan == (Plan{{8000, 48000}}));
+            const double in48 = bweLsd(speech, narrow48, 48000, 4000, 7500), out48 = bweLsd(speech, wide48, 48000, 4000, 7500);
+            qInfo("8 to 48 kHz (cut-off %.0f Hz, %.1f s): log-spectral distance 4-7.5 kHz %.1f dB -> %.1f dB", r.cutoff,
+                  timer.elapsed() / 1000.0, in48, out48);
+            QVERIFY(out48 <= in48 - 3);
+        }
     }
 
     void languageModelKeepsToItsGrammar() {

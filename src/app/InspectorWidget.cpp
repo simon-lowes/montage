@@ -1664,6 +1664,11 @@ void InspectorWidget::addEffectMenu(TrackKind kind, Id owner, int node) {
         QString label = QString::fromStdString(info->displayName);
         g->addAction(label, this, [this, owner, type, label, node] {
             if (!ensureEffectModel(window(), type)) return;
+            // Bandwidth Extension: the models the clip's cut-off needs.
+            if (type == "bandwidth_extension" && state_->sequence())
+                if (const Clip* c = edit::clipById(*state_->sequence(), owner);
+                    c && !ensureBandwidthModels(window(), state_->project(), *state_->sequence(), *c))
+                    return;
             Id added = 0;
             state_->edit(tr("Add %1").arg(label), [owner, type, node, &added](Project& p, Sequence& s) {
                 std::vector<Effect>* chain = edit::effectChain(s, owner);

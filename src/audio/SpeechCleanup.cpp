@@ -30,7 +30,7 @@ extern "C" {
 namespace montage {
 
 bool isSourceAudioEffect(const std::string& type) {
-    return type == "denoise" || type == "voice_isolate" || type == "enhance_speech" || type == "declick" || type == "pitch_shift" ||
+    return type == "denoise" || type == "voice_isolate" || type == "enhance_speech" || type == "bandwidth_extension" || type == "declick" || type == "pitch_shift" ||
            type == "dereverb" || type == "spectral_repair" || type == "dialogue_align" || type == "declip" || type == "deplosive" ||
            type == "dewind" || type == "ara";
 }
@@ -433,6 +433,53 @@ bool enhanceSpeech(const AudioBuffer& in, AudioBuffer& out, double amount, doubl
     return true;
 }
 
+namespace {
+std::vector<float> channelOf(const AudioBuffer& in, int c) {
+    const int64_t frames = in.frames();
+    std::vector<float> x(static_cast<size_t>(frames));
+    for (int64_t s = 0; s < frames; ++s) x[size_t(s)] = in.samples[size_t(s) * 2 + size_t(c)];
+    return x;
+}
+}  // namespace
+
+bool bandwidthExtensionApplies(const Effect& e, const Clip& c) {
+    return e.type != "bandwidth_extension" || (c.role != "Music" && c.role != "Effects");
+}
+
+BweResult bandwidthPlanFor(const AudioBuffer& in, double cutoff) {
+    BweResult r;
+    if (cutoff > 0) {
+        r.cutoff = std::min(cutoff, in.sampleRate / 2.0);
+    } else {
+        const int64_t frames = in.frames();
+        std::vector<float> mid(static_cast<size_t>(frames));
+        for (int64_t s = 0; s < frames; ++s) mid[size_t(s)] = 0.5f * (in.samples[size_t(s) * 2] + in.samples[size_t(s) * 2 + 1]);
+        r.cutoff = speechCutoff(mid, in.sampleRate);
+    }
+    r.plan = bwePlan(r.cutoff, in.sampleRate);
+    return r;
+}
+
+bool restoreBandwidth(const AudioBuffer& in, AudioBuffer& out, double amount, double cutoff, const std::atomic<bool>* cancel,
+                      std::string* error, const BweNetwork& network, BweResult* result) {
+    const BweResult plan = bandwidthPlanFor(in, cutoff);
+    if (result) *result = plan;
+    out = in;
+    if (plan.plan.empty() || amount <= 0) return true;
+    std::vector<float> ch[2] = {channelOf(in, 0), channelOf(in, 1)};
+    const bool mono = ch[0] == ch[1];
+    const int64_t frames = in.frames();
+    for (int c = 0; c < (mono ? 1 : 2); ++c) {
+        std::vector<float> y;
+        if (!extendBandwidth(ch[c], in.sampleRate, y, amount, plan.cutoff, network, cancel, error)) return false;
+        for (int64_t s = 0; s < frames; ++s) {
+            out.samples[size_t(s) * 2 + size_t(c)] = y[size_t(s)];
+            if (mono) out.samples[size_t(s) * 2 + 1] = y[size_t(s)];
+        }
+    }
+    return true;
+}
+
 // ---- Cache --------------------------------------------------------------------
 
 namespace {
@@ -441,6 +488,7 @@ struct Job {
     AudioBufferPtr result;
     bool done = false;
     bool needed = false;  // an export (or other blocking caller) is waiting for it: never cancelled
+    bool modelMissing = false;  // an effect was left out for want of its model (dropped once one is downloaded)
     std::atomic<bool> cancel{false};
 };
 
@@ -504,7 +552,8 @@ std::string keyFor(const std::string& path, int rate, const std::vector<const Ef
     return key;
 }
 
-AudioBufferPtr process(const AudioBufferPtr& source, const std::vector<Effect>& effects, const std::atomic<bool>* cancel) {
+AudioBufferPtr process(const AudioBufferPtr& source, const std::vector<Effect>& effects, const std::atomic<bool>* cancel,
+                       bool* modelMissing = nullptr) {
     AudioBufferPtr cur = source;
     for (const Effect& e : effects) {
         if (cancel && cancel->load()) return source;
@@ -517,6 +566,13 @@ AudioBufferPtr process(const AudioBufferPtr& source, const std::vector<Effect>& 
             ok = isolateVoice(*cur, *out, e.p("amount", 0, 100), cancel);
         } else if (e.type == "enhance_speech") {
             ok = enhanceSpeech(*cur, *out, e.p("amount", 0, 100), e.p("max_reduction_db", 0, 100), e.p("keep", 0) > 0.5, cancel);
+        } else if (e.type == "bandwidth_extension") {
+            std::string err;
+            ok = restoreBandwidth(*cur, *out, e.p("amount", 0, 100), e.p("cutoff_hz", 0, 0), cancel, &err);
+            if (!ok && !err.empty() && !(cancel && cancel->load())) {
+                std::fprintf(stderr, "Bandwidth Extension left out: %s\n", err.c_str());
+                if (modelMissing && err.find("not downloaded") != std::string::npos) *modelMissing = true;
+            }
         } else if (e.type == "declick") {
             declick(*cur, *out, e.p("sensitivity", 0, 50), e.p("max_ms", 0, 2), nullptr, cancel);
             ok = true;
@@ -570,7 +626,12 @@ void fieldFft(std::vector<std::complex<double>>& a, bool inverse) {
 // processed as a sound of its own, and what that did to it, frequency by frequency over time, is done to the other
 // channels too: every direction is turned down alike and the field keeps its shape. Pitch Shift moves frequencies
 // rather than turning them down, so a chain with it works on the channels in pairs.
-AudioBufferPtr processField(const AudioBufferPtr& source, const std::vector<Effect>& effects, const std::atomic<bool>* cancel) {
+AudioBufferPtr processField(const AudioBufferPtr& source, const std::vector<Effect>& chain, const std::atomic<bool>* cancel) {
+    // Bandwidth Extension makes a new band rather than turning one down, which W's change cannot carry to the other
+    // channels: a field is left without it.
+    std::vector<Effect> effects = chain;
+    std::erase_if(effects, [](const Effect& e) { return e.type == "bandwidth_extension"; });
+    if (effects.empty()) return source;
     const int64_t n = source->frames();
     const int nch = source->channels;
     const size_t stride = size_t(nch);
@@ -648,6 +709,11 @@ AudioBufferPtr processField(const AudioBufferPtr& source, const std::vector<Effe
 
 int cleanupsRunning() { return gRunning.load(); }
 
+void retryCleanupsMissingModels() {
+    std::lock_guard lock(gCacheMutex);
+    std::erase_if(gCache, [](const auto& kv) { return kv.second->done && kv.second->modelMissing; });
+}
+
 AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& source, const std::vector<const Effect*>& effects,
                             bool blocking) {
     if (!source || effects.empty()) return source;
@@ -681,8 +747,10 @@ AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& sourc
         // directions): the effects either side of it run as a chain of their own.
         AudioBufferPtr r = source;
         std::vector<Effect> chain;
+        bool missing = false;
         auto flush = [&] {
-            if (!chain.empty()) r = r->channels >= 4 ? processField(r, chain, &job->cancel) : process(r, chain, &job->cancel);
+            if (!chain.empty())
+                r = r->channels >= 4 ? processField(r, chain, &job->cancel) : process(r, chain, &job->cancel, &missing);
             chain.clear();
         };
         for (const Effect& e : copies) {
@@ -713,6 +781,7 @@ AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& sourc
         {
             std::lock_guard lock(gCacheMutex);
             job->result = r;
+            job->modelMissing = missing;
             job->done = true;
         }
         gCacheDone.notify_all();

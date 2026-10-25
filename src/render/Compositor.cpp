@@ -3846,7 +3846,8 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                 // (audio/SpeechCleanup.h).
                 std::vector<const Effect*> sourceFx;
                 for (const Effect& e : c.effects)
-                    if (e.enabled && isSourceAudioEffect(e.type) && dialogueAlignmentApplies(e, c)) sourceFx.push_back(&e);
+                    if (e.enabled && isSourceAudioEffect(e.type) && dialogueAlignmentApplies(e, c) && bandwidthExtensionApplies(e, c))
+                        sourceFx.push_back(&e);
                 if (!sourceFx.empty())
                     if (AudioBufferPtr clean = cleanedAudio(key, fb, sourceFx, !nonBlocking_); clean && clean->channels >= nch) fb = clean;
                 // Maintain Audio Pitch: the channels stretched together along the time map.
@@ -3984,7 +3985,8 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             // original plays until the cleaned copy is ready in real time).
             std::vector<const Effect*> sourceFx;
             for (const Effect& e : c.effects)
-                if (e.enabled && isSourceAudioEffect(e.type) && dialogueAlignmentApplies(e, c)) sourceFx.push_back(&e);
+                if (e.enabled && isSourceAudioEffect(e.type) && dialogueAlignmentApplies(e, c) && bandwidthExtensionApplies(e, c))
+                    sourceFx.push_back(&e);
             if (!sourceFx.empty())
                 if (AudioBufferPtr clean = cleanedAudio(source, buf, sourceFx, !nonBlocking_)) buf = clean;
             const int64_t n = buf->frames();

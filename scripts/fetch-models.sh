@@ -22,18 +22,21 @@
 #   <dir>/voice-clone    Cloned voices      (MONTAGE_VOICE_CLONE_MODEL; 1.6 GB, only with --voice-clone)
 #   <dir>/lipsync        Lip Sync           (MONTAGE_LIPSYNC_MODEL; 3.9 GB, only with --lipsync)
 #   <dir>/lensfun-db     Lens Correction    (MONTAGE_LENS_DB; lensfun's lens profiles, CC BY-SA 3.0)
+#   <dir>/bwe            Bandwidth Extension (MONTAGE_BWE_MODELS; AP-BWE's seven checkpoints, 119 MB each, only with
+#                                           --bwe; --bwe-test fetches the 8-to-16 and 8-to-48 kHz ones the tests use)
 #   <dir>/sadie-ku100    binaural ambisonics (MONTAGE_HRTF_DIR; SADIE II's KU100 HRIRs, Apache-2.0; only with --hrtf)
 #
-#   scripts/fetch-models.sh [dir] [--voice-clone] [--stems] [--dme] [--hrtf] [--lipsync]      (default: ./models)
+#   scripts/fetch-models.sh [dir] [--voice-clone] [--stems] [--dme] [--hrtf] [--lipsync] [--bwe|--bwe-test]   (default: ./models)
 set -euo pipefail
 VOICE_CLONE=0
 ALL_STEMS=0
 DME=0
 HRTF=0
 LIPSYNC=0
+BWE=0
 ARGS=()
 for a in "$@"; do
-  if [ "$a" = "--voice-clone" ]; then VOICE_CLONE=1; elif [ "$a" = "--stems" ]; then ALL_STEMS=1; elif [ "$a" = "--dme" ]; then DME=1; elif [ "$a" = "--hrtf" ]; then HRTF=1; elif [ "$a" = "--lipsync" ]; then LIPSYNC=1; else ARGS+=("$a"); fi
+  if [ "$a" = "--voice-clone" ]; then VOICE_CLONE=1; elif [ "$a" = "--stems" ]; then ALL_STEMS=1; elif [ "$a" = "--dme" ]; then DME=1; elif [ "$a" = "--hrtf" ]; then HRTF=1; elif [ "$a" = "--lipsync" ]; then LIPSYNC=1; elif [ "$a" = "--bwe" ]; then BWE=2; elif [ "$a" = "--bwe-test" ]; then BWE=1; else ARGS+=("$a"); fi
 done
 DIR=${ARGS[0]:-models}
 sha256() { if command -v sha256sum > /dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
@@ -156,6 +159,22 @@ if [ "$VOICE_CLONE" = 1 ]; then
   fetch voice-clone tokenizer.json "$CHATTERBOX/tokenizer.json" 29d48c4a178f6af3ad5130097c34744639e9294847b38a7b912c8c68027cb819
   fetch voice-clone Cangjie5_TC.json "$CHATTERBOX/Cangjie5_TC.json" 7073fd9de919443ae88e0bd2449917a65fe54898a4413ed1edcc4b67f28bce8c
   echo "Voice cloning model: MONTAGE_VOICE_CLONE_MODEL=$DIR/voice-clone"
+fi
+if [ "$BWE" != 0 ]; then
+  # AP-BWE's generator checkpoints (Ye-Xin Lu et al., MIT), the authors' files as mirrored at a pinned revision; the graph
+  # that reads them (src/media/apbwe.onnx) is written beside them on first use.
+  APBWE=https://huggingface.co/rsxdalv/AP-BWE/resolve/fa3f46d233cbc1d75cec9321188f86db627ba239/weights
+  bwe() { fetch "bwe/apbwe-$1k-$2k" generator.ckpt "$APBWE/$1kto$2k/g_$1kto$2k.zip" "$3" 900; }
+  bwe 8 16 84d63ecda61b45260668d3d51b491cbb75e00c7611f2111dd2f17d66da41711c
+  bwe 8 48 8f0387a4f1cdf1ec5dc557a9e8a303326b45b7706b37843f771f24ee94d2e521
+  if [ "$BWE" = 2 ]; then
+    bwe 2 16 a4adc96d9d86c01d7970417a12c79910c726c34989956ed5a8cfd153e137862e
+    bwe 4 16 f5dd745ede8126075451fbf3f767ce0f506f15d82fe746e6202151d2a77a9ab3
+    bwe 12 48 defa766ac25ccb5eda300860a7cbad5c7bfa02ee2b5e28d07c1daa470f8e8f39
+    bwe 16 48 305a05dcab7dc29ffba09d32692d7a34550fc8fbdf338013641ff5d39a3cb285
+    bwe 24 48 00950c7782a076e218f9c5a9bbc3b59a5beb0c4617b62ccea836df5f616a63dd
+  fi
+  echo "Bandwidth Extension models: MONTAGE_BWE_MODELS=$DIR/bwe"
 fi
 if [ "$LIPSYNC" = 1 ]; then
   # MuseTalk 1.5's UNet (MIT), Stability AI's sd-vae-ft-mse (MIT) and OpenAI's whisper-tiny (Apache-2.0), at the

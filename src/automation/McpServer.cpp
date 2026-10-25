@@ -109,6 +109,7 @@
 #include "media/DualSystem.h"
 #include "media/Relink.h"
 #include "media/SpeechEnhance.h"
+#include "media/BandwidthExtension.h"
 #include "media/LipSync.h"
 #include "media/MotionDeblur.h"
 #include "media/SuperScale.h"
@@ -2493,6 +2494,10 @@ void McpServer::Impl::addTools() {
         "brings faded dyes back to neutral (strength, frames either side); perf_lock holds the frame on its perforations "
         "(side 0 left, 1 right; rebate in % of the width), the reference (strings.reference, lines of \"x y\" as fractions "
         "of the frame) taken from the clip's first frame when none is given. "
+        "bandwidth_extension rebuilds the missing top of band-limited speech (a phone, a video call, a low-rate codec) "
+        "with AP-BWE: its cut-off is found (cutoff_hz 0) or given, the original kept below it and the new band crossfaded "
+        "in above it by amount, where the speech is; a clip whose role is Music or Effects is left alone; it needs the "
+        "models for the clip's cut-off (scripts/fetch-models.sh --bwe). "
         "lip_sync redraws the largest face's mouth and jaw to speak an audio track's sound (strings.track, e.g. \"A2\"; "
         "every track when empty), as a dub needs (MuseTalk; amount mixes it); it needs consent: true (the person shown has "
         "agreed) and its models (scripts/fetch-models.sh --lipsync), and runs in exports and renders (about 4 s a frame on four cores).",
@@ -2533,6 +2538,7 @@ void McpServer::Impl::addTools() {
                 throw ArgError{QStringLiteral("Unknown effect \"%1\" (see montage_list_effects)").arg(QString::fromStdString(type))};
             const std::string displayName = !plugin ? info->displayName : type == "ofx" ? ofx::effectName(*plugin) : plugins::effectName(*plugin);
             const bool pluginParams = plugin && type != "ara";  // an ARA effect's own settings are Montage's (tempo, bar)
+            if (type == "bandwidth_extension" && !bandwidthExtensionAvailable()) return fail("This build of Montage has no ONNX Runtime");
             if (type == "enhance_speech" && (!speechEnhancerAvailable() || !speechModel().installed()))
                 return fail("Enhance Speech needs its model: run `scripts/fetch-models.sh` or add the effect once in the app");
             if (type == "super_scale" && (!upscalerAvailable() || !upscaleModel().installed()))
@@ -2719,6 +2725,28 @@ void McpServer::Impl::addTools() {
                 std::string err;
                 if (!takePerforationReference(l.project, l.seq(), c, e, c.start, &err))
                     note = QStringLiteral(" (no reference yet: %1)").arg(QString::fromStdString(err));
+            }
+            if (type == "bandwidth_extension") {
+                // The models the clip's cut-off needs; the cut-off and them said.
+                const MediaItem* m = c.mediaId ? l.project.findMedia(c.mediaId) : nullptr;
+                const AudioBufferPtr sound = m && !m->path.empty() ? MediaPool::instance().audio(audioKey(m->path, c.channels), l.seq().sampleRate) : nullptr;
+                if (!bandwidthExtensionApplies(e, c)) {
+                    note = QStringLiteral(" (left alone while the clip's role is %1: it is for speech)").arg(QString::fromStdString(c.role));
+                } else if (sound) {
+                    const BweResult plan = bandwidthPlanFor(*sound, e.p("cutoff_hz", 0, 0));
+                    QStringList models, missing;
+                    for (const BweCheckpoint& k : plan.plan) {
+                        models << QString::fromStdString(bweModel(k).id);
+                        if (!bweModel(k).installed()) missing << QString::fromStdString(bweModel(k).id);
+                    }
+                    if (!missing.isEmpty())
+                        return fail(QStringLiteral("Bandwidth Extension needs %1 for this clip (its speech stops at %2 Hz): run `scripts/fetch-models.sh --bwe` "
+                                                   "or add the effect once in the app")
+                                        .arg(missing.join(", "))
+                                        .arg(std::lround(plan.cutoff)));
+                    note = plan.plan.empty() ? QStringLiteral(" (nothing is missing: the speech reaches %1 Hz)").arg(std::lround(plan.cutoff))
+                                             : QStringLiteral(" (the speech stops at %1 Hz; restored with %2)").arg(std::lround(plan.cutoff)).arg(models.join(" then "));
+                }
             }
             if (type == "sky_replace" && std::lround(e.p("follow", 0, 1)) == 1) {
                 // The new sky moves with the camera, measured now (a still, or a clip it fails on, keeps the sky still).
