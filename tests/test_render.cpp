@@ -7951,7 +7951,13 @@ colorspaces:
         half.params["strength"] = 50.0;
         edit::clipById(s, clip.id)->effects[0] = half;
         QVERIFY(!edit::lutToGrade(p, s, clip.id, 0, residual).ok);  // part strength: a mix, refused
+        Effect off = lut;
+        off.enabled = false;
+        edit::clipById(s, clip.id)->effects[0] = off;
+        QVERIFY(!edit::lutToGrade(p, s, clip.id, 0, residual).ok);  // switched off
         edit::clipById(s, clip.id)->effects[0] = lut;
+        QVERIFY(!edit::lutToGrade(p, s, clip.id, 0, printPath).ok);  // the residual over the LUT itself
+        QCOMPARE(edit::clipById(s, clip.id)->effects[0].s("path"), printPath);
         LutGrade fit;
         const edit::Result r = edit::lutToGrade(p, s, clip.id, 0, residual, &fit);
         QVERIFY2(r.ok, r.error.c_str());

@@ -505,6 +505,8 @@ const Effect* lutEffectOf(const Clip& c, Id lutEffect, std::string* error) {
         return nullptr;
     };
     if (it == c.effects.end()) return fail(lutEffect ? "No such LUT effect on the clip" : "The clip has no LUT effect");
+    if (!it->enabled) return fail("The LUT effect is switched off");
+    if (hasMask(*it, 0)) return fail("The LUT effect is masked (the rebuilt grade would not be)");
     if (it->p("strength", 0, 100) < 99.95) return fail("Set the LUT's strength to 100% first (a part-strength LUT is a mix)");
     if (it->params.count("strength") && it->params.at("strength").varies()) return fail("The LUT's strength is animated");
     if (it->s("path").empty()) return fail("The LUT effect has no file");
@@ -512,7 +514,9 @@ const Effect* lutEffectOf(const Clip& c, Id lutEffect, std::string* error) {
 }
 }  // namespace
 
-bool lutGradeSource(const Sequence& s, Id clipId, Id lutEffect, std::function<void(float[3])>& lut, const ColorSpace*& space, std::string* error) {
+bool lutGradeSource(const Sequence& s, Id clipId, Id lutEffect, std::function<void(float[3])>& lut, const ColorSpace*& space, std::string* error,
+                    Id* resolved) {
+    const WorkingSpaceScope scope(&sequenceColorSpace(s));  // (what "Apply In" names is told apart from it)
     const Clip* c = clipById(s, clipId);
     if (!c) {
         if (error) *error = "No such clip";
@@ -524,6 +528,7 @@ bool lutGradeSource(const Sequence& s, Id clipId, Id lutEffect, std::function<vo
     if (!lut) return false;
     const ColorSpace* other = effectApplySpace(*e);
     space = other ? other : &sequenceColorSpace(s);
+    if (resolved) *resolved = e->id;
     return true;
 }
 
@@ -532,11 +537,12 @@ Result lutToGrade(Project& p, Sequence& s, Id clipId, Id lutEffect, const std::s
     std::function<void(float[3])> fn;
     const ColorSpace* space = nullptr;
     std::string err;
-    if (!lutGradeSource(s, clipId, lutEffect, fn, space, &err)) return Result::fail(err);
+    Id resolved = 0;
+    if (!lutGradeSource(s, clipId, lutEffect, fn, space, &err, &resolved)) return Result::fail(err);
     const WorkingSpaceScope scope(&sequenceColorSpace(s));
     LutGrade fit;
     if (!fitLutGrade(fn, *space, fit, &err, progress, cancel)) return Result::fail(err);
-    Result r = applyLutGrade(p, s, clipId, lutEffect, residualPath, fit);
+    Result r = applyLutGrade(p, s, clipId, resolved, residualPath, fit);
     if (r.ok && fitOut) *fitOut = std::move(fit);
     return r;
 }
@@ -550,7 +556,30 @@ Result applyLutGrade(Project& p, Sequence& s, Id clipId, Id lutEffect, const std
     const auto it = c->effects.begin() + (found - c->effects.data());
     const std::string path = found->s("path");
     const ColorSpace& working = sequenceColorSpace(s);
+    const WorkingSpaceScope scope(&working);
     const ColorSpace* other = effectApplySpace(*found);
+    // The residual is a file of its own: never the LUT's, nor one another effect of the project reads.
+    if (!residualPath.empty()) {
+        const auto same = [&](const std::string& a) {
+            std::error_code ec;
+            return a == residualPath || std::filesystem::equivalent(a, residualPath, ec);
+        };
+        bool used = false;
+        auto check = [&](const Sequence& q) {
+            for (const auto* tracks : {&q.videoTracks, &q.audioTracks})
+                for (const Track& t : *tracks)
+                    for (const Clip& k : t.clips) {
+                        auto look = [&](const std::vector<Effect>& fx) {
+                            for (const Effect& e : fx) used = used || (!e.s("path").empty() && same(e.s("path")));
+                        };
+                        look(k.effects);
+                        for (const GradeVersion& v : k.gradeVersions) look(v.effects);
+                    }
+        };
+        for (const Sequence& q : p.sequences) check(q);
+        if (&s < p.sequences.data() || &s >= p.sequences.data() + p.sequences.size()) check(s);
+        if (used || same(path)) return Result::fail("Choose another file for the residual LUT: that one is in use");
+    }
     // In its place: the stages (and the residual) between transforms into and out of the LUT's own space.
     std::vector<Effect> fx;
     auto transform = [&](const ColorSpace& from, const ColorSpace& to) {
@@ -580,11 +609,10 @@ Result applyLutGrade(Project& p, Sequence& s, Id clipId, Id lutEffect, const std
     int ordinal = 0;
     for (auto e = c->effects.begin(); e != it; ++e) ordinal += e->type == "lut" && e->s("path") == path;
     const bool first = c->gradeVersions.empty();
-    const int was = c->gradeVersion;
     Result r = addGradeVersion(p, s, clipId, "Rebuilt from LUT");
     if (!r.ok) return r;
     c = clipById(s, clipId);
-    renameGradeVersion(s, clipId, first ? 0 : was, first ? "With LUT" : c->gradeVersions[size_t(was)].name);
+    if (first) renameGradeVersion(s, clipId, 0, "With LUT");
     int seen = 0;
     auto copy = c->effects.end();
     for (auto e = c->effects.begin(); e != c->effects.end(); ++e)

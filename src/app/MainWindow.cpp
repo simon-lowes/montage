@@ -5195,11 +5195,15 @@ bool MainWindow::rebuildLutAsGrade(const QString& residualPath, Id lutEffect) {
     std::function<void(float[3])> lut;
     const ColorSpace* space = nullptr;
     std::string err;
-    if (!edit::lutGradeSource(*seq, clip, lutEffect, lut, space, &err)) {
+    Id resolved = 0;
+    if (!edit::lutGradeSource(*seq, clip, lutEffect, lut, space, &err, &resolved)) {
         state_->message(QString::fromStdString(err), 6000);
         return false;
     }
     const ColorSpace* working = &sequenceColorSpace(*seq);
+    const Clip* before = edit::clipById(*seq, clip);
+    const auto at = std::find_if(before->effects.begin(), before->effects.end(), [&](const Effect& e) { return e.id == resolved; });
+    const std::string lutPath = at != before->effects.end() ? at->s("path") : std::string();
     LutGrade fit;
     if (!runWithProgress(this, state_, tr("Rebuilding the LUT as a grade…"), [&](const auto& progress, const std::atomic<bool>* cancel, std::string* error) {
             const WorkingSpaceScope scope(working);
@@ -5207,11 +5211,21 @@ bool MainWindow::rebuildLutAsGrade(const QString& residualPath, Id lutEffect) {
         }))
         return false;
     if (!state_->apply(tr("Rebuild LUT as Grade"), [&](Project& p, Sequence& s) {
-            return edit::applyLutGrade(p, s, clip, lutEffect, residualPath.toStdString(), fit);
+            // (the clip may have been changed while the fit ran)
+            const Clip* now = edit::clipById(s, clip);
+            const bool same = now && std::any_of(now->effects.begin(), now->effects.end(), [&](const Effect& e) {
+                return e.id == resolved && e.s("path") == lutPath;
+            });
+            if (!same) return edit::Result::fail("The clip's LUT changed while it was being rebuilt");
+            return edit::applyLutGrade(p, s, clip, resolved, residualPath.toStdString(), fit);
         }))
         return false;
-    QString msg = tr("Rebuilt the LUT as a grade: delta E %1 (largest %2), %3 with the residual LUT")
-                      .arg(fit.meanDeltaE, 0, 'f', 2).arg(fit.maxDeltaE, 0, 'f', 2).arg(fit.residualMeanDeltaE, 0, 'f', 2);
+    const Clip* after = edit::clipById(*state_->sequence(), clip);
+    const bool residual = after && std::any_of(after->effects.begin(), after->effects.end(), [&](const Effect& e) {
+        return e.type == "lut" && e.s("path") == residualPath.toStdString();
+    });
+    QString msg = tr("Rebuilt the LUT as a grade: delta E %1 (largest %2)").arg(fit.meanDeltaE, 0, 'f', 2).arg(fit.maxDeltaE, 0, 'f', 2);
+    if (residual) msg += tr(", %1 with the residual LUT").arg(fit.residualMeanDeltaE, 0, 'f', 2);
     if (fit.clips) msg += tr("; the LUT clips (%1)").arg(QString::fromStdString(fit.clipNote));
     state_->message(msg, 10000);
     return true;

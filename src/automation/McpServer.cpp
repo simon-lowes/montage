@@ -3216,7 +3216,10 @@ void McpServer::Impl::addTools() {
             QString text = QStringLiteral("Rebuilt as %1: mean delta E %2, largest %3")
                                .arg(stages.isEmpty() ? QStringLiteral("no controls") : stages.join(QStringLiteral(", ")))
                                .arg(fit.meanDeltaE, 0, 'f', 2).arg(fit.maxDeltaE, 0, 'f', 2);
-            if (!residual.isEmpty())
+            const Clip* after = edit::clipById(s, clip);
+            if (!residual.isEmpty() && after && std::any_of(after->effects.begin(), after->effects.end(), [&](const Effect& e) {
+                    return e.type == "lut" && e.s("path") == residual.toStdString();
+                }))
                 text += QStringLiteral("; with the residual LUT: mean %1, largest %2").arg(fit.residualMeanDeltaE, 0, 'f', 2).arg(fit.residualMaxDeltaE, 0, 'f', 2);
             if (fit.clips) text += QStringLiteral("\nThe LUT clips: ") + QString::fromStdString(fit.clipNote);
             return ok(text + QStringLiteral("\nThe grade with the LUT is kept as a grade version."));
