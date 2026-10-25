@@ -75,6 +75,7 @@ class PeoplePanel;
 class MulticamPanel;
 class AdrPanel;
 class MonitoringPanel;
+class CueSheetPanel;
 class LinedScriptPanel;
 class StackedTimelineWidget;
 class ProductionPanel;
@@ -309,6 +310,10 @@ public:
     // Film lists of the active sequence (render/FilmLists.h): .txt, .csv or .pdf; with `earlier` (another sequence),
     // the change list from it too.
     bool exportFilmLists(const QString& path, Id earlier = 0);
+    // Delivery paperwork (render/PaperworkOutput.h): `list` is "cue_sheet", "dialogue_list", "as_broadcast" or "ccsl";
+    // written as the extension says (.xlsx, .csv, .pdf; .txt for the dialogue lists), behind a progress dialog.
+    bool exportPaperwork(const QString& list, const QString& path);
+    void exportPaperworkDialog(const QString& list);
     // ASC CDL files (core/Cdl.h): a .cc, .ccc or .cdl onto the selected video clips (one correction onto all of them,
     // a collection matched by id to each clip's name, file or tape), returning how many clips were graded; the selected
     // clips' CDLs (else every clip with one) as a .cc (one) or a .ccc or .cdl.
@@ -578,6 +583,7 @@ private:
     MulticamPanel* multicam_ = nullptr;
     AdrPanel* adr_ = nullptr;
     MonitoringPanel* monitoring_ = nullptr;
+    CueSheetPanel* cueSheet_ = nullptr;
     LinedScriptPanel* linedScript_ = nullptr;
     ProductionPanel* production_ = nullptr;
     QDockWidget* productionDock_ = nullptr;
@@ -644,6 +650,7 @@ private:
     QDockWidget* multicamDock_ = nullptr;
     QDockWidget* adrDock_ = nullptr;
     QDockWidget* monitoringDock_ = nullptr;
+    QDockWidget* cueSheetDock_ = nullptr;
     QDockWidget* linedScriptDock_ = nullptr;
     QDockWidget* queueDock_ = nullptr;
     QDockWidget* keyframesDock_ = nullptr;

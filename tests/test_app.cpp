@@ -159,6 +159,8 @@
 #include "ModelPacks.h"
 #include "MixerPanel.h"
 #include "MonitoringPanel.h"
+#include "CueSheetPanel.h"
+#include "core/Xlsx.h"
 #include "ControlSurface.h"
 #include "OscControl.h"
 #include "SpeedEditorControl.h"
@@ -9896,6 +9898,64 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(dlg->findChild<QPushButton*>("voiceoverRecord"));
         dlg->close();
         state()->newProject();
+    }
+
+    void cueSheetPanel() {
+        const int rate = 48000;
+        std::vector<float> x(size_t(rate) * 3);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.2 * std::sin(2 * M_PI * 330 * double(i) / rate));
+        for (const char* name : {"/cueA.wav", "/cueB.wav"}) {
+            WavWriter w;
+            QVERIFY(w.open(dir_.path() + name, rate, 1));
+            w.write(x.data(), int64_t(x.size()));
+            QVERIFY(w.close());
+        }
+        state()->newProject();
+        const auto ids = state()->importFiles({dir_.path() + "/cueA.wav", dir_.path() + "/cueB.wav"});
+        QCOMPARE(ids.size(), size_t(2));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            const FrameTime second = FrameTime(std::llround(s.fpsValue() * 3)) + FrameTime(std::llround(s.fpsValue() * 2));
+            if (!edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok ||
+                !edit::placeMedia(p, s, ids[1], second, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok)
+                return false;
+            for (Clip& c : s.audioTracks[0].clips) c.role = "Music";
+            return true;
+        }));
+        auto* panel = win_->findChild<CueSheetPanel*>("cueSheetPanel");
+        QVERIFY(panel);
+        panel->refresh();
+        auto* table = panel->findChild<QTableWidget*>("cueSheetTable");
+        QCOMPARE(table->rowCount(), 2);
+        QCOMPARE(table->item(0, 1)->text(), QString("cueA"));  // the title from the file's name, untagged
+        // Typed fields are kept with the media.
+        table->item(0, 2)->setText("A. Writer");
+        QCOMPARE(QString::fromStdString(state()->project().findMedia(ids[0])->metadata.at("cue.composer")), QString("A. Writer"));
+        panel->refresh();
+        QCOMPARE(QString::fromStdString(panel->cues()[0].fields.at("composer")), QString("A. Writer"));
+        auto* use = qobject_cast<QComboBox*>(table->cellWidget(1, 9));
+        QVERIFY(use);
+        use->setCurrentIndex(1);
+        emit use->activated(1);
+        QCOMPARE(QString::fromStdString(state()->project().findMedia(ids[1])->metadata.at("cue.use")), QString("visual"));
+        state()->undo();
+        QVERIFY(!state()->project().findMedia(ids[1])->metadata.count("cue.use"));
+        // Clearing a field takes the media's word away.
+        panel->refresh();
+        table->item(0, 2)->setText("");
+        QVERIFY(!state()->project().findMedia(ids[0])->metadata.count("cue.composer"));
+        state()->undo();
+        // File › Export Paperwork: the sheet as a workbook.
+        QVERIFY(win_->findChild<QAction*>("exportPaperwork_ccsl"));
+        const QString xlsx = dir_.path() + "/cues.xlsx";
+        QVERIFY(win_->exportPaperwork("cue_sheet", xlsx));
+        std::vector<XlsxSheet> book;
+        std::string err;
+        QVERIFY2(readXlsxFile(xlsx.toStdString(), book, &err), err.c_str());
+        QCOMPARE(book[0].rows.size(), size_t(3));
+        QCOMPARE(QString::fromStdString(book[0].rows[1][2].text), QString("A. Writer"));
+        QVERIFY(win_->exportPaperwork("ccsl", dir_.path() + "/ccsl.pdf"));
+        QVERIFY(QFileInfo(dir_.path() + "/ccsl.pdf").size() > 0);
+        QVERIFY(!win_->exportPaperwork("cue_sheet", dir_.path() + "/cues.txt"));
     }
 
     void monitoringSection() {

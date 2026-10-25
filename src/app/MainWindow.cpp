@@ -4,6 +4,7 @@
 #include "LiveBridge.h"
 #include "LiveLink.h"
 #include "render/FilmLists.h"
+#include "render/PaperworkOutput.h"
 #include "render/DcpSecurity.h"
 #include "render/OGraf.h"
 #include "render/Ofx.h"
@@ -157,6 +158,7 @@
 #include "MulticamPanel.h"
 #include "AdrPanel.h"
 #include "MonitoringPanel.h"
+#include "CueSheetPanel.h"
 #include "LinedScriptPanel.h"
 #include "AudioDescriptionDialog.h"
 #include "FootageNotesDialog.h"
@@ -603,6 +605,9 @@ void MainWindow::buildPanels() {
     adr_ = new AdrPanel(state_, program_, programPanel_->viewer(), this);
     adrDock_ = makeDock(tr("ADR"), "adr", adr_);
     monitoringDock_ = makeDock(tr("Monitoring"), "monitoring", monitoring_);
+    cueSheet_ = new CueSheetPanel(state_, this);
+    cueSheetDock_ = makeDock(tr("Cue Sheet"), "cueSheet", cueSheet_);
+    connect(cueSheet_, &CueSheetPanel::exportRequested, this, [this] { exportPaperworkDialog(QStringLiteral("cue_sheet")); });
     keyframesDock_ = makeDock(tr("Keyframes"), "keyframes", new KeyframePanel(state_, this));
     gradeNodes_ = new GradeNodePanel(state_, this);
     nodesDock_ = makeDock(tr("Nodes"), "nodes", gradeNodes_);
@@ -879,7 +884,7 @@ void MainWindow::layOutBuiltIn(const QString& name) {
         resizeDocks({clipsDock_}, {150}, Qt::Vertical);
     } else if (name == "Audio") {
         // The mixer where the Source monitor was, wide meters (Premiere's Audio workspace, Resolve's Fairlight page).
-        arrangeDocks({{mixerDock_, adrDock_, monitoringDock_, sourceDock_}, {programDock_}}, {{binDock_, soundLibraryDock_, effectsDock_}}, {{meterDock_}});
+        arrangeDocks({{mixerDock_, adrDock_, monitoringDock_, sourceDock_}, {programDock_}}, {{binDock_, soundLibraryDock_, effectsDock_, cueSheetDock_}}, {{meterDock_}});
         resizeDocks({mixerDock_, programDock_}, {900, 640}, Qt::Horizontal);
         resizeDocks({mixerDock_}, {h / 2 + 40}, Qt::Vertical);
         resizeDocks({meterDock_}, {110}, Qt::Horizontal);
@@ -1212,6 +1217,17 @@ void MainWindow::buildMenus() {
         if (suffix != QLatin1String("txt") && suffix != QLatin1String("csv") && suffix != QLatin1String("pdf")) path += QLatin1Char('.') + ext;
         exportFilmLists(path, ids[size_t(std::max<qsizetype>(0, names.indexOf(pick)))]);
     })->setObjectName(QStringLiteral("exportFilmLists"));
+    {
+        QMenu* paperwork = file->addMenu(tr("Export Pape&rwork"));
+        paperwork->setObjectName(QStringLiteral("exportPaperworkMenu"));
+        const std::vector<std::pair<QString, QString>> lists{{QStringLiteral("cue_sheet"), tr("&Music Cue Sheet…")},
+                                                             {QStringLiteral("dialogue_list"), tr("&Dialogue List…")},
+                                                             {QStringLiteral("as_broadcast"), tr("&As-Broadcast Script…")},
+                                                             {QStringLiteral("ccsl"), tr("&CCSL (Continuity and Spotting List)…")}};
+        for (const auto& [id, label] : lists)
+            add(paperwork, label, QKeySequence(), [this, id] { exportPaperworkDialog(id); })
+                ->setObjectName(QStringLiteral("exportPaperwork_") + id);
+    }
     file->addSeparator();
     add(file, tr("&Quit"), QKeySequence::Quit, [this] { close(); });
 
@@ -5021,6 +5037,47 @@ bool runWithProgress(QWidget* parent, EditorState* state, const QString& title,
 }
 
 }  // namespace
+
+bool MainWindow::exportPaperwork(const QString& list, const QString& path) {
+    const Sequence* s = state_->sequence();
+    PaperworkList which;
+    if (!s || !paperworkListFromId(list.toStdString(), which)) return false;
+    PaperworkOptions o;
+    // The on-screen text where the model to read it is at hand.
+    o.onScreenText = (which == PaperworkList::DialogueList || which == PaperworkList::AsBroadcast) && ocrAvailable() && ocrModel().installed();
+    const Project p = state_->project();
+    const Sequence seq = *s;
+    const std::string file = path.toStdString();
+    const bool ok = runWithProgress(this, state_, tr("Writing the %1…").arg(tr(paperworkListName(which))),
+                                    [&](const auto&, const std::atomic<bool>* cancel, std::string* err) {
+                                        o.cancel = cancel;
+                                        return writePaperwork(p, seq, which, file, o, err);
+                                    });
+    if (ok) state_->message(tr("Wrote %1").arg(QDir::toNativeSeparators(path)), 5000);
+    return ok;
+}
+
+void MainWindow::exportPaperworkDialog(const QString& list) {
+    const Sequence* s = state_->sequence();
+    PaperworkList which;
+    if (!s || !paperworkListFromId(list.toStdString(), which)) return;
+    const bool text = which == PaperworkList::DialogueList || which == PaperworkList::AsBroadcast;
+    QString filter;
+    const QString name = QStringLiteral("%1 %2").arg(QString::fromStdString(s->name), tr(paperworkListName(which)));
+    QString path = QFileDialog::getSaveFileName(
+        this, tr("Export %1").arg(tr(paperworkListName(which))),
+        QDir(appSettings().value(QStringLiteral("export/lastDirectory")).toString()).filePath(name),
+        tr("Excel workbook (*.xlsx);;CSV (*.csv);;PDF (*.pdf)") + (text ? tr(";;Text (*.txt)") : QString()), &filter);
+    if (path.isEmpty()) return;
+    const QString suffix = QFileInfo(path).suffix().toLower();
+    if (suffix != QLatin1String("xlsx") && suffix != QLatin1String("csv") && suffix != QLatin1String("pdf") && !(text && suffix == QLatin1String("txt")))
+        path += filter.contains(QLatin1String("*.csv"))   ? QStringLiteral(".csv")
+                : filter.contains(QLatin1String("*.pdf")) ? QStringLiteral(".pdf")
+                : filter.contains(QLatin1String("*.txt")) ? QStringLiteral(".txt")
+                                                          : QStringLiteral(".xlsx");
+    appSettings().setValue(QStringLiteral("export/lastDirectory"), QFileInfo(path).absolutePath());
+    exportPaperwork(list, path);
+}
 
 int MainWindow::arrangeLayout(edit::Layout layout, double gap) {
     // The selected video clips; with fewer than two, every video clip under the playhead.
