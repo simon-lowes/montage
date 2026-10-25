@@ -23,8 +23,8 @@ namespace {
 std::map<std::string, std::string> fileTags(const std::string& path) {
     std::map<std::string, std::string> tags;
     AVFormatContext* fmt = nullptr;
+    // (The headers hold the tags: no need to look into the streams.)
     if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return tags;
-    avformat_find_stream_info(fmt, nullptr);
     std::vector<const AVDictionary*> dicts{fmt->metadata};
     for (unsigned i = 0; i < fmt->nb_streams; ++i) dicts.push_back(fmt->streams[i]->metadata);
     for (const AVDictionary* m : dicts) {

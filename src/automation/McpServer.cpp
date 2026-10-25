@@ -5111,6 +5111,8 @@ void McpServer::Impl::addTools() {
                     {"use", {"background", "visual"}}, {"vocal", {"vocal", "instrumental"}},
                     {"theme", {"main title", "end title"}}, {"music", {"yes", "no"}}};
                 for (auto it = fields.begin(); it != fields.end(); ++it) {
+                    if (!it.value().isString() && !it.value().isNull())
+                        throw ArgError{QStringLiteral("Cue field \"%1\" takes text (\"\" or null clears it)").arg(it.key())};
                     const std::string key = it.key().toStdString(), value = it.value().toString().trimmed().toStdString();
                     const bool known = std::find(std::begin(kCueFields), std::end(kCueFields), key) != std::end(kCueFields);
                     auto choice = choices.find(key);
@@ -5148,7 +5150,7 @@ void McpServer::Impl::addTools() {
             QJsonObject result{{"list", QString::fromLatin1(paperworkListId(list))}};
             if (a.contains("path")) {
                 const QString file = absolute(need(a, "path"));
-                if (!writePaperwork(l.project, *s, list, file.toStdString(), o, &err, &table)) return fail(QString::fromStdString(err));
+                if (!writePaperwork(l.project, *s, list, file.toStdString(), o, &err, &table, &script)) return fail(QString::fromStdString(err));
                 result["path"] = file;
             } else if (!buildPaperwork(l.project, *s, list, o, table, &script, &err)) {
                 return fail(QString::fromStdString(err));

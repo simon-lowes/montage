@@ -33,10 +33,12 @@ struct PaperworkOptions {
 bool buildPaperwork(const Project& p, const Sequence& seq, PaperworkList list, const PaperworkOptions& o, XlsxSheet& table,
                     std::string* script = nullptr, std::string* error = nullptr);
 
-// The list written to `path`, as its extension says: .xlsx, .csv, .pdf, or (the as-broadcast script and the
-// dialogue list) .txt. The table written goes to `table` when given.
+// The list written to `path`, as its extension says: .xlsx, .csv (UTF-8, marked as such), .pdf, or (the dialogue
+// lists) .txt: the as-broadcast script as it reads, the dialogue list a line a row, tab between columns. The table
+// written goes to `table` and the script to `script` when given.
 bool writePaperwork(const Project& p, const Sequence& seq, PaperworkList list, const std::string& path,
-                    const PaperworkOptions& o = {}, std::string* error = nullptr, XlsxSheet* table = nullptr);
+                    const PaperworkOptions& o = {}, std::string* error = nullptr, XlsxSheet* table = nullptr,
+                    std::string* script = nullptr);
 
 // A table as a PDF: a heading, then the rows (the first the header, repeated on each page), on landscape A4.
 bool writeTablePdf(const XlsxSheet& t, const std::string& heading, const std::string& path, std::string* error = nullptr);

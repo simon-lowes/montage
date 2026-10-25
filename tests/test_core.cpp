@@ -163,6 +163,35 @@ private slots:
         QCOMPARE(xlsxColumn(27), std::string("AB"));
         // Not a workbook.
         QVERIFY(!readXlsx("PK not really", back, &err));
+        // What XML cannot carry is left out (a malformed byte read as a replacement character); long names are cut
+        // on a character, and names differing only in case are told apart.
+        XlsxSheet odd;
+        odd.name = "Ünïcödé names that run on far too long for a sheet";
+        odd.rows = {{std::string("a\xEF\xBF\xBF" "b\x01" "c\xC3"), "\xF0\x9F\x8E\xB5 music"}};
+        XlsxSheet lower = a;
+        lower.name = "music cue sheet";
+        QVERIFY2(readXlsx(writeXlsx({a, lower, odd}), back, &err), err.c_str());
+        QCOMPARE(back.size(), size_t(3));
+        QVERIFY(back[1].name != back[0].name);
+        QCOMPARE(QString::fromStdString(back[2].name).size(), qsizetype(31));
+        QCOMPARE(QString::fromStdString(back[2].rows[0][0].text), QString::fromUtf8("abc\xEF\xBF\xBD"));
+        QCOMPARE(QString::fromStdString(back[2].rows[0][1].text), QString::fromUtf8("\xF0\x9F\x8E\xB5 music"));
+        // A row past a workbook's last is refused, not allocated.
+        {
+            ZipReader in;
+            QVERIFY(in.open(writeXlsx({b})));
+            ZipWriter out;
+            for (const char* name : {"[Content_Types].xml", "_rels/.rels", "xl/workbook.xml", "xl/_rels/workbook.xml.rels", "xl/styles.xml"}) {
+                std::string part;
+                QVERIFY(in.read(name, part));
+                out.add(name, part);
+            }
+            out.add("xl/worksheets/sheet1.xml", "<?xml version=\"1.0\"?><worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
+                                                 "<sheetData><row r=\"2000000000\"><c r=\"A2000000000\" t=\"inlineStr\"><is><t>x</t></is></c></row>"
+                                                 "</sheetData></worksheet>");
+            QVERIFY(!readXlsx(out.finish(), back, &err));
+            QVERIFY2(QString::fromStdString(err).contains("rows past"), err.c_str());
+        }
     }
 
     void musicCueSheet() {
@@ -239,6 +268,10 @@ private slots:
         QCOMPARE(t.rows.size(), size_t(4));
         QCOMPARE(QString::fromStdString(t.rows[2][14].text), QString("00:00:10:00"));
         QCOMPARE(t.rows[2][15].value, 10.0);
+        // A wrong tag blanked by the panel stays blank.
+        for (MediaItem& m : p.media)
+            if (m.id == c) m.metadata[cueMetadataKey("publisher")] = "";
+        QCOMPARE(QString::fromStdString(musicCues(p, s, tags)[2].fields.at("publisher")), QString());
         // Marked not music, the sting is gone; a muted role takes the rest.
         for (MediaItem& m : p.media)
             if (m.id == c) m.metadata[kCueMusic] = "no";

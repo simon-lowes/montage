@@ -18,7 +18,8 @@ namespace montage {
 
 // ---- Music cue sheet -------------------------------------------------------------------------------------------------
 
-// The media's own cue sheet fields (MediaItem::metadata, edited in the Cue Sheet panel), each over the file's tag.
+// The media's own cue sheet fields (MediaItem::metadata, edited in the Cue Sheet panel), each over the file's tag
+// (present but empty: the tag blanked).
 inline constexpr const char* kCueFields[] = {"title", "composer", "publisher", "society", "library", "catalogue", "isrc", "iswc"};
 std::string cueMetadataKey(const std::string& field);  // "cue.composer"
 // How it is used: "background" or "visual"; "instrumental" or "vocal"; "main title", "end title" or "".

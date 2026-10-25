@@ -18641,6 +18641,8 @@ if ui["pressed"] == "add":
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         r = callPaperwork({{"project", project}, {"action", "set_cue"}, {"media", "sting.wav"}, {"fields", QJsonObject{{"use", "loud"}}}});
         QVERIFY(r.value("isError").toBool());
+        r = callPaperwork({{"project", project}, {"action", "set_cue"}, {"media", "sting.wav"}, {"fields", QJsonObject{{"music", true}}}});
+        QVERIFY(r.value("isError").toBool());  // text only: a mistyped value does not clear the field
         r = callPaperwork({{"project", project}, {"list", "cue_sheet"}});
         const QJsonObject sting3 = r.value("structuredContent").toObject().value("rows").toArray()[2].toObject();
         QCOMPARE(sting3.value("use").toString(), QString("visual"));
@@ -18651,7 +18653,7 @@ if ui["pressed"] == "add":
         QVERIFY2(writePaperwork(saved, *saved.active(), PaperworkList::CueSheet, path("cues.csv"), {}, &err), err.c_str());
         QFile csv(QString::fromStdString(path("cues.csv")));
         QVERIFY(csv.open(QIODevice::ReadOnly));
-        QVERIFY(csv.readAll().startsWith("Cue,Title,Composer"));
+        QVERIFY(csv.readAll().startsWith("\xEF\xBB\xBF" "Cue,Title,Composer"));  // marked as UTF-8
         QVERIFY2(writePaperwork(saved, *saved.active(), PaperworkList::CueSheet, path("cues.pdf"), {}, &err), err.c_str());
         QFile pdf(QString::fromStdString(path("cues.pdf")));
         QVERIFY(pdf.open(QIODevice::ReadOnly));
@@ -18774,6 +18776,11 @@ if ui["pressed"] == "add":
         QVERIFY2(buildPaperwork(p, s, PaperworkList::DialogueList, o, table, nullptr, &err), err.c_str());
         QCOMPARE(table.rows.size(), size_t(2));
         QCOMPARE(QString::fromStdString(table.rows[1][1].text), QString("On screen"));
+        // As text, a row a line.
+        QVERIFY2(writePaperwork(p, s, PaperworkList::DialogueList, path("dialogue.txt"), o, &err), err.c_str());
+        QFile text(QString::fromStdString(path("dialogue.txt")));
+        QVERIFY(text.open(QIODevice::ReadOnly));
+        QVERIFY(text.readAll().contains("\tOn screen\t00:00:00:00\t00:00:02:00\t"));
     }
 
     void paperworkVocalSuggestion() {

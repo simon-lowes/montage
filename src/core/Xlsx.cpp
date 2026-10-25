@@ -1,6 +1,7 @@
 #include "Xlsx.h"
 
 #include <QFile>
+#include <QRegularExpression>
 #include <QSaveFile>
 #include <QXmlStreamReader>
 #include <algorithm>
@@ -30,36 +31,51 @@ std::string xlsxColumn(int index) {
 
 namespace {
 
+constexpr int kMaxRows = 1048576, kMaxColumns = 16384;  // a workbook's
+
 std::string escaped(const std::string& t) {
-    std::string o;
-    o.reserve(t.size());
-    for (unsigned char c : t) {
-        switch (c) {
-            case '&': o += "&amp;"; break;
-            case '<': o += "&lt;"; break;
-            case '>': o += "&gt;"; break;
-            case '"': o += "&quot;"; break;
-            case '\t':
-            case '\n':
-            case '\r': o.push_back(char(c)); break;
-            default:
-                if (c >= 0x20) o.push_back(char(c));  // (control characters are not allowed in XML 1.0)
+    // Through UTF-16, so a malformed byte becomes U+FFFD; then only what XML 1.0 allows (no control characters but
+    // tab and line ends, no lone surrogates, no U+FFFE or U+FFFF).
+    const QString in = QString::fromUtf8(t.data(), qsizetype(t.size()));
+    QString o;
+    o.reserve(in.size());
+    for (qsizetype i = 0; i < in.size(); ++i) {
+        const QChar c = in[i];
+        const char16_t u = c.unicode();
+        if (c.isHighSurrogate() && i + 1 < in.size() && in[i + 1].isLowSurrogate()) {
+            o += c, o += in[++i];
+            continue;
         }
+        if (c.isSurrogate() || u == 0xFFFE || u == 0xFFFF || (u < 0x20 && u != '\t' && u != '\n' && u != '\r')) continue;
+        if (u == '&') o += QStringLiteral("&amp;");
+        else if (u == '<') o += QStringLiteral("&lt;");
+        else if (u == '>') o += QStringLiteral("&gt;");
+        else if (u == '"') o += QStringLiteral("&quot;");
+        else o += c;
     }
-    return o;
+    return o.toStdString();
 }
 
-std::string sheetName(std::string n, int index, std::vector<std::string>& used) {
-    std::erase_if(n, [](char c) { return std::string("[]:*?/\\").find(c) != std::string::npos; });
-    if (n.size() > 31) n.resize(31);
-    if (n.empty()) n = "Sheet" + std::to_string(index + 1);
-    std::string base = n;
-    for (int k = 2; std::find(used.begin(), used.end(), n) != used.end(); ++k) {
-        const std::string tail = " (" + std::to_string(k) + ")";
-        n = base.substr(0, 31 - tail.size()) + tail;
+std::string sheetName(const std::string& name, int index, std::vector<std::string>& used) {
+    // At most 31 characters, none of []:*?/\, unique whatever the case.
+    QString n = QString::fromStdString(name);
+    n.remove(QRegularExpression(QStringLiteral("[\\[\\]:*?/\\\\]")));
+    auto cut = [](QString t, qsizetype most) {
+        if (t.size() > most) t.truncate(t[most - 1].isHighSurrogate() ? most - 1 : most);
+        return t;
+    };
+    n = cut(n, 31);
+    if (n.isEmpty()) n = QStringLiteral("Sheet%1").arg(index + 1);
+    const QString base = n;
+    auto taken = [&](const QString& t) {
+        return std::any_of(used.begin(), used.end(), [&](const std::string& u) { return QString::fromStdString(u).compare(t, Qt::CaseInsensitive) == 0; });
+    };
+    for (int k = 2; taken(n); ++k) {
+        const QString tail = QStringLiteral(" (%1)").arg(k);
+        n = cut(base, 31 - tail.size()) + tail;
     }
-    used.push_back(n);
-    return n;
+    used.push_back(n.toStdString());
+    return used.back();
 }
 
 std::string sheetXml(const XlsxSheet& s) {
@@ -146,7 +162,7 @@ std::string writeXlsx(const std::vector<XlsxSheet>& in) {
     // Two fonts (regular, bold) and the cell formats using them.
     z.add("xl/styles.xml", R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>)"
                            "\n<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">"
-                           R"(<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>)"
+                           R"(<fonts count="2"><font><sz val="11"/></font><font><b/><sz val="11"/></font></fonts>)"
                            R"(<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>)"
                            R"(<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>)"
                            R"(<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>)"
@@ -293,6 +309,7 @@ bool readXlsx(const std::string& bytes, std::vector<XlsxSheet>& out, std::string
             if (r.name() == u"row") {
                 const int rr = r.attributes().value("r").toInt();
                 row = rr > 0 ? rr - 1 : row + 1;
+                if (row >= kMaxRows) return fail(error, "Sheet \"" + sheet.name + "\" has rows past the last a workbook can have");
                 col = -1;
                 if (int(sheet.rows.size()) <= row) sheet.rows.resize(size_t(row) + 1);
             } else if (r.name() == u"c" && row >= 0) {
@@ -321,7 +338,7 @@ bool readXlsx(const std::string& bytes, std::vector<XlsxSheet>& out, std::string
                     cell = ok ? XlsxCell::num(v) : XlsxCell(value.toStdString());
                     if (ok) cell.text = value.toStdString();
                 }
-                if (col < 0) continue;
+                if (col < 0 || col >= kMaxColumns) continue;
                 auto& cells = sheet.rows[size_t(row)];
                 if (int(cells.size()) <= col) cells.resize(size_t(col) + 1);
                 cells[size_t(col)] = cell;

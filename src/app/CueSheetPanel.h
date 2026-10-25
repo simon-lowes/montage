@@ -7,6 +7,7 @@
 
 #include <QWidget>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -39,7 +40,7 @@ protected:
 
 private:
     void edited(int row, int column);
-    void setField(Id media, const std::string& key, const std::string& value);
+    void setField(Id media, const std::string& key, const std::optional<std::string>& value);  // none: the media's word taken away
     std::map<std::string, std::string> tagsOf(const MediaItem& m);
 
     EditorState* state_;
@@ -51,6 +52,7 @@ private:
     std::map<std::string, std::map<std::string, std::string>> tags_;  // by file, read once
     bool refreshing_ = false;
     bool stale_ = true;
+    bool suggesting_ = false;
 };
 
 }  // namespace montage

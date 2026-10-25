@@ -10,6 +10,7 @@
 #include <QTableWidget>
 #include <QVBoxLayout>
 #include <QtConcurrent>
+#include <optional>
 #include <set>
 
 #include "EditorState.h"
@@ -103,7 +104,8 @@ void CueSheetPanel::refresh() {
                 for (int r = 0; r < table_->rowCount(); ++r)
                     if (table_->cellWidget(r, column) == box && size_t(r) < cues_.size()) {
                         const char* key = column == kUse ? kCueUse : column == kVocal ? kCueVocal : kCueTheme;
-                        setField(cues_[size_t(r)].mediaId, key, box->currentData().toString().toStdString());
+                        const std::string v = box->currentData().toString().toStdString();
+                        setField(cues_[size_t(r)].mediaId, key, v.empty() ? std::nullopt : std::optional<std::string>(v));
                     }
             });
         }
@@ -138,20 +140,20 @@ void CueSheetPanel::refresh() {
     summary_->setText(cues_.empty() ? tr("No music in the cut: give music clips the Music role, or tag their files")
                                     : tr("%n cue(s), %1 of music", nullptr, int(cues_.size()))
                                           .arg(QString::fromStdString(formatTimecode(total, s->fps))));
-    suggest_->setEnabled(!cues_.empty());
+    suggest_->setEnabled(!cues_.empty() && !suggesting_);
     export_->setEnabled(s != nullptr);
 }
 
-void CueSheetPanel::setField(Id media, const std::string& key, const std::string& value) {
+void CueSheetPanel::setField(Id media, const std::string& key, const std::optional<std::string>& value) {
     state_->edit(tr("Cue Sheet"), [&](Project& p, Sequence&) {
         MediaItem* m = p.findMedia(media);
         if (!m) return false;
         auto it = m->metadata.find(key);
-        if (value.empty() ? it == m->metadata.end() : it != m->metadata.end() && it->second == value) return false;
-        if (value.empty())
+        if (!value ? it == m->metadata.end() : it != m->metadata.end() && it->second == *value) return false;
+        if (!value)
             m->metadata.erase(it);
         else
-            m->metadata[key] = value;
+            m->metadata[key] = *value;
         return true;
     });
 }
@@ -161,18 +163,19 @@ void CueSheetPanel::edited(int row, int column) {
     const MusicCue& c = cues_[size_t(row)];
     const std::string field = kCueFields[column - kFirstField];
     const std::string value = table_->item(row, column)->text().trimmed().toStdString();
-    // What the file's tag says needs no word of the media's own; anything else is kept.
+    // What the file's tag says needs no word of the media's own; anything else is kept (an empty cell too: the tag
+    // blanked).
     std::string tag;
     if (const MediaItem* m = state_->project().findMedia(c.mediaId)) {
         const auto tags = tagsOf(*m);
         if (auto it = tags.find(field); it != tags.end()) tag = it->second;
     }
-    setField(c.mediaId, cueMetadataKey(field), value == tag ? std::string() : value);
+    setField(c.mediaId, cueMetadataKey(field), value == tag ? std::nullopt : std::optional<std::string>(value));
 }
 
 bool CueSheetPanel::suggestVocal() {
     const Sequence* s = state_->sequence();
-    if (!s || cues_.empty()) return false;
+    if (!s || cues_.empty() || suggesting_) return false;
     if (!stemSeparationAvailable() || !(stemModel(2).installed() || stemModel(4).installed() || stemModel(5).installed())) {
         state_->message(tr("Suggest Vocal needs the music stem model (Separate Stems downloads it)"), 6000);
         return false;
@@ -186,32 +189,47 @@ bool CueSheetPanel::suggestVocal() {
     }
     const Project p = state_->project();
     const Sequence seq = *s;
-    using Found = std::vector<std::pair<Id, bool>>;
+    struct Found {
+        std::vector<std::pair<Id, bool>> vocal;
+        std::string error;  // the first cue that could not be told
+    };
     QApplication::setOverrideCursor(Qt::BusyCursor);
+    suggesting_ = true;
     suggest_->setEnabled(false);
     auto* watcher = new QFutureWatcher<Found>(this);
     connect(watcher, &QFutureWatcher<Found>::finished, this, [this, watcher] {
         QApplication::restoreOverrideCursor();
         const Found found = watcher->result();
         watcher->deleteLater();
-        suggest_->setEnabled(true);
+        suggesting_ = false;
+        suggest_->setEnabled(!cues_.empty());
+        int marked = 0;
         state_->edit(tr("Suggest Vocal"), [&](Project& p, Sequence&) {
             bool any = false;
-            for (const auto& [media, vocal] : found)
+            for (const auto& [media, vocal] : found.vocal)
                 if (MediaItem* m = p.findMedia(media); m && !m->metadata.count(kCueVocal)) {
                     m->metadata[kCueVocal] = vocal ? "vocal" : "instrumental";
                     any = true;
+                    ++marked;
                 }
             return any;
         });
-        state_->message(tr("Vocal or instrumental suggested for %n cue(s)", nullptr, int(found.size())), 5000);
+        if (marked || found.error.empty())
+            state_->message(tr("Vocal or instrumental suggested for %n piece(s) of music", nullptr, marked), 5000);
+        else
+            state_->message(tr("Could not tell: %1").arg(QString::fromStdString(found.error)), 6000);
     });
     watcher->setFuture(QtConcurrent::run([p, seq, open] {
         Found found;
         std::set<Id> done;
         for (const MusicCue& c : open) {
             bool vocal = false;
-            if (done.insert(c.mediaId).second && cueIsVocal(p, seq, c, vocal)) found.push_back({c.mediaId, vocal});
+            std::string err;
+            if (!done.insert(c.mediaId).second) continue;
+            if (cueIsVocal(p, seq, c, vocal, nullptr, 30, &err))
+                found.vocal.push_back({c.mediaId, vocal});
+            else if (found.error.empty())
+                found.error = err;
         }
         return found;
     }));

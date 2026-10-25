@@ -1,7 +1,7 @@
 #include "Paperwork.h"
 
+#include <QString>
 #include <algorithm>
-#include <cctype>
 #include <cmath>
 #include <set>
 
@@ -113,8 +113,8 @@ std::vector<MusicCue> musicCues(const Project& p, const Sequence& seq, const Mus
         return it->second;
     };
     auto field = [&](const MediaItem& m, const std::string& f) {
-        const std::string own = metaOf(m, cueMetadataKey(f));
-        if (!own.empty()) return own;
+        // The media's own word, even an empty one (a wrong tag blanked), over the file's.
+        if (auto it = m.metadata.find(cueMetadataKey(f)); it != m.metadata.end()) return it->second;
         auto& t = tagsOf(m);
         auto it = t.find(f);
         return it == t.end() ? std::string() : it->second;
@@ -365,8 +365,8 @@ std::string asBroadcastScript(const std::vector<DialogueEntry>& list, const Sequ
                 out += "\n" + tc(e.in, seq) + "  " + e.text + (e.description.empty() ? "" : " - " + e.description) + "\n\n";
                 break;
             case DialogueEntry::Kind::Line: {
-                std::string who = e.speaker.empty() ? std::string("(UNKNOWN)") : e.speaker;
-                for (char& c : who) c = char(std::toupper(static_cast<unsigned char>(c)));
+                const std::string who =
+                    e.speaker.empty() ? std::string("(UNKNOWN)") : QString::fromStdString(e.speaker).toUpper().toStdString();
                 out += tc(e.in, seq) + "  " + who + "\n              " + e.text + "\n\n";
                 break;
             }

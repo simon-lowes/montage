@@ -130,7 +130,7 @@ bool writeTablePdf(const XlsxSheet& t, const std::string& heading, const std::st
 }
 
 bool writePaperwork(const Project& p, const Sequence& seq, PaperworkList list, const std::string& path, const PaperworkOptions& o,
-                    std::string* error, XlsxSheet* tableOut) {
+                    std::string* error, XlsxSheet* tableOut, std::string* scriptOut) {
     const QString ext = QFileInfo(QString::fromStdString(path)).suffix().toLower();
     const bool text = ext == QLatin1String("txt");
     if (ext != QLatin1String("xlsx") && ext != QLatin1String("csv") && ext != QLatin1String("pdf") && !text)
@@ -141,10 +141,25 @@ bool writePaperwork(const Project& p, const Sequence& seq, PaperworkList list, c
     std::string script;
     if (!buildPaperwork(p, seq, list, o, table, &script, error)) return false;
     if (tableOut) *tableOut = table;
+    if (scriptOut) *scriptOut = script;
     const std::string heading = std::string(paperworkListName(list)) + (seq.name.empty() ? "" : ": " + seq.name);
     if (ext == QLatin1String("xlsx")) return writeXlsxFile(path, {table}, error);
-    if (ext == QLatin1String("csv")) return writeBytes(path, tableCsv(table), error);
-    if (text) return writeBytes(path, script, error);
+    // (A byte-order mark, so spreadsheets read the CSV as UTF-8 rather than in the system's code page.)
+    if (ext == QLatin1String("csv")) return writeBytes(path, "\xEF\xBB\xBF" + tableCsv(table), error);
+    if (text && list == PaperworkList::AsBroadcast) return writeBytes(path, script, error);
+    if (text) {
+        std::string rows;
+        for (const auto& row : table.rows) {
+            for (size_t i = 0; i < row.size(); ++i) {
+                std::string v = row[i].text;
+                std::replace(v.begin(), v.end(), '\t', ' ');
+                std::replace(v.begin(), v.end(), '\n', ' ');
+                rows += (i ? "\t" : "") + v;
+            }
+            rows += "\n";
+        }
+        return writeBytes(path, rows, error);
+    }
     if (list == PaperworkList::AsBroadcast) {
         // The script as it reads, in a typewriter face.
         QTextDocument doc;
