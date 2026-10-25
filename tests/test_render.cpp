@@ -51,6 +51,8 @@
 #include "render/Imf.h"
 #include "render/Jpeg2000.h"
 #include "render/DcpMxf.h"
+#include "render/ImageSubtitles.h"
+#include "media/TextReader.h"
 #include "render/DcpSecurity.h"
 #include "render/XmlCanonical.h"
 #include "core/Interpretation.h"
@@ -6956,6 +6958,109 @@ colorspaces:
         p.sequences.back().videoTracks[0].clips[2].duration = 30;
         sup.title = "Wrong cut";
         QVERIFY(!exportImf(p, now, sup, dir.path().toStdString(), nullptr, {}, &err) && err.find("mastered from") != std::string::npos);
+    }
+
+    void exportsImfImageSubtitles() {
+        if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
+        QTemporaryDir dir;
+        // Two subtitles over a two-second matte, sent as pictures (the IMSC 1.1 Image profile).
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 960, s.height = 540, s.fps = Rational{24, 1};
+        s.videoTracks[0].clips = {colorClip(p, 0.2f, 0.3f, 0.4f, 0, 48)};
+        CaptionTrack t;
+        t.id = p.newId();
+        t.name = "English";
+        t.language = "en";
+        Caption a{4, 20, "Pictures, not text"};
+        Caption b{26, 44, "The second subtitle"};
+        b.vertical = kCaptionTop;
+        t.captions = {a, b};
+        s.captionTracks.push_back(t);
+        ImfSettings st;
+        st.title = "Pictures";
+        st.threads = 2;
+        st.texts = {{t.id, "subtitles", true}};
+        ImfResult r;
+        std::string err;
+        QVERIFY2(exportImf(p, s, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+        QCOMPARE(r.texts, 1);
+        std::vector<std::string> issues = verifyImf(r.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        const QStringList photon = photonErrors(QString::fromStdString(r.folder));
+        QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+        // The timed text track file: an Image profile document, and its two PNGs in the file under their ids.
+        std::string xml;
+        dcp::ImfTrackReader text;
+        for (const std::string& f : r.trackFiles) {
+            dcp::ImfTrackReader reader;
+            if (reader.open(f, &err) && reader.kind() == dcp::ImfTrackReader::Kind::TimedText) text = reader;
+        }
+        QVERIFY(text.kind() == dcp::ImfTrackReader::Kind::TimedText && text.text(xml, &err));
+        QVERIFY(isImscImage(xml));
+        QVERIFY(xml.find("ttp:contentProfiles=\"http://www.w3.org/ns/ttml/profile/imsc1.1/image\"") != std::string::npos);
+        QVERIFY(xml.find("tts:extent=\"960px 540px\"") != std::string::npos);
+        QCOMPARE(text.resources().size(), size_t(2));
+        auto png = [&](const std::string& name) {
+            dcp::Uuid id;
+            std::vector<uint8_t> d;
+            if (name.rfind("urn:uuid:", 0) != 0 || !dcp::parseUuid(name.substr(9), id) || !text.resource(id, d)) return QByteArray();
+            return QByteArray(reinterpret_cast<const char*>(d.data()), qsizetype(d.size()));
+        };
+        const std::vector<std::string> problems = checkImscImage(xml, png, 960, 540);
+        QVERIFY2(problems.empty(), problems.empty() ? "" : problems.front().c_str());
+        DecodedSubtitles pictures;
+        QVERIFY2(decodeImscImage(xml, png, pictures, &err), err.c_str());
+        QCOMPARE(pictures.pictures.size(), size_t(2));
+        for (size_t i = 0; i < 2; ++i) {
+            QCOMPARE(FrameTime(std::llround(pictures.pictures[i].start * 24)), t.captions[i].start);
+            QCOMPARE(FrameTime(std::llround(pictures.pictures[i].end * 24)), t.captions[i].end);
+        }
+        QVERIFY(pictures.pictures[1].y < 540 / 3);  // the second at the top
+        // The composition's descriptor names the profile and the pictures.
+        QFile cpl(QString::fromStdString(r.cpl));
+        QVERIFY(cpl.open(QIODevice::ReadOnly));
+        const QString cplText = QString::fromUtf8(cpl.readAll());
+        QVERIFY(cplText.contains("imsc1.1/image") && cplText.count("<r0:DCTimedTextResourceSubDescriptor>") == 2);
+        // TTML2's schema (W3C) passes the document, where MONTAGE_TEST_TTML_SCHEMA names it (and xmllint is at hand).
+        const QString schema = qEnvironmentVariable("MONTAGE_TEST_TTML_SCHEMA");
+        if (schema.isEmpty()) {
+            qInfo("MONTAGE_TEST_TTML_SCHEMA not set: the document is not checked against TTML2's schema");
+        } else {
+            QFile doc(dir.filePath("image.ttml"));
+            QVERIFY(doc.open(QIODevice::WriteOnly));
+            doc.write(QByteArray::fromStdString(xml));
+            doc.close();
+            QProcess lint;
+            lint.setProcessChannelMode(QProcess::MergedChannels);
+            lint.start("xmllint", {"--noout", "--nonet", "--schema", schema, doc.fileName()});
+            QVERIFY2(lint.waitForFinished(120000), "xmllint did not finish");
+            QVERIFY2(lint.exitCode() == 0, lint.readAll().constData());
+        }
+        // Montage's check finds what is wrong with a broken one.
+        std::string broken = xml;
+        broken.replace(broken.find("urn:uuid:"), 9, "urn:uuid:0");
+        QVERIFY(!checkImscImage(broken, png, 960, 540).empty());
+        QVERIFY(!checkImscImage(xml, png, 1920, 1080).empty());
+        QVERIFY(!checkImscImage(captionsToTtml(t.captions, s.fps), png).empty());
+        // Opened again as a sequence: the subtitles read back off their pictures (with the text reading model).
+        if (!ocrAvailable() || !ocrModel().installed()) {
+            qInfo("Text reading model not installed (set MONTAGE_OCR_MODEL): the package's subtitles are not read back");
+            return;
+        }
+        Project q = makeDefaultProject();
+        const ImportResult in = importImf(q, r.folder, [](const std::string& f, MediaItem& m) { return probeMedia(f, m, nullptr); });
+        QVERIFY2(in.ok, in.error.c_str());
+        const Sequence* opened = q.findSequence(in.sequence);
+        QVERIFY(opened && opened->captionTracks.size() == 1);
+        const CaptionTrack& back = opened->captionTracks[0];
+        QCOMPARE(back.captions.size(), size_t(2));
+        for (size_t i = 0; i < 2; ++i) {
+            QCOMPARE(QString::fromStdString(back.captions[i].text), QString::fromStdString(t.captions[i].text));
+            QCOMPARE(back.captions[i].start, t.captions[i].start);
+            QCOMPARE(back.captions[i].end, t.captions[i].end);
+            QCOMPARE(back.captions[i].vertical, t.captions[i].vertical);
+        }
     }
 
     void exportsImfSupplementalAt2997() {

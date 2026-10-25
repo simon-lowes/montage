@@ -236,6 +236,7 @@
 #include "render/Intelligibility.h"
 #include "render/MonitorSection.h"
 #include "media/TakeChoice.h"
+#include "render/ImageSubtitles.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -1308,6 +1309,22 @@ struct LensRig {
                 }
     }
 };
+
+// A caption track of three captions at 1080 lines in the default look: at the bottom, at the top on the left, and
+// two lines in the middle.
+static CaptionTrack threeCaptions(Project& p) {
+    CaptionTrack t;
+    t.id = p.newId();
+    t.name = "English";
+    t.language = "en";
+    Caption a{25, 85, "The first line of dialogue"};
+    Caption b{100, 160, "Second line, at the top"};
+    b.vertical = kCaptionTop, b.align = kCaptionLeft;
+    Caption c{175, 230, "And the third one\nover two lines"};
+    c.vertical = kCaptionMiddle;
+    t.captions = {a, b, c};
+    return t;
+}
 
 class TestMedia : public QObject {
     Q_OBJECT
@@ -27581,6 +27598,239 @@ if ui["pressed"] == "add":
         QVERIFY(buildPaperwork(p, s, PaperworkList::CueSheet, o, table, nullptr, &err));
         QCOMPARE(QString::fromStdString(table.rows[1][10].text), QString("vocal"));
         QCOMPARE(QString::fromStdString(table.rows[2][10].text), QString("instrumental"));
+    }
+
+    void imageSubtitlesRoundTrip() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 1920, s.height = 1080, s.fps = {25, 1};
+        s.captionTracks.push_back(threeCaptions(p));
+        const CaptionTrack& t = s.captionTracks.back();
+        const bool ocr = ocrAvailable() && ocrModel().installed();
+        if (!ocr) qInfo("Text reading model not installed (set MONTAGE_OCR_MODEL): the subtitles are not read back");
+        const struct {
+            ImageSubtitleFormat format;
+            const char* file;
+            const char* codec;
+        } outs[] = {{ImageSubtitleFormat::Pgs, "subs.sup", "pgs"},       {ImageSubtitleFormat::Pgs, "subs-pgs.mks", "pgs"},
+                    {ImageSubtitleFormat::Dvb, "subs.ts", "dvb"},        {ImageSubtitleFormat::Dvb, "subs-dvb.mks", "dvb"},
+                    {ImageSubtitleFormat::Vobsub, "subs.idx", "dvd"},    {ImageSubtitleFormat::Vobsub, "subs-dvd.mks", "dvd"},
+                    {ImageSubtitleFormat::ImscImage, "subs.ttml", "imsc"}};
+        for (const auto& o : outs) {
+            const std::string file = path(o.file);
+            std::string err;
+            ImageSubtitleResult r;
+            QVERIFY2(writeImageSubtitles(t, s, file, o.format, &err, 0, 0, &r), err.c_str());
+            QCOMPARE(r.subtitles, 3);
+            // Decoded back through FFmpeg (IMSC by Montage): the same frame, each caption to the frame and in its place.
+            DecodedSubtitles d;
+            QVERIFY2(decodeImageSubtitles(file, d, -1, &err), (std::string(o.file) + ": " + err).c_str());
+            QCOMPARE(QString::fromStdString(d.codec), QString(o.codec));
+            QCOMPARE(d.width, 1920);
+            QCOMPARE(d.height, 1080);
+            QVERIFY2(d.pictures.size() == 3, qPrintable(QString("%1: %2 pictures").arg(o.file).arg(d.pictures.size())));
+            for (size_t i = 0; i < 3; ++i) {
+                const SubtitlePicture& pic = d.pictures[i];
+                const Caption& c = t.captions[i];
+                QVERIFY2(std::llround(pic.start * 25) == c.start && std::llround(pic.end * 25) == c.end,
+                         qPrintable(QString("%1 caption %2: %3-%4 s").arg(o.file).arg(i).arg(pic.start).arg(pic.end)));
+                const double cy = (pic.y + pic.image.height() / 2.0) / 1080, cx = (pic.x + pic.image.width() / 2.0) / 1920;
+                if (c.vertical == kCaptionBottom) QVERIFY(cy > 0.8);
+                if (c.vertical == kCaptionTop) QVERIFY(cy < 0.2 && cx < 0.4);
+                if (c.vertical == kCaptionMiddle) QVERIFY(std::fabs(cy - 0.5) < 0.05 && std::fabs(cx - 0.5) < 0.02);
+            }
+            if (!ocr) continue;
+            // Read by OCR into a track: every caption's text exactly, its time and its place.
+            ImageSubtitleImport in;
+            int ticks = 0;
+            QVERIFY2(readImageSubtitles(file, s.fps, in, -1, {}, [&](double) { ++ticks; }, nullptr, &err), err.c_str());
+            QVERIFY(ticks >= 3);
+            QCOMPARE(QString::fromStdString(in.track.language), QString("en"));
+            QCOMPARE(in.track.captions.size(), size_t(3));
+            for (size_t i = 0; i < 3; ++i) {
+                const Caption& got = in.track.captions[i];
+                const Caption& want = t.captions[i];
+                QVERIFY2(got.text == want.text, qPrintable(QString("%1: \"%2\"").arg(o.file, QString::fromStdString(got.text))));
+                QCOMPARE(got.start, want.start);
+                QCOMPARE(got.end, want.end);
+                QCOMPARE(got.vertical, want.vertical);
+                QCOMPARE(got.align, want.align);
+            }
+            // Styled as the pictures look: white text on a dark box.
+            QVERIFY(in.track.style.textR > 0.9 && in.track.style.textG > 0.9 && in.track.style.textB > 0.9);
+            QVERIFY(in.track.style.boxOpacity > 0.4 && in.track.style.boxR < 0.1);
+            QVERIFY2(std::fabs(in.track.style.size - t.style.size) < 0.015, qPrintable(QString::number(in.track.style.size)));
+            QVERIFY(in.review.empty());
+        }
+        // Formats that cannot be written where they were asked.
+        std::string err;
+        QVERIFY(!writeImageSubtitles(t, s, path("subs.mp4"), ImageSubtitleFormat::Pgs, &err));
+        QVERIFY(!writeImageSubtitles(t, s, path("subs.sup"), ImageSubtitleFormat::Dvb, &err));
+        QVERIFY(!writeImageSubtitles(CaptionTrack{}, s, path("none.sup"), ImageSubtitleFormat::Pgs, &err));
+        DecodedSubtitles d;
+        QVERIFY(!decodeImageSubtitles(path("missing.sup"), d, -1, &err));
+    }
+
+    void imageSubtitleColours() {
+        // Yellow text on a blue box: the colours each format keeps, down to DVD's four.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 1920, s.height = 1080, s.fps = {24000, 1001};
+        CaptionTrack t = threeCaptions(p);
+        t.style.textR = 1, t.style.textG = 0.85, t.style.textB = 0;
+        t.style.boxR = 0, t.style.boxG = 0.2, t.style.boxB = 0.6, t.style.boxOpacity = 1;
+        s.captionTracks.push_back(t);
+        for (const auto& [format, file] : std::vector<std::pair<ImageSubtitleFormat, const char*>>{
+                 {ImageSubtitleFormat::Pgs, "colours.sup"}, {ImageSubtitleFormat::Dvb, "colours.ts"}, {ImageSubtitleFormat::Vobsub, "colours.idx"}}) {
+            std::string err;
+            QVERIFY2(writeImageSubtitles(t, s, path(file), format, &err), err.c_str());
+            DecodedSubtitles d;
+            QVERIFY2(decodeImageSubtitles(path(file), d, -1, &err), err.c_str());
+            QCOMPARE(d.pictures.size(), size_t(3));
+            // At 23.976 too, each caption on its frame.
+            for (size_t i = 0; i < 3; ++i) {
+                QCOMPARE(FrameTime(std::llround(d.pictures[i].start * 24000 / 1001)), t.captions[i].start);
+                QCOMPARE(FrameTime(std::llround(d.pictures[i].end * 24000 / 1001)), t.captions[i].end);
+            }
+            // The box (most of the picture) and the text in their colours, within a step of the decoder's rounding.
+            std::map<uint32_t, int> count;
+            const QImage& img = d.pictures[0].image;
+            for (int y = 0; y < img.height(); ++y)
+                for (int x = 0; x < img.width(); ++x)
+                    if (const uint32_t c = img.pixel(x, y); (c >> 24) > 200) ++count[c & 0xffffff];
+            auto near = [](uint32_t c, int r, int g, int b) {
+                return std::abs(int((c >> 16) & 0xff) - r) <= 10 && std::abs(int((c >> 8) & 0xff) - g) <= 10 && std::abs(int(c & 0xff) - b) <= 10;
+            };
+            int box = 0, text = 0, total = 0;
+            for (const auto& [c, n] : count) {
+                total += n;
+                if (near(c, 0, 51, 153)) box += n;
+                if (near(c, 255, 217, 0)) text += n;
+            }
+            QVERIFY2(box > total / 2, qPrintable(QString("%1: %2 of %3 box").arg(file).arg(box).arg(total)));
+            QVERIFY2(text > total / 20, qPrintable(QString("%1: %2 of %3 text").arg(file).arg(text).arg(total)));
+        }
+        // DVD's colours: four a picture, sixteen in all, from the pictures themselves.
+        QFile idx(QString::fromStdString(path("colours.idx")));
+        QVERIFY(idx.open(QIODevice::ReadOnly));
+        const QString index = QString::fromUtf8(idx.readAll());
+        QVERIFY(index.startsWith("# VobSub index file, v7"));
+        QVERIFY(index.contains("size: 1920x1080"));
+        QVERIFY2(index.contains("palette: 003399") || index.contains(", 003399"), qPrintable(index.left(400)));
+        QVERIFY(index.contains("id: en, index: 0"));
+        QVERIFY(index.contains("timestamp: 00:00:01:043, filepos: 000000000"));
+        const IndexedPicture four = reduceColours(captionPictures(t, 1920, 1080).front().image, 4, 3);
+        QVERIFY(four.palette.size() <= 4);
+        QCOMPARE(four.palette[0], 0u);
+    }
+
+    void imageSubtitlesInVideo() {
+        // A video with subtitle pictures made here: PGS and DVD in Matroska, DVB in MPEG-TS, each stream in the track's
+        // language and each caption on its frame; the PGS read back into a track with the right text, from the file and
+        // over MCP where a trimmed clip of it plays them.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 1920, s.height = 1080, s.fps = {25, 1};
+        edit::overwrite(p, s, {TrackKind::Video, 0}, makeGeneratorClip(p, "color", 250));
+        s.captionTracks.push_back(threeCaptions(p));
+        const CaptionTrack& t = s.captionTracks.back();
+        const bool ocr = ocrAvailable() && ocrModel().installed();
+        std::string err;
+        for (const auto& [images, file, codec] : std::vector<std::tuple<const char*, const char*, const char*>>{
+                 {"pgs", "pgs.mkv", "pgs"}, {"dvd", "dvd.mkv", "dvd"}, {"", "dvb.ts", "dvb"}}) {
+            ExportSettings st;
+            st.path = path(file);
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            st.embedCaptions = true;
+            st.captionImages = images;
+            QVERIFY2(exportSequence(p, s, st, nullptr, nullptr, &err), err.c_str());
+            const std::vector<ImageSubtitleStream> streams = imageSubtitleStreams(st.path);
+            QCOMPARE(streams.size(), size_t(1));
+            QCOMPARE(QString::fromStdString(streams[0].codec), QString(codec));
+            QCOMPARE(QString::fromStdString(streams[0].language), QString("en"));
+            DecodedSubtitles d;
+            QVERIFY2(decodeImageSubtitles(st.path, d, -1, &err), (std::string(file) + ": " + err).c_str());
+            QVERIFY2(d.pictures.size() == 3, qPrintable(QString("%1: %2 pictures").arg(file).arg(d.pictures.size())));
+            for (size_t i = 0; i < 3; ++i)
+                QVERIFY2(std::llround(d.pictures[i].start * 25) == t.captions[i].start && std::llround(d.pictures[i].end * 25) == t.captions[i].end,
+                         qPrintable(QString("%1 caption %2: %3-%4 s").arg(file).arg(i).arg(d.pictures[i].start).arg(d.pictures[i].end)));
+        }
+        // Only Matroska and MPEG-TS hold them.
+        {
+            ExportSettings st;
+            st.path = path("pgs.mp4");
+            st.audioCodec = "none";
+            st.preset = "ultrafast";
+            st.embedCaptions = true;
+            st.captionImages = "pgs";
+            QVERIFY(!exportSequence(p, s, st, nullptr, nullptr, &err));
+            QVERIFY(QString::fromStdString(err).contains("PGS"));
+        }
+        if (ocr) {
+            ImageSubtitleImport in;
+            QVERIFY2(readImageSubtitles(path("pgs.mkv"), s.fps, in, -1, {}, {}, nullptr, &err), err.c_str());
+            QCOMPARE(QString::fromStdString(in.codec), QString("pgs"));
+            QCOMPARE(in.track.captions.size(), size_t(3));
+            for (size_t i = 0; i < 3; ++i) QCOMPARE(QString::fromStdString(in.track.captions[i].text), QString::fromStdString(t.captions[i].text));
+        }
+        // Over MCP: the captions written as pictures, and read from a clip of the video.
+        Project q = makeDefaultProject();
+        Sequence& qs = *q.active();
+        qs.width = 1920, qs.height = 1080, qs.fps = {25, 1};
+        MediaItem m = probeOrFail(q, path("pgs.mkv"));
+        q.media.push_back(m);
+        QVERIFY(edit::placeMedia(q, qs, m.id, 100, 10, 240, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);  // source 0.4-9.6 s at 100
+        const Id clip = qs.videoTracks[0].clips.at(0).id;
+        qs.captionTracks.push_back(threeCaptions(q));
+        const QString project = QString::fromStdString(path("subs-video.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_captions"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto structured = [](const QJsonObject& r) { return r.value("structuredContent").toObject(); };
+        for (const auto& [file, format, want, files] : std::vector<std::tuple<const char*, const char*, const char*, int>>{
+                 {"mcp.sup", "", "pgs", 1}, {"mcp.idx", "", "vobsub", 2}, {"mcp-dvb.mks", "dvb", "dvb", 1}, {"mcp.ttml", "imsc_image", "imsc_image", 4}}) {
+            QJsonObject args{{"project", project}, {"export", QString::fromStdString(path(file))}};
+            if (*format) args.insert("format", format);
+            const QJsonObject r = call(args);
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            QCOMPARE(structured(r).value("format").toString(), QString(want));
+            QCOMPARE(structured(r).value("captions").toInt(), 3);
+            QCOMPARE(int(structured(r).value("files").toArray().size()), files);
+            DecodedSubtitles d;
+            QVERIFY2(decodeImageSubtitles(path(file), d, -1, &err), err.c_str());
+            QCOMPARE(d.pictures.size(), size_t(3));
+        }
+        QVERIFY(call({{"project", project}, {"export", QString::fromStdString(path("bad.sup"))}, {"format", "png"}}).value("isError").toBool());
+        if (!ocr) QSKIP("Set MONTAGE_OCR_MODEL to read subtitle pictures back over MCP");
+        QJsonObject r = call({{"project", project}, {"import", QString::fromStdString(path("mcp.idx"))}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(structured(r).value("codec").toString(), QString("dvd"));
+        QCOMPARE(structured(r).value("captions").toInt(), 3);
+        QVERIFY(structured(r).value("review").toArray().isEmpty());
+        r = call({{"project", project}, {"import_embedded", double(clip)}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(structured(r).value("codec").toString(), QString("pgs"));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const auto& tracks = back.active()->captionTracks;
+        QCOMPARE(tracks.size(), size_t(3));
+        QCOMPARE(QString::fromStdString(tracks[1].name), QString("mcp"));
+        QCOMPARE(QString::fromStdString(tracks[2].name), QString::fromStdString("Subtitles - " + back.active()->videoTracks[0].clips[0].name));
+        QCOMPARE(QString::fromStdString(tracks[2].language), QString("en"));
+        QCOMPARE(tracks[2].captions.size(), size_t(3));
+        for (size_t i = 0; i < 3; ++i) {
+            QCOMPARE(QString::fromStdString(tracks[2].captions[i].text), QString::fromStdString(t.captions[i].text));
+            QCOMPARE(tracks[2].captions[i].start, t.captions[i].start + 90);  // the file's frame 10 is at 100
+            QCOMPARE(tracks[2].captions[i].end, t.captions[i].end + 90);
+        }
     }
 
     void dialogueMusicEffectsChunks() {

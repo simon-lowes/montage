@@ -1,5 +1,7 @@
 #include "Imf.h"
 
+#include <QBuffer>
+#include <QCryptographicHash>
 #include <QDate>
 #include <QDir>
 #include <QFile>
@@ -27,6 +29,7 @@ extern "C" {
 #include "ColorSpace.h"
 #include "Compositor.h"
 #include "DcpMxf.h"
+#include "ImageSubtitles.h"
 #include "Jpeg2000.h"
 #include "PackageFiles.h"
 #include "RateConversion.h"
@@ -532,11 +535,34 @@ QString descriptorXml(const std::function<void(QXmlStreamWriter&)>& write) {
     return out.trimmed();
 }
 
+// An IMSC Image document's images ("urn:uuid:..." resources) from its track file.
+std::function<QByteArray(const std::string&)> imscResource(const dcp::ImfTrackReader& reader) {
+    return [&reader](const std::string& name) {
+        dcp::Uuid id;
+        std::vector<uint8_t> data;
+        if (name.rfind("urn:uuid:", 0) != 0 || !dcp::parseUuid(name.substr(9), id) || !reader.resource(id, data)) return QByteArray();
+        return QByteArray(reinterpret_cast<const char*>(data.data()), qsizetype(data.size()));
+    };
+}
+
 void timedTextDescriptor(QXmlStreamWriter& x, const dcp::ImfTimedTextWriter& w) {
     x.writeStartElement("r0:DCTimedTextDescriptor");
     x.writeNamespace(kGroups, "r0");
     x.writeNamespace(kElements, "r1");
     x.writeTextElement("r1:InstanceID", urn(w.descriptorId()));
+    if (!w.resources().empty()) {
+        // An Image document's pictures.
+        x.writeStartElement("r1:SubDescriptors");
+        for (size_t i = 0; i < w.resources().size(); ++i) {
+            x.writeStartElement("r0:DCTimedTextResourceSubDescriptor");
+            x.writeTextElement("r1:InstanceID", urn(w.resourceSets()[i]));
+            x.writeTextElement("r1:AncillaryResourceID", urn(w.resources()[i].first));
+            x.writeTextElement("r1:MIMEType", QString::fromStdString(w.resources()[i].second));
+            x.writeTextElement("r1:EssenceStreamID", QString::number(10 + i));
+            x.writeEndElement();
+        }
+        x.writeEndElement();  // SubDescriptors
+    }
     x.writeTextElement("r1:LinkedTrackID", "1");
     x.writeTextElement("r1:SampleRate", QStringLiteral("%1/%2").arg(w.rate().num).arg(w.rate().den));
     x.writeTextElement("r1:EssenceLength", QString::number(w.duration()));
@@ -544,7 +570,7 @@ void timedTextDescriptor(QXmlStreamWriter& x, const dcp::ImfTimedTextWriter& w) 
     x.writeTextElement("r1:DataEssenceCoding", ulUrn(std::string(32, '0')));
     x.writeTextElement("r1:ResourceID", urn(w.resourceId()));
     x.writeTextElement("r1:UCSEncoding", "UTF-8");
-    x.writeTextElement("r1:NamespaceURI", dcp::ImfTimedTextWriter::kProfile);
+    x.writeTextElement("r1:NamespaceURI", w.profile());
     x.writeTextElement("r1:RFC5646LanguageTagList", QString::fromStdString(w.language()));
     x.writeEndElement();
 }
@@ -651,6 +677,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
     struct TextPlan {
         const CaptionTrack* track = nullptr;
         std::string kind;
+        bool image = false;
     };
     std::vector<TextPlan> textPlans;
     if (settings.captions) {
@@ -662,7 +689,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
                 const auto it = std::find_if(s.captionTracks.begin(), s.captionTracks.end(), [&](const CaptionTrack& t) { return t.id == x.track; });
                 if (it == s.captionTracks.end()) return fail("The sequence has no caption track " + std::to_string(x.track));
                 if (textSequence(x.kind).isEmpty()) return fail("A caption track goes in as subtitles, captions or forced, not " + x.kind);
-                textPlans.push_back({&*it, x.kind});
+                textPlans.push_back({&*it, x.kind, x.image});
             }
         }
         for (const TextPlan& t : textPlans)
@@ -975,7 +1002,34 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
             c.end = std::min<FrameTime>(c.end - first, programme);
             if (c.end > c.start) captions.push_back(c);
         }
-        const std::string xml = captionsToTtml(captions, s.fps, plan.track->language, plan.track->style);
+        // Pictures (IMSC 1.1 Image): each caption drawn on the master's frame, a PNG in the track file named by its id.
+        std::vector<dcp::TimedTextResource> images;
+        std::string xml;
+        if (plan.image) {
+            CaptionTrack drawn = *plan.track;
+            drawn.captions = captions;
+            const std::vector<CaptionPicture> pictures = captionPictures(drawn, W, H);
+            std::vector<std::string> names;
+            for (const CaptionPicture& pic : pictures) {
+                dcp::TimedTextResource r;
+                r.mime = "image/png";
+                QByteArray png;
+                QBuffer buf(&png);
+                buf.open(QIODevice::WriteOnly);
+                if (!pic.image.save(&buf, "PNG")) return fail("Cannot make a subtitle picture");
+                r.data.assign(png.begin(), png.end());
+                // Named by what it shows (a name-based UUID), so the same pictures make the same document again.
+                const QByteArray hash = QCryptographicHash::hash(png, QCryptographicHash::Md5);
+                std::copy(hash.begin(), hash.begin() + 16, r.id.begin());
+                r.id[6] = uint8_t((r.id[6] & 0x0f) | 0x30);
+                r.id[8] = uint8_t((r.id[8] & 0x3f) | 0x80);
+                names.push_back("urn:uuid:" + dcp::uuidString(r.id));
+                images.push_back(std::move(r));
+            }
+            xml = imscImageDocument(pictures, names, s.fps, W, H, plan.track->language);
+        } else {
+            xml = captionsToTtml(captions, s.fps, plan.track->language, plan.track->style);
+        }
         // The earlier version of the same kind and language: its virtual track carried on (a corrected one too), its
         // file played again when the document is the same.
         const ImfVirtualTrack* was = nullptr;
@@ -995,7 +1049,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
             const size_t fileIndex = ownFile("TEXT", vt.kind);
             dcp::ImfTimedTextWriter writer;
             if (!writer.open(QDir(folder).filePath(own[fileIndex].file).toStdString(), own[fileIndex].id, rate, &err) ||
-                !writer.write(xml, frames, plan.track->language, &err) || !writer.close(&err))
+                !writer.write(xml, frames, plan.track->language, &err, images) || !writer.close(&err))
                 return fail(err);
             own[fileIndex].descriptor = descriptorXml([&](QXmlStreamWriter& x) { timedTextDescriptor(x, writer); });
             vt.ownFile = int(fileIndex);
@@ -1530,7 +1584,15 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
                     if (reader.kind() != want) issue(QStringLiteral("%1 is not the %2 its %3 plays").arg(name, image ? "picture" : sound ? "sound" : "timed text", kind));
                     else if (r.intrinsic >= 0 && units != r.intrinsic)
                         issue(QStringLiteral("%1 has %2 edit units; the composition says %3").arg(name).arg(units).arg(r.intrinsic));
-                    else if (text && (!reader.text(xml, &err) || !parseTtml(xml, Rational{int(comp.rateNum), int(comp.rateDen)}, captions, &err)))
+                    else if (text && !reader.text(xml, &err))
+                        issue(QStringLiteral("%1 is not timed text Montage reads: %2").arg(name, QString::fromStdString(err)));
+                    else if (text && isImscImage(xml)) {
+                        // Pictures: the document as the Image profile has it, each image a PNG in the file.
+                        for (const std::string& problem : checkImscImage(xml, imscResource(reader), comp.width, comp.height))
+                            issue(QStringLiteral("%1: %2").arg(name, QString::fromStdString(problem)));
+                        for (const dcp::ImfTrackReader::Resource& res : reader.resources())
+                            if (!res.present) issue(QStringLiteral("%1 lists resource %2 but does not carry it").arg(name, QString::fromStdString(dcp::uuidString(res.id))));
+                    } else if (text && !parseTtml(xml, Rational{int(comp.rateNum), int(comp.rateDen)}, captions, &err))
                         issue(QStringLiteral("%1 is not timed text Montage reads: %2").arg(name, QString::fromStdString(err)));
                     continue;
                 }
@@ -1932,7 +1994,19 @@ ImportResult importImf(Project& p, const std::string& path, const MediaProber& p
             dcp::ImfTrackReader reader;
             std::string xml, err;
             std::vector<Caption> captions;
-            if (it == files.end() || !reader.open(it->second, &err) || !reader.text(xml, &err) || !parseTtml(xml, fps, captions, &err)) {
+            bool read = it != files.end() && reader.open(it->second, &err) && reader.text(xml, &err);
+            if (read && isImscImage(xml)) {
+                // Pictures, read by OCR (in the track's language).
+                DecodedSubtitles pictures;
+                ImageSubtitleImport in;
+                read = decodeImscImage(xml, imscResource(reader), pictures, &err) &&
+                       readSubtitlePictures(pictures, fps, in, track.language, {}, nullptr, &err);
+                captions = in.track.captions;
+                if (read && !in.track.captions.empty()) track.style = in.track.style;
+            } else if (read) {
+                read = parseTtml(xml, fps, captions, &err);
+            }
+            if (!read) {
                 b.warn("The timed text " + r.trackFile + " could not be read" + (err.empty() ? std::string() : ": " + err));
                 pos += r.duration * std::max<int64_t>(1, r.repeat);
                 continue;

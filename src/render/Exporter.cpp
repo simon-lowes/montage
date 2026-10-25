@@ -39,6 +39,7 @@
 
 #include "ColorSpace.h"
 #include "Compositor.h"
+#include "ImageSubtitles.h"
 #include "Hdr10Plus.h"
 #include "AdaptiveHdr.h"
 #include "HdrStill.h"
@@ -1358,6 +1359,8 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         AVCodecContext* ctx = nullptr;
         AVStream* st = nullptr;
         size_t next = 0;
+        std::vector<SubtitlePacket> pictures;  // image subtitles, coded ahead (times from the export's start)
+        bool image = false;
         ~CaptionOut() { avcodec_free_context(&ctx); }
     };
     std::vector<std::unique_ptr<CaptionOut>> captionOuts;
@@ -1371,11 +1374,44 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         auto out = std::make_unique<CaptionOut>();
         out->track = track;
         AVCodecID id = AV_CODEC_ID_NONE;
-        for (AVCodecID c : {AV_CODEC_ID_MOV_TEXT, AV_CODEC_ID_SUBRIP, AV_CODEC_ID_WEBVTT})
-            if (avformat_query_codec(o.oc->oformat, c, FF_COMPLIANCE_NORMAL) == 1) {
-                id = c;
-                break;
+        const bool ts = std::string(o.oc->oformat->name) == "mpegts";
+        auto holds = [&](AVCodecID c) { return avformat_query_codec(o.oc->oformat, c, FF_COMPLIANCE_NORMAL) == 1 || (ts && c == AV_CODEC_ID_DVB_SUBTITLE); };
+        if (s.captionImages.empty())
+            for (AVCodecID c : {AV_CODEC_ID_MOV_TEXT, AV_CODEC_ID_SUBRIP, AV_CODEC_ID_WEBVTT})
+                if (holds(c)) {
+                    id = c;
+                    break;
+                }
+        // As pictures (render/ImageSubtitles.h) when asked, or where only pictures go (MPEG-TS: DVB subtitles).
+        std::string images = s.captionImages;
+        if (images.empty() && id == AV_CODEC_ID_NONE && ts) images = "dvb";
+        if (!images.empty()) {
+            ImageSubtitleFormat f;
+            if (!imageSubtitleFormatFromId(images, f) || f == ImageSubtitleFormat::ImscImage)
+                return fail("Caption pictures are pgs, dvb or dvd, not " + images);
+            id = f == ImageSubtitleFormat::Pgs ? AV_CODEC_ID_HDMV_PGS_SUBTITLE : f == ImageSubtitleFormat::Dvb ? AV_CODEC_ID_DVB_SUBTITLE : AV_CODEC_ID_DVD_SUBTITLE;
+            if (!holds(id)) return fail(std::string("This file type cannot hold ") + (f == ImageSubtitleFormat::Pgs ? "PGS" : f == ImageSubtitleFormat::Dvb ? "DVB" : "DVD") +
+                                        " subtitles (Matroska holds all three, MPEG-TS DVB)");
+            std::vector<uint8_t> extra;
+            std::string err;
+            if (!encodeImageSubtitles(*track, dseq.fps, f, W / across, H / down, out->pictures, &extra, &err, din, dout)) return fail(err);
+            out->image = true;
+            out->st = avformat_new_stream(o.oc, nullptr);
+            out->st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+            out->st->codecpar->codec_id = id;
+            out->st->codecpar->width = W / across;
+            out->st->codecpar->height = H / down;
+            if (!extra.empty()) {
+                out->st->codecpar->extradata = static_cast<uint8_t*>(av_mallocz(extra.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+                std::copy(extra.begin(), extra.end(), out->st->codecpar->extradata);
+                out->st->codecpar->extradata_size = int(extra.size());
             }
+            out->st->time_base = AVRational{1, 90000};
+            tagStream(out->st, track->name, track->language);
+            if (captionOuts.empty() && embedded.size() > 1) out->st->disposition |= AV_DISPOSITION_DEFAULT;
+            captionOuts.push_back(std::move(out));
+            continue;
+        }
         if (id == AV_CODEC_ID_NONE) return fail("This file type cannot hold captions; export them as a sidecar file instead");
         const AVCodec* codec = avcodec_find_encoder(id);
         if (!codec) return fail("Caption encoder not available");
@@ -1605,7 +1641,24 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     std::vector<uint8_t> subBuf(1 << 16);
     auto writeCaptions = [&](FrameTime until) -> bool {
         const double msPerFrame = 1000.0 / dseq.fpsValue();
+        for (auto& co : captionOuts) {
+            if (!co->image) continue;
+            // Pictures: each packet whose time has come.
+            const int64_t limit = int64_t(std::llround(double(until - din) * 90000.0 / dseq.fpsValue()));
+            for (; co->next < co->pictures.size() && co->pictures[co->next].pts < limit; ++co->next) {
+                const SubtitlePacket& sp = co->pictures[co->next];
+                av_packet_unref(o.pkt);
+                if (av_new_packet(o.pkt, int(sp.data.size())) < 0) return false;
+                std::copy(sp.data.begin(), sp.data.end(), o.pkt->data);
+                o.pkt->pts = o.pkt->dts = av_rescale_q(sp.pts, AVRational{1, 90000}, co->st->time_base);
+                o.pkt->duration = av_rescale_q(sp.duration, AVRational{1, 90000}, co->st->time_base);
+                o.pkt->flags |= AV_PKT_FLAG_KEY;
+                o.pkt->stream_index = co->st->index;
+                if (av_interleaved_write_frame(o.oc, o.pkt) < 0) return false;
+            }
+        }
         for (auto& co : captionOuts)
+        if (!co->image)
         for (; co->next < co->track->captions.size() && co->track->captions[co->next].start < until; ++co->next) {
             const Caption& c = co->track->captions[co->next];
             const FrameTime a = std::max(c.start, din), b = std::min(c.end, dout);

@@ -98,6 +98,7 @@
 #include "render/LinedScript.h"
 #include "render/FilmLists.h"
 #include "render/PaperworkOutput.h"
+#include "render/ImageSubtitles.h"
 #include "core/Ambisonics.h"
 #include "media/Sofa.h"
 #include "core/Surround.h"
@@ -6025,16 +6026,39 @@ void McpServer::Impl::addTools() {
     add("montage_captions", "Import or export captions",
         "Write a caption track to a file in the format its extension names: .srt (SubRip), .vtt (WebVTT), .scc "
         "(Scenarist, CEA-608), .mcc (MCC captions: CEA-608 and CTA-708, with the track's places and colours), .ttml / .xml / .dfxp (TTML, IMSC 1.1 Text profile, with the track's colours), .stl "
-        "(EBU Tech 3264, 25 or 30 fps) or .ass / .ssa (SubStation Alpha, with the track's style); or read any of them "
-        "as a new caption track (`import`), or the closed captions inside a video clip's file (`import_embedded`: CTA-708 service 1, else CEA-608 channel 1). "
+        "(EBU Tech 3264, 25 or 30 fps) or .ass / .ssa (SubStation Alpha, with the track's style); or as pictures drawn in "
+        "the track's style (`format`): pgs (Blu-ray: .sup, or Matroska .mks/.mkv), dvb (MPEG-TS .ts, or Matroska), "
+        "vobsub (DVD: .idx with its .sub, or Matroska) or imsc_image (IMSC 1.1 Image: a .ttml document with a PNG a "
+        "caption beside it); .sup, .idx and .ts need no `format`. Or read any of them as a new caption track (`import`: "
+        "picture subtitles, and IMSC Image documents, are read by OCR, the words it is unsure of listed in `review`), "
+        "or the captions inside a video clip's file (`import_embedded`: CTA-708 service 1, else CEA-608 channel 1, else "
+        "its PGS, DVB or DVD subtitles by OCR; `stream` picks a subtitle stream). "
         "`track` is a caption track index (default: the visible one).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"export":{"type":"string","description":"A file to write"},
+            "format":{"type":"string","enum":["pgs","dvb","vobsub","imsc_image"],"description":"Export as subtitle pictures"},
+            "width":{"type":"integer","description":"The pictures' frame (default: the sequence's)"},"height":{"type":"integer"},
             "import":{"type":"string","description":"A file to read as a new track"},"track":{"type":"integer"},
-            "import_embedded":{"type":"number","description":"A video clip (id): the CEA-608 closed captions inside its file as a new track, where the clip plays them"},
+            "import_embedded":{"type":"number","description":"A video clip (id): the captions inside its file as a new track, where the clip plays them"},
+            "stream":{"type":"integer","description":"The file's subtitle stream to read (its index in the file)"},
             "language":{"type":"string","description":"ISO 639-1 code for an imported track"}},"required":["project"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
+            // Subtitles read off their pictures: the track and what to check.
+            auto reviewed = [&](const ImageSubtitleImport& in, QJsonObject extra) {
+                QJsonArray review;
+                for (const OcrReview& r : in.review) {
+                    QJsonArray sugg;
+                    for (const std::string& w : r.suggestions) sugg.append(QString::fromStdString(w));
+                    review.append(QJsonObject{{"caption", int(r.caption)}, {"word", QString::fromStdString(r.word)}, {"suggestions", sugg},
+                                              {"confidence", double(r.confidence)}});
+                }
+                extra.insert("review", review);
+                extra.insert("codec", QString::fromStdString(in.codec));
+                extra.insert("pictures", in.pictures);
+                extra.insert("unread", in.unread);
+                return extra;
+            };
             if (a.contains("import_embedded")) {
                 const Id id = Id(a.value("import_embedded").toDouble());
                 const Clip* c = edit::clipById(s, id);
@@ -6042,7 +6066,28 @@ void McpServer::Impl::addTools() {
                 if (!m || m->kind != MediaKind::Video) return fail("import_embedded names a video clip (see montage_project_info)");
                 std::vector<Caption> found;
                 std::string err;
-                if (!readEmbeddedCaptions(m->path, s.fps, found, {}, nullptr, &err)) return fail(QString::fromStdString(err));
+                const bool pictures = a.contains("stream") || (!readEmbeddedCaptions(m->path, s.fps, found, {}, nullptr, &err) &&
+                                                               !imageSubtitleStreams(m->path).empty());
+                if (pictures) {
+                    ImageSubtitleImport in;
+                    if (!readImageSubtitles(m->path, s.fps, in, a.value("stream").toInt(-1), a.value("language").toString().toStdString(), {},
+                                            nullptr, &err))
+                        return fail(QString::fromStdString(err));
+                    CaptionTrack t = in.track;
+                    t.id = l.project.newId();
+                    t.name = "Subtitles - " + c->name;
+                    t.captions = captionsThroughClip(*c, in.track.captions);
+                    if (t.captions.empty()) return fail("None of the clip's subtitles fall within it");
+                    // (Review indices follow the clip's captions only when none were cut away.)
+                    if (t.captions.size() != in.track.captions.size()) in.review.clear();
+                    const int n = int(t.captions.size());
+                    const QString name = QString::fromStdString(t.name), language = QString::fromStdString(t.language);
+                    s.captionTracks.push_back(std::move(t));
+                    save(l);
+                    return ok(QStringLiteral("Read %1 subtitles into \"%2\"").arg(n).arg(name),
+                              reviewed(in, QJsonObject{{"track", int(s.captionTracks.size()) - 1}, {"name", name}, {"captions", n}, {"language", language}}));
+                }
+                if (found.empty()) return fail(QString::fromStdString(err));
                 CaptionTrack t;
                 t.id = l.project.newId();
                 t.name = "CC1 - " + c->name;
@@ -6062,7 +6107,25 @@ void McpServer::Impl::addTools() {
                 const QString path = need(a, "import");
                 QFile in(path);
                 if (!in.open(QIODevice::ReadOnly)) return fail(QStringLiteral("Cannot read %1").arg(path));
-                const std::string data = in.readAll().toStdString();
+                const QString suffix = QFileInfo(path).suffix().toLower();
+                ImageSubtitleFormat pictureFormat;
+                // (Containers of pictures are not read into memory.)
+                const bool container = imageSubtitleFormatFor("." + suffix.toStdString(), pictureFormat) || suffix == "mks" || suffix == "mkv";
+                const std::string data = container ? std::string() : in.readAll().toStdString();
+                if (container || isImscImage(data)) {
+                    ImageSubtitleImport got;
+                    std::string err;
+                    if (!readImageSubtitles(path.toStdString(), s.fps, got, a.value("stream").toInt(-1), a.value("language").toString().toStdString(),
+                                            {}, nullptr, &err))
+                        return fail(QString::fromStdString(err));
+                    got.track.id = l.project.newId();
+                    const int n = int(got.track.captions.size());
+                    const QString name = QString::fromStdString(got.track.name), language = QString::fromStdString(got.track.language);
+                    s.captionTracks.push_back(got.track);
+                    save(l);
+                    return ok(QStringLiteral("Read %1 subtitles into \"%2\"").arg(n).arg(name),
+                              reviewed(got, QJsonObject{{"track", int(s.captionTracks.size()) - 1}, {"name", name}, {"captions", n}, {"language", language}}));
+                }
                 std::vector<Caption> caps;
                 std::string err;
                 if (!parseSubtitles(data, s.fps, caps, &err)) return fail(QString::fromStdString(err));
@@ -6092,7 +6155,22 @@ void McpServer::Impl::addTools() {
                 if (!t && !s.captionTracks.empty()) t = &s.captionTracks.front();
             }
             if (!t) return fail("The sequence has no captions");
-            const std::string ext = "." + QFileInfo(path).suffix().toStdString();
+            const std::string ext = "." + QFileInfo(path).suffix().toLower().toStdString();
+            ImageSubtitleFormat pictureFormat = ImageSubtitleFormat::Pgs;
+            const bool pictures = a.contains("format") ? true : imageSubtitleFormatFor(ext, pictureFormat) || ext == ".mks";
+            if (a.contains("format") && !imageSubtitleFormatFromId(a.value("format").toString().toStdString(), pictureFormat))
+                throw ArgError{"\"format\" is pgs, dvb, vobsub or imsc_image"};
+            if (pictures) {
+                std::string err;
+                ImageSubtitleResult r;
+                if (!writeImageSubtitles(*t, s, path.toStdString(), pictureFormat, &err, a.value("width").toInt(0), a.value("height").toInt(0), &r))
+                    return fail(QString::fromStdString(err));
+                QJsonArray files;
+                for (const std::string& f : r.files) files.append(QString::fromStdString(f));
+                return ok(QStringLiteral("Wrote %1 subtitles as %2 to %3").arg(r.subtitles).arg(imageSubtitleFormatId(pictureFormat)).arg(path),
+                          QJsonObject{{"path", path}, {"format", imageSubtitleFormatId(pictureFormat)}, {"captions", r.subtitles},
+                                      {"colours", r.colours}, {"files", files}});
+            }
             if (!captionFormatKnown(ext))
                 throw ArgError{QStringLiteral("Unknown caption format \"%1\": use .srt, .vtt, .scc, .mcc, .ttml, .stl or .ass")
                                    .arg(QString::fromStdString(ext))};
@@ -9073,7 +9151,8 @@ void McpServer::Impl::addTools() {
                 "roles":{"type":"array","items":{"type":"string"},"description":"The roles heard (default: the mix as it plays)"}},"required":["language"]}},
             "captions":{"type":"boolean","default":true,"description":"Caption tracks as IMSC 1.1 timed text"},
             "texts":{"type":"array","description":"Which caption tracks, and as what (default: all as subtitles)","items":{"type":"object","properties":{
-                "track":{"type":"string","description":"The caption track's name"},"kind":{"type":"string","enum":["subtitles","captions","forced"],"default":"subtitles"}},"required":["track"]}},
+                "track":{"type":"string","description":"The caption track's name"},"kind":{"type":"string","enum":["subtitles","captions","forced"],"default":"subtitles"},
+                "image":{"type":"boolean","default":false,"description":"As pictures in the track's style (IMSC 1.1 Image profile), not text"}},"required":["track"]}},
             "supplement_of":{"type":"string","description":"An earlier IMF package's folder: make a supplemental package of it (beside it: `folder` must be the folder holding it)"},
             "original_sequence":{"type":"string","description":"Supplemental: the sequence the earlier package was mastered from (default: the picture has not changed)"}},
             "required":["project","folder"]})json",
@@ -9111,6 +9190,7 @@ void McpServer::Impl::addTools() {
                     if (QString::fromStdString(c.name) == name) t.track = c.id;
                 if (!t.track) throw ArgError{QStringLiteral("No caption track named \"%1\"").arg(name)};
                 t.kind = str(o, "kind", "subtitles").toStdString();
+                t.image = o.value("image").toBool();
                 st.texts.push_back(t);
             }
             if (a.contains("supplement_of")) st.supplementOf = absolute(need(a, "supplement_of")).toStdString();
@@ -9229,6 +9309,7 @@ void McpServer::Impl::addTools() {
             "stems":{"type":"string","enum":["none","tracks","buses","roles"],"default":"none",
                 "description":"Also write 24-bit WAV stems beside the output, one per audio track, per bus (plus Main) or per audio role"},
             "captions":{"type":"string","enum":["none","burn","embed","both"],"default":"none","description":"The visible caption track, burned into the picture and/or embedded as a subtitle stream"},
+            "caption_images":{"type":"string","enum":["pgs","dvb","dvd"],"description":"Embedded captions as pictures in the track's style: PGS or DVD in Matroska, DVB in Matroska or MPEG-TS (MPEG-TS takes DVB anyway)"},
             "trim_target":{"type":"string","description":"A trim pass (montage_trim): deliver that target of the sequence (its space and peak, each shot's trim) instead of the master"},
             "hdr10plus":{"type":"boolean","default":false,"description":"PQ exports: dynamic HDR metadata (SMPTE ST 2094-40), scene by scene, in HEVC and AV1 video and as name.hdr10plus.json beside the file (measured first unless montage_measure_hdr's analysis still matches the cut)"},
             "adaptive_hdr":{"type":"boolean","default":false,"description":"PQ and HLG exports: adaptive HDR metadata (SMPTE ST 2094-50) in HEVC and AV1 video, scene by scene: the reference white, the scene's headroom and the gain curve to its SDR rendition (the sequence's SDR trim, else Montage's own mapping), so any display tones it down as the grade did (fitted first unless montage_measure_hdr's analysis still matches)"},
@@ -9387,6 +9468,11 @@ void McpServer::Impl::addTools() {
             if (!st.trimTarget.empty() && !findTrimTarget(s, st.trimTarget))
                 throw ArgError{QStringLiteral("The sequence has no trim target \"%1\" (montage_trim lists them)").arg(str(a, "trim_target"))};
             st.embedCaptions = cap == "embed" || cap == "both";
+            if (a.contains("caption_images")) {
+                st.captionImages = a.value("caption_images").toString().toStdString();
+                if (st.captionImages != "pgs" && st.captionImages != "dvb" && st.captionImages != "dvd")
+                    throw ArgError{"\"caption_images\" must be pgs, dvb or dvd"};
+            }
             if (st.embedCaptions && a.value("all_captions").toBool())
                 for (const CaptionTrack& t : s.captionTracks)
                     if (t.name != kDescriptionTrackName) st.extraCaptions.push_back(t.id);  // descriptions are spoken, not subtitles

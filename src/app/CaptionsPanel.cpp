@@ -39,6 +39,8 @@
 #include "EditorState.h"
 #include "core/ProjectIO.h"
 #include "ModelPacks.h"
+#include "media/TextReader.h"
+#include "render/ImageSubtitles.h"
 #include "media/LipSync.h"
 #include "SpeechDialog.h"
 #include "core/EditOps.h"
@@ -794,9 +796,14 @@ bool CaptionsPanel::importFile(const QString& path, QString* error) {
         if (error) *error = tr("Cannot read %1").arg(path);
         return false;
     }
+    const std::string data = f.readAll().toStdString();
+    const QString suffix = QFileInfo(path).suffix().toLower();
+    ImageSubtitleFormat pictures;
+    if (imageSubtitleFormatFor(suffix.toStdString(), pictures) || suffix == "mks" || suffix == "mkv" || isImscImage(data))
+        return importPictures(path, error);
     std::vector<Caption> caps;
     std::string err;
-    if (!parseSubtitles(f.readAll().toStdString(), s->fps, caps, &err)) {
+    if (!parseSubtitles(data, s->fps, caps, &err)) {
         if (error) *error = QString::fromStdString(err);
         return false;
     }
@@ -817,7 +824,62 @@ bool CaptionsPanel::importFile(const QString& path, QString* error) {
     return true;
 }
 
-bool CaptionsPanel::exportFile(const QString& path, QString* error) const {
+bool CaptionsPanel::importPictures(const QString& path, QString* error) {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    if (!ensureModelPack(this, ocrModel(), tr("Import Captions"),
+                         tr("Subtitles that are pictures (Blu-ray, DVB, DVD) are read with PP-OCR (PaddlePaddle, Apache-2.0), which runs on this computer.")))
+        return false;
+    // Reading every picture takes a while: in the background, with progress.
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    auto done = std::make_shared<std::atomic<double>>(0.0);
+    QProgressDialog progress(tr("Reading the subtitles…"), tr("Cancel"), 0, 1000, this);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(400);
+    connect(&progress, &QProgressDialog::canceled, &progress, [cancel] { *cancel = true; });
+    QTimer tick;
+    connect(&tick, &QTimer::timeout, &progress, [&progress, done] { progress.setValue(int(*done * 1000)); });
+    tick.start(100);
+    using Out = std::pair<ImageSubtitleImport, std::string>;
+    QFutureWatcher<Out> watcher;
+    QEventLoop wait;
+    connect(&watcher, &QFutureWatcher<Out>::finished, &wait, &QEventLoop::quit);
+    const std::string file = path.toStdString();
+    const Rational fps = s->fps;
+    watcher.setFuture(QtConcurrent::run([file, fps, cancel, done] {
+        Out out;
+        std::string err;
+        if (!readImageSubtitles(file, fps, out.first, -1, {}, [done](double f) { *done = f; }, cancel.get(), &err))
+            out.second = err.empty() ? "Cancelled" : err;
+        return out;
+    }));
+    if (!watcher.isFinished()) wait.exec();
+    tick.stop();
+    disconnect(&progress, &QProgressDialog::canceled, nullptr, nullptr);
+    progress.close();
+    const Out r = watcher.result();
+    if (*cancel || !r.second.empty()) {
+        if (error) *error = *cancel ? QString() : QString::fromStdString(r.second);
+        return false;
+    }
+    Id id = 0;
+    state_->edit(tr("Import Captions"), [&](Project& p, Sequence& sq) {
+        CaptionTrack t = r.first.track;
+        t.id = id = p.newId();
+        sq.captionTracks.push_back(std::move(t));
+        return true;
+    });
+    setCurrentTrack(id);
+    // The words read with little confidence are underlined by the spell check: say how many.
+    const int n = int(r.first.track.captions.size()), unsure = int(r.first.review.size());
+    state_->message(unsure ? tr("%n subtitle(s) read from their pictures; %1 word(s) to check (underlined)", "", n).arg(unsure)
+                           : tr("%n subtitle(s) read from their pictures", "", n),
+                    6000);
+    lastReview_ = r.first.review;
+    return true;
+}
+
+bool CaptionsPanel::exportFile(const QString& path, QString* error, const QString& pictures) const {
     const CaptionTrack* t = track();
     const Sequence* s = state_->sequence();
     if (!t || !s) {
@@ -825,6 +887,15 @@ bool CaptionsPanel::exportFile(const QString& path, QString* error) const {
         return false;
     }
     const std::string suffix = QFileInfo(path).suffix().toLower().toStdString();
+    ImageSubtitleFormat format = ImageSubtitleFormat::Pgs;
+    if ((!pictures.isEmpty() && imageSubtitleFormatFromId(pictures.toStdString(), format)) || imageSubtitleFormatFor(suffix, format) || suffix == "mks") {
+        std::string err;
+        if (!writeImageSubtitles(*t, *s, path.toStdString(), format, &err)) {
+            if (error) *error = QString::fromStdString(err);
+            return false;
+        }
+        return true;
+    }
     const std::string text = exportCaptions(*t, *s, captionFormatKnown(suffix) ? suffix : "srt");
     QSaveFile f(path);
     if (!f.open(QIODevice::WriteOnly) || f.write(text.data(), qint64(text.size())) != qint64(text.size()) || !f.commit()) {
@@ -837,7 +908,8 @@ bool CaptionsPanel::exportFile(const QString& path, QString* error) const {
 void CaptionsPanel::importDialog() {
     QSettings settings = appSettings();
     const QString path = QFileDialog::getOpenFileName(this, tr("Import Captions"), settings.value("captions/dir").toString(),
-                                                      tr("Captions (*.srt *.vtt *.scc *.mcc *.ttml *.xml *.dfxp *.stl *.ass *.ssa);;All files (*)"));
+                                                      tr("Captions (*.srt *.vtt *.scc *.mcc *.ttml *.xml *.dfxp *.stl *.ass *.ssa);;"
+                                                         "Subtitle pictures, read by OCR (*.sup *.idx *.mks *.mkv *.ts *.m2ts *.ttml);;All files (*)"));
     if (path.isEmpty()) return;
     settings.setValue("captions/dir", QFileInfo(path).absolutePath());
     QString err;
@@ -855,7 +927,12 @@ void CaptionsPanel::exportDialog() {
                                                     {tr("MCC captions, CEA-608 and CTA-708 (*.mcc)"), ".mcc"},
                                                     {tr("TTML, IMSC 1.1 (*.ttml *.xml *.dfxp)"), ".ttml"},
                                                     {tr("EBU STL (*.stl)"), ".stl"},
-                                                    {tr("Advanced SubStation Alpha (*.ass *.ssa)"), ".ass"}};
+                                                    {tr("Advanced SubStation Alpha (*.ass *.ssa)"), ".ass"},
+                                                    {tr("Blu-ray subtitle pictures, PGS (*.sup)"), ".sup"},
+                                                    {tr("Blu-ray subtitle pictures in Matroska (*.mks)"), ".mks"},
+                                                    {tr("DVB subtitle pictures in MPEG-TS (*.ts)"), ".ts"},
+                                                    {tr("DVD subtitle pictures, VobSub (*.idx *.sub)"), ".idx"},
+                                                    {tr("IMSC 1.1 Image, TTML with PNGs (*.ttml)"), ".ttml"}};
     QStringList filters;
     for (const auto& f : formats) filters << f.first;
     QString filter = filters.front();
@@ -869,7 +946,8 @@ void CaptionsPanel::exportDialog() {
             if (f.first == filter) path += f.second;
     settings.setValue("captions/dir", QFileInfo(path).absolutePath());
     QString err;
-    if (!exportFile(path, &err)) QMessageBox::warning(this, tr("Export Captions"), err);
+    if (!exportFile(path, &err, filter == formats.back().first ? QStringLiteral("imsc_image") : QString()))
+        QMessageBox::warning(this, tr("Export Captions"), err);
     else state_->message(tr("Exported %1").arg(QFileInfo(path).fileName()));
 }
 

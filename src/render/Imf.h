@@ -46,6 +46,8 @@ struct ImfSound {
 struct ImfText {
     Id track = 0;                    // Sequence::captionTracks id
     std::string kind = "subtitles";  // "subtitles", "captions" (for the deaf and hard of hearing) or "forced" (forced narrative)
+    // As pictures in the track's style (IMSC 1.1 Image profile: a PNG a caption, in the track file), not text.
+    bool image = false;
 };
 
 struct ImfSettings {

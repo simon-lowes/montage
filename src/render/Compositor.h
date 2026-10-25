@@ -16,6 +16,7 @@
 #include "media/Image.h"
 
 class QImage;
+class QPoint;
 
 namespace montage {
 
@@ -93,6 +94,9 @@ bool clipFrameSize(const Project& p, const Sequence& seq, const Clip& c, double&
 // Captions are styled in SDR; `space` converts them into the picture's colour space.
 struct ColorSpace;
 void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const ColorSpace* space = nullptr);
+// The caption on screen at frame t as drawCaption draws it on a `width` x `height` frame: just its area (premultiplied
+// RGBA, null when none is on screen), placed at `origin`.
+QImage captionImage(const CaptionTrack& track, FrameTime t, int width, int height, QPoint* origin = nullptr);
 
 // Burn-ins (timecode, clip name, text, watermark) drawn over frame t of `seq`
 // in `img` (the whole frame, in colour space `space`; null = Rec.709).

@@ -5,6 +5,7 @@
 #include "LiveLink.h"
 #include "render/FilmLists.h"
 #include "render/PaperworkOutput.h"
+#include "render/ImageSubtitles.h"
 #include "render/DcpSecurity.h"
 #include "render/OGraf.h"
 #include "render/Ofx.h"
@@ -5923,12 +5924,41 @@ int MainWindow::importEmbeddedCaptions() {
                 if (c.mediaId && c.start <= state_->playhead() && state_->playhead() < c.end()) clip = &c;
     const MediaItem* m = clip ? state_->project().findMedia(clip->mediaId) : nullptr;
     if (!m || m->kind != MediaKind::Video) {
-        state_->message(tr("Select a video clip whose file carries closed captions"));
+        state_->message(tr("Select a video clip whose file carries closed captions or subtitles"));
         return 0;
     }
     const std::string path = m->path;
     const Rational fps = s->fps;
     const Clip target = *clip;
+    // Subtitle pictures (a disc's or a broadcast's PGS, DVB or DVD subtitles) are read off them by OCR.
+    if (!imageSubtitleStreams(path).empty()) {
+        if (!ensureModelPack(this, ocrModel(), tr("Import Embedded Captions"),
+                             tr("Subtitles that are pictures are read with PP-OCR (PaddlePaddle, Apache-2.0), which runs on this computer.")))
+            return 0;
+        ImageSubtitleImport in;
+        if (!runWithProgress(this, state_, tr("Reading the subtitles..."), [&](const auto& progress, const auto* cancel, std::string* e) {
+                return readImageSubtitles(path, fps, in, -1, {}, [&](double f) { progress(f); }, cancel, e);
+            }))
+            return 0;
+        const std::vector<Caption> placed = captionsThroughClip(target, in.track.captions);
+        if (placed.empty()) {
+            state_->message(tr("None of the clip's subtitles fall within it"));
+            return 0;
+        }
+        state_->edit(tr("Import Embedded Captions"), [&](Project& p, Sequence& sq) {
+            CaptionTrack t = in.track;
+            t.id = p.newId();
+            t.name = "Subtitles - " + target.name;
+            t.captions = placed;
+            sq.captionTracks.push_back(std::move(t));
+            return true;
+        });
+        state_->message(in.review.empty() ? tr("%n subtitle(s) read from their pictures", "", int(placed.size()))
+                                          : tr("%n subtitle(s) read from their pictures; %1 word(s) to check (underlined)", "", int(placed.size()))
+                                                .arg(in.review.size()),
+                        6000);
+        return int(placed.size());
+    }
     std::vector<Caption> found;
     if (!runWithProgress(this, state_, tr("Reading closed captions..."), [&](const auto& progress, const auto* cancel, std::string* e) {
             return readEmbeddedCaptions(path, fps, found, progress, cancel, e);
@@ -6983,9 +7013,10 @@ void MainWindow::exportImfDialog() {
     soundBox->addLayout(soundButtons);
     form->addRow(tr("Sound:"), soundBox);
     // Each caption track as timed text: subtitles, captions for the deaf and hard of hearing, forced narrative, or left out.
-    auto* texts = new QTableWidget(0, 2, &dlg);
+    auto* texts = new QTableWidget(0, 3, &dlg);
     texts->setObjectName(QStringLiteral("imfTexts"));
-    texts->setHorizontalHeaderLabels({tr("Caption track"), tr("As")});
+    texts->setHorizontalHeaderLabels({tr("Caption track"), tr("As"), tr("Pictures")});
+    texts->horizontalHeaderItem(2)->setToolTip(tr("As pictures drawn in the track's style (IMSC 1.1 Image profile), not text"));
     texts->horizontalHeader()->setStretchLastSection(true);
     texts->verticalHeader()->hide();
     for (const CaptionTrack& t : s->captionTracks) {
@@ -7003,6 +7034,10 @@ void MainWindow::exportImfDialog() {
         k->addItem(tr("Left out"), QString());
         if (t.captions.empty()) k->setCurrentIndex(k->count() - 1);  // (nothing to send)
         texts->setCellWidget(row, 1, k);
+        auto* pictures = new QTableWidgetItem;
+        pictures->setFlags(Qt::ItemIsEnabled | Qt::ItemIsUserCheckable);
+        pictures->setCheckState(Qt::Unchecked);
+        texts->setItem(row, 2, pictures);
     }
     if (texts->rowCount()) {
         texts->setMinimumHeight(std::min(160, 40 + 28 * texts->rowCount()));
@@ -7095,7 +7130,9 @@ void MainWindow::exportImfDialog() {
     if (!st.sounds.empty()) st.language = st.sounds.front().language;
     for (int row = 0; row < texts->rowCount(); ++row) {
         const QString kind = static_cast<QComboBox*>(texts->cellWidget(row, 1))->currentData().toString();
-        if (!kind.isEmpty()) st.texts.push_back({Id(texts->item(row, 0)->data(Qt::UserRole).toULongLong()), kind.toStdString()});
+        if (!kind.isEmpty())
+            st.texts.push_back({Id(texts->item(row, 0)->data(Qt::UserRole).toULongLong()), kind.toStdString(),
+                                texts->item(row, 2) && texts->item(row, 2)->checkState() == Qt::Checked});
     }
     st.captions = !st.texts.empty();
     if (supplemental->isChecked()) {

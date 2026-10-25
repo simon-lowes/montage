@@ -202,7 +202,10 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     captions_->addItem(tr("Burn into the picture"), 1);
     captions_->addItem(tr("Embed as a subtitle track"), 2);
     captions_->addItem(tr("Burn in and embed"), 3);
-    captions_->setCurrentIndex(std::clamp(appSettings().value("export/captions", 0).toInt(), 0, 3));
+    // Pictures drawn in the track's style, as Blu-ray and broadcast deliveries take them (Matroska; DVB in MPEG-TS too).
+    captions_->addItem(tr("Embed as subtitle pictures (PGS)"), 2 | 4);
+    captions_->addItem(tr("Embed as DVB subtitle pictures"), 2 | 8);
+    captions_->setCurrentIndex(std::clamp(appSettings().value("export/captions", 0).toInt(), 0, captions_->count() - 1));
     form->addRow(tr("Captions:"), captions_);
     allCaptions_ = new QCheckBox(tr("Every caption track (a stream each)"), form_);
     allCaptions_->setObjectName(QStringLiteral("exportAllCaptions"));
@@ -1030,6 +1033,7 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         const int mode = captions_->currentData().toInt();
         s.burnInCaptions = mode & 1;
         s.embedCaptions = mode & 2;
+        s.captionImages = mode & 4 ? "pgs" : mode & 8 ? "dvb" : "";
     }
     settings.setValue("export/captions", captions_->currentIndex());
     if (allCaptions_->isEnabled() && allCaptions_->isChecked() && state_->sequence())

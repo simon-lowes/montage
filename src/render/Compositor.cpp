@@ -2405,15 +2405,15 @@ bool sequenceToClipFrame(const Project& p, const Sequence& seq, const Clip& c, F
     return true;
 }
 
-void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const ColorSpace* space) {
+QImage captionImage(const CaptionTrack& track, FrameTime t, int width, int height, QPoint* origin) {
     const Caption* cap = captionAt(track, t);
-    if (!cap || img.width < 8 || img.height < 8) return;
+    if (!cap || width < 8 || height < 8) return QImage();
     const CaptionStyle& st = track.style;
     const int anim = std::clamp(st.animation, 0, 4);
     const int spoken = anim ? captionWordAt(*cap, t) : -1;  // the word being said
     QFont f(QString::fromStdString(st.font));
     // One word at a time is shown large.
-    const double px = std::max(4.0, st.size * img.height * (anim == 4 ? 1.8 : 1.0));
+    const double px = std::max(4.0, st.size * height * (anim == 4 ? 1.8 : 1.0));
     f.setPixelSize(int(std::lround(px)));
     f.setBold(st.bold || anim == 4);
     f.setItalic(cap->italic);
@@ -2448,7 +2448,7 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const Color
         const Word* w = nullptr;
         for (const Word& x : words)
             if (x.index == spoken) w = &x;
-        if (!w) return;
+        if (!w) return QImage();
         lines = QStringList{w->text};
         words = {{w->text, 0, w->index, 0, w->w}};
     }
@@ -2458,21 +2458,21 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const Color
     const double blockH = lineH * double(lines.size());
     // Where the style puts captions, or at the top (as far from it as the style is from the bottom),
     // or in the middle; centred, or lined up inside the graphics-safe margins (EBU R95: 5 %).
-    const double fromBottom = std::clamp(st.position, 0.05, 1.0) * img.height;
-    const double bottom = cap->vertical == kCaptionTop      ? std::min(img.height - fromBottom, img.height / 2.0 - blockH / 2) + blockH
-                          : cap->vertical == kCaptionMiddle ? (img.height + blockH) / 2
+    const double fromBottom = std::clamp(st.position, 0.05, 1.0) * height;
+    const double bottom = cap->vertical == kCaptionTop      ? std::min(height - fromBottom, height / 2.0 - blockH / 2) + blockH
+                          : cap->vertical == kCaptionMiddle ? (height + blockH) / 2
                                                             : fromBottom;
-    const double margin = img.width * 0.05;
+    const double margin = width * 0.05;
     auto leftOf = [&](double w) {
-        return cap->align == kCaptionLeft ? margin : cap->align == kCaptionRight ? img.width - margin - w : img.width / 2.0 - w / 2;
+        return cap->align == kCaptionLeft ? margin : cap->align == kCaptionRight ? width - margin - w : width / 2.0 - w / 2;
     };
     const double grow = (anim == 3 ? 0.25 : 0.0) + std::max(0.0, st.shadow) + std::max(0.0, st.outline);  // room for a popped word, shadow, outline
     // Render only the caption's area, then blend it over the frame.
     const int x0 = std::max(0, int(std::floor(leftOf(blockW) - padX - 2 - grow * px)));
-    const int x1 = std::min(img.width, int(std::ceil(leftOf(blockW) + blockW + padX + 2 + grow * px)));
+    const int x1 = std::min(width, int(std::ceil(leftOf(blockW) + blockW + padX + 2 + grow * px)));
     const int y0 = std::max(0, int(std::floor(bottom - blockH - padY - 2 - grow * px)));
-    const int y1 = std::min(img.height, int(std::ceil(bottom + padY + 2 + grow * px)));
-    if (x1 <= x0 || y1 <= y0) return;
+    const int y1 = std::min(height, int(std::ceil(bottom + padY + 2 + grow * px)));
+    if (x1 <= x0 || y1 <= y0) return QImage();
     QImage qi(x1 - x0, y1 - y0, QImage::Format_RGBA8888_Premultiplied);
     qi.fill(Qt::transparent);
     {
@@ -2544,6 +2544,15 @@ void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const Color
         pa.fillPath(text, col(st.textR, st.textG, st.textB, 1));
         pa.fillPath(said, col(st.hiR, st.hiG, st.hiB, 1));
     }
+    if (origin) *origin = QPoint(x0, y0);
+    return qi;
+}
+
+void drawCaption(Image& img, const CaptionTrack& track, FrameTime t, const ColorSpace* space) {
+    QPoint at;
+    const QImage qi = captionImage(track, t, img.width, img.height, &at);
+    if (qi.isNull()) return;
+    const int x0 = at.x(), y0 = at.y(), x1 = x0 + qi.width(), y1 = y0 + qi.height();
     if (space && space->id != rec709Space().id) {
         // Caption colours are SDR: convert the rendered patch into the picture's space.
         Image patch(qi.width(), qi.height());

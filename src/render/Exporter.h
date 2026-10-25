@@ -67,7 +67,10 @@ struct ExportSettings {
     double spatialFieldOfView = 60;   // degrees
     // Captions from the sequence's visible caption track (or captionTrack):
     bool burnInCaptions = false;         // drawn into the picture
-    bool embedCaptions = false;          // as a subtitle stream (MP4/MOV mov_text, MKV SubRip, WebM WebVTT)
+    bool embedCaptions = false;          // as a subtitle stream (MP4/MOV mov_text, MKV SubRip, WebM WebVTT; MPEG-TS DVB pictures)
+    // Embedded as pictures (render/ImageSubtitles.h) drawn in the track's style: "pgs" (Blu-ray) or "dvd" in Matroska,
+    // "dvb" in Matroska or MPEG-TS. "" = as text where the file type takes text.
+    std::string captionImages;
     Id captionTrack = 0;                 // 0 = the first visible caption track
     // The caption track as CEA-608 line-21 captions inside the video (A/53, as US broadcast and streaming platforms
     // take them): H.264 and HEVC only.
