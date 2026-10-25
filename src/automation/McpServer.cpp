@@ -97,6 +97,7 @@
 #include "core/ScriptCut.h"
 #include "render/LinedScript.h"
 #include "render/FilmLists.h"
+#include "render/PaperworkOutput.h"
 #include "core/Ambisonics.h"
 #include "media/Sofa.h"
 #include "core/Surround.h"
@@ -5073,6 +5074,107 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("%1 event(s), %2 optical(s), %3 dupe(s) in %4").arg(lists.events.size()).arg(lists.opticals.size())
                           .arg(lists.dupes.size()).arg(QString::fromLatin1(g.name)),
                       result);
+        });
+
+    add("montage_paperwork", "Delivery paperwork: cue sheet, dialogue list, as-broadcast script, CCSL",
+        "The paperwork a delivery asks for, from the cut. cue_sheet: the music heard (clips with the Music role, or whose "
+        "media is marked or tagged as music), a cue per piece played on (gaps under a second bridged), each timed in, out "
+        "and by duration, with its title, composer, publisher, society, library, catalogue number, ISRC and ISWC (the "
+        "media's own cue fields over its file's tags and the sound library's index) and its use; `suggest_vocal` tells "
+        "unmarked cues vocal or instrumental from the vocal stem. dialogue_list and as_broadcast: the transcript by "
+        "speaker a line at a time, each timed to the dialogue heard (`refine`), with a heading where the logged scene "
+        "changes and, with `on_screen_text`, the text read from each shot. ccsl: shot by shot, footage in feet and frames "
+        "(`gauge`), shot size from the largest face (CU, MS, WS; faces must have been found), description, dialogue and "
+        "the first caption track's subtitles. `path` writes it as .xlsx, .csv, .pdf or (the dialogue lists) .txt. "
+        "action set_cue sets a media item's cue fields (`fields`: title, composer, publisher, society, library, "
+        "catalogue, isrc, iswc, use background|visual, vocal vocal|instrumental, theme \"main title\"|\"end title\", "
+        "music yes|no; \"\" clears one).",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "sequence":{"type":"string","description":"The sequence's name (default: the active one)"},
+            "list":{"type":"string","enum":["cue_sheet","dialogue_list","as_broadcast","ccsl"]},
+            "action":{"type":"string","enum":["list","set_cue"],"description":"Default list"},
+            "media":{"type":"string","description":"set_cue: the media's name or path"},
+            "fields":{"type":"object","description":"set_cue: field to value"},
+            "gauge":{"type":"string","enum":["35mm-4perf","35mm-3perf","35mm-2perf","16mm","65mm-5perf"]},
+            "refine":{"type":"boolean","description":"Time lines to the dialogue heard (default true)"},
+            "on_screen_text":{"type":"boolean","description":"Read on-screen text into the dialogue list (needs the OCR model)"},
+            "suggest_vocal":{"type":"boolean","description":"Tell unmarked cues vocal or instrumental (needs the stems model)"},
+            "path":{"type":"string","description":"Write it here (.xlsx, .csv, .pdf; .txt for the dialogue lists)"}},
+            "required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            if (str(a, "action") == QLatin1String("set_cue")) {
+                MediaItem& m = projectMedia(l.project, need(a, "media"));
+                const QJsonObject fields = a.value("fields").toObject();
+                if (fields.isEmpty()) throw ArgError{"set_cue needs \"fields\""};
+                const std::map<std::string, std::vector<std::string>> choices{
+                    {"use", {"background", "visual"}}, {"vocal", {"vocal", "instrumental"}},
+                    {"theme", {"main title", "end title"}}, {"music", {"yes", "no"}}};
+                for (auto it = fields.begin(); it != fields.end(); ++it) {
+                    const std::string key = it.key().toStdString(), value = it.value().toString().trimmed().toStdString();
+                    const bool known = std::find(std::begin(kCueFields), std::end(kCueFields), key) != std::end(kCueFields);
+                    auto choice = choices.find(key);
+                    if (!known && choice == choices.end()) throw ArgError{QStringLiteral("No cue field \"%1\"").arg(it.key())};
+                    if (choice != choices.end() && !value.empty() &&
+                        std::find(choice->second.begin(), choice->second.end(), value) == choice->second.end())
+                        throw ArgError{QStringLiteral("\"%1\" is not a %2").arg(QString::fromStdString(value), it.key())};
+                    if (value.empty())
+                        m.metadata.erase(cueMetadataKey(key));
+                    else
+                        m.metadata[cueMetadataKey(key)] = value;
+                }
+                save(l);
+                QJsonObject now;
+                for (const auto& [k, v] : m.metadata)
+                    if (k.rfind("cue.", 0) == 0) now[QString::fromStdString(k.substr(4))] = QString::fromStdString(v);
+                return ok(QStringLiteral("Cue fields of %1 set").arg(QString::fromStdString(m.name)), QJsonObject{{"fields", now}});
+            }
+            const Sequence* s = &l.seq();
+            if (a.contains("sequence")) {
+                s = nullptr;
+                for (const Sequence& sq : l.project.sequences)
+                    if (QString::fromStdString(sq.name) == str(a, "sequence")) s = &sq;
+                if (!s) throw ArgError{QStringLiteral("No sequence named \"%1\"").arg(str(a, "sequence"))};
+            }
+            PaperworkList list;
+            if (!paperworkListFromId(need(a, "list").toStdString(), list)) throw ArgError{QStringLiteral("No list \"%1\"").arg(str(a, "list"))};
+            PaperworkOptions o;
+            o.gauge = str(a, "gauge").toStdString();
+            o.refineTimes = a.value("refine").toBool(true);
+            o.onScreenText = a.value("on_screen_text").toBool();
+            o.suggestVocal = a.value("suggest_vocal").toBool();
+            XlsxSheet table;
+            std::string script, err;
+            QJsonObject result{{"list", QString::fromLatin1(paperworkListId(list))}};
+            if (a.contains("path")) {
+                const QString file = absolute(need(a, "path"));
+                if (!writePaperwork(l.project, *s, list, file.toStdString(), o, &err, &table)) return fail(QString::fromStdString(err));
+                result["path"] = file;
+            } else if (!buildPaperwork(l.project, *s, list, o, table, &script, &err)) {
+                return fail(QString::fromStdString(err));
+            }
+            // The rows as objects, keyed by their column (lower case, words joined by _).
+            QJsonArray rows;
+            if (!table.rows.empty()) {
+                std::vector<QString> keys;
+                for (const XlsxCell& c : table.rows.front()) {
+                    QString k = QString::fromStdString(c.text).toLower();
+                    k.replace(QLatin1Char(' '), QLatin1Char('_'));
+                    keys.push_back(k == QLatin1String("#") ? QStringLiteral("number") : k);
+                }
+                for (size_t r = 1; r < table.rows.size(); ++r) {
+                    QJsonObject row;
+                    for (size_t c = 0; c < table.rows[r].size() && c < keys.size(); ++c) {
+                        const XlsxCell& cell = table.rows[r][c];
+                        if (cell.number) row[keys[c]] = cell.value;
+                        else if (!cell.text.empty()) row[keys[c]] = QString::fromStdString(cell.text);
+                    }
+                    rows.append(row);
+                }
+            }
+            result["rows"] = rows;
+            if (list == PaperworkList::AsBroadcast && !script.empty()) result["script"] = QString::fromStdString(script);
+            return ok(QStringLiteral("%1: %2 row(s)").arg(QString::fromLatin1(paperworkListName(list))).arg(rows.size()), result);
         });
 
     add("montage_adr", "ADR cue list and takes",

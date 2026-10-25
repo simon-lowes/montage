@@ -212,6 +212,9 @@
 #include "render/Clf.h"
 #include "render/AudioFx.h"
 #include "render/FilmLists.h"
+#include "render/PaperworkOutput.h"
+#include "media/MusicTags.h"
+#include "core/Xlsx.h"
 #include "core/FilmCount.h"
 #include "render/Compositor.h"
 #include "render/Exporter.h"
@@ -813,6 +816,54 @@ std::vector<float> testSong(int rate, double lead, const std::vector<int>& barCh
 }
 
 // 16-bit mono WAV.
+// A mono 16-bit WAV with music tags: ID3v2.4 text frames (TIT2, TCOM...) in an "id3 " chunk and iXML USER fields.
+bool writeTaggedWav(const std::string& path, const std::vector<float>& x, int rate, const std::vector<std::pair<std::string, std::string>>& id3,
+                    const std::vector<std::pair<std::string, std::string>>& ixmlUser) {
+    auto le32 = [](std::string& s, uint32_t v) {
+        for (int i = 0; i < 4; ++i) s += char((v >> (8 * i)) & 0xff);
+    };
+    auto syncsafe = [](std::string& s, uint32_t v) {
+        for (int i = 3; i >= 0; --i) s += char((v >> (7 * i)) & 0x7f);
+    };
+    std::string body = "WAVE";
+    auto chunk = [&](const char* id, const std::string& data) {
+        body += id;
+        le32(body, uint32_t(data.size()));
+        body += data;
+        if (data.size() % 2) body += '\0';
+    };
+    std::string fmt;
+    le32(fmt, 0x00010001), le32(fmt, uint32_t(rate)), le32(fmt, uint32_t(rate) * 2), le32(fmt, 0x00100002);
+    chunk("fmt ", fmt);
+    if (!id3.empty()) {
+        std::string frames;
+        for (const auto& [id, text] : id3) {
+            frames += id;
+            syncsafe(frames, uint32_t(text.size() + 1));
+            frames += std::string("\0\0\x03", 3) + text;
+        }
+        std::string tag = std::string("ID3\x04\0\0", 6);
+        syncsafe(tag, uint32_t(frames.size()));
+        chunk("id3 ", tag + frames);
+    }
+    if (!ixmlUser.empty()) {
+        std::string xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><BWFXML><IXML_VERSION>2.10</IXML_VERSION><USER>";
+        for (const auto& [k, v] : ixmlUser) xml += "<" + k + ">" + v + "</" + k + ">";
+        chunk("iXML", xml + "</USER></BWFXML>");
+    }
+    std::string pcm;
+    for (float v : x) {
+        const int16_t s = int16_t(std::lround(std::clamp(v, -1.0f, 1.0f) * 32767));
+        pcm += char(s & 0xff), pcm += char((s >> 8) & 0xff);
+    }
+    chunk("data", pcm);
+    std::string file = "RIFF";
+    le32(file, uint32_t(body.size()));
+    file += body;
+    QFile f(QString::fromStdString(path));
+    return f.open(QIODevice::WriteOnly) && f.write(file.data(), qint64(file.size())) == qint64(file.size());
+}
+
 bool writeMonoWav(const std::string& path, const std::vector<float>& x, int rate) {
     FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) return false;
@@ -18479,6 +18530,299 @@ if ui["pressed"] == "add":
         QVERIFY(loadProject(project.toStdString(), back));
         QCOMPARE(QString::fromStdString(back.media[0].metadata["scene"]), QString("12"));
         QCOMPARE(QString::fromStdString(back.media[0].metadata["take"]), QString("3"));
+    }
+
+    // Calls a tool on a fresh MCP server; the result.
+    QJsonObject callPaperwork(const QJsonObject& arguments) {
+        McpServer server;
+        const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                              {"params", QJsonObject{{"name", "montage_paperwork"}, {"arguments", arguments},
+                                                     {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                           {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+        const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+        return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+    }
+
+    void paperworkCueSheetFromTags() {
+        // Three music files, tagged as libraries and recorders tag them: ID3 frames, iXML USER fields, ID3 again.
+        const int rate = 16000;
+        auto tone = [&](double seconds, double hz) {
+            std::vector<float> x(size_t(seconds * rate));
+            for (size_t i = 0; i < x.size(); ++i) x[i] = float(0.3 * std::sin(2 * M_PI * hz * double(i) / rate));
+            return x;
+        };
+        const std::string opening = path("opening.wav"), chase = path("chase.wav"), sting = path("sting.wav");
+        QVERIFY(writeTaggedWav(opening, tone(20, 220), rate,
+                               {{"TIT2", "Opening Titles"}, {"TCOM", "A. Writer"}, {"TPUB", "Alpha Music"}, {"TSRC", "GBAAA2600001"}}, {}));
+        QVERIFY(writeTaggedWav(chase, tone(20, 330), rate, {},
+                               {{"SONGTITLE", "The Chase"}, {"COMPOSER", "B. Writer"}, {"MUSICPUBLISHER", "Beta Music"}, {"ISRC", "GBBBB2600002"},
+                                {"LIBRARY", "Stock Sounds"}, {"CATALOGUENUMBER", "SS 104"}}));
+        QVERIFY(writeTaggedWav(sting, tone(8, 440), rate, {{"TCOM", "C. Writer"}, {"TPUB", "Gamma Music"}}, {}));
+        auto tags = musicTags(opening);
+        QCOMPARE(QString::fromStdString(tags["title"]), QString("Opening Titles"));
+        QCOMPARE(QString::fromStdString(tags["composer"]), QString("A. Writer"));
+        QCOMPARE(QString::fromStdString(tags["publisher"]), QString("Alpha Music"));
+        QCOMPARE(QString::fromStdString(tags["isrc"]), QString("GBAAA2600001"));
+        tags = musicTags(chase);
+        QCOMPARE(QString::fromStdString(tags["title"]), QString("The Chase"));
+        QCOMPARE(QString::fromStdString(tags["composer"]), QString("B. Writer"));
+        QCOMPARE(QString::fromStdString(tags["library"]), QString("Stock Sounds"));
+        QCOMPARE(QString::fromStdString(tags["catalogue"]), QString("SS 104"));
+
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {24, 1};
+        s.audioTracks.resize(2);
+        std::vector<Id> ids;
+        for (const std::string& f : {opening, chase, sting}) {
+            MediaItem m = probeOrFail(p, f);
+            ids.push_back(m.id);
+            p.media.push_back(m);
+        }
+        auto place = [&](int track, Id media, FrameTime at, FrameTime length, double sourceIn, const char* role) {
+            Clip c;
+            c.id = p.newId();
+            c.mediaId = media;
+            c.start = at;
+            c.duration = length;
+            c.sourceIn = sourceIn;
+            c.role = role;
+            s.audioTracks[size_t(track)].clips.push_back(c);
+        };
+        // The opening cut into twice, the chase run on under a picture cut, the sting with no role.
+        place(0, ids[0], 0, 100, 0, "Music");
+        place(0, ids[0], 100, 100, 200, "Music");
+        place(0, ids[0], 212, 88, 300, "Music");
+        place(0, ids[1], 300, 240, 0, "Music");
+        Clip shot1, shot2;
+        shot1.id = p.newId(), shot1.start = 250, shot1.duration = 150;
+        shot2.id = p.newId(), shot2.start = 400, shot2.duration = 200;
+        s.videoTracks[0].clips = {shot1, shot2};
+        place(1, ids[2], 700, 120, 0, "");
+        const std::vector<MusicCue> cues = musicCues(p, s, musicTagsFor);
+        QCOMPARE(cues.size(), size_t(3));
+        QCOMPARE(cues[0].duration(), FrameTime(300));
+        QCOMPARE(cues[1].duration(), FrameTime(240));
+        QCOMPARE(cues[2].duration(), FrameTime(120));
+        QCOMPARE(QString::fromStdString(cues[0].fields.at("composer")), QString("A. Writer"));
+        QCOMPARE(QString::fromStdString(cues[1].fields.at("publisher")), QString("Beta Music"));
+        QCOMPARE(QString::fromStdString(cues[1].fields.at("isrc")), QString("GBBBB2600002"));
+        QCOMPARE(QString::fromStdString(cues[2].fields.at("composer")), QString("C. Writer"));
+        QCOMPARE(QString::fromStdString(cues[2].fields.at("publisher")), QString("Gamma Music"));
+
+        // Over MCP, written as XLSX: Montage's own reader gives the same rows.
+        const QString project = QString::fromStdString(path("cues.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        const QString xlsx = QString::fromStdString(path("cues.xlsx"));
+        QJsonObject r = callPaperwork({{"project", project}, {"list", "cue_sheet"}, {"path", xlsx}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        const QJsonArray rows = r.value("structuredContent").toObject().value("rows").toArray();
+        QCOMPARE(rows.size(), qsizetype(3));
+        QCOMPARE(rows[0].toObject().value("composer").toString(), QString("A. Writer"));
+        QCOMPARE(rows[1].toObject().value("duration").toString(), QString("00:00:10:00"));
+        QCOMPARE(rows[2].toObject().value("seconds").toDouble(), 5.0);
+        std::vector<XlsxSheet> back;
+        std::string err;
+        QVERIFY2(readXlsxFile(xlsx.toStdString(), back, &err), err.c_str());
+        QCOMPARE(back.size(), size_t(1));
+        Project saved;
+        QVERIFY(loadProject(project.toStdString(), saved));
+        const XlsxSheet expected = cueSheetTable(musicCues(saved, *saved.active(), musicTagsFor), *saved.active());
+        QCOMPARE(back[0].rows.size(), expected.rows.size());
+        for (size_t i = 0; i < expected.rows.size(); ++i)
+            for (size_t c = 0; c < expected.rows[i].size(); ++c) {
+                const XlsxCell got = c < back[0].rows[i].size() ? back[0].rows[i][c] : XlsxCell();
+                QVERIFY2(got == expected.rows[i][c], qPrintable(QStringLiteral("row %1 column %2").arg(i).arg(c)));
+            }
+
+        // The panel's fields, set over MCP, are kept with the media and win over the tags.
+        r = callPaperwork({{"project", project}, {"action", "set_cue"}, {"media", "sting.wav"},
+                           {"fields", QJsonObject{{"use", "visual"}, {"theme", "end title"}, {"publisher", "Delta Music"}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        r = callPaperwork({{"project", project}, {"action", "set_cue"}, {"media", "sting.wav"}, {"fields", QJsonObject{{"use", "loud"}}}});
+        QVERIFY(r.value("isError").toBool());
+        r = callPaperwork({{"project", project}, {"list", "cue_sheet"}});
+        const QJsonObject sting3 = r.value("structuredContent").toObject().value("rows").toArray()[2].toObject();
+        QCOMPARE(sting3.value("use").toString(), QString("visual"));
+        QCOMPARE(sting3.value("theme").toString(), QString("end title"));
+        QCOMPARE(sting3.value("publisher").toString(), QString("Delta Music"));
+
+        // CSV and PDF; text only for the dialogue lists.
+        QVERIFY2(writePaperwork(saved, *saved.active(), PaperworkList::CueSheet, path("cues.csv"), {}, &err), err.c_str());
+        QFile csv(QString::fromStdString(path("cues.csv")));
+        QVERIFY(csv.open(QIODevice::ReadOnly));
+        QVERIFY(csv.readAll().startsWith("Cue,Title,Composer"));
+        QVERIFY2(writePaperwork(saved, *saved.active(), PaperworkList::CueSheet, path("cues.pdf"), {}, &err), err.c_str());
+        QFile pdf(QString::fromStdString(path("cues.pdf")));
+        QVERIFY(pdf.open(QIODevice::ReadOnly));
+        QVERIFY(pdf.read(5) == "%PDF-");
+        QVERIFY(!writePaperwork(saved, *saved.active(), PaperworkList::CueSheet, path("cues.txt"), {}, &err));
+    }
+
+    void paperworkDialogueFromVoices() {
+        const QByteArray whisper = qgetenv("MONTAGE_TEST_WHISPER_MODEL");
+        if (!ttsAvailable() || !ttsModel().installed() || whisper.isEmpty())
+            QSKIP("Set MONTAGE_TTS_MODEL and MONTAGE_TEST_WHISPER_MODEL to test the dialogue list");
+        if (!diarizerAvailable() || !speakerModel().installed()) QSKIP("Set MONTAGE_SPEAKER_MODEL to test the dialogue list");
+        // A scene with two voices, a line each in turn, a second and a half apart.
+        const std::vector<std::pair<const char*, const char*>> said{{"af_heart", "Where were you last night?"},
+                                                                    {"am_michael", "I was out walking by the river."},
+                                                                    {"af_heart", "You never walk anywhere."}};
+        std::vector<float> scene(size_t(kTtsSampleRate / 2), 0.0f);
+        std::vector<std::pair<double, double>> truth;  // each line's first and last sound, seconds into the file
+        std::string err;
+        for (const auto& [voice, text] : said) {
+            std::vector<float> line;
+            QVERIFY2(synthesizeSpeech(text, voice, 1.0, line, &err), err.c_str());
+            float peak = 0;
+            for (float v : line) peak = std::max(peak, std::fabs(v));
+            size_t first = 0, last = line.size();
+            while (first < line.size() && std::fabs(line[first]) < 0.03f * peak) ++first;
+            while (last > first && std::fabs(line[last - 1]) < 0.03f * peak) --last;
+            truth.push_back({double(scene.size() + first) / kTtsSampleRate, double(scene.size() + last) / kTtsSampleRate});
+            scene.insert(scene.end(), line.begin(), line.end());
+            scene.insert(scene.end(), size_t(kTtsSampleRate * 3 / 2), 0.0f);
+        }
+        const std::string wav = path("scene.wav");
+        QVERIFY(writeSpeechWav(wav, scene, &err));
+        TranscribeOptions opts;
+        opts.model = whisper.toStdString();
+        opts.language = "en";
+        opts.speakers = true;
+        opts.speakerCount = 2;
+        Transcript t;
+        QVERIFY2(transcribeMedia(wav, opts, t, {}, nullptr, &err), err.c_str());
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {24, 1};
+        MediaItem m = probeOrFail(p, wav);
+        m.transcript = std::make_shared<const Transcript>(t);
+        p.media.push_back(m);
+        // In the cut a second in.
+        Clip c;
+        c.id = p.newId();
+        c.mediaId = m.id;
+        c.start = 24;
+        c.duration = FrameTime(std::ceil(double(scene.size()) / kTtsSampleRate * 24));
+        c.role = "Dialogue";
+        s.audioTracks[0].clips.push_back(c);
+        std::vector<DialogueEntry> list = dialogueList(p, s);
+        QVERIFY2(refineDialogueTimes(p, s, list, 0.4, &err), err.c_str());
+        std::vector<DialogueEntry> lines;
+        for (const DialogueEntry& e : list)
+            if (e.kind == DialogueEntry::Kind::Line) lines.push_back(e);
+        QCOMPARE(lines.size(), size_t(3));
+        QCOMPARE(QString::fromStdString(lines[0].speaker), QString::fromStdString(lines[2].speaker));
+        QVERIFY(lines[0].speaker != lines[1].speaker);
+        QVERIFY2(QString::fromStdString(lines[1].text).toLower().contains("river"), lines[1].text.c_str());
+        for (size_t i = 0; i < 3; ++i) {
+            const double in = (1 + truth[i].first) * 24, out = (1 + truth[i].second) * 24;
+            qInfo("line %zu: %lld..%lld, heard %.2f..%.2f", i + 1, (long long)lines[i].in, (long long)lines[i].out, in, out);
+            QVERIFY(std::fabs(double(lines[i].in) - std::floor(in)) <= 1);
+            QVERIFY(std::fabs(double(lines[i].out) - std::ceil(out)) <= 1);
+        }
+        // As the as-broadcast script.
+        QVERIFY2(writePaperwork(p, s, PaperworkList::AsBroadcast, path("script.txt"), {}, &err), err.c_str());
+        QFile script(QString::fromStdString(path("script.txt")));
+        QVERIFY(script.open(QIODevice::ReadOnly));
+        const QString text = QString::fromUtf8(script.readAll());
+        QVERIFY2(text.contains(QString::fromStdString(lines[1].speaker).toUpper()) && text.contains(QStringLiteral("river")), qPrintable(text));
+    }
+
+    void paperworkOnScreenText() {
+        if (!ocrAvailable() || !ocrModel().installed()) QSKIP("Text reading model not installed (set MONTAGE_OCR_MODEL)");
+        QImage card(1280, 720, QImage::Format_RGB32);
+        card.fill(Qt::black);
+        {
+            QPainter pa(&card);
+            pa.setPen(Qt::white);
+            QFont f(QStringLiteral("DejaVu Sans"));
+            f.setPixelSize(90);
+            pa.setFont(f);
+            pa.drawText(card.rect(), Qt::AlignCenter, QStringLiteral("LONDON 1944"));
+        }
+        const std::string png = path("card.png");
+        QVERIFY(card.save(QString::fromStdString(png)));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {24, 1};
+        s.width = 1280, s.height = 720;
+        MediaItem m = probeOrFail(p, png);
+        p.media.push_back(m);
+        Clip c;
+        c.id = p.newId();
+        c.mediaId = m.id;
+        c.start = 0;
+        c.duration = 48;
+        s.videoTracks[0].clips.push_back(c);
+        Clip black;
+        black.id = p.newId();
+        black.start = 48;
+        black.duration = 24;
+        black.generator = makeEffect(p, "color");
+        s.videoTracks[0].clips.push_back(black);
+        std::vector<OnScreenText> read;
+        std::string err;
+        QVERIFY2(readOnScreenText(p, s, read, &err), err.c_str());
+        QCOMPARE(read.size(), size_t(1));
+        QVERIFY2(QString::fromStdString(read[0].text).contains(QStringLiteral("LONDON")), read[0].text.c_str());
+        QCOMPARE(read[0].in, FrameTime(0));
+        QCOMPARE(read[0].out, FrameTime(48));
+        PaperworkOptions o;
+        o.onScreenText = true;
+        XlsxSheet table;
+        QVERIFY2(buildPaperwork(p, s, PaperworkList::DialogueList, o, table, nullptr, &err), err.c_str());
+        QCOMPARE(table.rows.size(), size_t(2));
+        QCOMPARE(QString::fromStdString(table.rows[1][1].text), QString("On screen"));
+    }
+
+    void paperworkVocalSuggestion() {
+        if (!stemSeparationAvailable() || !(stemModel(2).installed() || stemModel(4).installed() || stemModel(5).installed()))
+            QSKIP("Set MONTAGE_STEM_MODELS to a folder holding a Spleeter model to test vocal suggestion");
+        if (!ttsAvailable() || !ttsModel().installed()) QSKIP("Set MONTAGE_TTS_MODEL to test vocal suggestion");
+        // A sung cue (a voice) and an instrumental one (a chord).
+        std::vector<float> voice;
+        std::string err;
+        QVERIFY2(synthesizeSpeech("La la la, the river runs to the sea, and the sea sings back to me.", "af_heart", 1.0, voice, &err), err.c_str());
+        QVERIFY(writeSpeechWav(path("song.wav"), voice, &err));
+        std::vector<float> chord(size_t(kTtsSampleRate * 6));
+        for (size_t i = 0; i < chord.size(); ++i) {
+            const double t = double(i) / kTtsSampleRate;
+            chord[i] = float(0.15 * (std::sin(2 * M_PI * 220 * t) + std::sin(2 * M_PI * 277.2 * t) + std::sin(2 * M_PI * 329.6 * t)));
+        }
+        QVERIFY(writeSpeechWav(path("chord.wav"), chord, &err));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {24, 1};
+        FrameTime at = 0;
+        for (const char* f : {"song.wav", "chord.wav"}) {
+            MediaItem m = probeOrFail(p, path(f));
+            p.media.push_back(m);
+            Clip c;
+            c.id = p.newId();
+            c.mediaId = m.id;
+            c.start = at;
+            c.duration = FrameTime(m.duration * 24) - 1;
+            c.role = "Music";
+            s.audioTracks[0].clips.push_back(c);
+            at += c.duration + 48;
+        }
+        const std::vector<MusicCue> cues = musicCues(p, s);
+        QCOMPARE(cues.size(), size_t(2));
+        bool vocal = false;
+        double share = 0;
+        QVERIFY2(cueIsVocal(p, s, cues[0], vocal, &share, 30, &err), err.c_str());
+        qInfo("voice: %.3f of it vocal", share);
+        QVERIFY(vocal);
+        QVERIFY2(cueIsVocal(p, s, cues[1], vocal, &share, 30, &err), err.c_str());
+        qInfo("chord: %.3f of it vocal", share);
+        QVERIFY(!vocal);
+        PaperworkOptions o;
+        o.suggestVocal = true;
+        XlsxSheet table;
+        QVERIFY(buildPaperwork(p, s, PaperworkList::CueSheet, o, table, nullptr, &err));
+        QCOMPARE(QString::fromStdString(table.rows[1][10].text), QString("vocal"));
+        QCOMPARE(QString::fromStdString(table.rows[2][10].text), QString("instrumental"));
     }
 
     void paperEdit() {

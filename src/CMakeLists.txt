@@ -30,6 +30,8 @@ add_library(montage_engine STATIC
   core/ScriptCut.h core/ScriptCut.cpp
   core/Cfb.h core/Cfb.cpp
   core/Zip.h core/Zip.cpp
+  core/Xlsx.h core/Xlsx.cpp
+  core/Paperwork.h core/Paperwork.cpp
   core/G2p.h core/G2p.cpp
   core/Checkerboard.h core/Checkerboard.cpp
   core/Bleep.h core/Bleep.cpp
@@ -99,6 +101,7 @@ add_library(montage_engine STATIC
   media/DescribePicture.h media/DescribePicture.cpp
   media/LanguageModel.h media/LanguageModel.cpp
   media/StemSeparation.h media/StemSeparation.cpp
+  media/MusicTags.h media/MusicTags.cpp
   media/BanditSeparation.h media/BanditSeparation.cpp
   media/LipSync.h media/LipSync.cpp
   media/LtcTimecode.h media/LtcTimecode.cpp
@@ -227,6 +230,7 @@ add_library(montage_engine STATIC
   render/Gallery.h render/Gallery.cpp
   render/LinedScript.h render/LinedScript.cpp
   render/FilmLists.h render/FilmLists.cpp
+  render/PaperworkOutput.h render/PaperworkOutput.cpp
   render/TrimPasses.h render/TrimPasses.cpp
   render/AutoTrims.h render/AutoTrims.cpp
   render/DialogueLoudness.h render/DialogueLoudness.cpp

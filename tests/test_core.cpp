@@ -10,6 +10,8 @@
 
 #include "core/Ale.h"
 #include "core/FilmCount.h"
+#include "core/Paperwork.h"
+#include "core/Xlsx.h"
 #include <QtEndian>
 #include <cstring>
 #include "core/Cdl.h"
@@ -128,6 +130,238 @@ struct Fixture {
 class TestCore : public QObject {
     Q_OBJECT
 private slots:
+    void xlsxRoundTrip() {
+        XlsxSheet a;
+        a.name = "Music Cue Sheet";
+        a.rows = {{"Cue", "Title", "Seconds"},
+                  {XlsxCell::num(1), "Café, \"live\"", XlsxCell::num(12.5)},
+                  {XlsxCell::num(2), "Line one\nline two", ""},
+                  {XlsxCell::num(3), "<b>&amp;</b>", XlsxCell::num(-0.04)}};
+        a.widths = {6, 30, 9};
+        XlsxSheet b;
+        b.name = "Second";
+        b.header = false;
+        b.rows = {{"x"}, {"", "", "far right"}};
+        const std::string bytes = writeXlsx({a, b});
+        std::vector<XlsxSheet> back;
+        std::string err;
+        QVERIFY2(readXlsx(bytes, back, &err), err.c_str());
+        QCOMPARE(back.size(), size_t(2));
+        QCOMPARE(QString::fromStdString(back[0].name), QString("Music Cue Sheet"));
+        QCOMPARE(back[0].rows.size(), a.rows.size());
+        for (size_t r = 0; r < a.rows.size(); ++r)
+            for (size_t c = 0; c < a.rows[r].size(); ++c) {
+                // An empty cell reads back as none (or an empty one).
+                const XlsxCell got = c < back[0].rows[r].size() ? back[0].rows[r][c] : XlsxCell();
+                QVERIFY2(got == a.rows[r][c], qPrintable(QStringLiteral("row %1 column %2: %3").arg(r).arg(c).arg(QString::fromStdString(got.text))));
+            }
+        QCOMPARE(back[0].rows[1][2].value, 12.5);
+        QCOMPARE(back[1].rows.size(), size_t(2));
+        QCOMPARE(QString::fromStdString(back[1].rows[1].back().text), QString("far right"));
+        QCOMPARE(back[1].rows[1].size(), size_t(3));  // the cell in column C stays in column C
+        QCOMPARE(xlsxColumn(0), std::string("A"));
+        QCOMPARE(xlsxColumn(27), std::string("AB"));
+        // Not a workbook.
+        QVERIFY(!readXlsx("PK not really", back, &err));
+    }
+
+    void musicCueSheet() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {24, 1};
+        s.audioTracks.resize(3);
+        auto music = [&](const char* name) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Audio;
+            m.hasAudio = true;
+            m.duration = 120;
+            m.name = name;
+            m.path = std::string("/music/") + name + ".flac";
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id a = music("Opening"), b = music("Chase"), c = music("Sting"), speech = music("Interview");
+        auto place = [&](int track, Id media, FrameTime at, FrameTime length, double sourceIn, const char* role) {
+            Clip clip;
+            clip.id = p.newId();
+            clip.mediaId = media;
+            clip.start = at;
+            clip.duration = length;
+            clip.sourceIn = sourceIn;
+            clip.role = role;
+            s.audioTracks[size_t(track)].clips.push_back(clip);
+        };
+        // The opening cut into twice (a jump in the music, then a half-second gap): one cue of 300 frames.
+        place(0, a, 0, 100, 0, "Music");
+        place(0, a, 100, 100, 480, "Music");
+        place(0, a, 212, 88, 600, "Music");
+        // The chase runs on under a picture cut: one cue.
+        place(0, b, 300, 240, 0, "Music");
+        Clip shot1, shot2;
+        shot1.id = p.newId(), shot1.start = 250, shot1.duration = 150;
+        shot2.id = p.newId(), shot2.start = 400, shot2.duration = 200;
+        s.videoTracks[0].clips = {shot1, shot2};
+        // The sting has no role, but its tags say it is music.
+        place(1, c, 700, 120, 0, "");
+        // Dialogue is not music; a muted track is not heard.
+        place(1, speech, 0, 600, 0, "Dialogue");
+        place(2, b, 900, 100, 0, "Music");
+        s.audioTracks[2].muted = true;
+        for (MediaItem& m : p.media)
+            if (m.id == b) m.metadata[cueMetadataKey("publisher")] = "Own Publishing";  // the panel's word over the tag
+        const MusicTagReader tags = [&](const MediaItem& m) -> std::map<std::string, std::string> {
+            if (m.id == a) return {{"composer", "A. Writer"}, {"publisher", "Alpha Music"}, {"isrc", "GBAAA2600001"}};
+            if (m.id == b) return {{"title", "The Chase"}, {"composer", "B. Writer"}, {"publisher", "Beta Music"}};
+            if (m.id == c) return {{"composer", "C. Writer"}, {"publisher", "Gamma Music"}};
+            return {};
+        };
+        const std::vector<MusicCue> cues = musicCues(p, s, tags);
+        QCOMPARE(cues.size(), size_t(3));
+        QCOMPARE(cues[0].mediaId, a);
+        QCOMPARE(cues[0].in, FrameTime(0));
+        QCOMPARE(cues[0].duration(), FrameTime(300));
+        QCOMPARE(cues[0].clips, 3);
+        QCOMPARE(QString::fromStdString(cues[0].fields.at("title")), QString("Opening"));  // its file's name
+        QCOMPARE(QString::fromStdString(cues[0].fields.at("composer")), QString("A. Writer"));
+        QCOMPARE(QString::fromStdString(cues[0].fields.at("isrc")), QString("GBAAA2600001"));
+        QCOMPARE(cues[1].mediaId, b);
+        QCOMPARE(cues[1].in, FrameTime(300));
+        QCOMPARE(cues[1].duration(), FrameTime(240));
+        QCOMPARE(QString::fromStdString(cues[1].fields.at("title")), QString("The Chase"));
+        QCOMPARE(QString::fromStdString(cues[1].fields.at("publisher")), QString("Own Publishing"));
+        QCOMPARE(cues[2].mediaId, c);
+        QCOMPARE(cues[2].duration(), FrameTime(120));
+        QCOMPARE(QString::fromStdString(cues[2].fields.at("publisher")), QString("Gamma Music"));
+        QCOMPARE(QString::fromStdString(cues[2].use), QString("background"));
+        // As a table: the duration as timecode and in seconds.
+        const XlsxSheet t = cueSheetTable(cues, s);
+        QCOMPARE(t.rows.size(), size_t(4));
+        QCOMPARE(QString::fromStdString(t.rows[2][14].text), QString("00:00:10:00"));
+        QCOMPARE(t.rows[2][15].value, 10.0);
+        // Marked not music, the sting is gone; a muted role takes the rest.
+        for (MediaItem& m : p.media)
+            if (m.id == c) m.metadata[kCueMusic] = "no";
+        QCOMPARE(musicCues(p, s, tags).size(), size_t(2));
+        edit::setRoleMuted(s, "Music", true);
+        QVERIFY(musicCues(p, s, tags).empty());
+        // CSV quotes what needs it.
+        XlsxSheet q;
+        q.rows = {{"a,b", "say \"hi\"", "plain"}};
+        QCOMPARE(tableCsv(q), std::string("\"a,b\",\"say \"\"hi\"\"\",plain\r\n"));
+    }
+
+    void dialogueListAndCcsl() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {24, 1};
+        s.filmGauge = "35mm-4perf";
+        auto footage = [&](const char* name, const char* scene, float faceHeight, bool looked) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Video;
+            m.hasVideo = true;
+            m.duration = 60;
+            m.name = name;
+            m.path = std::string("/shoot/") + name + ".mov";
+            if (scene) m.metadata["scene"] = scene;
+            if (looked) {
+                auto faces = std::make_shared<FaceIndex>();
+                faces->step = 1;
+                if (faceHeight > 0)
+                    for (int i = 0; i < 60; ++i) {
+                        FaceIndex::Face f;
+                        f.time = i;
+                        f.h = faceHeight;
+                        faces->faces.push_back(f);
+                    }
+                m.faces = faces;
+            }
+            p.media.push_back(m);
+            return m.id;
+        };
+        const Id close = footage("close", "12", 0.42f, true), mid = footage("mid", "12", 0.18f, true),
+                 wide = footage("wide", "13", 0, true), unknown = footage("unknown", "13", 0, false);
+        for (MediaItem& m : p.media)
+            if (m.id == wide) m.shots.push_back({0, 60, "A street at night"});
+        // Dialogue in the close-up's transcript, two speakers.
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment one, two;
+        one.speaker = 0;
+        one.words = {{0.5, 0.9, "Where", 1}, {1.0, 1.3, "were", 1}, {1.4, 1.8, "you?", 1}};
+        two.speaker = 1;
+        two.words = {{2.5, 2.8, "Out.", 1}};
+        t->segments = {one, two};
+        t->speakerNames = {"Anna", "Ben"};
+        for (MediaItem& m : p.media)
+            if (m.id == close) m.transcript = t;
+        auto shot = [&](Id media, FrameTime at, FrameTime length) {
+            Clip c;
+            c.id = p.newId();
+            c.mediaId = media;
+            c.start = at;
+            c.duration = length;
+            c.name = p.findMedia(media)->name;
+            s.videoTracks[0].clips.push_back(c);
+        };
+        shot(close, 0, 96);     // 4 s
+        shot(mid, 96, 48);
+        shot(wide, 144, 72);
+        shot(unknown, 216, 40);
+        CaptionTrack subs;
+        Caption cap;
+        cap.start = 12, cap.end = 44, cap.text = "Where were you?";
+        subs.captions.push_back(cap);
+        s.captionTracks.push_back(subs);
+
+        const std::vector<DialogueEntry> list = dialogueList(p, s);
+        // Scene 12, two lines, scene 13 (with the shot's description).
+        QCOMPARE(list.size(), size_t(4));
+        QCOMPARE(int(list[0].kind), int(DialogueEntry::Kind::Scene));
+        QCOMPARE(QString::fromStdString(list[0].text), QString("SCENE 12"));
+        QCOMPARE(list[0].out, FrameTime(144));
+        QCOMPARE(QString::fromStdString(list[1].speaker), QString("Anna"));
+        QCOMPARE(QString::fromStdString(list[1].text), QString("Where were you?"));
+        QCOMPARE(list[1].in, FrameTime(12));
+        QCOMPARE(list[1].out, FrameTime(44));  // 1.8 s, rounded up
+        QCOMPARE(QString::fromStdString(list[2].speaker), QString("Ben"));
+        QCOMPARE(list[2].in, FrameTime(60));
+        QCOMPARE(QString::fromStdString(list[3].text), QString("SCENE 13"));
+        QCOMPARE(QString::fromStdString(list[3].description), QString("A street at night"));
+        const std::string script = asBroadcastScript(list, s);
+        QVERIFY(script.find("00:00:00:12  ANNA\n") != std::string::npos);
+        QVERIFY(script.find("SCENE 13 - A street at night") != std::string::npos);
+
+        const std::vector<CcslShot> shots = ccsl(p, s);
+        QCOMPARE(shots.size(), size_t(4));
+        QCOMPARE(QString::fromStdString(shots[0].shotSize), QString("CU"));
+        QCOMPARE(QString::fromStdString(shots[1].shotSize), QString("MS"));
+        QCOMPARE(QString::fromStdString(shots[2].shotSize), QString("WS"));
+        QCOMPARE(QString::fromStdString(shots[3].shotSize), QString());  // faces never looked for
+        // 16 frames to the foot: the second shot from 6+00 to its last frame 8+15, 3 feet long.
+        QCOMPARE(QString::fromStdString(shots[1].footageIn), QString("6+00"));
+        QCOMPARE(QString::fromStdString(shots[1].footageOut), QString("8+15"));
+        QCOMPARE(QString::fromStdString(shots[1].length), QString("3+00"));
+        QCOMPARE(shots[0].dialogue.size(), size_t(2));
+        QCOMPARE(shots[0].subtitles.size(), size_t(1));
+        QCOMPARE(QString::fromStdString(shots[2].description), QString("A street at night"));
+        // 16 mm counts 40 frames to the foot.
+        QCOMPARE(QString::fromStdString(ccsl(p, s, "16mm")[1].footageIn), QString("2+16"));
+        const XlsxSheet table = ccslTable(shots, s);
+        QCOMPARE(table.rows.size(), size_t(5));
+        QCOMPARE(QString::fromStdString(table.rows[1][8].text), QString("Anna: Where were you?\nBen: Out."));
+        // A shot played on across a cut in the clip is one shot.
+        Sequence& seq = *p.active();
+        Clip second = seq.videoTracks[0].clips[1];
+        seq.videoTracks[0].clips[1].duration = 20;
+        second.id = p.newId();
+        second.start = 116;
+        second.duration = 28;
+        second.sourceIn = 20;
+        seq.videoTracks[0].clips.push_back(second);
+        QCOMPARE(ccsl(p, seq).size(), size_t(4));
+    }
+
     void numbersAndStressForSpeech() {
         QCOMPARE(numberWords(0), std::string("zero"));
         QCOMPARE(numberWords(42), std::string("forty-two"));
