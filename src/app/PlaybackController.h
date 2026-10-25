@@ -177,7 +177,10 @@ private slots:
 
 private:
     void startAudio(FrameTime from, bool idle = false);
-    void stopAudio();
+    void stopAudio(bool force = false);  // (not forced, an idle sink stays for calibration or talkback)
+    // The sink as playback and the monitoring section need it: the programme at normal speed, else idle for
+    // calibration or talkback, else none; `reopen` opens it again (other channels or another device).
+    void refreshAudio(bool reopen);
     bool monitorKeepsAudio() const { return monitoring_.on && (calibration_ >= 0 || talkback_); }
     void startTalkbackInput();
     FrameTime clampToSequence(FrameTime t) const;

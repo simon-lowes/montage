@@ -34,12 +34,13 @@ struct MonitorSpeaker {
     bool operator==(const MonitorSpeaker&) const = default;
 };
 constexpr int kMaxMonitorDelay = 9600;  // 200 ms: some 68 m of air
+constexpr int kMaxMonitorChannels = 64;  // device channels a setting may use
 
 enum class MonitorSolo { Project, InPlace, AfterFader, PreFader };
 
 struct CueMix {
     bool on = false;
-    int output = 2;          // its left channel on the device (the right is the next)
+    int output = 2;          // its left channel on the device (the right is the next); added to speakers on the same
     double levelDb = 0;
     std::vector<int> tracks;  // audio tracks (index) heard in it, as they are mixed
     bool beeps = true;        // an ADR cycle's beeps
@@ -78,6 +79,8 @@ struct MonitorSettings {
 const std::vector<Speaker>& monitorSpeakers(const std::string& set);
 int monitorOutputs(const MonitorSettings& s);
 MonitorSpeaker monitorSpeaker(const MonitorSettings& s, int speaker);  // its mapping (the default for a missing one)
+// The first device channel after the speakers' (where a cue mix goes unless set).
+int monitorFreeOutput(const MonitorSettings& s);
 // What the programme is mixed as for these speakers: a speaker layout, "stereo" or "binaural".
 std::string listenLayout(const MonitorSettings& s, const Sequence& seq);
 // The layouts Listen As offers for a set (beside "" the set's own).
@@ -89,6 +92,8 @@ Sequence monitorSequence(const Sequence& seq, const MonitorSettings& s);
 // edges) at -20 dBFS RMS, ten seconds of it, looped seamlessly; the same every time. A subwoofer's is from 20 Hz to
 // the crossover.
 std::vector<float> calibrationNoise(int sampleRate, double lowHz = 500, double highHz = 2000);
+// The noise for speaker `speaker` of a setting (a subwoofer's from 20 Hz to the crossover); empty for none.
+std::vector<float> calibrationNoiseFor(const MonitorSettings& s, int sampleRate, int speaker);
 // The monitor level that makes calibration noise read `referenceSpl` where it read `measuredSpl` at `currentDb`.
 inline double calibratedLevel(double currentDb, double measuredSpl, double referenceSpl) { return currentDb + referenceSpl - measuredSpl; }
 
@@ -112,6 +117,9 @@ public:
     // Calibration noise on speaker `speaker` instead of the programme (-1: off), through its trim, delay and the
     // monitor level (not bass management, Dim, Mono, Mute or a solo).
     void setCalibration(int speaker);
+    // The same with the noise made beforehand (calibrationNoiseFor), so it is not made while the audio thread waits.
+    // The same speaker again changes nothing (the noise plays on without a seam).
+    void setCalibration(int speaker, std::vector<float> noise);
     int calibration() const { return calibrate_; }
     void reset();
 

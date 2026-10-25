@@ -86,7 +86,7 @@ MonitorSettings MonitorSettings::fromJson(const QJsonObject& o) {
     for (const QJsonValue& v : o.value("map").toArray()) {
         const QJsonObject x = v.toObject();
         MonitorSpeaker sp;
-        sp.output = x.value("output").toInt(-1);
+        sp.output = std::clamp(x.value("output").toInt(-1), -1, kMaxMonitorChannels - 1);
         sp.trimDb = std::clamp(std::round(x.value("trim_db").toDouble() * 10) / 10, -40.0, 20.0);
         sp.delay = std::clamp(x.value("delay").toInt(), 0, kMaxMonitorDelay);
         s.map.push_back(sp);
@@ -100,12 +100,12 @@ MonitorSettings MonitorSettings::fromJson(const QJsonObject& o) {
     s.mute = o.value("mute").toBool();
     s.soloSpeaker = o.value("solo_speaker").toInt(-1);
     s.levelDb = std::clamp(o.value("level_db").toDouble(), -60.0, 20.0);
-    s.referenceSpl = o.value("reference_spl").toDouble(s.referenceSpl);
+    s.referenceSpl = std::clamp(std::round(o.value("reference_spl").toDouble(s.referenceSpl)), 60.0, 110.0);
     s.soloMode = soloFrom(o.value("solo_mode").toString());
     s.soloTracks = intsFrom(o.value("solo_tracks"));
     const QJsonObject c = o.value("cue").toObject();
     s.cue.on = c.value("on").toBool();
-    s.cue.output = std::max(0, c.value("output").toInt(s.cue.output));
+    s.cue.output = std::clamp(c.value("output").toInt(s.cue.output), 0, kMaxMonitorChannels - 2);
     s.cue.levelDb = std::clamp(c.value("level_db").toDouble(), -60.0, 20.0);
     s.cue.tracks = intsFrom(c.value("tracks"));
     s.cue.beeps = c.value("beeps").toBool(true);
@@ -120,26 +120,45 @@ const std::vector<Speaker>& monitorSpeakers(const std::string& set) {
 }
 
 MonitorSpeaker monitorSpeaker(const MonitorSettings& s, int speaker) {
-    if (speaker >= 0 && speaker < int(s.map.size())) return s.map[size_t(speaker)];
     MonitorSpeaker d;
     d.output = speaker;
+    if (speaker >= 0 && speaker < int(s.map.size())) d = s.map[size_t(speaker)];
+    d.output = std::clamp(d.output, -1, kMaxMonitorChannels - 1);
     return d;
+}
+
+int monitorFreeOutput(const MonitorSettings& s) {
+    int n = 2;
+    const int speakers = int(monitorSpeakers(s.speakers).size());
+    for (int k = 0; k < speakers; ++k) n = std::max(n, monitorSpeaker(s, k).output + 1);
+    return std::min(n, kMaxMonitorChannels - 2);
 }
 
 int monitorOutputs(const MonitorSettings& s) {
     int n = 2;
     const int speakers = int(monitorSpeakers(s.speakers).size());
     for (int k = 0; k < speakers; ++k) n = std::max(n, monitorSpeaker(s, k).output + 1);
-    if (s.cue.on) n = std::max(n, s.cue.output + 2);
+    if (s.cue.on) n = std::max(n, std::clamp(s.cue.output, 0, kMaxMonitorChannels - 2) + 2);
     return n;
 }
+
+namespace {
+
+// Every speaker of `layout` is one of the set's.
+bool layoutFits(const std::string& layout, const std::vector<Speaker>& set) {
+    for (const Speaker& sp : layoutSpeakers(layout))
+        if (speakerIndex(set, sp.name) < 0) return false;
+    return true;
+}
+
+}  // namespace
 
 std::vector<std::string> listenChoices(const std::string& set) {
     if (set == "headphones") return {"stereo", "binaural"};
     std::vector<std::string> out;
     const int n = layoutChannels(set);
     for (const std::string& l : {std::string("7.1"), std::string("5.1")})
-        if (layoutChannels(l) < n) out.push_back(l);
+        if (layoutChannels(l) < n && layoutFits(l, monitorSpeakers(set))) out.push_back(l);
     if (n > 2) out.push_back("stereo");
     return out;
 }
@@ -147,14 +166,11 @@ std::vector<std::string> listenChoices(const std::string& set) {
 std::string listenLayout(const MonitorSettings& s, const Sequence& seq) {
     if (s.speakers == "headphones") return s.listenAs == "binaural" ? "binaural" : "stereo";
     std::string want = s.listenAs.empty() || s.listenAs == "binaural" ? s.speakers : s.listenAs;
-    if (!speakerLayout(want) || layoutChannels(want) > layoutChannels(s.speakers)) want = s.speakers;
+    const auto& set = monitorSpeakers(s.speakers);
+    if (want != "stereo" && (!speakerLayout(want) || !layoutFits(want, set))) want = s.speakers;
     // The programme as it is when the speakers have room for it (no up-mixing).
-    if (speakerLayout(seq.audioLayout) && layoutChannels(seq.audioLayout) <= layoutChannels(want)) {
-        const auto& set = monitorSpeakers(s.speakers);
-        bool fits = true;
-        for (const Speaker& sp : layoutSpeakers(seq.audioLayout)) fits &= speakerIndex(set, sp.name) >= 0;
-        if (fits) return seq.audioLayout;
-    }
+    if (speakerLayout(seq.audioLayout) && layoutChannels(seq.audioLayout) <= layoutChannels(want) && layoutFits(seq.audioLayout, set))
+        return seq.audioLayout;
     return want;
 }
 
@@ -240,7 +256,11 @@ void MonitorSection::configure(const MonitorSettings& s, int sampleRate) {
             for (auto& b : l.lp) b.lowPass(rate_, s_.crossoverHz);
         }
     }
-    if (fresh && calibrate_ >= 0) setCalibration(calibrate_ < int(speakers_.size()) ? calibrate_ : -1);
+    if (fresh && calibrate_ >= 0) {
+        const int k = calibrate_;
+        calibrate_ = -1;  // (made afresh for the new set, rate or crossover)
+        setCalibration(k);
+    }
 }
 
 void MonitorSection::reset() {
@@ -253,11 +273,23 @@ void MonitorSection::reset() {
     noisePos_ = 0;
 }
 
+std::vector<float> calibrationNoiseFor(const MonitorSettings& s, int sampleRate, int speaker) {
+    const auto& sp = monitorSpeakers(s.speakers);
+    if (speaker < 0 || speaker >= int(sp.size())) return {};
+    return sp[size_t(speaker)].lfe ? calibrationNoise(sampleRate, 20, s.crossoverHz) : calibrationNoise(sampleRate);
+}
+
 void MonitorSection::setCalibration(int speaker) {
-    calibrate_ = speaker >= 0 && speaker < int(speakers_.size()) ? speaker : -1;
-    noise_.clear();
-    if (calibrate_ >= 0)
-        noise_ = speakers_[size_t(calibrate_)].lfe ? calibrationNoise(rate_, 20, s_.crossoverHz) : calibrationNoise(rate_);
+    const int k = speaker >= 0 && speaker < int(speakers_.size()) ? speaker : -1;
+    if (k == calibrate_ && (k < 0 || !noise_.empty())) return;
+    setCalibration(k, calibrationNoiseFor(s_, rate_, k));
+}
+
+void MonitorSection::setCalibration(int speaker, std::vector<float> noise) {
+    const int k = speaker >= 0 && speaker < int(speakers_.size()) && !noise.empty() ? speaker : -1;
+    if (k == calibrate_ && (k < 0 || !noise_.empty())) return;
+    calibrate_ = k;
+    noise_ = k >= 0 ? std::move(noise) : std::vector<float>{};
     noisePos_ = 0;
 }
 
@@ -374,8 +406,8 @@ void MonitorSection::addCue(const float* guide, const float* beeps, const float*
             ++talkRead_;
             if (talkback_) l += tg * t, r += tg * t;
         }
-        out[size_t(i) * size_t(outputs_) + size_t(s_.cue.output)] = g * l;
-        out[size_t(i) * size_t(outputs_) + size_t(s_.cue.output) + 1] = g * r;
+        out[size_t(i) * size_t(outputs_) + size_t(s_.cue.output)] += g * l;
+        out[size_t(i) * size_t(outputs_) + size_t(s_.cue.output) + 1] += g * r;
     }
 }
 

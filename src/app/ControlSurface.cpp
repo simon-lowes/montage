@@ -577,7 +577,9 @@ void ControlSurface::refresh() {
             sendFader(i, fv);
             was.fader = fv;
         }
-        const int mute = tr && tr->muted ? 2 : 0, solo = tr && tr->solo ? 2 : 0, select = has && t == selected ? 2 : 0;
+        QToolButton* soloButton = has ? mixer_->trackSolo(t) : nullptr;  // (the monitor's solos, when the mixer's are)
+        const int mute = tr && tr->muted ? 2 : 0, solo = soloButton ? (soloButton->isChecked() ? 2 : 0) : tr && tr->solo ? 2 : 0;
+        const int select = has && t == selected ? 2 : 0;
         if (mute != was.mute) sendLed(mcu::Mute + i, was.mute = mute);
         if (solo != was.solo) sendLed(mcu::Solo + i, was.solo = solo);
         if (select != was.select) sendLed(mcu::Select + i, was.select = select);

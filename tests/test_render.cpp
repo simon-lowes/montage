@@ -1,6 +1,7 @@
 // Renderer tests: blending, transforms, effects, transitions, generators.
 #include <QtTest>
 #include <map>
+#include <QJsonArray>
 #include <QTemporaryDir>
 #include <QProcess>
 
@@ -8150,6 +8151,7 @@ colorspaces:
         QVERIFY(co[100 * 4 + 2] == 0.1f);
         cue.setTalkback(true);
         cue.feedTalkback(talk.data(), n);
+        cue.process("stereo", lr.data(), nullptr, n, co.data());
         cue.addCue(guide.data(), nullptr, lr.data(), n, co.data());
         QVERIFY(std::fabs(co[100 * 4 + 2] - 0.15f) < 1e-7);
 
@@ -8177,6 +8179,38 @@ colorspaces:
         QCOMPARE(listenLayout(room, seq), std::string("binaural"));
         QCOMPARE(monitorSequence(seq, room).audioLayout, std::string("ambix3"));
         QVERIFY((listenChoices("7.1.4") == std::vector<std::string>{"7.1", "5.1", "stereo"}));
+        // Only layouts whose every speaker the set has: 5.1.4 has no back pair for 7.1, and 7.1 no heights for 5.1.2.
+        QVERIFY((listenChoices("5.1.4") == std::vector<std::string>{"5.1", "stereo"}));
+        room.speakers = "7.1", room.listenAs = "5.1.2";
+        seq.audioLayout = "7.1.4";
+        QCOMPARE(listenLayout(room, seq), std::string("7.1"));
+        seq.audioLayout = "stereo";
+        // A cue on speakers' channels is added to them; turned on, it goes after them. Channels stay on the device's.
+        {
+            MonitorSettings ov;
+            ov.on = true;
+            ov.speakers = "5.1";
+            ov.cue.on = true;
+            QCOMPARE(ov.cue.output, 2);
+            QCOMPARE(monitorFreeOutput(ov), 6);
+            MonitorSection sec;
+            sec.configure(ov, rate);
+            QCOMPARE(sec.outputs(), 6);
+            std::vector<float> six(600, 0.0f), guide(200, 0.25f), o(600);
+            for (int i = 0; i < 100; ++i) six[size_t(i) * 6 + 2] = 0.5f;
+            sec.process("5.1", six.data(), nullptr, 100, o.data());
+            sec.addCue(guide.data(), nullptr, nullptr, 100, o.data());
+            QCOMPARE(o[size_t(50) * 6 + 2], 0.75f);
+            QCOMPARE(o[size_t(50) * 6 + 3], 0.25f);
+            QJsonObject wild = ov.toJson();
+            wild["map"] = QJsonArray{QJsonObject{{"output", 100000000}}};
+            QJsonObject cue = wild["cue"].toObject();
+            cue["output"] = 2147483647;
+            wild["cue"] = cue;
+            const MonitorSettings tame = MonitorSettings::fromJson(wild);
+            QCOMPARE(monitorSpeaker(tame, 0).output, kMaxMonitorChannels - 1);
+            QCOMPARE(monitorOutputs(tame), kMaxMonitorChannels);
+        }
         // The monitor's solos leave the project's alone: after the fader, the track straight to the master without
         // its processing; before it, at unity and in the middle.
         seq.audioTracks.resize(2);

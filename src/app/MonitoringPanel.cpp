@@ -176,7 +176,8 @@ MonitoringPanel::MonitoringPanel(EditorState* state, PlaybackController* program
     reading_->setSuffix(tr(" dB SPL"));
     applyReading_ = new QPushButton(tr("Set Level"), calBox);
     applyReading_->setObjectName(QStringLiteral("monitorApplyReading"));
-    applyReading_->setToolTip(tr("The meter's reading of the noise sets the monitor level, so the noise plays at the reference"));
+    applyReading_->setToolTip(tr("The meter's reading of the noise: on the first speaker it sets the monitor level, on each "
+                                 "other speaker its trim, so the noise plays at the reference on every one"));
     auto* readRow = new QHBoxLayout;
     readRow->addWidget(reading_, 1);
     readRow->addWidget(applyReading_);
@@ -191,7 +192,8 @@ MonitoringPanel::MonitoringPanel(EditorState* state, PlaybackController* program
     qf->addRow(cueOn_);
     cueOutput_ = new QSpinBox(cueBox);
     cueOutput_->setObjectName(QStringLiteral("monitorCueOutput"));
-    cueOutput_->setRange(1, 63);
+    cueOutput_->setRange(1, kMaxMonitorChannels - 1);
+    cueOutput_->setToolTip(tr("Its first channel (the second is the next); on channels a speaker uses, it is added to that speaker"));
     cueOutput_->setPrefix(tr("Channels "));
     qf->addRow(tr("Output"), cueOutput_);
     cueLevel_ = new QDoubleSpinBox(cueBox);
@@ -277,8 +279,18 @@ void MonitoringPanel::calibrate(int speaker) {
 }
 
 void MonitoringPanel::applyReading(double measuredSpl) {
+    // The first speaker's reading (or one taken without the noise) sets the monitor level; each other speaker's, its
+    // own trim, so every speaker reads the reference in turn.
     MonitorSettings s = program_->monitoring();
-    s.levelDb = std::clamp(calibratedLevel(s.levelDb, measuredSpl, s.referenceSpl), -60.0, 20.0);
+    const int k = program_->monitorCalibration();
+    if (k <= 0) {
+        s.levelDb = std::clamp(calibratedLevel(s.levelDb, measuredSpl, s.referenceSpl), -60.0, 20.0);
+    } else {
+        const int n = int(monitorSpeakers(s.speakers).size());
+        for (int i = int(s.map.size()); i < n; ++i) s.map.push_back(monitorSpeaker(s, i));
+        MonitorSpeaker& m = s.map[size_t(k)];
+        m.trimDb = std::clamp(std::round(calibratedLevel(m.trimDb, measuredSpl, s.referenceSpl) * 10) / 10, -40.0, 20.0);
+    }
     apply(s);
 }
 
@@ -316,7 +328,7 @@ void MonitoringPanel::edited() {
         for (int r = 0; r < table_->rowCount(); ++r) {
             MonitorSpeaker m;
             auto num = [&](int col) { return table_->item(r, col) ? table_->item(r, col)->text().toDouble() : 0.0; };
-            m.output = int(num(1)) - 1;
+            m.output = std::clamp(int(num(1)) - 1, -1, kMaxMonitorChannels - 1);
             m.trimDb = std::clamp(std::round(num(2) * 10) / 10, -40.0, 20.0);
             m.delay = std::clamp(int(std::lround(num(3))), 0, kMaxMonitorDelay);
             s.map.push_back(m);
@@ -332,8 +344,11 @@ void MonitoringPanel::edited() {
     s.referenceSpl = reference_->currentData().toDouble();
     s.soloMode = MonitorSolo(soloMode_->currentData().toInt());
     if (s.soloMode == MonitorSolo::Project) s.soloTracks.clear();
+    const bool cueWasOn = s.cue.on;
     s.cue.on = cueOn_->isChecked();
     s.cue.output = cueOutput_->value() - 1;
+    // Turned on where speakers are, it moves to the first channels after them (it can still be put back by hand).
+    if (s.cue.on && !cueWasOn && s.cue.output < monitorFreeOutput(s)) s.cue.output = monitorFreeOutput(s);
     s.cue.levelDb = cueLevel_->value();
     s.cue.beeps = cueBeeps_->isChecked();
     s.cue.program = cueProgram_->isChecked();
@@ -381,11 +396,15 @@ void MonitoringPanel::refresh() {
     for (const std::string& l : listenChoices(s.speakers))
         if (!(s.speakers == "headphones" && l == "stereo"))
             listen_->addItem(l == "binaural" ? tr("Binaural") : setName(QString::fromStdString(l)), QString::fromStdString(l));
+    if (listen_->findData(QString::fromStdString(s.listenAs)) < 0)  // (another layout, set over MCP)
+        listen_->addItem(setName(QString::fromStdString(s.listenAs)), QString::fromStdString(s.listenAs));
     listen_->setCurrentIndex(std::max(0, listen_->findData(QString::fromStdString(s.listenAs))));
     dim_->setChecked(s.dim);
     mono_->setChecked(s.mono);
     mute_->setChecked(s.mute);
     level_->setValue(s.levelDb);
+    if (reference_->findData(int(std::lround(s.referenceSpl))) < 0)  // (another reference, set over MCP)
+        reference_->addItem(tr("%1 dB SPL").arg(int(std::lround(s.referenceSpl))), int(std::lround(s.referenceSpl)));
     reference_->setCurrentIndex(std::max(0, reference_->findData(int(std::lround(s.referenceSpl)))));
     noise_->setChecked(program_->monitorCalibration() >= 0);
     soloMode_->setCurrentIndex(std::max(0, soloMode_->findData(int(s.soloMode))));

@@ -9967,8 +9967,8 @@ const auto seq = [this] { return state()->sequence(); };
         // Dim (from F1 on a Mackie Control) is 20 dB down; Mono puts (L + R) / 2 on both.
         struct Quiet : MidiConnection {
             bool send(const MidiMessage&) override { return true; }
-            std::string inputName() const override { return "X-Touch"; }
-            std::string outputName() const override { return "X-Touch"; }
+            std::string inputName() const override { return "Surface"; }
+            std::string outputName() const override { return "Surface"; }
         };
         ControlSurface* surface = win_->controlSurface();
         surface->setConnection(std::make_unique<Quiet>());
@@ -10023,6 +10023,7 @@ const auto seq = [this] { return state()->sequence(); };
 
         // The cue mix on channels 3 and 4: A1 alone (the speakers still hear the solo).
         panel->findChild<QCheckBox*>("monitorCueOn")->click();
+        QCOMPARE(program->monitoring().cue.output, 2);  // (after the speakers)
         panel->findChild<QSpinBox*>("monitorCueOutput")->setValue(3);
         panel->findChild<QCheckBox*>("monitorCueBeeps")->setChecked(false);
         panel->findChild<QListWidget*>("monitorCueTracks")->item(0)->setCheckState(Qt::Checked);
@@ -10093,10 +10094,19 @@ const auto seq = [this] { return state()->sequence(); };
             const double rms = 10 * std::log10(right / (rate * 10));
             QVERIFY2(std::fabs(rms + 20) < 0.1, qPrintable(QString::number(rms)));
         }
+        // The right speaker's reading trims it; the left's sets the monitor level.
+        r = call({{"action", "reading"}, {"spl", 84.0}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(monitorSpeaker(program->monitoring(), 1).trimDb, 1.0);
+        QCOMPARE(program->monitoring().levelDb, 0.0);
+        QCOMPARE(table->item(1, 2)->text(), QString("1.0"));
+        call({{"action", "calibrate"}, {"speaker", 0}});
+        QCOMPARE(program->monitorCalibration(), 0);
         r = call({{"action", "reading"}, {"spl", 88.0}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         QCOMPARE(program->monitoring().levelDb, -3.0);  // 85 dB SPL wanted
         QCOMPARE(panel->findChild<QDoubleSpinBox*>("monitorLevel")->value(), -3.0);
+        QCOMPARE(monitorSpeaker(program->monitoring(), 1).trimDb, 1.0);
         QVERIFY(call({{"action", "reading"}}).value("isError").toBool());
         call({{"action", "calibrate"}, {"speaker", -1}});
         QCOMPARE(program->monitorCalibration(), -1);

@@ -380,9 +380,14 @@ public:
         monitor_->setSettings(m, rate);
         monitor_->prepare(project_, seq_);
     }
-    void setCalibration(int speaker) {
+    void setCalibration(int speaker, const MonitorSettings& s, int rate) {
+        {
+            QMutexLocker lock(&m_);
+            if (!monitor_ || monitor_->section().calibration() == speaker) return;
+        }
+        auto noise = calibrationNoiseFor(s, rate, speaker);  // (made while the audio thread plays on)
         QMutexLocker lock(&m_);
-        if (monitor_) monitor_->section().setCalibration(speaker);
+        if (monitor_) monitor_->section().setCalibration(speaker, std::move(noise));
     }
     void setTalkback(bool on) {
         QMutexLocker lock(&m_);
@@ -606,7 +611,8 @@ PlaybackController::PlaybackController(QObject* parent) : QObject(parent) {
 
 PlaybackController::~PlaybackController() {
     worker_->setSinks({});
-    stopAudio();
+    stopAudio(true);
+    if (talkSource_) talkSource_->stop();
     renderThread_->quit();
     renderThread_->wait();
 }
@@ -821,7 +827,7 @@ std::vector<float> PlaybackController::heard(int64_t start, int frames) {
 
 void PlaybackController::scrubAudio(FrameTime t) {
     const Sequence* s = sequence();
-    if (!scrubbing_ || !s || s->audioTracks.empty() || globalMute_) return;
+    if (!scrubbing_ || !s || s->audioTracks.empty() || globalMute_ || (monitoring_.on && monitoring_.mute)) return;
     if (!scrubSink_) {
         QAudioDevice dev = QMediaDevices::defaultAudioOutput();
         if (dev.isNull()) {
@@ -853,10 +859,12 @@ void PlaybackController::scrubAudio(FrameTime t) {
     scrubMixer_.mix(*heard_, *heard_->findSequence(sequenceId_), start, frames, mix.data());  // its tracks as heard
     std::vector<int16_t> pcm(mix.size());
     const int fade = std::min(frames / 4, 240);
+    // (The monitoring section's level and Dim, though not its speakers: scrubbing is heard in stereo.)
+    const float level = monitoring_.on ? float(std::pow(10.0, (monitoring_.levelDb + (monitoring_.dim ? monitoring_.dimDb : 0.0)) / 20)) : 1.0f;
     for (int i = 0; i < frames; ++i) {
-        float g = 1.0f;
-        if (i < fade) g = float(i) / fade;
-        if (i >= frames - fade) g = float(frames - 1 - i) / fade;
+        float g = level;
+        if (i < fade) g *= float(i) / fade;
+        if (i >= frames - fade) g *= float(frames - 1 - i) / fade;
         for (int c = 0; c < 2; ++c)
             pcm[size_t(i) * 2 + size_t(c)] = int16_t(std::lround(std::clamp(mix[size_t(i) * 2 + size_t(c)] * g, -1.0f, 1.0f) * 32767));
     }
@@ -986,7 +994,7 @@ void PlaybackController::startAudio(FrameTime from, bool idle) {
     const Sequence* s = sequence();
     if (!s) return;
     QAudioDevice dev = QMediaDevices::defaultAudioOutput();
-    if (!audioOutput_.isEmpty())
+    if (monitoring_.on && !audioOutput_.isEmpty())  // (the section's device; without it, the system's as before)
         for (const QAudioDevice& d : QMediaDevices::audioOutputs())
             if (d.description() == audioOutput_) dev = d;
     if (dev.isNull()) return;
@@ -1016,7 +1024,7 @@ void PlaybackController::startAudio(FrameTime from, bool idle) {
     device_->setMonitoring(monitoring_, s->sampleRate);
     int64_t startSample = int64_t(std::llround(double(from) * s->sampleRate / s->fpsValue()));
     device_->configure(heard_, sequenceId_, startSample, int16, outputChannels_, idle);
-    if (calibration_ >= 0) device_->setCalibration(calibration_);
+    device_->setCalibration(calibration_, monitoring_, s->sampleRate);
     device_->setTalkback(talkback_);
     if (!device_->isOpen()) device_->open(QIODevice::ReadOnly);
     sink_ = new QAudioSink(dev, fmt, this);
@@ -1024,10 +1032,10 @@ void PlaybackController::startAudio(FrameTime from, bool idle) {
     sink_->start(device_);
 }
 
-void PlaybackController::stopAudio() {
+void PlaybackController::stopAudio(bool force) {
     if (!sink_) return;
     // Calibration noise and talkback go on while stopped.
-    if (monitorKeepsAudio()) {
+    if (!force && monitorKeepsAudio()) {
         device_->setIdle(true);
         return;
     }
@@ -1053,25 +1061,17 @@ void PlaybackController::setMonitoring(const MonitorSettings& settings) {
     if (m.soloMode == MonitorSolo::Project) m.soloTracks.clear();  // (the mixer's solos are the project's again)
     if (m == monitoring_) return;
     const bool reopen = m.on != monitoring_.on || (m.on && monitorOutputs(m) != monitorOutputs(monitoring_));
+    // Calibration stops when the speakers change (the same number may be another speaker now).
+    if (!m.on || m.speakers != monitoring_.speakers) calibration_ = -1;
+    if (!m.on) talkback_ = false;
     monitoring_ = m;
-    if (!m.on) calibration_ = -1, talkback_ = false;
     const Sequence* s = sequence();
-    device_->setMonitoring(m, s ? s->sampleRate : 48000);
-    if (calibration_ >= 0) device_->setCalibration(calibration_);
+    const int rate = s ? s->sampleRate : 48000;
+    device_->setMonitoring(m, rate);
+    device_->setCalibration(calibration_, m, rate);
     device_->setTalkback(talkback_);
     testMonitor_.reset();
-    // The device opened again when it needs other channels.
-    if (sink_ && reopen) {
-        if (isPlaying()) startAudio(position_);
-        else {
-            sink_->stop();
-            sink_->deleteLater();
-            sink_ = nullptr;
-            if (monitorKeepsAudio()) startAudio(position_, true);
-        }
-    } else if (sink_ && !isPlaying() && !monitorKeepsAudio()) {
-        stopAudio();
-    }
+    refreshAudio(reopen);
     if (!talkback_ && talkSource_) {
         talkSource_->stop();
         talkSource_->deleteLater();
@@ -1081,10 +1081,26 @@ void PlaybackController::setMonitoring(const MonitorSettings& settings) {
     emit monitoringChanged();
 }
 
+void PlaybackController::refreshAudio(bool reopen) {
+    if (speed_ == 1) {
+        if (!sink_ || reopen) {
+            // (the picture's clock afresh with the sound, as after a seek)
+            startFrame_ = position_;
+            clock_.restart();
+            startAudio(position_);
+        }
+    } else if (monitorKeepsAudio()) {
+        if (!sink_ || reopen) startAudio(position_, true);
+        else device_->setIdle(true);
+    } else {
+        stopAudio(true);
+    }
+}
+
 void PlaybackController::setAudioOutput(const QString& description) {
     if (description == audioOutput_) return;
     audioOutput_ = description;
-    if (sink_) startAudio(position_, !isPlaying());
+    if (sink_ && monitoring_.on) refreshAudio(true);
     emit monitoringChanged();
 }
 
@@ -1093,10 +1109,10 @@ void PlaybackController::setMonitorCalibration(int speaker) {
     const int k = monitoring_.on && speaker >= 0 && speaker < n ? speaker : -1;
     if (k == calibration_) return;
     calibration_ = k;
-    device_->setCalibration(k);
+    const Sequence* s = sequence();
+    device_->setCalibration(k, monitoring_, s ? s->sampleRate : 48000);
     if (testMonitor_) testMonitor_->section().setCalibration(k);
-    if (!sink_ && monitorKeepsAudio()) startAudio(position_, true);
-    else if (sink_ && !isPlaying() && !monitorKeepsAudio()) stopAudio();
+    refreshAudio(false);
     emit monitoringChanged();
 }
 
@@ -1113,8 +1129,7 @@ void PlaybackController::setTalkback(bool on) {
         talkSource_ = nullptr;
         talkIo_ = nullptr;
     }
-    if (!sink_ && monitorKeepsAudio()) startAudio(position_, true);
-    else if (sink_ && !isPlaying() && !monitorKeepsAudio()) stopAudio();
+    refreshAudio(false);
     emit monitoringChanged();
 }
 
@@ -1158,6 +1173,7 @@ std::vector<float> PlaybackController::monitored(int64_t start, int frames, bool
         testMonitor_->section().setTalkback(talkback_);
     }
     testMonitor_->prepare(heard_, sequenceId_);
+    testMonitor_->reset();  // (each call from silence: the delays and noise from their starts)
     std::vector<float> out(size_t(frames) * size_t(testMonitor_->outputs()));
     testMonitor_->render(start, frames, out.data(), nullptr, nullptr, cycle_ ? &*cycle_ : nullptr, !idle);
     if (globalMute_) std::fill(out.begin(), out.end(), 0.0f);
