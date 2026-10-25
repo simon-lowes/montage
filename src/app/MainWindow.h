@@ -295,6 +295,9 @@ public:
     int importMarkers(const QString& path);
     // Bakes the colour effects of the clip a command acts on, at the playhead, into a .cube file.
     bool exportClipLut(const QString& path, int size = 33);
+    // Rebuilds the LUT effect (`lutEffect`, 0: the first) of the clip under the playhead as an editable grade, with the
+    // residual LUT written to `residualPath`; the grade with the LUT is kept as a grade version.
+    bool rebuildLutAsGrade(const QString& residualPath, Id lutEffect = 0);
     // Avid Log Exchange (core/Ale.h): an ALE's log fields and CDLs onto the matching media (and, with `cdlToClips`,
     // the CDLs onto their clips), as one undo step, returning how many media items matched (-1 if it cannot be read);
     // the selected media (else all) as an ALE.

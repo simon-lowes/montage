@@ -204,6 +204,17 @@ std::vector<EffectInfo> buildCatalog() {
                   num("lightness", "Lightness", -1, 1, 0), num("vibrance", "Vibrance", -1, 1, 0)},
                  {}});
     {
+        // RGB Mixer: each output channel a mix of the three input channels (a 3x3 matrix on the values as they are),
+        // for crosstalk between channels as film and some looks have it.
+        EffectInfo mixer{"rgb_mixer", "RGB Mixer", EffectCategory::VideoFilter, "Color", {}, {}};
+        const char* names[3] = {"Red", "Green", "Blue"};
+        for (int o = 0; o < 3; ++o)
+            for (int i = 0; i < 3; ++i)
+                mixer.params.push_back(num(std::string(1, "rgb"[o]) + "." + "rgb"[i], std::string(names[o]) + " Output: " + names[i], -2, 3,
+                                           o == i ? 1 : 0, 0.001));
+        c.push_back(mixer);
+    }
+    {
         // A .cube LUT or a Common LUT Format file (render/Clf.h, as ACES looks come), applied in the working space or
         // in the space it was made for (a camera log, ACEScct, ACES2065-1).
         std::vector<std::string> spaces{"Working space"};
@@ -268,8 +279,12 @@ std::vector<EffectInfo> buildCatalog() {
         for (const auto& cs : colorSpaces()) spaces.push_back(cs.label);
         EffectInfo cst{"color_space_transform", "Colour Space Transform", EffectCategory::VideoFilter, "Color", {},
                        {str("from", "From", StringKind::Choice, colorSpaces().front().label),
-                        str("to", "To", StringKind::Choice, colorSpaces().front().label)}};
+                        str("to", "To", StringKind::Choice, colorSpaces().front().label),
+                        str("rendering", "Rendering", StringKind::Choice, "Display Rendering")}};
         cst.strings[0].choices = cst.strings[1].choices = spaces;
+        // Display Rendering: camera footage into a display space looks as it would on screen (convertColor). None: the
+        // code values converted exactly and nothing more, as a LUT's "Apply In" goes into its space and back.
+        cst.strings[2].choices = {"Display Rendering", "None"};
         c.push_back(cst);
     }
     // Stabilize: the analysed camera path (strings["motion"], written by the

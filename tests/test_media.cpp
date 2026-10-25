@@ -2589,6 +2589,47 @@ private slots:
         QVERIFY(call({{"project", project}, {"clip", 999999.0}, {"path", cube}}).value("isError").toBool());
     }
 
+    void lutToGradeOverMcp() {
+        // A matte with a LUT made from a CDL.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        Effect cdl = makeEffect(p, "cdl");
+        cdl.params["slope.g"] = 1.2;
+        cdl.params["saturation"] = 0.8;
+        const std::string cube = path("look-for-grade.cube");
+        QVERIFY(writeCubeLut(bakeLut({cdl}, 0, 33), cube));
+        Clip c = makeGeneratorClip(p, "color", 30);
+        Effect lut = makeEffect(p, "lut");
+        lut.strings["path"] = cube;
+        c.effects.push_back(lut);
+        edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        const Id id = s.videoTracks[0].clips.front().id;
+        const QString project = QString::fromStdString(path("lut-to-grade.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_lut_to_grade"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        const QJsonObject r = call({{"project", project}, {"clip", double(id)}});
+        const QString text = r.value("content").toArray().at(0).toObject().value("text").toString();
+        QVERIFY2(!r.value("isError").toBool() && text.contains(QString::fromStdString(findEffectInfo("cdl")->displayName)) && text.contains("grade version"),
+                 qPrintable(text));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        const Clip& got = back.active()->videoTracks[0].clips.front();
+        QCOMPARE(got.gradeVersions.size(), size_t(2));
+        QVERIFY(!got.effects.empty() && got.effects.front().type == "cdl");
+        QVERIFY(std::fabs(got.effects.front().p("slope.g", 0, 1) - 1.2) < 0.03);
+        QVERIFY(std::none_of(got.effects.begin(), got.effects.end(), [](const Effect& e) { return e.type == "lut"; }));  // no residual asked for
+        // Nothing left to rebuild now.
+        QVERIFY(call({{"project", project}, {"clip", double(id)}}).value("isError").toBool());
+    }
+
     void qualityCheckSound() {
         // JFK's speech, then three seconds of nothing.
         Project p = makeDefaultProject();

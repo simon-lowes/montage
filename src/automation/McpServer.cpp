@@ -124,6 +124,7 @@
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
 #include "render/LutExport.h"
+#include "render/LutToGrade.h"
 #include "render/ProjectManager.h"
 #include "render/QualityCheck.h"
 #include "render/FrameRepair.h"
@@ -3190,6 +3191,35 @@ void McpServer::Impl::addTools() {
             for (const std::string& n : skipped) left << QString::fromStdString(n);
             return ok(QStringLiteral("Wrote %1 (%2-point cube)%3").arg(path).arg(lut.size)
                           .arg(left.isEmpty() ? QString() : QStringLiteral("; left out: ") + left.join(QStringLiteral(", "))));
+        });
+
+    add("montage_lut_to_grade", "Rebuild a clip's LUT as an editable grade",
+        "Turns a clip's LUT effect (a show LUT or a look from elsewhere) into Montage's own controls fitted to it: Color "
+        "Correct (CDL), RGB Mixer, Curves and Hue Curves, each kept only when it brings the fit closer, then a small "
+        "residual LUT for what they miss (written to residual; none when residual is left out). A LUT applied in another "
+        "space is rebuilt there, between Colour Space Transforms. The grade as it was is kept as a grade version. Reports "
+        "how close the controls come (mean and largest CIEDE2000) and where the LUT clips.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "effect":{"type":"number","description":"The LUT effect's id (default: the clip's first LUT)"},
+            "residual":{"type":"string","description":"A .cube file for the residual LUT"}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Id clip = clipArg(l, a).id;
+            const QString residual = a.contains("residual") ? absolute(a.value("residual").toString()) : QString();
+            LutGrade fit;
+            const edit::Result r = edit::lutToGrade(l.project, s, clip, Id(a.value("effect").toDouble()), residual.toStdString(), &fit);
+            if (!r.ok) return fail(QString::fromStdString(r.error));
+            save(l);
+            QStringList stages;
+            for (const Effect& e : fit.effects) stages << QString::fromStdString(findEffectInfo(e.type) ? findEffectInfo(e.type)->displayName : e.type);
+            QString text = QStringLiteral("Rebuilt as %1: mean delta E %2, largest %3")
+                               .arg(stages.isEmpty() ? QStringLiteral("no controls") : stages.join(QStringLiteral(", ")))
+                               .arg(fit.meanDeltaE, 0, 'f', 2).arg(fit.maxDeltaE, 0, 'f', 2);
+            if (!residual.isEmpty())
+                text += QStringLiteral("; with the residual LUT: mean %1, largest %2").arg(fit.residualMeanDeltaE, 0, 'f', 2).arg(fit.residualMaxDeltaE, 0, 'f', 2);
+            if (fit.clips) text += QStringLiteral("\nThe LUT clips: ") + QString::fromStdString(fit.clipNote);
+            return ok(text + QStringLiteral("\nThe grade with the LUT is kept as a grade version."));
         });
 
     add("montage_audition", "Audition takes on a clip",

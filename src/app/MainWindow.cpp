@@ -105,6 +105,7 @@
 #include "media/Exr.h"
 #include "render/Amf.h"
 #include "render/LutExport.h"
+#include "render/LutToGrade.h"
 #include "media/LtcTimecode.h"
 #include "media/TextReader.h"
 #include "media/Decoder.h"
@@ -1312,6 +1313,16 @@ void MainWindow::buildMenus() {
         const QString path = QFileDialog::getSaveFileName(this, tr("Export LUT"), QString(), tr("LUT files (*.cube)"));
         if (!path.isEmpty()) exportClipLut(path.endsWith(QLatin1String(".cube"), Qt::CaseInsensitive) ? path : path + QStringLiteral(".cube"));
     })->setObjectName(QStringLiteral("exportLut"));
+    add(clipM, tr("Rebuild LUT as &Grade…"), QKeySequence(), [this] {
+        const Clip* c = clipForCommand();
+        if (!c || std::none_of(c->effects.begin(), c->effects.end(), [](const Effect& e) { return e.type == "lut"; })) {
+            statusBar()->showMessage(tr("Select a clip with a LUT effect under the playhead to rebuild it as a grade"), 5000);
+            return;
+        }
+        const QString path = QFileDialog::getSaveFileName(this, tr("Save the Residual LUT"), QString(), tr("LUT files (*.cube)"));
+        if (path.isEmpty()) return;
+        rebuildLutAsGrade(path.endsWith(QLatin1String(".cube"), Qt::CaseInsensitive) ? path : path + QStringLiteral(".cube"));
+    })->setObjectName(QStringLiteral("lutToGrade"));
     add(clipM, tr("Import CDL…"), QKeySequence(), [this] {
         const QString path = QFileDialog::getOpenFileName(this, tr("Import CDL"), QString(), tr("ASC CDL (*.cdl *.cc *.ccc);;All files (*)"));
         if (!path.isEmpty()) importCdl(path);
@@ -5173,6 +5184,36 @@ bool MainWindow::exportClipLut(const QString& path, int size) {
                                             : tr("Exported the grade as %1, without %2 (a LUT holds only colour changes)")
                                                   .arg(QFileInfo(path).fileName(), left.join(QStringLiteral(", "))),
                              8000);
+    return true;
+}
+
+bool MainWindow::rebuildLutAsGrade(const QString& residualPath, Id lutEffect) {
+    const Clip* c = clipForCommand();
+    const Sequence* seq = state_->sequence();
+    if (!c || !seq) return false;
+    const Id clip = c->id;
+    std::function<void(float[3])> lut;
+    const ColorSpace* space = nullptr;
+    std::string err;
+    if (!edit::lutGradeSource(*seq, clip, lutEffect, lut, space, &err)) {
+        state_->message(QString::fromStdString(err), 6000);
+        return false;
+    }
+    const ColorSpace* working = &sequenceColorSpace(*seq);
+    LutGrade fit;
+    if (!runWithProgress(this, state_, tr("Rebuilding the LUT as a grade…"), [&](const auto& progress, const std::atomic<bool>* cancel, std::string* error) {
+            const WorkingSpaceScope scope(working);
+            return fitLutGrade(lut, *space, fit, error, progress, cancel);
+        }))
+        return false;
+    if (!state_->apply(tr("Rebuild LUT as Grade"), [&](Project& p, Sequence& s) {
+            return edit::applyLutGrade(p, s, clip, lutEffect, residualPath.toStdString(), fit);
+        }))
+        return false;
+    QString msg = tr("Rebuilt the LUT as a grade: delta E %1 (largest %2), %3 with the residual LUT")
+                      .arg(fit.meanDeltaE, 0, 'f', 2).arg(fit.maxDeltaE, 0, 'f', 2).arg(fit.residualMeanDeltaE, 0, 'f', 2);
+    if (fit.clips) msg += tr("; the LUT clips (%1)").arg(QString::fromStdString(fit.clipNote));
+    state_->message(msg, 10000);
     return true;
 }
 

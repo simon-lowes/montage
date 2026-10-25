@@ -212,6 +212,7 @@
 #include "SequenceIndexPanel.h"
 #include "core/Automation.h"
 #include "core/History.h"
+#include "render/LutExport.h"
 #include "render/Processing.h"
 #include "media/Segmenter.h"
 #include "HdrSurface.h"
@@ -3028,6 +3029,41 @@ private slots:
         state()->setPlayhead(5000);
         QVERIFY(!win_->exportClipLut(dir_.path() + "/none.cube"));
         QVERIFY(!QFileInfo::exists(dir_.path() + "/none.cube"));
+    }
+
+    void rebuildLutAsGrade() {
+        loadDemo();
+        QVERIFY(win_->findChild<QAction*>("lutToGrade"));
+        // A LUT made from a CDL on the red clip.
+        Project scratch = makeDefaultProject();
+        Effect cdl = makeEffect(scratch, "cdl");
+        cdl.params["slope.r"] = 0.8;
+        cdl.params["offset.b"] = 0.05;
+        const QString cube = dir_.path() + "/look.cube";
+        QVERIFY(writeCubeLut(bakeLut({cdl}, 0, 33), cube.toStdString()));
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        state()->edit("LUT", [red, cube](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "lut");
+            e.strings["path"] = cube.toStdString();
+            edit::clipById(s, red)->effects.push_back(e);
+            return true;
+        });
+        state()->setSelection({red});
+        state()->setPlayhead(30);
+        QVERIFY(win_->rebuildLutAsGrade(dir_.path() + "/residual.cube"));
+        const Clip* c = clipNamed(*state()->sequence(), "Red");
+        QVERIFY(std::none_of(c->effects.begin(), c->effects.end(), [&](const Effect& e) { return e.s("path") == cube.toStdString(); }));
+        QVERIFY(!c->effects.empty() && c->effects.front().type == "cdl");
+        QVERIFY(std::fabs(c->effects.front().p("slope.r", 0, 1) - 0.8) < 0.02);
+        QCOMPARE(c->gradeVersions.size(), size_t(2));
+        QVERIFY2(win_->statusBar()->currentMessage().contains("Rebuilt the LUT"), qPrintable(win_->statusBar()->currentMessage()));
+        // Undo puts the LUT back.
+        state()->undo();
+        c = clipNamed(*state()->sequence(), "Red");
+        QCOMPARE(c->effects.back().s("path"), cube.toStdString());
+        // A clip without a LUT: refused.
+        state()->undo();
+        QVERIFY(!win_->rebuildLutAsGrade(dir_.path() + "/residual.cube"));
     }
 
     void clipMarkersFromTheMenu() {

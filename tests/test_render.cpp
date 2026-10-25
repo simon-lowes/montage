@@ -85,6 +85,7 @@
 #include "render/Processing.h"
 #include "render/QualityCheck.h"
 #include "render/LutExport.h"
+#include "render/LutToGrade.h"
 #include "render/LightLevel.h"
 #include "render/Relight.h"
 #include "render/Deconvolve.h"
@@ -7831,6 +7832,180 @@ colorspaces:
         for (size_t i = 0; i < same.px.size(); ++i) moved = std::max(moved, std::fabs(same.px[i] - before.px[i]));
         QVERIFY2(moved < 1e-4f, qPrintable(QString::number(moved)));
         QVERIFY(!writeCubeLut(Lut3D{}, path));
+    }
+
+    void lutToGrade() {
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        QTemporaryDir dir;
+        const ColorSpace& space = sequenceColorSpace(s);
+        const WorkingSpaceScope working(&space);
+        std::string err;
+        // RGB Mixer: each output a mix of the inputs.
+        Effect mixer = makeEffect(p, "rgb_mixer");
+        mixer.params["r.g"] = 0.2;
+        mixer.params["g.g"] = 0.5;
+        mixer.params["b.r"] = -0.1;
+        Image one(1, 1);
+        one.px = {0.2f, 0.5f, 0.8f, 1};
+        applyVideoEffect(mixer, 0, one, 1);
+        QVERIFY(std::fabs(one.px[0] - 0.3f) < 1e-6f && std::fabs(one.px[1] - 0.25f) < 1e-6f && std::fabs(one.px[2] - 0.78f) < 1e-6f);
+        // A LUT file from a transform on 0..1, 33 points.
+        auto write = [&](const QString& name, const std::function<void(float[3])>& f) {
+            Lut3D l;
+            l.size = 33;
+            for (int b = 0; b < 33; ++b)
+                for (int g = 0; g < 33; ++g)
+                    for (int r = 0; r < 33; ++r) {
+                        float v[3] = {r / 32.0f, g / 32.0f, b / 32.0f};
+                        f(v);
+                        l.data.insert(l.data.end(), v, v + 3);
+                    }
+            const std::string path = (dir.path() + "/" + name).toStdString();
+            [&] { QVERIFY2(writeCubeLut(l, path, name.toStdString(), &err), err.c_str()); }();
+            return path;
+        };
+        auto fitted = [&](const std::string& path) {
+            LutGrade fit;
+            const auto fn = lutTransform(path, &err);
+            [&] { QVERIFY2(fn && fitLutGrade(fn, space, fit, &err), err.c_str()); }();
+            return fit;
+        };
+        auto label = [](const LutGrade& g) {
+            QString t = QString("mean %1 max %2, with the residual %3 %4:").arg(g.meanDeltaE).arg(g.maxDeltaE).arg(g.residualMeanDeltaE).arg(g.residualMaxDeltaE);
+            for (const std::string& st : g.stages) t += " " + QString::fromStdString(st);
+            return t;
+        };
+        // A LUT baked from an ASC CDL comes back as that CDL.
+        Effect cdl = makeEffect(p, "cdl");
+        const double slope[3] = {1.12, 0.94, 1.0}, offset[3] = {0.02, 0.0, -0.015}, power[3] = {0.9, 1.06, 1.0};
+        for (int i = 0; i < 3; ++i) {
+            const std::string c(1, "rgb"[i]);
+            cdl.params["slope." + c] = slope[i];
+            cdl.params["offset." + c] = offset[i];
+            cdl.params["power." + c] = power[i];
+        }
+        cdl.params["saturation"] = 1.1;
+        const std::string cdlPath = (dir.path() + "/cdl.cube").toStdString();
+        QVERIFY(writeCubeLut(bakeLut({cdl}, 0, 33), cdlPath));
+        const LutGrade fromCdl = fitted(cdlPath);
+        QVERIFY2(!fromCdl.stages.empty() && fromCdl.stages[0] == "cdl" && fromCdl.meanDeltaE < 0.2, qPrintable(label(fromCdl)));
+        for (int i = 0; i < 3; ++i) {
+            const std::string c(1, "rgb"[i]);
+            const Effect& got = fromCdl.effects[0];
+            QVERIFY2(std::fabs(got.p("slope." + c, 0, 1) - slope[i]) < 0.02 * slope[i] && std::fabs(got.p("offset." + c, 0, 0) - offset[i]) < 0.004 &&
+                         std::fabs(got.p("power." + c, 0, 1) - power[i]) < 0.02 * power[i],
+                     qPrintable(QString("%1: %2 %3 %4").arg(i).arg(got.p("slope." + c, 0, 1)).arg(got.p("offset." + c, 0, 0)).arg(got.p("power." + c, 0, 1))));
+        }
+        QVERIFY(std::fabs(fromCdl.effects[0].p("saturation", 0, 1) - 1.1) < 0.022);
+        // Curves on their own come back close.
+        Effect curves = makeEffect(p, "curves");
+        curves.strings["red"] = "0,0 0.25,0.2 0.6,0.68 1,1";
+        curves.strings["blue"] = "0,0.03 0.5,0.45 1,0.97";
+        const std::string curvesPath = (dir.path() + "/curves.cube").toStdString();
+        QVERIFY(writeCubeLut(bakeLut({curves}, 0, 33), curvesPath));
+        const LutGrade fromCurves = fitted(curvesPath);
+        QVERIFY2(fromCurves.meanDeltaE < 0.3 && fromCurves.maxDeltaE < 1.5, qPrintable(label(fromCurves)));
+        // A print-like look (channel crosstalk, an S-curve, a hue twist): the controls come close, the residual closer.
+        auto print = [](float v[3]) {
+            const float m[9] = {0.9f, 0.08f, 0.02f, 0.05f, 0.88f, 0.07f, 0.02f, 0.1f, 0.88f};
+            float x[3];
+            for (int o = 0; o < 3; ++o) x[o] = m[o * 3] * v[0] + m[o * 3 + 1] * v[1] + m[o * 3 + 2] * v[2];
+            auto sCurve = [](float t) {
+                auto f = [](float u) { return 1.0f / (1.0f + std::exp(-5.0f * (std::pow(std::clamp(u, 0.0f, 1.0f), 1.1f) - 0.5f))); };
+                return (f(t) - f(0)) / (f(1) - f(0));
+            };
+            for (float& c : x) c = sCurve(c);
+            // Hue turned a little towards orange and teal.
+            QColor col = QColor::fromRgbF(x[0], x[1], x[2]);
+            float h, sat, val, a;
+            col.getHsvF(&h, &sat, &val, &a);
+            if (h >= 0) {
+                h = std::fmod(h + 0.03f * std::sin(float(2 * M_PI) * h * 2) + 1.0f, 1.0f);
+                col = QColor::fromHsvF(h, sat, val);
+                x[0] = float(col.redF()), x[1] = float(col.greenF()), x[2] = float(col.blueF());
+            }
+            std::copy(x, x + 3, v);
+        };
+        const std::string printPath = write("print.cube", print);
+        const LutGrade fromPrint = fitted(printPath);
+        qInfo("print look: %s", qPrintable(label(fromPrint)));
+        QVERIFY2(fromPrint.meanDeltaE < 1.5 && fromPrint.residualMeanDeltaE < 0.3 && fromPrint.residualMeanDeltaE < fromPrint.meanDeltaE / 3,
+                 qPrintable(label(fromPrint)));
+        QVERIFY(!fromPrint.clips);
+        // A LUT that clips is said to.
+        const LutGrade fromClip = fitted(write("clip.cube", [](float v[3]) {
+            for (int c = 0; c < 3; ++c) v[c] = std::min(1.0f, 1.5f * v[c]);
+        }));
+        QVERIFY2(fromClip.clips && fromClip.clipNote == "every channel clips from 69% grey", fromClip.clipNote.c_str());  // (1/1.5 on the lattice)
+
+        // On a clip: the LUT effect becomes the grade (and the residual), the grade with the LUT a version.
+        Clip clip = colorClip(p, 0.5f, 0.4f, 0.3f, 0, 30);
+        Effect lut = makeEffect(p, "lut");
+        lut.strings["path"] = printPath;
+        Effect blur = makeEffect(p, "gaussian_blur");
+        clip.effects = {lut, blur};
+        edit::overwrite(p, s, {TrackKind::Video, 0}, clip);
+        const std::string residual = (dir.path() + "/residual.cube").toStdString();
+        Effect half = lut;
+        half.params["strength"] = 50.0;
+        edit::clipById(s, clip.id)->effects[0] = half;
+        QVERIFY(!edit::lutToGrade(p, s, clip.id, 0, residual).ok);  // part strength: a mix, refused
+        edit::clipById(s, clip.id)->effects[0] = lut;
+        LutGrade fit;
+        const edit::Result r = edit::lutToGrade(p, s, clip.id, 0, residual, &fit);
+        QVERIFY2(r.ok, r.error.c_str());
+        const Clip* c = edit::clipById(s, clip.id);
+        QCOMPARE(c->gradeVersions.size(), size_t(2));
+        QCOMPARE(c->gradeVersion, 1);
+        QCOMPARE(QString::fromStdString(c->gradeVersions[0].name), QString("With LUT"));
+        QCOMPARE(QString::fromStdString(c->gradeVersions[1].name), QString("Rebuilt from LUT"));
+        QVERIFY(QFileInfo::exists(QString::fromStdString(residual)));
+        QCOMPARE(c->effects.size(), fit.effects.size() + 2);  // the stages, the residual, the blur
+        QCOMPARE(c->effects.back().type, std::string("gaussian_blur"));
+        QCOMPARE(c->effects[c->effects.size() - 2].s("path"), residual);
+        for (size_t i = 0; i < fit.effects.size(); ++i) QCOMPARE(c->effects[i].type, fit.effects[i].type);
+        // It looks like the LUT did.
+        std::mt19937 rng(5);
+        std::uniform_real_distribution<float> u(0, 1);
+        Image viaLut(48, 32);
+        for (size_t i = 0; i < viaLut.px.size(); i += 4) viaLut.px[i] = u(rng), viaLut.px[i + 1] = u(rng), viaLut.px[i + 2] = u(rng), viaLut.px[i + 3] = 1;
+        Image viaGrade = viaLut;
+        applyVideoEffect(lut, 0, viaLut, 1);
+        for (size_t i = 0; i + 1 < c->effects.size(); ++i) applyVideoEffect(c->effects[i], 0, viaGrade, 1);
+        float worst = 0;
+        for (size_t i = 0; i < viaLut.px.size(); ++i) worst = std::max(worst, std::fabs(viaLut.px[i] - viaGrade.px[i]));
+        QVERIFY2(worst < 0.03f, qPrintable(QString::number(worst)));
+        // Switching back shows the LUT again.
+        QVERIFY(edit::switchGradeVersion(s, clip.id, 0).ok);
+        c = edit::clipById(s, clip.id);
+        QCOMPARE(c->effects.size(), size_t(2));
+        QCOMPARE(c->effects[0].s("path"), printPath);
+        // A LUT applied in another space is rebuilt there, between Colour Space Transforms.
+        Clip logClip = colorClip(p, 0.5f, 0.4f, 0.3f, 30, 30);
+        Effect logLut = makeEffect(p, "lut");
+        logLut.strings["path"] = printPath;
+        logLut.strings["space"] = findColorSpace("acescct")->label;
+        logClip.effects = {logLut};
+        edit::overwrite(p, s, {TrackKind::Video, 0}, logClip);
+        QVERIFY(effectApplySpace(logLut));
+        const edit::Result lr = edit::lutToGrade(p, s, logClip.id, 0, (dir.path() + "/log-residual.cube").toStdString());
+        QVERIFY2(lr.ok, lr.error.c_str());
+        c = edit::clipById(s, logClip.id);
+        QCOMPARE(c->effects.front().type, std::string("color_space_transform"));
+        QCOMPARE(c->effects.back().type, std::string("color_space_transform"));
+        Image a(32, 16);
+        for (size_t i = 0; i < a.px.size(); i += 4) a.px[i] = u(rng), a.px[i + 1] = u(rng), a.px[i + 2] = u(rng), a.px[i + 3] = 1;
+        Image b = a;
+        applyVideoEffect(logLut, 0, a, 1);
+        for (const Effect& e : c->effects) applyVideoEffect(e, 0, b, 1);
+        worst = 0;
+        double mean = 0;
+        for (size_t i = 0; i < a.px.size(); ++i) worst = std::max(worst, std::fabs(a.px[i] - b.px[i])), mean += std::fabs(a.px[i] - b.px[i]);
+        mean /= double(a.px.size());
+        // (Rec.709 pictures fill under half of ACEScct's range, so the 17-point residual is coarser there than the
+        // 33-point LUT, and coming back out of the log curve magnifies what it misses.)
+        QVERIFY2(worst < 0.15f && mean < 0.005, qPrintable(QString("%1 %2").arg(worst).arg(mean)));
     }
 
     void magnifyChannelBlurNoise() {
