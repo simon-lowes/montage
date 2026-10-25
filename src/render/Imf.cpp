@@ -1024,7 +1024,9 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
                 r.id[6] = uint8_t((r.id[6] & 0x0f) | 0x30);
                 r.id[8] = uint8_t((r.id[8] & 0x3f) | 0x80);
                 names.push_back("urn:uuid:" + dcp::uuidString(r.id));
-                images.push_back(std::move(r));
+                // (A picture shown again, the same words in the same place, is one resource.)
+                if (std::none_of(images.begin(), images.end(), [&](const dcp::TimedTextResource& o) { return o.id == r.id; }))
+                    images.push_back(std::move(r));
             }
             xml = imscImageDocument(pictures, names, s.fps, W, H, plan.track->language);
         } else {

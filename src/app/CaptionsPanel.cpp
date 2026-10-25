@@ -796,11 +796,12 @@ bool CaptionsPanel::importFile(const QString& path, QString* error) {
         if (error) *error = tr("Cannot read %1").arg(path);
         return false;
     }
-    const std::string data = f.readAll().toStdString();
     const QString suffix = QFileInfo(path).suffix().toLower();
     ImageSubtitleFormat pictures;
-    if (imageSubtitleFormatFor(suffix.toStdString(), pictures) || suffix == "mks" || suffix == "mkv" || isImscImage(data))
-        return importPictures(path, error);
+    // (Containers of pictures, a video perhaps, are not read into memory.)
+    if (imageSubtitleFormatFor(suffix.toStdString(), pictures) || suffix == "mks" || suffix == "mkv") return importPictures(path, error);
+    const std::string data = f.readAll().toStdString();
+    if (isImscImage(data)) return importPictures(path, error);
     std::vector<Caption> caps;
     std::string err;
     if (!parseSubtitles(data, s->fps, caps, &err)) {
@@ -913,7 +914,7 @@ void CaptionsPanel::importDialog() {
     if (path.isEmpty()) return;
     settings.setValue("captions/dir", QFileInfo(path).absolutePath());
     QString err;
-    if (!importFile(path, &err)) QMessageBox::warning(this, tr("Import Captions"), err);
+    if (!importFile(path, &err) && !err.isEmpty()) QMessageBox::warning(this, tr("Import Captions"), err);  // (none when cancelled)
 }
 
 void CaptionsPanel::exportDialog() {

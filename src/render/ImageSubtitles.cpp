@@ -10,7 +10,9 @@
 #include <QXmlStreamReader>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <map>
 #include <memory>
 #include <unordered_map>
@@ -113,6 +115,8 @@ std::vector<ImageSubtitleStream> imageSubtitleStreams(const std::string& path) {
     std::vector<ImageSubtitleStream> out;
     AVFormatContext* fmt = nullptr;
     if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return out;
+    // (MPEG program and transport streams find their streams as their packets come.)
+    if (fmt->ctx_flags & AVFMTCTX_NOHEADER) avformat_find_stream_info(fmt, nullptr);
     for (unsigned i = 0; i < fmt->nb_streams; ++i) {
         const AVStream* st = fmt->streams[i];
         const AVCodecID id = st->codecpar->codec_id;

@@ -1639,13 +1639,13 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
 
     // Writes the captions that start before frame `until` (export range only), on every caption stream.
     std::vector<uint8_t> subBuf(1 << 16);
-    auto writeCaptions = [&](FrameTime until) -> bool {
+    auto writeCaptions = [&](FrameTime until, bool last = false) -> bool {
         const double msPerFrame = 1000.0 / dseq.fpsValue();
         for (auto& co : captionOuts) {
             if (!co->image) continue;
-            // Pictures: each packet whose time has come.
+            // Pictures: each packet whose time has come (at the end, the one clearing the last caption too).
             const int64_t limit = int64_t(std::llround(double(until - din) * 90000.0 / dseq.fpsValue()));
-            for (; co->next < co->pictures.size() && co->pictures[co->next].pts < limit; ++co->next) {
+            for (; co->next < co->pictures.size() && (co->pictures[co->next].pts < limit || (last && co->pictures[co->next].pts <= limit)); ++co->next) {
                 const SubtitlePacket& sp = co->pictures[co->next];
                 av_packet_unref(o.pkt);
                 if (av_new_packet(o.pkt, int(sp.data.size())) < 0) return false;
@@ -2100,6 +2100,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             progress(renderFrom + (1 - renderFrom) * double(f - din + 1) / double(total),
                      conv.active() ? in + FrameTime(double(f - din) * double(out - in) / double(total)) : f);
     }
+    if (!writeCaptions(dout, true)) return fail("Writing captions failed");
     // Flush the encoders; errors here (e.g. a full disk) must fail the export.
     if (wantAudio) {
         if (o.actx) {

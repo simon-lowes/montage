@@ -5930,8 +5930,15 @@ int MainWindow::importEmbeddedCaptions() {
     const std::string path = m->path;
     const Rational fps = s->fps;
     const Clip target = *clip;
-    // Subtitle pictures (a disc's or a broadcast's PGS, DVB or DVD subtitles) are read off them by OCR.
-    if (!imageSubtitleStreams(path).empty()) {
+    // Closed captions first (exact); else subtitle pictures (a disc's or a broadcast's PGS, DVB or DVD subtitles),
+    // read off them by OCR.
+    const bool pictures = !imageSubtitleStreams(path).empty();
+    std::vector<Caption> found;
+    if (!runWithProgress(this, state_, tr("Reading closed captions..."), [&](const auto& progress, const auto* cancel, std::string* e) {
+            return readEmbeddedCaptions(path, fps, found, progress, cancel, e) || (pictures && !(cancel && *cancel));
+        }))
+        return 0;
+    if (found.empty() && pictures) {
         if (!ensureModelPack(this, ocrModel(), tr("Import Embedded Captions"),
                              tr("Subtitles that are pictures are read with PP-OCR (PaddlePaddle, Apache-2.0), which runs on this computer.")))
             return 0;
@@ -5959,11 +5966,6 @@ int MainWindow::importEmbeddedCaptions() {
                         6000);
         return int(placed.size());
     }
-    std::vector<Caption> found;
-    if (!runWithProgress(this, state_, tr("Reading closed captions..."), [&](const auto& progress, const auto* cancel, std::string* e) {
-            return readEmbeddedCaptions(path, fps, found, progress, cancel, e);
-        }))
-        return 0;
     const std::vector<Caption> placed = captionsThroughClip(target, found);
     if (placed.empty()) {
         state_->message(tr("None of the clip's closed captions fall within it"));

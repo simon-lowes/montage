@@ -6963,7 +6963,7 @@ colorspaces:
     void exportsImfImageSubtitles() {
         if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
         QTemporaryDir dir;
-        // Two subtitles over a two-second matte, sent as pictures (the IMSC 1.1 Image profile).
+        // Three subtitles over a two-second matte, sent as pictures (the IMSC 1.1 Image profile), the third the first again.
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
         s.width = 960, s.height = 540, s.fps = Rational{24, 1};
@@ -6975,7 +6975,8 @@ colorspaces:
         Caption a{4, 20, "Pictures, not text"};
         Caption b{26, 44, "The second subtitle"};
         b.vertical = kCaptionTop;
-        t.captions = {a, b};
+        Caption c{44, 48, "Pictures, not text"};
+        t.captions = {a, b, c};
         s.captionTracks.push_back(t);
         ImfSettings st;
         st.title = "Pictures";
@@ -6989,7 +6990,8 @@ colorspaces:
         QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
         const QStringList photon = photonErrors(QString::fromStdString(r.folder));
         QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
-        // The timed text track file: an Image profile document, and its two PNGs in the file under their ids.
+        // The timed text track file: an Image profile document, and its two PNGs (the repeated one once) in the file under
+        // their ids.
         std::string xml;
         dcp::ImfTrackReader text;
         for (const std::string& f : r.trackFiles) {
@@ -7011,8 +7013,8 @@ colorspaces:
         QVERIFY2(problems.empty(), problems.empty() ? "" : problems.front().c_str());
         DecodedSubtitles pictures;
         QVERIFY2(decodeImscImage(xml, png, pictures, &err), err.c_str());
-        QCOMPARE(pictures.pictures.size(), size_t(2));
-        for (size_t i = 0; i < 2; ++i) {
+        QCOMPARE(pictures.pictures.size(), size_t(3));
+        for (size_t i = 0; i < 3; ++i) {
             QCOMPARE(FrameTime(std::llround(pictures.pictures[i].start * 24)), t.captions[i].start);
             QCOMPARE(FrameTime(std::llround(pictures.pictures[i].end * 24)), t.captions[i].end);
         }
@@ -7054,8 +7056,8 @@ colorspaces:
         const Sequence* opened = q.findSequence(in.sequence);
         QVERIFY(opened && opened->captionTracks.size() == 1);
         const CaptionTrack& back = opened->captionTracks[0];
-        QCOMPARE(back.captions.size(), size_t(2));
-        for (size_t i = 0; i < 2; ++i) {
+        QCOMPARE(back.captions.size(), size_t(3));
+        for (size_t i = 0; i < 3; ++i) {
             QCOMPARE(QString::fromStdString(back.captions[i].text), QString::fromStdString(t.captions[i].text));
             QCOMPARE(back.captions[i].start, t.captions[i].start);
             QCOMPARE(back.captions[i].end, t.captions[i].end);
