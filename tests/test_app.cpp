@@ -1875,14 +1875,17 @@ private slots:
         QCOMPARE(m->timecode, 3600.0);
         QVERIFY(m->duration < 5.9);
         QVERIFY(dlg->statusText().startsWith("Recording 00:00:0"));
+        // Growing from when it is imported (under load the rest of the recording can pass before the loop below looks),
+        // and its length seen rising while it records.
+        bool grew = state()->isMediaGrowing(id);
+        const double firstSeen = m->duration;
         // Cut in while it records.
         QVERIFY(state()->edit("Place", [id](Project& p, Sequence& s) { return edit::placeMedia(p, s, id, 0, 0, 25, {TrackKind::Video, 0}, {}, false).ok; }));
-        bool grew = false;
         QElapsedTimer t;
         t.start();
         while (dlg->isRecording() && t.elapsed() < 20000) {
             QTest::qWait(50);
-            grew = grew || state()->isMediaGrowing(id);
+            grew = grew || state()->isMediaGrowing(id) || state()->project().findMedia(id)->duration > firstSeen + 0.5;
         }
         QVERIFY(!dlg->isRecording());
         QVERIFY(grew);

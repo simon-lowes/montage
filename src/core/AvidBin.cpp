@@ -1313,6 +1313,7 @@ bool BinReader::readBin(uint32_t root, std::string* error) {
         }
     }
     bin_.indexedMobs = bin_.mobs.size();
+    if (!bin_.mobs.empty()) bin_.lastIndexed = bin_.mobs.back().mobId;
     return true;
 }
 
@@ -1350,7 +1351,9 @@ const AvidMob* AvidBin::findMob(const AvidMobId& id) const {
     if (const auto it = mobIndex.find(id); it != mobIndex.end() && it->second < mobs.size() && mobs[it->second].mobId == id)
         return &mobs[it->second];
     // (mobs added or changed since they were read)
-    const bool changed = indexedMobs > mobs.size() || (mobIndex.count(id) != 0);
+    // (mobs taken away since: the index may be off, and a mob added since may sit below indexedMobs)
+    const bool changed = indexedMobs > mobs.size() || mobIndex.count(id) != 0 ||
+                         (indexedMobs > 0 && !(mobs[indexedMobs - 1].mobId == lastIndexed));
     for (size_t i = changed ? 0 : indexedMobs; i < mobs.size(); ++i)
         if (mobs[i].mobId == id) return &mobs[i];
     return nullptr;

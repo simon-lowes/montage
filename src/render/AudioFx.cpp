@@ -85,7 +85,8 @@ void ParametricEq::process(float* buf, int frames) {
 
 // ---- De-esser ----------------------------------------------------------------
 
-void DeEsser::process(float* buf, int frames, double sr, double hz, double thresholdDb, double maxReductionDb) {
+void DeEsser::process(float* buf, int frames, double sr, double hz, double thresholdDb, double maxReductionDb, float* gains,
+                      bool replay) {
     if (hz != hz_ || sr != sr_) {
         for (int k = 0; k < 2; ++k) {
             low_[k].lowPass(sr, hz);
@@ -102,11 +103,17 @@ void DeEsser::process(float* buf, int frames, double sr, double hz, double thres
             lo[ch] = low_[1].process(ch, low_[0].process(ch, d[ch]));
             hi[ch] = high_[1].process(ch, high_[0].process(ch, d[ch]));
         }
-        const double lvl = std::max(std::fabs(hi[0]), std::fabs(hi[1]));
-        env_ = lvl > env_ ? att * env_ + (1 - att) * lvl : rel * env_ + (1 - rel) * lvl;
-        // Over the threshold the band comes down 1:1, up to the most reduction allowed.
-        const double over = 20 * std::log10(env_ + 1e-9) - thresholdDb;
-        const float keep = dbToLin(-std::clamp(over, 0.0, maxReductionDb));
+        float keep;
+        if (gains && replay) {
+            keep = gains[i];
+        } else {
+            const double lvl = std::max(std::fabs(hi[0]), std::fabs(hi[1]));
+            env_ = lvl > env_ ? att * env_ + (1 - att) * lvl : rel * env_ + (1 - rel) * lvl;
+            // Over the threshold the band comes down 1:1, up to the most reduction allowed.
+            const double over = 20 * std::log10(env_ + 1e-9) - thresholdDb;
+            keep = dbToLin(-std::clamp(over, 0.0, maxReductionDb));
+            if (gains) gains[i] = keep;
+        }
         d[0] = lo[0] + hi[0] * keep;
         d[1] = lo[1] + hi[1] * keep;
     }
@@ -115,7 +122,7 @@ void DeEsser::process(float* buf, int frames, double sr, double hz, double thres
 // ---- Noise gate --------------------------------------------------------------
 
 void NoiseGate::process(float* buf, int frames, double sr, double thresholdDb, double rangeDb, double attackMs, double holdMs,
-                        double releaseMs, const float* key) {
+                        double releaseMs, const float* key, float* gains, bool replay) {
     const double det = std::exp(-1.0 / (0.002 * sr));  // the level detector's own smoothing
     const double att = std::exp(-1.0 / (std::max(0.05, attackMs) / 1000 * sr));
     const double rel = std::exp(-1.0 / (std::max(1.0, releaseMs) / 1000 * sr));
@@ -124,6 +131,10 @@ void NoiseGate::process(float* buf, int frames, double sr, double thresholdDb, d
     const int hold = int(std::max(0.0, holdMs) / 1000 * sr);
     for (int i = 0; i < frames; ++i) {
         float* d = buf + i * 2;
+        if (gains && replay) {
+            d[0] *= gains[i], d[1] *= gains[i];
+            continue;
+        }
         const float* k = key ? key + i * 2 : d;
         const double lvl = std::max(std::fabs(k[0]), std::fabs(k[1]));
         env_ = lvl > env_ ? lvl : det * env_ + (1 - det) * lvl;
@@ -138,6 +149,7 @@ void NoiseGate::process(float* buf, int frames, double sr, double thresholdDb, d
         gain_ = target > gain_ ? att * gain_ + (1 - att) * target : rel * gain_ + (1 - rel) * target;
         d[0] = float(d[0] * gain_);
         d[1] = float(d[1] * gain_);
+        if (gains) gains[i] = float(gain_);
     }
 }
 
@@ -209,7 +221,7 @@ void channelTools(float* buf, int frames, int mode, bool invertLeft, bool invert
 // ---- Multiband compressor -----------------------------------------------------
 
 void MultibandCompressor::process(float* buf, int frames, double sr, double lowHz, double highHz, const BandSettings bands[3],
-                                  double attackMs, double releaseMs, double outputDb) {
+                                  double attackMs, double releaseMs, double outputDb, float* gains, bool replay) {
     highHz = std::max(highHz, lowHz * 1.5);
     if (sr != sr_ || lowHz != lowHz_ || highHz != highHz_) {
         for (int k = 0; k < 2; ++k) {
@@ -237,6 +249,11 @@ void MultibandCompressor::process(float* buf, int frames, double sr, double lowH
         }
         float sum[2] = {0, 0};
         for (int b = 0; b < 3; ++b) {
+            if (gains && replay) {
+                const float g = gains[i * 3 + b];
+                sum[0] += band[b][0] * g, sum[1] += band[b][1] * g;
+                continue;
+            }
             const double level = std::max(std::fabs(band[b][0]), std::fabs(band[b][1]));
             env_[b] = level > env_[b] ? att * env_[b] + (1 - att) * level : rel * env_[b] + (1 - rel) * level;
             const double over = 20 * std::log10(env_[b] + 1e-9) - bands[b].thresholdDb;
@@ -244,6 +261,7 @@ void MultibandCompressor::process(float* buf, int frames, double sr, double lowH
             // Soft knee: the reduction grows smoothly over the 6 dB round the threshold.
             const double reduce = over <= -knee / 2 ? 0 : over >= knee / 2 ? over * slope : slope * (over + knee / 2) * (over + knee / 2) / (2 * knee);
             const float g = dbToLin(bands[b].gainDb - reduce);
+            if (gains) gains[i * 3 + b] = g;
             sum[0] += band[b][0] * g, sum[1] += band[b][1] * g;
         }
         d[0] = sum[0] * out;

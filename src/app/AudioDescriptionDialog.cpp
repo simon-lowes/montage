@@ -1,6 +1,8 @@
 #include "AudioDescriptionDialog.h"
 
 #include <QApplication>
+#include <QFutureWatcher>
+#include <QtConcurrent>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDoubleSpinBox>
@@ -161,11 +163,44 @@ AudioDescriptionDialog::AudioDescriptionDialog(EditorState* state, QWidget* pare
     refind_ = new QTimer(this);
     refind_->setSingleShot(true);
     refind_->setInterval(400);
+    // (The dialogue is listened to off the UI thread, which a long sequence would hold up; the answer is used if the
+    // dialogue is still as it was, else it is listened to again.)
     connect(refind_, &QTimer::timeout, this, [this] {
         if (!isVisible() || !stale()) return;
         if (QWidget* w = QApplication::focusWidget(); w && w != table_ && table_->isAncestorOf(w)) return refind_->start();  // (typing)
-        QString err;
-        if (foundFor_.empty() ? !checkAdded(&err) : findGaps(&err) < 0) status_->setText(err);
+        const Sequence* s = state_->sequence();
+        if (!s) return;
+        if (listening_) {
+            listenAgain_ = true;
+            return;
+        }
+        listening_ = true;
+        const Project project = state_->project();
+        const Sequence sequence = *s;
+        const int skip = adTrack();
+        const std::string layout = dialogueLayout();
+        const bool found = !foundFor_.empty();
+        const Id sequenceId = s->id;
+        const auto cancel = cancel_;
+        auto* watcher = new QFutureWatcher<std::pair<Spans, std::string>>(this);
+        connect(watcher, &QFutureWatcher<std::pair<Spans, std::string>>::finished, this, [this, watcher, layout, found, sequenceId, cancel] {
+            const auto [speech, err] = watcher->result();
+            watcher->deleteLater();
+            listening_ = false;
+            QString why;
+            if (const Sequence* now = state_->sequence();
+                now && now->id == sequenceId && !cancel->load() && dialogueLayout() == layout && found == !foundFor_.empty()) {
+                if (found ? useFound(speech, err, layout, &why) < 0 : !useAdded(speech, err, layout, &why)) status_->setText(why);
+            } else {
+                listenAgain_ = true;
+            }
+            if (std::exchange(listenAgain_, false) && isVisible() && stale()) refind_->start();
+        });
+        watcher->setFuture(QtConcurrent::run([project, sequence, skip, cancel] {
+            std::string err;
+            Spans speech = descriptionSpeech(project, sequence, skip, &err, cancel.get());
+            return std::make_pair(std::move(speech), err);
+        }));
     });
     connect(state_, &EditorState::projectChanged, this, [this] {
         if (isVisible() && stale()) refind_->start();
@@ -183,8 +218,16 @@ AudioDescriptionDialog::AudioDescriptionDialog(EditorState* state, QWidget* pare
 
 void AudioDescriptionDialog::showEvent(QShowEvent* e) {
     QDialog::showEvent(e);
+    if (cancel_->load()) cancel_ = std::make_shared<std::atomic<bool>>(false);
     if (stale()) refind_->start();
 }
+
+void AudioDescriptionDialog::hideEvent(QHideEvent* e) {
+    cancel_->store(true);  // (a listening still going stops; its answer is not used)
+    QDialog::hideEvent(e);
+}
+
+AudioDescriptionDialog::~AudioDescriptionDialog() { cancel_->store(true); }
 
 bool AudioDescriptionDialog::stale() const {
     if (!foundFor_.empty()) return dialogueLayout() != foundFor_;
@@ -212,7 +255,13 @@ bool AudioDescriptionDialog::checkAdded(QString* error) {
     std::string err;
     const Spans speech = descriptionSpeech(state_->project(), *s, adTrack(), &err);
     QApplication::restoreOverrideCursor();
-    addedFor_ = dialogueLayout();
+    return useAdded(speech, err, dialogueLayout(), error);
+}
+
+bool AudioDescriptionDialog::useAdded(const Spans& speech, const std::string& err, const std::string& layout, QString* error) {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    addedFor_ = layout;
     if (!err.empty()) {
         if (error) *error = qs(err);
         return false;
@@ -258,7 +307,13 @@ int AudioDescriptionDialog::findGaps(QString* error) {
     std::string err;
     const Spans speech = descriptionSpeech(state_->project(), *s, adTrack(), &err);
     QApplication::restoreOverrideCursor();
-    foundFor_ = dialogueLayout();  // (also when it fails: not tried again until the dialogue changes)
+    return useFound(speech, err, dialogueLayout(), error);
+}
+
+int AudioDescriptionDialog::useFound(const Spans& speech, const std::string& err, const std::string& layout, QString* error) {
+    const Sequence* s = state_->sequence();
+    if (!s) return -1;
+    foundFor_ = layout;  // (also when it fails: not tried again until the dialogue changes)
     if (!err.empty()) {
         if (error) *error = qs(err);
         return -1;

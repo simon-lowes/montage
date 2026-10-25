@@ -10058,6 +10058,24 @@ private slots:
         QCOMPARE(files, 4);
         // The project's sequence is found even with compound sequences written before it.
         QCOMPARE(back.duration(), FrameTime(130));
+        // The lav's angle placed to the sample (a head and a tail): its times in samples, read back the same.
+        {
+            Project ps = p;
+            Sequence& msq = *ps.findSequence(ps.findMedia(mcMedia)->sequenceId);
+            Clip& lavClip = msq.audioTracks.at(2).clips.at(0);
+            lavClip.start = 3;
+            lavClip.head = 0.25;
+            lavClip.tail = 0.5;
+            const std::string sx = exportFcpXml(ps, *ps.active());
+            Project qs = makeDefaultProject();
+            ImportResult rs = importXmlTimeline(qs, sx);
+            QVERIFY2(rs.ok, rs.error.c_str());
+            const Sequence* mcs = qs.findSequence(qs.findMedia(trackAt(*qs.findSequence(rs.sequence), V1)->clips.at(0).mediaId)->sequenceId);
+            const Clip& got = mcs->audioTracks.at(2).clips.at(0);
+            QVERIFY2(got.start == 3 && got.duration == lavClip.duration && std::fabs(got.head - 0.25) < 1e-3 &&
+                         std::fabs(got.tail - 0.5) < 1e-3 && std::fabs(got.sourceIn - lavClip.sourceIn) < 1e-3,
+                     qPrintable(QString("start %1 duration %2 head %3 tail %4 in %5").arg(got.start).arg(got.duration).arg(got.head).arg(got.tail).arg(got.sourceIn)));
+        }
 
         // As Final Cut writes them: random angle ids, an hour's timecode start, picture from one angle and sound from
         // another, a compound clip of sound alone.

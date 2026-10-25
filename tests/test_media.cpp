@@ -2842,7 +2842,7 @@ private slots:
         const double speechSeconds = double(jfk->frames()) / rate;
         std::string setup;  // (what went wrong making a sequence)
         auto measure = [&](const std::string& under, double seconds, std::vector<double> starts = {0},
-                           bool compressed = false) -> std::pair<Intelligibility, Project> {
+                           int compressed = 0) -> std::pair<Intelligibility, Project> {
             Project p = makeDefaultProject();
             Sequence& s = *p.active();
             MediaItem speech = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/jfk.wav"), bed = probeOrFail(p, under);
@@ -2861,7 +2861,16 @@ private slots:
                 comp.params["threshold_db"] = Param(-45.0);
                 comp.params["ratio"] = Param(10.0);
                 comp.params["makeup_db"] = Param(30.0);  // (about what it takes away: the mix as loud as before)
+                if (compressed == 2) {  // fast, to the waveform, then a limiter
+                    comp.params["attack_ms"] = Param(0.1);
+                    comp.params["release_ms"] = Param(5.0);
+                }
                 s.masterEffects.push_back(comp);
+                if (compressed == 2) {
+                    Effect lim = makeEffect(p, "limiter");
+                    lim.params["ceiling_db"] = Param(-12.0);
+                    s.masterEffects.push_back(lim);
+                }
             }
             IntelligibilityOptions o;
             o.out = FrameTime(std::llround(seconds * fps));
@@ -2896,10 +2905,18 @@ private slots:
         {
             const std::string file = path("music-compressed.wav");
             writeFloatWav(file, lowMusic(speechSeconds, speechRms * std::pow(10.0, 10 / 20.0)));
-            const double plain = measure(file, speechSeconds).first.average, squeezed = measure(file, speechSeconds, {0}, true).first.average;
+            const double plain = measure(file, speechSeconds).first.average, squeezed = measure(file, speechSeconds, {0}, 1).first.average;
             QVERIFY2(setup.empty(), setup.c_str());
             qInfo("compressed %.3f, plain %.3f", squeezed, plain);
             QVERIFY2(std::fabs(squeezed - plain) < 0.1, qPrintable(QString("compressed %1, plain %2").arg(squeezed).arg(plain)));
+            // Compression as fast as the waveform, then a limiter, over silence: the mix less the dialogue is nothing, so
+            // the dialogue scores as it does alone (none of it is left in the masker).
+            const std::string silence = path("silence.wav");
+            writeFloatWav(silence, std::vector<float>(size_t(speechSeconds * rate) * 2, 0.0f));
+            const double alone = measure(silence, speechSeconds).first.average, fast = measure(silence, speechSeconds, {0}, 2).first.average;
+            QVERIFY2(setup.empty(), setup.c_str());
+            qInfo("alone %.3f, fast dynamics %.3f", alone, fast);
+            QVERIFY2(alone > 0.9 && fast > alone - 0.02, qPrintable(QString("fast %1, alone %2").arg(fast).arg(alone)));
         }
 
         // A 33 s mix (the speech three times) over noise 15 dB down, which swells to 10 dB over the speech from 12 to 15 s:
@@ -10890,6 +10907,75 @@ private slots:
         QVERIFY2(!r.value("isError").toBool(), qPrintable(QJsonDocument(r).toJson()));
         QVERIFY(loadProject(project.toStdString(), back));
         QVERIFY(back.active()->audioTracks[0].effects.empty());
+    }
+
+    void dynamicsHeldToTheMix() {
+        // A voice (1 kHz and 7 kHz, in bursts) on A1 with music (110 Hz and 3 kHz) on A2, through a compressor on A1 keyed
+        // by A2, then on the master a compressor as fast as the waveform, a multiband compressor, a de-esser, a gate and
+        // a limiter. With the dynamics held to the mix's, each track mixed alone is its part of the mix: the two add up
+        // to the mix, to the sample.
+        const int rate = 48000, seconds = 3;
+        std::vector<float> voice(size_t(rate) * seconds), music(size_t(rate) * seconds);
+        for (size_t i = 0; i < voice.size(); ++i) {
+            const double t = double(i) / rate, burst = std::fmod(t, 0.5) < 0.3 ? 1 : 0.05;
+            voice[i] = float(burst * (0.3 * std::sin(2 * M_PI * 1000 * t) + 0.2 * std::sin(2 * M_PI * 7000 * t)));
+            music[i] = float(0.4 * std::sin(2 * M_PI * 110 * t) + 0.1 * std::sin(2 * M_PI * 3000 * t) * (0.5 + 0.5 * std::sin(2 * M_PI * 1.3 * t)));
+        }
+        QVERIFY(writeMonoWav(path("held-voice.wav"), voice, rate));
+        QVERIFY(writeMonoWav(path("held-music.wav"), music, rate));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        p.media.push_back(probeOrFail(p, path("held-voice.wav")));
+        p.media.push_back(probeOrFail(p, path("held-music.wav")));
+        while (s.audioTracks.size() < 2) edit::addTrack(p, s, TrackKind::Audio);
+        QVERIFY(edit::placeMedia(p, s, p.media[0].id, 0, 0, -1, {TrackKind::Video, -1}, {TrackKind::Audio, 0}, false).ok);
+        QVERIFY(edit::placeMedia(p, s, p.media[1].id, 0, 0, -1, {TrackKind::Video, -1}, {TrackKind::Audio, 1}, false).ok);
+        Effect keyed = makeEffect(p, "compressor");
+        keyed.params["threshold_db"] = Param(-30.0);
+        keyed.params["attack_ms"] = Param(1.0);
+        keyed.strings["sidechain"] = std::to_string(s.audioTracks[1].id);
+        s.audioTracks[0].effects = {keyed};
+        Effect comp = makeEffect(p, "compressor");
+        comp.params["threshold_db"] = Param(-24.0);
+        comp.params["ratio"] = Param(8.0);
+        comp.params["attack_ms"] = Param(0.1);
+        comp.params["release_ms"] = Param(5.0);
+        comp.params["makeup_db"] = Param(12.0);
+        Effect multi = makeEffect(p, "multiband"), ess = makeEffect(p, "deesser"), gate = makeEffect(p, "gate"), lim = makeEffect(p, "limiter");
+        gate.params["threshold_db"] = Param(-20.0);
+        lim.params["ceiling_db"] = Param(-6.0);
+        s.masterEffects = {comp, multi, ess, gate, lim};
+        Sequence voiceAlone = s, musicAlone = s;
+        voiceAlone.audioTracks[1].clips[0].enabled = false;
+        musicAlone.audioTracks[0].clips[0].enabled = false;
+        AudioMixer whole, a, b;
+        AudioMixer::GainTape tape;
+        whole.setGainTape(&tape, false);
+        a.setGainTape(&tape, true);
+        b.setGainTape(&tape, true);
+        std::vector<float> mix(2048), va(2048), mb(2048);
+        double worst = 0, peak = 0, apart = 0;
+        for (int at = 0; at < seconds * rate; at += 1024) {
+            const int n = std::min(1024, seconds * rate - at);
+            whole.mix(p, s, at, n, mix.data());
+            a.mix(p, voiceAlone, at, n, va.data());
+            b.mix(p, musicAlone, at, n, mb.data());
+            for (int i = 0; i < 2 * n; ++i) {
+                worst = std::max(worst, double(std::fabs(mix[size_t(i)] - va[size_t(i)] - mb[size_t(i)])));
+                peak = std::max(peak, double(std::fabs(mix[size_t(i)])));
+            }
+        }
+        QVERIFY2(peak > 0.1 && worst < 1e-5, qPrintable(QString("peak %1, worst %2").arg(peak).arg(worst)));
+        // Mixed alone without the tape, each part would be turned by itself: far from adding up.
+        AudioMixer whole2, a2, b2;
+        for (int at = 0; at < seconds * rate; at += 1024) {
+            const int n = std::min(1024, seconds * rate - at);
+            whole2.mix(p, s, at, n, mix.data());
+            a2.mix(p, voiceAlone, at, n, va.data());
+            b2.mix(p, musicAlone, at, n, mb.data());
+            for (int i = 0; i < 2 * n; ++i) apart = std::max(apart, double(std::fabs(mix[size_t(i)] - va[size_t(i)] - mb[size_t(i)])));
+        }
+        QVERIFY2(apart > 0.05, qPrintable(QString::number(apart)));
     }
 
     void describedExportAndMcp() {

@@ -828,9 +828,9 @@ struct FcpxWriter {
         }
         if (lane != 0) w.writeAttribute("lane", QString::number(lane));
         // Sound placed to the sample (its head and tail, parts of its first and last frames left silent), connected at
-        // its own speed: its times in samples, as Final Cut Pro edits sound on its own. (In a storyline, or retimed, it
-        // keeps whole frames, its neighbours and time map in frames too.)
-        const bool sampled = lane < 0 && !c.isGenerator() && !inner && c.speed == 1.0 && !c.reverse && !c.ramped();
+        // its own speed, or in a storyline of sound alone: its times in samples, as Final Cut Pro edits sound on its own.
+        // (In a storyline with pictures, or retimed, it keeps whole frames, its neighbours and time map in frames too.)
+        const bool sampled = (lane < 0 || storylineSamples) && !c.isGenerator() && !inner && c.speed == 1.0 && !c.reverse && !c.ramped();
         const double head = sampled ? c.head : 0, tail = sampled ? c.tail : 0;
         auto ts = [&](double frames) {
             if (head == 0 && tail == 0) return t(frames);
@@ -937,6 +937,8 @@ struct FcpxWriter {
         writtenMarkers = marks;
     }
 
+    bool storylineSamples = false;  // writing an angle of sound alone (its clips' times in samples)
+
     // A multicam clip's angles, each a storyline of its own.
     void multicamBody(const Sequence& mc) {
         const Sequence* was = cur;
@@ -946,20 +948,37 @@ struct FcpxWriter {
         w.writeAttribute("tcStart", "0s");
         w.writeAttribute("tcFormat", isDropFrameRate(mc.fps) ? "DF" : "NDF");
         auto storyline = [&](const Track& tr, const Track* sound) {
-            FrameTime cursor = 0;
+            // An angle of sound alone keeps its clips' heads and tails: their times in samples, as clip() writes them,
+            // and the gaps between running exactly from one to the next (in units of a sample and of a frame both).
+            const bool samples = tr.kind == TrackKind::Audio;
+            const long long rate = mc.sampleRate > 0 ? mc.sampleRate : 48000, perFrame = mc.fps.den * rate, perSample = mc.fps.num;
+            const long long unit = rate * mc.fps.num;  // a second
+            auto at = [&](long long u) {
+                if (u == 0) return QString("0s");
+                const long long g = std::gcd(u, unit);
+                return unit / g == 1 ? QString("%1s").arg(u / g) : QString("%1/%2s").arg(u / g).arg(unit / g);
+            };
+            auto sampleUnits = [&](double frames) { return std::llround(frames * double(rate) * mc.fps.den / mc.fps.num) * perSample; };
+            long long cursor = 0;
             for (const Clip& c : tr.clips) {
-                if (c.start > cursor) {
+                // (As clip() places it: retimed sound keeps whole frames, and so does sound with no head or tail.)
+                const bool keep = samples && !c.isGenerator() && !nestedOf(c) && c.speed == 1.0 && !c.reverse && !c.ramped() &&
+                                  (c.head != 0 || c.tail != 0);
+                const long long from = keep ? sampleUnits(double(c.start) + c.head) : c.start * perFrame;
+                if (from > cursor) {
                     w.writeEmptyElement("gap");
                     w.writeAttribute("name", "Gap");
-                    w.writeAttribute("offset", t(double(cursor)));
+                    w.writeAttribute("offset", at(cursor));
                     w.writeAttribute("start", "0s");
-                    w.writeAttribute("duration", t(double(c.start - cursor)));
+                    w.writeAttribute("duration", at(from - cursor));
                 }
                 bool carried = false;
                 if (sound)
                     for (const Clip& a : sound->clips) carried |= a.mediaId == c.mediaId && a.start == c.start && a.duration == c.duration;
-                clip(c, 0, double(c.start), carried, {}, nullptr, tr.kind == TrackKind::Audio);
-                cursor = c.end();
+                storylineSamples = samples;
+                clip(c, 0, double(c.start), carried, {}, nullptr, samples);
+                storylineSamples = false;
+                cursor = from + (keep ? sampleUnits(double(c.duration) - c.head - c.tail) : c.duration * perFrame);
             }
         };
         int index = 0;

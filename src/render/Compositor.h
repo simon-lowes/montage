@@ -5,7 +5,9 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "Stereo.h"
@@ -166,6 +168,23 @@ public:
     // speakers (the default, as downmixToStereo folds it: exports, stems; playback sets the monitoring choice).
     void setAmbisonicBinaural(bool on) { ambisonicBinaural_ = on; }
 
+    // Dynamics held to another mix's. Recording, the built-in compressors, limiters, gates, de-essers and multiband
+    // compressors note how far they turn the sound down (or up) at each sample of a mix; replaying, over the same
+    // samples, they turn it by just that much rather than by what they hear. Everything else being linear, a part of
+    // the first mix (its dialogue, say) mixed alone while replaying is exactly that part as it is heard in the mix.
+    // Each mix() starts the tape afresh (recording) or from its start (replaying); a latency pre-roll leaves it alone.
+    struct GainTape {
+        using Key = std::tuple<Id, Id, Id>;  // the nested clips it is heard through, the owner, the effect
+        std::map<Key, std::vector<float>> gains;
+        std::map<Key, size_t> read;
+    };
+    void setGainTape(GainTape* tape, bool replay) {
+        tape_ = tape;
+        replayTape_ = replay;
+    }
+    // These plugin effects only delay the sound by their latency (so everything else stays where it is heard).
+    void setDelayOnly(std::set<Id> effects) { delayOnly_ = std::move(effects); }
+
     struct State;  // per clip/effect DSP state
     static bool ensurePlugin(State& st, const Effect& e, double sr);
 
@@ -217,6 +236,27 @@ private:
     std::map<std::pair<Id, Id>, std::unique_ptr<State>> states_;
     std::mutex m_;
     bool nonBlocking_ = false;
+    GainTape* tape_ = nullptr;
+    std::set<Id> delayOnly_;
+    bool replayTape_ = false;
+    void startTape() {
+        if (!tape_) return;
+        if (!replayTape_) tape_->gains.clear();
+        tape_->read.clear();
+    }
+    Id tapeScope_ = 0;  // the nested clips being mixed through (a nested sequence placed twice: two sets of gains)
+    struct TapeScope {
+        Id& scope;
+        Id was;
+        TapeScope(Id& s, Id clip) : scope(s), was(s) { scope = Id(uint64_t(s) * 1000003u + uint64_t(clip)); }
+        ~TapeScope() { scope = was; }
+    };
+    struct TapeOff {
+        GainTape*& tape;
+        GainTape* was;
+        explicit TapeOff(GainTape*& t) : tape(t), was(t) { tape = nullptr; }
+        ~TapeOff() { tape = was; }
+    };
     Id skipUpmix_ = 0;  // the Upmix processChain leaves out (mixInto runs it, into the speakers)
     bool offlineProxies_ = false;
     std::vector<bool> mask_, lfeOnly_;

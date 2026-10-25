@@ -54,7 +54,9 @@ private:
 // halves add back up flat, so nothing changes until it acts.
 class DeEsser {
 public:
-    void process(float* buf, int frames, double sr, double hz, double thresholdDb, double maxReductionDb);
+    // `gains` (a sample each): where to note the band's gain, or with `replay` the gains to use instead of listening.
+    void process(float* buf, int frames, double sr, double hz, double thresholdDb, double maxReductionDb, float* gains = nullptr,
+                 bool replay = false);
 
 private:
     Biquad low_[2], high_[2];  // LR4: two Butterworth sections each
@@ -66,8 +68,9 @@ private:
 class NoiseGate {
 public:
     // `key` (interleaved stereo, `frames` long) opens and closes it in place of the signal itself (a sidechain).
+    // `gains` (a sample each): where to note its gain, or with `replay` the gains to use instead of listening.
     void process(float* buf, int frames, double sr, double thresholdDb, double rangeDb, double attackMs, double holdMs,
-                 double releaseMs, const float* key = nullptr);
+                 double releaseMs, const float* key = nullptr, float* gains = nullptr, bool replay = false);
 
 private:
     double env_ = 0, gain_ = 0;
@@ -179,8 +182,9 @@ struct BandSettings {
 };
 class MultibandCompressor {
 public:
+    // `gains` (three a sample, the bands'): where to note them, or with `replay` the gains to use instead of listening.
     void process(float* buf, int frames, double sr, double lowHz, double highHz, const BandSettings bands[3], double attackMs,
-                 double releaseMs, double outputDb);
+                 double releaseMs, double outputDb, float* gains = nullptr, bool replay = false);
 
 private:
     Biquad lo1_[2], hi1_[2], lo2_[2], hi2_[2], apLo_[2], apHi_[2];

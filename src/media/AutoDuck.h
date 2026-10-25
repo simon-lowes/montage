@@ -35,7 +35,8 @@ Spans dialogueSpans(const Project& p, const Sequence& s, const std::vector<int>&
 // The speech audio description works around: the Dialogue clips when the
 // sequence has any, else every clip but music, effects and the descriptions
 // themselves (by role), on every track but `skipTrack`.
-Spans descriptionSpeech(const Project& p, const Sequence& s, int skipTrack = -1, std::string* error = nullptr);
+Spans descriptionSpeech(const Project& p, const Sequence& s, int skipTrack = -1, std::string* error = nullptr,
+                        const std::atomic<bool>* cancel = nullptr);
 
 // The time the enabled clips on audio track `track` cover, joined across gaps
 // shorter than `minPause`: for ducking under clips whose whole length is

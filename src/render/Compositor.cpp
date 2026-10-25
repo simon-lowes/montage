@@ -3160,6 +3160,22 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
             for (int ch = 0; ch < 2; ++ch) st.keyBuf[size_t(i) * 2 + ch] = st.keyHp.process(ch, st.keyBuf[size_t(i) * 2 + ch]);
         return st.keyBuf.data();
     };
+    // This block's gains for a dynamics effect (`per` a sample): where to note them (recording), or the ones to use
+    // (replaying; null when the recording has none, so it listens for itself).
+    auto tapeFor = [&](const Effect& e, int per) -> float* {
+        if (!tape_) return nullptr;
+        const GainTape::Key key{tapeScope_, owner, e.id};
+        std::vector<float>& g = tape_->gains[key];
+        const size_t want = size_t(frames) * size_t(per);
+        if (!replayTape_) {
+            g.resize(g.size() + want);
+            return g.data() + g.size() - want;
+        }
+        size_t& at = tape_->read[key];
+        if (at + want > g.size()) return nullptr;
+        at += want;
+        return g.data() + at - want;
+    };
     for (const Effect& e : chain) {
         if (!e.enabled || isSourceAudioEffect(e.type)) continue;
         auto& st = states_[{owner, e.id}];
@@ -3204,6 +3220,11 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
             double att = std::exp(-1.0 / (std::max(0.1, e.p("attack_ms", lt, 10)) * sr / 1000));
             double rel = std::exp(-1.0 / (std::max(1.0, e.p("release_ms", lt, 120)) * sr / 1000));
             double makeup = e.p("makeup_db", lt);
+            float* tape = tapeFor(e, 1);
+            if (tape && replayTape_) {
+                for (int i = 0; i < frames; ++i) buf[size_t(i) * 2] *= tape[i], buf[size_t(i) * 2 + 1] *= tape[i];
+                continue;
+            }
             const float* key = detector(e, *st);
             for (int i = 0; i < frames; ++i) {
                 float* d = &buf[size_t(i) * 2];
@@ -3216,17 +3237,27 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
                 float g = dbToLin(makeup - gr);
                 d[0] *= g;
                 d[1] *= g;
+                if (tape) tape[i] = g;
             }
         } else if (e.type == "limiter") {
             float ceil = dbToLin(e.p("ceiling_db", lt, -1));
             double rel = std::exp(-1.0 / (std::max(1.0, e.p("release_ms", lt, 60)) * sr / 1000));
+            // (Each channel's own gain on the tape, the clipping at the ceiling included.)
+            float* tape = tapeFor(e, 2);
+            if (tape && replayTape_) {
+                for (size_t i = 0; i < size_t(frames) * 2; ++i) buf[i] *= tape[i];
+                continue;
+            }
             for (int i = 0; i < frames; ++i) {
                 float* d = &buf[size_t(i) * 2];
                 double pk = std::max(std::fabs(d[0]), std::fabs(d[1]));
                 double target = pk > ceil ? ceil / pk : 1.0;
                 st->gain = target < st->gain ? target : rel * st->gain + (1 - rel) * target;
-                d[0] = std::clamp(float(d[0] * st->gain), -ceil, ceil);
-                d[1] = std::clamp(float(d[1] * st->gain), -ceil, ceil);
+                for (int ch = 0; ch < 2; ++ch) {
+                    const float in = d[ch];
+                    d[ch] = std::clamp(float(in * st->gain), -ceil, ceil);
+                    if (tape) tape[size_t(i) * 2 + ch] = in != 0 ? d[ch] / in : float(st->gain);
+                }
             }
         } else if (e.type == "parametric_eq") {
             if (changed) {
@@ -3239,10 +3270,14 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
             }
             st->eq.process(buf, frames);
         } else if (e.type == "deesser") {
-            st->deesser.process(buf, frames, sr, e.p("hz", lt, 6000), e.p("threshold_db", lt, -30), e.p("reduction_db", lt, 10));
+            float* tape = tapeFor(e, 1);
+            st->deesser.process(buf, frames, sr, e.p("hz", lt, 6000), e.p("threshold_db", lt, -30), e.p("reduction_db", lt, 10), tape,
+                                replayTape_);
         } else if (e.type == "gate") {
+            float* tape = tapeFor(e, 1);
             st->gate.process(buf, frames, sr, e.p("threshold_db", lt, -45), e.p("range_db", lt, -40), e.p("attack_ms", lt, 1),
-                             e.p("hold_ms", lt, 50), e.p("release_ms", lt, 150), detector(e, *st));
+                             e.p("hold_ms", lt, 50), e.p("release_ms", lt, 150), tape && replayTape_ ? nullptr : detector(e, *st), tape,
+                             replayTape_);
         } else if (e.type == "reverb") {
             st->reverb.process(buf, frames, sr, e.p("size", lt, 50) / 100, e.p("damping", lt, 50) / 100, e.p("width", lt, 100) / 100,
                                e.p("mix", lt, 25) / 100);
@@ -3280,8 +3315,9 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
                 const std::string n(names[k]);
                 b[k] = {e.p(n + "_threshold_db", lt, -24), e.p(n + "_ratio", lt, ratios[k]), e.p(n + "_gain_db", lt, 0)};
             }
+            float* tape = tapeFor(e, 3);
             st->multiband.process(buf, frames, sr, e.p("low_hz", lt, 200), e.p("high_hz", lt, 2500), b, e.p("attack_ms", lt, 10),
-                                  e.p("release_ms", lt, 150), e.p("output_db", lt, 0));
+                                  e.p("release_ms", lt, 150), e.p("output_db", lt, 0), tape, replayTape_);
         } else if (e.type == "dehum") {
             st->dehum.process(buf, frames, sr, e.p("mains", lt, 0) > 0.5 ? 60 : 50, int(std::lround(e.p("harmonics", lt, 6))),
                               e.p("reduction_db", lt, 30), e.p("width_hz", lt, 2));
@@ -3305,6 +3341,20 @@ void AudioMixer::processChain(const std::vector<Effect>& chain, Id owner, FrameT
             st->width.process(buf, frames, sr, e.p("width", lt, 100) / 100, e.p("bass_mono_hz", lt, 0));
         } else if (e.type == "channels") {
             fx::channelTools(buf, frames, int(e.p("mode", lt, 0)), e.p("invert_l", lt) > 0.5, e.p("invert_r", lt) > 0.5);
+        } else if (e.type == "plugin" && delayOnly_.count(e.id)) {
+            ensurePlugin(*st, e, sr);
+            const int lat = st->plugin ? std::max(0, st->plugin->latencySamples()) : 0;
+            if (lat > 0) {
+                if (st->delay.size() != size_t(lat) * 2) {
+                    st->delay.assign(size_t(lat) * 2, 0.0f);
+                    st->pos = 0;
+                }
+                for (int i = 0; i < frames * 2; ++i) {
+                    std::swap(buf[i], st->delay[st->pos]);
+                    if (++st->pos == st->delay.size()) st->pos = 0;
+                }
+            }
+            keyAt -= lat;
         } else if (e.type == "plugin") {
             // Its key input hears its sidechain track (not its own), as the compressor's detector does.
             const float* key = nullptr;
@@ -3346,10 +3396,12 @@ void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int f
             resetLocked();
             if (const int pre = maxLatency(seq, seq.sampleRate); pre > 0) {
                 std::vector<float> scratch(size_t(pre) * 2);
+                TapeOff off(tape_);
                 mixInto(p, seq, start - pre, pre, scratch.data(), nullptr, 0);
             }
         }
         nextStart_ = start + frames;
+        startTape();
         mixInto(p, seq, start, frames, out, trackLevels, 0);
         return;
     }
@@ -3361,10 +3413,12 @@ void AudioMixer::mix(const Project& p, const Sequence& seq, int64_t start, int f
             resetLocked();
             if (const int pre = maxLatency(seq, seq.sampleRate); pre > 0) {
                 std::vector<float> scratch(size_t(pre) * size_t(n));
+                TapeOff off(tape_);
                 mixInto(p, seq, start - pre, pre, scratch.data(), nullptr, 0, 0, -1, n);
             }
         }
         nextStart_ = start + frames;
+        startTape();
         mixInto(p, seq, start, frames, full.data(), trackLevels, 0, 0, -1, n);
         // An ambisonic mix heard binaurally (the decoder keeps its state from block to block).
         if (ambisonicLayout(seq.audioLayout) && ambisonicBinaural_) {
@@ -3383,10 +3437,12 @@ void AudioMixer::mixLayout(const Project& p, const Sequence& seq, int64_t start,
         resetLocked();
         if (const int pre = maxLatency(seq, seq.sampleRate); pre > 0) {
             std::vector<float> scratch(size_t(pre) * size_t(n));
+            TapeOff off(tape_);
             mixInto(p, seq, start - pre, pre, scratch.data(), nullptr, 0, 0, -1, n);
         }
     }
     nextStart_ = start + frames;
+    startTape();
     mixInto(p, seq, start, frames, out, nullptr, 0, 0, -1, n);
 }
 
@@ -3504,6 +3560,7 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                     origin = int64_t(std::floor(lo));
                     n = int64_t(std::floor(hi)) - origin + 2;
                     nf.assign(size_t(n) * size_t(nch), 0.0f);
+                    TapeScope scope(tapeScope_, c.id);
                     mixInto(p, *nested, origin, int(n), nf.data(), nullptr, depth + 1, int(sr), nested->multicam ? c.audioAngle : -1, nch);
                     src = nf.data();
                 }
@@ -3626,7 +3683,10 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             int64_t nLen = s1 > s0 ? int64_t(std::floor(hi)) - nStart + 2 : 0;
             std::vector<float> nb(size_t(std::max<int64_t>(0, nLen)) * 2, 0.0f);
             const int only = nested->multicam ? c.audioAngle : -1;
-            if (nLen > 0) mixInto(p, *nested, nStart, int(nLen), nb.data(), nullptr, depth + 1, int(sr), only);
+            if (nLen > 0) {
+                TapeScope scope(tapeScope_, c.id);
+                mixInto(p, *nested, nStart, int(nLen), nb.data(), nullptr, depth + 1, int(sr), only);
+            }
             for (int64_t smp = s0; smp < s1; ++smp) {
                 double rel = srcPos(smp) - double(nStart);
                 int64_t i = std::clamp<int64_t>(int64_t(rel), 0, nLen - 2);

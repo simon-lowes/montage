@@ -6,6 +6,8 @@
 #include <deque>
 #include <set>
 
+#include <QString>
+
 #include "audio/RoomResponse.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
@@ -215,23 +217,30 @@ Intelligibility measureIntelligibility(const Project& p, const Sequence& s, cons
         // The masker is the whole mix less the dialogue, so music ducked under the dialogue (a compressor keyed from it)
         // is measured as it is heard. Where the dialogue and the rest go through dynamics together (a limiter or
         // compressor on the master, a bus, or a track with both), the dialogue in the mix is turned up and down by the
-        // whole mix, not by itself alone: it is taken without those, then at the level it has in the mix (a fifth of a
-        // second at a time, eased from one to the next), so none of it is left in the masker.
-        Sequence speech = s;
-        const auto dynamics = [](const Effect& e) {
-            const EffectInfo* info = findEffectInfo(e.type);
-            return info && info->group == "Dynamics";
+        // whole mix, not by itself alone: Montage's own dynamics are held to what they do in the mix (the mixer's gain
+        // tape), so the dialogue mixed alone is exactly the dialogue in the mix. A dynamics plugin cannot be held: on
+        // a shared path it is left out, and what it does is found from the mix with and without it (the gain between
+        // them, 2.5 ms at a time, eased from one to the next), exact where it hears everything (on the master).
+        AudioMixer::GainTape tape;
+        restMixer.setGainTape(&tape, false);
+        dialogueMixer.setGainTape(&tape, true);
+        const auto pluginDynamics = [](const Effect& e) {
+            if (e.type != "plugin") return false;
+            if (e.s("plugin_category") == "Dynamics") return true;
+            const QString name = QString::fromStdString(e.s("plugin_name")).toLower();
+            for (const char* w : {"compress", "limit", "gate", "dynamic", "maximi", "level"})
+                if (name.contains(QLatin1String(w))) return true;
+            return false;
         };
-        bool together = false;
-        const auto alone = [&](std::vector<Effect>& chain) { together = std::erase_if(chain, dynamics) > 0 || together; };
         // (Only where both pass: a compressor on the music alone, keyed from the dialogue or not, is measured exactly.)
-        std::set<Id> dialogueBuses, otherBuses;
+        std::set<Id> dialogueBuses, otherBuses, sharedTracks;
         bool anyDialogue = false, anyOther = false;
-        for (Track& t : speech.audioTracks) {
+        for (const Track& t : s.audioTracks) {
             bool hasDialogue = false, hasOther = false;
-            for (Clip& c : t.clips) {
-                if (c.role == "Dialogue") hasDialogue = hasDialogue || c.enabled;
-                else hasOther = hasOther || c.enabled, c.enabled = false;
+            for (const Clip& c : t.clips) {
+                if (!c.enabled) continue;
+                if (c.role == "Dialogue") hasDialogue = true;
+                else hasOther = true;
             }
             anyDialogue = anyDialogue || hasDialogue, anyOther = anyOther || hasOther;
             std::vector<Id> feeds{t.output};
@@ -240,23 +249,43 @@ Intelligibility measureIntelligibility(const Project& p, const Sequence& s, cons
                 if (hasDialogue) dialogueBuses.insert(bus);
                 if (hasOther) otherBuses.insert(bus);
             }
-            if (hasDialogue && hasOther) alone(t.effects);
+            if (hasDialogue && hasOther) sharedTracks.insert(t.id);
         }
-        if (anyDialogue && anyOther) alone(speech.masterEffects);
-        for (Bus& b : speech.buses)
+        // (Left out as a delay of its latency, so all else is heard where it is in the mix.)
+        std::set<Id> heldOut;
+        const auto alone = [&](const std::vector<Effect>& chain) {
+            for (const Effect& e : chain)
+                if (e.enabled && pluginDynamics(e)) heldOut.insert(e.id);
+        };
+        for (const Track& t : s.audioTracks)
+            if (sharedTracks.count(t.id)) alone(t.effects);
+        if (anyDialogue && anyOther) alone(s.masterEffects);
+        for (const Bus& b : s.buses)
             if (dialogueBuses.count(b.id) && otherBuses.count(b.id)) alone(b.effects);
-        const int block = std::max(1, rate / 5);
+        const bool together = !heldOut.empty();
+        Sequence speech = s;
+        for (Track& t : speech.audioTracks)
+            for (Clip& c : t.clips)
+                if (c.role != "Dialogue") c.enabled = false;
+        dialogueMixer.setDelayOnly(heldOut);
+        AudioMixer withoutMixer;
+        withoutMixer.setTrackMask(o.tracks);
+        withoutMixer.setGainTape(&tape, true);
+        withoutMixer.setDelayOnly(heldOut);
+        std::vector<float> plain(together ? size_t(chunk) * 2 : 0);
+        const int block = std::max(1, rate / 400);
         double gain = 1;
         for (int64_t pos = first; pos < end;) {
             if (cancel && cancel->load()) return fail("Cancelled");
             const int n = int(std::min<int64_t>(chunk, end - pos));
+            restMixer.mix(p, s, pos, n, rest.data());  // (first: it records the tape the others replay)
             dialogueMixer.mix(p, speech, pos, n, dialogue.data());
-            restMixer.mix(p, s, pos, n, rest.data());
+            if (together) withoutMixer.mix(p, s, pos, n, plain.data());
             for (int b0 = 0; together && b0 < n; b0 += block) {
                 const int b1 = std::min(n, b0 + block);
-                double dm = 0, dd = 0;
-                for (size_t i = size_t(2 * b0); i < size_t(2 * b1); ++i) dm += double(dialogue[i]) * rest[i], dd += double(dialogue[i]) * dialogue[i];
-                const double to = dd > 1e-12 * (b1 - b0) ? std::clamp(dm / dd, 0.0, 8.0) : gain;
+                double yx = 0, xx = 0;
+                for (size_t i = size_t(2 * b0); i < size_t(2 * b1); ++i) yx += double(rest[i]) * plain[i], xx += double(plain[i]) * plain[i];
+                const double to = xx > 1e-12 * (b1 - b0) ? std::clamp(yx / xx, 0.0, 8.0) : gain;
                 for (int i = b0; i < b1; ++i) {
                     const float g = float(gain + (to - gain) * double(i - b0 + 1) / double(b1 - b0));
                     dialogue[size_t(2 * i)] *= g, dialogue[size_t(2 * i + 1)] *= g;
