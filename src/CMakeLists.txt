@@ -82,6 +82,7 @@ add_library(montage_engine STATIC
   media/Image.h media/Image.cpp
   media/Decoder.h media/Decoder.cpp
   media/DeepImage.h media/DeepImage.cpp
+  media/Model3D.h media/Model3D.cpp
   media/Exr.h media/Exr.cpp
   media/Vector.h media/Vector.cpp
   media/CameraRaw.h media/CameraRaw.cpp
@@ -174,6 +175,8 @@ add_library(montage_engine STATIC
   render/ConformCheck.h render/ConformCheck.cpp
   render/Shapes.h render/Shapes.cpp
   render/Title3D.h render/Title3D.cpp
+  render/ModelRender.h render/ModelRender.cpp
+  render/ModelClip.h render/ModelClip.cpp
   render/Particles.h render/Particles.cpp
   render/AafExport.h render/AafExport.cpp
   render/AvidMedia.h render/AvidMedia.cpp
@@ -266,6 +269,8 @@ add_library(montage_engine STATIC
 )
 target_include_directories(montage_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/clap/include)
+# glTF and OBJ readers (media/Model3D.cpp), as system headers so their own warnings stay theirs.
+target_include_directories(montage_engine SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/third_party/cgltf ${PROJECT_SOURCE_DIR}/third_party/tinyobjloader)
 # OpenFX 1.5 headers (BSD-3-Clause, the ASWF's), for hosting video plugins (render/Ofx).
 target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/openfx/include)
 # NDI SDK headers (MIT, these files only), for loading the NDI Runtime when installed (render/NdiOutput).

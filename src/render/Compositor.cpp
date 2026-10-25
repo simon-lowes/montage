@@ -46,6 +46,7 @@
 #include "Retime.h"
 #include "Shapes.h"
 #include "Title3D.h"
+#include "ModelClip.h"
 #include "TemporalFx.h"
 #include "VideoDenoise.h"
 #include "audio/DialogueAlign.h"
@@ -1030,6 +1031,19 @@ bool sourceStageLooks(const Clip& c, FrameTime lt, const ColorSpace& from, const
     return false;
 }
 
+Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, const Image* below);
+
+// A track's picture at t for a 3D model's image-based light (render/ModelClip.h).
+std::function<Image(int)> modelLightLayer(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
+    return [&p, &seq, t, o](int track) {
+        if (track < 0 || size_t(track) >= seq.videoTracks.size()) return Image();
+        for (const Clip& lc : seq.videoTracks[size_t(track)].clips)
+            if (lc.enabled && t >= lc.start && t < lc.end() && !(lc.isGenerator() && lc.generator.type == "model3d"))
+                return clipLayer(p, seq, lc, t, o, nullptr);
+        return Image();
+    };
+}
+
 // False when the clip has no picture.
 bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, const Image* below,
                 bool deferFrame, ClipSource& out) {
@@ -1064,10 +1078,13 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
         g = clipGeometry(c, lt, SW, SH, SW, SH, seq.fpsValue());
         int w, h;
         sourceSize(g, o.scale, int(SW * 4), int(SH * 4), w, h);
-        src = c.generator.type == "audio_viz" ? renderAudioVisualiser(p, seq, c, t, w, h)
+        std::string modelError;
+        src = c.generator.type == "model3d"     ? renderModelClip(p, seq, c, t, w, h, double(w) / SW, modelLightLayer(p, seq, t, o), nullptr, &modelError)
+              : c.generator.type == "audio_viz" ? renderAudioVisualiser(p, seq, c, t, w, h)
               : c.generator.type == "ograf"   ? ografFrame(c.generator, lt, w, h, SW, SH, c.duration, seq.fpsValue())
               : c.generator.type == "particles" ? renderParticles(c.generator, lt, w, h, SW, SH, seq.fpsValue())
                                               : renderGenerator(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue());
+        if (!modelError.empty() && o.issues) o.issues->note(modelError);
         // Titles and mattes are authored in SDR: graphics white sits at HDR reference white.
         convertColor(src, rec709Space(), sequenceColorSpace(seq), seq.hdrPeakNits);
     } else {
@@ -1687,6 +1704,9 @@ std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t) {
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
             if (const Effect* e = enabledEffect(seq, *c, "deep_holdout"); e && e->p("hide", t - c->start, 0) > 0.5)
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
+            // The picture lighting a 3D model.
+            if (c->isGenerator() && c->generator.type == "model3d" && c->generator.p("env_hide", t - c->start, 1) > 0.5)
+                if (const int m = modelLightTrack(seq, ti, *c, t); m >= 0) hidden[size_t(m)] = true;
         }
     return hidden;
 }
@@ -1867,7 +1887,9 @@ std::string clipDeepFile(const Project& p, const Sequence& seq, const Clip& c, F
 
 // Whether a clip's picture takes part in the depth merge (or is flattened on its own, `flattened`).
 bool isDeepClip(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, bool* flattened = nullptr) {
-    const bool deep = enabledEffect(seq, c, "make_deep") || !clipDeepFile(p, seq, c, t).empty();
+    const bool deep = enabledEffect(seq, c, "make_deep") ||
+                      (c.isGenerator() && c.generator.type == "model3d" && c.generator.p("depth_merge", t - c.start, 0) > 0.5) ||
+                      !clipDeepFile(p, seq, c, t).empty();
     if (flattened) *flattened = deep && enabledEffect(seq, c, "flatten_deep");
     return deep;
 }
@@ -1907,7 +1929,32 @@ DeepFrame clipDeepFrame(const Project& p, const Sequence& seq, size_t ti, const 
     ExpressionScope expressions(&p, &seq, &c, o.cancel);  // (core/Expression.h)
     const FrameTime lt = t - c.start;
     DeepFrame f;
-    if (const Effect* md = enabledEffect(seq, c, "make_deep")) {
+    // The clip's transform as sequence pixels to its own frame's (0..1), for `resampleDeep`.
+    auto throughTransform = [&](const DeepFrame& src, double opacity) {
+        double u0, v0, u1, v1, u2, v2;
+        sequenceToClipFrame(p, seq, c, t, 0, 0, u0, v0);
+        sequenceToClipFrame(p, seq, c, t, 1, 0, u1, v1);
+        sequenceToClipFrame(p, seq, c, t, 0, 1, u2, v2);
+        const double s = o.scale > 0 ? o.scale : 1;
+        const int sw = src.width, sh = src.height;
+        return resampleDeep(src, W, H, [&](double x, double y, double& u, double& v) {
+            const double X = x / s, Y = y / s;
+            u = (u0 + (u1 - u0) * X + (u2 - u0) * Y) * sw;
+            v = (v0 + (v1 - v0) * X + (v2 - v0) * Y) * sh;
+        }, float(opacity));
+    };
+    if (c.isGenerator() && c.generator.type == "model3d" && !enabledEffect(seq, c, "make_deep")) {
+        // A 3D model at its own depths, through the clip's transform and opacity.
+        std::vector<float> depth;
+        std::string error;
+        Geometry g;
+        if (!clipGeometry(p, seq, c, t, g)) return DeepFrame::blank(W, H);
+        Image layer = renderModelClip(p, seq, c, t, W, H, double(W) / seq.width, modelLightLayer(p, seq, t, o), &depth, &error);
+        if (!error.empty() && o.issues) o.issues->note(error);
+        if (layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
+        convertColor(layer, rec709Space(), sequenceColorSpace(seq), seq.hdrPeakNits);
+        f = throughTransform(deepFromFlat(layer.px.data(), W, H, depth.data(), 0), g.opacity);
+    } else if (const Effect* md = enabledEffect(seq, c, "make_deep")) {
         Image layer = clipLayer(p, seq, c, t, o, nullptr);
         if (layer.empty() || layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
         const int source = int(std::lround(md->p("source", lt, 0)));
@@ -1940,18 +1987,7 @@ DeepFrame clipDeepFrame(const Project& p, const Sequence& seq, size_t ti, const 
         const std::shared_ptr<const DeepFrame> src = file.empty() ? nullptr : cachedDeepExr(file);
         Geometry g;
         if (!src || !clipGeometry(p, seq, c, t, g)) return DeepFrame::blank(W, H);
-        // The clip's transform, as sequence pixels to the deep frame's.
-        double u0, v0, u1, v1, u2, v2;
-        sequenceToClipFrame(p, seq, c, t, 0, 0, u0, v0);
-        sequenceToClipFrame(p, seq, c, t, 1, 0, u1, v1);
-        sequenceToClipFrame(p, seq, c, t, 0, 1, u2, v2);
-        const double s = o.scale > 0 ? o.scale : 1;
-        const int sw = src->width, sh = src->height;
-        f = resampleDeep(*src, W, H, [&](double x, double y, double& u, double& v) {
-            const double X = x / s, Y = y / s;
-            u = (u0 + (u1 - u0) * X + (u2 - u0) * Y) * sw;
-            v = (v0 + (v1 - v0) * X + (v2 - v0) * Y) * sh;
-        }, float(g.opacity));
+        f = throughTransform(*src, g.opacity);
         deepIntoWorkingSpace(f, pictureColorSpace(*m, m->path), seq);
     }
     for (const Effect* e : liveEffects(seq, c)) {

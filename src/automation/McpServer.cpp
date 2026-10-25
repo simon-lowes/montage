@@ -154,6 +154,7 @@
 #include "media/Transcriber.h"
 #include "media/VisualSearch.h"
 #include "render/ClipAnalysis.h"
+#include "media/Model3D.h"
 #include "render/OGraf.h"
 #include "render/Gallery.h"
 #include "render/DialogueLoudness.h"
@@ -2203,6 +2204,101 @@ void McpServer::Impl::addTools() {
             const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
             return ok(QStringLiteral("Added %1 on %2").arg(QString::fromStdString(c.name), QString::fromStdString(trackAt(s, t)->name)),
                       made ? clipJson(l.project, s, *made) : QJsonObject{});
+        });
+
+    add("montage_add_model", "Add a 3D model",
+        "Add a 3D model (glTF 2.0 .gltf or .glb, or OBJ with its MTL) to the picture, lit, shaded (metallic-roughness, its "
+        "textures), casting shadows onto the ground and playing one of its animations. Without over it is seen through "
+        "its own camera in front of the frame (size in pixels, positions in pixels from the centre, y up). With over (a "
+        "video clip whose camera montage_camera_track solved), it stands in that shot: placed at place {x, y} (fractions "
+        "of the picture, on the solved ground) or at position [x, y, z] in the scene's units (the ground at y = 0), at "
+        "its own size times scale (%), on the track above the footage for the footage's length. settings sets any of "
+        "its settings by name (montage_list_effects with kind generator lists model3d's; colours as name.r / .g / .b), "
+        "e.g. {\"light_angle\": 30, \"env_track\": 3, \"depth_merge\": 1}. Returns the clip with the model's "
+        "animations and triangle count.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"file":{"type":"string"},
+            "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":5},"track":{"type":"string"},
+            "over":{"type":["number","string"]},"place":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"}}},
+            "position":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
+            "settings":{"type":"object","additionalProperties":{"type":"number"}}},
+            "required":["project","file"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const QFileInfo fi(absolute(need(a, "file")));
+            if (!fi.exists()) throw ArgError{QStringLiteral("No file at \"%1\"").arg(need(a, "file"))};
+            std::string err;
+            const std::shared_ptr<const Model> model = cachedModel(fi.absoluteFilePath().toStdString(), &err);
+            if (!model) return fail(QString::fromStdString(err));
+            Clip c = makeGeneratorClip(l.project, "model3d", 1);
+            c.generator.strings["file"] = fi.absoluteFilePath().toStdString();
+            c.name = fi.completeBaseName().toStdString();
+            TrackRef t{TrackKind::Video, 0};
+            FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : 0;
+            FrameTime len = a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(5 * s.fpsValue()));
+            const Clip* footage = nullptr;
+            if (a.contains("over")) {
+                QJsonObject o;
+                o["clip"] = a.value("over");
+                footage = &videoClipArg(l, o);
+                CameraSolve cs;
+                if (!clipCameraSolve(*footage, cs)) return fail("Solve the clip's camera first (montage_camera_track)");
+                int ft = -1;
+                for (size_t i = 0; i < s.videoTracks.size(); ++i)
+                    for (const Clip& k : s.videoTracks[i].clips)
+                        if (k.id == footage->id) ft = int(i);
+                c.generator.params["camera"] = Param(1.0);
+                c.generator.params["camera_track"] = Param(double(ft + 1));
+                c.generator.params["pos_y"] = Param(0.0);
+                if (!a.contains("at")) at = footage->start;
+                if (!a.contains("duration")) len = footage->end() - at;
+                if (a.contains("place")) {
+                    const QJsonObject pl = a.value("place").toObject();
+                    const int frame = cameraSolveFrame(s, *footage, cs, std::clamp<FrameTime>(at - footage->start, 0, footage->duration - 1));
+                    Vec3 g;
+                    if (frame < 0 || !cs.oriented || !groundPoint(cs, frame, {pl.value("x").toDouble(0.5) * cs.width, pl.value("y").toDouble(0.7) * cs.height}, g))
+                        return fail("That point is not on the solved ground: pick one below the horizon");
+                    c.generator.params["pos_x"] = Param(g.x), c.generator.params["pos_y"] = Param(g.y), c.generator.params["pos_z"] = Param(g.z);
+                }
+                if (!a.contains("track")) {
+                    t = ft + 1 < int(s.videoTracks.size()) && s.videoTracks[size_t(ft + 1)].clips.empty() ? TrackRef{TrackKind::Video, ft + 1}
+                                                                                                         : edit::addTrack(l.project, s, TrackKind::Video);
+                }
+            } else if (!a.contains("track")) {
+                int top = -1;
+                for (int i = 0; i < int(s.videoTracks.size()); ++i)
+                    if (!s.videoTracks[size_t(i)].clips.empty()) top = i;
+                t = top + 1 < int(s.videoTracks.size()) ? TrackRef{TrackKind::Video, top + 1} : edit::addTrack(l.project, s, TrackKind::Video);
+            }
+            if (a.contains("track")) t = trackArg(str(a, "track"), s, true, &l.project, &s);
+            if (a.contains("position")) {
+                const QJsonArray pos = a.value("position").toArray();
+                if (pos.size() != 3) throw ArgError{"\"position\" is [x, y, z]"};
+                for (int k = 0; k < 3; ++k) c.generator.params[k == 0 ? "pos_x" : k == 1 ? "pos_y" : "pos_z"] = Param(pos[k].toDouble());
+            }
+            const EffectInfo* info = findEffectInfo("model3d");
+            const QJsonObject settings = a.value("settings").toObject();
+            for (auto it = settings.begin(); it != settings.end(); ++it) {
+                const std::string name = it.key().toStdString();
+                const ParamInfo* pi = nullptr;
+                for (const ParamInfo& p : info->params)
+                    if (p.kind == ParamKind::Color ? name == p.name + ".r" || name == p.name + ".g" || name == p.name + ".b" : p.name == name) pi = &p;
+                if (!pi) throw ArgError{QStringLiteral("\"%1\" is not a setting of 3D Model").arg(it.key())};
+                if (!it.value().isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(it.key())};
+                c.generator.params[name] = Param(std::clamp(it.value().toDouble(), pi->min, pi->max));
+            }
+            c.start = at;
+            c.duration = std::max<FrameTime>(1, len);
+            const auto r = edit::overwrite(l.project, s, t, c);
+            check(r);
+            save(l);
+            const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
+            QJsonObject out = made ? clipJson(l.project, s, *made) : QJsonObject{};
+            QJsonArray anims;
+            for (const ModelAnimation& an : model->animations) anims.append(QString::fromStdString(an.name));
+            out["animations"] = anims;
+            out["triangles"] = double(model->triangles());
+            return ok(QStringLiteral("Added %1 on %2").arg(QString::fromStdString(c.name), QString::fromStdString(trackAt(s, t)->name)), out);
         });
 
     add("montage_add_shape", "Add a shape",

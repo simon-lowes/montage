@@ -75,6 +75,22 @@ jobs:
               || { rm -f "$d/$name"; echo "::warning::Could not download Cryptomatte's $name; the sample test will be skipped"; }
           done
           [ "$(ls "$d" | wc -l)" -eq 5 ] && echo "MONTAGE_CRYPTOMATTE_SAMPLES=$d" >> "$GITHUB_ENV" || true
+      - name: Khronos's glTF sample models for the 3D model test
+        run: |
+          d="$HOME/gltf-samples"
+          mkdir -p "$d"
+          base="https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0"
+          # (CC BY 4.0, donated by Cesium; the repository is archived, and each file is checked by its hash)
+          for f in Box/glTF-Binary/Box.glb:ed52f7192b8311d700ac0ce80644e3852cd01537e4d62241b9acba023da3d54e \
+                   BoxTextured/glTF-Binary/BoxTextured.glb:2d055d2d56a492d1b9302de6e733046b625cf51e5f2a3090bd3a8c11acc93c17 \
+                   CesiumMan/glTF-Binary/CesiumMan.glb:659349b0a374b73d5362a61070039bc8601401bbdeacbece4f3680fb4bfd41b0; do
+            path="${f%%:*}"
+            name="$(basename "$path")"
+            curl -fsSL --retry 3 -o "$d/$name" "$base/$path" \
+              && [ "$(sha256sum "$d/$name" | cut -d' ' -f1)" = "${f#*:}" ] \
+              || { rm -f "$d/$name"; echo "::warning::Could not download $name; the sample model test will be skipped"; }
+          done
+          [ "$(ls "$d" | wc -l)" -eq 3 ] && echo "MONTAGE_TEST_GLTF_SAMPLES=$d" >> "$GITHUB_ENV" || true
       - name: Cache the AI models
         uses: actions/cache@v4
         with:

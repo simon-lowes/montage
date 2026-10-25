@@ -57,6 +57,8 @@ licence Adobe offers with its Gain Map specification; its terms are Adobe's, as 
 | [bmx](https://github.com/ebu/bmx) 1.7, the EBU's MXF library, with its [libMXF and libMXF++](https://github.com/ebu/bmx/tree/main/deps) and [uriparser](https://github.com/uriparser/uriparser) 1.0, and the version stamp each compiles in from [cmake-git-version-tracking](https://github.com/andrew-hardin/cmake-git-version-tracking) | BSD-3-Clause (uriparser's library: BSD-3-Clause; cmake-git-version-tracking: MIT) | the sources' licence files (copied into the packages) |
 | [c2pa-rs](https://github.com/contentauth/c2pa-rs) (`c2pa-c-ffi`) and the Rust crates it uses | MIT or Apache-2.0; each crate's own | `c2pa` in the packages' `licenses` folder, one folder per crate |
 | [VST 3 SDK](https://github.com/steinbergmedia/vst3sdk) (interfaces and host helpers) | MIT | [third_party/vst3sdk/LICENSE.txt](third_party/vst3sdk/LICENSE.txt) |
+| [cgltf](https://github.com/jkuhlmann/cgltf) 1.14, which reads glTF 2.0 models | MIT | [third_party/cgltf/LICENSE](third_party/cgltf/LICENSE) |
+| [tinyobjloader](https://github.com/tinyobjloader/tinyobjloader) 2.0.0rc13, which reads OBJ models | MIT (its optional earcut triangulator, ISC, is not compiled in) | [third_party/tinyobjloader/LICENSE](third_party/tinyobjloader/LICENSE) |
 | [CLAP](https://github.com/free-audio/clap) headers | MIT | [third_party/clap/LICENSE](third_party/clap/LICENSE) |
 | [OpenFX](https://github.com/AcademySoftwareFoundation/openfx) headers | BSD-3-Clause | [third_party/openfx/LICENSE](third_party/openfx/LICENSE) |
 | Blackmagic DeckLink SDK 12.0 headers | Blackmagic Design's header licence | [third_party/decklink/LICENSE](third_party/decklink/LICENSE) |

@@ -27,6 +27,7 @@
 #include <QVector3D>
 #include <QDir>
 #include <QFileInfo>
+#include <QDateTime>
 #include <QFile>
 #include <QFloat16>
 #include <random>
@@ -177,6 +178,9 @@
 #include "media/FaceTracks.h"
 #include "media/DepthMap.h"
 #include "media/DeepImage.h"
+#include "media/Model3D.h"
+#include "render/ModelClip.h"
+#include "render/ModelRender.h"
 #include "media/Exr.h"
 #include "render/VideoFx.h"
 #ifdef MONTAGE_WITH_OPENEXR
@@ -1327,6 +1331,58 @@ static CaptionTrack threeCaptions(Project& p) {
     t.captions = {a, b, c};
     return t;
 }
+
+namespace {
+
+// A text file (an OBJ, its MTL) written whole.
+void writeTextFile(const std::string& file, const std::string& text) {
+    QFile f(QString::fromStdString(file));
+    QVERIFY(f.open(QIODevice::WriteOnly));
+    f.write(text.data(), qint64(text.size()));
+}
+// A unit sphere (smooth normals) or a cube standing on y = 0, as OBJ with material "m" from `mtl`.
+std::string sphereObj(int segments, int rings, const char* mtl) {
+    std::string s = std::string("mtllib ") + mtl + "\nusemtl m\n";
+    for (int r = 0; r <= rings; ++r)
+        for (int k = 0; k <= segments; ++k) {
+            const double th = M_PI * r / rings, ph = 2 * M_PI * k / segments;
+            const double x = std::sin(th) * std::cos(ph), y = std::cos(th), z = -std::sin(th) * std::sin(ph);
+            s += QString("v %1 %2 %3\nvn %1 %2 %3\n").arg(x, 0, 'g', 17).arg(y, 0, 'g', 17).arg(z, 0, 'g', 17).toStdString();
+        }
+    auto id = [&](int r, int k) { return r * (segments + 1) + k + 1; };
+    for (int r = 0; r < rings; ++r)
+        for (int k = 0; k < segments; ++k) {
+            const int a = id(r, k), b = id(r + 1, k), c = id(r + 1, k + 1), d = id(r, k + 1);
+            s += QString("f %1//%1 %2//%2 %3//%3\nf %1//%1 %3//%3 %4//%4\n").arg(a).arg(b).arg(c).arg(d).toStdString();
+        }
+    return s;
+}
+std::string cubeObj(const char* mtl) {
+    std::string s = std::string("mtllib ") + mtl + "\nusemtl m\n";
+    for (int k = 0; k < 8; ++k) s += QString("v %1 %2 %3\n").arg(k & 1 ? 0.5 : -0.5).arg(k & 2 ? 1 : 0).arg(k & 4 ? 0.5 : -0.5).toStdString();
+    // Counter-clockwise from outside.
+    s += "f 1 2 4 3\nf 5 7 8 6\nf 1 5 6 2\nf 3 4 8 7\nf 1 3 7 5\nf 2 6 8 4\n";
+    return s;
+}
+// A camera at C looking at `at` (y up), f pixels, centred on w x h.
+ModelCamera lookAt(std::array<double, 3> C, std::array<double, 3> at, double f, int w, int h) {
+    auto unit = [](std::array<double, 3> v) {
+        const double l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        return std::array<double, 3>{v[0] / l, v[1] / l, v[2] / l};
+    };
+    auto cross = [](std::array<double, 3> a, std::array<double, 3> b) {
+        return std::array<double, 3>{a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+    };
+    const auto fw = unit({at[0] - C[0], at[1] - C[1], at[2] - C[2]});
+    const auto right = unit(cross(fw, {0, 1, 0})), down = cross(fw, right);
+    ModelCamera cam;
+    cam.R = {right[0], right[1], right[2], down[0], down[1], down[2], fw[0], fw[1], fw[2]};
+    cam.C = C;
+    cam.screen = {f, 0, w / 2.0, 0, f, h / 2.0};
+    return cam;
+}
+
+}  // namespace
 
 class TestMedia : public QObject {
     Q_OBJECT
@@ -28140,6 +28196,521 @@ if ui["pressed"] == "add":
         setDeepCacheBudget(1);
         QVERIFY(deepCacheBytes() <= std::max(red.bytes(), blue.bytes()) + 64);
         setDeepCacheBudget(was);
+    }
+
+    // ---- 3D models (media/Model3D.h, render/ModelRender.h, render/ModelClip.h) ----------------------------------
+
+    void modelFiles() {
+        // A glTF whose node is animated: its keys met exactly at 0, 1 and 2 s; linear between (translation, morph
+        // weight), stepped (rotation); past the end, the last keys.
+        std::string err;
+        Model m;
+        QVERIFY2(loadModel(MONTAGE_TEST_DATA_DIR "/models/anim.gltf", m, &err), err.c_str());
+        QCOMPARE(m.animations.size(), size_t(1));
+        QCOMPARE(m.animations[0].duration, 2.0);
+        QCOMPARE(m.triangles(), size_t(1));
+        const double s = std::sqrt(0.5);
+        const std::array<double, 3> T[3] = {{0, 0, 0}, {1, 0, 0}, {1, 2, 0}};
+        const std::array<double, 4> Q[3] = {{0, 0, 0, 1}, {0, s, 0, s}, {0, 1, 0, 0}};
+        for (int k = 0; k < 3; ++k) {
+            const ModelPose pose = poseModel(m, 0, k);
+            const Mat4 want = trsMatrix(T[k], Q[k], {1, 1, 1});
+            for (int e = 0; e < 16; ++e) QVERIFY2(std::fabs(pose.world[0][size_t(e)] - want[size_t(e)]) < 1e-6, qPrintable(QString("key %1, %2").arg(k).arg(e)));
+            QVERIFY(std::fabs(pose.weights[0].at(0) - k / 2.0) < 1e-6);
+        }
+        const ModelPose half = poseModel(m, 0, 0.5), after = poseModel(m, 0, 5);
+        QVERIFY(std::fabs(half.world[0][12] - 0.5) < 1e-6 && std::fabs(half.world[0][0] - 1) < 1e-6);  // moved half way, not yet turned
+        QVERIFY(std::fabs(after.world[0][13] - 2) < 1e-6);
+        // The morph target at weight 0.25 moves the first corner a quarter along z (before the node's transform).
+        const PosedTriangles tri = posedTriangles(m, half);
+        QVERIFY(std::fabs(tri.positions[2] - 0.25) < 1e-6 && std::fabs(tri.positions[0] - 0.5) < 1e-6);
+        // At rest (no animation): where the file puts it, flat normals made for it.
+        const PosedTriangles rest = posedTriangles(m, poseModel(m, -1, 0));
+        QVERIFY(rest.positions[0] == 0 && rest.normals[2] == 1);
+
+        // OBJ with its MTL: a texture, PBR roughness and metallic, quads cut into triangles, OBJ's v turned over.
+        QImage tex(4, 4, QImage::Format_RGB32);
+        tex.fill(Qt::red);
+        QVERIFY(tex.save(QString::fromStdString(path("red.png"))));
+        writeTextFile(path("cube.mtl"), "newmtl m\nKd 1 1 1\nPr 0.25\nPm 1\nmap_Kd red.png\n");
+        writeTextFile(path("cube.obj"), cubeObj("cube.mtl"));
+        Model cube;
+        QVERIFY2(loadModel(path("cube.obj"), cube, &err), err.c_str());
+        QCOMPARE(cube.triangles(), size_t(12));
+        QCOMPARE(cube.materials.size(), size_t(1));
+        QCOMPARE(cube.materials[0].roughness, 0.25f);
+        QCOMPARE(cube.materials[0].metallic, 1.0f);
+        QCOMPARE(cube.textures.size(), size_t(1));
+        QCOMPARE(cube.textures[0].levels.size(), size_t(3));  // 4, 2, 1
+        QCOMPARE(int(cube.textures[0].levels[0].rgba[0]), 255);
+        QCOMPARE(cube.textures[0].linear(255, 0), 1.0f);
+        std::array<double, 3> lo, hi;
+        QVERIFY(modelBounds(posedTriangles(cube, poseModel(cube, -1, 0)), lo, hi));
+        QVERIFY(lo[1] == 0 && hi[1] == 1 && lo[0] == -0.5);
+        QVERIFY(!loadModel(path("missing.obj"), cube, &err));
+        writeTextFile(path("broken.gltf"), "{\"asset\": {\"version\": \"2.0\"}, \"meshes\": [}");
+        QVERIFY(!loadModel(path("broken.gltf"), cube, &err));
+        QVERIFY(isModelPath("a.GLB") && isModelPath("b.obj") && !isModelPath("c.png"));
+
+        // A colour texture's smaller levels are averaged in linear light: black and white make 0.5, not sRGB's 0.5.
+        QImage halves(2, 2, QImage::Format_RGB32);
+        halves.fill(Qt::black);
+        halves.setPixel(1, 0, qRgb(255, 255, 255)), halves.setPixel(1, 1, qRgb(255, 255, 255));
+        QVERIFY(halves.save(QString::fromStdString(path("halves.png"))));
+        writeTextFile(path("halves.mtl"), "newmtl m\nmap_Kd halves.png\n");
+        writeTextFile(path("halves.obj"), cubeObj("halves.mtl"));
+        Model halfCube;
+        QVERIFY2(loadModel(path("halves.obj"), halfCube, &err), err.c_str());
+        const ModelTexture& ht = halfCube.textures.at(0);
+        QVERIFY(ht.srgb && ht.levels.size() == 2);
+        QVERIFY2(std::fabs(ht.linear(ht.levels[1].rgba[0], 0) - 0.5f) < 0.005f, qPrintable(QString::number(ht.linear(ht.levels[1].rgba[0], 0))));
+
+        // An OBJ face with a corner past the vertices is left out whole; the faces after it are as they were.
+        writeTextFile(path("holed.obj"), "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\nf 1 2 3\nf 2 99 4\nf 2 4 3\n");
+        Model holed;
+        QVERIFY2(loadModel(path("holed.obj"), holed, &err), err.c_str());
+        QCOMPARE(holed.triangles(), size_t(2));
+        const PosedTriangles hp = posedTriangles(holed, poseModel(holed, -1, 0));
+        QCOMPARE(hp.positions[hp.indices[3] * 3], 1.0f);  // (the third face's first corner: vertex 2)
+        QCOMPARE(hp.positions[hp.indices[4] * 3 + 1], 1.0f);
+
+        // A key at a time a float cannot hold exactly (1.1 s): just before it, nearly its value; never past the keys.
+        Model keyed;
+        keyed.nodes.resize(1);
+        keyed.roots = {0};
+        ModelAnimation slide;
+        slide.samplers.push_back({{0.0f, 1.1f}, {0, 0, 0, 5, 0, 0}, 3, ModelAnimation::Sampler::Interpolation::Linear});
+        slide.channels.push_back({0, ModelAnimation::Channel::Path::Translation, 0});
+        slide.duration = 1.1f;
+        keyed.animations.push_back(slide);
+        for (const double at : {1.1, std::nextafter(double(1.1f), 0.0), 0.55}) {
+            const double x = poseModel(keyed, 0, at).world[0][12];
+            QVERIFY2(std::fabs(x - 5 * at / double(1.1f)) < 1e-5, qPrintable(QString("%1 s: %2").arg(at, 0, 'g', 17).arg(x)));
+        }
+
+        // A glTF triangle with no material: glTF's default (metallic, rough), one-sided, so seen from its front alone.
+        const float corners[9] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+        const QByteArray triBytes(reinterpret_cast<const char*>(corners), sizeof corners);
+        // (written out here, not as a fixture, so the buffer is the floats above)
+        const std::string triGltf =
+            "{\"asset\": {\"version\": \"2.0\"}, \"scene\": 0, \"scenes\": [{\"nodes\": [0]}], \"nodes\": [{\"mesh\": 0}], "
+            "\"meshes\": [{\"primitives\": [{\"attributes\": {\"POSITION\": 0}}]}], "
+            "\"accessors\": [{\"bufferView\": 0, \"componentType\": 5126, \"count\": 3, \"type\": \"VEC3\", \"min\": [0, 0, 0], \"max\": [1, 1, 0]}], "
+            "\"bufferViews\": [{\"buffer\": 0, \"byteLength\": 36}], "
+            "\"buffers\": [{\"byteLength\": 36, \"uri\": \"data:application/octet-stream;base64," + triBytes.toBase64().toStdString() + "\"}]}";
+        writeTextFile(path("tri.gltf"), triGltf);
+        Model one;
+        QVERIFY2(loadModel(path("tri.gltf"), one, &err), err.c_str());
+        QVERIFY(one.materials.size() == 1 && one.materials[0].metallic == 1 && one.materials[0].roughness == 1 && !one.materials[0].doubleSided);
+        ModelScene triScene;
+        triScene.triangles = posedTriangles(one, poseModel(one, -1, 0));
+        triScene.model = &one;
+        triScene.ambient = {1, 1, 1};
+        for (const double side : {1.0, -1.0}) {
+            const Image img = renderModel(triScene, lookAt({0.3, 0.3, 3 * side}, {0.3, 0.3, 0}, 200, 64, 64), 64, 64);
+            QCOMPARE(img.at(32, 32)[3], side > 0 ? 1.0f : 0.0f);
+        }
+
+        // The cache sees a change to a file the model was read from (its MTL), and keeps a failure until it changes.
+        std::shared_ptr<const Model> first = cachedModel(path("cube.obj"), &err);
+        QVERIFY(first && cachedModel(path("cube.obj")) == first);
+        writeTextFile(path("cube.mtl"), "newmtl m\nKd 1 1 1\nPr 0.75\nPm 1\nmap_Kd red.png\n");
+        {
+            QFile f(QString::fromStdString(path("cube.mtl")));
+            QVERIFY(f.open(QIODevice::ReadWrite) && f.setFileTime(QDateTime::currentDateTime().addSecs(60), QFileDevice::FileModificationTime));
+        }
+        std::shared_ptr<const Model> second = cachedModel(path("cube.obj"), &err);
+        QVERIFY(second && second != first);
+        QCOMPARE(second->materials.at(0).roughness, 0.75f);
+        err.clear();
+        QVERIFY(!cachedModel(path("broken.gltf"), &err) && !err.empty());
+        const std::string firstError = err;
+        err.clear();
+        QVERIFY(!cachedModel(path("broken.gltf"), &err));
+        QCOMPARE(err, firstError);
+
+        // Khronos's sample models, when fetched (CI puts them in $MONTAGE_TEST_GLTF_SAMPLES): a box, a textured box,
+        // a skinned walker.
+        const QByteArray samples = qgetenv("MONTAGE_TEST_GLTF_SAMPLES");
+        if (samples.isEmpty()) {
+            qInfo("MONTAGE_TEST_GLTF_SAMPLES not set: Khronos's sample models not tried");
+            return;
+        }
+        Model box, textured, man;
+        QVERIFY2(loadModel(samples.toStdString() + "/Box.glb", box, &err), err.c_str());
+        QCOMPARE(box.triangles(), size_t(12));
+        QVERIFY2(loadModel(samples.toStdString() + "/BoxTextured.glb", textured, &err), err.c_str());
+        QVERIFY(textured.textures.size() == 1 && textured.materials.at(0).baseTexture == 0 && !textured.meshes.at(0).primitives.at(0).uvs.empty());
+        QVERIFY2(loadModel(samples.toStdString() + "/CesiumMan.glb", man, &err), err.c_str());
+        QVERIFY(man.skins.size() == 1 && man.skins[0].joints.size() == 19 && man.animations.size() == 1);
+        // Walking: its skinned feet move between three times, and it draws.
+        std::vector<float> at[3];
+        for (int k = 0; k < 3; ++k) at[k] = posedTriangles(man, poseModel(man, 0, 0.3 * k)).positions;
+        QVERIFY(at[0] != at[1] && at[1] != at[2]);
+        ModelScene scene;
+        scene.triangles = posedTriangles(man, poseModel(man, 0, 0.5));
+        scene.model = &man;
+        scene.ambient = {1, 1, 1};
+        QVERIFY(modelBounds(scene.triangles, lo, hi));
+        const std::array<double, 3> mid{(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2};
+        const Image img = renderModel(scene, lookAt({mid[0], mid[1], mid[2] + 4 * (hi[1] - lo[1])}, mid, 400, 160, 120), 160, 120);
+        int covered = 0;
+        for (int y = 0; y < 120; ++y)
+            for (int x = 0; x < 160; ++x) covered += img.at(x, y)[3] > 0.5f;
+        QVERIFY2(covered > 200, qPrintable(QString::number(covered)));
+    }
+
+    void modelRendering() {
+        std::string err;
+        // A sphere under a sun with no other light: every pixel within 2 code values of the glTF specification's
+        // BRDF worked out for the true sphere there (dielectric and metal).
+        writeTextFile(path("sphere.mtl"), "newmtl m\nKd 0.8 0.3 0.2\nPr 0.4\nPm 0\n");
+        writeTextFile(path("sphere.obj"), sphereObj(192, 96, "sphere.mtl"));
+        Model sphere;
+        QVERIFY2(loadModel(path("sphere.obj"), sphere, &err), err.c_str());
+        const int W = 256, H = 256;
+        const double f = 100 * std::sqrt(15.0);
+        const ModelCamera cam = lookAt({0, 0, 4}, {0, 0, 0}, f, W, H);
+        const std::array<double, 3> L0{-0.4, 0.6, 0.7};
+        const double ll = std::sqrt(L0[0] * L0[0] + L0[1] * L0[1] + L0[2] * L0[2]);
+        const std::array<double, 3> L{L0[0] / ll, L0[1] / ll, L0[2] / ll};
+        for (const float metallic : {0.0f, 1.0f}) {
+            sphere.materials[0].metallic = metallic;
+            ModelScene scene;
+            scene.triangles = posedTriangles(sphere, poseModel(sphere, -1, 0));
+            scene.model = &sphere;
+            ModelLight sun;
+            sun.direction = {-L[0], -L[1], -L[2]};
+            sun.shadows = false;
+            scene.lights = {sun};
+            const Image img = renderModel(scene, cam, W, H);
+            const double base[3] = {0.8, 0.3, 0.2}, a = 0.4 * 0.4, a2 = a * a;
+            int tested = 0;
+            double worst = 0;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const std::array<double, 3> d = cam.ray(x + 0.5, y + 0.5);
+                    const double dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                    const double dx = d[0] / dl, dy = d[1] / dl, dz = d[2] / dl;
+                    // Where the ray meets the unit sphere (from (0, 0, 4)).
+                    const double bq = 2 * (dz * 4), cq = 16 - 1, disc = bq * bq - 4 * cq;
+                    if (disc <= 0) continue;
+                    const double t = (-bq - std::sqrt(disc)) / 2;
+                    const double N[3] = {dx * t, dy * t, 4 + dz * t};
+                    const double V[3] = {-dx, -dy, -dz};
+                    const double NdotV = N[0] * V[0] + N[1] * V[1] + N[2] * V[2], NdotL = N[0] * L[0] + N[1] * L[1] + N[2] * L[2];
+                    if (NdotV < 0.3 || NdotL < 0.15) continue;
+                    double Hv[3] = {L[0] + V[0], L[1] + V[1], L[2] + V[2]};
+                    const double hl = std::sqrt(Hv[0] * Hv[0] + Hv[1] * Hv[1] + Hv[2] * Hv[2]);
+                    for (double& c : Hv) c /= hl;
+                    const double NdotH = N[0] * Hv[0] + N[1] * Hv[1] + N[2] * Hv[2], VdotH = V[0] * Hv[0] + V[1] * Hv[1] + V[2] * Hv[2];
+                    const double D = a2 / (M_PI * std::pow(NdotH * NdotH * (a2 - 1) + 1, 2));
+                    const double Vis = 0.5 / (NdotL * std::sqrt(NdotV * NdotV * (1 - a2) + a2) + NdotV * std::sqrt(NdotL * NdotL * (1 - a2) + a2));
+                    for (int k = 0; k < 3; ++k) {
+                        const double f0 = 0.04 + (base[k] - 0.04) * metallic, F = f0 + (1 - f0) * std::pow(1 - VdotH, 5);
+                        const double want = ((1 - F) * base[k] * (1 - metallic) / M_PI + F * D * Vis) * M_PI * NdotL;
+                        const float* q = img.at(x, y);
+                        const double got = q[k] / q[3];
+                        const double diff = 255 * std::fabs(fromLinear(Transfer::Bt1886, got) - fromLinear(Transfer::Bt1886, want));
+                        worst = std::max(worst, diff);
+                        QVERIFY2(diff <= 2, qPrintable(QString("metallic %1, (%2, %3) channel %4: %5 against %6").arg(metallic).arg(x).arg(y).arg(k).arg(got).arg(want)));
+                    }
+                    ++tested;
+                }
+            QVERIFY(tested > 10000);
+            qInfo("sphere, metallic %g: %d pixels, at worst %.2f code values from the BRDF", double(metallic), tested, worst);
+        }
+
+        // Light from a picture of the scene: an even grey all round lights the sphere as an ambient light of that
+        // grey does; a sky bright above and dark below lights its top more than its bottom.
+        {
+            sphere.materials[0].metallic = 0;
+            ModelScene scene;
+            scene.triangles = posedTriangles(sphere, poseModel(sphere, -1, 0));
+            scene.model = &sphere;
+            scene.ambient = {0.5f, 0.5f, 0.5f};
+            const Image ambient = renderModel(scene, cam, W, H);
+            auto env = std::make_shared<ModelEnvironment>();
+            env->width = 64, env->height = 32;
+            env->rgb.assign(64 * 32 * 3, 0.5f);
+            scene.ambient = {0, 0, 0};
+            scene.environment = env;
+            const Image even = renderModel(scene, cam, W, H);
+            for (int y = 40; y < 216; y += 7)
+                for (int x = 40; x < 216; x += 7)
+                    for (int k = 0; k < 4; ++k)
+                        QVERIFY2(std::fabs(even.at(x, y)[k] - ambient.at(x, y)[k]) < 0.01f,
+                                 qPrintable(QString("(%1, %2): %3 against %4").arg(x).arg(y).arg(even.at(x, y)[k]).arg(ambient.at(x, y)[k])));
+            auto sky = std::make_shared<ModelEnvironment>();
+            sky->width = 64, sky->height = 32;
+            for (int y = 0; y < 32; ++y)
+                for (int x = 0; x < 64; ++x)
+                    for (int k = 0; k < 3; ++k) sky->rgb.push_back(y < 16 ? 2.0f : 0.05f);
+            scene.environment = sky;
+            const Image lit = renderModel(scene, cam, W, H);
+            // (A white diffuse face there gives back 2 (1 + n_y) / 2 + 0.05 (1 - n_y) / 2, about 1.69 at the top and
+            // 0.36 at the bottom, near 4.7 to 1; the sheen of the sky on the bottom takes some of that away.)
+            QVERIFY(lit.at(128, 60)[1] > 3 * lit.at(128, 196)[1]);
+        }
+
+        // A checkerboard on the floor seen at a grazing angle: wherever a pixel's footprint lies within one square
+        // (with room for the filter), the square's colour, not a blur of both.
+        QImage checker(256, 256, QImage::Format_RGB32);
+        for (int y = 0; y < 256; ++y)
+            for (int x = 0; x < 256; ++x) checker.setPixel(x, y, ((x / 32 + y / 32) & 1) ? qRgb(255, 255, 255) : qRgb(0, 0, 0));
+        QVERIFY(checker.save(QString::fromStdString(path("checker.png"))));
+        writeTextFile(path("floor.mtl"), "newmtl m\nKd 0 0 0\nKe 1 1 1\nmap_Ke checker.png\n");
+        writeTextFile(path("floor.obj"), "mtllib floor.mtl\nusemtl m\nv -10 0 0\nv 10 0 0\nv 10 0 -40\nv -10 0 -40\n"
+                               "vt 0 8\nvt 4 8\nvt 4 0\nvt 0 0\nvn 0 1 0\nf 1/1/1 2/2/1 3/3/1 4/4/1\n");
+        Model floor;
+        QVERIFY2(loadModel(path("floor.obj"), floor, &err), err.c_str());
+        {
+            ModelScene scene;
+            scene.triangles = posedTriangles(floor, poseModel(floor, -1, 0));
+            scene.model = &floor;
+            const int w = 320, h = 180;
+            const ModelCamera fc = lookAt({0, 1, 2}, {0, 0, -10}, 300, w, h);
+            const Image img = renderModel(scene, fc, w, h);
+            auto texel = [&](double px, double py, double& u, double& v) {  // the floor's texel under a picture point
+                const std::array<double, 3> d = fc.ray(px, py);
+                if (d[1] >= 0) return false;
+                const double t = -1 / d[1], X = d[0] * t, Z = 2 + d[2] * t;
+                if (X < -10 || X > 10 || Z > 0 || Z < -40) return false;
+                u = (X + 10) / 20 * 4 * 256, v = (1 - (8 - (-Z) / 40 * 8)) * 256;  // (OBJ's v counts up)
+                return true;
+            };
+            int tested = 0;
+            for (int y = 0; y < h; ++y)
+                for (int x = 0; x < w; ++x) {
+                    double us[5], vs[5];
+                    bool all = true;
+                    const double cx[5] = {x + 0.5, x - 0.5, x + 1.5, x - 0.5, x + 1.5}, cy[5] = {y + 0.5, y - 0.5, y - 0.5, y + 1.5, y + 1.5};
+                    for (int k = 0; k < 5 && all; ++k) all = texel(cx[k], cy[k], us[k], vs[k]);
+                    if (!all) continue;
+                    const double eu = *std::max_element(us + 1, us + 5) - *std::min_element(us + 1, us + 5);
+                    const double ev = *std::max_element(vs + 1, vs + 5) - *std::min_element(vs + 1, vs + 5);
+                    const double margin = 1.5 * std::max(1.0, std::min(eu, ev));
+                    const int cell = (int(std::floor(us[0] / 32)) + int(std::floor(vs[0] / 32))) & 1;
+                    bool inside = true;
+                    for (int k = 0; k < 5 && inside; ++k) {
+                        const double mu = us[k] - 32 * std::floor(us[k] / 32), mv = vs[k] - 32 * std::floor(vs[k] / 32);
+                        inside = int(std::floor(us[k] / 32)) == int(std::floor(us[0] / 32)) && int(std::floor(vs[k] / 32)) == int(std::floor(vs[0] / 32)) &&
+                                 mu >= margin && mu <= 32 - margin && mv >= margin && mv <= 32 - margin;
+                    }
+                    if (!inside) continue;
+                    const float got = img.at(x, y)[0];
+                    QVERIFY2(std::fabs(got - float(cell)) < 0.03f, qPrintable(QString("(%1, %2): %3, want %4").arg(x).arg(y).arg(got).arg(cell)));
+                    ++tested;
+                }
+            QVERIFY2(tested > 300, qPrintable(QString::number(tested)));
+            // Far off, many squares to a pixel: grey, not aliased black and white.
+            double far = 0;
+            for (int x = 140; x < 180; ++x) far += img.at(x, 84)[0];
+            QVERIFY2(std::fabs(far / 40 - 0.5) < 0.15, qPrintable(QString::number(far / 40)));
+        }
+
+        // A box's shadow on the ground where the sun puts it: the ground dark wherever the way to the sun passes
+        // through the box, clear wherever it misses it (a little way off its edges either side).
+        writeTextFile(path("box.mtl"), "newmtl m\nKd 0.7 0.7 0.7\n");
+        writeTextFile(path("box.obj"), cubeObj("box.mtl"));
+        Model box;
+        QVERIFY2(loadModel(path("box.obj"), box, &err), err.c_str());
+        ModelScene scene;
+        scene.triangles = posedTriangles(box, poseModel(box, -1, 0));
+        scene.model = &box;
+        const std::array<double, 3> S0{0.6, 0.6, 0.9};
+        const double sl = std::sqrt(S0[0] * S0[0] + S0[1] * S0[1] + S0[2] * S0[2]);
+        const std::array<double, 3> S{S0[0] / sl, S0[1] / sl, S0[2] / sl};
+        ModelLight sun;
+        sun.direction = {-S[0], -S[1], -S[2]};
+        scene.lights = {sun};
+        scene.ground = true;
+        scene.groundHeight = 0;
+        scene.groundStrength = 1;
+        const int bw = 320, bh = 240;
+        const ModelCamera bc = lookAt({0.3, 4, 3}, {-0.4, 0, -0.6}, 300, bw, bh);
+        const Image shadowImg = renderModel(scene, bc, bw, bh);
+        // Whether a ray meets the box grown (or shrunk) by `grow`.
+        auto hitsBox = [](const std::array<double, 3>& o, const std::array<double, 3>& d, double grow) {
+            const double lo[3] = {-0.5 - grow, 0 - grow, -0.5 - grow}, hi[3] = {0.5 + grow, 1 + grow, 0.5 + grow};
+            double t0 = 0, t1 = 1e30;
+            for (int k = 0; k < 3; ++k) {
+                if (std::fabs(d[size_t(k)]) < 1e-12) {
+                    if (o[size_t(k)] < lo[k] || o[size_t(k)] > hi[k]) return false;
+                    continue;
+                }
+                double a = (lo[k] - o[size_t(k)]) / d[size_t(k)], b = (hi[k] - o[size_t(k)]) / d[size_t(k)];
+                if (a > b) std::swap(a, b);
+                t0 = std::max(t0, a), t1 = std::min(t1, b);
+            }
+            return t0 <= t1;
+        };
+        int dark = 0, clear = 0;
+        for (int y = 0; y < bh; ++y)
+            for (int x = 0; x < bw; ++x) {
+                const std::array<double, 3> d = bc.ray(x + 0.5, y + 0.5);
+                if (hitsBox(bc.C, d, 0.03) || d[1] >= 0) continue;  // (the box, or the sky)
+                const double t = -bc.C[1] / d[1];
+                const std::array<double, 3> P{bc.C[0] + d[0] * t, 0.0, bc.C[2] + d[2] * t};
+                const float a = shadowImg.at(x, y)[3];
+                if (hitsBox(P, S, -0.04)) {
+                    QVERIFY2(a > 0.9f, qPrintable(QString("(%1, %2) should be in shadow: %3").arg(x).arg(y).arg(a)));
+                    ++dark;
+                } else if (!hitsBox(P, S, 0.04)) {
+                    QVERIFY2(a < 0.05f, qPrintable(QString("(%1, %2) should be clear: %3").arg(x).arg(y).arg(a)));
+                    ++clear;
+                }
+            }
+        QVERIFY2(dark > 500 && clear > 5000, qPrintable(QString("%1 dark, %2 clear").arg(dark).arg(clear)));
+        // The same on one thread as on many.
+        ModelRenderOptions one;
+        one.serial = true;
+        const Image serial = renderModel(scene, bc, bw, bh, nullptr, one);
+        QVERIFY(std::memcmp(serial.px.data(), shadowImg.px.data(), shadowImg.px.size() * sizeof(float)) == 0);
+    }
+
+    void modelInTheShot() {
+        // A camera dollying past the scene (a solve made up rather than tracked), on a footage clip: a cube placed at
+        // a point of the solved scene projects its corners where the solve does on every frame.
+        const int W = 640, H = 360, frames = 50;
+        CameraSolve solve;
+        solve.width = W, solve.height = H, solve.focal = 500, solve.fps = 25, solve.start = 0, solve.oriented = true;
+        for (int i = 0; i < frames; ++i) {
+            const std::array<double, 3> C{-1 + 0.04 * i, 1.6, 6};
+            const ModelCamera c = lookAt(C, {0, 0.5, 0}, 1, 1, 1);
+            SolvedCamera sc;
+            sc.valid = true;
+            std::copy(c.R.begin(), c.R.end(), sc.R.begin());
+            sc.C = {C[0], C[1], C[2]};
+            solve.cameras.push_back(sc);
+        }
+        const QString dir = QString::fromStdString(path("dolly"));
+        QDir().mkpath(dir);
+        QImage grey(W, H, QImage::Format_RGB32);
+        grey.fill(qRgb(100, 100, 100));
+        for (int i = 1; i <= frames; ++i) QVERIFY(grey.save(dir + QStringLiteral("/plate_%1.png").arg(i, 4, 10, QLatin1Char('0'))));
+        ImageSequence seq;
+        QVERIFY(detectImageSequence((dir + "/plate_0001.png").toStdString(), seq));
+        seq.fps = Rational{25, 1};
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = {25, 1};
+        MediaItem m = probeOrFail(p, imageSequencePath(seq));
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, frames, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Clip& footage = s.videoTracks[0].clips.at(0);
+        Effect track = makeEffect(p, "camera_track");
+        track.strings["solve"] = cameraSolveToString(solve);
+        footage.effects.push_back(track);
+        writeTextFile(path("shot.mtl"), "newmtl m\nKd 0.9 0.2 0.1\n");
+        writeTextFile(path("shot.obj"), cubeObj("shot.mtl"));
+        const QString project = QString::fromStdString(path("models.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        // Placed over MCP where the picture's middle meets the ground on the first frame.
+        QJsonObject r = call("montage_add_model", {{"project", project}, {"file", QString::fromStdString(path("shot.obj"))},
+                                                   {"over", double(footage.id)}, {"place", QJsonObject{{"x", 0.5}, {"y", 0.6}}},
+                                                   {"settings", QJsonObject{{"ground", 0}, {"rot_y", 0}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("triangles").toDouble(), 12.0);
+        Project q;
+        std::string err;
+        QVERIFY(loadProject(project.toStdString(), q, &err));
+        Sequence& qs = *q.active();
+        QVERIFY(qs.videoTracks.size() >= 2 && qs.videoTracks[1].clips.size() == 1);
+        const Clip& model = qs.videoTracks[1].clips[0];
+        QCOMPARE(model.start, FrameTime(0));
+        QCOMPARE(model.duration, FrameTime(frames));
+        Vec3 ground;
+        QVERIFY(groundPoint(solve, 0, {0.5 * W, 0.6 * H}, ground));
+        QVERIFY(std::fabs(model.generator.p("pos_x", 0, 9) - ground.x) < 1e-9 && std::fabs(model.generator.p("pos_z", 0, 9) - ground.z) < 1e-9);
+        RenderOptions o;
+        for (const int t : {0, 17, 49}) {
+            ModelScene scene;
+            ModelCamera cam;
+            std::shared_ptr<const Model> mdl;
+            QVERIFY2(modelClipScene(q, qs, model, t, W, H, 1, {}, scene, cam, mdl, &err), err.c_str());
+            double xs[2] = {1e9, -1e9}, ys[2] = {1e9, -1e9};
+            for (int k = 0; k < 8; ++k) {
+                const std::array<double, 3> X{ground.x + (k & 1 ? 0.5 : -0.5), ground.y + (k & 2 ? 1 : 0), ground.z + (k & 4 ? 0.5 : -0.5)};
+                double px, py;
+                Point2 want;
+                QVERIFY(cam.project(X, px, py) && solve.project(t, {X[0], X[1], X[2]}, want));
+                QVERIFY2(std::hypot(px - want.x, py - want.y) < 0.5, qPrintable(QString("frame %1 corner %2: %3, %4 against %5, %6").arg(t).arg(k).arg(px).arg(py).arg(want.x).arg(want.y)));
+                xs[0] = std::min(xs[0], want.x), xs[1] = std::max(xs[1], want.x), ys[0] = std::min(ys[0], want.y), ys[1] = std::max(ys[1], want.y);
+            }
+            // Drawn in the cut: red where the cube is, the plate round it.
+            const Image img = renderSequenceFrame(q, qs, t, o);
+            int x0 = W, x1 = -1, y0 = H, y1 = -1;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x)
+                    if (img.at(x, y)[0] > img.at(x, y)[2] + 0.1f) x0 = std::min(x0, x), x1 = std::max(x1, x), y0 = std::min(y0, y), y1 = std::max(y1, y);
+            QVERIFY2(std::fabs(x0 - xs[0]) < 1.5 && std::fabs(x1 + 1 - xs[1]) < 1.5 && std::fabs(y0 - ys[0]) < 1.5 && std::fabs(y1 + 1 - ys[1]) < 1.5,
+                     qPrintable(QString("frame %1: drawn %2..%3 x %4..%5, projected %6..%7 x %8..%9").arg(t).arg(x0).arg(x1).arg(y0).arg(y1)
+                                    .arg(xs[0]).arg(xs[1]).arg(ys[0]).arg(ys[1])));
+        }
+        // Merged by depth with the plate made deep: behind a plate nearer than it, hidden; in front of one further
+        // off, seen.
+        Clip& mc = qs.videoTracks[1].clips[0];
+        mc.generator.params["depth_merge"] = Param(1.0);
+        Effect plateDeep = makeEffect(q, "make_deep");
+        plateDeep.params["source"] = 2.0;  // a constant depth
+        const std::vector<Effect> plateEffects = qs.videoTracks[0].clips[0].effects;  // (its solve)
+        for (const double depth : {2.0, 50.0}) {
+            plateDeep.params["depth"] = depth;
+            qs.videoTracks[0].clips[0].effects = plateEffects;
+            qs.videoTracks[0].clips[0].effects.push_back(plateDeep);
+            const Image img = renderSequenceFrame(q, qs, 0, o);
+            Point2 c;
+            QVERIFY(solve.project(0, {ground.x, ground.y + 0.5, ground.z}, c));
+            const float* px = img.at(int(c.x), int(c.y));
+            if (depth < 10) QVERIFY2(std::fabs(px[0] - px[2]) < 0.02f, "hidden behind the nearer plate");
+            else QVERIFY2(px[0] > px[2] + 0.1f, "in front of the further plate");
+        }
+        // Merged by depth, it still moves with the clip's position.
+        mc.motion.params["pos_x"] = 120.0;
+        {
+            const Image img = renderSequenceFrame(q, qs, 0, o);
+            Point2 c;
+            QVERIFY(solve.project(0, {ground.x, ground.y + 0.5, ground.z}, c));
+            QVERIFY2(img.at(int(c.x) + 120, int(c.y))[0] > img.at(int(c.x) + 120, int(c.y))[2] + 0.1f, "moved with the clip");
+            QVERIFY2(std::fabs(img.at(int(c.x), int(c.y))[0] - img.at(int(c.x), int(c.y))[2]) < 0.02f, "not where it was");
+        }
+
+        // Through its own camera, a model far from its file's origin is centred on the frame at its size.
+        writeTextFile(path("far.obj"), "mtllib shot.mtl\nusemtl m\nv 10 5 -3\nv 11 5 -3\nv 10 6 -3\nv 11 6 -3\nv 10 5 -2\nv 11 5 -2\n"
+                                       "v 10 6 -2\nv 11 6 -2\nf 1 2 4 3\nf 5 7 8 6\nf 1 5 6 2\nf 3 4 8 7\nf 1 3 7 5\nf 2 6 8 4\n");
+        Project own = makeDefaultProject();
+        Sequence& os = *own.active();
+        os.width = W, os.height = H, os.fps = {25, 1};
+        Clip far;
+        far.id = own.newId();
+        far.duration = 10;
+        far.generator = makeEffect(own, "model3d");
+        far.generator.strings["file"] = path("far.obj");
+        far.generator.params["size"] = 200.0;
+        far.generator.params["rot_y"] = 0.0;
+        far.generator.params["ground"] = 0.0;  // (its shadow would widen what is drawn)
+        os.videoTracks[0].clips.push_back(far);
+        const Image ownImg = renderModelClip(own, os, os.videoTracks[0].clips[0], 0, W, H, 1, {}, nullptr, &err);
+        QVERIFY2(ownImg.width == W, err.c_str());
+        int ox0 = W, ox1 = -1, oy0 = H, oy1 = -1;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                if (ownImg.at(x, y)[3] > 0.5f) ox0 = std::min(ox0, x), ox1 = std::max(ox1, x), oy0 = std::min(oy0, y), oy1 = std::max(oy1, y);
+        // (its front face, 100 px nearer than the frame, a little larger than 200 px)
+        const double fl = (W / 2.0) / std::tan(17.5 * M_PI / 180), want = 200 * fl / (fl - 100);
+        QVERIFY2(std::fabs((ox0 + ox1 + 1) / 2.0 - W / 2.0) < 1.5 && std::fabs((oy0 + oy1 + 1) / 2.0 - H / 2.0) < 1.5 &&
+                     std::fabs(oy1 + 1 - oy0 - want) < 2.5,
+                 qPrintable(QString("drawn %1..%2 x %3..%4, %5 tall wanted").arg(ox0).arg(ox1).arg(oy0).arg(oy1).arg(want)));
     }
 
     void dialogueMusicEffectsChunks() {
