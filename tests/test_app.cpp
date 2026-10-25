@@ -236,6 +236,7 @@
 #include "core/Expression.h"
 #include "core/Multicam.h"
 #include "core/ProjectIO.h"
+#include "core/TakeLanes.h"
 #include "media/Decoder.h"
 #include "media/LtcTimecode.h"
 #include "audio/Ltc.h"
@@ -9892,6 +9893,123 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(dlg && dlg->isVisible());
         QVERIFY(dlg->findChild<QPushButton*>("voiceoverRecord"));
         dlg->close();
+        state()->newProject();
+    }
+
+    void loopRecordingTakeLanes() {
+        state()->newProject();
+        QVERIFY(state()->save(dir_.path() + "/loop.montage"));
+        const double fps = state()->sequence()->fpsValue();
+        const FrameTime in = 48, out = in + FrameTime(std::llround(6 * fps)), pre = FrameTime(std::llround(fps));
+        const TrackRef a2{TrackKind::Audio, 1};
+        // Loop recording from In to Out with a second's pre-roll: three passes and half a second more (too short to
+        // keep), each sample saying where it is in the recording.
+        VoiceoverRecorder rec(state());
+        QVERIFY(rec.startLoop(in, out, pre, 1, {}, false, 48000, 1));
+        QVERIFY(rec.isLooping());
+        const double length = double(out - in) / fps * 48000;
+        const qint64 preroll = std::llround(double(pre) / fps * 48000);
+        auto passStart = [&](int k) { return preroll + qint64(std::llround(k * length)); };
+        auto value = [](qint64 i) { return float(i % 9973) / 9973.0f * 0.5f; };
+        const qint64 total = passStart(3) + 24000;
+        std::vector<float> block(4800);
+        for (qint64 at = 0; at < total; at += 4800) {
+            const qint64 n = std::min<qint64>(4800, total - at);
+            for (qint64 i = 0; i < n; ++i) block[size_t(i)] = value(at + i);
+            rec.feed(block.data(), n);
+        }
+        QCOMPARE(rec.passes(), 3);
+        const Id comp = rec.stop();
+        QVERIFY(comp);
+        QVERIFY(!rec.isLooping());
+        // Three lanes at In, each pass sample-exact; the last half second is dropped and the whole recording removed.
+        auto track = [&]() -> const Track& { return state()->sequence()->audioTracks[1]; };
+        QCOMPARE(track().lanes.size(), size_t(3));
+        for (int k = 0; k < 3; ++k) {
+            const TakeLane& l = track().lanes[size_t(k)];
+            QCOMPARE(l.start, in);
+            QCOMPARE(l.name, "Take " + std::to_string(k + 1));
+            QFile f(QString::fromStdString(state()->project().findMedia(l.mediaId)->path));
+            QVERIFY(f.open(QIODevice::ReadOnly));
+            f.seek(44);
+            const QByteArray data = f.readAll();
+            const auto* s = reinterpret_cast<const float*>(data.constData());
+            const qint64 count = data.size() / 4;
+            QCOMPARE(count, passStart(k + 1) - passStart(k));
+            QCOMPARE(s[0], value(passStart(k)));
+            QCOMPARE(s[count - 1], value(passStart(k + 1) - 1));
+        }
+        QVERIFY(rec.lastTake().endsWith(" pass 3.wav"));
+        const QString whole = rec.lastTake().chopped(11);  // ".../Sequence 1 VO n"
+        QVERIFY(!QFileInfo::exists(whole + ".wav"));
+        QVERIFY(!QFileInfo::exists(whole + " pass 4.wav"));
+        // The last pass is the comp, In to Out; one undo takes lanes and comp away.
+        const Clip* c = edit::clipById(*state()->sequence(), comp);
+        QVERIFY(c && c->start == in && c->duration == out - in);
+        QCOMPARE(c->mediaId, track().lanes[2].mediaId);
+        QCOMPARE(compLaneOf(track(), *c), track().lanes[2].id);
+        state()->undo();
+        QVERIFY(track().lanes.empty() && track().clips.empty());
+        state()->redo();
+        QCOMPARE(track().lanes.size(), size_t(3));
+
+        // A sweep across Take 1's lane gives that stretch to the comp, with crossfades at its joins.
+        TimelineWidget* tl = timeline();
+        tl->zoomToFit();
+        const Id take1 = track().lanes[0].id;
+        const QRect sweep = tl->takeLaneBounds(a2, take1, in + 24, in + 72);
+        QVERIFY(!sweep.isEmpty() && tl->viewport()->rect().contains(sweep.center()));
+        drag({sweep.left(), sweep.center().y()}, {sweep.right() + 1, sweep.center().y()});
+        QCOMPARE(track().clips.size(), size_t(3));
+        const Clip& mid = track().clips[1];
+        QCOMPARE(compLaneOf(track(), mid), take1);
+        QVERIFY(std::abs(mid.start - (in + 24)) <= 1 && std::abs(mid.end() - (in + 72)) <= 1);
+        QCOMPARE(track().transitions.size(), size_t(2));
+        state()->undo();
+        QCOMPARE(track().clips.size(), size_t(1));
+        state()->redo();
+
+        // Track Versions from the header's menu: a new empty version, then back to the first with its comp.
+        auto viaMenu = [&](const QString& text) {
+            bool triggered = false;
+            QTimer::singleShot(0, this, [&] {
+                auto* menu = qobject_cast<QMenu*>(QApplication::activePopupWidget());
+                if (!menu) return;
+                if (auto* sub = menu->findChild<QMenu*>("trackVersionMenu"))
+                    for (QAction* act : sub->actions())
+                        if (act->text() == text) {
+                            act->trigger();
+                            triggered = true;
+                        }
+                menu->close();
+            });
+            const QPoint at(40, tl->takeLaneBounds(a2, take1, in, in + 1).top() - 10);
+            QContextMenuEvent ev(QContextMenuEvent::Mouse, at, tl->viewport()->mapToGlobal(at));
+            QApplication::sendEvent(tl->viewport(), &ev);
+            return triggered;
+        };
+        const std::vector<Clip> comped = track().clips;
+        QVERIFY(viaMenu("New Empty Version"));
+        QCOMPARE(track().versions.size(), size_t(2));
+        QVERIFY(track().clips.empty());
+        QCOMPARE(track().lanes.size(), size_t(3));  // the takes stay with the track
+        QVERIFY(viaMenu("Version 1"));
+        QCOMPARE(track().version, 0);
+        QVERIFY(track().clips == comped);
+
+        // Another loop recording leaves the first one's passes as they were.
+        const QByteArray firstPass = [&] {
+            QFile f(whole + " pass 1.wav");
+            return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+        }();
+        QVERIFY(rec.startLoop(in, out, pre, 1, {}, false, 48000, 1));
+        std::fill(block.begin(), block.end(), 0.125f);
+        for (qint64 at = 0; at < passStart(1); at += 4800) rec.feed(block.data(), std::min<qint64>(4800, passStart(1) - at));
+        QVERIFY(rec.stop());
+        QVERIFY(!rec.lastTake().startsWith(whole + " "));
+        QCOMPARE(track().lanes.size(), size_t(4));
+        QFile again(whole + " pass 1.wav");
+        QVERIFY(again.open(QIODevice::ReadOnly) && again.readAll() == firstPass);
         state()->newProject();
     }
 

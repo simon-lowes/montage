@@ -55,6 +55,7 @@
 #include "core/Provenance.h"
 #include "core/LensProfile.h"
 #include "core/AudioDescription.h"
+#include "core/TakeLanes.h"
 #include <QProcess>
 #include <QSysInfo>
 #include <QCoreApplication>
@@ -9937,6 +9938,181 @@ private slots:
         QVERIFY(err.find("bad") != std::string::npos);
         QVERIFY(parseCdlXml("<ColorDecisionList><ColorDecision><ColorCorrectionRef ref=\"x\"/></ColorDecision></ColorDecisionList>", &err).empty());
         QVERIFY(err.find("ColorCorrectionRef") != std::string::npos);
+    }
+
+    void takesOnLanes() {
+        // Three takes of a 6 s line recorded in a loop from 1 s (30 fps), as lanes on A1.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        std::vector<Id> media;
+        for (int k = 1; k <= 3; ++k) {
+            MediaItem m;
+            m.id = p.newId();
+            m.kind = MediaKind::Audio;
+            m.name = "Take " + std::to_string(k) + ".wav";
+            m.path = "/nonexistent/take" + std::to_string(k) + ".wav";
+            m.duration = 6.0;
+            m.hasAudio = true;
+            p.media.push_back(m);
+            media.push_back(m.id);
+        }
+        // The passes of a loop recording: whole ones, a short last one kept only from a second, none drifting at 29.97.
+        {
+            const auto passes = loopPasses(48000 + 3 * 288000 + 30000, 48000, 288000.0, 48000);
+            QCOMPARE(passes.size(), size_t(3));
+            QCOMPARE(passes[2].first, int64_t(48000 + 2 * 288000));
+            QVERIFY(passes[2].complete);
+            QCOMPARE(loopPasses(48000 + 3 * 288000 + 50000, 48000, 288000.0, 48000).back().complete, false);
+            const double ntsc = 180 * 48000 * 1001.0 / 30000;  // 180 frames at 29.97
+            const auto drift = loopPasses(int64_t(10 * ntsc) + 10, 0, ntsc);
+            QCOMPARE(drift.size(), size_t(10));
+            QCOMPARE(drift[9].first, std::llround(9 * ntsc));
+        }
+        const TrackRef a1{TrackKind::Audio, 0};
+        const edit::Result added = edit::addLoopTakes(p, s, a1, media, {true, true, true}, 30, 210);
+        QVERIFY2(added.ok, added.error.c_str());
+        QCOMPARE(added.created.size(), size_t(4));  // three lanes and the comp of the last
+        const Track& t = s.audioTracks[0];
+        QCOMPARE(t.lanes.size(), size_t(3));
+        QCOMPARE(t.lanes[1].name, std::string("Take 2"));
+        QCOMPARE(t.lanes[2].start, FrameTime(30));
+        QCOMPARE(t.clips.size(), size_t(1));
+        QCOMPARE(compLaneOf(t, t.clips[0]), t.lanes[2].id);
+        const Id take1 = t.lanes[0].id, take2 = t.lanes[1].id, take3 = t.lanes[2].id;
+        // The comp: take 1 for 0-2 s of the line, take 3 for 2-4 s, take 2 for 4-6 s; a crossfade at each join.
+        QVERIFY(edit::compTake(p, s, a1, take1, 30, 90).ok);
+        QVERIFY(edit::compTake(p, s, a1, take2, 150, 210).ok);
+        auto comp = [&] {
+            std::vector<std::tuple<FrameTime, FrameTime, Id, double>> out;
+            const Track& at = p.active()->audioTracks[0];  // (undo replaces the sequence)
+            for (const Clip& c : at.clips) out.push_back({c.start, c.end(), compLaneOf(at, c), c.sourceIn});
+            return out;
+        };
+        using Seg = std::tuple<FrameTime, FrameTime, Id, double>;
+        QCOMPARE(comp(), (std::vector<Seg>{{30, 90, take1, 0.0}, {90, 150, take3, 60.0}, {150, 210, take2, 120.0}}));
+        QCOMPARE(s.audioTracks[0].transitions.size(), size_t(2));
+        for (const Transition& tr : s.audioTracks[0].transitions) {
+            QCOMPARE(tr.type, std::string("crossfade"));
+            QCOMPARE(tr.params.p("seconds", 0, 0), kCompCrossfadeSeconds);
+            QVERIFY(tr.clipA && tr.clipB);
+        }
+        QVERIFY(!edit::compTake(p, s, a1, take1, 10, 40).ok);   // before the take
+        QVERIFY(!edit::compTake(p, s, a1, take1, 200, 220).ok);  // past it
+        // The join at 2 s moved half a second later: both sides go, take 3 starting further in; the crossfade stays.
+        QVERIFY(edit::moveCompJoin(p, s, a1, 90, 15).ok);
+        QCOMPARE(comp(), (std::vector<Seg>{{30, 105, take1, 0.0}, {105, 150, take3, 75.0}, {150, 210, take2, 120.0}}));
+        QCOMPARE(s.audioTracks[0].transitions.size(), size_t(2));
+        QVERIFY(!edit::moveCompJoin(p, s, a1, 100, 5).ok);  // no join there
+        QVERIFY(edit::setCompCrossfade(p, s, a1, 150, 0.05).ok);
+        const auto joinAt150 = std::find_if(s.audioTracks[0].transitions.begin(), s.audioTracks[0].transitions.end(),
+                                            [&](const Transition& tr) { return edit::clipById(s, tr.clipB)->start == 150; });
+        QVERIFY(joinAt150 != s.audioTracks[0].transitions.end() && std::fabs(joinAt150->params.p("seconds", 0, 0) - 0.05) < 1e-12);
+        {
+            // Centred on the cut, a crossfade is at most twice the shorter clip (45 frames here); comping a stretch of
+            // the take already there puts none inside it; dragged on the timeline it is as long as drawn.
+            Project q = p;
+            Sequence& qs = *q.active();
+            auto fadeAt = [&](FrameTime at) -> const Transition* {
+                for (const Transition& tr : qs.audioTracks[0].transitions)
+                    if (edit::clipById(qs, tr.clipB)->start == at) return &tr;
+                return nullptr;
+            };
+            QVERIFY(edit::setCompCrossfade(q, qs, a1, 150, 9.0).ok);
+            QCOMPARE(fadeAt(150)->params.p("seconds", 0, 0), 3.0);
+            QVERIFY(edit::compTake(q, qs, a1, take1, 60, 90).ok);
+            QCOMPARE(qs.audioTracks[0].clips.size(), size_t(5));
+            QCOMPARE(qs.audioTracks[0].transitions.size(), size_t(2));
+            QVERIFY(!edit::compTake(q, qs, a1, take1, 60, 90, -1).ok);
+            QVERIFY(edit::setTransitionDuration(qs, fadeAt(150)->id, 6).ok);
+            QVERIFY(!fadeAt(150)->params.params.count("seconds"));
+        }
+        // Named and rated; the lanes and the comp saved and read back, and undone.
+        QVERIFY(edit::renameTakeLane(s, a1, take3, "Best").ok);
+        QVERIFY(edit::rateTakeLane(s, a1, take3, 4).ok);
+        History h;
+        h.push("Comp", p);
+        QVERIFY(edit::compTake(p, s, a1, take1, 150, 210).ok);
+        QVERIFY(h.undo(p));
+        QCOMPARE(comp(), (std::vector<Seg>{{30, 105, take1, 0.0}, {105, 150, take3, 75.0}, {150, 210, take2, 120.0}}));
+        QTemporaryDir dir;
+        const std::string file = (dir.path() + "/takes.montage").toStdString();
+        QVERIFY(saveProject(p, file));
+        Project back;
+        QVERIFY(loadProject(file, back));
+        QCOMPARE(back.active()->audioTracks[0].lanes, p.active()->audioTracks[0].lanes);
+        QCOMPARE(back.active()->audioTracks[0].clips, p.active()->audioTracks[0].clips);
+        QCOMPARE(back.active()->audioTracks[0].transitions, p.active()->audioTracks[0].transitions);
+        QCOMPARE(back.active()->audioTracks[0].lanes[2].rating, 4);
+        // Versions: the comp kept as version 1, a copy changed as version 2; switching back restores it exactly.
+        Sequence& sv = *p.active();
+        const Track before = sv.audioTracks[0];
+        QVERIFY(edit::newTrackVersion(p, sv, a1, "Alt").ok);
+        QCOMPARE(sv.audioTracks[0].versions.size(), size_t(2));
+        QCOMPARE(sv.audioTracks[0].version, 1);
+        QCOMPARE(sv.audioTracks[0].clips.size(), size_t(3));
+        QVERIFY(sv.audioTracks[0].clips[0].id != before.clips[0].id);
+        QVERIFY(edit::compTake(p, sv, a1, take1, 30, 210).ok);
+        QCOMPARE(sv.audioTracks[0].clips.size(), size_t(1));
+        QVERIFY(edit::switchTrackVersion(sv, a1, 0).ok);
+        QCOMPARE(sv.audioTracks[0].clips, before.clips);
+        QCOMPARE(sv.audioTracks[0].transitions, before.transitions);
+        QVERIFY(!edit::deleteTrackVersion(sv, a1, 0).ok);  // the one shown
+        {
+            // Saved with both versions; a copy of the sequence renews every id, the other version's too.
+            QVERIFY(saveProject(p, file));
+            Project again;
+            QVERIFY(loadProject(file, again));
+            QCOMPARE(again.active()->audioTracks[0].versions, sv.audioTracks[0].versions);
+            const Id copy = edit::duplicateSequence(again, again.activeSequence, "Copy");
+            const Track& ct = again.findSequence(copy)->audioTracks[0];
+            QCOMPARE(ct.versions.size(), size_t(2));
+            QVERIFY(ct.versions[1].clips.size() == 1 && ct.versions[1].clips[0].id != sv.audioTracks[0].versions[1].clips[0].id);
+            QVERIFY(ct.lanes[0].id != take1);
+            QCOMPARE(compLaneOf(ct, ct.clips[0]), ct.lanes[0].id);
+        }
+        QVERIFY(edit::switchTrackVersion(sv, a1, 1).ok);
+        QCOMPARE(sv.audioTracks[0].clips.size(), size_t(1));
+        QVERIFY(edit::switchTrackVersion(sv, a1, 0).ok);
+        QVERIFY(edit::deleteTrackVersion(sv, a1, 1).ok);
+        QVERIFY(sv.audioTracks[0].versions.empty());
+        QCOMPARE(sv.audioTracks[0].clips, before.clips);
+        // The lanes as shown: the three takes, then an audition's other takes at its place.
+        {
+            Project q = p;
+            Sequence& qs = *q.active();
+            Clip v = makeClip(q, *q.findMedia(media[0]), TrackKind::Audio, qs);
+            v.start = 300;
+            v.duration = 30;
+            QVERIFY(edit::overwrite(q, qs, a1, v).ok);
+            QVERIFY(edit::addTakes(q, qs, v.id, {{media[1], 0.0}}).ok);
+            const std::vector<LaneView> views = laneViews(q, qs, a1);
+            QCOMPARE(views.size(), size_t(4));
+            QCOMPARE(views[3].clip, v.id);
+            QCOMPARE(views[3].start, FrameTime(300));
+        }
+        // The take that says the line, and among those that do equally, one that does not clip.
+        {
+            std::vector<TakeCandidate> c(3);
+            for (auto& x : c) x.transcribed = true, x.rmsDb = -20;
+            c[0].name = "Take 1", c[0].said = "Ask not what your country can do";
+            c[1].name = "Take 2", c[1].said = "Ask not what your country can do for you.";
+            c[2].name = "Take 3", c[2].said = "ask not what you're country can do for you";
+            const std::string line = "Ask not what your country can do for you";
+            QCOMPARE(lineWordErrors(c[1].said, line), 0);
+            QCOMPARE(lineWordErrors(c[0].said, line), 2);
+            QCOMPARE(lineWordErrors(c[2].said, line), 1);
+            std::string why;
+            QCOMPARE(suggestTake(c, line, &why), 1);
+            QVERIFY2(why.find("Take 2") != std::string::npos, why.c_str());
+            c[2].said = c[1].said;
+            c[1].clippedSeconds = 0.2;
+            QCOMPARE(suggestTake(c, line), 2);
+            QCOMPARE(suggestTake({}, line), -1);
+        }
+        // A lane's media must have sound; a locked track takes no lanes.
+        QVERIFY(!edit::addTakeLane(p, sv, {TrackKind::Video, 0}, media[0], 0).ok);
+        sv.audioTracks[0].locked = true;
+        QVERIFY(!edit::compTake(p, sv, a1, take1, 30, 60).ok);
     }
 
     void interchangeCompoundAndMulticam() {

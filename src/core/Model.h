@@ -509,6 +509,27 @@ struct Send {
     bool operator==(const Send&) const = default;
 };
 
+// A take lane (Pro Tools' playlists, Logic's take folders, Nuendo's lanes; core/TakeLanes.h): one pass of a loop
+// recording, or any take kept with a track, its sound starting at timeline frame `start`. The track plays a comp of
+// its lanes as ordinary clips.
+struct TakeLane {
+    Id id = 0;
+    std::string name;
+    Id mediaId = 0;
+    FrameTime start = 0;  // where its first sample plays
+    int rating = 0;       // 0 none, 1..5
+    bool operator==(const TakeLane&) const = default;
+};
+
+// A track version (Pro Tools' playlists, Resolve's track layers kept aside; core/TakeLanes.h): a whole other edit
+// of a track's clips, switched to in one step.
+struct TrackVersion {
+    std::string name;
+    std::vector<Clip> clips;  // empty for the one shown: its clips are the track's
+    std::vector<Transition> transitions;
+    bool operator==(const TrackVersion&) const = default;
+};
+
 struct Track {
     Id id = 0;
     TrackKind kind = TrackKind::Video;
@@ -538,6 +559,12 @@ struct Track {
     // Track folder (Resolve's Fairlight folders): tracks of a kind with the same folder, next to each other, show under
     // one header that can collapse them and mute, solo or hide them together. "" = none.
     std::string folder;
+    // Take lanes under the track (shown or folded away) and its versions: empty for a track with one version, else
+    // versions[version] is the one shown, whose clips are the track's own.
+    std::vector<TakeLane> lanes;
+    bool lanesShown = true;
+    std::vector<TrackVersion> versions;
+    int version = 0;
     bool operator==(const Track&) const = default;
 };
 

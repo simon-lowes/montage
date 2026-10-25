@@ -1998,29 +1998,35 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
             for (Send& sd : t.sends) sd.bus = buses.count(sd.bus) ? buses[sd.bus] : 0;
             std::erase_if(t.sends, [](const Send& sd) { return !sd.bus; });
             for (Effect& e : t.effects) renew(e);
-            for (Clip& c : t.clips) {
-                const Id fresh = p.newId();
-                clips[c.id] = fresh;
-                owner = c.id;
-                c.id = fresh;
-                if (c.linkGroup) {
-                    auto [it, added] = groups.try_emplace(c.linkGroup, 0);
-                    if (added) it->second = p.newId();
-                    c.linkGroup = it->second;
+            // Its clips and transitions, and its other versions' likewise.
+            auto renewClips = [&](std::vector<Clip>& list, std::vector<Transition>& trs) {
+                for (Clip& c : list) {
+                    const Id fresh = p.newId();
+                    clips[c.id] = fresh;
+                    owner = c.id;
+                    c.id = fresh;
+                    if (c.linkGroup) {
+                        auto [it, added] = groups.try_emplace(c.linkGroup, 0);
+                        if (added) it->second = p.newId();
+                        c.linkGroup = it->second;
+                    }
+                    for (Effect* e : {&c.generator, &c.motion, &c.audio, &c.timing}) renew(*e);
+                    for (Effect& e : c.effects) renew(e);
+                    owner = 0;
+                    if (c.colorGroup) c.colorGroup = colorGroups.count(c.colorGroup) ? colorGroups[c.colorGroup] : 0;
+                    remapShared(c.grade);
+                    for (GradeVersion& v : c.gradeVersions) remapShared(v.grade);
                 }
-                for (Effect* e : {&c.generator, &c.motion, &c.audio, &c.timing}) renew(*e);
-                for (Effect& e : c.effects) renew(e);
-                owner = 0;
-                if (c.colorGroup) c.colorGroup = colorGroups.count(c.colorGroup) ? colorGroups[c.colorGroup] : 0;
-                remapShared(c.grade);
-                for (GradeVersion& v : c.gradeVersions) remapShared(v.grade);
-            }
-            for (Transition& tr : t.transitions) {
-                tr.id = p.newId();
-                renew(tr.params);
-                if (tr.clipA) tr.clipA = clips.count(tr.clipA) ? clips[tr.clipA] : 0;
-                if (tr.clipB) tr.clipB = clips.count(tr.clipB) ? clips[tr.clipB] : 0;
-            }
+                for (Transition& tr : trs) {
+                    tr.id = p.newId();
+                    renew(tr.params);
+                    if (tr.clipA) tr.clipA = clips.count(tr.clipA) ? clips[tr.clipA] : 0;
+                    if (tr.clipB) tr.clipB = clips.count(tr.clipB) ? clips[tr.clipB] : 0;
+                }
+            };
+            renewClips(t.clips, t.transitions);
+            for (TrackVersion& v : t.versions) renewClips(v.clips, v.transitions);
+            for (TakeLane& l : t.lanes) l.id = p.newId();
         }
     for (AdrCue& q : s.adrCues) {
         q.id = p.newId();
@@ -2121,6 +2127,7 @@ Result setTransitionDuration(Sequence& s, Id transitionId, FrameTime duration) {
     }
     if (room == std::numeric_limits<FrameTime>::max()) return Result::fail("The transition's clips are gone");
     tr->duration = std::clamp<FrameTime>(duration, 2, std::max<FrameTime>(2, room));
+    tr->params.params.erase("seconds");  // a take comp's short crossfade (core/TakeLanes.h) now as long as drawn
     Result r;
     r.applied = tr->duration;
     return r;

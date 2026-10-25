@@ -5,6 +5,8 @@
 #include <QAudioSource>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDoubleSpinBox>
+#include <QHBoxLayout>
 #include <QDir>
 #include <QFileInfo>
 #include <QFormLayout>
@@ -22,6 +24,7 @@
 #include "EditorState.h"
 #include "PlaybackController.h"
 #include "core/EditOps.h"
+#include "core/TakeLanes.h"
 
 namespace montage {
 
@@ -149,8 +152,9 @@ bool VoiceoverRecorder::start(FrameTime at, int track, FrameTime stopAt, const Q
     QDir().mkpath(takeFolder());
     const QString stem = stem_.isEmpty() ? QString::fromStdString(s->name) + QStringLiteral(" VO ") : stem_;
     int n = 1;
+    // (A loop recording's passes keep its name, "<name> pass 1.wav" ..., so that name is taken too.)
     do path_ = takeFolder() + '/' + stem + QString::number(n++) + QStringLiteral(".wav");
-    while (QFileInfo::exists(path_));
+    while (QFileInfo::exists(path_) || QFileInfo::exists(path_.chopped(4) + QStringLiteral(" pass 1.wav")));
     if (!writer_.open(path_, rate_, channels_)) {
         state_->message(tr("Cannot write %1").arg(path_), 5000);
         delete source_;
@@ -168,6 +172,23 @@ bool VoiceoverRecorder::start(FrameTime at, int track, FrameTime stopAt, const Q
         connect(io_, &QIODevice::readyRead, this, &VoiceoverRecorder::readDevice);
     }
     return true;
+}
+
+bool VoiceoverRecorder::startLoop(FrameTime in, FrameTime out, FrameTime preroll, int track, const QString& input, bool openDevice,
+                                  int sampleRate, int channels) {
+    if (isRecording() || out <= in) return false;
+    preroll = std::clamp<FrameTime>(preroll, 0, in);
+    loopIn_ = in, loopOut_ = out, preroll_ = preroll;
+    if (start(in - preroll, track, -1, input, openDevice, sampleRate, channels)) return true;
+    loopIn_ = loopOut_ = preroll_ = 0;
+    return false;
+}
+
+int VoiceoverRecorder::passes() const {
+    const Sequence* s = state_->sequence();
+    if (!isLooping() || !s) return 0;
+    const double fps = s->fpsValue(), length = double(loopOut_ - loopIn_) / fps * rate_;
+    return int(loopPasses(writer_.frames(), std::llround(double(preroll_) / fps * rate_), length).size());
 }
 
 void VoiceoverRecorder::readDevice() {
@@ -219,8 +240,10 @@ Id VoiceoverRecorder::stop() {
     writer_.close();
     if (frames == 0) {
         QFile::remove(path_);
+        loopIn_ = loopOut_ = 0;
         return 0;
     }
+    if (isLooping()) return stopLoop();
     lastTake_ = path_;
     // Into the bin's Voiceover folder, then onto the track where recording began.
     const auto ids = state_->importFiles({path_}, nullptr, folder_);
@@ -246,7 +269,64 @@ Id VoiceoverRecorder::stop() {
     return clip;
 }
 
+Id VoiceoverRecorder::stopLoop() {
+    const FrameTime in = loopIn_, out = loopOut_, preroll = preroll_;
+    loopIn_ = loopOut_ = preroll_ = 0;
+    const Sequence* s = state_->sequence();
+    QFile whole(path_);
+    if (!s || !whole.open(QIODevice::ReadOnly)) {
+        emit stopped(0);
+        return 0;
+    }
+    // The recording as written (a 44-byte header, then floats), cut into its passes.
+    whole.seek(44);
+    const QByteArray data = whole.readAll();
+    whole.close();
+    const qint64 frames = data.size() / qint64(sizeof(float) * size_t(channels_));
+    const float* samples = reinterpret_cast<const float*>(data.constData());
+    const double fps = s->fpsValue();
+    const std::vector<LoopPass> passes =
+        loopPasses(frames, std::llround(double(preroll) / fps * rate_), double(out - in) / fps * rate_, rate_);
+    QStringList files;
+    const QString stem = QFileInfo(path_).completeBaseName() + QStringLiteral(" pass ");
+    for (size_t k = 0; k < passes.size(); ++k) {
+        const QString file = takeFolder() + '/' + stem + QString::number(k + 1) + QStringLiteral(".wav");
+        WavWriter w;
+        if (!w.open(file, rate_, channels_)) continue;
+        w.write(samples + passes[k].first * channels_, passes[k].count);
+        if (w.close()) files << file;
+    }
+    QFile::remove(path_);
+    if (files.isEmpty()) {
+        state_->message(tr("The loop recording ended before a whole pass"), 5000);
+        emit stopped(0);
+        return 0;
+    }
+    lastTake_ = files.back();
+    const auto ids = state_->importFiles(files, nullptr, folder_);
+    for (const Id media : ids) emit taken(media, in);
+    if (ids.size() != files.size()) {  // (a pass that did not import would put the others on the wrong lanes)
+        state_->message(tr("Some passes of the loop recording could not be imported"), 5000);
+        emit stopped(0);
+        return 0;
+    }
+    const int track = track_;
+    std::vector<bool> complete;
+    for (const LoopPass& pass : passes) complete.push_back(pass.complete);
+    Id clip = 0;
+    state_->apply(tr("Loop Record"), [&](Project& p, Sequence& sq) {
+        if (sq.audioTracks.empty()) return edit::Result::fail("No audio track");
+        const TrackRef a{TrackKind::Audio, std::min(track, int(sq.audioTracks.size()) - 1)};
+        edit::Result r = edit::addLoopTakes(p, sq, a, ids, complete, in, out);
+        if (r.ok && r.created.size() > ids.size()) clip = r.created.back();
+        return r;
+    });
+    emit stopped(clip);
+    return clip;
+}
+
 void VoiceoverRecorder::cancel() {
+    loopIn_ = loopOut_ = preroll_ = 0;
     if (source_) {
         source_->stop();
         source_->deleteLater();
@@ -281,6 +361,18 @@ VoiceoverDialog::VoiceoverDialog(EditorState* state, PlaybackController* program
     punch_->setObjectName(QStringLiteral("voiceoverPunch"));
     const Sequence* s = state_->sequence();
     punch_->setEnabled(s && s->inPoint >= 0 && s->outPoint > s->inPoint);
+    // Loop: In to Out again and again, each pass a take lane (core/TakeLanes.h), after a pre-roll heard once.
+    loop_ = new QCheckBox(tr("Loop: each pass from In to Out a take"), this);
+    loop_->setObjectName(QStringLiteral("voiceoverLoop"));
+    loop_->setEnabled(punch_->isEnabled());
+    preroll_ = new QDoubleSpinBox(this);
+    preroll_->setObjectName(QStringLiteral("voiceoverPreroll"));
+    preroll_->setRange(0, 10);
+    preroll_->setDecimals(1);
+    preroll_->setSuffix(tr(" s pre-roll"));
+    preroll_->setValue(2);
+    preroll_->setEnabled(false);
+    connect(loop_, &QCheckBox::toggled, preroll_, &QWidget::setEnabled);
     meter_ = new QProgressBar(this);
     meter_->setRange(0, 1000);
     meter_->setTextVisible(false);
@@ -294,6 +386,10 @@ VoiceoverDialog::VoiceoverDialog(EditorState* state, PlaybackController* program
     form->addRow(tr("Track:"), track_);
     form->addRow(countdown_);
     form->addRow(punch_);
+    auto* loopRow = new QHBoxLayout;
+    loopRow->addWidget(loop_);
+    loopRow->addWidget(preroll_);
+    form->addRow(loopRow);
     form->addRow(tr("Level:"), meter_);
     form->addRow(status_);
     form->addRow(record_);
@@ -301,6 +397,7 @@ VoiceoverDialog::VoiceoverDialog(EditorState* state, PlaybackController* program
     connect(recorder_, &VoiceoverRecorder::level, this, [this](float peak) {
         const double db = peak > 0 ? 20 * std::log10(peak) : -60;
         meter_->setValue(int(std::clamp((db + 60) / 60, 0.0, 1.0) * 1000));
+        if (recorder_->isLooping()) status_->setText(tr("Recording pass %1...").arg(recorder_->passes() + 1));
     });
     connect(recorder_, &VoiceoverRecorder::stopped, this, [this](Id) { finish(); });
     tick_.setInterval(1000);
@@ -338,7 +435,24 @@ void VoiceoverDialog::toggle() {
 void VoiceoverDialog::begin() {
     const Sequence* s = state_->sequence();
     if (!s) return;
+    const bool loop = loop_->isChecked() && loop_->isEnabled();
     const bool punch = punch_->isChecked() && punch_->isEnabled();
+    if (loop) {
+        const FrameTime pre = std::min<FrameTime>(s->inPoint, FrameTime(std::llround(preroll_->value() * s->fpsValue())));
+        if (!recorder_->startLoop(s->inPoint, s->outPoint + 1, pre, track_->currentIndex(), input_->currentText())) {
+            record_->setText(tr("Record"));
+            status_->setText(tr("Could not start recording"));
+            return;
+        }
+        status_->setText(tr("Recording pass 1..."));
+        if (program_) {
+            wasLooping_ = program_->loop();
+            program_->setLoop(true);
+            program_->seek(s->inPoint - pre);
+            if (!program_->isPlaying()) program_->play();
+        }
+        return;
+    }
     const FrameTime at = punch ? s->inPoint : state_->playhead();
     const FrameTime out = punch ? s->outPoint + 1 : -1;
     if (!recorder_->start(at, track_->currentIndex(), out, input_->currentText())) {
@@ -356,6 +470,8 @@ void VoiceoverDialog::begin() {
 
 void VoiceoverDialog::finish() {
     if (program_ && program_->isPlaying()) program_->togglePlay();
+    if (program_ && wasLooping_) program_->setLoop(*wasLooping_);
+    wasLooping_.reset();
     record_->setText(tr("Record"));
     status_->setText(tr("Saved %1").arg(QFileInfo(recorder_->lastTake()).fileName()));
     meter_->setValue(0);

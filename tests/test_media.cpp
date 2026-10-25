@@ -231,6 +231,7 @@
 #include "render/LutExport.h"
 #include "render/FrameRepair.h"
 #include "render/Intelligibility.h"
+#include "media/TakeChoice.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -10907,6 +10908,150 @@ private slots:
         QVERIFY2(!r.value("isError").toBool(), qPrintable(QJsonDocument(r).toJson()));
         QVERIFY(loadProject(project.toStdString(), back));
         QVERIFY(back.active()->audioTracks[0].effects.empty());
+    }
+
+    void takesOnLanes() {
+        // A loop recording: 1 s of pre-roll, then three passes of a 6 s line (each its own noise), and half a second more
+        // (too short to keep).
+        const int rate = 48000, pass = 6 * rate;
+        std::mt19937 rng(11);
+        std::uniform_real_distribution<float> noise(-0.4f, 0.4f);
+        std::vector<float> rec(size_t(rate + 3 * pass + rate / 2));
+        for (float& v : rec) v = noise(rng);
+        const std::string recording = path("loop-recording.wav");
+        QVERIFY(writeMonoWav(recording, rec, rate));
+        Project p = makeDefaultProject();
+        const QString project = QString::fromStdString(path("takes.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_takes"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        // Recorded from the file: three lanes at In (1 s), the last half second left out, the last pass the comp.
+        QJsonObject r = call({{"project", project}, {"action", "record"}, {"file", QString::fromStdString(recording)}, {"in", 1}, {"out", 7}, {"preroll", 1}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QJsonObject sc = r.value("structuredContent").toObject();
+        QCOMPARE(sc.value("lanes").toArray().size(), qsizetype(3));
+        QCOMPARE(sc.value("comp").toArray().size(), qsizetype(1));
+        Project q;
+        QVERIFY(loadProject(project.toStdString(), q));
+        const std::vector<TakeLane> lanes = q.active()->audioTracks[0].lanes;
+        QCOMPARE(lanes.size(), size_t(3));
+        // Each lane starts at In, its first sample the pass's first: sample-exact against the recording.
+        std::string err;
+        const AudioBufferPtr whole = decodeAudio(recording, rate, &err);
+        QVERIFY2(whole, err.c_str());
+        std::vector<AudioBufferPtr> takes;
+        for (size_t k = 0; k < 3; ++k) {
+            QCOMPARE(lanes[k].start, FrameTime(30));
+            const MediaItem* m = q.findMedia(lanes[k].mediaId);
+            QVERIFY(m && std::fabs(m->duration - 6.0) < 1e-6);
+            takes.push_back(decodeAudio(m->path, rate, &err));
+            QVERIFY2(takes.back() && takes.back()->frames() == pass, err.c_str());
+            const size_t from = size_t(rate + int(k) * pass) * 2;
+            QVERIFY(std::equal(takes[k]->samples.begin(), takes[k]->samples.end(), whole->samples.begin() + std::ptrdiff_t(from)));
+        }
+        // The comp: take 1 for the first 2 s of the line, take 3 (already there) for the next 2, take 2 for the last 2.
+        r = call({{"project", project}, {"action", "comp"}, {"lane", "Take 1"}, {"from", 1}, {"to", 3}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call({{"project", project}, {"action", "comp"}, {"lane", "Take 2"}, {"from", 5}, {"to", 7}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(call({{"project", project}, {"action", "comp"}, {"lane", "Take 2"}, {"from", 0}, {"to", 2}}).value("isError").toBool());
+        // Rendered: exactly those takes' samples away from the joins, an equal-power crossfade (10 ms) at each.
+        auto render = [&](const Project& pr) {
+            AudioMixer mixer;
+            std::vector<float> out(size_t(8 * rate) * 2);
+            for (int at = 0; at < 8 * rate; at += 4800) mixer.mix(pr, *pr.active(), at, 4800, out.data() + size_t(at) * 2);
+            return out;
+        };
+        auto check = [&](const std::vector<float>& out, std::vector<std::pair<double, int>> parts) {  // (until s, take)
+            // The mix's level for the clip's sound (the pan law), from its loudest sample in the first part.
+            size_t loud = size_t(rate) * 2;
+            for (size_t i = size_t(rate) * 2; i < size_t(2 * rate) * 2; i += 2)
+                if (std::fabs(takes[size_t(parts[0].second)]->samples[i - size_t(rate) * 2]) > std::fabs(takes[size_t(parts[0].second)]->samples[loud - size_t(rate) * 2])) loud = i;
+            const double g = out[loud] / takes[size_t(parts[0].second)]->samples[loud - size_t(rate) * 2];
+            double worst = 0, joinErr = 0;
+            double from = 1;
+            for (size_t k = 0; k < parts.size(); ++k) {
+                const auto [to, take] = parts[k];
+                const int64_t a = std::llround((from + 0.006) * rate), b = std::llround((to - 0.006) * rate);
+                for (int64_t i = a; i < b; ++i)
+                    for (int ch = 0; ch < 2; ++ch)
+                        worst = std::max(worst, std::fabs(double(out[size_t(i * 2 + ch)]) - g * takes[size_t(take)]->samples[size_t((i - rate) * 2 + ch)]));
+                if (k + 1 < parts.size()) {  // the join's middle: both at cos 45 degrees
+                    const int64_t mid = std::llround(to * rate);
+                    const double want = g * std::sqrt(0.5) * (takes[size_t(take)]->samples[size_t((mid - rate) * 2)] +
+                                                              takes[size_t(parts[k + 1].second)]->samples[size_t((mid - rate) * 2)]);
+                    joinErr = std::max(joinErr, std::fabs(out[size_t(mid * 2)] - want));
+                }
+                from = to;
+            }
+            return std::make_tuple(g, worst, joinErr);
+        };
+        QVERIFY(loadProject(project.toStdString(), q));
+        auto [g, worst, joinErr] = check(render(q), {{3.0, 0}, {5.0, 2}, {7.0, 1}});
+        QVERIFY2(g > 0.5 && worst < 1e-5 && joinErr < 2e-3, qPrintable(QString("gain %1, worst %2, join %3").arg(g).arg(worst).arg(joinErr)));
+        // The join at 3 s moved half a second later: take 1 now plays to 3.5 s.
+        r = call({{"project", project}, {"action", "join"}, {"at", 3}, {"move", 0.5}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(loadProject(project.toStdString(), q));
+        std::tie(g, worst, joinErr) = check(render(q), {{3.5, 0}, {5.0, 2}, {7.0, 1}});
+        QVERIFY2(worst < 1e-5 && joinErr < 2e-3, qPrintable(QString("moved: worst %1, join %2").arg(worst).arg(joinErr)));
+        // AAF writes the comp as plain clips with crossfades.
+        {
+            const std::string aaf = path("takes.aaf");
+            AafExportResult ar;
+            QVERIFY2(exportAaf(q, *q.active(), aaf, &ar, {}, nullptr, &err), err.c_str());
+            QVERIFY(ar.audioTracks >= 1);  // (a stereo track is two)
+            QCOMPARE(ar.clips, 3 * ar.audioTracks);
+            QCOMPARE(ar.transitions, 2 * ar.audioTracks);
+        }
+        // A track version: a copy, comped from take 2 alone; switched back, the comp of three is as it was.
+        const std::vector<Clip> threePart = q.active()->audioTracks[0].clips;
+        r = call({{"project", project}, {"action", "version"}, {"version", "new"}, {"name", "Take 2 only"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(!call({{"project", project}, {"action", "comp"}, {"lane", "Take 2"}, {"from", 1}, {"to", 7}}).value("isError").toBool());
+        QVERIFY(loadProject(project.toStdString(), q));
+        QCOMPARE(q.active()->audioTracks[0].clips.size(), size_t(1));
+        r = call({{"project", project}, {"action", "version"}, {"version", "switch"}, {"index", 1}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(loadProject(project.toStdString(), q));
+        QCOMPARE(q.active()->audioTracks[0].clips, threePart);
+        sc = r.value("structuredContent").toObject();
+        QCOMPARE(sc.value("versions").toArray().size(), qsizetype(2));
+        QVERIFY(sc.value("versions").toArray().at(0).toObject().value("shown").toBool());
+        // Rated and renamed.
+        QVERIFY(!call({{"project", project}, {"action", "rate"}, {"lane", "Take 3"}, {"rating", 5}}).value("isError").toBool());
+        r = call({{"project", project}, {"action", "rename"}, {"lane", "Take 3"}, {"name", "Keeper"}});
+        QVERIFY(text(r).contains("Lane Keeper") && text(r).contains("rated 5"));
+        // The best take for a line: the one whose transcript says it, though another is rated higher.
+        {
+            QVERIFY(loadProject(project.toStdString(), q));
+            Sequence& qs = *q.active();
+            const char* said[3] = {"ask not what your country can", "ask not what your country can do for you", "ask what your country can do"};
+            for (size_t k = 0; k < 3; ++k) {
+                auto t = std::make_shared<Transcript>();
+                TranscriptSegment seg;
+                seg.start = 0.5, seg.end = 5.5;
+                double at = 0.5;
+                for (const QString& w : QString(said[k]).split(' ')) {
+                    seg.words.push_back({at, at + 0.4, w.toStdString()});
+                    at += 0.5;
+                }
+                t->segments.push_back(seg);
+                q.findMedia(qs.audioTracks[0].lanes[k].mediaId)->transcript = t;
+            }
+            const TakeChoice choice = chooseTake(q, qs, {TrackKind::Audio, 0}, 30, 210, "Ask not what your country can do for you.");
+            QCOMPARE(choice.takes.size(), size_t(3));
+            QVERIFY2(choice.best == 1, qPrintable(QString::fromStdString(choice.why)));
+            QVERIFY(choice.takes[1].rmsDb > -20 && choice.takes[1].clippedSeconds == 0);
+        }
     }
 
     void dynamicsHeldToTheMix() {

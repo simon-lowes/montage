@@ -26,6 +26,7 @@
 #include "core/GradeVersions.h"
 #include "core/GradeGraph.h"
 #include "core/AudioChannels.h"
+#include "core/TakeLanes.h"
 #include "core/TranscriptCorrect.h"
 #include "core/SpellCheck.h"
 #include "core/ColorGroups.h"
@@ -58,6 +59,7 @@
 #include "media/Recover.h"
 #include "media/Proxy.h"
 #include "media/SpeechSearch.h"
+#include "media/TakeChoice.h"
 #include "media/TextReader.h"
 #include "media/ImageSequence.h"
 #include "media/Interpret.h"
@@ -3298,6 +3300,140 @@ void McpServer::Impl::addTools() {
                 text += QStringLiteral("%1Grain Match put on %2 clip(s).").arg(text.isEmpty() ? QString() : QStringLiteral("\n")).arg(put);
             }
             return ok(text);
+        });
+
+    add("montage_takes", "Take lanes, comps and track versions on an audio track",
+        "Takes on lanes (Pro Tools' loop record, playlists and comping): an audio track keeps takes as lanes under it and "
+        "plays a comp of them, its own clips cut from the lanes with short equal-power crossfades at the joins. list gives "
+        "the lanes (and the track's audition takes), the comp's clips with the lane each comes from, and the versions. "
+        "record takes a loop recording from a file (from preroll seconds on, a pass for each In to Out) as lanes at In, the "
+        "last whole pass the comp. comp gives from..to of a lane to the comp; join moves the join at `at` by `move` "
+        "seconds, or sets its crossfade (`crossfade` seconds, 0 none); rate (0-5), rename and show (lanes shown or folded) "
+        "act on a lane; version makes a new version (a copy, or empty with empty true), switches to one (index, 1 = first), "
+        "renames or deletes one; suggest names the take that best says `line` (from transcripts) without clipping.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"string","default":"A1"},
+            "action":{"type":"string","enum":["list","record","comp","join","rate","rename","show","version","suggest"]},
+            "file":{"type":"string","description":"record: the loop recording"},
+            "in":{"type":["number","string"],"description":"record: where the loop starts (default the sequence In)"},
+            "out":{"type":["number","string"],"description":"record: where it ends, exclusive (default after the sequence Out)"},
+            "preroll":{"type":"number","default":0,"description":"record: seconds recorded before the first pass"},
+            "lane":{"type":["number","string"],"description":"A lane's id or name"},
+            "from":{"type":["number","string"]},"to":{"type":["number","string"]},
+            "at":{"type":["number","string"],"description":"join: the join's time"},"move":{"type":"number","description":"join: seconds"},
+            "crossfade":{"type":"number","description":"Seconds (comp, join; default 0.01)"},
+            "rating":{"type":"integer"},"name":{"type":"string"},"shown":{"type":"boolean"},
+            "version":{"type":"string","enum":["new","switch","rename","delete"]},"index":{"type":"integer"},"empty":{"type":"boolean"},
+            "line":{"type":"string","description":"suggest: the words the take should say"}},"required":["project","action"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const TrackRef track = trackArg(str(a, "track", "A1"), s, false);
+            if (track.kind != TrackKind::Audio) return fail(QStringLiteral("Take lanes are on audio tracks"));
+            const QString action = need(a, "action");
+            const double fps = s.fpsValue();
+            auto laneArg = [&]() -> Id {
+                const Track& t = *trackAt(s, track);
+                const QJsonValue v = a.value("lane");
+                for (const TakeLane& ln : t.lanes)
+                    if ((v.isDouble() && ln.id == Id(v.toDouble())) || (v.isString() && QString::fromStdString(ln.name).compare(v.toString(), Qt::CaseInsensitive) == 0))
+                        return ln.id;
+                throw ArgError{QStringLiteral("No such lane on that track (see action list)")};
+            };
+            auto listing = [&]() {
+                const Track& t = *trackAt(s, track);
+                QJsonArray lanes, comp, versions;
+                QString text;
+                for (const LaneView& v : laneViews(l.project, s, track)) {
+                    QJsonObject o{{"name", QString::fromStdString(v.name)}, {"start", secs(v.start, s)}, {"end", secs(v.end, s)}, {"rating", v.rating}};
+                    if (v.lane) o["lane"] = double(v.lane);
+                    else o["clip"] = double(v.clip), o["take"] = v.take + 1;
+                    lanes.append(o);
+                    text += QStringLiteral("%1%2 (%3 to %4)%5\n").arg(v.lane ? QStringLiteral("Lane ") : QStringLiteral("Audition take: "),
+                                                                    QString::fromStdString(v.name), tc(v.start, s), tc(v.end, s),
+                                                                    v.rating ? QStringLiteral(", rated %1").arg(v.rating) : QString());
+                }
+                for (const Clip& c : t.clips) {
+                    const Id from = compLaneOf(t, c);
+                    QJsonObject o{{"clip", double(c.id)}, {"start", secs(c.start, s)}, {"end", secs(c.end(), s)}};
+                    if (from) o["lane"] = double(from), o["lane_name"] = QString::fromStdString(edit::findTakeLane(t, from)->name);
+                    comp.append(o);
+                }
+                for (size_t k = 0; k < t.versions.size(); ++k)
+                    versions.append(QJsonObject{{"index", int(k) + 1}, {"name", QString::fromStdString(t.versions[k].name)}, {"shown", int(k) == t.version}});
+                text += QStringLiteral("%1 comp clip(s); %2 version(s)").arg(comp.size()).arg(std::max<qsizetype>(1, versions.size()));
+                return ok(text, {{"lanes", lanes}, {"comp", comp}, {"versions", versions}, {"lanes_shown", t.lanesShown}});
+            };
+            if (action == "list") return listing();
+            if (action == "suggest") {
+                // Over from..to, else In to Out, else the first take lane's span.
+                FrameTime from = s.inPoint >= 0 && s.outPoint > s.inPoint ? s.inPoint : -1, to = from >= 0 ? s.outPoint + 1 : -1;
+                if (from < 0)
+                    for (const LaneView& v : laneViews(l.project, s, track))
+                        if (v.lane) {
+                            from = v.start, to = v.end;
+                            break;
+                        }
+                if (a.contains("from")) from = timeArg(a.value("from"), s, "from");
+                if (a.contains("to")) to = timeArg(a.value("to"), s, "to");
+                if (from < 0 || to <= from) return fail(QStringLiteral("suggest needs from and to"));
+                const TakeChoice choice = chooseTake(l.project, s, track, from, to, a.value("line").toString().toStdString());
+                if (choice.best < 0) return fail(QStringLiteral("No takes cover that range"));
+                const TakeCandidate& b = choice.takes[size_t(choice.best)];
+                QJsonArray all;
+                for (const TakeCandidate& t : choice.takes)
+                    all.append(QJsonObject{{"name", QString::fromStdString(t.name)}, {"said", QString::fromStdString(t.said)},
+                                           {"word_errors", t.transcribed ? lineWordErrors(t.said, a.value("line").toString().toStdString()) : -1},
+                                           {"rms_db", t.rmsDb}, {"peak_db", t.peakDb}, {"clipped_seconds", t.clippedSeconds}});
+                QJsonObject sc{{"name", QString::fromStdString(b.name)}, {"takes", all}};
+                if (b.lane) sc["lane"] = double(b.lane);
+                else sc["clip"] = double(b.clip), sc["take"] = b.take + 1;
+                return ok(QString::fromStdString(choice.why), sc);
+            }
+            edit::Result r;
+            if (action == "record") {
+                const QString file = absolute(need(a, "file"));
+                const FrameTime in = a.contains("in") ? timeArg(a.value("in"), s, "in") : s.inPoint;
+                const FrameTime out = a.contains("out") ? timeArg(a.value("out"), s, "out") : s.outPoint >= 0 ? s.outPoint + 1 : -1;
+                if (in < 0 || out <= in) return fail(QStringLiteral("record needs in and out (or the sequence's In and Out)"));
+                std::vector<bool> complete;
+                std::string err;
+                const std::vector<std::string> passes = splitLoopRecording(
+                    file.toStdString(), a.value("preroll").toDouble(0), double(out - in) / fps, s.sampleRate > 0 ? s.sampleRate : 48000,
+                    (QFileInfo(l.path).absolutePath() + QStringLiteral("/Takes")).toStdString(), QFileInfo(file).completeBaseName().toStdString() + " pass ",
+                    &complete, &err);
+                if (passes.empty()) return fail(QString::fromStdString(err));
+                std::vector<Id> media;
+                for (const std::string& f : passes) media.push_back(mediaFor(l.project, QString::fromStdString(f)));
+                r = edit::addLoopTakes(l.project, s, track, media, complete, in, out);
+            } else if (action == "comp") {
+                r = edit::compTake(l.project, s, track, laneArg(), timeArg(a.value("from"), s, "from"), timeArg(a.value("to"), s, "to"),
+                                   a.value("crossfade").toDouble(kCompCrossfadeSeconds));
+            } else if (action == "join") {
+                const FrameTime at = timeArg(a.value("at"), s, "at");
+                if (a.contains("move")) r = edit::moveCompJoin(l.project, s, track, at, FrameTime(std::llround(a.value("move").toDouble() * fps)));
+                else if (a.contains("crossfade")) r = edit::setCompCrossfade(l.project, s, track, at, a.value("crossfade").toDouble());
+                else return fail(QStringLiteral("join needs move or crossfade"));
+            } else if (action == "rate") {
+                if (!a.value("rating").isDouble()) return fail(QStringLiteral("rate needs rating (0 to 5)"));
+                r = edit::rateTakeLane(s, track, laneArg(), a.value("rating").toInt());
+            } else if (action == "rename") {
+                r = edit::renameTakeLane(s, track, laneArg(), need(a, "name").toStdString());
+            } else if (action == "show") {
+                r = edit::showLanes(s, track, a.value("shown").toBool(true));
+            } else if (action == "version") {
+                const QString v = need(a, "version");
+                const int index = a.value("index").toInt(0) - 1;
+                if (v == "new") r = edit::newTrackVersion(l.project, s, track, str(a, "name").toStdString(), !a.value("empty").toBool(false));
+                else if (v == "switch") r = edit::switchTrackVersion(s, track, index);
+                else if (v == "rename") r = edit::renameTrackVersion(s, track, index, need(a, "name").toStdString());
+                else if (v == "delete") r = edit::deleteTrackVersion(s, track, index);
+                else return fail(QStringLiteral("version is new, switch, rename or delete"));
+            } else {
+                return fail(QStringLiteral("Unknown action %1").arg(action));
+            }
+            check(r);
+            save(l);
+            return listing();
         });
 
     add("montage_audition", "Audition takes on a clip",

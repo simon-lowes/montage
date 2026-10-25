@@ -3466,6 +3466,11 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             FrameTime a, b;
             if (!edit::transitionRange(track, tr, a, b)) continue;
             int64_t as = int64_t(std::llround(a * sr / fps)), bs = int64_t(std::llround(b * sr / fps));
+            // A comp's join (core/TakeLanes.h): a crossfade of so many seconds, centred on the edit point, to the sample.
+            if (const double secs = tr.params.p("seconds", 0, 0); secs > 0 && tr.clipA && tr.clipB) {
+                as = int64_t(std::llround(double(a + tr.duration / 2) * sr / fps - secs * sr / 2));
+                bs = as + std::max<int64_t>(1, int64_t(std::llround(secs * sr)));
+            }
             if (tr.clipB == c.id) {
                 ps = std::min(ps, as);
                 fiS = as;

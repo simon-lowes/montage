@@ -48,6 +48,7 @@ add_library(montage_engine STATIC
   core/TimelineCompare.h core/TimelineCompare.cpp
   core/Reconform.h core/Reconform.cpp
   core/Adr.h core/Adr.cpp
+  core/TakeLanes.h core/TakeLanes.cpp
   core/Provenance.h core/Provenance.cpp
   core/LensProfile.h core/LensProfile.cpp
   core/AudioDescription.h core/AudioDescription.cpp
@@ -115,6 +116,7 @@ add_library(montage_engine STATIC
   render/ColorChart.h render/ColorChart.cpp
   media/Loudness.h media/Loudness.cpp
   media/StereoAnalysis.h media/StereoAnalysis.cpp
+  media/TakeChoice.h media/TakeChoice.cpp
   media/AudioSync.h media/AudioSync.cpp
   media/FieldRecorder.h media/FieldRecorder.cpp
   media/ImageSequence.h media/ImageSequence.cpp

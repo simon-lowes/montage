@@ -455,13 +455,9 @@ Clip clipFromJson(const QJsonObject& o) {
     return c;
 }
 
-QJsonObject trackToJson(const Track& t) {
-    QJsonObject o{{"id", double(t.id)}, {"name", qs(t.name)}};
-    QJsonArray clips;
-    for (const auto& c : t.clips) clips.append(clipToJson(c));
-    o["clips"] = clips;
+QJsonArray transitionsToJson(const std::vector<Transition>& list) {
     QJsonArray trs;
-    for (const auto& tr : t.transitions) {
+    for (const auto& tr : list) {
         trs.append(QJsonObject{{"id", double(tr.id)},
                                {"type", qs(tr.type)},
                                {"a", double(tr.clipA)},
@@ -469,7 +465,31 @@ QJsonObject trackToJson(const Track& t) {
                                {"duration", double(tr.duration)},
                                {"params", effectToJson(tr.params)}});
     }
-    if (!trs.isEmpty()) o["transitions"] = trs;
+    return trs;
+}
+
+std::vector<Transition> transitionsFromJson(const QJsonValue& v) {
+    std::vector<Transition> out;
+    for (const auto& item : v.toArray()) {
+        QJsonObject to = item.toObject();
+        Transition tr;
+        tr.id = Id(i64(to.value("id")));
+        tr.type = ss(to.value("type"));
+        tr.clipA = Id(i64(to.value("a")));
+        tr.clipB = Id(i64(to.value("b")));
+        tr.duration = std::max<qint64>(1, i64(to.value("duration"), 15));
+        tr.params = effectFromJson(to.value("params"));
+        out.push_back(tr);
+    }
+    return out;
+}
+
+QJsonObject trackToJson(const Track& t) {
+    QJsonObject o{{"id", double(t.id)}, {"name", qs(t.name)}};
+    QJsonArray clips;
+    for (const auto& c : t.clips) clips.append(clipToJson(c));
+    o["clips"] = clips;
+    if (const QJsonArray trs = transitionsToJson(t.transitions); !trs.isEmpty()) o["transitions"] = trs;
     if (t.muted) o["muted"] = true;
     if (t.solo) o["solo"] = true;
     if (t.locked) o["locked"] = true;
@@ -503,6 +523,29 @@ QJsonObject trackToJson(const Track& t) {
         o["sends"] = sends;
     }
     if (!t.folder.empty()) o["folder"] = qs(t.folder);
+    if (!t.lanes.empty()) {
+        QJsonArray lanes;
+        for (const TakeLane& l : t.lanes) {
+            QJsonObject lo{{"id", double(l.id)}, {"name", qs(l.name)}, {"media", double(l.mediaId)}, {"start", double(l.start)}};
+            if (l.rating) lo["rating"] = l.rating;
+            lanes.append(lo);
+        }
+        o["lanes"] = lanes;
+    }
+    if (!t.lanesShown) o["lanesShown"] = false;
+    if (!t.versions.empty()) {
+        QJsonArray versions;
+        for (const TrackVersion& v : t.versions) {
+            QJsonObject vo{{"name", qs(v.name)}};
+            QJsonArray clips;
+            for (const auto& c : v.clips) clips.append(clipToJson(c));
+            if (!clips.isEmpty()) vo["clips"] = clips;
+            if (const QJsonArray trs = transitionsToJson(v.transitions); !trs.isEmpty()) vo["transitions"] = trs;
+            versions.append(vo);
+        }
+        o["versions"] = versions;
+        o["version"] = t.version;
+    }
     return o;
 }
 
@@ -512,17 +555,7 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
     t.id = Id(i64(o.value("id")));
     t.name = ss(o.value("name"));
     for (const auto& c : o.value("clips").toArray()) t.clips.push_back(clipFromJson(c.toObject()));
-    for (const auto& v : o.value("transitions").toArray()) {
-        QJsonObject to = v.toObject();
-        Transition tr;
-        tr.id = Id(i64(to.value("id")));
-        tr.type = ss(to.value("type"));
-        tr.clipA = Id(i64(to.value("a")));
-        tr.clipB = Id(i64(to.value("b")));
-        tr.duration = std::max<qint64>(1, i64(to.value("duration"), 15));
-        tr.params = effectFromJson(to.value("params"));
-        t.transitions.push_back(tr);
-    }
+    t.transitions = transitionsFromJson(o.value("transitions"));
     t.muted = o.value("muted").toBool(false);
     t.solo = o.value("solo").toBool(false);
     t.locked = o.value("locked").toBool(false);
@@ -551,6 +584,27 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
         if (sd.bus) t.sends.push_back(std::move(sd));
     }
     t.folder = ss(o.value("folder"));
+    for (const auto& v : o.value("lanes").toArray()) {
+        const QJsonObject lo = v.toObject();
+        TakeLane l;
+        l.id = Id(i64(lo.value("id")));
+        l.name = ss(lo.value("name"));
+        l.mediaId = Id(i64(lo.value("media")));
+        l.start = i64(lo.value("start"));
+        l.rating = std::clamp(lo.value("rating").toInt(0), 0, 5);
+        if (l.mediaId) t.lanes.push_back(std::move(l));
+    }
+    t.lanesShown = o.value("lanesShown").toBool(true);
+    for (const auto& v : o.value("versions").toArray()) {
+        const QJsonObject vo = v.toObject();
+        TrackVersion tv;
+        tv.name = ss(vo.value("name"));
+        for (const auto& c : vo.value("clips").toArray()) tv.clips.push_back(clipFromJson(c.toObject()));
+        std::sort(tv.clips.begin(), tv.clips.end(), [](const Clip& a, const Clip& b) { return a.start < b.start; });
+        tv.transitions = transitionsFromJson(vo.value("transitions"));
+        t.versions.push_back(std::move(tv));
+    }
+    t.version = t.versions.empty() ? 0 : std::clamp(o.value("version").toInt(0), 0, int(t.versions.size()) - 1);
     std::sort(t.clips.begin(), t.clips.end(), [](const Clip& a, const Clip& b) { return a.start < b.start; });
     return t;
 }
@@ -1268,6 +1322,14 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
                     bump(tr.params.id);
                 }
                 for (const auto& e : t.effects) bump(e.id);
+                for (const auto& l : t.lanes) bump(l.id);
+                for (const auto& v : t.versions) {
+                    for (const auto& c : v.clips) {
+                        bump(c.id);
+                        for (const auto& e : c.effects) bump(e.id);
+                    }
+                    for (const auto& tr : v.transitions) bump(tr.id);
+                }
             }
         for (const auto& b : s.buses) {
             bump(b.id);

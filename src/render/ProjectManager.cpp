@@ -83,12 +83,20 @@ std::vector<Id> usedMedia(const Project& p, const std::vector<Id>& sequences) {
     std::set<Id> used;
     for (Id sid : keptSequences(p, sequences)) {
         const Sequence* s = p.findSequence(sid);
-        for (TrackRef r : allTracks(*s))
-            for (const Clip& c : trackAt(*s, r)->clips) {
-                if (c.mediaId && p.findMedia(c.mediaId)) used.insert(c.mediaId);
-                for (const Take& t : c.takes)  // an audition's other takes
-                    if (p.findMedia(t.mediaId)) used.insert(t.mediaId);
-            }
+        for (TrackRef r : allTracks(*s)) {
+            const Track* tr = trackAt(*s, r);
+            auto useClips = [&](const std::vector<Clip>& clips) {
+                for (const Clip& c : clips) {
+                    if (c.mediaId && p.findMedia(c.mediaId)) used.insert(c.mediaId);
+                    for (const Take& t : c.takes)  // an audition's other takes
+                        if (p.findMedia(t.mediaId)) used.insert(t.mediaId);
+                }
+            };
+            useClips(tr->clips);
+            for (const TrackVersion& v : tr->versions) useClips(v.clips);  // its other versions
+            for (const TakeLane& l : tr->lanes)                             // and take lanes
+                if (p.findMedia(l.mediaId)) used.insert(l.mediaId);
+        }
         for (Id m : fieldMedia(p, *s)) used.insert(m);
     }
     return {used.begin(), used.end()};
@@ -168,6 +176,14 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
             for (TrackRef r : allTracks(s))
                 for (const Clip& c : trackAt(s, r)->clips)
                     for (size_t k = 0; k < c.takes.size(); ++k) aTake |= int(k) != c.take && c.takes[k].mediaId == m.id;
+        // So is media a track's other versions or take lanes use (core/TakeLanes.h).
+        for (const Sequence& s : q.sequences)
+            for (TrackRef r : allTracks(s)) {
+                const Track& t = *trackAt(s, r);
+                for (const TrackVersion& v : t.versions)
+                    for (const Clip& c : v.clips) aTake |= c.mediaId == m.id;
+                for (const TakeLane& l : t.lanes) aTake |= l.mediaId == m.id;
+            }
         // So is a graphic's picture: it plays over the span of the template's clip, not one of its own.
         for (const Sequence& s : q.sequences) aTake |= fieldMedia(q, s).count(m.id) > 0;
         // Stereo footage is copied whole too: rendered, it would keep one eye.
