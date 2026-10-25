@@ -135,6 +135,7 @@
 #include "render/LutToGrade.h"
 #include "render/ProjectManager.h"
 #include "render/QualityCheck.h"
+#include "render/SdhDraft.h"
 #include "render/FrameRepair.h"
 #include "render/Intelligibility.h"
 #include "render/ConformCheck.h"
@@ -3718,7 +3719,8 @@ void McpServer::Impl::addTools() {
         "captions (each track's language) and titles (`title_language`, default en-US), the project's vocabulary allowed, "
         "linked clips out of sync with their picture (`sync`), dialogue hard to follow under the music and effects "
         "(`intelligibility`, as montage_intelligibility measures it), left and right out of phase or one inverted, so a mono "
-        "fold-down loses them (`phase`), and DC offset (`dc_offset_db`). Lists each problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones).",
+        "fold-down loses them (`phase`), DC offset (`dc_offset_db`), and for SDH captions, loud sound outside speech that no caption describes "
+        "(`uncaptioned_seconds`). Lists each problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"flashing":{"type":"boolean","default":true},"levels":{"type":"boolean","default":true},
             "black_seconds":{"type":"number","default":1,"description":"0 = not checked"},
@@ -3736,6 +3738,7 @@ void McpServer::Impl::addTools() {
             "phase":{"type":"boolean","default":true,"description":"Left and right out of phase (correlation under -0.5) or one the other inverted"},
             "phase_seconds":{"type":"number","default":1,"description":"How long it must last"},
             "dc_offset_db":{"type":"number","default":-40,"description":"A channel's mean over a second above this, dBFS; 0 = not checked"},
+            "uncaptioned_seconds":{"type":"number","default":0,"description":"Sound louder than -40 dBFS outside speech with no caption over it for this long (SDH); 0 = not checked"},
             "markers":{"type":"boolean","default":false}},"required":["project"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -3761,6 +3764,7 @@ void McpServer::Impl::addTools() {
             q.phase = a.value("phase").toBool(true);
             q.phaseSeconds = std::max(0.05, a.value("phase_seconds").toDouble(1));
             q.dcOffsetDb = std::min(0.0, a.value("dc_offset_db").toDouble(-40));
+            q.uncaptionedSeconds = std::max(0.0, a.value("uncaptioned_seconds").toDouble(0));
             const std::vector<QcIssue> issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(f, "Checking"); });
             QString text;
             for (const QcIssue& i : issues)
@@ -6218,6 +6222,11 @@ void McpServer::Impl::addTools() {
         "picture subtitles, and IMSC Image documents, are read by OCR, the words it is unsure of listed in `review`), "
         "or the captions inside a video clip's file (`import_embedded`: CTA-708 service 1, else CEA-608 channel 1, else "
         "its PGS, DVB or DVD subtitles by OCR; `stream` picks a subtitle stream). "
+        "Or draft captions for the deaf and hard of hearing as a new track (`sdh`): the dialogue from the transcripts, "
+        "sounds outside speech described in brackets (scored by the sound model against the project's sound descriptions, "
+        "`sound_captions` replacing them), sung lines between ♪, the speaker named at a change where the frame shows no "
+        "face or several, and captions moved to the top off text in the picture; `style` brackets ([Door slams]), "
+        "capitals ([DOOR SLAMS], SPEAKER:) or colours (DOOR SLAMS, a colour per speaker). "
         "`track` is a caption track index (default: the visible one).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"export":{"type":"string","description":"A file to write"},
             "format":{"type":"string","enum":["pgs","dvb","vobsub","imsc_image"],"description":"Export as subtitle pictures"},
@@ -6225,10 +6234,61 @@ void McpServer::Impl::addTools() {
             "import":{"type":"string","description":"A file to read as a new track"},"track":{"type":"integer"},
             "import_embedded":{"type":"number","description":"A video clip (id): the captions inside its file as a new track, where the clip plays them"},
             "stream":{"type":"integer","description":"The file's subtitle stream to read (its index in the file)"},
-            "language":{"type":"string","description":"ISO 639-1 code for an imported track"}},"required":["project"]})json",
-        false, [](const QJsonObject& a) {
+            "language":{"type":"string","description":"ISO 639-1 code for an imported track"},
+            "sdh":{"type":"object","description":"Draft SDH captions as a new track","properties":{
+                "style":{"type":"string","enum":["brackets","capitals","colours"],"default":"brackets"},
+                "threshold":{"type":"number","default":0.3,"description":"How alike (0..1) a sound and its description must be"},
+                "sounds":{"type":"boolean","default":true},"lyrics":{"type":"boolean","default":true},
+                "speakers":{"type":"boolean","default":true},"read_text":{"type":"boolean","default":true},
+                "sound_captions":{"type":"array","items":{"type":"string"},"description":"The project's sound descriptions, saved with it: 'Door slams' or 'Door slams|a door slamming shut' (caption|what it sounds like); [] = the ready-made list"}}}},
+            "required":["project"]})json",
+        false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
+            if (a.contains("sdh")) {
+                const QJsonObject o = a.value("sdh").toObject();
+                if (o.contains("sound_captions")) {
+                    l.project.soundCaptions.clear();
+                    for (const auto& v : o.value("sound_captions").toArray())
+                        if (!v.toString().trimmed().isEmpty()) l.project.soundCaptions.push_back(v.toString().toStdString());
+                }
+                SdhDraftOptions d;
+                if (!parseSdhStyle(str(o, "style", "brackets").toStdString(), d.sdh.style)) return fail("style is brackets, capitals or colours");
+                d.threshold = std::clamp(o.value("threshold").toDouble(0.3), 0.0, 1.0);
+                d.sounds = o.value("sounds").toBool(true);
+                d.sdh.lyrics = o.value("lyrics").toBool(true);
+                d.sdh.speakerLabels = o.value("speakers").toBool(true);
+                d.faces = d.sdh.speakerLabels;
+                d.readText = o.value("read_text").toBool(true);
+                SdhDraft draft;
+                std::string err;
+                if (!draftSdhCaptions(l.project, s, d, draft, [this](double f) { progress(f, "Drafting SDH captions"); }, nullptr, &err))
+                    return fail(QString::fromStdString(err));
+                CaptionTrack t;
+                t.id = l.project.newId();
+                t.language = draft.language.empty() ? "en" : draft.language;
+                t.name = "SDH";
+                t.style = draft.look;
+                t.captions = draft.captions;
+                QJsonArray list, heard, notes;
+                for (const Caption& cap : t.captions)
+                    list.append(QJsonObject{{"start", tc(cap.start, s)}, {"end", tc(cap.end, s)}, {"text", QString::fromStdString(cap.text)},
+                                            {"place", QString::fromStdString(captionPlaceName(cap))}});
+                for (const SdhSound& h : draft.heard)
+                    heard.append(QJsonObject{{"start", h.start}, {"end", h.end}, {"sound", QString::fromStdString(h.label)}, {"score", double(h.score)}});
+                for (const std::string& n : draft.notes) notes.append(QString::fromStdString(n));
+                // The new track is the one shown (the first visible), so the other tracks are hidden.
+                int hidden = 0;
+                for (CaptionTrack& o : s.captionTracks)
+                    if (o.visible) o.visible = false, ++hidden;
+                s.captionTracks.push_back(std::move(t));
+                save(l);
+                const SdhSummary& sum = draft.summary;
+                return ok(QStringLiteral("Drafted %1 SDH captions: %2 sound cues, %3 sung, %4 with the speaker shown, %5 moved off text")
+                              .arg(list.size()).arg(sum.sounds).arg(sum.lyrics).arg(sum.speakers).arg(sum.raised),
+                          QJsonObject{{"track", int(s.captionTracks.size()) - 1}, {"hidden_tracks", hidden}, {"captions", list}, {"heard", heard}, {"notes", notes},
+                                      {"sounds", sum.sounds}, {"lyrics", sum.lyrics}, {"speakers", sum.speakers}, {"raised", sum.raised}});
+            }
             // Subtitles read off their pictures: the track and what to check.
             auto reviewed = [&](const ImageSubtitleImport& in, QJsonObject extra) {
                 QJsonArray review;

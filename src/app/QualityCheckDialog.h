@@ -47,6 +47,8 @@ private:
     QCheckBox* phase_;
     QCheckBox* dcOffset_;
     QCheckBox* spelling_ = nullptr;
+    QCheckBox* uncaptioned_ = nullptr;
+    QDoubleSpinBox* uncaptionedSeconds_ = nullptr;
     QCheckBox* sync_ = nullptr;
     QCheckBox* intelligibility_ = nullptr;
     QDoubleSpinBox* intelligibilitySeconds_ = nullptr;

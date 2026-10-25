@@ -68,6 +68,7 @@ const char* qcKindName(QcKind k) {
         case QcKind::Phase: return "Out of phase";
         case QcKind::Inverted: return "Channel inverted";
         case QcKind::DcOffset: return "DC offset";
+        case QcKind::Uncaptioned: return "Sound without a caption";
     }
     return "";
 }
@@ -158,7 +159,8 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
     const double fps = s.fpsValue();
     const FrameTime frames = out - in;
     const bool picture = q.flashing || q.levels || q.blackSeconds > 0 || q.freezeSeconds > 0;
-    const bool sound = q.silenceSeconds > 0 || q.clipping || q.loudnessTarget != 0 || q.intelligibility > 0 || q.phase || q.dcOffsetDb != 0;
+    const bool sound = q.silenceSeconds > 0 || q.clipping || q.loudnessTarget != 0 || q.intelligibility > 0 || q.phase || q.dcOffsetDb != 0 ||
+                       q.uncaptionedSeconds > 0;
     const double pictureShare = picture ? (sound ? 0.8 : 1.0) : 0.0;
 
     if (picture) {
@@ -265,7 +267,7 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
         AudioMixer mixer;
         LoudnessMeter meter(sr);
         const int win = std::max(1, sr / 20);  // 50 ms
-        std::vector<char> silentWin, clipWin;  // per 50 ms window
+        std::vector<char> silentWin, clipWin, loudWin;  // per 50 ms window
         std::vector<std::array<double, 5>> stereoWin;  // per 50 ms window: sums of left², right², left×right, left, right
         silentWin.reserve(size_t(total / win + 1));
         std::array<double, 5> winStereo{};
@@ -289,6 +291,7 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
                 if (std::fabs(l) >= 0.9999f || std::fabs(r) >= 0.9999f) ++clipped, winClip = true;
                 if (++winFill == win) {
                     silentWin.push_back(std::sqrt(winEnergy / (2.0 * win)) < 0.001);  // -60 dBFS
+                    loudWin.push_back(std::sqrt(winEnergy / (2.0 * win)) >= 0.01);    // -40 dBFS
                     clipWin.push_back(winClip);
                     stereoWin.push_back(winStereo);
                     winEnergy = 0, winFill = 0, winClip = false, winStereo = {};
@@ -298,6 +301,7 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
         }
         if (winFill > 0) {
             silentWin.push_back(std::sqrt(winEnergy / (2.0 * winFill)) < 0.001);
+            loudWin.push_back(std::sqrt(winEnergy / (2.0 * winFill)) >= 0.01);
             clipWin.push_back(winClip);
             stereoWin.push_back(winStereo);
         }
@@ -378,6 +382,28 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
                 for (size_t w = w0; w < w1; ++w) worst = std::max(worst, mean[w]);
                 issues.push_back({QcKind::DcOffset, a, b, fmt("DC offset: the sound's mean is %.1f dBFS (the limit is %.0f dBFS)", 20 * std::log10(worst), q.dcOffsetDb)});
             }
+        }
+        if (q.uncaptionedSeconds > 0) {
+            // Loud windows that are neither speech nor under a caption of the track shown.
+            const CaptionTrack* track = captionTrackFor(s);
+            SpeechGate gate = SpeechGate::Transcripts;
+            const auto speech = timelineSpeech(p, s, gate, {}, double(in) / fps, double(out) / fps);
+            std::vector<char> bare = loudWin;
+            const double step = double(win) / sr;
+            auto clear = [&](double a, double b) {
+                for (size_t w = size_t(std::max(0.0, std::floor((a - double(in) / fps) / step))); w < bare.size(); ++w) {
+                    if (double(in) / fps + double(w) * step >= b) break;
+                    bare[w] = 0;
+                }
+            };
+            for (const auto& [a, b] : speech) clear(a, b);
+            if (track)
+                for (const Caption& c : track->captions) clear(double(c.start) / fps, double(c.end) / fps);
+            for (const auto& [a, b] : fromWindows(bare, q.uncaptionedSeconds, 0.5))
+                issues.push_back({QcKind::Uncaptioned, a, b,
+                                  fmt(track ? "Sound without a caption for %.1f s: describe it for the deaf and hard of hearing"
+                                            : "Sound for %.1f s and no caption track to describe it",
+                                      double(b - a) / fps)});
         }
         if (q.loudnessTarget != 0) {
             LoudnessResult r = meter.result();

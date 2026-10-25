@@ -18,6 +18,7 @@ add_library(montage_engine STATIC
   core/Cea708.h core/Cea708.cpp
   core/Teletext.h core/Teletext.cpp
   core/CaptionTools.h core/CaptionTools.cpp
+  core/SdhCaptions.h core/SdhCaptions.cpp
   core/TranscriptEdit.h core/TranscriptEdit.cpp
   core/Slate.h core/Slate.cpp
   core/Chapters.h core/Chapters.cpp
@@ -213,6 +214,7 @@ add_library(montage_engine STATIC
   render/AudioReactive.h render/AudioReactive.cpp
   core/Expression.h render/Expressions.cpp
   render/QualityCheck.h render/QualityCheck.cpp
+  render/SdhDraft.h render/SdhDraft.cpp
   render/LutExport.h render/LutExport.cpp
   render/LutToGrade.h render/LutToGrade.cpp
   render/GrainMatch.h render/GrainMatch.cpp

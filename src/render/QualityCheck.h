@@ -9,7 +9,8 @@
 //  - spelling in captions (in each track's language) and titles (core/SpellCheck.h), the project's vocabulary allowed;
 //  - linked clips out of sync with their picture (core/EditOps.h syncOffsets);
 //  - dialogue the music and effects make hard to follow (render/Intelligibility.h);
-//  - stereo out of phase (a mono fold-down cancels it), a channel inverted, and DC offset (media/StereoAnalysis.h).
+//  - stereo out of phase (a mono fold-down cancels it), a channel inverted, and DC offset (media/StereoAnalysis.h);
+//  - for captions for the deaf and hard of hearing, loud sound outside speech that no caption describes.
 #pragma once
 
 #include <atomic>
@@ -48,9 +49,12 @@ struct QcSettings {
     bool phase = true;
     double phaseSeconds = 1;
     double dcOffsetDb = -40;        // a channel's mean over a second above this (dBFS); 0 = not checked
+    // Sound without a caption, for SDH: sound louder than -40 dBFS outside speech (the transcripts' words) with no
+    // caption of the shown track over it for this long; 0 = not checked.
+    double uncaptionedSeconds = 0;
 };
 
-enum class QcKind { Flashing, RedFlashing, Levels, Black, Freeze, Silence, Clipping, Loudness, TruePeak, Spelling, OutOfSync, Intelligibility, Phase, Inverted, DcOffset };
+enum class QcKind { Flashing, RedFlashing, Levels, Black, Freeze, Silence, Clipping, Loudness, TruePeak, Spelling, OutOfSync, Intelligibility, Phase, Inverted, DcOffset, Uncaptioned };
 
 struct QcIssue {
     QcKind kind = QcKind::Flashing;

@@ -630,13 +630,14 @@ QJsonObject captionTrackToJson(const CaptionTrack& t) {
     for (const Caption& c : t.captions) {
         QJsonArray item{double(c.start), double(c.end), qs(c.text)};
         const int keypad = captionKeypad(c);
-        if (!c.wordTimes.empty() || keypad != 2 || c.italic) {
+        if (!c.wordTimes.empty() || keypad != 2 || c.italic || !c.colour.empty()) {
             QJsonArray w;
             for (double f : c.wordTimes) w.append(std::round(f * 10000) / 10000);
             item.append(w);
         }
-        if (keypad != 2 || c.italic) item.append(keypad);  // out of its usual place: where, as a keypad digit
-        if (c.italic) item.append(1);
+        if (keypad != 2 || c.italic || !c.colour.empty()) item.append(keypad);  // out of its usual place: where, as a keypad digit
+        if (c.italic || !c.colour.empty()) item.append(c.italic ? 1 : 0);
+        if (!c.colour.empty()) item.append(qs(c.colour));
         items.append(item);
     }
     return QJsonObject{{"id", double(t.id)},        {"name", qs(t.name)}, {"language", qs(t.language)},
@@ -676,6 +677,7 @@ CaptionTrack captionTrackFromJson(const QJsonObject& o) {
         for (const auto& w : a.at(3).toArray()) c.wordTimes.push_back(w.toDouble());
         setCaptionKeypad(c, a.at(4).toInt(2));
         c.italic = a.at(5).toInt(0) == 1;
+        c.colour = ss(a.at(6));
         t.captions.push_back(std::move(c));
     }
     normalizeCaptions(t.captions);
@@ -1110,6 +1112,11 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         for (const auto& w : p.vocabulary) words.append(qs(w));
         root["vocabulary"] = words;
     }
+    if (!p.soundCaptions.empty()) {
+        QJsonArray words;
+        for (const auto& w : p.soundCaptions) words.append(qs(w));
+        root["soundCaptions"] = words;
+    }
     if (!p.watchFolders.empty()) {
         QJsonArray folders;
         for (const auto& f : p.watchFolders) folders.append(qs(f));
@@ -1258,6 +1265,8 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
     for (const auto& pv : root.value("people").toArray()) p.people.push_back({pv.toObject().value("id").toInt(), ss(pv.toObject().value("name"))});
     for (const auto& w : root.value("vocabulary").toArray())
         if (!w.toString().trimmed().isEmpty()) p.vocabulary.push_back(ss(w));
+    for (const auto& w : root.value("soundCaptions").toArray())
+        if (!w.toString().trimmed().isEmpty()) p.soundCaptions.push_back(ss(w));
     for (const auto& f : root.value("watchFolders").toArray())
         if (!f.toString().isEmpty()) p.watchFolders.push_back(ss(f));
     for (const auto& w : root.value("fillerWords").toArray())

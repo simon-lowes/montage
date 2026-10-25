@@ -235,6 +235,7 @@
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
 #include "render/QualityCheck.h"
+#include "render/SdhDraft.h"
 #include "render/DialogueLoudness.h"
 #include "render/ProjectManager.h"
 #include "render/LutExport.h"
@@ -27276,6 +27277,172 @@ if ui["pressed"] == "add":
         QCOMPARE(r.value("structuredContent").toObject().value("skipped").toArray().size(), 1);
         QVERIFY(loadProject(project.toStdString(), back, &err));
         for (const MediaItem& m : back.media) QCOMPARE(bool(m.sounds && !m.sounds->samples.empty()), m.name != "no-such-recording.wav");
+    }
+
+    void sdhCaptionsHeard() {
+        // Ten seconds at 48 kHz: noise from 2 s to 5 s (about -25 dBFS), "speech" from 6 s to 8 s (noise the transcript
+        // says is words), silence between.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        const int rate = 48000;
+        std::vector<float> sound(size_t(10 * rate), 0.0f);
+        uint32_t seed = 12345;
+        auto noise = [&] {
+            seed = seed * 1664525u + 1013904223u;
+            return float(double(seed >> 8) / double(1u << 24) * 2 - 1);
+        };
+        for (size_t i = size_t(2 * rate); i < size_t(5 * rate); ++i) sound[i] = 0.1f * noise();
+        for (size_t i = size_t(6 * rate); i < size_t(8 * rate); ++i) sound[i] = 0.1f * noise();
+        QVERIFY(writeMonoWav(path("sdh-noise.wav"), sound, rate));
+        MediaItem m = probeOrFail(p, path("sdh-noise.wav"));
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment seg;
+        seg.words = {{6.1, 6.6, "Come", 1}, {6.6, 7.1, "in,", 1}, {7.1, 7.5, "it's", 1}, {7.5, 7.9, "open.", 1}};
+        t->segments = {seg};
+        t->language = "en";
+        m.transcript = t;
+        p.media.push_back(m);
+        Clip c;
+        c.id = p.newId();
+        c.mediaId = m.id;
+        c.duration = 300;
+        s.audioTracks.at(0).clips.push_back(c);
+        const double fps = s.fpsValue();
+        QCOMPARE(fps, 30.0);
+
+        // The loud sound outside the speech: 2 s to 5 s, to the 50 ms window.
+        const auto stretches = loudStretches(p, s, {{6.0, 8.0}});
+        QCOMPARE(stretches.size(), size_t(1));
+        QVERIFY2(std::fabs(stretches[0].first - 2) < 0.06 && std::fabs(stretches[0].second - 5) < 0.06,
+                 qPrintable(QStringLiteral("%1-%2").arg(stretches[0].first).arg(stretches[0].second)));
+
+        // Quality Check: with only the dialogue captioned, the noise is sound without a caption; described, it is not.
+        QcSettings q;
+        q.flashing = q.levels = q.clipping = q.phase = q.spelling = q.sync = false;
+        q.blackSeconds = q.freezeSeconds = q.silenceSeconds = q.dcOffsetDb = 0;
+        q.uncaptionedSeconds = 1;
+        CaptionTrack track;
+        track.id = p.newId();
+        track.captions = {{183, 237, "Come in, it's open.", {}}};
+        s.captionTracks.push_back(track);
+        auto issues = qualityCheck(p, s, 0, -1, q);
+        QCOMPARE(issues.size(), size_t(1));
+        QCOMPARE(issues[0].kind, QcKind::Uncaptioned);
+        QVERIFY2(std::abs(issues[0].start - 60) <= 2 && std::abs(issues[0].end - 150) <= 2,
+                 qPrintable(QStringLiteral("%1-%2").arg(issues[0].start).arg(issues[0].end)));
+        s.captionTracks[0].captions.insert(s.captionTracks[0].captions.begin(), Caption{60, 150, "[Static]", {}});
+        QVERIFY(qualityCheck(p, s, 0, -1, q).empty());
+        q.uncaptionedSeconds = 0;
+        s.captionTracks[0].captions.erase(s.captionTracks[0].captions.begin());
+        QVERIFY(qualityCheck(p, s, 0, -1, q).empty());  // (not checked)
+
+        // A draft without listening: the dialogue, in capitals style, as a new track over MCP.
+        const QString project = QString::fromStdString(path("sdh.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        {
+            McpServer server;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_captions"},
+                                                         {"arguments", QJsonObject{{"project", project},
+                                                                                   {"sdh", QJsonObject{{"style", "capitals"}, {"sounds", false},
+                                                                                                       {"sound_captions", QJsonArray{"Static|radio static"}}}}}},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            const QJsonObject r = QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            const QJsonObject sc = r.value("structuredContent").toObject();
+            QCOMPARE(sc.value("track").toInt(), 1);
+            QCOMPARE(sc.value("captions").toArray().size(), 1);
+            QCOMPARE(sc.value("captions").toArray().at(0).toObject().value("text").toString(), QString("Come in, it's open."));
+            Project back;
+            QVERIFY(loadProject(project.toStdString(), back));
+            QCOMPARE(back.active()->captionTracks.size(), size_t(2));
+            QCOMPARE(back.active()->captionTracks[1].name, std::string("SDH"));
+            QCOMPARE(back.soundCaptions, (std::vector<std::string>{"Static|radio static"}));
+        }
+
+        // With the models: Kokoro's speech, a door closing and applause (CC0 recordings, tests/data/sounds) in a mix,
+        // drafted with the sound model listening. The door and the applause get cues within half a second of where
+        // they start, nothing is heard during the speech, and the speech is not taken for singing.
+        if (!soundSearchAvailable() || !soundModel().installed()) QSKIP("Set MONTAGE_SOUND_MODEL to the CLAP model to run the rest");
+        if (!ttsAvailable() || !ttsModel().installed()) QSKIP("Set MONTAGE_TTS_MODEL to the Kokoro speech pack to run the rest");
+        Project mix = makeDefaultProject();
+        Sequence& ms = *mix.active();
+        ms.audioTracks.push_back(Track{mix.newId(), TrackKind::Audio, "A2"});
+        std::vector<std::pair<double, double>> speech;
+        // Places a file on a track at `at` seconds; returns when its sound starts on the timeline (its first 50 ms
+        // above -40 dBFS). Speech gets a transcript of `words` spread over where it is loud.
+        auto place = [&](const std::string& file, double at, int trackIndex, const std::vector<std::string>& words = {}) {
+            MediaItem item = probeOrFail(mix, file);
+            std::vector<float> pcm;
+            if (!decodeAudioBlocks(file, kTtsSampleRate, size_t(kTtsSampleRate), [&](const std::vector<float>& b) {
+                    pcm.insert(pcm.end(), b.begin(), b.end());
+                    return true;
+                }))
+                qWarning("Cannot decode %s", file.c_str());
+            const size_t win = kTtsSampleRate / 20;
+            double onset = -1;
+            for (size_t w = 0; w + win <= pcm.size() && onset < 0; w += win) {
+                double e = 0;
+                for (size_t i = w; i < w + win; ++i) e += double(pcm[i]) * pcm[i];
+                if (std::sqrt(e / double(win)) >= 0.01) onset = at + double(w) / kTtsSampleRate;
+            }
+            if (!words.empty()) {
+                size_t first = pcm.size(), last = 0;
+                for (size_t i = 0; i < pcm.size(); ++i)
+                    if (std::fabs(pcm[i]) > 0.02f) first = std::min(first, i), last = i;
+                const double a = double(first) / kTtsSampleRate, b = double(last) / kTtsSampleRate, step = (b - a) / double(words.size());
+                auto tr = std::make_shared<Transcript>();
+                TranscriptSegment sg;
+                for (size_t k = 0; k < words.size(); ++k) sg.words.push_back({a + step * double(k), a + step * double(k + 1), words[k], 1});
+                tr->segments = {sg};
+                tr->language = "en";
+                item.transcript = tr;
+                speech.push_back({at + a, at + b});
+            }
+            mix.media.push_back(item);
+            Clip clip;
+            clip.id = mix.newId();
+            clip.mediaId = item.id;
+            clip.start = FrameTime(std::llround(at * 30));
+            clip.duration = FrameTime(std::floor(item.duration * 30));
+            ms.audioTracks.at(size_t(trackIndex)).clips.push_back(clip);
+            return onset;
+        };
+        std::string err;
+        std::vector<float> said;
+        QVERIFY2(synthesizeSpeech("Come in, the door is open.", "af_heart", 1.0, said, &err), err.c_str());
+        QVERIFY(writeSpeechWav(path("sdh-say1.wav"), said, &err));
+        QVERIFY2(synthesizeSpeech("Thank you all for coming tonight.", "am_adam", 1.0, said, &err), err.c_str());
+        QVERIFY(writeSpeechWav(path("sdh-say2.wav"), said, &err));
+        place(path("sdh-say1.wav"), 0.5, 0, {"Come", "in,", "the", "door", "is", "open."});
+        const double door = place(MONTAGE_TEST_DATA_DIR "/sounds/door-close.ogg", 4.0, 1);
+        place(path("sdh-say2.wav"), 7.0, 0, {"Thank", "you", "all", "for", "coming", "tonight."});
+        const double applause = place(MONTAGE_TEST_DATA_DIR "/sounds/applause.ogg", 10.5, 1);
+        SdhDraftOptions o;
+        o.faces = o.readText = false;
+        SdhDraft draft;
+        QVERIFY2(draftSdhCaptions(mix, ms, o, draft, {}, nullptr, &err), err.c_str());
+        QString all;
+        for (const Caption& cap : draft.captions) all += QStringLiteral("%1-%2 %3\n").arg(double(cap.start) / 30).arg(double(cap.end) / 30).arg(QString::fromStdString(cap.text));
+        for (const SdhSound& h : draft.heard) all += QStringLiteral("heard %1-%2 %3 (%4)\n").arg(h.start).arg(h.end).arg(QString::fromStdString(h.label)).arg(h.score);
+        auto cueNear = [&](double at, const std::vector<const char*>& words) {
+            for (const Caption& cap : draft.captions) {
+                const QString text = QString::fromStdString(cap.text).toLower();
+                if (!text.startsWith('[') || std::fabs(double(cap.start) / 30 - at) > 0.5) continue;
+                for (const char* w : words)
+                    if (text.contains(QLatin1String(w))) return true;
+            }
+            return false;
+        };
+        QVERIFY2(cueNear(door, {"door"}), qPrintable(all));
+        QVERIFY2(cueNear(applause, {"applause", "clap", "cheer"}), qPrintable(all));
+        for (const SdhSound& h : draft.heard)
+            for (const auto& [a, b] : speech) QVERIFY2(h.end <= a || h.start >= b, qPrintable(all));
+        QCOMPARE(draft.summary.lyrics, 0);
+        QVERIFY2(draft.summary.sounds >= 2, qPrintable(all));
+        QCOMPARE(draft.language, std::string("en"));
     }
 
     void stemSeparation() {

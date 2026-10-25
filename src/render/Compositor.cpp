@@ -2797,7 +2797,10 @@ QImage captionImage(const CaptionTrack& track, FrameTime t, int width, int heigh
             pa.strokePath(text, pen);
             pa.strokePath(said, pen);
         }
-        pa.fillPath(text, col(st.textR, st.textG, st.textB, 1));
+        // A caption's own colour (a speaker's) in place of the track's.
+        int ownR = 0, ownG = 0, ownB = 0;
+        const bool own = captionColour(*cap, ownR, ownG, ownB);
+        pa.fillPath(text, own ? QColor(ownR, ownG, ownB) : col(st.textR, st.textG, st.textB, 1));
         pa.fillPath(said, col(st.hiR, st.hiG, st.hiB, 1));
     }
     if (origin) *origin = QPoint(x0, y0);

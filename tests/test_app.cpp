@@ -13927,6 +13927,96 @@ const auto seq = [this] { return state()->sequence(); };
         QApplication::processEvents();
     }
 
+    void sdhCaptionsFromThePanel() {
+        // JFK's clip with a made-up transcript of two speakers.
+        state()->newProject();
+        auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment a, b;
+        a.speaker = 0, b.speaker = 1;
+        a.words = {{0.5, 0.9, "Ask", 1}, {0.9, 1.3, "not.", 1}};
+        b.words = {{3.0, 3.4, "Why", 1}, {3.4, 3.8, "not?", 1}};
+        t->segments = {a, b};
+        t->speakerNames = {"John", "Ted"};
+        QVERIFY(state()->edit("Transcript", [media, t](Project& p, Sequence&) {
+            p.findMedia(media)->transcript = t;
+            return true;
+        }));
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false); }));
+        auto* panel = win_->findChild<CaptionsPanel*>();
+        QVERIFY(panel);
+
+        // Drafted without listening, in the colours style: a new SDH track, the second speaker in yellow.
+        SdhDraftOptions o;
+        o.sounds = o.faces = o.readText = false;
+        o.sdh.lyrics = false;
+        o.sdh.style = kSdhColours;
+        QString error;
+        QCOMPARE(panel->draftSdh(o, &error), 2);
+        const Sequence* s = state()->sequence();
+        QCOMPARE(s->captionTracks.size(), size_t(1));
+        const CaptionTrack& sdh = s->captionTracks[0];
+        QCOMPARE(sdh.name, std::string("SDH"));
+        QCOMPARE(panel->currentTrack(), sdh.id);
+        QCOMPARE(sdh.captions[0].text, std::string("Ask not."));
+        QVERIFY(sdh.captions[0].colour.empty());
+        QCOMPARE(sdh.captions[1].text, std::string("Why not?"));
+        QCOMPARE(sdh.captions[1].colour, std::string("#ffff00"));
+        // The viewer draws it in that colour.
+        const QImage drawn = captionImage(sdh, sdh.captions[1].start, 640, 360);
+        QVERIFY(!drawn.isNull());
+        bool yellow = false;
+        for (int y = 0; y < drawn.height() && !yellow; ++y)
+            for (int x = 0; x < drawn.width() && !yellow; ++x) {
+                const QColor c = drawn.pixelColor(x, y);
+                yellow = c.redF() > 0.8 && c.greenF() > 0.8 && c.blueF() < 0.3 && c.alphaF() > 0.9;
+            }
+        QVERIFY(yellow);
+        // In the brackets style, a second track, the speakers named (no faces were looked for). It takes the style of the
+        // track that was shown and becomes the one shown, the first hidden.
+        QVERIFY(state()->edit("Style", [](Project&, Sequence& sq) {
+            sq.captionTracks[0].style.position = 0.8;
+            return true;
+        }));
+        o.sdh.style = kSdhBrackets;
+        QCOMPARE(panel->draftSdh(o, &error), 2);
+        s = state()->sequence();
+        QCOMPARE(s->captionTracks.size(), size_t(2));
+        QCOMPARE(s->captionTracks[1].captions[1].text, std::string("[Ted] Why not?"));
+        QCOMPARE(s->captionTracks[1].style.position, 0.8);
+        QVERIFY(!s->captionTracks[0].visible);
+        QCOMPARE(captionTrackFor(*s), &s->captionTracks[1]);
+        state()->undo();
+        QCOMPARE(state()->sequence()->captionTracks.size(), size_t(1));
+        QVERIFY(state()->sequence()->captionTracks[0].visible);
+
+        // The sounds to caption: edited as a list, kept with the project, one undo step; the ready-made list is no list.
+        auto editList = [&](const QString& text) {
+            QTimer::singleShot(0, [text] {
+                auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+                QVERIFY(dlg);
+                auto* edit = dlg->findChild<QPlainTextEdit*>("soundCaptions");
+                QVERIFY(edit);
+                QVERIFY(edit->toPlainText().startsWith("Door slams|"));
+                if (!text.isEmpty()) edit->setPlainText(text);
+                dlg->accept();
+            });
+            panel->editSoundCaptions();
+        };
+        const int steps = int(state()->history().undoCount());
+        editList({});
+        QVERIFY(state()->project().soundCaptions.empty());
+        QCOMPARE(int(state()->history().undoCount()), steps);
+        editList("Door slams|a door slamming shut\n\n  Kettle whistles  \n");
+        QCOMPARE(state()->project().soundCaptions, (std::vector<std::string>{"Door slams|a door slamming shut", "Kettle whistles"}));
+        QCOMPARE(int(state()->history().undoCount()), steps + 1);
+        state()->undo();
+        QVERIFY(state()->project().soundCaptions.empty());
+        state()->newProject();
+    }
+
     void transcriptPanelEditsTheCut() {
         state()->newProject();
         auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});

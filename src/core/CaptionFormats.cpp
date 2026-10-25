@@ -143,8 +143,14 @@ std::string captionsToTtml(const std::vector<Caption>& captions, Rational fps, c
         else if (c.vertical == kCaptionMiddle) place += " region=\"middle\"";
         if (c.align == kCaptionLeft) place += " style=\"left\"";
         else if (c.align == kCaptionRight) place += " style=\"right\"";
+        std::string own;  // the caption's own colour
+        if (int r, g, b; captionColour(c, r, g, b)) {
+            char hex[24];
+            std::snprintf(hex, sizeof hex, " tts:color=\"#%02x%02x%02x\"", r, g, b);
+            own = hex;
+        }
         out += "      <p xml:id=\"c" + std::to_string(++n) + "\" begin=\"" + ttmlClock(double(c.start) / f) + "\" end=\"" +
-               ttmlClock(double(c.end) / f) + "\"" + place + "><span style=\"caption" + (c.italic ? " italic" : "") + "\">" + body +
+               ttmlClock(double(c.end) / f) + "\"" + place + "><span style=\"caption" + (c.italic ? " italic" : "") + "\"" + own + ">" + body +
                "</span></p>\n";
     }
     out += "    </div>\n  </body>\n</tt>\n";
@@ -423,13 +429,21 @@ std::string captionsToStl(const std::vector<Caption>& captions, Rational fps, co
     for (const Caption& c : captions) {
         QStringList lines = captionLines(c.text);
         if (lines.isEmpty() || c.end <= c.start) continue;
-        if (lines.size() > 3 || std::any_of(lines.begin(), lines.end(), [](const QString& l) { return l.size() > 35; }))
-            lines = captionLines(wrapCaptionText(lines.join(' ').toStdString(), 35, 3));
+        // A caption's own colour as the nearest teletext colour (an alphanumeric colour code before the text, which
+        // takes a cell of the row: a character fewer to a line).
+        static const std::vector<NamedColour> teletext = {{"\x01", 255, 0, 0},   {"\x02", 0, 255, 0},   {"\x03", 255, 255, 0},
+                                                          {"\x04", 0, 0, 255},   {"\x05", 255, 0, 255}, {"\x06", 0, 255, 255},
+                                                          {"", 255, 255, 255}};
+        std::string colour;
+        if (int r, g, b; captionColour(c, r, g, b)) colour = nearestColour(r, g, b, teletext);
+        const int most = colour.empty() ? 35 : 34;
+        if (lines.size() > 3 || std::any_of(lines.begin(), lines.end(), [most](const QString& l) { return l.size() > most; }))
+            lines = captionLines(wrapCaptionText(lines.join(' ').toStdString(), most, 3));
         while (lines.size() > 3) lines.removeLast();
         std::string tf;
         for (int i = 0; i < lines.size(); ++i) {
             if (i) tf += "\x8A\x8A";
-            tf += "\x0D\x0B\x0B" + toIso6937(lines[i]) + "\x0A\x0A";
+            tf += "\x0D" + colour + "\x0B\x0B" + toIso6937(lines[i]) + "\x0A\x0A";
         }
         subs.push_back({stlFrames(c.start), stlFrames(c.end), int(lines.size()), tf, c.vertical, c.align});
     }
@@ -631,7 +645,10 @@ std::string captionsToAss(const std::vector<Caption>& captions, Rational fps, co
         QString t = lines.join(QStringLiteral("\\N"));
         if (style.allCaps) t = t.toUpper();  // the line breaks are \N already
         t.replace('{', '(').replace('}', ')');  // braces open override tags
-        if (c.italic) t.prepend(QStringLiteral("{\\i1}"));
+        QString tags;  // italics, and the caption's own colour (blue, green, red)
+        if (c.italic) tags += QStringLiteral("\\i1");
+        if (int r, g, b; captionColour(c, r, g, b)) tags += QString::asprintf("\\1c&H%02X%02X%02X&", b, g, r);
+        if (!tags.isEmpty()) t.prepend(QLatin1Char('{') + tags + QLatin1Char('}'));
         if (const int k = captionKeypad(c); k != 2) t.prepend(QStringLiteral("{\\an%1}").arg(k));
         out += "Dialogue: 0," + assTime(double(c.start) / f) + "," + assTime(double(c.end) / f) + ",Default,,0,0,0,," +
                t.toStdString() + "\n";
@@ -803,8 +820,11 @@ std::string captionsToDcst(const std::vector<Caption>& captions, const CaptionSt
             else if (c.align == kCaptionRight) place += " Halign=\"right\" Hposition=\"10\"";
             else place += " Halign=\"center\" Hposition=\"0\"";
             const std::string text = xmlEscape(lines[i].toStdString());
-            out += "        <Text " + place + " Direction=\"ltr\">" +
-                   (c.italic ? "<Font Italic=\"yes\">" + text + "</Font>" : text) + "</Text>\n";
+            std::string font;
+            if (c.italic) font += " Italic=\"yes\"";
+            if (int r, g, b; captionColour(c, r, g, b)) font += " Color=\"" + argb(r / 255.0, g / 255.0, b / 255.0) + "\"";
+            out += "        <Text " + place + " Direction=\"ltr\">" + (font.empty() ? text : "<Font" + font + ">" + text + "</Font>") +
+                   "</Text>\n";
         }
         out += "      </Subtitle>\n";
     }

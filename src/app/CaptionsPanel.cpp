@@ -26,6 +26,7 @@
 #include <QMenu>
 #include <functional>
 #include <QMessageBox>
+#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSaveFile>
 #include <QSettings>
@@ -39,6 +40,7 @@
 #include "EditorState.h"
 #include "core/ProjectIO.h"
 #include "ModelPacks.h"
+#include "media/SoundSearch.h"
 #include "media/TextReader.h"
 #include "render/ImageSubtitles.h"
 #include "media/LipSync.h"
@@ -766,13 +768,43 @@ void CaptionsPanel::generateDialog() {
     secs->setRange(1, 15);
     secs->setSuffix(tr(" s"));
     secs->setValue(settings.value("captions/maxSeconds", 7.0).toDouble());
+    // Subtitles, or captions for the deaf and hard of hearing (with sounds, songs and speakers written in).
+    auto* kind = new QComboBox(&dlg);
+    kind->setObjectName(QStringLiteral("captionKind"));
+    kind->addItem(tr("Subtitles (the dialogue)"));
+    kind->addItem(tr("For the deaf and hard of hearing (SDH)"));
+    kind->setCurrentIndex(settings.value("captions/sdh", false).toBool() ? 1 : 0);
+    auto* style = new QComboBox(&dlg);
+    style->setObjectName(QStringLiteral("sdhStyle"));
+    style->addItem(tr("Brackets: [Door slams]  [Anna] Over here!"), int(kSdhBrackets));
+    style->addItem(tr("Capitals: [DOOR SLAMS]  ANNA: Over here!"), int(kSdhCapitals));
+    style->addItem(tr("Colours: DOOR SLAMS, a colour for each speaker"), int(kSdhColours));
+    style->setCurrentIndex(std::clamp(settings.value("captions/sdhStyle", 0).toInt(), 0, 2));
+    auto* sounds = new QPushButton(tr("Sounds..."), &dlg);
+    sounds->setToolTip(tr("The sounds the captions describe, saved with the project"));
+    connect(sounds, &QPushButton::clicked, this, [this] { editSoundCaptions(); });
+    auto* styleRow = new QWidget(&dlg);
+    auto* styleBox = new QHBoxLayout(styleRow);
+    styleBox->setContentsMargins(0, 0, 0, 0);
+    styleBox->addWidget(style, 1);
+    styleBox->addWidget(sounds);
+    form->addRow(tr("Captions:"), kind);
+    form->addRow(tr("SDH style:"), styleRow);
     form->addRow(tr("Characters per line:"), chars);
     form->addRow(tr("Lines per caption:"), lines);
     form->addRow(tr("Longest caption:"), secs);
+    QLabel* note = nullptr;
     if (track()) {
-        auto* note = new QLabel(tr("Replaces the captions in \"%1\".").arg(QString::fromStdString(track()->name)), &dlg);
+        note = new QLabel(tr("Replaces the captions in \"%1\".").arg(QString::fromStdString(track()->name)), &dlg);
         form->addRow(note);
     }
+    auto showKind = [kind, styleRow, note] {
+        const bool sdh = kind->currentIndex() == 1;
+        styleRow->setEnabled(sdh);
+        if (note) note->setVisible(!sdh);  // SDH captions go on a track of their own
+    };
+    connect(kind, &QComboBox::currentIndexChanged, &dlg, showKind);
+    showKind();
     auto* box = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
     connect(box, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
     connect(box, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
@@ -781,12 +813,122 @@ void CaptionsPanel::generateDialog() {
     settings.setValue("captions/lineChars", chars->value());
     settings.setValue("captions/maxLines", lines->value());
     settings.setValue("captions/maxSeconds", secs->value());
+    settings.setValue("captions/sdh", kind->currentIndex() == 1);
+    settings.setValue("captions/sdhStyle", style->currentIndex());
     CaptionRules rules;
     rules.lineChars = chars->value();
     rules.maxLines = lines->value();
     rules.maxSeconds = secs->value();
+    if (kind->currentIndex() == 1) {
+        // Sounds are heard with What's Heard's model; without it the draft has no sound cues.
+        if (soundSearchAvailable())
+            ensureModelPack(this, soundModel(), tr("Generate Captions"),
+                            tr("Sounds are recognised by CLAP (LAION, Apache-2.0), which runs on this computer. Without it the captions "
+                               "describe no sounds."));
+        SdhDraftOptions o;
+        o.rules = rules;
+        o.sdh.style = SdhStyle(style->currentData().toInt());
+        QString error;
+        const int n = draftSdh(o, &error);
+        if (!n && !error.isEmpty()) QMessageBox::warning(this, tr("Generate Captions"), error);
+        return;
+    }
     const int n = generateFromTranscripts(rules);
     state_->message(n ? tr("Generated %n caption(s)", "", n) : tr("No transcribed speech is heard in this sequence"));
+}
+
+int CaptionsPanel::draftSdh(const SdhDraftOptions& options, QString* error) {
+    const Sequence* s = state_->sequence();
+    if (!s) return 0;
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    auto done = std::make_shared<std::atomic<double>>(0.0);
+    QProgressDialog progress(tr("Drafting captions for the deaf and hard of hearing…"), tr("Cancel"), 0, 1000, this);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(400);
+    connect(&progress, &QProgressDialog::canceled, &progress, [cancel] { *cancel = true; });
+    QTimer tick;
+    connect(&tick, &QTimer::timeout, &progress, [&progress, done] { progress.setValue(int(*done * 1000)); });
+    tick.start(100);
+    using Out = std::pair<SdhDraft, std::string>;
+    QFutureWatcher<Out> watcher;
+    QEventLoop wait;
+    connect(&watcher, &QFutureWatcher<Out>::finished, &wait, &QEventLoop::quit);
+    const Project project = state_->project();
+    const Sequence seq = *s;
+    watcher.setFuture(QtConcurrent::run([project, seq, options, cancel, done] {
+        Out out;
+        std::string err;
+        if (!draftSdhCaptions(project, seq, options, out.first, [done](double f) { *done = f; }, cancel.get(), &err))
+            out.second = err.empty() ? "Cancelled" : err;
+        return out;
+    }));
+    if (!watcher.isFinished()) wait.exec();
+    tick.stop();
+    disconnect(&progress, &QProgressDialog::canceled, nullptr, nullptr);
+    progress.close();
+    const Out r = watcher.result();
+    if (*cancel || !r.second.empty()) {
+        if (error) *error = *cancel ? QString() : QString::fromStdString(r.second);
+        return 0;
+    }
+    Id id = 0;
+    int hidden = 0;
+    state_->edit(tr("Generate SDH Captions"), [&](Project& p, Sequence& sq) {
+        CaptionTrack t;
+        t.id = id = p.newId();
+        t.name = tr("SDH").toStdString();
+        if (!r.first.language.empty()) t.language = r.first.language;
+        t.style = r.first.look;  // the captions were placed for it
+        t.captions = r.first.captions;
+        // The new track is the one shown (the first visible), so the other tracks are hidden.
+        for (CaptionTrack& o : sq.captionTracks)
+            if (o.visible) o.visible = false, ++hidden;
+        sq.captionTracks.push_back(std::move(t));
+        return true;
+    });
+    setCurrentTrack(id);
+    const SdhSummary& sum = r.first.summary;
+    QString text = tr("%n SDH caption(s): ", "", int(r.first.captions.size())) +
+                   tr("%1 sound(s), %2 sung, %3 with the speaker shown, %4 moved off text").arg(sum.sounds).arg(sum.lyrics).arg(sum.speakers).arg(sum.raised);
+    if (hidden) text += QStringLiteral(". ") + tr("%n other caption track(s) hidden", "", hidden);
+    for (const std::string& n : r.first.notes) text += QStringLiteral(". ") + QString::fromStdString(n);
+    state_->message(text, 8000);
+    return int(r.first.captions.size());
+}
+
+void CaptionsPanel::editSoundCaptions() {
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("Sounds to Caption"));
+    auto* layout = new QVBoxLayout(&dlg);
+    layout->addWidget(new QLabel(tr("One sound a line, as its caption reads (\"Door slams\"), optionally followed by | and what it "
+                                    "sounds like (\"Door slams|a door slamming shut\"). The project keeps its own list."),
+                                 &dlg));
+    auto* edit = new QPlainTextEdit(&dlg);
+    edit->setObjectName(QStringLiteral("soundCaptions"));
+    QStringList entries;
+    for (const std::string& e : soundCaptionsFor(state_->project())) entries << QString::fromStdString(e);
+    edit->setPlainText(entries.join('\n'));
+    layout->addWidget(edit);
+    auto* box = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel | QDialogButtonBox::RestoreDefaults, &dlg);
+    connect(box, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(box, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    connect(box->button(QDialogButtonBox::RestoreDefaults), &QPushButton::clicked, edit, [edit] {
+        QStringList all;
+        for (const std::string& e : defaultSoundCaptions()) all << QString::fromStdString(e);
+        edit->setPlainText(all.join('\n'));
+    });
+    layout->addWidget(box);
+    dlg.resize(520, 480);
+    if (dlg.exec() != QDialog::Accepted) return;
+    std::vector<std::string> list;
+    for (const QString& line : edit->toPlainText().split('\n'))
+        if (!line.trimmed().isEmpty()) list.push_back(line.trimmed().toStdString());
+    if (list == defaultSoundCaptions()) list.clear();  // the ready-made list, which stays current
+    if (list == state_->project().soundCaptions) return;
+    state_->edit(tr("Sounds to Caption"), [&list](Project& p, Sequence&) {
+        p.soundCaptions = list;
+        return true;
+    });
 }
 
 bool CaptionsPanel::importFile(const QString& path, QString* error) {

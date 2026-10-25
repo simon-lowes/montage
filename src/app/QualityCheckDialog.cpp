@@ -123,6 +123,14 @@ QualityCheckDialog::QualityCheckDialog(EditorState* state, QWidget* parent) : QD
     spelling_->setObjectName(QStringLiteral("qcSpelling"));
     spelling_->setChecked(true);
     form->addRow(tr("Text:"), spelling_);
+    {
+        // For captions for the deaf and hard of hearing: loud sound outside speech that no caption describes.
+        QWidget* w = row(uncaptioned_, uncaptionedSeconds_, tr("Sound without a caption for at least"), "qcUncaptioned", 3.0, false);
+        uncaptionedSeconds_->setEnabled(false);
+        uncaptioned_->setToolTip(tr("For captions for the deaf and hard of hearing (SDH): sound louder than -40 dBFS, outside the "
+                                    "transcribed speech, that no caption of the shown track describes"));
+        form->addRow(QString(), w);
+    }
     sync_ = new QCheckBox(tr("Linked clips out of sync"), this);
     sync_->setObjectName(QStringLiteral("qcSync"));
     sync_->setChecked(true);
@@ -175,6 +183,7 @@ QcSettings QualityCheckDialog::settings() const {
     q.dialogueGated = loudness_->currentData(Qt::UserRole + 1).toBool();
     if (q.dialogueGated) q.loudnessTolerance = 2;
     q.spelling = spelling_->isChecked();
+    q.uncaptionedSeconds = uncaptioned_->isChecked() ? uncaptionedSeconds_->value() : 0;
     q.sync = sync_->isChecked();
     q.intelligibility = intelligibility_->isChecked() ? intelligibilityPreset_->currentData().toDouble() : 0;
     q.intelligibilitySeconds = intelligibilitySeconds_->value();

@@ -27,6 +27,7 @@
 #include "core/CaptionTools.h"
 #include "core/ClipAnimation.h"
 #include "core/Captions.h"
+#include "core/SdhCaptions.h"
 #include "core/Cea708.h"
 #include "core/Teletext.h"
 #include "core/ColorWarp.h"
@@ -2192,6 +2193,176 @@ private slots:
         // Without transcripts there is nothing to caption.
         p.media[0].transcript.reset();
         QVERIFY(captionsFromTranscripts(p, s).empty());
+    }
+
+    void sdhCaptionRules() {
+        // A synthetic programme at 25 fps: six lines of dialogue (who says each, the faces in frame, one sung) and the
+        // sounds heard between them.
+        const Rational fps{25, 1};
+        auto line = [](FrameTime a, FrameTime b, const char* text, const char* who, int faces, bool sung = false) {
+            SdhLine l;
+            l.caption.start = a;
+            l.caption.end = b;
+            l.caption.text = text;
+            l.speaker = who;
+            l.faces = faces;
+            l.sung = sung;
+            return l;
+        };
+        std::vector<SdhLine> dialogue = {line(25, 75, "Where were you?", "Anna", 1),  line(100, 150, "Out.", "Bob", 0),
+                                         line(160, 200, "All night?", "Bob", 0),       line(400, 450, "Listen.", "Anna", 2),
+                                         line(700, 760, "la la la love", "Anna", -1, true), line(900, 950, "Who's there?", "", -1)};
+        dialogue[1].caption.wordTimes = {0.1};
+        QCOMPARE(sdhSpeakerChanges(dialogue), (std::vector<size_t>{0, 1, 3}));
+        const std::vector<SdhSound> sounds = {
+            {3.2, 3.5, "Phone rings"},  // between two lines with too little room: left out
+            {8.4, 8.6, "Door slams"},   // a short sound: held for 5/6 s
+            {10, 11, "Applause"},       // the same sound again a second later: one cue
+            {12, 13, "applause"},
+            {14, 14.2, "Door slams"},   // the same sound, but too long after the last to join it
+            {17.5, 19, "Dog barks"},    // starts under a line: the cue waits for it to end, two frames clear
+            {20, 40, "Thunder"},        // a long sound: seven seconds at most
+        };
+        // Text in the picture: low and central while Bob first speaks (that caption moves up), at the top during the
+        // last line, and low in the left corner during the first door slam (neither is under a caption).
+        const std::vector<SdhText> text = {{4.0, 6.0, 0.3, 0.86, 0.7, 0.9}, {36.0, 38.0, 0.3, 0.05, 0.7, 0.1}, {8.4, 9.0, 0.0, 0.8, 0.1, 0.9}};
+        SdhSummary sum;
+        std::vector<Caption> out = sdhCaptions(dialogue, sounds, text, fps, {}, &sum);
+        struct Want {
+            FrameTime start, end;
+            const char* text;
+        };
+        const std::vector<Want> want = {{25, 75, "Where were you?"},  {100, 150, "[Bob] Out."},     {160, 200, "All night?"},
+                                        {210, 231, "[Door slams]"},   {250, 325, "[Applause]"},     {350, 371, "[Door slams]"},
+                                        {400, 450, "[Anna] Listen."}, {452, 475, "[Dog barks]"},    {500, 675, "[Thunder]"},
+                                        {700, 760, "♪ la la la love ♪"}, {900, 950, "Who's there?"}};
+        QCOMPARE(out.size(), want.size());
+        for (size_t i = 0; i < want.size(); ++i) {
+            QVERIFY2(out[i].start == want[i].start && out[i].end == want[i].end && out[i].text == want[i].text,
+                     qPrintable(QStringLiteral("%1: %2-%3 %4").arg(i).arg(out[i].start).arg(out[i].end).arg(QString::fromStdString(out[i].text))));
+        }
+        // Bob's line over the text went to the top; the rest stayed down. The song is in italics; the speaker's name
+        // took a word time of its own.
+        for (size_t i = 0; i < out.size(); ++i) QCOMPARE(out[i].vertical, i == 1 ? int(kCaptionTop) : int(kCaptionBottom));
+        QVERIFY(out[9].italic && !out[0].italic);
+        QCOMPARE(out[1].wordTimes, (std::vector<double>{0, 0.1}));
+        QCOMPARE(sum.sounds, 5);
+        QCOMPARE(sum.lyrics, 1);
+        QCOMPARE(sum.speakers, 2);
+        QCOMPARE(sum.raised, 1);
+        // A cue never comes within two frames of a caption.
+        for (size_t i = 0; i + 1 < out.size(); ++i) QVERIFY2(out[i + 1].start - out[i].end >= 2, qPrintable(QString::number(i)));
+
+        // Capitals: speakers named before a colon, sounds in capital letters.
+        SdhOptions caps;
+        caps.style = kSdhCapitals;
+        out = sdhCaptions(dialogue, sounds, {}, fps, caps, &sum);
+        QCOMPARE(out[1].text, std::string("BOB: Out."));
+        QCOMPARE(out[3].text, std::string("[DOOR SLAMS]"));
+        QCOMPARE(out[6].text, std::string("ANNA: Listen."));
+        QCOMPARE(sum.raised, 0);
+        // Colours: no names; the one who says most stays white and the next is yellow, on every line; sounds in
+        // capitals without brackets.
+        SdhOptions colours;
+        colours.style = kSdhColours;
+        out = sdhCaptions(dialogue, sounds, {}, fps, colours, &sum);
+        QCOMPARE(out[1].text, std::string("Out."));
+        QCOMPARE(out[1].colour, std::string("#ffff00"));
+        QCOMPARE(out[2].colour, std::string("#ffff00"));
+        QVERIFY(out[0].colour.empty() && out[6].colour.empty() && out[10].colour.empty());
+        QCOMPARE(out[3].text, std::string("DOOR SLAMS"));
+        QCOMPARE(sum.speakers, 2);
+        // A fifth speaker has no colour left: named, in white.
+        std::vector<SdhLine> crowd;
+        const char* names[] = {"Ann", "Ben", "Cat", "Dan", "Eve"};
+        for (int k = 0; k < 5; ++k)
+            for (int r = 0; r < 5 - k; ++r) crowd.push_back(line(FrameTime(crowd.size()) * 50, FrameTime(crowd.size()) * 50 + 40, "Hi.", names[k], 0));
+        out = sdhCaptions(crowd, {}, {}, fps, colours);
+        QCOMPARE(out.back().text, std::string("EVE: Hi."));
+        QVERIFY(out.back().colour.empty());
+        QCOMPARE(out[5].colour, std::string("#ffff00"));  // Ben, who says the second most
+        // Without speaker labels or songs.
+        SdhOptions plain;
+        plain.speakerLabels = false;
+        plain.lyrics = false;
+        out = sdhCaptions(dialogue, {}, {}, fps, plain, &sum);
+        QCOMPARE(out[1].text, std::string("Out."));
+        QCOMPARE(out[4].text, std::string("la la la love"));
+        QVERIFY(!out[4].italic);
+        QCOMPARE(sum.speakers + sum.lyrics + sum.sounds, 0);
+
+        // The styles' words, and the sound descriptions.
+        QCOMPARE(sdhSoundText("door slams", kSdhBrackets), std::string("[Door slams]"));
+        QCOMPARE(sdhSpeakerPrefix("Mary Jane", kSdhCapitals), std::string("MARY JANE: "));
+        SdhStyle st = kSdhBrackets;
+        QVERIFY(parseSdhStyle("colours", st) && st == kSdhColours);
+        QVERIFY(!parseSdhStyle("loud", st));
+        QVERIFY(defaultSoundCaptions().size() >= 300);
+        const SoundCaption dc = parseSoundCaption("Door slams|a door slamming shut");
+        QCOMPARE(dc.caption, std::string("Door slams"));
+        QCOMPARE(dc.prompt, std::string("a door slamming shut"));
+        QCOMPARE(parseSoundCaption("wind chimes").prompt, std::string("the sound of wind chimes"));
+        Project p = makeDefaultProject();
+        QCOMPARE(soundCaptionsFor(p), defaultSoundCaptions());
+        p.soundCaptions = {"Kettle whistles", "Gong|a big gong"};
+        Project back;
+        QVERIFY(projectFromJson(projectToJson(p), back));
+        QCOMPARE(soundCaptionsFor(back), p.soundCaptions);
+
+        // A speaker's colour goes with the caption: saved, and written and read as SubRip, WebVTT and TTML say it.
+        Caption c{0, 50, "Over here!", {}};
+        c.colour = "#ffff00";
+        c.italic = true;
+        Sequence& s = *p.active();
+        CaptionTrack ct;
+        ct.id = p.newId();
+        ct.captions = {c};
+        s.captionTracks.push_back(ct);
+        QVERIFY(projectFromJson(projectToJson(p), back));
+        QCOMPARE(back.active()->captionTracks.at(0).captions.at(0).colour, std::string("#ffff00"));
+        const std::string srt = captionsToSrt({c}, fps), vtt = captionsToVtt({c}, fps);
+        QVERIFY2(srt.find("<i><font color=\"#ffff00\">Over here!</font></i>") != std::string::npos, srt.c_str());
+        QVERIFY2(vtt.find("<i><c.yellow>Over here!</c></i>") != std::string::npos, vtt.c_str());
+        for (const std::string& file : {srt, vtt}) {
+            std::vector<Caption> read;
+            QVERIFY(parseSubtitles(file, fps, read));
+            QCOMPARE(read.size(), size_t(1));
+            QCOMPARE(read[0].text, std::string("Over here!"));
+            QCOMPARE(read[0].colour, std::string("#ffff00"));
+            QVERIFY(read[0].italic);
+        }
+        QVERIFY(captionsToTtml({c}, fps).find("tts:color=\"#ffff00\"") != std::string::npos);
+        QVERIFY(captionsToAss({c}, fps, {}, 1920, 1080).find("{\\i1\\1c&H00FFFF&}Over here!") != std::string::npos);
+
+        // The dialogue from a transcript: a new caption where the speaker changes, with who says it.
+        MediaItem m;
+        m.id = p.newId();
+        m.kind = MediaKind::Audio;
+        m.hasAudio = true;
+        m.duration = 10;
+        m.name = "two.wav";
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment a, b;
+        a.speaker = 0, b.speaker = 1;
+        a.words = {{1.0, 1.4, "Hello", 1}, {1.4, 1.8, "there", 1}};
+        b.words = {{1.9, 2.3, "Hi.", 1}};
+        t->segments = {a, b};
+        t->speakerNames = {"Anna", "Bob"};
+        m.transcript = t;
+        p.media.push_back(m);
+        Clip clip;
+        clip.id = p.newId();
+        clip.mediaId = m.id;
+        clip.start = 0;
+        clip.duration = FrameTime(10 * s.fpsValue());
+        s.audioTracks.at(0).clips.push_back(clip);
+        const std::vector<SdhLine> said = sdhDialogue(p, s);
+        QCOMPARE(said.size(), size_t(2));
+        QCOMPARE(said[0].caption.text, std::string("Hello there"));
+        QCOMPARE(said[0].speaker, std::string("Anna"));
+        QCOMPARE(said[1].caption.text, std::string("Hi."));
+        QCOMPARE(said[1].speaker, std::string("Bob"));
+        QVERIFY(said[0].caption.end <= said[1].caption.start);
     }
 
     void renderAndReplaceBookkeeping() {

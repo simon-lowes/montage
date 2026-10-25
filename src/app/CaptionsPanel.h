@@ -11,6 +11,7 @@
 #include "core/Captions.h"
 #include "core/Model.h"
 #include "render/ImageSubtitles.h"
+#include "render/SdhDraft.h"
 
 class QCheckBox;
 class QLabel;
@@ -37,6 +38,11 @@ public:
     // Replaces the current track's captions with ones built from transcripts
     // (or adds a track when there is none). Returns the number of captions.
     int generateFromTranscripts(const CaptionRules& rules = {});
+    // Drafts captions for the deaf and hard of hearing (render/SdhDraft.h) as a new track, in the background with
+    // progress. Returns how many captions it made (0 with `error` on failure or "" when cancelled).
+    int draftSdh(const SdhDraftOptions& options, QString* error = nullptr);
+    // Edits the project's sound descriptions (one a line).
+    void editSoundCaptions();
     // Subtitle pictures (.sup, .idx, Matroska, MPEG-TS, IMSC Image) are read by OCR (render/ImageSubtitles.h), and
     // written as pictures by extension, or as `pictures` says ("pgs", "dvb", "vobsub", "imsc_image").
     bool importFile(const QString& path, QString* error = nullptr);

@@ -655,6 +655,7 @@ struct Project {
     std::vector<Person> people;  // the people found in the footage (FaceIndex.h), with their names
     std::vector<std::string> fillerWords;  // the editor's own filler words or phrases (core/TranscriptEdit.h)
     std::vector<std::string> vocabulary;   // names and terms speech-to-text should expect (core/TranscriptCorrect.h)
+    std::vector<std::string> soundCaptions;  // the sounds SDH captions describe (core/SdhCaptions.h); empty = the ready-made list
     std::vector<std::string> watchFolders;  // folders whose arriving media files are imported (app/EditorState)
     ProjectScript script;  // the screenplay and its lined coverage (core/ScriptCut.h)
     Id activeSequence = 0;

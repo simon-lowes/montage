@@ -233,11 +233,11 @@ QByteArray frameKey(const Project& p, const Sequence& seq, FrameTime t, const Re
     if (o.captions)
         if (const CaptionTrack* track = captionTrackFor(seq)) {
             if (const Caption* cue = captionAt(*track, t)) {
-                CaptionTrack style = *track;
-                style.captions.clear();
-                style.id = 0;
-                h.addData(QByteArray::fromStdString(captionTrackToJsonString(style)));
-                h.addData(QByteArray::fromStdString(cue->text) + QByteArray::number(qint64(cue->start)) + '-' + QByteArray::number(qint64(cue->end)));
+                // The track's style and the whole cue (its text, times, place, italics, word times and colour).
+                CaptionTrack shown = *track;
+                shown.captions = {*cue};
+                shown.id = 0;
+                h.addData(QByteArray::fromStdString(captionTrackToJsonString(shown)));
                 any = true;
             }
         }
