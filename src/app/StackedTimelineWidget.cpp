@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 
+#include "Accessibility.h"
 #include "EditorState.h"
 #include "Theme.h"
 
@@ -65,6 +66,8 @@ class StackedTimelineCanvas : public QWidget {
 public:
     explicit StackedTimelineCanvas(StackedTimelineWidget* owner) : QWidget(owner), w_(owner) {
         setFocusPolicy(Qt::StrongFocus);
+        access::describe(this, {QAccessible::Graphic, [] { return StackedTimelineWidget::tr("Stacked timelines"); }, {},
+                                [] { return StackedTimelineWidget::tr("The sequences one above another (the Timeline reads the active one)"); }});
         setMinimumHeight(90);
         setMouseTracking(false);
     }

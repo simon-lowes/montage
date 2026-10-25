@@ -42,6 +42,7 @@
 #include <cmath>
 #include <functional>
 
+#include "Accessibility.h"
 #include "EditorState.h"
 #include "ModelPacks.h"
 #include "Settings.h"
@@ -77,6 +78,7 @@ public:
     explicit SoundWaveView(QWidget* parent) : QWidget(parent) {
         setMinimumHeight(90);
         setFocusPolicy(Qt::ClickFocus);
+        access::describe(this, {QAccessible::Graphic, [] { return SoundLibraryPanel::tr("Waveform"); }, {}, {}});
         setMouseTracking(false);
     }
     void setSound(AudioBufferPtr sound) {

@@ -390,6 +390,20 @@ public:
     bool replaceWithSource();                         // the selected clip, or the one under the playhead
     bool fitToFill();
     int selectForward(bool allTracks);
+    // The keyboard's way round the timeline (each says what it selected to a screen reader): the clip before or after
+    // the selected one on its track (or the playhead's on the target track), the one at the same time on the track
+    // above or below (it becomes the target), the one under the playhead. Each moves the playhead to the clip's start
+    // except the last; false when there is none.
+    bool selectNeighbourClip(int step);
+    bool selectClipOnTrack(int step);
+    bool selectClipAtPlayhead();
+    // F6, Shift+F6: the keyboard focus to the next or previous panel shown (the timeline counts as one), and Ctrl+F6 the
+    // next panel tabbed with the focused one brought to the front. The panel focused, or null.
+    QDockWidget* focusPanel(int step);
+    QDockWidget* nextPanelTab();
+    // Window › High Contrast and Text Size (kept between sessions).
+    void setHighContrast(bool on);
+    void setTextScale(double scale);
     // Render cache: renders the frames between In and Out (the whole sequence
     // without marks) as the Program monitor shows them; returns how many were
     // rendered (-1 if cancelled). The render bar follows edits by itself;

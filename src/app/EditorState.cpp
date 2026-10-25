@@ -201,6 +201,7 @@ bool EditorState::edit(const QString& label, const std::function<bool(Project&, 
     pruneSelection();
     emit projectChanged();
     emit historyChanged();
+    emit edited(label);
     emit fileStateChanged();
     return true;
 }
@@ -256,6 +257,7 @@ void EditorState::endGesture(bool commit) {
         history_.push(g.label.toStdString(), g.origin);
         pruneSelection();
         emit historyChanged();
+        emit edited(g.label);
         emit fileStateChanged();
     } else if (!commit) {
         project_ = std::move(g.origin);
@@ -273,6 +275,7 @@ void EditorState::undo() {
     pruneSelection();
     emit projectChanged();
     emit historyChanged();
+    emit edited(tr("Undo %1").arg(redoText()));
     emit fileStateChanged();
     emit sourceChanged();
 }
@@ -287,6 +290,7 @@ void EditorState::redo() {
     pruneSelection();
     emit projectChanged();
     emit historyChanged();
+    emit edited(tr("Redo %1").arg(undoText()));
     emit fileStateChanged();
 }
 
@@ -298,12 +302,18 @@ bool EditorState::isSelected(Id clip) const {
 }
 
 void EditorState::setSelection(std::vector<Id> clips, bool expandLinked) {
+    primary_ = clips.empty() ? 0 : clips.front();
     if (expandLinked && sequence()) clips = edit::expandLinks(*sequence(), clips);
     if (clips == selection_ && selectedTransition_ == 0 && (clips.empty() || !inspectedChain_)) return;
     selection_ = std::move(clips);
     selectedTransition_ = 0;
     if (!selection_.empty()) inspectedChain_ = 0;
     emit selectionChanged();
+}
+
+Id EditorState::focusClip() const {
+    if (primary_ && isSelected(primary_)) return primary_;
+    return selection_.empty() ? 0 : selection_.front();
 }
 
 void EditorState::clearSelection() {

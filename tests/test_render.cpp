@@ -9673,7 +9673,8 @@ colorspaces:
         QVERIFY2(rx.open("omt://127.0.0.1:" + address.section(':', -1).toStdString(), ro, &why), why.c_str());
         for (int i = 0; i < 200 && backend->receivers() < 2; ++i) QThread::msleep(10);
         QCOMPARE(backend->receivers(), 2);  // (its picture's connection and its sound's)
-        QVERIFY(QString::fromStdString(rx.senderInfo()).contains("ProductName=\"Montage\""));
+        // (The sender's description arrives on the connection after it is accepted.)
+        QTRY_VERIFY_WITH_TIMEOUT(QString::fromStdString(rx.senderInfo()).contains("ProductName=\"Montage\""), 3000);
         const int frames = 50, spf = 960;
         const FrameTime tc0 = 3600 * 50;  // 01:00:00:00 at 50p
         std::vector<std::vector<uint8_t>> sentPictures;

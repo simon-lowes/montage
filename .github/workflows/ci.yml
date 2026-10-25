@@ -207,3 +207,8 @@ jobs:
             || echo "::warning::Could not install pyavb; the Avid bin tests' comparisons with pyavb will be skipped"
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: The window read over AT-SPI, as a screen reader on Linux reads it
+        run: |
+          sudo apt-get install -y --no-install-recommends at-spi2-core python3-pyatspi > /dev/null
+          build/src/montage-cli new -o "$RUNNER_TEMP/atspi.montage" tests/data/jfk.wav
+          dbus-run-session -- xvfb-run -a /usr/bin/python3 scripts/atspi-check.py build/src/app/montage "$RUNNER_TEMP/atspi.montage"

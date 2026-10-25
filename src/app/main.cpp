@@ -19,6 +19,7 @@ int main(int argc, char** argv) {
     QApplication::setOrganizationName("Montage");
     QApplication::setApplicationVersion(MONTAGE_VERSION);
     QApplication::setWindowIcon(QIcon(":/montage.png"));
+    montage::theme::loadSettings();  // (high contrast, text size)
     montage::theme::apply(app);
 
     QCommandLineParser parser;

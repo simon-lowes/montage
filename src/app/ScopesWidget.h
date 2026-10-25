@@ -52,6 +52,9 @@ public:
     double outsideP3() const { return outsideP3_; }
     // The chromaticity scope's samples near a point (xy, or u'v' when cieUv()), for tests.
     int cieSamplesNear(double a, double b, double radius) const;
+    // The frame in words, for a screen reader: "Waveform: levels 4 % to 96 %, average 41 %; saturation 18 %, leaning
+    // blue" (with the HDR light levels, and in the chromaticity scope what lies outside Rec.709).
+    QString summary() const;
     QSize sizeHint() const override;
     QSize minimumSizeHint() const override;
 
