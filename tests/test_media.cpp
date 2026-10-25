@@ -18783,55 +18783,6 @@ if ui["pressed"] == "add":
         QVERIFY(text.readAll().contains("\tOn screen\t00:00:00:00\t00:00:02:00\t"));
     }
 
-    void paperworkVocalSuggestion() {
-        if (!stemSeparationAvailable() || !(stemModel(2).installed() || stemModel(4).installed() || stemModel(5).installed()))
-            QSKIP("Set MONTAGE_STEM_MODELS to a folder holding a Spleeter model to test vocal suggestion");
-        if (!ttsAvailable() || !ttsModel().installed()) QSKIP("Set MONTAGE_TTS_MODEL to test vocal suggestion");
-        // A sung cue (a voice) and an instrumental one (a chord).
-        std::vector<float> voice;
-        std::string err;
-        QVERIFY2(synthesizeSpeech("La la la, the river runs to the sea, and the sea sings back to me.", "af_heart", 1.0, voice, &err), err.c_str());
-        QVERIFY(writeSpeechWav(path("song.wav"), voice, &err));
-        std::vector<float> chord(size_t(kTtsSampleRate * 6));
-        for (size_t i = 0; i < chord.size(); ++i) {
-            const double t = double(i) / kTtsSampleRate;
-            chord[i] = float(0.15 * (std::sin(2 * M_PI * 220 * t) + std::sin(2 * M_PI * 277.2 * t) + std::sin(2 * M_PI * 329.6 * t)));
-        }
-        QVERIFY(writeSpeechWav(path("chord.wav"), chord, &err));
-        Project p = makeDefaultProject();
-        Sequence& s = *p.active();
-        s.fps = {24, 1};
-        FrameTime at = 0;
-        for (const char* f : {"song.wav", "chord.wav"}) {
-            MediaItem m = probeOrFail(p, path(f));
-            p.media.push_back(m);
-            Clip c;
-            c.id = p.newId();
-            c.mediaId = m.id;
-            c.start = at;
-            c.duration = FrameTime(m.duration * 24) - 1;
-            c.role = "Music";
-            s.audioTracks[0].clips.push_back(c);
-            at += c.duration + 48;
-        }
-        const std::vector<MusicCue> cues = musicCues(p, s);
-        QCOMPARE(cues.size(), size_t(2));
-        bool vocal = false;
-        double share = 0;
-        QVERIFY2(cueIsVocal(p, s, cues[0], vocal, &share, 30, &err), err.c_str());
-        qInfo("voice: %.3f of it vocal", share);
-        QVERIFY(vocal);
-        QVERIFY2(cueIsVocal(p, s, cues[1], vocal, &share, 30, &err), err.c_str());
-        qInfo("chord: %.3f of it vocal", share);
-        QVERIFY(!vocal);
-        PaperworkOptions o;
-        o.suggestVocal = true;
-        XlsxSheet table;
-        QVERIFY(buildPaperwork(p, s, PaperworkList::CueSheet, o, table, nullptr, &err));
-        QCOMPARE(QString::fromStdString(table.rows[1][10].text), QString("vocal"));
-        QCOMPARE(QString::fromStdString(table.rows[2][10].text), QString("instrumental"));
-    }
-
     void paperEdit() {
         Project p = makeDefaultProject();
         p.active()->fps = {25, 1};
@@ -27580,6 +27531,56 @@ if ui["pressed"] == "add":
         res = call(QJsonObject{{"project", project}, {"clips", QJsonArray{double(fp.created[0]), double(title)}}});
         QVERIFY(res.value("isError").toBool());
         QCOMPARE(int(QDir(QString::fromStdString(path("mcp-stems/Stems"))).entryList(QDir::Files).size()), before);
+    }
+
+    void paperworkVocalSuggestion() {
+        // (After stemSeparation, which must be the first to load the model in this process.)
+        if (!stemSeparationAvailable() || !(stemModel(2).installed() || stemModel(4).installed() || stemModel(5).installed()))
+            QSKIP("Set MONTAGE_STEM_MODELS to a folder holding a Spleeter model to test vocal suggestion");
+        if (!ttsAvailable() || !ttsModel().installed()) QSKIP("Set MONTAGE_TTS_MODEL to test vocal suggestion");
+        // A sung cue (a voice) and an instrumental one (a chord).
+        std::vector<float> voice;
+        std::string err;
+        QVERIFY2(synthesizeSpeech("La la la, the river runs to the sea, and the sea sings back to me.", "af_heart", 1.0, voice, &err), err.c_str());
+        QVERIFY(writeSpeechWav(path("song.wav"), voice, &err));
+        std::vector<float> chord(size_t(kTtsSampleRate * 6));
+        for (size_t i = 0; i < chord.size(); ++i) {
+            const double t = double(i) / kTtsSampleRate;
+            chord[i] = float(0.15 * (std::sin(2 * M_PI * 220 * t) + std::sin(2 * M_PI * 277.2 * t) + std::sin(2 * M_PI * 329.6 * t)));
+        }
+        QVERIFY(writeSpeechWav(path("chord.wav"), chord, &err));
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = {24, 1};
+        FrameTime at = 0;
+        for (const char* f : {"song.wav", "chord.wav"}) {
+            MediaItem m = probeOrFail(p, path(f));
+            p.media.push_back(m);
+            Clip c;
+            c.id = p.newId();
+            c.mediaId = m.id;
+            c.start = at;
+            c.duration = FrameTime(m.duration * 24) - 1;
+            c.role = "Music";
+            s.audioTracks[0].clips.push_back(c);
+            at += c.duration + 48;
+        }
+        const std::vector<MusicCue> cues = musicCues(p, s);
+        QCOMPARE(cues.size(), size_t(2));
+        bool vocal = false;
+        double share = 0;
+        QVERIFY2(cueIsVocal(p, s, cues[0], vocal, &share, 30, &err), err.c_str());
+        qInfo("voice: %.3f of it vocal", share);
+        QVERIFY(vocal);
+        QVERIFY2(cueIsVocal(p, s, cues[1], vocal, &share, 30, &err), err.c_str());
+        qInfo("chord: %.3f of it vocal", share);
+        QVERIFY(!vocal);
+        PaperworkOptions o;
+        o.suggestVocal = true;
+        XlsxSheet table;
+        QVERIFY(buildPaperwork(p, s, PaperworkList::CueSheet, o, table, nullptr, &err));
+        QCOMPARE(QString::fromStdString(table.rows[1][10].text), QString("vocal"));
+        QCOMPARE(QString::fromStdString(table.rows[2][10].text), QString("instrumental"));
     }
 
     void dialogueMusicEffectsChunks() {
