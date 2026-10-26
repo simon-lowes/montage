@@ -83,6 +83,8 @@ private:
     void addGraphicSection(const Clip& clip);
     // An OGraf graphic's data, a row per field of its schema, and rendering it ahead.
     void addOGrafFields(QFormLayout* form, const Clip& clip, const Target& target);
+    // A title's styled runs (Style Selected Text, Clear Styles) and its text animations, a section each.
+    void addTitleTextTools(QFormLayout* form, const Clip& clip, const Target& target);
     void renderOGrafClip(Id clip);
 
 public:

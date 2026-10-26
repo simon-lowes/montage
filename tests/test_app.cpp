@@ -97,6 +97,7 @@
 #include "core/Interpretation.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
+#include "render/Titles.h"
 #include "render/DcpSecurity.h"
 #include "render/Ofx.h"
 #include "Assistant.h"
@@ -16191,6 +16192,71 @@ print("added " + ui["name"])
         QVERIFY(state()->sequence()->colorGroups.empty());
         QCOMPARE(edit::clipById(*state()->sequence(), a)->colorGroup, Id(0));
         state()->newProject();
+    }
+
+    void styledTitleInInspector() {
+        // A title's word styled from the Inspector, kept on its letters as the text is typed into; a text animation added
+        // with its own section, and taken off again.
+        state()->newProject();
+        Id clipId = 0;
+        QVERIFY(state()->edit("Title", [&](Project& p, Sequence& s) {
+            Clip c = makeGeneratorClip(p, "title", 60);
+            c.generator.strings["text"] = "Hello world";
+            clipId = c.id;
+            return edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok;
+        }));
+        auto generator = [&]() -> const Effect& { return edit::clipById(*state()->sequence(), clipId)->generator; };
+        state()->setSelection({clipId});
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QTRY_VERIFY(inspector->findChild<QPushButton*>("styleSelectedText"));
+        auto* text = inspector->findChild<QPlainTextEdit*>("string_text");
+        QVERIFY(text);
+        QTextCursor cur = text->textCursor();
+        cur.setPosition(6);
+        cur.setPosition(11, QTextCursor::KeepAnchor);
+        text->setTextCursor(cur);
+        whenModal<QDialog>(this, [](QDialog* d) {
+            for (QCheckBox* box : d->findChildren<QCheckBox*>())
+                if (box->text() == "Font") box->setChecked(true);
+            d->findChildren<QDoubleSpinBox*>().at(0)->setValue(150);  // its size
+            d->accept();
+        });
+        inspector->findChild<QPushButton*>("styleSelectedText")->click();
+        std::vector<TextRun> runs = parseTextRuns(generator().s("runs"));
+        QCOMPARE(int(runs.size()), 1);
+        QCOMPARE(runs[0].from, 6);
+        QCOMPARE(runs[0].len, 5);
+        QCOMPARE(runs[0].size, 150.0);
+        QVERIFY(!runs[0].font.empty());
+        QVERIFY(titleIsStyled(generator(), 0));
+        // Typed in before it: the style moves with "world".
+        text = inspector->findChild<QPlainTextEdit*>("string_text");
+        cur = text->textCursor();
+        cur.setPosition(0);
+        cur.insertText("Oh, ");
+        QCOMPARE(generator().s("text"), std::string("Oh, Hello world"));
+        QCOMPARE(parseTextRuns(generator().s("runs")).at(0).from, 10);
+        // A text animation, with its own section, removed with its ✕.
+        inspector->findChild<QPushButton*>("addTextAnimation")->click();
+        QCOMPARE(textAnimators(generator()), std::vector<int>{1});
+        QCOMPARE(generator().p("ta1.scale", 0), 100.0);
+        QTRY_VERIFY([&] {
+            for (QToolButton* b : inspector->findChildren<QToolButton*>())
+                if (b->toolTip() == "Remove Text Animation") return true;
+            return false;
+        }());
+        for (QToolButton* b : inspector->findChildren<QToolButton*>())
+            if (b->toolTip() == "Remove Text Animation") {
+                b->click();
+                break;
+            }
+        QVERIFY(textAnimators(generator()).empty());
+        // Clear Styles takes the runs off; undo puts them back.
+        QTRY_VERIFY(inspector->findChild<QPushButton*>("clearTextStyles"));
+        inspector->findChild<QPushButton*>("clearTextStyles")->click();
+        QVERIFY(generator().s("runs").empty());
+        state()->undo();
+        QVERIFY(!generator().s("runs").empty());
     }
 
     void spellCheckInCaptionsAndTitles() {

@@ -226,6 +226,7 @@
 #include "core/Xlsx.h"
 #include "core/FilmCount.h"
 #include "render/Compositor.h"
+#include "render/Titles.h"
 #include "render/Exporter.h"
 #include "render/RenderFarm.h"
 #include "core/ColorGroups.h"
@@ -12831,6 +12832,44 @@ private slots:
         QCOMPARE(snow->generator.p("rate", 0), 300.0);
         QCOMPARE(snow->generator.p("color.b", 0), 0.5);
         QCOMPARE(snow->generator.p("emitter", 0), 1.0);  // (the preset's line)
+
+        // A styled title: a red, larger word, set on a circle, its letters swept in; bad runs and paths are refused.
+        r = call("montage_add_title",
+                 {{"project", project}, {"text", "Hello world"}, {"at", 0}, {"duration", 2},
+                  {"runs", QJsonArray{QJsonObject{{"from", 6}, {"len", 5}, {"color", QJsonArray{1, 0, 0}}, {"size", 140}, {"axes", QJsonObject{{"wght", 700}}}}}},
+                  {"path", QJsonObject{{"shape", "circle"}, {"radius", 250}, {"reverse", true}}},
+                  {"animations", QJsonArray{QJsonObject{{"by", "words"}, {"shape", "ramp_up"}, {"sweep", "in_across"}, {"sweep_seconds", 0.5},
+                                                        {"opacity", 0}, {"y", -40}, {"fill", QJsonArray{0, 0, 1}}, {"fill_amount", 100}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(call("montage_add_title", {{"project", project}, {"text", "x"}, {"at", 0}, {"runs", QJsonArray{QJsonObject{{"len", 1}}}}}).value("isError").toBool());
+        QVERIFY(call("montage_add_title", {{"project", project}, {"text", "x"}, {"at", 0}, {"path", QJsonObject{{"shape", "custom"}}}}).value("isError").toBool());
+        QVERIFY(call("montage_add_title", {{"project", project}, {"text", "x"}, {"at", 0}, {"animations", QJsonArray{QJsonObject{{"shape", "zigzag"}}}}})
+                    .value("isError").toBool());
+        QVERIFY(call("montage_add_title", {{"project", project}, {"text", "x"}, {"at", 0}, {"template", "3d"}, {"path", QJsonObject{{"shape", "wave"}}}})
+                    .value("isError").toBool());
+        Project withTitle;
+        QVERIFY(loadProject(project.toStdString(), withTitle));
+        const Clip* styled = nullptr;
+        for (const Track& tr : withTitle.active()->videoTracks)
+            for (const Clip& c : tr.clips)
+                if (c.generator.type == "title" && c.generator.s("text") == "Hello world") styled = &c;
+        QVERIFY(styled);
+        const std::vector<TextRun> runs = parseTextRuns(styled->generator.s("runs"));
+        QCOMPARE(int(runs.size()), 1);
+        QCOMPARE(runs[0].from, 6);
+        QCOMPARE(runs[0].size, 140.0);
+        QCOMPARE(runs[0].axes.at("wght"), 700.0);
+        QCOMPARE(styled->generator.p("path_shape", 0), 1.0);
+        QCOMPARE(styled->generator.p("path_reverse", 0), 1.0);
+        QCOMPARE(textAnimators(styled->generator), std::vector<int>{1});
+        QCOMPARE(styled->generator.p("ta1.by", 0), 2.0);
+        QCOMPARE(styled->generator.p("ta1.sweep", 0), 1.0);
+        QCOMPARE(styled->generator.p("ta1.fill.b", 0), 1.0);
+        QCOMPARE(styled->generator.p("ta1.scale", 0), 100.0);  // the rest at their defaults
+        const Image drawn = renderGenerator(styled->generator, 20, 640, 360, 0.5, 60, 30);
+        double ink = 0;
+        for (float v : drawn.px) ink += v;
+        QVERIFY(ink > 100);
     }
 
     void bleepInTheMix() {

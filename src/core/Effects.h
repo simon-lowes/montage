@@ -107,6 +107,12 @@ std::vector<const EffectInfo*> effectsInCategory(EffectCategory c);
 // (keys "param.<id>", described by strings "meta.<id>").
 std::vector<ParamInfo> effectParams(const Effect& e);
 std::string pluginParamMeta(const ParamInfo& p);
+// A title's text animations (render/Titles.h): the k of each "ta<k>.by" param it has, in order, and the params an
+// animation has, named "ta<k>.<name>" (effectParams lists them after the title's own).
+std::vector<int> textAnimators(const Effect& e);
+std::vector<ParamInfo> textAnimatorParams(int k);
+// Adds text animation k to a title with its params at their defaults (a new k past the last when 0); returns k.
+int addTextAnimator(Effect& e, int k = 0);
 
 // The mask every video filter can have (params "mask.*", absent = no mask):
 // an ellipse or rectangle in the clip's source frame (centre and size as

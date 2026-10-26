@@ -45,6 +45,7 @@
 #include "render/HdrView.h"
 #include "render/Compositor.h"
 #include "render/Particles.h"
+#include "render/Titles.h"
 #include "core/Expression.h"
 #include "render/GpuCompositor.h"
 #include "render/Dcp.h"
@@ -77,6 +78,10 @@
 #include <functional>
 #include <mutex>
 #include <QPainter>
+#include <QFontDatabase>
+#include <QGlyphRun>
+#include <QRawFont>
+#include <QTextLayout>
 #include <QElapsedTimer>
 #include <QRandomGenerator>
 #include "core/ScriptCut.h"
@@ -9137,6 +9142,386 @@ colorspaces:
             Effect t = makeEffect(p, id);
             QVERIFY2(ink(renderGenerator(t, 60, 640, 360, 1.0, 90, 30), 0, 640) > 50, id);
         }
+    }
+
+    void styledTitleRuns() {
+        // A run that only restates the title's own style leaves it plain; one that colours a word colours it alone.
+        Project p;
+        Effect t = makeEffect(p, "title");
+        t.strings["text"] = "HELLO WORLD";
+        t.strings["font"] = "DejaVu Sans";
+        t.params["size"] = 40.0;
+        t.params["shadow"] = 0.0;
+        auto render = [&](const Effect& e, FrameTime f = 10) { return renderGenerator(e, f, 320, 180, 1.0, 90, 30); };
+        const Image plain = render(t);
+        Effect same = t;
+        TextRun r;
+        r.from = 0, r.len = 11, r.font = "DejaVu Sans", r.size = 40, r.bold = 1, r.color = std::array<double, 3>{1, 1, 1};
+        same.strings["runs"] = textRunsJson({r});
+        QVERIFY(!titleIsStyled(same, 10));
+        QVERIFY(render(same).px == plain.px);
+        // JSON both ways.
+        TextRun full;
+        full.from = 2, full.len = 3, full.font = "DejaVu Serif", full.size = 50, full.bold = 0, full.italic = 1;
+        full.color = std::array<double, 3>{1, 0, 0}, full.outline = 2, full.outlineColor = std::array<double, 3>{0, 0, 1};
+        full.tracking = 4, full.baseline = -6, full.axes = {{"wght", 650}};
+        QCOMPARE(parseTextRuns(textRunsJson({full, r})), (std::vector<TextRun>{full, r}));
+        QVERIFY(parseTextRuns("not json").empty());
+        QVERIFY(addTextRun({}, TextRun{}).empty());  // a run that sets nothing is dropped
+        // "WORLD" in red: red ink only on the right, white only on the left, the letters where the plain title has them.
+        Effect red = t;
+        TextRun w;
+        w.from = 6, w.len = 5, w.color = std::array<double, 3>{1, 0, 0};
+        red.strings["runs"] = textRunsJson({w});
+        QVERIFY(titleIsStyled(red, 10));
+        const Image styled = render(red);
+        const double split = titleGlyphs(red, 10, 320, 180, 1.0, 90, 30)[6].path.boundingRect().left();  // where W starts
+        double redLeft = 0, redRight = 0, whiteRight = 0, inkPlain = 0, inkStyled = 0;
+        for (int y = 0; y < 180; ++y)
+            for (int x = 0; x < 320; ++x) {
+                const float* px = styled.at(x, y);
+                const bool isRed = px[3] > 0.5f && px[0] > 0.9f * px[3] && px[1] < 0.1f * px[3];
+                const bool isWhite = px[3] > 0.5f && px[1] > 0.9f * px[3];
+                (x < split - 1 ? redLeft : redRight) += isRed;
+                if (x > split + 1) whiteRight += isWhite;
+                inkPlain += plain.at(x, y)[3], inkStyled += px[3];
+            }
+        QVERIFY2(redRight > 100 && redLeft == 0 && whiteRight == 0, qPrintable(QString("%1 %2 %3").arg(redRight).arg(redLeft).arg(whiteRight)));
+        QVERIFY2(std::abs(inkStyled - inkPlain) < 0.02 * inkPlain, qPrintable(QString("%1 %2").arg(inkStyled).arg(inkPlain)));
+        // A bigger run makes its letters taller than the rest.
+        Effect big = t;
+        TextRun b;
+        b.from = 0, b.len = 5, b.size = 80;
+        big.strings["runs"] = textRunsJson({b});
+        const std::vector<TitleGlyph> gl = titleGlyphs(big, 10, 320, 180, 1.0, 90, 30);
+        QCOMPARE(int(gl.size()), 11);
+        QVERIFY(gl[0].path.boundingRect().height() > 1.8 * gl[6].path.boundingRect().height());
+        QCOMPARE(gl[0].baselineMid.y(), gl[6].baselineMid.y());  // one baseline
+        // Baseline shift raises a run.
+        Effect up = t;
+        TextRun u;
+        u.from = 6, u.len = 5, u.baseline = 10;
+        up.strings["runs"] = textRunsJson({u});
+        const std::vector<TitleGlyph> ug = titleGlyphs(up, 10, 320, 180, 1.0, 90, 30);
+        QCOMPARE(ug[6].path.boundingRect().bottom(), ug[0].path.boundingRect().bottom() - 10);
+    }
+
+    void styledTitleGlyphPositions() {
+        // Every glyph sits where QTextLayout puts it, for Latin, Arabic (joined, right to left) and CJK text.
+        Project p;
+        for (const auto& [family, text] : std::vector<std::pair<QString, QString>>{
+                 {"DejaVu Sans", "Waffle AVATAR fiord"},
+                 {"DejaVu Sans", QString::fromUtf8("مرحبا بالعالم")},
+                 {"WenQuanYi Zen Hei", QString::fromUtf8("你好，世界 日本語")}}) {
+            Effect t = makeEffect(p, "title");
+            t.strings["text"] = text.toStdString();
+            t.strings["font"] = family.toStdString();
+            t.params["size"] = 48.0;
+            TextRun r;
+            r.from = 2, r.len = 3, r.color = std::array<double, 3>{0, 1, 0};  // styled, laid out as the title is
+            t.strings["runs"] = textRunsJson({r});
+            const std::vector<TitleGlyph> gl = titleGlyphs(t, 0, 1280, 720, 1.0, 30, 30);
+            QVERIFY(!gl.empty());
+            QFont f(family);
+            f.setPixelSize(48);
+            f.setBold(true);
+            f.setLetterSpacing(QFont::AbsoluteSpacing, 0);
+            f.setHintingPreference(QFont::PreferNoHinting);
+            QTextLayout layout(text, f);
+            QTextOption opt;
+            opt.setWrapMode(QTextOption::NoWrap);
+            opt.setAlignment(Qt::AlignLeft | Qt::AlignAbsolute);
+            layout.setTextOption(opt);
+            layout.beginLayout();
+            QTextLine line = layout.createLine();
+            line.setLeadingIncluded(false);
+            line.setLineWidth(1e7);
+            layout.endLayout();
+            std::vector<std::pair<quint32, QPointF>> want, got;
+            for (const QGlyphRun& run : layout.glyphRuns())
+                for (int k = 0; k < run.glyphIndexes().size(); ++k) want.emplace_back(run.glyphIndexes()[k], run.positions()[k]);
+            for (const TitleGlyph& g : gl)
+                for (const auto& gp : g.glyphs) got.push_back(gp);
+            auto near = [](const std::pair<quint32, QPointF>& a, const std::pair<quint32, QPointF>& b) {
+                return a.first == b.first && std::abs(a.second.x() - b.second.x()) <= 0.01 && std::abs(a.second.y() - b.second.y()) <= 0.01;
+            };
+            for (const auto& w : want)
+                QVERIFY2(std::any_of(got.begin(), got.end(), [&](const auto& g) { return near(g, w); }),
+                         qPrintable(QString("%1: glyph %2 at %3").arg(family).arg(w.first).arg(w.second.x())));
+            for (const auto& g : got)
+                QVERIFY2(std::any_of(want.begin(), want.end(), [&](const auto& w) { return near(g, w); }), qPrintable(family));
+            QCOMPARE(got.size(), want.size());  // a ligature's glyph drawn once, not once per letter it covers
+            // Drawn where they were laid out: the line centred in the frame (one line: its baseline at the centre less
+            // half its height plus its ascent).
+            const double left = 640 - line.naturalTextWidth() / 2;
+            for (const TitleGlyph& g : gl) {
+                if (g.glyphs.empty() || g.path.isEmpty()) continue;
+                const double x = g.glyphs[0].second.x() + left;
+                QVERIFY2(g.path.boundingRect().right() >= x - 1 && g.path.boundingRect().left() <= x + 48,
+                         qPrintable(QString("%1: %2 not near %3").arg(family).arg(g.path.boundingRect().left()).arg(x)));
+            }
+        }
+    }
+
+    void textAnimatorSelectors() {
+        // Ten letters, a ramp up over the whole text moving them down 100 px at 50 %: letter k by 50 (k + 0.5) / 10.
+        Project p;
+        Effect t = makeEffect(p, "title");
+        t.strings["text"] = "ABCDEFGHIJ";
+        t.strings["font"] = "DejaVu Sans";
+        t.params["size"] = 40.0;
+        for (const ParamInfo& pi : textAnimatorParams(1))
+            if (pi.kind == ParamKind::Color) {
+                t.params[pi.name + ".r"] = pi.def, t.params[pi.name + ".g"] = pi.defG, t.params[pi.name + ".b"] = pi.defB;
+            } else {
+                t.params[pi.name] = pi.def;
+            }
+        QCOMPARE(textAnimators(t), std::vector<int>{1});
+        Effect still = t;
+        still.params["ta1.amount"] = 0.0;
+        t.params["ta1.shape"] = 1.0;
+        t.params["ta1.y"] = 100.0;
+        t.params["ta1.amount"] = 50.0;
+        const std::vector<TitleGlyph> a = titleGlyphs(still, 0, 640, 360, 1.0, 30, 30), b = titleGlyphs(t, 0, 640, 360, 1.0, 30, 30);
+        QCOMPARE(int(a.size()), 10);
+        QCOMPARE(int(b.size()), 10);
+        for (int k = 0; k < 10; ++k) {
+            const double moved = b[size_t(k)].path.boundingRect().top() - a[size_t(k)].path.boundingRect().top();
+            QVERIFY2(std::abs(moved - 50.0 * (k + 0.5) / 10) < 1e-6, qPrintable(QString("letter %1 moved %2").arg(k).arg(moved)));
+            QCOMPARE(b[size_t(k)].path.boundingRect().left(), a[size_t(k)].path.boundingRect().left());
+        }
+        // Shapes, unit by unit (10 units).
+        auto sel = [&](double shape, double start, double end, double offset, int i) {
+            Effect e = t;
+            e.params["ta1.shape"] = shape, e.params["ta1.start"] = start, e.params["ta1.end"] = end, e.params["ta1.offset"] = offset;
+            e.params["ta1.amount"] = 100.0;
+            return textSelection(e, 1, 0, 30, 30, i, 10);
+        };
+        QCOMPARE(sel(0, 0, 25, 0, 1), 1.0);   // square: wholly inside
+        QCOMPARE(sel(0, 0, 25, 0, 2), 0.5);   // half covered
+        QCOMPARE(sel(0, 0, 25, 0, 3), 0.0);
+        QCOMPARE(sel(0, 0, 25, 50, 7), 0.5);  // moved by the offset
+        QCOMPARE(sel(2, 0, 100, 0, 9), 0.05); // ramp down
+        QCOMPARE(sel(3, 0, 100, 0, 2), 0.5);  // triangle: x = 0.25
+        QVERIFY(std::abs(sel(4, 0, 100, 0, 2) - std::sqrt(0.75)) < 1e-12);  // round
+        QVERIFY(std::abs(sel(5, 0, 100, 0, 2) - 0.5) < 1e-12);  // smooth: 0.5 - 0.5 cos(pi / 2)
+        // Ease, random spread (seeded, the same each time) and a sweep across at the start.
+        Effect e = t;
+        e.params["ta1.amount"] = 100.0;
+        e.params["ta1.ease"] = 100.0;
+        QVERIFY(std::abs(textSelection(e, 1, 0, 30, 30, 2, 10) - 0.15625) < 1e-12);  // smoothstep(0.25)
+        e.params["ta1.ease"] = 0.0;
+        e.params["ta1.random"] = 100.0;
+        e.params["ta1.seed"] = 7.0;
+        const double r1 = textSelection(e, 1, 0, 30, 30, 4, 10);
+        QCOMPARE(textSelection(e, 1, 0, 30, 30, 4, 10), r1);
+        QVERIFY(r1 >= 0 && r1 <= 0.45);
+        e.params["ta1.random"] = 0.0;
+        e.params["ta1.sweep"] = 1.0;  // in across over a second: everything selected at the start, nothing after
+        e.params["ta1.sweep_dur"] = 1.0;
+        QCOMPARE(textSelection(e, 1, 0, 30, 90, 0, 10), 1.0);
+        QCOMPARE(textSelection(e, 1, 30, 30, 90, 9, 10), 0.0);
+        const double mid = textSelection(e, 1, 15, 30, 90, 5, 10);
+        QVERIFY(mid > 0 && mid < 1);
+        e.params["ta1.sweep"] = 3.0;  // in together: the ramp's own amount (0.55 at x = 0.55), let go of over the second
+        QVERIFY(std::abs(textSelection(e, 1, 0, 30, 90, 5, 10) - 0.55) < 1e-12);
+        QCOMPARE(textSelection(e, 1, 45, 30, 90, 5, 10), 0.0);
+        // Random order: a permutation, the same for the same seed.
+        e.params["ta1.sweep"] = 0.0;
+        e.params["ta1.shape"] = 0.0;
+        e.params["ta1.end"] = 10.0;  // the first unit's slot only
+        e.params["ta1.shuffle"] = 1.0;
+        int selected = 0;
+        for (int i = 0; i < 10; ++i) selected += textSelection(e, 1, 0, 30, 30, i, 10) > 0.5;
+        QCOMPARE(selected, 1);
+        // Rotation, scale, opacity, blur and fill land on the glyphs.
+        Effect fx = still;
+        fx.params["ta1.amount"] = 100.0;
+        fx.params["ta1.opacity"] = 40.0;
+        fx.params["ta1.blur"] = 3.0;
+        fx.params["ta1.fill_mix"] = 100.0;
+        fx.params["ta1.fill.r"] = 1.0, fx.params["ta1.fill.g"] = 0.0, fx.params["ta1.fill.b"] = 0.0;
+        fx.params["ta1.scale"] = 200.0;
+        const std::vector<TitleGlyph> c = titleGlyphs(fx, 0, 640, 360, 1.0, 30, 30);
+        QCOMPARE(c[3].opacity, 0.4);
+        QCOMPARE(c[3].blur, 3.0);
+        QCOMPARE(c[3].fill, QColor::fromRgbF(1, 0, 0));
+        QVERIFY(std::abs(c[3].path.boundingRect().width() - 2 * a[3].path.boundingRect().width()) < 1e-6);
+        const Image blurred = renderGenerator(fx, 0, 640, 360, 1.0, 30, 30);
+        double ink = 0;
+        for (float v : blurred.px) ink += v;
+        QVERIFY(ink > 100);
+        // Tracking spreads the letters from the middle (centred), keeping the line centred.
+        Effect wide = still;
+        wide.params["ta1.amount"] = 100.0;
+        wide.params["ta1.tracking"] = 10.0;
+        const std::vector<TitleGlyph> d = titleGlyphs(wide, 0, 640, 360, 1.0, 30, 30);
+        QVERIFY(std::abs((d[1].baselineMid.x() - d[0].baselineMid.x()) - (a[1].baselineMid.x() - a[0].baselineMid.x()) - 10) < 1e-6);
+        QVERIFY(std::abs((d[0].baselineMid.x() + d[9].baselineMid.x()) - (a[0].baselineMid.x() + a[9].baselineMid.x()) + 10) < 1e-6);
+    }
+
+    void textOnAPath() {
+        // On a circle of radius 200: every glyph's baseline middle within half a pixel of it, turned to face out.
+        Project p;
+        Effect t = makeEffect(p, "title");
+        t.strings["text"] = "AROUND THE WORLD AND BACK AGAIN";
+        t.strings["font"] = "DejaVu Sans";
+        t.params["size"] = 36.0;
+        t.params["path_shape"] = 1.0;
+        t.params["path_radius"] = 200.0;
+        const QPointF c(400, 300);
+        const std::vector<TitleGlyph> gl = titleGlyphs(t, 0, 800, 600, 1.0, 30, 30);
+        QCOMPARE(int(gl.size()), 31);
+        double minAngle = 1e9, maxAngle = -1e9;
+        for (const TitleGlyph& g : gl) {
+            const double r = QLineF(c, g.baselineMid).length();
+            QVERIFY2(std::abs(r - 200) < 0.5, qPrintable(QString("radius %1").arg(r)));
+            if (!g.path.isEmpty()) QVERIFY(QLineF(c, g.path.boundingRect().center()).length() > 200);  // outside the circle
+            const double ang = std::atan2(g.baselineMid.y() - c.y(), g.baselineMid.x() - c.x());
+            minAngle = std::min(minAngle, ang), maxAngle = std::max(maxAngle, ang);
+        }
+        // Centred at the top, reading clockwise.
+        QVERIFY(gl.front().baselineMid.x() < c.x() && gl.back().baselineMid.x() > c.x());
+        QVERIFY(std::any_of(gl.begin(), gl.end(), [&](const TitleGlyph& g) { return std::abs(g.baselineMid.x() - c.x()) < 15 && g.baselineMid.y() < c.y(); }));
+        // Flipped: inside the circle.
+        t.params["path_reverse"] = 1.0;
+        for (const TitleGlyph& g : titleGlyphs(t, 0, 800, 600, 1.0, 30, 30)) {
+            QVERIFY(std::abs(QLineF(c, g.baselineMid).length() - 200) < 0.5);
+            if (!g.path.isEmpty()) QVERIFY(QLineF(c, g.path.boundingRect().center()).length() < 200);
+        }
+        // A straight path through the middle (SVG path data) sets the text as the plain layout does.
+        Effect line = t;
+        line.params["path_reverse"] = 0.0;
+        line.params["path_shape"] = 3.0;
+        line.strings["path_data"] = "M -350 0 L 350 0";
+        Effect flat = t;
+        flat.params["path_shape"] = 0.0;
+        TextRun r;
+        r.from = 0, r.len = 1, r.color = std::array<double, 3>{0.5, 0.5, 0.5};
+        flat.strings["runs"] = textRunsJson({r});
+        const std::vector<TitleGlyph> on = titleGlyphs(line, 0, 800, 600, 1.0, 30, 30), off = titleGlyphs(flat, 0, 800, 600, 1.0, 30, 30);
+        QCOMPARE(on.size(), off.size());
+        for (size_t i = 0; i < on.size(); ++i) {
+            QVERIFY(std::abs(on[i].baselineMid.x() - off[i].baselineMid.x()) < 0.01);
+            QVERIFY(std::abs(on[i].baselineMid.y() - c.y()) < 0.01);
+        }
+        // Path data with a number after its close is read, not looped on.
+        Effect closed = line;
+        closed.strings["path_data"] = "M -350 0 L 350 0 Z 5 z1";
+        QCOMPARE(titleGlyphs(closed, 0, 800, 600, 1.0, 30, 30).size(), on.size());
+        // Kept upright on a wave: glyphs not turned (their boxes as tall as on the straight line).
+        Effect wave = t;
+        wave.params["path_shape"] = 2.0;
+        wave.params["path_upright"] = 1.0;
+        const std::vector<TitleGlyph> wv = titleGlyphs(wave, 0, 800, 600, 1.0, 30, 30);
+        QVERIFY(std::abs(wv[1].path.boundingRect().height() - on[1].path.boundingRect().height()) < 1e-6);
+        QVERIFY(std::abs(wv[1].baselineMid.y() - wv[8].baselineMid.y()) > 5);  // up and down the wave
+        QVERIFY(renderGenerator(t, 0, 800, 600, 1.0, 30, 30).px != renderGenerator(flat, 0, 800, 600, 1.0, 30, 30).px);
+    }
+
+    void variableFontAxes() {
+        // Oswald's weight axis: at 400 it draws as its default (Regular) instance does, heavier as it rises, and at 700
+        // as its Bold instance where the font database offers that.
+#if QT_VERSION < QT_VERSION_CHECK(6, 7, 0)
+        QSKIP("Variable font axes need Qt 6.7 or later (older builds take the weight axis as the font's weight)");
+#else
+        const int id = QFontDatabase::addApplicationFont(QString(MONTAGE_TEST_DATA_DIR) + "/fonts/Oswald-wght.ttf");
+        QVERIFY(id >= 0);
+        const QString family = QFontDatabase::applicationFontFamilies(id).value(0);
+        QVERIFY(!family.isEmpty());
+        Project p;
+        auto outline = [&](int bold, std::optional<double> wght) {
+            Effect t = makeEffect(p, "title");
+            t.strings["text"] = "Hamburg";
+            t.strings["font"] = family.toStdString();
+            t.params["size"] = 80.0;
+            t.params["bold"] = double(bold);
+            TextRun r;
+            r.from = 0, r.len = 7, r.color = std::array<double, 3>{1, 1, 0.99};
+            if (wght) r.axes["wght"] = *wght;
+            t.strings["runs"] = textRunsJson({r});
+            QPainterPath all;
+            for (const TitleGlyph& g : titleGlyphs(t, 0, 800, 400, 1.0, 30, 30)) all.addPath(g.path);
+            return all;
+        };
+        auto area = [](const QPainterPath& path) {
+            QImage img(800, 400, QImage::Format_Alpha8);
+            img.fill(0);
+            QPainter pa(&img);
+            pa.setRenderHint(QPainter::Antialiasing);
+            pa.fillPath(path, Qt::black);
+            pa.end();
+            double a = 0;
+            for (int y = 0; y < img.height(); ++y)
+                for (int x = 0; x < img.width(); ++x) a += img.constScanLine(y)[x] / 255.0;
+            return a;
+        };
+        auto same = [&](const QPainterPath& a, const QPainterPath& b) {
+            const QRectF ra = a.boundingRect(), rb = b.boundingRect();
+            return std::abs(area(a) - area(b)) < 0.002 * area(a) && std::abs(ra.width() - rb.width()) < 0.5 && std::abs(ra.height() - rb.height()) < 0.5;
+        };
+        const QPainterPath regular = outline(0, std::nullopt);
+        QVERIFY2(same(outline(0, 400.0), regular), qPrintable(QString("%1 %2").arg(area(outline(0, 400.0))).arg(area(regular))));
+        const double a550 = area(outline(0, 550.0)), a700 = area(outline(0, 700.0));
+        QVERIFY2(area(regular) * 1.1 < a550 && a550 * 1.05 < a700, qPrintable(QString("%1 %2 %3").arg(area(regular)).arg(a550).arg(a700)));
+        if (QFontDatabase::styles(family).contains(QStringLiteral("Bold")))
+            QVERIFY2(same(outline(0, 700.0), outline(1, std::nullopt)), qPrintable(QString("%1 %2").arg(a700).arg(area(outline(1, std::nullopt)))));
+        else
+            qInfo("The font database offers %s's styles %s only: its Bold instance not compared", qPrintable(family),
+                  qPrintable(QFontDatabase::styles(family).join(", ")));
+#endif
+    }
+
+    void styledTitleRendersAlike() {
+        // Frame 37 of an animated, styled title on a path: the same alone, after the frames before it, and on 1 or 8
+        // threads at once.
+        Project p;
+        Effect t = makeEffect(p, "title_blur_in");
+        t.strings["text"] = "Spin me round\nand round";
+        TextRun r;
+        r.from = 5, r.len = 2, r.size = 120, r.color = std::array<double, 3>{0.2, 0.6, 1};
+        t.strings["runs"] = textRunsJson({r});
+        t.params["path_shape"] = 2.0;
+        for (const ParamInfo& pi : textAnimatorParams(2))
+            if (pi.kind == ParamKind::Color) {
+                t.params[pi.name + ".r"] = pi.def, t.params[pi.name + ".g"] = pi.defG, t.params[pi.name + ".b"] = pi.defB;
+            } else {
+                t.params[pi.name] = pi.def;
+            }
+        t.params["ta2.random"] = 80.0;
+        t.params["ta2.seed"] = 3.0;
+        t.params["ta2.rotation"] = 45.0;
+        t.params["ta2.shape"] = 5.0;
+        t.params["ta2.sweep"] = 1.0;
+        t.params["ta2.sweep_dur"] = 2.0;
+        auto render = [&](FrameTime f) { return renderGenerator(t, f, 480, 270, 1.0, 120, 30); };
+        const Image alone = render(37);
+        double ink = 0;
+        for (float v : alone.px) ink += v;
+        QVERIFY(ink > 100);
+        Image last;
+        for (FrameTime f = 0; f <= 37; ++f) last = render(f);
+        QVERIFY(last.px == alone.px);
+        std::vector<Image> out(8);
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 8; ++i) threads.emplace_back([&, i] { out[size_t(i)] = render(37); });
+        for (std::thread& th : threads) th.join();
+        for (const Image& o : out) QVERIFY(o.px == alone.px);
+        // The 3D title takes the runs' fonts and sizes.
+        Effect t3 = makeEffect(p, "title3d");
+        t3.strings["text"] = "BIG small";
+        const QPainterPath none = styledTextOutline(t3, 0, 1, 120, 1.1);
+        QVERIFY(none.isEmpty());
+        TextRun big;
+        big.from = 0, big.len = 3, big.size = 240;
+        t3.strings["runs"] = textRunsJson({big});
+        const QPainterPath styled = styledTextOutline(t3, 0, 1, 120, 1.1);
+        QVERIFY(styled.boundingRect().height() > 150);
+        QVERIFY(renderGenerator(t3, 0, 320, 180, 1.0, 30, 30).px != [&] {
+            Effect plain = t3;
+            plain.strings.erase("runs");
+            return renderGenerator(plain, 0, 320, 180, 1.0, 30, 30).px;
+        }());
     }
 
     void gradeNodeGraphs() {

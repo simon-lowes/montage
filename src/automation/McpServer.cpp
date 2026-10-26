@@ -168,6 +168,7 @@
 #include "render/TrimPasses.h"
 #include "media/Segmenter.h"
 #include "render/Compositor.h"
+#include "render/Titles.h"
 #include "render/Exporter.h"
 #include "render/RenderFarm.h"
 #include "render/Shorts.h"
@@ -2161,11 +2162,36 @@ void McpServer::Impl::addTools() {
         "track above the top one in use). template picks a ready-made, animated design (a lower third takes two lines: "
         "name, newline, role; credits roll up the frame, a crawl runs along the bottom); the text replaces its sample text. "
         "motion makes any title roll or crawl, starting and ending off screen. The 3d template is extruded text turned in "
-        "space and lit (Final Cut's 3D titles), `depth` deep, spinning in with `spin_in`.",
+        "space and lit (Final Cut's 3D titles), `depth` deep, spinning in with `spin_in`. runs style stretches of the text "
+        "(from and len count UTF-16 characters, newlines included): font, size, bold, italic, color and outline_color as "
+        "[r, g, b] in 0..1, outline width, tracking, baseline shift (pixels up) and a variable font's axes ({\"wght\": 650}). "
+        "path sets the text along a circle (radius), a wave or SVG path data from the title's position. animations move "
+        "the text a letter, word or line at a time: a range (start, end and offset in % of the text; shape) selects "
+        "units, and what it changes there (x, y, scale %, rotation, opacity %, blur, tracking, fill and outline colour) "
+        "goes as far as it selects them; sweep runs the range across the text from the start (in_across) or to the end "
+        "(out_across), or takes the whole change away (in_together) or brings it on (out_together), over sweep_seconds.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"text":{"type":"string"},
             "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":3},
             "track":{"type":"string"},"size":{"type":"number","description":"Font size in pixels"},
-            "template":{"type":"string","enum":["plain","lower_third","lower_third_box","centred","chapter","callout","typewriter","cascade","pop_words","drop","wave","decode","end_card","credits","crawl","3d"],"default":"plain"},
+            "template":{"type":"string","enum":["plain","lower_third","lower_third_box","centred","chapter","callout","typewriter","cascade","pop_words","drop","wave","decode","blur_in","tracking_out","word_by_word","circle","end_card","credits","crawl","3d"],"default":"plain"},
+            "runs":{"type":"array","items":{"type":"object","properties":{"from":{"type":"integer"},"len":{"type":"integer"},
+                "font":{"type":"string"},"size":{"type":"number"},"bold":{"type":"boolean"},"italic":{"type":"boolean"},
+                "color":{"type":"array","items":{"type":"number"}},"outline":{"type":"number"},
+                "outline_color":{"type":"array","items":{"type":"number"}},"tracking":{"type":"number"},"baseline":{"type":"number"},
+                "axes":{"type":"object","additionalProperties":{"type":"number"}}},"required":["from","len"]}},
+            "path":{"type":"object","properties":{"shape":{"type":"string","enum":["circle","wave","custom"]},"radius":{"type":"number"},
+                "wavelength":{"type":"number"},"offset":{"type":"number","description":"% of the path's length"},
+                "upright":{"type":"boolean"},"reverse":{"type":"boolean","description":"run the other way (inside a circle)"},
+                "data":{"type":"string","description":"custom: SVG path data, pixels from the title's position"}},"required":["shape"]},
+            "animations":{"type":"array","items":{"type":"object","properties":{
+                "by":{"type":"string","enum":["letters","letters_not_spaces","words","lines"],"default":"letters"},
+                "shape":{"type":"string","enum":["square","ramp_up","ramp_down","triangle","round","smooth"],"default":"square"},
+                "start":{"type":"number"},"end":{"type":"number"},"offset":{"type":"number"},"ease":{"type":"number"},"amount":{"type":"number"},
+                "sweep":{"type":"string","enum":["none","in_across","out_across","in_together","out_together"]},"sweep_seconds":{"type":"number"},
+                "random":{"type":"number"},"random_order":{"type":"boolean"},"seed":{"type":"number"},
+                "x":{"type":"number"},"y":{"type":"number"},"scale":{"type":"number"},"rotation":{"type":"number"},"opacity":{"type":"number"},
+                "blur":{"type":"number"},"tracking":{"type":"number"},"fill":{"type":"array","items":{"type":"number"}},"fill_amount":{"type":"number"},
+                "outline_color":{"type":"array","items":{"type":"number"}},"outline_color_amount":{"type":"number"}}}},
             "depth":{"type":"number","description":"3d: how far the letters are extruded (pixels)"},
             "spin_in":{"type":"boolean","description":"3d: spin in at the start"},
             "text_animation":{"type":"string","enum":["none","rise","fade","pop","drop","wave","scramble"],"description":"The text coming on a letter, word or line at a time"},
@@ -2211,6 +2237,66 @@ void McpServer::Impl::addTools() {
                 c.generator.params["text_anim_by"] = Param(double(by));
                 if (a.value("animation_seconds").isDouble()) c.generator.params["text_anim_dur"] = Param(std::clamp(a.value("animation_seconds").toDouble(), 0.1, 10.0));
                 c.generator.params["text_anim_out"] = Param(a.value("animate_out").toBool() ? 1.0 : 0.0);
+            }
+            if (type == "title3d" && (a.contains("path") || a.contains("animations")))
+                throw ArgError{"path and animations are for flat titles"};
+            if (a.contains("runs")) {
+                if (!a.value("runs").isArray()) throw ArgError{"\"runs\" is a list of {from, len, ...}"};
+                const QJsonArray arr = a.value("runs").toArray();
+                const std::string json = QJsonDocument(arr).toJson(QJsonDocument::Compact).toStdString();
+                const std::vector<TextRun> runs = parseTextRuns(json);
+                if (runs.size() != size_t(arr.size())) throw ArgError{"Each run needs from (0 or more) and len (1 or more)"};
+                c.generator.strings["runs"] = textRunsJson(runs);
+            }
+            if (a.contains("path")) {
+                const QJsonObject pa = a.value("path").toObject();
+                const QStringList shapes{"none", "circle", "wave", "custom"};
+                const int sh = int(shapes.indexOf(pa.value("shape").toString()));
+                if (sh <= 0) throw ArgError{"\"path\" shape is circle, wave or custom"};
+                if (sh == 3 && pa.value("data").toString().trimmed().isEmpty()) throw ArgError{"A custom path needs its SVG path data (data)"};
+                c.generator.params["path_shape"] = Param(double(sh));
+                for (const auto& [key, param] : std::vector<std::pair<const char*, const char*>>{
+                         {"radius", "path_radius"}, {"wavelength", "path_wavelength"}, {"offset", "path_offset"}})
+                    if (pa.value(key).isDouble()) c.generator.params[param] = Param(pa.value(key).toDouble());
+                c.generator.params["path_upright"] = Param(pa.value("upright").toBool() ? 1.0 : 0.0);
+                c.generator.params["path_reverse"] = Param(pa.value("reverse").toBool() ? 1.0 : 0.0);
+                if (sh == 3) c.generator.strings["path_data"] = pa.value("data").toString().toStdString();
+            }
+            if (a.contains("animations")) {
+                if (!a.value("animations").isArray()) throw ArgError{"\"animations\" is a list"};
+                auto pick = [](const QJsonObject& o, const char* key, const QStringList& names, const char* what) {
+                    if (!o.contains(key)) return 0;
+                    const int i = int(names.indexOf(o.value(key).toString()));
+                    if (i < 0) throw ArgError{QStringLiteral("\"%1\" is %2").arg(key, what)};
+                    return i;
+                };
+                for (const QJsonValue& v : a.value("animations").toArray()) {
+                    const QJsonObject o = v.toObject();
+                    const int k = addTextAnimator(c.generator);
+                    const std::string pre = "ta" + std::to_string(k) + ".";
+                    auto set = [&](const char* name, double value) { c.generator.params[pre + name] = Param(value); };
+                    set("by", pick(o, "by", {"letters", "letters_not_spaces", "words", "lines"}, "letters, letters_not_spaces, words or lines"));
+                    set("shape", pick(o, "shape", {"square", "ramp_up", "ramp_down", "triangle", "round", "smooth"},
+                                      "square, ramp_up, ramp_down, triangle, round or smooth"));
+                    set("sweep", pick(o, "sweep", {"none", "in_across", "out_across", "in_together", "out_together"},
+                                      "none, in_across, out_across, in_together or out_together"));
+                    for (const auto& [key, name] : std::vector<std::pair<const char*, const char*>>{
+                             {"start", "start"}, {"end", "end"}, {"offset", "offset"}, {"ease", "ease"}, {"amount", "amount"},
+                             {"sweep_seconds", "sweep_dur"}, {"random", "random"}, {"seed", "seed"}, {"x", "x"}, {"y", "y"},
+                             {"scale", "scale"}, {"rotation", "rotation"}, {"opacity", "opacity"}, {"blur", "blur"},
+                             {"tracking", "tracking"}, {"fill_amount", "fill_mix"}, {"outline_color_amount", "outline_mix"}})
+                        if (o.contains(key)) {
+                            if (!o.value(key).isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(key)};
+                            set(name, o.value(key).toDouble());
+                        }
+                    if (o.value("random_order").toBool()) set("shuffle", 1);
+                    for (const auto& [key, name] : std::vector<std::pair<const char*, const char*>>{{"fill", "fill"}, {"outline_color", "outline_color"}})
+                        if (o.contains(key)) {
+                            const QJsonArray rgb = o.value(key).toArray();
+                            if (rgb.size() != 3) throw ArgError{QStringLiteral("\"%1\" is [r, g, b] in 0..1").arg(key)};
+                            for (int ch = 0; ch < 3; ++ch) set((std::string(name) + "." + "rgb"[ch]).c_str(), std::clamp(rgb[ch].toDouble(), 0.0, 1.0));
+                        }
+                }
             }
             if (a.contains("motion")) {
                 const QStringList kinds{"still", "roll", "crawl_left", "crawl_right"};

@@ -1118,9 +1118,18 @@ std::vector<EffectInfo> buildCatalog() {
                              boolean("start_off", "Start Off Screen", true),
                              boolean("end_off", "End Off Screen", true),
                              num("motion_ease", "Ease In and Out (s)", 0, 10, 0, 0.1),
+                             // Text set along a path: a circle about Position (radius), a wave through it (a quarter
+                             // of the radius high) or SVG path data from it, starting at Offset (% of its length).
+                             choice("path_shape", "Text on a Path", {"None", "Circle", "Wave", "Custom (SVG Path Data)"}, 0),
+                             num("path_radius", "Path Radius (px)", 4, 4000, 300, 1),
+                             num("path_wavelength", "Wavelength (px)", 4, 8000, 600, 1),
+                             pct("path_offset", "Path Offset", -200, 200, 0),
+                             boolean("path_upright", "Keep Letters Upright"),
+                             boolean("path_reverse", "Flip Path"),
                          },
                          {str("text", "Text", StringKind::MultilineText, "Title"),
-                          str("font", "Font", StringKind::Font, "Sans Serif")}};
+                          str("font", "Font", StringKind::Font, "Sans Serif"),
+                          str("path_data", "Path (SVG Data)", StringKind::Text)}};
         c.push_back(title);
         // Extruded 3D text (render/Title3D.h): turned in space, lit, seen through a perspective camera.
         EffectInfo title3d{"title3d", "3D Title", EffectCategory::Generator, "Titles",
@@ -1385,10 +1394,76 @@ void applyMeta(ParamInfo& p, const std::vector<std::string>& f) {
 
 }  // namespace
 
+std::vector<int> textAnimators(const Effect& e) {
+    std::vector<int> out;
+    for (const auto& [key, param] : e.params) {
+        if (key.size() < 6 || key.compare(0, 2, "ta") != 0 || key.compare(key.size() - 3, 3, ".by") != 0) continue;
+        const std::string n = key.substr(2, key.size() - 5);
+        if (n.empty() || n.size() > 4 || !std::all_of(n.begin(), n.end(), [](char c) { return c >= '0' && c <= '9'; })) continue;
+        out.push_back(std::stoi(n));
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+std::vector<ParamInfo> textAnimatorParams(int k) {
+    const std::string pre = "ta" + std::to_string(k) + ".";
+    ParamInfo rotation = angle(pre + "rotation", "Rotation");
+    rotation.min = -720, rotation.max = 720;
+    return {
+        choice(pre + "by", "Animate", {"Letters", "Letters (Not Spaces)", "Words", "Lines"}),
+        choice(pre + "shape", "Shape", {"Square", "Ramp Up", "Ramp Down", "Triangle", "Round", "Smooth"}),
+        pct(pre + "start", "Start", 0, 100, 0),
+        pct(pre + "end", "End", 0, 100, 100),
+        pct(pre + "offset", "Offset", -200, 200, 0),
+        pct(pre + "ease", "Ease", 0, 100, 0),
+        pct(pre + "amount", "Amount", -100, 100, 100),
+        // The range swept through the text over a time from the clip's start (In) or to its end (Out, the In played
+        // backwards), or the whole selection let go of or taken up together: an animation without keyframes.
+        choice(pre + "sweep", "Sweep", {"None (Offset Only)", "In Across", "Out Across", "In Together", "Out Together"}),
+        num(pre + "sweep_dur", "Sweep Duration (s)", 0.05, 10, 1.0, 0.05),
+        pct(pre + "random", "Randomness", 0, 100, 0),
+        boolean(pre + "shuffle", "Random Order"),
+        num(pre + "seed", "Random Seed", 0, 10000, 0, 1),
+        num(pre + "x", "Position X", -4000, 4000, 0, 1),
+        num(pre + "y", "Position Y", -4000, 4000, 0, 1),
+        pct(pre + "scale", "Scale", 0, 1000, 100),
+        rotation,
+        pct(pre + "opacity", "Opacity", 0, 100, 100),
+        num(pre + "blur", "Blur (px)", 0, 200, 0, 0.5),
+        num(pre + "tracking", "Tracking", -200, 500, 0, 0.5),
+        color(pre + "fill", "Fill", 1, 1, 1),
+        pct(pre + "fill_mix", "Fill Amount", 0, 100, 0),
+        color(pre + "outline_color", "Outline Color", 0, 0, 0),
+        pct(pre + "outline_mix", "Outline Color Amount", 0, 100, 0),
+    };
+}
+
+int addTextAnimator(Effect& e, int k) {
+    if (k <= 0) {
+        const std::vector<int> have = textAnimators(e);
+        k = have.empty() ? 1 : have.back() + 1;
+    }
+    for (const ParamInfo& pi : textAnimatorParams(k)) {
+        if (pi.kind == ParamKind::Color) {
+            e.params.try_emplace(pi.name + ".r", Param(pi.def));
+            e.params.try_emplace(pi.name + ".g", Param(pi.defG));
+            e.params.try_emplace(pi.name + ".b", Param(pi.defB));
+        } else {
+            e.params.try_emplace(pi.name, Param(pi.def));
+        }
+    }
+    return k;
+}
+
 std::vector<ParamInfo> effectParams(const Effect& e) {
     if (e.type != "plugin" && e.type != "ofx") {
         const EffectInfo* info = findEffectInfo(e.type);
-        return info ? info->params : std::vector<ParamInfo>{};
+        std::vector<ParamInfo> out = info ? info->params : std::vector<ParamInfo>{};
+        if (e.type == "title")
+            for (int k : textAnimators(e))
+                for (ParamInfo& pi : textAnimatorParams(k)) out.push_back(std::move(pi));
+        return out;
     }
     std::vector<ParamInfo> out;
     for (const auto& [key, param] : e.params) {
@@ -1454,6 +1529,25 @@ const std::vector<TitleTemplate>& titleTemplates() {
         {"title_drop", "Drop In", {{"size", 120}, {"shadow", 6}, {"text_anim", 4}, {"text_anim_dur", 1.2}}, {{"text", "Drop In"}}},
         {"title_wave", "Wave", {{"size", 110}, {"shadow", 3}, {"text_anim", 5}}, {{"text", "Making waves"}}},
         {"title_decode", "Decode", {{"size", 96}, {"bold", 1}, {"text_anim", 6}, {"text_anim_dur", 1.2}}, {{"text", "ACCESS GRANTED"}, {"font", "Monospace"}}},
+        // Text animations (ta<k>.*, core/Effects.h textAnimatorParams): by 0 Letters, 1 Letters (Not Spaces), 2 Words,
+        // 3 Lines; shape 0 Square, 1 Ramp Up, 2 Ramp Down, 3 Triangle, 4 Round, 5 Smooth; sweep 0 None, 1 In Across,
+        // 2 Out Across, 3 In Together, 4 Out Together.
+        {"title_blur_in", "Blur In",
+         {{"size", 110}, {"shadow", 0}, {"ta1.by", 0}, {"ta1.shape", 1}, {"ta1.end", 40}, {"ta1.sweep", 1}, {"ta1.sweep_dur", 1.2},
+          {"ta1.blur", 18}, {"ta1.opacity", 0}, {"ta1.scale", 130}},
+         {{"text", "Blur In"}}},
+        {"title_tracking_out", "Tracking Out",
+         {{"size", 100}, {"shadow", 0}, {"anim_in", 1}, {"anim_in_dur", 0.5}, {"ta1.by", 0}, {"ta1.sweep", 4}, {"ta1.sweep_dur", 1.0},
+          {"ta1.tracking", 40}, {"ta1.opacity", 0}},
+         {{"text", "TRACKING OUT"}}},
+        {"title_word_by_word", "Word by Word",
+         {{"size", 90}, {"shadow", 3}, {"ta1.by", 2}, {"ta1.shape", 1}, {"ta1.end", 1}, {"ta1.sweep", 1}, {"ta1.sweep_dur", 1.5},
+          {"ta1.opacity", 0}, {"ta1.scale", 70}, {"ta1.y", 20}},
+         {{"text", "One word at a time"}}},
+        {"title_circle", "Text on a Circle",
+         {{"size", 56}, {"shadow", 2}, {"path_shape", 1}, {"path_radius", 220}, {"ta1.by", 0}, {"ta1.shape", 1}, {"ta1.end", 10},
+          {"ta1.sweep", 1}, {"ta1.sweep_dur", 1.5}, {"ta1.opacity", 0}, {"ta1.y", -30}},
+         {{"text", "ALL THE WAY AROUND"}}},
         {"title_end_card", "End Card",
          {{"size", 110}, {"sub_style", 1}, {"sub_scale", 50}, {"anim_in", 1}, {"anim_in_dur", 0.8}, {"anim_out", 1}, {"anim_out_dur", 0.8}},
          {{"text", "Thanks for watching\nSee you next time"}}},
@@ -1550,6 +1644,7 @@ Effect makeEffect(const std::string& type, Id id) {
         Effect e = makeEffect("title", id);
         for (const auto& [name, value] : tpl->params) e.params[name] = Param(value);
         for (const auto& [name, value] : tpl->strings) e.strings[name] = value;
+        for (int k : textAnimators(e)) addTextAnimator(e, k);  // the rest of a text animation's settings
         return e;
     }
     Effect e;

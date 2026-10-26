@@ -2,6 +2,7 @@
 // Pro's and Resolve's exchange format) and FCPXML 1.10 (Final Cut Pro X).
 #include <QDomDocument>
 #include <QFileInfo>
+#include <QLocale>
 #include <QUrl>
 #include <QXmlStreamWriter>
 #include <algorithm>
@@ -14,6 +15,7 @@
 
 #include "EditOps.h"
 #include "Effects.h"
+#include "render/Titles.h"
 #include "Interpretation.h"
 #include "History.h"
 #include "ImportBuilder.h"
@@ -874,19 +876,45 @@ struct FcpxWriter {
             }
         }
         if (c.isGenerator() && c.generator.type == "title") {
+            // The text in stretches of one style each (its styled runs, render/Titles.h), each with its style's def.
+            // (Spaces alone go with the stretch before them: a reader may drop a text-style holding only white space.)
+            std::vector<TitleStyleSpan> spans;
+            for (TitleStyleSpan& sp : titleStyleSpans(c.generator)) {
+                if (!spans.empty() && sp.text.trimmed().isEmpty()) spans.back().text += sp.text;
+                else if (!spans.empty() && spans.back().text.trimmed().isEmpty()) spans.back() = {spans.back().text + sp.text, sp.style};
+                else spans.push_back(std::move(sp));
+            }
+            std::vector<TextRun> defs;
             w.writeStartElement("text");
-            w.writeStartElement("text-style");
-            w.writeAttribute("ref", QString("ts%1").arg(c.id));
-            w.writeCharacters(q(c.generator.s("text")));
+            for (const TitleStyleSpan& sp : spans) {
+                size_t k = size_t(std::find(defs.begin(), defs.end(), sp.style) - defs.begin());
+                if (k == defs.size()) defs.push_back(sp.style);
+                w.writeStartElement("text-style");
+                w.writeAttribute("ref", k ? QString("ts%1_%2").arg(c.id).arg(k) : QString("ts%1").arg(c.id));
+                w.writeCharacters(sp.text);
+                w.writeEndElement();
+            }
             w.writeEndElement();
-            w.writeEndElement();
-            w.writeStartElement("text-style-def");
-            w.writeAttribute("id", QString("ts%1").arg(c.id));
-            w.writeEmptyElement("text-style");
-            w.writeAttribute("font", q(c.generator.s("font", "Helvetica")));
-            w.writeAttribute("fontSize", "63");
-            w.writeAttribute("fontColor", "1 1 1 1");
-            w.writeEndElement();
+            for (size_t k = 0; k < defs.size(); ++k) {
+                const TextRun& st = defs[k];
+                auto num = [](double v) { return QString::number(v, 'g', QLocale::FloatingPointShortest); };
+                auto rgba = [&](const std::array<double, 3>& v) { return QString("%1 %2 %3 1").arg(num(v[0]), num(v[1]), num(v[2])); };
+                w.writeStartElement("text-style-def");
+                w.writeAttribute("id", k ? QString("ts%1_%2").arg(c.id).arg(k) : QString("ts%1").arg(c.id));
+                w.writeEmptyElement("text-style");
+                w.writeAttribute("font", q(st.font));
+                w.writeAttribute("fontSize", num(st.size * 63.0 / 96.0));  // a title's 96 px as Final Cut's 63
+                w.writeAttribute("fontColor", rgba(st.color.value_or(std::array<double, 3>{1, 1, 1})));
+                w.writeAttribute("bold", st.bold > 0 ? "1" : "0");
+                w.writeAttribute("italic", st.italic > 0 ? "1" : "0");
+                if (st.outline > 0) {
+                    w.writeAttribute("strokeColor", rgba(st.outlineColor.value_or(std::array<double, 3>{0, 0, 0})));
+                    w.writeAttribute("strokeWidth", num(st.outline));
+                }
+                if (st.tracking && *st.tracking != 0) w.writeAttribute("kerning", num(*st.tracking));
+                if (st.baseline != 0) w.writeAttribute("baseline", num(st.baseline));
+                w.writeEndElement();
+            }
         }
         for (const Connected& k : connected) clip(*k.clip, k.lane, k.offset, false, {}, nullptr, false, k.scale);
         for (const Marker& m : markersIn(c.start, c.end()))
@@ -1374,10 +1402,48 @@ struct FcpxReader {
             }
         } else if (tag == "title" && vTrack >= 0) {
             if (Clip* c = b->addGenerator(vTrack, "title", s0, len, name)) {
-                QString words;
+                // Its text in stretches, each with the style its def gives (the most used one the title's own, the
+                // others styled runs).
+                std::map<QString, QDomElement> defs;
+                const QDomNodeList defList = e.elementsByTagName("text-style-def");
+                for (int i = 0; i < defList.size(); ++i) {
+                    const QDomElement d = defList.at(i).toElement();
+                    defs[d.attribute("id")] = d.firstChildElement("text-style");
+                }
+                std::vector<std::pair<QString, std::optional<TextRun>>> spans;
                 const QDomNodeList styles = e.firstChildElement("text").elementsByTagName("text-style");
-                for (int i = 0; i < styles.size(); ++i) words += styles.at(i).toElement().text();
-                c->generator.strings["text"] = words.toStdString();
+                for (int i = 0; i < styles.size(); ++i) {
+                    const QDomElement st = styles.at(i).toElement();
+                    std::optional<TextRun> style;
+                    if (auto it = defs.find(st.attribute("ref")); it != defs.end() && !it->second.isNull()) {
+                        const QDomElement d = it->second;
+                        TextRun r;
+                        auto rgb = [](const QString& v) -> std::optional<std::array<double, 3>> {
+                            const QStringList parts = v.simplified().split(' ');
+                            if (parts.size() < 3) return std::nullopt;
+                            return std::array<double, 3>{parts[0].toDouble(), parts[1].toDouble(), parts[2].toDouble()};
+                        };
+                        if (d.hasAttribute("font")) r.font = d.attribute("font").toStdString();
+                        if (d.hasAttribute("fontSize")) r.size = d.attribute("fontSize").toDouble() * 96.0 / 63.0;
+                        if (d.hasAttribute("fontColor")) r.color = rgb(d.attribute("fontColor"));
+                        const QString face = d.attribute("fontFace");
+                        if (d.hasAttribute("bold")) r.bold = d.attribute("bold").toInt() != 0;
+                        else if (!face.isEmpty()) r.bold = face.contains("Bold", Qt::CaseInsensitive);
+                        if (d.hasAttribute("italic")) r.italic = d.attribute("italic").toInt() != 0;
+                        else if (!face.isEmpty()) r.italic = face.contains("Italic", Qt::CaseInsensitive) || face.contains("Oblique", Qt::CaseInsensitive);
+                        if (d.hasAttribute("strokeWidth") && d.attribute("strokeWidth").toDouble() > 0) {
+                            r.outline = d.attribute("strokeWidth").toDouble();
+                            r.outlineColor = rgb(d.attribute("strokeColor", "0 0 0 1"));
+                        } else if (d.hasAttribute("bold") || d.hasAttribute("font")) {
+                            r.outline = 0;
+                        }
+                        if (d.hasAttribute("kerning")) r.tracking = d.attribute("kerning").toDouble();
+                        r.baseline = d.attribute("baseline").toDouble();
+                        style = r;
+                    }
+                    spans.emplace_back(st.text(), style);
+                }
+                applyTitleStyleSpans(c->generator, spans);
                 placed = c->id;
             }
         } else if (tag == "clip" || tag == "sync-clip") {

@@ -44,6 +44,7 @@
 #include "LensCorrectionDialog.h"
 #include "ModelPacks.h"
 #include "render/Expressions.h"
+#include "render/Titles.h"
 #include "media/DepthMap.h"
 #include "media/VideoDepth.h"
 #include "media/Exr.h"
@@ -161,6 +162,9 @@ QString InspectorWidget::signature() const {
     if (sceneReferredWorking(*s)) sig += QStringLiteral(":scene");  // (effects that work on display values are marked)
     // An OGraf graphic's fields: rebuild when another graphic is chosen.
     if (c->generator.type == "ograf") sig += "|G" + QString::fromStdString(c->generator.s("manifest"));
+    // A title's text animations: rebuild when one is added or removed.
+    if (c->generator.type == "title")
+        for (int k : textAnimators(c->generator)) sig += QString("|A%1").arg(k);
     // A graphic's fields: rebuild when one is published, removed or renamed.
     if (const Sequence* g = graphicOf(state_->project(), *c)) {
         sig += QString("|F%1").arg(g->id);
@@ -507,6 +511,7 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
             QFormLayout* g = addSection(QString::fromStdString(info->displayName));
             addParamRows(g, *info, target(clip.generator.id));
             if (clip.generator.type == "ograf") addOGrafFields(g, clip, target(clip.generator.id));
+            if (clip.generator.type == "title") addTitleTextTools(g, clip, target(clip.generator.id));
         }
     }
     // ---- Fixed attributes ----------------------------------------------------
@@ -2490,6 +2495,156 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
     refreshers_.push_back(refreshWidget);
 }
 
+void InspectorWidget::addTitleTextTools(QFormLayout* form, const Clip& clip, const Target& target) {
+    // Styling a stretch of the text: the selection in the Text box (all of it when nothing is selected).
+    auto* row = new QWidget(content_);
+    auto* h = new QHBoxLayout(row);
+    h->setContentsMargins(0, 0, 0, 0);
+    auto* style = new QPushButton(tr("Style Selected Text…"), row);
+    style->setObjectName(QStringLiteral("styleSelectedText"));
+    style->setToolTip(tr("Give the text selected in the Text box its own font, size, weight, colour, outline, tracking or baseline"));
+    auto* clear = new QPushButton(tr("Clear Styles"), row);
+    clear->setObjectName(QStringLiteral("clearTextStyles"));
+    h->addWidget(style);
+    h->addWidget(clear);
+    h->addStretch(1);
+    form->addRow(QString(), row);
+    auto current = [this, target]() -> Effect* {
+        const Sequence* s = state_->sequence();
+        return s ? target.resolve(const_cast<Sequence&>(*s)) : nullptr;
+    };
+    connect(clear, &QPushButton::clicked, this, [this, target] {
+        state_->edit(tr("Clear Text Styles"), [target](Project&, Sequence& s) {
+            Effect* e = target.resolve(s);
+            if (!e || e->s("runs").empty()) return false;
+            e->strings.erase("runs");
+            return true;
+        });
+    });
+    connect(style, &QPushButton::clicked, this, [this, target, current] {
+        const Effect* e = current();
+        if (!e) return;
+        const QString text = QString::fromStdString(e->s("text", "Title"));
+        int from = 0, to = int(text.size());
+        if (auto* edit = content_->findChild<QPlainTextEdit*>(QStringLiteral("string_text")); edit && edit->textCursor().hasSelection())
+            from = edit->textCursor().selectionStart(), to = edit->textCursor().selectionEnd();
+        if (to <= from) return;
+        QDialog dlg(this);
+        dlg.setWindowTitle(tr("Style Selected Text"));
+        auto* f = new QFormLayout(&dlg);
+        f->addRow(new QLabel(tr("“%1”").arg(text.mid(from, to - from).left(60)), &dlg));
+        auto* setFont = new QCheckBox(tr("Font"), &dlg);
+        auto* font = new QFontComboBox(&dlg);
+        font->setCurrentFont(QFont(QString::fromStdString(e->s("font", "Sans Serif"))));
+        f->addRow(setFont, font);
+        auto keepSpin = [&dlg](double lo, double hi, double step, const QString& suffix) {
+            auto* sp = new QDoubleSpinBox(&dlg);
+            sp->setRange(lo, hi);
+            sp->setSingleStep(step);
+            sp->setSpecialValueText(tr("Unchanged"));
+            sp->setValue(lo);
+            sp->setSuffix(suffix);
+            return sp;
+        };
+        auto* size = keepSpin(0, 1000, 1, tr(" px"));
+        f->addRow(tr("Size"), size);
+        auto* bold = new QCheckBox(tr("Bold"), &dlg);
+        bold->setTristate(true);
+        bold->setCheckState(Qt::PartiallyChecked);
+        auto* italic = new QCheckBox(tr("Italic"), &dlg);
+        italic->setTristate(true);
+        italic->setCheckState(Qt::PartiallyChecked);
+        auto* bi = new QWidget(&dlg);
+        auto* bih = new QHBoxLayout(bi);
+        bih->setContentsMargins(0, 0, 0, 0);
+        bih->addWidget(bold);
+        bih->addWidget(italic);
+        f->addRow(tr("Weight"), bi);
+        auto* weight = keepSpin(0, 1000, 50, QString());
+        weight->setToolTip(tr("A variable font's weight axis (100 thin to 900 black)"));
+        f->addRow(tr("Weight Axis"), weight);
+        std::optional<QColor> fill, outlineColor;
+        auto colourButton = [&dlg](std::optional<QColor>& c, const QString& title) {
+            auto* b = new QPushButton(tr("Unchanged"), &dlg);
+            QObject::connect(b, &QPushButton::clicked, &dlg, [b, &c, title, &dlg] {
+                const QColor picked = QColorDialog::getColor(c.value_or(Qt::white), &dlg, title);
+                if (!picked.isValid()) return;
+                c = picked;
+                b->setText(picked.name());
+                b->setIcon(colorIcon(picked));
+            });
+            return b;
+        };
+        f->addRow(tr("Fill"), colourButton(fill, tr("Fill")));
+        auto* outline = keepSpin(-0.5, 50, 0.5, tr(" px"));
+        outline->setValue(-0.5);
+        f->addRow(tr("Outline Width"), outline);
+        f->addRow(tr("Outline Color"), colourButton(outlineColor, tr("Outline Color")));
+        auto* tracking = keepSpin(-201, 500, 0.5, QString());
+        f->addRow(tr("Tracking"), tracking);
+        auto* baseline = keepSpin(-1001, 1000, 1, tr(" px"));
+        f->addRow(tr("Baseline Shift"), baseline);
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+        f->addRow(buttons);
+        connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        if (dlg.exec() != QDialog::Accepted) return;
+        TextRun r;
+        r.from = from, r.len = to - from;
+        if (setFont->isChecked()) r.font = font->currentFont().family().toStdString();
+        if (size->value() > size->minimum()) r.size = size->value();
+        if (bold->checkState() != Qt::PartiallyChecked) r.bold = bold->isChecked() ? 1 : 0;
+        if (italic->checkState() != Qt::PartiallyChecked) r.italic = italic->isChecked() ? 1 : 0;
+        if (weight->value() > weight->minimum()) r.axes["wght"] = weight->value();
+        auto rgb = [](const QColor& c) { return std::array<double, 3>{c.redF(), c.greenF(), c.blueF()}; };
+        if (fill) r.color = rgb(*fill);
+        if (outlineColor) r.outlineColor = rgb(*outlineColor);
+        if (outline->value() > outline->minimum()) r.outline = outline->value();
+        if (tracking->value() > tracking->minimum()) r.tracking = tracking->value();
+        if (baseline->value() > baseline->minimum()) r.baseline = baseline->value();
+        state_->edit(tr("Style Text"), [target, r](Project&, Sequence& s) {
+            Effect* ef = target.resolve(s);
+            if (!ef) return false;
+            const std::vector<TextRun> runs = addTextRun(parseTextRuns(ef->s("runs")), r);
+            const std::string json = textRunsJson(runs);
+            if (json == ef->s("runs")) return false;
+            ef->strings["runs"] = json;
+            return true;
+        });
+    });
+
+    // Text animations: each a range of the text and what it changes there, with its own settings.
+    for (int k : textAnimators(clip.generator)) {
+        auto* remove = smallButton(nullptr, QStringLiteral("✕"), tr("Remove Text Animation"));
+        QFormLayout* section = addSection(tr("Text Animation %1").arg(k), remove);
+        connect(remove, &QToolButton::clicked, this, [this, target, k] {
+            state_->edit(tr("Remove Text Animation"), [target, k](Project&, Sequence& s) {
+                Effect* e = target.resolve(s);
+                if (!e) return false;
+                const std::string pre = "ta" + std::to_string(k) + ".";
+                std::erase_if(e->params, [&](const auto& kv) { return kv.first.rfind(pre, 0) == 0; });
+                return true;
+            });
+        });
+        EffectInfo info;
+        info.type = "title";
+        info.params = textAnimatorParams(k);
+        addParamRows(section, info, target);
+    }
+    auto* add = new QPushButton(tr("Add Text Animation"), content_);
+    add->setObjectName(QStringLiteral("addTextAnimation"));
+    add->setToolTip(tr("Move, scale, turn, fade, blur or recolour the text a letter, word or line at a time"));
+    connect(add, &QPushButton::clicked, this, [this, target] {
+        state_->edit(tr("Add Text Animation"), [target](Project&, Sequence& s) {
+            Effect* e = target.resolve(s);
+            if (!e) return false;
+            addTextAnimator(*e);
+            return true;
+        });
+    });
+    layout_->addWidget(add);
+}
+
 void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si, const Target& target) {
     const std::string name = si.name;
     const QString label = tr(si.label.c_str());
@@ -2505,6 +2660,10 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
         state_->edit(tr("Change %1").arg(label), [target, name, val](Project&, Sequence& s) {
             Effect* e = target.resolve(s);
             if (!e) return false;
+            // A title's styled runs stay on the characters they were on.
+            if (name == "text" && e->type == "title" && !e->s("runs").empty())
+                e->strings["runs"] = textRunsJson(shiftTextRuns(parseTextRuns(e->s("runs")), QString::fromStdString(e->s("text", "Title")),
+                                                                QString::fromStdString(val)));
             e->strings[name] = val;
             return true;
         }, mergeKey);
@@ -2512,6 +2671,7 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
     switch (si.kind) {
         case StringKind::MultilineText: {
             auto* edit = new QPlainTextEdit(content_);
+            edit->setObjectName(QStringLiteral("string_") + QString::fromStdString(name));
             edit->setFixedHeight(64);
             std::function<void(QMenu*)> more;
             if (target.publishClip)

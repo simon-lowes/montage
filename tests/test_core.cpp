@@ -79,6 +79,7 @@
 #include "control/Hid.h"
 #include "control/MackieControl.h"
 #include "control/Midi.h"
+#include "render/Titles.h"
 
 using namespace montage;
 using namespace montage::edit;
@@ -9762,6 +9763,58 @@ private slots:
         p.sequences.push_back(other);
         QVERIFY(!placeSequenceClips(p, *p.findSequence(main), otherId, 0, -1, 0, 0, 0, false).ok);
         QVERIFY(!placeSequenceClips(p, *p.findSequence(main), selId, 500, 600, 0, 0, 0, false).ok);
+    }
+
+    void fcpxmlTitleStyles() {
+        // A title with styled runs (a font, a size, a colour, bold and italic, an outline, tracking and a baseline shift)
+        // keeps each character's style through FCPXML and back.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        Clip title = makeGeneratorClip(p, "title", 50);
+        Effect& g = title.generator;
+        g.strings["text"] = "Plain BOLD red\nand under";
+        g.strings["font"] = "DejaVu Sans";
+        g.params["size"] = 80.0;
+        g.params["color.g"] = 0.8;
+        TextRun bold, red, low;
+        bold.from = 6, bold.len = 4, bold.font = "DejaVu Serif", bold.size = 120, bold.bold = 1, bold.italic = 1;
+        bold.outline = 3, bold.outlineColor = std::array<double, 3>{0, 0, 0.5}, bold.tracking = 6;
+        red.from = 11, red.len = 3, red.color = std::array<double, 3>{1, 0.1, 0.2}, red.bold = 0;
+        low.from = 15, low.len = 3, low.baseline = -12;
+        g.strings["runs"] = textRunsJson({bold, red, low});
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, title).ok);
+        const std::string xml = exportFcpXml(p, s);
+        const Effect original = s.videoTracks[0].clips[0].generator;  // (importing adds a sequence)
+        QVERIFY(xml.find("<text-style-def id=\"ts") != std::string::npos);
+        QVERIFY(xml.find("font=\"DejaVu Serif\"") != std::string::npos);
+        ImportResult r = importXmlTimeline(p, xml);
+        QVERIFY2(r.ok, r.error.c_str());
+        const Clip& back = p.findSequence(r.sequence)->videoTracks.at(0).clips.at(0);
+        QCOMPARE(back.generator.type, std::string("title"));
+        // Each letter's style (spaces go with the stretch before them).
+        auto perChar = [](const Effect& g) {
+            std::vector<std::pair<QChar, TextRun>> out;
+            for (const TitleStyleSpan& sp : titleStyleSpans(g))
+                for (QChar ch : sp.text) out.emplace_back(ch, sp.style);
+            return out;
+        };
+        const auto want = perChar(original), got = perChar(back.generator);
+        QCOMPARE(got.size(), want.size());
+        QCOMPARE(back.generator.s("text"), original.s("text"));
+        QVERIFY(titleStyleSpans(back.generator).size() >= 4);
+        for (size_t i = 0; i < want.size(); ++i) {
+            if (want[i].first.isSpace()) continue;
+            TextRun a = want[i].second, b = got[i].second;
+            QVERIFY2(std::abs(a.size - b.size) < 1e-9, qPrintable(QString("%1 %2").arg(a.size).arg(b.size)));
+            b.size = a.size;
+            QVERIFY2(a == b, qPrintable(QString("letter %1").arg(i)));
+        }
+        // The plain title's own style is the title's again; Final Cut's own titles (no bold attribute) read too.
+        QCOMPARE(back.generator.s("font"), std::string("DejaVu Sans"));
+        QCOMPARE(back.generator.p("color.g", 0), 0.8);
+        Project fc;
+        ImportResult rf = importXmlTimeline(fc, readData("interchange/final-cut.fcpxml"));
+        QVERIFY(rf.ok);
     }
 
     void interchangeReviewFixes() {
