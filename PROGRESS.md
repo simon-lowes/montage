@@ -1382,3 +1382,23 @@ The ninth gap analysis (`docs/research/phase10-roadmap.md`, October 2026) ranks 
   - **Not yet:** about 85 billion multiply-adds a 1080p frame, seconds each through ONNX Runtime on the device Inference.h chooses (tests use the processor), so playback shows it only once rendered ahead; training is processor only (no GPU, no AVX-512 kernels); the network file is kept by its full path (a moved project finds it only where it was; an unsaved project's stay in the temporary folder when it is saved); the example pairs are held at the clip's full size while training (two float pictures a frame); networks no clip runs any more are left in the folder; masks, paint and other work are learned only as the clip's own effects show them (not other tracks above it); the example clip's own effects are turned off rather than kept beside it.
 
 Nightly fixes (26 Oct): a loop recording stopped in its pre-roll, or one a full disk cut short, kept its file instead of deleting it with its passes (a pass is only cut from the recording once every pass is written whole, and a short write is reported); the player wraps a loop's sound on the sample instead of on a timer tick, so takes stay in step with the picture (and turning the loop off as it plays goes on from where it is), and the picture no longer steps back a frame when the player moves between the sound's clock and its own; the monitoring section is planned outside the audio lock (a large sequence no longer stalls playback while it is rebuilt). Remove and Replace Grain measure in the space the grain was measured in and keep PQ and HLG blacks and whites where they were (the display curves now continue past 0 and 1, so the stabiliser's tables invert). Image subtitles: a crafted PGS or DVB picture far outside the frame is refused instead of allocating its bounding box; a DVB page's stated time-out is kept; a VobSub `.idx` or `.sub` beside the output is only replaced when it is one; IMSC export no longer writes over pictures of the same names unless the document it replaces names them. Adaptive HDR metadata past the first ten minutes of a clip is read in the background from the first time the clip is shown, for each version of the file. Removing media also removes its take lanes and the clips of hidden track versions, whose ids now count when a project is opened. Added audio description gaps follow ripple edits and slips of the dialogue before them, not its trims. A mono or surround cue is checked for vocals from its first channel; a workbook column past XFD or with other characters is refused; Rebuild LUT as Grade writes its residual LUT only once the edit is made. The test_render and test_app ctest limits are 900 s and 600 s (both suites outgrew 300 s). On Windows, the remote review test ticks markers on (the agent's start turns them off, which the registry kept for the rerun after a failure), and the naming check settles the dock layout before it looks.
+
+# Phase 11
+
+The tenth gap analysis (`docs/research/phase11-roadmap.md`, October 2026) ranks what is still missing against Premiere 26.5, After Effects 26.5, Resolve 21.1, Final Cut Pro 12.4 and Media Composer 2026.8, with Baselight 8, Nuke 17.1, Pro Tools 2026.4, Nuendo 15, Kdenlive and Shotcut, and open tools and standards (FFmpeg 9.0, OpenColorIO 2.6, OpenTimelineIO 0.18, OpenFX 1.5, AV2, SMPTE ST 2098-2 and ST 2067-50, ITU-R BT.2446-1, ISO 21727). Items 1–12 can be tested completely in CI and come first; 13–15 each have a part that cannot be checked here.
+
+- [ ] 1. Titles styled and animated letter by letter: mixed styles in one title, variable font axes, text on a path, and animation by character, word or line (M)
+- [ ] 2. Film-mix automation: trim passes, preview and punch, capture, write to, glide, and copy and paste of automation (S–M)
+- [ ] 3. Mesh and pin warp: as-rigid-as-possible deformation by pins, stiff areas, overlap order, and a grid warp (M)
+- [ ] 4. Merging two copies of a project from their common version, with conflicts listed (M)
+- [ ] 5. Archival masters as IMF Application #5 (ACES 2065-1 OpenEXR in MXF) (S–M)
+- [ ] 6. SDR brought up into HDR by ITU-R BT.2446-1 methods A and C, and those methods for HDR to SDR (S)
+- [ ] 7. Cinema loudness: Leq(m), the loudness range gated by dialogue, loudness logs and reports (S)
+- [ ] 8. Shots grouped by camera angle and by scene for grading (S–M)
+- [ ] 9. Light rays and aperture diffraction glare in scene light (S)
+- [ ] 10. USD scenes in and out (S–M)
+- [ ] 11. Gaussian splats as a layer (M)
+- [ ] 12. A node graph for compositing within a clip (L)
+- [ ] 13. IAB immersive audio in IMF and DCP, and S-ADM in IMF (M)
+- [ ] 14. Remote grading (M)
+- [ ] 15. Montage in other languages (M)
