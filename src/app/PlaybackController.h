@@ -211,6 +211,8 @@ private:
     bool gpu_ = false;
     double speed_ = 0;
     bool loop_ = false;
+    std::pair<int64_t, double> audioLoop_{-1, -1.0};  // (the sound's loop, as last given to it)
+    void syncAudioLoop();
     FrameTime position_ = 0;
     FrameTime startFrame_ = 0;
     QElapsedTimer clock_;

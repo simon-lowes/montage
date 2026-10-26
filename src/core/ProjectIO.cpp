@@ -1314,6 +1314,15 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
     // Guarantee nextId is above every id in the file.
     Id maxId = 0;
     auto bump = [&](Id id) { maxId = std::max(maxId, id); };
+    auto bumpClip = [&](const Clip& c) {
+        bump(c.id);
+        bump(c.linkGroup);
+        bump(c.motion.id);
+        bump(c.audio.id);
+        bump(c.generator.id);
+        bump(c.timing.id);
+        for (const auto& e : c.effects) bump(e.id);
+    };
     for (const auto& m : p.media) bump(m.id);
     for (const auto& b : p.smartBins) bump(b.id);
     for (const auto& s : p.sequences) {
@@ -1321,15 +1330,7 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         for (const auto* list : {&s.videoTracks, &s.audioTracks})
             for (const auto& t : *list) {
                 bump(t.id);
-                for (const auto& c : t.clips) {
-                    bump(c.id);
-                    bump(c.linkGroup);
-                    bump(c.motion.id);
-                    bump(c.audio.id);
-                    bump(c.generator.id);
-                    bump(c.timing.id);
-                    for (const auto& e : c.effects) bump(e.id);
-                }
+                for (const auto& c : t.clips) bumpClip(c);
                 for (const auto& tr : t.transitions) {
                     bump(tr.id);
                     bump(tr.params.id);
@@ -1337,11 +1338,11 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
                 for (const auto& e : t.effects) bump(e.id);
                 for (const auto& l : t.lanes) bump(l.id);
                 for (const auto& v : t.versions) {
-                    for (const auto& c : v.clips) {
-                        bump(c.id);
-                        for (const auto& e : c.effects) bump(e.id);
+                    for (const auto& c : v.clips) bumpClip(c);  // (hidden in a version not shown: their ids count too)
+                    for (const auto& tr : v.transitions) {
+                        bump(tr.id);
+                        bump(tr.params.id);
                     }
-                    for (const auto& tr : v.transitions) bump(tr.id);
                 }
             }
         for (const auto& b : s.buses) {

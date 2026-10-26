@@ -10501,6 +10501,18 @@ private slots:
             Project again;
             QVERIFY(loadProject(file, again));
             QCOMPARE(again.active()->audioTracks[0].versions, sv.audioTracks[0].versions);
+            // New ids after loading clash with none in the version not shown (its clips' parameter sets included).
+            {
+                Project hidden = p;
+                Clip& kept = hidden.active()->audioTracks[0].versions[1].clips[0];
+                kept.audio.id = hidden.nextId + 50;
+                kept.timing.id = hidden.nextId + 60;
+                QVERIFY(saveProject(hidden, file));
+                Project reloaded;
+                QVERIFY(loadProject(file, reloaded));
+                QVERIFY(reloaded.nextId > kept.timing.id);
+                QVERIFY(saveProject(p, file));
+            }
             const Id copy = edit::duplicateSequence(again, again.activeSequence, "Copy");
             const Track& ct = again.findSequence(copy)->audioTracks[0];
             QCOMPARE(ct.versions.size(), size_t(2));

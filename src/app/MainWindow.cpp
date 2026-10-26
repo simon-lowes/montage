@@ -3312,8 +3312,6 @@ void MainWindow::childEvent(QChildEvent* e) {
         if (auto* bar = qobject_cast<QTabBar*>(e->child())) {
             bar->setElideMode(Qt::ElideNone);
             bar->setUsesScrollButtons(true);
-            // (the tabs of stacked panels, which take the focus on Windows: named for a screen reader)
-            if (bar->inherits("QMainWindowTabBar") && bar->accessibleName().isEmpty()) bar->setAccessibleName(tr("Panel tabs"));
         }
 }
 

@@ -8892,6 +8892,27 @@ colorspaces:
             for (int c = 0; c < 3; ++c)
                 QVERIFY2(std::fabs(dB(replaced.amplitude[c][b], measured.amplitude[c][b])) < 0.75,
                          qPrintable(QString("band %1 channel %2: %3 dB").arg(b).arg(c).arg(dB(replaced.amplitude[c][b], measured.amplitude[c][b]))));
+        // A profile carried into another space: the same where the light is the same (Rec.709 to sRGB), the measured
+        // one in its own space.
+        {
+            const GrainProfile same = grainProfileIn(measured, space, space);
+            QCOMPARE(grainProfileText(same), grainProfileText(measured));
+            const GrainProfile srgb = grainProfileIn(measured, *findColorSpace("rec709"), *findColorSpace("srgb"));
+            for (int b = 0; b < GrainProfile::kBands; ++b)
+                QVERIFY2(std::fabs(dB(srgb.amplitude[1][b], grainAmplitude(measured, 1, std::exp2(b - 7.5)))) < 0.2,
+                         qPrintable(QString("band %1: %2 vs %3").arg(b).arg(srgb.amplitude[1][b]).arg(grainAmplitude(measured, 1, std::exp2(b - 7.5)))));
+        }
+        // Taking grain out keeps PQ's black black and HLG's peak where it was (code values past the curves kept apart).
+        for (const char* id : {"rec2100pq", "rec2100hlg"}) {
+            const ColorSpace& hdr = *findColorSpace(id);
+            for (const float v : {0.0f, 1.0f}) {
+                const Image flat = solid(32, 32, v, v, v);
+                const std::vector<const Image*> same(4, &flat);
+                const Image out = removeGrain(flat, same, {}, hdr, measured);
+                for (int k = 0; k < 3; ++k)
+                    QVERIFY2(std::fabs(out.at(16, 16)[k] - v) < 1e-3f, qPrintable(QString("%1 at %2: %3").arg(id).arg(v).arg(out.at(16, 16)[k])));
+            }
+        }
         // Too few frames, or nothing flat enough: refused.
         QVERIFY(!measureGrain(std::vector<Image>(plate.begin(), plate.begin() + 6), space, {}, back, &err));
         QVERIFY(!measureGrain(plate, space, {0, 0, 32, 32}, back, &err));

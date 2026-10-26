@@ -10370,6 +10370,18 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(track().lanes.size(), size_t(4));
         QFile again(whole + " pass 1.wav");
         QVERIFY(again.open(QIODevice::ReadOnly) && again.readAll() == firstPass);
+        // Stopped in the pre-roll, before any pass: nothing goes on the timeline, and the recording is kept.
+        QVERIFY(rec.startLoop(in, out, pre, 1, {}, false, 48000, 1));
+        rec.feed(block.data(), 4800);
+        QVERIFY(!rec.stop());
+        QCOMPARE(track().lanes.size(), size_t(4));
+        QVERIFY(rec.lastTake().endsWith(".wav") && !rec.lastTake().contains(" pass "));
+        QVERIFY2(QFileInfo(rec.lastTake()).size() == 44 + 4800 * 4, qPrintable(rec.lastTake()));
+        // Removing a take's media from the project takes its lane away too.
+        const Id firstTake = track().lanes[0].mediaId;
+        QVERIFY(state()->removeMedia(firstTake));
+        QCOMPARE(track().lanes.size(), size_t(3));
+        QVERIFY(std::none_of(track().lanes.begin(), track().lanes.end(), [&](const TakeLane& l) { return l.mediaId == firstTake; }));
         state()->newProject();
     }
 
@@ -10664,6 +10676,27 @@ const auto seq = [this] { return state()->sequence(); };
             QVERIFY2(end > 50 && end <= 92, qPrintable(QString::number(end)));
             rows->setCurrentItem(nullptr);  // (the row opened for typing closed, left empty)
             QVERIFY(!QApplication::focusWidget() || !rows->isAncestorOf(QApplication::focusWidget()));
+            // A ripple edit before it moves it with the dialogue, and undo back.
+            QVERIFY(state()->apply("Ripple", [&](Project& p, Sequence& s) {
+                std::vector<TrackRef> all;
+                for (int i = 0; i < int(s.videoTracks.size()); ++i) all.push_back({TrackKind::Video, i});
+                for (int i = 0; i < int(s.audioTracks.size()); ++i) all.push_back({TrackKind::Audio, i});
+                edit::rippleOpen(p, s, 0, 10, all);
+                return edit::Result{};
+            }));
+            QTRY_COMPARE(rows->item(0, 3)->data(Qt::UserRole).toLongLong(), 60LL);
+            state()->undo();
+            QTRY_COMPARE(rows->item(0, 3)->data(Qt::UserRole).toLongLong(), 50LL);
+            // Trimming the head of the line before it leaves it where it is (the line's sound has not moved).
+            Id before = 0;
+            for (const Track& t : state()->sequence()->audioTracks)
+                for (const Clip& c : t.clips)
+                    if (c.start <= 50 && (!before || c.start > edit::clipById(*state()->sequence(), before)->start)) before = c.id;
+            QVERIFY(before);
+            QVERIFY(state()->apply("Trim", [&](Project& p, Sequence& s) { return edit::trim(p, s, before, edit::Edge::In, 2, edit::TrimMode::Normal, false); }));
+            QTest::qWait(50);
+            QCOMPARE(rows->item(0, 3)->data(Qt::UserRole).toLongLong(), 50LL);
+            state()->undo();
             dlg->hide();
             QVERIFY(state()->apply("Line over it", [&](Project& p, Sequence& s) {
                 return edit::placeMedia(p, s, media, 45, 0, -1, {TrackKind::Video, -1}, {TrackKind::Audio, 0}, false);
@@ -13016,6 +13049,48 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY2(std::fabs(px.redF() - grey[0]) < 0.02, qPrintable(QString("%1 vs %2").arg(px.redF()).arg(grey[0])));
         read->setCurrentIndex(0);
         QTRY_COMPARE(lastSpace(), QString("rec709"));
+        state()->newProject();
+    }
+
+    void loopedPlaybackKeepsTime() {
+        // Played round In to Out, the picture keeps to the loop on one clock: within it, wrapping back to In, each pass as
+        // long as the loop.
+        state()->newProject();
+        state()->apply("Clip", [](Project& p, Sequence& s) {
+            s.videoTracks[0].clips.push_back(makeGeneratorClip(p, "color", 200));
+            return edit::Result{};
+        });
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        state()->setInPoint(10);
+        state()->setOutPoint(19);
+        const bool was = program->loop();
+        program->setLoop(true);
+        std::vector<std::pair<qint64, FrameTime>> seen;
+        QElapsedTimer clock;
+        clock.start();
+        const auto c = connect(program, &PlaybackController::positionChanged, this, [&](FrameTime t) { seen.emplace_back(clock.elapsed(), t); });
+        program->seek(10);
+        program->play();
+        QTest::qWait(1500);
+        disconnect(c);
+        // Turned off as it plays, it goes on from where it is, not from where the passes would have taken it.
+        const FrameTime at = program->position();
+        program->setLoop(false);
+        QTest::qWait(200);
+        const FrameTime after = program->position();
+        program->pause();
+        program->setLoop(was);
+        QVERIFY2(after >= at && after <= at + 15, qPrintable(QStringLiteral("%1 then %2").arg(at).arg(after)));
+        QVERIFY(seen.size() > 10);
+        std::vector<qint64> wraps;
+        for (size_t i = 0; i < seen.size(); ++i) {
+            QVERIFY2(seen[i].second >= 10 && seen[i].second <= 19, qPrintable(QString::number(seen[i].second)));
+            if (i > 0 && seen[i].second < seen[i - 1].second) wraps.push_back(seen[i].first);
+        }
+        QVERIFY2(wraps.size() >= 2, qPrintable(QString::number(wraps.size())));
+        const double fps = state()->sequence()->fpsValue();
+        const double pass = (wraps.back() - wraps.front()) / double(wraps.size() - 1);
+        QVERIFY2(std::fabs(pass - 10 / fps * 1000) < 60, qPrintable(QString::number(pass)));
         state()->newProject();
     }
 
@@ -17245,6 +17320,8 @@ print("added " + ui["name"])
         auto* size = dlg->findChild<QComboBox*>("reviewStreamSize");
         size->setCurrentIndex(size->findData(540));
         dlg->findChild<QCheckBox*>("reviewStreamHardware")->setChecked(false);
+        // (ticked here: the agent's start below turns markers off, which a second run on Windows reads back from the registry)
+        dlg->findChild<QCheckBox*>("reviewStreamMarkers")->setChecked(true);
         dlg->findChild<QSpinBox*>("reviewStreamMarkersPort")->setValue(markersPort);
         state()->setPlayhead(10);
         dlg->findChild<QPushButton*>("reviewStreamStart")->click();
@@ -17419,7 +17496,9 @@ print("added " + ui["name"])
         QStringList missing;
         for (const QString& workspace : MainWindow::builtInWorkspaces()) {
             QVERIFY(win_->applyWorkspace(workspace));
-            // (The tab bars of panels no longer stacked go when the event loop next runs, as it would between workspaces.)
+            // (The tab bars of panels no longer stacked go when the event loop next runs, as it would between workspaces:
+            // the layout is settled first, as it retires bars of its own.)
+            QApplication::processEvents();
             QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
             QApplication::processEvents();
             for (QWidget* w : win_->findChildren<QWidget*>()) {
@@ -17436,10 +17515,12 @@ print("added " + ui["name"])
                             in = QString::fromLatin1(p->metaObject()->className()) + QLatin1Char(' ') + p->objectName();
                             break;
                         }
-                    const QString what = QStringLiteral("%1 %2 '%3' named '%4' role %5 in %6")
-                                             .arg(workspace, QString::fromLatin1(w->metaObject()->className()), w->objectName(), name)
-                                             .arg(int(role), 0, 16)
-                                             .arg(in);
+                    QString what = QStringLiteral("%1 %2 '%3' named '%4' role %5 in %6")
+                                       .arg(workspace, QString::fromLatin1(w->metaObject()->className()), w->objectName(), name)
+                                       .arg(int(role), 0, 16)
+                                       .arg(in);
+                    if (const auto* bar = qobject_cast<const QTabBar*>(w))
+                        what += QStringLiteral(" (%1 tabs, current %2)").arg(bar->count()).arg(bar->currentIndex());
                     if (!missing.contains(what)) missing << what;
                 }
             }

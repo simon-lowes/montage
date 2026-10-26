@@ -5,9 +5,12 @@
 #include <QFloat16>
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
+#include <future>
 #include <list>
 #include <map>
 #include <mutex>
+#include <thread>
 
 #include "render/Compositor.h"
 #include "render/Hdr10Plus.h"
@@ -137,7 +140,7 @@ void forEachT35(const uint8_t* d, size_t n, bool av1, int lengthSize, const std:
     if (start != SIZE_MAX && start < n) nal(d + start, n - start);
 }
 
-bool readAdaptiveHdr(const std::string& path, std::vector<AdaptiveHdrScene>& scenes, std::string* error) {
+bool readAdaptiveHdr(const std::string& path, std::vector<AdaptiveHdrScene>& scenes, std::string* error, bool whole) {
     scenes.clear();
     AVFormatContext* fmt = nullptr;
     if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) {
@@ -171,8 +174,8 @@ bool readAdaptiveHdr(const std::string& path, std::vector<AdaptiveHdrScene>& sce
     int64_t frames = 0, last = -1;
     AVPacket* pkt = av_packet_alloc();
     constexpr int64_t kFirstFrames = 120;  // a file without any in these is taken to have none
-    // Read on import, so only the first ten minutes (the rest of a longer file has none).
-    const int64_t kMaxFrames = std::llround(600 * fps);
+    // Read on import, so only the first ten minutes there (the rest when it is needed).
+    const int64_t kMaxFrames = whole ? INT64_MAX : std::llround(600 * fps);
     bool cut = false;
     while (av_read_frame(fmt, pkt) >= 0) {
         if (pkt->stream_index == v) {
@@ -217,6 +220,7 @@ bool readAdaptiveHdr(const std::string& path, std::vector<AdaptiveHdrScene>& sce
         current = &it->second;
     }
     std::erase_if(scenes, [](const AdaptiveHdrScene& s) { return s.end <= s.start; });
+    if (cut && !scenes.empty()) scenes.back().key = kAdaptiveHdrMore;
     return !scenes.empty();
 }
 
@@ -224,7 +228,37 @@ const AdaptiveHdr* adaptiveHdrAt(const MediaItem& m, double seconds) {
     if (!m.adaptiveHdr || m.adaptiveHdr->empty()) return nullptr;
     const double fps = m.fps.valid() ? m.fps.toDouble() : 30;
     const FrameTime f = FrameTime(std::llround(std::max(0.0, seconds) * fps));
-    const auto& scenes = *m.adaptiveHdr;
+    const std::vector<AdaptiveHdrScene>* list = m.adaptiveHdr.get();
+    // Past the part read on import: the whole file, read once in the background from the first time the clip is asked
+    // about (so playback seldom waits for it), and kept for as long as Montage runs, for each version of the file.
+    if (list->back().key == kAdaptiveHdrMore) {
+        using Scenes = std::shared_ptr<const std::vector<AdaptiveHdrScene>>;
+        static std::mutex mutex;
+        static std::map<std::string, std::shared_future<Scenes>> wholeFiles;
+        std::shared_future<Scenes> whole;
+        {
+            std::error_code ec;
+            const std::filesystem::path p(std::u8string(m.path.begin(), m.path.end()));
+            const auto size = std::filesystem::file_size(p, ec);
+            const auto time = std::filesystem::last_write_time(p, ec);
+            const std::string key = m.path + '|' + std::to_string((unsigned long long)size) + '|' +
+                                    std::to_string((long long)time.time_since_epoch().count());
+            const std::lock_guard<std::mutex> lock(mutex);
+            auto& slot = wholeFiles[key];
+            if (!slot.valid()) {
+                std::promise<Scenes> promise;
+                slot = promise.get_future().share();
+                std::thread([path = m.path, promise = std::move(promise)]() mutable {
+                    auto read = std::make_shared<std::vector<AdaptiveHdrScene>>();
+                    readAdaptiveHdr(path, *read, nullptr, true);
+                    promise.set_value(std::move(read));
+                }).detach();
+            }
+            whole = slot;
+        }
+        if (f >= list->back().end) list = whole.get().get();
+    }
+    const auto& scenes = *list;
     auto it = std::upper_bound(scenes.begin(), scenes.end(), f, [](FrameTime t, const AdaptiveHdrScene& s) { return t < s.start; });
     if (it == scenes.begin()) return nullptr;
     --it;

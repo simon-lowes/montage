@@ -34,7 +34,8 @@ class WavWriter {
 public:
     ~WavWriter();
     bool open(const QString& path, int sampleRate, int channels);
-    void write(const float* interleaved, qint64 frames);
+    // False once anything could not be written (a full disk); close() then says so too.
+    bool write(const float* interleaved, qint64 frames);
     bool close();
     qint64 frames() const { return frames_; }
     bool isOpen() const { return file_.isOpen(); }
@@ -43,6 +44,7 @@ private:
     QFile file_;
     int rate_ = 48000, channels_ = 1;
     qint64 frames_ = 0;
+    bool failed_ = false;
 };
 
 class VoiceoverRecorder : public QObject {

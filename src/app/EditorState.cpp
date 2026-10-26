@@ -979,12 +979,27 @@ bool EditorState::removeMedia(Id id, QString* error) {
     QString name = QString::fromStdString(m->name);
     const Id removedSource = sourceMedia_;
     bool ok = edit(tr("Remove %1").arg(name), [id](Project& p, Sequence&) {
+        // (it and its subclips)
+        std::set<Id> gone{id};
+        for (const MediaItem& x : p.media)
+            if (x.subclipOf == id) gone.insert(x.id);
         for (auto& s : p.sequences) {
             std::vector<Id> uses;
             for (auto* list : {&s.videoTracks, &s.audioTracks})
-                for (auto& t : *list)
+                for (auto& t : *list) {
                     for (auto& c : t.clips)
-                        if (c.mediaId == id) uses.push_back(c.id);
+                        if (gone.count(c.mediaId)) uses.push_back(c.id);
+                    // Its takes, and its clips in the track's versions not shown, go too.
+                    std::erase_if(t.lanes, [&](const TakeLane& l) { return gone.count(l.mediaId) > 0; });
+                    for (TrackVersion& v : t.versions) {
+                        std::set<Id> removed;
+                        for (const Clip& c : v.clips)
+                            if (gone.count(c.mediaId)) removed.insert(c.id);
+                        if (removed.empty()) continue;
+                        std::erase_if(v.clips, [&](const Clip& c) { return removed.count(c.id) > 0; });
+                        std::erase_if(v.transitions, [&](const Transition& tr) { return removed.count(tr.clipA) || removed.count(tr.clipB); });
+                    }
+                }
             if (!uses.empty()) edit::removeClips(p, s, uses, false);
         }
         const MediaItem* mi = p.findMedia(id);

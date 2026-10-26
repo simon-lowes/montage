@@ -26920,6 +26920,16 @@ if ui["pressed"] == "add":
         QCOMPARE(adaptiveHdrAt(file, 0.2), &(*file.adaptiveHdr)[0].md);
         QCOMPARE(adaptiveHdrAt(file, 0.8), &(*file.adaptiveHdr)[1].md);
         QVERIFY(!adaptiveHdrAt(file, 1.3));
+        {
+            // A long file is read only in part on import; a frame past that part has the rest read for it.
+            MediaItem part = file;
+            std::vector<AdaptiveHdrScene> first(1, (*file.adaptiveHdr)[0]);
+            first[0].key = kAdaptiveHdrMore;
+            part.adaptiveHdr = std::make_shared<const std::vector<AdaptiveHdrScene>>(first);
+            const AdaptiveHdr* later = adaptiveHdrAt(part, 0.8);
+            QVERIFY(later && adaptiveHdrPayload(*later) == adaptiveHdrPayload(fitted[1].md));
+            QCOMPARE(adaptiveHdrAt(part, 0.2), &(*part.adaptiveHdr)[0].md);
+        }
         Project q = makeDefaultProject();
         q.media.push_back(file);
         MediaItem bare = file;
@@ -28185,8 +28195,23 @@ if ui["pressed"] == "add":
             QVERIFY2(std::fabs(in.track.style.size - t.style.size) < 0.015, qPrintable(QString::number(in.track.style.size)));
             QVERIFY(in.review.empty());
         }
-        // Formats that cannot be written where they were asked.
+        // Files beside the one chosen are not written over unless they are this kind's: a text .sub of the same name
+        // as DVD subtitles' .idx, pictures an IMSC document there does not name. Its own pair is written again.
         std::string err;
+        {
+            QFile text(QString::fromStdString(path("words.sub")));
+            QVERIFY(text.open(QIODevice::WriteOnly) && text.write("{1}{25}Hello\n") > 0);
+            text.close();
+            QVERIFY(!writeImageSubtitles(t, s, path("words.idx"), ImageSubtitleFormat::Vobsub, &err) && !err.empty());
+            QVERIFY(text.open(QIODevice::ReadOnly) && text.readAll().startsWith("{1}{25}"));
+            QFile png(QString::fromStdString(path("pics-0001.png")));
+            QVERIFY(png.open(QIODevice::WriteOnly) && png.write("not ours") > 0);
+            png.close();
+            QVERIFY(!writeImageSubtitles(t, s, path("pics.ttml"), ImageSubtitleFormat::ImscImage, &err));
+            QVERIFY2(writeImageSubtitles(t, s, path("subs.idx"), ImageSubtitleFormat::Vobsub, &err), err.c_str());
+            QVERIFY2(writeImageSubtitles(t, s, path("subs.ttml"), ImageSubtitleFormat::ImscImage, &err), err.c_str());
+        }
+        // Formats that cannot be written where they were asked.
         QVERIFY(!writeImageSubtitles(t, s, path("subs.mp4"), ImageSubtitleFormat::Pgs, &err));
         QVERIFY(!writeImageSubtitles(t, s, path("subs.sup"), ImageSubtitleFormat::Dvb, &err));
         QVERIFY(!writeImageSubtitles(CaptionTrack{}, s, path("none.sup"), ImageSubtitleFormat::Pgs, &err));

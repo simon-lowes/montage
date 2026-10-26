@@ -40,6 +40,9 @@ struct GrainProfile {
 
 std::string grainProfileText(const GrainProfile& g);
 bool parseGrainProfile(const std::string& text, GrainProfile& out);
+// A profile measured on pictures in `from` as the grain is in `to` (each band's amplitude carried through the conversion
+// between them), to take it out of pictures in `to`.
+GrainProfile grainProfileIn(const GrainProfile& g, const ColorSpace& from, const ColorSpace& to);
 // Film's grain in Film Look's gauges (0 65mm, 1 35mm, 2 16mm, 3 Super 8) as a profile.
 GrainProfile stockGrain(int gauge);
 // About how large one grain is, in pixels of the frame measured (from where the spectrum falls to half).

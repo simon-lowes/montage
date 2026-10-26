@@ -820,9 +820,10 @@ void applyDenoise(const Effect& e, FrameTime lt, Image& src, const std::vector<I
 }
 
 // Replace Grain's taking the plate's grain out (render/GrainMatch removeGrain), within the Grain Match's mask when it has one.
+// (`space` the picture's; `measured` the one its grain was measured in, the sequence's)
 void applyRemoveGrain(const Effect& e, FrameTime lt, Image& src, const std::vector<const Image*>& around, const std::vector<MotionFn>& motion,
-                      const ColorSpace& space, double pixelScale, double sourceSeconds) {
-    const Image clean = removeGrain(src, around, motion, space, effectGrainProfile(e));
+                      const ColorSpace& space, const ColorSpace& measured, double pixelScale, double sourceSeconds) {
+    const Image clean = removeGrain(src, around, motion, space, grainProfileIn(effectGrainProfile(e), measured, space));
     if (!hasMask(e, lt)) {
         src = clean;
         return;
@@ -1167,7 +1168,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             FrameTime nf = FrameTime(std::floor(c.sourceFrameAt(t) * nested->fpsValue() / seq.fpsValue() + 1e-6));
             src = renderSequenceFrame(p, *nested, nf, no);
             if (const Effect* rg = replaceGrainEffect(seq, c); rg && !src.empty())
-                applyRemoveGrain(*rg, lt, src, {}, {}, nestedSpace, effectPixelScale(c, lt, g.sx, mw, src.width), -1);
+                applyRemoveGrain(*rg, lt, src, {}, {}, nestedSpace, sequenceColorSpace(seq), effectPixelScale(c, lt, g.sx, mw, src.width), -1);
             else if (const Effect* nr = denoiseEffect(seq, c); nr && !src.empty())
                 applyDenoise(*nr, lt, src, {}, {}, effectPixelScale(c, lt, g.sx, mw, src.width), -1);
             if (const Effect* db = enabledEffect(seq, c, "motion_deblur")) applyMotionDeblur(*db, lt, o, src);
@@ -1416,7 +1417,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 if (const Effect* rg = replaceGrainEffect(seq, c)) {
                     std::vector<const Image*> nb;
                     for (const Image& im : around) nb.push_back(&im);
-                    applyRemoveGrain(*rg, lt, src, nb, motion, mediaColorSpace(*m), effectPixelScale(c, lt, g.sx, mw, src.width),
+                    applyRemoveGrain(*rg, lt, src, nb, motion, mediaColorSpace(*m), sequenceColorSpace(seq), effectPixelScale(c, lt, g.sx, mw, src.width),
                                      m->kind == MediaKind::Video ? sec : -1);
                 } else {
                     applyDenoise(*nr, lt, src, around, motion, effectPixelScale(c, lt, g.sx, mw, src.width),

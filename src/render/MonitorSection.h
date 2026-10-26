@@ -146,6 +146,18 @@ private:
 // The programme through the section: the mixes the monitor needs (in its listen layout, and the cue's tracks) and
 // what the device gets. Prepared for a project and sequence (when either or the settings change), then rendered
 // block by block from consecutive samples.
+// What Monitor::prepare works out for a project and sequence, made apart from the monitor (so away from a lock the
+// audio thread takes) and then given to it.
+struct MonitorPlan {
+    std::shared_ptr<const Project> project;
+    Id sequence = 0;
+    MonitorSettings settings;  // (made with)
+    std::optional<Sequence> seq, cueSeq;
+    std::string layout;
+    std::vector<bool> cueMask;
+};
+MonitorPlan planMonitor(std::shared_ptr<const Project> project, Id sequence, const MonitorSettings& m);
+
 class Monitor {
 public:
     Monitor();
@@ -156,6 +168,7 @@ public:
     void setOfflineProxies(bool on);
     void setAmbisonicBinaural(bool on);  // an ambisonic sequence heard as stereo: binaurally (playback's choice)
     void prepare(std::shared_ptr<const Project> project, Id sequence);
+    void prepare(MonitorPlan plan);  // (made with these settings)
     void reset();
     int outputs() const { return section_.outputs(); }
     // `frames` from sample `start`: `out` gets outputs() channels; `heard` (stereo, or null) the programme as heard

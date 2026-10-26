@@ -233,8 +233,10 @@ QString stringItem(QXmlStreamReader& r) {
 int columnOf(const QString& ref) {
     int c = 0;
     for (QChar ch : ref) {
-        if (!ch.isLetter()) break;
-        c = c * 26 + (ch.toUpper().unicode() - 'A' + 1);
+        const char16_t u = ch.toUpper().unicode();
+        if (u < 'A' || u > 'Z') break;
+        c = c * 26 + (u - 'A' + 1);
+        if (c > 16384) return 16383;  // (past Excel's last column, XFD: a broken reference, not an overflow)
     }
     return c - 1;
 }
