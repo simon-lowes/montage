@@ -17496,10 +17496,15 @@ print("added " + ui["name"])
         QStringList missing;
         for (const QString& workspace : MainWindow::builtInWorkspaces()) {
             QVERIFY(win_->applyWorkspace(workspace));
-            // (The tab bars of panels no longer stacked go when the event loop next runs, as it would between workspaces:
-            // the layout is settled first, as it retires bars of its own.)
-            QApplication::processEvents();
+            // (The tab bars of panels no longer stacked go when the event loop next runs, as it would between workspaces,
+            // and so do those the layout retires as it settles: only theirs are hurried, as anything else may be in use.)
             QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+            QApplication::processEvents();
+            QList<QPointer<QTabBar>> bars;
+            for (QTabBar* bar : win_->findChildren<QTabBar*>())
+                if (bar->inherits("QMainWindowTabBar")) bars << bar;
+            for (const QPointer<QTabBar>& bar : bars)
+                if (bar) QCoreApplication::sendPostedEvents(bar, QEvent::DeferredDelete);
             QApplication::processEvents();
             for (QWidget* w : win_->findChildren<QWidget*>()) {
                 if (!w->isVisible() || !w->isEnabled() || w->focusPolicy() == Qt::NoFocus || w->window() != win_.get()) continue;
