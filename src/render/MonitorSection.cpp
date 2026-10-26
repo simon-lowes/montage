@@ -436,24 +436,37 @@ void Monitor::setSettings(const MonitorSettings& s, int sampleRate) {
         prepare(project_, seq_ ? seq_->id : 0);
 }
 
-void Monitor::prepare(std::shared_ptr<const Project> project, Id sequence) {
-    project_ = std::move(project);
-    const Sequence* s = project_ ? project_->findSequence(sequence) : nullptr;
-    if (!s) {
+MonitorPlan planMonitor(std::shared_ptr<const Project> project, Id sequence, const MonitorSettings& m) {
+    MonitorPlan plan;
+    plan.project = std::move(project);
+    plan.sequence = sequence;
+    plan.settings = m;
+    const Sequence* s = plan.project ? plan.project->findSequence(sequence) : nullptr;
+    if (!s) return plan;
+    plan.layout = listenLayout(m, *s);
+    plan.seq = monitorSequence(*s, m);
+    // The cue's tracks as they are mixed (their faders and the master's processing), the rest left out.
+    plan.cueSeq = *s;
+    plan.cueMask.assign(s->audioTracks.size(), false);
+    for (int i : m.cue.tracks)
+        if (i >= 0 && i < int(plan.cueMask.size())) plan.cueMask[size_t(i)] = true;
+    for (Track& t : plan.cueSeq->audioTracks) t.solo = false;
+    return plan;
+}
+
+void Monitor::prepare(std::shared_ptr<const Project> project, Id sequence) { prepare(planMonitor(std::move(project), sequence, section_.settings())); }
+
+void Monitor::prepare(MonitorPlan plan) {
+    project_ = std::move(plan.project);
+    if (!plan.seq) {
         seq_.reset(), cueSeq_.reset();
         return;
     }
-    const MonitorSettings& m = section_.settings();
-    layout_ = listenLayout(m, *s);
-    seq_ = monitorSequence(*s, m);
+    layout_ = std::move(plan.layout);
+    seq_ = std::move(plan.seq);
     program_.setAmbisonicBinaural(binaural_ || layout_ == "binaural");
-    // The cue's tracks as they are mixed (their faders and the master's processing), the rest left out.
-    cueSeq_ = *s;
-    std::vector<bool> mask(s->audioTracks.size(), false);
-    for (int i : m.cue.tracks)
-        if (i >= 0 && i < int(mask.size())) mask[size_t(i)] = true;
-    for (Track& t : cueSeq_->audioTracks) t.solo = false;
-    cue_.setTrackMask(mask);
+    cueSeq_ = std::move(plan.cueSeq);
+    cue_.setTrackMask(plan.cueMask);
 }
 
 void Monitor::reset() {

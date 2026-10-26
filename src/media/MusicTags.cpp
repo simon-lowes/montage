@@ -121,7 +121,16 @@ bool cueIsVocal(const Project& p, const Sequence& seq, const MusicCue& cue, bool
         return true;
     }, error);
     if (!splitter) return false;
-    if (!splitter->push(sound->samples.data() + size_t(from) * 2, size_t(to - from), error) || !splitter->finish(error)) return false;
+    // (Stereo to the model: an ambisonic field's omni W on both sides.)
+    std::vector<float> stereo;
+    const float* in = sound->samples.data() + size_t(from) * 2;
+    if (sound->channels != 2) {
+        const size_t ch = size_t(std::max(1, sound->channels));
+        stereo.resize(size_t(to - from) * 2);
+        for (size_t i = 0; i < size_t(to - from); ++i) stereo[i * 2] = stereo[i * 2 + 1] = sound->samples[(size_t(from) + i) * ch];
+        in = stereo.data();
+    }
+    if (!splitter->push(in, size_t(to - from), error) || !splitter->finish(error)) return false;
     const double share = vocals + rest > 0 ? vocals / (vocals + rest) : 0;
     if (vocalShare) *vocalShare = share;
     vocal = share > 0.1;

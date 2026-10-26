@@ -12,13 +12,16 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 
+#include "audio/AraHost.h"
 #include "audio/PluginEffect.h"
 #include "audio/Plugins.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 #include "core/ProjectIO.h"
 #include "media/Decoder.h"
+#include "media/MediaPool.h"
 #include "render/ColorSpace.h"
 #include "render/Compositor.h"
 #include "render/Ofx.h"
@@ -71,6 +74,33 @@ void writeWav(const std::string& path, int rate, double seconds, float level) {
     u32(dataBytes);
     int16_t v = int16_t(std::lround(level * 32767));
     for (int i = 0; i < frames * 2; ++i) std::fwrite(&v, 2, 1, f);
+    std::fclose(f);
+}
+
+// A 16-bit stereo WAV of `frames` frames, each sample as `sample(frame, channel)` gives it.
+void writeWavOf(const std::string& path, int rate, int frames, const std::function<float(int, int)>& sample) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    QVERIFY(f);
+    const uint32_t dataBytes = uint32_t(frames) * 4;
+    auto u32 = [&](uint32_t v) { std::fwrite(&v, 4, 1, f); };
+    auto u16 = [&](uint16_t v) { std::fwrite(&v, 2, 1, f); };
+    std::fwrite("RIFF", 1, 4, f);
+    u32(36 + dataBytes);
+    std::fwrite("WAVEfmt ", 1, 8, f);
+    u32(16);
+    u16(1);
+    u16(2);
+    u32(uint32_t(rate));
+    u32(uint32_t(rate) * 4);
+    u16(4);
+    u16(16);
+    std::fwrite("data", 1, 4, f);
+    u32(dataBytes);
+    for (int i = 0; i < frames; ++i)
+        for (int ch = 0; ch < 2; ++ch) {
+            const int16_t v = int16_t(std::lround(std::clamp(sample(i, ch), -1.0f, 1.0f) * 32767));
+            std::fwrite(&v, 2, 1, f);
+        }
     std::fclose(f);
 }
 
@@ -518,6 +548,16 @@ private slots:
             QVERIFY2(std::fabs(bright.at(1, 1)[0] - 4.0f) < 1e-3f && std::fabs(bright.at(1, 1)[1] - 0.5f) < 1e-4f &&
                          std::fabs(bright.at(1, 1)[2] - 0.25f) < 1e-4f,
                      qPrintable(QString("%1 %2 %3").arg(bright.at(1, 1)[0]).arg(bright.at(1, 1)[1]).arg(bright.at(1, 1)[2])));
+            // A sequence graded in ACEScct tells the plugin so, and gives it its picture in ACEScg as it asked.
+            fx.params["param.mode"] = Param(2.0);
+            bright.fill(0.5f, 0.5f, 0.5f, 1.0f);
+            QVERIFY2(ofx::applyEffect(fx, 0, bright, 1.0, {}, &err, findColorSpace("acescct")), err.c_str());
+            QVERIFY2(bright.at(1, 1)[1] == 1.0f && bright.at(1, 1)[2] == 1.0f &&
+                         std::fabs(bright.at(1, 1)[0] - toLinear(Transfer::AcesCct, 0.5)) < 1e-4,
+                     qPrintable(QString("%1 %2 %3").arg(bright.at(1, 1)[0]).arg(bright.at(1, 1)[1]).arg(bright.at(1, 1)[2])));
+            bright.fill(0.5f, 0.5f, 0.5f, 1.0f);
+            QVERIFY2(ofx::applyEffect(fx, 0, bright, 1.0, {}, &err, findColorSpace("rec709")), err.c_str());
+            QCOMPARE(bright.at(1, 1)[1], 0.0f);
         }
         // A missing plugin leaves the picture as it was and says why.
         Effect gone = e;
@@ -1155,6 +1195,182 @@ private slots:
         AudioMixer fresh;
         fresh.mix(p, s, 24000, 4800, out.data());
         QVERIFY(std::fabs(out[200] - 0.5f) < 0.002f);
+    }
+
+    void araPlugIns() {
+        // ARA plug-ins (audio/AraHost.h), with the ARA SDK's test plug-in built as VST3 and CLAP plug-ins
+        // (scripts/build-ara-test-plugin.sh): it reads the clip's sound itself, finds a "note" in each stretch of
+        // samples that are not zero, plays back the source as it read it, and keeps what it found in its archive.
+        const QByteArray dir = qgetenv("MONTAGE_TEST_ARA_PLUGINS");
+        if (dir.isEmpty()) QSKIP("MONTAGE_TEST_ARA_PLUGINS is not set (scripts/build-ara-test-plugin.sh builds the test plug-in)");
+        Registry& reg = Registry::instance();
+        isolate(reg, path("cache-ara.json"), {dir.toStdString()});
+        reg.setSearchPaths(Format::Vst3, {dir.toStdString()});
+        reg.scan();
+        std::vector<Descriptor> found;
+        for (const Descriptor& d : reg.plugins())
+            if (d.ara && canHost(d.format)) found.push_back(d);
+        QCOMPARE(int(found.size()), canHost(Format::Vst3) ? 2 : 1);
+
+        // Three recordings: bursts of sound (never exactly zero within) with silence between, each its own.
+        const int rate = 48000;
+        struct Burst {
+            int start, length;
+        };
+        const std::vector<std::vector<Burst>> bursts = {
+            {{4800, 9600}, {24000, 4800}}, {{0, 12000}, {36000, 7200}, {60000, 2400}}, {{12000, 30000}}};
+        const int lengths[] = {48000, 72000, 60000};
+        std::vector<std::string> wavs;
+        for (int k = 0; k < 3; ++k) {
+            wavs.push_back(path(qPrintable(QStringLiteral("ara-%1.wav").arg(k))).toStdString());
+            writeWavOf(wavs.back(), rate, lengths[k], [&](int i, int ch) {
+                for (const Burst& b : bursts[size_t(k)])
+                    if (i >= b.start && i < b.start + b.length)
+                        return float((0.3 + 0.1 * k) * (ch ? -1 : 1) * (0.6 + 0.4 * std::sin(i * (0.01 + 0.003 * k))));
+                return 0.0f;
+            });
+        }
+        const int regionsBefore = ara::liveRegions();
+
+        for (const Descriptor& d : found) {
+            const std::string fmt = formatName(d.format);
+            std::string err;
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.sampleRate = rate;
+            FrameTime at = 0;
+            for (const std::string& wav : wavs) {
+                MediaItem m;
+                m.id = p.newId();
+                QVERIFY2(probeMedia(wav, m, &err), err.c_str());
+                p.media.push_back(m);
+                QVERIFY(edit::placeMedia(p, s, m.id, at, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+                at = s.audioTracks[0].clips.back().start + s.audioTracks[0].clips.back().duration + 25;
+            }
+            QCOMPARE(s.audioTracks[0].clips.size(), size_t(3));
+            for (Clip& c : s.audioTracks[0].clips) {
+                auto e = makePluginEffect(p, d, &err);
+                QVERIFY2(e && e->type == "ara", (fmt + ": " + err).c_str());
+                c.effects.push_back(*e);
+            }
+            // The sequence mixed with the plug-in on each clip, and without it.
+            auto mixAll = [&](bool plugIn) {
+                Sequence copy = s;
+                for (Clip& c : copy.audioTracks[0].clips)
+                    for (Effect& e : c.effects) e.enabled = plugIn;
+                const int64_t n = int64_t(std::llround(double(at) / s.fpsValue() * rate));
+                std::vector<float> out(size_t(n) * 2);
+                AudioMixer mixer;
+                mixer.mix(p, copy, 0, int(n), out.data());
+                return out;
+            };
+            auto differ = [](const std::vector<float>& a, const std::vector<float>& b) {
+                double worst = a.size() == b.size() ? 0 : 1e9;
+                for (size_t i = 0; i < std::min(a.size(), b.size()); ++i) worst = std::max(worst, double(std::fabs(a[i] - b[i])));
+                return worst;
+            };
+            const int rendersBefore = ara::rendersDone();
+            ara::logReads(true);
+            const std::vector<float> through = mixAll(true);
+            ara::logReads(false);
+            QCOMPARE(ara::rendersDone(), rendersBefore + 3);  // each clip's source through the plug-in
+            const std::vector<float> plain = mixAll(false);
+            double peak = 0;
+            for (float v : plain) peak = std::max(peak, double(std::fabs(v)));
+            QVERIFY2(peak > 0.2, (fmt + ": the clips are heard").c_str());
+            // Its playback is the clip, sample for sample.
+            QVERIFY2(differ(through, plain) < 1e-6, (fmt + ": " + std::to_string(differ(through, plain))).c_str());
+            // It read every sample of the three sources, each as the decoder gives it.
+            const auto reads = ara::readsLogged();
+            QCOMPARE(reads.size(), size_t(3));
+            for (size_t k = 0; k < wavs.size(); ++k) {
+                const std::string& wav = wavs[k];
+                const AudioBufferPtr decoded = MediaPool::instance().audio(audioKey(wav, {}), rate);
+                QVERIFY(decoded);
+                const std::string id = ara::sourceIdFor(s.audioTracks[0].clips[k].effects[0], *decoded);
+                const auto log = std::find_if(reads.begin(), reads.end(), [&](const auto& r) { return r.first == id; });
+                QVERIFY2(log != reads.end(), (fmt + ": no reads of " + wav).c_str());
+                QVERIFY(log->second.reads > 0 && log->second.channels == 2);
+                QCOMPARE(log->second.seen.size(), decoded->samples.size());
+                size_t wrong = 0;
+                for (size_t i = 0; i < decoded->samples.size(); ++i) wrong += !(log->second.seen[i] == decoded->samples[i]);  // (NaN: unread)
+                QVERIFY2(wrong == 0, (fmt + ": " + std::to_string(wrong) + " samples of " + wav + " unread or not as decoded").c_str());
+            }
+            // Slipped and trimmed, the clip still plays what it plays without the plug-in.
+            Clip& middle = s.audioTracks[0].clips[1];
+            middle.sourceIn += 7;
+            middle.duration -= 12;
+            QVERIFY2(differ(mixAll(true), mixAll(false)) < 1e-6, (fmt + ": after a slip and a trim").c_str());
+
+            // Over MCP: listed with the audio effects, added by its type, and its analysis read back.
+            const QString project = path(qPrintable(QStringLiteral("ara-%1.montage").arg(QString::fromStdString(fmt))));
+            QVERIFY(saveProject(p, project.toStdString()));
+            McpServer server;
+            auto call = [&](const QString& tool, const QJsonObject& args) {
+                const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"}, {"params", QJsonObject{{"name", tool}, {"arguments", args}}}};
+                const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+                return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+            };
+            QJsonObject r = call("montage_list_effects", {{"kind", "audio"}});
+            bool listed = false;
+            for (const QJsonValue& v : r.value("structuredContent").toObject().value("effects").toArray())
+                listed |= v.toObject().value("type").toString().toStdString() == pluginType(d) && v.toObject().value("ara").toBool();
+            QVERIFY2(listed, fmt.c_str());
+            const Id first = s.audioTracks[0].clips[0].id;
+            r = call("montage_add_effect", {{"project", project}, {"clip", double(s.audioTracks[0].clips[2].id)},
+                                            {"effect", QString::fromStdString(pluginType(d))}, {"params", QJsonObject{{"tempo_bpm", 96}}}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            r = call("montage_ara_content", {{"project", project}, {"clip", double(first)}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            auto checkNotes = [&](const QJsonObject& result) {
+                const QJsonObject o = result.value("structuredContent").toObject();
+                QVERIFY(o.value("analysed").toBool());
+                const QJsonArray notes = o.value("notes").toArray();
+                QCOMPARE(notes.size(), qsizetype(bursts[0].size()));
+                for (qsizetype i = 0; i < notes.size(); ++i) {
+                    const QJsonObject n = notes[i].toObject();
+                    const Burst& b = bursts[0][size_t(i)];
+                    QVERIFY2(std::fabs(n.value("start").toDouble() - double(b.start) / rate) < 1e-9, qPrintable(QJsonDocument(n).toJson()));
+                    QVERIFY(std::fabs(n.value("duration").toDouble() - double(b.length) / rate) < 1e-9);
+                    QVERIFY(std::fabs(n.value("volume").toDouble() - 0.3) < 0.01);
+                }
+            };
+            checkNotes(r);
+            // Its archive was kept in the effect: reopened, the notes are there without analysing again.
+            Project back;
+            QVERIFY(loadProject(project.toStdString(), back));
+            const Effect& kept = back.active()->audioTracks[0].clips[0].effects.at(0);
+            QVERIFY(!kept.s("archive").empty() && kept.s("modification_id") == s.audioTracks[0].clips[0].effects[0].s("modification_id"));
+            QCOMPARE(back.active()->audioTracks[0].clips[2].effects.at(1).type, std::string("ara"));
+            QCOMPARE(back.active()->audioTracks[0].clips[2].effects.at(1).p("tempo_bpm", 0), 96.0);
+            checkNotes(call("montage_ara_content", {{"project", project}, {"clip", double(first)}, {"analyse", false}}));
+            // A document restored from the archive renders as before.
+            s.audioTracks[0].clips[0].effects[0].strings["archive"] = kept.s("archive");
+            const int rendersThen = ara::rendersDone();
+            QVERIFY2(differ(mixAll(true), mixAll(false)) < 1e-6, (fmt + ": restored from its archive").c_str());
+            QCOMPARE(ara::rendersDone(), rendersThen + 1);
+
+            // An editor's document for a clip closes, ending its playback region, once the clip is deleted.
+            QCOMPARE(ara::liveRegions(), regionsBefore);
+            std::string key;
+            AudioBufferPtr sound;
+            const Clip& last = s.audioTracks[0].clips[2];
+            QVERIFY(ara::clipSource(p, s, last, key, sound, &err));
+            QVERIFY2(ara::liveSession(last.effects[0], key, sound, &err), err.c_str());
+            QCOMPARE(ara::liveRegions(), regionsBefore + 1);
+            ara::dropSessionsNotIn(p);
+            QCOMPARE(ara::liveRegions(), regionsBefore + 1);  // (still in the project)
+            // An undo that puts another archive in the effect closes the document it no longer matches.
+            s.audioTracks[0].clips[2].effects[0].strings["archive"] = kept.s("archive");
+            ara::dropSessionsNotIn(p);
+            QCOMPARE(ara::liveRegions(), regionsBefore);
+            s.audioTracks[0].clips[2].effects[0].strings.erase("archive");
+            QVERIFY2(ara::liveSession(last.effects[0], key, sound, &err), err.c_str());
+            QCOMPARE(ara::liveRegions(), regionsBefore + 1);
+            QVERIFY(edit::removeClips(p, s, {last.id}, false).ok);
+            ara::dropSessionsNotIn(p);
+            QCOMPARE(ara::liveRegions(), regionsBefore);
+        }
     }
 };
 

@@ -66,6 +66,66 @@ const ColorSpace& mediaColorSpace(const MediaItem& m);
 const ColorSpace& sequenceColorSpace(const Sequence& s);
 const ColorSpace& rec709Space();
 
+// ---- Scene-referred grading: a sequence's working space apart from its delivery space ----
+// Scene-referred spaces a sequence can grade and composite in.
+std::vector<const ColorSpace*> workingColorSpaces();
+// The space a sequence's clips are graded in: its scene-referred working space when it has one, else its delivery space
+// (sequenceColorSpace).
+const ColorSpace& workingColorSpace(const Sequence& s);
+bool sceneReferredWorking(const Sequence& s);
+// Linear light in `p`'s primaries (ACEScg for AP1, Linear Rec.709, ACES2065-1, else one made for them), and ACEScct's
+// log curve on them (ACEScct itself for AP1): where effects that work in light, or in log, run.
+const ColorSpace& linearColorSpace(Primaries p);
+const ColorSpace& logColorSpace(Primaries p);
+
+// How scene light is shown on a display: Montage's filmic transform (the ACES 2.0 tone scale on each channel, in the
+// display's primaries), or ACES 2.0 itself through OpenColorIO.
+enum class OutputTransformKind { Filmic, Aces2 };
+OutputTransformKind outputTransformKind(const Sequence& s);
+// Whether ACES 2.0 can render for `to` (OpenColorIO 2.5 and later, for the displays its ACES 2.0 config has).
+bool aces2Renders(const ColorSpace& to);
+// A display's peak in nits: SDR 100, HLG 1000, PQ `peakNits`.
+double displayPeakNits(const ColorSpace& to, double peakNits);
+// The filmic tone scale: scene light (0.18 grey) to the nits a display of `peakNits` shows, and back.
+double filmicNits(double scene, double peakNits);
+double filmicScene(double nits, double peakNits);
+// Premultiplied scene-referred pixels in `from` through the output transform into display space `to` (`peakNits` an
+// HDR one's peak), through a table unless `exact`; into a scene-referred `to` they are converted exactly instead (a VFX
+// pull keeps the working space's light).
+void outputTransform(Image& img, const ColorSpace& from, const ColorSpace& to, double peakNits, OutputTransformKind kind,
+                     bool exact = false);
+// A display-referred picture in `from` (graphics, a display-referred clip) back through the inverse of display `from`'s
+// output transform into scene-referred `to`, so it comes out of the output transform as it went in.
+void inverseOutputTransform(Image& img, const ColorSpace& from, const ColorSpace& to, double peakNits, OutputTransformKind kind);
+// The same on one colour (not premultiplied), exactly.
+void outputPixel(float rgb[3], const ColorSpace& from, const ColorSpace& to, double peakNits, OutputTransformKind kind);
+void inverseOutputPixel(float rgb[3], const ColorSpace& from, const ColorSpace& to, double peakNits, OutputTransformKind kind);
+// A sequence graded scene-referred, as the compositor draws it (set for each such sequence's frame): where its clips
+// are graded, the linear light of its primaries (where layers are composited), and the display the frame is made for
+// (graphics come in through its inverse output transform; effects made for display values run through it and back).
+struct SceneGrading {
+    const ColorSpace* working = nullptr;
+    const ColorSpace* linear = nullptr;
+    const ColorSpace* display = nullptr;
+    double peakNits = 1000;
+    OutputTransformKind kind = OutputTransformKind::Filmic;
+    bool exact = false;  // (deliveries: the output transform worked out for each pixel)
+};
+const SceneGrading* currentSceneGrading();
+class SceneGradingScope {
+public:
+    explicit SceneGradingScope(const SceneGrading* g);
+    ~SceneGradingScope();
+    SceneGradingScope(const SceneGradingScope&) = delete;
+    SceneGradingScope& operator=(const SceneGradingScope&) = delete;
+
+private:
+    const SceneGrading* previous_;
+};
+// Premultiplied pixels from one space's code values to another's exactly (linear light through the primaries, no
+// display rendering, no table): between scene-referred spaces.
+void convertExactly(Image& img, const ColorSpace& from, const ColorSpace& to);
+
 // Transfer functions: code value -> linear (display light for display
 // transfers, relative to SDR white = 1.0, so PQ 203 nits = 1.0) and back.
 double toLinear(Transfer t, double v);

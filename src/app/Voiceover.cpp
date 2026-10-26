@@ -54,6 +54,7 @@ bool WavWriter::open(const QString& path, int sampleRate, int channels) {
     rate_ = sampleRate;
     channels_ = std::max(1, channels);
     frames_ = 0;
+    failed_ = false;
     // RIFF header with the sizes left for close() (WAVE_FORMAT_IEEE_FLOAT, 32 bits).
     file_.write("RIFF", 4);
     put32(file_, 0);
@@ -70,10 +71,13 @@ bool WavWriter::open(const QString& path, int sampleRate, int channels) {
     return true;
 }
 
-void WavWriter::write(const float* interleaved, qint64 frames) {
-    if (!file_.isOpen() || frames <= 0) return;
-    file_.write(reinterpret_cast<const char*>(interleaved), frames * channels_ * qint64(sizeof(float)));
-    frames_ += frames;
+bool WavWriter::write(const float* interleaved, qint64 frames) {
+    if (!file_.isOpen() || frames <= 0) return file_.isOpen();
+    const qint64 bytes = frames * channels_ * qint64(sizeof(float));
+    const qint64 wrote = file_.write(reinterpret_cast<const char*>(interleaved), bytes);
+    if (wrote != bytes) failed_ = true;
+    frames_ += std::max<qint64>(0, wrote) / (channels_ * qint64(sizeof(float)));  // (the header says what is there)
+    return !failed_;
 }
 
 bool WavWriter::close() {
@@ -83,8 +87,9 @@ bool WavWriter::close() {
     put32(file_, 36 + data);
     file_.seek(40);
     put32(file_, data);
+    if (!file_.flush() || file_.error() != QFileDevice::NoError) failed_ = true;
     file_.close();
-    return true;
+    return !failed_;
 }
 
 // ---------------------------------------------------------------------------
@@ -237,11 +242,21 @@ Id VoiceoverRecorder::stop() {
         source_ = nullptr;
     }
     const qint64 frames = writer_.frames();
-    writer_.close();
+    const bool whole = writer_.close();
     if (frames == 0) {
         QFile::remove(path_);
         loopIn_ = loopOut_ = 0;
         return 0;
+    }
+    if (!whole) {
+        state_->message(tr("The recording could not all be written (is the disk full?): what was is kept in %1").arg(path_), 8000);
+        // (a loop recording cut short is not cut into passes: it is kept whole, as it is)
+        if (isLooping()) {
+            loopIn_ = loopOut_ = preroll_ = 0;
+            lastTake_ = path_;
+            emit stopped(0);
+            return 0;
+        }
     }
     if (isLooping()) return stopLoop();
     lastTake_ = path_;
@@ -288,20 +303,35 @@ Id VoiceoverRecorder::stopLoop() {
     const std::vector<LoopPass> passes =
         loopPasses(frames, std::llround(double(preroll) / fps * rate_), double(out - in) / fps * rate_, rate_);
     QStringList files;
+    bool written = true;
     const QString stem = QFileInfo(path_).completeBaseName() + QStringLiteral(" pass ");
     for (size_t k = 0; k < passes.size(); ++k) {
         const QString file = takeFolder() + '/' + stem + QString::number(k + 1) + QStringLiteral(".wav");
         WavWriter w;
-        if (!w.open(file, rate_, channels_)) continue;
+        if (!w.open(file, rate_, channels_)) {
+            written = false;
+            break;
+        }
         w.write(samples + passes[k].first * channels_, passes[k].count);
-        if (w.close()) files << file;
+        if (!w.close()) {
+            QFile::remove(file);
+            written = false;
+            break;
+        }
+        files << file;
     }
-    QFile::remove(path_);
-    if (files.isEmpty()) {
-        state_->message(tr("The loop recording ended before a whole pass"), 5000);
+    // The whole recording goes only once every pass is safely written; else it is kept, and the passes written so far
+    // removed (nothing is lost, and nothing goes on the timeline half done).
+    if (!written || files.isEmpty()) {
+        for (const QString& f : files) QFile::remove(f);
+        state_->message(written ? tr("The loop recording ended before a whole pass: it is kept in %1").arg(path_)
+                                : tr("The passes of the loop recording could not be written (is the disk full?): it is kept in %1").arg(path_),
+                        8000);
+        lastTake_ = path_;
         emit stopped(0);
         return 0;
     }
+    QFile::remove(path_);
     lastTake_ = files.back();
     const auto ids = state_->importFiles(files, nullptr, folder_);
     for (const Id media : ids) emit taken(media, in);

@@ -65,6 +65,8 @@
 #include "CurveEditor.h"
 #include "render/ClipAnalysis.h"
 #include "render/ColorSlice.h"
+#include "render/ColorSpace.h"
+#include "render/Processing.h"
 #include "render/Compositor.h"
 #include "render/OGraf.h"
 #include "render/Restoration.h"
@@ -151,11 +153,12 @@ QString InspectorWidget::signature() const {
                                          ? edit::effectChain(const_cast<Sequence&>(*s), state_->inspectedChain())
                                          : nullptr;
         if (!chain) return {};
-        QString sig = QString("X%1").arg(state_->inspectedChain());
+        QString sig = QString("X%1").arg(state_->inspectedChain()) + (sceneReferredWorking(*s) ? QStringLiteral(":scene") : QString());
         for (const auto& e : *chain) sig += QString(":%1%2").arg(e.id).arg(e.enabled ? "+" : "-");
         return sig;
     }
     QString sig = QString("C%1:%2:%3").arg(c->id).arg(QString::fromStdString(c->generator.type)).arg(c->mediaId);
+    if (sceneReferredWorking(*s)) sig += QStringLiteral(":scene");  // (effects that work on display values are marked)
     // An OGraf graphic's fields: rebuild when another graphic is chosen.
     if (c->generator.type == "ograf") sig += "|G" + QString::fromStdString(c->generator.s("manifest"));
     // A graphic's fields: rebuild when one is published, removed or renamed.
@@ -844,7 +847,7 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
         auto* reset = smallButton(tools, QStringLiteral("↺"), tr("Reset"));
         auto* del = smallButton(tools, QStringLiteral("✕"), tr("Remove Effect"));
         QToolButton* editor = nullptr;
-        if (e.type == "plugin") {
+        if (e.type == "plugin" || e.type == "ara") {
             editor = smallButton(tools, tr("Editor"), tr("Open the plugin's own editor"));
             editor->setObjectName("pluginEditor");
             th->addWidget(editor);
@@ -857,6 +860,15 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                            static_cast<QWidget*>(reset), static_cast<QWidget*>(del)})
             th->addWidget(w);
         QFormLayout* f = addSection(QString::fromStdString(info->displayName), tools);
+        if (state_->sequence() && sceneReferredWorking(*state_->sequence()) && effectDomain(e.type) == EffectDomain::Display) {
+            // (it cannot work on scene light: it gets the picture as the display shows it, and gives it back)
+            auto* note = new QLabel(tr("On the displayed picture: graded scene-referred, this effect works through the output "
+                                       "transform and back, so it does not see light above the display's peak"), content_);
+            note->setObjectName(QStringLiteral("displayDomain"));
+            note->setWordWrap(true);
+            note->setStyleSheet(QString("color: %1;").arg(theme::kTextDim.name()));
+            f->addRow(note);
+        }
         if (e.type == "color_correct") addColorWheels(f, target(eid));
         if (e.type == "hdr_palette") addHdrPalette(f, *info, target(eid));
         else if (e.type == "color_slice") addColorSlice(f, *info, target(eid));
@@ -1626,6 +1638,12 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                 if (v[k].type == "plugin") {
                     // Keep the plugin; put its parameters back to their defaults.
                     for (const ParamInfo& pi : effectParams(v[k])) v[k].params[pi.name] = Param(pi.def);
+                } else if (v[k].type == "ara") {
+                    // Keep the ARA plug-in; its document (analysis and edits) starts afresh.
+                    Effect e = makeEffect(v[k].type, v[k].id);
+                    e.strings = v[k].strings;
+                    e.strings.erase("archive");
+                    v[k] = e;
                 } else if (v[k].type == "lens_correction") {
                     // Keep the lens and what it was chosen with; put the rest back.
                     Effect e = makeEffect(v[k].type, v[k].id);
@@ -1658,6 +1676,11 @@ void InspectorWidget::addEffectMenu(TrackKind kind, Id owner, int node) {
         QString label = QString::fromStdString(info->displayName);
         g->addAction(label, this, [this, owner, type, label, node] {
             if (!ensureEffectModel(window(), type)) return;
+            // Bandwidth Extension: the models the clip's cut-off needs.
+            if (type == "bandwidth_extension" && state_->sequence())
+                if (const Clip* c = edit::clipById(*state_->sequence(), owner);
+                    c && !ensureBandwidthModels(window(), state_->project(), *state_->sequence(), *c))
+                    return;
             Id added = 0;
             state_->edit(tr("Add %1").arg(label), [owner, type, node, &added](Project& p, Sequence& s) {
                 std::vector<Effect>* chain = edit::effectChain(s, owner);

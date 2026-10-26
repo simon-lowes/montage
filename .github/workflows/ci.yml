@@ -75,6 +75,22 @@ jobs:
               || { rm -f "$d/$name"; echo "::warning::Could not download Cryptomatte's $name; the sample test will be skipped"; }
           done
           [ "$(ls "$d" | wc -l)" -eq 5 ] && echo "MONTAGE_CRYPTOMATTE_SAMPLES=$d" >> "$GITHUB_ENV" || true
+      - name: Khronos's glTF sample models for the 3D model test
+        run: |
+          d="$HOME/gltf-samples"
+          mkdir -p "$d"
+          base="https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0"
+          # (CC BY 4.0, donated by Cesium; the repository is archived, and each file is checked by its hash)
+          for f in Box/glTF-Binary/Box.glb:ed52f7192b8311d700ac0ce80644e3852cd01537e4d62241b9acba023da3d54e \
+                   BoxTextured/glTF-Binary/BoxTextured.glb:2d055d2d56a492d1b9302de6e733046b625cf51e5f2a3090bd3a8c11acc93c17 \
+                   CesiumMan/glTF-Binary/CesiumMan.glb:659349b0a374b73d5362a61070039bc8601401bbdeacbece4f3680fb4bfd41b0; do
+            path="${f%%:*}"
+            name="$(basename "$path")"
+            curl -fsSL --retry 3 -o "$d/$name" "$base/$path" \
+              && [ "$(sha256sum "$d/$name" | cut -d' ' -f1)" = "${f#*:}" ] \
+              || { rm -f "$d/$name"; echo "::warning::Could not download $name; the sample model test will be skipped"; }
+          done
+          [ "$(ls "$d" | wc -l)" -eq 3 ] && echo "MONTAGE_TEST_GLTF_SAMPLES=$d" >> "$GITHUB_ENV" || true
       - name: Cache the AI models
         uses: actions/cache@v4
         with:
@@ -109,6 +125,31 @@ jobs:
         with:
           path: ~/montage-models/stems/bandit-v2-eng
           key: bandit-eng-12701995
+      # Saved only once both checkpoints are here, as the dialogue, music and effects model is.
+      - name: Restore the speech bandwidth models
+        id: bwe-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/montage-models/bwe
+          key: apbwe-fa3f46d-8k16k-8k48k
+      - name: The speech bandwidth models (two AP-BWE checkpoints, 238 MB)
+        id: bwe
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          if [ "${{ steps.bwe-cache.outputs.cache-hit }}" != "true" ]; then
+            scripts/fetch-models.sh ~/montage-models --bwe-test \
+              || echo "::warning::Could not download the speech bandwidth models; their test will be skipped"
+            rm -f ~/montage-models/bwe/*/*.part
+            if [ -s ~/montage-models/bwe/apbwe-8k-16k/generator.ckpt ] && [ -s ~/montage-models/bwe/apbwe-8k-48k/generator.ckpt ]; then echo "fetched=1" >> "$GITHUB_OUTPUT"; fi
+          fi
+          echo "MONTAGE_BWE_MODELS=$HOME/montage-models/bwe" >> "$GITHUB_ENV"
+      - name: Keep the speech bandwidth models
+        if: steps.bwe.outputs.fetched == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/montage-models/bwe
+          key: apbwe-fa3f46d-8k16k-8k48k
       - name: Cache the reference IAMF decoder
         uses: actions/cache@v4
         with:
@@ -118,6 +159,15 @@ jobs:
         run: |
           scripts/build-iamfdec.sh ~/iamfdec && echo "MONTAGE_TEST_IAMFDEC=$HOME/iamfdec/bin/iamfdec" >> "$GITHUB_ENV" \
             || echo "::warning::Could not build the reference IAMF decoder; its part of the IAMF test will be skipped"
+      - name: Cache the ARA test plug-in
+        uses: actions/cache@v4
+        with:
+          path: ~/ara-test-plugin
+          key: ara-test-plugin-${{ runner.os }}-${{ hashFiles('scripts/build-ara-test-plugin.sh') }}
+      - name: The ARA SDK's test plug-in (VST3 and CLAP) for the ARA hosting test
+        run: |
+          scripts/build-ara-test-plugin.sh ~/ara-test-plugin && echo "MONTAGE_TEST_ARA_PLUGINS=$HOME/ara-test-plugin" >> "$GITHUB_ENV" \
+            || echo "::warning::Could not build the ARA test plug-in; the ARA hosting tests will be skipped"
       - name: Cache the reference gain-map decoder
         uses: actions/cache@v4
         with:
@@ -157,3 +207,8 @@ jobs:
             || echo "::warning::Could not install pyavb; the Avid bin tests' comparisons with pyavb will be skipped"
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: The window read over AT-SPI, as a screen reader on Linux reads it
+        run: |
+          sudo apt-get install -y --no-install-recommends at-spi2-core python3-pyatspi > /dev/null
+          build/src/montage-cli new -o "$RUNNER_TEMP/atspi.montage" tests/data/jfk.wav
+          dbus-run-session -- xvfb-run -a /usr/bin/python3 scripts/atspi-check.py build/src/app/montage "$RUNNER_TEMP/atspi.montage"

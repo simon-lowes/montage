@@ -1,4 +1,6 @@
 #include "MainWindow.h"
+
+#include "Accessibility.h"
 #include "MonitorCalibrationDialog.h"
 #include "PatchGenerator.h"
 #include "LiveBridge.h"
@@ -180,6 +182,7 @@
 #include "StackedTimelineWidget.h"
 #include "PanFollowDialog.h"
 #include "RedactFacesDialog.h"
+#include "LearnEffectDialog.h"
 #include "SpectralRepairDialog.h"
 #include "ShotSearchPanel.h"
 #include "SoundLibraryPanel.h"
@@ -234,6 +237,7 @@ namespace montage {
 
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
+    access::install();
     state_ = new EditorState(this);
     liveLink_ = new LiveLink(state_, this);
     program_ = new PlaybackController(this);
@@ -301,9 +305,21 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     connect(state_, &EditorState::historyChanged, this, &MainWindow::updateActions);
     connect(state_, &EditorState::selectionChanged, this, &MainWindow::updateActions);
     connect(state_, &EditorState::fileStateChanged, this, &MainWindow::updateTitle);
-    connect(state_, &EditorState::statusMessage, this, [this](const QString& text, int ms) { statusBar()->showMessage(text, ms); });
+    connect(state_, &EditorState::statusMessage, this, [this](const QString& text, int ms) {
+        statusBar()->showMessage(text, ms);
+        access::announce(this, text);
+    });
+    // Each edit said as it happens, with the clip it left selected.
+    connect(state_, &EditorState::edited, this, [this](const QString& what) {
+        QString text = what;
+        if (const Sequence* s = state_->sequence(); s && state_->focusClip())
+            if (const QString clip = access::clipDescription(*s, state_->focusClip()); !clip.isEmpty())
+                text += QStringLiteral(". ") + clip;
+        access::announce(this, text);
+    });
     connect(state_, &EditorState::mediaReady, this, [this] { program_->requestFrame(); });
     connect(program_, &PlaybackController::scopeFrameRendered, scopes_, &ScopesWidget::setSignal);
+    connect(scopes_, &ScopesWidget::readWorkingChanged, program_, &PlaybackController::setScopesReadWorking);
     connect(program_, &PlaybackController::audioLevels, this, [this](float l, float r, const QVector<float>& tracks) {
         meter_->setLevels(l, r);
         mixer_->setLevels(l, r, tracks);
@@ -1469,6 +1485,7 @@ void MainWindow::buildMenus() {
     add(clipM, tr("S&pectral Repair…"), QKeySequence(), withSeq([this] { spectralRepairDialog(); }))->setObjectName(QStringLiteral("spectralRepair"));
     add(clipM, tr("Pan to &Follow…"), QKeySequence(), withSeq([this] { panFollowDialog(); }))->setObjectName(QStringLiteral("panFollow"));
     add(clipM, tr("Redact &Faces…"), QKeySequence(), withSeq([this] { redactFacesDialog(); }))->setObjectName(QStringLiteral("redactFaces"));
+    add(clipM, tr("Learn Effect from E&xamples…"), QKeySequence(), withSeq([this] { learnEffectDialog(); }))->setObjectName(QStringLiteral("learnEffect"));
     add(clipM, tr("Remove Letterbo&x"), QKeySequence(), withSeq([this] { removeLetterbox(); }))->setObjectName(QStringLiteral("removeLetterbox"));
     // Colour groups: grade shots together, before and after each clip's own grade (core/ColorGroups.h).
     QMenu* groupM = clipM->addMenu(tr("Colour &Group"));
@@ -1782,7 +1799,7 @@ void MainWindow::buildMenus() {
     add(clipM, tr("Nudge &Left"), QKeySequence("Alt+Left"), [this] { nudge(-1); });
     add(clipM, tr("Nudge &Right"), QKeySequence("Alt+Right"), [this] { nudge(1); });
     clipM->addSeparator();
-    add(clipM, tr("New &Title"), QKeySequence("Ctrl+T"), [this] { addTitle(); });
+    add(clipM, tr("New &Title"), QKeySequence("Ctrl+T"), [this] { addTitle(); })->setObjectName(QStringLiteral("newTitle"));
     add(clipM, tr("Add OGraf Graphic…"), QKeySequence(), withSeq([this] { addOGrafGraphic(); }))
         ->setObjectName(QStringLiteral("addOGrafGraphic"));
     // Graphics templates (core/GraphicsTemplate.h): from the library, a picture published, filled from a table.
@@ -1994,6 +2011,16 @@ void MainWindow::buildMenus() {
         ->setObjectName(QStringLiteral("selectForward"));
     add(seqM, tr("Select Clips After Playhead on Target Track"), QKeySequence("Shift+A"), [this] { selectForward(false); })
         ->setObjectName(QStringLiteral("selectForwardTrack"));
+    add(seqM, tr("Select Next Clip"), QKeySequence("Alt+Down"), [this] { selectNeighbourClip(1); })
+        ->setObjectName(QStringLiteral("selectNextClip"));
+    add(seqM, tr("Select Previous Clip"), QKeySequence("Alt+Up"), [this] { selectNeighbourClip(-1); })
+        ->setObjectName(QStringLiteral("selectPreviousClip"));
+    add(seqM, tr("Select Clip on Track Above"), QKeySequence("Alt+Shift+Up"), [this] { selectClipOnTrack(-1); })
+        ->setObjectName(QStringLiteral("selectClipAbove"));
+    add(seqM, tr("Select Clip on Track Below"), QKeySequence("Alt+Shift+Down"), [this] { selectClipOnTrack(1); })
+        ->setObjectName(QStringLiteral("selectClipBelow"));
+    add(seqM, tr("Select Clip at Playhead"), QKeySequence("Shift+C"), [this] { selectClipAtPlayhead(); })
+        ->setObjectName(QStringLiteral("selectClipAtPlayhead"));
     add(seqM, tr("Add &Marker"), QKeySequence(Qt::Key_M), [this] { addMarker(); });
     add(seqM, tr("Add C&hapter Marker"), QKeySequence("Alt+M"), [this] { addChapterMarker(); })->setObjectName(QStringLiteral("addChapter"));
     add(seqM, tr("Add C&lip Marker"), QKeySequence("Shift+Alt+M"), [this] { addClipMarker(); })->setObjectName(QStringLiteral("addClipMarker"));
@@ -2618,6 +2645,23 @@ void MainWindow::buildMenus() {
     })->setObjectName(QStringLiteral("saveWorkspace"));
     deleteWorkspaceMenu_ = workspaceMenu_->addMenu(tr("&Delete Workspace"));
     add(windowMenu_, tr("&Reset Workspace to Saved Layout"), QKeySequence(), [this] { resetLayout(); })->setObjectName(QStringLiteral("resetWorkspace"));
+    windowMenu_->addSeparator();
+    add(windowMenu_, tr("Next Panel"), QKeySequence(Qt::Key_F6), [this] { focusPanel(1); })->setObjectName(QStringLiteral("nextPanel"));
+    add(windowMenu_, tr("Previous Panel"), QKeySequence("Shift+F6"), [this] { focusPanel(-1); })->setObjectName(QStringLiteral("previousPanel"));
+    add(windowMenu_, tr("Next Tab in Panel"), QKeySequence("Ctrl+F6"), [this] { nextPanelTab(); })->setObjectName(QStringLiteral("nextPanelTab"));
+    QAction* contrast = add(windowMenu_, tr("&High Contrast"), QKeySequence(), [this](bool on) { setHighContrast(on); });
+    contrast->setObjectName(QStringLiteral("highContrast"));
+    contrast->setCheckable(true);
+    contrast->setChecked(theme::highContrast());
+    QMenu* textSize = windowMenu_->addMenu(tr("Text &Size"));
+    auto* textSizes = new QActionGroup(this);
+    for (const int percent : {100, 125, 150, 175, 200}) {
+        QAction* a = add(textSize, tr("%1 %").arg(percent), QKeySequence(), [this, percent] { setTextScale(percent / 100.0); });
+        a->setObjectName(QStringLiteral("textSize%1").arg(percent));
+        a->setCheckable(true);
+        a->setChecked(std::lround(theme::textScale() * 100) == percent);
+        textSizes->addAction(a);
+    }
     workspaceBar_ = new QTabBar(this);
     workspaceBar_->setObjectName(QStringLiteral("workspaceBar"));
     workspaceBar_->setDrawBase(false);
@@ -6106,6 +6150,26 @@ RedactFacesDialog* MainWindow::redactFacesDialog() {
     return dlg;
 }
 
+LearnEffectDialog* MainWindow::learnEffectDialog() {
+    const Clip* c = state_->primaryClip();
+    const auto loc = c && state_->sequence() ? edit::locate(*state_->sequence(), c->id) : std::nullopt;
+    if (!c || !loc || loc->track.kind != TrackKind::Video) {
+        state_->message(tr("Select the video clip you worked on by hand: its effects are what is learned"));
+        return nullptr;
+    }
+    // (One a clip: two would train into the same file.)
+    for (LearnEffectDialog* open : findChildren<LearnEffectDialog*>())
+        if (open->clip() == c->id && open->isVisible()) {
+            open->raise();
+            open->activateWindow();
+            return open;
+        }
+    auto* dlg = new LearnEffectDialog(state_, c->id, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->show();
+    return dlg;
+}
+
 PanFollowDialog* MainWindow::panFollowDialog() {
     const Clip* c = musicClip();
     if (!c || !c->mediaId) {
@@ -8687,6 +8751,167 @@ void MainWindow::refreshRenderBar(bool wait) {
     watcher->setFuture(QtConcurrent::run(work));
 }
 
+bool MainWindow::selectNeighbourClip(int step) {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    // (From the clip the keyboard is on, not a linked partner selected with it.)
+    const Id on = state_->focusClip();
+    const auto loc = on ? edit::locate(*s, on) : std::nullopt;
+    TrackRef track = loc ? loc->track
+                         : (s->videoTracks.empty() ? TrackRef{TrackKind::Audio, state_->targetAudioTrack()}
+                                                   : TrackRef{TrackKind::Video, state_->targetVideoTrack()});
+    const Track* t = trackAt(*s, track);
+    if (!t) {
+        access::announce(this, tr("No tracks"));
+        return false;
+    }
+    const Clip* pick = nullptr;
+    if (loc) {
+        const auto it = std::find_if(t->clips.begin(), t->clips.end(), [&](const Clip& c) { return c.id == on; });
+        const auto i = it - t->clips.begin() + step;
+        if (it != t->clips.end() && i >= 0 && i < ptrdiff_t(t->clips.size())) pick = &t->clips[size_t(i)];
+    } else {
+        // From the playhead: the clip starting after it (or under it), else the one ending before it.
+        for (const Clip& c : t->clips) {
+            if (step > 0 && (c.contains(s->playhead) || c.start > s->playhead)) {
+                pick = &c;
+                break;
+            }
+            if (step < 0 && c.start < s->playhead) pick = &c;
+        }
+    }
+    if (!pick) {
+        access::announce(this, step > 0 ? tr("No clip after this on %1").arg(access::trackName(*s, track))
+                                        : tr("No clip before this on %1").arg(access::trackName(*s, track)));
+        return false;
+    }
+    const Id id = pick->id;
+    const FrameTime start = pick->start;
+    state_->setSelection({id});
+    state_->setPlayhead(start);
+    access::announce(this, access::clipDescription(*state_->sequence(), id));
+    return true;
+}
+
+bool MainWindow::selectClipOnTrack(int step) {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    const Id on = state_->focusClip();
+    const auto loc = on ? edit::locate(*s, on) : std::nullopt;
+    const TrackRef from = loc ? loc->track
+                              : (s->videoTracks.empty() ? TrackRef{TrackKind::Audio, state_->targetAudioTrack()}
+                                                        : TrackRef{TrackKind::Video, state_->targetVideoTrack()});
+    const Clip* current = loc ? edit::clipById(*s, on) : nullptr;
+    const FrameTime at = current ? current->start : s->playhead;
+    const std::vector<TrackRef> shown = timeline_->shownTracks();
+    const auto it = std::find(shown.begin(), shown.end(), from);
+    // (From a track not shown, inside a closed folder: the first track shown going down, the last going up.)
+    const ptrdiff_t base = it != shown.end() ? it - shown.begin() : step > 0 ? -1 : ptrdiff_t(shown.size());
+    const auto i = base + step;
+    if (i < 0 || i >= ptrdiff_t(shown.size())) {
+        access::announce(this, step < 0 ? tr("No track above") : tr("No track below"));
+        return false;
+    }
+    const TrackRef to = shown[size_t(i)];
+    if (to.kind == TrackKind::Video) state_->setTargetVideoTrack(to.index);
+    else state_->setTargetAudioTrack(to.index);
+    s = state_->sequence();
+    const Clip* pick = edit::clipAt(*s, to, at);
+    const QString track = access::trackName(*s, to);
+    if (!pick) {
+        state_->clearSelection();
+        access::announce(this, tr("%1, no clip at %2").arg(track, timecodeString(s, at)));
+        return false;
+    }
+    const Id id = pick->id;
+    state_->setSelection({id});
+    access::announce(this, access::clipDescription(*state_->sequence(), id));
+    return true;
+}
+
+bool MainWindow::selectClipAtPlayhead() {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    const Clip* pick = nullptr;
+    if (!s->videoTracks.empty()) pick = edit::clipAt(*s, {TrackKind::Video, state_->targetVideoTrack()}, s->playhead);
+    if (!pick && !s->audioTracks.empty()) pick = edit::clipAt(*s, {TrackKind::Audio, state_->targetAudioTrack()}, s->playhead);
+    if (!pick) {
+        access::announce(this, tr("No clip at the playhead on the target tracks"));
+        return false;
+    }
+    const Id id = pick->id;
+    state_->setSelection({id});
+    access::announce(this, access::clipDescription(*state_->sequence(), id));
+    return true;
+}
+
+namespace {
+// The control in a panel the keyboard lands on: the one last focused there, else its first that takes focus.
+QWidget* focusTarget(QWidget* panel) {
+    if (QWidget* w = panel->focusWidget(); w && w->isVisible() && w->isEnabled() && panel->isAncestorOf(w)) return w;
+    if (panel->focusPolicy() & Qt::TabFocus) return panel;
+    for (QWidget* w : panel->findChildren<QWidget*>())
+        if ((w->focusPolicy() & Qt::TabFocus) && w->isVisibleTo(panel) && w->isEnabled()) return w;
+    return panel;
+}
+}  // namespace
+
+QDockWidget* MainWindow::focusPanel(int step) {
+    // The timeline (null here) and the panels shown, in the order the Window menu lists them.
+    std::vector<QDockWidget*> panels{nullptr};
+    for (QDockWidget* d : docks_)
+        if (d->isVisible() && d->widget() && !d->isFloating()) panels.push_back(d);
+    for (QDockWidget* d : docks_)
+        if (d->isVisible() && d->widget() && d->isFloating()) panels.push_back(d);
+    int current = 0;
+    if (QWidget* f = QApplication::focusWidget())
+        for (size_t i = 1; i < panels.size(); ++i)
+            if (panels[i]->isAncestorOf(f)) current = int(i);
+    const int n = int(panels.size());
+    QDockWidget* next = panels[size_t(((current + step) % n + n) % n)];
+    QWidget* target = next ? focusTarget(next->widget()) : timeline_;
+    if (next) next->raise();
+    target->activateWindow();
+    target->setFocus(Qt::OtherFocusReason);
+    access::announce(this, next ? tr("%1 panel").arg(next->windowTitle()) : tr("Timeline"));
+    return next;
+}
+
+QDockWidget* MainWindow::nextPanelTab() {
+    QWidget* f = QApplication::focusWidget();
+    QDockWidget* in = nullptr;
+    for (QDockWidget* d : docks_)
+        if (f && d->isAncestorOf(f)) in = d;
+    if (!in) return nullptr;
+    // The panels tabbed with it, in the Window menu's order, and the one after it.
+    const QList<QDockWidget*> tabbed = tabifiedDockWidgets(in);
+    if (tabbed.isEmpty()) return nullptr;
+    std::vector<QDockWidget*> group;
+    for (QDockWidget* d : docks_)
+        if (d == in || tabbed.contains(d)) group.push_back(d);
+    const auto it = std::find(group.begin(), group.end(), in);
+    QDockWidget* next = group[size_t((it - group.begin() + 1) % ptrdiff_t(group.size()))];
+    next->show();
+    next->raise();
+    focusTarget(next->widget())->setFocus(Qt::OtherFocusReason);
+    access::announce(this, tr("%1 panel").arg(next->windowTitle()));
+    return next;
+}
+
+void MainWindow::setHighContrast(bool on) {
+    theme::setHighContrast(on);
+    theme::saveSettings();
+    theme::apply(*qApp);
+    if (auto* a = findChild<QAction*>(QStringLiteral("highContrast"))) a->setChecked(on);
+}
+
+void MainWindow::setTextScale(double scale) {
+    theme::setTextScale(scale);
+    theme::saveSettings();
+    theme::apply(*qApp);
+    if (auto* a = findChild<QAction*>(QStringLiteral("textSize%1").arg(std::lround(theme::textScale() * 100)))) a->setChecked(true);
+}
+
 int MainWindow::selectForward(bool allTracks) {
     const Sequence* s = state_->sequence();
     if (!s) return 0;
@@ -9215,6 +9440,8 @@ void MainWindow::newSequence() {
             s.vr180 = spec.vr180;
             s.stereo3d = spec.stereo3d;
             s.filmGauge = spec.filmGauge;
+            s.workingSpace = spec.workingSpace;
+            s.outputTransform = spec.outputTransform;
             return true;
         });
 }

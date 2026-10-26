@@ -2,6 +2,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
@@ -21,6 +22,11 @@ namespace montage {
 // `sourceSeconds` is the media time of the frame (for effects that follow
 // the footage, such as Stabilize); -1 when there is none.
 void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds = -1);
+// The values an effect is made for, in a sequence graded scene-referred: log (lift, gamma and gain, curves, the Colour
+// Warper), light (blurs, lens effects, Relight), the picture as a display shows it (keys, stylising effects: run through
+// the output transform and back), or whatever the working space holds. applyVideoEffect runs each in its own.
+enum class EffectDomain { AsIs, Log, Linear, Display };
+EffectDomain effectDomain(const std::string& type);
 
 // Film Negative (render/FilmScan.h): the base found in the frame's rebate (or as set), the negative inverted in the
 // picture's own curve `transfer`. Steady on Perforations: the frame moved so its perforations sit where they were on the
@@ -99,6 +105,25 @@ public:
 
 private:
     std::string previous_;
+};
+// How a frame being drawn takes effects that run for seconds a frame (a Learned Effect): `run` (deliveries, previews
+// rendered ahead) runs them, else a result already made is used or the frame goes without, told to `issues`.
+struct RenderIssues;
+struct SlowEffects {
+    bool run = true;
+    const std::atomic<bool>* cancel = nullptr;
+    RenderIssues* issues = nullptr;
+};
+const SlowEffects& currentSlowEffects();
+class SlowEffectsScope {
+public:
+    explicit SlowEffectsScope(SlowEffects slow);
+    ~SlowEffectsScope();
+    SlowEffectsScope(const SlowEffectsScope&) = delete;
+    SlowEffectsScope& operator=(const SlowEffectsScope&) = delete;
+
+private:
+    SlowEffects previous_;
 };
 // And the faces in the frame (media/Faces.h), for Face Refinement.
 struct FaceBox;

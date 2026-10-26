@@ -23,6 +23,7 @@
 #include <set>
 #include <utility>
 
+#include "Accessibility.h"
 #include "EditorState.h"
 #include "LensCorrectionDialog.h"
 #include "ModelPacks.h"
@@ -128,6 +129,7 @@ TimelineWidget::TimelineWidget(EditorState* state, QWidget* parent) : QAbstractS
     setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     setFrameShape(QFrame::NoFrame);
     setFocusPolicy(Qt::StrongFocus);
+    setAccessibleName(tr("Timeline"));
     horizontalScrollBar()->setSingleStep(20);
     verticalScrollBar()->setSingleStep(20);
     connect(state_, &EditorState::projectChanged, this, [this] {
@@ -136,16 +138,19 @@ TimelineWidget::TimelineWidget(EditorState* state, QWidget* parent) : QAbstractS
         gap_.reset();
         updateScrollBars();
         viewport()->update();
+        access::timelineChanged(this);
     });
     connect(state_, &EditorState::selectionChanged, this, [this] {
         if (!state_->selectedClips().empty()) gap_.reset();
         viewport()->update();
+        access::timelineSelectionChanged(this);
     });
     connect(state_, &EditorState::playheadChanged, viewport(), qOverload<>(&QWidget::update));
     connect(state_, &EditorState::sequenceSwitched, this, [this] {
         duplicatesDirty_ = throughDirty_ = syncDirty_ = true;
         horizontalScrollBar()->setValue(0);
         zoomToFit();
+        access::timelineChanged(this);
     });
     connect(state_, &EditorState::mediaReady, viewport(), qOverload<>(&QWidget::update));
     connect(&ThumbnailCache::instance(), &ThumbnailCache::ready, viewport(), qOverload<>(&QWidget::update));
@@ -1295,6 +1300,23 @@ bool TimelineWidget::clipRect(Id clip, QRect& r, TrackKind* kind) const {
             }
     }
     return false;
+}
+
+std::vector<TrackRef> TimelineWidget::shownTracks() const {
+    std::vector<TrackRef> tracks;
+    if (state_->sequence())
+        for (const Row& row : rows()) tracks.push_back(row.ref);
+    return tracks;
+}
+
+QRect TimelineWidget::spanBounds(TrackRef track, FrameTime from, FrameTime to) const {
+    if (!state_->sequence()) return {};
+    for (const Row& row : rows())
+        if (row.ref == track) {
+            const int xs = xForFrame(from), xe = xForFrame(to);
+            return QRect(xs, row.y + 1, std::max(2, xe - xs), row.h - 3);
+        }
+    return {};
 }
 
 bool TimelineWidget::laneOf(Id clip, Lane& lane, QRect& band) const {
@@ -2811,6 +2833,10 @@ void TimelineWidget::dropEffect(const QString& typeQ, const QPoint& pos) {
                 return;
             }
             Id id = h.clip;
+            // Bandwidth Extension: the models the clip's cut-off needs.
+            if (type == "bandwidth_extension")
+                if (const Clip* c = edit::clipById(*s, id); c && !ensureBandwidthModels(window(), state_->project(), *s, *c)) return;
+            if (!(s = state_->sequence())) return;  // (a download waits in an event loop)
             QString error;
             state_->edit(tr("Add %1").arg(name), [id, type, &error](Project& p, Sequence& sq) {
                 Clip* c = edit::clipById(sq, id);

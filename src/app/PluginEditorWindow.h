@@ -16,6 +16,9 @@ class QTimer;
 namespace montage {
 
 class EditorState;
+namespace ara {
+class Session;
+}
 
 class PluginEditorWindow : public QWidget, public plugins::EditorListener {
     Q_OBJECT
@@ -29,7 +32,7 @@ public:
 
     Id clipId() const { return clip_; }
     Id effectId() const { return effect_; }
-    plugins::Instance* instance() const { return inst_.get(); }
+    plugins::Instance* instance() const;
     // Stores the editor's current settings in the effect (also done on close).
     void saveSettings();
 
@@ -51,6 +54,9 @@ private:
     EditorState* state_;
     Id clip_, effect_;
     std::unique_ptr<plugins::Instance> inst_;
+    std::shared_ptr<ara::Session> ara_;  // an ARA plug-in's live document for the clip (its instance edits it)
+    std::string araArchive_;             // the effect's archive the document holds
+    bool discard_ = false;               // closing without saving (the effect's document was replaced)
     QWidget* host_ = nullptr;
     QTimer* idle_ = nullptr;
     std::map<uint32_t, int> gesture_;  // parameter -> serial of the drag in progress

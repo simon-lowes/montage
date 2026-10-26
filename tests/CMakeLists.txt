@@ -10,14 +10,17 @@ endfunction()
 montage_test(test_core)
 montage_test(test_render)
 target_link_libraries(test_render PRIVATE Qt6::Network)  # (free ports for the remote review stream)
+# (The DCP tests alone take minutes on a slow container: 317 s in the nightly build's in October 2026.)
+set_tests_properties(test_render PROPERTIES TIMEOUT 900)
 montage_test(test_media)
 target_link_libraries(test_media PRIVATE Qt6::Network)  # (a free port for the capture tests)
 if(TARGET OpenEXR::OpenEXR)
   target_link_libraries(test_media PRIVATE OpenEXR::OpenEXR)  # (writing multi-part files)
 endif()
 # Several minutes of real encoding, decoding and model runs: slow CI runners need more than the default (macOS
-# runners took 846 s on main in October 2026, and over 900 s on a slower one).
-set_tests_properties(test_media PROPERTIES TIMEOUT 1500)
+# runners took 846 s on main in October 2026, and over 900 s on a slower one; a learned effect's training test adds a
+# few minutes more).
+set_tests_properties(test_media PROPERTIES TIMEOUT 2100)
 target_compile_definitions(test_media PRIVATE MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
                            MONTAGE_TEST_TOOLS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tools")
 target_compile_definitions(test_core PRIVATE MONTAGE_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
@@ -29,7 +32,7 @@ if(MONTAGE_BUILD_APP)
   set_target_properties(test_app PROPERTIES AUTOMOC ON)
   montage_copy_runtime(test_app)
   add_test(NAME test_app COMMAND test_app)
-  set_tests_properties(test_app PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;MONTAGE_NO_PLUGIN_SCAN=1;MONTAGE_NO_RECOVERY_PROMPT=1;MONTAGE_RECOVERY_DIR=${CMAKE_CURRENT_BINARY_DIR}/recovery-test" TIMEOUT 300)
+  set_tests_properties(test_app PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;MONTAGE_NO_PLUGIN_SCAN=1;MONTAGE_NO_RECOVERY_PROMPT=1;MONTAGE_RECOVERY_DIR=${CMAKE_CURRENT_BINARY_DIR}/recovery-test" TIMEOUT 600)
   add_dependencies(test_app montage_test_plugins montage_test_sidechain montage_test_ofx montage-plugin-probe)
   target_compile_definitions(test_app PRIVATE
     MONTAGE_TEST_CLAP_DIR="${CMAKE_CURRENT_BINARY_DIR}/clap"

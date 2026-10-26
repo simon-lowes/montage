@@ -20,6 +20,7 @@
 #include <set>
 #include <utility>
 
+#include "audio/AraHost.h"
 #include "core/Ambisonics.h"
 #include "core/FilmCount.h"
 #include "core/MediaLog.h"
@@ -39,6 +40,8 @@ namespace montage {
 EditorState::EditorState(QObject* parent) : QObject(parent), project_(makeDefaultProject()) {
     // Clips playing chosen channels of a file need those decoded too (the whole file is decoded on import).
     connect(this, &EditorState::projectChanged, this, &EditorState::startClipAudioDecodes);
+    // ARA documents of effects no longer in the project (a clip deleted, an undo) close (audio/AraHost.h).
+    connect(this, &EditorState::projectChanged, this, [this] { ara::dropSessionsNotIn(project_); });
     // Decodes finish on worker threads, possibly after this object is gone:
     // hop to the application object and re-check before emitting.
     QPointer<EditorState> self(this);
@@ -96,6 +99,7 @@ EditorState::EditorState(QObject* parent) : QObject(parent), project_(makeDefaul
 
 EditorState::~EditorState() {
     MediaPool::instance().setReadyCallback(nullptr);
+    ara::dropAllSessions();  // plug-ins closed while the application is still there
     releaseLock();
 }
 
@@ -197,6 +201,7 @@ bool EditorState::edit(const QString& label, const std::function<bool(Project&, 
     pruneSelection();
     emit projectChanged();
     emit historyChanged();
+    emit edited(label);
     emit fileStateChanged();
     return true;
 }
@@ -252,6 +257,7 @@ void EditorState::endGesture(bool commit) {
         history_.push(g.label.toStdString(), g.origin);
         pruneSelection();
         emit historyChanged();
+        emit edited(g.label);
         emit fileStateChanged();
     } else if (!commit) {
         project_ = std::move(g.origin);
@@ -269,6 +275,7 @@ void EditorState::undo() {
     pruneSelection();
     emit projectChanged();
     emit historyChanged();
+    emit edited(tr("Undo %1").arg(redoText()));
     emit fileStateChanged();
     emit sourceChanged();
 }
@@ -283,6 +290,7 @@ void EditorState::redo() {
     pruneSelection();
     emit projectChanged();
     emit historyChanged();
+    emit edited(tr("Redo %1").arg(undoText()));
     emit fileStateChanged();
 }
 
@@ -294,12 +302,18 @@ bool EditorState::isSelected(Id clip) const {
 }
 
 void EditorState::setSelection(std::vector<Id> clips, bool expandLinked) {
+    primary_ = clips.empty() ? 0 : clips.front();
     if (expandLinked && sequence()) clips = edit::expandLinks(*sequence(), clips);
     if (clips == selection_ && selectedTransition_ == 0 && (clips.empty() || !inspectedChain_)) return;
     selection_ = std::move(clips);
     selectedTransition_ = 0;
     if (!selection_.empty()) inspectedChain_ = 0;
     emit selectionChanged();
+}
+
+Id EditorState::focusClip() const {
+    if (primary_ && isSelected(primary_)) return primary_;
+    return selection_.empty() ? 0 : selection_.front();
 }
 
 void EditorState::clearSelection() {
@@ -965,12 +979,27 @@ bool EditorState::removeMedia(Id id, QString* error) {
     QString name = QString::fromStdString(m->name);
     const Id removedSource = sourceMedia_;
     bool ok = edit(tr("Remove %1").arg(name), [id](Project& p, Sequence&) {
+        // (it and its subclips)
+        std::set<Id> gone{id};
+        for (const MediaItem& x : p.media)
+            if (x.subclipOf == id) gone.insert(x.id);
         for (auto& s : p.sequences) {
             std::vector<Id> uses;
             for (auto* list : {&s.videoTracks, &s.audioTracks})
-                for (auto& t : *list)
+                for (auto& t : *list) {
                     for (auto& c : t.clips)
-                        if (c.mediaId == id) uses.push_back(c.id);
+                        if (gone.count(c.mediaId)) uses.push_back(c.id);
+                    // Its takes, and its clips in the track's versions not shown, go too.
+                    std::erase_if(t.lanes, [&](const TakeLane& l) { return gone.count(l.mediaId) > 0; });
+                    for (TrackVersion& v : t.versions) {
+                        std::set<Id> removed;
+                        for (const Clip& c : v.clips)
+                            if (gone.count(c.mediaId)) removed.insert(c.id);
+                        if (removed.empty()) continue;
+                        std::erase_if(v.clips, [&](const Clip& c) { return removed.count(c.id) > 0; });
+                        std::erase_if(v.transitions, [&](const Transition& tr) { return removed.count(tr.clipA) || removed.count(tr.clipB); });
+                    }
+                }
             if (!uses.empty()) edit::removeClips(p, s, uses, false);
         }
         const MediaItem* mi = p.findMedia(id);

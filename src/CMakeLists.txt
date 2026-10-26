@@ -18,6 +18,7 @@ add_library(montage_engine STATIC
   core/Cea708.h core/Cea708.cpp
   core/Teletext.h core/Teletext.cpp
   core/CaptionTools.h core/CaptionTools.cpp
+  core/SdhCaptions.h core/SdhCaptions.cpp
   core/TranscriptEdit.h core/TranscriptEdit.cpp
   core/Slate.h core/Slate.cpp
   core/Chapters.h core/Chapters.cpp
@@ -82,6 +83,7 @@ add_library(montage_engine STATIC
   media/Image.h media/Image.cpp
   media/Decoder.h media/Decoder.cpp
   media/DeepImage.h media/DeepImage.cpp
+  media/Model3D.h media/Model3D.cpp
   media/Exr.h media/Exr.cpp
   media/Vector.h media/Vector.cpp
   media/CameraRaw.h media/CameraRaw.cpp
@@ -89,6 +91,7 @@ add_library(montage_engine STATIC
   media/Mlv.h media/Mlv.cpp
   media/SuperScale.h media/SuperScale.cpp
   media/MotionDeblur.h media/MotionDeblur.cpp
+  media/LearnedEffect.h media/LearnedEffect.cpp
   media/Faces.h media/Faces.cpp
   media/FaceMesh.h media/FaceMesh.cpp
   media/FaceTracks.h media/FaceTracks.cpp
@@ -149,6 +152,7 @@ add_library(montage_engine STATIC
   media/SpeechSearch.h media/SpeechSearch.cpp
   media/TextReader.h media/TextReader.cpp
   media/SpeechEnhance.h media/SpeechEnhance.cpp
+  media/BandwidthExtension.h media/BandwidthExtension.cpp
   media/Beats.h media/Beats.cpp
   media/Translator.h media/Translator.cpp
   render/Processing.h render/Processing.cpp render/TransferTables.h
@@ -174,6 +178,8 @@ add_library(montage_engine STATIC
   render/ConformCheck.h render/ConformCheck.cpp
   render/Shapes.h render/Shapes.cpp
   render/Title3D.h render/Title3D.cpp
+  render/ModelRender.h render/ModelRender.cpp
+  render/ModelClip.h render/ModelClip.cpp
   render/Particles.h render/Particles.cpp
   render/AafExport.h render/AafExport.cpp
   render/AvidMedia.h render/AvidMedia.cpp
@@ -210,6 +216,7 @@ add_library(montage_engine STATIC
   render/AudioReactive.h render/AudioReactive.cpp
   core/Expression.h render/Expressions.cpp
   render/QualityCheck.h render/QualityCheck.cpp
+  render/SdhDraft.h render/SdhDraft.cpp
   render/LutExport.h render/LutExport.cpp
   render/LutToGrade.h render/LutToGrade.cpp
   render/GrainMatch.h render/GrainMatch.cpp
@@ -226,6 +233,7 @@ add_library(montage_engine STATIC
   render/HdrView.h render/HdrView.cpp
   render/Ocio.h render/Ocio.cpp
   render/Compositor.h render/Compositor.cpp
+  render/LearnFromClip.h render/LearnFromClip.cpp
   render/GpuCompositor.h render/GpuCompositor.cpp
   render/OGraf.h render/OGraf.cpp
   render/Gallery.h render/Gallery.cpp
@@ -253,6 +261,7 @@ add_library(montage_engine STATIC
   render/MonitorCalibration.h render/MonitorCalibration.cpp
   render/MonitorSection.h render/MonitorSection.cpp
   audio/Plugins.h audio/PluginScan.cpp audio/ClapHost.cpp
+  audio/AraHost.h audio/AraHost.cpp ${PROJECT_SOURCE_DIR}/third_party/ara/ARA_Library/Dispatch/ARAHostDispatch.cpp
   audio/DynLib.h audio/DynLib.cpp
   audio/PluginEffect.h audio/PluginEffect.cpp
   audio/SpeechCleanup.h audio/SpeechCleanup.cpp
@@ -264,8 +273,14 @@ add_library(montage_engine STATIC
   audio/TimeStretch.h audio/TimeStretch.cpp
   audio/Upmix.h audio/Upmix.cpp
 )
+# The learned effect's trainer is its convolutions' inner loops, written to be vectorised (media/LearnedEffect.h).
+set_source_files_properties(media/LearnedEffect.cpp PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-O3>")
 target_include_directories(montage_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/clap/include)
+# ARA 2 interfaces and host dispatch library (Apache-2.0, Celemony's SDK), for hosting ARA plug-ins (audio/AraHost).
+target_include_directories(montage_engine SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/third_party/ara)
+# glTF and OBJ readers (media/Model3D.cpp), as system headers so their own warnings stay theirs.
+target_include_directories(montage_engine SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/third_party/cgltf ${PROJECT_SOURCE_DIR}/third_party/tinyobjloader)
 # OpenFX 1.5 headers (BSD-3-Clause, the ASWF's), for hosting video plugins (render/Ofx).
 target_include_directories(montage_engine PRIVATE ${PROJECT_SOURCE_DIR}/third_party/openfx/include)
 # NDI SDK headers (MIT, these files only), for loading the NDI Runtime when installed (render/NdiOutput).
@@ -610,6 +625,18 @@ file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/BanditGraph.cpp.new
      "extern const size_t kBanditEngGraphSize = ${graph_size};\n")
 configure_file(${CMAKE_CURRENT_BINARY_DIR}/BanditGraph.cpp.new ${CMAKE_CURRENT_BINARY_DIR}/BanditGraph.cpp COPYONLY)
 target_sources(montage_engine PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/BanditGraph.cpp)
+# AP-BWE's graph without its weights (scripts/gen-apbwe-graph.py), the same way.
+set(graph ${CMAKE_CURRENT_SOURCE_DIR}/media/apbwe.onnx)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${graph})
+file(READ ${graph} graph_hex HEX)
+file(SIZE ${graph} graph_size)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," graph_bytes "${graph_hex}")
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/ApBweGraph.cpp.new
+     "// Generated by CMake from media/apbwe.onnx.\n#include <cstddef>\n\n"
+     "extern const unsigned char kApBweGraph[] = {${graph_bytes}};\n"
+     "extern const size_t kApBweGraphSize = ${graph_size};\n")
+configure_file(${CMAKE_CURRENT_BINARY_DIR}/ApBweGraph.cpp.new ${CMAKE_CURRENT_BINARY_DIR}/ApBweGraph.cpp COPYONLY)
+target_sources(montage_engine PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/ApBweGraph.cpp)
 # Video Depth Anything Small's graphs without their weights (scripts/gen-vda-graph.py), the same way.
 set(vda_cpp "// Generated by CMake from media/vda-small-*.onnx.\n#include <cstddef>\n\n")
 foreach(part Encoder:encoder Temporal:temporal Decoder:decoder)

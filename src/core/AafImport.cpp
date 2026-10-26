@@ -215,6 +215,7 @@ struct Slot {
 struct Mob {
     Obj obj;
     std::string id, name;
+    std::map<std::string, std::string> comments;  // its UserComments that hold text
     std::vector<Slot> mobSlots;
     const Slot* slot(uint32_t id) const {
         for (const Slot& s : mobSlots)
@@ -246,6 +247,12 @@ public:
             Mob mob;
             mob.id = m.raw(0x4401);
             mob.name = m.text(0x4402);
+            for (Obj& c : strongList(m, 0x4406)) {
+                // (an Indirect value: byte order, the type's ID, then the value; a String's is UTF-16)
+                const std::string v = c.raw(0x5003);
+                if (v.size() > 17 && v.compare(1, 16, aafAuid("01100200-0000-0000-060e-2b3401040101")) == 0)
+                    mob.comments[c.text(0x5001)] = utf16z(v.substr(17));
+            }
             for (Obj& s : strongList(m, 0x4403)) {
                 Slot slot;
                 slot.id = s.u32(0x4801);
@@ -518,6 +525,13 @@ ImportResult importAaf(Project& p, const std::string& path, const MediaProber& p
             if (!fps.num && !s.event && rateOf(s.rate) > 0 && rateOf(s.rate) <= 120) fps = s.rate;
         if (!fps.valid()) fps = {25, 1};
         TimelineBuilder b(p, comp->name, fps, probe);
+        // Montage's colour (from its own AAF), graded scene-referred.
+        if (const auto ws = comp->comments.find("Montage working space"); ws != comp->comments.end()) {
+            b.sequence().workingSpace = ws->second;
+            if (const auto cs = comp->comments.find("Montage color space"); cs != comp->comments.end()) b.sequence().colorSpace = cs->second;
+            if (const auto ot = comp->comments.find("Montage output transform"); ot != comp->comments.end() && ot->second == "aces2")
+                b.sequence().outputTransform = ot->second;
+        }
         const double f = rateOf(fps);
         int videoTrack = 0, audioTrack = 0;
         for (const Slot& s : comp->mobSlots) {

@@ -247,6 +247,16 @@ bool exportVfxPulls(const Project& p, const Sequence& seq, const std::vector<Id>
         st.audioCodec = "none";
         st.smartRender = false;
         st.colorSpace = o.colorSpace;
+        if (st.colorSpace.empty() && sceneReferredWorking(seq) && o.format != "tiff") {
+            // Graded scene-referred, plates come in the working space: DPX in it (in ACEScct's curve on its primaries when
+            // it is linear light, which 10 bits would clip and band; ACEScct itself when the list has no such space),
+            // OpenEXR in its light (ACES2065-1 when the list has no linear space on its primaries).
+            const ColorSpace& working = workingColorSpace(seq);
+            const ColorSpace& light = linearColorSpace(working.primaries);
+            const ColorSpace& log = logColorSpace(working.primaries);
+            const std::string dpx = working.transfer != Transfer::Linear ? working.id : findColorSpace(log.id) ? log.id : std::string("acescct");
+            st.colorSpace = o.format == "dpx" ? dpx : findColorSpace(light.id) ? light.id : std::string("aces2065-1");
+        }
         if (st.colorSpace.empty() && o.format == "dpx") st.colorSpace = m.colorOverride.empty() ? m.colorSpace : m.colorOverride;  // log stays log
         st.startNumber = shot.firstFrame;
         const char* ext = o.format == "tiff" ? "tif" : o.format.c_str();

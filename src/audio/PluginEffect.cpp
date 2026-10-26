@@ -16,6 +16,17 @@ std::string decodeState(const std::string& base64) {
 std::optional<Effect> makePluginEffect(Project& p, const Descriptor& d, std::string* error) {
     auto inst = instantiate(d, error);
     if (!inst) return std::nullopt;
+    if (d.ara && inst->araFactory()) {
+        // An ARA plug-in works on the clip's whole sound (audio/AraHost.h); its document is kept in "archive".
+        Effect e = makeEffect(p, "ara");
+        e.strings["plugin_id"] = d.id;
+        e.strings["plugin_name"] = d.name;
+        e.strings["plugin_vendor"] = d.vendor;
+        e.strings["plugin_format"] = formatName(d.format);
+        e.strings["state"] = encodeState(inst->saveState());
+        e.strings["modification_id"] = "montage-effect:" + std::to_string(e.id);
+        return e;
+    }
     Effect e = makeEffect(p, "plugin");
     e.strings["plugin_id"] = d.id;
     e.strings["plugin_name"] = d.name;
@@ -78,9 +89,9 @@ std::string effectTypeName(const std::string& type) {
 
 std::string effectName(const Effect& e) {
     if (e.type == "ofx") return ofx::effectName(e);
-    if (e.type == "plugin") {
+    if (e.type == "plugin" || e.type == "ara") {
         const std::string fmt = e.s("plugin_format");
-        return e.s("plugin_name", "Audio Plugin") + (fmt.empty() ? "" : " (" + fmt + ")");
+        return e.s("plugin_name", "Audio Plugin") + (fmt.empty() ? "" : " (" + std::string(e.type == "ara" ? "ARA, " : "") + fmt + ")");
     }
     return effectTypeName(e.type);
 }

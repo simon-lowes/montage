@@ -78,6 +78,11 @@ void addClip(QCryptographicHash& h, const Sequence& seq, const Clip& c) {
         if (e->type == "motion_deblur") h.addData(deblurModel().installed() ? "deblur:1" : "deblur:0");
         else if (e->type == "super_scale") h.addData(upscaleModel().installed() ? "upscale:1" : "upscale:0");
         else if (e->type == "frame_repair") h.addData(rifeAvailable() && rifeModel().installed() ? "rife:1" : "rife:0");
+        else if (e->type == "learned_effect") {
+            // (Trained further, the network file changes, and so does the picture.)
+            const QFileInfo fi(QString::fromStdString(e->s("network")));
+            h.addData(QByteArray::number(fi.size()) + ':' + QByteArray::number(fi.lastModified().toMSecsSinceEpoch()));
+        }
 }
 
 void addMedia(QCryptographicHash& h, const MediaItem& m, const RenderOptions& o) {
@@ -88,6 +93,7 @@ void addMedia(QCryptographicHash& h, const MediaItem& m, const RenderOptions& o)
     h.addData(QByteArray::number(fi.size()));
     h.addData(QByteArray::number(fi.lastModified().toMSecsSinceEpoch()));
     h.addData(QByteArray::fromStdString(m.colorSpace));
+    if (!m.colorOverride.empty()) h.addData(QByteArray("|as ") + QByteArray::fromStdString(m.colorOverride));  // (Interpret Colour)
     h.addData(QByteArray::number(m.width) + 'x' + QByteArray::number(m.height));
 }
 
@@ -174,6 +180,7 @@ void addClipAt(QCryptographicHash& h, const Project& p, const Sequence& seq, con
 bool addFrame(QCryptographicHash& h, const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o, int depth) {
     h.addData(QByteArray::number(seq.width) + 'x' + QByteArray::number(seq.height) + '@' + QByteArray::number(seq.fpsValue(), 'g', 10));
     h.addData(QByteArray::fromStdString(seq.colorSpace) + QByteArray::number(seq.hdrPeakNits));
+    if (!seq.workingSpace.empty()) h.addData(QByteArray::fromStdString("|working " + seq.workingSpace + ' ' + seq.outputTransform));
     if (seq.stereo3d) h.addData("|stereo");  // clips placed in depth (a nested sequence's too)
     bool any = false;
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
@@ -214,8 +221,11 @@ QByteArray clipLayerKey(const Project& p, const Sequence& seq, const Clip& c, Fr
     h.addData(QByteArray("montage-layer-") + QByteArray::number(kCacheVersion));
     h.addData(QByteArray::number(o.scale, 'g', 10) + (o.useProxies ? "P" : "") + (o.highQuality ? "H" : "") + '#' +
               QByteArray::fromStdString(o.displaySpace) + (seq.stereo3d ? QByteArray("#3D") + QByteArray::number(int(o.stereoView)) : QByteArray()));
+    if (!o.outputSpace.empty() || o.sceneLight)
+        h.addData(QByteArray::fromStdString("#out|" + o.outputSpace + '|') + QByteArray::number(o.outputPeak) + (o.sceneLight ? "|light" : ""));
     h.addData(QByteArray::number(seq.width) + 'x' + QByteArray::number(seq.height) + '@' + QByteArray::number(seq.fpsValue(), 'g', 10));
     h.addData(QByteArray::fromStdString(seq.colorSpace) + QByteArray::number(seq.hdrPeakNits));
+    if (!seq.workingSpace.empty()) h.addData(QByteArray::fromStdString("|working " + seq.workingSpace + ' ' + seq.outputTransform));
     addClipAt(h, p, seq, c, t, o, 0);
     return h.result().toHex();
 }
@@ -227,17 +237,19 @@ QByteArray frameKey(const Project& p, const Sequence& seq, FrameTime t, const Re
     h.addData(QByteArray::number(o.scale, 'g', 10) + (o.useProxies ? "P" : "") + (o.highQuality ? "H" : "") + '#' +
               QByteArray::fromStdString(o.displaySpace) + '#' + QByteArray::number(o.soloVideoTrack) +
               (seq.stereo3d ? QByteArray("#3D") + QByteArray::number(int(o.stereoView)) : QByteArray()));
+    if (!o.outputSpace.empty() || o.sceneLight)
+        h.addData(QByteArray::fromStdString("#out|" + o.outputSpace + '|') + QByteArray::number(o.outputPeak) + (o.sceneLight ? "|light" : ""));
     if (const TrimTarget* trim = o.trimTarget.empty() ? nullptr : findTrimTarget(seq, o.trimTarget))
         h.addData(QByteArray::fromStdString("#trim|" + trim->id + "|" + trim->colorSpace + "|") + QByteArray::number(trim->peakNits));
     bool any = addFrame(h, p, seq, t, o, 0);
     if (o.captions)
         if (const CaptionTrack* track = captionTrackFor(seq)) {
             if (const Caption* cue = captionAt(*track, t)) {
-                CaptionTrack style = *track;
-                style.captions.clear();
-                style.id = 0;
-                h.addData(QByteArray::fromStdString(captionTrackToJsonString(style)));
-                h.addData(QByteArray::fromStdString(cue->text) + QByteArray::number(qint64(cue->start)) + '-' + QByteArray::number(qint64(cue->end)));
+                // The track's style and the whole cue (its text, times, place, italics, word times and colour).
+                CaptionTrack shown = *track;
+                shown.captions = {*cue};
+                shown.id = 0;
+                h.addData(QByteArray::fromStdString(captionTrackToJsonString(shown)));
                 any = true;
             }
         }

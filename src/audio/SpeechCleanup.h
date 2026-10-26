@@ -12,13 +12,14 @@
 #include <vector>
 
 #include "core/Model.h"
+#include "media/BandwidthExtension.h"
 #include "media/Decoder.h"
 
 namespace montage {
 
-// Effect types processed this way ("denoise", "voice_isolate", "enhance_speech",
-// "declick", "declip", "deplosive", "dewind" and "pitch_shift" from AudioRepair.h, and "dialogue_align" from
-// DialogueAlign.h).
+// Effect types processed this way ("denoise", "voice_isolate", "enhance_speech", "bandwidth_extension",
+// "declick", "declip", "deplosive", "dewind" and "pitch_shift" from AudioRepair.h, "dialogue_align" from
+// DialogueAlign.h, and "ara", an ARA plug-in, from AraHost.h).
 bool isSourceAudioEffect(const std::string& type);
 // (A Dialogue Alignment is for one take of an audition: DialogueAlign.h dialogueAlignmentApplies.)
 // True if this build includes the RNNoise voice model.
@@ -56,6 +57,16 @@ bool isolateVoice(const AudioBuffer& in, AudioBuffer& out, double amount, const 
 bool enhanceSpeech(const AudioBuffer& in, AudioBuffer& out, double amount, double maxReductionDb, bool background = false,
                    const std::atomic<bool>* cancel = nullptr, std::string* error = nullptr);
 
+// Restores the missing top of band-limited speech (media/BandwidthExtension.h): the cut-off found from both channels
+// together (or `cutoff` Hz), and each channel restored with the same checkpoints (a mono recording once). False (with
+// `error`) when a model is missing or failed.
+bool restoreBandwidth(const AudioBuffer& in, AudioBuffer& out, double amount, double cutoff = 0, const std::atomic<bool>* cancel = nullptr,
+                      std::string* error = nullptr, const BweNetwork& network = {}, BweResult* result = nullptr);
+// It is for speech: a clip whose role is Music or Effects is left alone (true for every other effect).
+bool bandwidthExtensionApplies(const Effect& e, const Clip& c);
+// The cut-off of the sound's speech and the checkpoints that would restore it (`cutoff` > 0: that one).
+BweResult bandwidthPlanFor(const AudioBuffer& in, double cutoff = 0);
+
 // The source audio with the clip's source effects applied, in order. With
 // `blocking` the work is done now; otherwise it starts in the background and
 // nullptr is returned until it is ready. An ambisonic field (four channels or
@@ -66,5 +77,7 @@ AudioBufferPtr cleanedAudio(const std::string& path, const AudioBufferPtr& sourc
                             bool blocking);
 // Number of cleanups still running in the background.
 int cleanupsRunning();
+// Forgets the cleaned copies that left an effect out for want of its model, so they are made again (after a download).
+void retryCleanupsMissingModels();
 
 }  // namespace montage

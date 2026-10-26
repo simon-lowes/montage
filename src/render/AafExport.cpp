@@ -40,6 +40,7 @@ const char* const kSequence = "0d010101-0101-0f00-060e-2b3402060101";
 const char* const kSourceClip = "0d010101-0101-1100-060e-2b3402060101";
 const char* const kFiller = "0d010101-0101-0900-060e-2b3402060101";
 const char* const kTimecode = "0d010101-0101-1400-060e-2b3402060101";
+const char* const kTaggedValue = "0d010101-0101-3f00-060e-2b3402060101";
 const char* const kTransition = "0d010101-0101-1700-060e-2b3402060101";
 const char* const kOperationGroup = "0d010101-0101-0a00-060e-2b3402060101";
 const char* const kConstantValue = "0d010101-0101-3d00-060e-2b3402060101";
@@ -850,6 +851,16 @@ bool exportAaf(const Project& p, const Sequence& seq, const std::string& path, A
     const std::string compId = aafNewMobId();
     Obj comp = mob(kCompositionMob, seq.name, compId);
     comp->bytes(0x4408, aafAuid(kTopLevel));
+    // Its colour, as comments on it (Mob::UserComments), when graded scene-referred: what it delivers, the space it is
+    // graded in and the output transform between them.
+    if (!seq.workingSpace.empty())
+        for (const auto& [name, value] : {std::pair<std::string, std::string>{"Montage color space", seq.colorSpace},
+                                          {"Montage working space", seq.workingSpace},
+                                          {"Montage output transform", seq.outputTransform.empty() ? "filmic" : seq.outputTransform}}) {
+            Obj tag = make(kTaggedValue);
+            tag->text(0x5001, name).indirectText(0x5003, value);
+            comp->add(0x4406, "UserComments", std::move(tag));
+        }
     const int32_t num = seq.fps.valid() ? int32_t(seq.fps.num) : 30, den = seq.fps.valid() ? int32_t(seq.fps.den) : 1;
     {
         Obj tc = make(kTimecode);

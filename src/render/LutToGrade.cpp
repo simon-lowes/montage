@@ -597,9 +597,8 @@ Result applyLutGrade(Project& p, Sequence& s, Id clipId, Id lutEffect, const std
         const size_t at = k % 3 == 0 ? node % n : k % 3 == 1 ? node / n % n : node / (n * n);
         most = std::max(most, std::fabs(fit.residual.data[k] - float(at) / float(n - 1)));
     }
-    if (!residualPath.empty() && most > 5e-4f) {
-        if (!writeCubeLut(fit.residual, residualPath, "Residual of " + std::filesystem::path(path).filename().string(), &err)) return Result::fail(err);
-        forgetCubeLut(residualPath);
+    const bool residual = !residualPath.empty() && most > 5e-4f;  // (written once the rest of the edit has been made)
+    if (residual) {
         Effect r = makeEffect("lut", 0);
         r.strings["path"] = residualPath;
         fx.push_back(r);
@@ -625,6 +624,10 @@ Result applyLutGrade(Project& p, Sequence& s, Id clipId, Id lutEffect, const std
     for (Effect& e : fx) e.id = p.newId(), e.node = node;
     const auto pos = c->effects.erase(copy);
     c->effects.insert(pos, fx.begin(), fx.end());
+    if (residual) {
+        if (!writeCubeLut(fit.residual, residualPath, "Residual of " + std::filesystem::path(path).filename().string(), &err)) return Result::fail(err);
+        forgetCubeLut(residualPath);
+    }
     return {};
 }
 

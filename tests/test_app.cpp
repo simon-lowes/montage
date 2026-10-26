@@ -60,6 +60,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <memory>
 
 #include "AutoDuckDialog.h"
 #include "Settings.h"
@@ -148,6 +149,7 @@
 #include "SequenceSettingsDialog.h"
 #include "media/Vector.h"
 #include "SurroundPanner.h"
+#include "audio/AraHost.h"
 #include "audio/DialogueAlign.h"
 #include "audio/Plugins.h"
 #include "MainWindow.h"
@@ -176,6 +178,11 @@
 #include "PluginEditorWindow.h"
 #include "audio/PluginEffect.h"
 #include "KeyframePanel.h"
+#include "Accessibility.h"
+#include "LearnEffectDialog.h"
+#include "Theme.h"
+#include <QAccessible>
+#include <QFileDialog>
 #include "GradeNodePanel.h"
 #include "CompareDialog.h"
 #include "Keymap.h"
@@ -382,6 +389,16 @@ private:
     std::shared_ptr<std::vector<std::vector<uint8_t>>> written_;
     int state_ = 0;
 };
+
+// Runs `act` on the modal dialog of type D once it is open: tried every 100 ms for 20 s, as a dialog can take a moment
+// to open and one timer may fire before it does (and leave it open, waiting).
+template <class D, class Fn>
+static void whenModal(QObject* context, Fn act, int tries = 200) {
+    QTimer::singleShot(100, context, [context, act, tries] {
+        if (auto* dialog = qobject_cast<D*>(QApplication::activeModalWidget())) act(dialog);
+        else if (tries > 1) whenModal<D>(context, act, tries - 1);
+    });
+}
 
 class TestApp : public QObject {
     Q_OBJECT
@@ -3678,6 +3695,62 @@ private slots:
         QVERIFY(state()->apply("Delete", [clip](Project& p, Sequence& s) { return edit::removeClips(p, s, {clip}, true); }));
         QApplication::processEvents();
         QVERIFY(!PluginEditorWindow::find(clip, eid));
+        state()->newProject();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+    }
+
+    void araPlugInDocument() {
+        // An ARA plug-in's Editor button opens the clip's ARA document (audio/AraHost.h), which stays with the effect
+        // and closes, ending its playback region, when the clip is deleted. The ARA SDK's test plug-in
+        // (scripts/build-ara-test-plugin.sh) has no editor window of its own, so the window itself does not open.
+        const QByteArray dir = qgetenv("MONTAGE_TEST_ARA_PLUGINS");
+        if (dir.isEmpty()) QSKIP("MONTAGE_TEST_ARA_PLUGINS is not set (scripts/build-ara-test-plugin.sh builds the test plug-in)");
+        plugins::Registry& reg = plugins::Registry::instance();
+        reg.setCachePath((dir_.path() + "/plugin-cache-ara.json").toStdString());
+        reg.setProbeExecutable(MONTAGE_PLUGIN_PROBE);
+        for (plugins::Format f : plugins::kAllFormats) reg.setSearchPaths(f, {"/nonexistent-montage-test-dir"});
+        reg.setSearchPaths(plugins::Format::Clap, {dir.toStdString()});
+        reg.scan();
+        std::optional<plugins::Descriptor> d;
+        for (const plugins::Descriptor& x : reg.plugins())
+            if (x.ara) d = x;
+        QVERIFY(d.has_value());
+        state()->newProject();
+        auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) {
+            return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false);
+        }));
+        const Id clip = trackAt(*state()->sequence(), A1)->clips.at(0).id;
+        Id eid = 0;
+        QVERIFY(state()->edit("Add ARA Plug-in", [&](Project& p, Sequence& s) {
+            auto e = plugins::makePluginEffect(p, *d);
+            if (!e || e->type != "ara") return false;
+            eid = e->id;
+            edit::clipById(s, clip)->effects.push_back(*e);
+            return true;
+        }));
+        state()->setSelection({clip}, false);
+        QApplication::processEvents();
+        const int regions = ara::liveRegions();
+        QToolButton* button = nullptr;
+        for (auto* b : win_->findChildren<QToolButton*>("pluginEditor"))
+            if (b->isVisibleTo(win_.get())) button = b;
+        QVERIFY(button);
+        button->click();
+        QVERIFY(!PluginEditorWindow::find(clip, eid));
+        QVERIFY(ara::findLiveSession(eid));
+        QCOMPARE(ara::liveRegions(), regions + 1);
+        // An edit elsewhere keeps it; deleting the clip closes it.
+        QVERIFY(state()->edit("Rename", [clip](Project&, Sequence& s) {
+            edit::clipById(s, clip)->name = "renamed";
+            return true;
+        }));
+        QCOMPARE(ara::liveRegions(), regions + 1);
+        QVERIFY(state()->apply("Delete", [clip](Project& p, Sequence& s) { return edit::removeClips(p, s, {clip}, true); }));
+        QCOMPARE(ara::liveRegions(), regions);
+        QVERIFY(!ara::findLiveSession(eid));
         state()->newProject();
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));
     }
@@ -10297,6 +10370,18 @@ const auto seq = [this] { return state()->sequence(); };
         QCOMPARE(track().lanes.size(), size_t(4));
         QFile again(whole + " pass 1.wav");
         QVERIFY(again.open(QIODevice::ReadOnly) && again.readAll() == firstPass);
+        // Stopped in the pre-roll, before any pass: nothing goes on the timeline, and the recording is kept.
+        QVERIFY(rec.startLoop(in, out, pre, 1, {}, false, 48000, 1));
+        rec.feed(block.data(), 4800);
+        QVERIFY(!rec.stop());
+        QCOMPARE(track().lanes.size(), size_t(4));
+        QVERIFY(rec.lastTake().endsWith(".wav") && !rec.lastTake().contains(" pass "));
+        QVERIFY2(QFileInfo(rec.lastTake()).size() == 44 + 4800 * 4, qPrintable(rec.lastTake()));
+        // Removing a take's media from the project takes its lane away too.
+        const Id firstTake = track().lanes[0].mediaId;
+        QVERIFY(state()->removeMedia(firstTake));
+        QCOMPARE(track().lanes.size(), size_t(3));
+        QVERIFY(std::none_of(track().lanes.begin(), track().lanes.end(), [&](const TakeLane& l) { return l.mediaId == firstTake; }));
         state()->newProject();
     }
 
@@ -10591,6 +10676,27 @@ const auto seq = [this] { return state()->sequence(); };
             QVERIFY2(end > 50 && end <= 92, qPrintable(QString::number(end)));
             rows->setCurrentItem(nullptr);  // (the row opened for typing closed, left empty)
             QVERIFY(!QApplication::focusWidget() || !rows->isAncestorOf(QApplication::focusWidget()));
+            // A ripple edit before it moves it with the dialogue, and undo back.
+            QVERIFY(state()->apply("Ripple", [&](Project& p, Sequence& s) {
+                std::vector<TrackRef> all;
+                for (int i = 0; i < int(s.videoTracks.size()); ++i) all.push_back({TrackKind::Video, i});
+                for (int i = 0; i < int(s.audioTracks.size()); ++i) all.push_back({TrackKind::Audio, i});
+                edit::rippleOpen(p, s, 0, 10, all);
+                return edit::Result{};
+            }));
+            QTRY_COMPARE(rows->item(0, 3)->data(Qt::UserRole).toLongLong(), 60LL);
+            state()->undo();
+            QTRY_COMPARE(rows->item(0, 3)->data(Qt::UserRole).toLongLong(), 50LL);
+            // Trimming the head of the line before it leaves it where it is (the line's sound has not moved).
+            Id before = 0;
+            for (const Track& t : state()->sequence()->audioTracks)
+                for (const Clip& c : t.clips)
+                    if (c.start <= 50 && (!before || c.start > edit::clipById(*state()->sequence(), before)->start)) before = c.id;
+            QVERIFY(before);
+            QVERIFY(state()->apply("Trim", [&](Project& p, Sequence& s) { return edit::trim(p, s, before, edit::Edge::In, 2, edit::TrimMode::Normal, false); }));
+            QTest::qWait(50);
+            QCOMPARE(rows->item(0, 3)->data(Qt::UserRole).toLongLong(), 50LL);
+            state()->undo();
             dlg->hide();
             QVERIFY(state()->apply("Line over it", [&](Project& p, Sequence& s) {
                 return edit::placeMedia(p, s, media, 45, 0, -1, {TrackKind::Video, -1}, {TrackKind::Audio, 0}, false);
@@ -12852,6 +12958,25 @@ const auto seq = [this] { return state()->sequence(); };
         space->setCurrentIndex(space->findData(QString("rec709")));
         QVERIFY(!peak->isEnabled());
         QCOMPARE(dlg.spec().colorSpace, std::string("rec709"));
+        // Graded scene-referred: a working space apart from it, and the output transform (for a working space only).
+        auto* working = dlg.findChild<QComboBox*>("workingSpace");
+        auto* output = dlg.findChild<QComboBox*>("outputTransform");
+        QVERIFY(working && output);
+        QCOMPARE(working->currentIndex(), 0);
+        QVERIFY(!output->isEnabled());
+        QCOMPARE(working->count(), int(workingColorSpaces().size()) + 1);
+        working->setCurrentIndex(working->findData(QString("acescct")));
+        QVERIFY(output->isEnabled());
+        QCOMPARE(dlg.spec().workingSpace, std::string("acescct"));
+        QCOMPARE(dlg.spec().outputTransform, std::string());
+        // A project graded through ACES 2.0 keeps it, whether or not this OpenColorIO has it.
+        spec.workingSpace = "acescg";
+        spec.outputTransform = "aces2";
+        dlg.setSpec(spec);
+        QCOMPARE(working->currentData().toString(), QString("acescg"));
+        QCOMPARE(dlg.spec().outputTransform, std::string("aces2"));
+        dlg.setSpec(spec);
+        QCOMPARE(output->count(), 2);  // (kept once)
 
         // Export: deliver the HLG sequence as it is or in any display space.
         state()->edit("HLG", [](Project&, Sequence& s) {
@@ -12875,6 +13000,98 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
         win_->activateWindow();  // the context menu took the focus
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+    }
+
+    void sceneReferredGradingUi() {
+        state()->newProject();
+        Id clip = 0;
+        QVERIFY(state()->apply("Grey", [&clip](Project& p, Sequence& s) {
+            Clip c = makeGeneratorClip(p, "color", 50);
+            for (const char* k : {"color.r", "color.g", "color.b"}) c.generator.params[k] = 0.5;
+            c.effects.push_back(makeEffect(p, "posterize"));
+            c.effects.push_back(makeEffect(p, "gaussian_blur"));
+            clip = c.id;
+            return edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        }));
+        state()->setSelection({clip});
+        QApplication::processEvents();
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QVERIFY(inspector);
+        // Posterize works on display values: marked once the sequence is graded scene-referred (and the blur, which works
+        // in light, is not).
+        QVERIFY(!inspector->findChild<QLabel*>("displayDomain"));
+        QVERIFY(state()->edit("Grade scene-referred", [](Project&, Sequence& s) {
+            s.workingSpace = "acescct";
+            return true;
+        }));
+        QTRY_COMPARE(inspector->findChildren<QLabel*>("displayDomain").size(), qsizetype(1));
+        // The scopes read the output, or the working space's values when asked (when the playhead stops).
+        QVERIFY(state()->edit("Effects off", [clip](Project&, Sequence& s) {
+            for (Effect& e : edit::clipById(s, clip)->effects) e.enabled = false;
+            return true;
+        }));
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        auto* scopes = win_->findChild<ScopesWidget*>();
+        QVERIFY(program && scopes);
+        auto* read = scopes->findChild<QComboBox*>("scopeRead");
+        QVERIFY(read);
+        QSignalSpy spy(program, &PlaybackController::scopeFrameRendered);
+        auto lastSpace = [&spy] { return spy.isEmpty() ? QString() : spy.last().at(2).toString(); };
+        read->setCurrentIndex(1);
+        QVERIFY(scopes->readsWorking());
+        QTRY_COMPARE(lastSpace(), QString("acescct"));
+        // 0.5 graphics grey comes in through the inverse output transform: the ACEScct code value that shows as it.
+        float grey[3] = {0.5f, 0.5f, 0.5f};
+        inverseOutputPixel(grey, rec709Space(), *findColorSpace("acescct"), 1000, OutputTransformKind::Filmic);
+        const QImage working = spy.last().at(0).value<QImage>();
+        QVERIFY(!working.isNull());
+        const QColor px = working.pixelColor(working.width() / 2, working.height() / 2);
+        QVERIFY2(std::fabs(px.redF() - grey[0]) < 0.02, qPrintable(QString("%1 vs %2").arg(px.redF()).arg(grey[0])));
+        read->setCurrentIndex(0);
+        QTRY_COMPARE(lastSpace(), QString("rec709"));
+        state()->newProject();
+    }
+
+    void loopedPlaybackKeepsTime() {
+        // Played round In to Out, the picture keeps to the loop on one clock: within it, wrapping back to In, each pass as
+        // long as the loop.
+        state()->newProject();
+        state()->apply("Clip", [](Project& p, Sequence& s) {
+            s.videoTracks[0].clips.push_back(makeGeneratorClip(p, "color", 200));
+            return edit::Result{};
+        });
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        state()->setInPoint(10);
+        state()->setOutPoint(19);
+        const bool was = program->loop();
+        program->setLoop(true);
+        std::vector<std::pair<qint64, FrameTime>> seen;
+        QElapsedTimer clock;
+        clock.start();
+        const auto c = connect(program, &PlaybackController::positionChanged, this, [&](FrameTime t) { seen.emplace_back(clock.elapsed(), t); });
+        program->seek(10);
+        program->play();
+        QTest::qWait(1500);
+        disconnect(c);
+        // Turned off as it plays, it goes on from where it is, not from where the passes would have taken it.
+        const FrameTime at = program->position();
+        program->setLoop(false);
+        QTest::qWait(200);
+        const FrameTime after = program->position();
+        program->pause();
+        program->setLoop(was);
+        QVERIFY2(after >= at && after <= at + 15, qPrintable(QStringLiteral("%1 then %2").arg(at).arg(after)));
+        QVERIFY(seen.size() > 10);
+        std::vector<qint64> wraps;
+        for (size_t i = 0; i < seen.size(); ++i) {
+            QVERIFY2(seen[i].second >= 10 && seen[i].second <= 19, qPrintable(QString::number(seen[i].second)));
+            if (i > 0 && seen[i].second + 5 < seen[i - 1].second) wraps.push_back(seen[i].first);  // (back to In, not a frame)
+        }
+        QVERIFY2(wraps.size() >= 2, qPrintable(QString::number(wraps.size())));
+        const double fps = state()->sequence()->fpsValue();
+        const double pass = (wraps.back() - wraps.front()) / double(wraps.size() - 1);
+        QVERIFY2(std::fabs(pass - 10 / fps * 1000) < 60, qPrintable(QString::number(pass)));
+        state()->newProject();
     }
 
     void multicamPanelSwitching() {
@@ -13868,6 +14085,96 @@ const auto seq = [this] { return state()->sequence(); };
         }
         state()->newProject();
         QApplication::processEvents();
+    }
+
+    void sdhCaptionsFromThePanel() {
+        // JFK's clip with a made-up transcript of two speakers.
+        state()->newProject();
+        auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        const Id media = ids[0];
+        auto t = std::make_shared<Transcript>();
+        TranscriptSegment a, b;
+        a.speaker = 0, b.speaker = 1;
+        a.words = {{0.5, 0.9, "Ask", 1}, {0.9, 1.3, "not.", 1}};
+        b.words = {{3.0, 3.4, "Why", 1}, {3.4, 3.8, "not?", 1}};
+        t->segments = {a, b};
+        t->speakerNames = {"John", "Ted"};
+        QVERIFY(state()->edit("Transcript", [media, t](Project& p, Sequence&) {
+            p.findMedia(media)->transcript = t;
+            return true;
+        }));
+        QVERIFY(state()->apply("Place", [media](Project& p, Sequence& s) { return edit::placeMedia(p, s, media, 0, 0, -1, V1, A1, false); }));
+        auto* panel = win_->findChild<CaptionsPanel*>();
+        QVERIFY(panel);
+
+        // Drafted without listening, in the colours style: a new SDH track, the second speaker in yellow.
+        SdhDraftOptions o;
+        o.sounds = o.faces = o.readText = false;
+        o.sdh.lyrics = false;
+        o.sdh.style = kSdhColours;
+        QString error;
+        QCOMPARE(panel->draftSdh(o, &error), 2);
+        const Sequence* s = state()->sequence();
+        QCOMPARE(s->captionTracks.size(), size_t(1));
+        const CaptionTrack& sdh = s->captionTracks[0];
+        QCOMPARE(sdh.name, std::string("SDH"));
+        QCOMPARE(panel->currentTrack(), sdh.id);
+        QCOMPARE(sdh.captions[0].text, std::string("Ask not."));
+        QVERIFY(sdh.captions[0].colour.empty());
+        QCOMPARE(sdh.captions[1].text, std::string("Why not?"));
+        QCOMPARE(sdh.captions[1].colour, std::string("#ffff00"));
+        // The viewer draws it in that colour.
+        const QImage drawn = captionImage(sdh, sdh.captions[1].start, 640, 360);
+        QVERIFY(!drawn.isNull());
+        bool yellow = false;
+        for (int y = 0; y < drawn.height() && !yellow; ++y)
+            for (int x = 0; x < drawn.width() && !yellow; ++x) {
+                const QColor c = drawn.pixelColor(x, y);
+                yellow = c.redF() > 0.8 && c.greenF() > 0.8 && c.blueF() < 0.3 && c.alphaF() > 0.9;
+            }
+        QVERIFY(yellow);
+        // In the brackets style, a second track, the speakers named (no faces were looked for). It takes the style of the
+        // track that was shown and becomes the one shown, the first hidden.
+        QVERIFY(state()->edit("Style", [](Project&, Sequence& sq) {
+            sq.captionTracks[0].style.position = 0.8;
+            return true;
+        }));
+        o.sdh.style = kSdhBrackets;
+        QCOMPARE(panel->draftSdh(o, &error), 2);
+        s = state()->sequence();
+        QCOMPARE(s->captionTracks.size(), size_t(2));
+        QCOMPARE(s->captionTracks[1].captions[1].text, std::string("[Ted] Why not?"));
+        QCOMPARE(s->captionTracks[1].style.position, 0.8);
+        QVERIFY(!s->captionTracks[0].visible);
+        QCOMPARE(captionTrackFor(*s), &s->captionTracks[1]);
+        state()->undo();
+        QCOMPARE(state()->sequence()->captionTracks.size(), size_t(1));
+        QVERIFY(state()->sequence()->captionTracks[0].visible);
+
+        // The sounds to caption: edited as a list, kept with the project, one undo step; the ready-made list is no list.
+        auto editList = [&](const QString& text) {
+            QTimer::singleShot(0, [text] {
+                auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+                QVERIFY(dlg);
+                auto* edit = dlg->findChild<QPlainTextEdit*>("soundCaptions");
+                QVERIFY(edit);
+                QVERIFY(edit->toPlainText().startsWith("Door slams|"));
+                if (!text.isEmpty()) edit->setPlainText(text);
+                dlg->accept();
+            });
+            panel->editSoundCaptions();
+        };
+        const int steps = int(state()->history().undoCount());
+        editList({});
+        QVERIFY(state()->project().soundCaptions.empty());
+        QCOMPARE(int(state()->history().undoCount()), steps);
+        editList("Door slams|a door slamming shut\n\n  Kettle whistles  \n");
+        QCOMPARE(state()->project().soundCaptions, (std::vector<std::string>{"Door slams|a door slamming shut", "Kettle whistles"}));
+        QCOMPARE(int(state()->history().undoCount()), steps + 1);
+        state()->undo();
+        QVERIFY(state()->project().soundCaptions.empty());
+        state()->newProject();
     }
 
     void transcriptPanelEditsTheCut() {
@@ -17013,6 +17320,8 @@ print("added " + ui["name"])
         auto* size = dlg->findChild<QComboBox*>("reviewStreamSize");
         size->setCurrentIndex(size->findData(540));
         dlg->findChild<QCheckBox*>("reviewStreamHardware")->setChecked(false);
+        // (ticked here: the agent's start below turns markers off, which a second run on Windows reads back from the registry)
+        dlg->findChild<QCheckBox*>("reviewStreamMarkers")->setChecked(true);
         dlg->findChild<QSpinBox*>("reviewStreamMarkersPort")->setValue(markersPort);
         state()->setPlayhead(10);
         dlg->findChild<QPushButton*>("reviewStreamStart")->click();
@@ -17047,7 +17356,11 @@ print("added " + ui["name"])
         const size_t before = state()->sequence()->markers.size();
         viewer->findChild<QLineEdit*>("reviewNote")->setText(QStringLiteral("Warmer here"));
         viewer->findChild<QPushButton*>("reviewAddMarker")->click();
-        QTRY_COMPARE_WITH_TIMEOUT(state()->sequence()->markers.size(), before + 1, 10000);
+        QTRY_VERIFY2_WITH_TIMEOUT(state()->sequence()->markers.size() == before + 1,
+                                  qPrintable(QStringLiteral("viewer: %1; editor: %2")
+                                                 .arg(viewer->findChild<QLabel*>("reviewStatus")->text(),
+                                                      dlg->findChild<QLabel*>("reviewStreamStatus")->text())),
+                                  10000);
         auto it = std::find_if(state()->sequence()->markers.begin(), state()->sequence()->markers.end(),
                                [](const Marker& m) { return m.comment == "Warmer here"; });
         QVERIFY(it != state()->sequence()->markers.end());
@@ -17171,6 +17484,459 @@ print("added " + ui["name"])
         state()->newProject();
         QVERIFY(win_->openProject(path));
         QCOMPARE(trackAt(*state()->sequence(), V1)->clips.size(), size_t(3));
+    }
+
+    // ---- Phase 10 #14: screen readers and the keyboard
+
+    void everyControlNamed() {
+        // In each workspace, every control the keyboard can reach has a name and a role for a screen reader (with a clip
+        // selected, so the Inspector shows its rows).
+        loadDemo();
+        state()->setSelection({clipNamed(*state()->sequence(), "Blue")->id});
+        QStringList missing;
+        for (const QString& workspace : MainWindow::builtInWorkspaces()) {
+            QVERIFY(win_->applyWorkspace(workspace));
+            // (The tab bars of panels no longer stacked go when the event loop next runs, as it would between workspaces,
+            // and so do those the layout retires as it settles: only theirs are hurried, as anything else may be in use.)
+            QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+            QApplication::processEvents();
+            QList<QPointer<QTabBar>> bars;
+            for (QTabBar* bar : win_->findChildren<QTabBar*>())
+                if (bar->inherits("QMainWindowTabBar")) bars << bar;
+            for (const QPointer<QTabBar>& bar : bars)
+                if (bar) QCoreApplication::sendPostedEvents(bar, QEvent::DeferredDelete);
+            QApplication::processEvents();
+            for (QWidget* w : win_->findChildren<QWidget*>()) {
+                if (!w->isVisible() || !w->isEnabled() || w->focusPolicy() == Qt::NoFocus || w->window() != win_.get()) continue;
+                const QWidget* parent = w->parentWidget();
+                if (parent && (qobject_cast<const QAbstractSpinBox*>(parent) || qobject_cast<const QComboBox*>(parent))) continue;
+                QAccessibleInterface* iface = QAccessible::queryAccessibleInterface(w);
+                const QString name = iface ? iface->text(QAccessible::Name).trimmed() : QString();
+                const QAccessible::Role role = iface ? iface->role() : QAccessible::NoRole;
+                if (name.isEmpty() || role == QAccessible::NoRole || role == QAccessible::Client) {
+                    QString in;
+                    for (const QWidget* p = w->parentWidget(); p && p != win_.get(); p = p->parentWidget())
+                        if (!p->objectName().isEmpty() || qobject_cast<const QDockWidget*>(p)) {
+                            in = QString::fromLatin1(p->metaObject()->className()) + QLatin1Char(' ') + p->objectName();
+                            break;
+                        }
+                    QString what = QStringLiteral("%1 %2 '%3' named '%4' role %5 in %6")
+                                       .arg(workspace, QString::fromLatin1(w->metaObject()->className()), w->objectName(), name)
+                                       .arg(int(role), 0, 16)
+                                       .arg(in);
+                    if (const auto* bar = qobject_cast<const QTabBar*>(w))
+                        what += QStringLiteral(" (%1 tabs, current %2)").arg(bar->count()).arg(bar->currentIndex());
+                    if (!missing.contains(what)) missing << what;
+                }
+            }
+        }
+        QVERIFY(win_->applyWorkspace(QStringLiteral("Editing")));
+        QVERIFY2(missing.isEmpty(), qPrintable(missing.join(QLatin1Char('\n'))));
+    }
+
+    void timelineReadAsTable() {
+        loadDemo();
+        const Sequence* s = state()->sequence();
+        QAccessibleInterface* iface = QAccessible::queryAccessibleInterface(timeline());
+        QVERIFY(iface && iface->role() == QAccessible::Table && iface->tableInterface());
+        QCOMPARE(iface->text(QAccessible::Name), QStringLiteral("Timeline"));
+        QAccessibleTableInterface* table = iface->tableInterface();
+        const std::vector<TrackRef> shown = timeline()->shownTracks();
+        QCOMPARE(table->rowCount(), int(shown.size()));
+        // A row a track, top to bottom; in each its clips in time order with the gaps between them, each cell its clip's
+        // name, track and times.
+        int cells = 0;
+        for (int row = 0; row < table->rowCount(); ++row) {
+            const Track* t = trackAt(*s, shown[size_t(row)]);
+            QCOMPARE(table->rowDescription(row), QString::fromStdString(t->name));
+            int column = 0;
+            FrameTime at = 0;
+            for (const Clip& c : t->clips) {
+                if (c.start > at) {
+                    QAccessibleInterface* gap = table->cellAt(row, column++);
+                    QVERIFY(gap);
+                    QCOMPARE(gap->text(QAccessible::Name), QStringLiteral("Gap, %1, %2 to %3")
+                                                               .arg(QString::fromStdString(t->name), timecodeString(s, at), timecodeString(s, c.start)));
+                }
+                QAccessibleInterface* cell = table->cellAt(row, column++);
+                QVERIFY(cell && cell->role() == QAccessible::Cell);
+                const QString expected = QStringLiteral("%1, %2, %3 to %4")
+                                             .arg(QString::fromStdString(c.name), QString::fromStdString(t->name), timecodeString(s, c.start),
+                                                  timecodeString(s, c.end()));
+                QVERIFY2(cell->text(QAccessible::Name).startsWith(expected), qPrintable(cell->text(QAccessible::Name)));
+                QCOMPARE(cell->tableCellInterface()->rowIndex(), row);
+                QCOMPARE(cell->tableCellInterface()->columnIndex(), column - 1);
+                at = c.end();
+            }
+            QVERIFY(!table->cellAt(row, column));
+            cells += column;
+        }
+        QCOMPARE(iface->childCount(), cells);
+        // Pressing a cell selects its clip, which the table's value and the cell's state say; its place finds it again.
+        const Id blue = clipNamed(*s, "Blue")->id;
+        QAccessibleInterface* blueCell = nullptr;
+        for (int i = 0; i < iface->childCount(); ++i)
+            if (iface->child(i)->text(QAccessible::Name).startsWith(QStringLiteral("Blue, ")))
+                blueCell = iface->child(i);
+        QVERIFY(blueCell && blueCell->actionInterface());
+        QCOMPARE(iface->child(iface->indexOfChild(blueCell)), blueCell);
+        blueCell->actionInterface()->doAction(QAccessibleActionInterface::pressAction());
+        QVERIFY(state()->isSelected(blue));
+        QVERIFY2(iface->text(QAccessible::Value).contains(QStringLiteral("Blue selected")), qPrintable(iface->text(QAccessible::Value)));
+        QVERIFY(blueCell->state().selected);
+        QVERIFY(table->selectedCells().contains(blueCell));
+        const QRect r = blueCell->rect();
+        QVERIFY(!r.isEmpty());
+        QCOMPARE(iface->childAt(r.center().x(), r.center().y()), blueCell);
+        // An edit reads at once, and is announced with the clip: Blue nudged a frame later.
+        timeline()->setFocus();
+        const FrameTime start = edit::clipById(*state()->sequence(), blue)->start;
+        QTest::keyClick(win_.get(), Qt::Key_Right, Qt::AltModifier);
+        QCOMPARE(edit::clipById(*state()->sequence(), blue)->start, start + 1);
+        bool found = false;
+        for (int i = 0; i < iface->childCount(); ++i)
+            if (const QString n = iface->child(i)->text(QAccessible::Name); n.startsWith(QStringLiteral("Blue, ")))
+                found = n.contains(timecodeString(state()->sequence(), start + 1) + QStringLiteral(" to"));
+        QVERIFY(found);
+        QVERIFY2(access::lastAnnouncement().contains(QStringLiteral("Blue, V1, ")), qPrintable(access::lastAnnouncement()));
+        QTest::keyClick(win_.get(), Qt::Key_Z, Qt::ControlModifier);
+        QVERIFY2(access::lastAnnouncement().startsWith(QStringLiteral("Undo ")), qPrintable(access::lastAnnouncement()));
+        // Transitions and switched-off clips are read as part of their clip.
+        Sequence seq;
+        seq.videoTracks.resize(1);
+        seq.videoTracks[0].name = "V1";
+        Clip a;
+        a.id = 1, a.name = "A001_C003", a.start = 300, a.duration = 132;
+        Clip b;
+        b.id = 2, b.name = "A001_C004", b.start = 432, b.duration = 60, b.enabled = false;
+        seq.videoTracks[0].clips = {a, b};
+        Transition x;
+        x.clipA = 1, x.clipB = 2;
+        seq.videoTracks[0].transitions = {x};
+        const auto rows = access::timelineRows(seq, {V1});
+        QCOMPARE(rows.size(), size_t(1));
+        QCOMPARE(rows[0].cells.size(), size_t(3));
+        QCOMPARE(rows[0].cells[0].text, QStringLiteral("Gap, V1, 00:00:00:00 to 00:00:10:00"));
+        QCOMPARE(rows[0].cells[1].text, QStringLiteral("A001_C003, V1, 00:00:10:00 to 00:00:14:12, Cross Dissolve out"));
+        QCOMPARE(rows[0].cells[2].text, QStringLiteral("A001_C004, V1, 00:00:14:12 to 00:00:16:12, Cross Dissolve in, disabled"));
+    }
+
+    void timelineByKeyboard() {
+        // Clips selected with the keys alone: along a track, across tracks, and under the playhead, each said aloud.
+        loadDemo();
+        state()->clearSelection();
+        state()->setTargetVideoTrack(0);
+        state()->setPlayhead(0);
+        const Sequence* s = state()->sequence();
+        const Track* v1 = trackAt(*s, V1);
+        QVERIFY(v1->clips.size() >= 2);
+        QTest::keyClick(win_.get(), Qt::Key_Down, Qt::AltModifier);
+        QCOMPARE(state()->selectedClips().front(), v1->clips[0].id);
+        QTest::keyClick(win_.get(), Qt::Key_Down, Qt::AltModifier);
+        QCOMPARE(state()->selectedClips().front(), v1->clips[1].id);
+        QCOMPARE(state()->playhead(), v1->clips[1].start);
+        QVERIFY(access::lastAnnouncement().startsWith(QString::fromStdString(v1->clips[1].name) + QStringLiteral(", V1, ")));
+        QTest::keyClick(win_.get(), Qt::Key_Up, Qt::AltModifier);
+        QCOMPARE(state()->selectedClips().front(), v1->clips[0].id);
+        // Up a track: V2 is the target, with whatever is there at the clip's start.
+        QTest::keyClick(win_.get(), Qt::Key_Up, Qt::AltModifier | Qt::ShiftModifier);
+        QCOMPARE(state()->targetVideoTrack(), 1);
+        const Clip* above = edit::clipAt(*state()->sequence(), {TrackKind::Video, 1}, v1->clips[0].start);
+        if (above) QCOMPARE(state()->selectedClips().front(), above->id);
+        else QVERIFY(state()->selectedClips().empty() && access::lastAnnouncement().contains(QStringLiteral("no clip")));
+        QTest::keyClick(win_.get(), Qt::Key_Down, Qt::AltModifier | Qt::ShiftModifier);
+        QCOMPARE(state()->targetVideoTrack(), 0);
+        state()->setPlayhead(v1->clips[1].start + 2);
+        QTest::keyClick(win_.get(), Qt::Key_C, Qt::ShiftModifier);
+        QCOMPARE(state()->selectedClips().front(), trackAt(*state()->sequence(), V1)->clips[1].id);
+        // A drop-down list with the focus keeps Alt+Down, to open.
+        QComboBox* combo = nullptr;
+        for (QComboBox* c : win_->findChildren<QComboBox*>())
+            if (c->isVisible() && c->isEnabled() && !combo) combo = c;
+        if (combo) {
+            combo->setFocus();
+            const auto before = state()->selectedClips();
+            QTest::keyClick(combo, Qt::Key_Down, Qt::AltModifier);
+            QCOMPARE(state()->selectedClips(), before);
+            combo->hidePopup();
+        }
+        // F6 goes round the panels shown and back to the timeline, saying where it is.
+        timeline()->setFocus();
+        QTest::keyClick(win_.get(), Qt::Key_F6);
+        QVERIFY(!timeline()->hasFocus());
+        QVERIFY2(access::lastAnnouncement().endsWith(QStringLiteral(" panel")), qPrintable(access::lastAnnouncement()));
+        int steps = 1;
+        while (!timeline()->hasFocus() && steps < 40) {
+            QTest::keyClick(QApplication::focusWidget() ? QApplication::focusWidget() : win_.get(), Qt::Key_F6);
+            ++steps;
+        }
+        QVERIFY(timeline()->hasFocus());
+        QCOMPARE(access::lastAnnouncement(), QStringLiteral("Timeline"));
+        QTest::keyClick(win_.get(), Qt::Key_F6, Qt::ShiftModifier);
+        QVERIFY(!timeline()->hasFocus());
+        timeline()->setFocus();
+    }
+
+    void keyframesByKeyboard() {
+        // The keyframes read as a list, and are moved between, nudged, added and removed from the keyboard.
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        QVERIFY(state()->edit("Keys", [&](Project&, Sequence& s) {
+            Clip* c = edit::clipById(s, red);
+            c->motion.params["opacity"].addKey(10, 100);
+            c->motion.params["opacity"].addKey(30, 0);
+            c->motion.params["scale"].expr = "100";  // (a row with no keys)
+            return true;
+        }));
+        state()->setSelection({red}, false);
+        win_->raisePanel("keyframes");
+        auto* panel = win_->findChild<KeyframePanel*>();
+        QTRY_COMPARE(panel->clip(), red);
+        QAccessibleInterface* list = QAccessible::queryAccessibleInterface(panel);
+        QVERIFY(list && list->role() == QAccessible::List);
+        QCOMPARE(list->childCount(), 2);
+        const FrameTime clipStart = edit::clipById(*state()->sequence(), red)->start;
+        QVERIFY2(list->child(0)->text(QAccessible::Name).contains(QStringLiteral("Opacity, %1, 100").arg(timecodeString(state()->sequence(), clipStart + 10))),
+                 qPrintable(list->child(0)->text(QAccessible::Name)));
+        QCOMPARE(list->child(0)->role(), QAccessible::ListItem);
+        panel->setFocus();
+        QVERIFY(panel->hasFocus());
+        state()->setPlayhead(clipStart + 12);
+        QTest::keyClick(panel, Qt::Key_Down);  // the key nearest the playhead
+        QCOMPARE(panel->selection().size(), size_t(1));
+        QCOMPARE(panel->selection().begin()->t, FrameTime(10));
+        QVERIFY(list->child(0)->state().selected);
+        QTest::keyClick(panel, Qt::Key_Right, Qt::AltModifier);  // the next key, the playhead with it
+        QCOMPARE(panel->selection().begin()->t, FrameTime(30));
+        QCOMPARE(state()->playhead(), clipStart + 30);
+        QTest::keyClick(panel, Qt::Key_Left);  // moved a frame earlier
+        QCOMPARE(panel->selection().begin()->t, FrameTime(29));
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->motion.params.at("opacity").keys.back().t, FrameTime(29));
+        state()->setPlayhead(clipStart + 20);
+        QTest::keyClick(panel, Qt::Key_Insert);  // a key at the playhead
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->motion.params.at("opacity").keys.size(), size_t(3));
+        QCOMPARE(list->childCount(), 3);
+        QTest::keyClick(panel, Qt::Key_Delete);
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->motion.params.at("opacity").keys.size(), size_t(2));
+        // Up and Down reach a row with no keys, said as one; a key added there past the clip's end lands on its last frame.
+        for (int i = 0; i < 6 && !access::lastAnnouncement().endsWith(QStringLiteral("no keyframes")); ++i)
+            QTest::keyClick(panel, i < 3 ? Qt::Key_Down : Qt::Key_Up);
+        QVERIFY2(access::lastAnnouncement().endsWith(QStringLiteral("no keyframes")), qPrintable(access::lastAnnouncement()));
+        QVERIFY(panel->selection().empty());
+        const int keysBefore = list->childCount();
+        const FrameTime duration = edit::clipById(*state()->sequence(), red)->duration;
+        state()->setPlayhead(clipStart + duration + 50);
+        QTest::keyClick(panel, Qt::Key_Insert);
+        QCOMPARE(list->childCount(), keysBefore + 1);
+        QCOMPARE(panel->selection().begin()->t, duration - 1);
+        // A chord with Ctrl is the window's, not a move.
+        const auto picked = panel->selection();
+        QTest::keyClick(panel, Qt::Key_Up, Qt::ControlModifier);
+        QVERIFY(panel->selection() == picked);
+        timeline()->setFocus();
+    }
+
+    void highContrastAndTextSize() {
+        // Text against every ground: 4.5:1 or more in the usual theme, 7:1 in high contrast, where the clips' white names
+        // are 7:1 too.
+        QCOMPARE(theme::contrastRatio(Qt::black, Qt::white), 21.0);
+        QCOMPARE(theme::contrastRatio(QColor(0x77, 0x77, 0x77), QColor(0x77, 0x77, 0x77)), 1.0);
+        for (const bool high : {false, true}) {
+            theme::setHighContrast(high);
+            const double need = high ? 7.0 : 4.5;
+            for (const QColor& ground : {theme::kWindow, theme::kPanel, theme::kPanelAlt})
+                for (const QColor& text : {theme::kText, theme::kTextDim})
+                    QVERIFY2(theme::contrastRatio(text, ground) >= need,
+                             qPrintable(QStringLiteral("%1 on %2: %3").arg(text.name(), ground.name()).arg(theme::contrastRatio(text, ground))));
+            if (high)
+                for (const QColor& clip : {theme::kVideoClip, theme::kAudioClip, theme::kGeneratorClip, theme::kCompoundClip, theme::kDisabledClip})
+                    QVERIFY2(theme::contrastRatio(Qt::white, clip) >= 7, qPrintable(clip.name()));
+        }
+        theme::setHighContrast(false);
+        // The window's commands switch it, and the text size, for the whole application (and back).
+        const QPalette palette = qApp->palette();
+        const QFont font = qApp->font();
+        const QString sheet = qApp->styleSheet();
+        win_->findChild<QAction*>("highContrast")->trigger();
+        QVERIFY(theme::highContrast());
+        QCOMPARE(qApp->palette().color(QPalette::Window), QColor(Qt::black));
+        QVERIFY(qApp->styleSheet().contains(QStringLiteral("#ffd400")));  // the yellow focus border
+        win_->findChild<QAction*>("textSize150")->trigger();
+        QCOMPARE(qApp->font().pointSizeF(), font.pointSizeF() * 1.5);
+        QCOMPARE(theme::monoFont(10).pointSizeF(), 15.0);
+        QCOMPARE(appSettings().value("ui/textScale").toDouble(), 1.5);
+        QCOMPARE(appSettings().value("ui/highContrast").toBool(), true);
+        win_->findChild<QAction*>("textSize100")->trigger();
+        win_->findChild<QAction*>("highContrast")->trigger();
+        QVERIFY(!theme::highContrast() && !win_->findChild<QAction*>("highContrast")->isChecked());
+        QCOMPARE(qApp->font().pointSizeF(), font.pointSizeF());
+        // (The tests run without the application's theme.)
+        qApp->setStyleSheet(sheet);
+        qApp->setPalette(palette);
+        qApp->setFont(font);
+    }
+
+    void learnEffectFromExamples() {
+        // Clip > Learn Effect from Examples: the clip's own work (an Invert) learned from a frame, then given to the clip
+        // in the Invert's place, and Undo takes that back.
+        loadDemo();
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        QVERIFY(state()->edit("Invert", [&](Project& p, Sequence& s) {
+            edit::clipById(s, red)->effects.push_back(makeEffect(p, "invert"));
+            return true;
+        }));
+        state()->setSelection({red});
+        const FrameTime at = edit::clipById(*state()->sequence(), red)->start + 5;
+        state()->setPlayhead(at);
+        LearnEffectDialog* dlg = win_->learnEffectDialog();
+        QVERIFY(dlg);
+        QFile::remove(dlg->networkFile());
+        dlg->setFrames({at});
+        QVERIFY(dlg->frames() == std::vector<FrameTime>{at});
+        learn::TrainOptions o;
+        o.crop = 64, o.batch = 1;
+        dlg->setOptions(o);
+        dlg->setSteps(60);
+        QVERIFY(dlg->train(true));
+        QVERIFY(!dlg->busy());
+        QCOMPARE(dlg->stepsTrained(), 60);
+        QVERIFY2(QFileInfo::exists(dlg->networkFile()), qPrintable(dlg->status()));
+        QVERIFY(dlg->findChild<QLabel*>("learnPreview")->pixmap().width() > 0);
+        // Trained again, it goes on from there.
+        QVERIFY(dlg->train(true));
+        QCOMPARE(dlg->stepsTrained(), 120);
+        QVERIFY(dlg->apply(false, true));
+        const Clip* c = edit::clipById(*state()->sequence(), red);
+        QCOMPARE(c->effects.front().type, std::string("learned_effect"));
+        QCOMPARE(QString::fromStdString(c->effects.front().s("network")), dlg->networkFile());
+        QVERIFY(!c->effects.back().enabled);
+        // Trained again, into a new file: the clip keeps the network it was given.
+        const QString given = dlg->networkFile();
+        dlg->setSteps(50);
+        QVERIFY(dlg->train(true));
+        QCOMPARE(dlg->stepsTrained(), 170);
+        QVERIFY(dlg->networkFile() != given && QFileInfo::exists(dlg->networkFile()));
+        QCOMPARE(QString::fromStdString(edit::clipById(*state()->sequence(), red)->effects.front().s("network")), given);
+        QFile::remove(given);
+        state()->undo();
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->effects.size(), size_t(1));
+        dlg->close();
+        QFile::remove(dlg->networkFile());
+    }
+
+    void editingByKeyboardAlone() {
+        // Import, insert, trim, a title and an export with the keys alone give the same sequence as the commands run
+        // directly.
+        const QString wav = QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav");
+        auto shape = [](const Sequence& s) {
+            QStringList out;
+            for (const auto* tracks : {&s.videoTracks, &s.audioTracks})
+                for (const Track& t : *tracks)
+                    for (const Clip& c : t.clips)
+                        out << QStringLiteral("%1 %2 %3 %4 %5 %6")
+                                   .arg(QString::fromStdString(t.name), QString::fromStdString(c.name), QString::fromStdString(c.generator.type))
+                                   .arg(c.start)
+                                   .arg(c.duration)
+                                   .arg(c.sourceIn);
+            return out;
+        };
+        // The commands run directly.
+        state()->newProject();
+        const auto ids = state()->importFiles({wav});
+        QCOMPARE(ids.size(), size_t(1));
+        state()->setSourceMedia(ids.front());
+        state()->setPlayhead(0);
+        state()->insertFromSource(false);
+        state()->setPlayhead(20);
+        win_->findChild<QAction*>("rippleTrimNext")->trigger();
+        win_->findChild<QAction*>("newTitle")->trigger();
+        const QStringList direct = shape(*state()->sequence());
+        QVERIFY2(direct.size() >= 2, qPrintable(direct.join(QLatin1Char('\n'))));
+
+        // The keyboard: Ctrl+I and the file name typed into the dialog.
+        state()->newProject();
+        win_->activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+        // (Held apart from the test's frame: the timer may fire after it, when no dialog opened.)
+        auto typed = std::make_shared<bool>(false);
+        whenModal<QFileDialog>(this, [typed, wav](QFileDialog* dialog) {
+            // (The file name field has the focus; offscreen, a dialog opened in a test may not be given it.)
+            QWidget* field = QApplication::focusWidget();
+            if (!field || !dialog->isAncestorOf(field)) field = dialog->findChild<QLineEdit*>(QStringLiteral("fileNameEdit"));
+            if (!field) {
+                dialog->reject();
+                return;
+            }
+            QTest::keyClicks(field, wav);
+            QTest::keyClick(field, Qt::Key_Return);
+            // (Return can go to the name's completion list when it opens late, which leaves Qt's own dialog up: the
+            // file typed is taken as it would be on a second Return.)
+            if (dialog->isVisible()) {
+                dialog->selectFile(wav);
+                static_cast<QDialog*>(dialog)->accept();
+            }
+            *typed = true;
+        });
+        QTest::keyClick(win_.get(), Qt::Key_I, Qt::ControlModifier);
+        QVERIFY(*typed);
+        QTRY_COMPARE(state()->project().media.size(), size_t(1));
+        // To the Media panel with F6, the clip chosen with the arrows, Enter opens it in the Source monitor.
+        win_->raisePanel("media");
+        win_->activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+        timeline()->setFocus();
+        auto focused = [this]() -> QWidget* { return QApplication::focusWidget() ? QApplication::focusWidget() : win_.get(); };
+        for (int i = 0; i < 40 && access::lastAnnouncement() != QStringLiteral("Media panel"); ++i) QTest::keyClick(focused(), Qt::Key_F6);
+        QCOMPARE(access::lastAnnouncement(), QStringLiteral("Media panel"));
+        QAbstractItemView* view = nullptr;
+        for (int i = 0; i < 20; ++i) {
+            if ((view = qobject_cast<QAbstractItemView*>(QApplication::focusWidget())) && view->model() && view->model()->rowCount() > 0) break;
+            view = nullptr;
+            QTest::keyClick(focused(), Qt::Key_Tab);
+        }
+        QVERIFY2(view, QApplication::focusWidget() ? QApplication::focusWidget()->metaObject()->className() : "no focus");
+        QTest::keyClick(view, Qt::Key_Home);
+        QTest::keyClick(view, Qt::Key_Return);
+        QTRY_COMPARE(state()->sourceMedia(), state()->project().media.front().id);
+        // Insert (comma) at the start, the playhead twenty frames on, W ripple-trims the rest away, Ctrl+T a title.
+        timeline()->setFocus();
+        QTest::keyClick(win_.get(), Qt::Key_Home);
+        QTest::keyClick(win_.get(), Qt::Key_Comma);
+        QTest::keyClick(win_.get(), Qt::Key_Home);
+        for (int i = 0; i < 4; ++i) QTest::keyClick(win_.get(), Qt::Key_Right, Qt::ShiftModifier);
+        QCOMPARE(state()->playhead(), FrameTime(20));
+        QTest::keyClick(win_.get(), Qt::Key_W);
+        QTest::keyClick(win_.get(), Qt::Key_T, Qt::ControlModifier);
+        QCOMPARE(shape(*state()->sequence()), direct);
+
+        // Ctrl+M, the file name typed (Tab to the field), Tab to Export, Space.
+        const QString out = dir_.filePath(QStringLiteral("keyboard-export.mp4"));
+        QFile::remove(out);
+        auto exported = std::make_shared<bool>(false);
+        whenModal<ExportDialog>(this, [exported, out](ExportDialog* dialog) {
+            auto* path = dialog->findChild<QLineEdit*>(QStringLiteral("exportPath"));
+            for (int i = 0; i < 80 && QApplication::focusWidget() != path; ++i) QTest::keyClick(QApplication::focusWidget(), Qt::Key_Tab);
+            if (QApplication::focusWidget() != path) {
+                dialog->reject();
+                return;
+            }
+            QTest::keyClick(path, Qt::Key_A, Qt::ControlModifier);
+            QTest::keyClicks(path, out);
+            QPushButton* go = nullptr;
+            for (QPushButton* b : dialog->findChildren<QPushButton*>())
+                if (b->text() == QStringLiteral("Export")) go = b;
+            for (int i = 0; i < 120 && QApplication::focusWidget() != go; ++i) QTest::keyClick(QApplication::focusWidget(), Qt::Key_Tab);
+            if (QApplication::focusWidget() != go) {
+                dialog->reject();
+                return;
+            }
+            QTest::keyClick(go, Qt::Key_Space);
+            *exported = true;
+        });
+        QTest::keyClick(win_.get(), Qt::Key_M, Qt::ControlModifier);
+        QVERIFY(*exported);
+        QTRY_VERIFY_WITH_TIMEOUT(QFileInfo(out).size() > 0, 60000);
+        state()->newProject();
     }
 };
 

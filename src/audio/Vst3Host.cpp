@@ -1,4 +1,5 @@
-// VST3 plugin probing and hosting (VST 3 SDK 3.8, MIT; third_party/vst3sdk).
+// VST3 plugin probing and hosting (VST 3 SDK 3.8, MIT; third_party/vst3sdk), with ARA through its VST3 companion
+// interfaces (Celemony's ARA SDK, Apache-2.0; third_party/ara).
 // VST is a registered trademark of Steinberg Media Technologies GmbH.
 #include <QString>
 #include <algorithm>
@@ -21,6 +22,8 @@
 #include "public.sdk/source/common/memorystream.h"
 #include "public.sdk/source/vst/hosting/hostclasses.h"
 #include "public.sdk/source/vst/hosting/parameterchanges.h"
+#include "pluginterfaces/vst/ivstprocesscontext.h"
+#include "ARA_API/ARAVST3.h"
 
 #ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
@@ -42,6 +45,12 @@ DEF_CLASS_IID(ITimerHandler)
 }  // namespace Linux
 #endif
 }  // namespace Steinberg
+
+namespace ARA {
+DEF_CLASS_IID(IMainFactory)
+DEF_CLASS_IID(IPlugInEntryPoint)
+DEF_CLASS_IID(IPlugInEntryPoint2)
+}  // namespace ARA
 
 namespace montage::plugins {
 
@@ -367,7 +376,8 @@ public:
             active_ = processing_ = false;
         }
         maxFrames_ = std::max(1, maxFrames);
-        ProcessSetup setup{kRealtime, kSample32, maxFrames_, sampleRate};
+        sampleRate_ = sampleRate;
+        ProcessSetup setup{offline_ ? kOffline : kRealtime, kSample32, maxFrames_, sampleRate};
         if (processor_->setupProcessing(setup) != kResultOk) return false;
         if (component_->setActive(true) != kResultOk) return false;
         active_ = true;
@@ -494,6 +504,36 @@ public:
     }
 
     int latencySamples() override { return processor_ ? int(processor_->getLatencySamples()) : 0; }
+
+    std::shared_ptr<const void> library() override { return module_; }
+    const void* araFactory() override {
+        FUnknownPtr<ARA::IPlugInEntryPoint> entry(component_);
+        return entry ? entry->getFactory() : nullptr;
+    }
+
+    const void* bindToAra(void* documentController, uint32_t knownRoles, uint32_t assignedRoles) override {
+        if (active_) return nullptr;
+        if (FUnknownPtr<ARA::IPlugInEntryPoint2> entry2(component_); entry2)
+            return entry2->bindToDocumentControllerWithRoles(static_cast<ARA::ARADocumentControllerRef>(documentController), knownRoles,
+                                                             assignedRoles);
+        return nullptr;
+    }
+
+    void setTransport(int64_t samplePosition, bool playing, double bpm, int beatsPerBar) override {
+        transportPos_ = samplePosition;
+        playing_ = playing;
+        bpm_ = bpm > 0 ? bpm : 120;
+        beatsPerBar_ = std::max(1, beatsPerBar);
+        transport_ = true;
+    }
+    void setOffline(bool offline) override { offline_ = offline; }
+
+    bool setMainChannels(int channels) override {
+        if (active_ || channels < 1 || channels > 2) return false;
+        setupBuses(channels == 1 ? SpeakerArr::kMono : SpeakerArr::kStereo);
+        return outChannels_ == channels;
+    }
+
     bool hasSidechain() override { return keyBus_ >= 0; }
     void setSidechain(const float* const* channels, int numChannels) override {
         key_ = channels;
@@ -537,11 +577,11 @@ private:
         controller_->setComponentState(&s);
     }
 
-    void setupBuses() {
+    void setupBuses(SpeakerArrangement main = SpeakerArr::kStereo) {
         const int32 numIn = component_->getBusCount(kAudio, kInput);
         const int32 numOut = component_->getBusCount(kAudio, kOutput);
-        // Ask for stereo main buses; keep whatever the plugin insists on otherwise.
-        std::vector<SpeakerArrangement> ins(size_t(numIn), SpeakerArr::kStereo), outs(size_t(numOut), SpeakerArr::kStereo);
+        // Ask for stereo main buses (or as asked); keep whatever the plugin insists on otherwise.
+        std::vector<SpeakerArrangement> ins(size_t(numIn), main), outs(size_t(numOut), main);
         for (int32 i = 1; i < numIn; ++i) processor_->getBusArrangement(kInput, i, ins[size_t(i)]);
         for (int32 i = 1; i < numOut; ++i) processor_->getBusArrangement(kOutput, i, outs[size_t(i)]);
         if (processor_->setBusArrangements(ins.data(), numIn, outs.data(), numOut) != kResultOk) {
@@ -615,7 +655,7 @@ private:
             }
         }
         ProcessData data{};
-        data.processMode = kRealtime;
+        data.processMode = offline_ ? kOffline : kRealtime;
         data.symbolicSampleSize = kSample32;
         data.numSamples = n;
         data.numInputs = int32(inBuses_.size());
@@ -623,6 +663,20 @@ private:
         data.inputs = inBuses_.empty() ? nullptr : inBuses_.data();
         data.outputs = outBuses_.data();
         data.inputParameterChanges = changes_;
+        ProcessContext context{};
+        if (transport_) {
+            // Where the block starts on the timeline (as ARA renderers read it), at the steady tempo and bar.
+            context.state = ProcessContext::kProjectTimeMusicValid | ProcessContext::kTempoValid | ProcessContext::kTimeSigValid |
+                            (playing_ ? ProcessContext::kPlaying : 0);
+            context.sampleRate = sampleRate_;
+            context.projectTimeSamples = transportPos_;
+            context.projectTimeMusic = double(transportPos_) / sampleRate_ * bpm_ / 60;
+            context.tempo = bpm_;
+            context.timeSigNumerator = beatsPerBar_;
+            context.timeSigDenominator = 4;
+            data.processContext = &context;
+            transportPos_ += n;
+        }
         const tresult r = processor_->process(data);
         changes_->clearQueue();
         if (r != kResultOk) return;
@@ -660,6 +714,12 @@ private:
     IPtr<ParameterChanges> changes_;
     bool separateController_ = false;
     bool active_ = false, processing_ = false;
+    bool transport_ = false, playing_ = false;  // (setTransport)
+    int64_t transportPos_ = 0;
+    double bpm_ = 120;
+    int beatsPerBar_ = 4;
+    bool offline_ = false;
+    double sampleRate_ = 48000;
     int maxFrames_ = 1024;
     int inChannels_ = 0, outChannels_ = 0;
     std::vector<int32> inBusChannels_, outBusChannels_;
@@ -682,6 +742,12 @@ std::vector<Descriptor> probeVst3(const std::string& path, std::string* error) {
     mod->factory->getFactoryInfo(&factoryInfo);
     FUnknownPtr<IPluginFactory2> factory2(mod->factory);
     const int32 count = mod->factory->countClasses();
+    // An ARA plugin has an ARA main factory class by the same name as its audio class.
+    std::vector<std::string> araNames;
+    for (int32 i = 0; i < count; ++i) {
+        PClassInfo info;
+        if (mod->factory->getClassInfo(i, &info) == kResultOk && std::strcmp(info.category, kARAMainFactoryClass) == 0) araNames.push_back(info.name);
+    }
     for (int32 i = 0; i < count; ++i) {
         PClassInfo info;
         if (mod->factory->getClassInfo(i, &info) != kResultOk) continue;
@@ -692,6 +758,7 @@ std::vector<Descriptor> probeVst3(const std::string& path, std::string* error) {
         d.id = "vst3:" + d.pluginId;
         d.name = info.name;
         d.vendor = factoryInfo.vendor;
+        d.ara = std::find(araNames.begin(), araNames.end(), d.name) != araNames.end();
         d.path = path;
         if (factory2) {
             PClassInfo2 info2;

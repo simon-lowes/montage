@@ -184,47 +184,56 @@ void rollOffPq(Image& img, double fromNits, double toNits) {
     });
 }
 
-void applyTrimPass(Image& img, const Sequence& s, FrameTime t, const TrimTarget& target) {
+void applyTrimPass(Image& img, const Sequence& s, FrameTime t, const TrimTarget& target, const ColorSpace* from, bool exact) {
     const Clip* shot = trimShot(s, t);
     const auto it = shot ? shot->trims.find(target.id) : decltype(shot->trims)::const_iterator{};
-    applyTrim(img, s, target, shot && it != shot->trims.end() ? &it->second : nullptr, shot ? t - shot->start : 0);
+    applyTrim(img, s, target, shot && it != shot->trims.end() ? &it->second : nullptr, shot ? t - shot->start : 0, from, exact);
 }
 
-void applyTrim(Image& img, const Sequence& s, const TrimTarget& target, const Effect* trimmed, FrameTime local) {
+void applyTrim(Image& img, const Sequence& s, const TrimTarget& target, const Effect* trimmed, FrameTime local, const ColorSpace* scene,
+               bool exact) {
     const ColorSpace& from = sequenceColorSpace(s);
     const ColorSpace* to = findColorSpace(target.colorSpace);
+    // (A frame in scene light is always rendered for a display: the delivery space when the target names none known.)
+    if (!to && scene && scene->sceneReferred) to = &from;
     if (img.empty() || !to) return;
-    // 1. The master on the target's display: PQ above its peak rolled off first, then into its space. The rolled-off
-    // light runs from the shot's own peak where its trim gives one, else the master's.
-    const double peak = targetPeak(*to, target.peakNits), master = sourcePeak(s);
-    const double shotPeak = trimmed && trimmed->enabled ? trimmed->p("peak", local, 0) : 0;
-    const double fromPeak = shotPeak > 0 ? std::min(shotPeak, master) : master;
-    const ColorSpace& pq = *findColorSpace("rec2100pq");
-    // (light above `top`, the shot's own brightest, held at the target's peak: no roll-off under it)
-    auto rollOff = [&](double top, double toNits) {
-        if (top > toNits) {
-            rollOffPq(img, top, toNits);
-            return;
-        }
-        const float most = float(nitsToCode(pq, toNits));
-        for (size_t i = 0; i + 3 < img.px.size(); i += 4)  // (premultiplied: the colour under its alpha times the code)
-            for (size_t k = 0; k < 3; ++k) img.px[i + k] = std::min(img.px[i + k], most * img.px[i + 3]);
-    };
-    if (!to->hdr() && from.hdr() && shotPeak > 0) {
-        // SDR from the shot's peak: its light rolled off (in PQ) to what SDR shows just short of white, then tone mapped.
-        // The roll-off is in the target's primaries, so a colour its smaller gamut makes brighter is rolled off too.
-        const ColorSpace rolled{"trim-pq-" + to->id, "", to->primaries, Transfer::Pq, false};
-        convertColor(img, from, rolled, master);
-        if (fromPeak > kSdrHeadroomNits) rollOffPq(img, fromPeak, kSdrHeadroomNits);
-        convertColor(img, rolled, *to, master);
-    } else if (to->transfer == Transfer::Pq && from.hdr() && (fromPeak > peak || master > peak)) {
-        // (into PQ at the master's peak, then rolled off there: HLG's highlights too)
-        convertColor(img, from, *to, master);
-        rollOff(fromPeak, peak);
+    if (scene && scene->sceneReferred) {
+        // (graded scene-referred: the target's own output transform, then its trim)
+        outputTransform(img, *scene, *to, targetPeak(*to, target.peakNits), outputTransformKind(s), exact);
     } else {
-        // (a PQ master into HLG rolled off to its 1000 nits first, on PQ's own code values)
-        if (from.transfer == Transfer::Pq && to->hdr() && master > peak) rollOff(fromPeak, peak);
-        convertColor(img, from, *to, to->transfer == Transfer::Pq ? peak : master);
+        // 1. The master on the target's display: PQ above its peak rolled off first, then into its space. The
+        // rolled-off light runs from the shot's own peak where its trim gives one, else the master's.
+        const double peak = targetPeak(*to, target.peakNits), master = sourcePeak(s);
+        const double shotPeak = trimmed && trimmed->enabled ? trimmed->p("peak", local, 0) : 0;
+        const double fromPeak = shotPeak > 0 ? std::min(shotPeak, master) : master;
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        // (light above `top`, the shot's own brightest, held at the target's peak: no roll-off under it)
+        auto rollOff = [&](double top, double toNits) {
+            if (top > toNits) {
+                rollOffPq(img, top, toNits);
+                return;
+            }
+            const float most = float(nitsToCode(pq, toNits));
+            for (size_t i = 0; i + 3 < img.px.size(); i += 4)  // (premultiplied: the colour under its alpha times the code)
+                for (size_t k = 0; k < 3; ++k) img.px[i + k] = std::min(img.px[i + k], most * img.px[i + 3]);
+        };
+        if (!to->hdr() && from.hdr() && shotPeak > 0) {
+            // SDR from the shot's peak: its light rolled off (in PQ) to what SDR shows just short of white, then tone
+            // mapped. The roll-off is in the target's primaries, so a colour its smaller gamut makes brighter is rolled
+            // off too.
+            const ColorSpace rolled{"trim-pq-" + to->id, "", to->primaries, Transfer::Pq, false};
+            convertColor(img, from, rolled, master);
+            if (fromPeak > kSdrHeadroomNits) rollOffPq(img, fromPeak, kSdrHeadroomNits);
+            convertColor(img, rolled, *to, master);
+        } else if (to->transfer == Transfer::Pq && from.hdr() && (fromPeak > peak || master > peak)) {
+            // (into PQ at the master's peak, then rolled off there: HLG's highlights too)
+            convertColor(img, from, *to, master);
+            rollOff(fromPeak, peak);
+        } else {
+            // (a PQ master into HLG rolled off to its 1000 nits first, on PQ's own code values)
+            if (from.transfer == Transfer::Pq && to->hdr() && master > peak) rollOff(fromPeak, peak);
+            convertColor(img, from, *to, to->transfer == Transfer::Pq ? peak : master);
+        }
     }
     // 2. The shot's trim, on the display's code values.
     if (!trimmed || isNeutralTrim(*trimmed, local)) return;

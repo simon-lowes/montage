@@ -59,6 +59,17 @@ public:
     int pasteAtPlayhead();
     static bool hasCopiedKeys();
 
+    // Every key, row by row and in time order within each, and how a screen reader reads one: "Opacity, 00:00:01:00,
+    // 80, Linear".
+    std::vector<Key> keys() const;
+    QString keyText(const Key& key) const;
+    // The keyboard (with the panel focused): Up and Down move to the row above or below and select its key nearest the
+    // playhead, Alt+Left and Alt+Right the key before or after on the row (the playhead following), Left and Right
+    // move the selected keys a frame (Shift: ten), Insert or Enter adds a key on the row at the playhead, Delete
+    // removes the selected ones. The row they act on:
+    int currentRow() const { return currentRow_; }
+    bool addKeyAt(int row, FrameTime t);  // a key with the value the parameter has there (one undo step)
+
     // The value graph.
     void setGraph(bool on);
     bool graph() const { return graph_; }
@@ -104,8 +115,11 @@ private:
     bool graphKeyAt(const QPoint& pos, Key& key, int& row) const;
     bool handleAt(const QPoint& pos, Key& key, int& row, bool& out) const;
 
+    void selectKey(int row, int step);  // step 0: the key nearest the playhead, else the one before / after
+
     EditorState* state_;
     Id clip_ = 0;
+    int currentRow_ = 0;
     std::vector<Row> rows_;
     std::set<Key> selection_;
     // Mouse: dragging keys, a selection box, or scrubbing the ruler.

@@ -17,6 +17,8 @@
 #include "media/Exr.h"
 #include "media/Matting.h"
 #include "media/Inpaint.h"
+#include "media/LearnedEffect.h"
+#include "render/Compositor.h"
 #include "FaceRefine.h"
 #include "FaceShape.h"
 #include "media/FaceMesh.h"
@@ -1160,6 +1162,10 @@ DepthScope::~DepthScope() { tDepth = std::move(previous_); }
 const ValueMap* currentPersonMatte() { return tPerson.get(); }
 PersonScope::PersonScope(std::shared_ptr<const ValueMap> matte) : previous_(std::move(tPerson)) { tPerson = std::move(matte); }
 PersonScope::~PersonScope() { tPerson = std::move(previous_); }
+thread_local SlowEffects tSlow;
+const SlowEffects& currentSlowEffects() { return tSlow; }
+SlowEffectsScope::SlowEffectsScope(SlowEffects slow) : previous_(tSlow) { tSlow = slow; }
+SlowEffectsScope::~SlowEffectsScope() { tSlow = previous_; }
 thread_local std::string tCryptoFile;
 const std::string& currentCryptomatteFile() { return tCryptoFile; }
 CryptomatteScope::CryptomatteScope(std::string file) : previous_(std::move(tCryptoFile)) { tCryptoFile = std::move(file); }
@@ -1894,10 +1900,59 @@ bool redactNeedsLiveFaces(const Effect& e, double sourceSeconds) {
     return !tracks || !tracksCover(*tracks, e, sourceSeconds);
 }
 
+EffectDomain effectDomain(const std::string& type) {
+    static const std::map<std::string, EffectDomain> domains = [] {
+        std::map<std::string, EffectDomain> m;
+        for (const char* t : {"color_correct", "curves", "hue_curves", "color_warper", "cdl", "lut", "hue_sat", "levels"})
+            m[t] = EffectDomain::Log;
+        for (const char* t : {"gaussian_blur", "directional_blur", "channel_blur", "glow", "depth_blur", "depth_fog", "lens_flare",
+                              "tilt_shift", "chromatic_aberration", "relight", "vignette", "drop_shadow", "rgb_mixer", "mosaic",
+                              "focus_repair"})
+            m[t] = EffectDomain::Linear;
+        for (const char* t : {"posterize", "halftone", "duotone", "vhs", "find_edges", "emboss", "invert", "chroma_key", "luma_key",
+                              "screen_key", "broadcast_safe", "noise", "depth_map"})
+            m[t] = EffectDomain::Display;
+        return m;
+    }();
+    const auto it = domains.find(type);
+    return it == domains.end() ? EffectDomain::AsIs : it->second;
+}
+
+namespace {
+void applyVideoEffectHere(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds);
+}
+
 void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds) {
     // (a grade node's settings act through the node graph, render/GradeGraph.h; a 3D Camera Tracker only holds its solve)
     // (Sky Replacement runs when tracks are composited, render/SkyReplace.h)
     if (!e.enabled || img.empty() || e.type == "grade_node" || e.type == "camera_track" || e.type == "sky_replace") return;
+    // A sequence graded scene-referred: the effect in the values it is made for, and back.
+    const SceneGrading* sg = currentSceneGrading();
+    const ColorSpace& here = currentWorkingSpace();
+    if (sg && (&here == sg->working || &here == sg->linear)) {
+        const EffectDomain d = effectDomain(e.type);
+        // (log: the working space itself when it is one, a camera's own log included, as a show LUT expects)
+        const ColorSpace* into = d == EffectDomain::Log      ? (here.transfer == Transfer::Linear ? &logColorSpace(here.primaries) : nullptr)
+                                 : d == EffectDomain::Linear ? sg->linear
+                                 : d == EffectDomain::Display ? sg->display
+                                                              : nullptr;
+        if (into && into != &here) {
+            if (d == EffectDomain::Display) outputTransform(img, here, *into, sg->peakNits, sg->kind, true);
+            else convertExactly(img, here, *into);
+            {
+                const WorkingSpaceScope inside(into);
+                applyVideoEffectHere(e, t, img, pixelScale, sourceSeconds);
+            }
+            if (d == EffectDomain::Display) inverseOutputTransform(img, *into, here, sg->peakNits, sg->kind);
+            else convertExactly(img, *into, here);
+            return;
+        }
+    }
+    applyVideoEffectHere(e, t, img, pixelScale, sourceSeconds);
+}
+
+namespace {
+void applyVideoEffectHere(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds) {
     struct SourceTime {
         double previous;
         explicit SourceTime(double s) : previous(tSourceSeconds) { tSourceSeconds = s; }
@@ -1966,6 +2021,7 @@ void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScal
         for (int c = 0; c < 4; ++c) p[c] = o[c] + (p[c] - o[c]) * m;
     }
 }
+}  // namespace
 
 double depthBlurFocus(const Effect& e, FrameTime t, const std::vector<float>& depth, int W, int H) {
     const int follow = int(std::lround(e.p("follow", t, 0)));
@@ -2224,6 +2280,22 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     }
     if (ty == "paint") {
         paintStrokes(e, t, img);
+        return;
+    }
+    if (ty == "learned_effect") {
+        // (Without its network file, or when it fails, the picture is left as it is.)
+        const float amount = float(std::clamp(e.p("amount", t, 100) / 100, 0.0, 1.0));
+        if (amount <= 0) return;
+        const SlowEffects& slow = currentSlowEffects();
+        Image learned;
+        std::string why;
+        if (!learn::applySaved(e.s("network"), img, learned, &why, slow.cancel, slow.run)) {
+            if (slow.issues)
+                slow.issues->note(why.empty() ? "The Learned Effect is shown once the frames are rendered (Render In to Out)"
+                                              : "Learned Effect: " + why);
+            return;
+        }
+        for (size_t i = 0; i < img.px.size(); ++i) img.px[i] += (learned.px[i] - img.px[i]) * amount;
         return;
     }
     if (ty == "color_correct") colorCorrect(e, t, img);

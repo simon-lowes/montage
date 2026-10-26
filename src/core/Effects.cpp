@@ -416,6 +416,12 @@ std::vector<EffectInfo> buildCatalog() {
     c.push_back({"object_removal", "Object Removal", EffectCategory::VideoFilter, "Refine",
                  {num("grow", "Grow Mask (px)", 0, 50, 4, 0.5)},
                  {}});
+    // A network trained on frames worked on by hand (media/LearnedEffect.h; Clip › Learn Effect from Examples), run on
+    // the picture: what was done to those frames, done to these.
+    c.push_back({"learned_effect", "Learned Effect", EffectCategory::VideoFilter, "Refine",
+                 {pct("amount", "Amount", 0, 100, 100)},
+                 {str("network", "Network File", StringKind::File)}});
+    c.back().strings[0].fileFilter = "Learned effects (*.mlnet)";
     // The faces in the frame (YuNet, found again each frame) touched up within a soft mask.
     c.push_back({"face_refine", "Face Refinement", EffectCategory::VideoFilter, "Refine",
                  {pct("smooth", "Smooth Skin", 0, 100, 40), pct("lighten", "Lighten Face", 0, 100, 0),
@@ -657,6 +663,13 @@ std::vector<EffectInfo> buildCatalog() {
 #ifndef MONTAGE_WITH_ONNXRUNTIME
     c.back().hidden = true;  // needs ONNX Runtime
 #endif
+    // The missing top of band-limited speech rebuilt (media/BandwidthExtension.h); the cut-off 0 is found.
+    c.push_back({"bandwidth_extension", "Bandwidth Extension", EffectCategory::AudioFilter, "Restoration",
+                 {pct("amount", "Amount", 0, 100, 100), num("cutoff_hz", "Cut-off (Hz, 0 = auto)", 0, 24000, 0, 50)},
+                 {}});
+#ifndef MONTAGE_WITH_ONNXRUNTIME
+    c.back().hidden = true;  // needs ONNX Runtime
+#endif
     c.push_back({"declick", "De-Click", EffectCategory::AudioFilter, "Restoration",
                  {pct("sensitivity", "Sensitivity", 0, 100, 50), num("max_ms", "Longest Click (ms)", 0.1, 10, 2, 0.1)},
                  {}});
@@ -803,6 +816,13 @@ std::vector<EffectInfo> buildCatalog() {
         EffectInfo plugin{"plugin", "Audio Plugin", EffectCategory::AudioFilter, "Plugins", {}, {}};
         plugin.hidden = true;
         c.push_back(plugin);
+        // An ARA plug-in on the clip's whole sound (audio/AraHost.h): the musical context it is given.
+        EffectInfo ara{"ara", "ARA Plug-in", EffectCategory::AudioFilter, "Plugins",
+                       {num("tempo_bpm", "Tempo (BPM)", 10, 1000, 120, 0.01), num("beats_per_bar", "Beats per Bar", 1, 32, 4, 1)},
+                       {}};
+        ara.hidden = true;
+        for (ParamInfo& pi : ara.params) pi.keyframeable = false;
+        c.push_back(ara);
     }
     {
         // An OpenFX video plugin; see render/Ofx.h.
@@ -1134,6 +1154,45 @@ std::vector<EffectInfo> buildCatalog() {
                            {str("text", "Text", StringKind::MultilineText, "3D Title"),
                             str("font", "Font", StringKind::Font, "Sans Serif")}};
         c.push_back(title3d);
+        // A glTF or OBJ model in the shot (render/ModelClip.h): through its own camera (pixels) or the camera the 3D
+        // Camera Tracker solved on another track (the solved scene's units, its ground at height 0).
+        c.push_back({"model3d", "3D Model", EffectCategory::Generator, "Titles",
+                     {
+                         choice("camera", "Camera", {"Its Own", "Solved by the 3D Camera Tracker"}, 0),
+                         num("camera_track", "Solved Footage Track (0: nearest below)", 0, 99, 0, 1),
+                         num("fov", "Lens (field of view °)", 5, 120, 35, 0.5),
+                         num("size", "Size (px, own camera)", 1, 20000, 400, 1),
+                         pct("scale", "Scale (solved camera, of its own units)", 0.01, 100000, 100),
+                         boolean("stand", "Stand It on the Ground (solved camera)", true),
+                         num("pos_x", "Position X", -100000, 100000, 0, 0.01),
+                         num("pos_y", "Position Y (up)", -100000, 100000, 0, 0.01),
+                         num("pos_z", "Position Z (towards the camera)", -100000, 100000, 0, 0.01),
+                         num("rot_y", "Turn (Y°)", -360, 360, -25, 0.5),
+                         num("rot_x", "Tilt (X°)", -360, 360, 0, 0.5),
+                         num("rot_z", "Roll (Z°)", -360, 360, 0, 0.5),
+                         num("animation", "Animation (0: none)", 0, 999, 1, 1),
+                         pct("anim_speed", "Animation Speed", -1000, 1000, 100),
+                         num("anim_offset", "Animation Offset (s)", -3600, 3600, 0, 0.01),
+                         boolean("loop", "Loop the Animation", true),
+                         choice("light_kind", "Light", {"Sun", "Point", "Spot"}, 0),
+                         num("light_angle", "Light Direction (°)", -180, 180, -40, 1),
+                         num("light_height", "Light Height (°)", -90, 90, 45, 1),
+                         num("light_distance", "Light Distance (model sizes)", 0.1, 100, 3, 0.1),
+                         num("spot_angle", "Spot Angle (°)", 1, 85, 30, 0.5),
+                         pct("light_strength", "Light Strength", 0, 1000, 100),
+                         color("light_color", "Light Colour", 1, 1, 1),
+                         boolean("shadows", "Cast Shadows (sun and spot)", true),
+                         pct("ambient", "Ambient Light", 0, 1000, 30),
+                         num("env_track", "Image Light Track (0: none)", 0, 99, 0, 1),
+                         num("env_rotation", "Image Light Rotation (°)", -360, 360, 0, 1),
+                         pct("env_strength", "Image Light Strength", 0, 1000, 100),
+                         boolean("env_hide", "Hide the Image Light Track", true),
+                         boolean("ground", "Shadows on the Ground", true),
+                         pct("ground_strength", "Ground Shadow Strength", 0, 100, 80),
+                         boolean("depth_merge", "Hide Behind Nearer Things (Merge by Depth)", false),
+                         pct("opacity", "Opacity", 0, 100, 100),
+                     },
+                     {str("file", "Model (glTF, GLB, OBJ)", StringKind::File)}});
         // Ready-made titles: a Title with its settings filled in (makeEffect gives type "title").
         for (const TitleTemplate& tpl : titleTemplates()) {
             EffectInfo t = title;

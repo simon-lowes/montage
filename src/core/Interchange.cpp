@@ -319,11 +319,17 @@ std::string exportOtio(const Project& p, const Sequence& sequence) {
     stack["children"] = tracks;
     stack["markers"] = markers;
     stack["source_range"] = QJsonValue();
+    QJsonObject own{{"width", s.width}, {"height", s.height}, {"sample_rate", s.sampleRate}};
+    // The sequence's colour: what it delivers and, graded scene-referred, the space it is graded in.
+    if (s.colorSpace != "rec709") own["color_space"] = QString::fromStdString(s.colorSpace);
+    if (s.hdrPeakNits != 1000) own["hdr_peak_nits"] = s.hdrPeakNits;
+    if (!s.workingSpace.empty()) own["working_space"] = QString::fromStdString(s.workingSpace);
+    if (!s.outputTransform.empty()) own["output_transform"] = QString::fromStdString(s.outputTransform);
     QJsonObject root{{"OTIO_SCHEMA", "Timeline.1"},
                      {"name", QString::fromStdString(s.name)},
                      {"global_start_time", rt(0, rate)},
                      {"tracks", stack},
-                     {"metadata", QJsonObject{{"montage", QJsonObject{{"width", s.width}, {"height", s.height}, {"sample_rate", s.sampleRate}}}}}};
+                     {"metadata", QJsonObject{{"montage", own}}}};
     return QJsonDocument(root).toJson(QJsonDocument::Indented).toStdString();
 }
 

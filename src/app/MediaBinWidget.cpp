@@ -1145,6 +1145,24 @@ bool MediaBinWidget::eventFilter(QObject* watched, QEvent* event) {
         const Qt::KeyboardModifiers mods = ke->modifiers() & ~Qt::KeypadModifier;
         const int key = ke->key();
         const bool rating = mods == Qt::NoModifier && ((key >= Qt::Key_0 && key <= Qt::Key_5) || key == Qt::Key_X);
+        // The arrows, Home, End, the page keys and Enter move through the view and open what is chosen, over the window's
+        // playback and edit keys (the keyboard's way round the bin).
+        const bool navigation = (mods & ~Qt::ShiftModifier) == Qt::NoModifier &&
+                                (key == Qt::Key_Up || key == Qt::Key_Down || key == Qt::Key_Left || key == Qt::Key_Right || key == Qt::Key_Home ||
+                                 key == Qt::Key_End || key == Qt::Key_PageUp || key == Qt::Key_PageDown || key == Qt::Key_Return ||
+                                 key == Qt::Key_Enter);
+        if (navigation && event->type() == QEvent::ShortcutOverride) {
+            ke->accept();
+            return true;
+        }
+        // Enter opens the clip chosen (on macOS a view starts renaming it instead).
+        if (event->type() == QEvent::KeyPress && mods == Qt::NoModifier && (key == Qt::Key_Return || key == Qt::Key_Enter)) {
+            const QModelIndex current = static_cast<QAbstractItemView*>(watched)->currentIndex();
+            if (current.isValid()) {
+                open(current.data(MediaBinModel::IdRole).toULongLong());
+                return true;
+            }
+        }
         if (rating && !selectedMedia().empty()) {  // (an open editor has the focus, not the view)
             ke->accept();
             if (event->type() == QEvent::KeyPress) {

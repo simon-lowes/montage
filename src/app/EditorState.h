@@ -99,6 +99,9 @@ public:
     const std::vector<Id>& selectedClips() const { return selection_; }
     bool isSelected(Id clip) const;
     void setSelection(std::vector<Id> clips, bool expandLinked = true);
+    // The clip the selection was made from (the first given to setSelection, not a linked partner it brought along)
+    // while it is still selected, else the first selected; 0 with none. What the keyboard and a screen reader are on.
+    Id focusClip() const;
     void clearSelection();
     Id selectedTransition() const { return selectedTransition_; }
     void selectTransition(Id id);
@@ -270,6 +273,8 @@ signals:
     void playheadChanged(montage::FrameTime t);
     void sequenceSwitched();          // a different sequence became active / project replaced
     void historyChanged();
+    // An edit made, undone or redone: its name ("Insert", "Undo Insert", "Redo Insert"), to announce.
+    void edited(const QString& what);
     void sourceChanged();             // source monitor media or marks changed
     void sequencesAsClipsChanged(bool on);
     void sourceKindsChanged();
@@ -329,6 +334,7 @@ private:
     uint64_t savedRevision_ = 0;
     QString path_;
     std::vector<Id> selection_;
+    Id primary_ = 0;
     Id selectedTransition_ = 0;
     Id inspectedChain_ = 0;
     std::map<Id, int> maskObjects_;  // effect -> object being picked

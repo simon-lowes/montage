@@ -32,6 +32,7 @@
 #include "core/ColorGroups.h"
 #include "core/GraphicsTemplate.h"
 #include "core/Storyboard.h"
+#include "render/LearnFromClip.h"
 #include "render/ExtendClip.h"
 #include "render/FootageWords.h"
 #include "media/LanguageModel.h"
@@ -49,7 +50,10 @@
 #include "render/AdaptiveHdr.h"
 #include "render/Spherical.h"
 #include "render/ClipPlacement.h"
+#include "audio/AraHost.h"
 #include "audio/DialogueAlign.h"
+#include "audio/PluginEffect.h"
+#include "audio/Plugins.h"
 #include "audio/SpeechCleanup.h"
 #include "core/AafImport.h"
 #include "core/AvidBinImport.h"
@@ -106,6 +110,7 @@
 #include "media/DualSystem.h"
 #include "media/Relink.h"
 #include "media/SpeechEnhance.h"
+#include "media/BandwidthExtension.h"
 #include "media/LipSync.h"
 #include "media/MotionDeblur.h"
 #include "media/SuperScale.h"
@@ -132,6 +137,7 @@
 #include "render/LutToGrade.h"
 #include "render/ProjectManager.h"
 #include "render/QualityCheck.h"
+#include "render/SdhDraft.h"
 #include "render/FrameRepair.h"
 #include "render/Intelligibility.h"
 #include "render/ConformCheck.h"
@@ -154,6 +160,7 @@
 #include "media/Transcriber.h"
 #include "media/VisualSearch.h"
 #include "render/ClipAnalysis.h"
+#include "media/Model3D.h"
 #include "render/OGraf.h"
 #include "render/Gallery.h"
 #include "render/DialogueLoudness.h"
@@ -466,6 +473,11 @@ QJsonObject projectJson(const Project& p) {
                        {"tracks", tracks},
                        {"markers", markers},
                        {"media", media}};
+    out["color_space"] = QString::fromStdString(sequenceColorSpace(s).id);
+    if (sceneReferredWorking(s)) {
+        out["working_space"] = QString::fromStdString(workingColorSpace(s).id);
+        out["output_transform"] = outputTransformKind(s) == OutputTransformKind::Aces2 ? "aces2" : "filmic";
+    }
     if (!s.mutedRoles.empty()) {
         QJsonArray muted;
         for (const std::string& r : s.mutedRoles) muted.append(QString::fromStdString(r));
@@ -1582,6 +1594,79 @@ void McpServer::Impl::addTools() {
             return ok(QStringLiteral("Keyed %1 clip(s)").arg(keyed.size()), QJsonObject{{"keyed", keyed}});
         });
 
+    add("montage_train_effect", "Learn an effect from examples",
+        "Train a small network on frames of a clip worked on by hand (painted, graded, cleaned up, a matte drawn: its "
+        "effects) against the same frames without its effects, on this computer, and give it to clips as a Learned "
+        "Effect (learned_effect), so what was done to those frames is done to the rest of the shot or to similar shots. "
+        "`frames` are the examples (default: the sequence's markers on the clip, else where its effects have keys); "
+        "`steps` how long to train (default 1000, up to 100000; more is better, each step a 128-pixel crop, about a "
+        "tenth of a second on four cores; progress is reported); `continue` goes on from the network the clip's "
+        "Learned Effect runs, into a new file (clips running the old one keep it). `apply_to` lists the clips to get it (default the clip itself); "
+        "`replace` (default true) turns off the clip's own effects, which the network now stands in for. Gives the "
+        "network file, the steps trained, the last loss and the examples' PSNR before and after.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "frames":{"type":"array","items":{"type":["number","string"]}},"steps":{"type":"number","default":1000},
+            "continue":{"type":"boolean","default":false},"apply_to":{"type":"array","items":{"type":"number"}},
+            "replace":{"type":"boolean","default":true},"seed":{"type":"number","default":1}},"required":["project","clip"]})json",
+        false, [this](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const Clip examples = clipArg(l, a);
+            std::vector<FrameTime> frames;
+            for (const QJsonValue& v : a.value("frames").toArray()) frames.push_back(timeArg(v, s, "frames"));
+            if (frames.empty()) frames = exampleFrames(s, examples, s.playhead);
+            if (frames.empty()) return fail("No frames to learn from: give `frames`, or put markers on the clip");
+            std::vector<learn::Pair> pairs;
+            std::string err;
+            for (FrameTime f : frames) {
+                if (!examples.contains(f)) throw ArgError{QStringLiteral("Frame %1 is not on the clip").arg(tc(f, s))};
+                learn::Pair p;
+                if (!learningPair(l.project, s, examples, f, p, &err)) return fail(QString::fromStdString(err));
+                pairs.push_back(std::move(p));
+            }
+            learn::TrainOptions o;
+            o.seed = uint64_t(std::clamp(a.value("seed").toDouble(1), 0.0, 9007199254740992.0));
+            learn::Trainer trainer(learn::NetShape{}, pairs, o);
+            if (a.value("continue").toBool()) {
+                const std::string from = learnedNetworkOf(examples);
+                learn::Saved before;
+                if (from.empty() || !learn::load(from, before, &err) || before.state.empty() || !trainer.restore(before.state))
+                    return fail("The clip has no network trained before to go on from");
+            }
+            const std::string file = newLearnedNetworkPath(l.path.toStdString(), l.project, examples);
+            const int steps = int(std::clamp(a.value("steps").toDouble(1000), 1.0, 100000.0));
+            const int start = trainer.steps();
+            trainer.run(steps, nullptr, [&](int step, double) {
+                if ((step - start) % 50 == 0) progress(double(step - start) / steps, QStringLiteral("Training"));
+            });
+            learn::Saved saved;
+            saved.net = trainer.net();
+            saved.frames = frames;
+            saved.options = o;
+            saved.state = trainer.state();
+            saved.source = examples.name;
+            if (!learn::save(file, saved, &err)) return fail(QString::fromStdString(err));
+            double before = 0, after = 0;
+            for (const learn::Pair& p : pairs) {
+                before += learn::psnr(p.before, p.after) / double(pairs.size());
+                after += learn::psnr(learn::applyNet(trainer.net(), p.before), p.after) / double(pairs.size());
+            }
+            std::vector<Id> targets;
+            for (const QJsonValue& v : a.value("apply_to").toArray()) targets.push_back(Id(v.toDouble()));
+            if (!a.contains("apply_to")) targets = {examples.id};
+            const int given = applyLearnedNetwork(l.project, s, targets, file, examples.id, a.value("replace").toBool(true));
+            save(l);
+            const QJsonObject o2{{"network", QString::fromStdString(file)}, {"steps", trainer.steps()}, {"loss", trainer.loss()},
+                                 {"examples", int(pairs.size())}, {"psnr_before", before}, {"psnr_after", after}, {"clips", given}};
+            return ok(QStringLiteral("Trained %1 steps on %2 frame(s): the examples %3 dB, from %4; given to %5 clip(s)")
+                          .arg(trainer.steps())
+                          .arg(pairs.size())
+                          .arg(after, 0, 'f', 1)
+                          .arg(before, 0, 'f', 1)
+                          .arg(given),
+                      o2);
+        });
+
     add("montage_move_clip", "Move a clip",
         "Move a clip (and the clips linked to it) to a new start time, optionally to another video track.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
@@ -2205,6 +2290,101 @@ void McpServer::Impl::addTools() {
                       made ? clipJson(l.project, s, *made) : QJsonObject{});
         });
 
+    add("montage_add_model", "Add a 3D model",
+        "Add a 3D model (glTF 2.0 .gltf or .glb, or OBJ with its MTL) to the picture, lit, shaded (metallic-roughness, its "
+        "textures), casting shadows onto the ground and playing one of its animations. Without over it is seen through "
+        "its own camera in front of the frame (size in pixels, positions in pixels from the centre, y up). With over (a "
+        "video clip whose camera montage_camera_track solved), it stands in that shot: placed at place {x, y} (fractions "
+        "of the picture, on the solved ground) or at position [x, y, z] in the scene's units (the ground at y = 0), at "
+        "its own size times scale (%), on the track above the footage for the footage's length. settings sets any of "
+        "its settings by name (montage_list_effects with kind generator lists model3d's; colours as name.r / .g / .b), "
+        "e.g. {\"light_angle\": 30, \"env_track\": 3, \"depth_merge\": 1}. Returns the clip with the model's "
+        "animations and triangle count.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"file":{"type":"string"},
+            "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":5},"track":{"type":"string"},
+            "over":{"type":["number","string"]},"place":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"}}},
+            "position":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
+            "settings":{"type":"object","additionalProperties":{"type":"number"}}},
+            "required":["project","file"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            const QFileInfo fi(absolute(need(a, "file")));
+            if (!fi.exists()) throw ArgError{QStringLiteral("No file at \"%1\"").arg(need(a, "file"))};
+            std::string err;
+            const std::shared_ptr<const Model> model = cachedModel(fi.absoluteFilePath().toStdString(), &err);
+            if (!model) return fail(QString::fromStdString(err));
+            Clip c = makeGeneratorClip(l.project, "model3d", 1);
+            c.generator.strings["file"] = fi.absoluteFilePath().toStdString();
+            c.name = fi.completeBaseName().toStdString();
+            TrackRef t{TrackKind::Video, 0};
+            FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : 0;
+            FrameTime len = a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(5 * s.fpsValue()));
+            const Clip* footage = nullptr;
+            if (a.contains("over")) {
+                QJsonObject o;
+                o["clip"] = a.value("over");
+                footage = &videoClipArg(l, o);
+                CameraSolve cs;
+                if (!clipCameraSolve(*footage, cs)) return fail("Solve the clip's camera first (montage_camera_track)");
+                int ft = -1;
+                for (size_t i = 0; i < s.videoTracks.size(); ++i)
+                    for (const Clip& k : s.videoTracks[i].clips)
+                        if (k.id == footage->id) ft = int(i);
+                c.generator.params["camera"] = Param(1.0);
+                c.generator.params["camera_track"] = Param(double(ft + 1));
+                c.generator.params["pos_y"] = Param(0.0);
+                if (!a.contains("at")) at = footage->start;
+                if (!a.contains("duration")) len = footage->end() - at;
+                if (a.contains("place")) {
+                    const QJsonObject pl = a.value("place").toObject();
+                    const int frame = cameraSolveFrame(s, *footage, cs, std::clamp<FrameTime>(at - footage->start, 0, footage->duration - 1));
+                    Vec3 g;
+                    if (frame < 0 || !cs.oriented || !groundPoint(cs, frame, {pl.value("x").toDouble(0.5) * cs.width, pl.value("y").toDouble(0.7) * cs.height}, g))
+                        return fail("That point is not on the solved ground: pick one below the horizon");
+                    c.generator.params["pos_x"] = Param(g.x), c.generator.params["pos_y"] = Param(g.y), c.generator.params["pos_z"] = Param(g.z);
+                }
+                if (!a.contains("track")) {
+                    t = ft + 1 < int(s.videoTracks.size()) && s.videoTracks[size_t(ft + 1)].clips.empty() ? TrackRef{TrackKind::Video, ft + 1}
+                                                                                                         : edit::addTrack(l.project, s, TrackKind::Video);
+                }
+            } else if (!a.contains("track")) {
+                int top = -1;
+                for (int i = 0; i < int(s.videoTracks.size()); ++i)
+                    if (!s.videoTracks[size_t(i)].clips.empty()) top = i;
+                t = top + 1 < int(s.videoTracks.size()) ? TrackRef{TrackKind::Video, top + 1} : edit::addTrack(l.project, s, TrackKind::Video);
+            }
+            if (a.contains("track")) t = trackArg(str(a, "track"), s, true, &l.project, &s);
+            if (a.contains("position")) {
+                const QJsonArray pos = a.value("position").toArray();
+                if (pos.size() != 3) throw ArgError{"\"position\" is [x, y, z]"};
+                for (int k = 0; k < 3; ++k) c.generator.params[k == 0 ? "pos_x" : k == 1 ? "pos_y" : "pos_z"] = Param(pos[k].toDouble());
+            }
+            const EffectInfo* info = findEffectInfo("model3d");
+            const QJsonObject settings = a.value("settings").toObject();
+            for (auto it = settings.begin(); it != settings.end(); ++it) {
+                const std::string name = it.key().toStdString();
+                const ParamInfo* pi = nullptr;
+                for (const ParamInfo& p : info->params)
+                    if (p.kind == ParamKind::Color ? name == p.name + ".r" || name == p.name + ".g" || name == p.name + ".b" : p.name == name) pi = &p;
+                if (!pi) throw ArgError{QStringLiteral("\"%1\" is not a setting of 3D Model").arg(it.key())};
+                if (!it.value().isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(it.key())};
+                c.generator.params[name] = Param(std::clamp(it.value().toDouble(), pi->min, pi->max));
+            }
+            c.start = at;
+            c.duration = std::max<FrameTime>(1, len);
+            const auto r = edit::overwrite(l.project, s, t, c);
+            check(r);
+            save(l);
+            const Clip* made = r.created.empty() ? nullptr : edit::clipById(s, r.created[0]);
+            QJsonObject out = made ? clipJson(l.project, s, *made) : QJsonObject{};
+            QJsonArray anims;
+            for (const ModelAnimation& an : model->animations) anims.append(QString::fromStdString(an.name));
+            out["animations"] = anims;
+            out["triangles"] = double(model->triangles());
+            return ok(QStringLiteral("Added %1 on %2").arg(QString::fromStdString(c.name), QString::fromStdString(trackAt(s, t)->name)), out);
+        });
+
     add("montage_add_shape", "Add a shape",
         "Add a shape layer over the picture: a rectangle, ellipse, polygon, star, line or arrow, filled (a colour, or a "
         "gradient to a second colour) and/or outlined. Sizes and positions are in sequence pixels, from the centre. "
@@ -2326,12 +2506,29 @@ void McpServer::Impl::addTools() {
                                             {"params", params}});
                 }
             }
+            // Audio plugins installed here (CLAP, VST3, LV2, AU), as the scanner found them; "ara": an ARA plug-in, which
+            // works on the clip's whole sound (audio/AraHost.h).
+            if (kind == "audio") {
+                plugins::Registry& reg = plugins::Registry::instance();
+                if (reg.plugins().empty()) reg.scan();
+                for (const plugins::Descriptor& d : reg.plugins()) {
+                    if (d.instrument || reg.isPluginDisabled(d.id) || !plugins::canHost(d.format)) continue;
+                    QJsonObject o{{"type", QString::fromStdString(plugins::pluginType(d))}, {"name", QString::fromStdString(d.name)},
+                                  {"group", QStringLiteral("Plugins/%1").arg(plugins::formatName(d.format))},
+                                  {"vendor", QString::fromStdString(d.vendor)}};
+                    if (d.ara) o["ara"] = true;
+                    list.append(o);
+                }
+            }
             const QJsonObject o{{"effects", list}};
             return ok(json(o), o);
         });
 
     add("montage_add_effect", "Add an effect",
-        "Add an effect to a clip (see montage_list_effects), with parameter values. Video effects can be limited to a "
+        "Add an effect to a clip (see montage_list_effects), with parameter values. Audio plugins are \"plugin:<id>\" "
+        "(montage_list_effects kind audio), their parameters param.<id>; an ARA plug-in (marked \"ara\" there) works on "
+        "the clip's whole sound, given a steady tempo_bpm and beats_per_bar (montage_ara_content reads what it finds). "
+        "Video effects can be limited to a "
         "mask: mask.shape 1 ellipse or 2 rectangle, mask.x / mask.y centre and mask.w / mask.h size as fractions of the frame; "
         "6 a gradient across that box (full effect above it, none below, mask.rotation turning it); or a drawn Bézier "
         "path through `mask_path` (points as frame fractions, [x, y] or {x, y, in: [dx, dy], out: [dx, dy]} with handles; "
@@ -2376,6 +2573,10 @@ void McpServer::Impl::addTools() {
         "brings faded dyes back to neutral (strength, frames either side); perf_lock holds the frame on its perforations "
         "(side 0 left, 1 right; rebate in % of the width), the reference (strings.reference, lines of \"x y\" as fractions "
         "of the frame) taken from the clip's first frame when none is given. "
+        "bandwidth_extension rebuilds the missing top of band-limited speech (a phone, a video call, a low-rate codec) "
+        "with AP-BWE: its cut-off is found (cutoff_hz 0) or given, the original kept below it and the new band crossfaded "
+        "in above it by amount, where the speech is; a clip whose role is Music or Effects is left alone; it needs the "
+        "models for the clip's cut-off (scripts/fetch-models.sh --bwe). "
         "lip_sync redraws the largest face's mouth and jaw to speak an audio track's sound (strings.track, e.g. \"A2\"; "
         "every track when empty), as a dub needs (MuseTalk; amount mixes it); it needs consent: true (the person shown has "
         "agreed) and its models (scripts/fetch-models.sh --lipsync), and runs in exports and renders (about 4 s a frame on four cores).",
@@ -2401,11 +2602,22 @@ void McpServer::Impl::addTools() {
                     throw ArgError{QStringLiteral("No OpenFX plugin \"%1\" is installed (see montage_list_effects)").arg(QString::fromStdString(type))};
                 plugin = ofx::makeEffect(l.project, d);
                 type = "ofx";
+            } else if (plugins::isPluginType(type)) {
+                // An audio plugin ("plugin:<id>"): its parameters as "param.<id>"; an ARA plug-in becomes an "ara" effect.
+                std::string err;
+                if (plugins::Registry::instance().plugins().empty()) plugins::Registry::instance().scan();
+                plugin = plugins::makeEffectOfType(l.project, type, &err);
+                if (!plugin)
+                    throw ArgError{QStringLiteral("The plugin \"%1\" cannot be used: %2 (see montage_list_effects kind audio)")
+                                       .arg(QString::fromStdString(type), QString::fromStdString(err))};
+                type = plugin->type;
             }
             const EffectInfo* info = findEffectInfo(type);
             if (!info || (info->hidden && !plugin) || (info->category != EffectCategory::VideoFilter && info->category != EffectCategory::AudioFilter))
                 throw ArgError{QStringLiteral("Unknown effect \"%1\" (see montage_list_effects)").arg(QString::fromStdString(type))};
-            const std::string displayName = plugin ? ofx::effectName(*plugin) : info->displayName;
+            const std::string displayName = !plugin ? info->displayName : type == "ofx" ? ofx::effectName(*plugin) : plugins::effectName(*plugin);
+            const bool pluginParams = plugin && type != "ara";  // an ARA effect's own settings are Montage's (tempo, bar)
+            if (type == "bandwidth_extension" && !bandwidthExtensionAvailable()) return fail("This build of Montage has no ONNX Runtime");
             if (type == "enhance_speech" && (!speechEnhancerAvailable() || !speechModel().installed()))
                 return fail("Enhance Speech needs its model: run `scripts/fetch-models.sh` or add the effect once in the app");
             if (type == "super_scale" && (!upscalerAvailable() || !upscaleModel().installed()))
@@ -2422,8 +2634,8 @@ void McpServer::Impl::addTools() {
             const QJsonObject params = a.value("params").toObject();
             for (auto it = params.begin(); it != params.end(); ++it) {
                 std::string name = it.key().toStdString();
-                if (plugin && name.rfind("param.", 0) != 0 && name.rfind("mask.", 0) != 0) name = "param." + name;  // "amount" for "param.amount"
-                const bool known = (plugin ? e.params.count(name) > 0
+                if (pluginParams && name.rfind("param.", 0) != 0 && name.rfind("mask.", 0) != 0) name = "param." + name;  // "amount" for "param.amount"
+                const bool known = (pluginParams ? e.params.count(name) > 0
                                            : std::any_of(info->params.begin(), info->params.end(), [&](const ParamInfo& p) { return p.name == name; })) ||
                                    (name.rfind("mask.", 0) == 0 && supportsMask(type));
                 if (!known) throw ArgError{QStringLiteral("\"%1\" has no parameter \"%2\"").arg(QString::fromStdString(type), it.key())};
@@ -2432,7 +2644,7 @@ void McpServer::Impl::addTools() {
             const QJsonObject strings = a.value("strings").toObject();
             for (auto it = strings.begin(); it != strings.end(); ++it) {
                 const std::string name = it.key().toStdString();
-                if (plugin) {
+                if (plugin && type == "ofx") {
                     const std::string key = name.rfind("str.", 0) == 0 ? name : "str." + name;
                     if (!e.strings.count(key))
                         throw ArgError{QStringLiteral("\"%1\" has no text setting \"%2\"").arg(QString::fromStdString(displayName), it.key())};
@@ -2593,6 +2805,28 @@ void McpServer::Impl::addTools() {
                 if (!takePerforationReference(l.project, l.seq(), c, e, c.start, &err))
                     note = QStringLiteral(" (no reference yet: %1)").arg(QString::fromStdString(err));
             }
+            if (type == "bandwidth_extension") {
+                // The models the clip's cut-off needs; the cut-off and them said.
+                const MediaItem* m = c.mediaId ? l.project.findMedia(c.mediaId) : nullptr;
+                const AudioBufferPtr sound = m && !m->path.empty() ? MediaPool::instance().audio(audioKey(m->path, c.channels), l.seq().sampleRate) : nullptr;
+                if (!bandwidthExtensionApplies(e, c)) {
+                    note = QStringLiteral(" (left alone while the clip's role is %1: it is for speech)").arg(QString::fromStdString(c.role));
+                } else if (sound) {
+                    const BweResult plan = bandwidthPlanFor(*sound, e.p("cutoff_hz", 0, 0));
+                    QStringList models, missing;
+                    for (const BweCheckpoint& k : plan.plan) {
+                        models << QString::fromStdString(bweModel(k).id);
+                        if (!bweModel(k).installed()) missing << QString::fromStdString(bweModel(k).id);
+                    }
+                    if (!missing.isEmpty())
+                        return fail(QStringLiteral("Bandwidth Extension needs %1 for this clip (its speech stops at %2 Hz): run `scripts/fetch-models.sh --bwe` "
+                                                   "or add the effect once in the app")
+                                        .arg(missing.join(", "))
+                                        .arg(std::lround(plan.cutoff)));
+                    note = plan.plan.empty() ? QStringLiteral(" (nothing is missing: the speech reaches %1 Hz)").arg(std::lround(plan.cutoff))
+                                             : QStringLiteral(" (the speech stops at %1 Hz; restored with %2)").arg(std::lround(plan.cutoff)).arg(models.join(" then "));
+                }
+            }
             if (type == "sky_replace" && std::lround(e.p("follow", 0, 1)) == 1) {
                 // The new sky moves with the camera, measured now (a still, or a clip it fails on, keeps the sky still).
                 std::string motion, err;
@@ -2603,6 +2837,65 @@ void McpServer::Impl::addTools() {
             save(l);
             return ok(QStringLiteral("Added %1 to %2%3").arg(QString::fromStdString(displayName), QString::fromStdString(c.name), note),
                       QJsonObject{{"effect_id", double(e.id)}});
+        });
+
+    add("montage_ara_content", "Read what an ARA plug-in found",
+        "Open a clip's ARA plug-in effect (added with montage_add_effect from a \"plugin:<id>\" type montage_list_effects "
+        "kind audio marks \"ara\") on the clip's sound, have the plug-in analyse it (unless analyse is false) and read "
+        "back what it found: notes (start and duration in seconds of the source, pitch as a MIDI note, frequency in Hz, "
+        "volume 0-1), tempo entries (seconds against quarter notes), bar signatures and chords (positions in quarter "
+        "notes). The plug-in's document, with its analysis, is stored in the effect, so it is kept with the project.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
+            "effect":{"type":"number","description":"The ARA effect's id (default: the clip's first)"},
+            "analyse":{"type":"boolean","default":true},
+            "timeout_seconds":{"type":"number","default":600}},"required":["project","clip"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Clip& c = clipArg(l, a);
+            Effect* e = nullptr;
+            for (Effect& x : c.effects)
+                if (x.type == "ara" && (!a.contains("effect") || x.id == Id(a.value("effect").toDouble()))) {
+                    e = &x;
+                    break;
+                }
+            if (!e) return fail(QStringLiteral("%1 has no ARA plug-in effect%2").arg(QString::fromStdString(c.name), a.contains("effect") ? QStringLiteral(" with that id") : QString()));
+            if (plugins::Registry::instance().plugins().empty()) plugins::Registry::instance().scan();
+            const auto d = plugins::Registry::instance().find(e->s("plugin_id"));
+            if (!d) return fail(QStringLiteral("%1 is not installed here").arg(QString::fromStdString(e->s("plugin_name", "The plug-in"))));
+            std::string key, err;
+            AudioBufferPtr sound;
+            if (!ara::clipSource(l.project, l.seq(), c, key, sound, &err)) return fail(QString::fromStdString(err));
+            auto session = ara::Session::open(*d, plugins::decodeState(e->s("archive")), sound, ara::sourceIdFor(*e, *sound),
+                                              ara::modificationIdFor(*e), ara::timelineOf(*e), ara::kEditorRenderer, &err);
+            if (!session) return fail(QString::fromStdString(err));
+            if (const std::string state = plugins::decodeState(e->s("state")); !state.empty()) session->instance()->loadState(state);
+            ara::Content content;
+            bool complete = true;
+            if (a.value("analyse").toBool(true)) complete = session->analyse(content, int(std::clamp(a.value("timeout_seconds").toDouble(600), 1.0, 86400.0) * 1000));
+            else content = session->content();
+            const std::string archive = plugins::encodeState(session->archive());
+            if (!archive.empty() && archive != e->s("archive")) {
+                e->strings["archive"] = archive;
+                save(l);
+            }
+            QJsonArray notes, tempo, bars, chords;
+            for (const ara::Note& n : content.notes) {
+                QJsonObject o{{"start", n.start}, {"duration", n.duration}, {"volume", double(n.volume)}};
+                if (n.pitch >= 0) o["pitch"] = n.pitch;
+                if (n.frequency > 0) o["frequency"] = n.frequency;
+                notes.append(o);
+            }
+            for (const ara::TempoEntry& t : content.tempo) tempo.append(QJsonObject{{"seconds", t.time}, {"quarter", t.quarter}});
+            for (const ara::BarSignature& b : content.bars)
+                bars.append(QJsonObject{{"numerator", b.numerator}, {"denominator", b.denominator}, {"quarter", b.position}});
+            for (const ara::Chord& ch : content.chords)
+                chords.append(QJsonObject{{"quarter", ch.position}, {"quarters", ch.duration}, {"root", ch.root}, {"bass", ch.bass},
+                                          {"name", QString::fromStdString(ch.name)}});
+            const QJsonObject o{{"effect_id", double(e->id)}, {"analysed", content.analysed}, {"notes", notes}, {"tempo", tempo},
+                                {"bars", bars}, {"chords", chords}};
+            if (!complete) return ok(QStringLiteral("The analysis did not finish in time; this is what %1 has so far: %2")
+                                         .arg(QString::fromStdString(d->name), json(o)), o);
+            return ok(json(o), o);
         });
 
     add("montage_track_effect", "Add an effect to an audio track",
@@ -2779,6 +3072,61 @@ void McpServer::Impl::addTools() {
             out["youtube"] = youtube;
             if (!warning.empty()) out["warning"] = QString::fromStdString(warning);
             return ok(QStringLiteral("%1 chapter marker(s) added:\n%2").arg(chapters.size()).arg(youtube), out);
+        });
+
+    add("montage_set_sequence", "Set the sequence's colour",
+        "Change how the sequence handles colour. `color_space` is the space it delivers (rec709, srgb, rec2020, p3d65, "
+        "rec2100pq, rec2100hlg, p3d65pq) and `hdr_peak_nits` a PQ sequence's mastering peak. `working_space` grades it "
+        "scene-referred: clips are graded in that space (acescct, acescg, linear-rec709, or a camera's log such as "
+        "slog3-sgamut3cine or logc4-awg4) and composited in its light, and the viewer, each export and each trim target "
+        "reach their display through an output transform, titles and graphics coming in through its inverse so a white "
+        "title stays white on every display; \"\" grades in the delivery space again. `output_transform` is \"filmic\" "
+        "(Montage's own: the ACES 2.0 tone scale on each channel) or \"aces2\" (ACES 2.0 itself, with OpenColorIO 2.5 or "
+        "later). Effects run in the values each is made for: lift, gamma and gain, curves and the Colour Warper in log; "
+        "blurs, lens effects and Relight in light; keys and stylising effects on the picture as the display shows it.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"color_space":{"type":"string"},
+            "hdr_peak_nits":{"type":"number","minimum":100,"maximum":10000},"working_space":{"type":"string"},
+            "output_transform":{"type":"string","enum":["filmic","aces2"]}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            if (a.contains("color_space")) {
+                const QString id = a.value("color_space").toString();
+                const ColorSpace* cs = findColorSpace(id.toStdString());
+                if (!cs || cs->sceneReferred)
+                    return fail(QStringLiteral("\"%1\" is not a display space a sequence delivers; for camera log or ACES use "
+                                               "working_space").arg(id));
+                s.colorSpace = cs->id;
+            }
+            if (a.contains("hdr_peak_nits")) s.hdrPeakNits = std::clamp(a.value("hdr_peak_nits").toDouble(), 100.0, 10000.0);
+            if (a.contains("working_space")) {
+                const QString id = a.value("working_space").toString();
+                const ColorSpace* cs = id.isEmpty() ? nullptr : findColorSpace(id.toStdString());
+                if (!id.isEmpty() && (!cs || !cs->sceneReferred)) {
+                    QStringList ids;
+                    for (const ColorSpace* w : workingColorSpaces()) ids << QString::fromStdString(w->id);
+                    return fail(QStringLiteral("\"%1\" is not a scene-referred working space; one of %2").arg(id, ids.join(", ")));
+                }
+                s.workingSpace = cs ? cs->id : std::string();
+            }
+            QString note;
+            if (a.contains("output_transform")) {
+                const QString t = a.value("output_transform").toString();
+                if (t != "filmic" && t != "aces2") return fail(QStringLiteral("output_transform is \"filmic\" or \"aces2\""));
+                s.outputTransform = t == "aces2" ? "aces2" : "";
+                if (t == "aces2" && !aces2Renders(sequenceColorSpace(s)))
+                    note = QStringLiteral(" (ACES 2.0 needs OpenColorIO 2.5 or later and a display its config has: shown filmic here)");
+            }
+            save(l);
+            QJsonObject out{{"color_space", QString::fromStdString(sequenceColorSpace(s).id)}, {"hdr_peak_nits", s.hdrPeakNits}};
+            const bool scene = sceneReferredWorking(s);
+            out["working_space"] = scene ? QString::fromStdString(workingColorSpace(s).id) : QString();
+            out["output_transform"] = outputTransformKind(s) == OutputTransformKind::Aces2 ? "aces2" : "filmic";
+            return ok(scene ? QStringLiteral("Graded in %1, delivered as %2 through the %3 output transform%4")
+                                  .arg(QString::fromStdString(workingColorSpace(s).label), QString::fromStdString(sequenceColorSpace(s).label),
+                                       out["output_transform"].toString() == "aces2" ? "ACES 2.0" : "filmic", note)
+                            : QStringLiteral("Graded and delivered in %1").arg(QString::fromStdString(sequenceColorSpace(s).label)),
+                      out);
         });
 
     add("montage_measure_hdr", "Measure HDR light levels",
@@ -3533,7 +3881,8 @@ void McpServer::Impl::addTools() {
         "captions (each track's language) and titles (`title_language`, default en-US), the project's vocabulary allowed, "
         "linked clips out of sync with their picture (`sync`), dialogue hard to follow under the music and effects "
         "(`intelligibility`, as montage_intelligibility measures it), left and right out of phase or one inverted, so a mono "
-        "fold-down loses them (`phase`), and DC offset (`dc_offset_db`). Lists each problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones).",
+        "fold-down loses them (`phase`), DC offset (`dc_offset_db`), and for SDH captions, loud sound outside speech that no caption describes "
+        "(`uncaptioned_seconds`). Lists each problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"flashing":{"type":"boolean","default":true},"levels":{"type":"boolean","default":true},
             "black_seconds":{"type":"number","default":1,"description":"0 = not checked"},
@@ -3551,6 +3900,7 @@ void McpServer::Impl::addTools() {
             "phase":{"type":"boolean","default":true,"description":"Left and right out of phase (correlation under -0.5) or one the other inverted"},
             "phase_seconds":{"type":"number","default":1,"description":"How long it must last"},
             "dc_offset_db":{"type":"number","default":-40,"description":"A channel's mean over a second above this, dBFS; 0 = not checked"},
+            "uncaptioned_seconds":{"type":"number","default":0,"description":"Sound louder than -40 dBFS outside speech with no caption over it for this long (SDH); 0 = not checked"},
             "markers":{"type":"boolean","default":false}},"required":["project"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -3576,6 +3926,7 @@ void McpServer::Impl::addTools() {
             q.phase = a.value("phase").toBool(true);
             q.phaseSeconds = std::max(0.05, a.value("phase_seconds").toDouble(1));
             q.dcOffsetDb = std::min(0.0, a.value("dc_offset_db").toDouble(-40));
+            q.uncaptionedSeconds = std::max(0.0, a.value("uncaptioned_seconds").toDouble(0));
             const std::vector<QcIssue> issues = qualityCheck(l.project, s, from, to, q, [this](double f) { progress(f, "Checking"); });
             QString text;
             for (const QcIssue& i : issues)
@@ -6033,6 +6384,11 @@ void McpServer::Impl::addTools() {
         "picture subtitles, and IMSC Image documents, are read by OCR, the words it is unsure of listed in `review`), "
         "or the captions inside a video clip's file (`import_embedded`: CTA-708 service 1, else CEA-608 channel 1, else "
         "its PGS, DVB or DVD subtitles by OCR; `stream` picks a subtitle stream). "
+        "Or draft captions for the deaf and hard of hearing as a new track (`sdh`): the dialogue from the transcripts, "
+        "sounds outside speech described in brackets (scored by the sound model against the project's sound descriptions, "
+        "`sound_captions` replacing them), sung lines between ♪, the speaker named at a change where the frame shows no "
+        "face or several, and captions moved to the top off text in the picture; `style` brackets ([Door slams]), "
+        "capitals ([DOOR SLAMS], SPEAKER:) or colours (DOOR SLAMS, a colour per speaker). "
         "`track` is a caption track index (default: the visible one).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"export":{"type":"string","description":"A file to write"},
             "format":{"type":"string","enum":["pgs","dvb","vobsub","imsc_image"],"description":"Export as subtitle pictures"},
@@ -6040,10 +6396,61 @@ void McpServer::Impl::addTools() {
             "import":{"type":"string","description":"A file to read as a new track"},"track":{"type":"integer"},
             "import_embedded":{"type":"number","description":"A video clip (id): the captions inside its file as a new track, where the clip plays them"},
             "stream":{"type":"integer","description":"The file's subtitle stream to read (its index in the file)"},
-            "language":{"type":"string","description":"ISO 639-1 code for an imported track"}},"required":["project"]})json",
-        false, [](const QJsonObject& a) {
+            "language":{"type":"string","description":"ISO 639-1 code for an imported track"},
+            "sdh":{"type":"object","description":"Draft SDH captions as a new track","properties":{
+                "style":{"type":"string","enum":["brackets","capitals","colours"],"default":"brackets"},
+                "threshold":{"type":"number","default":0.3,"description":"How alike (0..1) a sound and its description must be"},
+                "sounds":{"type":"boolean","default":true},"lyrics":{"type":"boolean","default":true},
+                "speakers":{"type":"boolean","default":true},"read_text":{"type":"boolean","default":true},
+                "sound_captions":{"type":"array","items":{"type":"string"},"description":"The project's sound descriptions, saved with it: 'Door slams' or 'Door slams|a door slamming shut' (caption|what it sounds like); [] = the ready-made list"}}}},
+            "required":["project"]})json",
+        false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
+            if (a.contains("sdh")) {
+                const QJsonObject o = a.value("sdh").toObject();
+                if (o.contains("sound_captions")) {
+                    l.project.soundCaptions.clear();
+                    for (const auto& v : o.value("sound_captions").toArray())
+                        if (!v.toString().trimmed().isEmpty()) l.project.soundCaptions.push_back(v.toString().toStdString());
+                }
+                SdhDraftOptions d;
+                if (!parseSdhStyle(str(o, "style", "brackets").toStdString(), d.sdh.style)) return fail("style is brackets, capitals or colours");
+                d.threshold = std::clamp(o.value("threshold").toDouble(0.3), 0.0, 1.0);
+                d.sounds = o.value("sounds").toBool(true);
+                d.sdh.lyrics = o.value("lyrics").toBool(true);
+                d.sdh.speakerLabels = o.value("speakers").toBool(true);
+                d.faces = d.sdh.speakerLabels;
+                d.readText = o.value("read_text").toBool(true);
+                SdhDraft draft;
+                std::string err;
+                if (!draftSdhCaptions(l.project, s, d, draft, [this](double f) { progress(f, "Drafting SDH captions"); }, nullptr, &err))
+                    return fail(QString::fromStdString(err));
+                CaptionTrack t;
+                t.id = l.project.newId();
+                t.language = draft.language.empty() ? "en" : draft.language;
+                t.name = "SDH";
+                t.style = draft.look;
+                t.captions = draft.captions;
+                QJsonArray list, heard, notes;
+                for (const Caption& cap : t.captions)
+                    list.append(QJsonObject{{"start", tc(cap.start, s)}, {"end", tc(cap.end, s)}, {"text", QString::fromStdString(cap.text)},
+                                            {"place", QString::fromStdString(captionPlaceName(cap))}});
+                for (const SdhSound& h : draft.heard)
+                    heard.append(QJsonObject{{"start", h.start}, {"end", h.end}, {"sound", QString::fromStdString(h.label)}, {"score", double(h.score)}});
+                for (const std::string& n : draft.notes) notes.append(QString::fromStdString(n));
+                // The new track is the one shown (the first visible), so the other tracks are hidden.
+                int hidden = 0;
+                for (CaptionTrack& o : s.captionTracks)
+                    if (o.visible) o.visible = false, ++hidden;
+                s.captionTracks.push_back(std::move(t));
+                save(l);
+                const SdhSummary& sum = draft.summary;
+                return ok(QStringLiteral("Drafted %1 SDH captions: %2 sound cues, %3 sung, %4 with the speaker shown, %5 moved off text")
+                              .arg(list.size()).arg(sum.sounds).arg(sum.lyrics).arg(sum.speakers).arg(sum.raised),
+                          QJsonObject{{"track", int(s.captionTracks.size()) - 1}, {"hidden_tracks", hidden}, {"captions", list}, {"heard", heard}, {"notes", notes},
+                                      {"sounds", sum.sounds}, {"lyrics", sum.lyrics}, {"speakers", sum.speakers}, {"raised", sum.raised}});
+            }
             // Subtitles read off their pictures: the track and what to check.
             auto reviewed = [&](const ImageSubtitleImport& in, QJsonObject extra) {
                 QJsonArray review;

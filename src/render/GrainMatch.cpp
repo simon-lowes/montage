@@ -69,12 +69,23 @@ int bandOf(double light) { return std::clamp(int(std::floor(std::log2(std::max(l
 
 // Code values to linear light and back, carried on below 0 (as grain on black takes them) by the curve's mirror where
 // the curve itself stops at 0.
+// (Display curves carried on past their range, so code values outside 0..1 keep apart: mirrored below black, HLG's log
+// curve on past 1, PQ straight on at its slope there.)
+bool displayCurve(Transfer t) { return t == Transfer::Bt1886 || t == Transfer::Srgb || t == Transfer::Pq || t == Transfer::Hlg; }
+constexpr double kHlgA = 0.17883277, kHlgB = 1 - 4 * kHlgA, kHlgC = 0.55991073;
+double pqTopSlope() {
+    static const double s = (toLinear(Transfer::Pq, 1) - toLinear(Transfer::Pq, 1 - 1e-4)) / 1e-4;
+    return s;
+}
 double linear(Transfer t, double v) {
-    if (v < 0 && (t == Transfer::Bt1886 || t == Transfer::Srgb)) return -toLinear(t, -v);
+    if (v < 0 && displayCurve(t)) return -toLinear(t, -v);
+    if (v > 1 && t == Transfer::Hlg) return (std::exp((v - kHlgC) / kHlgA) + kHlgB) / 12;
+    if (v > 1 && t == Transfer::Pq) return toLinear(t, 1) + (v - 1) * pqTopSlope();
     return toLinear(t, v);
 }
 double encoded(Transfer t, double l) {
-    if (l < 0 && (t == Transfer::Bt1886 || t == Transfer::Srgb)) return -fromLinear(t, -l);
+    if (l < 0 && displayCurve(t)) return -fromLinear(t, -l);
+    if (t == Transfer::Pq && l > toLinear(t, 1)) return 1 + (l - toLinear(t, 1)) / pqTopSlope();
     return fromLinear(t, l);
 }
 
@@ -300,6 +311,29 @@ bool parseGrainProfile(const std::string& text, GrainProfile& out) {
     for (double& r : g.correlation) r = std::clamp(r, -1.0, 1.0);
     out = g;
     return true;
+}
+
+GrainProfile grainProfileIn(const GrainProfile& g, const ColorSpace& from, const ColorSpace& to) {
+    if (from.id == to.id || !g.valid()) return g;
+    GrainProfile out = g;
+    // Grey at each band's middle in `to`, and a little brighter, through to `from`: the grain there over the slope.
+    auto inFrom = [&](double light, double l[3]) {
+        const float code = float(encoded(to.transfer, light));
+        float px[3] = {code, code, code};
+        convertPixel(px, to, from);
+        for (int c = 0; c < 3; ++c) l[c] = linear(from.transfer, px[c]);
+    };
+    for (int b = 0; b < GrainProfile::kBands; ++b) {
+        const double light = std::exp2(b - 7.5), h = 0.02;
+        double a[3], z[3];
+        inFrom(light, a);
+        inFrom(light * (1 + h), z);
+        for (int c = 0; c < 3; ++c) {
+            const double slope = (z[c] - a[c]) / (light * h);
+            out.amplitude[c][b] = slope > 1e-4 ? grainAmplitude(g, c, lumaOf(a)) / slope : 0;
+        }
+    }
+    return out;
 }
 
 GrainProfile stockGrain(int gauge) {

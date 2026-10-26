@@ -29,6 +29,12 @@ bool applyOcio(const Effect& e, Image& img, std::string* error = nullptr);
 // One of OCIO's built-in transforms (e.g. "ACEScct_to_ACES2065-1") on RGB
 // triples in place; used to check Montage's own colour maths.
 bool applyOcioBuiltin(const std::string& style, float* rgb, size_t count, bool inverse = false, std::string* error = nullptr);
+// ACES 2.0's output transform for `display` and `view` of OpenColorIO's built-in ACES 2.0 studio config (OpenColorIO 2.5
+// and later) on ACES2065-1 RGB triples in place, or display code values back to them (`inverse`); false (with why) where
+// this OpenColorIO has not got it.
+bool aces2OutputAvailable();
+bool applyAces2Output(const std::string& display, const std::string& view, float* rgb, size_t count, bool inverse = false,
+                      std::string* error = nullptr);
 // A LUT or transform file OCIO reads (.clf, .cube, ...) on RGB triples in place; used to check Montage's own readers.
 bool applyOcioFile(const std::string& path, float* rgb, size_t count, std::string* error = nullptr);
 

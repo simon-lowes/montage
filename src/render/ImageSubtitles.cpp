@@ -140,16 +140,20 @@ namespace {
 // Several pictures shown at once (the rects of one subtitle) as one, on their bounding box.
 SubtitlePicture joinRects(const AVSubtitle& sub) {
     SubtitlePicture p;
-    int x0 = INT32_MAX, y0 = INT32_MAX, x1 = INT32_MIN, y1 = INT32_MIN;
+    int64_t x0 = INT64_MAX, y0 = INT64_MAX, x1 = INT64_MIN, y1 = INT64_MIN;
     for (unsigned i = 0; i < sub.num_rects; ++i) {
         const AVSubtitleRect* r = sub.rects[i];
         if (r->type != SUBTITLE_BITMAP || r->w <= 0 || r->h <= 0) continue;
-        x0 = std::min(x0, r->x), y0 = std::min(y0, r->y);
-        x1 = std::max(x1, r->x + r->w), y1 = std::max(y1, r->y + r->h);
+        x0 = std::min<int64_t>(x0, r->x), y0 = std::min<int64_t>(y0, r->y);
+        x1 = std::max<int64_t>(x1, int64_t(r->x) + r->w), y1 = std::max<int64_t>(y1, int64_t(r->y) + r->h);
     }
-    if (x1 <= x0 || y1 <= y0) return p;
-    p.x = x0, p.y = y0;
-    p.image = QImage(x1 - x0, y1 - y0, QImage::Format_ARGB32);
+    // (A file's rects far apart, or huge, are not a subtitle: nothing rather than a picture too big to keep. A whole
+    // UHD frame fits, a little over.)
+    constexpr int64_t kMaxSide = 8192, kMaxArea = int64_t(4096) * 2304;
+    if (x1 <= x0 || y1 <= y0 || x1 - x0 > kMaxSide || y1 - y0 > kMaxSide || (x1 - x0) * (y1 - y0) > kMaxArea) return p;
+    p.image = QImage(int(x1 - x0), int(y1 - y0), QImage::Format_ARGB32);
+    if (p.image.isNull()) return {};
+    p.x = int(x0), p.y = int(y0);
     p.image.fill(0);
     for (unsigned i = 0; i < sub.num_rects; ++i) {
         const AVSubtitleRect* r = sub.rects[i];
@@ -310,10 +314,10 @@ bool decodeImageSubtitles(const std::string& path, DecodedSubtitles& out, int st
         SubtitlePicture p = joinRects(sub);
         if (p.image.isNull()) return;  // a clearing subtitle
         p.start = at;
-        // An end the decoder knows (DVD's, DVB's time-out), else until the next.
+        // An end the decoder knows (DVD's, DVB's time-out: the next page may still end it sooner), else until the next.
         const bool stated = sub.end_display_time != UINT32_MAX && sub.end_display_time > sub.start_display_time;
         p.end = stated ? base + sub.end_display_time / 1000.0 : at + 3600;
-        open = !stated || id == AV_CODEC_ID_DVB_SUBTITLE;
+        open = !stated;
         out.pictures.push_back(std::move(p));
     };
     while (av_read_frame(fmt, pkt) >= 0) {
@@ -1266,6 +1270,16 @@ bool writeImageSubtitles(const CaptionTrack& track, const Sequence& seq, const s
         if (ext != ".ttml" && ext != ".xml") return fail("IMSC 1.1 Image goes in a .ttml (or .xml) document");
         const std::vector<CaptionPicture> pictures = captionPictures(track, width, height);
         const QFileInfo info(qpath);
+        // Pictures beside it that the document there does not name (another export's, or anything else) are left alone.
+        QByteArray before;
+        if (QFile f(qpath); f.open(QIODevice::ReadOnly)) before = f.readAll();
+        for (size_t i = 0; i < pictures.size(); ++i) {
+            char num[32];
+            std::snprintf(num, sizeof num, "-%04zu.png", i + 1);
+            const QString name = info.completeBaseName() + QString::fromLatin1(num);
+            if (QFileInfo::exists(info.absoluteDir().filePath(name)) && !before.contains(QByteArray::fromStdString(xmlEscaped(name.toStdString()))))
+                return fail(name.toStdString() + " is already there: choose another name");
+        }
         std::vector<std::string> names;
         for (size_t i = 0; i < pictures.size(); ++i) {
             char num[32];
@@ -1301,6 +1315,16 @@ bool writeImageSubtitles(const CaptionTrack& track, const Sequence& seq, const s
         const QFileInfo info(qpath);
         const QString idx = info.absoluteDir().filePath(info.completeBaseName() + ".idx");
         const QString sub = info.absoluteDir().filePath(info.completeBaseName() + ".sub");
+        // The file of the pair not chosen, there already, is replaced only when it is DVD subtitles too (not, say, a
+        // text .sub subtitle file of the same name).
+        for (const QString& other : {idx, sub}) {
+            if (QFileInfo(other) == info) continue;
+            QFile f(other);
+            if (!f.exists()) continue;
+            const QByteArray head = f.open(QIODevice::ReadOnly) ? f.read(32) : QByteArray();
+            const bool dvd = other == idx ? head.startsWith("# VobSub index file") : head.startsWith(QByteArray("\x00\x00\x01\xba", 4));
+            if (!dvd) return fail(QFileInfo(other).fileName().toStdString() + " is already there and is not DVD subtitles: choose another name");
+        }
         QByteArray body, index;
         index += "# VobSub index file, v7 (do not modify this line!)\n# Made by Montage\n";
         index += QByteArray(reinterpret_cast<const char*>(extradata.data()), qsizetype(extradata.size()));

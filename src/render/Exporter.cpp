@@ -491,9 +491,12 @@ std::vector<uint8_t> gifFrame(const Project& p, const Sequence& seq, FrameTime f
     RenderOptions ro;
     ro.scale = double(W) / seq.width;
     ro.highQuality = true;
+    // (graded scene-referred: through the output transform for the GIF's own space)
+    const bool scene = sceneReferredWorking(seq);
+    if (scene) ro.displaySpace = outSpace.id;
     Image img = renderProgramFrame(p, seq, f, ro);
     if (img.width != W || img.height != H) img = resizeImage(img, W, H);
-    convertColor(img, sequenceColorSpace(seq), outSpace, std::clamp(seq.hdrPeakNits, 100.0, 10000.0));
+    if (!scene) convertColor(img, sequenceColorSpace(seq), outSpace, std::clamp(seq.hdrPeakNits, 100.0, 10000.0));
     std::vector<uint8_t> rgb(size_t(W) * size_t(H) * 3);
     for (int y = 0; y < H; ++y)
         for (int x = 0; x < W; ++x) {
@@ -1698,6 +1701,16 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     ro.scale = double(W / across) / seq.width;
     ro.highQuality = true;
     ro.useProxies = s.useProxies;
+    // Graded scene-referred, the frames are made for the space delivered, through its own output transform (a trim
+    // pass's target's, its trim after it; a scene-referred one gets the working space's light).
+    const bool sceneGraded = sceneReferredWorking(seq);
+    const ColorSpace* sceneLight = sceneGraded && trim ? &linearColorSpace(workingColorSpace(seq).primaries) : nullptr;
+    if (sceneGraded) {
+        ro.outputSpace = trim ? seqSpace.id : outSpace.id;
+        ro.outputPeak = peakNits;
+        ro.sceneLight = trim != nullptr;
+    }
+    const ColorSpace& frameSpace = sceneGraded && !trim ? outSpace : seqSpace;  // (the frames' space, once made)
     ro.stereoView = stereoView;
     // A frame an effect could not finish (its model missing or failing) fails the export rather than going out without it.
     RenderIssues issues;
@@ -1706,7 +1719,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     // Smart rendering: only where nothing would change the source's pictures for the whole export.
     std::unique_ptr<SmartRenderer> smart;
     if (wantVideo && s.smartRender && o.vctx && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height && !seq.stereo3d &&
-        !s.useProxies && !s.burnInCaptions && !s.cea608 && !interlacedOut && !s.burnIn.any() && outSpace.id == seqSpace.id && !trim &&
+        !s.useProxies && !s.burnInCaptions && !s.cea608 && !interlacedOut && !s.burnIn.any() && outSpace.id == seqSpace.id && !trim && !sceneGraded &&
         !conv.active())
         smart = std::make_unique<SmartRenderer>(p, seq, seqSpace, o.vctx, o.vst, s.alpha, s.profile);
     // CEA-608 (and CTA-708) captions in the video: each frame's A/53 cc_data (core/Cea708.h).
@@ -1750,15 +1763,15 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
         RenderOptions eye = ro;
         eye.stereoView = v;
         Image img = renderProgramFrame(p, seq, f, eye);
-        if (trim) applyTrimPass(img, seq, f, *trim);
+        if (trim) applyTrimPass(img, seq, f, *trim, sceneLight, true);
         return img;
     };
     // A frame of the programme, in the output space: rendered, with captions and burn-ins unless they go on the
     // delivered frames; `eye` 1 or 2 is the left or right eye alone.
     auto programmeFrame = [&](FrameTime f, int eye = 0) {
         auto burn = [&](Image& img) {
-            if (burnCaptions) drawCaption(img, *burnCaptions, f, &seqSpace);
-            if (s.burnIn.any()) drawBurnIns(img, p, seq, f, s.burnIn, watermark.isNull() ? nullptr : &watermark, &seqSpace);
+            if (burnCaptions) drawCaption(img, *burnCaptions, f, &frameSpace);
+            if (s.burnIn.any()) drawBurnIns(img, p, seq, f, s.burnIn, watermark.isNull() ? nullptr : &watermark, &frameSpace);
         };
         Image img;
         if (eye) {
@@ -1772,10 +1785,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             img = combineStereo(left, right, stereoView);
         } else {
             img = s.alpha && !seq.stereo3d ? renderSequenceFrame(p, seq, f, ro) : renderProgramFrame(p, seq, f, ro);
-            if (trim) applyTrimPass(img, seq, f, *trim);
+            if (trim) applyTrimPass(img, seq, f, *trim, sceneLight, true);
             if (!burnDelivered) burn(img);
         }
-        convertColor(img, seqSpace, outSpace, peakNits);
+        convertColor(img, frameSpace, outSpace, peakNits);
         return img;
     };
     // Delivered at another rate: the programme's pictures kept while the frames round them use them again (a standards

@@ -49,6 +49,7 @@
 #endif
 #include "media/Diarizer.h"
 #include "media/Segmenter.h"
+#include "media/BandwidthExtension.h"
 #include "media/SpeechEnhance.h"
 #include "media/MotionDeblur.h"
 #include "media/SuperScale.h"
@@ -964,6 +965,12 @@ int cmdModels() {
     else
         std::printf("  %-22s %6.0f MB  %s\n", speechModel().id.c_str(), double(speechModel().bytes()) / 1e6,
                     speechModel().installed() ? "downloaded" : "");
+    std::printf("\nSpeech bandwidth models (AP-BWE, the authors' checkpoints, for Bandwidth Extension; each clip downloads the ones "
+                "its cut-off needs)\n");
+    if (!bandwidthExtensionAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
+    else
+        for (const BweCheckpoint& c : bweCheckpoints())
+            std::printf("  %-22s %6.0f MB  %s\n", bweModel(c).id.c_str(), double(bweModel(c).bytes()) / 1e6, bweModel(c).installed() ? "downloaded" : "");
     std::printf("\nSuper Scale model (Real-ESRGAN general x4v3; folder: %s)\n", upscaleModel().directory().c_str());
     if (!upscalerAvailable()) std::printf("  unavailable: this build has no ONNX Runtime\n");
     else

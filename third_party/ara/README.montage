@@ -1,0 +1,4 @@
+Celemony's ARA Audio Random Access SDK 2.3.0 (Apache License 2.0), from https://github.com/Celemony/ARA_API
+(releases/2.3.0) and https://github.com/Celemony/ARA_Library (releases/2.3.0): the API headers (ARAInterface.h and
+the VST3 and CLAP companion headers) and the Library's host dispatch, which Montage uses to host ARA plug-ins.
+ARA Audio Random Access is a trademark of Celemony Software GmbH.

@@ -203,12 +203,14 @@ AudioDescriptionDialog::AudioDescriptionDialog(EditorState* state, QWidget* pare
         }));
     });
     connect(state_, &EditorState::projectChanged, this, [this] {
+        followAdded();
         if (isVisible() && stale()) refind_->start();
         refresh();
     });
     connect(state_, &EditorState::sequenceSwitched, this, [this] {
         gaps_.clear();
         added_.clear();
+        anchors_.clear();
         foundFor_.clear();
         addedFor_.clear();
         refresh();
@@ -237,7 +239,7 @@ bool AudioDescriptionDialog::stale() const {
 void AudioDescriptionDialog::keepAdded(const std::vector<std::pair<double, double>>& speech, double fps) {
     // A gap added at the playhead stays while it starts clear of the dialogue (ending where the next line now begins)
     // and not inside a gap found anyway (the found one is drafted and voiced instead).
-    std::erase_if(added_, [&](DescriptionGap& a) {
+    auto drop = [&](DescriptionGap& a) {
         for (const DescriptionGap& g : gaps_)
             if (a.start >= g.start && a.start < g.end) return true;
         for (const auto& [t0, t1] : speech) {
@@ -245,7 +247,51 @@ void AudioDescriptionDialog::keepAdded(const std::vector<std::pair<double, doubl
             if (t0 > double(a.start) / fps) a.end = std::min(a.end, FrameTime(std::floor(t0 * fps)));
         }
         return a.end <= a.start;
-    });
+    };
+    size_t kept = 0;
+    for (size_t i = 0; i < added_.size(); ++i)
+        if (!drop(added_[i])) {
+            added_[kept] = added_[i];
+            anchors_[kept++] = anchors_[i];
+        }
+    added_.resize(kept);
+    anchors_.resize(kept);
+}
+
+namespace {
+// Where a clip's sound would start on the timeline, untrimmed: it moves with the clip and its slips, not its trims.
+FrameTime soundOrigin(const Clip& c) { return c.reverse ? c.start : c.start - FrameTime(std::llround(c.sourceIn / c.speed)); }
+}  // namespace
+
+AudioDescriptionDialog::Anchor AudioDescriptionDialog::anchorAt(FrameTime at) const {
+    Anchor a;
+    const Sequence* s = state_->sequence();
+    if (!s) return a;
+    const int skip = adTrack();
+    FrameTime best = -1;
+    for (size_t i = 0; i < s->audioTracks.size(); ++i)
+        if (int(i) != skip)
+            for (const Clip& c : s->audioTracks[i].clips)
+                if (c.start <= at && c.start > best) best = c.start, a.clip = c.id;
+    if (const Clip* c = a.clip ? edit::clipById(*s, a.clip) : nullptr) a.offset = at - soundOrigin(*c);
+    return a;
+}
+
+void AudioDescriptionDialog::followAdded() {
+    const Sequence* s = state_->sequence();
+    if (!s) return;
+    bool moved = false;
+    for (size_t i = 0; i < added_.size(); ++i) {
+        const Clip* c = anchors_[i].clip ? edit::clipById(*s, anchors_[i].clip) : nullptr;
+        if (!c) continue;
+        const FrameTime shift = soundOrigin(*c) + anchors_[i].offset - added_[i].start;
+        if (!shift) continue;
+        for (DescriptionGap& g : gaps_)
+            if (g == added_[i]) g.start += shift, g.end += shift;
+        added_[i].start += shift, added_[i].end += shift;
+        moved = true;
+    }
+    if (moved) std::sort(gaps_.begin(), gaps_.end(), [](const DescriptionGap& a, const DescriptionGap& b) { return a.start < b.start; });
 }
 
 bool AudioDescriptionDialog::checkAdded(QString* error) {
@@ -422,6 +468,7 @@ void AudioDescriptionDialog::addAtPlayhead() {
             if (at >= g.start && at < g.end) end = std::min(end, g.end);
         gaps_.push_back({at, end});
         added_.push_back({at, end});
+        anchors_.push_back(anchorAt(at));
         std::sort(gaps_.begin(), gaps_.end(), [](const DescriptionGap& a, const DescriptionGap& b) { return a.start < b.start; });
         refresh();
         // (With no gaps found, checked against the dialogue now: kept clear of it, as a found gap would be.)

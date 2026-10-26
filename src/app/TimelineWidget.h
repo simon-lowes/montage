@@ -27,6 +27,7 @@ public:
 
     explicit TimelineWidget(EditorState* state, QWidget* parent = nullptr);
 
+    EditorState* state() const { return state_; }
     Tool tool() const { return tool_; }
     void setTool(Tool t);
 
@@ -93,6 +94,10 @@ public:
         QRect r;
         return clipRect(clip, r) ? r : QRect();
     }
+    // The tracks whose rows are shown, top to bottom, and where frames [from, to) of one are drawn, in viewport pixels
+    // (empty when its row is not shown): what its accessible table (app/Accessibility.h) reads.
+    std::vector<TrackRef> shownTracks() const;
+    QRect spanBounds(TrackRef track, FrameTime from, FrameTime to) const;
     // Where a take lane (or an audition take's lane: `lane` 0 and its clip and take) is drawn from frame `from` to
     // `to`, in viewport pixels (empty when its track's lanes are not shown).
     QRect takeLaneBounds(TrackRef track, Id lane, FrameTime from, FrameTime to, Id clip = 0, int take = -1) const;

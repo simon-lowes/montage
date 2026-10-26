@@ -1,5 +1,6 @@
 #include "Captions.h"
 
+#include <QColor>
 #include <QRegularExpression>
 #include <QString>
 #include <QStringList>
@@ -163,6 +164,26 @@ const CaptionLook* findCaptionLook(const std::string& id) {
     return nullptr;
 }
 
+bool captionColour(const Caption& c, int& r, int& g, int& b) {
+    const QString s = QString::fromStdString(c.colour).trimmed();
+    if (s.size() != 7 || !s.startsWith(QLatin1Char('#'))) return false;
+    bool ok = false;
+    const uint v = s.mid(1).toUInt(&ok, 16);
+    if (!ok) return false;
+    r = int(v >> 16) & 255, g = int(v >> 8) & 255, b = int(v) & 255;
+    return true;
+}
+
+const char* nearestColour(int r, int g, int b, const std::vector<NamedColour>& names) {
+    const char* best = nullptr;
+    int bestD = std::numeric_limits<int>::max();
+    for (const NamedColour& n : names) {
+        const int d = (r - n.r) * (r - n.r) + (g - n.g) * (g - n.g) + (b - n.b) * (b - n.b);
+        if (d < bestD) bestD = d, best = n.name;
+    }
+    return best;
+}
+
 void normalizeCaptions(std::vector<Caption>& captions) {
     for (auto& c : captions) c.text = QString::fromStdString(c.text).trimmed().toStdString();
     captions.erase(std::remove_if(captions.begin(), captions.end(),
@@ -273,21 +294,34 @@ int captionWordAt(const Caption& c, FrameTime t) {
     return w;
 }
 
-std::vector<Caption> captionsFromTranscripts(const Project& p, const Sequence& seq, const CaptionRules& rules) {
+std::vector<Caption> captionsFromTranscripts(const Project& p, const Sequence& seq, const CaptionRules& rules,
+                                             std::vector<std::string>* speakers) {
     const double fps = seq.fpsValue() > 0 ? seq.fpsValue() : 30.0;
-    std::vector<TranscriptWord> words = sequenceTranscriptWords(p, seq);
-    if (words.empty()) return {};
+    if (speakers) speakers->clear();
+    std::vector<TranscriptWord> all = sequenceTranscriptWords(p, seq);
+    if (all.empty()) return {};
 
+    // A segment for each run of one speaker's words, so a caption never mixes two speakers.
     Transcript t;
-    TranscriptSegment seg;
-    seg.words = std::move(words);
-    t.segments.push_back(std::move(seg));
+    for (const TranscriptWord& w : all) {
+        int who = -1;
+        if (!w.speaker.empty()) {
+            const auto it = std::find(t.speakerNames.begin(), t.speakerNames.end(), w.speaker);
+            who = int(it - t.speakerNames.begin());
+            if (it == t.speakerNames.end()) t.speakerNames.push_back(w.speaker);
+        }
+        if (t.segments.empty() || t.segments.back().speaker != who) {
+            t.segments.emplace_back();
+            t.segments.back().speaker = who;
+        }
+        t.segments.back().words.push_back(w);
+    }
     const auto cues = transcriptCues(t, rules.lineChars * std::max(1, rules.maxLines), rules.maxSeconds);
     std::vector<Caption> out;
     std::vector<std::vector<double>> wordFrames;  // when each of a caption's words starts, in frames
-    const auto& all = t.segments.front().words;
     size_t next = 0;
     for (const Cue& c : cues) {
+        if (speakers) speakers->push_back(c.voice);
         Caption cap;
         cap.start = FrameTime(std::llround(c.start * fps));
         cap.end = std::max(cap.start + 1, FrameTime(std::llround(c.end * fps)));
@@ -307,8 +341,27 @@ std::vector<Caption> captionsFromTranscripts(const Project& p, const Sequence& s
         const double len = double(std::max<FrameTime>(1, out[i].end - out[i].start));
         for (double f : wordFrames[i]) out[i].wordTimes.push_back(std::clamp((f - double(out[i].start)) / len, 0.0, 0.999));
     }
-    normalizeCaptions(out);
-    return out;
+    if (!speakers) {
+        normalizeCaptions(out);
+        return out;
+    }
+    // Kept in step with the speakers: sorted together, empty ones dropped, overlaps trimmed (as normalizeCaptions does).
+    std::vector<size_t> order(out.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return out[a].start < out[b].start; });
+    std::vector<Caption> sorted;
+    std::vector<std::string> who;
+    for (size_t i : order) {
+        Caption& c = out[i];
+        c.text = QString::fromStdString(c.text).trimmed().toStdString();
+        if (c.end <= c.start || c.text.empty()) continue;
+        if (!sorted.empty() && sorted.back().end > c.start) sorted.back().end = c.start;
+        if (!sorted.empty() && sorted.back().end <= sorted.back().start) sorted.pop_back(), who.pop_back();
+        sorted.push_back(std::move(c));
+        who.push_back((*speakers)[i]);
+    }
+    *speakers = std::move(who);
+    return sorted;
 }
 
 namespace {
@@ -380,6 +433,11 @@ std::string captionsToSrt(const std::vector<Caption>& captions, Rational fps) {
     // A caption out of its usual place leads with the {\an} tag players read in SubRip.
     std::vector<Cue> cues = toCues(captions, fps);
     for (size_t i = 0; i < cues.size(); ++i) {
+        if (int r, g, b; captionColour(captions[i], r, g, b)) {
+            char hex[8];
+            std::snprintf(hex, sizeof hex, "#%02x%02x%02x", r, g, b);
+            cues[i].text = std::string("<font color=\"") + hex + "\">" + cues[i].text + "</font>";
+        }
         if (captions[i].italic) cues[i].text = "<i>" + cues[i].text + "</i>";
         if (const int k = captionKeypad(captions[i]); k != 2) cues[i].text = "{\\an" + std::to_string(k) + "}" + cues[i].text;
     }
@@ -390,6 +448,13 @@ std::string captionsToVtt(const std::vector<Caption>& captions, Rational fps) {
     std::vector<Cue> cues = toCues(captions, fps);
     for (size_t i = 0; i < cues.size(); ++i) {
         const Caption& c = captions[i];
+        // WebVTT's colour classes, which players style by default.
+        static const std::vector<NamedColour> vttColours = {{"white", 255, 255, 255}, {"lime", 0, 255, 0},   {"cyan", 0, 255, 255},
+                                                            {"red", 255, 0, 0},       {"yellow", 255, 255, 0}, {"magenta", 255, 0, 255},
+                                                            {"blue", 0, 0, 255},      {"black", 0, 0, 0}};
+        if (int r, g, b; captionColour(c, r, g, b))
+            if (const std::string name = nearestColour(r, g, b, vttColours); name != "white")
+                cues[i].text = "<c." + name + ">" + cues[i].text + "</c>";
         if (c.italic) cues[i].text = "<i>" + cues[i].text + "</i>";
         std::string& s = cues[i].settings;
         if (c.vertical == kCaptionTop) s = "line:10%";
@@ -452,6 +517,16 @@ bool parseSubtitles(const std::string& text, Rational fps, std::vector<Caption>&
         placeFromVtt(parts[1].trimmed().section(QRegularExpression(QStringLiteral("\\s+")), 1), c);
         if (keypad) setCaptionKeypad(c, keypad);
         c.italic = italic;
+        // In one colour throughout: SubRip's <font color> or one of WebVTT's colour classes.
+        static const QRegularExpression font(QStringLiteral("<font\\s+color\\s*=\\s*\"?([#\\w]+)\"?\\s*>"), QRegularExpression::CaseInsensitiveOption),
+            vttClass(QStringLiteral("<c\\.(white|lime|cyan|red|yellow|magenta|blue|black)[.>]"));
+        std::vector<QString> colours;
+        for (const auto* re : {&font, &vttClass})
+            for (auto it = re->globalMatch(whole); it.hasNext();) colours.push_back(it.next().captured(1));
+        if (colours.size() == 1) {
+            const QColor colour(colours[0] == QStringLiteral("lime") ? QStringLiteral("#00ff00") : colours[0]);
+            if (colour.isValid() && colour != QColor(Qt::white)) c.colour = colour.name().toStdString();
+        }
         caps.push_back(std::move(c));
     }
     normalizeCaptions(caps);

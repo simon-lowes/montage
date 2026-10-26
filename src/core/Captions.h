@@ -66,8 +66,19 @@ struct Caption {
     int vertical = kCaptionBottom;
     int align = kCaptionCentre;
     bool italic = false;  // the whole caption in italics (a voice off screen, a song, a thought), as subtitles mark them
+    std::string colour;   // "#rrggbb": the text in this colour (a speaker's, as UK subtitles show who speaks); "" = the track's
     bool operator==(const Caption&) const = default;
 };
+
+// A caption's own colour ("#rrggbb") as red, green and blue (0-255); false when it has none (or it does not read).
+bool captionColour(const Caption& c, int& r, int& g, int& b);
+// The name of the colour closest to it of `names` (each with its red, green and blue), as formats with a few named
+// colours write it (WebVTT's classes, teletext's).
+struct NamedColour {
+    const char* name;
+    int r, g, b;
+};
+const char* nearestColour(int r, int g, int b, const std::vector<NamedColour>& names);
 
 // A caption's place as a keypad digit, as ASS's \an tag and SubRip's {\an} write
 // it (1-3 bottom, 4-6 middle, 7-9 top; left, centre, right), and back (anything
@@ -131,8 +142,11 @@ struct CaptionRules {
 
 // Captions for the sequence from the transcripts of the media its clips use:
 // each word is placed where its clip plays it (following trims, speed and
-// track mutes) and the words are grouped into readable captions.
-std::vector<Caption> captionsFromTranscripts(const Project& p, const Sequence& seq, const CaptionRules& rules = {});
+// track mutes) and the words are grouped into readable captions, a new one
+// where the speaker changes. With `speakers`, who says each caption ("" when
+// the transcript does not know).
+std::vector<Caption> captionsFromTranscripts(const Project& p, const Sequence& seq, const CaptionRules& rules = {},
+                                             std::vector<std::string>* speakers = nullptr);
 
 // SubRip / WebVTT text for the captions (times from the sequence frame rate).
 std::string captionsToSrt(const std::vector<Caption>& captions, Rational fps);

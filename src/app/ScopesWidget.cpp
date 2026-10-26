@@ -1,6 +1,8 @@
 // Montage — video scopes widget.
 #include "ScopesWidget.h"
 
+#include "Accessibility.h"
+
 #include <QComboBox>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -151,6 +153,7 @@ QFont scopeFont(const QFont& base) {
 
 ScopesWidget::ScopesWidget(QWidget* parent) : QWidget(parent) {
     setAttribute(Qt::WA_OpaquePaintEvent);
+    access::describe(this, {QAccessible::Graphic, [this] { return tr("Scopes"); }, {}, [this] { return summary(); }});
 
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(4, 4, 4, 4);
@@ -167,6 +170,16 @@ ScopesWidget::ScopesWidget(QWidget* parent) : QWidget(parent) {
     modeBox_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     modeBox_->setToolTip(tr("Scope type"));
     row->addWidget(modeBox_);
+    // What is read: the output, or the working space's values (graded scene-referred).
+    readBox_ = new QComboBox(this);
+    readBox_->setObjectName(QStringLiteral("scopeRead"));
+    readBox_->addItem(tr("Output"));
+    readBox_->addItem(tr("Working Space"));
+    readBox_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    readBox_->setToolTip(tr("Measure the picture as delivered, or (in a sequence graded scene-referred) the values its grade\n"
+                            "works on, in its working space; read when the playhead stops"));
+    row->addWidget(readBox_);
+    connect(readBox_, &QComboBox::currentIndexChanged, this, [this](int i) { setReadsWorking(i == 1); });
     // HDR: the waveform's top in nits, and the frame's light.
     rangeBox_ = new QComboBox(this);
     rangeBox_->setObjectName(QStringLiteral("scopeRange"));
@@ -237,6 +250,16 @@ int ScopesWidget::cieSamplesNear(double a, double b, double radius) const {
             if (std::hypot(ca - a, cb - b) <= radius) n += int(cieCounts_[size_t(by) * kCieBins + bx]);
         }
     return n;
+}
+
+void ScopesWidget::setReadsWorking(bool on) {
+    if (readBox_->currentIndex() != (on ? 1 : 0)) {
+        QSignalBlocker block(readBox_);
+        readBox_->setCurrentIndex(on ? 1 : 0);
+    }
+    if (readsWorking_ == on) return;
+    readsWorking_ = on;
+    emit readWorkingChanged(on);
 }
 
 void ScopesWidget::setFrame(const QImage& image, FrameTime t) { setSignal(image, t, QStringLiteral("rec709"), 1000); }
@@ -340,6 +363,58 @@ void ScopesWidget::analyze() {
     computeTrace();
     updateHdrControls();
     update();
+}
+
+QString ScopesWidget::summary() const {
+    if (!haveData_ || small_.isNull()) return tr("No picture");
+    std::array<uint64_t, 256> hist{};
+    double cb = 0, cr = 0, saturation = 0, sum = 0;
+    const int n = small_.width() * small_.height();
+    for (int y = 0; y < small_.height(); ++y) {
+        const auto* line = reinterpret_cast<const QRgb*>(small_.constScanLine(y));
+        for (int x = 0; x < small_.width(); ++x) {
+            const int r = qRed(line[x]), g = qGreen(line[x]), b = qBlue(line[x]);
+            const int l = std::clamp(luma(r, g, b), 0, 255);
+            ++hist[size_t(l)];
+            sum += l;
+            const double pb = (b - l) / 1.8556 / 255, pr = (r - l) / 1.5748 / 255;
+            cb += pb, cr += pr;
+            saturation += std::hypot(pb, pr);
+        }
+    }
+    if (n <= 0) return tr("No picture");
+    auto percentile = [&](double share) {
+        uint64_t seen = 0;
+        for (int i = 0; i < 256; ++i)
+            if ((seen += hist[size_t(i)]) >= uint64_t(share * n)) return i;
+        return 255;
+    };
+    auto percent = [](double code) { return int(std::lround(code / 2.55)); };
+    QString text = tr("%1: levels %2 % to %3 %, average %4 %; saturation %5 %")
+                       .arg(modeBox_ ? modeBox_->currentText() : tr("Scopes"))
+                       .arg(percent(percentile(0.02)))
+                       .arg(percent(percentile(0.98)))
+                       .arg(percent(sum / n))
+                       .arg(int(std::lround(saturation / n * 200)));  // (0.5, a primary, as 100 %)
+    // A cast: the average colour's hue, when it is far enough from grey.
+    cb /= n, cr /= n;
+    if (std::hypot(cb, cr) > 0.02) {
+        static const std::pair<double, const char*> kHues[] = {{103, QT_TR_NOOP("red")},   {175, QT_TR_NOOP("yellow")},
+                                                                {230, QT_TR_NOOP("green")}, {283, QT_TR_NOOP("cyan")},
+                                                                {355, QT_TR_NOOP("blue")},  {50, QT_TR_NOOP("magenta")}};
+        const double angle = std::fmod(std::atan2(cr, cb) * 180 / M_PI + 360, 360);
+        const char* hue = kHues[0].second;
+        double best = 360;
+        for (const auto& [at, name] : kHues)
+            if (const double d = std::min(std::fabs(angle - at), 360 - std::fabs(angle - at)); d < best) best = d, hue = name;
+        text += tr(", leaning %1").arg(tr(hue));
+    } else {
+        text += tr(", neutral");
+    }
+    if (peakNits_ > 0) text += tr("; peak %1 nits, average %2 nits").arg(std::lround(peakNits_)).arg(std::lround(averageNits_));
+    if (mode_ == Mode::Chromaticity && outside709_ >= 0)
+        text += tr("; %1 % outside Rec.709, %2 % outside P3").arg(std::lround(outside709_ * 100)).arg(std::lround(outsideP3_ * 100));
+    return text;
 }
 
 void ScopesWidget::computeTrace() {

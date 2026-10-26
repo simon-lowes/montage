@@ -11,6 +11,7 @@
 #include <cmath>
 #include <map>
 
+#include "Accessibility.h"
 #include "EditorState.h"
 #include "Theme.h"
 #include "core/EditOps.h"
@@ -120,6 +121,7 @@ void KeyframePanel::rebuild() {
         });
     }
     if (graphRow_ >= int(rows_.size())) graphRow_ = -1;
+    currentRow_ = std::clamp(currentRow_, 0, std::max(0, int(rows_.size()) - 1));
     setMinimumHeight(std::max(80, kRulerH + int(rows_.size()) * kRowH + 4));
     update();
 }
@@ -688,6 +690,8 @@ void KeyframePanel::mouseMoveEvent(QMouseEvent* e) {
 
 void KeyframePanel::mouseReleaseEvent(QMouseEvent* e) {
     if (e->button() != Qt::LeftButton) return;
+    // The keyboard carries on from the row clicked.
+    if (const int r = rowAt(e->pos().y()); r >= 0 && r < int(rows_.size())) currentRow_ = r;
     if ((drag_ == Drag::Keys || drag_ == Drag::GraphKey || drag_ == Drag::Handle) && dragging_) state_->endGesture(true);
     frozen_.clear();
     if (drag_ == Drag::Box) {
@@ -734,26 +738,90 @@ void KeyframePanel::mouseDoubleClickEvent(QMouseEvent* e) {
         return;
     }
     if (r < 0 || !c) return;
-    // A new key with the value the parameter has there.
-    const ParamAddress addr = rows_[size_t(r)].address;
-    const FrameTime t = frameAtX(e->pos().x());
+    addKeyAt(r, frameAtX(e->pos().x()));
+}
+
+bool KeyframePanel::addKeyAt(int row, FrameTime t) {
+    if (row < 0 || row >= int(rows_.size()) || !currentClip()) return false;
+    const ParamAddress addr = rows_[size_t(row)].address;
     const Id id = clip_;
-    if (state_->edit(tr("Add Keyframe"), [id, addr, t](Project&, Sequence& s) {
-            Clip* cc = edit::clipById(s, id);
-            if (isPathRow(addr)) {
-                // The whole path, as it is there.
-                Effect* e = cc ? paramOwner(*cc, addr) : nullptr;
-                if (!e || e->params[kMaskPathParam].keyAt(t)) return false;
-                setMaskPathAnimated(*e, t, true);
-                return true;
-            }
-            Param* p = cc ? findParam(*cc, addr) : nullptr;
-            if (!p || p->keyAt(t)) return false;
-            p->addKey(t, p->keyedAt(t));
+    const bool added = state_->edit(tr("Add Keyframe"), [id, addr, t](Project&, Sequence& s) {
+        Clip* cc = edit::clipById(s, id);
+        if (isPathRow(addr)) {
+            // The whole path, as it is there.
+            Effect* e = cc ? paramOwner(*cc, addr) : nullptr;
+            if (!e || e->params[kMaskPathParam].keyAt(t)) return false;
+            setMaskPathAnimated(*e, t, true);
             return true;
-        }))
+        }
+        Param* p = cc ? findParam(*cc, addr) : nullptr;
+        if (!p || p->keyAt(t)) return false;
+        p->addKey(t, p->keyedAt(t));
+        return true;
+    });
+    if (added) {
         selection_ = {{addr, t}};
+        currentRow_ = row;
+        access::notifyFocus(this);
+    }
     update();
+    return added;
+}
+
+std::vector<KeyframePanel::Key> KeyframePanel::keys() const {
+    std::vector<Key> out;
+    if (const Clip* c = currentClip())
+        for (const Row& r : rows_)
+            if (const Param* p = findParam(*c, r.address))
+                for (const Keyframe& k : p->keys) out.push_back({r.address, k.t});
+    return out;
+}
+
+QString KeyframePanel::keyText(const Key& key) const {
+    const Clip* c = currentClip();
+    const Param* p = c ? findParam(*c, key.address) : nullptr;
+    const Keyframe* k = p ? p->keyAt(key.t) : nullptr;
+    if (!k) return QString();
+    QString label;
+    for (const Row& r : rows_)
+        if (r.address == key.address) label = r.label;
+    static const char* const kInterp[] = {QT_TR_NOOP("Linear"), QT_TR_NOOP("Hold"), QT_TR_NOOP("Smooth"), QT_TR_NOOP("Bezier")};
+    const int interp = int(k->interp);
+    return tr("%1, %2, %3%4")
+        .arg(label, timecodeString(state_->sequence(), c->start + key.t), QString::number(k->v, 'g', 4),
+             interp >= 0 && interp < 4 ? QStringLiteral(", ") + tr(kInterp[interp]) : QString());
+}
+
+void KeyframePanel::selectKey(int row, int step) {
+    const Clip* c = currentClip();
+    if (!c || rows_.empty()) return;
+    row = std::clamp(row, 0, int(rows_.size()) - 1);
+    const Param* p = findParam(*c, rows_[size_t(row)].address);
+    if (!p || p->keys.empty()) {
+        // A row with no keys is still moved to (to add one there), and said.
+        if (step != 0 || row == currentRow_) return;
+        currentRow_ = row;
+        selection_.clear();
+        update();
+        access::announce(this, tr("%1, no keyframes").arg(rows_[size_t(row)].label));
+        return;
+    }
+    // From the selected key on the row, else from the playhead.
+    FrameTime from = state_->playhead() - c->start;
+    for (const Key& k : selection_)
+        if (k.address == rows_[size_t(row)].address) from = k.t;
+    const Keyframe* pick = nullptr;
+    for (const Keyframe& k : p->keys) {
+        if (step < 0 && k.t < from) pick = &k;
+        else if (step > 0 && k.t > from && !pick) pick = &k;
+        else if (step == 0 && (!pick || std::llabs(k.t - from) < std::llabs(pick->t - from))) pick = &k;
+    }
+    if (!pick) return;
+    currentRow_ = row;
+    selection_ = {{rows_[size_t(row)].address, pick->t}};
+    if (step != 0) state_->setPlayhead(c->start + pick->t);
+    update();
+    access::notifyFocus(this);
 }
 
 void KeyframePanel::contextMenuEvent(QContextMenuEvent* e) {
@@ -866,6 +934,13 @@ int KeyframePanel::pasteAtPlayhead() {
     return pasted;
 }
 
+namespace {
+// Without Ctrl, Alt or Meta (Shift and the keypad allowed): the keys that move through the keyframes, not a command on them.
+bool plainKey(const QKeyEvent* e) {
+    return !(e->modifiers() & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier));
+}
+}  // namespace
+
 bool KeyframePanel::event(QEvent* e) {
     // Delete, the arrow keys, copy and paste act on the keys, over the window's shortcuts.
     if (e->type() == QEvent::ShortcutOverride) {
@@ -873,7 +948,13 @@ bool KeyframePanel::event(QEvent* e) {
         const int key = ke->key();
         const bool ours = key == Qt::Key_Delete || key == Qt::Key_Backspace || key == Qt::Key_Left || key == Qt::Key_Right ||
                           ke->matches(QKeySequence::Copy);
-        if ((!selection_.empty() && ours) || (ke->matches(QKeySequence::Paste) && hasCopiedKeys() && currentClip())) {
+        // (Moving between keys and rows, and adding one, whenever there are rows; Shift+Insert is Paste, not one of them.)
+        const bool plain = plainKey(ke) && !ke->matches(QKeySequence::Paste);
+        const bool moving = (plain && (key == Qt::Key_Up || key == Qt::Key_Down || key == Qt::Key_Insert || key == Qt::Key_Return ||
+                                       key == Qt::Key_Enter)) ||
+                            ((key == Qt::Key_Left || key == Qt::Key_Right) && (ke->modifiers() & Qt::AltModifier));
+        if ((!selection_.empty() && ours) || (moving && !rows_.empty()) ||
+            (ke->matches(QKeySequence::Paste) && hasCopiedKeys() && currentClip())) {
             ke->accept();
             return true;
         }
@@ -890,13 +971,41 @@ void KeyframePanel::keyPressEvent(QKeyEvent* e) {
         pasteAtPlayhead();
         return;
     }
+    const bool alt = e->modifiers() & Qt::AltModifier;
     switch (e->key()) {
         case Qt::Key_Delete:
         case Qt::Key_Backspace: deleteSelected(); return;
-        case Qt::Key_Left: shiftSelected(e->modifiers() & Qt::ShiftModifier ? -10 : -1); return;
-        case Qt::Key_Right: shiftSelected(e->modifiers() & Qt::ShiftModifier ? 10 : 1); return;
-        default: QWidget::keyPressEvent(e);
+        case Qt::Key_Left:
+            if (alt) selectKey(currentRow_, -1);
+            else shiftSelected(e->modifiers() & Qt::ShiftModifier ? -10 : -1);
+            return;
+        case Qt::Key_Right:
+            if (alt) selectKey(currentRow_, 1);
+            else shiftSelected(e->modifiers() & Qt::ShiftModifier ? 10 : 1);
+            return;
+        case Qt::Key_Up:
+            if (!plainKey(e)) break;
+            selectKey(currentRow_ - 1, 0);
+            return;
+        case Qt::Key_Down: {
+            if (!plainKey(e)) break;
+            // (The first Down picks a key on the row it is on, when it has one.)
+            const Clip* c = currentClip();
+            const Param* p = c && currentRow_ < int(rows_.size()) ? findParam(*c, rows_[size_t(currentRow_)].address) : nullptr;
+            selectKey(selection_.empty() && p && !p->keys.empty() ? currentRow_ : currentRow_ + 1, 0);
+            return;
+        }
+        case Qt::Key_Insert:
+        case Qt::Key_Return:
+        case Qt::Key_Enter:
+            if (!plainKey(e)) break;
+            // (At the playhead, kept inside the clip.)
+            if (const Clip* c = currentClip())
+                addKeyAt(currentRow_, std::clamp<FrameTime>(state_->playhead() - c->start, 0, std::max<FrameTime>(0, c->duration - 1)));
+            return;
+        default: break;
     }
+    QWidget::keyPressEvent(e);
 }
 
 }  // namespace montage

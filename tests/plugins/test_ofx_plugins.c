@@ -9,6 +9,7 @@
  *    is raw; mode "Pass" gives its source back, in its source's colourspace.
  * With MONTAGE_TEST_OFX_CRASH defined it instead crashes while describing itself, for the scanner's blocklist. */
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #ifdef _WIN32
 #include <windows.h>
@@ -313,6 +314,7 @@ static OfxStatus describeColourInContext(OfxImageEffectHandle effect) {
     gProp->propSetString(p, kOfxPropLabel, 0, "Mode");
     gProp->propSetString(p, kOfxParamPropChoiceOption, 0, "Report");
     gProp->propSetString(p, kOfxParamPropChoiceOption, 1, "Pass");
+    gProp->propSetString(p, kOfxParamPropChoiceOption, 2, "Working");
     return kOfxStatOK;
 }
 
@@ -330,6 +332,9 @@ static int propIs(OfxPropertySetHandle props, const char* name, const char* valu
     char* v = NULL;
     return gProp->propGetString(props, name, 0, &v) == kOfxStatOK && v && !strcmp(v, value);
 }
+
+/* The working colourspace the host gave when asked for the output's. */
+static char gWorking[64];
 
 static OfxStatus renderColour(OfxImageEffectHandle effect, OfxPropertySetHandle in) {
     OfxTime time;
@@ -349,7 +354,8 @@ static OfxStatus renderColour(OfxImageEffectHandle effect, OfxPropertySetHandle 
     gEffect->clipGetPropertySet(source, &clipProps);
     const int core = propIs(props, kOfxImageEffectPropColourManagementStyle, kOfxImageEffectColourManagementCore);
     const int linear = propIs(clipProps, kOfxImageClipPropColourspace, kOfxColourspaceACEScg);
-    const int report = colourMode(effect, time) == 0;
+    const int mode = colourMode(effect, time), report = mode == 0;
+    const int toldAcescct = !strcmp(gWorking, kOfxColourspaceACEScct);
     View o, s;
     viewOf(outImg, &o);
     viewOf(srcImg, &s);
@@ -358,6 +364,7 @@ static OfxStatus renderColour(OfxImageEffectHandle effect, OfxPropertySetHandle 
             const float* sp = pixel(&s, x, y);
             float* op = pixel(&o, x, y);
             if (report) op[0] = sp[0], op[1] = (float)core, op[2] = (float)linear, op[3] = 1;
+            else if (mode == 2) op[0] = sp[0], op[1] = (float)toldAcescct, op[2] = (float)linear, op[3] = 1;
             else op[0] = sp[0], op[1] = sp[1], op[2] = sp[2], op[3] = sp[3];
         }
     gEffect->clipReleaseImage(srcImg);
@@ -376,7 +383,11 @@ static OfxStatus mainColour(const char* action, const void* handle, OfxPropertyS
         return kOfxStatOK;
     }
     if (!strcmp(action, kOfxImageEffectActionGetOutputColourspace)) {
-        gProp->propSetString(out, kOfxImageClipPropColourspace, 0, colourMode(effect, 0) == 0 ? kOfxColourspaceOfxRaw : "OfxColourspace_Source");
+        char* working = NULL;
+        gWorking[0] = 0;
+        if (gProp->propGetString(in, kOfxImageClipPropPreferredColourspaces, 0, &working) == kOfxStatOK && working)
+            snprintf(gWorking, sizeof gWorking, "%s", working);
+        gProp->propSetString(out, kOfxImageClipPropColourspace, 0, colourMode(effect, 0) != 1 ? kOfxColourspaceOfxRaw : "OfxColourspace_Source");
         return kOfxStatOK;
     }
     if (!strcmp(action, kOfxImageEffectActionRender)) return renderColour(effect, in);

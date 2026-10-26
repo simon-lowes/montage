@@ -1,5 +1,6 @@
 #include "ModelPacks.h"
 
+#include <QApplication>
 #include <QDir>
 #include <QEventLoop>
 #include <QFile>
@@ -28,6 +29,9 @@
 #include "media/MotionDeblur.h"
 #include "media/SuperScale.h"
 #include "media/SpeechEnhance.h"
+#include "media/BandwidthExtension.h"
+#include "media/MediaPool.h"
+#include "audio/SpeechCleanup.h"
 
 namespace montage {
 
@@ -159,6 +163,7 @@ bool ensureModelPack(QWidget* parent, const ModelPack& pack, const QString& titl
     for (QTimer* t : dlg.findChildren<QTimer*>()) t->stop();
     dlg.close();
     if (!ok && !error.isEmpty()) QMessageBox::warning(parent, title, error);
+    if (ok && pack.installed()) retryCleanupsMissingModels();  // (sound left as it was for want of it)
     return ok && pack.installed();
 }
 
@@ -325,6 +330,12 @@ bool ensureEffectModel(QWidget* parent, const std::string& type) {
                                QObject::tr("AI frames for slow motion use RIFE 4.26 (MIT), downloaded from its authors' release. "
                                            "It runs on this computer."));
     }
+    if (type == "bandwidth_extension") {
+        if (bandwidthExtensionAvailable()) return true;  // (its models depend on the clip: ensureBandwidthModels)
+        QMessageBox::information(parent, QObject::tr("Bandwidth Extension"),
+                                 QObject::tr("This build of Montage cannot restore speech: it was built without ONNX Runtime."));
+        return false;
+    }
     if (type != "enhance_speech") return true;
     if (!speechEnhancerAvailable()) {
         QMessageBox::information(parent, QObject::tr("Enhance Speech"),
@@ -333,6 +344,34 @@ bool ensureEffectModel(QWidget* parent, const std::string& type) {
     }
     return ensureModelPack(parent, speechModel(), QObject::tr("Enhance Speech"),
                            QObject::tr("Enhance Speech uses DeepFilterNet3 (MIT or Apache-2.0), a speech model that runs on this computer."));
+}
+
+bool ensureBandwidthModels(QWidget* parent, const Project& p, const Sequence& s, const Clip& c) {
+    const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
+    if (!m || m->path.empty() || !bandwidthExtensionAvailable()) return true;
+    const Effect* e = nullptr;
+    for (const Effect& x : c.effects)
+        if (x.type == "bandwidth_extension") e = &x;
+    Effect probe;
+    probe.type = "bandwidth_extension";
+    if (!bandwidthExtensionApplies(e ? *e : probe, c)) return true;  // (a Music or Effects clip is left alone)
+    AudioBufferPtr sound;
+    {
+        QApplication::setOverrideCursor(Qt::WaitCursor);
+        sound = MediaPool::instance().audio(audioKey(m->path, c.channels), s.sampleRate);  // as the clip plays it
+        QApplication::restoreOverrideCursor();
+    }
+    if (!sound) return true;
+    const BweResult plan = bandwidthPlanFor(*sound, e ? e->p("cutoff_hz", 0, 0) : 0);
+    for (const BweCheckpoint& k : plan.plan)
+        if (!ensureModelPack(parent, bweModel(k), QObject::tr("Bandwidth Extension"),
+                             QObject::tr("The speech in this clip stops at %1 kHz. Bandwidth Extension rebuilds what is above with "
+                                         "AP-BWE (MIT), which runs on this computer, using its %2 to %3 kHz model.")
+                                 .arg(plan.cutoff / 1000, 0, 'f', 1)
+                                 .arg(k.low / 1000)
+                                 .arg(k.high / 1000)))
+            return false;
+    return true;
 }
 
 }  // namespace montage

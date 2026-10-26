@@ -1,4 +1,6 @@
 #include "MonitorPanel.h"
+
+#include "Accessibility.h"
 #include "Settings.h"
 
 #include "ExposureView.h"
@@ -569,6 +571,10 @@ MonitorPanel::MonitorPanel(Mode mode, EditorState* state, PlaybackController* co
     lay->addWidget(viewer_, 1);
     scrub_ = new ScrubBar(this);
     lay->addWidget(scrub_);
+    // To a screen reader: the monitor, with where it is and its marks.
+    access::describe(viewer_, {QAccessible::Graphic, [this] { return mode_ == Mode::Source ? tr("Source monitor") : tr("Program monitor"); },
+                               [this] { return accessibleSummary(); }, {}});
+    access::describe(scrub_, {QAccessible::Slider, [this] { return tr("Position"); }, [this] { return timecode_->text(); }, {}});
 
     auto* bar = new QHBoxLayout;
     bar->setSpacing(1);
@@ -870,6 +876,22 @@ void MonitorPanel::setHdrViewer(bool on) {
     on = on && hdrViewerBuilt();
     viewer_->setHdrViewer(on);
     controller_->setHdrOutput(on && viewer_->hdrStatus().isEmpty());
+}
+
+QString MonitorPanel::accessibleSummary() const {
+    const Sequence* s = state_->sequence();
+    FrameTime in = -1, out = -1;
+    if (mode_ == Mode::Source) {
+        in = state_->sourceIn();
+        out = state_->sourceOut();
+    } else if (s) {
+        in = s->inPoint;
+        out = s->outPoint;
+    }
+    auto mark = [s](FrameTime t) { return t < 0 ? tr("not set") : timecodeString(s, t); };
+    QString summary = tr("%1, In %2, Out %3").arg(timecode_->text(), mark(in), mark(out));
+    if (mode_ == Mode::Source && !state_->sourceMedia()) summary = tr("Nothing open");
+    return summary;
 }
 
 void MonitorPanel::refresh() {

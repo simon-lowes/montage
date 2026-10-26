@@ -7,6 +7,7 @@
 #include <cmath>
 #include <iterator>
 
+#include "Accessibility.h"
 #include "Theme.h"
 
 namespace montage {
@@ -53,6 +54,17 @@ AudioMeterWidget::AudioMeterWidget(QWidget* parent) : QWidget(parent) {
     timer_.setInterval(kTickMs);
     connect(&timer_, &QTimer::timeout, this, &AudioMeterWidget::tick);
     clock_.start();
+    // To a screen reader: the levels, and whether either channel clipped.
+    access::describe(this, {QAccessible::Indicator, [this] { return accessibleName().isEmpty() ? tr("Peak level") : accessibleName(); },
+                            [this] {
+                                auto level = [](const Channel& c) {
+                                    return c.level <= -60 ? tr("silent") : tr("%1 dB").arg(c.level, 0, 'f', 1);
+                                };
+                                QString v = tr("Left %1, right %2").arg(level(ch_[0]), level(ch_[1]));
+                                if (ch_[0].clip || ch_[1].clip) v += tr(", clipped");
+                                return v;
+                            },
+                            {}});
 }
 
 double AudioMeterWidget::dbToPosition(double db) {

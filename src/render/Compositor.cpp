@@ -1,4 +1,7 @@
 #include "Compositor.h"
+
+#include <optional>
+
 #include "AdaptiveHdr.h"
 #include "GrainMatch.h"
 #include "TrimPasses.h"
@@ -46,6 +49,7 @@
 #include "Retime.h"
 #include "Shapes.h"
 #include "Title3D.h"
+#include "ModelClip.h"
 #include "TemporalFx.h"
 #include "VideoDenoise.h"
 #include "audio/DialogueAlign.h"
@@ -816,9 +820,10 @@ void applyDenoise(const Effect& e, FrameTime lt, Image& src, const std::vector<I
 }
 
 // Replace Grain's taking the plate's grain out (render/GrainMatch removeGrain), within the Grain Match's mask when it has one.
+// (`space` the picture's; `measured` the one its grain was measured in, the sequence's)
 void applyRemoveGrain(const Effect& e, FrameTime lt, Image& src, const std::vector<const Image*>& around, const std::vector<MotionFn>& motion,
-                      const ColorSpace& space, double pixelScale, double sourceSeconds) {
-    const Image clean = removeGrain(src, around, motion, space, effectGrainProfile(e));
+                      const ColorSpace& space, const ColorSpace& measured, double pixelScale, double sourceSeconds) {
+    const Image clean = removeGrain(src, around, motion, space, grainProfileIn(effectGrainProfile(e), measured, space));
     if (!hasMask(e, lt)) {
         src = clean;
         return;
@@ -989,19 +994,60 @@ struct ClipSource {
     std::string sourcePath;     // the video file, for its analysed depth (media/VideoDepth.h); "" for any other picture
     std::string exrFile;        // the OpenEXR file the frame was read from (its Cryptomattes), "" for any other
     ofx::FrameFetch ofxFetch;   // the clip's source at other clip frames, for OpenFX plugins that ask (render/Ofx.h)
+    bool displayReferred = false;  // graded scene-referred, it came in through the inverse output transform
 };
 
+// A picture in `from` into a sequence graded scene-referred: a scene-referred one exactly, a display-referred one
+// (graphics, video made for a display) as it shows on the display the frame is for, back through that display's output
+// transform (so it comes out as it went in); into the working space, or with `light` the linear light it is composited in.
+void intoGrading(Image& img, const ColorSpace& from, const SceneGrading& sg, bool light = false) {
+    const ColorSpace& to = light ? *sg.linear : *sg.working;
+    if (from.sceneReferred) {
+        convertExactly(img, from, to);
+        return;
+    }
+    convertColor(img, from, *sg.display, sg.peakNits);
+    inverseOutputTransform(img, *sg.display, to, sg.peakNits, sg.kind);
+}
+
+// A picture in `from` into the space the sequence's clips are graded in (render/ColorSpace.h workingColorSpace); true
+// when it came in display-referred, through the inverse output transform.
+bool intoWorking(Image& img, const ColorSpace& from, const Sequence& seq, bool light = false) {
+    if (const SceneGrading* sg = currentSceneGrading()) {
+        intoGrading(img, from, *sg, light);
+        return !from.sceneReferred;
+    }
+    convertColor(img, from, sequenceColorSpace(seq), seq.hdrPeakNits);
+    return false;
+}
+
 // The input transform: a picture in its media's space into the sequence's working space, by its adaptive HDR metadata
-// when it has some that matters there.
-void inputTransform(Image& img, const ColorSpace& from, const AdaptiveHdr* adaptive, const Sequence& seq) {
-    if (adaptive) convertColorAdaptive(img, from, *adaptive, sequenceColorSpace(seq), seq.hdrPeakNits);
-    else convertColor(img, from, sequenceColorSpace(seq), seq.hdrPeakNits);
+// when it has some that matters there (true as intoWorking says).
+bool inputTransform(Image& img, const ColorSpace& from, const AdaptiveHdr* adaptive, const Sequence& seq) {
+    if (!adaptive) return intoWorking(img, from, seq);
+    convertColorAdaptive(img, from, *adaptive, sequenceColorSpace(seq), seq.hdrPeakNits);
+    return false;
+}
+
+// Graded scene-referred, a layer in the light it is composited in (or a clip's picture in the working space, `from`) as
+// the frame's display shows it (what mattes, depth maps and the models that find people, faces and depth are made to
+// read); else as it is.
+Image asShown(Image img, const ColorSpace* from = nullptr) {
+    if (const SceneGrading* sg = currentSceneGrading())
+        outputTransform(img, from ? *from : *sg->linear, *sg->display, sg->peakNits, sg->kind, sg->exact);
+    return img;
+}
+
+// The display a frame of `seq` is for: the one a scene-referred grade renders it for, else its delivery space.
+const ColorSpace& frameDisplay(const Sequence& seq) {
+    const SceneGrading* sg = currentSceneGrading();
+    return sg ? *sg->display : sequenceColorSpace(seq);
 }
 
 // The metadata of a media file's frame at `seconds` that changes how it enters `seq` (not its proxy's, nor when its
 // colour is interpreted by hand).
 const AdaptiveHdr* clipAdaptiveHdr(const MediaItem& m, const std::string& path, double seconds, const Sequence& seq) {
-    if (m.kind != MediaKind::Video || path != m.path || !m.colorOverride.empty()) return nullptr;
+    if (m.kind != MediaKind::Video || path != m.path || !m.colorOverride.empty() || sceneReferredWorking(seq)) return nullptr;
     const AdaptiveHdr* md = adaptiveHdrAt(m, seconds);
     return md && adaptiveConverts(*md, mediaColorSpace(m), sequenceColorSpace(seq), seq.hdrPeakNits) ? md : nullptr;
 }
@@ -1030,6 +1076,20 @@ bool sourceStageLooks(const Clip& c, FrameTime lt, const ColorSpace& from, const
     return false;
 }
 
+Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, const Image* below = nullptr,
+                bool* displayReferred = nullptr);
+
+// A track's picture at t for a 3D model's image-based light (render/ModelClip.h).
+std::function<Image(int)> modelLightLayer(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o) {
+    return [&p, &seq, t, o](int track) {
+        if (track < 0 || size_t(track) >= seq.videoTracks.size()) return Image();
+        for (const Clip& lc : seq.videoTracks[size_t(track)].clips)
+            if (lc.enabled && t >= lc.start && t < lc.end() && !(lc.isGenerator() && lc.generator.type == "model3d"))
+                return clipLayer(p, seq, lc, t, o, nullptr);
+        return Image();
+    };
+}
+
 // False when the clip has no picture.
 bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o, const Image* below,
                 bool deferFrame, ClipSource& out) {
@@ -1056,20 +1116,26 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
     std::string& exrFile = out.exrFile;
     ofx::FrameFetch& ofxFetch = out.ofxFetch;
     if (c.isGenerator() && c.generator.type == "adjustment") {
-        // An adjustment layer's picture is the composite beneath it (already in the working space).
+        // An adjustment layer's picture is the composite beneath it (already in the working space; or, graded
+        // scene-referred, in the light layers are composited in).
         if (!below || below->empty()) return false;
         g = clipGeometry(c, lt, SW, SH, SW, SH, seq.fpsValue());
         src = *below;
+        if (const SceneGrading* sg = currentSceneGrading()) convertExactly(src, *sg->linear, *sg->working);
     } else if (c.isGenerator()) {
         g = clipGeometry(c, lt, SW, SH, SW, SH, seq.fpsValue());
         int w, h;
         sourceSize(g, o.scale, int(SW * 4), int(SH * 4), w, h);
-        src = c.generator.type == "audio_viz" ? renderAudioVisualiser(p, seq, c, t, w, h)
+        std::string modelError;
+        src = c.generator.type == "model3d"     ? renderModelClip(p, seq, c, t, w, h, double(w) / SW, modelLightLayer(p, seq, t, o), nullptr, &modelError)
+              : c.generator.type == "audio_viz" ? renderAudioVisualiser(p, seq, c, t, w, h)
               : c.generator.type == "ograf"   ? ografFrame(c.generator, lt, w, h, SW, SH, c.duration, seq.fpsValue())
               : c.generator.type == "particles" ? renderParticles(c.generator, lt, w, h, SW, SH, seq.fpsValue())
                                               : renderGenerator(c.generator, lt, w, h, double(w) / SW, c.duration, seq.fpsValue());
-        // Titles and mattes are authored in SDR: graphics white sits at HDR reference white.
-        convertColor(src, rec709Space(), sequenceColorSpace(seq), seq.hdrPeakNits);
+        if (!modelError.empty() && o.issues) o.issues->note(modelError);
+        // Titles and mattes are authored in SDR: graphics white sits at HDR reference white (graded scene-referred, back
+        // through the output transform, so a white title stays white).
+        out.displayReferred = intoWorking(src, rec709Space(), seq);
     } else {
         const MediaItem* m = p.findMedia(c.mediaId);
         if (!m) return false;
@@ -1090,16 +1156,24 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             RenderOptions no = o;
             no.depth = o.depth + 1;
             no.scale = double(w) / nested->width;
+            // Into a sequence graded scene-referred it comes in its working space; graded so itself, into another it
+            // comes through its output transform for this sequence's space.
+            const bool scene = currentSceneGrading() != nullptr, nestedScene = sceneReferredWorking(*nested);
+            no.sceneLight = scene;
+            no.outputSpace = !scene && nestedScene ? sequenceColorSpace(seq).id : std::string();
+            no.outputPeak = seq.hdrPeakNits;
+            const ColorSpace& nestedSpace = scene ? (nestedScene ? linearColorSpace(workingColorSpace(*nested).primaries) : sequenceColorSpace(*nested))
+                                            : nestedScene ? sequenceColorSpace(seq) : sequenceColorSpace(*nested);
             if (nested->multicam) no.soloVideoTrack = std::clamp(c.angle, 0, std::max(0, int(nested->videoTracks.size()) - 1));
             FrameTime nf = FrameTime(std::floor(c.sourceFrameAt(t) * nested->fpsValue() / seq.fpsValue() + 1e-6));
             src = renderSequenceFrame(p, *nested, nf, no);
             if (const Effect* rg = replaceGrainEffect(seq, c); rg && !src.empty())
-                applyRemoveGrain(*rg, lt, src, {}, {}, sequenceColorSpace(*nested), effectPixelScale(c, lt, g.sx, mw, src.width), -1);
+                applyRemoveGrain(*rg, lt, src, {}, {}, nestedSpace, sequenceColorSpace(seq), effectPixelScale(c, lt, g.sx, mw, src.width), -1);
             else if (const Effect* nr = denoiseEffect(seq, c); nr && !src.empty())
                 applyDenoise(*nr, lt, src, {}, {}, effectPixelScale(c, lt, g.sx, mw, src.width), -1);
             if (const Effect* db = enabledEffect(seq, c, "motion_deblur")) applyMotionDeblur(*db, lt, o, src);
             if (const Effect* ls = enabledEffect(seq, c, "lip_sync")) applyLipSync(p, seq, c, *ls, lt, o, src);
-            convertColor(src, sequenceColorSpace(*nested), sequenceColorSpace(seq), seq.hdrPeakNits);
+            out.displayReferred = intoWorking(src, nestedSpace, seq);
         } else if (m->kind == MediaKind::Video || m->kind == MediaKind::Image) {
             if (!m->hasVideo && m->kind != MediaKind::Image) return false;
             std::string path = pictureSource(*m, o.useProxies, o.offlineProxies);  // (viewing: an offline file plays its proxy)
@@ -1120,7 +1194,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 if (!proxy || fileOnline(m->path)) path = layerPath(proxy ? m->path : path, c.layer);
             }
             // A gain-map JPEG in an SDR sequence: its own SDR picture, rather than its HDR rendition tone mapped.
-            if (m->gainMap && path == m->path && m->colorOverride.empty() && !sequenceColorSpace(seq).hdr()) path = gainMapPath(path, false);
+            if (m->gainMap && path == m->path && m->colorOverride.empty() && !frameDisplay(seq).hdr()) path = gainMapPath(path, false);
             const bool original = m->proxyPath.empty() || path != m->proxyPath;  // the file itself, not its proxy
             mw = m->width > 0 ? m->width : SW;
             mh = m->height > 0 ? m->height : SH;
@@ -1175,10 +1249,11 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 const ColorSpace* from = &pictureColorSpace(*m, path);
                 const ColorSpace* to = &sequenceColorSpace(seq);
                 const double peak = seq.hdrPeakNits;
+                const std::optional<SceneGrading> grading = currentSceneGrading() ? std::optional(*currentSceneGrading()) : std::nullopt;
                 MediaItem media;  // (what the neighbours' adaptive HDR metadata needs)
                 media.kind = m->kind, media.path = m->path, media.colorSpace = m->colorSpace, media.colorOverride = m->colorOverride;
                 media.fps = m->fps, media.adaptiveHdr = m->adaptiveHdr;
-                ofxFetch = [path, w, h, hq, clipCopy, duration, frameSeconds, seqFps, from, to, peak, media](double at, Image& out) {
+                ofxFetch = [path, w, h, hq, clipCopy, duration, frameSeconds, seqFps, from, to, peak, media, grading](double at, Image& out) {
                     const FrameTime local = FrameTime(std::floor(at + 1e-6));
                     if (local < 0 || local >= clipCopy.duration) return false;
                     const double s = std::clamp(clipCopy.sourceFrameAt(clipCopy.start + local) / seqFps, 0.0, std::max(0.0, duration - frameSeconds * 0.5));
@@ -1186,7 +1261,8 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     if (!frame) return false;
                     out = toImage(*frame);
                     const AdaptiveHdr* md = path == media.path && media.colorOverride.empty() ? adaptiveHdrAt(media, s) : nullptr;
-                    if (md && adaptiveConverts(*md, *from, *to, peak)) convertColorAdaptive(out, *from, *md, *to, peak);
+                    if (grading) intoGrading(out, *from, *grading);
+                    else if (md && adaptiveConverts(*md, *from, *to, peak)) convertColorAdaptive(out, *from, *md, *to, peak);
                     else convertColor(out, *from, *to, peak);
                     return true;
                 };
@@ -1341,7 +1417,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                 if (const Effect* rg = replaceGrainEffect(seq, c)) {
                     std::vector<const Image*> nb;
                     for (const Image& im : around) nb.push_back(&im);
-                    applyRemoveGrain(*rg, lt, src, nb, motion, mediaColorSpace(*m), effectPixelScale(c, lt, g.sx, mw, src.width),
+                    applyRemoveGrain(*rg, lt, src, nb, motion, mediaColorSpace(*m), sequenceColorSpace(seq), effectPixelScale(c, lt, g.sx, mw, src.width),
                                      m->kind == MediaKind::Video ? sec : -1);
                 } else {
                     applyDenoise(*nr, lt, src, around, motion, effectPixelScale(c, lt, g.sx, mw, src.width),
@@ -1499,7 +1575,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
                     applyAcesGamutCompress(e, lt, from, src);
                 }
             // Input transform: the media's space (or its proxy's) into the sequence's working space.
-            inputTransform(src, from, out.adaptive, seq);
+            out.displayReferred = inputTransform(src, from, out.adaptive, seq);
         } else {
             return false;
         }
@@ -1514,7 +1590,7 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
     Image& src = cs.src;
     if (cs.frame) {  // (left as decoded)
         src = toImage(*cs.frame);
-        inputTransform(src, *cs.frameSpace, cs.adaptive, seq);
+        cs.displayReferred = inputTransform(src, *cs.frameSpace, cs.adaptive, seq);
         cs.frame.reset();
     }
     const Effect* sourceCdl = cs.sourceCdl;
@@ -1531,17 +1607,19 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
     const double pixelScale = effectPixelScale(c, lt, g.sx, mw, src.width);
     // Its colour group's pre-clip grade, its own effects, then the group's post-clip grade (core/ColorGroups.h).
     const std::vector<const Effect*> chain = gradeChain(seq, c);
+    // (The models below read the picture as shown.)
+    const SceneGrading* scene = currentSceneGrading();
     // The picture's depth, once, for the effects that work by distance.
     std::shared_ptr<const DepthMap> depth;
     // (The clip's analysed depth where it has one, steady through the shot: not of a reframed view or the other eye.)
     if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsDepth(*e, lt); }))
-        depth = frameDepth(src, reframed ? std::string() : cs.sourcePath, sourceSeconds);
+        depth = frameDepth(scene ? asShown(src, scene->working) : src, reframed ? std::string() : cs.sourcePath, sourceSeconds);
     DepthScope depthScope(depth);
     // And the people in it, for Remove Background and People masks.
     std::shared_ptr<const ValueMap> people;
     if (std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsPersonMatte(*e, lt); }) && mattingAvailable() &&
         mattingModel().installed())
-        people = cachedPersonMatte(src);
+        people = cachedPersonMatte(scene ? asShown(src, scene->working) : src);
     PersonScope personScope(people);
     // And the OpenEXR file the frame came from, for Cryptomatte masks.
     CryptomatteScope cryptoScope(std::any_of(chain.begin(), chain.end(), [&](const Effect* e) { return needsCryptomatte(*e, lt); }) ? cs.exrFile : std::string());
@@ -1553,8 +1631,9 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
                     [&](const Effect* e) { return e->type == "redact_faces" ? redactNeedsLiveFaces(*e, sourceSeconds) : needsFaces(*e); }) &&
         faceSearchAvailable() &&
         faceModel().installed())
-        faces = cachedFaces(src);
+        faces = cachedFaces(scene ? asShown(src, scene->working) : src);
     FaceScope faceScope(faces);
+    SlowEffectsScope slowScope({o.highQuality || o.slowEffects, o.cancel, o.issues});
     ofx::FetchScope fetchScope(ofxFetch);
     // Faces are covered first, where they are in the source, whatever moves the picture after (Stabilize, transforms).
     // (Its colour group's, and its own and its shared nodes' that take part.)
@@ -1603,17 +1682,73 @@ Image finishClipLayer(const Sequence& seq, const Clip& c, const RenderOptions& o
             const double half = s3d->p("depth", lt, 0) / 100.0 * SW / 2;
             g.px += o.eye ? half : -half;
         }
+    // Graded scene-referred, layers are composited in light (dissolves and blend modes mix light).
+    if (const SceneGrading* sg = currentSceneGrading()) convertExactly(src, *sg->working, *sg->linear);
     if (identityLayer(src, g, SW, seq.height, o.scale)) return std::move(src);  // a full-frame clip: no copy
     return transformLayer(src, g, SW, seq.height, o.scale);
 }
 
-// `below` is what the tracks under the clip have made so far, for adjustment layers.
+// `below` is what the tracks under the clip have made so far, for adjustment layers; `displayReferred` is told whether
+// the layer came in display-referred (graded scene-referred: graphics, a display-referred clip).
 Image clipLayer(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, const RenderOptions& o,
-                const Image* below = nullptr) {
+                const Image* below, bool* displayReferred) {
     ExpressionScope expressions(&p, &seq, &c, o.cancel);  // (core/Expression.h)
     ClipSource cs;
     if (!clipSource(p, seq, c, t, o, below, false, cs)) return {};
-    return finishClipLayer(seq, c, o, cs);
+    Image layer = finishClipLayer(seq, c, o, cs);
+    if (displayReferred) *displayReferred = cs.displayReferred;
+    return layer;
+}
+
+// Blend modes that mean the same on light of any brightness (the rest are made for values from 0 to 1).
+bool blendsLight(const std::string& mode) {
+    return mode == "normal" || mode == "add" || mode == "multiply" || mode == "subtract" || mode == "difference" ||
+           mode == "darken" || mode == "lighten";
+}
+
+// A layer blended onto the canvas in a sequence graded scene-referred, both in the light layers are composited in. A
+// display-referred layer (graphics, a display-referred clip) is mixed with what is beneath as the display shows them, so
+// it fades, and its edges soften, as it was made to (in light its white, the top of the output transform's range, would
+// outshine anything beneath until it was nearly gone); a scene layer is mixed in light, or for a blend mode made for
+// values from 0 to 1 on the log values of the working primaries.
+void blendGraded(Image& canvas, const Image& layer, const std::string& mode, bool displayReferred, const SceneGrading& sg) {
+    if (!displayReferred && blendsLight(mode)) {
+        blendOnto(canvas, layer, mode, 1.0f);
+        return;
+    }
+    if (layer.width != canvas.width || layer.height != canvas.height) return;
+    // Only where the layer is: the rest of the canvas is left as it was, and where it is solid (normal), it is the layer
+    // as it came. The pixels that mix are gathered, mixed in the values they mix in and put back.
+    const bool normal = mode == "normal";
+    const size_t n = size_t(canvas.width) * size_t(canvas.height);
+    std::vector<size_t> mixed;
+    for (size_t i = 0; i < n; ++i) {
+        const float a = layer.px[i * 4 + 3];
+        if (!(a > 0)) continue;
+        if (normal && a >= 1) std::copy_n(&layer.px[i * 4], 4, &canvas.px[i * 4]);
+        else mixed.push_back(i);
+    }
+    if (mixed.empty()) return;
+    const int w = int(std::min<size_t>(mixed.size(), 1024)), h = int((mixed.size() + size_t(w) - 1) / size_t(w));
+    Image under(w, h), over(w, h);
+    for (size_t k = 0; k < mixed.size(); ++k) {
+        std::copy_n(&canvas.px[mixed[k] * 4], 4, &under.px[k * 4]);
+        std::copy_n(&layer.px[mixed[k] * 4], 4, &over.px[k * 4]);
+    }
+    if (displayReferred) {
+        // (Worked out exactly both ways, so the table's error is not magnified going back.)
+        outputTransform(under, *sg.linear, *sg.display, sg.peakNits, sg.kind, true);
+        outputTransform(over, *sg.linear, *sg.display, sg.peakNits, sg.kind, true);
+        blendOnto(under, over, mode, 1.0f);
+        inverseOutputTransform(under, *sg.display, *sg.linear, sg.peakNits, sg.kind);
+    } else {
+        const ColorSpace& log = logColorSpace(sg.linear->primaries);
+        convertExactly(under, *sg.linear, log);
+        convertExactly(over, *sg.linear, log);
+        blendOnto(under, over, mode, 1.0f);
+        convertExactly(under, log, *sg.linear);
+    }
+    for (size_t k = 0; k < mixed.size(); ++k) std::copy_n(&under.px[k * 4], 4, &canvas.px[mixed[k] * 4]);
 }
 
 const Clip* findClip(const Track& t, Id id) {
@@ -1687,6 +1822,9 @@ std::vector<bool> hiddenMatteTracks(const Sequence& seq, FrameTime t) {
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
             if (const Effect* e = enabledEffect(seq, *c, "deep_holdout"); e && e->p("hide", t - c->start, 0) > 0.5)
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) hidden[size_t(m)] = true;
+            // The picture lighting a 3D model.
+            if (c->isGenerator() && c->generator.type == "model3d" && c->generator.p("env_hide", t - c->start, 1) > 0.5)
+                if (const int m = modelLightTrack(seq, ti, *c, t); m >= 0) hidden[size_t(m)] = true;
         }
     return hidden;
 }
@@ -1695,30 +1833,51 @@ namespace {
 
 // A transition's picture at t (from to `to` on its track), on the CPU.
 // (`finish`, when given, does what compositing does to each clip's layer at the time it shows: Sky Replacement)
+// (`displayReferred`, when given, is told whether the picture is mixed as the display shows it: graded scene-referred,
+// a transition from or to a display-referred clip is, as blendGraded mixes such layers)
 Image transitionLayer(const Project& p, const Sequence& seq, const Track& track, const Transition& tr, FrameTime from, FrameTime to,
                       FrameTime t, const RenderOptions& o, const Image* below, int W, int H,
-                      const std::function<void(const Clip&, FrameTime, Image&)>& finish = {}) {
+                      const std::function<void(const Clip&, FrameTime, Image&)>& finish = {}, bool* displayReferred = nullptr) {
     const Clip* A = findClip(track, tr.clipA);
     const Clip* B = findClip(track, tr.clipB);
     const double u = (double(t - from) + 0.5) / double(std::max<FrameTime>(1, to - from));
+    bool shown = false;
     auto layerOf = [&](const Clip& c, FrameTime at) {
-        Image l = clipLayer(p, seq, c, at, o, below);
+        bool display = false;
+        Image l = clipLayer(p, seq, c, at, o, below, &display);
         if (finish) finish(c, at, l);
+        shown |= display;
         return l;
     };
+    if (displayReferred) *displayReferred = false;
     if (tr.type == "smooth_cut" && A && A->enabled && B && B->enabled) {
         // The first frame of the transition morphs into its last along their optical flow
         // (the pair is the same throughout, so its flow is measured once).
         Image la = layerOf(*A, from), lb = layerOf(*B, to - 1);
-        if (la.width == W && la.height == H && lb.width == W && lb.height == H)
-            return interpolateFrames(la, lb, u,
-                                     "smooth#" + std::to_string(tr.id) + '@' + std::to_string(from) + '-' + std::to_string(to) + '#' +
-                                         std::to_string(W) + 'x' + std::to_string(H) + (o.eye ? "#R" : ""));
-        return transitionMix("cross_dissolve", tr.params, la, lb, u, W, H);
+        // (Graded scene-referred with a display-referred side, morphed as the display shows them, as below.)
+        const SceneGrading* sg = shown ? currentSceneGrading() : nullptr;
+        if (sg)
+            for (Image* l : {&la, &lb}) outputTransform(*l, *sg->linear, *sg->display, sg->peakNits, sg->kind, true);
+        Image mix = la.width == W && la.height == H && lb.width == W && lb.height == H
+                        ? interpolateFrames(la, lb, u,
+                                            "smooth#" + std::to_string(tr.id) + '@' + std::to_string(from) + '-' + std::to_string(to) + '#' +
+                                                std::to_string(W) + 'x' + std::to_string(H) + (o.eye ? "#R" : "") + (sg ? "#shown" : ""))
+                        : transitionMix("cross_dissolve", tr.params, la, lb, u, W, H);
+        if (sg) {
+            inverseOutputTransform(mix, *sg->display, *sg->linear, sg->peakNits, sg->kind);
+            if (displayReferred) *displayReferred = true;
+        }
+        return mix;
     }
     Image la = (A && A->enabled) ? layerOf(*A, t) : Image();
     Image lb = (B && B->enabled) ? layerOf(*B, t) : Image();
-    return transitionMix(tr.type, tr.params, la, lb, u, W, H);
+    const SceneGrading* sg = currentSceneGrading();
+    if (!sg || !shown) return transitionMix(tr.type, tr.params, la, lb, u, W, H);
+    for (Image* l : {&la, &lb}) outputTransform(*l, *sg->linear, *sg->display, sg->peakNits, sg->kind, true);
+    Image mix = transitionMix(tr.type, tr.params, la, lb, u, W, H);
+    inverseOutputTransform(mix, *sg->display, *sg->linear, sg->peakNits, sg->kind);
+    if (displayReferred) *displayReferred = true;
+    return mix;
 }
 
 const Transition* activeTransition(const Track& track, FrameTime t, FrameTime& from, FrameTime& to) {
@@ -1765,6 +1924,14 @@ void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c,
     Image sky;
     if (std::lround(sr->p("source", lt, 0)) == 0)
         if (const int m = matteTrack(seq, ti, c, *sr, t); m >= 0) sky = trackPicture(p, seq, size_t(m), t, o, W, H);
+    // Graded scene-referred, the sky is found and matched on the pictures as shown, and the layer taken back into light
+    // (as the effects made for display values are).
+    const SceneGrading* sg = currentSceneGrading();
+    auto shown = [sg](Image& img) {
+        if (sg && !img.empty()) outputTransform(img, *sg->linear, *sg->display, sg->peakNits, sg->kind, true);
+    };
+    shown(layer);
+    shown(sky);
     // A mask on the effect is drawn over the clip's own frame, as every effect's is: made there, from the layer seen
     // back through the clip's transform, and carried onto the canvas the same way (so a moved, turned or keyed picture
     // keeps it in place).
@@ -1826,6 +1993,7 @@ void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c,
         shot.frame = [&, inClip](int offset, Image& other, std::shared_ptr<const ValueMap>& otherDepth) {
             if (!inClip(offset)) return false;
             other = clipLayer(p, seq, c, t + offset, o);
+            shown(other);
             if (other.width != layer.width || other.height != layer.height) return false;
             if (sr->p("use_depth", lt, 1) > 0.5) otherDepth = analysedOnLayer(t + offset, other.width, other.height);
             return true;
@@ -1838,6 +2006,7 @@ void replaceSky(const Project& p, const Sequence& seq, size_t ti, const Clip& c,
     }
     applySkyReplacement(seq, c, *sr, lt, layer, &sky, o.scale, c.sourceFrameAt(t) / seq.fpsValue(), mask.empty() ? nullptr : &mask, depth.get(),
                         shot);
+    if (sg) inverseOutputTransform(layer, *sg->display, *sg->linear, sg->peakNits, sg->kind);
 }
 
 }  // namespace
@@ -1867,14 +2036,18 @@ std::string clipDeepFile(const Project& p, const Sequence& seq, const Clip& c, F
 
 // Whether a clip's picture takes part in the depth merge (or is flattened on its own, `flattened`).
 bool isDeepClip(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, bool* flattened = nullptr) {
-    const bool deep = enabledEffect(seq, c, "make_deep") || !clipDeepFile(p, seq, c, t).empty();
+    const bool deep = enabledEffect(seq, c, "make_deep") ||
+                      (c.isGenerator() && c.generator.type == "model3d" && c.generator.p("depth_merge", t - c.start, 0) > 0.5) ||
+                      !clipDeepFile(p, seq, c, t).empty();
     if (flattened) *flattened = deep && enabledEffect(seq, c, "flatten_deep");
     return deep;
 }
 
-// Samples' colours from a picture's space into the sequence's working space (straight, a million at a time).
+// Samples' colours from a picture's space into the sequence's working space (straight, a million at a time); graded
+// scene-referred, into the light layers are composited in.
 void deepIntoWorkingSpace(DeepFrame& f, const ColorSpace& from, const Sequence& seq) {
-    const ColorSpace& to = sequenceColorSpace(seq);
+    const SceneGrading* sg = currentSceneGrading();
+    const ColorSpace& to = sg ? *sg->linear : sequenceColorSpace(seq);
     if (&from == &to) return;
     constexpr size_t chunk = size_t(1) << 20;
     for (size_t at = 0; at < f.samples.size(); at += chunk) {
@@ -1886,7 +2059,7 @@ void deepIntoWorkingSpace(DeepFrame& f, const ColorSpace& from, const Sequence& 
             float* q = img.px.data() + i * 4;
             q[0] = s.r * k, q[1] = s.g * k, q[2] = s.b * k, q[3] = 1;
         }
-        convertColor(img, from, to, seq.hdrPeakNits);
+        intoWorking(img, from, seq, true);
         for (size_t i = 0; i < n; ++i) {
             DeepSample& s = f.samples[at + i];
             const float k = s.a > 1e-6f ? s.a : 1;
@@ -1907,7 +2080,32 @@ DeepFrame clipDeepFrame(const Project& p, const Sequence& seq, size_t ti, const 
     ExpressionScope expressions(&p, &seq, &c, o.cancel);  // (core/Expression.h)
     const FrameTime lt = t - c.start;
     DeepFrame f;
-    if (const Effect* md = enabledEffect(seq, c, "make_deep")) {
+    // The clip's transform as sequence pixels to its own frame's (0..1), for `resampleDeep`.
+    auto throughTransform = [&](const DeepFrame& src, double opacity) {
+        double u0, v0, u1, v1, u2, v2;
+        sequenceToClipFrame(p, seq, c, t, 0, 0, u0, v0);
+        sequenceToClipFrame(p, seq, c, t, 1, 0, u1, v1);
+        sequenceToClipFrame(p, seq, c, t, 0, 1, u2, v2);
+        const double s = o.scale > 0 ? o.scale : 1;
+        const int sw = src.width, sh = src.height;
+        return resampleDeep(src, W, H, [&](double x, double y, double& u, double& v) {
+            const double X = x / s, Y = y / s;
+            u = (u0 + (u1 - u0) * X + (u2 - u0) * Y) * sw;
+            v = (v0 + (v1 - v0) * X + (v2 - v0) * Y) * sh;
+        }, float(opacity));
+    };
+    if (c.isGenerator() && c.generator.type == "model3d" && !enabledEffect(seq, c, "make_deep")) {
+        // A 3D model at its own depths, through the clip's transform and opacity.
+        std::vector<float> depth;
+        std::string error;
+        Geometry g;
+        if (!clipGeometry(p, seq, c, t, g)) return DeepFrame::blank(W, H);
+        Image layer = renderModelClip(p, seq, c, t, W, H, double(W) / seq.width, modelLightLayer(p, seq, t, o), &depth, &error);
+        if (!error.empty() && o.issues) o.issues->note(error);
+        if (layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
+        intoWorking(layer, rec709Space(), seq, true);
+        f = throughTransform(deepFromFlat(layer.px.data(), W, H, depth.data(), 0), g.opacity);
+    } else if (const Effect* md = enabledEffect(seq, c, "make_deep")) {
         Image layer = clipLayer(p, seq, c, t, o, nullptr);
         if (layer.empty() || layer.width != W || layer.height != H) return DeepFrame::blank(W, H);
         const int source = int(std::lround(md->p("source", lt, 0)));
@@ -1920,12 +2118,12 @@ DeepFrame clipDeepFrame(const Project& p, const Sequence& seq, size_t ti, const 
         if (source == 0) {
             const int m = matteTrack(seq, ti, c, *md, t);
             const Clip* mc = m >= 0 ? clipAt(seq.videoTracks[size_t(m)], t) : nullptr;
-            const Image dm = mc ? clipLayer(p, seq, *mc, t, o, nullptr) : Image();
+            const Image dm = mc ? asShown(clipLayer(p, seq, *mc, t, o, nullptr)) : Image();
             if (dm.width != W || dm.height != H) return DeepFrame::blank(W, H);  // no depth map now: nothing
             for (int y = 0; y < H; ++y)
                 for (int x = 0; x < W; ++x) depth[size_t(y) * size_t(W) + size_t(x)] = toDepth(lumaOf(dm.at(x, y)));
         } else if (source == 1) {
-            const std::shared_ptr<const DepthMap> d = depthAvailable() && depthModel().installed() ? cachedDepth(layer) : nullptr;
+            const std::shared_ptr<const DepthMap> d = depthAvailable() && depthModel().installed() ? cachedDepth(asShown(layer)) : nullptr;
             if (!d) {
                 if (o.issues) o.issues->note("Make Deep from Depth Map needs the depth model");
                 return DeepFrame::blank(W, H);
@@ -1940,18 +2138,7 @@ DeepFrame clipDeepFrame(const Project& p, const Sequence& seq, size_t ti, const 
         const std::shared_ptr<const DeepFrame> src = file.empty() ? nullptr : cachedDeepExr(file);
         Geometry g;
         if (!src || !clipGeometry(p, seq, c, t, g)) return DeepFrame::blank(W, H);
-        // The clip's transform, as sequence pixels to the deep frame's.
-        double u0, v0, u1, v1, u2, v2;
-        sequenceToClipFrame(p, seq, c, t, 0, 0, u0, v0);
-        sequenceToClipFrame(p, seq, c, t, 1, 0, u1, v1);
-        sequenceToClipFrame(p, seq, c, t, 0, 1, u2, v2);
-        const double s = o.scale > 0 ? o.scale : 1;
-        const int sw = src->width, sh = src->height;
-        f = resampleDeep(*src, W, H, [&](double x, double y, double& u, double& v) {
-            const double X = x / s, Y = y / s;
-            u = (u0 + (u1 - u0) * X + (u2 - u0) * Y) * sw;
-            v = (v0 + (v1 - v0) * X + (v2 - v0) * Y) * sh;
-        }, float(g.opacity));
+        f = throughTransform(*src, g.opacity);
         deepIntoWorkingSpace(f, pictureColorSpace(*m, m->path), seq);
     }
     for (const Effect* e : liveEffects(seq, c)) {
@@ -2045,7 +2232,30 @@ DeepLayers deepLayers(const Project& p, const Sequence& seq, FrameTime t, const 
 
 Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& opts) {
     ExpressionScope expressions(&p, &seq, nullptr, opts.cancel);  // (core/Expression.h)
-    const WorkingSpaceScope working(&sequenceColorSpace(seq));  // effects that work in light know whose
+    // Graded scene-referred (render/ColorSpace.h): clips graded in the working space, layers composited in its light,
+    // the frame made for one display (the one asked for, the one a sequence it is in is made for, else its delivery
+    // space) and delivered through that display's output transform.
+    const bool scene = sceneReferredWorking(seq);
+    const SceneGrading* outer = currentSceneGrading();
+    const ColorSpace* asked = opts.outputSpace.empty() ? nullptr : findColorSpace(opts.outputSpace);
+    SceneGrading grading;
+    if (scene) {
+        grading.working = &workingColorSpace(seq);
+        grading.linear = &linearColorSpace(grading.working->primaries);
+        grading.kind = outputTransformKind(seq);
+        grading.exact = opts.highQuality;
+        if (asked && !asked->sceneReferred) {
+            grading.display = asked;
+            grading.peakNits = opts.outputPeak > 0 ? opts.outputPeak : seq.hdrPeakNits;
+        } else if (outer && !asked) {
+            grading.display = outer->display, grading.peakNits = outer->peakNits, grading.kind = outer->kind;
+        } else {
+            grading.display = &sequenceColorSpace(seq);
+            grading.peakNits = seq.hdrPeakNits;
+        }
+    }
+    const SceneGradingScope gradingScope(scene ? &grading : nullptr);
+    const WorkingSpaceScope working(scene ? grading.working : &sequenceColorSpace(seq));  // effects that work in light know whose
     const int solo = opts.soloVideoTrack;
     RenderOptions o = opts;
     o.soloVideoTrack = -1;
@@ -2053,9 +2263,10 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
     Image canvas(W, H);
     const std::vector<bool> hiddenMatte = hiddenMatteTracks(seq, t);
     bool canvasEmpty = true;  // nothing drawn yet: the first normal layer can be moved in
-    auto composite = [&](Image&& layer, const std::string& mode) {
+    auto composite = [&](Image&& layer, const std::string& mode, bool displayReferred = false) {
         if (layer.empty()) return;
         if (canvasEmpty && mode == "normal" && layer.width == W && layer.height == H) canvas = std::move(layer);
+        else if (scene && !canvasEmpty) blendGraded(canvas, layer, mode, displayReferred, grading);
         else blendOnto(canvas, layer, mode, 1.0f);
         canvasEmpty = false;
     };
@@ -2089,19 +2300,21 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
             const Clip* A = findClip(track, active->clipA);
             const Clip* B = findClip(track, active->clipB);
             const Clip* top = B ? B : A;
-            composite(transitionLayer(p, seq, track, *active, from, to, t, o, canvasEmpty ? nullptr : &canvas, W, H,
-                                      [&](const Clip& c, FrameTime at, Image& l) { replaceSky(p, seq, ti, c, at, o, l, W, H); }),
-                      top ? top->blendMode : "normal");
+            bool shown = false;
+            Image mix = transitionLayer(p, seq, track, *active, from, to, t, o, canvasEmpty ? nullptr : &canvas, W, H,
+                                        [&](const Clip& c, FrameTime at, Image& l) { replaceSky(p, seq, ti, c, at, o, l, W, H); }, &shown);
+            composite(std::move(mix), top ? top->blendMode : "normal", shown);
             continue;
         }
         if (const Clip* c = clipAt(track, t)) {
-            Image layer = clipLayer(p, seq, *c, t, o, canvasEmpty ? nullptr : &canvas);
+            bool shown = false;
+            Image layer = clipLayer(p, seq, *c, t, o, canvasEmpty ? nullptr : &canvas, &shown);
             if (const Effect* e = trackMatteOf(*c); e && !layer.empty()) {
                 // With no track to use the key does nothing; with nothing on that track now, the matte is empty.
                 if (const int m = matteTrack(seq, ti, *c, *e, t); m >= 0) {
                     const FrameTime lt = t - c->start;
                     Image matte;
-                    if (const Clip* mc = clipAt(seq.videoTracks[size_t(m)], t)) matte = clipLayer(p, seq, *mc, t, o, nullptr);
+                    if (const Clip* mc = clipAt(seq.videoTracks[size_t(m)], t)) matte = asShown(clipLayer(p, seq, *mc, t, o, nullptr));
                     applyTrackMatte(layer, matte, e->p("composite", lt, 0) > 0.5, e->p("reverse", lt, 0) > 0.5);
                 }
             }
@@ -2109,7 +2322,7 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
             // Behind People: the layer goes behind whoever is in the picture beneath it.
             if (const Effect* bp = enabledEffect(seq, *c, "behind_people"); bp && !layer.empty() && !canvasEmpty && mattingAvailable() &&
                                                                         mattingModel().installed())
-                if (std::shared_ptr<const ValueMap> people = cachedPersonMatte(canvas)) {
+                if (std::shared_ptr<const ValueMap> people = cachedPersonMatte(scene ? asShown(canvas) : canvas)) {
                     const FrameTime lt = t - c->start;
                     std::vector<float> m = people->resized(layer.width, layer.height);
                     const double soften = bp->p("soften", lt, 1) * o.scale;
@@ -2118,8 +2331,13 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
                     for (size_t i = 0; i < m.size() && i * 4 < layer.px.size(); ++i)
                         for (int k = 0; k < 4; ++k) layer.px[i * 4 + size_t(k)] *= 1 - m[i] * amount;
                 }
-            composite(std::move(layer), c->blendMode);
+            composite(std::move(layer), c->blendMode, shown);
         }
+    }
+    if (scene) {
+        if (opts.sceneLight) {
+        } else if (asked && asked->sceneReferred) convertExactly(canvas, *grading.linear, *asked);
+        else outputTransform(canvas, *grading.linear, *grading.display, grading.peakNits, grading.kind, grading.exact);
     }
     return canvas;
 }
@@ -2437,6 +2655,7 @@ bool gpuProgramFrame(const Project& p, const Sequence& seq, FrameTime t, const R
     if (!gpu::available(&why)) return fallback("no GPU: " + why);
     if (opts.depth != 0 || seq.stereo3d) return fallback("a stereoscopic sequence");
     if (!opts.trimTarget.empty() && findTrimTarget(seq, opts.trimTarget)) return fallback("a trim pass");
+    if (sceneReferredWorking(seq)) return fallback("a scene-referred working space");
     const WorkingSpaceScope working(&sequenceColorSpace(seq));
     const int solo = opts.soloVideoTrack;
     RenderOptions o = opts;
@@ -2546,14 +2765,25 @@ Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, con
     // A trim pass: each eye as its target shows it, captions over that (as exports burn them in).
     const TrimTarget* trim = o.depth == 0 && !o.trimTarget.empty() ? findTrimTarget(seq, o.trimTarget) : nullptr;
     const std::string shown = trim ? trim->id : std::string();
+    // Graded scene-referred, each target has its own output transform: the trim's target (its trim after it), or the
+    // display the frame is viewed on, rather than the master's picture converted.
+    const bool scene = o.depth == 0 && sceneReferredWorking(seq);
+    const ColorSpace* display = o.depth == 0 && !o.displaySpace.empty() ? findColorSpace(o.displaySpace) : nullptr;
+    const ColorSpace* asked = scene && !o.outputSpace.empty() ? findColorSpace(o.outputSpace) : nullptr;
+    const ColorSpace* drawn = scene && !trim && display ? display : scene && !trim && asked ? asked : &trimTargetSpace(seq, shown);  // (once made)
     auto eyeFrame = [&](int eye) {
         RenderOptions e = o;
         e.eye = eye;
+        if (scene) {
+            e.outputSpace = drawn->id;
+            e.outputPeak = drawn == asked && o.outputPeak > 0 ? o.outputPeak : trimTargetPeak(seq, shown);
+            e.sceneLight = o.sceneLight || trim;
+        }
         Image img = renderSequenceFrame(p, seq, t, e);
         flattenOver(img, 0, 0, 0);
-        if (trim) applyTrimPass(img, seq, t, *trim);
+        if (trim) applyTrimPass(img, seq, t, *trim, scene ? &linearColorSpace(workingColorSpace(seq).primaries) : nullptr, o.highQuality);
         if (o.captions && o.depth == 0)
-            if (const CaptionTrack* track = captionTrackFor(seq)) drawCaption(img, *track, t, &trimTargetSpace(seq, shown));
+            if (const CaptionTrack* track = captionTrackFor(seq)) drawCaption(img, *track, t, drawn);
         return img;
     };
     Image img;
@@ -2561,8 +2791,7 @@ Image renderProgramFrame(const Project& p, const Sequence& seq, FrameTime t, con
         img = o.stereoView == StereoView::Right ? eyeFrame(1) : combineStereo(eyeFrame(0), eyeFrame(1), o.stereoView);
     else
         img = eyeFrame(seq.stereo3d && o.depth == 0 ? 0 : o.eye);
-    if (!o.displaySpace.empty() && o.depth == 0)
-        if (const ColorSpace* d = findColorSpace(o.displaySpace)) convertColor(img, trimTargetSpace(seq, shown), *d, trimTargetPeak(seq, shown));
+    if (display && display != drawn) convertColor(img, *drawn, *display, trimTargetPeak(seq, shown));
     return img;
 }
 
@@ -2761,7 +2990,10 @@ QImage captionImage(const CaptionTrack& track, FrameTime t, int width, int heigh
             pa.strokePath(text, pen);
             pa.strokePath(said, pen);
         }
-        pa.fillPath(text, col(st.textR, st.textG, st.textB, 1));
+        // A caption's own colour (a speaker's) in place of the track's.
+        int ownR = 0, ownG = 0, ownB = 0;
+        const bool own = captionColour(*cap, ownR, ownG, ownB);
+        pa.fillPath(text, own ? QColor(ownR, ownG, ownB) : col(st.textR, st.textG, st.textB, 1));
         pa.fillPath(said, col(st.hiR, st.hiG, st.hiB, 1));
     }
     if (origin) *origin = QPoint(x0, y0);
@@ -2820,7 +3052,7 @@ Image clipPictureAt(const Project& p, const Sequence& s, const Clip& c, FrameTim
     // (The file clipSource reads when not viewing proxies: its layer, an SDR sequence's gain-map JPEG as SDR.)
     std::string path = pictureSource(*m, false, true);
     if (!c.layer.empty() && (path != m->proxyPath || fileOnline(m->path))) path = layerPath(m->path, c.layer);
-    if (m->gainMap && path == m->path && m->colorOverride.empty() && !sequenceColorSpace(s).hdr()) path = gainMapPath(path, false);
+    if (m->gainMap && path == m->path && m->colorOverride.empty() && !frameDisplay(s).hdr()) path = gainMapPath(path, false);
     const FrameTime t = c.contains(at) ? at : c.start;
     const double sec = m->kind == MediaKind::Video ? std::max(0.0, c.sourceFrameAt(t) / s.fpsValue()) : 0.0;
     const double mw = m->width > 0 ? m->width : s.width, mh = m->height > 0 ? m->height : s.height;
@@ -3807,7 +4039,8 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
                 // (audio/SpeechCleanup.h).
                 std::vector<const Effect*> sourceFx;
                 for (const Effect& e : c.effects)
-                    if (e.enabled && isSourceAudioEffect(e.type) && dialogueAlignmentApplies(e, c)) sourceFx.push_back(&e);
+                    if (e.enabled && isSourceAudioEffect(e.type) && dialogueAlignmentApplies(e, c) && bandwidthExtensionApplies(e, c))
+                        sourceFx.push_back(&e);
                 if (!sourceFx.empty())
                     if (AudioBufferPtr clean = cleanedAudio(key, fb, sourceFx, !nonBlocking_); clean && clean->channels >= nch) fb = clean;
                 // Maintain Audio Pitch: the channels stretched together along the time map.
@@ -3945,7 +4178,8 @@ bool AudioMixer::mixTrackClips(const Project& p, const Sequence& seq, const Trac
             // original plays until the cleaned copy is ready in real time).
             std::vector<const Effect*> sourceFx;
             for (const Effect& e : c.effects)
-                if (e.enabled && isSourceAudioEffect(e.type) && dialogueAlignmentApplies(e, c)) sourceFx.push_back(&e);
+                if (e.enabled && isSourceAudioEffect(e.type) && dialogueAlignmentApplies(e, c) && bandwidthExtensionApplies(e, c))
+                    sourceFx.push_back(&e);
             if (!sourceFx.empty())
                 if (AudioBufferPtr clean = cleanedAudio(source, buf, sourceFx, !nonBlocking_)) buf = clean;
             const int64_t n = buf->frames();

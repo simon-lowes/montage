@@ -7,6 +7,7 @@
 #include <mutex>
 #include <tuple>
 
+#include "Ocio.h"
 #include "Processing.h"
 
 namespace montage {
@@ -269,6 +270,357 @@ const ColorSpace& mediaColorSpace(const MediaItem& m) {
 const ColorSpace& sequenceColorSpace(const Sequence& s) {
     const ColorSpace* c = findColorSpace(s.colorSpace);
     return c && !c->sceneReferred ? *c : rec709Space();
+}
+
+std::vector<const ColorSpace*> workingColorSpaces() {
+    std::vector<const ColorSpace*> out;
+    for (const auto& c : colorSpaces())
+        if (c.sceneReferred) out.push_back(&c);
+    return out;
+}
+
+const ColorSpace& workingColorSpace(const Sequence& s) {
+    const ColorSpace* c = s.workingSpace.empty() ? nullptr : findColorSpace(s.workingSpace);
+    return c && c->sceneReferred ? *c : sequenceColorSpace(s);
+}
+
+bool sceneReferredWorking(const Sequence& s) { return workingColorSpace(s).sceneReferred; }
+
+namespace {
+// Spaces made for primaries the list has no linear (or ACEScct-curved) space in; kept for good (references stay valid).
+const ColorSpace& madeSpace(Primaries p, Transfer t, const char* stem, const char* label) {
+    static std::mutex m;
+    static std::map<std::pair<int, int>, ColorSpace> made;
+    std::lock_guard lock(m);
+    auto [it, fresh] = made.try_emplace({int(p), int(t)});
+    if (fresh) it->second = {std::string(stem) + std::to_string(int(p)), label, p, t, true};
+    return it->second;
+}
+}  // namespace
+
+const ColorSpace& linearColorSpace(Primaries p) {
+    for (const auto& c : colorSpaces())
+        if (c.transfer == Transfer::Linear && c.primaries == p) return c;
+    return madeSpace(p, Transfer::Linear, "linear:", "Linear (scene)");
+}
+
+const ColorSpace& logColorSpace(Primaries p) {
+    for (const auto& c : colorSpaces())
+        if (c.transfer == Transfer::AcesCct && c.primaries == p) return c;
+    return madeSpace(p, Transfer::AcesCct, "acescct:", "ACEScct curve");
+}
+
+OutputTransformKind outputTransformKind(const Sequence& s) {
+    return s.outputTransform == "aces2" ? OutputTransformKind::Aces2 : OutputTransformKind::Filmic;
+}
+
+double displayPeakNits(const ColorSpace& to, double peakNits) {
+    if (to.transfer == Transfer::Hlg) return kHlgPeak;
+    return to.hdr() ? std::clamp(peakNits, 100.0, 10000.0) : 100.0;
+}
+
+namespace {
+
+// The ACES 2.0 tone scale (its published curve, for a display of peak `n` nits): a Michaelis-Menten curve through 18 %
+// grey at 10 nits on SDR (higher, a little, on brighter displays) reaching the peak at `rHit`, with a toe.
+struct ToneScale {
+    double peak, rHit, m2, s2, g = 1.15, t1 = 0.04;
+    explicit ToneScale(double n) : peak(n) {
+        constexpr double nr = 100, c = 0.18, cd = 10.013, wg = 0.14, rHitMin = 128, rHitMax = 896;
+        rHit = rHitMin + (rHitMax - rHitMin) * (std::log(n / nr) / std::log(10000 / nr));
+        const double m0 = n / nr, m1 = 0.5 * (m0 + std::sqrt(m0 * (m0 + 4 * t1)));
+        const double u = std::pow((rHit / m1) / ((rHit / m1) + 1), g), m = m1 / u;
+        const double wi = std::log(n / 100) / std::log(2.0), ct = cd / nr * (1 + wi * wg);
+        const double gip = 0.5 * (ct + std::sqrt(ct * (ct + 4 * t1)));
+        const double gipp2 = -(m1 * std::pow(gip / m, 1 / g)) / (std::pow(gip / m, 1 / g) - 1);
+        const double w2 = c / gipp2;
+        s2 = w2 * m1;
+        m2 = m1 / std::pow((rHit / m1) / ((rHit / m1) + w2), g);
+    }
+    double nits(double x) const {
+        if (!(x > 0)) return 0;
+        if (x >= rHit) return peak;
+        const double f = m2 * std::pow(x / (x + s2), g);
+        return std::min(peak, 100 * f * f / (f + t1));
+    }
+    double scene(double nits) const {
+        if (!(nits > 0)) return 0;
+        if (nits >= peak) return rHit;
+        const double h = nits / 100, f = 0.5 * (h + std::sqrt(h * (h + 4 * t1)));
+        const double r = std::pow(f / m2, 1 / g);
+        return r >= 1 ? rHit : std::min(rHit, s2 * r / (1 - r));
+    }
+};
+
+// The ACES 2.0 config's display and view for a space (nearest peak for PQ), false where it has none.
+bool aces2View(const ColorSpace& to, double peakNits, std::string& display, std::string& view) {
+    auto hdr = [&](const char* gamut, std::initializer_list<int> peaks) {
+        int best = *peaks.begin();
+        for (int p : peaks)
+            if (std::fabs(std::log(p / peakNits)) < std::fabs(std::log(best / peakNits))) best = p;
+        view = "ACES 2.0 - HDR " + std::to_string(best) + " nits (" + gamut + ")";
+    };
+    if (to.id == "rec709") display = "Rec.1886 Rec.709 - Display", view = "ACES 2.0 - SDR 100 nits (Rec.709)";
+    else if (to.id == "srgb") display = "sRGB - Display", view = "ACES 2.0 - SDR 100 nits (Rec.709)";
+    else if (to.id == "p3d65") display = "Display P3 - Display", view = "ACES 2.0 - SDR 100 nits (P3 D65)";
+    else if (to.id == "rec2100pq") display = "Rec.2100-PQ - Display", hdr("Rec.2020", {500, 1000, 2000, 4000});
+    else if (to.id == "p3d65pq") display = "ST2084-P3-D65 - Display", hdr("P3 D65", {108, 500, 1000, 2000, 4000});
+    else if (to.id == "rec2100hlg") display = "Rec.2100-HLG - Display", view = "ACES 2.0 - HDR 1000 nits (P3 D65)";
+    else return false;
+    return true;
+}
+
+// A colour from one space's code values to another's exactly: linear light through the first's curve, its primaries
+// into the second's, out through the second's curve.
+void exactly(const double m[9], Transfer a, Transfer b, float v[3]) {
+    double l[3];
+    for (int i = 0; i < 3; ++i) l[i] = toLinear(a, v[i]);
+    for (int i = 0; i < 3; ++i) v[i] = float(fromLinear(b, m[i * 3] * l[0] + m[i * 3 + 1] * l[1] + m[i * 3 + 2] * l[2]));
+}
+
+// Scene light in `from` (code values) to a display through the filmic transform.
+void filmicPixel(float rgb[3], const ColorSpace& from, const ColorSpace& to, const ToneScale& ts, const double m[9]) {
+    double c[3], l[3];
+    for (int i = 0; i < 3; ++i) c[i] = toLinear(from.transfer, rgb[i]);
+    const double unit = to.hdr() ? kSdrWhiteNits : 100;
+    for (int r = 0; r < 3; ++r) l[r] = ts.nits(m[r * 3] * c[0] + m[r * 3 + 1] * c[1] + m[r * 3 + 2] * c[2]) / unit;
+    encodeDisplayLight(to, l, rgb);
+}
+
+// Pixels as ACES2065-1 through ACES 2.0 (`count` of them, packed RGB), from code values in `from`; left as they were
+// when OpenColorIO cannot.
+bool aces2Pixels(float* rgb, size_t count, const ColorSpace& from, const std::string& display, const std::string& view) {
+    double m[9];
+    primariesMatrix(from.primaries, Primaries::Ap0, m);
+    std::vector<float> v(rgb, rgb + 3 * count);
+    for (size_t i = 0; i < count; ++i) exactly(m, from.transfer, Transfer::Linear, v.data() + 3 * i);
+    if (!applyAces2Output(display, view, v.data(), count)) return false;
+    std::copy(v.begin(), v.end(), rgb);
+    return true;
+}
+
+struct OutputSetup {
+    OutputTransformKind kind;
+    std::string display, view;  // (ACES 2.0)
+    double peak;
+};
+OutputSetup outputSetup(const ColorSpace& to, double peakNits, OutputTransformKind kind) {
+    OutputSetup s{kind, {}, {}, displayPeakNits(to, peakNits)};
+    if (kind == OutputTransformKind::Aces2 && !(aces2OutputAvailable() && aces2View(to, s.peak, s.display, s.view)))
+        s.kind = OutputTransformKind::Filmic;
+    return s;
+}
+
+}  // namespace
+
+bool aces2Renders(const ColorSpace& to) {
+    std::string d, v;
+    return aces2OutputAvailable() && aces2View(to, 1000, d, v);
+}
+
+double filmicNits(double scene, double peakNits) { return ToneScale(peakNits).nits(scene); }
+double filmicScene(double nits, double peakNits) { return ToneScale(peakNits).scene(nits); }
+
+void outputPixel(float rgb[3], const ColorSpace& from, const ColorSpace& to, double peakNits, OutputTransformKind kind) {
+    double m[9];
+    if (to.sceneReferred) {
+        primariesMatrix(from.primaries, to.primaries, m);
+        exactly(m, from.transfer, to.transfer, rgb);
+        return;
+    }
+    const OutputSetup s = outputSetup(to, peakNits, kind);
+    if (s.kind == OutputTransformKind::Aces2 && aces2Pixels(rgb, 1, from, s.display, s.view)) return;
+    primariesMatrix(from.primaries, to.primaries, m);
+    filmicPixel(rgb, from, to, ToneScale(s.peak), m);
+}
+
+namespace {
+// A display's code values back through the filmic transform into scene light in `to` (`m` from the display's primaries
+// to `to`'s).
+void filmicInverse(float rgb[3], const ColorSpace& from, const ColorSpace& to, const ToneScale& ts, const double m[9]) {
+    double l[3], c[3];
+    displayLight(from, rgb, l);
+    const double unit = from.hdr() ? kSdrWhiteNits : 100;
+    for (int i = 0; i < 3; ++i) l[i] = ts.scene(std::max(0.0, l[i]) * unit);
+    for (int r = 0; r < 3; ++r) c[r] = m[r * 3] * l[0] + m[r * 3 + 1] * l[1] + m[r * 3 + 2] * l[2];
+    for (int i = 0; i < 3; ++i) rgb[i] = float(fromLinear(to.transfer, c[i]));
+}
+
+// Display code values (`count`, packed RGB) back through ACES 2.0 into scene light in `to`; false (left as they were)
+// when OpenColorIO cannot.
+bool aces2Inverse(float* rgb, size_t count, const ColorSpace& to, const std::string& display, const std::string& view) {
+    std::vector<float> v(rgb, rgb + 3 * count);
+    for (float& x : v) x = std::clamp(std::isfinite(x) ? x : 0.0f, 0.0f, 1.0f);
+    if (!applyAces2Output(display, view, v.data(), count, true)) return false;
+    double m[9];
+    primariesMatrix(Primaries::Ap0, to.primaries, m);
+    for (size_t i = 0; i < count; ++i) exactly(m, Transfer::Linear, to.transfer, v.data() + 3 * i);
+    std::copy(v.begin(), v.end(), rgb);
+    return true;
+}
+}  // namespace
+
+void inverseOutputPixel(float rgb[3], const ColorSpace& from, const ColorSpace& to, double peakNits, OutputTransformKind kind) {
+    const OutputSetup s = outputSetup(from, peakNits, kind);
+    if (s.kind == OutputTransformKind::Aces2 && aces2Inverse(rgb, 1, to, s.display, s.view)) return;
+    double m[9];
+    primariesMatrix(from.primaries, to.primaries, m);
+    filmicInverse(rgb, from, to, ToneScale(s.peak), m);
+}
+
+namespace {
+thread_local const SceneGrading* tSceneGrading = nullptr;
+}
+const SceneGrading* currentSceneGrading() { return tSceneGrading; }
+SceneGradingScope::SceneGradingScope(const SceneGrading* g) : previous_(tSceneGrading) { tSceneGrading = g; }
+SceneGradingScope::~SceneGradingScope() { tSceneGrading = previous_; }
+
+void convertExactly(Image& img, const ColorSpace& from, const ColorSpace& to) {
+    if (img.empty() || from.id == to.id) return;
+    double m[9];
+    primariesMatrix(from.primaries, to.primaries, m);
+    parallelRows(img.height, [&](int y0, int y1) {
+        for (int y = y0; y < y1; ++y) {
+            float* p = img.row(y);
+            for (int x = 0; x < img.width; ++x, p += 4) {
+                const float a = p[3];
+                if (a <= 0) continue;
+                float c[3] = {p[0] / a, p[1] / a, p[2] / a};
+                exactly(m, from.transfer, to.transfer, c);
+                p[0] = c[0] * a, p[1] = c[1] * a, p[2] = c[2] * a;
+            }
+        }
+    });
+}
+
+namespace {
+// The output transform as a table on ACEScct code values of the light in `from`'s primaries (0..1 holds -0.007 to 222),
+// built once per transform: 65^3, or 97^3 for ACES 2.0, whose gamut mapping bends saturated colours more sharply.
+std::shared_ptr<const Lut3D> outputTable(const ColorSpace& from, const ColorSpace& to, const OutputSetup& s) {
+    static std::mutex mu;
+    static std::map<std::string, std::shared_ptr<const Lut3D>> cache;
+    const std::string key = std::to_string(int(s.kind)) + '|' + from.id + '|' + to.id + '|' + std::to_string(std::lround(s.peak));
+    {
+        std::lock_guard lock(mu);
+        if (auto it = cache.find(key); it != cache.end()) return it->second;
+    }
+    const ColorSpace& shaper = logColorSpace(from.primaries);
+    auto l = std::make_shared<Lut3D>();
+    const int n = s.kind == OutputTransformKind::Aces2 ? 97 : 65;
+    l->size = n;
+    l->data.resize(size_t(n) * n * n * 3);
+    for (int b = 0; b < n; ++b)
+        for (int g = 0; g < n; ++g)
+            for (int r = 0; r < n; ++r) {
+                float* d = &l->data[(size_t(b) * n * n + size_t(g) * n + size_t(r)) * 3];
+                d[0] = float(r) / (n - 1), d[1] = float(g) / (n - 1), d[2] = float(b) / (n - 1);
+            }
+    bool done = false;
+    if (s.kind == OutputTransformKind::Aces2) done = aces2Pixels(l->data.data(), size_t(n) * n * n, shaper, s.display, s.view);
+    if (!done) {
+        double m[9];
+        primariesMatrix(shaper.primaries, to.primaries, m);
+        const ToneScale ts(s.peak);
+        parallelRows(n, [&](int b0, int b1) {
+            for (size_t i = size_t(b0) * n * n; i < size_t(b1) * n * n; ++i) filmicPixel(&l->data[i * 3], shaper, to, ts, m);
+        });
+    }
+    std::lock_guard lock(mu);
+    return cache.emplace(key, std::move(l)).first->second;
+}
+}  // namespace
+
+void outputTransform(Image& img, const ColorSpace& from, const ColorSpace& to, double peakNits, OutputTransformKind kind, bool exact) {
+    if (img.empty()) return;
+    if (to.sceneReferred) {
+        convertExactly(img, from, to);
+        return;
+    }
+    const OutputSetup s = outputSetup(to, peakNits, kind);
+    const std::shared_ptr<const Lut3D> lut = exact ? nullptr : outputTable(from, to, s);
+    const ToneScale ts(s.peak);
+    double m[9];
+    primariesMatrix(from.primaries, to.primaries, m);
+    const bool linear = from.transfer == Transfer::Linear;
+    parallelRows(img.height, [&](int y0, int y1) {
+        std::vector<float> row;  // (ACES 2.0 done a row at a time)
+        for (int y = y0; y < y1; ++y) {
+            float* p = img.row(y);
+            if (s.kind == OutputTransformKind::Aces2 && !lut) {
+                row.assign(size_t(img.width) * 3, 0.0f);
+                for (int x = 0; x < img.width; ++x)
+                    if (const float a = p[x * 4 + 3]; a > 0)
+                        for (int k = 0; k < 3; ++k) row[size_t(x) * 3 + k] = std::isfinite(p[x * 4 + k]) ? p[x * 4 + k] / a : 0.0f;
+                if (aces2Pixels(row.data(), size_t(img.width), from, s.display, s.view)) {
+                    for (int x = 0; x < img.width; ++x)
+                        if (const float a = p[x * 4 + 3]; a > 0)
+                            for (int k = 0; k < 3; ++k) p[x * 4 + k] = row[size_t(x) * 3 + k] * a;
+                    continue;
+                }
+            }
+            for (int x = 0; x < img.width; ++x, p += 4) {
+                const float a = p[3];
+                if (a <= 0) continue;
+                float c[3] = {p[0] / a, p[1] / a, p[2] / a};
+                for (float& v : c) v = std::isfinite(v) ? v : 0.0f;
+                bool inTable = false;
+                if (lut) {
+                    float sh[3];
+                    for (int k = 0; k < 3; ++k) sh[k] = float(linearToAcescct(linear ? c[k] : toLinear(from.transfer, c[k])));
+                    inTable = sh[0] >= 0 && sh[0] <= 1 && sh[1] >= 0 && sh[1] <= 1 && sh[2] >= 0 && sh[2] <= 1;
+                    if (inTable) {
+                        lut->apply(sh[0], sh[1], sh[2]);
+                        c[0] = sh[0], c[1] = sh[1], c[2] = sh[2];
+                    }
+                }
+                if (!inTable) {
+                    // (past the table: worked out exactly; ACES 2.0 a pixel at a time)
+                    if (s.kind != OutputTransformKind::Aces2 || !aces2Pixels(c, 1, from, s.display, s.view)) {  // (failing: filmic)
+                        filmicPixel(c, from, to, ts, m);
+                    }
+                }
+                p[0] = c[0] * a, p[1] = c[1] * a, p[2] = c[2] * a;
+            }
+        }
+    });
+}
+
+void inverseOutputTransform(Image& img, const ColorSpace& from, const ColorSpace& to, double peakNits, OutputTransformKind kind) {
+    if (img.empty()) return;
+    if (from.sceneReferred) {
+        convertExactly(img, from, to);
+        return;
+    }
+    const OutputSetup s = outputSetup(from, peakNits, kind);
+    const ToneScale ts(s.peak);
+    double m[9];
+    primariesMatrix(from.primaries, to.primaries, m);
+    parallelRows(img.height, [&](int y0, int y1) {
+        std::vector<float> row;  // (ACES 2.0 a row at a time)
+        for (int y = y0; y < y1; ++y) {
+            float* p = img.row(y);
+            if (s.kind == OutputTransformKind::Aces2) {
+                row.assign(size_t(img.width) * 3, 0.0f);
+                for (int x = 0; x < img.width; ++x)
+                    if (const float a = p[x * 4 + 3]; a > 0)
+                        for (int k = 0; k < 3; ++k) row[size_t(x) * 3 + k] = p[x * 4 + k] / a;
+                if (aces2Inverse(row.data(), size_t(img.width), to, s.display, s.view)) {
+                    for (int x = 0; x < img.width; ++x)
+                        if (const float a = p[x * 4 + 3]; a > 0)
+                            for (int k = 0; k < 3; ++k) p[x * 4 + k] = row[size_t(x) * 3 + k] * a;
+                    continue;
+                }
+            }
+            for (int x = 0; x < img.width; ++x, p += 4) {
+                const float a = p[3];
+                if (a <= 0) continue;
+                float c[3] = {p[0] / a, p[1] / a, p[2] / a};
+                for (float& v : c) v = std::isfinite(v) ? v : 0.0f;
+                filmicInverse(c, from, to, ts, m);
+                p[0] = c[0] * a, p[1] = c[1] * a, p[2] = c[2] * a;
+            }
+        }
+    });
 }
 
 double toLinear(Transfer t, double v) {

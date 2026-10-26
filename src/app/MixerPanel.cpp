@@ -30,6 +30,11 @@
 namespace montage {
 
 namespace {
+// A strip's controls named for a screen reader after its track: "A1 volume", "A1 mute".
+void nameControls(const QString& track, std::initializer_list<std::pair<QWidget*, QString>> controls) {
+    for (const auto& [w, what] : controls)
+        if (w && w->accessibleName() != track + QLatin1Char(' ') + what) w->setAccessibleName(track + QLatin1Char(' ') + what);
+}
 
 // Whether a track plays its automation lanes (and its fader edits them).
 bool readsLanes(const Track& t) {
@@ -893,6 +898,9 @@ void MixerPanel::refresh() {
         const QString name = t.name.empty() ? tr("A%1").arg(i + 1) : QString::fromStdString(t.name);
         s.name->setText(s.name->fontMetrics().elidedText(name, Qt::ElideRight, kStripWidth - 12));
         s.name->setToolTip(name);
+        nameControls(name, {{s.fader, tr("volume")}, {s.pan, tr("pan")}, {s.surround, tr("surround position")}, {s.meter, tr("level")},
+                            {s.mute, tr("mute")}, {s.solo, tr("solo")}, {s.fx, tr("effects")}, {s.output, tr("output")},
+                            {s.automation, tr("automation")}});
         // The automation at the playhead on tracks that read it; a fader being held stays where the hand is.
         const double db = trackVolumeAt(t, double(state_->playhead())), pan = trackPanAt(t, double(state_->playhead()));
         if (!s.fader->isSliderDown()) {
@@ -968,6 +976,8 @@ void MixerPanel::refresh() {
         const QString name = QString::fromStdString(b.name);
         st.name->setText(st.name->fontMetrics().elidedText(name, Qt::ElideRight, kStripWidth - 12));
         st.name->setToolTip(tr("%1 (bus; right-click to rename or delete)").arg(name));
+        nameControls(name, {{st.fader, tr("volume")}, {st.pan, tr("pan")}, {st.surround, tr("surround position")}, {st.mute, tr("mute")},
+                            {st.fx, tr("effects")}, {st.automation, tr("automation")}});
         st.fx->setText(b.effects.empty() ? tr("FX") : tr("FX %1").arg(b.effects.size()));
         // Fader, pan and mute as their lanes give them at the playhead on a bus that reads them.
         const double at = double(state_->playhead());

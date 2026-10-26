@@ -81,6 +81,14 @@ private:
     QLabel* status_;
     std::vector<DescriptionGap> gaps_;
     std::vector<DescriptionGap> added_;  // the gaps added at the playhead, kept when the gaps are found again
+    // Each one's place by the clip before it (on the dialogue's tracks), which it follows when edits move that clip.
+    struct Anchor {
+        Id clip = 0;
+        FrameTime offset = 0;
+    };
+    std::vector<Anchor> anchors_;  // (one for each of added_)
+    Anchor anchorAt(FrameTime at) const;
+    void followAdded();
     std::string foundFor_;               // the dialogue's layout when the gaps were found
     std::string addedFor_;               // and when the gaps added were checked, when none were found
     bool refreshing_ = false;

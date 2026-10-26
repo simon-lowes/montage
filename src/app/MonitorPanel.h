@@ -191,6 +191,8 @@ public:
     Mode mode() const { return mode_; }
     // Re-reads duration, marks and timecode from the state / controller.
     void refresh();
+    // What a screen reader says of the picture: "00:00:10:00, In 00:00:05:00, Out not set".
+    QString accessibleSummary() const;
     // Two-up trim view (as in Premiere, Resolve, Avid and Final Cut): while an
     // edit is trimmed, the program frames either side of it (-1: none, shown
     // black) side by side, each labelled. Rendered in the background at the

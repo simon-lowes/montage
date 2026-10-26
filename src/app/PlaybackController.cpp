@@ -57,6 +57,7 @@ public:
         std::shared_ptr<const Lut3D> hdrCalibration;  // the HDR viewer's display's calibration (render/MonitorCalibration.h)
         double hdrWhite = 203;                         // the nits that display shows SDR white at
         double hdrHeadroom = 1;                        // and its headroom (its peak over SDR white), for adaptive HDR metadata
+        bool scopeWorking = false;  // the scopes read the working space (a sequence graded scene-referred)
     };
     void request(const Request& r) {
         {
@@ -121,11 +122,33 @@ private:
         return signalImage(renderProgramFrame(*r.project, *s, t, o));
     }
 
+    // The frame in a scene-referred sequence's working space alone, for the scopes.
+    QImage renderWorkingSignal(const Request& r, FrameTime t) {
+        const Sequence* s = r.project->findSequence(r.sequence);
+        if (!s || !sceneReferredWorking(*s)) return {};
+        RenderOptions o;
+        o.scale = r.scale;
+        o.useProxies = r.proxies;
+        o.offlineProxies = true;
+        o.stereoView = r.stereoView;
+        o.sceneLight = true;
+        Image img = renderProgramFrame(*r.project, *s, t, o);
+        convertExactly(img, linearColorSpace(workingColorSpace(*s).primaries), workingColorSpace(*s));
+        return signalImage(img);
+    }
+
     void emitFrame(Rendered& img, const Request& r, FrameTime t) {
         emit rendered(img.view, t);
         if (r.hdr) emit hdrRendered(img.hdr, t);  // (none for SDR sequences: the viewer shows the SDR picture)
         const Sequence* s = r.project->findSequence(r.sequence);
         if (!s) return;
+        if (r.scopeWorking && sceneReferredWorking(*s)) {
+            // (paused: what the grade works on; playing, the scopes keep the last)
+            if (r.direction == 0)
+                if (const QImage w = renderWorkingSignal(r, t); !w.isNull())
+                    emit scopeRendered(w, t, QString::fromStdString(workingColorSpace(*s).id), s->hdrPeakNits);
+            return;
+        }
         if (!ownSpace(*s, r.trim)) {
             emit scopeRendered(img.view, t, QStringLiteral("rec709"), trimTargetPeak(*s, r.trim));
             return;
@@ -146,7 +169,7 @@ private:
         return r.project == ctx_.project && r.sequence == ctx_.sequence && r.scale == ctx_.scale && r.proxies == ctx_.proxies &&
                r.captions == ctx_.captions && r.stereoView == ctx_.stereoView && r.hdr == ctx_.hdr &&
                r.trim == ctx_.trim && r.gpu == ctx_.gpu && r.hdrCalibration == ctx_.hdrCalibration && r.hdrWhite == ctx_.hdrWhite &&
-               r.hdrHeadroom == ctx_.hdrHeadroom;
+               r.hdrHeadroom == ctx_.hdrHeadroom && r.scopeWorking == ctx_.scopeWorking;
     }
 
     Rendered render(const Request& r, FrameTime t) {
@@ -175,7 +198,9 @@ private:
         // Rendered in the sequence's own space, kept for the scopes, then shown as Rec.709 (as displaySpace does).
         Rendered out;
         RenderOptions own = o;
-        const bool other = ownSpace(*s, r.trim);
+        // (Graded scene-referred, the SDR viewer has its own output transform: the delivered picture, for the scopes, is
+        // rendered alone when paused.)
+        const bool other = ownSpace(*s, r.trim) && !(sceneReferredWorking(*s) && !hdr && !dest);
         // A Rec.709 frame for the viewer alone comes back from the GPU as 8-bit, with no float picture in between.
         if (r.gpu && !other && !dest) {
             out.view = renderProgramFrameRgba8(*r.project, *s, t, o);
@@ -312,7 +337,8 @@ public:
     }
 
     void configure(std::shared_ptr<const Project> p, Id seq, int64_t startSample, bool int16, int channels = 2, bool idle = false) {
-        auto speech = speechIn(p, seq);  // (worked out before the audio thread is held up)
+        auto speech = speechIn(p, seq);  // (worked out before the audio thread is held up, as the monitor's mixes are)
+        std::optional<MonitorPlan> plan = planMonitorFor(p, seq);
         QMutexLocker lock(&m_);
         const Sequence* s = p ? p->findSequence(seq) : nullptr;
         project_ = std::move(p);
@@ -323,7 +349,7 @@ public:
         idle_ = idle;
         mixer_.reset();
         if (monitor_) {
-            monitor_->prepare(project_, seq_);
+            installMonitorPlan(std::move(plan));
             monitor_->reset();
         }
         // Loudness keeps integrating across plays of the same sequence until reset.
@@ -348,12 +374,28 @@ public:
             QMutexLocker lock(&m_);
             seq = seq_;
         }
-        auto speech = speechIn(p, seq);  // (outside the locks the audio thread takes)
+        auto speech = speechIn(p, seq);  // (outside the locks the audio thread takes, as the monitor's mixes are)
+        std::optional<MonitorPlan> plan = planMonitorFor(p, seq);
         QMutexLocker lock(&m_);
         project_ = std::move(p);
-        if (monitor_) monitor_->prepare(project_, seq_);
+        if (monitor_) installMonitorPlan(std::move(plan));
         QMutexLocker meterLock(&meterM_);
         speech_ = std::move(speech);
+    }
+    // The monitor's mixes for a project worked out with its settings as they are (none without a monitor), and given
+    // to it under the lock (worked out again there, should its settings have changed in between).
+    std::optional<MonitorPlan> planMonitorFor(const std::shared_ptr<const Project>& p, Id seq) {
+        std::optional<MonitorSettings> settings;
+        {
+            QMutexLocker lock(&m_);
+            if (monitor_) settings = monitor_->settings();
+        }
+        if (!settings) return std::nullopt;
+        return planMonitor(p, seq, *settings);
+    }
+    void installMonitorPlan(std::optional<MonitorPlan> plan) {  // (with m_ held)
+        if (plan && plan->project == project_ && plan->sequence == seq_ && plan->settings == monitor_->settings()) monitor_->prepare(std::move(*plan));
+        else monitor_->prepare(project_, seq_);
     }
     void setSpectrumKWeighting(bool on) { kWeighted_ = on; }
     // Global Mute: the meters still move, the speakers get silence.
@@ -399,6 +441,13 @@ public:
     }
     // Stopped, with the sink kept running for calibration or talkback: no programme.
     void setIdle(bool on) { idle_ = on; }
+    // Looped playback from sample `in` for `length` samples (as many as the loop's frames last, so fractional), wrapped
+    // here sample-exactly, the picture following (0: no loop).
+    void setLoop(int64_t in, double length) {
+        QMutexLocker lock(&m_);
+        loopIn_ = in;
+        loopLength_ = length;
+    }
     // An ADR cycle's beeps, in what is heard (never in the meters).
     void setCycle(const std::optional<AdrCycle>& c) {
         QMutexLocker lock(&m_);
@@ -433,18 +482,25 @@ protected:
             if (monitor_) {
                 monitored = monitor_->outputs();
                 mon_.resize(size_t(frames) * size_t(monitored));
-                monitor_->render(sample_, frames, mon_.data(), buf_.data(), &tl, s && cycle_ && !idle ? &*cycle_ : nullptr, s && !idle);
-            } else if (s && !idle) {
-                mixer_.mix(*project_, *s, sample_, frames, buf_.data(), &tl);
-            } else {
-                std::fill(buf_.begin(), buf_.end(), 0.0f);
+            }
+            // (In pieces where a loop wraps.)
+            for (int done = 0; done < frames;) {
+                const int64_t v = sample_ + done;
+                const int n = int(std::min<int64_t>(frames - done, untilWrap(v)));
+                const int64_t at = looped(v);
+                if (monitor_)
+                    monitor_->render(at, n, mon_.data() + size_t(done) * size_t(monitored), buf_.data() + size_t(done) * 2, &tl,
+                                     s && cycle_ && !idle ? &*cycle_ : nullptr, s && !idle);
+                else if (s && !idle) mixer_.mix(*project_, *s, at, n, buf_.data() + size_t(done) * 2, &tl);
+                else std::fill(buf_.begin() + done * 2, buf_.begin() + (done + n) * 2, 0.0f);
+                done += n;
             }
             if (s && cycle_ && !monitored) {
                 cycle = cycle_;
                 fps = s->fpsValue();
                 rate = s->sampleRate;
             }
-            first = sample_;
+            first = looped(sample_);
             if (!idle) sample_ += frames;
         }
         if (monitored) {
@@ -522,6 +578,17 @@ protected:
     qint64 writeData(const char*, qint64) override { return -1; }
 
 private:
+    // Where the play's `v`th sample (counted on from where it began) is on the timeline, and how many follow before the
+    // loop wraps. (With m_ held.)
+    int64_t looped(int64_t v) const {
+        if (loopLength_ <= 0 || double(v - loopIn_) < loopLength_) return v;
+        return loopIn_ + int64_t(std::floor(std::fmod(double(v - loopIn_), loopLength_)));
+    }
+    int64_t untilWrap(int64_t v) const {
+        if (loopLength_ <= 0) return INT64_MAX;
+        const double k = v < loopIn_ ? 0 : std::floor(double(v - loopIn_) / loopLength_);
+        return std::max<int64_t>(1, int64_t(std::ceil(double(loopIn_) + (k + 1) * loopLength_)) - v);
+    }
     // The timeline's own speech marks (whole Dialogue clips, else transcribed words), in seconds.
     static std::vector<std::pair<double, double>> speechIn(const std::shared_ptr<const Project>& p, Id seq) {
         const Sequence* s = p ? p->findSequence(seq) : nullptr;
@@ -531,7 +598,9 @@ private:
     QMutex m_;
     std::shared_ptr<const Project> project_;
     Id seq_ = 0;
-    int64_t sample_ = 0;
+    int64_t sample_ = 0;  // (the play's samples so far, from where it began: looped() places them)
+    int64_t loopIn_ = 0;
+    double loopLength_ = 0;
     bool int16_ = false;
     std::atomic<int> channels_{2};
     std::atomic<bool> idle_{false};
@@ -773,6 +842,12 @@ void PlaybackController::setTrimTarget(const std::string& id) {
     requestFrame();
 }
 
+void PlaybackController::setScopesReadWorking(bool on) {
+    if (scopesWorking_ == on) return;
+    scopesWorking_ = on;
+    requestFrame();
+}
+
 void PlaybackController::setStereoView(StereoView v) {
     if (stereoView_ == v) return;
     stereoView_ = v;
@@ -790,7 +865,7 @@ FrameTime PlaybackController::clampToSequence(FrameTime t) const { return std::m
 void PlaybackController::requestFrame() {
     if (!sequence()) return;
     // Paused frames render at full quality; playback uses the preview scale (a reference output its own).
-    worker_->request({project_, sequenceId_, position_, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_, hdrHeadroom_});
+    worker_->request({project_, sequenceId_, position_, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_, hdrHeadroom_, scopesWorking_});
 }
 
 void PlaybackController::seek(FrameTime t) {
@@ -800,7 +875,7 @@ void PlaybackController::seek(FrameTime t) {
     position_ = t;
     if (playing) {
         startFrame_ = t;
-        clock_.restart();
+        restartClock();
         if (speed_ == 1) startAudio(t);
     }
     requestFrame();
@@ -884,7 +959,7 @@ void PlaybackController::play() {
     if (position_ >= end && end > 0) position_ = loop_ && s->inPoint >= 0 ? s->inPoint : 0;
     speed_ = 1;
     startFrame_ = position_;
-    clock_.restart();
+    restartClock();
     startAudio(position_);
     timer_.start();
     syncOutput();
@@ -917,7 +992,7 @@ void PlaybackController::shuttle(int direction) {
     bool wasPlaying = isPlaying();
     speed_ = next;
     startFrame_ = position_;
-    clock_.restart();
+    restartClock();
     if (speed_ == 1) startAudio(position_);
     else stopAudio();
     timer_.start();
@@ -935,12 +1010,17 @@ void PlaybackController::setSpeed(double speed) {
     const bool wasPlaying = isPlaying();
     speed_ = std::clamp(speed, -32.0, 32.0);
     startFrame_ = position_;
-    clock_.restart();
+    restartClock();
     if (speed_ == 1) startAudio(position_);
     else stopAudio();
     timer_.start();
     syncOutput();
     if (!wasPlaying) emit playingChanged(true);
+}
+
+void PlaybackController::restartClock() {
+    clock_.restart();
+    lastElapsed_ = 0;
 }
 
 void PlaybackController::tick() {
@@ -956,14 +1036,23 @@ void PlaybackController::tick() {
         double played = (sink_->processedUSecs() - sink_->format().durationForBytes(buffered)) / 1e6;
         if (played > 0 && std::fabs(played - elapsed) < 0.25) elapsed = played;
     }
+    // (never back: going between the two clocks would step the picture back a frame or two)
+    elapsed = lastElapsed_ = std::max(elapsed, lastElapsed_);
     FrameTime t = startFrame_ + FrameTime(std::floor(elapsed * s->fpsValue() * speed_));
     FrameTime end = s->duration();
     FrameTime loopIn = s->inPoint >= 0 ? s->inPoint : 0;
     FrameTime loopOut = s->outPoint >= 0 ? s->outPoint + 1 : end;
-    if (loop_ && speed_ > 0 && t >= loopOut) {
+    syncAudioLoop();
+    if (loop_ && speed_ > 0 && t >= loopOut && loopOut > loopIn) {
+        // Round and round on the same clock (the sound wraps itself, sample-exactly), so passes keep their length; the
+        // passes are taken off the start, so turning the loop off or moving its points goes on from where it is.
+        const FrameTime passes = (t - loopIn) / (loopOut - loopIn);
+        startFrame_ -= passes * (loopOut - loopIn);
+        t -= passes * (loopOut - loopIn);
+    } else if (loop_ && speed_ > 0 && t >= loopOut) {
         t = loopIn;
         startFrame_ = t;
-        clock_.restart();
+        restartClock();
         if (speed_ == 1) startAudio(t);
     } else if (speed_ > 0 && t >= end) {
         t = end;
@@ -979,7 +1068,7 @@ void PlaybackController::tick() {
     }
     if (t != position_) {
         position_ = t;
-        worker_->request({project_, sequenceId_, t, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_, hdrHeadroom_});
+        worker_->request({project_, sequenceId_, t, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_, hdrHeadroom_, scopesWorking_});
         syncOutput();
         emit positionChanged(t);
     }
@@ -1024,12 +1113,25 @@ void PlaybackController::startAudio(FrameTime from, bool idle) {
     device_->setMonitoring(monitoring_, s->sampleRate);
     int64_t startSample = int64_t(std::llround(double(from) * s->sampleRate / s->fpsValue()));
     device_->configure(heard_, sequenceId_, startSample, int16, outputChannels_, idle);
+    audioLoop_ = {-1, -1.0};  // (none a loop can be, so the device is always told)
+    syncAudioLoop();
     device_->setCalibration(calibration_, monitoring_, s->sampleRate);
     device_->setTalkback(talkback_);
     if (!device_->isOpen()) device_->open(QIODevice::ReadOnly);
     sink_ = new QAudioSink(dev, fmt, this);
     sink_->setBufferSize(fmt.bytesForDuration(80000));  // ~80 ms
     sink_->start(device_);
+}
+
+void PlaybackController::syncAudioLoop() {
+    const Sequence* s = sequence();
+    if (!s || !device_) return;
+    std::pair<int64_t, double> want{0, 0.0};
+    const FrameTime in = s->inPoint >= 0 ? s->inPoint : 0, out = s->outPoint >= 0 ? s->outPoint + 1 : s->duration();
+    if (loop_ && out > in) want = {std::llround(double(in) * s->sampleRate / s->fpsValue()), double(out - in) * s->sampleRate / s->fpsValue()};
+    if (want == audioLoop_) return;
+    audioLoop_ = want;
+    device_->setLoop(want.first, want.second);
 }
 
 void PlaybackController::stopAudio(bool force) {
@@ -1086,7 +1188,7 @@ void PlaybackController::refreshAudio(bool reopen) {
         if (!sink_ || reopen) {
             // (the picture's clock afresh with the sound, as after a seek)
             startFrame_ = position_;
-            clock_.restart();
+            restartClock();
             startAudio(position_);
         }
     } else if (monitorKeepsAudio()) {
