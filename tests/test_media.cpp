@@ -7943,6 +7943,99 @@ private slots:
         QVERIFY(call({{"scope", "everything"}}).value("isError").toBool());
     }
 
+    void sceneReferredSequences() {
+        // A sequence graded in ACEScct, delivered in HDR10 through ACES 2.0: kept in the project file, OpenTimelineIO and
+        // AAF; set and reported through MCP.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 64, s.height = 36, s.fps = {25, 1};
+        s.colorSpace = "rec2100pq";
+        s.hdrPeakNits = 2000;
+        s.workingSpace = "acescct";
+        s.outputTransform = "aces2";
+        const std::string still = path("graded-plate.png");
+        {
+            QImage img(64, 36, QImage::Format_RGB32);
+            img.fill(QColor(90, 100, 110));
+            QVERIFY(img.save(QString::fromStdString(still)));
+        }
+        const MediaItem plate = probeOrFail(p, still);
+        p.media.push_back(plate);
+        QVERIFY(edit::placeMedia(p, s, plate.id, 0, 0, 10, {TrackKind::Video, 0}, {TrackKind::Audio, -1}, false).ok);
+        auto same = [](const Sequence& a, const Sequence& b) {
+            return a.colorSpace == b.colorSpace && a.hdrPeakNits == b.hdrPeakNits && a.workingSpace == b.workingSpace &&
+                   a.outputTransform == b.outputTransform;
+        };
+        auto describe = [](const Sequence& q) {
+            return QString::fromStdString(q.colorSpace + " " + std::to_string(q.hdrPeakNits) + " " + q.workingSpace + " " + q.outputTransform);
+        };
+        const std::string file = path("graded.montage");
+        QVERIFY(saveProject(p, file));
+        Project loaded;
+        QVERIFY(loadProject(file, loaded));
+        QVERIFY2(same(*loaded.active(), s), qPrintable(describe(*loaded.active())));
+        Project fromOtio = makeDefaultProject();
+        const ImportResult o = importOtio(fromOtio, exportOtio(p, s));
+        QVERIFY2(o.ok, o.error.c_str());
+        QVERIFY2(same(*fromOtio.findSequence(o.sequence), s), qPrintable(describe(*fromOtio.findSequence(o.sequence))));
+        // A sequence graded in its delivery space writes none of it.
+        {
+            Sequence plain = s;
+            plain.workingSpace.clear();
+            plain.outputTransform.clear();
+            plain.colorSpace = "rec709";
+            QVERIFY(QString::fromStdString(exportOtio(p, plain)).indexOf("working_space") < 0);
+        }
+        {
+            const std::string aaf = path("graded.aaf");
+            AafExportResult ar;
+            std::string err;
+            QVERIFY2(exportAaf(p, s, aaf, &ar, {}, nullptr, &err), err.c_str());
+            Project back = makeDefaultProject();
+            const ImportResult ir = importAaf(back, aaf, [](const std::string& f, MediaItem& m) { return probeMedia(f, m); });
+            QVERIFY2(ir.ok, ir.error.c_str());
+            const Sequence& b = *back.findSequence(ir.sequence);
+            QVERIFY2(b.workingSpace == "acescct" && b.outputTransform == "aces2" && b.colorSpace == "rec2100pq",
+                     qPrintable(describe(b)));
+        }
+
+        // Through MCP.
+        Project fresh = makeDefaultProject();
+        const QString project = QString::fromStdString(path("graded-mcp.montage"));
+        QVERIFY(saveProject(fresh, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](const char* name, QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", name}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_set_sequence", {{"working_space", "acescg"}, {"color_space", "rec2100hlg"}, {"output_transform", "filmic"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject out = r.value("structuredContent").toObject();
+        QCOMPARE(out.value("working_space").toString(), QString("acescg"));
+        QCOMPARE(out.value("color_space").toString(), QString("rec2100hlg"));
+        QCOMPARE(out.value("output_transform").toString(), QString("filmic"));
+        Project after;
+        QVERIFY(loadProject(project.toStdString(), after));
+        QCOMPARE(after.active()->workingSpace, std::string("acescg"));
+        r = call("montage_project_info", {});
+        QCOMPARE(r.value("structuredContent").toObject().value("working_space").toString(), QString("acescg"));
+        // Camera log can be graded in but not delivered; a display space is not a working space.
+        QVERIFY(call("montage_set_sequence", {{"color_space", "slog3-sgamut3cine"}}).value("isError").toBool());
+        QVERIFY(call("montage_set_sequence", {{"working_space", "rec709"}}).value("isError").toBool());
+        QVERIFY(call("montage_set_sequence", {{"output_transform", "film"}}).value("isError").toBool());
+        // "" grades in the delivery space again.
+        r = call("montage_set_sequence", {{"working_space", ""}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("working_space").toString(), QString());
+        QVERIFY(!call("montage_project_info", {}).value("structuredContent").toObject().contains("working_space"));
+    }
+
     void mcpMeasureHdr() {
         // White graphics in an HDR10 sequence: reference white, 203 nits, on every frame.
         Project p = makeDefaultProject();
@@ -9495,6 +9588,26 @@ private slots:
         QCOMPARE(QString(avcodec_get_name(fmt->streams[0]->codecpar->codec_id)), QString("dpx"));
         QCOMPARE(fmt->streams[0]->codecpar->bits_per_raw_sample, 10);
         avformat_close_input(&fmt);
+        // A sequence graded in ACEScct pulls its plates in the working space: OpenEXR in ACEScg (its light), DPX in ACEScct.
+        {
+            Sequence graded = s;
+            graded.workingSpace = "acescct";
+            VfxPullOptions ge = o, gd = d;
+            ge.folder = path("pulls-graded-exr");
+            gd.folder = path("pulls-graded-dpx");
+            QVERIFY2(exportVfxPulls(p, graded, {b.id}, ge, &shots, nullptr, nullptr, &err), err.c_str());
+            QVERIFY2(readAmf(shots[0].amf, amf, &err), err.c_str());
+            QCOMPARE(amf.inputSpace, std::string("acescg"));
+            QVERIFY2(exportVfxPulls(p, graded, {b.id}, gd, &shots, nullptr, nullptr, &err), err.c_str());
+            QVERIFY2(readAmf(shots[0].amf, amf, &err), err.c_str());
+            QCOMPARE(amf.inputSpace, std::string("acescct"));
+            // Graded in ACEScg (linear light), DPX still comes on ACEScct's curve, which 10 bits hold.
+            graded.workingSpace = "acescg";
+            gd.folder = path("pulls-graded-dpx-linear");
+            QVERIFY2(exportVfxPulls(p, graded, {b.id}, gd, &shots, nullptr, nullptr, &err), err.c_str());
+            QVERIFY2(readAmf(shots[0].amf, amf, &err), err.c_str());
+            QCOMPARE(amf.inputSpace, std::string("acescct"));
+        }
         // Nothing to pull.
         Clip title = makeGeneratorClip(p, "title", 10);
         title.start = 40;

@@ -93,6 +93,7 @@ void addMedia(QCryptographicHash& h, const MediaItem& m, const RenderOptions& o)
     h.addData(QByteArray::number(fi.size()));
     h.addData(QByteArray::number(fi.lastModified().toMSecsSinceEpoch()));
     h.addData(QByteArray::fromStdString(m.colorSpace));
+    if (!m.colorOverride.empty()) h.addData(QByteArray("|as ") + QByteArray::fromStdString(m.colorOverride));  // (Interpret Colour)
     h.addData(QByteArray::number(m.width) + 'x' + QByteArray::number(m.height));
 }
 
@@ -179,6 +180,7 @@ void addClipAt(QCryptographicHash& h, const Project& p, const Sequence& seq, con
 bool addFrame(QCryptographicHash& h, const Project& p, const Sequence& seq, FrameTime t, const RenderOptions& o, int depth) {
     h.addData(QByteArray::number(seq.width) + 'x' + QByteArray::number(seq.height) + '@' + QByteArray::number(seq.fpsValue(), 'g', 10));
     h.addData(QByteArray::fromStdString(seq.colorSpace) + QByteArray::number(seq.hdrPeakNits));
+    if (!seq.workingSpace.empty()) h.addData(QByteArray::fromStdString("|working " + seq.workingSpace + ' ' + seq.outputTransform));
     if (seq.stereo3d) h.addData("|stereo");  // clips placed in depth (a nested sequence's too)
     bool any = false;
     for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti) {
@@ -219,8 +221,11 @@ QByteArray clipLayerKey(const Project& p, const Sequence& seq, const Clip& c, Fr
     h.addData(QByteArray("montage-layer-") + QByteArray::number(kCacheVersion));
     h.addData(QByteArray::number(o.scale, 'g', 10) + (o.useProxies ? "P" : "") + (o.highQuality ? "H" : "") + '#' +
               QByteArray::fromStdString(o.displaySpace) + (seq.stereo3d ? QByteArray("#3D") + QByteArray::number(int(o.stereoView)) : QByteArray()));
+    if (!o.outputSpace.empty() || o.sceneLight)
+        h.addData(QByteArray::fromStdString("#out|" + o.outputSpace + '|') + QByteArray::number(o.outputPeak) + (o.sceneLight ? "|light" : ""));
     h.addData(QByteArray::number(seq.width) + 'x' + QByteArray::number(seq.height) + '@' + QByteArray::number(seq.fpsValue(), 'g', 10));
     h.addData(QByteArray::fromStdString(seq.colorSpace) + QByteArray::number(seq.hdrPeakNits));
+    if (!seq.workingSpace.empty()) h.addData(QByteArray::fromStdString("|working " + seq.workingSpace + ' ' + seq.outputTransform));
     addClipAt(h, p, seq, c, t, o, 0);
     return h.result().toHex();
 }
@@ -232,6 +237,8 @@ QByteArray frameKey(const Project& p, const Sequence& seq, FrameTime t, const Re
     h.addData(QByteArray::number(o.scale, 'g', 10) + (o.useProxies ? "P" : "") + (o.highQuality ? "H" : "") + '#' +
               QByteArray::fromStdString(o.displaySpace) + '#' + QByteArray::number(o.soloVideoTrack) +
               (seq.stereo3d ? QByteArray("#3D") + QByteArray::number(int(o.stereoView)) : QByteArray()));
+    if (!o.outputSpace.empty() || o.sceneLight)
+        h.addData(QByteArray::fromStdString("#out|" + o.outputSpace + '|') + QByteArray::number(o.outputPeak) + (o.sceneLight ? "|light" : ""));
     if (const TrimTarget* trim = o.trimTarget.empty() ? nullptr : findTrimTarget(seq, o.trimTarget))
         h.addData(QByteArray::fromStdString("#trim|" + trim->id + "|" + trim->colorSpace + "|") + QByteArray::number(trim->peakNits));
     bool any = addFrame(h, p, seq, t, o, 0);

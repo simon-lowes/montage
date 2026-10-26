@@ -148,6 +148,20 @@ SequenceSettingsDialog::SequenceSettingsDialog(QWidget* parent) : QDialog(parent
     hdrPeak_->setSingleStep(100);
     hdrPeak_->setSuffix(tr(" nits"));
     hdrPeak_->setToolTip(tr("Mastering display peak: the brightest level exported, written into HDR10 metadata"));
+    workingSpace_ = new QComboBox(this);
+    workingSpace_->setObjectName(QStringLiteral("workingSpace"));
+    workingSpace_->addItem(tr("As delivered (the colour space)"), QString());
+    for (const ColorSpace* cs : workingColorSpaces())
+        workingSpace_->addItem(QString::fromStdString(cs->label), QString::fromStdString(cs->id));
+    workingSpace_->setToolTip(tr("Grade scene-referred: clips are graded in this space and composited in its light, and the\n"
+                                 "viewer, each export and each trim target reach their display through an output transform.\n"
+                                 "Titles and graphics come in through it, so they look as designed on every display."));
+    outputTransform_ = new QComboBox(this);
+    outputTransform_->setObjectName(QStringLiteral("outputTransform"));
+    outputTransform_->addItem(tr("Filmic (Montage)"), QString());
+    if (aces2Renders(rec709Space())) outputTransform_->addItem(tr("ACES 2.0"), QStringLiteral("aces2"));
+    outputTransform_->setToolTip(tr("How scene light is shown on a display: Montage's filmic curve on each channel, or\n"
+                                    "ACES 2.0 through OpenColorIO (2.5 and later)"));
 
     audioLayout_ = new QComboBox(this);
     audioLayout_->setObjectName(QStringLiteral("audioLayout"));
@@ -179,6 +193,8 @@ SequenceSettingsDialog::SequenceSettingsDialog(QWidget* parent) : QDialog(parent
     form->addRow(tr("Audio channels:"), audioLayout_);
     form->addRow(tr("Colour space:"), colorSpace_);
     form->addRow(tr("HDR peak:"), hdrPeak_);
+    form->addRow(tr("Working space:"), workingSpace_);
+    form->addRow(tr("Output transform:"), outputTransform_);
     spherical_ = new QCheckBox(tr("360° video (equirectangular)"), this);
     spherical_->setObjectName(QStringLiteral("sphericalSequence"));
     spherical_->setToolTip(tr("Exports say they are 360° to players and YouTube; 360° footage comes in whole, not as a view.\n"
@@ -224,6 +240,7 @@ SequenceSettingsDialog::SequenceSettingsDialog(QWidget* parent) : QDialog(parent
     connect(frameRate_, &QComboBox::currentIndexChanged, this, [this] { updateSummary(); });
     connect(sampleRate_, &QComboBox::currentIndexChanged, this, [this] { updateSummary(); });
     connect(colorSpace_, &QComboBox::currentIndexChanged, this, [this] { updateSummary(); });
+    connect(workingSpace_, &QComboBox::currentIndexChanged, this, [this] { updateSummary(); });
 
     setSpec(NewSequenceSpec{tr("Sequence 1")});
 }
@@ -240,6 +257,15 @@ void SequenceSettingsDialog::setSpec(const NewSequenceSpec& spec) {
     const int cs = colorSpace_->findData(QString::fromStdString(spec.colorSpace));
     colorSpace_->setCurrentIndex(cs >= 0 ? cs : 0);
     hdrPeak_->setValue(int(std::lround(spec.hdrPeakNits)));
+    const int ws = workingSpace_->findData(QString::fromStdString(spec.workingSpace));
+    workingSpace_->setCurrentIndex(ws >= 0 ? ws : 0);
+    int ot = outputTransform_->findData(QString::fromStdString(spec.outputTransform));
+    if (ot < 0 && !spec.outputTransform.empty()) {
+        // (a project graded through ACES 2.0 where this OpenColorIO has not got it: kept, shown with the filmic curve)
+        outputTransform_->addItem(tr("ACES 2.0 (needs OpenColorIO 2.5; filmic here)"), QString::fromStdString(spec.outputTransform));
+        ot = outputTransform_->count() - 1;
+    }
+    outputTransform_->setCurrentIndex(ot >= 0 ? ot : 0);
     const int al = audioLayout_->findData(QString::fromStdString(spec.audioLayout));
     audioLayout_->setCurrentIndex(al >= 0 ? al : 0);
     spherical_->setChecked(spec.spherical);
@@ -260,6 +286,8 @@ NewSequenceSpec SequenceSettingsDialog::spec() const {
     s.sampleRate = sampleRate_->currentData().toInt();
     s.colorSpace = colorSpace_->currentData().toString().toStdString();
     s.hdrPeakNits = hdrPeak_->value();
+    s.workingSpace = workingSpace_->currentData().toString().toStdString();
+    s.outputTransform = outputTransform_->currentData().toString().toStdString();
     s.audioLayout = audioLayout_->currentData().toString().toStdString();
     s.spherical = spherical_->isChecked();
     s.vr180 = s.spherical && vr180_->isChecked();
@@ -329,6 +357,8 @@ void SequenceSettingsDialog::updateSummary() {
     const ColorSpace* cs = findColorSpace(s.colorSpace);
     hdrPeak_->setEnabled(cs && cs->transfer == Transfer::Pq);
     if (cs && cs->hdr()) parts << tr("HDR");
+    outputTransform_->setEnabled(!s.workingSpace.empty());
+    if (!s.workingSpace.empty()) parts << tr("graded scene-referred");
     summary_->setText(parts.join(QStringLiteral("  ·  ")));
     if (okButton_) okButton_->setEnabled(!s.name.isEmpty());
 }
@@ -338,7 +368,7 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
     const Sequence& seq = *state->sequence();
     const NewSequenceSpec before{QString::fromStdString(seq.name), seq.width, seq.height, seq.fps, seq.sampleRate,
                                  seq.colorSpace, seq.hdrPeakNits, seq.audioLayout, seq.spherical, seq.vr180, seq.stereo3d,
-                                 seq.filmGauge};
+                                 seq.filmGauge, seq.workingSpace, seq.outputTransform};
 
     SequenceSettingsDialog dlg(parent);
     dlg.setWindowTitle(tr("Sequence Settings"));
@@ -354,7 +384,8 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
     if (after.name == before.name && after.width == before.width && after.height == before.height &&
         after.fps == before.fps && after.sampleRate == before.sampleRate && after.colorSpace == before.colorSpace &&
         after.hdrPeakNits == before.hdrPeakNits && after.audioLayout == before.audioLayout && after.spherical == before.spherical &&
-        after.vr180 == before.vr180 && after.stereo3d == before.stereo3d && after.filmGauge == before.filmGauge)
+        after.vr180 == before.vr180 && after.stereo3d == before.stereo3d && after.filmGauge == before.filmGauge &&
+        after.workingSpace == before.workingSpace && after.outputTransform == before.outputTransform)
         return false;
 
     const std::string name = after.name.toStdString();
@@ -371,6 +402,8 @@ bool SequenceSettingsDialog::editActive(EditorState* state, QWidget* parent) {
         s.vr180 = after.vr180;
         s.stereo3d = after.stereo3d;
         s.filmGauge = after.filmGauge;
+        s.workingSpace = after.workingSpace;
+        s.outputTransform = after.outputTransform;
         // Keep the media item that represents this sequence (for nesting) in sync.
         for (MediaItem& m : p.media) {
             if (m.kind != MediaKind::Sequence || m.sequenceId != s.id) continue;

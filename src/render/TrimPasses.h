@@ -39,10 +39,14 @@ bool isNeutralTrim(const Effect& trim, FrameTime t);
 
 // The shot whose trim a frame takes: the top enabled picture clip on a shown track at t (not an adjustment layer).
 const Clip* trimShot(const Sequence& s, FrameTime t);
-// The program frame at t, in the sequence's space (premultiplied), as `target` shows it: in its space and trimmed.
-void applyTrimPass(Image& img, const Sequence& s, FrameTime t, const TrimTarget& target);
+// The program frame at t, in the sequence's space (premultiplied), as `target` shows it: in its space and trimmed. A
+// sequence graded scene-referred gives its frame in the light it is composited in (`from`): that goes through the
+// target's own output transform (worked out for each pixel when `exact`, as deliveries are).
+void applyTrimPass(Image& img, const Sequence& s, FrameTime t, const TrimTarget& target, const ColorSpace* from = nullptr,
+                   bool exact = false);
 // The same with a given trim (null: none) at `local` frames into its shot.
-void applyTrim(Image& img, const Sequence& s, const TrimTarget& target, const Effect* trim, FrameTime local);
+void applyTrim(Image& img, const Sequence& s, const TrimTarget& target, const Effect* trim, FrameTime local,
+               const ColorSpace* from = nullptr, bool exact = false);
 // The master light an SDR target shows just short of white (Montage's HDR-to-SDR mapping puts it at 98 %): a shot's
 // peak is rolled off to it.
 constexpr double kSdrHeadroomNits = 280;

@@ -52,6 +52,8 @@ public:
     AafObject& now(uint16_t pid);  // a TimeStamp
     // An Indirect value holding a Rational (parameter values).
     AafObject& indirectRational(uint16_t pid, int32_t num, int32_t den);
+    // An Indirect value holding a String (a TaggedValue's).
+    AafObject& indirectText(uint16_t pid, const std::string& utf8);
 
     AafObject& strong(uint16_t pid, const std::string& name, std::unique_ptr<AafObject> child);
     AafObject& add(uint16_t pid, const std::string& name, std::unique_ptr<AafObject> child);  // strong reference vector

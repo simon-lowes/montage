@@ -22,7 +22,7 @@ struct VfxPullOptions {
     std::string format = "exr";  // exr, dpx or tiff
     int handles = 8;             // frames either side, as far as the footage goes
     int cutIn = 1001;            // the frame number of the first frame of the cut
-    std::string colorSpace;      // EXR: "" = Linear Rec.709; others: "" = the footage's own
+    std::string colorSpace;      // EXR: "" = Linear Rec.709; others: "" = the footage's own (graded scene-referred: the working space's)
     bool amf = true;             // an ACES Metadata File beside each shot's frames (render/Amf.h): their space, the grade's looks
     // OpenEXR, with the OpenEXR library (media/Exr.h):
     std::string compression;     // "" = ZIP (16 lines); or any of exrCompressions(), HTJ2K and zstd among them

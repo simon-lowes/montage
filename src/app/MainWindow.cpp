@@ -319,6 +319,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     });
     connect(state_, &EditorState::mediaReady, this, [this] { program_->requestFrame(); });
     connect(program_, &PlaybackController::scopeFrameRendered, scopes_, &ScopesWidget::setSignal);
+    connect(scopes_, &ScopesWidget::readWorkingChanged, program_, &PlaybackController::setScopesReadWorking);
     connect(program_, &PlaybackController::audioLevels, this, [this](float l, float r, const QVector<float>& tracks) {
         meter_->setLevels(l, r);
         mixer_->setLevels(l, r, tracks);
@@ -3311,6 +3312,8 @@ void MainWindow::childEvent(QChildEvent* e) {
         if (auto* bar = qobject_cast<QTabBar*>(e->child())) {
             bar->setElideMode(Qt::ElideNone);
             bar->setUsesScrollButtons(true);
+            // (the tabs of stacked panels, which take the focus on Windows: named for a screen reader)
+            if (bar->inherits("QMainWindowTabBar") && bar->accessibleName().isEmpty()) bar->setAccessibleName(tr("Panel tabs"));
         }
 }
 
@@ -9439,6 +9442,8 @@ void MainWindow::newSequence() {
             s.vr180 = spec.vr180;
             s.stereo3d = spec.stereo3d;
             s.filmGauge = spec.filmGauge;
+            s.workingSpace = spec.workingSpace;
+            s.outputTransform = spec.outputTransform;
             return true;
         });
 }

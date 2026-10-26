@@ -7,6 +7,7 @@
 #include <cmath>
 #include <set>
 
+#include "ColorSpace.h"
 #include "Compositor.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
@@ -58,11 +59,18 @@ bool learningPair(const Project& p, const Sequence& s, const Clip& c, FrameTime 
     alone.videoTracks.push_back(track);
     RenderOptions o;
     o.highQuality = true;
+    // (Graded scene-referred, the network learns in the working space it runs in.)
+    o.sceneLight = sceneReferredWorking(alone);
     out.after = renderSequenceFrame(p, alone, t, o);
     // And without them.
     Clip& bare = alone.videoTracks[0].clips[0];
     bare.effects.clear();
     out.before = renderSequenceFrame(p, alone, t, o);
+    if (o.sceneLight) {
+        const ColorSpace& working = workingColorSpace(alone);
+        convertExactly(out.after, linearColorSpace(working.primaries), working);
+        convertExactly(out.before, linearColorSpace(working.primaries), working);
+    }
     out.frame = t;
     if (out.before.empty() || out.after.empty() || out.before.width != out.after.width || out.before.height != out.after.height) {
         if (error) *error = "The clip's picture could not be rendered at that frame";

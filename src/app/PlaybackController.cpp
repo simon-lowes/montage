@@ -57,6 +57,7 @@ public:
         std::shared_ptr<const Lut3D> hdrCalibration;  // the HDR viewer's display's calibration (render/MonitorCalibration.h)
         double hdrWhite = 203;                         // the nits that display shows SDR white at
         double hdrHeadroom = 1;                        // and its headroom (its peak over SDR white), for adaptive HDR metadata
+        bool scopeWorking = false;  // the scopes read the working space (a sequence graded scene-referred)
     };
     void request(const Request& r) {
         {
@@ -121,11 +122,33 @@ private:
         return signalImage(renderProgramFrame(*r.project, *s, t, o));
     }
 
+    // The frame in a scene-referred sequence's working space alone, for the scopes.
+    QImage renderWorkingSignal(const Request& r, FrameTime t) {
+        const Sequence* s = r.project->findSequence(r.sequence);
+        if (!s || !sceneReferredWorking(*s)) return {};
+        RenderOptions o;
+        o.scale = r.scale;
+        o.useProxies = r.proxies;
+        o.offlineProxies = true;
+        o.stereoView = r.stereoView;
+        o.sceneLight = true;
+        Image img = renderProgramFrame(*r.project, *s, t, o);
+        convertExactly(img, linearColorSpace(workingColorSpace(*s).primaries), workingColorSpace(*s));
+        return signalImage(img);
+    }
+
     void emitFrame(Rendered& img, const Request& r, FrameTime t) {
         emit rendered(img.view, t);
         if (r.hdr) emit hdrRendered(img.hdr, t);  // (none for SDR sequences: the viewer shows the SDR picture)
         const Sequence* s = r.project->findSequence(r.sequence);
         if (!s) return;
+        if (r.scopeWorking && sceneReferredWorking(*s)) {
+            // (paused: what the grade works on; playing, the scopes keep the last)
+            if (r.direction == 0)
+                if (const QImage w = renderWorkingSignal(r, t); !w.isNull())
+                    emit scopeRendered(w, t, QString::fromStdString(workingColorSpace(*s).id), s->hdrPeakNits);
+            return;
+        }
         if (!ownSpace(*s, r.trim)) {
             emit scopeRendered(img.view, t, QStringLiteral("rec709"), trimTargetPeak(*s, r.trim));
             return;
@@ -146,7 +169,7 @@ private:
         return r.project == ctx_.project && r.sequence == ctx_.sequence && r.scale == ctx_.scale && r.proxies == ctx_.proxies &&
                r.captions == ctx_.captions && r.stereoView == ctx_.stereoView && r.hdr == ctx_.hdr &&
                r.trim == ctx_.trim && r.gpu == ctx_.gpu && r.hdrCalibration == ctx_.hdrCalibration && r.hdrWhite == ctx_.hdrWhite &&
-               r.hdrHeadroom == ctx_.hdrHeadroom;
+               r.hdrHeadroom == ctx_.hdrHeadroom && r.scopeWorking == ctx_.scopeWorking;
     }
 
     Rendered render(const Request& r, FrameTime t) {
@@ -175,7 +198,9 @@ private:
         // Rendered in the sequence's own space, kept for the scopes, then shown as Rec.709 (as displaySpace does).
         Rendered out;
         RenderOptions own = o;
-        const bool other = ownSpace(*s, r.trim);
+        // (Graded scene-referred, the SDR viewer has its own output transform: the delivered picture, for the scopes, is
+        // rendered alone when paused.)
+        const bool other = ownSpace(*s, r.trim) && !(sceneReferredWorking(*s) && !hdr && !dest);
         // A Rec.709 frame for the viewer alone comes back from the GPU as 8-bit, with no float picture in between.
         if (r.gpu && !other && !dest) {
             out.view = renderProgramFrameRgba8(*r.project, *s, t, o);
@@ -773,6 +798,12 @@ void PlaybackController::setTrimTarget(const std::string& id) {
     requestFrame();
 }
 
+void PlaybackController::setScopesReadWorking(bool on) {
+    if (scopesWorking_ == on) return;
+    scopesWorking_ = on;
+    requestFrame();
+}
+
 void PlaybackController::setStereoView(StereoView v) {
     if (stereoView_ == v) return;
     stereoView_ = v;
@@ -790,7 +821,7 @@ FrameTime PlaybackController::clampToSequence(FrameTime t) const { return std::m
 void PlaybackController::requestFrame() {
     if (!sequence()) return;
     // Paused frames render at full quality; playback uses the preview scale (a reference output its own).
-    worker_->request({project_, sequenceId_, position_, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_, hdrHeadroom_});
+    worker_->request({project_, sequenceId_, position_, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_, hdrHeadroom_, scopesWorking_});
 }
 
 void PlaybackController::seek(FrameTime t) {
@@ -979,7 +1010,7 @@ void PlaybackController::tick() {
     }
     if (t != position_) {
         position_ = t;
-        worker_->request({project_, sequenceId_, t, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_, hdrHeadroom_});
+        worker_->request({project_, sequenceId_, t, renderScale(), useProxies_, playStep(), showCaptions_, scale_, stereoView_, hdrOutput_, trimTarget_, gpu_, hdrCalibration_, hdrWhite_, hdrHeadroom_, scopesWorking_});
         syncOutput();
         emit positionChanged(t);
     }

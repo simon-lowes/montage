@@ -239,6 +239,12 @@ AafObject& AafObject::indirectRational(uint16_t pid, int32_t num, int32_t den) {
     return bytes(pid, s);
 }
 
+AafObject& AafObject::indirectText(uint16_t pid, const std::string& utf8) {
+    std::string s(1, char(0x4c));  // little-endian
+    s += aafAuid("01100200-0000-0000-060e-2b3401040101");  // TypeDef String
+    return bytes(pid, s + utf16z(utf8));
+}
+
 AafObject& AafObject::strong(uint16_t pid, const std::string& name, std::unique_ptr<AafObject> child) {
     Prop& p = prop(pid, 0x22);
     const std::string storage = mangle(name, pid, 32);

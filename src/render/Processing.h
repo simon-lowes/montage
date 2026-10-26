@@ -22,6 +22,11 @@ namespace montage {
 // `sourceSeconds` is the media time of the frame (for effects that follow
 // the footage, such as Stabilize); -1 when there is none.
 void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds = -1);
+// The values an effect is made for, in a sequence graded scene-referred: log (lift, gamma and gain, curves, the Colour
+// Warper), light (blurs, lens effects, Relight), the picture as a display shows it (keys, stylising effects: run through
+// the output transform and back), or whatever the working space holds. applyVideoEffect runs each in its own.
+enum class EffectDomain { AsIs, Log, Linear, Display };
+EffectDomain effectDomain(const std::string& type);
 
 // Film Negative (render/FilmScan.h): the base found in the frame's rebate (or as set), the negative inverted in the
 // picture's own curve `transfer`. Steady on Perforations: the frame moved so its perforations sit where they were on the

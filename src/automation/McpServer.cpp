@@ -473,6 +473,11 @@ QJsonObject projectJson(const Project& p) {
                        {"tracks", tracks},
                        {"markers", markers},
                        {"media", media}};
+    out["color_space"] = QString::fromStdString(sequenceColorSpace(s).id);
+    if (sceneReferredWorking(s)) {
+        out["working_space"] = QString::fromStdString(workingColorSpace(s).id);
+        out["output_transform"] = outputTransformKind(s) == OutputTransformKind::Aces2 ? "aces2" : "filmic";
+    }
     if (!s.mutedRoles.empty()) {
         QJsonArray muted;
         for (const std::string& r : s.mutedRoles) muted.append(QString::fromStdString(r));
@@ -3067,6 +3072,61 @@ void McpServer::Impl::addTools() {
             out["youtube"] = youtube;
             if (!warning.empty()) out["warning"] = QString::fromStdString(warning);
             return ok(QStringLiteral("%1 chapter marker(s) added:\n%2").arg(chapters.size()).arg(youtube), out);
+        });
+
+    add("montage_set_sequence", "Set the sequence's colour",
+        "Change how the sequence handles colour. `color_space` is the space it delivers (rec709, srgb, rec2020, p3d65, "
+        "rec2100pq, rec2100hlg, p3d65pq) and `hdr_peak_nits` a PQ sequence's mastering peak. `working_space` grades it "
+        "scene-referred: clips are graded in that space (acescct, acescg, linear-rec709, or a camera's log such as "
+        "slog3-sgamut3cine or logc4-awg4) and composited in its light, and the viewer, each export and each trim target "
+        "reach their display through an output transform, titles and graphics coming in through its inverse so a white "
+        "title stays white on every display; \"\" grades in the delivery space again. `output_transform` is \"filmic\" "
+        "(Montage's own: the ACES 2.0 tone scale on each channel) or \"aces2\" (ACES 2.0 itself, with OpenColorIO 2.5 or "
+        "later). Effects run in the values each is made for: lift, gamma and gain, curves and the Colour Warper in log; "
+        "blurs, lens effects and Relight in light; keys and stylising effects on the picture as the display shows it.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},"color_space":{"type":"string"},
+            "hdr_peak_nits":{"type":"number","minimum":100,"maximum":10000},"working_space":{"type":"string"},
+            "output_transform":{"type":"string","enum":["filmic","aces2"]}},"required":["project"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            Sequence& s = l.seq();
+            if (a.contains("color_space")) {
+                const QString id = a.value("color_space").toString();
+                const ColorSpace* cs = findColorSpace(id.toStdString());
+                if (!cs || cs->sceneReferred)
+                    return fail(QStringLiteral("\"%1\" is not a display space a sequence delivers; for camera log or ACES use "
+                                               "working_space").arg(id));
+                s.colorSpace = cs->id;
+            }
+            if (a.contains("hdr_peak_nits")) s.hdrPeakNits = std::clamp(a.value("hdr_peak_nits").toDouble(), 100.0, 10000.0);
+            if (a.contains("working_space")) {
+                const QString id = a.value("working_space").toString();
+                const ColorSpace* cs = id.isEmpty() ? nullptr : findColorSpace(id.toStdString());
+                if (!id.isEmpty() && (!cs || !cs->sceneReferred)) {
+                    QStringList ids;
+                    for (const ColorSpace* w : workingColorSpaces()) ids << QString::fromStdString(w->id);
+                    return fail(QStringLiteral("\"%1\" is not a scene-referred working space; one of %2").arg(id, ids.join(", ")));
+                }
+                s.workingSpace = cs ? cs->id : std::string();
+            }
+            QString note;
+            if (a.contains("output_transform")) {
+                const QString t = a.value("output_transform").toString();
+                if (t != "filmic" && t != "aces2") return fail(QStringLiteral("output_transform is \"filmic\" or \"aces2\""));
+                s.outputTransform = t == "aces2" ? "aces2" : "";
+                if (t == "aces2" && !aces2Renders(sequenceColorSpace(s)))
+                    note = QStringLiteral(" (ACES 2.0 needs OpenColorIO 2.5 or later and a display its config has: shown filmic here)");
+            }
+            save(l);
+            QJsonObject out{{"color_space", QString::fromStdString(sequenceColorSpace(s).id)}, {"hdr_peak_nits", s.hdrPeakNits}};
+            const bool scene = sceneReferredWorking(s);
+            out["working_space"] = scene ? QString::fromStdString(workingColorSpace(s).id) : QString();
+            out["output_transform"] = outputTransformKind(s) == OutputTransformKind::Aces2 ? "aces2" : "filmic";
+            return ok(scene ? QStringLiteral("Graded in %1, delivered as %2 through the %3 output transform%4")
+                                  .arg(QString::fromStdString(workingColorSpace(s).label), QString::fromStdString(sequenceColorSpace(s).label),
+                                       out["output_transform"].toString() == "aces2" ? "ACES 2.0" : "filmic", note)
+                            : QStringLiteral("Graded and delivered in %1").arg(QString::fromStdString(sequenceColorSpace(s).label)),
+                      out);
         });
 
     add("montage_measure_hdr", "Measure HDR light levels",

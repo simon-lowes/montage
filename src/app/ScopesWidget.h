@@ -47,6 +47,10 @@ public:
     // The chromaticity scope: 1976 u'v' (else 1931 xy).
     bool cieUv() const { return cieUv_; }
     void setCieUv(bool uv);
+    // Read the working space's values (a sequence graded scene-referred: what its grade works on) rather than the output
+    // as delivered; the viewer is told by readWorkingChanged.
+    bool readsWorking() const { return readsWorking_; }
+    void setReadsWorking(bool on);
     // Of the frame's lit pixels (chromaticity scope), the share outside Rec.709 and outside P3, 0..1 (-1: no data).
     double outsideRec709() const { return outside709_; }
     double outsideP3() const { return outsideP3_; }
@@ -57,6 +61,9 @@ public:
     QString summary() const;
     QSize sizeHint() const override;
     QSize minimumSizeHint() const override;
+
+signals:
+    void readWorkingChanged(bool on);
 
 public slots:
     // Latest program frame (any format), in Rec.709. Analysis happens at most ~15 Hz.
@@ -94,6 +101,8 @@ private:
     int luma(int r, int g, int b) const { return (lumaR_ * r + lumaG_ * g + lumaB_ * b + 32768) >> 16; }
 
     QComboBox* modeBox_ = nullptr;
+    QComboBox* readBox_ = nullptr;
+    bool readsWorking_ = false;
     QComboBox* rangeBox_ = nullptr;
     QComboBox* cieBox_ = nullptr;
     QLabel* nitsLabel_ = nullptr;

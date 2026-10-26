@@ -777,6 +777,8 @@ QJsonObject sequenceToJson(const Sequence& s) {
         o["collapsedFolders"] = folders;
     }
     if (s.colorSpace != "rec709") o["colorSpace"] = qs(s.colorSpace);
+    if (!s.workingSpace.empty()) o["workingSpace"] = qs(s.workingSpace);
+    if (!s.outputTransform.empty()) o["outputTransform"] = qs(s.outputTransform);
     if (s.hdrPeakNits != 1000) o["hdrPeakNits"] = s.hdrPeakNits;
     if (!s.trimTargets.empty()) {
         QJsonArray targets;
@@ -832,6 +834,8 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     const QJsonObject gains = o.value("folderGains").toObject();
     for (auto it = gains.begin(); it != gains.end(); ++it) s.folderGains[it.key().toStdString()] = it.value().toDouble();
     s.colorSpace = o.contains("colorSpace") ? ss(o.value("colorSpace")) : "rec709";
+    s.workingSpace = ss(o.value("workingSpace"));
+    s.outputTransform = ss(o.value("outputTransform"));
     s.hdrPeakNits = std::clamp(o.value("hdrPeakNits").toDouble(1000), 100.0, 10000.0);
     for (const auto& v : o.value("trimTargets").toArray()) {
         const QJsonObject tt = v.toObject();

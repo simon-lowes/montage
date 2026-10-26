@@ -471,6 +471,10 @@ ImportResult importOtio(Project& p, const std::string& json, const MediaProber& 
         b.sequence().height = std::max(16, meta.value("height").toInt(1080));
         b.sequence().sampleRate = meta.value("sample_rate").toInt(48000);
     }
+    if (meta.contains("color_space")) b.sequence().colorSpace = meta.value("color_space").toString().toStdString();
+    if (meta.contains("hdr_peak_nits")) b.sequence().hdrPeakNits = std::clamp(meta.value("hdr_peak_nits").toDouble(1000), 100.0, 10000.0);
+    b.sequence().workingSpace = meta.value("working_space").toString().toStdString();
+    b.sequence().outputTransform = meta.value("output_transform").toString().toStdString();
     OtioReader r{p, probe, {}, {}, {}, {}};
     r.gather(tracks, 0);
     r.readTracks(b, tracks, rate, 0);

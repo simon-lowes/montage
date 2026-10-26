@@ -50,6 +50,14 @@ struct RenderOptions {
     // them, in its space (displaySpace converts from there); "" = the master.
     std::string trimTarget;
     std::string displaySpace;  // program frames converted to this space (ColorSpace.h id) for viewing; "" = as is
+    // A sequence graded scene-referred (Sequence::workingSpace): its frames made for, and delivered through the output
+    // transform into, this space (a ColorSpace.h id; a scene-referred one gets the working space's light converted
+    // exactly, as a VFX pull does) at `outputPeak` nits (0: the sequence's); "" = its delivery space. With `sceneLight`
+    // the frame is left in the linear light it was composited in (linearColorSpace of the working space's primaries), for
+    // a trim pass to take through its target's own output transform.
+    std::string outputSpace;
+    double outputPeak = 0;
+    bool sceneLight = false;
     int soloVideoTrack = -1;   // render only this video track (a multicam angle); not passed to nested sequences
     int eye = 0;               // stereoscopic 3D: the eye rendered (0 left, 1 right)
     // How renderProgramFrame shows a stereoscopic sequence's two eyes (render/Stereo.h); flat sequences ignore it.

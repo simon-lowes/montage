@@ -1900,10 +1900,59 @@ bool redactNeedsLiveFaces(const Effect& e, double sourceSeconds) {
     return !tracks || !tracksCover(*tracks, e, sourceSeconds);
 }
 
+EffectDomain effectDomain(const std::string& type) {
+    static const std::map<std::string, EffectDomain> domains = [] {
+        std::map<std::string, EffectDomain> m;
+        for (const char* t : {"color_correct", "curves", "hue_curves", "color_warper", "cdl", "lut", "hue_sat", "levels"})
+            m[t] = EffectDomain::Log;
+        for (const char* t : {"gaussian_blur", "directional_blur", "channel_blur", "glow", "depth_blur", "depth_fog", "lens_flare",
+                              "tilt_shift", "chromatic_aberration", "relight", "vignette", "drop_shadow", "rgb_mixer", "mosaic",
+                              "focus_repair"})
+            m[t] = EffectDomain::Linear;
+        for (const char* t : {"posterize", "halftone", "duotone", "vhs", "find_edges", "emboss", "invert", "chroma_key", "luma_key",
+                              "screen_key", "broadcast_safe", "noise", "depth_map"})
+            m[t] = EffectDomain::Display;
+        return m;
+    }();
+    const auto it = domains.find(type);
+    return it == domains.end() ? EffectDomain::AsIs : it->second;
+}
+
+namespace {
+void applyVideoEffectHere(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds);
+}
+
 void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds) {
     // (a grade node's settings act through the node graph, render/GradeGraph.h; a 3D Camera Tracker only holds its solve)
     // (Sky Replacement runs when tracks are composited, render/SkyReplace.h)
     if (!e.enabled || img.empty() || e.type == "grade_node" || e.type == "camera_track" || e.type == "sky_replace") return;
+    // A sequence graded scene-referred: the effect in the values it is made for, and back.
+    const SceneGrading* sg = currentSceneGrading();
+    const ColorSpace& here = currentWorkingSpace();
+    if (sg && (&here == sg->working || &here == sg->linear)) {
+        const EffectDomain d = effectDomain(e.type);
+        // (log: the working space itself when it is one, a camera's own log included, as a show LUT expects)
+        const ColorSpace* into = d == EffectDomain::Log      ? (here.transfer == Transfer::Linear ? &logColorSpace(here.primaries) : nullptr)
+                                 : d == EffectDomain::Linear ? sg->linear
+                                 : d == EffectDomain::Display ? sg->display
+                                                              : nullptr;
+        if (into && into != &here) {
+            if (d == EffectDomain::Display) outputTransform(img, here, *into, sg->peakNits, sg->kind, true);
+            else convertExactly(img, here, *into);
+            {
+                const WorkingSpaceScope inside(into);
+                applyVideoEffectHere(e, t, img, pixelScale, sourceSeconds);
+            }
+            if (d == EffectDomain::Display) inverseOutputTransform(img, *into, here, sg->peakNits, sg->kind);
+            else convertExactly(img, *into, here);
+            return;
+        }
+    }
+    applyVideoEffectHere(e, t, img, pixelScale, sourceSeconds);
+}
+
+namespace {
+void applyVideoEffectHere(const Effect& e, FrameTime t, Image& img, double pixelScale, double sourceSeconds) {
     struct SourceTime {
         double previous;
         explicit SourceTime(double s) : previous(tSourceSeconds) { tSourceSeconds = s; }
@@ -1972,6 +2021,7 @@ void applyVideoEffect(const Effect& e, FrameTime t, Image& img, double pixelScal
         for (int c = 0; c < 4; ++c) p[c] = o[c] + (p[c] - o[c]) * m;
     }
 }
+}  // namespace
 
 double depthBlurFocus(const Effect& e, FrameTime t, const std::vector<float>& depth, int W, int H) {
     const int follow = int(std::lround(e.p("follow", t, 0)));

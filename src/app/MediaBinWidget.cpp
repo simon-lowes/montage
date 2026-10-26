@@ -1155,6 +1155,14 @@ bool MediaBinWidget::eventFilter(QObject* watched, QEvent* event) {
             ke->accept();
             return true;
         }
+        // Enter opens the clip chosen (on macOS a view starts renaming it instead).
+        if (event->type() == QEvent::KeyPress && mods == Qt::NoModifier && (key == Qt::Key_Return || key == Qt::Key_Enter)) {
+            const QModelIndex current = static_cast<QAbstractItemView*>(watched)->currentIndex();
+            if (current.isValid()) {
+                open(current.data(MediaBinModel::IdRole).toULongLong());
+                return true;
+            }
+        }
         if (rating && !selectedMedia().empty()) {  // (an open editor has the focus, not the view)
             ke->accept();
             if (event->type() == QEvent::KeyPress) {

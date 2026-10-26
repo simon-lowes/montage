@@ -601,6 +601,13 @@ bool analyseAdaptiveHdr(const Project& p, const Sequence& s, FrameTime from, Fra
     RenderOptions o;
     o.scale = std::min(1.0, 960.0 / std::max(1, s.width));  // (enough pixels for the statistics)
     o.highQuality = true;
+    const bool graded = sceneReferredWorking(s);
+    auto rendered = [&](FrameTime f, const std::string& trim, const ColorSpace* to, double peak) {
+        RenderOptions r = o;
+        r.trimTarget = trim;
+        if (to) r.outputSpace = to->id, r.outputPeak = peak;
+        return renderProgramFrame(p, s, f, r);
+    };
     constexpr int kFramesPerScene = 4;
     const size_t count = bounds.size() - 1;
     for (size_t i = 0; i < count; ++i) {
@@ -613,12 +620,20 @@ bool analyseAdaptiveHdr(const Project& p, const Sequence& s, FrameTime from, Fra
                 return false;
             }
             const FrameTime f = a + FrameTime((double(k) + 0.5) * double(b - a) / n);
-            const Image master = renderProgramFrame(p, s, f, o);
-            Image hdr = master, sdr = master;
-            if (hdrTrim) applyTrimPass(hdr, s, f, *hdrTrim);
-            convertColor(hdr, hdrFrom, out, peakNits);
-            if (sdrTarget) applyTrimPass(sdr, s, f, *sdrTarget);
-            else convertColor(sdr, space, sdrSpace, s.hdrPeakNits);
+            Image hdr, sdr;
+            if (graded) {
+                // Graded scene-referred, each picture as its delivery makes it: through its own output transform.
+                hdr = hdrTrim ? rendered(f, hdrTrim->id, nullptr, 0) : rendered(f, {}, &out, peakNits);
+                if (hdrTrim) convertColor(hdr, hdrFrom, out, peakNits);
+                sdr = sdrTarget ? rendered(f, sdrTarget->id, nullptr, 0) : rendered(f, {}, &sdrSpace, 0);
+            } else {
+                const Image master = renderProgramFrame(p, s, f, o);
+                hdr = master, sdr = master;
+                if (hdrTrim) applyTrimPass(hdr, s, f, *hdrTrim);
+                convertColor(hdr, hdrFrom, out, peakNits);
+                if (sdrTarget) applyTrimPass(sdr, s, f, *sdrTarget);
+                else convertColor(sdr, space, sdrSpace, s.hdrPeakNits);
+            }
             fit.add(hdr, sdr);
             if (progress) progress((double(i) + double(k + 1) / n) / double(count));
         }

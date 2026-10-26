@@ -548,6 +548,16 @@ private slots:
             QVERIFY2(std::fabs(bright.at(1, 1)[0] - 4.0f) < 1e-3f && std::fabs(bright.at(1, 1)[1] - 0.5f) < 1e-4f &&
                          std::fabs(bright.at(1, 1)[2] - 0.25f) < 1e-4f,
                      qPrintable(QString("%1 %2 %3").arg(bright.at(1, 1)[0]).arg(bright.at(1, 1)[1]).arg(bright.at(1, 1)[2])));
+            // A sequence graded in ACEScct tells the plugin so, and gives it its picture in ACEScg as it asked.
+            fx.params["param.mode"] = Param(2.0);
+            bright.fill(0.5f, 0.5f, 0.5f, 1.0f);
+            QVERIFY2(ofx::applyEffect(fx, 0, bright, 1.0, {}, &err, findColorSpace("acescct")), err.c_str());
+            QVERIFY2(bright.at(1, 1)[1] == 1.0f && bright.at(1, 1)[2] == 1.0f &&
+                         std::fabs(bright.at(1, 1)[0] - toLinear(Transfer::AcesCct, 0.5)) < 1e-4,
+                     qPrintable(QString("%1 %2 %3").arg(bright.at(1, 1)[0]).arg(bright.at(1, 1)[1]).arg(bright.at(1, 1)[2])));
+            bright.fill(0.5f, 0.5f, 0.5f, 1.0f);
+            QVERIFY2(ofx::applyEffect(fx, 0, bright, 1.0, {}, &err, findColorSpace("rec709")), err.c_str());
+            QCOMPARE(bright.at(1, 1)[1], 0.0f);
         }
         // A missing plugin leaves the picture as it was and says why.
         Effect gone = e;

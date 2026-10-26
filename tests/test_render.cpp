@@ -1963,6 +1963,313 @@ colorspaces:
         QVERIFY2(near(c[0], 0.75f, 0.005f), qPrintable(QString::number(c[0])));
     }
 
+    void sceneReferredGrading() {
+        QTemporaryDir dir;
+        int files = 0;
+        // Patches of code values in `space`, 8 px each, as a 16-bit PNG placed on the first video track (or `track`).
+        auto place = [&](Project& p, Sequence& s, const std::vector<std::array<double, 3>>& patches, const char* space, FrameTime at,
+                         FrameTime len, double srcIn = 0, int track = 0) -> Id {
+            const int W = 8 * int(patches.size()), H = 8;
+            QImage q(W, H, QImage::Format_RGBA64);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const auto& c = patches[size_t(x / 8)];
+                    q.setPixelColor(x, y, QColor::fromRgbF(float(c[0]), float(c[1]), float(c[2]), 1));
+                }
+            const QString path = dir.filePath(QStringLiteral("patches%1.png").arg(files++));
+            MediaItem m;
+            if (!q.save(path) || !probeMedia(path.toStdString(), m)) return 0;
+            m.id = p.newId();
+            m.colorOverride = space;
+            p.media.push_back(m);
+            while (int(s.videoTracks.size()) <= track) s.videoTracks.emplace_back();
+            if (!edit::placeMedia(p, s, m.id, at, srcIn, srcIn + double(len), {TrackKind::Video, track}, {}, false).ok) return 0;
+            return m.id;
+        };
+        // The code values as the PNG holds them.
+        auto stored = [](double v) { return std::round(v * 65535) / 65535; };
+        const ColorSpace& acescct = *findColorSpace("acescct");
+        const ColorSpace& acescg = *findColorSpace("acescg");
+        const ColorSpace& rec709 = *findColorSpace("rec709");
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        QVERIFY(&workingColorSpace(Sequence()) == &rec709);
+        QCOMPARE(&linearColorSpace(Primaries::Ap1), &acescg);
+        QCOMPARE(&logColorSpace(Primaries::Ap1), &acescct);
+        QVERIFY(linearColorSpace(Primaries::SGamut3Cine).transfer == Transfer::Linear && logColorSpace(Primaries::Bt2020).sceneReferred);
+        const std::vector<const ColorSpace*> working = workingColorSpaces();
+        QVERIFY(!working.empty() && std::all_of(working.begin(), working.end(), [](const ColorSpace* c) { return c->sceneReferred; }));
+
+        // The filmic tone scale: 18 % grey near 10 nits on SDR, a little brighter on a 1000-nit display, the peak reached,
+        // and its inverse the way back.
+        QVERIFY2(filmicNits(0.18, 100) > 9 && filmicNits(0.18, 100) < 11, qPrintable(QString::number(filmicNits(0.18, 100))));
+        QVERIFY(filmicNits(0.18, 1000) > filmicNits(0.18, 100) && filmicNits(0.18, 1000) < 20);
+        QCOMPARE(filmicNits(1e6, 100), 100.0);
+        QCOMPARE(filmicNits(1e6, 1000), 1000.0);
+        for (double x : {0.001, 0.05, 0.18, 1.0, 10.0, 60.0})
+            for (double peak : {100.0, 1000.0, 4000.0})
+                QVERIFY2(std::fabs(filmicScene(filmicNits(x, peak), peak) - x) < 1e-6 * std::max(1.0, x),
+                         qPrintable(QString("%1 at %2 nits").arg(x).arg(peak)));
+        // Display white goes back to the light that shows as white, on any display.
+        for (const ColorSpace* d : {&rec709, &pq}) {
+            float w[3] = {1, 1, 1};
+            convertPixel(w, rec709, *d);
+            const float shown[3] = {w[0], w[1], w[2]};
+            inverseOutputPixel(w, *d, acescct, 1000, OutputTransformKind::Filmic);
+            outputPixel(w, acescct, *d, 1000, OutputTransformKind::Filmic);
+            for (int i = 0; i < 3; ++i) QVERIFY2(std::fabs(w[i] - shown[i]) < 1e-5f, qPrintable(QString("%1 vs %2").arg(w[i]).arg(shown[i])));
+        }
+
+        // A Rec.709 sequence with no working space is as it was: an output transform or a display "working space" alone
+        // change nothing, to the bit.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 32;
+        s.height = 8;
+        edit::overwrite(p, s, {TrackKind::Video, 0}, colorClip(p, 0.9f, 0.4f, 0.1f, 0, 30));
+        QVERIFY(place(p, s, {{0.2, 0.4, 0.6}, {0.9, 0.5, 0.1}, {1, 1, 1}, {0.05, 0.02, 0.3}}, "rec709", 0, 30, 0, 1));
+        s.videoTracks[1].clips[0].motion.params["opacity"] = 60.0;
+        s.videoTracks[1].clips[0].effects.push_back(makeEffect(p, "gaussian_blur"));
+        s.videoTracks[1].clips[0].effects.push_back(makeEffect(p, "posterize"));
+        RenderOptions o;
+        const Image before = renderProgramFrame(p, s, 5, o);
+        for (const char* change : {"aces2", "rec709", "rec2100pq"}) {
+            if (std::string(change) == "aces2") s.outputTransform = change;
+            else s.workingSpace = change;
+            QVERIFY(!sceneReferredWorking(s));
+            const Image after = renderProgramFrame(p, s, 5, o);
+            QVERIFY2(after.px == before.px, change);
+        }
+        s.workingSpace.clear();
+        s.outputTransform.clear();
+
+        // One stop in ACEScct (a CDL offset of 1/17.52, made in log) doubles the light.
+        Project lp = makeDefaultProject();
+        Sequence& ls = *lp.active();
+        ls.width = 24;
+        ls.height = 8;
+        ls.workingSpace = "acescct";
+        QVERIFY(sceneReferredWorking(ls));
+        QCOMPARE(&workingColorSpace(ls), &acescct);
+        QCOMPARE(sequenceColorSpace(ls).id, std::string("rec709"));
+        QVERIFY(place(lp, ls, {{0.3, 0.3, 0.3}, {0.41, 0.45, 0.5}, {0.55, 0.5, 0.35}}, "acescct", 0, 30));
+        RenderOptions light;
+        light.outputSpace = "acescg";
+        const Image plain = renderProgramFrame(lp, ls, 5, light);
+        Effect stop = makeEffect(lp, "cdl");
+        for (const char* c : {"r", "g", "b"}) stop.params[std::string("offset.") + c] = 1 / 17.52;
+        ls.videoTracks[0].clips[0].effects.push_back(stop);
+        const Image brighter = renderProgramFrame(lp, ls, 5, light);
+        for (int x : {4, 12, 20})
+            for (int c = 0; c < 3; ++c) {
+                const double ratio = double(brighter.at(x, 4)[c]) / plain.at(x, 4)[c];
+                QVERIFY2(std::fabs(ratio - 2) < 2e-4, qPrintable(QString("patch %1: x%2").arg(x / 8).arg(ratio, 0, 'f', 6)));
+            }
+        // The light read as it was graded: ACEScct code values back to ACEScg exactly.
+        float c[4];
+        rgb(plain, 4, 4, c);
+        QVERIFY2(std::fabs(c[0] - toLinear(Transfer::AcesCct, stored(0.3))) < 1e-5f, qPrintable(QString::number(c[0])));
+
+        // An ACEScg dissolve from 0.18 to 1.8 passes through 0.99 half way: the light, not the code values, mixed.
+        Project dp = makeDefaultProject();
+        Sequence& ds = *dp.active();
+        ds.width = 8;
+        ds.height = 8;
+        ds.workingSpace = "acescg";
+        const double darkCode = stored(fromLinear(Transfer::AcesCct, 0.18)), brightCode = stored(fromLinear(Transfer::AcesCct, 1.8));
+        const Id a = place(dp, ds, {{darkCode, darkCode, darkCode}}, "acescct", 0, 20);
+        QVERIFY(a && place(dp, ds, {{brightCode, brightCode, brightCode}}, "acescct", 20, 20, 10));
+        QVERIFY(edit::addTransition(dp, ds, ds.videoTracks[0].clips[1].id, edit::Edge::In, "cross_dissolve", 11).ok);
+        const double dark = toLinear(Transfer::AcesCct, darkCode), bright = toLinear(Transfer::AcesCct, brightCode);
+        bool halfWay = false;
+        for (FrameTime t = 10; t < 30; ++t) {
+            rgb(renderProgramFrame(dp, ds, t, light), 4, 4, c);
+            QVERIFY2(c[0] > dark - 1e-4 && c[0] < bright + 1e-4, qPrintable(QString("%1 at %2").arg(c[0]).arg(t)));
+            if (std::fabs(c[0] - 0.99f) < 1e-3f) halfWay = true;
+        }
+        QVERIFY(halfWay);
+
+        // White graphics (a title's white) stay white: 1.0 in an SDR delivery, 203 nits (HDR reference white) in a PQ one,
+        // through the table the viewer uses and in an export.
+        Project tp = makeDefaultProject();
+        Sequence& ts = *tp.active();
+        ts.width = 16;
+        ts.height = 8;
+        ts.workingSpace = "acescct";
+        QVERIFY(place(tp, ts, {{0.3, 0.3, 0.3}}, "acescct", 0, 10));
+        edit::overwrite(tp, ts, {TrackKind::Video, 1}, colorClip(tp, 1, 1, 1, 0, 10));
+        auto exported = [&](const char* space, float out[3]) {
+            ExportSettings st;
+            st.path = dir.filePath(QStringLiteral("white-%1.png").arg(space)).toStdString();
+            st.videoCodec = "png";
+            st.pixFmt = "rgb48be";
+            st.audioCodec = "none";
+            st.colorSpace = space;
+            st.in = 2;
+            st.out = 3;
+            std::string err;
+            if (!exportSequence(tp, ts, st, nullptr, nullptr, &err)) return false;
+            const QImage back(dir.filePath(QStringLiteral("white-%1_000000.png").arg(space)));
+            if (back.isNull()) return false;
+            const QColor px = back.pixelColor(4, 4);
+            out[0] = float(px.redF()), out[1] = float(px.greenF()), out[2] = float(px.blueF());
+            return true;
+        };
+        for (const ColorSpace* d : {&rec709, &pq}) {
+            ts.colorSpace = d->id;
+            ts.hdrPeakNits = 1000;
+            const double want = d == &rec709 ? 1.0 : nitsToCode(pq, 203);
+            RenderOptions viewer, delivery;
+            delivery.highQuality = true;
+            rgb(renderProgramFrame(tp, ts, 2, viewer), 4, 4, c);
+            QVERIFY2(std::fabs(c[0] - want) < 1.0 / 1023 && std::fabs(c[2] - want) < 1.0 / 1023, qPrintable(QString::fromStdString(d->id) + ": " + QString::number(c[0])));
+            rgb(renderProgramFrame(tp, ts, 2, delivery), 4, 4, c);
+            QVERIFY2(std::fabs(c[0] - want) < 1e-4, qPrintable(QString::fromStdString(d->id) + ": " + QString::number(c[0])));
+            float e[3];
+            QVERIFY(exported(d->id.c_str(), e));
+            QVERIFY2(std::fabs(e[1] - want) < 1.5 / 1023, qPrintable(QString::fromStdString(d->id) + " export: " + QString::number(e[1])));
+            if (d == &pq) QVERIFY2(std::fabs(codeToNits(pq, e[1]) - 203) < 2, qPrintable(QString::number(codeToNits(pq, e[1]))));
+        }
+        // The ACEScct shot under it is the same light in both: the SDR and HDR deliveries render it each for its display.
+        ts.videoTracks[1].muted = true;
+        ts.colorSpace = "rec709";
+        rgb(renderProgramFrame(tp, ts, 2, o), 4, 4, c);
+        float shot[3] = {float(stored(0.3)), float(stored(0.3)), float(stored(0.3))};
+        outputPixel(shot, acescct, rec709, 100, OutputTransformKind::Filmic);
+        QVERIFY2(std::fabs(c[1] - shot[1]) < 1.0 / 1023, qPrintable(QString("%1 vs %2").arg(c[1]).arg(shot[1])));
+        // Graphics mix with the picture as it is shown: the white at half opacity is half way between white and the shot
+        // on the display, and screened over it, white and no brighter.
+        {
+            ts.videoTracks[1].muted = false;
+            Clip& white = ts.videoTracks[1].clips[0];
+            white.motion.params["opacity"] = 50.0;
+            RenderOptions exact;
+            exact.highQuality = true;
+            rgb(renderProgramFrame(tp, ts, 2, exact), 4, 4, c);
+            QVERIFY2(std::fabs(c[1] - (0.5 + 0.5 * shot[1])) < 2e-3, qPrintable(QString("%1 vs %2").arg(c[1]).arg(0.5 + 0.5 * shot[1])));
+            white.motion.params["opacity"] = 100.0;
+            white.blendMode = "screen";
+            rgb(renderProgramFrame(tp, ts, 2, exact), 4, 4, c);
+            QVERIFY2(std::fabs(c[1] - 1) < 1e-3, qPrintable(QString::number(c[1])));
+            white.blendMode = "normal";
+            ts.videoTracks[1].muted = true;
+        }
+        // A dissolve from white graphics to black passes through mid grey on the display, as it would graded on display
+        // values (mixed as light, the white would hold until the very end).
+        {
+            Project gp = makeDefaultProject();
+            Sequence& gs = *gp.active();
+            gs.width = 8;
+            gs.height = 8;
+            gs.workingSpace = "acescct";
+            QVERIFY(edit::overwrite(gp, gs, {TrackKind::Video, 0}, colorClip(gp, 1, 1, 1, 0, 20)).ok);
+            const Clip black = colorClip(gp, 0, 0, 0, 20, 20);
+            QVERIFY(edit::overwrite(gp, gs, {TrackKind::Video, 0}, black).ok);
+            QVERIFY(edit::addTransition(gp, gs, black.id, edit::Edge::In, "cross_dissolve", 11).ok);
+            RenderOptions exact;
+            exact.highQuality = true;
+            bool middle = false;
+            float last = 2;
+            for (FrameTime t = 10; t < 30; ++t) {
+                rgb(renderProgramFrame(gp, gs, t, exact), 4, 4, c);
+                QVERIFY2(c[1] > -1e-4f && c[1] < 1 + 1e-3f && c[1] <= last + 1e-4f, qPrintable(QString("%1 at %2").arg(c[1]).arg(t)));
+                if (c[1] > 0.35f && c[1] < 0.65f) middle = true;
+                last = c[1];
+            }
+            QVERIFY(middle);
+        }
+        // A luma track matte reads the matte as shown: mid grey lets half of the red through over blue.
+        {
+            Project mp = makeDefaultProject();
+            Sequence& ms = *mp.active();
+            ms.width = 16;
+            ms.height = 8;
+            ms.workingSpace = "acescct";
+            edit::overwrite(mp, ms, {TrackKind::Video, 0}, colorClip(mp, 0, 0, 1, 0, 10));
+            Clip fill = colorClip(mp, 1, 0, 0, 0, 10);
+            Effect key = makeEffect(mp, "track_matte");
+            key.params["composite"] = 1.0;
+            fill.effects.push_back(key);
+            QVERIFY(edit::overwrite(mp, ms, {TrackKind::Video, 1}, fill).ok);
+            QVERIFY(edit::overwrite(mp, ms, {TrackKind::Video, 2}, colorClip(mp, 0.5f, 0.5f, 0.5f, 0, 10)).ok);
+            RenderOptions exact;
+            exact.highQuality = true;
+            rgb(renderProgramFrame(mp, ms, 2, exact), 4, 4, c);
+            QVERIFY2(std::fabs(c[0] - 0.5f) < 0.03f && std::fabs(c[0] + c[2] - 1) < 0.02f, qPrintable(QString("%1 %2 %3").arg(c[0]).arg(c[1]).arg(c[2])));
+        }
+
+        // Effects run in the values they are made for: a blur in light, Posterize on display values, a grade in log.
+        QCOMPARE(effectDomain("gaussian_blur"), EffectDomain::Linear);
+        QCOMPARE(effectDomain("posterize"), EffectDomain::Display);
+        QCOMPARE(effectDomain("color_correct"), EffectDomain::Log);
+        QCOMPARE(effectDomain("transform"), EffectDomain::AsIs);
+        {
+            // Posterize's levels land on display code values: on a Rec.709 delivery, multiples of 1/(levels - 1).
+            Project pp = makeDefaultProject();
+            Sequence& ps = *pp.active();
+            ps.width = 24;
+            ps.height = 8;
+            ps.workingSpace = "acescct";
+            QVERIFY(place(pp, ps, {{0.3, 0.3, 0.3}, {0.45, 0.4, 0.5}, {0.55, 0.6, 0.5}}, "acescct", 0, 10));
+            Effect post = makeEffect(pp, "posterize");
+            ps.videoTracks[0].clips[0].effects.push_back(post);
+            const double levels = post.p("levels", 0, 4);
+            RenderOptions exact;
+            exact.highQuality = true;
+            const Image img = renderProgramFrame(pp, ps, 2, exact);
+            for (int x : {4, 12, 20})
+                for (int k = 0; k < 3; ++k) {
+                    const double v = img.at(x, 4)[k] * (levels - 1);
+                    QVERIFY2(std::fabs(v - std::round(v)) < 1e-3, qPrintable(QString("%1 levels: %2").arg(levels).arg(img.at(x, 4)[k])));
+                }
+        }
+
+        // ACES 2.0 through OpenColorIO: S-Log3 footage in an ACEScct sequence delivered to Rec.709 at 100 nits, as
+        // OpenColorIO renders it, to within a 10-bit step (through the viewer's table) and closely (an export).
+        if (!aces2Renders(rec709)) {
+            qWarning("ACES 2.0 not checked: this OpenColorIO is older than 2.5");
+            QCOMPARE(outputTransformKind(ts), OutputTransformKind::Filmic);
+        } else {
+            Project ap = makeDefaultProject();
+            Sequence& as = *ap.active();
+            const std::vector<std::array<double, 3>> codes = {{0.41, 0.41, 0.41}, {0.6, 0.6, 0.6}, {0.2, 0.3, 0.4}, {0.55, 0.45, 0.35},
+                                                              {0.35, 0.5, 0.3},   {0.7, 0.68, 0.65}, {0.3, 0.3, 0.55}, {0.1, 0.1, 0.1}};
+            as.width = 8 * int(codes.size());
+            as.height = 8;
+            as.workingSpace = "acescct";
+            as.outputTransform = "aces2";
+            QCOMPARE(outputTransformKind(as), OutputTransformKind::Aces2);
+            QVERIFY(place(ap, as, codes, "slog3-sgamut3cine", 0, 10));
+            std::vector<float> ref;
+            for (const auto& v : codes)
+                for (double k : v) ref.push_back(float(stored(k)));
+            std::string err;
+            QVERIFY2(applyOcioBuiltin("SONY_SLOG3-SGAMUT3.CINE_to_ACES2065-1", ref.data(), codes.size(), false, &err), err.c_str());
+            QVERIFY2(applyAces2Output("Rec.1886 Rec.709 - Display", "ACES 2.0 - SDR 100 nits (Rec.709)", ref.data(), codes.size(), false, &err),
+                     err.c_str());
+            RenderOptions exact;
+            exact.highQuality = true;
+            const Image table = renderProgramFrame(ap, as, 2, o), worked = renderProgramFrame(ap, as, 2, exact);
+            for (size_t i = 0; i < codes.size(); ++i)
+                for (int k = 0; k < 3; ++k) {
+                    const float want = ref[i * 3 + k];
+                    const float t = table.at(int(i) * 8 + 4, 4)[k], w = worked.at(int(i) * 8 + 4, 4)[k];
+                    QVERIFY2(std::fabs(t - want) < 1.0f / 1023 && std::fabs(w - want) < 2e-4f,
+                             qPrintable(QString("patch %1 channel %2: table %3, exact %4, OpenColorIO %5").arg(i).arg(k).arg(t).arg(w).arg(want)));
+                }
+            // White graphics stay white through ACES 2.0's own inverse too.
+            ts.outputTransform = "aces2";
+            ts.videoTracks[1].muted = false;
+            RenderOptions delivery;
+            delivery.highQuality = true;
+            for (const ColorSpace* d : {&rec709, &pq}) {
+                ts.colorSpace = d->id;
+                const double want = d == &rec709 ? 1.0 : nitsToCode(pq, 203);
+                rgb(renderProgramFrame(tp, ts, 2, delivery), 4, 4, c);
+                QVERIFY2(std::fabs(c[1] - want) < 2.0 / 1023, qPrintable(QString::fromStdString(d->id) + " ACES 2.0: " + QString::number(c[1])));
+            }
+        }
+    }
+
     void drawnAndGradientMasks() {
         // Coverage is exact across a pixel: a 10.5 x 10 rectangle with its sides a quarter into pixels.
         const std::vector<float> cov = polygonCoverage({{10.25, 10}, {20.75, 10}, {20.75, 20}, {10.25, 20}}, 32, 32);

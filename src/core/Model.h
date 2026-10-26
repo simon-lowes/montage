@@ -608,7 +608,11 @@ struct Sequence {
     std::vector<SharedNode> sharedNodes;   // grade nodes shared by its clips (core/GradeGraph.h)
     std::vector<TrimTarget> trimTargets;   // HDR and SDR deliverables the grade is trimmed for (render/TrimPasses.h)
     std::vector<AdrCue> adrCues;           // lines to re-record, in time order (core/Adr.h)
-    std::string colorSpace = "rec709";  // working and delivery space (ColorSpace.h id)
+    std::string colorSpace = "rec709";  // delivery space (ColorSpace.h id), and the working space when workingSpace is ""
+    // Scene-referred grading: the space clips are graded and composited in (a scene-referred ColorSpace.h id: ACEScct,
+    // ACEScg, a camera log), each viewer and deliverable reached through an output transform; "" = the delivery space.
+    std::string workingSpace;
+    std::string outputTransform;  // "" (Montage's filmic) or "aces2" (ACES 2.0 through OpenColorIO, where it has it)
     double hdrPeakNits = 1000;          // mastering peak for HDR spaces
     double hdrMaxCll = 0, hdrMaxFall = 0;  // measured light levels (Analyse HDR Light Levels), nits; 0 = not measured
     std::vector<Hdr10PlusScene> hdr10Plus;  // HDR10+ metadata from the same analysis (PQ only), in time order

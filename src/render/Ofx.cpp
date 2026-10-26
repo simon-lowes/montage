@@ -1024,11 +1024,15 @@ bool rawSpace(const std::string& name) {
     return name == kOfxColourspaceOfxRaw || name == kOfxColourspaceRaw || name == "data";
 }
 
-// Montage's working space by the config's name (the basic display one in the basic style).
+// Montage's working space by the config's name (the basic display one in the basic style). A scene-referred one the
+// config has no name for is given as ACEScct (the basic scene log one), which the pictures are then converted to.
 std::string workingSpaceName(const ColorSpace& working, const std::string& style) {
-    if (style == kOfxImageEffectColourManagementBasic) return working.hdr() ? kOfxColourspaceOfxDisplayHdr : kOfxColourspaceOfxDisplaySdr;
+    const bool basic = style == kOfxImageEffectColourManagementBasic;
+    if (basic && !working.sceneReferred) return working.hdr() ? kOfxColourspaceOfxDisplayHdr : kOfxColourspaceOfxDisplaySdr;
     for (const NativeSpace& n : kNativeSpaces)
-        if (n.display && n.primaries == working.primaries && n.transfer == working.transfer) return n.name;
+        if (n.display != working.sceneReferred && (!basic || n.basic) && n.primaries == working.primaries && n.transfer == working.transfer)
+            return n.name;
+    if (working.sceneReferred) return basic ? kOfxColourspaceOfxSceneLog : kOfxColourspaceACEScct;
     return kOfxColourspaceRec1886Rec709Display;
 }
 
@@ -1727,15 +1731,17 @@ ColourPlan planColour(Instance& inst, const ColorSpace& working) {
     const std::string& style = inst.colourStyle;
     const bool basic = style == kOfxImageEffectColourManagementBasic;
     const std::string workName = workingSpaceName(working, style);
+    const NativeSpace* workNative = nativeSpace(workName);
+    const bool workExact = !workNative || (workNative->primaries == working.primaries && workNative->transfer == working.transfer);
     auto basicName = [](const std::string& name) {
         const NativeSpace* n = nativeSpace(name);
         return (n && n->basic) || name == kOfxColourspaceOfxDisplaySdr || name == kOfxColourspaceOfxDisplayHdr || name == kOfxColourspaceOfxRaw;
     };
     auto isWorking = [&](const std::string& name) {
         if (basic && !basicName(name)) return false;
-        if (name == workName) return true;
-        if (name == kOfxColourspaceOfxDisplaySdr) return !working.hdr();
-        if (name == kOfxColourspaceOfxDisplayHdr) return working.hdr();
+        if (name == workName) return workExact;
+        if (name == kOfxColourspaceOfxDisplaySdr) return !working.sceneReferred && !working.hdr();
+        if (name == kOfxColourspaceOfxDisplayHdr) return !working.sceneReferred && working.hdr();
         const NativeSpace* n = nativeSpace(name);
         return n && n->primaries == working.primaries && n->transfer == working.transfer;
     };
@@ -1745,6 +1751,7 @@ ColourPlan planColour(Instance& inst, const ColorSpace& working) {
     for (auto& c : inst.obj.clips)
         if (!source && c->name != kOfxImageEffectOutputClipName) source = c.get();
     std::string chosen = workName;
+    if (!workExact) plan.source = workNative;
     // (GetClipPreferences's outArgs hold what the host would do anyway.)
     PropertySet prefs;
     const char* depth = inst.floatImages ? kOfxBitDepthFloat : kOfxBitDepthByte;
@@ -1762,6 +1769,7 @@ ColourPlan planColour(Instance& inst, const ColorSpace& working) {
         for (const std::string& name : prefs.strings(("OfxImageClipPropPreferredColourspaces_" + source->name).c_str())) {
             if (isWorking(name) || (rawSpace(name) && (!basic || basicName(name)))) {
                 chosen = name;
+                plan.source = nullptr;
                 break;
             }
             if (const NativeSpace* n = nativeSpace(name); n && (!basic || n->basic)) {

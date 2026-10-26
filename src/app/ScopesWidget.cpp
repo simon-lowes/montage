@@ -170,6 +170,16 @@ ScopesWidget::ScopesWidget(QWidget* parent) : QWidget(parent) {
     modeBox_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     modeBox_->setToolTip(tr("Scope type"));
     row->addWidget(modeBox_);
+    // What is read: the output, or the working space's values (graded scene-referred).
+    readBox_ = new QComboBox(this);
+    readBox_->setObjectName(QStringLiteral("scopeRead"));
+    readBox_->addItem(tr("Output"));
+    readBox_->addItem(tr("Working Space"));
+    readBox_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    readBox_->setToolTip(tr("Measure the picture as delivered, or (in a sequence graded scene-referred) the values its grade\n"
+                            "works on, in its working space; read when the playhead stops"));
+    row->addWidget(readBox_);
+    connect(readBox_, &QComboBox::currentIndexChanged, this, [this](int i) { setReadsWorking(i == 1); });
     // HDR: the waveform's top in nits, and the frame's light.
     rangeBox_ = new QComboBox(this);
     rangeBox_->setObjectName(QStringLiteral("scopeRange"));
@@ -240,6 +250,16 @@ int ScopesWidget::cieSamplesNear(double a, double b, double radius) const {
             if (std::hypot(ca - a, cb - b) <= radius) n += int(cieCounts_[size_t(by) * kCieBins + bx]);
         }
     return n;
+}
+
+void ScopesWidget::setReadsWorking(bool on) {
+    if (readBox_->currentIndex() != (on ? 1 : 0)) {
+        QSignalBlocker block(readBox_);
+        readBox_->setCurrentIndex(on ? 1 : 0);
+    }
+    if (readsWorking_ == on) return;
+    readsWorking_ = on;
+    emit readWorkingChanged(on);
 }
 
 void ScopesWidget::setFrame(const QImage& image, FrameTime t) { setSignal(image, t, QStringLiteral("rec709"), 1000); }

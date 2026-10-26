@@ -64,6 +64,8 @@ public:
     // The trim pass shown (render/TrimPasses.h: one of the sequence's targets), "" = the master.
     const std::string& trimTarget() const { return trimTarget_; }
     void setTrimTarget(const std::string& id);
+    // The scopes read the working space's values of a sequence graded scene-referred (rendered when paused).
+    void setScopesReadWorking(bool on);
     // Also render HDR sequences as light for the HDR viewer (hdrFrameRendered), beside their SDR pictures.
     void setHdrOutput(bool on);
     bool hdrOutput() const { return hdrOutput_; }
@@ -201,6 +203,7 @@ private:
     bool showCaptions_ = false;
     StereoView stereoView_ = StereoView::Left;
     std::string trimTarget_;
+    bool scopesWorking_ = false;
     bool hdrOutput_ = false;
     std::shared_ptr<const Lut3D> hdrCalibration_;
     double hdrWhite_ = 203;

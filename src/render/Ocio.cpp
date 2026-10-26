@@ -193,6 +193,64 @@ bool applyOcioBuiltin(const std::string& style, float* rgb, size_t count, bool i
     }
 }
 
+bool aces2OutputAvailable() {
+#if OCIO_VERSION_HEX >= 0x02050000
+    static const bool available = [] {  // (its built-in ACES 2.0 config there to load)
+        try {
+            return bool(OCIO::Config::CreateFromBuiltinConfig("studio-config-v4.0.0_aces-v2.0_ocio-v2.5"));
+        } catch (const OCIO::Exception&) {
+            return false;
+        }
+    }();
+    return available;
+#else
+    return false;
+#endif
+}
+
+bool applyAces2Output(const std::string& display, const std::string& view, float* rgb, size_t count, bool inverse, std::string* error) {
+#if OCIO_VERSION_HEX >= 0x02050000
+    static std::map<std::string, OCIO::ConstCPUProcessorRcPtr> cache;
+    static std::map<std::string, std::string> failed;  // (made once: the reason it could not be)
+    OCIO::ConstCPUProcessorRcPtr cpu;
+    const std::string key = display + '|' + view + (inverse ? "|inverse" : "");
+    try {
+        {
+            std::lock_guard lock(ocioMutex());
+            if (auto it = cache.find(key); it != cache.end()) cpu = it->second;
+            else if (auto f = failed.find(key); f != failed.end()) {
+                if (error) *error = f->second;
+                return false;
+            }
+        }
+        if (!cpu) {
+            OCIO::ConstConfigRcPtr cfg = OCIO::Config::CreateFromBuiltinConfig("studio-config-v4.0.0_aces-v2.0_ocio-v2.5");
+            OCIO::DisplayViewTransformRcPtr t = OCIO::DisplayViewTransform::Create();
+            t->setSrc("ACES2065-1");
+            t->setDisplay(display.c_str());
+            t->setView(view.c_str());
+            cpu = cfg->getProcessor(t, inverse ? OCIO::TRANSFORM_DIR_INVERSE : OCIO::TRANSFORM_DIR_FORWARD)->getDefaultCPUProcessor();
+            std::lock_guard lock(ocioMutex());
+            cache[key] = cpu;
+        }
+        OCIO::PackedImageDesc desc(rgb, long(count), 1, 3);
+        cpu->apply(desc);
+        return true;
+    } catch (const OCIO::Exception& ex) {
+        if (error) *error = ex.what();
+        if (!cpu) {
+            std::lock_guard lock(ocioMutex());
+            failed[key] = ex.what();
+        }
+        return false;
+    }
+#else
+    (void)display, (void)view, (void)rgb, (void)count, (void)inverse;
+    if (error) *error = "ACES 2.0 needs OpenColorIO 2.5 or later (this is " + ocioVersion() + ")";
+    return false;
+#endif
+}
+
 bool applyOcioFile(const std::string& path, float* rgb, size_t count, std::string* error) {
     try {
         OCIO::FileTransformRcPtr t = OCIO::FileTransform::Create();
@@ -224,6 +282,11 @@ bool applyOcioBuiltin(const std::string&, float*, size_t, bool, std::string* err
     return false;
 }
 bool applyOcioFile(const std::string&, float*, size_t, std::string* error) {
+    if (error) *error = "Montage was built without OpenColorIO";
+    return false;
+}
+bool aces2OutputAvailable() { return false; }
+bool applyAces2Output(const std::string&, const std::string&, float*, size_t, bool, std::string* error) {
     if (error) *error = "Montage was built without OpenColorIO";
     return false;
 }

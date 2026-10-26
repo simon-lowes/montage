@@ -12925,6 +12925,25 @@ const auto seq = [this] { return state()->sequence(); };
         space->setCurrentIndex(space->findData(QString("rec709")));
         QVERIFY(!peak->isEnabled());
         QCOMPARE(dlg.spec().colorSpace, std::string("rec709"));
+        // Graded scene-referred: a working space apart from it, and the output transform (for a working space only).
+        auto* working = dlg.findChild<QComboBox*>("workingSpace");
+        auto* output = dlg.findChild<QComboBox*>("outputTransform");
+        QVERIFY(working && output);
+        QCOMPARE(working->currentIndex(), 0);
+        QVERIFY(!output->isEnabled());
+        QCOMPARE(working->count(), int(workingColorSpaces().size()) + 1);
+        working->setCurrentIndex(working->findData(QString("acescct")));
+        QVERIFY(output->isEnabled());
+        QCOMPARE(dlg.spec().workingSpace, std::string("acescct"));
+        QCOMPARE(dlg.spec().outputTransform, std::string());
+        // A project graded through ACES 2.0 keeps it, whether or not this OpenColorIO has it.
+        spec.workingSpace = "acescg";
+        spec.outputTransform = "aces2";
+        dlg.setSpec(spec);
+        QCOMPARE(working->currentData().toString(), QString("acescg"));
+        QCOMPARE(dlg.spec().outputTransform, std::string("aces2"));
+        dlg.setSpec(spec);
+        QCOMPARE(output->count(), 2);  // (kept once)
 
         // Export: deliver the HLG sequence as it is or in any display space.
         state()->edit("HLG", [](Project&, Sequence& s) {
@@ -12948,6 +12967,56 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
         win_->activateWindow();  // the context menu took the focus
         QVERIFY(QTest::qWaitForWindowActive(win_.get()));
+    }
+
+    void sceneReferredGradingUi() {
+        state()->newProject();
+        Id clip = 0;
+        QVERIFY(state()->apply("Grey", [&clip](Project& p, Sequence& s) {
+            Clip c = makeGeneratorClip(p, "color", 50);
+            for (const char* k : {"color.r", "color.g", "color.b"}) c.generator.params[k] = 0.5;
+            c.effects.push_back(makeEffect(p, "posterize"));
+            c.effects.push_back(makeEffect(p, "gaussian_blur"));
+            clip = c.id;
+            return edit::overwrite(p, s, {TrackKind::Video, 0}, c);
+        }));
+        state()->setSelection({clip});
+        QApplication::processEvents();
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QVERIFY(inspector);
+        // Posterize works on display values: marked once the sequence is graded scene-referred (and the blur, which works
+        // in light, is not).
+        QVERIFY(!inspector->findChild<QLabel*>("displayDomain"));
+        QVERIFY(state()->edit("Grade scene-referred", [](Project&, Sequence& s) {
+            s.workingSpace = "acescct";
+            return true;
+        }));
+        QTRY_COMPARE(inspector->findChildren<QLabel*>("displayDomain").size(), qsizetype(1));
+        // The scopes read the output, or the working space's values when asked (when the playhead stops).
+        QVERIFY(state()->edit("Effects off", [clip](Project&, Sequence& s) {
+            for (Effect& e : edit::clipById(s, clip)->effects) e.enabled = false;
+            return true;
+        }));
+        auto* program = win_->findChild<PlaybackController*>("programPlayback");
+        auto* scopes = win_->findChild<ScopesWidget*>();
+        QVERIFY(program && scopes);
+        auto* read = scopes->findChild<QComboBox*>("scopeRead");
+        QVERIFY(read);
+        QSignalSpy spy(program, &PlaybackController::scopeFrameRendered);
+        auto lastSpace = [&spy] { return spy.isEmpty() ? QString() : spy.last().at(2).toString(); };
+        read->setCurrentIndex(1);
+        QVERIFY(scopes->readsWorking());
+        QTRY_COMPARE(lastSpace(), QString("acescct"));
+        // 0.5 graphics grey comes in through the inverse output transform: the ACEScct code value that shows as it.
+        float grey[3] = {0.5f, 0.5f, 0.5f};
+        inverseOutputPixel(grey, rec709Space(), *findColorSpace("acescct"), 1000, OutputTransformKind::Filmic);
+        const QImage working = spy.last().at(0).value<QImage>();
+        QVERIFY(!working.isNull());
+        const QColor px = working.pixelColor(working.width() / 2, working.height() / 2);
+        QVERIFY2(std::fabs(px.redF() - grey[0]) < 0.02, qPrintable(QString("%1 vs %2").arg(px.redF()).arg(grey[0])));
+        read->setCurrentIndex(0);
+        QTRY_COMPARE(lastSpace(), QString("rec709"));
+        state()->newProject();
     }
 
     void multicamPanelSwitching() {
@@ -17210,7 +17279,11 @@ print("added " + ui["name"])
         const size_t before = state()->sequence()->markers.size();
         viewer->findChild<QLineEdit*>("reviewNote")->setText(QStringLiteral("Warmer here"));
         viewer->findChild<QPushButton*>("reviewAddMarker")->click();
-        QTRY_COMPARE_WITH_TIMEOUT(state()->sequence()->markers.size(), before + 1, 10000);
+        QTRY_VERIFY2_WITH_TIMEOUT(state()->sequence()->markers.size() == before + 1,
+                                  qPrintable(QStringLiteral("viewer: %1; editor: %2")
+                                                 .arg(viewer->findChild<QLabel*>("reviewStatus")->text(),
+                                                      dlg->findChild<QLabel*>("reviewStreamStatus")->text())),
+                                  10000);
         auto it = std::find_if(state()->sequence()->markers.begin(), state()->sequence()->markers.end(),
                                [](const Marker& m) { return m.comment == "Warmer here"; });
         QVERIFY(it != state()->sequence()->markers.end());

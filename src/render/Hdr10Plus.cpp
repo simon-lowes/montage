@@ -260,6 +260,9 @@ bool analyseHdr10Plus(const Project& p, const Sequence& s, FrameTime from, Frame
     RenderOptions o;
     o.scale = 1.0;
     o.highQuality = true;
+    // (Graded scene-referred, the frames made for `out` through its own output transform, as a delivery to it is.)
+    const bool graded = sceneReferredWorking(s);
+    if (graded) o.outputSpace = out.id, o.outputPeak = peakNits;
     const LightMeter lightMeter(out);
     std::vector<QByteArray> keys;
     size_t nextCut = 0;
@@ -273,7 +276,7 @@ bool analyseHdr10Plus(const Project& p, const Sequence& s, FrameTime from, Frame
             img = frame(f);
         } else {
             img = renderProgramFrame(p, s, f, o);
-            convertColor(img, space, out, peakNits);
+            if (!graded) convertColor(img, space, out, peakNits);
         }
         const bool cut = nextCut < cuts.size() && cuts[nextCut] == f;
         if (cut) ++nextCut;

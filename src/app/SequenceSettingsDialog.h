@@ -1,5 +1,5 @@
 // Montage — sequence settings: name, frame size, frame rate, audio sample
-// rate and colour space, for editing the active sequence or creating a new one.
+// rate, colour space and working space, for editing the active sequence or creating a new one.
 #pragma once
 
 #include <QDialog>
@@ -32,6 +32,8 @@ struct NewSequenceSpec {
     bool vr180 = false;                  // with spherical: the front half of the sphere (Sequence::vr180)
     bool stereo3d = false;               // a stereoscopic 3D sequence (Sequence::stereo3d)
     std::string filmGauge;               // cut on film: the gauge it is counted in (Sequence::filmGauge)
+    std::string workingSpace;            // graded scene-referred in this space (Sequence::workingSpace); "" = as delivered
+    std::string outputTransform;         // (Sequence::outputTransform)
 };
 
 // Spin box that only accepts even values (most encoders need even frame sizes).
@@ -76,6 +78,8 @@ private:
     QComboBox* sampleRate_ = nullptr;
     QComboBox* colorSpace_ = nullptr;
     QSpinBox* hdrPeak_ = nullptr;
+    QComboBox* workingSpace_ = nullptr;
+    QComboBox* outputTransform_ = nullptr;
     QComboBox* audioLayout_ = nullptr;
     QComboBox* filmGauge_ = nullptr;
     QCheckBox* spherical_ = nullptr;
