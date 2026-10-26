@@ -13085,7 +13085,7 @@ const auto seq = [this] { return state()->sequence(); };
         std::vector<qint64> wraps;
         for (size_t i = 0; i < seen.size(); ++i) {
             QVERIFY2(seen[i].second >= 10 && seen[i].second <= 19, qPrintable(QString::number(seen[i].second)));
-            if (i > 0 && seen[i].second < seen[i - 1].second) wraps.push_back(seen[i].first);
+            if (i > 0 && seen[i].second + 5 < seen[i - 1].second) wraps.push_back(seen[i].first);  // (back to In, not a frame)
         }
         QVERIFY2(wraps.size() >= 2, qPrintable(QString::number(wraps.size())));
         const double fps = state()->sequence()->fpsValue();
@@ -17869,6 +17869,12 @@ print("added " + ui["name"])
             }
             QTest::keyClicks(field, wav);
             QTest::keyClick(field, Qt::Key_Return);
+            // (Return can go to the name's completion list when it opens late, which leaves Qt's own dialog up: the
+            // file typed is taken as it would be on a second Return.)
+            if (dialog->isVisible()) {
+                dialog->selectFile(wav);
+                static_cast<QDialog*>(dialog)->accept();
+            }
             *typed = true;
         });
         QTest::keyClick(win_.get(), Qt::Key_I, Qt::ControlModifier);

@@ -216,6 +216,8 @@ private:
     FrameTime position_ = 0;
     FrameTime startFrame_ = 0;
     QElapsedTimer clock_;
+    double lastElapsed_ = 0;  // (the clock as last read, in seconds)
+    void restartClock();
     QTimer timer_;
     QThread* renderThread_ = nullptr;
     RenderWorker* worker_ = nullptr;

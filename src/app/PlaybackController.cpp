@@ -875,7 +875,7 @@ void PlaybackController::seek(FrameTime t) {
     position_ = t;
     if (playing) {
         startFrame_ = t;
-        clock_.restart();
+        restartClock();
         if (speed_ == 1) startAudio(t);
     }
     requestFrame();
@@ -959,7 +959,7 @@ void PlaybackController::play() {
     if (position_ >= end && end > 0) position_ = loop_ && s->inPoint >= 0 ? s->inPoint : 0;
     speed_ = 1;
     startFrame_ = position_;
-    clock_.restart();
+    restartClock();
     startAudio(position_);
     timer_.start();
     syncOutput();
@@ -992,7 +992,7 @@ void PlaybackController::shuttle(int direction) {
     bool wasPlaying = isPlaying();
     speed_ = next;
     startFrame_ = position_;
-    clock_.restart();
+    restartClock();
     if (speed_ == 1) startAudio(position_);
     else stopAudio();
     timer_.start();
@@ -1010,12 +1010,17 @@ void PlaybackController::setSpeed(double speed) {
     const bool wasPlaying = isPlaying();
     speed_ = std::clamp(speed, -32.0, 32.0);
     startFrame_ = position_;
-    clock_.restart();
+    restartClock();
     if (speed_ == 1) startAudio(position_);
     else stopAudio();
     timer_.start();
     syncOutput();
     if (!wasPlaying) emit playingChanged(true);
+}
+
+void PlaybackController::restartClock() {
+    clock_.restart();
+    lastElapsed_ = 0;
 }
 
 void PlaybackController::tick() {
@@ -1031,6 +1036,8 @@ void PlaybackController::tick() {
         double played = (sink_->processedUSecs() - sink_->format().durationForBytes(buffered)) / 1e6;
         if (played > 0 && std::fabs(played - elapsed) < 0.25) elapsed = played;
     }
+    // (never back: going between the two clocks would step the picture back a frame or two)
+    elapsed = lastElapsed_ = std::max(elapsed, lastElapsed_);
     FrameTime t = startFrame_ + FrameTime(std::floor(elapsed * s->fpsValue() * speed_));
     FrameTime end = s->duration();
     FrameTime loopIn = s->inPoint >= 0 ? s->inPoint : 0;
@@ -1045,7 +1052,7 @@ void PlaybackController::tick() {
     } else if (loop_ && speed_ > 0 && t >= loopOut) {
         t = loopIn;
         startFrame_ = t;
-        clock_.restart();
+        restartClock();
         if (speed_ == 1) startAudio(t);
     } else if (speed_ > 0 && t >= end) {
         t = end;
@@ -1181,7 +1188,7 @@ void PlaybackController::refreshAudio(bool reopen) {
         if (!sink_ || reopen) {
             // (the picture's clock afresh with the sound, as after a seek)
             startFrame_ = position_;
-            clock_.restart();
+            restartClock();
             startAudio(position_);
         }
     } else if (monitorKeepsAudio()) {
