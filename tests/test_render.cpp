@@ -59,6 +59,7 @@
 #include "render/XmlCanonical.h"
 #include "core/Interpretation.h"
 #include "media/Decoder.h"
+#include "media/Exr.h"
 #include "media/DescribePicture.h"
 #include "media/LanguageModel.h"
 #include "render/FootageWords.h"
@@ -7376,6 +7377,180 @@ colorspaces:
             QCOMPARE(back.captions[i].end, t.captions[i].end);
             QCOMPARE(back.captions[i].vertical, t.captions[i].vertical);
         }
+    }
+
+    void exportsImfArchival() {
+        if (!exrAvailable()) QSKIP("Built without the OpenEXR library");
+        QTemporaryDir dir;
+        // A second at 24 fps graded scene-referred in ACEScct: an orange matte, then a blue one inverted by the grade.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = Rational{24, 1};
+        s.workingSpace = "acescct";
+        s.videoTracks[0].clips = {colorClip(p, 0.8f, 0.3f, 0.1f, 0, 12), colorClip(p, 0.1f, 0.4f, 0.8f, 12, 12)};
+        s.videoTracks[0].clips[1].effects.push_back(makeEffect("invert", p.newId()));
+        Sequence cut1 = s;
+        cut1.id = p.newId();
+        cut1.name = "Cut 1";
+        p.sequences.push_back(cut1);
+        Sequence& now = *p.active();
+        ImfSettings st;
+        st.title = "Archive";
+        st.captions = false;
+        st.application = 5;
+        st.targetFrames = {3, 18};
+        ImfResult r;
+        std::string err;
+        QVERIFY2(exportImf(p, now, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+        QVERIFY(r.application == 5 && r.frames == 24 && r.colour == "aces2065-1" && r.targetFrames == 2 && r.codedFrames == 24);
+        QCOMPARE(QString::fromStdString(r.outputTransform), QStringLiteral("urn:montage:transformId:Output.Montage.Filmic.rec709_100nit"));
+        QVERIFY(QFileInfo::exists(QString::fromStdString(r.amf)));
+        std::vector<std::string> issues = verifyImf(r.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        QStringList photon = photonErrors(QString::fromStdString(r.folder));
+        QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+        // The composition names Application #5 and the output transform.
+        ImfComposition comp;
+        QVERIFY(readImfComposition(r.cpl, comp, &err));
+        QVERIFY(comp.application == 5 && comp.colour == "aces2065-1" && comp.acesAuthoring == r.outputTransform && comp.width == 320);
+        const QDir out(QString::fromStdString(r.folder));
+        const std::string video = out.filePath(out.entryList({"VIDEO_*.mxf"}).value(0)).toStdString();
+        // Every frame an ACES image container (ST 2065-4) equal to the render in ACES 2065-1, in half floats.
+        RenderOptions ao;
+        ao.highQuality = true;
+        ao.outputSpace = "aces2065-1";
+        dcp::ImfTrackReader reader;
+        QVERIFY2(reader.open(video, &err), err.c_str());
+        QVERIFY(reader.imfAces() && reader.frames() == 24 && reader.width() == 320 && reader.height() == 180);
+        QCOMPARE(QString::fromStdString(reader.acesAuthoring()), QString::fromStdString(r.outputTransform));
+        for (int k : {0, 3, 18, 23}) {
+            std::vector<uint8_t> bytes;
+            AcesContainerInfo info;
+            QVERIFY(reader.frame(k, bytes) && readAcesContainer(bytes.data(), bytes.size(), info));
+            QVERIFY2(info.conforming && !info.alpha && info.width == 320, info.why.c_str());
+            std::vector<float> rgba;
+            int w = 0, h = 0;
+            QVERIFY2(readImfAcesFrame(video, k, rgba, w, h, &err), err.c_str());
+            const Image want = renderProgramFrame(p, now, k, ao);
+            QVERIFY(w == 320 && h == 180 && want.width == 320 && rgba.size() == want.px.size());
+            std::vector<qfloat16> halves(want.px.size());
+            qFloatToFloat16(halves.data(), want.px.data(), qsizetype(halves.size()));
+            for (size_t i = 0; i < rgba.size(); ++i)
+                if (i % 4 != 3 && rgba[i] != float(halves[i])) QFAIL(qPrintable(QStringLiteral("frame %1 value %2: %3, rendered %4").arg(k).arg(i).arg(rgba[i]).arg(float(halves[i]))));
+        }
+        // The target frames: those frames through the output transform, as delivered.
+        RenderOptions dout;
+        dout.highQuality = true;
+        for (int i = 0; i < 2; ++i) {
+            std::vector<uint16_t> tiff;
+            int w = 0, h = 0;
+            int64_t frame = -1;
+            QVERIFY2(readImfTargetFrame(video, i, tiff, w, h, &frame, &err), err.c_str());
+            QVERIFY(w == 320 && h == 180 && frame == (i ? 18 : 3));
+            const Image shown = renderProgramFrame(p, now, frame, dout);
+            for (int c = 0; c < 3; ++c) {
+                const double got = tiff[(size_t(90) * 320 + 160) * 3 + size_t(c)] / 65535.0;
+                QVERIFY2(std::fabs(got - shown.at(160, 90)[c]) < 2.0 / 255, qPrintable(QStringLiteral("target %1 channel %2: %3, delivered %4").arg(i).arg(c).arg(got).arg(shown.at(160, 90)[c])));
+            }
+        }
+        // The ACES Metadata File: the pictures' clip, no input transform (already ACES), an ACES Metadata File as AMF reads it.
+        AmfDocument amf;
+        QVERIFY2(readAmf(r.amf, amf, &err), err.c_str());
+        QVERIFY(!amf.hasInput && amf.clipName == "Archive");
+
+        // Ungraded: the inverted shot as it comes in; no target frames.
+        {
+            ImfSettings un = st;
+            un.graded = false;
+            un.targetFrames.clear();
+            un.title = "Archive ungraded";
+            ImfResult ru;
+            QVERIFY2(exportImf(p, now, un, dir.path().toStdString(), &ru, {}, &err), err.c_str());
+            QVERIFY(ru.targetFrames == 0 && ru.amf.empty());
+            issues = verifyImf(ru.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            photon = photonErrors(QString::fromStdString(ru.folder));
+            QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+            const QDir uo(QString::fromStdString(ru.folder));
+            std::vector<float> graded, ungraded;
+            int w = 0, h = 0;
+            QVERIFY(readImfAcesFrame(uo.filePath(uo.entryList({"VIDEO_*.mxf"}).value(0)).toStdString(), 18, ungraded, w, h, &err));
+            QVERIFY(readImfAcesFrame(video, 18, graded, w, h, &err));
+            Project plain = p;
+            plain.active()->videoTracks[0].clips[1].effects.clear();
+            const Image want = renderProgramFrame(plain, *plain.active(), 18, ao);
+            const size_t centre = (size_t(90) * 320 + 160) * 4;
+            for (int c = 0; c < 3; ++c) {
+                QVERIFY(std::fabs(ungraded[centre + size_t(c)] - want.px[centre + size_t(c)]) <= 1e-3f * std::max(1.0f, std::fabs(want.px[centre + size_t(c)])));
+                QVERIFY(std::fabs(ungraded[centre + size_t(c)] - graded[centre + size_t(c)]) > 0.01f);
+            }
+        }
+
+        // A display-referred sequence: its frames into ACES through the inverse of the filmic output transform, which
+        // brings the target frames back to what it delivers.
+        {
+            Project d = p;
+            Sequence& ds = *d.active();
+            ds.workingSpace.clear();
+            ImfSettings dst = st;
+            dst.title = "Archive display";
+            dst.targetFrames = {3};
+            ImfResult rd;
+            QVERIFY2(exportImf(d, ds, dst, dir.path().toStdString(), &rd, {}, &err), err.c_str());
+            issues = verifyImf(rd.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            const QDir dout2(QString::fromStdString(rd.folder));
+            std::vector<uint16_t> tiff;
+            int w = 0, h = 0;
+            QVERIFY(readImfTargetFrame(dout2.filePath(dout2.entryList({"VIDEO_*.mxf"}).value(0)).toStdString(), 0, tiff, w, h, nullptr, &err));
+            const Image shown = renderProgramFrame(d, ds, 3, dout);
+            for (int c = 0; c < 3; ++c) QVERIFY(std::fabs(tiff[(size_t(90) * 320 + 160) * 3 + size_t(c)] / 65535.0 - shown.at(160, 90)[c]) < 2.0 / 255);
+        }
+
+        // A supplemental: the blue shot changed, so only its twelve frames are new; it keeps the output transform.
+        now.videoTracks[0].clips[1].generator.params["color.g"] = 0.6;
+        ImfSettings sup = st;
+        sup.targetFrames.clear();
+        sup.supplementOf = r.folder;
+        sup.originalSequence = cut1.id;
+        ImfResult r2;
+        QVERIFY2(exportImf(p, now, sup, dir.path().toStdString(), &r2, {}, &err), err.c_str());
+        QVERIFY2(r2.supplemental && r2.codedFrames == 12, qPrintable(QString::number(r2.codedFrames)));
+        QCOMPARE(r2.outputTransform, r.outputTransform);
+        issues = verifyImf(r2.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        photon = photonErrors(QString::fromStdString(r2.folder));
+        QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+
+        // Opened again: a sequence in ACES 2065-1 delivered through the same output transform, its frames as written.
+        Project q = makeDefaultProject();
+        const ImportResult in = importImf(q, r.folder, [](const std::string& f, MediaItem& m) { return probeMedia(f, m, nullptr); });
+        QVERIFY2(in.error.empty(), in.error.c_str());
+        const Sequence* back = q.findSequence(in.sequence);
+        QVERIFY(back && back->workingSpace == "aces2065-1" && back->colorSpace == "rec709" && back->outputTransform.empty());
+        QVERIFY(back->width == 320 && back->height == 180 && back->videoTracks[0].clips.size() == 1);
+        {
+            const Image again = renderProgramFrame(q, *back, 18, ao);
+            std::vector<float> written;
+            int w = 0, h = 0;
+            QVERIFY(readImfAcesFrame(video, 18, written, w, h, &err));
+            const size_t centre = (size_t(90) * 320 + 160) * 4;
+            for (int c = 0; c < 3; ++c)
+                QVERIFY2(std::fabs(again.px[centre + size_t(c)] - written[centre + size_t(c)]) <= 1e-3f * std::max(1.0f, std::fabs(written[centre + size_t(c)])),
+                         qPrintable(QStringLiteral("%1 %2").arg(again.px[centre + size_t(c)]).arg(written[centre + size_t(c)])));
+        }
+
+        // Refused: a target frame outside what is exported, target frames for Application #2E, an Application #2E
+        // supplemental of this package.
+        ImfSettings bad = st;
+        bad.targetFrames = {40};
+        QVERIFY(!exportImf(p, now, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("outside") != std::string::npos);
+        bad = st;
+        bad.application = 2;
+        QVERIFY(!exportImf(p, now, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("Application #5") != std::string::npos);
+        bad = sup;
+        bad.application = 2;
+        QVERIFY(!exportImf(p, now, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("supplemental keeps") != std::string::npos);
     }
 
     void exportsImfSupplementalAt2997() {

@@ -1463,7 +1463,22 @@ The tenth gap analysis (`docs/research/phase11-roadmap.md`, October 2026) ranks 
     - Which record is later is judged by the ids each copy had made. Copies that merge each other back and forth without making new ids may need the base chosen.
     - A clip trimmed on one side and moved to another track on the other is two conflicts (removed and changed, and moved), not one trimmed and moved clip.
     - Productions have no copy-for-someone command of their own; Save a Copy for Another Editor into the production folder does it.
-- [ ] 5. Archival masters as IMF Application #5 (ACES 2065-1 OpenEXR in MXF) (S–M)
+- [x] 5. Archival masters as IMF Application #5 (ACES 2065-1 OpenEXR in MXF) (S–M)
+  - Done: `ImfSettings.application = 5` in `render/Imf`. Each frame is a whole ST 2065-4 OpenEXR file (`media/Exr` `writeAcesContainer`: half float, uncompressed, B G R, AP0 chromaticities, `acesImageContainerFlag`, adopted neutral) in one KLV, frame wrapped in the ST 2065-5 container (`dcp::ImfAcesWriter`). The RGBA descriptor has ACES primaries, linear transfer, a PixelLayout of half floats, the ContainerConstraints and ACESPicture sub-descriptors (authoring information and mastering display), and a TargetFrame sub-descriptor per target frame.
+    - The composition carries the ST 2067-50 application identification under the 2067-2:2016 core constraints namespace, as Photon expects for #5. The output transform is named by `imfOutputTransform`: ACES 2.0's transform id for a sequence graded through ACES 2.0, else `urn:montage:transformId:Output.Montage.Filmic.<display>_<peak>nit`.
+    - Scene-referred sequences render with `outputSpace = "aces2065-1"` (exact). Display-referred ones go through the inverse of the filmic output transform. Ungraded renders a copy of the project without grade effects, colour group effects or shared grade nodes.
+    - Target frames: the frame as delivered (the output transform worked out exactly), a 16-bit RGB TIFF in a generic stream partition after the essence, its resource id a UUID v5 of its bytes. With target frames an ACES Metadata File (`AMF_<id>.amf`) goes in the package, in the packing list and asset map.
+    - Supplementals compare ACES frames with a small tolerance and keep the earlier package's application and output transform (both refused if different).
+    - `verifyImf` checks every frame is a conforming ACES container of the composition's size and every target frame is present, indexed and decodes. `readImfComposition` reads the application, ACES authoring and mastering peak. `importImf` makes the sequence work in ACES 2065-1 with the named display and transform. The decoder plays ACES MXF frames (`probeMedia` says exr in aces2065-1).
+    - File › Export IMF Master gets Master (Application #2E or #5), Grade and Target frame (the playhead). MCP `montage_export_imf` `application`, `graded`, `target_frames`.
+  - **Tests:**
+    - render `exportsImfArchival`: a scene-referred ACEScct sequence with an inverted shot and two target frames. Result fields, the filmic transform name, `verifyImf` and Photon pass, and the composition reads back. Frames 0, 3, 18 and 23 are conforming containers equal to the render in half float. The target frames match the delivered render, and the AMF reads. Ungraded differs from graded and matches the render without the effect. A display-referred sequence's target frame matches its delivery. A supplemental after changing the second shot codes 12 frames and passes the checks and Photon. Import gives an ACES 2065-1 sequence whose frame matches what was written. Refusals: a target frame outside the export, target frames for #2E, and a #2E supplemental of a #5 package.
+    - app `exportImfFromTheFileMenu`: the dialog's Master switches the grade and target frame on and JPEG 2000's colour off; MCP makes a #5 package with a target frame and an AMF and it checks out.
+  - Not yet:
+    - Alpha: frames are written opaque (B G R); the A B G R layout is read and written by the container code but not offered.
+    - A supplemental keeps the earlier package's target frames, which may show pictures it replaces. Its own target frames go only on frames it codes anew (others are left out, untested).
+    - A display-referred sequence in a space other than Rec.709, P3-D65 PQ, Rec.2100 PQ or HLG is named for Rec.709.
+    - Photon cannot check the ancillary resources (target frames) yet; Montage's own check decodes them.
 - [ ] 6. SDR brought up into HDR by ITU-R BT.2446-1 methods A and C, and those methods for HDR to SDR (S)
 - [ ] 7. Cinema loudness: Leq(m), the loudness range gated by dialogue, loudness logs and reports (S)
 - [ ] 8. Shots grouped by camera angle and by scene for grading (S–M)

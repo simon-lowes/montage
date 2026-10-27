@@ -102,6 +102,23 @@ std::string exrCompressionLabel(const std::string& name);
 bool writeExr(const std::string& file, int width, int height, const std::vector<ExrOutLayer>& layers, const std::string& compression,
               const std::map<std::string, std::string>& attributes = {}, std::string* error = nullptr);
 
+// ---- ACES image container (SMPTE ST 2065-4) -------------------------------------------------------------------------
+
+// One frame as an ACES image container file in memory: ACES 2065-1 (AP0, linear) half floats, uncompressed scanlines,
+// the channels B, G, R (and A when `alpha`), with the attributes ST 2065-4 requires (acesImageContainerFlag, the AP0
+// chromaticities, the adopted neutral). `rgba` is width * height straight (not premultiplied) RGBA floats.
+bool writeAcesContainer(int width, int height, const float* rgba, bool alpha, std::vector<uint8_t>& out, std::string* error = nullptr);
+// Reads one back: its size, RGBA (A 1 without alpha) as stored, whether it has alpha, and whether it is an ACES image
+// container as ST 2065-4 has it (the flag, the AP0 chromaticities, half floats, no compression, scanlines), else why not.
+struct AcesContainerInfo {
+    int width = 0, height = 0;
+    bool alpha = false;
+    bool conforming = false;
+    std::string why;  // when not conforming
+};
+bool readAcesContainer(const uint8_t* data, size_t size, AcesContainerInfo& info, std::vector<float>* rgba = nullptr,
+                       std::string* error = nullptr);
+
 // ---- Deep data (media/DeepImage.h) ----------------------------------------------------------------------------------
 
 struct DeepFrame;

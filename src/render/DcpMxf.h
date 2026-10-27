@@ -17,7 +17,10 @@
 // JPEG 2000 frame-wrapped as progressive frames with RGBA and JPEG 2000 sub-descriptors that carry the colour
 // (primaries, transfer, coding equations, mastering display) and the component layout, or PCM clip-wrapped in a single
 // KLV with ST 2067-2 multichannel labels (a soundfield group with title, version, content and element kinds); the
-// index table sits in a partition of its own between the essence and the footer.
+// index table sits in a partition of its own between the essence and the footer. Archival masters (SMPTE ST 2065-5, for
+// ST 2067-50) frame-wrap one whole ACES image container file (ST 2065-4 OpenEXR) a frame, the RGBA descriptor naming ACES
+// 2065-1, with an ACES picture sub-descriptor (the output transform it was made for, its mastering display) and the target
+// frames (display-referred stills of chosen frames) in generic stream partitions, each described by a sub-descriptor.
 #pragma once
 
 #include <array>
@@ -259,6 +262,67 @@ private:
     uint32_t aspectNum_ = 16, aspectDen_ = 9;
 };
 
+// What an ACES picture sub-descriptor says: the output transform the pictures were made through (ACESAuthoringInformation)
+// and, when `mastering`, the display they were mastered on.
+struct AcesPicture {
+    std::string authoring;
+    bool mastering = false;
+    double display[8] = {};                     // red, green, blue and white x, y
+    double maxLuminance = 0, minLuminance = 0;  // cd/m^2
+};
+// A target frame: a display-referred still of one frame of the track file (its index there), as `mediaType` (TIFF), its
+// colour as SMPTE labels (hex, 32 digits), its code values' range.
+struct AcesTargetFrame {
+    std::vector<uint8_t> data;
+    std::string mediaType = "image/tiff";
+    int64_t index = 0;
+    std::string transfer, primaries;
+    uint32_t maxRef = 65535, minRef = 0;
+    Uuid resource{};  // set when written: a name-based UUID of its bytes
+    uint32_t stream = 0;
+    Uuid set{};       // its sub-descriptor's instance id
+};
+
+// SMPTE ST 2065-5: one ACES image container (ST 2065-4 OpenEXR, media/Exr.h writeAcesContainer) a frame, frame-wrapped,
+// for IMF Application #5 (ST 2067-50).
+class ImfAcesWriter : public TrackFileWriter {
+public:
+    bool open(const std::string& path, const Uuid& asset, EditRate rate, int width, int height, bool alpha, const AcesPicture& picture,
+              uint32_t aspectNum, uint32_t aspectDen, std::string* error = nullptr);
+    bool write(const uint8_t* exr, size_t size, std::string* error = nullptr);
+    // The target frames, each in a generic stream partition of its own (streams 10, 11, ...), after the last frame.
+    bool writeTargetFrames(std::vector<AcesTargetFrame> targets, std::string* error = nullptr);
+    int width() const { return width_; }
+    int height() const { return height_; }
+    bool alpha() const { return alpha_; }
+    const AcesPicture& picture() const { return picture_; }
+    uint32_t aspectNum() const { return aspectNum_; }
+    uint32_t aspectDen() const { return aspectDen_; }
+    EditRate rate() const { return rate_; }
+    const Uuid& constraintsId() const { return constraints_; }
+    const Uuid& pictureId() const { return pictureSet_; }
+    // The target frames written (their data dropped).
+    const std::vector<AcesTargetFrame>& targetFrames() const { return targets_; }
+    static constexpr const char* kContainer = "060e2b340401010d0d01030102190100";  // MXF-GC frame-wrapped ACES pictures
+    static constexpr const char* kPrimaries = "060e2b340401010d0401010103070000";  // ACES (AP0)
+    static constexpr const char* kTransfer = "060e2b34040101060401010101060000";   // linear
+    // The picture coding label: ACES without and with alpha.
+    const char* coding() const { return alpha_ ? "060e2b340401010d0401020203040200" : "060e2b340401010d0401020203040100"; }
+
+protected:
+    std::vector<uint8_t> headerMetadata(int64_t duration) const override;
+    std::vector<uint8_t> indexSegments() const override;
+    std::array<uint8_t, 16> essenceContainer() const override;
+
+private:
+    int width_ = 0, height_ = 0;
+    bool alpha_ = false;
+    AcesPicture picture_;
+    uint32_t aspectNum_ = 16, aspectDen_ = 9;
+    Uuid constraints_{}, pictureSet_{};
+    std::vector<AcesTargetFrame> targets_;
+};
+
 // The labels an IMF sound layout carries.
 struct McaLabel {
     const char* symbol;
@@ -344,7 +408,7 @@ private:
 class ImfTrackReader {
 public:
     enum class Kind { Unknown, Picture, Sound, TimedText };
-    // `imfPictureOnly`: give up at the end of the header unless it is an IMF picture (imfRgbJpeg2000), without walking
+    // `imfPictureOnly`: give up at the end of the header unless it is an IMF picture (imfRgbJpeg2000 or imfAces), without walking
     // the rest of a file that is not.
     bool open(const std::string& path, std::string* error = nullptr, bool imfPictureOnly = false);
     Kind kind() const { return kind_; }
@@ -358,6 +422,20 @@ public:
     // An IMF picture: OP1a, JPEG 2000 in an RGBA descriptor (full-range RGB), as Application #2E has it (a DCP's
     // OP-Atom pictures and other MXF are not).
     bool imfRgbJpeg2000() const { return kind_ == Kind::Picture && op1a_ && rgba_ && j2k_; }
+    // An IMF Application #5 picture: OP1a, ACES image containers in an RGBA descriptor (ST 2065-5).
+    bool imfAces() const { return kind_ == Kind::Picture && op1a_ && rgba_ && aces_; }
+    // Its ACES picture sub-descriptor's output transform, and its target frames, each found in its stream or not.
+    const std::string& acesAuthoring() const { return acesAuthoring_; }
+    struct TargetFrame {
+        Uuid resource{};
+        std::string mediaType;
+        int64_t index = 0;
+        uint32_t stream = 0;
+        uint64_t at = 0, size = 0;
+        bool present = false;
+    };
+    const std::vector<TargetFrame>& targetFrames() const { return targets_; }
+    bool targetFrame(size_t i, std::vector<uint8_t>& out, std::string* error = nullptr) const;
     int64_t samples() const { return channels_ > 0 ? int64_t(clipSize_ / (3 * uint64_t(channels_))) : 0; }
     bool frame(int64_t index, std::vector<uint8_t>& out, std::string* error = nullptr) const;
     // `count` sample frames from `first`, interleaved, as 24-bit integers (past the end: false).
@@ -379,7 +457,9 @@ private:
     Uuid asset_{};
     int channels_ = 0, width_ = 0, height_ = 0;
     EditRate rate_;
-    bool op1a_ = false, rgba_ = false, j2k_ = false;
+    bool op1a_ = false, rgba_ = false, j2k_ = false, aces_ = false;
+    std::string acesAuthoring_;
+    std::vector<TargetFrame> targets_;
     std::vector<std::pair<uint64_t, uint64_t>> elements_;  // picture frames: offset and size of each value
     uint64_t clipAt_ = 0, clipSize_ = 0;                    // sound or timed text: the one element's value
 };

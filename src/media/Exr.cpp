@@ -30,7 +30,12 @@
 #include <ImfDeepTiledInputPart.h>
 #include <ImfDeepTiledOutputFile.h>
 #include <ImfFrameBuffer.h>
+#include <ImfChromaticitiesAttribute.h>
 #include <ImfHeader.h>
+#include <ImfIO.h>
+#include <ImfInputFile.h>
+#include <ImfIntAttribute.h>
+#include <ImfVecAttribute.h>
 #include <ImfInputPart.h>
 #include <ImfMultiPartInputFile.h>
 #include <ImfOutputFile.h>
@@ -798,6 +803,146 @@ bool writeExr(const std::string& file, int width, int height, const std::vector<
 #else
     (void)file, (void)width, (void)height, (void)layers, (void)compression, (void)attributes;
     if (error) *error = "This build of Montage writes OpenEXR layers only with the OpenEXR library";
+    return false;
+#endif
+}
+
+// ---- ACES image container ------------------------------------------------------------------------------------------
+
+#ifdef MONTAGE_WITH_OPENEXR
+namespace {
+
+class MemoryOut : public Imf::OStream {
+public:
+    explicit MemoryOut(std::vector<uint8_t>& bytes) : Imf::OStream("memory"), bytes_(bytes) {}
+    void write(const char c[], int n) override {
+        if (at_ + size_t(n) > bytes_.size()) bytes_.resize(at_ + size_t(n));
+        std::memcpy(bytes_.data() + at_, c, size_t(n));
+        at_ += size_t(n);
+    }
+    uint64_t tellp() override { return at_; }
+    void seekp(uint64_t pos) override { at_ = size_t(pos); }
+
+private:
+    std::vector<uint8_t>& bytes_;
+    size_t at_ = 0;
+};
+
+class MemoryIn : public Imf::IStream {
+public:
+    MemoryIn(const uint8_t* data, size_t size) : Imf::IStream("memory"), data_(data), size_(size) {}
+    bool read(char c[], int n) override {
+        if (at_ + size_t(n) > size_) throw std::runtime_error("Early end of file");
+        std::memcpy(c, data_ + at_, size_t(n));
+        at_ += size_t(n);
+        return at_ < size_;
+    }
+    uint64_t tellg() override { return at_; }
+    void seekg(uint64_t pos) override { at_ = size_t(std::min<uint64_t>(pos, size_)); }
+
+private:
+    const uint8_t* data_;
+    size_t size_, at_ = 0;
+};
+
+// ACES 2065-1's primaries and white (ST 2065-1).
+const Imf::Chromaticities kAp0(Imath::V2f(0.7347f, 0.2653f), Imath::V2f(0.0f, 1.0f), Imath::V2f(0.0001f, -0.077f),
+                               Imath::V2f(0.32168f, 0.33767f));
+
+}  // namespace
+#endif
+
+bool writeAcesContainer(int width, int height, const float* rgba, bool alpha, std::vector<uint8_t>& out, std::string* error) {
+#ifdef MONTAGE_WITH_OPENEXR
+    try {
+        out.clear();
+        Imf::Header header(width, height);
+        header.compression() = Imf::NO_COMPRESSION;
+        header.lineOrder() = Imf::INCREASING_Y;
+        header.insert("acesImageContainerFlag", Imf::IntAttribute(1));
+        header.insert("chromaticities", Imf::ChromaticitiesAttribute(kAp0));
+        header.insert("adoptedNeutral", Imf::V2fAttribute(kAp0.white));
+        const char* names[4] = {"R", "G", "B", "A"};
+        const int channels = alpha ? 4 : 3;
+        std::vector<half> h(size_t(width) * size_t(height) * size_t(channels));
+        for (size_t i = 0, n = size_t(width) * size_t(height); i < n; ++i)
+            for (int c = 0; c < channels; ++c) h[i * size_t(channels) + size_t(c)] = half(rgba[i * 4 + size_t(c)]);
+        Imf::FrameBuffer fb;
+        for (int c = 0; c < channels; ++c) {
+            header.channels().insert(names[c], Imf::Channel(Imf::HALF));
+            fb.insert(names[c], Imf::Slice(Imf::HALF, reinterpret_cast<char*>(h.data() + c), sizeof(half) * size_t(channels),
+                                           sizeof(half) * size_t(channels) * size_t(width)));
+        }
+        MemoryOut stream(out);
+        Imf::OutputFile file(stream, header, 1);
+        file.setFrameBuffer(fb);
+        file.writePixels(height);
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = std::string("Cannot write the ACES frame: ") + e.what();
+        return false;
+    }
+#else
+    (void)width, (void)height, (void)rgba, (void)alpha, (void)out;
+    if (error) *error = "This build of Montage writes ACES frames only with the OpenEXR library";
+    return false;
+#endif
+}
+
+bool readAcesContainer(const uint8_t* data, size_t size, AcesContainerInfo& info, std::vector<float>* rgba, std::string* error) {
+    info = {};
+#ifdef MONTAGE_WITH_OPENEXR
+    try {
+        MemoryIn stream(data, size);
+        Imf::InputFile file(stream, 1);
+        const Imf::Header& header = file.header();
+        const Imath::Box2i dw = header.dataWindow();
+        info.width = dw.max.x - dw.min.x + 1;
+        info.height = dw.max.y - dw.min.y + 1;
+        info.alpha = header.channels().findChannel("A") != nullptr;
+        // ST 2065-4: what makes it an ACES image container.
+        const auto* flag = header.findTypedAttribute<Imf::IntAttribute>("acesImageContainerFlag");
+        const auto* chroma = header.findTypedAttribute<Imf::ChromaticitiesAttribute>("chromaticities");
+        auto near = [](const Imath::V2f& a, const Imath::V2f& b) { return std::fabs(a.x - b.x) < 1e-4f && std::fabs(a.y - b.y) < 1e-4f; };
+        std::vector<std::string> names;
+        bool halves = true;
+        for (auto it = header.channels().begin(); it != header.channels().end(); ++it) {
+            names.push_back(it.name());
+            halves = halves && it.channel().type == Imf::HALF;
+        }
+        const std::vector<std::string> want = info.alpha ? std::vector<std::string>{"A", "B", "G", "R"} : std::vector<std::string>{"B", "G", "R"};
+        if (!flag || flag->value() != 1) info.why = "no acesImageContainerFlag of 1";
+        else if (!chroma || !near(chroma->value().red, kAp0.red) || !near(chroma->value().green, kAp0.green) ||
+                 !near(chroma->value().blue, kAp0.blue) || !near(chroma->value().white, kAp0.white))
+            info.why = "chromaticities other than ACES 2065-1's";
+        else if (names != want) info.why = "channels other than B, G, R (and A)";
+        else if (!halves) info.why = "channels other than half floats";
+        else if (header.compression() != Imf::NO_COMPRESSION) info.why = "compressed";
+        else if (header.hasTileDescription()) info.why = "tiled";
+        info.conforming = info.why.empty();
+        if (rgba) {
+            // (a picture the size the header says, within reason: a damaged one cannot ask for gigabytes)
+            if (info.width <= 0 || info.height <= 0 || int64_t(info.width) * info.height > (int64_t(1) << 27))
+                throw std::runtime_error("a picture of " + std::to_string(info.width) + " x " + std::to_string(info.height));
+            const size_t n = size_t(info.width) * size_t(info.height);
+            rgba->assign(n * 4, 1.0f);
+            Imf::FrameBuffer fb;
+            const char* rgbaNames[4] = {"R", "G", "B", "A"};
+            for (int c = 0; c < (info.alpha ? 4 : 3); ++c) {
+                char* base = reinterpret_cast<char*>(rgba->data() + c) - (ptrdiff_t(dw.min.x) + ptrdiff_t(dw.min.y) * info.width) * 4 * ptrdiff_t(sizeof(float));
+                fb.insert(rgbaNames[c], Imf::Slice(Imf::FLOAT, base, 4 * sizeof(float), 4 * sizeof(float) * size_t(info.width), 1, 1, c == 3 ? 1.0 : 0.0));
+            }
+            file.setFrameBuffer(fb);
+            file.readPixels(dw.min.y, dw.max.y);
+        }
+        return true;
+    } catch (const std::exception& e) {
+        if (error) *error = std::string("Not an OpenEXR frame: ") + e.what();
+        return false;
+    }
+#else
+    (void)data, (void)size, (void)rgba;
+    if (error) *error = "This build of Montage reads ACES frames only with the OpenEXR library";
     return false;
 #endif
 }

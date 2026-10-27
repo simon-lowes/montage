@@ -9917,7 +9917,11 @@ void McpServer::Impl::addTools() {
         "captions or forced narratives (`texts`), and `supplement_of` (an earlier package's folder) makes a supplemental "
         "package carrying only what changed since it: the composition plays the earlier package's track files where the "
         "pictures and sound are the same. Give `original_sequence`, the sequence that package was mastered from (kept as "
-        "it was), when the cut has changed.",
+        "it was), when the cut has changed. `application` 5 makes an archival master instead (Application #5, SMPTE ST "
+        "2067-50): every frame an ACES 2065-1 OpenEXR image (ST 2065-4, half float) in MXF (ST 2065-5), the composition "
+        "naming the output transform it is viewed through; `graded` false keeps the shots as they came in, before the "
+        "grade; `target_frames` (sequence frame numbers, within what is exported) adds those frames as they are "
+        "delivered, as reference stills, with an ACES Metadata File.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string","description":"Where to make the IMF folder"},
             "title":{"type":"string"},"kind":{"type":"string","enum":["feature","episode","short","trailer","teaser","advertisement","promotion","test"],"default":"feature"},
             "colour":{"type":"string","enum":["rec709","p3d65-pq","rec2020-pq","rec2020-hlg"],"description":"Default: as the sequence is graded"},
@@ -9935,7 +9939,10 @@ void McpServer::Impl::addTools() {
                 "track":{"type":"string","description":"The caption track's name"},"kind":{"type":"string","enum":["subtitles","captions","forced"],"default":"subtitles"},
                 "image":{"type":"boolean","default":false,"description":"As pictures in the track's style (IMSC 1.1 Image profile), not text"}},"required":["track"]}},
             "supplement_of":{"type":"string","description":"An earlier IMF package's folder: make a supplemental package of it (beside it: `folder` must be the folder holding it)"},
-            "original_sequence":{"type":"string","description":"Supplemental: the sequence the earlier package was mastered from (default: the picture has not changed)"}},
+            "original_sequence":{"type":"string","description":"Supplemental: the sequence the earlier package was mastered from (default: the picture has not changed)"},
+            "application":{"type":"integer","enum":[2,5],"default":2,"description":"2: Application #2E (JPEG 2000); 5: ACES archival master"},
+            "graded":{"type":"boolean","default":true,"description":"Application #5: with the grade (false: the shots before it)"},
+            "target_frames":{"type":"array","items":{"type":"integer","minimum":0},"description":"Application #5: sequence frames to add as delivered reference stills"}},
             "required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -9981,6 +9988,9 @@ void McpServer::Impl::addTools() {
                     if (QString::fromStdString(sq.name) == name) st.originalSequence = sq.id;
                 if (!st.originalSequence) throw ArgError{QStringLiteral("No sequence named \"%1\"").arg(name)};
             }
+            st.application = a.value("application").toInt(2);
+            st.graded = a.value("graded").toBool(true);
+            for (const QJsonValue& v : a.value("target_frames").toArray()) st.targetFrames.push_back(FrameTime(v.toInteger()));
             const QString folder = absolute(need(a, "folder"));
             QDir().mkpath(folder);
             ImfResult r;
@@ -9992,12 +10002,17 @@ void McpServer::Impl::addTools() {
                 return fail(QString::fromStdString(err));
             QJsonArray found;
             for (const std::string& i : verifyImf(r.folder)) found.append(QString::fromStdString(i));
-            const QJsonObject out{{"folder", QString::fromStdString(r.folder)}, {"cpl", QString::fromStdString(r.cpl)},
+            QJsonObject out{{"folder", QString::fromStdString(r.folder)}, {"cpl", QString::fromStdString(r.cpl)},
                                   {"frames", double(r.frames)}, {"edit_rate", QStringLiteral("%1/%2").arg(r.rateNum).arg(r.rateDen)},
                                   {"width", r.width}, {"height", r.height}, {"bits", r.bits}, {"channels", r.channels},
                                   {"colour", QString::fromStdString(r.colour)}, {"rsiz", r.rsiz}, {"sounds", r.sounds}, {"texts", r.texts},
                                   {"supplemental", r.supplemental}, {"coded_frames", double(r.codedFrames)},
-                                  {"new_samples", double(r.newSamples)}, {"problems", found}};
+                                  {"new_samples", double(r.newSamples)}, {"problems", found}, {"application", r.application}};
+            if (r.application == 5) {
+                out["output_transform"] = QString::fromStdString(r.outputTransform);
+                out["target_frames"] = r.targetFrames;
+                if (!r.amf.empty()) out["amf"] = QString::fromStdString(r.amf);
+            }
             const QString name = QFileInfo(QString::fromStdString(r.folder)).fileName();
             return ok(found.isEmpty() ? QStringLiteral("Made %1 and checked it: no problems").arg(name)
                                       : QStringLiteral("Made %1; the check found %2 problem(s)").arg(name).arg(found.size()),
@@ -10006,8 +10021,8 @@ void McpServer::Impl::addTools() {
 
     add("montage_verify_imf", "Check an IMF package",
         "Check an IMF package folder: asset map, every file present at its size, packing list hashes, each composition's "
-        "resources in the package with their essence descriptors and durations, the Application #2E identification, "
-        "picture track files JPEG 2000 in an IMF profile with the right number of frames, sound 24-bit 48 kHz with the "
+        "resources in the package with their essence descriptors and durations, the Application #2E or #5 identification, "
+        "picture track files JPEG 2000 in an IMF profile (or ACES OpenEXR images, with their target frames) with the right number of frames, sound 24-bit 48 kHz with the "
         "right number of samples, timed text that reads. A supplemental package's track files from earlier packages are "
         "looked for in the folders beside it. Returns the problems found (none: it passed).",
         R"json({"type":"object","properties":{"folder":{"type":"string"}},"required":["folder"]})json", true, [](const QJsonObject& a) {

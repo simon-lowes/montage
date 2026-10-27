@@ -7474,6 +7474,17 @@ private slots:
         QVERIFY(!r.value("structuredContent").toObject().value("ok").toBool());
         QVERIFY(call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-imf")}, {"colour", "sepia"}})
                     .value("isError").toBool());
+        // An archival master over MCP: ACES pictures, the output transform named, a target frame and its ACES Metadata File.
+        if (exrAvailable()) {
+            r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-aces")}, {"title", "Archive"},
+                                            {"application", 5}, {"target_frames", QJsonArray{3}}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            const QJsonObject aces = r.value("structuredContent").toObject();
+            QVERIFY2(aces.value("problems").toArray().isEmpty() && aces.value("application").toInt() == 5 && aces.value("colour").toString() == "aces2065-1" &&
+                         aces.value("target_frames").toInt() == 1 && aces.value("output_transform").toString().startsWith("urn:") &&
+                         QFileInfo::exists(aces.value("amf").toString()),
+                     QJsonDocument(aces).toJson().constData());
+        }
         // A supplemental over MCP with a German version added: no new pictures, the German sound only.
         r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-versions")}, {"title", "Original"}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
@@ -7512,6 +7523,16 @@ private slots:
             auto* originalSeq = dlg->findChild<QComboBox*>("imfOriginal");
             offered = sounds && sounds->rowCount() == 1 && sounds->item(0, 0)->text() == "en" && texts && texts->rowCount() == 1 && supplemental &&
                       !supplemental->isChecked() && earlier && !earlier->isEnabled() && originalSeq && originalSeq->count() >= 2;
+            // An archival master: the grade and a target frame to choose, the JPEG 2000 colour not.
+            auto* application = dlg->findChild<QComboBox*>("imfApplication");
+            auto* graded = dlg->findChild<QComboBox*>("imfGraded");
+            offered = offered && application && graded && !graded->isEnabled() && dlg->findChild<QComboBox*>("imfColour")->isEnabled();
+            if (offered && exrAvailable()) {
+                application->setCurrentIndex(application->findData(5));
+                offered = graded->isEnabled() && dlg->findChild<QCheckBox*>("imfTargetFrame")->isEnabled() &&
+                          !dlg->findChild<QComboBox*>("imfColour")->isEnabled();
+                application->setCurrentIndex(application->findData(2));
+            }
             if (supplemental) supplemental->setChecked(true);
             offered = offered && earlier->isEnabled() && !dlg->findChild<QComboBox*>("imfSize")->isEnabled();
             dlg->reject();

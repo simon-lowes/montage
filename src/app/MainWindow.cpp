@@ -7022,16 +7022,17 @@ void MainWindow::exportImfDialog() {
         state_->message(tr("Nothing to export"));
         return;
     }
-    if (!openJpegAvailable()) {
-        state_->message(tr("This build of Montage cannot make IMF masters: it was built without OpenJPEG 2.5"), 8000);
+    if (!openJpegAvailable() && !exrAvailable()) {
+        state_->message(tr("This build of Montage cannot make IMF masters: it was built without OpenJPEG 2.5 and OpenEXR"), 8000);
         return;
     }
     QDialog dlg(this);
     dlg.setObjectName(QStringLiteral("exportImfDialog"));
     dlg.setWindowTitle(tr("Export IMF Master"));
     auto* form = new QFormLayout(&dlg);
-    auto* intro = new QLabel(tr("An IMF (Interoperable Master Format) package of %1, Application #2E, as streaming services and broadcasters "
-                                "ask for: JPEG 2000 pictures (lossless by default), 24-bit sound with channel labels, checked when it is done.")
+    auto* intro = new QLabel(tr("An IMF (Interoperable Master Format) package of %1: a delivery master (Application #2E) as streaming services "
+                                "and broadcasters ask for, JPEG 2000 pictures (lossless by default), or an archival master (Application #5), "
+                                "the pictures in ACES; 24-bit sound with channel labels, checked when it is done.")
                                  .arg(QString::fromStdString(s->name)),
                              &dlg);
     intro->setWordWrap(true);
@@ -7049,6 +7050,20 @@ void MainWindow::exportImfDialog() {
                                                                              {tr("Promotion"), "promotion"}, {tr("Test"), "test"}})
         kind->addItem(label, value);
     form->addRow(tr("Kind:"), kind);
+    // Application #2E for delivery, or #5 for the archive: the pictures in ACES, with the output transform named.
+    auto* application = new QComboBox(&dlg);
+    application->setObjectName(QStringLiteral("imfApplication"));
+    if (openJpegAvailable()) application->addItem(tr("Delivery master (Application #2E, JPEG 2000)"), 2);
+    if (exrAvailable()) application->addItem(tr("Archival master (Application #5, ACES OpenEXR)"), 5);
+    form->addRow(tr("Master:"), application);
+    auto* graded = new QComboBox(&dlg);
+    graded->setObjectName(QStringLiteral("imfGraded"));
+    graded->addItem(tr("Graded"), true);
+    graded->addItem(tr("Ungraded (the shots before the grade)"), false);
+    form->addRow(tr("Grade:"), graded);
+    auto* target = new QCheckBox(tr("Add the frame at the playhead as it is delivered, as a reference still"), &dlg);
+    target->setObjectName(QStringLiteral("imfTargetFrame"));
+    form->addRow(tr("Target frame:"), target);
     auto* size = new QComboBox(&dlg);
     size->setObjectName(QStringLiteral("imfSize"));
     size->addItem(tr("As the sequence (%1 x %2)").arg(s->width).arg(s->height), "sequence");
@@ -7167,11 +7182,17 @@ void MainWindow::exportImfDialog() {
     form->addRow(tr("Mastered from:"), original);
     auto syncSupplemental = [=] {
         for (QWidget* w : {static_cast<QWidget*>(earlier), static_cast<QWidget*>(browseEarlier), static_cast<QWidget*>(original)}) w->setEnabled(supplemental->isChecked());
-        // (a supplemental keeps the earlier picture's size, colour, depth and coding)
-        for (QWidget* w : {static_cast<QWidget*>(size), static_cast<QWidget*>(colour), static_cast<QWidget*>(bits), static_cast<QWidget*>(coding)})
-            w->setEnabled(!supplemental->isChecked());
+        // (a supplemental keeps the earlier picture's size, colour, depth and coding; an archival master's pictures are
+        // ACES, uncoded)
+        const bool aces = application->currentData().toInt() == 5;
+        size->setEnabled(!supplemental->isChecked());
+        for (QWidget* w : {static_cast<QWidget*>(colour), static_cast<QWidget*>(bits), static_cast<QWidget*>(coding)})
+            w->setEnabled(!supplemental->isChecked() && !aces);
+        graded->setEnabled(aces);
+        target->setEnabled(aces);
     };
     connect(supplemental, &QCheckBox::toggled, &dlg, syncSupplemental);
+    connect(application, &QComboBox::currentIndexChanged, &dlg, syncSupplemental);
     syncSupplemental();
     auto* issuer = new QLineEdit(appSettings().value(QStringLiteral("imf/issuer"), QStringLiteral("Montage")).toString(), &dlg);
     issuer->setObjectName(QStringLiteral("imfIssuer"));
@@ -7211,6 +7232,11 @@ void MainWindow::exportImfDialog() {
     ImfSettings st;
     st.title = title->text().trimmed().toStdString();
     st.kind = kind->currentData().toString().toStdString();
+    st.application = application->currentData().toInt();
+    if (st.application == 5) {
+        st.graded = graded->currentData().toBool();
+        if (target->isChecked()) st.targetFrames = {state_->playhead()};
+    }
     st.size = size->currentData().toString().toStdString();
     st.colour = colour->currentData().toString().toStdString();
     st.bits = bits->currentData().toInt();

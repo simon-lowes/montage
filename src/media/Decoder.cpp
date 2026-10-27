@@ -69,6 +69,8 @@ bool exrByLibrary(const std::string& file, const Interpretation&, ImageSequence*
     return readExrInfo(sequence ? imageSequenceFrame(s, s.first) : file, info);
 }
 
+std::shared_ptr<const dcp::ImfTrackReader> imfPicture(const std::string& file, int& w, int& h);
+
 // Keep FFmpeg quiet unless something is actually wrong.
 const bool kQuietLogs = [] {
     av_log_set_level(AV_LOG_ERROR);
@@ -551,6 +553,27 @@ bool probeMedia(const std::string& path, MediaItem& out, std::string* error) {
         out = m;
         return true;
     }
+    // An IMF archival master's pictures (Application #5: ACES image containers, which FFmpeg does not read), in ACES 2065-1.
+    if (file.size() >= 4 && exrAvailable() && QString::fromStdString(file.substr(file.size() - 4)).compare(".mxf", Qt::CaseInsensitive) == 0) {
+        int w = 0, h = 0;
+        if (const auto reader = imfPicture(file, w, h); reader && reader->imfAces()) {
+            MediaItem m = out;
+            m.path = path;
+            if (m.name.empty()) m.name = file.substr(file.find_last_of("/\\") + 1);
+            m.kind = MediaKind::Video;
+            m.hasVideo = true;
+            m.hasAudio = false;
+            m.width = w;
+            m.height = h;
+            const dcp::EditRate r = reader->rate();
+            m.fps = Rational{int(r.num), int(r.den)};
+            m.duration = double(reader->frames()) / r.value();
+            m.videoCodec = "exr";
+            m.colorSpace = "aces2065-1";
+            out = m;
+            return true;
+        }
+    }
     // A CinemaDNG run: numbered camera RAW frames, played as a video at the run's rate.
     if (ImageSequence seq; rawAvailable() && parseImageSequencePath(file, seq) && isRawPath(seq.pattern)) {
         RawInfo ri;
@@ -918,14 +941,15 @@ std::shared_ptr<const dcp::ImfTrackReader> imfPicture(const std::string& file, i
     }
     Known k;
     auto reader = std::make_shared<dcp::ImfTrackReader>();
-    if (reader->open(file, nullptr, true) && reader->imfRgbJpeg2000()) {
+    if (reader->open(file, nullptr, true) && (reader->imfRgbJpeg2000() ? openJpegAvailable() : reader->imfAces() && exrAvailable())) {
         k.w = reader->width(), k.h = reader->height();
         std::vector<uint8_t> cs;
         std::vector<uint16_t> rgb;
         int components = 0, bits = 0;
         // (the size from the first picture when the descriptor does not give it)
         if ((k.w > 0 && k.h > 0) ||
-            (reader->frame(0, cs) && decodeJpeg2000(cs.data(), cs.size(), rgb, k.w, k.h, components, bits) && components == 3))
+            (reader->imfRgbJpeg2000() && reader->frame(0, cs) && decodeJpeg2000(cs.data(), cs.size(), rgb, k.w, k.h, components, bits) &&
+             components == 3))
             k.reader = std::move(reader);
     }
     std::lock_guard<std::mutex> g(lock);
@@ -1056,11 +1080,12 @@ bool VideoDecoder::open(const std::string& path, std::string* error) {
         return true;
     }
     // An IMF picture track file (JPEG 2000 or HTJ2K, full-range RGB): decoded with OpenJPEG, so the codes come through
-    // as they were coded (HTJ2K too, which FFmpeg 6 does not read).
+    // as they were coded (HTJ2K too, which FFmpeg 6 does not read); or ACES image containers (Application #5), read
+    // with OpenEXR.
     const std::string file = uninterpretedPath(path);
     std::string ext = file.size() >= 4 ? file.substr(file.size() - 4) : std::string();
     for (char& ch : ext) ch = char(std::tolower(static_cast<unsigned char>(ch)));
-    if (ext == ".mxf" && openJpegAvailable()) {
+    if (ext == ".mxf" && (openJpegAvailable() || exrAvailable())) {
         int w = 0, h = 0;
         if (std::shared_ptr<const dcp::ImfTrackReader> reader = imfPicture(file, w, h)) {
             imf_ = std::move(reader);
@@ -1673,11 +1698,30 @@ Frame16Ptr VideoDecoder::frameAt(double t, int targetW, int targetH, bool highQu
         return stillFrame_;
     }
     if (imf_) {
-        // The frame shown at `t`, decoded once and kept while it is asked for again, its codes scaled to 16 bits.
+        // The frame shown at `t`, decoded once and kept while it is asked for again, its codes scaled to 16 bits (ACES:
+        // its half floats kept as they are).
         const int64_t n = std::clamp(int64_t(std::floor(std::min(std::max(0.0, t) * timeScale_ * fps_ + 1e-6, 1e15))), int64_t(0),
                                      std::max<int64_t>(0, imf_->frames() - 1));
         if (targetW <= 0) targetW = dispW_;
         if (targetH <= 0) targetH = dispH_;
+        if (imf_->imfAces()) {
+            if (n != rawFrame_ || exrRgba_.empty()) {
+                std::vector<uint8_t> bytes;
+                AcesContainerInfo info;
+                exrRgba_.clear();
+                if (!imf_->frame(n, bytes) || !readAcesContainer(bytes.data(), bytes.size(), info, &exrRgba_)) {
+                    exrRgba_.clear();
+                    return nullptr;
+                }
+                exrW_ = info.width, exrH_ = info.height;
+                rawFrame_ = n;
+                stillFrame_.reset();
+            }
+            if (!stillFrame_ || stillFrame_->width != targetW || stillFrame_->height != targetH)
+                stillFrame_ = halfFrame(exrRgba_.data(), exrW_, exrH_, targetW, targetH, double(n) / fps_);
+            curPts_ = double(n) / fps_;
+            return stillFrame_;
+        }
         if (n != rawFrame_ || !raw_) {
             std::vector<uint8_t> cs;
             std::vector<uint16_t> rgb;
