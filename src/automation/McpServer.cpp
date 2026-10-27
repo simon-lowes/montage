@@ -33,6 +33,7 @@
 #include "core/GraphicsTemplate.h"
 #include "core/Storyboard.h"
 #include "render/LearnFromClip.h"
+#include "render/ModelClip.h"
 #include "render/ExtendClip.h"
 #include "render/FootageWords.h"
 #include "media/LanguageModel.h"
@@ -162,6 +163,7 @@
 #include "media/VisualSearch.h"
 #include "render/ClipAnalysis.h"
 #include "media/Model3D.h"
+#include "media/Usd.h"
 #include "render/OGraf.h"
 #include "render/Gallery.h"
 #include "render/DialogueLoudness.h"
@@ -2381,19 +2383,23 @@ void McpServer::Impl::addTools() {
         });
 
     add("montage_add_model", "Add a 3D model",
-        "Add a 3D model (glTF 2.0 .gltf or .glb, or OBJ with its MTL) to the picture, lit, shaded (metallic-roughness, its "
-        "textures), casting shadows onto the ground and playing one of its animations. Without over it is seen through "
-        "its own camera in front of the frame (size in pixels, positions in pixels from the centre, y up). With over (a "
+        "Add a 3D model (glTF 2.0 .gltf or .glb, OBJ with its MTL, or a USD scene .usd/.usda/.usdc/.usdz) to the picture, "
+        "lit, shaded (metallic-roughness, its textures), casting shadows onto the ground and playing one of its "
+        "animations. With camera (a number, 1 for the file's first) it is seen through a camera in the file, everything "
+        "where the file puts it and lit by the file's own lights (and its dome light) when it has some; a USD file with "
+        "a camera is seen through it unless camera is 0. Otherwise, without over it is seen through its own camera in "
+        "front of the frame (size in pixels, positions in pixels from the centre, y up). With over (a "
         "video clip whose camera montage_camera_track solved), it stands in that shot: placed at place {x, y} (fractions "
         "of the picture, on the solved ground) or at position [x, y, z] in the scene's units (the ground at y = 0), at "
         "its own size times scale (%), on the track above the footage for the footage's length. settings sets any of "
         "its settings by name (montage_list_effects with kind generator lists model3d's; colours as name.r / .g / .b), "
         "e.g. {\"light_angle\": 30, \"env_track\": 3, \"depth_merge\": 1}. Returns the clip with the model's "
-        "animations and triangle count.",
+        "animations, cameras, lights, triangle count and what in the file is not read (notes).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"file":{"type":"string"},
             "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":5},"track":{"type":"string"},
             "over":{"type":["number","string"]},"place":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"}}},
             "position":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},
+            "camera":{"type":"integer","minimum":0},
             "settings":{"type":"object","additionalProperties":{"type":"number"}}},
             "required":["project","file"]})json",
         false, [](const QJsonObject& a) {
@@ -2411,6 +2417,17 @@ void McpServer::Impl::addTools() {
             FrameTime at = a.contains("at") ? timeArg(a.value("at"), s, "at") : 0;
             FrameTime len = a.contains("duration") ? timeArg(a.value("duration"), s, "duration") : FrameTime(std::llround(5 * s.fpsValue()));
             const Clip* footage = nullptr;
+            if (a.contains("camera") && !a.value("camera").isDouble()) throw ArgError{"\"camera\" is a number (1: the file's first)"};
+            const int fileCamera = a.contains("camera") ? a.value("camera").toInt()
+                                   : !a.contains("over") && usd::isUsdPath(fi.absoluteFilePath().toStdString()) && !model->cameras.empty() ? 1 : 0;
+            if (fileCamera > 0 && a.contains("over")) throw ArgError{"Give \"camera\" or \"over\", not both"};
+            if (fileCamera > int(model->cameras.size()))
+                return fail(model->cameras.empty() ? QStringLiteral("The file has no camera") : QStringLiteral("The file has %1 cameras").arg(model->cameras.size()));
+            if (fileCamera > 0) {
+                c.generator.params["camera"] = Param(2.0);
+                c.generator.params["camera_index"] = Param(double(fileCamera));
+                if (!model->lights.empty()) c.generator.params["light_kind"] = Param(3.0), c.generator.params["ambient"] = Param(0.0);
+            }
             if (a.contains("over")) {
                 QJsonObject o;
                 o["clip"] = a.value("over");
@@ -2471,6 +2488,13 @@ void McpServer::Impl::addTools() {
             QJsonArray anims;
             for (const ModelAnimation& an : model->animations) anims.append(QString::fromStdString(an.name));
             out["animations"] = anims;
+            QJsonArray cams, lights, notes;
+            for (const ModelCameraInfo& mc : model->cameras) cams.append(QString::fromStdString(mc.name));
+            for (const ModelLightInfo& ml : model->lights) lights.append(QString::fromStdString(ml.name));
+            for (const std::string& n : model->notes) notes.append(QString::fromStdString(n));
+            out["cameras"] = cams;
+            out["lights"] = lights;
+            if (!notes.isEmpty()) out["notes"] = notes;
             out["triangles"] = double(model->triangles());
             return ok(QStringLiteral("Added %1 on %2").arg(QString::fromStdString(c.name), QString::fromStdString(trackAt(s, t)->name)), out);
         });
@@ -10665,7 +10689,8 @@ void McpServer::Impl::addTools() {
         "The camera needs to move (not only turn) over a scene with depth. solve keeps it on the clip in a 3D Camera "
         "Tracker effect (redoing it replaces it); info reports it; place puts a title in the scene: on the ground where "
         "the point (x, y) of the picture at `at` is (or standing there, `upright`), pinned to it in every frame; export "
-        "writes the camera as a Nuke .chan file and the points as a PLY.",
+        "writes the camera as a Nuke .chan file, the points as a PLY, and/or a USD scene (.usda) holding the camera (time "
+        "codes 0, 1, 2... a frame), the points and the 3D models placed in the shot.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},
             "action":{"type":"string","enum":["solve","info","place","export"],"default":"solve"},
             "field_of_view":{"type":"number","description":"solve: the lens's horizontal field of view in degrees, when known (else it is solved)"},
@@ -10676,6 +10701,7 @@ void McpServer::Impl::addTools() {
             "size":{"type":"number","default":0.4,"description":"place: the title's width as a share of its distance from the camera"},
             "upright":{"type":"boolean","default":false},"turn":{"type":"number","default":0,"description":"place: degrees about its face"},
             "chan":{"type":"string","description":"export: the .chan file to write"},"ply":{"type":"string","description":"export: the .ply file to write"},
+            "usd":{"type":"string","description":"export: the .usda file to write"},
             "first_frame":{"type":"integer","default":1,"description":"export: the .chan's first frame number"}},
             "required":["project","clip"]})json",
         false, [this](const QJsonObject& a) {
@@ -10726,7 +10752,7 @@ void McpServer::Impl::addTools() {
             if (!clipCameraSolve(c, cs)) return fail("The clip's camera is not solved yet (action solve)");
             if (action == "info") return ok(line(cs), summary(cs));
             if (action == "export") {
-                if (!a.contains("chan") && !a.contains("ply")) throw ArgError{"Give \"chan\" and/or \"ply\": the files to write"};
+                if (!a.contains("chan") && !a.contains("ply") && !a.contains("usd")) throw ArgError{"Give \"chan\", \"ply\" and/or \"usd\": the files to write"};
                 QJsonObject r;
                 if (a.contains("chan")) {
                     const QString chan = absolute(need(a, "chan"));
@@ -10737,6 +10763,17 @@ void McpServer::Impl::addTools() {
                     const QString ply = absolute(need(a, "ply"));
                     if (!writePointsPly(cs, ply.toStdString(), &err)) return fail(QString::fromStdString(err));
                     r["ply"] = ply;
+                }
+                if (a.contains("usd")) {
+                    const QString usdPath = absolute(need(a, "usd"));
+                    int ft = -1;
+                    for (size_t i = 0; i < s.videoTracks.size(); ++i)
+                        for (const Clip& k : s.videoTracks[i].clips)
+                            if (k.id == c.id) ft = int(i);
+                    const std::vector<SolvedSceneMesh> models = ft >= 0 ? solvedSceneModels(l.project, s, size_t(ft), c) : std::vector<SolvedSceneMesh>{};
+                    if (!writeSolveUsda(cs, usdPath.toStdString(), models, &err)) return fail(QString::fromStdString(err));
+                    r["usd"] = usdPath;
+                    r["meshes"] = double(models.size());  // (a mesh for each model clip's material)
                 }
                 return ok(QStringLiteral("Wrote %1").arg(QStringList(r.keys()).join(" and ")), r);
             }

@@ -1,8 +1,10 @@
 // Montage — the "model3d" generator: a 3D model (media/Model3D.h) placed in the shot and drawn (render/ModelRender.h)
 // through either its own camera (in front of the frame as 3D titles are, sizes in pixels) or the camera solved from
 // footage on another track by the 3D Camera Tracker (media/CameraSolve.h; sizes in the solved scene's units, the
-// ground at y = 0), lit by a sun, a point or a spot light, by an ambient light or by a latitude-longitude picture on
-// another track, casting shadows onto a ground that shows them alone, and playing one of its animations.
+// ground at y = 0) or a camera in the file itself (a USD or glTF scene, as the file places everything), lit by a sun,
+// a point or a spot light or by the file's own lights, by an ambient light or by a latitude-longitude picture on
+// another track (or the file's dome light), casting shadows onto a ground that shows them alone, and playing one of
+// its animations.
 #pragma once
 
 #include <functional>
@@ -10,6 +12,7 @@
 #include <vector>
 
 #include "core/Model.h"
+#include "media/CameraSolve.h"
 #include "media/Image.h"
 #include "render/ModelRender.h"
 
@@ -34,5 +37,9 @@ Image renderModelClip(const Project& p, const Sequence& seq, const Clip& c, Fram
 int modelCameraTrack(const Sequence& seq, size_t track, const Clip& c, FrameTime t);
 // The track lighting it (-1: none).
 int modelLightTrack(const Sequence& seq, size_t track, const Clip& c, FrameTime t);
+
+// The models placed in the scene solved on `footage` (on video track `track`): each model clip seen through that
+// solve, as it stands at its first frame, one mesh a material (for writeSolveUsda).
+std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence& seq, size_t track, const Clip& footage);
 
 }  // namespace montage

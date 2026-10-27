@@ -12,8 +12,8 @@
 namespace montage {
 
 // Raw DEFLATE data (no zlib or gzip header) inflated onto `out`; false if it
-// is malformed or ends early. `expected` reserves room when it is known.
-bool inflateRaw(const uint8_t* data, size_t size, std::string& out, size_t expected = 0);
+// is malformed or ends early. `expected` reserves room when it is known; `limit` (0: none) is the most it may make.
+bool inflateRaw(const uint8_t* data, size_t size, std::string& out, size_t expected = 0, size_t limit = 0);
 
 uint32_t crc32(const void* data, size_t size, uint32_t crc = 0);
 

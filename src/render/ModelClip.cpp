@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <list>
+#include <map>
 #include <mutex>
 
 #include "media/CameraSolve.h"
@@ -104,6 +105,94 @@ std::shared_ptr<const ModelEnvironment> environmentFrom(const Image& layer, cons
     return e;
 }
 
+// A dome light's picture as image light (tinted by its colour), kept while its model is.
+std::shared_ptr<const ModelEnvironment> domeEnvironment(const std::shared_ptr<const Model>& model, size_t light) {
+    const ModelLightInfo& l = model->lights[light];
+    if (l.picture.empty()) return nullptr;
+    static std::mutex m;
+    struct Kept {
+        std::shared_ptr<const Model> model;
+        size_t light;
+        std::shared_ptr<const ModelEnvironment> env;
+    };
+    static std::list<Kept> recent;
+    std::lock_guard lock(m);
+    for (auto it = recent.begin(); it != recent.end(); ++it)
+        if (it->model == model && it->light == light) {
+            recent.splice(recent.begin(), recent, it);
+            return it->env;
+        }
+    auto e = std::make_shared<ModelEnvironment>();
+    e->width = l.pictureWidth, e->height = l.pictureHeight, e->rgb = l.picture;
+    for (size_t i = 0; i < e->rgb.size(); ++i) e->rgb[i] *= l.color[i % 3];
+    recent.push_front({model, light, e});
+    if (recent.size() > 2) recent.pop_back();
+    return e;
+}
+
+// The file's lights (USD's or glTF's) in the world, placed with the model by `place` (scaling it by `k`), and its dome
+// light as image light.
+void addFileLights(const std::shared_ptr<const Model>& model, const ModelPose& pose, const Mat4& place, double k, ModelScene& scene) {
+    constexpr double kPi = 3.14159265358979323846;
+    for (size_t i = 0; i < model->lights.size(); ++i) {
+        const ModelLightInfo& l = model->lights[i];
+        if (l.node < 0 || size_t(l.node) >= pose.world.size()) continue;
+        const Mat4 W = place * pose.world[size_t(l.node)];
+        if (l.kind == ModelLightInfo::Kind::Dome) {
+            if (scene.environment) continue;  // (one image light)
+            scene.environment = domeEnvironment(model, i);
+            if (!scene.environment) {  // its colour alone, from all round
+                for (int c = 0; c < 3; ++c) scene.ambient[size_t(c)] += l.color[size_t(c)];
+                continue;
+            }
+            // Turned as its node turns about the vertical; its picture's middle faces +z (ours faces -z).
+            const std::array<double, 3> x = transformDirection(W, {1, 0, 0});
+            scene.environmentRotation = std::atan2(-x[2], x[0]) + kPi;
+            scene.environmentIntensity = 1;
+            continue;
+        }
+        ModelLight ml;
+        const std::array<double, 3> at = transformPoint(W, {0, 0, 0}), way = transformDirection(W, {0, 0, -1});
+        const double wl = std::sqrt(way[0] * way[0] + way[1] * way[1] + way[2] * way[2]);
+        ml.position = at;
+        if (wl > 0) ml.direction = {way[0] / wl, way[1] / wl, way[2] / wl};
+        ml.color = l.color;
+        ml.shadows = l.shadows;
+        // Intensity: illuminance for a distant light; else what it gives 1 unit away (its luminance times the area
+        // it shows, or spread over its whole surface when normalised), the units scaled with the model.
+        double intensity = 1;
+        const double r = std::max(0.0, l.radius);
+        switch (l.kind) {
+        case ModelLightInfo::Kind::Distant: {
+            const double half = std::clamp(l.angle * kPi / 360, 0.0, kPi), s2 = std::sin(half) * std::sin(half);
+            intensity = l.normalize || half == 0 ? 1 : half <= kPi / 2 ? kPi * s2 : (2 - s2) * kPi;
+            break;
+        }
+        case ModelLightInfo::Kind::Point: break;
+        case ModelLightInfo::Kind::Sphere: intensity = r == 0 ? 1 : l.normalize ? 0.25 : kPi * r * r; break;
+        case ModelLightInfo::Kind::Rect: intensity = l.normalize ? 1 : std::max(0.0, l.width * l.height); break;
+        case ModelLightInfo::Kind::Disk: intensity = l.normalize ? 1 : kPi * r * r; break;
+        case ModelLightInfo::Kind::Cylinder: intensity = l.normalize ? 1 / kPi : 2 * r * std::max(0.0, l.length); break;
+        case ModelLightInfo::Kind::Dome: break;
+        }
+        if (l.kind == ModelLightInfo::Kind::Distant) {
+            ml.kind = ModelLight::Kind::Directional;
+            ml.intensity = intensity;
+        } else {
+            ml.intensity = intensity * k * k;
+            const bool face = l.kind == ModelLightInfo::Kind::Rect || l.kind == ModelLightInfo::Kind::Disk;
+            if (face || l.coneAngle < 180) {  // (a rect or disk lights the side it faces)
+                ml.kind = ModelLight::Kind::Spot;
+                ml.outerCone = std::clamp(std::min(l.coneAngle, face ? 89.0 : 180.0), 0.1, 179.0) * kDeg;
+                ml.innerCone = face && l.coneAngle >= 180 ? 0 : ml.outerCone * (1 - std::clamp(l.coneSoftness, 0.0, 1.0));
+            } else {
+                ml.kind = ModelLight::Kind::Point;
+            }
+        }
+        scene.lights.push_back(ml);
+    }
+}
+
 }  // namespace
 
 int modelCameraTrack(const Sequence& seq, size_t track, const Clip& c, FrameTime t) {
@@ -127,7 +216,7 @@ bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
     auto P = [&](const char* name, double def) { return g.p(name, lt, def); };
     const std::string file = g.s("file");
     if (file.empty()) {
-        if (error) *error = "Choose a model file (glTF, GLB or OBJ)";
+        if (error) *error = "Choose a model file (glTF, GLB, OBJ or USD)";
         return false;
     }
     model = cachedModel(file, error);
@@ -148,16 +237,20 @@ bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
         if (error) *error = file + " has nothing to draw";
         return false;
     }
-    PosedTriangles posed = posedTriangles(*model, poseModel(*model, animation, sec));
+    const ModelPose pose = poseModel(*model, animation, sec);
+    PosedTriangles posed = posedTriangles(*model, pose);
 
-    // Into the world: centred on its rest bounds (standing on their bottom when asked), sized, turned and moved.
-    const bool solved = std::lround(P("camera", 0)) == 1;
+    // Into the world: centred on its rest bounds (standing on their bottom when asked), sized, turned and moved; seen
+    // through its own file's camera, left where the file has it.
+    const long mode = std::lround(P("camera", 0));
+    const bool solved = mode == 1, fileCamera = mode == 2;
     const bool stand = solved && P("stand", 1) > 0.5;
     const double modelHeight = std::max(1e-9, hi[1] - lo[1]);
-    const double k = solved ? P("scale", 100) / 100 : P("size", 400) / std::max({modelHeight, hi[0] - lo[0], hi[2] - lo[2]});
+    const double k = fileCamera ? 1 : solved ? P("scale", 100) / 100 : P("size", 400) / std::max({modelHeight, hi[0] - lo[0], hi[2] - lo[2]});
     const Mat4 centre = trsMatrix({-k * (lo[0] + hi[0]) / 2, -k * (stand ? lo[1] : (lo[1] + hi[1]) / 2), -k * (lo[2] + hi[2]) / 2}, {0, 0, 0, 1}, {k, k, k});
-    const Mat4 place = trsMatrix({P("pos_x", 0), P("pos_y", 0), P("pos_z", 0)}, {0, 0, 0, 1}, {1, 1, 1}) *
-                       turned(P("rot_x", 0), P("rot_y", 0), P("rot_z", 0)) * centre;
+    const Mat4 place = fileCamera ? identity4()
+                                  : trsMatrix({P("pos_x", 0), P("pos_y", 0), P("pos_z", 0)}, {0, 0, 0, 1}, {1, 1, 1}) *
+                                        turned(P("rot_x", 0), P("rot_y", 0), P("rot_z", 0)) * centre;
     const Mat4 normalM = inverse4(place);
     for (size_t i = 0; i < posed.positions.size() / 3; ++i) {
         const std::array<double, 3> q = transformPoint(place, {posed.positions[i * 3], posed.positions[i * 3 + 1], posed.positions[i * 3 + 2]});
@@ -213,6 +306,22 @@ bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
         cam.nearZ = 1e-3;
         groundY = 0;
         onGround = solve->oriented;  // (a scene not stood on its ground has no ground to catch shadows)
+    } else if (fileCamera) {
+        const int index = int(std::lround(P("camera_index", 1))) - 1;
+        std::array<double, 3> at;
+        std::array<std::array<double, 3>, 3> axes;
+        if (index < 0 || size_t(index) >= model->cameras.size() || !modelCameraPlace(pose, model->cameras[size_t(index)], at, axes)) {
+            if (error) *error = model->cameras.empty() ? file + " has no camera" : file + " has no camera " + std::to_string(index + 1);
+            return false;
+        }
+        const ModelCameraInfo& fc = model->cameras[size_t(index)];
+        // Rows: right, down and ahead.
+        cam.R = {axes[0][0], axes[0][1], axes[0][2], -axes[1][0], -axes[1][1], -axes[1][2], -axes[2][0], -axes[2][1], -axes[2][2]};
+        cam.C = at;
+        double f, cx, cy;
+        modelCameraLens(fc, sec, SW, SH, f, cx, cy);
+        cam.screen = {f * scale, 0, cx * scale, 0, f * scale, cy * scale};
+        cam.nearZ = std::max(1e-6, fc.nearClip);
     } else {
         // In front of the frame: the plane z = 0 at one sequence pixel a unit, y up, the camera on +z looking back.
         const double f = (SW / 2) / std::tan(std::clamp(P("fov", 35), 1.0, 170.0) * kDeg / 2);
@@ -240,12 +349,16 @@ bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
     light.outerCone = std::clamp(P("spot_angle", 30), 1.0, 85.0) * kDeg;
     light.innerCone = light.outerCone * 0.8;
     light.shadows = P("shadows", 1) > 0.5;
-    if (P("light_strength", 100) > 0) scene.lights.push_back(light);
     const float ambient = float(P("ambient", 30) / 100);
     scene.ambient = {ambient, ambient, ambient};
+    if (kind == 3) addFileLights(model, pose, place, k, scene);
+    else if (P("light_strength", 100) > 0) scene.lights.push_back(light);
     if (const int lt2 = ti >= 0 ? modelLightTrack(seq, size_t(ti), c, t) : -1; lt2 >= 0 && trackLayer) {
         scene.environment = environmentFrom(trackLayer(lt2), seq);
         scene.environmentRotation = P("env_rotation", 0) * kDeg;
+        scene.environmentIntensity = float(P("env_strength", 100) / 100);
+    } else if (scene.environment) {  // (the file's dome light)
+        scene.environmentRotation += P("env_rotation", 0) * kDeg;
         scene.environmentIntensity = float(P("env_strength", 100) / 100);
     }
     scene.ground = onGround && P("ground", 1) > 0.5;
@@ -253,6 +366,47 @@ bool modelClipScene(const Project& p, const Sequence& seq, const Clip& c, FrameT
     scene.groundStrength = float(P("ground_strength", 80) / 100);
     scene.opacity = float(P("opacity", 100) / 100);
     return true;
+}
+
+std::vector<SolvedSceneMesh> solvedSceneModels(const Project& p, const Sequence& seq, size_t track, const Clip& footage) {
+    std::vector<SolvedSceneMesh> out;
+    for (size_t ti = 0; ti < seq.videoTracks.size(); ++ti)
+        for (const Clip& c : seq.videoTracks[ti].clips) {
+            if (!c.enabled || !c.isGenerator() || c.generator.type != "model3d" || std::lround(c.generator.p("camera", 0, 0)) != 1) continue;
+            if (modelCameraTrack(seq, ti, c, c.start) != int(track) || clipOn(seq.videoTracks[track], c.start) != &footage) continue;
+            ModelScene scene;
+            ModelCamera cam;
+            std::shared_ptr<const Model> model;
+            if (!modelClipScene(p, seq, c, c.start, seq.width, seq.height, 1, {}, scene, cam, model)) continue;
+            const PosedTriangles& tr = scene.triangles;
+            std::map<int, size_t> byMaterial;
+            for (size_t t = 0; t < tr.materials.size() && t * 3 + 2 < tr.indices.size(); ++t) {
+                const int mi = tr.materials[t];
+                auto it = byMaterial.find(mi);
+                if (it == byMaterial.end()) {
+                    SolvedSceneMesh m;
+                    m.name = c.name.empty() ? model->path : c.name;
+                    if (mi >= 0 && size_t(mi) < model->materials.size()) {
+                        const ModelMaterial& mm = model->materials[size_t(mi)];
+                        m.color = mm.baseColor;
+                        m.metallic = mm.metallic, m.roughness = mm.roughness;
+                        m.doubleSided = mm.doubleSided;
+                    }
+                    it = byMaterial.emplace(mi, out.size()).first;
+                    out.push_back(std::move(m));
+                }
+                SolvedSceneMesh& m = out[it->second];
+                for (int v = 0; v < 3; ++v) {
+                    const uint32_t i = tr.indices[t * 3 + size_t(v)];
+                    m.indices.push_back(uint32_t(m.positions.size() / 3));
+                    for (int a = 0; a < 3; ++a) {
+                        m.positions.push_back(tr.positions[size_t(i) * 3 + size_t(a)]);
+                        m.normals.push_back(tr.normals[size_t(i) * 3 + size_t(a)]);
+                    }
+                }
+            }
+        }
+    return out;
 }
 
 Image renderModelClip(const Project& p, const Sequence& seq, const Clip& c, FrameTime t, int w, int h, double scale,

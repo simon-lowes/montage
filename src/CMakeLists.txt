@@ -85,6 +85,7 @@ add_library(montage_engine STATIC
   media/Decoder.h media/Decoder.cpp
   media/DeepImage.h media/DeepImage.cpp
   media/Model3D.h media/Model3D.cpp
+  media/Usd.h media/Usd.cpp media/UsdModel.cpp
   media/Exr.h media/Exr.cpp
   media/Vector.h media/Vector.cpp
   media/CameraRaw.h media/CameraRaw.cpp

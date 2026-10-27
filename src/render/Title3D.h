@@ -1,5 +1,6 @@
 // Montage — extruded 3D titles (Final Cut's 3D titles, Resolve's Fusion 3D text): the text's outline pulled out into
-// depth, turned in space and lit, seen through a perspective camera, every setting keyframeable. Drawn by a small
+// depth, turned in space and lit, seen through a perspective camera (its own, or a camera in a USD or glTF scene
+// with the title standing in that scene), every setting keyframeable. Drawn by a small
 // z-buffered rasteriser at twice the size and filtered down: the front and back faces fill the projected outline
 // (nonzero winding, so letters keep their holes; each pixel's depth from the face's plane), and the sides are quads
 // along every edge, smooth where the outline curves and sharp at its corners.

@@ -112,4 +112,19 @@ bool cameraSolveFromString(const std::string& text, CameraSolve& s);
 bool writeNukeChan(const CameraSolve& s, const std::string& path, int firstFrame = 1, std::string* error = nullptr);
 bool writePointsPly(const CameraSolve& s, const std::string& path, std::string* error = nullptr);
 
+// A model placed in the solved scene, for writeSolveUsda: triangles in the scene's space, of one material.
+struct SolvedSceneMesh {
+    std::string name;
+    std::vector<float> positions, normals;  // 3 a vertex (normals may be empty)
+    std::vector<uint32_t> indices;          // triangles
+    std::array<float, 4> color{0.18f, 0.18f, 0.18f, 1};  // linear base colour and opacity
+    float metallic = 0, roughness = 0.5f;
+    bool doubleSided = false;
+};
+// The camera, its points and the models placed in its scene as a USD scene (USDA): a camera moving through time codes
+// 0, 1, 2... (one a frame, at the footage's frame rate; a 36 mm wide film back), the points as a point cloud and each
+// model as a mesh with a plain material. Turned as writeNukeChan turns a scene with no ground.
+bool writeSolveUsda(const CameraSolve& s, const std::string& path, const std::vector<SolvedSceneMesh>& models = {},
+                    std::string* error = nullptr);
+
 }  // namespace montage

@@ -187,6 +187,8 @@
 #include "media/DepthMap.h"
 #include "media/DeepImage.h"
 #include "media/Model3D.h"
+#include "media/Usd.h"
+#include "core/Zip.h"
 #include "render/ModelClip.h"
 #include "render/ModelRender.h"
 #include "media/Exr.h"
@@ -29738,6 +29740,156 @@ if ui["pressed"] == "add":
         QVERIFY2(covered > 200, qPrintable(QString::number(covered)));
     }
 
+    void usdScenes() {
+        // The same cube as USDA, packed in a USDZ with its texture, and as glTF: drawn the same, pixel for pixel.
+        const std::string dir = MONTAGE_TEST_DATA_DIR "/models/";
+        auto slurp = [](const std::string& file) {
+            QFile f(QString::fromStdString(file));
+            return f.open(QIODevice::ReadOnly) ? f.readAll().toStdString() : std::string();
+        };
+        std::string err;
+        const std::string usda = slurp(dir + "cube.usda"), png = slurp(dir + "checker.png");
+        QVERIFY(!usda.empty() && !png.empty());
+        ZipWriter zip;
+        zip.add("cube.usda", usda);
+        zip.add("checker.png", png);
+        writeTextFile(path("cube.usdz"), zip.finish());
+        Model gltf, text, packed;
+        QVERIFY2(loadModel(dir + "cube.gltf", gltf, &err), err.c_str());
+        QVERIFY2(loadModel(dir + "cube.usda", text, &err), err.c_str());
+        QVERIFY2(loadModel(path("cube.usdz"), packed, &err), err.c_str());
+        auto draw = [&](const Model& m) {
+            ModelScene scene;
+            scene.triangles = posedTriangles(m, poseModel(m, -1, 0));
+            scene.model = &m;
+            ModelLight sun;
+            sun.direction = {-0.3, -0.8, -0.5};
+            scene.lights = {sun};
+            scene.ambient = {0.2f, 0.2f, 0.2f};
+            return renderModel(scene, lookAt({3, 2.5, 4}, {0, 0, 0}, 300, 200, 150), 200, 150);
+        };
+        const Image want = draw(gltf);
+        int covered = 0;
+        for (const Model* m : {&text, &packed}) {
+            QCOMPARE(m->triangles(), size_t(12));
+            const Image got = draw(*m);
+            double worst = 0;
+            for (int y = 0; y < 150; ++y)
+                for (int x = 0; x < 200; ++x)
+                    for (int k = 0; k < 4; ++k) worst = std::max(worst, double(std::fabs(got.at(x, y)[k] - want.at(x, y)[k])));
+            QVERIFY2(worst < 1e-5, qPrintable(QString::number(worst)));
+        }
+        for (int y = 0; y < 150; ++y)
+            for (int x = 0; x < 200; ++x) covered += want.at(x, y)[3] > 0.5f;
+        QVERIFY(covered > 3000);
+        // The texture in the package read as it is: the checker's red and blue squares.
+        QCOMPARE(packed.textures.size(), size_t(1));
+        const ModelTexture::Level& l = packed.textures[0].levels[0];
+        QVERIFY(l.width == 8 && l.height == 8 && l.rgba[0] == 220 && l.rgba[1] == 40 && l.rgba[2] == 30);
+        QVERIFY(l.rgba[(2 * 8 + 0) * 4 + 2] == 200 && l.rgba[(0 * 8 + 2) * 4 + 2] == 200);
+        QVERIFY(isModelPath("a.usdz") && isModelPath("b.USDA") && isModelPath("c.usd") && isModelPath("d.usdc"));
+
+        // A transform sampled in time: met at its samples (time codes 0, 12 and 24, 24 a second), between them linear.
+        Model anim;
+        QVERIFY2(loadModel(dir + "anim.usda", anim, &err), err.c_str());
+        QCOMPARE(anim.animations.size(), size_t(1));
+        QCOMPARE(anim.animations[0].duration, 1.0);
+        auto turnY = [](double deg) {
+            const double h = deg * M_PI / 360;
+            return std::array<double, 4>{0, std::sin(h), 0, std::cos(h)};
+        };
+        const std::array<double, 3> T[4] = {{0, 0, 0}, {1, 0, 0}, {1, 2, 0}, {0.5, 0, 0}};
+        const double turn[4] = {0, 45, 90, 22.5}, when[4] = {0, 0.5, 1, 0.25};
+        for (int k = 0; k < 4; ++k) {
+            const ModelPose pose = poseModel(anim, 0, when[k]);
+            const Mat4 want = trsMatrix(T[k], turnY(turn[k]), {1, 1, 1});
+            for (int e = 0; e < 16; ++e)
+                QVERIFY2(std::fabs(pose.world.at(0)[size_t(e)] - want[size_t(e)]) < 1e-6, qPrintable(QString("at %1 s, %2").arg(when[k]).arg(e)));
+        }
+
+        // A camera and light in a scene that references the cube: read, with the cube composed in.
+        Model scene;
+        QVERIFY2(loadModel(dir + "camera.usda", scene, &err), err.c_str());
+        QCOMPARE(scene.triangles(), size_t(12));
+        QVERIFY(scene.cameras.size() == 1 && scene.cameras[0].focalLength == 50 && scene.cameras[0].verticalAperture == 20.25);
+        QVERIFY(scene.lights.size() == 1 && scene.lights[0].kind == ModelLightInfo::Kind::Distant && scene.lights[0].angle == 0);
+        double f, cx, cy;
+        modelCameraLens(scene.cameras[0], 0, 640, 360, f, cx, cy);
+        QVERIFY(std::fabs(f - 50 * 360 / 20.25) < 1e-3 && cx == 320 && cy == 180);
+        // What is not read is listed (a scene with nothing to draw is still read for its camera); a file that is not
+        // USD is refused.
+        writeTextFile(path("odd.usda"), "#usda 1.0\ndef PointInstancer \"Trees\"\n{\n}\ndef BasisCurves \"Hair\"\n{\n}\ndef Camera \"C\"\n{\n}\n");
+        Model odd;
+        QVERIFY2(loadModel(path("odd.usda"), odd, &err), err.c_str());
+        QVERIFY(odd.notes.size() == 2);
+        writeTextFile(path("broken.usda"), "#usda 1.0\ndef Mesh \"M\"\n{\n    int[] faceVertexCounts = [3\n");
+        QVERIFY(!loadModel(path("broken.usda"), odd, &err) && !err.empty());
+        writeTextFile(path("broken.usdc"), std::string("PXR-USDC") + std::string(80, '\xff'));
+        QVERIFY(!loadModel(path("broken.usdc"), odd, &err) && !err.empty());
+
+        // A turn about three axes in another order: its angles are still (x, y, z), applied in the order named.
+        writeTextFile(path("turned.usda"), "#usda 1.0\ndef Xform \"T\"\n{\n    float3 xformOp:rotateXZY = (0, 90, 0)\n"
+                                           "    uniform token[] xformOpOrder = [\"xformOp:rotateXZY\"]\n    def Camera \"C\"\n    {\n    }\n}\n");
+        Model turned;
+        QVERIFY2(loadModel(path("turned.usda"), turned, &err), err.c_str());
+        {
+            const Mat4 want = trsMatrix({0, 0, 0}, turnY(90), {1, 1, 1});
+            for (int e = 0; e < 16; ++e) QVERIFY2(std::fabs(poseModel(turned, -1, 0).world.at(0)[size_t(e)] - want[size_t(e)]) < 1e-6, qPrintable(QString::number(e)));
+        }
+        // A distant light with no intensity of its own: USD's fallback, the sun's luminance.
+        writeTextFile(path("sun.usda"), "#usda 1.0\ndef DistantLight \"Sun\"\n{\n}\ndef Camera \"C\"\n{\n}\n");
+        Model sun;
+        QVERIFY2(loadModel(path("sun.usda"), sun, &err), err.c_str());
+        QVERIFY(sun.lights.size() == 1 && sun.lights[0].color[0] == 50000 && std::fabs(sun.lights[0].angle - 0.53) < 1e-6);
+        // Files made to do harm: a left-handed mesh with a face of -1 corners, a colour of one number where three are
+        // needed, a dome picture claiming 32768 x 32768 in a few bytes, and references that double at every level
+        // (2^30 prims): read without harm, what cannot be used left out and listed.
+        writeTextFile(path("dome.hdr"), "#?RADIANCE\n\n-Y 32768 +X 32768\n");
+        std::string harm = "#usda 1.0\ndef Mesh \"Bad\"\n{\n    uniform token orientation = \"leftHanded\"\n"
+                           "    int[] faceVertexCounts = [-1, 4]\n    int[] faceVertexIndices = [0, 1, 2, 3]\n"
+                           "    point3f[] points = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)]\n}\n"
+                           "def Mesh \"Thin\"\n{\n    int[] faceVertexCounts = [3]\n    int[] faceVertexIndices = [0, 1, 2]\n"
+                           "    point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]\n    color3f[] primvars:displayColor = [0.5] (\n"
+                           "        interpolation = \"vertex\"\n    )\n    float[] primvars:normals = [1] (\n        interpolation = \"vertex\"\n    )\n"
+                           "    uniform token subdivisionScheme = \"none\"\n}\n"
+                           "def DomeLight \"Sky\"\n{\n    asset inputs:texture:file = @dome.hdr@\n}\n"
+                           "def Xform \"L0\"\n{\n}\n";
+        for (int k = 1; k <= 30; ++k)
+            harm += QString("def Xform \"L%1\"\n{\n    def \"x\" (\n        references = </L%2>\n    )\n    {\n    }\n"
+                            "    def \"y\" (\n        references = </L%2>\n    )\n    {\n    }\n}\n").arg(k).arg(k - 1).toStdString();
+        writeTextFile(path("harm.usda"), harm);
+        Model harmed;
+        QElapsedTimer clock;
+        clock.start();
+        QVERIFY2(loadModel(path("harm.usda"), harmed, &err), err.c_str());
+        QVERIFY2(clock.elapsed() < 60000, qPrintable(QString::number(clock.elapsed())));
+        QCOMPARE(harmed.triangles(), size_t(1));  // (the thin triangle; the bad mesh refused)
+        auto noted = [&](const char* what) {
+            return std::any_of(harmed.notes.begin(), harmed.notes.end(), [&](const std::string& n) { return n.find(what) != std::string::npos; });
+        };
+        QVERIFY(noted("Bad") && noted("dome") && noted("262,144"));
+
+        // Sample scenes from the tinyusdz project, when fetched (CI puts them in $MONTAGE_TEST_USD_SAMPLES): the same
+        // cube as USDA and USDC (the binary crate) drawn the same; a texture packed in a USDZ.
+        const QByteArray samples = qgetenv("MONTAGE_TEST_USD_SAMPLES");
+        if (samples.isEmpty()) {
+            qInfo("MONTAGE_TEST_USD_SAMPLES not set: the sample USD scenes not tried");
+            return;
+        }
+        const std::string sd = samples.toStdString() + "/";
+        Model a, c;
+        QVERIFY2(loadModel(sd + "cube-previewsurface.usda", a, &err), err.c_str());
+        QVERIFY2(loadModel(sd + "cube-previewsurface.usdc", c, &err), err.c_str());
+        QVERIFY(a.triangles() == 12 && a.cameras.size() == 1 && a.lights.size() == 1);
+        const Image ia = draw(a), ic = draw(c);
+        for (int y = 0; y < 150; ++y)
+            for (int x = 0; x < 200; ++x)
+                for (int k = 0; k < 4; ++k) QVERIFY(std::fabs(ia.at(x, y)[k] - ic.at(x, y)[k]) < 1e-5f);
+        Model cat;
+        QVERIFY2(loadModel(sd + "texture-cat-plane.usdz", cat, &err), err.c_str());
+        QVERIFY(cat.textures.size() == 1 && cat.textures[0].levels[0].width > 16 && cat.materials.at(0).baseTexture == 0);
+    }
+
     void modelFilesRefused() {
         // A glTF whose buffer says 100 MB beside a 16-byte file: refused, not read past the file's end.
         auto writeGltf = [&](const std::string& name, const QJsonObject& gltf) {
@@ -30060,6 +30212,17 @@ if ui["pressed"] == "add":
                                                    {"settings", QJsonObject{{"ground", 0}, {"rot_y", 0}}}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
         QCOMPARE(r.value("structuredContent").toObject().value("triangles").toDouble(), 12.0);
+        // Exported with its solve as a USD scene: the camera, and the cube where it stands in the shot.
+        r = call("montage_camera_track", {{"project", project}, {"clip", double(footage.id)}, {"action", "export"},
+                                          {"usd", QString::fromStdString(path("shot.usda"))}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QCOMPARE(r.value("structuredContent").toObject().value("meshes").toDouble(), 1.0);
+        {
+            Model shot;
+            std::string e;
+            QVERIFY2(loadModel(path("shot.usda"), shot, &e), e.c_str());
+            QVERIFY(shot.triangles() == 12 && shot.cameras.size() == 1 && std::fabs(shot.materials.at(0).baseColor[0] - 0.9f) < 1e-6f);
+        }
         Project q;
         std::string err;
         QVERIFY(loadProject(project.toStdString(), q, &err));
@@ -30150,6 +30313,103 @@ if ui["pressed"] == "add":
         QVERIFY2(std::fabs((ox0 + ox1 + 1) / 2.0 - W / 2.0) < 1.5 && std::fabs((oy0 + oy1 + 1) / 2.0 - H / 2.0) < 1.5 &&
                      std::fabs(oy1 + 1 - oy0 - want) < 2.5,
                  qPrintable(QString("drawn %1..%2 x %3..%4, %5 tall wanted").arg(ox0).arg(ox1).arg(oy0).arg(oy1).arg(want)));
+    }
+
+    void usdCameraAndSolveExport() {
+        // A model clip seen through the camera in its USD scene and lit by the scene's light: the camera where the
+        // file puts it (8 units down +z, a 50 mm lens on a 16:9 film back), the light a sun of illuminance pi.
+        const int W = 640, H = 360;
+        std::string err;
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = W, s.height = H, s.fps = {25, 1};
+        Clip clip;
+        clip.id = p.newId();
+        clip.duration = 10;
+        clip.generator = makeEffect(p, "model3d");
+        clip.generator.strings["file"] = MONTAGE_TEST_DATA_DIR "/models/camera.usda";
+        clip.generator.params["camera"] = 2.0;
+        clip.generator.params["light_kind"] = 3.0;
+        clip.generator.params["ambient"] = 0.0;
+        clip.generator.params["ground"] = 0.0;
+        s.videoTracks[0].clips.push_back(clip);
+        ModelScene scene;
+        ModelCamera cam;
+        std::shared_ptr<const Model> model;
+        QVERIFY2(modelClipScene(p, s, s.videoTracks[0].clips[0], 0, W, H, 1, {}, scene, cam, model, &err), err.c_str());
+        const ModelCamera want = lookAt({0, 0, 8}, {0, 0, 0}, 50 * H / 20.25, W, H);
+        for (int k = 0; k < 8; ++k) {
+            const std::array<double, 3> X{k & 1 ? 1.0 : -1.0, k & 2 ? 1.0 : -1.0, k & 4 ? 1.0 : -1.0};
+            double px, py, qx, qy;
+            QVERIFY(cam.project(X, px, py) && want.project(X, qx, qy));
+            QVERIFY2(std::hypot(px - qx, py - qy) < 1e-6, qPrintable(QString("corner %1: %2, %3 against %4, %5").arg(k).arg(px).arg(py).arg(qx).arg(qy)));
+        }
+        QVERIFY(scene.lights.size() == 1 && scene.lights[0].kind == ModelLight::Kind::Directional);
+        QVERIFY(std::fabs(scene.lights[0].intensity * scene.lights[0].color[0] - M_PI) < 1e-5 && std::fabs(scene.lights[0].direction[2] + 1) < 1e-9);
+        QVERIFY(scene.ambient[0] == 0 && scene.triangles.indices.size() == 36);
+        // Drawn: its front face, 7 units off, fills f / 7 either side of the middle.
+        const Image img = renderModelClip(p, s, s.videoTracks[0].clips[0], 0, W, H, 1, {}, nullptr, &err);
+        int x0 = W, x1 = -1, y0 = H, y1 = -1;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                if (img.at(x, y)[3] > 0.5f) x0 = std::min(x0, x), x1 = std::max(x1, x), y0 = std::min(y0, y), y1 = std::max(y1, y);
+        const double half = 50 * H / 20.25 / 7;
+        QVERIFY2(std::fabs(x0 - (W / 2 - half)) < 1.5 && std::fabs(x1 + 1 - (W / 2 + half)) < 1.5 && std::fabs(y0 - (H / 2 - half)) < 1.5,
+                 qPrintable(QString("drawn %1..%2 x %3..%4").arg(x0).arg(x1).arg(y0).arg(y1)));
+
+        // A camera solve written as a USD scene and read back: the camera where the solve has it in every frame (to
+        // 1e-6), and the points where the solve sees them (to 0.01 px), with or without a ground.
+        CameraSolve solve;
+        solve.width = W, solve.height = H, solve.focal = 520, solve.fps = 25;
+        for (int i = 0; i < 30; ++i) {
+            const std::array<double, 3> C{-1 + 0.05 * i, 1.6 + 0.01 * i, 6 - 0.02 * i};
+            const ModelCamera c = lookAt(C, {0.1 * i, 0.5, 0}, 1, 1, 1);
+            SolvedCamera sc;
+            sc.valid = i != 7;  // (a frame not solved)
+            std::copy(c.R.begin(), c.R.end(), sc.R.begin());
+            sc.C = {C[0], C[1], C[2]};
+            solve.cameras.push_back(sc);
+        }
+        for (int k = 0; k < 40; ++k) {
+            SolvedPoint pt;
+            pt.X = {-2 + 0.1 * k, std::fmod(0.37 * k, 1.5), -1 - std::fmod(0.53 * k, 3.0)};
+            solve.points.push_back(pt);
+        }
+        for (const bool oriented : {true, false}) {
+            solve.oriented = oriented;
+            const std::string file = path(oriented ? "solve.usda" : "solve-unoriented.usda");
+            QVERIFY2(writeSolveUsda(solve, file, {}, &err), err.c_str());
+            Model back;
+            QVERIFY2(loadModel(file, back, &err), err.c_str());
+            QVERIFY(back.cameras.size() == 1 && back.animations.size() == 1);
+            usd::Stage stage;
+            QVERIFY2(usd::openStage(file, stage, &err), err.c_str());
+            QVERIFY(stage.layer.timeCodesPerSecond == 25 && stage.prim("/Solve/Points") && stage.prim("/Solve/Points")->attribute("points"));
+            const std::vector<double> pts = stage.prim("/Solve/Points")->attribute("points")->value.numbers;
+            QCOMPARE(pts.size(), solve.points.size() * 3);
+            const double k = oriented ? 1 : -1;
+            for (int i = 0; i < 30; ++i) {
+                if (!solve.cameras[size_t(i)].valid) continue;
+                const ModelPose pose = poseModel(back, 0, i / 25.0);
+                std::array<double, 3> at;
+                std::array<std::array<double, 3>, 3> axes;
+                QVERIFY(modelCameraPlace(pose, back.cameras[0], at, axes));
+                const Vec3& C = solve.cameras[size_t(i)].C;
+                QVERIFY2(std::fabs(at[0] - C.x) < 1e-6 && std::fabs(at[1] - k * C.y) < 1e-6 && std::fabs(at[2] - k * C.z) < 1e-6, qPrintable(QString("frame %1").arg(i)));
+                ModelCamera mc;
+                mc.R = {axes[0][0], axes[0][1], axes[0][2], -axes[1][0], -axes[1][1], -axes[1][2], -axes[2][0], -axes[2][1], -axes[2][2]};
+                mc.C = at;
+                double f, cx, cy;
+                modelCameraLens(back.cameras[0], i / 25.0, W, H, f, cx, cy);
+                mc.screen = {f, 0, cx, 0, f, cy};
+                for (size_t n = 0; n < solve.points.size(); ++n) {
+                    double px, py;
+                    Point2 seen;
+                    QVERIFY(solve.project(i, solve.points[n].X, seen) && mc.project({pts[n * 3], pts[n * 3 + 1], pts[n * 3 + 2]}, px, py));
+                    QVERIFY2(std::hypot(px - seen.x, py - seen.y) < 0.01, qPrintable(QString("frame %1 point %2: %3, %4 against %5, %6").arg(i).arg(n).arg(px).arg(py).arg(seen.x).arg(seen.y)));
+                }
+            }
+        }
     }
 
     void dialogueMusicEffectsChunks() {

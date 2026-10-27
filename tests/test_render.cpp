@@ -13442,6 +13442,38 @@ colorspaces:
         QVERIFY(info && info->category == EffectCategory::Generator && info->displayName == "3D Title");
     }
 
+    void title3DThroughAFileCamera() {
+        // A 3D title seen through the camera in a USD scene (8 units down +z, a 50 mm lens on a 16:9 film back) draws
+        // as the same title through its own camera set by hand to that lens, the scene's units sized to match.
+        const int w = 640, h = 360;
+        const double f = 50 * h / 20.25;  // the lens in pixels across the picture's height
+        Effect hand = makeEffect("title3d", 1);
+        hand.strings["text"] = "USD";
+        hand.params["rot_y"] = Param(25.0);
+        hand.params["pos_x"] = Param(40.0);
+        hand.params["fov"] = Param(2 * std::atan(h / 2.0 / f) * 180 / M_PI);
+        Effect file = hand;
+        file.strings["camera_file"] = MONTAGE_TEST_DATA_DIR "/models/camera.usda";
+        file.params["units"] = Param(f / 8);
+        const Image a = renderGenerator(hand, 0, w, h, 1.0, 90, 30), b = renderGenerator(file, 0, w, h, 1.0, 90, 30);
+        double worst = 0, total = 0;
+        int covered = 0;
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                covered += a.at(x, y)[3] > 0.5f;
+                for (int k = 0; k < 4; ++k) {
+                    const double d = std::fabs(a.at(x, y)[k] - b.at(x, y)[k]);
+                    worst = std::max(worst, d), total += d;
+                }
+            }
+        QVERIFY2(covered > 2000, qPrintable(QString::number(covered)));
+        QVERIFY2(worst < 0.02 && total / (w * h * 4) < 1e-5, qPrintable(QString("worst %1, mean %2").arg(worst).arg(total / (w * h * 4))));
+        // A camera the file does not have: its own camera instead.
+        file.params["camera_index"] = Param(2.0);
+        const Image own = renderGenerator(file, 0, w, h, 1.0, 90, 30);
+        QVERIFY(std::equal(own.px.begin(), own.px.end(), a.px.begin()));
+    }
+
     void titlesRender() {
         Project p;
         Effect t = makeEffect(p, "title");
