@@ -49,6 +49,7 @@ add_library(montage_engine STATIC
   core/Effects.h core/Effects.cpp
   core/EditOps.h core/EditOps.cpp
   core/TimelineCompare.h core/TimelineCompare.cpp
+  core/ProjectMerge.h core/ProjectMerge.cpp
   core/Reconform.h core/Reconform.cpp
   core/Adr.h core/Adr.cpp
   core/TakeLanes.h core/TakeLanes.cpp

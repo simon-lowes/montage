@@ -186,6 +186,7 @@
 #include <QFileDialog>
 #include "GradeNodePanel.h"
 #include "CompareDialog.h"
+#include "MergeDialog.h"
 #include "Keymap.h"
 #include "LoudnessReadout.h"
 #include "AudioAnalysisWidget.h"
@@ -12822,6 +12823,71 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(state()->sequence()->markers.empty());
         dlg->close();
         QVERIFY(!win_->compareWith(999999));
+        state()->newProject();
+    }
+
+    void mergeProjectFromTheFileMenu() {
+        // The demo saved as a copy for another editor; both then work on it.
+        loadDemo();
+        QVERIFY(win_->findChild<QAction*>("saveCopyForEditor"));
+        QVERIFY(win_->findChild<QAction*>("mergeProject"));
+        QTemporaryDir dir;
+        const QString copyPath = dir.filePath("copy.montage");
+        QVERIFY(win_->saveCopyForAnotherEditor(copyPath));
+        Project theirs;
+        QVERIFY(loadProject(copyPath.toStdString(), theirs));
+        Project base;
+        QVERIFY(mergeBaseOf(theirs, base));
+        const Id red = state()->sequence()->videoTracks[0].clips[0].id, blue = state()->sequence()->videoTracks[0].clips[1].id;
+        // Theirs: a marker, and Red shortened by 10 frames; mine: Red shortened by 20.
+        theirs.active()->markers.push_back(Marker{12, 0, "From the assistant", "", 3});
+        edit::clipById(*theirs.active(), red)->duration -= 10;
+        QVERIFY(saveProject(theirs, copyPath.toStdString()));
+        const FrameTime redLength = edit::clipById(*state()->sequence(), red)->duration;
+        QVERIFY(state()->edit("Trim", [&](Project&, Sequence& s) {
+            edit::clipById(s, red)->duration -= 20;
+            return true;
+        }));
+        MergeDialog* dlg = win_->mergeProjectDialog(copyPath);
+        QVERIFY(dlg);
+        QVERIFY2(dlg->result().ok, dlg->result().error.c_str());
+        QCOMPARE(dlg->result().conflicts.size(), size_t(1));
+        QVERIFY(dlg->isConflict(0));
+        QCOMPARE(dlg->cell(0, MergeDialog::Side), QString("Conflict"));
+        QCOMPARE(dlg->cell(0, MergeDialog::Choice), QString("Mine"));
+        QVERIFY(dlg->cell(0, MergeDialog::Field).startsWith("duration"));
+        QVERIFY(dlg->summary().contains("1 conflict"));
+        bool marker = false;
+        for (int r = 1; r < dlg->rowCount(); ++r)
+            marker = marker || (dlg->cell(r, MergeDialog::Side) == "Theirs" && dlg->cell(r, MergeDialog::What).contains("From the assistant"));
+        QVERIFY(marker);
+        // Going to the conflict selects Red; Theirs is taken, and the merge is one undo step.
+        state()->setPlayhead(200);
+        dlg->activate(0);
+        QCOMPARE(state()->selectedClips(), std::vector<Id>{red});
+        QCOMPARE(state()->playhead(), edit::clipById(*state()->sequence(), red)->start);
+        dlg->choose(0, MergeSide::Theirs);
+        QCOMPARE(dlg->cell(0, MergeDialog::Choice), QString("Theirs"));
+        QVERIFY(dlg->merge());
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->duration, redLength - 10);
+        QVERIFY(edit::clipById(*state()->sequence(), blue));
+        QCOMPARE(state()->sequence()->markers.size(), size_t(1));
+        QCOMPARE(state()->undoText(), QString("Merge Project"));
+        state()->undo();
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->duration, redLength - 20);
+        QVERIFY(state()->sequence()->markers.empty());
+        dlg->close();
+        // A copy that records no base: it has to be chosen.
+        Project plain = theirs;
+        plain.mergeBase.reset();
+        QVERIFY(saveProject(plain, dir.filePath("plain.montage").toStdString()));
+        MergeDialog* none = win_->mergeProjectDialog(dir.filePath("plain.montage"));
+        QVERIFY(!none->result().ok);
+        QVERIFY(none->summary().contains("Choose Base"));
+        QVERIFY(saveProject(base, dir.filePath("base.montage").toStdString()));
+        QVERIFY(none->setBase(dir.filePath("base.montage")));
+        QCOMPARE(none->result().conflicts.size(), size_t(1));
+        none->close();
         state()->newProject();
     }
 

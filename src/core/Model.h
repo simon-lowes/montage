@@ -667,6 +667,12 @@ struct Project {
     std::vector<std::string> soundCaptions;  // the sounds SDH captions describe (core/SdhCaptions.h); empty = the ready-made list
     std::vector<std::string> watchFolders;  // folders whose arriving media files are imported (app/EditorState)
     ProjectScript script;  // the screenplay and its lined coverage (core/ScriptCut.h)
+    // The version this project and a copy of it both started from (core/ProjectMerge.h), as project file JSON; null =
+    // none. A copy made for someone keeps it, so the two can be merged later. Shared: undo snapshots copy the pointer.
+    std::shared_ptr<const std::string> mergeBase;
+    // After a merge that gave the other copy's ids new ones here: their ids (as in their copy and the merge base) to
+    // this project's, so the next merge of that copy matches them up.
+    std::map<Id, Id> mergeIds;
     Id activeSequence = 0;
     Id nextId = 1;
     // Whether its media's stereo packing (MediaItem::stereo) has been read: false for a project saved before Montage

@@ -57,6 +57,7 @@
 #include "render/MeshWarp.h"
 #include "core/Expression.h"
 #include "core/ProjectIO.h"
+#include "core/ProjectMerge.h"
 #include "render/GrainMatch.h"
 #include "render/Expressions.h"
 #include "render/Particles.h"
@@ -17706,6 +17707,20 @@ if ui["pressed"] == "add":
         QCOMPARE(collected.sequences.size(), size_t(2));
         for (const MediaItem& m : collected.media) QVERIFY2(QString::fromStdString(m.path).contains("/collected/Media/"), m.path.c_str());
         QVERIFY(frame(collected, 10).px == before.px);
+        // The copy keeps what it started as, so it can be merged back: the original's own media paths and B are
+        // the original's side, the copy's new marker theirs, and nothing conflicts.
+        Project startedAs;
+        QVERIFY(mergeBaseOf(collected, startedAs));
+        Project unmarked = collected;
+        unmarked.mergeBase.reset();
+        QCOMPARE(projectToJson(startedAs), projectToJson(unmarked));
+        Project worked = collected;
+        worked.active()->markers.push_back(Marker{5, 0, "From the copy", "", 1});
+        const MergeResult home = mergeProjects(startedAs, p, worked);
+        QVERIFY2(home.ok && home.conflicts.empty(), home.error.c_str());
+        QCOMPARE(home.project.active()->markers.size(), p.active()->markers.size() + 1);
+        QCOMPARE(home.project.media.size(), p.media.size());
+        for (const MediaItem& m : home.project.media) QCOMPARE(m.path, p.findMedia(m.id)->path);
 
         // Consolidate the first sequence only, with half a second of handles: A becomes 0.5 to 2.5 s. A Dialogue
         // Alignment made for A's clip goes along (its span, in source frames, moved with the clip).
@@ -22084,6 +22099,82 @@ if ui["pressed"] == "add":
         QCOMPARE(mix->videoTracks[0].clips[2].start, FrameTime(200));
         r = reconform({{"project", project}, {"before", "Cut 1"}, {"source", "Cut 9"}});
         QVERIFY(r.value("isError").toBool());
+    }
+
+    void mcpMergeProject() {
+        // A cut copied for an assistant: they add a marker and trim the first shot to 40 frames, the editor trims it to
+        // 50 and adds a bin.
+        Project p = makeDefaultProject();
+        MediaItem m;
+        m.id = p.newId();
+        m.kind = MediaKind::Video;
+        m.name = "shot.mov";
+        m.path = path("shot.mov");
+        m.duration = 20;
+        m.width = 1920, m.height = 1080;
+        m.fps = {30, 1};
+        m.hasVideo = true;
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, *p.active(), m.id, 0, 0, 60, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id shot = p.active()->videoTracks[0].clips[0].id;
+        Project theirs = p, mine = p;
+        setMergeBase(theirs, p);
+        theirs.active()->markers.push_back(Marker{10, 0, "Check sync", "", 1});
+        edit::clipById(*theirs.active(), shot)->duration = 40;
+        edit::clipById(*mine.active(), shot)->duration = 50;
+        mine.bins.push_back("Selects");
+        const QString mineFile = QString::fromStdString(path("merge-mine.montage")), theirsFile = QString::fromStdString(path("merge-theirs.montage"));
+        QVERIFY(saveProject(mine, mineFile.toStdString()));
+        QVERIFY(saveProject(theirs, theirsFile.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_merge_project"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        // A dry run lists the conflict and their marker, and saves nothing.
+        QJsonObject r = call({{"project", mineFile}, {"theirs", theirsFile}, {"dry_run", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject out = r.value("structuredContent").toObject();
+        const QJsonArray conflicts = out.value("conflicts").toArray();
+        QCOMPARE(conflicts.size(), 1);
+        QCOMPARE(conflicts[0].toObject().value("field").toString(), QString("duration"));
+        QCOMPARE(conflicts[0].toObject().value("mine").toString(), QString("50"));
+        QCOMPARE(conflicts[0].toObject().value("theirs").toString(), QString("40"));
+        QCOMPARE(conflicts[0].toObject().value("took").toString(), QString("mine"));
+        const QString key = conflicts[0].toObject().value("key").toString();
+        bool marker = false;
+        for (const QJsonValue& c : out.value("changes").toArray())
+            marker = marker || (c.toObject().value("side").toString() == "theirs" && c.toObject().value("what").toString().contains("Check sync"));
+        QVERIFY(marker);
+        Project after;
+        QVERIFY(loadProject(mineFile.toStdString(), after));
+        QVERIFY(after.active()->markers.empty());
+        // Wrong choices are refused.
+        QVERIFY(call({{"project", mineFile}, {"theirs", theirsFile}, {"choices", QJsonObject{{"nothing", "theirs"}}}}).value("isError").toBool());
+        QVERIFY(call({{"project", mineFile}, {"theirs", theirsFile}, {"choices", QJsonObject{{key, "both"}}}}).value("isError").toBool());
+        QVERIFY(call({{"project", mineFile}, {"theirs", theirsFile}, {"take", "ours"}}).value("isError").toBool());
+        // Theirs taken for the trim: everything lands.
+        r = call({{"project", mineFile}, {"theirs", theirsFile}, {"choices", QJsonObject{{key, "theirs"}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(loadProject(mineFile.toStdString(), after));
+        QCOMPARE(edit::clipById(*after.active(), shot)->duration, FrameTime(40));
+        QCOMPARE(after.active()->markers.size(), size_t(1));
+        QCOMPARE(after.bins, std::vector<std::string>{"Selects"});
+        // A copy with no record of the base needs one given.
+        theirs.mergeBase.reset();
+        QVERIFY(saveProject(theirs, theirsFile.toStdString()));
+        QVERIFY(saveProject(mine, mineFile.toStdString()));
+        QVERIFY(call({{"project", mineFile}, {"theirs", theirsFile}}).value("isError").toBool());
+        const QString baseFile = QString::fromStdString(path("merge-base.montage"));
+        QVERIFY(saveProject(p, baseFile.toStdString()));
+        r = call({{"project", mineFile}, {"theirs", theirsFile}, {"base", baseFile}, {"take", "theirs"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(loadProject(mineFile.toStdString(), after));
+        QCOMPARE(edit::clipById(*after.active(), shot)->duration, FrameTime(40));
     }
 
     void mcpServerEditsProjects() {

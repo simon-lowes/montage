@@ -27,6 +27,7 @@
 #include "core/History.h"
 #include "core/Interchange.h"
 #include "core/ProjectIO.h"
+#include "core/ProjectMerge.h"
 #include "core/Provenance.h"
 #include "core/Transcript.h"
 #include "media/LtcTimecode.h"
@@ -91,6 +92,9 @@ int usage() {
                  "  montage-cli new -o <project.montage> [--size WxH] [--fps N[/D]] [--color-space ID]\n"
                  "                     [--hdr-peak NITS] <media>...\n"
                  "  montage-cli info <project.montage>\n"
+                 "  montage-cli merge [base.montage] <mine.montage> <theirs.montage> -o <out.montage> [--take mine|theirs]\n"
+                 "                     (two copies merged from the version both started from, recorded in a copy when\n"
+                 "                     not given; conflicts take mine, or theirs, and their overlapping clips a new track)\n"
                  "  montage-cli render <project.montage> -o <output> [--preset NAME] [--in TC] [--out TC]\n"
                  "                     [--width W] [--height H] [--crf N] [--vcodec C] [--acodec C] [--proxies]\n"
                  "                     [--loudness LUFS [--ceiling dBTP] [--dialogue-gated]]  (e.g. --loudness -14: normalise the mix;\n"
@@ -303,6 +307,54 @@ bool writeFile(const std::string& path, const std::string& text) {
     std::fclose(f);
     std::printf("Wrote %s\n", path.c_str());
     return true;
+}
+
+// Two copies of a project merged from the version both started from (core/ProjectMerge.h).
+int cmdMerge(const std::vector<std::string>& args) {
+    std::vector<std::string> files;
+    std::string out, take = "mine";
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
+        else if (args[i] == "--take" && i + 1 < args.size()) take = args[++i];
+        else files.push_back(args[i]);
+    }
+    if ((files.size() != 2 && files.size() != 3) || out.empty() || (take != "mine" && take != "theirs")) return usage();
+    Project mine, theirs;
+    MergeBase base;
+    if (!load(files[files.size() - 2], mine) || !load(files.back(), theirs)) return 1;
+    if (files.size() == 3) {
+        if (!load(files[0], base.base)) return 1;
+    } else if (!commonMergeBase(mine, theirs, base)) {
+        std::fprintf(stderr, "Neither project records the version both started from: give it first (merge base mine theirs -o out)\n");
+        return 1;
+    }
+    MergeResult r = mergeProjects(base, mine, theirs);
+    if (r.ok && take == "theirs" && !r.conflicts.empty()) {
+        std::map<std::string, MergeSide> choices;
+        for (const MergeConflict& c : r.conflicts)
+            if (c.kind != MergeConflict::Overlap) choices[c.key] = MergeSide::Theirs;
+        r = mergeProjects(base, mine, theirs, choices);
+    }
+    if (!r.ok) {
+        std::fprintf(stderr, "%s\n", r.error.c_str());
+        return 1;
+    }
+    int bySide[3] = {0, 0, 0};
+    for (const MergeChange& c : r.changes) bySide[int(c.side)]++;
+    std::printf("%zu changes (mine %d, theirs %d, both %d), %zu conflicts", r.changes.size(), bySide[0], bySide[1], bySide[2], r.conflicts.size());
+    if (!r.renumbered.empty()) std::printf(", %zu of their ids renumbered", r.renumbered.size());
+    if (r.newTracks) std::printf(", %d new tracks for their overlapping clips", r.newTracks);
+    std::printf("\n");
+    for (const MergeConflict& c : r.conflicts)
+        std::printf("  conflict: %s%s%s: mine %s, theirs %s -> took %s\n", c.what.c_str(), c.field.empty() ? "" : ", ", c.field.c_str(),
+                    c.mine.c_str(), c.theirs.c_str(), c.choice == MergeSide::Both ? "both (theirs on a new track)" : mergeSideName(c.choice));
+    std::string err;
+    if (!saveProject(r.project, out, &err)) {
+        std::fprintf(stderr, "Cannot save %s: %s\n", out.c_str(), err.c_str());
+        return 1;
+    }
+    std::printf("Wrote %s\n", out.c_str());
+    return 0;
 }
 
 int cmdInfo(const std::vector<std::string>& args) {
@@ -1803,6 +1855,7 @@ int main(int argc, char** argv) {
     if (cmd == "probe") return cmdProbe(args);
     if (cmd == "new") return cmdNew(args);
     if (cmd == "info") return cmdInfo(args);
+    if (cmd == "merge") return cmdMerge(args);
     if (cmd == "render") return cmdRender(args);
     if (cmd == "farm") return cmdFarm(args);
     if (cmd == "node") return cmdNode(args);

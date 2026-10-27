@@ -1167,6 +1167,13 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
     QJsonArray seqs;
     for (const auto& s : p.sequences) seqs.append(sequenceToJson(s));
     root["sequences"] = seqs;
+    if (p.mergeBase && !p.mergeBase->empty())
+        if (const QJsonDocument d = QJsonDocument::fromJson(QByteArray::fromStdString(*p.mergeBase)); d.isObject()) root["mergeBase"] = d.object();
+    if (!p.mergeIds.empty()) {
+        QJsonObject ids;
+        for (const auto& [from, to] : p.mergeIds) ids[QString::number(from)] = double(to);
+        root["mergeIds"] = ids;
+    }
     return QJsonDocument(root).toJson(QJsonDocument::Indented).toStdString();
 }
 
@@ -1192,6 +1199,11 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
     p.activeSequence = Id(i64(root.value("activeSequence")));
     p.nextId = Id(i64(root.value("nextId"), 1));
     p.stereoChecked = root.value("mediaStereo").toInt() >= 2;
+    if (root.value("mergeBase").isObject())
+        p.mergeBase = std::make_shared<const std::string>(QJsonDocument(root.value("mergeBase").toObject()).toJson(QJsonDocument::Compact).toStdString());
+    const QJsonObject mergeIds = root.value("mergeIds").toObject();
+    for (auto it = mergeIds.begin(); it != mergeIds.end(); ++it)
+        if (const Id from = it.key().toULongLong(), to = Id(i64(it.value())); from && to) p.mergeIds[from] = to;
     for (const auto& mv : root.value("media").toArray()) {
         QJsonObject o = mv.toObject();
         MediaItem m;

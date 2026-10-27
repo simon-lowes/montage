@@ -98,6 +98,7 @@
 #include "core/Interchange.h"
 #include "core/MediaLog.h"
 #include "core/ProjectIO.h"
+#include "core/ProjectMerge.h"
 #include "core/ScriptCut.h"
 #include "render/LinedScript.h"
 #include "render/FilmLists.h"
@@ -5475,6 +5476,84 @@ void McpServer::Impl::addTools() {
             }
             return ok(changes.empty() ? QStringLiteral("No differences") : QStringLiteral("%1 change(s)").arg(changes.size()),
                       QJsonObject{{"changes", list}});
+        });
+
+    add("montage_merge_project", "Merge another copy of the project",
+        "Brings another copy of this project (an assistant's bins and syncing, a colourist's grades, work done on another "
+        "computer) into this one from the version both started from: the copy's own record of it (kept by Save a Copy for "
+        "Another Editor and the Project Manager), this project's, or `base`. Changes made on one side are taken, the same "
+        "change on both once; different changes to one thing are conflicts (each with a `key`), settled by `choices` "
+        "({key: mine|theirs|both}) or `take` (mine by default; both only for clips that overlap, which by default put "
+        "theirs on a new track). Ids both copies made are renumbered on their side. dry_run lists what would happen "
+        "without saving.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "theirs":{"type":"string","description":"The other copy's project file"},
+            "base":{"type":"string","description":"The version both started from (default: as recorded in either copy)"},
+            "choices":{"type":"object","additionalProperties":{"type":"string","enum":["mine","theirs","both"]}},
+            "take":{"type":"string","enum":["mine","theirs"],"default":"mine"},
+            "dry_run":{"type":"boolean","default":false}},"required":["project","theirs"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            auto read = [](const QString& path) {
+                Project p;
+                std::string err;
+                if (!loadProject(absolute(path).toStdString(), p, &err))
+                    throw ArgError{QStringLiteral("Cannot open %1: %2").arg(path, QString::fromStdString(err))};
+                return p;
+            };
+            const Project theirs = read(need(a, "theirs"));
+            MergeBase base;
+            if (a.contains("base")) base.base = read(str(a, "base"));
+            else if (!commonMergeBase(l.project, theirs, base))
+                throw ArgError{"Neither copy records the version both started from: give it as base"};
+            const QString take = a.contains("take") ? str(a, "take") : QStringLiteral("mine");
+            if (take != "mine" && take != "theirs") throw ArgError{"take is mine or theirs"};
+            auto side = [](const QString& s) {
+                if (s == "mine") return MergeSide::Mine;
+                if (s == "theirs") return MergeSide::Theirs;
+                if (s == "both") return MergeSide::Both;
+                throw ArgError{QStringLiteral("A choice is mine, theirs or both, not \"%1\"").arg(s)};
+            };
+            std::map<std::string, MergeSide> choices;
+            MergeResult r = mergeProjects(base, l.project, theirs);
+            if (!r.ok) throw ArgError{QString::fromStdString(r.error)};
+            if (take == "theirs")
+                for (const MergeConflict& c : r.conflicts)
+                    if (c.kind != MergeConflict::Overlap) choices[c.key] = MergeSide::Theirs;
+            const QJsonObject given = a.value("choices").toObject();
+            for (auto it = given.begin(); it != given.end(); ++it) {
+                if (!it.value().isString()) throw ArgError{"Each choice is mine, theirs or both"};
+                const auto c = std::find_if(r.conflicts.begin(), r.conflicts.end(), [&](const MergeConflict& k) { return k.key == it.key().toStdString(); });
+                if (c == r.conflicts.end()) throw ArgError{QStringLiteral("No conflict \"%1\"").arg(it.key())};
+                const MergeSide s = side(it.value().toString());
+                if (s == MergeSide::Both && !c->canBoth) throw ArgError{QStringLiteral("Both is only for clips that overlap (%1)").arg(it.key())};
+                choices[it.key().toStdString()] = s;
+            }
+            if (!choices.empty()) r = mergeProjects(base, l.project, theirs, choices);
+            if (!r.ok) throw ArgError{QString::fromStdString(r.error)};
+            QJsonArray changes, conflicts;
+            for (const MergeChange& c : r.changes)
+                changes.append(QJsonObject{{"side", QString::fromLatin1(mergeSideName(c.side)).toLower()},
+                                           {"change", QString::fromLatin1(mergeChangeKindName(c.kind)).toLower()},
+                                           {"what", QString::fromStdString(c.what)},
+                                           {"field", QString::fromStdString(c.field)}});
+            for (const MergeConflict& c : r.conflicts)
+                conflicts.append(QJsonObject{{"key", QString::fromStdString(c.key)},
+                                             {"kind", c.kind == MergeConflict::Overlap ? "overlap" : c.kind == MergeConflict::Moved ? "moved" : c.kind == MergeConflict::Removed ? "removed" : "field"},
+                                             {"what", QString::fromStdString(c.what)},
+                                             {"field", QString::fromStdString(c.field)},
+                                             {"mine", QString::fromStdString(c.mine)},
+                                             {"theirs", QString::fromStdString(c.theirs)},
+                                             {"took", QString::fromLatin1(mergeSideName(c.choice)).toLower()}});
+            QJsonObject renumbered;
+            for (const auto& [from, to] : r.renumbered) renumbered[QString::number(from)] = double(to);
+            const bool dry = a.value("dry_run").toBool();
+            if (!dry) {
+                l.project = r.project;
+                save(l);
+            }
+            return ok(QStringLiteral("%1%2 change(s), %3 conflict(s)").arg(dry ? QStringLiteral("Would merge: ") : QStringLiteral("Merged: ")).arg(r.changes.size()).arg(r.conflicts.size()),
+                      QJsonObject{{"changes", changes}, {"conflicts", conflicts}, {"renumbered", renumbered}, {"new_tracks", r.newTracks}});
         });
 
     add("montage_conform_check", "Conform check against the offline reference",

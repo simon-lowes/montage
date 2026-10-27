@@ -19,6 +19,7 @@
 #include "Settings.h"
 
 #include "CompareDialog.h"
+#include "MergeDialog.h"
 
 #include "Keymap.h"
 #include "LoudnessReadout.h"
@@ -1126,6 +1127,16 @@ void MainWindow::buildMenus() {
         ProjectManagerDialog dlg(state_, this);
         if (dlg.exec() == QDialog::Accepted) runProjectManager(dlg.options());
     })->setObjectName(QStringLiteral("projectManager"));
+    add(file, tr("Save a Copy for Another Editor…"), QKeySequence(), [this] {
+        QString path = QFileDialog::getSaveFileName(this, tr("Save a Copy for Another Editor"),
+                                                    appSettings().value("lastProjectDir").toString() + "/" +
+                                                        QString::fromStdString(state_->project().name) + " copy.montage",
+                                                    tr("Montage projects (*.montage)"));
+        if (path.isEmpty()) return;
+        if (!path.endsWith(".montage")) path += ".montage";
+        saveCopyForAnotherEditor(path);
+    })->setObjectName(QStringLiteral("saveCopyForEditor"));
+    add(file, tr("Mer&ge Project…"), QKeySequence(), [this] { mergeProjectDialog(); })->setObjectName(QStringLiteral("mergeProject"));
     {
         QMenu* prod = file->addMenu(tr("Productio&n"));
         add(prod, tr("&New Production…"), QKeySequence(), [this] {
@@ -3782,6 +3793,27 @@ void MainWindow::matchFrame() {
         return;
     }
     state_->message(tr("No video clip under the playhead"));
+}
+
+bool MainWindow::saveCopyForAnotherEditor(const QString& path) {
+    Project copy = state_->project();
+    setMergeBase(copy, copy);
+    std::string err;
+    if (!saveProject(copy, path.toStdString(), &err)) {
+        QMessageBox::warning(this, tr("Save a Copy for Another Editor"), QString::fromStdString(err.empty() ? "Cannot save the copy" : err));
+        return false;
+    }
+    statusBar()->showMessage(tr("Saved a copy to %1: Merge Project brings its changes back").arg(QDir::toNativeSeparators(path)), 6000);
+    return true;
+}
+
+MergeDialog* MainWindow::mergeProjectDialog(const QString& theirs) {
+    if (!state_->sequence()) return nullptr;
+    auto* dlg = new MergeDialog(state_, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    if (!theirs.isEmpty()) dlg->setTheirs(theirs);
+    dlg->show();
+    return dlg;
 }
 
 CompareDialog* MainWindow::compareWith(Id before) {

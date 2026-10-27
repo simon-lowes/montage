@@ -54,6 +54,7 @@
 #include "core/MediaLog.h"
 #include "core/Multicam.h"
 #include "core/TimelineCompare.h"
+#include "core/ProjectMerge.h"
 #include "core/Reconform.h"
 #include "core/Adr.h"
 #include "core/Provenance.h"
@@ -8384,6 +8385,255 @@ private slots:
         QVERIFY(overwrite(p, top, {TrackKind::Video, 2}, title).ok);
         m = matchSource(p, top, 160);
         QVERIFY(m && m->media == camB);
+    }
+
+    void projectMerge() {
+        // The base: clips A and B on V1, C on V2, two captions and a bin.
+        Fixture fx;
+        const Id a = fx.put(V1, 0, 60, 0), b = fx.put(V1, 100, 60, 100), c = fx.put(V2, 0, 100, 200);
+        CaptionTrack subs;
+        subs.id = fx.p.newId();
+        subs.captions = {{0, 30, "Hello", {}}, {40, 70, "World", {}}};
+        fx.s().captionTracks.push_back(subs);
+        fx.p.bins = {"Rushes"};
+        const Project base = fx.p;
+        auto json = [](Project p) {
+            p.mergeBase.reset();
+            return projectToJson(p);
+        };
+        auto clip = [](const Project& p, Id id) { return clipById(*p.active(), id); };
+
+        // Mine trims A, adds a bin and grades C; theirs adds markers, moves B and changes a caption.
+        Project mine = base;
+        clipById(*mine.active(), a)->duration = 50;
+        mine.bins.push_back("Selects");
+        Effect grade = makeEffect(mine, "color_correct");
+        grade.params["exposure"] = 1.5;
+        clipById(*mine.active(), c)->effects.push_back(grade);
+        Project theirs = base;
+        theirs.active()->markers = {Marker{10, 0, "Logo", "", 1}, Marker{20, 0, "Cut here", "", 2}};
+        QVERIFY(moveClips(theirs, *theirs.active(), {b}, 100, 0, 0).ok);
+        theirs.active()->captionTracks[0].captions[1].text = "Everyone";
+
+        const MergeResult r = mergeProjects(base, mine, theirs);
+        QVERIFY2(r.ok, r.error.c_str());
+        QVERIFY(r.conflicts.empty());
+        QVERIFY(r.renumbered.empty());
+        QCOMPARE(clip(r.project, a)->duration, FrameTime(50));
+        QCOMPARE(clip(r.project, b)->start, FrameTime(200));
+        QCOMPARE(clip(r.project, c)->effects.size(), size_t(1));
+        QCOMPARE(clip(r.project, c)->effects[0].p("exposure", 0), 1.5);
+        QCOMPARE(r.project.active()->markers.size(), size_t(2));
+        QCOMPARE(r.project.active()->captionTracks[0].captions[1].text, std::string("Everyone"));
+        QCOMPARE(r.project.bins, (std::vector<std::string>{"Rushes", "Selects"}));
+        // Each change is listed with its side.
+        auto changed = [&](const MergeResult& m, MergeSide side, Id clipId) {
+            return std::any_of(m.changes.begin(), m.changes.end(), [&](const MergeChange& ch) { return ch.side == side && ch.clip == clipId; });
+        };
+        QVERIFY(changed(r, MergeSide::Mine, a));
+        QVERIFY(changed(r, MergeSide::Mine, c));
+        QVERIFY(changed(r, MergeSide::Theirs, b));
+        QVERIFY(std::any_of(r.changes.begin(), r.changes.end(),
+                            [](const MergeChange& ch) { return ch.side == MergeSide::Mine && ch.kind == MergeChange::Added && ch.field == "bins › Selects"; }));
+        // The other way round gives the same project.
+        const MergeResult back = mergeProjects(base, theirs, mine);
+        QVERIFY(back.ok && back.conflicts.empty());
+        QCOMPARE(json(back.project), json(r.project));
+        // Its merge base is theirs now; saved and opened again, it is the same.
+        Project kept;
+        QVERIFY(mergeBaseOf(r.project, kept));
+        QCOMPARE(json(kept), json(theirs));
+        QTemporaryDir dir;
+        const std::string file = dir.filePath("merged.montage").toStdString();
+        QVERIFY(saveProject(r.project, file));
+        Project reopened;
+        QVERIFY(loadProject(file, reopened));
+        QCOMPARE(projectToJson(reopened), projectToJson(r.project));
+        // A side with no changes gives the other side exactly.
+        QCOMPARE(json(mergeProjects(base, base, theirs).project), json(theirs));
+        QCOMPARE(json(mergeProjects(base, mine, base).project), json(mine));
+        QVERIFY(mergeProjects(base, base, theirs).changes.size() > 0 && mergeProjects(base, base, base).changes.empty());
+
+        // Both trimming A differently: one conflict, and either choice gives that side's trim.
+        Project theirTrim = base;
+        clipById(*theirTrim.active(), a)->duration = 40;
+        const MergeResult both = mergeProjects(base, mine, theirTrim);
+        QCOMPARE(both.conflicts.size(), size_t(1));
+        const MergeConflict& k = both.conflicts[0];
+        QCOMPARE(k.kind, MergeConflict::Field);
+        QCOMPARE(k.clip, a);
+        QCOMPARE(k.field, std::string("duration"));
+        QCOMPARE(k.mine, std::string("50"));
+        QCOMPARE(k.theirs, std::string("40"));
+        QCOMPARE(clip(both.project, a)->duration, FrameTime(50));
+        QCOMPARE(clip(mergeProjects(base, mine, theirTrim, {{k.key, MergeSide::Theirs}}).project, a)->duration, FrameTime(40));
+        QCOMPARE(clip(mergeProjects(base, mine, theirTrim, {{k.key, MergeSide::Mine}}).project, a)->duration, FrameTime(50));
+        // The same trim on both sides is taken once.
+        Project sameTrim = base;
+        clipById(*sameTrim.active(), a)->duration = 50;
+        const MergeResult same = mergeProjects(base, mine, sameTrim);
+        QVERIFY(same.conflicts.empty());
+        QCOMPARE(clip(same.project, a)->duration, FrameTime(50));
+        QVERIFY(changed(same, MergeSide::Both, a));
+        // Removed on one side and changed on the other.
+        Project removed = base;
+        QVERIFY(removeClips(removed, *removed.active(), {b}, false).ok);
+        const MergeResult gone = mergeProjects(base, removed, theirs);
+        QCOMPARE(gone.conflicts.size(), size_t(1));
+        QCOMPARE(gone.conflicts[0].kind, MergeConflict::Removed);
+        QVERIFY(!clip(gone.project, b));
+        QCOMPARE(clip(mergeProjects(base, removed, theirs, {{gone.conflicts[0].key, MergeSide::Theirs}}).project, b)->start, FrameTime(200));
+
+        // Ids both sides made: theirs are renumbered and what refers to them follows.
+        Project mineNew = base, theirsNew = base;
+        auto place = [](Project& p, Id media, TrackRef t, FrameTime start, FrameTime len) {
+            Clip x = makeClip(p, *p.findMedia(media), t.kind, *p.active());
+            x.start = start;
+            x.duration = len;
+            return overwrite(p, *p.active(), t, x).created.at(0);
+        };
+        const Id d = place(mineNew, fx.media, V2, 200, 30);
+        const Id e = place(theirsNew, fx.media, V1, 300, 30);
+        QCOMPARE(d, e);  // (made from the same next id)
+        Transition fade;
+        fade.id = theirsNew.newId();
+        fade.clipB = e;
+        theirsNew.active()->videoTracks[0].transitions.push_back(fade);
+        const MergeResult ids = mergeProjects(base, mineNew, theirsNew);
+        QVERIFY(ids.ok && ids.conflicts.empty());
+        QVERIFY(ids.renumbered.count(e));
+        const Id e2 = ids.renumbered.at(e);
+        QVERIFY(clip(ids.project, d) && clip(ids.project, e2));
+        QCOMPARE(clip(ids.project, d)->start, FrameTime(200));
+        QCOMPARE(clip(ids.project, e2)->start, FrameTime(300));
+        QCOMPARE(ids.project.active()->videoTracks[0].transitions.size(), size_t(1));
+        QCOMPARE(ids.project.active()->videoTracks[0].transitions[0].clipB, e2);
+        QVERIFY(ids.project.nextId > e2);
+        std::set<Id> seen;  // every id once
+        bool unique = true;
+        for (const Sequence& sq : ids.project.sequences)
+            for (const Track& t : sq.videoTracks)
+                for (const Clip& x : t.clips) unique = unique && seen.insert(x.id).second && seen.insert(x.motion.id).second;
+        QVERIFY(unique);
+
+        // Clips from both sides overlapping on a track: theirs goes on a new track until it is settled.
+        Project longer = base, added = base;
+        clipById(*longer.active(), a)->duration = 90;  // over 0..90, where B starts at 100
+        const Id f = place(added, fx.media, V1, 70, 25);  // in the gap at 70..95 in theirs
+        const MergeResult lap = mergeProjects(base, longer, added);
+        QCOMPARE(lap.conflicts.size(), size_t(1));
+        const MergeConflict& o = lap.conflicts[0];
+        QCOMPARE(o.kind, MergeConflict::Overlap);
+        QVERIFY(o.canBoth);
+        QCOMPARE(o.choice, MergeSide::Both);
+        QCOMPARE(lap.newTracks, 1);
+        const Sequence& ls = *lap.project.active();
+        QCOMPARE(ls.videoTracks.size(), base.active()->videoTracks.size() + 1);
+        QCOMPARE(ls.videoTracks.back().clips.size(), size_t(1));
+        QCOMPARE(ls.videoTracks.back().clips[0].id, f);
+        QCOMPARE(clip(lap.project, a)->duration, FrameTime(90));
+        const MergeResult keepMine = mergeProjects(base, longer, added, {{o.key, MergeSide::Mine}});
+        QVERIFY(!clip(keepMine.project, f) && clip(keepMine.project, a));
+        QCOMPARE(keepMine.project.active()->videoTracks.size(), base.active()->videoTracks.size());
+        const MergeResult keepTheirs = mergeProjects(base, longer, added, {{o.key, MergeSide::Theirs}});
+        QVERIFY(clip(keepTheirs.project, f) && !clip(keepTheirs.project, a));
+        QCOMPARE(keepTheirs.project.active()->videoTracks.size(), base.active()->videoTracks.size());
+
+        // The merge base a copy keeps.
+        Project copy = base;
+        QVERIFY(!mergeBaseOf(copy, kept));
+        setMergeBase(copy, base);
+        MergeBase found;
+        QVERIFY(commonMergeBase(base, copy, found));
+        QCOMPARE(json(found.base), json(base));
+
+        // Both add an effect to C: the same order whichever side is mine.
+        Project fxMine = base, fxTheirs = base;
+        clipById(*fxMine.active(), c)->effects.push_back(makeEffect(fxMine, "color_correct"));
+        fxTheirs.nextId += 5;  // (ids of their own, apart from mine's)
+        clipById(*fxTheirs.active(), c)->effects.push_back(makeEffect(fxTheirs, "color_correct"));
+        QCOMPARE(json(mergeProjects(base, fxMine, fxTheirs).project), json(mergeProjects(base, fxTheirs, fxMine).project));
+        QCOMPARE(clip(mergeProjects(base, fxMine, fxTheirs).project, c)->effects.size(), size_t(2));
+
+        // A clip each side moved to another track: one conflict, mine's place kept unless theirs is chosen.
+        Project toV2 = base, toV3 = base;
+        QVERIFY(moveClips(toV2, *toV2.active(), {b}, 0, 1, 0).ok);
+        QVERIFY(moveClips(toV3, *toV3.active(), {b}, 0, 2, 0).ok);
+        const MergeResult moved = mergeProjects(base, toV2, toV3);
+        QCOMPARE(moved.conflicts.size(), size_t(1));
+        QCOMPARE(moved.conflicts[0].kind, MergeConflict::Moved);
+        auto tracksWith = [](const Project& p, Id id) {
+            int n = 0, at = -1;
+            for (size_t i = 0; i < p.active()->videoTracks.size(); ++i)
+                for (const Clip& x : p.active()->videoTracks[i].clips)
+                    if (x.id == id) ++n, at = int(i);
+            return std::make_pair(n, at);
+        };
+        QCOMPARE(tracksWith(moved.project, b), std::make_pair(1, 1));
+        QCOMPARE(tracksWith(mergeProjects(base, toV2, toV3, {{moved.conflicts[0].key, MergeSide::Theirs}}).project, b), std::make_pair(1, 2));
+
+        // Theirs moves B onto a clip mine added: Mine keeps B where it was.
+        Project mineAdds = base, theirsMoves = base;
+        const Id g = place(mineAdds, fx.media, V1, 300, 40);
+        QVERIFY(moveClips(theirsMoves, *theirsMoves.active(), {b}, 210, 0, 0).ok);  // B to 310..370
+        const MergeResult onto = mergeProjects(base, mineAdds, theirsMoves);
+        QCOMPARE(onto.conflicts.size(), size_t(1));
+        QCOMPARE(onto.conflicts[0].kind, MergeConflict::Overlap);
+        const MergeResult keepB = mergeProjects(base, mineAdds, theirsMoves, {{onto.conflicts[0].key, MergeSide::Mine}});
+        QVERIFY(clip(keepB.project, g));
+        QCOMPARE(clip(keepB.project, b)->start, FrameTime(100));
+
+        // Merged twice from the same copy: the second time their earlier clip is not brought in again, and a
+        // clip of theirs renumbered the first time takes their later change.
+        Project editor = base, assistant = base;
+        setMergeBase(assistant, base);
+        const Id editorClip = place(editor, fx.media, V2, 400, 20);
+        const Id assistantClip = place(assistant, fx.media, V1, 400, 20);
+        QCOMPARE(editorClip, assistantClip);
+        const MergeResult first = mergeProjects(base, editor, assistant);
+        QVERIFY(first.ok && first.conflicts.empty());
+        const Id renamed = first.renumbered.at(assistantClip);
+        QCOMPARE(first.project.mergeIds.at(assistantClip), renamed);
+        Project assistant2 = assistant;
+        clipById(*assistant2.active(), assistantClip)->duration = 10;
+        const Id later = place(assistant2, fx.media, V1, 500, 20);
+        MergeBase again;
+        QVERIFY(commonMergeBase(first.project, assistant2, again));
+        QVERIFY(again.baseInTheirIds);
+        const MergeResult second = mergeProjects(again, first.project, assistant2);
+        QVERIFY2(second.ok && second.conflicts.empty(), second.conflicts.empty() ? "" : second.conflicts[0].key.c_str());
+        QCOMPARE(clip(second.project, renamed)->duration, FrameTime(10));
+        QCOMPARE(clip(second.project, editorClip)->start, FrameTime(400));
+        QCOMPARE(clip(second.project, editorClip)->duration, FrameTime(20));
+        QCOMPARE(second.project.active()->videoTracks.size(), base.active()->videoTracks.size());
+        int clips = 0;
+        for (const Track& t : second.project.active()->videoTracks) clips += int(t.clips.size());
+        int baseClips = 0;
+        for (const Track& t : base.active()->videoTracks) baseClips += int(t.clips.size());
+        QCOMPARE(clips, baseClips + 3);  // the editor's, the assistant's first and later ones
+        QVERIFY(std::any_of(second.project.active()->videoTracks[0].clips.begin(), second.project.active()->videoTracks[0].clips.end(),
+                            [&](const Clip& x) { return x.start == 500 && x.id != editorClip && x.id != renamed; }));
+        (void)later;
+
+        // A Dialogue Alignment names its take's media as text: renumbered with it.
+        Project mediaMine = base, mediaTheirs = base;
+        auto addMedia = [](Project& p) {
+            MediaItem m = p.media[0];
+            m.id = p.newId();
+            m.name = "take2.mov";
+            p.media.push_back(m);
+            return m.id;
+        };
+        addMedia(mediaMine);
+        const Id take = addMedia(mediaTheirs);
+        Effect align;
+        align.id = mediaTheirs.newId();
+        align.type = "dialogue_align";
+        align.strings["media"] = std::to_string(take);
+        clipById(*mediaTheirs.active(), a)->effects.push_back(align);
+        const MergeResult withTake = mergeProjects(base, mediaMine, mediaTheirs);
+        QVERIFY(withTake.renumbered.count(take));
+        QCOMPARE(clip(withTake.project, a)->effects.back().s("media"), std::to_string(withTake.renumbered.at(take)));
     }
 
     void timelineCompare() {

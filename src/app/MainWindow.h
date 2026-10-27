@@ -49,6 +49,7 @@ class LearnEffectDialog;
 
 class EditorState;
 class CompareDialog;
+class MergeDialog;
 class CleanFeedWindow;
 class MonitorCalibrationDialog;
 class PatchGenerator;
@@ -384,6 +385,11 @@ public:
     QString selectionSummary() const;
     // Sequence › Compare with Sequence: the differences from an earlier version to this sequence, in a dialog.
     CompareDialog* compareWith(Id before);
+    // File › Save a Copy for Another Editor: the project as it is, saved to `path` with this version as its merge base
+    // (core/ProjectMerge.h), so it can be merged back later. This project stays open. False (with a message) on failure.
+    bool saveCopyForAnotherEditor(const QString& path);
+    // File › Merge Project (app/MergeDialog.h), with their copy at `theirs` read when given.
+    MergeDialog* mergeProjectDialog(const QString& theirs = {});
     // Video layouts (Clip › Layout): the selected video clips, or with fewer than two every video clip under the
     // playhead, sharing the frame. Returns how many clips were arranged.
     int arrangeLayout(edit::Layout layout, double gap = 0);
