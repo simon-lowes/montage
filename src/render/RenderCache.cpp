@@ -132,8 +132,8 @@ void addClipAt(QCryptographicHash& h, const Project& p, const Sequence& seq, con
                 }
             }
         }
-    // Its colour group's grades run on it too.
-    if (const ColorGroup* g = colorGroupOf(seq, c))
+    // Its colour groups' grades run on it too.
+    for (const ColorGroup* g : colorGroupsOf(seq, c))
         for (const auto* chain : {&g->pre, &g->post}) {
             h.addData(chain == &g->pre ? QByteArray("|pre") : QByteArray("|post"));
             for (Effect e : *chain) {

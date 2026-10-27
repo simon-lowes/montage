@@ -11,6 +11,7 @@
 
 #include "ColorSpace.h"
 #include "Compositor.h"
+#include "core/ColorGroups.h"
 #include "core/EditOps.h"
 #include "core/Effects.h"
 
@@ -49,14 +50,15 @@ bool learningPair(const Project& p, const Sequence& s, const Clip& c, FrameTime 
     Clip clip = c;
     clip.motion = makeEffect("transform", c.motion.id);
     clip.enabled = true;
-    // Its own effects, those a Learned Effect stands in for on again; not its grade's nodes or its colour group's
-    // post-clip grade, which run after the network. (The group's pre-clip grade runs before it: in both pictures.)
+    // Its own effects, those a Learned Effect stands in for on again; not its grade's nodes or its colour groups'
+    // post-clip grades, which run after the network. (The groups' pre-clip grades run before it: in both pictures.)
     for (Effect& e : clip.effects)
         if (learnedOff(e)) e.enabled = true;
     std::erase_if(clip.effects, [](const Effect& e) { return e.type == "learned_effect" || e.node != 0; });
     clip.grade = {};
-    for (ColorGroup& g : alone.colorGroups)
-        if (g.id == c.colorGroup) g.post.clear();
+    for (const ColorGroup* around : colorGroupsOf(s, c))
+        for (ColorGroup& g : alone.colorGroups)
+            if (g.id == around->id) g.post.clear();
     track.clips.push_back(clip);
     alone.videoTracks.push_back(track);
     RenderOptions o;

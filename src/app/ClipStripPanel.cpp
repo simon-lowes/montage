@@ -7,14 +7,23 @@
 #include <QLabel>
 #include <QListWidget>
 #include <QPixmap>
+#include <QDropEvent>
 #include <QPointer>
+#include <QPushButton>
+#include <QSlider>
+#include <QTreeWidget>
 #include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <QtConcurrent>
 #include <algorithm>
+#include <functional>
+#include <map>
+#include <set>
+#include <tuple>
 
 #include "EditorState.h"
+#include "core/ColorGroups.h"
 #include "core/EditOps.h"
 #include "core/GradeGraph.h"
 #include "core/History.h"
@@ -45,6 +54,28 @@ std::vector<Listed> pictureClips(const Sequence& s) {
     return out;
 }
 
+constexpr int kRowKind = Qt::UserRole + 1;  // 0 a clip, 1 a group, 2 Not Grouped
+
+// The group rows, which take clips and groups dropped on them.
+class GroupTree : public QTreeWidget {
+public:
+    using QTreeWidget::QTreeWidget;
+    std::function<bool(const std::vector<Id>&, Id)> dropped;
+
+protected:
+    void dropEvent(QDropEvent* e) override {
+        QTreeWidgetItem* at = itemAt(e->position().toPoint());
+        // (onto a clip: into its group)
+        while (at && at->data(0, kRowKind).toInt() == 0) at = at->parent();
+        std::vector<Id> moved;
+        for (QTreeWidgetItem* item : selectedItems())
+            if (item->data(0, kRowKind).toInt() != 2) moved.push_back(Id(item->data(0, Qt::UserRole).toULongLong()));
+        e->setDropAction(Qt::IgnoreAction);  // (the rows are listed again from the project)
+        e->accept();
+        if (at && dropped) dropped(moved, at->data(0, kRowKind).toInt() == 1 ? Id(at->data(0, Qt::UserRole).toULongLong()) : 0);
+    }
+};
+
 }  // namespace
 
 ClipStripPanel::ClipStripPanel(EditorState* state, QWidget* parent) : QWidget(parent), state_(state) {
@@ -56,10 +87,67 @@ ClipStripPanel::ClipStripPanel(EditorState* state, QWidget* parent) : QWidget(pa
     lightbox_->setText(tr("Lightbox"));
     lightbox_->setCheckable(true);
     lightbox_->setToolTip(tr("Show the clips as a grid of larger thumbnails"));
+    groups_ = new QToolButton(this);
+    groups_->setObjectName(QStringLiteral("clipGroups"));
+    groups_->setText(tr("Groups"));
+    groups_->setCheckable(true);
+    groups_->setToolTip(tr("Show the colour groups as rows: scenes, the angles in them, and their clips"));
     top->addWidget(new QLabel(tr("Clips"), this));
     top->addStretch(1);
+    top->addWidget(groups_);
     top->addWidget(lightbox_);
     v->addLayout(top);
+    // Group Shots and what it is done with.
+    groupBar_ = new QWidget(this);
+    auto* bar = new QHBoxLayout(groupBar_);
+    bar->setContentsMargins(0, 0, 0, 0);
+    auto* run = new QPushButton(tr("Group Shots"), groupBar_);
+    run->setObjectName(QStringLiteral("groupShots"));
+    run->setToolTip(tr("Group the shots by camera angle and scene (groups made by hand and locked ones stay)"));
+    sensitivity_ = new QSlider(Qt::Horizontal, groupBar_);
+    sensitivity_->setObjectName(QStringLiteral("groupSensitivity"));
+    sensitivity_->setRange(0, 100);
+    sensitivity_->setValue(50);
+    sensitivity_->setToolTip(tr("Sensitivity: higher makes more, closer angle groups"));
+    bar->addWidget(run);
+    bar->addWidget(new QLabel(tr("Sensitivity"), groupBar_));
+    bar->addWidget(sensitivity_, 1);
+    for (const auto& [name, text, tip] : {std::tuple{"splitGroup", tr("Split"), tr("The selected clips into a group of their own")},
+                                          std::tuple{"joinGroups", tr("Join"), tr("The selected groups into the first of them")},
+                                          std::tuple{"lockGroup", tr("Lock"), tr("Lock the selected groups (Group Shots leaves them as they are)")},
+                                          std::tuple{"unlockGroup", tr("Unlock"), tr("Unlock the selected groups")}}) {
+        auto* b = new QToolButton(groupBar_);
+        b->setObjectName(QString::fromLatin1(name));
+        b->setText(text);
+        b->setToolTip(tip);
+        bar->addWidget(b);
+        const QString which = QString::fromLatin1(name);
+        connect(b, &QToolButton::clicked, this, [this, which] {
+            if (which == "splitGroup") splitSelected();
+            else if (which == "joinGroups") joinSelected();
+            else lockSelected(which == "lockGroup");
+        });
+    }
+    connect(run, &QPushButton::clicked, this, [this] { emit groupShotsRequested(sensitivity()); });
+    v->addWidget(groupBar_);
+    auto* tree = new GroupTree(this);
+    tree_ = tree;
+    tree_->setObjectName(QStringLiteral("colorGroupTree"));
+    tree_->setHeaderHidden(true);
+    tree_->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    tree_->setDragDropMode(QAbstractItemView::InternalMove);
+    tree_->setDefaultDropAction(Qt::MoveAction);
+    tree->dropped = [this](const std::vector<Id>& items, Id group) { return moveInto(items, group); };
+    connect(tree_, &QTreeWidget::itemClicked, this, [this](QTreeWidgetItem* item) {
+        const Sequence* s = state_->sequence();
+        if (!s || item->data(0, kRowKind).toInt() != 0) return;
+        const Clip* c = edit::clipById(*s, Id(item->data(0, Qt::UserRole).toULongLong()));
+        if (!c) return;
+        state_->setSelection({c->id}, false);
+        if (!c->contains(state_->playhead())) state_->setPlayhead(c->start);
+    });
+    v->addWidget(tree_, 1);
+    connect(groups_, &QToolButton::toggled, this, [this](bool on) { setGroupsShown(on); });
     list_ = new QListWidget(this);
     list_->setObjectName(QStringLiteral("clipStrip"));
     list_->setViewMode(QListView::IconMode);
@@ -69,6 +157,7 @@ ClipStripPanel::ClipStripPanel(EditorState* state, QWidget* parent) : QWidget(pa
     list_->setSelectionMode(QAbstractItemView::SingleSelection);
     v->addWidget(list_, 1);
     setLightbox(false);
+    setGroupsShown(false);
 
     auto* later = new QTimer(this);
     later->setSingleShot(true);
@@ -111,6 +200,123 @@ void ClipStripPanel::setLightbox(bool on) {
 
 bool ClipStripPanel::lightbox() const { return lightbox_->isChecked(); }
 
+void ClipStripPanel::setGroupsShown(bool on) {
+    {
+        const QSignalBlocker b(groups_);
+        groups_->setChecked(on);
+    }
+    list_->setVisible(!on);
+    lightbox_->setEnabled(!on);
+    groupBar_->setVisible(on);
+    tree_->setVisible(on);
+    if (on) rebuildGroups();
+}
+
+bool ClipStripPanel::groupsShown() const { return groups_->isChecked(); }
+
+double ClipStripPanel::sensitivity() const { return sensitivity_->value() / 100.0; }
+
+void ClipStripPanel::rebuildGroups() {
+    const Sequence* s = state_->sequence();
+    // (the rows open and selected stay so)
+    std::set<std::pair<int, qulonglong>> selected;
+    for (QTreeWidgetItem* item : tree_->selectedItems()) selected.insert({item->data(0, kRowKind).toInt(), item->data(0, Qt::UserRole).toULongLong()});
+    const QSignalBlocker b(tree_);
+    tree_->clear();
+    if (!s) return;
+    std::map<Id, int> numbers;
+    int n = 0;
+    for (const Listed& c : pictureClips(*s)) numbers[c.id] = ++n;
+    auto clipRow = [&](QTreeWidgetItem* parent, Id id) {
+        const Clip* c = edit::clipById(*s, id);
+        if (!c) return;
+        auto* item = new QTreeWidgetItem(parent, {QStringLiteral("%1  %2  %3").arg(numbers[id]).arg(QString::fromStdString(formatTimecode(c->start, s->fps)),
+                                                                                                     QString::fromStdString(c->name))});
+        item->setData(0, Qt::UserRole, QVariant::fromValue<qulonglong>(id));
+        item->setData(0, kRowKind, 0);
+        item->setFlags(item->flags() & ~Qt::ItemIsDropEnabled);
+        item->setSelected(selected.count({0, qulonglong(id)}) > 0);
+    };
+    // Each group's shots and those of the groups inside it, and its own, in timeline order.
+    std::map<Id, int> shotCount;
+    std::map<Id, std::vector<std::pair<FrameTime, Id>>> own;
+    for (const Track& t : s->videoTracks)
+        for (const Clip& c : t.clips) {
+            for (const ColorGroup* g : colorGroupsOf(*s, c)) ++shotCount[g->id];
+            if (c.colorGroup) own[c.colorGroup].push_back({c.start, c.id});
+        }
+    for (auto& [g, clips] : own) std::sort(clips.begin(), clips.end());
+    std::function<void(QTreeWidgetItem*, const ColorGroup&)> groupRow = [&](QTreeWidgetItem* parent, const ColorGroup& g) {
+        const int shots = shotCount[g.id];
+        const QString kind = g.kind == "scene" ? tr("scene") : g.kind == "angle" ? tr("angle") : tr("by hand");
+        const QString text = tr("%1  (%2, %n shot(s))", "", shots).arg(QString::fromStdString(g.name), kind) + (g.locked ? tr("  locked") : QString());
+        auto* item = parent ? new QTreeWidgetItem(parent, {text}) : new QTreeWidgetItem(tree_, {text});
+        item->setData(0, Qt::UserRole, QVariant::fromValue<qulonglong>(g.id));
+        item->setData(0, kRowKind, 1);
+        QFont f = item->font(0);
+        f.setBold(true);
+        item->setFont(0, f);
+        item->setSelected(selected.count({1, qulonglong(g.id)}) > 0);
+        for (const ColorGroup& inner : s->colorGroups)
+            if (inner.parent == g.id && inner.id != g.id) groupRow(item, inner);
+        for (const auto& [at, c] : own[g.id]) clipRow(item, c);
+    };
+    for (const ColorGroup& g : s->colorGroups)
+        if (!findColorGroup(*s, g.parent)) groupRow(nullptr, g);
+    auto* loose = new QTreeWidgetItem(tree_, {tr("Not grouped")});
+    loose->setData(0, kRowKind, 2);
+    loose->setData(0, Qt::UserRole, QVariant::fromValue<qulonglong>(0));
+    loose->setFlags(loose->flags() & ~Qt::ItemIsDragEnabled);
+    for (const Listed& c : pictureClips(*s))
+        if (const Clip* clip = edit::clipById(*s, c.id); clip && !colorGroupOf(*s, *clip)) clipRow(loose, c.id);
+    tree_->expandAll();
+}
+
+std::vector<Id> ClipStripPanel::selectedRows(int kind) const {
+    std::vector<Id> out;
+    // (in the order listed)
+    for (QTreeWidgetItemIterator it(tree_); *it; ++it)
+        if ((*it)->isSelected() && (*it)->data(0, kRowKind).toInt() == kind) out.push_back(Id((*it)->data(0, Qt::UserRole).toULongLong()));
+    return out;
+}
+
+bool ClipStripPanel::splitSelected() {
+    const std::vector<Id> clips = selectedRows(0);
+    if (clips.empty()) return false;
+    return state_->edit(tr("Split Colour Group"), [clips](Project& p, Sequence& s) { return edit::splitColorGroup(p, s, clips).ok; });
+}
+
+bool ClipStripPanel::joinSelected() {
+    const std::vector<Id> groups = selectedRows(1);
+    if (groups.size() < 2) return false;
+    return state_->edit(tr("Join Colour Groups"), [groups](Project&, Sequence& s) {
+        return edit::joinColorGroups(s, groups.front(), std::vector<Id>(groups.begin() + 1, groups.end())).ok;
+    });
+}
+
+bool ClipStripPanel::lockSelected(bool locked) {
+    const std::vector<Id> groups = selectedRows(1);
+    if (groups.empty()) return false;
+    return state_->edit(locked ? tr("Lock Colour Group") : tr("Unlock Colour Group"), [groups, locked](Project&, Sequence& s) {
+        bool any = false;
+        for (Id g : groups) any = edit::setColorGroupLocked(s, g, locked).ok || any;
+        return any;
+    });
+}
+
+bool ClipStripPanel::moveInto(const std::vector<Id>& items, Id group) {
+    const Sequence* now = state_->sequence();
+    if (!now || items.empty()) return false;
+    std::vector<Id> clips, groups;
+    for (Id id : items) (findColorGroup(*now, id) ? groups : clips).push_back(id);
+    return state_->edit(tr("Move into Colour Group"), [clips, groups, group](Project&, Sequence& s) {
+        bool any = false;
+        if (!clips.empty()) any = (group ? edit::addToColorGroup(s, clips, group) : edit::removeFromColorGroup(s, clips)).ok || any;
+        for (Id g : groups) any = edit::setColorGroupParent(s, g, group).ok || any;
+        return any;
+    });
+}
+
 std::vector<Id> ClipStripPanel::clips() const {
     std::vector<Id> out;
     for (int i = 0; i < list_->count(); ++i) out.push_back(Id(list_->item(i)->data(Qt::UserRole).toULongLong()));
@@ -136,6 +342,9 @@ void ClipStripPanel::rebuild() {
             h.addData(QByteArray::fromStdString("|" + m->path + "|" + m->proxyPath + "|" + m->colorOverride + "|" + m->sdrExpand));
         for (const SharedNode& n : sharedNodesUsed(*s, *clip))
             for (const Effect& e : n.effects) h.addData(QByteArray::fromStdString(effectToJsonString(e)));
+        for (const ColorGroup* g : colorGroupsOf(*s, *clip))  // (its groups' grades)
+            for (const auto* chain : {&g->pre, &g->post})
+                for (const Effect& e : *chain) h.addData(QByteArray::fromStdString("|g" + effectToJsonString(e)));
         h.addData(QStringLiteral("|%1|%2|%3x%4|%5").arg(s->id).arg(c.track).arg(s->width).arg(s->height).arg(QString::fromStdString(s->colorSpace)).toUtf8());
         const QString key = QString::fromLatin1(h.result().toHex());
         keys_.insert(c.id, key);
@@ -154,6 +363,7 @@ void ClipStripPanel::rebuild() {
     thumbs_ = std::move(kept);
     markCurrent();
     requestThumbnails();
+    if (groupsShown()) rebuildGroups();
 }
 
 void ClipStripPanel::requestThumbnails() {

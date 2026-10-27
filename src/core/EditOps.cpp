@@ -1979,6 +1979,8 @@ Id duplicateSequence(Project& p, Id id, const std::string& name, std::map<Id, Id
         for (Effect& e : g.pre) renew(e);
         for (Effect& e : g.post) renew(e);
     }
+    for (ColorGroup& g : s.colorGroups)
+        if (g.parent) g.parent = colorGroups.count(g.parent) ? colorGroups[g.parent] : 0;
     // Shared grade nodes likewise (their ids own their effects).
     std::map<Id, Id> sharedNodes;
     for (SharedNode& n : s.sharedNodes) {
