@@ -344,6 +344,7 @@ public:
         project_ = std::move(p);
         seq_ = seq;
         sample_ = startSample;
+        loopIn_ = 0, loopLength_ = 0;  // (the play's loop is set after, from where it starts)
         int16_ = int16;
         channels_ = std::max(1, channels);
         idle_ = idle;
@@ -442,9 +443,12 @@ public:
     // Stopped, with the sink kept running for calibration or talkback: no programme.
     void setIdle(bool on) { idle_ = on; }
     // Looped playback from sample `in` for `length` samples (as many as the loop's frames last, so fractional), wrapped
-    // here sample-exactly, the picture following (0: no loop).
-    void setLoop(int64_t in, double length) {
+    // here sample-exactly, the picture following (0: no loop). `taken`: the samples of the whole passes the picture took
+    // off its start under the loop before, taken off here too, so a loop turned off or moved goes on from where the
+    // picture is (not from where the sound has read ahead to, which may have wrapped already).
+    void setLoop(int64_t in, double length, int64_t taken = 0) {
         QMutexLocker lock(&m_);
+        sample_ -= taken;
         loopIn_ = in;
         loopLength_ = length;
     }
@@ -1048,6 +1052,7 @@ void PlaybackController::tick() {
         // passes are taken off the start, so turning the loop off or moving its points goes on from where it is.
         const FrameTime passes = (t - loopIn) / (loopOut - loopIn);
         startFrame_ -= passes * (loopOut - loopIn);
+        loopTaken_ += passes * (loopOut - loopIn);
         t -= passes * (loopOut - loopIn);
     } else if (loop_ && speed_ > 0 && t >= loopOut) {
         t = loopIn;
@@ -1114,6 +1119,7 @@ void PlaybackController::startAudio(FrameTime from, bool idle) {
     int64_t startSample = int64_t(std::llround(double(from) * s->sampleRate / s->fpsValue()));
     device_->configure(heard_, sequenceId_, startSample, int16, outputChannels_, idle);
     audioLoop_ = {-1, -1.0};  // (none a loop can be, so the device is always told)
+    loopTaken_ = 0;
     syncAudioLoop();
     device_->setCalibration(calibration_, monitoring_, s->sampleRate);
     device_->setTalkback(talkback_);
@@ -1131,7 +1137,8 @@ void PlaybackController::syncAudioLoop() {
     if (loop_ && out > in) want = {std::llround(double(in) * s->sampleRate / s->fpsValue()), double(out - in) * s->sampleRate / s->fpsValue()};
     if (want == audioLoop_) return;
     audioLoop_ = want;
-    device_->setLoop(want.first, want.second);
+    device_->setLoop(want.first, want.second, std::llround(double(loopTaken_) * s->sampleRate / s->fpsValue()));
+    loopTaken_ = 0;
 }
 
 void PlaybackController::stopAudio(bool force) {

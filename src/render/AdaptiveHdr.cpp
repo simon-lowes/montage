@@ -5,6 +5,7 @@
 #include <QFloat16>
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <filesystem>
 #include <future>
 #include <list>
@@ -224,7 +225,7 @@ bool readAdaptiveHdr(const std::string& path, std::vector<AdaptiveHdrScene>& sce
     return !scenes.empty();
 }
 
-const AdaptiveHdr* adaptiveHdrAt(const MediaItem& m, double seconds) {
+const AdaptiveHdr* adaptiveHdrAt(const MediaItem& m, double seconds, bool* standIn) {
     if (!m.adaptiveHdr || m.adaptiveHdr->empty()) return nullptr;
     const double fps = m.fps.valid() ? m.fps.toDouble() : 30;
     const FrameTime f = FrameTime(std::llround(std::max(0.0, seconds) * fps));
@@ -256,7 +257,14 @@ const AdaptiveHdr* adaptiveHdrAt(const MediaItem& m, double seconds) {
             }
             whole = slot;
         }
-        if (f >= list->back().end) list = whole.get().get();
+        if (f >= list->back().end) {
+            // (Not waited for by a view that cannot wait: the last scene read stands in until the rest is.)
+            if (standIn && whole.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+                *standIn = true;
+                return &list->back().md;
+            }
+            list = whole.get().get();
+        }
     }
     const auto& scenes = *list;
     auto it = std::upper_bound(scenes.begin(), scenes.end(), f, [](FrameTime t, const AdaptiveHdrScene& s) { return t < s.start; });

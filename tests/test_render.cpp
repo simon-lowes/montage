@@ -8771,6 +8771,34 @@ colorspaces:
                          qPrintable(QString("band %1 channel %2: %3 dB").arg(b).arg(c).arg(dB(again.amplitude[c][b], measured.amplitude[c][b]))));
         for (int k = 0; k < 3; ++k) QVERIFY(std::fabs(again.correlation[k] - measured.correlation[k]) < 0.06);
         QVERIFY2(std::fabs(grainSize(again) / grainSize(measured) - 1) < 0.1, qPrintable(QString("%1 for %2").arg(grainSize(again)).arg(grainSize(measured))));
+        // Graded scene-referred, the picture comes in the working space and the profile in the sequence's, where it was
+        // measured: back in the sequence's space, the grain measures as the plate did.
+        {
+            const ColorSpace& cct = *findColorSpace("acescct");
+            SceneGrading grading;
+            grading.working = &cct;
+            grading.linear = &linearColorSpace(cct.primaries);
+            grading.display = grading.delivery = &space;
+            std::vector<Image> graded;
+            for (int f = 0; f < kFrames; ++f) {
+                Image img = clean();
+                convertExactly(img, space, cct);
+                {
+                    const SceneGradingScope scene(&grading);
+                    const WorkingSpaceScope inCct(&cct);
+                    applyVideoEffect(match, f, img, 1);
+                }
+                convertExactly(img, cct, space);
+                graded.push_back(std::move(img));
+            }
+            GrainProfile delivered;
+            QVERIFY2(measureGrain(graded, space, {}, delivered, &err), err.c_str());
+            for (int b = 0; b < GrainProfile::kBands; ++b)
+                for (int c = 0; c < 3; ++c)
+                    if (measured.amplitude[c][b] > 0)  // (the darkest two lose a little: grain dipping below black)
+                        QVERIFY2(std::fabs(dB(delivered.amplitude[c][b], measured.amplitude[c][b])) < (b < 2 ? 2 : 1),
+                                 qPrintable(QString("band %1 channel %2: %3 dB").arg(b).arg(c).arg(dB(delivered.amplitude[c][b], measured.amplitude[c][b]))));
+        }
         // Twice the size: grain twice as large.
         {
             Effect big = match;

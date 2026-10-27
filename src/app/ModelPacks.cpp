@@ -32,6 +32,7 @@
 #include "media/BandwidthExtension.h"
 #include "media/MediaPool.h"
 #include "audio/SpeechCleanup.h"
+#include "WorkProgress.h"
 
 namespace montage {
 
@@ -355,14 +356,27 @@ bool ensureBandwidthModels(QWidget* parent, const Project& p, const Sequence& s,
     Effect probe;
     probe.type = "bandwidth_extension";
     if (!bandwidthExtensionApplies(e ? *e : probe, c)) return true;  // (a Music or Effects clip is left alone)
-    AudioBufferPtr sound;
-    {
-        QApplication::setOverrideCursor(Qt::WaitCursor);
-        sound = MediaPool::instance().audio(audioKey(m->path, c.channels), s.sampleRate);  // as the clip plays it
-        QApplication::restoreOverrideCursor();
-    }
-    if (!sound) return true;
-    const BweResult plan = bandwidthPlanFor(*sound, e ? e->p("cutoff_hz", 0, 0) : 0);
+    // (The clip's sound as it plays, and where its speech stops: a long recording takes a while, so off this thread.)
+    struct Found {
+        bool sound = false, cancelled = false;
+        BweResult plan;
+    };
+    const std::string key = audioKey(m->path, c.channels);
+    const int rate = s.sampleRate;
+    const double cutoff = e ? e->p("cutoff_hz", 0, 0) : 0;
+    const Found found = withProgress<Found>(parent, QObject::tr("Finding where the speech stops…"), [=](const auto& progress) {
+        Found f;
+        const AudioBufferPtr sound = MediaPool::instance().audio(key, rate);
+        if (!progress(0.5, QString())) return f.cancelled = true, f;
+        if (!sound) return f;
+        f.sound = true;
+        f.plan = bandwidthPlanFor(*sound, cutoff);
+        f.cancelled = !progress(1, QString());
+        return f;
+    });
+    if (found.cancelled) return false;
+    if (!found.sound) return true;
+    const BweResult& plan = found.plan;
     for (const BweCheckpoint& k : plan.plan)
         if (!ensureModelPack(parent, bweModel(k), QObject::tr("Bandwidth Extension"),
                              QObject::tr("The speech in this clip stops at %1 kHz. Bandwidth Extension rebuilds what is above with "

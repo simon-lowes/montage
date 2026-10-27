@@ -771,10 +771,14 @@ const ColorSpace& frameDisplay(const Sequence& seq) {
 }
 
 // The metadata of a media file's frame at `seconds` that changes how it enters `seq` (not its proxy's, nor when its
-// colour is interpreted by hand).
-const AdaptiveHdr* clipAdaptiveHdr(const MediaItem& m, const std::string& path, double seconds, const Sequence& seq) {
+// colour is interpreted by hand). Past the part of the file read on import it is waited for when the frame is final
+// (`wait`: exports and frames rendered ahead), as effects that take seconds are; else a stand-in is noted in `issues`.
+const AdaptiveHdr* clipAdaptiveHdr(const MediaItem& m, const std::string& path, double seconds, const Sequence& seq, bool wait,
+                                   RenderIssues* issues) {
     if (m.kind != MediaKind::Video || path != m.path || !m.colorOverride.empty() || sceneReferredWorking(seq)) return nullptr;
-    const AdaptiveHdr* md = adaptiveHdrAt(m, seconds);
+    bool standIn = false;
+    const AdaptiveHdr* md = adaptiveHdrAt(m, seconds, wait ? nullptr : &standIn);
+    if (standIn && issues) issues->note("The file's adaptive HDR metadata is still being read");
     return md && adaptiveConverts(*md, mediaColorSpace(m), sequenceColorSpace(seq), seq.hdrPeakNits) ? md : nullptr;
 }
 
@@ -963,7 +967,7 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, FrameTime 
             if (!f && original && isOffline(*m)) f = offlineSlate(w, h);
             if (!f) return false;
             if (m->kind == MediaKind::Video) sourceSeconds = sec;
-            out.adaptive = clipAdaptiveHdr(*m, path, sec, seq);
+            out.adaptive = clipAdaptiveHdr(*m, path, sec, seq, o.highQuality || o.slowEffects, o.issues);
             if (m->kind == MediaKind::Video && c.layer.empty()) out.sourcePath = m->path;
             sourceMedia = m->id;
             exrFile = exrFrameFile(m->path, sec);
@@ -1970,6 +1974,7 @@ Image renderSequenceFrame(const Project& p, const Sequence& seq, FrameTime t, co
         grading.linear = &linearColorSpace(grading.working->primaries);
         grading.kind = outputTransformKind(seq);
         grading.exact = opts.highQuality;
+        grading.delivery = &sequenceColorSpace(seq);
         if (asked && !asked->sceneReferred) {
             grading.display = asked;
             grading.peakNits = opts.outputPeak > 0 ? opts.outputPeak : seq.hdrPeakNits;

@@ -17913,7 +17913,6 @@ print("added " + ui["name"])
             QVERIFY(win_->applyWorkspace(workspace));
             // (The tab bars of panels no longer stacked go when the event loop next runs, as it would between workspaces,
             // and so do those the layout retires as it settles: only theirs are hurried, as anything else may be in use.)
-            QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
             QApplication::processEvents();
             QList<QPointer<QTabBar>> bars;
             for (QTabBar* bar : win_->findChildren<QTabBar*>())

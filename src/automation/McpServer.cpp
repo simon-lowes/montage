@@ -1624,11 +1624,12 @@ void McpServer::Impl::addTools() {
                 if (!examples.contains(f)) throw ArgError{QStringLiteral("Frame %1 is not on the clip").arg(tc(f, s))};
                 learn::Pair p;
                 if (!learningPair(l.project, s, examples, f, p, &err)) return fail(QString::fromStdString(err));
+                fitLearningPair(p, learningPixelsEach(frames.size()));
                 pairs.push_back(std::move(p));
             }
             learn::TrainOptions o;
             o.seed = uint64_t(std::clamp(a.value("seed").toDouble(1), 0.0, 9007199254740992.0));
-            learn::Trainer trainer(learn::NetShape{}, pairs, o);
+            learn::Trainer trainer(learn::NetShape{}, std::move(pairs), o);
             if (a.value("continue").toBool()) {
                 const std::string from = learnedNetworkOf(examples);
                 learn::Saved before;
@@ -1649,9 +1650,9 @@ void McpServer::Impl::addTools() {
             saved.source = examples.name;
             if (!learn::save(file, saved, &err)) return fail(QString::fromStdString(err));
             double before = 0, after = 0;
-            for (const learn::Pair& p : pairs) {
-                before += learn::psnr(p.before, p.after) / double(pairs.size());
-                after += learn::psnr(learn::applyNet(trainer.net(), p.before), p.after) / double(pairs.size());
+            for (const learn::Pair& p : trainer.pairs()) {
+                before += learn::psnr(p.before, p.after) / double(trainer.pairs().size());
+                after += learn::psnr(learn::applyNet(trainer.net(), p.before), p.after) / double(trainer.pairs().size());
             }
             std::vector<Id> targets;
             for (const QJsonValue& v : a.value("apply_to").toArray()) targets.push_back(Id(v.toDouble()));
@@ -1659,10 +1660,10 @@ void McpServer::Impl::addTools() {
             const int given = applyLearnedNetwork(l.project, s, targets, file, examples.id, a.value("replace").toBool(true));
             save(l);
             const QJsonObject o2{{"network", QString::fromStdString(file)}, {"steps", trainer.steps()}, {"loss", trainer.loss()},
-                                 {"examples", int(pairs.size())}, {"psnr_before", before}, {"psnr_after", after}, {"clips", given}};
+                                 {"examples", int(trainer.pairs().size())}, {"psnr_before", before}, {"psnr_after", after}, {"clips", given}};
             return ok(QStringLiteral("Trained %1 steps on %2 frame(s): the examples %3 dB, from %4; given to %5 clip(s)")
                           .arg(trainer.steps())
-                          .arg(pairs.size())
+                          .arg(trainer.pairs().size())
                           .arg(after, 0, 'f', 1)
                           .arg(before, 0, 'f', 1)
                           .arg(given),
@@ -3007,7 +3008,7 @@ void McpServer::Impl::addTools() {
             if (!d) return fail(QStringLiteral("%1 is not installed here").arg(QString::fromStdString(e->s("plugin_name", "The plug-in"))));
             std::string key, err;
             AudioBufferPtr sound;
-            if (!ara::clipSource(l.project, l.seq(), c, key, sound, &err)) return fail(QString::fromStdString(err));
+            if (!ara::clipSource(l.project, l.seq(), c, key, sound, &err, e)) return fail(QString::fromStdString(err));
             auto session = ara::Session::open(*d, plugins::decodeState(e->s("archive")), sound, ara::sourceIdFor(*e, *sound),
                                               ara::modificationIdFor(*e), ara::timelineOf(*e), ara::kEditorRenderer, &err);
             if (!session) return fail(QString::fromStdString(err));

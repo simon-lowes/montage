@@ -33,8 +33,10 @@ void forEachT35(const uint8_t* data, size_t size, bool av1, int lengthSize, cons
 // further is marked (its key kAdaptiveHdrMore), and adaptiveHdrAt reads the rest when a frame past it is asked for.
 bool readAdaptiveHdr(const std::string& path, std::vector<AdaptiveHdrScene>& scenes, std::string* error = nullptr, bool whole = false);
 inline constexpr const char* kAdaptiveHdrMore = "more";
-// The metadata of a media item's frame at `seconds` (null: none).
-const AdaptiveHdr* adaptiveHdrAt(const MediaItem& m, double seconds);
+// The metadata of a media item's frame at `seconds` (null: none). Past the part read on import it waits for the rest of
+// the file to be read, unless given `standIn` (a view that cannot wait): then the last scene read stands in until it
+// is, and `standIn` is set.
+const AdaptiveHdr* adaptiveHdrAt(const MediaItem& m, double seconds, bool* standIn = nullptr);
 
 // ---- In pictures --------------------------------------------------------------------------------------------------
 // The headroom (log2 of the peak over reference white) a picture in `space` can show: 0 for SDR, the mastering peak

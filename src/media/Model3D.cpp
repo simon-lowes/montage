@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <list>
 #include <map>
 #include <mutex>
@@ -139,10 +140,24 @@ bool decodeTexture(const QByteArray& bytes, bool srgb, ModelTexture& out) {
 // The files read while a model loads (for its cache to see when one changes), when asked for.
 thread_local std::vector<std::string>* filesRead = nullptr;
 
+// The sizes of the buffer files read for a glTF, by where they were put (to check them against what the file says).
+thread_local std::map<const void*, size_t>* buffersRead = nullptr;
+
+// The largest file a model reads (its .gltf, .bin, .obj, .mtl or a texture), and the most values it may unpack.
+constexpr qint64 kMaxModelFile = qint64(1) << 30;
+constexpr cgltf_size kMaxAccessorValues = cgltf_size(1) << 26, kMaxModelValues = cgltf_size(1) << 28;
+
+// A model file whole: regular files only (not a device, a pipe or a socket, which could be endless or never end), and
+// none larger than kMaxModelFile.
 QByteArray readWhole(const QString& path) {
     if (filesRead) filesRead->push_back(path.toStdString());
+    std::error_code ec;
+    const std::filesystem::path p = std::filesystem::u8path(path.toStdString());
+    if (!std::filesystem::is_regular_file(p, ec) || std::filesystem::file_size(p, ec) > uintmax_t(kMaxModelFile) || ec) return {};
     QFile f(path);
-    return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+    if (!f.open(QIODevice::ReadOnly)) return {};
+    QByteArray bytes = f.read(kMaxModelFile + 1);
+    return bytes.size() > kMaxModelFile ? QByteArray() : bytes;
 }
 
 // Normals for a primitive without them: flat, each triangle its own corners.
@@ -236,6 +251,7 @@ cgltf_result readFile(const cgltf_memory_options*, const cgltf_file_options*, co
     std::memcpy(p, bytes.constData(), size_t(bytes.size()));
     *size = cgltf_size(bytes.size());
     *data = p;
+    if (buffersRead) (*buffersRead)[p] = size_t(bytes.size());
     return cgltf_result_success;
 }
 void releaseFile(const cgltf_memory_options*, const cgltf_file_options*, void* data) { std::free(data); }
@@ -263,16 +279,34 @@ bool loadGltf(const std::string& path, const QByteArray& bytes, Model& out, std:
     };
     if (cgltf_parse(&options, bytes.constData(), cgltf_size(bytes.size()), &data) != cgltf_result_success)
         return fail(path + " is not a glTF model Montage can read");
-    if (cgltf_load_buffers(&options, data, path.c_str()) != cgltf_result_success) return fail("The buffers of " + path + " cannot be read");
+    std::map<const void*, size_t> sizes;
+    buffersRead = &sizes;
+    const cgltf_result loaded = cgltf_load_buffers(&options, data, path.c_str());
+    buffersRead = nullptr;
+    if (loaded != cgltf_result_success) return fail("The buffers of " + path + " cannot be read");
+    // cgltf keeps the size the model gives each buffer, not its file's: a file shorter than that is refused (its
+    // views would be read past its end).
+    for (cgltf_size i = 0; i < data->buffers_count; ++i)
+        if (const auto it = sizes.find(data->buffers[i].data); it != sizes.end() && it->second < data->buffers[i].size)
+            return fail("A buffer of " + path + " is shorter than the model says");
     if (cgltf_validate(data) != cgltf_result_success) return fail(path + " is not a valid glTF model");
+    // Accessors with no data behind them are zeros of any length: none may unpack to more than a model can hold.
+    cgltf_size values = 0;
+    for (cgltf_size i = 0; i < data->accessors_count; ++i) {
+        const cgltf_size n = data->accessors[i].count * std::max<cgltf_size>(1, cgltf_num_components(data->accessors[i].type));
+        if (data->accessors[i].count > kMaxAccessorValues || n > kMaxAccessorValues || (values += n) > kMaxModelValues)
+            return fail(path + " is larger than Montage can load");
+    }
     const QDir dir = QFileInfo(QString::fromStdString(path)).absoluteDir();
 
     // Textures: one for each image and colour use (base colour and emissive are sRGB, the rest linear).
-    std::map<std::pair<const cgltf_texture*, bool>, int> made;
+    // (Keyed by the image, so one picture used by several textures is decoded once.)
+    std::map<std::tuple<const cgltf_image*, bool, int, int>, int> made;
     auto texture = [&](const cgltf_texture_view& view, bool srgb) -> int {
         const cgltf_texture* t = view.texture;
         if (!t || !t->image) return -1;
-        if (auto it = made.find({t, srgb}); it != made.end()) return it->second;
+        const auto key = std::make_tuple(t->image, srgb, t->sampler ? int(t->sampler->wrap_s) : 10497, t->sampler ? int(t->sampler->wrap_t) : 10497);
+        if (auto it = made.find(key); it != made.end()) return it->second;
         const cgltf_image* im = t->image;
         QByteArray b;
         if (im->buffer_view) {
@@ -292,7 +326,7 @@ bool loadGltf(const std::string& path, const QByteArray& bytes, Model& out, std:
             id = int(out.textures.size());
             out.textures.push_back(std::move(tex));
         }
-        made[{t, srgb}] = id;
+        made[key] = id;
         return id;
     };
 
@@ -327,6 +361,23 @@ bool loadGltf(const std::string& path, const QByteArray& bytes, Model& out, std:
     }
 
     int defaultMaterial = -1;
+    // (Each use of an accessor is unpacked again: counted before any is, so many primitives or targets sharing a large
+    // one cannot add up to more than a model may.)
+    cgltf_size unpacked = 0;
+    auto unpack = [&](const cgltf_accessor* a, cgltf_size per) {
+        if (!a) return true;
+        const cgltf_size v = a->count * std::max<cgltf_size>(per, cgltf_num_components(a->type));
+        return (unpacked += v) <= kMaxModelValues;
+    };
+    for (cgltf_size i = 0; i < data->meshes_count; ++i)
+        for (cgltf_size j = 0; j < data->meshes[i].primitives_count; ++j) {
+            const cgltf_primitive& gp = data->meshes[i].primitives[j];
+            bool fits = unpack(gp.indices, 3);
+            for (cgltf_size k = 0; k < gp.attributes_count; ++k) fits = fits && unpack(gp.attributes[k].data, 4);
+            for (cgltf_size t = 0; t < gp.targets_count; ++t)
+                for (cgltf_size k = 0; k < gp.targets[t].attributes_count; ++k) fits = fits && unpack(gp.targets[t].attributes[k].data, 1);
+            if (!fits) return fail(path + " is larger than Montage can load");
+        }
     for (cgltf_size i = 0; i < data->meshes_count; ++i) {
         const cgltf_mesh& gm = data->meshes[i];
         ModelMesh mesh;

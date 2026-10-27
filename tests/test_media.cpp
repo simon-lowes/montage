@@ -2,6 +2,9 @@
 #include <clocale>
 #include <QtTest>
 #include <QElapsedTimer>
+#ifdef Q_OS_UNIX
+#include <sys/stat.h>
+#endif
 #include <QCryptographicHash>
 #include <QtEndian>
 #include <QPainter>
@@ -5533,6 +5536,57 @@ private slots:
         Project reloaded;
         QVERIFY(loadProject(project.toStdString(), reloaded));
         QCOMPARE(reloaded.active()->videoTracks[0].clips.at(0).effects[0].s("network"), network2.toStdString());
+    }
+
+    void learnedEffectLimits() {
+        // Examples too large to hold are cut, at full size, to where the frame was worked on.
+        learn::Pair big;
+        big.before = Image(400, 300);
+        big.after = Image(400, 300);
+        for (int y = 200; y < 260; ++y)
+            for (int x = 300; x < 380; ++x) big.after.at(x, y)[0] = 1;
+        fitLearningPair(big, 120 * 90);
+        QVERIFY(big.before.width * big.before.height <= 120 * 90 && big.before.width >= 100);
+        QCOMPARE(big.after.width, big.before.width);
+        QCOMPARE(big.after.height, big.before.height);
+        double changed = 0;
+        for (float v : big.after.px) changed += v;
+        QVERIFY2(changed > 0.7 * 60 * 80, qPrintable(QString::number(changed)));  // (most of the worked-on patch kept)
+        learn::Pair small;
+        small.before = small.after = Image(64, 48);
+        fitLearningPair(small, 120 * 90);
+        QCOMPARE(small.before.width, 64);
+        // Together the examples stay near a gigabyte: a minute's markers on 8K is not 60 whole frames.
+        QVERIFY(learningPixelsEach(60) * 60 * 32 <= int64_t(1) << 30);
+        QVERIFY(learningPixelsEach(60) < 7680 * 4320);
+        QCOMPARE(learningPixelsEach(1), int64_t(32) << 20);
+        // A network trained before the project was saved goes beside it when it is.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        Clip clip = makeGeneratorClip(p, "bars", 50);
+        Effect learned = makeEffect(p, "learned_effect");
+        const std::string temporary = newLearnedNetworkPath("", p, clip);
+        QVERIFY(QFileInfo(QString::fromStdString(temporary)).absolutePath().startsWith(QDir::tempPath()));
+        {
+            QFile f(QString::fromStdString(temporary));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write("network");
+        }
+        learned.strings["network"] = temporary;
+        clip.effects.push_back(learned);
+        s.videoTracks[0].clips.push_back(clip);
+        const std::string project = path("kept.montage");
+        Project mine = p;
+        const auto moved = keepLearnedNetworks(p, project);
+        QCOMPARE(moved.size(), size_t(1));
+        const std::string kept = p.active()->videoTracks[0].clips.at(0).effects.at(0).s("network");
+        QVERIFY2(QString::fromStdString(kept).contains("kept Learned Effects"), kept.c_str());
+        QVERIFY(QFileInfo::exists(QString::fromStdString(kept)));
+        repointLearnedNetworks(mine, moved);
+        QCOMPARE(mine.active()->videoTracks[0].clips.at(0).effects.at(0).s("network"), kept);
+        // Saved again: nothing more to keep.
+        QVERIFY(keepLearnedNetworks(p, project).empty());
+        QFile::remove(QString::fromStdString(temporary));
     }
 
     void mcpKeyScreen() {
@@ -29153,6 +29207,67 @@ if ui["pressed"] == "add":
         for (int y = 0; y < 120; ++y)
             for (int x = 0; x < 160; ++x) covered += img.at(x, y)[3] > 0.5f;
         QVERIFY2(covered > 200, qPrintable(QString::number(covered)));
+    }
+
+    void modelFilesRefused() {
+        // A glTF whose buffer says 100 MB beside a 16-byte file: refused, not read past the file's end.
+        auto writeGltf = [&](const std::string& name, const QJsonObject& gltf) {
+            QFile f(QString::fromStdString(path(name.c_str())));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QJsonDocument(gltf).toJson());
+        };
+        {
+            QFile bin(QString::fromStdString(path("tiny.bin")));
+            QVERIFY(bin.open(QIODevice::WriteOnly));
+            bin.write(QByteArray(16, '\0'));
+        }
+        const QJsonObject asset{{"version", "2.0"}};
+        const QJsonArray meshes{QJsonObject{{"primitives", QJsonArray{QJsonObject{{"attributes", QJsonObject{{"POSITION", 0}}}}}}}};
+        writeGltf("long.gltf", QJsonObject{{"asset", asset},
+                                           {"buffers", QJsonArray{QJsonObject{{"uri", "tiny.bin"}, {"byteLength", 100000000}}}},
+                                           {"bufferViews", QJsonArray{QJsonObject{{"buffer", 0}, {"byteLength", 100000000}}}},
+                                           {"accessors", QJsonArray{QJsonObject{{"bufferView", 0}, {"componentType", 5126}, {"count", 8000000}, {"type", "VEC3"}}}},
+                                           {"meshes", meshes}});
+        std::string err;
+        Model m;
+        QVERIFY(!loadModel(path("long.gltf"), m, &err));
+        QVERIFY2(err.find("shorter") != std::string::npos, err.c_str());
+        // An accessor of two billion zeros (no data behind it): refused, not allocated.
+        writeGltf("zeros.gltf", QJsonObject{{"asset", asset},
+                                            {"accessors", QJsonArray{QJsonObject{{"componentType", 5126}, {"count", 2000000000.0}, {"type", "VEC3"}}}},
+                                            {"meshes", meshes}});
+        err.clear();
+        QVERIFY(!loadModel(path("zeros.gltf"), m, &err));
+        QVERIFY2(err.find("larger") != std::string::npos, err.c_str());
+        // One accessor within bounds used by a hundred primitives: each use counts.
+        QJsonArray many;
+        for (int i = 0; i < 100; ++i) many.append(QJsonObject{{"attributes", QJsonObject{{"POSITION", 0}}}});
+        writeGltf("shared.gltf", QJsonObject{{"asset", asset},
+                                             {"accessors", QJsonArray{QJsonObject{{"componentType", 5126}, {"count", 20000000}, {"type", "VEC3"}}}},
+                                             {"meshes", QJsonArray{QJsonObject{{"primitives", many}}}}});
+        err.clear();
+        QVERIFY(!loadModel(path("shared.gltf"), m, &err));
+        QVERIFY2(err.find("larger") != std::string::npos, err.c_str());
+#ifdef Q_OS_UNIX
+        // An OBJ whose material library is /dev/zero, then a pipe nothing writes to: loads at once without it.
+        QFile::remove(QString::fromStdString(path("zero.mtl")));
+        QVERIFY(QFile::link("/dev/zero", QString::fromStdString(path("zero.mtl"))));
+        QFile::remove(QString::fromStdString(path("pipe.mtl")));
+        QCOMPARE(::mkfifo(path("pipe.mtl").c_str(), 0600), 0);
+        for (const char* lib : {"zero.mtl", "pipe.mtl"}) {
+            QFile obj(QString::fromStdString(path("tri.obj")));
+            QVERIFY(obj.open(QIODevice::WriteOnly));
+            obj.write(QByteArray("mtllib ") + lib + "\nusemtl x\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n");
+            obj.close();
+            Model tri;
+            err.clear();
+            QElapsedTimer clock;
+            clock.start();
+            QVERIFY2(loadModel(path("tri.obj"), tri, &err), err.c_str());
+            QCOMPARE(tri.triangles(), size_t(1));
+            QVERIFY(clock.elapsed() < 5000);
+        }
+#endif
     }
 
     void modelRendering() {

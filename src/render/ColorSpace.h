@@ -107,6 +107,7 @@ struct SceneGrading {
     const ColorSpace* working = nullptr;
     const ColorSpace* linear = nullptr;
     const ColorSpace* display = nullptr;
+    const ColorSpace* delivery = nullptr;  // the sequence's own space (where grain and the like are measured)
     double peakNits = 1000;
     OutputTransformKind kind = OutputTransformKind::Filmic;
     bool exact = false;  // (deliveries: the output transform worked out for each pixel)
