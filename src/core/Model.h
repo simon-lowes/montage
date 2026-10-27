@@ -506,6 +506,7 @@ struct Send {
     bool preFader = false;
     bool muted = false;
     Param levelAuto;  // send level automation (dB), keyed in timeline frames and played in the track's mode
+    Param levelTrim;  // its trim (dB on top of the level; core/Automation.h), written in the track's trim modes
     bool operator==(const Send&) const = default;
 };
 
@@ -547,8 +548,11 @@ struct Track {
     Id output = 0;                // audio: the bus the track feeds, 0 = master
     SurroundPan surround;         // audio, in 5.1 and 7.1 sequences
     // Fader automation (core/Automation.h): volume (dB) and pan lanes keyed in timeline frames, and the
-    // AutomationMode (0 Off, 1 Read, 2 Write, 3 Latch, 4 Touch).
+    // AutomationMode (0 Off, 1 Read, 2 Write, 3 Latch, 4 Touch, 5 Trim Write, 6 Trim Latch, 7 Trim Touch).
     Param volumeAuto, panAuto;
+    // The fader's trim: an offset in dB played on top of the volume lane, written in the trim modes; its static value
+    // without keys.
+    Param volumeTrim;
     // Surround position lanes (x, y, z as in SurroundPan), keyed in timeline frames and played in the same mode: a
     // sound, or an ADM object, moving round the room.
     Param surroundXAuto, surroundYAuto, surroundZAuto;
@@ -580,6 +584,7 @@ struct Bus {
     SurroundPan surround;
     // Its fader, pan and mute automation (core/Automation.h), keyed in timeline frames, and its AutomationMode.
     Param volumeAuto, panAuto, muteAuto;
+    Param volumeTrim;  // its fader's trim, as a track's
     int automation = 1;
     bool operator==(const Bus&) const = default;
 };

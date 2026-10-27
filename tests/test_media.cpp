@@ -2663,6 +2663,70 @@ private slots:
         QVERIFY(std::fabs(back->samples[size_t(72000) * 2 + 1]) < 1e-3);     // 1.5 s: hard left
     }
 
+    void trimmedMixExportsAsCoalesced() {
+        // A steady signal on A1 under a moving volume lane and a trim, sent to a bus with a trim of its own: exported,
+        // the mix is the same as with every trim folded into the volume lanes.
+        const std::string wav = path("trimsrc.wav");
+        writeWav(wav, 48000, 2.0, 0.5f, 0.3f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{30, 1};
+        s.sampleRate = 48000;
+        MediaItem m = probeOrFail(p, wav);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Bus ret;
+        ret.id = p.newId();
+        ret.name = "Return";
+        ret.automation = int(AutomationMode::TrimLatch);
+        ret.volumeAuto.addKey(0, -6);
+        ret.volumeAuto.addKey(60, 0);
+        ret.volumeTrim.addKey(15, 0);
+        ret.volumeTrim.addKey(30, -4);
+        s.buses.push_back(ret);
+        QVERIFY(edit::setSend(s, 0, ret.id, -8, false).ok);
+        Track& a1 = s.audioTracks[0];
+        a1.automation = int(AutomationMode::TrimTouch);
+        a1.volumeAuto.addKey(0, -20);
+        a1.volumeAuto.addKey(45, -2);
+        a1.volumeTrim.addKey(10, 0);
+        a1.volumeTrim.addKey(20, -6);
+        a1.volumeTrim.addKey(40, -6);
+        a1.volumeTrim.addKey(50, 3);
+        a1.sends[0].levelTrim.addKey(5, 0);
+        a1.sends[0].levelTrim.addKey(25, -10);
+        std::string err;
+        auto render = [&](const std::string& name) -> AudioBufferPtr {
+            ExportSettings st;
+            st.path = path(name.c_str());
+            st.videoCodec = "none";
+            st.audioCodec = "pcm_s24le";
+            if (!exportSequence(p, s, st, nullptr, nullptr, &err)) return nullptr;
+            return decodeAudio(st.path, 48000, &err);
+        };
+        const AudioBufferPtr trimmed = render("trimmed.wav");
+        QVERIFY2(trimmed, err.c_str());
+        // Folded in: at frame 30 the volume lane is 6 dB down, as the trim had it.
+        const Sequence before = s;
+        QVERIFY(coalesceTrim(s.audioTracks[0]) && coalesceTrim(s.buses[0]));
+        QVERIFY(!hasTrim(s.audioTracks[0]) && !hasTrim(s.buses[0]));
+        QCOMPARE(s.audioTracks[0].volumeAuto.at(30), before.audioTracks[0].volumeAuto.at(30) - 6);
+        const AudioBufferPtr coalesced = render("coalesced.wav");
+        QVERIFY2(coalesced, err.c_str());
+        QCOMPARE(coalesced->samples.size(), trimmed->samples.size());
+        QVERIFY(trimmed->samples.size() > 48000);
+        double worst = 0;
+        size_t differ = 0;
+        for (size_t i = 0; i < trimmed->samples.size(); ++i) {
+            const double d = std::fabs(double(trimmed->samples[i]) - double(coalesced->samples[i]));
+            worst = std::max(worst, d);
+            differ += d > 0 ? 1 : 0;
+        }
+        // Sample for sample (to within one 24-bit step, where the two sums of dB round apart).
+        QVERIFY2(worst <= 1.0 / 8388608 + 1e-12, qPrintable(QString("%1 (%2 samples differ)").arg(worst).arg(differ)));
+        QVERIFY2(differ * 1000 < trimmed->samples.size(), qPrintable(QString::number(differ)));
+    }
+
     void auxSendsAndMixerAutomation() {
         // A steady signal on A1 to the master, and a return bus (no effects) it can send to.
         const std::string wav = path("sendsrc.wav");
@@ -22357,6 +22421,56 @@ if ui["pressed"] == "add":
                     .value("isError").toBool());
         r = tool("montage_automate_track", QJsonObject{{"project", project}, {"sends", QJsonArray{QJsonObject{{"bus", "Reverb"}, {"remove", true}}}}});
         QVERIFY2(!r.value("isError").toBool() && text(r).contains("Sends: none"), qPrintable(text(r)));
+        // Film-mix tools: a trim mode and trim points, folded in; Write To End; a glide; a punched preview; a capture
+        // pasted later; automation copied along the track.
+        {
+            auto a1At = [&](const char* lane, double seconds) {
+                Project q;
+                if (!loadProject(project.toStdString(), q)) return 1e9;
+                Track& t = q.active()->audioTracks.at(0);
+                const FrameTime f = FrameTime(std::llround(seconds * q.active()->fpsValue()));
+                if (std::string(lane) == "heard") return trackVolumeAt(t, double(f));
+                const LaneRef ref = trackLane(t, lane);
+                return ref.lane ? ref.at(f) : 1e9;
+            };
+            auto run = [&](QJsonObject args) {
+                args["project"] = project;
+                args["track"] = "A1";
+                return tool("montage_automate_track", args);
+            };
+            r = run({{"mode", "trim latch"}, {"volume", QJsonArray{QJsonArray{0, -10}, QJsonArray{8, -10}}},
+                     {"trim", QJsonArray{QJsonArray{2, 0}, QJsonArray{3, -3}}}});
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("Trim Latch automation") && !text(r).contains("Trim: none"), qPrintable(text(r)));
+            QCOMPARE(a1At("heard", 4), -13.0);
+            QCOMPARE(a1At("volume", 4), -10.0);
+            r = run({{"coalesce", true}});
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("Coalesced") && text(r).contains("Trim: none"), qPrintable(text(r)));
+            QCOMPARE(a1At("volume", 4), -13.0);
+            r = run({{"write_to", QJsonObject{{"target", "end"}, {"value", -6}, {"from", 6}}}});
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("Wrote -6"), qPrintable(text(r)));
+            QCOMPARE(a1At("volume", 5), -13.0);
+            QCOMPARE(a1At("volume", 6), -6.0);
+            QCOMPARE(a1At("volume", 20), -6.0);
+            r = run({{"glide", QJsonObject{{"from", 1}, {"to", 3}, {"value", 0}}}});
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("Glided"), qPrintable(text(r)));
+            QCOMPARE(a1At("volume", 1), -10.0);
+            QVERIFY(std::fabs(a1At("volume", 2) + 5) < 1e-9);
+            QCOMPARE(a1At("volume", 3), 0.0);
+            r = run({{"preview", QJsonObject{{"values", QJsonObject{{"pan", 0.5}}}, {"from", 4}, {"to", 5}}}});
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("Punched 1"), qPrintable(text(r)));
+            QCOMPARE(a1At("pan", 4.5), 0.5);
+            QCOMPARE(a1At("pan", 3), 0.0);
+            r = run({{"capture", QJsonObject{{"at", 4.5}, {"tracks", QJsonArray{"A1"}}, {"paste_at", 7}}}});
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("Captured 1 strip"), qPrintable(text(r)));
+            QCOMPARE(a1At("pan", 7), 0.5);
+            QCOMPARE(a1At("volume", 7), -13.0);
+            r = run({{"copy", QJsonObject{{"from", 4}, {"to", 5}, {"at", 9}, {"lanes", QJsonArray{"pan"}}}}});
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("Pasted 1 lane"), qPrintable(text(r)));
+            QCOMPARE(a1At("pan", 9.5), 0.5);
+            QVERIFY(run({{"write_to", QJsonObject{{"target", "middle"}}}}).value("isError").toBool());
+            QVERIFY(run({{"glide", QJsonObject{{"lane", "mute"}, {"from", 1}, {"value", 1}}}}).value("isError").toBool());
+            QVERIFY(run({{"glide", QJsonObject{{"lane", "send:Nowhere"}, {"from", 1}, {"value", 1}}}}).value("isError").toBool());
+        }
         QVERIFY(QFile::remove(project) && QFile::rename(beforeSends, project));
         QFile::remove(project + ".bak");
         // A clip marker, on the clip rather than the sequence.

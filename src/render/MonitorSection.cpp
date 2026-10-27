@@ -194,6 +194,7 @@ Sequence monitorSequence(const Sequence& seq, const MonitorSettings& s) {
             t.pan = 0;
             t.surround = SurroundPan{};
             t.volumeAuto = Param{};
+            t.volumeTrim = Param{};
             t.panAuto = Param{};
             t.surroundXAuto = t.surroundYAuto = t.surroundZAuto = Param{};
             t.folder.clear();

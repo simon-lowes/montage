@@ -562,7 +562,8 @@ edit::Result placeStems(Project& p, Sequence& s, Id clip, const std::vector<Id>&
     const Track source = s.audioTracks[size_t(loc->track.index)];
     auto sameMix = [&](const Track& t) {
         if (t.output != source.output || t.volumeDb != source.volumeDb || t.pan != source.pan || !(t.sends == source.sends) ||
-            t.effects.size() != source.effects.size() || !(t.volumeAuto == source.volumeAuto) || !(t.panAuto == source.panAuto))
+            t.effects.size() != source.effects.size() || !(t.volumeAuto == source.volumeAuto) || !(t.panAuto == source.panAuto) ||
+            !(t.volumeTrim == source.volumeTrim))
             return false;
         for (size_t k = 0; k < t.effects.size(); ++k)
             if (t.effects[k].type != source.effects[k].type || t.effects[k].params != source.effects[k].params) return false;
@@ -588,6 +589,7 @@ edit::Result placeStems(Project& p, Sequence& s, Id clip, const std::vector<Id>&
             made.sends = source.sends;
             made.surround = source.surround;
             made.volumeAuto = source.volumeAuto;
+            made.volumeTrim = source.volumeTrim;
             made.panAuto = source.panAuto;
             made.muteAuto = source.muteAuto;
             made.surroundXAuto = source.surroundXAuto;

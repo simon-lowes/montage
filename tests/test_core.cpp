@@ -6759,6 +6759,239 @@ private slots:
         QCOMPARE(back.active()->audioTracks.at(1).automation, int(AutomationMode::Read));
     }
 
+    void filmMixAutomation() {
+        // Trim: a lane at -10 dB trimmed by -3 dB in a Trim Latch pass plays at -13 dB.
+        Track t;
+        t.kind = TrackKind::Audio;
+        t.automation = int(AutomationMode::TrimLatch);
+        t.volumeAuto.addKey(0, -10);
+        t.volumeAuto.addKey(300, -10);
+        QVERIFY(automationReads(montage::trackAutomation(t)) && automationWrites(montage::trackAutomation(t)));
+        QCOMPARE(QString(automationModeName(montage::trackAutomation(t))), QString("Trim Latch"));
+        {
+            AutomationRecorder r(montage::trackAutomation(t), t.volumeTrim, t.volumeTrim.value, 0);
+            for (FrameTime f = 0; f <= 120; ++f) r.tick(f, f < 20 ? 0.0 : -3.0, f >= 20 && f <= 25);
+            t.volumeTrim = r.finish(120, 0.05);
+        }
+        QCOMPARE(trackVolumeAt(t, 10), -10.0);
+        QCOMPARE(trackVolumeAt(t, 60), -13.0);
+        QCOMPARE(trackVolumeAt(t, 200), -10.0);  // after the stop, as it was
+        QVERIFY(trackVolumeAnimated(t));
+        // Off ignores the trim; the volume lane itself is untouched.
+        t.automation = int(AutomationMode::Off);
+        QCOMPARE(trackVolumeAt(t, 60), t.volumeDb);
+        t.automation = int(AutomationMode::Read);
+        QCOMPARE(t.volumeAuto.at(60), -10.0);
+        // Coalescing leaves -13 dB on the volume lane and the trim empty, heard the same at every frame and between.
+        {
+            const Track before = t;
+            QVERIFY(coalesceTrim(t));
+            QVERIFY(!hasTrim(t) && !t.volumeTrim.animated() && t.volumeTrim.value == 0);
+            QCOMPARE(t.volumeAuto.at(60), -13.0);
+            for (double f = 0; f <= 320; f += 0.25) QVERIFY2(std::fabs(trackVolumeAt(t, f) - trackVolumeAt(before, f)) < 1e-9, qPrintable(QString::number(f)));
+            QVERIFY(!coalesceTrim(t));  // nothing left to fold
+            // A trim on a track in Off is not heard, so it is not folded in.
+            Track off = before;
+            off.automation = int(AutomationMode::Off);
+            QVERIFY(!coalesceTrim(off) && hasTrim(off));
+        }
+        // Coalescing a moving lane and a moving trim (and a still trim on a still fader, on a send).
+        {
+            Track m;
+            m.kind = TrackKind::Audio;
+            m.volumeAuto.addKey(0, -20);
+            m.volumeAuto.addKey(100, 0);
+            m.volumeTrim.addKey(30, 0);
+            m.volumeTrim.addKey(50, -6);
+            m.volumeTrim.addKey(70, 2);
+            m.sends.push_back(Send{7, -12, false, false, {}, {}});
+            m.sends.back().levelTrim.value = -2;
+            const Track before = m;
+            QVERIFY(coalesceTrim(m));
+            for (double f = 0; f <= 150; f += 0.5) QVERIFY(std::fabs(trackVolumeAt(m, f) - trackVolumeAt(before, f)) < 1e-9);
+            QCOMPARE(m.sends[0].levelDb, -14.0);
+            QCOMPARE(sendLevelAt(m, m.sends[0], 10), sendLevelAt(before, before.sends[0], 10));
+            // Saved with the project.
+            Project p = makeDefaultProject();
+            Track& a1 = p.active()->audioTracks.at(0);
+            a1.volumeTrim = before.volumeTrim;
+            a1.sends = before.sends;
+            a1.automation = int(AutomationMode::TrimTouch);
+            Bus bus;
+            bus.id = 7;
+            bus.volumeTrim.value = 1.5;
+            bus.automation = int(AutomationMode::TrimWrite);
+            p.active()->buses.push_back(bus);
+            Project back;
+            QVERIFY(projectFromJson(projectToJson(p), back));
+            QCOMPARE(back.active()->audioTracks.at(0), a1);
+            QCOMPARE(back.active()->buses.at(0), bus);
+            QCOMPARE(busVolumeAt(back.active()->buses.at(0), 0), 1.5);
+        }
+        // Trim modes write the trim and show it; what cannot be trimmed is written as in Write, Latch or Touch.
+        QCOMPARE(untrimmed(AutomationMode::TrimTouch), AutomationMode::Touch);
+        QCOMPARE(trimmed(AutomationMode::Write), AutomationMode::TrimWrite);
+        QCOMPARE(trimmed(AutomationMode::Read), AutomationMode::TrimTouch);
+
+        // Write To End from the playhead at -6 dB replaces everything after it and nothing before.
+        Param lane;
+        lane.addKey(0, -20);
+        lane.addKey(50, -5);
+        lane.addKey(100, -15);
+        lane.addKey(200, -30);
+        {
+            Param w = lane;
+            const auto [from, to] = writeToRange(WriteTo::End, w, 40, 40, -1, -1);
+            QCOMPARE(from, FrameTime(40));
+            QCOMPARE(to, FrameTime(-1));
+            writeLaneValue(w, 0, from, to, -6);
+            for (FrameTime f = 0; f < 40; ++f) QCOMPARE(w.at(f), lane.at(f));
+            for (FrameTime f = 40; f <= 400; ++f) QCOMPARE(w.at(f), -6.0);
+        }
+        // Write To Start, All and Next.
+        {
+            Param w = lane;
+            const auto [from, to] = writeToRange(WriteTo::Start, w, 70, 80, -1, -1);
+            writeLaneValue(w, 0, from, to, -8);
+            for (FrameTime f = 0; f <= 80; ++f) QCOMPARE(w.at(f), -8.0);
+            for (FrameTime f = 81; f <= 300; ++f) QCOMPARE(w.at(f), lane.at(f));
+            Param all = lane;
+            const auto [a0, a1] = writeToRange(WriteTo::All, all, 70, 80, -1, -1);
+            writeLaneValue(all, 0, a0, a1, -3);
+            QCOMPARE(all.keys.size(), size_t(1));
+            QCOMPARE(all.at(500), -3.0);
+            // Next: to the point after the pass, which takes the value; the lane runs on from there.
+            Param next = lane;
+            const auto [n0, n1] = writeToRange(WriteTo::Next, next, 60, 70, -1, -1);
+            QCOMPARE(n1, FrameTime(100));
+            writeLaneValue(next, 0, n0, n1, -9);
+            QCOMPARE(next.at(80), -9.0);
+            QCOMPARE(next.at(100), -9.0);
+            QCOMPARE(next.at(150), (-9.0 + -30.0) / 2);
+            QCOMPARE(next.at(30), lane.at(30));
+        }
+        // A previewed -4 dB punched over In to Out changes only that range.
+        {
+            Param w = lane;
+            const auto [from, to] = writeToRange(WriteTo::InOut, w, 0, 0, 120, 160);
+            writeLaneValue(w, 0, from, to, -4);
+            for (FrameTime f = 0; f <= 400; ++f)
+                if (f >= 120 && f <= 160) QCOMPARE(w.at(f), -4.0);
+                else QCOMPARE(w.at(f), lane.at(f));
+            // On a lane with no points: the level either side stays.
+            Param still;
+            writeLaneValue(still, -12, 120, 160, -4);
+            QCOMPARE(still.at(119), -12.0);
+            QCOMPARE(still.at(140), -4.0);
+            QCOMPARE(still.at(161), -12.0);
+            // Without In and Out, nothing.
+            QCOMPARE(writeToRange(WriteTo::InOut, w, 0, 0, -1, -1).first, FrameTime(-1));
+            // A switch's points hold.
+            Param mute;
+            writeLaneValue(mute, 0, 10, 20, 1, true);
+            QVERIFY(!laneMuted(mute, false, 9.5) && laneMuted(mute, false, 10) && laneMuted(mute, false, 20.5) && !laneMuted(mute, false, 21));
+        }
+        // A glide from -20 to 0 dB over 2 s is linear in dB, and the lane goes back after it (or holds).
+        {
+            Track g;
+            g.kind = TrackKind::Audio;
+            g.volumeDb = -20;
+            glideLane(g.volumeAuto, g.volumeDb, 30, 90, 0);
+            for (double f = 30; f <= 90; f += 0.25) {
+                const double want = -20 + 20 * (f - 30) / 60;
+                QVERIFY2(std::fabs(trackVolumeAt(g, f) - want) < 0.05, qPrintable(QString("%1: %2").arg(f).arg(trackVolumeAt(g, f))));
+            }
+            QCOMPARE(trackVolumeAt(g, 10), -20.0);
+            QCOMPARE(trackVolumeAt(g, 91), -20.0);
+            glideLane(g.volumeAuto, g.volumeDb, 30, 90, 0, true);
+            QCOMPARE(trackVolumeAt(g, 300), 0.0);
+        }
+
+        // Capture: a snapshot of five tracks pasted 10 s later matches on every parameter.
+        {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.fps = Rational{30, 1};
+            while (s.audioTracks.size() < 5) edit::addTrack(p, s, TrackKind::Audio);
+            Bus fx;
+            fx.id = p.newId();
+            fx.name = "Reverb";
+            s.buses.push_back(fx);
+            for (size_t i = 0; i < 5; ++i) {
+                Track& tr = s.audioTracks[i];
+                tr.volumeAuto.addKey(0, -20 + double(i));
+                tr.volumeAuto.addKey(60, -5 - double(i));
+                tr.panAuto.addKey(10, -0.5);
+                tr.panAuto.addKey(40, 0.25 * double(i));
+                tr.volumeTrim.value = i == 2 ? -1.5 : 0;
+                tr.sends.push_back(Send{fx.id, -10 - double(i), false, false, {}, {}});
+                if (i == 3) {
+                    tr.sends.back().levelAuto.addKey(0, -30);
+                    tr.sends.back().levelAuto.addKey(60, -3);
+                    tr.muteAuto.addKey(0, 0, Interp::Hold);
+                    tr.muteAuto.addKey(15, 1, Interp::Hold);
+                    tr.effects.push_back(makeEffect(p, "parametric_eq"));
+                    tr.effects.back().params["b1_db"].addKey(0, -6);
+                    tr.effects.back().params["b1_db"].addKey(60, 6);
+                }
+            }
+            s.buses[0].volumeAuto.addKey(0, -3);
+            s.buses[0].volumeAuto.addKey(60, 0);
+            std::vector<Id> ids;
+            for (const Track& tr : s.audioTracks) ids.push_back(tr.id);
+            ids.push_back(fx.id);
+            const MixSnapshot snap = captureMix(s, ids, 25);
+            QCOMPARE(snap.strips.size(), size_t(6));
+            QVERIFY(snap.strips[3].values.count("insert:0:parametric_eq:b1_db"));
+            QCOMPARE(snap.strips[3].values.at("mute"), 1.0);
+            {
+                Sequence m = s;
+                m.audioTracks[0].muted = true;  // a static mute is captured as muted
+                QCOMPARE(captureMix(m, {m.audioTracks[0].id}, 25).strips[0].values.at("mute"), 1.0);
+            }
+            const Sequence before = s;
+            QVERIFY(pasteMix(s, snap, 25 + 300, -1) > 0);
+            MixSnapshot later = captureMix(s, ids, 325);
+            later.at = snap.at;
+            QCOMPARE(later, snap);
+            // Before the paste, nothing changed.
+            for (size_t i = 0; i < 5; ++i)
+                for (FrameTime f = 0; f < 325; f += 7) QCOMPARE(s.audioTracks[i].volumeAuto.at(f), before.audioTracks[i].volumeAuto.at(f));
+            // Over a range: the values there, the lanes either side as they were.
+            Sequence r = before;
+            QVERIFY(pasteMix(r, snap, 100, 130) > 0);
+            for (size_t i = 0; i < 5; ++i) {
+                QCOMPARE(r.audioTracks[i].volumeAuto.at(115), snap.strips[i].values.at("volume"));
+                QCOMPARE(r.audioTracks[i].volumeAuto.at(99), before.audioTracks[i].volumeAuto.at(99));
+                QCOMPARE(r.audioTracks[i].volumeAuto.at(131), before.audioTracks[i].volumeAuto.at(131));
+            }
+
+            // Copy and paste: frames 10-40 of A1 onto A2 at 100, as it was; and relative onto A3.
+            const AutomationCopy c = copyAutomation(before, {before.audioTracks[0].id}, 10, 40);
+            QCOMPARE(c.strips.size(), size_t(1));
+            QVERIFY(c.strips[0].count("volume") && c.strips[0].count("pan") && !c.strips[0].count("mute"));
+            Sequence q = before;
+            QVERIFY(pasteAutomation(q, c, {q.audioTracks[1].id}, 100, false) == 2);
+            for (FrameTime k = 0; k <= 30; ++k) {
+                QCOMPARE(q.audioTracks[1].volumeAuto.at(100 + k), before.audioTracks[0].volumeAuto.at(10 + k));
+                QCOMPARE(q.audioTracks[1].panAuto.at(100 + k), before.audioTracks[0].panAuto.at(10 + k));
+            }
+            QCOMPARE(q.audioTracks[1].volumeAuto.at(99), before.audioTracks[1].volumeAuto.at(99));
+            QCOMPARE(q.audioTracks[1].volumeAuto.at(131), before.audioTracks[1].volumeAuto.at(131));
+            const AutomationCopy v = copyAutomation(before, {before.audioTracks[0].id}, 10, 40, {"volume"});
+            QVERIFY(pasteAutomation(q, v, {q.audioTracks[2].id}, 200, true) == 1);
+            for (FrameTime k = 0; k <= 30; ++k) {
+                const double moved = before.audioTracks[0].volumeAuto.at(10 + k) - before.audioTracks[0].volumeAuto.at(10);
+                QVERIFY(std::fabs(q.audioTracks[2].volumeAuto.at(200 + k) - (before.audioTracks[2].volumeAuto.at(200 + k) + moved)) < 1e-9);
+            }
+            // A send's lane goes to a track that feeds the same bus, an insert's to the same effect in the same place.
+            const AutomationCopy sends = copyAutomation(before, {before.audioTracks[3].id}, 0, 60);
+            QVERIFY(sends.strips[0].count("send:" + std::to_string(fx.id)) && sends.strips[0].count("insert:0:parametric_eq:b1_db"));
+            Sequence u = before;
+            QCOMPARE(pasteAutomation(u, sends, {u.audioTracks[4].id}, 0, false), 4);  // volume, pan, mute and the send, not the EQ it lacks
+        }
+    }
+
     void clipMarkers() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();

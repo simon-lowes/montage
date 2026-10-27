@@ -500,12 +500,24 @@ void ControlSurface::button(int note, bool down) {
                 // The selected track's fader automation; its own mode again turns it off.
                 QComboBox* mode = mixer_->trackAutomationMode(selectedTrack());
                 if (!mode || !mode->isEnabled()) break;
-                const AutomationMode want = note == mcu::Read    ? AutomationMode::Read
-                                            : note == mcu::Write ? AutomationMode::Write
-                                            : note == mcu::Touch ? AutomationMode::Touch
-                                            : note == mcu::Latch ? AutomationMode::Latch
-                                                                 : AutomationMode::Off;
-                mode->setCurrentIndex(mode->currentIndex() == int(want) ? int(AutomationMode::Off) : int(want));
+                // In a trim mode, Write, Touch and Latch pick that trim mode (Read and Off leave trimming).
+                const AutomationMode now = AutomationMode(mode->currentIndex());
+                AutomationMode want = note == mcu::Read    ? AutomationMode::Read
+                                      : note == mcu::Write ? AutomationMode::Write
+                                      : note == mcu::Touch ? AutomationMode::Touch
+                                      : note == mcu::Latch ? AutomationMode::Latch
+                                                           : AutomationMode::Off;
+                if (automationTrims(now) && want != AutomationMode::Read && want != AutomationMode::Off) want = trimmed(want);
+                mode->setCurrentIndex(now == want ? int(AutomationMode::Off) : int(want));
+                break;
+            }
+            case mcu::Trim: {
+                // Trim on or off for the selected track's mode (Pro Tools' Trim key): Write, Latch and Touch become
+                // their trim modes and back; Read and Off become Trim Touch.
+                QComboBox* mode = mixer_->trackAutomationMode(selectedTrack());
+                if (!mode || !mode->isEnabled()) break;
+                const AutomationMode now = AutomationMode(mode->currentIndex());
+                mode->setCurrentIndex(int(automationTrims(now) ? untrimmed(now) : trimmed(now)));
                 break;
             }
             default: break;
@@ -634,9 +646,10 @@ void ControlSurface::refresh() {
                                            {mcu::Stop, !playing},
                                            {mcu::Cycle, program_->loop()},
                                            {mcu::Read, am == int(AutomationMode::Read)},
-                                           {mcu::Write, am == int(AutomationMode::Write)},
-                                           {mcu::Touch, am == int(AutomationMode::Touch)},
-                                           {mcu::Latch, am == int(AutomationMode::Latch)},
+                                           {mcu::Write, am >= 0 && untrimmed(AutomationMode(am)) == AutomationMode::Write},
+                                           {mcu::Touch, am >= 0 && untrimmed(AutomationMode(am)) == AutomationMode::Touch},
+                                           {mcu::Latch, am >= 0 && untrimmed(AutomationMode(am)) == AutomationMode::Latch},
+                                           {mcu::Trim, am >= 0 && automationTrims(AutomationMode(am))},
                                            {hui::AutomationOff, am == int(AutomationMode::Off)},
                                            {mcu::SmpteLed, true}};
     for (const auto& [note, on] : lights) {

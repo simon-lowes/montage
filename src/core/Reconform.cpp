@@ -603,8 +603,11 @@ ReconformResult reconformSequence(Project& p, Id sourceId, const CutChanges& cha
         to.surroundYAuto = remapParam(from.surroundYAuto, pieces);
         to.surroundZAuto = remapParam(from.surroundZAuto, pieces);
         to.muteAuto = remapParam(from.muteAuto, pieces);
-        for (size_t k = 0; k < to.sends.size() && k < from.sends.size(); ++k)  // (the copy's sends, in the source's order)
+        to.volumeTrim = remapParam(from.volumeTrim, pieces);
+        for (size_t k = 0; k < to.sends.size() && k < from.sends.size(); ++k) {  // (the copy's sends, in the source's order)
             to.sends[k].levelAuto = remapParam(from.sends[k].levelAuto, pieces);
+            to.sends[k].levelTrim = remapParam(from.sends[k].levelTrim, pieces);
+        }
         remapEffects(to.effects, pieces);
     };
     for (size_t i = 0; i < out.videoTracks.size() && i < source.videoTracks.size(); ++i) rebuild(source.videoTracks[i], out.videoTracks[i]);
@@ -612,7 +615,7 @@ ReconformResult reconformSequence(Project& p, Id sourceId, const CutChanges& cha
     remapEffects(out.masterEffects, pieces);
     for (Bus& b : out.buses) {
         remapEffects(b.effects, pieces);
-        for (Param* lane : {&b.volumeAuto, &b.panAuto, &b.muteAuto}) *lane = remapParam(*lane, pieces);
+        for (Param* lane : {&b.volumeAuto, &b.panAuto, &b.muteAuto, &b.volumeTrim}) *lane = remapParam(*lane, pieces);
     }
 
     // Markers and captions inside the stretches go with them; a range marker that starts in what was taken out begins

@@ -1221,6 +1221,17 @@ private slots:
         // Automation: select a strip, Touch on it, and a pass written while the fader is held.
         surface->handle({0x90, uint8_t(mcu::Select + 5), 0x7F});
         QCOMPARE(surface->selectedTrack(), 5);
+        // The Trim key: Touch becomes Trim Touch (its light on), Write in a trim mode picks Trim Write, Trim again leaves
+        // trimming.
+        sent->clear();
+        surface->handle({0x90, uint8_t(mcu::Trim), 0x7F});
+        QCOMPARE(track(5).automation, int(AutomationMode::TrimTouch));
+        QVERIFY(has(mcu::led(mcu::Trim, 2)));
+        surface->handle({0x90, uint8_t(mcu::Write), 0x7F});
+        QCOMPARE(track(5).automation, int(AutomationMode::TrimWrite));
+        surface->handle({0x90, uint8_t(mcu::Trim), 0x7F});
+        QCOMPARE(track(5).automation, int(AutomationMode::Write));
+        QVERIFY(has(mcu::led(mcu::Trim, 0)));
         surface->handle({0x90, uint8_t(mcu::Touch), 0x7F});
         QCOMPARE(track(5).automation, int(AutomationMode::Touch));
         QVERIFY(has(mcu::led(mcu::Touch, 2)));
@@ -2429,6 +2440,195 @@ private slots:
         QVERIFY(!mixer->recordingAutomation());
         mixer->playbackStopped(30);
         QCOMPARE(a1().volumeAuto.keys.size(), keys);
+    }
+
+    void mixerFilmMixAutomation() {
+        loadDemo();
+        auto* mixer = win_->findChild<MixerPanel*>();
+        QVERIFY(mixer);
+        QTRY_VERIFY(mixer->trackFader(0));
+        QSlider* fader = mixer->trackFader(0);
+        QComboBox* mode = mixer->trackAutomationMode(0);
+        auto a1 = [&]() -> const Track& { return state()->sequence()->audioTracks.at(0); };
+        QCOMPARE(mode->count(), kAutomationModes);
+        QVERIFY(state()->edit("Lane", [](Project&, Sequence& s) {
+            s.audioTracks[0].volumeAuto = Param();
+            s.audioTracks[0].volumeAuto.addKey(0, -10);
+            s.audioTracks[0].volumeAuto.addKey(900, -10);
+            s.inPoint = s.outPoint = -1;
+            return true;
+        }));
+        // A Trim Latch pass: the fader shows the trim (0 dB), moved to -3 dB from frame 20; heard at -13 dB.
+        mode->setCurrentIndex(int(AutomationMode::TrimLatch));
+        QCOMPARE(a1().automation, int(AutomationMode::TrimLatch));
+        state()->setPlayhead(0);
+        QCOMPARE(fader->value(), 0);
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 60; ++f) {
+            if (f == 20) {
+                fader->setSliderDown(true);
+                fader->setValue(-30);
+            }
+            if (f == 25) fader->setSliderDown(false);
+            mixer->playbackPosition(f);
+            if (f == 30) QCOMPARE(trackVolumeAt(mixer->heard().audioTracks.at(0), 30), -13.0);
+        }
+        mixer->playbackStopped(60);
+        QCOMPARE(a1().volumeTrim.at(40), -3.0);
+        QCOMPARE(a1().volumeTrim.at(10), 0.0);
+        QCOMPARE(a1().volumeAuto.at(40), -10.0);  // the volume lane is untouched
+        QCOMPARE(trackVolumeAt(a1(), 40), -13.0);
+        state()->setPlayhead(40);
+        QCOMPARE(fader->value(), -30);  // a trim mode's fader follows the trim
+        // One undo step.
+        state()->undo();
+        QVERIFY(!a1().volumeTrim.animated());
+        state()->redo();
+        QCOMPARE(a1().volumeTrim.at(40), -3.0);
+        // Coalesced: the volume lane takes it, the trim is empty, the sound the same.
+        const Track trimmed = a1();
+        mixer->automationAction("coalesceTrim")->trigger();
+        QVERIFY(!hasTrim(a1()));
+        QCOMPARE(a1().volumeAuto.at(40), -13.0);
+        for (FrameTime f = 0; f <= 120; ++f) QVERIFY(std::fabs(trackVolumeAt(a1(), double(f)) - trackVolumeAt(trimmed, double(f))) < 1e-9);
+        // Coalesce After Each Pass folds a pass's trim in at the stop.
+        mixer->automationAction("coalesceTrimAfterPass")->trigger();
+        QVERIFY(appSettings().value("mixer/coalesceTrim").toBool());
+        mixer->playbackStarted(100);
+        for (FrameTime f = 100; f <= 140; ++f) {
+            if (f == 110) {
+                fader->setSliderDown(true);
+                fader->setValue(-20);
+            }
+            if (f == 112) fader->setSliderDown(false);
+            mixer->playbackPosition(f);
+        }
+        mixer->playbackStopped(140);
+        QVERIFY(!hasTrim(a1()));
+        QCOMPARE(a1().volumeAuto.at(130), -12.0);  // -10 and -2
+        mixer->automationAction("coalesceTrimAfterPass")->trigger();
+        QVERIFY(!appSettings().value("mixer/coalesceTrim").toBool());
+
+        // Preview: the fader moves without writing, and playing writes nothing; Punch Preview writes -4 dB over In to Out.
+        mode->setCurrentIndex(int(AutomationMode::Touch));
+        QVERIFY(state()->edit("In and Out", [](Project&, Sequence& s) {
+            s.inPoint = 300, s.outPoint = 330;
+            return true;
+        }));
+        const Param before = a1().volumeAuto;
+        mixer->automationAction("previewAutomation")->trigger();
+        QVERIFY(mixer->previewing());
+        state()->setPlayhead(310);
+        fader->setValue(-40);
+        QVERIFY(mixer->holdingMoves());
+        QCOMPARE(a1().volumeAuto, before);
+        QCOMPARE(trackVolumeAt(mixer->heard().audioTracks.at(0), 310), -4.0);  // heard as set
+        state()->setPlayhead(320);
+        QCOMPARE(fader->value(), -40);  // held where it was put
+        mixer->playbackStarted(300);
+        QVERIFY(!mixer->recordingAutomation());
+        mixer->playbackStopped(320);
+        mixer->automationAction("punchPreview")->trigger();
+        QVERIFY(!mixer->holdingMoves());
+        for (FrameTime f = 280; f <= 350; ++f) QCOMPARE(a1().volumeAuto.at(f), f >= 300 && f <= 330 ? -4.0 : before.at(f));
+        state()->undo();
+        QCOMPARE(a1().volumeAuto, before);
+        // Glide to Preview: from what is at In to the previewed value at Out.
+        fader->setValue(0);
+        mixer->automationAction("glidePreview")->trigger();
+        QCOMPARE(a1().volumeAuto.at(300), before.at(300));
+        QCOMPARE(a1().volumeAuto.at(330), 0.0);
+        QVERIFY(std::fabs(a1().volumeAuto.at(315) - before.at(300) / 2) < 1e-9);  // halfway, linear in dB
+        state()->undo();
+        // Leaving Preview lets what was held go.
+        fader->setValue(-50);
+        mixer->automationAction("previewAutomation")->trigger();
+        QVERIFY(!mixer->previewing() && !mixer->holdingMoves());
+        QCOMPARE(a1().volumeAuto, before);
+
+        // Write To End, stopped: the fader at the playhead (a Touch track is armed) to the end, nothing before it.
+        state()->setPlayhead(400);
+        fader->setValue(-60);
+        QCOMPARE(a1().volumeAuto.at(400), -6.0);
+        const Param keyed = a1().volumeAuto;
+        mixer->automationAction("writeToEnd")->trigger();
+        for (FrameTime f = 0; f < 400; f += 3) QCOMPARE(a1().volumeAuto.at(f), keyed.at(f));
+        QCOMPARE(a1().volumeAuto.at(899), -6.0);
+        state()->undo();
+        // Write To End during a Latch pass: the value it ends on, as playback stops.
+        mode->setCurrentIndex(int(AutomationMode::Latch));
+        mixer->playbackStarted(500);
+        for (FrameTime f = 500; f <= 530; ++f) {
+            if (f == 510) {
+                fader->setSliderDown(true);
+                fader->setValue(-200);
+            }
+            if (f == 512) fader->setSliderDown(false);
+            if (f == 520) mixer->automationAction("writeToEnd")->trigger();
+            mixer->playbackPosition(f);
+        }
+        mixer->playbackStopped(530);
+        QCOMPARE(a1().volumeAuto.at(515), -20.0);
+        QCOMPARE(a1().volumeAuto.at(900), -20.0);
+        QCOMPARE(a1().volumeAuto.at(505), keyed.at(505));
+        state()->undo();
+
+        // Capture at 40 and paste at 700: every control there as it was at 40.
+        mode->setCurrentIndex(int(AutomationMode::Read));
+        QVERIFY(state()->edit("No In or Out", [](Project&, Sequence& s) {
+            s.inPoint = s.outPoint = -1;
+            return true;
+        }));
+        state()->setPlayhead(40);
+        mixer->automationAction("captureAutomation")->trigger();
+        state()->setPlayhead(700);
+        mixer->automationAction("pasteCapture")->trigger();
+        {
+            MixSnapshot then = captureMix(*state()->sequence(), {}, 40), now = captureMix(*state()->sequence(), {}, 700);
+            now.at = then.at;
+            QCOMPARE(now, then);
+        }
+        state()->undo();
+
+        // Latch primed while stopped: the fader moved before playback is written from the first frame.
+        mixer->automationAction("latchPrime")->trigger();
+        mode->setCurrentIndex(int(AutomationMode::Latch));
+        state()->setPlayhead(600);
+        const Param unprimed = a1().volumeAuto;
+        fader->setValue(-90);
+        QVERIFY(mixer->holdingMoves());
+        QCOMPARE(a1().volumeAuto, unprimed);
+        mixer->playbackStarted(600);
+        QVERIFY(!mixer->holdingMoves());
+        for (FrameTime f = 600; f <= 630; ++f) mixer->playbackPosition(f);
+        mixer->playbackStopped(630);
+        QCOMPARE(a1().volumeAuto.at(600), -9.0);
+        QCOMPARE(a1().volumeAuto.at(630), -9.0);
+        QCOMPARE(a1().volumeAuto.at(590), unprimed.at(590));
+        mixer->automationAction("latchPrime")->trigger();
+        QVERIFY(!appSettings().value("mixer/latchPrime").toBool());
+        state()->undo();
+
+        // Copy In to Out from every track (none armed) and paste it at 800, relative too.
+        mode->setCurrentIndex(int(AutomationMode::Read));
+        QVERIFY(state()->edit("In and Out", [](Project&, Sequence& s) {
+            s.inPoint = 0, s.outPoint = 60;
+            s.audioTracks[0].volumeAuto = Param();
+            s.audioTracks[0].volumeAuto.addKey(0, -20);
+            s.audioTracks[0].volumeAuto.addKey(60, -8);
+            return true;
+        }));
+        const Param source = a1().volumeAuto;
+        QVERIFY(mixer->automationAction("copyAutomation"));
+        mixer->automationAction("copyAutomation")->trigger();
+        state()->setPlayhead(800);
+        mixer->automationAction("pasteAutomation")->trigger();
+        for (FrameTime k = 0; k <= 60; ++k) QCOMPARE(a1().volumeAuto.at(800 + k), source.at(k));
+        state()->undo();
+        mixer->automationAction("pasteAutomationRelative")->trigger();
+        for (FrameTime k = 0; k <= 60; ++k) QVERIFY(std::fabs(a1().volumeAuto.at(800 + k) - (source.at(800 + k) + source.at(k) - source.at(0))) < 1e-9);
+        state()->undo();
+        QCOMPARE(a1().volumeAuto, source);
     }
 
     void mixerSendsAndBusAutomation() {

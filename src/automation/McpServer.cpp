@@ -3426,10 +3426,41 @@ void McpServer::Impl::addTools() {
         "not there yet is made, as an effects return): level_db, pre_fader, muted, level points, or remove. inserts sets "
         "points on the track's insert effects' parameters (an effect's id, a parameter's name as montage_describe lists it, "
         "or param.<id> for a plugin's; on/off and choice parameters hold to the next point). With bus, the named bus's "
-        "mode, volume, pan, mute and inserts are set instead. clear removes the lanes. Lists the automation afterwards.",
+        "mode, volume, pan, mute and inserts are set instead. clear removes the lanes. "
+        "Film-mix tools (lanes named volume, trim, pan, mute, x, y, z, send:<bus>, send-trim:<bus> or "
+        "insert:<index>:<type>:<param>): trim sets trim points (dB added on top of the volume lane, as the trim modes "
+        "write them) and coalesce folds every trim into the volume lanes; write_to writes a value to the start, the end, "
+        "In to Out, all, or the next point (Pro Tools' Write To); glide ramps from the lane's value at from to value at "
+        "to (or over duration); preview punches values over from..to (to the end without to); capture snapshots every "
+        "control of tracks and buses (all without tracks) at a time and pastes it at paste_at (to each lane's next "
+        "point) or over paste_at..paste_to; copy copies from..to of tracks onto to_tracks at a time, replacing or "
+        "relative. Lists the automation afterwards.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"string","default":"A1"},
             "bus":{"type":"string","description":"Automate this bus (by name) instead of a track"},
-            "mode":{"type":"string","enum":["off","read","write","latch","touch"]},
+            "mode":{"type":"string","enum":["off","read","write","latch","touch","trim write","trim latch","trim touch"]},
+            "trim":{"type":"array","items":{"type":"array","items":{"type":["number","string"]},"minItems":2,"maxItems":2},
+                    "description":"[[time, dB], ...] on the fader's trim lane"},
+            "coalesce":{"type":"boolean","description":"Fold the trims into the volume lanes (after the other changes)"},
+            "write_to":{"type":"object","properties":{"lane":{"type":"string","default":"volume"},
+                "target":{"type":"string","enum":["start","end","in_out","all","next"]},
+                "value":{"type":"number","description":"Default: the lane's value at from"},
+                "from":{"type":["number","string"],"description":"Where the pass began (default 0)"},
+                "to":{"type":["number","string"],"description":"Where it ended (default: from)"},
+                "in":{"type":["number","string"]},"out":{"type":["number","string"]}},"required":["target"]},
+            "glide":{"type":"object","properties":{"lane":{"type":"string","default":"volume"},"from":{"type":["number","string"]},
+                "to":{"type":["number","string"]},"duration":{"type":["number","string"]},"value":{"type":"number"},
+                "hold":{"type":"boolean","description":"Stay at value to the end"}},"required":["from","value"]},
+            "preview":{"type":"object","properties":{"values":{"type":"object","description":"{lane: value}"},
+                "from":{"type":["number","string"]},"to":{"type":["number","string"]}},"required":["values","from"]},
+            "capture":{"type":"object","properties":{"at":{"type":["number","string"]},
+                "tracks":{"type":"array","items":{"type":"string"},"description":"Tracks (A1...) and buses by name; default all"},
+                "paste_at":{"type":["number","string"]},"paste_to":{"type":["number","string"]}},"required":["at","paste_at"]},
+            "copy":{"type":"object","properties":{"from":{"type":["number","string"]},"to":{"type":["number","string"]},
+                "tracks":{"type":"array","items":{"type":"string"},"description":"Default: this track or bus"},
+                "to_tracks":{"type":"array","items":{"type":"string"},"description":"Default: the same"},
+                "at":{"type":["number","string"]},"relative":{"type":"boolean","default":false},
+                "lanes":{"type":"array","items":{"type":"string"},"description":"Default: the lanes that move"}},
+                "required":["from","to","at"]},
             "volume":{"type":"array","items":{"type":"array","items":{"type":["number","string"]},"minItems":2,"maxItems":2},
                       "description":"[[time, dB], ...]"},
             "pan":{"type":"array","items":{"type":"array","items":{"type":["number","string"]},"minItems":2,"maxItems":2},
@@ -3450,10 +3481,11 @@ void McpServer::Impl::addTools() {
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
-            const QStringList names{"off", "read", "write", "latch", "touch"};
+            const QStringList names{"off", "read", "write", "latch", "touch", "trim write", "trim latch", "trim touch"};
             auto mode = [&]() {
-                const QString m = str(a, "mode").toLower();
-                if (!names.contains(m)) throw ArgError{QStringLiteral("\"mode\" must be off, read, write, latch or touch")};
+                const QString m = str(a, "mode").toLower().replace(QLatin1Char('_'), QLatin1Char(' '));
+                if (!names.contains(m))
+                    throw ArgError{QStringLiteral("\"mode\" must be off, read, write, latch, touch, trim write, trim latch or trim touch")};
                 return int(names.indexOf(m));
             };
             // (hold: a switch's keys hold to the next; whole: its values are whole numbers, a mute's 0 or 1, a choice's index)
@@ -3485,6 +3517,9 @@ void McpServer::Impl::addTools() {
                 QStringList parts;
                 for (const Keyframe& k : lane.keys) parts << QStringLiteral("%1 %2%3").arg(tc(k.t, s)).arg(k.v, 0, 'f', 2).arg(QString::fromLatin1(unit));
                 return parts.isEmpty() ? QStringLiteral("none") : parts.join(QStringLiteral(", "));
+            };
+            auto describeTrim = [&](const Param& trim) {
+                return trim.animated() ? describe(trim, " dB") : trim.value != 0 ? QStringLiteral("%1 dB").arg(trim.value, 0, 'f', 2) : QStringLiteral("none");
             };
             auto findBus = [&](const QString& name) -> Bus* {
                 for (Bus& b : s.buses)
@@ -3532,28 +3567,142 @@ void McpServer::Impl::addTools() {
                                          .arg(QString::fromStdString(name), describe(lane, ""));
                 return parts.isEmpty() ? QStringLiteral("none") : parts.join(QStringLiteral("; "));
             };
+            // ---- Film-mix tools ----
+            // A lane name as given (send:<bus name>) as core/Automation.h names it (send:<bus id>).
+            auto laneName = [&](QString name) {
+                name = name.trimmed();
+                for (const char* prefix : {"send:", "send-trim:"})
+                    if (name.startsWith(QLatin1String(prefix))) {
+                        Bus* bus = findBus(name.mid(int(qstrlen(prefix))));
+                        if (!bus) throw ArgError{QStringLiteral("No bus called %1").arg(name.mid(int(qstrlen(prefix))))};
+                        return std::string(prefix) + std::to_string(bus->id);
+                    }
+                return name.toStdString();
+            };
+            // Tracks (A1...) and buses (by name) as ids.
+            auto ownerIds = [&](const QJsonArray& list) {
+                std::vector<Id> ids;
+                for (const auto& v : list) {
+                    const QString name = v.toString().trimmed();
+                    if (Bus* b = findBus(name)) {
+                        ids.push_back(b->id);
+                        continue;
+                    }
+                    const TrackRef r = trackArg(name, s, false);
+                    if (r.kind != TrackKind::Audio) throw ArgError{QStringLiteral("%1 is not an audio track or bus").arg(name)};
+                    ids.push_back(s.audioTracks.at(size_t(r.index)).id);
+                }
+                return ids;
+            };
+            QStringList filmMix;  // what the film-mix tools did, listed afterwards
+            // write_to, glide and preview on one track's or bus's lanes; trim points on its trim lane.
+            auto filmMixOn = [&](const std::function<LaneRef(const std::string&)>& laneOf) {
+                auto lane = [&](const QString& name) {
+                    const LaneRef r = laneOf(laneName(name));
+                    if (!r.lane) throw ArgError{QStringLiteral("No lane %1 here").arg(name)};
+                    return r;
+                };
+                if (a.contains("trim")) {
+                    const LaneRef r = lane(QStringLiteral("trim"));
+                    points(a.value("trim").toArray(), QStringLiteral("trim"), *r.lane, -96, 24, false);
+                }
+                if (a.contains("write_to")) {
+                    const QJsonObject o = a.value("write_to").toObject();
+                    const QStringList targets{"start", "end", "in_out", "all", "next"};
+                    const int target = int(targets.indexOf(o.value("target").toString().toLower()));
+                    if (target < 0) throw ArgError{QStringLiteral("\"target\" must be start, end, in_out, all or next")};
+                    const LaneRef r = lane(o.value("lane").toString(QStringLiteral("volume")));
+                    const FrameTime from = o.contains("from") ? timeArg(o.value("from"), s, "from") : 0;
+                    const FrameTime to = o.contains("to") ? timeArg(o.value("to"), s, "to") : from;
+                    const FrameTime in = o.contains("in") ? timeArg(o.value("in"), s, "in") : s.inPoint;
+                    const FrameTime out = o.contains("out") ? timeArg(o.value("out"), s, "out") : s.outPoint;
+                    if (WriteTo(target) == WriteTo::InOut && (in < 0 || out < in)) throw ArgError{QStringLiteral("in_out needs In and Out")};
+                    const double value = std::clamp(o.contains("value") ? o.value("value").toDouble() : r.at(from), r.lo, r.hi);
+                    const auto [x, y] = writeToRange(WriteTo(target), *r.lane, from, to, in, out);
+                    writeLaneValue(*r.lane, *r.still, x, y, value, r.hold);
+                    filmMix << QStringLiteral("Wrote %1 from %2 to %3").arg(value).arg(tc(x, s), y < 0 ? QStringLiteral("the end") : tc(y, s));
+                }
+                if (a.contains("glide")) {
+                    const QJsonObject o = a.value("glide").toObject();
+                    const LaneRef r = lane(o.value("lane").toString(QStringLiteral("volume")));
+                    if (r.hold) throw ArgError{QStringLiteral("A switch cannot glide")};
+                    const FrameTime from = timeArg(o.value("from"), s, "from");
+                    FrameTime to = from + FrameTime(std::lround(s.fpsValue()));
+                    if (o.contains("to")) to = timeArg(o.value("to"), s, "to");
+                    else if (o.contains("duration")) to = from + timeArg(o.value("duration"), s, "duration");
+                    if (to <= from) throw ArgError{QStringLiteral("A glide ends after it starts")};
+                    const double value = std::clamp(o.value("value").toDouble(), r.lo, r.hi);
+                    glideLane(*r.lane, *r.still, from, to, value, o.value("hold").toBool());
+                    filmMix << QStringLiteral("Glided to %1 from %2 to %3").arg(value).arg(tc(from, s), tc(to, s));
+                }
+                if (a.contains("preview")) {
+                    const QJsonObject o = a.value("preview").toObject();
+                    const FrameTime from = timeArg(o.value("from"), s, "from");
+                    const FrameTime to = o.contains("to") ? timeArg(o.value("to"), s, "to") : -1;
+                    const QJsonObject values = o.value("values").toObject();
+                    for (auto it = values.begin(); it != values.end(); ++it) {
+                        const LaneRef r = lane(it.key());
+                        writeLaneValue(*r.lane, *r.still, from, to, std::clamp(it.value().toDouble(), r.lo, r.hi), r.hold);
+                    }
+                    filmMix << QStringLiteral("Punched %1 previewed value(s)").arg(values.size());
+                }
+            };
+            // capture, copy and coalesce, over the sequence (after the track's or bus's own changes).
+            auto filmMixAll = [&](Id self) {
+                if (a.contains("capture")) {
+                    const QJsonObject o = a.value("capture").toObject();
+                    const MixSnapshot snap = captureMix(s, ownerIds(o.value("tracks").toArray()), timeArg(o.value("at"), s, "at"));
+                    const FrameTime from = timeArg(o.value("paste_at"), s, "paste_at");
+                    const FrameTime to = o.contains("paste_to") ? timeArg(o.value("paste_to"), s, "paste_to") : from - 1;
+                    filmMix << QStringLiteral("Captured %1 strip(s) at %2; pasted on %3 lane(s)")
+                                   .arg(snap.strips.size()).arg(tc(snap.at, s)).arg(pasteMix(s, snap, from, to));
+                }
+                if (a.contains("copy")) {
+                    const QJsonObject o = a.value("copy").toObject();
+                    std::vector<Id> from = o.contains("tracks") ? ownerIds(o.value("tracks").toArray()) : std::vector<Id>{self};
+                    std::vector<Id> onto = o.contains("to_tracks") ? ownerIds(o.value("to_tracks").toArray()) : from;
+                    std::vector<std::string> lanes;
+                    for (const auto& v : o.value("lanes").toArray()) lanes.push_back(laneName(v.toString()));
+                    const AutomationCopy c = copyAutomation(s, from, timeArg(o.value("from"), s, "from"), timeArg(o.value("to"), s, "to"), lanes);
+                    const int n = pasteAutomation(s, c, onto, timeArg(o.value("at"), s, "at"), o.value("relative").toBool());
+                    filmMix << QStringLiteral("Pasted %1 lane(s)").arg(n);
+                }
+                if (a.value("coalesce").toBool()) {
+                    int n = 0;
+                    for (Track& t : s.audioTracks) n += coalesceTrim(t) ? 1 : 0;
+                    for (Bus& b : s.buses) n += coalesceTrim(b) ? 1 : 0;
+                    filmMix << QStringLiteral("Coalesced the trims of %1 track(s) and bus(es)").arg(n);
+                }
+            };
+            auto filmMixText = [&] { return filmMix.isEmpty() ? QString() : QStringLiteral("\n") + filmMix.join(QStringLiteral("\n")); };
             if (a.contains("bus")) {
                 Bus* b = findBus(str(a, "bus"));
                 if (!b) throw ArgError{QStringLiteral("No bus called %1").arg(str(a, "bus"))};
-                if (a.value("clear").toBool()) b->volumeAuto = Param(), b->panAuto = Param(), b->muteAuto = Param();
+                if (a.value("clear").toBool()) b->volumeAuto = Param(), b->panAuto = Param(), b->muteAuto = Param(), b->volumeTrim = Param();
                 if (a.contains("mode")) b->automation = mode();
                 points(a.value("volume").toArray(), QStringLiteral("volume"), b->volumeAuto, -96, 12, false);
                 points(a.value("pan").toArray(), QStringLiteral("pan"), b->panAuto, -1, 1, false);
                 points(a.value("mute").toArray(), QStringLiteral("mute"), b->muteAuto, 0, 1, true);
                 insertPoints(b->effects);
+                const Id busId = b->id;
+                filmMixOn([&](const std::string& name) { return busLane(*b, name); });
+                filmMixAll(busId);
+                b = nullptr;
+                for (Bus& x : s.buses)
+                    if (x.id == busId) b = &x;
                 save(l);
-                return ok(QStringLiteral("Bus %1: %2 automation\nVolume: %3\nPan: %4\nMute: %5\nInserts: %6")
+                return ok(QStringLiteral("Bus %1: %2 automation\nVolume: %3\nTrim: %4\nPan: %5\nMute: %6\nInserts: %7%8")
                               .arg(QString::fromStdString(b->name), QString::fromLatin1(automationModeName(busAutomation(*b))),
-                                   describe(b->volumeAuto, " dB"), describe(b->panAuto, ""), describe(b->muteAuto, ""),
-                                   describeInserts(b->effects)));
+                                   describe(b->volumeAuto, " dB"), describeTrim(b->volumeTrim), describe(b->panAuto, ""),
+                                   describe(b->muteAuto, ""), describeInserts(b->effects), filmMixText()));
             }
             const TrackRef ref = trackArg(str(a, "track", "A1"), s, false);
             if (ref.kind != TrackKind::Audio) throw ArgError{QStringLiteral("Automation is for audio tracks (A1, A2...)")};
             const int ti = ref.index;
             if (a.value("clear").toBool()) {
                 Track& t = s.audioTracks.at(size_t(ti));
-                t.volumeAuto = Param(), t.panAuto = Param(), t.muteAuto = Param();
-                for (Send& sd : t.sends) sd.levelAuto = Param();
+                t.volumeAuto = Param(), t.panAuto = Param(), t.muteAuto = Param(), t.volumeTrim = Param();
+                for (Send& sd : t.sends) sd.levelAuto = Param(), sd.levelTrim = Param();
             }
             if (a.contains("mode")) s.audioTracks.at(size_t(ti)).automation = mode();
             for (const auto& v : a.value("sends").toArray()) {
@@ -3590,6 +3739,8 @@ void McpServer::Impl::addTools() {
             points(a.value("pan").toArray(), QStringLiteral("pan"), t.panAuto, -1, 1, false);
             points(a.value("mute").toArray(), QStringLiteral("mute"), t.muteAuto, 0, 1, true);
             insertPoints(t.effects);
+            filmMixOn([&](const std::string& name) { return trackLane(t, name); });
+            filmMixAll(t.id);
             save(l);
             QStringList sendText;
             for (const Send& sd : t.sends) {
@@ -3600,10 +3751,11 @@ void McpServer::Impl::addTools() {
                                 .arg(sd.preFader ? QStringLiteral(" pre-fader") : QString(), sd.muted ? QStringLiteral(" (muted)") : QString(),
                                      sd.levelAuto.animated() ? QStringLiteral(", level: ") + describe(sd.levelAuto, " dB") : QString());
             }
-            return ok(QStringLiteral("%1: %2 automation\nVolume: %3\nPan: %4\nMute: %5\nSends: %6\nInserts: %7")
+            return ok(QStringLiteral("%1: %2 automation\nVolume: %3\nTrim: %4\nPan: %5\nMute: %6\nSends: %7\nInserts: %8%9")
                           .arg(str(a, "track", "A1"), QString::fromLatin1(automationModeName(trackAutomation(t))), describe(t.volumeAuto, " dB"),
-                               describe(t.panAuto, ""), describe(t.muteAuto, ""),
-                               sendText.isEmpty() ? QStringLiteral("none") : sendText.join(QStringLiteral("; ")), describeInserts(t.effects)));
+                               describeTrim(t.volumeTrim), describe(t.panAuto, ""), describe(t.muteAuto, ""),
+                               sendText.isEmpty() ? QStringLiteral("none") : sendText.join(QStringLiteral("; ")), describeInserts(t.effects),
+                               filmMixText()));
         });
 
     add("montage_export_lut", "Export a clip's grade as a LUT",

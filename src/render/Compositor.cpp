@@ -4184,8 +4184,8 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         }
         float tg = dbToLin(track.volumeDb), tl, tr;
         // Fader automation (core/Automation.h): the gain ramps smoothly between frames; pan steps every 64 samples.
-        const bool readsLanes = trackAutomation(track) != AutomationMode::Off && trackAutomation(track) != AutomationMode::Write;
-        const bool volumeAuto = readsLanes && track.volumeAuto.animated(), panAuto = readsLanes && track.panAuto.animated();
+        const bool readsLanes = automationReads(trackAutomation(track));
+        const bool volumeAuto = trackVolumeAnimated(track), panAuto = readsLanes && track.panAuto.animated();  // (a trim too)
         const int64_t heard = start + downstream;  // the timeline sample the fader acts on now
         // Mute automation: off and on again over 64 samples, the field too (heard where the master is fed from).
         if (readsLanes && track.muteAuto.animated()) {
@@ -4204,7 +4204,7 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         auto addSend = [&](const float* src, const Send& sd) {
             float* dest = sendDest(sd);
             if (!dest) return;
-            const bool lane = readsLanes && sd.levelAuto.animated();
+            const bool lane = sendLevelAnimated(track, sd);
             const float still = dbToLin(sd.levelDb);
             float g0 = lane ? dbToLin(sendLevelAt(track, sd, double(heard) * fps / sr)) : still;
             for (int i = 0; i < frames; i += 64) {
@@ -4340,10 +4340,10 @@ void AudioMixer::mixInto(const Project& p, const Sequence& seq, int64_t start, i
         // Its automation (core/Automation.h), heard where the master is fed from: mute and fader glide every 64
         // samples, pan steps.
         const AutomationMode bm = busAutomation(b);
-        const bool busReads = bm == AutomationMode::Read || bm == AutomationMode::Latch || bm == AutomationMode::Touch;
+        const bool busReads = automationReads(bm);
         const int64_t busHeard = start + masterLat;
         auto bf = busFields.find(b.id);
-        if (busReads && (b.muteAuto.animated() || b.volumeAuto.animated())) {
+        if (busReads && (b.muteAuto.animated() || busVolumeAnimated(b))) {
             auto gainAt = [&](int64_t at) {
                 const double f = double(at) * fps / sr;
                 return laneMuted(b.muteAuto, false, f) ? 0.0f : dbToLin(busVolumeAt(b, f));

@@ -15,6 +15,7 @@
 #include "core/Automation.h"
 #include "core/Model.h"
 
+class QAction;
 class QDial;
 class QHBoxLayout;
 class QComboBox;
@@ -41,11 +42,14 @@ public:
     // the Inspector or a plugin's editor) are written too: Touch while moved, Latch and Write from the first move to the
     // stop. While the pass records, what it plays goes out as liveMix() (laid over the sound, the project unchanged), so
     // other edits made meanwhile are kept; at the stop the lanes written are laid over the project as it is then.
+    // Tracks and buses in a trim mode write their faders' (and sends') trim lanes instead of the volume lanes, each
+    // fader then showing its trim; with "Coalesce Trim After Each Pass" set the trim is folded in at the stop.
     void playbackStarted(FrameTime t);
     void playbackPosition(FrameTime t);
     void playbackStopped(FrameTime t);
     bool recordingAutomation() const { return !recording_.empty() || !lanes_.empty(); }
-    // The active sequence as the pass plays it (its live values laid over); the sequence itself outside a pass.
+    // The active sequence as the pass plays it (its live values laid over), or with the values held in Preview; the
+    // sequence itself otherwise.
     Sequence heard() const;
     // Aux sends, as a track strip's "+ Send" menu: to an existing bus, or to a new effects return (its id).
     void addSend(int track, Id bus);
@@ -78,6 +82,31 @@ public:
     // step, not one per message); empty, each track's control merges its own moves.
     void setEditMergeKey(const QString& key) { mergeKey_ = key; }
     int trackStrips() const { return int(strips_.size()); }
+    // Film-mix automation (the Automation menu, automationMenu()). Preview: faders, pans and send levels move without
+    // writing anything (heard as set), and playing writes no pass; punchPreview() writes what they were set to over In
+    // to Out (from the playhead to the end without them), glidePreview() glides there from what was at In to the
+    // value at Out (a second from the playhead without them). With "Prime Latch While Stopped" a Latch track's control
+    // moved while stopped is held the same way and written from the first frame played. capture() snapshots every
+    // control at the playhead, pasteCapture() writes it over In to Out (or from the playhead to each lane's next
+    // point). writeTo(): during a pass, the value each written lane ends on is written to the target as the pass
+    // stops; stopped, the armed tracks' and buses' faders (trims in a trim mode) and pans at the playhead are, or the
+    // values held in Preview. copyAutomation() takes In to Out (the whole sequence without them) from the armed tracks
+    // and buses, every one when none is armed; pasteAutomation() puts it at the playhead on the armed ones (the same
+    // ones when none is). coalesceTrim() folds every trim in. Each is one undo step. (Armed: in a writing mode.)
+    QToolButton* automationMenu() const { return automationMenu_; }
+    QAction* automationAction(const QString& objectName) const;
+    bool previewing() const { return previewing_; }
+    void setPreviewing(bool on);
+    bool punchPreview();
+    bool glidePreview();
+    void capture();
+    bool pasteCapture();
+    bool writeTo(WriteTo target);
+    bool copyAutomation();
+    bool pasteAutomation(bool relative);
+    bool coalesceTrim();
+    bool holdingMoves() const { return !held_.empty(); }
+
     // The monitoring section whose solo mode the solo buttons follow: in place, after or before the fader, they solo
     // in what is heard (PlaybackController::monitoring) and leave the project's solos alone.
     void setMonitor(PlaybackController* monitor);
@@ -155,6 +184,7 @@ private:
     QWidget* makeMasterStrip();
     void inspect(Id owner);
     void addBus();
+    void makeAutomationMenu(QWidget* parent);
 
     void setVolume(int index, double db);
     void setPan(int index, double pan);
@@ -203,7 +233,7 @@ private:
     QLabel* emptyLabel_ = nullptr;
     struct Recording {
         int track = 0;
-        AutomationMode mode = AutomationMode::Read;
+        AutomationMode mode = AutomationMode::Read;  // (its fader writes the trim lane in a trim mode)
         AutomationRecorder volume, pan;
         double volumeDb = 0, panValue = 0;  // the fader and pan before
         Param volumeLane, panLane;          // the lanes before
@@ -255,6 +285,31 @@ private:
     std::map<QString, InsertMove> insertMoves_;
     // Moves since the last frame, played at once rather than at the next frame.
     std::map<QString, std::pair<std::function<void(Sequence&, double)>, double>> pendingLive_;
+
+    // Moves held without writing (Preview, and Latch primed while stopped): a lane (core/Automation.h's names) of a
+    // track or bus, by "<owner>/<lane>".
+    struct HeldMove {
+        Id owner = 0;
+        std::string lane;
+        double value = 0;
+    };
+    std::map<QString, HeldMove> held_;
+    Id heldSequence_ = 0;          // the sequence they were held on
+    uint64_t heldGeneration_ = 0;  // (EditorState::projectGeneration)
+    bool previewing_ = false;
+    // Holds a control's move instead of editing (previewing, or a Latch control primed while stopped): true if held.
+    bool holdMove(Id owner, AutomationMode mode, const std::string& lane, double value);
+    std::function<void(Sequence&)> heldOverlay() const;
+    void showHeld();      // the held values back on their controls (after a refresh or the playhead moved)
+    void releaseHeld();   // forgets them, the controls showing the project again
+    // In to Out, or from the playhead `fallback` frames on (-1: to the end) without them.
+    std::pair<FrameTime, FrameTime> markedRange(FrameTime fallback) const;
+    std::vector<Id> armedOwners() const;  // tracks and buses in a writing mode
+    std::optional<WriteTo> writeTo_;      // pressed during a pass: applied at its stop
+    std::optional<MixSnapshot> capture_;
+    std::optional<AutomationCopy> copy_;
+    std::vector<Id> copyOwners_;
+    QToolButton* automationMenu_ = nullptr;
 };
 
 }  // namespace montage
