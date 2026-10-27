@@ -69,6 +69,7 @@ const char* qcKindName(QcKind k) {
         case QcKind::Inverted: return "Channel inverted";
         case QcKind::DcOffset: return "DC offset";
         case QcKind::Uncaptioned: return "Sound without a caption";
+        case QcKind::CinemaLoudness: return "Leq(M)";
     }
     return "";
 }
@@ -160,7 +161,7 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
     const FrameTime frames = out - in;
     const bool picture = q.flashing || q.levels || q.blackSeconds > 0 || q.freezeSeconds > 0;
     const bool sound = q.silenceSeconds > 0 || q.clipping || q.loudnessTarget != 0 || q.intelligibility > 0 || q.phase || q.dcOffsetDb != 0 ||
-                       q.uncaptionedSeconds > 0;
+                       q.uncaptionedSeconds > 0 || q.leqmLimit > 0;
     const double pictureShare = picture ? (sound ? 0.8 : 1.0) : 0.0;
 
     if (picture) {
@@ -424,6 +425,18 @@ std::vector<QcIssue> qualityCheck(const Project& p, const Sequence& s, FrameTime
                 issues.push_back({QcKind::Loudness, in, out, (r.valid ? measured : std::string("Too quiet to measure")) + "; " + target});
             if (r.valid && r.truePeakDb > q.peakCeiling + 0.05)
                 issues.push_back({QcKind::TruePeak, in, out, fmt("True peak %.1f dBTP; the ceiling is %.1f dBTP", r.truePeakDb, q.peakCeiling)});
+        }
+        if (q.leqmLimit > 0) {
+            DialogueLoudnessOptions o;
+            o.in = in;
+            o.out = out;
+            o.layout = true;
+            o.leqm = true;
+            o.gate = SpeechGate::Transcripts;  // (only the Leq(M) is wanted: no listening, no stem)
+            const DialogueLoudness d = measureDialogueLoudness(p, s, o, {}, cancel);
+            if (cancel && cancel->load()) return {};
+            if (d.leqm > q.leqmLimit + 0.05)
+                issues.push_back({QcKind::CinemaLoudness, in, out, fmt("Leq(M) %.1f; the limit is %.0f", d.leqm, q.leqmLimit)});
         }
         // Dialogue the music and effects make hard to follow (render/Intelligibility.h); nothing when there is no
         // dialogue to measure.

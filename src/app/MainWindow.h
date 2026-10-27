@@ -31,6 +31,7 @@
 #include "render/Versions.h"
 #include "render/RemoteReview.h"
 #include "render/Intelligibility.h"
+#include "render/LoudnessReport.h"
 
 class QAction;
 class QActionGroup;
@@ -190,6 +191,11 @@ public:
     // Intelligibility.h), shown in the timeline's intelligibility lane and, at the playhead, the meters' INT readout.
     // The average, or -1 when it could not be measured.
     double analyseIntelligibility(const QString& preset);
+    // Sequence › Loudness Report: the active sequence's sound in its own channels measured against `spec` (render/
+    // LoudnessReport.h: integrated and dialogue loudness, ranges, true peak, Leq(M), the readings every 100 ms), shown
+    // in the timeline's loudness lane (green, amber over the target, red over the ceiling) and, with `base`, written
+    // as base.pdf and base.csv. Whether it was measured.
+    bool loudnessReport(const LoudnessReportSpec& spec, const QString& base = {});
     // Clip › Import Embedded Captions: the CEA-608 captions inside the selected video clip's file (else the clip under
     // the playhead on the target video track) as a new caption track where the clip plays them. How many captions.
     int importEmbeddedCaptions();
@@ -639,6 +645,14 @@ private:
     };
     std::map<Id, IntelligibilityRun> intelligibility_;
     void showIntelligibility();
+    // Each sequence's last loudness report, the same way.
+    struct LoudnessRun {
+        DialogueLoudness result;
+        LoudnessReportSpec spec;
+        uint64_t revision = 0, generation = 0;
+    };
+    std::map<Id, LoudnessRun> loudnessRuns_;
+    void showLoudnessLane();
     std::vector<QDockWidget*> docks_;
     QDockWidget* sourceDock_ = nullptr;
     QDockWidget* programDock_ = nullptr;

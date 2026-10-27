@@ -5,7 +5,8 @@
 //    screen, more than three flashes in any second;
 //  - picture levels outside EBU R103 (RGB -5 % to 105 %, luma -1 % to 103 %) on more than 1 % of the picture;
 //  - black and frozen picture, silence and clipped sound held too long;
-//  - integrated loudness (or the dialogue's) away from the target and true peaks over the ceiling;
+//  - integrated loudness (or the dialogue's) away from the target and true peaks over the ceiling; Leq(M) over a
+//    cinema limit (ISO 21727: 85 for trailers, 82 for advertising);
 //  - spelling in captions (in each track's language) and titles (core/SpellCheck.h), the project's vocabulary allowed;
 //  - linked clips out of sync with their picture (core/EditOps.h syncOffsets);
 //  - dialogue the music and effects make hard to follow (render/Intelligibility.h);
@@ -36,6 +37,9 @@ struct QcSettings {
     // The loudness of the dialogue, as Netflix asks for it (render/DialogueLoudness.h; the programme's where speech is
     // under 15 % of the sound), not of everything.
     bool dialogueGated = false;
+    // Leq(M) (media/Loudness.h LeqMMeter, in the sequence's channels with cinema calibration) over this; 0 = not
+    // checked. 85 is the trailer limit (TASA), 82 the advertising one (SAWA).
+    double leqmLimit = 0;
     int analysisWidth = 160;        // the picture is checked at this width
     bool spelling = true;           // captions and titles
     std::string titleLanguage = "en-US";  // the dictionary titles are checked with
@@ -54,7 +58,7 @@ struct QcSettings {
     double uncaptionedSeconds = 0;
 };
 
-enum class QcKind { Flashing, RedFlashing, Levels, Black, Freeze, Silence, Clipping, Loudness, TruePeak, Spelling, OutOfSync, Intelligibility, Phase, Inverted, DcOffset, Uncaptioned };
+enum class QcKind { Flashing, RedFlashing, Levels, Black, Freeze, Silence, Clipping, Loudness, TruePeak, Spelling, OutOfSync, Intelligibility, Phase, Inverted, DcOffset, Uncaptioned, CinemaLoudness };
 
 struct QcIssue {
     QcKind kind = QcKind::Flashing;

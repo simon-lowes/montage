@@ -244,6 +244,8 @@
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
 #include "render/QualityCheck.h"
+#include "render/LoudnessReport.h"
+#include "render/Dcp.h"
 #include "render/SdhDraft.h"
 #include "render/DialogueLoudness.h"
 #include "render/ProjectManager.h"
@@ -10436,6 +10438,313 @@ private slots:
         r.reset();
         QCOMPARE(r.seconds(), 0.0);
         QVERIFY(r.momentary() <= -70);
+    }
+
+    void cinemaLoudness() {
+        const int rate = 48000;
+        auto sine = [&](double hz, double amp, double seconds, int channels = 1, int on = 0) {
+            std::vector<float> v(size_t(rate * seconds) * size_t(channels), 0.0f);
+            for (size_t i = 0; i < v.size() / size_t(channels); ++i)
+                v[i * size_t(channels) + size_t(on)] = float(amp * std::sin(2 * M_PI * hz * double(i) / rate));
+            return v;
+        };
+        auto leqm = [&](const std::vector<float>& v, int channels = 1, const double* gains = nullptr) {
+            LeqMMeter m(rate, channels, gains);
+            m.add(v.data(), int64_t(v.size()) / channels);
+            return m.leqm();
+        };
+        // The M weighting: 0 dB at 2 kHz, ISO 21727's table elsewhere (ITU-R 468 lowered 5.6 dB).
+        QVERIFY(std::fabs(LeqMMeter::weightingDb(2000)) < 0.05);
+        QVERIFY(std::fabs(LeqMMeter::weightingDb(1000) + 5.6) < 0.1);
+        QVERIFY(std::fabs(LeqMMeter::weightingDb(6300) - 6.6) < 0.1);
+        QVERIFY(std::fabs(LeqMMeter::weightingDb(100) + 25.4) < 0.2);
+        // A 2 kHz sine peaking at -20 dBFS reads 85 (the cinema's reference); the scale is the sine's energy + 108.01.
+        const double at2k = leqm(sine(2000, 0.1, 10));
+        QVERIFY2(std::fabs(at2k - 85.0) < 0.05, qPrintable(QString::number(at2k)));
+        // Tones at 1 kHz and 6.3 kHz at the same level differ by the weighting's difference (12.2 dB).
+        const double at1k = leqm(sine(1000, 0.1, 10)), at6k = leqm(sine(6300, 0.1, 10));
+        const double want = LeqMMeter::weightingDb(6300) - LeqMMeter::weightingDb(1000);
+        QVERIFY2(std::fabs((at6k - at1k) - want) < 0.1, qPrintable(QString("%1 vs %2").arg(at6k - at1k).arg(want)));
+        QVERIFY(std::fabs(at1k - (85.0 + LeqMMeter::weightingDb(1000))) < 0.1);
+        // Fed in uneven pieces, the same; shorter than the filter (a fifth of a second), the same level.
+        {
+            const auto v = sine(2000, 0.1, 10);
+            LeqMMeter m(rate, 1);
+            size_t at = 0;
+            for (size_t piece : {1u, 777u, 20000u, 3u, 123456u}) {
+                m.add(v.data() + at, int64_t(piece));
+                at += piece;
+            }
+            m.add(v.data() + at, int64_t(v.size() - at));
+            QVERIFY2(std::fabs(m.leqm() - at2k) < 1e-6, qPrintable(QString::number(m.leqm() - at2k)));
+            QVERIFY(std::fabs(m.seconds() - 10) < 1e-9);
+            QVERIFY(std::fabs(leqm(sine(2000, 0.1, 0.2)) - 85.0) < 0.1);
+        }
+        // Channels add as energy: the same tone in two channels is 3 dB up; a surround at the cinema's -3 dB adds half.
+        {
+            std::vector<float> two = sine(2000, 0.1, 5, 2, 0);
+            for (size_t i = 0; i < two.size(); i += 2) two[i + 1] = two[i];
+            QVERIFY(std::fabs(leqm(two, 2) - (at2k + 3.0103)) < 0.05);
+            const double gains[2] = {1.0, std::pow(10.0, -3.0 / 20)};
+            QVERIFY(std::fabs(leqm(two, 2, gains) - (at2k + 10 * std::log10(1.5))) < 0.05);
+        }
+        QCOMPARE(leqm(std::vector<float>(size_t(rate), 0.0f)), 0.0);
+
+        // Speech (JFK) and pink noise, as leqm-nrt reads them when it is at hand (MONTAGE_TEST_LEQM). Its own filter is a
+        // fifth-order fit to the M curve that runs up to 0.4 dB under it around 1 kHz: pink noise agrees within
+        // 0.1 dB, speech within 0.5.
+        std::string err;
+        AudioBufferPtr jfk = decodeAudio(MONTAGE_TEST_DATA_DIR "/jfk.wav", rate, &err);
+        QVERIFY2(jfk, err.c_str());
+        std::vector<float> pink(size_t(rate) * 20);
+        {
+            // (Voss-McCartney: 16 rows of white noise, each held twice as long as the last)
+            std::mt19937 gen(7);
+            std::uniform_real_distribution<float> u(-1, 1);
+            std::array<float, 16> rows{};
+            float sum = 0;
+            for (size_t i = 0; i < pink.size(); ++i) {
+                for (size_t r = 0; r < rows.size(); ++r)
+                    if (i % (size_t(1) << r) == 0) {
+                        sum -= rows[r];
+                        rows[r] = u(gen);
+                        sum += rows[r];
+                    }
+                pink[i] = sum + u(gen);
+            }
+            double ss = 0;
+            for (float v : pink) ss += double(v) * v;
+            const float g = float(0.1 / std::sqrt(ss / double(pink.size())));  // -20 dBFS RMS
+            for (float& v : pink) v *= g;
+        }
+        const QByteArray leqmNrt = qgetenv("MONTAGE_TEST_LEQM");
+        if (leqmNrt.isEmpty()) return;
+        auto writeFloatWav = [](const std::string& file, const std::vector<float>& v, int channels, int r) {
+            QFile f(QString::fromStdString(file));
+            if (!f.open(QIODevice::WriteOnly)) return false;
+            QDataStream out(&f);
+            out.setByteOrder(QDataStream::LittleEndian);
+            const quint32 bytes = quint32(v.size() * 4);
+            f.write("RIFF");
+            out << quint32(36 + bytes);
+            f.write("WAVEfmt ");
+            out << quint32(16) << quint16(3) << quint16(channels) << quint32(r) << quint32(r * channels * 4) << quint16(channels * 4) << quint16(32);
+            f.write("data");
+            out << bytes;
+            f.write(reinterpret_cast<const char*>(v.data()), qint64(bytes));
+            return true;
+        };
+        auto theirs = [&](const std::vector<float>& v, int channels) {
+            const std::string file = path(("leqm-" + std::to_string(v.size()) + "-" + std::to_string(channels) + ".wav").c_str());
+            if (!writeFloatWav(file, v, channels, rate)) return -1.0;
+            QProcess run;
+            run.start(QString::fromLocal8Bit(leqmNrt), {QString::fromStdString(file)});
+            if (!run.waitForFinished(120000)) return -1.0;
+            const QString said = QString::fromLocal8Bit(run.readAllStandardOutput());
+            const QRegularExpressionMatch m = QRegularExpression("Leq\\(M\\):\\s*([0-9.]+)").match(said);
+            return m.hasMatch() ? m.captured(1).toDouble() : -1.0;
+        };
+        const double pinkTheirs = theirs(pink, 1);
+        QVERIFY2(std::fabs(leqm(pink) - pinkTheirs) < 0.1, qPrintable(QString("%1 vs %2").arg(leqm(pink)).arg(pinkTheirs)));
+        const double speechTheirs = theirs(jfk->samples, 2), speechOurs = leqm(jfk->samples, 2);
+        QVERIFY2(std::fabs(speechOurs - speechTheirs) < 0.5, qPrintable(QString("%1 vs %2").arg(speechOurs).arg(speechTheirs)));
+        // In 5.1, with leqm-nrt's calibration (surrounds 3 dB down): speech in the centre, pink noise in the surrounds.
+        std::vector<float> mix(size_t(jfk->frames()) * 6, 0.0f);
+        for (int64_t i = 0; i < jfk->frames(); ++i) {
+            mix[size_t(i) * 6 + 2] = jfk->samples[size_t(i) * 2];
+            mix[size_t(i) * 6 + 4] = mix[size_t(i) * 6 + 5] = 0.5f * pink[size_t(i) % pink.size()];
+        }
+        const double surround[6] = {1, 1, 1, 1, std::pow(10.0, -3.0 / 20), std::pow(10.0, -3.0 / 20)};
+        const double mixTheirs = theirs(mix, 6), mixOurs = leqm(mix, 6, surround);
+        QVERIFY2(std::fabs(mixOurs - mixTheirs) < 0.5, qPrintable(QString("%1 vs %2").arg(mixOurs).arg(mixTheirs)));
+    }
+
+    void cinemaLoudnessDelivery() {
+        const int rate = 48000;
+        // EBU Tech 3341's first two signals: a stereo 1 kHz sine at -23 and at -33 dBFS reads that in momentary and
+        // short-term loudness (within 0.1 LU) once the windows are full.
+        for (const double level : {-23.0, -33.0}) {
+            const float amp = float(std::pow(10.0, level / 20));
+            std::vector<float> v(size_t(rate) * 20 * 2);
+            for (size_t i = 0; i < v.size() / 2; ++i) v[i * 2] = v[i * 2 + 1] = amp * float(std::sin(2 * M_PI * 1000 * double(i) / rate));
+            LoudnessMeter m(rate);
+            m.add(v.data(), int64_t(v.size() / 2));
+            QCOMPARE(m.steps(), size_t(200));
+            for (size_t i = 3; i < m.steps(); ++i) QVERIFY2(std::fabs(m.momentaryAt(i) - level) < 0.1, qPrintable(QString::number(m.momentaryAt(i))));
+            for (size_t i = 29; i < m.steps(); ++i) QVERIFY2(std::fabs(m.shortTermAt(i) - level) < 0.1, qPrintable(QString::number(m.shortTermAt(i))));
+            QVERIFY2(std::fabs(m.truePeakAt(100) - level) < 0.2, qPrintable(QString::number(m.truePeakAt(100))));
+        }
+        QCOMPARE(dcpLeqmLimit("trailer"), 85.0);
+        QCOMPARE(dcpLeqmLimit("teaser"), 85.0);
+        QCOMPARE(dcpLeqmLimit("advertisement"), 82.0);
+        QCOMPARE(dcpLeqmLimit("feature"), 0.0);
+        QCOMPARE(loudnessReportBase("/a/b/film.mov"), std::string("/a/b/film.loudness"));
+        QCOMPARE(loudnessReportBase("/a/b.c/frames_%05d.png"), std::string("/a/b.c/frames.loudness"));
+
+        // In 5.1: JFK's speech (Dialogue), then 8 s of quiet music only, then the speech again. The dialogue's loudness
+        // range leaves the music out, so it is narrower than the whole programme's.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.audioLayout = "5.1";
+        MediaItem jfk = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/jfk.wav");
+        p.media.push_back(jfk);
+        QVERIFY(edit::placeMedia(p, s, jfk.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const FrameTime speechEnd = s.duration();
+        const double fps = s.fpsValue();
+        std::vector<float> music(size_t(rate) * 8 * 2);
+        {
+            std::mt19937 gen(3);
+            std::uniform_real_distribution<float> u(-1, 1);
+            for (size_t i = 0; i < music.size() / 2; ++i)
+                music[i * 2] = music[i * 2 + 1] = 0.05f * float(std::sin(2 * M_PI * 330 * double(i) / rate)) + 0.025f * u(gen);
+        }
+        std::string err;
+        QVERIFY2(writeStereoWav(path("cinema-music.wav"), music, rate, &err), err.c_str());
+        MediaItem mus = probeOrFail(p, path("cinema-music.wav"));
+        p.media.push_back(mus);
+        QVERIFY(edit::placeMedia(p, s, mus.id, speechEnd, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok);
+        const FrameTime secondSpeech = s.duration();
+        QVERIFY(edit::placeMedia(p, s, jfk.id, secondSpeech, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        for (Clip& c : s.audioTracks[0].clips) c.role = "Dialogue";
+        s.audioTracks[1].clips.front().role = "Music";
+        DialogueLoudnessOptions o;
+        o.layout = true;
+        o.leqm = true;
+        o.log = true;
+        o.gate = SpeechGate::Roles;
+        const DialogueLoudness d = measureDialogueLoudness(p, s, o, {}, nullptr, &err);
+        const QString said = QString::fromStdString(describeDialogueLoudness(d)) +
+                             QStringLiteral(" range %1 dialogue %2 Leq(M) %3").arg(d.range).arg(d.dialogueRange).arg(d.leqm);
+        QVERIFY2(d.valid && err.empty(), qPrintable(said + QString::fromStdString(err)));
+        QVERIFY2(d.dialogueRange > 0 && d.dialogueRange < d.range - 2, qPrintable(said));
+        QVERIFY2(d.leqm > 60 && d.leqm < 100, qPrintable(said));
+        const double seconds = double(s.duration()) / fps;
+        QVERIFY2(std::fabs(double(d.log.size()) - seconds * 10) < 3, qPrintable(QString::number(d.log.size())));
+        QVERIFY(std::any_of(d.log.begin(), d.log.begin() + 30, [](const LoudnessLogPoint& pt) { return pt.speech; }));
+        QVERIFY(!d.log[size_t((double(speechEnd) / fps + 4) * 10)].speech);
+        // Its report against -31 LKFS of dialogue: the music is over it too but is not dialogue, so nothing of it is
+        // listed; against the programme's -31 LUFS it is; a ceiling under its peaks lists those.
+        LoudnessReportSpec spec;
+        spec.title = "Cinema test";
+        spec.target = -31;
+        spec.tolerance = 1;
+        spec.dialogueGated = true;
+        const double musicFrom = double(speechEnd) / fps, musicTo = double(secondSpeech) / fps;
+        for (const LoudnessOver& v : loudnessOvers(d, spec))
+            QVERIFY2(v.to < musicFrom + 0.5 || v.from > musicTo - 0.5, v.what.c_str());
+        spec.dialogueGated = false;
+        std::vector<LoudnessOver> overs = loudnessOvers(d, spec);
+        QVERIFY(std::any_of(overs.begin(), overs.end(), [&](const LoudnessOver& v) {
+            return !v.truePeak && v.from < musicFrom + 1 && v.to > musicTo - 0.5 && QString::fromStdString(v.what).startsWith("Short-term");
+        }));
+        QVERIFY(!loudnessPasses(d, spec));
+        spec.peakCeiling = d.truePeak - 3;
+        overs = loudnessOvers(d, spec);
+        QVERIFY(std::any_of(overs.begin(), overs.end(), [](const LoudnessOver& v) { return v.truePeak; }));
+        spec.leqmLimit = 85;
+        const std::string base = path("cinema-report");
+        QVERIFY2(writeLoudnessCsv(base + ".csv", d, spec, s, &err), err.c_str());
+        QVERIFY2(writeLoudnessPdf(base + ".pdf", d, spec, s, &err), err.c_str());
+        {
+            QFile csv(QString::fromStdString(base + ".csv"));
+            QVERIFY(csv.open(QIODevice::ReadOnly | QIODevice::Text));
+            const QStringList lines = QString::fromUtf8(csv.readAll()).split('\n', Qt::SkipEmptyParts);
+            QVERIFY(lines.front().startsWith("# Loudness report: Cinema test"));
+            QVERIFY(lines.contains(QStringLiteral("# Leq(M) limit: 85")));
+            QVERIFY(std::any_of(lines.begin(), lines.end(), [](const QString& l) { return l.startsWith("# Over: 00:00:") && l.contains("Short-term"); }));
+            const qsizetype header = lines.indexOf(QStringLiteral("seconds,timecode,momentary_lufs,short_term_lufs,true_peak_dbtp,dialogue"));
+            QVERIFY(header > 0);
+            QCOMPARE(lines.size() - header - 1, qsizetype(d.log.size()));
+            QCOMPARE(lines[header + 1].split(',').size(), qsizetype(6));
+            QFile pdf(QString::fromStdString(base + ".pdf"));
+            QVERIFY(pdf.open(QIODevice::ReadOnly));
+            QVERIFY(pdf.read(5) == "%PDF-" && pdf.size() > 2000);
+        }
+
+        // A trailer at 87 Leq(M): a stereo noise bed brought to 87, which the cinema trailer check (85) marks and 84
+        // passes.
+        Project t = makeDefaultProject();
+        Sequence& ts = *t.active();
+        std::vector<float> bed(size_t(rate) * 6 * 2);
+        {
+            std::mt19937 gen(5);
+            std::normal_distribution<float> n(0, 0.05f);
+            for (float& v : bed) v = n(gen);
+        }
+        QVERIFY2(writeStereoWav(path("cinema-bed.wav"), bed, rate, &err), err.c_str());
+        MediaItem bm = probeOrFail(t, path("cinema-bed.wav"));
+        t.media.push_back(bm);
+        QVERIFY(edit::placeMedia(t, ts, bm.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        DialogueLoudnessOptions lo;
+        lo.layout = true;
+        lo.leqm = true;
+        lo.gate = SpeechGate::Transcripts;
+        auto leqmOf = [&](const Sequence& q) { return measureDialogueLoudness(t, q, lo).leqm; };
+        const double before = leqmOf(ts);
+        QVERIFY2(before > 70, qPrintable(QString::number(before)));
+        ts.audioTracks[0].clips.front().audio.params["gain_db"] = 87 - before;
+        QVERIFY2(std::fabs(leqmOf(ts) - 87) < 0.1, qPrintable(QString::number(leqmOf(ts))));
+        QcSettings q;
+        q.flashing = false, q.levels = false, q.blackSeconds = 0, q.freezeSeconds = 0, q.silenceSeconds = 0, q.clipping = false;
+        q.spelling = false, q.sync = false, q.phase = false, q.dcOffsetDb = 0;
+        q.leqmLimit = 85;
+        std::vector<QcIssue> issues = qualityCheck(t, ts, 0, -1, q);
+        QVERIFY2(issues.size() == 1 && issues[0].kind == QcKind::CinemaLoudness, issues.empty() ? "none" : issues[0].text.c_str());
+        QCOMPARE(issues[0].text, std::string("Leq(M) 87.0; the limit is 85"));
+        QCOMPARE(QString::fromLatin1(qcKindName(issues[0].kind)), QStringLiteral("Leq(M)"));
+        ts.audioTracks[0].clips.front().audio.params["gain_db"] = 84 - before;
+        QVERIFY(qualityCheck(t, ts, 0, -1, q).empty());
+        ts.audioTracks[0].clips.front().audio.params["gain_db"] = 87 - before;
+
+        // Exported with a report: name.loudness.pdf and .csv beside it, of the sound as delivered.
+        ExportSettings st = findExportPreset("Audio - WAV 24-bit")->settings;
+        st.path = path("trailer.wav");
+        st.loudnessReport = true;
+        st.leqmLimit = 85;
+        QVERIFY2(exportSequence(t, ts, st, nullptr, nullptr, &err), err.c_str());
+        {
+            QFile csv(QString::fromStdString(path("trailer.loudness.csv")));
+            QVERIFY(csv.open(QIODevice::ReadOnly | QIODevice::Text));
+            const QString text = QString::fromUtf8(csv.readAll());
+            const QRegularExpressionMatch m = QRegularExpression("# Leq\\(M\\): ([0-9.]+)").match(text);
+            QVERIFY2(m.hasMatch() && std::fabs(m.captured(1).toDouble() - 87) < 0.2, qPrintable(text.left(400)));
+            QVERIFY(text.contains("# Result: does not pass"));
+            QVERIFY(QFileInfo(QString::fromStdString(path("trailer.loudness.pdf"))).size() > 2000);
+        }
+
+        // Over the agent link: Leq(M) and both ranges measured, a report written, the cinema presets checked.
+        const QString project = QString::fromStdString(path("cinema/trailer.montage"));
+        QDir().mkpath(QFileInfo(project).absolutePath());
+        QVERIFY(saveProject(t, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        const QString reportBase = QString::fromStdString(path("cinema/agent-report"));
+        QJsonObject r = call("montage_dialogue_loudness", {{"surround", true}, {"gate", "transcripts"}, {"report", reportBase}, {"leqm_limit", 85}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QJsonObject m = r.value("structuredContent").toObject();
+        QVERIFY2(std::fabs(m.value("leqm").toDouble() - 87) < 0.1, qPrintable(text(r)));
+        QVERIFY(m.contains("lra") && m.contains("lra_dialogue") && !m.value("passes").toBool(true));
+        QVERIFY(QFileInfo::exists(reportBase + ".pdf") && QFileInfo::exists(reportBase + ".csv"));
+        r = call("montage_quality_check", {{"flashing", false}, {"levels", false}, {"black_seconds", 0}, {"freeze_seconds", 0},
+                                           {"silence_seconds", 0}, {"clipping", false}, {"spelling", false}, {"sync", false},
+                                           {"phase", false}, {"dc_offset_db", 0}, {"cinema", "trailer"}, {"report", reportBase + "-qc"}});
+        QVERIFY2(text(r).contains("Leq(M) 87.0; the limit is 85") && text(r).contains("Loudness report"), qPrintable(text(r)));
+        QVERIFY(QFileInfo::exists(reportBase + "-qc.pdf"));
+        r = call("montage_quality_check", {{"cinema", "imax"}});
+        QVERIFY(r.value("isError").toBool());
+        r = call("montage_render", {{"output", QString::fromStdString(path("cinema/trailer.wav"))}, {"preset", "Audio - WAV 24-bit"},
+                                    {"loudness_report", true}, {"leqm_limit", 82}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY2(QFileInfo::exists(r.value("structuredContent").toObject().value("loudness_report").toString()), qPrintable(text(r)));
     }
 
     void peakLimiter() {

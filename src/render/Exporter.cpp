@@ -51,6 +51,7 @@
 #include "media/HwAccel.h"
 #include "media/Loudness.h"
 #include "render/DialogueLoudness.h"
+#include "render/LoudnessReport.h"
 #include "media/SuperScale.h"
 
 extern "C" {
@@ -1475,6 +1476,14 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     std::vector<float> mixBuf;
     int64_t audioPts = 0;
     int64_t audioCursor = int64_t(std::llround(double(in) * mixRate / seq.fpsValue()));
+    // The loudness report's meters, fed what is delivered.
+    std::unique_ptr<LoudnessMeter> reportMeter;
+    std::unique_ptr<LeqMMeter> reportLeqm;
+    if (wantAudio && s.loudnessReport) {
+        reportMeter = std::make_unique<LoudnessMeter>(mixRate);
+        const std::vector<double> gains = leqmChannelGains(nch > 2 ? seq.audioLayout : std::string("stereo"), nch);
+        reportLeqm = std::make_unique<LeqMMeter>(mixRate, nch, gains.data());
+    }
     for (auto& e : extras) {  // every stream starts where the mix does
         e->cursor = audioCursor;
         e->seq.sampleRate = mixRate;
@@ -1528,11 +1537,15 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     double normGain = 1;
     std::unique_ptr<PeakLimiter> limiter;
     int64_t limiterDelay = 0;
+    // The dialogue the normalisation measured (for the report to mark the same).
+    std::vector<std::pair<double, double>> normalisedSpeech;
+    SpeechGate normalisedGate = SpeechGate::Auto;
+    bool normalisedByDialogue = false;
     if (wantAudio && s.loudnessTarget < 0) {
         const int64_t end = int64_t(std::llround(double(out) * mixRate / seq.fpsValue()));
         std::vector<float> chunk(size_t(8192) * size_t(nch));
         // The dialogue's loudness (Netflix's), or everything's.
-        auto dialogueGain = [&](const Sequence& sq, const std::vector<bool>& tracks, double& gain) {
+        auto dialogueGain = [&](const Sequence& sq, const std::vector<bool>& tracks, double& gain, DialogueLoudness* found = nullptr) {
             DialogueLoudnessOptions o;
             o.tracks = tracks;
             o.in = in;
@@ -1540,10 +1553,15 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
             o.layout = nch > 2;
             const DialogueLoudness d = measureDialogueLoudness(p, sq, o, {}, cancel);
             if (d.valid) gain = std::pow(10.0, (s.loudnessTarget - d.value()) / 20.0);
+            if (found) *found = d;
             return !(cancel && cancel->load());
         };
         if (s.dialogueGated) {
-            if (!dialogueGain(mixSeq, s.audioTracks, normGain)) return fail("Cancelled");
+            DialogueLoudness found;
+            if (!dialogueGain(mixSeq, s.audioTracks, normGain, &found)) return fail("Cancelled");
+            normalisedSpeech = std::move(found.speech);
+            normalisedGate = found.gate;
+            normalisedByDialogue = true;
         } else {
             AudioMixer meterMixer;
             meterMixer.setTrackMask(s.audioTracks);
@@ -2078,6 +2096,10 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
                     limiter->process(mixBuf.data(), mixBuf.data(), n);
                 }
                 audioCursor = target;
+                if (reportMeter) {
+                    reportMeter->addChannels(mixBuf.data(), n, nch, weights.data());
+                    reportLeqm->add(mixBuf.data(), n);
+                }
                 if (monos.empty()) {
                     fifo.insert(fifo.end(), mixBuf.begin(), mixBuf.end());
                     if (!encodeAudio(false)) return fail("Audio encoding failed");
@@ -2163,15 +2185,38 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     // The HDR10+ metadata beside the file too (named after it, an image sequence's frame number left out). The video
     // is done by now: a JSON that cannot be written is warned about, never a reason to lose the export.
     if (!hdr10.empty()) {
-        const size_t slash = s.path.find_last_of("/\\"), dot = s.path.find_last_of('.');
-        std::string stem = s.path.substr(0, dot != std::string::npos && (slash == std::string::npos || dot > slash) ? dot : s.path.size());
-        if (const size_t pct = stem.find('%'); pct != std::string::npos && (slash == std::string::npos || pct > slash)) {
-            size_t cut = pct;
-            if (cut > 0 && (stem[cut - 1] == '_' || stem[cut - 1] == '.' || stem[cut - 1] == '-')) --cut;
-            stem.erase(cut);
-        }
+        const std::string stem = exportSidecarStem(s.path);
         std::string e;
         if (!writeHdr10PlusJson(stem + ".hdr10plus.json", hdr10, din, dout, &e)) qWarning("Dynamic HDR metadata JSON not written beside %s: %s", s.path.c_str(), e.c_str());
+    }
+    // The loudness report beside the file (like the JSON: not written is warned about, the export kept).
+    if (reportMeter) {
+        // The dialogue as the normalisation found it, else as the sequence marks it (no listening). A speed change
+        // delivers the sound faster: its marks go to delivered time and the readings back to timeline time.
+        SpeechGate gate = normalisedGate;
+        const double fps = seq.fpsValue(), start = double(in) / fps;
+        std::vector<std::pair<double, double>> speech =
+            normalisedByDialogue ? normalisedSpeech : timelineSpeech(p, seq, gate, s.audioTracks, start, double(out) / fps);
+        const double speed = conv.mode == RateConversion::Mode::Speed ? conv.speed() : 1.0;
+        for (auto& [a, b] : speech) a = start + (a - start) / speed, b = start + (b - start) / speed;
+        DialogueLoudness d = loudnessOfMeter(*reportMeter, reportLeqm.get(), start, mixRate, speech, gate);
+        if (speed != 1.0) {
+            for (LoudnessLogPoint& pt : d.log) pt.t = start + (pt.t - start) * speed;
+            for (auto& [a, b] : d.speech) a = start + (a - start) * speed, b = start + (b - start) * speed;
+        }
+        LoudnessReportSpec spec;
+        spec.title = seq.name;
+        if (s.loudnessTarget < 0) {
+            spec.target = s.loudnessTarget;
+            spec.dialogueGated = s.dialogueGated;
+            spec.tolerance = s.dialogueGated ? 2 : 1;
+            spec.peakCeiling = s.peakCeiling;
+        }
+        spec.leqmLimit = s.leqmLimit;
+        const std::string base = loudnessReportBase(s.path);
+        std::string e;
+        if (!writeLoudnessCsv(base + ".csv", d, spec, seq, &e) || !writeLoudnessPdf(base + ".pdf", d, spec, seq, &e))
+            qWarning("Loudness report not written beside %s: %s", s.path.c_str(), e.c_str());
     }
     if (smartRendered) *smartRendered = smart ? smart->copied() : 0;
     if (light) *light = measured;
@@ -2179,6 +2224,19 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
 }
 
 }  // namespace
+
+std::string exportSidecarStem(const std::string& path) {
+    const size_t slash = path.find_last_of("/\\"), dot = path.find_last_of('.');
+    std::string stem = path.substr(0, dot != std::string::npos && (slash == std::string::npos || dot > slash) ? dot : path.size());
+    if (const size_t pct = stem.find('%'); pct != std::string::npos && (slash == std::string::npos || pct > slash)) {
+        size_t cut = pct;
+        if (cut > 0 && (stem[cut - 1] == '_' || stem[cut - 1] == '.' || stem[cut - 1] == '-')) --cut;
+        stem.erase(cut);
+    }
+    return stem;
+}
+
+std::string loudnessReportBase(const std::string& path) { return exportSidecarStem(path) + ".loudness"; }
 
 std::string hdr10PlusCarriage(const Sequence& seq, const ExportSettings& s) {
     const std::string& c = s.videoCodec;
@@ -2657,6 +2715,7 @@ bool exportStems(const Project& p, const Sequence& seq, const ExportSettings& s,
         one.videoCodec = "none";
         one.audioCodec = "pcm_s24le";
         one.loudnessTarget = 0;  // stems keep their levels, so they add back up to the mix
+        one.loudnessReport = false;  // (the delivery's report is the mix's)
         one.describedStream = false;  // one stream each
         one.extraAudio.clear();
         one.burnInCaptions = one.embedCaptions = false;

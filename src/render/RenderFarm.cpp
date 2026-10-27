@@ -182,6 +182,8 @@ void visitSettings(S& s, V& v) {
     v("loudnessTarget", s.loudnessTarget);
     v("peakCeiling", s.peakCeiling);
     v("dialogueGated", s.dialogueGated);
+    v("loudnessReport", s.loudnessReport);
+    v("leqmLimit", s.leqmLimit);
     v("downmixStereo", s.downmixStereo);
     v("audioTracks", s.audioTracks);
     v("chapters", s.chapters);

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <deque>
+#include <memory>
 
 #include "core/EditOps.h"
 #include "core/Surround.h"
@@ -92,6 +93,43 @@ Spans timelineSpeech(const Project& p, const Sequence& s, SpeechGate& gate, cons
     return merged(std::move(words), kWordGap);
 }
 
+namespace {
+// The readings of a meter fed with [first, end) samples at `rate` (its steps already marked), with Leq(M) when given.
+DialogueLoudness finish(const LoudnessMeter& meter, const LeqMMeter* leqm, const std::vector<char>& marked, int64_t first, int64_t end,
+                        int rate, SpeechGate gate, double minSpeechShare, bool log) {
+    const size_t steps = meter.steps();
+    const int64_t step = std::max<int64_t>(1, int64_t(rate * 0.1));
+    DialogueLoudness r;
+    r.gate = gate;
+    const LoudnessResult whole = meter.result(), dialogue = meter.speechResult();
+    r.valid = whole.valid;
+    r.programme = whole.valid ? whole.integrated : -70;
+    r.truePeak = whole.truePeakDb;
+    r.dialogue = dialogue.valid ? dialogue.integrated : -70;
+    r.speechShare = meter.speechShare();
+    r.minSpeechShare = minSpeechShare;
+    r.usesProgramme = !dialogue.valid || r.speechShare < minSpeechShare;
+    r.range = meter.loudnessRange();
+    r.dialogueRange = meter.speechLoudnessRange();
+    if (leqm) r.leqm = leqm->leqm();
+    if (log) {
+        r.log.reserve(steps);
+        for (size_t i = 0; i < steps; ++i)
+            r.log.push_back({std::min(double(end), double(first) + double(i + 1) * double(step)) / rate, float(meter.momentaryAt(i)),
+                             float(meter.shortTermAt(i)), float(meter.truePeakAt(i)), marked[i] != 0});
+    }
+    // The speech as timeline spans.
+    for (size_t i = 0; i < steps; ++i)
+        if (marked[i]) {
+            const double a = (double(first) + double(i) * double(step)) / rate;
+            const double b = std::min(double(end), double(first) + double(i + 1) * double(step)) / rate;
+            if (!r.speech.empty() && r.speech.back().second >= a - 1e-9) r.speech.back().second = b;
+            else r.speech.push_back({a, b});
+        }
+    return r;
+}
+}  // namespace
+
 DialogueLoudness measureDialogueLoudness(const Project& p, const Sequence& s, const DialogueLoudnessOptions& o,
                                          const std::function<void(double)>& progress, const std::atomic<bool>* cancel,
                                          std::string* error) {
@@ -117,6 +155,11 @@ DialogueLoudness measureDialogueLoudness(const Project& p, const Sequence& s, co
     AudioMixer mixer;
     mixer.setTrackMask(o.tracks);
     LoudnessMeter meter(rate);
+    std::unique_ptr<LeqMMeter> leqm;
+    if (o.leqm) {
+        const std::vector<double> gains = leqmChannelGains(nch > 2 ? s.audioLayout : std::string("stereo"), nch);
+        leqm = std::make_unique<LeqMMeter>(rate, nch, gains.data());
+    }
     // Roles: the Dialogue clips on their own, to hear where they have something to say.
     Sequence stem;
     AudioMixer stemMixer;
@@ -146,6 +189,7 @@ DialogueLoudness measureDialogueLoudness(const Project& p, const Sequence& s, co
         if (nch > 2) mixer.mixLayout(p, s, pos, n, buf.data());
         else mixer.mix(p, s, pos, n, buf.data());
         meter.addChannels(buf.data(), n, nch, weights.data());
+        if (leqm) leqm->add(buf.data(), n);
         if (gate == SpeechGate::Roles) {
             stemMixer.mix(p, stem, pos, n, stemBuf.data());
             stemMeter.add(stemBuf.data(), n);
@@ -200,25 +244,32 @@ DialogueLoudness measureDialogueLoudness(const Project& p, const Sequence& s, co
         marked[i] = speech;
     }
 
-    DialogueLoudness r;
-    r.gate = gate;
-    const LoudnessResult whole = meter.result(), dialogue = meter.speechResult();
-    r.valid = whole.valid;
-    r.programme = whole.valid ? whole.integrated : -70;
-    r.truePeak = whole.truePeakDb;
-    r.dialogue = dialogue.valid ? dialogue.integrated : -70;
-    r.speechShare = meter.speechShare();
-    r.minSpeechShare = o.minSpeechShare;
-    r.usesProgramme = !dialogue.valid || r.speechShare < o.minSpeechShare;
-    // The speech as timeline spans.
-    for (size_t i = 0; i < steps; ++i)
-        if (marked[i]) {
-            const double a = (double(first) + double(i) * double(step)) / rate;
-            const double b = std::min(double(end), double(first) + double(i + 1) * double(step)) / rate;
-            if (!r.speech.empty() && r.speech.back().second >= a - 1e-9) r.speech.back().second = b;
-            else r.speech.push_back({a, b});
-        }
-    return r;
+    return finish(meter, leqm.get(), marked, first, end, rate, gate, o.minSpeechShare, o.log);
+}
+
+DialogueLoudness loudnessOfMeter(LoudnessMeter& meter, const LeqMMeter* leqm, double start, int rate,
+                                 const std::vector<std::pair<double, double>>& speech, SpeechGate gate, double minSpeechShare, bool log) {
+    const int64_t step = std::max<int64_t>(1, int64_t(rate * 0.1));
+    const int64_t first = int64_t(std::llround(start * rate));
+    const int64_t end = first + int64_t(std::llround(meter.seconds() * rate));
+    std::vector<char> marked(meter.steps(), 0);
+    size_t mark = 0;
+    for (size_t i = 0; i < marked.size(); ++i) {
+        const double t = (double(first) + (double(i) + 0.5) * double(step)) / rate;
+        while (mark < speech.size() && speech[mark].second <= t) ++mark;
+        marked[i] = mark < speech.size() && speech[mark].first <= t;
+        meter.markSpeech(i, marked[i] != 0);
+    }
+    return finish(meter, leqm, marked, first, end, rate, gate, minSpeechShare, log);
+}
+
+std::vector<double> leqmChannelGains(const std::string& audioLayout, int channels) {
+    std::vector<double> gains;
+    if (channels > 2)
+        for (const Speaker& sp : layoutSpeakers(audioLayout))
+            gains.push_back(sp.lfe || (sp.elevation == 0 && std::fabs(sp.angle) <= 30.0 + 1e-9) ? 1.0 : std::pow(10.0, -3.0 / 20));
+    gains.resize(size_t(std::max(1, channels)), 1.0);
+    return gains;
 }
 
 std::string describeDialogueLoudness(const DialogueLoudness& d) {

@@ -442,6 +442,18 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     loudness_->setToolTip(tr("Measures the whole mix first, then sets its level to the target, with a limiter "
                              "keeping peaks under the ceiling"));
     form->addRow(tr("Loudness:"), loudness_);
+    // A report of the sound as delivered (render/LoudnessReport.h): none, or a PDF and CSV, with a cinema Leq(M) limit
+    // (the data; -1 for no report).
+    loudnessReport_ = new QComboBox(form_);
+    loudnessReport_->setObjectName(QStringLiteral("exportLoudnessReport"));
+    loudnessReport_->addItem(tr("None"), -1.0);
+    loudnessReport_->addItem(tr("PDF and CSV"), 0.0);
+    loudnessReport_->addItem(tr("PDF and CSV, cinema trailer: 85 Leq(M)"), 85.0);
+    loudnessReport_->addItem(tr("PDF and CSV, cinema advertising: 82 Leq(M)"), 82.0);
+    loudnessReport_->setCurrentIndex(std::clamp(appSettings().value("export/loudnessReport", 0).toInt(), 0, loudnessReport_->count() - 1));
+    loudnessReport_->setToolTip(tr("Writes name.loudness.pdf and name.loudness.csv beside the file: integrated and dialogue loudness, "
+                                   "loudness range, true peak, Leq(M), the readings every 100 ms and every stretch over a limit"));
+    form->addRow(tr("Loudness report:"), loudnessReport_);
     // Surround sequences: every channel, or the stereo fold-down.
     {
         const Sequence* sq = state_->sequence();
@@ -814,6 +826,7 @@ void ExportDialog::updateControls() {
         exrCompression_->setEnabled(video && vc == "exr" && exrAvailable());
     }
     loudness_->setEnabled(p && hasAudio(p->settings));
+    loudnessReport_->setEnabled(p && hasAudio(p->settings));
     quality_->setEnabled(p && usesCrf(p->settings.videoCodec));
     const Sequence* seq = state_ ? state_->sequence() : nullptr;
     const CaptionTrack* ct = seq ? captionTrackFor(*seq) : nullptr;
@@ -1128,6 +1141,11 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         s.dialogueGated = loudness_->currentData(Qt::UserRole + 1).toBool();
     }
     settings.setValue("export/loudness", loudness_->currentIndex());
+    if (hasAudio(s) && loudnessReport_->currentIndex() > 0) {
+        s.loudnessReport = true;
+        s.leqmLimit = loudnessReport_->currentData().toDouble();
+    }
+    settings.setValue("export/loudnessReport", loudnessReport_->currentIndex());
     if (hasAudio(s)) s.downmixStereo = !audioOut_->isHidden() && audioOut_->currentIndex() == 1;
     stemsMode_ = hasAudio(s) ? stems_->currentIndex() : 0;
     if (hasVideo(s)) {

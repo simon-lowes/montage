@@ -65,7 +65,15 @@ struct DcpResult {
     int subtitleCount = 0;      // subtitles (or closed captions) in the track, burned in or not
     std::string cplId;          // the composition's UUID (what KDMs name)
     std::string dkdm;           // an encrypted package's DKDM file
+    // The sound's Leq(M) (ISO 21727, surrounds 3 dB down), and the limit its kind is held to: 85 for a trailer or
+    // teaser (TASA), 82 for an advertisement (SAWA), else 0.
+    double leqm = 0;
+    double leqmLimit = 0;
+    bool overLoudnessLimit() const { return leqmLimit > 0 && leqm > leqmLimit + 0.05; }
 };
+
+// The Leq(M) limit for a DCP's content kind: 85 for trailers and teasers, 82 for advertisements, else 0.
+double dcpLeqmLimit(const std::string& kind);
 
 // The container sizes (at 2K or 4K), the one that suits a sequence's shape (Scope from 2:1, else Flat), and the DCP
 // rate for it.

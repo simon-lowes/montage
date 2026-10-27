@@ -7699,6 +7699,69 @@ private slots:
         QCOMPARE(readout->text("INT"), QStringLiteral("—"));
     }
 
+    void loudnessReportAndCinemaLimits() {
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("loudnessReport"));
+        QVERIFY(!win_->loudnessReport({}));  // nothing to measure
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            const bool ok = edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+            s.audioTracks[0].clips.at(0).role = "Dialogue";
+            return ok;
+        }));
+        // Against a ceiling under the speech's peaks: red where they go over, and the report beside the name given.
+        LoudnessReportSpec spec;
+        spec.target = -16;
+        spec.tolerance = 1;
+        spec.peakCeiling = -12;
+        const QString base = dir_.path() + "/jfk.loudness";
+        QVERIFY(win_->loudnessReport(spec, base));
+        QVERIFY(QFileInfo::exists(base + ".pdf") && QFileInfo::exists(base + ".csv"));
+        QVERIFY(win_->statusBar()->currentMessage().contains("Leq(M)"));
+        const auto& lane = win_->timeline()->loudnessLane();
+        QVERIFY(!lane.empty());
+        QVERIFY(std::any_of(lane.begin(), lane.end(), [](const auto& sp) { return sp.status == 2; }));
+        // Within limits everywhere: all green.
+        spec.target = 0;
+        spec.peakCeiling = 0;
+        QVERIFY(win_->loudnessReport(spec));
+        QVERIFY(std::all_of(lane.begin(), lane.end(), [](const auto& sp) { return sp.status == 0; }));
+        // The Quality Check's cinema presets ask for Leq(M).
+        {
+            QualityCheckDialog dlg(state(), win_.get());
+            auto* loudness = dlg.findChild<QComboBox*>("qcLoudness");
+            const int trailer = loudness->findText("Cinema trailer: 85 Leq(M)"), ads = loudness->findText("Cinema advertising: 82 Leq(M)");
+            QVERIFY(trailer > 0 && ads > 0);
+            loudness->setCurrentIndex(trailer);
+            QCOMPARE(dlg.settings().leqmLimit, 85.0);
+            QCOMPARE(dlg.settings().loudnessTarget, 0.0);
+            loudness->setCurrentIndex(ads);
+            QCOMPARE(dlg.settings().leqmLimit, 82.0);
+            loudness->setCurrentIndex(0);
+            QCOMPARE(dlg.settings().leqmLimit, 0.0);
+        }
+        // Exported with a report and the trailer limit.
+        {
+            ExportDialog ed(state(), win_.get());
+            auto* report = ed.findChild<QComboBox*>("exportLoudnessReport");
+            QVERIFY(report && report->isEnabled() && report->count() == 4);
+            ed.findChild<QComboBox*>("exportPreset")->setCurrentIndex(ed.findChild<QComboBox*>("exportPreset")->findText("Audio - WAV 24-bit"));
+            ed.findChild<QLineEdit*>("exportPath")->setText(dir_.path() + "/speech.wav");
+            report->setCurrentIndex(2);
+            ed.findChild<QPushButton*>("exportButton")->click();
+            QTRY_COMPARE_WITH_TIMEOUT(ed.result(), int(QDialog::Accepted), 60000);
+        }
+        appSettings().remove("export/loudnessReport");
+        QFile csv(dir_.path() + "/speech.loudness.csv");
+        QVERIFY(csv.open(QIODevice::ReadOnly | QIODevice::Text));
+        QVERIFY(QString::fromUtf8(csv.readAll()).contains("# Leq(M) limit: 85"));
+        QVERIFY(QFileInfo::exists(dir_.path() + "/speech.loudness.pdf"));
+        // Another project: the lane goes.
+        state()->newProject();
+        QVERIFY(win_->timeline()->loudnessLane().empty());
+    }
+
     void repairDamagedFramesFromTheMenu() {
         // A grey shot with one white frame (frame 10) in it.
         Project gen = makeDefaultProject();

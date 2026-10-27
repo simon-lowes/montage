@@ -1,4 +1,4 @@
-// Montage — loudness measurement (ITU-R BS.1770-4 / EBU R128), and the
+// Montage — loudness measurement (ITU-R BS.1770-4 / EBU R128), cinema loudness (Leq(M), ISO 21727), and the
 // limiter loudness-normalised exports use to stay under a peak ceiling.
 #pragma once
 
@@ -51,13 +51,41 @@ public:
     void setSpeech(bool on);
     void markSpeech(size_t step, bool on);
     size_t steps() const;  // the 100 ms steps finished so far
-    // The loudness of the 400 ms ending with step `i` (LUFS, -200 for silence or before it).
+    // The loudness of the 400 ms ending with step `i` (LUFS, -200 for silence or before it), of the 3 s ending with
+    // it (fewer at the start), and the true peak within step `i` (dBTP, -96 for silence).
     double momentaryAt(size_t i) const;
+    double shortTermAt(size_t i) const;
+    double truePeakAt(size_t i) const;
     // BS.1770 over only the 400 ms blocks that are speech throughout (all four of their steps); the true peak is the
     // whole programme's. Not valid without speech.
     LoudnessResult speechResult() const;
     // The share of the sound (steps above -70 LUFS) marked as speech, 0..1.
     double speechShare() const;
+    // Loudness range (EBU Tech 3342) over only the short-term blocks that are mostly dialogue (at least two thirds of
+    // their 3 s marked as speech), in LU; 0 without enough of them.
+    double speechLoudnessRange() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> d_;
+};
+
+// Leq(M) (ISO 21727), the loudness cinema trailers and advertisements are held to: the programme through the M
+// weighting (ITU-R 468's, 5.6 dB lower: 0 dB at 2 kHz, +6.6 dB at 6.3 kHz), its energy summed over the channels and
+// averaged over its length, in dB on the cinema's scale (a full-scale sine's energy is 108.01, -20 dBFS pink noise
+// in one channel about 85, as leqm-nrt reads it). Each channel is scaled by its gain first (amplitude;
+// cinema calibration has the surrounds 3 dB down). The weighting is a linear-phase FIR built from the 468 network's
+// response, applied by FFT, true to the curve within 0.01 dB from 31.5 Hz up.
+class LeqMMeter {
+public:
+    // `channels` interleaved; `gains` one per channel (null: all 1).
+    LeqMMeter(int sampleRate, int channels, const double* gains = nullptr);
+    ~LeqMMeter();
+    void add(const float* data, int64_t frames);
+    double leqm() const;    // dB (0 for silence)
+    double seconds() const;
+    // The M weighting's gain at `hz` (dB), as the meter applies it.
+    static double weightingDb(double hz);
 
 private:
     struct Impl;

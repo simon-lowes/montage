@@ -7883,6 +7883,9 @@ colorspaces:
         const QString name = QString::fromStdString(r.name);
         QVERIFY2(name.startsWith("TestFilmAShort_SHR_S_EN-XX_XX_51_2K_") && name.endsWith("_SMPTE_OV"), qPrintable(name));
         QVERIFY2(r.cinemaProfile, "encoded in the DCI 2K profile");
+        // Its Leq(M): a second of a loud 1 kHz tone (M weighting -5.6 dB there) is well over 85, but a short has no limit.
+        QVERIFY2(r.leqm > 88 && r.leqm < 100, qPrintable(QString::number(r.leqm)));
+        QVERIFY(r.leqmLimit == 0 && !r.overLoudnessLimit());
         const QDir out(QString::fromStdString(r.folder));
         QVERIFY(out.exists("ASSETMAP.xml") && out.exists("VOLINDEX.xml"));
         const QStringList pictures = out.entryList({"j2c_*.mxf"}), sounds = out.entryList({"pcm_*.mxf"}), cpls = out.entryList({"CPL_*.xml"});

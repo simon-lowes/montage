@@ -285,9 +285,13 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     });
     // The intelligibility lane and readout follow the playhead, the active sequence and its edits.
     connect(state_, &EditorState::playheadChanged, this, [this] { showIntelligibility(); });
-    connect(state_, &EditorState::sequenceSwitched, this, [this] { showIntelligibility(); });
+    connect(state_, &EditorState::sequenceSwitched, this, [this] {
+        showIntelligibility();
+        showLoudnessLane();
+    });
     connect(state_, &EditorState::projectChanged, this, [this] {
         if (const Sequence* s = state_->sequence(); s && intelligibility_.count(s->id)) showIntelligibility();
+        if (!loudnessRuns_.empty()) showLoudnessLane();
     });
     connect(program_, &PlaybackController::positionChanged, this, [this](FrameTime t) {
         state_->setPlayhead(t);
@@ -2101,6 +2105,47 @@ void MainWindow::buildMenus() {
             appSettings().setValue("intelligibility/preset", preset);
             analyseIntelligibility(preset);
         })->setObjectName(QStringLiteral("analyseIntelligibility"));
+    add(seqM, tr("Loudness &Report…"), QKeySequence(), [this] {
+            if (!state_->sequence()) return;
+            // (name, target, tolerance, dialogue, true peak ceiling, Leq(M) limit)
+            struct Standard {
+                QString name;
+                double target, tolerance;
+                bool dialogue;
+                double ceiling, leqm;
+            };
+            const std::vector<Standard> standards = {
+                {tr("EBU R128: -23 LUFS, -1 dBTP"), -23, 1, false, -1, 0},
+                {tr("ATSC A/85: -24 LKFS, -2 dBTP"), -24, 2, false, -2, 0},
+                {tr("Streaming: -14 LUFS, -1 dBTP"), -14, 1, false, -1, 0},
+                {tr("Dialogue: -27 LKFS, -2 dBTP"), -27, 2, true, -2, 0},
+                {tr("Cinema trailer: 85 Leq(M)"), 0, 1, false, 0, 85},
+                {tr("Cinema advertising: 82 Leq(M)"), 0, 1, false, 0, 82},
+                {tr("Measured only"), 0, 1, false, 0, 0}};
+            QStringList names;
+            for (const Standard& st : standards) names << st.name;
+            bool ok = false;
+            const QString picked = QInputDialog::getItem(this, tr("Loudness Report"), tr("Measure the sound against:"), names,
+                                                         std::clamp(appSettings().value("loudnessReport/standard", 0).toInt(), 0, int(names.size()) - 1),
+                                                         false, &ok);
+            if (!ok) return;
+            const int i = int(names.indexOf(picked));
+            appSettings().setValue("loudnessReport/standard", i);
+            QString path = QFileDialog::getSaveFileName(this, tr("Save Loudness Report"),
+                                                        QString::fromStdString(state_->sequence()->name) + ".loudness.pdf",
+                                                        tr("PDF (*.pdf)"));
+            if (path.isEmpty()) return;
+            if (path.endsWith(".pdf", Qt::CaseInsensitive)) path.chop(4);
+            LoudnessReportSpec spec;
+            spec.title = state_->sequence()->name;
+            spec.targetName = standards[size_t(i)].name.section(':', 0, 0).toStdString();
+            spec.target = standards[size_t(i)].target;
+            spec.tolerance = standards[size_t(i)].tolerance;
+            spec.dialogueGated = standards[size_t(i)].dialogue;
+            spec.peakCeiling = standards[size_t(i)].ceiling;
+            spec.leqmLimit = standards[size_t(i)].leqm;
+            loudnessReport(spec, path);
+        })->setObjectName(QStringLiteral("loudnessReport"));
     add(seqM, tr("Analyse HDR &Light Levels…"), QKeySequence(), [this] { analyseHdrLightLevels(); })->setObjectName(QStringLiteral("analyseHdrLightLevels"));
     add(seqM, tr("Next Marker"), QKeySequence("Shift+M"), [this] { jumpMarker(true); });
     add(seqM, tr("Previous Marker"), QKeySequence("Ctrl+Shift+M"), [this] { jumpMarker(false); });
@@ -5913,6 +5958,69 @@ double MainWindow::analyseIntelligibility(const QString& preset) {
     return r.average;
 }
 
+bool MainWindow::loudnessReport(const LoudnessReportSpec& spec, const QString& base) {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    const Project project = state_->project();
+    const Sequence seq = *s;
+    const uint64_t revision = state_->history().revision(), generation = state_->projectGeneration();
+    DialogueLoudnessOptions o;
+    o.layout = true;
+    o.leqm = true;
+    o.log = true;
+    DialogueLoudness d;
+    if (!runWithProgress(this, state_, tr("Measuring the loudness…"), [&](const auto& progress, const auto* cancel, std::string* e) {
+            d = measureDialogueLoudness(project, seq, o, progress, cancel, e);
+            return !d.log.empty() && (!e || e->empty());
+        }))
+        return false;
+    if (generation != state_->projectGeneration()) return false;
+    loudnessRuns_[seq.id] = {d, spec, revision, generation};
+    showLoudnessLane();
+    QString written;
+    if (!base.isEmpty()) {
+        std::string e;
+        if (!writeLoudnessCsv((base + ".csv").toStdString(), d, spec, seq, &e) || !writeLoudnessPdf((base + ".pdf").toStdString(), d, spec, seq, &e)) {
+            state_->message(tr("Loudness report not written: %1").arg(QString::fromStdString(e)), 8000);
+            return false;
+        }
+        written = tr("; report in %1").arg(QDir::toNativeSeparators(base + ".pdf"));
+    }
+    const size_t overs = loudnessOvers(d, spec).size();
+    state_->message(tr("Integrated %1 LUFS, range %2 LU, true peak %3 dBTP, Leq(M) %4; %n stretch(es) over a limit%5", "", int(overs))
+                        .arg(d.programme, 0, 'f', 1).arg(d.range, 0, 'f', 1).arg(d.truePeak, 0, 'f', 1).arg(d.leqm, 0, 'f', 1).arg(written),
+                    10000);
+    return true;
+}
+
+void MainWindow::showLoudnessLane() {
+    std::erase_if(loudnessRuns_, [this](const auto& run) { return run.second.generation != state_->projectGeneration(); });
+    const Sequence* s = state_->sequence();
+    const auto it = s ? loudnessRuns_.find(s->id) : loudnessRuns_.end();
+    if (it == loudnessRuns_.end()) {
+        timeline_->setLoudnessLane({}, false);
+        return;
+    }
+    const LoudnessRun& run = it->second;
+    const double fps = s->fpsValue();
+    // Each 100 ms step where there is sound, coloured by the worst stretch over a limit it falls in.
+    const std::vector<LoudnessOver> overs = loudnessOvers(run.result, run.spec);
+    std::vector<TimelineWidget::IntelligibilitySpan> spans;
+    double prev = run.result.log.empty() ? 0 : run.result.log.front().t - 0.1;
+    for (const LoudnessLogPoint& pt : run.result.log) {
+        const double from = prev;
+        prev = pt.t;
+        if (pt.momentary < -70 && pt.shortTerm < -70) continue;
+        int st = 0;
+        for (const LoudnessOver& v : overs)
+            if (from < v.to - 1e-9 && pt.t > v.from + 1e-9) st = std::max(st, v.truePeak ? 2 : 1);
+        const FrameTime a = FrameTime(std::floor(from * fps + 1e-6)), e = std::max(a + 1, FrameTime(std::ceil(pt.t * fps - 1e-6)));
+        if (!spans.empty() && spans.back().status == st && spans.back().end >= a) spans.back().end = std::max(spans.back().end, e);
+        else spans.push_back({a, e, st});
+    }
+    timeline_->setLoudnessLane(std::move(spans), run.revision != state_->history().revision());
+}
+
 void MainWindow::showIntelligibility() {
     std::erase_if(intelligibility_, [this](const auto& run) { return run.second.generation != state_->projectGeneration(); });
     const Sequence* s = state_->sequence();
@@ -6766,6 +6874,8 @@ QString MainWindow::exportDcpTo(const QString& parent, const DcpSettings& settin
     }
     QStringList found;
     for (const std::string& i : issues) found << QString::fromStdString(i);
+    if (result.overLoudnessLimit())
+        found << tr("its sound is %1 Leq(M), over the %2 its kind is held to").arg(result.leqm, 0, 'f', 1).arg(result.leqmLimit, 0, 'f', 0);
     if (problems) *problems = found;
     const QString folder = QString::fromStdString(result.folder);
     if (!found.isEmpty())

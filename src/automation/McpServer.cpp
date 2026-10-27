@@ -165,6 +165,7 @@
 #include "render/OGraf.h"
 #include "render/Gallery.h"
 #include "render/DialogueLoudness.h"
+#include "render/LoudnessReport.h"
 #include "render/AutoTrims.h"
 #include "render/TrimPasses.h"
 #include "media/Segmenter.h"
@@ -4178,7 +4179,9 @@ void McpServer::Impl::addTools() {
         "linked clips out of sync with their picture (`sync`), dialogue hard to follow under the music and effects "
         "(`intelligibility`, as montage_intelligibility measures it), left and right out of phase or one inverted, so a mono "
         "fold-down loses them (`phase`), DC offset (`dc_offset_db`), and for SDH captions, loud sound outside speech that no caption describes "
-        "(`uncaptioned_seconds`). Lists each problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones).",
+        "(`uncaptioned_seconds`), and a cinema Leq(M) limit (`cinema` trailer 85 or advertising 82, or `leqm_limit`). Lists each "
+        "problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones). `report` writes "
+        "a loudness report beside it (report.pdf and report.csv, as montage_dialogue_loudness's).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"flashing":{"type":"boolean","default":true},"levels":{"type":"boolean","default":true},
             "black_seconds":{"type":"number","default":1,"description":"0 = not checked"},
@@ -4189,6 +4192,9 @@ void McpServer::Impl::addTools() {
             "peak_ceiling":{"type":"number","default":-1,"description":"dBTP, checked with the loudness"},
             "loudness_dialogue":{"type":"boolean","default":false,"description":"Check the dialogue's loudness (montage_dialogue_loudness), as Netflix does: -27 with peak_ceiling -2"},
             "loudness_tolerance":{"type":"number","description":"LU either side of the target (default 1, 2 with loudness_dialogue)"},
+            "cinema":{"type":"string","enum":["trailer","advertising"],"description":"Leq(M) limit for cinemas: 85 trailers, 82 advertising"},
+            "leqm_limit":{"type":"number","description":"Leq(M) limit in place of cinema's; omitted = not checked"},
+            "report":{"type":"string","description":"Path for a loudness report (no extension: .pdf and .csv are added)"},
             "spelling":{"type":"boolean","default":true},"title_language":{"type":"string","default":"en-US"},
             "sync":{"type":"boolean","default":true},
             "intelligibility":{"type":"number","description":"Dialogue intelligibility limit, 0..1 (e.g. 0.45); omitted = not checked"},
@@ -4214,6 +4220,16 @@ void McpServer::Impl::addTools() {
             q.peakCeiling = a.value("peak_ceiling").toDouble(-1);
             q.dialogueGated = a.value("loudness_dialogue").toBool(false);
             q.loudnessTolerance = std::max(0.1, a.value("loudness_tolerance").toDouble(q.dialogueGated ? 2 : 1));
+            if (a.contains("cinema")) {
+                const QString cinema = str(a, "cinema", "");
+                if (cinema == "trailer") q.leqmLimit = 85;
+                else if (cinema == "advertising") q.leqmLimit = 82;
+                else throw ArgError{"\"cinema\" is trailer or advertising"};
+            }
+            if (a.contains("leqm_limit")) {
+                q.leqmLimit = a.value("leqm_limit").toDouble();
+                if (!(q.leqmLimit >= 60 && q.leqmLimit <= 110)) throw ArgError{"\"leqm_limit\" must be between 60 and 110"};
+            }
             q.spelling = a.value("spelling").toBool(true);
             q.titleLanguage = str(a, "title_language", "en-US").toStdString();
             q.sync = a.value("sync").toBool(true);
@@ -4232,7 +4248,35 @@ void McpServer::Impl::addTools() {
                 addQcMarkers(s, issues);
                 save(l);
             }
-            return ok(issues.empty() ? QStringLiteral("No problems found.") : QStringLiteral("%1 problem(s):\n").arg(issues.size()) + text);
+            if (a.contains("report")) {
+                LoudnessReportSpec spec;
+                spec.title = s.name;
+                if (q.loudnessTarget != 0) {
+                    spec.target = q.loudnessTarget;
+                    spec.tolerance = q.loudnessTolerance;
+                    spec.dialogueGated = q.dialogueGated;
+                    spec.peakCeiling = q.peakCeiling;
+                }
+                spec.leqmLimit = q.leqmLimit;
+                // The sound in its own channels, the dialogue found as montage_dialogue_loudness's auto gate finds it.
+                DialogueLoudnessOptions o;
+                o.in = from;
+                o.out = to;
+                o.layout = true;
+                o.leqm = true;
+                o.log = true;
+                o.gate = SpeechGate::Auto;
+                std::string e;
+                const DialogueLoudness d = measureDialogueLoudness(l.project, s, o, [this](double f) { progress(f, "Measuring"); }, nullptr, &e);
+                const QString base = absolute(need(a, "report"));
+                QDir().mkpath(QFileInfo(base).absolutePath());
+                if (!e.empty() || !writeLoudnessCsv((base + ".csv").toStdString(), d, spec, s, &e) ||
+                    !writeLoudnessPdf((base + ".pdf").toStdString(), d, spec, s, &e))
+                    return fail(QStringLiteral("No loudness report: %1").arg(QString::fromStdString(e)));
+                text += QStringLiteral("Loudness report: %1.pdf (and .csv)\n").arg(base);
+            }
+            return ok(issues.empty() ? QStringLiteral("No problems found.") + (text.isEmpty() ? QString() : "\n" + text)
+                                     : QStringLiteral("%1 problem(s):\n").arg(issues.size()) + text);
         });
 
     add("montage_intelligibility", "Measure dialogue intelligibility",
@@ -4309,12 +4353,22 @@ void McpServer::Impl::addTools() {
         "the sound that is speech (under 15 %, the programme figure is the one that counts: `value`). The speech is found "
         "from the Dialogue clips (`gate` roles), transcribed words (transcripts) or by listening (classifier); auto takes "
         "the first the sequence has. Speech-gated loudness from Montage's own speech detection: an estimate of the dialogue "
-        "measurement Netflix's QC makes.",
+        "measurement Netflix's QC makes. Also the loudness range (EBU Tech 3342) over everything (`lra`) and over the "
+        "dialogue alone (`lra_dialogue`), and the cinema Leq(M) (ISO 21727; with `surround`, the surrounds 3 dB down as "
+        "cinemas are calibrated). `report` writes a loudness report: report.pdf and report.csv with the figures, the "
+        "momentary and short-term loudness and true peak every 100 ms, and every stretch over `target` (LUFS, or the "
+        "dialogue's LKFS for a target set with `dialogue`), `peak_ceiling` or `leqm_limit`.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"gate":{"type":"string","enum":["auto","roles","transcripts","classifier"],"default":"auto"},
-            "surround":{"type":"boolean","default":false,"description":"Measure a surround sequence's own channels, not its stereo fold-down"}},
+            "surround":{"type":"boolean","default":false,"description":"Measure a surround sequence's own channels, not its stereo fold-down"},
+            "report":{"type":"string","description":"Path for a loudness report (no extension: .pdf and .csv are added)"},
+            "target":{"type":"number","description":"The report's target, LUFS (LKFS with dialogue)"},
+            "dialogue":{"type":"boolean","default":false,"description":"The target is the dialogue's"},
+            "tolerance":{"type":"number","description":"LU either side of the target (default 1, 2 with dialogue)"},
+            "peak_ceiling":{"type":"number","description":"The report's true peak ceiling, dBTP"},
+            "leqm_limit":{"type":"number","description":"The report's Leq(M) limit (85 trailers, 82 advertising)"}},
             "required":["project"]})json",
-        true, [this](const QJsonObject& a) {
+        false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             const Sequence& s = l.seq();
             DialogueLoudnessOptions o;
@@ -4323,15 +4377,56 @@ void McpServer::Impl::addTools() {
             o.layout = a.value("surround").toBool(false);
             if (!parseSpeechGate(str(a, "gate", "auto").toStdString(), o.gate))
                 throw ArgError{"\"gate\" is auto, roles, transcripts or classifier"};
+            o.leqm = true;
+            LoudnessReportSpec spec;
+            const bool report = a.contains("report");
+            if (report) {
+                o.log = true;
+                spec.title = s.name;
+                if (a.contains("target")) {
+                    spec.target = a.value("target").toDouble();
+                    if (!(spec.target < 0 && spec.target >= -70)) throw ArgError{"\"target\" must be between -70 and 0"};
+                    spec.dialogueGated = a.value("dialogue").toBool(false);
+                    spec.tolerance = std::max(0.1, a.value("tolerance").toDouble(spec.dialogueGated ? 2 : 1));
+                }
+                if (a.contains("peak_ceiling")) {
+                    spec.peakCeiling = a.value("peak_ceiling").toDouble();
+                    if (!(spec.peakCeiling < 0 && spec.peakCeiling >= -20)) throw ArgError{"\"peak_ceiling\" must be between -20 and 0 dBTP"};
+                }
+                if (a.contains("leqm_limit")) {
+                    spec.leqmLimit = a.value("leqm_limit").toDouble();
+                    if (!(spec.leqmLimit >= 60 && spec.leqmLimit <= 110)) throw ArgError{"\"leqm_limit\" must be between 60 and 110"};
+                }
+            }
             std::string why;
             const DialogueLoudness d = measureDialogueLoudness(l.project, s, o, [this](double f) { progress(f, "Measuring"); }, nullptr, &why);
             if (!why.empty()) return fail(QString::fromStdString(why));
+            QString written;
+            if (report) {
+                const QString base = absolute(need(a, "report"));
+                QDir().mkpath(QFileInfo(base).absolutePath());
+                std::string e;
+                if (!writeLoudnessCsv((base + ".csv").toStdString(), d, spec, s, &e) || !writeLoudnessPdf((base + ".pdf").toStdString(), d, spec, s, &e))
+                    return fail(QString::fromStdString(e));
+                written = base + ".pdf";
+            }
             QJsonArray speech;
             for (const auto& [from, to] : d.speech) speech.append(QJsonArray{from, to});
             const QJsonObject r{{"valid", d.valid}, {"dialogue_lkfs", d.dialogue}, {"programme_lkfs", d.programme},
                                 {"true_peak_dbtp", d.truePeak}, {"speech_share", d.speechShare}, {"uses_programme", d.usesProgramme},
                                 {"value", d.value()}, {"gate", QString::fromLatin1(speechGateName(d.gate))}, {"estimate", true},
-                                {"speech_seconds", speech}, {"text", QString::fromStdString(describeDialogueLoudness(d))}};
+                                {"speech_seconds", speech}, {"text", QString::fromStdString(describeDialogueLoudness(d))},
+                                {"lra", d.range}, {"lra_dialogue", d.dialogueRange}, {"leqm", d.leqm}};
+            if (report) {
+                QJsonArray overs;
+                for (const LoudnessOver& v : loudnessOvers(d, spec))
+                    overs.append(QJsonObject{{"from", v.from}, {"to", v.to}, {"what", QString::fromStdString(v.what)}});
+                QJsonObject out = r;
+                out["report"] = written;
+                out["overs"] = overs;
+                out["passes"] = loudnessPasses(d, spec);
+                return ok(json(out), out);
+            }
             return ok(json(r), r);
         });
 
@@ -9800,7 +9895,7 @@ void McpServer::Impl::addTools() {
         "24. `subtitles` names a caption track to send as SMPTE subtitles (or closed captions, or burned in). `encrypt` "
         "encrypts the track files and keeps their keys in a DKDM, from which montage_make_kdm makes KDMs for cinemas. "
         "The package is checked when done (as montage_verify_dcp); returns its name, folder, anything the check found and "
-        "what Bv2.1 advises.",
+        "what Bv2.1 advises, and the sound's Leq(M) (a trailer or teaser over 85, or an advertisement over 82, is a problem).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string","description":"Where to make the DCP folder"},
             "title":{"type":"string"},"kind":{"type":"string","enum":["feature","short","trailer","teaser","advertisement","test","rating","psa"],"default":"feature"},
             "container":{"type":"string","enum":["flat","scope","full"],"description":"Default: Scope for sequences 2:1 or wider, else Flat"},
@@ -9862,6 +9957,8 @@ void McpServer::Impl::addTools() {
             std::vector<std::string> advice;
             for (const std::string& i : verifyDcp(r.folder, {}, &advice)) found.append(QString::fromStdString(i));
             for (const std::string& i : advice) advised.append(QString::fromStdString(i));
+            if (r.overLoudnessLimit())
+                found.append(QStringLiteral("The sound is %1 Leq(M), over the %2 its kind is held to").arg(r.leqm, 0, 'f', 1).arg(r.leqmLimit, 0, 'f', 0));
             const QJsonObject out{{"name", QString::fromStdString(r.name)}, {"folder", QString::fromStdString(r.folder)},
                                   {"cpl", QString::fromStdString(r.cpl)}, {"cpl_id", QString::fromStdString(r.cplId)},
                                   {"frames", double(r.frames)}, {"fps", r.fps},
@@ -9869,6 +9966,8 @@ void McpServer::Impl::addTools() {
                                   {"dci_profile", r.cinemaProfile}, {"stereo", r.stereo}, {"encrypted", r.encrypted},
                                   {"signed", r.signedPackage}, {"subtitles", r.subtitleCount},
                                   {"dkdm", r.dkdm.empty() ? QJsonValue() : QJsonValue(QString::fromStdString(r.dkdm))},
+                                  {"leqm", std::round(r.leqm * 10) / 10},
+                                  {"leqm_limit", r.leqmLimit > 0 ? QJsonValue(r.leqmLimit) : QJsonValue()},
                                   {"problems", found}, {"advice", advised}};
             return ok(found.isEmpty() ? QStringLiteral("Made %1 and checked it: no problems").arg(QString::fromStdString(r.name))
                                       : QStringLiteral("Made %1; the check found %2 problem(s)").arg(QString::fromStdString(r.name)).arg(found.size()),
@@ -10118,6 +10217,8 @@ void McpServer::Impl::addTools() {
             "loudness_lufs":{"type":"number","description":"Normalise the mix to this loudness, e.g. -14 (streaming) or -23 (EBU R128)"},
             "peak_ceiling":{"type":"number","default":-1,"description":"True peak ceiling (dBTP) when normalising"},
             "loudness_dialogue":{"type":"boolean","default":false,"description":"loudness_lufs is the dialogue's (Netflix: -27, peak_ceiling -2), measured as montage_dialogue_loudness does"},
+            "loudness_report":{"type":"boolean","default":false,"description":"Write a loudness report of the sound as delivered beside the output: name.loudness.pdf and name.loudness.csv"},
+            "leqm_limit":{"type":"number","description":"With loudness_report: a cinema Leq(M) limit (85 trailers, 82 advertising)"},
             "burn_in":{"type":"object","description":"Overlays for a review copy","properties":{
                 "timecode":{"type":"boolean"},"clip_name":{"type":"boolean"},"text":{"type":"string"},
                 "footage":{"type":"boolean","description":"Feet and frames in the sequence's film gauge"},
@@ -10258,6 +10359,11 @@ void McpServer::Impl::addTools() {
                 st.peakCeiling = std::min(0.0, a.value("peak_ceiling").toDouble(-1));
                 st.dialogueGated = a.value("loudness_dialogue").toBool(false);
             }
+            st.loudnessReport = a.value("loudness_report").toBool(false);
+            if (a.contains("leqm_limit")) {
+                st.leqmLimit = a.value("leqm_limit").toDouble();
+                if (!(st.leqmLimit >= 60 && st.leqmLimit <= 110)) throw ArgError{"\"leqm_limit\" must be between 60 and 110"};
+            }
             if (a.value("burn_in").isObject()) {
                 const QJsonObject b = a.value("burn_in").toObject();
                 static const QStringList corners = {"top_left", "top_centre", "top_right", "bottom_left", "bottom_centre", "bottom_right"};
@@ -10369,6 +10475,8 @@ void McpServer::Impl::addTools() {
             }
             std::string err;
             LightLevels light;
+            const QString report = QString::fromStdString(loudnessReportBase(st.path)) + ".pdf";
+            if (st.loudnessReport) QFile::remove(report);  // (one from before is not this one's)
             if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, nullptr, &err, nullptr, nullptr, &light))
                 return fail(QString::fromStdString(err));
             QJsonObject o{{"output", QString::fromStdString(st.path)}};
@@ -10415,6 +10523,12 @@ void McpServer::Impl::addTools() {
                     text += QStringLiteral("\nWrote %1").arg(QString::fromStdString(f.path));
                 }
                 o["stems"] = list;
+            }
+            if (st.loudnessReport) {
+                const bool written = QFileInfo::exists(report);
+                o["loudness_report"] = written ? QJsonValue(report) : QJsonValue();
+                text += written ? QStringLiteral("\nLoudness report: %1 (and .csv)").arg(report)
+                                : QStringLiteral("\nNo loudness report: the delivery has no sound, or it could not be written");
             }
             return ok(text, o);
         });

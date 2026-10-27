@@ -1498,6 +1498,26 @@ The tenth gap analysis (`docs/research/phase11-roadmap.md`, October 2026) ranks 
     - Method C's crosstalk α is fixed at 0.05 (the report leaves it open between 0 and 0.33).
     - An HDR sequence peaking below 1000 nits clips Method A's expanded highlights at its peak rather than compressing them.
     - Method A's HLG simplification is not used; HLG output goes through PQ light, which matches it within a 10-bit code.
+- [x] 7. Cinema loudness: Leq(M), dialogue-gated loudness range, loudness logs and a report for each delivery (S)
+  - Done: `LeqMMeter` in `media/Loudness`: the M weighting (ITU-R 468 lowered 5.6 dB, 0 dB at 2 kHz) as a linear-phase FIR from the closed-form curve (frequency sampling, Blackman window, fs/3 taps rounded to a power of two), applied by FFT overlap-add; each channel times its calibration gain, energy summed over channels, 10·log10 + 108.01 (a 2 kHz sine peaking at −20 dBFS reads 85). Fed in any pieces; its reading includes the filter's tail.
+    - `LoudnessMeter` keeps each 100 ms step's true peak and gives `shortTermAt`, `truePeakAt` and `speechLoudnessRange` (EBU Tech 3342 over short-term blocks at least two thirds dialogue).
+    - `DialogueLoudness` gains `range`, `dialogueRange`, `leqm` and `log` (momentary, short-term, true peak and dialogue every 100 ms). `loudnessOfMeter` reads a meter already fed (what an export delivered). `leqmChannelGains`: screen channels and LFE at 0 dB, others −3 dB.
+    - `render/LoudnessReport`: `loudnessOvers` (true peak over the ceiling; short-term over target + tolerance, over dialogue only when the target is the dialogue's; stretches within 1 s joined, each with its worst value), `loudnessPasses`, `writeLoudnessCsv` and `writeLoudnessPdf` (figures, a graph of the readings against the target and ceiling, the overs with timecodes).
+    - Exports: `ExportSettings.loudnessReport` and `leqmLimit` (render farm jobs carry them) write name.loudness.pdf and .csv of the sound after normalisation and limiting. The export dialog's Loudness report: none, PDF and CSV, or with the trailer or advertising limit.
+    - DCP: `DcpResult.leqm`, `leqmLimit` (`dcpLeqmLimit`: trailer and teaser 85, advertisement 82) and `overLoudnessLimit()`, listed with the check's problems in the app and over MCP.
+    - Quality Check: `QcSettings.leqmLimit`, `QcKind::CinemaLoudness`, and the dialog's Cinema trailer and Cinema advertising entries.
+    - Sequence › Loudness Report… (`MainWindow::loudnessReport`): a standard (EBU R128, ATSC A/85, streaming, dialogue, the two cinema limits, or measured only), the timeline's loudness lane, and the PDF and CSV.
+    - MCP: `montage_dialogue_loudness` returns `leqm`, `lra`, `lra_dialogue` and with `report` (and `target`, `dialogue`, `tolerance`, `peak_ceiling`, `leqm_limit`) writes the report and returns its overs; `montage_quality_check` `cinema`, `leqm_limit` and `report`; `montage_render` `loudness_report` and `leqm_limit`; `montage_export_dcp` returns `leqm` and `leqm_limit`.
+  - **Tests:**
+    - media `cinemaLoudness`: the weighting's values; a 2 kHz sine at −20 dBFS reads 85; 1 kHz and 6.3 kHz sines differ by the weighting within 0.1 dB; pieces of any size; channel gains; silence. With `MONTAGE_TEST_LEQM` (leqm-nrt, `scripts/build-leqm-nrt.sh`): pink noise within 0.1 dB, speech and a 5.1 mix within 0.5 dB.
+    - media `cinemaLoudnessDelivery`: Tech 3341 cases 1 and 2 in momentary and short-term loudness (within 0.1 LU) and true peak; a 5.1 sequence with quiet music only between the dialogue has a dialogue range under the whole range; the log's steps and dialogue marks; overs against a dialogue target leave the music out and against the programme include it, and a ceiling lists peaks; CSV and PDF written and read back; a stereo bed brought to 87 Leq(M) is marked by the trailer check and 84 passes; an export's report gives 87 and does not pass; MCP `montage_dialogue_loudness` with a report, `montage_quality_check` `cinema` and `report` (an unknown preset refused), `montage_render` `loudness_report`.
+    - render `exportsDigitalCinemaPackage`: the DCP's Leq(M), and no limit for a short.
+    - app `loudnessReportAndCinemaLimits`: the menu command's lane (red over a low ceiling, all green without limits) and files, the Quality Check presets, the export dialog's report with the trailer limit, the lane cleared by another project.
+  - Not yet:
+    - leqm-nrt's default filter is a polynomial fit that restarts every 850 ms; it reads speech about 0.3 dB lower than the exact ISO curve Montage uses (pink noise agrees within 0.1 dB).
+    - CI does not build leqm-nrt yet, so the comparison runs only where `MONTAGE_TEST_LEQM` is set.
+    - The report's dialogue comes from Dialogue clips or transcripts (Montage's own speech detection when the sequence has neither); an export with a frame rate change has no dialogue marks.
+    - The Tech 3341 cases beyond 1 and 2 (level steps, the integrated cases) are covered by the earlier loudness tests, not repeated here.
     - Montage's titles and graphics are always at reference white (there is no per-title choice to expand them).
 - [ ] 7. Cinema loudness: Leq(m), the loudness range gated by dialogue, loudness logs and reports (S)
 - [ ] 8. Shots grouped by camera angle and by scene for grading (S–M)

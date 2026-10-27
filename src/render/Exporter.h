@@ -114,6 +114,12 @@ struct ExportSettings {
     // The target is the dialogue's loudness (render/DialogueLoudness.h), as Netflix's -27 LKFS is: the mix is measured
     // over its speech (over everything when speech is under 15 % of it).
     bool dialogueGated = false;
+    // A loudness report of the sound as delivered (render/LoudnessReport.h), beside the file as name.loudness.pdf and
+    // name.loudness.csv: integrated and dialogue loudness (the dialogue found from Dialogue clips or transcripts),
+    // ranges, true peak, Leq(M), the readings every 100 ms and every stretch over the target (when normalising) or the
+    // ceiling. leqmLimit adds a cinema Leq(M) limit to it (85 trailers, 82 advertising; 0 none).
+    bool loudnessReport = false;
+    double leqmLimit = 0;
     BurnIn burnIn;
     // A 5.1 or 7.1 sequence's audio is written with all its channels, or folded down to stereo.
     bool downmixStereo = false;
@@ -244,6 +250,11 @@ bool containerCarriesStreams(const std::string& path);
 std::string hdr10PlusCarriage(const Sequence& seq, const ExportSettings& s);
 // Whether an export with these settings carries adaptive HDR metadata (PQ or HLG out, HEVC or AV1 video).
 bool adaptiveHdrCarried(const Sequence& seq, const ExportSettings& s);
+
+// An export's name for the files beside it, without the extension (an image sequence's frame number left out).
+std::string exportSidecarStem(const std::string& path);
+// Where an export's loudness report goes, without the extension: the sidecar stem + ".loudness".
+std::string loudnessReportBase(const std::string& path);
 
 // HDR exports measure their light levels as they render (`light`, when given); PQ files to MP4 and MOV carry the
 // measured MaxCLL and MaxFALL. Encoders that state them before the first frame (x265) use the sequence's analysed

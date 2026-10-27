@@ -110,6 +110,7 @@ private:
     QDoubleSpinBox* spatialBaseline_ = nullptr;  // spatial video: the cameras' baseline (mm)
     QDoubleSpinBox* spatialFov_ = nullptr;       // and horizontal field of view (degrees)
     QComboBox* loudness_ = nullptr;
+    QComboBox* loudnessReport_ = nullptr;
     QCheckBox* described_ = nullptr;  // an audio description stream after the mix
     QComboBox* audioOut_ = nullptr;  // a surround sequence: all its channels, or folded to stereo
     QComboBox* stems_ = nullptr;     // also write stems: none, per track, per bus
