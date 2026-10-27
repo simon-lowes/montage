@@ -8,6 +8,8 @@
 // in the header's cryptomatte/<key>/ metadata with a manifest of object names) are listed apart, not as pictures.
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
