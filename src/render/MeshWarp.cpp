@@ -890,17 +890,26 @@ bool trackMeshPins(const Project& p, const Sequence& seq, const Clip& c, const E
         const std::string pre = "pin" + std::to_string(pins[i]) + ".";
         const double x = e.p(pre + "x", at, 0.5), y = e.p(pre + "y", at, 0.5);
         TrackRegion start;
-        start.x = e.p(pre + "to_x", at, x), start.y = e.p(pre + "to_y", at, y), start.w = 0.1, start.h = 0.1 * aspect;
+        start.x = e.p(pre + "to_x", at, x), start.y = e.p(pre + "to_y", at, y);
         auto stage = [&, i](double a, double b) {
             return [&, i, a, b](double f) {
                 if (progress && !progress((double(i) + a + (b - a) * f) / double(pins.size()))) cancelled = true;
             };
         };
-        const std::vector<TrackRegion> ahead = last > from ? trackRegion(path, from, last, start, MotionModel::TranslationScale, stage(0, 0.5), &cancelled, error)
-                                                           : std::vector<TrackRegion>{start};
-        const std::vector<TrackRegion> behind = first < from ? trackRegion(path, from, first, start, MotionModel::TranslationScale, stage(0.5, 1), &cancelled, error)
-                                                             : std::vector<TrackRegion>{start};
-        if (cancelled) return fail("Cancelled");
+        // A small region round the pin first; where it has too little detail to hold on to and is lost, a larger one.
+        std::vector<TrackRegion> ahead, behind;
+        const size_t wantAhead = last > from ? size_t(std::floor((last - from) / frameSeconds + 1e-6)) + 1 : 1;
+        const size_t wantBehind = first < from ? size_t(std::floor((from - first) / frameSeconds + 1e-6)) + 1 : 1;
+        for (double size : {0.1, 0.2, 0.3}) {
+            start.w = size, start.h = size * aspect;
+            std::vector<TrackRegion> a = last > from ? trackRegion(path, from, last, start, MotionModel::TranslationScale, stage(0, 0.5), &cancelled, error)
+                                                     : std::vector<TrackRegion>{start};
+            std::vector<TrackRegion> b = first < from ? trackRegion(path, from, first, start, MotionModel::TranslationScale, stage(0.5, 1), &cancelled, error)
+                                                      : std::vector<TrackRegion>{start};
+            if (cancelled) return fail("Cancelled");
+            if (a.size() + b.size() > ahead.size() + behind.size()) ahead = std::move(a), behind = std::move(b);
+            if (ahead.size() >= wantAhead && behind.size() >= wantBehind) break;
+        }
         Param px(start.x), py(start.y);
         for (FrameTime f = 0; f < c.duration; ++f) {
             const double k = (mediaTime(f) - from) / frameSeconds;
