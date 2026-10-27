@@ -49,6 +49,7 @@ add_library(montage_engine STATIC
   core/Effects.h core/Effects.cpp
   core/EditOps.h core/EditOps.cpp
   core/TimelineCompare.h core/TimelineCompare.cpp
+  core/ProjectMerge.h core/ProjectMerge.cpp
   core/Reconform.h core/Reconform.cpp
   core/Adr.h core/Adr.cpp
   core/TakeLanes.h core/TakeLanes.cpp
@@ -178,6 +179,7 @@ add_library(montage_engine STATIC
   render/ConformCheck.h render/ConformCheck.cpp
   render/Shapes.h render/Shapes.cpp
   render/Title3D.h render/Title3D.cpp
+  render/Titles.h render/Titles.cpp
   render/ModelRender.h render/ModelRender.cpp
   render/ModelClip.h render/ModelClip.cpp
   render/Particles.h render/Particles.cpp
@@ -238,6 +240,7 @@ add_library(montage_engine STATIC
   render/OGraf.h render/OGraf.cpp
   render/Gallery.h render/Gallery.cpp
   render/LinedScript.h render/LinedScript.cpp
+  render/LoudnessReport.h render/LoudnessReport.cpp
   render/FilmLists.h render/FilmLists.cpp
   render/PaperworkOutput.h render/PaperworkOutput.cpp
   render/ImageSubtitles.h render/ImageSubtitles.cpp
@@ -248,6 +251,7 @@ add_library(montage_engine STATIC
   render/AudioFx.h render/AudioFx.cpp
   render/VideoFx.h render/VideoFx.cpp
   render/StyleFx.h render/StyleFx.cpp
+  render/MeshWarp.h render/MeshWarp.cpp
   render/TemporalFx.h render/TemporalFx.cpp
   render/Deconvolve.h render/Deconvolve.cpp
   render/Exporter.h render/Exporter.cpp

@@ -24,6 +24,9 @@ const std::vector<TrimTarget>& trimTargetPresets();
 const TrimTarget* findTrimTarget(const Sequence& s, const std::string& id);
 // The space and peak a target's pictures are in (the sequence's own for "" or an unknown target).
 const ColorSpace& trimTargetSpace(const Sequence& s, const std::string& id);
+// A target's display space with its tone mapping (none for a sequence graded scene-referred, which goes through its
+// output transform), or null when it names no space Montage knows.
+const ColorSpace* trimTargetDisplay(const Sequence& s, const TrimTarget& t);
 double trimTargetPeak(const Sequence& s, const std::string& id);
 
 // A trim's controls: lift, gamma, gain, saturation, highlights, mid_detail, each with its default (no change), and
@@ -50,6 +53,8 @@ void applyTrim(Image& img, const Sequence& s, const TrimTarget& target, const Ef
 // The master light an SDR target shows just short of white (Montage's HDR-to-SDR mapping puts it at 98 %): a shot's
 // peak is rolled off to it.
 constexpr double kSdrHeadroomNits = 280;
+// The same for an SDR space: with a BT.2446 method, the light it brings down to white.
+double sdrHeadroomNits(const ColorSpace& sdr);
 // BT.2390's EETF on PQ code values: the brightest channel rolled off from `fromNits` to `toNits`, hue kept.
 void rollOffPq(Image& img, double fromNits, double toNits);
 
@@ -58,6 +63,8 @@ namespace edit {
 Result addTrimTarget(Sequence& s, TrimTarget target);
 // Removes one and every clip's trim for it.
 Result removeTrimTarget(Sequence& s, const std::string& id);
+// How an SDR target is made from the HDR master (render/ColorSpace.h ToneMapping id: "", "bt2446a" or "bt2446c").
+Result setTrimTargetToneMapping(Sequence& s, const std::string& id, const std::string& toneMapping);
 // Sets controls of a clip's trim for a target (made if need be): at `at` (timeline frame) when the control has
 // keyframes (or `keyframe`: one is added there, the first also keeping its value at the clip's start), else its
 // value. Unknown controls fail.

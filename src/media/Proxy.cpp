@@ -204,11 +204,15 @@ std::string soundSource(const MediaItem& m, bool offlineProxies) {
 }
 
 const ColorSpace& pictureColorSpace(const MediaItem& m, const std::string& path) {
+    // (SDR footage brought up into HDR as Interpret Footage asks; not an HDR file's SDR proxy or gain-map picture)
+    ToneMapping expand = ToneMapping::Montage;
+    const ColorSpace& own = mediaColorSpace(m);
+    if (!own.hdr() && !own.sceneReferred) parseToneMapping(m.sdrExpand, expand);
     // A gain-map JPEG's SDR picture (read in place of its HDR rendition: render/Compositor.cpp).
-    if (m.gainMap && m.colorOverride.empty() && path != m.path && path == gainMapPath(m.path, false)) return rec709Space();
-    if (m.proxyPath.empty() || path != m.proxyPath) return mediaColorSpace(m);
+    if (m.gainMap && m.colorOverride.empty() && path != m.path && path == gainMapPath(m.path, false)) return withToneMapping(rec709Space(), expand);
+    if (m.proxyPath.empty() || path != m.proxyPath) return withToneMapping(mediaColorSpace(m), expand);
     const ColorSpace* c = findColorSpace(probed(path).colorSpace);
-    return c ? *c : rec709Space();
+    return withToneMapping(c ? *c : rec709Space(), expand);
 }
 
 std::string analysisSource(const MediaItem& m) {

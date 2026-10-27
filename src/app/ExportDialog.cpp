@@ -351,6 +351,14 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     color_->setToolTip(tr("Deliver in another colour space: an HDR sequence delivered in Rec.709 is tone mapped.\n"
                           "HDR output is 10-bit and tagged; PQ carries HDR10 metadata."));
     form->addRow(tr("Colour:"), color_);
+    // An HDR sequence delivered in SDR: Montage's roll-off, or a BT.2446 method.
+    toneMapping_ = new QComboBox(form_);
+    toneMapping_->setObjectName(QStringLiteral("exportToneMapping"));
+    toneMapping_->addItem(tr("Montage (highlights rolled off)"), QString());
+    toneMapping_->addItem(tr("BT.2446 Method A"), QStringLiteral("bt2446a"));
+    toneMapping_->addItem(tr("BT.2446 Method C"), QStringLiteral("bt2446c"));
+    toneMapping_->setToolTip(tr("How an HDR sequence is made into SDR (a sequence graded scene-referred goes through its output transform)"));
+    form->addRow(tr("Tone mapping:"), toneMapping_);
     hdr10Plus_ = new QCheckBox(tr("Dynamic HDR metadata (ST 2094-40, scene by scene)"), form_);
     hdr10Plus_->setObjectName(QStringLiteral("exportHdr10Plus"));
     hdr10Plus_->setToolTip(tr("Each scene's light measured (SMPTE ST 2094-40) so televisions that read dynamic HDR metadata tone map it scene by scene: "
@@ -434,6 +442,18 @@ ExportDialog::ExportDialog(EditorState* state, QWidget* parent) : QDialog(parent
     loudness_->setToolTip(tr("Measures the whole mix first, then sets its level to the target, with a limiter "
                              "keeping peaks under the ceiling"));
     form->addRow(tr("Loudness:"), loudness_);
+    // A report of the sound as delivered (render/LoudnessReport.h): none, or a PDF and CSV, with a cinema Leq(M) limit
+    // (the data; -1 for no report).
+    loudnessReport_ = new QComboBox(form_);
+    loudnessReport_->setObjectName(QStringLiteral("exportLoudnessReport"));
+    loudnessReport_->addItem(tr("None"), -1.0);
+    loudnessReport_->addItem(tr("PDF and CSV"), 0.0);
+    loudnessReport_->addItem(tr("PDF and CSV, cinema trailer: 85 Leq(M)"), 85.0);
+    loudnessReport_->addItem(tr("PDF and CSV, cinema advertising: 82 Leq(M)"), 82.0);
+    loudnessReport_->setCurrentIndex(std::clamp(appSettings().value("export/loudnessReport", 0).toInt(), 0, loudnessReport_->count() - 1));
+    loudnessReport_->setToolTip(tr("Writes name.loudness.pdf and name.loudness.csv beside the file: integrated and dialogue loudness, "
+                                   "loudness range, true peak, Leq(M), the readings every 100 ms and every stretch over a limit"));
+    form->addRow(tr("Loudness report:"), loudnessReport_);
     // Surround sequences: every channel, or the stereo fold-down.
     {
         const Sequence* sq = state_->sequence();
@@ -800,10 +820,13 @@ void ExportDialog::updateControls() {
         const ColorSpace* out = chosen ? chosen : sq ? &sequenceColorSpace(*sq) : nullptr;
         const std::string vc = p ? p->settings.videoCodec : std::string();
         hdr10Plus_->setEnabled(video && out && out->transfer == Transfer::Pq && vc != "exr" && vc != "gif");
+        toneMapping_->setEnabled(video && sq && out && !out->hdr() && !out->sceneReferred && sequenceColorSpace(*sq).hdr() &&
+                                 !sceneReferredWorking(*sq) && vc != "exr");
         adaptiveHdr_->setEnabled(video && out && out->hdr() && vc != "exr" && vc != "gif");
         exrCompression_->setEnabled(video && vc == "exr" && exrAvailable());
     }
     loudness_->setEnabled(p && hasAudio(p->settings));
+    loudnessReport_->setEnabled(p && hasAudio(p->settings));
     quality_->setEnabled(p && usesCrf(p->settings.videoCodec));
     const Sequence* seq = state_ ? state_->sequence() : nullptr;
     const CaptionTrack* ct = seq ? captionTrackFor(*seq) : nullptr;
@@ -1102,6 +1125,7 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
     s.smartRender = smart_->isChecked();
     settings.setValue("export/smartRender", smart_->isChecked());
     if (hasVideo(s)) s.colorSpace = color_->currentData().toString().toStdString();
+    if (hasVideo(s) && toneMapping_->isEnabled()) s.toneMapping = toneMapping_->currentData().toString().toStdString();
     if (hasVideo(s) && state_->sequence() && state_->sequence()->stereo3d) {
         s.stereo = stereo_->currentData().toString().toStdString();
         settings.setValue("export/stereo", stereo_->currentData().toString());
@@ -1117,6 +1141,11 @@ bool ExportDialog::prepare(ExportSettings& s, FrameTime& in, FrameTime& out) {
         s.dialogueGated = loudness_->currentData(Qt::UserRole + 1).toBool();
     }
     settings.setValue("export/loudness", loudness_->currentIndex());
+    if (hasAudio(s) && loudnessReport_->currentIndex() > 0) {
+        s.loudnessReport = true;
+        s.leqmLimit = loudnessReport_->currentData().toDouble();
+    }
+    settings.setValue("export/loudnessReport", loudnessReport_->currentIndex());
     if (hasAudio(s)) s.downmixStereo = !audioOut_->isHidden() && audioOut_->currentIndex() == 1;
     stemsMode_ = hasAudio(s) ? stems_->currentIndex() : 0;
     if (hasVideo(s)) {

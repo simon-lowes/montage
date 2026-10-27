@@ -1207,14 +1207,15 @@ Result deleteGaps(Project& p, Sequence& s, bool leading, int* closed, FrameTime*
             shiftParam(t->volumeAuto, b, len);
             shiftParam(t->panAuto, b, len);
             shiftParam(t->muteAuto, b, len);
+            shiftParam(t->volumeTrim, b, len);
             for (Param* lane : {&t->surroundXAuto, &t->surroundYAuto, &t->surroundZAuto}) shiftParam(*lane, b, len);
-            for (Send& sd : t->sends) shiftParam(sd.levelAuto, b, len);
+            for (Send& sd : t->sends) shiftParam(sd.levelAuto, b, len), shiftParam(sd.levelTrim, b, len);
             for (Effect& e : t->effects)
                 for (auto& [name, q] : e.params) shiftParam(q, b, len);
         }
         // Buses and the master are keyed in timeline frames too.
         for (Bus& bus : s.buses) {
-            for (Param* lane : {&bus.volumeAuto, &bus.panAuto, &bus.muteAuto}) shiftParam(*lane, b, len);
+            for (Param* lane : {&bus.volumeAuto, &bus.panAuto, &bus.muteAuto, &bus.volumeTrim}) shiftParam(*lane, b, len);
             for (Effect& e : bus.effects)
                 for (auto& [name, q] : e.params) shiftParam(q, b, len);
         }

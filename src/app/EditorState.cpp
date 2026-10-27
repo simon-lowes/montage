@@ -3,6 +3,7 @@
 #include "core/Expression.h"
 #include "core/GradeGraph.h"
 #include "render/ClipAnalysis.h"
+#include "render/LearnFromClip.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -1273,6 +1274,8 @@ bool EditorState::save(const QString& path, QString* error) {
     }
     Project p = project_;
     if (p.name.empty() || p.name == "Untitled") p.name = QFileInfo(path).completeBaseName().toStdString();
+    // (Learned networks trained before the project had a file are kept beside it, not left in the temporary folder.)
+    const std::map<std::string, std::string> networks = keepLearnedNetworks(p, path.toStdString());
     std::string err;
     if (!saveProject(p, path.toStdString(), &err)) {
         if (newLock) releaseProjectLock(path.toStdString());
@@ -1289,6 +1292,7 @@ bool EditorState::save(const QString& path, QString* error) {
         }
     }
     project_.name = p.name;
+    repointLearnedNetworks(project_, networks);
     path_ = path;
     savedRevision_ = history_.revision();
     diskTime_ = QFileInfo(path).lastModified();

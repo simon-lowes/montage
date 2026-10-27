@@ -176,11 +176,14 @@ void visitSettings(S& s, V& v) {
     v("cea708", s.cea708);
     v("exrCompression", s.exrCompression);
     v("colorSpace", s.colorSpace);
+    v("toneMapping", s.toneMapping);
     v("trimTarget", s.trimTarget);
     v("hdr10Plus", s.hdr10Plus);
     v("loudnessTarget", s.loudnessTarget);
     v("peakCeiling", s.peakCeiling);
     v("dialogueGated", s.dialogueGated);
+    v("loudnessReport", s.loudnessReport);
+    v("leqmLimit", s.leqmLimit);
     v("downmixStereo", s.downmixStereo);
     v("audioTracks", s.audioTracks);
     v("chapters", s.chapters);

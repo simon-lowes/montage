@@ -20,6 +20,14 @@
 // with the new one, each reused stretch checked against the old package's frames), the sound where its samples
 // differ, timed text that is new; its composition plays the earlier packages' track files by id around them. An IMF
 // package, original or supplemental, can also be opened as a sequence.
+//
+// Archival masters (Application #5, ST 2067-50): the programme as ACES 2065-1, half-float OpenEXR frames (ST 2065-4)
+// wrapped frame by frame (ST 2065-5), graded (the grade in the pictures, in the working space's light) or ungraded (each
+// clip only as its input transform brings it into ACES). The composition names the output transform the pictures were
+// made for (the sequence's ACES 2.0 one, or Montage's filmic one under Montage's own name; a display-referred sequence's
+// pictures are brought into ACES through the inverse of the filmic one). Target frames, display-referred 16-bit TIFF
+// stills of chosen frames through that output transform, travel in the track file, with an ACES Metadata File in the
+// package. Sound, timed text and supplementals are as for Application #2E.
 #pragma once
 
 #include <cstdint>
@@ -73,6 +81,13 @@ struct ImfSettings {
     // The sequence that package was mastered from, kept as it was (a copy made before the changes): its cut is
     // compared with this one to find the pictures that changed. 0: the picture has not changed (new sound or text).
     Id originalSequence = 0;
+    // The IMF application: 2 (#2E, JPEG 2000 in the colour above) or 5 (#5, an archival master in ACES 2065-1, where the
+    // colour, depth and coding above do not apply).
+    int application = 2;
+    // Application #5: the grade in the pictures; false leaves it off.
+    bool graded = true;
+    // Application #5: sequence frames (within what is exported) also given as target frames.
+    std::vector<FrameTime> targetFrames;
 };
 
 struct ImfResult {
@@ -87,6 +102,10 @@ struct ImfResult {
     int64_t codedFrames = 0;     // pictures in the package's own track file (a supplemental's: those that changed)
     int64_t newSamples = 0;      // sample frames in its own sound track files
     std::vector<std::string> trackFiles;  // the track files written
+    int application = 2;
+    std::string outputTransform;  // Application #5: the output transform named (ACESAuthoringInformation)
+    int targetFrames = 0;
+    std::string amf;              // ... and the ACES Metadata File, when there are target frames
 };
 
 // A composition playlist as read back: its virtual tracks (each Resource with the track file it plays), and what the
@@ -111,8 +130,10 @@ struct ImfComposition {
     uint32_t rateNum = 24, rateDen = 1;
     int width = 0, height = 0, bits = 0;
     uint16_t rsiz = 0;
-    std::string colour;  // as ImfSettings::colour ("" when not one of those)
+    std::string colour;  // as ImfSettings::colour, or "aces2065-1" for Application #5 ("" when none of those)
     double masteringPeak = 0;
+    int application = 2;        // from its ApplicationIdentification (2 for #2E, 5 for #5, 0 for another)
+    std::string acesAuthoring;  // Application #5: the output transform its pictures were made for
     std::vector<ImfVirtualTrack> tracks;
     std::map<std::string, std::string> descriptors;  // id: the descriptor's RegXML, as written
     const ImfVirtualTrack* picture() const;
@@ -149,8 +170,9 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
 
 // Checks a package: the asset map, every file at its size, the packing list's hashes, the composition's resources in
 // the package (or, for a supplemental, in the packages beside it, against the composition's hashes) with durations
-// within them and their essence descriptors listed, every virtual track as long as the picture, the Application #2E
-// identification, the picture track files JPEG 2000 in an IMF profile with as many frames as the composition says, the
+// within them and their essence descriptors listed, every virtual track as long as the picture, the Application #2E or #5
+// identification, the picture track files JPEG 2000 in an IMF profile (#5: every frame an ACES image container with
+// the attributes ST 2065-4 requires, every target frame in its stream) with as many frames as the composition says, the
 // sound 24-bit 48 kHz with as many samples, the timed text TTML. An empty list means it passed; `progress` may return
 // false to stop ("Stopped").
 std::vector<std::string> verifyImf(const std::string& folder, const std::function<bool(double)>& progress = {});
@@ -158,5 +180,12 @@ std::vector<std::string> verifyImf(const std::string& folder, const std::functio
 // Frame `index` of an IMF picture track file decoded to RGB samples.
 bool readImfFrame(const std::string& mxf, int index, std::vector<uint16_t>& rgb, int& width, int& height, int& bits,
                   std::string* error = nullptr);
+// Frame `index` of an Application #5 track file as straight RGBA floats (ACES 2065-1), through OpenEXR.
+bool readImfAcesFrame(const std::string& mxf, int index, std::vector<float>& rgba, int& width, int& height, std::string* error = nullptr);
+// Its target frame `i` decoded to 16-bit RGB, and the track file frame it shows.
+bool readImfTargetFrame(const std::string& mxf, int i, std::vector<uint16_t>& rgb, int& width, int& height, int64_t* frame = nullptr,
+                        std::string* error = nullptr);
+// The output transform an Application #5 master of `s` is named with, and the display and peak it renders for.
+std::string imfOutputTransform(const Sequence& s, std::string* display = nullptr, double* peakNits = nullptr);
 
 }  // namespace montage

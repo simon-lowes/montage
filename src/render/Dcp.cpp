@@ -33,6 +33,7 @@ extern "C" {
 #include "PackageFiles.h"
 #include "core/Captions.h"
 #include "core/Surround.h"
+#include "media/Loudness.h"
 #include "media/SuperScale.h"
 
 namespace montage {
@@ -327,6 +328,8 @@ bool dcpContainer(const std::string& container, int& width, int& height, bool fo
     return true;
 }
 
+double dcpLeqmLimit(const std::string& kind) { return kind == "trailer" || kind == "teaser" ? 85.0 : kind == "advertisement" ? 82.0 : 0.0; }
+
 std::string defaultDcpContainer(const Sequence& s) { return s.height > 0 && double(s.width) / s.height >= 2.0 ? "scope" : "flat"; }
 
 int dcpFrameRate(const Sequence& s, int requested) {
@@ -485,6 +488,10 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
         const int64_t firstSample = int64_t(std::llround(double(first) * perFrame / step));
         AudioMixer mixer;
         std::vector<float> mix(size_t(perFrame) * size_t(std::max(2, seqChannels))), out(size_t(perFrame) * size_t(channels));
+        // (its Leq(M), as the cinema hears it: the screen channels and LFE at 0 dB, the surrounds 3 dB down)
+        std::vector<double> gains(size_t(channels), 1.0);
+        for (int c = 4; c < channels; ++c) gains[size_t(c)] = std::pow(10.0, -3.0 / 20);
+        LeqMMeter leqm(kSampleRate, channels, gains.data());
         // Where each of the sequence's channels goes: stereo to L and R; 5.1 as it is; 7.1 (L R C LFE Lb Rb Ls Rs, as
         // FFmpeg orders it) to 7.1 DS (L R C LFE Lss Rss Lrs Rrs).
         std::vector<int> route;
@@ -500,9 +507,14 @@ bool exportDcp(const Project& p, const Sequence& s, const DcpSettings& requested
             for (int i = 0; i < perFrame; ++i)
                 for (size_t c = 0; c < route.size(); ++c) out[size_t(i) * size_t(channels) + size_t(route[c])] = mix[size_t(i) * size_t(in) + c];
             if (!sound.write(out.data(), &err)) return fail(err);
+            leqm.add(out.data(), perFrame);
             if (progress && k % 48 == 0 && !progress(0.05 * double(k) / double(frames))) return fail("Stopped");
         }
         if (!sound.close(&err)) return fail(err);
+        if (result) {
+            result->leqm = leqm.leqm();
+            result->leqmLimit = dcpLeqmLimit(settings.kind);
+        }
     }
 
     // The subtitles: ST 428-7 XML with the font it loads, in a timed text track file.

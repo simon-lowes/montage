@@ -1,6 +1,7 @@
 #include "ColorSpace.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <map>
 #include <memory>
@@ -240,7 +241,55 @@ const std::vector<ColorSpace>& colorSpaces() {
 const ColorSpace* findColorSpace(const std::string& id) {
     for (const auto& c : colorSpaces())
         if (c.id == id) return &c;
-    return nullptr;
+    // (an SDR space with a tone mapping)
+    const size_t plus = id.find('+');
+    ToneMapping t;
+    if (plus == std::string::npos || !parseToneMapping(id.substr(plus + 1), t) || t == ToneMapping::Montage) return nullptr;
+    const ColorSpace* base = findColorSpace(id.substr(0, plus));
+    if (!base || base->hdr() || base->sceneReferred) return nullptr;
+    return &withToneMapping(*base, t);
+}
+
+const char* toneMappingId(ToneMapping t) {
+    switch (t) {
+        case ToneMapping::Montage: return "";
+        case ToneMapping::Bt2446A: return "bt2446a";
+        case ToneMapping::Bt2446C: return "bt2446c";
+    }
+    return "";
+}
+
+bool parseToneMapping(const std::string& id, ToneMapping& out) {
+    for (ToneMapping t : {ToneMapping::Montage, ToneMapping::Bt2446A, ToneMapping::Bt2446C})
+        if (id == toneMappingId(t)) {
+            out = t;
+            return true;
+        }
+    return false;
+}
+
+const ColorSpace& withToneMapping(const ColorSpace& s, ToneMapping t) {
+    if (s.hdr() || s.sceneReferred || s.toneMapping == t) return s;
+    const ColorSpace* base = findColorSpace(s.id.substr(0, s.id.find('+')));
+    if (!base) return s;
+    if (t == ToneMapping::Montage) return *base;
+    // (made once each, kept for the life of the program: callers hold them by reference)
+    static std::mutex m;
+    static std::map<std::string, std::unique_ptr<ColorSpace>> made;
+    const std::string id = base->id + "+" + toneMappingId(t);
+    std::lock_guard lock(m);
+    auto& slot = made[id];
+    if (!slot) {
+        slot = std::make_unique<ColorSpace>(*base);
+        slot->id = id;
+        slot->label = base->label + (t == ToneMapping::Bt2446A ? " (BT.2446 A)" : " (BT.2446 C)");
+        slot->toneMapping = t;
+    }
+    return *slot;
+}
+
+bool sameColorSpace(const ColorSpace& a, const ColorSpace& b) {
+    return a.id == b.id || a.id.substr(0, a.id.find('+')) == b.id.substr(0, b.id.find('+'));
 }
 
 std::string colorSpaceFromTags(const std::string& primaries, const std::string& transfer) {
@@ -353,7 +402,8 @@ struct ToneScale {
 };
 
 // The ACES 2.0 config's display and view for a space (nearest peak for PQ), false where it has none.
-bool aces2View(const ColorSpace& to, double peakNits, std::string& display, std::string& view) {
+bool aces2View(const ColorSpace& space, double peakNits, std::string& display, std::string& view) {
+    const ColorSpace& to = withToneMapping(space, ToneMapping::Montage);  // (a scene-referred grade has its own transform)
     auto hdr = [&](const char* gamut, std::initializer_list<int> peaks) {
         int best = *peaks.begin();
         for (int p : peaks)
@@ -686,8 +736,112 @@ void primariesMatrix(Primaries from, Primaries to, double m[9]) {
 }
 
 namespace {
+// ---- Report ITU-R BT.2446-1: methods A and C, on BT.2020 display light in cd/m² ----
+// Method A (§ 4): HDR made at 1000 cd/m² into SDR at 100 (Tables 2 and 3), and SDR into HDR (Table 4).
+void bt2446aDown(const double nits[3], double sdr[3]) {
+    double p[3];
+    for (int i = 0; i < 3; ++i) p[i] = std::pow(std::clamp(nits[i] / 1000, 0.0, 1.0), 1 / 2.4);
+    const double y = luminance2020(p[0], p[1], p[2]);
+    const double rhoHdr = 1 + 32 * std::pow(1000.0 / 10000, 1 / 2.4), rhoSdr = 1 + 32 * std::pow(100.0 / 10000, 1 / 2.4);
+    const double yp = std::log(1 + (rhoHdr - 1) * y) / std::log(rhoHdr);
+    const double yc = yp <= 0.7399 ? 1.0770 * yp : yp < 0.9909 ? -1.1510 * yp * yp + 2.7811 * yp - 0.6302 : 0.5 * yp + 0.5;
+    const double ySdr = (std::pow(rhoSdr, yc) - 1) / (rhoSdr - 1);
+    const double f = y > 0 ? ySdr / (1.1 * y) : 0;
+    const double cb = f * (p[2] - y) / 1.8814, cr = f * (p[0] - y) / 1.4746;
+    const double yt = ySdr - std::max(0.1 * cr, 0.0);
+    const double out[3] = {yt + 1.4746 * cr, yt - 0.16455 * cb - 0.57135 * cr, yt + 1.8814 * cb};
+    for (int i = 0; i < 3; ++i) sdr[i] = std::pow(std::clamp(out[i], 0.0, 1.0), 2.4) * 100;
+}
+void bt2446aUp(const double sdr[3], double nits[3]) {
+    double p[3];
+    for (int i = 0; i < 3; ++i) p[i] = std::pow(std::clamp(sdr[i] / 100, 0.0, 1.0), 1 / 2.4);
+    const double y = luminance2020(p[0], p[1], p[2]);
+    const double cb = (p[2] - y) / 1.8814, cr = (p[0] - y) / 1.4746;
+    const double y2 = 255.0 * y;
+    const double e = y2 <= 70 ? 1.8712e-5 * y2 * y2 - 2.7334e-3 * y2 + 1.3141 : 2.8305e-6 * y2 * y2 - 7.4622e-4 * y2 + 1.2528;
+    const double yHdr = y2 > 0 ? std::pow(y2, e) : 0;
+    const double sc = y > 0 ? 1.075 * yHdr / y : 1;
+    const double cbH = cb * sc, crH = cr * sc;
+    const double out[3] = {yHdr + 1.4746 * crH, yHdr - 0.16455 * cbH - 0.57135 * crH, yHdr + 1.8814 * cbH};
+    for (int i = 0; i < 3; ++i) nits[i] = std::pow(std::clamp(out[i], 0.0, 1000.0) / 1000, 2.4) * 1000;
+}
+// Method C (§ 6): HDR into SDR (§§ 6.1.1 to 6.1.7, without the optional § 6.1.8) and its exact inverse (§ 6.2), with
+// k1 and k3 of equation (10) and a light crosstalk (α = 0.05; the report leaves it between 0 and 0.33). k2 and k4 are
+// worked out from them by equations (7) and (8), as rounded in (10) the two parts of the curve miss each other by
+// 0.035 cd/m², and its inverse would turn back on itself there.
+constexpr double kK1 = 0.83802, kK3 = 0.74204, kAlpha = 0.05;
+constexpr double kKnee = 58.5 / kK1;  // the inflection point, cd/m² of HDR
+const double kK2 = kK1 * (1 - kK3) * kKnee, kK4 = kK1 * kKnee - kK2 * std::log(1 - kK3);
+// (the light Method C brings down to SDR's 100 cd/m²)
+const double kCWhite = kKnee * (std::exp((100 - kK4) / kK2) + kK3);
+void bt2446c(const double in[3], double out[3], bool down) {
+    static const double toXyz[9] = {0.6370, 0.1446, 0.1689, 0.2627, 0.6780, 0.0593, 0.0000, 0.0281, 1.0610};
+    static const double cross[9] = {1 - 2 * kAlpha, kAlpha, kAlpha, kAlpha, 1 - 2 * kAlpha, kAlpha, kAlpha, kAlpha, 1 - 2 * kAlpha};
+    static const auto inverses = [] {
+        std::array<double, 18> m{};
+        invert3(toXyz, m.data());
+        invert3(cross, m.data() + 9);
+        return m;
+    }();
+    const double* fromXyz = inverses.data();
+    const double* uncross = inverses.data() + 9;
+    auto apply = [](const double* m, const double v[3], double r[3]) {
+        for (int i = 0; i < 3; ++i) r[i] = m[i * 3] * v[0] + m[i * 3 + 1] * v[1] + m[i * 3 + 2] * v[2];
+    };
+    double x[3], xyz[3];
+    apply(cross, in, x);
+    apply(toXyz, x, xyz);
+    const double sum = xyz[0] + xyz[1] + xyz[2];
+    if (!(sum > 1e-12) || !(xyz[1] > 1e-12)) {
+        out[0] = out[1] = out[2] = 0;
+        return;
+    }
+    const double cx = xyz[0] / sum, cy = xyz[1] / sum, y = xyz[1];
+    const double mapped = down ? (y < kKnee ? kK1 * y : kK2 * std::log(y / kKnee - kK3) + kK4)
+                               : (y < kK1 * kKnee ? y / kK1 : kKnee * (std::exp((y - kK4) / kK2) + kK3));
+    const double back[3] = {cx / cy * mapped, mapped, (1 - cx - cy) / cy * mapped};
+    apply(fromXyz, back, x);
+    apply(uncross, x, out);
+}
+
+// A pixel between SDR and HDR by `t` (one of the BT.2446 methods): code values in `from` to code values in `to`.
+void convertBt2446(float rgb[3], const ColorSpace& from, const ColorSpace& to, double hdrPeakNits, ToneMapping t) {
+    double c[3], in[3], out[3], m[9];
+    displayLight(from, rgb, c);  // (relative to SDR white, or HDR reference white)
+    primariesMatrix(from.primaries, Primaries::Bt2020, m);
+    const double scale = from.hdr() ? kSdrWhiteNits : 100;
+    for (int r = 0; r < 3; ++r) in[r] = std::max(0.0, (m[r * 3] * c[0] + m[r * 3 + 1] * c[1] + m[r * 3 + 2] * c[2]) * scale);
+    if (from.hdr()) {
+        if (t == ToneMapping::Bt2446A) bt2446aDown(in, out);
+        else bt2446c(in, out, true);
+    } else {
+        for (double& v : in) v = std::min(v, 100.0);  // (SDR's own range: its peak at 100 cd/m²)
+        if (t == ToneMapping::Bt2446A) bt2446aUp(in, out);
+        else bt2446c(in, out, false);
+    }
+    // Into the target's primaries, relative again, held to what its display shows.
+    primariesMatrix(Primaries::Bt2020, to.primaries, m);
+    const double toScale = to.hdr() ? kSdrWhiteNits : 100;
+    const double most = to.hdr() ? (to.transfer == Transfer::Hlg ? kHlgPeak : hdrPeakNits) / kSdrWhiteNits : 1.0;
+    double l[3];
+    for (int r = 0; r < 3; ++r)
+        l[r] = std::clamp((m[r * 3] * out[0] + m[r * 3 + 1] * out[1] + m[r * 3 + 2] * out[2]) / toScale, 0.0, most);
+    encodeDisplayLight(to, l, rgb);
+}
+
+// The tone mapping a conversion takes: the SDR side's, between an SDR display space and an HDR one.
+ToneMapping conversionToneMapping(const ColorSpace& from, const ColorSpace& to) {
+    if (!from.hdr() && !from.sceneReferred && to.hdr()) return from.toneMapping;
+    if (from.hdr() && !to.hdr() && !to.sceneReferred) return to.toneMapping;
+    return ToneMapping::Montage;
+}
+
 // convertPixel with the primaries matrix already worked out.
 void convertPixelWith(float rgb[3], const ColorSpace& from, const ColorSpace& to, double hdrPeakNits, const double m[9]) {
+    if (const ToneMapping t = conversionToneMapping(from, to); t != ToneMapping::Montage) {
+        convertBt2446(rgb, from, to, hdrPeakNits, t);
+        return;
+    }
     // 1. Code values to linear light in the source primaries.
     double c[3];
     displayLight(from, rgb, c);
@@ -729,6 +883,8 @@ void convertPixelWith(float rgb[3], const ColorSpace& from, const ColorSpace& to
     for (int i = 0; i < 3; ++i) rgb[i] = float(fromLinear(to.transfer, l[i]));
 }
 }  // namespace
+
+double toneMappingWhiteNits(ToneMapping t) { return t == ToneMapping::Bt2446A ? 1000.0 : t == ToneMapping::Bt2446C ? kCWhite : 0.0; }
 
 void displayLight(const ColorSpace& space, const float rgb[3], double c[3]) {
     for (int i = 0; i < 3; ++i) c[i] = toLinear(space.transfer, rgb[i]);
@@ -875,7 +1031,7 @@ void convertPixel(float rgb[3], const ColorSpace& from, const ColorSpace& to, do
 }
 
 std::shared_ptr<const Lut3D> conversionLut(const ColorSpace& from, const ColorSpace& to, double hdrPeakNits) {
-    if (from.id == to.id) return nullptr;
+    if (sameColorSpace(from, to)) return nullptr;
     // The whole conversion as a 65^3 LUT, built once per pair.
     static std::mutex m;
     static std::map<std::tuple<std::string, std::string, int>, std::shared_ptr<Lut3D>> cache;
@@ -906,7 +1062,7 @@ std::shared_ptr<const Lut3D> conversionLut(const ColorSpace& from, const ColorSp
 }
 
 void convertColor(Image& img, const ColorSpace& from, const ColorSpace& to, double hdrPeakNits) {
-    if (img.empty() || from.id == to.id) return;
+    if (img.empty() || sameColorSpace(from, to)) return;
     const std::shared_ptr<const Lut3D> lut = conversionLut(from, to, hdrPeakNits);
     double mat[9];
     primariesMatrix(from.primaries, to.primaries, mat);

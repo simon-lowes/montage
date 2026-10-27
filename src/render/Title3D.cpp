@@ -1,4 +1,5 @@
 #include "Title3D.h"
+#include "Titles.h"
 
 #include <QFont>
 #include <QFontMetricsF>
@@ -208,13 +209,15 @@ Image renderTitle3D(const Effect& g, FrameTime t, int w, int h, double scale, Fr
     double blockW = 0;
     for (const QString& l : lines) blockW = std::max(blockW, fm.horizontalAdvance(l));
     const int align = int(std::lround(g.p("align", t, 1)));
-    QPainterPath path;
+    // Styled runs (render/Titles.h): each in its own font, size, weight and tracking.
+    QPainterPath path = styledTextOutline(g, t, px, 120, std::clamp(g.p("line_spacing", t, 1.1), 0.5, 3.0));
     path.setFillRule(Qt::WindingFill);
-    for (int i = 0; i < lines.size(); ++i) {
-        const double lw = fm.horizontalAdvance(lines[i]);
-        const double x = align == 0 ? 0 : align == 2 ? blockW - lw : (blockW - lw) / 2;
-        path.addText(QPointF(x, fm.ascent() + i * lineH), font, lines[i]);
-    }
+    if (path.isEmpty())
+        for (int i = 0; i < lines.size(); ++i) {
+            const double lw = fm.horizontalAdvance(lines[i]);
+            const double x = align == 0 ? 0 : align == 2 ? blockW - lw : (blockW - lw) / 2;
+            path.addText(QPointF(x, fm.ascent() + i * lineH), font, lines[i]);
+        }
     if (path.isEmpty()) return out;
     // Overlaps merged (letters run together by tight tracking or line spacing, fonts built from overlapping
     // strokes), so every contour bounds solid on one side: outlines then run anticlockwise and holes clockwise (y up),

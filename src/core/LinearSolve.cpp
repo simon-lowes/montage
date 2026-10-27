@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numeric>
 
 namespace montage {
 
@@ -82,6 +83,111 @@ bool choleskySolve(std::vector<double>& a, int n, std::vector<double>& b) {
         b[i] = s / a[size_t(i) * n + i];
     }
     return true;
+}
+
+bool SparseCholesky::factor(int n, const std::vector<Entry>& entries) {
+    n_ = n;
+    perm_.assign(size_t(n), 0);
+    first_.assign(size_t(n), 0);
+    start_.assign(size_t(n) + 1, 0);
+    l_.clear();
+    if (n <= 0) return n == 0;
+    // Neighbours, then a reverse Cuthill–McKee order: breadth first from a low-degree row of each part, neighbours by
+    // degree, reversed.
+    std::vector<std::vector<int>> adj(static_cast<size_t>(n));
+    for (const Entry& e : entries)
+        if (e.row != e.col) {
+            adj[size_t(e.row)].push_back(e.col);
+            adj[size_t(e.col)].push_back(e.row);
+        }
+    for (auto& a : adj) {
+        std::sort(a.begin(), a.end());
+        a.erase(std::unique(a.begin(), a.end()), a.end());
+    }
+    std::vector<int> order, byDegree(static_cast<size_t>(n));
+    order.reserve(size_t(n));
+    std::iota(byDegree.begin(), byDegree.end(), 0);
+    std::stable_sort(byDegree.begin(), byDegree.end(), [&](int a, int b) { return adj[size_t(a)].size() < adj[size_t(b)].size(); });
+    std::vector<char> seen(static_cast<size_t>(n), 0);
+    for (int root : byDegree) {
+        if (seen[size_t(root)]) continue;
+        // (a far end of the part: the last row reached from the root, a few times over)
+        int start = root;
+        for (int pass = 0; pass < 2; ++pass) {
+            std::vector<int> level{start};
+            std::vector<char> in(size_t(n), 0);
+            in[size_t(start)] = 1;
+            for (size_t i = 0; i < level.size(); ++i)
+                for (int nb : adj[size_t(level[i])])
+                    if (!in[size_t(nb)]) in[size_t(nb)] = 1, level.push_back(nb);
+            start = level.back();
+        }
+        const size_t from = order.size();
+        order.push_back(start);
+        seen[size_t(start)] = 1;
+        for (size_t i = from; i < order.size(); ++i) {
+            std::vector<int> next;
+            for (int nb : adj[size_t(order[i])])
+                if (!seen[size_t(nb)]) seen[size_t(nb)] = 1, next.push_back(nb);
+            std::stable_sort(next.begin(), next.end(), [&](int a, int b) { return adj[size_t(a)].size() < adj[size_t(b)].size(); });
+            order.insert(order.end(), next.begin(), next.end());
+        }
+    }
+    std::reverse(order.begin(), order.end());
+    std::vector<int> inv(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) perm_[size_t(i)] = order[size_t(i)], inv[size_t(order[size_t(i)])] = i;
+    // Each row's envelope, then the entries placed in it.
+    for (int i = 0; i < n; ++i) first_[size_t(i)] = i;
+    for (const Entry& e : entries) {
+        const int a = inv[size_t(e.row)], b = inv[size_t(e.col)];
+        const int r = std::max(a, b), c = std::min(a, b);
+        first_[size_t(r)] = std::min(first_[size_t(r)], c);
+    }
+    for (int i = 0; i < n; ++i) start_[size_t(i) + 1] = start_[size_t(i)] + size_t(i - first_[size_t(i)] + 1);
+    l_.assign(start_[size_t(n)], 0.0);
+    auto at = [&](int r, int c) -> double& { return l_[start_[size_t(r)] + size_t(c - first_[size_t(r)])]; };
+    for (const Entry& e : entries) {
+        const int a = inv[size_t(e.row)], b = inv[size_t(e.col)];
+        at(std::max(a, b), std::min(a, b)) += e.value;
+    }
+    // Cholesky, row by row within the envelope.
+    for (int i = 0; i < n; ++i) {
+        const int fi = first_[size_t(i)];
+        double* li = &l_[start_[size_t(i)]];  // li[k - fi] is column k of row i
+        for (int j = fi; j <= i; ++j) {
+            const int fj = first_[size_t(j)];
+            const double* lj = &l_[start_[size_t(j)]];
+            double s = li[j - fi];
+            for (int k = std::max(fi, fj); k < j; ++k) s -= li[k - fi] * lj[k - fj];
+            if (j < i) li[j - fi] = s / lj[j - fj];
+            else {
+                if (!(s > 0)) return false;
+                li[i - fi] = std::sqrt(s);
+            }
+        }
+    }
+    return true;
+}
+
+void SparseCholesky::solve(std::vector<double>& b) const {
+    if (int(b.size()) != n_ || n_ == 0) return;
+    std::vector<double> y(static_cast<size_t>(n_));
+    for (int i = 0; i < n_; ++i) y[size_t(i)] = b[size_t(perm_[size_t(i)])];
+    for (int i = 0; i < n_; ++i) {
+        const int fi = first_[size_t(i)];
+        const double* li = &l_[start_[size_t(i)]];
+        double s = y[size_t(i)];
+        for (int k = fi; k < i; ++k) s -= li[k - fi] * y[size_t(k)];
+        y[size_t(i)] = s / li[i - fi];
+    }
+    for (int i = n_ - 1; i >= 0; --i) {
+        const int fi = first_[size_t(i)];
+        const double* li = &l_[start_[size_t(i)]];
+        y[size_t(i)] /= li[i - fi];
+        const double xi = y[size_t(i)];
+        for (int k = fi; k < i; ++k) y[size_t(k)] -= li[k - fi] * xi;
+    }
+    for (int i = 0; i < n_; ++i) b[size_t(perm_[size_t(i)])] = y[size_t(i)];
 }
 
 }  // namespace montage

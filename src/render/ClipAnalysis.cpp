@@ -563,7 +563,7 @@ void panFollowPosition(const Sequence& s, double x, double width, bool stereo, d
 bool applyPanFollow(const Sequence& s, Track& t, const std::vector<PanFollowKey>& keys, double width) {
     if (keys.size() < 2 || t.kind != TrackKind::Audio) return false;
     const bool stereo = panFollowStereo(s, t);
-    const bool reading = trackAutomation(t) != AutomationMode::Off && trackAutomation(t) != AutomationMode::Write;
+    const bool reading = automationReads(trackAutomation(t));
     const Track was = t;
     // A pixel or two of tracking jitter would be heard as the sound wobbling: a five-frame moving average.
     std::vector<double> xs(keys.size());

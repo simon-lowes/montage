@@ -43,18 +43,38 @@ enum class Primaries {
     SGamut3, DGamut, RedWideGamut, BmdWideGamut, DavinciWideGamut, AppleWideGamut
 };
 
+// How SDR and HDR meet. Montage's own: SDR white at HDR reference white (203 nits, BT.2408), and HDR into SDR through a
+// roll-off of the brightest channel. Or the methods of Report ITU-R BT.2446-1: Method A (SDR's peak to 1000 nits and
+// back, through a perceptual curve on luma with its colour correction) or Method C (a linear part and a log shoulder on
+// luminance, between crosstalk matrices, the one exactly the other's inverse).
+enum class ToneMapping { Montage, Bt2446A, Bt2446C };
+// Its id: "" (Montage's), "bt2446a" or "bt2446c"; and back (false for anything else).
+const char* toneMappingId(ToneMapping t);
+bool parseToneMapping(const std::string& id, ToneMapping& out);
+// The HDR light (cd/m²) a BT.2446 method brings down to SDR white (and SDR white up to): 1000 for Method A, about 333
+// for C; 0 for Montage's, whose roll-off has no such point.
+double toneMappingWhiteNits(ToneMapping t);
+
 struct ColorSpace {
     std::string id;     // e.g. "rec709", "rec2100pq", "slog3-sgamut3cine"
     std::string label;  // shown in menus
     Primaries primaries = Primaries::Bt709;
     Transfer transfer = Transfer::Bt1886;
     bool sceneReferred = false;  // camera log / linear: needs a display rendering to view
+    // An SDR display space's: how it is brought into HDR (a clip's picture) and how HDR is made into it (a delivery).
+    ToneMapping toneMapping = ToneMapping::Montage;
     bool hdr() const { return transfer == Transfer::Pq || transfer == Transfer::Hlg; }
 };
 
 // Every colour space Montage knows, Rec.709 first.
 const std::vector<ColorSpace>& colorSpaces();
+// One of them by id, or an SDR display space with a tone mapping ("rec709+bt2446a", as withToneMapping names it).
 const ColorSpace* findColorSpace(const std::string& id);
+// An SDR display space with that tone mapping (its id the space's with "+bt2446a" or "+bt2446c"); any other space, or
+// with Montage's, as it is (an SDR space with another tone mapping, without it).
+const ColorSpace& withToneMapping(const ColorSpace& s, ToneMapping t);
+// Whether two spaces hold the same code values (the same space, whatever tone mapping each has).
+bool sameColorSpace(const ColorSpace& a, const ColorSpace& b);
 // The space FFmpeg's tags describe (primaries and transfer names as av_color_*_name gives them).
 std::string colorSpaceFromTags(const std::string& primaries, const std::string& transfer);
 
@@ -107,6 +127,7 @@ struct SceneGrading {
     const ColorSpace* working = nullptr;
     const ColorSpace* linear = nullptr;
     const ColorSpace* display = nullptr;
+    const ColorSpace* delivery = nullptr;  // the sequence's own space (where grain and the like are measured)
     double peakNits = 1000;
     OutputTransformKind kind = OutputTransformKind::Filmic;
     bool exact = false;  // (deliveries: the output transform worked out for each pixel)

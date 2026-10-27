@@ -88,6 +88,8 @@ public:
     std::string archive();
     // Changes the plug-in reported to the document (edits in its editor) since the last call.
     bool changed();
+    // Reported again at the next changed() (its archive could not be stored).
+    void stillChanged();
     // Main thread housekeeping while an editor is open (model updates).
     void idle();
 
@@ -110,9 +112,11 @@ bool renderEffect(const Effect& e, const AudioBufferPtr& source, AudioBuffer& ou
                   std::string* error = nullptr);
 
 // The clip's media sound as the mixer plays it to its source effects: MediaPool's key and the decoded buffer at the
-// sequence's rate (false with `error` when the clip has no media sound).
+// sequence's rate (false with `error` when the clip has no media sound). With `upTo`, the sound as it reaches that
+// effect: through the clip's source effects before it (worked out now), as rendering gives it the sound, so the plug-in
+// edits what it renders, under the same source id; the key then names them too.
 bool clipSource(const Project& p, const Sequence& seq, const Clip& c, std::string& key, AudioBufferPtr& buffer,
-                std::string* error = nullptr);
+                std::string* error = nullptr, const Effect* upTo = nullptr);
 
 // Sessions kept open for effects (the editor): one per effect id, bound as editor view and editor renderer with its
 // playback region selected. `sourceKey` and `source` name and hold the clip's media sound (MediaPool audio key and

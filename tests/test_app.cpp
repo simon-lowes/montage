@@ -97,6 +97,7 @@
 #include "core/Interpretation.h"
 #include "LiveBridge.h"
 #include "LiveLink.h"
+#include "render/Titles.h"
 #include "render/DcpSecurity.h"
 #include "render/Ofx.h"
 #include "Assistant.h"
@@ -185,6 +186,7 @@
 #include <QFileDialog>
 #include "GradeNodePanel.h"
 #include "CompareDialog.h"
+#include "MergeDialog.h"
 #include "Keymap.h"
 #include "LoudnessReadout.h"
 #include "AudioAnalysisWidget.h"
@@ -1220,6 +1222,17 @@ private slots:
         // Automation: select a strip, Touch on it, and a pass written while the fader is held.
         surface->handle({0x90, uint8_t(mcu::Select + 5), 0x7F});
         QCOMPARE(surface->selectedTrack(), 5);
+        // The Trim key: Touch becomes Trim Touch (its light on), Write in a trim mode picks Trim Write, Trim again leaves
+        // trimming.
+        sent->clear();
+        surface->handle({0x90, uint8_t(mcu::Trim), 0x7F});
+        QCOMPARE(track(5).automation, int(AutomationMode::TrimTouch));
+        QVERIFY(has(mcu::led(mcu::Trim, 2)));
+        surface->handle({0x90, uint8_t(mcu::Write), 0x7F});
+        QCOMPARE(track(5).automation, int(AutomationMode::TrimWrite));
+        surface->handle({0x90, uint8_t(mcu::Trim), 0x7F});
+        QCOMPARE(track(5).automation, int(AutomationMode::Write));
+        QVERIFY(has(mcu::led(mcu::Trim, 0)));
         surface->handle({0x90, uint8_t(mcu::Touch), 0x7F});
         QCOMPARE(track(5).automation, int(AutomationMode::Touch));
         QVERIFY(has(mcu::led(mcu::Touch, 2)));
@@ -2428,6 +2441,195 @@ private slots:
         QVERIFY(!mixer->recordingAutomation());
         mixer->playbackStopped(30);
         QCOMPARE(a1().volumeAuto.keys.size(), keys);
+    }
+
+    void mixerFilmMixAutomation() {
+        loadDemo();
+        auto* mixer = win_->findChild<MixerPanel*>();
+        QVERIFY(mixer);
+        QTRY_VERIFY(mixer->trackFader(0));
+        QSlider* fader = mixer->trackFader(0);
+        QComboBox* mode = mixer->trackAutomationMode(0);
+        auto a1 = [&]() -> const Track& { return state()->sequence()->audioTracks.at(0); };
+        QCOMPARE(mode->count(), kAutomationModes);
+        QVERIFY(state()->edit("Lane", [](Project&, Sequence& s) {
+            s.audioTracks[0].volumeAuto = Param();
+            s.audioTracks[0].volumeAuto.addKey(0, -10);
+            s.audioTracks[0].volumeAuto.addKey(900, -10);
+            s.inPoint = s.outPoint = -1;
+            return true;
+        }));
+        // A Trim Latch pass: the fader shows the trim (0 dB), moved to -3 dB from frame 20; heard at -13 dB.
+        mode->setCurrentIndex(int(AutomationMode::TrimLatch));
+        QCOMPARE(a1().automation, int(AutomationMode::TrimLatch));
+        state()->setPlayhead(0);
+        QCOMPARE(fader->value(), 0);
+        mixer->playbackStarted(0);
+        for (FrameTime f = 0; f <= 60; ++f) {
+            if (f == 20) {
+                fader->setSliderDown(true);
+                fader->setValue(-30);
+            }
+            if (f == 25) fader->setSliderDown(false);
+            mixer->playbackPosition(f);
+            if (f == 30) QCOMPARE(trackVolumeAt(mixer->heard().audioTracks.at(0), 30), -13.0);
+        }
+        mixer->playbackStopped(60);
+        QCOMPARE(a1().volumeTrim.at(40), -3.0);
+        QCOMPARE(a1().volumeTrim.at(10), 0.0);
+        QCOMPARE(a1().volumeAuto.at(40), -10.0);  // the volume lane is untouched
+        QCOMPARE(trackVolumeAt(a1(), 40), -13.0);
+        state()->setPlayhead(40);
+        QCOMPARE(fader->value(), -30);  // a trim mode's fader follows the trim
+        // One undo step.
+        state()->undo();
+        QVERIFY(!a1().volumeTrim.animated());
+        state()->redo();
+        QCOMPARE(a1().volumeTrim.at(40), -3.0);
+        // Coalesced: the volume lane takes it, the trim is empty, the sound the same.
+        const Track trimmed = a1();
+        mixer->automationAction("coalesceTrim")->trigger();
+        QVERIFY(!hasTrim(a1()));
+        QCOMPARE(a1().volumeAuto.at(40), -13.0);
+        for (FrameTime f = 0; f <= 120; ++f) QVERIFY(std::fabs(trackVolumeAt(a1(), double(f)) - trackVolumeAt(trimmed, double(f))) < 1e-9);
+        // Coalesce After Each Pass folds a pass's trim in at the stop.
+        mixer->automationAction("coalesceTrimAfterPass")->trigger();
+        QVERIFY(appSettings().value("mixer/coalesceTrim").toBool());
+        mixer->playbackStarted(100);
+        for (FrameTime f = 100; f <= 140; ++f) {
+            if (f == 110) {
+                fader->setSliderDown(true);
+                fader->setValue(-20);
+            }
+            if (f == 112) fader->setSliderDown(false);
+            mixer->playbackPosition(f);
+        }
+        mixer->playbackStopped(140);
+        QVERIFY(!hasTrim(a1()));
+        QCOMPARE(a1().volumeAuto.at(130), -12.0);  // -10 and -2
+        mixer->automationAction("coalesceTrimAfterPass")->trigger();
+        QVERIFY(!appSettings().value("mixer/coalesceTrim").toBool());
+
+        // Preview: the fader moves without writing, and playing writes nothing; Punch Preview writes -4 dB over In to Out.
+        mode->setCurrentIndex(int(AutomationMode::Touch));
+        QVERIFY(state()->edit("In and Out", [](Project&, Sequence& s) {
+            s.inPoint = 300, s.outPoint = 330;
+            return true;
+        }));
+        const Param before = a1().volumeAuto;
+        mixer->automationAction("previewAutomation")->trigger();
+        QVERIFY(mixer->previewing());
+        state()->setPlayhead(310);
+        fader->setValue(-40);
+        QVERIFY(mixer->holdingMoves());
+        QCOMPARE(a1().volumeAuto, before);
+        QCOMPARE(trackVolumeAt(mixer->heard().audioTracks.at(0), 310), -4.0);  // heard as set
+        state()->setPlayhead(320);
+        QCOMPARE(fader->value(), -40);  // held where it was put
+        mixer->playbackStarted(300);
+        QVERIFY(!mixer->recordingAutomation());
+        mixer->playbackStopped(320);
+        mixer->automationAction("punchPreview")->trigger();
+        QVERIFY(!mixer->holdingMoves());
+        for (FrameTime f = 280; f <= 350; ++f) QCOMPARE(a1().volumeAuto.at(f), f >= 300 && f <= 330 ? -4.0 : before.at(f));
+        state()->undo();
+        QCOMPARE(a1().volumeAuto, before);
+        // Glide to Preview: from what is at In to the previewed value at Out.
+        fader->setValue(0);
+        mixer->automationAction("glidePreview")->trigger();
+        QCOMPARE(a1().volumeAuto.at(300), before.at(300));
+        QCOMPARE(a1().volumeAuto.at(330), 0.0);
+        QVERIFY(std::fabs(a1().volumeAuto.at(315) - before.at(300) / 2) < 1e-9);  // halfway, linear in dB
+        state()->undo();
+        // Leaving Preview lets what was held go.
+        fader->setValue(-50);
+        mixer->automationAction("previewAutomation")->trigger();
+        QVERIFY(!mixer->previewing() && !mixer->holdingMoves());
+        QCOMPARE(a1().volumeAuto, before);
+
+        // Write To End, stopped: the fader at the playhead (a Touch track is armed) to the end, nothing before it.
+        state()->setPlayhead(400);
+        fader->setValue(-60);
+        QCOMPARE(a1().volumeAuto.at(400), -6.0);
+        const Param keyed = a1().volumeAuto;
+        mixer->automationAction("writeToEnd")->trigger();
+        for (FrameTime f = 0; f < 400; f += 3) QCOMPARE(a1().volumeAuto.at(f), keyed.at(f));
+        QCOMPARE(a1().volumeAuto.at(899), -6.0);
+        state()->undo();
+        // Write To End during a Latch pass: the value it ends on, as playback stops.
+        mode->setCurrentIndex(int(AutomationMode::Latch));
+        mixer->playbackStarted(500);
+        for (FrameTime f = 500; f <= 530; ++f) {
+            if (f == 510) {
+                fader->setSliderDown(true);
+                fader->setValue(-200);
+            }
+            if (f == 512) fader->setSliderDown(false);
+            if (f == 520) mixer->automationAction("writeToEnd")->trigger();
+            mixer->playbackPosition(f);
+        }
+        mixer->playbackStopped(530);
+        QCOMPARE(a1().volumeAuto.at(515), -20.0);
+        QCOMPARE(a1().volumeAuto.at(900), -20.0);
+        QCOMPARE(a1().volumeAuto.at(505), keyed.at(505));
+        state()->undo();
+
+        // Capture at 40 and paste at 700: every control there as it was at 40.
+        mode->setCurrentIndex(int(AutomationMode::Read));
+        QVERIFY(state()->edit("No In or Out", [](Project&, Sequence& s) {
+            s.inPoint = s.outPoint = -1;
+            return true;
+        }));
+        state()->setPlayhead(40);
+        mixer->automationAction("captureAutomation")->trigger();
+        state()->setPlayhead(700);
+        mixer->automationAction("pasteCapture")->trigger();
+        {
+            MixSnapshot then = captureMix(*state()->sequence(), {}, 40), now = captureMix(*state()->sequence(), {}, 700);
+            now.at = then.at;
+            QCOMPARE(now, then);
+        }
+        state()->undo();
+
+        // Latch primed while stopped: the fader moved before playback is written from the first frame.
+        mixer->automationAction("latchPrime")->trigger();
+        mode->setCurrentIndex(int(AutomationMode::Latch));
+        state()->setPlayhead(600);
+        const Param unprimed = a1().volumeAuto;
+        fader->setValue(-90);
+        QVERIFY(mixer->holdingMoves());
+        QCOMPARE(a1().volumeAuto, unprimed);
+        mixer->playbackStarted(600);
+        QVERIFY(!mixer->holdingMoves());
+        for (FrameTime f = 600; f <= 630; ++f) mixer->playbackPosition(f);
+        mixer->playbackStopped(630);
+        QCOMPARE(a1().volumeAuto.at(600), -9.0);
+        QCOMPARE(a1().volumeAuto.at(630), -9.0);
+        QCOMPARE(a1().volumeAuto.at(590), unprimed.at(590));
+        mixer->automationAction("latchPrime")->trigger();
+        QVERIFY(!appSettings().value("mixer/latchPrime").toBool());
+        state()->undo();
+
+        // Copy In to Out from every track (none armed) and paste it at 800, relative too.
+        mode->setCurrentIndex(int(AutomationMode::Read));
+        QVERIFY(state()->edit("In and Out", [](Project&, Sequence& s) {
+            s.inPoint = 0, s.outPoint = 60;
+            s.audioTracks[0].volumeAuto = Param();
+            s.audioTracks[0].volumeAuto.addKey(0, -20);
+            s.audioTracks[0].volumeAuto.addKey(60, -8);
+            return true;
+        }));
+        const Param source = a1().volumeAuto;
+        QVERIFY(mixer->automationAction("copyAutomation"));
+        mixer->automationAction("copyAutomation")->trigger();
+        state()->setPlayhead(800);
+        mixer->automationAction("pasteAutomation")->trigger();
+        for (FrameTime k = 0; k <= 60; ++k) QCOMPARE(a1().volumeAuto.at(800 + k), source.at(k));
+        state()->undo();
+        mixer->automationAction("pasteAutomationRelative")->trigger();
+        for (FrameTime k = 0; k <= 60; ++k) QVERIFY(std::fabs(a1().volumeAuto.at(800 + k) - (source.at(800 + k) + source.at(k) - source.at(0))) < 1e-9);
+        state()->undo();
+        QCOMPARE(a1().volumeAuto, source);
     }
 
     void mixerSendsAndBusAutomation() {
@@ -7272,6 +7474,17 @@ private slots:
         QVERIFY(!r.value("structuredContent").toObject().value("ok").toBool());
         QVERIFY(call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-imf")}, {"colour", "sepia"}})
                     .value("isError").toBool());
+        // An archival master over MCP: ACES pictures, the output transform named, a target frame and its ACES Metadata File.
+        if (exrAvailable()) {
+            r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-aces")}, {"title", "Archive"},
+                                            {"application", 5}, {"target_frames", QJsonArray{3}}});
+            QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+            const QJsonObject aces = r.value("structuredContent").toObject();
+            QVERIFY2(aces.value("problems").toArray().isEmpty() && aces.value("application").toInt() == 5 && aces.value("colour").toString() == "aces2065-1" &&
+                         aces.value("target_frames").toInt() == 1 && aces.value("output_transform").toString().startsWith("urn:") &&
+                         QFileInfo::exists(aces.value("amf").toString()),
+                     QJsonDocument(aces).toJson().constData());
+        }
         // A supplemental over MCP with a German version added: no new pictures, the German sound only.
         r = call("montage_export_imf", {{"project", dir_.filePath("imf.montage")}, {"folder", dir_.filePath("mcp-versions")}, {"title", "Original"}});
         QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
@@ -7310,6 +7523,16 @@ private slots:
             auto* originalSeq = dlg->findChild<QComboBox*>("imfOriginal");
             offered = sounds && sounds->rowCount() == 1 && sounds->item(0, 0)->text() == "en" && texts && texts->rowCount() == 1 && supplemental &&
                       !supplemental->isChecked() && earlier && !earlier->isEnabled() && originalSeq && originalSeq->count() >= 2;
+            // An archival master: the grade and a target frame to choose, the JPEG 2000 colour not.
+            auto* application = dlg->findChild<QComboBox*>("imfApplication");
+            auto* graded = dlg->findChild<QComboBox*>("imfGraded");
+            offered = offered && application && graded && !graded->isEnabled() && dlg->findChild<QComboBox*>("imfColour")->isEnabled();
+            if (offered && exrAvailable()) {
+                application->setCurrentIndex(application->findData(5));
+                offered = graded->isEnabled() && dlg->findChild<QCheckBox*>("imfTargetFrame")->isEnabled() &&
+                          !dlg->findChild<QComboBox*>("imfColour")->isEnabled();
+                application->setCurrentIndex(application->findData(2));
+            }
             if (supplemental) supplemental->setChecked(true);
             offered = offered && earlier->isEnabled() && !dlg->findChild<QComboBox*>("imfSize")->isEnabled();
             dlg->reject();
@@ -7474,6 +7697,69 @@ private slots:
         state()->newProject();
         QVERIFY(win_->timeline()->intelligibilityLane().empty());
         QCOMPARE(readout->text("INT"), QStringLiteral("—"));
+    }
+
+    void loudnessReportAndCinemaLimits() {
+        state()->newProject();
+        QVERIFY(win_->findChild<QAction*>("loudnessReport"));
+        QVERIFY(!win_->loudnessReport({}));  // nothing to measure
+        const auto ids = state()->importFiles({QStringLiteral(MONTAGE_TEST_DATA_DIR "/jfk.wav")});
+        QCOMPARE(ids.size(), size_t(1));
+        QVERIFY(state()->edit("Place", [&](Project& p, Sequence& s) {
+            const bool ok = edit::placeMedia(p, s, ids[0], 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok;
+            s.audioTracks[0].clips.at(0).role = "Dialogue";
+            return ok;
+        }));
+        // Against a ceiling under the speech's peaks: red where they go over, and the report beside the name given.
+        LoudnessReportSpec spec;
+        spec.target = -16;
+        spec.tolerance = 1;
+        spec.peakCeiling = -12;
+        const QString base = dir_.path() + "/jfk.loudness";
+        QVERIFY(win_->loudnessReport(spec, base));
+        QVERIFY(QFileInfo::exists(base + ".pdf") && QFileInfo::exists(base + ".csv"));
+        QVERIFY(win_->statusBar()->currentMessage().contains("Leq(M)"));
+        const auto& lane = win_->timeline()->loudnessLane();
+        QVERIFY(!lane.empty());
+        QVERIFY(std::any_of(lane.begin(), lane.end(), [](const auto& sp) { return sp.status == 2; }));
+        // Within limits everywhere: all green.
+        spec.target = 0;
+        spec.peakCeiling = 0;
+        QVERIFY(win_->loudnessReport(spec));
+        QVERIFY(std::all_of(lane.begin(), lane.end(), [](const auto& sp) { return sp.status == 0; }));
+        // The Quality Check's cinema presets ask for Leq(M).
+        {
+            QualityCheckDialog dlg(state(), win_.get());
+            auto* loudness = dlg.findChild<QComboBox*>("qcLoudness");
+            const int trailer = loudness->findText("Cinema trailer: 85 Leq(M)"), ads = loudness->findText("Cinema advertising: 82 Leq(M)");
+            QVERIFY(trailer > 0 && ads > 0);
+            loudness->setCurrentIndex(trailer);
+            QCOMPARE(dlg.settings().leqmLimit, 85.0);
+            QCOMPARE(dlg.settings().loudnessTarget, 0.0);
+            loudness->setCurrentIndex(ads);
+            QCOMPARE(dlg.settings().leqmLimit, 82.0);
+            loudness->setCurrentIndex(0);
+            QCOMPARE(dlg.settings().leqmLimit, 0.0);
+        }
+        // Exported with a report and the trailer limit.
+        {
+            ExportDialog ed(state(), win_.get());
+            auto* report = ed.findChild<QComboBox*>("exportLoudnessReport");
+            QVERIFY(report && report->isEnabled() && report->count() == 4);
+            ed.findChild<QComboBox*>("exportPreset")->setCurrentIndex(ed.findChild<QComboBox*>("exportPreset")->findText("Audio - WAV 24-bit"));
+            ed.findChild<QLineEdit*>("exportPath")->setText(dir_.path() + "/speech.wav");
+            report->setCurrentIndex(2);
+            ed.findChild<QPushButton*>("exportButton")->click();
+            QTRY_COMPARE_WITH_TIMEOUT(ed.result(), int(QDialog::Accepted), 60000);
+        }
+        appSettings().remove("export/loudnessReport");
+        QFile csv(dir_.path() + "/speech.loudness.csv");
+        QVERIFY(csv.open(QIODevice::ReadOnly | QIODevice::Text));
+        QVERIFY(QString::fromUtf8(csv.readAll()).contains("# Leq(M) limit: 85"));
+        QVERIFY(QFileInfo::exists(dir_.path() + "/speech.loudness.pdf"));
+        // Another project: the lane goes.
+        state()->newProject();
+        QVERIFY(win_->timeline()->loudnessLane().empty());
     }
 
     void repairDamagedFramesFromTheMenu() {
@@ -10918,6 +11204,20 @@ const auto seq = [this] { return state()->sequence(); };
         bad.fps = Rational{5000, 1};
         QVERIFY(!bin->interpretFootage({ids[0]}, bad));
         QCOMPARE(state()->project().findMedia(ids[0])->fps, (Rational{25, 1}));
+        // SDR footage in an HDR sequence: brought up by BT.2446 Method C, how it is read kept.
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+            if (!dlg) return;
+            auto* expand = dlg->findChild<QComboBox*>("interpretSdrInHdr");
+            shown = expand && expand->currentIndex() == 0;
+            if (expand) expand->setCurrentIndex(expand->findData(QString("bt2446c")));
+            dlg->accept();
+        });
+        shown = false;
+        bin->interpretFootageDialog({ids[0]});
+        QVERIFY(shown);
+        QCOMPARE(state()->project().findMedia(ids[0])->sdrExpand, std::string("bt2446c"));
+        QCOMPARE(state()->project().findMedia(ids[0])->fps, (Rational{25, 1}));
         state()->newProject();
     }
 
@@ -12624,6 +12924,71 @@ const auto seq = [this] { return state()->sequence(); };
         state()->newProject();
     }
 
+    void mergeProjectFromTheFileMenu() {
+        // The demo saved as a copy for another editor; both then work on it.
+        loadDemo();
+        QVERIFY(win_->findChild<QAction*>("saveCopyForEditor"));
+        QVERIFY(win_->findChild<QAction*>("mergeProject"));
+        QTemporaryDir dir;
+        const QString copyPath = dir.filePath("copy.montage");
+        QVERIFY(win_->saveCopyForAnotherEditor(copyPath));
+        Project theirs;
+        QVERIFY(loadProject(copyPath.toStdString(), theirs));
+        Project base;
+        QVERIFY(mergeBaseOf(theirs, base));
+        const Id red = state()->sequence()->videoTracks[0].clips[0].id, blue = state()->sequence()->videoTracks[0].clips[1].id;
+        // Theirs: a marker, and Red shortened by 10 frames; mine: Red shortened by 20.
+        theirs.active()->markers.push_back(Marker{12, 0, "From the assistant", "", 3});
+        edit::clipById(*theirs.active(), red)->duration -= 10;
+        QVERIFY(saveProject(theirs, copyPath.toStdString()));
+        const FrameTime redLength = edit::clipById(*state()->sequence(), red)->duration;
+        QVERIFY(state()->edit("Trim", [&](Project&, Sequence& s) {
+            edit::clipById(s, red)->duration -= 20;
+            return true;
+        }));
+        MergeDialog* dlg = win_->mergeProjectDialog(copyPath);
+        QVERIFY(dlg);
+        QVERIFY2(dlg->result().ok, dlg->result().error.c_str());
+        QCOMPARE(dlg->result().conflicts.size(), size_t(1));
+        QVERIFY(dlg->isConflict(0));
+        QCOMPARE(dlg->cell(0, MergeDialog::Side), QString("Conflict"));
+        QCOMPARE(dlg->cell(0, MergeDialog::Choice), QString("Mine"));
+        QVERIFY(dlg->cell(0, MergeDialog::Field).startsWith("duration"));
+        QVERIFY(dlg->summary().contains("1 conflict"));
+        bool marker = false;
+        for (int r = 1; r < dlg->rowCount(); ++r)
+            marker = marker || (dlg->cell(r, MergeDialog::Side) == "Theirs" && dlg->cell(r, MergeDialog::What).contains("From the assistant"));
+        QVERIFY(marker);
+        // Going to the conflict selects Red; Theirs is taken, and the merge is one undo step.
+        state()->setPlayhead(200);
+        dlg->activate(0);
+        QCOMPARE(state()->selectedClips(), std::vector<Id>{red});
+        QCOMPARE(state()->playhead(), edit::clipById(*state()->sequence(), red)->start);
+        dlg->choose(0, MergeSide::Theirs);
+        QCOMPARE(dlg->cell(0, MergeDialog::Choice), QString("Theirs"));
+        QVERIFY(dlg->merge());
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->duration, redLength - 10);
+        QVERIFY(edit::clipById(*state()->sequence(), blue));
+        QCOMPARE(state()->sequence()->markers.size(), size_t(1));
+        QCOMPARE(state()->undoText(), QString("Merge Project"));
+        state()->undo();
+        QCOMPARE(edit::clipById(*state()->sequence(), red)->duration, redLength - 20);
+        QVERIFY(state()->sequence()->markers.empty());
+        dlg->close();
+        // A copy that records no base: it has to be chosen.
+        Project plain = theirs;
+        plain.mergeBase.reset();
+        QVERIFY(saveProject(plain, dir.filePath("plain.montage").toStdString()));
+        MergeDialog* none = win_->mergeProjectDialog(dir.filePath("plain.montage"));
+        QVERIFY(!none->result().ok);
+        QVERIFY(none->summary().contains("Choose Base"));
+        QVERIFY(saveProject(base, dir.filePath("base.montage").toStdString()));
+        QVERIFY(none->setBase(dir.filePath("base.montage")));
+        QCOMPARE(none->result().conflicts.size(), size_t(1));
+        none->close();
+        state()->newProject();
+    }
+
     void reconformFromCompareDialog() {
         // Version 2 of the demo: Blue first, then Red, and no title.
         loadDemo();
@@ -12988,6 +13353,13 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(color);
         QCOMPARE(color->count(), int(displayColorSpaces().size()) + 1);
         QVERIFY(color->itemText(0).contains("HLG"));
+        // Tone mapping is offered for an SDR delivery of it.
+        auto* mapping = ed.findChild<QComboBox*>("exportToneMapping");
+        QVERIFY(mapping && !mapping->isEnabled() && mapping->count() == 3);
+        color->setCurrentIndex(color->findData(QString("rec709")));
+        QVERIFY(mapping->isEnabled());
+        color->setCurrentIndex(0);
+        QVERIFY(!mapping->isEnabled());
         // Loudness targets for delivery, as (LUFS, dBTP).
         auto* loudness = ed.findChild<QComboBox*>("exportLoudness");
         QVERIFY(loudness && loudness->count() == 6);
@@ -13193,6 +13565,14 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(trims->addTarget("sdr"));
         QCOMPARE(trims->shown(), QString("sdr"));
         QCOMPARE(program->trimTarget(), std::string("sdr"));
+        // The SDR target made by BT.2446 Method A, one undo step.
+        auto* mapping = win_->findChild<QComboBox*>("trimToneMapping");
+        QVERIFY(mapping && mapping->isEnabled() && mapping->currentIndex() == 0);
+        mapping->setCurrentIndex(mapping->findData(QString("bt2446a")));
+        QCOMPARE(state()->sequence()->trimTargets.at(0).toneMapping, std::string("bt2446a"));
+        state()->undo();
+        QVERIFY(state()->sequence()->trimTargets.at(0).toneMapping.empty());
+        QCOMPARE(mapping->currentIndex(), 0);
 
         // The shot at the playhead (Red; the title over it is not one) trimmed: one undo step for a run of changes.
         const Id red = clipNamed(*state()->sequence(), "Red")->id, blue = clipNamed(*state()->sequence(), "Blue")->id;
@@ -14730,6 +15110,89 @@ const auto seq = [this] { return state()->sequence(); };
         state()->setSelection({}, false);
     }
 
+    void meshWarpPinsInProgramMonitor() {
+        loadDemo();
+        // Mesh Warp on the red clip: Pins on the Monitor, then clicks place pins, a drag moves one, Ctrl-click removes one.
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        Id meshId = 0, gridId = 0;
+        QVERIFY(state()->edit("Warp", [red, &meshId](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "mesh_warp");
+            meshId = e.id;
+            edit::clipById(s, red)->effects.push_back(e);
+            return true;
+        }));
+        state()->setSelection({red}, false);
+        state()->setPlayhead(10);
+        const int64_t lt = 10 - clipNamed(*state()->sequence(), "Red")->start;
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        QTRY_VERIFY_WITH_TIMEOUT(!viewer->image().isNull(), 5000);
+        QPushButton* arm = nullptr;
+        QTRY_VERIFY((arm = win_->findChild<QPushButton*>(QStringLiteral("warpOnMonitor"))) != nullptr);
+        arm->click();
+        QCOMPARE(state()->paintEffect(), meshId);
+        const QRectF r = viewer->imageRect();
+        auto at = [&r](double u, double v) { return QPointF(r.left() + u * r.width(), r.top() + v * r.height()).toPoint(); };
+        auto fx = [&](Id id) -> const Effect& { return *edit::ownedEffect(const_cast<Sequence&>(*state()->sequence()), red, id); };
+        const double px = 2.0 / r.width(), py = 2.0 / r.height();
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.3, 0.4));
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.7, 0.6));
+        QCOMPARE(meshPins(fx(meshId)), (std::vector<int>{1, 2}));
+        QCOMPARE(meshPinKind(fx(meshId), 2), 0);
+        QVERIFY(std::fabs(fx(meshId).p("pin1.x", lt) - 0.3) < px && std::fabs(fx(meshId).p("pin1.to_y", lt) - 0.4) < py);
+        // Dragging a pin moves where it goes, not where it sits on the picture.
+        QTest::mousePress(viewer, Qt::LeftButton, Qt::NoModifier, at(0.7, 0.6));
+        QTest::mouseMove(viewer, at(0.72, 0.55));
+        QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, at(0.75, 0.5));
+        QVERIFY(std::fabs(fx(meshId).p("pin2.to_x", lt) - 0.75) < px && std::fabs(fx(meshId).p("pin2.to_y", lt) - 0.5) < py);
+        QVERIFY(std::fabs(fx(meshId).p("pin2.x", lt) - 0.7) < px);
+        // A click on a pin without moving it leaves it alone.
+        const size_t steps = state()->history().undoCount();
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.75, 0.5) + QPoint(2, 1));
+        QVERIFY(std::fabs(fx(meshId).p("pin2.to_x", lt) - 0.75) < px && std::fabs(fx(meshId).p("pin2.to_y", lt) - 0.5) < py);
+        QCOMPARE(state()->history().undoCount(), steps);
+        // A Stiff pin, chosen in the Inspector.
+        QComboBox* kind = nullptr;
+        QTRY_VERIFY((kind = win_->findChild<QComboBox*>(QStringLiteral("meshPinKind"))) != nullptr);
+        kind->setCurrentIndex(1);
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.5, 0.2));
+        QCOMPARE(meshPins(fx(meshId)), (std::vector<int>{1, 2, 3}));
+        QCOMPARE(meshPinKind(fx(meshId), 3), 1);
+        QVERIFY(!fx(meshId).params.count("pin3.to_x"));
+        // Ctrl-click removes a pin; so does the Inspector's Remove.
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::ControlModifier, at(0.3, 0.4));
+        QCOMPARE(meshPins(fx(meshId)), (std::vector<int>{2, 3}));
+        QComboBox* list = nullptr;
+        QTRY_VERIFY((list = win_->findChild<QComboBox*>(QStringLiteral("meshPinList"))) && list->count() == 2);
+        list->setCurrentIndex(1);
+        win_->findChild<QPushButton*>(QStringLiteral("removeMeshPin"))->click();
+        QCOMPARE(meshPins(fx(meshId)), (std::vector<int>{2}));
+        state()->undo();
+        QCOMPARE(meshPins(fx(meshId)), (std::vector<int>{2, 3}));
+        QTest::keyClick(viewer, Qt::Key_Escape);
+        QCOMPARE(state()->paintEffect(), Id(0));
+        // Grid Warp: its points are dragged.
+        QVERIFY(state()->edit("Grid", [red, &gridId](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "grid_warp");
+            gridId = e.id;
+            edit::clipById(s, red)->effects.push_back(e);
+            return true;
+        }));
+        state()->setPaintEffect(gridId);
+        QTest::mousePress(viewer, Qt::LeftButton, Qt::NoModifier, at(1.0 / 3, 1.0 / 3));
+        QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, at(0.4, 0.35));
+        QVERIFY(std::fabs(fx(gridId).p(gridWarpPoint(1, 1) + ".dx", lt) - (0.4 - 1.0 / 3)) < px);
+        QVERIFY(std::fabs(fx(gridId).p(gridWarpPoint(1, 1) + ".dy", lt) - (0.35 - 1.0 / 3)) < py);
+        QTRY_VERIFY(win_->findChild<QPushButton*>(QStringLiteral("resetGridWarp")) != nullptr);
+        win_->findChild<QPushButton*>(QStringLiteral("resetGridWarp"))->click();
+        QVERIFY(!fx(gridId).params.count(gridWarpPoint(1, 1) + ".dx"));
+        state()->setPaintEffect(0);
+        state()->setSelection({}, false);
+    }
+
     void restorationPaintInProgramMonitor() {
         loadDemo();
         // A Paint effect on the red clip, armed from the Inspector, painted on the Program monitor.
@@ -16191,6 +16654,71 @@ print("added " + ui["name"])
         QVERIFY(state()->sequence()->colorGroups.empty());
         QCOMPARE(edit::clipById(*state()->sequence(), a)->colorGroup, Id(0));
         state()->newProject();
+    }
+
+    void styledTitleInInspector() {
+        // A title's word styled from the Inspector, kept on its letters as the text is typed into; a text animation added
+        // with its own section, and taken off again.
+        state()->newProject();
+        Id clipId = 0;
+        QVERIFY(state()->edit("Title", [&](Project& p, Sequence& s) {
+            Clip c = makeGeneratorClip(p, "title", 60);
+            c.generator.strings["text"] = "Hello world";
+            clipId = c.id;
+            return edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok;
+        }));
+        auto generator = [&]() -> const Effect& { return edit::clipById(*state()->sequence(), clipId)->generator; };
+        state()->setSelection({clipId});
+        auto* inspector = win_->findChild<InspectorWidget*>();
+        QTRY_VERIFY(inspector->findChild<QPushButton*>("styleSelectedText"));
+        auto* text = inspector->findChild<QPlainTextEdit*>("string_text");
+        QVERIFY(text);
+        QTextCursor cur = text->textCursor();
+        cur.setPosition(6);
+        cur.setPosition(11, QTextCursor::KeepAnchor);
+        text->setTextCursor(cur);
+        whenModal<QDialog>(this, [](QDialog* d) {
+            for (QCheckBox* box : d->findChildren<QCheckBox*>())
+                if (box->text() == "Font") box->setChecked(true);
+            d->findChildren<QDoubleSpinBox*>().at(0)->setValue(150);  // its size
+            d->accept();
+        });
+        inspector->findChild<QPushButton*>("styleSelectedText")->click();
+        std::vector<TextRun> runs = parseTextRuns(generator().s("runs"));
+        QCOMPARE(int(runs.size()), 1);
+        QCOMPARE(runs[0].from, 6);
+        QCOMPARE(runs[0].len, 5);
+        QCOMPARE(runs[0].size, 150.0);
+        QVERIFY(!runs[0].font.empty());
+        QVERIFY(titleIsStyled(generator(), 0));
+        // Typed in before it: the style moves with "world".
+        text = inspector->findChild<QPlainTextEdit*>("string_text");
+        cur = text->textCursor();
+        cur.setPosition(0);
+        cur.insertText("Oh, ");
+        QCOMPARE(generator().s("text"), std::string("Oh, Hello world"));
+        QCOMPARE(parseTextRuns(generator().s("runs")).at(0).from, 10);
+        // A text animation, with its own section, removed with its ✕.
+        inspector->findChild<QPushButton*>("addTextAnimation")->click();
+        QCOMPARE(textAnimators(generator()), std::vector<int>{1});
+        QCOMPARE(generator().p("ta1.scale", 0), 100.0);
+        QTRY_VERIFY([&] {
+            for (QToolButton* b : inspector->findChildren<QToolButton*>())
+                if (b->toolTip() == "Remove Text Animation") return true;
+            return false;
+        }());
+        for (QToolButton* b : inspector->findChildren<QToolButton*>())
+            if (b->toolTip() == "Remove Text Animation") {
+                b->click();
+                break;
+            }
+        QVERIFY(textAnimators(generator()).empty());
+        // Clear Styles takes the runs off; undo puts them back.
+        QTRY_VERIFY(inspector->findChild<QPushButton*>("clearTextStyles"));
+        inspector->findChild<QPushButton*>("clearTextStyles")->click();
+        QVERIFY(generator().s("runs").empty());
+        state()->undo();
+        QVERIFY(!generator().s("runs").empty());
     }
 
     void spellCheckInCaptionsAndTitles() {

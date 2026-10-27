@@ -100,6 +100,11 @@ QualityCheckDialog::QualityCheckDialog(EditorState* state, QWidget* parent) : QD
     loudness_->addItem(tr("ATSC A/85: -24 LKFS, -2 dBTP"), QPointF(-24, -2));
     loudness_->addItem(tr("Netflix: -27 ±2 LKFS dialogue, -2 dBTP"), QPointF(-27, -2));
     loudness_->setItemData(loudness_->count() - 1, true, Qt::UserRole + 1);  // (measured on the dialogue, within 2 LU)
+    // Cinema: Leq(M) (ISO 21727) under the trailer and advertising limits.
+    loudness_->addItem(tr("Cinema trailer: 85 Leq(M)"), QPointF(0, 0));
+    loudness_->setItemData(loudness_->count() - 1, 85.0, Qt::UserRole + 2);
+    loudness_->addItem(tr("Cinema advertising: 82 Leq(M)"), QPointF(0, 0));
+    loudness_->setItemData(loudness_->count() - 1, 82.0, Qt::UserRole + 2);
     form->addRow(tr("Loudness:"), loudness_);
     {
         // Dialogue intelligibility (render/Intelligibility.h): under the chosen preset's red line for at least a time.
@@ -182,6 +187,7 @@ QcSettings QualityCheckDialog::settings() const {
     q.peakCeiling = target.y();
     q.dialogueGated = loudness_->currentData(Qt::UserRole + 1).toBool();
     if (q.dialogueGated) q.loudnessTolerance = 2;
+    q.leqmLimit = loudness_->currentData(Qt::UserRole + 2).toDouble();
     q.spelling = spelling_->isChecked();
     q.uncaptionedSeconds = uncaptioned_->isChecked() ? uncaptionedSeconds_->value() : 0;
     q.sync = sync_->isChecked();

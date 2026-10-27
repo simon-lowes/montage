@@ -24,8 +24,10 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/opt.h>
 }
 
+#include "Amf.h"
 #include "ColorSpace.h"
 #include "Compositor.h"
 #include "DcpMxf.h"
@@ -36,9 +38,11 @@ extern "C" {
 #include "core/AudioDescription.h"
 #include "core/Captions.h"
 #include "core/EditOps.h"
+#include "core/GradeVersions.h"
 #include "core/ImportBuilder.h"
 #include "core/Surround.h"
 #include "core/TimelineCompare.h"
+#include "media/Exr.h"
 #include "media/SuperScale.h"
 
 namespace montage {
@@ -296,6 +300,194 @@ void pictureDescriptor(QXmlStreamWriter& x, const dcp::ImfPictureWriter& w, int6
     x.writeEndElement();  // RGBADescriptor
 }
 
+// Application #5's: the RGBA descriptor ST 2065-5 has (no coding equations, ranges or scanning direction), with its
+// container constraints, ACES picture and target frame sub-descriptors.
+void acesDescriptor(QXmlStreamWriter& x, const dcp::ImfAcesWriter& w, int64_t duration) {
+    auto display = [&](const QString& prefix, const double* d, double peak, double floor) {
+        auto xy = [](double v) { return QString::number(std::clamp(std::lround(v / 0.00002), 0L, 50000L)); };
+        x.writeStartElement("r1:" + prefix + "Primaries");
+        for (int i = 0; i < 3; ++i) {
+            x.writeStartElement("r2:ColorPrimary");
+            x.writeTextElement("r2:X", xy(d[2 * i]));
+            x.writeTextElement("r2:Y", xy(d[2 * i + 1]));
+            x.writeEndElement();
+        }
+        x.writeEndElement();
+        x.writeStartElement("r1:" + prefix + "WhitePointChromaticity");
+        x.writeTextElement("r2:X", xy(d[6]));
+        x.writeTextElement("r2:Y", xy(d[7]));
+        x.writeEndElement();
+        x.writeTextElement("r1:" + prefix + "MaximumLuminance", QString::number(std::llround(peak * 10000)));
+        x.writeTextElement("r1:" + prefix + "MinimumLuminance", QString::number(std::llround(floor * 10000)));
+    };
+    x.writeStartElement("r0:RGBADescriptor");
+    x.writeNamespace(kGroups, "r0");
+    x.writeNamespace(kElements, "r1");
+    x.writeNamespace(kTypes, "r2");
+    x.writeTextElement("r1:InstanceID", urn(w.descriptorId()));
+    x.writeStartElement("r1:SubDescriptors");
+    x.writeStartElement("r0:ContainerConstraintsSubDescriptor");
+    x.writeTextElement("r1:InstanceID", urn(w.constraintsId()));
+    x.writeEndElement();
+    const dcp::AcesPicture& pic = w.picture();
+    x.writeStartElement("r0:ACESPictureSubDescriptor");
+    x.writeTextElement("r1:InstanceID", urn(w.pictureId()));
+    if (!pic.authoring.empty()) x.writeTextElement("r1:ACESAuthoringInformation", QString::fromStdString(pic.authoring));
+    if (pic.mastering) display("ACESMasteringDisplay", pic.display, pic.maxLuminance, pic.minLuminance);
+    x.writeEndElement();
+    for (const dcp::AcesTargetFrame& t : w.targetFrames()) {
+        x.writeStartElement("r0:TargetFrameSubDescriptor");
+        x.writeTextElement("r1:InstanceID", urn(t.set));
+        x.writeTextElement("r1:TargetFrameAncillaryResourceID", urn(t.resource));
+        x.writeTextElement("r1:MediaType", QString::fromStdString(t.mediaType));
+        x.writeTextElement("r1:TargetFrameIndex", QString::number(t.index));
+        x.writeTextElement("r1:TargetFrameTransferCharacteristic", ulUrn(t.transfer));
+        x.writeTextElement("r1:TargetFrameColorPrimaries", ulUrn(t.primaries));
+        x.writeTextElement("r1:TargetFrameComponentMaxRef", QString::number(t.maxRef));
+        x.writeTextElement("r1:TargetFrameComponentMinRef", QString::number(t.minRef));
+        x.writeTextElement("r1:TargetFrameEssenceStreamID", QString::number(t.stream));
+        x.writeTextElement("r1:ACESPictureSubDescriptorInstanceID", urn(w.pictureId()));
+        x.writeEndElement();
+    }
+    x.writeEndElement();  // SubDescriptors
+    const dcp::EditRate r = w.rate();
+    x.writeTextElement("r1:LinkedTrackID", "1");
+    x.writeTextElement("r1:SampleRate", QStringLiteral("%1/%2").arg(r.num).arg(r.den));
+    x.writeTextElement("r1:EssenceLength", QString::number(duration));
+    x.writeTextElement("r1:ContainerFormat", ulUrn(std::string(dcp::ImfAcesWriter::kContainer)));
+    x.writeTextElement("r1:FrameLayout", "FullFrame");
+    x.writeTextElement("r1:StoredWidth", QString::number(w.width()));
+    x.writeTextElement("r1:StoredHeight", QString::number(w.height()));
+    x.writeTextElement("r1:DisplayHeight", QString::number(w.height()));
+    x.writeTextElement("r1:DisplayWidth", QString::number(w.width()));
+    x.writeTextElement("r1:DisplayXOffset", "0");
+    x.writeTextElement("r1:DisplayYOffset", "0");
+    x.writeTextElement("r1:ImageAspectRatio", QStringLiteral("%1/%2").arg(w.aspectNum()).arg(w.aspectDen()));
+    x.writeTextElement("r1:TransferCharacteristic", ulUrn(std::string(dcp::ImfAcesWriter::kTransfer)));
+    x.writeTextElement("r1:PictureCompression", ulUrn(std::string(w.coding())));
+    x.writeTextElement("r1:ColorPrimaries", ulUrn(std::string(dcp::ImfAcesWriter::kPrimaries)));
+    x.writeStartElement("r1:VideoLineMap");
+    x.writeTextElement("r2:Int32", "0");
+    x.writeTextElement("r2:Int32", "0");
+    x.writeEndElement();
+    x.writeStartElement("r1:PixelLayout");
+    const char* codes[] = {"CompAlpha", "CompBlue", "CompGreen", "CompRed"};
+    for (int i = 0, first = w.alpha() ? 0 : 1; i < 8; ++i) {
+        const bool used = first + i < 4;
+        x.writeStartElement("r2:RGBAComponent");
+        x.writeTextElement("r2:Code", used ? codes[first + i] : "CompNull");
+        x.writeTextElement("r2:ComponentSize", used ? "253" : "0");
+        x.writeEndElement();
+    }
+    x.writeEndElement();
+    x.writeEndElement();  // RGBADescriptor
+}
+
+// The grade taken off every clip (its colour effects and grade nodes), colour groups and shared nodes: an ungraded
+// archival master's pictures, each clip only as its input transform brings it in.
+void withoutGrades(Project& p) {
+    auto off = [](std::vector<Effect>& effects, bool all) {
+        for (Effect& e : effects)
+            if (all || isGradeEffect(e)) e.enabled = false;
+    };
+    for (Sequence& seq : p.sequences) {
+        for (Track& t : seq.videoTracks)
+            for (Clip& c : t.clips) off(c.effects, false);
+        for (ColorGroup& g : seq.colorGroups) off(g.pre, true), off(g.post, true);
+        for (SharedNode& n : seq.sharedNodes) off(n.effects, true);
+    }
+}
+
+// One picture of 16-bit RGB as an uncompressed TIFF file in memory (FFmpeg's encoder), and back.
+bool encodeTiff16(const std::vector<uint16_t>& rgb, int w, int h, std::vector<uint8_t>& out, std::string* error) {
+    const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_TIFF);
+    AVCodecContext* ctx = codec ? avcodec_alloc_context3(codec) : nullptr;
+    AVFrame* frame = av_frame_alloc();
+    AVPacket* pkt = av_packet_alloc();
+    bool ok = false;
+    if (ctx && frame && pkt) {
+        ctx->width = w;
+        ctx->height = h;
+        ctx->pix_fmt = AV_PIX_FMT_RGB48LE;
+        ctx->time_base = {1, 25};
+        av_opt_set(ctx->priv_data, "compression_algo", "raw", 0);
+        frame->format = ctx->pix_fmt;
+        frame->width = w;
+        frame->height = h;
+        if (avcodec_open2(ctx, codec, nullptr) >= 0 && av_frame_get_buffer(frame, 0) >= 0) {
+            for (int y = 0; y < h; ++y) {
+                auto* d = reinterpret_cast<uint8_t*>(frame->data[0] + size_t(y) * size_t(frame->linesize[0]));
+                const uint16_t* q = rgb.data() + size_t(y) * size_t(w) * 3;
+                for (int i = 0; i < w * 3; ++i) d[2 * i] = uint8_t(q[i]), d[2 * i + 1] = uint8_t(q[i] >> 8);
+            }
+            if (avcodec_send_frame(ctx, frame) >= 0 && avcodec_send_frame(ctx, nullptr) >= 0 && avcodec_receive_packet(ctx, pkt) >= 0) {
+                out.assign(pkt->data, pkt->data + pkt->size);
+                ok = true;
+            }
+        }
+    }
+    av_packet_free(&pkt);
+    av_frame_free(&frame);
+    avcodec_free_context(&ctx);
+    if (!ok && error) *error = "Cannot make a target frame (FFmpeg's TIFF encoder)";
+    return ok;
+}
+
+bool decodeTiff16(const std::vector<uint8_t>& tiff, std::vector<uint16_t>& rgb, int& w, int& h, std::string* error) {
+    const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_TIFF);
+    AVCodecContext* ctx = codec ? avcodec_alloc_context3(codec) : nullptr;
+    AVFrame* frame = av_frame_alloc();
+    AVPacket* pkt = av_packet_alloc();
+    bool ok = false;
+    if (ctx && frame && pkt && avcodec_open2(ctx, codec, nullptr) >= 0 && av_new_packet(pkt, int(tiff.size())) >= 0) {
+        std::memcpy(pkt->data, tiff.data(), tiff.size());
+        if (avcodec_send_packet(ctx, pkt) >= 0 && avcodec_receive_frame(ctx, frame) >= 0 &&
+            (frame->format == AV_PIX_FMT_RGB48LE || frame->format == AV_PIX_FMT_RGB48BE)) {
+            w = frame->width, h = frame->height;
+            rgb.resize(size_t(w) * size_t(h) * 3);
+            const bool le = frame->format == AV_PIX_FMT_RGB48LE;
+            for (int y = 0; y < h; ++y) {
+                const uint8_t* q = frame->data[0] + size_t(y) * size_t(frame->linesize[0]);
+                for (int i = 0; i < w * 3; ++i)
+                    rgb[size_t(y) * size_t(w) * 3 + size_t(i)] = le ? uint16_t(q[2 * i] | q[2 * i + 1] << 8) : uint16_t(q[2 * i] << 8 | q[2 * i + 1]);
+            }
+            ok = true;
+        }
+    }
+    av_packet_free(&pkt);
+    av_frame_free(&frame);
+    avcodec_free_context(&ctx);
+    if (!ok && error) *error = "Not a 16-bit RGB TIFF";
+    return ok;
+}
+
+constexpr const char* kApp5 = "http://www.smpte-ra.org/ns/2067-50/2017";
+
+// The display an Application #5 master's target frames are shown on: the sequence's delivery colour when IMF has one
+// for it, else Rec.709.
+const ImfColourSpec& acesDisplay(const Sequence& s) {
+    const ColorSpace& delivery = sequenceColorSpace(s);
+    for (const ImfColourSpec& c : kColours)
+        if (delivery.id == c.space) return c;
+    return kColours[0];
+}
+
+// What an output transform name says: the display Montage has for it and its peak (from ACES's ids, or Montage's own).
+bool parseImfOutputTransform(const std::string& name, std::string& display, double& peak, bool& aces2) {
+    static const QRegularExpression own(QStringLiteral("^urn:montage:transformId:Output\\.Montage\\.Filmic\\.([a-z0-9-]+)_(\\d+)nit$"));
+    const auto m = own.match(QString::fromStdString(name));
+    if (m.hasMatch()) {
+        display = m.captured(1).toStdString();
+        peak = m.captured(2).toDouble();
+        aces2 = false;
+        return findColorSpace(display) != nullptr;
+    }
+    peak = 0;
+    display = acesOutputSpace(name, &peak);
+    aces2 = !display.empty();
+    return aces2;
+}
+
 void soundDescriptor(QXmlStreamWriter& x, const dcp::ImfSoundWriter& w) {
     x.writeStartElement("r0:WAVEPCMDescriptor");
     x.writeNamespace(kGroups, "r0");
@@ -345,6 +537,19 @@ void soundDescriptor(QXmlStreamWriter& x, const dcp::ImfSoundWriter& w) {
 }
 
 }  // namespace
+
+std::string imfOutputTransform(const Sequence& s, std::string* display, double* peakNits) {
+    const ColorSpace* shown = findColorSpace(acesDisplay(s).space);
+    const double peak = displayPeakNits(*shown, std::clamp(s.hdrPeakNits, 100.0, 10000.0));
+    if (display) *display = shown->id;
+    if (peakNits) *peakNits = peak;
+    // ACES 2.0's own id where the sequence is graded through it (and it renders here), else Montage's filmic one.
+    if (sceneReferredWorking(s) && outputTransformKind(s) == OutputTransformKind::Aces2 && aces2Renders(*shown)) {
+        const std::string id = acesOutputTransformId(shown->id, peak);
+        if (!id.empty()) return id;
+    }
+    return "urn:montage:transformId:Output.Montage.Filmic." + shown->id + "_" + std::to_string(std::lround(peak)) + "nit";
+}
 
 std::string defaultImfColour(const Sequence& s) {
     const ColorSpace& cs = sequenceColorSpace(s);
@@ -583,7 +788,10 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         if (error) *error = why;
         return false;
     };
-    if (!openJpegAvailable()) return fail("This build of Montage has no OpenJPEG, which IMF masters are coded with");
+    if (settings.application != 2 && settings.application != 5) return fail("The IMF application is 2 (#2E) or 5 (#5)");
+    const bool aces = settings.application == 5;
+    if (!aces && !openJpegAvailable()) return fail("This build of Montage has no OpenJPEG, which IMF masters are coded with");
+    if (aces && !exrAvailable()) return fail("This build of Montage has no OpenEXR library, which archival masters are written with");
     if (!validKind(settings.kind)) return fail("Unknown content kind " + settings.kind);
     std::string err;
     // A supplemental package keeps the earlier composition's picture: its size, colour, depth and coding.
@@ -596,7 +804,11 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         if (cpl.empty()) return fail("There is no IMF package in " + settings.supplementOf);
         if (!readImfComposition(cpl, old, &err)) return fail(err);
         oldPicture = old.picture();
-        if (!oldPicture || old.width <= 0 || old.height <= 0 || (old.bits != 10 && old.bits != 12) || !old.rsiz || old.colour.empty())
+        if ((old.application == 5) != aces)
+            return fail("The earlier package is " + std::string(old.application == 5 ? "IMF Application #5" : "not IMF Application #5") +
+                        "; a supplemental keeps its application");
+        if (!oldPicture || old.width <= 0 || old.height <= 0 ||
+            (aces ? old.colour != "aces2065-1" : (old.bits != 10 && old.bits != 12) || !old.rsiz || old.colour.empty()))
             return fail("The earlier package's picture is not one Montage makes supplementals of");
         oldPaths = imfTrackFiles(settings.supplementOf);
         // (its composition plays the earlier package's files from the folder beside it)
@@ -610,22 +822,30 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
     else if (!imfPictureSize(s, settings.size, W, H, &err)) return fail(err);
     Rational canonical;
     if (!imfFrameRateAllowed(s.fps, W, H, &canonical))
-        return fail("IMF Application #2E takes 23.976, 24, 25, 29.97, 30, 50, 59.94 or 60 fps (120 above HD)");
+        return fail("IMF masters here are 23.976, 24, 25, 29.97, 30, 50, 59.94 or 60 fps (120 above HD)");
     if (supplemental && (uint32_t(canonical.num) != old.rateNum || uint32_t(canonical.den) != old.rateDen))
         return fail("The earlier package runs at another frame rate");
-    const std::string colourId = supplemental ? old.colour : settings.colour.empty() ? defaultImfColour(s) : settings.colour;
-    const ImfColourSpec* spec = colourSpec(colourId);
-    if (!spec) return fail("The colour is rec709, p3d65-pq, rec2020-pq or rec2020-hlg");
-    const ColorSpace* target = findColorSpace(spec->space);
-    if (!target) return fail("Missing colour space " + std::string(spec->space));
-    const bool hdrOut = target->hdr();
-    const int bits = supplemental ? old.bits : settings.bits ? settings.bits : (hdrOut ? 12 : 10);
-    if (bits != 10 && bits != 12) return fail("IMF pictures here are 10 or 12 bits");
-    const bool htj2k = supplemental ? old.rsiz == kHtj2kRsiz : settings.htj2k;
-    const bool lossless = supplemental ? htj2k || (old.rsiz & 0xff00) >= 0x0700 : settings.lossless;
-    if (!lossless && !supplemental && !(settings.megabitsPerSecond >= 20)) return fail("A lossy master needs at least 20 Mbit/s");
-    if (htj2k && !lossless) return fail("HTJ2K masters here are lossless");
-    if (htj2k && !htj2kAvailable()) return fail("This build of Montage has no HTJ2K encoder");
+    // (Application #5: ACES 2065-1 half floats, none of the colour, depth and coding choices)
+    std::string colourId = "aces2065-1";
+    const ImfColourSpec* spec = nullptr;
+    const ColorSpace* target = nullptr;
+    int bits = 16;
+    bool htj2k = false, lossless = true;
+    if (!aces) {
+        colourId = supplemental ? old.colour : settings.colour.empty() ? defaultImfColour(s) : settings.colour;
+        spec = colourSpec(colourId);
+        if (!spec) return fail("The colour is rec709, p3d65-pq, rec2020-pq or rec2020-hlg");
+        target = findColorSpace(spec->space);
+        if (!target) return fail("Missing colour space " + std::string(spec->space));
+        const bool hdrOut = target->hdr();
+        bits = supplemental ? old.bits : settings.bits ? settings.bits : (hdrOut ? 12 : 10);
+        if (bits != 10 && bits != 12) return fail("IMF pictures here are 10 or 12 bits");
+        htj2k = supplemental ? old.rsiz == kHtj2kRsiz : settings.htj2k;
+        lossless = supplemental ? htj2k || (old.rsiz & 0xff00) >= 0x0700 : settings.lossless;
+        if (!lossless && !supplemental && !(settings.megabitsPerSecond >= 20)) return fail("A lossy master needs at least 20 Mbit/s");
+        if (htj2k && !lossless) return fail("HTJ2K masters here are lossless");
+        if (htj2k && !htj2kAvailable()) return fail("This build of Montage has no HTJ2K encoder");
+    }
     const dcp::EditRate rate{uint32_t(canonical.num), uint32_t(canonical.den)};  // as written, not as the sequence stores it
     const double fps = rate.value();
     FrameTime first = 0, end = s.duration();
@@ -639,14 +859,17 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
     };
     const int64_t programme = end - first;
     const int64_t frames = padded(programme);
-    // (HTJ2K: the codestream declares no Part 1 profile, but is held to the size and rate one would take)
-    const uint16_t profile = supplemental ? old.rsiz : imfRsiz(W, H, 3, fps, lossless, settings.megabitsPerSecond);
-    if (!profile) return fail("No JPEG 2000 IMF profile takes that picture at that rate");
-    const uint16_t rsiz = htj2k ? kHtj2kRsiz : profile;
-    uint8_t coding[16];
-    imfPictureCoding(rsiz, coding);
-    if (std::all_of(std::begin(coding), std::end(coding), [](uint8_t b) { return b == 0; }))
-        return fail("No JPEG 2000 IMF profile takes that picture at that bit rate");
+    uint16_t rsiz = 0;
+    if (!aces) {
+        // (HTJ2K: the codestream declares no Part 1 profile, but is held to the size and rate one would take)
+        const uint16_t profile = supplemental ? old.rsiz : imfRsiz(W, H, 3, fps, lossless, settings.megabitsPerSecond);
+        if (!profile) return fail("No JPEG 2000 IMF profile takes that picture at that rate");
+        rsiz = htj2k ? kHtj2kRsiz : profile;
+        uint8_t coding[16];
+        imfPictureCoding(rsiz, coding);
+        if (std::all_of(std::begin(coding), std::end(coding), [](uint8_t b) { return b == 0; }))
+            return fail("No JPEG 2000 IMF profile takes that picture at that bit rate");
+    }
     size_t maxBytes = lossless ? 0 : size_t(settings.megabitsPerSecond * 1e6 / 8 / fps);
     // A lossy supplemental's new pictures at the earlier ones' rate: no larger than its largest (within its level).
     if (supplemental && !lossless) {
@@ -725,6 +948,60 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
                 for (int c = 0; c < 3; ++c) d[c] = uint16_t(std::lround(std::clamp(double(src[c]), 0.0, 1.0) * maxCode));
         }
         return rgb;
+    };
+    // Application #5: the output transform the pictures are made for (an earlier package's kept), the project they come
+    // from (without its grade when ungraded), and each composition frame in ACES 2065-1: the working space's light
+    // converted exactly, or a display-referred sequence's frame through the inverse of the output transform named.
+    std::string outputName, displayId;
+    double displayPeak = 100;
+    OutputTransformKind outputKind = OutputTransformKind::Filmic;
+    Project ungraded;
+    const Project* source = &p;
+    const Sequence* sourceSeq = &s;
+    const bool scene = sceneReferredWorking(s);
+    const ColorSpace* acesSpace = findColorSpace("aces2065-1");
+    std::vector<int64_t> targets;  // composition frames
+    if (aces) {
+        if (!acesSpace) return fail("Missing colour space aces2065-1");
+        outputName = imfOutputTransform(s, &displayId, &displayPeak);
+        if (supplemental && !old.acesAuthoring.empty() && old.acesAuthoring != outputName)
+            return fail("The earlier package was made for the output transform " + old.acesAuthoring + "; this sequence is graded for " + outputName);
+        bool aces2 = false;
+        if (supplemental && !old.acesAuthoring.empty() && !parseImfOutputTransform(old.acesAuthoring, displayId, displayPeak, aces2))
+            return fail("The earlier package's output transform " + old.acesAuthoring + " is not one Montage renders");
+        outputKind = outputName.rfind("urn:montage:", 0) == 0 ? OutputTransformKind::Filmic : OutputTransformKind::Aces2;
+        if (!settings.graded) {
+            ungraded = p;
+            withoutGrades(ungraded);
+            source = &ungraded;
+            sourceSeq = ungraded.findSequence(s.id);
+            if (!sourceSeq) return fail("The sequence is not in the project");
+        }
+        for (FrameTime t : settings.targetFrames) {
+            if (t < first || t >= end) return fail("Target frame " + std::to_string(t) + " is outside what is exported");
+            if (std::find(targets.begin(), targets.end(), t - first) == targets.end()) targets.push_back(t - first);
+        }
+        std::sort(targets.begin(), targets.end());
+        if (targets.size() > size_t(dcp::ImfAcesWriter::kMaxTargetFrames))
+            return fail("An IMF master holds at most " + std::to_string(dcp::ImfAcesWriter::kMaxTargetFrames) + " target frames");
+    } else if (!settings.targetFrames.empty()) {
+        return fail("Target frames are for IMF Application #5 masters");
+    }
+    auto acesAt = [&](int64_t k) {
+        Image frame;
+        if (k < programme) {
+            RenderOptions ao = o;
+            if (scene) ao.outputSpace = "aces2065-1";
+            frame = renderProgramFrame(*source, *sourceSeq, first + k, ao);
+            if (frame.width != fw || frame.height != fh) frame = resizeImage(frame, fw, fh);
+            if (!scene) inverseOutputTransform(frame, seqSpace, *acesSpace, peakNits, OutputTransformKind::Filmic);
+        }
+        std::vector<float> rgba(size_t(W) * size_t(H) * 4, 0.0f);
+        for (size_t i = 3; i < rgba.size(); i += 4) rgba[i] = 1.0f;
+        for (int y = 0; y < fh && !frame.empty(); ++y)
+            std::copy(frame.row(y), frame.row(y) + size_t(fw) * 4, rgba.data() + (size_t(y + oy) * size_t(W) + size_t(ox)) * 4);
+        for (size_t i = 3; i < rgba.size(); i += 4) rgba[i] = 1.0f;  // (opaque: flattened over black)
+        return rgba;
     };
     if (supplemental) {
         const Sequence* before = settings.originalSequence ? p.findSequence(settings.originalSequence) : &s;
@@ -813,12 +1090,29 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
                 stopped = progress && !progress(0.05 * double(++checked) / double(std::max<int64_t>(1, toCheck)));
                 continue;
             }
-            std::vector<uint16_t> mine = pictureAt(k);
             // (the earlier frame's codestream read here: the files are not shared between threads)
             std::vector<uint8_t> cs;
             const std::vector<ImfResource> r = slice(*oldPicture, same[size_t(k)], 1);
             const dcp::ImfTrackReader* f = r.size() == 1 ? oldFiles.get(r[0].trackFile) : nullptr;
             if (!f || !f->frame(r[0].entry, cs)) cs.clear();
+            if (aces) {
+                // ACES frames: the same within half float's precision.
+                checks.emplace_back(k, std::async(std::launch::async, [W, H, mine = acesAt(k), cs = std::move(cs)] {
+                    try {
+                        std::vector<float> theirs;
+                        AcesContainerInfo info;
+                        if (cs.empty() || !readAcesContainer(cs.data(), cs.size(), info, &theirs) || info.width != W || info.height != H) return false;
+                        for (size_t i = 0; i < mine.size(); ++i)
+                            if (!(std::fabs(mine[i] - theirs[i]) <= 1e-3f * std::max(1.0f, std::fabs(mine[i])))) return false;
+                        return true;
+                    } catch (...) {
+                        return false;
+                    }
+                }));
+                collect(inHand);
+                continue;
+            }
+            std::vector<uint16_t> mine = pictureAt(k);
             checks.emplace_back(k, std::async(std::launch::async, [&alikeTo, W, H, mine = std::move(mine), cs = std::move(cs)] {
                 try {
                     std::vector<uint16_t> theirs;
@@ -1063,11 +1357,13 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
 
     // The picture: the frames to code (all, or a supplemental's changed ones), several encoding at once.
     dcp::ImfColour colour;
-    colour.primaries = spec->primaries;
-    colour.transfer = spec->transfer;
-    colour.codingEquations = spec->codingEquations;
-    colour.hdr = spec->hdr;
-    if (spec->hdr) {
+    if (spec) {
+        colour.primaries = spec->primaries;
+        colour.transfer = spec->transfer;
+        colour.codingEquations = spec->codingEquations;
+        colour.hdr = spec->hdr;
+    }
+    if (spec && spec->hdr) {
         // A P3-D65 mastering display (as HDR grading monitors are), at the master's peak.
         const double p3[8] = {0.680, 0.320, 0.265, 0.690, 0.150, 0.060, 0.3127, 0.3290};
         std::copy(std::begin(p3), std::end(p3), colour.display);
@@ -1095,7 +1391,77 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         virtuals.insert(virtuals.begin(), std::move(vt));
     }
     dcp::ImfPictureWriter picture;
-    if (!toCode.empty()) {
+    std::string amfFile;
+    int targetsWritten = 0;
+    if (aces && !toCode.empty()) {
+        // Application #5: each frame rendered into ACES 2065-1 and written as an ACES image container, then the target
+        // frames (those among the frames coded here) through the output transform, as 16-bit TIFF in the display's colour.
+        const size_t fileIndex = ownFile("VIDEO", "MainImageSequence");
+        const ImfColourSpec* shown = nullptr;
+        for (const ImfColourSpec& c : kColours)
+            if (findColorSpace(c.space) && findColorSpace(c.space)->id == displayId) shown = &c;
+        const ColorSpace* display = shown ? findColorSpace(shown->space) : nullptr;
+        if (!display) return fail("The output transform renders for " + displayId + ", which IMF target frames are not in");
+        dcp::AcesPicture pic;
+        pic.authoring = outputName;
+        pic.mastering = true;
+        // The display it was made for: Rec.709 at 100 nits (and 0.05), or HDR on a P3-D65 display at its peak.
+        const double rec709[8] = {0.640, 0.330, 0.300, 0.600, 0.150, 0.060, 0.3127, 0.3290};
+        const double p3[8] = {0.680, 0.320, 0.265, 0.690, 0.150, 0.060, 0.3127, 0.3290};
+        std::copy(display->hdr() ? std::begin(p3) : std::begin(rec709), display->hdr() ? std::end(p3) : std::end(rec709), pic.display);
+        pic.maxLuminance = display->hdr() ? displayPeak : 100;
+        pic.minLuminance = display->hdr() ? 0.0001 : 0.05;
+        dcp::ImfAcesWriter writer;
+        const int g = std::gcd(W, H);
+        if (!writer.open(QDir(folder).filePath(own[fileIndex].file).toStdString(), own[fileIndex].id, rate, W, H, false, pic, uint32_t(W / g),
+                         uint32_t(H / g), &err))
+            return fail(err);
+        std::vector<dcp::AcesTargetFrame> stills;
+        const int64_t count = int64_t(toCode.size());
+        std::vector<uint8_t> exr;
+        for (int64_t j = 0; j < count; ++j) {
+            const int64_t k = toCode[size_t(j)];
+            const std::vector<float> rgba = acesAt(k);
+            if (!writeAcesContainer(W, H, rgba.data(), false, exr, &err) || !writer.write(exr.data(), exr.size(), &err)) return fail(err);
+            if (std::binary_search(targets.begin(), targets.end(), k)) {
+                Image img(W, H, Image::Uninitialized{});
+                std::copy(rgba.begin(), rgba.end(), img.px.begin());
+                outputTransform(img, *acesSpace, *display, displayPeak, outputKind, true);
+                std::vector<uint16_t> rgb(size_t(W) * size_t(H) * 3);
+                for (size_t i = 0, n = size_t(W) * size_t(H); i < n; ++i)
+                    for (int c = 0; c < 3; ++c) rgb[i * 3 + size_t(c)] = uint16_t(std::lround(std::clamp(double(img.px[i * 4 + size_t(c)]), 0.0, 1.0) * 65535.0));
+                dcp::AcesTargetFrame t;
+                if (!encodeTiff16(rgb, W, H, t.data, &err)) return fail(err);
+                t.index = j;
+                t.transfer = shown->transfer;
+                t.primaries = shown->primaries;
+                stills.push_back(std::move(t));
+            }
+            if (progress && !progress(0.1 + 0.85 * double(j + 1) / double(count))) return fail("Stopped");
+        }
+        targetsWritten = int(stills.size());
+        if (!writer.writeTargetFrames(std::move(stills), &err) || !writer.close(&err)) return fail(err);
+        own[fileIndex].descriptor = descriptorXml([&](QXmlStreamWriter& x) { acesDescriptor(x, writer, count); });
+        virtuals.front().ownFile = int(fileIndex);
+        virtuals.front().ownDuration = count;
+        if (targetsWritten) {
+            // The ACES Metadata File beside them: the pictures already in ACES 2065-1, and the output transform they are for
+            // when it is one of ACES's own (Montage's filmic one is named in the composition only).
+            AmfDocument amf;
+            amf.description = title.toStdString() + " (IMF Application #5, " + (settings.graded ? "graded" : "ungraded") + ")";
+            amf.clipName = title.toStdString();
+            amf.clipFile = own[fileIndex].file.toStdString();
+            if (outputKind == OutputTransformKind::Aces2) {
+                amf.hasOutput = true;
+                amf.outputTransformId = outputName;
+            }
+            const std::string xml = writeAmf(amf);
+            amfFile = QStringLiteral("AMF_%1.amf").arg(QString::fromStdString(dcp::uuidString(own[fileIndex].id))).toStdString();
+            QFile f(QDir(folder).filePath(QString::fromStdString(amfFile)));
+            if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate) || f.write(xml.data(), qint64(xml.size())) != qint64(xml.size()))
+                return fail("Cannot write the ACES Metadata File");
+        }
+    } else if (!aces && !toCode.empty()) {
         const size_t fileIndex = ownFile("VIDEO", "MainImageSequence");
         // Encoders at once, within about 4 GiB for the frames waiting and being coded (an encode holds roughly 30 bytes
         // a pixel, a waiting frame 6, two waiting per encoder): a dozen at UHD, more at HD.
@@ -1161,6 +1527,11 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         f.hash = packageFileHash(QDir(folder).filePath(f.file), &f.size, hashing);
         if (f.hash.isEmpty()) return fail(stopped ? "Stopped" : "Cannot read the track files back");
     }
+    // (the ACES Metadata File, an asset of the package the composition does not play)
+    const dcp::Uuid amfId = dcp::newUuid();
+    qint64 amfSize = 0;
+    const QString amfHash = amfFile.empty() ? QString() : packageFileHash(QDir(folder).filePath(QString::fromStdString(amfFile)), &amfSize);
+    if (!amfFile.empty() && amfHash.isEmpty()) return fail("Cannot read the ACES Metadata File back");
     const QString issued = packageTimestamp();
     const QString issuer = QString::fromStdString(settings.issuer.empty() ? "Montage" : settings.issuer);
     const QString lang = QString::fromStdString(sounds.front().language);
@@ -1232,7 +1603,8 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
     const bool cplOk = writeXml(cplFile, [&](QXmlStreamWriter& x) {
         x.writeStartElement("CompositionPlaylist");
         x.writeDefaultNamespace("http://www.smpte-ra.org/schemas/2067-3/2016");
-        x.writeNamespace("http://www.smpte-ra.org/ns/2067-2/2020", "cc");
+        // (Application #5 was published against ST 2067-2:2016's core constraints, so it keeps their namespace.)
+        x.writeNamespace(aces ? "http://www.smpte-ra.org/schemas/2067-2/2016" : "http://www.smpte-ra.org/ns/2067-2/2020", "cc");
         x.writeNamespace("http://www.w3.org/2001/XMLSchema-instance", "xsi");
         x.writeTextElement("Id", urn(cplId));
         text(x, "Annotation", title);
@@ -1263,7 +1635,9 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         x.writeTextElement("TotalRunningTime", running);
         x.writeStartElement("ExtensionProperties");
         // (HTJ2K pictures came with the 2023 edition)
-        x.writeTextElement("cc:ApplicationIdentification", htj2k ? "http://www.smpte-ra.org/ns/2067-21/2023" : "http://www.smpte-ra.org/ns/2067-21/2021");
+        x.writeTextElement("cc:ApplicationIdentification", aces    ? kApp5
+                                                           : htj2k ? "http://www.smpte-ra.org/ns/2067-21/2023"
+                                                                   : "http://www.smpte-ra.org/ns/2067-21/2021");
         x.writeEndElement();
         x.writeStartElement("SegmentList");
         x.writeStartElement("Segment");
@@ -1325,6 +1699,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         };
         asset(cplId, cplHash, cplSize, "text/xml", cplFile);
         for (const Own& f : own) asset(f.id, f.hash, f.size, "application/mxf", f.file);
+        if (!amfFile.empty()) asset(amfId, amfHash, amfSize, "text/xml", QString::fromStdString(amfFile));
         x.writeEndElement();
         x.writeEndElement();
     });
@@ -1357,6 +1732,7 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         asset(pklId, true, pklFile, pklSize);
         asset(cplId, false, cplFile, cplSize);
         for (const Own& f : own) asset(f.id, false, f.file, f.size);
+        if (!amfFile.empty()) asset(amfId, false, QString::fromStdString(amfFile), amfSize);
         x.writeEndElement();
         x.writeEndElement();
     });
@@ -1381,6 +1757,10 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         result->newSamples = newSamples;
         result->trackFiles.clear();
         for (const Own& f : own) result->trackFiles.push_back(QDir(folder).filePath(f.file).toStdString());
+        result->application = settings.application;
+        result->outputTransform = outputName;
+        result->targetFrames = targetsWritten;
+        result->amf = amfFile.empty() ? std::string() : QDir(folder).filePath(QString::fromStdString(amfFile)).toStdString();
     }
     return true;
 }
@@ -1522,9 +1902,10 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
         ++compositions;
         bool application = false;
         for (const auto& [path, text] : cplItems)
-            if (path.endsWith("ExtensionProperties/ApplicationIdentification") && text.startsWith("http://www.smpte-ra.org/ns/2067-21/"))
+            if (path.endsWith("ExtensionProperties/ApplicationIdentification") &&
+                (text.contains("http://www.smpte-ra.org/ns/2067-21/") || text.contains("http://www.smpte-ra.org/ns/2067-50/")))
                 application = true;
-        if (!application) issue(c.path + " does not identify IMF Application #2E");
+        if (!application) issue(c.path + " does not identify IMF Application #2E or #5");
         ImfComposition comp;
         std::string err;
         if (!readImfComposition(dir.filePath(c.path).toStdString(), comp, &err)) {
@@ -1571,7 +1952,8 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
                         continue;
                     }
                 }
-                if (text || !inside) {
+                const bool acesPicture = image && comp.application == 5;
+                if (text || !inside || acesPicture) {
                     // Read as Montage reads track files (those of other packages without reading all their essence).
                     dcp::ImfTrackReader reader;
                     if (!reader.open(file, &err)) {
@@ -1586,7 +1968,41 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
                     if (reader.kind() != want) issue(QStringLiteral("%1 is not the %2 its %3 plays").arg(name, image ? "picture" : sound ? "sound" : "timed text", kind));
                     else if (r.intrinsic >= 0 && units != r.intrinsic)
                         issue(QStringLiteral("%1 has %2 edit units; the composition says %3").arg(name).arg(units).arg(r.intrinsic));
-                    else if (text && !reader.text(xml, &err))
+                    else if (acesPicture && !reader.imfAces())
+                        issue(QStringLiteral("%1 is not ACES pictures (ST 2065-5)").arg(name));
+                    else if (acesPicture && inside) {
+                        // Every frame an ACES image container as ST 2065-4 has it, of the composition's size; every
+                        // target frame in its stream, a still of that size.
+                        std::vector<uint8_t> bytes;
+                        for (int64_t k = 0; k < reader.frames(); ++k) {
+                            AcesContainerInfo info;
+                            if (!reader.frame(k, bytes, &err) || !readAcesContainer(bytes.data(), bytes.size(), info, nullptr, &err)) {
+                                issue(QStringLiteral("%1 frame %2 is not OpenEXR: %3").arg(name).arg(k).arg(QString::fromStdString(err)));
+                                break;
+                            }
+                            if (!info.conforming) {
+                                issue(QStringLiteral("%1 frame %2 is not an ACES image container (ST 2065-4): %3").arg(name).arg(k).arg(QString::fromStdString(info.why)));
+                                break;
+                            }
+                            if (comp.width > 0 && (info.width != comp.width || info.height != comp.height)) {
+                                issue(QStringLiteral("%1 frame %2 is %3 x %4; the descriptor says %5 x %6").arg(name).arg(k).arg(info.width).arg(info.height).arg(comp.width).arg(comp.height));
+                                break;
+                            }
+                            if (!reading(qint64(bytes.size()))) {
+                                issue("Stopped");
+                                return issues;
+                            }
+                        }
+                        for (size_t i = 0; i < reader.targetFrames().size(); ++i) {
+                            const auto& t = reader.targetFrames()[i];
+                            std::vector<uint16_t> rgb;
+                            int w = 0, h = 0;
+                            if (!t.present) issue(QStringLiteral("%1 names target frame %2 but does not carry it").arg(name).arg(i));
+                            else if (t.index < 0 || t.index >= reader.frames()) issue(QStringLiteral("%1's target frame %2 is of no frame of it").arg(name).arg(i));
+                            else if (!reader.targetFrame(i, bytes, &err) || !decodeTiff16(bytes, rgb, w, h, &err) || (comp.width > 0 && (w != comp.width || h != comp.height)))
+                                issue(QStringLiteral("%1's target frame %2 is not a 16-bit TIFF of the picture's size").arg(name).arg(i));
+                        }
+                    } else if (text && !reader.text(xml, &err))
                         issue(QStringLiteral("%1 is not timed text Montage reads: %2").arg(name, QString::fromStdString(err)));
                     else if (text && isImscImage(xml)) {
                         // Pictures: the document as the Image profile has it, each image a PNG in the file.
@@ -1659,6 +2075,33 @@ bool readImfFrame(const std::string& mxf, int index, std::vector<uint16_t>& rgb,
     return true;
 }
 
+bool readImfAcesFrame(const std::string& mxf, int index, std::vector<float>& rgba, int& width, int& height, std::string* error) {
+    dcp::ImfTrackReader reader;
+    std::vector<uint8_t> bytes;
+    AcesContainerInfo info;
+    if (!reader.open(mxf, error, true)) return false;
+    if (!reader.imfAces()) {
+        if (error) *error = mxf + " is not an IMF Application #5 picture track file";
+        return false;
+    }
+    if (!reader.frame(index, bytes, error) || !readAcesContainer(bytes.data(), bytes.size(), info, &rgba, error)) return false;
+    width = info.width, height = info.height;
+    return true;
+}
+
+bool readImfTargetFrame(const std::string& mxf, int i, std::vector<uint16_t>& rgb, int& width, int& height, int64_t* frame, std::string* error) {
+    dcp::ImfTrackReader reader;
+    std::vector<uint8_t> bytes;
+    if (!reader.open(mxf, error)) return false;
+    if (i < 0 || size_t(i) >= reader.targetFrames().size()) {
+        if (error) *error = mxf + " has no target frame " + std::to_string(i);
+        return false;
+    }
+    if (!reader.targetFrame(size_t(i), bytes, error) || !decodeTiff16(bytes, rgb, width, height, error)) return false;
+    if (frame) *frame = reader.targetFrames()[size_t(i)].index;
+    return true;
+}
+
 // ---- Reading compositions -----------------------------------------------------------------------------------------
 
 int64_t ImfVirtualTrack::length() const {
@@ -1690,7 +2133,7 @@ bool readImfComposition(const std::string& cplPath, ImfComposition& out, std::st
     struct Info {
         int width = 0, height = 0, bits = 0, channels = 0;
         uint16_t rsiz = 0;
-        QString transfer, primaries, language, contentKind;
+        QString transfer, primaries, language, contentKind, container, authoring;
         double peak = 0;
     };
     std::map<std::string, Info> info;
@@ -1713,7 +2156,12 @@ bool readImfComposition(const std::string& cplPath, ImfComposition& out, std::st
                 value = r.readElementText(QXmlStreamReader::IncludeChildElements).trimmed();
                 leaf = true;
             };
-            if (d == 2 && (name == "Id" || name == "ContentTitle" || name == "EditRate" || name == "IssueDate")) {
+            if (d == 3 && path[1] == "ExtensionProperties" && name == "ApplicationIdentification") {
+                take();
+                if (value.contains("http://www.smpte-ra.org/ns/2067-50/")) out.application = 5;
+                else if (value.contains("http://www.smpte-ra.org/ns/2067-21/")) out.application = 2;
+                else out.application = 0;
+            } else if (d == 2 && (name == "Id" || name == "ContentTitle" || name == "EditRate" || name == "IssueDate")) {
                 take();
                 if (name == "Id") out.id = packageBareId(value).toStdString();
                 if (name == "ContentTitle") out.title = value.toStdString();
@@ -1741,7 +2189,8 @@ bool readImfComposition(const std::string& cplPath, ImfComposition& out, std::st
             } else if (d > 4 && descriptorStart >= 0) {
                 static const QStringList fields = {"StoredWidth", "StoredHeight", "Rsiz", "ComponentSize", "TransferCharacteristic", "ColorPrimaries",
                                                    "MasteringDisplayMaximumLuminance", "ChannelCount", "RFC5646SpokenLanguage",
-                                                   "MCAAudioContentKind", "RFC5646LanguageTagList"};
+                                                   "MCAAudioContentKind", "RFC5646LanguageTagList", "ContainerFormat",
+                                                   "ACESAuthoringInformation", "ACESMasteringDisplayMaximumLuminance"};
                 if (fields.contains(name)) {
                     take();
                     Info& x = info[descriptorId.toStdString()];
@@ -1756,6 +2205,9 @@ bool readImfComposition(const std::string& cplPath, ImfComposition& out, std::st
                     if ((name == "RFC5646SpokenLanguage" || name == "RFC5646LanguageTagList") && x.language.isEmpty())
                         x.language = value.split(',').value(0).trimmed();
                     if (name == "MCAAudioContentKind" && x.contentKind.isEmpty()) x.contentKind = value;
+                    if (name == "ContainerFormat") x.container = value.toLower();
+                    if (name == "ACESAuthoringInformation") x.authoring = value;
+                    if (name == "ACESMasteringDisplayMaximumLuminance") x.peak = value.toDouble() / 10000.0;
                 }
             } else if (d >= 5 && path[1] == "SegmentList" && path[2] == "Segment" && path[3] == "SequenceList") {
                 // CompositionPlaylist/SegmentList/Segment/SequenceList/<kind>/TrackId, .../ResourceList/Resource/<field>
@@ -1852,6 +2304,12 @@ bool readImfComposition(const std::string& cplPath, ImfComposition& out, std::st
             out.masteringPeak = x.peak;
             for (const ImfColourSpec& c : kColours)
                 if (ulUrn(std::string(c.transfer)) == x.transfer && ulUrn(std::string(c.primaries)) == x.primaries) out.colour = c.id;
+            // ACES 2065-1 pictures (ST 2065-5): half floats, the output transform they were made for.
+            if (x.container == ulUrn(std::string(dcp::ImfAcesWriter::kContainer)) && x.primaries == ulUrn(std::string(dcp::ImfAcesWriter::kPrimaries))) {
+                out.colour = "aces2065-1";
+                out.bits = 16;
+                out.acesAuthoring = x.authoring.toStdString();
+            }
         }
     }
     return true;
@@ -1938,6 +2396,22 @@ ImportResult importImf(Project& p, const std::string& path, const MediaProber& p
         if (c.width > 0 && c.height > 0) seq.width = c.width, seq.height = c.height;
         seq.colorSpace = space;
         if (c.masteringPeak > 0) seq.hdrPeakNits = c.masteringPeak;
+        if (c.colour == "aces2065-1") {
+            // An archival master: graded in ACES 2065-1, delivered through the output transform it names.
+            space = "aces2065-1";
+            seq.workingSpace = space;
+            std::string display;
+            double peak = 0;
+            bool aces2 = false;
+            if (parseImfOutputTransform(c.acesAuthoring, display, peak, aces2)) {
+                seq.colorSpace = display;
+                seq.outputTransform = aces2 ? "aces2" : "";
+                if (const ColorSpace* d = findColorSpace(display); d && d->hdr() && peak > 0) seq.hdrPeakNits = peak;
+            } else {
+                seq.colorSpace = "rec709";
+                if (!c.acesAuthoring.empty()) b.warn("The output transform " + c.acesAuthoring + " is not one Montage has: shown through Rec.709");
+            }
+        }
     }
     auto media = [&](const ImfResource& r, bool video, double seconds) {
         const auto it = files.find(r.trackFile);

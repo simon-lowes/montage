@@ -118,6 +118,9 @@ public:
     // choice of what to work on, not an edit.
     Id paintEffect() const { return paintEffect_; }
     void setPaintEffect(Id effect);
+    // The kind of pin a click on the monitor places on an armed Mesh Warp (core/Effects.h meshPinKind's).
+    int meshPinKind() const { return meshPinKind_; }
+    void setMeshPinKind(int kind) { meshPinKind_ = kind; }
     // The single clip shown in the inspector (first selected), or nullptr.
     const Clip* primaryClip() const;
     // The colour node picked in the Nodes panel (core/GradeGraph.h): its key in the graph of the clip shown in the
@@ -339,6 +342,7 @@ private:
     Id inspectedChain_ = 0;
     std::map<Id, int> maskObjects_;  // effect -> object being picked
     Id paintEffect_ = 0;
+    int meshPinKind_ = 0;
     Id gradeNodeClip_ = 0;           // the clip whose colour node is picked, and the node
     int gradeNodeKey_ = 0;
     int targetVideo_ = 0;

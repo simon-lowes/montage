@@ -8,6 +8,7 @@
 #include "Gamut.h"
 #include "TransferTables.h"
 #include "Ocio.h"
+#include "MeshWarp.h"
 #include "VideoFx.h"
 #include "core/Cdl.h"
 #include "core/Effects.h"
@@ -2358,6 +2359,8 @@ void applyEffectUnmasked(const Effect& e, FrameTime t, Image& img, double pixelS
     else if (ty == "channel_blur") vfx::channelBlur(e, t, img, pixelScale);
     else if (ty == "noise") vfx::noise(e, t, img);
     else if (ty == "corner_pin") vfx::cornerPin(e, t, img);
+    else if (ty == "mesh_warp") meshWarp(e, t, img, pixelScale);
+    else if (ty == "grid_warp") gridWarp(e, t, img);
     else if (ty == "letterbox") vfx::letterbox(e, t, img);
     else if (ty == "posterize") vfx::posterize(e, t, img);
     else if (ty == "wave_warp") sfx::waveWarp(e, t, img, pixelScale);

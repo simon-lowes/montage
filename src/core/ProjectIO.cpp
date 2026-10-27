@@ -1,4 +1,5 @@
 #include "ProjectIO.h"
+#include "Automation.h"
 #include "AdaptiveHdrMetadata.h"
 #include "Surround.h"
 #include "FilmCount.h"
@@ -510,6 +511,7 @@ QJsonObject trackToJson(const Track& t) {
     if (t.surroundYAuto.animated()) o["surroundYAuto"] = paramToJson(t.surroundYAuto);
     if (t.surroundZAuto.animated()) o["surroundZAuto"] = paramToJson(t.surroundZAuto);
     if (t.muteAuto.animated()) o["muteAuto"] = paramToJson(t.muteAuto);
+    if (t.volumeTrim.animated() || t.volumeTrim.value != 0) o["volumeTrim"] = paramToJson(t.volumeTrim);
     if (t.automation != 1) o["automation"] = t.automation;
     if (!t.sends.empty()) {
         QJsonArray sends;
@@ -518,6 +520,7 @@ QJsonObject trackToJson(const Track& t) {
             if (sd.preFader) so["preFader"] = true;
             if (sd.muted) so["muted"] = true;
             if (sd.levelAuto.animated()) so["levelAuto"] = paramToJson(sd.levelAuto);
+            if (sd.levelTrim.animated() || sd.levelTrim.value != 0) so["levelTrim"] = paramToJson(sd.levelTrim);
             sends.append(so);
         }
         o["sends"] = sends;
@@ -572,7 +575,8 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
     if (o.contains("surroundYAuto")) t.surroundYAuto = paramFromJson(o.value("surroundYAuto"));
     if (o.contains("surroundZAuto")) t.surroundZAuto = paramFromJson(o.value("surroundZAuto"));
     if (o.contains("muteAuto")) t.muteAuto = paramFromJson(o.value("muteAuto"));
-    t.automation = std::clamp(o.value("automation").toInt(1), 0, 4);
+    if (o.contains("volumeTrim")) t.volumeTrim = paramFromJson(o.value("volumeTrim"));
+    t.automation = std::clamp(o.value("automation").toInt(1), 0, kAutomationModes - 1);
     for (const auto& v : o.value("sends").toArray()) {
         const QJsonObject so = v.toObject();
         Send sd;
@@ -581,6 +585,7 @@ Track trackFromJson(const QJsonObject& o, TrackKind kind) {
         sd.preFader = so.value("preFader").toBool(false);
         sd.muted = so.value("muted").toBool(false);
         if (so.contains("levelAuto")) sd.levelAuto = paramFromJson(so.value("levelAuto"));
+        if (so.contains("levelTrim")) sd.levelTrim = paramFromJson(so.value("levelTrim"));
         if (sd.bus) t.sends.push_back(std::move(sd));
     }
     t.folder = ss(o.value("folder"));
@@ -730,6 +735,7 @@ QJsonObject sequenceToJson(const Sequence& s) {
             if (b.volumeAuto.animated()) bo["volumeAuto"] = paramToJson(b.volumeAuto);
             if (b.panAuto.animated()) bo["panAuto"] = paramToJson(b.panAuto);
             if (b.muteAuto.animated()) bo["muteAuto"] = paramToJson(b.muteAuto);
+            if (b.volumeTrim.animated() || b.volumeTrim.value != 0) bo["volumeTrim"] = paramToJson(b.volumeTrim);
             if (b.automation != 1) bo["automation"] = b.automation;
             buses.append(bo);
         }
@@ -782,8 +788,11 @@ QJsonObject sequenceToJson(const Sequence& s) {
     if (s.hdrPeakNits != 1000) o["hdrPeakNits"] = s.hdrPeakNits;
     if (!s.trimTargets.empty()) {
         QJsonArray targets;
-        for (const TrimTarget& tt : s.trimTargets)
-            targets.append(QJsonObject{{"id", qs(tt.id)}, {"name", qs(tt.name)}, {"colorSpace", qs(tt.colorSpace)}, {"peakNits", tt.peakNits}});
+        for (const TrimTarget& tt : s.trimTargets) {
+            QJsonObject t{{"id", qs(tt.id)}, {"name", qs(tt.name)}, {"colorSpace", qs(tt.colorSpace)}, {"peakNits", tt.peakNits}};
+            if (!tt.toneMapping.empty()) t["toneMapping"] = qs(tt.toneMapping);
+            targets.append(t);
+        }
         o["trimTargets"] = targets;
     }
     if (s.hdrMaxCll > 0) o["hdrMaxCll"] = s.hdrMaxCll;
@@ -839,7 +848,8 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     s.hdrPeakNits = std::clamp(o.value("hdrPeakNits").toDouble(1000), 100.0, 10000.0);
     for (const auto& v : o.value("trimTargets").toArray()) {
         const QJsonObject tt = v.toObject();
-        TrimTarget target{ss(tt.value("id")), ss(tt.value("name")), ss(tt.value("colorSpace")), std::clamp(tt.value("peakNits").toDouble(100), 100.0, 10000.0)};
+        TrimTarget target{ss(tt.value("id")), ss(tt.value("name")), ss(tt.value("colorSpace")), std::clamp(tt.value("peakNits").toDouble(100), 100.0, 10000.0),
+                          ss(tt.value("toneMapping"))};
         if (!target.id.empty() && std::none_of(s.trimTargets.begin(), s.trimTargets.end(), [&](const TrimTarget& x) { return x.id == target.id; }))
             s.trimTargets.push_back(std::move(target));
     }
@@ -910,7 +920,8 @@ Sequence sequenceFromJson(const QJsonObject& o) {
         if (bo.contains("volumeAuto")) b.volumeAuto = paramFromJson(bo.value("volumeAuto"));
         if (bo.contains("panAuto")) b.panAuto = paramFromJson(bo.value("panAuto"));
         if (bo.contains("muteAuto")) b.muteAuto = paramFromJson(bo.value("muteAuto"));
-        b.automation = std::clamp(bo.value("automation").toInt(1), 0, 4);
+        if (bo.contains("volumeTrim")) b.volumeTrim = paramFromJson(bo.value("volumeTrim"));
+        b.automation = std::clamp(bo.value("automation").toInt(1), 0, kAutomationModes - 1);
         s.buses.push_back(std::move(b));
     }
     for (const auto& e : o.value("masterEffects").toArray()) s.masterEffects.push_back(effectFromJson(e));
@@ -1054,6 +1065,7 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         if (!m.bin.empty()) o["bin"] = qs(m.bin);
         if (!m.colorSpace.empty()) o["colorSpace"] = qs(m.colorSpace);
         if (!m.colorOverride.empty()) o["colorOverride"] = qs(m.colorOverride);
+        if (!m.sdrExpand.empty()) o["sdrExpand"] = qs(m.sdrExpand);
         if (m.maxCll > 0) o["maxCll"] = m.maxCll;
         if (m.maxFall > 0) o["maxFall"] = m.maxFall;
         if (m.gainMap) o["gainMap"] = true;
@@ -1160,6 +1172,13 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
     QJsonArray seqs;
     for (const auto& s : p.sequences) seqs.append(sequenceToJson(s));
     root["sequences"] = seqs;
+    if (p.mergeBase && !p.mergeBase->empty())
+        if (const QJsonDocument d = QJsonDocument::fromJson(QByteArray::fromStdString(*p.mergeBase)); d.isObject()) root["mergeBase"] = d.object();
+    if (!p.mergeIds.empty()) {
+        QJsonObject ids;
+        for (const auto& [from, to] : p.mergeIds) ids[QString::number(from)] = double(to);
+        root["mergeIds"] = ids;
+    }
     return QJsonDocument(root).toJson(QJsonDocument::Indented).toStdString();
 }
 
@@ -1185,6 +1204,11 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
     p.activeSequence = Id(i64(root.value("activeSequence")));
     p.nextId = Id(i64(root.value("nextId"), 1));
     p.stereoChecked = root.value("mediaStereo").toInt() >= 2;
+    if (root.value("mergeBase").isObject())
+        p.mergeBase = std::make_shared<const std::string>(QJsonDocument(root.value("mergeBase").toObject()).toJson(QJsonDocument::Compact).toStdString());
+    const QJsonObject mergeIds = root.value("mergeIds").toObject();
+    for (auto it = mergeIds.begin(); it != mergeIds.end(); ++it)
+        if (const Id from = it.key().toULongLong(), to = Id(i64(it.value())); from && to) p.mergeIds[from] = to;
     for (const auto& mv : root.value("media").toArray()) {
         QJsonObject o = mv.toObject();
         MediaItem m;
@@ -1235,6 +1259,7 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         m.bin = ss(o.value("bin"));
         m.colorSpace = ss(o.value("colorSpace"));
         m.colorOverride = ss(o.value("colorOverride"));
+        m.sdrExpand = ss(o.value("sdrExpand"));
         m.maxCll = std::max(0.0, o.value("maxCll").toDouble());
         m.maxFall = std::max(0.0, o.value("maxFall").toDouble());
         m.gainMap = o.value("gainMap").toBool();

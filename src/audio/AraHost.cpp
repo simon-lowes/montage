@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -11,7 +12,9 @@
 #include <thread>
 
 #include "ARA_Library/Dispatch/ARAHostDispatch.h"
+#include "DialogueAlign.h"
 #include "PluginEffect.h"
+#include "SpeechCleanup.h"
 #include "media/MediaPool.h"
 
 namespace montage::ara {
@@ -212,6 +215,7 @@ struct Session::Impl final : AudioAccessControllerInterface,
     }
     bool writeBytesToArchive(ARAArchiveWriterHostRef ref, ARASize position, ARASize length, const ARAByte buffer[]) noexcept override {
         std::string& bytes = reinterpret_cast<ArchiveOut*>(ref)->bytes;
+        if (length > bytes.max_size() || position > bytes.max_size() - length) return false;  // (the end past what can be held)
         try {
             if (bytes.size() < position + length) bytes.resize(position + length);
         } catch (...) {
@@ -496,6 +500,8 @@ std::string Session::archive() {
 
 bool Session::changed() { return d_->dirty.exchange(false); }
 
+void Session::stillChanged() { d_->dirty = true; }
+
 void Session::idle() {
     d_->dc->notifyModelUpdates();
     if (d_->inst) d_->inst->idle();
@@ -538,7 +544,8 @@ bool renderEffect(const Effect& e, const AudioBufferPtr& source, AudioBuffer& ou
     return false;
 }
 
-bool clipSource(const Project& p, const Sequence& seq, const Clip& c, std::string& key, AudioBufferPtr& buffer, std::string* error) {
+bool clipSource(const Project& p, const Sequence& seq, const Clip& c, std::string& key, AudioBufferPtr& buffer, std::string* error,
+                const Effect* upTo) {
     const MediaItem* m = c.mediaId ? p.findMedia(c.mediaId) : nullptr;
     if (!m || !m->hasAudio) {
         if (error) *error = "the clip has no sound of its own";
@@ -549,6 +556,18 @@ bool clipSource(const Project& p, const Sequence& seq, const Clip& c, std::strin
     if (!buffer || buffer->frames() <= 0) {
         if (error) *error = "the clip's sound could not be read";
         return false;
+    }
+    if (!upTo) return true;
+    // (Chosen as the mixer chooses them: render/Compositor.cpp.)
+    std::vector<const Effect*> before;
+    for (const Effect& e : c.effects) {
+        if (e.id == upTo->id) break;
+        if (e.enabled && isSourceAudioEffect(e.type) && dialogueAlignmentApplies(e, c) && bandwidthExtensionApplies(e, c)) before.push_back(&e);
+    }
+    if (before.empty()) return true;
+    if (AudioBufferPtr through = cleanedAudio(key, buffer, before, true); through && through->frames() > 0) {
+        buffer = through;
+        key += "|through:" + std::to_string(reinterpret_cast<uintptr_t>(through.get()));
     }
     return true;
 }

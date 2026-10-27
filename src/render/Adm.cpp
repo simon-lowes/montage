@@ -120,8 +120,7 @@ struct Block {
 // two points behind stays behind. Boundaries fall on whole samples that hh:mm:ss.fffff writes exactly (every 12 at
 // 48 kHz).
 std::vector<Block> objectBlocks(const Track& tr, bool overhead, FrameTime first, FrameTime end, double fps, int64_t total) {
-    const bool reads = trackAutomation(tr) == AutomationMode::Read || trackAutomation(tr) == AutomationMode::Latch ||
-                       trackAutomation(tr) == AutomationMode::Touch;
+    const bool reads = automationReads(trackAutomation(tr));
     if (!reads || !surroundAnimated(tr)) return {{0, total, admPosition(tr.surround, overhead)}};
     auto sampleAt = [&](FrameTime f) {
         const int64_t v = int64_t(std::llround(double(f - first) * kRate / fps));

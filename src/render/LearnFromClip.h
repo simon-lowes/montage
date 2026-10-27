@@ -2,6 +2,7 @@
 // before its effects and with them, and the network then given to clips as their Learned Effect.
 #pragma once
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -17,6 +18,13 @@ namespace montage {
 // picture there.
 bool learningPair(const Project& p, const Sequence& s, const Clip& c, FrameTime t, learn::Pair& out, std::string* error = nullptr);
 
+// The most pixels each of `frames` examples keeps, so that together they stay within what training can hold (about a
+// gigabyte: a few 4K frames whole, a minute's markers on 8K each a part).
+int64_t learningPixelsEach(size_t frames);
+// Cuts a pair larger than `maxPixels` down to the part of the frame (its shape, at full size, so the network still
+// learns at the picture's scale) where before and after differ most: where it was worked on.
+void fitLearningPair(learn::Pair& p, int64_t maxPixels);
+
 // The frames the clip was worked on, to learn from: the sequence's markers on it, else where its effects (those a
 // Learned Effect stands in for too) have keys, else the playhead (when on it). Timeline frames, in order.
 std::vector<FrameTime> exampleFrames(const Sequence& s, const Clip& c, FrameTime playhead);
@@ -28,6 +36,12 @@ std::string learnedNetworkOf(const Clip& c);
 // already show (an undo puts back the one they had), and no file is at, unless `reuse` (a saved project's network
 // trained before and not given, to go on from).
 std::string newLearnedNetworkPath(const std::string& projectPath, const Project& p, const Clip& c, bool reuse = false);
+// A project saved for the first time keeps its networks: those its clips run from the temporary folder (made before it
+// was saved) are copied beside it, as newLearnedNetworkPath() names them, and the clips pointed at the copies. Returns
+// the networks copied, from where to where.
+std::map<std::string, std::string> keepLearnedNetworks(Project& p, const std::string& projectPath);
+// Points the clips running the networks `moved` (keepLearnedNetworks()) at their copies.
+void repointLearnedNetworks(Project& p, const std::map<std::string, std::string>& moved);
 // Whether a clip of the project runs that network.
 bool networkInUse(const Project& p, const std::string& network);
 

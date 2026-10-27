@@ -17,6 +17,7 @@
 #include "media/ImageSequence.h"
 #include "media/Interpret.h"
 #include "media/Pulldown.h"
+#include "render/ColorSpace.h"
 
 namespace montage {
 
@@ -196,6 +197,19 @@ InterpretFootageDialog::InterpretFootageDialog(const MediaItem& first, int count
     swapEyes_->setEnabled(video);
     form->addRow(tr("Stereo 3D:"), stereo_);
     form->addRow(QString(), swapEyes_);
+    // SDR pictures in an HDR sequence: at HDR reference white, or brought up by a BT.2446 method.
+    const ColorSpace& space = mediaColorSpace(first);
+    if (!space.hdr() && !space.sceneReferred) {
+        sdrExpand_ = new QComboBox(this);
+        sdrExpand_->setObjectName(QStringLiteral("interpretSdrInHdr"));
+        sdrExpand_->addItem(tr("At HDR Reference White (203 nits)"), QString());
+        sdrExpand_->addItem(tr("Expanded, BT.2446 Method A (SDR white at 1000 nits)"), QStringLiteral("bt2446a"));
+        sdrExpand_->addItem(tr("Expanded, BT.2446 Method C (SDR white at about 330 nits)"), QStringLiteral("bt2446c"));
+        sdrExpand_->setCurrentIndex(std::max(0, sdrExpand_->findData(QString::fromStdString(first.sdrExpand))));
+        sdrExpand_->setToolTip(tr("How the picture is shown in an HDR sequence. Expanded brings its highlights up so they look like HDR; "
+                                  "titles and graphics made in Montage stay at reference white."));
+        form->addRow(tr("SDR in HDR:"), sdrExpand_);
+    }
     lay->addLayout(form);
 
     // Camera RAW: how the sensor data is developed.
@@ -272,6 +286,11 @@ InterpretFootageDialog::InterpretFootageDialog(const MediaItem& first, int count
 }
 
 QString InterpretFootageDialog::pulldownChoice() const { return pulldown_->isEnabled() ? pulldown_->currentData().toString() : QStringLiteral("keep"); }
+
+std::optional<std::string> InterpretFootageDialog::sdrExpand() const {
+    if (!sdrExpand_) return std::nullopt;
+    return sdrExpand_->currentData().toString().toStdString();
+}
 
 Interpretation InterpretFootageDialog::interpretation() const {
     Interpretation i;

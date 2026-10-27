@@ -34,6 +34,7 @@
 #include "core/GraphicsTemplate.h"
 #include "core/Effects.h"
 #include "core/MaskPath.h"
+#include "render/MeshWarp.h"
 #include "render/ColorChart.h"
 #include "core/LensProfile.h"
 #include "render/ColorSpace.h"
@@ -45,6 +46,7 @@
 #include "render/HdrView.h"
 #include "render/Compositor.h"
 #include "render/Particles.h"
+#include "render/Titles.h"
 #include "core/Expression.h"
 #include "render/GpuCompositor.h"
 #include "render/Dcp.h"
@@ -57,6 +59,8 @@
 #include "render/XmlCanonical.h"
 #include "core/Interpretation.h"
 #include "media/Decoder.h"
+#include "media/Exr.h"
+#include "media/Proxy.h"
 #include "media/DescribePicture.h"
 #include "media/LanguageModel.h"
 #include "render/FootageWords.h"
@@ -77,6 +81,10 @@
 #include <functional>
 #include <mutex>
 #include <QPainter>
+#include <QFontDatabase>
+#include <QGlyphRun>
+#include <QRawFont>
+#include <QTextLayout>
 #include <QElapsedTimer>
 #include <QRandomGenerator>
 #include "core/ScriptCut.h"
@@ -4698,6 +4706,192 @@ colorspaces:
         QVERIFY(!edit::removeTrimTarget(s, "hdr10-600").ok);
     }
 
+    void sdrAndHdrByBt2446() {
+        const ColorSpace& rec709 = *findColorSpace("rec709");
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        const ColorSpace& hlg = *findColorSpace("rec2100hlg");
+        const ColorSpace& a = withToneMapping(rec709, ToneMapping::Bt2446A);
+        const ColorSpace& c = withToneMapping(rec709, ToneMapping::Bt2446C);
+        // Named and found by name; Montage's is the space itself; HDR and camera spaces take none.
+        QCOMPARE(QString::fromStdString(a.id), QStringLiteral("rec709+bt2446a"));
+        QCOMPARE(findColorSpace("rec709+bt2446c"), &c);
+        QCOMPARE(&withToneMapping(a, ToneMapping::Montage), &rec709);
+        QCOMPARE(&withToneMapping(c, ToneMapping::Bt2446A), &a);
+        QCOMPARE(&withToneMapping(pq, ToneMapping::Bt2446A), &pq);
+        QVERIFY(!findColorSpace("rec2100pq+bt2446a") && !findColorSpace("rec709+bt2446x") && !findColorSpace("acescct+bt2446c"));
+        QVERIFY(sameColorSpace(a, rec709) && sameColorSpace(a, c) && !sameColorSpace(a, pq));
+        QVERIFY(!conversionLut(a, rec709));  // (the same code values)
+        auto through = [](double v, const ColorSpace& from, const ColorSpace& to) {
+            float px[3] = {float(v), float(v), float(v)};
+            convertPixel(px, from, to, 1000);
+            return std::array<double, 3>{px[0], px[1], px[2]};
+        };
+        // SDR white: at HDR reference white as before (BT.2408); at 1000 cd/m² by Method A; at the top of Method C's curve
+        // (its log shoulder from the knee at 58.5 cd/m² of SDR up to 100).
+        QVERIFY(std::fabs(codeToNits(pq, through(1, rec709, pq)[1]) - 203) < 0.5);
+        QVERIFY2(std::fabs(codeToNits(pq, through(1, a, pq)[1]) - 1000) < 1, qPrintable(QString::number(codeToNits(pq, through(1, a, pq)[1]))));
+        const double k1 = 0.83802, k3 = 0.74204, knee = 58.5 / k1, k2 = k1 * (1 - k3) * knee, k4 = 58.5 - k2 * std::log(1 - k3);
+        QVERIFY(std::fabs(k2 - 15.09968) < 0.01 && std::fabs(k4 - 78.99439) < 0.05);  // (equation (10), rounded)
+        const double cTop = knee * (std::exp((100 - k4) / k2) + k3);
+        QVERIFY2(std::fabs(codeToNits(pq, through(1, c, pq)[1]) - cTop) < 0.5, qPrintable(QString::number(codeToNits(pq, through(1, c, pq)[1]))));
+        // HDR reference white into SDR by Method C: 96 % (the report's design point).
+        QVERIFY2(std::fabs(through(nitsToCode(pq, 203), pq, c)[1] - 0.96) < 0.003, qPrintable(QString::number(through(nitsToCode(pq, 203), pq, c)[1])));
+        // Montage's own mapping down is untouched by the spaces that are not tone mapped.
+        QCOMPARE(through(nitsToCode(pq, 600), pq, rec709), through(nitsToCode(pq, 600), pq, withToneMapping(c, ToneMapping::Montage)));
+
+        // Every curve rises: SDR up into PQ, and PQ (to 1000 cd/m²) down into SDR.
+        for (const ColorSpace* m : {&rec709, &a, &c}) {
+            double last = -1;
+            for (int i = 0; i <= 2048; ++i) {
+                const double v = through(i / 2048.0, *m, pq)[1];
+                QVERIFY2(v >= last, qPrintable(QString("%1 up at %2").arg(QString::fromStdString(m->id)).arg(i)));
+                last = v;
+            }
+            last = -1;
+            for (int i = 0; i <= 2048; ++i) {
+                const double v = through(nitsToCode(pq, 1000.0 * i / 2048), pq, *m)[1];
+                QVERIFY2(v >= last, qPrintable(QString("%1 down at %2").arg(QString::fromStdString(m->id)).arg(i)));
+                last = v;
+            }
+        }
+
+        // Method C's curve is continuous at its knee (58.5 cd/m² of SDR, code 0.8): it rises through it both ways.
+        double lastUp = -1, lastDown = -1;
+        for (int i = 0; i <= 2000; ++i) {
+            const double code = std::pow((58.3 + i * 0.0002) / 100, 1 / 2.4);
+            const double up = through(code, c, pq)[1];
+            const double down = through(nitsToCode(pq, knee * 0.995 + i * knee * 0.00001), pq, c)[1];
+            QVERIFY2(up >= lastUp && down >= lastDown, qPrintable(QString::number(i)));
+            lastUp = up, lastDown = down;
+        }
+        // Method C's way back is its way there exactly (§ 6.2): SDR colours up into HDR and down again.
+        double worstC = 0;
+        for (double r : {0.0, 0.1, 0.3, 0.5, 0.8, 1.0})
+            for (double g : {0.0, 0.2, 0.5, 0.9, 1.0})
+                for (double b : {0.0, 0.25, 0.6, 1.0}) {
+                    float px[3] = {float(r), float(g), float(b)};
+                    convertPixel(px, c, pq, 1000);
+                    convertPixel(px, pq, c, 1000);
+                    // (compared in light: a channel at zero comes back within the float precision of the PQ code,
+                    // which BT.1886's curve magnifies near black)
+                    const double want[3] = {r, g, b};
+                    for (int k = 0; k < 3; ++k) worstC = std::max(worstC, std::fabs(std::pow(double(px[k]), 2.4) - std::pow(want[k], 2.4)));
+                }
+        QVERIFY2(worstC < 1e-5, qPrintable(QString::number(worstC)));
+        // Method A is a matched pair, not an exact inverse: 10-bit SDR up and down again within 12 code values (11.4 at
+        // worst, near 86 %), and HDR down and up again within 7 % of its light from 1 to 1000 cd/m².
+        double worstA = 0;
+        for (int code = 0; code < 1024; ++code) worstA = std::max(worstA, std::fabs(through(through(code / 1023.0, a, pq)[1], pq, a)[1] * 1023 - code));
+        QVERIFY2(worstA < 12, qPrintable(QString::number(worstA)));
+        for (double nits : {1.0, 10.0, 50.0, 203.0, 500.0, 1000.0}) {
+            const double back = codeToNits(pq, through(through(nitsToCode(pq, nits), pq, a)[1], a, pq)[1]);
+            QVERIFY2(std::fabs(back - nits) < 0.07 * nits, qPrintable(QString("%1 back as %2").arg(nits).arg(back)));
+        }
+
+        // Into HLG: what goes into PQ, through BT.2100's conversion from PQ to HLG (at 1000 cd/m²), within a 10-bit code.
+        for (const ColorSpace* m : {&a, &c})
+            for (double r : {0.05, 0.4, 0.9, 1.0})
+                for (double g : {0.1, 0.6, 1.0}) {
+                    float direct[3] = {float(r), float(g), 0.3f}, viaPq[3] = {float(r), float(g), 0.3f};
+                    convertPixel(direct, *m, hlg, 1000);
+                    convertPixel(viaPq, *m, pq, 1000);
+                    convertPixel(viaPq, pq, hlg, 1000);
+                    for (int k = 0; k < 3; ++k)
+                        QVERIFY2(std::fabs(direct[k] - viaPq[k]) < 1.0 / 1023, qPrintable(QString("%1: %2 vs %3").arg(QString::fromStdString(m->id)).arg(direct[k]).arg(viaPq[k])));
+                }
+
+        // The table the frames go through (as the GPU's is) agrees with the conversion worked out exactly.
+        Image grid(9, 9);
+        for (int y = 0; y < 9; ++y)
+            for (int x = 0; x < 9; ++x) {
+                float* px = grid.at(x, y);
+                px[0] = x / 8.0f, px[1] = y / 8.0f, px[2] = float((x + y) % 9) / 8.0f, px[3] = 1;
+            }
+        for (const ColorSpace* m : {&a, &c}) {
+            Image up = grid;
+            convertColor(up, *m, pq, 1000);
+            double worst = 0;
+            for (int y = 0; y < 9; ++y)
+                for (int x = 0; x < 9; ++x) {
+                    float want[3] = {grid.at(x, y)[0], grid.at(x, y)[1], grid.at(x, y)[2]};
+                    convertPixel(want, *m, pq, 1000);
+                    for (int k = 0; k < 3; ++k) worst = std::max(worst, double(std::fabs(up.at(x, y)[k] - want[k])));
+                }
+            QVERIFY2(worst < 1.0 / 1023, qPrintable(QString("%1: %2 codes").arg(QString::fromStdString(m->id)).arg(worst * 1023)));
+        }
+
+        // A still read in an HDR sequence: Method C as Interpret Footage asks, kept in the project; graphics stay at
+        // reference white.
+        QTemporaryDir dir;
+        QImage q(16, 16, QImage::Format_RGBA64);
+        q.fill(QColor::fromRgbF(0.9f, 0.6f, 0.3f, 1));
+        const QString path = dir.filePath("sdr.png");
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 16, s.height = 16, s.colorSpace = "rec2100pq", s.hdrPeakNits = 1000;
+        MediaItem m;
+        QVERIFY(q.save(path) && probeMedia(path.toStdString(), m));
+        m.id = p.newId();
+        m.sdrExpand = "bt2446c";
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 1, {TrackKind::Video, 0}, {}, false).ok);
+        Project reread;
+        QVERIFY(projectFromJson(projectToJson(p), reread));
+        QCOMPARE(QString::fromStdString(reread.findMedia(m.id)->sdrExpand), QStringLiteral("bt2446c"));
+        RenderOptions ro;
+        ro.highQuality = true;
+        const Image frame = renderProgramFrame(p, s, 0, ro);
+        const float* got = frame.at(8, 8);
+        auto stored = [](double v) { return float(std::round(v * 65535) / 65535); };
+        float want[3] = {stored(0.9), stored(0.6), stored(0.3)};
+        convertPixel(want, c, pq, 1000);
+        for (int k = 0; k < 3; ++k) QVERIFY2(std::fabs(got[k] - want[k]) < 1.0 / 1023, qPrintable(QString("%1 vs %2").arg(got[k]).arg(want[k])));
+        p.findMedia(m.id)->sdrExpand.clear();
+        float plain[3] = {stored(0.9), stored(0.6), stored(0.3)};
+        convertPixel(plain, rec709, pq, 1000);
+        QVERIFY(std::fabs(renderProgramFrame(p, s, 0, ro).at(8, 8)[1] - plain[1]) < 1.0 / 1023);
+
+        // An SDR trim target made by Method A: its frames are the master through Method A, kept in the project.
+        TrimTarget sdr{"sdr", "SDR", "rec709", 100, "bt2446a"};
+        QVERIFY(edit::addTrimTarget(s, sdr).ok);
+        QCOMPARE(QString::fromStdString(trimTargetSpace(s, "sdr").id), QStringLiteral("rec709+bt2446a"));
+        QVERIFY(!edit::addTrimTarget(s, TrimTarget{"", "", "rec2100hlg", 1000, "bt2446a"}).ok);  // (an HDR target is not tone mapped)
+        QVERIFY(!edit::addTrimTarget(s, TrimTarget{"", "", "rec709", 100, "bt2446b"}).ok);
+        QVERIFY(projectFromJson(projectToJson(p), reread));
+        QCOMPARE(QString::fromStdString(reread.active()->trimTargets.at(0).toneMapping), QStringLiteral("bt2446a"));
+        Image master = renderProgramFrame(p, s, 0, ro), trimmed = master;
+        applyTrimPass(trimmed, s, 0, s.trimTargets.at(0));
+        float down[3] = {master.at(8, 8)[0], master.at(8, 8)[1], master.at(8, 8)[2]};
+        convertPixel(down, pq, a, 1000);
+        for (int k = 0; k < 3; ++k) QVERIFY2(std::fabs(trimmed.at(8, 8)[k] - down[k]) < 1.0 / 1023, qPrintable(QString("%1 vs %2").arg(trimmed.at(8, 8)[k]).arg(down[k])));
+        // A shot's own peak is rolled off to the light the method brings to white (1000 cd/m² for A, about 333 for C;
+        // Montage's 280 otherwise), so the master's 1000 cd/m² white stays white through Method A.
+        QCOMPARE(sdrHeadroomNits(a), 1000.0);
+        QVERIFY(sdrHeadroomNits(c) > 320 && sdrHeadroomNits(c) < 340);
+        QCOMPARE(sdrHeadroomNits(rec709), kSdrHeadroomNits);
+        Effect shot = makeTrim();
+        shot.params["peak"] = Param(1000.0);
+        Image white(2, 2);
+        for (size_t i = 0; i < white.px.size(); i += 4)
+            white.px[i] = white.px[i + 1] = white.px[i + 2] = float(nitsToCode(pq, 1000)), white.px[i + 3] = 1;
+        applyTrim(white, s, s.trimTargets.at(0), &shot, 0);
+        QVERIFY2(white.at(0, 0)[1] > 0.97, qPrintable(QString::number(white.at(0, 0)[1])));
+
+        // HDR footage takes no expansion (nor its SDR proxy).
+        MediaItem hdrFile = m;
+        hdrFile.colorSpace = "rec2100pq";
+        hdrFile.sdrExpand = "bt2446a";
+        QCOMPARE(&pictureColorSpace(hdrFile, hdrFile.path), &pq);
+
+        // A sequence graded scene-referred goes into SDR through its output transform: no tone mapping for its targets.
+        s.workingSpace = "acescct";
+        QVERIFY(sceneReferredWorking(s));
+        QCOMPARE(&trimTargetSpace(s, "sdr"), &rec709);
+        QVERIFY(!edit::setTrimTargetToneMapping(s, "sdr", "bt2446c").ok);
+        QVERIFY(!edit::addTrimTarget(s, TrimTarget{"sdr2", "", "rec709", 100, "bt2446a"}).ok);
+        QVERIFY(edit::setTrimTargetToneMapping(s, "sdr", "").ok);
+    }
+
     void hdrStillsInAndOut() {
         // A PQ master (1000 nits, with an SDR trim target) of eight flat patches, from 10 nits to its peak and in colour.
         Project p = makeDefaultProject();
@@ -7372,6 +7566,184 @@ colorspaces:
         }
     }
 
+    void exportsImfArchival() {
+        if (!exrAvailable()) QSKIP("Built without the OpenEXR library");
+        QTemporaryDir dir;
+        // A second at 24 fps graded scene-referred in ACEScct: an orange matte, then a blue one inverted by the grade.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 320, s.height = 180, s.fps = Rational{24, 1};
+        s.workingSpace = "acescct";
+        s.videoTracks[0].clips = {colorClip(p, 0.8f, 0.3f, 0.1f, 0, 12), colorClip(p, 0.1f, 0.4f, 0.8f, 12, 12)};
+        s.videoTracks[0].clips[1].effects.push_back(makeEffect("invert", p.newId()));
+        Sequence cut1 = s;
+        cut1.id = p.newId();
+        cut1.name = "Cut 1";
+        p.sequences.push_back(cut1);
+        Sequence& now = *p.active();
+        ImfSettings st;
+        st.title = "Archive";
+        st.captions = false;
+        st.application = 5;
+        st.targetFrames = {3, 18};
+        ImfResult r;
+        std::string err;
+        QVERIFY2(exportImf(p, now, st, dir.path().toStdString(), &r, {}, &err), err.c_str());
+        QVERIFY(r.application == 5 && r.frames == 24 && r.colour == "aces2065-1" && r.targetFrames == 2 && r.codedFrames == 24);
+        QCOMPARE(QString::fromStdString(r.outputTransform), QStringLiteral("urn:montage:transformId:Output.Montage.Filmic.rec709_100nit"));
+        QVERIFY(QFileInfo::exists(QString::fromStdString(r.amf)));
+        std::vector<std::string> issues = verifyImf(r.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        QStringList photon = photonErrors(QString::fromStdString(r.folder));
+        QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+        // The composition names Application #5 and the output transform.
+        ImfComposition comp;
+        QVERIFY(readImfComposition(r.cpl, comp, &err));
+        QVERIFY(comp.application == 5 && comp.colour == "aces2065-1" && comp.acesAuthoring == r.outputTransform && comp.width == 320);
+        const QDir out(QString::fromStdString(r.folder));
+        const std::string video = out.filePath(out.entryList({"VIDEO_*.mxf"}).value(0)).toStdString();
+        // Every frame an ACES image container (ST 2065-4) equal to the render in ACES 2065-1, in half floats.
+        RenderOptions ao;
+        ao.highQuality = true;
+        ao.outputSpace = "aces2065-1";
+        dcp::ImfTrackReader reader;
+        QVERIFY2(reader.open(video, &err), err.c_str());
+        QVERIFY(reader.imfAces() && reader.frames() == 24 && reader.width() == 320 && reader.height() == 180);
+        QCOMPARE(QString::fromStdString(reader.acesAuthoring()), QString::fromStdString(r.outputTransform));
+        for (int k : {0, 3, 18, 23}) {
+            std::vector<uint8_t> bytes;
+            AcesContainerInfo info;
+            QVERIFY(reader.frame(k, bytes) && readAcesContainer(bytes.data(), bytes.size(), info));
+            QVERIFY2(info.conforming && !info.alpha && info.width == 320, info.why.c_str());
+            std::vector<float> rgba;
+            int w = 0, h = 0;
+            QVERIFY2(readImfAcesFrame(video, k, rgba, w, h, &err), err.c_str());
+            const Image want = renderProgramFrame(p, now, k, ao);
+            QVERIFY(w == 320 && h == 180 && want.width == 320 && rgba.size() == want.px.size());
+            std::vector<qfloat16> halves(want.px.size());
+            qFloatToFloat16(halves.data(), want.px.data(), qsizetype(halves.size()));
+            for (size_t i = 0; i < rgba.size(); ++i)
+                if (i % 4 != 3 && rgba[i] != float(halves[i])) QFAIL(qPrintable(QStringLiteral("frame %1 value %2: %3, rendered %4").arg(k).arg(i).arg(rgba[i]).arg(float(halves[i]))));
+        }
+        // The target frames: those frames through the output transform, as delivered.
+        RenderOptions dout;
+        dout.highQuality = true;
+        for (int i = 0; i < 2; ++i) {
+            std::vector<uint16_t> tiff;
+            int w = 0, h = 0;
+            int64_t frame = -1;
+            QVERIFY2(readImfTargetFrame(video, i, tiff, w, h, &frame, &err), err.c_str());
+            QVERIFY(w == 320 && h == 180 && frame == (i ? 18 : 3));
+            const Image shown = renderProgramFrame(p, now, frame, dout);
+            for (int c = 0; c < 3; ++c) {
+                const double got = tiff[(size_t(90) * 320 + 160) * 3 + size_t(c)] / 65535.0;
+                QVERIFY2(std::fabs(got - shown.at(160, 90)[c]) < 2.0 / 255, qPrintable(QStringLiteral("target %1 channel %2: %3, delivered %4").arg(i).arg(c).arg(got).arg(shown.at(160, 90)[c])));
+            }
+        }
+        // The ACES Metadata File: the pictures' clip, no input transform (already ACES), an ACES Metadata File as AMF reads it.
+        AmfDocument amf;
+        QVERIFY2(readAmf(r.amf, amf, &err), err.c_str());
+        QVERIFY(!amf.hasInput && amf.clipName == "Archive");
+
+        // Ungraded: the inverted shot as it comes in; no target frames.
+        {
+            ImfSettings un = st;
+            un.graded = false;
+            un.targetFrames.clear();
+            un.title = "Archive ungraded";
+            ImfResult ru;
+            QVERIFY2(exportImf(p, now, un, dir.path().toStdString(), &ru, {}, &err), err.c_str());
+            QVERIFY(ru.targetFrames == 0 && ru.amf.empty());
+            issues = verifyImf(ru.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            photon = photonErrors(QString::fromStdString(ru.folder));
+            QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+            const QDir uo(QString::fromStdString(ru.folder));
+            std::vector<float> graded, ungraded;
+            int w = 0, h = 0;
+            QVERIFY(readImfAcesFrame(uo.filePath(uo.entryList({"VIDEO_*.mxf"}).value(0)).toStdString(), 18, ungraded, w, h, &err));
+            QVERIFY(readImfAcesFrame(video, 18, graded, w, h, &err));
+            Project plain = p;
+            plain.active()->videoTracks[0].clips[1].effects.clear();
+            const Image want = renderProgramFrame(plain, *plain.active(), 18, ao);
+            const size_t centre = (size_t(90) * 320 + 160) * 4;
+            for (int c = 0; c < 3; ++c) {
+                QVERIFY(std::fabs(ungraded[centre + size_t(c)] - want.px[centre + size_t(c)]) <= 1e-3f * std::max(1.0f, std::fabs(want.px[centre + size_t(c)])));
+                QVERIFY(std::fabs(ungraded[centre + size_t(c)] - graded[centre + size_t(c)]) > 0.01f);
+            }
+        }
+
+        // A display-referred sequence: its frames into ACES through the inverse of the filmic output transform, which
+        // brings the target frames back to what it delivers.
+        {
+            Project d = p;
+            Sequence& ds = *d.active();
+            ds.workingSpace.clear();
+            ImfSettings dst = st;
+            dst.title = "Archive display";
+            dst.targetFrames = {3, 4};  // (the same picture twice: two resources all the same)
+            ImfResult rd;
+            QVERIFY2(exportImf(d, ds, dst, dir.path().toStdString(), &rd, {}, &err), err.c_str());
+            issues = verifyImf(rd.folder);
+            QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+            const QDir dout2(QString::fromStdString(rd.folder));
+            std::vector<uint16_t> tiff;
+            int w = 0, h = 0;
+            const std::string dvideo = dout2.filePath(dout2.entryList({"VIDEO_*.mxf"}).value(0)).toStdString();
+            QVERIFY(readImfTargetFrame(dvideo, 0, tiff, w, h, nullptr, &err));
+            dcp::ImfTrackReader dr;
+            QVERIFY(dr.open(dvideo) && dr.targetFrames().size() == 2 && dr.targetFrames()[0].resource != dr.targetFrames()[1].resource);
+            QVERIFY(!readImfTargetFrame(dvideo, -1, tiff, w, h, nullptr, &err) && !readImfTargetFrame(dvideo, 2, tiff, w, h, nullptr, &err));
+            const Image shown = renderProgramFrame(d, ds, 3, dout);
+            for (int c = 0; c < 3; ++c) QVERIFY(std::fabs(tiff[(size_t(90) * 320 + 160) * 3 + size_t(c)] / 65535.0 - shown.at(160, 90)[c]) < 2.0 / 255);
+        }
+
+        // A supplemental: the blue shot changed, so only its twelve frames are new; it keeps the output transform.
+        now.videoTracks[0].clips[1].generator.params["color.g"] = 0.6;
+        ImfSettings sup = st;
+        sup.targetFrames.clear();
+        sup.supplementOf = r.folder;
+        sup.originalSequence = cut1.id;
+        ImfResult r2;
+        QVERIFY2(exportImf(p, now, sup, dir.path().toStdString(), &r2, {}, &err), err.c_str());
+        QVERIFY2(r2.supplemental && r2.codedFrames == 12, qPrintable(QString::number(r2.codedFrames)));
+        QCOMPARE(r2.outputTransform, r.outputTransform);
+        issues = verifyImf(r2.folder);
+        QVERIFY2(issues.empty(), issues.empty() ? "" : issues.front().c_str());
+        photon = photonErrors(QString::fromStdString(r2.folder));
+        QVERIFY2(photon.isEmpty() || photon == QStringList{"skipped"}, qPrintable(photon.join("\n")));
+
+        // Opened again: a sequence in ACES 2065-1 delivered through the same output transform, its frames as written.
+        Project q = makeDefaultProject();
+        const ImportResult in = importImf(q, r.folder, [](const std::string& f, MediaItem& m) { return probeMedia(f, m, nullptr); });
+        QVERIFY2(in.error.empty(), in.error.c_str());
+        const Sequence* back = q.findSequence(in.sequence);
+        QVERIFY(back && back->workingSpace == "aces2065-1" && back->colorSpace == "rec709" && back->outputTransform.empty());
+        QVERIFY(back->width == 320 && back->height == 180 && back->videoTracks[0].clips.size() == 1);
+        {
+            const Image again = renderProgramFrame(q, *back, 18, ao);
+            std::vector<float> written;
+            int w = 0, h = 0;
+            QVERIFY(readImfAcesFrame(video, 18, written, w, h, &err));
+            const size_t centre = (size_t(90) * 320 + 160) * 4;
+            for (int c = 0; c < 3; ++c)
+                QVERIFY2(std::fabs(again.px[centre + size_t(c)] - written[centre + size_t(c)]) <= 1e-3f * std::max(1.0f, std::fabs(written[centre + size_t(c)])),
+                         qPrintable(QStringLiteral("%1 %2").arg(again.px[centre + size_t(c)]).arg(written[centre + size_t(c)])));
+        }
+
+        // Refused: a target frame outside what is exported, target frames for Application #2E, an Application #2E
+        // supplemental of this package.
+        ImfSettings bad = st;
+        bad.targetFrames = {40};
+        QVERIFY(!exportImf(p, now, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("outside") != std::string::npos);
+        bad = st;
+        bad.application = 2;
+        QVERIFY(!exportImf(p, now, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("Application #5") != std::string::npos);
+        bad = sup;
+        bad.application = 2;
+        QVERIFY(!exportImf(p, now, bad, dir.path().toStdString(), nullptr, {}, &err) && err.find("supplemental keeps") != std::string::npos);
+    }
+
     void exportsImfSupplementalAt2997() {
         if (!openJpegAvailable()) QSKIP("Built without OpenJPEG 2.5");
         // A lossy 29.97 master of 7 frames (padded to 10, so the sound fills whole frames), then a supplemental with
@@ -7511,6 +7883,9 @@ colorspaces:
         const QString name = QString::fromStdString(r.name);
         QVERIFY2(name.startsWith("TestFilmAShort_SHR_S_EN-XX_XX_51_2K_") && name.endsWith("_SMPTE_OV"), qPrintable(name));
         QVERIFY2(r.cinemaProfile, "encoded in the DCI 2K profile");
+        // Its Leq(M): a second of a loud 1 kHz tone (M weighting -5.6 dB there) is well over 85, but a short has no limit.
+        QVERIFY2(r.leqm > 88 && r.leqm < 100, qPrintable(QString::number(r.leqm)));
+        QVERIFY(r.leqmLimit == 0 && !r.overLoudnessLimit());
         const QDir out(QString::fromStdString(r.folder));
         QVERIFY(out.exists("ASSETMAP.xml") && out.exists("VOLINDEX.xml"));
         const QStringList pictures = out.entryList({"j2c_*.mxf"}), sounds = out.entryList({"pcm_*.mxf"}), cpls = out.entryList({"CPL_*.xml"});
@@ -8765,6 +9140,34 @@ colorspaces:
                          qPrintable(QString("band %1 channel %2: %3 dB").arg(b).arg(c).arg(dB(again.amplitude[c][b], measured.amplitude[c][b]))));
         for (int k = 0; k < 3; ++k) QVERIFY(std::fabs(again.correlation[k] - measured.correlation[k]) < 0.06);
         QVERIFY2(std::fabs(grainSize(again) / grainSize(measured) - 1) < 0.1, qPrintable(QString("%1 for %2").arg(grainSize(again)).arg(grainSize(measured))));
+        // Graded scene-referred, the picture comes in the working space and the profile in the sequence's, where it was
+        // measured: back in the sequence's space, the grain measures as the plate did.
+        {
+            const ColorSpace& cct = *findColorSpace("acescct");
+            SceneGrading grading;
+            grading.working = &cct;
+            grading.linear = &linearColorSpace(cct.primaries);
+            grading.display = grading.delivery = &space;
+            std::vector<Image> graded;
+            for (int f = 0; f < kFrames; ++f) {
+                Image img = clean();
+                convertExactly(img, space, cct);
+                {
+                    const SceneGradingScope scene(&grading);
+                    const WorkingSpaceScope inCct(&cct);
+                    applyVideoEffect(match, f, img, 1);
+                }
+                convertExactly(img, cct, space);
+                graded.push_back(std::move(img));
+            }
+            GrainProfile delivered;
+            QVERIFY2(measureGrain(graded, space, {}, delivered, &err), err.c_str());
+            for (int b = 0; b < GrainProfile::kBands; ++b)
+                for (int c = 0; c < 3; ++c)
+                    if (measured.amplitude[c][b] > 0)  // (the darkest two lose a little: grain dipping below black)
+                        QVERIFY2(std::fabs(dB(delivered.amplitude[c][b], measured.amplitude[c][b])) < (b < 2 ? 2 : 1),
+                                 qPrintable(QString("band %1 channel %2: %3 dB").arg(b).arg(c).arg(dB(delivered.amplitude[c][b], measured.amplitude[c][b]))));
+        }
         // Twice the size: grain twice as large.
         {
             Effect big = match;
@@ -9136,6 +9539,717 @@ colorspaces:
             QVERIFY(findTitleTemplate(id));
             Effect t = makeEffect(p, id);
             QVERIFY2(ink(renderGenerator(t, 60, 640, 360, 1.0, 90, 30), 0, 640) > 50, id);
+        }
+    }
+
+    void styledTitleRuns() {
+        // A run that only restates the title's own style leaves it plain; one that colours a word colours it alone.
+        Project p;
+        Effect t = makeEffect(p, "title");
+        t.strings["text"] = "HELLO WORLD";
+        t.strings["font"] = "DejaVu Sans";
+        t.params["size"] = 40.0;
+        t.params["shadow"] = 0.0;
+        auto render = [&](const Effect& e, FrameTime f = 10) { return renderGenerator(e, f, 320, 180, 1.0, 90, 30); };
+        const Image plain = render(t);
+        Effect same = t;
+        TextRun r;
+        r.from = 0, r.len = 11, r.font = "DejaVu Sans", r.size = 40, r.bold = 1, r.color = std::array<double, 3>{1, 1, 1};
+        same.strings["runs"] = textRunsJson({r});
+        QVERIFY(!titleIsStyled(same, 10));
+        QVERIFY(render(same).px == plain.px);
+        // JSON both ways.
+        TextRun full;
+        full.from = 2, full.len = 3, full.font = "DejaVu Serif", full.size = 50, full.bold = 0, full.italic = 1;
+        full.color = std::array<double, 3>{1, 0, 0}, full.outline = 2, full.outlineColor = std::array<double, 3>{0, 0, 1};
+        full.tracking = 4, full.baseline = -6, full.axes = {{"wght", 650}};
+        QCOMPARE(parseTextRuns(textRunsJson({full, r})), (std::vector<TextRun>{full, r}));
+        QVERIFY(parseTextRuns("not json").empty());
+        QVERIFY(addTextRun({}, TextRun{}).empty());  // a run that sets nothing is dropped
+        // "WORLD" in red: red ink only on the right, white only on the left, the letters where the plain title has them.
+        Effect red = t;
+        TextRun w;
+        w.from = 6, w.len = 5, w.color = std::array<double, 3>{1, 0, 0};
+        red.strings["runs"] = textRunsJson({w});
+        QVERIFY(titleIsStyled(red, 10));
+        const Image styled = render(red);
+        const double split = titleGlyphs(red, 10, 320, 180, 1.0, 90, 30)[6].path.boundingRect().left();  // where W starts
+        double redLeft = 0, redRight = 0, whiteRight = 0, inkPlain = 0, inkStyled = 0;
+        for (int y = 0; y < 180; ++y)
+            for (int x = 0; x < 320; ++x) {
+                const float* px = styled.at(x, y);
+                const bool isRed = px[3] > 0.5f && px[0] > 0.9f * px[3] && px[1] < 0.1f * px[3];
+                const bool isWhite = px[3] > 0.5f && px[1] > 0.9f * px[3];
+                (x < split - 1 ? redLeft : redRight) += isRed;
+                if (x > split + 1) whiteRight += isWhite;
+                inkPlain += plain.at(x, y)[3], inkStyled += px[3];
+            }
+        QVERIFY2(redRight > 100 && redLeft == 0 && whiteRight == 0, qPrintable(QString("%1 %2 %3").arg(redRight).arg(redLeft).arg(whiteRight)));
+        QVERIFY2(std::abs(inkStyled - inkPlain) < 0.02 * inkPlain, qPrintable(QString("%1 %2").arg(inkStyled).arg(inkPlain)));
+        // A bigger run makes its letters taller than the rest.
+        Effect big = t;
+        TextRun b;
+        b.from = 0, b.len = 5, b.size = 80;
+        big.strings["runs"] = textRunsJson({b});
+        const std::vector<TitleGlyph> gl = titleGlyphs(big, 10, 320, 180, 1.0, 90, 30);
+        QCOMPARE(int(gl.size()), 11);
+        QVERIFY(gl[0].path.boundingRect().height() > 1.8 * gl[6].path.boundingRect().height());
+        QCOMPARE(gl[0].baselineMid.y(), gl[6].baselineMid.y());  // one baseline
+        // Baseline shift raises a run.
+        Effect up = t;
+        TextRun u;
+        u.from = 6, u.len = 5, u.baseline = 10;
+        up.strings["runs"] = textRunsJson({u});
+        const std::vector<TitleGlyph> ug = titleGlyphs(up, 10, 320, 180, 1.0, 90, 30);
+        QCOMPARE(ug[6].path.boundingRect().bottom(), ug[0].path.boundingRect().bottom() - 10);
+    }
+
+    void styledTitleGlyphPositions() {
+        // Every glyph sits where QTextLayout puts it, for Latin, Arabic (joined, right to left) and CJK text.
+        Project p;
+        for (const auto& [family, text] : std::vector<std::pair<QString, QString>>{
+                 {"DejaVu Sans", "Waffle AVATAR fiord"},
+                 {"DejaVu Sans", QString::fromUtf8("مرحبا بالعالم")},
+                 {"WenQuanYi Zen Hei", QString::fromUtf8("你好，世界 日本語")}}) {
+            Effect t = makeEffect(p, "title");
+            t.strings["text"] = text.toStdString();
+            t.strings["font"] = family.toStdString();
+            t.params["size"] = 48.0;
+            TextRun r;
+            r.from = 2, r.len = 3, r.color = std::array<double, 3>{0, 1, 0};  // styled, laid out as the title is
+            t.strings["runs"] = textRunsJson({r});
+            const std::vector<TitleGlyph> gl = titleGlyphs(t, 0, 1280, 720, 1.0, 30, 30);
+            QVERIFY(!gl.empty());
+            QFont f(family);
+            f.setPixelSize(48);
+            f.setBold(true);
+            f.setLetterSpacing(QFont::AbsoluteSpacing, 0);
+            f.setHintingPreference(QFont::PreferNoHinting);
+            QTextLayout layout(text, f);
+            QTextOption opt;
+            opt.setWrapMode(QTextOption::NoWrap);
+            opt.setAlignment(Qt::AlignLeft | Qt::AlignAbsolute);
+            layout.setTextOption(opt);
+            layout.beginLayout();
+            QTextLine line = layout.createLine();
+            line.setLeadingIncluded(false);
+            line.setLineWidth(1e7);
+            layout.endLayout();
+            std::vector<std::pair<quint32, QPointF>> want, got;
+            for (const QGlyphRun& run : layout.glyphRuns())
+                for (int k = 0; k < run.glyphIndexes().size(); ++k) want.emplace_back(run.glyphIndexes()[k], run.positions()[k]);
+            for (const TitleGlyph& g : gl)
+                for (const auto& gp : g.glyphs) got.push_back(gp);
+            auto near = [](const std::pair<quint32, QPointF>& a, const std::pair<quint32, QPointF>& b) {
+                return a.first == b.first && std::abs(a.second.x() - b.second.x()) <= 0.01 && std::abs(a.second.y() - b.second.y()) <= 0.01;
+            };
+            for (const auto& w : want)
+                QVERIFY2(std::any_of(got.begin(), got.end(), [&](const auto& g) { return near(g, w); }),
+                         qPrintable(QString("%1: glyph %2 at %3").arg(family).arg(w.first).arg(w.second.x())));
+            for (const auto& g : got)
+                QVERIFY2(std::any_of(want.begin(), want.end(), [&](const auto& w) { return near(g, w); }), qPrintable(family));
+            QCOMPARE(got.size(), want.size());  // a ligature's glyph drawn once, not once per letter it covers
+            // Drawn where they were laid out: the line centred in the frame (one line: its baseline at the centre less
+            // half its height plus its ascent).
+            const double left = 640 - line.naturalTextWidth() / 2;
+            for (const TitleGlyph& g : gl) {
+                if (g.glyphs.empty() || g.path.isEmpty()) continue;
+                const double x = g.glyphs[0].second.x() + left;
+                QVERIFY2(g.path.boundingRect().right() >= x - 1 && g.path.boundingRect().left() <= x + 48,
+                         qPrintable(QString("%1: %2 not near %3").arg(family).arg(g.path.boundingRect().left()).arg(x)));
+            }
+        }
+    }
+
+    void textAnimatorSelectors() {
+        // Ten letters, a ramp up over the whole text moving them down 100 px at 50 %: letter k by 50 (k + 0.5) / 10.
+        Project p;
+        Effect t = makeEffect(p, "title");
+        t.strings["text"] = "ABCDEFGHIJ";
+        t.strings["font"] = "DejaVu Sans";
+        t.params["size"] = 40.0;
+        for (const ParamInfo& pi : textAnimatorParams(1))
+            if (pi.kind == ParamKind::Color) {
+                t.params[pi.name + ".r"] = pi.def, t.params[pi.name + ".g"] = pi.defG, t.params[pi.name + ".b"] = pi.defB;
+            } else {
+                t.params[pi.name] = pi.def;
+            }
+        QCOMPARE(textAnimators(t), std::vector<int>{1});
+        Effect still = t;
+        still.params["ta1.amount"] = 0.0;
+        t.params["ta1.shape"] = 1.0;
+        t.params["ta1.y"] = 100.0;
+        t.params["ta1.amount"] = 50.0;
+        const std::vector<TitleGlyph> a = titleGlyphs(still, 0, 640, 360, 1.0, 30, 30), b = titleGlyphs(t, 0, 640, 360, 1.0, 30, 30);
+        QCOMPARE(int(a.size()), 10);
+        QCOMPARE(int(b.size()), 10);
+        for (int k = 0; k < 10; ++k) {
+            const double moved = b[size_t(k)].path.boundingRect().top() - a[size_t(k)].path.boundingRect().top();
+            QVERIFY2(std::abs(moved - 50.0 * (k + 0.5) / 10) < 1e-6, qPrintable(QString("letter %1 moved %2").arg(k).arg(moved)));
+            QCOMPARE(b[size_t(k)].path.boundingRect().left(), a[size_t(k)].path.boundingRect().left());
+        }
+        // Shapes, unit by unit (10 units).
+        auto sel = [&](double shape, double start, double end, double offset, int i) {
+            Effect e = t;
+            e.params["ta1.shape"] = shape, e.params["ta1.start"] = start, e.params["ta1.end"] = end, e.params["ta1.offset"] = offset;
+            e.params["ta1.amount"] = 100.0;
+            return textSelection(e, 1, 0, 30, 30, i, 10);
+        };
+        QCOMPARE(sel(0, 0, 25, 0, 1), 1.0);   // square: wholly inside
+        QCOMPARE(sel(0, 0, 25, 0, 2), 0.5);   // half covered
+        QCOMPARE(sel(0, 0, 25, 0, 3), 0.0);
+        QCOMPARE(sel(0, 0, 25, 50, 7), 0.5);  // moved by the offset
+        QCOMPARE(sel(2, 0, 100, 0, 9), 0.05); // ramp down
+        QCOMPARE(sel(3, 0, 100, 0, 2), 0.5);  // triangle: x = 0.25
+        QVERIFY(std::abs(sel(4, 0, 100, 0, 2) - std::sqrt(0.75)) < 1e-12);  // round
+        QVERIFY(std::abs(sel(5, 0, 100, 0, 2) - 0.5) < 1e-12);  // smooth: 0.5 - 0.5 cos(pi / 2)
+        // Ease, random spread (seeded, the same each time) and a sweep across at the start.
+        Effect e = t;
+        e.params["ta1.amount"] = 100.0;
+        e.params["ta1.ease"] = 100.0;
+        QVERIFY(std::abs(textSelection(e, 1, 0, 30, 30, 2, 10) - 0.15625) < 1e-12);  // smoothstep(0.25)
+        e.params["ta1.ease"] = 0.0;
+        e.params["ta1.random"] = 100.0;
+        e.params["ta1.seed"] = 7.0;
+        const double r1 = textSelection(e, 1, 0, 30, 30, 4, 10);
+        QCOMPARE(textSelection(e, 1, 0, 30, 30, 4, 10), r1);
+        QVERIFY(r1 >= 0 && r1 <= 0.45);
+        e.params["ta1.random"] = 0.0;
+        e.params["ta1.sweep"] = 1.0;  // in across over a second: everything selected at the start, nothing after
+        e.params["ta1.sweep_dur"] = 1.0;
+        QCOMPARE(textSelection(e, 1, 0, 30, 90, 0, 10), 1.0);
+        QCOMPARE(textSelection(e, 1, 30, 30, 90, 9, 10), 0.0);
+        const double mid = textSelection(e, 1, 15, 30, 90, 5, 10);
+        QVERIFY(mid > 0 && mid < 1);
+        e.params["ta1.sweep"] = 3.0;  // in together: the ramp's own amount (0.55 at x = 0.55), let go of over the second
+        QVERIFY(std::abs(textSelection(e, 1, 0, 30, 90, 5, 10) - 0.55) < 1e-12);
+        QCOMPARE(textSelection(e, 1, 45, 30, 90, 5, 10), 0.0);
+        // Random order: a permutation, the same for the same seed.
+        e.params["ta1.sweep"] = 0.0;
+        e.params["ta1.shape"] = 0.0;
+        e.params["ta1.end"] = 10.0;  // the first unit's slot only
+        e.params["ta1.shuffle"] = 1.0;
+        int selected = 0;
+        for (int i = 0; i < 10; ++i) selected += textSelection(e, 1, 0, 30, 30, i, 10) > 0.5;
+        QCOMPARE(selected, 1);
+        // Rotation, scale, opacity, blur and fill land on the glyphs.
+        Effect fx = still;
+        fx.params["ta1.amount"] = 100.0;
+        fx.params["ta1.opacity"] = 40.0;
+        fx.params["ta1.blur"] = 3.0;
+        fx.params["ta1.fill_mix"] = 100.0;
+        fx.params["ta1.fill.r"] = 1.0, fx.params["ta1.fill.g"] = 0.0, fx.params["ta1.fill.b"] = 0.0;
+        fx.params["ta1.scale"] = 200.0;
+        const std::vector<TitleGlyph> c = titleGlyphs(fx, 0, 640, 360, 1.0, 30, 30);
+        QCOMPARE(c[3].opacity, 0.4);
+        QCOMPARE(c[3].blur, 3.0);
+        QCOMPARE(c[3].fill, QColor::fromRgbF(1, 0, 0));
+        QVERIFY(std::abs(c[3].path.boundingRect().width() - 2 * a[3].path.boundingRect().width()) < 1e-6);
+        const Image blurred = renderGenerator(fx, 0, 640, 360, 1.0, 30, 30);
+        double ink = 0;
+        for (float v : blurred.px) ink += v;
+        QVERIFY(ink > 100);
+        // Tracking spreads the letters from the middle (centred), keeping the line centred.
+        Effect wide = still;
+        wide.params["ta1.amount"] = 100.0;
+        wide.params["ta1.tracking"] = 10.0;
+        const std::vector<TitleGlyph> d = titleGlyphs(wide, 0, 640, 360, 1.0, 30, 30);
+        QVERIFY(std::abs((d[1].baselineMid.x() - d[0].baselineMid.x()) - (a[1].baselineMid.x() - a[0].baselineMid.x()) - 10) < 1e-6);
+        QVERIFY(std::abs((d[0].baselineMid.x() + d[9].baselineMid.x()) - (a[0].baselineMid.x() + a[9].baselineMid.x()) + 10) < 1e-6);
+    }
+
+    void textOnAPath() {
+        // On a circle of radius 200: every glyph's baseline middle within half a pixel of it, turned to face out.
+        Project p;
+        Effect t = makeEffect(p, "title");
+        t.strings["text"] = "AROUND THE WORLD AND BACK AGAIN";
+        t.strings["font"] = "DejaVu Sans";
+        t.params["size"] = 36.0;
+        t.params["path_shape"] = 1.0;
+        t.params["path_radius"] = 200.0;
+        const QPointF c(400, 300);
+        const std::vector<TitleGlyph> gl = titleGlyphs(t, 0, 800, 600, 1.0, 30, 30);
+        QCOMPARE(int(gl.size()), 31);
+        double minAngle = 1e9, maxAngle = -1e9;
+        for (const TitleGlyph& g : gl) {
+            const double r = QLineF(c, g.baselineMid).length();
+            QVERIFY2(std::abs(r - 200) < 0.5, qPrintable(QString("radius %1").arg(r)));
+            if (!g.path.isEmpty()) QVERIFY(QLineF(c, g.path.boundingRect().center()).length() > 200);  // outside the circle
+            const double ang = std::atan2(g.baselineMid.y() - c.y(), g.baselineMid.x() - c.x());
+            minAngle = std::min(minAngle, ang), maxAngle = std::max(maxAngle, ang);
+        }
+        // Centred at the top, reading clockwise.
+        QVERIFY(gl.front().baselineMid.x() < c.x() && gl.back().baselineMid.x() > c.x());
+        QVERIFY(std::any_of(gl.begin(), gl.end(), [&](const TitleGlyph& g) { return std::abs(g.baselineMid.x() - c.x()) < 15 && g.baselineMid.y() < c.y(); }));
+        // Flipped: inside the circle.
+        t.params["path_reverse"] = 1.0;
+        for (const TitleGlyph& g : titleGlyphs(t, 0, 800, 600, 1.0, 30, 30)) {
+            QVERIFY(std::abs(QLineF(c, g.baselineMid).length() - 200) < 0.5);
+            if (!g.path.isEmpty()) QVERIFY(QLineF(c, g.path.boundingRect().center()).length() < 200);
+        }
+        // A straight path through the middle (SVG path data) sets the text as the plain layout does.
+        Effect line = t;
+        line.params["path_reverse"] = 0.0;
+        line.params["path_shape"] = 3.0;
+        line.strings["path_data"] = "M -350 0 L 350 0";
+        Effect flat = t;
+        flat.params["path_shape"] = 0.0;
+        TextRun r;
+        r.from = 0, r.len = 1, r.color = std::array<double, 3>{0.5, 0.5, 0.5};
+        flat.strings["runs"] = textRunsJson({r});
+        const std::vector<TitleGlyph> on = titleGlyphs(line, 0, 800, 600, 1.0, 30, 30), off = titleGlyphs(flat, 0, 800, 600, 1.0, 30, 30);
+        QCOMPARE(on.size(), off.size());
+        for (size_t i = 0; i < on.size(); ++i) {
+            QVERIFY(std::abs(on[i].baselineMid.x() - off[i].baselineMid.x()) < 0.01);
+            QVERIFY(std::abs(on[i].baselineMid.y() - c.y()) < 0.01);
+        }
+        // Path data with a number after its close is read, not looped on.
+        Effect closed = line;
+        closed.strings["path_data"] = "M -350 0 L 350 0 Z 5 z1";
+        QCOMPARE(titleGlyphs(closed, 0, 800, 600, 1.0, 30, 30).size(), on.size());
+        // Kept upright on a wave: glyphs not turned (their boxes as tall as on the straight line).
+        Effect wave = t;
+        wave.params["path_shape"] = 2.0;
+        wave.params["path_upright"] = 1.0;
+        const std::vector<TitleGlyph> wv = titleGlyphs(wave, 0, 800, 600, 1.0, 30, 30);
+        QVERIFY(std::abs(wv[1].path.boundingRect().height() - on[1].path.boundingRect().height()) < 1e-6);
+        QVERIFY(std::abs(wv[1].baselineMid.y() - wv[8].baselineMid.y()) > 5);  // up and down the wave
+        QVERIFY(renderGenerator(t, 0, 800, 600, 1.0, 30, 30).px != renderGenerator(flat, 0, 800, 600, 1.0, 30, 30).px);
+    }
+
+    void variableFontAxes() {
+        // Oswald's weight axis: at 400 it draws as its default (Regular) instance does, heavier as it rises, and at 700
+        // as its Bold instance where the font database offers that.
+#if QT_VERSION < QT_VERSION_CHECK(6, 7, 0)
+        QSKIP("Variable font axes need Qt 6.7 or later (older builds take the weight axis as the font's weight)");
+#else
+        const int id = QFontDatabase::addApplicationFont(QString(MONTAGE_TEST_DATA_DIR) + "/fonts/Oswald-wght.ttf");
+        QVERIFY(id >= 0);
+        const QString family = QFontDatabase::applicationFontFamilies(id).value(0);
+        QVERIFY(!family.isEmpty());
+        Project p;
+        auto outline = [&](int bold, std::optional<double> wght) {
+            Effect t = makeEffect(p, "title");
+            t.strings["text"] = "Hamburg";
+            t.strings["font"] = family.toStdString();
+            t.params["size"] = 80.0;
+            t.params["bold"] = double(bold);
+            TextRun r;
+            r.from = 0, r.len = 7, r.color = std::array<double, 3>{1, 1, 0.99};
+            if (wght) r.axes["wght"] = *wght;
+            t.strings["runs"] = textRunsJson({r});
+            QPainterPath all;
+            for (const TitleGlyph& g : titleGlyphs(t, 0, 800, 400, 1.0, 30, 30)) all.addPath(g.path);
+            return all;
+        };
+        auto area = [](const QPainterPath& path) {
+            QImage img(800, 400, QImage::Format_Alpha8);
+            img.fill(0);
+            QPainter pa(&img);
+            pa.setRenderHint(QPainter::Antialiasing);
+            pa.fillPath(path, Qt::black);
+            pa.end();
+            double a = 0;
+            for (int y = 0; y < img.height(); ++y)
+                for (int x = 0; x < img.width(); ++x) a += img.constScanLine(y)[x] / 255.0;
+            return a;
+        };
+        auto same = [&](const QPainterPath& a, const QPainterPath& b) {
+            const QRectF ra = a.boundingRect(), rb = b.boundingRect();
+            return std::abs(area(a) - area(b)) < 0.002 * area(a) && std::abs(ra.width() - rb.width()) < 0.5 && std::abs(ra.height() - rb.height()) < 0.5;
+        };
+        const QPainterPath regular = outline(0, std::nullopt);
+        QVERIFY2(same(outline(0, 400.0), regular), qPrintable(QString("%1 %2").arg(area(outline(0, 400.0))).arg(area(regular))));
+        const double a550 = area(outline(0, 550.0)), a700 = area(outline(0, 700.0));
+        QVERIFY2(area(regular) * 1.1 < a550 && a550 * 1.05 < a700, qPrintable(QString("%1 %2 %3").arg(area(regular)).arg(a550).arg(a700)));
+        if (QFontDatabase::styles(family).contains(QStringLiteral("Bold")))
+            QVERIFY2(same(outline(0, 700.0), outline(1, std::nullopt)), qPrintable(QString("%1 %2").arg(a700).arg(area(outline(1, std::nullopt)))));
+        else
+            qInfo("The font database offers %s's styles %s only: its Bold instance not compared", qPrintable(family),
+                  qPrintable(QFontDatabase::styles(family).join(", ")));
+#endif
+    }
+
+    void styledTitleRendersAlike() {
+        // Frame 37 of an animated, styled title on a path: the same alone, after the frames before it, and on 1 or 8
+        // threads at once.
+        Project p;
+        Effect t = makeEffect(p, "title_blur_in");
+        t.strings["text"] = "Spin me round\nand round";
+        TextRun r;
+        r.from = 5, r.len = 2, r.size = 120, r.color = std::array<double, 3>{0.2, 0.6, 1};
+        t.strings["runs"] = textRunsJson({r});
+        t.params["path_shape"] = 2.0;
+        for (const ParamInfo& pi : textAnimatorParams(2))
+            if (pi.kind == ParamKind::Color) {
+                t.params[pi.name + ".r"] = pi.def, t.params[pi.name + ".g"] = pi.defG, t.params[pi.name + ".b"] = pi.defB;
+            } else {
+                t.params[pi.name] = pi.def;
+            }
+        t.params["ta2.random"] = 80.0;
+        t.params["ta2.seed"] = 3.0;
+        t.params["ta2.rotation"] = 45.0;
+        t.params["ta2.shape"] = 5.0;
+        t.params["ta2.sweep"] = 1.0;
+        t.params["ta2.sweep_dur"] = 2.0;
+        auto render = [&](FrameTime f) { return renderGenerator(t, f, 480, 270, 1.0, 120, 30); };
+        const Image alone = render(37);
+        double ink = 0;
+        for (float v : alone.px) ink += v;
+        QVERIFY(ink > 100);
+        Image last;
+        for (FrameTime f = 0; f <= 37; ++f) last = render(f);
+        QVERIFY(last.px == alone.px);
+        std::vector<Image> out(8);
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 8; ++i) threads.emplace_back([&, i] { out[size_t(i)] = render(37); });
+        for (std::thread& th : threads) th.join();
+        for (const Image& o : out) QVERIFY(o.px == alone.px);
+        // The 3D title takes the runs' fonts and sizes.
+        Effect t3 = makeEffect(p, "title3d");
+        t3.strings["text"] = "BIG small";
+        const QPainterPath none = styledTextOutline(t3, 0, 1, 120, 1.1);
+        QVERIFY(none.isEmpty());
+        TextRun big;
+        big.from = 0, big.len = 3, big.size = 240;
+        t3.strings["runs"] = textRunsJson({big});
+        const QPainterPath styled = styledTextOutline(t3, 0, 1, 120, 1.1);
+        QVERIFY(styled.boundingRect().height() > 150);
+        QVERIFY(renderGenerator(t3, 0, 320, 180, 1.0, 30, 30).px != [&] {
+            Effect plain = t3;
+            plain.strings.erase("runs");
+            return renderGenerator(plain, 0, 320, 180, 1.0, 30, 30).px;
+        }());
+    }
+
+    // Mesh Warp (render/MeshWarp.h): pins left where they sit leave the picture exactly as it was.
+    void meshWarpStillPins() {
+        Project p;
+        Image img(320, 180, Image::Uninitialized{});
+        for (int y = 0; y < img.height; ++y)
+            for (int x = 0; x < img.width; ++x) {
+                float* px = img.at(x, y);
+                px[0] = float(x) / img.width, px[1] = float(y) / img.height;
+                px[2] = 0.5f + 0.5f * float(std::sin(x * 0.3) * std::sin(y * 0.3)), px[3] = 1;
+            }
+        Effect e = makeEffect(p, "mesh_warp");
+        addMeshPin(e, 0, 0.2, 0.3);
+        addMeshPin(e, 0, 0.8, 0.6);
+        addMeshPin(e, 1, 0.5, 0.5);
+        addMeshPin(e, 3, 0.4, 0.4);
+        const int bend = addMeshPin(e, 2, 0.6, 0.3);
+        QCOMPARE(meshPins(e), (std::vector<int>{1, 2, 3, 4, 5}));
+        QCOMPARE(meshPinKind(e, 3), 1);
+        Image out = img;
+        applyVideoEffect(e, 0, out, 1.0);
+        QVERIFY(out.px == img.px);
+        // A bend changes it; so does a pin moved.
+        e.params["pin" + std::to_string(bend) + ".angle"] = 20.0;
+        out = img;
+        applyVideoEffect(e, 0, out, 1.0);
+        QVERIFY(out.px != img.px);
+        e.params["pin" + std::to_string(bend) + ".angle"] = 0.0;
+        e.params["pin1.to_x"] = 0.25;
+        out = img;
+        applyVideoEffect(e, 0, out, 1.0);
+        QVERIFY(out.px != img.px);
+        // Its params are listed after the effect's own, by kind.
+        const std::vector<ParamInfo> ps = effectParams(e);
+        QVERIFY(std::any_of(ps.begin(), ps.end(), [](const ParamInfo& pi) { return pi.name == "pin1.to_x" && pi.keyframeable; }));
+        QVERIFY(std::any_of(ps.begin(), ps.end(), [](const ParamInfo& pi) { return pi.name == "pin3.amount"; }));
+        QVERIFY(std::none_of(ps.begin(), ps.end(), [](const ParamInfo& pi) { return pi.name == "pin3.to_x"; }));
+        removeMeshPin(e, 2);
+        QCOMPARE(meshPins(e), (std::vector<int>{1, 3, 4, 5}));
+    }
+
+    // All pins moved by one rotation and translation move the mesh and the picture rigidly.
+    void meshWarpMovesRigidly() {
+        const int W = 640, H = 360;
+        const WarpMesh mesh = buildWarpMesh(W, H, 2000);
+        QVERIFY(mesh.rest.size() > 1800 && mesh.rest.size() < 2200);
+        const double a = 25 * M_PI / 180, tx = 15, ty = -10;
+        auto move = [&](MeshPoint q) {
+            const double x = q[0] - 320, y = q[1] - 180;
+            return MeshPoint{320 + std::cos(a) * x - std::sin(a) * y + tx, 180 + std::sin(a) * x + std::cos(a) * y + ty};
+        };
+        std::vector<WarpPin> pins;
+        for (MeshPoint at : {MeshPoint{100, 100}, MeshPoint{500, 120}, MeshPoint{300, 300}}) {
+            WarpPin pin;
+            pin.at = at;
+            pin.to = move(at);
+            pins.push_back(pin);
+        }
+        const std::vector<MeshPoint> v = solveWarp(mesh, pins);
+        double worst = 0;
+        for (size_t i = 0; i < v.size(); ++i) {
+            const MeshPoint want = move(mesh.rest[i]);
+            worst = std::max(worst, std::hypot(v[i][0] - want[0], v[i][1] - want[1]));
+        }
+        QVERIFY2(worst < 0.25, qPrintable(QString::number(worst)));
+        // A bright square on the picture goes where the move takes it.
+        Project p;
+        Image img(W, H);
+        for (int y = 140; y < 160; ++y)
+            for (int x = 240; x < 260; ++x) std::fill(img.at(x, y), img.at(x, y) + 4, 1.0f);
+        Effect e = makeEffect(p, "mesh_warp");
+        e.params["mesh_from"] = 1.0;
+        for (const WarpPin& pin : pins) {
+            const int k = addMeshPin(e, 0, pin.at[0] / W, pin.at[1] / H);
+            e.params["pin" + std::to_string(k) + ".to_x"] = pin.to[0] / W;
+            e.params["pin" + std::to_string(k) + ".to_y"] = pin.to[1] / H;
+        }
+        applyVideoEffect(e, 0, img, 1.0);
+        double sx = 0, sy = 0, sum = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const double w = img.at(x, y)[3];
+                sx += w * (x + 0.5), sy += w * (y + 0.5), sum += w;
+            }
+        const MeshPoint want = move({250, 150});
+        QVERIFY(std::fabs(sum - 400) < 4);
+        QVERIFY2(std::hypot(sx / sum - want[0], sy / sum - want[1]) < 0.25, qPrintable(QString("%1 %2").arg(sx / sum).arg(sy / sum)));
+    }
+
+    // One pin pulled on a strip bends it, each triangle keeping its area within 5 %, where a plain warp does not.
+    void meshWarpBendsAStrip() {
+        const int W = 800, H = 480;
+        Image strip(W, H);
+        for (int y = 205; y < 235; ++y)
+            for (int x = 100; x < 500; ++x) std::fill(strip.at(x, y), strip.at(x, y) + 4, 1.0f);
+        const WarpMesh mesh = buildWarpMesh(W, H, 4000, &strip, 0);
+        QVERIFY(mesh.tris.size() > 100);
+        for (const MeshPoint& q : mesh.rest) QVERIFY(q[0] > 80 && q[0] < 520 && q[1] > 185 && q[1] < 255);
+        std::vector<WarpPin> pins(3);
+        pins[0].at = pins[0].to = {110, 208};
+        pins[1].at = pins[1].to = {110, 232};
+        // The free end swung down through 30 degrees along the arc the strip would make.
+        const double radius = 380 / (M_PI / 6);
+        pins[2].at = {490, 220};
+        pins[2].to = {110 + radius * std::sin(M_PI / 6), 220 + radius * (1 - std::cos(M_PI / 6))};
+        auto worstArea = [&](const std::vector<MeshPoint>& v) {
+            double worst = 0;
+            for (const auto& t : mesh.tris) {
+                auto area = [&](const std::vector<MeshPoint>& q) {
+                    const MeshPoint &a = q[size_t(t[0])], &b = q[size_t(t[1])], &c = q[size_t(t[2])];
+                    return 0.5 * ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]));
+                };
+                const double d = std::fabs(area(v) / area(mesh.rest) - 1);
+                worst = std::max(worst, d);
+            }
+            return worst;
+        };
+        const std::vector<MeshPoint> rigid = solveWarp(mesh, pins), plain = solveWarp(mesh, pins, WarpSolve::Plain);
+        QVERIFY(std::hypot(rigid[0][0] - mesh.rest[0][0], rigid[0][1] - mesh.rest[0][1]) < 1);
+        const double r = worstArea(rigid), q = worstArea(plain);
+        QVERIFY2(r < 0.05, qPrintable(QString::number(r)));
+        QVERIFY2(q > 0.05, qPrintable(QString::number(q)));
+        // The far end went where it was pulled.
+        double nearest = 1e9;
+        for (const MeshPoint& v : rigid) nearest = std::min(nearest, std::hypot(v[0] - pins[2].to[0], v[1] - pins[2].to[1]));
+        QVERIFY(nearest < 15);
+    }
+
+    // A stiff area keeps its edges within 1 % of their lengths while the mesh round it bends.
+    void meshWarpStiffArea() {
+        const WarpMesh mesh = buildWarpMesh(640, 360, 2000);
+        std::vector<WarpPin> pins(3);
+        pins[0].at = pins[0].to = {80, 80};
+        pins[1].at = pins[1].to = {80, 280};
+        pins[2].at = {560, 180};
+        pins[2].to = {520, 330};
+        WarpPin stiff;
+        stiff.kind = PinKind::Stiff;
+        stiff.at = {380, 180};
+        stiff.radius = 70;
+        auto worstEdge = [&](const std::vector<MeshPoint>& v) {
+            double worst = 0;
+            for (const auto& t : mesh.tris) {
+                const MeshPoint c{(mesh.rest[size_t(t[0])][0] + mesh.rest[size_t(t[1])][0] + mesh.rest[size_t(t[2])][0]) / 3,
+                                  (mesh.rest[size_t(t[0])][1] + mesh.rest[size_t(t[1])][1] + mesh.rest[size_t(t[2])][1]) / 3};
+                if (std::hypot(c[0] - stiff.at[0], c[1] - stiff.at[1]) > 0.75 * stiff.radius) continue;
+                for (int k = 0; k < 3; ++k) {
+                    const size_t a = size_t(t[size_t(k)]), b = size_t(t[size_t((k + 1) % 3)]);
+                    const double l0 = std::hypot(mesh.rest[b][0] - mesh.rest[a][0], mesh.rest[b][1] - mesh.rest[a][1]);
+                    worst = std::max(worst, std::fabs(std::hypot(v[b][0] - v[a][0], v[b][1] - v[a][1]) / l0 - 1));
+                }
+            }
+            return worst;
+        };
+        const double loose = worstEdge(solveWarp(mesh, pins));
+        pins.push_back(stiff);
+        const double held = worstEdge(solveWarp(mesh, pins));
+        QVERIFY2(held < 0.01, qPrintable(QString::number(held)));
+        QVERIFY2(loose > held * 2, qPrintable(QString("%1 %2").arg(loose).arg(held)));
+    }
+
+    // Awkward pins: one dropped from the list after a solve, two on one spot, one off the mesh, shapes touching at a
+    // corner, and pins thrown far off the picture.
+    void meshWarpAwkwardPins() {
+        const WarpMesh mesh = buildWarpMesh(320, 180, 500);
+        WarpPin over;
+        over.kind = PinKind::Overlap;
+        over.at = {100, 90};
+        WarpPin a, b;
+        a.at = {60, 60};
+        a.to = {70, 60};
+        b.at = {260, 120};
+        b.to = {270, 120};
+        // An Overlap pin removed after a solve gets its own solver (the pins' places in the list differ).
+        const std::vector<MeshPoint> with = solveWarp(mesh, {over, a, b}), without = solveWarp(mesh, {a, b});
+        for (size_t i = 0; i < with.size(); ++i) QVERIFY(std::hypot(with[i][0] - without[i][0], with[i][1] - without[i][1]) < 1e-6);
+        QVERIFY(std::fabs(without[0][0] - mesh.rest[0][0] - 10) < 0.01);
+        // Two pins on one spot hold the mesh in one place: it moves with them.
+        WarpPin a2 = a;
+        const std::vector<MeshPoint> twice = solveWarp(mesh, {a, a2});
+        for (size_t i = 0; i < twice.size(); ++i) QVERIFY(std::fabs(twice[i][0] - mesh.rest[i][0] - 10) < 0.01 && std::fabs(twice[i][1] - mesh.rest[i][1]) < 0.01);
+        // A pin off the picture's mesh keeps its distance from the vertex it holds.
+        Image logo(320, 180);
+        for (int y = 60; y < 120; ++y)
+            for (int x = 40; x < 140; ++x) logo.at(x, y)[3] = 1;
+        const WarpMesh small = buildWarpMesh(320, 180, 500, &logo, 0);
+        WarpPin on, off;
+        on.at = {60, 90};
+        on.to = {65, 90};
+        off.at = off.to = {300, 90};
+        const std::vector<MeshPoint> v = solveWarp(small, {on, off});
+        for (size_t i = 0; i < v.size(); ++i) QVERIFY(std::hypot(v[i][0] - small.rest[i][0], v[i][1] - small.rest[i][1]) < 8);
+        // Two squares touching at one corner, each pinned in two places: each solves.
+        Image corners(320, 180);
+        const WarpMesh lattice = buildWarpMesh(320, 180, 500);
+        const double cell = lattice.rest[1][0] - lattice.rest[0][0];
+        for (int y = 0; y < int(cell) - 1; ++y)
+            for (int x = 0; x < int(cell) - 1; ++x) {
+                corners.at(x + 1, y + 1)[3] = 1;
+                corners.at(int(cell) + x + 1, int(cell) + y + 1)[3] = 1;
+            }
+        const WarpMesh touching = buildWarpMesh(320, 180, 500, &corners, 0);
+        QCOMPARE(int(touching.tris.size()), 4);
+        WarpPin p1, p2;
+        p1.at = {cell * 0.3, cell * 0.6};
+        p2.at = {cell * 1.6, cell * 1.4};
+        p1.to = {p1.at[0] + 3, p1.at[1]};
+        p2.to = {p2.at[0] + 3, p2.at[1]};
+        const std::vector<MeshPoint> t = solveWarp(touching, {p1, p2});
+        for (size_t i = 0; i < t.size(); ++i) QVERIFY(std::isfinite(t[i][0]) && std::hypot(t[i][0] - touching.rest[i][0] - 3, t[i][1] - touching.rest[i][1]) < 0.5);
+        // Pins thrown far off: the mesh goes with them, and drawing it neither hangs nor crashes.
+        Project p;
+        Effect e = makeEffect(p, "mesh_warp");
+        e.params["show_mesh"] = 1.0;
+        for (double x : {0.2, 0.8}) {
+            const int k = addMeshPin(e, 0, x, 0.5);
+            e.params["pin" + std::to_string(k) + ".to_x"] = 3.0;
+            e.params["pin" + std::to_string(k) + ".to_y"] = -2.0;
+        }
+        Image img(64, 36);
+        img.fill(1, 1, 1, 1);
+        applyVideoEffect(e, 0, img, 1.0);
+        Image tiny(1, 1);
+        tiny.fill(1, 0, 0, 1);
+        applyVideoEffect(e, 0, tiny, 1.0);
+    }
+
+    // Where parts of the picture are moved over each other, the Overlap pins say which is in front.
+    void meshWarpOverlapOrder() {
+        Project p;
+        Image img(400, 200);
+        for (int y = 50; y < 150; ++y)
+            for (int x = 40; x < 140; ++x) img.at(x, y)[0] = img.at(x, y)[3] = 1;
+        for (int y = 50; y < 150; ++y)
+            for (int x = 220; x < 320; ++x) img.at(x, y)[2] = img.at(x, y)[3] = 1;
+        Effect e = makeEffect(p, "mesh_warp");
+        e.params["expand"] = 0.0;
+        addMeshPin(e, 0, 60 / 400.0, 70 / 200.0);
+        addMeshPin(e, 0, 120 / 400.0, 130 / 200.0);
+        for (double x : {240.0, 300.0}) {
+            const int k = addMeshPin(e, 0, x / 400, (x == 240 ? 70 : 130) / 200.0);
+            e.params["pin" + std::to_string(k) + ".to_x"] = (x - 120) / 400;
+        }
+        const int red = addMeshPin(e, 3, 90 / 400.0, 0.5), blue = addMeshPin(e, 3, 270 / 400.0, 0.5);
+        e.params["pin" + std::to_string(red) + ".radius"] = 60.0;
+        e.params["pin" + std::to_string(blue) + ".radius"] = 60.0;
+        auto front = [&](double redDepth, double blueDepth) {
+            e.params["pin" + std::to_string(red) + ".depth"] = redDepth;
+            e.params["pin" + std::to_string(blue) + ".depth"] = blueDepth;
+            Image out = img;
+            applyVideoEffect(e, 0, out, 1.0);
+            const float* px = out.at(120, 100);
+            // (each where only it is, too)
+            if (std::fabs(px[3] - 1) > 1e-4 || out.at(70, 100)[0] < 0.99f || out.at(170, 100)[2] < 0.99f) return '?';
+            return px[0] > 0.99f ? 'r' : px[2] > 0.99f ? 'b' : '?';
+        };
+        QCOMPARE(front(50, -50), 'r');
+        QCOMPARE(front(-50, 50), 'b');
+    }
+
+    // Keyframed pins with motion blur render the same frame alone, after others and on eight threads at once; the
+    // blur follows the mesh's motion.
+    void meshWarpRendersAlike() {
+        Project p;
+        Image img(320, 180, Image::Uninitialized{});
+        for (int y = 0; y < img.height; ++y)
+            for (int x = 0; x < img.width; ++x) {
+                float* px = img.at(x, y);
+                px[0] = (x / 8 + y / 8) % 2 ? 1.f : 0.f, px[1] = float(y) / img.height, px[2] = 0.3f, px[3] = 1;
+            }
+        Effect e = makeEffect(p, "mesh_warp");
+        addMeshPin(e, 0, 0.1, 0.1);
+        addMeshPin(e, 0, 0.1, 0.9);
+        const int k = addMeshPin(e, 0, 0.8, 0.5);
+        Param& x = e.params["pin" + std::to_string(k) + ".to_x"];
+        x.addKey(0, 0.8);
+        x.addKey(20, 0.6);
+        e.params["pin" + std::to_string(k) + ".to_y"].addKey(0, 0.5);
+        e.params["pin" + std::to_string(k) + ".to_y"].addKey(20, 0.7);
+        e.params["motion_blur"] = 1.0;
+        auto render = [&](FrameTime f) {
+            Image out = img;
+            applyVideoEffect(e, f, out, 1.0);
+            return out;
+        };
+        const Image alone = render(7);
+        Image last;
+        for (FrameTime f = 0; f <= 7; ++f) last = render(f);
+        QVERIFY(last.px == alone.px);
+        std::vector<Image> out(8);
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 8; ++i) threads.emplace_back([&, i] { out[size_t(i)] = render(7); });
+        for (std::thread& th : threads) th.join();
+        for (const Image& o : out) QVERIFY(o.px == alone.px);
+        e.params["motion_blur"] = 0.0;
+        const Image sharp = render(7);
+        double diff = 0;
+        for (size_t i = 0; i < sharp.px.size(); ++i) diff += std::fabs(sharp.px[i] - alone.px[i]);
+        QVERIFY(diff > 100);
+    }
+
+    // Grid Warp: points where they are leave the picture as it was; a point moved takes the picture there with it,
+    // straight or smoothly between the points.
+    void gridWarpMovesPoints() {
+        Project p;
+        Image img(300, 300);
+        for (int y = 145; y < 155; ++y)
+            for (int x = 145; x < 155; ++x) std::fill(img.at(x, y), img.at(x, y) + 4, 1.0f);
+        for (int x = 0; x < 300; ++x) img.at(x, 75)[1] = img.at(x, 75)[3] = 1;
+        Effect e = makeEffect(p, "grid_warp");
+        e.params["rows"] = 2.0;
+        e.params["cols"] = 2.0;
+        QCOMPARE(int(gridWarpParams(e).size()), 18);
+        Image out = img;
+        applyVideoEffect(e, 0, out, 1.0);
+        QVERIFY(out.px == img.px);
+        e.params[gridWarpPoint(1, 1) + ".dx"] = 0.1;
+        e.params[gridWarpPoint(1, 1) + ".dy"] = -0.05;
+        const MeshPoint at = gridWarpPointAt(e, 0, 1, 1);
+        QVERIFY(std::fabs(at[0] - 0.6) < 1e-9 && std::fabs(at[1] - 0.45) < 1e-9);
+        for (int shape : {0, 1}) {
+            e.params["shape"] = double(shape);
+            out = img;
+            applyVideoEffect(e, 0, out, 1.0);
+            // The dot is drawn where its point went, and not where it was.
+            QVERIFY2(out.at(179, 134)[0] > 0.9f && out.at(180, 135)[0] > 0.9f, qPrintable(QString::number(shape)));
+            QVERIFY(out.at(149, 149)[0] < 0.1f);
+            // The corners hold.
+            QVERIFY(out.at(0, 75)[1] > 0.9f);
         }
     }
 
@@ -12372,6 +13486,10 @@ colorspaces:
         s.colorSpace = "rec2100pq";
         o.displaySpace = "rec709";
         compare(15, o, "pq to rec709");
+        // The pictures brought up into it by BT.2446 Method C and seen through Method A: the GPU takes the same tables.
+        for (MediaItem& m : p.media) m.sdrExpand = "bt2446c";
+        o.displaySpace = "rec709+bt2446a";
+        compare(15, o, "bt2446 c in, a out");
     }
 
     // The lined script: pages of the screenplay with a line per take down what it reads, ticks for what the cut uses,

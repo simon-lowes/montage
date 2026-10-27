@@ -8,6 +8,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 
+#include "core/LinearSolve.h"
 #include "core/Ale.h"
 #include "core/FilmCount.h"
 #include "core/Paperwork.h"
@@ -53,6 +54,7 @@
 #include "core/MediaLog.h"
 #include "core/Multicam.h"
 #include "core/TimelineCompare.h"
+#include "core/ProjectMerge.h"
 #include "core/Reconform.h"
 #include "core/Adr.h"
 #include "core/Provenance.h"
@@ -79,6 +81,7 @@
 #include "control/Hid.h"
 #include "control/MackieControl.h"
 #include "control/Midi.h"
+#include "render/Titles.h"
 
 using namespace montage;
 using namespace montage::edit;
@@ -6758,6 +6761,279 @@ private slots:
         QCOMPARE(back.active()->audioTracks.at(1).automation, int(AutomationMode::Read));
     }
 
+    // A sparse positive definite matrix (a grid's Laplacian, a few rows held) factored in its envelope solves as the
+    // dense Cholesky does, whichever index of an off-diagonal entry is given first and with repeated entries summed.
+    void sparseCholeskySolves() {
+        const int w = 9, h = 7, n = w * h;
+        std::vector<SparseCholesky::Entry> entries;
+        std::vector<double> dense(size_t(n) * n, 0.0);
+        auto put = [&](int r, int c, double v) {
+            entries.push_back({r, c, v});
+            dense[size_t(r) * n + c] += v;
+            if (r != c) dense[size_t(c) * n + r] += v;
+        };
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                const int i = y * w + x;
+                for (int j : {x + 1 < w ? i + 1 : -1, y + 1 < h ? i + w : -1}) {
+                    if (j < 0) continue;
+                    put(i, i, 1);
+                    put(j, j, 1);
+                    if ((i + j) % 2) put(i, j, -1);
+                    else put(j, i, -1);
+                }
+            }
+        put(0, 0, 100);
+        put(n - 1, n - 1, 50);
+        put(5, 5, 0.5);
+        put(5, 5, 0.5);
+        std::vector<double> b(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) b[size_t(i)] = std::sin(i * 0.7) + 0.1 * i;
+        std::vector<double> x = b, want = b;
+        SparseCholesky f;
+        QVERIFY(f.factor(n, entries));
+        QVERIFY(f.stored() < size_t(n) * n / 2);
+        f.solve(x);
+        QVERIFY(choleskySolve(dense, n, want));
+        for (int i = 0; i < n; ++i) QVERIFY(std::fabs(x[size_t(i)] - want[size_t(i)]) < 1e-9);
+        // Not positive definite: refused.
+        SparseCholesky g;
+        QVERIFY(!g.factor(2, {{0, 0, 1}, {1, 1, 1}, {0, 1, 2}}));
+    }
+
+    void filmMixAutomation() {
+        // Trim: a lane at -10 dB trimmed by -3 dB in a Trim Latch pass plays at -13 dB.
+        Track t;
+        t.kind = TrackKind::Audio;
+        t.automation = int(AutomationMode::TrimLatch);
+        t.volumeAuto.addKey(0, -10);
+        t.volumeAuto.addKey(300, -10);
+        QVERIFY(automationReads(montage::trackAutomation(t)) && automationWrites(montage::trackAutomation(t)));
+        QCOMPARE(QString(automationModeName(montage::trackAutomation(t))), QString("Trim Latch"));
+        {
+            AutomationRecorder r(montage::trackAutomation(t), t.volumeTrim, t.volumeTrim.value, 0);
+            for (FrameTime f = 0; f <= 120; ++f) r.tick(f, f < 20 ? 0.0 : -3.0, f >= 20 && f <= 25);
+            t.volumeTrim = r.finish(120, 0.05);
+        }
+        QCOMPARE(trackVolumeAt(t, 10), -10.0);
+        QCOMPARE(trackVolumeAt(t, 60), -13.0);
+        QCOMPARE(trackVolumeAt(t, 200), -10.0);  // after the stop, as it was
+        QVERIFY(trackVolumeAnimated(t));
+        // Off ignores the trim; the volume lane itself is untouched.
+        t.automation = int(AutomationMode::Off);
+        QCOMPARE(trackVolumeAt(t, 60), t.volumeDb);
+        t.automation = int(AutomationMode::Read);
+        QCOMPARE(t.volumeAuto.at(60), -10.0);
+        // Coalescing leaves -13 dB on the volume lane and the trim empty, heard the same at every frame and between.
+        {
+            const Track before = t;
+            QVERIFY(coalesceTrim(t));
+            QVERIFY(!hasTrim(t) && !t.volumeTrim.animated() && t.volumeTrim.value == 0);
+            QCOMPARE(t.volumeAuto.at(60), -13.0);
+            for (double f = 0; f <= 320; f += 0.25) QVERIFY2(std::fabs(trackVolumeAt(t, f) - trackVolumeAt(before, f)) < 1e-9, qPrintable(QString::number(f)));
+            QVERIFY(!coalesceTrim(t));  // nothing left to fold
+            // A trim on a track in Off is not heard, so it is not folded in.
+            Track off = before;
+            off.automation = int(AutomationMode::Off);
+            QVERIFY(!coalesceTrim(off) && hasTrim(off));
+        }
+        // Coalescing a moving lane and a moving trim (and a still trim on a still fader, on a send).
+        {
+            Track m;
+            m.kind = TrackKind::Audio;
+            m.volumeAuto.addKey(0, -20);
+            m.volumeAuto.addKey(100, 0);
+            m.volumeTrim.addKey(30, 0);
+            m.volumeTrim.addKey(50, -6);
+            m.volumeTrim.addKey(70, 2);
+            m.sends.push_back(Send{7, -12, false, false, {}, {}});
+            m.sends.back().levelTrim.value = -2;
+            const Track before = m;
+            QVERIFY(coalesceTrim(m));
+            for (double f = 0; f <= 150; f += 0.5) QVERIFY(std::fabs(trackVolumeAt(m, f) - trackVolumeAt(before, f)) < 1e-9);
+            QCOMPARE(m.sends[0].levelDb, -14.0);
+            QCOMPARE(sendLevelAt(m, m.sends[0], 10), sendLevelAt(before, before.sends[0], 10));
+            // Saved with the project.
+            Project p = makeDefaultProject();
+            Track& a1 = p.active()->audioTracks.at(0);
+            a1.volumeTrim = before.volumeTrim;
+            a1.sends = before.sends;
+            a1.automation = int(AutomationMode::TrimTouch);
+            Bus bus;
+            bus.id = 7;
+            bus.volumeTrim.value = 1.5;
+            bus.automation = int(AutomationMode::TrimWrite);
+            p.active()->buses.push_back(bus);
+            Project back;
+            QVERIFY(projectFromJson(projectToJson(p), back));
+            QCOMPARE(back.active()->audioTracks.at(0), a1);
+            QCOMPARE(back.active()->buses.at(0), bus);
+            QCOMPARE(busVolumeAt(back.active()->buses.at(0), 0), 1.5);
+        }
+        // Trim modes write the trim and show it; what cannot be trimmed is written as in Write, Latch or Touch.
+        QCOMPARE(untrimmed(AutomationMode::TrimTouch), AutomationMode::Touch);
+        QCOMPARE(trimmed(AutomationMode::Write), AutomationMode::TrimWrite);
+        QCOMPARE(trimmed(AutomationMode::Read), AutomationMode::TrimTouch);
+
+        // Write To End from the playhead at -6 dB replaces everything after it and nothing before.
+        Param lane;
+        lane.addKey(0, -20);
+        lane.addKey(50, -5);
+        lane.addKey(100, -15);
+        lane.addKey(200, -30);
+        {
+            Param w = lane;
+            const auto [from, to] = writeToRange(WriteTo::End, w, 40, 40, -1, -1);
+            QCOMPARE(from, FrameTime(40));
+            QCOMPARE(to, FrameTime(-1));
+            writeLaneValue(w, 0, from, to, -6);
+            for (FrameTime f = 0; f < 40; ++f) QCOMPARE(w.at(f), lane.at(f));
+            for (FrameTime f = 40; f <= 400; ++f) QCOMPARE(w.at(f), -6.0);
+        }
+        // Write To Start, All and Next.
+        {
+            Param w = lane;
+            const auto [from, to] = writeToRange(WriteTo::Start, w, 70, 80, -1, -1);
+            writeLaneValue(w, 0, from, to, -8);
+            for (FrameTime f = 0; f <= 80; ++f) QCOMPARE(w.at(f), -8.0);
+            for (FrameTime f = 81; f <= 300; ++f) QCOMPARE(w.at(f), lane.at(f));
+            Param all = lane;
+            const auto [a0, a1] = writeToRange(WriteTo::All, all, 70, 80, -1, -1);
+            writeLaneValue(all, 0, a0, a1, -3);
+            QCOMPARE(all.keys.size(), size_t(1));
+            QCOMPARE(all.at(500), -3.0);
+            // Next: to the point after the pass, which takes the value; the lane runs on from there.
+            Param next = lane;
+            const auto [n0, n1] = writeToRange(WriteTo::Next, next, 60, 70, -1, -1);
+            QCOMPARE(n1, FrameTime(100));
+            writeLaneValue(next, 0, n0, n1, -9);
+            QCOMPARE(next.at(80), -9.0);
+            QCOMPARE(next.at(100), -9.0);
+            QCOMPARE(next.at(150), (-9.0 + -30.0) / 2);
+            QCOMPARE(next.at(30), lane.at(30));
+        }
+        // A previewed -4 dB punched over In to Out changes only that range.
+        {
+            Param w = lane;
+            const auto [from, to] = writeToRange(WriteTo::InOut, w, 0, 0, 120, 160);
+            writeLaneValue(w, 0, from, to, -4);
+            for (FrameTime f = 0; f <= 400; ++f)
+                if (f >= 120 && f <= 160) QCOMPARE(w.at(f), -4.0);
+                else QCOMPARE(w.at(f), lane.at(f));
+            // On a lane with no points: the level either side stays.
+            Param still;
+            writeLaneValue(still, -12, 120, 160, -4);
+            QCOMPARE(still.at(119), -12.0);
+            QCOMPARE(still.at(140), -4.0);
+            QCOMPARE(still.at(161), -12.0);
+            // Without In and Out, nothing.
+            QCOMPARE(writeToRange(WriteTo::InOut, w, 0, 0, -1, -1).first, FrameTime(-1));
+            // A switch's points hold.
+            Param mute;
+            writeLaneValue(mute, 0, 10, 20, 1, true);
+            QVERIFY(!laneMuted(mute, false, 9.5) && laneMuted(mute, false, 10) && laneMuted(mute, false, 20.5) && !laneMuted(mute, false, 21));
+        }
+        // A glide from -20 to 0 dB over 2 s is linear in dB, and the lane goes back after it (or holds).
+        {
+            Track g;
+            g.kind = TrackKind::Audio;
+            g.volumeDb = -20;
+            glideLane(g.volumeAuto, g.volumeDb, 30, 90, 0);
+            for (double f = 30; f <= 90; f += 0.25) {
+                const double want = -20 + 20 * (f - 30) / 60;
+                QVERIFY2(std::fabs(trackVolumeAt(g, f) - want) < 0.05, qPrintable(QString("%1: %2").arg(f).arg(trackVolumeAt(g, f))));
+            }
+            QCOMPARE(trackVolumeAt(g, 10), -20.0);
+            QCOMPARE(trackVolumeAt(g, 91), -20.0);
+            glideLane(g.volumeAuto, g.volumeDb, 30, 90, 0, true);
+            QCOMPARE(trackVolumeAt(g, 300), 0.0);
+        }
+
+        // Capture: a snapshot of five tracks pasted 10 s later matches on every parameter.
+        {
+            Project p = makeDefaultProject();
+            Sequence& s = *p.active();
+            s.fps = Rational{30, 1};
+            while (s.audioTracks.size() < 5) edit::addTrack(p, s, TrackKind::Audio);
+            Bus fx;
+            fx.id = p.newId();
+            fx.name = "Reverb";
+            s.buses.push_back(fx);
+            for (size_t i = 0; i < 5; ++i) {
+                Track& tr = s.audioTracks[i];
+                tr.volumeAuto.addKey(0, -20 + double(i));
+                tr.volumeAuto.addKey(60, -5 - double(i));
+                tr.panAuto.addKey(10, -0.5);
+                tr.panAuto.addKey(40, 0.25 * double(i));
+                tr.volumeTrim.value = i == 2 ? -1.5 : 0;
+                tr.sends.push_back(Send{fx.id, -10 - double(i), false, false, {}, {}});
+                if (i == 3) {
+                    tr.sends.back().levelAuto.addKey(0, -30);
+                    tr.sends.back().levelAuto.addKey(60, -3);
+                    tr.muteAuto.addKey(0, 0, Interp::Hold);
+                    tr.muteAuto.addKey(15, 1, Interp::Hold);
+                    tr.effects.push_back(makeEffect(p, "parametric_eq"));
+                    tr.effects.back().params["b1_db"].addKey(0, -6);
+                    tr.effects.back().params["b1_db"].addKey(60, 6);
+                }
+            }
+            s.buses[0].volumeAuto.addKey(0, -3);
+            s.buses[0].volumeAuto.addKey(60, 0);
+            std::vector<Id> ids;
+            for (const Track& tr : s.audioTracks) ids.push_back(tr.id);
+            ids.push_back(fx.id);
+            const MixSnapshot snap = captureMix(s, ids, 25);
+            QCOMPARE(snap.strips.size(), size_t(6));
+            QVERIFY(snap.strips[3].values.count("insert:0:parametric_eq:b1_db"));
+            QCOMPARE(snap.strips[3].values.at("mute"), 1.0);
+            {
+                Sequence m = s;
+                m.audioTracks[0].muted = true;  // a static mute is captured as muted
+                QCOMPARE(captureMix(m, {m.audioTracks[0].id}, 25).strips[0].values.at("mute"), 1.0);
+            }
+            const Sequence before = s;
+            QVERIFY(pasteMix(s, snap, 25 + 300, -1) > 0);
+            MixSnapshot later = captureMix(s, ids, 325);
+            later.at = snap.at;
+            QCOMPARE(later, snap);
+            // Before the paste, nothing changed.
+            for (size_t i = 0; i < 5; ++i)
+                for (FrameTime f = 0; f < 325; f += 7) QCOMPARE(s.audioTracks[i].volumeAuto.at(f), before.audioTracks[i].volumeAuto.at(f));
+            // Over a range: the values there, the lanes either side as they were.
+            Sequence r = before;
+            QVERIFY(pasteMix(r, snap, 100, 130) > 0);
+            for (size_t i = 0; i < 5; ++i) {
+                QCOMPARE(r.audioTracks[i].volumeAuto.at(115), snap.strips[i].values.at("volume"));
+                QCOMPARE(r.audioTracks[i].volumeAuto.at(99), before.audioTracks[i].volumeAuto.at(99));
+                QCOMPARE(r.audioTracks[i].volumeAuto.at(131), before.audioTracks[i].volumeAuto.at(131));
+            }
+
+            // Copy and paste: frames 10-40 of A1 onto A2 at 100, as it was; and relative onto A3.
+            const AutomationCopy c = copyAutomation(before, {before.audioTracks[0].id}, 10, 40);
+            QCOMPARE(c.strips.size(), size_t(1));
+            QVERIFY(c.strips[0].count("volume") && c.strips[0].count("pan") && !c.strips[0].count("mute"));
+            Sequence q = before;
+            QVERIFY(pasteAutomation(q, c, {q.audioTracks[1].id}, 100, false) == 2);
+            for (FrameTime k = 0; k <= 30; ++k) {
+                QCOMPARE(q.audioTracks[1].volumeAuto.at(100 + k), before.audioTracks[0].volumeAuto.at(10 + k));
+                QCOMPARE(q.audioTracks[1].panAuto.at(100 + k), before.audioTracks[0].panAuto.at(10 + k));
+            }
+            QCOMPARE(q.audioTracks[1].volumeAuto.at(99), before.audioTracks[1].volumeAuto.at(99));
+            QCOMPARE(q.audioTracks[1].volumeAuto.at(131), before.audioTracks[1].volumeAuto.at(131));
+            const AutomationCopy v = copyAutomation(before, {before.audioTracks[0].id}, 10, 40, {"volume"});
+            QVERIFY(pasteAutomation(q, v, {q.audioTracks[2].id}, 200, true) == 1);
+            for (FrameTime k = 0; k <= 30; ++k) {
+                const double moved = before.audioTracks[0].volumeAuto.at(10 + k) - before.audioTracks[0].volumeAuto.at(10);
+                QVERIFY(std::fabs(q.audioTracks[2].volumeAuto.at(200 + k) - (before.audioTracks[2].volumeAuto.at(200 + k) + moved)) < 1e-9);
+            }
+            // A send's lane goes to a track that feeds the same bus, an insert's to the same effect in the same place.
+            const AutomationCopy sends = copyAutomation(before, {before.audioTracks[3].id}, 0, 60);
+            QVERIFY(sends.strips[0].count("send:" + std::to_string(fx.id)) && sends.strips[0].count("insert:0:parametric_eq:b1_db"));
+            Sequence u = before;
+            QCOMPARE(pasteAutomation(u, sends, {u.audioTracks[4].id}, 0, false), 4);  // volume, pan, mute and the send, not the EQ it lacks
+        }
+    }
+
     void clipMarkers() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();
@@ -8109,6 +8385,255 @@ private slots:
         QVERIFY(overwrite(p, top, {TrackKind::Video, 2}, title).ok);
         m = matchSource(p, top, 160);
         QVERIFY(m && m->media == camB);
+    }
+
+    void projectMerge() {
+        // The base: clips A and B on V1, C on V2, two captions and a bin.
+        Fixture fx;
+        const Id a = fx.put(V1, 0, 60, 0), b = fx.put(V1, 100, 60, 100), c = fx.put(V2, 0, 100, 200);
+        CaptionTrack subs;
+        subs.id = fx.p.newId();
+        subs.captions = {{0, 30, "Hello", {}}, {40, 70, "World", {}}};
+        fx.s().captionTracks.push_back(subs);
+        fx.p.bins = {"Rushes"};
+        const Project base = fx.p;
+        auto json = [](Project p) {
+            p.mergeBase.reset();
+            return projectToJson(p);
+        };
+        auto clip = [](const Project& p, Id id) { return clipById(*p.active(), id); };
+
+        // Mine trims A, adds a bin and grades C; theirs adds markers, moves B and changes a caption.
+        Project mine = base;
+        clipById(*mine.active(), a)->duration = 50;
+        mine.bins.push_back("Selects");
+        Effect grade = makeEffect(mine, "color_correct");
+        grade.params["exposure"] = 1.5;
+        clipById(*mine.active(), c)->effects.push_back(grade);
+        Project theirs = base;
+        theirs.active()->markers = {Marker{10, 0, "Logo", "", 1}, Marker{20, 0, "Cut here", "", 2}};
+        QVERIFY(moveClips(theirs, *theirs.active(), {b}, 100, 0, 0).ok);
+        theirs.active()->captionTracks[0].captions[1].text = "Everyone";
+
+        const MergeResult r = mergeProjects(base, mine, theirs);
+        QVERIFY2(r.ok, r.error.c_str());
+        QVERIFY(r.conflicts.empty());
+        QVERIFY(r.renumbered.empty());
+        QCOMPARE(clip(r.project, a)->duration, FrameTime(50));
+        QCOMPARE(clip(r.project, b)->start, FrameTime(200));
+        QCOMPARE(clip(r.project, c)->effects.size(), size_t(1));
+        QCOMPARE(clip(r.project, c)->effects[0].p("exposure", 0), 1.5);
+        QCOMPARE(r.project.active()->markers.size(), size_t(2));
+        QCOMPARE(r.project.active()->captionTracks[0].captions[1].text, std::string("Everyone"));
+        QCOMPARE(r.project.bins, (std::vector<std::string>{"Rushes", "Selects"}));
+        // Each change is listed with its side.
+        auto changed = [&](const MergeResult& m, MergeSide side, Id clipId) {
+            return std::any_of(m.changes.begin(), m.changes.end(), [&](const MergeChange& ch) { return ch.side == side && ch.clip == clipId; });
+        };
+        QVERIFY(changed(r, MergeSide::Mine, a));
+        QVERIFY(changed(r, MergeSide::Mine, c));
+        QVERIFY(changed(r, MergeSide::Theirs, b));
+        QVERIFY(std::any_of(r.changes.begin(), r.changes.end(),
+                            [](const MergeChange& ch) { return ch.side == MergeSide::Mine && ch.kind == MergeChange::Added && ch.field == "bins › Selects"; }));
+        // The other way round gives the same project.
+        const MergeResult back = mergeProjects(base, theirs, mine);
+        QVERIFY(back.ok && back.conflicts.empty());
+        QCOMPARE(json(back.project), json(r.project));
+        // Its merge base is theirs now; saved and opened again, it is the same.
+        Project kept;
+        QVERIFY(mergeBaseOf(r.project, kept));
+        QCOMPARE(json(kept), json(theirs));
+        QTemporaryDir dir;
+        const std::string file = dir.filePath("merged.montage").toStdString();
+        QVERIFY(saveProject(r.project, file));
+        Project reopened;
+        QVERIFY(loadProject(file, reopened));
+        QCOMPARE(projectToJson(reopened), projectToJson(r.project));
+        // A side with no changes gives the other side exactly.
+        QCOMPARE(json(mergeProjects(base, base, theirs).project), json(theirs));
+        QCOMPARE(json(mergeProjects(base, mine, base).project), json(mine));
+        QVERIFY(mergeProjects(base, base, theirs).changes.size() > 0 && mergeProjects(base, base, base).changes.empty());
+
+        // Both trimming A differently: one conflict, and either choice gives that side's trim.
+        Project theirTrim = base;
+        clipById(*theirTrim.active(), a)->duration = 40;
+        const MergeResult both = mergeProjects(base, mine, theirTrim);
+        QCOMPARE(both.conflicts.size(), size_t(1));
+        const MergeConflict& k = both.conflicts[0];
+        QCOMPARE(k.kind, MergeConflict::Field);
+        QCOMPARE(k.clip, a);
+        QCOMPARE(k.field, std::string("duration"));
+        QCOMPARE(k.mine, std::string("50"));
+        QCOMPARE(k.theirs, std::string("40"));
+        QCOMPARE(clip(both.project, a)->duration, FrameTime(50));
+        QCOMPARE(clip(mergeProjects(base, mine, theirTrim, {{k.key, MergeSide::Theirs}}).project, a)->duration, FrameTime(40));
+        QCOMPARE(clip(mergeProjects(base, mine, theirTrim, {{k.key, MergeSide::Mine}}).project, a)->duration, FrameTime(50));
+        // The same trim on both sides is taken once.
+        Project sameTrim = base;
+        clipById(*sameTrim.active(), a)->duration = 50;
+        const MergeResult same = mergeProjects(base, mine, sameTrim);
+        QVERIFY(same.conflicts.empty());
+        QCOMPARE(clip(same.project, a)->duration, FrameTime(50));
+        QVERIFY(changed(same, MergeSide::Both, a));
+        // Removed on one side and changed on the other.
+        Project removed = base;
+        QVERIFY(removeClips(removed, *removed.active(), {b}, false).ok);
+        const MergeResult gone = mergeProjects(base, removed, theirs);
+        QCOMPARE(gone.conflicts.size(), size_t(1));
+        QCOMPARE(gone.conflicts[0].kind, MergeConflict::Removed);
+        QVERIFY(!clip(gone.project, b));
+        QCOMPARE(clip(mergeProjects(base, removed, theirs, {{gone.conflicts[0].key, MergeSide::Theirs}}).project, b)->start, FrameTime(200));
+
+        // Ids both sides made: theirs are renumbered and what refers to them follows.
+        Project mineNew = base, theirsNew = base;
+        auto place = [](Project& p, Id media, TrackRef t, FrameTime start, FrameTime len) {
+            Clip x = makeClip(p, *p.findMedia(media), t.kind, *p.active());
+            x.start = start;
+            x.duration = len;
+            return overwrite(p, *p.active(), t, x).created.at(0);
+        };
+        const Id d = place(mineNew, fx.media, V2, 200, 30);
+        const Id e = place(theirsNew, fx.media, V1, 300, 30);
+        QCOMPARE(d, e);  // (made from the same next id)
+        Transition fade;
+        fade.id = theirsNew.newId();
+        fade.clipB = e;
+        theirsNew.active()->videoTracks[0].transitions.push_back(fade);
+        const MergeResult ids = mergeProjects(base, mineNew, theirsNew);
+        QVERIFY(ids.ok && ids.conflicts.empty());
+        QVERIFY(ids.renumbered.count(e));
+        const Id e2 = ids.renumbered.at(e);
+        QVERIFY(clip(ids.project, d) && clip(ids.project, e2));
+        QCOMPARE(clip(ids.project, d)->start, FrameTime(200));
+        QCOMPARE(clip(ids.project, e2)->start, FrameTime(300));
+        QCOMPARE(ids.project.active()->videoTracks[0].transitions.size(), size_t(1));
+        QCOMPARE(ids.project.active()->videoTracks[0].transitions[0].clipB, e2);
+        QVERIFY(ids.project.nextId > e2);
+        std::set<Id> seen;  // every id once
+        bool unique = true;
+        for (const Sequence& sq : ids.project.sequences)
+            for (const Track& t : sq.videoTracks)
+                for (const Clip& x : t.clips) unique = unique && seen.insert(x.id).second && seen.insert(x.motion.id).second;
+        QVERIFY(unique);
+
+        // Clips from both sides overlapping on a track: theirs goes on a new track until it is settled.
+        Project longer = base, added = base;
+        clipById(*longer.active(), a)->duration = 90;  // over 0..90, where B starts at 100
+        const Id f = place(added, fx.media, V1, 70, 25);  // in the gap at 70..95 in theirs
+        const MergeResult lap = mergeProjects(base, longer, added);
+        QCOMPARE(lap.conflicts.size(), size_t(1));
+        const MergeConflict& o = lap.conflicts[0];
+        QCOMPARE(o.kind, MergeConflict::Overlap);
+        QVERIFY(o.canBoth);
+        QCOMPARE(o.choice, MergeSide::Both);
+        QCOMPARE(lap.newTracks, 1);
+        const Sequence& ls = *lap.project.active();
+        QCOMPARE(ls.videoTracks.size(), base.active()->videoTracks.size() + 1);
+        QCOMPARE(ls.videoTracks.back().clips.size(), size_t(1));
+        QCOMPARE(ls.videoTracks.back().clips[0].id, f);
+        QCOMPARE(clip(lap.project, a)->duration, FrameTime(90));
+        const MergeResult keepMine = mergeProjects(base, longer, added, {{o.key, MergeSide::Mine}});
+        QVERIFY(!clip(keepMine.project, f) && clip(keepMine.project, a));
+        QCOMPARE(keepMine.project.active()->videoTracks.size(), base.active()->videoTracks.size());
+        const MergeResult keepTheirs = mergeProjects(base, longer, added, {{o.key, MergeSide::Theirs}});
+        QVERIFY(clip(keepTheirs.project, f) && !clip(keepTheirs.project, a));
+        QCOMPARE(keepTheirs.project.active()->videoTracks.size(), base.active()->videoTracks.size());
+
+        // The merge base a copy keeps.
+        Project copy = base;
+        QVERIFY(!mergeBaseOf(copy, kept));
+        setMergeBase(copy, base);
+        MergeBase found;
+        QVERIFY(commonMergeBase(base, copy, found));
+        QCOMPARE(json(found.base), json(base));
+
+        // Both add an effect to C: the same order whichever side is mine.
+        Project fxMine = base, fxTheirs = base;
+        clipById(*fxMine.active(), c)->effects.push_back(makeEffect(fxMine, "color_correct"));
+        fxTheirs.nextId += 5;  // (ids of their own, apart from mine's)
+        clipById(*fxTheirs.active(), c)->effects.push_back(makeEffect(fxTheirs, "color_correct"));
+        QCOMPARE(json(mergeProjects(base, fxMine, fxTheirs).project), json(mergeProjects(base, fxTheirs, fxMine).project));
+        QCOMPARE(clip(mergeProjects(base, fxMine, fxTheirs).project, c)->effects.size(), size_t(2));
+
+        // A clip each side moved to another track: one conflict, mine's place kept unless theirs is chosen.
+        Project toV2 = base, toV3 = base;
+        QVERIFY(moveClips(toV2, *toV2.active(), {b}, 0, 1, 0).ok);
+        QVERIFY(moveClips(toV3, *toV3.active(), {b}, 0, 2, 0).ok);
+        const MergeResult moved = mergeProjects(base, toV2, toV3);
+        QCOMPARE(moved.conflicts.size(), size_t(1));
+        QCOMPARE(moved.conflicts[0].kind, MergeConflict::Moved);
+        auto tracksWith = [](const Project& p, Id id) {
+            int n = 0, at = -1;
+            for (size_t i = 0; i < p.active()->videoTracks.size(); ++i)
+                for (const Clip& x : p.active()->videoTracks[i].clips)
+                    if (x.id == id) ++n, at = int(i);
+            return std::make_pair(n, at);
+        };
+        QCOMPARE(tracksWith(moved.project, b), std::make_pair(1, 1));
+        QCOMPARE(tracksWith(mergeProjects(base, toV2, toV3, {{moved.conflicts[0].key, MergeSide::Theirs}}).project, b), std::make_pair(1, 2));
+
+        // Theirs moves B onto a clip mine added: Mine keeps B where it was.
+        Project mineAdds = base, theirsMoves = base;
+        const Id g = place(mineAdds, fx.media, V1, 300, 40);
+        QVERIFY(moveClips(theirsMoves, *theirsMoves.active(), {b}, 210, 0, 0).ok);  // B to 310..370
+        const MergeResult onto = mergeProjects(base, mineAdds, theirsMoves);
+        QCOMPARE(onto.conflicts.size(), size_t(1));
+        QCOMPARE(onto.conflicts[0].kind, MergeConflict::Overlap);
+        const MergeResult keepB = mergeProjects(base, mineAdds, theirsMoves, {{onto.conflicts[0].key, MergeSide::Mine}});
+        QVERIFY(clip(keepB.project, g));
+        QCOMPARE(clip(keepB.project, b)->start, FrameTime(100));
+
+        // Merged twice from the same copy: the second time their earlier clip is not brought in again, and a
+        // clip of theirs renumbered the first time takes their later change.
+        Project editor = base, assistant = base;
+        setMergeBase(assistant, base);
+        const Id editorClip = place(editor, fx.media, V2, 400, 20);
+        const Id assistantClip = place(assistant, fx.media, V1, 400, 20);
+        QCOMPARE(editorClip, assistantClip);
+        const MergeResult first = mergeProjects(base, editor, assistant);
+        QVERIFY(first.ok && first.conflicts.empty());
+        const Id renamed = first.renumbered.at(assistantClip);
+        QCOMPARE(first.project.mergeIds.at(assistantClip), renamed);
+        Project assistant2 = assistant;
+        clipById(*assistant2.active(), assistantClip)->duration = 10;
+        const Id later = place(assistant2, fx.media, V1, 500, 20);
+        MergeBase again;
+        QVERIFY(commonMergeBase(first.project, assistant2, again));
+        QVERIFY(again.baseInTheirIds);
+        const MergeResult second = mergeProjects(again, first.project, assistant2);
+        QVERIFY2(second.ok && second.conflicts.empty(), second.conflicts.empty() ? "" : second.conflicts[0].key.c_str());
+        QCOMPARE(clip(second.project, renamed)->duration, FrameTime(10));
+        QCOMPARE(clip(second.project, editorClip)->start, FrameTime(400));
+        QCOMPARE(clip(second.project, editorClip)->duration, FrameTime(20));
+        QCOMPARE(second.project.active()->videoTracks.size(), base.active()->videoTracks.size());
+        int clips = 0;
+        for (const Track& t : second.project.active()->videoTracks) clips += int(t.clips.size());
+        int baseClips = 0;
+        for (const Track& t : base.active()->videoTracks) baseClips += int(t.clips.size());
+        QCOMPARE(clips, baseClips + 3);  // the editor's, the assistant's first and later ones
+        QVERIFY(std::any_of(second.project.active()->videoTracks[0].clips.begin(), second.project.active()->videoTracks[0].clips.end(),
+                            [&](const Clip& x) { return x.start == 500 && x.id != editorClip && x.id != renamed; }));
+        (void)later;
+
+        // A Dialogue Alignment names its take's media as text: renumbered with it.
+        Project mediaMine = base, mediaTheirs = base;
+        auto addMedia = [](Project& p) {
+            MediaItem m = p.media[0];
+            m.id = p.newId();
+            m.name = "take2.mov";
+            p.media.push_back(m);
+            return m.id;
+        };
+        addMedia(mediaMine);
+        const Id take = addMedia(mediaTheirs);
+        Effect align;
+        align.id = mediaTheirs.newId();
+        align.type = "dialogue_align";
+        align.strings["media"] = std::to_string(take);
+        clipById(*mediaTheirs.active(), a)->effects.push_back(align);
+        const MergeResult withTake = mergeProjects(base, mediaMine, mediaTheirs);
+        QVERIFY(withTake.renumbered.count(take));
+        QCOMPARE(clip(withTake.project, a)->effects.back().s("media"), std::to_string(withTake.renumbered.at(take)));
     }
 
     void timelineCompare() {
@@ -9762,6 +10287,58 @@ private slots:
         p.sequences.push_back(other);
         QVERIFY(!placeSequenceClips(p, *p.findSequence(main), otherId, 0, -1, 0, 0, 0, false).ok);
         QVERIFY(!placeSequenceClips(p, *p.findSequence(main), selId, 500, 600, 0, 0, 0, false).ok);
+    }
+
+    void fcpxmlTitleStyles() {
+        // A title with styled runs (a font, a size, a colour, bold and italic, an outline, tracking and a baseline shift)
+        // keeps each character's style through FCPXML and back.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        Clip title = makeGeneratorClip(p, "title", 50);
+        Effect& g = title.generator;
+        g.strings["text"] = "Plain BOLD red\nand under";
+        g.strings["font"] = "DejaVu Sans";
+        g.params["size"] = 80.0;
+        g.params["color.g"] = 0.8;
+        TextRun bold, red, low;
+        bold.from = 6, bold.len = 4, bold.font = "DejaVu Serif", bold.size = 120, bold.bold = 1, bold.italic = 1;
+        bold.outline = 3, bold.outlineColor = std::array<double, 3>{0, 0, 0.5}, bold.tracking = 6;
+        red.from = 11, red.len = 3, red.color = std::array<double, 3>{1, 0.1, 0.2}, red.bold = 0;
+        low.from = 15, low.len = 3, low.baseline = -12;
+        g.strings["runs"] = textRunsJson({bold, red, low});
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, title).ok);
+        const std::string xml = exportFcpXml(p, s);
+        const Effect original = s.videoTracks[0].clips[0].generator;  // (importing adds a sequence)
+        QVERIFY(xml.find("<text-style-def id=\"ts") != std::string::npos);
+        QVERIFY(xml.find("font=\"DejaVu Serif\"") != std::string::npos);
+        ImportResult r = importXmlTimeline(p, xml);
+        QVERIFY2(r.ok, r.error.c_str());
+        const Clip& back = p.findSequence(r.sequence)->videoTracks.at(0).clips.at(0);
+        QCOMPARE(back.generator.type, std::string("title"));
+        // Each letter's style (spaces go with the stretch before them).
+        auto perChar = [](const Effect& g) {
+            std::vector<std::pair<QChar, TextRun>> out;
+            for (const TitleStyleSpan& sp : titleStyleSpans(g))
+                for (QChar ch : sp.text) out.emplace_back(ch, sp.style);
+            return out;
+        };
+        const auto want = perChar(original), got = perChar(back.generator);
+        QCOMPARE(got.size(), want.size());
+        QCOMPARE(back.generator.s("text"), original.s("text"));
+        QVERIFY(titleStyleSpans(back.generator).size() >= 4);
+        for (size_t i = 0; i < want.size(); ++i) {
+            if (want[i].first.isSpace()) continue;
+            TextRun a = want[i].second, b = got[i].second;
+            QVERIFY2(std::abs(a.size - b.size) < 1e-9, qPrintable(QString("%1 %2").arg(a.size).arg(b.size)));
+            b.size = a.size;
+            QVERIFY2(a == b, qPrintable(QString("letter %1").arg(i)));
+        }
+        // The plain title's own style is the title's again; Final Cut's own titles (no bold attribute) read too.
+        QCOMPARE(back.generator.s("font"), std::string("DejaVu Sans"));
+        QCOMPARE(back.generator.p("color.g", 0), 0.8);
+        Project fc;
+        ImportResult rf = importXmlTimeline(fc, readData("interchange/final-cut.fcpxml"));
+        QVERIFY(rf.ok);
     }
 
     void interchangeReviewFixes() {

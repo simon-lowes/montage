@@ -501,17 +501,17 @@ bool extendBandwidth(const std::vector<float>& in, int rate, std::vector<float>&
     });
     const std::vector<float> gate = speechGate(levels);
     const int64_t len = int64_t(in.size());
-    std::vector<float> acc(static_cast<size_t>(len), 0.0f), env(size_t(len), 0.0f);
+    // (What is added is summed in `out`; every sample is under four frames, so the windows' overlap is the same every H
+    // samples and needs no buffer of its own.)
+    out.assign(in.size(), 0.0f);
+    std::vector<float> env(static_cast<size_t>(H), 0.0f);
+    for (int i = 0; i < N; ++i) env[size_t(i % H)] += w[size_t(i)] * w[size_t(i)];
     std::vector<std::complex<float>> x(static_cast<size_t>(N)), y(static_cast<size_t>(N));
     // The original's frames and the restored sound's, in step.
     for (int64_t start = -N, t = 0; start < len; start += H, ++t) {
         if ((t & 255) == 0 && cancel && cancel->load()) {
             if (error) *error = "Cancelled";
             return false;
-        }
-        for (int i = 0; i < N; ++i) {
-            const int64_t s = start + i;
-            if (s >= 0 && s < len) env[size_t(s)] += w[size_t(i)] * w[size_t(i)];
         }
         const float g = gate[size_t(t)];
         if (g <= 0) continue;
@@ -531,11 +531,14 @@ bool extendBandwidth(const std::vector<float>& in, int rate, std::vector<float>&
         fftInPlace(y, true);
         for (int i = 0; i < N; ++i) {
             const int64_t s = start + i;
-            if (s >= 0 && s < len) acc[size_t(s)] += y[size_t(i)].real() / N * w[size_t(i)];
+            if (s >= 0 && s < len) out[size_t(s)] += y[size_t(i)].real() / N * w[size_t(i)];
         }
     }
-    out.resize(in.size());
-    for (int64_t s = 0; s < len; ++s) out[size_t(s)] = in[size_t(s)] + (env[size_t(s)] > 1e-11f ? acc[size_t(s)] / env[size_t(s)] : 0.0f);
+    std::vector<float>().swap(wide);
+    for (int64_t s = 0; s < len; ++s) {
+        const float e = env[size_t(s % H)];
+        out[size_t(s)] = in[size_t(s)] + (e > 1e-11f ? out[size_t(s)] / e : 0.0f);
+    }
     return true;
 }
 

@@ -1,10 +1,12 @@
 #include "LearnFromClip.h"
 
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QUuid>
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <set>
 
 #include "ColorSpace.h"
@@ -79,6 +81,49 @@ bool learningPair(const Project& p, const Sequence& s, const Clip& c, FrameTime 
     return true;
 }
 
+int64_t learningPixelsEach(size_t frames) {
+    // (Before and after, float RGBA: 32 bytes a pixel; about a gigabyte in all, never less than a 512-pixel square each.)
+    constexpr int64_t kAll = int64_t(32) << 20;
+    return std::max<int64_t>(512 * 512, kAll / int64_t(std::max<size_t>(1, frames)));
+}
+
+void fitLearningPair(learn::Pair& p, int64_t maxPixels) {
+    const int W = p.before.width, H = p.before.height;
+    if (int64_t(W) * H <= maxPixels || p.after.width != W || p.after.height != H) return;
+    // The window, the frame's shape, at full size (the network learns at the picture's own scale).
+    int w = std::clamp(int(std::sqrt(double(maxPixels) * W / H)), 1, W);
+    int h = std::clamp(int(maxPixels / w), 1, H);
+    // Where before and after differ most, in 32-pixel blocks (summed, so any window's total is four lookups).
+    constexpr int B = 32;
+    const int gw = (W + B - 1) / B, gh = (H + B - 1) / B;
+    std::vector<double> sum(size_t(gw + 1) * size_t(gh + 1), 0.0);
+    auto at = [&](int gx, int gy) -> double& { return sum[size_t(gy) * size_t(gw + 1) + size_t(gx)]; };
+    for (int by = 0; by < gh; ++by)
+        for (int bx = 0; bx < gw; ++bx) {
+            double d = 0;
+            for (int y = by * B; y < std::min(H, (by + 1) * B); ++y) {
+                const float* a = p.before.at(bx * B, y);
+                const float* b = p.after.at(bx * B, y);
+                for (int i = 0; i < (std::min(W, (bx + 1) * B) - bx * B) * 4; ++i) d += std::fabs(double(b[i]) - double(a[i]));
+            }
+            at(bx + 1, by + 1) = d + at(bx, by + 1) + at(bx + 1, by) - at(bx, by);
+        }
+    const int ww = std::max(1, w / B), wh = std::max(1, h / B);
+    int bestX = 0, bestY = 0;
+    double best = -1;
+    for (int by = 0; by + wh <= gh; ++by)
+        for (int bx = 0; bx + ww <= gw; ++bx)
+            if (const double d = at(bx + ww, by + wh) - at(bx, by + wh) - at(bx + ww, by) + at(bx, by); d > best) best = d, bestX = bx, bestY = by;
+    const int x0 = std::min(bestX * B, W - w), y0 = std::min(bestY * B, H - h);
+    auto cut = [&](const Image& from) {
+        Image out(w, h, Image::Uninitialized{});
+        for (int y = 0; y < h; ++y) std::copy_n(from.at(x0, y0 + y), size_t(w) * 4, out.row(y));
+        return out;
+    };
+    p.before = cut(p.before);
+    p.after = cut(p.after);
+}
+
 std::vector<FrameTime> exampleFrames(const Sequence& s, const Clip& c, FrameTime playhead) {
     std::set<FrameTime> frames;
     for (const Marker& m : s.markers)
@@ -123,6 +168,40 @@ std::string newLearnedNetworkPath(const std::string& projectPath, const Project&
         if ((!QFileInfo::exists(path) || (reuse && !projectPath.empty())) && !used.count(QFileInfo(path).absoluteFilePath().toStdString()))
             return path.toStdString();
     }
+}
+
+std::map<std::string, std::string> keepLearnedNetworks(Project& p, const std::string& projectPath) {
+    std::map<std::string, std::string> moved;
+    if (projectPath.empty()) return moved;
+    const QString temporary = QFileInfo(QDir::tempPath() + QStringLiteral("/Montage Learned Effects")).absoluteFilePath();
+    for (Sequence& s : p.sequences)
+        for (Track& t : s.videoTracks)
+            for (Clip& c : t.clips)
+                for (Effect& e : c.effects) {
+                    if (e.type != "learned_effect") continue;
+                    const auto it = e.strings.find("network");
+                    if (it == e.strings.end() || it->second.empty()) continue;
+                    const QFileInfo file(QString::fromStdString(it->second));
+                    if (file.absolutePath() != temporary) continue;
+                    auto to = moved.find(it->second);
+                    if (to == moved.end()) {
+                        const std::string path = newLearnedNetworkPath(projectPath, p, c);
+                        if (!QFile::copy(file.absoluteFilePath(), QString::fromStdString(path))) continue;
+                        to = moved.emplace(it->second, path).first;
+                    }
+                    it->second = to->second;
+                }
+    return moved;
+}
+
+void repointLearnedNetworks(Project& p, const std::map<std::string, std::string>& moved) {
+    for (Sequence& s : p.sequences)
+        for (Track& t : s.videoTracks)
+            for (Clip& c : t.clips)
+                for (Effect& e : c.effects)
+                    if (e.type == "learned_effect")
+                        if (const auto it = e.strings.find("network"); it != e.strings.end())
+                            if (const auto to = moved.find(it->second); to != moved.end()) it->second = to->second;
 }
 
 bool networkInUse(const Project& p, const std::string& network) {

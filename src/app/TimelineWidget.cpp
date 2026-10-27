@@ -1192,9 +1192,10 @@ void TimelineWidget::paintTrackLane(QPainter& p, const Row& row, const Track& t)
     std::sort(xs.begin(), xs.end());
     QPolygonF line;
     for (int x : xs) line << QPointF(x, laneY(lane, band, trackLaneValue(t, std::max<FrameTime>(0, FrameTime(std::floor(frameAtX(x)))))));
-    // Heard in Read, Latch and Touch; dimmed when the mode ignores it, dashed while it is only the fader's level.
+    // Heard in Read, Latch, Touch and the trim modes; dimmed when the mode ignores it, dashed while it is only the fader's
+    // level.
     const AutomationMode m = trackAutomation(t);
-    const bool heard = m == AutomationMode::Read || m == AutomationMode::Latch || m == AutomationMode::Touch;
+    const bool heard = automationReads(m);
     QColor col(84, 200, 255, heard ? 230 : 110);
     p.save();
     p.setRenderHint(QPainter::Antialiasing);
@@ -1212,12 +1213,26 @@ void TimelineWidget::paintTrackLane(QPainter& p, const Row& row, const Track& t)
         d << at + QPointF(0, -4) << at + QPointF(4, 0) << at + QPointF(0, 4) << at + QPointF(-4, 0);
         p.drawPolygon(d);
     }
+    // A trim on it: what is heard, the two together, as a thinner amber line.
+    const bool trimmed = heard && (t.volumeTrim.animated() || t.volumeTrim.value != 0);
+    if (trimmed) {
+        std::vector<int> txs = xs;
+        for (const Keyframe& k : t.volumeTrim.keys)
+            if (const int kx = xForFrame(k.t); kx > x0 && kx < x1) txs.push_back(kx);
+        std::sort(txs.begin(), txs.end());
+        QPolygonF heardLine;
+        for (int x : txs)
+            heardLine << QPointF(x, laneY(lane, band, trackVolumeAt(t, double(std::max<FrameTime>(0, FrameTime(std::floor(frameAtX(x))))))));
+        p.setPen(QPen(QColor(255, 190, 70, 220), 1));
+        p.setBrush(Qt::NoBrush);
+        p.drawPolyline(heardLine);
+    }
     p.setPen(col);
     QFont f = p.font();
     f.setPointSize(7);
     p.setFont(f);
-    p.drawText(QRect(band.left() + 4, row.y + 1, 120, 12), Qt::AlignLeft | Qt::AlignTop,
-               tr("Volume · %1").arg(tr(automationModeName(m))));
+    p.drawText(QRect(band.left() + 4, row.y + 1, 160, 12), Qt::AlignLeft | Qt::AlignTop,
+               trimmed ? tr("Volume · %1 · trimmed").arg(tr(automationModeName(m))) : tr("Volume · %1").arg(tr(automationModeName(m))));
     p.restore();
 }
 
@@ -1568,6 +1583,12 @@ void TimelineWidget::setIntelligibilityLane(std::vector<IntelligibilitySpan> spa
     viewport()->update();
 }
 
+void TimelineWidget::setLoudnessLane(std::vector<IntelligibilitySpan> spans, bool stale) {
+    loudnessLane_ = std::move(spans);
+    loudnessLaneStale_ = stale;
+    viewport()->update();
+}
+
 void TimelineWidget::setRenderedRanges(std::vector<std::pair<FrameTime, FrameTime>> ranges) {
     rendered_ = std::move(ranges);
     viewport()->update();
@@ -1624,6 +1645,14 @@ void TimelineWidget::paintRuler(QPainter& p) {
         QColor c = sp.status == 0 ? QColor(63, 185, 80) : sp.status == 1 ? QColor(210, 153, 34) : QColor(248, 81, 73);
         if (intelligibilityStale_) c.setAlpha(90);
         p.fillRect(QRect(xa, kRulerH - 10, std::max(1, xb - xa), 3), c);
+    }
+    // Loudness lane above it: green within the limits, amber over the target, red over the ceiling.
+    for (const IntelligibilitySpan& sp : loudnessLane_) {
+        const int xa = xForFrame(sp.first), xb = xForFrame(sp.end);
+        if (xb < kHeaderW || xa > W) continue;
+        QColor c = sp.status == 0 ? QColor(63, 185, 80) : sp.status == 1 ? QColor(210, 153, 34) : QColor(248, 81, 73);
+        if (loudnessLaneStale_) c.setAlpha(90);
+        p.fillRect(QRect(xa, kRulerH - 14, std::max(1, xb - xa), 3), c);
     }
     // In/out band.
     if (s->inPoint >= 0 || s->outPoint >= 0) {

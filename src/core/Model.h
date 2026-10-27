@@ -185,6 +185,8 @@ struct MediaItem {
     std::string bin;         // bin path, "/" between nested bins ("Interviews/Day 1"), "" = the project root
     std::string colorSpace;     // detected from the file's colour tags (ColorSpace.h id), "" = Rec.709
     std::string colorOverride;  // Interpret Colour: the space to read it as, "" = as detected
+    // SDR in an HDR sequence (render/ColorSpace.h ToneMapping id): "" = at HDR reference white, "bt2446a" or "bt2446c"
+    std::string sdrExpand;
     double maxCll = 0, maxFall = 0;  // HDR light levels the file states (CTA-861.3), nits; 0 = none stated
     // Adaptive HDR metadata the video carries (ST 2094-50, render/AdaptiveHdr.h), scene by scene in its own frames;
     // null = none. Shared: undo snapshots copy the pointer.
@@ -332,6 +334,8 @@ struct TrimTarget {
     std::string name;        // shown
     std::string colorSpace;  // a display space (ColorSpace.h id)
     double peakNits = 100;   // its display's peak (a PQ target is rolled off to it)
+    // An SDR target made from HDR (render/ColorSpace.h ToneMapping id): "" = Montage's roll-off, "bt2446a" or "bt2446c"
+    std::string toneMapping;
     bool operator==(const TrimTarget&) const = default;
 };
 // A grade node's effects shared by clips (Resolve's shared nodes): edited once, seen on each clip using it. Its id is
@@ -506,6 +510,7 @@ struct Send {
     bool preFader = false;
     bool muted = false;
     Param levelAuto;  // send level automation (dB), keyed in timeline frames and played in the track's mode
+    Param levelTrim;  // its trim (dB on top of the level; core/Automation.h), written in the track's trim modes
     bool operator==(const Send&) const = default;
 };
 
@@ -547,8 +552,11 @@ struct Track {
     Id output = 0;                // audio: the bus the track feeds, 0 = master
     SurroundPan surround;         // audio, in 5.1 and 7.1 sequences
     // Fader automation (core/Automation.h): volume (dB) and pan lanes keyed in timeline frames, and the
-    // AutomationMode (0 Off, 1 Read, 2 Write, 3 Latch, 4 Touch).
+    // AutomationMode (0 Off, 1 Read, 2 Write, 3 Latch, 4 Touch, 5 Trim Write, 6 Trim Latch, 7 Trim Touch).
     Param volumeAuto, panAuto;
+    // The fader's trim: an offset in dB played on top of the volume lane, written in the trim modes; its static value
+    // without keys.
+    Param volumeTrim;
     // Surround position lanes (x, y, z as in SurroundPan), keyed in timeline frames and played in the same mode: a
     // sound, or an ADM object, moving round the room.
     Param surroundXAuto, surroundYAuto, surroundZAuto;
@@ -580,6 +588,7 @@ struct Bus {
     SurroundPan surround;
     // Its fader, pan and mute automation (core/Automation.h), keyed in timeline frames, and its AutomationMode.
     Param volumeAuto, panAuto, muteAuto;
+    Param volumeTrim;  // its fader's trim, as a track's
     int automation = 1;
     bool operator==(const Bus&) const = default;
 };
@@ -662,6 +671,12 @@ struct Project {
     std::vector<std::string> soundCaptions;  // the sounds SDH captions describe (core/SdhCaptions.h); empty = the ready-made list
     std::vector<std::string> watchFolders;  // folders whose arriving media files are imported (app/EditorState)
     ProjectScript script;  // the screenplay and its lined coverage (core/ScriptCut.h)
+    // The version this project and a copy of it both started from (core/ProjectMerge.h), as project file JSON; null =
+    // none. A copy made for someone keeps it, so the two can be merged later. Shared: undo snapshots copy the pointer.
+    std::shared_ptr<const std::string> mergeBase;
+    // After a merge that gave the other copy's ids new ones here: their ids (as in their copy and the merge base) to
+    // this project's, so the next merge of that copy matches them up.
+    std::map<Id, Id> mergeIds;
     Id activeSequence = 0;
     Id nextId = 1;
     // Whether its media's stereo packing (MediaItem::stereo) has been read: false for a project saved before Montage

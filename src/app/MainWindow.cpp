@@ -19,6 +19,7 @@
 #include "Settings.h"
 
 #include "CompareDialog.h"
+#include "MergeDialog.h"
 
 #include "Keymap.h"
 #include "LoudnessReadout.h"
@@ -284,9 +285,13 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     });
     // The intelligibility lane and readout follow the playhead, the active sequence and its edits.
     connect(state_, &EditorState::playheadChanged, this, [this] { showIntelligibility(); });
-    connect(state_, &EditorState::sequenceSwitched, this, [this] { showIntelligibility(); });
+    connect(state_, &EditorState::sequenceSwitched, this, [this] {
+        showIntelligibility();
+        showLoudnessLane();
+    });
     connect(state_, &EditorState::projectChanged, this, [this] {
         if (const Sequence* s = state_->sequence(); s && intelligibility_.count(s->id)) showIntelligibility();
+        if (!loudnessRuns_.empty()) showLoudnessLane();
     });
     connect(program_, &PlaybackController::positionChanged, this, [this](FrameTime t) {
         state_->setPlayhead(t);
@@ -1126,6 +1131,16 @@ void MainWindow::buildMenus() {
         ProjectManagerDialog dlg(state_, this);
         if (dlg.exec() == QDialog::Accepted) runProjectManager(dlg.options());
     })->setObjectName(QStringLiteral("projectManager"));
+    add(file, tr("Save a Copy for Another Editor…"), QKeySequence(), [this] {
+        QString path = QFileDialog::getSaveFileName(this, tr("Save a Copy for Another Editor"),
+                                                    appSettings().value("lastProjectDir").toString() + "/" +
+                                                        QString::fromStdString(state_->project().name) + " copy.montage",
+                                                    tr("Montage projects (*.montage)"));
+        if (path.isEmpty()) return;
+        if (!path.endsWith(".montage")) path += ".montage";
+        saveCopyForAnotherEditor(path);
+    })->setObjectName(QStringLiteral("saveCopyForEditor"));
+    add(file, tr("Mer&ge Project…"), QKeySequence(), [this] { mergeProjectDialog(); })->setObjectName(QStringLiteral("mergeProject"));
     {
         QMenu* prod = file->addMenu(tr("Productio&n"));
         add(prod, tr("&New Production…"), QKeySequence(), [this] {
@@ -2090,6 +2105,47 @@ void MainWindow::buildMenus() {
             appSettings().setValue("intelligibility/preset", preset);
             analyseIntelligibility(preset);
         })->setObjectName(QStringLiteral("analyseIntelligibility"));
+    add(seqM, tr("Loudness &Report…"), QKeySequence(), [this] {
+            if (!state_->sequence()) return;
+            // (name, target, tolerance, dialogue, true peak ceiling, Leq(M) limit)
+            struct Standard {
+                QString name;
+                double target, tolerance;
+                bool dialogue;
+                double ceiling, leqm;
+            };
+            const std::vector<Standard> standards = {
+                {tr("EBU R128: -23 LUFS, -1 dBTP"), -23, 1, false, -1, 0},
+                {tr("ATSC A/85: -24 LKFS, -2 dBTP"), -24, 2, false, -2, 0},
+                {tr("Streaming: -14 LUFS, -1 dBTP"), -14, 1, false, -1, 0},
+                {tr("Dialogue: -27 LKFS, -2 dBTP"), -27, 2, true, -2, 0},
+                {tr("Cinema trailer: 85 Leq(M)"), 0, 1, false, 0, 85},
+                {tr("Cinema advertising: 82 Leq(M)"), 0, 1, false, 0, 82},
+                {tr("Measured only"), 0, 1, false, 0, 0}};
+            QStringList names;
+            for (const Standard& st : standards) names << st.name;
+            bool ok = false;
+            const QString picked = QInputDialog::getItem(this, tr("Loudness Report"), tr("Measure the sound against:"), names,
+                                                         std::clamp(appSettings().value("loudnessReport/standard", 0).toInt(), 0, int(names.size()) - 1),
+                                                         false, &ok);
+            if (!ok) return;
+            const int i = int(names.indexOf(picked));
+            appSettings().setValue("loudnessReport/standard", i);
+            QString path = QFileDialog::getSaveFileName(this, tr("Save Loudness Report"),
+                                                        QString::fromStdString(state_->sequence()->name) + ".loudness.pdf",
+                                                        tr("PDF (*.pdf)"));
+            if (path.isEmpty()) return;
+            if (path.endsWith(".pdf", Qt::CaseInsensitive)) path.chop(4);
+            LoudnessReportSpec spec;
+            spec.title = state_->sequence()->name;
+            spec.targetName = standards[size_t(i)].name.section(':', 0, 0).toStdString();
+            spec.target = standards[size_t(i)].target;
+            spec.tolerance = standards[size_t(i)].tolerance;
+            spec.dialogueGated = standards[size_t(i)].dialogue;
+            spec.peakCeiling = standards[size_t(i)].ceiling;
+            spec.leqmLimit = standards[size_t(i)].leqm;
+            loudnessReport(spec, path);
+        })->setObjectName(QStringLiteral("loudnessReport"));
     add(seqM, tr("Analyse HDR &Light Levels…"), QKeySequence(), [this] { analyseHdrLightLevels(); })->setObjectName(QStringLiteral("analyseHdrLightLevels"));
     add(seqM, tr("Next Marker"), QKeySequence("Shift+M"), [this] { jumpMarker(true); });
     add(seqM, tr("Previous Marker"), QKeySequence("Ctrl+Shift+M"), [this] { jumpMarker(false); });
@@ -3782,6 +3838,27 @@ void MainWindow::matchFrame() {
         return;
     }
     state_->message(tr("No video clip under the playhead"));
+}
+
+bool MainWindow::saveCopyForAnotherEditor(const QString& path) {
+    Project copy = state_->project();
+    setMergeBase(copy, copy);
+    std::string err;
+    if (!saveProject(copy, path.toStdString(), &err)) {
+        QMessageBox::warning(this, tr("Save a Copy for Another Editor"), QString::fromStdString(err.empty() ? "Cannot save the copy" : err));
+        return false;
+    }
+    statusBar()->showMessage(tr("Saved a copy to %1: Merge Project brings its changes back").arg(QDir::toNativeSeparators(path)), 6000);
+    return true;
+}
+
+MergeDialog* MainWindow::mergeProjectDialog(const QString& theirs) {
+    if (!state_->sequence()) return nullptr;
+    auto* dlg = new MergeDialog(state_, this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    if (!theirs.isEmpty()) dlg->setTheirs(theirs);
+    dlg->show();
+    return dlg;
 }
 
 CompareDialog* MainWindow::compareWith(Id before) {
@@ -5881,6 +5958,69 @@ double MainWindow::analyseIntelligibility(const QString& preset) {
     return r.average;
 }
 
+bool MainWindow::loudnessReport(const LoudnessReportSpec& spec, const QString& base) {
+    const Sequence* s = state_->sequence();
+    if (!s) return false;
+    const Project project = state_->project();
+    const Sequence seq = *s;
+    const uint64_t revision = state_->history().revision(), generation = state_->projectGeneration();
+    DialogueLoudnessOptions o;
+    o.layout = true;
+    o.leqm = true;
+    o.log = true;
+    DialogueLoudness d;
+    if (!runWithProgress(this, state_, tr("Measuring the loudness…"), [&](const auto& progress, const auto* cancel, std::string* e) {
+            d = measureDialogueLoudness(project, seq, o, progress, cancel, e);
+            return !d.log.empty() && (!e || e->empty());
+        }))
+        return false;
+    if (generation != state_->projectGeneration()) return false;
+    loudnessRuns_[seq.id] = {d, spec, revision, generation};
+    showLoudnessLane();
+    QString written;
+    if (!base.isEmpty()) {
+        std::string e;
+        if (!writeLoudnessCsv((base + ".csv").toStdString(), d, spec, seq, &e) || !writeLoudnessPdf((base + ".pdf").toStdString(), d, spec, seq, &e)) {
+            state_->message(tr("Loudness report not written: %1").arg(QString::fromStdString(e)), 8000);
+            return false;
+        }
+        written = tr("; report in %1").arg(QDir::toNativeSeparators(base + ".pdf"));
+    }
+    const size_t overs = loudnessOvers(d, spec).size();
+    state_->message(tr("Integrated %1 LUFS, range %2 LU, true peak %3 dBTP, Leq(M) %4; %n stretch(es) over a limit%5", "", int(overs))
+                        .arg(d.programme, 0, 'f', 1).arg(d.range, 0, 'f', 1).arg(d.truePeak, 0, 'f', 1).arg(d.leqm, 0, 'f', 1).arg(written),
+                    10000);
+    return true;
+}
+
+void MainWindow::showLoudnessLane() {
+    std::erase_if(loudnessRuns_, [this](const auto& run) { return run.second.generation != state_->projectGeneration(); });
+    const Sequence* s = state_->sequence();
+    const auto it = s ? loudnessRuns_.find(s->id) : loudnessRuns_.end();
+    if (it == loudnessRuns_.end()) {
+        timeline_->setLoudnessLane({}, false);
+        return;
+    }
+    const LoudnessRun& run = it->second;
+    const double fps = s->fpsValue();
+    // Each 100 ms step where there is sound, coloured by the worst stretch over a limit it falls in.
+    const std::vector<LoudnessOver> overs = loudnessOvers(run.result, run.spec);
+    std::vector<TimelineWidget::IntelligibilitySpan> spans;
+    double prev = run.result.log.empty() ? 0 : run.result.log.front().t - 0.1;
+    for (const LoudnessLogPoint& pt : run.result.log) {
+        const double from = prev;
+        prev = pt.t;
+        if (pt.momentary < -70 && pt.shortTerm < -70) continue;
+        int st = 0;
+        for (const LoudnessOver& v : overs)
+            if (from < v.to - 1e-9 && pt.t > v.from + 1e-9) st = std::max(st, v.truePeak ? 2 : 1);
+        const FrameTime a = FrameTime(std::floor(from * fps + 1e-6)), e = std::max(a + 1, FrameTime(std::ceil(pt.t * fps - 1e-6)));
+        if (!spans.empty() && spans.back().status == st && spans.back().end >= a) spans.back().end = std::max(spans.back().end, e);
+        else spans.push_back({a, e, st});
+    }
+    timeline_->setLoudnessLane(std::move(spans), run.revision != state_->history().revision());
+}
+
 void MainWindow::showIntelligibility() {
     std::erase_if(intelligibility_, [this](const auto& run) { return run.second.generation != state_->projectGeneration(); });
     const Sequence* s = state_->sequence();
@@ -6734,6 +6874,8 @@ QString MainWindow::exportDcpTo(const QString& parent, const DcpSettings& settin
     }
     QStringList found;
     for (const std::string& i : issues) found << QString::fromStdString(i);
+    if (result.overLoudnessLimit())
+        found << tr("its sound is %1 Leq(M), over the %2 its kind is held to").arg(result.leqm, 0, 'f', 1).arg(result.leqmLimit, 0, 'f', 0);
     if (problems) *problems = found;
     const QString folder = QString::fromStdString(result.folder);
     if (!found.isEmpty())
@@ -6990,16 +7132,17 @@ void MainWindow::exportImfDialog() {
         state_->message(tr("Nothing to export"));
         return;
     }
-    if (!openJpegAvailable()) {
-        state_->message(tr("This build of Montage cannot make IMF masters: it was built without OpenJPEG 2.5"), 8000);
+    if (!openJpegAvailable() && !exrAvailable()) {
+        state_->message(tr("This build of Montage cannot make IMF masters: it was built without OpenJPEG 2.5 and OpenEXR"), 8000);
         return;
     }
     QDialog dlg(this);
     dlg.setObjectName(QStringLiteral("exportImfDialog"));
     dlg.setWindowTitle(tr("Export IMF Master"));
     auto* form = new QFormLayout(&dlg);
-    auto* intro = new QLabel(tr("An IMF (Interoperable Master Format) package of %1, Application #2E, as streaming services and broadcasters "
-                                "ask for: JPEG 2000 pictures (lossless by default), 24-bit sound with channel labels, checked when it is done.")
+    auto* intro = new QLabel(tr("An IMF (Interoperable Master Format) package of %1: a delivery master (Application #2E) as streaming services "
+                                "and broadcasters ask for, JPEG 2000 pictures (lossless by default), or an archival master (Application #5), "
+                                "the pictures in ACES; 24-bit sound with channel labels, checked when it is done.")
                                  .arg(QString::fromStdString(s->name)),
                              &dlg);
     intro->setWordWrap(true);
@@ -7017,6 +7160,20 @@ void MainWindow::exportImfDialog() {
                                                                              {tr("Promotion"), "promotion"}, {tr("Test"), "test"}})
         kind->addItem(label, value);
     form->addRow(tr("Kind:"), kind);
+    // Application #2E for delivery, or #5 for the archive: the pictures in ACES, with the output transform named.
+    auto* application = new QComboBox(&dlg);
+    application->setObjectName(QStringLiteral("imfApplication"));
+    if (openJpegAvailable()) application->addItem(tr("Delivery master (Application #2E, JPEG 2000)"), 2);
+    if (exrAvailable()) application->addItem(tr("Archival master (Application #5, ACES OpenEXR)"), 5);
+    form->addRow(tr("Master:"), application);
+    auto* graded = new QComboBox(&dlg);
+    graded->setObjectName(QStringLiteral("imfGraded"));
+    graded->addItem(tr("Graded"), true);
+    graded->addItem(tr("Ungraded (the shots before the grade)"), false);
+    form->addRow(tr("Grade:"), graded);
+    auto* target = new QCheckBox(tr("Add the frame at the playhead as it is delivered, as a reference still"), &dlg);
+    target->setObjectName(QStringLiteral("imfTargetFrame"));
+    form->addRow(tr("Target frame:"), target);
     auto* size = new QComboBox(&dlg);
     size->setObjectName(QStringLiteral("imfSize"));
     size->addItem(tr("As the sequence (%1 x %2)").arg(s->width).arg(s->height), "sequence");
@@ -7135,11 +7292,17 @@ void MainWindow::exportImfDialog() {
     form->addRow(tr("Mastered from:"), original);
     auto syncSupplemental = [=] {
         for (QWidget* w : {static_cast<QWidget*>(earlier), static_cast<QWidget*>(browseEarlier), static_cast<QWidget*>(original)}) w->setEnabled(supplemental->isChecked());
-        // (a supplemental keeps the earlier picture's size, colour, depth and coding)
-        for (QWidget* w : {static_cast<QWidget*>(size), static_cast<QWidget*>(colour), static_cast<QWidget*>(bits), static_cast<QWidget*>(coding)})
-            w->setEnabled(!supplemental->isChecked());
+        // (a supplemental keeps the earlier picture's size, colour, depth and coding; an archival master's pictures are
+        // ACES, uncoded)
+        const bool aces = application->currentData().toInt() == 5;
+        size->setEnabled(!supplemental->isChecked());
+        for (QWidget* w : {static_cast<QWidget*>(colour), static_cast<QWidget*>(bits), static_cast<QWidget*>(coding)})
+            w->setEnabled(!supplemental->isChecked() && !aces);
+        graded->setEnabled(aces);
+        target->setEnabled(aces);
     };
     connect(supplemental, &QCheckBox::toggled, &dlg, syncSupplemental);
+    connect(application, &QComboBox::currentIndexChanged, &dlg, syncSupplemental);
     syncSupplemental();
     auto* issuer = new QLineEdit(appSettings().value(QStringLiteral("imf/issuer"), QStringLiteral("Montage")).toString(), &dlg);
     issuer->setObjectName(QStringLiteral("imfIssuer"));
@@ -7179,6 +7342,11 @@ void MainWindow::exportImfDialog() {
     ImfSettings st;
     st.title = title->text().trimmed().toStdString();
     st.kind = kind->currentData().toString().toStdString();
+    st.application = application->currentData().toInt();
+    if (st.application == 5) {
+        st.graded = graded->currentData().toBool();
+        if (target->isChecked()) st.targetFrames = {state_->playhead()};
+    }
     st.size = size->currentData().toString().toStdString();
     st.colour = colour->currentData().toString().toStdString();
     st.bits = bits->currentData().toInt();

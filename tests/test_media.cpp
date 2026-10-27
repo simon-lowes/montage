@@ -2,6 +2,9 @@
 #include <clocale>
 #include <QtTest>
 #include <QElapsedTimer>
+#ifdef Q_OS_UNIX
+#include <sys/stat.h>
+#endif
 #include <QCryptographicHash>
 #include <QtEndian>
 #include <QPainter>
@@ -54,8 +57,10 @@
 #include "core/MediaLog.h"
 #include "core/Multicam.h"
 #include "core/Effects.h"
+#include "render/MeshWarp.h"
 #include "core/Expression.h"
 #include "core/ProjectIO.h"
+#include "core/ProjectMerge.h"
 #include "render/GrainMatch.h"
 #include "render/Expressions.h"
 #include "render/Particles.h"
@@ -226,6 +231,7 @@
 #include "core/Xlsx.h"
 #include "core/FilmCount.h"
 #include "render/Compositor.h"
+#include "render/Titles.h"
 #include "render/Exporter.h"
 #include "render/RenderFarm.h"
 #include "core/ColorGroups.h"
@@ -238,6 +244,8 @@
 #include "core/Slate.h"
 #include "render/PaperEdit.h"
 #include "render/QualityCheck.h"
+#include "render/LoudnessReport.h"
+#include "render/Dcp.h"
 #include "render/SdhDraft.h"
 #include "render/DialogueLoudness.h"
 #include "render/ProjectManager.h"
@@ -2660,6 +2668,70 @@ private slots:
         QVERIFY2(back, err.c_str());
         QVERIFY(std::fabs(back->samples[size_t(12000) * 2]) < 0.05 * base);  // 0.25 s: -45 dB
         QVERIFY(std::fabs(back->samples[size_t(72000) * 2 + 1]) < 1e-3);     // 1.5 s: hard left
+    }
+
+    void trimmedMixExportsAsCoalesced() {
+        // A steady signal on A1 under a moving volume lane and a trim, sent to a bus with a trim of its own: exported,
+        // the mix is the same as with every trim folded into the volume lanes.
+        const std::string wav = path("trimsrc.wav");
+        writeWav(wav, 48000, 2.0, 0.5f, 0.3f);
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.fps = Rational{30, 1};
+        s.sampleRate = 48000;
+        MediaItem m = probeOrFail(p, wav);
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        Bus ret;
+        ret.id = p.newId();
+        ret.name = "Return";
+        ret.automation = int(AutomationMode::TrimLatch);
+        ret.volumeAuto.addKey(0, -6);
+        ret.volumeAuto.addKey(60, 0);
+        ret.volumeTrim.addKey(15, 0);
+        ret.volumeTrim.addKey(30, -4);
+        s.buses.push_back(ret);
+        QVERIFY(edit::setSend(s, 0, ret.id, -8, false).ok);
+        Track& a1 = s.audioTracks[0];
+        a1.automation = int(AutomationMode::TrimTouch);
+        a1.volumeAuto.addKey(0, -20);
+        a1.volumeAuto.addKey(45, -2);
+        a1.volumeTrim.addKey(10, 0);
+        a1.volumeTrim.addKey(20, -6);
+        a1.volumeTrim.addKey(40, -6);
+        a1.volumeTrim.addKey(50, 3);
+        a1.sends[0].levelTrim.addKey(5, 0);
+        a1.sends[0].levelTrim.addKey(25, -10);
+        std::string err;
+        auto render = [&](const std::string& name) -> AudioBufferPtr {
+            ExportSettings st;
+            st.path = path(name.c_str());
+            st.videoCodec = "none";
+            st.audioCodec = "pcm_s24le";
+            if (!exportSequence(p, s, st, nullptr, nullptr, &err)) return nullptr;
+            return decodeAudio(st.path, 48000, &err);
+        };
+        const AudioBufferPtr trimmed = render("trimmed.wav");
+        QVERIFY2(trimmed, err.c_str());
+        // Folded in: at frame 30 the volume lane is 6 dB down, as the trim had it.
+        const Sequence before = s;
+        QVERIFY(coalesceTrim(s.audioTracks[0]) && coalesceTrim(s.buses[0]));
+        QVERIFY(!hasTrim(s.audioTracks[0]) && !hasTrim(s.buses[0]));
+        QCOMPARE(s.audioTracks[0].volumeAuto.at(30), before.audioTracks[0].volumeAuto.at(30) - 6);
+        const AudioBufferPtr coalesced = render("coalesced.wav");
+        QVERIFY2(coalesced, err.c_str());
+        QCOMPARE(coalesced->samples.size(), trimmed->samples.size());
+        QVERIFY(trimmed->samples.size() > 48000);
+        double worst = 0;
+        size_t differ = 0;
+        for (size_t i = 0; i < trimmed->samples.size(); ++i) {
+            const double d = std::fabs(double(trimmed->samples[i]) - double(coalesced->samples[i]));
+            worst = std::max(worst, d);
+            differ += d > 0 ? 1 : 0;
+        }
+        // Sample for sample (to within one 24-bit step, where the two sums of dB round apart).
+        QVERIFY2(worst <= 1.0 / 8388608 + 1e-12, qPrintable(QString("%1 (%2 samples differ)").arg(worst).arg(differ)));
+        QVERIFY2(differ * 1000 < trimmed->samples.size(), qPrintable(QString::number(differ)));
     }
 
     void auxSendsAndMixerAutomation() {
@@ -5466,6 +5538,57 @@ private slots:
         Project reloaded;
         QVERIFY(loadProject(project.toStdString(), reloaded));
         QCOMPARE(reloaded.active()->videoTracks[0].clips.at(0).effects[0].s("network"), network2.toStdString());
+    }
+
+    void learnedEffectLimits() {
+        // Examples too large to hold are cut, at full size, to where the frame was worked on.
+        learn::Pair big;
+        big.before = Image(400, 300);
+        big.after = Image(400, 300);
+        for (int y = 200; y < 260; ++y)
+            for (int x = 300; x < 380; ++x) big.after.at(x, y)[0] = 1;
+        fitLearningPair(big, 120 * 90);
+        QVERIFY(big.before.width * big.before.height <= 120 * 90 && big.before.width >= 100);
+        QCOMPARE(big.after.width, big.before.width);
+        QCOMPARE(big.after.height, big.before.height);
+        double changed = 0;
+        for (float v : big.after.px) changed += v;
+        QVERIFY2(changed > 0.7 * 60 * 80, qPrintable(QString::number(changed)));  // (most of the worked-on patch kept)
+        learn::Pair small;
+        small.before = small.after = Image(64, 48);
+        fitLearningPair(small, 120 * 90);
+        QCOMPARE(small.before.width, 64);
+        // Together the examples stay near a gigabyte: a minute's markers on 8K is not 60 whole frames.
+        QVERIFY(learningPixelsEach(60) * 60 * 32 <= int64_t(1) << 30);
+        QVERIFY(learningPixelsEach(60) < 7680 * 4320);
+        QCOMPARE(learningPixelsEach(1), int64_t(32) << 20);
+        // A network trained before the project was saved goes beside it when it is.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        Clip clip = makeGeneratorClip(p, "bars", 50);
+        Effect learned = makeEffect(p, "learned_effect");
+        const std::string temporary = newLearnedNetworkPath("", p, clip);
+        QVERIFY(QFileInfo(QString::fromStdString(temporary)).absolutePath().startsWith(QDir::tempPath()));
+        {
+            QFile f(QString::fromStdString(temporary));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write("network");
+        }
+        learned.strings["network"] = temporary;
+        clip.effects.push_back(learned);
+        s.videoTracks[0].clips.push_back(clip);
+        const std::string project = path("kept.montage");
+        Project mine = p;
+        const auto moved = keepLearnedNetworks(p, project);
+        QCOMPARE(moved.size(), size_t(1));
+        const std::string kept = p.active()->videoTracks[0].clips.at(0).effects.at(0).s("network");
+        QVERIFY2(QString::fromStdString(kept).contains("kept Learned Effects"), kept.c_str());
+        QVERIFY(QFileInfo::exists(QString::fromStdString(kept)));
+        repointLearnedNetworks(mine, moved);
+        QCOMPARE(mine.active()->videoTracks[0].clips.at(0).effects.at(0).s("network"), kept);
+        // Saved again: nothing more to keep.
+        QVERIFY(keepLearnedNetworks(p, project).empty());
+        QFile::remove(QString::fromStdString(temporary));
     }
 
     void mcpKeyScreen() {
@@ -9664,6 +9787,93 @@ private slots:
         QVERIFY(res.value("isError").toBool());  // (no clips)
     }
 
+    void bt2446OverMcp() {
+        // An HDR master with an SDR still in it and a grey shot: the still brought into HDR by BT.2446 Method C, an SDR
+        // trim target and an SDR render made with Method A.
+        const QString still = QString::fromStdString(path("bt2446/still.png"));
+        QDir().mkpath(QFileInfo(still).absolutePath());
+        {
+            QImage img(64, 36, QImage::Format_RGB32);
+            img.fill(QColor(230, 230, 230));
+            QVERIFY(img.save(still));
+        }
+        Project q = makeDefaultProject();
+        Sequence& seq = *q.active();
+        seq.width = 64;
+        seq.height = 36;
+        seq.colorSpace = "rec2100pq";
+        MediaItem m;
+        QVERIFY(probeMedia(still.toStdString(), m));
+        m.id = q.newId();
+        q.media.push_back(m);
+        Clip grey = makeGeneratorClip(q, "color", 10);
+        grey.name = "Grey";
+        for (const char* k : {"color.r", "color.g", "color.b"}) grey.generator.params[k] = 0.5;
+        edit::overwrite(q, seq, {TrackKind::Video, 0}, grey);
+        const QString project = QString::fromStdString(path("bt2446/film.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+
+        // The still: expanded by Method C, saved with the project; a method Montage lacks refused; reset puts it back.
+        QJsonObject r = call("montage_interpret_media", {{"media", "still.png"}, {"sdr_expand", "bt2446c"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("media").toArray().at(0).toObject().value("sdr_expand").toString(), QString("bt2446c"));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.media.at(0).sdrExpand, std::string("bt2446c"));
+        QVERIFY(call("montage_interpret_media", {{"media", "still.png"}, {"sdr_expand", "bt2446b"}}).value("isError").toBool());
+        r = call("montage_interpret_media", {{"media", "still.png"}, {"reset", true}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(loadProject(project.toStdString(), back) && back.media.at(0).sdrExpand.empty());
+
+        // An SDR trim target by Method A, listed, then changed to C; an HDR target takes none.
+        r = call("montage_trim", {{"action", "add_target"}, {"target", "sdr"}, {"tone_mapping", "bt2446a"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call("montage_trim", {});
+        QCOMPARE(r.value("structuredContent").toObject().value("targets").toArray().at(0).toObject().value("tone_mapping").toString(), QString("bt2446a"));
+        r = call("montage_trim", {{"action", "tone_mapping"}, {"target", "sdr"}, {"tone_mapping", "bt2446c"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->trimTargets.at(0).toneMapping, std::string("bt2446c"));
+        QVERIFY(call("montage_trim", {{"action", "add_target"}, {"target", "hlg"}, {"tone_mapping", "bt2446a"}}).value("isError").toBool());
+        QVERIFY(call("montage_trim", {{"action", "add_target"}, {"color_space", "rec709+bt2446a"}}).value("isError").toBool());
+
+        // The master delivered in Rec.709, by Montage's mapping (the grey as it was made) and by Method A (darker: its
+        // SDR white is 1000 nits).
+        auto centre = [&](const QString& file) {
+            VideoDecoder dec;
+            double v = -1;
+            if (!dec.open(file.toStdString())) return v;
+            const Frame16Ptr fr = dec.frameAt(0);
+            if (fr) v = toImage(*fr).at(32, 18)[1];
+            return v;
+        };
+        const QString montage = QString::fromStdString(path("bt2446/montage.mp4")), methodA = QString::fromStdString(path("bt2446/a.mp4"));
+        r = call("montage_render", {{"output", montage}, {"preset", "H.264 - Fast Draft"}, {"color_space", "rec709"}, {"in", 0}, {"out", 0.2}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call("montage_render", {{"output", methodA}, {"preset", "H.264 - Fast Draft"}, {"color_space", "rec709"}, {"tone_mapping", "bt2446a"},
+                                    {"in", 0}, {"out", 0.2}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const double byMontage = centre(montage), byA = centre(methodA);
+        QVERIFY2(byMontage > 0 && byA > 0 && std::fabs(byMontage - 0.5) < 0.01 && byA < byMontage - 0.05, qPrintable(QString("%1 %2").arg(byMontage).arg(byA)));
+        QVERIFY(call("montage_render", {{"output", methodA}, {"preset", "H.264 - Fast Draft"}, {"tone_mapping", "bt2446b"}}).value("isError").toBool());
+        QVERIFY(call("montage_render", {{"output", methodA}, {"preset", "H.264 - Fast Draft"}, {"color_space", "rec709+bt2446a"}}).value("isError").toBool());
+        // (an HDR delivery, or a trim target, takes none)
+        QVERIFY(call("montage_render", {{"output", methodA}, {"preset", "H.264 - Fast Draft"}, {"tone_mapping", "bt2446a"}}).value("isError").toBool());
+        QVERIFY(call("montage_render", {{"output", methodA}, {"preset", "H.264 - Fast Draft"}, {"trim_target", "sdr"}, {"color_space", "rec709"},
+                                        {"tone_mapping", "bt2446a"}}).value("isError").toBool());
+    }
+
     void trimPassesOverMcp() {
         // An HDR master with two shots: trim targets added, a shot trimmed, the SDR pass rendered.
         Project q = makeDefaultProject();
@@ -10228,6 +10438,313 @@ private slots:
         r.reset();
         QCOMPARE(r.seconds(), 0.0);
         QVERIFY(r.momentary() <= -70);
+    }
+
+    void cinemaLoudness() {
+        const int rate = 48000;
+        auto sine = [&](double hz, double amp, double seconds, int channels = 1, int on = 0) {
+            std::vector<float> v(size_t(rate * seconds) * size_t(channels), 0.0f);
+            for (size_t i = 0; i < v.size() / size_t(channels); ++i)
+                v[i * size_t(channels) + size_t(on)] = float(amp * std::sin(2 * M_PI * hz * double(i) / rate));
+            return v;
+        };
+        auto leqm = [&](const std::vector<float>& v, int channels = 1, const double* gains = nullptr) {
+            LeqMMeter m(rate, channels, gains);
+            m.add(v.data(), int64_t(v.size()) / channels);
+            return m.leqm();
+        };
+        // The M weighting: 0 dB at 2 kHz, ISO 21727's table elsewhere (ITU-R 468 lowered 5.6 dB).
+        QVERIFY(std::fabs(LeqMMeter::weightingDb(2000)) < 0.05);
+        QVERIFY(std::fabs(LeqMMeter::weightingDb(1000) + 5.6) < 0.1);
+        QVERIFY(std::fabs(LeqMMeter::weightingDb(6300) - 6.6) < 0.1);
+        QVERIFY(std::fabs(LeqMMeter::weightingDb(100) + 25.4) < 0.2);
+        // A 2 kHz sine peaking at -20 dBFS reads 85 (the cinema's reference); the scale is the sine's energy + 108.01.
+        const double at2k = leqm(sine(2000, 0.1, 10));
+        QVERIFY2(std::fabs(at2k - 85.0) < 0.05, qPrintable(QString::number(at2k)));
+        // Tones at 1 kHz and 6.3 kHz at the same level differ by the weighting's difference (12.2 dB).
+        const double at1k = leqm(sine(1000, 0.1, 10)), at6k = leqm(sine(6300, 0.1, 10));
+        const double want = LeqMMeter::weightingDb(6300) - LeqMMeter::weightingDb(1000);
+        QVERIFY2(std::fabs((at6k - at1k) - want) < 0.1, qPrintable(QString("%1 vs %2").arg(at6k - at1k).arg(want)));
+        QVERIFY(std::fabs(at1k - (85.0 + LeqMMeter::weightingDb(1000))) < 0.1);
+        // Fed in uneven pieces, the same; shorter than the filter (a fifth of a second), the same level.
+        {
+            const auto v = sine(2000, 0.1, 10);
+            LeqMMeter m(rate, 1);
+            size_t at = 0;
+            for (size_t piece : {1u, 777u, 20000u, 3u, 123456u}) {
+                m.add(v.data() + at, int64_t(piece));
+                at += piece;
+            }
+            m.add(v.data() + at, int64_t(v.size() - at));
+            QVERIFY2(std::fabs(m.leqm() - at2k) < 1e-6, qPrintable(QString::number(m.leqm() - at2k)));
+            QVERIFY(std::fabs(m.seconds() - 10) < 1e-9);
+            QVERIFY(std::fabs(leqm(sine(2000, 0.1, 0.2)) - 85.0) < 0.1);
+        }
+        // Channels add as energy: the same tone in two channels is 3 dB up; a surround at the cinema's -3 dB adds half.
+        {
+            std::vector<float> two = sine(2000, 0.1, 5, 2, 0);
+            for (size_t i = 0; i < two.size(); i += 2) two[i + 1] = two[i];
+            QVERIFY(std::fabs(leqm(two, 2) - (at2k + 3.0103)) < 0.05);
+            const double gains[2] = {1.0, std::pow(10.0, -3.0 / 20)};
+            QVERIFY(std::fabs(leqm(two, 2, gains) - (at2k + 10 * std::log10(1.5))) < 0.05);
+        }
+        QCOMPARE(leqm(std::vector<float>(size_t(rate), 0.0f)), 0.0);
+
+        // Speech (JFK) and pink noise, as leqm-nrt reads them when it is at hand (MONTAGE_TEST_LEQM). Its own filter is a
+        // fifth-order fit to the M curve that runs up to 0.4 dB under it around 1 kHz: pink noise agrees within
+        // 0.1 dB, speech within 0.5.
+        std::string err;
+        AudioBufferPtr jfk = decodeAudio(MONTAGE_TEST_DATA_DIR "/jfk.wav", rate, &err);
+        QVERIFY2(jfk, err.c_str());
+        std::vector<float> pink(size_t(rate) * 20);
+        {
+            // (Voss-McCartney: 16 rows of white noise, each held twice as long as the last)
+            std::mt19937 gen(7);
+            std::uniform_real_distribution<float> u(-1, 1);
+            std::array<float, 16> rows{};
+            float sum = 0;
+            for (size_t i = 0; i < pink.size(); ++i) {
+                for (size_t r = 0; r < rows.size(); ++r)
+                    if (i % (size_t(1) << r) == 0) {
+                        sum -= rows[r];
+                        rows[r] = u(gen);
+                        sum += rows[r];
+                    }
+                pink[i] = sum + u(gen);
+            }
+            double ss = 0;
+            for (float v : pink) ss += double(v) * v;
+            const float g = float(0.1 / std::sqrt(ss / double(pink.size())));  // -20 dBFS RMS
+            for (float& v : pink) v *= g;
+        }
+        const QByteArray leqmNrt = qgetenv("MONTAGE_TEST_LEQM");
+        if (leqmNrt.isEmpty()) return;
+        auto writeFloatWav = [](const std::string& file, const std::vector<float>& v, int channels, int r) {
+            QFile f(QString::fromStdString(file));
+            if (!f.open(QIODevice::WriteOnly)) return false;
+            QDataStream out(&f);
+            out.setByteOrder(QDataStream::LittleEndian);
+            const quint32 bytes = quint32(v.size() * 4);
+            f.write("RIFF");
+            out << quint32(36 + bytes);
+            f.write("WAVEfmt ");
+            out << quint32(16) << quint16(3) << quint16(channels) << quint32(r) << quint32(r * channels * 4) << quint16(channels * 4) << quint16(32);
+            f.write("data");
+            out << bytes;
+            f.write(reinterpret_cast<const char*>(v.data()), qint64(bytes));
+            return true;
+        };
+        auto theirs = [&](const std::vector<float>& v, int channels) {
+            const std::string file = path(("leqm-" + std::to_string(v.size()) + "-" + std::to_string(channels) + ".wav").c_str());
+            if (!writeFloatWav(file, v, channels, rate)) return -1.0;
+            QProcess run;
+            run.start(QString::fromLocal8Bit(leqmNrt), {QString::fromStdString(file)});
+            if (!run.waitForFinished(120000)) return -1.0;
+            const QString said = QString::fromLocal8Bit(run.readAllStandardOutput());
+            const QRegularExpressionMatch m = QRegularExpression("Leq\\(M\\):\\s*([0-9.]+)").match(said);
+            return m.hasMatch() ? m.captured(1).toDouble() : -1.0;
+        };
+        const double pinkTheirs = theirs(pink, 1);
+        QVERIFY2(std::fabs(leqm(pink) - pinkTheirs) < 0.1, qPrintable(QString("%1 vs %2").arg(leqm(pink)).arg(pinkTheirs)));
+        const double speechTheirs = theirs(jfk->samples, 2), speechOurs = leqm(jfk->samples, 2);
+        QVERIFY2(std::fabs(speechOurs - speechTheirs) < 0.5, qPrintable(QString("%1 vs %2").arg(speechOurs).arg(speechTheirs)));
+        // In 5.1, with leqm-nrt's calibration (surrounds 3 dB down): speech in the centre, pink noise in the surrounds.
+        std::vector<float> mix(size_t(jfk->frames()) * 6, 0.0f);
+        for (int64_t i = 0; i < jfk->frames(); ++i) {
+            mix[size_t(i) * 6 + 2] = jfk->samples[size_t(i) * 2];
+            mix[size_t(i) * 6 + 4] = mix[size_t(i) * 6 + 5] = 0.5f * pink[size_t(i) % pink.size()];
+        }
+        const double surround[6] = {1, 1, 1, 1, std::pow(10.0, -3.0 / 20), std::pow(10.0, -3.0 / 20)};
+        const double mixTheirs = theirs(mix, 6), mixOurs = leqm(mix, 6, surround);
+        QVERIFY2(std::fabs(mixOurs - mixTheirs) < 0.5, qPrintable(QString("%1 vs %2").arg(mixOurs).arg(mixTheirs)));
+    }
+
+    void cinemaLoudnessDelivery() {
+        const int rate = 48000;
+        // EBU Tech 3341's first two signals: a stereo 1 kHz sine at -23 and at -33 dBFS reads that in momentary and
+        // short-term loudness (within 0.1 LU) once the windows are full.
+        for (const double level : {-23.0, -33.0}) {
+            const float amp = float(std::pow(10.0, level / 20));
+            std::vector<float> v(size_t(rate) * 20 * 2);
+            for (size_t i = 0; i < v.size() / 2; ++i) v[i * 2] = v[i * 2 + 1] = amp * float(std::sin(2 * M_PI * 1000 * double(i) / rate));
+            LoudnessMeter m(rate);
+            m.add(v.data(), int64_t(v.size() / 2));
+            QCOMPARE(m.steps(), size_t(200));
+            for (size_t i = 3; i < m.steps(); ++i) QVERIFY2(std::fabs(m.momentaryAt(i) - level) < 0.1, qPrintable(QString::number(m.momentaryAt(i))));
+            for (size_t i = 29; i < m.steps(); ++i) QVERIFY2(std::fabs(m.shortTermAt(i) - level) < 0.1, qPrintable(QString::number(m.shortTermAt(i))));
+            QVERIFY2(std::fabs(m.truePeakAt(100) - level) < 0.2, qPrintable(QString::number(m.truePeakAt(100))));
+        }
+        QCOMPARE(dcpLeqmLimit("trailer"), 85.0);
+        QCOMPARE(dcpLeqmLimit("teaser"), 85.0);
+        QCOMPARE(dcpLeqmLimit("advertisement"), 82.0);
+        QCOMPARE(dcpLeqmLimit("feature"), 0.0);
+        QCOMPARE(loudnessReportBase("/a/b/film.mov"), std::string("/a/b/film.loudness"));
+        QCOMPARE(loudnessReportBase("/a/b.c/frames_%05d.png"), std::string("/a/b.c/frames.loudness"));
+
+        // In 5.1: JFK's speech (Dialogue), then 8 s of quiet music only, then the speech again. The dialogue's loudness
+        // range leaves the music out, so it is narrower than the whole programme's.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.audioLayout = "5.1";
+        MediaItem jfk = probeOrFail(p, MONTAGE_TEST_DATA_DIR "/jfk.wav");
+        p.media.push_back(jfk);
+        QVERIFY(edit::placeMedia(p, s, jfk.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const FrameTime speechEnd = s.duration();
+        const double fps = s.fpsValue();
+        std::vector<float> music(size_t(rate) * 8 * 2);
+        {
+            std::mt19937 gen(3);
+            std::uniform_real_distribution<float> u(-1, 1);
+            for (size_t i = 0; i < music.size() / 2; ++i)
+                music[i * 2] = music[i * 2 + 1] = 0.05f * float(std::sin(2 * M_PI * 330 * double(i) / rate)) + 0.025f * u(gen);
+        }
+        std::string err;
+        QVERIFY2(writeStereoWav(path("cinema-music.wav"), music, rate, &err), err.c_str());
+        MediaItem mus = probeOrFail(p, path("cinema-music.wav"));
+        p.media.push_back(mus);
+        QVERIFY(edit::placeMedia(p, s, mus.id, speechEnd, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 1}, false).ok);
+        const FrameTime secondSpeech = s.duration();
+        QVERIFY(edit::placeMedia(p, s, jfk.id, secondSpeech, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        for (Clip& c : s.audioTracks[0].clips) c.role = "Dialogue";
+        s.audioTracks[1].clips.front().role = "Music";
+        DialogueLoudnessOptions o;
+        o.layout = true;
+        o.leqm = true;
+        o.log = true;
+        o.gate = SpeechGate::Roles;
+        const DialogueLoudness d = measureDialogueLoudness(p, s, o, {}, nullptr, &err);
+        const QString said = QString::fromStdString(describeDialogueLoudness(d)) +
+                             QStringLiteral(" range %1 dialogue %2 Leq(M) %3").arg(d.range).arg(d.dialogueRange).arg(d.leqm);
+        QVERIFY2(d.valid && err.empty(), qPrintable(said + QString::fromStdString(err)));
+        QVERIFY2(d.dialogueRange > 0 && d.dialogueRange < d.range - 2, qPrintable(said));
+        QVERIFY2(d.leqm > 60 && d.leqm < 100, qPrintable(said));
+        const double seconds = double(s.duration()) / fps;
+        QVERIFY2(std::fabs(double(d.log.size()) - seconds * 10) < 3, qPrintable(QString::number(d.log.size())));
+        QVERIFY(std::any_of(d.log.begin(), d.log.begin() + 30, [](const LoudnessLogPoint& pt) { return pt.speech; }));
+        QVERIFY(!d.log[size_t((double(speechEnd) / fps + 4) * 10)].speech);
+        // Its report against -31 LKFS of dialogue: the music is over it too but is not dialogue, so nothing of it is
+        // listed; against the programme's -31 LUFS it is; a ceiling under its peaks lists those.
+        LoudnessReportSpec spec;
+        spec.title = "Cinema test";
+        spec.target = -31;
+        spec.tolerance = 1;
+        spec.dialogueGated = true;
+        const double musicFrom = double(speechEnd) / fps, musicTo = double(secondSpeech) / fps;
+        for (const LoudnessOver& v : loudnessOvers(d, spec))
+            QVERIFY2(v.to < musicFrom + 0.5 || v.from > musicTo - 0.5, v.what.c_str());
+        spec.dialogueGated = false;
+        std::vector<LoudnessOver> overs = loudnessOvers(d, spec);
+        QVERIFY(std::any_of(overs.begin(), overs.end(), [&](const LoudnessOver& v) {
+            return !v.truePeak && v.from < musicFrom + 1 && v.to > musicTo - 0.5 && QString::fromStdString(v.what).startsWith("Short-term");
+        }));
+        QVERIFY(!loudnessPasses(d, spec));
+        spec.peakCeiling = d.truePeak - 3;
+        overs = loudnessOvers(d, spec);
+        QVERIFY(std::any_of(overs.begin(), overs.end(), [](const LoudnessOver& v) { return v.truePeak; }));
+        spec.leqmLimit = 85;
+        const std::string base = path("cinema-report");
+        QVERIFY2(writeLoudnessCsv(base + ".csv", d, spec, s, &err), err.c_str());
+        QVERIFY2(writeLoudnessPdf(base + ".pdf", d, spec, s, &err), err.c_str());
+        {
+            QFile csv(QString::fromStdString(base + ".csv"));
+            QVERIFY(csv.open(QIODevice::ReadOnly | QIODevice::Text));
+            const QStringList lines = QString::fromUtf8(csv.readAll()).split('\n', Qt::SkipEmptyParts);
+            QVERIFY(lines.front().startsWith("# Loudness report: Cinema test"));
+            QVERIFY(lines.contains(QStringLiteral("# Leq(M) limit: 85")));
+            QVERIFY(std::any_of(lines.begin(), lines.end(), [](const QString& l) { return l.startsWith("# Over: 00:00:") && l.contains("Short-term"); }));
+            const qsizetype header = lines.indexOf(QStringLiteral("seconds,timecode,momentary_lufs,short_term_lufs,true_peak_dbtp,dialogue"));
+            QVERIFY(header > 0);
+            QCOMPARE(lines.size() - header - 1, qsizetype(d.log.size()));
+            QCOMPARE(lines[header + 1].split(',').size(), qsizetype(6));
+            QFile pdf(QString::fromStdString(base + ".pdf"));
+            QVERIFY(pdf.open(QIODevice::ReadOnly));
+            QVERIFY(pdf.read(5) == "%PDF-" && pdf.size() > 2000);
+        }
+
+        // A trailer at 87 Leq(M): a stereo noise bed brought to 87, which the cinema trailer check (85) marks and 84
+        // passes.
+        Project t = makeDefaultProject();
+        Sequence& ts = *t.active();
+        std::vector<float> bed(size_t(rate) * 6 * 2);
+        {
+            std::mt19937 gen(5);
+            std::normal_distribution<float> n(0, 0.05f);
+            for (float& v : bed) v = n(gen);
+        }
+        QVERIFY2(writeStereoWav(path("cinema-bed.wav"), bed, rate, &err), err.c_str());
+        MediaItem bm = probeOrFail(t, path("cinema-bed.wav"));
+        t.media.push_back(bm);
+        QVERIFY(edit::placeMedia(t, ts, bm.id, 0, 0, -1, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        DialogueLoudnessOptions lo;
+        lo.layout = true;
+        lo.leqm = true;
+        lo.gate = SpeechGate::Transcripts;
+        auto leqmOf = [&](const Sequence& q) { return measureDialogueLoudness(t, q, lo).leqm; };
+        const double before = leqmOf(ts);
+        QVERIFY2(before > 70, qPrintable(QString::number(before)));
+        ts.audioTracks[0].clips.front().audio.params["gain_db"] = 87 - before;
+        QVERIFY2(std::fabs(leqmOf(ts) - 87) < 0.1, qPrintable(QString::number(leqmOf(ts))));
+        QcSettings q;
+        q.flashing = false, q.levels = false, q.blackSeconds = 0, q.freezeSeconds = 0, q.silenceSeconds = 0, q.clipping = false;
+        q.spelling = false, q.sync = false, q.phase = false, q.dcOffsetDb = 0;
+        q.leqmLimit = 85;
+        std::vector<QcIssue> issues = qualityCheck(t, ts, 0, -1, q);
+        QVERIFY2(issues.size() == 1 && issues[0].kind == QcKind::CinemaLoudness, issues.empty() ? "none" : issues[0].text.c_str());
+        QCOMPARE(issues[0].text, std::string("Leq(M) 87.0; the limit is 85"));
+        QCOMPARE(QString::fromLatin1(qcKindName(issues[0].kind)), QStringLiteral("Leq(M)"));
+        ts.audioTracks[0].clips.front().audio.params["gain_db"] = 84 - before;
+        QVERIFY(qualityCheck(t, ts, 0, -1, q).empty());
+        ts.audioTracks[0].clips.front().audio.params["gain_db"] = 87 - before;
+
+        // Exported with a report: name.loudness.pdf and .csv beside it, of the sound as delivered.
+        ExportSettings st = findExportPreset("Audio - WAV 24-bit")->settings;
+        st.path = path("trailer.wav");
+        st.loudnessReport = true;
+        st.leqmLimit = 85;
+        QVERIFY2(exportSequence(t, ts, st, nullptr, nullptr, &err), err.c_str());
+        {
+            QFile csv(QString::fromStdString(path("trailer.loudness.csv")));
+            QVERIFY(csv.open(QIODevice::ReadOnly | QIODevice::Text));
+            const QString text = QString::fromUtf8(csv.readAll());
+            const QRegularExpressionMatch m = QRegularExpression("# Leq\\(M\\): ([0-9.]+)").match(text);
+            QVERIFY2(m.hasMatch() && std::fabs(m.captured(1).toDouble() - 87) < 0.2, qPrintable(text.left(400)));
+            QVERIFY(text.contains("# Result: does not pass"));
+            QVERIFY(QFileInfo(QString::fromStdString(path("trailer.loudness.pdf"))).size() > 2000);
+        }
+
+        // Over the agent link: Leq(M) and both ranges measured, a report written, the cinema presets checked.
+        const QString project = QString::fromStdString(path("cinema/trailer.montage"));
+        QDir().mkpath(QFileInfo(project).absolutePath());
+        QVERIFY(saveProject(t, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+        const QString reportBase = QString::fromStdString(path("cinema/agent-report"));
+        QJsonObject r = call("montage_dialogue_loudness", {{"surround", true}, {"gate", "transcripts"}, {"report", reportBase}, {"leqm_limit", 85}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QJsonObject m = r.value("structuredContent").toObject();
+        QVERIFY2(std::fabs(m.value("leqm").toDouble() - 87) < 0.1, qPrintable(text(r)));
+        QVERIFY(m.contains("lra") && m.contains("lra_dialogue") && !m.value("passes").toBool(true));
+        QVERIFY(QFileInfo::exists(reportBase + ".pdf") && QFileInfo::exists(reportBase + ".csv"));
+        r = call("montage_quality_check", {{"flashing", false}, {"levels", false}, {"black_seconds", 0}, {"freeze_seconds", 0},
+                                           {"silence_seconds", 0}, {"clipping", false}, {"spelling", false}, {"sync", false},
+                                           {"phase", false}, {"dc_offset_db", 0}, {"cinema", "trailer"}, {"report", reportBase + "-qc"}});
+        QVERIFY2(text(r).contains("Leq(M) 87.0; the limit is 85") && text(r).contains("Loudness report"), qPrintable(text(r)));
+        QVERIFY(QFileInfo::exists(reportBase + "-qc.pdf"));
+        r = call("montage_quality_check", {{"cinema", "imax"}});
+        QVERIFY(r.value("isError").toBool());
+        r = call("montage_render", {{"output", QString::fromStdString(path("cinema/trailer.wav"))}, {"preset", "Audio - WAV 24-bit"},
+                                    {"loudness_report", true}, {"leqm_limit", 82}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY2(QFileInfo::exists(r.value("structuredContent").toObject().value("loudness_report").toString()), qPrintable(text(r)));
     }
 
     void peakLimiter() {
@@ -12831,6 +13348,44 @@ private slots:
         QCOMPARE(snow->generator.p("rate", 0), 300.0);
         QCOMPARE(snow->generator.p("color.b", 0), 0.5);
         QCOMPARE(snow->generator.p("emitter", 0), 1.0);  // (the preset's line)
+
+        // A styled title: a red, larger word, set on a circle, its letters swept in; bad runs and paths are refused.
+        r = call("montage_add_title",
+                 {{"project", project}, {"text", "Hello world"}, {"at", 0}, {"duration", 2},
+                  {"runs", QJsonArray{QJsonObject{{"from", 6}, {"len", 5}, {"color", QJsonArray{1, 0, 0}}, {"size", 140}, {"axes", QJsonObject{{"wght", 700}}}}}},
+                  {"path", QJsonObject{{"shape", "circle"}, {"radius", 250}, {"reverse", true}}},
+                  {"animations", QJsonArray{QJsonObject{{"by", "words"}, {"shape", "ramp_up"}, {"sweep", "in_across"}, {"sweep_seconds", 0.5},
+                                                        {"opacity", 0}, {"y", -40}, {"fill", QJsonArray{0, 0, 1}}, {"fill_amount", 100}}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(call("montage_add_title", {{"project", project}, {"text", "x"}, {"at", 0}, {"runs", QJsonArray{QJsonObject{{"len", 1}}}}}).value("isError").toBool());
+        QVERIFY(call("montage_add_title", {{"project", project}, {"text", "x"}, {"at", 0}, {"path", QJsonObject{{"shape", "custom"}}}}).value("isError").toBool());
+        QVERIFY(call("montage_add_title", {{"project", project}, {"text", "x"}, {"at", 0}, {"animations", QJsonArray{QJsonObject{{"shape", "zigzag"}}}}})
+                    .value("isError").toBool());
+        QVERIFY(call("montage_add_title", {{"project", project}, {"text", "x"}, {"at", 0}, {"template", "3d"}, {"path", QJsonObject{{"shape", "wave"}}}})
+                    .value("isError").toBool());
+        Project withTitle;
+        QVERIFY(loadProject(project.toStdString(), withTitle));
+        const Clip* styled = nullptr;
+        for (const Track& tr : withTitle.active()->videoTracks)
+            for (const Clip& c : tr.clips)
+                if (c.generator.type == "title" && c.generator.s("text") == "Hello world") styled = &c;
+        QVERIFY(styled);
+        const std::vector<TextRun> runs = parseTextRuns(styled->generator.s("runs"));
+        QCOMPARE(int(runs.size()), 1);
+        QCOMPARE(runs[0].from, 6);
+        QCOMPARE(runs[0].size, 140.0);
+        QCOMPARE(runs[0].axes.at("wght"), 700.0);
+        QCOMPARE(styled->generator.p("path_shape", 0), 1.0);
+        QCOMPARE(styled->generator.p("path_reverse", 0), 1.0);
+        QCOMPARE(textAnimators(styled->generator), std::vector<int>{1});
+        QCOMPARE(styled->generator.p("ta1.by", 0), 2.0);
+        QCOMPARE(styled->generator.p("ta1.sweep", 0), 1.0);
+        QCOMPARE(styled->generator.p("ta1.fill.b", 0), 1.0);
+        QCOMPARE(styled->generator.p("ta1.scale", 0), 100.0);  // the rest at their defaults
+        const Image drawn = renderGenerator(styled->generator, 20, 640, 360, 0.5, 60, 30);
+        double ink = 0;
+        for (float v : drawn.px) ink += v;
+        QVERIFY(ink > 100);
     }
 
     void bleepInTheMix() {
@@ -17602,6 +18157,20 @@ if ui["pressed"] == "add":
         QCOMPARE(collected.sequences.size(), size_t(2));
         for (const MediaItem& m : collected.media) QVERIFY2(QString::fromStdString(m.path).contains("/collected/Media/"), m.path.c_str());
         QVERIFY(frame(collected, 10).px == before.px);
+        // The copy keeps what it started as, so it can be merged back: the original's own media paths and B are
+        // the original's side, the copy's new marker theirs, and nothing conflicts.
+        Project startedAs;
+        QVERIFY(mergeBaseOf(collected, startedAs));
+        Project unmarked = collected;
+        unmarked.mergeBase.reset();
+        QCOMPARE(projectToJson(startedAs), projectToJson(unmarked));
+        Project worked = collected;
+        worked.active()->markers.push_back(Marker{5, 0, "From the copy", "", 1});
+        const MergeResult home = mergeProjects(startedAs, p, worked);
+        QVERIFY2(home.ok && home.conflicts.empty(), home.error.c_str());
+        QCOMPARE(home.project.active()->markers.size(), p.active()->markers.size() + 1);
+        QCOMPARE(home.project.media.size(), p.media.size());
+        for (const MediaItem& m : home.project.media) QCOMPARE(m.path, p.findMedia(m.id)->path);
 
         // Consolidate the first sequence only, with half a second of handles: A becomes 0.5 to 2.5 s. A Dialogue
         // Alignment made for A's clip goes along (its span, in source frames, moved with the clip).
@@ -21982,6 +22551,82 @@ if ui["pressed"] == "add":
         QVERIFY(r.value("isError").toBool());
     }
 
+    void mcpMergeProject() {
+        // A cut copied for an assistant: they add a marker and trim the first shot to 40 frames, the editor trims it to
+        // 50 and adds a bin.
+        Project p = makeDefaultProject();
+        MediaItem m;
+        m.id = p.newId();
+        m.kind = MediaKind::Video;
+        m.name = "shot.mov";
+        m.path = path("shot.mov");
+        m.duration = 20;
+        m.width = 1920, m.height = 1080;
+        m.fps = {30, 1};
+        m.hasVideo = true;
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, *p.active(), m.id, 0, 0, 60, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
+        const Id shot = p.active()->videoTracks[0].clips[0].id;
+        Project theirs = p, mine = p;
+        setMergeBase(theirs, p);
+        theirs.active()->markers.push_back(Marker{10, 0, "Check sync", "", 1});
+        edit::clipById(*theirs.active(), shot)->duration = 40;
+        edit::clipById(*mine.active(), shot)->duration = 50;
+        mine.bins.push_back("Selects");
+        const QString mineFile = QString::fromStdString(path("merge-mine.montage")), theirsFile = QString::fromStdString(path("merge-theirs.montage"));
+        QVERIFY(saveProject(mine, mineFile.toStdString()));
+        QVERIFY(saveProject(theirs, theirsFile.toStdString()));
+        McpServer server;
+        auto call = [&](const QJsonObject& args) {
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", "montage_merge_project"}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        // A dry run lists the conflict and their marker, and saves nothing.
+        QJsonObject r = call({{"project", mineFile}, {"theirs", theirsFile}, {"dry_run", true}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QJsonObject out = r.value("structuredContent").toObject();
+        const QJsonArray conflicts = out.value("conflicts").toArray();
+        QCOMPARE(conflicts.size(), 1);
+        QCOMPARE(conflicts[0].toObject().value("field").toString(), QString("duration"));
+        QCOMPARE(conflicts[0].toObject().value("mine").toString(), QString("50"));
+        QCOMPARE(conflicts[0].toObject().value("theirs").toString(), QString("40"));
+        QCOMPARE(conflicts[0].toObject().value("took").toString(), QString("mine"));
+        const QString key = conflicts[0].toObject().value("key").toString();
+        bool marker = false;
+        for (const QJsonValue& c : out.value("changes").toArray())
+            marker = marker || (c.toObject().value("side").toString() == "theirs" && c.toObject().value("what").toString().contains("Check sync"));
+        QVERIFY(marker);
+        Project after;
+        QVERIFY(loadProject(mineFile.toStdString(), after));
+        QVERIFY(after.active()->markers.empty());
+        // Wrong choices are refused.
+        QVERIFY(call({{"project", mineFile}, {"theirs", theirsFile}, {"choices", QJsonObject{{"nothing", "theirs"}}}}).value("isError").toBool());
+        QVERIFY(call({{"project", mineFile}, {"theirs", theirsFile}, {"choices", QJsonObject{{key, "both"}}}}).value("isError").toBool());
+        QVERIFY(call({{"project", mineFile}, {"theirs", theirsFile}, {"take", "ours"}}).value("isError").toBool());
+        // Theirs taken for the trim: everything lands.
+        r = call({{"project", mineFile}, {"theirs", theirsFile}, {"choices", QJsonObject{{key, "theirs"}}}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(loadProject(mineFile.toStdString(), after));
+        QCOMPARE(edit::clipById(*after.active(), shot)->duration, FrameTime(40));
+        QCOMPARE(after.active()->markers.size(), size_t(1));
+        QCOMPARE(after.bins, std::vector<std::string>{"Selects"});
+        // A copy with no record of the base needs one given.
+        theirs.mergeBase.reset();
+        QVERIFY(saveProject(theirs, theirsFile.toStdString()));
+        QVERIFY(saveProject(mine, mineFile.toStdString()));
+        QVERIFY(call({{"project", mineFile}, {"theirs", theirsFile}}).value("isError").toBool());
+        const QString baseFile = QString::fromStdString(path("merge-base.montage"));
+        QVERIFY(saveProject(p, baseFile.toStdString()));
+        r = call({{"project", mineFile}, {"theirs", theirsFile}, {"base", baseFile}, {"take", "theirs"}});
+        QVERIFY2(!r.value("isError").toBool(), QJsonDocument(r).toJson().constData());
+        QVERIFY(loadProject(mineFile.toStdString(), after));
+        QCOMPARE(edit::clipById(*after.active(), shot)->duration, FrameTime(40));
+    }
+
     void mcpServerEditsProjects() {
         writeBallVideo(path("mcp-ball.mp4"), 12);
         const QString project = QString::fromStdString(path("agent.montage"));
@@ -22034,6 +22679,48 @@ if ui["pressed"] == "add":
         QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
         r = tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "gaussian_blur"}, {"params", QJsonObject{{"no_such", 1}}}});
         QVERIFY(r.value("isError").toBool() && text(r).contains("no_such"));
+        // A Mesh Warp with pins (a keyed Position pin, a Stiff one), and a Grid Warp with a point moved; pins are a Mesh Warp's.
+        r = tool("montage_add_effect",
+                 QJsonObject{{"project", project}, {"clip", second}, {"effect", "mesh_warp"},
+                             {"pins", QJsonArray{QJsonObject{{"x", 0.2}, {"y", 0.5}},
+                                                 QJsonObject{{"x", 0.8}, {"y", 0.5}, {"path", QJsonArray{QJsonObject{{"frame", 0}, {"x", 0.8}, {"y", 0.5}},
+                                                                                                           QJsonObject{{"frame", 5}, {"x", 0.7}, {"y", 0.6}}}}},
+                                                 QJsonObject{{"kind", "stiff"}, {"x", 0.5}, {"y", 0.5}, {"radius", 40}}}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const Id meshFx = Id(r.value("structuredContent").toObject().value("effect_id").toDouble());
+        r = tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "grid_warp"},
+                                                   {"params", QJsonObject{{"rows", 2}, {"cols", 2}, {"g1_1.dx", 0.05}}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const Id gridFx = Id(r.value("structuredContent").toObject().value("effect_id").toDouble());
+        QVERIFY(tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "invert"},
+                                                       {"pins", QJsonArray{QJsonObject{{"x", 0.2}, {"y", 0.5}}}}}).value("isError").toBool());
+        QVERIFY(tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "mesh_warp"},
+                                                       {"pins", QJsonArray{QJsonObject{{"kind", "pinch"}, {"x", 0.2}, {"y", 0.5}}}}}).value("isError").toBool());
+        for (const QJsonObject& bad : {QJsonObject{{"kind", 2}, {"x", 0.2}, {"y", 0.5}}, QJsonObject{{"x", 9}, {"y", 0.5}},
+                                       QJsonObject{{"x", 0.2}, {"y", 0.5}, {"depth", 10}},
+                                       QJsonObject{{"x", 0.2}, {"y", 0.5}, {"path", QJsonArray{QJsonObject{{"frame", 2.5}, {"x", 0.2}, {"y", 0.5}}}}}})
+            QVERIFY(tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "mesh_warp"}, {"pins", QJsonArray{bad}}})
+                        .value("isError").toBool());
+        {
+            Project warped;
+            QVERIFY(loadProject(project.toStdString(), warped));
+            const Clip* c = edit::clipById(*warped.active(), Id(second));
+            QVERIFY(c);
+            const Effect* mesh = nullptr;
+            const Effect* grid = nullptr;
+            for (const Effect& ef : c->effects) {
+                if (ef.id == meshFx) mesh = &ef;
+                if (ef.id == gridFx) grid = &ef;
+            }
+            QVERIFY(mesh && grid);
+            QCOMPARE(meshPins(*mesh), (std::vector<int>{1, 2, 3}));
+            QCOMPARE(meshPinKind(*mesh, 3), 1);
+            QCOMPARE(mesh->p("pin3.radius", 0), 40.0);
+            QCOMPARE(mesh->params.at("pin2.to_x").keys.size(), size_t(2));
+            QVERIFY(std::fabs(mesh->p("pin2.to_y", 5) - 0.6) < 1e-9 && mesh->p("pin1.to_x", 3) == 0.2);
+            QCOMPARE(grid->p(gridWarpPoint(1, 1) + ".dx", 0), 0.05);
+            QCOMPARE(gridWarpPointAt(*grid, 0, 1, 1)[0], 0.55);
+        }
         // A drawn Bezier mask from frame fractions (a curved point among corners); too few points refused.
         r = tool("montage_add_effect",
                  QJsonObject{{"project", project}, {"clip", second}, {"effect", "gaussian_blur"},
@@ -22318,6 +23005,56 @@ if ui["pressed"] == "add":
                     .value("isError").toBool());
         r = tool("montage_automate_track", QJsonObject{{"project", project}, {"sends", QJsonArray{QJsonObject{{"bus", "Reverb"}, {"remove", true}}}}});
         QVERIFY2(!r.value("isError").toBool() && text(r).contains("Sends: none"), qPrintable(text(r)));
+        // Film-mix tools: a trim mode and trim points, folded in; Write To End; a glide; a punched preview; a capture
+        // pasted later; automation copied along the track.
+        {
+            auto a1At = [&](const char* lane, double seconds) {
+                Project q;
+                if (!loadProject(project.toStdString(), q)) return 1e9;
+                Track& t = q.active()->audioTracks.at(0);
+                const FrameTime f = FrameTime(std::llround(seconds * q.active()->fpsValue()));
+                if (std::string(lane) == "heard") return trackVolumeAt(t, double(f));
+                const LaneRef ref = trackLane(t, lane);
+                return ref.lane ? ref.at(f) : 1e9;
+            };
+            auto run = [&](QJsonObject args) {
+                args["project"] = project;
+                args["track"] = "A1";
+                return tool("montage_automate_track", args);
+            };
+            r = run({{"mode", "trim latch"}, {"volume", QJsonArray{QJsonArray{0, -10}, QJsonArray{8, -10}}},
+                     {"trim", QJsonArray{QJsonArray{2, 0}, QJsonArray{3, -3}}}});
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("Trim Latch automation") && !text(r).contains("Trim: none"), qPrintable(text(r)));
+            QCOMPARE(a1At("heard", 4), -13.0);
+            QCOMPARE(a1At("volume", 4), -10.0);
+            r = run({{"coalesce", true}});
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("Coalesced") && text(r).contains("Trim: none"), qPrintable(text(r)));
+            QCOMPARE(a1At("volume", 4), -13.0);
+            r = run({{"write_to", QJsonObject{{"target", "end"}, {"value", -6}, {"from", 6}}}});
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("Wrote -6"), qPrintable(text(r)));
+            QCOMPARE(a1At("volume", 5), -13.0);
+            QCOMPARE(a1At("volume", 6), -6.0);
+            QCOMPARE(a1At("volume", 20), -6.0);
+            r = run({{"glide", QJsonObject{{"from", 1}, {"to", 3}, {"value", 0}}}});
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("Glided"), qPrintable(text(r)));
+            QCOMPARE(a1At("volume", 1), -10.0);
+            QVERIFY(std::fabs(a1At("volume", 2) + 5) < 1e-9);
+            QCOMPARE(a1At("volume", 3), 0.0);
+            r = run({{"preview", QJsonObject{{"values", QJsonObject{{"pan", 0.5}}}, {"from", 4}, {"to", 5}}}});
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("Punched 1"), qPrintable(text(r)));
+            QCOMPARE(a1At("pan", 4.5), 0.5);
+            QCOMPARE(a1At("pan", 3), 0.0);
+            r = run({{"capture", QJsonObject{{"at", 4.5}, {"tracks", QJsonArray{"A1"}}, {"paste_at", 7}}}});
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("Captured 1 strip"), qPrintable(text(r)));
+            QCOMPARE(a1At("pan", 7), 0.5);
+            QCOMPARE(a1At("volume", 7), -13.0);
+            r = run({{"copy", QJsonObject{{"from", 4}, {"to", 5}, {"at", 9}, {"lanes", QJsonArray{"pan"}}}}});
+            QVERIFY2(!r.value("isError").toBool() && text(r).contains("Pasted 1 lane"), qPrintable(text(r)));
+            QCOMPARE(a1At("pan", 9.5), 0.5);
+            QVERIFY(run({{"write_to", QJsonObject{{"target", "middle"}}}}).value("isError").toBool());
+            QVERIFY(run({{"glide", QJsonObject{{"lane", "mute"}, {"from", 1}, {"value", 1}}}}).value("isError").toBool());
+            QVERIFY(run({{"glide", QJsonObject{{"lane", "send:Nowhere"}, {"from", 1}, {"value", 1}}}}).value("isError").toBool());
+        }
         QVERIFY(QFile::remove(project) && QFile::rename(beforeSends, project));
         QFile::remove(project + ".bak");
         // A clip marker, on the clip rather than the sequence.
@@ -23306,6 +24043,24 @@ if ui["pressed"] == "add":
         p.media.push_back(mi);
         QVERIFY(edit::placeMedia(p, s, mi.id, 0, 10, 35, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
         Clip& clip = trackAt(s, {TrackKind::Video, 0})->clips.at(0);
+        // A Mesh Warp's Position pins keyed to follow what is under them, from the middle of the clip both ways.
+        {
+            Effect warp = makeEffect(p, "mesh_warp");
+            addMeshPin(warp, 0, 0.45, 0.5);
+            addMeshPin(warp, 2, 0.6, 0.5);  // (a Bend pin is not tracked)
+            std::map<int, std::pair<Param, Param>> keys;
+            QVERIFY2(trackMeshPins(p, s, clip, warp, 12, keys, {}, &err), err.c_str());
+            QCOMPARE(int(keys.size()), 1);
+            const Param& kx = keys.at(1).first;
+            const Param& ky = keys.at(1).second;
+            QVERIFY2(int(kx.keys.size()) == int(clip.duration), qPrintable(QString("%1 keys, %2 frames").arg(kx.keys.size()).arg(clip.duration)));
+            double worst = 0;
+            for (FrameTime f = 0; f < clip.duration; ++f)
+                worst = std::max({worst, std::fabs((kx.at(f) - kx.at(12)) * 320 - (jitter[size_t(10 + f)].x - jitter[22].x)),
+                                  std::fabs((ky.at(f) - ky.at(12)) * 180 - (jitter[size_t(10 + f)].y - jitter[22].y))});
+            QVERIFY2(worst < 1.0, qPrintable(QString::number(worst)));
+            QCOMPARE(kx.at(12), 0.45);
+        }
         // Stabilize: frame-to-frame differences shrink to almost nothing when locked.
         std::string motion;
         QVERIFY2(analyzeClipStabilization(p, s, clip, motion, {}, nullptr, &err), err.c_str());
@@ -28848,6 +29603,67 @@ if ui["pressed"] == "add":
         for (int y = 0; y < 120; ++y)
             for (int x = 0; x < 160; ++x) covered += img.at(x, y)[3] > 0.5f;
         QVERIFY2(covered > 200, qPrintable(QString::number(covered)));
+    }
+
+    void modelFilesRefused() {
+        // A glTF whose buffer says 100 MB beside a 16-byte file: refused, not read past the file's end.
+        auto writeGltf = [&](const std::string& name, const QJsonObject& gltf) {
+            QFile f(QString::fromStdString(path(name.c_str())));
+            QVERIFY(f.open(QIODevice::WriteOnly));
+            f.write(QJsonDocument(gltf).toJson());
+        };
+        {
+            QFile bin(QString::fromStdString(path("tiny.bin")));
+            QVERIFY(bin.open(QIODevice::WriteOnly));
+            bin.write(QByteArray(16, '\0'));
+        }
+        const QJsonObject asset{{"version", "2.0"}};
+        const QJsonArray meshes{QJsonObject{{"primitives", QJsonArray{QJsonObject{{"attributes", QJsonObject{{"POSITION", 0}}}}}}}};
+        writeGltf("long.gltf", QJsonObject{{"asset", asset},
+                                           {"buffers", QJsonArray{QJsonObject{{"uri", "tiny.bin"}, {"byteLength", 100000000}}}},
+                                           {"bufferViews", QJsonArray{QJsonObject{{"buffer", 0}, {"byteLength", 100000000}}}},
+                                           {"accessors", QJsonArray{QJsonObject{{"bufferView", 0}, {"componentType", 5126}, {"count", 8000000}, {"type", "VEC3"}}}},
+                                           {"meshes", meshes}});
+        std::string err;
+        Model m;
+        QVERIFY(!loadModel(path("long.gltf"), m, &err));
+        QVERIFY2(err.find("shorter") != std::string::npos, err.c_str());
+        // An accessor of two billion zeros (no data behind it): refused, not allocated.
+        writeGltf("zeros.gltf", QJsonObject{{"asset", asset},
+                                            {"accessors", QJsonArray{QJsonObject{{"componentType", 5126}, {"count", 2000000000.0}, {"type", "VEC3"}}}},
+                                            {"meshes", meshes}});
+        err.clear();
+        QVERIFY(!loadModel(path("zeros.gltf"), m, &err));
+        QVERIFY2(err.find("larger") != std::string::npos, err.c_str());
+        // One accessor within bounds used by a hundred primitives: each use counts.
+        QJsonArray many;
+        for (int i = 0; i < 100; ++i) many.append(QJsonObject{{"attributes", QJsonObject{{"POSITION", 0}}}});
+        writeGltf("shared.gltf", QJsonObject{{"asset", asset},
+                                             {"accessors", QJsonArray{QJsonObject{{"componentType", 5126}, {"count", 20000000}, {"type", "VEC3"}}}},
+                                             {"meshes", QJsonArray{QJsonObject{{"primitives", many}}}}});
+        err.clear();
+        QVERIFY(!loadModel(path("shared.gltf"), m, &err));
+        QVERIFY2(err.find("larger") != std::string::npos, err.c_str());
+#ifdef Q_OS_UNIX
+        // An OBJ whose material library is /dev/zero, then a pipe nothing writes to: loads at once without it.
+        QFile::remove(QString::fromStdString(path("zero.mtl")));
+        QVERIFY(QFile::link("/dev/zero", QString::fromStdString(path("zero.mtl"))));
+        QFile::remove(QString::fromStdString(path("pipe.mtl")));
+        QCOMPARE(::mkfifo(path("pipe.mtl").c_str(), 0600), 0);
+        for (const char* lib : {"zero.mtl", "pipe.mtl"}) {
+            QFile obj(QString::fromStdString(path("tri.obj")));
+            QVERIFY(obj.open(QIODevice::WriteOnly));
+            obj.write(QByteArray("mtllib ") + lib + "\nusemtl x\nv 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n");
+            obj.close();
+            Model tri;
+            err.clear();
+            QElapsedTimer clock;
+            clock.start();
+            QVERIFY2(loadModel(path("tri.obj"), tri, &err), err.c_str());
+            QCOMPARE(tri.triangles(), size_t(1));
+            QVERIFY(clock.elapsed() < 5000);
+        }
+#endif
     }
 
     void modelRendering() {

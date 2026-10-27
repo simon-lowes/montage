@@ -44,6 +44,7 @@
 #include "LensCorrectionDialog.h"
 #include "ModelPacks.h"
 #include "render/Expressions.h"
+#include "render/Titles.h"
 #include "media/DepthMap.h"
 #include "media/VideoDepth.h"
 #include "media/Exr.h"
@@ -71,6 +72,7 @@
 #include "render/OGraf.h"
 #include "render/Restoration.h"
 #include "render/FilmScan.h"
+#include "render/MeshWarp.h"
 #include "render/Ocio.h"
 
 namespace montage {
@@ -161,6 +163,9 @@ QString InspectorWidget::signature() const {
     if (sceneReferredWorking(*s)) sig += QStringLiteral(":scene");  // (effects that work on display values are marked)
     // An OGraf graphic's fields: rebuild when another graphic is chosen.
     if (c->generator.type == "ograf") sig += "|G" + QString::fromStdString(c->generator.s("manifest"));
+    // A title's text animations: rebuild when one is added or removed.
+    if (c->generator.type == "title")
+        for (int k : textAnimators(c->generator)) sig += QString("|A%1").arg(k);
     // A graphic's fields: rebuild when one is published, removed or renamed.
     if (const Sequence* g = graphicOf(state_->project(), *c)) {
         sig += QString("|F%1").arg(g->id);
@@ -176,6 +181,10 @@ QString InspectorWidget::signature() const {
         // A film scan's status line: rebuild when its reference or base is taken.
         if (e.type == "perf_lock") sig += QString("r%1").arg(perforationsFromString(e.s("reference"), 1, 1).size());
         if (e.type == "film_negative") sig += QString("b%1").arg(std::lround(e.p("base_from", 0)));
+        // A Mesh Warp's pins and a Grid Warp's points: rebuild when a pin is added or removed, or the grid resized.
+        if (e.type == "mesh_warp")
+            for (int k : meshPins(e)) sig += QString("p%1k%2").arg(k).arg(meshPinKind(e, k));
+        if (e.type == "grid_warp") sig += QString("g%1x%2").arg(std::lround(e.p("rows", 0, 3))).arg(std::lround(e.p("cols", 0, 3)));
     }
     // Its colour nodes: rebuild when one is added, picked, renamed or shared, or a shared one's effects change.
     if (!c->grade.empty()) {
@@ -507,6 +516,7 @@ void InspectorWidget::buildClip(const Clip& clip, TrackKind kind) {
             QFormLayout* g = addSection(QString::fromStdString(info->displayName));
             addParamRows(g, *info, target(clip.generator.id));
             if (clip.generator.type == "ograf") addOGrafFields(g, clip, target(clip.generator.id));
+            if (clip.generator.type == "title") addTitleTextTools(g, clip, target(clip.generator.id));
         }
     }
     // ---- Fixed attributes ----------------------------------------------------
@@ -1015,6 +1025,87 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                 const QSignalBlocker block(pick);
                 pick->setChecked(state_->paintEffect() == eid);
             });
+        }
+        if ((e.type == "mesh_warp" || e.type == "grid_warp") && onClip) {
+            // Pins are placed and dragged, and grid points dragged, on the Program monitor (app/PaintOverlay).
+            const bool mesh = e.type == "mesh_warp";
+            auto* row = new QWidget(content_);
+            auto* rh = new QHBoxLayout(row);
+            rh->setContentsMargins(0, 0, 0, 0);
+            auto* arm = new QPushButton(mesh ? tr("Pins on the Monitor") : tr("Points on the Monitor"), row);
+            arm->setObjectName(QStringLiteral("warpOnMonitor"));
+            arm->setCheckable(true);
+            arm->setChecked(state_->paintEffect() == eid);
+            arm->setToolTip(mesh ? tr("Click the Program monitor to place a pin of the kind chosen; drag a pin to move it (a key "
+                                      "there when it is keyed); Ctrl-click a pin to remove it. Esc stops.")
+                                 : tr("Drag the grid's points on the Program monitor (a key there when they are keyed). Esc stops."));
+            connect(arm, &QPushButton::toggled, this, [this, eid](bool on) {
+                if (on) state_->setPaintEffect(eid);
+                else if (state_->paintEffect() == eid) state_->setPaintEffect(0);
+            });
+            connect(state_, &EditorState::paintEffectChanged, arm, [this, arm, eid] {
+                const QSignalBlocker block(arm);
+                arm->setChecked(state_->paintEffect() == eid);
+            });
+            if (mesh) {
+                auto* kind = new QComboBox(row);
+                kind->setObjectName(QStringLiteral("meshPinKind"));
+                kind->addItems({tr("Position Pin"), tr("Stiff Pin"), tr("Bend Pin"), tr("Overlap Pin")});
+                kind->setCurrentIndex(state_->meshPinKind());
+                kind->setToolTip(tr("What a click on the monitor places: a pin that moves the picture, an area that keeps its "
+                                    "shape, a point the picture turns and scales about, or which part is in front where it folds"));
+                connect(kind, &QComboBox::currentIndexChanged, this, [this](int i) { state_->setMeshPinKind(i); });
+                rh->addWidget(kind);
+            }
+            rh->addWidget(arm);
+            rh->addStretch(1);
+            f->addRow(mesh ? tr("Pins:") : tr("Grid:"), row);
+            if (mesh && !meshPins(e).empty()) {
+                auto* edits = new QWidget(content_);
+                auto* eh = new QHBoxLayout(edits);
+                eh->setContentsMargins(0, 0, 0, 0);
+                auto* which = new QComboBox(edits);
+                which->setObjectName(QStringLiteral("meshPinList"));
+                static const char* kinds[] = {QT_TR_NOOP("Position"), QT_TR_NOOP("Stiff"), QT_TR_NOOP("Bend"), QT_TR_NOOP("Overlap")};
+                for (int k : meshPins(e)) which->addItem(tr("Pin %1 (%2)").arg(k).arg(tr(kinds[meshPinKind(e, k)])), k);
+                auto* remove = new QPushButton(tr("Remove"), edits);
+                remove->setObjectName(QStringLiteral("removeMeshPin"));
+                connect(remove, &QPushButton::clicked, this, [this, owner, eid, which] {
+                    const int k = which->currentData().toInt();
+                    state_->edit(tr("Remove Pin"), [owner, eid, k](Project&, Sequence& sq) {
+                        Effect* ef = edit::ownedEffect(sq, owner, eid);
+                        if (!ef || meshPins(*ef).empty()) return false;
+                        removeMeshPin(*ef, k);
+                        return true;
+                    });
+                });
+                auto* track = new QPushButton(tr("Track Position Pins"), edits);
+                track->setObjectName(QStringLiteral("trackMeshPins"));
+                track->setToolTip(tr("Key each Position pin to follow what is under it in the footage, tracked from the playhead "
+                                     "to both ends of the clip"));
+                connect(track, &QPushButton::clicked, this, [this, owner, eid] {
+                    QTimer::singleShot(0, this, [this, owner, eid] { trackWarpPins(owner, eid); });
+                });
+                eh->addWidget(which);
+                eh->addWidget(remove);
+                eh->addWidget(track);
+                eh->addStretch(1);
+                f->addRow(QString(), edits);
+            }
+            if (!mesh) {
+                auto* reset = new QPushButton(tr("Reset Points"), content_);
+                reset->setObjectName(QStringLiteral("resetGridWarp"));
+                connect(reset, &QPushButton::clicked, this, [this, owner, eid] {
+                    state_->edit(tr("Reset Grid"), [owner, eid](Project&, Sequence& sq) {
+                        Effect* ef = edit::ownedEffect(sq, owner, eid);
+                        if (!ef) return false;
+                        return std::erase_if(ef->params, [](const auto& kv) {
+                                   return kv.first.size() > 3 && kv.first[0] == 'g' && (kv.first.ends_with(".dx") || kv.first.ends_with(".dy"));
+                               }) > 0;
+                    });
+                });
+                f->addRow(QString(), reset);
+            }
         }
         if ((e.type == "paint" || e.type == "dust_spots") && onClip) {
             // Strokes and spots are drawn on the Program monitor while the effect is armed (app/PaintOverlay).
@@ -2490,6 +2581,156 @@ void InspectorWidget::addParamRow(QFormLayout* form, const ParamInfo& pi, const 
     refreshers_.push_back(refreshWidget);
 }
 
+void InspectorWidget::addTitleTextTools(QFormLayout* form, const Clip& clip, const Target& target) {
+    // Styling a stretch of the text: the selection in the Text box (all of it when nothing is selected).
+    auto* row = new QWidget(content_);
+    auto* h = new QHBoxLayout(row);
+    h->setContentsMargins(0, 0, 0, 0);
+    auto* style = new QPushButton(tr("Style Selected Text…"), row);
+    style->setObjectName(QStringLiteral("styleSelectedText"));
+    style->setToolTip(tr("Give the text selected in the Text box its own font, size, weight, colour, outline, tracking or baseline"));
+    auto* clear = new QPushButton(tr("Clear Styles"), row);
+    clear->setObjectName(QStringLiteral("clearTextStyles"));
+    h->addWidget(style);
+    h->addWidget(clear);
+    h->addStretch(1);
+    form->addRow(QString(), row);
+    auto current = [this, target]() -> Effect* {
+        const Sequence* s = state_->sequence();
+        return s ? target.resolve(const_cast<Sequence&>(*s)) : nullptr;
+    };
+    connect(clear, &QPushButton::clicked, this, [this, target] {
+        state_->edit(tr("Clear Text Styles"), [target](Project&, Sequence& s) {
+            Effect* e = target.resolve(s);
+            if (!e || e->s("runs").empty()) return false;
+            e->strings.erase("runs");
+            return true;
+        });
+    });
+    connect(style, &QPushButton::clicked, this, [this, target, current] {
+        const Effect* e = current();
+        if (!e) return;
+        const QString text = QString::fromStdString(e->s("text", "Title"));
+        int from = 0, to = int(text.size());
+        if (auto* edit = content_->findChild<QPlainTextEdit*>(QStringLiteral("string_text")); edit && edit->textCursor().hasSelection())
+            from = edit->textCursor().selectionStart(), to = edit->textCursor().selectionEnd();
+        if (to <= from) return;
+        QDialog dlg(this);
+        dlg.setWindowTitle(tr("Style Selected Text"));
+        auto* f = new QFormLayout(&dlg);
+        f->addRow(new QLabel(tr("“%1”").arg(text.mid(from, to - from).left(60)), &dlg));
+        auto* setFont = new QCheckBox(tr("Font"), &dlg);
+        auto* font = new QFontComboBox(&dlg);
+        font->setCurrentFont(QFont(QString::fromStdString(e->s("font", "Sans Serif"))));
+        f->addRow(setFont, font);
+        auto keepSpin = [&dlg](double lo, double hi, double step, const QString& suffix) {
+            auto* sp = new QDoubleSpinBox(&dlg);
+            sp->setRange(lo, hi);
+            sp->setSingleStep(step);
+            sp->setSpecialValueText(tr("Unchanged"));
+            sp->setValue(lo);
+            sp->setSuffix(suffix);
+            return sp;
+        };
+        auto* size = keepSpin(0, 1000, 1, tr(" px"));
+        f->addRow(tr("Size"), size);
+        auto* bold = new QCheckBox(tr("Bold"), &dlg);
+        bold->setTristate(true);
+        bold->setCheckState(Qt::PartiallyChecked);
+        auto* italic = new QCheckBox(tr("Italic"), &dlg);
+        italic->setTristate(true);
+        italic->setCheckState(Qt::PartiallyChecked);
+        auto* bi = new QWidget(&dlg);
+        auto* bih = new QHBoxLayout(bi);
+        bih->setContentsMargins(0, 0, 0, 0);
+        bih->addWidget(bold);
+        bih->addWidget(italic);
+        f->addRow(tr("Weight"), bi);
+        auto* weight = keepSpin(0, 1000, 50, QString());
+        weight->setToolTip(tr("A variable font's weight axis (100 thin to 900 black)"));
+        f->addRow(tr("Weight Axis"), weight);
+        std::optional<QColor> fill, outlineColor;
+        auto colourButton = [&dlg](std::optional<QColor>& c, const QString& title) {
+            auto* b = new QPushButton(tr("Unchanged"), &dlg);
+            QObject::connect(b, &QPushButton::clicked, &dlg, [b, &c, title, &dlg] {
+                const QColor picked = QColorDialog::getColor(c.value_or(Qt::white), &dlg, title);
+                if (!picked.isValid()) return;
+                c = picked;
+                b->setText(picked.name());
+                b->setIcon(colorIcon(picked));
+            });
+            return b;
+        };
+        f->addRow(tr("Fill"), colourButton(fill, tr("Fill")));
+        auto* outline = keepSpin(-0.5, 50, 0.5, tr(" px"));
+        outline->setValue(-0.5);
+        f->addRow(tr("Outline Width"), outline);
+        f->addRow(tr("Outline Color"), colourButton(outlineColor, tr("Outline Color")));
+        auto* tracking = keepSpin(-201, 500, 0.5, QString());
+        f->addRow(tr("Tracking"), tracking);
+        auto* baseline = keepSpin(-1001, 1000, 1, tr(" px"));
+        f->addRow(tr("Baseline Shift"), baseline);
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+        f->addRow(buttons);
+        connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        if (dlg.exec() != QDialog::Accepted) return;
+        TextRun r;
+        r.from = from, r.len = to - from;
+        if (setFont->isChecked()) r.font = font->currentFont().family().toStdString();
+        if (size->value() > size->minimum()) r.size = size->value();
+        if (bold->checkState() != Qt::PartiallyChecked) r.bold = bold->isChecked() ? 1 : 0;
+        if (italic->checkState() != Qt::PartiallyChecked) r.italic = italic->isChecked() ? 1 : 0;
+        if (weight->value() > weight->minimum()) r.axes["wght"] = weight->value();
+        auto rgb = [](const QColor& c) { return std::array<double, 3>{c.redF(), c.greenF(), c.blueF()}; };
+        if (fill) r.color = rgb(*fill);
+        if (outlineColor) r.outlineColor = rgb(*outlineColor);
+        if (outline->value() > outline->minimum()) r.outline = outline->value();
+        if (tracking->value() > tracking->minimum()) r.tracking = tracking->value();
+        if (baseline->value() > baseline->minimum()) r.baseline = baseline->value();
+        state_->edit(tr("Style Text"), [target, r](Project&, Sequence& s) {
+            Effect* ef = target.resolve(s);
+            if (!ef) return false;
+            const std::vector<TextRun> runs = addTextRun(parseTextRuns(ef->s("runs")), r);
+            const std::string json = textRunsJson(runs);
+            if (json == ef->s("runs")) return false;
+            ef->strings["runs"] = json;
+            return true;
+        });
+    });
+
+    // Text animations: each a range of the text and what it changes there, with its own settings.
+    for (int k : textAnimators(clip.generator)) {
+        auto* remove = smallButton(nullptr, QStringLiteral("✕"), tr("Remove Text Animation"));
+        QFormLayout* section = addSection(tr("Text Animation %1").arg(k), remove);
+        connect(remove, &QToolButton::clicked, this, [this, target, k] {
+            state_->edit(tr("Remove Text Animation"), [target, k](Project&, Sequence& s) {
+                Effect* e = target.resolve(s);
+                if (!e) return false;
+                const std::string pre = "ta" + std::to_string(k) + ".";
+                std::erase_if(e->params, [&](const auto& kv) { return kv.first.rfind(pre, 0) == 0; });
+                return true;
+            });
+        });
+        EffectInfo info;
+        info.type = "title";
+        info.params = textAnimatorParams(k);
+        addParamRows(section, info, target);
+    }
+    auto* add = new QPushButton(tr("Add Text Animation"), content_);
+    add->setObjectName(QStringLiteral("addTextAnimation"));
+    add->setToolTip(tr("Move, scale, turn, fade, blur or recolour the text a letter, word or line at a time"));
+    connect(add, &QPushButton::clicked, this, [this, target] {
+        state_->edit(tr("Add Text Animation"), [target](Project&, Sequence& s) {
+            Effect* e = target.resolve(s);
+            if (!e) return false;
+            addTextAnimator(*e);
+            return true;
+        });
+    });
+    layout_->addWidget(add);
+}
+
 void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si, const Target& target) {
     const std::string name = si.name;
     const QString label = tr(si.label.c_str());
@@ -2505,6 +2746,10 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
         state_->edit(tr("Change %1").arg(label), [target, name, val](Project&, Sequence& s) {
             Effect* e = target.resolve(s);
             if (!e) return false;
+            // A title's styled runs stay on the characters they were on.
+            if (name == "text" && e->type == "title" && !e->s("runs").empty())
+                e->strings["runs"] = textRunsJson(shiftTextRuns(parseTextRuns(e->s("runs")), QString::fromStdString(e->s("text", "Title")),
+                                                                QString::fromStdString(val)));
             e->strings[name] = val;
             return true;
         }, mergeKey);
@@ -2512,6 +2757,7 @@ void InspectorWidget::addStringRow(QFormLayout* form, const StringParamInfo& si,
     switch (si.kind) {
         case StringKind::MultilineText: {
             auto* edit = new QPlainTextEdit(content_);
+            edit->setObjectName(QStringLiteral("string_") + QString::fromStdString(name));
             edit->setFixedHeight(64);
             std::function<void(QMenu*)> more;
             if (target.publishClip)
@@ -3197,6 +3443,33 @@ void InspectorWidget::analyzeDepth(Id clip) {
     // Drawn again with it (nothing in the project changed).
     state_->amend([](Project&, Sequence&) { return true; });
     state_->message(tr("Depth analysed over the clip: depth effects on it are steady"), 4000);
+}
+
+void InspectorWidget::trackWarpPins(Id clip, Id effect) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
+    if (!c || c->duration <= 0 || !edit::ownedEffect(const_cast<Sequence&>(*s), clip, effect)) return;
+    const FrameTime at = std::clamp<FrameTime>(state_->playhead() - c->start, 0, c->duration - 1);
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    std::map<int, std::pair<Param, Param>> keys;
+    const bool ok = runAnalysis(tr("Tracking pins..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
+        Sequence* sq = const_cast<Sequence*>(project->findSequence(seqId));
+        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
+        const Effect* ef = sq ? edit::ownedEffect(*sq, clip, effect) : nullptr;
+        return cl && ef && trackMeshPins(*project, *sq, *cl, *ef, at, keys, [&](double f) { progress(f); return !*cancel; }, err);
+    });
+    if (!ok) return;
+    state_->edit(tr("Track Pins"), [clip, effect, keys](Project&, Sequence& sq) {
+        Effect* ef = edit::ownedEffect(sq, clip, effect);
+        if (!ef) return false;
+        for (const auto& [k, xy] : keys) {
+            ef->params["pin" + std::to_string(k) + ".to_x"] = xy.first;
+            ef->params["pin" + std::to_string(k) + ".to_y"] = xy.second;
+        }
+        return true;
+    });
+    state_->message(tr("Tracked %n pin(s)", "", int(keys.size())), 4000);
 }
 
 void InspectorWidget::followFocusOn(Id clip, Id effect, FocusTarget target) {

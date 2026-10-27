@@ -123,6 +123,10 @@ public:
     };
     void setIntelligibilityLane(std::vector<IntelligibilitySpan> spans, bool stale);
     const std::vector<IntelligibilitySpan>& intelligibilityLane() const { return intelligibility_; }
+    // The loudness lane above it, the same way: where a loudness report found the sound within its limits (0), its
+    // short-term loudness over the target (1) or its true peak over the ceiling (2).
+    void setLoudnessLane(std::vector<IntelligibilitySpan> spans, bool stale);
+    const std::vector<IntelligibilitySpan>& loudnessLane() const { return loudnessLane_; }
     // Where a clip's line is drawn (widget coordinates), for tests; empty if it is not shown.
     QRect lineBand(montage::Id clip) const;
     int lineY(montage::Id clip, montage::FrameTime local) const;
@@ -331,6 +335,8 @@ private:
     std::vector<std::pair<FrameTime, FrameTime>> rendered_;
     std::vector<IntelligibilitySpan> intelligibility_;
     bool intelligibilityStale_ = false;
+    std::vector<IntelligibilitySpan> loudnessLane_;
+    bool loudnessLaneStale_ = false;
 };
 
 }  // namespace montage

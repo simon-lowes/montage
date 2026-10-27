@@ -273,6 +273,25 @@ const PrimerEntry kImfSoundPrimer[] = {
     {0xfffd, "060e2b340101010e0103070105000000"}, {0xfffe, "060e2b340101010e0103070101000000"},
 };
 
+// IMF Application #5 (ST 2065-5): the picture items an ACES descriptor uses (no JPEG 2000 sub-descriptor), its display
+// size and offsets, and the ACES picture and target frame sub-descriptors' items (numbered as asdcplib numbers them).
+const PrimerEntry kAcesPrimer[] = {
+    {0x3201, "060e2b34010101020401060100000000"}, {0x3202, "060e2b34010101010401050201000000"},
+    {0x3203, "060e2b34010101010401050202000000"}, {0x3208, "060e2b3401010101040105010b000000"},
+    {0x3209, "060e2b3401010101040105010c000000"}, {0x320a, "060e2b3401010101040105010d000000"},
+    {0x320b, "060e2b3401010101040105010e000000"}, {0x320c, "060e2b34010101010401030104000000"},
+    {0x320d, "060e2b34010101020401030205000000"}, {0x320e, "060e2b34010101010401010101000000"},
+    {0x3210, "060e2b34010101020401020101010200"}, {0x3219, "060e2b34010101090401020101060100"},
+    {0x3401, "060e2b34010101020401050306000000"}, {0xfffe, "060e2b340101010e0401060a01000000"},
+    {0xfffd, "060e2b340101010e0401060a02000000"}, {0xfffc, "060e2b340101010e0401060a03000000"},
+    {0xfffb, "060e2b340101010e0401060a04000000"}, {0xfffa, "060e2b340101010e0401060a05000000"},
+    {0xfff9, "060e2b340101010e0401060901000000"}, {0xfff8, "060e2b340101010e0401060902000000"},
+    {0xfff7, "060e2b340101010e0401060903000000"}, {0xfff6, "060e2b340101010e0401060904000000"},
+    {0xfff5, "060e2b340101010e0401060905000000"}, {0xfff4, "060e2b340101010e0401060906000000"},
+    {0xfff3, "060e2b340101010e0401060907000000"}, {0xfff2, "060e2b340101010e0401060908000000"},
+    {0xfff1, "060e2b340101010e0401060909000000"},
+};
+
 constexpr const char* kOpAtom = "060e2b34040101020d01020110000000";
 constexpr const char* kOp1a = "060e2b34040101010d01020101010100";
 constexpr const char* kImfJ2kContainer = "060e2b340401010d0d010301020c0600";  // JPEG 2000, progressive frames (P1)
@@ -289,6 +308,7 @@ constexpr const char* kSoundElement = "060e2b34010201010d01030116010101";
 constexpr const char* kDataDef = "060e2b34040101010103020203000000";
 constexpr const char* kTimedTextContainer = "060e2b340401010a0d01030102130101";  // ST 429-5, clip wrapped
 constexpr const char* kTimedTextElement = "060e2b34010201010d01030117010b01";
+constexpr const char* kAcesElement = "060e2b34010201010d01030115011201";  // an ACES frame (track number 15011201)
 constexpr const char* kStreamElement = "060e2b340101010c0d01050901000000";       // a generic stream's data
 constexpr const char* kStreamPartition = "060e2b34020501010d01020101031100";
 constexpr const char* kEncryptedContainer = "060e2b34040101070d010301020b0100";
@@ -795,6 +815,23 @@ void sha1Block(uint32_t h[5], const uint8_t* p) {
         e = d, d = c, c = rol(b, 30), b = a, a = t;
     }
     h[0] += a, h[1] += b, h[2] += c, h[3] += d, h[4] += e;
+}
+
+// SHA-1 of a message (FIPS 180-4), without OpenSSL.
+void sha1Plain(const uint8_t* data, size_t size, uint8_t out[20]) {
+    uint32_t h[5] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0};
+    size_t at = 0;
+    for (; at + 64 <= size; at += 64) sha1Block(h, data + at);
+    uint8_t tail[128] = {};
+    const size_t left = size - at;
+    if (left) std::memcpy(tail, data + at, left);
+    tail[left] = 0x80;
+    const size_t blocks = left + 9 <= 64 ? 1 : 2;
+    const uint64_t bits = uint64_t(size) * 8;
+    for (int k = 0; k < 8; ++k) tail[blocks * 64 - 1 - size_t(k)] = uint8_t(bits >> (8 * k));
+    for (size_t b = 0; b < blocks; ++b) sha1Block(h, tail + 64 * b);
+    for (int i = 0; i < 5; ++i)
+        for (int k = 0; k < 4; ++k) out[4 * i + k] = uint8_t(h[i] >> (24 - 8 * k));
 }
 
 // The 56 bytes after an encrypted triplet's value: the track file, the element's sequence number and its MIC (over
@@ -1841,6 +1878,149 @@ std::vector<uint8_t> ImfPictureWriter::headerMetadata(int64_t duration) const {
 
 std::vector<uint8_t> ImfPictureWriter::indexSegments() const { return vbrIndex(offsets_, rate_); }
 
+// ---- IMF Application #5 (ACES) ------------------------------------------------------------------------------------
+
+bool ImfAcesWriter::open(const std::string& path, const Uuid& asset, EditRate rate, int width, int height, bool alpha, const AcesPicture& picture,
+                         uint32_t aspectNum, uint32_t aspectDen, std::string* error) {
+    width_ = width;
+    height_ = height;
+    alpha_ = alpha;
+    picture_ = picture;
+    aspectNum_ = aspectNum;
+    aspectDen_ = aspectDen;
+    constraints_ = newUuid();
+    pictureSet_ = newUuid();
+    targets_.clear();
+    return openImfFile(path, asset, rate, error);
+}
+
+bool ImfAcesWriter::write(const uint8_t* exr, size_t size, std::string* error) {
+    // (an OpenEXR file starts 76 2f 31 01)
+    if (size < 8 || exr[0] != 0x76 || exr[1] != 0x2f || exr[2] != 0x31 || exr[3] != 0x01) {
+        if (error) *error = "Not an OpenEXR frame";
+        return false;
+    }
+    return writeElement(ul(kAcesElement).data(), exr, size, error);
+}
+
+bool ImfAcesWriter::writeTargetFrames(std::vector<AcesTargetFrame> targets, std::string* error) {
+    // Each named by a UUID made from its bytes (version 5, under Montage's own name space).
+    static const uint8_t space[16] = {0x8d, 0x3e, 0x51, 0x0b, 0x6f, 0x2a, 0x4c, 0x77, 0x9e, 0x14, 0xc2, 0x58, 0x31, 0xa6, 0x0f, 0xd4};
+    uint32_t sid = 10;
+    if (targets.size() > size_t(kMaxTargetFrames)) {
+        if (error) *error = "More than " + std::to_string(kMaxTargetFrames) + " target frames";
+        return false;
+    }
+    for (AcesTargetFrame& t : targets) {
+        if (t.index < 0 || t.index >= frames()) {
+            if (error) *error = "A target frame is not one of the track file's frames";
+            return false;
+        }
+        // (named by the frame it is of as well as its bytes, so two frames that look the same are two resources)
+        Bytes named(space, space + 16);
+        put64(named, uint64_t(t.index));
+        putBytes(named, t.data);
+        uint8_t digest[20];
+        sha1Plain(named.data(), named.size(), digest);
+        std::copy(digest, digest + 16, t.resource.begin());
+        t.resource[6] = uint8_t((t.resource[6] & 0x0f) | 0x50);
+        t.resource[8] = uint8_t((t.resource[8] & 0x3f) | 0x80);
+        t.stream = sid++;
+        t.set = newUuid();
+        if (!startStream(t.stream, error) || !writeElement(ul(kStreamElement).data(), t.data.data(), t.data.size(), error, false)) return false;
+        t.data = {};
+        targets_.push_back(std::move(t));
+    }
+    return true;
+}
+
+std::array<uint8_t, 16> ImfAcesWriter::essenceContainer() const { return ul(kContainer); }
+
+std::vector<uint8_t> ImfAcesWriter::headerMetadata(int64_t duration) const {
+    std::vector<PrimerEntry> entries(std::begin(kCommonPrimer), std::end(kCommonPrimer));
+    entries.insert(entries.end(), std::begin(kAcesPrimer), std::end(kAcesPrimer));
+    Bytes out = primerOf(entries);
+    putBytes(out, packagesImf(ids_, asset_, rate_, duration, created_, kContainer, kPictureDef, "Image Track", 0x15011201,
+                              "File Package: SMPTE ST 2065-5 frame wrapping of ACES image containers"));
+    // B, G, R (A first when there is alpha), each a half float (253), the rest of the eight entries empty.
+    Bytes layout(16, 0);
+    const char* order = alpha_ ? "ABGR" : "BGR";
+    for (int i = 0; order[i]; ++i) layout[size_t(2 * i)] = uint8_t(order[i]), layout[size_t(2 * i + 1)] = 253;
+    std::vector<Uuid> subs = {constraints_, pictureSet_};
+    for (const AcesTargetFrame& t : targets_) subs.push_back(t.set);
+    {
+        // ST 2065-5 leaves out the items that do not apply to ACES: no coding equations, component or alpha ranges,
+        // alpha transparency, second field or image offsets.
+        Set s;
+        s.uuid(0x3c0a, ids_[kDescriptor]);
+        s.refs(0xffff, subs);
+        s.u32(0x3006, 1);
+        s.rational(0x3001, rate_.num, rate_.den);
+        s.i64(0x3002, duration);
+        s.label(0x3004, kContainer);
+        s.u8(0x320c, 0);  // full frame
+        s.u32(0x3203, uint32_t(width_));
+        s.u32(0x3202, uint32_t(height_));
+        s.u32(0x3208, uint32_t(height_));
+        s.u32(0x3209, uint32_t(width_));
+        s.u32(0x320a, 0);
+        s.u32(0x320b, 0);
+        s.rational(0x320e, aspectNum_, aspectDen_);
+        s.label(0x3210, kTransfer);
+        s.label(0x3201, coding());
+        s.label(0x3219, kPrimaries);
+        Bytes lines;
+        put32(lines, 2);
+        put32(lines, 4);
+        put32(lines, 0);
+        put32(lines, 0);
+        s.item(0x320d, lines);
+        s.item(0x3401, layout);
+        putBytes(out, setKlv(0x29, s));
+    }
+    {
+        Set s;  // ContainerConstraintsSubDescriptor (ST 379-2): nothing but its id
+        s.uuid(0x3c0a, constraints_);
+        putBytes(out, setKlv(0x67, s));
+    }
+    {
+        Set s;  // ACESPictureSubDescriptor
+        s.uuid(0x3c0a, pictureSet_);
+        if (!picture_.authoring.empty()) s.text(0xfffe, picture_.authoring);
+        if (picture_.mastering) {
+            // Chromaticities in steps of 0.00002, luminance in steps of 0.0001 cd/m^2.
+            auto xy = [](double v) { return uint64_t(std::clamp(std::lround(v / 0.00002), 0L, 50000L)); };
+            Bytes primaries;
+            for (int i = 0; i < 6; ++i) put16(primaries, xy(picture_.display[i]));
+            s.item(0xfffd, primaries);
+            Bytes white;
+            put16(white, xy(picture_.display[6]));
+            put16(white, xy(picture_.display[7]));
+            s.item(0xfffc, white);
+            s.u32(0xfffb, uint64_t(std::llround(picture_.maxLuminance * 10000)));
+            s.u32(0xfffa, uint64_t(std::llround(picture_.minLuminance * 10000)));
+        }
+        putBytes(out, setKlv(0x79, s));
+    }
+    for (const AcesTargetFrame& t : targets_) {
+        Set s;  // TargetFrameSubDescriptor
+        s.uuid(0x3c0a, t.set);
+        s.uuid(0xfff9, t.resource);
+        s.text(0xfff8, t.mediaType);
+        s.i64(0xfff7, t.index);
+        s.label(0xfff6, t.transfer.c_str());
+        s.label(0xfff5, t.primaries.c_str());
+        s.u32(0xfff4, t.maxRef);
+        s.u32(0xfff3, t.minRef);
+        s.u32(0xfff2, t.stream);
+        s.uuid(0xfff1, pictureSet_);
+        putBytes(out, setKlv(0x7a, s));
+    }
+    return out;
+}
+
+std::vector<uint8_t> ImfAcesWriter::indexSegments() const { return vbrIndex(offsets_, rate_); }
+
 // ---- IMF sound -----------------------------------------------------------------------------------------------------
 
 McaLabel imfSoundfield(int channels) {
@@ -2056,10 +2236,21 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
     asset_ = {};
     channels_ = width_ = height_ = 0;
     rate_ = {};
-    op1a_ = rgba_ = j2k_ = false;
+    op1a_ = rgba_ = j2k_ = aces_ = false;
+    acesAuthoring_.clear();
+    targets_.clear();
     elements_.clear();
     clipAt_ = clipSize_ = 0;
     resources_.clear();
+    std::map<uint16_t, std::string> primer;  // local tags and the labels they stand for (hex, the version byte as 00)
+    // An item of a set by its label, through the primer (its dynamic tags differ between writers).
+    auto item = [&](const std::map<uint16_t, Bytes>& set, const char* hex) -> const Bytes* {
+        std::string want = hex;
+        want.replace(14, 2, "00");
+        for (const auto& [tag, value] : set)
+            if (auto p = primer.find(tag); p != primer.end() && p->second == want) return &value;
+        return nullptr;
+    };
     File file;
     if (!openRead(file, path)) return fail("Cannot open " + path);
     std::map<uint32_t, std::pair<uint64_t, uint64_t>> streamData;  // generic streams' elements, by body stream
@@ -2075,13 +2266,50 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
         const uint64_t value = at + head;
         static const uint8_t essence[12] = {0x06, 0x0e, 0x2b, 0x34, 0x01, 0x02, 0x01, 0x01, 0x0d, 0x01, 0x03, 0x01};
         static const uint8_t set[6] = {0x06, 0x0e, 0x2b, 0x34, 0x02, 0x53};
-        if (std::memcmp(key, ul(kStreamPartition).data(), 16) == 0 && length >= 64) {
+        if (std::memcmp(key, ul("060e2b34020501010d01020101050100").data(), 16) == 0 && length >= 8 && length < (1u << 20)) {
+            Bytes v(static_cast<size_t>(length));
+            if (!file.read(v.data(), v.size())) return fail(path + " is damaged");
+            const uint64_t n = beOf(Bytes(v.begin(), v.begin() + 4)), each = beOf(Bytes(v.begin() + 4, v.begin() + 8));
+            for (uint64_t i = 0; each == 18 && i < n && 8 + 18 * (i + 1) <= v.size(); ++i) {
+                const uint8_t* e = v.data() + 8 + 18 * i;
+                std::string label = hexOf(e + 2);
+                label.replace(14, 2, "00");
+                primer[uint16_t(e[0] << 8 | e[1])] = label;
+            }
+        } else if (std::memcmp(key, ul(kStreamPartition).data(), 16) == 0 && length >= 64) {
             // (a generic stream partition: its BodySID, 60 bytes into the pack)
             Bytes v(64);
             if (!file.read(v.data(), v.size())) return fail(path + " is damaged");
             stream = uint32_t(beOf(Bytes(v.begin() + 60, v.begin() + 64)));
         } else if (std::memcmp(key, ul(kStreamElement).data(), 13) == 0) {
             if (stream) streamData[stream] = {value, length};
+        } else if (std::memcmp(key, set, 6) == 0 && length < (1u << 20) && (key[14] == 0x79 || key[14] == 0x7a)) {
+            // ACES picture and target frame sub-descriptors (ST 2065-5).
+            Bytes v(static_cast<size_t>(length));
+            if (!file.read(v.data(), v.size())) return fail(path + " is damaged");
+            const auto it = items(v);
+            auto text = [](const Bytes& b) {
+                std::string out;
+                for (size_t i = 0; i + 1 < b.size(); i += 2)
+                    if (const unsigned c = unsigned(b[i]) << 8 | b[i + 1]; c >= 0x20 && c < 0x7f) out += char(c);
+                return out;
+            };
+            if (key[14] == 0x79) {
+                if (const Bytes* a = item(it, "060e2b340101010e0401060a01000000")) acesAuthoring_ = text(*a);
+            } else {
+                TargetFrame t;
+                const Bytes* id = item(it, "060e2b340101010e0401060901000000");
+                const Bytes* type = item(it, "060e2b340101010e0401060902000000");
+                const Bytes* index = item(it, "060e2b340101010e0401060903000000");
+                const Bytes* sid = item(it, "060e2b340101010e0401060908000000");
+                if (id && id->size() == 16 && index && index->size() == 8 && sid && sid->size() == 4 && targets_.size() < 10000) {
+                    std::copy(id->begin(), id->end(), t.resource.begin());
+                    t.index = int64_t(std::min<uint64_t>(beOf(*index), uint64_t(1) << 40));
+                    t.stream = uint32_t(beOf(*sid));
+                    if (type) t.mediaType = text(*type);
+                    targets_.push_back(t);
+                }
+            }
         } else if (std::memcmp(key, set, 6) == 0 && length < (1u << 20) && key[14] == 0x65) {
             // A timed text resource: its id and stream.
             Bytes v(static_cast<size_t>(length));
@@ -2095,7 +2323,7 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
             }
         } else if (std::memcmp(key, essence, 12) == 0) {
             // (past the header: what it said is all there is)
-            if (imfPictureOnly && !(op1a_ && rgba_ && j2k_)) return fail(path + " is not an IMF picture track file");
+            if (imfPictureOnly && !(op1a_ && rgba_ && (j2k_ || aces_))) return fail(path + " is not an IMF picture track file");
             if (key[12] == 0x15) {
                 // (a frame a few bytes long, by the million: a damaged or hostile file, not pictures)
                 if (elements_.size() >= (size_t(1) << 24)) return fail(path + " has too many frames");
@@ -2135,9 +2363,13 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
                         return fail(path + " is not 24-bit sound");
                 }
                 // (the essence container: the JPEG 2000 mapping, 06.0e.2b.34.04.01.01.xx.0d.01.03.01.02.0c)
-                if (auto ec = it.find(0x3004); ec != it.end() && ec->second.size() == 16 && (key[14] == 0x29 || key[14] == 0x28))
-                    j2k_ = ec->second[8] == 0x0d && ec->second[9] == 0x01 && ec->second[10] == 0x03 && ec->second[11] == 0x01 &&
-                           ec->second[12] == 0x02 && ec->second[13] == 0x0c;
+                // (or ACES, ...02.19, ST 2065-5)
+                if (auto ec = it.find(0x3004); ec != it.end() && ec->second.size() == 16 && (key[14] == 0x29 || key[14] == 0x28)) {
+                    const bool gc = ec->second[8] == 0x0d && ec->second[9] == 0x01 && ec->second[10] == 0x03 && ec->second[11] == 0x01 &&
+                                    ec->second[12] == 0x02;
+                    j2k_ = gc && ec->second[13] == 0x0c;
+                    aces_ = gc && ec->second[13] == 0x19;
+                }
                 if (auto r = it.find(0x3001); r != it.end() && r->second.size() == 8)
                     rate_ = EditRate{uint32_t(beOf(Bytes(r->second.begin(), r->second.begin() + 4))), uint32_t(beOf(Bytes(r->second.begin() + 4, r->second.end())))};
             }
@@ -2155,7 +2387,20 @@ bool ImfTrackReader::open(const std::string& path, std::string* error, bool imfP
         const auto d = streamData.find(sid);
         resources_.push_back({id, d == streamData.end() ? 0 : d->second.first, d == streamData.end() ? 0 : d->second.second, d != streamData.end()});
     }
+    for (TargetFrame& t : targets_)
+        if (const auto d = streamData.find(t.stream); d != streamData.end()) t.at = d->second.first, t.size = d->second.second, t.present = true;
     return true;
+}
+
+bool ImfTrackReader::targetFrame(size_t i, std::vector<uint8_t>& out, std::string* error) const {
+    File file;
+    if (i < targets_.size() && targets_[i].present && targets_[i].size <= (uint64_t(1) << 30) && openRead(file, path_) &&
+        file.seek(targets_[i].at) && file.fits(targets_[i].size)) {
+        out.resize(size_t(targets_[i].size));
+        if (file.read(out.data(), out.size())) return true;
+    }
+    if (error) *error = "Cannot read target frame " + std::to_string(i) + " of " + path_;
+    return false;
 }
 
 bool ImfTrackReader::resource(const Uuid& id, std::vector<uint8_t>& out, std::string* error) const {

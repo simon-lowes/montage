@@ -156,8 +156,9 @@ LearnEffectDialog::LearnEffectDialog(EditorState* state, Id clip, QWidget* paren
 }
 
 LearnEffectDialog::~LearnEffectDialog() {
+    // (Not waited for: a render of an example can take a while. The work holds copies of all it uses and stops at the
+    // next step; what it would tell the dialog goes nowhere.)
     cancel_->store(true);
-    watcher_.waitForFinished();
 }
 
 void LearnEffectDialog::setFrames(std::vector<FrameTime> frames) {
@@ -229,6 +230,7 @@ bool LearnEffectDialog::train(bool wait) {
             learn::Pair p;
             std::string err;
             if (!learningPair(project, *sq, *cc, f, p, &err)) return QString::fromStdString(err);
+            fitLearningPair(p, learningPixelsEach(job->frames.size()));
             pairs.push_back(std::move(p));
         }
         job->trainer = std::make_shared<learn::Trainer>(learn::NetShape{}, std::move(pairs), options);
@@ -251,7 +253,7 @@ bool LearnEffectDialog::train(bool wait) {
             if (done % 100 != 0 && done != steps) return;
             const Image learned = learn::applyNet(t.net(), small);
             QMetaObject::invokeMethod(
-                self.data(),
+                QCoreApplication::instance(),  // (not the dialog, which may be gone by the time it is posted: it is checked there)
                 [self, done, loss, small, learned] {
                     if (!self) return;
                     self->progress_->setValue(done);
@@ -271,7 +273,7 @@ bool LearnEffectDialog::train(bool wait) {
         const int trained = t.steps();
         const double loss = t.loss();
         QMetaObject::invokeMethod(
-            self.data(),
+            QCoreApplication::instance(),
             [self, job, file, trained, loss] {
                 if (!self) return;
                 self->trainer_ = job->trainer;

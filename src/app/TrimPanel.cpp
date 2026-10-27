@@ -14,6 +14,7 @@
 
 #include "EditorState.h"
 #include "core/EditOps.h"
+#include "render/ColorSpace.h"
 #include "render/TrimPasses.h"
 
 namespace montage {
@@ -44,6 +45,16 @@ TrimPanel::TrimPanel(EditorState* state, QWidget* parent) : QWidget(parent), sta
     top->addWidget(add_);
     top->addWidget(remove_);
     v->addLayout(top);
+    // An SDR target's tone mapping: Montage's roll-off, or a BT.2446 method.
+    auto* mapping = new QFormLayout;
+    toneMapping_ = new QComboBox(this);
+    toneMapping_->setObjectName(QStringLiteral("trimToneMapping"));
+    toneMapping_->addItem(tr("Montage (highlights rolled off)"), QString());
+    toneMapping_->addItem(tr("BT.2446 Method A"), QStringLiteral("bt2446a"));
+    toneMapping_->addItem(tr("BT.2446 Method C"), QStringLiteral("bt2446c"));
+    toneMapping_->setToolTip(tr("How the HDR master is made into this SDR target, before its trims"));
+    mapping->addRow(tr("Tone mapping:"), toneMapping_);
+    v->addLayout(mapping);
 
     shotLabel_ = new QLabel(this);
     shotLabel_->setObjectName(QStringLiteral("trimShot"));
@@ -105,6 +116,11 @@ TrimPanel::TrimPanel(EditorState* state, QWidget* parent) : QWidget(parent), sta
         if (updating_) return;
         refresh();
         emit shownChanged(shown());
+    });
+    connect(toneMapping_, &QComboBox::currentIndexChanged, this, [this] {
+        const std::string target = shown().toStdString(), value = toneMapping_->currentData().toString().toStdString();
+        if (updating_ || target.empty()) return;
+        state_->apply(tr("Tone Mapping"), [target, value](Project&, Sequence& s) { return edit::setTrimTargetToneMapping(s, target, value); });
     });
     connect(remove_, &QToolButton::clicked, this, [this] {
         if (QMessageBox::question(this, tr("Remove Trim Target"), tr("Remove %1 and every shot's trim for it?").arg(targets_->currentText())) ==
@@ -176,6 +192,11 @@ void TrimPanel::refreshShot() {
         box->setToolTip(has && p != trim->second.params.end() && p->second.animated() ? tr("Keyframed: set at the playhead") : QString());
     }
     remove_->setEnabled(!target.empty());
+    // (for an SDR target of an HDR master)
+    const TrimTarget* shownTarget = s ? findTrimTarget(*s, target) : nullptr;
+    const ColorSpace* targetSpace = shownTarget ? findColorSpace(shownTarget->colorSpace) : nullptr;
+    toneMapping_->setEnabled(targetSpace && !targetSpace->hdr() && sequenceColorSpace(*s).hdr() && !sceneReferredWorking(*s));
+    toneMapping_->setCurrentIndex(std::max(0, toneMapping_->findData(shownTarget ? QString::fromStdString(shownTarget->toneMapping) : QString())));
     reset_->setEnabled(has);
     copy_->setEnabled(editing);
     queue_->setEnabled(s && !s->trimTargets.empty());

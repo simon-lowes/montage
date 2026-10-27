@@ -148,7 +148,7 @@ bool hasOwnTrim(const Clip& c, const std::string& target) {
 std::vector<AutoTrim> solveAutoTrims(const Sequence& s, const std::string& targetId, const std::vector<ShotLight>& shots) {
     std::vector<AutoTrim> out;
     const TrimTarget* target = findTrimTarget(s, targetId);
-    const ColorSpace* to = target ? findColorSpace(target->colorSpace) : nullptr;
+    const ColorSpace* to = target ? trimTargetDisplay(s, *target) : nullptr;
     const ColorSpace& from = sequenceColorSpace(s);
     if (!to || !from.hdr()) return out;
     const double master = from.transfer == Transfer::Pq ? std::clamp(s.hdrPeakNits, 100.0, 10000.0) : 1000;
@@ -182,7 +182,7 @@ std::vector<AutoTrim> solveAutoTrims(const Sequence& s, const std::string& targe
             a.values[name] = v;
         };
         // The highlight roll-off from the shot's own brightest (all but its brightest 0.1 %).
-        const double headroom = to->hdr() ? peak : kSdrHeadroomNits;
+        const double headroom = to->hdr() ? peak : sdrHeadroomNits(*to);
         if (master > headroom) {
             const double top = std::clamp(l.high, 1.0, master);
             if (to->hdr() || top > headroom) set("peak", std::round(top));

@@ -6,11 +6,14 @@
 #include <QPainterPath>
 #include <algorithm>
 #include <cmath>
+#include <map>
 
 #include "EditorState.h"
 #include "MonitorPanel.h"
 #include "core/EditOps.h"
+#include "core/Effects.h"
 #include "render/Compositor.h"
+#include "render/MeshWarp.h"
 #include "render/Processing.h"
 #include "render/Restoration.h"
 
@@ -27,6 +30,7 @@ PaintOverlay::PaintOverlay(EditorState* state, ViewerWidget* viewer) : QObject(v
     connect(state_, &EditorState::paintEffectChanged, this, [this] {
         source_.reset();
         stroke_.clear();
+        dragging_ = -1;
     });
 }
 
@@ -45,7 +49,8 @@ std::optional<PaintOverlay::Target> PaintOverlay::target() const {
         for (const Effect& e : c.effects)
             if (e.enabled && e.type == "stop_motion") lt -= lt % std::max<FrameTime>(1, FrameTime(std::lround(e.p("hold", lt, 3))));
         for (const Effect& e : c.effects)
-            if (e.id == armed && e.enabled && (e.type == "paint" || e.type == "dust_spots" || e.type == "depth_blur")) {
+            if (e.id == armed && e.enabled &&
+                (e.type == "paint" || e.type == "dust_spots" || e.type == "depth_blur" || e.type == "mesh_warp" || e.type == "grid_warp")) {
                 // Dust spots are taken out where a video or picture file is read (not in nested sequences or generators).
                 const MediaItem* m = state_->project().findMedia(c.mediaId);
                 if (e.type == "dust_spots" && (!m || (m->kind != MediaKind::Video && m->kind != MediaKind::Image))) return std::nullopt;
@@ -54,6 +59,8 @@ std::optional<PaintOverlay::Target> PaintOverlay::target() const {
                 tg.effect = e.id;
                 tg.dust = e.type == "dust_spots";
                 tg.focus = e.type == "depth_blur";
+                tg.mesh = e.type == "mesh_warp";
+                tg.grid = e.type == "grid_warp";
                 tg.lt = lt;
                 tg.brush = e.p("brush", tg.lt, tg.dust ? 24 : 30);
                 return tg;
@@ -106,6 +113,46 @@ void PaintOverlay::paint(QPainter& p, const QRectF& picture) {
     p.setRenderHint(QPainter::Antialiasing);
     p.setBrush(Qt::NoBrush);
     const double wpx = picture.width() / seq->width;  // widget pixels a sequence pixel
+    if (t->mesh || t->grid) {
+        const std::vector<std::pair<int, QPointF>> hs = handles(*t, *e);
+        auto shown = [&](int id, QPointF at) { return id == dragging_ && drawing_.effect == t->effect ? mouse_ + grab_ : at; };
+        if (t->grid) {
+            // The grid's lines, then its points.
+            const int cols = std::clamp(int(std::lround(e->p("cols", 0, 3))), 1, 12);
+            std::map<int, QPointF> at;
+            for (const auto& [id, w] : hs) at[id] = shown(id, w);
+            p.setPen(QPen(QColor(255, 255, 255, 170), 1));
+            for (const auto& [id, w] : at) {
+                if (id % 1000 < cols && at.count(id + 1)) p.drawLine(w, at[id + 1]);
+                if (at.count(id + 1000)) p.drawLine(w, at[id + 1000]);
+            }
+            for (const auto& [id, w] : at) {
+                p.setPen(QPen(QColor(0, 0, 0, 160), 3));
+                p.drawRect(QRectF(w - QPointF(4, 4), QSizeF(8, 8)));
+                p.setPen(QPen(QColor(255, 200, 0, 230), 1.5));
+                p.drawRect(QRectF(w - QPointF(4, 4), QSizeF(8, 8)));
+            }
+        } else {
+            // Each pin as a dot in its kind's colour (yellow Position, red Stiff, green Bend, blue Overlap), its reach
+            // as a dashed circle.
+            static const QColor colours[4] = {QColor(255, 210, 0), QColor(255, 80, 60), QColor(80, 220, 120), QColor(80, 170, 255)};
+            for (const auto& [k, w0] : hs) {
+                const int kind = meshPinKind(*e, k);
+                const QPointF w = shown(k, w0);
+                if (kind != 0) {
+                    const double r = e->p("pin" + std::to_string(k) + ".radius", t->lt, 80) * wpx;
+                    p.setPen(QPen(colours[kind], 1, Qt::DashLine));
+                    p.drawEllipse(w, r, r);
+                }
+                p.setPen(QPen(QColor(0, 0, 0, 170), 2));
+                p.setBrush(colours[kind]);
+                p.drawEllipse(w, 5, 5);
+                p.setBrush(Qt::NoBrush);
+            }
+        }
+        p.restore();
+        return;
+    }
     if (t->focus) {
         // The focus point (when it focuses on one), and a target under the mouse.
         auto target = [&](QPointF at, const QColor& colour) {
@@ -173,6 +220,136 @@ void PaintOverlay::paint(QPainter& p, const QRectF& picture) {
         }
     }
     p.restore();
+}
+
+std::vector<std::pair<int, QPointF>> PaintOverlay::handles(const Target& t, const Effect& e) const {
+    std::vector<std::pair<int, QPointF>> out;
+    const Sequence* seq = state_->sequence();
+    const Clip* c = seq ? edit::clipById(*seq, t.clip) : nullptr;
+    double fw = 0, fh = 0;
+    if (!c || !clipFrameSize(state_->project(), *seq, *c, fw, fh) || fw < 1 || fh < 1) return out;
+    if (t.grid) {
+        const int rows = std::clamp(int(std::lround(e.p("rows", 0, 3))), 1, 12), cols = std::clamp(int(std::lround(e.p("cols", 0, 3))), 1, 12);
+        for (int r = 0; r <= rows; ++r)
+            for (int col = 0; col <= cols; ++col) {
+                const MeshPoint q = gridWarpPointAt(e, double(t.lt), r, col);
+                QPointF w;
+                if (toWidget(t.clip, q[0], q[1], w)) out.emplace_back(r * 1000 + col, w);
+            }
+        return out;
+    }
+    // Position pins where they are put; the others where the warp takes them.
+    const int W = int(std::lround(fw)), H = int(std::lround(fh));
+    const double scale = fw / std::max(1, seq->width);
+    std::vector<int> others;
+    std::vector<MeshPoint> rest;
+    for (int k : meshPins(e)) {
+        const std::string pre = "pin" + std::to_string(k) + ".";
+        const double x = e.p(pre + "x", t.lt, 0.5), y = e.p(pre + "y", t.lt, 0.5);
+        QPointF w;
+        if (meshPinKind(e, k) == 0) {
+            if (toWidget(t.clip, e.p(pre + "to_x", t.lt, x), e.p(pre + "to_y", t.lt, y), w)) out.emplace_back(k, w);
+        } else {
+            others.push_back(k);
+            rest.push_back({x * W, y * H});
+        }
+    }
+    if (!others.empty()) {
+        const std::vector<MeshPoint> moved = meshWarpMoved(e, double(t.lt), W, H, scale, rest);
+        for (size_t i = 0; i < others.size(); ++i) {
+            QPointF w;
+            if (toWidget(t.clip, moved[i][0] / W, moved[i][1] / H, w)) out.emplace_back(others[i], w);
+        }
+    }
+    return out;
+}
+
+int PaintOverlay::handleAt(const Target& t, const Effect& e, const QPointF& at) const {
+    int best = -1;
+    double nearest = 9;
+    for (const auto& [id, w] : handles(t, e))
+        if (const double d = QLineF(w, at).length(); d <= nearest) nearest = d, best = id;
+    return best;
+}
+
+void PaintOverlay::placePin(const Target& t, const QPointF& at) {
+    const Sequence* seq = state_->sequence();
+    const Clip* c = seq ? edit::clipById(*seq, t.clip) : nullptr;
+    const Effect* e = c ? edit::ownedEffect(const_cast<Sequence&>(*seq), t.clip, t.effect) : nullptr;
+    double fw = 0, fh = 0, u, v;
+    if (!e || !clipFrameSize(state_->project(), *seq, *c, fw, fh) || fw < 1 || fh < 1 || !fromWidget(t.clip, at, u, v)) return;
+    // Where on the picture at rest the point clicked is (as the mesh is bent now).
+    const int W = int(std::lround(fw)), H = int(std::lround(fh));
+    MeshPoint rest{u * W, v * H};
+    if (!meshWarpRestOf(*e, double(t.lt), W, H, fw / std::max(1, seq->width), {u * W, v * H}, rest)) rest = {u * W, v * H};
+    const Id clip = t.clip, effect = t.effect;
+    const int kind = state_->meshPinKind();
+    state_->edit(tr("Add Pin"), [=](Project&, Sequence& sq) {
+        Effect* ef = edit::ownedEffect(sq, clip, effect);
+        if (!ef) return false;
+        const int k = addMeshPin(*ef, kind, rest[0] / W, rest[1] / H);
+        if (kind == 0) {
+            ef->params["pin" + std::to_string(k) + ".to_x"] = Param(u);
+            ef->params["pin" + std::to_string(k) + ".to_y"] = Param(v);
+        }
+        return true;
+    });
+}
+
+void PaintOverlay::dropHandle(const Target& t, const QPointF& at, bool remove) {
+    const Sequence* seq = state_->sequence();
+    const Clip* c = seq ? edit::clipById(*seq, t.clip) : nullptr;
+    const Effect* e = c ? edit::ownedEffect(const_cast<Sequence&>(*seq), t.clip, t.effect) : nullptr;
+    const int id = dragging_;
+    dragging_ = -1;
+    double fw = 0, fh = 0, u, v;
+    if (!e || id < 0 || !clipFrameSize(state_->project(), *seq, *c, fw, fh) || fw < 1 || fh < 1 || !fromWidget(t.clip, at, u, v)) return;
+    const Id clip = t.clip, effect = t.effect;
+    const FrameTime lt = t.lt;
+    if (t.grid) {
+        const int rows = std::clamp(int(std::lround(e->p("rows", 0, 3))), 1, 12), cols = std::clamp(int(std::lround(e->p("cols", 0, 3))), 1, 12);
+        const int r = id / 1000, col = id % 1000;
+        const double dx = u - double(col) / cols, dy = v - double(r) / rows;
+        state_->edit(tr("Move Grid Point"), [=](Project&, Sequence& sq) {
+            Effect* ef = edit::ownedEffect(sq, clip, effect);
+            if (!ef) return false;
+            const std::string n = gridWarpPoint(r, col);
+            ef->params[n + ".dx"].set(lt, dx);
+            ef->params[n + ".dy"].set(lt, dy);
+            return true;
+        });
+        return;
+    }
+    if (remove) {
+        state_->edit(tr("Remove Pin"), [=](Project&, Sequence& sq) {
+            Effect* ef = edit::ownedEffect(sq, clip, effect);
+            const std::vector<int> pins = ef ? meshPins(*ef) : std::vector<int>{};
+            if (std::find(pins.begin(), pins.end(), id) == pins.end()) return false;
+            removeMeshPin(*ef, id);
+            return true;
+        });
+        return;
+    }
+    const int kind = meshPinKind(*e, id);
+    MeshPoint rest{0, 0};
+    const int W = int(std::lround(fw)), H = int(std::lround(fh));
+    // Any other pin: put where on the picture at rest the point it is dropped on is.
+    if (kind != 0 && !meshWarpRestOf(*e, double(lt), W, H, fw / std::max(1, seq->width), {u * W, v * H}, rest)) return;
+    state_->edit(tr("Move Pin"), [=](Project&, Sequence& sq) {
+        Effect* ef = edit::ownedEffect(sq, clip, effect);
+        const std::vector<int> pins = ef ? meshPins(*ef) : std::vector<int>{};
+        if (std::find(pins.begin(), pins.end(), id) == pins.end() || meshPinKind(*ef, id) != kind) return false;  // (undone meanwhile)
+        const std::string pre = "pin" + std::to_string(id) + ".";
+        if (kind == 0) {
+            // A key here when it is keyed.
+            ef->params[pre + "to_x"].set(lt, u);
+            ef->params[pre + "to_y"].set(lt, v);
+        } else {
+            ef->params[pre + "x"] = Param(rest[0] / W);
+            ef->params[pre + "y"] = Param(rest[1] / H);
+        }
+        return true;
+    });
 }
 
 void PaintOverlay::pickFocus(const Target& t, double u, double v) {
@@ -290,6 +467,26 @@ bool PaintOverlay::eventFilter(QObject* obj, QEvent* e) {
         inside_ = true;
         double u, v;
         if (!fromWidget(t->clip, mouse_, u, v)) return true;
+        if (t->mesh || t->grid) {
+            const Sequence* seq = state_->sequence();
+            const Effect* ef = seq ? edit::ownedEffect(const_cast<Sequence&>(*seq), t->clip, t->effect) : nullptr;
+            if (!ef) return true;
+            const int id = handleAt(*t, *ef, mouse_);
+            drawing_ = *t;
+            if (id >= 0 && t->mesh && (me->modifiers() & Qt::ControlModifier)) {
+                dragging_ = id;
+                dropHandle(*t, mouse_, true);
+            } else if (id >= 0) {
+                dragging_ = id;
+                pressAt_ = mouse_;
+                for (const auto& [h, w] : handles(*t, *ef))
+                    if (h == id) grab_ = w - mouse_;
+            } else if (t->mesh && u >= 0 && u <= 1 && v >= 0 && v <= 1) {
+                placePin(*t, mouse_);
+            }
+            viewer_->update();
+            return true;
+        }
         if (t->dust) {
             markSpot(*t, mouse_, me->modifiers() & Qt::ControlModifier);
             return true;
@@ -314,6 +511,10 @@ bool PaintOverlay::eventFilter(QObject* obj, QEvent* e) {
         if (!t) return false;
         mouse_ = me->position();
         inside_ = viewer_->imageRect().contains(mouse_);
+        if (dragging_ >= 0) {
+            viewer_->update();
+            return true;
+        }
         double u, v;
         if (!stroke_.empty() && (me->buttons() & Qt::LeftButton) && fromWidget(drawing_.clip, mouse_, u, v)) {
             // A point each time it has moved a fifth of the brush.
@@ -325,6 +526,15 @@ bool PaintOverlay::eventFilter(QObject* obj, QEvent* e) {
     }
     case QEvent::MouseButtonRelease: {
         auto* me = static_cast<QMouseEvent*>(e);
+        if (me->button() == Qt::LeftButton && dragging_ >= 0) {
+            mouse_ = me->position();
+            // (a click on a handle without moving it leaves it where it is)
+            if (QLineF(pressAt_, mouse_).length() < 3) dragging_ = -1;
+            else dropHandle(drawing_, mouse_ + grab_, false);
+            drawing_ = {};
+            viewer_->update();
+            return true;
+        }
         if (me->button() != Qt::LeftButton || stroke_.empty()) return target().has_value() && me->button() == Qt::LeftButton;
         mouse_ = me->position();
         double u, v;

@@ -5,6 +5,8 @@
 #pragma once
 
 #include <QDialog>
+#include <optional>
+#include <string>
 
 #include "core/Interpretation.h"
 #include "core/Model.h"
@@ -28,6 +30,9 @@ public:
     bool highlightsShown() const { return highlightsShown_; }
     // Pulldown: "" none, "keep" as each item has it, "auto" each item's cadence to be found, "A" to "D" where it starts.
     QString pulldownChoice() const;
+    // How SDR pictures are brought into HDR (render/ColorSpace.h ToneMapping id); not offered (null) for HDR or camera
+    // media, which keep theirs.
+    std::optional<std::string> sdrExpand() const;
 
 private:
     QRadioButton* fileRate_ = nullptr;
@@ -43,6 +48,7 @@ private:
     QComboBox* pulldown_ = nullptr;
     QComboBox* stereo_ = nullptr;
     QCheckBox* swapEyes_ = nullptr;
+    QComboBox* sdrExpand_ = nullptr;
     // Camera RAW (stills and CinemaDNG).
     QDoubleSpinBox* exposure_ = nullptr;
     QComboBox* whiteBalance_ = nullptr;

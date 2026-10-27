@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "EditorState.h"
+#include "WorkProgress.h"
 #include "audio/AraHost.h"
 #include "audio/PluginEffect.h"
 #include "core/EditOps.h"
@@ -94,9 +95,24 @@ bool PluginEditorWindow::start(QString* error) {
         // An ARA plug-in edits the clip's document: its editor view and renderer bound to the clip's sound.
         const Sequence* s = state_->sequence();
         const Clip* c = s ? edit::clipById(*s, clip_) : nullptr;
-        std::string key;
-        AudioBufferPtr sound;
-        if (!c || !ara::clipSource(state_->project(), *s, *c, key, sound, &err) || !(ara_ = ara::liveSession(*e, key, sound, &err)))
+        if (!c) return fail(tr("The ARA plug-in could not open the clip: %1").arg(tr("the clip is gone")));
+        // (The clip's sound as it reaches the plug-in: the source effects before it may take a while, so off this thread,
+        // on copies.)
+        struct Source {
+            bool ok = false;
+            std::string key, error;
+            AudioBufferPtr sound;
+        };
+        const Source src = withProgress<Source>(this, tr("Preparing the clip's sound…"),
+                                                [project = state_->project(), seq = *s, clip = *c, fx = *e](const auto&) {
+                                                    Source r;
+                                                    r.ok = ara::clipSource(project, seq, clip, r.key, r.sound, &r.error, &fx);
+                                                    return r;
+                                                });
+        err = src.error;
+        e = effect();  // (looked up again: the project may have changed meanwhile)
+        if (!e) return fail(tr("The ARA plug-in could not open the clip: %1").arg(tr("the effect is gone")));
+        if (!src.ok || !(ara_ = ara::liveSession(*e, src.key, src.sound, &err)))
             return fail(tr("The ARA plug-in could not open the clip: %1").arg(QString::fromStdString(err)));
         araArchive_ = e->s("archive");
     } else {
@@ -231,7 +247,11 @@ void PluginEditorWindow::saveSettings() {
     else inst->idle();
     const std::string state = plugins::encodeState(inst->saveState());
     // An ARA plug-in's edits live in its document, kept with the project as an archive when it reports a change.
-    const std::string archive = ara_ && ara_->changed() ? plugins::encodeState(ara_->archive()) : std::string();
+    std::string archive;
+    if (ara_ && ara_->changed()) {
+        archive = plugins::encodeState(ara_->archive());
+        if (archive.empty()) ara_->stillChanged();  // (not stored: tried again next time)
+    }
     const bool newState = !state.empty() && state != e->s("state");
     const bool newArchive = ara_ && !archive.empty() && archive != e->s("archive");
     if (!newState && !newArchive) return;

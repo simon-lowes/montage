@@ -818,7 +818,17 @@ void grainMatch(const Effect& e, FrameTime t, Image& img) {
     s.size = e.p("size", t, 100) / 100;
     s.saturation = e.p("saturation", t, 100) / 100;
     s.seed = uint32_t(std::max(0.0, e.p("seed", t, 0)));
-    addGrain(img, currentWorkingSpace(), effectGrainProfile(e), s, t);
+    const ColorSpace& working = currentWorkingSpace();
+    // (Graded scene-referred, the picture is in the working space and the profile in the sequence's, where the plate's
+    // grain was measured: the grain is added there, its strength in each light and colour as measured, and the picture
+    // taken back.)
+    if (const SceneGrading* sg = currentSceneGrading(); sg && sg->delivery && sg->delivery->id != working.id) {
+        convertExactly(img, working, *sg->delivery);
+        addGrain(img, *sg->delivery, effectGrainProfile(e), s, t);
+        convertExactly(img, *sg->delivery, working);
+        return;
+    }
+    addGrain(img, working, effectGrainProfile(e), s, t);
 }
 
 }  // namespace montage

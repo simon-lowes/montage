@@ -9,6 +9,7 @@
 #include <set>
 
 #include "Exporter.h"
+#include "core/ProjectMerge.h"
 #include "audio/DialogueAlign.h"
 #include "core/GraphicsTemplate.h"
 #include "core/Interpretation.h"
@@ -294,6 +295,7 @@ bool consolidateProject(const Project& p, const ConsolidateOptions& o, Consolida
     }
     const fs::path projectPath = folder / u8path(o.name + ".montage");
     std::string err;
+    if (!o.trim) setMergeBase(q, q);  // (what it starts as, to be merged back; a consolidated copy plays other files)
     if (!saveProject(q, utf8(projectPath), &err)) return fail(err.empty() ? "Cannot save the project" : err);
     res.projectPath = utf8(projectPath);
     if (progress) progress(1.0);

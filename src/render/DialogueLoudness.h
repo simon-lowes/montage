@@ -27,6 +27,17 @@ struct DialogueLoudnessOptions {
     FrameTime in = 0, out = -1;          // the range measured; out -1 = the sequence's end
     bool layout = false;                 // the sequence's own channels (surround weighted as BS.1770 says), not stereo
     double minSpeechShare = 0.15;        // below this share of speech the programme's loudness counts
+    bool leqm = false;                   // also Leq(M) (media/Loudness.h LeqMMeter), with cinema calibration
+    bool log = false;                    // also the readings every 100 ms (DialogueLoudness::log)
+};
+
+// The readings over one 100 ms step: the loudness of the 400 ms and 3 s ending with it, and its true peak.
+struct LoudnessLogPoint {
+    double t = 0;             // timeline seconds at the step's end
+    float momentary = -200;   // LUFS
+    float shortTerm = -200;   // LUFS
+    float truePeak = -96;     // dBTP
+    bool speech = false;      // marked as dialogue
 };
 
 struct DialogueLoudness {
@@ -39,8 +50,25 @@ struct DialogueLoudness {
     double minSpeechShare = 0.15;  // the share asked for
     SpeechGate gate = SpeechGate::Auto;  // how the speech was found
     std::vector<std::pair<double, double>> speech;  // timeline seconds
+    double range = 0;          // loudness range (EBU Tech 3342), LU
+    double dialogueRange = 0;  // the same over the dialogue only (0 without enough of it)
+    double leqm = 0;           // Leq(M) (with DialogueLoudnessOptions::leqm; 0 otherwise or for silence)
+    std::vector<LoudnessLogPoint> log;  // with DialogueLoudnessOptions::log
     double value() const { return usesProgramme ? programme : dialogue; }
 };
+
+// The readings of a meter already fed with a delivery's sound (its first sample at timeline second `start`), its
+// 100 ms steps marked as dialogue where `speech` (timeline seconds, as timelineSpeech gives them, `gate` saying how they
+// were found) says.
+class LoudnessMeter;
+class LeqMMeter;
+DialogueLoudness loudnessOfMeter(LoudnessMeter& meter, const LeqMMeter* leqm, double start, int rate,
+                                 const std::vector<std::pair<double, double>>& speech, SpeechGate gate, double minSpeechShare = 0.15,
+                                 bool log = true);
+
+// Leq(M)'s channel gains for the sequence's layout (amplitude), as cinemas are calibrated: the screen channels and the
+// LFE at 0 dB, the surrounds and overheads 3 dB down; stereo both 0 dB.
+std::vector<double> leqmChannelGains(const std::string& audioLayout, int channels);
 
 // Where the sequence itself says someone speaks, in timeline seconds (merged, in order), without listening: heard
 // Dialogue-role clips (Roles) or transcribed words, a little padded (Transcripts), over [from, to) seconds (to < 0:

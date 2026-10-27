@@ -98,6 +98,7 @@
 #include "core/Interchange.h"
 #include "core/MediaLog.h"
 #include "core/ProjectIO.h"
+#include "core/ProjectMerge.h"
 #include "core/ScriptCut.h"
 #include "render/LinedScript.h"
 #include "render/FilmLists.h"
@@ -164,10 +165,12 @@
 #include "render/OGraf.h"
 #include "render/Gallery.h"
 #include "render/DialogueLoudness.h"
+#include "render/LoudnessReport.h"
 #include "render/AutoTrims.h"
 #include "render/TrimPasses.h"
 #include "media/Segmenter.h"
 #include "render/Compositor.h"
+#include "render/Titles.h"
 #include "render/Exporter.h"
 #include "render/RenderFarm.h"
 #include "render/Shorts.h"
@@ -1622,11 +1625,12 @@ void McpServer::Impl::addTools() {
                 if (!examples.contains(f)) throw ArgError{QStringLiteral("Frame %1 is not on the clip").arg(tc(f, s))};
                 learn::Pair p;
                 if (!learningPair(l.project, s, examples, f, p, &err)) return fail(QString::fromStdString(err));
+                fitLearningPair(p, learningPixelsEach(frames.size()));
                 pairs.push_back(std::move(p));
             }
             learn::TrainOptions o;
             o.seed = uint64_t(std::clamp(a.value("seed").toDouble(1), 0.0, 9007199254740992.0));
-            learn::Trainer trainer(learn::NetShape{}, pairs, o);
+            learn::Trainer trainer(learn::NetShape{}, std::move(pairs), o);
             if (a.value("continue").toBool()) {
                 const std::string from = learnedNetworkOf(examples);
                 learn::Saved before;
@@ -1647,9 +1651,9 @@ void McpServer::Impl::addTools() {
             saved.source = examples.name;
             if (!learn::save(file, saved, &err)) return fail(QString::fromStdString(err));
             double before = 0, after = 0;
-            for (const learn::Pair& p : pairs) {
-                before += learn::psnr(p.before, p.after) / double(pairs.size());
-                after += learn::psnr(learn::applyNet(trainer.net(), p.before), p.after) / double(pairs.size());
+            for (const learn::Pair& p : trainer.pairs()) {
+                before += learn::psnr(p.before, p.after) / double(trainer.pairs().size());
+                after += learn::psnr(learn::applyNet(trainer.net(), p.before), p.after) / double(trainer.pairs().size());
             }
             std::vector<Id> targets;
             for (const QJsonValue& v : a.value("apply_to").toArray()) targets.push_back(Id(v.toDouble()));
@@ -1657,10 +1661,10 @@ void McpServer::Impl::addTools() {
             const int given = applyLearnedNetwork(l.project, s, targets, file, examples.id, a.value("replace").toBool(true));
             save(l);
             const QJsonObject o2{{"network", QString::fromStdString(file)}, {"steps", trainer.steps()}, {"loss", trainer.loss()},
-                                 {"examples", int(pairs.size())}, {"psnr_before", before}, {"psnr_after", after}, {"clips", given}};
+                                 {"examples", int(trainer.pairs().size())}, {"psnr_before", before}, {"psnr_after", after}, {"clips", given}};
             return ok(QStringLiteral("Trained %1 steps on %2 frame(s): the examples %3 dB, from %4; given to %5 clip(s)")
                           .arg(trainer.steps())
-                          .arg(pairs.size())
+                          .arg(trainer.pairs().size())
                           .arg(after, 0, 'f', 1)
                           .arg(before, 0, 'f', 1)
                           .arg(given),
@@ -2161,11 +2165,36 @@ void McpServer::Impl::addTools() {
         "track above the top one in use). template picks a ready-made, animated design (a lower third takes two lines: "
         "name, newline, role; credits roll up the frame, a crawl runs along the bottom); the text replaces its sample text. "
         "motion makes any title roll or crawl, starting and ending off screen. The 3d template is extruded text turned in "
-        "space and lit (Final Cut's 3D titles), `depth` deep, spinning in with `spin_in`.",
+        "space and lit (Final Cut's 3D titles), `depth` deep, spinning in with `spin_in`. runs style stretches of the text "
+        "(from and len count UTF-16 characters, newlines included): font, size, bold, italic, color and outline_color as "
+        "[r, g, b] in 0..1, outline width, tracking, baseline shift (pixels up) and a variable font's axes ({\"wght\": 650}). "
+        "path sets the text along a circle (radius), a wave or SVG path data from the title's position. animations move "
+        "the text a letter, word or line at a time: a range (start, end and offset in % of the text; shape) selects "
+        "units, and what it changes there (x, y, scale %, rotation, opacity %, blur, tracking, fill and outline colour) "
+        "goes as far as it selects them; sweep runs the range across the text from the start (in_across) or to the end "
+        "(out_across), or takes the whole change away (in_together) or brings it on (out_together), over sweep_seconds.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"text":{"type":"string"},
             "at":{"type":["number","string"]},"duration":{"type":["number","string"],"default":3},
             "track":{"type":"string"},"size":{"type":"number","description":"Font size in pixels"},
-            "template":{"type":"string","enum":["plain","lower_third","lower_third_box","centred","chapter","callout","typewriter","cascade","pop_words","drop","wave","decode","end_card","credits","crawl","3d"],"default":"plain"},
+            "template":{"type":"string","enum":["plain","lower_third","lower_third_box","centred","chapter","callout","typewriter","cascade","pop_words","drop","wave","decode","blur_in","tracking_out","word_by_word","circle","end_card","credits","crawl","3d"],"default":"plain"},
+            "runs":{"type":"array","items":{"type":"object","properties":{"from":{"type":"integer"},"len":{"type":"integer"},
+                "font":{"type":"string"},"size":{"type":"number"},"bold":{"type":"boolean"},"italic":{"type":"boolean"},
+                "color":{"type":"array","items":{"type":"number"}},"outline":{"type":"number"},
+                "outline_color":{"type":"array","items":{"type":"number"}},"tracking":{"type":"number"},"baseline":{"type":"number"},
+                "axes":{"type":"object","additionalProperties":{"type":"number"}}},"required":["from","len"]}},
+            "path":{"type":"object","properties":{"shape":{"type":"string","enum":["circle","wave","custom"]},"radius":{"type":"number"},
+                "wavelength":{"type":"number"},"offset":{"type":"number","description":"% of the path's length"},
+                "upright":{"type":"boolean"},"reverse":{"type":"boolean","description":"run the other way (inside a circle)"},
+                "data":{"type":"string","description":"custom: SVG path data, pixels from the title's position"}},"required":["shape"]},
+            "animations":{"type":"array","items":{"type":"object","properties":{
+                "by":{"type":"string","enum":["letters","letters_not_spaces","words","lines"],"default":"letters"},
+                "shape":{"type":"string","enum":["square","ramp_up","ramp_down","triangle","round","smooth"],"default":"square"},
+                "start":{"type":"number"},"end":{"type":"number"},"offset":{"type":"number"},"ease":{"type":"number"},"amount":{"type":"number"},
+                "sweep":{"type":"string","enum":["none","in_across","out_across","in_together","out_together"]},"sweep_seconds":{"type":"number"},
+                "random":{"type":"number"},"random_order":{"type":"boolean"},"seed":{"type":"number"},
+                "x":{"type":"number"},"y":{"type":"number"},"scale":{"type":"number"},"rotation":{"type":"number"},"opacity":{"type":"number"},
+                "blur":{"type":"number"},"tracking":{"type":"number"},"fill":{"type":"array","items":{"type":"number"}},"fill_amount":{"type":"number"},
+                "outline_color":{"type":"array","items":{"type":"number"}},"outline_color_amount":{"type":"number"}}}},
             "depth":{"type":"number","description":"3d: how far the letters are extruded (pixels)"},
             "spin_in":{"type":"boolean","description":"3d: spin in at the start"},
             "text_animation":{"type":"string","enum":["none","rise","fade","pop","drop","wave","scramble"],"description":"The text coming on a letter, word or line at a time"},
@@ -2211,6 +2240,66 @@ void McpServer::Impl::addTools() {
                 c.generator.params["text_anim_by"] = Param(double(by));
                 if (a.value("animation_seconds").isDouble()) c.generator.params["text_anim_dur"] = Param(std::clamp(a.value("animation_seconds").toDouble(), 0.1, 10.0));
                 c.generator.params["text_anim_out"] = Param(a.value("animate_out").toBool() ? 1.0 : 0.0);
+            }
+            if (type == "title3d" && (a.contains("path") || a.contains("animations")))
+                throw ArgError{"path and animations are for flat titles"};
+            if (a.contains("runs")) {
+                if (!a.value("runs").isArray()) throw ArgError{"\"runs\" is a list of {from, len, ...}"};
+                const QJsonArray arr = a.value("runs").toArray();
+                const std::string json = QJsonDocument(arr).toJson(QJsonDocument::Compact).toStdString();
+                const std::vector<TextRun> runs = parseTextRuns(json);
+                if (runs.size() != size_t(arr.size())) throw ArgError{"Each run needs from (0 or more) and len (1 or more)"};
+                c.generator.strings["runs"] = textRunsJson(runs);
+            }
+            if (a.contains("path")) {
+                const QJsonObject pa = a.value("path").toObject();
+                const QStringList shapes{"none", "circle", "wave", "custom"};
+                const int sh = int(shapes.indexOf(pa.value("shape").toString()));
+                if (sh <= 0) throw ArgError{"\"path\" shape is circle, wave or custom"};
+                if (sh == 3 && pa.value("data").toString().trimmed().isEmpty()) throw ArgError{"A custom path needs its SVG path data (data)"};
+                c.generator.params["path_shape"] = Param(double(sh));
+                for (const auto& [key, param] : std::vector<std::pair<const char*, const char*>>{
+                         {"radius", "path_radius"}, {"wavelength", "path_wavelength"}, {"offset", "path_offset"}})
+                    if (pa.value(key).isDouble()) c.generator.params[param] = Param(pa.value(key).toDouble());
+                c.generator.params["path_upright"] = Param(pa.value("upright").toBool() ? 1.0 : 0.0);
+                c.generator.params["path_reverse"] = Param(pa.value("reverse").toBool() ? 1.0 : 0.0);
+                if (sh == 3) c.generator.strings["path_data"] = pa.value("data").toString().toStdString();
+            }
+            if (a.contains("animations")) {
+                if (!a.value("animations").isArray()) throw ArgError{"\"animations\" is a list"};
+                auto pick = [](const QJsonObject& o, const char* key, const QStringList& names, const char* what) {
+                    if (!o.contains(key)) return 0;
+                    const int i = int(names.indexOf(o.value(key).toString()));
+                    if (i < 0) throw ArgError{QStringLiteral("\"%1\" is %2").arg(key, what)};
+                    return i;
+                };
+                for (const QJsonValue& v : a.value("animations").toArray()) {
+                    const QJsonObject o = v.toObject();
+                    const int k = addTextAnimator(c.generator);
+                    const std::string pre = "ta" + std::to_string(k) + ".";
+                    auto set = [&](const char* name, double value) { c.generator.params[pre + name] = Param(value); };
+                    set("by", pick(o, "by", {"letters", "letters_not_spaces", "words", "lines"}, "letters, letters_not_spaces, words or lines"));
+                    set("shape", pick(o, "shape", {"square", "ramp_up", "ramp_down", "triangle", "round", "smooth"},
+                                      "square, ramp_up, ramp_down, triangle, round or smooth"));
+                    set("sweep", pick(o, "sweep", {"none", "in_across", "out_across", "in_together", "out_together"},
+                                      "none, in_across, out_across, in_together or out_together"));
+                    for (const auto& [key, name] : std::vector<std::pair<const char*, const char*>>{
+                             {"start", "start"}, {"end", "end"}, {"offset", "offset"}, {"ease", "ease"}, {"amount", "amount"},
+                             {"sweep_seconds", "sweep_dur"}, {"random", "random"}, {"seed", "seed"}, {"x", "x"}, {"y", "y"},
+                             {"scale", "scale"}, {"rotation", "rotation"}, {"opacity", "opacity"}, {"blur", "blur"},
+                             {"tracking", "tracking"}, {"fill_amount", "fill_mix"}, {"outline_color_amount", "outline_mix"}})
+                        if (o.contains(key)) {
+                            if (!o.value(key).isDouble()) throw ArgError{QStringLiteral("\"%1\" is a number").arg(key)};
+                            set(name, o.value(key).toDouble());
+                        }
+                    if (o.value("random_order").toBool()) set("shuffle", 1);
+                    for (const auto& [key, name] : std::vector<std::pair<const char*, const char*>>{{"fill", "fill"}, {"outline_color", "outline_color"}})
+                        if (o.contains(key)) {
+                            const QJsonArray rgb = o.value(key).toArray();
+                            if (rgb.size() != 3) throw ArgError{QStringLiteral("\"%1\" is [r, g, b] in 0..1").arg(key)};
+                            for (int ch = 0; ch < 3; ++ch) set((std::string(name) + "." + "rgb"[ch]).c_str(), std::clamp(rgb[ch].toDouble(), 0.0, 1.0));
+                        }
+                }
             }
             if (a.contains("motion")) {
                 const QStringList kinds{"still", "roll", "crawl_left", "crawl_right"};
@@ -2579,13 +2668,21 @@ void McpServer::Impl::addTools() {
         "models for the clip's cut-off (scripts/fetch-models.sh --bwe). "
         "lip_sync redraws the largest face's mouth and jaw to speak an audio track's sound (strings.track, e.g. \"A2\"; "
         "every track when empty), as a dub needs (MuseTalk; amount mixes it); it needs consent: true (the person shown has "
-        "agreed) and its models (scripts/fetch-models.sh --lipsync), and runs in exports and renders (about 4 s a frame on four cores).",
+        "agreed) and its models (scripts/fetch-models.sh --lipsync), and runs in exports and renders (about 4 s a frame on four cores). "
+        "mesh_warp bends the picture by `pins` as rigidly as it can (a mesh over its alpha, or the whole frame with mesh_from 1; "
+        "density vertices): each pin sits at x, y on the picture (fractions of the frame); a position pin is moved to to_x, "
+        "to_y, or keyed along path [{frame, x, y}]; a stiff pin keeps the area within radius (sequence pixels) in shape "
+        "(amount %); a bend pin turns (angle, degrees) and scales (scale %) the area round it; an overlap pin sets which "
+        "part is in front where it folds (depth -100..100 over radius); motion_blur 1 blurs along the mesh's motion "
+        "(shutter in degrees). grid_warp moves the points of a grid of rows x cols: params g<r>_<c>.dx and .dy (r 0..rows, "
+        "c 0..cols; fractions of the frame), smooth (shape 0) or straight (shape 1) between them.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
             "consent":{"type":"boolean","description":"lip_sync: the person shown has agreed to it"},
             "params":{"type":"object","additionalProperties":{"type":"number"}},
             "strings":{"type":"object","additionalProperties":{"type":"string"},"description":"Text settings: curves (\"x,y x,y\"), hue curves, a LUT file, the Colour Warper's mesh (\"spoke,ring,hue,sat,luma;...\": spokes 0-11 every 30 degrees from red, rings 1-4 for saturation 25-100 %, hue moved in degrees, saturation in 0-1 units, brightness in stops)..."},
             "mask_path":{"type":"array","items":{"type":["array","object"]},"description":"A closed Bezier mask: three or more points, fractions of the clip's frame"},
             "mask_smooth":{"type":"boolean","default":false},
+            "pins":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["position","stiff","bend","overlap"]},"x":{"type":"number"},"y":{"type":"number"},"to_x":{"type":"number"},"to_y":{"type":"number"},"path":{"type":"array","items":{"type":"object"}},"radius":{"type":"number"},"amount":{"type":"number"},"angle":{"type":"number"},"scale":{"type":"number"},"depth":{"type":"number"}},"required":["x","y"]},"description":"mesh_warp's pins"},
             "group_stage":{"type":"string","enum":["pre","post"],"description":"Add it to the clip's colour group instead: its pre-clip grade (before each member's own effects) or post-clip grade (after them)"},
             "node":{"type":"integer","description":"Into the clip's corrector node with this key (montage_grade_nodes); a shared node's goes into the shared node"},
             "shared":{"type":"number","description":"Into this shared node (montage_grade_nodes), seen by every clip using it"}},
@@ -2635,11 +2732,59 @@ void McpServer::Impl::addTools() {
             for (auto it = params.begin(); it != params.end(); ++it) {
                 std::string name = it.key().toStdString();
                 if (pluginParams && name.rfind("param.", 0) != 0 && name.rfind("mask.", 0) != 0) name = "param." + name;  // "amount" for "param.amount"
+                // (a Grid Warp's points, "g<r>_<c>.dx" and ".dy", as many as its rows and columns have)
+                static const QRegularExpression gridPoint(QStringLiteral("^g([0-9]|1[0-2])_([0-9]|1[0-2])\\.d[xy]$"));
                 const bool known = (pluginParams ? e.params.count(name) > 0
                                            : std::any_of(info->params.begin(), info->params.end(), [&](const ParamInfo& p) { return p.name == name; })) ||
-                                   (name.rfind("mask.", 0) == 0 && supportsMask(type));
+                                   (name.rfind("mask.", 0) == 0 && supportsMask(type)) || (type == "grid_warp" && gridPoint.match(it.key()).hasMatch());
                 if (!known) throw ArgError{QStringLiteral("\"%1\" has no parameter \"%2\"").arg(QString::fromStdString(type), it.key())};
                 e.params[name] = Param(it.value().toDouble());
+            }
+            if (a.contains("pins")) {
+                // A Mesh Warp's pins: each placed at x, y on the picture (fractions of the frame), a Position pin moved
+                // to to_x, to_y or keyed along `path`.
+                if (type != "mesh_warp") throw ArgError{"pins are a mesh_warp's"};
+                static const QStringList kinds{"position", "stiff", "bend", "overlap"};
+                if (!a.value("pins").isArray()) throw ArgError{"pins is a list of pins"};
+                for (const QJsonValue& v : a.value("pins").toArray()) {
+                    const QJsonObject pin = v.toObject();
+                    if (!v.isObject() || (pin.contains("kind") && !pin.value("kind").isString()))
+                        throw ArgError{"Each pin is {kind, x, y, ...}, kind a name"};
+                    const int kind = int(kinds.indexOf(pin.value("kind").toString("position")));
+                    if (kind < 0) throw ArgError{"A pin's kind is position, stiff, bend or overlap"};
+                    // Each value within its param's range (x and y as on the picture).
+                    const std::vector<ParamInfo> infos = meshPinParams(1, kind);
+                    for (const ParamInfo& pi : infos) {
+                        const QString field = QString::fromStdString(pi.name.substr(5));
+                        if (field == "kind" || !pin.contains(field)) continue;
+                        const double value = pin.value(field).toDouble(std::nan(""));
+                        if (!(value >= pi.min && value <= pi.max))
+                            throw ArgError{QStringLiteral("A %1 pin's %2 is a number from %3 to %4")
+                                               .arg(kinds[kind], field).arg(pi.min).arg(pi.max)};
+                    }
+                    for (auto it = pin.begin(); it != pin.end(); ++it)
+                        if (it.key() != "kind" && it.key() != "path" &&
+                            std::none_of(infos.begin(), infos.end(), [&](const ParamInfo& pi) { return pi.name.substr(5) == it.key().toStdString(); }))
+                            throw ArgError{QStringLiteral("A %1 pin has no \"%2\"").arg(kinds[kind], it.key())};
+                    if (!pin.value("x").isDouble() || !pin.value("y").isDouble()) throw ArgError{"Each pin needs x and y"};
+                    if (pin.contains("path") && (kind != 0 || !pin.value("path").isArray()))
+                        throw ArgError{"A path is a Position pin's list of keys"};
+                    const int k = addMeshPin(e, kind, pin.value("x").toDouble(), pin.value("y").toDouble());
+                    const std::string pre = "pin" + std::to_string(k) + ".";
+                    for (const ParamInfo& pi : meshPinParams(k, kind)) {
+                        const QString field = QString::fromStdString(pi.name.substr(pre.size()));
+                        if (field != "kind" && field != "x" && field != "y" && pin.value(field).isDouble())
+                            e.params[pi.name] = Param(pin.value(field).toDouble());
+                    }
+                    for (const QJsonValue& key : pin.value("path").toArray()) {
+                        const QJsonObject o = key.toObject();
+                        const double frame = o.value("frame").toDouble(-1), x = o.value("x").toDouble(std::nan("")), y = o.value("y").toDouble(std::nan(""));
+                        if (!(frame >= 0 && frame == std::floor(frame) && frame < 1e9 && x >= -2 && x <= 3 && y >= -2 && y <= 3))
+                            throw ArgError{"A path is a Position pin's keys: {frame, x, y}, the frame a whole number counted from the clip's start"};
+                        e.params[pre + "to_x"].addKey(FrameTime(o.value("frame").toInteger()), o.value("x").toDouble());
+                        e.params[pre + "to_y"].addKey(FrameTime(o.value("frame").toInteger()), o.value("y").toDouble());
+                    }
+                }
             }
             const QJsonObject strings = a.value("strings").toObject();
             for (auto it = strings.begin(); it != strings.end(); ++it) {
@@ -2864,7 +3009,7 @@ void McpServer::Impl::addTools() {
             if (!d) return fail(QStringLiteral("%1 is not installed here").arg(QString::fromStdString(e->s("plugin_name", "The plug-in"))));
             std::string key, err;
             AudioBufferPtr sound;
-            if (!ara::clipSource(l.project, l.seq(), c, key, sound, &err)) return fail(QString::fromStdString(err));
+            if (!ara::clipSource(l.project, l.seq(), c, key, sound, &err, e)) return fail(QString::fromStdString(err));
             auto session = ara::Session::open(*d, plugins::decodeState(e->s("archive")), sound, ara::sourceIdFor(*e, *sound),
                                               ara::modificationIdFor(*e), ara::timelineOf(*e), ara::kEditorRenderer, &err);
             if (!session) return fail(QString::fromStdString(err));
@@ -3093,7 +3238,7 @@ void McpServer::Impl::addTools() {
             if (a.contains("color_space")) {
                 const QString id = a.value("color_space").toString();
                 const ColorSpace* cs = findColorSpace(id.toStdString());
-                if (!cs || cs->sceneReferred)
+                if (!cs || cs->sceneReferred || cs->toneMapping != ToneMapping::Montage)
                     return fail(QStringLiteral("\"%1\" is not a display space a sequence delivers; for camera log or ACES use "
                                                "working_space").arg(id));
                 s.colorSpace = cs->id;
@@ -3340,10 +3485,41 @@ void McpServer::Impl::addTools() {
         "not there yet is made, as an effects return): level_db, pre_fader, muted, level points, or remove. inserts sets "
         "points on the track's insert effects' parameters (an effect's id, a parameter's name as montage_describe lists it, "
         "or param.<id> for a plugin's; on/off and choice parameters hold to the next point). With bus, the named bus's "
-        "mode, volume, pan, mute and inserts are set instead. clear removes the lanes. Lists the automation afterwards.",
+        "mode, volume, pan, mute and inserts are set instead. clear removes the lanes. "
+        "Film-mix tools (lanes named volume, trim, pan, mute, x, y, z, send:<bus>, send-trim:<bus> or "
+        "insert:<index>:<type>:<param>): trim sets trim points (dB added on top of the volume lane, as the trim modes "
+        "write them) and coalesce folds every trim into the volume lanes; write_to writes a value to the start, the end, "
+        "In to Out, all, or the next point (Pro Tools' Write To); glide ramps from the lane's value at from to value at "
+        "to (or over duration); preview punches values over from..to (to the end without to); capture snapshots every "
+        "control of tracks and buses (all without tracks) at a time and pastes it at paste_at (to each lane's next "
+        "point) or over paste_at..paste_to; copy copies from..to of tracks onto to_tracks at a time, replacing or "
+        "relative. Lists the automation afterwards.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"track":{"type":"string","default":"A1"},
             "bus":{"type":"string","description":"Automate this bus (by name) instead of a track"},
-            "mode":{"type":"string","enum":["off","read","write","latch","touch"]},
+            "mode":{"type":"string","enum":["off","read","write","latch","touch","trim write","trim latch","trim touch"]},
+            "trim":{"type":"array","items":{"type":"array","items":{"type":["number","string"]},"minItems":2,"maxItems":2},
+                    "description":"[[time, dB], ...] on the fader's trim lane"},
+            "coalesce":{"type":"boolean","description":"Fold the trims into the volume lanes (after the other changes)"},
+            "write_to":{"type":"object","properties":{"lane":{"type":"string","default":"volume"},
+                "target":{"type":"string","enum":["start","end","in_out","all","next"]},
+                "value":{"type":"number","description":"Default: the lane's value at from"},
+                "from":{"type":["number","string"],"description":"Where the pass began (default 0)"},
+                "to":{"type":["number","string"],"description":"Where it ended (default: from)"},
+                "in":{"type":["number","string"]},"out":{"type":["number","string"]}},"required":["target"]},
+            "glide":{"type":"object","properties":{"lane":{"type":"string","default":"volume"},"from":{"type":["number","string"]},
+                "to":{"type":["number","string"]},"duration":{"type":["number","string"]},"value":{"type":"number"},
+                "hold":{"type":"boolean","description":"Stay at value to the end"}},"required":["from","value"]},
+            "preview":{"type":"object","properties":{"values":{"type":"object","description":"{lane: value}"},
+                "from":{"type":["number","string"]},"to":{"type":["number","string"]}},"required":["values","from"]},
+            "capture":{"type":"object","properties":{"at":{"type":["number","string"]},
+                "tracks":{"type":"array","items":{"type":"string"},"description":"Tracks (A1...) and buses by name; default all"},
+                "paste_at":{"type":["number","string"]},"paste_to":{"type":["number","string"]}},"required":["at","paste_at"]},
+            "copy":{"type":"object","properties":{"from":{"type":["number","string"]},"to":{"type":["number","string"]},
+                "tracks":{"type":"array","items":{"type":"string"},"description":"Default: this track or bus"},
+                "to_tracks":{"type":"array","items":{"type":"string"},"description":"Default: the same"},
+                "at":{"type":["number","string"]},"relative":{"type":"boolean","default":false},
+                "lanes":{"type":"array","items":{"type":"string"},"description":"Default: the lanes that move"}},
+                "required":["from","to","at"]},
             "volume":{"type":"array","items":{"type":"array","items":{"type":["number","string"]},"minItems":2,"maxItems":2},
                       "description":"[[time, dB], ...]"},
             "pan":{"type":"array","items":{"type":"array","items":{"type":["number","string"]},"minItems":2,"maxItems":2},
@@ -3364,10 +3540,11 @@ void McpServer::Impl::addTools() {
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
             Sequence& s = l.seq();
-            const QStringList names{"off", "read", "write", "latch", "touch"};
+            const QStringList names{"off", "read", "write", "latch", "touch", "trim write", "trim latch", "trim touch"};
             auto mode = [&]() {
-                const QString m = str(a, "mode").toLower();
-                if (!names.contains(m)) throw ArgError{QStringLiteral("\"mode\" must be off, read, write, latch or touch")};
+                const QString m = str(a, "mode").toLower().replace(QLatin1Char('_'), QLatin1Char(' '));
+                if (!names.contains(m))
+                    throw ArgError{QStringLiteral("\"mode\" must be off, read, write, latch, touch, trim write, trim latch or trim touch")};
                 return int(names.indexOf(m));
             };
             // (hold: a switch's keys hold to the next; whole: its values are whole numbers, a mute's 0 or 1, a choice's index)
@@ -3399,6 +3576,9 @@ void McpServer::Impl::addTools() {
                 QStringList parts;
                 for (const Keyframe& k : lane.keys) parts << QStringLiteral("%1 %2%3").arg(tc(k.t, s)).arg(k.v, 0, 'f', 2).arg(QString::fromLatin1(unit));
                 return parts.isEmpty() ? QStringLiteral("none") : parts.join(QStringLiteral(", "));
+            };
+            auto describeTrim = [&](const Param& trim) {
+                return trim.animated() ? describe(trim, " dB") : trim.value != 0 ? QStringLiteral("%1 dB").arg(trim.value, 0, 'f', 2) : QStringLiteral("none");
             };
             auto findBus = [&](const QString& name) -> Bus* {
                 for (Bus& b : s.buses)
@@ -3446,28 +3626,142 @@ void McpServer::Impl::addTools() {
                                          .arg(QString::fromStdString(name), describe(lane, ""));
                 return parts.isEmpty() ? QStringLiteral("none") : parts.join(QStringLiteral("; "));
             };
+            // ---- Film-mix tools ----
+            // A lane name as given (send:<bus name>) as core/Automation.h names it (send:<bus id>).
+            auto laneName = [&](QString name) {
+                name = name.trimmed();
+                for (const char* prefix : {"send:", "send-trim:"})
+                    if (name.startsWith(QLatin1String(prefix))) {
+                        Bus* bus = findBus(name.mid(int(qstrlen(prefix))));
+                        if (!bus) throw ArgError{QStringLiteral("No bus called %1").arg(name.mid(int(qstrlen(prefix))))};
+                        return std::string(prefix) + std::to_string(bus->id);
+                    }
+                return name.toStdString();
+            };
+            // Tracks (A1...) and buses (by name) as ids.
+            auto ownerIds = [&](const QJsonArray& list) {
+                std::vector<Id> ids;
+                for (const auto& v : list) {
+                    const QString name = v.toString().trimmed();
+                    if (Bus* b = findBus(name)) {
+                        ids.push_back(b->id);
+                        continue;
+                    }
+                    const TrackRef r = trackArg(name, s, false);
+                    if (r.kind != TrackKind::Audio) throw ArgError{QStringLiteral("%1 is not an audio track or bus").arg(name)};
+                    ids.push_back(s.audioTracks.at(size_t(r.index)).id);
+                }
+                return ids;
+            };
+            QStringList filmMix;  // what the film-mix tools did, listed afterwards
+            // write_to, glide and preview on one track's or bus's lanes; trim points on its trim lane.
+            auto filmMixOn = [&](const std::function<LaneRef(const std::string&)>& laneOf) {
+                auto lane = [&](const QString& name) {
+                    const LaneRef r = laneOf(laneName(name));
+                    if (!r.lane) throw ArgError{QStringLiteral("No lane %1 here").arg(name)};
+                    return r;
+                };
+                if (a.contains("trim")) {
+                    const LaneRef r = lane(QStringLiteral("trim"));
+                    points(a.value("trim").toArray(), QStringLiteral("trim"), *r.lane, -96, 24, false);
+                }
+                if (a.contains("write_to")) {
+                    const QJsonObject o = a.value("write_to").toObject();
+                    const QStringList targets{"start", "end", "in_out", "all", "next"};
+                    const int target = int(targets.indexOf(o.value("target").toString().toLower()));
+                    if (target < 0) throw ArgError{QStringLiteral("\"target\" must be start, end, in_out, all or next")};
+                    const LaneRef r = lane(o.value("lane").toString(QStringLiteral("volume")));
+                    const FrameTime from = o.contains("from") ? timeArg(o.value("from"), s, "from") : 0;
+                    const FrameTime to = o.contains("to") ? timeArg(o.value("to"), s, "to") : from;
+                    const FrameTime in = o.contains("in") ? timeArg(o.value("in"), s, "in") : s.inPoint;
+                    const FrameTime out = o.contains("out") ? timeArg(o.value("out"), s, "out") : s.outPoint;
+                    if (WriteTo(target) == WriteTo::InOut && (in < 0 || out < in)) throw ArgError{QStringLiteral("in_out needs In and Out")};
+                    const double value = std::clamp(o.contains("value") ? o.value("value").toDouble() : r.at(from), r.lo, r.hi);
+                    const auto [x, y] = writeToRange(WriteTo(target), *r.lane, from, to, in, out);
+                    writeLaneValue(*r.lane, *r.still, x, y, value, r.hold);
+                    filmMix << QStringLiteral("Wrote %1 from %2 to %3").arg(value).arg(tc(x, s), y < 0 ? QStringLiteral("the end") : tc(y, s));
+                }
+                if (a.contains("glide")) {
+                    const QJsonObject o = a.value("glide").toObject();
+                    const LaneRef r = lane(o.value("lane").toString(QStringLiteral("volume")));
+                    if (r.hold) throw ArgError{QStringLiteral("A switch cannot glide")};
+                    const FrameTime from = timeArg(o.value("from"), s, "from");
+                    FrameTime to = from + FrameTime(std::lround(s.fpsValue()));
+                    if (o.contains("to")) to = timeArg(o.value("to"), s, "to");
+                    else if (o.contains("duration")) to = from + timeArg(o.value("duration"), s, "duration");
+                    if (to <= from) throw ArgError{QStringLiteral("A glide ends after it starts")};
+                    const double value = std::clamp(o.value("value").toDouble(), r.lo, r.hi);
+                    glideLane(*r.lane, *r.still, from, to, value, o.value("hold").toBool());
+                    filmMix << QStringLiteral("Glided to %1 from %2 to %3").arg(value).arg(tc(from, s), tc(to, s));
+                }
+                if (a.contains("preview")) {
+                    const QJsonObject o = a.value("preview").toObject();
+                    const FrameTime from = timeArg(o.value("from"), s, "from");
+                    const FrameTime to = o.contains("to") ? timeArg(o.value("to"), s, "to") : -1;
+                    const QJsonObject values = o.value("values").toObject();
+                    for (auto it = values.begin(); it != values.end(); ++it) {
+                        const LaneRef r = lane(it.key());
+                        writeLaneValue(*r.lane, *r.still, from, to, std::clamp(it.value().toDouble(), r.lo, r.hi), r.hold);
+                    }
+                    filmMix << QStringLiteral("Punched %1 previewed value(s)").arg(values.size());
+                }
+            };
+            // capture, copy and coalesce, over the sequence (after the track's or bus's own changes).
+            auto filmMixAll = [&](Id self) {
+                if (a.contains("capture")) {
+                    const QJsonObject o = a.value("capture").toObject();
+                    const MixSnapshot snap = captureMix(s, ownerIds(o.value("tracks").toArray()), timeArg(o.value("at"), s, "at"));
+                    const FrameTime from = timeArg(o.value("paste_at"), s, "paste_at");
+                    const FrameTime to = o.contains("paste_to") ? timeArg(o.value("paste_to"), s, "paste_to") : from - 1;
+                    filmMix << QStringLiteral("Captured %1 strip(s) at %2; pasted on %3 lane(s)")
+                                   .arg(snap.strips.size()).arg(tc(snap.at, s)).arg(pasteMix(s, snap, from, to));
+                }
+                if (a.contains("copy")) {
+                    const QJsonObject o = a.value("copy").toObject();
+                    std::vector<Id> from = o.contains("tracks") ? ownerIds(o.value("tracks").toArray()) : std::vector<Id>{self};
+                    std::vector<Id> onto = o.contains("to_tracks") ? ownerIds(o.value("to_tracks").toArray()) : from;
+                    std::vector<std::string> lanes;
+                    for (const auto& v : o.value("lanes").toArray()) lanes.push_back(laneName(v.toString()));
+                    const AutomationCopy c = copyAutomation(s, from, timeArg(o.value("from"), s, "from"), timeArg(o.value("to"), s, "to"), lanes);
+                    const int n = pasteAutomation(s, c, onto, timeArg(o.value("at"), s, "at"), o.value("relative").toBool());
+                    filmMix << QStringLiteral("Pasted %1 lane(s)").arg(n);
+                }
+                if (a.value("coalesce").toBool()) {
+                    int n = 0;
+                    for (Track& t : s.audioTracks) n += coalesceTrim(t) ? 1 : 0;
+                    for (Bus& b : s.buses) n += coalesceTrim(b) ? 1 : 0;
+                    filmMix << QStringLiteral("Coalesced the trims of %1 track(s) and bus(es)").arg(n);
+                }
+            };
+            auto filmMixText = [&] { return filmMix.isEmpty() ? QString() : QStringLiteral("\n") + filmMix.join(QStringLiteral("\n")); };
             if (a.contains("bus")) {
                 Bus* b = findBus(str(a, "bus"));
                 if (!b) throw ArgError{QStringLiteral("No bus called %1").arg(str(a, "bus"))};
-                if (a.value("clear").toBool()) b->volumeAuto = Param(), b->panAuto = Param(), b->muteAuto = Param();
+                if (a.value("clear").toBool()) b->volumeAuto = Param(), b->panAuto = Param(), b->muteAuto = Param(), b->volumeTrim = Param();
                 if (a.contains("mode")) b->automation = mode();
                 points(a.value("volume").toArray(), QStringLiteral("volume"), b->volumeAuto, -96, 12, false);
                 points(a.value("pan").toArray(), QStringLiteral("pan"), b->panAuto, -1, 1, false);
                 points(a.value("mute").toArray(), QStringLiteral("mute"), b->muteAuto, 0, 1, true);
                 insertPoints(b->effects);
+                const Id busId = b->id;
+                filmMixOn([&](const std::string& name) { return busLane(*b, name); });
+                filmMixAll(busId);
+                b = nullptr;
+                for (Bus& x : s.buses)
+                    if (x.id == busId) b = &x;
                 save(l);
-                return ok(QStringLiteral("Bus %1: %2 automation\nVolume: %3\nPan: %4\nMute: %5\nInserts: %6")
+                return ok(QStringLiteral("Bus %1: %2 automation\nVolume: %3\nTrim: %4\nPan: %5\nMute: %6\nInserts: %7%8")
                               .arg(QString::fromStdString(b->name), QString::fromLatin1(automationModeName(busAutomation(*b))),
-                                   describe(b->volumeAuto, " dB"), describe(b->panAuto, ""), describe(b->muteAuto, ""),
-                                   describeInserts(b->effects)));
+                                   describe(b->volumeAuto, " dB"), describeTrim(b->volumeTrim), describe(b->panAuto, ""),
+                                   describe(b->muteAuto, ""), describeInserts(b->effects), filmMixText()));
             }
             const TrackRef ref = trackArg(str(a, "track", "A1"), s, false);
             if (ref.kind != TrackKind::Audio) throw ArgError{QStringLiteral("Automation is for audio tracks (A1, A2...)")};
             const int ti = ref.index;
             if (a.value("clear").toBool()) {
                 Track& t = s.audioTracks.at(size_t(ti));
-                t.volumeAuto = Param(), t.panAuto = Param(), t.muteAuto = Param();
-                for (Send& sd : t.sends) sd.levelAuto = Param();
+                t.volumeAuto = Param(), t.panAuto = Param(), t.muteAuto = Param(), t.volumeTrim = Param();
+                for (Send& sd : t.sends) sd.levelAuto = Param(), sd.levelTrim = Param();
             }
             if (a.contains("mode")) s.audioTracks.at(size_t(ti)).automation = mode();
             for (const auto& v : a.value("sends").toArray()) {
@@ -3504,6 +3798,8 @@ void McpServer::Impl::addTools() {
             points(a.value("pan").toArray(), QStringLiteral("pan"), t.panAuto, -1, 1, false);
             points(a.value("mute").toArray(), QStringLiteral("mute"), t.muteAuto, 0, 1, true);
             insertPoints(t.effects);
+            filmMixOn([&](const std::string& name) { return trackLane(t, name); });
+            filmMixAll(t.id);
             save(l);
             QStringList sendText;
             for (const Send& sd : t.sends) {
@@ -3514,10 +3810,11 @@ void McpServer::Impl::addTools() {
                                 .arg(sd.preFader ? QStringLiteral(" pre-fader") : QString(), sd.muted ? QStringLiteral(" (muted)") : QString(),
                                      sd.levelAuto.animated() ? QStringLiteral(", level: ") + describe(sd.levelAuto, " dB") : QString());
             }
-            return ok(QStringLiteral("%1: %2 automation\nVolume: %3\nPan: %4\nMute: %5\nSends: %6\nInserts: %7")
+            return ok(QStringLiteral("%1: %2 automation\nVolume: %3\nTrim: %4\nPan: %5\nMute: %6\nSends: %7\nInserts: %8%9")
                           .arg(str(a, "track", "A1"), QString::fromLatin1(automationModeName(trackAutomation(t))), describe(t.volumeAuto, " dB"),
-                               describe(t.panAuto, ""), describe(t.muteAuto, ""),
-                               sendText.isEmpty() ? QStringLiteral("none") : sendText.join(QStringLiteral("; ")), describeInserts(t.effects)));
+                               describeTrim(t.volumeTrim), describe(t.panAuto, ""), describe(t.muteAuto, ""),
+                               sendText.isEmpty() ? QStringLiteral("none") : sendText.join(QStringLiteral("; ")), describeInserts(t.effects),
+                               filmMixText()));
         });
 
     add("montage_export_lut", "Export a clip's grade as a LUT",
@@ -3882,7 +4179,9 @@ void McpServer::Impl::addTools() {
         "linked clips out of sync with their picture (`sync`), dialogue hard to follow under the music and effects "
         "(`intelligibility`, as montage_intelligibility measures it), left and right out of phase or one inverted, so a mono "
         "fold-down loses them (`phase`), DC offset (`dc_offset_db`), and for SDH captions, loud sound outside speech that no caption describes "
-        "(`uncaptioned_seconds`). Lists each problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones).",
+        "(`uncaptioned_seconds`), and a cinema Leq(M) limit (`cinema` trailer 85 or advertising 82, or `leqm_limit`). Lists each "
+        "problem with its timecodes; with markers, puts a red \"QC:\" marker on each (replacing earlier ones). `report` writes "
+        "a loudness report beside it (report.pdf and report.csv, as montage_dialogue_loudness's).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"flashing":{"type":"boolean","default":true},"levels":{"type":"boolean","default":true},
             "black_seconds":{"type":"number","default":1,"description":"0 = not checked"},
@@ -3893,6 +4192,9 @@ void McpServer::Impl::addTools() {
             "peak_ceiling":{"type":"number","default":-1,"description":"dBTP, checked with the loudness"},
             "loudness_dialogue":{"type":"boolean","default":false,"description":"Check the dialogue's loudness (montage_dialogue_loudness), as Netflix does: -27 with peak_ceiling -2"},
             "loudness_tolerance":{"type":"number","description":"LU either side of the target (default 1, 2 with loudness_dialogue)"},
+            "cinema":{"type":"string","enum":["trailer","advertising"],"description":"Leq(M) limit for cinemas: 85 trailers, 82 advertising"},
+            "leqm_limit":{"type":"number","description":"Leq(M) limit in place of cinema's; omitted = not checked"},
+            "report":{"type":"string","description":"Path for a loudness report (no extension: .pdf and .csv are added)"},
             "spelling":{"type":"boolean","default":true},"title_language":{"type":"string","default":"en-US"},
             "sync":{"type":"boolean","default":true},
             "intelligibility":{"type":"number","description":"Dialogue intelligibility limit, 0..1 (e.g. 0.45); omitted = not checked"},
@@ -3918,6 +4220,16 @@ void McpServer::Impl::addTools() {
             q.peakCeiling = a.value("peak_ceiling").toDouble(-1);
             q.dialogueGated = a.value("loudness_dialogue").toBool(false);
             q.loudnessTolerance = std::max(0.1, a.value("loudness_tolerance").toDouble(q.dialogueGated ? 2 : 1));
+            if (a.contains("cinema")) {
+                const QString cinema = str(a, "cinema", "");
+                if (cinema == "trailer") q.leqmLimit = 85;
+                else if (cinema == "advertising") q.leqmLimit = 82;
+                else throw ArgError{"\"cinema\" is trailer or advertising"};
+            }
+            if (a.contains("leqm_limit")) {
+                q.leqmLimit = a.value("leqm_limit").toDouble();
+                if (!(q.leqmLimit >= 60 && q.leqmLimit <= 110)) throw ArgError{"\"leqm_limit\" must be between 60 and 110"};
+            }
             q.spelling = a.value("spelling").toBool(true);
             q.titleLanguage = str(a, "title_language", "en-US").toStdString();
             q.sync = a.value("sync").toBool(true);
@@ -3936,7 +4248,35 @@ void McpServer::Impl::addTools() {
                 addQcMarkers(s, issues);
                 save(l);
             }
-            return ok(issues.empty() ? QStringLiteral("No problems found.") : QStringLiteral("%1 problem(s):\n").arg(issues.size()) + text);
+            if (a.contains("report")) {
+                LoudnessReportSpec spec;
+                spec.title = s.name;
+                if (q.loudnessTarget != 0) {
+                    spec.target = q.loudnessTarget;
+                    spec.tolerance = q.loudnessTolerance;
+                    spec.dialogueGated = q.dialogueGated;
+                    spec.peakCeiling = q.peakCeiling;
+                }
+                spec.leqmLimit = q.leqmLimit;
+                // The sound in its own channels, the dialogue found as montage_dialogue_loudness's auto gate finds it.
+                DialogueLoudnessOptions o;
+                o.in = from;
+                o.out = to;
+                o.layout = true;
+                o.leqm = true;
+                o.log = true;
+                o.gate = SpeechGate::Auto;
+                std::string e;
+                const DialogueLoudness d = measureDialogueLoudness(l.project, s, o, [this](double f) { progress(f, "Measuring"); }, nullptr, &e);
+                const QString base = absolute(need(a, "report"));
+                QDir().mkpath(QFileInfo(base).absolutePath());
+                if (!e.empty() || !writeLoudnessCsv((base + ".csv").toStdString(), d, spec, s, &e) ||
+                    !writeLoudnessPdf((base + ".pdf").toStdString(), d, spec, s, &e))
+                    return fail(QStringLiteral("No loudness report: %1").arg(QString::fromStdString(e)));
+                text += QStringLiteral("Loudness report: %1.pdf (and .csv)\n").arg(base);
+            }
+            return ok(issues.empty() ? QStringLiteral("No problems found.") + (text.isEmpty() ? QString() : "\n" + text)
+                                     : QStringLiteral("%1 problem(s):\n").arg(issues.size()) + text);
         });
 
     add("montage_intelligibility", "Measure dialogue intelligibility",
@@ -4013,12 +4353,22 @@ void McpServer::Impl::addTools() {
         "the sound that is speech (under 15 %, the programme figure is the one that counts: `value`). The speech is found "
         "from the Dialogue clips (`gate` roles), transcribed words (transcripts) or by listening (classifier); auto takes "
         "the first the sequence has. Speech-gated loudness from Montage's own speech detection: an estimate of the dialogue "
-        "measurement Netflix's QC makes.",
+        "measurement Netflix's QC makes. Also the loudness range (EBU Tech 3342) over everything (`lra`) and over the "
+        "dialogue alone (`lra_dialogue`), and the cinema Leq(M) (ISO 21727; with `surround`, the surrounds 3 dB down as "
+        "cinemas are calibrated). `report` writes a loudness report: report.pdf and report.csv with the figures, the "
+        "momentary and short-term loudness and true peak every 100 ms, and every stretch over `target` (LUFS, or the "
+        "dialogue's LKFS for a target set with `dialogue`), `peak_ceiling` or `leqm_limit`.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"from":{"type":["number","string"]},
             "to":{"type":["number","string"]},"gate":{"type":"string","enum":["auto","roles","transcripts","classifier"],"default":"auto"},
-            "surround":{"type":"boolean","default":false,"description":"Measure a surround sequence's own channels, not its stereo fold-down"}},
+            "surround":{"type":"boolean","default":false,"description":"Measure a surround sequence's own channels, not its stereo fold-down"},
+            "report":{"type":"string","description":"Path for a loudness report (no extension: .pdf and .csv are added)"},
+            "target":{"type":"number","description":"The report's target, LUFS (LKFS with dialogue)"},
+            "dialogue":{"type":"boolean","default":false,"description":"The target is the dialogue's"},
+            "tolerance":{"type":"number","description":"LU either side of the target (default 1, 2 with dialogue)"},
+            "peak_ceiling":{"type":"number","description":"The report's true peak ceiling, dBTP"},
+            "leqm_limit":{"type":"number","description":"The report's Leq(M) limit (85 trailers, 82 advertising)"}},
             "required":["project"]})json",
-        true, [this](const QJsonObject& a) {
+        false, [this](const QJsonObject& a) {
             Loaded l = open(a);
             const Sequence& s = l.seq();
             DialogueLoudnessOptions o;
@@ -4027,15 +4377,56 @@ void McpServer::Impl::addTools() {
             o.layout = a.value("surround").toBool(false);
             if (!parseSpeechGate(str(a, "gate", "auto").toStdString(), o.gate))
                 throw ArgError{"\"gate\" is auto, roles, transcripts or classifier"};
+            o.leqm = true;
+            LoudnessReportSpec spec;
+            const bool report = a.contains("report");
+            if (report) {
+                o.log = true;
+                spec.title = s.name;
+                if (a.contains("target")) {
+                    spec.target = a.value("target").toDouble();
+                    if (!(spec.target < 0 && spec.target >= -70)) throw ArgError{"\"target\" must be between -70 and 0"};
+                    spec.dialogueGated = a.value("dialogue").toBool(false);
+                    spec.tolerance = std::max(0.1, a.value("tolerance").toDouble(spec.dialogueGated ? 2 : 1));
+                }
+                if (a.contains("peak_ceiling")) {
+                    spec.peakCeiling = a.value("peak_ceiling").toDouble();
+                    if (!(spec.peakCeiling < 0 && spec.peakCeiling >= -20)) throw ArgError{"\"peak_ceiling\" must be between -20 and 0 dBTP"};
+                }
+                if (a.contains("leqm_limit")) {
+                    spec.leqmLimit = a.value("leqm_limit").toDouble();
+                    if (!(spec.leqmLimit >= 60 && spec.leqmLimit <= 110)) throw ArgError{"\"leqm_limit\" must be between 60 and 110"};
+                }
+            }
             std::string why;
             const DialogueLoudness d = measureDialogueLoudness(l.project, s, o, [this](double f) { progress(f, "Measuring"); }, nullptr, &why);
             if (!why.empty()) return fail(QString::fromStdString(why));
+            QString written;
+            if (report) {
+                const QString base = absolute(need(a, "report"));
+                QDir().mkpath(QFileInfo(base).absolutePath());
+                std::string e;
+                if (!writeLoudnessCsv((base + ".csv").toStdString(), d, spec, s, &e) || !writeLoudnessPdf((base + ".pdf").toStdString(), d, spec, s, &e))
+                    return fail(QString::fromStdString(e));
+                written = base + ".pdf";
+            }
             QJsonArray speech;
             for (const auto& [from, to] : d.speech) speech.append(QJsonArray{from, to});
             const QJsonObject r{{"valid", d.valid}, {"dialogue_lkfs", d.dialogue}, {"programme_lkfs", d.programme},
                                 {"true_peak_dbtp", d.truePeak}, {"speech_share", d.speechShare}, {"uses_programme", d.usesProgramme},
                                 {"value", d.value()}, {"gate", QString::fromLatin1(speechGateName(d.gate))}, {"estimate", true},
-                                {"speech_seconds", speech}, {"text", QString::fromStdString(describeDialogueLoudness(d))}};
+                                {"speech_seconds", speech}, {"text", QString::fromStdString(describeDialogueLoudness(d))},
+                                {"lra", d.range}, {"lra_dialogue", d.dialogueRange}, {"leqm", d.leqm}};
+            if (report) {
+                QJsonArray overs;
+                for (const LoudnessOver& v : loudnessOvers(d, spec))
+                    overs.append(QJsonObject{{"from", v.from}, {"to", v.to}, {"what", QString::fromStdString(v.what)}});
+                QJsonObject out = r;
+                out["report"] = written;
+                out["overs"] = overs;
+                out["passes"] = loudnessPasses(d, spec);
+                return ok(json(out), out);
+            }
             return ok(json(r), r);
         });
 
@@ -5181,6 +5572,84 @@ void McpServer::Impl::addTools() {
             }
             return ok(changes.empty() ? QStringLiteral("No differences") : QStringLiteral("%1 change(s)").arg(changes.size()),
                       QJsonObject{{"changes", list}});
+        });
+
+    add("montage_merge_project", "Merge another copy of the project",
+        "Brings another copy of this project (an assistant's bins and syncing, a colourist's grades, work done on another "
+        "computer) into this one from the version both started from: the copy's own record of it (kept by Save a Copy for "
+        "Another Editor and the Project Manager), this project's, or `base`. Changes made on one side are taken, the same "
+        "change on both once; different changes to one thing are conflicts (each with a `key`), settled by `choices` "
+        "({key: mine|theirs|both}) or `take` (mine by default; both only for clips that overlap, which by default put "
+        "theirs on a new track). Ids both copies made are renumbered on their side. dry_run lists what would happen "
+        "without saving.",
+        R"json({"type":"object","properties":{"project":{"type":"string"},
+            "theirs":{"type":"string","description":"The other copy's project file"},
+            "base":{"type":"string","description":"The version both started from (default: as recorded in either copy)"},
+            "choices":{"type":"object","additionalProperties":{"type":"string","enum":["mine","theirs","both"]}},
+            "take":{"type":"string","enum":["mine","theirs"],"default":"mine"},
+            "dry_run":{"type":"boolean","default":false}},"required":["project","theirs"]})json",
+        false, [](const QJsonObject& a) {
+            Loaded l = open(a);
+            auto read = [](const QString& path) {
+                Project p;
+                std::string err;
+                if (!loadProject(absolute(path).toStdString(), p, &err))
+                    throw ArgError{QStringLiteral("Cannot open %1: %2").arg(path, QString::fromStdString(err))};
+                return p;
+            };
+            const Project theirs = read(need(a, "theirs"));
+            MergeBase base;
+            if (a.contains("base")) base.base = read(str(a, "base"));
+            else if (!commonMergeBase(l.project, theirs, base))
+                throw ArgError{"Neither copy records the version both started from: give it as base"};
+            const QString take = a.contains("take") ? str(a, "take") : QStringLiteral("mine");
+            if (take != "mine" && take != "theirs") throw ArgError{"take is mine or theirs"};
+            auto side = [](const QString& s) {
+                if (s == "mine") return MergeSide::Mine;
+                if (s == "theirs") return MergeSide::Theirs;
+                if (s == "both") return MergeSide::Both;
+                throw ArgError{QStringLiteral("A choice is mine, theirs or both, not \"%1\"").arg(s)};
+            };
+            std::map<std::string, MergeSide> choices;
+            MergeResult r = mergeProjects(base, l.project, theirs);
+            if (!r.ok) throw ArgError{QString::fromStdString(r.error)};
+            if (take == "theirs")
+                for (const MergeConflict& c : r.conflicts)
+                    if (c.kind != MergeConflict::Overlap) choices[c.key] = MergeSide::Theirs;
+            const QJsonObject given = a.value("choices").toObject();
+            for (auto it = given.begin(); it != given.end(); ++it) {
+                if (!it.value().isString()) throw ArgError{"Each choice is mine, theirs or both"};
+                const auto c = std::find_if(r.conflicts.begin(), r.conflicts.end(), [&](const MergeConflict& k) { return k.key == it.key().toStdString(); });
+                if (c == r.conflicts.end()) throw ArgError{QStringLiteral("No conflict \"%1\"").arg(it.key())};
+                const MergeSide s = side(it.value().toString());
+                if (s == MergeSide::Both && !c->canBoth) throw ArgError{QStringLiteral("Both is only for clips that overlap (%1)").arg(it.key())};
+                choices[it.key().toStdString()] = s;
+            }
+            if (!choices.empty()) r = mergeProjects(base, l.project, theirs, choices);
+            if (!r.ok) throw ArgError{QString::fromStdString(r.error)};
+            QJsonArray changes, conflicts;
+            for (const MergeChange& c : r.changes)
+                changes.append(QJsonObject{{"side", QString::fromLatin1(mergeSideName(c.side)).toLower()},
+                                           {"change", QString::fromLatin1(mergeChangeKindName(c.kind)).toLower()},
+                                           {"what", QString::fromStdString(c.what)},
+                                           {"field", QString::fromStdString(c.field)}});
+            for (const MergeConflict& c : r.conflicts)
+                conflicts.append(QJsonObject{{"key", QString::fromStdString(c.key)},
+                                             {"kind", c.kind == MergeConflict::Overlap ? "overlap" : c.kind == MergeConflict::Moved ? "moved" : c.kind == MergeConflict::Removed ? "removed" : "field"},
+                                             {"what", QString::fromStdString(c.what)},
+                                             {"field", QString::fromStdString(c.field)},
+                                             {"mine", QString::fromStdString(c.mine)},
+                                             {"theirs", QString::fromStdString(c.theirs)},
+                                             {"took", QString::fromLatin1(mergeSideName(c.choice)).toLower()}});
+            QJsonObject renumbered;
+            for (const auto& [from, to] : r.renumbered) renumbered[QString::number(from)] = double(to);
+            const bool dry = a.value("dry_run").toBool();
+            if (!dry) {
+                l.project = r.project;
+                save(l);
+            }
+            return ok(QStringLiteral("%1%2 change(s), %3 conflict(s)").arg(dry ? QStringLiteral("Would merge: ") : QStringLiteral("Merged: ")).arg(r.changes.size()).arg(r.conflicts.size()),
+                      QJsonObject{{"changes", changes}, {"conflicts", conflicts}, {"renumbered", renumbered}, {"new_tracks", r.newTracks}});
         });
 
     add("montage_conform_check", "Conform check against the offline reference",
@@ -8041,7 +8510,8 @@ void McpServer::Impl::addTools() {
         "its sound with it, at the new speed or with keep_pitch time-stretched); pixel_aspect replaces the file's (2 for "
         "a 2x anamorphic lens, 1.33, 1.5, 1.8, 0.9 for DV NTSC, 1 for square); alpha reads its transparency as straight, "
         "premultiplied, ignore (opaque) or invert; field_order forces progressive, upper (top field first) or lower "
-        "(bottom field first) whatever the frames are flagged; remove_pulldown undoes 2:3 pulldown (29.97 to 23.976). Arguments left out keep their current setting; 0 or "
+        "(bottom field first) whatever the frames are flagged; remove_pulldown undoes 2:3 pulldown (29.97 to 23.976); sdr_expand "
+        "says how SDR footage is shown in an HDR sequence. Arguments left out keep their current setting; 0 or "
         "\"file\" goes back to the file's own; reset puts everything back. Clips keep starting on the same frame and keep "
         "their timeline length (shortened where the footage no longer reaches); subclips, clip markers and transcripts "
         "follow.",
@@ -8060,6 +8530,7 @@ void McpServer::Impl::addTools() {
             "raw_half":{"type":"boolean","description":"Camera RAW: decode at half size for speed"},
             "stereo":{"type":"string","enum":["file","none","sbs","sbs_half","tb","tb_half","mv"],"description":"Stereoscopic 3D: how the eyes are packed (side by side or top and bottom, full size or squeezed, or mv for MV-HEVC's two views), none for a flat picture"},
             "swap_eyes":{"type":"boolean","description":"Stereoscopic 3D: the eyes are the other way round"},
+            "sdr_expand":{"type":"string","enum":["","bt2446a","bt2446c"],"description":"SDR footage in an HDR sequence: \"\" at HDR reference white (203 nits), or brought up into HDR by ITU-R BT.2446 Method A (SDR white at 1000 nits) or Method C (SDR white at about 330 nits). Titles and graphics stay at reference white"},
             "reset":{"type":"boolean","description":"Read the files as they are"}},"required":["project","media"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -8068,6 +8539,11 @@ void McpServer::Impl::addTools() {
             if (mv.isString()) ids.push_back(projectMedia(l.project, mv.toString()).id);
             for (const QJsonValue& v : mv.toArray()) ids.push_back(projectMedia(l.project, v.toString()).id);
             if (ids.empty()) throw ArgError{"\"media\" is required"};
+            std::string sdrExpand;
+            if (a.contains("sdr_expand")) {
+                sdrExpand = str(a, "sdr_expand").toStdString();
+                if (ToneMapping t; !parseToneMapping(sdrExpand, t)) throw ArgError{"\"sdr_expand\" is \"\", bt2446a or bt2446c"};
+            }
             auto fileOr = [&](const char* key, double& value) {
                 const QJsonValue v = a.value(key);
                 if (v.isUndefined() || v.isNull()) return false;
@@ -8120,9 +8596,18 @@ void McpServer::Impl::addTools() {
                 if (!r.ok && !r.error.empty()) throw ArgError{QStringLiteral("%1: %2").arg(QString::fromStdString(m->name), QString::fromStdString(r.error))};
                 changed += r.ok;
                 m = l.project.findMedia(m->id);
+                // (how SDR comes into HDR: the file and its subclips, apart from how it is read)
+                if (a.contains("sdr_expand") || a.value("reset").toBool()) {
+                    const std::string value = a.contains("sdr_expand") ? sdrExpand : std::string();
+                    bool any = false;
+                    for (MediaItem& x : l.project.media)
+                        if ((x.id == m->id || x.subclipOf == m->id) && x.sdrExpand != value) x.sdrExpand = value, any = true;
+                    changed += any && !r.ok;
+                }
                 QJsonObject o{{"name", QString::fromStdString(m->name)}, {"frame_rate", m->fps.toDouble()}, {"duration_seconds", m->duration},
                               {"width", m->width}, {"height", m->height}};
                 if (!m->stereo.empty()) o["stereo"] = QString::fromStdString(m->stereo);
+                if (!m->sdrExpand.empty()) o["sdr_expand"] = QString::fromStdString(m->sdrExpand);
                 mediaPathJson(*m, o);
                 out.append(o);
             }
@@ -8612,14 +9097,15 @@ void McpServer::Impl::addTools() {
         "a target on its code values: lift (-0.5..0.5), gamma (-1..1), gain (0..2), saturation (0..2), highlights (a "
         "roll-off, 0..1) and mid_detail (-1..1), keyframed with `keyframe` (or where a control has keys), and peak (the "
         "shot's brightest light in nits, which the target's roll-off starts from; 0 the master's peak). list gives the "
-        "targets and the clips' trims; add_target, remove_target; set a clip's controls (at a timeline time, default the "
+        "targets and the clips' trims; add_target, remove_target; tone_mapping says how an SDR target is made from the HDR "
+        "master (\"\" Montage's roll-off, bt2446a or bt2446c, ITU-R BT.2446 Method A or C); set a clip's controls (at a timeline time, default the "
         "playhead); reset clips' trims; copy one clip's trim to others; analyse measures each shot's light in an HDR "
         "master (between `from` and `to`, default all) and gives every shot with no trim of its own a starting trim for "
         "`target` (default every target), shots of one colour group pulled towards their median, returning each shot's "
         "light and trims (whether each was filled, kept the shot's own or is on a locked track; `measure_only` changes "
         "nothing). montage_render's trim_target delivers a target.",
         R"json({"type":"object","properties":{"project":{"type":"string"},
-            "action":{"type":"string","enum":["list","add_target","remove_target","set","reset","copy","analyse"],"default":"list"},
+            "action":{"type":"string","enum":["list","add_target","remove_target","tone_mapping","set","reset","copy","analyse"],"default":"list"},
             "target":{"type":"string","description":"A target's id; add_target: a preset (sdr, hdr10-1000, hdr10-600, hdr10-300, hlg) or omitted with color_space"},
             "from":{"type":["number","string"],"description":"analyse: timeline time to start at (default the start)"},
             "to":{"type":["number","string"],"description":"analyse: timeline time to end at (exclusive; default the end)"},
@@ -8627,6 +9113,7 @@ void McpServer::Impl::addTools() {
             "color_space":{"type":"string","description":"add_target: a display space (rec709, rec2100pq, rec2100hlg...)"},
             "peak_nits":{"type":"number","description":"add_target: the display's peak (PQ)"},
             "name":{"type":"string","description":"add_target: its name"},
+            "tone_mapping":{"type":"string","enum":["","bt2446a","bt2446c"],"description":"add_target, tone_mapping: an SDR target's tone mapping from the HDR master"},
             "clip":{"type":["number","string"],"description":"set, copy: the clip (id or name)"},
             "clips":{"type":"array","items":{"type":["number","string"]},"description":"reset, copy: clips (ids or names)"},
             "values":{"type":"object","description":"set: controls and their values, e.g. {\"gain\":0.9,\"highlights\":0.4}"},
@@ -8652,7 +9139,8 @@ void McpServer::Impl::addTools() {
                 QJsonArray targets, presets, trims;
                 for (const TrimTarget& tt : s.trimTargets)
                     targets.append(QJsonObject{{"id", QString::fromStdString(tt.id)}, {"name", QString::fromStdString(tt.name)},
-                                               {"color_space", QString::fromStdString(tt.colorSpace)}, {"peak_nits", trimTargetPeak(s, tt.id)}});
+                                               {"color_space", QString::fromStdString(tt.colorSpace)}, {"peak_nits", trimTargetPeak(s, tt.id)},
+                                               {"tone_mapping", QString::fromStdString(tt.toneMapping)}});
                 for (const TrimTarget& tt : trimTargetPresets()) presets.append(QString::fromStdString(tt.id));
                 for (const Track& tr : s.videoTracks)
                     for (const Clip& c : tr.clips)
@@ -8685,6 +9173,7 @@ void McpServer::Impl::addTools() {
                     tt.peakNits = a.value("peak_nits").toDouble(1000);
                 }
                 if (a.contains("name")) tt.name = str(a, "name").toStdString();
+                if (a.contains("tone_mapping")) tt.toneMapping = str(a, "tone_mapping").toStdString();
                 const size_t before = s.trimTargets.size();
                 const auto r = edit::addTrimTarget(s, tt);
                 if (!r.ok) return fail(QString::fromStdString(r.error));
@@ -8694,6 +9183,9 @@ void McpServer::Impl::addTools() {
                           QJsonObject{{"id", QString::fromStdString(added.id)}});
             }
             if (action == "remove_target") return done(edit::removeTrimTarget(s, need(a, "target").toStdString()), QStringLiteral("Removed"));
+            if (action == "tone_mapping")
+                return done(edit::setTrimTargetToneMapping(s, need(a, "target").toStdString(), str(a, "tone_mapping").toStdString()),
+                            QStringLiteral("Tone mapping set"));
             if (action == "set") {
                 const Clip& c = videoClipArg(l, a);
                 std::map<std::string, double> values;
@@ -9403,7 +9895,7 @@ void McpServer::Impl::addTools() {
         "24. `subtitles` names a caption track to send as SMPTE subtitles (or closed captions, or burned in). `encrypt` "
         "encrypts the track files and keeps their keys in a DKDM, from which montage_make_kdm makes KDMs for cinemas. "
         "The package is checked when done (as montage_verify_dcp); returns its name, folder, anything the check found and "
-        "what Bv2.1 advises.",
+        "what Bv2.1 advises, and the sound's Leq(M) (a trailer or teaser over 85, or an advertisement over 82, is a problem).",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string","description":"Where to make the DCP folder"},
             "title":{"type":"string"},"kind":{"type":"string","enum":["feature","short","trailer","teaser","advertisement","test","rating","psa"],"default":"feature"},
             "container":{"type":"string","enum":["flat","scope","full"],"description":"Default: Scope for sequences 2:1 or wider, else Flat"},
@@ -9465,6 +9957,8 @@ void McpServer::Impl::addTools() {
             std::vector<std::string> advice;
             for (const std::string& i : verifyDcp(r.folder, {}, &advice)) found.append(QString::fromStdString(i));
             for (const std::string& i : advice) advised.append(QString::fromStdString(i));
+            if (r.overLoudnessLimit())
+                found.append(QStringLiteral("The sound is %1 Leq(M), over the %2 its kind is held to").arg(r.leqm, 0, 'f', 1).arg(r.leqmLimit, 0, 'f', 0));
             const QJsonObject out{{"name", QString::fromStdString(r.name)}, {"folder", QString::fromStdString(r.folder)},
                                   {"cpl", QString::fromStdString(r.cpl)}, {"cpl_id", QString::fromStdString(r.cplId)},
                                   {"frames", double(r.frames)}, {"fps", r.fps},
@@ -9472,6 +9966,8 @@ void McpServer::Impl::addTools() {
                                   {"dci_profile", r.cinemaProfile}, {"stereo", r.stereo}, {"encrypted", r.encrypted},
                                   {"signed", r.signedPackage}, {"subtitles", r.subtitleCount},
                                   {"dkdm", r.dkdm.empty() ? QJsonValue() : QJsonValue(QString::fromStdString(r.dkdm))},
+                                  {"leqm", std::round(r.leqm * 10) / 10},
+                                  {"leqm_limit", r.leqmLimit > 0 ? QJsonValue(r.leqmLimit) : QJsonValue()},
                                   {"problems", found}, {"advice", advised}};
             return ok(found.isEmpty() ? QStringLiteral("Made %1 and checked it: no problems").arg(QString::fromStdString(r.name))
                                       : QStringLiteral("Made %1; the check found %2 problem(s)").arg(QString::fromStdString(r.name)).arg(found.size()),
@@ -9543,7 +10039,11 @@ void McpServer::Impl::addTools() {
         "captions or forced narratives (`texts`), and `supplement_of` (an earlier package's folder) makes a supplemental "
         "package carrying only what changed since it: the composition plays the earlier package's track files where the "
         "pictures and sound are the same. Give `original_sequence`, the sequence that package was mastered from (kept as "
-        "it was), when the cut has changed.",
+        "it was), when the cut has changed. `application` 5 makes an archival master instead (Application #5, SMPTE ST "
+        "2067-50): every frame an ACES 2065-1 OpenEXR image (ST 2065-4, half float) in MXF (ST 2065-5), the composition "
+        "naming the output transform it is viewed through; `graded` false keeps the shots as they came in, before the "
+        "grade; `target_frames` (sequence frame numbers, within what is exported) adds those frames as they are "
+        "delivered, as reference stills, with an ACES Metadata File.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"folder":{"type":"string","description":"Where to make the IMF folder"},
             "title":{"type":"string"},"kind":{"type":"string","enum":["feature","episode","short","trailer","teaser","advertisement","promotion","test"],"default":"feature"},
             "colour":{"type":"string","enum":["rec709","p3d65-pq","rec2020-pq","rec2020-hlg"],"description":"Default: as the sequence is graded"},
@@ -9561,7 +10061,10 @@ void McpServer::Impl::addTools() {
                 "track":{"type":"string","description":"The caption track's name"},"kind":{"type":"string","enum":["subtitles","captions","forced"],"default":"subtitles"},
                 "image":{"type":"boolean","default":false,"description":"As pictures in the track's style (IMSC 1.1 Image profile), not text"}},"required":["track"]}},
             "supplement_of":{"type":"string","description":"An earlier IMF package's folder: make a supplemental package of it (beside it: `folder` must be the folder holding it)"},
-            "original_sequence":{"type":"string","description":"Supplemental: the sequence the earlier package was mastered from (default: the picture has not changed)"}},
+            "original_sequence":{"type":"string","description":"Supplemental: the sequence the earlier package was mastered from (default: the picture has not changed)"},
+            "application":{"type":"integer","enum":[2,5],"default":2,"description":"2: Application #2E (JPEG 2000); 5: ACES archival master"},
+            "graded":{"type":"boolean","default":true,"description":"Application #5: with the grade (false: the shots before it)"},
+            "target_frames":{"type":"array","items":{"type":"integer","minimum":0},"description":"Application #5: sequence frames to add as delivered reference stills"}},
             "required":["project","folder"]})json",
         false, [this](const QJsonObject& a) {
             Loaded l = open(a);
@@ -9607,6 +10110,13 @@ void McpServer::Impl::addTools() {
                     if (QString::fromStdString(sq.name) == name) st.originalSequence = sq.id;
                 if (!st.originalSequence) throw ArgError{QStringLiteral("No sequence named \"%1\"").arg(name)};
             }
+            st.application = a.value("application").toInt(2);
+            st.graded = a.value("graded").toBool(true);
+            for (const QJsonValue& v : a.value("target_frames").toArray()) {
+                if (!v.isDouble() || v.toDouble() != std::floor(v.toDouble()) || v.toDouble() < 0)
+                    throw ArgError{QStringLiteral("target_frames are whole frame numbers")};
+                st.targetFrames.push_back(FrameTime(v.toDouble()));
+            }
             const QString folder = absolute(need(a, "folder"));
             QDir().mkpath(folder);
             ImfResult r;
@@ -9618,12 +10128,17 @@ void McpServer::Impl::addTools() {
                 return fail(QString::fromStdString(err));
             QJsonArray found;
             for (const std::string& i : verifyImf(r.folder)) found.append(QString::fromStdString(i));
-            const QJsonObject out{{"folder", QString::fromStdString(r.folder)}, {"cpl", QString::fromStdString(r.cpl)},
+            QJsonObject out{{"folder", QString::fromStdString(r.folder)}, {"cpl", QString::fromStdString(r.cpl)},
                                   {"frames", double(r.frames)}, {"edit_rate", QStringLiteral("%1/%2").arg(r.rateNum).arg(r.rateDen)},
                                   {"width", r.width}, {"height", r.height}, {"bits", r.bits}, {"channels", r.channels},
                                   {"colour", QString::fromStdString(r.colour)}, {"rsiz", r.rsiz}, {"sounds", r.sounds}, {"texts", r.texts},
                                   {"supplemental", r.supplemental}, {"coded_frames", double(r.codedFrames)},
-                                  {"new_samples", double(r.newSamples)}, {"problems", found}};
+                                  {"new_samples", double(r.newSamples)}, {"problems", found}, {"application", r.application}};
+            if (r.application == 5) {
+                out["output_transform"] = QString::fromStdString(r.outputTransform);
+                out["target_frames"] = r.targetFrames;
+                if (!r.amf.empty()) out["amf"] = QString::fromStdString(r.amf);
+            }
             const QString name = QFileInfo(QString::fromStdString(r.folder)).fileName();
             return ok(found.isEmpty() ? QStringLiteral("Made %1 and checked it: no problems").arg(name)
                                       : QStringLiteral("Made %1; the check found %2 problem(s)").arg(name).arg(found.size()),
@@ -9632,8 +10147,8 @@ void McpServer::Impl::addTools() {
 
     add("montage_verify_imf", "Check an IMF package",
         "Check an IMF package folder: asset map, every file present at its size, packing list hashes, each composition's "
-        "resources in the package with their essence descriptors and durations, the Application #2E identification, "
-        "picture track files JPEG 2000 in an IMF profile with the right number of frames, sound 24-bit 48 kHz with the "
+        "resources in the package with their essence descriptors and durations, the Application #2E or #5 identification, "
+        "picture track files JPEG 2000 in an IMF profile (or ACES OpenEXR images, with their target frames) with the right number of frames, sound 24-bit 48 kHz with the "
         "right number of samples, timed text that reads. A supplemental package's track files from earlier packages are "
         "looked for in the folders beside it. Returns the problems found (none: it passed).",
         R"json({"type":"object","properties":{"folder":{"type":"string"}},"required":["folder"]})json", true, [](const QJsonObject& a) {
@@ -9702,6 +10217,8 @@ void McpServer::Impl::addTools() {
             "loudness_lufs":{"type":"number","description":"Normalise the mix to this loudness, e.g. -14 (streaming) or -23 (EBU R128)"},
             "peak_ceiling":{"type":"number","default":-1,"description":"True peak ceiling (dBTP) when normalising"},
             "loudness_dialogue":{"type":"boolean","default":false,"description":"loudness_lufs is the dialogue's (Netflix: -27, peak_ceiling -2), measured as montage_dialogue_loudness does"},
+            "loudness_report":{"type":"boolean","default":false,"description":"Write a loudness report of the sound as delivered beside the output: name.loudness.pdf and name.loudness.csv"},
+            "leqm_limit":{"type":"number","description":"With loudness_report: a cinema Leq(M) limit (85 trailers, 82 advertising)"},
             "burn_in":{"type":"object","description":"Overlays for a review copy","properties":{
                 "timecode":{"type":"boolean"},"clip_name":{"type":"boolean"},"text":{"type":"string"},
                 "footage":{"type":"boolean","description":"Feet and frames in the sequence's film gauge"},
@@ -9718,6 +10235,8 @@ void McpServer::Impl::addTools() {
             "captions":{"type":"string","enum":["none","burn","embed","both"],"default":"none","description":"The visible caption track, burned into the picture and/or embedded as a subtitle stream"},
             "caption_images":{"type":"string","enum":["pgs","dvb","dvd"],"description":"Embedded captions as pictures in the track's style: PGS or DVD in Matroska, DVB in Matroska or MPEG-TS (MPEG-TS takes DVB anyway)"},
             "trim_target":{"type":"string","description":"A trim pass (montage_trim): deliver that target of the sequence (its space and peak, each shot's trim) instead of the master"},
+            "color_space":{"type":"string","description":"Deliver in this display space (rec709, srgb, rec2100pq, rec2100hlg...) instead of the sequence's; an HDR sequence delivered in SDR is tone mapped"},
+            "tone_mapping":{"type":"string","enum":["","bt2446a","bt2446c"],"description":"An HDR sequence delivered in SDR: \"\" Montage's roll-off, or ITU-R BT.2446 Method A or C (a sequence graded scene-referred goes through its output transform instead)"},
             "hdr10plus":{"type":"boolean","default":false,"description":"PQ exports: dynamic HDR metadata (SMPTE ST 2094-40), scene by scene, in HEVC and AV1 video and as name.hdr10plus.json beside the file (measured first unless montage_measure_hdr's analysis still matches the cut)"},
             "adaptive_hdr":{"type":"boolean","default":false,"description":"PQ and HLG exports: adaptive HDR metadata (SMPTE ST 2094-50) in HEVC and AV1 video, scene by scene: the reference white, the scene's headroom and the gain curve to its SDR rendition (the sequence's SDR trim, else Montage's own mapping), so any display tones it down as the grade did (fitted first unless montage_measure_hdr's analysis still matches)"},
             "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask): CEA-608 and CTA-708 service 1"},
@@ -9840,6 +10359,11 @@ void McpServer::Impl::addTools() {
                 st.peakCeiling = std::min(0.0, a.value("peak_ceiling").toDouble(-1));
                 st.dialogueGated = a.value("loudness_dialogue").toBool(false);
             }
+            st.loudnessReport = a.value("loudness_report").toBool(false);
+            if (a.contains("leqm_limit")) {
+                st.leqmLimit = a.value("leqm_limit").toDouble();
+                if (!(st.leqmLimit >= 60 && st.leqmLimit <= 110)) throw ArgError{"\"leqm_limit\" must be between 60 and 110"};
+            }
             if (a.value("burn_in").isObject()) {
                 const QJsonObject b = a.value("burn_in").toObject();
                 static const QStringList corners = {"top_left", "top_centre", "top_right", "bottom_left", "bottom_centre", "bottom_right"};
@@ -9874,6 +10398,19 @@ void McpServer::Impl::addTools() {
             st.trimTarget = str(a, "trim_target").toStdString();
             if (!st.trimTarget.empty() && !findTrimTarget(s, st.trimTarget))
                 throw ArgError{QStringLiteral("The sequence has no trim target \"%1\" (montage_trim lists them)").arg(str(a, "trim_target"))};
+            if (a.contains("color_space")) {
+                const ColorSpace* cs = findColorSpace(str(a, "color_space").toStdString());
+                if (!cs || cs->sceneReferred || cs->toneMapping != ToneMapping::Montage) throw ArgError{"\"color_space\" must be a display space (rec709, srgb, rec2100pq, rec2100hlg...)"};
+                st.colorSpace = cs->id;
+            }
+            st.toneMapping = str(a, "tone_mapping").toStdString();
+            if (ToneMapping t; !parseToneMapping(st.toneMapping, t)) throw ArgError{"\"tone_mapping\" is \"\", bt2446a or bt2446c"};
+            if (!st.toneMapping.empty()) {
+                const ColorSpace& out = st.colorSpace.empty() ? sequenceColorSpace(s) : *findColorSpace(st.colorSpace);
+                if (!st.trimTarget.empty()) throw ArgError{"A trim target has its own tone mapping (montage_trim)"};
+                if (sceneReferredWorking(s)) throw ArgError{"A sequence graded scene-referred goes into SDR through its output transform"};
+                if (!sequenceColorSpace(s).hdr() || out.hdr()) throw ArgError{"\"tone_mapping\" is for an HDR sequence delivered in SDR (color_space)"};
+            }
             st.embedCaptions = cap == "embed" || cap == "both";
             if (a.contains("caption_images")) {
                 st.captionImages = a.value("caption_images").toString().toStdString();
@@ -9938,6 +10475,8 @@ void McpServer::Impl::addTools() {
             }
             std::string err;
             LightLevels light;
+            const QString report = QString::fromStdString(loudnessReportBase(st.path)) + ".pdf";
+            if (st.loudnessReport) QFile::remove(report);  // (one from before is not this one's)
             if (!exportSequence(l.project, s, st, [this](double f, FrameTime) { progress(f, "Rendering"); }, nullptr, &err, nullptr, nullptr, &light))
                 return fail(QString::fromStdString(err));
             QJsonObject o{{"output", QString::fromStdString(st.path)}};
@@ -9984,6 +10523,12 @@ void McpServer::Impl::addTools() {
                     text += QStringLiteral("\nWrote %1").arg(QString::fromStdString(f.path));
                 }
                 o["stems"] = list;
+            }
+            if (st.loudnessReport) {
+                const bool written = QFileInfo::exists(report);
+                o["loudness_report"] = written ? QJsonValue(report) : QJsonValue();
+                text += written ? QStringLiteral("\nLoudness report: %1 (and .csv)").arg(report)
+                                : QStringLiteral("\nNo loudness report: the delivery has no sound, or it could not be written");
             }
             return ok(text, o);
         });
