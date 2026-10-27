@@ -107,10 +107,22 @@ const TrimTarget* findTrimTarget(const Sequence& s, const std::string& id) {
     return nullptr;
 }
 
+const ColorSpace* trimTargetDisplay(const Sequence& s, const TrimTarget& t) {
+    const ColorSpace* c = findColorSpace(t.colorSpace);
+    ToneMapping tm = ToneMapping::Montage;
+    if (c && !sceneReferredWorking(s) && parseToneMapping(t.toneMapping, tm)) c = &withToneMapping(*c, tm);
+    return c;
+}
+
 const ColorSpace& trimTargetSpace(const Sequence& s, const std::string& id) {
     if (const TrimTarget* t = findTrimTarget(s, id))
-        if (const ColorSpace* c = findColorSpace(t->colorSpace)) return *c;
+        if (const ColorSpace* c = trimTargetDisplay(s, *t)) return *c;
     return sequenceColorSpace(s);
+}
+
+double sdrHeadroomNits(const ColorSpace& sdr) {
+    const double white = toneMappingWhiteNits(sdr.toneMapping);
+    return white > 0 ? white : kSdrHeadroomNits;
 }
 
 double trimTargetPeak(const Sequence& s, const std::string& id) {
@@ -193,7 +205,7 @@ void applyTrimPass(Image& img, const Sequence& s, FrameTime t, const TrimTarget&
 void applyTrim(Image& img, const Sequence& s, const TrimTarget& target, const Effect* trimmed, FrameTime local, const ColorSpace* scene,
                bool exact) {
     const ColorSpace& from = sequenceColorSpace(s);
-    const ColorSpace* to = findColorSpace(target.colorSpace);
+    const ColorSpace* to = trimTargetDisplay(s, target);
     // (A frame in scene light is always rendered for a display: the delivery space when the target names none known.)
     if (!to && scene && scene->sceneReferred) to = &from;
     if (img.empty() || !to) return;
@@ -223,7 +235,7 @@ void applyTrim(Image& img, const Sequence& s, const TrimTarget& target, const Ef
             // off too.
             const ColorSpace rolled{"trim-pq-" + to->id, "", to->primaries, Transfer::Pq, false};
             convertColor(img, from, rolled, master);
-            if (fromPeak > kSdrHeadroomNits) rollOffPq(img, fromPeak, kSdrHeadroomNits);
+            if (const double headroom = sdrHeadroomNits(*to); fromPeak > headroom) rollOffPq(img, fromPeak, headroom);
             convertColor(img, rolled, *to, master);
         } else if (to->transfer == Transfer::Pq && from.hdr() && (fromPeak > peak || master > peak)) {
             // (into PQ at the master's peak, then rolled off there: HLG's highlights too)
@@ -293,7 +305,13 @@ namespace edit {
 
 Result addTrimTarget(Sequence& s, TrimTarget target) {
     const ColorSpace* space = findColorSpace(target.colorSpace);
-    if (!space || space->sceneReferred) return Result::fail("A trim target is a display space (Rec.709, Rec.2100 PQ or HLG...)");
+    if (!space || space->sceneReferred || space->toneMapping != ToneMapping::Montage)
+        return Result::fail("A trim target is a display space (Rec.709, Rec.2100 PQ or HLG...)");
+    ToneMapping tm;
+    if (!parseToneMapping(target.toneMapping, tm)) return Result::fail("No tone mapping " + target.toneMapping + " (bt2446a or bt2446c)");
+    if (tm != ToneMapping::Montage && space->hdr()) return Result::fail("Tone mapping is for an SDR target");
+    if (tm != ToneMapping::Montage && sceneReferredWorking(s))
+        return Result::fail("A sequence graded scene-referred goes into SDR through its output transform");
     target.peakNits = targetPeak(*space, target.peakNits);
     if (target.id.empty()) target.id = space->hdr() ? space->id + "-" + std::to_string(int(std::lround(target.peakNits))) : space->id;
     if (target.name.empty())
@@ -301,6 +319,20 @@ Result addTrimTarget(Sequence& s, TrimTarget target) {
     const std::string base = target.id;
     for (int n = 2; findTrimTarget(s, target.id); ++n) target.id = base + "-" + std::to_string(n);
     s.trimTargets.push_back(std::move(target));
+    return {};
+}
+
+Result setTrimTargetToneMapping(Sequence& s, const std::string& id, const std::string& toneMapping) {
+    const TrimTarget* found = findTrimTarget(s, id);
+    if (!found) return Result::fail("No trim target " + id);
+    ToneMapping tm;
+    if (!parseToneMapping(toneMapping, tm)) return Result::fail("No tone mapping " + toneMapping + " (bt2446a or bt2446c)");
+    const ColorSpace* space = findColorSpace(found->colorSpace);
+    if (tm != ToneMapping::Montage && (!space || space->hdr())) return Result::fail("Tone mapping is for an SDR target");
+    if (tm != ToneMapping::Montage && sceneReferredWorking(s))
+        return Result::fail("A sequence graded scene-referred goes into SDR through its output transform");
+    for (TrimTarget& t : s.trimTargets)
+        if (t.id == id) t.toneMapping = toneMapping;
     return {};
 }
 

@@ -1482,7 +1482,23 @@ The tenth gap analysis (`docs/research/phase11-roadmap.md`, October 2026) ranks 
     - At most 48 target frames (the header partition is a fixed 16 KB).
     - The ACES Metadata File names the output transform only when it is ACES 2.0's; Montage's filmic one is named in the composition only.
     - The ST 2065-4 check reads each frame's header, not its pixels.
-- [ ] 6. SDR brought up into HDR by ITU-R BT.2446-1 methods A and C, and those methods for HDR to SDR (S)
+- [x] 6. SDR brought up into HDR by ITU-R BT.2446-1 methods A and C, and those methods for HDR to SDR (S)
+  - Done: `ToneMapping` (Montage, Bt2446A, Bt2446C) in `render/ColorSpace`. `withToneMapping` gives an SDR display space a variant (`rec709+bt2446a`, `+bt2446c`) that `findColorSpace` also resolves; conversions between an SDR space and HDR use the SDR side's method (`convertBt2446`: display light to BT.2020 nits, the method, the target's primaries, clamped to its peak). The LUT cache is keyed by id, so each variant has its own 65³ table, which the GPU compositor uses too. Montage's own mapping is unchanged.
+    - Method A (Tables 2–4): HDR to SDR by its log compression, knee and colour scaling with the Cr correction; SDR to HDR by its luma-dependent exponent and saturation scale, SDR white at 1000 nits.
+    - Method C (§ 6): crosstalk matrix (α = 0.05), XYZ, Yxy; a linear part below 58.5 cd/m² of SDR and a log shoulder above it. k1 and k3 are the report's; k2 and k4 are worked out from its equations (7) and (8), because the rounded values in (10) leave a 0.035 cd/m² step at the knee. The way up is the exact inverse.
+    - `MediaItem.sdrExpand` (Interpret Footage's SDR in HDR, saved; a file and its subclips together; ignored for HDR footage and its SDR proxy), `TrimTarget.toneMapping` (`edit::setTrimTargetToneMapping`, refused on HDR targets), `ExportSettings.toneMapping` (render farm jobs carry it). A sequence graded scene-referred goes into SDR through its output transform, so its targets and exports take no tone mapping (refused when asked).
+    - A shot's own peak (a trim's `peak`) is rolled off to the light the method brings to white (`sdrHeadroomNits`: 1000 cd/m² for A, about 333 for C) instead of Montage's 280. Render cache, clip strip and ST 2094-50 analysis keys include the settings.
+    - UI: Interpret Footage's SDR in HDR (SDR footage only), the Trims panel's Tone mapping (an SDR target of an HDR master), the export dialog's Tone mapping (an HDR sequence delivered in SDR). MCP `montage_interpret_media` `sdr_expand`, `montage_render` `color_space` and `tone_mapping`, `montage_trim` `tone_mapping` (on `add_target`, an action of its own, and listed).
+  - **Tests:**
+    - render `sdrAndHdrByBt2446`: names and lookups; SDR white at 203 nits by Montage, 1000 by A, the top of C's curve; HDR reference white to 96 % by C; Montage's mapping untouched; every curve monotonic, densely through C's knee; C round trip exact in light; A's round trips within 12 10-bit codes and within 7 % of light from 1 to 1000 nits; HLG equal to PQ through BT.2100's conversion within a 10-bit code; the table equal to the exact conversion within a 10-bit code; a still brought in by C and a trim target by A, saved and reloaded; a shot peak through A keeps white; HDR footage takes no expansion; a scene-referred sequence's targets take none. `gpuCompositorMatchesCpu` (Qt 6.6 or later): pictures brought up by C and viewed through A.
+    - media `bt2446OverMcp`: `sdr_expand` saved, refused and reset; a trim target by A, listed, changed to C, refused on HLG and for a variant id; renders in Rec.709 by Montage's mapping and by A differ as expected; bad values, an HDR delivery and a trim target with `tone_mapping` refused.
+    - app: Interpret Footage's SDR in HDR (`interpretFootageFromTheBin`), the Trims panel's Tone mapping with undo (`trimPassesPanel`), and the export dialog's Tone mapping offered only for an SDR delivery (`colourManagementUi`).
+  - Not yet:
+    - Method A is not an exact inverse: the report's constants bring 10-bit SDR back within 11.4 code values at worst (near 86 %), not within 1 as the roadmap hoped.
+    - Method C's crosstalk α is fixed at 0.05 (the report leaves it open between 0 and 0.33).
+    - An HDR sequence peaking below 1000 nits clips Method A's expanded highlights at its peak rather than compressing them.
+    - Method A's HLG simplification is not used; HLG output goes through PQ light, which matches it within a 10-bit code.
+    - Montage's titles and graphics are always at reference white (there is no per-title choice to expand them).
 - [ ] 7. Cinema loudness: Leq(m), the loudness range gated by dialogue, loudness logs and reports (S)
 - [ ] 8. Shots grouped by camera angle and by scene for grading (S–M)
 - [ ] 9. Light rays and aperture diffraction glare in scene light (S)

@@ -70,6 +70,14 @@ namespace montage {
 
 namespace {
 
+// The delivery space an export asks for (none: the sequence's), with its tone mapping when it is SDR (not for a
+// sequence graded scene-referred, which goes through its output transform).
+const ColorSpace* deliverySpaceAsked(const Sequence& seq, const ExportSettings& s) {
+    const ColorSpace* c = findColorSpace(s.colorSpace);
+    ToneMapping t = ToneMapping::Montage;
+    return c && !sceneReferredWorking(seq) && parseToneMapping(s.toneMapping, t) ? &withToneMapping(*c, t) : c;
+}
+
 std::string averr(int code) {
     char buf[AV_ERROR_MAX_STRING_SIZE] = {0};
     av_strerror(code, buf, sizeof buf);
@@ -517,7 +525,7 @@ bool exportGif(const Project& p, const Sequence& seq, const ExportSettings& s, F
     const double fps = s.fps > 0 ? s.fps : std::min(15.0, seq.fpsValue());
     const double step = seq.fpsValue() / fps;  // sequence frames per GIF frame
     const int64_t frames = std::max<int64_t>(1, int64_t(std::floor(double(out - in) / step + 1e-9)));
-    const ColorSpace* chosen = findColorSpace(s.colorSpace);
+    const ColorSpace* chosen = deliverySpaceAsked(seq, s);
     const ColorSpace& seqSpace = sequenceColorSpace(seq);
     const ColorSpace& outSpace = chosen && !chosen->sceneReferred && !chosen->hdr() ? *chosen
                                  : !seqSpace.sceneReferred && !seqSpace.hdr()      ? seqSpace
@@ -882,7 +890,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
 
     // (A trim pass's pictures are in its target's space and delivered so.)
     const ColorSpace& seqSpace = trim ? trimTargetSpace(seq, trim->id) : sequenceColorSpace(seq);
-    const ColorSpace* chosen = trim ? &seqSpace : findColorSpace(s.colorSpace);
+    const ColorSpace* chosen = trim ? &seqSpace : deliverySpaceAsked(seq, s);
     // OpenEXR holds scene-linear light: Linear Rec.709 unless a linear (or any scene-referred) space is asked for.
     // DPX can hold camera log too (a VFX pull of log footage stays log).
     const bool logOk = s.videoCodec == "dpx";
@@ -1719,7 +1727,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
     // Smart rendering: only where nothing would change the source's pictures for the whole export.
     std::unique_ptr<SmartRenderer> smart;
     if (wantVideo && s.smartRender && o.vctx && isIntraCodec(o.vctx->codec ? o.vctx->codec->name : "") && W == seq.width && H == seq.height && !seq.stereo3d &&
-        !s.useProxies && !s.burnInCaptions && !s.cea608 && !interlacedOut && !s.burnIn.any() && outSpace.id == seqSpace.id && !trim && !sceneGraded &&
+        !s.useProxies && !s.burnInCaptions && !s.cea608 && !interlacedOut && !s.burnIn.any() && sameColorSpace(outSpace, seqSpace) && !trim && !sceneGraded &&
         !conv.active())
         smart = std::make_unique<SmartRenderer>(p, seq, seqSpace, o.vctx, o.vst, s.alpha, s.profile);
     // CEA-608 (and CTA-708) captions in the video: each frame's A/53 cc_data (core/Cea708.h).
@@ -2175,7 +2183,7 @@ bool exportImpl(const Project& p, const Sequence& seq, const ExportSettings& s, 
 std::string hdr10PlusCarriage(const Sequence& seq, const ExportSettings& s) {
     const std::string& c = s.videoCodec;
     if (c.empty() || c == "none" || c == "gif" || c == "exr") return {};
-    const ColorSpace* chosen = findTrimTarget(seq, s.trimTarget) ? &trimTargetSpace(seq, s.trimTarget) : findColorSpace(s.colorSpace);
+    const ColorSpace* chosen = findTrimTarget(seq, s.trimTarget) ? &trimTargetSpace(seq, s.trimTarget) : deliverySpaceAsked(seq, s);
     const ColorSpace& out = chosen && !chosen->sceneReferred ? *chosen : sequenceColorSpace(seq);
     if (out.transfer != Transfer::Pq) return {};
     const bool video = c == "libx265" || c == "hw_hevc" || c.rfind("hevc_", 0) == 0 || c == "libsvtav1" || c == "libaom-av1" ||
@@ -2186,7 +2194,7 @@ std::string hdr10PlusCarriage(const Sequence& seq, const ExportSettings& s) {
 bool adaptiveHdrCarried(const Sequence& seq, const ExportSettings& s) {
     const std::string& c = s.videoCodec;
     if (!s.adaptiveHdr || c.empty() || c == "none" || c == "gif" || c == "exr") return false;
-    const ColorSpace* chosen = findTrimTarget(seq, s.trimTarget) ? &trimTargetSpace(seq, s.trimTarget) : findColorSpace(s.colorSpace);
+    const ColorSpace* chosen = findTrimTarget(seq, s.trimTarget) ? &trimTargetSpace(seq, s.trimTarget) : deliverySpaceAsked(seq, s);
     const ColorSpace& out = chosen && !chosen->sceneReferred ? *chosen : sequenceColorSpace(seq);
     return out.hdr() && (c == "libx265" || c == "hw_hevc" || c.rfind("hevc_", 0) == 0 || c == "libsvtav1" || c == "libaom-av1" ||
                          c == "librav1e" || c.rfind("av1_", 0) == 0);

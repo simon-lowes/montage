@@ -3237,7 +3237,7 @@ void McpServer::Impl::addTools() {
             if (a.contains("color_space")) {
                 const QString id = a.value("color_space").toString();
                 const ColorSpace* cs = findColorSpace(id.toStdString());
-                if (!cs || cs->sceneReferred)
+                if (!cs || cs->sceneReferred || cs->toneMapping != ToneMapping::Montage)
                     return fail(QStringLiteral("\"%1\" is not a display space a sequence delivers; for camera log or ACES use "
                                                "working_space").arg(id));
                 s.colorSpace = cs->id;
@@ -8415,7 +8415,8 @@ void McpServer::Impl::addTools() {
         "its sound with it, at the new speed or with keep_pitch time-stretched); pixel_aspect replaces the file's (2 for "
         "a 2x anamorphic lens, 1.33, 1.5, 1.8, 0.9 for DV NTSC, 1 for square); alpha reads its transparency as straight, "
         "premultiplied, ignore (opaque) or invert; field_order forces progressive, upper (top field first) or lower "
-        "(bottom field first) whatever the frames are flagged; remove_pulldown undoes 2:3 pulldown (29.97 to 23.976). Arguments left out keep their current setting; 0 or "
+        "(bottom field first) whatever the frames are flagged; remove_pulldown undoes 2:3 pulldown (29.97 to 23.976); sdr_expand "
+        "says how SDR footage is shown in an HDR sequence. Arguments left out keep their current setting; 0 or "
         "\"file\" goes back to the file's own; reset puts everything back. Clips keep starting on the same frame and keep "
         "their timeline length (shortened where the footage no longer reaches); subclips, clip markers and transcripts "
         "follow.",
@@ -8434,6 +8435,7 @@ void McpServer::Impl::addTools() {
             "raw_half":{"type":"boolean","description":"Camera RAW: decode at half size for speed"},
             "stereo":{"type":"string","enum":["file","none","sbs","sbs_half","tb","tb_half","mv"],"description":"Stereoscopic 3D: how the eyes are packed (side by side or top and bottom, full size or squeezed, or mv for MV-HEVC's two views), none for a flat picture"},
             "swap_eyes":{"type":"boolean","description":"Stereoscopic 3D: the eyes are the other way round"},
+            "sdr_expand":{"type":"string","enum":["","bt2446a","bt2446c"],"description":"SDR footage in an HDR sequence: \"\" at HDR reference white (203 nits), or brought up into HDR by ITU-R BT.2446 Method A (SDR white at 1000 nits) or Method C (SDR white at about 330 nits). Titles and graphics stay at reference white"},
             "reset":{"type":"boolean","description":"Read the files as they are"}},"required":["project","media"]})json",
         false, [](const QJsonObject& a) {
             Loaded l = open(a);
@@ -8442,6 +8444,11 @@ void McpServer::Impl::addTools() {
             if (mv.isString()) ids.push_back(projectMedia(l.project, mv.toString()).id);
             for (const QJsonValue& v : mv.toArray()) ids.push_back(projectMedia(l.project, v.toString()).id);
             if (ids.empty()) throw ArgError{"\"media\" is required"};
+            std::string sdrExpand;
+            if (a.contains("sdr_expand")) {
+                sdrExpand = str(a, "sdr_expand").toStdString();
+                if (ToneMapping t; !parseToneMapping(sdrExpand, t)) throw ArgError{"\"sdr_expand\" is \"\", bt2446a or bt2446c"};
+            }
             auto fileOr = [&](const char* key, double& value) {
                 const QJsonValue v = a.value(key);
                 if (v.isUndefined() || v.isNull()) return false;
@@ -8494,9 +8501,18 @@ void McpServer::Impl::addTools() {
                 if (!r.ok && !r.error.empty()) throw ArgError{QStringLiteral("%1: %2").arg(QString::fromStdString(m->name), QString::fromStdString(r.error))};
                 changed += r.ok;
                 m = l.project.findMedia(m->id);
+                // (how SDR comes into HDR: the file and its subclips, apart from how it is read)
+                if (a.contains("sdr_expand") || a.value("reset").toBool()) {
+                    const std::string value = a.contains("sdr_expand") ? sdrExpand : std::string();
+                    bool any = false;
+                    for (MediaItem& x : l.project.media)
+                        if ((x.id == m->id || x.subclipOf == m->id) && x.sdrExpand != value) x.sdrExpand = value, any = true;
+                    changed += any && !r.ok;
+                }
                 QJsonObject o{{"name", QString::fromStdString(m->name)}, {"frame_rate", m->fps.toDouble()}, {"duration_seconds", m->duration},
                               {"width", m->width}, {"height", m->height}};
                 if (!m->stereo.empty()) o["stereo"] = QString::fromStdString(m->stereo);
+                if (!m->sdrExpand.empty()) o["sdr_expand"] = QString::fromStdString(m->sdrExpand);
                 mediaPathJson(*m, o);
                 out.append(o);
             }
@@ -8986,14 +9002,15 @@ void McpServer::Impl::addTools() {
         "a target on its code values: lift (-0.5..0.5), gamma (-1..1), gain (0..2), saturation (0..2), highlights (a "
         "roll-off, 0..1) and mid_detail (-1..1), keyframed with `keyframe` (or where a control has keys), and peak (the "
         "shot's brightest light in nits, which the target's roll-off starts from; 0 the master's peak). list gives the "
-        "targets and the clips' trims; add_target, remove_target; set a clip's controls (at a timeline time, default the "
+        "targets and the clips' trims; add_target, remove_target; tone_mapping says how an SDR target is made from the HDR "
+        "master (\"\" Montage's roll-off, bt2446a or bt2446c, ITU-R BT.2446 Method A or C); set a clip's controls (at a timeline time, default the "
         "playhead); reset clips' trims; copy one clip's trim to others; analyse measures each shot's light in an HDR "
         "master (between `from` and `to`, default all) and gives every shot with no trim of its own a starting trim for "
         "`target` (default every target), shots of one colour group pulled towards their median, returning each shot's "
         "light and trims (whether each was filled, kept the shot's own or is on a locked track; `measure_only` changes "
         "nothing). montage_render's trim_target delivers a target.",
         R"json({"type":"object","properties":{"project":{"type":"string"},
-            "action":{"type":"string","enum":["list","add_target","remove_target","set","reset","copy","analyse"],"default":"list"},
+            "action":{"type":"string","enum":["list","add_target","remove_target","tone_mapping","set","reset","copy","analyse"],"default":"list"},
             "target":{"type":"string","description":"A target's id; add_target: a preset (sdr, hdr10-1000, hdr10-600, hdr10-300, hlg) or omitted with color_space"},
             "from":{"type":["number","string"],"description":"analyse: timeline time to start at (default the start)"},
             "to":{"type":["number","string"],"description":"analyse: timeline time to end at (exclusive; default the end)"},
@@ -9001,6 +9018,7 @@ void McpServer::Impl::addTools() {
             "color_space":{"type":"string","description":"add_target: a display space (rec709, rec2100pq, rec2100hlg...)"},
             "peak_nits":{"type":"number","description":"add_target: the display's peak (PQ)"},
             "name":{"type":"string","description":"add_target: its name"},
+            "tone_mapping":{"type":"string","enum":["","bt2446a","bt2446c"],"description":"add_target, tone_mapping: an SDR target's tone mapping from the HDR master"},
             "clip":{"type":["number","string"],"description":"set, copy: the clip (id or name)"},
             "clips":{"type":"array","items":{"type":["number","string"]},"description":"reset, copy: clips (ids or names)"},
             "values":{"type":"object","description":"set: controls and their values, e.g. {\"gain\":0.9,\"highlights\":0.4}"},
@@ -9026,7 +9044,8 @@ void McpServer::Impl::addTools() {
                 QJsonArray targets, presets, trims;
                 for (const TrimTarget& tt : s.trimTargets)
                     targets.append(QJsonObject{{"id", QString::fromStdString(tt.id)}, {"name", QString::fromStdString(tt.name)},
-                                               {"color_space", QString::fromStdString(tt.colorSpace)}, {"peak_nits", trimTargetPeak(s, tt.id)}});
+                                               {"color_space", QString::fromStdString(tt.colorSpace)}, {"peak_nits", trimTargetPeak(s, tt.id)},
+                                               {"tone_mapping", QString::fromStdString(tt.toneMapping)}});
                 for (const TrimTarget& tt : trimTargetPresets()) presets.append(QString::fromStdString(tt.id));
                 for (const Track& tr : s.videoTracks)
                     for (const Clip& c : tr.clips)
@@ -9059,6 +9078,7 @@ void McpServer::Impl::addTools() {
                     tt.peakNits = a.value("peak_nits").toDouble(1000);
                 }
                 if (a.contains("name")) tt.name = str(a, "name").toStdString();
+                if (a.contains("tone_mapping")) tt.toneMapping = str(a, "tone_mapping").toStdString();
                 const size_t before = s.trimTargets.size();
                 const auto r = edit::addTrimTarget(s, tt);
                 if (!r.ok) return fail(QString::fromStdString(r.error));
@@ -9068,6 +9088,9 @@ void McpServer::Impl::addTools() {
                           QJsonObject{{"id", QString::fromStdString(added.id)}});
             }
             if (action == "remove_target") return done(edit::removeTrimTarget(s, need(a, "target").toStdString()), QStringLiteral("Removed"));
+            if (action == "tone_mapping")
+                return done(edit::setTrimTargetToneMapping(s, need(a, "target").toStdString(), str(a, "tone_mapping").toStdString()),
+                            QStringLiteral("Tone mapping set"));
             if (action == "set") {
                 const Clip& c = videoClipArg(l, a);
                 std::map<std::string, double> values;
@@ -10111,6 +10134,8 @@ void McpServer::Impl::addTools() {
             "captions":{"type":"string","enum":["none","burn","embed","both"],"default":"none","description":"The visible caption track, burned into the picture and/or embedded as a subtitle stream"},
             "caption_images":{"type":"string","enum":["pgs","dvb","dvd"],"description":"Embedded captions as pictures in the track's style: PGS or DVD in Matroska, DVB in Matroska or MPEG-TS (MPEG-TS takes DVB anyway)"},
             "trim_target":{"type":"string","description":"A trim pass (montage_trim): deliver that target of the sequence (its space and peak, each shot's trim) instead of the master"},
+            "color_space":{"type":"string","description":"Deliver in this display space (rec709, srgb, rec2100pq, rec2100hlg...) instead of the sequence's; an HDR sequence delivered in SDR is tone mapped"},
+            "tone_mapping":{"type":"string","enum":["","bt2446a","bt2446c"],"description":"An HDR sequence delivered in SDR: \"\" Montage's roll-off, or ITU-R BT.2446 Method A or C (a sequence graded scene-referred goes through its output transform instead)"},
             "hdr10plus":{"type":"boolean","default":false,"description":"PQ exports: dynamic HDR metadata (SMPTE ST 2094-40), scene by scene, in HEVC and AV1 video and as name.hdr10plus.json beside the file (measured first unless montage_measure_hdr's analysis still matches the cut)"},
             "adaptive_hdr":{"type":"boolean","default":false,"description":"PQ and HLG exports: adaptive HDR metadata (SMPTE ST 2094-50) in HEVC and AV1 video, scene by scene: the reference white, the scene's headroom and the gain curve to its SDR rendition (the sequence's SDR trim, else Montage's own mapping), so any display tones it down as the grade did (fitted first unless montage_measure_hdr's analysis still matches)"},
             "cea608":{"type":"boolean","default":false,"description":"Also carry the caption track as closed captions inside H.264/HEVC video (A/53, as US broadcast and streaming deliveries ask): CEA-608 and CTA-708 service 1"},
@@ -10267,6 +10292,19 @@ void McpServer::Impl::addTools() {
             st.trimTarget = str(a, "trim_target").toStdString();
             if (!st.trimTarget.empty() && !findTrimTarget(s, st.trimTarget))
                 throw ArgError{QStringLiteral("The sequence has no trim target \"%1\" (montage_trim lists them)").arg(str(a, "trim_target"))};
+            if (a.contains("color_space")) {
+                const ColorSpace* cs = findColorSpace(str(a, "color_space").toStdString());
+                if (!cs || cs->sceneReferred || cs->toneMapping != ToneMapping::Montage) throw ArgError{"\"color_space\" must be a display space (rec709, srgb, rec2100pq, rec2100hlg...)"};
+                st.colorSpace = cs->id;
+            }
+            st.toneMapping = str(a, "tone_mapping").toStdString();
+            if (ToneMapping t; !parseToneMapping(st.toneMapping, t)) throw ArgError{"\"tone_mapping\" is \"\", bt2446a or bt2446c"};
+            if (!st.toneMapping.empty()) {
+                const ColorSpace& out = st.colorSpace.empty() ? sequenceColorSpace(s) : *findColorSpace(st.colorSpace);
+                if (!st.trimTarget.empty()) throw ArgError{"A trim target has its own tone mapping (montage_trim)"};
+                if (sceneReferredWorking(s)) throw ArgError{"A sequence graded scene-referred goes into SDR through its output transform"};
+                if (!sequenceColorSpace(s).hdr() || out.hdr()) throw ArgError{"\"tone_mapping\" is for an HDR sequence delivered in SDR (color_space)"};
+            }
             st.embedCaptions = cap == "embed" || cap == "both";
             if (a.contains("caption_images")) {
                 st.captionImages = a.value("caption_images").toString().toStdString();

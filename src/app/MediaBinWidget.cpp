@@ -546,6 +546,19 @@ void MediaBinWidget::interpretFootageDialog(const std::vector<Id>& media) {
     if (!first) return;
     InterpretFootageDialog dlg(*first, int(media.size()), this);
     if (dlg.exec() != QDialog::Accepted) return;
+    // (how SDR is brought into HDR: on each file and every subclip of it, apart from how they are read)
+    if (const std::optional<std::string> expand = dlg.sdrExpand())
+        state_->edit(tr("SDR in HDR"), [media, value = *expand](Project& p, Sequence&) {
+            bool any = false;
+            for (Id id : media) {
+                const MediaItem* m = p.findMedia(id);
+                if (!m) continue;
+                const Id file = m->subclipOf ? m->subclipOf : m->id;
+                for (MediaItem& x : p.media)
+                    if ((x.id == file || x.subclipOf == file) && x.sdrExpand != value) x.sdrExpand = value, any = true;
+            }
+            return any;
+        });
     const Interpretation how = dlg.interpretation();
     const bool keepHighlights = !dlg.highlightsShown();
     const QString choice = dlg.pulldownChoice();

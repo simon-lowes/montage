@@ -788,8 +788,11 @@ QJsonObject sequenceToJson(const Sequence& s) {
     if (s.hdrPeakNits != 1000) o["hdrPeakNits"] = s.hdrPeakNits;
     if (!s.trimTargets.empty()) {
         QJsonArray targets;
-        for (const TrimTarget& tt : s.trimTargets)
-            targets.append(QJsonObject{{"id", qs(tt.id)}, {"name", qs(tt.name)}, {"colorSpace", qs(tt.colorSpace)}, {"peakNits", tt.peakNits}});
+        for (const TrimTarget& tt : s.trimTargets) {
+            QJsonObject t{{"id", qs(tt.id)}, {"name", qs(tt.name)}, {"colorSpace", qs(tt.colorSpace)}, {"peakNits", tt.peakNits}};
+            if (!tt.toneMapping.empty()) t["toneMapping"] = qs(tt.toneMapping);
+            targets.append(t);
+        }
         o["trimTargets"] = targets;
     }
     if (s.hdrMaxCll > 0) o["hdrMaxCll"] = s.hdrMaxCll;
@@ -845,7 +848,8 @@ Sequence sequenceFromJson(const QJsonObject& o) {
     s.hdrPeakNits = std::clamp(o.value("hdrPeakNits").toDouble(1000), 100.0, 10000.0);
     for (const auto& v : o.value("trimTargets").toArray()) {
         const QJsonObject tt = v.toObject();
-        TrimTarget target{ss(tt.value("id")), ss(tt.value("name")), ss(tt.value("colorSpace")), std::clamp(tt.value("peakNits").toDouble(100), 100.0, 10000.0)};
+        TrimTarget target{ss(tt.value("id")), ss(tt.value("name")), ss(tt.value("colorSpace")), std::clamp(tt.value("peakNits").toDouble(100), 100.0, 10000.0),
+                          ss(tt.value("toneMapping"))};
         if (!target.id.empty() && std::none_of(s.trimTargets.begin(), s.trimTargets.end(), [&](const TrimTarget& x) { return x.id == target.id; }))
             s.trimTargets.push_back(std::move(target));
     }
@@ -1061,6 +1065,7 @@ std::string projectToJson(const Project& p, const std::string& projectPath) {
         if (!m.bin.empty()) o["bin"] = qs(m.bin);
         if (!m.colorSpace.empty()) o["colorSpace"] = qs(m.colorSpace);
         if (!m.colorOverride.empty()) o["colorOverride"] = qs(m.colorOverride);
+        if (!m.sdrExpand.empty()) o["sdrExpand"] = qs(m.sdrExpand);
         if (m.maxCll > 0) o["maxCll"] = m.maxCll;
         if (m.maxFall > 0) o["maxFall"] = m.maxFall;
         if (m.gainMap) o["gainMap"] = true;
@@ -1254,6 +1259,7 @@ bool projectFromJson(const std::string& json, Project& out, std::string* error, 
         m.bin = ss(o.value("bin"));
         m.colorSpace = ss(o.value("colorSpace"));
         m.colorOverride = ss(o.value("colorOverride"));
+        m.sdrExpand = ss(o.value("sdrExpand"));
         m.maxCll = std::max(0.0, o.value("maxCll").toDouble());
         m.maxFall = std::max(0.0, o.value("maxFall").toDouble());
         m.gainMap = o.value("gainMap").toBool();

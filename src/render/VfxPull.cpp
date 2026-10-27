@@ -24,6 +24,7 @@
 #include "media/LensCalibration.h"
 #include "media/Matting.h"
 #include "media/MediaPool.h"
+#include "media/Proxy.h"
 
 namespace montage {
 
@@ -132,7 +133,7 @@ struct PullLayers {
                 return false;
             }
             Image src = toImage(*frame);
-            convertColor(src, mediaColorSpace(m), sequenceColorSpace(s), s.hdrPeakNits);
+            convertColor(src, pictureColorSpace(m, m.path), sequenceColorSpace(s), s.hdrPeakNits);
             // (sizes in sequence pixels to source pixels, as the clip's fit scales them)
             const int fit = int(c.motion.p("fit", lt, 0));
             const double fx = fit == 0 ? std::min(s.width / double(mw), s.height / double(mh))

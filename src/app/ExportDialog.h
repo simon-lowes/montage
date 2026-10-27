@@ -105,6 +105,7 @@ private:
     QString as11Text_;  // "Name=value" lines
     bool initialisedMxf_ = false;
     QComboBox* color_ = nullptr;
+    QComboBox* toneMapping_ = nullptr;
     QComboBox* stereo_ = nullptr;  // a stereoscopic sequence: how its eyes are delivered
     QDoubleSpinBox* spatialBaseline_ = nullptr;  // spatial video: the cameras' baseline (mm)
     QDoubleSpinBox* spatialFov_ = nullptr;       // and horizontal field of view (degrees)

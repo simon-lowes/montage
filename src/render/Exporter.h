@@ -92,6 +92,9 @@ struct ExportSettings {
     // An HDR sequence delivered in SDR is tone mapped. HDR output is 10-bit,
     // tagged, and PQ carries HDR10 mastering and light-level metadata.
     std::string colorSpace;
+    // An HDR sequence delivered in SDR: how it is tone mapped (render/ColorSpace.h ToneMapping id), "" = Montage's
+    // roll-off, "bt2446a" or "bt2446c". (A sequence graded scene-referred goes through its output transform instead.)
+    std::string toneMapping;
     // A trim pass (render/TrimPasses.h): the id of one of the sequence's targets, delivered in its space and peak (in
     // place of colorSpace), each shot trimmed for it; "" = the master. Not for GIF or OpenEXR.
     std::string trimTarget;

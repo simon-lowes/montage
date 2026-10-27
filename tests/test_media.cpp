@@ -9785,6 +9785,93 @@ private slots:
         QVERIFY(res.value("isError").toBool());  // (no clips)
     }
 
+    void bt2446OverMcp() {
+        // An HDR master with an SDR still in it and a grey shot: the still brought into HDR by BT.2446 Method C, an SDR
+        // trim target and an SDR render made with Method A.
+        const QString still = QString::fromStdString(path("bt2446/still.png"));
+        QDir().mkpath(QFileInfo(still).absolutePath());
+        {
+            QImage img(64, 36, QImage::Format_RGB32);
+            img.fill(QColor(230, 230, 230));
+            QVERIFY(img.save(still));
+        }
+        Project q = makeDefaultProject();
+        Sequence& seq = *q.active();
+        seq.width = 64;
+        seq.height = 36;
+        seq.colorSpace = "rec2100pq";
+        MediaItem m;
+        QVERIFY(probeMedia(still.toStdString(), m));
+        m.id = q.newId();
+        q.media.push_back(m);
+        Clip grey = makeGeneratorClip(q, "color", 10);
+        grey.name = "Grey";
+        for (const char* k : {"color.r", "color.g", "color.b"}) grey.generator.params[k] = 0.5;
+        edit::overwrite(q, seq, {TrackKind::Video, 0}, grey);
+        const QString project = QString::fromStdString(path("bt2446/film.montage"));
+        QVERIFY(saveProject(q, project.toStdString()));
+        McpServer server;
+        auto call = [&](const char* tool, QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", 1}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", tool}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        auto text = [](const QJsonObject& r) { return r.value("content").toArray().at(0).toObject().value("text").toString(); };
+
+        // The still: expanded by Method C, saved with the project; a method Montage lacks refused; reset puts it back.
+        QJsonObject r = call("montage_interpret_media", {{"media", "still.png"}, {"sdr_expand", "bt2446c"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QCOMPARE(r.value("structuredContent").toObject().value("media").toArray().at(0).toObject().value("sdr_expand").toString(), QString("bt2446c"));
+        Project back;
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.media.at(0).sdrExpand, std::string("bt2446c"));
+        QVERIFY(call("montage_interpret_media", {{"media", "still.png"}, {"sdr_expand", "bt2446b"}}).value("isError").toBool());
+        r = call("montage_interpret_media", {{"media", "still.png"}, {"reset", true}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(loadProject(project.toStdString(), back) && back.media.at(0).sdrExpand.empty());
+
+        // An SDR trim target by Method A, listed, then changed to C; an HDR target takes none.
+        r = call("montage_trim", {{"action", "add_target"}, {"target", "sdr"}, {"tone_mapping", "bt2446a"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call("montage_trim", {});
+        QCOMPARE(r.value("structuredContent").toObject().value("targets").toArray().at(0).toObject().value("tone_mapping").toString(), QString("bt2446a"));
+        r = call("montage_trim", {{"action", "tone_mapping"}, {"target", "sdr"}, {"tone_mapping", "bt2446c"}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        QVERIFY(loadProject(project.toStdString(), back));
+        QCOMPARE(back.active()->trimTargets.at(0).toneMapping, std::string("bt2446c"));
+        QVERIFY(call("montage_trim", {{"action", "add_target"}, {"target", "hlg"}, {"tone_mapping", "bt2446a"}}).value("isError").toBool());
+        QVERIFY(call("montage_trim", {{"action", "add_target"}, {"color_space", "rec709+bt2446a"}}).value("isError").toBool());
+
+        // The master delivered in Rec.709, by Montage's mapping (the grey as it was made) and by Method A (darker: its
+        // SDR white is 1000 nits).
+        auto centre = [&](const QString& file) {
+            VideoDecoder dec;
+            double v = -1;
+            if (!dec.open(file.toStdString())) return v;
+            const Frame16Ptr fr = dec.frameAt(0);
+            if (fr) v = toImage(*fr).at(32, 18)[1];
+            return v;
+        };
+        const QString montage = QString::fromStdString(path("bt2446/montage.mp4")), methodA = QString::fromStdString(path("bt2446/a.mp4"));
+        r = call("montage_render", {{"output", montage}, {"preset", "H.264 - Fast Draft"}, {"color_space", "rec709"}, {"in", 0}, {"out", 0.2}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        r = call("montage_render", {{"output", methodA}, {"preset", "H.264 - Fast Draft"}, {"color_space", "rec709"}, {"tone_mapping", "bt2446a"},
+                                    {"in", 0}, {"out", 0.2}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const double byMontage = centre(montage), byA = centre(methodA);
+        QVERIFY2(byMontage > 0 && byA > 0 && std::fabs(byMontage - 0.5) < 0.01 && byA < byMontage - 0.05, qPrintable(QString("%1 %2").arg(byMontage).arg(byA)));
+        QVERIFY(call("montage_render", {{"output", methodA}, {"preset", "H.264 - Fast Draft"}, {"tone_mapping", "bt2446b"}}).value("isError").toBool());
+        QVERIFY(call("montage_render", {{"output", methodA}, {"preset", "H.264 - Fast Draft"}, {"color_space", "rec709+bt2446a"}}).value("isError").toBool());
+        // (an HDR delivery, or a trim target, takes none)
+        QVERIFY(call("montage_render", {{"output", methodA}, {"preset", "H.264 - Fast Draft"}, {"tone_mapping", "bt2446a"}}).value("isError").toBool());
+        QVERIFY(call("montage_render", {{"output", methodA}, {"preset", "H.264 - Fast Draft"}, {"trim_target", "sdr"}, {"color_space", "rec709"},
+                                        {"tone_mapping", "bt2446a"}}).value("isError").toBool());
+    }
+
     void trimPassesOverMcp() {
         // An HDR master with two shots: trim targets added, a shot trimmed, the SDR pass rendered.
         Project q = makeDefaultProject();

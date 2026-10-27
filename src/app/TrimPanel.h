@@ -53,6 +53,7 @@ private:
     QComboBox* targets_;
     QToolButton* add_;
     QToolButton* remove_;
+    QComboBox* toneMapping_;
     QLabel* shotLabel_;
     std::map<std::string, QDoubleSpinBox*> controls_;
     QToolButton* key_;

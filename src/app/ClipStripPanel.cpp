@@ -133,7 +133,7 @@ void ClipStripPanel::rebuild() {
         QCryptographicHash h(QCryptographicHash::Sha1);
         h.addData(QByteArray::fromStdString(clipToJsonString(*clip)));
         if (const MediaItem* m = state_->project().findMedia(clip->mediaId))
-            h.addData(QByteArray::fromStdString("|" + m->path + "|" + m->proxyPath + "|" + m->colorOverride));
+            h.addData(QByteArray::fromStdString("|" + m->path + "|" + m->proxyPath + "|" + m->colorOverride + "|" + m->sdrExpand));
         for (const SharedNode& n : sharedNodesUsed(*s, *clip))
             for (const Effect& e : n.effects) h.addData(QByteArray::fromStdString(effectToJsonString(e)));
         h.addData(QStringLiteral("|%1|%2|%3x%4|%5").arg(s->id).arg(c.track).arg(s->width).arg(s->height).arg(QString::fromStdString(s->colorSpace)).toUtf8());

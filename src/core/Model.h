@@ -185,6 +185,8 @@ struct MediaItem {
     std::string bin;         // bin path, "/" between nested bins ("Interviews/Day 1"), "" = the project root
     std::string colorSpace;     // detected from the file's colour tags (ColorSpace.h id), "" = Rec.709
     std::string colorOverride;  // Interpret Colour: the space to read it as, "" = as detected
+    // SDR in an HDR sequence (render/ColorSpace.h ToneMapping id): "" = at HDR reference white, "bt2446a" or "bt2446c"
+    std::string sdrExpand;
     double maxCll = 0, maxFall = 0;  // HDR light levels the file states (CTA-861.3), nits; 0 = none stated
     // Adaptive HDR metadata the video carries (ST 2094-50, render/AdaptiveHdr.h), scene by scene in its own frames;
     // null = none. Shared: undo snapshots copy the pointer.
@@ -332,6 +334,8 @@ struct TrimTarget {
     std::string name;        // shown
     std::string colorSpace;  // a display space (ColorSpace.h id)
     double peakNits = 100;   // its display's peak (a PQ target is rolled off to it)
+    // An SDR target made from HDR (render/ColorSpace.h ToneMapping id): "" = Montage's roll-off, "bt2446a" or "bt2446c"
+    std::string toneMapping;
     bool operator==(const TrimTarget&) const = default;
 };
 // A grade node's effects shared by clips (Resolve's shared nodes): edited once, seen on each clip using it. Its id is

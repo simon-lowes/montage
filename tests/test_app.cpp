@@ -11141,6 +11141,20 @@ const auto seq = [this] { return state()->sequence(); };
         bad.fps = Rational{5000, 1};
         QVERIFY(!bin->interpretFootage({ids[0]}, bad));
         QCOMPARE(state()->project().findMedia(ids[0])->fps, (Rational{25, 1}));
+        // SDR footage in an HDR sequence: brought up by BT.2446 Method C, how it is read kept.
+        QTimer::singleShot(0, this, [&] {
+            auto* dlg = qobject_cast<QDialog*>(QApplication::activeModalWidget());
+            if (!dlg) return;
+            auto* expand = dlg->findChild<QComboBox*>("interpretSdrInHdr");
+            shown = expand && expand->currentIndex() == 0;
+            if (expand) expand->setCurrentIndex(expand->findData(QString("bt2446c")));
+            dlg->accept();
+        });
+        shown = false;
+        bin->interpretFootageDialog({ids[0]});
+        QVERIFY(shown);
+        QCOMPARE(state()->project().findMedia(ids[0])->sdrExpand, std::string("bt2446c"));
+        QCOMPARE(state()->project().findMedia(ids[0])->fps, (Rational{25, 1}));
         state()->newProject();
     }
 
@@ -13276,6 +13290,13 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(color);
         QCOMPARE(color->count(), int(displayColorSpaces().size()) + 1);
         QVERIFY(color->itemText(0).contains("HLG"));
+        // Tone mapping is offered for an SDR delivery of it.
+        auto* mapping = ed.findChild<QComboBox*>("exportToneMapping");
+        QVERIFY(mapping && !mapping->isEnabled() && mapping->count() == 3);
+        color->setCurrentIndex(color->findData(QString("rec709")));
+        QVERIFY(mapping->isEnabled());
+        color->setCurrentIndex(0);
+        QVERIFY(!mapping->isEnabled());
         // Loudness targets for delivery, as (LUFS, dBTP).
         auto* loudness = ed.findChild<QComboBox*>("exportLoudness");
         QVERIFY(loudness && loudness->count() == 6);
@@ -13481,6 +13502,14 @@ const auto seq = [this] { return state()->sequence(); };
         QVERIFY(trims->addTarget("sdr"));
         QCOMPARE(trims->shown(), QString("sdr"));
         QCOMPARE(program->trimTarget(), std::string("sdr"));
+        // The SDR target made by BT.2446 Method A, one undo step.
+        auto* mapping = win_->findChild<QComboBox*>("trimToneMapping");
+        QVERIFY(mapping && mapping->isEnabled() && mapping->currentIndex() == 0);
+        mapping->setCurrentIndex(mapping->findData(QString("bt2446a")));
+        QCOMPARE(state()->sequence()->trimTargets.at(0).toneMapping, std::string("bt2446a"));
+        state()->undo();
+        QVERIFY(state()->sequence()->trimTargets.at(0).toneMapping.empty());
+        QCOMPARE(mapping->currentIndex(), 0);
 
         // The shot at the playhead (Red; the title over it is not one) trimmed: one undo step for a run of changes.
         const Id red = clipNamed(*state()->sequence(), "Red")->id, blue = clipNamed(*state()->sequence(), "Blue")->id;

@@ -94,6 +94,7 @@ void addMedia(QCryptographicHash& h, const MediaItem& m, const RenderOptions& o)
     h.addData(QByteArray::number(fi.lastModified().toMSecsSinceEpoch()));
     h.addData(QByteArray::fromStdString(m.colorSpace));
     if (!m.colorOverride.empty()) h.addData(QByteArray("|as ") + QByteArray::fromStdString(m.colorOverride));  // (Interpret Colour)
+    if (!m.sdrExpand.empty()) h.addData(QByteArray("|up ") + QByteArray::fromStdString(m.sdrExpand));  // (SDR in HDR)
     h.addData(QByteArray::number(m.width) + 'x' + QByteArray::number(m.height));
 }
 
@@ -240,7 +241,8 @@ QByteArray frameKey(const Project& p, const Sequence& seq, FrameTime t, const Re
     if (!o.outputSpace.empty() || o.sceneLight)
         h.addData(QByteArray::fromStdString("#out|" + o.outputSpace + '|') + QByteArray::number(o.outputPeak) + (o.sceneLight ? "|light" : ""));
     if (const TrimTarget* trim = o.trimTarget.empty() ? nullptr : findTrimTarget(seq, o.trimTarget))
-        h.addData(QByteArray::fromStdString("#trim|" + trim->id + "|" + trim->colorSpace + "|") + QByteArray::number(trim->peakNits));
+        h.addData(QByteArray::fromStdString("#trim|" + trim->id + "|" + trim->colorSpace + "|" + trim->toneMapping + "|") +
+                  QByteArray::number(trim->peakNits));
     bool any = addFrame(h, p, seq, t, o, 0);
     if (o.captions)
         if (const CaptionTrack* track = captionTrackFor(seq)) {

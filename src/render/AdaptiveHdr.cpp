@@ -601,7 +601,7 @@ const TrimTarget* adaptiveSdrTarget(const Sequence& s) {
 std::string adaptiveHdrFramesKey(const Project& p, const Sequence& s, FrameTime from, FrameTime to, const ColorSpace& out, double peakNits) {
     // The pictures, and every trim each frame takes (the SDR rendition comes from one, an HDR delivery from another).
     std::string trims;
-    for (const TrimTarget& t : s.trimTargets) trims += t.id + "," + t.colorSpace + "," + std::to_string(t.peakNits) + ";";
+    for (const TrimTarget& t : s.trimTargets) trims += t.id + "," + t.colorSpace + "," + t.toneMapping + "," + std::to_string(t.peakNits) + ";";
     for (FrameTime f = from; f < to; ++f) {
         const Clip* shot = trimShot(s, f);
         if (!shot || shot->trims.empty()) continue;

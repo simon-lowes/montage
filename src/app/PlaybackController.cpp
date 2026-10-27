@@ -106,7 +106,7 @@ private:
     }
 
     // (A trim pass is in its target's space.)
-    static bool ownSpace(const Sequence& s, const std::string& trim) { return trimTargetSpace(s, trim).id != "rec709"; }
+    static bool ownSpace(const Sequence& s, const std::string& trim) { return !sameColorSpace(trimTargetSpace(s, trim), rec709Space()); }
 
     // The frame as delivered alone (a preview from the render cache has only its SDR picture).
     QImage renderSignal(const Request& r, FrameTime t) {

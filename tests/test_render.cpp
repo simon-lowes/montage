@@ -60,6 +60,7 @@
 #include "core/Interpretation.h"
 #include "media/Decoder.h"
 #include "media/Exr.h"
+#include "media/Proxy.h"
 #include "media/DescribePicture.h"
 #include "media/LanguageModel.h"
 #include "render/FootageWords.h"
@@ -4703,6 +4704,192 @@ colorspaces:
         QVERIFY(edit::removeTrimTarget(s, "hdr10-600").ok);
         QVERIFY(!edit::clipById(s, a.id)->trims.count("hdr10-600"));
         QVERIFY(!edit::removeTrimTarget(s, "hdr10-600").ok);
+    }
+
+    void sdrAndHdrByBt2446() {
+        const ColorSpace& rec709 = *findColorSpace("rec709");
+        const ColorSpace& pq = *findColorSpace("rec2100pq");
+        const ColorSpace& hlg = *findColorSpace("rec2100hlg");
+        const ColorSpace& a = withToneMapping(rec709, ToneMapping::Bt2446A);
+        const ColorSpace& c = withToneMapping(rec709, ToneMapping::Bt2446C);
+        // Named and found by name; Montage's is the space itself; HDR and camera spaces take none.
+        QCOMPARE(QString::fromStdString(a.id), QStringLiteral("rec709+bt2446a"));
+        QCOMPARE(findColorSpace("rec709+bt2446c"), &c);
+        QCOMPARE(&withToneMapping(a, ToneMapping::Montage), &rec709);
+        QCOMPARE(&withToneMapping(c, ToneMapping::Bt2446A), &a);
+        QCOMPARE(&withToneMapping(pq, ToneMapping::Bt2446A), &pq);
+        QVERIFY(!findColorSpace("rec2100pq+bt2446a") && !findColorSpace("rec709+bt2446x") && !findColorSpace("acescct+bt2446c"));
+        QVERIFY(sameColorSpace(a, rec709) && sameColorSpace(a, c) && !sameColorSpace(a, pq));
+        QVERIFY(!conversionLut(a, rec709));  // (the same code values)
+        auto through = [](double v, const ColorSpace& from, const ColorSpace& to) {
+            float px[3] = {float(v), float(v), float(v)};
+            convertPixel(px, from, to, 1000);
+            return std::array<double, 3>{px[0], px[1], px[2]};
+        };
+        // SDR white: at HDR reference white as before (BT.2408); at 1000 cd/m² by Method A; at the top of Method C's curve
+        // (its log shoulder from the knee at 58.5 cd/m² of SDR up to 100).
+        QVERIFY(std::fabs(codeToNits(pq, through(1, rec709, pq)[1]) - 203) < 0.5);
+        QVERIFY2(std::fabs(codeToNits(pq, through(1, a, pq)[1]) - 1000) < 1, qPrintable(QString::number(codeToNits(pq, through(1, a, pq)[1]))));
+        const double k1 = 0.83802, k3 = 0.74204, knee = 58.5 / k1, k2 = k1 * (1 - k3) * knee, k4 = 58.5 - k2 * std::log(1 - k3);
+        QVERIFY(std::fabs(k2 - 15.09968) < 0.01 && std::fabs(k4 - 78.99439) < 0.05);  // (equation (10), rounded)
+        const double cTop = knee * (std::exp((100 - k4) / k2) + k3);
+        QVERIFY2(std::fabs(codeToNits(pq, through(1, c, pq)[1]) - cTop) < 0.5, qPrintable(QString::number(codeToNits(pq, through(1, c, pq)[1]))));
+        // HDR reference white into SDR by Method C: 96 % (the report's design point).
+        QVERIFY2(std::fabs(through(nitsToCode(pq, 203), pq, c)[1] - 0.96) < 0.003, qPrintable(QString::number(through(nitsToCode(pq, 203), pq, c)[1])));
+        // Montage's own mapping down is untouched by the spaces that are not tone mapped.
+        QCOMPARE(through(nitsToCode(pq, 600), pq, rec709), through(nitsToCode(pq, 600), pq, withToneMapping(c, ToneMapping::Montage)));
+
+        // Every curve rises: SDR up into PQ, and PQ (to 1000 cd/m²) down into SDR.
+        for (const ColorSpace* m : {&rec709, &a, &c}) {
+            double last = -1;
+            for (int i = 0; i <= 2048; ++i) {
+                const double v = through(i / 2048.0, *m, pq)[1];
+                QVERIFY2(v >= last, qPrintable(QString("%1 up at %2").arg(QString::fromStdString(m->id)).arg(i)));
+                last = v;
+            }
+            last = -1;
+            for (int i = 0; i <= 2048; ++i) {
+                const double v = through(nitsToCode(pq, 1000.0 * i / 2048), pq, *m)[1];
+                QVERIFY2(v >= last, qPrintable(QString("%1 down at %2").arg(QString::fromStdString(m->id)).arg(i)));
+                last = v;
+            }
+        }
+
+        // Method C's curve is continuous at its knee (58.5 cd/m² of SDR, code 0.8): it rises through it both ways.
+        double lastUp = -1, lastDown = -1;
+        for (int i = 0; i <= 2000; ++i) {
+            const double code = std::pow((58.3 + i * 0.0002) / 100, 1 / 2.4);
+            const double up = through(code, c, pq)[1];
+            const double down = through(nitsToCode(pq, knee * 0.995 + i * knee * 0.00001), pq, c)[1];
+            QVERIFY2(up >= lastUp && down >= lastDown, qPrintable(QString::number(i)));
+            lastUp = up, lastDown = down;
+        }
+        // Method C's way back is its way there exactly (§ 6.2): SDR colours up into HDR and down again.
+        double worstC = 0;
+        for (double r : {0.0, 0.1, 0.3, 0.5, 0.8, 1.0})
+            for (double g : {0.0, 0.2, 0.5, 0.9, 1.0})
+                for (double b : {0.0, 0.25, 0.6, 1.0}) {
+                    float px[3] = {float(r), float(g), float(b)};
+                    convertPixel(px, c, pq, 1000);
+                    convertPixel(px, pq, c, 1000);
+                    // (compared in light: a channel at zero comes back within the float precision of the PQ code,
+                    // which BT.1886's curve magnifies near black)
+                    const double want[3] = {r, g, b};
+                    for (int k = 0; k < 3; ++k) worstC = std::max(worstC, std::fabs(std::pow(double(px[k]), 2.4) - std::pow(want[k], 2.4)));
+                }
+        QVERIFY2(worstC < 1e-5, qPrintable(QString::number(worstC)));
+        // Method A is a matched pair, not an exact inverse: 10-bit SDR up and down again within 12 code values (11.4 at
+        // worst, near 86 %), and HDR down and up again within 7 % of its light from 1 to 1000 cd/m².
+        double worstA = 0;
+        for (int code = 0; code < 1024; ++code) worstA = std::max(worstA, std::fabs(through(through(code / 1023.0, a, pq)[1], pq, a)[1] * 1023 - code));
+        QVERIFY2(worstA < 12, qPrintable(QString::number(worstA)));
+        for (double nits : {1.0, 10.0, 50.0, 203.0, 500.0, 1000.0}) {
+            const double back = codeToNits(pq, through(through(nitsToCode(pq, nits), pq, a)[1], a, pq)[1]);
+            QVERIFY2(std::fabs(back - nits) < 0.07 * nits, qPrintable(QString("%1 back as %2").arg(nits).arg(back)));
+        }
+
+        // Into HLG: what goes into PQ, through BT.2100's conversion from PQ to HLG (at 1000 cd/m²), within a 10-bit code.
+        for (const ColorSpace* m : {&a, &c})
+            for (double r : {0.05, 0.4, 0.9, 1.0})
+                for (double g : {0.1, 0.6, 1.0}) {
+                    float direct[3] = {float(r), float(g), 0.3f}, viaPq[3] = {float(r), float(g), 0.3f};
+                    convertPixel(direct, *m, hlg, 1000);
+                    convertPixel(viaPq, *m, pq, 1000);
+                    convertPixel(viaPq, pq, hlg, 1000);
+                    for (int k = 0; k < 3; ++k)
+                        QVERIFY2(std::fabs(direct[k] - viaPq[k]) < 1.0 / 1023, qPrintable(QString("%1: %2 vs %3").arg(QString::fromStdString(m->id)).arg(direct[k]).arg(viaPq[k])));
+                }
+
+        // The table the frames go through (as the GPU's is) agrees with the conversion worked out exactly.
+        Image grid(9, 9);
+        for (int y = 0; y < 9; ++y)
+            for (int x = 0; x < 9; ++x) {
+                float* px = grid.at(x, y);
+                px[0] = x / 8.0f, px[1] = y / 8.0f, px[2] = float((x + y) % 9) / 8.0f, px[3] = 1;
+            }
+        for (const ColorSpace* m : {&a, &c}) {
+            Image up = grid;
+            convertColor(up, *m, pq, 1000);
+            double worst = 0;
+            for (int y = 0; y < 9; ++y)
+                for (int x = 0; x < 9; ++x) {
+                    float want[3] = {grid.at(x, y)[0], grid.at(x, y)[1], grid.at(x, y)[2]};
+                    convertPixel(want, *m, pq, 1000);
+                    for (int k = 0; k < 3; ++k) worst = std::max(worst, double(std::fabs(up.at(x, y)[k] - want[k])));
+                }
+            QVERIFY2(worst < 1.0 / 1023, qPrintable(QString("%1: %2 codes").arg(QString::fromStdString(m->id)).arg(worst * 1023)));
+        }
+
+        // A still read in an HDR sequence: Method C as Interpret Footage asks, kept in the project; graphics stay at
+        // reference white.
+        QTemporaryDir dir;
+        QImage q(16, 16, QImage::Format_RGBA64);
+        q.fill(QColor::fromRgbF(0.9f, 0.6f, 0.3f, 1));
+        const QString path = dir.filePath("sdr.png");
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 16, s.height = 16, s.colorSpace = "rec2100pq", s.hdrPeakNits = 1000;
+        MediaItem m;
+        QVERIFY(q.save(path) && probeMedia(path.toStdString(), m));
+        m.id = p.newId();
+        m.sdrExpand = "bt2446c";
+        p.media.push_back(m);
+        QVERIFY(edit::placeMedia(p, s, m.id, 0, 0, 1, {TrackKind::Video, 0}, {}, false).ok);
+        Project reread;
+        QVERIFY(projectFromJson(projectToJson(p), reread));
+        QCOMPARE(QString::fromStdString(reread.findMedia(m.id)->sdrExpand), QStringLiteral("bt2446c"));
+        RenderOptions ro;
+        ro.highQuality = true;
+        const Image frame = renderProgramFrame(p, s, 0, ro);
+        const float* got = frame.at(8, 8);
+        auto stored = [](double v) { return float(std::round(v * 65535) / 65535); };
+        float want[3] = {stored(0.9), stored(0.6), stored(0.3)};
+        convertPixel(want, c, pq, 1000);
+        for (int k = 0; k < 3; ++k) QVERIFY2(std::fabs(got[k] - want[k]) < 1.0 / 1023, qPrintable(QString("%1 vs %2").arg(got[k]).arg(want[k])));
+        p.findMedia(m.id)->sdrExpand.clear();
+        float plain[3] = {stored(0.9), stored(0.6), stored(0.3)};
+        convertPixel(plain, rec709, pq, 1000);
+        QVERIFY(std::fabs(renderProgramFrame(p, s, 0, ro).at(8, 8)[1] - plain[1]) < 1.0 / 1023);
+
+        // An SDR trim target made by Method A: its frames are the master through Method A, kept in the project.
+        TrimTarget sdr{"sdr", "SDR", "rec709", 100, "bt2446a"};
+        QVERIFY(edit::addTrimTarget(s, sdr).ok);
+        QCOMPARE(QString::fromStdString(trimTargetSpace(s, "sdr").id), QStringLiteral("rec709+bt2446a"));
+        QVERIFY(!edit::addTrimTarget(s, TrimTarget{"", "", "rec2100hlg", 1000, "bt2446a"}).ok);  // (an HDR target is not tone mapped)
+        QVERIFY(!edit::addTrimTarget(s, TrimTarget{"", "", "rec709", 100, "bt2446b"}).ok);
+        QVERIFY(projectFromJson(projectToJson(p), reread));
+        QCOMPARE(QString::fromStdString(reread.active()->trimTargets.at(0).toneMapping), QStringLiteral("bt2446a"));
+        Image master = renderProgramFrame(p, s, 0, ro), trimmed = master;
+        applyTrimPass(trimmed, s, 0, s.trimTargets.at(0));
+        float down[3] = {master.at(8, 8)[0], master.at(8, 8)[1], master.at(8, 8)[2]};
+        convertPixel(down, pq, a, 1000);
+        for (int k = 0; k < 3; ++k) QVERIFY2(std::fabs(trimmed.at(8, 8)[k] - down[k]) < 1.0 / 1023, qPrintable(QString("%1 vs %2").arg(trimmed.at(8, 8)[k]).arg(down[k])));
+        // A shot's own peak is rolled off to the light the method brings to white (1000 cd/m² for A, about 333 for C;
+        // Montage's 280 otherwise), so the master's 1000 cd/m² white stays white through Method A.
+        QCOMPARE(sdrHeadroomNits(a), 1000.0);
+        QVERIFY(sdrHeadroomNits(c) > 320 && sdrHeadroomNits(c) < 340);
+        QCOMPARE(sdrHeadroomNits(rec709), kSdrHeadroomNits);
+        Effect shot = makeTrim();
+        shot.params["peak"] = Param(1000.0);
+        Image white(2, 2);
+        for (size_t i = 0; i < white.px.size(); i += 4)
+            white.px[i] = white.px[i + 1] = white.px[i + 2] = float(nitsToCode(pq, 1000)), white.px[i + 3] = 1;
+        applyTrim(white, s, s.trimTargets.at(0), &shot, 0);
+        QVERIFY2(white.at(0, 0)[1] > 0.97, qPrintable(QString::number(white.at(0, 0)[1])));
+
+        // HDR footage takes no expansion (nor its SDR proxy).
+        MediaItem hdrFile = m;
+        hdrFile.colorSpace = "rec2100pq";
+        hdrFile.sdrExpand = "bt2446a";
+        QCOMPARE(&pictureColorSpace(hdrFile, hdrFile.path), &pq);
+
+        // A sequence graded scene-referred goes into SDR through its output transform: no tone mapping for its targets.
+        s.workingSpace = "acescct";
+        QVERIFY(sceneReferredWorking(s));
+        QCOMPARE(&trimTargetSpace(s, "sdr"), &rec709);
+        QVERIFY(!edit::setTrimTargetToneMapping(s, "sdr", "bt2446c").ok);
+        QVERIFY(!edit::addTrimTarget(s, TrimTarget{"sdr2", "", "rec709", 100, "bt2446a"}).ok);
+        QVERIFY(edit::setTrimTargetToneMapping(s, "sdr", "").ok);
     }
 
     void hdrStillsInAndOut() {
@@ -13296,6 +13483,10 @@ colorspaces:
         s.colorSpace = "rec2100pq";
         o.displaySpace = "rec709";
         compare(15, o, "pq to rec709");
+        // The pictures brought up into it by BT.2446 Method C and seen through Method A: the GPU takes the same tables.
+        for (MediaItem& m : p.media) m.sdrExpand = "bt2446c";
+        o.displaySpace = "rec709+bt2446a";
+        compare(15, o, "bt2446 c in, a out");
     }
 
     // The lined script: pages of the screenplay with a line per take down what it reads, ticks for what the cut uses,
