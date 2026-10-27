@@ -7494,7 +7494,7 @@ colorspaces:
             ds.workingSpace.clear();
             ImfSettings dst = st;
             dst.title = "Archive display";
-            dst.targetFrames = {3};
+            dst.targetFrames = {3, 4};  // (the same picture twice: two resources all the same)
             ImfResult rd;
             QVERIFY2(exportImf(d, ds, dst, dir.path().toStdString(), &rd, {}, &err), err.c_str());
             issues = verifyImf(rd.folder);
@@ -7502,7 +7502,11 @@ colorspaces:
             const QDir dout2(QString::fromStdString(rd.folder));
             std::vector<uint16_t> tiff;
             int w = 0, h = 0;
-            QVERIFY(readImfTargetFrame(dout2.filePath(dout2.entryList({"VIDEO_*.mxf"}).value(0)).toStdString(), 0, tiff, w, h, nullptr, &err));
+            const std::string dvideo = dout2.filePath(dout2.entryList({"VIDEO_*.mxf"}).value(0)).toStdString();
+            QVERIFY(readImfTargetFrame(dvideo, 0, tiff, w, h, nullptr, &err));
+            dcp::ImfTrackReader dr;
+            QVERIFY(dr.open(dvideo) && dr.targetFrames().size() == 2 && dr.targetFrames()[0].resource != dr.targetFrames()[1].resource);
+            QVERIFY(!readImfTargetFrame(dvideo, -1, tiff, w, h, nullptr, &err) && !readImfTargetFrame(dvideo, 2, tiff, w, h, nullptr, &err));
             const Image shown = renderProgramFrame(d, ds, 3, dout);
             for (int c = 0; c < 3; ++c) QVERIFY(std::fabs(tiff[(size_t(90) * 320 + 160) * 3 + size_t(c)] / 65535.0 - shown.at(160, 90)[c]) < 2.0 / 255);
         }

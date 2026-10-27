@@ -290,7 +290,9 @@ public:
     bool open(const std::string& path, const Uuid& asset, EditRate rate, int width, int height, bool alpha, const AcesPicture& picture,
               uint32_t aspectNum, uint32_t aspectDen, std::string* error = nullptr);
     bool write(const uint8_t* exr, size_t size, std::string* error = nullptr);
-    // The target frames, each in a generic stream partition of its own (streams 10, 11, ...), after the last frame.
+    // The target frames, each in a generic stream partition of its own (streams 10, 11, ...), after the last frame. Each
+    // adds about 200 bytes to the header, which is a fixed size: at most kMaxTargetFrames.
+    static constexpr int kMaxTargetFrames = 48;
     bool writeTargetFrames(std::vector<AcesTargetFrame> targets, std::string* error = nullptr);
     int width() const { return width_; }
     int height() const { return height_; }

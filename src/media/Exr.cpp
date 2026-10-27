@@ -922,8 +922,12 @@ bool readAcesContainer(const uint8_t* data, size_t size, AcesContainerInfo& info
         info.conforming = info.why.empty();
         if (rgba) {
             // (a picture the size the header says, within reason: a damaged one cannot ask for gigabytes)
-            if (info.width <= 0 || info.height <= 0 || int64_t(info.width) * info.height > (int64_t(1) << 27))
-                throw std::runtime_error("a picture of " + std::to_string(info.width) + " x " + std::to_string(info.height));
+            const int64_t pixels = int64_t(info.width) * info.height;
+            const int64_t channels = int64_t(names.size());
+            if (info.width <= 0 || info.height <= 0 || pixels > (int64_t(1) << 27) ||
+                (header.compression() == Imf::NO_COMPRESSION && !header.hasTileDescription() && pixels * channels * 2 > int64_t(size)))
+                throw std::runtime_error("a picture of " + std::to_string(info.width) + " x " + std::to_string(info.height) + " in " +
+                                         std::to_string(size) + " bytes");
             const size_t n = size_t(info.width) * size_t(info.height);
             rgba->assign(n * 4, 1.0f);
             Imf::FrameBuffer fb;

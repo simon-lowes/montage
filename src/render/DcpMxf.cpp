@@ -1907,12 +1907,18 @@ bool ImfAcesWriter::writeTargetFrames(std::vector<AcesTargetFrame> targets, std:
     // Each named by a UUID made from its bytes (version 5, under Montage's own name space).
     static const uint8_t space[16] = {0x8d, 0x3e, 0x51, 0x0b, 0x6f, 0x2a, 0x4c, 0x77, 0x9e, 0x14, 0xc2, 0x58, 0x31, 0xa6, 0x0f, 0xd4};
     uint32_t sid = 10;
+    if (targets.size() > size_t(kMaxTargetFrames)) {
+        if (error) *error = "More than " + std::to_string(kMaxTargetFrames) + " target frames";
+        return false;
+    }
     for (AcesTargetFrame& t : targets) {
         if (t.index < 0 || t.index >= frames()) {
             if (error) *error = "A target frame is not one of the track file's frames";
             return false;
         }
+        // (named by the frame it is of as well as its bytes, so two frames that look the same are two resources)
         Bytes named(space, space + 16);
+        put64(named, uint64_t(t.index));
         putBytes(named, t.data);
         uint8_t digest[20];
         sha1Plain(named.data(), named.size(), digest);

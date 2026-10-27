@@ -9990,7 +9990,11 @@ void McpServer::Impl::addTools() {
             }
             st.application = a.value("application").toInt(2);
             st.graded = a.value("graded").toBool(true);
-            for (const QJsonValue& v : a.value("target_frames").toArray()) st.targetFrames.push_back(FrameTime(v.toInteger()));
+            for (const QJsonValue& v : a.value("target_frames").toArray()) {
+                if (!v.isDouble() || v.toDouble() != std::floor(v.toDouble()) || v.toDouble() < 0)
+                    throw ArgError{QStringLiteral("target_frames are whole frame numbers")};
+                st.targetFrames.push_back(FrameTime(v.toDouble()));
+            }
             const QString folder = absolute(need(a, "folder"));
             QDir().mkpath(folder);
             ImfResult r;

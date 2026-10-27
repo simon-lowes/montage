@@ -1479,6 +1479,9 @@ The tenth gap analysis (`docs/research/phase11-roadmap.md`, October 2026) ranks 
     - A supplemental keeps the earlier package's target frames, which may show pictures it replaces. Its own target frames go only on frames it codes anew (others are left out, untested).
     - A display-referred sequence in a space other than Rec.709, P3-D65 PQ, Rec.2100 PQ or HLG is named for Rec.709.
     - Photon cannot check the ancillary resources (target frames) yet; Montage's own check decodes them.
+    - At most 48 target frames (the header partition is a fixed 16 KB).
+    - The ACES Metadata File names the output transform only when it is ACES 2.0's; Montage's filmic one is named in the composition only.
+    - The ST 2065-4 check reads each frame's header, not its pixels.
 - [ ] 6. SDR brought up into HDR by ITU-R BT.2446-1 methods A and C, and those methods for HDR to SDR (S)
 - [ ] 7. Cinema loudness: Leq(m), the loudness range gated by dialogue, loudness logs and reports (S)
 - [ ] 8. Shots grouped by camera angle and by scene for grading (S–M)

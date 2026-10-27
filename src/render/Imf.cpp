@@ -804,8 +804,9 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         if (cpl.empty()) return fail("There is no IMF package in " + settings.supplementOf);
         if (!readImfComposition(cpl, old, &err)) return fail(err);
         oldPicture = old.picture();
-        if (old.application != settings.application)
-            return fail("The earlier package is IMF Application #" + std::string(old.application == 5 ? "5" : "2E") + "; a supplemental keeps it");
+        if ((old.application == 5) != aces)
+            return fail("The earlier package is " + std::string(old.application == 5 ? "IMF Application #5" : "not IMF Application #5") +
+                        "; a supplemental keeps its application");
         if (!oldPicture || old.width <= 0 || old.height <= 0 ||
             (aces ? old.colour != "aces2065-1" : (old.bits != 10 && old.bits != 12) || !old.rsiz || old.colour.empty()))
             return fail("The earlier package's picture is not one Montage makes supplementals of");
@@ -981,6 +982,8 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
             if (std::find(targets.begin(), targets.end(), t - first) == targets.end()) targets.push_back(t - first);
         }
         std::sort(targets.begin(), targets.end());
+        if (targets.size() > size_t(dcp::ImfAcesWriter::kMaxTargetFrames))
+            return fail("An IMF master holds at most " + std::to_string(dcp::ImfAcesWriter::kMaxTargetFrames) + " target frames");
     } else if (!settings.targetFrames.empty()) {
         return fail("Target frames are for IMF Application #5 masters");
     }
@@ -1442,7 +1445,8 @@ bool exportImf(const Project& p, const Sequence& s, const ImfSettings& settings,
         virtuals.front().ownFile = int(fileIndex);
         virtuals.front().ownDuration = count;
         if (targetsWritten) {
-            // The ACES Metadata File beside them: the pictures already in ACES 2065-1, the output transform they are for.
+            // The ACES Metadata File beside them: the pictures already in ACES 2065-1, and the output transform they are for
+            // when it is one of ACES's own (Montage's filmic one is named in the composition only).
             AmfDocument amf;
             amf.description = title.toStdString() + " (IMF Application #5, " + (settings.graded ? "graded" : "ungraded") + ")";
             amf.clipName = title.toStdString();
@@ -1899,7 +1903,7 @@ std::vector<std::string> verifyImf(const std::string& folderPath, const std::fun
         bool application = false;
         for (const auto& [path, text] : cplItems)
             if (path.endsWith("ExtensionProperties/ApplicationIdentification") &&
-                (text.startsWith("http://www.smpte-ra.org/ns/2067-21/") || text == kApp5))
+                (text.contains("http://www.smpte-ra.org/ns/2067-21/") || text.contains("http://www.smpte-ra.org/ns/2067-50/")))
                 application = true;
         if (!application) issue(c.path + " does not identify IMF Application #2E or #5");
         ImfComposition comp;
@@ -2088,8 +2092,12 @@ bool readImfAcesFrame(const std::string& mxf, int index, std::vector<float>& rgb
 bool readImfTargetFrame(const std::string& mxf, int i, std::vector<uint16_t>& rgb, int& width, int& height, int64_t* frame, std::string* error) {
     dcp::ImfTrackReader reader;
     std::vector<uint8_t> bytes;
-    if (!reader.open(mxf, error) || !reader.targetFrame(size_t(std::max(0, i)), bytes, error) || !decodeTiff16(bytes, rgb, width, height, error))
+    if (!reader.open(mxf, error)) return false;
+    if (i < 0 || size_t(i) >= reader.targetFrames().size()) {
+        if (error) *error = mxf + " has no target frame " + std::to_string(i);
         return false;
+    }
+    if (!reader.targetFrame(size_t(i), bytes, error) || !decodeTiff16(bytes, rgb, width, height, error)) return false;
     if (frame) *frame = reader.targetFrames()[size_t(i)].index;
     return true;
 }
@@ -2150,8 +2158,8 @@ bool readImfComposition(const std::string& cplPath, ImfComposition& out, std::st
             };
             if (d == 3 && path[1] == "ExtensionProperties" && name == "ApplicationIdentification") {
                 take();
-                if (value.startsWith("http://www.smpte-ra.org/ns/2067-21/")) out.application = 2;
-                else if (value.startsWith("http://www.smpte-ra.org/ns/2067-50/")) out.application = 5;
+                if (value.contains("http://www.smpte-ra.org/ns/2067-50/")) out.application = 5;
+                else if (value.contains("http://www.smpte-ra.org/ns/2067-21/")) out.application = 2;
                 else out.application = 0;
             } else if (d == 2 && (name == "Id" || name == "ContentTitle" || name == "EditRate" || name == "IssueDate")) {
                 take();
