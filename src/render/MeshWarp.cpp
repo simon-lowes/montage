@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -25,6 +26,9 @@ constexpr double kPi = 3.14159265358979323846;
 constexpr double kPinWeight = 1e6;
 // A fully stiff triangle's weight against an ordinary one's.
 constexpr double kStiffWeight = 1000;
+// How faintly step 1 keeps each edge unturned and its length (so a part left free to turn or grow, as two shapes touching
+// at one vertex are, still solves, and moves as little as it can).
+constexpr double kLooseWeight = 1e-9;
 // Passes of as-rigid-as-possible refinement after the two steps.
 constexpr int kRefine = 4;
 
@@ -75,11 +79,13 @@ WarpMesh lattice(int cols, int rows, double w, double h) {
 // nearest vertex).
 struct Attach {
     std::array<int, 3> v{};
-    std::array<double, 3> b{};
+    std::array<double, 3> b{1, 0, 0};
+    MeshPoint offset{0, 0};  // off the mesh: from the point to the vertex it holds (so the gap between them is kept)
 };
 Attach attach(const WarpMesh& m, const MeshPoint& p) {
     Attach out;
-    double nearest = 1e300;
+    double nearest = std::numeric_limits<double>::infinity();
+    bool snapped = false;
     for (size_t t = 0; t < m.tris.size(); ++t) {
         const auto& tr = m.tris[t];
         const MeshPoint &a = m.rest[size_t(tr[0])], &b = m.rest[size_t(tr[1])], &c = m.rest[size_t(tr[2])];
@@ -94,9 +100,10 @@ Attach attach(const WarpMesh& m, const MeshPoint& p) {
         for (int k = 0; k < 3; ++k) {
             const MeshPoint& q = m.rest[size_t(tr[size_t(k)])];
             const double d = std::hypot(q[0] - p[0], q[1] - p[1]);
-            if (d < nearest) nearest = d, out.v = {tr[size_t(k)], tr[size_t(k)], tr[size_t(k)]}, out.b = {1, 0, 0};
+            if (!snapped || d < nearest) nearest = d, snapped = true, out.v = {tr[size_t(k)], tr[size_t(k)], tr[size_t(k)]}, out.b = {1, 0, 0};
         }
     }
+    if (snapped) out.offset = sub(m.rest[size_t(out.v[0])], p);
     return out;
 }
 
@@ -144,6 +151,7 @@ struct Solver {
     std::vector<double> groupReach;   // ... and how far in
     std::vector<std::array<double, 6>> local;  // step 1: each vertex of a triangle in the frame of the other two (x, y)
     SparseCholesky step1, step2;
+    bool rigid = false;  // step 1 factored
     bool ok = false;
 };
 
@@ -159,10 +167,13 @@ uint64_t solverKey(const WarpMesh& m, const std::vector<WarpPin>& pins, WarpSolv
     h = mix(h, &mode, sizeof mode);
     h = mix(h, m.rest.data(), m.rest.size() * sizeof(MeshPoint));
     h = mix(h, m.tris.data(), m.tris.size() * sizeof(m.tris[0]));
+    // (every pin's kind, in order, as the holds refer to pins by their place in the list)
+    const size_t n = pins.size();
+    h = mix(h, &n, sizeof n);
     for (const WarpPin& p : pins) {
-        if (p.kind == PinKind::Overlap) continue;
         const int kind = int(p.kind);
         h = mix(h, &kind, sizeof kind);
+        if (p.kind == PinKind::Overlap) continue;
         h = mix(h, p.at.data(), sizeof p.at);
         if (p.kind == PinKind::Stiff) {
             h = mix(h, &p.radius, sizeof p.radius);
@@ -189,22 +200,26 @@ std::shared_ptr<const Solver> makeSolver(const WarpMesh& m, const std::vector<Wa
     for (int v = 0; v < nv; ++v) s->comp[size_t(v)] = find(v);
     s->triComp.resize(size_t(nt));
     for (int t = 0; t < nt; ++t) s->triComp[size_t(t)] = s->comp[size_t(m.tris[size_t(t)][0])];
-    // What holds each part: its Position pins, or where it has none, its Bend pins where they are.
+    // What holds each part: its Position pins, or where it has none, its Bend pins where they are. A part is held in
+    // as many places as it has holds half a pixel or more apart (two pins on one spot hold it in one).
+    std::map<int, std::vector<MeshPoint>> places;
+    auto hold = [&](size_t i) {
+        Solver::Hold hd{attach(m, pins[i].at), int(i)};
+        s->holds.push_back(hd);
+        MeshPoint at{0, 0};
+        for (int k = 0; k < 3; ++k)
+            at[0] += hd.a.b[size_t(k)] * m.rest[size_t(hd.a.v[size_t(k)])][0], at[1] += hd.a.b[size_t(k)] * m.rest[size_t(hd.a.v[size_t(k)])][1];
+        auto& seen = places[s->comp[size_t(hd.a.v[0])]];
+        if (std::none_of(seen.begin(), seen.end(), [&](const MeshPoint& q) { return std::hypot(q[0] - at[0], q[1] - at[1]) < 0.5; }))
+            seen.push_back(at);
+    };
+    for (size_t i = 0; i < pins.size(); ++i)
+        if (pins[i].kind == PinKind::Position) hold(i);
+    const auto positioned = places;
+    for (size_t i = 0; i < pins.size(); ++i)
+        if (pins[i].kind == PinKind::Bend && !positioned.count(s->comp[size_t(attach(m, pins[i].at).v[0])])) hold(i);
     std::map<int, int> holding;
-    for (size_t i = 0; i < pins.size(); ++i)
-        if (pins[i].kind == PinKind::Position) {
-            Solver::Hold hd{attach(m, pins[i].at), int(i)};
-            s->holds.push_back(hd);
-            ++holding[s->comp[size_t(hd.a.v[0])]];
-        }
-    std::map<int, int> positioned = holding;
-    for (size_t i = 0; i < pins.size(); ++i)
-        if (pins[i].kind == PinKind::Bend) {
-            Solver::Hold hd{attach(m, pins[i].at), int(i)};
-            if (positioned.count(s->comp[size_t(hd.a.v[0])])) continue;
-            s->holds.push_back(hd);
-            ++holding[s->comp[size_t(hd.a.v[0])]];
-        }
+    for (const auto& [part, at] : places) holding[part] = int(at.size());
     // Unknowns: step 1 for parts held in two places or more (the rigid solve), step 2 for parts held at all.
     s->idx1.assign(size_t(nv), -1);
     s->idx2.assign(size_t(nv), -1);
@@ -279,7 +294,20 @@ std::shared_ptr<const Solver> makeSolver(const WarpMesh& m, const std::vector<Wa
         for (int k = 0; k < 3; ++k) l2[k] = s->idx2[size_t(hd.a.v[size_t(k)])];
         addForm(e2, l2, hd.a.b.data(), 3, kPinWeight);
     }
-    s->ok = s->step1.factor(2 * n1, e1) && s->step2.factor(n2, e2);
+    for (int t = 0; t < nt; ++t) {
+        const auto& tr = m.tris[size_t(t)];
+        if (s->idx1[size_t(tr[0])] < 0) continue;
+        for (int k = 0; k < 3; ++k) {
+            const int i = s->idx1[size_t(tr[size_t(k)])], j = s->idx1[size_t(tr[size_t((k + 1) % 3)])];
+            const double q[2] = {-1, 1};
+            const int lx[2] = {2 * i, 2 * j}, ly[2] = {2 * i + 1, 2 * j + 1};
+            addForm(e1, lx, q, 2, kLooseWeight);
+            addForm(e1, ly, q, 2, kLooseWeight);
+        }
+    }
+    // (without step 1, the triangles keep their turns at rest)
+    s->rigid = s->step1.factor(2 * n1, e1);
+    s->ok = s->step2.factor(n2, e2);
     return s;
 }
 
@@ -305,6 +333,7 @@ std::shared_ptr<const Solver> cachedSolver(const WarpMesh& m, const std::vector<
 // Draws a line over the picture (for Show Mesh and Show Grid).
 void drawLine(Image& img, MeshPoint a, MeshPoint b, const float colour[4]) {
     const double len = std::hypot(b[0] - a[0], b[1] - a[1]);
+    if (!(len < 1e5)) return;  // (a mesh thrown far off the picture)
     const int n = std::max(1, int(std::ceil(len * 2)));
     for (int i = 0; i <= n; ++i) {
         const double f = double(i) / n;
@@ -342,6 +371,40 @@ void throughShutter(Image& img, double t, bool blur, double shutter, Moved moved
     for (size_t k = 0; k < sum.size(); ++k) img.px[k] = sum[k] / float(n);
 }
 
+// The mesh each Mesh Warp was last drawn with over its picture's alpha (by effect id, with the picture's size), for
+// showing and placing its pins on the mesh the picture was drawn with.
+struct LastMesh {
+    int w = 0, h = 0;
+    std::shared_ptr<const WarpMesh> mesh;
+};
+std::mutex lastMeshLock;
+std::map<Id, LastMesh> lastMeshes;
+
+void rememberMesh(const Effect& e, int w, int h, const WarpMesh& m) {
+    std::lock_guard<std::mutex> g(lastMeshLock);
+    if (lastMeshes.size() > 64 && !lastMeshes.count(e.id)) lastMeshes.clear();
+    LastMesh& last = lastMeshes[e.id];
+    if (last.w == w && last.h == h && last.mesh && last.mesh->rest == m.rest && last.mesh->tris == m.tris) return;
+    last = {w, h, std::make_shared<const WarpMesh>(m)};
+}
+
+WarpMesh meshFor(const Effect& e, int w, int h) {
+    if (std::lround(e.p("mesh_from", 0, 0)) == 0) {
+        LastMesh last;
+        {
+            std::lock_guard<std::mutex> g(lastMeshLock);
+            if (const auto it = lastMeshes.find(e.id); it != lastMeshes.end()) last = it->second;
+        }
+        if (last.mesh && last.w > 0 && last.h > 0) {
+            // (drawn at another size, a preview's: scaled to this one)
+            WarpMesh m = *last.mesh;
+            for (MeshPoint& q : m.rest) q = {q[0] * w / last.w, q[1] * h / last.h};
+            return m;
+        }
+    }
+    return buildWarpMesh(w, h, int(std::lround(e.p("density", 0, 2000))));
+}
+
 }  // namespace
 
 WarpMesh buildWarpMesh(int w, int h, int vertices, const Image* alpha, double grow) {
@@ -351,27 +414,22 @@ WarpMesh buildWarpMesh(int w, int h, int vertices, const Image* alpha, double gr
     const int rows = std::max(1, int(std::lround(double(vertices) / (cols + 1))) - 1);
     WarpMesh full = lattice(cols, rows, w, h);
     if (!alpha || alpha->width != w || alpha->height != h) return full;
-    // Which lattice squares come within `grow` of the picture (a count of its pixels over any rectangle, summed ahead).
-    std::vector<uint32_t> sat(size_t(w + 1) * size_t(h + 1), 0);
-    for (int y = 0; y < h; ++y) {
-        uint32_t run = 0;
-        for (int x = 0; x < w; ++x) {
-            run += alpha->at(x, y)[3] > 1.0f / 255 ? 1 : 0;
-            sat[size_t(y + 1) * size_t(w + 1) + size_t(x + 1)] = sat[size_t(y) * size_t(w + 1) + size_t(x + 1)] + run;
-        }
-    }
-    auto any = [&](double x0, double y0, double x1, double y1) {
-        const int a = std::clamp(int(std::floor(x0)), 0, w), b = std::clamp(int(std::floor(y0)), 0, h);
-        const int c = std::clamp(int(std::ceil(x1)), 0, w), d = std::clamp(int(std::ceil(y1)), 0, h);
-        if (c <= a || d <= b) return false;
-        const auto at = [&](int x, int y) { return sat[size_t(y) * size_t(w + 1) + size_t(x)]; };
-        return at(c, d) - at(a, d) - at(c, b) + at(a, b) > 0;
-    };
+    // Which lattice squares have any of the picture, then which come within `grow` of one that has.
     const double cw = double(w) / cols, ch = double(h) / rows;
-    std::vector<char> keepSquare(size_t(cols) * size_t(rows), 0);
+    std::vector<char> has(size_t(cols) * size_t(rows), 0);
+    for (int y = 0; y < h; ++y) {
+        const int r = std::min(rows - 1, int(y / ch));
+        for (int x = 0; x < w; ++x)
+            if (alpha->at(x, y)[3] > 1.0f / 255) has[size_t(r) * size_t(cols) + size_t(std::min(cols - 1, int(x / cw)))] = 1;
+    }
+    std::vector<char> keepSquare(has.size(), 0);
+    const int reachX = int(std::ceil(std::max(0.0, grow) / cw)), reachY = int(std::ceil(std::max(0.0, grow) / ch));
     for (int r = 0; r < rows; ++r)
-        for (int c = 0; c < cols; ++c)
-            keepSquare[size_t(r) * size_t(cols) + size_t(c)] = any(c * cw - grow, r * ch - grow, (c + 1) * cw + grow, (r + 1) * ch + grow);
+        for (int c = 0; c < cols; ++c) {
+            if (!has[size_t(r) * size_t(cols) + size_t(c)]) continue;
+            for (int rr = std::max(0, r - reachY); rr <= std::min(rows - 1, r + reachY); ++rr)
+                for (int cc = std::max(0, c - reachX); cc <= std::min(cols - 1, c + reachX); ++cc) keepSquare[size_t(rr) * size_t(cols) + size_t(cc)] = 1;
+        }
     WarpMesh m;
     std::vector<int> remap(full.rest.size(), -1);
     for (size_t t = 0; t < full.tris.size(); ++t) {
@@ -397,11 +455,28 @@ std::vector<MeshPoint> solveWarp(const WarpMesh& m, const std::vector<WarpPin>& 
     const std::shared_ptr<const Solver> s = cachedSolver(m, pins, how);
     if (!s->ok) return out;
     const int nt = int(m.tris.size());
-    auto target = [&](const Solver::Hold& hd) { return pins[size_t(hd.pin)].kind == PinKind::Position ? pins[size_t(hd.pin)].to : pins[size_t(hd.pin)].at; };
+    if (std::any_of(s->holds.begin(), s->holds.end(), [&](const Solver::Hold& hd) { return hd.pin < 0 || size_t(hd.pin) >= pins.size(); }))
+        return out;
+    auto target = [&](const Solver::Hold& hd) {
+        const WarpPin& p = pins[size_t(hd.pin)];
+        const MeshPoint& to = p.kind == PinKind::Position ? p.to : p.at;
+        return MeshPoint{to[0] + hd.a.offset[0], to[1] + hd.a.offset[1]};
+    };
     // Step 1.
     std::vector<MeshPoint> first = m.rest;
-    if (s->step1.size() > 0) {
+    if (s->rigid && s->step1.size() > 0) {
         std::vector<double> b(size_t(s->step1.size()), 0.0);
+        for (int t = 0; t < nt; ++t) {
+            const auto& tr = m.tris[size_t(t)];
+            if (s->idx1[size_t(tr[0])] < 0) continue;
+            for (int k = 0; k < 3; ++k) {
+                const int a = tr[size_t(k)], c = tr[size_t((k + 1) % 3)];
+                const size_t i = size_t(s->idx1[size_t(a)]), j = size_t(s->idx1[size_t(c)]);
+                const MeshPoint e = sub(m.rest[size_t(c)], m.rest[size_t(a)]);
+                b[2 * j] += kLooseWeight * e[0], b[2 * j + 1] += kLooseWeight * e[1];
+                b[2 * i] -= kLooseWeight * e[0], b[2 * i + 1] -= kLooseWeight * e[1];
+            }
+        }
         for (const Solver::Hold& hd : s->holds) {
             if (s->idx1[size_t(hd.a.v[0])] < 0) continue;
             const MeshPoint p = target(hd);
@@ -504,7 +579,7 @@ std::vector<MeshPoint> solveWarp(const WarpMesh& m, const std::vector<WarpPin>& 
         for (size_t v = 0; v < m.rest.size(); ++v)
             if (const int i = s->idx2[v]; i >= 0) out[v] = {bx[size_t(i)], by[size_t(i)]};
     };
-    if (how == WarpSolve::Rigid) turns(first, true);
+    if (how == WarpSolve::Rigid && s->rigid) turns(first, true);
     step2();
     if (how == WarpSolve::Rigid)
         for (int pass = 0; pass < kRefine; ++pass) {
@@ -565,9 +640,9 @@ void drawWarp(const Image& src, const WarpMesh& m, const std::vector<MeshPoint>&
             d.r[k] = m.rest[size_t(tr[size_t(k)])];
             minX = std::min(minX, V[0]), maxX = std::max(maxX, V[0]), minY = std::min(minY, V[1]), maxY = std::max(maxY, V[1]);
         }
-        if (!ok) continue;
-        d.x0 = std::max(0, int(std::floor(minX - 0.5))), d.x1 = std::min(W - 1, int(std::ceil(maxX - 0.5)));
-        d.y0 = std::max(0, int(std::floor(minY - 0.5))), d.y1 = std::min(H - 1, int(std::ceil(maxY - 0.5)));
+        if (!ok || !(minX < W && maxX > -1 && minY < H && maxY > -1)) continue;  // (off the picture, or not a number)
+        d.x0 = int(std::floor(std::max(minX - 0.5, 0.0))), d.x1 = int(std::ceil(std::min(maxX - 0.5, double(W - 1))));
+        d.y0 = int(std::floor(std::max(minY - 0.5, 0.0))), d.y1 = int(std::ceil(std::min(maxY - 0.5, double(H - 1))));
         if (d.x0 > d.x1 || d.y0 > d.y1) continue;
         tris.push_back(d);
     }
@@ -649,6 +724,7 @@ void meshWarp(const Effect& e, FrameTime t, Image& img, double pixelScale) {
         return;
     const WarpMesh mesh = buildWarpMesh(W, H, int(std::lround(e.p("density", t, 2000))),
                                         std::lround(e.p("mesh_from", t, 0)) == 0 ? &img : nullptr, std::max(0.0, e.p("expand", t, 3)) * pixelScale);
+    if (std::lround(e.p("mesh_from", t, 0)) == 0) rememberMesh(e, W, H, mesh);
     auto moved = [&](double time) { return solveWarp(mesh, meshWarpPins(e, time, W, H, pixelScale)); };
     throughShutter(img, double(t), blur, shutter, moved, [&](const Image& src, double time, Image& out) {
         const std::vector<WarpPin> pins = meshWarpPins(e, time, W, H, pixelScale);
@@ -666,12 +742,14 @@ void meshWarp(const Effect& e, FrameTime t, Image& img, double pixelScale) {
 }
 
 std::vector<MeshPoint> meshWarpMoved(const Effect& e, double t, int w, int h, double pixelScale, const std::vector<MeshPoint>& rest) {
-    const WarpMesh mesh = buildWarpMesh(w, h, int(std::lround(e.p("density", 0, 2000))));
+    if (w <= 0 || h <= 0) return rest;
+    const WarpMesh mesh = meshFor(e, w, h);
+    if (mesh.tris.empty()) return rest;
     const std::vector<MeshPoint> v = solveWarp(mesh, meshWarpPins(e, t, w, h, pixelScale));
     std::vector<MeshPoint> out;
     for (const MeshPoint& p : rest) {
         const Attach a = attach(mesh, p);
-        MeshPoint q{0, 0};
+        MeshPoint q{-a.offset[0], -a.offset[1]};
         for (int k = 0; k < 3; ++k) q[0] += a.b[size_t(k)] * v[size_t(a.v[size_t(k)])][0], q[1] += a.b[size_t(k)] * v[size_t(a.v[size_t(k)])][1];
         out.push_back(q);
     }
@@ -679,7 +757,8 @@ std::vector<MeshPoint> meshWarpMoved(const Effect& e, double t, int w, int h, do
 }
 
 bool meshWarpRestOf(const Effect& e, double t, int w, int h, double pixelScale, const MeshPoint& shown, MeshPoint& rest) {
-    const WarpMesh mesh = buildWarpMesh(w, h, int(std::lround(e.p("density", 0, 2000))));
+    if (w <= 0 || h <= 0) return false;
+    const WarpMesh mesh = meshFor(e, w, h);
     const std::vector<WarpPin> pins = meshWarpPins(e, t, w, h, pixelScale);
     const std::vector<MeshPoint> v = solveWarp(mesh, pins);
     const std::vector<double> depth = warpDepths(mesh, pins);
@@ -788,6 +867,7 @@ bool trackMeshPins(const Project& p, const Sequence& seq, const Clip& c, const E
         return false;
     };
     keys.clear();
+    if (c.duration <= 0) return fail("The clip is empty");
     std::string path;
     double first = 0, last = 0;
     const MediaItem* m = c.isGenerator() ? nullptr : p.findMedia(c.mediaId);

@@ -2742,11 +2742,30 @@ void McpServer::Impl::addTools() {
                 // to to_x, to_y or keyed along `path`.
                 if (type != "mesh_warp") throw ArgError{"pins are a mesh_warp's"};
                 static const QStringList kinds{"position", "stiff", "bend", "overlap"};
+                if (!a.value("pins").isArray()) throw ArgError{"pins is a list of pins"};
                 for (const QJsonValue& v : a.value("pins").toArray()) {
                     const QJsonObject pin = v.toObject();
+                    if (!v.isObject() || (pin.contains("kind") && !pin.value("kind").isString()))
+                        throw ArgError{"Each pin is {kind, x, y, ...}, kind a name"};
                     const int kind = int(kinds.indexOf(pin.value("kind").toString("position")));
                     if (kind < 0) throw ArgError{"A pin's kind is position, stiff, bend or overlap"};
+                    // Each value within its param's range (x and y as on the picture).
+                    const std::vector<ParamInfo> infos = meshPinParams(1, kind);
+                    for (const ParamInfo& pi : infos) {
+                        const QString field = QString::fromStdString(pi.name.substr(5));
+                        if (field == "kind" || !pin.contains(field)) continue;
+                        const double value = pin.value(field).toDouble(std::nan(""));
+                        if (!(value >= pi.min && value <= pi.max))
+                            throw ArgError{QStringLiteral("A %1 pin's %2 is a number from %3 to %4")
+                                               .arg(kinds[kind], field).arg(pi.min).arg(pi.max)};
+                    }
+                    for (auto it = pin.begin(); it != pin.end(); ++it)
+                        if (it.key() != "kind" && it.key() != "path" &&
+                            std::none_of(infos.begin(), infos.end(), [&](const ParamInfo& pi) { return pi.name.substr(5) == it.key().toStdString(); }))
+                            throw ArgError{QStringLiteral("A %1 pin has no \"%2\"").arg(kinds[kind], it.key())};
                     if (!pin.value("x").isDouble() || !pin.value("y").isDouble()) throw ArgError{"Each pin needs x and y"};
+                    if (pin.contains("path") && (kind != 0 || !pin.value("path").isArray()))
+                        throw ArgError{"A path is a Position pin's list of keys"};
                     const int k = addMeshPin(e, kind, pin.value("x").toDouble(), pin.value("y").toDouble());
                     const std::string pre = "pin" + std::to_string(k) + ".";
                     for (const ParamInfo& pi : meshPinParams(k, kind)) {
@@ -2756,8 +2775,9 @@ void McpServer::Impl::addTools() {
                     }
                     for (const QJsonValue& key : pin.value("path").toArray()) {
                         const QJsonObject o = key.toObject();
-                        if (kind != 0 || !o.value("x").isDouble() || !o.value("y").isDouble())
-                            throw ArgError{"A path is a Position pin's keys: {frame, x, y}, the frame counted from the clip's start"};
+                        const double frame = o.value("frame").toDouble(-1), x = o.value("x").toDouble(std::nan("")), y = o.value("y").toDouble(std::nan(""));
+                        if (!(frame >= 0 && frame == std::floor(frame) && frame < 1e9 && x >= -2 && x <= 3 && y >= -2 && y <= 3))
+                            throw ArgError{"A path is a Position pin's keys: {frame, x, y}, the frame a whole number counted from the clip's start"};
                         e.params[pre + "to_x"].addKey(FrameTime(o.value("frame").toInteger()), o.value("x").toDouble());
                         e.params[pre + "to_y"].addKey(FrameTime(o.value("frame").toInteger()), o.value("y").toDouble());
                     }

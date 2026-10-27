@@ -68,7 +68,8 @@ private:
     std::optional<std::array<double, 2>> source_;   // an Alt-clicked source, for the next stroke
     std::vector<std::array<double, 2>> stroke_;     // the stroke being drawn (clip frame fractions)
     Target drawing_;
-    int dragging_ = -1;  // the pin or grid point being dragged
+    int dragging_ = -1;  // the pin or grid point being dragged ...
+    QPointF pressAt_, grab_;  // ... where it was pressed, and from there to the handle's middle
 };
 
 }  // namespace montage

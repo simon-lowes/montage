@@ -14970,6 +14970,11 @@ const auto seq = [this] { return state()->sequence(); };
         QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, at(0.75, 0.5));
         QVERIFY(std::fabs(fx(meshId).p("pin2.to_x", lt) - 0.75) < px && std::fabs(fx(meshId).p("pin2.to_y", lt) - 0.5) < py);
         QVERIFY(std::fabs(fx(meshId).p("pin2.x", lt) - 0.7) < px);
+        // A click on a pin without moving it leaves it alone.
+        const size_t steps = state()->history().undoCount();
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.75, 0.5) + QPoint(2, 1));
+        QVERIFY(std::fabs(fx(meshId).p("pin2.to_x", lt) - 0.75) < px && std::fabs(fx(meshId).p("pin2.to_y", lt) - 0.5) < py);
+        QCOMPARE(state()->history().undoCount(), steps);
         // A Stiff pin, chosen in the Inspector.
         QComboBox* kind = nullptr;
         QTRY_VERIFY((kind = win_->findChild<QComboBox*>(QStringLiteral("meshPinKind"))) != nullptr);

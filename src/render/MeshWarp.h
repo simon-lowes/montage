@@ -28,8 +28,8 @@ struct WarpMesh {
     std::vector<MeshPoint> rest;           // vertices, pixels
     std::vector<std::array<int, 3>> tris;  // vertex indices
 };
-// A lattice of about `vertices` vertices over the w x h frame: all of it, or (with `alpha`) the squares that come within
-// `grow` pixels of a pixel of it whose alpha is above 1/255. The lattice does not depend on the picture, so a moving
+// A lattice of about `vertices` vertices over the w x h frame: all of it, or (with `alpha`) the squares that hold a pixel
+// whose alpha is above 1/255 and those within `grow` pixels of them (in whole squares). The lattice does not depend on the picture, so a moving
 // alpha keeps its vertices where they were.
 WarpMesh buildWarpMesh(int w, int h, int vertices, const Image* alpha = nullptr, double grow = 0);
 
@@ -61,8 +61,8 @@ void drawWarp(const Image& src, const WarpMesh& m, const std::vector<MeshPoint>&
 std::vector<WarpPin> meshWarpPins(const Effect& e, double t, int w, int h, double pixelScale);
 void meshWarp(const Effect& e, FrameTime t, Image& img, double pixelScale);
 void gridWarp(const Effect& e, FrameTime t, Image& img);
-// Points on the picture at rest, where Mesh Warp `e` on clip frame t puts them (pixels of a w x h picture, its mesh
-// over the whole frame), and the point at rest it puts at `shown` (false where nothing of the mesh is there): for
+// Points on the picture at rest, where Mesh Warp `e` on clip frame t puts them (pixels of a w x h picture, on the mesh
+// it was last drawn with, or one over the whole frame), and the point at rest it puts at `shown` (false where nothing of the mesh is there): for
 // showing and placing pins on the monitor.
 std::vector<MeshPoint> meshWarpMoved(const Effect& e, double t, int w, int h, double pixelScale, const std::vector<MeshPoint>& rest);
 bool meshWarpRestOf(const Effect& e, double t, int w, int h, double pixelScale, const MeshPoint& shown, MeshPoint& rest);

@@ -22155,6 +22155,11 @@ if ui["pressed"] == "add":
                                                        {"pins", QJsonArray{QJsonObject{{"x", 0.2}, {"y", 0.5}}}}}).value("isError").toBool());
         QVERIFY(tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "mesh_warp"},
                                                        {"pins", QJsonArray{QJsonObject{{"kind", "pinch"}, {"x", 0.2}, {"y", 0.5}}}}}).value("isError").toBool());
+        for (const QJsonObject& bad : {QJsonObject{{"kind", 2}, {"x", 0.2}, {"y", 0.5}}, QJsonObject{{"x", 9}, {"y", 0.5}},
+                                       QJsonObject{{"x", 0.2}, {"y", 0.5}, {"depth", 10}},
+                                       QJsonObject{{"x", 0.2}, {"y", 0.5}, {"path", QJsonArray{QJsonObject{{"frame", 2.5}, {"x", 0.2}, {"y", 0.5}}}}}})
+            QVERIFY(tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "mesh_warp"}, {"pins", QJsonArray{bad}}})
+                        .value("isError").toBool());
         {
             Project warped;
             QVERIFY(loadProject(project.toStdString(), warped));

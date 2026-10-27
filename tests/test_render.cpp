@@ -9685,6 +9685,72 @@ colorspaces:
         QVERIFY2(loose > held * 2, qPrintable(QString("%1 %2").arg(loose).arg(held)));
     }
 
+    // Awkward pins: one dropped from the list after a solve, two on one spot, one off the mesh, shapes touching at a
+    // corner, and pins thrown far off the picture.
+    void meshWarpAwkwardPins() {
+        const WarpMesh mesh = buildWarpMesh(320, 180, 500);
+        WarpPin over;
+        over.kind = PinKind::Overlap;
+        over.at = {100, 90};
+        WarpPin a, b;
+        a.at = {60, 60};
+        a.to = {70, 60};
+        b.at = {260, 120};
+        b.to = {270, 120};
+        // An Overlap pin removed after a solve gets its own solver (the pins' places in the list differ).
+        const std::vector<MeshPoint> with = solveWarp(mesh, {over, a, b}), without = solveWarp(mesh, {a, b});
+        for (size_t i = 0; i < with.size(); ++i) QVERIFY(std::hypot(with[i][0] - without[i][0], with[i][1] - without[i][1]) < 1e-6);
+        QVERIFY(std::fabs(without[0][0] - mesh.rest[0][0] - 10) < 0.01);
+        // Two pins on one spot hold the mesh in one place: it moves with them.
+        WarpPin a2 = a;
+        const std::vector<MeshPoint> twice = solveWarp(mesh, {a, a2});
+        for (size_t i = 0; i < twice.size(); ++i) QVERIFY(std::fabs(twice[i][0] - mesh.rest[i][0] - 10) < 0.01 && std::fabs(twice[i][1] - mesh.rest[i][1]) < 0.01);
+        // A pin off the picture's mesh keeps its distance from the vertex it holds.
+        Image logo(320, 180);
+        for (int y = 60; y < 120; ++y)
+            for (int x = 40; x < 140; ++x) logo.at(x, y)[3] = 1;
+        const WarpMesh small = buildWarpMesh(320, 180, 500, &logo, 0);
+        WarpPin on, off;
+        on.at = {60, 90};
+        on.to = {65, 90};
+        off.at = off.to = {300, 90};
+        const std::vector<MeshPoint> v = solveWarp(small, {on, off});
+        for (size_t i = 0; i < v.size(); ++i) QVERIFY(std::hypot(v[i][0] - small.rest[i][0], v[i][1] - small.rest[i][1]) < 8);
+        // Two squares touching at one corner, each pinned in two places: each solves.
+        Image corners(320, 180);
+        const WarpMesh lattice = buildWarpMesh(320, 180, 500);
+        const double cell = lattice.rest[1][0] - lattice.rest[0][0];
+        for (int y = 0; y < int(cell) - 1; ++y)
+            for (int x = 0; x < int(cell) - 1; ++x) {
+                corners.at(x + 1, y + 1)[3] = 1;
+                corners.at(int(cell) + x + 1, int(cell) + y + 1)[3] = 1;
+            }
+        const WarpMesh touching = buildWarpMesh(320, 180, 500, &corners, 0);
+        QCOMPARE(int(touching.tris.size()), 4);
+        WarpPin p1, p2;
+        p1.at = {cell * 0.3, cell * 0.6};
+        p2.at = {cell * 1.6, cell * 1.4};
+        p1.to = {p1.at[0] + 3, p1.at[1]};
+        p2.to = {p2.at[0] + 3, p2.at[1]};
+        const std::vector<MeshPoint> t = solveWarp(touching, {p1, p2});
+        for (size_t i = 0; i < t.size(); ++i) QVERIFY(std::isfinite(t[i][0]) && std::hypot(t[i][0] - touching.rest[i][0] - 3, t[i][1] - touching.rest[i][1]) < 0.5);
+        // Pins thrown far off: the mesh goes with them, and drawing it neither hangs nor crashes.
+        Project p;
+        Effect e = makeEffect(p, "mesh_warp");
+        e.params["show_mesh"] = 1.0;
+        for (double x : {0.2, 0.8}) {
+            const int k = addMeshPin(e, 0, x, 0.5);
+            e.params["pin" + std::to_string(k) + ".to_x"] = 3.0;
+            e.params["pin" + std::to_string(k) + ".to_y"] = -2.0;
+        }
+        Image img(64, 36);
+        img.fill(1, 1, 1, 1);
+        applyVideoEffect(e, 0, img, 1.0);
+        Image tiny(1, 1);
+        tiny.fill(1, 0, 0, 1);
+        applyVideoEffect(e, 0, tiny, 1.0);
+    }
+
     // Where parts of the picture are moved over each other, the Overlap pins say which is in front.
     void meshWarpOverlapOrder() {
         Project p;

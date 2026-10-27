@@ -115,7 +115,7 @@ void PaintOverlay::paint(QPainter& p, const QRectF& picture) {
     const double wpx = picture.width() / seq->width;  // widget pixels a sequence pixel
     if (t->mesh || t->grid) {
         const std::vector<std::pair<int, QPointF>> hs = handles(*t, *e);
-        auto shown = [&](int id, QPointF at) { return id == dragging_ && drawing_.effect == t->effect ? mouse_ : at; };
+        auto shown = [&](int id, QPointF at) { return id == dragging_ && drawing_.effect == t->effect ? mouse_ + grab_ : at; };
         if (t->grid) {
             // The grid's lines, then its points.
             const int cols = std::clamp(int(std::lround(e->p("cols", 0, 3))), 1, 12);
@@ -323,7 +323,8 @@ void PaintOverlay::dropHandle(const Target& t, const QPointF& at, bool remove) {
     if (remove) {
         state_->edit(tr("Remove Pin"), [=](Project&, Sequence& sq) {
             Effect* ef = edit::ownedEffect(sq, clip, effect);
-            if (!ef) return false;
+            const std::vector<int> pins = ef ? meshPins(*ef) : std::vector<int>{};
+            if (std::find(pins.begin(), pins.end(), id) == pins.end()) return false;
             removeMeshPin(*ef, id);
             return true;
         });
@@ -336,7 +337,8 @@ void PaintOverlay::dropHandle(const Target& t, const QPointF& at, bool remove) {
     if (kind != 0 && !meshWarpRestOf(*e, double(lt), W, H, fw / std::max(1, seq->width), {u * W, v * H}, rest)) return;
     state_->edit(tr("Move Pin"), [=](Project&, Sequence& sq) {
         Effect* ef = edit::ownedEffect(sq, clip, effect);
-        if (!ef) return false;
+        const std::vector<int> pins = ef ? meshPins(*ef) : std::vector<int>{};
+        if (std::find(pins.begin(), pins.end(), id) == pins.end() || meshPinKind(*ef, id) != kind) return false;  // (undone meanwhile)
         const std::string pre = "pin" + std::to_string(id) + ".";
         if (kind == 0) {
             // A key here when it is keyed.
@@ -476,6 +478,9 @@ bool PaintOverlay::eventFilter(QObject* obj, QEvent* e) {
                 dropHandle(*t, mouse_, true);
             } else if (id >= 0) {
                 dragging_ = id;
+                pressAt_ = mouse_;
+                for (const auto& [h, w] : handles(*t, *ef))
+                    if (h == id) grab_ = w - mouse_;
             } else if (t->mesh && u >= 0 && u <= 1 && v >= 0 && v <= 1) {
                 placePin(*t, mouse_);
             }
@@ -523,7 +528,9 @@ bool PaintOverlay::eventFilter(QObject* obj, QEvent* e) {
         auto* me = static_cast<QMouseEvent*>(e);
         if (me->button() == Qt::LeftButton && dragging_ >= 0) {
             mouse_ = me->position();
-            dropHandle(drawing_, mouse_, false);
+            // (a click on a handle without moving it leaves it where it is)
+            if (QLineF(pressAt_, mouse_).length() < 3) dragging_ = -1;
+            else dropHandle(drawing_, mouse_ + grab_, false);
             drawing_ = {};
             viewer_->update();
             return true;
