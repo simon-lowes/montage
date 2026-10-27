@@ -34,6 +34,7 @@
 #include "core/GraphicsTemplate.h"
 #include "core/Effects.h"
 #include "core/MaskPath.h"
+#include "render/MeshWarp.h"
 #include "render/ColorChart.h"
 #include "core/LensProfile.h"
 #include "render/ColorSpace.h"
@@ -9522,6 +9523,271 @@ colorspaces:
             plain.strings.erase("runs");
             return renderGenerator(plain, 0, 320, 180, 1.0, 30, 30).px;
         }());
+    }
+
+    // Mesh Warp (render/MeshWarp.h): pins left where they sit leave the picture exactly as it was.
+    void meshWarpStillPins() {
+        Project p;
+        Image img(320, 180, Image::Uninitialized{});
+        for (int y = 0; y < img.height; ++y)
+            for (int x = 0; x < img.width; ++x) {
+                float* px = img.at(x, y);
+                px[0] = float(x) / img.width, px[1] = float(y) / img.height;
+                px[2] = 0.5f + 0.5f * float(std::sin(x * 0.3) * std::sin(y * 0.3)), px[3] = 1;
+            }
+        Effect e = makeEffect(p, "mesh_warp");
+        addMeshPin(e, 0, 0.2, 0.3);
+        addMeshPin(e, 0, 0.8, 0.6);
+        addMeshPin(e, 1, 0.5, 0.5);
+        addMeshPin(e, 3, 0.4, 0.4);
+        const int bend = addMeshPin(e, 2, 0.6, 0.3);
+        QCOMPARE(meshPins(e), (std::vector<int>{1, 2, 3, 4, 5}));
+        QCOMPARE(meshPinKind(e, 3), 1);
+        Image out = img;
+        applyVideoEffect(e, 0, out, 1.0);
+        QVERIFY(out.px == img.px);
+        // A bend changes it; so does a pin moved.
+        e.params["pin" + std::to_string(bend) + ".angle"] = 20.0;
+        out = img;
+        applyVideoEffect(e, 0, out, 1.0);
+        QVERIFY(out.px != img.px);
+        e.params["pin" + std::to_string(bend) + ".angle"] = 0.0;
+        e.params["pin1.to_x"] = 0.25;
+        out = img;
+        applyVideoEffect(e, 0, out, 1.0);
+        QVERIFY(out.px != img.px);
+        // Its params are listed after the effect's own, by kind.
+        const std::vector<ParamInfo> ps = effectParams(e);
+        QVERIFY(std::any_of(ps.begin(), ps.end(), [](const ParamInfo& pi) { return pi.name == "pin1.to_x" && pi.keyframeable; }));
+        QVERIFY(std::any_of(ps.begin(), ps.end(), [](const ParamInfo& pi) { return pi.name == "pin3.amount"; }));
+        QVERIFY(std::none_of(ps.begin(), ps.end(), [](const ParamInfo& pi) { return pi.name == "pin3.to_x"; }));
+        removeMeshPin(e, 2);
+        QCOMPARE(meshPins(e), (std::vector<int>{1, 3, 4, 5}));
+    }
+
+    // All pins moved by one rotation and translation move the mesh and the picture rigidly.
+    void meshWarpMovesRigidly() {
+        const int W = 640, H = 360;
+        const WarpMesh mesh = buildWarpMesh(W, H, 2000);
+        QVERIFY(mesh.rest.size() > 1800 && mesh.rest.size() < 2200);
+        const double a = 25 * M_PI / 180, tx = 15, ty = -10;
+        auto move = [&](MeshPoint q) {
+            const double x = q[0] - 320, y = q[1] - 180;
+            return MeshPoint{320 + std::cos(a) * x - std::sin(a) * y + tx, 180 + std::sin(a) * x + std::cos(a) * y + ty};
+        };
+        std::vector<WarpPin> pins;
+        for (MeshPoint at : {MeshPoint{100, 100}, MeshPoint{500, 120}, MeshPoint{300, 300}}) {
+            WarpPin pin;
+            pin.at = at;
+            pin.to = move(at);
+            pins.push_back(pin);
+        }
+        const std::vector<MeshPoint> v = solveWarp(mesh, pins);
+        double worst = 0;
+        for (size_t i = 0; i < v.size(); ++i) {
+            const MeshPoint want = move(mesh.rest[i]);
+            worst = std::max(worst, std::hypot(v[i][0] - want[0], v[i][1] - want[1]));
+        }
+        QVERIFY2(worst < 0.25, qPrintable(QString::number(worst)));
+        // A bright square on the picture goes where the move takes it.
+        Project p;
+        Image img(W, H);
+        for (int y = 140; y < 160; ++y)
+            for (int x = 240; x < 260; ++x) std::fill(img.at(x, y), img.at(x, y) + 4, 1.0f);
+        Effect e = makeEffect(p, "mesh_warp");
+        e.params["mesh_from"] = 1.0;
+        for (const WarpPin& pin : pins) {
+            const int k = addMeshPin(e, 0, pin.at[0] / W, pin.at[1] / H);
+            e.params["pin" + std::to_string(k) + ".to_x"] = pin.to[0] / W;
+            e.params["pin" + std::to_string(k) + ".to_y"] = pin.to[1] / H;
+        }
+        applyVideoEffect(e, 0, img, 1.0);
+        double sx = 0, sy = 0, sum = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const double w = img.at(x, y)[3];
+                sx += w * (x + 0.5), sy += w * (y + 0.5), sum += w;
+            }
+        const MeshPoint want = move({250, 150});
+        QVERIFY(std::fabs(sum - 400) < 4);
+        QVERIFY2(std::hypot(sx / sum - want[0], sy / sum - want[1]) < 0.25, qPrintable(QString("%1 %2").arg(sx / sum).arg(sy / sum)));
+    }
+
+    // One pin pulled on a strip bends it, each triangle keeping its area within 5 %, where a plain warp does not.
+    void meshWarpBendsAStrip() {
+        const int W = 800, H = 480;
+        Image strip(W, H);
+        for (int y = 205; y < 235; ++y)
+            for (int x = 100; x < 500; ++x) std::fill(strip.at(x, y), strip.at(x, y) + 4, 1.0f);
+        const WarpMesh mesh = buildWarpMesh(W, H, 4000, &strip, 0);
+        QVERIFY(mesh.tris.size() > 100);
+        for (const MeshPoint& q : mesh.rest) QVERIFY(q[0] > 80 && q[0] < 520 && q[1] > 185 && q[1] < 255);
+        std::vector<WarpPin> pins(3);
+        pins[0].at = pins[0].to = {110, 208};
+        pins[1].at = pins[1].to = {110, 232};
+        // The free end swung down through 30 degrees along the arc the strip would make.
+        const double radius = 380 / (M_PI / 6);
+        pins[2].at = {490, 220};
+        pins[2].to = {110 + radius * std::sin(M_PI / 6), 220 + radius * (1 - std::cos(M_PI / 6))};
+        auto worstArea = [&](const std::vector<MeshPoint>& v) {
+            double worst = 0;
+            for (const auto& t : mesh.tris) {
+                auto area = [&](const std::vector<MeshPoint>& q) {
+                    const MeshPoint &a = q[size_t(t[0])], &b = q[size_t(t[1])], &c = q[size_t(t[2])];
+                    return 0.5 * ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]));
+                };
+                const double d = std::fabs(area(v) / area(mesh.rest) - 1);
+                worst = std::max(worst, d);
+            }
+            return worst;
+        };
+        const std::vector<MeshPoint> rigid = solveWarp(mesh, pins), plain = solveWarp(mesh, pins, WarpSolve::Plain);
+        QVERIFY(std::hypot(rigid[0][0] - mesh.rest[0][0], rigid[0][1] - mesh.rest[0][1]) < 1);
+        const double r = worstArea(rigid), q = worstArea(plain);
+        QVERIFY2(r < 0.05, qPrintable(QString::number(r)));
+        QVERIFY2(q > 0.05, qPrintable(QString::number(q)));
+        // The far end went where it was pulled.
+        double nearest = 1e9;
+        for (const MeshPoint& v : rigid) nearest = std::min(nearest, std::hypot(v[0] - pins[2].to[0], v[1] - pins[2].to[1]));
+        QVERIFY(nearest < 15);
+    }
+
+    // A stiff area keeps its edges within 1 % of their lengths while the mesh round it bends.
+    void meshWarpStiffArea() {
+        const WarpMesh mesh = buildWarpMesh(640, 360, 2000);
+        std::vector<WarpPin> pins(3);
+        pins[0].at = pins[0].to = {80, 80};
+        pins[1].at = pins[1].to = {80, 280};
+        pins[2].at = {560, 180};
+        pins[2].to = {520, 330};
+        WarpPin stiff;
+        stiff.kind = PinKind::Stiff;
+        stiff.at = {380, 180};
+        stiff.radius = 70;
+        auto worstEdge = [&](const std::vector<MeshPoint>& v) {
+            double worst = 0;
+            for (const auto& t : mesh.tris) {
+                const MeshPoint c{(mesh.rest[size_t(t[0])][0] + mesh.rest[size_t(t[1])][0] + mesh.rest[size_t(t[2])][0]) / 3,
+                                  (mesh.rest[size_t(t[0])][1] + mesh.rest[size_t(t[1])][1] + mesh.rest[size_t(t[2])][1]) / 3};
+                if (std::hypot(c[0] - stiff.at[0], c[1] - stiff.at[1]) > 0.75 * stiff.radius) continue;
+                for (int k = 0; k < 3; ++k) {
+                    const size_t a = size_t(t[size_t(k)]), b = size_t(t[size_t((k + 1) % 3)]);
+                    const double l0 = std::hypot(mesh.rest[b][0] - mesh.rest[a][0], mesh.rest[b][1] - mesh.rest[a][1]);
+                    worst = std::max(worst, std::fabs(std::hypot(v[b][0] - v[a][0], v[b][1] - v[a][1]) / l0 - 1));
+                }
+            }
+            return worst;
+        };
+        const double loose = worstEdge(solveWarp(mesh, pins));
+        pins.push_back(stiff);
+        const double held = worstEdge(solveWarp(mesh, pins));
+        QVERIFY2(held < 0.01, qPrintable(QString::number(held)));
+        QVERIFY2(loose > held * 2, qPrintable(QString("%1 %2").arg(loose).arg(held)));
+    }
+
+    // Where parts of the picture are moved over each other, the Overlap pins say which is in front.
+    void meshWarpOverlapOrder() {
+        Project p;
+        Image img(400, 200);
+        for (int y = 50; y < 150; ++y)
+            for (int x = 40; x < 140; ++x) img.at(x, y)[0] = img.at(x, y)[3] = 1;
+        for (int y = 50; y < 150; ++y)
+            for (int x = 220; x < 320; ++x) img.at(x, y)[2] = img.at(x, y)[3] = 1;
+        Effect e = makeEffect(p, "mesh_warp");
+        e.params["expand"] = 0.0;
+        addMeshPin(e, 0, 60 / 400.0, 70 / 200.0);
+        addMeshPin(e, 0, 120 / 400.0, 130 / 200.0);
+        for (double x : {240.0, 300.0}) {
+            const int k = addMeshPin(e, 0, x / 400, (x == 240 ? 70 : 130) / 200.0);
+            e.params["pin" + std::to_string(k) + ".to_x"] = (x - 120) / 400;
+        }
+        const int red = addMeshPin(e, 3, 90 / 400.0, 0.5), blue = addMeshPin(e, 3, 270 / 400.0, 0.5);
+        e.params["pin" + std::to_string(red) + ".radius"] = 60.0;
+        e.params["pin" + std::to_string(blue) + ".radius"] = 60.0;
+        auto front = [&](double redDepth, double blueDepth) {
+            e.params["pin" + std::to_string(red) + ".depth"] = redDepth;
+            e.params["pin" + std::to_string(blue) + ".depth"] = blueDepth;
+            Image out = img;
+            applyVideoEffect(e, 0, out, 1.0);
+            const float* px = out.at(120, 100);
+            // (each where only it is, too)
+            if (std::fabs(px[3] - 1) > 1e-4 || out.at(70, 100)[0] < 0.99f || out.at(170, 100)[2] < 0.99f) return '?';
+            return px[0] > 0.99f ? 'r' : px[2] > 0.99f ? 'b' : '?';
+        };
+        QCOMPARE(front(50, -50), 'r');
+        QCOMPARE(front(-50, 50), 'b');
+    }
+
+    // Keyframed pins with motion blur render the same frame alone, after others and on eight threads at once; the
+    // blur follows the mesh's motion.
+    void meshWarpRendersAlike() {
+        Project p;
+        Image img(320, 180, Image::Uninitialized{});
+        for (int y = 0; y < img.height; ++y)
+            for (int x = 0; x < img.width; ++x) {
+                float* px = img.at(x, y);
+                px[0] = (x / 8 + y / 8) % 2 ? 1.f : 0.f, px[1] = float(y) / img.height, px[2] = 0.3f, px[3] = 1;
+            }
+        Effect e = makeEffect(p, "mesh_warp");
+        addMeshPin(e, 0, 0.1, 0.1);
+        addMeshPin(e, 0, 0.1, 0.9);
+        const int k = addMeshPin(e, 0, 0.8, 0.5);
+        Param& x = e.params["pin" + std::to_string(k) + ".to_x"];
+        x.addKey(0, 0.8);
+        x.addKey(20, 0.6);
+        e.params["pin" + std::to_string(k) + ".to_y"].addKey(0, 0.5);
+        e.params["pin" + std::to_string(k) + ".to_y"].addKey(20, 0.7);
+        e.params["motion_blur"] = 1.0;
+        auto render = [&](FrameTime f) {
+            Image out = img;
+            applyVideoEffect(e, f, out, 1.0);
+            return out;
+        };
+        const Image alone = render(7);
+        Image last;
+        for (FrameTime f = 0; f <= 7; ++f) last = render(f);
+        QVERIFY(last.px == alone.px);
+        std::vector<Image> out(8);
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 8; ++i) threads.emplace_back([&, i] { out[size_t(i)] = render(7); });
+        for (std::thread& th : threads) th.join();
+        for (const Image& o : out) QVERIFY(o.px == alone.px);
+        e.params["motion_blur"] = 0.0;
+        const Image sharp = render(7);
+        double diff = 0;
+        for (size_t i = 0; i < sharp.px.size(); ++i) diff += std::fabs(sharp.px[i] - alone.px[i]);
+        QVERIFY(diff > 100);
+    }
+
+    // Grid Warp: points where they are leave the picture as it was; a point moved takes the picture there with it,
+    // straight or smoothly between the points.
+    void gridWarpMovesPoints() {
+        Project p;
+        Image img(300, 300);
+        for (int y = 145; y < 155; ++y)
+            for (int x = 145; x < 155; ++x) std::fill(img.at(x, y), img.at(x, y) + 4, 1.0f);
+        for (int x = 0; x < 300; ++x) img.at(x, 75)[1] = img.at(x, 75)[3] = 1;
+        Effect e = makeEffect(p, "grid_warp");
+        e.params["rows"] = 2.0;
+        e.params["cols"] = 2.0;
+        QCOMPARE(int(gridWarpParams(e).size()), 18);
+        Image out = img;
+        applyVideoEffect(e, 0, out, 1.0);
+        QVERIFY(out.px == img.px);
+        e.params[gridWarpPoint(1, 1) + ".dx"] = 0.1;
+        e.params[gridWarpPoint(1, 1) + ".dy"] = -0.05;
+        const MeshPoint at = gridWarpPointAt(e, 0, 1, 1);
+        QVERIFY(std::fabs(at[0] - 0.6) < 1e-9 && std::fabs(at[1] - 0.45) < 1e-9);
+        for (int shape : {0, 1}) {
+            e.params["shape"] = double(shape);
+            out = img;
+            applyVideoEffect(e, 0, out, 1.0);
+            // The dot is drawn where its point went, and not where it was.
+            QVERIFY2(out.at(179, 134)[0] > 0.9f && out.at(180, 135)[0] > 0.9f, qPrintable(QString::number(shape)));
+            QVERIFY(out.at(149, 149)[0] < 0.1f);
+            // The corners hold.
+            QVERIFY(out.at(0, 75)[1] > 0.9f);
+        }
     }
 
     void gradeNodeGraphs() {

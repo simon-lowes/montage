@@ -608,6 +608,20 @@ std::vector<EffectInfo> buildCatalog() {
                   num("br_x", "Bottom Right X", -1, 2, 1, 0.001), num("br_y", "Bottom Right Y", -1, 2, 1, 0.001),
                   num("bl_x", "Bottom Left X", -1, 2, 0, 0.001), num("bl_y", "Bottom Left Y", -1, 2, 1, 0.001)},
                  {}});
+    // Mesh Warp (render/MeshWarp.h): a mesh over the picture's alpha bent by pins as rigidly as it can be, the pins
+    // being params "pin<k>.*" (meshPinParams). Grid Warp: a grid of rows x columns whose points (params "g<r>_<c>.dx"
+    // and ".dy", offsets as fractions of the frame) bend the picture smoothly or straight between them.
+    c.push_back({"mesh_warp", "Mesh Warp", EffectCategory::VideoFilter, "Distort",
+                 {num("density", "Mesh Vertices", 100, 10000, 2000, 50), choice("mesh_from", "Mesh Covers", {"The Picture (Its Alpha)", "The Whole Frame"}, 0),
+                  num("expand", "Mesh Expansion (px)", 0, 200, 3, 0.5), boolean("motion_blur", "Motion Blur"),
+                  num("shutter", "Shutter Angle", 0, 720, 180, 1), boolean("show_mesh", "Show Mesh")},
+                 {}});
+    for (auto& pi : c.back().params) pi.keyframeable = false;
+    c.push_back({"grid_warp", "Grid Warp", EffectCategory::VideoFilter, "Distort",
+                 {num("rows", "Rows", 1, 12, 3, 1), num("cols", "Columns", 1, 12, 3, 1), choice("shape", "Between Points", {"Smooth", "Straight"}, 0),
+                  boolean("motion_blur", "Motion Blur"), num("shutter", "Shutter Angle", 0, 720, 180, 1), boolean("show_grid", "Show Grid")},
+                 {}});
+    for (auto& pi : c.back().params) pi.keyframeable = false;
     c.push_back({"letterbox", "Letterbox", EffectCategory::VideoFilter, "Stylize",
                  {choice("aspect", "Aspect", {"2.39:1", "2:1", "1.85:1", "4:3", "1:1", "9:16"}, 0),
                   pct("opacity", "Opacity", 0, 100, 100)},
@@ -1456,6 +1470,92 @@ int addTextAnimator(Effect& e, int k) {
     return k;
 }
 
+std::vector<int> meshPins(const Effect& e) {
+    std::vector<int> out;
+    for (const auto& [key, param] : e.params) {
+        if (key.size() < 9 || key.compare(0, 3, "pin") != 0 || key.compare(key.size() - 5, 5, ".kind") != 0) continue;
+        const std::string n = key.substr(3, key.size() - 8);
+        if (n.empty() || n.size() > 4 || !std::all_of(n.begin(), n.end(), [](char c) { return c >= '0' && c <= '9'; })) continue;
+        out.push_back(std::stoi(n));
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+int meshPinKind(const Effect& e, int k) {
+    return std::clamp(int(std::lround(e.p("pin" + std::to_string(k) + ".kind", 0, 0))), 0, 3);
+}
+
+std::vector<ParamInfo> meshPinParams(int k, int kind) {
+    const std::string pre = "pin" + std::to_string(k) + ".";
+    const std::string n = std::to_string(k);
+    ParamInfo kindInfo = choice(pre + "kind", "Pin " + n, {"Position", "Stiff", "Bend", "Overlap"});
+    // Where the pin sits on the picture at rest (fractions of the frame): set where it is placed.
+    ParamInfo x = num(pre + "x", "Pin " + n + " On Picture X", -1, 2, 0.5, 0.001), y = num(pre + "y", "Pin " + n + " On Picture Y", -1, 2, 0.5, 0.001);
+    x.keyframeable = y.keyframeable = false;
+    std::vector<ParamInfo> out{kindInfo, x, y};
+    switch (kind) {
+    case 0:
+        out.push_back(num(pre + "to_x", "Pin " + n + " Position X", -2, 3, 0.5, 0.001));
+        out.push_back(num(pre + "to_y", "Pin " + n + " Position Y", -2, 3, 0.5, 0.001));
+        break;
+    case 1:
+        out.push_back(num(pre + "radius", "Pin " + n + " Extent (px)", 1, 4000, 80, 1));
+        out.push_back(pct(pre + "amount", "Pin " + n + " Stiffness", 0, 100, 100));
+        out.back().keyframeable = out[out.size() - 2].keyframeable = false;
+        break;
+    case 2: {
+        out.push_back(num(pre + "radius", "Pin " + n + " Extent (px)", 1, 4000, 80, 1));
+        out.back().keyframeable = false;
+        ParamInfo turn = angle(pre + "angle", "Pin " + n + " Rotation");
+        turn.min = -720, turn.max = 720;
+        out.push_back(turn);
+        out.push_back(pct(pre + "scale", "Pin " + n + " Scale", 10, 1000, 100));
+        break;
+    }
+    default:
+        out.push_back(num(pre + "radius", "Pin " + n + " Extent (px)", 1, 4000, 80, 1));
+        out.push_back(pct(pre + "depth", "Pin " + n + " In Front", -100, 100, 50));
+        break;
+    }
+    return out;
+}
+
+int addMeshPin(Effect& e, int kind, double x, double y) {
+    const std::vector<int> have = meshPins(e);
+    const int k = have.empty() ? 1 : have.back() + 1;
+    kind = std::clamp(kind, 0, 3);
+    for (const ParamInfo& pi : meshPinParams(k, kind)) e.params.try_emplace(pi.name, Param(pi.def));
+    const std::string pre = "pin" + std::to_string(k) + ".";
+    e.params[pre + "kind"] = Param(double(kind));
+    e.params[pre + "x"] = Param(x);
+    e.params[pre + "y"] = Param(y);
+    if (kind == 0) {
+        e.params[pre + "to_x"] = Param(x);
+        e.params[pre + "to_y"] = Param(y);
+    }
+    return k;
+}
+
+void removeMeshPin(Effect& e, int k) {
+    const std::string pre = "pin" + std::to_string(k) + ".";
+    std::erase_if(e.params, [&](const auto& kv) { return kv.first.rfind(pre, 0) == 0; });
+}
+
+std::string gridWarpPoint(int r, int c) { return "g" + std::to_string(r) + "_" + std::to_string(c); }
+
+std::vector<ParamInfo> gridWarpParams(const Effect& e) {
+    const int rows = std::clamp(int(std::lround(e.p("rows", 0, 3))), 1, 12), cols = std::clamp(int(std::lround(e.p("cols", 0, 3))), 1, 12);
+    std::vector<ParamInfo> out;
+    for (int r = 0; r <= rows; ++r)
+        for (int c = 0; c <= cols; ++c) {
+            const std::string name = gridWarpPoint(r, c), label = "Point " + std::to_string(r + 1) + "," + std::to_string(c + 1);
+            out.push_back(num(name + ".dx", label + " Move X", -2, 2, 0, 0.001));
+            out.push_back(num(name + ".dy", label + " Move Y", -2, 2, 0, 0.001));
+        }
+    return out;
+}
+
 std::vector<ParamInfo> effectParams(const Effect& e) {
     if (e.type != "plugin" && e.type != "ofx") {
         const EffectInfo* info = findEffectInfo(e.type);
@@ -1463,6 +1563,11 @@ std::vector<ParamInfo> effectParams(const Effect& e) {
         if (e.type == "title")
             for (int k : textAnimators(e))
                 for (ParamInfo& pi : textAnimatorParams(k)) out.push_back(std::move(pi));
+        if (e.type == "mesh_warp")
+            for (int k : meshPins(e))
+                for (ParamInfo& pi : meshPinParams(k, meshPinKind(e, k))) out.push_back(std::move(pi));
+        if (e.type == "grid_warp")
+            for (ParamInfo& pi : gridWarpParams(e)) out.push_back(std::move(pi));
         return out;
     }
     std::vector<ParamInfo> out;

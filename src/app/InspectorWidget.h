@@ -109,6 +109,8 @@ public:
     void analyzeDepth(Id clip);
     // Keys Lens Blur (Depth) `effect`'s Focus Depth to follow `target` (render/FollowFocus.h): its Focus Point at the
     // playhead, its Object mask, or the face nearest the point.
+    // Keys each Position pin of the Mesh Warp `effect` on `clip` to follow the footage (render/MeshWarp.h trackMeshPins).
+    void trackWarpPins(Id clip, Id effect);
     void followFocusOn(Id clip, Id effect, FocusTarget target);
     // Follows the surface under the corners of Corner Pin `effect` on `clip`
     // (in the clip beneath it, or its own footage) from the playhead to the

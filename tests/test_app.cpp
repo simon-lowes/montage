@@ -14931,6 +14931,84 @@ const auto seq = [this] { return state()->sequence(); };
         state()->setSelection({}, false);
     }
 
+    void meshWarpPinsInProgramMonitor() {
+        loadDemo();
+        // Mesh Warp on the red clip: Pins on the Monitor, then clicks place pins, a drag moves one, Ctrl-click removes one.
+        const Id red = clipNamed(*state()->sequence(), "Red")->id;
+        Id meshId = 0, gridId = 0;
+        QVERIFY(state()->edit("Warp", [red, &meshId](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "mesh_warp");
+            meshId = e.id;
+            edit::clipById(s, red)->effects.push_back(e);
+            return true;
+        }));
+        state()->setSelection({red}, false);
+        state()->setPlayhead(10);
+        const int64_t lt = 10 - clipNamed(*state()->sequence(), "Red")->start;
+        MonitorPanel* program = nullptr;
+        for (auto* m : win_->findChildren<MonitorPanel*>())
+            if (m->mode() == MonitorPanel::Mode::Program) program = m;
+        QVERIFY(program);
+        ViewerWidget* viewer = program->viewer();
+        QTRY_VERIFY_WITH_TIMEOUT(!viewer->image().isNull(), 5000);
+        QPushButton* arm = nullptr;
+        QTRY_VERIFY((arm = win_->findChild<QPushButton*>(QStringLiteral("warpOnMonitor"))) != nullptr);
+        arm->click();
+        QCOMPARE(state()->paintEffect(), meshId);
+        const QRectF r = viewer->imageRect();
+        auto at = [&r](double u, double v) { return QPointF(r.left() + u * r.width(), r.top() + v * r.height()).toPoint(); };
+        auto fx = [&](Id id) -> const Effect& { return *edit::ownedEffect(const_cast<Sequence&>(*state()->sequence()), red, id); };
+        const double px = 2.0 / r.width(), py = 2.0 / r.height();
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.3, 0.4));
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.7, 0.6));
+        QCOMPARE(meshPins(fx(meshId)), (std::vector<int>{1, 2}));
+        QCOMPARE(meshPinKind(fx(meshId), 2), 0);
+        QVERIFY(std::fabs(fx(meshId).p("pin1.x", lt) - 0.3) < px && std::fabs(fx(meshId).p("pin1.to_y", lt) - 0.4) < py);
+        // Dragging a pin moves where it goes, not where it sits on the picture.
+        QTest::mousePress(viewer, Qt::LeftButton, Qt::NoModifier, at(0.7, 0.6));
+        QTest::mouseMove(viewer, at(0.72, 0.55));
+        QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, at(0.75, 0.5));
+        QVERIFY(std::fabs(fx(meshId).p("pin2.to_x", lt) - 0.75) < px && std::fabs(fx(meshId).p("pin2.to_y", lt) - 0.5) < py);
+        QVERIFY(std::fabs(fx(meshId).p("pin2.x", lt) - 0.7) < px);
+        // A Stiff pin, chosen in the Inspector.
+        QComboBox* kind = nullptr;
+        QTRY_VERIFY((kind = win_->findChild<QComboBox*>(QStringLiteral("meshPinKind"))) != nullptr);
+        kind->setCurrentIndex(1);
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::NoModifier, at(0.5, 0.2));
+        QCOMPARE(meshPins(fx(meshId)), (std::vector<int>{1, 2, 3}));
+        QCOMPARE(meshPinKind(fx(meshId), 3), 1);
+        QVERIFY(!fx(meshId).params.count("pin3.to_x"));
+        // Ctrl-click removes a pin; so does the Inspector's Remove.
+        QTest::mouseClick(viewer, Qt::LeftButton, Qt::ControlModifier, at(0.3, 0.4));
+        QCOMPARE(meshPins(fx(meshId)), (std::vector<int>{2, 3}));
+        QComboBox* list = nullptr;
+        QTRY_VERIFY((list = win_->findChild<QComboBox*>(QStringLiteral("meshPinList"))) && list->count() == 2);
+        list->setCurrentIndex(1);
+        win_->findChild<QPushButton*>(QStringLiteral("removeMeshPin"))->click();
+        QCOMPARE(meshPins(fx(meshId)), (std::vector<int>{2}));
+        state()->undo();
+        QCOMPARE(meshPins(fx(meshId)), (std::vector<int>{2, 3}));
+        QTest::keyClick(viewer, Qt::Key_Escape);
+        QCOMPARE(state()->paintEffect(), Id(0));
+        // Grid Warp: its points are dragged.
+        QVERIFY(state()->edit("Grid", [red, &gridId](Project& p, Sequence& s) {
+            Effect e = makeEffect(p, "grid_warp");
+            gridId = e.id;
+            edit::clipById(s, red)->effects.push_back(e);
+            return true;
+        }));
+        state()->setPaintEffect(gridId);
+        QTest::mousePress(viewer, Qt::LeftButton, Qt::NoModifier, at(1.0 / 3, 1.0 / 3));
+        QTest::mouseRelease(viewer, Qt::LeftButton, Qt::NoModifier, at(0.4, 0.35));
+        QVERIFY(std::fabs(fx(gridId).p(gridWarpPoint(1, 1) + ".dx", lt) - (0.4 - 1.0 / 3)) < px);
+        QVERIFY(std::fabs(fx(gridId).p(gridWarpPoint(1, 1) + ".dy", lt) - (0.35 - 1.0 / 3)) < py);
+        QTRY_VERIFY(win_->findChild<QPushButton*>(QStringLiteral("resetGridWarp")) != nullptr);
+        win_->findChild<QPushButton*>(QStringLiteral("resetGridWarp"))->click();
+        QVERIFY(!fx(gridId).params.count(gridWarpPoint(1, 1) + ".dx"));
+        state()->setPaintEffect(0);
+        state()->setSelection({}, false);
+    }
+
     void restorationPaintInProgramMonitor() {
         loadDemo();
         // A Paint effect on the red clip, armed from the Inspector, painted on the Program monitor.

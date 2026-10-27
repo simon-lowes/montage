@@ -8,6 +8,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 
+#include "core/LinearSolve.h"
 #include "core/Ale.h"
 #include "core/FilmCount.h"
 #include "core/Paperwork.h"
@@ -6757,6 +6758,46 @@ private slots:
         QVERIFY(projectFromJson(projectToJson(p), back));
         QCOMPARE(back.active()->audioTracks.at(0), a1);
         QCOMPARE(back.active()->audioTracks.at(1).automation, int(AutomationMode::Read));
+    }
+
+    // A sparse positive definite matrix (a grid's Laplacian, a few rows held) factored in its envelope solves as the
+    // dense Cholesky does, whichever index of an off-diagonal entry is given first and with repeated entries summed.
+    void sparseCholeskySolves() {
+        const int w = 9, h = 7, n = w * h;
+        std::vector<SparseCholesky::Entry> entries;
+        std::vector<double> dense(size_t(n) * n, 0.0);
+        auto put = [&](int r, int c, double v) {
+            entries.push_back({r, c, v});
+            dense[size_t(r) * n + c] += v;
+            if (r != c) dense[size_t(c) * n + r] += v;
+        };
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x) {
+                const int i = y * w + x;
+                for (int j : {x + 1 < w ? i + 1 : -1, y + 1 < h ? i + w : -1}) {
+                    if (j < 0) continue;
+                    put(i, i, 1);
+                    put(j, j, 1);
+                    if ((i + j) % 2) put(i, j, -1);
+                    else put(j, i, -1);
+                }
+            }
+        put(0, 0, 100);
+        put(n - 1, n - 1, 50);
+        put(5, 5, 0.5);
+        put(5, 5, 0.5);
+        std::vector<double> b(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) b[size_t(i)] = std::sin(i * 0.7) + 0.1 * i;
+        std::vector<double> x = b, want = b;
+        SparseCholesky f;
+        QVERIFY(f.factor(n, entries));
+        QVERIFY(f.stored() < size_t(n) * n / 2);
+        f.solve(x);
+        QVERIFY(choleskySolve(dense, n, want));
+        for (int i = 0; i < n; ++i) QVERIFY(std::fabs(x[size_t(i)] - want[size_t(i)]) < 1e-9);
+        // Not positive definite: refused.
+        SparseCholesky g;
+        QVERIFY(!g.factor(2, {{0, 0, 1}, {1, 1, 1}, {0, 1, 2}}));
     }
 
     void filmMixAutomation() {

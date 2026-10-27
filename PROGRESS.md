@@ -1418,7 +1418,31 @@ The tenth gap analysis (`docs/research/phase11-roadmap.md`, October 2026) ranks 
     - Write To on a selection made in the timeline (it uses In and Out).
     - Copy and paste from a timeline selection (the mixer copies the armed tracks).
     - Trim lanes edited by hand in the timeline (drawn, not editable).
-- [ ] 3. Mesh and pin warp: as-rigid-as-possible deformation by pins, stiff areas, overlap order, and a grid warp (M)
+- [x] 3. Mesh and pin warp: as-rigid-as-possible deformation by pins, stiff areas, overlap order, and a grid warp (M)
+  - Done: `render/MeshWarp` lays a lattice over the picture's alpha, or the whole frame, about 2,000 vertices by default. The lattice does not depend on the picture, so a moving alpha keeps its vertices. Pins bend it as rigidly as it can, in Igarashi et al.'s two linear steps (similarity, then each triangle's turn with its size kept), followed by four as-rigid-as-possible refinement passes on the step-2 matrix. Both matrices are factored once per mesh and pin layout with a new sparse Cholesky (`core/LinearSolve` `SparseCholesky`, envelope storage after reverse Cuthill–McKee) and cached, so moving pins only solves right-hand sides. Pins are soft constraints held at a weight of 10^6. A part with no Position pin stays put, and a part with one moves with it. Pins are params `pin<k>.*` (`core/Effects` `meshPins`, `meshPinParams`, `addMeshPin`):
+    - Position pins are keyframed, or keyed from a region track of the footage (`trackMeshPins`, Track Position Pins).
+    - Stiff pins weight their area 1,000 times and give it one turn.
+    - Bend pins turn and scale the shape at rest round them, with a smooth falloff.
+    - Overlap pins give triangles a depth, and the picture is drawn back to front.
+  - Drawing is per triangle (bilinear, clamped at the edges), with edge functions shared by neighbouring triangles so each pixel is drawn once. It is parallel by row bands, so it is deterministic. Motion blur averages up to 32 renders through the shutter, as many as the pixels the mesh moves. Grid Warp (`grid_warp`, points `g<r>_<c>.dx/.dy`) moves a fine lattice smoothly (Catmull-Rom) or straight between the points. Pins and grid points are placed and dragged on the Program monitor (`app/PaintOverlay`). The Inspector has the pin kind, a pin list with Remove, Track Position Pins and Reset Points. MCP `montage_add_effect` takes `pins` (with keyed `path`) and the grid points.
+  - **Tests:**
+    - render `meshWarpStillPins`: pins left in place (with stiff, overlap and bend pins) leave the picture bit-identical.
+    - render `meshWarpMovesRigidly`: pins moved by one rotation and translation move every vertex within 0.25 px, and a square's centroid too.
+    - render `meshWarpBendsAStrip`: a strip held at one end, its far end pulled 30° round, keeps every triangle's area within 5 %. The plain warp (edges kept unturned) is off by well over 5 %.
+    - render `meshWarpStiffArea`: edges in a stiff area stay within 1 % of their length, against twice that and more without it.
+    - render `meshWarpOverlapOrder`: the part in front flips when the overlap pins' depths swap.
+    - render `meshWarpRendersAlike`: keyed pins with motion blur render the same frame alone, in sequence and on eight threads, and the blur changes the picture.
+    - render `gridWarpMovesPoints`: smooth and straight.
+    - core `sparseCholeskySolves`: matches the dense solve.
+    - app `meshWarpPinsInProgramMonitor`: placing, dragging, Stiff from the Inspector, Ctrl-click and Remove, and grid points.
+    - media `trackingAndStabilization`: tracked pins follow the footage's known jitter within 1 px, from the middle of the clip both ways.
+    - The MCP block in `mcpServerEditsProjects`.
+  - Not yet:
+    - Pins following a face landmark.
+    - Painting stiff areas with a brush (they are circles).
+    - The GPU path draws the warp from the CPU's picture, as it does for the other distortions; there is no GPU mesh.
+    - Grid Warp's points have no tangent handles.
+    - A thick strip bent hard stretches its outer edge, as elastic material does: the 5 % area check holds for a 30° bend at 4,000 vertices.
 - [ ] 4. Merging two copies of a project from their common version, with conflicts listed (M)
 - [ ] 5. Archival masters as IMF Application #5 (ACES 2065-1 OpenEXR in MXF) (S–M)
 - [ ] 6. SDR brought up into HDR by ITU-R BT.2446-1 methods A and C, and those methods for HDR to SDR (S)

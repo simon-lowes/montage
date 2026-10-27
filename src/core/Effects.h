@@ -114,6 +114,21 @@ std::vector<ParamInfo> textAnimatorParams(int k);
 // Adds text animation k to a title with its params at their defaults (a new k past the last when 0); returns k.
 int addTextAnimator(Effect& e, int k = 0);
 
+// A Mesh Warp's pins (render/MeshWarp.h): the k of each "pin<k>.kind" param it has, in order; a pin's kind (0
+// Position, 1 Stiff, 2 Bend, 3 Overlap); and the params a pin of that kind has, named "pin<k>.<name>" (effectParams
+// lists them after the effect's own). Positions are fractions of the frame: x and y where the pin sits on the picture at
+// rest, to_x and to_y where a Position pin moves it.
+std::vector<int> meshPins(const Effect& e);
+int meshPinKind(const Effect& e, int k);
+std::vector<ParamInfo> meshPinParams(int k, int kind);
+// Adds a pin of `kind` at (x, y) (past the last; its params at their defaults, a Position pin where it sits); returns k.
+int addMeshPin(Effect& e, int kind, double x, double y);
+void removeMeshPin(Effect& e, int k);
+// A Grid Warp's points: "g<r>_<c>" (r 0..rows, c 0..cols), each with params ".dx" and ".dy", how far it is moved (as
+// fractions of the frame); gridWarpParams lists them for its rows and columns.
+std::string gridWarpPoint(int r, int c);
+std::vector<ParamInfo> gridWarpParams(const Effect& e);
+
 // The mask every video filter can have (params "mask.*", absent = no mask):
 // an ellipse or rectangle in the clip's source frame (centre and size as
 // fractions of the frame, feather and expansion in sequence pixels), a drawn

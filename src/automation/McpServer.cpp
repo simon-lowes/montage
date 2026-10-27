@@ -2665,13 +2665,21 @@ void McpServer::Impl::addTools() {
         "models for the clip's cut-off (scripts/fetch-models.sh --bwe). "
         "lip_sync redraws the largest face's mouth and jaw to speak an audio track's sound (strings.track, e.g. \"A2\"; "
         "every track when empty), as a dub needs (MuseTalk; amount mixes it); it needs consent: true (the person shown has "
-        "agreed) and its models (scripts/fetch-models.sh --lipsync), and runs in exports and renders (about 4 s a frame on four cores).",
+        "agreed) and its models (scripts/fetch-models.sh --lipsync), and runs in exports and renders (about 4 s a frame on four cores). "
+        "mesh_warp bends the picture by `pins` as rigidly as it can (a mesh over its alpha, or the whole frame with mesh_from 1; "
+        "density vertices): each pin sits at x, y on the picture (fractions of the frame); a position pin is moved to to_x, "
+        "to_y, or keyed along path [{frame, x, y}]; a stiff pin keeps the area within radius (sequence pixels) in shape "
+        "(amount %); a bend pin turns (angle, degrees) and scales (scale %) the area round it; an overlap pin sets which "
+        "part is in front where it folds (depth -100..100 over radius); motion_blur 1 blurs along the mesh's motion "
+        "(shutter in degrees). grid_warp moves the points of a grid of rows x cols: params g<r>_<c>.dx and .dy (r 0..rows, "
+        "c 0..cols; fractions of the frame), smooth (shape 0) or straight (shape 1) between them.",
         R"json({"type":"object","properties":{"project":{"type":"string"},"clip":{"type":"number"},"effect":{"type":"string"},
             "consent":{"type":"boolean","description":"lip_sync: the person shown has agreed to it"},
             "params":{"type":"object","additionalProperties":{"type":"number"}},
             "strings":{"type":"object","additionalProperties":{"type":"string"},"description":"Text settings: curves (\"x,y x,y\"), hue curves, a LUT file, the Colour Warper's mesh (\"spoke,ring,hue,sat,luma;...\": spokes 0-11 every 30 degrees from red, rings 1-4 for saturation 25-100 %, hue moved in degrees, saturation in 0-1 units, brightness in stops)..."},
             "mask_path":{"type":"array","items":{"type":["array","object"]},"description":"A closed Bezier mask: three or more points, fractions of the clip's frame"},
             "mask_smooth":{"type":"boolean","default":false},
+            "pins":{"type":"array","items":{"type":"object","properties":{"kind":{"type":"string","enum":["position","stiff","bend","overlap"]},"x":{"type":"number"},"y":{"type":"number"},"to_x":{"type":"number"},"to_y":{"type":"number"},"path":{"type":"array","items":{"type":"object"}},"radius":{"type":"number"},"amount":{"type":"number"},"angle":{"type":"number"},"scale":{"type":"number"},"depth":{"type":"number"}},"required":["x","y"]},"description":"mesh_warp's pins"},
             "group_stage":{"type":"string","enum":["pre","post"],"description":"Add it to the clip's colour group instead: its pre-clip grade (before each member's own effects) or post-clip grade (after them)"},
             "node":{"type":"integer","description":"Into the clip's corrector node with this key (montage_grade_nodes); a shared node's goes into the shared node"},
             "shared":{"type":"number","description":"Into this shared node (montage_grade_nodes), seen by every clip using it"}},
@@ -2721,11 +2729,39 @@ void McpServer::Impl::addTools() {
             for (auto it = params.begin(); it != params.end(); ++it) {
                 std::string name = it.key().toStdString();
                 if (pluginParams && name.rfind("param.", 0) != 0 && name.rfind("mask.", 0) != 0) name = "param." + name;  // "amount" for "param.amount"
+                // (a Grid Warp's points, "g<r>_<c>.dx" and ".dy", as many as its rows and columns have)
+                static const QRegularExpression gridPoint(QStringLiteral("^g([0-9]|1[0-2])_([0-9]|1[0-2])\\.d[xy]$"));
                 const bool known = (pluginParams ? e.params.count(name) > 0
                                            : std::any_of(info->params.begin(), info->params.end(), [&](const ParamInfo& p) { return p.name == name; })) ||
-                                   (name.rfind("mask.", 0) == 0 && supportsMask(type));
+                                   (name.rfind("mask.", 0) == 0 && supportsMask(type)) || (type == "grid_warp" && gridPoint.match(it.key()).hasMatch());
                 if (!known) throw ArgError{QStringLiteral("\"%1\" has no parameter \"%2\"").arg(QString::fromStdString(type), it.key())};
                 e.params[name] = Param(it.value().toDouble());
+            }
+            if (a.contains("pins")) {
+                // A Mesh Warp's pins: each placed at x, y on the picture (fractions of the frame), a Position pin moved
+                // to to_x, to_y or keyed along `path`.
+                if (type != "mesh_warp") throw ArgError{"pins are a mesh_warp's"};
+                static const QStringList kinds{"position", "stiff", "bend", "overlap"};
+                for (const QJsonValue& v : a.value("pins").toArray()) {
+                    const QJsonObject pin = v.toObject();
+                    const int kind = int(kinds.indexOf(pin.value("kind").toString("position")));
+                    if (kind < 0) throw ArgError{"A pin's kind is position, stiff, bend or overlap"};
+                    if (!pin.value("x").isDouble() || !pin.value("y").isDouble()) throw ArgError{"Each pin needs x and y"};
+                    const int k = addMeshPin(e, kind, pin.value("x").toDouble(), pin.value("y").toDouble());
+                    const std::string pre = "pin" + std::to_string(k) + ".";
+                    for (const ParamInfo& pi : meshPinParams(k, kind)) {
+                        const QString field = QString::fromStdString(pi.name.substr(pre.size()));
+                        if (field != "kind" && field != "x" && field != "y" && pin.value(field).isDouble())
+                            e.params[pi.name] = Param(pin.value(field).toDouble());
+                    }
+                    for (const QJsonValue& key : pin.value("path").toArray()) {
+                        const QJsonObject o = key.toObject();
+                        if (kind != 0 || !o.value("x").isDouble() || !o.value("y").isDouble())
+                            throw ArgError{"A path is a Position pin's keys: {frame, x, y}, the frame counted from the clip's start"};
+                        e.params[pre + "to_x"].addKey(FrameTime(o.value("frame").toInteger()), o.value("x").toDouble());
+                        e.params[pre + "to_y"].addKey(FrameTime(o.value("frame").toInteger()), o.value("y").toDouble());
+                    }
+                }
             }
             const QJsonObject strings = a.value("strings").toObject();
             for (auto it = strings.begin(); it != strings.end(); ++it) {

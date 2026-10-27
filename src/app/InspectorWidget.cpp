@@ -72,6 +72,7 @@
 #include "render/OGraf.h"
 #include "render/Restoration.h"
 #include "render/FilmScan.h"
+#include "render/MeshWarp.h"
 #include "render/Ocio.h"
 
 namespace montage {
@@ -180,6 +181,10 @@ QString InspectorWidget::signature() const {
         // A film scan's status line: rebuild when its reference or base is taken.
         if (e.type == "perf_lock") sig += QString("r%1").arg(perforationsFromString(e.s("reference"), 1, 1).size());
         if (e.type == "film_negative") sig += QString("b%1").arg(std::lround(e.p("base_from", 0)));
+        // A Mesh Warp's pins and a Grid Warp's points: rebuild when a pin is added or removed, or the grid resized.
+        if (e.type == "mesh_warp")
+            for (int k : meshPins(e)) sig += QString("p%1k%2").arg(k).arg(meshPinKind(e, k));
+        if (e.type == "grid_warp") sig += QString("g%1x%2").arg(std::lround(e.p("rows", 0, 3))).arg(std::lround(e.p("cols", 0, 3)));
     }
     // Its colour nodes: rebuild when one is added, picked, renamed or shared, or a shared one's effects change.
     if (!c->grade.empty()) {
@@ -1020,6 +1025,87 @@ void InspectorWidget::buildEffectStack(Id owner, TrackKind kind, const std::vect
                 const QSignalBlocker block(pick);
                 pick->setChecked(state_->paintEffect() == eid);
             });
+        }
+        if ((e.type == "mesh_warp" || e.type == "grid_warp") && onClip) {
+            // Pins are placed and dragged, and grid points dragged, on the Program monitor (app/PaintOverlay).
+            const bool mesh = e.type == "mesh_warp";
+            auto* row = new QWidget(content_);
+            auto* rh = new QHBoxLayout(row);
+            rh->setContentsMargins(0, 0, 0, 0);
+            auto* arm = new QPushButton(mesh ? tr("Pins on the Monitor") : tr("Points on the Monitor"), row);
+            arm->setObjectName(QStringLiteral("warpOnMonitor"));
+            arm->setCheckable(true);
+            arm->setChecked(state_->paintEffect() == eid);
+            arm->setToolTip(mesh ? tr("Click the Program monitor to place a pin of the kind chosen; drag a pin to move it (a key "
+                                      "there when it is keyed); Ctrl-click a pin to remove it. Esc stops.")
+                                 : tr("Drag the grid's points on the Program monitor (a key there when they are keyed). Esc stops."));
+            connect(arm, &QPushButton::toggled, this, [this, eid](bool on) {
+                if (on) state_->setPaintEffect(eid);
+                else if (state_->paintEffect() == eid) state_->setPaintEffect(0);
+            });
+            connect(state_, &EditorState::paintEffectChanged, arm, [this, arm, eid] {
+                const QSignalBlocker block(arm);
+                arm->setChecked(state_->paintEffect() == eid);
+            });
+            if (mesh) {
+                auto* kind = new QComboBox(row);
+                kind->setObjectName(QStringLiteral("meshPinKind"));
+                kind->addItems({tr("Position Pin"), tr("Stiff Pin"), tr("Bend Pin"), tr("Overlap Pin")});
+                kind->setCurrentIndex(state_->meshPinKind());
+                kind->setToolTip(tr("What a click on the monitor places: a pin that moves the picture, an area that keeps its "
+                                    "shape, a point the picture turns and scales about, or which part is in front where it folds"));
+                connect(kind, &QComboBox::currentIndexChanged, this, [this](int i) { state_->setMeshPinKind(i); });
+                rh->addWidget(kind);
+            }
+            rh->addWidget(arm);
+            rh->addStretch(1);
+            f->addRow(mesh ? tr("Pins:") : tr("Grid:"), row);
+            if (mesh && !meshPins(e).empty()) {
+                auto* edits = new QWidget(content_);
+                auto* eh = new QHBoxLayout(edits);
+                eh->setContentsMargins(0, 0, 0, 0);
+                auto* which = new QComboBox(edits);
+                which->setObjectName(QStringLiteral("meshPinList"));
+                static const char* kinds[] = {QT_TR_NOOP("Position"), QT_TR_NOOP("Stiff"), QT_TR_NOOP("Bend"), QT_TR_NOOP("Overlap")};
+                for (int k : meshPins(e)) which->addItem(tr("Pin %1 (%2)").arg(k).arg(tr(kinds[meshPinKind(e, k)])), k);
+                auto* remove = new QPushButton(tr("Remove"), edits);
+                remove->setObjectName(QStringLiteral("removeMeshPin"));
+                connect(remove, &QPushButton::clicked, this, [this, owner, eid, which] {
+                    const int k = which->currentData().toInt();
+                    state_->edit(tr("Remove Pin"), [owner, eid, k](Project&, Sequence& sq) {
+                        Effect* ef = edit::ownedEffect(sq, owner, eid);
+                        if (!ef || meshPins(*ef).empty()) return false;
+                        removeMeshPin(*ef, k);
+                        return true;
+                    });
+                });
+                auto* track = new QPushButton(tr("Track Position Pins"), edits);
+                track->setObjectName(QStringLiteral("trackMeshPins"));
+                track->setToolTip(tr("Key each Position pin to follow what is under it in the footage, tracked from the playhead "
+                                     "to both ends of the clip"));
+                connect(track, &QPushButton::clicked, this, [this, owner, eid] {
+                    QTimer::singleShot(0, this, [this, owner, eid] { trackWarpPins(owner, eid); });
+                });
+                eh->addWidget(which);
+                eh->addWidget(remove);
+                eh->addWidget(track);
+                eh->addStretch(1);
+                f->addRow(QString(), edits);
+            }
+            if (!mesh) {
+                auto* reset = new QPushButton(tr("Reset Points"), content_);
+                reset->setObjectName(QStringLiteral("resetGridWarp"));
+                connect(reset, &QPushButton::clicked, this, [this, owner, eid] {
+                    state_->edit(tr("Reset Grid"), [owner, eid](Project&, Sequence& sq) {
+                        Effect* ef = edit::ownedEffect(sq, owner, eid);
+                        if (!ef) return false;
+                        return std::erase_if(ef->params, [](const auto& kv) {
+                                   return kv.first.size() > 3 && kv.first[0] == 'g' && (kv.first.ends_with(".dx") || kv.first.ends_with(".dy"));
+                               }) > 0;
+                    });
+                });
+                f->addRow(QString(), reset);
+            }
         }
         if ((e.type == "paint" || e.type == "dust_spots") && onClip) {
             // Strokes and spots are drawn on the Program monitor while the effect is armed (app/PaintOverlay).
@@ -3357,6 +3443,33 @@ void InspectorWidget::analyzeDepth(Id clip) {
     // Drawn again with it (nothing in the project changed).
     state_->amend([](Project&, Sequence&) { return true; });
     state_->message(tr("Depth analysed over the clip: depth effects on it are steady"), 4000);
+}
+
+void InspectorWidget::trackWarpPins(Id clip, Id effect) {
+    const Sequence* s = state_->sequence();
+    const Clip* c = s ? edit::clipById(*s, clip) : nullptr;
+    if (!c || c->duration <= 0 || !edit::ownedEffect(const_cast<Sequence&>(*s), clip, effect)) return;
+    const FrameTime at = std::clamp<FrameTime>(state_->playhead() - c->start, 0, c->duration - 1);
+    auto project = std::make_shared<const Project>(state_->project());
+    const Id seqId = s->id;
+    std::map<int, std::pair<Param, Param>> keys;
+    const bool ok = runAnalysis(tr("Tracking pins..."), [&, project, seqId](const auto& progress, const auto* cancel, std::string* err) {
+        Sequence* sq = const_cast<Sequence*>(project->findSequence(seqId));
+        const Clip* cl = sq ? edit::clipById(*sq, clip) : nullptr;
+        const Effect* ef = sq ? edit::ownedEffect(*sq, clip, effect) : nullptr;
+        return cl && ef && trackMeshPins(*project, *sq, *cl, *ef, at, keys, [&](double f) { progress(f); return !*cancel; }, err);
+    });
+    if (!ok) return;
+    state_->edit(tr("Track Pins"), [clip, effect, keys](Project&, Sequence& sq) {
+        Effect* ef = edit::ownedEffect(sq, clip, effect);
+        if (!ef) return false;
+        for (const auto& [k, xy] : keys) {
+            ef->params["pin" + std::to_string(k) + ".to_x"] = xy.first;
+            ef->params["pin" + std::to_string(k) + ".to_y"] = xy.second;
+        }
+        return true;
+    });
+    state_->message(tr("Tracked %n pin(s)", "", int(keys.size())), 4000);
 }
 
 void InspectorWidget::followFocusOn(Id clip, Id effect, FocusTarget target) {

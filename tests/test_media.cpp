@@ -54,6 +54,7 @@
 #include "core/MediaLog.h"
 #include "core/Multicam.h"
 #include "core/Effects.h"
+#include "render/MeshWarp.h"
 #include "core/Expression.h"
 #include "core/ProjectIO.h"
 #include "render/GrainMatch.h"
@@ -22137,6 +22138,43 @@ if ui["pressed"] == "add":
         QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
         r = tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "gaussian_blur"}, {"params", QJsonObject{{"no_such", 1}}}});
         QVERIFY(r.value("isError").toBool() && text(r).contains("no_such"));
+        // A Mesh Warp with pins (a keyed Position pin, a Stiff one), and a Grid Warp with a point moved; pins are a Mesh Warp's.
+        r = tool("montage_add_effect",
+                 QJsonObject{{"project", project}, {"clip", second}, {"effect", "mesh_warp"},
+                             {"pins", QJsonArray{QJsonObject{{"x", 0.2}, {"y", 0.5}},
+                                                 QJsonObject{{"x", 0.8}, {"y", 0.5}, {"path", QJsonArray{QJsonObject{{"frame", 0}, {"x", 0.8}, {"y", 0.5}},
+                                                                                                           QJsonObject{{"frame", 5}, {"x", 0.7}, {"y", 0.6}}}}},
+                                                 QJsonObject{{"kind", "stiff"}, {"x", 0.5}, {"y", 0.5}, {"radius", 40}}}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const Id meshFx = Id(r.value("structuredContent").toObject().value("effect_id").toDouble());
+        r = tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "grid_warp"},
+                                                   {"params", QJsonObject{{"rows", 2}, {"cols", 2}, {"g1_1.dx", 0.05}}}});
+        QVERIFY2(!r.value("isError").toBool(), qPrintable(text(r)));
+        const Id gridFx = Id(r.value("structuredContent").toObject().value("effect_id").toDouble());
+        QVERIFY(tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "invert"},
+                                                       {"pins", QJsonArray{QJsonObject{{"x", 0.2}, {"y", 0.5}}}}}).value("isError").toBool());
+        QVERIFY(tool("montage_add_effect", QJsonObject{{"project", project}, {"clip", second}, {"effect", "mesh_warp"},
+                                                       {"pins", QJsonArray{QJsonObject{{"kind", "pinch"}, {"x", 0.2}, {"y", 0.5}}}}}).value("isError").toBool());
+        {
+            Project warped;
+            QVERIFY(loadProject(project.toStdString(), warped));
+            const Clip* c = edit::clipById(*warped.active(), Id(second));
+            QVERIFY(c);
+            const Effect* mesh = nullptr;
+            const Effect* grid = nullptr;
+            for (const Effect& ef : c->effects) {
+                if (ef.id == meshFx) mesh = &ef;
+                if (ef.id == gridFx) grid = &ef;
+            }
+            QVERIFY(mesh && grid);
+            QCOMPARE(meshPins(*mesh), (std::vector<int>{1, 2, 3}));
+            QCOMPARE(meshPinKind(*mesh, 3), 1);
+            QCOMPARE(mesh->p("pin3.radius", 0), 40.0);
+            QCOMPARE(mesh->params.at("pin2.to_x").keys.size(), size_t(2));
+            QVERIFY(std::fabs(mesh->p("pin2.to_y", 5) - 0.6) < 1e-9 && mesh->p("pin1.to_x", 3) == 0.2);
+            QCOMPARE(grid->p(gridWarpPoint(1, 1) + ".dx", 0), 0.05);
+            QCOMPARE(gridWarpPointAt(*grid, 0, 1, 1)[0], 0.55);
+        }
         // A drawn Bezier mask from frame fractions (a curved point among corners); too few points refused.
         r = tool("montage_add_effect",
                  QJsonObject{{"project", project}, {"clip", second}, {"effect", "gaussian_blur"},
@@ -23459,6 +23497,24 @@ if ui["pressed"] == "add":
         p.media.push_back(mi);
         QVERIFY(edit::placeMedia(p, s, mi.id, 0, 10, 35, {TrackKind::Video, 0}, {TrackKind::Audio, 0}, false).ok);
         Clip& clip = trackAt(s, {TrackKind::Video, 0})->clips.at(0);
+        // A Mesh Warp's Position pins keyed to follow what is under them, from the middle of the clip both ways.
+        {
+            Effect warp = makeEffect(p, "mesh_warp");
+            addMeshPin(warp, 0, 0.45, 0.5);
+            addMeshPin(warp, 2, 0.6, 0.5);  // (a Bend pin is not tracked)
+            std::map<int, std::pair<Param, Param>> keys;
+            QVERIFY2(trackMeshPins(p, s, clip, warp, 12, keys, {}, &err), err.c_str());
+            QCOMPARE(int(keys.size()), 1);
+            const Param& kx = keys.at(1).first;
+            const Param& ky = keys.at(1).second;
+            QVERIFY2(int(kx.keys.size()) == int(clip.duration), qPrintable(QString("%1 keys, %2 frames").arg(kx.keys.size()).arg(clip.duration)));
+            double worst = 0;
+            for (FrameTime f = 0; f < clip.duration; ++f)
+                worst = std::max({worst, std::fabs((kx.at(f) - kx.at(12)) * 320 - (jitter[size_t(10 + f)].x - jitter[22].x)),
+                                  std::fabs((ky.at(f) - ky.at(12)) * 180 - (jitter[size_t(10 + f)].y - jitter[22].y))});
+            QVERIFY2(worst < 1.0, qPrintable(QString::number(worst)));
+            QCOMPARE(kx.at(12), 0.45);
+        }
         // Stabilize: frame-to-frame differences shrink to almost nothing when locked.
         std::string motion;
         QVERIFY2(analyzeClipStabilization(p, s, clip, motion, {}, nullptr, &err), err.c_str());
