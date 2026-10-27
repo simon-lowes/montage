@@ -13459,8 +13459,8 @@ colorspaces:
 
     // The GPU compositor draws a frame the same as the CPU renderer: media through its input transform, the colour
     // effects it has (a LUT, Color Correct, Curves, Hue Curves), scaled, rotated and cropped layers in every blend mode,
-    // a cross dissolve, a layer made on the CPU (with Light Rays and Aperture Glare), and the display conversion.
-    // Skipped where there is no GPU.
+    // a cross dissolve, a layer made on the CPU (and one with Light Rays and Aperture Glare), and the display
+    // conversion. Skipped where there is no GPU.
     void gpuCompositorMatchesCpu() {
         std::string why;
         if (!gpu::initialize(&why)) QSKIP(why.c_str());
@@ -13535,15 +13535,8 @@ colorspaces:
         hue.strings["hue_sat"] = "0,0.5 0.3,0.8 0.6,0.3 0.9,0.5";
         hue.strings["luma_sat"] = "0,0.3 0.5,0.5 1,0.6";
         top->effects.push_back(hue);
-        // V3: a colour generator with light rays and aperture glare, made on the CPU and composited on the GPU.
+        // V3: a colour generator, made on the CPU and composited on the GPU.
         Clip gen = colorClip(p, 0.2f, 0.9f, 0.4f, 0, 80);
-        Effect rays = makeEffect(p, "light_rays");
-        rays.params["threshold"] = 0.5;
-        gen.effects.push_back(rays);
-        Effect glare = makeEffect(p, "aperture_glare");
-        glare.params["threshold"] = 0.6;
-        glare.params["size"] = 20.0;
-        gen.effects.push_back(glare);
         gen.motion.params["scale"] = 30.0;
         gen.motion.params["pos_x"] = 100.0;
         gen.motion.params["pos_y"] = 50.0;
@@ -13665,6 +13658,21 @@ colorspaces:
         compare(20, o, "color space transform");
         QVERIFY(gpu::stats().cpuLayers > 0);
         graded->effects.erase(graded->effects.begin() + 1);
+        // Light Rays and Aperture Glare are worked out on the CPU too, and the layer they make drawn there.
+        {
+            Clip* generated = s.videoTracks[2].clips.empty() ? nullptr : &s.videoTracks[2].clips[0];
+            QVERIFY(generated);
+            Effect rays = makeEffect(p, "light_rays");
+            rays.params["threshold"] = 0.5;
+            Effect glare = makeEffect(p, "aperture_glare");
+            glare.params["threshold"] = 0.6;
+            glare.params["size"] = 20.0;
+            generated->effects = {rays, glare};
+            gpu::resetStats();
+            compare(20, o, "light rays and aperture glare");
+            QVERIFY(gpu::stats().cpuLayers > 0);
+            generated->effects.clear();
+        }
         // As grade nodes in series, one with a window and a qualifier at 60 %, one faded to 50 %; then beside another
         // through a parallel mixer, which the GPU leaves to the CPU.
         const Id topId = r2.created[0];
