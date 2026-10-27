@@ -8109,6 +8109,45 @@ private slots:
         for (int i = 1; i < 6; i += 2) QVERIFY(groupOf(shots[i]) && groupOf(shots[i]) != first);
     }
 
+    void mcpLightRaysAndGlare() {
+        // Light Rays and Aperture Glare added over MCP, with their parameters, and run in the render.
+        Project p = makeDefaultProject();
+        Sequence& s = *p.active();
+        s.width = 160, s.height = 90;
+        Clip c = makeGeneratorClip(p, "color", 10);
+        c.generator.params["color.r"] = 1.0, c.generator.params["color.g"] = 1.0, c.generator.params["color.b"] = 1.0;
+        QVERIFY(edit::overwrite(p, s, {TrackKind::Video, 0}, c).ok);
+        const double clip = double(s.videoTracks[0].clips[0].id);
+        const QString project = QString::fromStdString(path("light-mcp.montage"));
+        QVERIFY(saveProject(p, project.toStdString()));
+        McpServer server;
+        int rid = 1;
+        auto call = [&](const char* name, QJsonObject args) {
+            args["project"] = project;
+            const QJsonObject req{{"jsonrpc", "2.0"}, {"id", rid++}, {"method", "tools/call"},
+                                  {"params", QJsonObject{{"name", name}, {"arguments", args},
+                                                         {"_meta", QJsonObject{{"io.modelcontextprotocol/protocolVersion", "2026-07-28"},
+                                                                               {"io.modelcontextprotocol/clientCapabilities", QJsonObject{}}}}}}};
+            const auto lines = server.handle(QJsonDocument(req).toJson(QJsonDocument::Compact).toStdString());
+            return QJsonDocument::fromJson(QByteArray::fromStdString(lines.back())).object().value("result").toObject();
+        };
+        QJsonObject r = call("montage_add_effect", {{"clip", clip}, {"effect", "aperture_glare"}, {"params", QJsonObject{{"blades", 7}, {"size", 30}, {"threshold", 0.5}}}});
+        QVERIFY(!r.value("isError").toBool());
+        r = call("montage_add_effect", {{"clip", clip}, {"effect", "light_rays"}, {"params", QJsonObject{{"pos_x", 0.2}, {"block", 50}}}});
+        QVERIFY(!r.value("isError").toBool());
+        Project q;
+        QVERIFY(loadProject(project.toStdString(), q));
+        const Clip* back = edit::clipById(*q.active(), Id(clip));
+        QVERIFY(back && back->effects.size() == 2);
+        QCOMPARE(back->effects[0].type, std::string("aperture_glare"));
+        QCOMPARE(back->effects[0].p("blades", 0, 0), 7.0);
+        QCOMPARE(back->effects[1].p("pos_x", 0, 0), 0.2);
+        // White above both thresholds: the glare and the rays add light.
+        RenderOptions o;
+        const Image frame = renderProgramFrame(q, *q.active(), 0, o);
+        QVERIFY2(frame.at(80, 45)[1] > 1.2f, qPrintable(QString::number(frame.at(80, 45)[1])));
+    }
+
     void mcpSpellCheck() {
         Project p = makeDefaultProject();
         Sequence& s = *p.active();

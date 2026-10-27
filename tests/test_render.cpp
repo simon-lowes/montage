@@ -46,6 +46,7 @@
 #include "render/HdrView.h"
 #include "render/Compositor.h"
 #include "render/ShotGroups.h"
+#include "render/StyleFx.h"
 #include "render/Particles.h"
 #include "render/Titles.h"
 #include "core/Expression.h"
@@ -3653,6 +3654,146 @@ colorspaces:
         QVERIFY2((at(10, 10, 10), near(c[2], 1)), qPrintable(at(10, 10, 10)));
         key.params["track"] = 2.0;
         QVERIFY2((at(10, 10, 10), near(c[0], 1) && near(c[2], 0)), qPrintable(at(10, 10, 10)));
+    }
+
+    void lightRaysAndApertureGlare() {
+        Project p;
+        auto fx = [&](const char* type, std::initializer_list<std::pair<const char*, double>> params) {
+            if (!findEffectInfo(type)) qFatal("no effect %s", type);
+            Effect e = makeEffect(p, type);
+            for (const auto& [k, v] : params) e.params[k] = v;
+            return e;
+        };
+        QCOMPARE(effectDomain("light_rays"), EffectDomain::Linear);
+        QCOMPARE(effectDomain("aperture_glare"), EffectDomain::Linear);
+        // A round aperture's pattern is the Airy pattern: its first dark ring at 1.22 lambda / D, growing with the
+        // wavelength.
+        sfx::ApertureShape round;
+        round.rounding = 1;
+        for (double nm : {550.0, 700.0}) {
+            const int size = 201, c = 100;
+            const std::vector<double> airy = sfx::apertureDiffraction(round, nm, size, 20);
+            int i = 1;
+            while (i + 1 < c && !(airy[size_t(c) * size + size_t(c + i)] < airy[size_t(c) * size + size_t(c + i - 1)] &&
+                                  airy[size_t(c) * size + size_t(c + i)] <= airy[size_t(c) * size + size_t(c + i + 1)]))
+                ++i;
+            const double a = airy[size_t(c) * size + size_t(c + i - 1)], b = airy[size_t(c) * size + size_t(c + i)],
+                         d = airy[size_t(c) * size + size_t(c + i + 1)];
+            const double ring = i + 0.5 * (a - d) / (a - 2 * b + d);  // (the minimum between the samples)
+            const double expected = 1.22 * 20 * nm / 550;
+            QVERIFY2(std::fabs(ring - expected) < 0.02 * expected, qPrintable(QStringLiteral("%1 nm: %2 px, %3 expected").arg(nm).arg(ring).arg(expected)));
+        }
+        // Six blades give six spikes and seven give fourteen.
+        for (int blades : {6, 7}) {
+            sfx::ApertureShape shape;
+            shape.blades = blades;
+            shape.rotation = 10;
+            const int size = 301, c = 150;
+            const std::vector<double> pattern = sfx::apertureDiffraction(shape, 550, size, 4);
+            constexpr int kSteps = 1440;
+            std::vector<double> ring(kSteps);
+            for (int k = 0; k < kSteps; ++k) {
+                const double a = 2 * M_PI * k / kSteps, x = c + 80 * std::cos(a), y = c + 80 * std::sin(a);
+                const int x0 = int(x), y0 = int(y);
+                const double fx0 = x - x0, fy0 = y - y0;
+                auto at = [&](int xi, int yi) { return pattern[size_t(yi) * size + size_t(xi)]; };
+                ring[size_t(k)] = (at(x0, y0) * (1 - fx0) + at(x0 + 1, y0) * fx0) * (1 - fy0) + (at(x0, y0 + 1) * (1 - fx0) + at(x0 + 1, y0 + 1) * fx0) * fy0;
+            }
+            std::vector<double> sorted = ring;
+            std::nth_element(sorted.begin(), sorted.begin() + kSteps / 2, sorted.end());
+            const double median = sorted[kSteps / 2];
+            int spikes = 0;
+            const int window = kSteps / (8 * blades);
+            for (int k = 0; k < kSteps; ++k) {
+                bool peak = ring[size_t(k)] > 4 * median;
+                for (int j = -window; j <= window && peak; ++j)
+                    if (j && ring[size_t((k + j + kSteps) % kSteps)] >= ring[size_t(k)]) peak = false;
+                spikes += peak;
+            }
+            QCOMPARE(spikes, blades % 2 ? 2 * blades : blades);
+        }
+        // Each channel of the kernel sums to 1.
+        sfx::ApertureShape seven;
+        seven.blades = 7;
+        seven.rounding = 0.3;
+        const std::vector<float> kernel = sfx::apertureKernel(seven, 40);
+        QCOMPARE(kernel.size(), size_t(81 * 81 * 3));
+        for (int ch = 0; ch < 3; ++ch) {
+            double sum = 0;
+            for (size_t k = size_t(ch); k < kernel.size(); k += 3) sum += kernel[k];
+            QVERIFY2(std::fabs(sum - 1) < 1e-6, qPrintable(QString::number(sum - 1)));
+        }
+        // So a picture with nothing above the threshold is unchanged, and a highlight's light above it is spread
+        // without being lost.
+        Image calm(256, 256);
+        for (int y = 0; y < 256; ++y)
+            for (int x = 0; x < 256; ++x) {
+                float* q = calm.at(x, y);
+                q[0] = q[1] = q[2] = float(x) / 256, q[3] = 1;
+            }
+        Image same = calm;
+        applyVideoEffect(fx("aperture_glare", {{"threshold", 1.0}, {"size", 40}}), 0, same, 1);
+        QVERIFY(same.px == calm.px);
+        Image point(256, 256);
+        for (int y = 0; y < 256; ++y)
+            for (int x = 0; x < 256; ++x) point.at(x, y)[3] = 1;
+        std::fill_n(point.at(128, 128), 3, 5.0f);
+        Image glared = point;
+        applyVideoEffect(fx("aperture_glare", {{"threshold", 1.0}, {"size", 40}, {"intensity", 1.0}}), 0, glared, 1);
+        for (int ch = 0; ch < 3; ++ch) {
+            double added = 0;
+            for (int y = 0; y < 256; ++y)
+                for (int x = 0; x < 256; ++x) added += glared.at(x, y)[ch] - point.at(x, y)[ch];
+            QVERIFY2(std::fabs(added - 4) < 0.04, qPrintable(QString::number(added)));
+        }
+        // Six straight blades (a corner at 0 degrees): a spike straight down, little between the spikes, nothing beyond the
+        // kernel's 40 px.
+        QVERIFY(glared.at(128, 148)[1] > 20 * glared.at(148, 128)[1] && glared.at(188, 128)[1] < 1e-6f);
+
+        // Light Rays: a bright point gives a ray straight out from the centre, beyond the point, and nothing towards
+        // the centre or to the side.
+        Image dark(320, 180);
+        for (int y = 0; y < 180; ++y)
+            for (int x = 0; x < 320; ++x) dark.at(x, y)[3] = 1;
+        Image lit = dark;
+        for (int y = 59; y <= 61; ++y)
+            for (int x = 219; x <= 221; ++x) std::fill_n(lit.at(x, y), 3, 8.0f);
+        Image rays = lit;
+        applyVideoEffect(fx("light_rays", {{"pos_x", 0.5}, {"pos_y", 0.5}}), 0, rays, 1);
+        auto added = [&](const Image& a, int x, int y) { return a.at(x, y)[1] - lit.at(x, y)[1]; };
+        QVERIFY2(added(rays, 250, 45) > 0.005f, qPrintable(QString::number(added(rays, 250, 45))));  // on the line from (160, 90) through (220, 60)
+        QVERIFY(added(rays, 250, 55) < 1e-4f && added(rays, 250, 35) < 1e-4f);                         // beside it
+        QVERIFY(added(rays, 190, 75) < 1e-4f);                                                         // between it and the centre
+        QVERIFY(added(rays, 250, 45) > added(rays, 280, 30));                                          // fading further out
+        // Nothing above the threshold, or no intensity: unchanged.
+        Image none = dark;
+        applyVideoEffect(fx("light_rays", {}), 0, none, 1);
+        QVERIFY(none.px == dark.px);
+        Image off = lit;
+        applyVideoEffect(fx("light_rays", {{"intensity", 0.0}}), 0, off, 1);
+        QVERIFY(off.px == lit.px);
+        // Centred on the mask as tracked (the mask then not a limit): from (96, 90), the ray runs on to the right.
+        Image level = dark;
+        for (int y = 89; y <= 91; ++y)
+            for (int x = 219; x <= 221; ++x) std::fill_n(level.at(x, y), 3, 8.0f);
+        Image followed = level;
+        applyVideoEffect(fx("light_rays", {{"follow", 1.0}, {"pos_x", 0.9}, {"mask.shape", 1.0}, {"mask.x", 0.3}, {"mask.y", 0.5}, {"mask.w", 0.05}, {"mask.h", 0.05}}),
+                         0, followed, 1);
+        QVERIFY(followed.at(250, 90)[1] > 0.005f && followed.at(190, 90)[1] < 1e-4f);
+        // Shadows Block Rays: a dark bar across the ray stops it beyond the bar.
+        Image white = dark;
+        for (int y = 0; y < 180; ++y)
+            for (int x = 0; x < 320; ++x) std::fill_n(white.at(x, y), 3, 1.0f);
+        for (int y = 89; y <= 91; ++y)
+            for (int x = 219; x <= 221; ++x) std::fill_n(white.at(x, y), 3, 8.0f);
+        for (int y = 70; y < 110; ++y)
+            for (int x = 240; x < 246; ++x) std::fill_n(white.at(x, y), 3, 0.0f);
+        Image open = white, blocked = white;
+        applyVideoEffect(fx("light_rays", {{"threshold", 1.0}, {"pos_y", 0.5}}), 0, open, 1);
+        applyVideoEffect(fx("light_rays", {{"threshold", 1.0}, {"pos_y", 0.5}, {"block", 100.0}}), 0, blocked, 1);
+        const float beyondOpen = open.at(260, 90)[1] - 1, beyondBlocked = blocked.at(260, 90)[1] - 1;
+        QVERIFY2(beyondOpen > 0.005f && beyondBlocked < 0.1f * beyondOpen, qPrintable(QStringLiteral("%1 %2").arg(beyondOpen).arg(beyondBlocked)));
+        QVERIFY(blocked.at(230, 90)[1] - 1 > 0.5f * (open.at(230, 90)[1] - 1));  // (before the bar the ray is there)
     }
 
     void distortAndStylize() {
@@ -13318,7 +13459,8 @@ colorspaces:
 
     // The GPU compositor draws a frame the same as the CPU renderer: media through its input transform, the colour
     // effects it has (a LUT, Color Correct, Curves, Hue Curves), scaled, rotated and cropped layers in every blend mode,
-    // a cross dissolve, a layer made on the CPU, and the display conversion. Skipped where there is no GPU.
+    // a cross dissolve, a layer made on the CPU (with Light Rays and Aperture Glare), and the display conversion.
+    // Skipped where there is no GPU.
     void gpuCompositorMatchesCpu() {
         std::string why;
         if (!gpu::initialize(&why)) QSKIP(why.c_str());
@@ -13393,8 +13535,15 @@ colorspaces:
         hue.strings["hue_sat"] = "0,0.5 0.3,0.8 0.6,0.3 0.9,0.5";
         hue.strings["luma_sat"] = "0,0.3 0.5,0.5 1,0.6";
         top->effects.push_back(hue);
-        // V3: a colour generator, made on the CPU and composited on the GPU.
+        // V3: a colour generator with light rays and aperture glare, made on the CPU and composited on the GPU.
         Clip gen = colorClip(p, 0.2f, 0.9f, 0.4f, 0, 80);
+        Effect rays = makeEffect(p, "light_rays");
+        rays.params["threshold"] = 0.5;
+        gen.effects.push_back(rays);
+        Effect glare = makeEffect(p, "aperture_glare");
+        glare.params["threshold"] = 0.6;
+        glare.params["size"] = 20.0;
+        gen.effects.push_back(glare);
         gen.motion.params["scale"] = 30.0;
         gen.motion.params["pos_x"] = 100.0;
         gen.motion.params["pos_y"] = 50.0;

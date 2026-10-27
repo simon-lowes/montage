@@ -897,6 +897,19 @@ std::vector<EffectInfo> buildCatalog() {
                       pct("brightness", "Brightness", 0, 300, 100), choice("lens", "Lens", {"50-300mm Zoom", "35mm Prime", "105mm Prime", "Anamorphic"}, 0),
                       color("color", "Colour", 1, 0.9, 0.75), pct("ghosts", "Ghosts", 0, 200, 100)},
                      {}});
+        // Light from the picture's bright parts streaming out from a centre, and the spikes and glare a lens's aperture
+        // makes of highlights, both in scene light (render/StyleFx.h).
+        c.push_back({"light_rays", "Light Rays", EffectCategory::VideoFilter, "Stylize",
+                     {num("pos_x", "Centre X", -0.5, 1.5, 0.5, 0.001), num("pos_y", "Centre Y", -0.5, 1.5, 0.25, 0.001),
+                      choice("follow", "Centre From", {"Centre X and Y", "The Mask's Track"}, 0), num("threshold", "Threshold", 0, 4, 0.8, 0.005),
+                      pct("length", "Length", 0, 100, 60), pct("decay", "Decay", 0, 100, 50), num("intensity", "Intensity", 0, 10, 1, 0.01),
+                      color("color", "Colour", 1, 0.95, 0.85), pct("block", "Shadows Block Rays", 0, 100, 0)},
+                     {}});
+        c.push_back({"aperture_glare", "Aperture Glare", EffectCategory::VideoFilter, "Stylize",
+                     {num("threshold", "Threshold", 0, 16, 1, 0.01), num("intensity", "Intensity", 0, 10, 1, 0.01),
+                      num("blades", "Aperture Blades", 3, 16, 6, 1), pct("rounding", "Blade Rounding", 0, 100, 0), angle("rotation", "Rotation", 0),
+                      num("size", "Size (px)", 10, 600, 200, 1)},
+                     {}});
         // Holds each frame for a few (handled where the clip's frame is chosen).
         c.push_back({"stop_motion", "Stop Motion", EffectCategory::VideoFilter, "Stylize",
                      {num("hold", "Hold Each Frame For (frames)", 1, 30, 3, 1)}, {}});
